@@ -205,3 +205,159 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("c11_rvalue_unqualified", code, &[]), 0);
 }
+
+/// Each enumerated type is compatible with one integer type (C17 6.7.2.2p4),
+/// the one the implementation chooses to represent it -- for gcc, `unsigned
+/// int` when no enumerator is negative and `int` otherwise. c17 made an enum
+/// compatible with no integer type, so `_Generic` fell to `default` and
+/// `__builtin_types_compatible_p` answered 0 where gcc answers 1.
+#[test]
+fn c11_generic_enum_is_compatible_with_its_integer_type() {
+    crate::common::compile_and_run_everywhere(
+        "generic_enum_compat",
+        r#"
+enum E { A, B };           /* gcc: compatible with unsigned int */
+enum F { M = -1, N };      /* gcc: compatible with int */
+int main(void) {
+    if (__builtin_types_compatible_p(enum E, unsigned) != 1) return 1;
+    if (__builtin_types_compatible_p(enum E, int) != 0) return 2;
+    if (__builtin_types_compatible_p(enum F, int) != 1) return 3;
+    if (_Generic((enum E)0, unsigned: 1, int: 2, default: 3) != 1) return 4;
+    if (_Generic((enum F)0, unsigned: 1, int: 2, default: 3) != 2) return 5;
+    if (_Generic(0u, enum E: 1, default: 2) != 1) return 6;
+    return 0;
+}
+"#,
+    );
+}
+
+/// The integer type gcc picks for each range, and that the choice is what an
+/// enum *computes* as: `e + 1` has the enum's integer type, as for gcc, where
+/// c17 kept the enum type itself and compared a signed 64-bit enum against
+/// `unsigned` as though it ranked with `int`. Two enumerated types stay
+/// incompatible with each other whatever their integer types.
+#[test]
+fn c11_enum_computes_as_its_integer_type() {
+    crate::common::compile_and_run_everywhere(
+        "enum_integer_type",
+        r#"
+#define T(x) _Generic((x), int: 1, unsigned: 2, long: 3, unsigned long: 4, \
+                      long long: 5, unsigned long long: 6, default: 0)
+enum U { U0, U1 };                        /* unsigned int */
+enum S { S0 = -1, S1 };                   /* int */
+enum UB { UB0 = 0x80000000u };            /* unsigned int */
+enum UL { UL0 = 0x100000000 };            /* unsigned long */
+enum SL { SL0 = -1, SL1 = 0x80000000 };   /* long */
+int main(void) {
+    enum U u = U1; enum S s = S1; enum UL ul = UL0; enum SL sl = SL1;
+    if (T(u) != 2 || T((enum UB)0) != 2 || T(sl) != 3) return 1;
+    if (T(u + 1) != 2 || T(s + 1u) != 2 || T(u + s) != 2) return 2;
+    if (T(ul + 1L) != 4 || T(sl + 1u) != 3 || T(ul + sl) != 4) return 3;
+    if (T(sl + 1LL) != 5 || T(ul + 1LL) != 6) return 4;
+    if (!(u - 2 > 0) || !(sl + 0u < 0x80000001L)) return 5;
+    if (!__builtin_types_compatible_p(enum UB, unsigned)) return 6;
+    if (!__builtin_types_compatible_p(enum UL, unsigned long)) return 7;
+    if (__builtin_types_compatible_p(enum UL, unsigned long long)) return 8;
+    if (!__builtin_types_compatible_p(enum SL, long)) return 9;
+    if (__builtin_types_compatible_p(enum SL, unsigned long)) return 10;
+    if (__builtin_types_compatible_p(enum U, enum UB)) return 11;
+    if (!__builtin_types_compatible_p(const enum U, unsigned)) return 12;
+    if (!__builtin_types_compatible_p(enum U *, unsigned *)) return 13;
+    if (__builtin_types_compatible_p(enum U *, const unsigned *)) return 14;
+    if (_Generic((enum S)0, enum U: 1, enum S: 2, default: 3) != 2) return 15;
+    if (_Generic(0L, enum SL: 1, default: 2) != 1) return 16;
+    return 0;
+}
+"#,
+    );
+}
+
+/// A pointer to an enum and a pointer to its integer type point at compatible
+/// types (C17 6.7.6.1p2), so assigning one to the other is silent in gcc.
+#[test]
+fn c11_enum_pointer_to_its_integer_type_is_silent() {
+    crate::common::compile_expect_no_diagnostic(
+        "enum_ptr_same_int",
+        r#"
+enum E { A, B };
+enum S { M = -1 };
+int main(void) {
+    enum E e = A; enum S s = M;
+    unsigned *pu = &e;
+    enum E *pe = pu;
+    int *ps = &s;
+    enum S *pes = ps;
+    return *pe + *pes;
+}
+"#,
+        "pointer",
+    );
+}
+
+/// The signedness has to agree: `enum E` is `unsigned int`, so an `int *`
+/// does not point at a compatible type, and gcc warns.
+#[test]
+fn c11_enum_pointer_to_the_other_signedness_warns() {
+    crate::common::compile_expect_warning(
+        "enum_ptr_other_int",
+        "enum E { A, B };\nint main(void) { enum E e = A; int *p = &e; return *p; }\n",
+        "incompatible pointer type",
+    );
+    crate::common::compile_expect_warning(
+        "enum_ptr_other_uint",
+        "enum S { M = -1 };\nint main(void) { enum S s = M; unsigned *p = &s; return *p; }\n",
+        "incompatible pointer type",
+    );
+}
+
+/// Compatible types make a compatible redeclaration (C17 6.2.7), which gcc
+/// accepts -- warning only under `-Wenum-int-mismatch`, part of `-Wall`.
+#[test]
+fn c11_enum_redeclared_as_its_integer_type() {
+    crate::common::compile_expect_no_diagnostic(
+        "enum_redecl_int",
+        r#"
+enum E { E0, E1 };
+enum S { S0 = -1 };
+enum E f(void);
+unsigned f(void) { return E1; }
+int g(enum S);
+int g(int x) { return x; }
+extern enum E v;
+unsigned v = E1;
+int main(void) { return f() + g(S0) + (int)v - 1 != 0; }
+"#,
+        "conflicting",
+    );
+}
+
+/// A typedef may be redefined only as the *same* type (C17 6.7p3), and
+/// neither an enum and its integer type nor `int` and `const int` are that.
+#[test]
+fn c11_typedef_redefinition_needs_the_same_type() {
+    crate::common::compile_expect_error(
+        "typedef_enum_vs_int",
+        "enum E { A };\ntypedef enum E T;\ntypedef unsigned T;\n",
+        "typedef 'T' redefined with a different type ('enum E' then 'unsigned int')",
+    );
+    crate::common::compile_expect_error(
+        "typedef_const_int",
+        "typedef int T;\ntypedef const int T;\n",
+        "typedef 'T' redefined with a different type ('int' then 'const int')",
+    );
+    crate::common::compile_expect_ok(
+        "typedef_enum_repeated",
+        "enum E { A };\ntypedef enum E T;\ntypedef enum E T;\ntypedef const int C;\ntypedef const int C;\n",
+    );
+}
+
+/// An enum and its integer type are compatible, so they cannot both be
+/// `_Generic` associations (C17 6.5.1.1p2).
+#[test]
+fn c11_generic_rejects_an_enum_beside_its_integer_type() {
+    crate::common::compile_expect_error(
+        "generic_enum_dup",
+        "enum E { A };\nint main(void) { return _Generic(0u, enum E: 0, unsigned: 1, default: 2); }\n",
+        "two associations with compatible type",
+    );
+}

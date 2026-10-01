@@ -27,10 +27,11 @@ impl Parser<'_> {
     /// The integer type an enumerated type is compatible with, and its size.
     ///
     /// C17 6.7.2.2p4 requires it to represent every member; the choice among
-    /// the types that do is implementation-defined. Narrowest wins, signed
-    /// before unsigned at each width, so an enum whose members all fit in
-    /// `int` is exactly the four signed bytes it has always been -- the
-    /// widening only happens where the alternative was a wrong value.
+    /// the types that do is implementation-defined. gcc's choice, which this
+    /// matches: `unsigned int` when no member is negative, else `int`, and
+    /// the 64-bit type of the same signedness when a member does not fit.
+    /// The choice is recorded as the enum's size and `UNSIGNED` modifier,
+    /// which [`crate::types::TypeTable::enum_compatible_type`] reads back.
     fn enum_underlying_type(
         &mut self,
         constants: &[EnumConstant],
@@ -190,10 +191,8 @@ impl Parser<'_> {
             self.expect_special(b'}')?;
 
             // C17 6.7.2.2p4: the enumerated type is compatible with some
-            // integer type capable of representing every member. Pick the
-            // narrowest that is, preferring signed at each width, and give
-            // the enumerators that type -- for an enum that fits in `int`,
-            // which is nearly all of them, this is the `int` it always was.
+            // integer type capable of representing every member. Pick it, and
+            // give the enumerators that type.
             let (underlying, size) = self.enum_underlying_type(&constants, enum_pos);
             for &sym_id in &constant_syms {
                 self.symbols.get_mut(sym_id).typ = underlying;

@@ -936,6 +936,19 @@ enum TopLevelQualifiers {
     Significant,
 }
 
+/// Whether a comparison lets an enumerated type match its integer type.
+///
+/// For compatibility it does: C17 6.7.2.2p4 makes every enumerated type
+/// compatible with one integer type. A typedef, though, may be redefined only
+/// to denote the *same* type (6.7p3), and an enum is not the same type as the
+/// integer it is compatible with -- gcc rejects `typedef enum E T; typedef
+/// unsigned T;`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnumMatch {
+    Integer,
+    Distinct,
+}
+
 const DEFAULT_TYPE_TABLE_CAPACITY: usize = 65536;
 
 /// Type table - stores all types and provides ID-based lookup
@@ -2176,7 +2189,10 @@ impl TypeTable {
     /// unsigned and is written neither way. Using [`Self::is_unsigned`] here would make
     /// a type printer say `unsigned char` for a declaration that says `char`.
     pub fn spelled_unsigned(&self, id: TypeId) -> bool {
-        self.get(id).modifiers.contains(TypeModifiers::UNSIGNED)
+        // An enum's `UNSIGNED` records the signedness of its integer type;
+        // nothing spelled it, and `unsigned enum E` is not a type.
+        let typ = self.get(id);
+        typ.kind != TypeKind::Enum && typ.modifiers.contains(TypeModifiers::UNSIGNED)
     }
 
     /// The common type of two operands under the usual arithmetic conversions
@@ -2295,9 +2311,12 @@ impl TypeTable {
             TypeKind::Bool => 0,
             TypeKind::Char => 1,
             TypeKind::Short => 2,
-            // An enumerated type has the rank of its compatible type, which
-            // here is always `int`.
-            TypeKind::Int | TypeKind::Enum => 3,
+            TypeKind::Int => 3,
+            // An enumerated type has the rank of its compatible type
+            // (6.3.1.1p1); one not yet completed has no other to go on.
+            TypeKind::Enum => self
+                .enum_compatible_type(id)
+                .map_or(3, |int| self.integer_rank(int)),
             TypeKind::Long => 4,
             TypeKind::LongLong => 5,
             TypeKind::Int128 => 6,
@@ -2339,6 +2358,12 @@ impl TypeTable {
     pub fn integer_promote(&self, id: TypeId) -> TypeId {
         match self.kind(id) {
             TypeKind::Bool | TypeKind::Char | TypeKind::Short => self.int_id,
+            // An enumerated type computes as the integer type it is
+            // compatible with, as gcc's does: `e + 1` for an enum whose
+            // members are all non-negative is `unsigned int`, not the enum.
+            TypeKind::Enum => self
+                .enum_compatible_type(id)
+                .map_or(id, |int| self.integer_promote(int)),
             _ => id,
         }
     }
@@ -2748,10 +2773,32 @@ impl TypeTable {
     /// as to point at compatible types, so `char *` and `const char *` are
     /// different types.
     pub fn types_compatible(&self, id1: TypeId, id2: TypeId) -> bool {
-        self.compatible(id1, id2, TopLevelQualifiers::Ignored)
+        self.compatible(id1, id2, TopLevelQualifiers::Ignored, EnumMatch::Integer)
     }
 
-    fn compatible(&self, id1: TypeId, id2: TypeId, quals: TopLevelQualifiers) -> bool {
+    /// Do these two types denote the same type, as a typedef redefinition
+    /// requires (C17 6.7p3)?
+    ///
+    /// Compatibility, minus the two allowances that make different types
+    /// compatible: top-level qualifiers count, and an enumerated type is not
+    /// its integer type. gcc rejects both `typedef int T; typedef const int T;`
+    /// and `typedef enum E T; typedef unsigned T;`.
+    pub fn types_same(&self, id1: TypeId, id2: TypeId) -> bool {
+        self.compatible(
+            id1,
+            id2,
+            TopLevelQualifiers::Significant,
+            EnumMatch::Distinct,
+        )
+    }
+
+    fn compatible(
+        &self,
+        id1: TypeId,
+        id2: TypeId,
+        quals: TopLevelQualifiers,
+        enums: EnumMatch,
+    ) -> bool {
         // Quick check: same TypeId means same type
         if id1 == id2 {
             return true;
@@ -2759,6 +2806,14 @@ impl TypeTable {
         if quals == TopLevelQualifiers::Significant && self.qualifiers(id1) != self.qualifiers(id2)
         {
             return false;
+        }
+        // C17 6.7.2.2p4: an enumerated type is compatible with its integer
+        // type. The qualifiers have been settled above, so what is left is a
+        // comparison of two unqualified integer types.
+        if enums == EnumMatch::Integer {
+            if let Some((a, b)) = self.enum_as_integer(id1, id2) {
+                return self.compatible(a, b, TopLevelQualifiers::Ignored, enums);
+            }
         }
         if !self.get(id1).compatible_ignoring_base(self.get(id2)) {
             return false;
@@ -2774,7 +2829,7 @@ impl TypeTable {
         // its declared type, so `void f(const int)` and `void f(int)` are one
         // type.
         let base_ok = match (self.get(id1).base, self.get(id2).base) {
-            (Some(a), Some(b)) => self.compatible(a, b, TopLevelQualifiers::Significant),
+            (Some(a), Some(b)) => self.compatible(a, b, TopLevelQualifiers::Significant, enums),
             (None, None) => true,
             _ => false,
         };
@@ -2785,9 +2840,54 @@ impl TypeTable {
             (Some(a), Some(b)) => a
                 .iter()
                 .zip(b.iter())
-                .all(|(&x, &y)| self.parameters_compatible(x, y)),
+                .all(|(&x, &y)| self.parameters_compatible(x, y, enums)),
             _ => true,
         }
+    }
+
+    /// An enumerated type meeting a type that is not one, with the enum
+    /// replaced by the integer type it is compatible with; `None` for any
+    /// other pairing.
+    ///
+    /// Two enums are left alone: different enumerated types are not
+    /// compatible even when their integer types agree, and an enum meeting
+    /// its own forward declaration is decided by its tag.
+    fn enum_as_integer(&self, id1: TypeId, id2: TypeId) -> Option<(TypeId, TypeId)> {
+        let is_enum = |id| self.kind(id) == TypeKind::Enum;
+        match (is_enum(id1), is_enum(id2)) {
+            (true, false) => Some((self.enum_compatible_type(id1)?, id2)),
+            (false, true) => Some((id1, self.enum_compatible_type(id2)?)),
+            _ => None,
+        }
+    }
+
+    /// The integer type an enumerated type is compatible with (C17
+    /// 6.7.2.2p4), or `None` for any other type and for an enum whose list
+    /// has not been seen yet.
+    ///
+    /// The parser's `enum_underlying_type` makes the choice when the list
+    /// closes, and records it as the enum's size and its `UNSIGNED` modifier
+    /// -- the two things layout and arithmetic read. This reads them back. An
+    /// eight-byte enum is `long`, as it is for gcc on LP64.
+    pub fn enum_compatible_type(&self, id: TypeId) -> Option<TypeId> {
+        let typ = self.get(id);
+        if typ.kind != TypeKind::Enum {
+            return None;
+        }
+        let composite = typ.composite.as_deref().filter(|c| c.is_complete)?;
+        let unsigned = typ.modifiers.contains(TypeModifiers::UNSIGNED);
+        let int = match (composite.size, unsigned) {
+            (1, false) => IntType::SChar,
+            (1, true) => IntType::UChar,
+            (2, false) => IntType::Short,
+            (2, true) => IntType::UShort,
+            (4, false) => IntType::Int,
+            (4, true) => IntType::UInt,
+            (8, false) => IntType::Long,
+            (8, true) => IntType::ULong,
+            _ => return None,
+        };
+        Some(self.int_type_id(int))
     }
 
     /// Are these two parameter types compatible?
@@ -2799,13 +2899,13 @@ impl TypeTable {
     /// declared with `__CONST_SOCKADDR_ARG` and defined with
     /// `const struct sockaddr *` -- and refusing the pair reported
     /// "conflicting types" for a header and a source file that agree.
-    fn parameters_compatible(&self, a: TypeId, b: TypeId) -> bool {
-        if self.compatible(a, b, TopLevelQualifiers::Ignored) {
+    fn parameters_compatible(&self, a: TypeId, b: TypeId, enums: EnumMatch) -> bool {
+        if self.compatible(a, b, TopLevelQualifiers::Ignored, enums) {
             return true;
         }
         for (union_side, other) in [(a, b), (b, a)] {
             if let Some(member) = self.transparent_union_first_member(union_side) {
-                if self.compatible(member, other, TopLevelQualifiers::Ignored) {
+                if self.compatible(member, other, TopLevelQualifiers::Ignored, enums) {
                     return true;
                 }
             }
@@ -2824,7 +2924,12 @@ impl TypeTable {
     /// association can never be selected because the controlling expression has
     /// been lvalue-converted to an unqualified type.
     pub fn types_compatible_qualified(&self, id1: TypeId, id2: TypeId) -> bool {
-        self.compatible(id1, id2, TopLevelQualifiers::Significant)
+        self.compatible(
+            id1,
+            id2,
+            TopLevelQualifiers::Significant,
+            EnumMatch::Integer,
+        )
     }
 
     /// Compute struct layout with natural alignment
@@ -4114,6 +4219,134 @@ mod tests {
 
         let char_ptr = types.intern(Type::pointer(types.char_id));
         assert!(!types.types_compatible(int_ptr, char_ptr));
+    }
+
+    /// A complete enumerated type of `size` bytes, as the parser records one
+    /// whose integer type has that size and signedness.
+    fn enum_of(
+        types: &mut TypeTable,
+        idents: &mut crate::strings::StringTable,
+        tag: &str,
+        size: usize,
+        unsigned: bool,
+    ) -> TypeId {
+        let composite = CompositeType {
+            tag: Some(idents.intern(tag)),
+            members: Vec::new(),
+            enum_constants: Vec::new(),
+            size,
+            align: size,
+            member_align: size,
+            is_complete: true,
+            transparent: false,
+            anon_id: None,
+        };
+        let mut typ = Type::enum_type(composite);
+        if unsigned {
+            typ.modifiers |= TypeModifiers::UNSIGNED;
+        }
+        types.intern(typ)
+    }
+
+    /// C17 6.7.2.2p4: an enum is compatible with the one integer type it was
+    /// given -- not with the other signedness, not with another type of the
+    /// same width, and not with a different enum.
+    #[test]
+    fn test_types_compatible_enum_and_its_integer_type() {
+        let mut types = TypeTable::new(&Target::host());
+        let mut idents = crate::strings::StringTable::new();
+        let e_uint = enum_of(&mut types, &mut idents, "U", 4, true);
+        let e_int = enum_of(&mut types, &mut idents, "S", 4, false);
+        let e_ulong = enum_of(&mut types, &mut idents, "UL", 8, true);
+        let e_long = enum_of(&mut types, &mut idents, "L", 8, false);
+
+        assert!(types.types_compatible(e_uint, types.uint_id));
+        assert!(types.types_compatible(types.uint_id, e_uint));
+        assert!(!types.types_compatible(e_uint, types.int_id));
+        assert!(types.types_compatible(e_int, types.int_id));
+        assert!(!types.types_compatible(e_int, types.uint_id));
+        assert!(types.types_compatible(e_ulong, types.ulong_id));
+        assert!(!types.types_compatible(e_ulong, types.ulonglong_id));
+        assert!(types.types_compatible(e_long, types.long_id));
+        assert!(!types.types_compatible(e_long, types.longlong_id));
+
+        // Two enums with the same integer type are still two types.
+        let e_uint2 = enum_of(&mut types, &mut idents, "U2", 4, true);
+        assert!(!types.types_compatible(e_uint, e_uint2));
+
+        // A forward reference has no integer type yet.
+        let fwd = types.intern(Type::incomplete_enum(idents.intern("F")));
+        assert_eq!(types.enum_compatible_type(fwd), None);
+        assert!(!types.types_compatible(fwd, types.int_id));
+        assert_eq!(types.enum_compatible_type(types.int_id), None);
+    }
+
+    /// Below a pointer the qualifiers count, the enum rule still applies, and
+    /// the signedness still has to agree.
+    #[test]
+    fn test_types_compatible_pointer_to_enum() {
+        let mut types = TypeTable::new(&Target::host());
+        let mut idents = crate::strings::StringTable::new();
+        let e_uint = enum_of(&mut types, &mut idents, "U", 4, true);
+        let e_int = enum_of(&mut types, &mut idents, "S", 4, false);
+        let p_e_uint = types.intern(Type::pointer(e_uint));
+        let p_e_int = types.intern(Type::pointer(e_int));
+        let p_uint = types.intern(Type::pointer(types.uint_id));
+        let p_int = types.intern(Type::pointer(types.int_id));
+        let const_uint = types.qualified_with(types.uint_id, TypeModifiers::CONST);
+        let p_const_uint = types.intern(Type::pointer(const_uint));
+
+        assert!(types.types_compatible(p_e_uint, p_uint));
+        assert!(!types.types_compatible(p_e_uint, p_int));
+        assert!(types.types_compatible(p_e_int, p_int));
+        assert!(!types.types_compatible(p_e_int, p_uint));
+        assert!(!types.types_compatible(p_e_uint, p_const_uint));
+        assert!(!types.types_compatible(p_e_uint, p_e_int));
+
+        // `_Generic` compares top-level qualifiers too.
+        let const_e_uint = types.qualified_with(e_uint, TypeModifiers::CONST);
+        assert!(types.types_compatible_qualified(const_e_uint, const_uint));
+        assert!(!types.types_compatible_qualified(const_e_uint, types.uint_id));
+    }
+
+    /// A typedef redefinition needs the same type: neither an enum's integer
+    /// type nor a differently qualified one will do, at any level.
+    #[test]
+    fn test_types_same_keeps_enums_and_qualifiers_distinct() {
+        let mut types = TypeTable::new(&Target::host());
+        let mut idents = crate::strings::StringTable::new();
+        let e_uint = enum_of(&mut types, &mut idents, "U", 4, true);
+        let p_e_uint = types.intern(Type::pointer(e_uint));
+        let p_uint = types.intern(Type::pointer(types.uint_id));
+        let const_int = types.qualified_with(types.int_id, TypeModifiers::CONST);
+
+        assert!(!types.types_same(e_uint, types.uint_id));
+        assert!(!types.types_same(p_e_uint, p_uint));
+        assert!(!types.types_same(const_int, types.int_id));
+        assert!(types.types_same(e_uint, e_uint));
+        let p_uint2 = types.intern(Type::pointer(types.uint_id));
+        assert!(types.types_same(p_uint, p_uint2));
+    }
+
+    /// An enum computes as its integer type: the promotions and the usual
+    /// arithmetic conversions replace it, at the integer type's rank.
+    #[test]
+    fn test_enum_promotes_to_its_integer_type() {
+        let mut types = TypeTable::new(&Target::host());
+        let mut idents = crate::strings::StringTable::new();
+        let e_uint = enum_of(&mut types, &mut idents, "U", 4, true);
+        let e_long = enum_of(&mut types, &mut idents, "L", 8, false);
+        let e_ulong = enum_of(&mut types, &mut idents, "UL", 8, true);
+
+        assert_eq!(types.integer_promote(e_uint), types.uint_id);
+        assert_eq!(types.integer_promote(e_long), types.long_id);
+        assert_eq!(types.common_type(e_uint, types.int_id), types.uint_id);
+        assert_eq!(types.common_type(e_long, types.uint_id), types.long_id);
+        assert_eq!(types.common_type(e_ulong, e_long), types.ulong_id);
+        assert_eq!(
+            types.common_type(e_ulong, types.longlong_id),
+            types.ulonglong_id
+        );
     }
 
     /// 6.5.16.1p1 keeps the pointee's qualifiers when one side is `void *`

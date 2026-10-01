@@ -353,11 +353,11 @@ fn diagnostics_incompatible_typedef_redefinition_is_rejected() {
     compile_expect_error(
         "typedef_conflict",
         "typedef int foo; typedef char foo; foo x;\n",
-        "incompatible type",
+        "different type",
     );
 }
 
-/// C11 legalized redefining a typedef to a *compatible* type, which two
+/// C11 legalized redefining a typedef to denote the *same* type (6.7p3), which two
 /// headers declaring the same alias rely on.
 #[test]
 fn diagnostics_compatible_typedef_redefinition_is_accepted() {
@@ -527,7 +527,7 @@ fn diagnostics_typedef_may_be_shadowed_in_an_inner_scope() {
     compile_expect_error(
         "typedef_conflict_same_scope",
         "typedef int T;\ntypedef double T;\n",
-        "incompatible type",
+        "different type",
     );
 }
 

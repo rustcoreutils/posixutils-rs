@@ -1472,17 +1472,17 @@ impl Parser<'_> {
         // comparing raw modifiers reports two identical `short`s as different.
         let old_type = self.types.without_decl_specifiers(old_type);
         let new_type = self.types.without_decl_specifiers(new_type);
-        if self.types.types_compatible(old_type, new_type) {
+        if self.types.types_same(old_type, new_type) {
             return;
         }
         let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
         diag::error_args(
             pos,
-            "typedef '{0}' redefined with an incompatible type ('{1}' then '{2}')",
+            "typedef '{0}' redefined with a different type ('{1}' then '{2}')",
             &[
                 &spelled.to_string(),
-                &self.types.get(old_type).to_string(),
-                &self.types.get(new_type).to_string(),
+                &self.types.format_type(old_type, Some(self.idents)),
+                &self.types.format_type(new_type, Some(self.idents)),
             ],
         );
     }

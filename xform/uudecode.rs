@@ -11,9 +11,8 @@ use base64::prelude::*;
 use clap::Parser;
 use gettextrs::gettext;
 use plib::diag;
-use std::fs::File;
+use std::fs::{File, Permissions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// uudecode - decode a binary file
@@ -61,12 +60,37 @@ fn is_stdout_cookie(path: &Path) -> bool {
     s == "-" || s == "/dev/stdout"
 }
 
-/// Whether the caller has write permission on an existing path (access(2), W_OK).
+/// Whether the caller has write permission on an existing path (access(2),
+/// W_OK). Windows has no `access`; there a file is writable unless it carries
+/// the read-only attribute.
 fn is_writable(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    match std::ffi::CString::new(path.as_os_str().as_bytes()) {
-        Ok(c) => unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 },
-        Err(_) => false,
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+            Ok(c) => unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 },
+            Err(_) => false,
+        }
+    }
+    #[cfg(windows)]
+    {
+        std::fs::metadata(path).is_ok_and(|m| !m.permissions().readonly())
+    }
+}
+
+/// Give `perm` the header's permission bits, keeping whatever else it holds.
+/// Windows keeps only a read-only attribute, the owner-write bit seen from
+/// POSIX, so there the file is read-only exactly when the header withholds
+/// owner write.
+fn set_mode(perm: &mut Permissions, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perm.set_mode(((perm.mode() >> 9) << 9) | (mode & 0o7777));
+    }
+    #[cfg(windows)]
+    {
+        perm.set_readonly(mode & 0o200 == 0);
     }
 }
 
@@ -228,10 +252,7 @@ fn decode_file(args: &Args) -> io::Result<()> {
 
         let mut o_file = File::create(out_path)?;
         let mut o_file_perm = o_file.metadata()?.permissions();
-        let o_file_perm_mode = o_file_perm.mode();
-        let new_o_file_perm_mode =
-            ((o_file_perm_mode >> 9) << 9) | (header.lower_perm_bits & 0o7777);
-        o_file_perm.set_mode(new_o_file_perm_mode);
+        set_mode(&mut o_file_perm, header.lower_perm_bits);
 
         o_file.write_all(&out)?;
         // If the mode bits cannot be set, this is not an error (spec 119719-119720).

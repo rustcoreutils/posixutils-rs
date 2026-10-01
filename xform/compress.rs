@@ -17,15 +17,14 @@ use plib::io::input_stream;
 use plib::lzw::{UnixLZWReader, UnixLZWWriter};
 use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 /// Conventional fallback when {NAME_MAX} cannot be queried.
 const NAME_MAX_FALLBACK: usize = 255;
 
 /// Query `{NAME_MAX}` for the directory that will hold the output file, via
 /// `pathconf(_PC_NAME_MAX)`; fall back to a conventional 255 when unavailable.
+#[cfg(unix)]
 fn name_max(dir: &Path) -> usize {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -42,6 +41,13 @@ fn name_max(dir: &Path) -> usize {
             return v as usize;
         }
     }
+    NAME_MAX_FALLBACK
+}
+
+/// `{NAME_MAX}` on Windows, which has no `pathconf`: 255, NTFS's limit on a
+/// path component.
+#[cfg(windows)]
+fn name_max(_dir: &Path) -> usize {
     NAME_MAX_FALLBACK
 }
 
@@ -186,102 +192,124 @@ fn may_overwrite(output_path: &Path, force: bool) -> bool {
 
 /// Saved file metadata for preservation
 struct FileMetadata {
-    mode: u32,
-    uid: u32,
-    gid: u32,
-    atime: SystemTime,
-    mtime: SystemTime,
+    /// The mode on Unix; the read-only attribute on Windows.
+    permissions: fs::Permissions,
+    #[cfg(unix)]
+    owner: (u32, u32),
+    times: fs::FileTimes,
 }
 
 impl FileMetadata {
     fn from_path(path: &Path) -> io::Result<Self> {
         let meta = fs::metadata(path)?;
         Ok(Self {
-            mode: meta.permissions().mode(),
-            uid: meta.uid(),
-            gid: meta.gid(),
-            atime: meta.accessed()?,
-            mtime: meta.modified()?,
+            permissions: meta.permissions(),
+            #[cfg(unix)]
+            owner: {
+                use std::os::unix::fs::MetadataExt;
+                (meta.uid(), meta.gid())
+            },
+            times: fs::FileTimes::new()
+                .set_accessed(meta.accessed()?)
+                .set_modified(meta.modified()?),
         })
     }
 
-    fn apply_to(&self, path: &Path) -> io::Result<()> {
+    /// Apply the saved metadata to the output at `path`, whose write handle
+    /// `file` is still open.
+    fn apply_to(&self, file: &File, path: &Path) -> io::Result<()> {
+        // Restore ownership before the mode bits: chown() clears the
+        // set-user-ID / set-group-ID bits, so it must run first. Best effort —
+        // only a sufficiently privileged process succeeds, so the result is
+        // intentionally ignored (spec 90389-90392).
         #[cfg(unix)]
         {
             use std::ffi::CString;
             use std::os::unix::ffi::OsStrExt;
 
             let path_cstr = CString::new(path.as_os_str().as_bytes())?;
-
-            // Restore ownership before the mode bits: chown() clears the
-            // set-user-ID / set-group-ID bits, so it must run first. Best
-            // effort — only a sufficiently privileged process succeeds, so the
-            // result is intentionally ignored (spec 90389-90392).
             unsafe {
-                libc::chown(path_cstr.as_ptr(), self.uid, self.gid);
-            }
-
-            let perms = fs::Permissions::from_mode(self.mode);
-            fs::set_permissions(path, perms)?;
-
-            // utimensat, not utimes: utimes takes `struct timeval`, whose
-            // resolution is microseconds, so it silently truncated the
-            // sub-microsecond part of the timestamp. On a filesystem with
-            // nanosecond timestamps (ext4, APFS, ...) that meant the copy's
-            // mtime differed from the original's by up to 999ns — a "preserved"
-            // time that did not compare equal to the one it came from.
-            fn to_timespec(time: SystemTime) -> libc::timespec {
-                match time.duration_since(std::time::UNIX_EPOCH) {
-                    Ok(d) => libc::timespec {
-                        tv_sec: d.as_secs() as libc::time_t,
-                        tv_nsec: d.subsec_nanos() as _,
-                    },
-                    // A pre-1970 timestamp: the error carries how far *before*
-                    // the epoch the time is, which is a negative tv_sec.
-                    // tv_nsec has to stay in [0, 1e9), so a sub-second
-                    // remainder borrows one second from tv_sec.
-                    Err(e) => {
-                        let d = e.duration();
-                        let (secs, nsec) = match d.subsec_nanos() {
-                            0 => (-(d.as_secs() as i64), 0),
-                            n => (-(d.as_secs() as i64) - 1, 1_000_000_000 - n as i64),
-                        };
-                        libc::timespec {
-                            tv_sec: secs as libc::time_t,
-                            tv_nsec: nsec as _,
-                        }
-                    }
-                }
-            }
-
-            // Best effort, like the chown above: timestamp preservation is a
-            // courtesy on top of an output file that is already complete and
-            // correct, so a failure here must not turn into a non-zero exit.
-            // Both call sites discard this function's result for that reason.
-            let times = [to_timespec(self.atime), to_timespec(self.mtime)];
-            unsafe {
-                libc::utimensat(libc::AT_FDCWD, path_cstr.as_ptr(), times.as_ptr(), 0);
+                libc::chown(path_cstr.as_ptr(), self.owner.0, self.owner.1);
             }
         }
 
-        Ok(())
+        // The times go through the write handle the caller already holds, so
+        // neither the umask (which may have created the file without owner
+        // write) nor the mode restored below can keep them from being set; a
+        // reopen by path would be refused in either case. set_times keeps
+        // nanoseconds (futimens on Unix), so a preserved time compares equal
+        // to the one it came from. Best effort, like the chown: timestamp
+        // preservation is a courtesy on top of an output file that is already
+        // complete and correct, so a failure here must not turn into a
+        // non-zero exit. Both call sites discard this function's result for
+        // that reason.
+        let _ = file.set_times(self.times);
+
+        fs::set_permissions(path, self.permissions.clone())
     }
 }
 
 /// Check for multiple hard links
 fn check_hard_links(path: &Path, force: bool) -> io::Result<bool> {
-    let meta = fs::metadata(path)?;
-    if meta.nlink() > 1 {
+    let links = link_count(path)?;
+    if links > 1 {
         diag::warning(&format!(
             "{}: {}",
             path.display(),
-            gettext!("has {} hard links", meta.nlink())
+            gettext!("has {} hard links", links)
         ));
         if !force {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// The number of hard links to `path`.
+#[cfg(unix)]
+fn link_count(path: &Path) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(fs::metadata(path)?.nlink())
+}
+
+/// The number of hard links to `path`. Stable Rust exposes no link count on
+/// Windows, so a file there counts as its only link; a stat failure is still
+/// reported.
+#[cfg(windows)]
+fn link_count(path: &Path) -> io::Result<u64> {
+    fs::metadata(path)?;
+    Ok(1)
+}
+
+/// Remove `path`. On Unix, removal is governed by the directory's
+/// permissions, not the file's, so a read-only file is removed as is.
+#[cfg(unix)]
+fn remove_file(path: &Path) -> io::Result<()> {
+    fs::remove_file(path)
+}
+
+/// Remove `path`, clearing its read-only attribute first. Windows will not
+/// delete a read-only file wherever FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE
+/// is not honoured (Wine, older Windows), and compress copies that attribute
+/// onto its output, so both the input removal and the back-out of the output
+/// depend on this. A file that still cannot be removed gets its attribute
+/// back, so a failure leaves it as it was.
+#[cfg(windows)]
+fn remove_file(path: &Path) -> io::Result<()> {
+    let mut perms = fs::symlink_metadata(path)?.permissions();
+    if !perms.readonly() {
+        return fs::remove_file(path);
+    }
+    let original = perms.clone();
+    #[expect(
+        clippy::permissions_set_readonly_false,
+        reason = "Windows only: clears the read-only attribute, no Unix mode bits"
+    )]
+    perms.set_readonly(false);
+    fs::set_permissions(path, perms)?;
+    fs::remove_file(path).inspect_err(|_| {
+        let _ = fs::set_permissions(path, original);
+    })
 }
 
 /// Check if output path would exceed PATH_MAX
@@ -554,21 +582,19 @@ fn compress_file(args: &Args, pathname: &Path, algo: Algorithm) -> io::Result<i3
         return Ok(1);
     }
 
-    // Write compressed file
+    // Write compressed file, then apply metadata while the handle is open
     let mut f = File::create(&output_path)?;
     f.write_all(&out_buf)?;
-    drop(f);
-
-    // Apply metadata
     if let Some(ref meta) = orig_metadata {
-        let _ = meta.apply_to(&output_path);
+        let _ = meta.apply_to(&f, &output_path);
     }
+    drop(f);
 
     // Remove original. If it cannot be removed, back out the output so we do
     // not leave both files behind, and report a non-zero status
     // (spec 90393-90400).
-    if let Err(e) = fs::remove_file(pathname) {
-        let _ = fs::remove_file(&output_path);
+    if let Err(e) = remove_file(pathname) {
+        let _ = remove_file(&output_path);
         diag::error(&format!(
             "{}: {}: {}",
             pathname.display(),
@@ -660,21 +686,19 @@ fn decompress_file(args: &Args, pathname: &Path) -> io::Result<i32> {
         return Ok(1);
     }
 
-    // Write decompressed file
+    // Write decompressed file, then apply metadata while the handle is open
     let mut f = File::create(&output_path)?;
     f.write_all(&decompressed)?;
-    drop(f);
-
-    // Apply metadata
     if let Some(ref meta) = orig_metadata {
-        let _ = meta.apply_to(&output_path);
+        let _ = meta.apply_to(&f, &output_path);
     }
+    drop(f);
 
     // Remove compressed file. If it cannot be removed, back out the output so
     // we do not leave both files behind, and report a non-zero status
     // (spec 90393-90400).
-    if let Err(e) = fs::remove_file(&input_path) {
-        let _ = fs::remove_file(&output_path);
+    if let Err(e) = remove_file(&input_path) {
+        let _ = remove_file(&output_path);
         diag::error(&format!(
             "{}: {}: {}",
             input_path.display(),

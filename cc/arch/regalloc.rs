@@ -11,7 +11,7 @@
 
 use crate::ir::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::{TypeId, TypeTable};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 
 /// Grow a frame's locals area by one slot, refusing a total no `i32`
@@ -767,15 +767,20 @@ where
         }
     }
 
-    // Phase F: Build sorted LiveInterval vec
+    // Phase F: Build sorted LiveInterval vec. A local's interval is its
+    // lifetime's, which liveness alone cannot see; see `local_lifetimes`.
+    let lifetimes = local_lifetimes(func, &block_start_pos, &block_end_pos, &bb_id_to_idx);
     let mut result: Vec<LiveInterval> = interval_start
         .into_iter()
         .filter_map(|(pseudo, start)| {
-            interval_end.get(&pseudo).map(|&end| LiveInterval {
-                pseudo,
-                start,
-                end,
-                in_loop: loop_pseudos.contains(&pseudo),
+            interval_end.get(&pseudo).map(|&end| {
+                let (start, end) = lifetimes.get(&pseudo).copied().unwrap_or((start, end));
+                LiveInterval {
+                    pseudo,
+                    start,
+                    end,
+                    in_loop: loop_pseudos.contains(&pseudo),
+                }
             })
         })
         .collect();
@@ -787,6 +792,218 @@ where
         live_in,
         live_out,
     }
+}
+
+/// The frame slot a local takes, as `(bytes, alignment)`: its own size and
+/// alignment, each at least eight -- or the alignment it was declared with.
+/// One rule for both allocators.
+pub fn local_slot(
+    local: &crate::ir::LocalVar,
+    types: &TypeTable,
+    pos: crate::diag::Position,
+) -> (i32, i32) {
+    let bytes = crate::abi::slot_bytes(types.size_bytes(local.typ), pos, "an automatic object");
+    let align = local
+        .explicit_align
+        .map(|a| a as i32)
+        .unwrap_or_else(|| (types.alignment(local.typ) as i32).max(8));
+    (bytes.max(8), align)
+}
+
+/// Each local's frame slot, as `(local, offset)`, with `new_slot(bytes,
+/// alignment)` making a fresh one.
+///
+/// Locals are laid out in declaration order, as they always were: the order
+/// decides which of them land near the frame base, and an inline-asm memory
+/// operand can name a local in place only while its displacement fits the
+/// addressing mode -- small locals declared beside a large array must stay
+/// on the near side of it. A local takes an earlier one's slot when the two
+/// agree in size and alignment and its interval -- its lifetime, see
+/// `local_lifetimes` -- overlaps none the slot has held.
+pub fn place_locals(
+    func: &Function,
+    types: &TypeTable,
+    pos: crate::diag::Position,
+    intervals: &[LiveInterval],
+    mut new_slot: impl FnMut(i32, i32) -> i32,
+) -> Vec<(PseudoId, i32)> {
+    struct Shared {
+        bytes: i32,
+        align: i32,
+        offset: i32,
+        owners: Vec<(usize, usize)>,
+    }
+    let lifetime: HashMap<PseudoId, (usize, usize)> = intervals
+        .iter()
+        .map(|i| (i.pseudo, (i.start, i.end)))
+        .collect();
+    let mut locals: Vec<&crate::ir::LocalVar> = func
+        .locals
+        .values()
+        .filter(|l| lifetime.contains_key(&l.sym))
+        .collect();
+    locals.sort_by_key(|l| l.sym.0);
+    let mut slots: Vec<Shared> = Vec::new();
+    let mut placed = Vec::with_capacity(locals.len());
+    for local in locals {
+        let (bytes, align) = local_slot(local, types, pos);
+        let (start, end) = lifetime[&local.sym];
+        let free = slots.iter_mut().find(|s| {
+            s.bytes == bytes
+                && s.align >= align
+                && s.owners.iter().all(|&(os, oe)| oe < start || end < os)
+        });
+        let offset = match free {
+            Some(s) => {
+                s.owners.push((start, end));
+                s.offset
+            }
+            None => {
+                let offset = new_slot(bytes, align);
+                slots.push(Shared {
+                    bytes,
+                    align,
+                    offset,
+                    owners: vec![(start, end)],
+                });
+                offset
+            }
+        };
+        placed.push((local.sym, offset));
+    }
+    placed
+}
+
+/// The positions each local's object may hold a value at, as `[start, end]`:
+/// the hull of every point where it may be inside its lifetime.
+///
+/// A local is a `Sym`, which no instruction defines, so ordinary liveness
+/// finds each of its uses upward-exposed and carries it to function entry:
+/// every local overlapped every other from position 0, and no frame slot was
+/// ever free to share. What bounds an object is its lifetime instead. It is
+/// "may be live" forward from any instruction that mentions it -- the first
+/// mention of an object nothing has written is its start, and a jump past
+/// its declaration reaches a mention all the same -- until a `LifetimeEnd`
+/// for it, which the linearizer puts where control falls out of the block
+/// that declared it. A path leaving that block any other way simply carries
+/// the object further, the safe direction. A use after the end is undefined
+/// behaviour (C17 6.2.4p2), so a pointer into the object, escaped or not,
+/// needs no tracking of its own.
+///
+/// A parameter's local is written by the prologue before any instruction
+/// mentions it, so it is live from entry. In a function that calls
+/// `setjmp`, control can come back to a point the analysis cannot see, and
+/// every local spans the whole function.
+fn local_lifetimes(
+    func: &Function,
+    block_start_pos: &[usize],
+    block_end_pos: &[usize],
+    bb_id_to_idx: &HashMap<BasicBlockId, usize>,
+) -> HashMap<PseudoId, (usize, usize)> {
+    let locals: Vec<PseudoId> = func.locals.values().map(|l| l.sym).collect();
+    let last = block_end_pos.last().copied().unwrap_or(0);
+    let returns_twice = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insns)
+        .any(|i| matches!(i.op, Opcode::Setjmp | Opcode::Longjmp));
+    if returns_twice {
+        return locals.into_iter().map(|l| (l, (0, last))).collect();
+    }
+    let index: HashMap<PseudoId, usize> = locals.iter().enumerate().map(|(i, &l)| (l, i)).collect();
+    let words = locals.len().div_ceil(64);
+    let set = |bits: &mut Vec<u64>, i: usize| bits[i / 64] |= 1 << (i % 64);
+    let clear = |bits: &mut Vec<u64>, i: usize| bits[i / 64] &= !(1 << (i % 64));
+    let has = |bits: &[u64], i: usize| bits[i / 64] & (1 << (i % 64)) != 0;
+
+    // Each block's events in order: (position, local, starts) -- a mention
+    // starts (or continues) a lifetime, a `LifetimeEnd` ends one.
+    let mut events: Vec<Vec<(usize, usize, bool)>> = vec![Vec::new(); func.blocks.len()];
+    for (b, block) in func.blocks.iter().enumerate() {
+        for (pos, insn) in (block_start_pos[b]..).zip(&block.insns) {
+            if insn.op == Opcode::LifetimeEnd {
+                if let Some(&i) = insn.extra().lifetime_of.and_then(|l| index.get(&l)) {
+                    events[b].push((pos, i, false));
+                }
+                continue;
+            }
+            for p in insn.mentioned() {
+                if let Some(&i) = index.get(&p) {
+                    events[b].push((pos, i, true));
+                }
+            }
+        }
+    }
+
+    // Forward "may be inside its lifetime", to a fixed point.
+    let mut live_in: Vec<Vec<u64>> = vec![vec![0; words]; func.blocks.len()];
+    let mut live_out: Vec<Vec<u64>> = vec![vec![0; words]; func.blocks.len()];
+    let params: HashSet<&str> = func.params.iter().map(|(n, _)| n.as_str()).collect();
+    if let Some(&entry) = bb_id_to_idx.get(&func.entry) {
+        for (name, local) in &func.locals {
+            if params.contains(name.as_str()) {
+                set(&mut live_in[entry], index[&local.sym]);
+            }
+        }
+    }
+    let mut work: VecDeque<usize> = (0..func.blocks.len()).collect();
+    let mut queued = vec![true; func.blocks.len()];
+    while let Some(b) = work.pop_front() {
+        queued[b] = false;
+        let mut out = live_in[b].clone();
+        for &(_, i, starts) in &events[b] {
+            if starts {
+                set(&mut out, i);
+            } else {
+                clear(&mut out, i);
+            }
+        }
+        if out == live_out[b] {
+            continue;
+        }
+        live_out[b] = out;
+        for child in &func.blocks[b].children {
+            let Some(&c) = bb_id_to_idx.get(child) else {
+                continue;
+            };
+            let mut changed = false;
+            for (w, word) in live_in[c].iter_mut().enumerate() {
+                let merged = *word | live_out[b][w];
+                changed |= merged != *word;
+                *word = merged;
+            }
+            if changed && !queued[c] {
+                queued[c] = true;
+                work.push_back(c);
+            }
+        }
+    }
+
+    // The hull: a block's start where the object is live in, its end where
+    // live out, and every event in between.
+    let mut hull: HashMap<PseudoId, (usize, usize)> = HashMap::new();
+    let mut widen = |i: usize, pos: usize| {
+        hull.entry(locals[i])
+            .and_modify(|(s, e)| {
+                *s = (*s).min(pos);
+                *e = (*e).max(pos);
+            })
+            .or_insert((pos, pos));
+    };
+    for b in 0..func.blocks.len() {
+        for i in 0..locals.len() {
+            if has(&live_in[b], i) {
+                widen(i, block_start_pos[b]);
+            }
+            if has(&live_out[b], i) {
+                widen(i, block_end_pos[b]);
+            }
+        }
+        for &(pos, i, _) in &events[b] {
+            widen(i, pos);
+        }
+    }
+    hull
 }
 
 /// Each pseudo's live interval, by pseudo -- the first, if several.
@@ -809,36 +1026,6 @@ pub fn intervals_by_pseudo(intervals: &[LiveInterval]) -> HashMap<PseudoId, &Liv
 /// live-out set made the chordal pre-pass intervals x blocks.
 pub fn live_out_anywhere(live_out: &[HashSet<PseudoId>]) -> HashSet<PseudoId> {
     live_out.iter().flatten().copied().collect()
-}
-
-/// Identify Sym pseudos whose address is taken: by a `SymAddr`, or by an
-/// inline-asm memory operand that addresses the object in place, which hands
-/// the template its storage just the same.
-/// These must have stable stack addresses and cannot participate in slot reuse.
-pub fn identify_addr_taken_syms(func: &Function) -> HashSet<PseudoId> {
-    let mut addr_taken = HashSet::new();
-    for block in &func.blocks {
-        for insn in &block.insns {
-            if insn.op == Opcode::SymAddr {
-                for &src in &insn.src {
-                    addr_taken.insert(src);
-                }
-            }
-            if let Some(asm) = insn
-                .extra()
-                .asm_data
-                .as_ref()
-                .filter(|_| insn.op == Opcode::Asm)
-            {
-                for c in asm.outputs.iter().chain(asm.inputs.iter()) {
-                    if c.is_memory() {
-                        addr_taken.insert(c.pseudo);
-                    }
-                }
-            }
-        }
-    }
-    addr_taken
 }
 
 /// Identify pseudo-registers that should use floating-point registers.
@@ -1607,6 +1794,89 @@ impl AbiLowering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One block: `a` used and ended, then `b` used and ended, a parameter's
+    /// local `p` read at the end, and a `setjmp` when `returns_twice`.
+    fn two_scopes(returns_twice: bool) -> Function {
+        use crate::ir::{BasicBlock, Pseudo};
+        let types = TypeTable::new(&crate::target::Target::host());
+        let mut f = Function::new("f", types.int_id);
+        f.add_param("p", types.int_id);
+        for (id, name) in [(0, "a.0"), (1, "b.1"), (2, "p")] {
+            f.add_pseudo(Pseudo::sym(PseudoId(id), name.into()));
+            f.add_local(name, PseudoId(id), types.long_id, None, None);
+        }
+        for id in 3..7 {
+            f.add_pseudo(Pseudo::reg(PseudoId(id), id));
+        }
+        f.next_pseudo = 8;
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        if returns_twice {
+            bb.add_insn(Instruction::new(Opcode::Setjmp));
+        }
+        bb.add_insn(Instruction::load(
+            PseudoId(3),
+            PseudoId(0),
+            0,
+            types.long_id,
+            64,
+        ));
+        bb.add_insn(Instruction::lifetime_end(PseudoId(0)));
+        bb.add_insn(Instruction::load(
+            PseudoId(4),
+            PseudoId(1),
+            0,
+            types.long_id,
+            64,
+        ));
+        bb.add_insn(Instruction::lifetime_end(PseudoId(1)));
+        bb.add_insn(Instruction::load(
+            PseudoId(5),
+            PseudoId(2),
+            0,
+            types.int_id,
+            32,
+        ));
+        bb.add_insn(Instruction::ret(Some(PseudoId(5))));
+        f.add_block(bb);
+        f.entry = BasicBlockId(0);
+        f
+    }
+
+    fn lifetime_of(f: &Function, p: u32) -> (usize, usize) {
+        let r = compute_live_intervals(f, |_| None::<(Vec<()>, Vec<PseudoId>)>);
+        let i = r
+            .intervals
+            .iter()
+            .find(|i| i.pseudo == PseudoId(p))
+            .unwrap();
+        (i.start, i.end)
+    }
+
+    /// A local's interval is its lifetime: from its first mention to its
+    /// `LifetimeEnd`, so two locals whose lifetimes do not overlap can share
+    /// a slot -- and a parameter's local, which the prologue writes, is live
+    /// from entry.
+    #[test]
+    fn a_local_is_live_from_its_first_mention_to_its_end() {
+        let f = two_scopes(false);
+        let (a, b, p) = (lifetime_of(&f, 0), lifetime_of(&f, 1), lifetime_of(&f, 2));
+        assert_eq!(a, (1, 2), "a");
+        assert_eq!(b, (3, 4), "b");
+        assert!(a.1 < b.0, "disjoint: {a:?} {b:?}");
+        assert_eq!(p.0, 0, "a parameter's local from entry: {p:?}");
+    }
+
+    /// Where `setjmp` can bring control back unseen, every local spans the
+    /// whole function and nothing shares a slot.
+    #[test]
+    fn under_setjmp_every_local_spans_the_function() {
+        let f = two_scopes(true);
+        let (a, b) = (lifetime_of(&f, 0), lifetime_of(&f, 1));
+        assert_eq!(a, b);
+        assert_eq!(a.0, 0);
+    }
 
     /// With a hidden sret pointer, `Arg(0)` is that pointer and each declared
     /// parameter is one `Arg` further along; without one, `Arg(n)` is

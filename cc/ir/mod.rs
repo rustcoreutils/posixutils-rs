@@ -354,6 +354,11 @@ pub enum Opcode {
     SubC, // 64-bit sub with borrow output: target = src[0] - src[1], sets borrow
     SbcC, // 64-bit sub with borrow in+out: target = src[0] - src[1] - borrow; src[2] = borrow producer
     UMulHi, // Upper 64 bits of unsigned 64×64 multiply: target = (src[0] * src[1]) >> 64
+    /// The lifetime of the local `InsnExtra::lifetime_of` names ends here:
+    /// control falls out of the block that declared it (C17 6.2.4p6). Named
+    /// out of band, never in `src`, so no analysis counts it as a use, an
+    /// escape or a reason to keep the local. See `arch::regalloc::LocalLifetimes`.
+    LifetimeEnd,
 }
 
 impl Opcode {
@@ -541,6 +546,9 @@ impl Opcode {
                 | Opcode::AtomicFetchOr
                 | Opcode::AtomicFetchXor
                 | Opcode::Fence
+                // Not an effect of the program's, but a fact the allocator
+                // reads, which deleting would lose.
+                | Opcode::LifetimeEnd
         )
     }
 
@@ -688,6 +696,7 @@ impl Opcode {
             Opcode::SubC => "subc",
             Opcode::SbcC => "sbcc",
             Opcode::UMulHi => "umulhi",
+            Opcode::LifetimeEnd => "lifetime.end",
         }
     }
 }
@@ -1123,6 +1132,8 @@ pub struct InsnExtra {
     pub abi_info: Option<Box<CallAbiInfo>>,
     /// For atomic operations: memory ordering constraint
     pub memory_order: MemoryOrder,
+    /// For `LifetimeEnd`: the local whose lifetime ends.
+    pub lifetime_of: Option<PseudoId>,
 }
 
 /// What an instruction with no extra fields answers: every one empty.
@@ -1140,6 +1151,7 @@ static NO_EXTRA: InsnExtra = InsnExtra {
     asm_data: None,
     abi_info: None,
     memory_order: MemoryOrder::Relaxed,
+    lifetime_of: None,
 };
 
 impl Default for Instruction {
@@ -1480,6 +1492,13 @@ impl Instruction {
     }
 
     /// Create a conditional branch
+    /// The end of `local`'s lifetime: see [`Opcode::LifetimeEnd`].
+    pub fn lifetime_end(local: PseudoId) -> Self {
+        let mut insn = Self::new(Opcode::LifetimeEnd);
+        insn.extra_mut().lifetime_of = Some(local);
+        insn
+    }
+
     pub fn cbr(cond: PseudoId, bb_true: BasicBlockId, bb_false: BasicBlockId) -> Self {
         Self::new(Opcode::Cbr)
             .with_src(cond)
@@ -1959,6 +1978,11 @@ impl fmt::Display for InstructionDisplay<'_> {
                         write!(f, ",")?;
                     }
                     write!(f, " {} ({})", ctx.pseudo(*pseudo), bb)?;
+                }
+            }
+            Opcode::LifetimeEnd => {
+                if let Some(local) = this.extra().lifetime_of {
+                    write!(f, " {}", ctx.pseudo(local))?;
                 }
             }
             Opcode::PhiSource => {

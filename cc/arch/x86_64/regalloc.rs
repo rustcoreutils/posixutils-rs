@@ -42,8 +42,8 @@ use super::x87::{is_x87_float_to_int, uses_x87_scratch};
 use crate::arch::asm_constraints::OperandConstraint;
 use crate::arch::lir::FpSize;
 use crate::arch::regalloc::{
-    compute_live_intervals, find_call_positions, identify_addr_taken_syms, identify_fp_pseudos,
-    interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
+    compute_live_intervals, find_call_positions, identify_fp_pseudos, interval_crosses_call,
+    ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
 };
 use crate::float::FloatVal;
 use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
@@ -829,8 +829,6 @@ pub struct RegAlloc {
     active_stack: Vec<crate::arch::regalloc::ActiveSlot>,
     /// Free stack slots keyed by size, available for reuse
     free_stack_slots: BTreeMap<i32, Vec<FreeSlot>>,
-    /// Sym pseudos whose address is taken (cannot participate in slot reuse)
-    addr_taken_syms: HashSet<PseudoId>,
     /// Per-block live-in sets for interference-based stack coloring
     live_in: Vec<HashSet<PseudoId>>,
     /// Per-block live-out sets for interference-based stack coloring
@@ -1116,7 +1114,6 @@ impl RegAlloc {
             spilled_xmm_args: Vec::new(),
             active_stack: Vec::new(),
             free_stack_slots: BTreeMap::new(),
-            addr_taken_syms: HashSet::new(),
             live_in: Vec::new(),
             live_out: Vec::new(),
             max_local_align: 8,
@@ -1150,7 +1147,6 @@ impl RegAlloc {
         self.identify_quad_pseudos(func, types);
         // Identify 128-bit integer pseudos (always spill to 16-byte stack slots)
         self.identify_int128_pseudos(func, types);
-        self.addr_taken_syms = identify_addr_taken_syms(func);
         self.allocate_arguments(func, types);
 
         let result = self.compute_live_intervals(func);
@@ -1171,9 +1167,9 @@ impl RegAlloc {
             )
         });
         self.allocate_alloca_to_stack(func);
+        self.place_locals(func, types, &intervals);
         self.run_chordal_color(
             func,
-            types,
             intervals,
             &call_positions,
             &fp_call_positions,
@@ -1219,7 +1215,6 @@ impl RegAlloc {
         self.spilled_xmm_args.clear();
         self.active_stack.clear();
         self.free_stack_slots.clear();
-        self.addr_taken_syms.clear();
         self.live_in.clear();
         self.live_out.clear();
         self.max_local_align = 8;
@@ -1930,6 +1925,35 @@ impl RegAlloc {
     /// Only short-lived spills (no register available, not crossing calls/loops)
     /// should set `reusable=true`. Call-crossing and in-loop spills have
     /// unreliable interval estimates in complex control flow (e.g., computed gotos).
+    /// A fresh frame slot of `size` bytes at `alignment`, shared with nothing.
+    fn new_frame_slot(&mut self, size: i32, alignment: i32) -> i32 {
+        if alignment > self.max_local_align {
+            self.max_local_align = alignment;
+        }
+        let frame_align = self.frame_align();
+        crate::arch::regalloc::grow_frame(
+            &mut self.stack_offset,
+            size,
+            alignment,
+            frame_align,
+            self.func_pos,
+        )
+    }
+
+    /// Give every local its frame slot; see `arch::regalloc::place_locals`.
+    fn place_locals(&mut self, func: &Function, types: &TypeTable, intervals: &[LiveInterval]) {
+        let pos = self.func_pos;
+        let placed = crate::arch::regalloc::place_locals(func, types, pos, intervals, |b, a| {
+            self.new_frame_slot(b, a)
+        });
+        for (local, offset) in placed {
+            self.locations.insert(local, Loc::Stack(offset));
+            if func.local_of(local).is_some_and(|l| types.is_float(l.typ)) {
+                self.fp_pseudos.insert(local);
+            }
+        }
+    }
+
     fn alloc_stack_slot(
         &mut self,
         interval: &LiveInterval,
@@ -1937,10 +1961,8 @@ impl RegAlloc {
         alignment: i32,
         reusable: bool,
     ) {
-        // Track maximum alignment for dynamic stack alignment
-        if alignment > self.max_local_align {
-            self.max_local_align = alignment;
-        }
+        // A reused slot was counted toward the frame's alignment when it was
+        // made; a new one is counted by `new_frame_slot`.
         if reusable {
             if let Some((reused, past)) = self.try_reuse_stack_slot(size, alignment, interval) {
                 self.locations.insert(interval.pseudo, Loc::Stack(reused));
@@ -1953,14 +1975,7 @@ impl RegAlloc {
                 return;
             }
         }
-        let frame_align = self.frame_align();
-        let offset = crate::arch::regalloc::grow_frame(
-            &mut self.stack_offset,
-            size,
-            alignment,
-            frame_align,
-            self.func_pos,
-        );
+        let offset = self.new_frame_slot(size, alignment);
         self.locations.insert(interval.pseudo, Loc::Stack(offset));
         if reusable {
             self.active_stack.push(crate::arch::regalloc::ActiveSlot {
@@ -1992,7 +2007,6 @@ impl RegAlloc {
     fn run_chordal_color(
         &mut self,
         func: &Function,
-        types: &TypeTable,
         intervals: Vec<LiveInterval>,
         call_positions: &[usize],
         fp_call_positions: &[usize],
@@ -2053,41 +2067,10 @@ impl RegAlloc {
                         // block-scope `extern` carries the same bare name as a
                         // parameter, and answering by name gave the global the
                         // parameter's slot instead of `Loc::Global`.
-                        if let Some(local_var) = func.local_of(interval.pseudo) {
-                            let size = crate::abi::slot_bytes(
-                                types.size_bytes(local_var.typ),
-                                self.func_pos,
-                                "an automatic object",
-                            );
-                            let size = size.max(8);
-                            let natural_align = types.alignment(local_var.typ) as i32;
-                            let alignment = if let Some(explicit) = local_var.explicit_align {
-                                explicit as i32
-                            } else {
-                                natural_align.max(8)
-                            };
-                            // Sym slot reuse disabled. The IR-level
-                            // interval of a Sym pseudo only captures
-                            // its direct Store/Load/SymAddr uses,
-                            // not the lifetime of register pseudos
-                            //
-                            // Future fix: extend the Sym's interval
-                            // to cover all derived register pseudos'
-                            // lifetimes. Until then, Sym slots are
-                            // permanent. The `addr_taken_syms`
-                            // computation stays in place — it remains
-                            // the correct gating predicate when slot
-                            // reuse is re-enabled.
-                            let _ = self.addr_taken_syms.contains(&interval.pseudo);
-                            let reusable = false;
-                            self.alloc_stack_slot(interval, size, alignment, reusable);
-                            if types.is_float(local_var.typ) {
-                                self.fp_pseudos.insert(interval.pseudo);
-                            }
-                        } else {
-                            self.locations
-                                .insert(interval.pseudo, Loc::Global(name.clone()));
-                        }
+                        // A local has its slot already: `place_locals`.
+                        debug_assert!(func.local_of(interval.pseudo).is_none());
+                        self.locations
+                            .insert(interval.pseudo, Loc::Global(name.clone()));
                         continue;
                     }
                     _ => {}

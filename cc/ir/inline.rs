@@ -101,7 +101,8 @@ fn insn_cost(insn: &Instruction) -> usize {
         | Opcode::Phi
         | Opcode::PhiSource
         | Opcode::Copy
-        | Opcode::SetVal => 0,
+        | Opcode::SetVal
+        | Opcode::LifetimeEnd => 0,
         _ => 1,
     }
 }
@@ -944,6 +945,16 @@ fn clone_instruction(
                 .iter()
                 .map(|(bb, pseudo)| (ctx.remap_bb(*bb), ctx.remap_pseudo(*pseudo, callee_func)))
                 .collect();
+            vec![new_insn]
+        }
+
+        // The local it names is the callee's, cloned under a new pseudo.
+        Opcode::LifetimeEnd => {
+            let mut new_insn = insn.clone();
+            new_insn.extra_mut().lifetime_of = insn
+                .extra()
+                .lifetime_of
+                .map(|l| ctx.remap_pseudo(l, callee_func));
             vec![new_insn]
         }
 

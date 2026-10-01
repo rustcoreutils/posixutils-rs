@@ -782,6 +782,7 @@ impl<'a> Linearizer<'a> {
     /// own unwinding and terminated the block.
     pub(crate) fn pop_scope(&mut self, scope: Scope) {
         self.close_vla_scope(&scope);
+        self.end_lifetimes();
         if let Some(entries) = self.local_scope_stack.pop() {
             for (sym, prev) in entries.into_iter().rev() {
                 match prev {
@@ -793,6 +794,39 @@ impl<'a> Linearizer<'a> {
                     }
                 }
             }
+        }
+    }
+
+    /// Mark the end of the lifetime of every local the innermost scope
+    /// declared, on the path that falls out of it.
+    ///
+    /// Only that path: a `break`, `goto` or `return` that leaves the scope
+    /// has terminated its block, and an object whose end is not marked on
+    /// some path just stays live longer there. That is the safe direction --
+    /// the allocator may then share its slot less, never more.
+    ///
+    /// Not for the function's own scope, the outermost: what it declares
+    /// lives until a return, and it is closed only after SSA has run.
+    fn end_lifetimes(&mut self) {
+        if self.local_scope_stack.len() < 2 || self.is_terminated() || self.current_bb.is_none() {
+            return;
+        }
+        let Some(entries) = self.local_scope_stack.last() else {
+            return;
+        };
+        // A block-scope `static` or `extern` is in scope here too, and names
+        // a global: only a frame slot has a lifetime to end.
+        let Some(func) = self.current_func.as_ref() else {
+            return;
+        };
+        let ending: Vec<PseudoId> = entries
+            .iter()
+            .filter_map(|(sym, _)| self.locals.get(sym))
+            .map(|info| info.sym)
+            .filter(|&p| func.local_of(p).is_some())
+            .collect();
+        for local in ending {
+            self.emit(Instruction::lifetime_end(local));
         }
     }
 

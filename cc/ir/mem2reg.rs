@@ -14,7 +14,7 @@
 // still referenced by a surviving Load/Store or SymAddr, so the retain
 // check leaves them in place.
 
-use super::{Function, PseudoId};
+use super::{Function, Opcode, PseudoId};
 use std::collections::HashSet;
 
 /// Drop `func.locals` entries whose `Sym` pseudo has no remaining
@@ -66,6 +66,19 @@ pub fn mem2reg(func: &mut Function) {
     // find no copy to make either.
     func.implicit_param_copies
         .retain(|c| !dropped.contains(&c.local_sym));
+
+    // So does the end of its lifetime: a marker names its local out of band,
+    // which is why it never kept one alive.
+    for insn in func.blocks.iter_mut().flat_map(|b| &mut b.insns) {
+        if insn.op == Opcode::LifetimeEnd
+            && insn
+                .extra()
+                .lifetime_of
+                .is_some_and(|l| dropped.contains(&l))
+        {
+            insn.kill();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -156,5 +169,36 @@ mod tests {
             .map(|c| c.local_sym)
             .collect();
         assert_eq!(kept, vec![PseudoId(1)]);
+    }
+    /// A dropped local takes the markers of its lifetime with it; a kept
+    /// one keeps its own.
+    #[test]
+    fn a_dropped_local_loses_its_lifetime_marker() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = Function::new("f", types.void_id);
+        for (id, name) in [(0, "gone.0"), (1, "kept.1")] {
+            func.add_pseudo(Pseudo::sym(PseudoId(id), name.into()));
+            func.add_local(name, PseudoId(id), types.int_id, None, None);
+        }
+        func.add_pseudo(Pseudo::reg(PseudoId(2), 2));
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        bb.add_insn(Instruction::load(
+            PseudoId(2),
+            PseudoId(1),
+            0,
+            types.int_id,
+            32,
+        ));
+        bb.add_insn(Instruction::lifetime_end(PseudoId(0)));
+        bb.add_insn(Instruction::lifetime_end(PseudoId(1)));
+        bb.add_insn(Instruction::ret(None));
+        func.blocks.push(bb);
+        func.entry = BasicBlockId(0);
+
+        mem2reg(&mut func);
+        let ops: Vec<Opcode> = func.blocks[0].insns.iter().map(|i| i.op).collect();
+        assert_eq!(ops[2], Opcode::Nop, "the dropped local's marker goes");
+        assert_eq!(ops[3], Opcode::LifetimeEnd, "the kept one stays");
     }
 }

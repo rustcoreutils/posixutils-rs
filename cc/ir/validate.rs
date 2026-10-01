@@ -64,6 +64,12 @@
 //        (`Instruction::operand_type`). Built without them, a backend would
 //        compare at the result's width.
 //
+//   I11 — A LIFETIME MARKER NAMES A LOCAL OF ITS OWN FUNCTION
+//        `LifetimeEnd` names its local out of band, where no pass that
+//        rewrites operands looks. A local dropped or renamed without its
+//        markers would leave the allocator ending the lifetime of nothing,
+//        or of another function's object.
+//
 //   I8 — THE CFG CACHE AGREES WITH THE INSTRUCTIONS
 //        Every block ends in exactly one terminator; `children` is exactly the
 //        successors its instructions name (`BasicBlock::named_successors`, or
@@ -153,6 +159,12 @@ pub enum ValidationError {
         block: usize,
         index: usize,
         opcode: Opcode,
+    },
+    /// I11 violation: a `LifetimeEnd` naming no local of this function.
+    StrayLifetimeEnd {
+        function: String,
+        block: usize,
+        index: usize,
     },
     /// I7 violation: `get_pseudo` does not find this pseudo at its own
     /// position in `pseudos`.
@@ -250,6 +262,15 @@ impl fmt::Display for ValidationError {
                 f,
                 "[ir-validate I10] in function `{function}`: bb={block} insn={index} \
                  op={opcode:?} records no operand type or width"
+            ),
+            ValidationError::StrayLifetimeEnd {
+                function,
+                block,
+                index,
+            } => write!(
+                f,
+                "[ir-validate I11] in function `{function}`: bb={block} insn={index} \
+                 ends the lifetime of no local of this function"
             ),
             ValidationError::StalePseudoIndex { function, pseudo } => write!(
                 f,
@@ -376,6 +397,7 @@ pub fn validate_function_at(func: &Function, stage: Stage) -> Result<(), Vec<Val
     check_pseudo_index(func, &mut errors);
     check_cfg(func, &mut errors);
     check_operand_types(func, &mut errors);
+    check_lifetime_markers(func, &mut errors);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -540,6 +562,28 @@ fn check_operand_types(func: &Function, out: &mut Vec<ValidationError>) {
                     block,
                     index,
                     opcode: insn.op,
+                });
+            }
+        }
+    }
+}
+
+/// I11 -- a lifetime marker names a local of its own function.
+fn check_lifetime_markers(func: &Function, out: &mut Vec<ValidationError>) {
+    for (block, bb) in func.blocks.iter().enumerate() {
+        for (index, insn) in bb.insns.iter().enumerate() {
+            if insn.op != Opcode::LifetimeEnd {
+                continue;
+            }
+            let names_a_local = insn
+                .extra()
+                .lifetime_of
+                .is_some_and(|l| func.local_of(l).is_some());
+            if !names_a_local {
+                out.push(ValidationError::StrayLifetimeEnd {
+                    function: func.name.clone(),
+                    block,
+                    index,
                 });
             }
         }
@@ -1069,6 +1113,30 @@ mod tests {
 
     /// A diamond: 0 branches to 1 and 2, both of which reach 3, where one phi
     /// merges what each arm supplies. Every edge recorded both ways.
+    /// I11: a lifetime marker must name one of the function's own locals.
+    #[test]
+    fn i11_rejects_a_lifetime_end_of_no_local() {
+        let types = crate::types::TypeTable::new(&crate::target::Target::host());
+        let mut f = Function::new("f", types.void_id);
+        f.add_pseudo(crate::ir::Pseudo::sym(PseudoId(0), "x.0".into()));
+        f.add_local("x.0", PseudoId(0), types.int_id, None, None);
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        bb.add_insn(Instruction::lifetime_end(PseudoId(0)));
+        bb.add_insn(Instruction::lifetime_end(PseudoId(7)));
+        bb.add_insn(Instruction::ret(None));
+        f.add_block(bb);
+        f.entry = BasicBlockId(0);
+        let errors = validate_function(&f).unwrap_err();
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ValidationError::StrayLifetimeEnd { index: 2, .. }]
+            ),
+            "{errors:?}"
+        );
+    }
+
     fn diamond() -> Function {
         let types = TypeTable::new(&Target::host());
         let int = types.int_id;

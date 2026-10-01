@@ -13,14 +13,69 @@ use crate::arch::aarch64::codegen::Aarch64CodeGen;
 use crate::arch::aarch64::lir::{Aarch64Inst, DmbOption, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{Loc, Reg};
 use crate::arch::lir::{CondCode, Directive, FpSize, OperandSize};
-use crate::ir::Instruction;
+use crate::ir::{Instruction, MemoryOrder, Opcode};
 
-/// Helper enum for atomic bitwise operations
+/// How an atomic access is ordered on AArch64 without LSE: which of its
+/// halves carry the acquire and the release.
+///
+/// This is the one mapping from a memory order to instructions, and it is
+/// gcc's (`-mno-outline-atomics`): an acquiring order makes the load an
+/// acquire (`ldar`, `ldaxr`) and a releasing one makes the store a release
+/// (`stlr`, `stlxr`); relaxed is the plain `ldr`, `str`, `ldxr`, `stxr`.
+/// Seq-cst needs nothing beyond acq-rel, because ARMv8 never lets a
+/// load-acquire pass an earlier store-release.
 #[derive(Clone, Copy)]
-enum AtomicBitOp {
+struct Ordering {
+    acquire: bool,
+    release: bool,
+}
+
+impl Ordering {
+    fn of(order: MemoryOrder) -> Self {
+        Self {
+            acquire: order.acquires(),
+            release: order.releases(),
+        }
+    }
+}
+
+/// The barrier a thread fence at `order` needs, as gcc picks it: `dmb
+/// ishld` orders only earlier loads, which is all an acquire fence needs.
+/// A release fence must order earlier loads *and* stores before later
+/// stores, which `dmb ishst` (stores only) does not do, so it is a full
+/// `dmb ish`.
+fn fence_barrier(order: MemoryOrder) -> Option<DmbOption> {
+    match order {
+        MemoryOrder::Relaxed => None,
+        MemoryOrder::Consume | MemoryOrder::Acquire => Some(DmbOption::Ishld),
+        MemoryOrder::Release | MemoryOrder::AcqRel | MemoryOrder::SeqCst => Some(DmbOption::Ish),
+    }
+}
+
+/// What a read-modify-write stores, computed from the old value in X11 and
+/// the operand in X9.
+#[derive(Clone, Copy)]
+enum RmwOp {
+    Swap,
+    Add,
+    Sub,
     And,
     Or,
     Xor,
+}
+
+impl RmwOp {
+    fn of(op: Opcode) -> Self {
+        match op {
+            Opcode::AtomicSwap => Self::Swap,
+            Opcode::AtomicFetchAdd => Self::Add,
+            Opcode::AtomicFetchSub => Self::Sub,
+            Opcode::AtomicFetchAnd => Self::And,
+            Opcode::AtomicFetchOr => Self::Or,
+            Opcode::AtomicFetchXor => Self::Xor,
+            _ => unreachable!("{op:?} is not an atomic read-modify-write"),
+        }
+    }
 }
 
 // Register discipline for this file
@@ -49,22 +104,15 @@ impl Aarch64CodeGen {
         // Load the pointer (64-bit) into a scratch register
         self.emit_mov_to_reg(addr_loc, Reg::X10, 64);
 
-        // LDAR provides acquire semantics (sufficient for SeqCst on AArch64)
-        self.push_lir(Aarch64Inst::Ldar {
-            size: op_size,
-            addr: MemAddr::Base(Reg::X10),
-            dst: Reg::X9,
+        let addr = MemAddr::Base(Reg::X10);
+        let (size, dst) = (op_size, Reg::X9);
+        self.push_lir(if Ordering::of(insn.extra().memory_order).acquire {
+            Aarch64Inst::Ldar { size, addr, dst }
+        } else {
+            Aarch64Inst::Ldr { size, addr, dst }
         });
 
-        // The instruction leaves the result in a fixed scratch register, but
-        // the allocator gave this pseudo its own location. Overwriting that
-        // made every atomic result alias the same register, so two atomic
-        // reads in one expression collapsed into one -- `x + y` on two
-        // _Atomic ints returned `y + y`. Move it where the allocator expects.
-        let dst_loc = self.get_location(target);
-        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X9) {
-            self.emit_move_to_loc(Reg::X9, &dst_loc, size.max(32));
-        }
+        self.move_atomic_result(Reg::X9, target, insn.size);
     }
 
     pub(super) fn emit_atomic_store(&mut self, insn: &Instruction) {
@@ -83,11 +131,12 @@ impl Aarch64CodeGen {
         // Load the value
         self.emit_mov_to_reg(value_loc, Reg::X9, size);
 
-        // STLR provides release semantics (sufficient for SeqCst on AArch64)
-        self.push_lir(Aarch64Inst::Stlr {
-            size: op_size,
-            src: Reg::X9,
-            addr: MemAddr::Base(Reg::X10),
+        let addr = MemAddr::Base(Reg::X10);
+        let (size, src) = (op_size, Reg::X9);
+        self.push_lir(if Ordering::of(insn.extra().memory_order).release {
+            Aarch64Inst::Stlr { size, src, addr }
+        } else {
+            Aarch64Inst::Str { size, src, addr }
         });
 
         // Atomic store has no result value
@@ -96,13 +145,16 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Emit atomic swap using LL/SC (LDAXR/STLXR loop)
-    pub(super) fn emit_atomic_swap(&mut self, insn: &Instruction) {
-        let target = insn.target.expect("atomic swap needs target");
+    /// Emit an exchange or a fetch-and-op as an LL/SC loop: load-exclusive
+    /// the old value, compute the new one, store-exclusive it, and retry
+    /// until the store succeeds. The result is the old value.
+    pub(super) fn emit_atomic_rmw(&mut self, insn: &Instruction) {
+        let target = insn.target.expect("atomic read-modify-write needs target");
         let addr = insn.src[0];
         let value = insn.src[1];
         let size = insn.size;
         let op_size = OperandSize::from_bits(size);
+        let ordering = Ordering::of(insn.extra().memory_order);
 
         let addr_loc = self.get_location(addr);
         let value_loc = self.get_location(value);
@@ -111,48 +163,93 @@ impl Aarch64CodeGen {
         // still readable when it is loaded next.
         self.emit_mov_to_reg(addr_loc, Reg::X10, 64);
 
-        // Load the new value
+        // Load the operand
         self.emit_mov_to_reg(value_loc, Reg::X9, size);
 
-        // LL/SC loop for atomic swap
-        let loop_label = self.next_unique_label("swap_loop");
-
-        // Loop label
+        let loop_label = self.next_unique_label("atomic_rmw");
         self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
             loop_label.clone(),
         )));
 
-        // LDAXR: load-acquire exclusive old value
-        self.push_lir(Aarch64Inst::Ldaxr {
+        self.push_lir(Aarch64Inst::Ldxr {
+            acquire: ordering.acquire,
             size: op_size,
             addr: MemAddr::Base(Reg::X10),
             dst: Reg::X11,
         });
 
-        // STLXR: try to store the new value; status in W8
-        self.push_lir(Aarch64Inst::Stlxr {
+        let new = self.emit_rmw_compute(RmwOp::of(insn.op), op_size);
+
+        // Try to store the new value; status in W8
+        self.push_lir(Aarch64Inst::Stxr {
+            release: ordering.release,
             size: op_size,
-            src: Reg::X9,
+            src: new,
             addr: MemAddr::Base(Reg::X10),
             status: Reg::X8,
         });
 
-        // CBNZ: Retry if store failed (status != 0)
+        // Retry if the store failed (status != 0)
         self.push_lir(Aarch64Inst::Cbnz {
             size: OperandSize::B32, // Status is always 32-bit
             src: Reg::X8,
             target: loop_label,
         });
 
-        // Result: the old value
-        // The instruction leaves the result in a fixed scratch register, but
-        // the allocator gave this pseudo its own location. Overwriting that
-        // made every atomic result alias the same register, so two atomic
-        // reads in one expression collapsed into one -- `x + y` on two
-        // _Atomic ints returned `y + y`. Move it where the allocator expects.
+        self.move_atomic_result(Reg::X11, target, size);
+    }
+
+    /// Compute the value a read-modify-write stores from the old value in
+    /// X11 and the operand in X9, returning the register holding it.
+    fn emit_rmw_compute(&mut self, op: RmwOp, size: OperandSize) -> Reg {
+        let (src1, src2, dst) = (Reg::X11, GpOperand::Reg(Reg::X9), Reg::X16);
+        self.push_lir(match op {
+            RmwOp::Swap => return Reg::X9,
+            RmwOp::Add => Aarch64Inst::Add {
+                size,
+                src1,
+                src2,
+                dst,
+            },
+            RmwOp::Sub => Aarch64Inst::Sub {
+                size,
+                src1,
+                src2,
+                dst,
+            },
+            RmwOp::And => Aarch64Inst::And {
+                size,
+                src1,
+                src2,
+                dst,
+            },
+            RmwOp::Or => Aarch64Inst::Orr {
+                size,
+                src1,
+                src2,
+                dst,
+            },
+            RmwOp::Xor => Aarch64Inst::Eor {
+                size,
+                src1,
+                src2,
+                dst,
+            },
+        });
+        dst
+    }
+
+    /// Move an atomic's result from the fixed scratch register `reg` to
+    /// where the allocator placed `target`.
+    ///
+    /// Overwriting the pseudo's location with the scratch register made
+    /// every atomic result alias the same register, so two atomic reads in
+    /// one expression collapsed into one -- `x + y` on two _Atomic ints
+    /// returned `y + y`.
+    fn move_atomic_result(&mut self, reg: Reg, target: crate::ir::PseudoId, size: u32) {
         let dst_loc = self.get_location(target);
-        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X11) {
-            self.emit_move_to_loc(Reg::X11, &dst_loc, size.max(32));
+        if !matches!(&dst_loc, Loc::Reg(r) if *r == reg) {
+            self.emit_move_to_loc(reg, &dst_loc, size.max(32));
         }
     }
 
@@ -164,6 +261,9 @@ impl Aarch64CodeGen {
         let desired = insn.src[2];
         let size = insn.size;
         let op_size = OperandSize::from_bits(size);
+        // The success and failure orders were combined into this one by the
+        // linearizer (`cas_order`); a failed attempt runs the same load.
+        let ordering = Ordering::of(insn.extra().memory_order);
 
         let addr_loc = self.get_location(addr);
         let expected_loc = self.get_location(expected_ptr);
@@ -195,8 +295,9 @@ impl Aarch64CodeGen {
             loop_label.clone(),
         )));
 
-        // LDAXR: load-acquire exclusive current value
-        self.push_lir(Aarch64Inst::Ldaxr {
+        // Load-exclusive the current value
+        self.push_lir(Aarch64Inst::Ldxr {
+            acquire: ordering.acquire,
             size: op_size,
             addr: MemAddr::Base(Reg::X10),
             dst: Reg::X16,
@@ -215,8 +316,9 @@ impl Aarch64CodeGen {
             target: fail_label.clone(),
         });
 
-        // STLXR: try to store the desired value; status in W8
-        self.push_lir(Aarch64Inst::Stlxr {
+        // Try to store the desired value; status in W8
+        self.push_lir(Aarch64Inst::Stxr {
+            release: ordering.release,
             size: op_size,
             src: Reg::X17,
             addr: MemAddr::Base(Reg::X10),
@@ -261,283 +363,12 @@ impl Aarch64CodeGen {
         // Done label
         self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(done_label)));
 
-        // The instruction leaves the result in a fixed scratch register, but
-        // the allocator gave this pseudo its own location. Overwriting that
-        // made every atomic result alias the same register, so two atomic
-        // reads in one expression collapsed into one -- `x + y` on two
-        // _Atomic ints returned `y + y`. Move it where the allocator expects.
-        let dst_loc = self.get_location(target);
-        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X16) {
-            self.emit_move_to_loc(Reg::X16, &dst_loc, size.max(32));
-        }
-    }
-
-    /// Emit atomic fetch-and-add using LL/SC
-    pub(super) fn emit_atomic_fetch_add(&mut self, insn: &Instruction) {
-        let target = insn.target.expect("atomic fetch_add needs target");
-        let addr = insn.src[0];
-        let value = insn.src[1];
-        let size = insn.size;
-        let op_size = OperandSize::from_bits(size);
-
-        let addr_loc = self.get_location(addr);
-        let value_loc = self.get_location(value);
-
-        // Load the pointer first, so a value in the same register is
-        // still readable when it is loaded next.
-        self.emit_mov_to_reg(addr_loc, Reg::X10, 64);
-
-        // Load the addend
-        self.emit_mov_to_reg(value_loc, Reg::X9, size);
-
-        // LL/SC loop for fetch_add
-        let loop_label = self.next_unique_label("fadd_loop");
-
-        // Loop label
-        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
-            loop_label.clone(),
-        )));
-
-        // LDAXR: load-acquire exclusive old value
-        self.push_lir(Aarch64Inst::Ldaxr {
-            size: op_size,
-            addr: MemAddr::Base(Reg::X10),
-            dst: Reg::X11,
-        });
-
-        // new = old + addend
-        self.push_lir(Aarch64Inst::Add {
-            size: op_size,
-            src1: Reg::X11,
-            src2: GpOperand::Reg(Reg::X9),
-            dst: Reg::X16,
-        });
-
-        // STLXR: try to store the new value; status in W8
-        self.push_lir(Aarch64Inst::Stlxr {
-            size: op_size,
-            src: Reg::X16,
-            addr: MemAddr::Base(Reg::X10),
-            status: Reg::X8,
-        });
-
-        // CBNZ: Retry if store failed
-        self.push_lir(Aarch64Inst::Cbnz {
-            size: OperandSize::B32,
-            src: Reg::X8,
-            target: loop_label,
-        });
-
-        // Result: the old value
-        // The instruction leaves the result in a fixed scratch register, but
-        // the allocator gave this pseudo its own location. Overwriting that
-        // made every atomic result alias the same register, so two atomic
-        // reads in one expression collapsed into one -- `x + y` on two
-        // _Atomic ints returned `y + y`. Move it where the allocator expects.
-        let dst_loc = self.get_location(target);
-        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X11) {
-            self.emit_move_to_loc(Reg::X11, &dst_loc, size.max(32));
-        }
-    }
-
-    /// Emit atomic fetch-and-subtract using LL/SC
-    pub(super) fn emit_atomic_fetch_sub(&mut self, insn: &Instruction) {
-        let target = insn.target.expect("atomic fetch_sub needs target");
-        let addr = insn.src[0];
-        let value = insn.src[1];
-        let size = insn.size;
-        let op_size = OperandSize::from_bits(size);
-
-        let addr_loc = self.get_location(addr);
-        let value_loc = self.get_location(value);
-
-        // Load the pointer first, so a value in the same register is
-        // still readable when it is loaded next.
-        self.emit_mov_to_reg(addr_loc, Reg::X10, 64);
-
-        // Load subtrahend value into X0
-        self.emit_mov_to_reg(value_loc, Reg::X9, size);
-
-        // LL/SC loop for fetch_sub
-        let loop_label = self.next_unique_label("fsub_loop");
-
-        // Loop label
-        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
-            loop_label.clone(),
-        )));
-
-        // LDAXR: load-acquire exclusive old value
-        self.push_lir(Aarch64Inst::Ldaxr {
-            size: op_size,
-            addr: MemAddr::Base(Reg::X10),
-            dst: Reg::X11,
-        });
-
-        // SUB: X2 = X1 (old) - X0 (subtrahend)
-        self.push_lir(Aarch64Inst::Sub {
-            size: op_size,
-            src1: Reg::X11,
-            src2: GpOperand::Reg(Reg::X9),
-            dst: Reg::X16,
-        });
-
-        // STLXR: try to store the new value; status in W8
-        self.push_lir(Aarch64Inst::Stlxr {
-            size: op_size,
-            src: Reg::X16,
-            addr: MemAddr::Base(Reg::X10),
-            status: Reg::X8,
-        });
-
-        // CBNZ: Retry if store failed
-        self.push_lir(Aarch64Inst::Cbnz {
-            size: OperandSize::B32,
-            src: Reg::X8,
-            target: loop_label,
-        });
-
-        // Result: the old value
-        // The instruction leaves the result in a fixed scratch register, but
-        // the allocator gave this pseudo its own location. Overwriting that
-        // made every atomic result alias the same register, so two atomic
-        // reads in one expression collapsed into one -- `x + y` on two
-        // _Atomic ints returned `y + y`. Move it where the allocator expects.
-        let dst_loc = self.get_location(target);
-        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X11) {
-            self.emit_move_to_loc(Reg::X11, &dst_loc, size.max(32));
-        }
-    }
-
-    /// Emit atomic fetch-and-AND using LL/SC
-    pub(super) fn emit_atomic_fetch_and(&mut self, insn: &Instruction) {
-        self.emit_atomic_fetch_bitop(insn, AtomicBitOp::And);
-    }
-
-    /// Emit atomic fetch-and-OR using LL/SC
-    pub(super) fn emit_atomic_fetch_or(&mut self, insn: &Instruction) {
-        self.emit_atomic_fetch_bitop(insn, AtomicBitOp::Or);
-    }
-
-    /// Emit atomic fetch-and-XOR using LL/SC
-    pub(super) fn emit_atomic_fetch_xor(&mut self, insn: &Instruction) {
-        self.emit_atomic_fetch_bitop(insn, AtomicBitOp::Xor);
-    }
-
-    /// Helper for atomic fetch bitwise operations (AND, OR, XOR)
-    /// Uses LL/SC loop with LDAXR/STLXR
-    fn emit_atomic_fetch_bitop(&mut self, insn: &Instruction, op: AtomicBitOp) {
-        let target = insn.target.expect("atomic fetch bitop needs target");
-        let addr = insn.src[0];
-        let value = insn.src[1];
-        let size = insn.size;
-        let op_size = OperandSize::from_bits(size);
-
-        let addr_loc = self.get_location(addr);
-        let value_loc = self.get_location(value);
-
-        // Load the pointer first, so a value in the same register is
-        // still readable when it is loaded next.
-        self.emit_mov_to_reg(addr_loc, Reg::X10, 64);
-
-        // Load operand value into X0
-        self.emit_mov_to_reg(value_loc, Reg::X9, size);
-
-        // LL/SC loop
-        let loop_label = self.next_unique_label("atomic_bitop");
-
-        // Loop label
-        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(
-            loop_label.clone(),
-        )));
-
-        // LDAXR: load-acquire exclusive old value
-        self.push_lir(Aarch64Inst::Ldaxr {
-            size: op_size,
-            addr: MemAddr::Base(Reg::X10),
-            dst: Reg::X11,
-        });
-
-        // Apply bitwise operation: X2 = X1 (old) op X0 (operand)
-        match op {
-            AtomicBitOp::And => {
-                self.push_lir(Aarch64Inst::And {
-                    size: op_size,
-                    src1: Reg::X11,
-                    src2: GpOperand::Reg(Reg::X9),
-                    dst: Reg::X16,
-                });
-            }
-            AtomicBitOp::Or => {
-                self.push_lir(Aarch64Inst::Orr {
-                    size: op_size,
-                    src1: Reg::X11,
-                    src2: GpOperand::Reg(Reg::X9),
-                    dst: Reg::X16,
-                });
-            }
-            AtomicBitOp::Xor => {
-                self.push_lir(Aarch64Inst::Eor {
-                    size: op_size,
-                    src1: Reg::X11,
-                    src2: GpOperand::Reg(Reg::X9),
-                    dst: Reg::X16,
-                });
-            }
-        }
-
-        // STLXR: try to store the new value; status in W8
-        self.push_lir(Aarch64Inst::Stlxr {
-            size: op_size,
-            src: Reg::X16,
-            addr: MemAddr::Base(Reg::X10),
-            status: Reg::X8,
-        });
-
-        // CBNZ: Retry if store failed
-        self.push_lir(Aarch64Inst::Cbnz {
-            size: OperandSize::B32,
-            src: Reg::X8,
-            target: loop_label,
-        });
-
-        // Result: the old value
-        // The instruction leaves the result in a fixed scratch register, but
-        // the allocator gave this pseudo its own location. Overwriting that
-        // made every atomic result alias the same register, so two atomic
-        // reads in one expression collapsed into one -- `x + y` on two
-        // _Atomic ints returned `y + y`. Move it where the allocator expects.
-        let dst_loc = self.get_location(target);
-        if !matches!(&dst_loc, Loc::Reg(r) if *r == Reg::X11) {
-            self.emit_move_to_loc(Reg::X11, &dst_loc, size.max(32));
-        }
+        self.move_atomic_result(Reg::X16, target, size);
     }
 
     pub(super) fn emit_fence(&mut self, insn: &Instruction) {
-        use crate::ir::MemoryOrder;
-
-        // Emit appropriate fence based on memory ordering
-        match insn.extra().memory_order {
-            MemoryOrder::SeqCst | MemoryOrder::AcqRel => {
-                // Full barrier
-                self.push_lir(Aarch64Inst::Dmb {
-                    option: DmbOption::Ish,
-                });
-            }
-            MemoryOrder::Acquire | MemoryOrder::Consume => {
-                // Load barrier
-                self.push_lir(Aarch64Inst::Dmb {
-                    option: DmbOption::Ishld,
-                });
-            }
-            MemoryOrder::Release => {
-                // Store barrier
-                self.push_lir(Aarch64Inst::Dmb {
-                    option: DmbOption::Ishst,
-                });
-            }
-            MemoryOrder::Relaxed => {
-                // No fence needed for relaxed
-            }
+        if let Some(option) = fence_barrier(insn.extra().memory_order) {
+            self.push_lir(Aarch64Inst::Dmb { option });
         }
 
         // Fence has no result value, but set target to 0 if present

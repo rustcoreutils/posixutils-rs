@@ -134,22 +134,6 @@ What it takes:
 
 ---
 
-### An `__atomic_*` read-modify-write ignores its memory order
-
-`__atomic_fetch_add` and its eleven siblings lower through `emit_atomic_rmw`
-(`ir/linearize_atomic.rs`), which an `_Atomic` compound assignment also uses
-and which is sequentially consistent by C17 6.5.16.2p3. The `order` argument
-is evaluated and then dropped, so `__atomic_fetch_add(p, v, __ATOMIC_RELAXED)`
-gets a seq-cst operation -- never wrong, and slower than asked for. The load,
-store, exchange and compare-exchange forms carry their order into the
-instruction.
-
-Done is `emit_atomic_rmw` and its CAS loop (`emit_atomic_cas_loop`) taking an
-order, the `_Atomic`-operator callers passing seq-cst, and the aarch64 LL/SC
-loop picking its acquire/release variants from it.
-
----
-
 ## Conformance
 
 ### `restrict` on a non-pointer is accepted

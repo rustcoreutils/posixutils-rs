@@ -18,7 +18,7 @@ use super::{
 use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::diag::{get_all_stream_names, Position};
 use crate::float::FloatVal;
-use crate::ir::linearize_atomic::AtomicLvalue;
+use crate::ir::linearize_atomic::{AtomicLvalue, OrderedAccess};
 use crate::ir::linearize_emit::CompoundAssign;
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef,
@@ -5825,11 +5825,10 @@ impl<'a> Linearizer<'a> {
             // so there is no common type left to compute at.
             (self.emit_convert(raw, value_typ, elem_typ), elem_typ)
         };
-        // The order argument is accepted and evaluated, as gcc evaluates it,
-        // but every lowering here is sequentially consistent: `emit_atomic_rmw`
-        // and its CAS loop are, and answering a weaker order with a stronger
-        // one is always correct.
+        // Evaluated for its side effects, as gcc evaluates it; what it asks
+        // for is read from the expression itself.
         let _ = self.linearize_expr(order);
+        let memory_order = self.atomic_order(order, OrderedAccess::ReadModifyWrite);
 
         let lv = AtomicLvalue {
             addr,
@@ -5854,7 +5853,7 @@ impl<'a> Linearizer<'a> {
             ..CompoundAssign::new(assign_op, elem_typ, operand_typ)
         };
 
-        let old = self.emit_atomic_rmw(&lv, &ca, operand);
+        let old = self.emit_atomic_rmw(&lv, &ca, operand, memory_order);
         if !returns_new {
             return old;
         }
@@ -5892,14 +5891,8 @@ impl<'a> Linearizer<'a> {
         let exp_addr = self.frame_temp_addr("__casexp", elem_typ);
         self.emit(Instruction::store(exp_val, exp_addr, 0, elem_typ, bits));
 
-        let ok = self.alloc_reg_pseudo();
-        let order = self.emit_const(MemoryOrder::SeqCst as i128, self.types.int_id);
-        let mut cas = Instruction::new(Opcode::AtomicCas).with_target(ok);
-        cas.src = vec![addr, exp_addr, des_val, order];
-        cas.typ = Some(self.types.bool_id);
-        cas.size = bits;
-        cas.extra_mut().memory_order = MemoryOrder::SeqCst;
-        self.emit(cas);
+        // `__sync_*` is sequentially consistent and has no order argument.
+        let ok = self.emit_atomic_cas(addr, exp_addr, des_val, bits, MemoryOrder::SeqCst);
 
         if !returns_old {
             return ok;
@@ -5922,7 +5915,10 @@ impl<'a> Linearizer<'a> {
         // `atomic_init` carries no order argument: it is a non-atomic store,
         // so it is emitted as a relaxed one.
         let (order_val, memory_order) = match order {
-            Some(o) => (self.linearize_expr(o), self.eval_memory_order(o)),
+            Some(o) => (
+                self.linearize_expr(o),
+                self.atomic_order(o, OrderedAccess::of(op)),
+            ),
             None => (
                 self.emit_const(MemoryOrder::Relaxed as i128, self.types.int_id),
                 MemoryOrder::Relaxed,
@@ -5970,36 +5966,29 @@ impl<'a> Linearizer<'a> {
                 expected,
                 desired,
                 succ_order,
+                fail_order,
             }
             | ExprKind::C11AtomicCompareExchangeWeak {
                 ptr,
                 expected,
                 desired,
                 succ_order,
+                fail_order,
             } => {
-                // Both strong and weak are implemented the same (as strong)
+                // Both are implemented as strong: a weak exchange that never
+                // fails spuriously is a conforming weak exchange.
                 let ptr_val = self.linearize_expr(ptr);
                 let expected_ptr = self.linearize_expr(expected);
                 let desired_val = self.linearize_expr(desired);
-                let order_val = self.linearize_expr(succ_order);
-                let memory_order = self.eval_memory_order(succ_order);
+                // Evaluated for their side effects; what they ask for is read
+                // from the expressions themselves.
+                let _ = self.linearize_expr(succ_order);
+                let _ = self.linearize_expr(fail_order);
+                let memory_order = self.cas_order(succ_order, fail_order);
                 let ptr_type = self.expr_type(ptr);
                 let elem_type = self.types.base_type(ptr_type).unwrap_or(self.types.int_id);
                 let elem_size = self.types.size_bits(elem_type);
-                let result = self.alloc_pseudo();
-
-                // For CAS, typ is bool (result), but size is the element size for codegen
-                let insn = Instruction::new(Opcode::AtomicCas)
-                    .with_target(result)
-                    .with_src(ptr_val)
-                    .with_src(expected_ptr)
-                    .with_src(desired_val)
-                    .with_src(order_val)
-                    .with_type(self.types.bool_id)
-                    .with_size(elem_size)
-                    .with_memory_order(memory_order);
-                self.emit(insn);
-                result
+                self.emit_atomic_cas(ptr_val, expected_ptr, desired_val, elem_size, memory_order)
             }
 
             ExprKind::GnuAtomicRmw {
@@ -6039,7 +6028,7 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::C11AtomicThreadFence { order } => {
                 let order_val = self.linearize_expr(order);
-                let memory_order = self.eval_memory_order(order);
+                let memory_order = self.atomic_order(order, OrderedAccess::Fence);
                 let result = self.alloc_pseudo();
 
                 let insn = Instruction::new(Opcode::Fence)
@@ -6055,7 +6044,7 @@ impl<'a> Linearizer<'a> {
                 // Signal fence is a compiler barrier only (no memory fence instruction)
                 // For now, treat it the same as thread fence
                 let order_val = self.linearize_expr(order);
-                let memory_order = self.eval_memory_order(order);
+                let memory_order = self.atomic_order(order, OrderedAccess::Fence);
                 let result = self.alloc_pseudo();
 
                 let insn = Instruction::new(Opcode::Fence)
@@ -6797,26 +6786,6 @@ impl<'a> Linearizer<'a> {
             }
         }
     }
-
-    /// Evaluate a memory order expression to a MemoryOrder enum value.
-    /// If the expression is not a constant or out of range, defaults to SeqCst.
-    pub(crate) fn eval_memory_order(&self, expr: &Expr) -> MemoryOrder {
-        // Try to evaluate as a constant integer
-        if let ExprKind::IntLit(val) = &expr.kind {
-            match *val {
-                0 => MemoryOrder::Relaxed,
-                1 => MemoryOrder::Consume,
-                2 => MemoryOrder::Acquire,
-                3 => MemoryOrder::Release,
-                4 => MemoryOrder::AcqRel,
-                5 => MemoryOrder::SeqCst,
-                _ => MemoryOrder::SeqCst, // Invalid, use strongest ordering
-            }
-        } else {
-            // Non-constant order expression - use SeqCst for safety
-            MemoryOrder::SeqCst
-        }
-    }
 }
 
 // Public API
@@ -6855,4 +6824,4 @@ pub fn linearize(
 // Additional tests in separate file to keep this file manageable
 #[cfg(test)]
 #[path = "test_linearize.rs"]
-mod test_linearize;
+pub(crate) mod test_linearize;

@@ -13,7 +13,7 @@ use crate::arch::lir::{CondCode, Directive, Label, OperandSize, Symbol};
 use crate::arch::x86_64::codegen::X86_64CodeGen;
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst};
 use crate::arch::x86_64::regalloc::{Loc, Reg};
-use crate::ir::Instruction;
+use crate::ir::{Instruction, MemoryOrder};
 use crate::types::TypeTable;
 
 /// Helper enum for atomic bitwise operations
@@ -22,6 +22,18 @@ enum AtomicBitOp {
     And,
     Or,
     Xor,
+}
+
+/// The one mapping from a memory order to instructions on x86-64, which is
+/// gcc's.
+///
+/// x86-64 is TSO: the only reordering it allows is a later load passing an
+/// earlier store, and only seq-cst forbids that. So seq-cst is the one order
+/// that costs anything -- `xchg` for a store, `mfence` for a fence -- while
+/// every load is a plain `mov` and every read-modify-write a `lock`ed
+/// instruction, which is a full barrier at any order.
+fn orders_store_then_load(order: MemoryOrder) -> bool {
+    order == MemoryOrder::SeqCst
 }
 
 impl X86_64CodeGen {
@@ -36,8 +48,6 @@ impl X86_64CodeGen {
     /// Emit atomic store
     /// On x86-64, aligned stores are atomic. For SeqCst, use XCHG for full barrier.
     pub(super) fn emit_atomic_store(&mut self, insn: &Instruction, types: &TypeTable) {
-        use crate::ir::MemoryOrder;
-
         let target = insn.target.expect("atomic store needs target");
         let addr = insn.src[0];
         let value = insn.src[1];
@@ -48,9 +58,9 @@ impl X86_64CodeGen {
         let size = insn.size.max(32);
         let op_size = OperandSize::from_bits(mem_size);
 
-        // For SeqCst, use XCHG which provides full barrier
-        // For weaker orderings, regular store + optional SFENCE is sufficient
-        if insn.extra().memory_order == MemoryOrder::SeqCst {
+        // XCHG is a store with a full barrier; anything weaker is a plain
+        // store, which already has release semantics on x86.
+        if orders_store_then_load(insn.extra().memory_order) {
             // Load value into a register
             let value_loc = self.get_location(value);
             let addr_loc = self.get_location(addr);
@@ -570,26 +580,12 @@ impl X86_64CodeGen {
     }
 
     pub(super) fn emit_fence(&mut self, insn: &Instruction) {
-        use crate::ir::MemoryOrder;
-
         let target = insn.target.expect("fence needs target");
 
-        // Emit appropriate fence based on memory ordering
-        match insn.extra().memory_order {
-            MemoryOrder::SeqCst | MemoryOrder::AcqRel => {
-                self.push_lir(X86Inst::Mfence);
-            }
-            MemoryOrder::Acquire | MemoryOrder::Consume => {
-                // LFENCE - but x86 loads have acquire semantics anyway
-                self.push_lir(X86Inst::Lfence);
-            }
-            MemoryOrder::Release => {
-                // SFENCE - but x86 stores have release semantics anyway
-                self.push_lir(X86Inst::Sfence);
-            }
-            MemoryOrder::Relaxed => {
-                // No fence needed for relaxed
-            }
+        // An acquire, release or acq-rel fence needs no instruction: x86
+        // already keeps loads and stores in every order but store-then-load.
+        if orders_store_then_load(insn.extra().memory_order) {
+            self.push_lir(X86Inst::Mfence);
         }
 
         self.locations.set(target, Loc::Imm(0));

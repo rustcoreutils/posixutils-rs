@@ -872,32 +872,17 @@ impl Aarch64CodeGen {
                 self.emit_atomic_store(insn);
             }
 
-            Opcode::AtomicSwap => {
-                self.emit_atomic_swap(insn);
-            }
-
             Opcode::AtomicCas => {
                 self.emit_atomic_cas(insn);
             }
 
-            Opcode::AtomicFetchAdd => {
-                self.emit_atomic_fetch_add(insn);
-            }
-
-            Opcode::AtomicFetchSub => {
-                self.emit_atomic_fetch_sub(insn);
-            }
-
-            Opcode::AtomicFetchAnd => {
-                self.emit_atomic_fetch_and(insn);
-            }
-
-            Opcode::AtomicFetchOr => {
-                self.emit_atomic_fetch_or(insn);
-            }
-
-            Opcode::AtomicFetchXor => {
-                self.emit_atomic_fetch_xor(insn);
+            Opcode::AtomicSwap
+            | Opcode::AtomicFetchAdd
+            | Opcode::AtomicFetchSub
+            | Opcode::AtomicFetchAnd
+            | Opcode::AtomicFetchOr
+            | Opcode::AtomicFetchXor => {
+                self.emit_atomic_rmw(insn);
             }
 
             Opcode::Fence => {

@@ -373,7 +373,7 @@ fn opcode_clobbers_r10_r11(op: Opcode) -> bool {
     // - `Phi` / `PhiSource` → lowered out by `cc/ir/lower.rs`
     //   before codegen runs.
     // - `Unreachable` → `ud2`.
-    // - `Fence` → single `mfence`/`sfence`/`lfence`.
+    // - `Fence` → `mfence` or nothing.
     // - `VaEnd` → no-op on x86_64 SysV.
     //
     // **Entry is dirty** — the function prologue's `rep stosq`

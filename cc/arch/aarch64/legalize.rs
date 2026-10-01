@@ -161,18 +161,30 @@ pub(super) fn legalize(inst: Aarch64Inst, out: &mut Vec<Aarch64Inst>) -> Result<
             let addr = bare_addr(addr, out)?;
             out.push(Aarch64Inst::Stlr { size, src, addr });
         }
-        Aarch64Inst::Ldaxr { size, addr, dst } => {
+        Aarch64Inst::Ldxr {
+            acquire,
+            size,
+            addr,
+            dst,
+        } => {
             let addr = bare_addr(addr, out)?;
-            out.push(Aarch64Inst::Ldaxr { size, addr, dst });
+            out.push(Aarch64Inst::Ldxr {
+                acquire,
+                size,
+                addr,
+                dst,
+            });
         }
-        Aarch64Inst::Stlxr {
+        Aarch64Inst::Stxr {
+            release,
             size,
             src,
             addr,
             status,
         } => {
             let addr = bare_addr(addr, out)?;
-            out.push(Aarch64Inst::Stlxr {
+            out.push(Aarch64Inst::Stxr {
+                release,
                 size,
                 src,
                 addr,

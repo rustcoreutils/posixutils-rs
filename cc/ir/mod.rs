@@ -740,6 +740,36 @@ pub enum MemoryOrder {
     SeqCst = 5,
 }
 
+impl MemoryOrder {
+    /// The order a `__ATOMIC_*` value names, or `None` outside 0..=5.
+    pub fn from_value(value: i128) -> Option<Self> {
+        Some(match value {
+            0 => Self::Relaxed,
+            1 => Self::Consume,
+            2 => Self::Acquire,
+            3 => Self::Release,
+            4 => Self::AcqRel,
+            5 => Self::SeqCst,
+            _ => return None,
+        })
+    }
+
+    /// True when a load under this order is an acquire. `consume` is
+    /// one: no compiler tracks the dependencies it would need, and gcc
+    /// promotes it the same way.
+    pub fn acquires(self) -> bool {
+        matches!(
+            self,
+            Self::Consume | Self::Acquire | Self::AcqRel | Self::SeqCst
+        )
+    }
+
+    /// True when a store under this order is a release.
+    pub fn releases(self) -> bool {
+        matches!(self, Self::Release | Self::AcqRel | Self::SeqCst)
+    }
+}
+
 impl fmt::Display for MemoryOrder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -3587,6 +3617,21 @@ mod tests {
         assert_eq!(format!("{}", MemoryOrder::Release), "release");
         assert_eq!(format!("{}", MemoryOrder::AcqRel), "acq_rel");
         assert_eq!(format!("{}", MemoryOrder::SeqCst), "seq_cst");
+    }
+
+    #[test]
+    fn test_memory_order_halves() {
+        use MemoryOrder::*;
+        let all = [Relaxed, Consume, Acquire, Release, AcqRel, SeqCst];
+        for (value, order) in all.into_iter().enumerate() {
+            assert_eq!(MemoryOrder::from_value(value as i128), Some(order));
+        }
+        assert_eq!(MemoryOrder::from_value(6), None);
+        assert_eq!(MemoryOrder::from_value(-1), None);
+        let acquiring: Vec<_> = all.into_iter().filter(|o| o.acquires()).collect();
+        assert_eq!(acquiring, [Consume, Acquire, AcqRel, SeqCst]);
+        let releasing: Vec<_> = all.into_iter().filter(|o| o.releases()).collect();
+        assert_eq!(releasing, [Release, AcqRel, SeqCst]);
     }
 
     #[test]

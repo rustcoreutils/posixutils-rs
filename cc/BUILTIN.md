@@ -481,7 +481,7 @@ unknown. Folding it after inlining is the remaining work; see the
 | `__c11_atomic_load(ptr, order)` | `Opcode::AtomicLoad` |
 | `__c11_atomic_store(ptr, val, order)` | `Opcode::AtomicStore` |
 | `__c11_atomic_exchange(ptr, val, order)` | `Opcode::AtomicSwap`; returns the old value |
-| `__c11_atomic_compare_exchange_strong(ptr, exp, des, succ, fail)`, `_weak` | `Opcode::AtomicCas`; returns `_Bool`. `fail` is parsed and discarded; weak is implemented as strong |
+| `__c11_atomic_compare_exchange_strong(ptr, exp, des, succ, fail)`, `_weak` | `Opcode::AtomicCas`; returns `_Bool`. The two orders combine into one (Memory orders, below); weak is implemented as strong |
 | `__c11_atomic_fetch_add`, `sub`, `and`, `or`, `xor` | `Opcode::AtomicFetchAdd` etc.; return the old value |
 | `__c11_atomic_thread_fence(order)` | `Opcode::Fence` |
 | `__c11_atomic_signal_fence(order)` | The same `Opcode::Fence`: a hardware fence, stronger than the compiler barrier required |
@@ -518,22 +518,34 @@ re-applies the operation to the returned old value, so `v` is evaluated once.
 
 ### Memory orders
 
-An order argument is evaluated, and recorded on the IR instruction only when
-it is an integer literal after preprocessing (`__ATOMIC_*` and the
-`memory_order_*` enumerators both are); anything else is seq-cst
-(`eval_memory_order`). What the back ends then do with it:
+An order argument is evaluated for its side effects, and read as gcc reads
+it (`Linearizer::atomic_order`): an integer constant expression names the
+order (`__ATOMIC_*` and the `memory_order_*` enumerators both are); anything
+else is seq-cst. An order out of range, or one the operation cannot have, is
+seq-cst with gcc's `-Winvalid-memory-model` warning: a load takes relaxed,
+consume, acquire and seq-cst; a store (`__atomic_clear` included) relaxed,
+release and seq-cst; a read-modify-write and a fence any order. `_Atomic`
+operators are seq-cst (C17 6.5.16.2p3).
 
-- the GNU read-modify-write forms record seq-cst whatever was asked
-  (TODO.md);
-- fences honour it on both targets (`mfence`, `lfence`, `sfence` or nothing
-  on x86-64; `dmb ish`, `ishld`, `ishst` or nothing on aarch64);
-- x86-64 stores honour it (`xchg` for seq-cst, a plain `mov` otherwise);
-  x86-64 loads are plain loads, correct for every order;
-- aarch64 ignores it for loads (`ldar`), stores (`stlr`), exchange,
-  compare-exchange and fetch-ops (`ldaxr`/`stlxr` loops).
+A compare-exchange runs one instruction sequence for both outcomes, so its
+two orders combine into the one recorded (`Linearizer::cas_order`), by
+gcc's rules: a failure order of release or acq-rel, or one stronger than
+the success order (consume counting as acquire), makes it seq-cst, with the
+warning; a release success with an acquiring failure is acq-rel; otherwise
+the success order stands. A weak compare-exchange is implemented as strong.
 
-A stronger order than requested is always correct, so this costs speed only:
-`__atomic_load_n(p, __ATOMIC_RELAXED)` is an `ldar` on aarch64.
+Each back end maps an order to instructions in one place, matching gcc
+(aarch64 without LSE and outline atomics):
+
+| | x86-64 (`orders_store_then_load`) | aarch64 (`Ordering`, `fence_barrier`) |
+|---|---|---|
+| load | `mov` | `ldr`; `ldar` when acquiring (consume, acquire, seq-cst) |
+| store | `mov`; `xchg` for seq-cst | `str`; `stlr` when releasing (release, seq-cst) |
+| exchange, fetch-op, compare-exchange | `lock`-prefixed (or `xchg`) at every order | `ldxr`/`stxr` loop; `ldaxr` when acquiring, `stlxr` when releasing |
+| fence | nothing; `mfence` for seq-cst | nothing for relaxed; `dmb ishld` for consume, acquire; `dmb ish` otherwise |
+
+`nand`, and an operation with no native form, is a compare-exchange loop at
+the requested order, seeded by a load at the half of it a load can have.
 
 ## Not Implemented
 

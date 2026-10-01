@@ -1210,6 +1210,8 @@ pub enum ExprKind {
         desired: Box<Expr>,
         /// Memory ordering on success
         succ_order: Box<Expr>,
+        /// Memory ordering on failure
+        fail_order: Box<Expr>,
     },
 
     /// __c11_atomic_compare_exchange_weak(ptr, expected, desired, succ_order, fail_order)
@@ -1223,6 +1225,8 @@ pub enum ExprKind {
         desired: Box<Expr>,
         /// Memory ordering on success
         succ_order: Box<Expr>,
+        /// Memory ordering on failure
+        fail_order: Box<Expr>,
     },
 
     /// __c11_atomic_fetch_add(ptr, val, order)
@@ -1967,13 +1971,15 @@ impl Expr {
                 expected,
                 desired,
                 succ_order,
+                fail_order,
             }
             | K::C11AtomicCompareExchangeWeak {
                 ptr,
                 expected,
                 desired,
                 succ_order,
-            } => vec![ptr, expected, desired, succ_order],
+                fail_order,
+            } => vec![ptr, expected, desired, succ_order, fail_order],
             K::Call { func, args, .. } => std::iter::once(&**func).chain(args).collect(),
             K::Comma(exprs)
             | K::SizeofType(_, exprs)
@@ -2872,6 +2878,7 @@ mod tests {
         let expected = Expr::int(0x2000, &types);
         let desired = Expr::int(42, &types);
         let succ_order = Expr::int(5, &types);
+        let fail_order = Expr::int(2, &types);
 
         // Test strong variant
         let cas_strong = Expr::new_unpositioned(ExprKind::C11AtomicCompareExchangeStrong {
@@ -2879,6 +2886,7 @@ mod tests {
             expected: Box::new(expected.clone()),
             desired: Box::new(desired.clone()),
             succ_order: Box::new(succ_order.clone()),
+            fail_order: Box::new(fail_order.clone()),
         });
         match cas_strong.kind {
             ExprKind::C11AtomicCompareExchangeStrong {
@@ -2886,11 +2894,13 @@ mod tests {
                 expected,
                 desired,
                 succ_order,
+                fail_order,
             } => {
                 assert!(matches!(ptr.kind, ExprKind::IntLit(0x1000)));
                 assert!(matches!(expected.kind, ExprKind::IntLit(0x2000)));
                 assert!(matches!(desired.kind, ExprKind::IntLit(42)));
                 assert!(matches!(succ_order.kind, ExprKind::IntLit(5)));
+                assert!(matches!(fail_order.kind, ExprKind::IntLit(2)));
             }
             _ => panic!("Expected C11AtomicCompareExchangeStrong"),
         }
@@ -2901,6 +2911,7 @@ mod tests {
             expected: Box::new(expected),
             desired: Box::new(desired),
             succ_order: Box::new(succ_order),
+            fail_order: Box::new(fail_order),
         });
         match cas_weak.kind {
             ExprKind::C11AtomicCompareExchangeWeak {
@@ -2908,11 +2919,13 @@ mod tests {
                 expected,
                 desired,
                 succ_order,
+                fail_order,
             } => {
                 assert!(matches!(ptr.kind, ExprKind::IntLit(0x1000)));
                 assert!(matches!(expected.kind, ExprKind::IntLit(0x2000)));
                 assert!(matches!(desired.kind, ExprKind::IntLit(42)));
                 assert!(matches!(succ_order.kind, ExprKind::IntLit(5)));
+                assert!(matches!(fail_order.kind, ExprKind::IntLit(2)));
             }
             _ => panic!("Expected C11AtomicCompareExchangeWeak"),
         }

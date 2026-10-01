@@ -950,7 +950,6 @@ impl Parser<'_> {
             })()),
             crate::kw::C11_ATOMIC_COMPARE_EXCHANGE_STRONG => Some((|| {
                 // __c11_atomic_compare_exchange_strong(ptr, expected, desired, succ, fail)
-                // Note: fail_order is parsed but ignored (we use succ_order for both)
                 self.expect_special(b'(')?;
                 let ptr = self.parse_assignment_expr()?;
                 self.expect_special(b',')?;
@@ -960,7 +959,7 @@ impl Parser<'_> {
                 self.expect_special(b',')?;
                 let succ_order = self.parse_assignment_expr()?;
                 self.expect_special(b',')?;
-                let _fail_order = self.parse_assignment_expr()?;
+                let fail_order = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
                 // Returns bool (_Bool)
                 Ok(Self::typed_expr(
@@ -969,6 +968,7 @@ impl Parser<'_> {
                         expected: Box::new(expected),
                         desired: Box::new(desired),
                         succ_order: Box::new(succ_order),
+                        fail_order: Box::new(fail_order),
                     },
                     self.types.bool_id,
                     token_pos,
@@ -986,7 +986,7 @@ impl Parser<'_> {
                 self.expect_special(b',')?;
                 let succ_order = self.parse_assignment_expr()?;
                 self.expect_special(b',')?;
-                let _fail_order = self.parse_assignment_expr()?;
+                let fail_order = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
                 // Returns bool (_Bool)
                 Ok(Self::typed_expr(
@@ -995,6 +995,7 @@ impl Parser<'_> {
                         expected: Box::new(expected),
                         desired: Box::new(desired),
                         succ_order: Box::new(succ_order),
+                        fail_order: Box::new(fail_order),
                     },
                     self.types.bool_id,
                     token_pos,
@@ -1263,7 +1264,7 @@ impl Parser<'_> {
                 self.expect_special(b',')?;
                 let succ_order = self.parse_assignment_expr()?;
                 self.expect_special(b',')?;
-                let _fail_order = self.parse_assignment_expr()?;
+                let fail_order = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
                 if !self.check_atomic_object(&ptr, name_id, false) {
                     return Ok(self.diagnosed_call(self.types.int_id, token_pos));
@@ -1272,11 +1273,12 @@ impl Parser<'_> {
                 // which node is built; a weak exchange that never fails
                 // spuriously is a conforming weak exchange.
                 let is_weak = self.eval_const_expr(&weak).is_some_and(|v| v != 0);
-                let (ptr, expected, desired, succ_order) = (
+                let (ptr, expected, desired, succ_order, fail_order) = (
                     Box::new(ptr),
                     Box::new(expected),
                     Box::new(desired),
                     Box::new(succ_order),
+                    Box::new(fail_order),
                 );
                 let kind = if is_weak {
                     ExprKind::C11AtomicCompareExchangeWeak {
@@ -1284,6 +1286,7 @@ impl Parser<'_> {
                         expected,
                         desired,
                         succ_order,
+                        fail_order,
                     }
                 } else {
                     ExprKind::C11AtomicCompareExchangeStrong {
@@ -1291,6 +1294,7 @@ impl Parser<'_> {
                         expected,
                         desired,
                         succ_order,
+                        fail_order,
                     }
                 };
                 Ok(Self::typed_expr(kind, self.types.int_id, token_pos))

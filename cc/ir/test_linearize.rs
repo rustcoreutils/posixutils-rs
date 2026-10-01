@@ -7671,7 +7671,7 @@ fn test_asm_memory_operand_keeps_an_address_something_else_reads() {
 }
 
 /// Parse `src` and linearize it for `target`.
-fn linearize_source(src: &str, target: &Target) -> Module {
+pub(crate) fn linearize_source(src: &str, target: &Target) -> Module {
     linearize_source_with_types(src, target).0
 }
 

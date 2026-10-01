@@ -264,7 +264,7 @@ pub fn parse_blocksize(blocksize: u32) -> PaxResult<usize> {
             "blocksize (-b) must be a positive number of bytes".to_string(),
         ));
     }
-    if size % TAR_BLOCK_SIZE != 0 {
+    if !size.is_multiple_of(TAR_BLOCK_SIZE) {
         return Err(PaxError::InvalidFormat(format!(
             "blocksize (-b) must be a multiple of {} bytes",
             TAR_BLOCK_SIZE

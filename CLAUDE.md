@@ -8,7 +8,7 @@
 
 posixutils-rs: Rust-native POSIX utilities (cp, mv, awk, sh, cc, make, vi, etc.) targeting POSIX.2024. Goal: clean, race-free, POSIX-compliant utilities.
 
-**Rust**: 1.84.0+ | **License**: MIT | **Platforms**: Linux, macOS
+**Rust**: 1.88.0+ | **License**: MIT | **Platforms**: Linux, macOS
 
 ## Commands
 

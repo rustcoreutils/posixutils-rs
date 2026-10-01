@@ -559,7 +559,7 @@ fn narrowing(
 /// Which byte of the store `s` the one-byte access `b` is, counting from
 /// the store's lowest address; `None` unless `s` writes all of `b`.
 fn byte_index(s: &MemLoc, b: &MemLoc) -> Option<u32> {
-    if s.base != b.base || s.size % 8 != 0 {
+    if s.base != b.base || !s.size.is_multiple_of(8) {
         return None;
     }
     let (start, end) = s.byte_extent()?;

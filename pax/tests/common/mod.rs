@@ -482,11 +482,11 @@ impl CpioNewc<'_> {
         if self.namesize.is_none() {
             out.push(0);
         }
-        while out.len() % 4 != 0 {
+        while !out.len().is_multiple_of(4) {
             out.push(0);
         }
         out.extend_from_slice(self.body);
-        while out.len() % 4 != 0 {
+        while !out.len().is_multiple_of(4) {
             out.push(0);
         }
         out

@@ -228,7 +228,7 @@ impl Linearizer<'_> {
 
         let bits = self.types.size_bits(typ);
         (is_scalar || is_aggregate)
-            && bits % 8 == 0
+            && bits.is_multiple_of(8)
             && crate::target::atomic_is_lock_free(u64::from(bits / 8))
     }
 

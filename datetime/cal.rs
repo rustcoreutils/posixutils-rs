@@ -65,9 +65,9 @@ fn is_julian(year: u32, month: u32, day: u32) -> bool {
 /// Gregorian: divisible by 4, except centuries unless divisible by 400
 fn is_leap_year(year: u32, use_julian: bool) -> bool {
     if use_julian {
-        year % 4 == 0
+        year.is_multiple_of(4)
     } else {
-        year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
     }
 }
 
@@ -220,7 +220,7 @@ fn print_month(month: u32, year: u32) {
             // After day 2 (Thursday), we jump to day 14 (Saturday)
             // Day 2 is at position 4 (Thursday), day 14 should be at position 6 (Saturday)
             // So we need to advance to Saturday position
-            if current_weekday % 7 == 0 {
+            if current_weekday.is_multiple_of(7) {
                 println!();
             }
             // Add padding to move from Friday (position 5) to Saturday (position 6)
@@ -229,20 +229,20 @@ fn print_month(month: u32, year: u32) {
             while current_weekday % 7 != day14_weekday {
                 print!("   ");
                 current_weekday += 1;
-                if current_weekday % 7 == 0 {
+                if current_weekday.is_multiple_of(7) {
                     println!();
                 }
             }
             continue;
         }
 
-        if current_weekday % 7 == 0 {
+        if current_weekday.is_multiple_of(7) {
             println!();
         }
     }
 
     // Final newline if we didn't end on a Sunday
-    if current_weekday % 7 != 0 {
+    if !current_weekday.is_multiple_of(7) {
         println!();
     }
 }

@@ -7175,7 +7175,7 @@ fn diagnostics_relational_operator_rejects_a_complex_operand() {
         compile_expect_error(
             &format!("complex_relational_{name}"),
             src,
-            "a complex value has no ordering",
+            "invalid operands to binary",
         );
     }
 }

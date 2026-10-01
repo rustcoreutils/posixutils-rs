@@ -3413,6 +3413,8 @@ aarch64/compile/pr83487@-O0
 aarch64/compile/pr83487@-O2
 aarch64/compile/pr83510@-O0
 aarch64/compile/pr83510@-O2
+aarch64/compile/pr83547@-O0
+aarch64/compile/pr83547@-O2
 aarch64/compile/pr83575@-O0
 aarch64/compile/pr83575@-O2
 aarch64/compile/pr84111@-O0

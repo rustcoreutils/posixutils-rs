@@ -10,6 +10,7 @@
 //
 
 use super::ast::{AssignOp, BinaryOp, Designator, Expr, ExprKind, InitElement, UnaryOp};
+use super::operand_rule::UnaryOperator;
 use super::parser::{ParseError, ParseResult, Parser};
 use crate::diag;
 use crate::float::FloatVal;
@@ -111,8 +112,9 @@ impl<'a> Parser<'a> {
 
             // Right-to-left associativity: parse the right side as another assignment
             let right = self.parse_assignment_expr()?;
-            if assign_op == AssignOp::Assign {
-                self.check_assignment_types(&left, &right, assign_pos);
+            match assign_op.binary_op() {
+                Some(op) => self.check_compound_assignment(op, &left, &right, assign_pos),
+                None => self.check_assignment_types(&left, &right, assign_pos),
             }
             let assign_type = self.modification_result_type(&left);
             Ok(Self::typed_expr(
@@ -396,6 +398,7 @@ impl<'a> Parser<'a> {
 
         if self.is_special(b'?') {
             self.advance();
+            self.check_truth_value(&cond);
 
             // GNU `a ?: b`: the middle operand may be omitted, and then the
             // condition is also the value when it is true. Kept as its own
@@ -665,6 +668,7 @@ impl<'a> Parser<'a> {
             // Check for const modification
             self.check_modifiable_lvalue(&operand, "increment operand", op_pos);
             self.check_const_assignment(&operand, op_pos);
+            self.check_unary_operand(UnaryOperator::Increment, &operand, op_pos);
             let typ = self.modification_result_type(&operand);
             return Ok(Self::typed_expr(
                 ExprKind::Unary {
@@ -683,6 +687,7 @@ impl<'a> Parser<'a> {
             // Check for const modification
             self.check_modifiable_lvalue(&operand, "decrement operand", op_pos);
             self.check_const_assignment(&operand, op_pos);
+            self.check_unary_operand(UnaryOperator::Decrement, &operand, op_pos);
             let typ = self.modification_result_type(&operand);
             return Ok(Self::typed_expr(
                 ExprKind::Unary {
@@ -768,23 +773,24 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
-            self.check_unary_arithmetic_operand(&operand, "unary plus", op_pos);
+            let valid = self.check_unary_operand(UnaryOperator::Plus, &operand, op_pos);
             let (operand, typ) = self.promote_unary_operand(operand);
-            return Ok(Self::typed_expr(
+            let e = Self::typed_expr(
                 ExprKind::Cast {
                     cast_type: typ,
                     expr: Box::new(operand),
                 },
                 typ,
                 op_pos,
-            ));
+            );
+            return Ok(Self::typed_if(e, valid));
         }
 
         if self.is_special(b'-') && !self.is_special_token(SpecialToken::Decrement) {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
-            self.check_unary_arithmetic_operand(&operand, "unary minus", op_pos);
+            let valid = self.check_unary_operand(UnaryOperator::Minus, &operand, op_pos);
             let (operand, typ) = self.promote_unary_operand(operand);
             let width = self.unary_bitfield_width(&operand, typ);
             let mut e = Self::typed_expr(
@@ -796,13 +802,14 @@ impl<'a> Parser<'a> {
                 op_pos,
             );
             e.bitfield_bits = width;
-            return Ok(e);
+            return Ok(Self::typed_if(e, valid));
         }
 
         if self.is_special(b'~') {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
+            let valid = self.check_unary_operand(UnaryOperator::Complement, &operand, op_pos);
             let (operand, typ) = self.promote_unary_operand(operand);
             let width = self.unary_bitfield_width(&operand, typ);
             let mut e = Self::typed_expr(
@@ -814,7 +821,7 @@ impl<'a> Parser<'a> {
                 op_pos,
             );
             e.bitfield_bits = width;
-            return Ok(e);
+            return Ok(Self::typed_if(e, valid));
         }
 
         if self.is_special(b'!') {
@@ -822,15 +829,17 @@ impl<'a> Parser<'a> {
             self.advance();
             let operand = self.parse_unary_expr()?;
             self.check_not_vector_value(operand.typ, operand.pos);
+            let valid = self.check_unary_operand(UnaryOperator::Not, &operand, op_pos);
             // Logical not always produces int (0 or 1)
-            return Ok(Self::typed_expr(
+            let e = Self::typed_expr(
                 ExprKind::Unary {
                     op: UnaryOp::Not,
                     operand: Box::new(operand),
                 },
                 self.types.int_id,
                 op_pos,
-            ));
+            );
+            return Ok(Self::typed_if(e, valid));
         }
 
         // sizeof and _Alignof
@@ -1281,6 +1290,7 @@ impl<'a> Parser<'a> {
                 // Check for const modification
                 self.check_modifiable_lvalue(&expr, "increment operand", op_pos);
                 self.check_const_assignment(&expr, op_pos);
+                self.check_unary_operand(UnaryOperator::Increment, &expr, op_pos);
                 let typ = self.modification_result_type(&expr);
                 expr = Self::typed_expr(ExprKind::PostInc(Box::new(expr)), typ, base_pos);
             } else if self.is_special_token(SpecialToken::Decrement) {
@@ -1289,6 +1299,7 @@ impl<'a> Parser<'a> {
                 // Check for const modification
                 self.check_modifiable_lvalue(&expr, "decrement operand", op_pos);
                 self.check_const_assignment(&expr, op_pos);
+                self.check_unary_operand(UnaryOperator::Decrement, &expr, op_pos);
                 let typ = self.modification_result_type(&expr);
                 expr = Self::typed_expr(ExprKind::PostDec(Box::new(expr)), typ, base_pos);
             } else if self.is_special(b'[') {
@@ -1631,6 +1642,16 @@ impl<'a> Parser<'a> {
         Ok(id)
     }
 
+    /// `e` as built, or left untyped when its operands were diagnosed: an
+    /// untyped result keeps whatever encloses it from reporting the same
+    /// mistake again.
+    fn typed_if(mut e: Expr, valid: bool) -> Expr {
+        if !valid {
+            e.typ = None;
+        }
+        e
+    }
+
     /// Create a typed expression with position
     pub(crate) fn typed_expr(kind: ExprKind, typ: TypeId, pos: Position) -> Expr {
         Expr {
@@ -1643,13 +1664,7 @@ impl<'a> Parser<'a> {
 
     /// Create a typed binary expression, computing result type from operands
     fn make_binary(&mut self, op: BinaryOp, left: Expr, right: Expr) -> Expr {
-        // C17 6.5.5-6.5.14 require operands with a value. `f() + 1` where `f`
-        // returns void has none.
-        self.check_not_void(&left, left.pos);
-        self.check_not_void(&right, right.pos);
-        self.check_not_vector_value(left.typ, left.pos);
-        self.check_not_vector_value(right.typ, right.pos);
-        self.check_relational_operands(op, &left, &right);
+        let valid = self.check_binary_operands(op, &left, &right, left.pos);
 
         // A bit-field operand promotes before anything else looks at it
         // (C17 6.3.1.1p2), and that promotion is not derivable from the
@@ -1662,11 +1677,58 @@ impl<'a> Parser<'a> {
         let left = self.promote_bitfield_operand(left);
         let right = self.promote_bitfield_operand(right);
 
-        // Compute result type based on operator and operand types
         let left_type = left.typ.unwrap_or(self.types.int_id);
-        let right_type = right.typ.unwrap_or(self.types.int_id);
+        let result_type = self.binary_result_type(op, left_type, &right);
 
-        let result_type = match op {
+        // C17 6.7.2.1p10: a bit-field has a type of exactly its declared width,
+        // and 6.2.5p9 then reduces an unsigned result modulo 2^width. So
+        // `x.b << 32` with `unsigned long long b : 40` holding 0x100 is zero --
+        // every set bit shifts out of the 40-bit type.
+        //
+        // Which operators carry the width, and from where:
+        //   - the arithmetic and bitwise ones take the wider operand's width;
+        //   - a shift takes the **left** operand's alone (6.5.7p3 -- the right
+        //     operand's type never reaches the result);
+        //   - a comparison or a logical operator yields `int` and carries
+        //     nothing, which falls out of not asking.
+        let width = match op {
+            BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor => self.combined_bitfield_width(&left, &right),
+            BinaryOp::Shl | BinaryOp::Shr => self.effective_bitfield_width(&left),
+            _ => None,
+        }
+        .filter(|bits| *bits < self.types.size_bits(result_type));
+
+        let pos = left.pos;
+        let mut e = Self::typed_expr(
+            ExprKind::Binary {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            },
+            result_type,
+            pos,
+        );
+        e.bitfield_bits = width;
+        Self::typed_if(e, valid)
+    }
+
+    /// The type of `left op right`, where `left` has type `left_type` and
+    /// the operands satisfy the operator's constraints.
+    pub(super) fn binary_result_type(
+        &mut self,
+        op: BinaryOp,
+        left_type: TypeId,
+        right: &Expr,
+    ) -> TypeId {
+        let right_type = right.typ.unwrap_or(self.types.int_id);
+        match op {
             // Comparison and logical operators always return int
             BinaryOp::Eq
             | BinaryOp::Ne
@@ -1738,48 +1800,10 @@ impl<'a> Parser<'a> {
                 // arithmetic result is (6.3.2.1p2).
                 let promoted = self.types.integer_promote(left_type);
                 let promoted = self.types.unqualified(promoted);
-                self.check_shift_count(op, promoted, &right);
+                self.check_shift_count(op, promoted, right);
                 promoted
             }
-        };
-
-        // C17 6.7.2.1p10: a bit-field has a type of exactly its declared width,
-        // and 6.2.5p9 then reduces an unsigned result modulo 2^width. So
-        // `x.b << 32` with `unsigned long long b : 40` holding 0x100 is zero --
-        // every set bit shifts out of the 40-bit type.
-        //
-        // Which operators carry the width, and from where:
-        //   - the arithmetic and bitwise ones take the wider operand's width;
-        //   - a shift takes the **left** operand's alone (6.5.7p3 -- the right
-        //     operand's type never reaches the result);
-        //   - a comparison or a logical operator yields `int` and carries
-        //     nothing, which falls out of not asking.
-        let width = match op {
-            BinaryOp::Add
-            | BinaryOp::Sub
-            | BinaryOp::Mul
-            | BinaryOp::Div
-            | BinaryOp::Mod
-            | BinaryOp::BitAnd
-            | BinaryOp::BitOr
-            | BinaryOp::BitXor => self.combined_bitfield_width(&left, &right),
-            BinaryOp::Shl | BinaryOp::Shr => self.effective_bitfield_width(&left),
-            _ => None,
         }
-        .filter(|bits| *bits < self.types.size_bits(result_type));
-
-        let pos = left.pos;
-        let mut e = Self::typed_expr(
-            ExprKind::Binary {
-                op,
-                left: Box::new(left),
-                right: Box::new(right),
-            },
-            result_type,
-            pos,
-        );
-        e.bitfield_bits = width;
-        e
     }
 
     /// Warn when a shift's constant count cannot name a bit of the value

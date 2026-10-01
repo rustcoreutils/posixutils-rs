@@ -9114,3 +9114,180 @@ fn test_prototyped_generic_builtins_convert_their_arguments() {
         assert_eq!(b.typ, Some(p.types.int_id));
     });
 }
+
+// ============================================================================
+// Operand constraints of the operators (C17 6.5.3.3, 6.5.5-6.5.15)
+// ============================================================================
+
+/// A table of types for the operand-rule tests: one of each shape an operand
+/// can have once arrays and functions have decayed.
+struct OperandTypes {
+    types: TypeTable,
+    structure: crate::types::TypeId,
+    union: crate::types::TypeId,
+    complex_int: crate::types::TypeId,
+    long_ptr: crate::types::TypeId,
+}
+
+fn operand_types() -> OperandTypes {
+    use crate::types::{CompositeType, Type};
+    let mut types = TypeTable::new(&Target::host());
+    let structure = types.intern(Type::struct_type(CompositeType::incomplete(None)));
+    let union = types.intern(Type::union_type(CompositeType::incomplete(None)));
+    let complex_int = types.make_complex(types.int_id);
+    let long_ptr = types.intern(Type::pointer(types.long_id));
+    OperandTypes {
+        types,
+        structure,
+        union,
+        complex_int,
+        long_ptr,
+    }
+}
+
+/// Which types each operand class admits. A structure or union is in none of
+/// them; a complex integer is not an integer, though `is_integer` says so.
+#[test]
+fn operand_class_admits_its_types_and_no_aggregate() {
+    use super::operand_rule::OperandClass::*;
+    let t = operand_types();
+    let ty = &t.types;
+    // (type, Integer, IntegerOrComplex, Real, Arithmetic, Scalar)
+    let table = [
+        (ty.int_id, [true, true, true, true, true]),
+        (ty.bool_id, [true, true, true, true, true]),
+        (ty.double_id, [false, false, true, true, true]),
+        (ty.complex_double_id, [false, true, false, true, true]),
+        (t.complex_int, [false, true, false, true, true]),
+        (ty.int_ptr_id, [false, false, false, false, true]),
+        (t.structure, [false, false, false, false, false]),
+        (t.union, [false, false, false, false, false]),
+        (ty.void_id, [false, false, false, false, false]),
+    ];
+    for (typ, expected) in table {
+        for (class, want) in [Integer, IntegerOrComplex, Real, Arithmetic, Scalar]
+            .into_iter()
+            .zip(expected)
+        {
+            assert_eq!(
+                class.admits(ty, typ),
+                want,
+                "{:?} of {}",
+                class,
+                ty.format_type(typ, None)
+            );
+        }
+    }
+}
+
+/// The unary operators' classes, as gcc applies them: `~` takes a complex
+/// operand (its conjugate), and `++` a complex one too.
+#[test]
+fn unary_operator_classes() {
+    use super::operand_rule::{OperandClass, UnaryOperator};
+    for (op, class, name) in [
+        (UnaryOperator::Plus, OperandClass::Arithmetic, "unary plus"),
+        (
+            UnaryOperator::Minus,
+            OperandClass::Arithmetic,
+            "unary minus",
+        ),
+        (
+            UnaryOperator::Complement,
+            OperandClass::IntegerOrComplex,
+            "bit-complement",
+        ),
+        (
+            UnaryOperator::Not,
+            OperandClass::Scalar,
+            "unary exclamation mark",
+        ),
+        (UnaryOperator::Increment, OperandClass::Scalar, "increment"),
+        (UnaryOperator::Decrement, OperandClass::Scalar, "decrement"),
+    ] {
+        assert_eq!(op.operand_class(), class);
+        assert_eq!(op.name(), name);
+    }
+}
+
+/// Every binary operator against representative operand pairs, with gcc's
+/// verdict for each.
+#[test]
+fn binary_operand_verdicts() {
+    use super::operand_rule::{binary_operand_verdict, Operand, OperandVerdict::*};
+    let t = operand_types();
+    let ty = &t.types;
+    let v = |typ| Operand {
+        typ,
+        null_constant: false,
+    };
+    let zero = Operand {
+        typ: ty.int_id,
+        null_constant: true,
+    };
+    let (int, dbl, cplx, ptr, s) = (
+        v(ty.int_id),
+        v(ty.double_id),
+        v(ty.complex_double_id),
+        v(ty.int_ptr_id),
+        v(t.structure),
+    );
+    let (lptr, vptr) = (v(t.long_ptr), v(ty.void_ptr_id));
+    use BinaryOp::*;
+    let table = [
+        // Aggregates satisfy no operator.
+        (Add, s, int, Invalid),
+        (Add, int, s, Invalid),
+        (Mul, s, s, Invalid),
+        (Eq, s, s, Invalid),
+        (Lt, int, s, Invalid),
+        (LogAnd, int, v(t.union), Invalid),
+        (BitAnd, s, int, Invalid),
+        // Integer-only operators.
+        (Mod, dbl, int, Invalid),
+        (Mod, cplx, int, Invalid),
+        (Shl, int, cplx, Invalid),
+        (BitXor, v(t.complex_int), int, Invalid),
+        (Shr, ptr, int, Invalid),
+        (BitOr, v(ty.bool_id), int, Valid),
+        // Arithmetic, complex included.
+        (Mul, cplx, dbl, Valid),
+        (Mul, ptr, int, Invalid),
+        (Eq, cplx, int, Valid),
+        (Lt, cplx, int, Invalid),
+        // Pointer forms of + and -.
+        (Add, ptr, int, Valid),
+        (Add, int, ptr, Valid),
+        (Add, ptr, ptr, Invalid),
+        (Add, ptr, dbl, Invalid),
+        (Sub, ptr, int, Valid),
+        (Sub, int, ptr, Invalid),
+        (Sub, ptr, ptr, Valid),
+        (Sub, ptr, lptr, Invalid),
+        (Sub, ptr, vptr, Invalid),
+        // Comparisons with pointers.
+        (Lt, ptr, ptr, Valid),
+        (Lt, ptr, lptr, DistinctPointers),
+        (Lt, ptr, vptr, DistinctPointers),
+        (Eq, ptr, vptr, Valid),
+        (Eq, ptr, lptr, DistinctPointers),
+        (Eq, ptr, int, PointerInteger),
+        (Gt, int, ptr, PointerInteger),
+        (Eq, ptr, zero, Valid),
+        (Gt, ptr, zero, Valid),
+        (Eq, ptr, dbl, Invalid),
+        // Logical operators take any scalar.
+        (LogOr, ptr, cplx, Valid),
+        (LogAnd, s, int, Invalid),
+    ];
+    for (op, l, r, want) in table {
+        assert_eq!(
+            binary_operand_verdict(ty, op, l, r),
+            want,
+            "{} {} {}",
+            ty.format_type(l.typ, None),
+            op.spelling(),
+            ty.format_type(r.typ, None)
+        );
+    }
+}

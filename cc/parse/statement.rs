@@ -132,6 +132,14 @@ impl Parser<'_> {
         self.parse_in_block(Self::parse_statement)
     }
 
+    /// The controlling expression of `if`, `while`, `do` or `for`, which
+    /// shall have scalar type (C17 6.8.4.1p1, 6.8.5p2).
+    fn parse_controlling_expression(&mut self) -> ParseResult<Expr> {
+        let cond = self.parse_expression()?;
+        self.check_truth_value(&cond);
+        Ok(cond)
+    }
+
     fn parse_if_stmt(&mut self) -> ParseResult<Stmt> {
         self.parse_in_block(Self::parse_if_stmt_in_block)
     }
@@ -139,7 +147,7 @@ impl Parser<'_> {
     fn parse_if_stmt_in_block(&mut self) -> ParseResult<Stmt> {
         self.advance(); // consume 'if'
         self.expect_special(b'(')?;
-        let cond = self.parse_expression()?;
+        let cond = self.parse_controlling_expression()?;
         self.expect_special(b')')?;
         let then_stmt = self.parse_substatement()?;
 
@@ -164,7 +172,7 @@ impl Parser<'_> {
     fn parse_while_stmt_in_block(&mut self) -> ParseResult<Stmt> {
         self.advance(); // consume 'while'
         self.expect_special(b'(')?;
-        let cond = self.parse_expression()?;
+        let cond = self.parse_controlling_expression()?;
         self.expect_special(b')')?;
         let body = self.parse_substatement()?;
 
@@ -189,7 +197,7 @@ impl Parser<'_> {
         self.advance();
 
         self.expect_special(b'(')?;
-        let cond = self.parse_expression()?;
+        let cond = self.parse_controlling_expression()?;
         self.expect_special(b')')?;
         self.expect_special(b';')?;
 
@@ -232,7 +240,7 @@ impl Parser<'_> {
             self.advance();
             None
         } else {
-            let expr = self.parse_expression()?;
+            let expr = self.parse_controlling_expression()?;
             self.expect_special(b';')?;
             Some(expr)
         };

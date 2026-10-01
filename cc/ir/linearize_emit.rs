@@ -2864,15 +2864,14 @@ impl<'a> super::linearize::Linearizer<'a> {
         // `z += 1.0` computed on a pointer bit pattern and stored the result
         // over the object -- the program then died reading it back.
         if self.types.is_complex(target_typ) && op != AssignOp::Assign {
-            let binop = match op {
-                AssignOp::AddAssign => Some(BinaryOp::Add),
-                AssignOp::SubAssign => Some(BinaryOp::Sub),
-                AssignOp::MulAssign => Some(BinaryOp::Mul),
-                AssignOp::DivAssign => Some(BinaryOp::Div),
-                // Every other compound operator is a constraint violation on a
-                // complex operand; leave those to the path that reports it.
-                _ => None,
-            };
+            // Every other compound operator is a constraint violation on a
+            // complex operand, which the parser has reported.
+            let binop = op.binary_op().filter(|b| {
+                matches!(
+                    b,
+                    BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
+                )
+            });
 
             if let Some(binop) = binop {
                 let target_addr = self.linearize_lvalue(target);

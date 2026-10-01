@@ -337,6 +337,30 @@ impl BinaryOp {
             BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge | BinaryOp::Eq | BinaryOp::Ne
         )
     }
+
+    /// The operator as it is written in source, for diagnostics.
+    pub fn spelling(self) -> &'static str {
+        match self {
+            BinaryOp::Add => "+",
+            BinaryOp::Sub => "-",
+            BinaryOp::Mul => "*",
+            BinaryOp::Div => "/",
+            BinaryOp::Mod => "%",
+            BinaryOp::Lt => "<",
+            BinaryOp::Gt => ">",
+            BinaryOp::Le => "<=",
+            BinaryOp::Ge => ">=",
+            BinaryOp::Eq => "==",
+            BinaryOp::Ne => "!=",
+            BinaryOp::LogAnd => "&&",
+            BinaryOp::LogOr => "||",
+            BinaryOp::BitAnd => "&",
+            BinaryOp::BitOr => "|",
+            BinaryOp::BitXor => "^",
+            BinaryOp::Shl => "<<",
+            BinaryOp::Shr => ">>",
+        }
+    }
 }
 
 /// Which classification question a [`ExprKind::FpTest`] asks.
@@ -434,6 +458,27 @@ pub enum AssignOp {
     ShlAssign,
     /// Right-shift-assign: >>=
     ShrAssign,
+}
+
+impl AssignOp {
+    /// The binary operator a compound assignment applies (C17 6.5.16.2p3:
+    /// `E1 op= E2` is `E1 = E1 op (E2)` with `E1` evaluated once); `None`
+    /// for simple assignment.
+    pub fn binary_op(self) -> Option<BinaryOp> {
+        match self {
+            AssignOp::Assign => None,
+            AssignOp::AddAssign => Some(BinaryOp::Add),
+            AssignOp::SubAssign => Some(BinaryOp::Sub),
+            AssignOp::MulAssign => Some(BinaryOp::Mul),
+            AssignOp::DivAssign => Some(BinaryOp::Div),
+            AssignOp::ModAssign => Some(BinaryOp::Mod),
+            AssignOp::AndAssign => Some(BinaryOp::BitAnd),
+            AssignOp::OrAssign => Some(BinaryOp::BitOr),
+            AssignOp::XorAssign => Some(BinaryOp::BitXor),
+            AssignOp::ShlAssign => Some(BinaryOp::Shl),
+            AssignOp::ShrAssign => Some(BinaryOp::Shr),
+        }
+    }
 }
 
 // Expressions

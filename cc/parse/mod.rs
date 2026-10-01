@@ -25,6 +25,7 @@ mod expr_check;
 mod expression;
 mod generic_builtin;
 mod library_builtin;
+mod operand_rule;
 pub mod parser;
 mod statement;
 mod toplevel;

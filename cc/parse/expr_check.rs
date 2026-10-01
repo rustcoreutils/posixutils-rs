@@ -11,6 +11,9 @@
 //
 
 use super::ast::{BinaryOp, Expr, ExprKind, UnaryOp};
+use super::operand_rule::{
+    binary_operand_verdict, Operand, OperandClass, OperandVerdict, UnaryOperator,
+};
 use super::parser::Parser;
 use crate::diag;
 use crate::strings::StringId;
@@ -341,36 +344,166 @@ impl Parser<'_> {
         is_vector
     }
 
-    /// C17 6.5.3.3p1: the operand of unary `+` and `-` has arithmetic type.
-    /// A vector is diagnosed on its own by `check_not_vector_value`, and an
-    /// operand with no type has been diagnosed already.
-    pub(super) fn check_unary_arithmetic_operand(&self, operand: &Expr, op: &str, pos: Position) {
-        let Some(t) = operand.typ else { return };
-        if !self.types.is_arithmetic(t) && !self.types.is_vector(t) {
-            diag::error_args(pos, "wrong type argument to {0}", &[op]);
+    /// Check the operand of a unary operator against the type its operator
+    /// requires (C17 6.5.3.3p1, 6.5.2.4p1, 6.5.3.1p1).
+    ///
+    /// Answers whether the operand passed, so the caller can leave the
+    /// result untyped after an error and spare the expressions around it a
+    /// second report of the same mistake. A vector operand passes: the
+    /// vector path has its own message. An operand with no type has been
+    /// diagnosed already.
+    pub(super) fn check_unary_operand(
+        &mut self,
+        op: UnaryOperator,
+        operand: &Expr,
+        pos: Position,
+    ) -> bool {
+        let Some(t) = operand.typ else { return true };
+        if self.types.is_vector(t) {
+            return true;
+        }
+        if self.types.kind(t) == TypeKind::Void {
+            diag::error(pos, &gettext("invalid use of void expression"));
+            return false;
+        }
+        let t = self.decayed_type(t);
+        if op.operand_class().admits(self.types, t) {
+            return true;
+        }
+        diag::error_args(pos, "wrong type argument to {0}", &[op.name()]);
+        false
+    }
+
+    /// Check an expression whose truth is tested -- the first operand of
+    /// `?:` (C17 6.5.15p2), the left operand of `&&` and `||`, and the
+    /// controlling expression of `if` and the loops (6.8.4.1p1, 6.8.5p2) --
+    /// for the scalar type each requires. Worded as gcc words it.
+    pub(super) fn check_truth_value(&mut self, cond: &Expr) -> bool {
+        let Some(t) = cond.typ else { return true };
+        if self.check_not_void(cond, cond.pos) || self.check_not_vector_value(Some(t), cond.pos) {
+            return false;
+        }
+        let t = self.decayed_type(t);
+        if OperandClass::Scalar.admits(self.types, t) {
+            return true;
+        }
+        let what = match self.types.kind(t) {
+            TypeKind::Union => "union".to_string(),
+            TypeKind::Struct => "struct".to_string(),
+            _ => self.types.format_type(t, Some(self.idents)),
+        };
+        diag::error_args(
+            cond.pos,
+            "used {0} type value where scalar is required",
+            &[&what],
+        );
+        false
+    }
+
+    /// Check a binary operator's operands (C17 6.5.5p2 through 6.5.14p2),
+    /// and a compound assignment's (6.5.16.2p1-2) through the operator it
+    /// applies.
+    ///
+    /// Answers whether the operation has a type: `false` after an error, so
+    /// the caller leaves the result untyped and an enclosing assignment or
+    /// operator does not report the same mistake again. gcc's warnings for
+    /// a pointer compared with an integer or with an unrelated pointer leave
+    /// the operation intact.
+    pub(super) fn check_binary_operands(
+        &mut self,
+        op: BinaryOp,
+        left: &Expr,
+        right: &Expr,
+        pos: Position,
+    ) -> bool {
+        // `&&` and `||` test their left operand for truth, as `if` would;
+        // gcc reports that test and the right operand independently.
+        let logical = matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr);
+        let left_ok = if logical {
+            self.check_truth_value(left)
+        } else {
+            self.check_has_value(left)
+        };
+        if !(self.check_has_value(right) && left_ok) {
+            return false;
+        }
+        let (Some(lt), Some(rt)) = (left.typ, right.typ) else {
+            return true;
+        };
+        let (lt, rt) = (self.decayed_type(lt), self.decayed_type(rt));
+        let l = self.binary_operand(op, left, lt, rt);
+        let r = self.binary_operand(op, right, rt, lt);
+        match binary_operand_verdict(self.types, op, l, r) {
+            OperandVerdict::Valid => true,
+            OperandVerdict::Invalid => {
+                // `&&` and `||` have tested the left operand for truth by
+                // now, and gcc names it by the `int` that test yields.
+                let lt = if logical { self.types.int_id } else { lt };
+                self.report_invalid_operands(op, lt, rt, pos);
+                false
+            }
+            OperandVerdict::PointerInteger => {
+                diag::warning(pos, &gettext("comparison between pointer and integer"));
+                true
+            }
+            OperandVerdict::DistinctPointers => {
+                diag::warning(
+                    pos,
+                    &gettext("comparison of distinct pointer types lacks a cast"),
+                );
+                true
+            }
         }
     }
 
-    /// C17 6.5.8p2: the operands of `<`, `>`, `<=` and `>=` are both real or
-    /// both pointers. A complex value has no ordering, so a relational
-    /// operator on one is a constraint violation; `==` and `!=` accept it.
-    pub(super) fn check_relational_operands(&self, op: BinaryOp, left: &Expr, right: &Expr) {
-        if !matches!(
-            op,
-            BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge
-        ) {
-            return;
-        }
-        for operand in [left, right] {
-            if operand.typ.is_some_and(|t| self.types.is_complex(t)) {
-                diag::error(
-                    operand.pos,
-                    &gettext(
-                        "invalid operand to a relational operator: a complex value has no ordering",
-                    ),
-                );
-                return;
-            }
+    /// C17 6.5.5-6.5.14 require operands with a value: `f() + 1`, where `f`
+    /// returns void, has none, and c17 gives a vector none it can compute
+    /// with.
+    fn check_has_value(&self, operand: &Expr) -> bool {
+        !self.check_not_void(operand, operand.pos)
+            && !self.check_not_vector_value(operand.typ, operand.pos)
+    }
+
+    /// One operand of `op`, with its decayed type `typ`, beside an operand of
+    /// type `other`. Whether it is a null pointer constant matters only to a
+    /// comparison with a pointer, and costs a constant evaluation, so it is
+    /// asked only then.
+    fn binary_operand(&self, op: BinaryOp, e: &Expr, typ: TypeId, other: TypeId) -> Operand {
+        let null_constant = op.is_comparison()
+            && self.types.kind(other) == TypeKind::Pointer
+            && self.is_null_pointer_constant(e);
+        Operand { typ, null_constant }
+    }
+
+    /// gcc's "invalid operands to binary +", naming each operand by the type
+    /// the operator would have seen: decayed, unqualified, and promoted.
+    fn report_invalid_operands(
+        &mut self,
+        op: BinaryOp,
+        left: TypeId,
+        right: TypeId,
+        pos: Position,
+    ) {
+        let names = [left, right].map(|t| {
+            let t = self.operand_value_type(t);
+            self.types.format_type(t, Some(self.idents))
+        });
+        diag::error_args(
+            pos,
+            "invalid operands to binary {0} (have '{1}' and '{2}')",
+            &[op.spelling(), &names[0], &names[1]],
+        );
+    }
+
+    /// The type of an operand's value as an operator computes with it: an
+    /// integer narrower than `int`, or an enumeration, after the integer
+    /// promotions (C17 6.3.1.1p2).
+    fn operand_value_type(&mut self, typ: TypeId) -> TypeId {
+        let t = self.types.unqualified(typ);
+        if self.types.is_integer(t) && !self.types.is_complex(t) {
+            self.types.integer_promote(t)
+        } else {
+            t
         }
     }
 
@@ -415,12 +548,47 @@ impl Parser<'_> {
         let (Some(t), Some(v)) = (target.typ, value.typ) else {
             return;
         };
+        let null_constant = self.is_null_pointer_constant(value);
+        self.check_assignment_conversion(t, v, null_constant, pos);
+    }
+
+    /// Report a compound assignment whose operands the operator rejects
+    /// (C17 6.5.16.2p1-2), or whose result cannot be stored back.
+    ///
+    /// `E1 op= E2` computes `E1 op E2` and assigns it, so it is checked as
+    /// exactly that: the operator's own constraints first, then the
+    /// conversion of the operation's result to the target's type -- which is
+    /// how gcc finds `i += p` (an `int *` stored to an `int`) worth a warning
+    /// while `p += 1` is ordinary pointer arithmetic.
+    pub(super) fn check_compound_assignment(
+        &mut self,
+        op: BinaryOp,
+        target: &Expr,
+        value: &Expr,
+        pos: Position,
+    ) {
+        if !self.check_binary_operands(op, target, value, pos) {
+            return;
+        }
+        let Some(t) = target.typ else { return };
+        let left = self.lvalue_converted_type(t);
+        let result = self.binary_result_type(op, left, value);
+        self.check_assignment_conversion(t, result, false, pos);
+    }
+
+    /// Report a value of type `v` that cannot be converted to the type `t`
+    /// as if by assignment (C17 6.5.16.1p1). `null_constant` says whether the
+    /// value is a null pointer constant.
+    fn check_assignment_conversion(
+        &mut self,
+        t: TypeId,
+        v: TypeId,
+        null_constant: bool,
+        pos: Position,
+    ) {
         let t = self.decayed_type(t);
         let v = self.decayed_type(v);
-        let Some(fault) = self
-            .types
-            .assignment_fault(t, v, self.is_null_pointer_constant(value))
-        else {
+        let Some(fault) = self.types.assignment_fault(t, v, null_constant) else {
             return;
         };
         if fault == AssignFault::FunctionPointerVoid {

@@ -354,7 +354,7 @@ impl Facts<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{BasicBlock, Module, Pseudo};
+    use crate::ir::{BasicBlock, FenceScope, MemoryOrder, Module, Pseudo};
     use crate::target::Target;
 
     fn host_types() -> TypeTable {
@@ -439,6 +439,35 @@ mod tests {
         assert!(b.run());
         assert_eq!(b.op(0, 1), Opcode::Nop, "the first store is overwritten");
         assert_eq!(b.op(0, 2), Opcode::Store);
+    }
+
+    /// A signal fence between two stores revives the first: a handler that
+    /// runs at the fence may read it, though the fence emits nothing.
+    #[test]
+    fn dse_a_signal_fence_between_two_stores_revives_the_first() {
+        let mut b = Build::new();
+        let i32t = b.types.int_id;
+        let mut fence = Instruction::new(Opcode::Fence).with_memory_order(MemoryOrder::SeqCst);
+        fence.extra_mut().fence_scope = FenceScope::Signal;
+        b.block(
+            0,
+            vec![
+                entry(),
+                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, 32),
+                fence,
+                Instruction::store(PseudoId(6), PseudoId(0), 0, i32t, 32),
+                Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, 32),
+                Instruction::new(Opcode::Ret).with_src(PseudoId(20)),
+            ],
+            vec![],
+        );
+        b.run();
+        assert_eq!(
+            b.op(0, 1),
+            Opcode::Store,
+            "the fence orders the first store"
+        );
+        assert_eq!(b.op(0, 2), Opcode::Fence);
     }
 
     /// **The read-modify-write shape.** A read of the bytes between the two

@@ -584,7 +584,11 @@ impl X86_64CodeGen {
 
         // An acquire, release or acq-rel fence needs no instruction: x86
         // already keeps loads and stores in every order but store-then-load.
-        if orders_store_then_load(insn.extra().memory_order) {
+        // Nor does a signal fence, at any order.
+        if insn
+            .hardware_fence_order()
+            .is_some_and(orders_store_then_load)
+        {
             self.push_lir(X86Inst::Mfence);
         }
 

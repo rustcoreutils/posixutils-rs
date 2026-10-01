@@ -361,7 +361,7 @@ address.
 | `atomic_swap` | Exchange; returns the old value |
 | `atomic_cas` | Compare-and-swap: `(addr, expected_addr, desired, order)`. Returns success as a `bool`; on failure the current value is written to `*expected_addr` (gcc's `__atomic_compare_exchange` shape). `size` is the element width |
 | `atomic_fetch_add`, `atomic_fetch_sub`, `atomic_fetch_and`, `atomic_fetch_or`, `atomic_fetch_xor` | Read-modify-write; returns the old value |
-| `fence` | Thread or signal fence |
+| `fence` | Thread or signal fence, told apart by `fence_scope`. Both are a memory barrier and a side-effecting root to every pass; only the thread fence emits an instruction |
 
 ### Int128 Decomposition
 

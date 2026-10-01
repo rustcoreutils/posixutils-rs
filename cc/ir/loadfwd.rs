@@ -608,7 +608,7 @@ fn reachable(
 mod tests {
     use super::*;
     use crate::ir::memloc::{MemBase, ModuleInfo};
-    use crate::ir::{BasicBlock, Module, Pseudo, PseudoKind};
+    use crate::ir::{BasicBlock, FenceScope, MemoryOrder, Module, Pseudo, PseudoKind};
     use crate::target::Target;
 
     fn host_types() -> TypeTable {
@@ -737,6 +737,29 @@ mod tests {
         assert!(b.run());
         assert_eq!(b.op(0, 4), Opcode::Copy);
         assert_eq!(b.f.blocks[0].insns[4].src, vec![PseudoId(5)]);
+    }
+
+    /// A signal fence emits nothing, but a handler on this thread may read
+    /// or write across it, so a store is not forwarded over it.
+    #[test]
+    fn loadfwd_refuses_across_a_signal_fence() {
+        let mut b = Build::new();
+        let i32t = b.types.int_id;
+        let mut fence = Instruction::new(Opcode::Fence).with_memory_order(MemoryOrder::SeqCst);
+        fence.extra_mut().fence_scope = FenceScope::Signal;
+        b.block(
+            0,
+            vec![
+                entry(),
+                Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+                Instruction::store(PseudoId(5), PseudoId(10), 0, i32t, 32),
+                fence,
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+            ],
+            vec![],
+        );
+        assert!(!b.run());
+        assert_eq!(b.op(0, 4), Opcode::Load);
     }
 
     /// The same shape on a *global*, which any externally-linked callee can

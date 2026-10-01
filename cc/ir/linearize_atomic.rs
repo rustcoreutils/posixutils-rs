@@ -21,7 +21,7 @@
 
 use super::linearize::Linearizer;
 use super::linearize_emit::{compound_assign_arith_type, compound_assign_opcode, CompoundAssign};
-use super::{Instruction, MemoryOrder, Opcode, PseudoId};
+use super::{FenceScope, Instruction, MemoryOrder, Opcode, PseudoId};
 use crate::diag;
 use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, Expr, ExprKind};
@@ -472,6 +472,20 @@ impl Linearizer<'_> {
         ok
     }
 
+    /// A fence at the order `order` names, against whom `scope` says.
+    pub(crate) fn emit_fence(&mut self, order: &Expr, scope: FenceScope) -> PseudoId {
+        let order_val = self.linearize_expr(order);
+        let result = self.alloc_pseudo();
+        let mut fence = Instruction::new(Opcode::Fence)
+            .with_target(result)
+            .with_src(order_val)
+            .with_type(self.types.void_id)
+            .with_memory_order(self.atomic_order(order, OrderedAccess::Fence));
+        fence.extra_mut().fence_scope = scope;
+        self.emit(fence);
+        result
+    }
+
     /// The CAS retry loop described on `emit_atomic_rmw`.
     ///
     /// Only the attempt that succeeds has to be ordered, so the exchange
@@ -686,7 +700,7 @@ impl Linearizer<'_> {
 #[cfg(test)]
 mod tests {
     use super::super::linearize::test_linearize::linearize_source;
-    use super::{MemoryOrder, Opcode};
+    use super::{FenceScope, MemoryOrder, Opcode};
     use crate::target::Target;
 
     /// The memory order recorded on every atomic instruction of `f`, in
@@ -807,5 +821,32 @@ mod tests {
         );
         let fence = "void f(void) { __atomic_thread_fence(3); }";
         assert_eq!(orders(fence), [(Opcode::Fence, Release)]);
+    }
+
+    /// Every spelling of a fence records whom it orders against, alongside
+    /// its order.
+    #[test]
+    fn a_fence_records_its_scope() {
+        let src = "void f(void) { __atomic_thread_fence(2); __atomic_signal_fence(3); \
+                   __c11_atomic_thread_fence(4); __c11_atomic_signal_fence(5); }";
+        let module = linearize_source(src, &Target::host());
+        let scopes: Vec<_> = module.functions[0]
+            .blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .filter(|i| i.op == Opcode::Fence)
+            .map(|i| (i.extra().fence_scope, i.extra().memory_order))
+            .collect();
+        use FenceScope::*;
+        use MemoryOrder::*;
+        assert_eq!(
+            scopes,
+            [
+                (Thread, Acquire),
+                (Signal, Release),
+                (Thread, AcqRel),
+                (Signal, SeqCst)
+            ]
+        );
     }
 }

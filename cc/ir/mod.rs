@@ -770,6 +770,21 @@ impl MemoryOrder {
     }
 }
 
+/// Whom a `Fence` orders against.
+///
+/// Both are the same compiler barrier to every IR pass, which asks the
+/// opcode; only the code a back end emits differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FenceScope {
+    /// `atomic_thread_fence`: other threads, so the hardware must order too.
+    #[default]
+    Thread,
+    /// `atomic_signal_fence`: a signal handler on this same thread, which
+    /// sees the thread's own accesses in program order. Ordering the
+    /// compiler is all it needs, so it costs no instruction.
+    Signal,
+}
+
 impl fmt::Display for MemoryOrder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1174,6 +1189,9 @@ pub struct InsnExtra {
     pub abi_info: Option<Box<CallAbiInfo>>,
     /// For atomic operations: memory ordering constraint
     pub memory_order: MemoryOrder,
+    /// For `Fence`: whether it orders against other threads or only a
+    /// signal handler on this one.
+    pub fence_scope: FenceScope,
     /// For `LifetimeEnd`: the local whose lifetime ends.
     pub lifetime_of: Option<PseudoId>,
 }
@@ -1193,6 +1211,7 @@ static NO_EXTRA: InsnExtra = InsnExtra {
     asm_data: None,
     abi_info: None,
     memory_order: MemoryOrder::Relaxed,
+    fence_scope: FenceScope::Thread,
     lifetime_of: None,
 };
 
@@ -1369,6 +1388,17 @@ impl Instruction {
         self
     }
 
+    /// The order a `Fence` asks the hardware for: its own for a thread
+    /// fence, and `None` for a signal fence, which needs no instruction.
+    /// What each back end maps to its barrier.
+    pub fn hardware_fence_order(&self) -> Option<MemoryOrder> {
+        let extra = self.extra();
+        match extra.fence_scope {
+            FenceScope::Thread => Some(extra.memory_order),
+            FenceScope::Signal => None,
+        }
+    }
+
     /// Returns true if this instruction acts as a memory-reordering
     /// barrier — no IR pass may move a `Load`/`Store` (or any other
     /// memory-touching op) across this instruction in either direction.
@@ -1378,7 +1408,9 @@ impl Instruction {
     ///   "compiler memory barrier" idiom used by `pause`/`yield`
     ///   spin loops, ticket-lock acquire, `__sync_synchronize`-style
     ///   fences, etc.).
-    /// - `Opcode::Fence` — explicit C11 `atomic_thread_fence`.
+    /// - `Opcode::Fence` — explicit C11 `atomic_thread_fence`, and
+    ///   `atomic_signal_fence` exactly as much: a signal handler sees memory
+    ///   only as the compiler left it, though no instruction is emitted.
     /// - `Opcode::Atomic*` — every atomic memory op (including
     ///   `Relaxed`-ordered ones — see note below).
     /// - `Opcode::Call` — c17 has no escape/alias analysis; any
@@ -4275,6 +4307,21 @@ mod tests {
                 insn.is_memory_barrier(),
                 "{op:?} should be a memory barrier"
             );
+        }
+    }
+
+    /// A signal fence emits no instruction, but stays the compiler barrier
+    /// a thread fence is: a barrier, a side-effecting root, a memory access.
+    #[test]
+    fn test_signal_fence_is_a_barrier_without_an_instruction() {
+        for scope in [FenceScope::Thread, FenceScope::Signal] {
+            let mut insn = Instruction::new(Opcode::Fence).with_memory_order(MemoryOrder::SeqCst);
+            insn.extra_mut().fence_scope = scope;
+            assert!(insn.is_memory_barrier(), "{scope:?}");
+            assert!(insn.op.has_side_effects(), "{scope:?}");
+            assert!(insn.op.may_access_memory(), "{scope:?}");
+            let hardware = (scope == FenceScope::Thread).then_some(MemoryOrder::SeqCst);
+            assert_eq!(insn.hardware_fence_order(), hardware);
         }
     }
 

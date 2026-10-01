@@ -367,7 +367,7 @@ impl Aarch64CodeGen {
     }
 
     pub(super) fn emit_fence(&mut self, insn: &Instruction) {
-        if let Some(option) = fence_barrier(insn.extra().memory_order) {
+        if let Some(option) = insn.hardware_fence_order().and_then(fence_barrier) {
             self.push_lir(Aarch64Inst::Dmb { option });
         }
 

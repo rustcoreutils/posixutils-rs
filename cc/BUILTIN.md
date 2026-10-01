@@ -484,7 +484,7 @@ unknown. Folding it after inlining is the remaining work; see the
 | `__c11_atomic_compare_exchange_strong(ptr, exp, des, succ, fail)`, `_weak` | `Opcode::AtomicCas`; returns `_Bool`. The two orders combine into one (Memory orders, below); weak is implemented as strong |
 | `__c11_atomic_fetch_add`, `sub`, `and`, `or`, `xor` | `Opcode::AtomicFetchAdd` etc.; return the old value |
 | `__c11_atomic_thread_fence(order)` | `Opcode::Fence` |
-| `__c11_atomic_signal_fence(order)` | The same `Opcode::Fence`: a hardware fence, stronger than the compiler barrier required |
+| `__c11_atomic_signal_fence(order)` | `Opcode::Fence` with `fence_scope` `Signal`: the same compiler barrier to every IR pass, and no instruction at any order, as in gcc |
 
 `<stdatomic.h>` maps the standard names to these. `_Atomic` objects accessed
 through ordinary operators are lowered to the same instructions.

@@ -488,3 +488,30 @@ fn builtins_atomics_answer_an_invalid_order_with_seq_cst() {
         "memory model",
     );
 }
+
+/// `__atomic_signal_fence` orders only against a signal handler on the same
+/// thread, which needs the compiler not to move memory accesses across it and
+/// no instruction at all; gcc emits nothing. c17 emitted a full hardware
+/// fence (`mfence`, `dmb ish`). The thread fence keeps its instruction.
+#[test]
+fn builtins_signal_fence_emits_no_instruction() {
+    let host: &[&str] = &[];
+    for target in [host, &crate::common::AARCH64_TARGET_ARGS[..]] {
+        let sig = atomic_asm(
+            target,
+            "void f(void) { __atomic_signal_fence(__ATOMIC_SEQ_CST); }",
+        );
+        assert!(
+            !sig.contains("mfence") && !sig.contains("dmb"),
+            "signal fence emitted a hardware fence:\n{sig}"
+        );
+        let thr = atomic_asm(
+            target,
+            "void f(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }",
+        );
+        assert!(
+            thr.contains("mfence") || thr.contains("dmb"),
+            "thread fence lost its instruction:\n{thr}"
+        );
+    }
+}

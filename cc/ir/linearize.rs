@@ -12,8 +12,8 @@
 use super::mem2reg::mem2reg;
 use super::ssa::ssa_convert;
 use super::{
-    BasicBlock, BasicBlockId, CallAbiInfo, Function, Initializer, Instruction, MemoryOrder, Module,
-    Opcode, Pseudo, PseudoId, PseudoKind,
+    BasicBlock, BasicBlockId, CallAbiInfo, FenceScope, Function, Initializer, Instruction,
+    MemoryOrder, Module, Opcode, Pseudo, PseudoId, PseudoKind,
 };
 use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::diag::{get_all_stream_names, Position};
@@ -6026,35 +6026,8 @@ impl<'a> Linearizer<'a> {
                 self.emit_c11_atomic_builtin(Opcode::AtomicFetchXor, ptr, Some(val), Some(order))
             }
 
-            ExprKind::C11AtomicThreadFence { order } => {
-                let order_val = self.linearize_expr(order);
-                let memory_order = self.atomic_order(order, OrderedAccess::Fence);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Fence)
-                    .with_target(result)
-                    .with_src(order_val)
-                    .with_type(self.types.void_id)
-                    .with_memory_order(memory_order);
-                self.emit(insn);
-                result
-            }
-
-            ExprKind::C11AtomicSignalFence { order } => {
-                // Signal fence is a compiler barrier only (no memory fence instruction)
-                // For now, treat it the same as thread fence
-                let order_val = self.linearize_expr(order);
-                let memory_order = self.atomic_order(order, OrderedAccess::Fence);
-                let result = self.alloc_pseudo();
-
-                let insn = Instruction::new(Opcode::Fence)
-                    .with_target(result)
-                    .with_src(order_val)
-                    .with_type(self.types.void_id)
-                    .with_memory_order(memory_order);
-                self.emit(insn);
-                result
-            }
+            ExprKind::C11AtomicThreadFence { order } => self.emit_fence(order, FenceScope::Thread),
+            ExprKind::C11AtomicSignalFence { order } => self.emit_fence(order, FenceScope::Signal),
             _ => unreachable!(),
         }
     }

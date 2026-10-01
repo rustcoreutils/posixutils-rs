@@ -75,7 +75,8 @@ pub struct Aarch64CodeGen {
     pic_mode: bool,
     /// Counter for generating unique labels (atomic loops, etc.)
     unique_label_counter: u32,
-    /// Stack allocation size for locals (for zero_stack_frame)
+    /// Bytes the prologue allocates for locals: what a dynamically aligned
+    /// frame addresses them from.
     pub(super) stack_alloc_size: i32,
     /// Sym pseudo ID → type size in bits (for distinguishing scalar vs struct stores)
     pub(super) sym_slots: HashMap<PseudoId, crate::arch::codegen::SymSlot>,
@@ -303,6 +304,73 @@ impl Aarch64CodeGen {
 
     /// Emit conditional branch: test condition and branch accordingly
     /// Returns true if an early return was taken (for constant conditions)
+    /// Set the flags for `cond != 0`, reading `cond` at the width its value
+    /// is held at -- see [`crate::arch::codegen::ValueWidths`] -- through
+    /// `scratch` where it is not already in a register. The one test `Cbr`
+    /// and `Select` both make. A wider-than-64-bit condition also uses X10,
+    /// or X11 when `scratch` is X10, so neither may hold anything live.
+    fn emit_condition_test(&mut self, cond: PseudoId, scratch: Reg) {
+        let bits = self.base.value_widths.bits(cond);
+        let loc = self.get_location(cond);
+        if bits > 64 {
+            if let l @ (Loc::Stack(_) | Loc::IncomingArg(_)) = &loc {
+                // Both halves, ORed: nonzero if either is.
+                let other = if scratch == Reg::X10 {
+                    Reg::X11
+                } else {
+                    Reg::X10
+                };
+                self.push_lir(Aarch64Inst::Ldp {
+                    size: OperandSize::B64,
+                    addr: self.loc_mem(l).unwrap(),
+                    dst1: scratch,
+                    dst2: other,
+                });
+                self.push_lir(Aarch64Inst::Orr {
+                    size: OperandSize::B64,
+                    src1: scratch,
+                    src2: GpOperand::Reg(other),
+                    dst: scratch,
+                });
+                self.push_lir(Aarch64Inst::Cmp {
+                    size: OperandSize::B64,
+                    src1: scratch,
+                    src2: GpOperand::Imm(0),
+                });
+                return;
+            }
+        }
+        let bits = bits.min(64);
+        let reg = match loc {
+            Loc::Reg(r) if bits >= 32 => r,
+            _ => {
+                self.emit_move(cond, scratch, bits);
+                // A register keeps whatever lies above a narrow value.
+                match bits {
+                    8 => self.push_lir(Aarch64Inst::Uxtb {
+                        src: scratch,
+                        dst: scratch,
+                    }),
+                    16 => self.push_lir(Aarch64Inst::Uxth {
+                        src: scratch,
+                        dst: scratch,
+                    }),
+                    _ => {}
+                }
+                scratch
+            }
+        };
+        self.push_lir(Aarch64Inst::Cmp {
+            size: if bits <= 32 {
+                OperandSize::B32
+            } else {
+                OperandSize::B64
+            },
+            src1: reg,
+            src2: GpOperand::Imm(0),
+        });
+    }
+
     fn emit_cbr(&mut self, insn: &Instruction) -> bool {
         let Some(&cond) = insn.src.first() else {
             return false;
@@ -312,49 +380,8 @@ impl Aarch64CodeGen {
         let (scratch0, _, _) = Reg::scratch_regs();
 
         match &loc {
-            Loc::Reg(r) => {
-                self.push_lir(Aarch64Inst::Cmp {
-                    size: OperandSize::B64,
-                    src1: *r,
-                    src2: GpOperand::Imm(0),
-                });
-            }
-            loc @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
-                // A condition can be an incoming stack argument as readily as
-                // a local; both are just a value in memory here.
-                let mem = self.loc_mem(loc).unwrap();
-                if insn.size >= 128 {
-                    // 128-bit: load both halves and ORR them to check for non-zero
-                    let (_, scratch1, _) = Reg::scratch_regs();
-                    self.push_lir(Aarch64Inst::Ldp {
-                        size: OperandSize::B64,
-                        addr: mem,
-                        dst1: scratch0,
-                        dst2: scratch1,
-                    });
-                    self.push_lir(Aarch64Inst::Orr {
-                        size: OperandSize::B64,
-                        src1: scratch0,
-                        src2: GpOperand::Reg(scratch1),
-                        dst: scratch0,
-                    });
-                    self.push_lir(Aarch64Inst::Cmp {
-                        size: OperandSize::B64,
-                        src1: scratch0,
-                        src2: GpOperand::Imm(0),
-                    });
-                } else {
-                    self.push_lir(Aarch64Inst::Ldr {
-                        size: OperandSize::B64,
-                        addr: mem,
-                        dst: scratch0,
-                    });
-                    self.push_lir(Aarch64Inst::Cmp {
-                        size: OperandSize::B64,
-                        src1: scratch0,
-                        src2: GpOperand::Imm(0),
-                    });
-                }
+            Loc::Reg(_) | Loc::Stack(_) | Loc::IncomingArg(_) | Loc::Global(_) => {
+                self.emit_condition_test(cond, scratch0);
             }
             Loc::Imm(v) => {
                 let target = if *v != 0 { insn.bb_true } else { insn.bb_false };
@@ -364,14 +391,6 @@ impl Aarch64CodeGen {
                     });
                 }
                 return true;
-            }
-            Loc::Global(name) => {
-                self.emit_load_global(name, scratch0, OperandSize::B64);
-                self.push_lir(Aarch64Inst::Cmp {
-                    size: OperandSize::B64,
-                    src1: scratch0,
-                    src2: GpOperand::Imm(0),
-                });
             }
             Loc::VReg(v) => {
                 let bit_size = if insn.size == 0 { 64 } else { insn.size };
@@ -1166,13 +1185,7 @@ impl Aarch64CodeGen {
             return;
         }
 
-        // Load condition to GP register and compare with zero
-        self.emit_move(cond, Reg::X16, 64);
-        self.push_lir(Aarch64Inst::Cmp {
-            size: OperandSize::B64,
-            src1: Reg::X16,
-            src2: GpOperand::Imm(0),
-        });
+        self.emit_condition_test(cond, Reg::X16);
 
         let then_label = self.next_unique_label("sel_then");
         let done_label = self.next_unique_label("sel_done");
@@ -1221,17 +1234,11 @@ impl Aarch64CodeGen {
         // overwritten by the select's operand, and read back wrong after it.
         let (cond_reg, then_reg, else_reg) = Reg::scratch_regs();
 
-        // Load condition, then and else values
-        self.emit_move(cond, cond_reg, 64);
+        // The test first, while the other two scratches are still free for
+        // it; loading the arms after it leaves the flags alone.
+        self.emit_condition_test(cond, cond_reg);
         self.emit_move(then_val, then_reg, size);
         self.emit_move(else_val, else_reg, size);
-
-        // Compare condition with zero
-        self.push_lir(Aarch64Inst::Cmp {
-            size: OperandSize::B64,
-            src1: cond_reg,
-            src2: GpOperand::Imm(0),
-        });
 
         // Use csel: if cond != 0, select then_val, else select else_val
         self.push_lir(Aarch64Inst::Csel {

@@ -40,7 +40,8 @@ pub struct X86_64CodeGen {
     pub(super) callee_saved_regs: Vec<Reg>,
     /// Offset to add to stack locations to account for callee-saved registers
     pub(super) callee_saved_offset: i32,
-    /// Stack allocation size (for zero_stack_frame)
+    /// Bytes the prologue allocates for locals: what a dynamically aligned
+    /// frame addresses them from.
     pub(super) stack_alloc_size: i32,
     /// Offset from rbp to register save area (for variadic functions)
     pub(super) reg_save_area_offset: i32,
@@ -567,22 +568,50 @@ impl X86_64CodeGen {
 
     /// Emit conditional branch: test condition and branch accordingly
     /// Returns true if an early return was taken (for constant conditions)
-    fn emit_cbr(&mut self, insn: &Instruction, types: &TypeTable) -> bool {
+    /// Set the flags for `cond != 0`, reading `cond` at the width its value
+    /// is held at -- see [`crate::arch::codegen::ValueWidths`] -- through
+    /// `scratch` where it is neither in a register nor in the frame. The one
+    /// test `Cbr` and `Select` both make.
+    fn emit_condition_test(&mut self, cond: PseudoId, scratch: Reg) {
+        let bits = self.base.value_widths.bits(cond).clamp(8, 64);
+        let size = OperandSize::from_bits(bits);
+        match self.get_location(cond) {
+            Loc::Reg(r) => self.push_lir(X86Inst::Test {
+                size,
+                src: GpOperand::Reg(r),
+                dst: GpOperand::Reg(r),
+            }),
+            Loc::Stack(offset) => self.push_lir(X86Inst::Cmp {
+                size,
+                src: GpOperand::Imm(0),
+                dst: GpOperand::Mem(self.stack_mem(offset)),
+            }),
+            Loc::IncomingArg(offset) => self.push_lir(X86Inst::Cmp {
+                size,
+                src: GpOperand::Imm(0),
+                dst: GpOperand::Mem(MemAddr::BaseOffset {
+                    base: Reg::Rbp,
+                    offset,
+                }),
+            }),
+            _ => {
+                self.emit_move(cond, scratch, bits);
+                self.push_lir(X86Inst::Test {
+                    size,
+                    src: GpOperand::Reg(scratch),
+                    dst: GpOperand::Reg(scratch),
+                });
+            }
+        }
+    }
+
+    fn emit_cbr(&mut self, insn: &Instruction) -> bool {
         let Some(&cond) = insn.src.first() else {
             return false;
         };
 
         let loc = self.get_location(cond);
-        // Derive size from type when available, falling back to 64-bit
-        // when size is unset (0) to avoid truncating 64-bit condition values.
-        let size = insn
-            .typ
-            .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(if insn.size == 0 {
-                64
-            } else {
-                insn.size.max(32)
-            });
+        let size = self.base.value_widths.bits(cond);
 
         // Handle 128-bit integer stack values: OR both halves together and test
         if self.int128_pseudos.contains(&insn.src[0]) {
@@ -615,32 +644,9 @@ impl X86_64CodeGen {
             }
         }
 
-        let op_size = OperandSize::from_bits(size);
-
         match &loc {
-            Loc::Reg(r) => {
-                self.push_lir(X86Inst::Test {
-                    size: op_size,
-                    src: GpOperand::Reg(*r),
-                    dst: GpOperand::Reg(*r),
-                });
-            }
-            Loc::Stack(offset) => {
-                self.push_lir(X86Inst::Cmp {
-                    size: op_size,
-                    src: GpOperand::Imm(0),
-                    dst: GpOperand::Mem(self.stack_mem(*offset)),
-                });
-            }
-            Loc::IncomingArg(offset) => {
-                self.push_lir(X86Inst::Cmp {
-                    size: op_size,
-                    src: GpOperand::Imm(0),
-                    dst: GpOperand::Mem(MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset: *offset,
-                    }),
-                });
+            Loc::Reg(_) | Loc::Stack(_) | Loc::IncomingArg(_) | Loc::Global(_) => {
+                self.emit_condition_test(cond, Reg::R10);
             }
             Loc::Imm(v) => {
                 let target = if *v != 0 { insn.bb_true } else { insn.bb_false };
@@ -650,14 +656,6 @@ impl X86_64CodeGen {
                     });
                 }
                 return true;
-            }
-            Loc::Global(_) => {
-                self.emit_move(cond, Reg::R10, size);
-                self.push_lir(X86Inst::Test {
-                    size: op_size,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: GpOperand::Reg(Reg::R10),
-                });
             }
             Loc::Xmm(x) => {
                 let fp_size = if size <= 32 {
@@ -988,7 +986,7 @@ impl X86_64CodeGen {
                 }
             }
 
-            Opcode::Cbr => if self.emit_cbr(insn, types) {},
+            Opcode::Cbr => if self.emit_cbr(insn) {},
 
             // GNU computed goto: jump through the address in src[0]. The
             // CFG edges to every address-taken label are recorded on the
@@ -1409,24 +1407,8 @@ impl X86_64CodeGen {
                 self.emit_fp_move_from_xmm(XmmReg::Xmm15, &dst_loc, size);
                 return;
             }
-            Loc::Stack(offset) => {
-                // Reload directly from stack (safe from clobber)
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B64,
-                    src: GpOperand::Mem(self.stack_mem(*offset)),
-                    dst: GpOperand::Reg(Reg::R11),
-                });
-            }
-            _ => {
-                // For other locations (Reg, Global), use emit_move
-                self.emit_move(cond, Reg::R11, 64);
-            }
+            _ => self.emit_condition_test(cond, Reg::R11),
         }
-        self.push_lir(X86Inst::Test {
-            size: OperandSize::B64,
-            src: GpOperand::Reg(Reg::R11),
-            dst: GpOperand::Reg(Reg::R11),
-        });
 
         // Branch: load else_val, skip over then_val load if condition is false
         let then_suffix = self.unique_label_counter;
@@ -1478,13 +1460,6 @@ impl X86_64CodeGen {
         // Test condition
         let cond_loc = self.get_location(cond);
         match &cond_loc {
-            Loc::Reg(r) => {
-                self.push_lir(X86Inst::Test {
-                    size: OperandSize::B64,
-                    src: GpOperand::Reg(*r),
-                    dst: GpOperand::Reg(*r),
-                });
-            }
             Loc::Imm(v) => {
                 if *v != 0 {
                     self.emit_move(then_val, dst_reg, size);
@@ -1498,14 +1473,7 @@ impl X86_64CodeGen {
                 }
                 return;
             }
-            _ => {
-                self.emit_move(cond, Reg::R11, 64);
-                self.push_lir(X86Inst::Test {
-                    size: OperandSize::B64,
-                    src: GpOperand::Reg(Reg::R11),
-                    dst: GpOperand::Reg(Reg::R11),
-                });
-            }
+            _ => self.emit_condition_test(cond, Reg::R11),
         }
 
         let then_reg = if dst_reg == Reg::R10 {

@@ -10,6 +10,7 @@
 // 128-bit integer transfers
 //
 
+use crate::arch::codegen::SymSlot;
 use crate::arch::lir::{FpSize, OperandSize, Symbol};
 use crate::arch::x86_64::codegen::X86_64CodeGen;
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
@@ -926,31 +927,13 @@ impl X86_64CodeGen {
 
                 let op_size = OperandSize::from_bits(mem_size);
                 if is_symbol {
-                    // Local variable - store directly to stack slot.
-                    // Widen a 32-bit store at offset 0 to 64 bits, so a narrow
-                    // value going into a wider slot leaves no stale upper bits
-                    // behind it (an int-to-long or int-to-pointer assignment).
-                    //
-                    // Only where the slot holds one scalar, though: an
-                    // aggregate or a complex has another member at offset 4 or
-                    // 8, and widening the store writes over it. Asking how
-                    // *large* the object is cannot tell the two apart -- a
-                    // `long` and a `struct { int x, y; }` are both 64 bits, and
-                    // testing for more than 64 spared only the aggregates too
-                    // big to be confused with a scalar in the first place. A
-                    // slot this has no record of keeps the widening, which is
-                    // what it did before.
-                    let store_size = if mem_size == 32 && insn.offset == 0 {
-                        match self.sym_slots.get(&addr) {
-                            Some(slot) if slot.widenable() => OperandSize::B64,
-                            Some(_) => op_size,
-                            // A slot with no record keeps the widening here,
-                            // which is what this back end did before.
-                            None => OperandSize::B64,
-                        }
-                    } else {
-                        op_size
-                    };
+                    // Local variable: store directly to its stack slot, at
+                    // the width `SymSlot::store_bits` decides.
+                    let store_size = OperandSize::from_bits(SymSlot::store_bits(
+                        self.sym_slots.get(&addr),
+                        mem_size,
+                        insn.offset,
+                    ));
                     // LIR: store to stack slot
                     self.push_lir(X86Inst::Mov {
                         size: store_size,

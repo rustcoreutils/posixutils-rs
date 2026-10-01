@@ -141,6 +141,8 @@ pub struct CodeGenBase<I: LirInst> {
     /// buffer lets `emit_all` append it to the line it has just written,
     /// without a new field on either enum or a change to any `emit` arm.
     pub lir_comments: std::collections::HashMap<usize, String>,
+    /// The width each of the current function's values is held at.
+    pub value_widths: ValueWidths,
     /// What `-g` needs to say about each function: its extent, and the
     /// parameters and locals inside it with where they live.
     ///
@@ -166,6 +168,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             shared_mode: false,
             verbose_asm: false,
             lir_comments: std::collections::HashMap::new(),
+            value_widths: ValueWidths::default(),
             fn_dies: Vec::new(),
         }
     }
@@ -1243,9 +1246,57 @@ pub struct SymSlot {
 }
 
 impl SymSlot {
-    /// Whether a 32-bit store at offset 0 of this slot may be widened to 64.
-    pub fn widenable(&self) -> bool {
-        self.one_scalar && self.bits <= 64
+    /// The width a store of `mem_bits` at `offset` into a local writes.
+    ///
+    /// A 32-bit store at offset 0 of a slot holding one scalar wider than
+    /// that writes all 64 bits, so no stale upper half is left beside it.
+    /// Everything else is written at exactly its width: an aggregate or a
+    /// complex has another member next to it, and a 32-bit scalar's slot has
+    /// nothing above it that is its own. `slot` is `None` for an address that
+    /// is no local this function records -- exact width there too, since
+    /// nothing says what adjoins it.
+    pub fn store_bits(slot: Option<&SymSlot>, mem_bits: u32, offset: i64) -> u32 {
+        match slot {
+            Some(s)
+                if mem_bits == 32 && offset == 0 && s.one_scalar && (33..=64).contains(&s.bits) =>
+            {
+                64
+            }
+            _ => mem_bits,
+        }
+    }
+}
+
+/// The width each of a function's values is held at: its defining
+/// instruction's size, or an argument's parameter type.
+///
+/// A value spilled to the frame is stored at this width, so it is the width
+/// a read of one must use: reading wider takes in bytes no store wrote,
+/// which held zero only while the prologue zeroed the whole frame. A
+/// comparison's `int` result stored with `str w16` and tested as a branch
+/// condition with `ldr x9` was the case that showed it.
+#[derive(Debug, Default)]
+pub struct ValueWidths(std::collections::HashMap<crate::ir::PseudoId, u32>);
+
+impl ValueWidths {
+    pub fn of(func: &crate::ir::Function, types: &crate::types::TypeTable) -> ValueWidths {
+        let mut widths: std::collections::HashMap<_, _> =
+            crate::arch::regalloc::arg_pseudo_types(func)
+                .into_iter()
+                .map(|(p, t)| (p, types.size_bits(t)))
+                .collect();
+        for insn in func.blocks.iter().flat_map(|b| &b.insns) {
+            if let Some(t) = insn.target.filter(|_| insn.size > 0) {
+                widths.insert(t, insn.size);
+            }
+        }
+        ValueWidths(widths)
+    }
+
+    /// The width `id`'s value is held at; sixty-four bits for a value with no
+    /// recorded width, which is what every reader assumed before.
+    pub fn bits(&self, id: crate::ir::PseudoId) -> u32 {
+        self.0.get(&id).copied().filter(|&b| b > 0).unwrap_or(64)
     }
 }
 
@@ -1367,4 +1418,45 @@ pub fn create_codegen(
     codegen.set_shared_mode(shared_mode);
     codegen.set_verbose_asm(verbose_asm);
     codegen
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SymSlot;
+
+    /// The one place a store into a local is widened: 32 bits at offset 0 of
+    /// a slot holding a single scalar wider than that, and nothing else.
+    #[test]
+    fn a_store_is_widened_only_into_a_wider_scalar() {
+        let scalar = |bits| SymSlot {
+            bits,
+            one_scalar: true,
+        };
+        let aggregate = SymSlot {
+            bits: 64,
+            one_scalar: false,
+        };
+        assert_eq!(
+            SymSlot::store_bits(Some(&scalar(64)), 32, 0),
+            64,
+            "int into a long"
+        );
+        assert_eq!(
+            SymSlot::store_bits(Some(&scalar(32)), 32, 0),
+            32,
+            "int into an int"
+        );
+        assert_eq!(SymSlot::store_bits(Some(&aggregate), 32, 0), 32, "a member");
+        assert_eq!(
+            SymSlot::store_bits(Some(&scalar(64)), 32, 4),
+            32,
+            "not at the start"
+        );
+        assert_eq!(
+            SymSlot::store_bits(Some(&scalar(64)), 16, 0),
+            16,
+            "not 32 bits"
+        );
+        assert_eq!(SymSlot::store_bits(None, 32, 0), 32, "no record");
+    }
 }

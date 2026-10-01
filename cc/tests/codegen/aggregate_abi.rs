@@ -1000,8 +1000,9 @@ long stride(struct Big *p, int i) { return (char *)&p[i] - (char *)p; }
 ///   one that materialises the constant as a literal rather than as
 ///   `movz`/`movk`. An `AARCH64_LINUX` assertion once cost **12.5 seconds and
 ///   16 GB** resident, because `initialize`'s 600 MB local went through an
-///   unrolled `zero_stack_frame`. That is a loop now; nobody has re-measured
-///   the rest of the aarch64 path at this size, so keep the list as it is.
+///   unrolled zeroing of the frame. Nothing zeroes the frame now; nobody has
+///   re-measured the rest of the aarch64 path at this size, so keep the list
+///   as it is.
 /// - **`by_value_param` does not pass its argument on.** The prologue copy is
 ///   the site under test. Sending a 600 MB aggregate used to cost 16 seconds
 ///   and 21.9 GB of compiler memory, one load/store pair per eightbyte; the

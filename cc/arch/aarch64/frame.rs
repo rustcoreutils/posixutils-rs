@@ -52,6 +52,7 @@ impl Aarch64CodeGen {
         self.pseudos = crate::arch::codegen::PseudoTable::new(&func.pseudos);
 
         self.sym_slots = crate::arch::codegen::sym_slots(func, types);
+        self.base.value_widths = crate::arch::codegen::ValueWidths::of(func, types);
 
         let stack_size = alloc.stack_size();
         self.frame_base = alloc.frame_base();
@@ -132,12 +133,6 @@ impl Aarch64CodeGen {
 
         // Emit prologue (save fp/lr, callee-saved regs, allocate stack)
         self.emit_prologue(total_frame, &callee_saved, &callee_saved_fp);
-
-        // Zero-initialize the local variable area BEFORE storing any arguments.
-        // This ensures all stack slots start as zero, so narrow writes (8/16/32-bit)
-        // leave zero in the unwritten upper bytes.
-        // Uses stp xzr, xzr which doesn't clobber any registers.
-        self.zero_stack_frame();
 
         // Compute aligned base register (x19) for over-aligned locals
         if let FrameBase::Aligned {
@@ -428,110 +423,6 @@ impl Aarch64CodeGen {
                     "x29",
                 )));
             }
-        }
-    }
-
-    /// Zero-initialize the local variable area of the stack frame.
-    /// This ensures all stack slots start as zero, so narrow writes (8/16/32-bit)
-    /// leave zero in the unwritten upper bytes.
-    ///
-    /// A small area -- one whose last pair store still reaches `x29` with the
-    /// `stp` immediate, [-512, 504] -- is zeroed by unrolled `stp xzr, xzr`.
-    /// Anything larger is a counted loop, so the prologue stays the same size
-    /// whatever the frame is, as x86-64's `rep stosq` does. Unrolling it cost
-    /// one instruction per eight bytes: a gigabyte local was 125 million
-    /// stores, and past 16 MiB the cursor's re-basing `add` did not encode.
-    fn zero_stack_frame(&mut self) {
-        let alloc_size = self.stack_alloc_size;
-        if alloc_size <= 0 {
-            return;
-        }
-        // Local variable area starts at FP + 16 + callee_saved_size
-        let base_offset = 16 + self.callee_saved_size;
-        // stp signed offset range is [-512, 504] for 64-bit registers
-        let max_stp_offset = base_offset + alloc_size - 16;
-        if max_stp_offset <= 504 {
-            // Small frame: use stp xzr, xzr (16 bytes per instruction)
-            let mut offset = 0;
-            while offset + 16 <= alloc_size {
-                self.push_lir(Aarch64Inst::Stp {
-                    size: OperandSize::B64,
-                    src1: Reg::Xzr,
-                    src2: Reg::Xzr,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: base_offset + offset,
-                    },
-                });
-                offset += 16;
-            }
-            if offset < alloc_size {
-                self.push_lir(Aarch64Inst::Str {
-                    size: OperandSize::B64,
-                    src: Reg::Xzr,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::X29,
-                        offset: base_offset + offset,
-                    },
-                });
-            }
-        } else {
-            self.emit_zero_loop(base_offset, alloc_size);
-        }
-    }
-
-    /// Zero `[x29 + base_offset, x29 + base_offset + bytes)`, rounded up to a
-    /// whole eightbyte, with a loop.
-    ///
-    /// X16 is the cursor and X17 the end of the paired part. Both are AAPCS64
-    /// intra-procedure scratch and nothing is live in them this early in the
-    /// prologue: the arguments are still in x0-x7 and v0-v7, and x8 holds the
-    /// indirect-result pointer.
-    fn emit_zero_loop(&mut self, base_offset: i32, bytes: i32) {
-        let bytes = (bytes + 7) & !7;
-        let pairs = bytes & !15;
-        self.push_lir(Aarch64Inst::Add {
-            size: OperandSize::B64,
-            src1: Reg::X29,
-            src2: GpOperand::Imm(base_offset.into()),
-            dst: Reg::X16,
-        });
-        if pairs > 0 {
-            self.push_lir(Aarch64Inst::Add {
-                size: OperandSize::B64,
-                src1: Reg::X16,
-                src2: GpOperand::Imm(pairs.into()),
-                dst: Reg::X17,
-            });
-            let top = self.next_unique_label("zero_frame");
-            self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(top.clone())));
-            self.push_lir(Aarch64Inst::Stp {
-                size: OperandSize::B64,
-                src1: Reg::Xzr,
-                src2: Reg::Xzr,
-                addr: MemAddr::PostIndex {
-                    base: Reg::X16,
-                    offset: 16,
-                },
-            });
-            self.push_lir(Aarch64Inst::Cmp {
-                size: OperandSize::B64,
-                src1: Reg::X16,
-                src2: GpOperand::Reg(Reg::X17),
-            });
-            self.push_lir(Aarch64Inst::BCond {
-                cond: CondCode::Ult,
-                target: top,
-            });
-        }
-        // The eightbyte left over when the area is not a multiple of sixteen;
-        // the cursor already points at it.
-        if bytes > pairs {
-            self.push_lir(Aarch64Inst::Str {
-                size: OperandSize::B64,
-                src: Reg::Xzr,
-                addr: MemAddr::Base(Reg::X16),
-            });
         }
     }
 

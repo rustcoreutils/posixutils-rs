@@ -1637,15 +1637,11 @@ fn codegen_many_branches_one_function() {
     }
 }
 
-/// A large frame's zeroing on aarch64 is a loop, not one store per eightbyte.
+/// A large aarch64 frame is allocated and addressed whole.
 ///
-/// Every aarch64 prologue zeroes the locals area so that a narrow write leaves
-/// zeros above it. It was unrolled: a 1 MB local came to about 125,000 lines
-/// of assembly, a gigabyte one to 125 million stores, and past 16 MiB the
-/// cursor's re-basing `add` did not encode at all. `clean` relies on that
-/// zeroing -- it reads a frame `dirty` just filled at the same depth -- which
-/// is c17's guarantee, not gcc's, so gcc is checked on the first two only.
-const AARCH64_BIG_FRAME_ZEROED: &str = r#"
+/// The locals of `big_frame` span a megabyte, past every load and store
+/// immediate, and `dirty` writes a frame `big_frame` has just left behind.
+const AARCH64_BIG_FRAME: &str = r#"
 #define NI __attribute__((noinline))
 volatile long sink;
 NI void touch(void *p) { sink += *(volatile char *)p; }
@@ -1667,64 +1663,44 @@ NI long dirty(void)
     return a[997];
 }
 
-NI long clean(void)
-{
-    volatile char a[100000];
-    touch((void *)a);
-    long bad = 0;
-    for (int i = 0; i < 100000; i += 997) bad += a[i] != 0;
-    return bad;
-}
-
 int main(void)
 {
     if (big_frame(5) != 8) return 1;
     if (dirty() != 0x55) return 2;
-    if (clean() != 0) return 3;
     return 0;
 }
 "#;
 
 #[test]
-fn codegen_aarch64_big_frame_is_zeroed_by_a_loop() {
+fn codegen_aarch64_big_frame_runs() {
     for opt in ["-O0", "-O2"] {
-        if let Some(code) =
-            compile_and_run_aarch64("a64_big_frame_zeroed", AARCH64_BIG_FRAME_ZEROED, opt)
-        {
+        if let Some(code) = compile_and_run_aarch64("a64_big_frame", AARCH64_BIG_FRAME, opt) {
             assert_eq!(code, 0, "at {opt}");
         }
     }
 }
 
-/// The shape of the zeroing: a loop past the `stp` range, whose size does
-/// not grow with the frame, and the unrolled pair stores below it.
+/// A prologue's size does not depend on its frame's. It once zeroed the
+/// whole locals area, unrolled -- a megabyte of locals was 125,000 lines of
+/// assembly -- and stores nothing into the frame at all now: C gives an
+/// uninitialized object no value, and every value is read back at the width
+/// it was stored at.
 #[test]
-fn codegen_aarch64_frame_zeroing_shape() {
+fn codegen_aarch64_prologue_does_not_grow_with_the_frame() {
     let target = ["--target", "aarch64-unknown-linux-gnu"];
     let big = asm_for_at(
-        "a64_zero_big",
+        "a64_big_prologue",
         "long f(void) { volatile char a[1000000]; a[0] = 1; return a[0]; }\n",
         &target,
-    );
-    assert!(
-        big.contains("stp xzr, xzr, [x16], #16"),
-        "no zeroing loop:\n{big}"
     );
     assert!(
         big.lines().count() < 200,
         "a 1 MB frame's prologue should not grow with the frame: {} lines",
         big.lines().count()
     );
-
-    let small = asm_for_at(
-        "a64_zero_small",
-        "long f(void) { volatile char a[64]; a[0] = 1; return a[0]; }\n",
-        &target,
-    );
-    assert!(small.contains("stp xzr, xzr, [x29, #"), "{small}");
     assert!(
-        !small.contains("[x16], #16"),
-        "a small frame is unrolled:\n{small}"
+        !big.contains("xzr, xzr"),
+        "nothing zeroes the frame:\n{big}"
     );
 }
 

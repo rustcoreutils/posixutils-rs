@@ -747,13 +747,17 @@ fn codegen_a_function_designator_is_tested_at_address_width() {
     let body = body_of(&asm, "same");
     assert!(body.contains("cmpq"), "{body}");
     assert!(!body.contains("cmpl"), "{body}");
+    // The address is compared at sixty-four bits. What that comparison
+    // yields is an `int`, and a branch on it rightly tests thirty-two.
     let asm = asm_for_with("fn_truth_a64", AARCH64_LINUX, src, &["-O0"]);
     for f in ["probe", "same"] {
         let body = body_of(&asm, f);
-        assert!(
-            !body.lines().any(|l| l.trim().starts_with("cmp w")),
-            "{body}"
-        );
+        let lines: Vec<&str> = body.lines().map(str::trim).collect();
+        let address_test = lines
+            .iter()
+            .position(|l| l.starts_with("cmp "))
+            .unwrap_or_else(|| panic!("no comparison in {f}:\n{body}"));
+        assert!(lines[address_test].starts_with("cmp x"), "{body}");
     }
 }
 

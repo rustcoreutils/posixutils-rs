@@ -13,6 +13,7 @@
 use crate::arch::aarch64::codegen::Aarch64CodeGen;
 use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{Loc, LocalSlot, Reg, VReg};
+use crate::arch::codegen::SymSlot;
 use crate::arch::lir::{FpSize, OperandSize, Symbol};
 use crate::ir::{Instruction, PseudoId};
 use crate::target::Os;
@@ -601,20 +602,12 @@ impl Aarch64CodeGen {
             return;
         }
 
-        // Widen a 32-bit store at offset 0 to 64 bits, so a narrow value going
-        // into a wider slot leaves no stale upper bits behind it (an
-        // int-to-long or int-to-pointer assignment). Only where the slot holds
-        // one scalar: see `SymSlot`. Only for a known local, too -- a global or
-        // a store through a pointer keeps its exact width, since nothing here
-        // knows what adjoins it.
-        let store_size = if mem_size == 32 && insn.offset == 0 {
-            match self.sym_slots.get(&addr) {
-                Some(slot) if slot.widenable() && slot.bits > 32 => OperandSize::B64,
-                _ => OperandSize::from_bits(mem_size),
-            }
-        } else {
-            OperandSize::from_bits(mem_size)
-        };
+        // At the width `SymSlot::store_bits` decides.
+        let store_size = OperandSize::from_bits(SymSlot::store_bits(
+            self.sym_slots.get(&addr),
+            mem_size,
+            insn.offset,
+        ));
 
         // Use widened size for register load when store is widened
         let reg_size = if store_size == OperandSize::B64 {

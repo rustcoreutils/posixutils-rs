@@ -874,7 +874,7 @@ enum TypeKey {
 /// exist at all is an error, while one that exists but is almost certainly a
 /// mistake is a warning. Matching that split is what lets code which builds
 /// today keep building.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AssignFault {
     /// No conversion exists: a pointer against a floating type, an aggregate
     /// against anything but a compatible aggregate, or a `void` value.
@@ -1885,15 +1885,13 @@ impl TypeTable {
             if (t_void && v_fn) || (v_void && t_fn) {
                 return Some(AssignFault::FunctionPointerVoid);
             }
-            if t_void || v_void {
-                return None;
-            }
-            if !self.types_compatible(t_pointee, v_pointee) {
+            if !(t_void || v_void) && !self.types_compatible(t_pointee, v_pointee) {
                 return Some(AssignFault::PointerMismatch);
             }
-            // Compatible targets, but the assignment must not silently gain
-            // write access: the target's qualifiers have to include the
-            // source's.
+            // Compatible targets, or one of them `void`, but the assignment
+            // must not silently gain write access: the target's qualifiers
+            // have to include the source's (6.5.16.1p1 says so of both
+            // cases), so `void *v = (const int *)p` is diagnosed too.
             let t_quals = self.qualifiers(t_pointee);
             let v_quals = self.qualifiers(v_pointee);
             return (!t_quals.contains(v_quals)).then_some(AssignFault::QualifierDiscard);
@@ -4116,6 +4114,33 @@ mod tests {
 
         let char_ptr = types.intern(Type::pointer(types.char_id));
         assert!(!types.types_compatible(int_ptr, char_ptr));
+    }
+
+    /// 6.5.16.1p1 keeps the pointee's qualifiers when one side is `void *`
+    /// just as when the pointees are compatible: dropping `const` or
+    /// `volatile` on the way to or from `void *` is a qualifier discard.
+    #[test]
+    fn test_void_pointer_assignment_keeps_qualifiers() {
+        let mut types = TypeTable::new(&Target::host());
+        let const_int = types.qualified_with(types.int_id, TypeModifiers::CONST);
+        let volatile_int = types.qualified_with(types.int_id, TypeModifiers::VOLATILE);
+        let const_int_ptr = types.intern(Type::pointer(const_int));
+        let volatile_int_ptr = types.intern(Type::pointer(volatile_int));
+        let int_ptr = types.intern(Type::pointer(types.int_id));
+        let (void_ptr, const_void_ptr) = (types.void_ptr_id, types.const_void_ptr_id);
+        let discard = Some(AssignFault::QualifierDiscard);
+        // (target, value, fault)
+        for (target, value, fault) in [
+            (void_ptr, const_int_ptr, discard),
+            (const_void_ptr, volatile_int_ptr, discard),
+            (int_ptr, const_void_ptr, discard),
+            (const_void_ptr, const_int_ptr, None),
+            (const_int_ptr, const_void_ptr, None),
+            (void_ptr, int_ptr, None),
+            (int_ptr, void_ptr, None),
+        ] {
+            assert_eq!(types.assignment_fault(target, value, false), fault);
+        }
     }
 
     #[test]

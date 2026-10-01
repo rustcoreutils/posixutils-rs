@@ -23,6 +23,7 @@
 //!   `LC_COLLATE` (consumed when nm's sort lands).
 
 use std::ffi::CString;
+#[cfg(unix)]
 use std::io;
 
 // libc-rs doesn't surface `wint_t` for Linux or macOS targets (only for
@@ -32,7 +33,7 @@ use std::io;
 // but we still match signedness for strict type correctness.
 #[cfg(target_vendor = "apple")]
 type WintT = libc::c_int;
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(unix, not(target_vendor = "apple")))]
 type WintT = libc::c_uint;
 
 /// Opaque `mbstate_t`. The `libc` crate exposes `mbstate_t` on Linux but not on
@@ -40,16 +41,19 @@ type WintT = libc::c_uint;
 /// layout (glibc: 8 bytes; macOS/Darwin: 128 bytes) with 8-byte alignment. A
 /// freshly zeroed value is the documented initial conversion state; `mbrtowc`
 /// only touches the bytes its own ABI defines, so over-sizing is safe.
+#[cfg(unix)]
 #[repr(C, align(8))]
 #[derive(Clone, Copy)]
 struct MbStateT([u8; 128]);
 
+#[cfg(unix)]
 impl MbStateT {
     fn zeroed() -> Self {
         MbStateT([0u8; 128])
     }
 }
 
+#[cfg(unix)]
 extern "C" {
     fn iswprint(c: WintT) -> libc::c_int;
     fn towlower(c: WintT) -> WintT;
@@ -93,6 +97,7 @@ extern "C" {
 /// `expand`, `fold`, `unexpand`, `pr`) handle control characters such as
 /// `<tab>`, `<backspace>`, and `<carriage-return>` separately and only consult
 /// this for ordinary characters.
+#[cfg(unix)]
 pub fn wcwidth_char(c: char) -> i32 {
     // SAFETY: wcwidth is thread-safe and side-effect-free; every Unicode
     // codepoint (max 0x10FFFF) fits losslessly in wchar_t (32-bit on all
@@ -107,6 +112,7 @@ pub fn wcwidth_char(c: char) -> i32 {
 macro_rules! ctype_predicate {
     ($(#[$meta:meta])* $name:ident, $byte_fn:path, $wide_fn:ident) => {
         $(#[$meta])*
+        #[cfg(unix)]
         pub fn $name(c: char) -> bool {
             if c.is_ascii() {
                 // SAFETY: the libc ctype function is thread-safe and
@@ -191,6 +197,7 @@ ctype_predicate!(
 /// through `towlower(3)`. (A non-ASCII codepoint such as `É` is multi-byte in a
 /// UTF-8 locale, so the byte-oriented `tolower(3)` could not map it.) Characters
 /// with no mapping are returned unchanged.
+#[cfg(unix)]
 pub fn to_lower(c: char) -> char {
     let mapped = if c.is_ascii() {
         // SAFETY: tolower is thread-safe; the argument is in [0, 127].
@@ -203,6 +210,7 @@ pub fn to_lower(c: char) -> char {
 }
 
 /// Map `c` to uppercase under the current `LC_CTYPE`. See [`to_lower`].
+#[cfg(unix)]
 pub fn to_upper(c: char) -> char {
     let mapped = if c.is_ascii() {
         // SAFETY: toupper is thread-safe; the argument is in [0, 127].
@@ -220,6 +228,7 @@ pub fn to_upper(c: char) -> char {
 /// multi-byte / non-ASCII Unicode characters it calls libc `iswprint(3)`.
 /// In the POSIX `C` locale: ASCII space and printable graph characters are
 /// printable; control characters (including `\n`, `\r`, `\t`, NUL) are not.
+#[cfg(unix)]
 pub fn isprint(c: char) -> bool {
     let code = c as u32;
     if c.is_ascii() {
@@ -244,6 +253,7 @@ pub fn isprint(c: char) -> bool {
 ///
 /// Call after `setlocale(LC_ALL, "")` (see `plib::diag::init_locale`);
 /// before that, the C locale's `"."` is reported.
+#[cfg(unix)]
 pub fn radix_char() -> String {
     // SAFETY: localeconv() returns a pointer to a static structure owned by
     // the C library, valid until the next setlocale()/localeconv() call. We
@@ -299,6 +309,7 @@ pub fn strcoll_bytes(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
 ///
 /// Returns an `io::Error` if `fmt` contains an interior NUL byte or if
 /// `localtime_r` reports failure.
+#[cfg(unix)]
 pub fn strftime(fmt: &str, epoch_secs: i64) -> io::Result<String> {
     let cfmt = CString::new(fmt).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
@@ -362,25 +373,33 @@ pub fn strftime(fmt: &str, epoch_secs: i64) -> io::Result<String> {
 ///
 /// `setlocale(LC_ALL, "")` must have been called for a non-`C` `YESEXPR` to take effect.
 pub fn is_affirmative(response: &str) -> bool {
+    #[cfg(unix)]
+    if let Some(yesexpr) = locale_yesexpr() {
+        return yesexpr.is_match(response);
+    }
+    response.starts_with(['y', 'Y'])
+}
+
+/// The current locale's `YESEXPR`, compiled; `None` when the locale supplies
+/// none or it does not compile, and [`is_affirmative`] takes the POSIX
+/// locale's leading `y`/`Y` instead. Windows has no `nl_langinfo`, and always
+/// takes that rule.
+#[cfg(unix)]
+fn locale_yesexpr() -> Option<crate::regex::Regex> {
     use std::ffi::CStr;
     // SAFETY: nl_langinfo returns a pointer to a static, locale-owned string (or a valid empty
     // string); the bytes are copied immediately before any further locale call.
     let pattern = unsafe {
         let p = libc::nl_langinfo(libc::YESEXPR);
         if p.is_null() {
-            None
-        } else {
-            CStr::from_ptr(p).to_str().ok().map(str::to_owned)
+            return None;
         }
+        CStr::from_ptr(p).to_str().ok()?.to_owned()
     };
-    let pattern = pattern.filter(|s| !s.is_empty());
-    match pattern {
-        Some(pat) => match crate::regex::Regex::ere(&pat) {
-            Ok(re) => re.is_match(response),
-            Err(_) => response.starts_with(['y', 'Y']),
-        },
-        None => response.starts_with(['y', 'Y']),
+    if pattern.is_empty() {
+        return None;
     }
+    crate::regex::Regex::ere(&pattern).ok()
 }
 
 /// Split `bytes` into multibyte characters under the current `LC_CTYPE`, each
@@ -393,6 +412,7 @@ pub fn is_affirmative(response: &str) -> bool {
 ///
 /// Used by `m4` for character- (not byte-) oriented `len`, `index`, `substr`,
 /// and `translit`, per POSIX `LC_CTYPE`.
+#[cfg(unix)]
 pub fn mb_char_slices(bytes: &[u8]) -> Vec<&[u8]> {
     let mut result = Vec::new();
     // An all-zero mbstate_t is the documented initial conversion state.
@@ -440,17 +460,20 @@ pub fn mb_char_slices(bytes: &[u8]) -> Vec<&[u8]> {
 ///
 /// Used by `wc` to count characters (`-m`) and split words (`-w`) correctly in
 /// a multibyte locale without reading the whole input into memory.
+#[cfg(unix)]
 pub struct MbDecoder {
     state: MbStateT,
     pending: usize,
 }
 
+#[cfg(unix)]
 impl Default for MbDecoder {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(unix)]
 impl MbDecoder {
     pub fn new() -> Self {
         MbDecoder {
@@ -514,7 +537,7 @@ impl MbDecoder {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
 
     use super::*;

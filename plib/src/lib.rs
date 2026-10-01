@@ -9,26 +9,41 @@
 
 pub mod archive;
 pub mod cscan;
+#[cfg(unix)]
 pub mod curuser;
 pub mod diag;
+#[cfg(unix)]
 pub mod exec;
+#[cfg(unix)]
 pub mod group;
 pub mod io;
 pub mod linediff;
 pub mod locale;
 pub mod lzw;
+#[cfg(unix)]
 pub mod modestr;
+#[cfg(unix)]
 pub mod platform;
+#[cfg(unix)]
 pub mod priority;
+#[cfg(unix)]
 pub mod projectdir;
+#[cfg(unix)]
 pub mod regex;
+#[cfg(unix)]
 pub mod sccsfile;
+#[cfg(unix)]
 pub mod syslog;
+#[cfg(unix)]
 pub mod test_expr;
 pub mod testing;
+#[cfg(unix)]
 pub mod tmp;
+#[cfg(unix)]
 pub mod tty;
+#[cfg(unix)]
 pub mod user;
+#[cfg(unix)]
 pub mod utmpx;
 
 pub const BUFSZ: usize = 8 * 1024;
@@ -45,7 +60,7 @@ pub const BUFSZ: usize = 8 * 1024;
 ///
 /// Recovers from a poisoned lock — the guarded data is `()`, so a panic in a
 /// prior holder leaves it perfectly usable.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn locale_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCALE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCALE_LOCK.lock().unwrap_or_else(|e| e.into_inner())

@@ -8,7 +8,7 @@
 //
 
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 /// open file, or stdin
@@ -81,6 +81,7 @@ pub fn input_reader(
 ///
 /// Used by utilities like `ar` and `strip` that rewrite a binary in place
 /// where a partial write would corrupt the artifact on disk.
+#[cfg(unix)]
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mode = match fs::metadata(path) {
         Ok(meta) => {
@@ -103,7 +104,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// For the callers whose spec, or whose security posture, fixes the mode
 /// rather than deriving it — `crontab` writes the spool copy `0600` whether or
 /// not one was already there.
+#[cfg(unix)]
 pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
     let parent = path
@@ -145,9 +148,13 @@ pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()>
 /// one raw `libc::execve` -- resets every disposition itself in
 /// `TrapManager::reset`. A default disposition is inherited unchanged, so with
 /// this called there is nothing left for either of them to undo.
+///
+/// Windows has no `SIGPIPE`: a write to a closed pipe fails with an error,
+/// and there is nothing to restore.
 pub fn restore_sigpipe() {
     // SAFETY: `signal` with SIG_DFL is async-signal-safe and this runs before
     // any other thread exists.
+    #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
@@ -178,9 +185,11 @@ pub fn restore_sigpipe() {
 ///
 /// When a thread does the writing, the guard has to outlive the join, not just
 /// the spawn.
+#[cfg(unix)]
 #[must_use = "SIGPIPE is only ignored while the guard is alive"]
 pub struct SigPipeIgnored(libc::sighandler_t);
 
+#[cfg(unix)]
 impl SigPipeIgnored {
     /// Ignore `SIGPIPE`, remembering the disposition being replaced.
     pub fn new() -> Self {
@@ -191,12 +200,14 @@ impl SigPipeIgnored {
     }
 }
 
+#[cfg(unix)]
 impl Default for SigPipeIgnored {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(unix)]
 impl Drop for SigPipeIgnored {
     fn drop(&mut self) {
         // SAFETY: as `new`; `self.0` came from `signal` and is a valid handler.
@@ -217,7 +228,17 @@ impl Drop for SigPipeIgnored {
 /// output out of an unrelated file.
 ///
 /// Call this as the first statement of `main`, before opening anything.
+///
+/// Windows hands out handles rather than reusing the lowest free descriptor
+/// number, so a closed standard handle is never filled by an unrelated open,
+/// and there is nothing to do.
 pub fn ensure_std_fds_open() {
+    #[cfg(unix)]
+    open_free_std_fds();
+}
+
+#[cfg(unix)]
+fn open_free_std_fds() {
     use std::os::fd::{AsRawFd, IntoRawFd};
     while let Ok(file) = std::fs::OpenOptions::new()
         .read(true)
@@ -233,7 +254,7 @@ pub fn ensure_std_fds_open() {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

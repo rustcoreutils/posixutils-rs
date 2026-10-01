@@ -172,6 +172,9 @@ pub fn exit_status() -> i32 {
 /// regardless of locale. Errors we constructed ourselves have no `errno` and
 /// are passed through with the parenthetical stripped if one is somehow there.
 pub fn io_error_text(e: &io::Error) -> String {
+    // Windows has no `strerror_r`; there Rust's own text is already the
+    // system's (FormatMessage), so the fallback below is the locale's message.
+    #[cfg(unix)]
     if let Some(errno) = e.raw_os_error() {
         // `strerror_r` rather than `strerror`: the latter may return a pointer
         // into a shared static buffer for an unrecognized errno, which is a

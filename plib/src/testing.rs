@@ -14,44 +14,31 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::Duration;
 
-/// Get the target directory for built binaries.
-///
-/// Handles cargo-llvm-cov which uses a custom target directory.
-pub fn get_target_dir() -> String {
-    std::env::var("CARGO_TARGET_DIR")
-        .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
-        .unwrap_or_else(|_| {
-            if cfg!(coverage) {
-                String::from("target/llvm-cov-target")
-            } else {
-                String::from("target")
-            }
-        })
-}
-
-/// Get the current build profile ("debug" or "release").
-pub fn get_profile() -> &'static str {
-    if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    }
-}
-
 /// Get the full path to a built binary.
 ///
-/// This assumes the current directory is within a workspace member crate
-/// and navigates up to the workspace root to find the binary.
+/// Cargo puts an integration-test executable in `<bin dir>/deps/` and the
+/// package's binaries in `<bin dir>`, whatever the target directory, profile,
+/// `--target` triple or coverage wrapper, so the binaries are found from the
+/// running test executable rather than reconstructed from guesses at those.
+/// The platform's executable suffix (`.exe` on Windows) is appended.
 pub fn get_binary_path(cmd: &str) -> PathBuf {
-    let target_dir = get_target_dir();
-    let profile = get_profile();
-    let relpath = format!("{}/{}/{}", target_dir, profile, cmd);
+    binary_dir().join(format!("{cmd}{}", std::env::consts::EXE_SUFFIX))
+}
 
-    std::env::current_dir()
-        .unwrap()
+/// The directory holding the workspace's built binaries: the running test
+/// executable's own directory, or its parent when that is `deps`.
+fn binary_dir() -> PathBuf {
+    let exe = std::env::current_exe().expect("locate the running test executable");
+    let dir = exe
         .parent()
-        .unwrap() // Move up to the workspace root from the current package directory
-        .join(relpath)
+        .expect("test executable has a parent directory");
+    if dir.file_name().is_some_and(|name| name == "deps") {
+        dir.parent()
+            .expect("deps has a parent directory")
+            .to_path_buf()
+    } else {
+        dir.to_path_buf()
+    }
 }
 
 pub struct TestPlan {
@@ -372,6 +359,7 @@ pub fn locale_matching(candidates: &[&str]) -> Option<String> {
 /// this short" -- the answer `read_exact` throws away -- from "one `read`
 /// happened to come back early", which is not an answer about the stream at
 /// all.
+#[cfg(any(unix, test))]
 fn read_until_full(r: &mut impl std::io::Read, buf: &mut [u8]) -> usize {
     let mut n = 0;
     while n < buf.len() {
@@ -385,6 +373,7 @@ fn read_until_full(r: &mut impl std::io::Read, buf: &mut [u8]) -> usize {
     n
 }
 
+#[cfg(unix)]
 pub fn assert_dies_by_sigpipe(cmd: &str, args: &[&str]) {
     use std::os::unix::process::ExitStatusExt as _;
 

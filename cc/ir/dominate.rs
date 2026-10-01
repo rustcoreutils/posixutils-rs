@@ -8,7 +8,8 @@
 //
 // Dominator tree computation.
 //
-// - Dominator tree: "A simple, fast dominance algorithm" by Cooper, Harvey, Kennedy
+// - Dominator tree: "A Fast Algorithm for Finding Dominators in a Flowgraph"
+//   by Lengauer and Tarjan, in its simple form
 // - IDF computation: "A Linear Time Algorithm for Placing phi-nodes" by Sreedhar and Gao
 //
 

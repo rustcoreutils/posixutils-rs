@@ -2770,3 +2770,35 @@ int main(void) {{
         0
     );
 }
+
+/// An array or a function in a register operand has decayed to a pointer
+/// (C17 6.3.2.1p3-4), so the operand is the pointer's width. c17 sized it
+/// as the array, and named the register for an odd width as its 32-bit half:
+/// `0(%eax)` addressed the low four gigabytes, where no stack is.
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn codegen_asm_array_operand_is_a_pointer() {
+    #[cfg(target_arch = "x86_64")]
+    let store = "movq $7, 0(%0)";
+    #[cfg(target_arch = "aarch64")]
+    let store = "mov x9, #7\n\tstr x9, [%0]";
+    let code = format!(
+        r#"
+static long kept[2];
+static int seven(void) {{ return 7; }}
+int main(void) {{
+    long local[2] = {{ 0, 0 }};
+    void *fp;
+    __asm__ volatile("{store}" : : "r"(local) : "x9", "memory");
+    __asm__ volatile("{store}" : : "r"(kept) : "x9", "memory");
+    __asm__ volatile("" : "=r"(fp) : "0"(seven));
+    if (local[0] != 7 || kept[0] != 7) return 1;
+    return fp == (void *)seven ? 0 : 2;
+}}
+"#
+    );
+    #[cfg(target_arch = "x86_64")]
+    let code = code.replace("\"x9\", ", "");
+    assert_eq!(compile_and_run("asm_array_operand", &code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("asm_array_operand_opt", &code), 0);
+}

@@ -3172,7 +3172,19 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Get symbolic name if present
             let name = op.name.map(|n| self.str(n).to_string());
 
+            // A value operand is the expression's value, and an array or a
+            // function there has decayed to a pointer (C17 6.3.2.1p3-4): its
+            // width is the pointer's, not the array's. A memory operand is the
+            // object itself and keeps the object's size.
             let typ = self.expr_type(&op.expr);
+            let typ = match self.types.kind(typ) {
+                TypeKind::Array if !is_memory => {
+                    let elem = self.types.base_type(typ).unwrap_or(typ);
+                    self.types.pointer_to(elem)
+                }
+                TypeKind::Function if !is_memory => self.types.pointer_to(typ),
+                _ => typ,
+            };
             let size = self.types.size_bits(typ);
 
             // For matching constraints (like "0"), we need to load the input value
@@ -4610,5 +4622,44 @@ mod jump_scope_tests {
         assert_eq!(w.stray_jumps.len(), 1);
         let w = walk_of("int f(int x) { for (;;) { x = ({ if (x) break; x; }); } return x; }");
         assert!(w.stray_jumps.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod asm_operand_tests {
+    use crate::ir::linearize::test_linearize::linearize_source;
+    use crate::ir::Opcode;
+    use crate::target::Target;
+
+    /// A register operand of array or function type is the pointer it
+    /// decays to, sixty-four bits wide; a memory operand keeps the object's
+    /// size.
+    #[test]
+    fn an_array_value_operand_is_pointer_wide() {
+        let module = linearize_source(
+            "long a[4];\n\
+             int g(void);\n\
+             void f(void) {\n\
+             __asm__ volatile(\"\" : : \"r\"(a), \"r\"(g), \"m\"(a));\n\
+             }\n",
+            &Target::host(),
+        );
+        let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+        let asm = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .find(|i| i.op == Opcode::Asm)
+            .unwrap();
+        let sizes: Vec<u32> = asm
+            .extra()
+            .asm_data
+            .as_ref()
+            .unwrap()
+            .inputs
+            .iter()
+            .map(|c| c.size)
+            .collect();
+        assert_eq!(sizes, [64, 64, 256]);
     }
 }

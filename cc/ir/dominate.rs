@@ -352,140 +352,95 @@ pub fn idf_compute(func: &Function, dom: &DomTree, alpha: &[BasicBlockId]) -> Ve
         return Vec::new();
     }
 
-    let mut visited = HashSet::with_capacity(DEFAULT_IDF_CAPACITY);
-    let mut in_idf = HashSet::with_capacity(DEFAULT_IDF_CAPACITY);
-    let mut in_alpha: HashSet<BasicBlockId> = alpha.iter().copied().collect();
-    let mut idf = Vec::with_capacity(DEFAULT_IDF_CAPACITY);
-
-    let mut queue = LevelQueue::new(dom.max_level());
-
-    // Initialize: put all alpha blocks in the queue
+    let mut walk = IdfWalk {
+        func,
+        dom,
+        in_alpha: alpha.iter().copied().collect(),
+        visited: HashSet::with_capacity(DEFAULT_IDF_CAPACITY),
+        in_idf: HashSet::with_capacity(DEFAULT_IDF_CAPACITY),
+        idf: Vec::with_capacity(DEFAULT_IDF_CAPACITY),
+        queue: LevelQueue::new(dom.max_level()),
+    };
     for &bb_id in alpha {
         if func.get_block(bb_id).is_some() {
-            queue.push(bb_id, dom.level(bb_id));
+            walk.queue.push(bb_id, dom.level(bb_id));
         }
     }
+    while let Some(x) = walk.queue.pop() {
+        walk.visited.insert(x);
+        let level = dom.level(x);
+        walk.j_edges(x, level);
+        for &child in dom.children(x) {
+            if !walk.visited.contains(&child) {
+                walk.visit_subtree(child, level);
+            }
+        }
+    }
+    walk.idf
+}
 
-    // Process queue
-    while let Some(x) = queue.pop() {
-        visited.insert(x);
+/// One Sreedhar-Gao walk: the blocks the IDF has gathered and the queue of
+/// those still to explore.
+struct IdfWalk<'a> {
+    func: &'a Function,
+    dom: &'a DomTree,
+    in_alpha: HashSet<BasicBlockId>,
+    visited: HashSet<BasicBlockId>,
+    in_idf: HashSet<BasicBlockId>,
+    idf: Vec<BasicBlockId>,
+    queue: LevelQueue,
+}
 
-        let x_level = dom.level(x);
-
-        // Get children (successors) of x
-        let children: Vec<BasicBlockId> = func
-            .get_block(x)
-            .map(|bb| bb.children.clone())
-            .unwrap_or_default();
-
-        for y in children {
-            // Skip if y is dominated by x (not a J-edge)
+impl IdfWalk<'_> {
+    /// Add to the IDF the target of each J-edge out of `x` -- an edge to a
+    /// block `x` does not immediately dominate -- whose level is at or above
+    /// `level`, and queue each new one that is not in alpha.
+    fn j_edges(&mut self, x: BasicBlockId, level: u32) {
+        let (func, dom) = (self.func, self.dom);
+        let Some(bb) = func.get_block(x) else {
+            return;
+        };
+        for &y in &bb.children {
             if dom.idom(y) == Some(x) {
                 continue;
             }
-
-            // y must be at same or lower level than x to be in DF
             let y_level = dom.level(y);
-            if y_level > x_level {
+            if y_level > level {
                 continue;
             }
-
-            // Add y to IDF if not already there
-            if !in_idf.contains(&y) {
-                in_idf.insert(y);
-                idf.push(y);
-
-                // If y is not in alpha, add it to the queue for further exploration
-                if !in_alpha.contains(&y) {
-                    queue.push(y, y_level);
+            if self.in_idf.insert(y) {
+                self.idf.push(y);
+                if !self.in_alpha.contains(&y) {
+                    self.queue.push(y, y_level);
                 }
-            }
-        }
-
-        // Visit dominator tree children
-        let dom_children: Vec<BasicBlockId> = dom.children(x).to_vec();
-
-        for child in dom_children {
-            if !visited.contains(&child) {
-                // Recursively visit in dominator tree order
-                // For proper IDF, we need to visit subtree
-                visit_domtree(
-                    func,
-                    dom,
-                    child,
-                    x_level,
-                    &mut visited,
-                    &mut in_idf,
-                    &mut in_alpha,
-                    &mut idf,
-                    &mut queue,
-                );
             }
         }
     }
 
-    idf
-}
-
-/// Visit the dominator subtree under `root` in pre-order -- a block, then
-/// each dominated child's subtree in order -- recording the J-edges that
-/// leave it at or above `curr_level`.
-///
-/// On an explicit stack rather than the call stack: a function of n
-/// sequential `if` statements has a dominator tree n levels deep, and a
-/// recursion per level overflowed the compiler's stack. Children are pushed
-/// in reverse so they are popped, and so visited, in order.
-#[allow(clippy::too_many_arguments)]
-fn visit_domtree(
-    func: &Function,
-    dom: &DomTree,
-    root: BasicBlockId,
-    curr_level: u32,
-    visited: &mut HashSet<BasicBlockId>,
-    in_idf: &mut HashSet<BasicBlockId>,
-    in_alpha: &mut HashSet<BasicBlockId>,
-    idf: &mut Vec<BasicBlockId>,
-    queue: &mut LevelQueue,
-) {
-    let mut stack = vec![root];
-    while let Some(bb_id) = stack.pop() {
-        if !visited.insert(bb_id) {
-            continue;
-        }
-
-        // Check successors
-        let children: &[BasicBlockId] = func
-            .get_block(bb_id)
-            .map(|bb| bb.children.as_slice())
-            .unwrap_or(&[]);
-
-        for &y in children {
-            // Skip if y is dominated by bb_id (not a J-edge)
-            if dom.idom(y) == Some(bb_id) {
+    /// Visit the dominator subtree under `root` in pre-order -- a block, then
+    /// each dominated child's subtree in order -- recording the J-edges that
+    /// leave it at or above `level`.
+    ///
+    /// On an explicit stack rather than the call stack: a function of n
+    /// sequential `if` statements has a dominator tree n levels deep, and a
+    /// recursion per level overflowed the compiler's stack. Children are
+    /// pushed in reverse so they are popped, and so visited, in order.
+    fn visit_subtree(&mut self, root: BasicBlockId, level: u32) {
+        let dom = self.dom;
+        let mut stack = vec![root];
+        while let Some(bb_id) = stack.pop() {
+            if !self.visited.insert(bb_id) {
                 continue;
             }
-
-            // y must be at same or lower level
-            let y_level = dom.level(y);
-            if y_level > curr_level {
-                continue;
-            }
-
-            if in_idf.insert(y) {
-                idf.push(y);
-                if !in_alpha.contains(&y) {
-                    queue.push(y, y_level);
-                }
-            }
+            self.j_edges(bb_id, level);
+            stack.extend(
+                dom.children(bb_id)
+                    .iter()
+                    .rev()
+                    .copied()
+                    .filter(|c| !self.visited.contains(c)),
+            );
         }
-
-        stack.extend(
-            dom.children(bb_id)
-                .iter()
-                .rev()
-                .copied()
-                .filter(|c| !visited.contains(c)),
-        );
     }
 }
 

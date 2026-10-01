@@ -91,10 +91,11 @@ fn bitfield_carrier_bytes(
 /// The bytes a bit-field member's own bits occupy, measured from the first
 /// byte of the struct that declares it. `None` for anything but a bit-field.
 fn bitfield_byte_span(member: &crate::types::StructMember) -> Option<std::ops::Range<usize>> {
-    let (bit_offset, bit_width) = (member.bit_offset?, member.bit_width?);
-    let start = member.offset + (bit_offset / 8) as usize;
-    let end = member.offset + (bit_offset + bit_width).div_ceil(8) as usize;
-    Some(start..end.max(start + 1))
+    Some(crate::types::own_bit_bytes(
+        member.offset,
+        member.bit_offset?,
+        member.bit_width?,
+    ))
 }
 
 /// Give the carrier byte at `offset` of a struct initializer the bits `bits`

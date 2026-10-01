@@ -306,9 +306,7 @@ impl RawFieldInit {
     pub(crate) fn byte_span(&self) -> std::ops::Range<usize> {
         match (self.bit_offset, self.bit_width) {
             (Some(bit_offset), Some(bit_width)) => {
-                let start = self.offset + (bit_offset / 8) as usize;
-                let end = self.offset + (bit_offset + bit_width).div_ceil(8) as usize;
-                start..end.max(start + 1)
+                crate::types::own_bit_bytes(self.offset, bit_offset, bit_width)
             }
             _ => self.offset..self.offset + self.field_size,
         }
@@ -415,6 +413,18 @@ pub(crate) struct StructFieldVisit {
     /// designator chain went through. Not those of the object itself, which
     /// the consumer applies. See [`crate::types::TypeTable::subobject_type`].
     pub(crate) quals: TypeModifiers,
+}
+
+impl StructFieldVisit {
+    /// This field's placement, if it is a bit-field of non-zero width.
+    pub(crate) fn bitfield(&self) -> Option<crate::types::Bitfield> {
+        crate::types::Bitfield::from_parts(
+            self.offset,
+            self.bit_offset,
+            self.bit_width,
+            self.access_bytes,
+        )
+    }
 }
 
 pub(crate) enum StructFieldVisitKind {
@@ -1113,12 +1123,8 @@ impl<'a> Linearizer<'a> {
         let Some(&base) = insn.src.first() else {
             return insn;
         };
-        let ptr = self.types.pointer_to(self.types.char_id);
         let base = self.rvalue_addr(base, self.types.char_id);
-        let delta = self.emit_const(insn.offset as i128, self.types.long_id);
-        let addr = self.alloc_reg_pseudo();
-        self.emit(Instruction::binop(Opcode::Add, addr, base, delta, ptr, 64));
-        insn.src[0] = addr;
+        insn.src[0] = self.offset_address(base, insn.offset);
         insn.offset = 0;
         insn
     }
@@ -2739,22 +2745,7 @@ impl<'a> Linearizer<'a> {
                     .find_member(struct_type, *member)
                     .unwrap_or_else(|| MemberInfo::standing_in(self.expr_type(expr)));
 
-                if member_info.offset == 0 {
-                    base
-                } else {
-                    let offset_val =
-                        self.emit_const(member_info.offset as i128, self.types.long_id);
-                    let result = self.alloc_pseudo();
-                    self.emit(Instruction::binop(
-                        Opcode::Add,
-                        result,
-                        base,
-                        offset_val,
-                        self.types.long_id,
-                        64,
-                    ));
-                    result
-                }
+                self.offset_address(base, member_info.offset as i64)
             }
             ExprKind::Arrow {
                 expr: inner,
@@ -2774,22 +2765,7 @@ impl<'a> Linearizer<'a> {
                     .find_member(struct_type, *member)
                     .unwrap_or_else(|| MemberInfo::standing_in(self.expr_type(expr)));
 
-                if member_info.offset == 0 {
-                    ptr
-                } else {
-                    let offset_val =
-                        self.emit_const(member_info.offset as i128, self.types.long_id);
-                    let result = self.alloc_pseudo();
-                    self.emit(Instruction::binop(
-                        Opcode::Add,
-                        result,
-                        ptr,
-                        offset_val,
-                        self.types.long_id,
-                        64,
-                    ));
-                    result
-                }
+                self.offset_address(ptr, member_info.offset as i64)
             }
             ExprKind::Index { array, index } => {
                 // arr[idx] as lvalue = arr + idx * sizeof(elem)
@@ -3153,57 +3129,16 @@ impl<'a> Linearizer<'a> {
 
         // If member type is an array, return the address (arrays decay to pointers)
         if self.types.kind(member_info.typ) == TypeKind::Array {
-            if member_info.offset == 0 {
-                base
-            } else {
-                let result = self.alloc_pseudo();
-                let offset_val = self.emit_const(member_info.offset as i128, self.types.long_id);
-                self.emit(Instruction::binop(
-                    Opcode::Add,
-                    result,
-                    base,
-                    offset_val,
-                    self.types.long_id,
-                    64,
-                ));
-                result
-            }
-        } else if let (Some(bit_offset), Some(bit_width), Some(storage_size)) = (
-            member_info.bit_offset,
-            member_info.bit_width,
-            member_info.access_bytes,
-        ) {
-            // Bitfield read
-            self.emit_bitfield_load(
-                base,
-                member_info.offset,
-                bit_offset,
-                bit_width,
-                storage_size,
-                access_typ,
-            )
+            self.offset_address(base, member_info.offset as i64)
+        } else if let Some(bf) = member_info.bitfield() {
+            self.emit_bitfield_load(base, bf, access_typ)
         } else {
             let size = self.types.size_bits(member_info.typ);
             let member_kind = self.types.kind(member_info.typ);
 
             // Large structs (size > 64) can't be loaded into registers - return address
             if (member_kind == TypeKind::Struct || member_kind == TypeKind::Union) && size > 64 {
-                if member_info.offset == 0 {
-                    base
-                } else {
-                    let result = self.alloc_pseudo();
-                    let offset_val =
-                        self.emit_const(member_info.offset as i128, self.types.long_id);
-                    self.emit(Instruction::binop(
-                        Opcode::Add,
-                        result,
-                        base,
-                        offset_val,
-                        self.types.long_id,
-                        64,
-                    ));
-                    result
-                }
+                self.offset_address(base, member_info.offset as i64)
             } else {
                 let result = self.alloc_pseudo();
                 self.emit(Instruction::load(

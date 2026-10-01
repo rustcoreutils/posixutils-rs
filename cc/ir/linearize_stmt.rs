@@ -1147,6 +1147,12 @@ impl<'a> super::linearize::Linearizer<'a> {
 
                         let offset = base_offset + visit.offset as i64;
                         let field_type = visit.typ;
+                        // Placed in the object being initialized, not in the
+                        // aggregate the visit walked.
+                        let bitfield = visit.bitfield().map(|bf| crate::types::Bitfield {
+                            offset: offset as usize,
+                            ..bf
+                        });
                         // The member as a subobject of this object: a store
                         // into a `volatile` object is a volatile access even
                         // where the member was not declared so.
@@ -1167,9 +1173,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                                 );
                             }
                             StructFieldVisitKind::Expr(expr) => {
-                                if let (Some(bit_off), Some(bit_w), Some(storage_size)) =
-                                    (visit.bit_offset, visit.bit_width, visit.access_bytes)
-                                {
+                                if let Some(bf) = bitfield {
                                     let val = self.linearize_expr(&expr);
                                     let val_type = self.expr_type(&expr);
 
@@ -1179,15 +1183,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                                     // conversion normalizing to 0/1 (6.3.1.2), so
                                     // `struct { _Bool f:1; } v = {2};` stores 1.
                                     let member_val = self.emit_convert(val, val_type, field_type);
-                                    self.emit_bitfield_store(
-                                        base_sym,
-                                        offset as usize,
-                                        bit_off,
-                                        bit_w,
-                                        storage_size,
-                                        member_val,
-                                        field_type,
-                                    );
+                                    self.emit_bitfield_store(base_sym, bf, member_val, field_type);
                                 } else {
                                     self.linearize_struct_field_init(
                                         base_sym, offset, field_type, &expr,
@@ -1254,9 +1250,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Only the bytes the field's own bits reach; its access span is
             // wider and covers bytes other members own.
             (Some(bit_offset), Some(bit_width)) => {
-                let start = visit.offset + (bit_offset / 8) as usize;
-                let end = visit.offset + (bit_offset + bit_width).div_ceil(8) as usize;
-                start..end.max(start + 1)
+                crate::types::own_bit_bytes(visit.offset, bit_offset, bit_width)
             }
             _ => visit.offset..visit.offset + visit.field_size,
         };

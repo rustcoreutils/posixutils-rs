@@ -1777,7 +1777,6 @@ impl RegAlloc {
     ///   3. Commit: write Loc::Reg / Loc::VReg for colored vertices,
     ///      allocate stack slots for spilled vertices, track
     ///      `used_callee_saved` for the prologue.
-    #[allow(clippy::too_many_arguments)]
     fn run_chordal_color(
         &mut self,
         func: &Function,

@@ -9124,10 +9124,10 @@ fn test_void_cast_of_a_float_converts_nothing() {
 /// cannot arrive.
 ///
 /// `current_bb` is `None` after a `goto` and before a `switch`'s first
-/// `case`, and `emit` quietly drops what it is handed there. `emit_two_way`
+/// `case`, and `emit` quietly drops what it is handed there. A diamond
 /// cannot be dropped that way -- it has to hang three blocks off something --
 /// and it took `self.current_bb.unwrap()`, so `sqrt`, whose errno check is a
-/// two-way, panicked the compiler outright on the dead statement after a
+/// diamond, panicked the compiler outright on the dead statement after a
 /// `goto`.
 #[test]
 fn test_two_way_in_unreachable_code_does_not_panic() {

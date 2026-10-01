@@ -1267,6 +1267,39 @@ impl SymSlot {
     }
 }
 
+/// A `Select`'s operands, `target = cond ? then_val : else_val`, and the
+/// width the arms are moved at: what both targets' select emitters take.
+#[derive(Debug, Clone, Copy)]
+pub struct SelectOperands {
+    pub cond: crate::ir::PseudoId,
+    pub then_val: crate::ir::PseudoId,
+    pub else_val: crate::ir::PseudoId,
+    pub target: crate::ir::PseudoId,
+    /// The arms' width: the result type's, and never under 32 bits.
+    pub width: u32,
+}
+
+impl SelectOperands {
+    pub fn of(
+        insn: &crate::ir::Instruction,
+        types: &crate::types::TypeTable,
+    ) -> Option<SelectOperands> {
+        let [cond, then_val, else_val] = insn.src[..] else {
+            return None;
+        };
+        Some(SelectOperands {
+            cond,
+            then_val,
+            else_val,
+            target: insn.target?,
+            width: insn
+                .typ
+                .map(|t| types.size_bits(t).max(32))
+                .unwrap_or(insn.size.max(32)),
+        })
+    }
+}
+
 /// The width each of a function's values is held at: its defining
 /// instruction's size, or an argument's parameter type.
 ///

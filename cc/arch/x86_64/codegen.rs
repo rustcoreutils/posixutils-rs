@@ -12,6 +12,7 @@
 // Uses linear scan register allocation and System V AMD64 ABI.
 //
 
+use crate::arch::codegen::SelectOperands;
 use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
@@ -1348,19 +1349,10 @@ impl X86_64CodeGen {
     /// Emit a select (ternary) instruction using CMOVcc (integers) or
     /// conditional branch (floats, since CMov only works on GP registers).
     fn emit_select(&mut self, insn: &Instruction, types: &TypeTable) {
-        let (cond, then_val, else_val) = match (insn.src.first(), insn.src.get(1), insn.src.get(2))
-        {
-            (Some(&c), Some(&t), Some(&e)) => (c, t, e),
-            _ => return,
+        let Some(ops) = SelectOperands::of(insn, types) else {
+            return;
         };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-        let size = insn
-            .typ
-            .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+        let (then_val, else_val, size) = (ops.then_val, ops.else_val, ops.width);
 
         // Check if this is a floating-point select
         let is_fp = insn.typ.is_some_and(|t| types.is_float(t))
@@ -1369,9 +1361,9 @@ impl X86_64CodeGen {
 
         if is_fp {
             let fmt = self.fp_format(insn.typ, size, types);
-            self.emit_select_fp(cond, then_val, else_val, target, fmt);
+            self.emit_select_fp(ops, fmt);
         } else {
-            self.emit_select_int(cond, then_val, else_val, target, insn, types, size);
+            self.emit_select_int(ops);
         }
     }
 
@@ -1386,14 +1378,14 @@ impl X86_64CodeGen {
     /// whose interval doesn't cross a call) and is the classic
     /// silent-corruption case: the value-loss only manifests in
     /// downstream computations, often as infinite loops or wrong results.
-    fn emit_select_fp(
-        &mut self,
-        cond: PseudoId,
-        then_val: PseudoId,
-        else_val: PseudoId,
-        target: PseudoId,
-        size: FpSize,
-    ) {
+    fn emit_select_fp(&mut self, ops: SelectOperands, size: FpSize) {
+        let SelectOperands {
+            cond,
+            then_val,
+            else_val,
+            target,
+            ..
+        } = ops;
         let dst_loc = self.get_location(target);
 
         // Load condition to R11. FP value computation (fneg, fadd, etc.)
@@ -1435,18 +1427,14 @@ impl X86_64CodeGen {
     }
 
     /// Emit integer select using CMOVcc
-    #[allow(clippy::too_many_arguments)]
-    fn emit_select_int(
-        &mut self,
-        cond: PseudoId,
-        then_val: PseudoId,
-        else_val: PseudoId,
-        target: PseudoId,
-        insn: &Instruction,
-        _types: &TypeTable,
-        size: u32,
-    ) {
-        let _ = insn;
+    fn emit_select_int(&mut self, ops: SelectOperands) {
+        let SelectOperands {
+            cond,
+            then_val,
+            else_val,
+            target,
+            width: size,
+        } = ops;
         let op_size = OperandSize::from_bits(size);
         let dst_loc = self.get_location(target);
         let dst_reg = match &dst_loc {

@@ -65,7 +65,66 @@ pub struct StructMember {
     pub explicit_align: Option<u32>,
 }
 
+/// Where a bit-field lies: the access span its bits are read and written
+/// through, and the bits within it. See [`StructMember::access_bytes`] for
+/// the span's contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bitfield {
+    /// Byte offset of the access span from the base of the object.
+    pub offset: usize,
+    /// The field's first bit within the span.
+    pub bit_offset: u32,
+    /// The field's width in bits.
+    pub bit_width: u32,
+    /// The span's length in bytes.
+    pub access_bytes: u32,
+}
+
+impl Bitfield {
+    /// The placement the three member fields describe, when they describe
+    /// one: a bit-field of non-zero width.
+    pub fn from_parts(
+        offset: usize,
+        bit_offset: Option<u32>,
+        bit_width: Option<u32>,
+        access_bytes: Option<u32>,
+    ) -> Option<Bitfield> {
+        Some(Bitfield {
+            offset,
+            bit_offset: bit_offset?,
+            bit_width: bit_width.filter(|&w| w > 0)?,
+            access_bytes: access_bytes?,
+        })
+    }
+
+    /// The bytes the field's own bits occupy, from the object's base --
+    /// narrower than the access span, which covers bytes other members own:
+    /// what decides whether two initializers describe overlapping storage.
+    pub fn own_bytes(&self) -> std::ops::Range<usize> {
+        own_bit_bytes(self.offset, self.bit_offset, self.bit_width)
+    }
+}
+
+/// The bytes bits `[bit_offset, bit_offset + bit_width)` of the span at
+/// `offset` occupy: at least one, so that a zero-width field still names a
+/// place.
+pub fn own_bit_bytes(offset: usize, bit_offset: u32, bit_width: u32) -> std::ops::Range<usize> {
+    let start = offset + (bit_offset / 8) as usize;
+    let end = offset + (bit_offset + bit_width).div_ceil(8) as usize;
+    start..end.max(start + 1)
+}
+
 impl StructMember {
+    /// This member's placement, if it is a bit-field of non-zero width.
+    pub fn bitfield(&self) -> Option<Bitfield> {
+        Bitfield::from_parts(
+            self.offset,
+            self.bit_offset,
+            self.bit_width,
+            self.access_bytes,
+        )
+    }
+
     /// Does an initializer reach this member?
     ///
     /// Everything but an unnamed bit-field, which is padding rather than a
@@ -105,6 +164,16 @@ pub struct MemberInfo {
 }
 
 impl MemberInfo {
+    /// This member's placement, if it is a bit-field of non-zero width.
+    pub fn bitfield(&self) -> Option<Bitfield> {
+        Bitfield::from_parts(
+            self.offset,
+            self.bit_offset,
+            self.bit_width,
+            self.access_bytes,
+        )
+    }
+
     /// A stand-in for a member lookup that failed, occupying the whole object
     /// at offset 0 with type `typ`.
     ///
@@ -2961,6 +3030,33 @@ impl TypeTable {
 
 #[cfg(test)]
 mod tests {
+    /// A bit-field's own bytes: from the byte its first bit is in to the
+    /// byte its last bit is in, never empty -- narrower than the access span,
+    /// which covers bytes other members own.
+    #[test]
+    fn a_bitfield_owns_the_bytes_its_bits_reach() {
+        use super::{own_bit_bytes, Bitfield};
+        assert_eq!(own_bit_bytes(4, 0, 1), 4..5);
+        assert_eq!(own_bit_bytes(4, 7, 2), 4..6, "straddles a byte boundary");
+        assert_eq!(own_bit_bytes(4, 8, 8), 5..6);
+        assert_eq!(
+            own_bit_bytes(0, 3, 0),
+            0..1,
+            "zero width still names a byte"
+        );
+        let bf = Bitfield::from_parts(8, Some(12), Some(4), Some(4)).unwrap();
+        assert_eq!(bf.own_bytes(), 9..10);
+        assert_eq!(
+            Bitfield::from_parts(8, Some(0), Some(0), Some(4)),
+            None,
+            "zero width"
+        );
+        assert_eq!(
+            Bitfield::from_parts(8, None, None, None),
+            None,
+            "not a bit-field"
+        );
+    }
 
     /// `is_plain_int128` separates the two types `kind()` cannot.
     #[test]

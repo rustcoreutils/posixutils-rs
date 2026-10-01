@@ -17,6 +17,7 @@ use crate::diag::{error, Position};
 use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, FpCompare, LibFn, MathErrno, UnaryOp};
 use crate::strings::StringId;
+use crate::types::Bitfield;
 use crate::types::{MemberInfo, TypeId, TypeKind, TypeTable};
 
 /// A read-modify-write target whose address has been computed **once**.
@@ -33,10 +34,8 @@ use crate::types::{MemberInfo, TypeId, TypeKind, TypeTable};
 /// instead.
 pub(crate) struct RmwPlace {
     base: PseudoId,
-    /// `(byte offset, bit offset, bit width, storage bytes, field type)` --
-    /// spelled to match `emit_bitfield_load`/`_store`, which are the only
-    /// consumers.
-    bitfield: Option<(usize, u32, u32, u32, TypeId)>,
+    /// The bit-field's placement and its type as the access reaches it.
+    bitfield: Option<(Bitfield, TypeId)>,
 }
 
 /// Everything `E1 op= E2` needs beyond the two operand *values*: the operator
@@ -465,20 +464,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     fn block_dest_addr(&mut self, dst: PseudoId, dst_base_offset: i64) -> PseudoId {
         let void_ptr = self.types.void_ptr_id;
         let dst = self.rvalue_addr(dst, void_ptr);
-        if dst_base_offset == 0 {
-            return dst;
-        }
-        let off = self.emit_const(dst_base_offset as i128, self.types.long_id);
-        let adjusted = self.alloc_reg_pseudo();
-        self.emit(Instruction::binop(
-            Opcode::Add,
-            adjusted,
-            dst,
-            off,
-            void_ptr,
-            64,
-        ));
-        adjusted
+        self.offset_address(dst, dst_base_offset)
     }
 
     /// The same copy as a `memcpy` call.
@@ -516,12 +502,15 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn emit_bitfield_load(
         &mut self,
         base: PseudoId,
-        byte_offset: usize,
-        bit_offset: u32,
-        bit_width: u32,
-        storage_size: u32,
+        bf: Bitfield,
         typ: TypeId,
     ) -> PseudoId {
+        let Bitfield {
+            offset: byte_offset,
+            bit_offset,
+            bit_width,
+            access_bytes: storage_size,
+        } = bf;
         // A span that is not one addressable unit has to be assembled a byte at
         // a time. Only a packed bit-field produces one, and only then can the
         // span exceed eight bytes -- `packed { char c:1; unsigned long long
@@ -533,14 +522,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         // addressable unit -- and packing plus a >64-bit width is refused in
         // `validate_bitfield` for that reason.
         if !matches!(storage_size, 1 | 2 | 4 | 8 | 16) {
-            return self.emit_bitfield_load_bytewise(
-                base,
-                byte_offset,
-                bit_offset,
-                bit_width,
-                storage_size,
-                typ,
-            );
+            return self.emit_bitfield_load_bytewise(base, bf, typ);
         }
 
         // Determine storage type based on storage unit size
@@ -694,12 +676,15 @@ impl<'a> super::linearize::Linearizer<'a> {
     fn emit_bitfield_load_bytewise(
         &mut self,
         base: PseudoId,
-        byte_offset: usize,
-        bit_offset: u32,
-        bit_width: u32,
-        span: u32,
+        bf: Bitfield,
         typ: TypeId,
     ) -> PseudoId {
+        let Bitfield {
+            offset: byte_offset,
+            bit_offset,
+            bit_width,
+            access_bytes: span,
+        } = bf;
         let wide = bit_offset + bit_width > 32;
         let carrier = if wide {
             self.types.ulong_id
@@ -848,27 +833,21 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// qualifier and the marker is set from the field's type instead. Both
     /// halves are marked -- the read of the storage unit is as observable as
     /// the write of it.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn emit_bitfield_store(
         &mut self,
         base: PseudoId,
-        byte_offset: usize,
-        bit_offset: u32,
-        bit_width: u32,
-        storage_size: u32,
+        bf: Bitfield,
         new_value: PseudoId,
         typ: TypeId,
     ) {
+        let Bitfield {
+            offset: byte_offset,
+            bit_offset,
+            bit_width,
+            access_bytes: storage_size,
+        } = bf;
         if !matches!(storage_size, 1 | 2 | 4 | 8 | 16) {
-            return self.emit_bitfield_store_bytewise(
-                base,
-                byte_offset,
-                bit_offset,
-                bit_width,
-                storage_size,
-                new_value,
-                typ,
-            );
+            return self.emit_bitfield_store_bytewise(base, bf, new_value, typ);
         }
 
         // Determine storage type based on storage unit size
@@ -969,17 +948,19 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// bits survive. Neither ever touches a byte outside the field's own span,
     /// which is what a wide read-modify-write could not promise: the span may
     /// end at the last byte of the object.
-    #[allow(clippy::too_many_arguments)]
     fn emit_bitfield_store_bytewise(
         &mut self,
         base: PseudoId,
-        byte_offset: usize,
-        bit_offset: u32,
-        bit_width: u32,
-        span: u32,
+        bf: Bitfield,
         new_value: PseudoId,
         typ: TypeId,
     ) {
+        let Bitfield {
+            offset: byte_offset,
+            bit_offset,
+            bit_width,
+            access_bytes: span,
+        } = bf;
         let wide = bit_offset + bit_width > 32;
         let carrier = if wide {
             self.types.ulong_id
@@ -1920,9 +1901,11 @@ impl<'a> super::linearize::Linearizer<'a> {
             MathErrno::Set => {
                 let zero = self.emit_fconst(FloatVal::ZERO, typ);
                 let below = self.emit_compare(Opcode::FCmpOLt, x, zero, typ);
-                self.emit_two_way(
+                let size = self.types.size_bits(typ);
+                self.emit_diamond(
                     below,
                     typ,
+                    size,
                     |lin| lin.emit_library_call(&callee, &[(x, typ)], typ),
                     sqrt,
                 )
@@ -1985,24 +1968,6 @@ impl<'a> super::linearize::Linearizer<'a> {
             self.target,
         ));
         result
-    }
-
-    /// `cond ? taken() : fallthrough()`, each arm in a block of its own and
-    /// merged by a phi of type `typ`: for arms that may not both be
-    /// evaluated.
-    ///
-    /// The phi is as wide as `typ` is. A construct whose merge width is not
-    /// its type's -- a pointer-merged complex arm, a function designator,
-    /// whose `size_bits` is zero -- calls [`Self::emit_diamond`] and states it.
-    fn emit_two_way(
-        &mut self,
-        cond: PseudoId,
-        typ: TypeId,
-        taken: impl FnOnce(&mut Self) -> PseudoId,
-        fallthrough: impl FnOnce(&mut Self) -> PseudoId,
-    ) -> PseudoId {
-        let size = self.types.size_bits(typ);
-        self.emit_diamond(cond, typ, size, taken, fallthrough)
     }
 
     /// `cond ? then_arm() : else_arm()`, merged by a `size`-bit phi of type
@@ -2736,14 +2701,12 @@ impl<'a> super::linearize::Linearizer<'a> {
             .types
             .find_member(struct_type, member)
             .unwrap_or_else(|| MemberInfo::standing_in(target_typ));
-        let bitfield = match (info.bit_offset, info.bit_width, info.access_bytes) {
+        let bitfield = match info.bitfield() {
             // The target expression's type, not the member's declared one:
             // they name the same width and sign, and only the expression's
             // carries the object's qualifiers (C17 6.5.2.3p3), which is what
             // tells the bit-field emitters that the access is volatile.
-            (Some(bit_offset), Some(bit_width), Some(storage)) => {
-                Some((info.offset, bit_offset, bit_width, storage, target_typ))
-            }
+            Some(bf) => Some((bf, target_typ)),
             // Not a bit-field: fold the member offset into the base so the
             // load and the store share one address.
             _ => {
@@ -2758,7 +2721,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// `base + offset` as an address, or `base` itself when the offset is zero.
-    fn offset_address(&mut self, base: PseudoId, offset: i64) -> PseudoId {
+    pub(crate) fn offset_address(&mut self, base: PseudoId, offset: i64) -> PseudoId {
         if offset == 0 {
             return base;
         }
@@ -2777,10 +2740,8 @@ impl<'a> super::linearize::Linearizer<'a> {
 
     /// The target's current value, read through an already-resolved place.
     pub(crate) fn load_rmw_place(&mut self, place: &RmwPlace, typ: TypeId) -> PseudoId {
-        if let Some((offset, bit_offset, bit_width, storage, field_typ)) = place.bitfield {
-            return self.emit_bitfield_load(
-                place.base, offset, bit_offset, bit_width, storage, field_typ,
-            );
+        if let Some((bf, field_typ)) = place.bitfield {
+            return self.emit_bitfield_load(place.base, bf, field_typ);
         }
         let size = self.types.size_bits(typ);
         let val = self.alloc_reg_pseudo();
@@ -2799,11 +2760,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         val: PseudoId,
         typ: TypeId,
     ) -> Option<(u32, TypeId)> {
-        if let Some((offset, bit_offset, bit_width, storage, field_typ)) = place.bitfield {
-            self.emit_bitfield_store(
-                place.base, offset, bit_offset, bit_width, storage, val, field_typ,
-            );
-            return Some((bit_width, field_typ));
+        if let Some((bf, field_typ)) = place.bitfield {
+            self.emit_bitfield_store(place.base, bf, val, field_typ);
+            return Some((bf.bit_width, field_typ));
         }
         let size = self.types.size_bits(typ);
         self.emit(Instruction::store(val, place.base, 0, typ, size));

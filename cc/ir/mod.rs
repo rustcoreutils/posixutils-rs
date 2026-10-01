@@ -2073,17 +2073,6 @@ pub struct BasicBlock {
     /// address without branching on it -- legal GNU C -- lost the block to
     /// DCE, and the link failed on an undefined `.L` symbol.
     pub addr_taken: bool,
-
-    // ========================================================================
-    // Dominator tree fields (computed by dominate.rs)
-    // ========================================================================
-
-    // ========================================================================
-    // SSA construction fields (used during SSA conversion)
-    // ========================================================================
-    /// Phi nodes at the beginning of this block (variable name -> phi instruction)
-    /// Used during SSA construction to track inserted phi nodes
-    pub phi_map: HashMap<String, usize>,
 }
 
 impl Default for BasicBlock {
@@ -2095,7 +2084,6 @@ impl Default for BasicBlock {
             children: Vec::new(),
             label: None,
             addr_taken: false,
-            phi_map: HashMap::new(),
         }
     }
 }
@@ -3174,7 +3162,6 @@ impl Module {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
     /// The global named `name`, without a walk of every global: a unit with
     /// 100,000 of them spent fifteen seconds finding each one.
     fn global_mut(&mut self, name: &str) -> Option<&mut GlobalDef> {

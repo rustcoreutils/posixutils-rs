@@ -797,6 +797,13 @@ where
 /// The frame slot a local takes, as `(bytes, alignment)`: its own size and
 /// alignment, each at least eight -- or the alignment it was declared with.
 /// One rule for both allocators.
+///
+/// Eight, and not the object's own size, is a contract the back ends rely
+/// on: they move a register-passed value or an aggregate's tail a whole
+/// eightbyte at a time, as the calling conventions classify them, so every
+/// slot is a whole number of eightbytes. Packing a three-byte struct, a
+/// `_Float16` or a plain `char` parameter at its own size was measured to
+/// break each of those paths.
 pub fn local_slot(
     local: &crate::ir::LocalVar,
     types: &TypeTable,

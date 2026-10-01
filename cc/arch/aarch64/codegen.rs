@@ -20,6 +20,7 @@
 use crate::arch::aarch64::inline_asm::{asm_reg_name_32, asm_reg_name_64};
 use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{FrameBase, IncomingOff, Loc, LocalSlot, Reg, VReg};
+use crate::arch::codegen::SelectOperands;
 use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::ir::{Instruction, Module, Opcode, PseudoId, PseudoKind};
@@ -1136,19 +1137,10 @@ impl Aarch64CodeGen {
     /// Emit a select (ternary) instruction using CSEL (integers) or
     /// conditional branch (floats, since CSEL only works on GP registers).
     fn emit_select(&mut self, insn: &Instruction, types: &TypeTable) {
-        let (cond, then_val, else_val) = match (insn.src.first(), insn.src.get(1), insn.src.get(2))
-        {
-            (Some(&c), Some(&t), Some(&e)) => (c, t, e),
-            _ => return,
+        let Some(ops) = SelectOperands::of(insn, types) else {
+            return;
         };
-        let target = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-        let size = insn
-            .typ
-            .map(|t| types.size_bits(t).max(32))
-            .unwrap_or(insn.size.max(32));
+        let (then_val, else_val) = (ops.then_val, ops.else_val);
 
         // Check if this is a floating-point select
         let is_fp = insn.typ.is_some_and(|t| types.is_float(t))
@@ -1156,24 +1148,21 @@ impl Aarch64CodeGen {
             || matches!(self.get_location(else_val), Loc::VReg(_) | Loc::FImm(..));
 
         if is_fp {
-            self.emit_select_fp(cond, then_val, else_val, target, insn.typ, size, types);
+            self.emit_select_fp(ops, insn.typ, types);
         } else {
-            self.emit_select_int(cond, then_val, else_val, target, size);
+            self.emit_select_int(ops);
         }
     }
 
     /// Emit FP select using conditional branch (CSEL doesn't work on VRegs)
-    #[allow(clippy::too_many_arguments)]
-    fn emit_select_fp(
-        &mut self,
-        cond: PseudoId,
-        then_val: PseudoId,
-        else_val: PseudoId,
-        target: PseudoId,
-        typ: Option<TypeId>,
-        size: u32,
-        types: &TypeTable,
-    ) {
+    fn emit_select_fp(&mut self, ops: SelectOperands, typ: Option<TypeId>, types: &TypeTable) {
+        let SelectOperands {
+            cond,
+            then_val,
+            else_val,
+            target,
+            width: size,
+        } = ops;
         let dst_loc = self.get_location(target);
 
         // Check if condition is a constant
@@ -1212,14 +1201,14 @@ impl Aarch64CodeGen {
     }
 
     /// Emit integer select using CSEL
-    fn emit_select_int(
-        &mut self,
-        cond: PseudoId,
-        then_val: PseudoId,
-        else_val: PseudoId,
-        target: PseudoId,
-        size: u32,
-    ) {
+    fn emit_select_int(&mut self, ops: SelectOperands) {
+        let SelectOperands {
+            cond,
+            then_val,
+            else_val,
+            target,
+            width: size,
+        } = ops;
         let op_size = OperandSize::from_bits(size);
         let dst_loc = self.get_location(target);
         // Use X16 as default scratch to avoid clobbering live values

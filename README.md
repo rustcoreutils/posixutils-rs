@@ -96,6 +96,39 @@ The standard `cargo install` should work, for those interested in testing.  Care
 
 Note that `cargo install` copies the declared binaries and nothing else, so the six `argv[0]` symlinks above — `tar`, `cpio`, `ex`, `zcat`, `uncompress` and `[` — are *not* installed by it.  They are created in `target/<profile>` by the crates' build scripts, and delivered by the container image.
 
+### Windows
+
+A subset builds and is tested on Windows (MSVC): the `xform` crate's
+`cksum`, `compress`, `uuencode` and `uudecode`.
+
+```sh
+cargo build --release -p posixutils-xform
+```
+
+Building the whole workspace on Windows does not work: most utilities are
+inherently Unix (users, terminals, signals, file modes and ownership), and the
+`plib` modules behind them are compiled on Unix only. On Windows:
+
+- a file's POSIX mode is its read-only attribute, read as the owner-write bit
+  (`0444` or `0644`), and setting a mode without owner write makes the file
+  read-only;
+- `compress` restores permissions and times but not ownership, and does not
+  warn about hard links;
+- the `zcat` and `uncompress` aliases do not exist; use `compress -c -d` and
+  `compress -d`.
+
+Utilities are ported a whole crate at a time, since `cargo test -p` builds
+every binary in a crate. A crate joins the Windows CI job by being added to
+`WINDOWS_CRATES` in `.github/workflows/TestingCI.yml` once all of its binaries
+and tests compile and pass there; Unix-only code is gated with `#[cfg(unix)]`,
+never replaced by a stand-in. The Windows tests can be run on Linux under Wine:
+
+```sh
+rustup target add x86_64-pc-windows-gnu   # needs the mingw-w64 and wine packages
+CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine \
+    cargo test --release --target x86_64-pc-windows-gnu -p gettext-rs -p plib -p posixutils-xform
+```
+
 ### Container image
 
 A multi-architecture image is published to the GitHub container registry on

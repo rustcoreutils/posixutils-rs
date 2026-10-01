@@ -21,7 +21,7 @@ use crate::parse::ast::{
 use crate::strings::StringTable;
 use crate::symbol::Symbol;
 use crate::target::{Arch, Os, Target};
-use crate::types::{CompositeType, StructMember, Type, TypeTable};
+use crate::types::{CompositeType, MemberAlign, StructMember, Type, TypeTable};
 
 /// Create a default position for test code
 fn test_pos() -> Position {
@@ -3101,7 +3101,7 @@ fn test_incomplete_struct_type_resolution() {
                 bit_offset: None,
                 bit_width: None,
                 access_bytes: None,
-                explicit_align: None,
+                align: MemberAlign::NATURAL,
             },
             StructMember {
                 name: y_id,
@@ -3110,7 +3110,7 @@ fn test_incomplete_struct_type_resolution() {
                 bit_offset: None,
                 bit_width: None,
                 access_bytes: None,
-                explicit_align: None,
+                align: MemberAlign::NATURAL,
             },
         ],
         enum_constants: vec![],
@@ -3928,7 +3928,7 @@ fn test_struct_deref_returns_address() {
             bit_width: None,
             bit_offset: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         }],
         enum_constants: vec![],
         size: 4,
@@ -4567,7 +4567,7 @@ fn test_mixed_designated_positional_struct_init() {
                 bit_offset: None,
                 bit_width: None,
                 access_bytes: None,
-                explicit_align: None,
+                align: MemberAlign::NATURAL,
             },
             StructMember {
                 name: b_id,
@@ -4576,7 +4576,7 @@ fn test_mixed_designated_positional_struct_init() {
                 bit_offset: None,
                 bit_width: None,
                 access_bytes: None,
-                explicit_align: None,
+                align: MemberAlign::NATURAL,
             },
             StructMember {
                 name: c_id,
@@ -4585,7 +4585,7 @@ fn test_mixed_designated_positional_struct_init() {
                 bit_offset: None,
                 bit_width: None,
                 access_bytes: None,
-                explicit_align: None,
+                align: MemberAlign::NATURAL,
             },
             StructMember {
                 name: d_id,
@@ -4594,7 +4594,7 @@ fn test_mixed_designated_positional_struct_init() {
                 bit_offset: None,
                 bit_width: None,
                 access_bytes: None,
-                explicit_align: None,
+                align: MemberAlign::NATURAL,
             },
         ],
         enum_constants: vec![],
@@ -4808,7 +4808,7 @@ fn test_designator_chain_nested_struct_init() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: y_id,
@@ -4817,7 +4817,7 @@ fn test_designator_chain_nested_struct_init() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
     ];
     let pt_type = ctx.types.intern(Type::struct_type(CompositeType {
@@ -4842,7 +4842,7 @@ fn test_designator_chain_nested_struct_init() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: z_id,
@@ -4851,7 +4851,7 @@ fn test_designator_chain_nested_struct_init() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
     ];
     let outer_type = ctx.types.intern(Type::struct_type(CompositeType {
@@ -4944,7 +4944,7 @@ fn test_designator_chain_array_member_init() {
         bit_offset: None,
         bit_width: None,
         access_bytes: None,
-        explicit_align: None,
+        align: MemberAlign::NATURAL,
     }];
     let struct_type = ctx.types.intern(Type::struct_type(CompositeType {
         tag: None,
@@ -5093,7 +5093,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: StringId::EMPTY,
@@ -5102,7 +5102,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
             bit_offset: Some(0),
             bit_width: Some(8),
             access_bytes: Some(4),
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: b_id,
@@ -5111,7 +5111,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
     ];
     let struct_type = ctx.types.intern(Type::struct_type(CompositeType {
@@ -5199,7 +5199,7 @@ fn test_union_first_named_member_positional_init() {
             bit_offset: Some(0),
             bit_width: Some(16),
             access_bytes: Some(4),
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: a_id,
@@ -5208,7 +5208,7 @@ fn test_union_first_named_member_positional_init() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
     ];
     let union_type = ctx.types.intern(Type::union_type(CompositeType {
@@ -5497,7 +5497,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             bit_offset: Some(0),
             bit_width: Some(3),
             access_bytes: Some(1),
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: compact_id,
@@ -5506,7 +5506,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             bit_offset: Some(3),
             bit_width: Some(1),
             access_bytes: Some(1),
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: ascii_id,
@@ -5515,7 +5515,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             bit_offset: Some(4),
             bit_width: Some(1),
             access_bytes: Some(1),
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: static_alloc_id,
@@ -5524,7 +5524,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             bit_offset: Some(5),
             bit_width: Some(1),
             access_bytes: Some(1),
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
     ];
 
@@ -5660,7 +5660,7 @@ fn test_bitfield_designated_init_local_var() {
             bit_offset: Some(0),
             bit_width: Some(4),
             access_bytes: Some(1),
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: b_id,
@@ -5669,7 +5669,7 @@ fn test_bitfield_designated_init_local_var() {
             bit_offset: Some(4),
             bit_width: Some(4),
             access_bytes: Some(1),
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: c_id,
@@ -5678,7 +5678,7 @@ fn test_bitfield_designated_init_local_var() {
             bit_offset: Some(0),
             bit_width: Some(8),
             access_bytes: Some(1),
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
     ];
 
@@ -5806,7 +5806,7 @@ fn test_large_struct_copy_from_array() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: str_id,
@@ -5815,7 +5815,7 @@ fn test_large_struct_copy_from_array() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
     ];
 
@@ -5938,7 +5938,7 @@ fn test_compound_literal_zero_init_lvalue() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: b_id,
@@ -5947,7 +5947,7 @@ fn test_compound_literal_zero_init_lvalue() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
         StructMember {
             name: c_id,
@@ -5956,7 +5956,7 @@ fn test_compound_literal_zero_init_lvalue() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         },
     ];
 
@@ -6114,7 +6114,7 @@ fn test_conditional_short_circuit_arrow() {
         bit_offset: None,
         bit_width: None,
         access_bytes: None,
-        explicit_align: None,
+        align: MemberAlign::NATURAL,
     }];
     let struct_type = ctx.types.intern(Type::struct_type(CompositeType {
         tag: None,
@@ -6514,7 +6514,7 @@ fn test_atomic_aggregate_assign_uses_atomic_store() {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         }],
         enum_constants: vec![],
         size: 4,
@@ -6877,7 +6877,7 @@ fn test_complex_struct_member_init_stores_both_halves() {
             bit_width: None,
             bit_offset: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         }],
         enum_constants: vec![],
         size: 16,

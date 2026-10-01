@@ -291,6 +291,11 @@ impl AttributeList {
         self.has_attr("transparent_union")
     }
 
+    /// `__attribute__((packed))`, in either spelling.
+    pub(super) fn has_packed(&self) -> bool {
+        self.has_attr("packed")
+    }
+
     /// Whether an attribute is present, in either spelling.
     fn has_attr(&self, name: &str) -> bool {
         self.find(name).is_some()
@@ -955,6 +960,7 @@ impl Parser<'_> {
                 if attrs.has_transparent_union() {
                     self.pending_transparent_union = Some(self.current_pos());
                 }
+                self.pending_packed |= attrs.has_packed();
                 self.merge_symbol_attrs(&attrs);
                 let fn_attrs = attrs.function_attrs();
                 self.pending_fn_attrs.merge(&fn_attrs);
@@ -1004,6 +1010,7 @@ pub(super) struct PendingDeclAttrs {
     mode: Option<(String, Position)>,
     vector_size: Option<(u64, Position)>,
     transparent_union: Option<Position>,
+    packed: bool,
     symbol_attrs: crate::parse::ast::SymbolAttrs,
     fn_attrs: crate::parse::ast::FunctionAttrs,
     asm_label: Option<String>,
@@ -1022,6 +1029,7 @@ impl Parser<'_> {
             mode: take(&mut self.pending_mode),
             vector_size: take(&mut self.pending_vector_size),
             transparent_union: take(&mut self.pending_transparent_union),
+            packed: take(&mut self.pending_packed),
             symbol_attrs: take(&mut self.pending_symbol_attrs),
             fn_attrs: take(&mut self.pending_fn_attrs),
             asm_label: take(&mut self.pending_asm_label),
@@ -1038,6 +1046,7 @@ impl Parser<'_> {
         self.pending_mode = saved.mode;
         self.pending_vector_size = saved.vector_size;
         self.pending_transparent_union = saved.transparent_union;
+        self.pending_packed = saved.packed;
         self.pending_symbol_attrs = saved.symbol_attrs;
         self.pending_fn_attrs = saved.fn_attrs;
         self.pending_asm_label = saved.asm_label;

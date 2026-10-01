@@ -11,7 +11,7 @@
 // Consolidates: longlong, bool, complex tests
 //
 
-use crate::common::{compile_and_run, compile_and_run_optimized};
+use crate::common::{compile_and_run, compile_and_run_everywhere, compile_and_run_optimized};
 
 // ============================================================================
 // Mega-test: C99 types (long long, _Bool)
@@ -2104,4 +2104,91 @@ int main(void) {
         compile_and_run("c99_vla_scope_release_o2", code, &["-O2".to_string()]),
         0
     );
+}
+
+/// `packed` on one member drops that member's alignment to 1, so it is laid
+/// out at the next byte and no longer raises the struct's alignment; the
+/// members around it keep theirs. c17 accepted the attribute there and laid
+/// the member out as if it were absent: `struct { char a; int b
+/// __attribute__((packed)); }` was 8 bytes, where gcc makes it 5. An
+/// `aligned` written alongside still raises the member back. Every size and
+/// offset here is gcc's.
+#[test]
+fn c99_packed_member_drops_only_its_own_alignment() {
+    let code = r#"
+#include <stddef.h>
+struct A { char a; int b __attribute__((packed)); };
+struct B { char a; int b __attribute__((packed)); char c; };
+struct C { char a; long b __attribute__((packed)); int c; };
+struct D { char a; struct { char x; int y; } s __attribute__((packed)); };
+struct E { char a; int b __attribute__((packed, aligned(2))); };
+int main(void) {
+    struct B b = { 1, 0x12345678, 3 };
+    if (sizeof(struct A) != 5 || offsetof(struct A, b) != 1 || _Alignof(struct A) != 1) return 1;
+    if (sizeof(struct B) != 6 || offsetof(struct B, c) != 5) return 2;
+    if (sizeof(struct C) != 16 || offsetof(struct C, b) != 1 || offsetof(struct C, c) != 12) return 3;
+    if (sizeof(struct D) != 9 || offsetof(struct D, s) != 1) return 4;
+    if (sizeof(struct E) != 6 || offsetof(struct E, b) != 2) return 5;
+    if (b.a != 1 || b.b != 0x12345678 || b.c != 3) return 6;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("packed_member", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("packed_member_opt", code), 0);
+}
+
+/// `packed` on a member against the rest of the alignment rules, on both
+/// targets: a packed bit-field takes the next free bit and adds no alignment,
+/// `#pragma pack(n)` caps a member's written `aligned` as well as its type's,
+/// a struct-level `packed` leaves a member's own `aligned` in force, and a
+/// union is as aligned as its least-packed member. Every size, offset and
+/// byte image here is gcc's, the same on x86-64 and aarch64.
+#[test]
+fn c99_packed_member_against_pack_and_aligned() {
+    let code = r#"
+#include <stddef.h>
+#include <string.h>
+struct I { char a; int b:12 __attribute__((packed)); char c; };
+struct W { short s; int b:30 __attribute__((packed)); };
+struct X { char a; int b:3 __attribute__((packed, aligned(4))); };
+#pragma pack(push, 2)
+struct J { char a; int b __attribute__((packed)); int c; };
+struct K { char a; int b __attribute__((aligned(8))); };
+#pragma pack(pop)
+#pragma pack(push, 1)
+union UK { char a; int b __attribute__((aligned(8))); };
+#pragma pack(pop)
+struct P { char x; int y; } __attribute__((packed));
+struct L { char a; struct P p __attribute__((packed)); int c; };
+struct __attribute__((packed)) M { char a; int b __attribute__((aligned(4))); char c; };
+union N { char a; int b __attribute__((packed)); };
+union N2 { char a; int b __attribute__((packed)); int c; };
+typedef int ai8 __attribute__((aligned(8)));
+struct T { char a; ai8 b __attribute__((packed)); };
+static int image(const void *p, size_t n, const char *want) {
+    return memcmp(p, want, n) != 0;
+}
+int main(void) {
+    struct I i; struct W w; struct X x;
+    if (sizeof(struct I) != 4 || _Alignof(struct I) != 1 || offsetof(struct I, c) != 3) return 1;
+    memset(&i, 0, sizeof i); i.b = -1;
+    if (image(&i, 4, "\x00\xff\x0f\x00") || i.b != -1) return 2;
+    if (sizeof(struct W) != 6 || _Alignof(struct W) != 2) return 3;
+    memset(&w, 0, sizeof w); w.b = -1;
+    if (image(&w, 6, "\x00\x00\xff\xff\xff\x3f") || w.b != -1) return 4;
+    if (sizeof(struct X) != 8 || _Alignof(struct X) != 4) return 5;
+    memset(&x, 0, sizeof x); x.b = 3;
+    if (image(&x, 8, "\x00\x00\x00\x00\x03\x00\x00\x00") || x.b != 3) return 6;
+    if (sizeof(struct J) != 10 || offsetof(struct J, b) != 1 || offsetof(struct J, c) != 6) return 7;
+    if (sizeof(struct K) != 6 || _Alignof(struct K) != 2 || offsetof(struct K, b) != 2) return 8;
+    if (sizeof(union UK) != 4 || _Alignof(union UK) != 1) return 9;
+    if (sizeof(struct L) != 12 || offsetof(struct L, p) != 1 || offsetof(struct L, c) != 8) return 10;
+    if (sizeof(struct M) != 12 || _Alignof(struct M) != 4 || offsetof(struct M, c) != 8) return 11;
+    if (sizeof(union N) != 4 || _Alignof(union N) != 1) return 12;
+    if (sizeof(union N2) != 4 || _Alignof(union N2) != 4) return 13;
+    if (sizeof(struct T) != 5 || offsetof(struct T, b) != 1) return 14;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("packed_member_rules", code);
 }

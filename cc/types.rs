@@ -60,9 +60,43 @@ pub struct StructMember {
     /// need not be aligned. The name was `storage_unit_size`, which was only
     /// ever true of the unpacked case.
     pub access_bytes: Option<u32>,
-    /// Explicit alignment from _Alignas specifier (C11 6.7.5)
-    /// None means use natural alignment for the type
-    pub explicit_align: Option<u32>,
+    /// What the member's own declaration says about its alignment. See
+    /// [`TypeTable::member_alignment`] for how it combines with the type's.
+    pub align: MemberAlign,
+}
+
+/// What a member's declaration says about its alignment, apart from what its
+/// type says.
+///
+/// Both halves are written on the member -- in its specifiers, which give them
+/// to every declarator of the declaration, or after one declarator, which
+/// gives them to that one -- and a struct-level `packed` is `packed` on every
+/// member, which is how gcc defines it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemberAlign {
+    /// `_Alignas(n)` or `__attribute__((aligned(n)))`: raises the member's
+    /// alignment, and never lowers it.
+    pub written: Option<u32>,
+    /// `__attribute__((packed))`: drops the alignment the member's type
+    /// demands to one byte, and packs a bit-field to the bit.
+    pub packed: bool,
+}
+
+impl MemberAlign {
+    /// No alignment written and not packed: the type's own alignment.
+    pub const NATURAL: MemberAlign = MemberAlign {
+        written: None,
+        packed: false,
+    };
+
+    /// Both declarations' alignments at once: the larger written alignment,
+    /// and packed if either is.
+    pub fn merge(self, other: MemberAlign) -> MemberAlign {
+        MemberAlign {
+            written: self.written.max(other.written),
+            packed: self.packed || other.packed,
+        }
+    }
 }
 
 /// Where a bit-field lies: the access span its bits are read and written
@@ -2805,10 +2839,10 @@ impl TypeTable {
     /// its own. So two bitfields of different declared types share a unit
     /// freely, and a bitfield reuses the padding left by the plain member
     /// before it.
-    /// `pack_cap` is the largest alignment any member may claim: `Some(1)`
-    /// for `__attribute__((packed))`, `Some(n)` for `#pragma pack(n)`, `None`
-    /// for natural alignment. One cap serves both because they are the same
-    /// rule -- gcc's `packed` is `pack(1)` scoped to one declaration.
+    /// `pack_cap` is the `#pragma pack(n)` in force, if any. A struct-level
+    /// `packed` is not a cap but a property of every member, so it arrives in
+    /// each member's [`MemberAlign`]; [`Self::member_alignment`] is the one
+    /// rule that combines the two.
     pub fn compute_struct_layout(
         &self,
         members: &mut [StructMember],
@@ -2824,7 +2858,7 @@ impl TypeTable {
         let bytes_of = |bits: u128| usize::try_from(bits / 8).unwrap_or(usize::MAX);
         let mut max_align = 1usize;
         // Alignment demanded by a zero-width bitfield, on the ABIs where one
-        // demands any. Kept separate because `pack_cap` does not cap it.
+        // demands any. Kept separate because packing does not reduce it.
         let mut zero_width_align = 1usize;
         // The furthest bit any access window reaches. Ordinary members never
         // reach past the running offset, but a window is a power-of-two span
@@ -2833,17 +2867,7 @@ impl TypeTable {
 
         for member in members.iter_mut() {
             let Some(bit_width) = member.bit_width else {
-                // Use explicit alignment from _Alignas if specified, otherwise natural alignment.
-                // A pack cap lowers it; it never raises one, so
-                // `#pragma pack(8)` on an int leaves the int at 4.
-                let natural_align = match pack_cap {
-                    Some(cap) => self.alignment(member.typ).min(cap as usize),
-                    None => self.alignment(member.typ),
-                };
-                let align = member
-                    .explicit_align
-                    .map(|a| a as usize)
-                    .unwrap_or(natural_align);
+                let align = self.member_alignment(member, pack_cap);
                 max_align = max_align.max(align);
 
                 bit_offset = bit_offset.next_multiple_of(align as u128 * 8);
@@ -2870,8 +2894,8 @@ impl TypeTable {
                 // contributes its declared type's alignment, making the same
                 // struct 8 bytes with alignment 4 -- and unlike an ordinary
                 // member's, that contribution survives packing, so it is kept
-                // out of `max_align` (which `pack_cap` caps) and applied
-                // afterwards. Both are gcc's answers on the respective target.
+                // out of `max_align` and applied afterwards. Both are gcc's
+                // answers on the respective target.
                 if self.target_arch == Arch::Aarch64 {
                     zero_width_align = zero_width_align.max(self.alignment(member.typ));
                 }
@@ -2882,12 +2906,21 @@ impl TypeTable {
                 continue;
             }
 
-            max_align = max_align.max(self.alignment(member.typ));
+            let align = self.member_alignment(member, pack_cap);
+            max_align = max_align.max(align);
+            // An alignment written on the field places it, as it places any
+            // member: `int b:3 __attribute__((aligned(8)))` starts at the
+            // next 8-byte boundary, packed or not. Without one, the rules below
+            // place it.
+            if member.align.written.is_some() {
+                bit_offset = bit_offset.next_multiple_of(align as u128 * 8);
+            }
 
             let bit_width = u128::from(bit_width);
-            if pack_cap.is_some() {
-                // Under a pack cap the unit rule is switched off entirely --
-                // not narrowed to the cap. `#pragma pack(2)` lets a 16-bit
+            if Self::packs_bitfield(member, pack_cap) {
+                // Packed -- by `packed` on the field or its aggregate, or by
+                // any pack cap -- the unit rule is switched off entirely, not
+                // narrowed to the cap. `#pragma pack(2)` lets a 16-bit
                 // field starting at bit 1 straddle both the 2- and the 4-byte
                 // boundary, which is gcc's answer and the measurement that
                 // rules out the narrowing reading. So the field takes the next
@@ -2920,17 +2953,41 @@ impl TypeTable {
             bit_offset += bit_width;
         }
 
-        let final_align = match pack_cap {
-            Some(cap) => max_align.min(cap as usize),
-            None => max_align,
-        }
-        .max(zero_width_align);
+        let final_align = max_align.max(zero_width_align);
         // `window_end` is a multiple of 8, so rounding the larger of the two
         // up to the alignment is the byte round-up and the padding at once.
         let size_bits = bit_offset
             .max(window_end)
             .next_multiple_of(final_align as u128 * 8);
         (bytes_of(size_bits), final_align)
+    }
+
+    /// The alignment a struct or union member is laid out at, and contributes
+    /// to its aggregate's: the one rule for `packed` (on the member or the
+    /// whole aggregate), `_Alignas`/`aligned` written on the member, and
+    /// `#pragma pack(n)`, in gcc's order.
+    ///
+    /// `packed` drops the type's alignment to 1 -- including an alignment the
+    /// type itself carries from a typedef's `aligned`. An alignment written on
+    /// the member then raises it, and never lowers it, so `aligned(1)` on an
+    /// `int` member leaves it at 4. A pack cap lowers the result last, written
+    /// alignment included, and never raises it: `#pragma pack(8)` leaves an
+    /// int at 4. Every answer here is gcc's, the same on x86-64 and aarch64.
+    pub fn member_alignment(&self, member: &StructMember, pack_cap: Option<u32>) -> usize {
+        let base = if member.align.packed {
+            1
+        } else {
+            self.alignment(member.typ)
+        };
+        let raised = member.align.written.map_or(base, |w| base.max(w as usize));
+        pack_cap.map_or(raised, |cap| raised.min(cap as usize))
+    }
+
+    /// Whether a bit-field is laid out packed -- at the next free bit, through
+    /// an access span of exactly the bytes it touches -- rather than by the
+    /// unit rule. Any packing does it, `#pragma pack(n)` at any `n` included.
+    fn packs_bitfield(member: &StructMember, pack_cap: Option<u32>) -> bool {
+        member.align.packed || pack_cap.is_some()
     }
 
     /// Get the number of interned types
@@ -2941,9 +2998,9 @@ impl TypeTable {
 
     /// Compute union layout (all members at offset 0)
     /// Returns (total_size, alignment)
-    /// `pack_cap` caps every member's alignment, as for a struct. A union's
-    /// size still follows its widest member; only the alignment, and so the
-    /// trailing padding, can change.
+    /// Members are aligned by [`Self::member_alignment`], as in a struct. A
+    /// union's size still follows its widest member; only the alignment, and
+    /// so the trailing padding, can change.
     pub fn compute_union_layout(
         &self,
         members: &mut [StructMember],
@@ -2973,7 +3030,7 @@ impl TypeTable {
                 // bytes under gcc, not 4. Unpacked the two spellings coincide
                 // on both targets, and gating on the cap keeps that output
                 // bit-identical.
-                member.access_bytes = Some(if pack_cap.is_some() {
+                member.access_bytes = Some(if Self::packs_bitfield(member, pack_cap) {
                     w.div_ceil(8)
                 } else {
                     self.size_bytes(member.typ) as u32
@@ -3001,21 +3058,14 @@ impl TypeTable {
             // A packed bit-field contributes only the bytes it occupies, which
             // is what makes `packed union { unsigned a:20; char c; }` three
             // bytes rather than four.
-            let member_size = match (pack_cap, member.bit_width) {
-                (Some(_), Some(w)) if w > 0 => w.div_ceil(8) as usize,
+            let member_size = match member.bit_width {
+                Some(w) if w > 0 && Self::packs_bitfield(member, pack_cap) => {
+                    w.div_ceil(8) as usize
+                }
                 _ => self.size_bytes(member.typ),
             };
             max_size = max_size.max(member_size);
-            // Use explicit alignment from _Alignas if specified, otherwise natural alignment
-            let natural_align = match pack_cap {
-                Some(cap) => self.alignment(member.typ).min(cap as usize),
-                None => self.alignment(member.typ),
-            };
-            let align = member
-                .explicit_align
-                .map(|a| a as usize)
-                .unwrap_or(natural_align);
-            max_align = max_align.max(align);
+            max_align = max_align.max(self.member_alignment(member, pack_cap));
         }
 
         let max_align = max_align.max(zero_width_align);
@@ -3094,7 +3144,7 @@ mod tests {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         };
         let composite = |members| CompositeType {
             tag: None,
@@ -3226,7 +3276,7 @@ mod tests {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         };
         let tag = idents.intern("S");
         let composite = CompositeType {
@@ -3483,7 +3533,7 @@ mod tests {
             bit_offset: None,
             bit_width,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         };
         let composite = |members| CompositeType {
             tag: None,
@@ -3749,7 +3799,7 @@ mod tests {
                     bit_offset: None,
                     bit_width: None,
                     access_bytes: None,
-                    explicit_align: None,
+                    align: MemberAlign::NATURAL,
                 },
                 StructMember {
                     name: StringId::EMPTY,
@@ -3758,7 +3808,7 @@ mod tests {
                     bit_offset: None,
                     bit_width: Some(0),
                     access_bytes: None,
-                    explicit_align: None,
+                    align: MemberAlign::NATURAL,
                 },
                 StructMember {
                     name: StringId::EMPTY,
@@ -3767,7 +3817,7 @@ mod tests {
                     bit_offset: None,
                     bit_width: None,
                     access_bytes: None,
-                    explicit_align: None,
+                    align: MemberAlign::NATURAL,
                 },
             ];
             if union_ {
@@ -3795,6 +3845,121 @@ mod tests {
         assert_eq!(layout(&arm, None, true), (4, 4));
         assert_eq!(layout(&x86, Some(1), true), (1, 1));
         assert_eq!(layout(&arm, Some(1), true), (4, 4));
+    }
+
+    /// One rule aligns a member: `packed` (on it, or on its whole aggregate)
+    /// drops its type's alignment to 1, an alignment written on it raises
+    /// that, and a `#pragma pack` cap lowers the result last. Every row is
+    /// gcc's, and gcc gives the same on x86-64 and aarch64.
+    #[test]
+    fn test_member_alignment_rule() {
+        fn member(typ: TypeId, written: Option<u32>, packed: bool) -> StructMember {
+            StructMember {
+                name: StringId::EMPTY,
+                typ,
+                offset: 0,
+                bit_offset: None,
+                bit_width: None,
+                access_bytes: None,
+                align: MemberAlign { written, packed },
+            }
+        }
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            let mut types = TypeTable::new(&Target::new(arch, Os::Linux));
+            let int = types.int_id;
+            // `typedef int ai8 __attribute__((aligned(8)));`
+            let ai8 = types.intern(Type {
+                explicit_align: Some(8),
+                ..types.get(int).clone()
+            });
+            for (m, cap, want) in [
+                (member(int, None, false), None, 4),
+                (member(int, None, true), None, 1),
+                // `aligned(1)` alone cannot lower an int.
+                (member(int, Some(1), false), None, 4),
+                (member(int, Some(2), true), None, 2),
+                (member(int, Some(8), true), None, 8),
+                // `packed` drops a typedef's alignment too.
+                (member(ai8, None, true), None, 1),
+                (member(ai8, None, false), Some(2), 2),
+                // The cap lowers a written alignment, and raises nothing.
+                (member(int, Some(8), false), Some(1), 1),
+                (member(int, Some(8), true), Some(2), 2),
+                (member(int, None, false), Some(8), 4),
+            ] {
+                assert_eq!(
+                    types.member_alignment(&m, cap),
+                    want,
+                    "{arch:?} {:?} cap {cap:?}",
+                    m.align
+                );
+            }
+        }
+    }
+
+    /// `packed` on one member moves only that member, and the aggregate's
+    /// alignment is the largest of what its members then demand. Offsets
+    /// and sizes are gcc's, on both targets.
+    #[test]
+    fn test_packed_member_layout() {
+        let member = |typ, bit_width, packed| StructMember {
+            name: StringId::EMPTY,
+            typ,
+            offset: 0,
+            bit_offset: None,
+            bit_width,
+            access_bytes: None,
+            align: MemberAlign {
+                written: None,
+                packed,
+            },
+        };
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            let types = TypeTable::new(&Target::new(arch, Os::Linux));
+            let (c, i, l) = (types.char_id, types.int_id, types.long_id);
+
+            // struct { char a; long b __attribute__((packed)); int c; }
+            let mut m = vec![
+                member(c, None, false),
+                member(l, None, true),
+                member(i, None, false),
+            ];
+            assert_eq!(types.compute_struct_layout(&mut m, None), (16, 4));
+            assert_eq!((m[1].offset, m[2].offset), (1, 12));
+
+            // struct { char a; int b:12 __attribute__((packed)); char c; }:
+            // the field takes the next free bit and adds no alignment.
+            let mut m = vec![
+                member(c, None, false),
+                member(i, Some(12), true),
+                member(c, None, false),
+            ];
+            assert_eq!(types.compute_struct_layout(&mut m, None), (4, 1));
+            assert_eq!((m[1].offset, m[1].bit_offset), (1, Some(0)));
+            assert_eq!(m[1].access_bytes, Some(2));
+            assert_eq!(m[2].offset, 3);
+
+            // #pragma pack(2): struct { char a; int b __attribute__((packed)); int c; }
+            let mut m = vec![
+                member(c, None, false),
+                member(i, None, true),
+                member(i, None, false),
+            ];
+            assert_eq!(types.compute_struct_layout(&mut m, Some(2)), (10, 2));
+            assert_eq!((m[1].offset, m[2].offset), (1, 6));
+
+            // union { char a; int b:20 __attribute__((packed)); }
+            let mut m = vec![member(c, None, false), member(i, Some(20), true)];
+            assert_eq!(types.compute_union_layout(&mut m, None), (3, 1));
+
+            // union { char a; int b __attribute__((packed)); int c; }
+            let mut m = vec![
+                member(c, None, false),
+                member(i, None, true),
+                member(i, None, false),
+            ];
+            assert_eq!(types.compute_union_layout(&mut m, None), (4, 4));
+        }
     }
 
     #[test]
@@ -4109,7 +4274,7 @@ mod tests {
             bit_offset: None,
             bit_width,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         };
         let shorts = types.intern(Type::array(types.short_id, (1 << 62) - 256));
         let chars_max = types.intern(Type::array(types.char_id, i64::MAX as usize));
@@ -4180,7 +4345,7 @@ mod tests {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         };
         let chars = types.intern(Type::array(types.char_id, (1 << 62) - 256));
         let mut m = vec![member(types.int_id), member(chars)];

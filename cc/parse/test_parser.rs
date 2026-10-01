@@ -6691,6 +6691,87 @@ fn test_aligned_typedef_as_struct_member() {
     }
 }
 
+/// The layout of the type of the last declaration's first declarator:
+/// member offsets, size and alignment.
+fn last_struct_layout(src: &str) -> (Vec<usize>, usize, usize) {
+    let (tu, types, _strings, _symbols) = parse_tu(src).unwrap();
+    let Some(ExternalDecl::Declaration(decl)) = tu.items.last() else {
+        panic!("{src}: the last item is not a declaration");
+    };
+    let typ = decl.declarators[0].typ;
+    let composite = types.composite(typ).expect("a struct or union");
+    let offsets = composite.members.iter().map(|m| m.offset).collect();
+    (offsets, types.size_bytes(typ), types.alignment(typ))
+}
+
+/// `packed` on a member drops that member's alignment to 1 wherever the
+/// member's declaration writes it, and an `aligned` alongside raises it back.
+/// Written among the specifiers it reaches every declarator, as `aligned`
+/// does; after a declarator, that declarator alone. Every layout is gcc's.
+#[test]
+fn test_packed_on_struct_member() {
+    for (src, offsets, size, align) in [
+        ("struct { char a; int b __attribute__((packed)); } x;", &[0, 1][..], 5, 1),
+        ("struct { char a; __attribute__((packed)) int b; } x;", &[0, 1], 5, 1),
+        ("struct { char a; int __attribute__((packed)) b; } x;", &[0, 1], 5, 1),
+        ("struct { char a; int b __attribute__((packed)), c; } x;", &[0, 1, 8], 12, 4),
+        ("struct { char a; __attribute__((packed)) int b, c; } x;", &[0, 1, 5], 9, 1),
+        ("struct { char a; __attribute__((aligned(8))) int b, c; } x;", &[0, 8, 16], 24, 8),
+        ("struct { char a; int b __attribute__((packed, aligned(2))); } x;", &[0, 2], 6, 2),
+        ("struct { char a; int b __attribute__((aligned(1))); } x;", &[0, 4], 8, 4),
+        (
+            "struct { char a; struct { char x; int y; } s __attribute__((packed)); } x;",
+            &[0, 1],
+            9,
+            1,
+        ),
+        // A struct-level `packed` leaves a member's own `aligned` in force.
+        (
+            "struct __attribute__((packed)) { char a; int b __attribute__((aligned(4))); char c; } x;",
+            &[0, 4, 8],
+            12,
+            4,
+        ),
+        // gcc ignores `packed` on an anonymous member.
+        (
+            "struct { char a; __attribute__((packed)) struct { char x; int y; }; } x;",
+            &[0, 4],
+            12,
+            4,
+        ),
+        ("union { char a; int b __attribute__((packed)); } x;", &[0, 0], 4, 1),
+    ] {
+        assert_eq!(
+            last_struct_layout(src),
+            (offsets.to_vec(), size, align),
+            "{src}"
+        );
+    }
+}
+
+/// `packed` reaches no declaration but the member it is written on: not the
+/// struct declared after an object that wrote it, where gcc ignores it, nor
+/// the member whose array bound holds a type-name that wrote it.
+#[test]
+fn test_packed_reaches_only_its_member() {
+    for src in [
+        "int g __attribute__((packed)); struct T { char a; int b; } t;",
+        "struct { char a; int b[sizeof(int __attribute__((packed)))]; } x;",
+    ] {
+        let (offsets, _, align) = last_struct_layout(src);
+        assert_eq!((offsets[1], align), (4, 4), "{src}");
+    }
+}
+
+/// An `_Alignas` keyword is its own member declaration's: the next member's
+/// bit-field must not be rejected for it.
+#[test]
+fn test_alignas_does_not_reach_the_next_bitfield() {
+    let (offsets, size, align) =
+        last_struct_layout("struct { _Alignas(8) int a; int b:3; char c; } x;");
+    assert_eq!((offsets[2], size, align), (5, 8, 8));
+}
+
 /// The argument is an integer constant expression, not one numeric token:
 /// a hex or suffixed literal, arithmetic, `sizeof` and a parenthesised value
 /// all fold.

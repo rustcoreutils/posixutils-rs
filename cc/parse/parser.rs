@@ -198,6 +198,11 @@ pub struct Parser<'a> {
     /// `pending_mode`: the attribute is consumed while the declarator is, and
     /// only the finished type can carry it.
     pub(super) pending_transparent_union: Option<Position>,
+    /// `__attribute__((packed))` written on the declaration being parsed.
+    /// Only a struct or union member claims it, as half of its
+    /// [`crate::types::MemberAlign`]; anywhere else gcc ignores it too, and
+    /// the declaration's end clears it.
+    pub(super) pending_packed: bool,
     /// File-scope object definitions whose type was incomplete when parsed.
     /// Judged at end of translation unit -- see
     /// [`Self::check_deferred_incomplete_definitions`].
@@ -321,6 +326,7 @@ impl<'a> Parser<'a> {
             types,
             pos: 0,
             pending_alignas: None,
+            pending_packed: false,
             pending_alignas_kw: None,
             pending_mode: None,
             pending_vector_size: None,

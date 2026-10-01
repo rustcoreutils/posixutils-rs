@@ -644,7 +644,7 @@ mod tests {
     use super::*;
 
     use crate::target::{Arch, Os, Target};
-    use crate::types::{CompositeType, StructMember, Type};
+    use crate::types::{CompositeType, MemberAlign, StructMember, Type};
 
     #[test]
     fn test_abi_creation() {
@@ -671,7 +671,7 @@ mod tests {
                 bit_width: None,
                 bit_offset: None,
                 access_bytes: None,
-                explicit_align: None,
+                align: MemberAlign::NATURAL,
             }],
             enum_constants: vec![],
             size,
@@ -819,7 +819,7 @@ mod tests {
                     bit_width: None,
                     bit_offset: None,
                     access_bytes: None,
-                    explicit_align: None,
+                    align: MemberAlign::NATURAL,
                 },
                 StructMember {
                     name: crate::strings::StringId::default(),
@@ -828,7 +828,7 @@ mod tests {
                     bit_width: None,
                     bit_offset: None,
                     access_bytes: None,
-                    explicit_align: None,
+                    align: MemberAlign::NATURAL,
                 },
             ],
             enum_constants: vec![],

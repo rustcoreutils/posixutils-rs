@@ -710,18 +710,18 @@ impl Abi for Aapcs64Abi {
 mod tests {
     use super::*;
     use crate::target::{Arch, Os, Target};
-    use crate::types::{CompositeType, StructMember, Type};
+    use crate::types::{CompositeType, MemberAlign, StructMember, Type};
 
     /// `argument_alignment` follows the members, not the type's own attribute.
     ///
     /// Every row here was read off gcc's own aarch64 output; the doc comment on
     /// the function records the offsets. The two that a naive "walk the
-    /// members" implementation gets wrong are the packed struct (whose pack cap
-    /// is not recorded anywhere but `member_align`) and the attributed typedef
+    /// members" implementation gets wrong are the packed struct (whose `#pragma pack`
+    /// cap is recorded nowhere but `member_align`) and the attributed typedef
     /// (whose attribute lives in `explicit_align`, not in a composite).
     #[test]
     fn argument_alignment_follows_the_members() {
-        fn member(typ: TypeId, explicit_align: Option<u32>) -> StructMember {
+        fn member(typ: TypeId, written: Option<u32>) -> StructMember {
             StructMember {
                 name: crate::strings::StringId::default(),
                 typ,
@@ -729,7 +729,10 @@ mod tests {
                 bit_width: None,
                 bit_offset: None,
                 access_bytes: None,
-                explicit_align,
+                align: MemberAlign {
+                    written,
+                    packed: false,
+                },
             }
         }
         // `align` is what the type reports to the language; `member_align` is
@@ -820,7 +823,7 @@ mod tests {
             bit_width: None,
             bit_offset: None,
             access_bytes: None,
-            explicit_align: None,
+            align: MemberAlign::NATURAL,
         };
         let m0 = member(d);
         let m1 = member(d);
@@ -888,7 +891,7 @@ mod tests {
                     bit_width: None,
                     bit_offset: None,
                     access_bytes: None,
-                    explicit_align: None,
+                    align: MemberAlign::NATURAL,
                 })
                 .collect(),
             enum_constants: vec![],

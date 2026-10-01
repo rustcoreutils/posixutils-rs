@@ -641,7 +641,7 @@ mod tests {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: crate::types::MemberAlign::NATURAL,
         };
         let composite = |members| crate::types::CompositeType {
             tag: None,

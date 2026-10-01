@@ -2736,7 +2736,7 @@ mod tests {
             bit_offset: None,
             bit_width: None,
             access_bytes: None,
-            explicit_align: None,
+            align: crate::types::MemberAlign::NATURAL,
         }
     }
 
@@ -2755,7 +2755,7 @@ mod tests {
             bit_offset: Some(bit_offset),
             bit_width: Some(width),
             access_bytes: Some(4),
-            explicit_align: None,
+            align: crate::types::MemberAlign::NATURAL,
         }
     }
 

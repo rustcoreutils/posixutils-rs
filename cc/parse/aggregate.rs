@@ -16,7 +16,7 @@ use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId};
 use crate::token::lexer::{Position, TokenType};
 use crate::types::{
-    CompositeType, EnumConstant, StructMember, Type, TypeId, TypeKind, TypeModifiers,
+    CompositeType, EnumConstant, MemberAlign, StructMember, Type, TypeId, TypeKind, TypeModifiers,
 };
 use gettextrs::gettext;
 
@@ -260,10 +260,7 @@ impl Parser<'_> {
         // Parse __attribute__ between 'struct' keyword and tag name
         // (e.g., struct __attribute__((packed)) tagname { ... })
         let early_attrs = self.parse_attributes();
-        let mut is_packed = early_attrs
-            .attrs
-            .iter()
-            .any(|a| a.name == "packed" || a.name == "__packed__");
+        let mut is_packed = early_attrs.has_packed();
         // `transparent_union` is collected at the same four positions as
         // `packed`, for the same reason: gcc accepts it at any of them.
         let mut is_transparent = early_attrs.has_transparent_union();
@@ -276,11 +273,7 @@ impl Parser<'_> {
                 Some(self.expect_identifier()?)
             } else {
                 let mid_attrs = self.parse_attributes();
-                is_packed = is_packed
-                    || mid_attrs
-                        .attrs
-                        .iter()
-                        .any(|a| a.name == "packed" || a.name == "__packed__");
+                is_packed = is_packed || mid_attrs.has_packed();
                 is_transparent = is_transparent || mid_attrs.has_transparent_union();
                 if let Some(a) = mid_attrs.get_alignment() {
                     struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
@@ -297,11 +290,7 @@ impl Parser<'_> {
 
         // Parse __attribute__ after tag name but before '{'
         let pre_attrs = self.parse_attributes();
-        is_packed = is_packed
-            || pre_attrs
-                .attrs
-                .iter()
-                .any(|a| a.name == "packed" || a.name == "__packed__");
+        is_packed = is_packed || pre_attrs.has_packed();
         is_transparent = is_transparent || pre_attrs.has_transparent_union();
         if let Some(a) = pre_attrs.get_alignment() {
             struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
@@ -324,11 +313,7 @@ impl Parser<'_> {
 
             // Parse trailing __attribute__ (e.g., __attribute__((packed)))
             let attrs = self.parse_attributes();
-            is_packed = is_packed
-                || attrs
-                    .attrs
-                    .iter()
-                    .any(|a| a.name == "packed" || a.name == "__packed__");
+            is_packed = is_packed || attrs.has_packed();
             is_transparent = is_transparent || attrs.has_transparent_union();
             if let Some(a) = attrs.get_alignment() {
                 struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
@@ -336,15 +321,15 @@ impl Parser<'_> {
 
             self.check_flexible_array_members(&members, is_union);
 
-            // Compute layout. `__attribute__((packed))` is a cap of 1; a
-            // `#pragma pack(n)` in force is a cap of n. Where both apply the
-            // tighter one wins, which is what gcc does.
-            let pragma_cap = self.current_pack();
-            let pack_cap = match (is_packed, pragma_cap) {
-                (true, Some(n)) => Some(n.min(1)),
-                (true, None) => Some(1),
-                (false, cap) => cap,
-            };
+            // Compute layout. `__attribute__((packed))` on the struct or union
+            // is `packed` on every member, which is how gcc defines it; a
+            // `#pragma pack(n)` in force caps every member at n.
+            if is_packed {
+                for member in &mut members {
+                    member.align.packed = true;
+                }
+            }
+            let pack_cap = self.current_pack();
             let (size, mut align) = if is_union {
                 self.types.compute_union_layout(&mut members, pack_cap)
             } else {
@@ -354,8 +339,8 @@ impl Parser<'_> {
 
             // What the members alone require, kept before the attribute below
             // overwrites it. AAPCS64 derives an argument's alignment from the
-            // members and ignores the type's own attribute, and the pack cap
-            // already folded in here is not recorded anywhere else.
+            // members and ignores the type's own attribute, and a `#pragma
+            // pack` cap folded in here is recorded nowhere else.
             let member_align = align;
 
             // Apply struct-level aligned attribute (raises alignment, never lowers)
@@ -483,6 +468,10 @@ impl Parser<'_> {
                 continue;
             }
 
+            // An `_Alignas` keyword is the declaration's that wrote it, and
+            // the bit-field check below must not see the previous member's.
+            self.pending_alignas_kw = None;
+
             // Parse member declaration
             let member_specs = self.parse_declaration_specifiers(SpecContext::Member)?;
             let member_base_type = &member_specs.ty;
@@ -494,6 +483,10 @@ impl Parser<'_> {
 
             // Skip any __attribute__ after type specifier (before member name)
             self.skip_extensions();
+            // An alignment or `packed` among the specifiers is the whole
+            // declaration's, and reaches every declarator in it:
+            // `__attribute__((aligned(8))) int b, c;` aligns both.
+            let specifier_align = self.take_member_align();
 
             // C11 anonymous struct/union members: "struct { ... };" or "union { ... };"
             // These have no declarator name, just end with ';'
@@ -505,7 +498,13 @@ impl Parser<'_> {
                     bit_offset: None,
                     bit_width: None,
                     access_bytes: None,
-                    explicit_align: None, // anonymous members
+                    // gcc takes an alignment written here and ignores
+                    // `packed`, silently: the anonymous member keeps its
+                    // type's alignment.
+                    align: MemberAlign {
+                        packed: false,
+                        ..specifier_align
+                    },
                 });
                 self.advance(); // consume ';'
                 continue;
@@ -529,7 +528,7 @@ impl Parser<'_> {
                     bit_offset: None,
                     bit_width: Some(width),
                     access_bytes: None,
-                    explicit_align: None, // bitfields don't support _Alignas
+                    align: MemberAlign::NATURAL, // padding: nothing written aligns it
                 });
 
                 self.expect_special(b';')?;
@@ -552,7 +551,7 @@ impl Parser<'_> {
                         bit_offset: None,
                         bit_width: Some(width),
                         access_bytes: None,
-                        explicit_align: None, // bitfields don't support _Alignas
+                        align: MemberAlign::NATURAL, // padding: nothing written aligns it
                     });
 
                     if self.is_special(b',') {
@@ -609,8 +608,8 @@ impl Parser<'_> {
                 // staying pending for the enclosing declaration.
                 let typ = self.apply_pending_type_attrs(typ);
 
-                // Capture any pending _Alignas from type specifier
-                let member_align = self.pending_alignas.take();
+                // What this declarator adds to the specifiers' alignment.
+                let member_align = specifier_align.merge(self.take_member_align());
 
                 // C17 6.7.2.1p2: members share one name space, so a
                 // repeated name is a constraint violation. Unnamed members
@@ -629,7 +628,7 @@ impl Parser<'_> {
                     bit_offset: None,
                     bit_width,
                     access_bytes: None,
-                    explicit_align: member_align,
+                    align: member_align,
                 });
 
                 if self.is_special(b',') {
@@ -654,6 +653,15 @@ impl Parser<'_> {
             }
         }
         Ok(members)
+    }
+
+    /// The alignment and `packed` written since the last call, consumed: the
+    /// member's half of [`crate::types::TypeTable::member_alignment`].
+    fn take_member_align(&mut self) -> MemberAlign {
+        MemberAlign {
+            written: self.pending_alignas.take(),
+            packed: std::mem::take(&mut self.pending_packed),
+        }
     }
 
     /// Parse a bitfield width (constant expression after ':')

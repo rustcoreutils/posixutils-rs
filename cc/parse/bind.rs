@@ -243,6 +243,7 @@ impl Parser<'_> {
         self.pending_alignas_kw = None;
         self.pending_mode = None;
         self.pending_transparent_union = None;
+        self.pending_packed = false;
     }
 
     /// Bind one declarator of a declaration: the rules of C17 6.7 in one

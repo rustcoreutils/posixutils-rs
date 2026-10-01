@@ -191,6 +191,7 @@ impl Parser<'_> {
         // leaving it set applied it to whatever came next.
         self.pending_mode = None;
         self.pending_transparent_union = None;
+        self.pending_packed = false;
         self.pending_fn_attrs = Default::default();
         // And any asm label the previous declaration left behind.
         //

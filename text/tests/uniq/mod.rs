@@ -307,8 +307,7 @@ fn test_uniq_error_names_utility_and_input_file() {
 /// input one -- the whole point of naming the file.
 #[test]
 fn test_uniq_error_distinguishes_output_file_from_input() {
-    let dir = plib::tmp::tempdir().expect("tempdir");
-    let input = dir.path().join("in.txt");
+    let input = std::env::temp_dir().join(format!("posixutils-uniq-in-{}", std::process::id()));
     std::fs::write(&input, "a\na\nb\n").unwrap();
 
     let out = std::process::Command::new(plib::testing::get_binary_path("uniq"))
@@ -327,4 +326,5 @@ fn test_uniq_error_distinguishes_output_file_from_input() {
         "the readable input must not be blamed: {stderr:?}"
     );
     assert_ne!(out.status.code(), Some(0));
+    let _ = std::fs::remove_file(input);
 }

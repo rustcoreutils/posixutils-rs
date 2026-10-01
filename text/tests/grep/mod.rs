@@ -21,6 +21,16 @@ const INPUT_FILE_3: &str = "tests/grep/f_3";
 const BAD_INPUT_FILE: &str = "tests/grep/inexisting_file";
 const INVALID_LINE_INPUT_FILE: &str = "tests/grep/invalid_line";
 
+/// What grep reports for `BAD_INPUT_FILE`: the system's own text for the
+/// failed open, which differs between Unix and Windows.
+fn bad_input_file_error() -> String {
+    let err = std::fs::File::open(BAD_INPUT_FILE).expect_err("BAD_INPUT_FILE must not exist");
+    format!(
+        "grep: {BAD_INPUT_FILE}: {}\n",
+        plib::diag::io_error_text(&err)
+    )
+}
+
 const BRE: &str = r#"line_{[0-9]\{1,\}}"#;
 const ERE: &str = r#"line_\{[0-9]{1,}\}"#;
 const FIXED: &str = "line_{";
@@ -115,13 +125,7 @@ fn test_absent_pattern() {
 
 #[test]
 fn test_inexisting_file_pattern() {
-    grep_test(
-        &["-f", BAD_INPUT_FILE],
-        "",
-        "",
-        "grep: tests/grep/inexisting_file: No such file or directory\n",
-        2,
-    );
+    grep_test(&["-f", BAD_INPUT_FILE], "", "", &bad_input_file_error(), 2);
 }
 
 #[test]
@@ -198,7 +202,7 @@ fn test_basic_regexp_quiet_with_error_02() {
         &["-q", BRE, BAD_INPUT_FILE, "-"],
         LINES_INPUT,
         "",
-        "grep: tests/grep/inexisting_file: No such file or directory\n",
+        &bad_input_file_error(),
         0,
     );
 }
@@ -209,7 +213,7 @@ fn test_basic_regexp_quiet_with_error_03() {
         &["-q", BRE, "-", BAD_INPUT_FILE],
         BAD_INPUT,
         "",
-        "grep: tests/grep/inexisting_file: No such file or directory\n",
+        &bad_input_file_error(),
         2,
     );
 }
@@ -422,7 +426,7 @@ fn test_extended_regexp_quiet_with_error_02() {
         &["-E", "-q", ERE, BAD_INPUT_FILE, "-"],
         LINES_INPUT,
         "",
-        "grep: tests/grep/inexisting_file: No such file or directory\n",
+        &bad_input_file_error(),
         0,
     );
 }
@@ -433,7 +437,7 @@ fn test_extended_regexp_quiet_with_error_03() {
         &["-E", "-q", ERE, "-", BAD_INPUT_FILE],
         BAD_INPUT,
         "",
-        "grep: tests/grep/inexisting_file: No such file or directory\n",
+        &bad_input_file_error(),
         2,
     );
 }
@@ -668,7 +672,7 @@ fn test_fixed_strings_quiet_with_error_02() {
         &["-F", "-q", FIXED, BAD_INPUT_FILE, "-"],
         LINES_INPUT,
         "",
-        "grep: tests/grep/inexisting_file: No such file or directory\n",
+        &bad_input_file_error(),
         0,
     );
 }
@@ -679,7 +683,7 @@ fn test_fixed_strings_quiet_with_error_03() {
         &["-F", "-q", FIXED, "-", BAD_INPUT_FILE],
         BAD_INPUT,
         "",
-        "grep: tests/grep/inexisting_file: No such file or directory\n",
+        &bad_input_file_error(),
         2,
     );
 }

@@ -117,7 +117,13 @@ fn f1_txt_with_eol_spaces_path() -> String {
 /// The timestamp is the file's mtime and so is not reproducible; everything
 /// else about the output is. These expectations were taken from GNU diffutils
 /// 3.10, which matches us byte for byte on this fixture set in every format.
+///
+/// The expectations spell paths with `/`. The operands are built with
+/// `Path::join`, and diff joins a directory and an entry name the same way, so
+/// the separator in the output is the platform's: `\` on Windows. No fixture
+/// file contains a `/`, so every one in `expected` is a separator.
 fn diff_test_fixture(args: &[&str], expected: &str, code: i32) {
+    let expected = expected.replace('/', std::path::MAIN_SEPARATOR_STR);
     run_test_with_checker(
         TestPlan {
             cmd: String::from("diff"),
@@ -1063,6 +1069,8 @@ fn test_diff_directory_with_a_fifo() {
 /// short-circuits on `path1 == path2` before dir_diff is ever entered -- so it
 /// proved only that the short-circuit exists. Two distinct trees actually
 /// reach the guard.
+// Unix only: creating a symlink on Windows needs a privilege tests do not have.
+#[cfg(unix)]
 #[test]
 fn test_diff_recursive_symlink_cycle_terminates() {
     let (a, b) = dir_pair("cycle");
@@ -1750,6 +1758,8 @@ fn test_diff_stdin_leaves_no_temp_file() {
 /// `diff big1 big2 | head -2` must die by SIGPIPE the way the historical
 /// utilities do. The Rust runtime ignores SIGPIPE before main, so the write
 /// failed with EPIPE instead, surfacing as a panic on stderr and exit 101.
+// Unix only: Windows has no SIGPIPE.
+#[cfg(unix)]
 #[test]
 fn test_diff_dies_by_sigpipe_on_a_closed_pipe() {
     // Enough output that diff is still writing when the reader goes away.
@@ -1805,6 +1815,8 @@ fn test_diff_directory_only_in_sets_exit_status() {
 /// not, so a symlink to a regular file was taken for a directory: without -r
 /// that printed "Common subdirectories", and with -r the walk called read_dir
 /// on it and died with ENOTDIR, exit 2.
+// Unix only: creating a symlink on Windows needs a privilege tests do not have.
+#[cfg(unix)]
 #[test]
 fn test_diff_symlink_to_file_is_compared_as_a_file() {
     let (a, b) = dir_pair("symlink");
@@ -1852,6 +1864,9 @@ fn test_diff_directory_versus_file_mismatch() {
 
 /// One unreadable entry used to end the walk, so every later entry went
 /// uncompared, and the diagnostic did not say which file failed.
+// Unix only: a file is made unreadable with mode 000, which Windows has no
+// meaning for (its read-only attribute leaves a file readable).
+#[cfg(unix)]
 #[test]
 fn test_diff_directory_walk_continues_past_an_unreadable_entry() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -1882,6 +1897,8 @@ fn test_diff_directory_walk_continues_past_an_unreadable_entry() {
 /// POSIX: on entering a previously visited directory, diff "shall write a
 /// diagnostic message to standard error". This used to skip in silence and
 /// exit 0.
+// Unix only: creating a symlink on Windows needs a privilege tests do not have.
+#[cfg(unix)]
 #[test]
 fn test_diff_recursive_directory_loop_is_diagnosed() {
     let (a, b) = dir_pair("rloop");
@@ -1908,16 +1925,17 @@ fn test_diff_recursive_per_file_header_echoes_the_command_line() {
     std::fs::write(a.join("f"), "one\n").unwrap();
     std::fs::write(b.join("f"), "two\n").unwrap();
     let (as_, bs) = (a.to_str().unwrap(), b.to_str().unwrap());
+    // diff names an entry by joining it to its directory operand, with the
+    // platform's separator.
+    let (af, bf) = (a.join("f"), b.join("f"));
+    let (af, bf) = (af.display(), bf.display());
 
     for (args, expected) in [
-        (
-            vec!["-r", "-c", as_, bs],
-            format!("diff -r -c {as_}/f {bs}/f"),
-        ),
-        (vec![as_, bs], format!("diff {as_}/f {bs}/f")),
+        (vec!["-r", "-c", as_, bs], format!("diff -r -c {af} {bf}")),
+        (vec![as_, bs], format!("diff {af} {bf}")),
         (
             vec!["-C", "5", "-b", as_, bs],
-            format!("diff -C 5 -b {as_}/f {bs}/f"),
+            format!("diff -C 5 -b {af} {bf}"),
         ),
     ] {
         let (stdout, _, _) = run_diff(&args);
@@ -1935,6 +1953,9 @@ fn test_diff_recursive_per_file_header_echoes_the_command_line() {
 /// `io::Error` does not carry a path, so the reporting sites used to guess,
 /// and always guessed the first operand: a failure reading the *second* file
 /// of a pair, or the second subdirectory, was reported against the first.
+// Unix only: a file is made unreadable with mode 000, which Windows has no
+// meaning for (its read-only attribute leaves a file readable).
+#[cfg(unix)]
 #[test]
 fn test_diff_io_error_names_the_failing_path() {
     use std::os::unix::fs::PermissionsExt as _;

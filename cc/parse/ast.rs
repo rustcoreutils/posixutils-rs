@@ -516,6 +516,17 @@ pub struct Expr {
 }
 
 impl Expr {
+    /// Whether this is a string literal of any kind: narrow, wide, `u` or `U`.
+    pub fn is_string_literal(&self) -> bool {
+        matches!(
+            self.kind,
+            ExprKind::StringLit(_)
+                | ExprKind::WideStringLit(_)
+                | ExprKind::Utf16StringLit(_)
+                | ExprKind::Utf32StringLit(_)
+        )
+    }
+
     /// Create a new untyped expression with position
     pub fn new(kind: ExprKind, pos: Position) -> Self {
         Self {
@@ -1376,6 +1387,11 @@ pub(crate) fn vm_extent_count(types: &TypeTable, symbols: &SymbolTable, expr: &E
 /// positional elements as the type has scalar fields, stopping early at a
 /// designated one -- which addresses the enclosing aggregate, not this slot.
 ///
+/// A slot with no bound at its end -- a flexible array member, or a structure
+/// ending in one -- has no scalar count to stop at, so it takes every
+/// positional element left, as gcc does: `static struct { int n; int a[]; }
+/// w = {1, 2, 3};` gives `a` both of the last two.
+///
 /// The parser sizing an incomplete array and the linearizer placing values
 /// both take elements this way, and each counted them with a loop of its own.
 pub fn brace_elision_span(
@@ -1384,7 +1400,11 @@ pub fn brace_elision_span(
     start: usize,
     target_type: TypeId,
 ) -> std::ops::Range<usize> {
-    let wanted = types.count_scalar_fields(target_type).max(1);
+    let wanted = if types.has_unbounded_tail(target_type) {
+        usize::MAX
+    } else {
+        types.count_scalar_fields(target_type).max(1)
+    };
     let mut end = (start + 1).min(elements.len());
     while end - start < wanted && end < elements.len() && elements[end].designators.is_empty() {
         end += 1;

@@ -376,6 +376,26 @@ pub(crate) struct AnonContinuation {
     pub(crate) levels: Vec<AnonLevel>,
 }
 
+/// Where an initializer of an object with static storage duration is, inside
+/// that object -- what [`Linearizer::admit_fam_visits`] needs to decide whether
+/// a flexible array member may be initialized there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StaticInitNesting {
+    /// Inside a subobject, not at the object's own top level.
+    pub(crate) nested: bool,
+    /// Inside an element of an array.
+    pub(crate) in_array: bool,
+}
+
+/// The storage duration of the object an initializer list initializes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InitStorage {
+    /// Initialized by stores each time its declaration is reached.
+    Automatic,
+    /// Laid out as a data image, at the given nesting.
+    Static(StaticInitNesting),
+}
+
 /// Grouped array init elements, keyed by array index (sorted).
 /// Shared between static (ast_init_list_to_ir) and runtime (linearize_init_list_at_offset) paths.
 pub(crate) struct ArrayInitGroups {
@@ -654,6 +674,11 @@ pub struct Linearizer<'a> {
     /// keeps its own answer.
     pub(crate) volatile_init_object: Option<PseudoId>,
 
+    /// Where the static initializer being lowered is inside its object. Each
+    /// level of [`Self::ast_init_list_to_ir`] sets it for the levels below and
+    /// restores it, so it reads as the top level between objects.
+    pub(crate) static_init_nesting: StaticInitNesting,
+
     /// The one block every computed `goto` in this function branches through,
     /// and the hidden local carrying the target address to it.
     ///
@@ -737,6 +762,7 @@ impl<'a> Linearizer<'a> {
             pending_goto_vla: Vec::new(),
             vla_marks: Vec::new(),
             volatile_init_object: None,
+            static_init_nesting: StaticInitNesting::default(),
             func_has_vla: false,
             indirect_dispatch: None,
             static_local_counter: 0,

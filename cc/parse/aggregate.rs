@@ -707,10 +707,10 @@ impl Parser<'_> {
     }
 
     fn check_flexible_array_members(&self, members: &[StructMember], is_union: bool) {
-        let is_flexible =
-            |m: &StructMember| m.bit_width.is_none() && self.types.unsized_array_levels(m.typ) > 0;
-
-        let Some(first) = members.iter().position(is_flexible) else {
+        let Some(first) = members
+            .iter()
+            .position(|m| self.types.is_flexible_array_member(m))
+        else {
             return;
         };
         let pos = self.current_pos();

@@ -1123,8 +1123,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let members: Vec<_> = composite.members.clone();
                     let is_union = self.types.kind(resolved_typ) == TypeKind::Union;
 
-                    let visits =
+                    let mut visits =
                         self.walk_struct_init_fields(resolved_typ, &members, is_union, elements);
+                    self.admit_fam_visits(&mut visits, &members, InitStorage::Automatic);
 
                     // C17 6.7.9p19 resolves two initializers for overlapping
                     // storage by subobject. Storing them in list order is
@@ -2564,7 +2565,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.compound_literal_counter += 1;
                 let typ = *typ;
                 let elements = elements.clone();
-                let init = self.ast_init_list_to_ir(&elements, typ);
+                let init = self.new_static_object_init(&elements, typ);
                 self.module.add_global(&name, typ, init);
                 Some((name, 0))
             }

@@ -1411,6 +1411,28 @@ impl TypeTable {
         cur
     }
 
+    /// Whether `member` is a flexible array member: an array with no bound,
+    /// which C17 6.7.2.1p18 allows only as the last member of a structure.
+    pub fn is_flexible_array_member(&self, member: &StructMember) -> bool {
+        member.bit_width.is_none() && self.unsized_array_levels(member.typ) > 0
+    }
+
+    /// Whether an object of type `id` ends in storage with no bound: it is an
+    /// array of unknown size, or a structure whose flexible array member is
+    /// last.
+    pub fn has_unbounded_tail(&self, id: TypeId) -> bool {
+        match self.kind(id) {
+            TypeKind::Array => self.get(id).array_size.is_none(),
+            TypeKind::Struct => self
+                .get(id)
+                .composite
+                .as_ref()
+                .and_then(|c| c.members.last())
+                .is_some_and(|m| self.is_flexible_array_member(m)),
+            _ => false,
+        }
+    }
+
     /// How many array levels of `id`, outermost-first, have no extent.
     ///
     /// The type table cannot tell a variably-modified array from an incomplete

@@ -456,7 +456,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     self.compound_literal_counter += 1;
 
                     // Create the anonymous global
-                    let init = self.ast_init_list_to_ir(elements, *cl_type);
+                    let init = self.new_static_object_init(elements, *cl_type);
                     self.module.add_global(&anon_name, *cl_type, init);
 
                     // Return address of the anonymous global
@@ -1156,6 +1156,74 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
 
         visits
+    }
+
+    /// Drop every visit that initializes a flexible array member where gcc
+    /// does not allow one to be, reporting each at its initializer.
+    ///
+    /// Initializing a flexible array member at all is a GNU extension (C17
+    /// 6.7.2.1p18 gives it no storage); see [`fam_init_violation`] for where
+    /// gcc draws the line. A dropped visit leaves the object's bytes as if
+    /// the member had not been named, so nothing further is reported.
+    pub(crate) fn admit_fam_visits(
+        &self,
+        visits: &mut Vec<StructFieldVisit>,
+        members: &[crate::types::StructMember],
+        storage: InitStorage,
+    ) {
+        visits.retain(|visit| {
+            let Some(message) = self
+                .fam_init_form(visit, members)
+                .and_then(|form| fam_init_violation(form, storage))
+            else {
+                return true;
+            };
+            error(self.visit_pos(visit), &gettextrs::gettext(message));
+            false
+        });
+    }
+
+    /// How `visit` initializes a flexible array member, or `None` if it
+    /// initializes some other member.
+    fn fam_init_form(
+        &self,
+        visit: &StructFieldVisit,
+        members: &[crate::types::StructMember],
+    ) -> Option<FamInit> {
+        let member = members.get(visit.member_index?)?;
+        if !self.types.is_flexible_array_member(member) {
+            return None;
+        }
+        let form = match &visit.kind {
+            // A designator into the member, `.s[1] = c`, initializes elements.
+            StructFieldVisitKind::Expr(expr) if self.types.unsized_array_levels(visit.typ) > 0 => {
+                match &expr.kind {
+                    ExprKind::InitList { elements } if elements.is_empty() => FamInit::Empty,
+                    ExprKind::InitList { elements } => match elements.as_slice() {
+                        [only] if only.designators.is_empty() && only.value.is_string_literal() => {
+                            FamInit::String
+                        }
+                        _ => FamInit::Elements,
+                    },
+                    _ if expr.is_string_literal() => FamInit::String,
+                    _ => FamInit::Elements,
+                }
+            }
+            _ => FamInit::Elements,
+        };
+        Some(form)
+    }
+
+    /// The position of the initializer a visit stands for.
+    fn visit_pos(&self, visit: &StructFieldVisit) -> Position {
+        match &visit.kind {
+            StructFieldVisitKind::Expr(expr) => self.expr_pos(expr),
+            StructFieldVisitKind::BraceElision(elements) => elements
+                .first()
+                .map_or(self.current_pos.unwrap_or_default(), |e| {
+                    self.expr_pos(&e.value)
+                }),
+        }
     }
 
     /// The member each union inside the subobject a visit initializes comes
@@ -1869,6 +1937,31 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// Convert an AST initializer list to an IR Initializer
+    /// Lower the initializer of a new object with static storage duration --
+    /// a compound literal -- met while lowering another one: it is at its own
+    /// top level, not at the enclosing initializer's.
+    pub(crate) fn new_static_object_init(
+        &mut self,
+        elements: &[InitElement],
+        typ: TypeId,
+    ) -> Initializer {
+        let outer = std::mem::take(&mut self.static_init_nesting);
+        let init = self.ast_init_list_to_ir(elements, typ);
+        self.static_init_nesting = outer;
+        init
+    }
+
+    /// Mark the levels below as inside a subobject -- an array element if
+    /// `array` -- returning the nesting to restore once they are lowered.
+    fn enter_static_subobject(&mut self, array: bool) -> StaticInitNesting {
+        let outer = self.static_init_nesting;
+        self.static_init_nesting = StaticInitNesting {
+            nested: true,
+            in_array: outer.in_array || array,
+        };
+        outer
+    }
+
     pub(crate) fn ast_init_list_to_ir(
         &mut self,
         elements: &[InitElement],
@@ -1912,6 +2005,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
                 let groups = self.group_array_init_elements(elements, typ);
                 let mut init_elements = Vec::new();
+                let outer = self.enter_static_subobject(true);
                 for element_index in groups.indices {
                     let Some(list) = groups.element_lists.get(&element_index) else {
                         continue;
@@ -1943,6 +2037,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     };
                     init_elements.push((offset, elem_init));
                 }
+                self.static_init_nesting = outer;
 
                 init_elements.sort_by_key(|(offset, _)| *offset);
 
@@ -1960,11 +2055,14 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let members: Vec<_> = composite.members.clone();
                     let is_union = self.types.kind(resolved_typ) == TypeKind::Union;
 
-                    let visits =
+                    let mut visits =
                         self.walk_struct_init_fields(resolved_typ, &members, is_union, elements);
+                    let storage = InitStorage::Static(self.static_init_nesting);
+                    self.admit_fam_visits(&mut visits, &members, storage);
 
                     // Convert field visits to RawFieldInit by evaluating expressions
                     let mut raw_fields: Vec<RawFieldInit> = Vec::new();
+                    let outer = self.enter_static_subobject(false);
                     for visit in visits {
                         let held = self.held_union_members(visit.typ, &visit.kind, visit.offset);
                         let field_init = match visit.kind {
@@ -1986,6 +2084,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                             named: visit.unions,
                         });
                     }
+                    self.static_init_nesting = outer;
 
                     // Initializing the same object twice: the later one wins
                     // (C17 6.7.9p19), and one that names a *subobject* of an
@@ -2571,6 +2670,40 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 }
 
+/// What initializes a flexible array member, as far as where it may appear
+/// depends on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FamInit {
+    /// `{}`: nothing, which gcc discards wherever the object is static.
+    Empty,
+    /// A string literal, braced or not.
+    String,
+    /// Elements: a braced list, brace-elided values, or a designator into it.
+    Elements,
+}
+
+/// The diagnostic gcc gives for initializing a flexible array member with
+/// `form` in an object of `storage`, or `None` where gcc accepts it.
+///
+/// An automatic object cannot be given one at all, not even `{}`. In a static
+/// object a list of elements is allowed only at the object's own top level,
+/// and a string literal anywhere but inside an array element -- each element
+/// would have a different size.
+fn fam_init_violation(form: FamInit, storage: InitStorage) -> Option<&'static str> {
+    let nesting = match storage {
+        InitStorage::Automatic => {
+            return Some("non-static initialization of a flexible array member")
+        }
+        InitStorage::Static(nesting) => nesting,
+    };
+    let rejected = match form {
+        FamInit::Empty => false,
+        FamInit::String => nesting.in_array,
+        FamInit::Elements => nesting.nested,
+    };
+    rejected.then_some("initialization of flexible array member in a nested context")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2694,6 +2827,87 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, Initializer::Int(1)), (4, Initializer::Int(2))],
         );
+    }
+
+    #[test]
+    fn a_flexible_array_member_initializer_is_placed_as_gcc_places_it() {
+        use FamInit::{Elements, Empty, String};
+        let top = InitStorage::Static(StaticInitNesting::default());
+        let member = InitStorage::Static(StaticInitNesting {
+            nested: true,
+            in_array: false,
+        });
+        let element = InitStorage::Static(StaticInitNesting {
+            nested: true,
+            in_array: true,
+        });
+        let nested = Some("initialization of flexible array member in a nested context");
+        for form in [Empty, String, Elements] {
+            assert_eq!(fam_init_violation(form, top), None, "{form:?} at top level");
+        }
+        assert_eq!(fam_init_violation(Empty, member), None);
+        assert_eq!(fam_init_violation(String, member), None);
+        assert_eq!(fam_init_violation(Elements, member), nested);
+        assert_eq!(fam_init_violation(Empty, element), None);
+        assert_eq!(fam_init_violation(String, element), nested);
+        assert_eq!(fam_init_violation(Elements, element), nested);
+        for form in [Empty, String, Elements] {
+            assert_eq!(
+                fam_init_violation(form, InitStorage::Automatic),
+                Some("non-static initialization of a flexible array member"),
+            );
+        }
+    }
+
+    /// `struct V { int n; char s[]; }` initialized `{1, "x"}`: the string is
+    /// laid out after `n` at the object's top level, and dropped -- leaving
+    /// `n` alone -- in an array element, where it is rejected.
+    #[test]
+    fn a_rejected_flexible_array_member_initializer_lays_out_nothing() {
+        let target = Target::host();
+        let mut types = TypeTable::new(&target);
+        let mut strings = crate::strings::StringTable::new();
+        let (n, s) = (strings.intern("n"), strings.intern("s"));
+        let chars = types.intern(Type {
+            kind: TypeKind::Array,
+            base: Some(types.char_id),
+            array_size: None,
+            ..Default::default()
+        });
+        let v = types.intern(Type::struct_type(composite(
+            vec![member(n, types.int_id, 0), member(s, chars, 4)],
+            4,
+            4,
+        )));
+        let v_array = types.intern(Type::array(v, 1));
+        let list = |elements: Vec<InitElement>| InitElement {
+            designators: vec![],
+            value: Box::new(Expr::new_unpositioned(ExprKind::InitList { elements })),
+        };
+        let fields = vec![
+            positional(1, &types),
+            InitElement {
+                designators: vec![],
+                value: Box::new(Expr::new_unpositioned(ExprKind::StringLit("x".into()))),
+            },
+        ];
+        let symbols = SymbolTable::new();
+        let mut lin = Linearizer::new(&symbols, &types, &strings, &target);
+        let offsets = |init: &Initializer| match init {
+            Initializer::Struct { fields, .. } => fields.iter().map(|f| f.0).collect::<Vec<_>>(),
+            other => panic!("a struct initializer lowers to Initializer::Struct, got {other:?}"),
+        };
+
+        let top = lin.ast_init_list_to_ir(&fields, v);
+        assert_eq!(offsets(&top), vec![0, 4]);
+
+        let init = lin.ast_init_list_to_ir(&[list(fields)], v_array);
+        let Initializer::Array { elements, .. } = init else {
+            panic!("an array initializer lowers to Initializer::Array, got {init:?}");
+        };
+        assert_eq!(elements.len(), 1);
+        assert_eq!(offsets(&elements[0].1), vec![0]);
+        assert_eq!(lin.static_init_nesting, StaticInitNesting::default());
     }
 
     // Resolving two initializers that describe overlapping storage

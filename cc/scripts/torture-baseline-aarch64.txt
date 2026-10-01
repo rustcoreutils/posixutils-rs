@@ -425,6 +425,8 @@ aarch64/compile/20030219-1@-O0
 aarch64/compile/20030219-1@-O2
 aarch64/compile/20030220-1@-O0
 aarch64/compile/20030220-1@-O2
+aarch64/compile/20030305-1@-O0
+aarch64/compile/20030305-1@-O2
 aarch64/compile/20030310-1@-O0
 aarch64/compile/20030310-1@-O2
 aarch64/compile/20030314-1@-O0
@@ -2355,6 +2357,8 @@ aarch64/compile/pr28776-1@-O0
 aarch64/compile/pr28776-1@-O2
 aarch64/compile/pr28776-2@-O0
 aarch64/compile/pr28776-2@-O2
+aarch64/compile/pr28865@-O0
+aarch64/compile/pr28865@-O2
 aarch64/compile/pr28905@-O0
 aarch64/compile/pr28905@-O2
 aarch64/compile/pr29128@-O0

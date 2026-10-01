@@ -636,6 +636,13 @@ impl<'a> Parser<'a> {
 
         while let Some(name_id) = self.current_ident() {
             let pos = self.current_pos();
+            // Every spelling of `const`, `volatile` and `restrict`, from the
+            // one shared answer.
+            if let Some(m) = super::cv_qualifier_modifier(name_id) {
+                self.advance();
+                modifiers |= m;
+                continue;
+            }
             match name_id {
                 // An attribute can sit anywhere among the specifiers and goes
                 // to the pending slots; a type-name has set the enclosing
@@ -643,12 +650,6 @@ impl<'a> Parser<'a> {
                 crate::kw::GNU_ATTRIBUTE | crate::kw::GNU_ATTRIBUTE2 => {
                     self.skip_extensions();
                     continue;
-                }
-                // Every spelling of `const`, `volatile` and `restrict`,
-                // from the one shared answer.
-                _ if let Some(m) = super::cv_qualifier_modifier(name_id) => {
-                    self.advance();
-                    modifiers |= m;
                 }
                 crate::kw::STATIC
                 | crate::kw::EXTERN

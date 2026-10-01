@@ -186,8 +186,9 @@ pub enum LocaleCategory {
 impl LocaleCategory {
     /// Map to the libc `LC_*` constant for `setlocale(3)`.
     ///
-    /// The `LcPaper`..`LcIdentification` categories are glibc extensions; on
-    /// platforms that lack them (e.g. macOS) they fall back to `LC_ALL`.
+    /// The `LcPaper`..`LcIdentification` categories are glibc extensions, and
+    /// `LcMessages` is POSIX rather than ISO C; on platforms that lack one
+    /// (macOS for the first, Windows for both) it falls back to `LC_ALL`.
     fn to_libc(&self) -> libc::c_int {
         match self {
             LocaleCategory::LcCType => libc::LC_CTYPE,
@@ -195,6 +196,9 @@ impl LocaleCategory {
             LocaleCategory::LcTime => libc::LC_TIME,
             LocaleCategory::LcCollate => libc::LC_COLLATE,
             LocaleCategory::LcMonetary => libc::LC_MONETARY,
+            // POSIX, not ISO C: Windows has no LC_MESSAGES, and takes the
+            // LC_ALL fallback below.
+            #[cfg(unix)]
             LocaleCategory::LcMessages => libc::LC_MESSAGES,
             LocaleCategory::LcAll => libc::LC_ALL,
             #[cfg(target_os = "linux")]

@@ -120,7 +120,9 @@ fn read_string(
 ///
 /// Search order, following GNU gettext and XSI:
 ///
-/// 1. `NLSPATH` templates — a colon-separated list of path templates with `%N`
+/// 1. `NLSPATH` templates — a list of path templates, separated as the platform
+///    separates `PATH` (`:`, or `;` on Windows, where `:` follows a drive
+///    letter), with `%N`
 ///    (domain), `%L` (full locale), `%l` (language), `%t` (territory) and `%c`
 ///    (codeset) substitutions. POSIX lists this for the XSI message-catalog
 ///    interface, and it takes precedence over everything else.
@@ -131,7 +133,11 @@ pub fn load(domain: &str, locale: &str, bound_dir: Option<&Path>) -> Option<Cata
     let variants = locale_variants(locale);
 
     if let Ok(nlspath) = env::var("NLSPATH") {
-        for template in nlspath.split(':').filter(|t| !t.is_empty()) {
+        let templates = env::split_paths(&nlspath).filter(|t| !t.as_os_str().is_empty());
+        for template in templates {
+            let Some(template) = template.to_str() else {
+                continue;
+            };
             for variant in &variants {
                 let path = PathBuf::from(expand_nlspath(template, domain, variant));
                 if let Some(cat) = try_read(&path) {

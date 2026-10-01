@@ -105,6 +105,12 @@ pub fn init(utility: &str) {
 ///   locale-sensitive libc functions (`<ctype.h>`/`<wctype.h>`, `strcoll`,
 ///   `strftime`, `nl_langinfo`, …) observe `LC_*`. The gettextrs wrapper applies
 ///   this directly to libc's global locale.
+/// - on Windows, `setlocale(LC_ALL, ".UTF-8")` — the user's locale as `""`
+///   selects it, but in UTF-8 instead of the ANSI code page, so that the C
+///   runtime's multibyte functions (and with them [`crate::regex`]) read
+///   the UTF-8 that Rust strings hold. The UCRT supports this from Windows
+///   10 1803; where it is refused (older systems, or the msvcrt that the
+///   `-gnu` targets link) the `""` locale stays.
 /// - `textdomain("posixutils-rs")`
 /// - `bind_textdomain_codeset("posixutils-rs", "UTF-8")`
 /// - [`init`]`(utility)`
@@ -117,6 +123,8 @@ pub fn init_locale(utility: &str) {
     use gettextrs::{bind_textdomain_codeset, setlocale, textdomain, LocaleCategory};
     crate::io::restore_sigpipe();
     setlocale(LocaleCategory::LcAll, "");
+    #[cfg(windows)]
+    setlocale(LocaleCategory::LcAll, ".UTF-8");
     let _ = textdomain("posixutils-rs");
     let _ = bind_textdomain_codeset("posixutils-rs", "UTF-8");
     init(utility);

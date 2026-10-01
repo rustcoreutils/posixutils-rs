@@ -28,7 +28,6 @@ pub mod platform;
 pub mod priority;
 #[cfg(unix)]
 pub mod projectdir;
-#[cfg(unix)]
 pub mod regex;
 #[cfg(unix)]
 pub mod sccsfile;
@@ -60,7 +59,7 @@ pub const BUFSZ: usize = 8 * 1024;
 ///
 /// Recovers from a poisoned lock — the guarded data is `()`, so a panic in a
 /// prior holder leaves it perfectly usable.
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn locale_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCALE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCALE_LOCK.lock().unwrap_or_else(|e| e.into_inner())

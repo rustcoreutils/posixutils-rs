@@ -115,7 +115,12 @@ inherently Unix (users, terminals, signals, file modes and ownership), and the
 - `compress` restores permissions and times but not ownership, and does not
   warn about hard links;
 - the `zcat` and `uncompress` aliases do not exist; use `compress -c -d` and
-  `compress -d`.
+  `compress -d`;
+- POSIX regular expressions (`plib::regex`) are musl's, compiled from
+  `plib/vendor/musl-regex` with the C compiler that the Rust toolchain
+  already needs (MSVC's `cl.exe`, or mingw-w64 `gcc`). They match per
+  character in UTF-8, which the utilities' locale setup selects, and do not
+  support characters above U+FFFF; see that directory's `README.md`.
 
 Utilities are ported a whole crate at a time, since `cargo test -p` builds
 every binary in a crate. A crate joins the Windows CI job by being added to

@@ -19,6 +19,7 @@
 use super::ast::{
     Expr, ExprKind, InlineLibraryFn, LibFn, MathErrno, MemoryFn, NarrowedLibraryCall,
 };
+use super::builtin_args::BuiltinArgs;
 use super::parser::{ParseResult, Parser};
 use crate::constexpr::ConstScope;
 use crate::float::IntegralRounding;
@@ -26,7 +27,7 @@ use crate::kw;
 use crate::strings::StringId;
 use crate::symbol::SymbolId;
 use crate::token::lexer::Position;
-use crate::types::{Type, TypeId, TypeKind, TypeTable};
+use crate::types::{TypeId, TypeKind, TypeTable};
 
 /// What the command line says about evaluating library calls in place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +106,7 @@ impl LibraryCallPolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProtoType {
     Void,
+    Bool,
     Int,
     Long,
     LongLong,
@@ -115,6 +117,10 @@ pub(super) enum ProtoType {
     Float,
     Double,
     LongDouble,
+    /// `_Float16`.
+    Float16,
+    /// `_Float128`, where the target has it.
+    Float128,
     ComplexFloat,
     ComplexDouble,
     ComplexLongDouble,
@@ -122,6 +128,14 @@ pub(super) enum ProtoType {
     ConstVoidPtr,
     CharPtr,
     ConstCharPtr,
+    /// `volatile void *`.
+    VolatileVoidPtr,
+    /// `const volatile void *`.
+    ConstVolatileVoidPtr,
+    IntPtr,
+    FloatPtr,
+    DoublePtr,
+    LongDoublePtr,
     /// `FILE *`. c17 has no `FILE` of its own, so any pointer to an object
     /// stands for it in a declaration; one this synthesizes says `void *`,
     /// which every ABI passes the same way.
@@ -136,6 +150,7 @@ impl ProtoType {
     pub(super) fn id(self, t: &TypeTable) -> TypeId {
         match self {
             ProtoType::Void => t.void_id,
+            ProtoType::Bool => t.bool_id,
             ProtoType::Int => t.int_id,
             ProtoType::Long => t.long_id,
             ProtoType::LongLong => t.longlong_id,
@@ -146,6 +161,8 @@ impl ProtoType {
             ProtoType::Float => t.float_id,
             ProtoType::Double => t.double_id,
             ProtoType::LongDouble => t.longdouble_id,
+            ProtoType::Float16 => t.float16_id,
+            ProtoType::Float128 => t.float128_id,
             ProtoType::ComplexFloat => t.complex_float_id,
             ProtoType::ComplexDouble => t.complex_double_id,
             ProtoType::ComplexLongDouble => t.complex_longdouble_id,
@@ -153,6 +170,12 @@ impl ProtoType {
             ProtoType::ConstVoidPtr => t.const_void_ptr_id,
             ProtoType::CharPtr => t.char_ptr_id,
             ProtoType::ConstCharPtr => t.const_char_ptr_id,
+            ProtoType::VolatileVoidPtr => t.volatile_void_ptr_id,
+            ProtoType::ConstVolatileVoidPtr => t.const_volatile_void_ptr_id,
+            ProtoType::IntPtr => t.int_ptr_id,
+            ProtoType::FloatPtr => t.float_ptr_id,
+            ProtoType::DoublePtr => t.double_ptr_id,
+            ProtoType::LongDoublePtr => t.longdouble_ptr_id,
             ProtoType::VaList => t.va_list_id,
             ProtoType::SizeT => t.ulong_id,
         }
@@ -196,6 +219,8 @@ enum Evaluation {
     /// An ordinary call, tagged with what it calls so that the optimizer
     /// may fold it (`ir::libcall_fold`).
     Call(LibFn),
+    /// An ordinary call the optimizer knows nothing more about.
+    Plain,
 }
 
 /// A library function c17 knows by prototype.
@@ -252,10 +277,30 @@ const fn known(
     }
 }
 
+/// A function called, of which nothing is known but its prototype: what a
+/// `__builtin_` spelling of it calls, and what an implicit declaration of
+/// it under `-fpermissive` returns.
+const fn plain(
+    bare: StringId,
+    ret: ProtoType,
+    params: &'static [ProtoType],
+    variadic: bool,
+) -> LibraryBuiltin {
+    LibraryBuiltin {
+        bare,
+        reserved: None,
+        ret,
+        params,
+        variadic,
+        eval: Evaluation::Plain,
+    }
+}
+
 /// Every library builtin, with its prototype and how it is evaluated.
 ///
-/// `intmax_t` is `long` on every target c17 has, as
-/// `chk_builtin_return_type` also answers.
+/// `intmax_t` is `long` on every target c17 has. The `_chk` rows are glibc's
+/// declarations, so a header that declares one after a call has declared it
+/// from here agrees with it.
 #[rustfmt::skip]
 static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
     use InlineLibraryFn as F;
@@ -349,6 +394,158 @@ static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
         known(kw::PUTCHAR,           Int,          &[Int],                                     FIXED,    L::Putchar),
         known(kw::FPUTC,             Int,          &[Int, ObjPtr],                             FIXED,    L::Fputc),
         known(kw::FWRITE,            SizeT,        &[ConstVoidPtr, SizeT, SizeT, ObjPtr],      FIXED,    L::Fwrite),
+        //    name               returns           parameters                                   `...`
+        plain(kw::CBRT,             Double,            &[Double],                FIXED),
+        plain(kw::CBRTF,            Float,             &[Float],                 FIXED),
+        plain(kw::CBRTL,            LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::SIN,              Double,            &[Double],                FIXED),
+        plain(kw::SINF,             Float,             &[Float],                 FIXED),
+        plain(kw::SINL,             LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::COS,              Double,            &[Double],                FIXED),
+        plain(kw::COSF,             Float,             &[Float],                 FIXED),
+        plain(kw::COSL,             LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::TAN,              Double,            &[Double],                FIXED),
+        plain(kw::TANF,             Float,             &[Float],                 FIXED),
+        plain(kw::TANL,             LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::ASIN,             Double,            &[Double],                FIXED),
+        plain(kw::ASINF,            Float,             &[Float],                 FIXED),
+        plain(kw::ASINL,            LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::ACOS,             Double,            &[Double],                FIXED),
+        plain(kw::ACOSF,            Float,             &[Float],                 FIXED),
+        plain(kw::ACOSL,            LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::ATAN,             Double,            &[Double],                FIXED),
+        plain(kw::ATANF,            Float,             &[Float],                 FIXED),
+        plain(kw::ATANL,            LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::SINH,             Double,            &[Double],                FIXED),
+        plain(kw::SINHF,            Float,             &[Float],                 FIXED),
+        plain(kw::SINHL,            LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::COSH,             Double,            &[Double],                FIXED),
+        plain(kw::COSHF,            Float,             &[Float],                 FIXED),
+        plain(kw::COSHL,            LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::TANH,             Double,            &[Double],                FIXED),
+        plain(kw::TANHF,            Float,             &[Float],                 FIXED),
+        plain(kw::TANHL,            LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::ASINH,            Double,            &[Double],                FIXED),
+        plain(kw::ASINHF,           Float,             &[Float],                 FIXED),
+        plain(kw::ASINHL,           LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::ACOSH,            Double,            &[Double],                FIXED),
+        plain(kw::ACOSHF,           Float,             &[Float],                 FIXED),
+        plain(kw::ACOSHL,           LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::ATANH,            Double,            &[Double],                FIXED),
+        plain(kw::ATANHF,           Float,             &[Float],                 FIXED),
+        plain(kw::ATANHL,           LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::EXP,              Double,            &[Double],                FIXED),
+        plain(kw::EXPF,             Float,             &[Float],                 FIXED),
+        plain(kw::EXPL,             LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::EXP2,             Double,            &[Double],                FIXED),
+        plain(kw::EXP2F,            Float,             &[Float],                 FIXED),
+        plain(kw::EXP2L,            LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::EXPM1,            Double,            &[Double],                FIXED),
+        plain(kw::EXPM1F,           Float,             &[Float],                 FIXED),
+        plain(kw::EXPM1L,           LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::LOG,              Double,            &[Double],                FIXED),
+        plain(kw::LOGF,             Float,             &[Float],                 FIXED),
+        plain(kw::LOGL,             LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::LOG2,             Double,            &[Double],                FIXED),
+        plain(kw::LOG2F,            Float,             &[Float],                 FIXED),
+        plain(kw::LOG2L,            LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::LOG10,            Double,            &[Double],                FIXED),
+        plain(kw::LOG10F,           Float,             &[Float],                 FIXED),
+        plain(kw::LOG10L,           LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::LOG1P,            Double,            &[Double],                FIXED),
+        plain(kw::LOG1PF,           Float,             &[Float],                 FIXED),
+        plain(kw::LOG1PL,           LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::LOGB,             Double,            &[Double],                FIXED),
+        plain(kw::LOGBF,            Float,             &[Float],                 FIXED),
+        plain(kw::LOGBL,            LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::TGAMMA,           Double,            &[Double],                FIXED),
+        plain(kw::TGAMMAF,          Float,             &[Float],                 FIXED),
+        plain(kw::TGAMMAL,          LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::LGAMMA,           Double,            &[Double],                FIXED),
+        plain(kw::LGAMMAF,          Float,             &[Float],                 FIXED),
+        plain(kw::LGAMMAL,          LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::ERF,              Double,            &[Double],                FIXED),
+        plain(kw::ERFF,             Float,             &[Float],                 FIXED),
+        plain(kw::ERFL,             LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::ERFC,             Double,            &[Double],                FIXED),
+        plain(kw::ERFCF,            Float,             &[Float],                 FIXED),
+        plain(kw::ERFCL,            LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::CEILL,            LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::FLOORL,           LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::TRUNCL,           LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::ROUNDL,           LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::RINTL,            LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::NEARBYINTL,       LongDouble,        &[LongDouble],            FIXED),
+        plain(kw::POW,              Double,            &[Double, Double],        FIXED),
+        plain(kw::POWF,             Float,             &[Float, Float],          FIXED),
+        plain(kw::POWL,             LongDouble,        &[LongDouble, LongDouble], FIXED),
+        plain(kw::FMOD,             Double,            &[Double, Double],        FIXED),
+        plain(kw::FMODF,            Float,             &[Float, Float],          FIXED),
+        plain(kw::FMODL,            LongDouble,        &[LongDouble, LongDouble], FIXED),
+        plain(kw::ATAN2,            Double,            &[Double, Double],        FIXED),
+        plain(kw::ATAN2F,           Float,             &[Float, Float],          FIXED),
+        plain(kw::ATAN2L,           LongDouble,        &[LongDouble, LongDouble], FIXED),
+        plain(kw::HYPOT,            Double,            &[Double, Double],        FIXED),
+        plain(kw::HYPOTF,           Float,             &[Float, Float],          FIXED),
+        plain(kw::HYPOTL,           LongDouble,        &[LongDouble, LongDouble], FIXED),
+        plain(kw::FDIM,             Double,            &[Double, Double],        FIXED),
+        plain(kw::FDIMF,            Float,             &[Float, Float],          FIXED),
+        plain(kw::FDIML,            LongDouble,        &[LongDouble, LongDouble], FIXED),
+        plain(kw::REMAINDER,        Double,            &[Double, Double],        FIXED),
+        plain(kw::REMAINDERF,       Float,             &[Float, Float],          FIXED),
+        plain(kw::REMAINDERL,       LongDouble,        &[LongDouble, LongDouble], FIXED),
+        plain(kw::NEXTAFTER,        Double,            &[Double, Double],        FIXED),
+        plain(kw::NEXTAFTERF,       Float,             &[Float, Float],          FIXED),
+        plain(kw::NEXTAFTERL,       LongDouble,        &[LongDouble, LongDouble], FIXED),
+        plain(kw::FMAXL,            LongDouble,        &[LongDouble, LongDouble], FIXED),
+        plain(kw::FMINL,            LongDouble,        &[LongDouble, LongDouble], FIXED),
+        plain(kw::FMAL,             LongDouble,        &[LongDouble, LongDouble, LongDouble], FIXED),
+        plain(kw::MODF,             Double,            &[Double, DoublePtr],     FIXED),
+        plain(kw::MODFF,            Float,             &[Float, FloatPtr],       FIXED),
+        plain(kw::MODFL,            LongDouble,        &[LongDouble, LongDoublePtr], FIXED),
+        plain(kw::FREXP,            Double,            &[Double, IntPtr],        FIXED),
+        plain(kw::FREXPF,           Float,             &[Float, IntPtr],         FIXED),
+        plain(kw::FREXPL,           LongDouble,        &[LongDouble, IntPtr],    FIXED),
+        plain(kw::LDEXP,            Double,            &[Double, Int],           FIXED),
+        plain(kw::LDEXPF,           Float,             &[Float, Int],            FIXED),
+        plain(kw::LDEXPL,           LongDouble,        &[LongDouble, Int],       FIXED),
+        plain(kw::NAN,              Double,            &[ConstCharPtr],          FIXED),
+        plain(kw::NANF,             Float,             &[ConstCharPtr],          FIXED),
+        plain(kw::NANL,             LongDouble,        &[ConstCharPtr],          FIXED),
+        plain(kw::NANF16,           Float16,           &[ConstCharPtr],          FIXED),
+        plain(kw::NANF32,           Float,             &[ConstCharPtr],          FIXED),
+        plain(kw::NANF64,           Double,            &[ConstCharPtr],          FIXED),
+        plain(kw::NANF128,          Float128,          &[ConstCharPtr],          FIXED),
+        plain(kw::MEMCPY_CHK,       VoidPtr,           &[VoidPtr, ConstVoidPtr, SizeT, SizeT], FIXED),
+        plain(kw::MEMMOVE_CHK,      VoidPtr,           &[VoidPtr, ConstVoidPtr, SizeT, SizeT], FIXED),
+        plain(kw::MEMPCPY_CHK,      VoidPtr,           &[VoidPtr, ConstVoidPtr, SizeT, SizeT], FIXED),
+        plain(kw::MEMSET_CHK,       VoidPtr,           &[VoidPtr, Int, SizeT, SizeT], FIXED),
+        plain(kw::STRCPY_CHK,       CharPtr,           &[CharPtr, ConstCharPtr, SizeT], FIXED),
+        plain(kw::STPCPY_CHK,       CharPtr,           &[CharPtr, ConstCharPtr, SizeT], FIXED),
+        plain(kw::STRCAT_CHK,       CharPtr,           &[CharPtr, ConstCharPtr, SizeT], FIXED),
+        plain(kw::STRNCPY_CHK,      CharPtr,           &[CharPtr, ConstCharPtr, SizeT, SizeT], FIXED),
+        plain(kw::STPNCPY_CHK,      CharPtr,           &[CharPtr, ConstCharPtr, SizeT, SizeT], FIXED),
+        plain(kw::STRNCAT_CHK,      CharPtr,           &[CharPtr, ConstCharPtr, SizeT, SizeT], FIXED),
+        plain(kw::SPRINTF_CHK,      Int,               &[CharPtr, Int, SizeT, ConstCharPtr], VARIADIC),
+        plain(kw::SNPRINTF_CHK,     Int,               &[CharPtr, SizeT, Int, SizeT, ConstCharPtr], VARIADIC),
+        plain(kw::VSPRINTF_CHK,     Int,               &[CharPtr, Int, SizeT, ConstCharPtr, VaList], FIXED),
+        plain(kw::VSNPRINTF_CHK,    Int,               &[CharPtr, SizeT, Int, SizeT, ConstCharPtr, VaList], FIXED),
+        plain(kw::SNPRINTF,         Int,               &[CharPtr, SizeT, ConstCharPtr], VARIADIC),
+        plain(kw::BCMP,             Int,               &[ConstVoidPtr, ConstVoidPtr, SizeT], FIXED),
+        plain(kw::BZERO,            Void,              &[VoidPtr, SizeT],        FIXED),
+        plain(kw::STPNCPY,          CharPtr,           &[CharPtr, ConstCharPtr, SizeT], FIXED),
+        plain(kw::STRDUP,           CharPtr,           &[ConstCharPtr],          FIXED),
+        plain(kw::STRNDUP,          CharPtr,           &[ConstCharPtr, SizeT],   FIXED),
+        plain(kw::STRCASECMP,       Int,               &[ConstCharPtr, ConstCharPtr], FIXED),
+        plain(kw::STRNCASECMP,      Int,               &[ConstCharPtr, ConstCharPtr, SizeT], FIXED),
+        plain(kw::STRSPN,           SizeT,             &[ConstCharPtr, ConstCharPtr], FIXED),
+        plain(kw::ABORT,            Void,              &[],                      FIXED),
+        plain(kw::EXIT,             Void,              &[Int],                   FIXED),
+        plain(kw::MALLOC,           VoidPtr,           &[SizeT],                 FIXED),
+        plain(kw::CALLOC,           VoidPtr,           &[SizeT, SizeT],          FIXED),
+        plain(kw::REALLOC,          VoidPtr,           &[VoidPtr, SizeT],        FIXED),
+        plain(kw::FREE,             Void,              &[VoidPtr],               FIXED),
+        plain(kw::ALLOCA,           VoidPtr,           &[SizeT],                 FIXED),
     ]
 };
 
@@ -366,21 +563,33 @@ impl LibFn {
 
 impl LibraryBuiltin {
     /// The library builtin `name_id` spells, and which spelling it is.
+    ///
+    /// Asked of every identifier an expression starts with, so it is a
+    /// table index rather than a search: every spelling is a keyword, and a
+    /// keyword's id is below [`kw::KEYWORD_COUNT`].
     fn lookup(name_id: StringId) -> Option<(&'static LibraryBuiltin, Spelling)> {
-        LIBRARY_BUILTINS.iter().find_map(|lb| {
-            if lb.bare == name_id {
-                Some((lb, Spelling::Bare))
-            } else if lb.reserved == Some(name_id) {
-                Some((lb, Spelling::Reserved))
-            } else {
-                None
+        static INDEX: std::sync::OnceLock<Vec<Option<(u16, Spelling)>>> =
+            std::sync::OnceLock::new();
+        let index = INDEX.get_or_init(|| {
+            let mut index = vec![None; kw::KEYWORD_COUNT + 1];
+            for (row, lb) in LIBRARY_BUILTINS.iter().enumerate() {
+                let row = u16::try_from(row).expect("the table fits a u16");
+                index[lb.bare.0 as usize] = Some((row, Spelling::Bare));
+                if let Some(reserved) = lb.reserved {
+                    index[reserved.0 as usize] = Some((row, Spelling::Reserved));
+                }
             }
-        })
+            index
+        });
+        let (row, spelling) = (*index.get(name_id.0 as usize)?)?;
+        Some((&LIBRARY_BUILTINS[usize::from(row)], spelling))
     }
 
     /// The library builtin whose bare name is `name_id`.
     pub(super) fn by_bare_name(name_id: StringId) -> Option<&'static LibraryBuiltin> {
-        LIBRARY_BUILTINS.iter().find(|lb| lb.bare == name_id)
+        Self::lookup(name_id)
+            .filter(|&(_, spelling)| spelling == Spelling::Bare)
+            .map(|(lb, _)| lb)
     }
 
     /// The library function a call to `name_id` calls, when the table knows
@@ -400,7 +609,7 @@ impl LibraryBuiltin {
     pub(super) fn called(&self) -> Option<LibFn> {
         match self.eval {
             Evaluation::Call(f) => Some(f),
-            Evaluation::InPlace(_) => None,
+            Evaluation::InPlace(_) | Evaluation::Plain => None,
         }
     }
 
@@ -413,7 +622,7 @@ impl LibraryBuiltin {
     pub(super) fn is_displaced(&self, defined: &std::collections::HashSet<StringId>) -> bool {
         match self.eval {
             Evaluation::InPlace(f) => f.is_displaced(self.bare, defined),
-            Evaluation::Call(_) => false,
+            Evaluation::Call(_) | Evaluation::Plain => false,
         }
     }
 
@@ -469,10 +678,7 @@ impl Parser<'_> {
 
     /// The function type `lb`'s prototype spells.
     fn library_function_type(&mut self, lb: &LibraryBuiltin) -> TypeId {
-        let ret = lb.ret.id(self.types);
-        let params = self.library_params(lb);
-        self.types
-            .intern(Type::function(ret, params, lb.variadic, false))
+        self.builtin_prototype(lb.ret, lb.params, lb.variadic)
     }
 
     /// Declare the library function `lb` with its own prototype, for a call
@@ -575,12 +781,7 @@ impl Parser<'_> {
         spelling: Spelling,
         pos: Position,
     ) -> ParseResult<Expr> {
-        let call_pos = self.current_pos();
-        self.expect_special(b'(')?;
-        let args = self.parse_argument_list()?;
-        self.expect_special(b')')?;
-
-        let ret = lb.ret.id(self.types);
+        let BuiltinArgs { args, call_pos } = self.parse_builtin_call_args()?;
         let func_type = self.library_function_type(lb);
         let spelled = match spelling {
             Spelling::Bare => lb.bare,
@@ -590,11 +791,8 @@ impl Parser<'_> {
         if sound && args.len() == lb.params.len() {
             Ok(self.lower_library_call(lb, func, spelling, args, pos))
         } else {
-            // Diagnosed already. A zero of the return type stands in for the
-            // call, so the enclosing expression still parses and types, and
-            // no conversion is asked of an argument that has none.
-            let zero = Self::typed_expr(ExprKind::IntLit(0), self.types.int_id, pos);
-            Ok(self.convert_operand(zero, ret))
+            let ret = lb.ret.id(self.types);
+            Ok(self.diagnosed_call(ret, pos))
         }
     }
 
@@ -703,6 +901,18 @@ mod tests {
             if let Evaluation::InPlace(func) = lb.eval {
                 assert_eq!(lb.params.len(), func.arity(), "{lb:?}");
                 assert!(!lb.variadic, "{lb:?}");
+            }
+        }
+    }
+
+    /// Each spelling names one row: a second would never be found.
+    #[test]
+    fn every_spelling_has_one_row() {
+        let mut seen = std::collections::HashSet::new();
+        for lb in LIBRARY_BUILTINS {
+            assert!(seen.insert(lb.bare), "{lb:?}");
+            if let Some(reserved) = lb.reserved {
+                assert!(seen.insert(reserved), "{lb:?}");
             }
         }
     }

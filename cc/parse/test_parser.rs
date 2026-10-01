@@ -8949,3 +8949,168 @@ fn test_assume_aligned_rejects_bad_arguments() {
         });
     }
 }
+
+/// An argument a builtin requires to be an integer constant is one only if
+/// it is an integer constant expression (C17 6.6p6): an enumerator, a cast
+/// of a floating constant and `sizeof` are; a floating constant, a `const`
+/// object and a variable are not. The range decides in from out.
+#[test]
+fn test_constant_argument_is_an_integer_constant_expression() {
+    use super::builtin_args::ConstantArgument::{InRange, NotConstant, OutOfRange};
+    let decls = "enum E { A = 2 }; const int ci = 1; int i; double d;";
+    for (stmt, expected) in [
+        ("3", InRange(3)),
+        ("A", InRange(2)),
+        ("(int)1.0", InRange(1)),
+        ("sizeof(int) - 3", InRange(1)),
+        ("4", OutOfRange(4)),
+        ("-1", OutOfRange(-1)),
+        ("1.0", NotConstant),
+        ("ci", NotConstant),
+        ("i", NotConstant),
+        ("d", NotConstant),
+    ] {
+        let got = with_statement_expr(decls, stmt, |p, e| p.constant_argument(e, 0..=3));
+        assert_eq!(got, expected, "{stmt}");
+    }
+}
+
+/// What gcc calls integral: the integer types, `_Bool` and enumerations --
+/// not a complex integer, a floating type or a pointer.
+#[test]
+fn test_is_integral_is_gccs_integral_type() {
+    let decls = "enum E { A } e; _Bool b; char c; __int128 w; unsigned long u;\
+                 _Complex int ci; double d; int *p;";
+    for (stmt, integral) in [
+        ("e", true),
+        ("b", true),
+        ("c", true),
+        ("w", true),
+        ("u", true),
+        ("ci", false),
+        ("d", false),
+        ("p", false),
+    ] {
+        let got = with_statement_expr(decls, stmt, |p, e| p.is_integral(e.typ.unwrap()));
+        assert_eq!(got, integral, "{stmt}");
+    }
+}
+
+/// The classification builtins take any real floating argument and nothing
+/// else; a rejection is an error.
+#[test]
+fn test_require_floating_argument_takes_real_floating_only() {
+    let decls = "float f; long double ld; _Float16 h; const double cd = 0; int i;\
+                 enum E { A } e; _Bool b; char *p; _Complex double z; struct S { int a; } s;";
+    for (stmt, floating) in [
+        ("f", true),
+        ("ld", true),
+        ("h", true),
+        ("cd", true),
+        ("i", false),
+        ("e", false),
+        ("b", false),
+        ("p", false),
+        ("z", false),
+        ("s", false),
+    ] {
+        let before = crate::diag::error_count();
+        let got = with_statement_expr(decls, stmt, |p, e| {
+            p.require_floating_argument(e, crate::kw::BUILTIN_ISNAN)
+        });
+        assert_eq!(got, floating, "{stmt}");
+        if !floating {
+            assert!(crate::diag::error_count() > before, "{stmt}: not reported");
+        }
+    }
+}
+
+/// A count is judged against a minimum and an optional maximum, as every
+/// call's is.
+#[test]
+fn test_check_argument_count_bounds() {
+    for (given, min, max, ok) in [
+        (2, 2, Some(2), true),
+        (1, 2, Some(2), false),
+        (3, 2, Some(2), false),
+        (5, 1, None, true),
+        (0, 1, None, false),
+        (3, 0, Some(3), true),
+        (4, 0, Some(3), false),
+    ] {
+        let got = with_statement_expr("", "0", |p, _| {
+            p.check_argument_count(
+                Some(crate::kw::BUILTIN_FFS),
+                given,
+                min,
+                max,
+                p.current_pos(),
+            )
+        });
+        assert_eq!(got, ok, "{given} of {min}..{max:?}");
+    }
+}
+
+/// A builtin call rejected by its checks is not built: a zero of its type
+/// stands in, so nothing downstream sees an operand it cannot handle.
+#[test]
+fn test_rejected_builtin_calls_are_a_typed_zero() {
+    let decls = "int i; double d; _Bool b; char *p; struct S { int a; } s;";
+    for (stmt, typ) in [
+        ("__builtin_isnan(i)", TypeKind::Int),
+        ("__builtin_fpclassify(i, 1, 2, 3, 4, d)", TypeKind::Int),
+        ("__builtin_complex(1, 2)", TypeKind::Double),
+        ("__builtin_complex(1.0f, 2.0)", TypeKind::Double),
+        ("__builtin_add_overflow(1, 2, &d)", TypeKind::Int),
+        ("__builtin_add_overflow(1, 2, &b)", TypeKind::Int),
+        ("__builtin_mul_overflow_p(1, 2, b)", TypeKind::Int),
+        ("__builtin_object_size(p, i)", TypeKind::Long),
+        ("__builtin_prefetch(p, i)", TypeKind::Void),
+        ("__atomic_fetch_add(&b, 1, 0)", TypeKind::Bool),
+        ("__atomic_load_n(i, 0)", TypeKind::Int),
+        ("__atomic_always_lock_free(i, 0)", TypeKind::Bool),
+        ("__builtin_alloca(s)", TypeKind::Pointer),
+    ] {
+        let before = crate::diag::error_count();
+        with_statement_expr(decls, stmt, |p, e| {
+            assert!(crate::diag::error_count() > before, "{stmt}: accepted");
+            assert_eq!(p.types.kind(e.typ.unwrap()), typ, "{stmt}: type");
+            let zero = match &e.kind {
+                ExprKind::Cast { expr, .. } => expr,
+                _ => e,
+            };
+            assert!(
+                matches!(zero.kind, ExprKind::IntLit(0)),
+                "{stmt}: built {:?}",
+                e.kind
+            );
+        });
+    }
+}
+
+/// The suffixed classification builtins and the typed checked arithmetic
+/// have gcc's prototypes, so their arguments convert: `__builtin_isnanf(i)`
+/// tests a `float`, `__builtin_sadd_overflow(1.5, ...)` adds `int`s.
+#[test]
+fn test_prototyped_generic_builtins_convert_their_arguments() {
+    let decls = "int i; long double ld;";
+    with_statement_expr(decls, "__builtin_isnanf(i)", |p, e| {
+        let ExprKind::FpTest { arg, .. } = &e.kind else {
+            panic!("built {:?}", e.kind);
+        };
+        assert_eq!(arg.typ, Some(p.types.float_id));
+    });
+    with_statement_expr(decls, "__builtin_signbitl(i)", |p, e| {
+        let ExprKind::FpTest { arg, .. } = &e.kind else {
+            panic!("built {:?}", e.kind);
+        };
+        assert_eq!(arg.typ, Some(p.types.longdouble_id));
+    });
+    with_statement_expr(decls, "__builtin_sadd_overflow(1.5, ld, &i)", |p, e| {
+        let ExprKind::CheckedArith { a, b, .. } = &e.kind else {
+            panic!("built {:?}", e.kind);
+        };
+        assert_eq!(a.typ, Some(p.types.int_id));
+        assert_eq!(b.typ, Some(p.types.int_id));
+    });
+}

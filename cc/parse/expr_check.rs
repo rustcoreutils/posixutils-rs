@@ -47,7 +47,7 @@ impl Parser<'_> {
         args: &[Expr],
         call_pos: Position,
     ) -> bool {
-        let arity_ok = self.check_call_arity(func_type, args, call_pos);
+        let arity_ok = self.check_call_arity(func_type, callee, args, call_pos);
         let types_ok = self.check_argument_types(func_type, callee, args);
         arity_ok && types_ok
     }
@@ -66,6 +66,7 @@ impl Parser<'_> {
     fn check_call_arity(
         &self,
         func_type: Option<TypeId>,
+        callee: Option<StringId>,
         args: &[Expr],
         call_pos: Position,
     ) -> bool {
@@ -81,34 +82,38 @@ impl Parser<'_> {
         let Some(params) = ft.params.as_ref() else {
             return true;
         };
-        let required = params.len();
+        let max = (!ft.variadic).then_some(params.len());
+        self.check_argument_count(callee, args.len(), params.len(), max, call_pos)
+    }
 
-        let variadic = ft.variadic;
-
-        let wrong = if variadic {
-            args.len() < required
-        } else {
-            args.len() != required
-        };
-        if !wrong {
+    /// Whether `given` arguments are at least `min` and at most `max` (no
+    /// limit when `None`), reporting the call to `callee` in gcc's words
+    /// when they are not. Every call's count is judged here: an ordinary
+    /// call's against its prototype, and a builtin's against the counts it
+    /// takes.
+    pub(super) fn check_argument_count(
+        &self,
+        callee: Option<StringId>,
+        given: usize,
+        min: usize,
+        max: Option<usize>,
+        call_pos: Position,
+    ) -> bool {
+        let fewer = given < min;
+        if !fewer && max.is_none_or(|max| given <= max) {
             return true;
         }
-
-        let expected = if variadic {
-            format!("at least {}", required)
-        } else {
-            required.to_string()
-        };
-        // The singular/plural split is baked into the English sentence, so no
-        // amount of substitution fixes it from outside -- both forms have to be
-        // msgids.
-        diag::error_plural(
-            call_pos,
-            "call expects {0} argument, but {1} given",
-            "call expects {0} arguments, but {1} given",
-            required,
-            &[&expected, &args.len().to_string()],
-        );
+        let callee = callee.and_then(|id| self.idents.get_opt(id));
+        match (fewer, callee) {
+            (true, Some(f)) => {
+                diag::error_args(call_pos, "too few arguments to function '{0}'", &[f])
+            }
+            (true, None) => diag::error(call_pos, &gettext("too few arguments to function")),
+            (false, Some(f)) => {
+                diag::error_args(call_pos, "too many arguments to function '{0}'", &[f])
+            }
+            (false, None) => diag::error(call_pos, &gettext("too many arguments to function")),
+        }
         false
     }
 

@@ -266,7 +266,7 @@ fn builtin_library_call_arguments_are_checked_like_a_call() {
              builtin:\n{real_err}\nordinary:\n{twin_err}"
         );
         // An argument diagnostic names the callee as it was spelled.
-        let named = |m: String| m.replace("of 'F'", &format!("of '{}'", &call[..open]));
+        let named = |m: String| m.replace("'F'", &format!("'{}'", &call[..open]));
         assert_eq!(
             messages(&real_err),
             messages(&twin_err)

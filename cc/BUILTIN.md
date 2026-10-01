@@ -22,8 +22,8 @@ the keyword tag is not consulted while parsing.
   functions only) a function declaration whose type is not the library
   prototype. `offsetof` is displaced by any declaration.
 - Any `__builtin___NAME` becomes a call to `__NAME` when a declaration of
-  `__NAME` is in scope or c17 knows it (the `_chk` family); otherwise it is
-  `undeclared function`.
+  `__NAME` is in scope or `LIBRARY_BUILTINS` has a row for it (the `_chk`
+  family); otherwise it is `undeclared function`.
 
 ### `__has_builtin`
 
@@ -48,55 +48,85 @@ Differences from gcc's answers:
 
 ## Argument checking
 
+Every argument count is judged by `check_argument_count`
+(`parse/expr_check.rs`), in gcc's words: `too few arguments to function 'f'`,
+`too many arguments to function 'f'`, naming the callee as the call spelled
+it -- or naming none, for a call through an expression that is not an
+identifier. Argument diagnostics name the callee the same way.
+
 Checked as an ordinary call is -- count, types, conversions, the usual
-diagnostics in the usual words:
+diagnostics in the usual words -- through gcc's prototype:
 
-- the library functions computed in place (`LIBRARY_BUILTINS` rows made with
-  `entry`), by either spelling;
-- the bit builtins, against gcc's prototypes for them (`BIT_BUILTINS`);
-- a `__builtin_X` that calls library function `X` when a declaration of `X`
-  is in scope, or when `X` has a `known` row in `LIBRARY_BUILTINS` (the
-  `<string.h>`/`<stdio.h>` functions the optimizer folds).
+- every library builtin, by either spelling: each has a row in
+  `LIBRARY_BUILTINS` (`parse/library_builtin.rs`) with the library's
+  prototype (glibc's, for the `_chk` functions), and a declaration in scope
+  is checked against instead when there is one;
+- the bit builtins (`BIT_BUILTINS`), `__builtin_assume_aligned`,
+  `__builtin_alloca` and `alloca`, `__builtin_object_size`,
+  `__builtin_prefetch`, the suffixed classification builtins (`isnanf`,
+  `isinfl`, `signbitf`, ...), the typed checked arithmetic
+  (`__builtin_sadd_overflow`, ...), `__atomic_test_and_set`,
+  `__atomic_clear` and the lock-free queries (`parse_prototyped_builtin`,
+  `parse/builtin_args.rs`).
 
-Checked by a dedicated diagnostic:
+Checked by gcc's own rules, in its words, with the shared helpers of
+`parse/builtin_args.rs` (`require_floating_argument`, `constant_argument`,
+`is_integral`, `parse_generic_builtin_args`):
 
-- `__builtin_signbit` and the unordered relations reject a non-floating
-  argument, in gcc's words;
+- the type-generic classification builtins (`isnan`, `isinf`, `isfinite`,
+  `isnormal`, `isinf_sign`, `signbit`, and `fpclassify`'s last argument)
+  require a real floating argument; the unordered relations require one of
+  their two (`parse_fp_compare`);
+- `__builtin_fpclassify` takes six arguments, and its five class codes,
+  converted to `int`, must be integer constants;
+- `__builtin_complex` requires two operands of one real floating type;
+- the type-generic checked arithmetic requires integral operands, and a
+  result -- pointed to, or for the `_p` forms the value itself -- of an
+  integer type that is neither `_Bool` nor an enumeration, nor, pointed to,
+  `const`;
+- `__builtin_object_size`'s type must be an integer constant from 0 to 3 (an
+  error); `__builtin_prefetch`'s hints must be integer constants (an error)
+  and in range (a warning; zero is used);
+- the `__atomic_*` and `__sync_*` builtins overloaded on their object
+  (`check_atomic_object`, `parse/builtin_expr.rs`) require a pointer to an
+  integer or to a pointer, of 1, 2, 4, 8 or 16 bytes -- and for an
+  arithmetic one, not to `_Bool`; `__atomic_always_lock_free` requires a
+  constant size;
+- `__builtin_va_start` requires a variadic function (an error), and warns
+  (`-Wvarargs`) when `last` is not its last named parameter;
 - `__builtin_choose_expr` requires a constant first argument;
 - `__builtin_frame_address`/`__builtin_return_address` require a
   non-negative integer constant;
-- `__builtin_fpclassify` requires exactly six arguments;
 - `offsetof` requires a constant array index;
 - `__builtin_nans*` requires a string literal naming a payload (gcc accepts
   any string);
 - `__builtin_va_arg_pack*` require an `always_inline` variadic function.
 
-Everything else is parsed by its fixed shape: a wrong argument count is a
-parse error (`expected ')'`), and the argument types are **not** checked. In
-particular, unlike gcc, c17 accepts without a diagnostic:
+An integer constant here is an integer constant expression (C17 6.6p6), as
+`eval_const_expr` evaluates it: an enumerator or a cast of a floating
+constant is one; a floating constant or a `const` object is not. A call
+rejected by any of these checks is not built: a zero of its type stands in
+(`diagnosed_call`).
 
-- a non-floating argument to `__builtin_isnan`, `isinf`, `isfinite`,
-  `isnormal`, `isinf_sign` and `fpclassify`;
-- `__builtin_complex` operands that are not floating or not of one type;
-- a non-integer operand, or a non-pointer / pointer-to-non-integer result, to
-  the checked-arithmetic builtins;
-- a non-constant or out-of-range type argument to `__builtin_object_size`
-  (treated as 0 and clamped to 0..3);
-- a non-constant `rw`/locality to `__builtin_prefetch`;
-- an operand of the wrong type to any atomic builtin, and a non-constant size
-  to `__atomic_always_lock_free` (answered 0);
-- `__builtin_va_start` in a function that is not variadic;
-- a `__builtin_X` library call with neither a declaration nor a `known` row:
-  c17 declares `X` itself with a placeholder prototype
-  (`declare_chk_builtin`) and checks neither the count nor the types, so
-  `__builtin_pow(1.0)` and `__builtin_sin(p)` compile.
+Where c17 still differs from gcc:
+
+- gcc folds some calls whose value is discarded before it checks them, so
+  `(void)__builtin_object_size(p, i)` and
+  `(void)__atomic_always_lock_free(i, 0)` compile there; c17 rejects them,
+  used or not.
+- The remaining builtins are parsed by their fixed shape: a wrong argument
+  count is a parse error (`expected ')'`), and their argument types are not
+  checked -- `__builtin_va_start`'s `last` must be an identifier, and the
+  `__c11_atomic_*` builtins (clang's; gcc has none) take anything.
+- No memory-order argument is checked; gcc warns about one out of range and
+  rejects one that is not an integer.
 
 ## Variadic Functions
 
 | Builtin | Description |
 |---------|-------------|
 | `__builtin_va_list` | Platform-specific `va_list` type (a type keyword) |
-| `__builtin_va_start(ap, last)` | `Opcode::VaStart`. `last` must be an identifier; it is not checked to be the last parameter |
+| `__builtin_va_start(ap, last)` | `Opcode::VaStart`. `last` must be an identifier. In a function that is not variadic it is an error, and a `last` that is not the last named parameter a warning, as in gcc |
 | `__builtin_va_arg(ap, type)` | `Opcode::VaArg`; an aggregate or complex result gets a frame temporary |
 | `__builtin_va_end(ap)` | `Opcode::VaEnd` |
 | `__builtin_va_copy(dest, src)` | `Opcode::VaCopy` |
@@ -150,9 +180,9 @@ value gcc folds them to on both targets; at run time they stay undefined.
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_alloca(size)`, `alloca(size)` | `Opcode::Alloca`, freed on return. An inlined callee's `alloca` is bracketed by `StackSave`/`StackRestore` so it is freed when the call would have returned. The bare `alloca` is displaced by a non-function declaration or `-fno-builtin[-alloca]`; `<alloca.h>`'s function declaration does not displace it |
+| `__builtin_alloca(size)`, `alloca(size)` | `Opcode::Alloca`, freed on return. An inlined callee's `alloca` is bracketed by `StackSave`/`StackRestore` so it is freed when the call would have returned. The bare `alloca` is displaced by a non-function declaration or `-fno-builtin[-alloca]`; `<alloca.h>`'s function declaration does not displace it. Either spelling is checked through gcc's prototype `void *(size_t)` |
 | `memset`, `memcpy`, `memmove`, `mempcpy`, `bcopy` and their `__builtin_` spellings | Computed in place (next section) |
-| `__builtin_prefetch(addr[, rw[, locality]])` | Emits nothing. `addr` is evaluated (`__builtin_prefetch((q = p))` assigns `q`); `rw` and locality are parsed and discarded without evaluation or the constant check gcc makes |
+| `__builtin_prefetch(addr[, rw[, locality]])` | Emits nothing. `addr` is evaluated (`__builtin_prefetch((q = p))` assigns `q`). `rw` (0 or 1) and locality (0 to 3) must be integer constants, so there is nothing in them to evaluate; one out of range is a warning, as in gcc. Further arguments are accepted and ignored, as gcc ignores them |
 
 ## Library Functions Computed in Place
 
@@ -253,11 +283,11 @@ error.
 |---------|-------------|
 | `__builtin_signbit(x)` | 1 if the sign bit is set (also for `-0.0` and a negative NaN), else 0. Any real floating type, read at its own width (`_Float16` widened to `float`, `__float128` to `long double`). Of a constant it is an integer constant expression. gcc answers the bit in place at run time (`INT_MIN` for a `float`, 512 for an x86-64 `long double`); c17 answers 1 |
 | `__builtin_signbitf(x)`, `__builtin_signbitl(x)` | The same, of `x` converted to `float` or `long double` |
-| `__builtin_isnan(x)`, `isnanf`, `isnanl` | 1 if NaN. The suffix is not consulted; the operand's type decides |
+| `__builtin_isnan(x)`, `isnanf`, `isnanl` | 1 if NaN. The unsuffixed form tests any real floating type at its own width; the suffixed forms convert `x` to `float` or `long double`, gcc's prototypes for them |
 | `__builtin_isinf(x)`, `isinff`, `isinfl` | 1 if an infinity of either sign |
 | `__builtin_isinf_sign(x)` | +1 for +inf, -1 for -inf, 0 otherwise |
 | `__builtin_isfinite(x)`, `__builtin_isnormal(x)` | As C's macros. No suffixed spellings, as in gcc |
-| `__builtin_fpclassify(nan, inf, normal, subnormal, zero, x)` | Whichever of the five codes describes `x`; the codes are ordinary expressions |
+| `__builtin_fpclassify(nan, inf, normal, subnormal, zero, x)` | Whichever of the five codes describes `x`. The codes convert to `int` and must be integer constants |
 | `__builtin_flt_rounds()` | The integer constant 1, whatever the current rounding mode (clang reads the mode; gcc has no such builtin) |
 
 The classification builtins are `ExprKind::FpTest` / `FpClassify`, lowered by
@@ -322,7 +352,7 @@ them.
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_complex(re, im)` | `ExprKind::BuiltinComplex`, of the complex type of `re`'s type. Usable in static initializers and at file scope (`<complex.h>`'s `I` and `CMPLX` macros use it), at every precision. Not checked: gcc requires two operands of one real floating type |
+| `__builtin_complex(re, im)` | `ExprKind::BuiltinComplex`, of the complex type of `re`'s type. Usable in static initializers and at file scope (`<complex.h>`'s `I` and `CMPLX` macros use it), at every precision. The operands must be of one real floating type, as gcc requires |
 | `__builtin_creal`, `crealf`, `creall`, `cimag`, `cimagf`, `cimagl`, `conj`, `conjf`, `conjl` | Computed in place (above) |
 
 Complex integer types (`_Complex int` and the rest, a GNU extension) are
@@ -346,8 +376,10 @@ if it did not fit; the store happens either way. All are
 | `__builtin_sadd_overflow`, `saddl`, `saddll`, `ssub*`, `smul*` | `int` / `long` / `long long` |
 | `__builtin_uadd_overflow`, `uaddl`, `uaddll`, `usub*`, `umul*` | `unsigned int` / `unsigned long` / `unsigned long long` |
 
-The fixed-type forms are parsed as the generic ones, so their arguments are
-not converted to the named type first (and see Argument checking).
+The fixed-type forms are calls through gcc's prototype (`bool (int, int,
+int *)` for `sadd`), so their arguments are converted to the named type
+first; the type-generic forms take their operands as they are (and see
+Argument checking).
 
 ## Library Functions
 
@@ -361,13 +393,13 @@ library's function, never an inline definition of the same name, so an
 `always_inline` `extern inline` `strncpy` whose body is
 `return __builtin_strncpy(...)` is not recursive.
 
-How the callee is declared, and so what is checked, is described under
-Argument checking. Return types are modelled (`chk_builtin_return_type`):
-the string family returns `char *`, the allocators `void *`; a placeholder
-prototype gets the libm parameter types from `libm_real_kind` (with `modf`,
-`frexp` and `ldexp` special-cased), and the right count of fixed parameters
-for the variadic ones, which matters on Apple arm64 where variadic arguments
-go on the stack.
+Each has a row in `LIBRARY_BUILTINS` giving the library's prototype, which
+declares the function when nothing in scope does, so the call is checked as
+any call is (see Argument checking). The prototype is the library's own, so
+a header that declares the function later agrees with it; and the fixed
+parameters of the variadic ones are counted right, which matters on Apple
+arm64, where variadic arguments go on the stack. Under `-fpermissive` an
+implicit declaration of one of these names takes the row's return type.
 
 | Builtin | Notes |
 |---------|-------|
@@ -421,7 +453,7 @@ incompatible declaration keep the bare name's call.
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_object_size(ptr, type)` | Bytes left in the object `ptr` points into, folded **at parse time** (`parse_object_size_builtin`) from what the expression shows: an array, a string literal, `&lvalue`, member and constant-index chains, casts and constant pointer arithmetic. Unknown is `(size_t)-1` for types 0/1 and 0 for 2/3 |
+| `__builtin_object_size(ptr, type)` | Bytes left in the object `ptr` points into, folded **at parse time** (`parse_object_size`) from what the expression shows: an array, a string literal, `&lvalue`, member and constant-index chains, casts and constant pointer arithmetic. Unknown is `(size_t)-1` for types 0/1 and 0 for 2/3. `type` must be an integer constant from 0 to 3 |
 | `__builtin___memcpy_chk`, `memmove_chk`, `mempcpy_chk`, `memset_chk` | Calls to `__memcpy_chk` etc. |
 | `__builtin___strcpy_chk`, `stpcpy_chk`, `strncpy_chk`, `stpncpy_chk`, `strcat_chk`, `strncat_chk` | |
 | `__builtin___printf_chk`, `fprintf_chk`, `sprintf_chk`, `snprintf_chk`, `vsprintf_chk`, `vsnprintf_chk` | |
@@ -459,9 +491,9 @@ through ordinary operators are lowered to the same instructions.
 | `__atomic_compare_exchange_n(p, expected, desired, weak, succ, fail)` | `expected` is a pointer, written back on failure; returns `int` (gcc: `bool`). `weak` only picks the node; both are strong |
 | `__atomic_fetch_add/sub/and/or/xor/nand(p, v, order)` | Returns the value before |
 | `__atomic_add/sub/and/or/xor/nand_fetch(p, v, order)` | Returns the value after |
-| `__atomic_test_and_set(p, order)`, `__atomic_clear(p, order)` | An exchange of 1 compared with 0; a store of 0 |
+| `__atomic_test_and_set(p, order)`, `__atomic_clear(p, order)` | An exchange of 1 into the byte at `p`, compared with 0; a store of 0 into it. One byte, whatever `p` points to, as in gcc |
 | `__atomic_thread_fence(order)`, `__atomic_signal_fence(order)` | As the C11 fences |
-| `__atomic_always_lock_free(size, p)`, `__atomic_is_lock_free(size, p)` | Answered by the parser from the constant size (`target::atomic_is_lock_free`: 1, 2, 4, 8); `p` is discarded |
+| `__atomic_always_lock_free(size, p)`, `__atomic_is_lock_free(size, p)` | Answered by the parser from the size (`target::atomic_is_lock_free`: 1, 2, 4, 8); `p` is checked and discarded. The `always` form requires a constant size; `is_lock_free` answers 0 for one that is not |
 | `__sync_fetch_and_add/sub/and/or/xor/nand(p, v, ...)` | Returns the value before |
 | `__sync_add/sub/and/or/xor/nand_and_fetch(p, v, ...)` | Returns the value after |
 | `__sync_bool_compare_and_swap(p, old, new)` | Whether the exchange happened; `old` is a value, not a pointer |
@@ -523,16 +555,19 @@ Every kind starts the same way.
    `builtins.rs`. `test_supported_builtins_match_kw_tags` and
    `test_kw_builtin_tags_are_all_registered` fail until the two lists agree.
    A target-dependent builtin also needs a case in `available_on`.
-3. **Parse.** Add an arm to the family function in `parse/builtin_expr.rs`
-   that fits (`parse_checked_builtin`, `parse_float_builtin`,
-   `parse_misc_builtin`, `parse_atomic_builtin`, ...), all reached from
-   `parse_builtin_expr`. Use `expect_special`, `parse_assignment_expr` (one
-   argument -- not `parse_expression`, which would eat the comma),
-   `parse_type_name`, and `eval_const_expr` for arguments that must be
-   constant. Check argument types here and report with `diag::error` /
-   `diag::error_args` in gcc's wording (or `ParseError::new` if parsing
-   cannot continue); convert arguments to their parameter types with
-   `convert_operand`; build the node with `typed_expr`. A builtin of one
+3. **Parse.** Add an arm to the family function that fits
+   (`parse_float_builtin`, `parse_misc_builtin`, `parse_atomic_builtin`, ...
+   in `parse/builtin_expr.rs`; `parse_generic_builtin` in
+   `parse/generic_builtin.rs`), all reached from `parse_builtin_expr`. A
+   builtin gcc declares with a prototype is parsed by
+   `parse_prototyped_builtin`, which checks and converts the arguments as a
+   call does; a type-generic one by `parse_generic_builtin_args`, which
+   checks the count, and then by gcc's rules for it, built from the helpers
+   in `parse/builtin_args.rs` (`require_floating_argument`, `is_integral`,
+   `constant_argument` for an argument that must be an integer constant).
+   Report in gcc's wording with `diag::error` / `diag::error_args` (or
+   `ParseError::new` if parsing cannot continue), and answer
+   `diagnosed_call` for a rejected call; build the node with `typed_expr`. A builtin of one
    argument with a prototype, like the bit builtins, is a row in
    `BIT_BUILTINS` (`parse/bit_builtin.rs`) instead, which checks and converts
    the argument as a call does. An argument you drop
@@ -615,10 +650,8 @@ constants go in `FLOAT_CONSTANT_BUILTINS`.
      which declares it with the real prototype, checks calls, and tags them
      with a new `LibFn` variant (`parse/ast.rs`; add it to `LibFn::only_reads`
      if it writes no memory);
-   - a libm function: its stem in `libm_real_kind` and, for two or three
-     parameters, `libm_arity`;
-   - otherwise: its return type in `chk_builtin_return_type` and its fixed
-     parameter count in `declare_chk_builtin` (placeholder, unchecked).
+   - otherwise a `plain(...)` row, which declares it with its prototype and
+     checks calls, but tells the optimizer nothing.
 3. **Folded.** For a `LibFn`, add the fold to the family module in
    `ir/libcall_fold/` and dispatch it from `fold` in
    `ir/libcall_fold/mod.rs`. A fold that emits a call to a function no fold

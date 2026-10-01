@@ -144,6 +144,19 @@ pub(crate) struct ParsedDeclarator {
 
 // Parser
 
+/// The function whose body is being parsed, as the variadic builtins see it.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct EnclosingFunction {
+    /// Declared with `...`: `__builtin_va_start` needs it to be.
+    pub(crate) variadic: bool,
+    /// Variadic and `always_inline`. `__builtin_va_arg_pack()` names the
+    /// caller's variadic arguments, so it needs both: there are arguments,
+    /// and a known caller to take them from.
+    pub(crate) forwarding: bool,
+    /// The last named parameter, which `__builtin_va_start` names.
+    pub(crate) last_param: Option<StringId>,
+}
+
 /// C expression parser using recursive descent with precedence climbing
 ///
 /// The parser binds symbols to the symbol table during parsing. This means
@@ -227,13 +240,10 @@ pub struct Parser<'a> {
     /// parameter list. Cleared at the start of each external declaration.
     pub(super) pending_fn_attrs: crate::parse::ast::FunctionAttrs,
 
-    /// Set while parsing the body of a function that may use the forwarding
-    /// builtins: one that is both variadic and `always_inline`.
-    ///
-    /// `__builtin_va_arg_pack()` names the caller's variadic arguments, so it
-    /// needs both facts, and this is the last place either is visible --
-    /// `ir::Function` records neither.
-    pub(crate) in_forwarding_function: bool,
+    /// What the variadic builtins need to know of the function whose body
+    /// is being parsed; the default outside any function. This is the last
+    /// place it is visible -- `ir::Function` records none of it.
+    pub(crate) enclosing_function: EnclosingFunction,
     /// Every function attribute seen for a given name anywhere in the
     /// translation unit.
     ///
@@ -269,12 +279,6 @@ pub struct Parser<'a> {
     /// reason as `declared_extern_fns`: a later declaration binds a fresh
     /// symbol that knows nothing of the body.
     pub(super) defined_functions: std::collections::HashSet<StringId>,
-    /// Library functions the parser declared itself, for a `__builtin_` alias
-    /// the translation unit never declared, whose parameter types are
-    /// placeholders rather than the library's (see `declare_chk_builtin`). A
-    /// call is not checked against those types: they would report errors
-    /// the program does not have.
-    pub(super) placeholder_prototypes: std::collections::HashSet<crate::symbol::SymbolId>,
     /// `#pragma pack` directives, and where they stood in the token stream.
     ///
     /// Sorted by index; `pack_cursor` is how far the parser has consumed
@@ -336,14 +340,13 @@ impl<'a> Parser<'a> {
             pending_declarator_align: None,
             pending_symbol_attrs: Default::default(),
             pending_fn_attrs: Default::default(),
-            in_forwarding_function: false,
+            enclosing_function: EnclosingFunction::default(),
             declared_fn_attrs: BTreeMap::new(),
             pending_asm_label: None,
             declared_asm_labels: BTreeMap::new(),
             declared_extern_fns: std::collections::BTreeSet::new(),
             declared_non_inline_fns: std::collections::BTreeSet::new(),
             defined_functions: std::collections::HashSet::new(),
-            placeholder_prototypes: std::collections::HashSet::new(),
             pack_directives,
             pack_cursor: 0,
             vm_typedefs: HashMap::new(),

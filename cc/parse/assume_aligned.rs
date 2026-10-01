@@ -20,12 +20,13 @@
 //
 
 use super::ast::{Expr, ExprKind};
+use super::builtin_args::BuiltinArgs;
 use super::library_builtin::ProtoType;
 use super::parser::{ParseResult, Parser};
 use crate::diag;
 use crate::kw;
 use crate::token::lexer::Position;
-use crate::types::{Type, TypeId};
+use crate::types::TypeId;
 
 /// The arguments gcc accepts: the pointer, the alignment and the
 /// misalignment.
@@ -34,27 +35,16 @@ const MAX_ARGS: usize = 3;
 impl Parser<'_> {
     /// A call to `__builtin_assume_aligned`, from its argument list on.
     pub(super) fn parse_assume_aligned(&mut self, pos: Position) -> ParseResult<Expr> {
-        let call_pos = self.current_pos();
-        self.expect_special(b'(')?;
-        let mut args = self.parse_argument_list()?;
-        self.expect_special(b')')?;
+        let BuiltinArgs { mut args, call_pos } = self.parse_builtin_call_args()?;
 
         let void_ptr = self.types.void_ptr_id;
-        let params = vec![
-            ProtoType::ConstVoidPtr.id(self.types),
-            ProtoType::SizeT.id(self.types),
-        ];
-        let func_type = self
-            .types
-            .intern(Type::function(void_ptr, params, true, false));
+        let params = [ProtoType::ConstVoidPtr, ProtoType::SizeT];
+        let func_type = self.builtin_prototype(ProtoType::VoidPtr, &params, true);
         let name = Some(kw::BUILTIN_ASSUME_ALIGNED);
         let prototyped = self.check_call(Some(func_type), name, &args, call_pos);
         let extra = self.check_assume_aligned_extra(&args, call_pos);
         if !(prototyped && extra) {
-            // Diagnosed already. A null `void *` stands in, so the enclosing
-            // expression still parses and types.
-            let zero = Self::typed_expr(ExprKind::IntLit(0), self.types.int_id, pos);
-            return Ok(self.convert_operand(zero, void_ptr));
+            return Ok(self.diagnosed_call(void_ptr, pos));
         }
         let ptr = args.remove(0);
         let ptr = self.convert_operand(ptr, void_ptr);
@@ -64,9 +54,9 @@ impl Parser<'_> {
     /// gcc's rules past the prototype: no argument after the misalignment,
     /// which is an integer. `false` when either was reported.
     fn check_assume_aligned_extra(&self, args: &[Expr], call_pos: Position) -> bool {
-        let name = "__builtin_assume_aligned";
-        if args.len() > MAX_ARGS {
-            diag::error_args(call_pos, "too many arguments to function '{0}'", &[name]);
+        // At least two was the prototype's to check.
+        let callee = Some(kw::BUILTIN_ASSUME_ALIGNED);
+        if !self.check_argument_count(callee, args.len(), 0, Some(MAX_ARGS), call_pos) {
             return false;
         }
         let Some(misalign) = args.get(MAX_ARGS - 1) else {
@@ -78,7 +68,7 @@ impl Parser<'_> {
         diag::error_args(
             misalign.pos,
             "non-integer argument 3 in call to function '{0}'",
-            &[name],
+            &["__builtin_assume_aligned"],
         );
         false
     }

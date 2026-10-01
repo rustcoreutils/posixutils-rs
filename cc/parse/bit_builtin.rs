@@ -16,13 +16,14 @@
 //
 
 use super::ast::{BinaryOp, Expr, ExprKind};
+use super::builtin_args::BuiltinArgs;
 use super::library_builtin::ProtoType;
 use super::parser::{ParseResult, Parser};
 use crate::ir::constfold::{eval_bit_op, BitOp};
 use crate::kw;
 use crate::strings::StringId;
 use crate::token::lexer::Position;
-use crate::types::{Type, TypeId};
+use crate::types::TypeId;
 
 /// What a call to a bit builtin becomes, once its argument is converted.
 #[derive(Clone, Copy)]
@@ -103,24 +104,15 @@ impl Parser<'_> {
     /// The argument list of a call to `row`, checked as an ordinary call
     /// through its prototype is, and converted to the parameter type.
     fn parse_checked_bit_call(&mut self, row: &BitBuiltin, pos: Position) -> ParseResult<Expr> {
-        let call_pos = self.current_pos();
-        self.expect_special(b'(')?;
-        let mut args = self.parse_argument_list()?;
-        self.expect_special(b')')?;
-
-        let ret = row.ret.id(self.types);
-        let param = row.param.id(self.types);
-        let func_type = self
-            .types
-            .intern(Type::function(ret, vec![param], false, false));
-        let sound = self.check_call(Some(func_type), Some(row.name), &args, call_pos);
-        if !sound || args.len() != 1 {
-            // Diagnosed already. A zero of the return type stands in, so the
-            // enclosing expression still parses and types.
-            let zero = Self::typed_expr(ExprKind::IntLit(0), self.types.int_id, pos);
-            return Ok(self.convert_operand(zero, ret));
-        }
-        let arg = self.convert_operand(args.remove(0), param);
+        let BuiltinArgs { args, call_pos } = self.parse_builtin_call_args()?;
+        let func_type = self.builtin_prototype(row.ret, &[row.param], false);
+        let arg = self
+            .check_prototyped_builtin(row.name, func_type, args, call_pos)
+            .and_then(|args| args.into_iter().next());
+        let Some(arg) = arg else {
+            let ret = row.ret.id(self.types);
+            return Ok(self.diagnosed_call(ret, pos));
+        };
         Ok(self.evaluate_bit_builtin(row, arg, func_type, call_pos, pos))
     }
 

@@ -1018,6 +1018,16 @@ pub struct TypeTable {
     pub char_ptr_id: TypeId,
     /// `const char *`, the string operand of `<string.h>` and `<stdio.h>`.
     pub const_char_ptr_id: TypeId,
+    /// `volatile void *`, the flag operand of `__atomic_test_and_set`.
+    pub volatile_void_ptr_id: TypeId,
+    /// `const volatile void *`, the object operand of the lock-free queries.
+    pub const_volatile_void_ptr_id: TypeId,
+    /// `int *`, `float *`, `double *` and `long double *`: the out
+    /// parameters of `frexp` and `modf`.
+    pub int_ptr_id: TypeId,
+    pub float_ptr_id: TypeId,
+    pub double_ptr_id: TypeId,
+    pub longdouble_ptr_id: TypeId,
     /// `__builtin_va_list`, the last parameter of `vprintf` and its siblings.
     pub va_list_id: TypeId,
 }
@@ -1077,6 +1087,12 @@ impl TypeTable {
             const_void_ptr_id: TypeId::INVALID,
             char_ptr_id: TypeId::INVALID,
             const_char_ptr_id: TypeId::INVALID,
+            volatile_void_ptr_id: TypeId::INVALID,
+            const_volatile_void_ptr_id: TypeId::INVALID,
+            int_ptr_id: TypeId::INVALID,
+            float_ptr_id: TypeId::INVALID,
+            double_ptr_id: TypeId::INVALID,
+            longdouble_ptr_id: TypeId::INVALID,
             va_list_id: TypeId::INVALID,
         };
 
@@ -1185,6 +1201,20 @@ impl TypeTable {
         table.char_ptr_id = table.intern(Type::pointer(table.char_id));
         let const_char = table.intern(Type::with_modifiers(TypeKind::Char, TypeModifiers::CONST));
         table.const_char_ptr_id = table.intern(Type::pointer(const_char));
+        let volatile_void = table.intern(Type::with_modifiers(
+            TypeKind::Void,
+            TypeModifiers::VOLATILE,
+        ));
+        table.volatile_void_ptr_id = table.intern(Type::pointer(volatile_void));
+        let const_volatile_void = table.intern(Type::with_modifiers(
+            TypeKind::Void,
+            TypeModifiers::CONST | TypeModifiers::VOLATILE,
+        ));
+        table.const_volatile_void_ptr_id = table.intern(Type::pointer(const_volatile_void));
+        table.int_ptr_id = table.intern(Type::pointer(table.int_id));
+        table.float_ptr_id = table.intern(Type::pointer(table.float_id));
+        table.double_ptr_id = table.intern(Type::pointer(table.double_id));
+        table.longdouble_ptr_id = table.intern(Type::pointer(table.longdouble_id));
         table.va_list_id = table.intern(Type::basic(TypeKind::VaList));
 
         table

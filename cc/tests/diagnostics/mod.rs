@@ -296,17 +296,23 @@ fn diagnostics_call_arity_mismatch_is_rejected() {
     compile_expect_error(
         "call_too_few",
         "int g(int,int);\nint main(void){return g(1);}\n",
-        "call expects 2 arguments",
+        "too few arguments to function 'g'",
     );
     compile_expect_error(
         "call_too_many",
         "int g(int);\nint main(void){return g(1,2,3);}\n",
-        "call expects 1 argument",
+        "too many arguments to function 'g'",
     );
     compile_expect_error(
         "call_variadic_short",
         "int g(int,int,...);\nint main(void){return g(1);}\n",
-        "call expects at least 2 arguments",
+        "too few arguments to function 'g'",
+    );
+    // A callee that is not a name is not named.
+    compile_expect_error(
+        "call_through_expression",
+        "int (*fp[1])(int);\nint main(void){return fp[0](1, 2);}\n",
+        "error: too many arguments to function\n",
     );
 }
 
@@ -979,17 +985,17 @@ fn diagnostics_zero_parameter_prototype_arity_is_rejected() {
     compile_expect_error(
         "void_proto_too_many_args",
         "int f(void);\nint main(void){ return f(1, 2); }\nint f(void){ return 0; }\n",
-        "call expects 0 arguments",
+        "too many arguments to function 'f'",
     );
     compile_expect_error(
         "void_definition_too_many_args",
         "int f(void){ return 0; }\nint main(void){ return f(1, 2); }\n",
-        "call expects 0 arguments",
+        "too many arguments to function 'f'",
     );
     compile_expect_error(
         "void_proto_one_arg",
         "int f(void);\nint main(void){ return f(7); }\nint f(void){ return 0; }\n",
-        "call expects 0 arguments",
+        "too many arguments to function 'f'",
     );
 }
 
@@ -1004,7 +1010,7 @@ fn diagnostics_unprototyped_calls_are_accepted() {
             "int f();\nint main(void){ return f(1, 2); }\nint f(int a, int b){ return a + b; }\n",
         ),
         // A K&R definition is likewise unprototyped -- this used to be
-        // rejected with "call expects 2 arguments, but 1 given".
+        // rejected with "too few arguments to function 'f'".
         (
             "kr_definition_too_few",
             "int f(a, b) int a, b; { return a + b; }\nint main(void){ return f(1); }\n",

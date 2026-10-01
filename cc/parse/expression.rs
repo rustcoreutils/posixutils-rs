@@ -2236,7 +2236,7 @@ impl<'a> Parser<'a> {
                         // argument is checked or converted, as C89 6.3.2.2
                         // says.
                         let ret_id = self
-                            .chk_builtin_return_type(&name_str)
+                            .library_return_type(&name_str)
                             .unwrap_or(self.types.int_id);
                         let func_type = self.types.intern(Type {
                             kind: TypeKind::Function,

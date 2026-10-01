@@ -298,8 +298,8 @@ pub fn gettext_args(msgid: &str, args: &[&str]) -> String {
 /// this picks by `n == 1`, which is correct for English and for the
 /// untranslated case. Both forms are msgids so an extractor sees them.
 ///
-/// Exists because two of `cc`'s diagnostics bake the English pluralization
-/// into the sentence -- "call expects 1 argument" versus "2 arguments" -- and
+/// Exists because some of `cc`'s diagnostics bake the English pluralization
+/// into the sentence -- "requires 1 argument" versus "2 arguments" -- and
 /// no amount of positional substitution can fix that from outside.
 pub fn ngettext_args(singular: &str, plural: &str, n: usize, args: &[&str]) -> String {
     gettext_args(if n == 1 { singular } else { plural }, args)

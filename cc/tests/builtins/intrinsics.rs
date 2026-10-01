@@ -1061,7 +1061,7 @@ fn builtins_assume_aligned_rejects_bad_arguments() {
         (
             "assume_aligned_too_few",
             "__builtin_assume_aligned(p)",
-            "call expects at least 2 arguments, but 1 given",
+            "too few arguments to function '__builtin_assume_aligned'",
         ),
         (
             "assume_aligned_float_misalign",

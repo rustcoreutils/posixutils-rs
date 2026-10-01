@@ -16,6 +16,7 @@
 // - has_feature: __has_builtin, __has_feature
 //
 
+mod argument_checks;
 mod bit_ops;
 mod call_semantics;
 mod copy_fold;

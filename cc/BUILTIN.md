@@ -31,8 +31,9 @@ Answered in `token/preprocess.rs` (`eval_has_builtin_expr`, inside `#if`) and
 `token/preprocess_macro.rs` (`eval_has_builtin`, in running text), both from
 `builtins.rs`: a name answers 1 when it is in `SUPPORTED_BUILTINS` (or tagged
 `kw::BUILTIN`, which `builtins.rs` tests keep identical) and `available_on`
-the target. `available_on` withholds only the `f128` constants on macOS,
-which has no `_Float128`.
+the target. `available_on` withholds the `f128` constants on macOS, which has
+no `_Float128`, and the `__builtin_ms_va_*` names off x86-64, where gcc has
+none of them.
 
 Differences from gcc's answers:
 
@@ -94,6 +95,11 @@ Checked by gcc's own rules, in its words, with the shared helpers of
   constant size;
 - `__builtin_va_start` requires a variadic function (an error), and warns
   (`-Wvarargs`) when `last` is not its last named parameter;
+- `__builtin_va_start` in an `ms_abi` function, `__builtin_ms_va_start` in
+  any other, and `__builtin_ms_va_start` on a list that is not a
+  `__builtin_ms_va_list` are errors, in clang's words
+  (`check_va_start_convention`) -- gcc accepts each and reads the wrong
+  frame;
 - `__builtin_va_arg`'s type must be a complete object type
   (`check_va_arg_type`): an incomplete type (`type_name_is_incomplete`, the
   predicate `sizeof` uses) or a function type is an error, and `_Bool`,
@@ -125,6 +131,10 @@ Where c17 still differs from gcc:
   `__c11_atomic_*` builtins (clang's; gcc has none) take anything.
 - gcc compiles a `__builtin_va_arg` of a promoted type to a trap; c17 only
   warns, and reads the argument as though it had that type.
+- gcc's `__builtin_va_arg` on a `__builtin_ms_va_list` reads a type the
+  Microsoft convention passes by reference -- an aggregate not of 1, 2, 4 or
+  8 bytes, `long double`, `__int128` -- out of the argument position itself,
+  where every caller put a pointer; c17 follows the pointer.
 - No memory-order argument is checked; gcc warns about one out of range and
   rejects one that is not an integer.
 
@@ -139,6 +149,17 @@ Where c17 still differs from gcc:
 | `__builtin_va_copy(dest, src)` | `Opcode::VaCopy` |
 | `__builtin_va_arg_pack()` | The caller's variadic arguments, spliced in by the inliner. Only in an `always_inline` variadic function (an error otherwise), and only as the last argument of a call (linearizer error otherwise) |
 | `__builtin_va_arg_pack_len()` | How many arguments the pack stands for: `Opcode::VaArgPackLen`, replaced by a constant at inlining; a survivor is diagnosed by `opt::check_forwarding_resolved` |
+
+The Microsoft x64 variadic builtins, for an `ms_abi` function, exist only on
+x86-64:
+
+| Builtin | Description |
+|---------|-------------|
+| `__builtin_ms_va_list` | A `char *` walking the eight-byte argument positions (`TypeModifiers::MS_VA_LIST`): assignable to and from `char *` without a diagnostic, and the one pointer `__builtin_va_arg` walks the Microsoft way. A type keyword |
+| `__builtin_ms_va_start(ap, last)` | `Opcode::VaStart` in an `ms_abi` function, whose prologue spills the register positions to its shadow area: `ap` points past the named ones |
+| `__builtin_va_arg(ap, type)` on a `__builtin_ms_va_list` | Plain IR (`linearize_ms_va_arg`): step `ap` eight bytes, follow the position once more for a type passed by reference, read the value |
+| `__builtin_ms_va_end(ap)` | Nothing |
+| `__builtin_ms_va_copy(dest, src)` | `dest = src` |
 
 ## Byte Swapping and Bit Operations
 

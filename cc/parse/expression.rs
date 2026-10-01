@@ -2188,7 +2188,9 @@ impl<'a> Parser<'a> {
 
                     // Try builtin dispatch first, unless a declaration in scope
                     // has claimed the name (see `builtin_is_shadowed`).
-                    if !self.builtin_is_shadowed(name_id) {
+                    if !self.builtin_is_shadowed(name_id)
+                        && crate::kw::exists_on(name_id, self.types.target().arch)
+                    {
                         if let Some(result) = self.parse_builtin_expr(name_id, token_pos) {
                             return result;
                         }

@@ -905,6 +905,16 @@ impl<'a> Parser<'a> {
                     self.advance();
                     base_kind = Some(TypeKind::VaList);
                 }
+                crate::kw::BUILTIN_MS_VA_LIST => {
+                    // A name gcc knows only on x86-64: anywhere else it names
+                    // no type, and is diagnosed as gcc diagnoses it.
+                    if !crate::kw::exists_on(name_id, self.types.target().arch) {
+                        diag::error(pos, "unknown type name '__builtin_ms_va_list'");
+                    }
+                    tally.note_data_type("__builtin_ms_va_list", pos);
+                    self.advance();
+                    resolved = Some(Resolved::Id(self.types.ms_va_list_id));
+                }
                 crate::kw::TYPEOF | crate::kw::GNU_TYPEOF | crate::kw::GNU_TYPEOF2 => {
                     // `typeof` always takes a parenthesized operand, so
                     // without one this is not a type specifier -- it is the

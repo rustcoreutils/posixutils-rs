@@ -9,7 +9,8 @@
 // x86-64 Code Generator
 // Converts IR to x86-64 assembly (AT&T syntax)
 //
-// Uses linear scan register allocation and System V AMD64 ABI.
+// Uses linear scan register allocation and System V AMD64 ABI; an `ms_abi`
+// function, and a call to one, use the Microsoft x64 convention (win64.rs).
 //
 
 use crate::arch::codegen::SelectOperands;
@@ -93,6 +94,16 @@ pub struct X86_64CodeGen {
     /// Where the allocator put the x87 control words, when this function
     /// converts a long double to an integer.
     pub(super) x87_control_words: Option<X87ControlWords>,
+    /// The current function's calling convention.
+    pub(super) func_conv: crate::abi::CallingConv,
+    /// The XMM registers an `ms_abi` function saves in its prologue, in
+    /// save-slot order. Empty for any other function.
+    pub(super) win64_xmm_saves: Vec<XmmReg>,
+    /// The `Arg` pseudos whose parameter is a pointer. An incoming slot of
+    /// one holds the pointer, where the slot of a by-value aggregate *is*
+    /// the object -- [`Self::address_of_pseudo`] loads the one and takes the
+    /// address of the other.
+    pub(super) incoming_pointers: HashSet<PseudoId>,
 }
 
 impl X86_64CodeGen {
@@ -121,6 +132,9 @@ impl X86_64CodeGen {
             int128_pseudos: HashSet::new(),
             x87_scratch: None,
             x87_control_words: None,
+            func_conv: crate::abi::CallingConv::C,
+            win64_xmm_saves: Vec::new(),
+            incoming_pointers: HashSet::new(),
         }
     }
 
@@ -1156,6 +1170,9 @@ impl X86_64CodeGen {
             }
 
             // Variadic function support (va_* builtins)
+            Opcode::VaStart if self.func_conv == crate::abi::CallingConv::Win64 => {
+                self.emit_win64_va_start(insn);
+            }
             Opcode::VaStart => {
                 self.emit_va_start(insn);
             }
@@ -1308,6 +1325,12 @@ impl X86_64CodeGen {
                 None => return,
             }
         };
+
+        let conv = insn.extra().abi_info.as_ref().map(|ai| ai.conv);
+        if conv == Some(crate::abi::CallingConv::Win64) {
+            self.emit_win64_call(insn, &func_name, types);
+            return;
+        }
 
         // Classify arguments into register vs stack
         let info = self.classify_call_args(insn, types);

@@ -159,6 +159,9 @@ pub(crate) struct EnclosingFunction {
     pub(crate) forwarding: bool,
     /// The last named parameter, which `__builtin_va_start` names.
     pub(crate) last_param: Option<StringId>,
+    /// The function's calling convention, which decides which of
+    /// `__builtin_va_start` and `__builtin_ms_va_start` it may use.
+    pub(crate) conv: crate::abi::CallingConv,
 }
 
 /// C expression parser using recursive descent with precedence climbing
@@ -243,6 +246,11 @@ pub struct Parser<'a> {
     /// specifiers, between the type and the declarator, or after the
     /// parameter list. Cleared at the start of each external declaration.
     pub(super) pending_fn_attrs: crate::parse::ast::FunctionAttrs,
+    /// `__attribute__((ms_abi))` or `((sysv_abi))` awaiting the declarator
+    /// whose function type it belongs to, with where it was written. A
+    /// property of the type, so it is applied with the other type attributes
+    /// (`apply_pending_type_attrs`) and taken there.
+    pub(super) pending_calling_conv: Option<(crate::abi::CallingConv, Position)>,
 
     /// What the variadic builtins need to know of the function whose body
     /// is being parsed; the default outside any function. This is the last
@@ -344,6 +352,7 @@ impl<'a> Parser<'a> {
             pending_declarator_align: None,
             pending_symbol_attrs: Default::default(),
             pending_fn_attrs: Default::default(),
+            pending_calling_conv: None,
             enclosing_function: EnclosingFunction::default(),
             declared_fn_attrs: BTreeMap::new(),
             pending_asm_label: None,

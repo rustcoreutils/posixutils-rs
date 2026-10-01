@@ -1069,6 +1069,18 @@ impl X86_64CodeGen {
                     self.handle_two_sse_return(&dst_loc);
                     return;
                 }
+                // A whole `__int128` in XMM0, as an `ms_abi` callee returns
+                // one: into the sixteen bytes of its slot.
+                if classes.as_slice() == [RegClass::Sse]
+                    && insn.typ.is_some_and(|t| types.is_plain_int128(t))
+                {
+                    self.push_lir(X86Inst::MovFp {
+                        size: FpSize::Quad,
+                        src: XmmOperand::Reg(XmmReg::Xmm0),
+                        dst: XmmOperand::Mem(self.int128_lo_mem_loc(&dst_loc)),
+                    });
+                    return;
+                }
                 // Check for single SSE return
                 if classes.first() == Some(&RegClass::Sse) {
                     // An aggregate's type does not say how wide the move is --

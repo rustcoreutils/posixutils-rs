@@ -22,6 +22,7 @@ pub mod macros;
 pub(crate) mod mapping;
 mod memory;
 pub mod regalloc;
+mod win64;
 pub(crate) mod x87;
 
 pub use macros::get_macros;

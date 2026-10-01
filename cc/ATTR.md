@@ -68,6 +68,8 @@ The arguments of an unrecognised attribute are skipped without being parsed.
 | Attribute | Applies to | Effect |
 |-----------|-----------|--------|
 | `noreturn` | Functions | Part of the function *type*. The linearizer emits an `Unreachable` after every call through such a type, which the backends lower to `ud2` (x86-64) or `brk #1` (AArch64), and which ends the block for the optimizer. A noreturn function's own body is compiled normally |
+| `ms_abi` | Function types (x86-64) | The Microsoft x64 calling convention, carried on the function *type* (`Type::conv`): every call is classified by the type it calls through, directly or through a pointer (`CallingConv::of_callee`), and a definition by its own (`abi::Win64Abi`). The x86-64 backend assigns the argument positions, the 32-byte shadow area and the callee-saved RSI, RDI and XMM6-XMM15 (`arch/x86_64/win64.rs`). As in gcc it goes to the declared function or to the function a declared pointer points at, and on anything else warns "'ms_abi' attribute only applies to function types". Two function types differing only in convention are incompatible: a pointer assignment between them warns, a redeclaration that changes it is "conflicting types", and `ms_abi` with `sysv_abi` on one declaration is an error. On aarch64 it is not an attribute: it warns "directive ignored", `__has_attribute` answers 0, and the native convention applies, as in gcc |
+| `sysv_abi` | Function types (x86-64) | The x86-64 default convention, placed and checked as `ms_abi` is. Not an attribute on aarch64 |
 | `aligned` | Types, variables, struct members, functions | Raises alignment: layout and `_Alignof` on a type, `.align` on a variable, `.p2align` on a function. Bare `aligned` means 16. Several requests take the largest. Ignored silently on an enum, and after an enum's closing brace on the declarators that follow, as gcc does |
 | `packed` | Structs, unions, enums, struct and union members | On a member, drops the alignment its type demands to 1 (a typedef's `aligned` included) and packs a bit-field to the bit; the rest of the aggregate is unaffected, and the aggregate's alignment is the largest its members then demand. On a struct or union it is `packed` on every member. One rule, `TypeTable::member_alignment`, combines it with the rest: an `aligned`/`_Alignas` written on the member raises the result and never lowers it, and a `#pragma pack(n)` in force caps it at `n` last, written alignment included. Accepted anywhere in the struct-or-union specifier, and anywhere in a member declaration: among the specifiers it reaches every declarator, after a declarator only that one. Ignored silently on an anonymous member, as gcc does, and on anything else that is not a member, where gcc warns. On an enum definition it makes the enum the smallest of the 1-, 2-, 4- and 8-byte integer types that holds every enumerator, signed iff one is negative, with that type's alignment; the enumeration constants stay `int` unless the enum is wider than `int`. Read between `enum` and the tag and after the closing brace, as gcc does; between the tag and `{` is a syntax error there too, and on a declaration that is not a definition it is ignored |
 | `transparent_union` | Unions | An argument matching **any** member's type may be passed to a parameter of this union, and the union is passed as its **first** member would be -- an unnamed zero-width bit-field is not a member for this purpose. glibc declares every socket call this way. Calls only: assignment and `return` stay strict, as in gcc. Ignored with a warning anywhere but a union |
@@ -116,12 +118,6 @@ No diagnostic comes from `deprecated`, `warn_unused_result` or `format`.
 
 Also accepted:
 
-- `sysv_abi`, `ms_abi`: recorded as `FunctionAttrs::calling_conv`. A function
-  *definition* then classifies its own parameters, its return and the calls it
-  makes with `abi::get_abi_for_conv`. `sysv_abi` is already the x86-64 default;
-  `ms_abi` has no Win64 implementation and falls back to the target default. A
-  call to such a function is classified by the caller's convention, not the
-  callee's.
 - `fallthrough`: the statement `__attribute__((fallthrough));` (gcc's
   spelling of C23 `[[fallthrough]];`) is a null statement. Diagnosed as gcc
   does, as far as the next token can tell: outside every `switch` it is an
@@ -152,9 +148,11 @@ ignored", suppressible with `-Wno-attributes`, and its arguments are skipped.
 
 ## `__has_attribute`
 
-Answers 1 exactly when the name carries the `SUPPORTED_ATTR` tag in `kw.rs`:
-every attribute in the two sections above, in both spellings, plus `__const`.
-Both evaluators read that one tag -- `eval_has_attribute` in
+Answers 1 exactly when `kw::attribute_supported` does: the name carries the
+`SUPPORTED_ATTR` tag in `kw.rs` -- every attribute in the two sections above,
+in both spellings, plus `__const` -- and is not tagged `X86_64_ONLY` on
+another target (`ms_abi`, `sysv_abi`). The parser's "directive ignored"
+warning and both evaluators ask that one function -- `eval_has_attribute` in
 `token/preprocess.rs` (`#if`) and the `BuiltinMacro::HasAttribute` arm in
 `token/preprocess_macro.rs` -- so there is no second list to keep in step.
 
@@ -206,7 +204,10 @@ In order:
      by `CodeGenBase` in `arch/codegen.rs` (`emit_global`,
      `emit_declared_symbol_attrs`, `emit_symbol_aliases`).
    - *A property of the function type*, as `noreturn` is: set it on the type in
-     `Parser::function_declarator_attrs` (`parse/bind.rs`).
+     `Parser::function_declarator_attrs` (`parse/bind.rs`). One that a pointer
+     to a function, a typedef, a parameter or a type-name carries too, as
+     `ms_abi` does, is a type attribute instead (below), placed on the
+     function by `Parser::apply_pending_calling_conv`.
    - *A property of a type*: a `pending_*` slot set in
      `Parser::parse_single_attribute` and applied in
      `Parser::apply_pending_type_attrs`, once the type is final. A new slot must

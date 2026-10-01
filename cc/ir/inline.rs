@@ -1194,6 +1194,23 @@ fn split_caller_at_call(
     continuation_bb
 }
 
+/// Whether inlining `callee` at `call` would hand its caller's arguments
+/// on through `__builtin_va_arg_pack()` to a call of a different calling
+/// convention.
+///
+/// The forwarded arguments are as `call`'s convention passes them -- a Win64
+/// three-byte struct as a pointer to a copy, a System V one as its bits --
+/// and their classifications were made under it, so splicing them into a
+/// call of another convention would describe them wrongly. That call is
+/// left alone.
+fn forwards_across_conventions(call: &Instruction, callee: &Function) -> bool {
+    let conv = |insn: &Instruction| insn.extra().abi_info.as_ref().map(|ai| ai.conv);
+    let outer = conv(call);
+    callee.blocks.iter().flat_map(|b| &b.insns).any(|insn| {
+        insn.op == Opcode::Call && insn.extra().ends_with_va_arg_pack && conv(insn) != outer
+    })
+}
+
 /// Inline a specific call site
 /// Returns true if inlining was performed
 fn inline_call_site(
@@ -1207,6 +1224,9 @@ fn inline_call_site(
     let call_insn = &call_bb.insns[call_insn_idx];
 
     if call_insn.op != Opcode::Call {
+        return false;
+    }
+    if forwards_across_conventions(call_insn, callee) {
         return false;
     }
 
@@ -1929,6 +1949,39 @@ mod tests {
         });
 
         func
+    }
+
+    /// A call carrying `abi_info` under `conv`, forwarding the caller's
+    /// variadic arguments when `forwards`.
+    fn call_under(conv: crate::abi::CallingConv, forwards: bool) -> Instruction {
+        let mut call = Instruction::new(Opcode::Call);
+        call.extra_mut().abi_info = Some(Box::new(crate::ir::CallAbiInfo::with_conv(
+            vec![],
+            crate::abi::ArgClass::Ignore,
+            conv,
+        )));
+        call.extra_mut().ends_with_va_arg_pack = forwards;
+        call
+    }
+
+    /// Arguments forwarded through `__builtin_va_arg_pack()` are as the outer
+    /// call's convention passes them, so they are spliced only into a call of
+    /// the same one.
+    #[test]
+    fn test_va_arg_pack_is_not_forwarded_across_conventions() {
+        use crate::abi::CallingConv::{Win64, C};
+        let mut callee = make_simple_func("fwd", true);
+        callee.blocks[0].insns.insert(1, call_under(C, true));
+        assert!(!forwards_across_conventions(&call_under(C, false), &callee));
+        assert!(forwards_across_conventions(
+            &call_under(Win64, false),
+            &callee
+        ));
+        callee.blocks[0].insns[1].extra_mut().ends_with_va_arg_pack = false;
+        assert!(!forwards_across_conventions(
+            &call_under(Win64, false),
+            &callee
+        ));
     }
 
     #[test]

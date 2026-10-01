@@ -7677,7 +7677,7 @@ pub(crate) fn linearize_source(src: &str, target: &Target) -> Module {
 
 /// [`linearize_source`], also handing back the type table the module's type
 /// ids index.
-fn linearize_source_with_types(src: &str, target: &Target) -> (Module, TypeTable) {
+pub(crate) fn linearize_source_with_types(src: &str, target: &Target) -> (Module, TypeTable) {
     linearize_source_under(src, target, Default::default())
 }
 

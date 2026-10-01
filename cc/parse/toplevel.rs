@@ -145,15 +145,18 @@ impl Parser<'_> {
     fn parse_function_body(
         &mut self,
         attrs: &FunctionAttrs,
-        is_variadic: bool,
+        typ: TypeId,
         last_param: Option<StringId>,
     ) -> ParseResult<Stmt> {
+        let func = self.types.get(typ);
+        let is_variadic = func.variadic;
         let outer = std::mem::replace(
             &mut self.enclosing_function,
             EnclosingFunction {
                 variadic: is_variadic,
                 forwarding: is_variadic && attrs.always_inline,
                 last_param,
+                conv: func.conv,
             },
         );
         let body = self.parse_block_stmt_no_scope();
@@ -197,6 +200,7 @@ impl Parser<'_> {
         self.pending_transparent_union = None;
         self.pending_packed = false;
         self.pending_fn_attrs = Default::default();
+        self.pending_calling_conv = None;
         // And any asm label the previous declaration left behind.
         //
         // `skip_extensions` collects one wherever it runs, which is most
@@ -247,8 +251,6 @@ impl Parser<'_> {
             ParamStyle::IdentifierList
         };
         let return_type = func.base.expect("a function type has a return type");
-        // An old-style declarator has no `...` to be variadic with.
-        let is_variadic = func.variadic;
 
         self.check_redeclaration(name, typ, pos);
         let _ = self
@@ -283,7 +285,7 @@ impl Parser<'_> {
             })
             .collect();
         // Parse body without creating another scope
-        let body = self.parse_function_body(&attrs, is_variadic, last_param)?;
+        let body = self.parse_function_body(&attrs, typ, last_param)?;
         self.symbols.leave_scope();
 
         Ok(FunctionDef {
@@ -295,7 +297,7 @@ impl Parser<'_> {
             pos: specs.pos,
             is_static: specs.storage_class.contains(TypeModifiers::STATIC),
             is_inline: specs.storage_class.contains(TypeModifiers::INLINE),
-            calling_conv: attrs.calling_conv.unwrap_or_default(),
+            calling_conv: self.types.get(typ).conv,
             attrs,
         })
     }

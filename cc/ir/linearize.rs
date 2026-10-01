@@ -1404,20 +1404,26 @@ impl<'a> Linearizer<'a> {
     /// libgcc's `__mul?c3`/`__div?c3` follow the same classification, which
     /// is why the complex arithmetic asks this too
     /// (`emit_complex_rtlib_call`).
-    pub(crate) fn returns_via_hidden_pointer(&self, typ: TypeId) -> bool {
+    ///
+    /// A scalar does exactly the same: none ever does under System V or
+    /// AAPCS64, while the Microsoft x64 convention returns `long double` and
+    /// `__float128` through the pointer, since no register position is wide
+    /// enough for either.
+    ///
+    /// `conv` is the convention of the function whose return this is: the
+    /// callee's at a call, the function's own in its definition.
+    pub(crate) fn returns_via_hidden_pointer(&self, typ: TypeId, conv: CallingConv) -> bool {
         let kind = self.types.kind(typ);
-        if self.types.is_complex(typ) {
-            let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+        let abi = get_abi_for_conv(conv, self.target);
+        if self.types.is_complex(typ) || self.types.is_scalar(typ) {
             return matches!(
                 abi.classify_return(typ, self.types),
                 crate::abi::ArgClass::Indirect { .. }
             );
         }
         if kind != TypeKind::Struct && kind != TypeKind::Union {
-            // Scalars never do.
             return false;
         }
-        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
         let class = abi.classify_return(typ, self.types);
         if matches!(class, crate::abi::ArgClass::Hfa { .. }) {
             // An HFA comes back in one V register per element, up to four, so
@@ -1498,7 +1504,8 @@ impl<'a> Linearizer<'a> {
             // `typ_size` saturates for an aggregate past `u32::MAX` bits and is
             // good only for the class tests below, which compare against 64.
             let typ_bytes = self.types.size_bytes(typ) as i64;
-            let is_aarch64 = self.target.arch == crate::target::Arch::Aarch64;
+            let conv = self.current_calling_conv;
+            let abi = get_abi_for_conv(conv, self.target);
             // MEMORY class: the caller left the bytes in the incoming argument
             // area, so `arg_pseudo` names storage rather than pointing at it.
             // Over sixteen bytes that is every aggregate; at or below, only one
@@ -1510,8 +1517,12 @@ impl<'a> Linearizer<'a> {
             // COMPLEX_X87 and travels in memory too, and asking only about
             // struct kinds sent it down the pointer path the caller had not
             // taken.
-            let arrived_by_value =
-                !is_aarch64 && crate::arch::lir::memory_class_bytes(self.types, typ).is_some();
+            //
+            // A convention that passes such a value by reference instead --
+            // AAPCS64, Win64 -- hands over a pointer to the caller's copy,
+            // which the pointer path below copies out of.
+            let arrived_by_value = !abi.indirect_param_is_reference()
+                && crate::arch::lir::memory_class_bytes(self.types, typ).is_some();
             if arrived_by_value {
                 // Passed by value on the stack. `arg_pseudo` is an IncomingArg
                 // naming the struct data; take its address, then copy each
@@ -1531,8 +1542,10 @@ impl<'a> Linearizer<'a> {
                     src: false,
                 };
                 self.emit_block_copy(local_sym, addr_pseudo, typ_bytes, vol);
-            } else if typ_size > 64 {
+            } else if typ_size > 64 || self.passed_by_reference(typ, conv) {
                 // Medium struct (9-16 bytes): arg_pseudo is a pointer (current behavior).
+                // So is anything passed by reference, at any size: a Win64
+                // three-byte struct or `long double`.
                 // Copy each 8-byte chunk through pointer dereference.
                 let vol = BlockVolatility {
                     dst: self.types.contains_volatile(typ),
@@ -1540,8 +1553,17 @@ impl<'a> Linearizer<'a> {
                 };
                 self.emit_block_copy(local_sym, arg_pseudo, typ_bytes, vol);
             } else {
-                // Small struct: arg_pseudo contains the value directly
-                self.emit(Instruction::store(arg_pseudo, local_sym, 0, typ, typ_size));
+                // Small struct: arg_pseudo contains the value directly. A
+                // complex value passed that way (Win64) is its bits, stored
+                // as the integer they are.
+                let as_typ = if self.types.is_complex(typ) {
+                    self.bits_type(typ_bytes as usize).unwrap_or(typ)
+                } else {
+                    typ
+                };
+                self.emit(Instruction::store(
+                    arg_pseudo, local_sym, 0, as_typ, typ_size,
+                ));
             }
 
             // Register as a local variable (only if named parameter)
@@ -1771,10 +1793,11 @@ impl<'a> Linearizer<'a> {
         let is_extern = modifiers.contains(TypeModifiers::EXTERN);
         let is_noreturn = modifiers.contains(TypeModifiers::NORETURN);
 
-        // Store calling convention from function attributes (e.g., __attribute__((sysv_abi)))
+        // The definition is compiled under its own type's convention.
         self.current_calling_conv = func.calling_conv;
 
         let mut ir_func = Function::new(self.emitted_name(func.name), func.return_type);
+        ir_func.conv = func.calling_conv;
 
         // Whether this is an *inline definition*, which provides no external
         // definition and so must not be emitted.
@@ -1838,7 +1861,8 @@ impl<'a> Linearizer<'a> {
         // Check if function returns a large struct
         // Large structs are returned via a hidden first parameter (sret)
         // that points to caller-allocated space
-        let returns_large_struct = self.returns_via_hidden_pointer(func.return_type);
+        let returns_large_struct =
+            self.returns_via_hidden_pointer(func.return_type, self.current_calling_conv);
 
         // Argument index offset: if returning large struct, first arg is hidden return pointer
         let arg_offset: u32 = if returns_large_struct { 1 } else { 0 };
@@ -1851,7 +1875,7 @@ impl<'a> Linearizer<'a> {
             self.struct_return_ptr = Some(sret_id);
         }
 
-        if self.returns_reg_aggregate(func.return_type) {
+        if self.returns_reg_aggregate(func.return_type, self.current_calling_conv) {
             self.reg_aggregate_return_type = Some(func.return_type);
         }
 
@@ -1892,7 +1916,22 @@ impl<'a> Linearizer<'a> {
                 ParamStyle::Prototype => param.typ,
                 ParamStyle::IdentifierList => self.types.default_argument_promote(param.typ),
             };
-            ir_func.add_param(&name, passed_as);
+            // A scalar or complex value passed by reference arrives as a
+            // pointer, and the `Arg` is recorded as one: the back end types
+            // each `Arg` by its parameter, and a `long double` pointer taken
+            // for an x87 value is read as one.
+            let conv = self.current_calling_conv;
+            let by_reference = self.passed_by_reference(passed_as, conv);
+            let carried = if by_reference
+                && !matches!(
+                    self.types.kind(passed_as),
+                    TypeKind::Struct | TypeKind::Union
+                ) {
+                self.types.pointer_to(passed_as)
+            } else {
+                passed_as
+            };
+            ir_func.add_param(&name, carried);
 
             // Create argument pseudo (offset by 1 if there's a hidden return pointer)
             let pseudo_id = self.alloc_pseudo();
@@ -1902,7 +1941,11 @@ impl<'a> Linearizer<'a> {
             // For struct/union types, we'll copy to a local later
             // so member access works properly
             let param_kind = self.types.kind(param.typ);
-            if param_kind == TypeKind::VaList && !self.types.va_list_is_pointer() {
+            if by_reference || self.complex_travels_as_bits(param.typ, conv) {
+                // Copied out of the caller's copy, or stored from the bits it
+                // arrived as: `store_struct_params` knows both.
+                struct_params.push((name, param.symbol, param.typ, pseudo_id));
+            } else if param_kind == TypeKind::VaList && !self.types.va_list_is_pointer() {
                 // va_list parameters are special: due to array-to-pointer decay at call site,
                 // the actual value passed is a pointer to the va_list struct, not the struct itself.
                 // We'll handle this after function setup.
@@ -1977,7 +2020,7 @@ impl<'a> Linearizer<'a> {
                 // pointer while the prologue also stores the argument
                 // registers into the same local, and the load wins — reading
                 // whatever happened to be in the first integer register.
-                let abi = get_abi_for_conv(CallingConv::C, self.target);
+                let abi = get_abi_for_conv(conv, self.target);
                 let by_address = matches!(
                     abi.classify_param(param.typ, self.types),
                     crate::abi::ArgClass::Indirect { .. }
@@ -2144,6 +2187,21 @@ impl<'a> Linearizer<'a> {
     /// return type first, as the register return path does: the caller reads
     /// it with the declared base type's stride.
     pub(crate) fn emit_sret_return(&mut self, e: &Expr, sret_ptr: PseudoId, ret_type: TypeId) {
+        if self.types.is_scalar(ret_type) && !self.types.is_complex(ret_type) {
+            // A scalar the convention returns through the pointer -- a Win64
+            // `long double` -- is converted as `return` converts any value
+            // (C17 6.8.6.4p3) and stored there.
+            let val = self.linearize_expr(e);
+            let val = self.emit_convert(val, self.expr_type(e), ret_type);
+            let size = self.types.size_bits(ret_type);
+            self.emit(Instruction::store(val, sret_ptr, 0, ret_type, size));
+            self.emit(Instruction::ret_typed(
+                Some(sret_ptr),
+                self.types.void_ptr_id,
+                64,
+            ));
+            return;
+        }
         let src_addr = if !self.types.is_complex(ret_type) {
             self.linearize_lvalue(e)
         } else if self.types.is_complex(self.expr_type(e)) {
@@ -2181,10 +2239,47 @@ impl<'a> Linearizer<'a> {
     /// ordinary scalar return to its callee, whose `Ret` then carried an
     /// address under no ABI classification -- which is why the inliner had to
     /// refuse every HFA and x87 return.
-    pub(crate) fn returns_reg_aggregate(&self, typ: TypeId) -> bool {
+    pub(crate) fn returns_reg_aggregate(&self, typ: TypeId, conv: CallingConv) -> bool {
         matches!(self.types.kind(typ), TypeKind::Struct | TypeKind::Union)
             && self.types.size_bits(typ) > 64
-            && !self.returns_via_hidden_pointer(typ)
+            && !self.returns_via_hidden_pointer(typ, conv)
+    }
+
+    /// Whether an argument of type `typ` travels, under `conv`, as a pointer
+    /// to a copy the caller made: an AAPCS64 composite over sixteen bytes,
+    /// and under Win64 every value that is not 1, 2, 4 or 8 bytes wide. The
+    /// one statement of it for both ends of a call -- the caller makes the
+    /// copy, the callee receives the pointer.
+    pub(crate) fn passed_by_reference(&self, typ: TypeId, conv: CallingConv) -> bool {
+        let abi = get_abi_for_conv(conv, self.target);
+        abi.indirect_param_is_reference()
+            && matches!(
+                abi.classify_param(typ, self.types),
+                crate::abi::ArgClass::Indirect { .. }
+            )
+    }
+
+    /// Whether a complex value of type `typ` travels, under `conv`, as the
+    /// bits of its value in one integer position rather than by address:
+    /// Win64 passes and returns a complex number of 1, 2, 4 or 8 bytes the
+    /// way it does an aggregate of that size. The value is then read as the
+    /// unsigned integer of that width -- [`Self::bits_type`].
+    pub(crate) fn complex_travels_as_bits(&self, typ: TypeId, conv: CallingConv) -> bool {
+        conv == CallingConv::Win64
+            && self.types.is_complex(typ)
+            && self.bits_type(self.types.size_bytes(typ)).is_some()
+    }
+
+    /// The unsigned integer type `bytes` wide, for moving an object's bits
+    /// as a value; `None` for a width with no such type.
+    pub(crate) fn bits_type(&self, bytes: usize) -> Option<TypeId> {
+        match bytes {
+            1 => Some(self.types.uchar_id),
+            2 => Some(self.types.ushort_id),
+            4 => Some(self.types.uint_id),
+            8 => Some(self.types.ulong_id),
+            _ => None,
+        }
     }
 
     /// Return an aggregate the ABI returns in registers
@@ -3674,6 +3769,66 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// The address of a fresh copy of an argument passed by reference, which
+    /// the callee owns and may write.
+    ///
+    /// `val` is the argument's address when `by_address`, its value
+    /// otherwise. Passing the original's address instead was invisible
+    /// c17-to-c17 -- a c17 callee copies out of it first -- but a gcc callee
+    /// that assigned to its parameter wrote through into the caller's object.
+    fn argument_copy(
+        &mut self,
+        val: PseudoId,
+        typ: TypeId,
+        by_address: bool,
+        vol: BlockVolatility,
+    ) -> PseudoId {
+        let copy = self.frame_temp("__argcopy", typ);
+        let copy_addr = self.alloc_reg_pseudo();
+        self.emit(Instruction::sym_addr(
+            copy_addr,
+            copy,
+            self.types.pointer_to(typ),
+        ));
+        if by_address {
+            let bytes = self.types.size_bytes(typ) as i64;
+            self.emit_block_copy(copy_addr, val, bytes, vol);
+        } else {
+            let size = self.types.size_bits(typ);
+            self.emit(Instruction::store(val, copy, 0, typ, size));
+        }
+        copy_addr
+    }
+
+    /// An argument of type `passed`, as convention `conv` hands it over.
+    ///
+    /// An aggregate has already been settled by the argument loop, which
+    /// copies one passed by reference as it materializes it. What remains
+    /// is the Win64 treatment of a value that is not an aggregate: a scalar
+    /// or complex value passed by reference goes as a pointer to a copy --
+    /// `val` is a complex value's address, or a scalar's value -- and a
+    /// complex value of 1, 2, 4 or 8 bytes goes as the bits it holds.
+    fn pass_by_convention(&mut self, val: PseudoId, passed: TypeId, conv: CallingConv) -> PseudoId {
+        if matches!(self.types.kind(passed), TypeKind::Struct | TypeKind::Union) {
+            return val;
+        }
+        if self.passed_by_reference(passed, conv) {
+            let by_address = self.types.is_complex(passed);
+            return self.argument_copy(val, passed, by_address, BlockVolatility::default());
+        }
+        if self.complex_travels_as_bits(passed, conv) {
+            let bytes = self.types.size_bytes(passed);
+            let bits = self
+                .bits_type(bytes)
+                .expect("checked by complex_travels_as_bits");
+            let loaded = self.alloc_reg_pseudo();
+            let size = self.types.size_bits(bits);
+            self.emit(Instruction::load(loaded, val, 0, bits, size));
+            return loaded;
+        }
+        val
+    }
+
     /// Linearize a function call expression
     pub(crate) fn linearize_call(
         &mut self,
@@ -3736,6 +3891,16 @@ impl<'a> Linearizer<'a> {
 
         let typ = self.expr_type(expr); // Use evaluated type (function return type)
 
+        // The callee's convention classifies everything below: its return,
+        // which arguments it takes by reference, and the registers.
+        let conv = func_expr
+            .typ
+            .map_or(CallingConv::C, |t| CallingConv::of_callee(t, self.types));
+        // A library function is known by its System V signature: what folds
+        // or lowers a call to `memcpy` makes a System V call, and a callee
+        // declared `ms_abi` is some other function of that name.
+        let known = known.filter(|_| conv == CallingConv::C);
+
         // Check if this is a variadic function call and if it's noreturn
         // If the function expression has a type, check its variadic and noreturn flags
         let (variadic_arg_start, is_noreturn_call) = if let Some(func_type) = func_expr.typ {
@@ -3757,12 +3922,12 @@ impl<'a> Linearizer<'a> {
         // Two-register structs (9-16 bytes): allocate local storage, codegen stores two regs
         let typ_kind = self.types.kind(typ);
         let struct_size_bits = self.types.size_bits(typ);
-        let returns_large_struct = self.returns_via_hidden_pointer(typ);
+        let returns_large_struct = self.returns_via_hidden_pointer(typ, conv);
         // An aggregate that comes back in registers still needs somewhere to
         // land, and the backend writes the registers into this local. There is
         // no upper size bound: an HFA of four `double`s is thirty-two bytes
         // and still returns in registers, not through the hidden pointer.
-        let returns_reg_aggregate = self.returns_reg_aggregate(typ);
+        let returns_reg_aggregate = self.returns_reg_aggregate(typ, conv);
         // A complex value the ABI returns in registers (x87 or SSE) is handed
         // back as the address of its halves; one it returns in memory --
         // `_Float128 _Complex` on x86-64 -- came back through the hidden
@@ -3869,10 +4034,10 @@ impl<'a> Linearizer<'a> {
                     self.types.is_complex(arg_type) && self.types.kind(*pt) == TypeKind::Bool
                 });
             let arg_val = if (arg_kind == TypeKind::Struct || arg_kind == TypeKind::Union)
-                && self.types.size_bits(arg_type) > 64
+                && (self.types.size_bits(arg_type) > 64 || self.passed_by_reference(arg_type, conv))
             {
                 let size_bits = self.types.size_bits(arg_type);
-                let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+                let abi = get_abi_for_conv(conv, self.target);
                 let class = abi.classify_param(arg_type, self.types);
                 if size_bits > 128 {
                     // Large struct (> 16 bytes): keep struct type so ABI classifies as
@@ -3917,26 +4082,9 @@ impl<'a> Linearizer<'a> {
                 // hands back the temporary's address, so both cases are the
                 // same call.
                 let addr = self.linearize_lvalue(a);
-                if matches!(class, crate::abi::ArgClass::Indirect { .. })
-                    && abi.indirect_param_is_reference()
-                {
-                    // AAPCS64 B.4: the callee owns the memory it is pointed at
-                    // and may write it, so it must be a copy. Passing the
-                    // original's address was invisible c17-to-c17 -- a c17
-                    // callee copies out of it first -- but a gcc callee that
-                    // assigned to its parameter wrote through into the
-                    // caller's object.
-                    let copy = self.frame_temp("__argcopy", arg_type);
-                    let copy_addr = self.alloc_reg_pseudo();
-                    self.emit(Instruction::sym_addr(
-                        copy_addr,
-                        copy,
-                        self.types.pointer_to(arg_type),
-                    ));
-                    let bytes = self.types.size_bytes(arg_type) as i64;
+                if self.passed_by_reference(arg_type, conv) {
                     let vol = self.block_volatility(arg_type, self.expr_type(a));
-                    self.emit_block_copy(copy_addr, addr, bytes, vol);
-                    copy_addr
+                    self.argument_copy(addr, arg_type, true, vol)
                 } else {
                     addr
                 }
@@ -4081,6 +4229,10 @@ impl<'a> Linearizer<'a> {
                 arg_types_vec.push(arg_type);
                 val
             };
+            let passed = *arg_types_vec
+                .last()
+                .expect("every argument records its type");
+            let arg_val = self.pass_by_convention(arg_val, passed, conv);
             arg_vals.push(arg_val);
         }
 
@@ -4101,13 +4253,13 @@ impl<'a> Linearizer<'a> {
             }
         }
 
-        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+        let abi = get_abi_for_conv(conv, self.target);
         let param_classes: Vec<_> = arg_types_vec
             .iter()
             .map(|&t| abi.classify_param(t, self.types))
             .collect();
         let ret_class = abi.classify_return(typ, self.types);
-        let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
+        let call_abi_info = Box::new(CallAbiInfo::with_conv(param_classes, ret_class, conv));
 
         if returns_large_struct {
             // For large struct returns, the return value is the address
@@ -4146,6 +4298,14 @@ impl<'a> Linearizer<'a> {
                 self.emit_no_return(
                     Instruction::new(Opcode::Unreachable).with_type(self.types.void_id),
                 );
+            }
+            // A scalar returned through the pointer is read back as the
+            // call's value; anything else is used by address, as stored.
+            if self.types.is_scalar(typ) && !self.types.is_complex(typ) {
+                let val = self.alloc_reg_pseudo();
+                let size = self.types.size_bits(typ);
+                self.emit(Instruction::load(val, result_sym, 0, typ, size));
+                return val;
             }
             // Return the symbol (address) where struct is stored
             result_sym
@@ -5560,6 +5720,21 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
+            ExprKind::VaArg { ap, arg_type } if self.types.is_ms_va_list(self.expr_type(ap)) => {
+                let ap_addr = self.linearize_lvalue(ap);
+                self.linearize_ms_va_arg(ap_addr, *arg_type)
+            }
+
+            ExprKind::VaCopy { dest, src } if self.types.is_ms_va_list(self.expr_type(dest)) => {
+                // A Microsoft `va_list` is a plain pointer: copying it is an
+                // assignment.
+                let dest_addr = self.linearize_lvalue(dest);
+                let val = self.linearize_expr(src);
+                let ptr = self.types.ms_va_list_id;
+                self.emit(Instruction::store(val, dest_addr, 0, ptr, 64));
+                self.alloc_pseudo()
+            }
+
             ExprKind::VaArg { ap, arg_type } => {
                 // va_arg(ap, type)
                 // Get address of ap (it's an lvalue)
@@ -5632,6 +5807,52 @@ impl<'a> Linearizer<'a> {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// `__builtin_va_arg` on a `__builtin_ms_va_list` at `ap_addr`.
+    ///
+    /// The list is a pointer walking the Microsoft x64 argument positions,
+    /// eight bytes each -- the four the callee spilled to its shadow area and
+    /// the stacked ones after them -- so this is ordinary IR, with nothing for
+    /// a back end to know: step the pointer, follow it once more for a type
+    /// passed by reference, and read the value. An aggregate or complex value
+    /// lands in a local of its own, as a System V `va_arg` puts it.
+    ///
+    /// gcc reads a by-reference type -- a three-byte struct, a `long double`
+    /// -- out of the position itself, as if it had been passed by value;
+    /// every caller, gcc's included, passed a pointer there.
+    fn linearize_ms_va_arg(&mut self, ap_addr: PseudoId, typ: TypeId) -> PseudoId {
+        let ptr = self.types.ms_va_list_id;
+        let slot = self.alloc_reg_pseudo();
+        self.emit(Instruction::load(slot, ap_addr, 0, ptr, 64));
+        let step = self.emit_const(crate::abi::WIN64_POSITION_BYTES as i128, self.types.long_id);
+        let next = self.alloc_reg_pseudo();
+        self.emit(Instruction::binop(
+            Opcode::Add,
+            next,
+            slot,
+            step,
+            self.types.long_id,
+            64,
+        ));
+        self.emit(Instruction::store(next, ap_addr, 0, ptr, 64));
+        let at = if self.passed_by_reference(typ, CallingConv::Win64) {
+            let target = self.alloc_reg_pseudo();
+            self.emit(Instruction::load(target, slot, 0, ptr, 64));
+            target
+        } else {
+            slot
+        };
+        if self.types.is_aggregate_or_complex(typ) {
+            let local = self.frame_temp("__vaarg", typ);
+            let bytes = self.types.size_bytes(typ) as i64;
+            self.emit_block_copy(local, at, bytes, BlockVolatility::default());
+            return local;
+        }
+        let val = self.alloc_reg_pseudo();
+        let size = self.types.size_bits(typ);
+        self.emit(Instruction::load(val, at, 0, typ, size));
+        val
     }
 
     pub(crate) fn linearize_builtin(&mut self, expr: &Expr) -> PseudoId {
@@ -6798,3 +7019,6 @@ pub fn linearize(
 #[cfg(test)]
 #[path = "test_linearize.rs"]
 pub(crate) mod test_linearize;
+#[cfg(test)]
+#[path = "test_linearize_win64.rs"]
+mod test_linearize_win64;

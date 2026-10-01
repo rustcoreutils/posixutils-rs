@@ -9,6 +9,7 @@
 // Compositional type model with interning for efficient comparison.
 //
 
+use crate::abi::CallingConv;
 use crate::float::{ComplexRoutineFormat, FpFormat};
 use crate::strings::{StringId, StringTable as IdentTable};
 use crate::target::{Arch, CharSignedness, IntType, Os, Target};
@@ -351,6 +352,13 @@ bitflags::bitflags! {
         // elements -- storage only, see DECISIONS.md -- and this is what tells
         // it apart from a real array, which decays where a vector would not.
         const VECTOR = 1 << 18;
+
+        // `__builtin_ms_va_list`: a `char *` that `__builtin_va_arg` walks
+        // by the Microsoft x64 convention. gcc makes it a variant of `char *`
+        // -- assignable to and from one without a diagnostic -- that is
+        // still the one pointer `va_arg` walks as a list, and this bit is
+        // that variant.
+        const MS_VA_LIST = 1 << 19;
     }
 }
 
@@ -462,6 +470,11 @@ pub struct Type {
     /// Set via __attribute__((noreturn)) or _Noreturn keyword
     pub noreturn: bool,
 
+    /// The calling convention of a function type: `__attribute__((ms_abi))`
+    /// makes it [`CallingConv::Win64`]. Part of the type, so two function
+    /// types differing only here are distinct and incompatible.
+    pub conv: CallingConv,
+
     /// Composite type data (for struct, union, enum)
     pub composite: Option<Box<CompositeType>>,
 
@@ -480,6 +493,7 @@ impl Default for Type {
             params: None,
             variadic: false,
             noreturn: false,
+            conv: CallingConv::C,
             composite: None,
             explicit_align: None,
         }
@@ -686,10 +700,12 @@ impl Type {
         const REDUNDANT_SIZE: TypeModifiers = TypeModifiers::SHORT
             .union(TypeModifiers::LONG)
             .union(TypeModifiers::LONGLONG);
+        // `__builtin_ms_va_list` is a `char *` to everything but `va_arg`.
         let ignored = Self::QUALIFIERS
             .union(redundant_signed)
             .union(REDUNDANT_SIZE)
-            .union(Self::DECL_SPECIFIERS);
+            .union(Self::DECL_SPECIFIERS)
+            .union(TypeModifiers::MS_VA_LIST);
 
         // Compare modifiers (ignoring top-level qualifiers)
         let self_mods = self.modifiers.difference(ignored);
@@ -718,6 +734,13 @@ impl Type {
 
         // Compare variadic flag
         if self.variadic != other.variadic {
+            return false;
+        }
+
+        // A function type's calling convention is part of it: gcc calls
+        // `long (*)(long)` and `long (__attribute__((ms_abi)) *)(long)`
+        // incompatible, and a redeclaration that changes it conflicting.
+        if self.conv != other.conv {
             return false;
         }
 
@@ -863,6 +886,7 @@ enum TypeKey {
         params: Option<Vec<TypeId>>,
         variadic: bool,
         noreturn: bool,
+        conv: CallingConv,
         modifiers: u32,
     },
 }
@@ -1030,6 +1054,9 @@ pub struct TypeTable {
     pub longdouble_ptr_id: TypeId,
     /// `__builtin_va_list`, the last parameter of `vprintf` and its siblings.
     pub va_list_id: TypeId,
+    /// `__builtin_ms_va_list`: the `char *` variant
+    /// [`TypeModifiers::MS_VA_LIST`] marks.
+    pub ms_va_list_id: TypeId,
 }
 
 /// Parenthesize a declarator that has reached a `*` before an array or
@@ -1094,6 +1121,7 @@ impl TypeTable {
             double_ptr_id: TypeId::INVALID,
             longdouble_ptr_id: TypeId::INVALID,
             va_list_id: TypeId::INVALID,
+            ms_va_list_id: TypeId::INVALID,
         };
 
         // Pre-intern common basic types
@@ -1216,6 +1244,10 @@ impl TypeTable {
         table.double_ptr_id = table.intern(Type::pointer(table.double_id));
         table.longdouble_ptr_id = table.intern(Type::pointer(table.longdouble_id));
         table.va_list_id = table.intern(Type::basic(TypeKind::VaList));
+        table.ms_va_list_id = table.intern(Type {
+            modifiers: TypeModifiers::MS_VA_LIST,
+            ..Type::pointer(table.char_id)
+        });
 
         table
     }
@@ -1290,6 +1322,7 @@ impl TypeTable {
                     params: typ.params.clone(),
                     variadic: typ.variadic,
                     noreturn: typ.noreturn,
+                    conv: typ.conv,
                     modifiers: typ.modifiers.bits(),
                 })
             }
@@ -1520,6 +1553,15 @@ impl TypeTable {
         let typ = self.get(id);
 
         match typ.kind {
+            TypeKind::Pointer if typ.modifiers.contains(TypeModifiers::MS_VA_LIST) => {
+                let mut name = String::from("__builtin_ms_va_list");
+                if !decl.is_empty() {
+                    name.push(' ');
+                    name.push_str(&decl);
+                }
+                name
+            }
+
             TypeKind::Pointer => {
                 // Qualifiers on the pointer belong after the star -- the
                 // `const` in `char *const` qualifies the pointer, not the char.
@@ -1568,6 +1610,13 @@ impl TypeTable {
             }
 
             TypeKind::Function => {
+                // gcc's spelling of a convention other than the default,
+                // inside the declarator: `long (__attribute__((ms_abi)) *)(long)`.
+                let decl = match typ.conv {
+                    CallingConv::C => decl,
+                    CallingConv::Win64 if decl.is_empty() => " __attribute__((ms_abi))".to_string(),
+                    CallingConv::Win64 => format!("__attribute__((ms_abi)) {decl}"),
+                };
                 let mut sig = parenthesize_if_pointer(decl);
                 sig.push('(');
                 match &typ.params {
@@ -1693,6 +1742,13 @@ impl TypeTable {
     /// Is this a GNU `vector_size` type?
     pub fn is_vector(&self, id: TypeId) -> bool {
         self.get(id).modifiers.contains(TypeModifiers::VECTOR)
+    }
+
+    /// Is this `__builtin_ms_va_list`, the one pointer `__builtin_va_arg`
+    /// walks by the Microsoft x64 convention?
+    pub fn is_ms_va_list(&self, id: TypeId) -> bool {
+        let typ = self.get(id);
+        typ.kind == TypeKind::Pointer && typ.modifiers.contains(TypeModifiers::MS_VA_LIST)
     }
 
     /// Check if type is a complex floating point type

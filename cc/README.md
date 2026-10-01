@@ -55,7 +55,7 @@ algorithms and contracts live:
 | `opt.rs` | The optimizer: the pass order, and why each pass sits where it does |
 | `ir/dataflow.rs` | The sparse conditional solver (Wegman-Zadeck) behind `sccp` and `vrp` |
 | `ir/memloc.rs`, `ir/loadfwd.rs` | Memory analysis: what an access addresses, what may alias, and what a location holds at a point |
-| `abi/` | Calling-convention classification (System V AMD64, AAPCS64) |
+| `abi/` | Calling-convention classification (System V AMD64, Microsoft x64, AAPCS64) |
 | `arch/regalloc.rs` | Shared register allocation: liveness, local lifetimes and slot sharing, spill slots |
 | `arch/x86_64/`, `arch/aarch64/` | Code generators: instruction selection, frames, calls, inline asm |
 

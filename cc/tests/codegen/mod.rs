@@ -31,6 +31,7 @@ mod inline_asm;
 mod inlining;
 mod int128;
 mod memopt;
+mod ms_abi;
 mod optimizer;
 mod pic;
 mod plain_char;

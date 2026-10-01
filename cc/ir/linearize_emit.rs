@@ -2170,7 +2170,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         let (left_real, left_imag) = left;
         let (right_real, right_imag) = right;
         let (known, func_name) = routine_fn;
-        let sret = self.returns_via_hidden_pointer(complex_typ);
+        // libgcc's routines are ordinary functions of the target's own
+        // convention, whatever the function calling them is.
+        let conv = crate::abi::CallingConv::C;
+        let sret = self.returns_via_hidden_pointer(complex_typ, conv);
 
         // The result's storage, and the hidden pointer to it if there is one.
         let (result_sym, mut arg_vals, mut arg_types) = if sret {
@@ -2187,7 +2190,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         arg_types.extend([base_typ; 4]);
 
         // Compute ABI classification for the call
-        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
+        let abi = get_abi_for_conv(conv, self.target);
         let param_classes: Vec<_> = arg_types
             .iter()
             .map(|&t| abi.classify_param(t, self.types))

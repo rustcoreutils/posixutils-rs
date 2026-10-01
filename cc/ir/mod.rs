@@ -72,12 +72,23 @@ pub struct CallAbiInfo {
     pub params: Vec<ArgClass>,
     /// Return value classification
     pub ret: ArgClass,
+    /// The callee's calling convention, which made the classifications
+    /// above. It also decides what they cannot say: which register each
+    /// argument lands in, and the shadow area a Win64 callee is owed.
+    pub conv: CallingConv,
 }
 
 impl CallAbiInfo {
-    /// Create a new CallAbiInfo with the given classifications.
+    /// Classifications made under the target's own convention, which is
+    /// what every call the compiler synthesizes -- a runtime library
+    /// routine, `memcpy` -- is made with.
     pub fn new(params: Vec<ArgClass>, ret: ArgClass) -> Self {
-        Self { params, ret }
+        Self::with_conv(params, ret, CallingConv::C)
+    }
+
+    /// Classifications made under `conv`, the callee's convention.
+    pub fn with_conv(params: Vec<ArgClass>, ret: ArgClass, conv: CallingConv) -> Self {
+        Self { params, ret, conv }
     }
 }
 
@@ -1794,7 +1805,7 @@ impl Instruction {
             .map(|&t| abi.classify_param(t, types))
             .collect();
         let ret_class = abi.classify_return(ret_type, types);
-        let call_abi_info = Box::new(CallAbiInfo::new(param_classes, ret_class));
+        let call_abi_info = Box::new(CallAbiInfo::with_conv(param_classes, ret_class, conv));
 
         let mut insn = Self::call(target, func_name, args, arg_types, ret_type, ret_size);
         insn.extra_mut().abi_info = Some(call_abi_info);
@@ -2343,6 +2354,9 @@ pub struct Function {
     pub emit: bool,
     /// Is this function noreturn (never returns)?
     pub is_noreturn: bool,
+    /// The calling convention of the function's type: how its parameters
+    /// arrive, its value leaves, and which registers it must preserve.
+    pub conv: CallingConv,
     /// Is this function declared with the inline keyword?
     pub is_inline: bool,
     /// `__attribute__((noinline))`: the inliner must leave this function
@@ -2422,6 +2436,7 @@ impl Default for Function {
             is_static: false,
             emit: true,
             is_noreturn: false,
+            conv: CallingConv::C,
             is_noinline: false,
             declared_effect: crate::parse::ast::MemEffect::Unknown,
             is_always_inline: false,

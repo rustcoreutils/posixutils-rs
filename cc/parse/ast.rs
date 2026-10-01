@@ -2304,10 +2304,6 @@ pub struct FunctionAttrs {
     /// `__attribute__((noreturn))`. What a call site reads is the function
     /// *type*'s `noreturn`, which the declarator is given from this.
     pub noreturn: bool,
-    /// `__attribute__((sysv_abi))` or `((ms_abi))`, from whichever
-    /// declaration wrote it: gcc compiles a definition under the convention
-    /// an earlier prototype named.
-    pub calling_conv: Option<crate::abi::CallingConv>,
 }
 
 impl FunctionAttrs {
@@ -2336,9 +2332,6 @@ impl FunctionAttrs {
         // wins, as it does for an object.
         self.align = self.align.max(other.align);
         self.noreturn |= other.noreturn;
-        if other.calling_conv.is_some() {
-            self.calling_conv = other.calling_conv;
-        }
     }
 }
 
@@ -2374,7 +2367,8 @@ pub struct FunctionDef {
     pub is_static: bool,
     /// Whether function is inline
     pub is_inline: bool,
-    /// Calling convention override (from __attribute__((sysv_abi)) etc.)
+    /// The calling convention of the function's type, which
+    /// `__attribute__((ms_abi))` sets: the definition is compiled under it.
     pub calling_conv: crate::abi::CallingConv,
     /// Emission-affecting attributes; see [`FunctionAttrs`].
     pub attrs: FunctionAttrs,

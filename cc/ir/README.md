@@ -286,8 +286,16 @@ Optional `CallAbiInfo` provides detailed ABI classification:
 CallAbiInfo {
     params: Vec<ArgClass>,  // Per-argument classification
     ret: ArgClass,          // Return value classification
+    conv: CallingConv,      // The callee's convention, which made them
 }
 ```
+
+The convention is the callee's: `CallingConv::of_callee` reads it off the
+function type a call names, directly or through a pointer, since
+`__attribute__((ms_abi))` is part of that type. A definition's own is
+`Function::conv`. Under `Win64` an `Indirect` parameter is a pointer to a
+copy the caller made, as under AAPCS64, and the backend assigns registers
+by argument position.
 
 `ArgClass` variants:
 - `Direct { classes, size_bits }` - pass in register(s)
@@ -647,7 +655,9 @@ because that is the part an index cannot show.
   register allocation, and several Darwin ABI details whose LLVM source is
   cited in `arch/`.
 - **ABIs**, which `abi_info` and the back ends implement: System V AMD64 psABI
-  (<https://gitlab.com/x86-psABIs/x86-64-ABI>), AAPCS64
+  (<https://gitlab.com/x86-psABIs/x86-64-ABI>), the Microsoft x64 calling
+  convention (<https://learn.microsoft.com/cpp/build/x64-calling-convention>,
+  for `ms_abi`), AAPCS64
   (<https://github.com/ARM-software/abi-aa>), and Apple's "Writing ARM64 code
   for Apple platforms" for the Darwin variations.
 - **IEEE 754-2019** and C17 Annex F: the semantics of the floating-point

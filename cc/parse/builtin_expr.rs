@@ -306,8 +306,14 @@ impl Parser<'_> {
             })(
             )),
 
-            crate::kw::BUILTIN_VA_START => Some((|| {
-                // __builtin_va_start(ap, last_param)
+            crate::kw::BUILTIN_VA_START | crate::kw::BUILTIN_MS_VA_START => Some((|| {
+                // __builtin_va_start(ap, last_param), or the Microsoft
+                // flavour of it, which only an `ms_abi` function may use.
+                let wants = if name_id == crate::kw::BUILTIN_MS_VA_START {
+                    crate::abi::CallingConv::Win64
+                } else {
+                    crate::abi::CallingConv::C
+                };
                 self.expect_special(b'(')?;
                 let ap = self.parse_assignment_expr()?;
                 self.expect_special(b',')?;
@@ -315,7 +321,9 @@ impl Parser<'_> {
                 let last_param_pos = self.current_pos();
                 let last_param = self.expect_identifier()?;
                 self.expect_special(b')')?;
-                if !self.check_va_start(last_param, token_pos, last_param_pos) {
+                if !self.check_va_start(last_param, token_pos, last_param_pos)
+                    || !self.check_va_start_convention(wants, &ap, token_pos)
+                {
                     return Ok(self.diagnosed_call(self.types.void_id, token_pos));
                 }
                 Ok(Self::typed_expr(
@@ -350,7 +358,7 @@ impl Parser<'_> {
                 );
                 Ok(self.with_type_name_extents(dims, value))
             })()),
-            crate::kw::BUILTIN_VA_END => Some((|| {
+            crate::kw::BUILTIN_VA_END | crate::kw::BUILTIN_MS_VA_END => Some((|| {
                 // __builtin_va_end(ap)
                 self.expect_special(b'(')?;
                 let ap = self.parse_assignment_expr()?;
@@ -361,7 +369,7 @@ impl Parser<'_> {
                     token_pos,
                 ))
             })()),
-            crate::kw::BUILTIN_VA_COPY => Some((|| {
+            crate::kw::BUILTIN_VA_COPY | crate::kw::BUILTIN_MS_VA_COPY => Some((|| {
                 // __builtin_va_copy(dest, src)
                 self.expect_special(b'(')?;
                 let dest = self.parse_assignment_expr()?;
@@ -401,6 +409,34 @@ impl Parser<'_> {
             );
         }
         true
+    }
+
+    /// Each `va_start` belongs to one convention: `__builtin_va_start` lays
+    /// out a System V `va_list` from the register save area, and
+    /// `__builtin_ms_va_start` points a `__builtin_ms_va_list` at the stacked
+    /// arguments of an `ms_abi` function. Either in the other kind of function
+    /// is an error, as clang makes it -- gcc accepts both and emits code that
+    /// reads the wrong frame -- and so is the Microsoft one on a list that is
+    /// not a `__builtin_ms_va_list`. `false` once one is reported.
+    fn check_va_start_convention(
+        &self,
+        wants: crate::abi::CallingConv,
+        ap: &Expr,
+        pos: Position,
+    ) -> bool {
+        use crate::abi::CallingConv;
+        let message = match (wants, self.enclosing_function.conv) {
+            (CallingConv::C, CallingConv::Win64) => "'va_start' used in Win64 ABI function",
+            (CallingConv::Win64, CallingConv::C) => {
+                "'__builtin_ms_va_start' used in System V ABI function"
+            }
+            (CallingConv::Win64, _) if !ap.typ.is_some_and(|t| self.types.is_ms_va_list(t)) => {
+                "first argument to '__builtin_ms_va_start' not of type '__builtin_ms_va_list'"
+            }
+            _ => return true,
+        };
+        diag::error(pos, message);
+        false
     }
 
     /// gcc's rules for `__builtin_va_arg(ap, type)`: the type must be a

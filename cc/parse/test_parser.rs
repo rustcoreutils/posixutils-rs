@@ -8660,20 +8660,57 @@ fn test_later_declarators_align_and_complete() {
     assert_eq!(types.get(find("q")).array_size, Some(5));
 }
 
-/// A definition is compiled under the calling convention any declaration of
-/// its name asked for -- a prototype's, or one written among the specifiers --
-/// as gcc does. Only an attribute directly after the definition's own
-/// parameter list used to count.
+/// `ms_abi` belongs to the function *type*, as gcc has it: a definition, a
+/// prototype, a pointer to a function, a typedef and a parameter each carry
+/// it, and `sysv_abi` names the x86-64 default. Read off the types the
+/// declarations bound.
 #[test]
-fn test_calling_convention_comes_from_any_declaration() {
-    let (tu, _types, strings, _symbols) = parse_tu(
-        "int f(int a, int b) __attribute__((ms_abi));\n\
-         int f(int a, int b) { return a - b; }\n\
-         __attribute__((ms_abi)) int g(void) { return 0; }\n\
-         int h(void) { return 0; }\n",
+fn test_calling_convention_is_part_of_the_function_type() {
+    use crate::abi::CallingConv::{Win64, C};
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    let (tu, types, strings, symbols) = parse_tu_for(
+        &"int f(int a, int b) MS;\n\
+          MS int g(void) { return 0; }\n\
+          int h(void) { return 0; }\n\
+          __attribute__((sysv_abi)) int s(void);\n\
+          MS long (*fp)(long);\n\
+          long (MS *gp)(long);\n\
+          typedef MS long fn_t(long);\n\
+          fn_t *tp;\n\
+          void take(MS long (*cb)(long));\n\
+          MS long (*ret_ms(void))(long);\n"
+            .replace("MS", "__attribute__((ms_abi))"),
+        &target,
     )
     .unwrap();
-    let convs: Vec<(String, crate::abi::CallingConv)> = tu
+    let find = |name: &str| {
+        let id = strings.lookup(name).expect("interned");
+        symbols
+            .lookup(id, crate::symbol::Namespace::Ordinary)
+            .unwrap_or_else(|| panic!("no symbol {name}"))
+            .typ
+    };
+    let conv = |t: TypeId| crate::abi::CallingConv::of_callee(t, &types);
+    for (name, want) in [
+        ("f", Win64),
+        ("g", Win64),
+        ("h", C),
+        ("s", C),
+        ("fp", Win64),
+        ("gp", Win64),
+        ("tp", Win64),
+        // The attribute is the function's, not the pointer it returns.
+        ("ret_ms", Win64),
+    ] {
+        assert_eq!(conv(find(name)), want, "{name}");
+    }
+    let returned = types.base_type(find("ret_ms")).unwrap();
+    assert_eq!(conv(returned), C, "ret_ms returns a System V pointer");
+    let take = types.get(find("take")).params.clone().unwrap();
+    assert_eq!(conv(take[0]), Win64, "parameter");
+    assert_eq!(conv(find("take")), C);
+    // A definition is compiled under its type's convention.
+    let defs: Vec<(String, crate::abi::CallingConv)> = tu
         .items
         .iter()
         .filter_map(|item| match item {
@@ -8681,15 +8718,106 @@ fn test_calling_convention_comes_from_any_declaration() {
             _ => None,
         })
         .collect();
-    use crate::abi::CallingConv::{Win64, C};
+    assert_eq!(defs, [("g".to_string(), Win64), ("h".to_string(), C)]);
+    // Two types differing only in convention are distinct.
+    let ms_fn = types.base_type(find("fp")).unwrap();
+    let mut types = types;
+    let mut sysv = types.get(ms_fn).clone();
+    sysv.conv = C;
+    let sysv_fn = types.intern(sysv);
+    assert_ne!(ms_fn, sysv_fn);
+    assert!(!types.types_compatible(ms_fn, sysv_fn));
     assert_eq!(
-        convs,
-        [
-            ("f".to_string(), Win64),
-            ("g".to_string(), Win64),
-            ("h".to_string(), C)
-        ]
+        types.format_type(types.pointer_to(ms_fn), None),
+        "long (__attribute__((ms_abi)) *)(long)"
     );
+}
+
+/// gcc rejects a redeclaration that changes a function's calling
+/// convention, and the two attributes on one declaration, as conflicts; a
+/// pointer to a pointer to a function is not a function type, so the
+/// attribute warns there and is ignored.
+#[test]
+fn test_calling_convention_conflicts() {
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    for src in [
+        "int f(int a, int b) __attribute__((ms_abi));\nint f(int a, int b) { return a - b; }\n",
+        "__attribute__((ms_abi)) int f(int);\n__attribute__((sysv_abi)) int f(int);\n",
+        "__attribute__((ms_abi, sysv_abi)) int f(int);\n",
+        "__attribute__((ms_abi)) int f(int) __attribute__((sysv_abi));\n",
+    ] {
+        let before = crate::diag::error_count();
+        let _ = parse_tu_for(src, &target);
+        assert!(crate::diag::error_count() > before, "{src}: accepted");
+    }
+    let (_, types, strings, symbols) =
+        parse_tu_for("__attribute__((ms_abi)) long (**pp)(long);\n", &target).unwrap();
+    let id = strings.lookup("pp").unwrap();
+    let pp = symbols
+        .lookup(id, crate::symbol::Namespace::Ordinary)
+        .unwrap()
+        .typ;
+    let func = types.base_type(types.base_type(pp).unwrap()).unwrap();
+    assert_eq!(types.get(func).conv, crate::abi::CallingConv::C);
+}
+
+/// On aarch64 neither attribute exists, as for gcc there: the type keeps the
+/// native convention.
+#[test]
+fn test_calling_convention_attributes_do_not_exist_on_aarch64() {
+    let target = Target::new(crate::target::Arch::Aarch64, crate::target::Os::Linux);
+    let (_, types, strings, symbols) = parse_tu_for(
+        "__attribute__((ms_abi)) long f(long);\n__attribute__((sysv_abi)) long g(long);\n",
+        &target,
+    )
+    .unwrap();
+    for name in ["f", "g"] {
+        let id = strings.lookup(name).unwrap();
+        let typ = symbols
+            .lookup(id, crate::symbol::Namespace::Ordinary)
+            .unwrap()
+            .typ;
+        assert_eq!(types.get(typ).conv, crate::abi::CallingConv::C, "{name}");
+    }
+}
+
+/// Each `va_start` belongs to one convention, and `__builtin_ms_va_list`
+/// is a `char *` to everything but `va_arg`: assignable both ways without a
+/// diagnostic, and named by its own spelling.
+#[test]
+fn test_ms_va_builtins() {
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    let ok = "__attribute__((ms_abi)) int f(int n, ...) {\n\
+              __builtin_ms_va_list ap, ap2; char *p;\n\
+              __builtin_ms_va_start(ap, n);\n\
+              __builtin_ms_va_copy(ap2, ap);\n\
+              p = ap; ap2 = p;\n\
+              int r = __builtin_va_arg(ap, int);\n\
+              __builtin_ms_va_end(ap);\n\
+              return r;\n}\n\
+              int g(__builtin_ms_va_list ap) { return __builtin_va_arg(ap, int); }\n";
+    let (_, types, _, _) = parse_tu_for(ok, &target).unwrap();
+    assert!(types.is_ms_va_list(types.ms_va_list_id));
+    assert!(!types.is_ms_va_list(types.char_ptr_id));
+    assert!(types.types_compatible(types.ms_va_list_id, types.char_ptr_id));
+    assert_eq!(
+        types.format_type(types.ms_va_list_id, None),
+        "__builtin_ms_va_list"
+    );
+    for src in [
+        // The System V `va_start` in an `ms_abi` function...
+        "__attribute__((ms_abi)) int f(int n, ...) { __builtin_va_list ap; \
+         __builtin_va_start(ap, n); return 0; }",
+        // ...the Microsoft one in a System V function...
+        "int f(int n, ...) { __builtin_ms_va_list ap; __builtin_ms_va_start(ap, n); return 0; }",
+        // ...and on a list of the wrong type.
+        "__attribute__((ms_abi)) int f(int n, ...) { char *ap; \
+         __builtin_ms_va_start(ap, n); return 0; }",
+    ] {
+        let before = crate::diag::error_count();
+        let _ = parse_tu_for(src, &target);
+        assert!(crate::diag::error_count() > before, "{src}: accepted");
+    }
 }
 
 /// A floating comparison or a cast to an integer in an integer constant

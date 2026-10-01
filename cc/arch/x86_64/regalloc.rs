@@ -36,6 +36,10 @@
 //   Xmm0-Xmm7                   - FP arguments
 //   Rax, Xmm0                   - Return values
 //   Rbx, Rbp, R12-R15          - Callee-saved
+//
+// An `ms_abi` function's arguments all live in its incoming area instead,
+// and it saves Rsi, Rdi and Xmm6-Xmm15 as well (see win64.rs). Every call is
+// taken to clobber the System V set, which covers both conventions.
 // ============================================================================
 
 use super::x87::{is_x87_float_to_int, uses_x87_scratch};
@@ -675,6 +679,11 @@ impl XmmReg {
         }
     }
 
+    /// The DWARF register number: XMM0-XMM15 are 17-32 on x86-64.
+    pub fn dwarf_number(&self) -> u16 {
+        17 + *self as u16
+    }
+
     /// Floating-point argument registers (System V AMD64 ABI)
     pub fn arg_regs() -> &'static [XmmReg] {
         &[
@@ -806,6 +815,8 @@ pub struct RegAlloc {
     func_pos: crate::diag::Position,
     /// Callee-saved registers that were used
     used_callee_saved: Vec<Reg>,
+    /// The XMM registers an `ms_abi` function must save and restore.
+    win64_xmm_saves: Vec<XmmReg>,
     /// Track which pseudos need FP registers (based on type)
     fp_pseudos: HashSet<PseudoId>,
     /// Track which pseudos are long double (use x87, need 16-byte stack slots)
@@ -1106,6 +1117,7 @@ impl RegAlloc {
             x87_control_words: None,
             func_pos: crate::diag::Position::default(),
             used_callee_saved: Vec::new(),
+            win64_xmm_saves: Vec::new(),
             fp_pseudos: HashSet::new(),
             ld_pseudos: HashSet::new(),
             quad_pseudos: HashSet::new(),
@@ -1139,6 +1151,11 @@ impl RegAlloc {
             // The prologue writes it, so the function must save it.
             self.used_callee_saved.push(base);
         }
+        let win64 = func.conv == crate::abi::CallingConv::Win64;
+        if win64 {
+            self.used_callee_saved
+                .extend_from_slice(&super::win64::CALLEE_SAVED_GP);
+        }
         // Use shared identify_fp_pseudos with type-checker closure
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
         // Identify long double pseudos (use x87 not XMM)
@@ -1148,7 +1165,11 @@ impl RegAlloc {
         self.identify_quad_pseudos(func, types);
         // Identify 128-bit integer pseudos (always spill to 16-byte stack slots)
         self.identify_int128_pseudos(func, types);
-        self.allocate_arguments(func, types);
+        if win64 {
+            self.allocate_win64_arguments(func);
+        } else {
+            self.allocate_arguments(func, types);
+        }
 
         let result = self.compute_live_intervals(func);
         self.live_in = result.live_in;
@@ -1176,8 +1197,62 @@ impl RegAlloc {
             &fp_call_positions,
             &constraint_points,
         );
+        if win64 {
+            self.win64_xmm_saves = self.win64_xmm_to_save(func);
+        }
 
         crate::arch::regalloc::LocationMap::from(self.locations.clone())
+    }
+
+    /// Give every argument of an `ms_abi` function its position's slot in
+    /// the incoming area -- the shadow slot for the first four, which the
+    /// prologue homes them to (`win64::homed_positions`). Each then lives in
+    /// memory for the whole function, like any stacked argument: nothing has
+    /// to track which register it arrived in, and nothing the body does can
+    /// overwrite it there.
+    fn allocate_win64_arguments(&mut self, func: &Function) {
+        for p in &func.pseudos {
+            if let PseudoKind::Arg(n) = p.kind {
+                let at = super::win64::incoming_offset(n as usize);
+                self.locations.insert(p.id, Loc::IncomingArg(at));
+            }
+        }
+        let positions = func.params.len() + usize::from(func.sret_arg().is_some());
+        self.named_incoming_end = super::win64::incoming_offset(positions);
+        crate::arch::regalloc::check_incoming_area(self.named_incoming_end, self.func_pos);
+    }
+
+    /// The XMM registers an `ms_abi` function has to save: every one Win64
+    /// makes callee-saved that the function may write.
+    ///
+    /// That is all ten once it calls anything -- the callee may be System V,
+    /// which preserves none of them, and a `memcpy` is a call too -- or runs
+    /// inline asm. Otherwise it is the ones the allocator handed out, and the
+    /// two scratch registers, which the back end writes without asking it.
+    fn win64_xmm_to_save(&self, func: &Function) -> Vec<XmmReg> {
+        let calls = func.blocks.iter().flat_map(|b| &b.insns).any(|insn| {
+            is_call_like_x86_64(insn.op) || matches!(insn.op, Opcode::Asm | Opcode::TlsAddr)
+        });
+        let allocated: HashSet<XmmReg> = self
+            .locations
+            .values()
+            .filter_map(|loc| match loc {
+                Loc::Xmm(x) => Some(*x),
+                _ => None,
+            })
+            .collect();
+        super::win64::CALLEE_SAVED_XMM
+            .iter()
+            .copied()
+            .filter(|x| {
+                calls || matches!(x, XmmReg::Xmm14 | XmmReg::Xmm15) || allocated.contains(x)
+            })
+            .collect()
+    }
+
+    /// The XMM registers an `ms_abi` function saves; empty for any other.
+    pub fn win64_xmm_saves(&self) -> &[XmmReg] {
+        &self.win64_xmm_saves
     }
 
     /// The positions that destroy every XMM register: the calls, and on
@@ -1207,6 +1282,7 @@ impl RegAlloc {
         self.x87_scratch = None;
         self.x87_control_words = None;
         self.used_callee_saved.clear();
+        self.win64_xmm_saves.clear();
         self.fp_pseudos.clear();
         self.ld_pseudos.clear();
         self.quad_pseudos.clear();

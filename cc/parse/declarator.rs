@@ -118,6 +118,37 @@ impl Parser<'_> {
         modifiers
     }
 
+    /// Whether the `(` just consumed groups a declarator, looking past any
+    /// attribute lists at its start without consuming them.
+    ///
+    /// Those attributes are what decides nothing: `(__attribute__((x)) *p)`
+    /// groups a pointer declarator, while `(__attribute__((mode(SI))) int f)`
+    /// opens a parameter list whose first parameter carries them, and only
+    /// the token after them tells the two apart.
+    fn is_grouped_declarator_after_attributes(&mut self) -> bool {
+        let start = self.pos;
+        while self.is_attribute_keyword() {
+            self.advance();
+            let mut depth = 0usize;
+            loop {
+                if self.is_special(b'(') {
+                    depth += 1;
+                } else if self.is_special(b')') {
+                    depth = depth.saturating_sub(1);
+                } else if self.peek() == TokenType::StreamEnd {
+                    break;
+                }
+                self.advance();
+                if depth == 0 {
+                    break;
+                }
+            }
+        }
+        let grouped = self.is_grouped_declarator();
+        self.pos = start;
+        grouped
+    }
+
     /// Parse a declarator (name and type modifiers)
     ///
     /// C declarators are parsed "inside-out". For example, `int (*p)[3]`:
@@ -168,7 +199,12 @@ impl Parser<'_> {
             let saved_pos = self.pos;
             self.advance(); // consume '('
 
-            if self.is_grouped_declarator() {
+            if self.is_grouped_declarator_after_attributes() {
+                // An attribute opening the group -- `long (__attribute__
+                // ((ms_abi)) *fp)(long)`, the spelling every Windows
+                // calling-convention macro expands to -- belongs to this
+                // declaration.
+                self.skip_extensions();
                 // For int (*p)[3]: we're now at *p), base_type is int
                 let inner = self.parse_declarator_level(self.types.void_id, ctx, true)?;
                 self.expect_special(b')')?;
@@ -525,6 +561,7 @@ impl Parser<'_> {
                 let decl_params = decl_type.params.clone();
                 let decl_variadic = decl_type.variadic;
                 let decl_noreturn = decl_type.noreturn;
+                let decl_conv = decl_type.conv;
                 let new_ret_id = self.substitute_base_type(inner_base_id, actual_base_id);
                 let func_type = Type {
                     kind: TypeKind::Function,
@@ -532,6 +569,7 @@ impl Parser<'_> {
                     params: decl_params,
                     variadic: decl_variadic,
                     noreturn: decl_noreturn,
+                    conv: decl_conv,
                     ..Default::default()
                 };
                 self.types.intern(func_type)
@@ -560,6 +598,7 @@ impl Parser<'_> {
         let saved_align_kw = self.pending_alignas_kw.take();
         let saved_fn_attrs = std::mem::take(&mut self.pending_fn_attrs);
         let saved_symbol_attrs = std::mem::take(&mut self.pending_symbol_attrs);
+        let saved_calling_conv = self.pending_calling_conv.take();
         // The parameter scope is opened and closed here rather than inside, so
         // that it is balanced however the inner parse exits. It used to be left
         // open on the `?` paths and on the trailing-comma `return Err`.
@@ -570,6 +609,7 @@ impl Parser<'_> {
         self.pending_alignas_kw = saved_align_kw;
         self.pending_fn_attrs = saved_fn_attrs;
         self.pending_symbol_attrs = saved_symbol_attrs;
+        self.pending_calling_conv = saved_calling_conv;
         result
     }
 

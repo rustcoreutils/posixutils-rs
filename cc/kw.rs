@@ -45,6 +45,10 @@ pub const TYPE_KEYWORD: u32 = 1 << 13;
 /// separates standard C from GNU extensions (`FOO` vs `GNU_FOO`), because that
 /// lives in the Rust const identifier and is not queryable at runtime.
 pub const RESERVED_NAME: u32 = 1 << 14;
+/// An attribute or builtin gcc knows only on x86-64: the calling-convention
+/// attributes and the Microsoft `va_list` builtins. Anywhere else gcc has
+/// never heard of the name, so neither has c17 -- see [`exists_on`].
+pub const X86_64_ONLY: u32 = 1 << 15;
 
 /// Composite: all tags that start a declaration
 pub const DECL_START: u32 =
@@ -165,6 +169,7 @@ define_keywords! {
     (INT128_T,          "__int128_t",        TYPE_SPEC | TYPE_KEYWORD),
     (UINT128_T,         "__uint128_t",       TYPE_SPEC | TYPE_KEYWORD),
     (BUILTIN_VA_LIST,   "__builtin_va_list", TYPE_SPEC | TYPE_KEYWORD | BUILTIN),
+    (BUILTIN_MS_VA_LIST, "__builtin_ms_va_list", TYPE_SPEC | TYPE_KEYWORD | BUILTIN | X86_64_ONLY),
     (STRUCT,            "struct",            TYPE_SPEC | TYPE_KEYWORD),
     (UNION,             "union",             TYPE_SPEC | TYPE_KEYWORD),
     (ENUM,              "enum",              TYPE_SPEC | TYPE_KEYWORD),
@@ -288,6 +293,11 @@ define_keywords! {
     (BUILTIN_VA_END,    "__builtin_va_end",   BUILTIN),
     (BUILTIN_VA_ARG,    "__builtin_va_arg",   BUILTIN),
     (BUILTIN_VA_COPY,   "__builtin_va_copy",  BUILTIN),
+    // The Microsoft x64 `va_list`, for an `ms_abi` function; `va_arg` is
+    // the shared `__builtin_va_arg`, which the list's type steers.
+    (BUILTIN_MS_VA_START, "__builtin_ms_va_start", BUILTIN | X86_64_ONLY),
+    (BUILTIN_MS_VA_END,   "__builtin_ms_va_end",   BUILTIN | X86_64_ONLY),
+    (BUILTIN_MS_VA_COPY,  "__builtin_ms_va_copy",  BUILTIN | X86_64_ONLY),
     // Forwarding builtins: inside an `always_inline` variadic function these
     // name the *caller's* variadic arguments, and are resolved when it is
     // inlined. glibc forwards sprintf/printf into the `__*_chk` family with
@@ -1014,8 +1024,8 @@ define_keywords! {
     (_, "no_sanitize_thread",   SUPPORTED_ATTR),
     (_, "gnu_inline",              SUPPORTED_ATTR),
     (_, "artificial",              SUPPORTED_ATTR),
-    (_, "sysv_abi",                SUPPORTED_ATTR),
-    (_, "ms_abi",                  SUPPORTED_ATTR),
+    (_, "sysv_abi",                SUPPORTED_ATTR | X86_64_ONLY),
+    (_, "ms_abi",                  SUPPORTED_ATTR | X86_64_ONLY),
     (_, "mode",                    SUPPORTED_ATTR),
     (_, "vector_size",             SUPPORTED_ATTR),
     // Parsed and ignored. Recognised so that a build does not drown in
@@ -1071,8 +1081,8 @@ define_keywords! {
     (_, "__no_sanitize_thread__",    SUPPORTED_ATTR),
     (_, "__gnu_inline__",            SUPPORTED_ATTR),
     (_, "__artificial__",            SUPPORTED_ATTR),
-    (_, "__sysv_abi__",              SUPPORTED_ATTR),
-    (_, "__ms_abi__",                SUPPORTED_ATTR),
+    (_, "__sysv_abi__",              SUPPORTED_ATTR | X86_64_ONLY),
+    (_, "__ms_abi__",                SUPPORTED_ATTR | X86_64_ONLY),
     (_, "__mode__",                  SUPPORTED_ATTR),
     (_, "__vector_size__",           SUPPORTED_ATTR),
     (_, "__nonnull__",               SUPPORTED_ATTR),
@@ -1110,6 +1120,32 @@ define_keywords! {
 pub fn has_tag(id: StringId, mask: u32) -> bool {
     let idx = id.0 as usize;
     idx > 0 && idx <= KEYWORD_COUNT && KEYWORD_TAGS[idx - 1] & mask != 0
+}
+
+/// Does keyword `id` exist on a target of architecture `arch`?
+///
+/// Every keyword does, except an [`X86_64_ONLY`] one off x86-64: there it is
+/// an ordinary identifier, so an attribute of that name warns as unknown and
+/// `__has_attribute` answers 0, exactly as gcc for aarch64 does.
+pub fn exists_on(id: StringId, arch: crate::target::Arch) -> bool {
+    arch == crate::target::Arch::X86_64 || !has_tag(id, X86_64_ONLY)
+}
+
+/// [`exists_on`] for a spelling rather than an interned id: `__has_builtin`
+/// is asked about a name.
+pub fn spelling_exists_on(name: &str, arch: crate::target::Arch) -> bool {
+    arch == crate::target::Arch::X86_64
+        || !KEYWORD_STRINGS
+            .iter()
+            .zip(KEYWORD_TAGS.iter())
+            .any(|(s, &t)| *s == name && t & X86_64_ONLY != 0)
+}
+
+/// Is `id` an attribute c17 supports on a target of architecture `arch`?
+/// The one answer the parser's "directive ignored" warning and both
+/// `__has_attribute` evaluators give.
+pub fn attribute_supported(id: StringId, arch: crate::target::Arch) -> bool {
+    has_tag(id, SUPPORTED_ATTR) && exists_on(id, arch)
 }
 
 /// Every spelling in the table carrying any of `mask`.
@@ -1402,6 +1438,31 @@ mod tests {
             "expected at least 68 builtins, got {}",
             builtin_count
         );
+    }
+
+    /// The calling-convention attributes and the Microsoft `va_list`
+    /// builtins are gcc's on x86-64 only; elsewhere they are plain names.
+    #[test]
+    fn test_x86_64_only_names() {
+        use crate::target::Arch;
+        let table = StringTable::new();
+        for attr in ["ms_abi", "__ms_abi__", "sysv_abi", "__sysv_abi__"] {
+            let sid = id(&table, attr);
+            assert!(attribute_supported(sid, Arch::X86_64), "{attr}");
+            assert!(!attribute_supported(sid, Arch::Aarch64), "{attr}");
+        }
+        assert!(attribute_supported(id(&table, "noreturn"), Arch::Aarch64));
+        for name in [
+            "__builtin_ms_va_list",
+            "__builtin_ms_va_start",
+            "__builtin_ms_va_end",
+            "__builtin_ms_va_copy",
+        ] {
+            assert!(exists_on(id(&table, name), Arch::X86_64), "{name}");
+            assert!(!exists_on(id(&table, name), Arch::Aarch64), "{name}");
+            assert!(!spelling_exists_on(name, Arch::Aarch64), "{name}");
+        }
+        assert!(spelling_exists_on("__builtin_va_start", Arch::Aarch64));
     }
 
     #[test]

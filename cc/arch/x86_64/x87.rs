@@ -671,13 +671,27 @@ impl X86_64CodeGen {
                 Reg::R11
             }
             Loc::IncomingArg(offset) => {
-                self.push_lir(X86Inst::Lea {
-                    dst: Reg::R11,
-                    addr: MemAddr::BaseOffset {
-                        base: Reg::Rbp,
-                        offset,
-                    },
-                });
+                // The same two meanings as a stack slot, by what the
+                // parameter is: an aggregate passed by value lies in the
+                // incoming area, while a pointer parameter's slot holds the
+                // pointer -- which is how a Win64 by-reference argument past
+                // the fourth arrives.
+                let addr = MemAddr::BaseOffset {
+                    base: Reg::Rbp,
+                    offset,
+                };
+                if self.incoming_pointers.contains(&pseudo) {
+                    self.push_lir(X86Inst::Mov {
+                        size: OperandSize::B64,
+                        src: GpOperand::Mem(addr),
+                        dst: GpOperand::Reg(Reg::R11),
+                    });
+                } else {
+                    self.push_lir(X86Inst::Lea {
+                        dst: Reg::R11,
+                        addr,
+                    });
+                }
                 Reg::R11
             }
             _ => {

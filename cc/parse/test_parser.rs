@@ -7140,6 +7140,70 @@ fn test_gnu_complex_in_type_name() {
     }
 }
 
+/// `_Imaginary` is a type specifier c17 provides no type for (C17 6.7.2p2;
+/// the types are Annex G's): every use is diagnosed, and the declaration goes
+/// on as `_Complex` so nothing after it trips over the same mistake.
+///
+/// It used to be tagged only as a reserved name, so `_Imaginary double x;`
+/// was not a declaration at all: it drew implicit-int and then "keyword
+/// cannot be used as a name", neither of which names the actual problem.
+#[test]
+fn test_imaginary_is_diagnosed_and_recovers_as_complex() {
+    for decl in [
+        "_Imaginary double v;",
+        "double _Imaginary v;",
+        "_Imaginary v;",
+    ] {
+        let before = crate::diag::error_count();
+        let (d, types, _, _) = parse_decl(decl).unwrap_or_else(|e| panic!("{decl}: {e:?}"));
+        // The count is process-wide and only grows, so a concurrent test can
+        // add to it but never hide this one's error.
+        assert!(
+            crate::diag::error_count() > before,
+            "{decl}: _Imaginary was accepted without a diagnostic"
+        );
+        let typ = d.declarators[0].typ;
+        assert!(
+            types.modifiers(typ).contains(TypeModifiers::COMPLEX),
+            "{decl}: did not recover as a complex type"
+        );
+    }
+    // In a type-name (a cast, `sizeof`) it is always the specifier.
+    let before = crate::diag::error_count();
+    let (expr, types, _, _) =
+        parse_expr("sizeof(float _Imaginary)").unwrap_or_else(|e| panic!("{e:?}"));
+    assert!(crate::diag::error_count() > before);
+    let ExprKind::SizeofType(typ, _) = expr.kind else {
+        panic!("sizeof(float _Imaginary) gave {:?}", expr.kind);
+    };
+    assert_eq!(types.size_bits(typ), 64);
+}
+
+/// Where only a declarator's name can stand, `_Imaginary` is that name, as a
+/// typedef name would be: `int _Imaginary;` misuses a keyword, and must say
+/// so rather than complain that c17 lacks imaginary types.
+#[test]
+fn test_imaginary_in_name_position_is_a_keyword_misused() {
+    for src in [
+        "int _Imaginary;",
+        "int _Imaginary = 0;",
+        "int _Imaginary[2];",
+        "int _Imaginary, y;",
+        "void g(int _Imaginary);",
+        "int _Imaginary(void);",
+        "struct S { int _Imaginary : 3; };",
+    ] {
+        match parse_tu(src) {
+            Err(e) => assert!(
+                e.to_string()
+                    .contains("'_Imaginary' is a keyword and cannot be used as a name"),
+                "{src}: wrong message: {e}"
+            ),
+            Ok(_) => panic!("{src}: accepted a keyword as a name"),
+        }
+    }
+}
+
 /// `_Complex` applies to the integer types too, and doubles their size.
 ///
 /// The `COMPLEX` size multiplier reached only the floating kinds, so

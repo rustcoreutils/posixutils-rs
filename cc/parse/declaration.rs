@@ -705,6 +705,30 @@ impl<'a> Parser<'a> {
                     self.advance();
                     modifiers |= TypeModifiers::COMPLEX;
                 }
+                // After a type specifier and before what can only follow a
+                // declarator's name, it *is* the name, as a typedef name would
+                // be: `int _Imaginary;` is a keyword misused, which the
+                // declarator reports, not a type c17 lacks. A type-name has
+                // no declarator name, so there it is always the specifier.
+                crate::kw::IMAGINARY
+                    if !matches!(ctx, SpecContext::TypeName)
+                        && tally.has_type_specifier()
+                        && b";,=[():".iter().any(|&c| self.next_token_is_special(c)) =>
+                {
+                    break;
+                }
+                // Imaginary types belong to Annex G, which binds only an
+                // implementation that defines `__STDC_IEC_559_COMPLEX__`, and
+                // c17 does not; without them `_Imaginary` is no permitted type
+                // specifier (C17 6.7.2p2), which needs a diagnostic. One, and
+                // then the declaration goes on as if `_Complex` had been
+                // written, so nothing after it reports the same mistake again.
+                crate::kw::IMAGINARY => {
+                    diag::error(pos, "imaginary types are not supported");
+                    tally.complex = true;
+                    self.advance();
+                    modifiers |= TypeModifiers::COMPLEX;
+                }
                 // `_Atomic` immediately followed by `(` is the type specifier
                 // `_Atomic(type-name)` (C17 6.7.2.4p4); anywhere else it is
                 // the qualifier.

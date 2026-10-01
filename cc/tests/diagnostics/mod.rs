@@ -687,6 +687,8 @@ fn diagnostics_keywords_are_rejected_as_declarator_names() {
         "__alignof__",
         "__alignof",
         "_Static_assert",
+        // A type specifier c17 provides no type for; in the name position it
+        // is the name, not the specifier.
         "_Imaginary",
         // Statement keywords.
         "if",

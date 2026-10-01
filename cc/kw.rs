@@ -151,9 +151,11 @@ define_keywords! {
     (GNU_COMPLEX,       "__complex__",       TYPE_SPEC | TYPE_KEYWORD | RESERVED_NAME),
     (GNU_COMPLEX2,      "__complex",         TYPE_SPEC | TYPE_KEYWORD | RESERVED_NAME),
     // C99 6.4.1 reserves `_Imaginary` whether or not imaginary types are
-    // provided (Annex G makes the types optional, not the keyword), so the
-    // name is reserved here without a type behind it.
-    (_,                 "_Imaginary",        RESERVED_NAME),
+    // provided (Annex G makes the types optional, not the keyword). It is
+    // tagged as the type specifier it is, so that it starts a declaration or
+    // a type name and reaches the one diagnostic for it in the specifier
+    // loop; c17 provides no type behind it.
+    (IMAGINARY,         "_Imaginary",        TYPE_SPEC | TYPE_KEYWORD | RESERVED_NAME),
     (FLOAT16,           "_Float16",          TYPE_SPEC | TYPE_KEYWORD),
     (FLOAT32,           "_Float32",          TYPE_SPEC | TYPE_KEYWORD),
     (FLOAT64,           "_Float64",          TYPE_SPEC | TYPE_KEYWORD),
@@ -1339,6 +1341,7 @@ mod tests {
             "__thread",
             "_Static_assert",
             "static_assert",
+            "_Imaginary",
         ] {
             let table = StringTable::new();
             let sid = id(&table, s);

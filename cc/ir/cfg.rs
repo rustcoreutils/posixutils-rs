@@ -41,8 +41,48 @@
 // to simplify after lowering would reintroduce every lost copy.
 //
 
-use super::{BasicBlock, BasicBlockId, Function, Instruction, Opcode};
+use super::{BasicBlock, BasicBlockId, Function, InsnExtra, Instruction, Opcode};
 use std::collections::{HashMap, HashSet};
+
+/// Every block an [`Instruction`] can transfer control to, as an iterator of
+/// references to its slots, repeats included: the true and false targets,
+/// each switch case and the default, then the `asm goto` labels. Expanded
+/// once over a shared instruction and once (with `mut`) over a unique one,
+/// so the walk that reads the targets and the walks that rewrite them are
+/// one list.
+macro_rules! target_slots {
+    ($insn:expr $(, $m:tt)?) => {{
+        let Instruction {
+            bb_true,
+            bb_false,
+            extra,
+            ..
+        } = $insn;
+        let (cases, default, asm) = match extra {
+            Some(e) => {
+                let InsnExtra {
+                    switch_cases,
+                    switch_default,
+                    asm_data,
+                    ..
+                } = &$($m)? **e;
+                (Some(switch_cases), Some(switch_default), Some(asm_data))
+            }
+            None => (None, None, None),
+        };
+        bb_true
+            .into_iter()
+            .chain(bb_false)
+            .chain(cases.into_iter().flatten().map(|(_, _, b)| b))
+            .chain(default.into_iter().flatten())
+            .chain(
+                asm.into_iter()
+                    .flatten()
+                    .flat_map(|d| &$($m)? d.goto_labels)
+                    .map(|(b, _)| b),
+            )
+    }};
+}
 
 impl Instruction {
     /// Every block this instruction can transfer control to: a branch's and a
@@ -57,16 +97,7 @@ impl Instruction {
                 out.push(b);
             }
         };
-        self.bb_true.into_iter().for_each(&mut add);
-        self.bb_false.into_iter().for_each(&mut add);
-        self.extra()
-            .switch_cases
-            .iter()
-            .for_each(|(_, _, b)| add(*b));
-        self.extra().switch_default.into_iter().for_each(&mut add);
-        if let Some(asm) = &self.extra().asm_data {
-            asm.goto_labels.iter().for_each(|(b, _)| add(*b));
-        }
+        target_slots!(self).copied().for_each(&mut add);
         out
     }
 
@@ -76,22 +107,26 @@ impl Instruction {
     /// One pass over the instruction whatever the map holds: a switch whose
     /// thousands of edges are all being split is rewritten once, not once per
     /// edge.
+    ///
+    /// Only the control targets: a `Phi`'s predecessors name the edges *into*
+    /// its block, which no change to this block's successors moves.
     fn retarget(&mut self, map: &HashMap<BasicBlockId, BasicBlockId>) {
-        let swap = |b: &mut BasicBlockId| {
+        for b in target_slots!(self, mut) {
             if let Some(to) = map.get(b) {
                 *b = *to;
             }
-        };
-        self.bb_true.iter_mut().for_each(swap);
-        self.bb_false.iter_mut().for_each(swap);
-        let Some(extra) = self.extra.as_deref_mut() else {
-            return;
-        };
-        extra.switch_cases.iter_mut().for_each(|(_, _, b)| swap(b));
-        extra.switch_default.iter_mut().for_each(swap);
-        if let Some(asm) = &mut extra.asm_data {
-            asm.goto_labels.iter_mut().for_each(|(b, _)| swap(b));
         }
+    }
+
+    /// Rewrite every block this instruction names: each control target
+    /// [`Self::control_targets`] reads, then the predecessor of each phi
+    /// operand -- for a `PhiSource`, the block of the `Phi` it feeds.
+    ///
+    /// For copying an instruction into another block numbering, where every
+    /// block id changes; an edit to one edge wants [`Self::retarget`].
+    pub fn for_each_block_mut(&mut self, mut f: impl FnMut(&mut BasicBlockId)) {
+        target_slots!(self, mut).for_each(&mut f);
+        self.phi_list.iter_mut().for_each(|(b, _)| f(b));
     }
 }
 
@@ -790,5 +825,27 @@ mod tests {
             ids(&f)
         );
         valid(&f);
+    }
+
+    /// Retargeting moves control targets only. A phi operand's predecessor
+    /// names an edge *into* the block, so a loop's back edge -- the block
+    /// both branching to `1` and receiving from it -- keeps its phi operand
+    /// when the branch is split.
+    #[test]
+    fn retarget_moves_control_targets_and_not_phi_predecessors() {
+        let types = TypeTable::new(&Target::host());
+        let mut phi = Instruction::phi(PseudoId(9), types.int_id, 32);
+        phi.phi_list = vec![(BasicBlockId(1), PseudoId(2))];
+        let mut sw = Instruction::switch_insn(
+            PseudoId(1),
+            vec![(0, 0, BasicBlockId(1)), (1, 1, BasicBlockId(2))],
+            Some(BasicBlockId(1)),
+            32,
+        );
+        let map = std::collections::HashMap::from([(BasicBlockId(1), BasicBlockId(5))]);
+        phi.retarget(&map);
+        sw.retarget(&map);
+        assert_eq!(phi.phi_list, [(BasicBlockId(1), PseudoId(2))]);
+        assert_eq!(sw.control_targets(), [5, 2].map(BasicBlockId));
     }
 }

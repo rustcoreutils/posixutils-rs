@@ -709,298 +709,7 @@ fn clone_instruction(
         // Entry instruction: skip (caller already has its own)
         Opcode::Entry => vec![],
 
-        // Return instruction: convert to phi-source/stores + branch to continuation.
-        //
-        // For a single-value `Ret`, every cloned return path contributes to a
-        // single Phi at the continuation block whose target is the caller's
-        // `return_target`. We emit a PhiSource here in the predecessor; the
-        // matching Phi is materialized by `inline_call_site` after all blocks
-        // are cloned.
-        //
-        // An aggregate returned in registers takes neither path: the call's
-        // result slot is a local, and the returned bytes are written into it.
-        // Two-register form, both halves are stored there; address form
-        // (`returns_aggregate_address`), the bytes are copied there. The Sym
-        // itself remains single-defined (it is the local's address); the
-        // stores are side-effecting writes to memory and do not violate SSA.
-        Opcode::Ret => {
-            let mut result = Vec::new();
-
-            if let Some(ret_val) = insn.src.first() {
-                if let Some(target) = ctx.return_target {
-                    if insn.returns_two_regs() && insn.src.len() >= 2 {
-                        // Two-register struct return: store both halves to the
-                        // result local. The target is a __2reg_N local symbol;
-                        // low half goes at offset 0, high half at offset 8.
-                        let remapped_low = ctx.remap_pseudo(insn.src[0], callee_func);
-                        let remapped_high = ctx.remap_pseudo(insn.src[1], callee_func);
-
-                        // The high half is whatever is left past the first
-                        // eight bytes, which is 1..=8 of them:
-                        // `returns_reg_aggregate` admits 9..=16 bytes, so a
-                        // 12-byte struct leaves four. Stored at a hardcoded
-                        // 64 bits it overran the result local by four -- and
-                        // it disagreed with the *load* in
-                        // `emit_reg_aggregate_return`, which has always narrowed the
-                        // high half to `min(64, struct_size - 64)`.
-                        let high_bits = match insn.size.checked_sub(64) {
-                            Some(rest) if rest > 0 => rest.min(64),
-                            // Two registers means more than eight bytes, so
-                            // this is not a shape `emit_reg_aggregate_return`
-                            // produces. Keep the old width rather than emit a
-                            // store of no bits at all.
-                            _ => 64,
-                        };
-
-                        let mut store_low = Instruction::store(
-                            remapped_low,
-                            target,
-                            0,
-                            insn.typ.unwrap_or(crate::types::TypeId::INVALID),
-                            64,
-                        );
-                        store_low.pos = insn.pos;
-                        result.push(store_low);
-
-                        let mut store_high = Instruction::store(
-                            remapped_high,
-                            target,
-                            8,
-                            insn.typ.unwrap_or(crate::types::TypeId::INVALID),
-                            high_bits,
-                        );
-                        store_high.pos = insn.pos;
-                        result.push(store_high);
-                    } else if insn.returns_aggregate_address() {
-                        // The callee hands back the *address* of the
-                        // aggregate -- one SSE register holding sixteen
-                        // bytes, an x87 aggregate, an HFA -- because no pair
-                        // of general registers can carry it (see
-                        // `aggregate_ret_is_address`). A call leaves the
-                        // value in the result local and the caller reads it
-                        // from there, so the spliced return has to put the
-                        // bytes there itself.
-                        //
-                        // Asked of the `Ret`'s own classification, which is
-                        // what `returns_two_regs` just above asks and all
-                        // this pass has: it carries no `TypeTable` and cannot
-                        // classify anything itself -- and every such `Ret`
-                        // carries one: `emit_reg_aggregate_return` attaches
-                        // it to every aggregate returned in registers, a
-                        // four-`double` HFA included.
-                        //
-                        // Phi-ing the source instead handed the caller a
-                        // pointer where the value belonged:
-                        //
-                        //     %16 = symaddr.64 %11(@mk_inline0_r.2)
-                        //     %17 = phisrc.128 %16
-                        //
-                        // -- a 64-bit address as a 128-bit value. Inlining
-                        // changed the answer, and only for this shape: the
-                        // two-register return stores its halves just above,
-                        // and an aggregate of eight bytes or less never
-                        // reaches `emit_reg_aggregate_return` at all, so its `Ret`
-                        // already carries a loaded value.
-                        //
-                        // `insn.size` is the aggregate's own width, in the
-                        // 8/4/2/1 chunks every other block move in the
-                        // compiler uses, so a size that is not a multiple of
-                        // eight is copied exactly rather than rounded up past
-                        // either object. No bound is needed: a register
-                        // return is at most a four-element HFA, thirty-two
-                        // bytes. The access type stays the `Ret`'s own, as
-                        // the two-register stores above keep theirs -- this
-                        // pass has no `TypeTable` to name a qword with.
-                        let src_addr = ctx.remap_pseudo(*ret_val, callee_func);
-                        let typ = insn.typ.unwrap_or(crate::types::TypeId::INVALID);
-                        for (offset, chunk) in memexpand::block_chunks(i64::from(insn.size / 8)) {
-                            let temp = ctx.alloc_pseudo_id();
-                            ctx.ret_pseudos.push(Pseudo::undef(temp));
-                            let mut load =
-                                Instruction::load(temp, src_addr, offset, typ, chunk.bits());
-                            load.pos = insn.pos;
-                            result.push(load);
-                            let mut store =
-                                Instruction::store(temp, target, offset, typ, chunk.bits());
-                            store.pos = insn.pos;
-                            result.push(store);
-                        }
-                    } else {
-                        // Single-value return: emit PhiSource in the predecessor
-                        // and record the arm for `inline_call_site` to assemble
-                        // into a Phi at the continuation block.
-                        let remapped_val = ctx.remap_pseudo(*ret_val, callee_func);
-                        let pred_bb_in_caller = ctx
-                            .current_callee_bb
-                            .and_then(|cb| ctx.bb_map.get(&cb).copied())
-                            .expect(
-                                "clone_callee_blocks must set current_callee_bb \
-                                 before cloning a Ret",
-                            );
-                        let phisrc_target = ctx.alloc_pseudo_id();
-                        ctx.ret_pseudos
-                            .push(Pseudo::phi(phisrc_target, phisrc_target.0));
-
-                        let typ = insn.typ.unwrap_or(crate::types::TypeId::INVALID);
-                        let mut phisrc =
-                            Instruction::phi_source(phisrc_target, remapped_val, typ, insn.size);
-                        phisrc.phi_list = vec![(ctx.return_continuation_bb, target)];
-                        phisrc.pos = insn.pos;
-                        result.push(phisrc);
-
-                        ctx.ret_arms.push((pred_bb_in_caller, phisrc_target));
-                        if ctx.ret_typ.is_none() {
-                            ctx.ret_typ = insn.typ;
-                            ctx.ret_size = insn.size;
-                        }
-                    }
-                }
-            }
-
-            // Branch to continuation
-            let mut br_insn = Instruction::new(Opcode::Br);
-            br_insn.bb_true = Some(ctx.return_continuation_bb);
-            result.push(br_insn);
-
-            result
-        }
-
-        // Branch instruction: remap target
-        Opcode::Br => {
-            let mut new_insn = Instruction::new(Opcode::Br);
-            new_insn.bb_true = insn.bb_true.map(|bb| ctx.remap_bb(bb));
-            vec![new_insn]
-        }
-
-        // Conditional branch: remap both targets
-        Opcode::Cbr => {
-            let mut new_insn = Instruction::new(Opcode::Cbr);
-            new_insn.src = insn
-                .src
-                .iter()
-                .map(|s| ctx.remap_pseudo(*s, callee_func))
-                .collect();
-            new_insn.bb_true = insn.bb_true.map(|bb| ctx.remap_bb(bb));
-            new_insn.bb_false = insn.bb_false.map(|bb| ctx.remap_bb(bb));
-            vec![new_insn]
-        }
-
-        // Switch: remap value (src[0]) and all branch targets
-        Opcode::Switch => {
-            // Built fresh rather than cloned, so everything the switch needs
-            // has to be carried over by hand -- and the operation width was
-            // not. A 64-bit switch became a 32-bit compare once inlined, so
-            // `case 4294967296ul:` matched 0. Pre-existing; a `case lo ... hi`
-            // range made it visible because its subtraction exposes the top
-            // half where an equality compare on the low half often agrees by
-            // accident.
-            let mut new_insn = Instruction::new(Opcode::Switch);
-            new_insn.size = insn.size;
-            new_insn.typ = insn.typ;
-            new_insn.src = insn
-                .src
-                .iter()
-                .map(|&s| ctx.remap_pseudo(s, callee_func))
-                .collect();
-            new_insn.extra_mut().switch_cases = insn
-                .extra()
-                .switch_cases
-                .iter()
-                .map(|(lo, hi, bb)| (*lo, *hi, ctx.remap_bb(*bb)))
-                .collect();
-            new_insn.extra_mut().switch_default =
-                insn.extra().switch_default.map(|bb| ctx.remap_bb(bb));
-            vec![new_insn]
-        }
-
-        // Phi nodes: remap all sources and block references
-        Opcode::Phi => {
-            let mut new_insn = Instruction::new(Opcode::Phi);
-            new_insn.target = insn.target.map(|t| ctx.remap_pseudo(t, callee_func));
-            new_insn.typ = insn.typ;
-            new_insn.size = insn.size;
-            new_insn.phi_list = insn
-                .phi_list
-                .iter()
-                .map(|(bb, pseudo)| (ctx.remap_bb(*bb), ctx.remap_pseudo(*pseudo, callee_func)))
-                .collect();
-            vec![new_insn]
-        }
-
-        // PhiSource: remap target, src, and back-pointer
-        Opcode::PhiSource => {
-            let mut new_insn = Instruction::new(Opcode::PhiSource);
-            new_insn.target = insn.target.map(|t| ctx.remap_pseudo(t, callee_func));
-            new_insn.src = insn
-                .src
-                .iter()
-                .map(|s| ctx.remap_pseudo(*s, callee_func))
-                .collect();
-            new_insn.typ = insn.typ;
-            new_insn.size = insn.size;
-            new_insn.phi_list = insn
-                .phi_list
-                .iter()
-                .map(|(bb, pseudo)| (ctx.remap_bb(*bb), ctx.remap_pseudo(*pseudo, callee_func)))
-                .collect();
-            vec![new_insn]
-        }
-
-        // The local it names is the callee's, cloned under a new pseudo.
-        Opcode::LifetimeEnd => {
-            let mut new_insn = insn.clone();
-            new_insn.extra_mut().lifetime_of = insn
-                .extra()
-                .lifetime_of
-                .map(|l| ctx.remap_pseudo(l, callee_func));
-            vec![new_insn]
-        }
-
-        // Call instructions: remap arguments but keep function name
-        Opcode::Call => {
-            let mut new_insn = insn.clone();
-            new_insn.target = insn.target.map(|t| ctx.remap_pseudo(t, callee_func));
-            new_insn.src = insn
-                .src
-                .iter()
-                .map(|s| ctx.remap_pseudo(*s, callee_func))
-                .collect();
-            // For indirect calls, also remap the function pointer pseudo
-            new_insn.extra_mut().indirect_target = insn
-                .extra()
-                .indirect_target
-                .map(|t| ctx.remap_pseudo(t, callee_func));
-
-            // `f(a, __builtin_va_arg_pack())`: the caller's variadic
-            // arguments belong on the end, and now they are known. `src`,
-            // `arg_types` and `abi_info.params` are parallel and indexed in
-            // parallel by both backends, so all three grow together.
-            if new_insn.extra().ends_with_va_arg_pack {
-                new_insn.src.extend_from_slice(&ctx.forwarded.vals);
-                new_insn
-                    .extra_mut()
-                    .arg_types
-                    .extend_from_slice(&ctx.forwarded.types);
-                if let Some(abi) = new_insn.extra_mut().abi_info.as_mut() {
-                    abi.params.extend_from_slice(&ctx.forwarded.classes);
-                }
-                // Anything spliced in is variadic by construction: it came
-                // from past the callee's declared parameters. If the inner
-                // call had no variadic tail of its own, one starts here.
-                let fixed = new_insn.src.len() - ctx.forwarded.vals.len();
-                new_insn.extra_mut().variadic_arg_start = Some(
-                    new_insn
-                        .extra()
-                        .variadic_arg_start
-                        .unwrap_or(fixed)
-                        .min(fixed),
-                );
-                new_insn.extra_mut().ends_with_va_arg_pack = false;
-            }
-
-            // Keep func_name and other call metadata unchanged
-            vec![new_insn]
-        }
+        Opcode::Ret => clone_ret(ctx, insn, callee_func),
 
         // `__builtin_va_arg_pack_len()`: how many arguments the pack stands
         // for, which is a constant now that the call site is known.
@@ -1041,63 +750,208 @@ fn clone_instruction(
             vec![copy_insn]
         }
 
-        // All other instructions: remap target and sources
         _ => {
-            debug_assert!(
-                insn.extra().switch_cases.is_empty(),
-                "unexpected switch_cases in {:?} during inlining",
-                insn.op
-            );
-
-            let mut new_insn = insn.clone();
-
-            // Remap target
-            if let Some(target) = new_insn.target {
-                new_insn.target = Some(ctx.remap_pseudo(target, callee_func));
+            let mut new_insn = remapped(ctx, insn, callee_func);
+            if new_insn.extra().ends_with_va_arg_pack {
+                splice_va_arg_pack(ctx, &mut new_insn);
             }
-
-            // Remap sources
-            new_insn.src = new_insn
-                .src
-                .iter()
-                .map(|s| ctx.remap_pseudo(*s, callee_func))
-                .collect();
-
-            // Remap branch targets if present (shouldn't be for non-control-flow)
-            if let Some(bb) = new_insn.bb_true {
-                new_insn.bb_true = Some(ctx.remap_bb(bb));
-            }
-            if let Some(bb) = new_insn.bb_false {
-                new_insn.bb_false = Some(ctx.remap_bb(bb));
-            }
-
-            // Remap pseudos inside inline asm operands
-            if let Some(ref mut asm_data) = new_insn.extra_mut().asm_data {
-                for output in &mut asm_data.outputs {
-                    output.pseudo = ctx.remap_pseudo(output.pseudo, callee_func);
-                }
-                for input in &mut asm_data.inputs {
-                    input.pseudo = ctx.remap_pseudo(input.pseudo, callee_func);
-                    if let Some(ref mut match_idx) = input.matching_output {
-                        // matching_output is an index, not a pseudo — no remap needed
-                        let _ = match_idx;
-                    }
-                }
-                // An `asm goto` label is a *block*, and it is the callee's
-                // block. Left unremapped it named whichever caller block
-                // happened to share the id, which for a small callee is the
-                // block holding the asm itself: `asm goto("b %l[done]")`
-                // inlined into a caller branched to its own address and hung.
-                // The two branch targets above are remapped for this reason;
-                // these were missed because they live inside the operand data.
-                for (bb, _) in &mut asm_data.goto_labels {
-                    *bb = ctx.remap_bb(*bb);
-                }
-            }
-
             vec![new_insn]
         }
     }
+}
+
+/// `insn` in the caller's numbering: every pseudo and every block it names
+/// remapped, and everything else -- width, type, position, switch cases, asm
+/// operands -- as it was.
+///
+/// Copied whole and then renamed through the instruction's own slot walks,
+/// because rebuilding an instruction field by field drops whatever field the
+/// copy forgets: that is how an inlined switch once lost its operation width
+/// and an inlined `asm goto` kept the callee's label blocks.
+fn remapped(ctx: &mut InlineContext, insn: &Instruction, callee_func: &Function) -> Instruction {
+    let mut new_insn = insn.clone();
+    new_insn.for_each_pseudo_mut(|p| *p = ctx.remap_pseudo(*p, callee_func));
+    new_insn.for_each_block_mut(|b| *b = ctx.remap_bb(*b));
+    new_insn
+}
+
+/// `f(a, __builtin_va_arg_pack())`: the caller's variadic arguments belong
+/// on the end, and now they are known. `src`, `arg_types` and
+/// `abi_info.params` are parallel and indexed in parallel by both backends,
+/// so all three grow together.
+fn splice_va_arg_pack(ctx: &InlineContext, call: &mut Instruction) {
+    call.src.extend_from_slice(&ctx.forwarded.vals);
+    call.extra_mut()
+        .arg_types
+        .extend_from_slice(&ctx.forwarded.types);
+    if let Some(abi) = call.extra_mut().abi_info.as_mut() {
+        abi.params.extend_from_slice(&ctx.forwarded.classes);
+    }
+    // Anything spliced in is variadic by construction: it came from past the
+    // callee's declared parameters. If the inner call had no variadic tail of
+    // its own, one starts here.
+    let fixed = call.src.len() - ctx.forwarded.vals.len();
+    call.extra_mut().variadic_arg_start =
+        Some(call.extra().variadic_arg_start.unwrap_or(fixed).min(fixed));
+    call.extra_mut().ends_with_va_arg_pack = false;
+}
+
+/// Return instruction: convert to phi-source/stores + branch to continuation.
+///
+/// For a single-value `Ret`, every cloned return path contributes to a
+/// single Phi at the continuation block whose target is the caller's
+/// `return_target`. We emit a PhiSource here in the predecessor; the
+/// matching Phi is materialized by `inline_call_site` after all blocks
+/// are cloned.
+///
+/// An aggregate returned in registers takes neither path: the call's
+/// result slot is a local, and the returned bytes are written into it.
+/// Two-register form, both halves are stored there; address form
+/// (`returns_aggregate_address`), the bytes are copied there. The Sym
+/// itself remains single-defined (it is the local's address); the
+/// stores are side-effecting writes to memory and do not violate SSA.
+fn clone_ret(
+    ctx: &mut InlineContext,
+    insn: &Instruction,
+    callee_func: &Function,
+) -> Vec<Instruction> {
+    let mut result = Vec::new();
+
+    if let Some(ret_val) = insn.src.first() {
+        if let Some(target) = ctx.return_target {
+            if insn.returns_two_regs() && insn.src.len() >= 2 {
+                // Two-register struct return: store both halves to the
+                // result local. The target is a __2reg_N local symbol;
+                // low half goes at offset 0, high half at offset 8.
+                let remapped_low = ctx.remap_pseudo(insn.src[0], callee_func);
+                let remapped_high = ctx.remap_pseudo(insn.src[1], callee_func);
+
+                // The high half is whatever is left past the first
+                // eight bytes, which is 1..=8 of them:
+                // `returns_reg_aggregate` admits 9..=16 bytes, so a
+                // 12-byte struct leaves four. Stored at a hardcoded
+                // 64 bits it overran the result local by four -- and
+                // it disagreed with the *load* in
+                // `emit_reg_aggregate_return`, which has always narrowed the
+                // high half to `min(64, struct_size - 64)`.
+                let high_bits = match insn.size.checked_sub(64) {
+                    Some(rest) if rest > 0 => rest.min(64),
+                    // Two registers means more than eight bytes, so
+                    // this is not a shape `emit_reg_aggregate_return`
+                    // produces. Keep the old width rather than emit a
+                    // store of no bits at all.
+                    _ => 64,
+                };
+
+                let mut store_low = Instruction::store(
+                    remapped_low,
+                    target,
+                    0,
+                    insn.typ.unwrap_or(crate::types::TypeId::INVALID),
+                    64,
+                );
+                store_low.pos = insn.pos;
+                result.push(store_low);
+
+                let mut store_high = Instruction::store(
+                    remapped_high,
+                    target,
+                    8,
+                    insn.typ.unwrap_or(crate::types::TypeId::INVALID),
+                    high_bits,
+                );
+                store_high.pos = insn.pos;
+                result.push(store_high);
+            } else if insn.returns_aggregate_address() {
+                // The callee hands back the *address* of the
+                // aggregate -- one SSE register holding sixteen
+                // bytes, an x87 aggregate, an HFA -- because no pair
+                // of general registers can carry it (see
+                // `aggregate_ret_is_address`). A call leaves the
+                // value in the result local and the caller reads it
+                // from there, so the spliced return has to put the
+                // bytes there itself.
+                //
+                // Asked of the `Ret`'s own classification, which is
+                // what `returns_two_regs` just above asks and all
+                // this pass has: it carries no `TypeTable` and cannot
+                // classify anything itself -- and every such `Ret`
+                // carries one: `emit_reg_aggregate_return` attaches
+                // it to every aggregate returned in registers, a
+                // four-`double` HFA included.
+                //
+                // Phi-ing the source instead handed the caller a
+                // pointer where the value belonged:
+                //
+                //     %16 = symaddr.64 %11(@mk_inline0_r.2)
+                //     %17 = phisrc.128 %16
+                //
+                // -- a 64-bit address as a 128-bit value. Inlining
+                // changed the answer, and only for this shape: the
+                // two-register return stores its halves just above,
+                // and an aggregate of eight bytes or less never
+                // reaches `emit_reg_aggregate_return` at all, so its `Ret`
+                // already carries a loaded value.
+                //
+                // `insn.size` is the aggregate's own width, in the
+                // 8/4/2/1 chunks every other block move in the
+                // compiler uses, so a size that is not a multiple of
+                // eight is copied exactly rather than rounded up past
+                // either object. No bound is needed: a register
+                // return is at most a four-element HFA, thirty-two
+                // bytes. The access type stays the `Ret`'s own, as
+                // the two-register stores above keep theirs -- this
+                // pass has no `TypeTable` to name a qword with.
+                let src_addr = ctx.remap_pseudo(*ret_val, callee_func);
+                let typ = insn.typ.unwrap_or(crate::types::TypeId::INVALID);
+                for (offset, chunk) in memexpand::block_chunks(i64::from(insn.size / 8)) {
+                    let temp = ctx.alloc_pseudo_id();
+                    ctx.ret_pseudos.push(Pseudo::undef(temp));
+                    let mut load = Instruction::load(temp, src_addr, offset, typ, chunk.bits());
+                    load.pos = insn.pos;
+                    result.push(load);
+                    let mut store = Instruction::store(temp, target, offset, typ, chunk.bits());
+                    store.pos = insn.pos;
+                    result.push(store);
+                }
+            } else {
+                // Single-value return: emit PhiSource in the predecessor
+                // and record the arm for `inline_call_site` to assemble
+                // into a Phi at the continuation block.
+                let remapped_val = ctx.remap_pseudo(*ret_val, callee_func);
+                let pred_bb_in_caller = ctx
+                    .current_callee_bb
+                    .and_then(|cb| ctx.bb_map.get(&cb).copied())
+                    .expect(
+                        "clone_callee_blocks must set current_callee_bb \
+                         before cloning a Ret",
+                    );
+                let phisrc_target = ctx.alloc_pseudo_id();
+                ctx.ret_pseudos
+                    .push(Pseudo::phi(phisrc_target, phisrc_target.0));
+
+                let typ = insn.typ.unwrap_or(crate::types::TypeId::INVALID);
+                let mut phisrc =
+                    Instruction::phi_source(phisrc_target, remapped_val, typ, insn.size);
+                phisrc.phi_list = vec![(ctx.return_continuation_bb, target)];
+                phisrc.pos = insn.pos;
+                result.push(phisrc);
+
+                ctx.ret_arms.push((pred_bb_in_caller, phisrc_target));
+                if ctx.ret_typ.is_none() {
+                    ctx.ret_typ = insn.typ;
+                    ctx.ret_size = insn.size;
+                }
+            }
+        }
+    }
+
+    // Branch to continuation
+    let mut br_insn = Instruction::new(Opcode::Br);
+    br_insn.bb_true = Some(ctx.return_continuation_bb);
+    result.push(br_insn);
+
+    result
 }
 
 // Call Site Inlining
@@ -2676,6 +2530,103 @@ mod tests {
             BasicBlockId(1),
             "leaving the callee's id names an unrelated caller block"
         );
+    }
+
+    /// A terminator, a phi and an `asm goto` come through inlining whole:
+    /// width, type and position as they were, every pseudo and block -- the
+    /// switch's cases and default, the phi's predecessors, the asm's labels
+    /// -- in the caller's numbering.
+    #[test]
+    fn test_clone_instruction_keeps_width_position_and_labels() {
+        let types = TypeTable::new(&Target::host());
+        let mut callee = Function::new("callee", types.int_id);
+        for id in 0..4 {
+            let mut b = BasicBlock::new(BasicBlockId(id));
+            b.insns.push(Instruction::ret(None));
+            callee.add_block(b);
+        }
+        callee.add_pseudo(Pseudo::reg(PseudoId(0), 0));
+        callee.add_pseudo(Pseudo::reg(PseudoId(1), 1));
+        callee.entry = BasicBlockId(0);
+        // Caller blocks at every callee id, so a label left in the callee's
+        // numbering would name a real caller block.
+        let mut caller = Function::new("caller", types.int_id);
+        for id in 0..5 {
+            caller.add_block(BasicBlock::new(BasicBlockId(id)));
+        }
+        caller.next_pseudo = 100;
+        let mut ctx = InlineContext::new(
+            &caller,
+            &callee,
+            vec![],
+            ForwardedArgs::default(),
+            BasicBlockId(99),
+            None,
+        );
+        for bb in 0..4 {
+            let id = ctx.alloc_bb_id();
+            ctx.bb_map.insert(BasicBlockId(bb), id);
+        }
+        let pos = Some(crate::diag::Position {
+            line: 42,
+            col: 3,
+            ..Default::default()
+        });
+
+        let mut sw = Instruction::switch_insn(
+            PseudoId(0),
+            vec![
+                (0, 0, BasicBlockId(1)),
+                (4294967296, 4294967296, BasicBlockId(2)),
+            ],
+            Some(BasicBlockId(3)),
+            64,
+        );
+        sw.typ = Some(types.ulong_id);
+        let cbr = Instruction::cbr(PseudoId(0), BasicBlockId(1), BasicBlockId(2));
+        let mut phi = Instruction::phi(PseudoId(1), types.int_id, 32);
+        phi.phi_list = vec![
+            (BasicBlockId(1), PseudoId(0)),
+            (BasicBlockId(2), PseudoId(0)),
+        ];
+        let mut asm = Instruction::new(Opcode::Asm);
+        asm.extra_mut().asm_data = Some(Box::new(AsmData {
+            template: "jmp %l[out]".to_string(),
+            outputs: Vec::new(),
+            inputs: vec![crate::ir::AsmConstraint::new(
+                PseudoId(0),
+                "r",
+                Target::host().arch,
+                32,
+            )],
+            clobbers: Vec::new(),
+            goto_labels: vec![(BasicBlockId(3), "out".to_string())],
+        }));
+
+        for mut insn in [sw, cbr, phi, asm] {
+            insn.pos = pos;
+            let cloned = clone_instruction(&mut ctx, &insn, &callee);
+            assert_eq!(cloned.len(), 1, "{:?}", insn.op);
+            let new = &cloned[0];
+            let mut expected = insn.clone();
+            expected.for_each_pseudo_mut(|p| *p = ctx.pseudo_map[p]);
+            expected.for_each_block_mut(|b| *b = ctx.bb_map[b]);
+            assert_eq!(format!("{new:?}"), format!("{expected:?}"));
+            assert_eq!(
+                (new.op, new.size, new.typ, new.pos),
+                (insn.op, insn.size, insn.typ, pos),
+                "{:?} keeps its width, type and position",
+                insn.op
+            );
+            assert!(
+                new.control_targets()
+                    .iter()
+                    .chain(new.phi_list.iter().map(|(b, _)| b))
+                    .all(|b| b.0 >= 5),
+                "{:?} names only the cloned blocks: {new:?}",
+                insn.op
+            );
+        }
     }
 
     /// `void *callee(void) { lab: return &&lab; }` -- the label's block is

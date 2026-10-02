@@ -1121,6 +1121,48 @@ pub struct AsmData {
 
 // Instruction
 
+/// Every `PseudoId` slot of an [`Instruction`] that [`Instruction::mentioned`]
+/// reads, as an iterator of references: target, sources, indirect call
+/// target, phi operands, then asm outputs and inputs. Expanded once over a
+/// shared instruction and once (with `mut`) over a unique one, so the walk
+/// that reads the slots and the walk that rewrites them are one list.
+///
+/// The order is the inliner's: it allocates a caller pseudo for each callee
+/// pseudo in the order it first meets them.
+macro_rules! mention_slots {
+    ($insn:expr $(, $m:tt)?) => {{
+        let Instruction {
+            target,
+            src,
+            phi_list,
+            extra,
+            ..
+        } = $insn;
+        let (indirect, asm) = match extra {
+            Some(e) => {
+                let InsnExtra {
+                    indirect_target,
+                    asm_data,
+                    ..
+                } = &$($m)? **e;
+                (Some(indirect_target), Some(asm_data))
+            }
+            None => (None, None),
+        };
+        target
+            .into_iter()
+            .chain(src)
+            .chain(indirect.into_iter().flatten())
+            .chain(phi_list.into_iter().map(|(_, p)| p))
+            .chain(
+                asm.into_iter()
+                    .flatten()
+                    .flat_map(|d| (&$($m)? d.outputs).into_iter().chain(&$($m)? d.inputs))
+                    .map(|c| &$($m)? c.pseudo),
+            )
+    }};
+}
+
 /// An IR instruction
 #[derive(Debug, Clone)]
 pub struct Instruction {
@@ -1498,7 +1540,9 @@ impl Instruction {
     /// model reads as an escape rather than as nothing.
     ///
     /// If a field that can hold a `PseudoId` is ever added to `Instruction`,
-    /// it must be added here too, or an address escapes invisibly.
+    /// it must be added to `mention_slots`, which this walks, or an address
+    /// escapes invisibly. The one field left out is `lifetime_of`: a
+    /// lifetime marker is out of band, and is not a mention of its local.
     pub fn mentions(&self, id: PseudoId) -> bool {
         self.mentioned().any(|p| p == id)
     }
@@ -1508,19 +1552,21 @@ impl Instruction {
     /// time. For a pass that needs the answer for every symbol at once, which
     /// asking `mentions` per symbol per instruction makes quadratic.
     pub fn mentioned(&self) -> impl Iterator<Item = PseudoId> + '_ {
-        let asm = self
-            .extra()
-            .asm_data
-            .iter()
-            .flat_map(|d| d.inputs.iter().chain(d.outputs.iter()))
-            .map(|c| c.pseudo);
-        self.src
-            .iter()
-            .copied()
-            .chain(self.target)
-            .chain(self.extra().indirect_target)
-            .chain(self.phi_list.iter().map(|&(_, p)| p))
-            .chain(asm)
+        mention_slots!(self).copied()
+    }
+
+    /// Rewrite every pseudo this instruction names: each slot
+    /// [`Self::mentioned`] reads, in the same order, and then the local a
+    /// `LifetimeEnd` names.
+    ///
+    /// That last one is the only `PseudoId` field `mentioned` leaves out (see
+    /// [`Self::mentions`]), but renaming the local renames it too. Built on
+    /// the same slot walk as `mentioned`, so the two cannot drift apart.
+    pub fn for_each_pseudo_mut(&mut self, mut f: impl FnMut(&mut PseudoId)) {
+        mention_slots!(self, mut).for_each(&mut f);
+        if let Some(extra) = self.extra.as_deref_mut() {
+            extra.lifetime_of.iter_mut().for_each(f);
+        }
     }
 
     /// Every pseudo this instruction reads.
@@ -4687,5 +4733,111 @@ mod tests {
         // robust).
         let no_data = Instruction::new(Opcode::Asm);
         assert!(!no_data.is_memory_barrier());
+    }
+
+    /// An instruction of `op` with every `PseudoId` and block slot filled,
+    /// each with its own id, whether or not `op` uses the field.
+    fn every_slot_filled(op: Opcode) -> Instruction {
+        let operand =
+            |pseudo: u32| AsmConstraint::new(PseudoId(pseudo), "r", Target::host().arch, 64);
+        let mut insn = Instruction::new(op);
+        insn.target = Some(PseudoId(1));
+        insn.src = vec![PseudoId(2), PseudoId(3)];
+        insn.phi_list = vec![
+            (BasicBlockId(1), PseudoId(4)),
+            (BasicBlockId(2), PseudoId(5)),
+        ];
+        insn.bb_true = Some(BasicBlockId(3));
+        insn.bb_false = Some(BasicBlockId(4));
+        let extra = insn.extra_mut();
+        extra.indirect_target = Some(PseudoId(6));
+        extra.lifetime_of = Some(PseudoId(7));
+        extra.switch_cases = vec![(0, 0, BasicBlockId(5)), (1, 9, BasicBlockId(6))];
+        extra.switch_default = Some(BasicBlockId(7));
+        extra.asm_data = Some(Box::new(AsmData {
+            template: String::new(),
+            outputs: vec![operand(8), operand(9)],
+            inputs: vec![operand(10), operand(11)],
+            clobbers: Vec::new(),
+            goto_labels: vec![(BasicBlockId(8), "l".to_string())],
+        }));
+        insn
+    }
+
+    /// `for_each_pseudo_mut` rewrites every slot `mentioned` reads, in its
+    /// order, and then `lifetime_of` -- and nothing else: what it leaves
+    /// alone reads back unchanged.
+    #[test]
+    fn test_for_each_pseudo_mut_visits_what_mentioned_reads() {
+        for &op in Opcode::ALL {
+            let mut insn = every_slot_filled(op);
+            let mentioned: Vec<PseudoId> = insn.mentioned().collect();
+            assert_eq!(
+                mentioned,
+                [1, 2, 3, 6, 4, 5, 8, 9, 10, 11].map(PseudoId),
+                "{op:?}: target, sources, indirect target, phi operands, asm outputs then inputs"
+            );
+
+            let mut visited = Vec::new();
+            insn.for_each_pseudo_mut(|p| {
+                visited.push(*p);
+                p.0 += 100;
+            });
+            let mut expected = mentioned.clone();
+            expected.push(PseudoId(7));
+            assert_eq!(visited, expected, "{op:?}: mentioned, then lifetime_of");
+
+            let shifted: Vec<PseudoId> = mentioned.iter().map(|p| PseudoId(p.0 + 100)).collect();
+            assert_eq!(insn.mentioned().collect::<Vec<_>>(), shifted, "{op:?}");
+            assert_eq!(insn.extra().lifetime_of, Some(PseudoId(107)), "{op:?}");
+        }
+
+        // No extra box: nothing to visit there, and none is allocated.
+        let mut bare = Instruction::new(Opcode::Add);
+        bare.target = Some(PseudoId(1));
+        bare.src = vec![PseudoId(2)];
+        let mut visited = Vec::new();
+        bare.for_each_pseudo_mut(|p| visited.push(*p));
+        assert_eq!(visited, [PseudoId(1), PseudoId(2)]);
+        assert!(bare.extra.is_none());
+    }
+
+    /// `for_each_block_mut` rewrites every block slot -- the control targets
+    /// `control_targets` reads, then each phi operand's predecessor -- and
+    /// leaves the operation width, type and position alone.
+    #[test]
+    fn test_for_each_block_mut_visits_every_block_slot() {
+        for &op in Opcode::ALL {
+            let mut insn = every_slot_filled(op);
+            insn.size = 64;
+            insn.pos = Some(Position {
+                line: 7,
+                ..Default::default()
+            });
+            assert_eq!(
+                insn.control_targets(),
+                [3, 4, 5, 6, 7, 8].map(BasicBlockId),
+                "{op:?}"
+            );
+
+            let mut visited = Vec::new();
+            insn.for_each_block_mut(|b| {
+                visited.push(*b);
+                b.0 += 100;
+            });
+            assert_eq!(
+                visited,
+                [3, 4, 5, 6, 7, 8, 1, 2].map(BasicBlockId),
+                "{op:?}"
+            );
+            assert_eq!(
+                insn.control_targets(),
+                [103, 104, 105, 106, 107, 108].map(BasicBlockId),
+                "{op:?}"
+            );
+            let preds: Vec<BasicBlockId> = insn.phi_list.iter().map(|&(b, _)| b).collect();
+            assert_eq!(preds, [101, 102].map(BasicBlockId), "{op:?}");
+            assert_eq!((insn.size, insn.pos.map(|p| p.line)), (64, Some(7)));
+        }
     }
 }

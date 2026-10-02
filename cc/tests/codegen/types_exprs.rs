@@ -11,7 +11,8 @@
 //
 
 use crate::common::{
-    compile_and_run, compile_and_run_everywhere, compile_and_run_optimized, create_c_file,
+    compile_and_run, compile_and_run_everywhere, compile_and_run_optimized, compile_expect_error,
+    create_c_file,
 };
 use plib::testing::run_test_base;
 
@@ -1518,4 +1519,118 @@ int main(void)
 }
 "#;
     compile_and_run_everywhere("vla_extent_in_grouped_declarator", src);
+}
+
+/// A function designator or an array converts from the pointer it decays to
+/// (C17 6.3.2.1p3-4), so every bit of the address survives a cast to an
+/// integer, a conversion to `_Bool` sees all of it, and as a static
+/// initializer the cast is a relocation (6.6p9).
+///
+/// Typed as the function itself, the conversion read a value with no width:
+/// on x86-64 `(long)h` kept the low 32 bits of the address, `(_Bool)h` was an
+/// internal compiler error, and `long l = (long)h;` at file scope was rejected
+/// as "the value of a variable". `full` is the address read back through a
+/// `volatile` pointer, which no conversion touches.
+#[test]
+fn codegen_function_and_array_convert_from_their_address() {
+    let src = r#"
+#include <stdint.h>
+#include <stdarg.h>
+
+static long h(void) { return 7; }
+static long g(void) { return 9; }
+static int arr[4] = {1, 2, 3, 4};
+
+static long via_mem(long (*volatile *pp)(void)) { return (long)*pp; }
+static long arr_via_mem(int *volatile *pp) { return (long)*pp; }
+
+static long take_long(long x) { return x; }
+static long take_var(int n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    long v = (long)va_arg(ap, long (*)(void));
+    va_end(ap);
+    return v;
+}
+static long take_old();
+static _Bool ret_bool_h(void) { return h; }
+static _Bool ret_bool_arr(void) { return arr; }
+static _Bool take_bool(_Bool b) { return b; }
+
+static long file_scope_h = (long)h;
+static uintptr_t file_scope_u = (uintptr_t)h;
+static long file_scope_arr = (long)arr;
+static uintptr_t file_scope_str = (uintptr_t)"str";
+static _Bool file_scope_bool = (_Bool)h;
+
+int main(void) {
+    long (*volatile fp)(void) = h;
+    int *volatile ap = arr;
+    long full = via_mem(&fp);
+    long afull = arr_via_mem(&ap);
+
+    if ((long)h != full) return 1;
+    if ((unsigned long)h != (unsigned long)full) return 2;
+    if ((uintptr_t)h != (uintptr_t)full) return 3;
+    if ((int)h != (int)full) return 4;
+    if ((_Bool)h != 1) return 5;
+    if ((void *)h != (void *)full) return 6;
+    if ((char *)h != (char *)full) return 7;
+    if ((long)arr != afull) return 8;
+    if ((uintptr_t)arr != (uintptr_t)afull) return 9;
+    if (((long)h >> 32) != (full >> 32)) return 10;
+    if (take_long((long)h) != full) return 11;
+    if (take_var(1, h) != full) return 12;
+    if (take_old(h) != full) return 13;
+    if (file_scope_h != full) return 14;
+    if (file_scope_u != (uintptr_t)full) return 15;
+    if (file_scope_arr != afull) return 16;
+    if (file_scope_str == 0 || !file_scope_bool) return 17;
+    void *p = (void *)full;
+    if (!(h == (long (*)(void))p) || !((void *)h == p)) return 18;
+    volatile int c = 1;
+    if ((long)(c ? h : g) != full) return 19;
+    c = 0;
+    if ((long)(c ? h : g) == full) return 20;
+    if ((long)&*h != full || (long)*h != full) return 21;
+    if ((short)h != (short)full || (unsigned char)arr != (unsigned char)afull) return 22;
+    if ((long long)h != (long long)full) return 23;
+    _Bool b = h;
+    if (!b) return 24;
+    b = arr;
+    if (!b || !(_Bool)arr) return 25;
+    if (!ret_bool_h() || !ret_bool_arr()) return 26;
+    if (!take_bool(h) || !take_bool(arr)) return 27;
+    if (sizeof(&h) != sizeof(void *) || sizeof arr != 4 * sizeof(int)) return 28;
+    if (h() + g() != 16) return 29;
+    return 0;
+}
+static long take_old(x) long (*x)(void); { return (long)x; }
+"#;
+    compile_and_run_everywhere("fn_array_convert_from_address", src);
+}
+
+/// The x86-64 shape of the defect above, where a non-PIE link would put the
+/// function below 4 GiB and hide it: the address loaded from the GOT is the
+/// value, with no 32-bit move between.
+#[test]
+fn codegen_function_cast_to_integer_keeps_the_whole_address() {
+    use crate::codegen::asm_probe::{asm_for_with, body_of, X86_64_LINUX};
+    let src = "long h(void);\nlong a(void) { return (long)h; }\n";
+    let asm = asm_for_with("fn_cast_width", X86_64_LINUX, src, &["-O0"]);
+    let body = body_of(&asm, "a");
+    assert!(!body.contains("movl"), "{body}");
+}
+
+/// The name of an object that does not decay is its *value*, which is not a
+/// constant expression (C17 6.6p9). Deciding by the type being initialized
+/// rather than the name's own type made `int *q = p;` initialize `q` with
+/// the address of `p`.
+#[test]
+fn codegen_pointer_object_value_is_not_a_static_initializer() {
+    compile_expect_error(
+        "ptr_value_static_init",
+        "int x;\nint *p = &x;\nint *q = p;\n",
+        "is not a constant expression",
+    );
 }

@@ -1174,29 +1174,22 @@ impl<'a> Linearizer<'a> {
         from_typ: TypeId,
         to_typ: TypeId,
     ) -> PseudoId {
+        // Same type and size - no conversion needed
+        if self.types.kind(from_typ) == self.types.kind(to_typ)
+            && self.types.size_bits(from_typ) == self.types.size_bits(to_typ)
+        {
+            return val;
+        }
+
+        // An array or a function is converted as the pointer it decays to
+        // (C17 6.3.2.1p3-4), which is what its value already is: the address.
+        let from_typ = self.types.decayed_value(from_typ);
         let from_size = self.types.size_bits(from_typ);
         let to_size = self.types.size_bits(to_typ);
         let from_float = self.types.is_float(from_typ);
         let to_float = self.types.is_float(to_typ);
         let from_kind = self.types.kind(from_typ);
         let to_kind = self.types.kind(to_typ);
-
-        // Same type and size - no conversion needed
-        if from_kind == to_kind && from_size == to_size {
-            return val;
-        }
-
-        // Array to pointer conversion (decay) - no actual conversion needed
-        // The array value is already the address of the first element (64-bit)
-        if from_kind == TypeKind::Array && to_kind == TypeKind::Pointer {
-            return val;
-        }
-
-        // Function to pointer conversion (decay) - no actual conversion needed
-        // Function name decays to function pointer (64-bit address)
-        if from_kind == TypeKind::Function && to_kind == TypeKind::Pointer {
-            return val;
-        }
 
         // Pointer to pointer conversion - no actual conversion needed
         // All pointers are the same size (64-bit)
@@ -3126,7 +3119,9 @@ impl<'a> Linearizer<'a> {
     }
 
     pub(crate) fn linearize_cast(&mut self, inner_expr: &Expr, cast_type: TypeId) -> PseudoId {
-        let src_type = self.expr_type(inner_expr);
+        // The operand's value, not the designator: a function or an array is
+        // converted from the pointer it decays to.
+        let src_type = self.types.decayed_value(self.expr_type(inner_expr));
 
         // C17 6.3.1.7p2: converting a complex value to a real type keeps the
         // real part and discards the imaginary one. Falling through to the

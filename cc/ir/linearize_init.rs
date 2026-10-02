@@ -467,12 +467,17 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
 
-            // Identifier - for constant addresses (function pointers, array decay, etc.)
-            // or enum constants
+            // Identifier: an address constant when it names an array or a
+            // function, which decay to their address (C17 6.3.2.1p3-4), or an
+            // enum constant.
+            //
+            // The name's own type decides, not the type it initializes.
+            // Asking the target made `long l = (long)f;` a diagnostic, when
+            // it is as much a relocation as `long (*p)(void) = f;`, and made
+            // `int *q = p;` for a pointer object `p` initialize `q` with the
+            // address of `p` rather than reject a value read.
             ExprKind::Ident(symbol_id) => {
-                let type_kind = self.types.kind(typ);
-                // For pointer types, this is likely a function address or array decay
-                if type_kind == TypeKind::Pointer {
+                if self.types.decays(self.expr_type(expr)) {
                     let name_str = self.symbol_name(*symbol_id);
                     // Check if this is a static local variable
                     // Static locals have mangled names like "func_name.var_name.N"
@@ -807,10 +812,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // A bare identifier is an address constant only when it decays --
             // an array or a function. Anything else is an object's *value*,
             // which is not a constant expression at file scope.
-            ExprKind::Ident(_) => {
-                let kind = self.types.kind(cond.typ?);
-                matches!(kind, TypeKind::Array | TypeKind::Function).then_some(true)
-            }
+            ExprKind::Ident(_) => self.types.decays(cond.typ?).then_some(true),
             _ => None,
         }
     }

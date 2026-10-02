@@ -2513,9 +2513,10 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// or None if it can't be computed at compile time.
     /// Is this expression an *address*, whatever its type says?
     ///
-    /// A pointer or an array is one. So is a cast of one: `(unsigned long)&x`
-    /// has integer type and is still a relocation, which is how a kernel or a
-    /// linker script's C half writes an address constant.
+    /// A pointer is one, as are an array and a function, which decay to one.
+    /// So is a cast of one: `(unsigned long)&x` has integer type and is still
+    /// a relocation, which is how a kernel or a linker script's C half writes
+    /// an address constant.
     ///
     /// An object *read* is not one, however freely its address could be
     /// taken. `int v = 5; int w = v + 1;` is not a constant expression, and
@@ -2524,7 +2525,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn is_address_valued(&self, expr: &Expr) -> bool {
         if expr
             .typ
-            .is_some_and(|t| matches!(self.types.kind(t), TypeKind::Pointer | TypeKind::Array))
+            .is_some_and(|t| self.types.kind(self.types.decayed_value(t)) == TypeKind::Pointer)
         {
             return true;
         }

@@ -1929,9 +1929,10 @@ impl TypeTable {
     /// Reported as a kind plus the referenced type rather than by interning a
     /// pointer, so a caller holding the table immutably can still ask.
     fn as_assigned(&self, id: TypeId) -> (TypeKind, Option<TypeId>) {
+        if let Some(pointee) = self.decay_pointee(id) {
+            return (TypeKind::Pointer, Some(pointee));
+        }
         match self.kind(id) {
-            TypeKind::Array => (TypeKind::Pointer, self.base_type(id)),
-            TypeKind::Function => (TypeKind::Pointer, Some(id)),
             TypeKind::Pointer => (TypeKind::Pointer, self.base_type(id)),
             other => (other, None),
         }
@@ -2053,13 +2054,42 @@ impl TypeTable {
     /// converts an array to a pointer to its first element and a function to a
     /// pointer to itself. Every other type is its own.
     pub fn decayed(&mut self, typ: TypeId) -> TypeId {
+        match self.decay_pointee(typ) {
+            Some(pointee) => self.intern(Type::pointer(pointee)),
+            None => typ,
+        }
+    }
+
+    /// [`Self::decayed`] for a caller holding the table immutably, as the
+    /// linearizer does: the pointer type when it has been interned, `void *`
+    /// otherwise. Either has the kind, width and signedness of the pointer,
+    /// which is everything a conversion of the value reads.
+    ///
+    /// Typed as itself, a function has no width and an array has its whole
+    /// size, so a value converted from that type was converted from the
+    /// wrong width -- `(long)f` kept 32 bits of the address.
+    pub fn decayed_value(&self, typ: TypeId) -> TypeId {
+        match self.decay_pointee(typ) {
+            Some(pointee) => self.pointer_to(pointee),
+            None => typ,
+        }
+    }
+
+    /// Whether a value of this type is the address it decays to: an array or
+    /// a function.
+    pub fn decays(&self, typ: TypeId) -> bool {
+        self.decay_pointee(typ).is_some()
+    }
+
+    /// What an array or a function decays to a pointer *to*: the element
+    /// type, or the function type itself. `None` for a type that does not
+    /// decay. The one statement of C17 6.3.2.1p3-4 that the decays above
+    /// and assignment checking all read.
+    fn decay_pointee(&self, typ: TypeId) -> Option<TypeId> {
         match self.kind(typ) {
-            TypeKind::Array => {
-                let elem = self.base_type(typ).unwrap_or(self.char_id);
-                self.intern(Type::pointer(elem))
-            }
-            TypeKind::Function => self.intern(Type::pointer(typ)),
-            _ => typ,
+            TypeKind::Array => Some(self.base_type(typ).unwrap_or(self.char_id)),
+            TypeKind::Function => Some(typ),
+            _ => None,
         }
     }
 
@@ -3888,6 +3918,30 @@ mod tests {
         assert_eq!(params.len(), 2);
         assert_eq!(types.kind(params[0]), TypeKind::Int);
         assert_eq!(types.kind(params[1]), TypeKind::Char);
+    }
+
+    /// An array and a function decay to a pointer; the immutable lookup gives
+    /// the interned pointer when there is one and `void *` otherwise, and
+    /// either is a full-width pointer.
+    #[test]
+    fn test_decayed_value_is_an_address() {
+        let mut types = TypeTable::new(&Target::host());
+        let arr = types.intern(Type::array(types.int_id, 10));
+        let func = types.intern(Type::function(types.long_id, vec![], false, false));
+        let ptr_bits = types.size_bits(types.void_ptr_id);
+        for t in [arr, func] {
+            assert!(types.decays(t));
+            let v = types.decayed_value(t);
+            assert_eq!(types.kind(v), TypeKind::Pointer);
+            assert_eq!(types.size_bits(v), ptr_bits);
+        }
+        let int_ptr = types.decayed(arr);
+        assert_eq!(types.decayed_value(arr), int_ptr);
+        let fn_ptr = types.decayed(func);
+        assert_eq!(types.decayed_value(func), fn_ptr);
+        assert!(!types.decays(types.long_id));
+        assert_eq!(types.decayed_value(types.long_id), types.long_id);
+        assert!(!types.decays(int_ptr));
     }
 
     #[test]

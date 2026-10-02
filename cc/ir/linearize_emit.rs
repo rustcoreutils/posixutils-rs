@@ -1271,10 +1271,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         operands: (PseudoId, PseudoId),
         operand: TypeId,
     ) -> Instruction {
-        let operand = match self.types.kind(operand) {
-            TypeKind::Array | TypeKind::Function => self.types.void_ptr_id,
-            _ => operand,
-        };
+        let operand = self.types.decayed_value(operand);
         let width = self.types.size_bits(operand);
         let int = self.types.int_id;
         let result = (int, self.types.size_bits(int));

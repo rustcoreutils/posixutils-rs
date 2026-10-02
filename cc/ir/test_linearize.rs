@@ -7678,6 +7678,68 @@ fn test_asm_memory_operand_keeps_an_address_something_else_reads() {
     }
 }
 
+/// A function or an array converts from the pointer it decays to (C17
+/// 6.3.2.1p3-4), at the full width of an address. Typed as the designator, a
+/// function had no width: `(long)h` sign-extended from it, which x86 lowered
+/// as a 32-bit move, and `(_Bool)h` compared at width 0. As a static
+/// initializer, `(long)h` is a relocation, not the value of a variable.
+#[test]
+fn test_function_and_array_convert_from_their_address() {
+    let src = "long h(void);\nint arr[4];\n\
+               long fn_long(void) { return (long)h; }\n\
+               unsigned long fn_ulong(void) { return (unsigned long)h; }\n\
+               long arr_long(void) { return (long)arr; }\n\
+               _Bool fn_bool(void) { return (_Bool)h; }\n\
+               _Bool fn_bool_implicit(void) { return h; }\n\
+               int fn_int(void) { return (int)h; }\n\
+               long file_long = (long)h;\n\
+               long file_arr = (long)arr;\n";
+    for target in [
+        Target::new(Arch::X86_64, Os::Linux),
+        Target::new(Arch::Aarch64, Os::Linux),
+    ] {
+        let module = linearize_source(src, &target);
+        let insns = |f: &str| -> Vec<Instruction> {
+            let func = module.functions.iter().find(|x| x.name == f).unwrap();
+            func.blocks
+                .iter()
+                .flat_map(|bb| bb.insns.iter().cloned())
+                .collect()
+        };
+        for f in ["fn_long", "fn_ulong", "arr_long"] {
+            let body = insns(f);
+            assert!(
+                !body
+                    .iter()
+                    .any(|i| matches!(i.op, Opcode::Sext | Opcode::Zext | Opcode::Trunc)),
+                "{f}: an address converts to a 64-bit integer unchanged\n{body:?}"
+            );
+        }
+        for f in ["fn_bool", "fn_bool_implicit"] {
+            let body = insns(f);
+            let test = body
+                .iter()
+                .find(|i| i.op == Opcode::SetNe)
+                .unwrap_or_else(|| panic!("{f}: no comparison\n{body:?}"));
+            assert_eq!(test.operand_width(), 64, "{f}: {test:?}");
+        }
+        let body = insns("fn_int");
+        let trunc = body
+            .iter()
+            .find(|i| i.op == Opcode::Trunc)
+            .unwrap_or_else(|| panic!("fn_int: no truncation\n{body:?}"));
+        assert_eq!((trunc.src_size, trunc.size), (64, 32), "{trunc:?}");
+        for (global, sym) in [("file_long", "h"), ("file_arr", "arr")] {
+            let def = module.globals.iter().find(|g| g.name == global).unwrap();
+            assert!(
+                matches!(&def.init, Initializer::SymAddr(s) if s == sym),
+                "{global}: {:?}",
+                def.init
+            );
+        }
+    }
+}
+
 /// Parse `src` and linearize it for `target`.
 pub(crate) fn linearize_source(src: &str, target: &Target) -> Module {
     linearize_source_with_types(src, target).0

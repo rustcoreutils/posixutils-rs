@@ -1920,11 +1920,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         // 6.8.1p3: a label name is unique within the function it appears in.
         // Two labels of one name were silently merged into one basic block, so
         // `L: i++; if (i<2) goto L; L: return i;` looped forever.
-        for (i, (name, _, pos)) in w.labels.iter().enumerate() {
-            if w.labels[..i].iter().any(|(earlier, _, _)| earlier == name) {
-                let spelled = self.strings.get(*name).to_string();
-                crate::diag::error_args(*pos, "duplicate label '{0}'", &[&spelled]);
-            }
+        let (first_label, duplicates) = w.resolve_labels();
+        for i in duplicates {
+            let (name, _, pos) = &w.labels[i];
+            let spelled = self.strings.get(*name).to_string();
+            crate::diag::error_args(*pos, "duplicate label '{0}'", &[&spelled]);
         }
 
         // A `goto` is illegal exactly when its label sits inside a scope the
@@ -1932,10 +1932,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         for jump in &w.gotos {
             // A missing label is reported by `check_label_references` once
             // the body is lowered.
-            let Some((_, to, label_pos)) = w.labels.iter().find(|(n, _, _)| *n == jump.label)
-            else {
+            let Some(&i) = first_label.get(&jump.label) else {
                 continue;
             };
+            let (_, to, label_pos) = &w.labels[i];
             let pos = jump.pos.unwrap_or(*label_pos);
             for id in w.entered(&jump.from, to) {
                 self.report_protected_jump(&w.scopes[id], false, pos);
@@ -3800,6 +3800,23 @@ impl JumpScopeWalk {
         w
     }
 
+    /// The first label of each name, as an index into `labels`, which is the
+    /// one a `goto` reaches; and in order, every later label of a name already
+    /// seen. One lookup per label: comparing each label with the labels before
+    /// it, and each `goto` with every label, was quadratic in the labels.
+    fn resolve_labels(&self) -> (std::collections::HashMap<StringId, usize>, Vec<usize>) {
+        let mut first = std::collections::HashMap::with_capacity(self.labels.len());
+        let mut duplicates = Vec::new();
+        for (i, (name, _, _)) in self.labels.iter().enumerate() {
+            if first.contains_key(name) {
+                duplicates.push(i);
+            } else {
+                first.insert(*name, i);
+            }
+        }
+        (first, duplicates)
+    }
+
     /// The offending scopes. A variably modified scope is reported once
     /// however many `case` labels sit inside it; a statement expression once
     /// per label, as gcc does.
@@ -4485,8 +4502,9 @@ mod jump_scope_tests {
     /// Whether any `goto` in `src` enters a statement expression.
     fn goto_enters_stmt_expr(src: &str) -> bool {
         let w = walk_of(src);
+        let (first, _) = w.resolve_labels();
         w.gotos.iter().any(|jump| {
-            let (_, to, _) = w.labels.iter().find(|l| l.0 == jump.label).unwrap();
+            let (_, to, _) = &w.labels[first[&jump.label]];
             w.entered(&jump.from, to)
                 .iter()
                 .any(|id| matches!(w.scopes[*id], JumpScope::StmtExpr))
@@ -4543,6 +4561,21 @@ mod jump_scope_tests {
         assert_eq!(w.stray_jumps.len(), 1);
         let w = walk_of("int f(int x) { for (;;) { x = ({ if (x) break; x; }); } return x; }");
         assert!(w.stray_jumps.is_empty());
+    }
+
+    /// A `goto` reaches the first label of its name; every later one is a
+    /// duplicate, each reported, a label in a statement expression included.
+    #[test]
+    fn labels_resolve_to_the_first_of_each_name() {
+        let w = walk_of(
+            "int f(int x) { A: x++; B: x++; A: x++; ({ B: x; }); A: goto B; C: return x; }",
+        );
+        let (first, duplicates) = w.resolve_labels();
+        let mut firsts: Vec<usize> = first.values().copied().collect();
+        firsts.sort_unstable();
+        assert_eq!(firsts, [0, 1, 5]);
+        assert_eq!(duplicates, [2, 3, 4]);
+        assert_eq!(first[&w.gotos[0].label], 1);
     }
 }
 

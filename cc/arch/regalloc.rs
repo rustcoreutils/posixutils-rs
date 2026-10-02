@@ -237,42 +237,59 @@ impl<R> ConstraintPoint<R> {
 /// inside its live range clobbers them -- unless `exempt` says the interval
 /// is one the point may clobber, which is where the backends differ.
 ///
-/// A sweep over both lists in position order, so each point visits only the
-/// intervals live across it. Pairing every point with every interval made a
-/// function of a few thousand branches (`compile/20001226-1`) spend minutes
-/// here on both targets.
+/// An exemption belongs to an operand of the point, so `exempt` is asked only
+/// about points whose `involved_pseudos` name the interval's pseudo; both
+/// backends' rules already require that.
+///
+/// Each register is looked up once per interval: the points clobbering it
+/// inside the interval are counted by binary search over their positions, and
+/// the register is forbidden unless every one of them excuses the interval.
+/// The work is intervals x registers, not intervals x points. Visiting every
+/// point an interval spans was quadratic for a function with many labels and
+/// gotos, whose merged live ranges each span most of the function.
 pub fn constraint_clobbers<R: Copy + Ord>(
     constraint_points: &[ConstraintPoint<R>],
     intervals: &[LiveInterval],
     candidates: &std::collections::BTreeSet<PseudoId>,
     exempt: impl Fn(&ConstraintPoint<R>, &LiveInterval) -> bool,
 ) -> BTreeMap<PseudoId, std::collections::BTreeSet<R>> {
-    let mut points: Vec<&ConstraintPoint<R>> = constraint_points.iter().collect();
-    points.sort_by_key(|cp| cp.position);
-    let mut pending: Vec<&LiveInterval> = intervals
-        .iter()
-        .filter(|i| candidates.contains(&i.pseudo))
-        .collect();
-    pending.sort_by_key(|i| i.start);
+    // Positions of the points clobbering each register, one per point.
+    let mut clobbered_at: BTreeMap<R, Vec<usize>> = BTreeMap::new();
+    // The points each pseudo is an operand of, one entry per point.
+    let mut operand_of: HashMap<PseudoId, Vec<&ConstraintPoint<R>>> = HashMap::new();
+    for cp in constraint_points {
+        let regs: std::collections::BTreeSet<R> = cp.clobbers.iter().copied().collect();
+        for r in regs {
+            clobbered_at.entry(r).or_default().push(cp.position);
+        }
+        let operands: std::collections::BTreeSet<PseudoId> =
+            cp.involved_pseudos.iter().copied().collect();
+        for p in operands {
+            operand_of.entry(p).or_default().push(cp);
+        }
+    }
+    for positions in clobbered_at.values_mut() {
+        positions.sort_unstable();
+    }
 
     let mut forbidden: BTreeMap<PseudoId, std::collections::BTreeSet<R>> = BTreeMap::new();
-    let mut next = 0;
-    let mut live: Vec<&LiveInterval> = Vec::new();
-    for cp in points {
-        // Intervals are live across the point when start <= position <= end.
-        while next < pending.len() && pending[next].start <= cp.position {
-            live.push(pending[next]);
-            next += 1;
-        }
-        live.retain(|i| i.end >= cp.position);
-        for interval in &live {
-            if exempt(cp, interval) {
-                continue;
+    for interval in intervals.iter().filter(|i| candidates.contains(&i.pseudo)) {
+        // A point is inside the interval when start <= position <= end.
+        let excused: Vec<&ConstraintPoint<R>> = operand_of
+            .get(&interval.pseudo)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|cp| interval.start <= cp.position && cp.position <= interval.end)
+            .filter(|cp| exempt(cp, interval))
+            .collect();
+        for (&r, positions) in &clobbered_at {
+            let inside = positions.partition_point(|&q| q <= interval.end)
+                - positions.partition_point(|&q| q < interval.start);
+            let excused_here = excused.iter().filter(|cp| cp.clobbers.contains(&r)).count();
+            if inside > excused_here {
+                forbidden.entry(interval.pseudo).or_default().insert(r);
             }
-            forbidden
-                .entry(interval.pseudo)
-                .or_default()
-                .extend(cp.clobbers.iter().copied());
         }
     }
     forbidden
@@ -2002,5 +2019,101 @@ mod tests {
         let expect: BTreeMap<PseudoId, std::collections::BTreeSet<u8>> =
             [(PseudoId(1), [1u8].into()), (PseudoId(2), [1u8].into())].into();
         assert_eq!(forbidden, expect);
+    }
+
+    /// The answer of pairing every point with every interval it lies in.
+    fn clobbers_by_pairing(
+        points: &[ConstraintPoint<u8>],
+        intervals: &[LiveInterval],
+        candidates: &std::collections::BTreeSet<PseudoId>,
+        exempt: impl Fn(&ConstraintPoint<u8>, &LiveInterval) -> bool,
+    ) -> BTreeMap<PseudoId, std::collections::BTreeSet<u8>> {
+        let mut forbidden: BTreeMap<PseudoId, std::collections::BTreeSet<u8>> = BTreeMap::new();
+        for cp in points {
+            for i in intervals.iter().filter(|i| candidates.contains(&i.pseudo)) {
+                if i.start <= cp.position && cp.position <= i.end && !exempt(cp, i) {
+                    forbidden
+                        .entry(i.pseudo)
+                        .or_default()
+                        .extend(cp.clobbers.iter().copied());
+                }
+            }
+        }
+        forbidden.retain(|_, regs| !regs.is_empty());
+        forbidden
+    }
+
+    /// Agrees with pairing on overlapping intervals, a pseudo with two
+    /// intervals, points clobbering one register twice or none, points that
+    /// name an operand twice, and both backends' exemption rules.
+    #[test]
+    fn test_constraint_clobbers_matches_pairing() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % bound as u64) as usize
+        };
+        for _ in 0..200 {
+            let intervals: Vec<LiveInterval> = (0..12)
+                .map(|_| {
+                    let start = next(60);
+                    interval(next(8) as u32, start, start + next(30))
+                })
+                .collect();
+            let points: Vec<ConstraintPoint<u8>> = (0..10)
+                .map(|_| ConstraintPoint {
+                    position: next(90),
+                    clobbers: (0..next(4)).map(|_| next(5) as u8).collect(),
+                    involved_pseudos: (0..next(3)).map(|_| PseudoId(next(8) as u32)).collect(),
+                })
+                .collect();
+            let candidates: std::collections::BTreeSet<PseudoId> =
+                (0..8).filter(|p| p % 3 != 2).map(PseudoId).collect();
+            let operand = |cp: &ConstraintPoint<u8>, i: &LiveInterval| {
+                cp.involved_pseudos.contains(&i.pseudo)
+            };
+            let survives = |cp: &ConstraintPoint<u8>, i: &LiveInterval| {
+                cp.operand_survives(i.pseudo, i.start, i.end)
+            };
+            assert_eq!(
+                constraint_clobbers(&points, &intervals, &candidates, operand),
+                clobbers_by_pairing(&points, &intervals, &candidates, operand)
+            );
+            assert_eq!(
+                constraint_clobbers(&points, &intervals, &candidates, survives),
+                clobbers_by_pairing(&points, &intervals, &candidates, survives)
+            );
+        }
+    }
+
+    /// The work does not grow with intervals x points. Every interval spans
+    /// every point, as the merged live ranges of a function full of gotos do,
+    /// and the exemption rule is asked only about the points each pseudo is an
+    /// operand of: one per interval here, where pairing asked about all of
+    /// them.
+    #[test]
+    fn test_constraint_clobbers_work_is_not_pairwise() {
+        const N: usize = 4000;
+        let intervals: Vec<LiveInterval> = (0..N).map(|p| interval(p as u32, 0, 2 * N)).collect();
+        let points: Vec<ConstraintPoint<u8>> = (0..N)
+            .map(|p| ConstraintPoint {
+                position: 2 * p + 1,
+                clobbers: vec![(p % 3) as u8],
+                involved_pseudos: vec![PseudoId(p as u32)],
+            })
+            .collect();
+        let candidates: std::collections::BTreeSet<PseudoId> =
+            (0..N as u32).map(PseudoId).collect();
+        let asked = std::cell::Cell::new(0usize);
+        let forbidden = constraint_clobbers(&points, &intervals, &candidates, |cp, i| {
+            asked.set(asked.get() + 1);
+            cp.involved_pseudos.contains(&i.pseudo)
+        });
+        assert_eq!(asked.get(), N);
+        // Every pseudo still meets the other points clobbering each register.
+        assert!(forbidden.values().all(|regs| regs.len() == 3));
+        assert_eq!(forbidden.len(), N);
     }
 }

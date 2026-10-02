@@ -33,7 +33,7 @@
 //
 
 use crate::codegen::asm_probe::{asm_for_with, body_of, AARCH64_LINUX, X86_64_LINUX};
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_and_run_everywhere};
 
 /// How many instructions the body of `func` has.
 fn body_insns(asm: &str, func: &str) -> usize {
@@ -260,4 +260,106 @@ int main(void)
 }
 "#;
     assert_eq!(compile_and_run("block_moved_params", code, &[]), 0);
+}
+
+/// A zero-sized aggregate -- GNU's `struct {}`, or `struct { int a[0]; }` --
+/// moves no bytes however it is read: by name, through `*p`, `s.m`, `a[i]`,
+/// a compound literal, a conditional, a statement expression, a call's
+/// result, or as an argument.
+///
+/// Read as an rvalue, it was "loaded" at zero bits wherever the reading site
+/// spelled the by-address rule as `size > 64`, and the store of that value
+/// was lowered as one byte -- over the member that follows it. The members
+/// around it here are the guards.
+#[test]
+fn codegen_a_zero_sized_aggregate_moves_no_bytes() {
+    let code = r#"
+#include <stdarg.h>
+
+struct E {};
+struct Z { int a[0]; };
+struct W { char lo; struct E e; char mid; struct Z z; char hi; };
+
+struct E ge1, ge2, garr[4];
+static struct E gs;
+
+__attribute__((noinline)) struct E ret_e(void) { struct E e; return e; }
+__attribute__((noinline)) struct Z ret_z(void) { struct Z z; return z; }
+__attribute__((noinline)) struct E pass_e(struct E e) { return e; }
+__attribute__((noinline)) int take(int a, struct E e, int b, struct Z z, int c)
+{ (void)e; (void)z; return a * 100 + b * 10 + c; }
+__attribute__((noinline)) int va_take(int n, ...)
+{
+    va_list ap;
+    va_start(ap, n);
+    int a = va_arg(ap, int);
+    struct E e = va_arg(ap, struct E);
+    int b = va_arg(ap, int);
+    va_end(ap);
+    (void)e;
+    return n * 100 + a * 10 + b;
+}
+
+static int intact(const struct W *w)
+{ return w->lo == 0x11 && w->mid == 0x22 && w->hi == 0x33; }
+
+int main(int argc, char **argv)
+{
+    (void)argv;
+    int c = argc > 0, i = argc;
+    struct E a, b, arr[3];
+    struct Z za, zarr[3];
+    struct W w = {0x11, {}, 0x22, {}, 0x33};
+    struct W *pw = &w;
+    struct E *p = &a;
+    static struct E sl;
+
+    w.e = a;                              if (!intact(&w)) return 1;
+    w.e = *p;                             if (!intact(&w)) return 2;
+    w.e = arr[i];                         if (!intact(&w)) return 3;
+    w.e = c ? a : b;                      if (!intact(&w)) return 4;
+    w.e = (struct E){};                   if (!intact(&w)) return 5;
+    w.e = ({ struct E t; t; });           if (!intact(&w)) return 6;
+    w.e = ret_e();                        if (!intact(&w)) return 7;
+    w.e = pass_e(w.e);                    if (!intact(&w)) return 8;
+    w.e = ge1;                            if (!intact(&w)) return 9;
+    w.e = gs;                             if (!intact(&w)) return 10;
+    w.e = garr[i];                        if (!intact(&w)) return 11;
+    w.e = sl;                             if (!intact(&w)) return 12;
+    pw->e = pw->e;                        if (!intact(&w)) return 13;
+    w.z = za;                             if (!intact(&w)) return 14;
+    w.z = zarr[i];                        if (!intact(&w)) return 15;
+    w.z = ret_z();                        if (!intact(&w)) return 16;
+    w.z = *&pw->z;                        if (!intact(&w)) return 17;
+
+    struct E x = w.e, y = *p, z = arr[i];
+    (void)x; (void)y; (void)z;
+    arr[i] = w.e; *p = pw->e; ge1 = ge2; gs = garr[i]; sl = a;
+    if (!intact(&w)) return 18;
+
+    if (take(1, w.e, 2, w.z, 3) != 123) return 19;
+    if (take(4, ret_e(), 5, ret_z(), 6) != 456) return 20;
+    if (take(7, c ? a : b, 8, zarr[i], 9) != 789) return 21;
+    if (va_take(1, 2, w.e, 3) != 123) return 22;
+    if (!intact(&w)) return 23;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("zero_sized_aggregate", code);
+}
+
+/// A zero-sized parameter arrives in nothing, so the prologue stores nothing
+/// for it -- it stored a byte of whatever the register held.
+#[test]
+fn codegen_a_zero_sized_parameter_stores_nothing() {
+    let src = "\
+struct E {};
+__attribute__((noinline)) int probe(struct E a, struct E b) { (void)a; (void)b; return 7; }
+";
+    let asm = asm_for_with("zero_sized_param", X86_64_LINUX, src, &["-O0"]);
+    let body = body_of(&asm, "probe");
+    assert!(
+        !body.contains("movb"),
+        "a zero-sized parameter has no byte to store:\n{body}"
+    );
 }

@@ -10390,3 +10390,101 @@ fn test_bit_counts_record_their_operand() {
         assert!(insn.src_typ.is_some(), "{:?}", insn.op);
     }
 }
+
+/// Parse `src` for `target` and answer, for each named file-scope object,
+/// whether [`Linearizer::object_reads_as_address`] and
+/// [`Linearizer::aggregate_travels_by_value`] say so of its type.
+fn read_object_decisions(src: &str, target: &Target, names: &[&str]) -> Vec<(bool, bool)> {
+    let mut strings = StringTable::new();
+    let mut tokenizer = crate::token::lexer::Tokenizer::new(src.as_bytes(), 0, &mut strings);
+    let tokens = tokenizer.tokenize();
+    let mut symbols = crate::symbol::SymbolTable::new();
+    let mut types = TypeTable::new(target);
+    {
+        let mut parser =
+            crate::parse::Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
+        parser.parse_translation_unit().expect("parse");
+    }
+    let linearizer = Linearizer::new(&symbols, &types, &strings, target);
+    names
+        .iter()
+        .map(|name| {
+            let id = strings.lookup(name).expect("name interned");
+            let typ = symbols
+                .lookup(id, crate::symbol::Namespace::Ordinary)
+                .expect("declared")
+                .typ;
+            (
+                linearizer.object_reads_as_address(typ),
+                linearizer.aggregate_travels_by_value(typ),
+            )
+        })
+        .collect()
+}
+
+/// The one rule for reading an object as an rvalue: an array, a function
+/// designator and an array-typed `va_list` yield their address; a struct or
+/// union travels as its value only when it has between one and 64 bits, so a
+/// zero-sized one is used by address exactly like a wide one.
+#[test]
+fn test_read_object_decides_address_or_value() {
+    let src = "struct E {}; struct Z { int a[0]; };\n\
+               struct S4 { int a; }; struct S16 { long a, b; };\n\
+               union U8 { long l; char c; }; union U0 {};\n\
+               int i; double d; int *p; int arr[3]; int fn(void);\n\
+               __builtin_va_list ap;\n\
+               struct E e; struct Z z; struct S4 s4; struct S16 s16;\n\
+               union U8 u8; union U0 u0;\n";
+    let names = [
+        "i", "d", "p", "arr", "fn", "ap", "e", "z", "s4", "s16", "u8", "u0",
+    ];
+    let expect = [
+        (false, false), // i
+        (false, false), // d
+        (false, false), // p
+        (true, false),  // arr
+        (true, false),  // fn
+        (true, false),  // ap: an array on x86-64
+        (true, false),  // e: zero-sized
+        (true, false),  // z: zero-sized
+        (false, true),  // s4
+        (true, false),  // s16
+        (false, true),  // u8
+        (true, false),  // u0: zero-sized
+    ];
+    let got = read_object_decisions(src, &Target::new(Arch::X86_64, Os::Linux), &names);
+    for ((name, want), have) in names.iter().zip(expect).zip(got) {
+        assert_eq!(have, want, "{name}: (reads as address, travels by value)");
+    }
+
+    // Where `va_list` is itself a pointer it is read like one.
+    let got = read_object_decisions(
+        "__builtin_va_list ap;\n",
+        &Target::new(Arch::Aarch64, Os::MacOS),
+        &["ap"],
+    );
+    assert_eq!(got, [(false, false)], "a pointer va_list is loaded");
+}
+
+/// No access to a zero-sized object moves any bits: every load and store in
+/// these functions is of a non-zero width. A zero-sized read through `*p`,
+/// `s.m`, `a[i]`, a name or a compound literal was a zero-bit load whose
+/// store the back end performed as a byte, over the following member.
+#[test]
+fn test_zero_sized_aggregate_is_never_loaded_or_stored() {
+    let src = "struct E {};\n\
+               struct W { char lo; struct E e; char hi; };\n\
+               struct E g; struct E garr[2];\n\
+               void f(struct W *w, struct E *p, int i, int c, struct E a) {\n\
+                 struct E l = *p, arr[2];\n\
+                 w->e = *p; w->e = l; w->e = arr[i]; w->e = g; w->e = garr[i];\n\
+                 w->e = (struct E){}; w->e = c ? a : l; l = w->e; arr[i] = w->e;\n\
+               }\n";
+    let module = linearize_source(src, &Target::new(Arch::X86_64, Os::Linux));
+    let func = module.functions.iter().find(|f| f.name == "f").expect("f");
+    for insn in func.blocks.iter().flat_map(|bb| bb.insns.iter()) {
+        if matches!(insn.op, Opcode::Load | Opcode::Store) {
+            assert!(insn.size > 0, "a zero-width access: {insn:?}");
+        }
+    }
+}

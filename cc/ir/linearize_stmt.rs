@@ -613,14 +613,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                 } else if self.types.is_complex(typ) {
                     self.store_complex_at(sym_id, 0, typ, init);
                 } else {
-                    // Check for large struct/union initialization (> 64 bits)
-                    // linearize_expr returns an address for large aggregates
+                    // An aggregate that does not travel by value: the
+                    // initializer yields its address, and it is block-copied
+                    // -- by nothing at all when it is zero-sized.
                     let type_kind = self.types.kind(typ);
-                    let type_size = self.types.size_bits(typ);
-                    if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union)
-                        && type_size > 64
+                    if matches!(type_kind, TypeKind::Struct | TypeKind::Union)
+                        && !self.aggregate_travels_by_value(typ)
                     {
-                        // Large struct/union init - source is an address, do block copy
                         let value_addr = self.linearize_expr(init);
                         let type_size_bytes = self.types.size_bytes(typ);
 

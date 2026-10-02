@@ -99,6 +99,17 @@ pub(crate) struct LocalVarInfo {
     pub(crate) storage: Storage,
 }
 
+/// Where an object an expression designates lives, for
+/// [`Linearizer::read_object`].
+#[derive(Clone, Copy)]
+pub(crate) enum ObjectPlace {
+    /// A symbol's own storage: a local's slot, a static, a global, a
+    /// compound literal.
+    Sym(PseudoId),
+    /// `offset` bytes past an address computed at run time.
+    At(PseudoId, i64),
+}
+
 /// Where a local's object lives relative to its stack slot.
 #[derive(Clone, Copy)]
 pub(crate) enum Storage {
@@ -1552,10 +1563,11 @@ impl<'a> Linearizer<'a> {
                     src: false,
                 };
                 self.emit_block_copy(local_sym, arg_pseudo, typ_bytes, vol);
-            } else {
+            } else if typ_bytes > 0 {
                 // Small struct: arg_pseudo contains the value directly. A
                 // complex value passed that way (Win64) is its bits, stored
-                // as the integer they are.
+                // as the integer they are. A zero-sized one arrives in
+                // nothing (`ArgClass::Ignore`) and has nothing to store.
                 let as_typ = if self.types.is_complex(typ) {
                     self.bits_type(typ_bytes as usize).unwrap_or(typ)
                 } else {
@@ -2692,11 +2704,61 @@ impl<'a> Linearizer<'a> {
 
     /// Whether a struct or union of this type travels in the IR as its value
     /// rather than its address: it does when it fits in one register, the
-    /// threshold `linearize_ident` applies. A complex value always travels by
-    /// address, and is not asked about here.
+    /// threshold [`Self::read_object`] applies. A complex value always
+    /// travels by address, and is not asked about here.
+    ///
+    /// A zero-sized one -- GNU's `struct {}`, or `struct { int a[0]; }` --
+    /// does not: it has no bits to carry, and loading "nothing" from it was
+    /// lowered as a one-byte access that stored over its neighbour.
     pub(crate) fn aggregate_travels_by_value(&self, typ: TypeId) -> bool {
         matches!(self.types.kind(typ), TypeKind::Struct | TypeKind::Union)
             && (1..=64).contains(&self.types.size_bits(typ))
+    }
+
+    /// Whether an object of type `typ`, read as an rvalue, yields its
+    /// address rather than its value: an array or a `va_list` that is one
+    /// decays (C17 6.3.2.1p3, 7.16p3), a function designator converts to a
+    /// pointer (6.3.2.1p4), and an aggregate that does not travel by value
+    /// ([`Self::aggregate_travels_by_value`]) is used where it lies.
+    pub(crate) fn object_reads_as_address(&self, typ: TypeId) -> bool {
+        match self.types.kind(typ) {
+            TypeKind::Array | TypeKind::Function => true,
+            TypeKind::VaList => !self.types.va_list_is_pointer(),
+            TypeKind::Struct | TypeKind::Union => !self.aggregate_travels_by_value(typ),
+            _ => false,
+        }
+    }
+
+    /// Read the object of type `typ` at `place` as an rvalue: its address
+    /// when [`Self::object_reads_as_address`] says so, else its value. Every
+    /// expression that designates an object -- a name, `*p`, `s.m`, `a[i]`,
+    /// a compound literal -- reads it here, so they cannot disagree about
+    /// which objects travel by address.
+    pub(crate) fn read_object(&mut self, place: ObjectPlace, typ: TypeId) -> PseudoId {
+        if self.object_reads_as_address(typ) {
+            return match place {
+                ObjectPlace::Sym(sym) => {
+                    // An array's address is its first element's (6.3.2.1p3).
+                    let pointee = match self.types.kind(typ) {
+                        TypeKind::Array => self.types.base_type(typ).unwrap_or(self.types.int_id),
+                        _ => typ,
+                    };
+                    let result = self.alloc_reg_pseudo();
+                    let ptr_type = self.types.pointer_to(pointee);
+                    self.emit(Instruction::sym_addr(result, sym, ptr_type));
+                    result
+                }
+                ObjectPlace::At(base, offset) => self.offset_address(base, offset),
+            };
+        }
+        let (base, offset) = match place {
+            ObjectPlace::Sym(sym) => (sym, 0),
+            ObjectPlace::At(base, offset) => (base, offset),
+        };
+        let result = self.alloc_reg_pseudo();
+        let size = self.types.size_bits(typ);
+        self.emit(Instruction::load(result, base, offset, typ, size));
+        result
     }
 
     /// Linearize an expression as an lvalue (get its address)
@@ -3229,11 +3291,11 @@ impl<'a> Linearizer<'a> {
     /// [`Self::mark_volatile_access`] sees the qualifier -- the type
     /// `find_member` answers with is the member's *declared* one and cannot
     /// carry it, which is why a member of a `volatile` struct read as an
-    /// ordinary `int` and DCE deleted the load from `-O1` up. Its width, sign
-    /// and kind still come from the member, so the two disagreeing (only
-    /// reachable once the parser has already reported an unknown member)
-    /// cannot change how the access is performed. It also stands in for the
-    /// member type entirely when the lookup fails here.
+    /// ordinary `int` and DCE deleted the load from `-O1` up. It differs from
+    /// the member's type only in qualifiers, so its width, sign and kind are
+    /// the member's; the two disagree otherwise only once the parser has
+    /// already reported an unknown member. It also stands in for the member
+    /// type entirely when the lookup fails here.
     pub(crate) fn emit_member_access(
         &mut self,
         base: PseudoId,
@@ -3246,30 +3308,10 @@ impl<'a> Linearizer<'a> {
             .find_member(struct_type, member)
             .unwrap_or_else(|| MemberInfo::standing_in(access_typ));
 
-        // If member type is an array, return the address (arrays decay to pointers)
-        if self.types.kind(member_info.typ) == TypeKind::Array {
-            self.offset_address(base, member_info.offset as i64)
-        } else if let Some(bf) = member_info.bitfield() {
-            self.emit_bitfield_load(base, bf, access_typ)
-        } else {
-            let size = self.types.size_bits(member_info.typ);
-            let member_kind = self.types.kind(member_info.typ);
-
-            // Large structs (size > 64) can't be loaded into registers - return address
-            if (member_kind == TypeKind::Struct || member_kind == TypeKind::Union) && size > 64 {
-                self.offset_address(base, member_info.offset as i64)
-            } else {
-                let result = self.alloc_pseudo();
-                self.emit(Instruction::load(
-                    result,
-                    base,
-                    member_info.offset as i64,
-                    access_typ,
-                    size,
-                ));
-                result
-            }
+        if let Some(bf) = member_info.bitfield() {
+            return self.emit_bitfield_load(base, bf, access_typ);
         }
+        self.read_object(ObjectPlace::At(base, member_info.offset as i64), access_typ)
     }
 
     /// Bytes that one step of `ptr_expr` spans, as a run-time value.
@@ -3731,22 +3773,7 @@ impl<'a> Linearizer<'a> {
             64,
         ));
 
-        // If element type is an array, just return the address (arrays decay to pointers)
-        let elem_kind = self.types.kind(elem_type);
-        if elem_kind == TypeKind::Array {
-            addr
-        } else {
-            let size = self.types.size_bits(elem_type);
-            // Large structs/unions (> 64 bits) can't be loaded into registers - return address
-            // Assignment will handle the actual copy via emit_assign's large struct handling
-            if (elem_kind == TypeKind::Struct || elem_kind == TypeKind::Union) && size > 64 {
-                addr
-            } else {
-                let result = self.alloc_pseudo();
-                self.emit(Instruction::load(result, addr, 0, elem_type, size));
-                result
-            }
-        }
+        self.read_object(ObjectPlace::At(addr, 0), elem_type)
     }
 
     /// Storage for a call returning `typ` through the hidden pointer, and
@@ -3919,7 +3946,6 @@ impl<'a> Linearizer<'a> {
         // Complex types: allocate local storage for result (needs stack for 16-byte value)
         // Two-register structs (9-16 bytes): allocate local storage, codegen stores two regs
         let typ_kind = self.types.kind(typ);
-        let struct_size_bits = self.types.size_bits(typ);
         let returns_large_struct = self.returns_via_hidden_pointer(typ, conv);
         // An aggregate that comes back in registers still needs somewhere to
         // land, and the backend writes the registers into this local. There is
@@ -3945,15 +3971,13 @@ impl<'a> Linearizer<'a> {
             // Complex values are 16 bytes and need stack storage
             let local_sym = self.frame_temp("__cret", typ);
             (local_sym, Vec::new(), Vec::new())
-        } else if (typ_kind == TypeKind::Struct || typ_kind == TypeKind::Union)
-            && struct_size_bits > 0
-            && struct_size_bits <= 64
-        {
-            // Small struct/union returns (<=64 bits, single register):
-            // Allocate local storage so the result has a stable address.
-            // The codegen stores RAX (or XMM0) to this location.
-            // Without this, the result pseudo holds a raw value which
-            // emit_assign's block_copy would incorrectly dereference as a pointer.
+        } else if matches!(typ_kind, TypeKind::Struct | TypeKind::Union) {
+            // Every other struct/union return -- one register's worth, or a
+            // zero-sized one, which comes back in nothing: allocate local
+            // storage so the result has a stable address. The codegen
+            // stores RAX (or XMM0) to this location. Without this, the
+            // result pseudo holds a raw value which emit_assign's block_copy
+            // would incorrectly dereference as a pointer.
             let local_sym = self.frame_temp("__sret1", typ);
             (local_sym, Vec::new(), Vec::new())
         } else {
@@ -5063,76 +5087,32 @@ impl<'a> Linearizer<'a> {
             if local.sym.0 == u32::MAX {
                 // Static local - look up the global name and treat as global
                 let key = format!("{}.{}", self.current_func_name, name_str);
-                if let Some(static_info) = self.static_locals.get(&key).cloned() {
-                    let sym_id = self.alloc_pseudo();
-                    let pseudo = Pseudo::sym(sym_id, static_info.global_name);
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(pseudo);
-                    }
-                    let typ = static_info.typ;
-                    let type_kind = self.types.kind(typ);
-                    let size = self.types.size_bits(typ);
-                    // Arrays decay to pointers - get address, not value
-                    if type_kind == TypeKind::Array {
-                        let result = self.alloc_pseudo();
-                        let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
-                        let ptr_type = self.types.pointer_to(elem_type);
-                        self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
-                        return result;
-                    } else if type_kind == TypeKind::VaList {
-                        // va_list is defined as __va_list_tag[1] (an array type), so it decays to
-                        // a pointer when used in expressions (C99 6.3.2.1, 7.15.1)
-                        let result = self.alloc_pseudo();
-                        let ptr_type = self.types.pointer_to(typ);
-                        self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
-                        return result;
-                    } else if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union)
-                        && size > 64
-                    {
-                        // Large structs can't be loaded into registers - return address
-                        let result = self.alloc_pseudo();
-                        let ptr_type = self.types.pointer_to(typ);
-                        self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
-                        return result;
-                    } else {
-                        let result = self.alloc_pseudo();
-                        self.emit(Instruction::load(result, sym_id, 0, typ, size));
-                        return result;
-                    }
-                } else {
+                let Some(static_info) = self.static_locals.get(&key).cloned() else {
                     unreachable!("static local sentinel without static_locals entry");
+                };
+                let sym_id = self.alloc_pseudo();
+                let pseudo = Pseudo::sym(sym_id, static_info.global_name);
+                if let Some(func) = &mut self.current_func {
+                    func.add_pseudo(pseudo);
                 }
+                return self.read_object(ObjectPlace::Sym(sym_id), static_info.typ);
             }
-            let result = self.alloc_reg_pseudo();
-            let type_kind = self.types.kind(local.typ);
-            let size = self.types.size_bits(local.typ);
-            // Arrays decay to pointers - get address, not value
-            if type_kind == TypeKind::Array {
-                let elem_type = self.types.base_type(local.typ).unwrap_or(self.types.int_id);
-                let ptr_type = self.types.pointer_to(elem_type);
-                self.emit(Instruction::sym_addr(result, local.sym, ptr_type));
-            } else if type_kind == TypeKind::VaList && !self.types.va_list_is_pointer() {
-                // va_list is defined as __va_list_tag[1] (an array type), so it decays to
-                // a pointer when used in expressions (C99 6.3.2.1, 7.15.1). A target
-                // whose va_list is itself a pointer falls through to the scalar load.
-                if let Storage::Indirect(ptr_type) = local.storage {
-                    // va_list parameter: local holds a pointer to the va_list struct
-                    // Load the pointer value (array decay already happened at call site)
+            let place = match local.storage {
+                // A `va_list` parameter where `va_list` is an array: the
+                // caller's argument decayed, so the slot holds a pointer to
+                // the caller's object (C17 7.16p3).
+                Storage::Indirect(ptr_type)
+                    if self.types.kind(local.typ) == TypeKind::VaList
+                        && !self.types.va_list_is_pointer() =>
+                {
+                    let ptr = self.alloc_reg_pseudo();
                     let ptr_size = self.types.size_bits(ptr_type);
-                    self.emit(Instruction::load(result, local.sym, 0, ptr_type, ptr_size));
-                } else {
-                    // Regular va_list local: take address (normal array decay)
-                    let ptr_type = self.types.pointer_to(local.typ);
-                    self.emit(Instruction::sym_addr(result, local.sym, ptr_type));
+                    self.emit(Instruction::load(ptr, local.sym, 0, ptr_type, ptr_size));
+                    ObjectPlace::At(ptr, 0)
                 }
-            } else if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union) && size > 64 {
-                // Large structs can't be loaded into registers - return address
-                let ptr_type = self.types.pointer_to(local.typ);
-                self.emit(Instruction::sym_addr(result, local.sym, ptr_type));
-            } else {
-                self.emit(Instruction::load(result, local.sym, 0, local.typ, size));
-            }
-            result
+                _ => ObjectPlace::Sym(local.sym),
+            };
+            self.read_object(place, local.typ)
         }
         // Check if it's a parameter (already SSA value)
         else if let Some(&pseudo) = self.var_map.get(&name_str) {
@@ -5164,31 +5144,7 @@ impl<'a> Linearizer<'a> {
                 func.add_pseudo(pseudo);
             }
             let typ = self.expr_type(expr);
-            let type_kind = self.types.kind(typ);
-            let size = self.types.size_bits(typ);
-            // Arrays decay to pointers - get address, not value
-            if type_kind == TypeKind::Array {
-                let result = self.alloc_pseudo();
-                let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
-                let ptr_type = self.types.pointer_to(elem_type);
-                self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
-                result
-            }
-            // Functions decay to function pointers, va_list decays to pointer (C99 6.3.2.1, 7.15.1),
-            // and large structs can't be loaded into registers - for all cases, return the address
-            else if type_kind == TypeKind::Function
-                || (type_kind == TypeKind::VaList && !self.types.va_list_is_pointer())
-                || ((type_kind == TypeKind::Struct || type_kind == TypeKind::Union) && size > 64)
-            {
-                let result = self.alloc_pseudo();
-                let ptr_type = self.types.pointer_to(typ);
-                self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
-                result
-            } else {
-                let result = self.alloc_pseudo();
-                self.emit(Instruction::load(result, sym_id, 0, typ, size));
-                result
-            }
+            self.read_object(ObjectPlace::Sym(sym_id), typ)
         }
     }
 
@@ -5670,29 +5626,7 @@ impl<'a> Linearizer<'a> {
                 // Initialize using existing init list machinery
                 self.linearize_init_list(sym_id, *typ, elements);
 
-                // For arrays: return pointer (array-to-pointer decay)
-                // For structs/scalars: load and return the value
-                let result = self.alloc_reg_pseudo();
-
-                let type_kind = self.types.kind(*typ);
-                let size = self.types.size_bits(*typ);
-                if type_kind == TypeKind::Array {
-                    // Array compound literal - decay to pointer to first element
-                    let elem_type = self.types.base_type(*typ).unwrap_or(self.types.int_id);
-                    let ptr_type = self.types.pointer_to(elem_type);
-                    self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
-                } else if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union)
-                    && size > 64
-                {
-                    // Large struct/union compound literal - return address
-                    // Large structs can't be "loaded" into registers; assignment handles copying
-                    let ptr_type = self.types.pointer_to(*typ);
-                    self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
-                } else {
-                    // Scalar or small struct compound literal - load the value
-                    self.emit(Instruction::load(result, sym_id, 0, *typ, size));
-                }
-                result
+                self.read_object(ObjectPlace::Sym(sym_id), *typ)
             }
             _ => unreachable!(),
         }

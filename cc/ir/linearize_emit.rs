@@ -8,7 +8,7 @@
 
 //! Emit helpers for the linearizer (constants, block copies, bitfields, operators, assignments)
 
-use super::linearize::BlockVolatility;
+use super::linearize::{BlockVolatility, ObjectPlace};
 use super::memexpand;
 use super::{BasicBlockId, CallAbiInfo, Instruction, Opcode, Pseudo, PseudoId};
 use crate::abi::get_abi_for_conv;
@@ -1109,33 +1109,16 @@ impl<'a> super::linearize::Linearizer<'a> {
                 return src;
             }
             UnaryOp::Deref => {
-                // Dereferencing a pointer-to-array gives an array, which is just an address
-                // (arrays decay to their first element's address)
-                let type_kind = self.types.kind(typ);
-                if type_kind == TypeKind::Array {
-                    return src;
-                }
-                // In C, dereferencing a function pointer is a no-op:
-                // *func_ptr == func_ptr (C99 6.5.3.2, 6.3.2.1)
-                if type_kind == TypeKind::Function {
-                    return src;
-                }
-                // An aggregate wider than a register travels by address; one
-                // that fits travels *as* its value. Both kinds, on the same
-                // rule: a struct returned the address at every size while a
-                // union already loaded when it fit, and the disagreement was
-                // the bug. A caller handed the address where the convention
-                // promised the value stored the pointer instead --
-                // `struct { unsigned a, b; } q = *p;` put `p` into `q`.
+                // `*p` designates the object `p` points to, and reads it the
+                // way every other designation does. Deciding here instead
+                // once returned a register-sized struct's address where the
+                // convention promised its value, and the caller stored the
+                // pointer -- `struct { unsigned a, b; } q = *p;` put `p` into
+                // `q`.
                 //
                 // Member access is unaffected: `(*p).f` and `p->f` take the
-                // address through `linearize_lvalue`, not through here, which
-                // is why the union half of this has worked all along.
-                if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union) && size > 64 {
-                    return src;
-                }
-                self.emit(Instruction::load(result, src, 0, typ, size));
-                return result;
+                // address through `linearize_lvalue`, not through here.
+                return self.read_object(ObjectPlace::At(src, 0), typ);
             }
             // Intercepted in `linearize_unary`, which needs the operand
             // expression: a pointer's step is not always its pointee's
@@ -2987,11 +2970,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         // For struct/union assignment, do a block copy via addresses, at every
         // size: `linearize_lvalue` gives the source's address whether the
         // expression yields a small aggregate's value or a large one's
-        // address.
+        // address. A zero-sized one copies nothing; through the scalar path
+        // below its "nothing" was stored as a byte, over the next member.
         let target_kind = self.types.kind(target_typ);
         let target_size_bytes = self.types.size_bytes(target_typ);
         if (target_kind == TypeKind::Struct || target_kind == TypeKind::Union)
-            && target_size_bytes > 0
             && op == AssignOp::Assign
         {
             let target_addr = self.linearize_lvalue(target);

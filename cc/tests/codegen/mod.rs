@@ -28,6 +28,7 @@ mod cross_abi;
 mod cross_abi_types;
 mod cross_abi_varargs;
 mod debug_info;
+mod determinism;
 mod floating;
 mod inline_asm;
 mod inlining;

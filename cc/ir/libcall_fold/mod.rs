@@ -49,7 +49,7 @@ use crate::target::Target;
 use crate::token::lexer::bytes_payload;
 use crate::types::{TypeId, TypeKind, TypeTable};
 use std::cell::{OnceCell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// What the folds need that is the same for every function in a module.
 pub struct FoldCtx<'a> {
@@ -348,8 +348,12 @@ fn callee_symbol<'a>(ctx: &'a FoldCtx, callee: Callee) -> &'a str {
 }
 
 /// Replace each call in `sites` with what it folds to.
+///
+/// Blocks are rewritten in block order: a fold may add a literal and new
+/// pseudos, and the order they are made in is the order of their labels and
+/// numbers in the output.
 fn apply(func: &mut Function, ctx: &FoldCtx, sites: Vec<FoldSite>) {
-    let mut by_block: HashMap<usize, HashMap<usize, Folded>> = HashMap::new();
+    let mut by_block: BTreeMap<usize, HashMap<usize, Folded>> = BTreeMap::new();
     for ((b, i), folded) in sites {
         by_block.entry(b).or_default().insert(i, folded);
     }

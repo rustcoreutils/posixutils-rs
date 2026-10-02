@@ -235,13 +235,14 @@ impl Parser<'_> {
                 is_complete: true,
                 transparent: false,
                 anon_id: tag.is_none().then(|| self.types.fresh_anon_id()),
+                forward_of: None,
             };
 
             let unsigned = self.types.is_unsigned(underlying);
 
             // A forward reference to the tag made an incomplete enum; the
             // definition completes that same type, as a struct's does.
-            if let Some(existing) = tag.and_then(|t| self.symbols.lookup_tag(t)) {
+            if let Some(existing) = tag.and_then(|t| self.symbols.lookup_tag_in_current_scope(t)) {
                 let existing_typ = existing.typ;
                 let forward = self.types.get(existing_typ);
                 if forward.kind == TypeKind::Enum
@@ -281,11 +282,10 @@ impl Parser<'_> {
                 } else {
                     // Registered, so that the definition completes this
                     // same type rather than making another.
-                    let incomplete = Type::incomplete_enum(tag_name);
-                    let typ_id = self.types.intern(incomplete.clone());
+                    let typ_id = self.types.intern(Type::incomplete_enum(tag_name));
                     let sym = Symbol::tag(tag_name, typ_id, self.symbols.depth());
                     let _ = self.symbols.declare(sym);
-                    Ok(incomplete)
+                    Ok(self.types.get(typ_id).clone())
                 }
             } else {
                 Err(ParseError::new(
@@ -424,11 +424,12 @@ impl Parser<'_> {
                 is_complete: true,
                 transparent: is_transparent && is_union,
                 anon_id: tag.is_none().then(|| self.types.fresh_anon_id()),
+                forward_of: None,
             };
 
             // Check if there's an existing forward declaration that we should complete
             if let Some(tag_name) = tag {
-                if let Some(existing) = self.symbols.lookup_tag(tag_name) {
+                if let Some(existing) = self.symbols.lookup_tag_in_current_scope(tag_name) {
                     // Complete the existing forward-declared type in place
                     // This ensures all pointers to the incomplete type now see the complete type
                     let existing_typ = existing.typ;
@@ -480,10 +481,10 @@ impl Parser<'_> {
                     } else {
                         Type::incomplete_struct(tag_name)
                     };
-                    let typ_id = self.types.intern(incomplete_type.clone());
+                    let typ_id = self.types.intern(incomplete_type);
                     let sym = Symbol::tag(tag_name, typ_id, self.symbols.depth());
                     let _ = self.symbols.declare(sym);
-                    Ok(incomplete_type)
+                    Ok(self.types.get(typ_id).clone())
                 }
             } else {
                 Err(ParseError::new(
@@ -833,6 +834,7 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::super::test_parser::parse_tu;
+    use crate::types::TypeModifiers;
 
     /// A forward reference to an enum tag is the type its definition later
     /// completes: the typedef made through it is the tag's own type, of the
@@ -848,5 +850,49 @@ mod tests {
         assert_eq!(e, tag.typ);
         assert_eq!(types.size_bits(e), 32);
         assert!(types.is_unsigned(e));
+    }
+
+    /// A qualified forward reference is a copy of the tag's type carrying its
+    /// qualifiers, and the definition completes the copy along with the tag:
+    /// it takes the enum's size and signedness and keeps its own `const`.
+    #[test]
+    fn a_qualified_forward_enum_is_completed_with_its_tag() {
+        let (_tu, types, strings, symbols) = parse_tu(
+            "enum big; typedef const enum big CB; enum big { n = -1, l = 0x7fffffffffLL };\n\
+             enum pos; typedef volatile enum pos VP; enum pos { h = 0x80000000u };\n\
+             struct S; typedef const struct S CS; struct S { long a, b; };",
+        )
+        .unwrap();
+        let typedef = |name: &str| {
+            symbols
+                .lookup_typedef(strings.lookup(name).unwrap())
+                .unwrap()
+        };
+        let (cb, vp, cs) = (typedef("CB"), typedef("VP"), typedef("CS"));
+        assert_eq!(types.size_bits(cb), 64);
+        assert!(!types.is_unsigned(cb));
+        assert_eq!(types.qualifiers(cb), TypeModifiers::CONST);
+        assert_eq!(types.size_bits(vp), 32);
+        assert!(types.is_unsigned(vp));
+        assert_eq!(types.qualifiers(vp), TypeModifiers::VOLATILE);
+        assert!(types.is_composite_complete(cs));
+        assert_eq!(types.size_bytes(cs), 16);
+        assert_eq!(types.qualifiers(cs), TypeModifiers::CONST);
+    }
+
+    /// A tag defined in an inner scope is a new type: it leaves the outer
+    /// forward declaration incomplete, for the outer definition to complete.
+    #[test]
+    fn an_inner_definition_does_not_complete_the_outer_tag() {
+        let (_tu, types, strings, symbols) = parse_tu(
+            "struct S; typedef const struct S CS;\n\
+             void f(void) { struct S { int a; } s; }\n\
+             struct S { long x, y; };",
+        )
+        .unwrap();
+        let cs = symbols
+            .lookup_typedef(strings.lookup("CS").unwrap())
+            .unwrap();
+        assert_eq!(types.size_bytes(cs), 16);
     }
 }

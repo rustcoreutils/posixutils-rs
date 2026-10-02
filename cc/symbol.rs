@@ -440,6 +440,15 @@ impl SymbolTable {
         self.lookup(name, Namespace::Tag)
     }
 
+    /// The tag of this name declared in the current scope -- the one a
+    /// definition here completes (C17 6.7.2.3p5). A tag visible only from an
+    /// enclosing scope is not: a definition in an inner scope declares a new
+    /// type that hides it, and must not complete the outer one.
+    pub fn lookup_tag_in_current_scope(&self, name: StringId) -> Option<&Symbol> {
+        self.lookup_tag(name)
+            .filter(|sym| sym.scope_depth == self.depth())
+    }
+
     /// Resolve an incomplete struct/union type to its complete definition.
     ///
     /// When a struct is forward-declared (e.g., `struct foo;`) and later

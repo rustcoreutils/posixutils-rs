@@ -52,15 +52,10 @@ impl Parser<'_> {
     /// judged here, when nothing more can complete them.
     fn check_deferred_incomplete_definitions(&mut self) {
         for (typ, pos) in std::mem::take(&mut self.tentative_definitions) {
-            // Ask the *tag*, not the recorded id. A qualified spelling --
-            // `volatile struct S` -- is interned as a fresh type carrying a
-            // clone of the tag's composite data as it stood at the time
-            // (`intern_type_with_tag`), and `complete_struct` only ever
-            // mutates the tag's own entry. So the recorded id is a frozen
-            // `is_complete: false` that completing the tag never updates, and
-            // `struct S; volatile struct S vs; struct S { int a; };` was
-            // rejected although the tag is complete.
-            let typ = self.symbols.resolve_struct_type(self.types, typ);
+            // A qualified spelling -- `volatile struct S` -- is its own
+            // `TypeId`, completed along with the tag (`complete_struct`), so
+            // `struct S; volatile struct S vs; struct S { int a; };` is
+            // complete by now.
             if self.types.is_composite_complete(typ) {
                 continue;
             }

@@ -973,6 +973,7 @@ fn test_conditional_short_circuit_arrow() {
         is_complete: true,
         transparent: false,
         anon_id: None,
+        forward_of: None,
     }));
     let struct_ptr_type = ctx.types.intern(Type::pointer(struct_type));
 

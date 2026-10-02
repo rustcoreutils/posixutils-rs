@@ -284,6 +284,18 @@ pub struct CompositeType {
     /// was accepted, where gcc rejects it. A qualified variant of the type
     /// clones the composite, and so keeps the identity.
     pub anon_id: Option<u32>,
+    /// For a tag referenced before its definition: the tag's own `TypeId`,
+    /// the one its definition completes in place.
+    ///
+    /// A qualified reference -- `const enum E`, `volatile struct S` -- is a
+    /// separate `TypeId` holding a clone of this composite, so the clone
+    /// carries the tag's identity, and [`TypeTable::intern`] records every
+    /// such copy. The definition then completes the copies with the tag: a
+    /// `typedef const enum E CE;` ahead of the list has the enum's size and
+    /// signedness, and a `const enum E *` parameter declared before it is
+    /// the same type as one declared after. Set by `intern`; `None` once the
+    /// composite is complete.
+    pub forward_of: Option<TypeId>,
 }
 
 impl CompositeType {
@@ -299,6 +311,7 @@ impl CompositeType {
             is_complete: false,
             transparent: false,
             anon_id: None,
+            forward_of: None,
         }
     }
 
@@ -986,6 +999,9 @@ pub struct TypeTable {
     lookup: HashMap<TypeKey, TypeId>,
     /// The last identity [`TypeTable::fresh_anon_id`] handed out.
     next_anon_id: u32,
+    /// The qualified copies of each incomplete tagged type, by the tag's own
+    /// `TypeId`; see [`CompositeType::forward_of`].
+    forward_copies: HashMap<TypeId, Vec<TypeId>>,
     /// Pointer size in bits (target-dependent, defaults to 64 for LP64)
     pointer_width: u32,
     /// Target architecture for runtime type size calculations
@@ -1079,6 +1095,7 @@ impl TypeTable {
             types: Vec::with_capacity(DEFAULT_TYPE_TABLE_CAPACITY),
             lookup: HashMap::with_capacity(DEFAULT_TYPE_TABLE_CAPACITY),
             next_anon_id: 0,
+            forward_copies: HashMap::new(),
             pointer_width: target.pointer_width,
             target_arch: target.arch,
             target_os: target.os,
@@ -1291,7 +1308,7 @@ impl TypeTable {
 
     /// Intern a type, returning its unique ID.
     /// Deduplicates equivalent types (same ID for equivalent types).
-    pub fn intern(&mut self, typ: Type) -> TypeId {
+    pub fn intern(&mut self, mut typ: Type) -> TypeId {
         // Try to create a key for deduplication
         if let Some(key) = self.make_key(&typ) {
             if let Some(&existing_id) = self.lookup.get(&key) {
@@ -1304,8 +1321,26 @@ impl TypeTable {
         } else {
             // Types with composite data (structs) are not deduplicated
             let id = TypeId(self.types.len() as u32);
+            self.note_forward_copy(&mut typ, id);
             self.types.push(typ);
             id
+        }
+    }
+
+    /// Tie an incomplete tagged type being interned as `id` to the tag it
+    /// stands for, so that the tag's definition completes it too: the first
+    /// one interned is the tag's own type, and every later one is a copy of
+    /// it. See [`CompositeType::forward_of`].
+    fn note_forward_copy(&mut self, typ: &mut Type, id: TypeId) {
+        let Some(composite) = typ.composite.as_deref_mut() else {
+            return;
+        };
+        if composite.is_complete || composite.tag.is_none() {
+            return;
+        }
+        let tag_type = *composite.forward_of.get_or_insert(id);
+        if tag_type != id {
+            self.forward_copies.entry(tag_type).or_default().push(id);
         }
     }
 
@@ -1353,12 +1388,11 @@ impl TypeTable {
     /// This updates the type in place so that all existing pointers to
     /// the incomplete type will now see the complete type.
     pub fn complete_struct(&mut self, id: TypeId, composite: CompositeType) {
-        let typ = &mut self.types[id.0 as usize];
         debug_assert!(
-            matches!(typ.kind, TypeKind::Struct | TypeKind::Union),
+            matches!(self.kind(id), TypeKind::Struct | TypeKind::Union),
             "complete_struct called on non-struct/union type"
         );
-        typ.composite = Some(Box::new(composite));
+        self.complete_tag(id, composite, TypeModifiers::empty());
     }
 
     /// Complete a forward-declared enum with its definition, in place, as
@@ -1366,14 +1400,28 @@ impl TypeTable {
     /// pointee declared through the forward reference sees the enum's size,
     /// and its signedness when the underlying type is unsigned.
     pub fn complete_enum(&mut self, id: TypeId, composite: CompositeType, unsigned: bool) {
-        let typ = &mut self.types[id.0 as usize];
         debug_assert!(
-            typ.kind == TypeKind::Enum,
+            self.kind(id) == TypeKind::Enum,
             "complete_enum called on a non-enum type"
         );
-        typ.composite = Some(Box::new(composite));
-        if unsigned {
-            typ.modifiers |= TypeModifiers::UNSIGNED;
+        let sign = if unsigned {
+            TypeModifiers::UNSIGNED
+        } else {
+            TypeModifiers::empty()
+        };
+        self.complete_tag(id, composite, sign);
+    }
+
+    /// Give the tag's type `id`, and every qualified copy of it, the
+    /// definition's composite and `added` modifiers. Each copy keeps its own
+    /// qualifiers.
+    fn complete_tag(&mut self, id: TypeId, composite: CompositeType, added: TypeModifiers) {
+        let tag_type = self.composite(id).and_then(|c| c.forward_of).unwrap_or(id);
+        let copies = self.forward_copies.remove(&tag_type).unwrap_or_default();
+        for copy in std::iter::once(tag_type).chain(copies) {
+            let typ = &mut self.types[copy.0 as usize];
+            typ.composite = Some(Box::new(composite.clone()));
+            typ.modifiers |= added;
         }
     }
 
@@ -3559,6 +3607,7 @@ mod tests {
             is_complete: true,
             transparent: false,
             anon_id: None,
+            forward_of: None,
         };
 
         // The plain scalars.
@@ -3692,6 +3741,7 @@ mod tests {
             is_complete: true,
             transparent: false,
             anon_id: None,
+            forward_of: None,
         };
         let plain = types.intern(Type::struct_type(composite));
 
@@ -3948,6 +3998,7 @@ mod tests {
             is_complete: true,
             transparent: false,
             anon_id: None,
+            forward_of: None,
         };
 
         // An ordinary union answers None even though it has members.
@@ -4011,6 +4062,7 @@ mod tests {
             is_complete: true,
             transparent: false,
             anon_id: None,
+            forward_of: None,
         };
         let members = vec![
             member(bf, types.int_id, Some(3)),
@@ -4660,6 +4712,7 @@ mod tests {
             is_complete: true,
             transparent: false,
             anon_id: None,
+            forward_of: None,
         };
         let mut typ = Type::enum_type(composite);
         if unsigned {

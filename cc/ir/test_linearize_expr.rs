@@ -646,6 +646,7 @@ fn test_struct_deref_returns_address() {
         is_complete: true,
         transparent: false,
         anon_id: None,
+        forward_of: None,
     });
     let struct_type_id = ctx.types.intern(struct_type);
     let struct_ptr_type_id = ctx.types.intern(Type::pointer(struct_type_id));

@@ -580,6 +580,7 @@ fn test_mixed_designated_positional_struct_init() {
         is_complete: true,
         transparent: false,
         anon_id: None,
+        forward_of: None,
     };
     let struct_type = ctx.types.intern(Type::struct_type(struct_composite));
     let s_sym = ctx.var("s", struct_type);
@@ -806,6 +807,7 @@ fn test_designator_chain_nested_struct_init() {
         is_complete: true,
         transparent: false,
         anon_id: None,
+        forward_of: None,
     }));
 
     let pt_id = ctx.str("pt");
@@ -840,6 +842,7 @@ fn test_designator_chain_nested_struct_init() {
         is_complete: true,
         transparent: false,
         anon_id: None,
+        forward_of: None,
     }));
     let outer_sym = ctx.var("s", outer_type);
 
@@ -932,6 +935,7 @@ fn test_designator_chain_array_member_init() {
         is_complete: true,
         transparent: false,
         anon_id: None,
+        forward_of: None,
     }));
     let s_sym = ctx.var("s", struct_type);
 
@@ -1100,6 +1104,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
         is_complete: true,
         transparent: false,
         anon_id: None,
+        forward_of: None,
     }));
     let s_sym = ctx.var("s", struct_type);
 
@@ -1197,6 +1202,7 @@ fn test_union_first_named_member_positional_init() {
         is_complete: true,
         transparent: false,
         anon_id: None,
+        forward_of: None,
     }));
     let u_sym = ctx.var("u", union_type);
 
@@ -1319,6 +1325,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             is_complete: true,
             transparent: false,
             anon_id: None,
+            forward_of: None,
         })),
         ..Default::default()
     });
@@ -1470,6 +1477,7 @@ fn test_bitfield_designated_init_local_var() {
         is_complete: true,
         transparent: false,
         anon_id: None,
+        forward_of: None,
     }));
 
     let s_sym = ctx.var("s", struct_type);
@@ -1624,6 +1632,7 @@ fn test_compound_literal_zero_init_lvalue() {
             is_complete: true,
             transparent: false,
             anon_id: None,
+            forward_of: None,
         })),
         ..Default::default()
     });
@@ -1782,6 +1791,7 @@ fn test_complex_struct_member_init_stores_both_halves() {
         is_complete: true,
         transparent: false,
         anon_id: None,
+        forward_of: None,
     });
     let struct_type_id = ctx.types.intern(struct_type);
     let s_sym = ctx.var("s", struct_type_id);

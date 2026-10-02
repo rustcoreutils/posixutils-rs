@@ -1307,6 +1307,7 @@ fn test_incomplete_struct_type_resolution() {
         is_complete: true,
         transparent: false,
         anon_id: None,
+        forward_of: None,
     };
     let complete_struct_type = ctx.types.intern(Type::struct_type(complete_composite));
 

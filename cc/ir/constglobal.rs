@@ -30,7 +30,7 @@
 // cannot see.
 //
 
-use super::memloc::{AddrMap, MemBase};
+use super::memloc::{same_register_file, AddrMap, GlobalFacts, MemBase};
 use super::propagate;
 use super::{ConstValue, Function, Initializer, Instruction, Module, Opcode};
 use crate::types::{TypeId, TypeTable};
@@ -99,26 +99,13 @@ pub(crate) fn qualifies(g: &super::GlobalDef, types: &TypeTable) -> bool {
     if !g.is_const {
         return false;
     }
-    // `volatile` says the value can change for reasons not in the program,
-    // which is exactly the assumption being made here.
-    //
-    // `contains_volatile`, not the top-level modifier: a `const struct` with a
-    // `volatile` member is one of these objects too, and asking only what was
-    // written on the struct let it through the gate. Every access is checked
-    // again below, so this was not reachable as a wrong fold -- but the object
-    // and its members are one question and get one spelling of it.
-    if types.contains_volatile(g.typ) {
-        return false;
-    }
-    // A weak definition exists to be replaced at link time, and the
-    // replacement's initializer is not this one. gcc folds these anyway;
-    // declining costs a fold and cannot be wrong.
-    if g.symbol_attrs.weak {
-        return false;
-    }
-    // Thread-local storage is per-thread, and this pass has no notion of
-    // which thread's copy a load reads.
-    if g.is_thread_local {
+    // `volatile` -- anywhere inside, so a `const struct` with a `volatile`
+    // member too -- says the value can change for reasons not in the
+    // program, which is exactly the assumption being made here. A weak
+    // definition's replacement has another initializer (gcc folds these
+    // anyway; declining costs a fold and cannot be wrong). And this pass has
+    // no notion of which thread's copy of a thread-local a load reads.
+    if !GlobalFacts::of(g, types).is_plain() {
         return false;
     }
     // A tentative definition (`const int t;`) may be merged with a real
@@ -184,12 +171,9 @@ fn foldable_load(
         return None;
     }
 
-    // Both sides must agree on which register file the value lives in, or a
-    // type pun -- `*(long *)&one` -- would be answered with the bits read the
-    // wrong way round. Comparing the *formats* rather than testing one side
-    // catches it in both directions, and distinguishes the two 128-bit float
-    // formats that a width cannot.
-    if types.fp_format(g.typ) != insn.typ.and_then(|t| types.fp_format(t)) {
+    // A type pun -- `*(long *)&one` -- would be answered with the bits read
+    // the wrong way round.
+    if !same_register_file(types, Some(g.typ), insn.typ) {
         return None;
     }
 

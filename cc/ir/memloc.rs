@@ -32,7 +32,8 @@
 // that `i.0` and `symaddr i.0` name one object.
 //
 
-use super::{Function, Instruction, Opcode, PseudoId, PseudoKind};
+use super::facts::ConstMap;
+use super::{Function, GlobalDef, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::parse::ast::MemEffect;
 use crate::types::{TypeId, TypeTable};
 use std::collections::HashMap;
@@ -92,7 +93,8 @@ impl MemLoc {
     }
 }
 
-/// Every pseudo's unique defining instruction.
+/// Every pseudo's unique defining instruction, and the constant each one
+/// carries.
 ///
 /// Sound as a whole-function map with no dominance query, for the same
 /// reason `facts::ConstMap` is: SSA invariant I1 makes each target's
@@ -102,6 +104,7 @@ impl MemLoc {
 /// on `Function`.
 pub(crate) struct AddrMap {
     defs: HashMap<PseudoId, (usize, usize)>,
+    consts: ConstMap,
 }
 
 impl AddrMap {
@@ -123,7 +126,15 @@ impl AddrMap {
         for out in func.asm_defined_pseudos() {
             defs.remove(&out);
         }
-        AddrMap { defs }
+        AddrMap {
+            defs,
+            consts: ConstMap::new(func),
+        }
+    }
+
+    /// The constants this function's pseudos carry, through their copies.
+    pub(crate) fn consts(&self) -> &ConstMap {
+        &self.consts
     }
 
     /// The one instruction defining `id`, if this function has it.
@@ -158,26 +169,15 @@ impl AddrMap {
             .map(|t| (types.size_bits(t), Some(t)))
     }
 
-    /// The constant a pseudo carries, if any: an address-arithmetic operand,
-    /// or the value of a store.
+    /// The constant a pseudo carries, if any, read as the `width`-bit
+    /// operand of the instruction consuming it: an address-arithmetic
+    /// operand, or the value of a store.
     ///
-    /// Only `Copy` is followed. A `SetVal` needs no arm of its own: its
-    /// constant lives in its *target pseudo*, so `func.const_val` above has
-    /// already answered for it, and an arm that asked `const_val` a second
-    /// time about the same pseudo could only repeat the `None` that got it
-    /// there.
-    pub(crate) fn const_operand(&self, func: &Function, id: PseudoId) -> Option<i128> {
-        let mut cur = id;
-        for _ in 0..MAX_ADDR_DEPTH {
-            if let Some(v) = func.const_val(cur) {
-                return Some(v);
-            }
-            match self.def(func, cur) {
-                Some(d) if d.op == Opcode::Copy && d.src.len() == 1 => cur = d.src[0],
-                _ => return None,
-            }
-        }
-        None
+    /// `ConstMap::get_at`, sign-extended: address arithmetic is modular at
+    /// pointer width, so `p + 0xff..f8` is `p - 8`, and a store's bytes are
+    /// the low `width` bits whichever extension holds them.
+    pub(crate) fn const_operand(&self, id: PseudoId, width: u32) -> Option<i128> {
+        self.consts.get_at(id, width, true)
     }
 
     /// The location `insn` accesses, for a `Load` or `Store`.
@@ -223,13 +223,13 @@ impl AddrMap {
                 Opcode::Copy | Opcode::SymAddr if d.src.len() == 1 => cur = d.src[0],
                 Opcode::Add if d.src.len() == 2 => {
                     let (a, b) = (d.src[0], d.src[1]);
-                    if let Some(c) = self.const_operand(func, b) {
+                    if let Some(c) = self.const_operand(b, d.size) {
                         let Some(n) = add_offset(off, c) else {
                             return MemLoc::unknown();
                         };
                         off = n;
                         cur = a;
-                    } else if let Some(c) = self.const_operand(func, a) {
+                    } else if let Some(c) = self.const_operand(a, d.size) {
                         let Some(n) = add_offset(off, c) else {
                             return MemLoc::unknown();
                         };
@@ -240,7 +240,7 @@ impl AddrMap {
                     }
                 }
                 Opcode::Sub if d.src.len() == 2 => {
-                    let Some(c) = self.const_operand(func, d.src[1]) else {
+                    let Some(c) = self.const_operand(d.src[1], d.size) else {
                         return MemLoc::unknown();
                     };
                     let Some(n) = c.checked_neg().and_then(|n| add_offset(off, n)) else {
@@ -274,6 +274,27 @@ pub(crate) struct GlobalFacts {
 }
 
 impl GlobalFacts {
+    /// What `g`'s definition says. The one place a pass reads these three
+    /// flags off a `GlobalDef`.
+    pub(crate) fn of(g: &GlobalDef, types: &TypeTable) -> GlobalFacts {
+        GlobalFacts {
+            // Anywhere inside, not only on the object itself: a
+            // `struct { volatile int v; ... }` is not volatile-qualified, but
+            // every access to it still has to happen as written (C17 6.7.3p7).
+            is_volatile: types.contains_volatile(g.typ),
+            // A weak definition exists to be replaced at link time.
+            is_weak: g.symbol_attrs.weak,
+            // Thread-local storage is per-thread.
+            is_thread_local: g.is_thread_local,
+        }
+    }
+
+    /// Whether every access to this object happens in this program, to one
+    /// copy of it, defined here: none of the three flags is set.
+    pub(crate) fn is_plain(&self) -> bool {
+        !self.is_volatile && !self.is_weak && !self.is_thread_local
+    }
+
     /// What is assumed about a name this translation unit does not define.
     ///
     /// Everything. `extern volatile int x;` never reaches `module.globals`,
@@ -296,21 +317,11 @@ pub(crate) struct ModuleInfo {
 
 impl ModuleInfo {
     pub(crate) fn build(module: &super::Module, types: &TypeTable) -> ModuleInfo {
-        let mut globals = HashMap::new();
-        for g in &module.globals {
-            globals.insert(
-                g.name.clone(),
-                GlobalFacts {
-                    // Anywhere inside, not only on the object itself: a
-                    // `struct { volatile int v; ... }` is not
-                    // volatile-qualified, but every access to it still has to
-                    // happen as written (C17 6.7.3p7).
-                    is_volatile: types.contains_volatile(g.typ),
-                    is_weak: g.symbol_attrs.weak,
-                    is_thread_local: g.is_thread_local,
-                },
-            );
-        }
+        let globals = module
+            .globals
+            .iter()
+            .map(|g| (g.name.clone(), GlobalFacts::of(g, types)))
+            .collect();
         ModuleInfo {
             globals,
             effects: super::effects::EffectTable::build(module, types),
@@ -406,14 +417,24 @@ pub(crate) fn may_alias(a: &MemLoc, b: &MemLoc, mi: &ModuleInfo) -> bool {
     }
 }
 
-/// Are these the same access -- the same bytes, read as the same kind of
-/// value?
+/// Do values of types `a` and `b` live in the same register file -- may one
+/// be handed over as the other without a conversion?
 ///
-/// The type test is `constglobal`'s pun guard: forwarding a `double` store
-/// into a `long` load hands over bits in the wrong register file. Comparing
-/// the *formats* catches it in both directions and distinguishes the two
-/// 128-bit float formats that a width cannot, while `int` against `long` at
-/// one width passes, which is right -- both are general registers.
+/// The pun guard: answering a `long` load with a `double` store's value, or
+/// with a `double` initializer, hands over bits in the wrong register file.
+/// Comparing the *formats* catches it in both directions and distinguishes
+/// the two 128-bit float formats that a width cannot, while `int` against
+/// `long` passes, which is right -- both are general registers.
+///
+/// A missing type has no float format, so it counts as a general register:
+/// only a floating type names the other file.
+pub(crate) fn same_register_file(types: &TypeTable, a: Option<TypeId>, b: Option<TypeId>) -> bool {
+    let format = |t: Option<TypeId>| t.and_then(|t| types.fp_format(t));
+    format(a) == format(b)
+}
+
+/// Are these the same access -- the same bytes, read as the same kind of
+/// value (`same_register_file`)?
 pub(crate) fn is_same_access(a: &MemLoc, b: &MemLoc, types: &TypeTable) -> bool {
     a.is_known()
         && a.base == b.base
@@ -421,8 +442,7 @@ pub(crate) fn is_same_access(a: &MemLoc, b: &MemLoc, types: &TypeTable) -> bool 
         && a.offset == b.offset
         && a.size == b.size
         && a.size != 0
-        && types.fp_format(a.typ.unwrap_or(types.int_id))
-            == types.fp_format(b.typ.unwrap_or(types.int_id))
+        && same_register_file(types, a.typ, b.typ)
 }
 
 #[cfg(test)]
@@ -808,6 +828,88 @@ mod tests {
             loc.base,
             MemBase::Unknown,
             "the asm redefines %10, so its pre-asm Copy says nothing about it"
+        );
+    }
+
+    /// The pun guard compares float formats, so a missing type is a general
+    /// register: it matches an integer and not a float.
+    #[test]
+    fn memloc_same_register_file_reads_float_formats() {
+        let types = host_types();
+        let (int, long, double) = (types.int_id, types.long_id, types.double_id);
+        assert!(same_register_file(&types, Some(int), Some(long)));
+        assert!(!same_register_file(&types, Some(long), Some(double)));
+        assert!(!same_register_file(
+            &types,
+            Some(types.float_id),
+            Some(double)
+        ));
+        assert!(same_register_file(&types, None, Some(int)));
+        assert!(!same_register_file(&types, None, Some(double)));
+        assert!(same_register_file(&types, None, None));
+    }
+
+    /// `GlobalFacts::of` reads the three flags off the definition, and a
+    /// global is plain only when none is set.
+    #[test]
+    fn memloc_global_facts_of_a_definition() {
+        let types = host_types();
+        let int = types.int_id;
+        let mut module = super::super::Module::default();
+        module.add_global("g", int, super::super::Initializer::None);
+        let plain = GlobalFacts::of(&module.globals[0], &types);
+        assert!(plain.is_plain());
+
+        let mut weak = module.globals[0].clone();
+        weak.symbol_attrs.weak = true;
+        let facts = GlobalFacts::of(&weak, &types);
+        assert!(facts.is_weak && !facts.is_plain());
+
+        let mut tls = module.globals[0].clone();
+        tls.is_thread_local = true;
+        let facts = GlobalFacts::of(&tls, &types);
+        assert!(facts.is_thread_local && !facts.is_plain());
+
+        assert!(!GlobalFacts::unknown().is_plain());
+    }
+
+    /// `const_operand` answers through `ConstMap`: through a `Copy` or a
+    /// `Trunc`, sign-extended at the consumer's width, and not through a
+    /// chain narrower than that width.
+    #[test]
+    fn memloc_const_operand_reads_at_the_consumer_width() {
+        let types = host_types();
+        let (i8t, i32t, i64t) = (types.char_id, types.int_id, types.long_id);
+        let mut f = Function::new("f", types.void_id);
+        f.add_pseudo(Pseudo::val(PseudoId(1), -8));
+        f.add_pseudo(Pseudo::val(PseudoId(2), 0xffff_fff8));
+        f.add_pseudo(Pseudo::val(PseudoId(3), 300));
+        f.next_pseudo = 40;
+
+        let insn = |op, target, src, typ, size| {
+            Instruction::new(op)
+                .with_target(PseudoId(target))
+                .with_src(PseudoId(src))
+                .with_type_and_size(typ, size)
+        };
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        bb.add_insn(insn(Opcode::Copy, 10, 1, i64t, 64));
+        bb.add_insn(insn(Opcode::Copy, 11, 10, i64t, 64));
+        bb.add_insn(insn(Opcode::Copy, 12, 2, i32t, 32));
+        bb.add_insn(insn(Opcode::Trunc, 13, 3, i8t, 8));
+        f.blocks.push(bb);
+        f.entry = BasicBlockId(0);
+
+        let am = AddrMap::build(&f);
+        assert_eq!(am.const_operand(PseudoId(1), 64), Some(-8));
+        assert_eq!(am.const_operand(PseudoId(11), 64), Some(-8), "copies");
+        assert_eq!(am.const_operand(PseudoId(12), 32), Some(-8), "at width");
+        assert_eq!(am.const_operand(PseudoId(12), 64), None, "narrower chain");
+        assert_eq!(am.const_operand(PseudoId(13), 8), Some(44), "a trunc");
+        assert_eq!(
+            am.const_operand(PseudoId(10), 64),
+            am.consts().get_at(PseudoId(10), 64, true)
         );
     }
 }

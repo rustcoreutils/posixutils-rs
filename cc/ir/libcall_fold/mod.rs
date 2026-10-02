@@ -37,7 +37,6 @@ mod stdio;
 mod strings;
 
 use super::build::Builder;
-use super::facts::ConstMap;
 use super::loadfwd::MemOracle;
 use super::memexpand::BlockOp;
 use super::memloc::{AddrMap, MemBase, ModuleInfo};
@@ -169,7 +168,6 @@ pub(crate) enum Operand {
 pub(crate) struct CallSite<'a> {
     pub(crate) types: &'a TypeTable,
     pub(crate) target: &'a Target,
-    consts: &'a ConstMap,
     am: &'a AddrMap,
     func: &'a Function,
     pub(crate) strings: StrReader<'a>,
@@ -199,13 +197,13 @@ impl<'a> CallSite<'a> {
     /// The float constant `p` holds, of the format `typ` is in.
     pub(crate) fn float(&self, p: PseudoId, typ: TypeId) -> Option<FloatVal> {
         let fmt = self.types.fp_format(typ)?;
-        let v = self.consts.fget(p, self.types.size_bits(typ))?;
+        let v = self.am.consts().fget(p, self.types.size_bits(typ))?;
         Some(v.round_to_format(fmt))
     }
 
     /// The constant `p` holds, read as an unsigned `bits`-bit value.
     pub(crate) fn unsigned(&self, p: PseudoId, bits: u32) -> Option<u128> {
-        self.consts.get_at(p, bits, false).map(|v| v as u128)
+        self.am.consts().get_at(p, bits, false).map(|v| v as u128)
     }
 
     /// The constant `p` holds, read as a `size_t`.
@@ -217,7 +215,8 @@ impl<'a> CallSite<'a> {
     /// addresses of the same place in the same object.
     pub(crate) fn same_pointer(&self, a: PseudoId, b: PseudoId) -> bool {
         let bits = self.types.size_bits(self.types.void_ptr_id);
-        if self.consts.root(a, bits) == self.consts.root(b, bits) {
+        let consts = self.am.consts();
+        if consts.root(a, bits) == consts.root(b, bits) {
             return true;
         }
         let loc = |p| self.am.resolve(self.func, p, 0, 0, None);
@@ -245,7 +244,6 @@ type FoldSite = (Site, Folded);
 
 fn collect(func: &Function, ctx: &FoldCtx) -> Vec<FoldSite> {
     let am = AddrMap::build(func);
-    let consts = ConstMap::new(func);
     let oracle = MemOracle::new(func, ctx.types, ctx.mi, &am);
     let used = OnceCell::new();
     let mut sites = Vec::new();
@@ -265,7 +263,6 @@ fn collect(func: &Function, ctx: &FoldCtx) -> Vec<FoldSite> {
             let facts = CallSite {
                 types: ctx.types,
                 target: ctx.target,
-                consts: &consts,
                 am: &am,
                 func,
                 strings: StrReader::new(ctx.bytes, func, &am, ctx.types).with_locals(locals),

@@ -342,7 +342,7 @@ impl<'a> MemOracle<'a> {
                 let byte = insn
                     .src
                     .get(1)
-                    .and_then(|&v| self.am.const_operand(self.func, v))
+                    .and_then(|&v| self.am.const_operand(v, s.size))
                     .filter(|_| plain)
                     .and_then(|c| byte_of(c, s.size / 8, at, little_endian));
                 Some(byte.map_or(Candidate::Clobber, Candidate::Value))

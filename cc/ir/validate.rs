@@ -350,7 +350,15 @@ pub fn validate_module(module: &Module) -> Result<(), Vec<ValidationError>> {
 /// holds on *lowered* IR: phi elimination deliberately creates multi-def
 /// copies, so I1 does not, and calling the whole validator after lowering
 /// would report those instead.
+///
+/// A function codegen skips (`Function::emit` false) is exempt. Its body is
+/// kept only for the inliner, and a `__builtin_va_arg_pack_len()` in one
+/// that forwards its caller's arguments has nothing to resolve against: the
+/// pack exists only at a call site, and every one has been spliced.
 pub fn check_no_placeholders(func: &Function) -> Result<(), Vec<ValidationError>> {
+    if !func.emit {
+        return Ok(());
+    }
     let mut errors = Vec::new();
     for (block, bb) in func.blocks.iter().enumerate() {
         for (index, insn) in bb.insns.iter().enumerate() {
@@ -789,6 +797,33 @@ mod tests {
         i.target = Some(PseudoId(dst));
         i.src = vec![PseudoId(src)];
         i
+    }
+
+    /// I4: a placeholder is flagged in a function codegen emits, and not in
+    /// one it skips -- a `__builtin_va_arg_pack_len()` forwarder left in the
+    /// module after every call to it was inlined.
+    #[test]
+    fn validate_flags_a_placeholder_only_in_an_emitted_function() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = fresh_func("count");
+        func.add_pseudo(Pseudo::reg(PseudoId(0), 0));
+        push(
+            &mut func,
+            Instruction::new(Opcode::VaArgPackLen)
+                .with_target(PseudoId(0))
+                .with_type_and_size(types.int_id, 32),
+        );
+        let errors = validate_function_at(&func, Stage::Lowered).unwrap_err();
+        assert!(
+            matches!(
+                errors.as_slice(),
+                [ValidationError::UnresolvedPlaceholder { .. }]
+            ),
+            "{errors:?}"
+        );
+
+        func.emit = false;
+        assert!(validate_function_at(&func, Stage::Lowered).is_ok());
     }
 
     /// I6: a load or atomic whose offset no 32-bit displacement holds is

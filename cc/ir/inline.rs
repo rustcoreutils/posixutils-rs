@@ -536,10 +536,6 @@ impl InlineContext {
         return_continuation_bb: BasicBlockId,
         return_target: Option<PseudoId>,
     ) -> Self {
-        // Use caller.next_pseudo instead of scanning pseudos list
-        // (the list may not contain all pseudo IDs, e.g., phi nodes from SSA)
-        let max_bb = caller.blocks.iter().map(|b| b.id.0).max().unwrap_or(0);
-
         // Collect the callee's local variable pseudos - these need renaming
         let callee_local_syms: HashSet<PseudoId> =
             callee.locals.values().map(|local| local.sym).collect();
@@ -556,8 +552,10 @@ impl InlineContext {
             pseudo_map: HashMap::with_capacity(DEFAULT_REMAP_CAPACITY),
             bb_map: HashMap::with_capacity(DEFAULT_ORDER_CAPACITY),
             global_sym_map: HashMap::with_capacity(DEFAULT_ORDER_CAPACITY),
+            // Use caller.next_pseudo instead of scanning pseudos list
+            // (the list may not contain all pseudo IDs, e.g., phi nodes from SSA)
             next_pseudo_id: caller.next_pseudo,
-            next_bb_id: max_bb + 1,
+            next_bb_id: caller.fresh_block_id().0,
             call_args,
             forwarded,
             return_continuation_bb,
@@ -1552,23 +1550,7 @@ fn inline_call_site(
     // Update old children's parent references and phi nodes to point to continuation
     for &child_id in &old_children {
         if let Some(child) = caller.blocks.iter_mut().find(|b| b.id == child_id) {
-            // Update parent list
-            for parent in &mut child.parents {
-                if *parent == call_bb_id {
-                    *parent = continuation_bb_id;
-                }
-            }
-
-            // Update phi nodes: replace call_bb_id with continuation_bb_id
-            for insn in &mut child.insns {
-                if insn.op == Opcode::Phi {
-                    for (pred_bb, _) in &mut insn.phi_list {
-                        if *pred_bb == call_bb_id {
-                            *pred_bb = continuation_bb_id;
-                        }
-                    }
-                }
-            }
+            child.rename_predecessor(call_bb_id, continuation_bb_id);
         }
     }
 
@@ -3098,7 +3080,7 @@ mod tests {
 
         // Verify phi_list back-pointer was remapped (both bb and pseudo)
         assert_eq!(cloned_insn.phi_list.len(), 1);
-        let (new_bb, new_pseudo) = cloned_insn.phi_list[0];
+        let (new_bb, new_pseudo) = cloned_insn.phi_source_dest().expect("a back-pointer");
         assert_ne!(new_bb, BasicBlockId(5), "phi_list bb should be remapped");
         assert_ne!(
             new_pseudo,

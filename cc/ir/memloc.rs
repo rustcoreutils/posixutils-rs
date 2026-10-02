@@ -117,18 +117,11 @@ impl AddrMap {
                 }
             }
         }
-        // An inline-asm output is the one second definition invariant I1
-        // exempts, so for those pseudos "the instruction that defines %n" is
-        // not a fact about the function. Leaving them out of the map makes
+        // An inline-asm output has no one defining instruction (see
+        // `Function::asm_defined_pseudos`). Leaving them out of the map makes
         // the walk stop there and answer `Unknown`, which is the safe end.
-        for bb in &func.blocks {
-            for insn in &bb.insns {
-                if let Some(ref asm) = insn.extra().asm_data {
-                    for out in &asm.outputs {
-                        defs.remove(&out.pseudo);
-                    }
-                }
-            }
+        for out in func.asm_defined_pseudos() {
+            defs.remove(&out);
         }
         AddrMap { defs }
     }

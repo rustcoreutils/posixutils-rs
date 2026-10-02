@@ -22,11 +22,8 @@
 // into a constant, float or integer.
 //
 
-use super::{BasicBlockId, ConstValue, Function, Instruction, Opcode, PseudoId};
+use super::{BasicBlockId, ConstValue, Function, Instruction, Opcode, PseudoId, Site};
 use std::collections::HashMap;
-
-/// A `(block index, instruction index)` pair.
-pub(crate) type Site = (usize, usize);
 
 /// Replace the instruction at `site` with a `Copy` of the constant `v`.
 ///

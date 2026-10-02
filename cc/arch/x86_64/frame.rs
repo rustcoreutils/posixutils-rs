@@ -725,17 +725,13 @@ impl X86_64CodeGen {
             .chain(alloc.spilled_xmm_args().iter().map(|s| s.pseudo))
             .collect();
 
-        // Detect if there's a hidden return pointer (for functions returning large structs)
-        // The __sret pseudo has arg_idx=0 and shifts all other arg indices by 1
-        let has_sret = func
-            .pseudos
-            .iter()
-            .any(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"));
-        let arg_idx_offset: u32 = if has_sret { 1 } else { 0 };
+        // A hidden return pointer (for functions returning large structs) is
+        // `Arg(0)` and shifts every declared parameter one `Arg` along.
+        let args = func.arg_types();
         let arg_pseudos = func.arg_pseudos();
 
         // If there's a hidden return pointer, it takes RDI, so params start from RSI
-        if has_sret {
+        if args.sret.is_some() {
             int_arg_idx = 1;
         }
 
@@ -747,7 +743,7 @@ impl X86_64CodeGen {
             if crate::abi::param_is_memory_class(*typ, types) {
                 continue;
             }
-            if !arg_pseudos.contains_key(&((i as u32) + arg_idx_offset)) {
+            if !arg_pseudos.contains_key(&args.arg_of_param(i)) {
                 Self::advance_arg_regs(
                     *typ,
                     types,
@@ -760,7 +756,7 @@ impl X86_64CodeGen {
             }
             // The pseudo for this argument; each early exit leaves the block.
             'arg: {
-                let Some(pseudo) = arg_pseudos.get(&((i as u32) + arg_idx_offset)) else {
+                let Some(pseudo) = arg_pseudos.get(&args.arg_of_param(i)) else {
                     break 'arg;
                 };
                 // A MEMORY-class struct arrives on the stack by
@@ -1104,10 +1100,10 @@ impl X86_64CodeGen {
                 .map(|t| types.size_bits(t).max(32))
                 .unwrap_or(insn.size.max(32));
 
-            let one_sse_ret = insn.extra().abi_info.as_ref().is_some_and(|ai| {
-                matches!(&ai.ret, ArgClass::Direct { classes, .. }
-                         if classes.len() == 1 && classes[0] == RegClass::Sse)
-            });
+            let one_sse_ret = matches!(
+                insn.ret_class(),
+                Some(ArgClass::Direct { classes, .. }) if classes.as_slice() == [RegClass::Sse]
+            );
             if one_sse_ret && is_struct_or_union && !is_complex {
                 // One SSE register holding the whole aggregate. The `Ret`
                 // carries its address, so move every byte at once: a lone

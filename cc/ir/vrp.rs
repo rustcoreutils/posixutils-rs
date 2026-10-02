@@ -44,9 +44,9 @@ use super::constfold::{
 };
 use super::dataflow::{Lattice, Selector, Sparse, SparseAnalysis};
 use super::facts::{CmpDomain, CmpFacts, ConstMap};
-use super::propagate::{cbr_taken, Site};
+use super::propagate::cbr_taken;
 use super::range::{allowed_by_predicate, possible_orderings, Range};
-use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
+use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId, Site};
 use std::collections::{BTreeMap, HashMap};
 
 /// How many times one cell may move before it is pinned at the bottom of its

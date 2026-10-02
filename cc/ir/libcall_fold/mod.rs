@@ -41,7 +41,7 @@ use super::facts::ConstMap;
 use super::loadfwd::MemOracle;
 use super::memloc::{AddrMap, MemBase, ModuleInfo};
 use super::strdata::{ConstBytes, LocalBytes, StrReader};
-use super::{string_label, Function, Instruction, Opcode, PseudoId};
+use super::{string_label, Function, Instruction, Opcode, PseudoId, Site};
 use crate::abi::CallingConv;
 use crate::float::FloatVal;
 use crate::parse::ast::{CalleeBinding, LibFn};
@@ -220,9 +220,9 @@ pub fn run(func: &mut Function, ctx: &FoldCtx) -> bool {
 }
 
 /// Where a call folds, and to what.
-type Site = ((usize, usize), Folded);
+type FoldSite = (Site, Folded);
 
-fn collect(func: &Function, ctx: &FoldCtx) -> Vec<Site> {
+fn collect(func: &Function, ctx: &FoldCtx) -> Vec<FoldSite> {
     let am = AddrMap::build(func);
     let consts = ConstMap::new(func);
     let oracle = MemOracle::new(func, ctx.types, ctx.mi, &am);
@@ -355,7 +355,7 @@ fn callee_symbol<'a>(ctx: &'a FoldCtx, name: &'a str) -> &'a str {
 }
 
 /// Replace each call in `sites` with what it folds to.
-fn apply(func: &mut Function, ctx: &FoldCtx, sites: Vec<Site>) {
+fn apply(func: &mut Function, ctx: &FoldCtx, sites: Vec<FoldSite>) {
     let mut by_block: HashMap<usize, HashMap<usize, Folded>> = HashMap::new();
     for ((b, i), folded) in sites {
         by_block.entry(b).or_default().insert(i, folded);

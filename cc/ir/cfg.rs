@@ -144,7 +144,7 @@ impl BasicBlock {
     /// Make every record of `old` as a predecessor of this block -- in
     /// `parents`, and as the edge each phi takes an operand along -- name
     /// `new` instead.
-    fn rename_predecessor(&mut self, old: BasicBlockId, new: BasicBlockId) {
+    pub(super) fn rename_predecessor(&mut self, old: BasicBlockId, new: BasicBlockId) {
         for p in &mut self.parents {
             if *p == old {
                 *p = new;
@@ -205,7 +205,9 @@ impl Function {
         if let Some(b) = self.get_block_mut(from) {
             b.children.retain(|c| *c != to);
             for insn in &mut b.insns {
-                if insn.op == Opcode::PhiSource && insn.phi_list.first().is_some_and(|p| p.0 == to)
+                if insn
+                    .phi_source_dest()
+                    .is_some_and(|(phi_bb, _)| phi_bb == to)
                 {
                     insn.kill();
                 }
@@ -294,9 +296,9 @@ impl Function {
         let mut moved: HashMap<BasicBlockId, Vec<Instruction>> = HashMap::new();
         let mut kept = Vec::with_capacity(src.insns.len());
         for mut insn in std::mem::take(&mut src.insns) {
-            let feeds = (insn.op == Opcode::PhiSource)
-                .then(|| insn.phi_list.first().map(|p| p.0))
-                .flatten()
+            let feeds = insn
+                .phi_source_dest()
+                .map(|(to, _)| to)
                 .filter(|to| map.contains_key(to));
             match feeds {
                 Some(to) => moved.entry(to).or_default().push(insn),
@@ -546,7 +548,10 @@ impl Function {
         let block = &mut self.blocks[a];
         block.insns.pop();
         for insn in &mut block.insns {
-            if insn.op == Opcode::PhiSource && insn.phi_list.first().is_some_and(|p| p.0 == b) {
+            if insn
+                .phi_source_dest()
+                .is_some_and(|(phi_bb, _)| phi_bb == b)
+            {
                 insn.op = Opcode::Copy;
                 insn.phi_list.clear();
             }

@@ -53,15 +53,15 @@ pub fn eliminate_phi_nodes(func: &mut Function) {
                 Opcode::PhiSource => {
                     // PhiSource: target=phisrc_pseudo, src[0]=value,
                     //            phi_list[0]=(phi_bb, phi_target)
-                    if !insn.phi_list.is_empty() && !insn.src.is_empty() {
+                    if let (Some((_phi_bb, phi_target)), Some(&source)) =
+                        (insn.phi_source_dest(), insn.src.first())
+                    {
                         debug_assert_eq!(
                             insn.phi_list.len(),
                             1,
                             "PhiSource must have exactly one back-pointer"
                         );
-                        let (_phi_bb, phi_target) = insn.phi_list[0];
                         let phi_target = routed.get(&phi_target).copied().unwrap_or(phi_target);
-                        let source = insn.src[0];
 
                         // Skip copies from undef sources
                         let is_undef = func

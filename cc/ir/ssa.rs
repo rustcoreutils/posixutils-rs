@@ -11,7 +11,7 @@
 //
 
 use super::dominate::{domtree_build, idf_compute, DomTree};
-use super::{BasicBlockId, Function, InsnRef, Instruction, Opcode, Pseudo, PseudoId, PseudoKind};
+use super::{BasicBlockId, Function, Instruction, Opcode, Pseudo, PseudoId, PseudoKind, Site};
 use crate::types::{TypeId, TypeTable};
 use std::collections::HashMap;
 
@@ -46,7 +46,7 @@ struct SsaConverter<'a> {
     phis: Phis,
 
     /// Stores to remove after conversion
-    dead_stores: Vec<InsnRef>,
+    dead_stores: Vec<Site>,
 
     /// Counter for generating new pseudo IDs
     next_pseudo_id: u32,
@@ -406,7 +406,9 @@ fn rename_insn(
                         def_stack.push(name, val);
 
                         // Mark store for removal
-                        converter.dead_stores.push(InsnRef::new(bb_id, insn_idx));
+                        if let Some(b) = converter.func.block_index(bb_id) {
+                            converter.dead_stores.push((b, insn_idx));
+                        }
                     }
                 }
             }
@@ -668,14 +670,12 @@ fn lookup_var_in_pred(
 // Phase 3: Cleanup
 
 /// Remove dead stores that were converted to SSA.
-fn remove_dead_stores(func: &mut Function, dead_stores: &[InsnRef]) {
+fn remove_dead_stores(func: &mut Function, dead_stores: &[Site]) {
     // Converting to Nop is index-stable so iteration order doesn't matter.
-    for insn_ref in dead_stores {
-        if let Some(bb) = func.get_block_mut(insn_ref.bb) {
-            if insn_ref.idx < bb.insns.len() {
-                // Convert to Nop instead of removing to preserve indices
-                bb.insns[insn_ref.idx].kill();
-            }
+    for &(b, i) in dead_stores {
+        if let Some(insn) = func.blocks.get_mut(b).and_then(|bb| bb.insns.get_mut(i)) {
+            // Convert to Nop instead of removing to preserve indices
+            insn.kill();
         }
     }
 }
@@ -1160,12 +1160,9 @@ mod tests {
         for bb in &func.blocks {
             for insn in &bb.insns {
                 if insn.op == Opcode::PhiSource {
-                    // PhiSource must have a back-pointer in phi_list
-                    assert!(
-                        !insn.phi_list.is_empty(),
-                        "PhiSource must have a back-pointer"
-                    );
-                    let (phi_bb, phi_pseudo) = insn.phi_list[0];
+                    let (phi_bb, phi_pseudo) = insn
+                        .phi_source_dest()
+                        .expect("PhiSource must have a back-pointer");
                     // Back-pointer should reference the merge block's phi
                     assert_eq!(phi_bb, BasicBlockId(3));
                     assert_eq!(phi_pseudo, phi_target);

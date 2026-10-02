@@ -635,7 +635,7 @@ fn check_phis(func: &Function, out: &mut Vec<ValidationError>) {
                     }
                 }
                 Opcode::PhiSource => {
-                    let feeds = insn.phi_list.first().map(|p| p.0);
+                    let feeds = insn.phi_source_dest().map(|(bb, _)| bb);
                     if !feeds.is_some_and(|f| bb.children.contains(&f)) {
                         out.push(ValidationError::CfgInconsistent {
                             function: func.name.clone(),

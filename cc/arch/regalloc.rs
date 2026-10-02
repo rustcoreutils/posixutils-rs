@@ -1918,6 +1918,7 @@ mod tests {
             let offset = u32::from(sret);
             if sret {
                 func.add_pseudo(Pseudo::arg(PseudoId(0), 0).with_name("__sret"));
+                func.sret = Some(PseudoId(0));
             }
             for (i, typ) in params.iter().enumerate() {
                 func.add_param(format!("p{i}"), *typ);

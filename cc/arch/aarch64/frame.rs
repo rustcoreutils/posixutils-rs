@@ -21,7 +21,7 @@ use crate::arch::codegen::is_variadic_function;
 use crate::arch::lir::{
     complex_fp_info, plan_pair_move, CondCode, Directive, FpSize, OperandSize, PairMove, Symbol,
 };
-use crate::ir::{Function, Instruction, PseudoId, PseudoKind};
+use crate::ir::{Function, Instruction, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::HashSet;
 
@@ -771,12 +771,7 @@ impl Aarch64CodeGen {
         let spilled_pseudos: HashSet<PseudoId> =
             alloc.spilled_args().iter().map(|s| s.pseudo).collect();
 
-        // Detect sret for arg_idx offset
-        let has_sret = func
-            .pseudos
-            .iter()
-            .any(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"));
-        let arg_idx_offset: u32 = if has_sret { 1 } else { 0 };
+        let args = func.arg_types();
         let arg_pseudos = func.arg_pseudos();
 
         for (i, (_name, typ)) in func.params.iter().enumerate() {
@@ -827,7 +822,7 @@ impl Aarch64CodeGen {
             // The pseudo for this argument; each early exit leaves the block.
             // With sret, params have arg_idx = i + 1, but still use arg_regs[i].
             'arg: {
-                let Some(pseudo) = arg_pseudos.get(&((i as u32) + arg_idx_offset)) else {
+                let Some(pseudo) = arg_pseudos.get(&args.arg_of_param(i)) else {
                     break 'arg;
                 };
                 // Skip pseudos already stored via spilled_args

@@ -117,13 +117,10 @@ fn forwarding(func: &Function, types: &TypeTable) -> HashMap<PseudoId, PseudoId>
             }
         }
     }
-    // An inline-asm output is a second definition of its pseudo, which the
-    // SSA invariant exempts; such a pseudo is never a copy's safe source.
-    let mut multiply_defined: Vec<PseudoId> = Vec::new();
+    // An inline-asm output is a second definition of its pseudo, so it is
+    // never a copy's safe source; see `Function::asm_defined_pseudos`.
+    let multiply_defined = func.asm_defined_pseudos();
     for insn in func.blocks.iter().flat_map(|b| &b.insns) {
-        if let Some(asm) = &insn.extra().asm_data {
-            multiply_defined.extend(asm.outputs.iter().map(|o| o.pseudo));
-        }
         if let (Some(t), Some(typ)) = (insn.target, insn.typ) {
             shape.insert(
                 t,

@@ -1871,6 +1871,7 @@ impl<'a> Linearizer<'a> {
             let sret_id = self.alloc_pseudo();
             let sret_pseudo = Pseudo::arg(sret_id, 0).with_name("__sret");
             ir_func.add_pseudo(sret_pseudo);
+            ir_func.sret = Some(sret_id);
             self.struct_return_ptr = Some(sret_id);
         }
 

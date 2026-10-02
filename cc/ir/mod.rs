@@ -132,20 +132,11 @@ pub fn aggregate_ret_is_address(ret: &ArgClass, size_bits: u32) -> bool {
         }
 }
 
-// Instruction Reference - for def-use chains
+// Instruction sites
 
-/// Reference to an instruction by (basic block id, instruction index)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct InsnRef {
-    pub bb: BasicBlockId,
-    pub idx: usize,
-}
-
-impl InsnRef {
-    pub fn new(bb: BasicBlockId, idx: usize) -> Self {
-        Self { bb, idx }
-    }
-}
+/// An instruction's place in a function: `(block index, instruction index)`,
+/// both positions in the vectors rather than ids.
+pub(crate) type Site = (usize, usize);
 
 // Opcodes
 
@@ -1870,6 +1861,17 @@ impl Instruction {
             .with_type_and_size(typ, size)
     }
 
+    /// The phi a `PhiSource` feeds: the phi's block and its target, read from
+    /// the back-pointer in `phi_list`. `None` for any other opcode, whose
+    /// `phi_list` (a phi's incoming pairs, or nothing) is no back-pointer.
+    pub fn phi_source_dest(&self) -> Option<(BasicBlockId, PseudoId)> {
+        if self.op == Opcode::PhiSource {
+            self.phi_list.first().copied()
+        } else {
+            None
+        }
+    }
+
     /// Create a select (ternary) instruction for pure expressions
     /// Enables cmov/csel codegen instead of branches
     pub fn select(
@@ -1898,13 +1900,15 @@ impl Instruction {
         }
     }
 
+    /// The ABI classification of this call's or return's value, when the
+    /// instruction carries one.
+    pub fn ret_class(&self) -> Option<&ArgClass> {
+        self.extra().abi_info.as_ref().map(|ai| &ai.ret)
+    }
+
     /// Check if this call/return uses a hidden sret pointer for the return value.
     pub fn returns_via_sret(&self) -> bool {
-        self.extra()
-            .abi_info
-            .as_ref()
-            .map(|ai| matches!(ai.ret, ArgClass::Indirect { .. }))
-            .unwrap_or(false)
+        matches!(self.ret_class(), Some(ArgClass::Indirect { .. }))
     }
 
     /// True when this `Ret` hands its value back in st(0).
@@ -1913,23 +1917,12 @@ impl Instruction {
     /// is loaded onto the FPU stack from memory, since nothing else can hold
     /// an 80-bit value.
     pub fn returns_via_x87(&self) -> bool {
-        self.extra()
-            .abi_info
-            .as_ref()
-            .map(|ai| matches!(ai.ret, ArgClass::X87 { .. }))
-            .unwrap_or(false)
+        matches!(self.ret_class(), Some(ArgClass::X87 { .. }))
     }
 
     /// Check if this call/return uses two registers for the return value.
     pub fn returns_two_regs(&self) -> bool {
-        self.extra()
-            .abi_info
-            .as_ref()
-            .map(|ai| match &ai.ret {
-                ArgClass::Direct { classes, .. } => classes.len() == 2,
-                _ => false,
-            })
-            .unwrap_or(false)
+        matches!(self.ret_class(), Some(ArgClass::Direct { classes, .. }) if classes.len() == 2)
     }
 
     /// True when this `Ret` hands back an aggregate by *address*: its source
@@ -1942,10 +1935,8 @@ impl Instruction {
     /// puts `abi_info` on a `Ret`, and only for a struct or union, so no
     /// scalar reaches this.
     pub fn returns_aggregate_address(&self) -> bool {
-        self.extra()
-            .abi_info
-            .as_ref()
-            .is_some_and(|ai| aggregate_ret_is_address(&ai.ret, self.size))
+        self.ret_class()
+            .is_some_and(|ret| aggregate_ret_is_address(ret, self.size))
     }
 
     /// Turn this instruction into a `Nop` that holds nothing at all.
@@ -2087,7 +2078,7 @@ impl fmt::Display for InstructionDisplay<'_> {
                 if let Some(src) = this.src.first() {
                     write!(f, " {}", ctx.pseudo(*src))?;
                 }
-                if let Some((bb, pseudo)) = this.phi_list.first() {
+                if let Some((bb, pseudo)) = this.phi_source_dest() {
                     write!(f, " (-> {}:{})", bb, pseudo)?;
                 }
             }
@@ -2299,6 +2290,11 @@ impl<'a> ArgTypes<'a> {
         let i = arg.checked_sub(u32::from(self.sret.is_some()))?;
         self.params.get(i as usize).map(|(_, typ)| *typ)
     }
+
+    /// The `Arg` number the `i`-th declared parameter arrives as.
+    pub fn arg_of_param(&self, i: usize) -> u32 {
+        i as u32 + u32::from(self.sret.is_some())
+    }
 }
 
 /// A parameter whose local storage is filled implicitly by the backend prologue
@@ -2425,6 +2421,11 @@ pub struct Function {
     /// this set: its `Ret` carries the ABI classification that lets the
     /// inliner copy the bytes (`Instruction::returns_aggregate_address`).
     pub ret_is_address: bool,
+    /// The hidden struct-return pointer, when the function returns through
+    /// one: the `Arg(0)` pseudo the linearizer creates for it, which shifts
+    /// every declared parameter one `Arg` along. Read it through
+    /// [`Function::sret_arg`].
+    pub sret: Option<PseudoId>,
     /// Block ID -> index in `blocks` vec (O(1) lookup)
     block_idx: HashMap<BasicBlockId, usize>,
     /// Pseudo ID -> index in `pseudos` vec (O(1) lookup)
@@ -2458,6 +2459,7 @@ impl Default for Function {
             is_inline: false,
             implicit_param_copies: Vec::new(),
             ret_is_address: false,
+            sret: None,
             block_idx: HashMap::new(),
             pseudo_idx: HashMap::new(),
         }
@@ -2623,13 +2625,28 @@ impl Function {
 
     /// The hidden struct-return pointer, if this function has one.
     ///
-    /// The linearizer emits it as `Arg(0)` under the literal name `__sret`,
-    /// which shifts every declared parameter one `Arg` along.
+    /// The linearizer emits it as `Arg(0)` and records it in
+    /// [`Function::sret`]; it shifts every declared parameter one `Arg` along.
     pub fn sret_arg(&self) -> Option<PseudoId> {
-        self.pseudos
+        self.sret
+    }
+
+    /// The pseudos an inline `asm` writes as outputs.
+    ///
+    /// An asm output is a second definition of its pseudo, the one invariant
+    /// I1 deliberately exempts, so for these "the instruction that defines
+    /// %n" says nothing about the value: a tied operand (`"0"(x)`) is even
+    /// written as a `Copy` into the output pseudo *before* the asm. Every
+    /// pass that follows a pseudo to its definition, or folds a use of it,
+    /// leaves these alone; asking here keeps them answering alike, because a
+    /// pass that folds what the others would not is the one that miscompiles.
+    pub fn asm_defined_pseudos(&self) -> HashSet<PseudoId> {
+        self.blocks
             .iter()
-            .find(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"))
-            .map(|p| p.id)
+            .flat_map(|bb| &bb.insns)
+            .filter_map(|insn| insn.extra().asm_data.as_deref())
+            .flat_map(|asm| asm.outputs.iter().map(|o| o.pseudo))
+            .collect()
     }
 
     /// The type the caller passes for the parameter an `Arg(arg)` pseudo
@@ -2643,10 +2660,8 @@ impl Function {
         self.arg_types().of(arg)
     }
 
-    /// [`Function::param_type_of_arg`] for many arguments: finding the sret
-    /// pointer is a walk of the pseudo table, done here once rather than per
-    /// argument -- which, over a function of 100,000 parameters, was 10^10
-    /// steps.
+    /// [`Function::param_type_of_arg`] for many arguments, and the `Arg`
+    /// each declared parameter arrives as.
     pub fn arg_types(&self) -> ArgTypes<'_> {
         ArgTypes::new(self.sret_arg(), &self.params)
     }
@@ -4124,6 +4139,7 @@ mod tests {
             let off = u32::from(sret);
             if sret {
                 f.add_pseudo(Pseudo::arg(PseudoId(9), 0).with_name("__sret"));
+                f.sret = Some(PseudoId(9));
             }
             let params = [
                 types.char_id,
@@ -4148,7 +4164,60 @@ mod tests {
                 assert_eq!(args.of(arg), f.param_type_of_arg(arg), "Arg({arg})");
             }
             assert_eq!(args.of(off), Some(types.char_id));
+            for (i, t) in params.iter().enumerate() {
+                assert_eq!(args.of(args.arg_of_param(i)), Some(*t));
+            }
         }
+    }
+
+    /// Only a `PhiSource`'s `phi_list` is a back-pointer; a phi's is its
+    /// incoming pairs.
+    #[test]
+    fn test_phi_source_dest() {
+        let types = TypeTable::new(&Target::host());
+        let mut src = Instruction::phi_source(PseudoId(1), PseudoId(0), types.int_id, 32);
+        assert_eq!(src.phi_source_dest(), None, "no back-pointer yet");
+        src.phi_list = vec![(BasicBlockId(3), PseudoId(2))];
+        assert_eq!(src.phi_source_dest(), Some((BasicBlockId(3), PseudoId(2))));
+        let mut phi = Instruction::phi(PseudoId(2), types.int_id, 32);
+        phi.phi_list = vec![(BasicBlockId(1), PseudoId(1))];
+        assert_eq!(phi.phi_source_dest(), None, "a phi feeds nothing");
+    }
+
+    /// Every asm output across the function, and nothing else.
+    #[test]
+    fn test_asm_defined_pseudos() {
+        let types = TypeTable::new(&Target::host());
+        let asm = |outs: &[u32]| {
+            Instruction::asm(AsmData {
+                template: String::new(),
+                outputs: outs
+                    .iter()
+                    .map(|&n| AsmConstraint::new(PseudoId(n), "=r", Arch::X86_64, 32))
+                    .collect(),
+                inputs: vec![AsmConstraint::new(PseudoId(9), "r", Arch::X86_64, 32)],
+                clobbers: vec![],
+                goto_labels: vec![],
+            })
+        };
+        let mut f = Function::new("f", types.void_id);
+        assert!(f.asm_defined_pseudos().is_empty());
+        let mut b0 = BasicBlock::new(BasicBlockId(0));
+        b0.add_insn(asm(&[1, 2]));
+        b0.add_insn(Instruction::unop(
+            Opcode::Copy,
+            PseudoId(3),
+            PseudoId(1),
+            types.int_id,
+            32,
+        ));
+        let mut b1 = BasicBlock::new(BasicBlockId(1));
+        b1.add_insn(asm(&[4]));
+        f.add_block(b0);
+        f.add_block(b1);
+        let got = f.asm_defined_pseudos();
+        let want: HashSet<PseudoId> = [1, 2, 4].into_iter().map(PseudoId).collect();
+        assert_eq!(got, want);
     }
 
     #[test]

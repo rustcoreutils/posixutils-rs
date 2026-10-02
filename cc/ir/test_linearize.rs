@@ -9153,13 +9153,19 @@ fn test_complex_multiply_routine_follows_the_return_class() {
         );
         let module = linearize_source(&src, &Target::new(arch, Os::Linux));
         let m = module.functions.iter().find(|f| f.name == "m").unwrap();
-        let has_sret = m
+        let sret_pseudo = m
             .pseudos
             .iter()
-            .any(|p| p.kind == PseudoKind::Arg(0) && p.name.as_deref() == Some("__sret"));
+            .find(|p| p.kind == PseudoKind::Arg(0) && p.name.as_deref() == Some("__sret"))
+            .map(|p| p.id);
         assert_eq!(
-            has_sret, sret,
+            sret_pseudo.is_some(),
+            sret,
             "{base} on {arch:?}: the function's own return"
+        );
+        assert_eq!(
+            m.sret, sret_pseudo,
+            "{base} on {arch:?}: the function records the pointer it takes"
         );
         let call = m
             .blocks

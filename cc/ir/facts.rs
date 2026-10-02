@@ -118,24 +118,9 @@ impl ConstMap {
                 }
             }
         }
-        // An inline-asm output is a second definition of its pseudo that
-        // invariant I1 deliberately exempts, so nothing else notices the
-        // pseudo has two defs. A tied operand (`"0"(x)`) is written as a
-        // `Copy` into the output pseudo *before* the asm, so following that
-        // copy answers with the asm's input where the question was about its
-        // result. `dataflow::Sparse` already refuses these for the same
-        // reason, for `sccp` and `vrp`; they must agree, because a pass that
-        // folds what those would not is the one that miscompiles.
-        for bb in &func.blocks {
-            for insn in &bb.insns {
-                let Some(ref asm) = insn.extra().asm_data else {
-                    continue;
-                };
-                for out in &asm.outputs {
-                    poisoned.push(out.pseudo);
-                }
-            }
-        }
+        // An inline-asm output's recorded definition says nothing about its
+        // value; see `Function::asm_defined_pseudos`.
+        poisoned.extend(func.asm_defined_pseudos());
 
         for id in poisoned {
             copies.remove(&id);

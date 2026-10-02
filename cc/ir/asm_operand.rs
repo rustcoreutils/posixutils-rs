@@ -184,11 +184,9 @@ fn immediate_rewrites(
     if !asms().any(|(.., asm)| asm.inputs.iter().any(|c| c.class.is_immediate_only())) {
         return Vec::new();
     }
-    // An asm output is a second definition of its pseudo, so the definition
-    // recorded for it says nothing about the value: follow none of them.
-    let redefined: HashSet<PseudoId> = asms()
-        .flat_map(|(.., asm)| asm.outputs.iter().map(|o| o.pseudo))
-        .collect();
+    // The definition recorded for an asm output says nothing about the
+    // value (see `Function::asm_defined_pseudos`): follow none of them.
+    let redefined = func.asm_defined_pseudos();
     let defs: HashMap<PseudoId, &Instruction> = func
         .blocks
         .iter()

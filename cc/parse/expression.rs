@@ -1476,7 +1476,7 @@ impl<'a> Parser<'a> {
                 let member = self.expect_identifier()?;
                 // Get member type from struct type, resolving incomplete types first
                 let member_type = if let Some(t) = expr.typ {
-                    let resolved = self.resolve_struct_type(t);
+                    let resolved = self.symbols.resolve_struct_type(self.types, t);
                     let kind = self.types.kind(resolved);
                     if kind != TypeKind::Struct && kind != TypeKind::Union {
                         diag::error(
@@ -1515,7 +1515,7 @@ impl<'a> Parser<'a> {
                 // Get member type: dereference pointer to get struct, resolve if incomplete, then find member
                 let member_type = if let Some(t) = expr.typ {
                     if let Some(struct_type) = self.types.base_type(t) {
-                        let resolved = self.resolve_struct_type(struct_type);
+                        let resolved = self.symbols.resolve_struct_type(self.types, struct_type);
                         let kind = self.types.kind(resolved);
                         if kind != TypeKind::Struct && kind != TypeKind::Union {
                             diag::error(
@@ -1983,7 +1983,7 @@ impl<'a> Parser<'a> {
             ExprKind::Arrow { expr, member } => (self.types.base_type(expr.typ?)?, *member),
             _ => return None,
         };
-        let resolved = self.resolve_struct_type(base_typ);
+        let resolved = self.symbols.resolve_struct_type(self.types, base_typ);
         let info = self.types.find_member(resolved, member)?;
         Some((info.bit_width?, info.typ))
     }

@@ -590,6 +590,6 @@ impl Parser<'_> {
     /// (`intern_type_with_tag`), which completing the tag never updates.
     fn is_complete_type(&self, typ: TypeId) -> bool {
         self.types
-            .is_composite_complete(self.resolve_struct_type(typ))
+            .is_composite_complete(self.symbols.resolve_struct_type(self.types, typ))
     }
 }

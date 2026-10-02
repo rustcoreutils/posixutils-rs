@@ -2068,12 +2068,34 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// grow the stack on every evaluation until the function returned.
     pub(crate) fn frame_temp(&mut self, prefix: &str, typ: TypeId) -> PseudoId {
         let sym = self.alloc_pseudo();
-        let name = format!("{prefix}_{}", sym.0);
+        self.named_local(
+            sym,
+            format!("{prefix}_{}", sym.0),
+            typ,
+            self.current_bb,
+            None,
+        );
+        sym
+    }
+
+    /// Make `sym` the `Sym` pseudo of a frame local called `name`.
+    ///
+    /// `name` keys the function's locals, so a caller makes it unique --
+    /// usually by suffixing `sym`'s own number. `decl_block` is the block the
+    /// declaration appears in, for scope-aware phi placement; `None` for a
+    /// parameter or a slot live across the whole function.
+    pub(crate) fn named_local(
+        &mut self,
+        sym: PseudoId,
+        name: String,
+        typ: TypeId,
+        decl_block: Option<BasicBlockId>,
+        explicit_align: Option<u32>,
+    ) {
         if let Some(func) = &mut self.current_func {
             func.add_pseudo(Pseudo::sym(sym, name.clone()));
-            func.add_local(&name, sym, typ, self.current_bb, None);
+            func.add_local(name, sym, typ, decl_block, explicit_align);
         }
-        sym
     }
 
     /// The address of a fresh [`Self::frame_temp`], in a register.
@@ -2617,13 +2639,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                         storage: Storage::Indirect(_),
                         ..
                     }) => self.linearize_lvalue(target),
-                    Some(LocalBinding::Static { global }) => self.global_sym(global),
+                    Some(LocalBinding::Static { global }) => self.sym_pseudo(global),
                     Some(LocalBinding::ExtentsOnly) => {
                         unreachable!("no identifier names a type name's extents")
                     }
                     None => {
                         let name = self.symbol_name(*symbol_id);
-                        self.global_sym(name)
+                        self.sym_pseudo(name)
                     }
                 };
                 RmwPlace {
@@ -2635,7 +2657,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let base = self.linearize_lvalue(expr);
                 let struct_type = {
                     let declared = self.expr_type(expr);
-                    self.resolve_struct_type(declared)
+                    self.symbols.resolve_struct_type(self.types, declared)
                 };
                 self.member_place(base, struct_type, *member, target)
             }
@@ -2648,7 +2670,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         .types
                         .base_type(ptr_type)
                         .unwrap_or_else(|| self.expr_type(target));
-                    self.resolve_struct_type(declared)
+                    self.symbols.resolve_struct_type(self.types, declared)
                 };
                 self.member_place(base, struct_type, *member, target)
             }

@@ -10555,3 +10555,31 @@ fn test_zero_sized_aggregate_is_never_loaded_or_stored() {
         }
     }
 }
+
+/// A compound literal is an anonymous frame local whether it is read as a
+/// value or has its address taken: each gets its own `.compound_literal.N`
+/// local, named after its `Sym` pseudo, whose kind names that same local.
+#[test]
+fn test_compound_literal_is_a_named_frame_local() {
+    let src = "struct P { int x, y; };\n\
+               int f(void) { struct P a = (struct P){ 1 }; struct P *q = &(struct P){ .y = 2 };\n\
+               return a.x + q->y; }\n";
+    let module = linearize_source(src, &Target::host());
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let literals: Vec<(&String, &crate::ir::LocalVar)> = f
+        .locals
+        .iter()
+        .filter(|(name, _)| name.starts_with(".compound_literal."))
+        .collect();
+    assert_eq!(literals.len(), 2, "{:?}", f.locals.keys());
+    for (name, local) in literals {
+        assert_eq!(name.as_str(), format!(".compound_literal.{}", local.sym.0));
+        assert!(local.decl_block.is_some(), "{name}");
+        let pseudo = f.get_pseudo(local.sym).expect("registered");
+        assert!(
+            matches!(&pseudo.kind, PseudoKind::Sym(n) if n == name),
+            "{name}: {:?}",
+            pseudo.kind
+        );
+    }
+}

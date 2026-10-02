@@ -11,7 +11,7 @@
 //
 
 use crate::strings::StringId;
-use crate::types::TypeId;
+use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::HashMap;
 
 const DEFAULT_SYMBOL_MAP_CAPACITY: usize = 16384;
@@ -440,6 +440,29 @@ impl SymbolTable {
         self.lookup(name, Namespace::Tag)
     }
 
+    /// Resolve an incomplete struct/union type to its complete definition.
+    ///
+    /// When a struct is forward-declared (e.g., `struct foo;`) and later
+    /// defined, the forward declaration creates an incomplete TypeId.
+    /// Pointers to the forward-declared type still reference this incomplete
+    /// TypeId even after the struct is fully defined with a new TypeId.
+    ///
+    /// This looks up the complete definition by the struct's tag name,
+    /// returning the complete TypeId if found and `type_id` otherwise.
+    pub fn resolve_struct_type(&self, types: &TypeTable, type_id: TypeId) -> TypeId {
+        let typ = types.get(type_id);
+        if typ.kind != TypeKind::Struct && typ.kind != TypeKind::Union {
+            return type_id;
+        }
+        match &typ.composite {
+            Some(composite) if !composite.is_complete => composite
+                .tag
+                .and_then(|tag| self.lookup_tag(tag))
+                .map_or(type_id, |symbol| symbol.typ),
+            _ => type_id,
+        }
+    }
+
     /// Look up a typedef by name, returning its symbol as well as its type.
     ///
     /// A variably modified typedef's array extents cannot live in the
@@ -509,7 +532,7 @@ mod tests {
     use super::*;
     use crate::strings::StringTable;
     use crate::target::Target;
-    use crate::types::{Type, TypeKind, TypeTable};
+    use crate::types::{CompositeType, Type};
 
     #[test]
     fn test_declare_and_lookup() {
@@ -527,6 +550,32 @@ mod tests {
         let found = table.lookup(x_id, Namespace::Ordinary).unwrap();
         assert_eq!(found.name, x_id);
         assert_eq!(found.kind, SymbolKind::Variable);
+    }
+
+    #[test]
+    fn test_resolve_struct_type() {
+        let mut strings = StringTable::new();
+        let mut types = TypeTable::new(&Target::host());
+        let mut table = SymbolTable::new();
+
+        let tag = strings.intern("node");
+        let forward = types.intern(Type::incomplete_struct(tag));
+        let complete = types.intern(Type::struct_type(CompositeType {
+            is_complete: true,
+            ..CompositeType::incomplete(Some(tag))
+        }));
+        assert_ne!(forward, complete);
+
+        // Before the tag is declared there is nothing to resolve to.
+        assert_eq!(table.resolve_struct_type(&types, forward), forward);
+
+        table.declare(Symbol::tag(tag, complete, 0)).unwrap();
+        assert_eq!(table.resolve_struct_type(&types, forward), complete);
+        assert_eq!(table.resolve_struct_type(&types, complete), complete);
+        assert_eq!(
+            table.resolve_struct_type(&types, types.int_id),
+            types.int_id
+        );
     }
 
     #[test]

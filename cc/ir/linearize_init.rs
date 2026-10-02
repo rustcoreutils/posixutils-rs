@@ -1246,7 +1246,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// included. Pointers are not looked through, so this terminates on the
     /// self-referential types C allows.
     fn type_holds_union(&self, typ: TypeId) -> bool {
-        let typ = self.resolve_struct_type(typ);
+        let typ = self.symbols.resolve_struct_type(self.types, typ);
         match self.types.kind(typ) {
             TypeKind::Union => true,
             TypeKind::Struct => self
@@ -1275,7 +1275,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         base: usize,
         held: &mut UnionMembers,
     ) {
-        let typ = self.resolve_struct_type(typ);
+        let typ = self.symbols.resolve_struct_type(self.types, typ);
         match self.types.kind(typ) {
             TypeKind::Struct | TypeKind::Union => {
                 let Some(composite) = self.types.get(typ).composite.as_ref() else {
@@ -1398,7 +1398,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         bitfield: bool,
         unions: UnionFold<'_>,
     ) -> SubobjectPlace {
-        let mut typ = self.resolve_struct_type(typ);
+        let mut typ = self.symbols.resolve_struct_type(self.types, typ);
         let mut base = 0usize;
         let mut unions = unions;
 
@@ -1428,7 +1428,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     };
                     base += member.0;
                     unions = unions.inside(member.0);
-                    typ = self.resolve_struct_type(member.1);
+                    typ = self.symbols.resolve_struct_type(self.types, member.1);
                 }
                 TypeKind::Struct => {
                     let Some(composite) = self.types.get(typ).composite.as_ref() else {
@@ -1463,7 +1463,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     };
                     base += member.offset;
                     unions = unions.inside(member.offset);
-                    typ = self.resolve_struct_type(member.typ);
+                    typ = self.symbols.resolve_struct_type(self.types, member.typ);
                 }
                 TypeKind::Array => {
                     let Some(elem_type) = self.types.base_type(typ) else {
@@ -1479,7 +1479,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     }
                     unions = unions.inside(elem_start - base);
                     base = elem_start;
-                    typ = self.resolve_struct_type(elem_type);
+                    typ = self.symbols.resolve_struct_type(self.types, elem_type);
                 }
                 // A scalar with something strictly inside it: only a union or
                 // a bit-field carrier can produce that, and neither is a
@@ -1595,7 +1595,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         size: usize,
         unions: UnionFold<'_>,
     ) -> Option<&'i mut Initializer> {
-        let typ = self.resolve_struct_type(typ);
+        let typ = self.symbols.resolve_struct_type(self.types, typ);
         if offset == 0 && size == self.types.size_bytes(typ) {
             return Some(init);
         }
@@ -2042,7 +2042,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             TypeKind::Struct | TypeKind::Union => {
-                let resolved_typ = self.resolve_struct_type(typ);
+                let resolved_typ = self.symbols.resolve_struct_type(self.types, typ);
                 let resolved_size = self.types.size_bytes(resolved_typ);
                 if let Some(composite) = self.types.get(resolved_typ).composite.as_ref() {
                     let members: Vec<_> = composite.members.clone();
@@ -2167,7 +2167,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     if self.types.kind(resolved) == TypeKind::Array {
                         resolved = self.types.base_type(resolved)?;
                     }
-                    resolved = self.resolve_struct_type(resolved);
+                    resolved = self.symbols.resolve_struct_type(self.types, resolved);
                     // Naming a member of a union says which member the
                     // initializer is for, and nothing downstream can recover
                     // that: every member of a union begins at `offset`.

@@ -12,8 +12,7 @@ use super::asm_operand::AddrWalk;
 use super::linearize::*;
 use super::linearize_emit::Controlling;
 use super::{
-    AsmConstraint, AsmData, BasicBlockId, GlobalStorage, Initializer, Instruction, Opcode, Pseudo,
-    PseudoId,
+    AsmConstraint, AsmData, BasicBlockId, GlobalStorage, Initializer, Instruction, Opcode, PseudoId,
 };
 use crate::arch::asm_constraints::{AsmAccess, AsmOperandClass};
 use crate::constexpr::ConstScope;
@@ -25,6 +24,7 @@ use crate::parse::ast::{
 };
 use crate::strings::StringId;
 use crate::symbol::SymbolId;
+use crate::token::lexer::payload_bytes;
 use crate::types::TypeTable;
 
 use crate::types::{TypeId, TypeKind, TypeModifiers};
@@ -480,19 +480,15 @@ impl<'a> super::linearize::Linearizer<'a> {
             let sym_id = self.alloc_pseudo();
             let name_str = self.symbol_name(declarator.symbol);
             let unique_name = format!("{}.{}", name_str, sym_id.0);
-            let sym = Pseudo::sym(sym_id, unique_name.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(sym);
-                // Register with function's local variable tracking for SSA
-                // Pass the current basic block as the declaration block for scope-aware phi placement
-                func.add_local(
-                    &unique_name,
-                    sym_id,
-                    typ,
-                    self.current_bb,
-                    declarator.explicit_align,
-                );
-            }
+            // The current block is the declaration block, for scope-aware phi
+            // placement.
+            self.named_local(
+                sym_id,
+                unique_name,
+                typ,
+                self.current_bb,
+                declarator.explicit_align,
+            );
 
             // Track in linearizer's locals map using SymbolId as key
             self.insert_local(declarator.symbol, LocalVarInfo::frame(sym_id, typ));
@@ -665,18 +661,13 @@ impl<'a> super::linearize::Linearizer<'a> {
         let size_sym_id = self.alloc_pseudo();
         let vla_name = self.symbol_name(declarator.symbol);
         let size_var_name = format!("__vla_size_{}.{}", vla_name, size_sym_id.0);
-        let size_sym = Pseudo::sym(size_sym_id, size_var_name.clone());
-
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(size_sym);
-            func.add_local(
-                &size_var_name,
-                size_sym_id,
-                ulong_type,
-                self.current_bb,
-                None, // no explicit alignment
-            );
-        }
+        self.named_local(
+            size_sym_id,
+            size_var_name,
+            ulong_type,
+            self.current_bb,
+            None,
+        );
 
         // Store num_elements into the hidden size variable
         let store_size_insn = Instruction::store(num_elements, size_sym_id, 0, ulong_type, 64);
@@ -712,22 +703,18 @@ impl<'a> super::linearize::Linearizer<'a> {
         let sym_id = self.alloc_pseudo();
         let sym_name = self.symbol_name(declarator.symbol);
         let unique_name = format!("{}.{}", sym_name, sym_id.0);
-        let sym = Pseudo::sym(sym_id, unique_name.clone());
 
         // Create a pointer type for the VLA (pointer to element type)
         let ptr_type = self.types.pointer_to(elem_type);
 
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(sym);
-            // Register as a pointer variable, not as the array type
-            func.add_local(
-                &unique_name,
-                sym_id,
-                ptr_type,
-                self.current_bb,
-                declarator.explicit_align, // VLA explicit alignment
-            );
-        }
+        // Register as a pointer variable, not as the array type
+        self.named_local(
+            sym_id,
+            unique_name,
+            ptr_type,
+            self.current_bb,
+            declarator.explicit_align,
+        );
 
         // Store the Alloca result (pointer) into the VLA symbol
         let store_insn = Instruction::store(alloca_result, sym_id, 0, ptr_type, 64);
@@ -990,7 +977,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // What every member inherits from the object: taken before
                 // resolving, which answers with the tag's unqualified type.
                 let object_quals = self.types.qualifiers(typ);
-                let resolved_typ = self.resolve_struct_type(typ);
+                let resolved_typ = self.symbols.resolve_struct_type(self.types, typ);
                 if let Some(composite) = self.types.get(resolved_typ).composite.as_ref() {
                     let members: Vec<_> = composite.members.clone();
                     let is_union = self.types.kind(resolved_typ) == TypeKind::Union;
@@ -1760,11 +1747,13 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
         let void_ptr = self.types.void_ptr_id;
         let slot = self.alloc_pseudo();
-        let name = format!("__goto_target.{}", slot.0);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(crate::ir::Pseudo::sym(slot, name.clone()));
-            func.add_local(&name, slot, void_ptr, None, None);
-        }
+        self.named_local(
+            slot,
+            format!("__goto_target.{}", slot.0),
+            void_ptr,
+            None,
+            None,
+        );
 
         let dispatch_bb = self.alloc_bb();
         let saved = self.current_bb;
@@ -2210,13 +2199,14 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// The code units a string literal contributes to an array initializer,
     /// or `None` if this is not a string literal.
     ///
-    /// A narrow literal's parsed form holds one C byte per Rust `char`, so the
-    /// units are the scalar values — iterating `bytes()` UTF-8-encodes anything
-    /// at or above 0x80, which turned `char a[] = "\x80"` into the two bytes
-    /// 0xC2 0x80 and left the array one byte short of what `sizeof` reported.
+    /// A narrow literal's parsed form is a literal payload, one C byte per
+    /// Rust `char`, so its units are [`payload_bytes`] — iterating `bytes()`
+    /// UTF-8-encodes anything at or above 0x80, which turned
+    /// `char a[] = "\x80"` into the two bytes 0xC2 0x80 and left the array one
+    /// byte short of what `sizeof` reported.
     fn string_literal_units(kind: &ExprKind) -> Option<Vec<i128>> {
         match kind {
-            ExprKind::StringLit(s) => Some(s.chars().map(|c| (c as u32 as u8) as i128).collect()),
+            ExprKind::StringLit(s) => Some(payload_bytes(s).map(i128::from).collect()),
             ExprKind::Utf16StringLit(u) => Some(u.iter().map(|c| *c as i128).collect()),
             ExprKind::WideStringLit(u) | ExprKind::Utf32StringLit(u) => {
                 Some(u.iter().map(|c| *c as i128).collect())
@@ -3749,7 +3739,7 @@ impl crate::constexpr::ConstEnv for Linearizer<'_> {
     }
 
     fn struct_of(&self, typ: TypeId) -> TypeId {
-        self.resolve_struct_type(typ)
+        self.symbols.resolve_struct_type(self.types, typ)
     }
 
     /// A `const` floating object folds only in a static initializer, as its

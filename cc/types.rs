@@ -1270,6 +1270,18 @@ impl TypeTable {
         }
     }
 
+    /// The unsigned integer type `bytes` wide, for moving an object's bits
+    /// as a value; `None` for a width with no such type.
+    pub fn unsigned_of_size(&self, bytes: usize) -> Option<TypeId> {
+        match bytes {
+            1 => Some(self.uchar_id),
+            2 => Some(self.ushort_id),
+            4 => Some(self.uint_id),
+            8 => Some(self.ulong_id),
+            _ => None,
+        }
+    }
+
     /// A fresh identity for a tagless composite definition; see
     /// [`CompositeType::anon_id`].
     pub fn fresh_anon_id(&mut self) -> u32 {
@@ -4120,6 +4132,17 @@ mod tests {
         let types = TypeTable::new(&Target::host());
         assert!(types.is_unsigned(types.uint_id));
         assert!(!types.is_unsigned(types.int_id));
+    }
+
+    #[test]
+    fn test_unsigned_of_size() {
+        let types = TypeTable::new(&Target::host());
+        assert_eq!(types.unsigned_of_size(1), Some(types.uchar_id));
+        assert_eq!(types.unsigned_of_size(2), Some(types.ushort_id));
+        assert_eq!(types.unsigned_of_size(4), Some(types.uint_id));
+        assert_eq!(types.unsigned_of_size(8), Some(types.ulong_id));
+        assert_eq!(types.unsigned_of_size(3), None);
+        assert_eq!(types.unsigned_of_size(16), None);
     }
 
     /// Plain `char`'s signedness is the target's (C17 6.2.5p15), and it is a

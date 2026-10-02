@@ -60,7 +60,7 @@ impl Parser<'_> {
             // `is_complete: false` that completing the tag never updates, and
             // `struct S; volatile struct S vs; struct S { int a; };` was
             // rejected although the tag is complete.
-            let typ = self.resolve_struct_type(typ);
+            let typ = self.symbols.resolve_struct_type(self.types, typ);
             if self.types.is_composite_complete(typ) {
                 continue;
             }

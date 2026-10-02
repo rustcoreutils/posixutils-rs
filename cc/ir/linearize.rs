@@ -973,8 +973,10 @@ impl<'a> Linearizer<'a> {
         }
     }
 
-    /// A `Sym` pseudo naming the global `name`.
-    pub(crate) fn global_sym(&mut self, name: String) -> PseudoId {
+    /// A `Sym` pseudo naming the assembler symbol `name`: a global, a string
+    /// literal's label, a code label. A frame local's is made by
+    /// [`Self::named_local`].
+    pub(crate) fn sym_pseudo(&mut self, name: String) -> PseudoId {
         let sym_id = self.alloc_pseudo();
         let pseudo = Pseudo::sym(sym_id, name);
         if let Some(func) = &mut self.current_func {
@@ -1133,12 +1135,11 @@ impl<'a> Linearizer<'a> {
     /// -- including a size no integer type could hold -- takes the default.
     pub(crate) fn bitfield_storage_type(&self, storage_size: usize) -> TypeId {
         match storage_size {
-            1 => self.types.uchar_id,
-            2 => self.types.ushort_id,
-            4 => self.types.uint_id,
-            8 => self.types.ulong_id,
             16 => self.types.uint128_id,
-            _ => self.types.uint_id,
+            _ => self
+                .types
+                .unsigned_of_size(storage_size)
+                .unwrap_or(self.types.uint_id),
         }
     }
 
@@ -1557,11 +1558,7 @@ impl<'a> Linearizer<'a> {
             // Store the pointer value (8 bytes) to a local.
             let ptr_type = self.types.pointer_to(typ);
             let local_sym = self.alloc_pseudo();
-            let sym = Pseudo::sym(local_sym, name.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(sym);
-                func.add_local(&name, local_sym, ptr_type, None, None);
-            }
+            self.named_local(local_sym, name, ptr_type, None, None);
             let ptr_size = self.types.size_bits(ptr_type);
             self.emit(Instruction::store(
                 arg_pseudo, local_sym, 0, ptr_type, ptr_size,
@@ -1593,11 +1590,7 @@ impl<'a> Linearizer<'a> {
         for (name, symbol_id_opt, typ, arg_pseudo) in struct_params {
             // Create a symbol pseudo for this local variable (its address)
             let local_sym = self.alloc_pseudo();
-            let sym = Pseudo::sym(local_sym, name.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(sym);
-                func.add_local(&name, local_sym, typ, None, None);
-            }
+            self.named_local(local_sym, name, typ, None, None);
 
             let typ_size = self.types.size_bits(typ);
             // The copy length is an object size, so it is counted in bytes.
@@ -1658,7 +1651,9 @@ impl<'a> Linearizer<'a> {
                 // as the integer they are. A zero-sized one arrives in
                 // nothing (`ArgClass::Ignore`) and has nothing to store.
                 let as_typ = if self.types.is_complex(typ) {
-                    self.bits_type(typ_bytes as usize).unwrap_or(typ)
+                    self.types
+                        .unsigned_of_size(typ_bytes as usize)
+                        .unwrap_or(typ)
                 } else {
                     typ
                 };
@@ -1689,11 +1684,9 @@ impl<'a> Linearizer<'a> {
             let is_complex = self.types.is_complex(typ);
             // Create a symbol pseudo for this local variable (its address)
             let local_sym = self.alloc_pseudo();
-            let sym = Pseudo::sym(local_sym, name.clone());
+            self.named_local(local_sym, name, typ, None, None);
             let typ_size_bytes = self.types.size_bytes(typ);
             if let Some(func) = &mut self.current_func {
-                func.add_pseudo(sym);
-                func.add_local(&name, local_sym, typ, None, None);
                 // Record for inliner: the backend prologue fills this local from
                 // registers; the inliner must generate an explicit copy instead.
                 func.implicit_param_copies.push(super::ImplicitParamCopy {
@@ -1735,11 +1728,7 @@ impl<'a> Linearizer<'a> {
         {
             // Create a symbol pseudo for this local variable (its address)
             let local_sym = self.alloc_pseudo();
-            let sym = Pseudo::sym(local_sym, name.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(sym);
-                func.add_local(&name, local_sym, typ, None, None);
-            }
+            self.named_local(local_sym, name, typ, None, None);
 
             // Store the incoming argument value to the local, converted from
             // its promoted type when an identifier list declared it.
@@ -2300,23 +2289,14 @@ impl<'a> Linearizer<'a> {
     /// bits of its value in one integer position rather than by address:
     /// Win64 passes and returns a complex number of 1, 2, 4 or 8 bytes the
     /// way it does an aggregate of that size. The value is then read as the
-    /// unsigned integer of that width -- [`Self::bits_type`].
+    /// unsigned integer of that width -- [`TypeTable::unsigned_of_size`].
     pub(crate) fn complex_travels_as_bits(&self, typ: TypeId, conv: CallingConv) -> bool {
         conv == CallingConv::Win64
             && self.types.is_complex(typ)
-            && self.bits_type(self.types.size_bytes(typ)).is_some()
-    }
-
-    /// The unsigned integer type `bytes` wide, for moving an object's bits
-    /// as a value; `None` for a width with no such type.
-    pub(crate) fn bits_type(&self, bytes: usize) -> Option<TypeId> {
-        match bytes {
-            1 => Some(self.types.uchar_id),
-            2 => Some(self.types.ushort_id),
-            4 => Some(self.types.uint_id),
-            8 => Some(self.types.ulong_id),
-            _ => None,
-        }
+            && self
+                .types
+                .unsigned_of_size(self.types.size_bytes(typ))
+                .is_some()
     }
 
     /// Return an aggregate the ABI returns in registers
@@ -2624,42 +2604,6 @@ impl<'a> Linearizer<'a> {
         }
     }
 
-    /// Resolve an incomplete struct/union type to its complete definition.
-    ///
-    /// When a struct is forward-declared (e.g., `struct foo;`) and later
-    /// defined, the forward declaration creates an incomplete TypeId.
-    /// Pointers to the forward-declared type still reference this incomplete
-    /// TypeId even after the struct is fully defined with a new TypeId.
-    ///
-    /// This method looks up the complete definition in the symbol table
-    /// using the struct's tag name, returning the complete TypeId if found.
-    pub(crate) fn resolve_struct_type(&self, type_id: TypeId) -> TypeId {
-        let typ = self.types.get(type_id);
-
-        // Only try to resolve struct/union types
-        if typ.kind != TypeKind::Struct && typ.kind != TypeKind::Union {
-            return type_id;
-        }
-
-        // Check if this is an incomplete type with a tag
-        if let Some(ref composite) = typ.composite {
-            if composite.is_complete {
-                // Already complete, no resolution needed
-                return type_id;
-            }
-            if let Some(tag) = composite.tag {
-                // Look up the tag in the symbol table to find the complete type
-                if let Some(symbol) = self.symbols.lookup_tag(tag) {
-                    // Return the complete type from the symbol table
-                    return symbol.typ;
-                }
-            }
-        }
-
-        // Couldn't resolve, return original
-        type_id
-    }
-
     /// The address of a complex-valued expression, whichever kind it is.
     ///
     /// Complex values live in memory and travel by address, and every complex
@@ -2823,14 +2767,14 @@ impl<'a> Linearizer<'a> {
                         binding: LocalBinding::Static { global },
                         typ,
                         ..
-                    }) => (self.global_sym(global), typ),
+                    }) => (self.sym_pseudo(global), typ),
                     Some(LocalVarInfo {
                         binding: LocalBinding::ExtentsOnly,
                         ..
                     }) => unreachable!("no identifier names a type name's extents"),
                     None => {
                         let name = self.symbol_name(*symbol_id);
-                        (self.global_sym(name), self.expr_type(expr))
+                        (self.sym_pseudo(name), self.expr_type(expr))
                     }
                 };
                 let result = self.alloc_pseudo();
@@ -2856,7 +2800,9 @@ impl<'a> Linearizer<'a> {
                 let base = self.linearize_lvalue(inner);
                 let base_struct_type = self.expr_type(inner);
                 // Resolve if the struct type is incomplete (forward-declared)
-                let struct_type = self.resolve_struct_type(base_struct_type);
+                let struct_type = self
+                    .symbols
+                    .resolve_struct_type(self.types, base_struct_type);
                 let member_info = self
                     .types
                     .find_member(struct_type, *member)
@@ -2876,7 +2822,9 @@ impl<'a> Linearizer<'a> {
                     .base_type(ptr_type)
                     .unwrap_or_else(|| self.expr_type(expr));
                 // Resolve if the struct type is incomplete (forward-declared)
-                let struct_type = self.resolve_struct_type(base_struct_type);
+                let struct_type = self
+                    .symbols
+                    .resolve_struct_type(self.types, base_struct_type);
                 let member_info = self
                     .types
                     .find_member(struct_type, *member)
@@ -2937,28 +2885,7 @@ impl<'a> Linearizer<'a> {
             ExprKind::CompoundLiteral { typ, elements } => {
                 // Compound literal as lvalue: create it and return its address
                 // This is used for &(struct S){...} and large struct assignment like *p = (struct S){...}
-                let sym_id = self.alloc_pseudo();
-                let unique_name = format!(".compound_literal.{}", sym_id.0);
-                let sym = Pseudo::sym(sym_id, unique_name.clone());
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(sym);
-                    func.add_local(&unique_name, sym_id, *typ, self.current_bb, None);
-                }
-
-                // For compound literals with partial initialization, C99 6.7.8p21 requires
-                // zero-initialization of all subobjects not explicitly initialized.
-                // Zero the entire compound literal first, then initialize specific members.
-                let type_kind = self.types.kind(*typ);
-                if type_kind == TypeKind::Struct
-                    || type_kind == TypeKind::Union
-                    || type_kind == TypeKind::Array
-                {
-                    self.emit_aggregate_zero(sym_id, *typ);
-                }
-
-                self.linearize_init_list(sym_id, *typ, elements);
-
-                // Return address of the compound literal
+                let sym_id = self.materialize_compound_literal(*typ, elements);
                 let result = self.alloc_reg_pseudo();
                 let ptr_type = self.types.pointer_to(*typ);
                 self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
@@ -3199,7 +3126,9 @@ impl<'a> Linearizer<'a> {
     ) -> PseudoId {
         let base = self.linearize_lvalue(inner_expr);
         let base_struct_type = self.expr_type(inner_expr);
-        let struct_type = self.resolve_struct_type(base_struct_type);
+        let struct_type = self
+            .symbols
+            .resolve_struct_type(self.types, base_struct_type);
         self.emit_member_access(base, struct_type, member, self.expr_type(expr))
     }
 
@@ -3216,7 +3145,9 @@ impl<'a> Linearizer<'a> {
             .types
             .base_type(ptr_type)
             .unwrap_or_else(|| self.expr_type(expr));
-        let struct_type = self.resolve_struct_type(base_struct_type);
+        let struct_type = self
+            .symbols
+            .resolve_struct_type(self.types, base_struct_type);
         self.emit_member_access(ptr, struct_type, member, self.expr_type(expr))
     }
 
@@ -3324,17 +3255,7 @@ impl<'a> Linearizer<'a> {
 
             let dim_sym_id = self.alloc_pseudo();
             let dim_var_name = format!("__vla_dim{}_{}.{}", dims.len(), name, dim_sym_id.0);
-            let dim_sym = Pseudo::sym(dim_sym_id, dim_var_name.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(dim_sym);
-                func.add_local(
-                    &dim_var_name,
-                    dim_sym_id,
-                    ulong_type,
-                    self.current_bb,
-                    None, // no explicit alignment
-                );
-            }
+            self.named_local(dim_sym_id, dim_var_name, ulong_type, self.current_bb, None);
 
             // Widen to 64-bit before storing.
             let dim_expr_typ = size_expr.typ.unwrap_or(self.types.int_id);
@@ -3785,7 +3706,8 @@ impl<'a> Linearizer<'a> {
         if self.complex_travels_as_bits(passed, conv) {
             let bytes = self.types.size_bytes(passed);
             let bits = self
-                .bits_type(bytes)
+                .types
+                .unsigned_of_size(bytes)
                 .expect("checked by complex_travels_as_bits");
             let loaded = self.alloc_reg_pseudo();
             let size = self.types.size_bits(bits);
@@ -4888,11 +4810,7 @@ impl<'a> Linearizer<'a> {
         let label = self.module.add_string(self.current_func_name.clone());
 
         // Create symbol pseudo for the string label
-        let sym_id = self.alloc_pseudo();
-        let sym_pseudo = Pseudo::sym(sym_id, label);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(sym_pseudo);
-        }
+        let sym_id = self.sym_pseudo(label);
 
         // Create result pseudo for the address
         let result = self.alloc_reg_pseudo();
@@ -4935,7 +4853,7 @@ impl<'a> Linearizer<'a> {
                     ObjectPlace::At(ptr, 0)
                 }
                 LocalBinding::Frame { sym, .. } => ObjectPlace::Sym(sym),
-                LocalBinding::Static { global } => ObjectPlace::Sym(self.global_sym(global)),
+                LocalBinding::Static { global } => ObjectPlace::Sym(self.sym_pseudo(global)),
                 LocalBinding::ExtentsOnly => {
                     unreachable!("no identifier names a type name's extents")
                 }
@@ -4946,7 +4864,7 @@ impl<'a> Linearizer<'a> {
         else {
             let name_str = self.symbol_name(symbol_id);
             self.check_inline_static_reference(&name_str);
-            let sym_id = self.global_sym(name_str);
+            let sym_id = self.sym_pseudo(name_str);
             let typ = self.expr_type(expr);
             self.read_object(ObjectPlace::Sym(sym_id), typ)
         }
@@ -4973,11 +4891,7 @@ impl<'a> Linearizer<'a> {
 
     /// Emit a symbol address for a string/wide-string label.
     pub(crate) fn emit_string_sym(&mut self, expr: &Expr, label: String) -> PseudoId {
-        let sym_id = self.alloc_pseudo();
-        let sym_pseudo = Pseudo::sym(sym_id, label);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(sym_pseudo);
-        }
+        let sym_id = self.sym_pseudo(label);
         let result = self.alloc_reg_pseudo();
         let typ = self.expr_type(expr);
         self.emit(Instruction::sym_addr(result, sym_id, typ));
@@ -5422,37 +5336,31 @@ impl<'a> Linearizer<'a> {
     pub(crate) fn linearize_compound_literal(&mut self, expr: &Expr) -> PseudoId {
         match &expr.kind {
             ExprKind::CompoundLiteral { typ, elements } => {
-                // Compound literals have automatic storage at block scope
-                // Create an anonymous local variable, similar to how local variables work
-
-                // Create a symbol pseudo for the compound literal (its address)
-                let sym_id = self.alloc_pseudo();
-                let unique_name = format!(".compound_literal.{}", sym_id.0);
-                let sym = Pseudo::sym(sym_id, unique_name.clone());
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(sym);
-                    // Register as local for proper stack allocation
-                    func.add_local(&unique_name, sym_id, *typ, self.current_bb, None);
-                }
-
-                // For compound literals with partial initialization, C99 6.7.8p21 requires
-                // zero-initialization of all subobjects not explicitly initialized.
-                // Zero the entire compound literal first, then initialize specific members.
-                let type_kind = self.types.kind(*typ);
-                if type_kind == TypeKind::Struct
-                    || type_kind == TypeKind::Union
-                    || type_kind == TypeKind::Array
-                {
-                    self.emit_aggregate_zero(sym_id, *typ);
-                }
-
-                // Initialize using existing init list machinery
-                self.linearize_init_list(sym_id, *typ, elements);
-
+                let sym_id = self.materialize_compound_literal(*typ, elements);
                 self.read_object(ObjectPlace::Sym(sym_id), *typ)
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Create a compound literal's object and initialize it; its `Sym`.
+    ///
+    /// A compound literal at block scope has automatic storage, so it is an
+    /// anonymous frame local. C17 6.7.9p21 zero-initializes every subobject
+    /// the list does not name, so an aggregate is zeroed whole first and the
+    /// list then writes the members it names.
+    fn materialize_compound_literal(&mut self, typ: TypeId, elements: &[InitElement]) -> PseudoId {
+        let sym_id = self.alloc_pseudo();
+        let name = format!(".compound_literal.{}", sym_id.0);
+        self.named_local(sym_id, name, typ, self.current_bb, None);
+        if matches!(
+            self.types.kind(typ),
+            TypeKind::Struct | TypeKind::Union | TypeKind::Array
+        ) {
+            self.emit_aggregate_zero(sym_id, typ);
+        }
+        self.linearize_init_list(sym_id, typ, elements);
+        sym_id
     }
 
     pub(crate) fn linearize_va_op(&mut self, expr: &Expr) -> PseudoId {
@@ -6308,10 +6216,7 @@ impl<'a> Linearizer<'a> {
         let Some(sym) = self.take_label_address(*name, expr.pos) else {
             return self.emit_const(0, self.types.void_ptr_id);
         };
-        let sym_pseudo = self.alloc_pseudo();
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(Pseudo::sym(sym_pseudo, sym));
-        }
+        let sym_pseudo = self.sym_pseudo(sym);
         let dst = self.alloc_pseudo();
         let void_ptr = self.types.void_ptr_id;
         self.emit(Instruction::sym_addr(dst, sym_pseudo, void_ptr));

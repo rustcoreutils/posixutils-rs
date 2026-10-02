@@ -608,42 +608,6 @@ impl<'a> Parser<'a> {
         false
     }
 
-    /// Resolve an incomplete struct/union type to its complete definition.
-    ///
-    /// When a struct is forward-declared (e.g., `struct foo;`) and later
-    /// defined, the forward declaration creates an incomplete TypeId.
-    /// Pointers to the forward-declared type still reference this incomplete
-    /// TypeId even after the struct is fully defined with a new TypeId.
-    ///
-    /// This method looks up the complete definition in the symbol table
-    /// using the struct's tag name, returning the complete TypeId if found.
-    pub(crate) fn resolve_struct_type(&self, type_id: TypeId) -> TypeId {
-        let typ = self.types.get(type_id);
-
-        // Only try to resolve struct/union types
-        if typ.kind != TypeKind::Struct && typ.kind != TypeKind::Union {
-            return type_id;
-        }
-
-        // Check if this is an incomplete type with a tag
-        if let Some(ref composite) = typ.composite {
-            if composite.is_complete {
-                // Already complete, no resolution needed
-                return type_id;
-            }
-            if let Some(tag) = composite.tag {
-                // Look up the tag in the symbol table to find the complete type
-                if let Some(symbol) = self.symbols.lookup_tag(tag) {
-                    // Return the complete type from the symbol table
-                    return symbol.typ;
-                }
-            }
-        }
-
-        // Couldn't resolve, return original
-        type_id
-    }
-
     /// Intern a type, but for struct/union/enum types with tags, check the symbol table
     /// first to reuse the existing TypeId. This ensures forward-declared types
     /// are properly linked when the type is later completed.
@@ -898,7 +862,7 @@ impl crate::constexpr::ConstEnv for Parser<'_> {
     }
 
     fn struct_of(&self, typ: TypeId) -> TypeId {
-        self.resolve_struct_type(typ)
+        self.symbols.resolve_struct_type(self.types, typ)
     }
 
     /// No floating identifier has a value in the parser, for the reason

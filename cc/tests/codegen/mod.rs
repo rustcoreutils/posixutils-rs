@@ -16,6 +16,7 @@ mod aarch64_runtime;
 mod aggregate_abi;
 mod asm_attributes;
 mod asm_constraint_letters;
+mod asm_operand_modifiers;
 pub mod asm_probe;
 mod atomics_asm;
 mod binary128;

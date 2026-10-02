@@ -138,6 +138,7 @@ impl Parser<'_> {
     /// Parse GCC extended inline assembly statement
     /// Format: __asm__ [volatile] [goto] ( "template" [: outputs [: inputs [: clobbers [: goto_labels]]]] );
     pub(super) fn parse_asm_statement(&mut self) -> ParseResult<Stmt> {
+        let pos = self.current_pos();
         self.advance(); // consume __asm/__asm__
 
         // Parse optional qualifiers: 'volatile', '__volatile__', 'inline', '__inline__', 'goto'
@@ -163,7 +164,14 @@ impl Parser<'_> {
         self.expect_special(b'(')?;
 
         // Parse template string (may be multiple concatenated strings)
-        let template = self.parse_asm_string_literal()?;
+        let mut template = self.parse_asm_string_literal()?;
+
+        // Basic asm, with no colon, is emitted as written: gcc substitutes
+        // nothing into it, so `%eax` and `%%` both reach the assembler
+        // unchanged. Escaping every `%` lets it share the extended-asm path.
+        if !self.is_special(b':') {
+            template = template.replace('%', "%%");
+        }
 
         // Parse outputs (after first ':')
         let outputs = if self.is_special(b':') {
@@ -204,6 +212,7 @@ impl Parser<'_> {
         let _ = is_volatile;
 
         Ok(Stmt::Asm {
+            pos,
             template,
             outputs,
             inputs,

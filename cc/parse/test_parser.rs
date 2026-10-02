@@ -1786,6 +1786,29 @@ fn test_goto_stmt() {
     }
 }
 
+/// Basic asm is emitted verbatim, so every `%` in it is escaped for the
+/// substitution extended asm shares; extended asm, even with no operands,
+/// keeps its template as written.
+#[test]
+fn test_asm_basic_template_escapes_percent() {
+    let template = |src| match parse_stmt(src).unwrap().0 {
+        Stmt::Asm { template, .. } => template,
+        other => panic!("expected asm: {other:?}"),
+    };
+    assert_eq!(
+        template("__asm__(\"mov %eax, %%ebx\");"),
+        "mov %%eax, %%%%ebx"
+    );
+    assert_eq!(
+        template("__asm__(\"mov %eax, %%ebx\" ::);"),
+        "mov %eax, %%ebx"
+    );
+    assert_eq!(
+        template("__asm__(\"mov %0, %%ebx\" :: \"r\"(1));"),
+        "mov %0, %%ebx"
+    );
+}
+
 #[test]
 fn test_labeled_stmt() {
     let (stmt, strings) = parse_stmt("label: x = 1;").unwrap();

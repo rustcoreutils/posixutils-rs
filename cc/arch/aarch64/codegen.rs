@@ -21,8 +21,10 @@ use crate::arch::aarch64::inline_asm::{asm_reg_name_32, asm_reg_name_64};
 use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{FrameBase, IncomingOff, Loc, LocalSlot, Reg, VReg};
 use crate::arch::codegen::SelectOperands;
+use crate::arch::codegen::{AsmModifierError, AsmOperandSlot, AsmOperandValue};
 use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
+use crate::float::FloatVal;
 use crate::ir::{Instruction, Module, Opcode, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
 use crate::types::{TypeId, TypeTable};
@@ -1245,37 +1247,76 @@ impl Aarch64CodeGen {
 impl crate::arch::AsmOperandFormatter for Aarch64CodeGen {
     type Reg = Reg;
 
-    fn size_modifiers(&self) -> &'static [char] {
-        // `w`/`x` name a general register's two widths; `b`/`h`/`s`/`d`/`q`
-        // name a vector register's five. Without the vector set a `"w"`
-        // operand could not be referenced at all -- `fsqrt %d0, %d1` reached
-        // the assembler with the `%d0` intact -- so there was no way to write
-        // a working vector asm.
-        //
-        // A vector operand is pre-rendered at its own type's width, and the
-        // substitution emits that text, so the modifier selects the operand
-        // rather than re-widening it. That agrees with the width the modifier
-        // names in every case where the two are consistent, which is what
-        // real code writes.
-        &['w', 'x', 'b', 'h', 's', 'd', 'q']
+    /// gcc's aarch64 operand modifiers, those real code uses: `w`/`x`, a
+    /// general register's two widths, and the zero register for a constant
+    /// zero; `b`/`h`/`s`/`d`/`q`, a vector register's five; `a`, an operand
+    /// as an address. A constant prints bare, with no `#`: gcc leaves that to
+    /// the template, so `.word %0` assembles and `add x0, x1, %2` still does.
+    fn format_operand(
+        &self,
+        slot: &AsmOperandSlot<Reg>,
+        modifier: Option<char>,
+    ) -> Result<String, AsmModifierError> {
+        use AsmOperandValue as V;
+        let zero = |v: &V<Reg>| match v {
+            V::Int(0) => true,
+            V::Float(f, _) => f.is_positive_zero(),
+            _ => false,
+        };
+        Ok(match (modifier, &slot.value) {
+            (Some('w'), V::Reg(r)) => asm_reg_name_32(*r).to_string(),
+            (Some('x'), V::Reg(r)) => asm_reg_name_64(*r).to_string(),
+            (Some('w'), v) if zero(v) => "wzr".to_string(),
+            (Some('x'), v) if zero(v) => "xzr".to_string(),
+            // A vector operand is rendered at its own type's width; the
+            // modifier renames the same register at the width it names.
+            (Some(m @ ('b' | 'h' | 's' | 'd' | 'q')), V::RegName(name)) => {
+                format!("{m}{}", &name[1..])
+            }
+            (Some('a'), V::Reg(r)) => format!("[{}]", asm_reg_name_64(*r)),
+            (Some('a'), V::Int(v)) => v.to_string(),
+            (Some('a'), V::Symbol(sym)) => sym.clone(),
+            (Some('b' | 'h' | 's' | 'd' | 'q' | 'a'), _) => {
+                return Err(AsmModifierError::Inapplicable)
+            }
+            (None | Some('w' | 'x'), value) => match value {
+                V::Reg(r) if slot.size <= 32 => asm_reg_name_32(*r).to_string(),
+                V::Reg(r) => asm_reg_name_64(*r).to_string(),
+                V::RegName(text) | V::Mem(text) => text.clone(),
+                V::Int(v) => v.to_string(),
+                V::Float(v, _) => float_immediate(*v).ok_or(AsmModifierError::Unencodable(
+                    "aarch64 writes only a floating constant `fmov` encodes as an immediate",
+                ))?,
+                V::Symbol(sym) => sym.clone(),
+            },
+            _ => return Err(AsmModifierError::Unsupported),
+        })
     }
+}
 
-    fn format_reg_sized(&self, reg: Reg, size_mod: char) -> String {
-        // AArch64 doesn't use % prefix for register names
-        match size_mod {
-            'w' => asm_reg_name_32(reg).to_string(),
-            _ => asm_reg_name_64(reg).to_string(),
-        }
+/// A floating constant as gcc writes it into an aarch64 template: `0` for
+/// positive zero, else in decimal (`1.5e+0`) if `fmov` can encode it --
+/// `±n/16 * 2^r`, `n` in 16..=31 and `r` in -3..=4. Anything else has no
+/// immediate form.
+fn float_immediate(v: FloatVal) -> Option<String> {
+    if v.is_positive_zero() {
+        return Some("0".to_string());
     }
-
-    fn format_reg_default(&self, reg: Reg, size_bits: u32) -> String {
-        // Select register width matching the operand's declared size
-        if size_bits <= 32 {
-            asm_reg_name_32(reg).to_string()
-        } else {
-            asm_reg_name_64(reg).to_string()
-        }
+    let x = v.to_f64();
+    let encodable = x.is_finite()
+        && (-3..=4).any(|r| {
+            let n = x.abs() * 16.0 / 2f64.powi(r);
+            n.fract() == 0.0 && (16.0..=31.0).contains(&n)
+        });
+    if !encodable {
+        return None;
     }
+    // gcc's spelling: a mantissa with a point, an exponent with a sign.
+    let text = format!("{x:e}");
+    let (mantissa, exp) = text.split_once('e')?;
+    let point = if mantissa.contains('.') { "" } else { ".0" };
+    let sign = if exp.starts_with('-') { "" } else { "+" };
+    Some(format!("{mantissa}{point}e{sign}{exp}"))
 }
 
 // CodeGenerator trait implementation
@@ -1433,5 +1474,27 @@ impl CodeGenerator for Aarch64CodeGen {
 
     fn set_verbose_asm(&mut self, verbose: bool) {
         self.base.verbose_asm = verbose;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::float_immediate;
+    use crate::float::FloatVal;
+
+    /// gcc's spelling of the floating constants `fmov` encodes, and nothing
+    /// for the rest.
+    #[test]
+    fn float_immediates() {
+        let imm = |v: f64| float_immediate(FloatVal::from_f64(v));
+        assert_eq!(imm(0.0).as_deref(), Some("0"));
+        assert_eq!(imm(1.0).as_deref(), Some("1.0e+0"));
+        assert_eq!(imm(1.5).as_deref(), Some("1.5e+0"));
+        assert_eq!(imm(-0.125).as_deref(), Some("-1.25e-1"));
+        assert_eq!(imm(31.0).as_deref(), Some("3.1e+1"));
+        assert_eq!(imm(0.1328125).as_deref(), Some("1.328125e-1"));
+        for v in [-0.0, 1.1, 32.0, 0.0625, f64::INFINITY, f64::NAN] {
+            assert_eq!(imm(v), None, "{v}");
+        }
     }
 }

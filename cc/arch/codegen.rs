@@ -875,50 +875,90 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
 
 // Inline Assembly Support
 
-/// Trait for architecture-specific inline asm operand formatting.
-/// Implementations provide register formatting specific to their architecture.
-pub trait AsmOperandFormatter {
-    /// The register type for this architecture
-    type Reg: Copy;
+/// What one inline-asm operand is, as the template substitutes it.
+#[derive(Debug, Clone)]
+pub enum AsmOperandValue<R> {
+    /// A general register, named at the width the operand or a modifier asks
+    /// for.
+    Reg(R),
+    /// A register the backend names by its own spelling: a vector or x87
+    /// register.
+    RegName(String),
+    /// A memory reference in the target's syntax: `(%rax)`, `[x0, #8]`.
+    Mem(String),
+    /// An integer constant, sign-extended from the operand's width (see
+    /// [`crate::arch::asm_constraints::canonical_int`]).
+    Int(i64),
+    /// A floating constant, and its width in bits.
+    Float(FloatVal, u32),
+    /// A symbolic address constant, `sym` or `sym+off`, decorated for the
+    /// target.
+    Symbol(String),
+}
 
-    /// Return the size modifier characters recognized by this architecture.
-    /// e.g., x86: ['b', 'w', 'k', 'q'], aarch64: ['w', 'x']
-    fn size_modifiers(&self) -> &'static [char];
-
-    /// Format a register with the given size modifier.
-    /// Returns the formatted register string (e.g., "%eax" for x86, "w0" for aarch64).
-    fn format_reg_sized(&self, reg: Self::Reg, size_mod: char) -> String;
-
-    /// Format a register at operand-appropriate size (for bare %0, %1 references).
-    /// The `size_bits` parameter is the operand's declared size from the constraint.
-    fn format_reg_default(&self, reg: Self::Reg, size_bits: u32) -> String;
+impl<R> AsmOperandValue<R> {
+    /// What the operand is, for a diagnostic.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            AsmOperandValue::Reg(_) => "a general register",
+            AsmOperandValue::RegName(_) => "a floating-point or vector register",
+            AsmOperandValue::Mem(_) => "a memory reference",
+            AsmOperandValue::Int(_) => "an integer constant",
+            AsmOperandValue::Float(..) => "a floating constant",
+            AsmOperandValue::Symbol(_) => "a symbolic constant",
+        }
+    }
 }
 
 /// One inline-asm operand's resolved location, ready for template
 /// substitution. Built once per operand by `emit_inline_asm` on each
 /// backend; consumed by `substitute_asm_operands`.
-///
-/// Exactly one of `reg` or `mem` is meaningful for any given operand:
-/// `reg` holds a physical register if the operand resolved to a
-/// register substitution, and `mem` holds a pre-formatted operand
-/// string (memory operand like `[x0]`/`(%rax)`, or an immediate
-/// literal like `#42`/`$42`). The formatter chooses between them at
-/// substitution time — `mem` wins if set.
 #[derive(Debug, Clone)]
 pub struct AsmOperandSlot<R> {
-    /// Physical register if the operand resolved to a register-class
-    /// substitution; `None` otherwise.
-    pub reg: Option<R>,
-    /// Pre-formatted memory or immediate operand string; `None` if
-    /// the operand is a plain register.
-    pub mem: Option<String>,
-    /// Operand size in bits. Used by the formatter for sized register
-    /// modifiers (`%w0`/`%x0` on aarch64, `%b0`/`%w0`/`%k0`/`%q0` on
-    /// x86_64) and as a default for unmodified register formatting.
+    pub value: AsmOperandValue<R>,
+    /// Operand size in bits: the width a bare `%0` names a general register
+    /// at.
     pub size: u32,
     /// GCC named-operand alias (e.g. the `[out]` in `%[out]`). `None`
     /// for positional `%0`/`%1`/... operands.
     pub name: Option<String>,
+}
+
+impl<R: Copy> AsmOperandSlot<R> {
+    /// The general register the operand is in, if it is one.
+    pub fn reg(&self) -> Option<R> {
+        match self.value {
+            AsmOperandValue::Reg(r) => Some(r),
+            _ => None,
+        }
+    }
+}
+
+/// Why a template could not print an operand with a modifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsmModifierError {
+    /// The target has no such modifier, or c17 does not implement it.
+    Unsupported,
+    /// The modifier exists but does not apply to this kind of operand: x86
+    /// `%a` of a memory reference, aarch64 `%d` of a general register.
+    Inapplicable,
+    /// The operand has no spelling the target's assembler takes, and why.
+    Unencodable(&'static str),
+}
+
+/// Trait for architecture-specific inline asm operand formatting.
+pub trait AsmOperandFormatter {
+    /// The register type for this architecture
+    type Reg: Copy;
+
+    /// The operand as the template names it under `modifier`, or `None` for
+    /// a bare `%0`. The modifiers every target shares -- `%c` and `%n` of a
+    /// constant, `%l` of a label -- never reach here.
+    fn format_operand(
+        &self,
+        slot: &AsmOperandSlot<Self::Reg>,
+        modifier: Option<char>,
+    ) -> Result<String, AsmModifierError>;
 }
 
 /// A symbolic inline-asm constant: the already-decorated symbol `sym`
@@ -930,228 +970,164 @@ pub fn asm_symbol_constant(sym: &str, offset: i64) -> String {
     }
 }
 
-/// Substitute `%N`, `%[name]`, `%lN`, `%l[name]`, and size modifiers in
-/// an asm template. Architecture-specific register formatting is handled
-/// via the [`AsmOperandFormatter`] trait.
+/// The diagnostic for a constant operand whose constraint offers neither a
+/// register to load it into nor an immediate range that holds it:
+/// `"mN"(300)`. gcc rejects it too.
+pub fn impossible_constant(operand: usize, value: i128, constraint: &str) -> String {
+    format!(
+        "impossible constraint in 'asm': operand {operand} ({value}) fits no \
+         alternative of \"{constraint}\""
+    )
+}
+
+/// How a template names an operand: by number or by `[name]`.
+enum OperandRef {
+    Number(usize),
+    Name(String),
+}
+
+/// Read the operand reference after `%` and any modifier: digits, or a
+/// bracketed name. `None` when neither follows.
+fn read_operand_ref(chars: &mut std::iter::Peekable<std::str::Chars>) -> Option<OperandRef> {
+    if chars.next_if_eq(&'[').is_some() {
+        let mut name = String::new();
+        for ch in chars.by_ref() {
+            if ch == ']' {
+                break;
+            }
+            name.push(ch);
+        }
+        return Some(OperandRef::Name(name));
+    }
+    let mut digits = String::new();
+    while let Some(d) = chars.next_if(|d| d.is_ascii_digit()) {
+        digits.push(d);
+    }
+    // Too many digits to be an operand is out of range, like any other.
+    (!digits.is_empty()).then(|| OperandRef::Number(digits.parse().unwrap_or(usize::MAX)))
+}
+
+/// Substitute the operands into an extended-asm template, as gcc does:
 ///
-/// Handles:
-/// - `%%` escape sequences -> `%`
-/// - `%N` numeric operand references (multi-digit supported)
-/// - `%[name]` named operand references
-/// - `%lN` and `%l[name]` goto label references
-/// - `%{modifier}N` and `%{modifier}[name]` sized register references
+/// - `%%` is `%`
+/// - `%N` and `%[name]` name an operand, and `%xN`/`%x[name]` name it under
+///   the modifier `x`
+/// - `%lN` and `%l[name]` name an `asm goto` label; gcc numbers labels after
+///   every operand
+/// - `%cN` is a constant without its immediate prefix and `%nN` its
+///   negation, on every target
+///
+/// Anything else after a `%` is an error naming it: an unknown modifier, a
+/// modifier the operand cannot take, an operand that does not exist. Passed
+/// through, each reached the assembler as text it rejected or, worse,
+/// accepted as something else.
 pub fn substitute_asm_operands<F: AsmOperandFormatter>(
     formatter: &F,
     template: &str,
     slots: &[AsmOperandSlot<F::Reg>],
     goto_labels: &[(String, String)],
-) -> String {
+) -> Result<String, String> {
     let mut result = String::with_capacity(template.len() * 2);
     let mut chars = template.chars().peekable();
 
     while let Some(c) = chars.next() {
-        if c == '%' {
-            match chars.peek() {
-                Some('%') => {
-                    // %% -> %
-                    chars.next();
-                    result.push('%');
-                }
-                Some('[') => {
-                    // %[name] - named operand reference
-                    chars.next(); // consume '['
-                    let mut name = String::new();
-                    while let Some(&ch) = chars.peek() {
-                        if ch == ']' {
-                            chars.next();
-                            break;
-                        }
-                        name.push(ch);
-                        chars.next();
-                    }
-                    // Look up the name in operand slots
-                    if let Some(idx) = slots
-                        .iter()
-                        .position(|s| s.name.as_deref() == Some(name.as_str()))
-                    {
-                        let slot = &slots[idx];
-                        if let Some(ref mem) = slot.mem {
-                            result.push_str(mem);
-                        } else if let Some(reg) = slot.reg {
-                            result.push_str(&formatter.format_reg_default(reg, slot.size));
-                        }
-                    } else {
-                        // Unknown name, pass through
-                        result.push_str("%[");
-                        result.push_str(&name);
-                        result.push(']');
-                    }
-                }
-                Some(&d) if d.is_ascii_digit() => {
-                    // %0, %1, %10, etc. - numeric operand reference (multi-digit supported)
-                    chars.next();
-                    let mut num_str = String::new();
-                    num_str.push(d);
-                    while let Some(&digit) = chars.peek() {
-                        if digit.is_ascii_digit() {
-                            num_str.push(digit);
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    let idx: usize = num_str.parse().unwrap_or(0);
-                    if let Some(slot) = slots.get(idx) {
-                        if let Some(ref mem) = slot.mem {
-                            result.push_str(mem);
-                        } else if let Some(reg) = slot.reg {
-                            result.push_str(&formatter.format_reg_default(reg, slot.size));
-                        }
-                    } else {
-                        // Unknown operand, pass through
-                        result.push('%');
-                        result.push_str(&num_str);
-                    }
-                }
-                Some('l') => {
-                    // %l - label reference for asm goto: %l0, %l1, %l[name]
-                    chars.next(); // consume 'l'
-                    if let Some(&next_ch) = chars.peek() {
-                        if next_ch == '[' {
-                            // %l[name] - named label reference
-                            chars.next(); // consume '['
-                            let mut name = String::new();
-                            while let Some(&ch) = chars.peek() {
-                                if ch == ']' {
-                                    chars.next();
-                                    break;
-                                }
-                                name.push(ch);
-                                chars.next();
-                            }
-                            // Look up label by name (label_string, label_name)
-                            if let Some((label_str, _)) =
-                                goto_labels.iter().find(|(_, n)| n == &name)
-                            {
-                                result.push_str(label_str);
-                            } else {
-                                // Unknown label, pass through
-                                result.push_str("%l[");
-                                result.push_str(&name);
-                                result.push(']');
-                            }
-                        } else if next_ch.is_ascii_digit() {
-                            // `%lN`: gcc numbers labels after every operand,
-                            // the hidden inputs of `"+"` outputs included, so
-                            // the first label of a statement with three
-                            // operands is `%l3`. Counting from zero, and one
-                            // digit at a time, named the wrong label or none.
-                            let mut num = String::new();
-                            while let Some(&d) = chars.peek() {
-                                if !d.is_ascii_digit() {
-                                    break;
-                                }
-                                num.push(d);
-                                chars.next();
-                            }
-                            let label = num
-                                .parse::<usize>()
-                                .ok()
-                                .and_then(|n| n.checked_sub(slots.len()))
-                                .and_then(|i| goto_labels.get(i));
-                            if let Some((label_str, _)) = label {
-                                result.push_str(label_str);
-                            } else {
-                                // Not a label: pass through for the assembler
-                                // to reject, as gcc does.
-                                result.push_str("%l");
-                                result.push_str(&num);
-                            }
-                        } else {
-                            // Just %l without number or name, pass through
-                            result.push_str("%l");
-                        }
-                    } else {
-                        result.push_str("%l");
-                    }
-                }
-                Some(&d) if formatter.size_modifiers().contains(&d) => {
-                    // Size modifier: %b0, %w0, %k0, %q0 (x86) or %w0, %x0 (aarch64)
-                    chars.next();
-                    let size_mod = d;
-                    if let Some(&next_ch) = chars.peek() {
-                        if next_ch == '[' {
-                            // %b[name], %w[name], etc.
-                            chars.next(); // consume '['
-                            let mut name = String::new();
-                            while let Some(&ch) = chars.peek() {
-                                if ch == ']' {
-                                    chars.next();
-                                    break;
-                                }
-                                name.push(ch);
-                                chars.next();
-                            }
-                            if let Some(idx) = slots
-                                .iter()
-                                .position(|s| s.name.as_deref() == Some(name.as_str()))
-                            {
-                                let slot = &slots[idx];
-                                if let Some(ref mem) = slot.mem {
-                                    result.push_str(mem);
-                                } else if let Some(reg) = slot.reg {
-                                    result.push_str(&formatter.format_reg_sized(reg, size_mod));
-                                }
-                            } else {
-                                result.push('%');
-                                result.push(size_mod);
-                                result.push('[');
-                                result.push_str(&name);
-                                result.push(']');
-                            }
-                        } else if next_ch.is_ascii_digit() {
-                            chars.next();
-                            let mut num_str = String::new();
-                            num_str.push(next_ch);
-                            while let Some(&digit) = chars.peek() {
-                                if digit.is_ascii_digit() {
-                                    num_str.push(digit);
-                                    chars.next();
-                                } else {
-                                    break;
-                                }
-                            }
-                            let idx: usize = num_str.parse().unwrap_or(0);
-                            if let Some(slot) = slots.get(idx) {
-                                if let Some(ref mem) = slot.mem {
-                                    result.push_str(mem);
-                                } else if let Some(reg) = slot.reg {
-                                    result.push_str(&formatter.format_reg_sized(reg, size_mod));
-                                }
-                            } else {
-                                result.push('%');
-                                result.push(size_mod);
-                                result.push_str(&num_str);
-                            }
-                        } else {
-                            result.push('%');
-                            result.push(size_mod);
-                        }
-                    } else {
-                        result.push('%');
-                        result.push(size_mod);
-                    }
-                }
-                _ => {
-                    result.push('%');
-                }
-            }
-        } else {
+        if c != '%' {
             result.push(c);
+            continue;
+        }
+        if chars.next_if_eq(&'%').is_some() {
+            result.push('%');
+            continue;
+        }
+        let modifier = chars.next_if(|m| m.is_ascii_alphabetic());
+        let Some(operand) = read_operand_ref(&mut chars) else {
+            return Err(match (modifier, chars.peek()) {
+                (Some(m), _) => {
+                    format!("operand number missing after '%{m}' in asm template")
+                }
+                (None, Some(p)) => format!("invalid '%{p}' in asm template"),
+                (None, None) => "'%' at the end of an asm template".to_string(),
+            });
+        };
+        if modifier == Some('l') {
+            result.push_str(&goto_label(&operand, slots.len(), goto_labels)?);
+            continue;
+        }
+        // A label is an operand too, numbered after the rest, and a bare
+        // `%N` writes it as the constant address it is: `$.L5` on x86-64.
+        let label_slot;
+        let slot = match &operand {
+            OperandRef::Number(n) if *n >= slots.len() => {
+                let (text, _) = n
+                    .checked_sub(slots.len())
+                    .and_then(|i| goto_labels.get(i))
+                    .ok_or_else(|| format!("asm operand number {n} out of range"))?;
+                label_slot = AsmOperandSlot {
+                    value: AsmOperandValue::Symbol(text.clone()),
+                    size: 64,
+                    name: None,
+                };
+                &label_slot
+            }
+            OperandRef::Number(n) => &slots[*n],
+            OperandRef::Name(name) => slots
+                .iter()
+                .find(|s| s.name.as_deref() == Some(name.as_str()))
+                .ok_or_else(|| format!("undefined named asm operand '{name}'"))?,
+        };
+        let text = match (modifier, &slot.value) {
+            (Some('c'), AsmOperandValue::Int(v)) => Ok(v.to_string()),
+            (Some('c'), AsmOperandValue::Symbol(sym)) => Ok(sym.clone()),
+            (Some('n'), AsmOperandValue::Int(v)) => Ok((-(*v as i128)).to_string()),
+            (Some('n'), AsmOperandValue::Symbol(sym)) => Ok(format!("-{sym}")),
+            (Some('c' | 'n'), _) => Err(AsmModifierError::Inapplicable),
+            _ => formatter.format_operand(slot, modifier),
+        };
+        let m = modifier.map(String::from).unwrap_or_default();
+        match text {
+            Ok(text) => result.push_str(&text),
+            Err(AsmModifierError::Unsupported) => {
+                return Err(format!(
+                    "unsupported operand modifier '%{m}' in asm template"
+                ))
+            }
+            Err(AsmModifierError::Unencodable(why)) => {
+                return Err(format!(
+                    "asm operand is {} that cannot be written into the template: {why}",
+                    slot.value.describe()
+                ))
+            }
+            Err(AsmModifierError::Inapplicable) => {
+                return Err(format!(
+                    "operand modifier '%{m}' does not apply to {}",
+                    slot.value.describe()
+                ))
+            }
         }
     }
 
-    result
+    Ok(result)
+}
+
+/// The `asm goto` label `%l` names. gcc numbers labels after every operand,
+/// the hidden inputs of `"+"` outputs included, so the first label of a
+/// statement with three operands is `%l3`.
+fn goto_label(
+    operand: &OperandRef,
+    operands: usize,
+    goto_labels: &[(String, String)],
+) -> Result<String, String> {
+    let label = match operand {
+        OperandRef::Name(name) => goto_labels.iter().find(|(_, n)| n == name),
+        OperandRef::Number(n) => n.checked_sub(operands).and_then(|i| goto_labels.get(i)),
+    };
+    match (label, operand) {
+        (Some((text, _)), _) => Ok(text.clone()),
+        (None, OperandRef::Name(name)) => Err(format!("undefined asm goto label '{name}'")),
+        (None, OperandRef::Number(n)) => {
+            Err(format!("asm operand {n} named by '%l' is not a label"))
+        }
+    }
 }
 
 // CodeGenerator Trait
@@ -1500,5 +1476,71 @@ mod tests {
             "not 32 bits"
         );
         assert_eq!(SymSlot::store_bits(None, 32, 0), 32, "no record");
+    }
+
+    /// A formatter that writes a register as `rN` and implements only `%k`,
+    /// so the shared rules are what is under test.
+    struct Stub;
+
+    impl super::AsmOperandFormatter for Stub {
+        type Reg = u8;
+        fn format_operand(
+            &self,
+            slot: &super::AsmOperandSlot<u8>,
+            modifier: Option<char>,
+        ) -> Result<String, super::AsmModifierError> {
+            use super::AsmOperandValue as V;
+            match (modifier, &slot.value) {
+                (None | Some('k'), V::Reg(r)) => Ok(format!("r{r}")),
+                (None, V::Int(v)) => Ok(format!("${v}")),
+                (None, V::Symbol(s) | V::Mem(s) | V::RegName(s)) => Ok(s.clone()),
+                (Some('k'), _) => Err(super::AsmModifierError::Inapplicable),
+                _ => Err(super::AsmModifierError::Unsupported),
+            }
+        }
+    }
+
+    fn substitute(template: &str) -> Result<String, String> {
+        use super::{AsmOperandSlot, AsmOperandValue as V};
+        let slot = |value, name: Option<&str>| AsmOperandSlot {
+            value,
+            size: 64,
+            name: name.map(String::from),
+        };
+        let slots = [
+            slot(V::Reg(3), Some("out")),
+            slot(V::Int(-7), None),
+            slot(V::Symbol("g+8".into()), None),
+            slot(V::Mem("(%rax)".into()), None),
+        ];
+        let labels = [(".L9".to_string(), "done".to_string())];
+        super::substitute_asm_operands(&Stub, template, &slots, &labels)
+    }
+
+    /// `%c` and `%n` of a constant and `%l` of a label are the same on
+    /// every target; the formatter answers the rest.
+    #[test]
+    fn substitution_shared_rules() {
+        assert_eq!(
+            substitute("%0 %[out] %k0 %1 %c1 %n1 %c2 %n2 %%x %l4 %l[done] %4 %c4"),
+            Ok("r3 r3 r3 $-7 -7 7 g+8 -g+8 %x .L9 .L9 .L9 .L9".to_string())
+        );
+    }
+
+    /// Anything else after a `%` is an error naming what it is.
+    #[test]
+    fn substitution_errors() {
+        let err = |t: &str| substitute(t).unwrap_err();
+        assert!(err("%z0").contains("unsupported operand modifier '%z'"));
+        assert!(err("%k3").contains("'%k' does not apply to a memory reference"));
+        assert!(err("%c0").contains("'%c' does not apply to a general register"));
+        assert!(err("%e").contains("operand number missing after '%e'"));
+        assert!(err("%9").contains("operand number 9 out of range"));
+        assert!(err("%k4").contains("'%k' does not apply to a symbolic constant"));
+        assert!(err("%[nope]").contains("undefined named asm operand 'nope'"));
+        assert!(err("%=").contains("invalid '%='"));
+        assert!(err("x %").contains("at the end"));
+        assert!(err("%l1").contains("asm operand 1 named by '%l' is not a label"));
+        assert!(err("%l[gone]").contains("undefined asm goto label 'gone'"));
     }
 }

@@ -22,13 +22,20 @@
 
 use crate::common::{compile_rejected_with, create_c_file, run_c17};
 
-const X86: [&str; 2] = ["--target", "x86_64-unknown-linux-gnu"];
-const A64: [&str; 2] = ["--target", "aarch64-unknown-linux-gnu"];
-const OPTS: [&str; 2] = ["-O0", "-O2"];
+pub(super) const X86: [&str; 2] = ["--target", "x86_64-unknown-linux-gnu"];
+pub(super) const A64: [&str; 2] = ["--target", "aarch64-unknown-linux-gnu"];
+pub(super) const OPTS: [&str; 2] = ["-O0", "-O2"];
 
 /// Require `src` to be rejected for `target` at `opt` with a diagnostic
 /// containing `wanted`, reported on line `line`.
-fn expect_rejected(name: &str, src: &str, target: [&str; 2], opt: &str, wanted: &str, line: u32) {
+pub(super) fn expect_rejected(
+    name: &str,
+    src: &str,
+    target: [&str; 2],
+    opt: &str,
+    wanted: &str,
+    line: u32,
+) {
     let stderr = compile_rejected_with(&format!("{name}{opt}"), src, &[target[0], target[1], opt]);
     assert!(
         stderr.contains(wanted),
@@ -44,7 +51,7 @@ fn expect_rejected(name: &str, src: &str, target: [&str; 2], opt: &str, wanted: 
 
 /// Compile `src` for `target` at `opt`, require it to be accepted, and return
 /// the assembly.
-fn expect_accepted(name: &str, src: &str, target: [&str; 2], opt: &str) -> String {
+pub(super) fn expect_accepted(name: &str, src: &str, target: [&str; 2], opt: &str) -> String {
     let c = create_c_file(&format!("{name}{opt}"), src);
     let path = c.path().to_string_lossy().to_string();
     let out = plib::tmp::Builder::new()
@@ -62,7 +69,7 @@ fn expect_accepted(name: &str, src: &str, target: [&str; 2], opt: &str) -> Strin
     std::fs::read_to_string(&out_path).expect("read assembly")
 }
 
-const IMPOSSIBLE: &str = "impossible constraint in 'asm'";
+pub(super) const IMPOSSIBLE: &str = "impossible constraint in 'asm'";
 
 /// A variable under an immediate-only constraint is rejected at every level:
 /// nothing makes a parameter constant.
@@ -100,10 +107,11 @@ fn asm_immediate_operand_through_an_inlined_parameter() {
     for target in [X86, A64] {
         expect_rejected("asm_inl_lit", &literal, target, "-O0", IMPOSSIBLE, 2);
         let asm = expect_accepted("asm_inl_lit", &literal, target, "-O2");
+        // gcc writes an aarch64 constant bare: any `#` is the template's.
         let (three, four_hundred) = if target == X86 {
             ("# $3", "# $400")
         } else {
-            ("# #3", "# #400")
+            ("# 3", "# 400")
         };
         assert!(
             asm.contains(three) && asm.contains(four_hundred),
@@ -204,7 +212,7 @@ fn asm_immediate_operands_gcc_accepts() {
                }\n";
     for opt in OPTS {
         let asm = expect_accepted("asm_imm_ok_a64", a64, A64, opt);
-        assert!(asm.contains("// A g x+8 #8"), "{opt}:\n{asm}");
+        assert!(asm.contains("// A g x+8 8"), "{opt}:\n{asm}");
     }
 }
 

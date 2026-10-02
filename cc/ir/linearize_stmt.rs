@@ -393,12 +393,15 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             Stmt::Asm {
+                pos,
                 template,
                 outputs,
                 inputs,
                 clobbers,
                 goto_labels,
             } => {
+                // The statement's own position until an operand gives one.
+                self.current_pos = Some(*pos);
                 self.linearize_asm(template, outputs, inputs, clobbers, goto_labels);
             }
         }

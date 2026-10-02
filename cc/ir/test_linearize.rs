@@ -7486,6 +7486,7 @@ fn test_asm_goto_output_written_back_on_the_label_edge() {
     // { asm goto("" : "=r"(x) : : : out); return 0; out: return x; }
     let body = Stmt::Block(vec![
         BlockItem::Statement(Box::new(Stmt::Asm {
+            pos: Position::default(),
             template: String::new(),
             outputs: vec![AsmOperand {
                 name: None,
@@ -7567,6 +7568,7 @@ fn test_asm_memory_operand_names_its_object() {
     // { asm("" : "=m"(x) : "m"(x)); return x; }
     let body = Stmt::Block(vec![
         BlockItem::Statement(Box::new(Stmt::Asm {
+            pos: Position::default(),
             template: String::new(),
             outputs: vec![AsmOperand {
                 name: None,

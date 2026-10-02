@@ -14,6 +14,7 @@
 //
 
 use crate::arch::codegen::SelectOperands;
+use crate::arch::codegen::{AsmModifierError, AsmOperandSlot, AsmOperandValue};
 use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
@@ -1515,35 +1516,61 @@ impl X86_64CodeGen {
 impl crate::arch::AsmOperandFormatter for X86_64CodeGen {
     type Reg = Reg;
 
-    fn size_modifiers(&self) -> &'static [char] {
-        // 8, 16, 32, 64-bit, and `h` the high byte of %ax..%dx
-        &['b', 'w', 'k', 'q', 'h']
-    }
-
-    fn format_reg_sized(&self, reg: Reg, size_mod: char) -> String {
-        if size_mod == 'h' {
-            return match reg {
+    /// gcc's x86 operand modifiers, those real code uses: the register widths
+    /// `b`/`w`/`k`/`q` and the high byte `h`; `c` and `P`, a constant without
+    /// its `$`; `a`, an operand as an address; `V`, a register without its
+    /// `%`. A width or `P` leaves anything that is not a general register as
+    /// a bare `%0` prints it, as gcc does.
+    fn format_operand(
+        &self,
+        slot: &AsmOperandSlot<Reg>,
+        modifier: Option<char>,
+    ) -> Result<String, AsmModifierError> {
+        use AsmOperandValue as V;
+        Ok(match (modifier, &slot.value) {
+            (Some(m @ ('b' | 'w' | 'k' | 'q')), V::Reg(r)) => {
+                format!("%{}", self.sized_reg_name(*r, m))
+            }
+            (Some('h'), V::Reg(r)) => match r {
                 Reg::Rax => "%ah".to_string(),
                 Reg::Rbx => "%bh".to_string(),
                 Reg::Rcx => "%ch".to_string(),
                 Reg::Rdx => "%dh".to_string(),
                 // No high byte: left for the assembler to reject, as gcc
                 // rejects it.
-                _ => format!("%{}h", self.reg_name_64(reg)),
-            };
-        }
-        format!("%{}", self.sized_reg_name(reg, size_mod))
+                _ => format!("%{}h", self.reg_name_64(*r)),
+            },
+            (Some('P'), V::Int(v)) => v.to_string(),
+            (Some('P'), V::Symbol(sym)) => sym.clone(),
+            (Some('a'), V::Reg(r)) => format!("(%{})", self.reg_name_64(*r)),
+            (Some('a'), V::Int(v)) => v.to_string(),
+            (Some('a'), V::Symbol(sym)) => format!("{sym}(%rip)"),
+            (Some('V'), V::Reg(r)) => self.asm_default_reg(*r, slot.size),
+            (Some('a'), _) | (Some('V'), V::RegName(_)) => {
+                return Err(AsmModifierError::Inapplicable)
+            }
+            (None | Some('b' | 'w' | 'k' | 'q' | 'h' | 'P' | 'V'), value) => match value {
+                V::Reg(r) => format!("%{}", self.asm_default_reg(*r, slot.size)),
+                V::RegName(text) | V::Mem(text) => text.clone(),
+                V::Int(v) => format!("${v}"),
+                V::Float(v, bits) => format!("${}", v.to_bits_at_width(*bits)),
+                V::Symbol(sym) => format!("${sym}"),
+            },
+            _ => return Err(AsmModifierError::Unsupported),
+        })
     }
+}
 
-    fn format_reg_default(&self, reg: Reg, size_bits: u32) -> String {
-        // Select register width matching the operand's declared size
+impl X86_64CodeGen {
+    /// A general register at the operand's width, without the `%`.
+    fn asm_default_reg(&self, reg: Reg, size_bits: u32) -> String {
         let size_mod = match size_bits {
             8 => 'b',
             16 => 'w',
             64 => 'q',
             _ => 'k', // 32-bit default
         };
-        format!("%{}", self.sized_reg_name(reg, size_mod))
+        self.sized_reg_name(reg, size_mod).to_string()
     }
 }
 

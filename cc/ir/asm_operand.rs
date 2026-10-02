@@ -22,7 +22,8 @@
 // same point. Before, it accepted any operand and substituted whatever
 // register held it -- `"i"(&global)` gave `%rax` rather than `$global`.
 
-use super::{Function, Instruction, Module, Opcode, PseudoId, PseudoKind};
+use super::{AsmConstraint, Function, Instruction, Module, Opcode, PseudoId, PseudoKind};
+use crate::arch::asm_constraints::{canonical_int, FloatImm};
 use std::collections::{HashMap, HashSet};
 
 /// Follows the address arithmetic of an operand back to the object it names.
@@ -216,10 +217,13 @@ fn immediate_rewrites(
                 continue;
             }
             let imm = c.class.imm;
+            let int = !imm.int.is_empty();
             let source = walk.copied_from(c.pseudo);
             let found = match func.get_pseudo(source).map(|p| &p.kind) {
-                Some(PseudoKind::Val(_)) if imm.int => Some(Immediate::Int(source)),
-                Some(PseudoKind::FVal(_)) if imm.float => Some(Immediate::Float(source)),
+                Some(PseudoKind::Val(_)) if int => Some(Immediate::Int(source)),
+                Some(PseudoKind::FVal(_)) if imm.float != FloatImm::None => {
+                    Some(Immediate::Float(source))
+                }
                 Some(PseudoKind::Val(_) | PseudoKind::FVal(_)) => None,
                 // Already resolved: a global named by the operand itself.
                 Some(PseudoKind::Sym(_)) if imm.symbol && global(source, insn) => {
@@ -228,10 +232,22 @@ fn immediate_rewrites(
                 _ => match walk.object(c.pseudo, &global) {
                     Some((sym, off)) if imm.symbol => Some(Immediate::Symbol(sym, off)),
                     Some(_) => None,
-                    None if imm.int => walk.constant(c.pseudo).map(Immediate::Folded),
+                    None if int => walk.constant(c.pseudo).map(Immediate::Folded),
                     None => None,
                 },
             };
+            if let Some(Err(what)) = found.as_ref().map(|f| out_of_range(func, c, f)) {
+                crate::diag::error(
+                    insn.pos.unwrap_or_default(),
+                    &format!(
+                        "impossible constraint in 'asm': operand {} ({what}) is out of \
+                         range for \"{}\"",
+                        number - 1,
+                        c.constraint
+                    ),
+                );
+                continue;
+            }
             match found {
                 Some(Immediate::Int(p) | Immediate::Float(p)) if p == c.pseudo => {}
                 Some(Immediate::Symbol(sym, off)) if sym == c.pseudo && off == c.offset => {}
@@ -249,6 +265,36 @@ fn immediate_rewrites(
         }
     }
     rewrites
+}
+
+/// A constant of the right kind may still be one no letter's range holds:
+/// `"I"(32)` on x86-64, a non-zero `"Z"` on aarch64. `Err` names the value.
+/// An integer is checked sign-extended from the operand's width, as gcc
+/// checks its canonical constant.
+fn out_of_range(func: &Function, c: &AsmConstraint, found: &Immediate) -> Result<(), String> {
+    let kind = |p: PseudoId| func.get_pseudo(p).map(|p| &p.kind);
+    let imm = c.class.imm;
+    let int = match found {
+        Immediate::Int(p) => match kind(*p) {
+            Some(PseudoKind::Val(v)) => canonical_int(*v, c.size),
+            _ => return Ok(()),
+        },
+        Immediate::Folded(v) => canonical_int((*v).into(), c.size),
+        Immediate::Float(p) => {
+            return match kind(*p) {
+                Some(PseudoKind::FVal(v)) if !imm.float.admits(*v) => {
+                    Err("the floating constant".to_string())
+                }
+                _ => Ok(()),
+            }
+        }
+        Immediate::Symbol(..) => return Ok(()),
+    };
+    if imm.int.admits(int) {
+        Ok(())
+    } else {
+        Err(int.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -325,5 +371,27 @@ mod tests {
         func.next_pseudo = 4;
         assert!(resolve_immediates(&mut func, &HashSet::new()));
         assert_eq!(operand(&func), (PseudoId(0), 4));
+    }
+
+    /// A constant of the right kind that no range the letter takes holds is
+    /// out of range: `"I"(32)` on x86-64. The value is checked sign-extended
+    /// from the operand's width, as gcc checks it.
+    #[test]
+    fn out_of_range_constants() {
+        let check = |constraint: &str, value: i128, size: u32| {
+            let types = TypeTable::new(&crate::target::Target::host());
+            let mut func = Function::new("f", types.int_id);
+            func.add_pseudo(Pseudo::val(PseudoId(0), value));
+            let c = AsmConstraint::new(PseudoId(0), constraint, Arch::X86_64, size);
+            out_of_range(&func, &c, &Immediate::Int(PseudoId(0)))
+        };
+        assert_eq!(check("I", 31, 32), Ok(()));
+        assert_eq!(check("I", 32, 32), Err("32".to_string()));
+        assert_eq!(check("IK", -128, 32), Ok(()));
+        // 200 as an `unsigned char` is -56.
+        assert_eq!(check("N", 200, 8), Err("-56".to_string()));
+        assert_eq!(check("N", 200, 32), Ok(()));
+        assert_eq!(check("e", 0xffff_ffff, 32), Ok(()));
+        assert_eq!(check("e", 0xffff_ffff, 64), Err("4294967295".to_string()));
     }
 }

@@ -1725,6 +1725,9 @@ pub enum Stmt {
     /// Inline assembly statement (GCC extended asm)
     /// Format: asm [volatile] [goto] ( "template" : outputs : inputs : clobbers [: goto_labels] );
     Asm {
+        /// Where the statement starts: a diagnostic about a statement with no
+        /// operand to borrow a position from is reported here.
+        pos: Position,
         /// The assembly template string with %0, %1, etc. placeholders
         template: String,
         /// Output operands: [name] "=constraint" (lvalue)

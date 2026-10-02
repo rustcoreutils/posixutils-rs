@@ -22,6 +22,7 @@
 // register on one and a symbolic constant on the other -- which is why the
 // classifier takes the target.
 
+use crate::float::FloatVal;
 use crate::ir::{AsmData, PseudoId};
 use crate::target::Arch;
 
@@ -102,67 +103,280 @@ pub enum AsmMemClass {
 ///
 /// gcc distinguishes three kinds, and so must the classification: `n` takes
 /// an integer and nothing else, `s` a link-time symbolic address and never an
-/// integer, `i` either -- and a floating constant's bit pattern too. Which
+/// integer, `i` either -- and a floating constant too. Which
 /// letters take a symbolic address also differs by target: under the
 /// position-independent code both targets build by default, gcc substitutes
 /// `$sym` for x86-64 `i`, while on aarch64 only `S` names a symbol.
+///
+/// Most integer letters take only a range, which is what an instruction
+/// field encodes: x86-64 `I` a shift count, aarch64 `K` a logical
+/// immediate. A constant outside every range offered is "impossible".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AsmImm {
-    /// An integer constant.
-    pub int: bool,
-    /// A floating constant, substituted as its bit pattern.
-    pub float: bool,
+    /// The integer constants allowed.
+    pub int: IntRanges,
+    /// The floating constants allowed: x86-64 substitutes the bit pattern,
+    /// aarch64 the value.
+    pub float: FloatImm,
     /// The address of a global object or function, plus a constant offset.
     pub symbol: bool,
 }
 
-impl AsmImm {
-    const INT: Self = Self {
-        int: true,
-        float: false,
-        symbol: false,
+/// The integers one immediate letter takes on its target. Each is checked
+/// against the constant sign-extended from the operand's width, as gcc
+/// checks its canonical constant: `"N"((unsigned char)200)` is -56, and out
+/// of range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntRange {
+    /// Any integer: `i`, `n`, `g`, `X`.
+    Any,
+    /// x86-64 `I`: a 32-bit shift count, 0..=31.
+    X86Shift32,
+    /// x86-64 `J`: a 64-bit shift count, 0..=63.
+    X86Shift64,
+    /// x86-64 `K`: a signed 8-bit constant.
+    X86Signed8,
+    /// x86-64 `L`: `0xff`, `0xffff` or `0xffffffff`, the masks a `movz`
+    /// replaces an `and` with.
+    X86ZeroExtendMask,
+    /// x86-64 `M`: an `lea` shift, 0..=3.
+    X86LeaShift,
+    /// x86-64 `N`: an `in`/`out` port, 0..=255.
+    X86Port,
+    /// x86-64 `O`: a 128-bit shift count, 0..=127.
+    X86Shift128,
+    /// x86-64 `e`: a signed 32-bit constant.
+    X86Signed32,
+    /// x86-64 `Z`: an unsigned 32-bit constant.
+    X86Unsigned32,
+    /// aarch64 `I`: an `add` immediate, 12 bits optionally shifted by 12.
+    A64Add,
+    /// aarch64 `J`: the negation of an `add` immediate, for `sub`.
+    A64Sub,
+    /// aarch64 `K`: a 32-bit logical immediate.
+    A64Logical32,
+    /// aarch64 `L`: a 64-bit logical immediate.
+    A64Logical64,
+    /// aarch64 `M`: a 32-bit value one `mov` loads.
+    A64Mov32,
+    /// aarch64 `N`: a 64-bit value one `mov` loads.
+    A64Mov64,
+    /// aarch64 `Z`: zero.
+    Zero,
+}
+
+impl IntRange {
+    const ALL: [IntRange; 17] = [
+        IntRange::Any,
+        IntRange::X86Shift32,
+        IntRange::X86Shift64,
+        IntRange::X86Signed8,
+        IntRange::X86ZeroExtendMask,
+        IntRange::X86LeaShift,
+        IntRange::X86Port,
+        IntRange::X86Shift128,
+        IntRange::X86Signed32,
+        IntRange::X86Unsigned32,
+        IntRange::A64Add,
+        IntRange::A64Sub,
+        IntRange::A64Logical32,
+        IntRange::A64Logical64,
+        IntRange::A64Mov32,
+        IntRange::A64Mov64,
+        IntRange::Zero,
+    ];
+
+    /// Whether `v`, already sign-extended from the operand's width, is in
+    /// the range.
+    pub fn admits(self, v: i64) -> bool {
+        match self {
+            IntRange::Any => true,
+            IntRange::X86Shift32 => (0..=31).contains(&v),
+            IntRange::X86Shift64 => (0..=63).contains(&v),
+            IntRange::X86Signed8 => i8::try_from(v).is_ok(),
+            IntRange::X86ZeroExtendMask => matches!(v, 0xff | 0xffff | 0xffff_ffff),
+            IntRange::X86LeaShift => (0..=3).contains(&v),
+            IntRange::X86Port => (0..=255).contains(&v),
+            IntRange::X86Shift128 => (0..=127).contains(&v),
+            IntRange::X86Signed32 => i32::try_from(v).is_ok(),
+            IntRange::X86Unsigned32 => u32::try_from(v).is_ok(),
+            IntRange::A64Add => a64_add_imm(v),
+            IntRange::A64Sub => v.checked_neg().is_some_and(a64_add_imm),
+            IntRange::A64Logical32 => a64_logical_imm(replicate32(v)),
+            IntRange::A64Logical64 => a64_logical_imm(v as u64),
+            IntRange::A64Mov32 => a64_mov_imm(v as u64, true),
+            IntRange::A64Mov64 => a64_mov_imm(v as u64, false),
+            IntRange::Zero => v == 0,
+        }
+    }
+}
+
+/// A set of [`IntRange`]s: the integer letters one constraint lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IntRanges(u32);
+
+impl IntRanges {
+    const ANY: Self = Self::of(IntRange::Any);
+
+    const fn of(r: IntRange) -> Self {
+        Self(1 << r as u32)
+    }
+
+    /// Whether no integer is allowed.
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Whether some range offered holds `v`, sign-extended from the
+    /// operand's width (see [`canonical_int`]).
+    pub fn admits(self, v: i64) -> bool {
+        IntRange::ALL
+            .iter()
+            .any(|&r| self.0 & Self::of(r).0 != 0 && r.admits(v))
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
+/// The floating constants a constraint takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum FloatImm {
+    #[default]
+    None,
+    /// aarch64 `Y`: positive zero, the one value `fcmp` and `fmov` name
+    /// without a register.
+    Zero,
+    /// Any floating constant.
+    Any,
+}
+
+impl FloatImm {
+    /// Whether `v` is allowed.
+    pub fn admits(self, v: FloatVal) -> bool {
+        match self {
+            FloatImm::None => false,
+            FloatImm::Zero => v.is_positive_zero(),
+            FloatImm::Any => true,
+        }
+    }
+}
+
+/// An integer constant as gcc substitutes and checks it: sign-extended from
+/// the operand's width. `"i"(0xffffffffu)` is `$-1`, not `$4294967295`.
+pub fn canonical_int(v: i128, bits: u32) -> i64 {
+    match bits {
+        1..=63 => ((v as i64) << (64 - bits)) >> (64 - bits),
+        _ => v as i64,
+    }
+}
+
+/// An aarch64 `add`/`sub` immediate: 12 bits, optionally shifted left by 12.
+fn a64_add_imm(v: i64) -> bool {
+    v & 0xfff == v || v & 0xfff000 == v
+}
+
+/// The low 32 bits of `v` in both halves: a 32-bit logical immediate is the
+/// 64-bit one whose pattern repeats at least every 32 bits.
+fn replicate32(v: i64) -> u64 {
+    let low = v as u64 & 0xffff_ffff;
+    low | low << 32
+}
+
+/// An aarch64 64-bit logical (bitmask) immediate: a pattern of 2, 4, ..., 64
+/// bits repeated across the register, each a rotated run of ones, never all
+/// zeros or all ones.
+fn a64_logical_imm(v: u64) -> bool {
+    if v == 0 || v == u64::MAX {
+        return false;
+    }
+    // The smallest period the value repeats with.
+    let mut size = 64;
+    while size > 2 {
+        let half = size / 2;
+        let mask = (1u64 << half) - 1;
+        if (v & mask) != ((v >> half) & mask) {
+            break;
+        }
+        size = half;
+    }
+    let mask = if size == 64 {
+        u64::MAX
+    } else {
+        (1u64 << size) - 1
     };
+    let elem = v & mask;
+    // A rotated run of ones within `size` bits has exactly one 0->1 and one
+    // 1->0 transition going round the element.
+    let rotated = ((elem >> 1) | (elem << (size - 1))) & mask;
+    (elem ^ rotated).count_ones() == 2
+}
+
+/// A value one aarch64 `mov` loads: one 16-bit chunk (`movz`), its inverse
+/// (`movn`), or a logical immediate (`orr` from the zero register). A 32-bit
+/// value is read in its low 32 bits, where a 32-bit logical immediate
+/// repeats; a 64-bit one is taken whole.
+fn a64_mov_imm(v: u64, w: bool) -> bool {
+    let mask = if w { 0xffff_ffff } else { u64::MAX };
+    let movz = |x: u64| (0..64).step_by(16).any(|s| x & !(0xffffu64 << s) == 0);
+    movz(v & mask) || movz(!v & mask) || a64_logical_imm(if w { replicate32(v as i64) } else { v })
+}
+
+impl AsmImm {
+    const INT: Self = Self::ints(IntRange::Any);
     const NUMBER: Self = Self {
-        int: true,
-        float: true,
+        int: IntRanges::ANY,
+        float: FloatImm::Any,
         symbol: false,
     };
     const SYMBOL: Self = Self {
-        int: false,
-        float: false,
+        int: IntRanges(0),
+        float: FloatImm::None,
         symbol: true,
     };
-    const FLOAT: Self = Self {
-        int: false,
-        float: true,
+    const FLOAT_ZERO: Self = Self {
+        int: IntRanges(0),
+        float: FloatImm::Zero,
         symbol: false,
     };
     const ANY: Self = Self {
-        int: true,
-        float: true,
+        int: IntRanges::ANY,
+        float: FloatImm::Any,
         symbol: true,
     };
 
+    /// The integers of one range, and nothing else.
+    const fn ints(r: IntRange) -> Self {
+        Self {
+            int: IntRanges::of(r),
+            float: FloatImm::None,
+            symbol: false,
+        }
+    }
+
     /// Whether any constant is allowed.
     pub fn any(self) -> bool {
-        self.int || self.float || self.symbol
+        !self.int.is_empty() || self.float != FloatImm::None || self.symbol
     }
 
     fn union(self, other: Self) -> Self {
         Self {
-            int: self.int || other.int,
-            float: self.float || other.float,
+            int: self.int.union(other.int),
+            float: self.float.max(other.float),
             symbol: self.symbol || other.symbol,
         }
     }
 
     /// What the operand must be, for a diagnostic.
     pub fn describe(self) -> &'static str {
-        match (self.int || self.float, self.symbol) {
+        let int = !self.int.is_empty();
+        let float = self.float != FloatImm::None;
+        match (int || float, self.symbol) {
             (true, true) => "a constant",
             (false, true) => "a symbolic address constant",
-            _ if !self.float => "an integer constant",
-            _ if !self.int => "a floating constant",
+            _ if !float => "an integer constant",
+            _ if !int => "a floating constant",
             _ => "a numeric constant",
         }
     }
@@ -317,11 +531,19 @@ fn letter(c: char, arch: Arch) -> Option<Letter> {
         (_, '%' | ',' | '*' | '?' | '!' | '^' | '$' | '<' | '>') => Letter::Modifier,
         (_, 'r') => Letter::Reg(General),
         (_, 'm' | 'o' | 'V') => Letter::Mem(AsmMemClass::Any),
-        (_, 'n' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'Z') => Letter::Imm(AsmImm::INT),
+        (_, 'n') => Letter::Imm(AsmImm::INT),
         (_, 'g' | 'X') => Letter::Any,
 
         (Arch::X86_64, 'i') => Letter::Imm(AsmImm::ANY),
-        (Arch::X86_64, 'O' | 'e') => Letter::Imm(AsmImm::INT),
+        (Arch::X86_64, 'I') => Letter::Imm(AsmImm::ints(IntRange::X86Shift32)),
+        (Arch::X86_64, 'J') => Letter::Imm(AsmImm::ints(IntRange::X86Shift64)),
+        (Arch::X86_64, 'K') => Letter::Imm(AsmImm::ints(IntRange::X86Signed8)),
+        (Arch::X86_64, 'L') => Letter::Imm(AsmImm::ints(IntRange::X86ZeroExtendMask)),
+        (Arch::X86_64, 'M') => Letter::Imm(AsmImm::ints(IntRange::X86LeaShift)),
+        (Arch::X86_64, 'N') => Letter::Imm(AsmImm::ints(IntRange::X86Port)),
+        (Arch::X86_64, 'O') => Letter::Imm(AsmImm::ints(IntRange::X86Shift128)),
+        (Arch::X86_64, 'e') => Letter::Imm(AsmImm::ints(IntRange::X86Signed32)),
+        (Arch::X86_64, 'Z') => Letter::Imm(AsmImm::ints(IntRange::X86Unsigned32)),
         (Arch::X86_64, 's') => Letter::Imm(AsmImm::SYMBOL),
         (Arch::X86_64, 'q' | 'R' | 'l') => Letter::Reg(General),
         (Arch::X86_64, 'a') => Letter::Reg(Pinned(PinnedGp::Rax)),
@@ -338,7 +560,14 @@ fn letter(c: char, arch: Arch) -> Option<Letter> {
 
         (Arch::Aarch64, 'i') => Letter::Imm(AsmImm::NUMBER),
         (Arch::Aarch64, 'S') => Letter::Imm(AsmImm::SYMBOL),
-        (Arch::Aarch64, 'Y') => Letter::Imm(AsmImm::FLOAT),
+        (Arch::Aarch64, 'Y') => Letter::Imm(AsmImm::FLOAT_ZERO),
+        (Arch::Aarch64, 'I') => Letter::Imm(AsmImm::ints(IntRange::A64Add)),
+        (Arch::Aarch64, 'J') => Letter::Imm(AsmImm::ints(IntRange::A64Sub)),
+        (Arch::Aarch64, 'K') => Letter::Imm(AsmImm::ints(IntRange::A64Logical32)),
+        (Arch::Aarch64, 'L') => Letter::Imm(AsmImm::ints(IntRange::A64Logical64)),
+        (Arch::Aarch64, 'M') => Letter::Imm(AsmImm::ints(IntRange::A64Mov32)),
+        (Arch::Aarch64, 'N') => Letter::Imm(AsmImm::ints(IntRange::A64Mov64)),
+        (Arch::Aarch64, 'Z') => Letter::Imm(AsmImm::ints(IntRange::Zero)),
         (Arch::Aarch64, 'w' | 'x' | 'y') => Letter::Reg(Vector),
         (Arch::Aarch64, 'Q') => Letter::Mem(AsmMemClass::BaseOnly),
 
@@ -585,10 +814,20 @@ mod tests {
             (Arch::Aarch64, "n", INT),
             (Arch::X86_64, "s", SYM),
             (Arch::Aarch64, "S", SYM),
-            (Arch::X86_64, "e", INT),
-            (Arch::X86_64, "I", INT),
-            (Arch::Aarch64, "Z", INT),
-            (Arch::Aarch64, "Y", AsmImm::FLOAT),
+            (Arch::X86_64, "e", AsmImm::ints(IntRange::X86Signed32)),
+            (Arch::X86_64, "I", AsmImm::ints(IntRange::X86Shift32)),
+            (Arch::Aarch64, "I", AsmImm::ints(IntRange::A64Add)),
+            (Arch::Aarch64, "Z", AsmImm::ints(IntRange::Zero)),
+            (Arch::Aarch64, "Y", AsmImm::FLOAT_ZERO),
+            (
+                Arch::X86_64,
+                "IK",
+                AsmImm {
+                    int: IntRanges::of(IntRange::X86Shift32)
+                        .union(IntRanges::of(IntRange::X86Signed8)),
+                    ..AsmImm::default()
+                },
+            ),
             (
                 Arch::X86_64,
                 "ns",
@@ -604,6 +843,90 @@ mod tests {
             let got = AsmOperandClass::parse(s, arch).unwrap().imm;
             assert_eq!(got, want, "{arch:?} {s:?}");
         }
+    }
+
+    /// Each range letter's bounds, as gcc 13 accepts and rejects them: the
+    /// constant sign-extended from the operand's width is what is checked.
+    #[test]
+    fn immediate_ranges() {
+        let admits =
+            |arch, s: &str, v: i64| AsmOperandClass::parse(s, arch).unwrap().imm.int.admits(v);
+        let x86: &[(&str, &[i64], &[i64])] = &[
+            ("I", &[0, 31], &[-1, 32]),
+            ("J", &[0, 63], &[-1, 64]),
+            ("K", &[-128, 127], &[-129, 128]),
+            (
+                "L",
+                &[0xff, 0xffff, 0xffff_ffff],
+                &[0xfe, -1, 0x1_0000_0000],
+            ),
+            ("M", &[0, 3], &[-1, 4]),
+            ("N", &[0, 255], &[-56, 256]),
+            ("O", &[0, 127], &[-1, 128]),
+            (
+                "e",
+                &[i32::MIN as i64, i32::MAX as i64],
+                &[1 << 31, -(1 << 31) - 1],
+            ),
+            ("Z", &[0, 0xffff_ffff], &[-1, 1 << 32]),
+            ("IK", &[31, -128, 127], &[128]),
+            ("n", &[i64::MIN, i64::MAX], &[]),
+        ];
+        for &(s, yes, no) in x86 {
+            for &v in yes {
+                assert!(admits(Arch::X86_64, s, v), "x86-64 {s:?} {v:#x}");
+            }
+            for &v in no {
+                assert!(!admits(Arch::X86_64, s, v), "x86-64 {s:?} {v:#x}");
+            }
+        }
+        let a64: &[(&str, &[i64], &[i64])] = &[
+            ("I", &[0, 4095, 0x1000, 0xfff000], &[-1, 4097, 0x1001000]),
+            ("J", &[0, -1, -4095, -0x1000], &[1, -4097]),
+            (
+                "K",
+                &[0xff, 0xff00ff00u32 as i32 as i64, 0x5555_5555, -256],
+                &[0, -1, 0x1234],
+            ),
+            (
+                "L",
+                &[0xff, 0xff00_ff00_ff00_ff00u64 as i64, 0x0ff0, 1 << 63],
+                &[0, -1, 0x1234, 0xff00_ff00],
+            ),
+            (
+                "M",
+                &[0, 0xffff, 0x1234_0000, -1, 0xffff_1234u32 as i32 as i64],
+                &[0x1234_5678],
+            ),
+            (
+                "N",
+                &[
+                    0x1234_0000_0000_0000,
+                    -2,
+                    0x0ff0,
+                    0xffff_ffff_0000_ffffu64 as i64,
+                ],
+                &[0xff00_ff00, 0xffff_1234, 0x1234_5678],
+            ),
+            ("Z", &[0], &[1, -1]),
+        ];
+        for &(s, yes, no) in a64 {
+            for &v in yes {
+                assert!(admits(Arch::Aarch64, s, v), "aarch64 {s:?} {v:#x}");
+            }
+            for &v in no {
+                assert!(!admits(Arch::Aarch64, s, v), "aarch64 {s:?} {v:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_int_sign_extends() {
+        assert_eq!(canonical_int(0xffff_ffff, 32), -1);
+        assert_eq!(canonical_int(200, 8), -56);
+        assert_eq!(canonical_int(200, 16), 200);
+        assert_eq!(canonical_int(0xffff_ffff, 64), 0xffff_ffff);
+        assert_eq!(canonical_int(-1, 64), -1);
     }
 
     #[test]

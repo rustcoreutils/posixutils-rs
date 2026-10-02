@@ -14,7 +14,10 @@ use crate::arch::aarch64::codegen::Aarch64CodeGen;
 use crate::arch::aarch64::legalize::{single_offset_fits, LEGALIZE_REG};
 use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{parse_gp_clobber_name, Loc, Reg, VReg};
-use crate::arch::asm_constraints::{AsmAccess, AsmMemClass, AsmOperandClass, AsmRegClass};
+use crate::arch::asm_constraints::{
+    canonical_int, AsmAccess, AsmMemClass, AsmOperandClass, AsmRegClass,
+};
+use crate::arch::codegen::{impossible_constant, AsmOperandValue};
 use crate::arch::lir::{Directive, FpSize, OperandSize, Symbol};
 use crate::ir::{Instruction, PseudoId};
 
@@ -239,9 +242,8 @@ impl Aarch64CodeGen {
             let read_write = output.class.access == AsmAccess::ReadWrite;
             let op_size = output.size;
             let op_name = output.name.clone();
-            let mk = |reg: Option<Reg>, mem: Option<String>| crate::arch::AsmOperandSlot {
-                reg,
-                mem,
+            let mk = |value: AsmOperandValue<Reg>| crate::arch::AsmOperandSlot {
+                value,
                 size: op_size,
                 name: op_name.clone(),
             };
@@ -253,7 +255,10 @@ impl Aarch64CodeGen {
                     // asm template substitutes `wN`/`xN` and the
                     // assembler rejects (`ldr w8, w0` → "expected
                     // label or encodable integer pc offset").
-                    slots.push(mk(None, Some(format!("[{}]", asm_reg_name_64(r)))));
+                    slots.push(mk(AsmOperandValue::Mem(format!(
+                        "[{}]",
+                        asm_reg_name_64(r)
+                    ))));
                 }
                 // A vector-class output. Without this arm a `"=w"` output
                 // takes whatever the allocator gave the pseudo -- a general
@@ -261,7 +266,9 @@ impl Aarch64CodeGen {
                 // assembler rejects.
                 _ if requires_vector(&output.class) => match v_scratch.pop() {
                     Some(v) => {
-                        slots.push(mk(None, Some(Self::vreg_name(v, op_size).to_string())));
+                        slots.push(mk(AsmOperandValue::RegName(
+                            Self::vreg_name(v, op_size).to_string(),
+                        )));
                         vec_output_moves.push((v, loc.clone(), op_size));
                         if read_write {
                             vec_input_moves.push((v, loc.clone(), op_size));
@@ -273,11 +280,11 @@ impl Aarch64CodeGen {
                             "too many vector register constraints in one asm \
                              statement; c17 has three scratch registers to give",
                         );
-                        slots.push(mk(None, Some(VReg::V16.name_d().to_string())));
+                        slots.push(mk(AsmOperandValue::RegName(VReg::V16.name_d().to_string())));
                     }
                 },
                 Loc::Reg(r) => {
-                    slots.push(mk(Some(r), None));
+                    slots.push(mk(AsmOperandValue::Reg(r)));
                 }
                 // A register output the allocator gave no register: the
                 // template writes a scratch, stored back once it has run.
@@ -292,10 +299,10 @@ impl Aarch64CodeGen {
                             "too many register operands in one asm statement; \
                              c17 has no register left to give one",
                         );
-                        slots.push(mk(Some(Reg::X9), None));
+                        slots.push(mk(AsmOperandValue::Reg(Reg::X9)));
                         continue;
                     };
-                    slots.push(mk(Some(reg), None));
+                    slots.push(mk(AsmOperandValue::Reg(reg)));
                     gp_output_moves.push((reg, loc.clone(), op_size));
                     if read_write {
                         addr_regs.setups.push((
@@ -318,12 +325,11 @@ impl Aarch64CodeGen {
                         &mut gp_scratch,
                         insn,
                     );
-                    slots.push(mk(None, Some(mem_str)));
+                    slots.push(mk(mem_str));
                 }
                 _ => {
                     // Memory or other location - emit as memory operand
-                    let mem_str = self.loc_to_asm_string(&loc, op_size);
-                    slots.push(mk(None, Some(mem_str)));
+                    slots.push(mk(self.loc_to_asm_operand(&loc, op_size)));
                 }
             }
         }
@@ -352,12 +358,12 @@ impl Aarch64CodeGen {
                 // the same register, holding the input's value -- which the
                 // linearizer put in the output's own pseudo. When that output
                 // was given a scratch, the value has to be loaded into it.
-                if match_idx < num_outputs && slots[match_idx].reg.is_some() {
+                if match_idx < num_outputs && slots[match_idx].reg().is_some() {
                     let mut slot = slots[match_idx].clone();
                     slot.name = input.name.clone();
                     if let Some(&(reg, _, size)) = gp_output_moves
                         .iter()
-                        .find(|(r, _, _)| Some(*r) == slots[match_idx].reg)
+                        .find(|(r, _, _)| Some(*r) == slots[match_idx].reg())
                     {
                         let pseudo = asm_data.outputs[match_idx].pseudo;
                         addr_regs
@@ -382,9 +388,8 @@ impl Aarch64CodeGen {
             let requires_mem = input.is_memory();
             let op_size = input.size;
             let op_name = input.name.clone();
-            let mk = |reg: Option<Reg>, mem: Option<String>| crate::arch::AsmOperandSlot {
-                reg,
-                mem,
+            let mk = |value: AsmOperandValue<Reg>| crate::arch::AsmOperandSlot {
+                value,
                 size: op_size,
                 name: op_name.clone(),
             };
@@ -400,42 +405,55 @@ impl Aarch64CodeGen {
                         Symbol::global(name)
                     };
                     let sym = sym.format_for_target(&self.base.target);
-                    slots.push(mk(
-                        None,
-                        Some(crate::arch::codegen::asm_symbol_constant(
-                            &sym,
-                            input.offset,
-                        )),
-                    ));
+                    slots.push(mk(AsmOperandValue::Symbol(
+                        crate::arch::codegen::asm_symbol_constant(&sym, input.offset),
+                    )));
                 }
                 Loc::Reg(r) if requires_mem => {
                     // See output-side note: memory-class input with
                     // its address in a register renders as `[xN]`.
-                    slots.push(mk(None, Some(format!("[{}]", asm_reg_name_64(r)))));
+                    slots.push(mk(AsmOperandValue::Mem(format!(
+                        "[{}]",
+                        asm_reg_name_64(r)
+                    ))));
                 }
                 Loc::Reg(r) => {
-                    slots.push(mk(Some(r), None));
+                    slots.push(mk(AsmOperandValue::Reg(r)));
                 }
                 // A constant under a register-only constraint still goes in a
                 // register: the template may use it where no immediate
-                // encodes (`add x0, #100, #100`). A class that offers no
-                // register at all takes the constant as written.
-                Loc::Imm(v) if class.reg.is_some() && !class.imm.int => {
+                // encodes (`add x0, #100, #100`). So does one no immediate
+                // letter's range holds, when a register is offered:
+                // `"rI"(5000)`. A class that offers no register at all takes
+                // the constant as written, if it fits.
+                Loc::Imm(v)
+                    if class.reg.is_some() && !class.imm.int.admits(canonical_int(v, op_size)) =>
+                {
                     let Some(reg) = addr_regs.take(&mut gp_scratch, true) else {
                         crate::diag::error(
                             insn.pos.unwrap_or_default(),
                             "too many register operands in one asm statement; \
                              c17 has no register left to give one",
                         );
-                        slots.push(mk(Some(Reg::X9), None));
+                        slots.push(mk(AsmOperandValue::Reg(Reg::X9)));
                         continue;
                     };
                     addr_regs.setups.push((reg, OperandSetup::Imm(v as i64)));
-                    slots.push(mk(Some(reg), None));
+                    slots.push(mk(AsmOperandValue::Reg(reg)));
+                }
+                Loc::Imm(v)
+                    if !class.imm.int.is_empty()
+                        && !class.imm.int.admits(canonical_int(v, op_size)) =>
+                {
+                    crate::diag::error(
+                        insn.pos.unwrap_or_default(),
+                        &impossible_constant(slots.len(), v, &input.constraint),
+                    );
+                    slots.push(mk(AsmOperandValue::Int(0)));
                 }
                 Loc::Imm(v) => {
                     // Immediate value
-                    slots.push(mk(None, Some(format!("#{}", v as i64))));
+                    slots.push(mk(AsmOperandValue::Int(canonical_int(v, op_size))));
                 }
                 // A floating constant has no address, so a memory-class
                 // constraint cannot be satisfied. gcc says the same and stops.
@@ -444,7 +462,7 @@ impl Aarch64CodeGen {
                         insn.pos.unwrap_or_default(),
                         &format!("memory input {} is not directly addressable", slots.len()),
                     );
-                    slots.push(mk(None, Some("[sp]".to_string())));
+                    slots.push(mk(AsmOperandValue::Mem("[sp]".to_string())));
                 }
                 // A register-class constraint wants the value in a register,
                 // and a constant is never allocated one. Materialize it into
@@ -457,7 +475,7 @@ impl Aarch64CodeGen {
                             "too many register constraints in one asm statement; \
                              c17 has three general scratch registers to give",
                         );
-                        slots.push(mk(Some(Reg::X9), None));
+                        slots.push(mk(AsmOperandValue::Reg(Reg::X9)));
                         continue;
                     };
                     self.emit_mov_imm(scratch, bits, 64);
@@ -469,7 +487,8 @@ impl Aarch64CodeGen {
                                 "too many vector register constraints in one asm \
                                  statement; c17 has three scratch registers to give",
                             );
-                            slots.push(mk(None, Some(VReg::V16.name_d().to_string())));
+                            slots
+                                .push(mk(AsmOperandValue::RegName(VReg::V16.name_d().to_string())));
                             continue;
                         };
                         let fp_size = match imm_size {
@@ -482,16 +501,18 @@ impl Aarch64CodeGen {
                             src: scratch,
                             dst: vreg,
                         });
-                        // A vector operand has to be pre-rendered: the slot
-                        // carries only a general register, and `%w`-style
-                        // width modifiers do not apply to one of these.
-                        slots.push(mk(None, Some(Self::vreg_name(vreg, imm_size).to_string())));
+                        // A vector operand is named by its spelling, at the
+                        // constant's width; `%s`/`%d`-style modifiers rename
+                        // it at theirs.
+                        slots.push(mk(AsmOperandValue::RegName(
+                            Self::vreg_name(vreg, imm_size).to_string(),
+                        )));
                     } else {
                         // A *register* slot, not a pre-rendered name: the
                         // template decides the width it wants, and `%w1`
                         // against a hard-coded `x9` assembled as
                         // `mov w0, x9`.
-                        slots.push(mk(Some(scratch), None));
+                        slots.push(mk(AsmOperandValue::Reg(scratch)));
                     }
                 }
                 // An FP *value* under a general-register constraint. Nothing
@@ -504,7 +525,9 @@ impl Aarch64CodeGen {
                 // Already in a vector register, and that is what was asked
                 // for: name it directly at the operand's width.
                 Loc::VReg(v) if requires_vector(class) => {
-                    slots.push(mk(None, Some(Self::vreg_name(v, op_size).to_string())));
+                    slots.push(mk(AsmOperandValue::RegName(
+                        Self::vreg_name(v, op_size).to_string(),
+                    )));
                 }
                 // A vector-class input that is not in a vector register. The
                 // output loop's note applies: without this the operand named
@@ -516,10 +539,12 @@ impl Aarch64CodeGen {
                             "too many vector register constraints in one asm \
                              statement; c17 has three scratch registers to give",
                         );
-                        slots.push(mk(None, Some(VReg::V16.name_d().to_string())));
+                        slots.push(mk(AsmOperandValue::RegName(VReg::V16.name_d().to_string())));
                         continue;
                     };
-                    slots.push(mk(None, Some(Self::vreg_name(vreg, op_size).to_string())));
+                    slots.push(mk(AsmOperandValue::RegName(
+                        Self::vreg_name(vreg, op_size).to_string(),
+                    )));
                     vec_input_moves.push((vreg, loc.clone(), op_size));
                 }
                 Loc::VReg(v) if !requires_vector(class) => {
@@ -529,7 +554,7 @@ impl Aarch64CodeGen {
                             "too many register constraints in one asm statement; \
                              c17 has three general scratch registers to give",
                         );
-                        slots.push(mk(Some(Reg::X9), None));
+                        slots.push(mk(AsmOperandValue::Reg(Reg::X9)));
                         continue;
                     };
                     let fp_size = match op_size {
@@ -542,7 +567,7 @@ impl Aarch64CodeGen {
                         src: v,
                         dst: scratch,
                     });
-                    slots.push(mk(Some(scratch), None));
+                    slots.push(mk(AsmOperandValue::Reg(scratch)));
                 }
                 // A register input the allocator gave no register: loaded into
                 // a scratch before the template.
@@ -560,11 +585,11 @@ impl Aarch64CodeGen {
                             "too many register operands in one asm statement; \
                              c17 has no register left to give one",
                         );
-                        slots.push(mk(Some(Reg::X9), None));
+                        slots.push(mk(AsmOperandValue::Reg(Reg::X9)));
                         continue;
                     };
                     addr_regs.setups.push((reg, setup));
-                    slots.push(mk(Some(reg), None));
+                    slots.push(mk(AsmOperandValue::Reg(reg)));
                 }
                 _ if requires_mem => {
                     // A `+m` input shares its output's pseudo, and so its
@@ -585,12 +610,11 @@ impl Aarch64CodeGen {
                         &mut gp_scratch,
                         insn,
                     );
-                    slots.push(mk(None, Some(mem_str)));
+                    slots.push(mk(mem_str));
                 }
                 _ => {
                     // Memory or other location
-                    let mem_str = self.loc_to_asm_string(&loc, op_size);
-                    slots.push(mk(None, Some(mem_str)));
+                    slots.push(mk(self.loc_to_asm_operand(&loc, op_size)));
                 }
             }
         }
@@ -626,9 +650,18 @@ impl Aarch64CodeGen {
             self.emit_operand_setup(reg, setup);
         }
 
-        // Substitute %0, %1, %[name], %l0, %l[name], etc. in the template with actual operands
-        let asm_output =
-            self.substitute_asm_operands(&asm_data.template, &slots, &goto_labels_formatted);
+        let asm_output = match crate::arch::substitute_asm_operands(
+            self,
+            &asm_data.template,
+            &slots,
+            &goto_labels_formatted,
+        ) {
+            Ok(text) => text,
+            Err(msg) => {
+                crate::diag::error(insn.pos.unwrap_or_default(), &msg);
+                return;
+            }
+        };
 
         // Emit the inline assembly as raw text
         // Split by newlines and emit each line
@@ -702,19 +735,19 @@ impl Aarch64CodeGen {
         regs: &mut OperandRegs,
         gp_scratch: &mut Vec<Reg>,
         insn: &Instruction,
-    ) -> String {
+    ) -> AsmOperandValue<Reg> {
         let Ok(object_offset) = i32::try_from(object_offset) else {
             crate::diag::error(
                 insn.pos.unwrap_or_default(),
                 "an asm memory operand lies past the displacement an instruction can hold",
             );
-            return "[sp]".to_string();
+            return AsmOperandValue::Mem("[sp]".to_string());
         };
         // Two members of one object share its `Sym` and differ in offset, so
         // an address register is reused only for the same pseudo *and* offset.
         let key = (pseudo, object_offset);
         if let Some(&(_, reg)) = regs.given.iter().find(|(k, _)| *k == key) {
-            return format!("[{}]", asm_reg_name_64(reg));
+            return AsmOperandValue::Mem(format!("[{}]", asm_reg_name_64(reg)));
         }
         let setup = match loc {
             Loc::Stack(_) | Loc::IncomingArg(_) if self.pseudos.is_sym(pseudo) => {
@@ -729,11 +762,11 @@ impl Aarch64CodeGen {
                     (-256..=255).contains(&offset)
                 };
                 if fits {
-                    return if offset == 0 {
+                    return AsmOperandValue::Mem(if offset == 0 {
                         format!("[{}]", asm_reg_name_64(base))
                     } else {
                         format!("[{}, #{}]", asm_reg_name_64(base), offset)
-                    };
+                    });
                 }
                 OperandSetup::Object { base, offset }
             }
@@ -744,7 +777,7 @@ impl Aarch64CodeGen {
                 name: name.clone(),
                 offset: object_offset.into(),
             },
-            other => return self.loc_to_asm_string(other, size_bits),
+            other => return self.loc_to_asm_operand(other, size_bits),
         };
         let x15_ok = !self.setup_borrows_legalize_reg(&setup);
         let Some(reg) = regs.take(gp_scratch, x15_ok) else {
@@ -754,11 +787,11 @@ impl Aarch64CodeGen {
                  in a register; c17 has six scratch registers to give, fewer if \
                  the statement uses or clobbers them",
             );
-            return "[sp]".to_string();
+            return AsmOperandValue::Mem("[sp]".to_string());
         };
         regs.given.push((key, reg));
         regs.setups.push((reg, setup));
-        format!("[{}]", asm_reg_name_64(reg))
+        AsmOperandValue::Mem(format!("[{}]", asm_reg_name_64(reg)))
     }
 
     /// Whether putting `setup` in a register would also need X15 as a
@@ -913,40 +946,23 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Convert a location to an asm operand string for AArch64
-    fn loc_to_asm_string(&self, loc: &Loc, size_bits: u32) -> String {
+    /// A location as the template substitutes it, for an operand of
+    /// `size_bits`.
+    fn loc_to_asm_operand(&self, loc: &Loc, size_bits: u32) -> AsmOperandValue<Reg> {
         match loc {
-            Loc::Reg(r) => {
-                if size_bits <= 32 {
-                    asm_reg_name_32(*r).to_string()
-                } else {
-                    asm_reg_name_64(*r).to_string()
-                }
-            }
+            Loc::Reg(r) => AsmOperandValue::Reg(*r),
             loc @ (Loc::Stack(_) | Loc::IncomingArg(_)) => {
                 // AArch64 addresses a local from whichever base the frame uses
                 let (base, actual) = self.loc_addr_parts(loc).unwrap();
-                format!("[{}, #{}]", asm_reg_name_64(base), actual)
+                AsmOperandValue::Mem(format!("[{}, #{}]", asm_reg_name_64(base), actual))
             }
-            Loc::Imm(v) => format!("#{}", *v as i64),
-            Loc::VReg(vreg) => vreg.name_d().to_string(),
-            // An immediate-class constraint takes the constant's bit pattern:
-            // there is no other way to name a floating value in an assembler
-            // operand. The register and memory classes never reach here;
-            // `emit_inline_asm` materializes or diagnoses them first.
-            Loc::FImm(v, fp_size) => format!("#{}", v.to_bits_at_width(*fp_size)),
-            Loc::Global(name) => name.clone(),
+            Loc::Imm(v) => AsmOperandValue::Int(canonical_int(*v, size_bits)),
+            Loc::VReg(vreg) => AsmOperandValue::RegName(vreg.name_d().to_string()),
+            // An immediate-class constraint takes the constant itself. The
+            // register and memory classes never reach here; `emit_inline_asm`
+            // materializes or diagnoses them first.
+            Loc::FImm(v, fp_size) => AsmOperandValue::Float(*v, *fp_size),
+            Loc::Global(name) => AsmOperandValue::Mem(name.clone()),
         }
-    }
-
-    /// Substitute %0, %1, %[name], %l0, %l[name], etc. in asm template with actual operands
-    /// goto_labels: (label_string, label_name) - label_string is the fully formatted label
-    fn substitute_asm_operands(
-        &self,
-        template: &str,
-        slots: &[crate::arch::AsmOperandSlot<Reg>],
-        goto_labels: &[(String, String)],
-    ) -> String {
-        crate::arch::substitute_asm_operands(self, template, slots, goto_labels)
     }
 }

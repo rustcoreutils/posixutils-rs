@@ -2626,9 +2626,8 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// Resolve a read-modify-write target, evaluating its subexpressions once.
     ///
     /// `None` for a bare identifier: it has no subexpressions, so nothing can
-    /// be evaluated twice, and the name-based paths handle the shapes that
-    /// have no address at all -- a parameter living in `var_map`, and a static
-    /// local behind its sentinel.
+    /// be evaluated twice, and the name-based paths handle the shape that
+    /// has no address of its own -- a static local behind its sentinel.
     pub(crate) fn resolve_rmw_place(&mut self, target: &Expr) -> Option<RmwPlace> {
         match &target.kind {
             ExprKind::Ident(_) => None,
@@ -3103,11 +3102,6 @@ impl<'a> super::linearize::Linearizer<'a> {
                         target_size,
                     ));
                 }
-            } else if self.var_map.contains_key(&name_str) {
-                // Parameter: this is not SSA-correct but parameters
-                // shouldn't be reassigned. If they are, we'd need to
-                // demote them to locals. For now, just update the mapping.
-                self.var_map.insert(name_str.clone(), final_val);
             } else {
                 // Global variable - emit store
                 let sym_id = self.alloc_pseudo();

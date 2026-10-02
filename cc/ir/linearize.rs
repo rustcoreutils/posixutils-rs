@@ -31,7 +31,7 @@ use crate::target::Target;
 use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::{HashMap, HashSet};
 
-const DEFAULT_VAR_MAP_CAPACITY: usize = 64;
+const DEFAULT_LOCALS_CAPACITY: usize = 64;
 const DEFAULT_LABEL_MAP_CAPACITY: usize = 16;
 const DEFAULT_LOOP_DEPTH_CAPACITY: usize = 4;
 const DEFAULT_FILE_SCOPE_CAPACITY: usize = 16;
@@ -566,8 +566,6 @@ pub struct Linearizer<'a> {
     pub(crate) next_pseudo: u32,
     /// Next basic block ID
     pub(crate) next_bb: u32,
-    /// Parameter -> pseudo mapping (parameters are already SSA values)
-    pub(crate) var_map: HashMap<String, PseudoId>,
     /// Local variables (use Load/Store, converted to SSA later)
     /// Keyed by SymbolId for proper scope handling
     pub(crate) locals: HashMap<SymbolId, LocalVarInfo>,
@@ -752,8 +750,7 @@ impl<'a> Linearizer<'a> {
             current_bb: None,
             next_pseudo: 0,
             next_bb: 0,
-            var_map: HashMap::with_capacity(DEFAULT_VAR_MAP_CAPACITY),
-            locals: HashMap::with_capacity(DEFAULT_VAR_MAP_CAPACITY),
+            locals: HashMap::with_capacity(DEFAULT_LOCALS_CAPACITY),
             vm_typedef_dims: HashMap::new(),
             label_map: HashMap::with_capacity(DEFAULT_LABEL_MAP_CAPACITY),
             break_targets: Vec::with_capacity(DEFAULT_LOOP_DEPTH_CAPACITY),
@@ -1710,7 +1707,6 @@ impl<'a> Linearizer<'a> {
         // Reset per-function state
         self.next_pseudo = 0;
         self.next_bb = 0;
-        self.var_map.clear();
         self.locals.clear();
         self.local_scope_stack.clear();
         self.label_map.clear();
@@ -2806,79 +2802,6 @@ impl<'a> Linearizer<'a> {
                         result,
                         local.sym,
                         self.types.pointer_to(local.typ),
-                    ));
-                    result
-                } else if let Some(&param_pseudo) = self.var_map.get(&name_str) {
-                    // Parameter whose address is taken
-                    let param_type = self.expr_type(expr);
-                    let type_kind = self.types.kind(param_type);
-
-                    // va_list parameters are special: the parameter value IS already a pointer
-                    // to the va_list structure (due to array-to-pointer decay at call site).
-                    // Return the pointer value directly instead of spilling.
-                    //
-                    // Again only where `va_list` is an array. Where it is a
-                    // pointer, the object's address is the slot's, so the
-                    // parameter has to spill like any other.
-                    if type_kind == TypeKind::VaList && !self.types.va_list_is_pointer() {
-                        return param_pseudo;
-                    }
-
-                    // For other parameters, spill to local storage.
-                    // Parameters are pass-by-value in the IR (Arg pseudos), but if
-                    // their address is taken, we need to copy to a stack slot first.
-                    let size = self.types.size_bits(param_type);
-
-                    // Create a local variable to hold the parameter value
-                    let local_sym = self.alloc_pseudo();
-                    let local_pseudo = Pseudo::sym(local_sym, format!("{}_spill", name_str));
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(local_pseudo);
-                        func.locals.insert(
-                            format!("{}_spill", name_str),
-                            super::LocalVar {
-                                sym: local_sym,
-                                typ: param_type,
-                                decl_block: self.current_bb,
-                                explicit_align: None, // parameter spill storage
-                            },
-                        );
-                    }
-
-                    // Store the parameter value to the local
-                    self.emit(Instruction::store(
-                        param_pseudo,
-                        local_sym,
-                        0,
-                        param_type,
-                        size,
-                    ));
-
-                    // Update locals map so future accesses use the spilled location
-                    self.insert_local(
-                        *symbol_id,
-                        LocalVarInfo {
-                            sym: local_sym,
-                            typ: param_type,
-                            vla_size_sym: None,
-                            vla_outer_extent: None,
-                            vla_elem_type: None,
-                            vm_row_dims: vec![],
-                            storage: Storage::InSlot,
-                        },
-                    );
-
-                    // Also update var_map to point to the local for future value accesses
-                    // (so reads go through load instead of using the original Arg pseudo)
-                    // Note: We leave var_map unchanged here because reads should use
-                    // the stored value via load from the local.
-
-                    // Return address of the local
-                    let result = self.alloc_pseudo();
-                    self.emit(Instruction::sym_addr(
-                        result,
-                        local_sym,
-                        self.types.pointer_to(param_type),
                     ));
                     result
                 } else {
@@ -4475,8 +4398,6 @@ impl<'a> Linearizer<'a> {
                         store_size,
                     ));
                 }
-            } else if self.var_map.contains_key(&name_str) {
-                self.var_map.insert(name_str.clone(), final_result);
             } else {
                 // Global variable - emit store
                 let sym_id = self.alloc_pseudo();
@@ -4990,8 +4911,6 @@ impl<'a> Linearizer<'a> {
                             store_size,
                         ));
                     }
-                } else if self.var_map.contains_key(&name_str) {
-                    self.var_map.insert(name_str.clone(), final_result);
                 } else {
                     // Global variable - emit store
                     let sym_id = self.alloc_pseudo();
@@ -5108,10 +5027,6 @@ impl<'a> Linearizer<'a> {
                 _ => ObjectPlace::Sym(local.sym),
             };
             self.read_object(place, local.typ)
-        }
-        // Check if it's a parameter (already SSA value)
-        else if let Some(&pseudo) = self.var_map.get(&name_str) {
-            pseudo
         }
         // Global variable - create symbol reference and load
         else {

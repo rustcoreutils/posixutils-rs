@@ -2921,19 +2921,6 @@ impl<'a> super::linearize::Linearizer<'a> {
 
     // Inline assembly linearization
 
-    /// Linearize an inline assembly statement
-    /// Check if an expression is a simple identifier that's a parameter (in var_map)
-    /// Returns Some((name, pseudo)) if it is, None otherwise
-    pub(crate) fn get_param_if_ident(&self, expr: &Expr) -> Option<(String, PseudoId)> {
-        if let ExprKind::Ident(symbol_id) = &expr.kind {
-            let name_str = self.symbol_name(*symbol_id);
-            if let Some(&pseudo) = self.var_map.get(&name_str) {
-                return Some((name_str, pseudo));
-            }
-        }
-        None
-    }
-
     /// What each operand's constraint allows on the target being compiled,
     /// outputs then inputs. Classified here once and stored on the operand,
     /// so liveness, the allocator and the backend all read the same answer.
@@ -2995,6 +2982,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         Some(self.emit_fconst(v.round_to_format(fmt), typ))
     }
 
+    /// Linearize an inline assembly statement
     pub(crate) fn linearize_asm(
         &mut self,
         template: &str,
@@ -3005,8 +2993,6 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) {
         let mut ir_outputs = Vec::new();
         let mut ir_inputs = Vec::new();
-        // Track which outputs are parameters (need var_map update instead of store)
-        let mut param_outputs: Vec<Option<String>> = Vec::new();
         // Track which outputs need no post-asm processing — true for
         // memory-class outputs (`=m`/`+m`/`=o`/`+o`/...), where the asm
         // wrote the new value directly through the memory operand and
@@ -3098,7 +3084,6 @@ impl<'a> super::linearize::Linearizer<'a> {
                     offset,
                 });
 
-                param_outputs.push(None);
                 skip_post_handling.push(true);
                 continue;
             }
@@ -3106,9 +3091,6 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Non-memory output (register or value class): allocate a
             // fresh pseudo for the asm to write into.
             let pseudo = self.alloc_pseudo();
-
-            // Check if this output is a parameter (SSA value, not memory location)
-            let param_info = self.get_param_if_ident(&op.expr);
 
             // For read-write outputs ("+r"), load the initial value into the SAME pseudo
             // so that input and output use the same register — unless a
@@ -3118,16 +3100,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // validator invariant after optimization).
             if is_readwrite {
                 if !tied_inputs[output_idx] {
-                    if let Some((_, param_pseudo)) = &param_info {
-                        // Parameter: copy value directly (no memory address)
-                        self.emit(
-                            Instruction::new(Opcode::Copy)
-                                .with_target(pseudo)
-                                .with_src(*param_pseudo)
-                                .with_type(typ)
-                                .with_size(size),
-                        );
-                    } else if let Some(p) = &place {
+                    if let Some(p) = &place {
                         // Through the resolved place, so the operand
                         // expression runs once for the read and the write.
                         let val = self.load_rmw_place(p, typ);
@@ -3169,8 +3142,6 @@ impl<'a> super::linearize::Linearizer<'a> {
                 offset: 0,
             });
 
-            // Track if this is a parameter output
-            param_outputs.push(param_info.map(|(name, _)| name));
             skip_post_handling.push(false);
             output_places.push(place);
         }
@@ -3327,7 +3298,6 @@ impl<'a> super::linearize::Linearizer<'a> {
                                 outputs,
                                 &ir_outputs,
                                 &skip_post_handling,
-                                &param_outputs,
                                 &output_places,
                             );
                         }
@@ -3344,13 +3314,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
         }
 
-        self.emit_asm_output_writeback(
-            outputs,
-            &ir_outputs,
-            &skip_post_handling,
-            &param_outputs,
-            &output_places,
-        );
+        self.emit_asm_output_writeback(outputs, &ir_outputs, &skip_post_handling, &output_places);
     }
 
     /// Store an asm statement's register outputs back to their destinations.
@@ -3359,7 +3323,6 @@ impl<'a> super::linearize::Linearizer<'a> {
         outputs: &[AsmOperand],
         ir_outputs: &[AsmConstraint],
         skip_post_handling: &[bool],
-        param_outputs: &[Option<String>],
         output_places: &[Option<super::linearize_emit::RmwPlace>],
     ) {
         // store(value, addr, ...) - value first, then address
@@ -3373,22 +3336,16 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             let out_pseudo = ir_outputs[i].pseudo;
 
-            // Check if this output is a parameter (update var_map instead of memory store)
-            if let Some(param_name) = &param_outputs[i] {
-                // Parameter: update var_map with the new SSA value
-                self.var_map.insert(param_name.clone(), out_pseudo);
+            let typ = self.expr_type(&op.expr);
+            let size = self.types.size_bits(typ);
+            // Back through the place the read came from, so the operand
+            // expression is not evaluated a second time.
+            if let Some(p) = &output_places[i] {
+                self.store_rmw_place(p, out_pseudo, typ);
             } else {
-                let typ = self.expr_type(&op.expr);
-                let size = self.types.size_bits(typ);
-                // Back through the place the read came from, so the operand
-                // expression is not evaluated a second time.
-                if let Some(p) = &output_places[i] {
-                    self.store_rmw_place(p, out_pseudo, typ);
-                } else {
-                    // A bare identifier: nothing to evaluate twice.
-                    let addr = self.linearize_lvalue(&op.expr);
-                    self.emit(Instruction::store(out_pseudo, addr, 0, typ, size));
-                }
+                // A bare identifier: nothing to evaluate twice.
+                let addr = self.linearize_lvalue(&op.expr);
+                self.emit(Instruction::store(out_pseudo, addr, 0, typ, size));
             }
         }
     }

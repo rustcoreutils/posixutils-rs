@@ -181,6 +181,12 @@ impl ConstMap {
         cur
     }
 
+    /// Whether `a` and `b` are the same value read at `width` bits: whether
+    /// they share a [`Self::root`].
+    pub(crate) fn same(&self, a: PseudoId, b: PseudoId, width: u32) -> bool {
+        self.root(a, width) == self.root(b, width)
+    }
+
     /// The constant at `id`, read at `size` bits in the given signedness.
     ///
     /// For a consumer that *knows* how to read its operands -- a comparison
@@ -192,20 +198,10 @@ impl ConstMap {
     /// Still `None` when the chain narrows *below* `size`, since the value
     /// was truncated before it got here.
     pub(crate) fn get_at(&self, id: PseudoId, size: u32, signed: bool) -> Option<i128> {
-        let mut cur = id;
-        let mut narrowest: Option<u32> = None;
-        for _ in 0..=self.copies.len() {
-            if let Some(&v) = self.vals.get(&cur) {
-                return match narrowest {
-                    Some(w) if w < size => None,
-                    _ => Some(at_width(v, size, signed)),
-                };
-            }
-            let &(src, width) = self.copies.get(&cur)?;
-            narrowest = Some(narrowest.map_or(width, |w: u32| w.min(width)));
-            cur = src;
+        match self.walk(id)? {
+            (_, Some(w)) if w < size => None,
+            (v, _) => Some(at_width(v, size, signed)),
         }
-        None
     }
 
     /// The float constant at `id`, following `Copy` chains to their source.
@@ -226,19 +222,24 @@ impl ConstMap {
     /// `Phi`, a `Load` or `Call` result, an `Arg`, an `Undef`, a float, or a
     /// chain whose value does not fit the width it is copied at.
     pub(crate) fn get(&self, id: PseudoId) -> Option<i128> {
-        let mut cur = id;
-        // The narrowest width the value is observed through bounds what the
-        // final answer is allowed to be.
-        let mut narrowest: Option<u32> = None;
+        match self.walk(id)? {
+            (v, Some(w)) if !unambiguous_at(v, w) => None,
+            (v, _) => Some(v),
+        }
+    }
 
-        // Bounded rather than visited-set: a cycle terminates instead of
-        // hanging, without relying on I1 having actually been checked.
+    /// The integer constant at the end of `id`'s copy chain, with the
+    /// narrowest width the chain observes it through -- which bounds what the
+    /// final answer is allowed to be, and is `None` for no copy at all.
+    ///
+    /// Bounded rather than visited-set: a cycle terminates instead of
+    /// hanging, without relying on I1 having actually been checked.
+    fn walk(&self, id: PseudoId) -> Option<(i128, Option<u32>)> {
+        let mut cur = id;
+        let mut narrowest: Option<u32> = None;
         for _ in 0..=self.copies.len() {
             if let Some(&v) = self.vals.get(&cur) {
-                return match narrowest {
-                    Some(w) if !unambiguous_at(v, w) => None,
-                    _ => Some(v),
-                };
+                return Some((v, narrowest));
             }
             let &(src, width) = self.copies.get(&cur)?;
             narrowest = Some(narrowest.map_or(width, |w: u32| w.min(width)));

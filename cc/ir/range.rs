@@ -31,20 +31,15 @@
 // intervals frightening.
 //
 
-use super::constfold::{at_width, Outcomes};
+use super::constfold::{at_width, signed_min_at, Outcomes};
 use std::cmp::Ordering;
 
-/// The signed range a `width`-bit value spans.
-///
-/// Not `-(1i128 << (w - 1))`: at `w == 128` that shift yields `i128::MIN`
-/// and negating it overflows, which panics a debug build -- and CI runs the
-/// tests in debug.
+/// The signed range a `width`-bit value spans. The maximum is the
+/// complement of the minimum, which unlike negating it cannot overflow at
+/// 128 bits.
 const fn signed_bounds(width: u32) -> (i128, i128) {
-    if width >= 128 {
-        (i128::MIN, i128::MAX)
-    } else {
-        (-(1i128 << (width - 1)), (1i128 << (width - 1)) - 1)
-    }
+    let min = signed_min_at(width);
+    (min, !min)
 }
 
 /// The low `width` bits set.

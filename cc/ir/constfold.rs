@@ -327,7 +327,7 @@ fn eval_binop(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
 ///
 /// `size == 0` and `size >= 128` both answer `i128::MIN`, matching
 /// [`at_width`], which leaves a value alone at those widths.
-fn signed_min_at(size: u32) -> i128 {
+pub(crate) const fn signed_min_at(size: u32) -> i128 {
     if size == 0 || size >= 128 {
         i128::MIN
     } else {

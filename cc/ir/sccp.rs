@@ -115,7 +115,7 @@ impl Solver {
         // the value, exactly as `instcombine` does it.
         if let ([a, b], Some((mask, domain))) = (insn.src.as_slice(), Outcomes::of_op(insn.op)) {
             let w = insn.operand_width();
-            if self.consts.root(*a, w) == self.consts.root(*b, w) {
+            if self.consts.same(*a, *b, w) {
                 if let Some(v) = mask.decide(domain.reflexive()) {
                     return Val::Const(i128::from(v));
                 }

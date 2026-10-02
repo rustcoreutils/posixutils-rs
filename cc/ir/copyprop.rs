@@ -145,11 +145,7 @@ fn forwarding(func: &Function, types: &TypeTable) -> HashMap<PseudoId, PseudoId>
         };
         // A `Sym` target names storage, and uses of it are addresses, not
         // the value copied in.
-        let register = matches!(
-            func.get_pseudo(target).map(|p| &p.kind),
-            Some(PseudoKind::Reg(_)) | None
-        );
-        if !register || multiply_defined.contains(&target) {
+        if !func.is_plain_temp(target) || multiply_defined.contains(&target) {
             continue;
         }
         let src = insn.src[0];

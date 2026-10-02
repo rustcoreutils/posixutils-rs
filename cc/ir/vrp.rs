@@ -434,7 +434,7 @@ impl Solver {
             return RVal::Bottom;
         };
         // Comparing a value with itself is decided without knowing it.
-        let possible = if self.consts.root(insn.src[0], ow) == self.consts.root(insn.src[1], ow) {
+        let possible = if self.consts.same(insn.src[0], insn.src[1], ow) {
             domain.reflexive()
         } else {
             let (RVal::Known(a), RVal::Known(b)) = (

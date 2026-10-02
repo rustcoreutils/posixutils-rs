@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use super::fuser_test;
+use super::{fuser_test, wait_for_open_fd};
 use libc::uid_t;
 use std::{ffi::CStr, fs::File, io, process::Command, str};
 
@@ -81,7 +81,8 @@ fn get_username_by_uid(uid: uid_t) -> io::Result<String> {
 /// - Verifies that the owner printed in stderr.
 #[test]
 fn test_fuser_with_user() {
-    let temp_file_path = std::env::temp_dir().join("test_file_with_user");
+    let temp_file_path =
+        std::env::temp_dir().join(format!("fuser_with_user_{}", std::process::id()));
     let temp_file_path_clone = temp_file_path.clone();
 
     File::create(&temp_file_path_clone).expect("Failed to create temporary file");
@@ -93,6 +94,9 @@ fn test_fuser_with_user() {
         .expect("Failed to start process");
 
     let pid = process.id();
+    // fuser only reports `tail` (and so its owner) once `tail` has the file
+    // open, which a loaded machine can delay past fuser's scan of /proc.
+    wait_for_open_fd(pid, temp_file_path_clone.to_str().unwrap());
     let owner = get_process_user(pid).expect("Failed to get owner of process");
 
     fuser_test(

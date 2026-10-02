@@ -64,7 +64,10 @@ fn wait_for_unix_socket(socket_path: &str) {
 /// - Verifies that the `fuser` command can find the process associated with the Unix socket.
 #[test]
 fn test_fuser_unixsocket() {
-    let socket_path = "/tmp/test.sock";
+    // Unique per run: a fixed path is shared with any other copy of this suite
+    // running at the same time, which deletes and rebinds it underneath us.
+    let socket_file = std::env::temp_dir().join(format!("fuser_unix_{}.sock", std::process::id()));
+    let socket_path = socket_file.to_str().unwrap();
     let _unix_socket = match start_unix_socket(socket_path) {
         Ok(socket) => socket,
         Err(e) => {
@@ -75,9 +78,10 @@ fn test_fuser_unixsocket() {
 
     wait_for_unix_socket(socket_path);
 
+    let thread_path = socket_path.to_string();
     let handle = thread::spawn(move || {
-        fuser_test(vec![socket_path.to_string()], "", 0, |_, _output| {
-            let manual_output = Command::new("fuser").arg(socket_path).output();
+        fuser_test(vec![thread_path.clone()], "", 0, |_, _output| {
+            let manual_output = Command::new("fuser").arg(&thread_path).output();
 
             match manual_output {
                 Ok(output) => {
@@ -91,4 +95,5 @@ fn test_fuser_unixsocket() {
     });
 
     handle.join().expect("Thread panicked");
+    let _ = fs::remove_file(socket_path);
 }

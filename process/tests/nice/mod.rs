@@ -64,7 +64,10 @@ fn nice_not_found() {
 // #NC2: utility found but not executable -> 126 (not 1).
 #[test]
 fn nice_not_executable() {
-    let path = std::env::temp_dir().join("posixutils_nice_test_noexec");
+    let path = std::env::temp_dir().join(format!(
+        "posixutils_nice_test_noexec_{}",
+        std::process::id()
+    ));
     {
         let _f = std::fs::OpenOptions::new()
             .create(true)

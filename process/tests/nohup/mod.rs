@@ -36,7 +36,10 @@ fn nohup_not_found() {
 // Utility found but not executable -> 126.
 #[test]
 fn nohup_not_executable() {
-    let path = std::env::temp_dir().join("posixutils_nohup_test_noexec");
+    let path = std::env::temp_dir().join(format!(
+        "posixutils_nohup_test_noexec_{}",
+        std::process::id()
+    ));
     {
         let _f = std::fs::OpenOptions::new()
             .create(true)

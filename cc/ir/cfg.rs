@@ -229,6 +229,28 @@ impl Function {
         }
     }
 
+    /// Block `to` has taken over every instruction of `from` that named a
+    /// successor -- the tail of a block split in two -- so move the edges
+    /// with them: each successor of `from` becomes one of `to` instead, and
+    /// takes `to` as its predecessor where it had `from`, phi operands
+    /// included, keeping its place in each list. `from` is left with no
+    /// successors and `to` must have none yet.
+    pub fn move_successors(&mut self, from: BasicBlockId, to: BasicBlockId) {
+        let moved = self
+            .get_block_mut(from)
+            .map(|b| std::mem::take(&mut b.children))
+            .unwrap_or_default();
+        for &c in &moved {
+            if let Some(b) = self.get_block_mut(c) {
+                b.rename_predecessor(from, to);
+            }
+        }
+        if let Some(b) = self.get_block_mut(to) {
+            debug_assert!(b.children.is_empty(), "{to} already has successors");
+            b.children = moved;
+        }
+    }
+
     /// Forget the edge `from` -> `to`, which no instruction of `from` names any
     /// more (or `from` is about to be deleted).
     ///
@@ -823,6 +845,56 @@ mod tests {
             f.blocks.iter().any(|b| b.forwards_to().is_some()),
             "the forwarding cycle is still there: {before:?} -> {:?}",
             ids(&f)
+        );
+        valid(&f);
+    }
+
+    /// Splitting a block moves its successors to the tail: each keeps its
+    /// place in its successor's predecessor list, and the phi operands taken
+    /// along the old edge are taken along the new one.
+    #[test]
+    fn move_successors_hands_the_edges_to_the_tail() {
+        let int = TypeTable::new(&Target::host()).int_id;
+        let mut src0 = Instruction::phi_source(PseudoId(10), PseudoId(2), int, 32);
+        src0.phi_list = vec![(BasicBlockId(2), PseudoId(11))];
+        let mut src1 = Instruction::phi_source(PseudoId(12), PseudoId(2), int, 32);
+        src1.phi_list = vec![(BasicBlockId(2), PseudoId(11))];
+        let mut phi = Instruction::phi(PseudoId(11), int, 32);
+        phi.phi_list = vec![
+            (BasicBlockId(0), PseudoId(10)),
+            (BasicBlockId(1), PseudoId(12)),
+        ];
+        let mut f = function(vec![
+            (0, vec![entry(), src0, cbr(1, 2)], vec![1, 2]),
+            (1, vec![src1, br(2)], vec![2]),
+            (2, vec![phi, Instruction::ret(Some(PseudoId(11)))], vec![]),
+        ]);
+        f.rebuild_block_idx();
+        assert_eq!(
+            f.get_block(BasicBlockId(2)).unwrap().parents,
+            [0, 1].map(BasicBlockId)
+        );
+
+        // Block 0's tail moves to a new block 3, and 0 branches to it.
+        let mut tail = BasicBlock::new(BasicBlockId(3));
+        tail.insns = f.blocks[0].insns.split_off(1);
+        f.blocks[0].insns.push(br(3));
+        f.add_block(tail);
+        f.move_successors(BasicBlockId(0), BasicBlockId(3));
+        f.add_edge(BasicBlockId(0), BasicBlockId(3));
+
+        let block = |id| f.get_block(BasicBlockId(id)).unwrap();
+        assert_eq!(block(0).children, [BasicBlockId(3)]);
+        assert_eq!(block(3).children, [1, 2].map(BasicBlockId));
+        assert_eq!(block(3).parents, [BasicBlockId(0)]);
+        assert_eq!(block(1).parents, [BasicBlockId(3)]);
+        assert_eq!(block(2).parents, [3, 1].map(BasicBlockId));
+        assert_eq!(
+            block(2).insns[0].phi_list,
+            [
+                (BasicBlockId(3), PseudoId(10)),
+                (BasicBlockId(1), PseudoId(12))
+            ]
         );
         valid(&f);
     }

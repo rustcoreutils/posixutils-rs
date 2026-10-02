@@ -107,6 +107,35 @@ pub(crate) fn block_chunks(bytes: i64) -> impl Iterator<Item = (i64, Chunk)> {
     })
 }
 
+/// A copy of `bytes` bytes from `src` to `dst + dst_offset`, as a load and a
+/// store per [`block_chunks`] piece, in rising offset.
+///
+/// `typ` names the access type of each piece and `alloc` the temporary that
+/// carries it, so the copy needs no `TypeTable` and no function to build
+/// into: the inliner has neither, and the linearizer marks the accesses
+/// volatile and emits them itself. Each temporary is allocated in the order
+/// its piece is copied, the order a hand-written loop allocated them.
+///
+/// No bound: a caller copying something the program sized checks it against
+/// [`INLINE_LIMIT_BYTES`] first.
+pub(crate) fn chunk_copy(
+    src: PseudoId,
+    dst: PseudoId,
+    dst_offset: i64,
+    bytes: i64,
+    typ: impl Fn(Chunk) -> TypeId,
+    mut alloc: impl FnMut() -> PseudoId,
+) -> Vec<Instruction> {
+    let mut out = Vec::new();
+    for (at, chunk) in block_chunks(bytes) {
+        let (t, bits) = (typ(chunk), chunk.bits());
+        let v = alloc();
+        out.push(Instruction::load(v, src, at, t, bits));
+        out.push(Instruction::store(v, dst, dst_offset + at, t, bits));
+    }
+    out
+}
+
 /// How to read a whole object of `bytes` bytes into one register when
 /// `bytes` is not a natural access width -- 3, 5, 6 or 7, which is what a
 /// small composite gives.
@@ -210,9 +239,11 @@ impl Expander<'_> {
         let (dest, second) = (self.model.src[0], self.model.src[1]);
         match op {
             BlockOp::Copy => {
-                for (at, chunk) in block_chunks(n) {
-                    let v = self.load(second, at, chunk);
-                    self.store(v, dest, at, chunk);
+                let types = self.b.types;
+                let func = &mut *self.b.func;
+                for insn in chunk_copy(second, dest, 0, n, |c| c.typ(types), || func.alloc_pseudo())
+                {
+                    self.b.push(insn);
                 }
             }
             BlockOp::Move => {
@@ -322,6 +353,65 @@ mod tests {
     use crate::ir::constfold::at_width;
     use crate::ir::{BasicBlock, BasicBlockId, Pseudo, PseudoKind};
     use crate::target::Target;
+
+    /// A chunked copy is a load and a store per piece, each through a
+    /// temporary of its own allocated in order, the store displaced by the
+    /// destination offset and both of the piece's width and type.
+    #[test]
+    fn chunk_copy_loads_and_stores_each_piece_in_order() {
+        let (src, dst) = (PseudoId(1), PseudoId(2));
+        let width_type = |c: Chunk| TypeId(c.bytes() as u32 + 100);
+        for n in 0..=24 {
+            let mut next = 50;
+            let insns = chunk_copy(src, dst, 1000, n, width_type, || {
+                next += 1;
+                PseudoId(next)
+            });
+            let pieces: Vec<(i64, Chunk)> = block_chunks(n).collect();
+            assert_eq!(insns.len(), 2 * pieces.len(), "{n} bytes");
+            for (k, ((at, chunk), pair)) in pieces.iter().zip(insns.chunks(2)).enumerate() {
+                let v = PseudoId(51 + k as u32);
+                let (typ, bits) = (Some(width_type(*chunk)), chunk.bits());
+                let (load, store) = (&pair[0], &pair[1]);
+                assert_eq!(
+                    (
+                        load.op,
+                        load.target,
+                        &load.src[..],
+                        load.offset,
+                        load.typ,
+                        load.size
+                    ),
+                    (Opcode::Load, Some(v), &[src][..], *at, typ, bits),
+                    "{n} bytes, piece {k}"
+                );
+                assert_eq!(
+                    (
+                        store.op,
+                        &store.src[..],
+                        store.offset,
+                        store.typ,
+                        store.size
+                    ),
+                    (Opcode::Store, &[dst, v][..], 1000 + at, typ, bits),
+                    "{n} bytes, piece {k}"
+                );
+            }
+            assert_eq!(next, 50 + pieces.len() as u32, "one temporary per piece");
+        }
+        let widths = |n| {
+            chunk_copy(src, dst, 0, n, width_type, || PseudoId(0))
+                .iter()
+                .step_by(2)
+                .map(|i| (i.offset, i.size / 8))
+                .collect::<Vec<_>>()
+        };
+        assert!(widths(0).is_empty());
+        assert_eq!(widths(7), [(0, 4), (4, 2), (6, 1)]);
+        assert_eq!(widths(13), [(0, 8), (8, 4), (12, 1)]);
+        assert_eq!(widths(23), [(0, 8), (8, 8), (16, 4), (20, 2), (22, 1)]);
+        assert_eq!(widths(24), [(0, 8), (8, 8), (16, 8)]);
+    }
 
     #[test]
     fn chunks_cover_the_block_widest_first() {

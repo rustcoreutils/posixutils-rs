@@ -408,14 +408,22 @@ impl<'a> super::linearize::Linearizer<'a> {
             self.emit_block_copy_call(dst, dst_base_offset, src, size_bytes);
             return;
         }
-        for (offset, chunk) in memexpand::block_chunks(size_bytes) {
-            let (typ, bits) = (chunk.typ(self.types), chunk.bits());
-            let tmp = self.alloc_pseudo();
-            self.emit(Instruction::load(tmp, src, offset, typ, bits).with_volatile(vol.src));
-            self.emit(
-                Instruction::store(tmp, dst, dst_base_offset + offset, typ, bits)
-                    .with_volatile(vol.dst),
-            );
+        let types = self.types;
+        let copy = memexpand::chunk_copy(
+            src,
+            dst,
+            dst_base_offset,
+            size_bytes,
+            |c| c.typ(types),
+            || self.alloc_pseudo(),
+        );
+        for insn in copy {
+            let volatile = if insn.op == Opcode::Load {
+                vol.src
+            } else {
+                vol.dst
+            };
+            self.emit(insn.with_volatile(volatile));
         }
     }
 

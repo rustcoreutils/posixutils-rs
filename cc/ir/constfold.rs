@@ -626,8 +626,7 @@ fn eval_unop(insn: &Instruction, a: i128) -> Option<i128> {
         // Read the operand at the width it was stored in, in the signedness
         // the opcode names, and leave it there: the destination is wider.
         Opcode::Sext | Opcode::Zext => {
-            let src = conversion_src_width(insn)?;
-            Some(at_width(a, src, insn.op == Opcode::Sext))
+            Some(at_width(a, insn.operand_width(), insn.op == Opcode::Sext))
         }
         // Truncation keeps the low `size` bits -- but *which value* those
         // bits are is decided by the consumer, not here, and the IR does not
@@ -713,16 +712,6 @@ pub(crate) fn eval_bit_op(op: BitOp, width: u32, a: i128) -> i128 {
             eval_bit_op(BitOp::Clz, width, magnitude) - 1
         }
     }
-}
-
-/// The width a conversion reads its operand at, or `None` when the
-/// instruction does not say.
-///
-/// Refusing is right rather than guessing from `size`: that is the
-/// *destination* width, so an extension read at it is the identity and a
-/// negative `char` would come back positive.
-fn conversion_src_width(insn: &Instruction) -> Option<u32> {
-    (insn.src_size != 0).then_some(insn.src_size)
 }
 
 #[cfg(test)]

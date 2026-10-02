@@ -371,16 +371,11 @@ impl Solver {
         if insn.src.len() != 1 {
             return RVal::Bottom;
         }
-        let dst = insn.size;
-        let src = if insn.op == Opcode::Trunc {
-            insn.size.max(insn.src_size)
-        } else {
-            insn.src_size
-        };
-        // An extension with no recorded source width cannot be read at all;
-        // guessing from the destination makes it the identity, which is how
-        // a negative `char` comes back positive.
-        let (Some(src), Some(dst)) = (Range::at(src), Range::at(dst)) else {
+        // The operand is read at its own width, which every width change
+        // records (validator I10): reading an extension at its destination
+        // width would make it the identity, which is how a negative `char`
+        // comes back positive.
+        let (Some(src), Some(dst)) = (Range::at(insn.operand_width()), Range::at(insn.size)) else {
             return RVal::Bottom;
         };
         let RVal::Known(a) = self.operand(block, insn.src[0], src) else {
@@ -673,6 +668,7 @@ mod tests {
             .with_target(PseudoId(11))
             .with_src(PseudoId(10))
             .with_type_and_size(i64t, 64);
+        zext.src_typ = Some(i32t);
         zext.src_size = 32;
         l1.add_insn(zext);
         l1.add_insn(Instruction::compare(

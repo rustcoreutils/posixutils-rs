@@ -647,19 +647,20 @@ fn simplify_select(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simp
 
 /// Fold an integer width conversion of a constant.
 ///
-/// The operand is read at the width the conversion says it was stored in,
-/// which is not `insn.size` -- that is the destination. `get_at` is the
-/// accessor that takes both, and it is right here for the same reason it is
-/// right for a comparison: the opcode carries the signedness.
+/// An extension's operand is read at the width the conversion says it was
+/// stored in, which is not `insn.size` -- that is the destination. `get_at`
+/// is the accessor that takes both, and it is right here for the same reason
+/// it is right for a comparison: the opcode carries the signedness.
+///
+/// A truncation's operand is read at `size` instead: its source is wider
+/// (validator I12), and the low `size` bits are all the result keeps.
 fn simplify_convert(insn: &Instruction, consts: &ConstMap) -> Simplification {
     if insn.src.len() != 1 {
         return Simplification::None;
     }
     let (width, signed) = match insn.op {
-        Opcode::Trunc => (insn.size.max(1), true),
-        _ if insn.src_size != 0 => (insn.src_size, insn.op == Opcode::Sext),
-        // Without a source width an extension cannot be read at all.
-        _ => return Simplification::None,
+        Opcode::Trunc => (insn.size, true),
+        _ => (insn.operand_width(), insn.op == Opcode::Sext),
     };
     match consts.get_at(insn.src[0], width, signed) {
         Some(a) => fold_with(insn, &[a]),
@@ -791,16 +792,13 @@ fn simplify_fcvtf(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simpl
     if insn.src.len() != 1 {
         return Simplification::None;
     }
-    let src_width = if insn.src_size != 0 {
-        insn.src_size
-    } else {
-        insn.size.max(1)
-    };
-    let Some(a) = consts.fget(insn.src[0], src_width) else {
+    let Some(a) = consts.fget(insn.src[0], insn.operand_width()) else {
         return Simplification::None;
     };
-    let (Some(src_fmt), Some(dst_fmt)) = (facts.fp_format(insn.src_typ), facts.fp_format(insn.typ))
-    else {
+    let (Some(src_fmt), Some(dst_fmt)) = (
+        facts.fp_format(insn.operand_type()),
+        facts.fp_format(insn.typ),
+    ) else {
         return Simplification::None;
     };
     match eval_fcvtf(insn.op, src_fmt, dst_fmt, a) {
@@ -813,20 +811,16 @@ fn simplify_fcvtf(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simpl
 /// which has the same shape.
 ///
 /// The source format comes from `src_typ`, not `typ`: a conversion's `typ` is
-/// the integer it produces, and the width it reads is the separate `src_size`.
+/// the integer it produces, and the width it reads is the separate
+/// `src_size` ([`Instruction::operand_width`]).
 fn simplify_fcvt(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
     if insn.src.len() != 1 {
         return Simplification::None;
     }
-    let src_width = if insn.src_size != 0 {
-        insn.src_size
-    } else {
-        insn.size.max(1)
-    };
-    let Some(a) = consts.fget(insn.src[0], src_width) else {
+    let Some(a) = consts.fget(insn.src[0], insn.operand_width()) else {
         return Simplification::None;
     };
-    let Some(fmt) = facts.fp_format(insn.src_typ) else {
+    let Some(fmt) = facts.fp_format(insn.operand_type()) else {
         return Simplification::None;
     };
     match eval_fcvt(insn.op, insn.size.max(1), fmt, a) {
@@ -3444,13 +3438,5 @@ mod tests {
         // These read the same either way, so they fold.
         assert_eq!(fold_convert(Opcode::Trunc, 0x1200, 32, 8), Some(0));
         assert_eq!(fold_convert(Opcode::Trunc, 100, 32, 8), Some(100));
-    }
-
-    /// Without a source width an extension cannot be read at all, and
-    /// falling back on `size` would make it the identity.
-    #[test]
-    fn an_extension_with_no_source_width_is_left_alone() {
-        assert_eq!(fold_convert(Opcode::Sext, 200, 0, 32), None);
-        assert_eq!(fold_convert(Opcode::Zext, 200, 0, 32), None);
     }
 }

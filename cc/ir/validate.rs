@@ -74,10 +74,13 @@
 //
 //   I10 — AN OPERAND OF ANOTHER TYPE IS RECORDED AS ONE
 //        `typ`/`size` describe an instruction's result, for every opcode; a
-//        comparison or a bit count, which reads another type than it
-//        produces, records its operands in `src_typ`/`src_size`
-//        (`Instruction::operand_type`). Built without them, a backend would
-//        compare at the result's width.
+//        conversion, comparison, bit count or `Signbit`, which reads another
+//        type than it produces (`Opcode::reads_another_type`), records its
+//        operands in `src_typ`/`src_size` (`Instruction::operand_type`).
+//        Built without them, a backend would compare at the result's width,
+//        and a fold would have to refuse or guess: the result's width is the
+//        wrong answer for every conversion, since an extension read at it is
+//        the identity and a negative `char` comes back positive.
 //
 //   I11 — A LIFETIME MARKER NAMES A LOCAL OF ITS OWN FUNCTION
 //        `LifetimeEnd` names its local out of band, where no pass that
@@ -85,9 +88,17 @@
 //        markers would leave the allocator ending the lifetime of nothing,
 //        or of another function's object.
 //
+//   I12 — AN INTEGER WIDTH CHANGE CHANGES THE WIDTH ITS OPCODE SAYS
+//        A `Sext` or `Zext` reads an operand narrower than its result and a
+//        `Trunc` one wider, to a result of at least one bit
+//        (`Opcode::is_int_width_change`). A same-width integer conversion is
+//        no instruction at all, so the folds may read an extension's operand
+//        at `src_size` and a truncation's at `size` without asking which of
+//        the two is the narrower.
+//
 // I2 and I5 hold for every program or for none: `Opcode::has_side_effects`
 // is derived from `may_access_memory`, and unit tests in `ir/mod.rs` check
-// both over `Opcode::ALL`. The validator checks the other nine.
+// both over `Opcode::ALL`. The validator checks the other ten.
 //
 // The validator runs always, in every build, through [`verify`]: after
 // linearization, after optimization, and after lowering. It is one walk over
@@ -164,10 +175,14 @@ pub enum Invariant {
     },
     /// I9: a `PhiSource` feeds no phi in a successor of its own block.
     PhiSourceNotToSuccessor { feeds: Option<BasicBlockId> },
-    /// I10: a comparison or bit count with no operand type or width.
+    /// I10: an opcode that reads another type with no operand type or
+    /// width.
     MissingOperandType,
     /// I11: a `LifetimeEnd` naming no local of this function.
     StrayLifetimeEnd,
+    /// I12: an integer width change from `from` bits to `to` that does not
+    /// change the width the way its opcode says.
+    WidthChangeBackwards { from: u32, to: u32 },
 }
 
 impl Invariant {
@@ -185,6 +200,7 @@ impl Invariant {
             | Invariant::PhiSourceNotToSuccessor { .. } => "I9",
             Invariant::MissingOperandType => "I10",
             Invariant::StrayLifetimeEnd => "I11",
+            Invariant::WidthChangeBackwards { .. } => "I12",
         }
     }
 }
@@ -248,6 +264,9 @@ impl fmt::Display for Invariant {
             Invariant::MissingOperandType => write!(f, "records no operand type or width"),
             Invariant::StrayLifetimeEnd => {
                 write!(f, "ends the lifetime of no local of this function")
+            }
+            Invariant::WidthChangeBackwards { from, to } => {
+                write!(f, "converts {from} bits to {to}, against its opcode")
             }
         }
     }
@@ -484,10 +503,21 @@ impl<'a> Walk<'a> {
         }
 
         // I10
-        if (insn.op.is_comparison() || insn.op.is_bit_count())
-            && (insn.src_typ.is_none() || insn.src_size == 0)
-        {
+        if insn.op.reads_another_type() && (insn.src_typ.is_none() || insn.src_size == 0) {
             self.report(at, Invariant::MissingOperandType);
+        }
+
+        // I12, of a width change that records its source width at all
+        if insn.op.is_int_width_change() && insn.src_size != 0 {
+            let (from, to) = (insn.src_size, insn.size);
+            let as_said = if insn.op == Opcode::Trunc {
+                0 < to && to < from
+            } else {
+                from < to
+            };
+            if !as_said {
+                self.report(at, Invariant::WidthChangeBackwards { from, to });
+            }
         }
 
         // I11
@@ -670,7 +700,7 @@ mod tests {
     use super::*;
     use crate::ir::{BasicBlock, BasicBlockId, Function, Instruction, Pseudo, PseudoId};
     use crate::target::Target;
-    use crate::types::TypeTable;
+    use crate::types::{TypeId, TypeTable};
 
     fn fresh_func(name: &str) -> Function {
         let types = TypeTable::new(&Target::host());
@@ -1199,5 +1229,99 @@ mod tests {
             "{:?}",
             validate_function(&func)
         );
+    }
+
+    /// The invariants one hand-built instruction breaks, by kind.
+    fn kinds_of(insn: Instruction) -> Vec<Invariant> {
+        let mut func = fresh_func("one");
+        for i in 0..2 {
+            func.add_pseudo(Pseudo::reg(PseudoId(i), i));
+        }
+        push(&mut func, insn);
+        match validate_function(&func) {
+            Ok(()) => Vec::new(),
+            Err(errors) => errors.into_iter().map(|e| e.kind).collect(),
+        }
+    }
+
+    /// `op` of pseudo 0 into pseudo 1, from `from` at `from_size` bits to
+    /// `to` at `size`.
+    fn conversion(
+        op: Opcode,
+        (from, from_size): (TypeId, u32),
+        (to, size): (TypeId, u32),
+    ) -> Instruction {
+        let mut insn = Instruction::unop(op, PseudoId(1), PseudoId(0), to, size);
+        insn.src_typ = Some(from);
+        insn.src_size = from_size;
+        insn
+    }
+
+    /// I10 covers every opcode that reads another type, the conversions and
+    /// `Signbit` as much as the comparisons: built without its source width,
+    /// each is reported, and with one it is not.
+    #[test]
+    fn i10_a_conversion_without_its_source_width_is_flagged() {
+        let t = TypeTable::new(&Target::host());
+        let cases = [
+            (Opcode::Sext, (t.schar_id, 8), (t.int_id, 32)),
+            (Opcode::Zext, (t.uint_id, 32), (t.ulong_id, 64)),
+            (Opcode::Trunc, (t.long_id, 64), (t.short_id, 16)),
+            (Opcode::FCvtS, (t.double_id, 64), (t.int_id, 32)),
+            (Opcode::FCvtU, (t.float_id, 32), (t.ulong_id, 64)),
+            (Opcode::SCvtF, (t.int_id, 32), (t.double_id, 64)),
+            (Opcode::UCvtF, (t.ulong_id, 64), (t.float_id, 32)),
+            (Opcode::FCvtF, (t.double_id, 64), (t.float_id, 32)),
+            (Opcode::Signbit, (t.double_id, 64), (t.int_id, 32)),
+        ];
+        for (op, from, to) in cases {
+            assert!(op.reads_another_type(), "{op:?}");
+            assert_eq!(kinds_of(conversion(op, from, to)), vec![], "{op:?}");
+            let mut bare = conversion(op, from, to);
+            bare.src_size = 0;
+            assert_eq!(
+                kinds_of(bare),
+                vec![Invariant::MissingOperandType],
+                "{op:?}"
+            );
+            let mut bare = conversion(op, from, to);
+            bare.src_typ = None;
+            assert_eq!(
+                kinds_of(bare),
+                vec![Invariant::MissingOperandType],
+                "{op:?}"
+            );
+        }
+    }
+
+    /// I12: an extension widens and a truncation narrows. The reverse, and
+    /// a conversion to the width it started at, are each reported.
+    #[test]
+    fn i12_an_integer_width_change_goes_the_way_its_opcode_says() {
+        let t = TypeTable::new(&Target::host());
+        let (char8, int32, long64) = ((t.schar_id, 8), (t.int_id, 32), (t.long_id, 64));
+        for (op, from, to) in [
+            (Opcode::Sext, char8, int32),
+            (Opcode::Zext, int32, long64),
+            (Opcode::Trunc, long64, char8),
+        ] {
+            assert_eq!(kinds_of(conversion(op, from, to)), vec![], "{op:?}");
+        }
+        for (op, from, to) in [
+            (Opcode::Sext, long64, int32),
+            (Opcode::Zext, int32, int32),
+            (Opcode::Trunc, char8, int32),
+            (Opcode::Trunc, int32, int32),
+            (Opcode::Trunc, int32, (t.bool_id, 0)),
+        ] {
+            assert_eq!(
+                kinds_of(conversion(op, from, to)),
+                vec![Invariant::WidthChangeBackwards {
+                    from: from.1,
+                    to: to.1
+                }],
+                "{op:?} {from:?} -> {to:?}"
+            );
+        }
     }
 }

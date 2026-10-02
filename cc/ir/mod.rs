@@ -427,22 +427,36 @@ impl Opcode {
     /// result, as for every opcode?
     ///
     /// The conversions, the comparisons (which read any type and produce an
-    /// `int` or a `_Bool`), and the bit counts (which count a 32- or 64-bit
-    /// operand into an `int`).
+    /// `int` or a `_Bool`), the bit counts (which count a 32- or 64-bit
+    /// operand into an `int`), and `Signbit` (which tests a floating operand
+    /// into an `int`).
+    ///
+    /// Every one records a nonzero `src_size`, which the validator checks
+    /// (I10), so [`Instruction::operand_width`] is never an unknown 0.
     pub fn reads_another_type(self) -> bool {
         self.is_comparison()
+            || self.is_conversion()
+            || self.is_bit_count()
+            || self == Opcode::Signbit
+    }
+
+    /// The conversions: an integer width change (`Sext`, `Zext`, `Trunc`)
+    /// or a change between an integer and a floating type, or between two
+    /// floating types.
+    pub fn is_conversion(self) -> bool {
+        self.is_int_width_change()
             || matches!(
                 self,
-                Opcode::Sext
-                    | Opcode::Zext
-                    | Opcode::Trunc
-                    | Opcode::FCvtS
-                    | Opcode::FCvtU
-                    | Opcode::SCvtF
-                    | Opcode::UCvtF
-                    | Opcode::FCvtF
+                Opcode::FCvtS | Opcode::FCvtU | Opcode::SCvtF | Opcode::UCvtF | Opcode::FCvtF
             )
-            || self.is_bit_count()
+    }
+
+    /// The integer width changes. An extension reads a narrower operand
+    /// than its result and a truncation a wider one -- never the same
+    /// width, which is no conversion at all -- and the validator checks it
+    /// (I12).
+    pub fn is_int_width_change(self) -> bool {
+        matches!(self, Opcode::Sext | Opcode::Zext | Opcode::Trunc)
     }
 
     /// The bit counts: an `int` count of the bits of a 32- or 64-bit operand.

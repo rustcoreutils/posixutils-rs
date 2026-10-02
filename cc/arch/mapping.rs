@@ -807,6 +807,7 @@ fn expand_int128_zext(
     let lo = if src_size < 64 {
         let ext = func.create_reg_pseudo();
         let mut zext_insn = Instruction::unop(Opcode::Zext, ext, src, long_type, 64);
+        zext_insn.src_typ = insn.src_typ;
         zext_insn.src_size = src_size;
         insns.push(zext_insn);
         ext
@@ -843,6 +844,7 @@ fn expand_int128_sext(
     let lo = if src_size < 64 {
         let ext = func.create_reg_pseudo();
         let mut sext_insn = Instruction::unop(Opcode::Sext, ext, src, long_type, 64);
+        sext_insn.src_typ = insn.src_typ;
         sext_insn.src_size = src_size;
         insns.push(sext_insn);
         ext
@@ -2555,6 +2557,39 @@ mod tests {
             Some("__floattidf")
         );
         assert!(block.insns[1].extra().abi_info.is_some());
+    }
+
+    /// Extending a narrower integer to 128 bits widens it to 64 first, and
+    /// that step is a conversion like any other: it records its operand's
+    /// type and width (validator I10). It recorded only the width, and the
+    /// first function to widen an `int` to `__int128` failed validation.
+    #[test]
+    fn test_mapping_int128_extension_records_its_operand() {
+        let target = Target::new(Arch::X86_64, Os::Linux);
+        let types = TypeTable::new(&target);
+        for (op, from) in [(Opcode::Sext, types.int_id), (Opcode::Zext, types.uint_id)] {
+            let mut func = Function::new("widen", types.int128_id);
+            func.add_pseudo(Pseudo::reg(PseudoId(0), 0));
+            func.add_pseudo(Pseudo::reg(PseudoId(2), 2));
+            func.next_pseudo = 3;
+            let mut bb = BasicBlock::new(BasicBlockId(0));
+            bb.add_insn(Instruction::new(Opcode::Entry));
+            bb.add_insn(make_convert_insn(op, types.int128_id, 128, from, 32));
+            bb.add_insn(Instruction::ret(Some(PseudoId(2))));
+            func.add_block(bb);
+            func.entry = BasicBlockId(0);
+
+            let mut module = Module::default();
+            module.add_function(func);
+            run_mapping(&mut module, &types, &target);
+
+            let func = &module.functions[0];
+            let step = func.blocks[0].insns.iter().find(|i| i.op == op).unwrap();
+            assert_eq!((step.src_typ, step.src_size), (Some(from), 32), "{op:?}");
+            assert_eq!(step.size, 64, "{op:?}");
+            let checked = crate::ir::validate::validate_function(func);
+            assert!(checked.is_ok(), "{op:?}: {checked:?}");
+        }
     }
 
     // Complex mul/div rtlib name tests

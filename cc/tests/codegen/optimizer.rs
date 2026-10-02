@@ -1919,3 +1919,45 @@ int main(void) {
         }
     }
 }
+
+/// Every conversion of a constant folds to the value the conversion produces
+/// at run time: the operand is read at the width the conversion records for
+/// it, never at its result's width. An extension read at its destination
+/// width is the identity, so a negative `char` would come back positive; a
+/// `double` read at the 32 bits of the `float` or `int` it becomes is not
+/// the `double` at all.
+#[test]
+fn codegen_a_conversion_of_a_constant_reads_its_source_width() {
+    let src = r#"
+#include <math.h>
+int main(void) {
+    signed char sc = -56;
+    unsigned char uc = 200;
+    long long wide = 0x123456789LL;
+    if ((int)sc != -56 || (unsigned)sc != 4294967240u) return 1;
+    if ((int)uc != 200 || (long long)(short)-2 != -2) return 2;
+    if ((int)wide != 0x23456789 || (short)wide != 0x6789) return 3;
+    double d = 0.1;
+    float f = (float)d;
+    if (f != 0.1f || (double)f == d) return 4;
+    if ((int)-3.75 != -3 || (unsigned)3e9 != 3000000000u) return 5;
+    if ((long long)-1e15 != -1000000000000000LL) return 6;
+    if ((double)sc != -56.0 || (float)uc != 200.0f) return 7;
+    if ((double)18446744073709551615ull != 18446744073709551616.0) return 8;
+    long double ld = -0.0L;
+    if (!signbit(ld) || !signbit(-2.5) || signbit(2.5f) || (long double)d != 0.1) return 9;
+    return 0;
+}
+"#;
+    for level in ["-O0", "-O1", "-O2"] {
+        let opts = vec![level.to_string(), "-lm".to_string()];
+        assert_eq!(
+            compile_and_run(&format!("convert_const{level}"), src, &opts),
+            0,
+            "{level}"
+        );
+        if let Some(rc) = compile_and_run_aarch64("convert_const_a64", src, level) {
+            assert_eq!(rc, 0, "aarch64 {level}");
+        }
+    }
+}

@@ -4001,39 +4001,24 @@ impl<'a> Linearizer<'a> {
             .typ
             .map_or(CallingConv::C, |t| CallingConv::of_callee(t, self.types));
 
-        // Check if this is a variadic function call and if it's noreturn
-        // If the function expression has a type, check its variadic and noreturn flags
-        let (variadic_arg_start, is_noreturn) = if let Some(func_type) = func_expr.typ {
-            let ft = self.types.get(func_type);
-            let variadic = if ft.variadic {
-                // Variadic args start after the fixed parameters
-                ft.params.as_ref().map(|p| p.len())
-            } else {
-                None
-            };
-            (variadic, ft.noreturn)
-        } else {
-            (None, false) // No type info, assume non-variadic and returns
-        };
-
-        // Get formal parameter types for implicit widening conversions.
-        // When a narrow int (e.g., int) is passed to a wider parameter (e.g., long),
-        // C requires implicit promotion. This is transparent for non-inlined calls
-        // (the ABI handles it), but inlining exposes the mismatch since the argument
-        // pseudo is used directly without conversion.
         // C17 6.5.2.2p1 lets the function designator be a function *or* a
-        // pointer to one, and the prototype lives on the function type either
-        // way. Reading `params` off the pointer found nothing, so a call
-        // through a pointer converted no argument at all:
+        // pointer to one, and everything the call needs to know lives on the
+        // function type either way. Reading it off the pointer found nothing:
+        // a call through a pointer converted no argument to its parameter,
         //
         //   void f(double); void (*p)(double) = f; p(1);
         //
-        // passed the integer 1 where a `double` was expected and the callee
-        // read 0. With a mixed list every later argument moved as well.
+        // passing the integer 1 where the callee read a `double`, and a call
+        // through a pointer to a variadic function was no variadic call, so
+        // its trailing arguments took no default argument promotions.
         let callee = func_expr
             .typ
-            .and_then(|t| self.types.callee_function_type(t));
-        let params = callee.and_then(|f| self.types.get(f).params.clone());
+            .and_then(|t| self.types.callee_function_type(t))
+            .map(|f| self.types.get(f));
+        // The parameter types, for the conversions to them: transparent for
+        // a call the ABI carries out, but an inlined callee reads the
+        // argument pseudo as it is.
+        let params = callee.and_then(|ft| ft.params.clone());
         // A call through a function type with no prototype: C17 6.5.2.2p6
         // gives every argument the default argument promotions, as it does
         // a variadic one, and an identifier-list definition receives them so
@@ -4041,7 +4026,12 @@ impl<'a> Linearizer<'a> {
         // K&R callee read a double out of a register that held a single, and
         // a `char` took Apple arm64's one-byte stack slot where the callee
         // reads an `int`.
-        let unprototyped = callee.is_some_and(|f| self.types.get(f).params.is_none());
+        let unprototyped = callee.is_some_and(|ft| ft.params.is_none());
+        // The variadic arguments start after the fixed parameters.
+        let variadic_arg_start = callee
+            .filter(|ft| ft.variadic)
+            .and_then(|ft| ft.params.as_ref().map(|p| p.len()));
+        let is_noreturn = callee.is_some_and(|ft| ft.noreturn);
 
         CalleeSignature {
             conv,

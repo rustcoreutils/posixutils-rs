@@ -552,14 +552,7 @@ impl Parser<'_> {
     /// The function type a callee expression resolves to, through a function
     /// pointer if need be.
     pub(super) fn resolved_function_type(&self, callee: &Expr) -> Option<TypeId> {
-        callee.typ.and_then(|t| match self.types.kind(t) {
-            TypeKind::Function => Some(t),
-            TypeKind::Pointer => self
-                .types
-                .base_type(t)
-                .filter(|&b| self.types.kind(b) == TypeKind::Function),
-            _ => None,
-        })
+        callee.typ.and_then(|t| self.types.callee_function_type(t))
     }
 
     /// Report a simple assignment whose value cannot be converted to the

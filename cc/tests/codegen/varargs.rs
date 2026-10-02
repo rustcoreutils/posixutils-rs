@@ -1652,3 +1652,72 @@ int main(void) {
         );
     }
 }
+
+// ============================================================================
+// A variadic callee reached through a pointer
+// ============================================================================
+
+/// A call through a pointer to a variadic function is a variadic call: the
+/// arguments past the prototype take the default argument promotions (C17
+/// 6.5.2.2p7), whatever spelling reaches the pointer -- a variable, a
+/// typedef, a struct member, a call returning one. The callee's type was
+/// read off the pointer, which is not variadic, so none of that happened:
+/// `(unsigned char)0x80` arrived sign-extended and a `float` arrived as a
+/// `float` where `va_arg(ap, double)` reads.
+///
+/// A `_Noreturn` callee through a pointer ends the path the same way.
+#[test]
+fn codegen_variadic_call_through_a_pointer_promotes() {
+    let src = r#"
+#include <stdarg.h>
+#include <stdlib.h>
+
+static int check(int n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    int c = va_arg(ap, int);
+    int s = va_arg(ap, int);
+    double f = va_arg(ap, double);
+    long l = va_arg(ap, long);
+    va_end(ap);
+    if (c != 0x80) return n + 1;
+    if (s != 0xffff) return n + 2;
+    if (f != 1.5) return n + 3;
+    if (l != 7) return n + 4;
+    return 0;
+}
+
+typedef int (*VF)(int, ...);
+struct ops { long pad; VF fn; };
+static VF get(void) { return check; }
+
+_Noreturn static void die(int code) { exit(code); }
+
+int main(void) {
+    signed char c = -128;
+    short s = -1;
+    float f = 1.5f;
+    int r;
+    if ((r = check(0, (unsigned char)c, (unsigned short)s, f, 7L))) return r;
+
+    int (*p)(int, ...) = check;
+    if ((r = p(10, (unsigned char)c, (unsigned short)s, f, 7L))) return r;
+    if ((r = (*p)(20, (unsigned char)c, (unsigned short)s, f, 7L))) return r;
+
+    VF q = check;
+    if ((r = q(30, (unsigned char)c, (unsigned short)s, f, 7L))) return r;
+
+    struct ops o = { 0, check };
+    struct ops *op = &o;
+    if ((r = o.fn(40, (unsigned char)c, (unsigned short)s, f, 7L))) return r;
+    if ((r = op->fn(50, (unsigned char)c, (unsigned short)s, f, 7L))) return r;
+
+    if ((r = get()(60, (unsigned char)c, (unsigned short)s, f, 7L))) return r;
+
+    __typeof__(die) *np = die;
+    np(0);
+    return 99;
+}
+"#;
+    compile_and_run_everywhere("va_through_ptr", src);
+}

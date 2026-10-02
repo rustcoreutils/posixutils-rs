@@ -1570,35 +1570,13 @@ impl<'a> Parser<'a> {
                 let callee = self.callee_name(&expr);
                 self.check_call(func_type, callee, &args, call_pos);
 
-                // Get the return type from the function type
-                // The func expression should have type TypeKind::Function
-                // and the return type is stored in base.
-                // For function pointers (TypeKind::Pointer to Function),
-                // we need to dereference first to get the function type.
-                let return_type = expr
-                    .typ
-                    .and_then(|t| {
-                        let kind = self.types.kind(t);
-                        if kind == TypeKind::Function {
-                            // Direct function call
-                            self.types.base_type(t)
-                        } else if kind == TypeKind::Pointer {
-                            // Function pointer call - get the pointee (function type)
-                            self.types.base_type(t).and_then(|func_type| {
-                                if self.types.kind(func_type) == TypeKind::Function {
-                                    // Get return type from function type
-                                    self.types.base_type(func_type)
-                                } else {
-                                    None
-                                }
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(self.types.int_id); // Default to int
-                                                   // A call's value has the unqualified version of the return
-                                                   // type (C17 6.7.6.3p4 makes that the function's return type).
+                // The return type, from the function type the call calls --
+                // through a pointer for a call through one -- or `int` when
+                // there is none. A call's value has the unqualified version
+                // of it (C17 6.7.6.3p4 makes that the function's return type).
+                let return_type = func_type
+                    .and_then(|f| self.types.base_type(f))
+                    .unwrap_or(self.types.int_id);
                 let return_type = self.types.unqualified(return_type);
 
                 let known = self.known_callee(&expr);

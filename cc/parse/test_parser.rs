@@ -3940,6 +3940,32 @@ fn test_typedef_function_pointer_call() {
     assert_eq!(tu.items.len(), 3);
 }
 
+/// A call's value has its callee's return type, unqualified, however the
+/// callee is reached: a function, a pointer to one -- a variable, a typedef,
+/// a member, a call returning one -- or the explicit `(*p)` form.
+#[test]
+fn test_call_type_is_the_callee_return_type() {
+    let decls = "const short f(int); \
+                 const short (*p)(int); \
+                 typedef const short (*F)(int); F q; \
+                 struct S { F m; } s; \
+                 F get(void);";
+    for call in ["f(1)", "p(1)", "(*p)(1)", "q(1)", "s.m(1)", "get()(1)"] {
+        let src = format!("{decls} void g(void) {{ {call}; }}");
+        let (tu, types, _, _) = parse_tu(&src).unwrap();
+        let Stmt::Expr(e) = first_statement_of(&tu, 0) else {
+            panic!("{call}: expected an expression statement");
+        };
+        assert!(matches!(e.kind, ExprKind::Call { .. }), "{call}");
+        let typ = e.typ.expect("typed");
+        assert_eq!(types.kind(typ), TypeKind::Short, "{call}");
+        assert!(
+            !types.modifiers(typ).contains(TypeModifiers::CONST),
+            "{call}: the value is unqualified"
+        );
+    }
+}
+
 // Designated Initializer Edge Cases
 
 #[test]

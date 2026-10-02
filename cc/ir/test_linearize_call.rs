@@ -116,3 +116,28 @@ fn a_medium_struct_argument_keeps_its_type() {
         assert_eq!(kinds(&types, call), [TypeKind::Struct]);
     }
 }
+
+/// The callee's variadic start and `noreturn` are the function type's,
+/// read through a pointer as they are off a function.
+#[test]
+fn variadic_and_noreturn_are_read_through_a_pointer() {
+    let src = "int v(int, ...);\n\
+               _Noreturn void stop(void);\n\
+               int (*p)(int, ...);\n\
+               __typeof__(stop) *np;\n\
+               void g(void) { v(1, 2); p(1, 2); np(); }\n";
+    let (module, _) = linearize_source_with_types(src, &x86());
+    let g = func(&module, "g");
+    let calls = calls(g);
+    assert_eq!(calls.len(), 3);
+    for call in &calls[..2] {
+        assert_eq!(call.extra().variadic_arg_start, Some(1));
+    }
+    assert!(calls[2].extra().is_noreturn_call);
+    let all = insns(g);
+    let at = all
+        .iter()
+        .position(|i| std::ptr::eq(*i, calls[2]))
+        .expect("the call");
+    assert_eq!(all[at + 1].op, Opcode::Unreachable);
+}

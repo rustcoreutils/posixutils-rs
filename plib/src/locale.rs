@@ -21,9 +21,73 @@
 //!   and `TZ`, replacing chrono's locale-blind UTC formatter.
 //! - `nm` — [`strcoll`] enables the default symbol-name sort to follow
 //!   `LC_COLLATE` (consumed when nm's sort lands).
+//!
+//! # Windows
+//!
+//! The MSVC CRT cannot stand in for the Unix C library here: its `wchar_t` is
+//! 16 bits, so a character outside the Basic Multilingual Plane is not one
+//! wide character, and it has no `wcwidth`. On Windows the character functions
+//! therefore answer for themselves, in one of two modes that
+//! [`crate::diag::init_locale`] picks from `LC_CTYPE` as POSIX resolves it
+//! (see [`CtypeMode`]); a program starts in the C locale's, as on Unix. Each
+//! public function keeps its signature and its contract, so callers are
+//! unchanged:
+//!
+//! - ASCII answers exactly as the POSIX locale does on Unix, in both modes.
+//! - In the C locale (`LC_CTYPE` is `C` or `POSIX`), nothing above ASCII
+//!   belongs to any class, has a case mapping or a width, and every byte is
+//!   its own character -- one above ASCII undecodable -- as in glibc's C
+//!   locale.
+//! - Otherwise (`C.UTF-8`, or any other locale) above ASCII each predicate
+//!   takes the closest Unicode property (each function's documentation names
+//!   it), and byte input decodes as UTF-8, an invalid or incomplete sequence
+//!   decoding as a single byte -- the same fallback the Unix functions
+//!   document for a byte `mbrtowc(3)` rejects.
+//!
+//! Every public function splits ASCII from the rest the same way on both
+//! platforms; only the private helpers that answer each half are per-platform.
+//! [`strftime`] stays Unix-only: it needs `localtime_r` and `LC_TIME`, and
+//! plib carries no date library to replace them.
 
 use std::ffi::CString;
+#[cfg(unix)]
 use std::io;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// How the Windows character functions read text: the `LC_CTYPE` category's
+/// meaning there. Unix asks the C library, whose locale already says this.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CtypeMode {
+    /// The C (POSIX) locale: ASCII classification and case mapping only, and
+    /// every byte one character.
+    C,
+    /// Unicode classification and case mapping, text decoded as UTF-8.
+    Unicode,
+}
+
+/// Whether [`CtypeMode::Unicode`] is in effect. A program starts in the C
+/// locale, as on Unix, until [`crate::diag::init_locale`] reads `LC_CTYPE`.
+#[cfg(windows)]
+static UNICODE_CTYPE: AtomicBool = AtomicBool::new(false);
+
+/// Select how the character functions read text; [`crate::diag::init_locale`]
+/// calls it once, and tests to exercise each mode.
+#[cfg(windows)]
+pub(crate) fn set_ctype_mode(mode: CtypeMode) {
+    UNICODE_CTYPE.store(mode == CtypeMode::Unicode, Ordering::Relaxed);
+}
+
+/// The mode [`set_ctype_mode`] last selected.
+#[cfg(windows)]
+pub(crate) fn ctype_mode() -> CtypeMode {
+    if UNICODE_CTYPE.load(Ordering::Relaxed) {
+        CtypeMode::Unicode
+    } else {
+        CtypeMode::C
+    }
+}
 
 // libc-rs doesn't surface `wint_t` for Linux or macOS targets (only for
 // teeos / hurd), so we mirror the platform's underlying `wint_t` choice
@@ -32,7 +96,7 @@ use std::io;
 // but we still match signedness for strict type correctness.
 #[cfg(target_vendor = "apple")]
 type WintT = libc::c_int;
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(all(unix, not(target_vendor = "apple")))]
 type WintT = libc::c_uint;
 
 /// Opaque `mbstate_t`. The `libc` crate exposes `mbstate_t` on Linux but not on
@@ -40,16 +104,19 @@ type WintT = libc::c_uint;
 /// layout (glibc: 8 bytes; macOS/Darwin: 128 bytes) with 8-byte alignment. A
 /// freshly zeroed value is the documented initial conversion state; `mbrtowc`
 /// only touches the bytes its own ABI defines, so over-sizing is safe.
+#[cfg(unix)]
 #[repr(C, align(8))]
 #[derive(Clone, Copy)]
 struct MbStateT([u8; 128]);
 
+#[cfg(unix)]
 impl MbStateT {
     fn zeroed() -> Self {
         MbStateT([0u8; 128])
     }
 }
 
+#[cfg(unix)]
 extern "C" {
     fn iswprint(c: WintT) -> libc::c_int;
     fn towlower(c: WintT) -> WintT;
@@ -93,36 +160,140 @@ extern "C" {
 /// `expand`, `fold`, `unexpand`, `pr`) handle control characters such as
 /// `<tab>`, `<backspace>`, and `<carriage-return>` separately and only consult
 /// this for ordinary characters.
+///
+/// On Windows: NUL is 0 and any other control character -1, as `wcwidth`
+/// answers, and in the C locale so is anything above ASCII; otherwise the
+/// zero-width combining blocks, zero-width spaces and joiners,
+/// and variation selectors are 0; East Asian Wide and Fullwidth characters are
+/// 2; everything else is 1. Rust's standard library cannot tell a combining
+/// mark, so one outside the dedicated combining blocks (e.g. a Devanagari
+/// vowel sign) counts as 1 column.
 pub fn wcwidth_char(c: char) -> i32 {
-    // SAFETY: wcwidth is thread-safe and side-effect-free; every Unicode
-    // codepoint (max 0x10FFFF) fits losslessly in wchar_t (32-bit on all
-    // supported targets).
-    unsafe { wcwidth(c as u32 as libc::wchar_t) }
+    #[cfg(unix)]
+    {
+        // SAFETY: wcwidth is thread-safe and side-effect-free; every Unicode
+        // codepoint (max 0x10FFFF) fits losslessly in wchar_t (32-bit on all
+        // supported Unix targets).
+        unsafe { wcwidth(c as u32 as libc::wchar_t) }
+    }
+    #[cfg(windows)]
+    {
+        if c == '\0' {
+            0
+        } else if c.is_control() || (!c.is_ascii() && ctype_mode() == CtypeMode::C) {
+            -1
+        } else if in_ranges(c, ZERO_WIDTH) {
+            0
+        } else if in_ranges(c, DOUBLE_WIDTH) {
+            2
+        } else {
+            1
+        }
+    }
 }
 
-/// Generate a locale-aware character-class predicate that dispatches a
-/// single-byte value (`code <= 0xFF`) to the libc `isX(3)` function and any
-/// wider Unicode character to the corresponding `iswX(3)` function. Mirrors the
-/// byte-vs-wide split used by [`isprint`].
+/// Zero-width characters on Windows: the blocks that hold only combining marks
+/// (Combining Diacritical Marks, its Extended and Supplement blocks, the
+/// Combining Marks for Symbols, and Combining Half Marks), the zero-width
+/// space, joiners and direction marks, and the variation selectors.
+#[cfg(windows)]
+const ZERO_WIDTH: &[(char, char)] = &[
+    ('\u{0300}', '\u{036F}'),
+    ('\u{1AB0}', '\u{1AFF}'),
+    ('\u{1DC0}', '\u{1DFF}'),
+    ('\u{200B}', '\u{200F}'),
+    ('\u{20D0}', '\u{20FF}'),
+    ('\u{FE00}', '\u{FE0F}'),
+    ('\u{FE20}', '\u{FE2F}'),
+];
+
+/// Double-width characters on Windows: East Asian Wide and Fullwidth, as
+/// Markus Kuhn's reference `wcwidth` gives them -- Hangul Jamo initials, the
+/// angle brackets, CJK radicals through Yi (less U+303F, which is narrow),
+/// Hangul syllables, CJK compatibility ideographs, the vertical, compatibility
+/// and fullwidth forms, the supplementary ideographic planes -- plus the two
+/// main pictographic emoji blocks.
+#[cfg(windows)]
+const DOUBLE_WIDTH: &[(char, char)] = &[
+    ('\u{1100}', '\u{115F}'),
+    ('\u{2329}', '\u{232A}'),
+    ('\u{2E80}', '\u{303E}'),
+    ('\u{3040}', '\u{A4CF}'),
+    ('\u{AC00}', '\u{D7A3}'),
+    ('\u{F900}', '\u{FAFF}'),
+    ('\u{FE10}', '\u{FE19}'),
+    ('\u{FE30}', '\u{FE6F}'),
+    ('\u{FF00}', '\u{FF60}'),
+    ('\u{FFE0}', '\u{FFE6}'),
+    ('\u{1F300}', '\u{1F64F}'),
+    ('\u{1F900}', '\u{1F9FF}'),
+    ('\u{20000}', '\u{2FFFD}'),
+    ('\u{30000}', '\u{3FFFD}'),
+];
+
+/// True if `c` falls in one of the inclusive `ranges`.
+#[cfg(windows)]
+fn in_ranges(c: char, ranges: &[(char, char)]) -> bool {
+    ranges.iter().any(|&(lo, hi)| (lo..=hi).contains(&c))
+}
+
+/// Answer a character-class question for an ASCII character. On Unix this is
+/// the libc `isX(3)` function under `LC_CTYPE`; on Windows it is the POSIX
+/// locale's answer, given as a `fn(u8) -> bool`.
+#[cfg(unix)]
+macro_rules! ascii_class {
+    ($c:expr, $byte_fn:path, $ascii:expr) => {
+        // SAFETY: the libc ctype function is thread-safe and side-effect-free;
+        // the argument is in [0, 127].
+        unsafe { $byte_fn($c as libc::c_int) != 0 }
+    };
+}
+#[cfg(windows)]
+macro_rules! ascii_class {
+    ($c:expr, $byte_fn:path, $ascii:expr) => {
+        ($ascii)($c as u8)
+    };
+}
+
+/// Answer a character-class question for a character above ASCII. On Unix
+/// this is the libc `iswX(3)` function under `LC_CTYPE`; on Windows it is the
+/// closest Unicode property, given as a `fn(char) -> bool`, and in the C
+/// locale "no".
+#[cfg(unix)]
+macro_rules! wide_class {
+    ($c:expr, $wide_fn:ident, $unicode:expr) => {
+        // SAFETY: the libc wide-ctype function is thread-safe; `WintT` matches
+        // the platform's wint_t (32-bit unsigned on glibc/musl, 32-bit signed
+        // on Darwin) and every Unicode codepoint (max 0x10FFFF) fits losslessly
+        // in both because the high bit is always clear.
+        unsafe { $wide_fn($c as u32 as WintT) != 0 }
+    };
+}
+#[cfg(windows)]
+macro_rules! wide_class {
+    ($c:expr, $wide_fn:ident, $unicode:expr) => {
+        ctype_mode() == CtypeMode::Unicode && ($unicode)($c)
+    };
+}
+
+/// Generate a locale-aware character-class predicate that sends an ASCII
+/// character to `ascii_class!` and anything wider to `wide_class!`.
+///
+/// The split is at ASCII, not at `<= 0xFF`: U+00E9 is two bytes in UTF-8, so
+/// the byte-oriented `isalpha(0xE9)` cannot classify it and answers "no". This
+/// matches the `is_ascii()` split `to_lower`/`to_upper` use.
 macro_rules! ctype_predicate {
-    ($(#[$meta:meta])* $name:ident, $byte_fn:path, $wide_fn:ident) => {
+    (
+        $(#[$meta:meta])* $name:ident,
+        unix: $byte_fn:path, $wide_fn:ident;
+        windows: $ascii:expr, $unicode:expr $(;)?
+    ) => {
         $(#[$meta])*
         pub fn $name(c: char) -> bool {
             if c.is_ascii() {
-                // SAFETY: the libc ctype function is thread-safe and
-                // side-effect-free; the argument is in [0, 127].
-                unsafe { $byte_fn(c as libc::c_int) != 0 }
+                ascii_class!(c, $byte_fn, $ascii)
             } else {
-                // Anything above ASCII goes to the wide function. Dispatching
-                // on `<= 0xFF` instead would be wrong in a multi-byte locale:
-                // U+00E9 is two bytes in UTF-8, so the byte-oriented
-                // `isalpha(0xE9)` cannot classify it and answers "no". This
-                // matches the `is_ascii()` split `to_lower`/`to_upper` use.
-                //
-                // SAFETY: the libc wide-ctype function is thread-safe; `WintT`
-                // matches the platform's wint_t and every Unicode codepoint
-                // fits losslessly (the high bit is always clear).
-                unsafe { $wide_fn(c as u32 as WintT) != 0 }
+                wide_class!(c, $wide_fn, $unicode)
             }
         }
     };
@@ -131,59 +302,163 @@ macro_rules! ctype_predicate {
 ctype_predicate!(
     /// True if `c` is a blank (`<space>` or `<tab>` in the POSIX locale) under
     /// the current `LC_CTYPE`, per libc `isblank(3)`.
-    isblank, libc::isblank, iswblank
+    ///
+    /// On Windows, above ASCII: a Unicode space separator (category Zs) other
+    /// than the no-break spaces U+00A0, U+2007 and U+202F, as glibc's UTF-8
+    /// locales answer.
+    isblank,
+    unix: libc::isblank, iswblank;
+    windows: |b: u8| b == b' ' || b == b'\t', unicode_blank
 );
 ctype_predicate!(
     /// True if `c` is whitespace under the current `LC_CTYPE`, per libc
     /// `isspace(3)` (space, tab, newline, vertical tab, form feed, carriage
     /// return in the POSIX locale).
-    isspace, libc::isspace, iswspace
+    ///
+    /// On Windows, above ASCII: Unicode `White_Space` (`char::is_whitespace`)
+    /// other than the no-break spaces U+00A0, U+2007 and U+202F, as glibc's
+    /// UTF-8 locales answer.
+    isspace,
+    unix: libc::isspace, iswspace;
+    windows: |b: u8| matches!(b, b' ' | b'\t'..=b'\r'), unicode_space
 );
 ctype_predicate!(
     /// True if `c` is alphabetic under the current `LC_CTYPE`, per libc
     /// `isalpha(3)`.
-    isalpha, libc::isalpha, iswalpha
+    ///
+    /// On Windows, above ASCII: Unicode `Alphabetic` or `Numeric`
+    /// (`char::is_alphabetic`, `char::is_numeric`). Digits of other scripts
+    /// count as alphabetic because the `digit` class is ASCII-only, and that
+    /// keeps `alnum` the union of `alpha` and `digit`; glibc does the same.
+    isalpha,
+    unix: libc::isalpha, iswalpha;
+    windows: |b: u8| b.is_ascii_alphabetic(), unicode_alpha
 );
 ctype_predicate!(
     /// True if `c` is alphanumeric under the current `LC_CTYPE`, per libc
     /// `isalnum(3)`.
-    isalnum, libc::isalnum, iswalnum
+    ///
+    /// On Windows, above ASCII: the same as [`isalpha`], since [`isdigit`] is
+    /// ASCII-only.
+    isalnum,
+    unix: libc::isalnum, iswalnum;
+    windows: |b: u8| b.is_ascii_alphanumeric(), unicode_alpha
 );
 ctype_predicate!(
     /// True if `c` is a decimal digit under the current `LC_CTYPE`, per libc
     /// `isdigit(3)`.
-    isdigit, libc::isdigit, iswdigit
+    ///
+    /// On Windows, false above ASCII: POSIX defines the `digit` class as
+    /// `0`..`9` only.
+    isdigit,
+    unix: libc::isdigit, iswdigit;
+    windows: |b: u8| b.is_ascii_digit(), |_: char| false
 );
 ctype_predicate!(
     /// True if `c` is punctuation under the current `LC_CTYPE`, per libc
     /// `ispunct(3)`.
-    ispunct, libc::ispunct, iswpunct
+    ///
+    /// On Windows, above ASCII: [`isgraph`] and not [`isalnum`], which takes in
+    /// symbols as well as punctuation, as POSIX defines the class and glibc
+    /// answers.
+    ispunct,
+    unix: libc::ispunct, iswpunct;
+    windows: |b: u8| b.is_ascii_punctuation(), unicode_punct
 );
 ctype_predicate!(
     /// True if `c` is a control character under the current `LC_CTYPE`, per
     /// libc `iscntrl(3)`.
-    iscntrl, libc::iscntrl, iswcntrl
+    ///
+    /// On Windows, above ASCII: Unicode category Cc (`char::is_control`), which
+    /// is U+0080..U+009F.
+    iscntrl,
+    unix: libc::iscntrl, iswcntrl;
+    windows: |b: u8| b.is_ascii_control(), char::is_control
 );
 ctype_predicate!(
     /// True if `c` has a visible glyph (printable and not `<space>`) under the
     /// current `LC_CTYPE`, per libc `isgraph(3)`.
-    isgraph, libc::isgraph, iswgraph
+    ///
+    /// On Windows, above ASCII: [`isprint`] and not [`isspace`].
+    isgraph,
+    unix: libc::isgraph, iswgraph;
+    windows: |b: u8| b.is_ascii_graphic(), unicode_graph
 );
 ctype_predicate!(
     /// True if `c` is a hexadecimal digit under the current `LC_CTYPE`, per
     /// libc `isxdigit(3)`.
-    isxdigit, libc::isxdigit, iswxdigit
+    ///
+    /// On Windows, false above ASCII: POSIX defines the `xdigit` class as
+    /// `0`..`9`, `A`..`F` and `a`..`f` only.
+    isxdigit,
+    unix: libc::isxdigit, iswxdigit;
+    windows: |b: u8| b.is_ascii_hexdigit(), |_: char| false
 );
 ctype_predicate!(
     /// True if `c` is a lowercase letter under the current `LC_CTYPE`, per libc
     /// `islower(3)`.
-    islower, libc::islower, iswlower
+    ///
+    /// On Windows, above ASCII: Unicode `Lowercase` (`char::is_lowercase`).
+    islower,
+    unix: libc::islower, iswlower;
+    windows: |b: u8| b.is_ascii_lowercase(), char::is_lowercase
 );
 ctype_predicate!(
     /// True if `c` is an uppercase letter under the current `LC_CTYPE`, per libc
     /// `isupper(3)`.
-    isupper, libc::isupper, iswupper
+    ///
+    /// On Windows, above ASCII: Unicode `Uppercase` (`char::is_uppercase`).
+    isupper,
+    unix: libc::isupper, iswupper;
+    windows: |b: u8| b.is_ascii_uppercase(), char::is_uppercase
 );
+ctype_predicate!(
+    /// True if `c` is printable under the current `LC_CTYPE`.
+    ///
+    /// ASCII calls libc `isprint(3)`; anything wider calls libc `iswprint(3)`.
+    /// In the POSIX `C` locale: ASCII space and printable graph characters are
+    /// printable; control characters (including `\n`, `\r`, `\t`, NUL) are not.
+    ///
+    /// On Windows, above ASCII: anything that is not a control character
+    /// (`!char::is_control`).
+    isprint,
+    unix: libc::isprint, iswprint;
+    windows: |b: u8| matches!(b, b' '..=b'~'), |c: char| !c.is_control()
+);
+
+/// The no-break spaces, which are Unicode `White_Space` but not in glibc's
+/// `space` or `blank` classes.
+#[cfg(windows)]
+fn is_no_break_space(c: char) -> bool {
+    matches!(c, '\u{00A0}' | '\u{2007}' | '\u{202F}')
+}
+
+#[cfg(windows)]
+fn unicode_space(c: char) -> bool {
+    c.is_whitespace() && !is_no_break_space(c)
+}
+
+/// `unicode_space` less the line-breaking characters NEL, LINE SEPARATOR
+/// and PARAGRAPH SEPARATOR, leaving the horizontal space separators.
+#[cfg(windows)]
+fn unicode_blank(c: char) -> bool {
+    unicode_space(c) && !matches!(c, '\u{0085}' | '\u{2028}' | '\u{2029}')
+}
+
+#[cfg(windows)]
+fn unicode_alpha(c: char) -> bool {
+    c.is_alphabetic() || c.is_numeric()
+}
+
+#[cfg(windows)]
+fn unicode_graph(c: char) -> bool {
+    !c.is_control() && !unicode_space(c)
+}
+
+#[cfg(windows)]
+fn unicode_punct(c: char) -> bool {
+    unicode_graph(c) && !unicode_alpha(c)
+}
 
 /// Map `c` to lowercase under the current `LC_CTYPE`.
 ///
@@ -191,47 +466,92 @@ ctype_predicate!(
 /// through `towlower(3)`. (A non-ASCII codepoint such as `É` is multi-byte in a
 /// UTF-8 locale, so the byte-oriented `tolower(3)` could not map it.) Characters
 /// with no mapping are returned unchanged.
+///
+/// On Windows, above ASCII: unchanged in the C locale; otherwise
+/// `char::to_lowercase` when it maps `c` to a single character; a character
+/// whose lowercase is several characters (U+0130 is `i` plus a combining dot)
+/// has no one-character mapping and is unchanged, as `towlower` leaves it.
 pub fn to_lower(c: char) -> char {
-    let mapped = if c.is_ascii() {
-        // SAFETY: tolower is thread-safe; the argument is in [0, 127].
-        unsafe { libc::tolower(c as libc::c_int) as u32 }
+    if c.is_ascii() {
+        lower_ascii(c)
     } else {
-        // SAFETY: towlower is thread-safe; every Unicode codepoint fits in WintT.
-        unsafe { towlower(c as u32 as WintT) as u32 }
-    };
-    char::from_u32(mapped).unwrap_or(c)
+        lower_wide(c)
+    }
 }
 
 /// Map `c` to uppercase under the current `LC_CTYPE`. See [`to_lower`].
+///
+/// On Windows, above ASCII: unchanged in the C locale; otherwise
+/// `char::to_uppercase` when it maps `c` to a single character, else
+/// unchanged (U+00DF `ß` uppercases to `SS`, so it stays).
 pub fn to_upper(c: char) -> char {
-    let mapped = if c.is_ascii() {
-        // SAFETY: toupper is thread-safe; the argument is in [0, 127].
-        unsafe { libc::toupper(c as libc::c_int) as u32 }
+    if c.is_ascii() {
+        upper_ascii(c)
     } else {
-        // SAFETY: towupper is thread-safe; every Unicode codepoint fits in WintT.
-        unsafe { towupper(c as u32 as WintT) as u32 }
-    };
+        upper_wide(c)
+    }
+}
+
+#[cfg(unix)]
+fn lower_ascii(c: char) -> char {
+    // SAFETY: tolower is thread-safe; the argument is in [0, 127].
+    let mapped = unsafe { libc::tolower(c as libc::c_int) as u32 };
     char::from_u32(mapped).unwrap_or(c)
 }
 
-/// True if `c` is printable under the current `LC_CTYPE`.
-///
-/// For single-byte values (`c <= 0xFF`) this calls libc `isprint(3)`. For
-/// multi-byte / non-ASCII Unicode characters it calls libc `iswprint(3)`.
-/// In the POSIX `C` locale: ASCII space and printable graph characters are
-/// printable; control characters (including `\n`, `\r`, `\t`, NUL) are not.
-pub fn isprint(c: char) -> bool {
-    let code = c as u32;
-    if c.is_ascii() {
-        // SAFETY: libc::isprint is thread-safe and side-effect-free with
-        // any int input; we pass a value in [0, 127].
-        unsafe { libc::isprint(code as libc::c_int) != 0 }
-    } else {
-        // SAFETY: iswprint is thread-safe; `WintT` matches the platform's
-        // wint_t (32-bit unsigned on glibc/musl, 32-bit signed on Darwin),
-        // and every Unicode codepoint (max 0x10FFFF) fits losslessly in
-        // both representations because the high bit is always clear.
-        unsafe { iswprint(code as WintT) != 0 }
+#[cfg(unix)]
+fn lower_wide(c: char) -> char {
+    // SAFETY: towlower is thread-safe; every Unicode codepoint fits in WintT.
+    let mapped = unsafe { towlower(c as u32 as WintT) as u32 };
+    char::from_u32(mapped).unwrap_or(c)
+}
+
+#[cfg(unix)]
+fn upper_ascii(c: char) -> char {
+    // SAFETY: toupper is thread-safe; the argument is in [0, 127].
+    let mapped = unsafe { libc::toupper(c as libc::c_int) as u32 };
+    char::from_u32(mapped).unwrap_or(c)
+}
+
+#[cfg(unix)]
+fn upper_wide(c: char) -> char {
+    // SAFETY: towupper is thread-safe; every Unicode codepoint fits in WintT.
+    let mapped = unsafe { towupper(c as u32 as WintT) as u32 };
+    char::from_u32(mapped).unwrap_or(c)
+}
+
+#[cfg(windows)]
+fn lower_ascii(c: char) -> char {
+    c.to_ascii_lowercase()
+}
+
+#[cfg(windows)]
+fn lower_wide(c: char) -> char {
+    match ctype_mode() {
+        CtypeMode::C => c,
+        CtypeMode::Unicode => single_char(c.to_lowercase()).unwrap_or(c),
+    }
+}
+
+#[cfg(windows)]
+fn upper_ascii(c: char) -> char {
+    c.to_ascii_uppercase()
+}
+
+#[cfg(windows)]
+fn upper_wide(c: char) -> char {
+    match ctype_mode() {
+        CtypeMode::C => c,
+        CtypeMode::Unicode => single_char(c.to_uppercase()).unwrap_or(c),
+    }
+}
+
+/// The one character `mapping` yields, or `None` when it yields several.
+#[cfg(windows)]
+fn single_char(mut mapping: impl Iterator<Item = char>) -> Option<char> {
+    match (mapping.next(), mapping.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
     }
 }
 
@@ -243,25 +563,35 @@ pub fn isprint(c: char) -> bool {
 /// exposed for every platform this project targets.
 ///
 /// Call after `setlocale(LC_ALL, "")` (see `plib::diag::init_locale`);
-/// before that, the C locale's `"."` is reported.
+/// before that, the C locale's `"."` is reported. On Windows this is always
+/// `"."`, the POSIX locale's radix character.
 pub fn radix_char() -> String {
+    #[cfg(unix)]
+    if let Some(radix) = locale_radix_char() {
+        return radix;
+    }
+    ".".to_string()
+}
+
+/// `localeconv(3)`'s decimal point; `None` when the locale supplies none or it
+/// is empty or not UTF-8, and [`radix_char`] reports `"."` instead.
+#[cfg(unix)]
+fn locale_radix_char() -> Option<String> {
     // SAFETY: localeconv() returns a pointer to a static structure owned by
     // the C library, valid until the next setlocale()/localeconv() call. We
     // copy the string out immediately.
     unsafe {
         let lconv = libc::localeconv();
         if lconv.is_null() {
-            return ".".to_string();
+            return None;
         }
-
         let decimal_point = (*lconv).decimal_point;
         if decimal_point.is_null() {
-            return ".".to_string();
+            return None;
         }
-
         match std::ffi::CStr::from_ptr(decimal_point).to_str() {
-            Ok("") | Err(_) => ".".to_string(),
-            Ok(s) => s.to_string(),
+            Ok("") | Err(_) => None,
+            Ok(s) => Some(s.to_string()),
         }
     }
 }
@@ -299,6 +629,7 @@ pub fn strcoll_bytes(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
 ///
 /// Returns an `io::Error` if `fmt` contains an interior NUL byte or if
 /// `localtime_r` reports failure.
+#[cfg(unix)]
 pub fn strftime(fmt: &str, epoch_secs: i64) -> io::Result<String> {
     let cfmt = CString::new(fmt).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
@@ -362,25 +693,33 @@ pub fn strftime(fmt: &str, epoch_secs: i64) -> io::Result<String> {
 ///
 /// `setlocale(LC_ALL, "")` must have been called for a non-`C` `YESEXPR` to take effect.
 pub fn is_affirmative(response: &str) -> bool {
+    #[cfg(unix)]
+    if let Some(yesexpr) = locale_yesexpr() {
+        return yesexpr.is_match(response);
+    }
+    response.starts_with(['y', 'Y'])
+}
+
+/// The current locale's `YESEXPR`, compiled; `None` when the locale supplies
+/// none or it does not compile, and [`is_affirmative`] takes the POSIX
+/// locale's leading `y`/`Y` instead. Windows has no `nl_langinfo`, and always
+/// takes that rule.
+#[cfg(unix)]
+fn locale_yesexpr() -> Option<crate::regex::Regex> {
     use std::ffi::CStr;
     // SAFETY: nl_langinfo returns a pointer to a static, locale-owned string (or a valid empty
     // string); the bytes are copied immediately before any further locale call.
     let pattern = unsafe {
         let p = libc::nl_langinfo(libc::YESEXPR);
         if p.is_null() {
-            None
-        } else {
-            CStr::from_ptr(p).to_str().ok().map(str::to_owned)
+            return None;
         }
+        CStr::from_ptr(p).to_str().ok()?.to_owned()
     };
-    let pattern = pattern.filter(|s| !s.is_empty());
-    match pattern {
-        Some(pat) => match crate::regex::Regex::ere(&pat) {
-            Ok(re) => re.is_match(response),
-            Err(_) => response.starts_with(['y', 'Y']),
-        },
-        None => response.starts_with(['y', 'Y']),
+    if pattern.is_empty() {
+        return None;
     }
+    crate::regex::Regex::ere(&pattern).ok()
 }
 
 /// Split `bytes` into multibyte characters under the current `LC_CTYPE`, each
@@ -393,15 +732,31 @@ pub fn is_affirmative(response: &str) -> bool {
 ///
 /// Used by `m4` for character- (not byte-) oriented `len`, `index`, `substr`,
 /// and `translit`, per POSIX `LC_CTYPE`.
+///
+/// On Windows every byte is its own character in the C locale; otherwise the
+/// encoding is UTF-8, with the same one-byte fallback.
 pub fn mb_char_slices(bytes: &[u8]) -> Vec<&[u8]> {
     let mut result = Vec::new();
-    // An all-zero mbstate_t is the documented initial conversion state.
-    let mut state = MbStateT::zeroed();
+    let mut char_len = mb_char_len_fn();
     let mut i = 0;
     while i < bytes.len() {
-        let remaining = &bytes[i..];
+        let consumed = char_len(&bytes[i..]);
+        result.push(&bytes[i..i + consumed]);
+        i += consumed;
+    }
+    result
+}
+
+/// A function giving the byte length of the character that starts a non-empty
+/// slice, between 1 and the slice's length, for [`mb_char_slices`]. On Unix it
+/// owns the `mbrtowc` conversion state across calls.
+#[cfg(unix)]
+fn mb_char_len_fn() -> impl FnMut(&[u8]) -> usize {
+    // An all-zero mbstate_t is the documented initial conversion state.
+    let mut state = MbStateT::zeroed();
+    move |remaining: &[u8]| {
         // SAFETY: the pointer/length describe a valid slice, and `state` is a
-        // live mbstate_t owned by this call. A null first argument means "do
+        // live mbstate_t owned by this closure. A null first argument means "do
         // not store the wide character", only report the byte count.
         let n = unsafe {
             mbrtowc(
@@ -411,7 +766,7 @@ pub fn mb_char_slices(bytes: &[u8]) -> Vec<&[u8]> {
                 &mut state,
             )
         };
-        let consumed = if n == 0 {
+        if n == 0 {
             // A NUL wide character occupies one byte.
             1
         } else if n == usize::MAX || n == usize::MAX - 1 {
@@ -421,11 +776,66 @@ pub fn mb_char_slices(bytes: &[u8]) -> Vec<&[u8]> {
             1
         } else {
             n
-        };
-        result.push(&bytes[i..i + consumed]);
-        i += consumed;
+        }
     }
-    result
+}
+
+#[cfg(windows)]
+fn mb_char_len_fn() -> impl FnMut(&[u8]) -> usize {
+    let mode = ctype_mode();
+    move |remaining: &[u8]| match decode_char(remaining, mode) {
+        Utf8Step::Char(_, n) => n,
+        // An incomplete sequence at the end of the input, like an invalid one,
+        // is one byte: there is no later input to complete it.
+        Utf8Step::Invalid | Utf8Step::Incomplete => 1,
+    }
+}
+
+/// What the bytes at the start of a slice decode to.
+#[cfg(windows)]
+#[derive(Debug, PartialEq)]
+enum Utf8Step {
+    /// A complete character and its length in bytes.
+    Char(char, usize),
+    /// The first byte begins no valid sequence; it stands alone.
+    Invalid,
+    /// The whole slice is a valid but unfinished sequence.
+    Incomplete,
+}
+
+/// Decode the character that starts the non-empty slice `bytes` as `mode`
+/// reads text: in the C locale one byte, undecodable above ASCII; otherwise
+/// UTF-8.
+#[cfg(windows)]
+fn decode_char(bytes: &[u8], mode: CtypeMode) -> Utf8Step {
+    match mode {
+        CtypeMode::C if bytes[0].is_ascii() => Utf8Step::Char(bytes[0] as char, 1),
+        CtypeMode::C => Utf8Step::Invalid,
+        CtypeMode::Unicode => decode_utf8_char(bytes),
+    }
+}
+
+/// Decode the character that starts the non-empty slice `bytes` as UTF-8.
+#[cfg(windows)]
+fn decode_utf8_char(bytes: &[u8]) -> Utf8Step {
+    // No UTF-8 character is longer than four bytes.
+    let window = &bytes[..bytes.len().min(4)];
+    let valid_len = match std::str::from_utf8(window) {
+        Ok(_) => window.len(),
+        Err(e) if e.valid_up_to() > 0 => e.valid_up_to(),
+        // Nothing valid, and no invalid byte either: the window ended inside
+        // a sequence. Four bytes finish any sequence, so the window is the
+        // whole slice and the slice is the unfinished prefix.
+        Err(e) if e.error_len().is_none() => return Utf8Step::Incomplete,
+        Err(_) => return Utf8Step::Invalid,
+    };
+    match std::str::from_utf8(&window[..valid_len])
+        .ok()
+        .and_then(|s| s.chars().next())
+    {
+        Some(c) => Utf8Step::Char(c, c.len_utf8()),
+        None => Utf8Step::Invalid,
+    }
 }
 
 /// Stateful incremental multibyte decoder for streaming input.
@@ -440,8 +850,19 @@ pub fn mb_char_slices(bytes: &[u8]) -> Vec<&[u8]> {
 ///
 /// Used by `wc` to count characters (`-m`) and split words (`-w`) correctly in
 /// a multibyte locale without reading the whole input into memory.
+///
+/// On Windows every byte is one character in the C locale, a byte above ASCII
+/// decoding as `None` as glibc's C locale has it; otherwise the encoding is
+/// UTF-8. A sequence split across chunks is completed the same way; if the next chunk shows the retained bytes did not
+/// begin a valid character after all, each of them decodes as `None`, one
+/// character per byte.
 pub struct MbDecoder {
+    /// The `mbrtowc` conversion state, holding any unfinished sequence.
+    #[cfg(unix)]
     state: MbStateT,
+    /// The bytes of the unfinished sequence; `pending` of them are live.
+    #[cfg(windows)]
+    carry: [u8; 3],
     pending: usize,
 }
 
@@ -454,7 +875,10 @@ impl Default for MbDecoder {
 impl MbDecoder {
     pub fn new() -> Self {
         MbDecoder {
+            #[cfg(unix)]
             state: MbStateT::zeroed(),
+            #[cfg(windows)]
+            carry: [0; 3],
             pending: 0,
         }
     }
@@ -470,6 +894,48 @@ impl MbDecoder {
     /// `char` (an undecodable byte yields `None` and counts as one character).
     /// The whole chunk is consumed: a trailing incomplete sequence is retained
     /// in the decoder state and completed by the next chunk.
+    #[cfg(windows)]
+    pub fn decode(&mut self, bytes: &[u8]) -> Vec<Option<char>> {
+        // Resume an unfinished sequence by decoding it together with this chunk.
+        let joined;
+        let input = if self.pending == 0 {
+            bytes
+        } else {
+            joined = [&self.carry[..self.pending], bytes].concat();
+            &joined[..]
+        };
+        self.pending = 0;
+
+        let mode = ctype_mode();
+        let mut chars = Vec::new();
+        let mut i = 0;
+        while i < input.len() {
+            match decode_char(&input[i..], mode) {
+                Utf8Step::Char(c, n) => {
+                    chars.push(Some(c));
+                    i += n;
+                }
+                Utf8Step::Invalid => {
+                    chars.push(None);
+                    i += 1;
+                }
+                Utf8Step::Incomplete => {
+                    // At most three bytes: four would have finished it.
+                    let rest = &input[i..];
+                    self.carry[..rest.len()].copy_from_slice(rest);
+                    self.pending = rest.len();
+                    break;
+                }
+            }
+        }
+        chars
+    }
+
+    /// Decode every complete character in `bytes`, returning each as the decoded
+    /// `char` (an undecodable byte yields `None` and counts as one character).
+    /// The whole chunk is consumed: a trailing incomplete sequence is retained
+    /// in the decoder state and completed by the next chunk.
+    #[cfg(unix)]
     pub fn decode(&mut self, bytes: &[u8]) -> Vec<Option<char>> {
         let mut chars = Vec::new();
         let mut i = 0;
@@ -516,6 +982,9 @@ impl MbDecoder {
 
 #[cfg(test)]
 mod tests {
+    //! Tests whose answers are the same on every platform: ASCII, which every
+    //! locale and the Windows implementation classify as the POSIX locale does,
+    //! and collation of plain byte strings.
 
     use super::*;
 
@@ -598,56 +1067,11 @@ mod tests {
     }
 
     #[test]
-    fn strftime_year_at_epoch() {
-        let s = strftime("%Y", 0).unwrap();
-        // Unix epoch is 1970 in any sane timezone; the year string must
-        // contain "1970" or "1969" (in negative-UTC timezones the local
-        // date wraps back). Either is acceptable.
-        assert!(s == "1970" || s == "1969", "got {}", s);
-    }
-
-    #[test]
-    fn strftime_nul_in_format_errors() {
-        assert!(strftime("%Y\0%m", 0).is_err());
-    }
-
-    #[test]
     fn mb_char_slices_ascii_is_one_byte_each() {
         // ASCII is single-byte in every locale.
         let slices = mb_char_slices(b"abc");
         assert_eq!(slices, vec![b"a".as_slice(), b"b", b"c"]);
         assert_eq!(mb_char_slices(b"").len(), 0);
-    }
-
-    #[test]
-    fn mb_char_slices_utf8_after_setlocale() {
-        let _guard = crate::locale_test_lock();
-
-        // Save the exact current locale so it can be restored afterwards
-        // (setlocale(_, NULL) returns it; the string must be copied immediately
-        // as the next setlocale call may invalidate it).
-        let saved = unsafe { libc::setlocale(libc::LC_ALL, std::ptr::null()) };
-        let saved =
-            (!saved.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(saved) }.to_owned());
-
-        let utf8 = std::ffi::CString::new("C.UTF-8").unwrap();
-        let ok = unsafe { libc::setlocale(libc::LC_ALL, utf8.as_ptr()) };
-        // "é" is U+00E9 = 0xC3 0xA9 in UTF-8. Only assert when a UTF-8 locale is
-        // actually available (mirrors isprint_non_ascii_requires_setlocale).
-        let slices = mb_char_slices("é".as_bytes());
-        let matched = slices == vec![&[0xC3u8, 0xA9u8][..]];
-
-        // Restore the precise prior locale before asserting (so a failure does
-        // not leak the C.UTF-8 locale into other tests).
-        if let Some(saved) = saved {
-            unsafe { libc::setlocale(libc::LC_ALL, saved.as_ptr()) };
-        }
-        if !ok.is_null() {
-            assert!(
-                matched,
-                "expected é to be one 2-byte character, got {slices:?}"
-            );
-        }
     }
 
     #[test]
@@ -694,6 +1118,57 @@ mod tests {
         assert!(!isxdigit('g'));
     }
 
+    /// Every ASCII character, every class, against the POSIX locale's
+    /// definitions -- the libc answer on Unix, the Windows implementation's own.
+    #[test]
+    fn ascii_classes_match_the_posix_locale() {
+        // ASCII answers the same in either Windows mode; on Unix a test may
+        // change the locale, so hold it.
+        #[cfg(unix)]
+        let _guard = crate::locale_test_lock();
+        for b in 0u8..=0x7F {
+            let c = b as char;
+            let print = (0x20..=0x7E).contains(&b);
+            assert_eq!(isblank(c), b == b' ' || b == b'\t', "isblank({b:#x})");
+            assert_eq!(
+                isspace(c),
+                b == b' ' || (0x09..=0x0D).contains(&b),
+                "isspace({b:#x})"
+            );
+            assert_eq!(isalpha(c), b.is_ascii_alphabetic(), "isalpha({b:#x})");
+            assert_eq!(isalnum(c), b.is_ascii_alphanumeric(), "isalnum({b:#x})");
+            assert_eq!(isdigit(c), b.is_ascii_digit(), "isdigit({b:#x})");
+            assert_eq!(isxdigit(c), b.is_ascii_hexdigit(), "isxdigit({b:#x})");
+            assert_eq!(iscntrl(c), b < 0x20 || b == 0x7F, "iscntrl({b:#x})");
+            assert_eq!(isprint(c), print, "isprint({b:#x})");
+            assert_eq!(isgraph(c), print && b != b' ', "isgraph({b:#x})");
+            assert_eq!(
+                ispunct(c),
+                print && b != b' ' && !b.is_ascii_alphanumeric(),
+                "ispunct({b:#x})"
+            );
+            assert_eq!(islower(c), b.is_ascii_lowercase(), "islower({b:#x})");
+            assert_eq!(isupper(c), b.is_ascii_uppercase(), "isupper({b:#x})");
+            assert_eq!(to_lower(c), c.to_ascii_lowercase(), "to_lower({b:#x})");
+            assert_eq!(to_upper(c), c.to_ascii_uppercase(), "to_upper({b:#x})");
+            let width = match b {
+                0 => 0,
+                _ if print => 1,
+                _ => -1,
+            };
+            assert_eq!(wcwidth_char(c), width, "wcwidth_char({b:#x})");
+        }
+    }
+
+    #[test]
+    fn radix_char_defaults_to_period() {
+        // The process runs in the C locale (a test that switches it restores
+        // it under the lock), whose radix character is the period.
+        #[cfg(unix)]
+        let _guard = crate::locale_test_lock();
+        assert_eq!(radix_char(), ".");
+    }
+
     #[test]
     fn wcwidth_ascii() {
         // Ordinary printable ASCII is one column wide.
@@ -703,6 +1178,66 @@ mod tests {
         // Control characters are non-printable: width -1.
         assert_eq!(wcwidth_char('\t'), -1);
         assert_eq!(wcwidth_char('\n'), -1);
+    }
+
+    #[test]
+    fn mb_decoder_ascii() {
+        let mut d = MbDecoder::new();
+        let chars = d.decode(b"abc");
+        assert_eq!(chars, vec![Some('a'), Some('b'), Some('c')]);
+        assert_eq!(d.pending(), 0);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    //! Tests of the libc-backed implementation and its locale dependence.
+
+    use super::*;
+
+    #[test]
+    fn strftime_year_at_epoch() {
+        let s = strftime("%Y", 0).unwrap();
+        // Unix epoch is 1970 in any sane timezone; the year string must
+        // contain "1970" or "1969" (in negative-UTC timezones the local
+        // date wraps back). Either is acceptable.
+        assert!(s == "1970" || s == "1969", "got {}", s);
+    }
+
+    #[test]
+    fn strftime_nul_in_format_errors() {
+        assert!(strftime("%Y\0%m", 0).is_err());
+    }
+
+    #[test]
+    fn mb_char_slices_utf8_after_setlocale() {
+        let _guard = crate::locale_test_lock();
+
+        // Save the exact current locale so it can be restored afterwards
+        // (setlocale(_, NULL) returns it; the string must be copied immediately
+        // as the next setlocale call may invalidate it).
+        let saved = unsafe { libc::setlocale(libc::LC_ALL, std::ptr::null()) };
+        let saved =
+            (!saved.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(saved) }.to_owned());
+
+        let utf8 = std::ffi::CString::new("C.UTF-8").unwrap();
+        let ok = unsafe { libc::setlocale(libc::LC_ALL, utf8.as_ptr()) };
+        // "é" is U+00E9 = 0xC3 0xA9 in UTF-8. Only assert when a UTF-8 locale is
+        // actually available (mirrors isprint_non_ascii_requires_setlocale).
+        let slices = mb_char_slices("é".as_bytes());
+        let matched = slices == vec![&[0xC3u8, 0xA9u8][..]];
+
+        // Restore the precise prior locale before asserting (so a failure does
+        // not leak the C.UTF-8 locale into other tests).
+        if let Some(saved) = saved {
+            unsafe { libc::setlocale(libc::LC_ALL, saved.as_ptr()) };
+        }
+        if !ok.is_null() {
+            assert!(
+                matched,
+                "expected é to be one 2-byte character, got {slices:?}"
+            );
+        }
     }
 
     #[test]
@@ -724,14 +1259,6 @@ mod tests {
         if !ok.is_null() {
             assert_eq!(w, 2, "expected 世 to be 2 columns wide in a UTF-8 locale");
         }
-    }
-
-    #[test]
-    fn mb_decoder_ascii() {
-        let mut d = MbDecoder::new();
-        let chars = d.decode(b"abc");
-        assert_eq!(chars, vec![Some('a'), Some('b'), Some('c')]);
-        assert_eq!(d.pending(), 0);
     }
 
     #[test]
@@ -826,5 +1353,230 @@ mod tests {
         if let Some(saved) = saved {
             unsafe { libc::setlocale(libc::LC_ALL, saved.as_ptr()) };
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    //! Tests of the Windows implementation: in the Unicode mode, Unicode
+    //! classification above ASCII and UTF-8 decoding with the one-byte
+    //! fallback; in the C locale's, ASCII alone and one byte per character.
+
+    use super::*;
+
+    /// Holds the character functions in one mode for a test, under the locale
+    /// lock, and restores the previous mode when dropped.
+    struct ModeGuard {
+        saved: CtypeMode,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            set_ctype_mode(self.saved);
+        }
+    }
+
+    fn ctype(mode: CtypeMode) -> ModeGuard {
+        let lock = crate::locale_test_lock();
+        let saved = ctype_mode();
+        set_ctype_mode(mode);
+        ModeGuard { saved, _lock: lock }
+    }
+
+    #[test]
+    fn a_program_starts_in_the_c_locale() {
+        let _lock = crate::locale_test_lock();
+        assert_eq!(ctype_mode(), CtypeMode::C);
+    }
+
+    #[test]
+    fn c_locale_has_nothing_above_ascii() {
+        let _mode = ctype(CtypeMode::C);
+        for c in [
+            'é', 'É', 'З', '世', '\u{80}', '\u{A0}', '\u{2003}', '¿', '\u{663}',
+        ] {
+            for (name, class) in [
+                ("isalpha", isalpha as fn(char) -> bool),
+                ("isalnum", isalnum),
+                ("isblank", isblank),
+                ("isspace", isspace),
+                ("iscntrl", iscntrl),
+                ("isdigit", isdigit),
+                ("isgraph", isgraph),
+                ("islower", islower),
+                ("isprint", isprint),
+                ("ispunct", ispunct),
+                ("isupper", isupper),
+                ("isxdigit", isxdigit),
+            ] {
+                assert!(!class(c), "{name}({c:?})");
+            }
+            assert_eq!(to_upper(c), c);
+            assert_eq!(to_lower(c), c);
+            assert_eq!(wcwidth_char(c), -1, "wcwidth_char({c:?})");
+        }
+        // ASCII is unchanged.
+        assert!(isalpha('a') && isupper('A') && isprint(' '));
+        assert_eq!(to_upper('a'), 'A');
+        assert_eq!(wcwidth_char('a'), 1);
+    }
+
+    #[test]
+    fn c_locale_reads_one_byte_per_character() {
+        let _mode = ctype(CtypeMode::C);
+        let input = "aé世".as_bytes();
+        let slices = mb_char_slices(input);
+        assert_eq!(slices.len(), input.len());
+        assert!(slices.iter().all(|s| s.len() == 1));
+        let mut d = MbDecoder::new();
+        assert_eq!(
+            d.decode(b"a\xC3\xA9\0"),
+            vec![Some('a'), None, None, Some('\0')]
+        );
+        // No byte waits for another.
+        assert_eq!(d.decode(&[0xE4]), vec![None]);
+        assert_eq!(d.pending(), 0);
+    }
+
+    #[test]
+    fn non_ascii_letters_and_case() {
+        let _mode = ctype(CtypeMode::Unicode);
+        for c in ['é', 'É', 'ß', 'З', 'ж', '世'] {
+            assert!(isalpha(c) && isalnum(c), "{c} is alphabetic");
+            assert!(isprint(c) && isgraph(c), "{c} is printable");
+            assert!(!ispunct(c) && !isspace(c) && !iscntrl(c), "{c}");
+            assert!(!isdigit(c) && !isxdigit(c), "{c}");
+        }
+        assert!(islower('é') && !isupper('é'));
+        assert!(isupper('É') && !islower('É'));
+        assert!(!islower('世') && !isupper('世'));
+        assert_eq!(to_upper('é'), 'É');
+        assert_eq!(to_lower('É'), 'é');
+        assert_eq!(to_lower('З'), 'з');
+        // No one-character mapping: unchanged.
+        assert_eq!(to_upper('ß'), 'ß');
+        assert_eq!(to_lower('\u{130}'), '\u{130}');
+        assert_eq!(to_upper('世'), '世');
+    }
+
+    #[test]
+    fn non_ascii_digits_are_alpha_not_digit() {
+        let _mode = ctype(CtypeMode::Unicode);
+        // ARABIC-INDIC DIGIT THREE and FULLWIDTH DIGIT ONE.
+        for c in ['\u{663}', '\u{FF11}'] {
+            assert!(!isdigit(c) && !isxdigit(c));
+            assert!(isalpha(c) && isalnum(c));
+        }
+    }
+
+    #[test]
+    fn non_ascii_spaces_controls_and_punctuation() {
+        let _mode = ctype(CtypeMode::Unicode);
+        // EM SPACE and IDEOGRAPHIC SPACE: blank and space, not graph.
+        for c in ['\u{2003}', '\u{3000}'] {
+            assert!(isblank(c) && isspace(c) && isprint(c) && !isgraph(c));
+        }
+        // LINE SEPARATOR and NEL: space but not blank.
+        assert!(isspace('\u{2028}') && !isblank('\u{2028}'));
+        assert!(isspace('\u{85}') && !isblank('\u{85}'));
+        // NO-BREAK SPACE: neither, and visible.
+        assert!(!isspace('\u{A0}') && !isblank('\u{A0}') && isgraph('\u{A0}'));
+        // C1 controls.
+        assert!(iscntrl('\u{80}') && iscntrl('\u{9F}') && !isprint('\u{9F}'));
+        // Punctuation and symbols.
+        for c in ['¿', '«', '—', '€', '©'] {
+            assert!(ispunct(c) && isgraph(c) && !isalnum(c), "{c}");
+        }
+    }
+
+    #[test]
+    fn wcwidth_unicode() {
+        let _mode = ctype(CtypeMode::Unicode);
+        assert_eq!(wcwidth_char('é'), 1);
+        assert_eq!(wcwidth_char('З'), 1);
+        assert_eq!(wcwidth_char('世'), 2);
+        assert_eq!(wcwidth_char('한'), 2);
+        assert_eq!(wcwidth_char('\u{FF21}'), 2); // FULLWIDTH LATIN CAPITAL A
+        assert_eq!(wcwidth_char('\u{3000}'), 2); // IDEOGRAPHIC SPACE
+        assert_eq!(wcwidth_char('\u{303F}'), 1); // IDEOGRAPHIC HALF FILL SPACE
+        assert_eq!(wcwidth_char('🦀'), 2);
+        assert_eq!(wcwidth_char('\u{20000}'), 2);
+        assert_eq!(wcwidth_char('\u{301}'), 0); // COMBINING ACUTE ACCENT
+        assert_eq!(wcwidth_char('\u{200B}'), 0); // ZERO WIDTH SPACE
+        assert_eq!(wcwidth_char('\u{FE0F}'), 0); // VARIATION SELECTOR-16
+        assert_eq!(wcwidth_char('\u{85}'), -1);
+    }
+
+    #[test]
+    fn mb_char_slices_utf8() {
+        let _mode = ctype(CtypeMode::Unicode);
+        let s = "aé世🦀";
+        let slices = mb_char_slices(s.as_bytes());
+        let want: Vec<&[u8]> = vec![b"a", "é".as_bytes(), "世".as_bytes(), "🦀".as_bytes()];
+        assert_eq!(slices, want);
+    }
+
+    #[test]
+    fn mb_char_slices_invalid_bytes_stand_alone() {
+        let _mode = ctype(CtypeMode::Unicode);
+        // A stray continuation byte, an invalid lead, a lead cut off by ASCII,
+        // a surrogate encoding, and a sequence cut off by the end of input.
+        let input = b"\x80a\xFF\xC3b\xED\xA0\x80\xE4\xB8";
+        let slices = mb_char_slices(input);
+        let want: Vec<&[u8]> = vec![
+            b"\x80", b"a", b"\xFF", b"\xC3", b"b", b"\xED", b"\xA0", b"\x80", b"\xE4", b"\xB8",
+        ];
+        assert_eq!(slices, want);
+        assert_eq!(slices.concat(), input);
+    }
+
+    #[test]
+    fn mb_decoder_split_sequences() {
+        let _mode = ctype(CtypeMode::Unicode);
+        let mut d = MbDecoder::new();
+        // 世 is E4 B8 96: one byte per chunk.
+        assert_eq!(d.decode(&[b'a', 0xE4]), vec![Some('a')]);
+        assert_eq!(d.pending(), 1);
+        assert!(d.decode(&[0xB8]).is_empty());
+        assert_eq!(d.pending(), 2);
+        assert_eq!(d.decode(&[0x96, b'b']), vec![Some('世'), Some('b')]);
+        assert_eq!(d.pending(), 0);
+        // 🦀 (F0 9F A6 80) split 2 + 2, and é split 1 + 1 within one call.
+        assert!(d.decode(&[0xF0, 0x9F]).is_empty());
+        assert_eq!(d.decode(&[0xA6, 0x80, 0xC3]), vec![Some('🦀')]);
+        assert_eq!(d.decode(&[0xA9]), vec![Some('é')]);
+        assert_eq!(d.pending(), 0);
+        assert!(d.decode(b"").is_empty());
+    }
+
+    #[test]
+    fn mb_decoder_invalid_bytes() {
+        let _mode = ctype(CtypeMode::Unicode);
+        let mut d = MbDecoder::new();
+        assert_eq!(
+            d.decode(b"\x80a\xFF\0"),
+            vec![None, Some('a'), None, Some('\0')]
+        );
+        // A retained prefix that the next chunk breaks: each retained byte is
+        // one undecodable character, and the breaking byte decodes normally.
+        assert!(d.decode(&[0xE4, 0xB8]).is_empty());
+        assert_eq!(d.pending(), 2);
+        assert_eq!(d.decode(b"x"), vec![None, None, Some('x')]);
+        assert_eq!(d.pending(), 0);
+        // A prefix still unfinished at end of input stays pending.
+        assert!(d.decode(&[0xC3]).is_empty());
+        assert_eq!(d.pending(), 1);
+    }
+
+    #[test]
+    fn decode_utf8_char_steps() {
+        assert_eq!(decode_utf8_char(b"a"), Utf8Step::Char('a', 1));
+        assert_eq!(decode_utf8_char("éx".as_bytes()), Utf8Step::Char('é', 2));
+        assert_eq!(decode_utf8_char("🦀🦀".as_bytes()), Utf8Step::Char('🦀', 4));
+        assert_eq!(decode_utf8_char(b"\xF0\x9F\xA6"), Utf8Step::Incomplete);
+        assert_eq!(decode_utf8_char(b"\xF0\x9F\xA6x"), Utf8Step::Invalid);
+        assert_eq!(decode_utf8_char(b"\xC0\x80"), Utf8Step::Invalid); // overlong
+        assert_eq!(decode_utf8_char(b"\xED\xA0"), Utf8Step::Invalid); // surrogate
     }
 }

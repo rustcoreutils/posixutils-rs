@@ -766,7 +766,7 @@ fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str
 
             // If the last entry does not end up on the bottom right of
             // the grid
-            if entries.len() % num_columns != 0 {
+            if !entries.len().is_multiple_of(num_columns) {
                 println!();
             }
         }

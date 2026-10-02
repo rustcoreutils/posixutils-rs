@@ -799,6 +799,9 @@ fn test_warn_z_suffix_on_compress() {
 // Symlink invocation tests (zcat, uncompress)
 // =============================================================================
 
+/// `zcat` and `uncompress` are argv[0] aliases of `compress`, symlinked
+/// only on Unix by `xform/build.rs`.
+#[cfg(unix)]
 #[test]
 fn test_zcat_lzw() {
     // Test zcat symlink with LZW (.Z) format
@@ -836,6 +839,9 @@ fn test_zcat_lzw() {
     cleanup_file(&compressed_file);
 }
 
+/// `zcat` and `uncompress` are argv[0] aliases of `compress`, symlinked
+/// only on Unix by `xform/build.rs`.
+#[cfg(unix)]
 #[test]
 fn test_zcat_gzip() {
     // Test zcat symlink with gzip (.gz) format
@@ -873,6 +879,9 @@ fn test_zcat_gzip() {
     cleanup_file(&compressed_file);
 }
 
+/// `zcat` and `uncompress` are argv[0] aliases of `compress`, symlinked
+/// only on Unix by `xform/build.rs`.
+#[cfg(unix)]
 #[test]
 fn test_uncompress_lzw() {
     // Test uncompress symlink with LZW (.Z) format - in-place decompression
@@ -926,6 +935,9 @@ fn test_uncompress_lzw() {
     cleanup_file(&test_file);
 }
 
+/// `zcat` and `uncompress` are argv[0] aliases of `compress`, symlinked
+/// only on Unix by `xform/build.rs`.
+#[cfg(unix)]
 #[test]
 fn test_uncompress_gzip() {
     // Test uncompress symlink with gzip (.gz) format - in-place decompression
@@ -994,6 +1006,17 @@ fn generate_binary_data(size: usize) -> Vec<u8> {
     data
 }
 
+/// The command that decompresses a `.Z` file in place: `uncompress` on Unix,
+/// and `compress -d` on Windows, where `xform/build.rs` creates no argv[0]
+/// aliases.
+fn decompress_command() -> (String, Vec<String>) {
+    if cfg!(unix) {
+        (String::from("uncompress"), vec![])
+    } else {
+        (String::from("compress"), vec![String::from("-d")])
+    }
+}
+
 /// Helper: compress binary data via file, decompress, and verify roundtrip
 fn binary_roundtrip_test(data: &[u8], label: &str) {
     let test_dir = get_test_dir();
@@ -1029,9 +1052,11 @@ fn binary_roundtrip_test(data: &[u8], label: &str) {
     );
 
     // Decompress
+    let (cmd, mut args) = decompress_command();
+    args.push(compressed_file.to_str().unwrap().to_string());
     run_test(TestPlan {
-        cmd: String::from("uncompress"),
-        args: vec![compressed_file.to_str().unwrap().to_string()],
+        cmd,
+        args,
         stdin_data: String::new(),
         expected_out: String::new(),
         expected_err: String::new(),
@@ -1308,6 +1333,9 @@ fn test_compress_bits_16_accepted_and_roundtrips(/* #C4 */) {
 /// before any cleanup runs, and a scratch file left in the source tree is both
 /// repo trash and a hazard for the next `git add`. The `TempDir` the caller
 /// holds removes everything on unwind.
+///
+/// It and the tests using it are Unix-only while `plib::tmp` is.
+#[cfg(unix)]
 fn scratch_file(dir: &plib::tmp::TempDir, name: &str, contents: &[u8]) -> PathBuf {
     let path = dir.path().join(name);
     let mut f = File::create(&path).unwrap();
@@ -1317,6 +1345,7 @@ fn scratch_file(dir: &plib::tmp::TempDir, name: &str, contents: &[u8]) -> PathBu
 
 /// `-v` reports the compression achieved on stderr. The audit had no test for
 /// the *content* of that message, only that the flag was accepted.
+#[cfg(unix)]
 #[test]
 fn test_compress_verbose_reports_compression_percentage() {
     // Highly compressible, so the percentage is comfortably positive.
@@ -1372,6 +1401,7 @@ fn test_compress_verbose_reports_compression_percentage() {
 
 /// Without `-v` nothing is written to stderr — the counterpart assertion, so
 /// the test above cannot pass just because some other message happens to match.
+#[cfg(unix)]
 #[test]
 fn test_compress_without_verbose_is_silent() {
     let td = plib::tmp::tempdir().unwrap();
@@ -1398,6 +1428,7 @@ fn test_compress_without_verbose_is_silent() {
 /// The compressed file keeps the original's permission bits and modification
 /// time (`FileMetadata::apply_to`). Ownership is best-effort and only testable
 /// as root, so it is not asserted here.
+#[cfg(unix)]
 #[test]
 fn test_compress_preserves_mode_and_mtime() {
     use std::os::unix::fs::PermissionsExt;
@@ -1441,6 +1472,7 @@ fn test_compress_preserves_mode_and_mtime() {
 /// reports pre-1970 times as an error carrying the distance *before* the epoch,
 /// which must be turned into a negative `tv_sec` rather than collapsed onto
 /// 1970-01-01.
+#[cfg(unix)]
 #[test]
 fn test_compress_preserves_pre_epoch_mtime() {
     let td = plib::tmp::tempdir().unwrap();
@@ -1487,6 +1519,7 @@ fn test_compress_preserves_pre_epoch_mtime() {
 }
 
 /// Decompression restores the same metadata onto the recovered file.
+#[cfg(unix)]
 #[test]
 fn test_uncompress_preserves_mode_and_mtime() {
     use std::os::unix::fs::PermissionsExt;
@@ -1519,4 +1552,103 @@ fn test_uncompress_preserves_mode_and_mtime() {
     let after = fs::metadata(&source).unwrap();
     assert_eq!(after.permissions().mode() & 0o777, 0o604);
     assert_eq!(after.modified().unwrap(), want_mtime);
+}
+
+/// The input's times survive a umask that leaves the output without owner
+/// write. Setting them needs only ownership, but a version that reopened
+/// the finished output for writing to set them was refused on a 0400 file,
+/// and the times were silently lost. The umask is set in a shell, not in
+/// this process, so no other test sees it.
+#[cfg(unix)]
+#[test]
+fn test_times_preserved_under_a_umask_without_owner_write() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let dir = get_test_dir();
+    let source = dir.join("umask_times.txt");
+    let compressed = dir.join("umask_times.txt.Z");
+    cleanup_file(&source);
+    cleanup_file(&compressed);
+
+    // 2001-01-01T00:00:00Z: unmistakably not "now".
+    let past = UNIX_EPOCH + Duration::from_secs(978_307_200);
+    let set_past = |path: &PathBuf| {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_accessed(past).set_modified(past))
+            .unwrap();
+    };
+    let compress_under_umask = |args: &[&std::ffi::OsStr]| {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg("umask 0277; exec \"$@\"")
+            .arg("sh")
+            .arg(plib::testing::get_binary_path("compress"))
+            .args(args)
+            .status()
+            .unwrap()
+    };
+
+    fs::write(&source, b"umask times\n".repeat(200)).unwrap();
+    set_past(&source);
+    let compressed_status = compress_under_umask(&["-f".as_ref(), source.as_os_str()]);
+    let compressed_mtime = fs::metadata(&compressed).and_then(|m| m.modified());
+
+    set_past(&compressed);
+    let restored_status = compress_under_umask(&["-d".as_ref(), compressed.as_os_str()]);
+    let restored_mtime = fs::metadata(&source).and_then(|m| m.modified());
+
+    cleanup_file(&source);
+    cleanup_file(&compressed);
+    assert!(compressed_status.success(), "compress: {compressed_status}");
+    assert_eq!(compressed_mtime.unwrap(), past, "compress lost the mtime");
+    assert!(restored_status.success(), "compress -d: {restored_status}");
+    assert_eq!(restored_mtime.unwrap(), past, "compress -d lost the mtime");
+}
+
+/// A read-only input is compressed and removed, as any other is. On
+/// Windows the read-only attribute travels to the output with the rest of
+/// the metadata, and a Rust standard library before 1.86 would not delete
+/// a read-only file there: removing the input failed, the back-out could
+/// not remove the equally read-only output either, and both were left
+/// behind with a non-zero status.
+#[test]
+fn test_compress_read_only_input() {
+    let dir = get_test_dir();
+    let source = dir.join("read_only_input.txt");
+    let compressed = dir.join("read_only_input.txt.Z");
+    let set_read_only = |path: &PathBuf, read_only: bool| {
+        if let Ok(meta) = fs::metadata(path) {
+            let mut perm = meta.permissions();
+            perm.set_readonly(read_only);
+            fs::set_permissions(path, perm).unwrap();
+        }
+    };
+    for path in [&source, &compressed] {
+        set_read_only(path, false);
+        cleanup_file(path);
+    }
+
+    fs::write(&source, b"read only input\n".repeat(200)).unwrap();
+    set_read_only(&source, true);
+
+    let output =
+        plib::testing::run_test_base("compress", &[source.to_str().unwrap().to_string()], b"");
+    let source_left = source.exists();
+    let compressed_made = compressed.exists();
+
+    for path in [&source, &compressed] {
+        set_read_only(path, false);
+        cleanup_file(path);
+    }
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!source_left, "the read-only input must be removed");
+    assert!(compressed_made, "the output must be left in place");
 }

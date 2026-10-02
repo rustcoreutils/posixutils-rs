@@ -8,6 +8,7 @@
 //
 
 use std::cmp::Ordering;
+#[cfg(unix)]
 use std::ffi::CStr;
 use std::{
     fs::File,
@@ -129,6 +130,7 @@ struct Record {
 }
 
 /// Locale-driven numeric formatting: (decimal point, optional thousands separator).
+#[cfg(unix)]
 fn numeric_conv() -> (char, Option<char>) {
     // SAFETY: localeconv returns a pointer to a static, locale-owned struct.
     unsafe {
@@ -161,6 +163,15 @@ fn numeric_conv() -> (char, Option<char>) {
         };
         (decimal, thousands)
     }
+}
+
+/// Windows has no `localeconv` in the `libc` crate, and `plib` takes numbers
+/// in the POSIX locale's form there: its radix character, and no thousands
+/// grouping.
+#[cfg(windows)]
+fn numeric_conv() -> (char, Option<char>) {
+    let decimal = locale::radix_char().chars().next().unwrap_or('.');
+    (decimal, None)
 }
 
 fn is_blank(c: char) -> bool {

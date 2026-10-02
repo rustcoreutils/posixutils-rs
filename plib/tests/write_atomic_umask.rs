@@ -14,6 +14,8 @@
 //! thread would make a mode assertion here flap. Same reasoning as
 //! `tree/tests/tree-tests-umask.rs`.
 
+#![cfg(unix)]
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;

@@ -903,6 +903,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 name = "plib"
 version = "0.9.0"
 dependencies = [
+ "cc",
  "cfg-if",
  "errno",
  "gettext-rs",

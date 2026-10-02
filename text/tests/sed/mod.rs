@@ -1891,6 +1891,21 @@ mod tests {
         }
     }
 
+    /// What sed reports when it cannot open `path` as a `w` file: the system's
+    /// own text for the failed open (which differs between Unix and Windows),
+    /// lowercased as sed prints it.
+    fn w_open_error(path: &str) -> String {
+        let err = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .expect_err("the w file must not be creatable");
+        format!(
+            "sed: read stdin: can't find '{path}': {}\n",
+            plib::diag::io_error_text(&err).to_lowercase()
+        )
+    }
+
     #[test]
     fn test_w() {
         // Relative wfile paths are written relative to the CWD; tests redirect
@@ -1904,26 +1919,36 @@ mod tests {
                 String::new(),
             ),
             (format!("w{}", wfile("w_empty")), "", "", String::new()),
-            (format!("w {}", wfile("newfile")), "a\n", "a\n", String::new()),
-            ("w ; h".to_string(), "abc\ncdf\n", "abc\ncdf\n", String::new()),
+            (
+                format!("w {}", wfile("newfile")),
+                "a\n",
+                "a\n",
+                String::new(),
+            ),
+            (
+                "w ; h".to_string(),
+                "abc\ncdf\n",
+                "abc\ncdf\n",
+                String::new(),
+            ),
             // wrong
             (
                 "w ./dir/newfile".to_string(),
                 "abc\ncdf\n",
                 "",
-                "sed: read stdin: can't find './dir/newfile': no such file or directory\n".to_string(),
+                w_open_error("./dir/newfile"),
             ),
             (
                 "w./tests/s\x04ed/assets/abc".to_string(),
                 "a\n",
                 "",
-                "sed: read stdin: can't find './tests/s\u{4}ed/assets/abc': no such file or directory\n".to_string(),
+                w_open_error("./tests/s\u{4}ed/assets/abc"),
             ),
             (
                 "w./tests/ard/assets/abc".to_string(),
                 "a\n",
                 "",
-                "sed: read stdin: can't find './tests/ard/assets/abc': no such file or directory\n".to_string(),
+                w_open_error("./tests/ard/assets/abc"),
             ),
         ];
 

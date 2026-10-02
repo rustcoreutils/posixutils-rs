@@ -40,7 +40,7 @@ members = [
 repository = "https://github.com/rustcoreutils/posixutils-rs"
 license = "MIT"
 edition = "2021"
-rust-version = "1.84.0"
+rust-version = "1.88.0"
 
 [workspace.dependencies]
 clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "cargo"] }

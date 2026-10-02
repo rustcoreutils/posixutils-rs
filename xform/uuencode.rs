@@ -13,10 +13,10 @@ use gettextrs::gettext;
 use plib::diag;
 use std::fs::{File, Permissions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 const PERMISSION_MASK: u32 = 0o7;
+#[cfg(unix)]
 const RW: u32 = 0o666;
 
 /// uuencode - encode a binary file
@@ -61,31 +61,55 @@ fn resolve_operands(operands: &[String]) -> Result<(Option<PathBuf>, String), St
     }
 }
 
-/// <sys/stat.h> mentions the constants ncessary to extract out the permission
-/// so we'll use bit masking by shifting 3 bits everytime to ge
-fn get_permission_values(perm: Permissions) -> String {
-    let perm_mode = perm.mode();
-
-    let others_perm = perm_mode & PERMISSION_MASK;
-    let group_perm = (perm_mode >> 3) & PERMISSION_MASK;
-    let user_perm = (perm_mode >> 6) & PERMISSION_MASK;
+/// A mode's permission bits as the header's three octal digits (owner,
+/// group, other); the set-ID and sticky bits are not written.
+fn format_mode(mode: u32) -> String {
+    let others_perm = mode & PERMISSION_MASK;
+    let group_perm = (mode >> 3) & PERMISSION_MASK;
+    let user_perm = (mode >> 6) & PERMISSION_MASK;
 
     format!("{user_perm}{group_perm}{others_perm}")
 }
 
-/// Read the current umask without leaving it changed (umask(2) has no read-only form).
-fn current_umask_mode() -> u32 {
+/// The permission bits of `perm`, as POSIX writes them.
+///
+/// Windows keeps only a read-only attribute, which is the owner-write bit
+/// seen from POSIX: such a file reads as `0444`, any other as `0644`.
+fn mode_of(perm: &Permissions) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perm.mode()
+    }
+    #[cfg(windows)]
+    {
+        if perm.readonly() {
+            0o444
+        } else {
+            0o644
+        }
+    }
+}
+
+/// The mode a newly created file gets: `0666` less the umask, read without
+/// leaving it changed (umask(2) has no read-only form). Windows has no umask,
+/// and a new file there is an ordinary writable one, `0644`.
+fn new_file_mode() -> u32 {
     #[cfg(target_os = "macos")]
     {
         let old = unsafe { libc::umask(RW as u16) };
         unsafe { libc::umask(old) };
         RW & (!old as u32)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(unix, not(target_os = "macos")))]
     {
         let old = unsafe { libc::umask(RW) };
         unsafe { libc::umask(old) };
         RW & !old
+    }
+    #[cfg(windows)]
+    {
+        0o644
     }
 }
 
@@ -139,15 +163,14 @@ fn encode_file(base64: bool, file: Option<&Path>, decode_path: &str) -> io::Resu
 
     match file {
         None => {
-            let mode = current_umask_mode();
-            let perm = get_permission_values(Permissions::from_mode(mode));
+            let perm = format_mode(new_file_mode());
             let header = format!("{header_init} {perm} {decode_path}\n");
             out.extend_from_slice(header.as_bytes());
             io::stdin().lock().read_to_end(&mut buf)?;
         }
         Some(path) => {
             let mut f = File::open(path)?;
-            let perm = get_permission_values(f.metadata()?.permissions());
+            let perm = format_mode(mode_of(&f.metadata()?.permissions()));
             let header = format!("{header_init} {perm} {decode_path}\n");
             out.extend_from_slice(header.as_bytes());
             f.read_to_end(&mut buf)?;

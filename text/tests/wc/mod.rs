@@ -193,6 +193,8 @@ fn wc_double_dash_ends_options() {
 
 /// `wc -l` over many operands into a closed pipe must die by SIGPIPE.
 /// See `plib::testing::assert_dies_by_sigpipe`.
+// Unix only: Windows has no SIGPIPE (and no plib::tmp).
+#[cfg(unix)]
 #[test]
 fn test_wc_dies_by_sigpipe_on_a_closed_pipe() {
     let dir = plib::tmp::tempdir().unwrap();

@@ -9,26 +9,40 @@
 
 pub mod archive;
 pub mod cscan;
+#[cfg(unix)]
 pub mod curuser;
 pub mod diag;
+#[cfg(unix)]
 pub mod exec;
+#[cfg(unix)]
 pub mod group;
 pub mod io;
 pub mod linediff;
 pub mod locale;
 pub mod lzw;
+#[cfg(unix)]
 pub mod modestr;
+#[cfg(unix)]
 pub mod platform;
+#[cfg(unix)]
 pub mod priority;
+#[cfg(unix)]
 pub mod projectdir;
 pub mod regex;
+#[cfg(unix)]
 pub mod sccsfile;
+#[cfg(unix)]
 pub mod syslog;
+#[cfg(unix)]
 pub mod test_expr;
 pub mod testing;
+#[cfg(unix)]
 pub mod tmp;
+#[cfg(unix)]
 pub mod tty;
+#[cfg(unix)]
 pub mod user;
+#[cfg(unix)]
 pub mod utmpx;
 
 pub const BUFSZ: usize = 8 * 1024;

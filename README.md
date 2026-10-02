@@ -96,6 +96,45 @@ The standard `cargo install` should work, for those interested in testing.  Care
 
 Note that `cargo install` copies the declared binaries and nothing else, so the six `argv[0]` symlinks above — `tar`, `cpio`, `ex`, `zcat`, `uncompress` and `[` — are *not* installed by it.  They are created in `target/<profile>` by the crates' build scripts, and delivered by the container image.
 
+### Windows
+
+Two crates build and are tested on Windows, natively with MSVC (no MinGW or
+Cygwin runtime): `xform` (`cksum`, `compress`, `uuencode`, `uudecode`) and
+`text` (`asa`, `comm`, `csplit`, `cut`, `diff`, `expand`, `fold`, `grep`,
+`head`, `join`, `nl`, `paste`, `patch`, `pr`, `sed`, `sort`, `tail`, `tr`,
+`tsort`, `unexpand`, `uniq`, `wc`).
+
+```sh
+cargo build --release -p posixutils-xform -p posixutils-text
+```
+
+Building the whole workspace on Windows does not work: most other utilities
+are inherently Unix (users, terminals, signals, file modes and ownership).
+What behaves differently on Windows:
+
+- a file's POSIX mode is its read-only attribute, read as the owner-write bit
+  (`0444` or `0644`); setting a mode without owner write makes it read-only;
+- `compress` restores permissions and times but not ownership, and does not
+  warn about hard links; the `zcat` and `uncompress` aliases do not exist
+  (use `compress -c -d` and `compress -d`);
+- `LC_ALL`, `LC_*` and `LANG` set to `C` or `POSIX` select the C locale:
+  ASCII-only character classes and case mapping, one byte per character, and
+  byte-order collation; `C.UTF-8` (or any `C`/`POSIX` name with a codeset)
+  collates in byte order but reads UTF-8 and classifies and case-maps by
+  Unicode; any other value, or none, is the user's locale with UTF-8 input and
+  Unicode characters;
+- POSIX regular expressions are musl's (vendored in `plib/vendor/musl-regex`)
+  and do not support characters above U+FFFF;
+- `sort -n` always takes `.` as the decimal point, with no thousands
+  separator;
+- `diff` reports anything that is neither a file nor a directory as a
+  special file, and recognises a directory loop by its canonical path;
+- `pr -p` and `patch` prompt on the console; `csplit` removes its files on
+  Ctrl-C, Ctrl-Break and termination, Windows having no hangup or quit
+  signal.
+
+[WINDOWS.md](WINDOWS.md) is the guide to porting another crate.
+
 ### Container image
 
 A multi-architecture image is published to the GitHub container registry on

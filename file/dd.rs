@@ -209,7 +209,7 @@ fn convert_ascii(data: &mut [u8], ascii_conv: &AsciiConv) {
 }
 
 fn convert_swab(data: &mut [u8]) {
-    for chunk in data.chunks_exact_mut(2) {
+    for chunk in data.as_chunks_mut::<2>().0 {
         chunk.swap(0, 1);
     }
 }

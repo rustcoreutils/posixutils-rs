@@ -226,7 +226,7 @@ impl ArchiveMember {
         writer.write_all(&pad_metadata_with_spaces::<10>(self.size.to_string())?)?;
         writer.write_all(&object::archive::TERMINATOR)?;
         writer.write_all(&self.data)?;
-        if self.data.len() % 2 != 0 {
+        if !self.data.len().is_multiple_of(2) {
             writer.write_all(b"\n")?;
         }
 

@@ -14,44 +14,31 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::Duration;
 
-/// Get the target directory for built binaries.
-///
-/// Handles cargo-llvm-cov which uses a custom target directory.
-pub fn get_target_dir() -> String {
-    std::env::var("CARGO_TARGET_DIR")
-        .or_else(|_| std::env::var("CARGO_LLVM_COV_TARGET_DIR"))
-        .unwrap_or_else(|_| {
-            if cfg!(coverage) {
-                String::from("target/llvm-cov-target")
-            } else {
-                String::from("target")
-            }
-        })
-}
-
-/// Get the current build profile ("debug" or "release").
-pub fn get_profile() -> &'static str {
-    if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    }
-}
-
 /// Get the full path to a built binary.
 ///
-/// This assumes the current directory is within a workspace member crate
-/// and navigates up to the workspace root to find the binary.
+/// Cargo puts an integration-test executable in `<bin dir>/deps/` and the
+/// package's binaries in `<bin dir>`, whatever the target directory, profile,
+/// `--target` triple or coverage wrapper, so the binaries are found from the
+/// running test executable rather than reconstructed from guesses at those.
+/// The platform's executable suffix (`.exe` on Windows) is appended.
 pub fn get_binary_path(cmd: &str) -> PathBuf {
-    let target_dir = get_target_dir();
-    let profile = get_profile();
-    let relpath = format!("{}/{}/{}", target_dir, profile, cmd);
+    binary_dir().join(format!("{cmd}{}", std::env::consts::EXE_SUFFIX))
+}
 
-    std::env::current_dir()
-        .unwrap()
+/// The directory holding the workspace's built binaries: the running test
+/// executable's own directory, or its parent when that is `deps`.
+fn binary_dir() -> PathBuf {
+    let exe = std::env::current_exe().expect("locate the running test executable");
+    let dir = exe
         .parent()
-        .unwrap() // Move up to the workspace root from the current package directory
-        .join(relpath)
+        .expect("test executable has a parent directory");
+    if dir.file_name().is_some_and(|name| name == "deps") {
+        dir.parent()
+            .expect("deps has a parent directory")
+            .to_path_buf()
+    } else {
+        dir.to_path_buf()
+    }
 }
 
 pub struct TestPlan {
@@ -324,25 +311,49 @@ pub fn run_test_with_checker_and_env<F: FnMut(&TestPlan, &Output)>(
 /// The search is case-insensitive but the returned name keeps its canonical
 /// spelling: glibc locale names are case-sensitive, so `LC_ALL=c.utf8` is not
 /// recognized and silently falls back to C.
+///
+/// On Windows this is always `C.UTF-8`, without asking `locale -a` (Windows
+/// has no such command, and a `locale.exe` found on `PATH` -- Git Bash's --
+/// lists a different system's locales): plib supports UTF-8 on every Windows
+/// system, and resolves `C.UTF-8` to Unicode characters in UTF-8 with the C
+/// locale's byte-order collation, as glibc does (see
+/// [`crate::diag::init_locale`]).
 pub fn utf8_locale() -> Option<String> {
-    let avail = std::process::Command::new("locale")
-        .arg("-a")
-        .output()
-        .ok()?;
-    let list = String::from_utf8_lossy(&avail.stdout).to_lowercase();
-    for name in ["C.UTF-8", "C.utf8", "en_US.UTF-8", "en_US.utf8"] {
-        if list.contains(&name.to_lowercase()) {
-            return Some(name.to_string());
-        }
+    #[cfg(windows)]
+    {
+        Some("C.UTF-8".to_string())
     }
-    None
+    #[cfg(not(windows))]
+    {
+        installed_locale(&["C.UTF-8", "C.utf8", "en_US.UTF-8", "en_US.utf8"])
+    }
 }
 
 /// Name of an installed locale matching one of `candidates`, or `None`.
 ///
 /// For tests that need a *specific* locale rather than any UTF-8 one — Turkish
 /// for dotless-i case mapping, say — which most hosts do not have installed.
+///
+/// On Windows this is always `None`: plib gives a POSIX locale name meaning
+/// only when it names the C locale (see [`crate::diag::init_locale`]), and
+/// any other name selects the user's own regional locale, not the one named,
+/// so no candidate can be the locale a test asks for.
 pub fn locale_matching(candidates: &[&str]) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let _ = candidates;
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        installed_locale(candidates)
+    }
+}
+
+/// The first of `candidates` that `locale -a` lists, compared without regard
+/// to case, in its own spelling.
+#[cfg(not(windows))]
+fn installed_locale(candidates: &[&str]) -> Option<String> {
     let avail = std::process::Command::new("locale")
         .arg("-a")
         .output()
@@ -372,6 +383,7 @@ pub fn locale_matching(candidates: &[&str]) -> Option<String> {
 /// this short" -- the answer `read_exact` throws away -- from "one `read`
 /// happened to come back early", which is not an answer about the stream at
 /// all.
+#[cfg(any(unix, test))]
 fn read_until_full(r: &mut impl std::io::Read, buf: &mut [u8]) -> usize {
     let mut n = 0;
     while n < buf.len() {
@@ -385,6 +397,7 @@ fn read_until_full(r: &mut impl std::io::Read, buf: &mut [u8]) -> usize {
     n
 }
 
+#[cfg(unix)]
 pub fn assert_dies_by_sigpipe(cmd: &str, args: &[&str]) {
     use std::os::unix::process::ExitStatusExt as _;
 

@@ -13,6 +13,12 @@ libc.workspace = true
 errno.workspace = true
 gettext-rs.workspace = true
 
+# Compiles the vendored musl regex for a Windows target (see build.rs). Not
+# under [target.'cfg(windows)'.build-dependencies]: Cargo matches that against
+# the host, so a Linux host cross-building for Windows would not get it.
+[build-dependencies]
+cc = "1"
+
 [lints]
 workspace = true
 

@@ -522,8 +522,7 @@ fn test_pr_r_still_suppresses_the_named_warning() {
 /// nothing to name; the failing path is the loop variable inside it.
 #[test]
 fn test_pr_merge_error_names_the_file() {
-    let dir = plib::tmp::tempdir().expect("tempdir");
-    let good = dir.path().join("good.txt");
+    let good = std::env::temp_dir().join(format!("posixutils-pr-merge-{}", std::process::id()));
     std::fs::write(&good, "one\ntwo\n").unwrap();
 
     let out = std::process::Command::new(plib::testing::get_binary_path("pr"))
@@ -547,4 +546,5 @@ fn test_pr_merge_error_names_the_file() {
         "the readable operand must not be blamed: {stderr:?}"
     );
     assert_ne!(out.status.code(), Some(0));
+    let _ = std::fs::remove_file(good);
 }

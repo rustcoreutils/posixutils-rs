@@ -7,11 +7,18 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! POSIX Regular Expression support using libc regcomp/regexec.
+//! POSIX Regular Expression support using regcomp/regexec.
 //!
 //! This module provides a safe Rust wrapper around POSIX regex functions,
 //! supporting both Basic Regular Expressions (BRE) and Extended Regular
 //! Expressions (ERE).
+//!
+//! On Unix the functions are the C library's. Windows has none, so there
+//! they are musl's, vendored in `plib/vendor/musl-regex` and compiled by
+//! `plib/build.rs` under `plib_`-prefixed names. Matching is per character
+//! under the C runtime's `LC_CTYPE`, which [`crate::diag::init_locale`] makes
+//! UTF-8 on Windows; `wchar_t` is 16 bits there, so characters above U+FFFF
+//! are not supported.
 //!
 //! # Example
 //!
@@ -27,13 +34,75 @@
 //! assert!(re.is_match("HELLOOO"));
 //! ```
 
-use libc::{
-    regcomp, regex_t, regexec, regfree, regmatch_t, REG_EXTENDED, REG_ICASE, REG_NOMATCH,
+use ffi::{
+    regcomp, regerror, regexec, regfree, RegMatchT, RegexT, REG_EXTENDED, REG_ICASE, REG_NOMATCH,
     REG_NOTBOL,
 };
-use std::ffi::CString;
+use std::ffi::{c_char, c_int, CString};
 use std::io::{Error, ErrorKind};
 use std::ptr;
+
+/// The C library's regex.
+#[cfg(unix)]
+mod ffi {
+    pub use libc::{
+        regcomp, regerror, regex_t as RegexT, regexec, regfree, regmatch_t as RegMatchT,
+        REG_EXTENDED, REG_ICASE, REG_NOMATCH, REG_NOTBOL,
+    };
+}
+
+/// musl's regex, built by `build.rs` under `plib_` names. The layouts and
+/// values mirror `vendor/musl-regex/include/regex.h`, which is musl's own
+/// except that `regoff_t` is `ptrdiff_t`: musl's pointer-sized `_Addr`, which
+/// on 64-bit Windows is not `long` (32 bits there).
+#[cfg(windows)]
+mod ffi {
+    use std::ffi::{c_char, c_int, c_void};
+
+    /// Only ever handled through a pointer by the C side.
+    #[repr(C)]
+    pub struct RegexT {
+        _re_nsub: usize,
+        _opaque: *mut c_void,
+        _padding: [*mut c_void; 4],
+        _nsub2: usize,
+        _padding2: c_char,
+    }
+
+    /// `regoff_t` is `ptrdiff_t`.
+    #[repr(C)]
+    pub struct RegMatchT {
+        pub rm_so: isize,
+        pub rm_eo: isize,
+    }
+
+    pub const REG_EXTENDED: c_int = 1;
+    pub const REG_ICASE: c_int = 2;
+    pub const REG_NOTBOL: c_int = 1;
+    pub const REG_NOMATCH: c_int = 1;
+
+    extern "C" {
+        #[link_name = "plib_regcomp"]
+        pub fn regcomp(preg: *mut RegexT, pattern: *const c_char, cflags: c_int) -> c_int;
+        #[link_name = "plib_regexec"]
+        pub fn regexec(
+            preg: *const RegexT,
+            input: *const c_char,
+            nmatch: usize,
+            pmatch: *mut RegMatchT,
+            eflags: c_int,
+        ) -> c_int;
+        #[link_name = "plib_regfree"]
+        pub fn regfree(preg: *mut RegexT);
+        #[link_name = "plib_regerror"]
+        pub fn regerror(
+            errcode: c_int,
+            preg: *const RegexT,
+            errbuf: *mut c_char,
+            errbuf_size: usize,
+        ) -> usize;
+    }
+}
 
 /// Maximum number of capture groups supported
 pub const MAX_CAPTURES: usize = 10;
@@ -68,8 +137,8 @@ impl RegexFlags {
         self
     }
 
-    /// Convert to libc cflags
-    fn to_cflags(self) -> libc::c_int {
+    /// Convert to regcomp cflags
+    fn to_cflags(self) -> c_int {
         let mut cflags = 0;
         if self.extended {
             cflags |= REG_EXTENDED;
@@ -116,7 +185,7 @@ impl Match {
 
 /// A compiled POSIX regular expression.
 pub struct Regex {
-    raw: regex_t,
+    raw: RegexT,
     /// Original pattern, kept for Clone and Debug. Bytes rather than a String
     /// because POSIX patterns are byte strings.
     pattern: Vec<u8>,
@@ -158,7 +227,7 @@ impl Regex {
         // already does for it.
         if pattern.is_empty() {
             return Ok(Regex {
-                raw: unsafe { std::mem::zeroed::<regex_t>() },
+                raw: unsafe { std::mem::zeroed::<RegexT>() },
                 pattern: Vec::new(),
                 flags,
                 empty: true,
@@ -168,7 +237,7 @@ impl Regex {
         let c_pattern =
             CString::new(pattern).map_err(|e| Error::new(ErrorKind::InvalidInput, e))?;
 
-        let mut raw = unsafe { std::mem::zeroed::<regex_t>() };
+        let mut raw = unsafe { std::mem::zeroed::<RegexT>() };
         let cflags = flags.to_cflags();
 
         let result = unsafe { regcomp(&mut raw, c_pattern.as_ptr(), cflags) };
@@ -232,13 +301,13 @@ impl Regex {
     }
 
     /// Get error message from regcomp failure using regerror.
-    fn get_error_message(errcode: libc::c_int, regex: &regex_t) -> String {
+    fn get_error_message(errcode: c_int, regex: &RegexT) -> String {
         let mut errbuf = [0u8; 256];
         unsafe {
-            libc::regerror(
+            regerror(
                 errcode,
-                regex as *const regex_t,
-                errbuf.as_mut_ptr() as *mut libc::c_char,
+                regex as *const RegexT,
+                errbuf.as_mut_ptr() as *mut c_char,
                 errbuf.len(),
             );
         }
@@ -295,7 +364,7 @@ impl Regex {
         }
         let c_text = CString::new(text).ok()?;
 
-        let mut pmatch = regmatch_t {
+        let mut pmatch = RegMatchT {
             rm_so: -1,
             rm_eo: -1,
         };
@@ -305,7 +374,7 @@ impl Regex {
                 &self.raw,
                 c_text.as_ptr(),
                 1,
-                &mut pmatch as *mut regmatch_t,
+                &mut pmatch as *mut RegMatchT,
                 0,
             )
         };
@@ -333,7 +402,7 @@ impl Regex {
         }
         let c_text = CString::new(text).ok()?;
 
-        let mut pmatch = regmatch_t {
+        let mut pmatch = RegMatchT {
             rm_so: -1,
             rm_eo: -1,
         };
@@ -343,7 +412,7 @@ impl Regex {
                 &self.raw,
                 c_text.as_ptr(),
                 1,
-                &mut pmatch as *mut regmatch_t,
+                &mut pmatch as *mut RegMatchT,
                 REG_NOTBOL,
             )
         };
@@ -385,7 +454,7 @@ impl Regex {
         }
         let c_text = CString::new(text).ok()?;
 
-        let mut pmatch: [regmatch_t; MAX_CAPTURES] = unsafe { std::mem::zeroed() };
+        let mut pmatch: [RegMatchT; MAX_CAPTURES] = unsafe { std::mem::zeroed() };
 
         let result = unsafe {
             regexec(
@@ -447,7 +516,7 @@ impl Regex {
         let substring = &text[offset..];
         let c_text = CString::new(substring).ok()?;
 
-        let mut pmatch: [regmatch_t; MAX_CAPTURES] = unsafe { std::mem::zeroed() };
+        let mut pmatch: [RegMatchT; MAX_CAPTURES] = unsafe { std::mem::zeroed() };
 
         // Past the start of `text`, the substring's first byte is not the
         // beginning of a line, so `^` must not match there.  Without
@@ -860,5 +929,160 @@ mod tests {
     fn test_captures_at_still_matches_eol() {
         let re = Regex::new("$", RegexFlags::bre()).unwrap();
         assert!(re.captures_at("abc", 3).is_some());
+    }
+
+    #[test]
+    fn bre_backreference() {
+        let re = Regex::bre(r"^\(a*\)b\1$").unwrap();
+        let caps = re.captures("aabaa").expect("matches");
+        assert_eq!(caps[0], Match { start: 0, end: 5 });
+        assert_eq!(caps[1], Match { start: 0, end: 2 });
+        assert!(!re.is_match("aaba"));
+
+        let re = Regex::bre(r"\(ab\)\1").unwrap();
+        assert_eq!(re.find("xxabab"), Some(Match { start: 2, end: 6 }));
+        assert!(!re.is_match("abba"));
+    }
+
+    /// POSIX picks the longest of the leftmost matches, not the first
+    /// alternative that matches.
+    #[test]
+    fn leftmost_longest() {
+        let re = Regex::ere("a|ab").unwrap();
+        assert_eq!(re.find("xabc"), Some(Match { start: 1, end: 3 }));
+
+        let re = Regex::ere("(a|ab)(c|bcd)").unwrap();
+        assert_eq!(re.find("abcd"), Some(Match { start: 0, end: 4 }));
+
+        let re = Regex::bre("x*").unwrap();
+        assert_eq!(re.find("xxxy"), Some(Match { start: 0, end: 3 }));
+    }
+
+    #[test]
+    fn bracket_classes() {
+        let re = Regex::ere("[[:digit:]]+").unwrap();
+        assert_eq!(re.find("ab123c"), Some(Match { start: 2, end: 5 }));
+
+        let re = Regex::ere("[[:alpha:]][[:alnum:]_]*").unwrap();
+        assert_eq!(re.find("12 foo_9 x"), Some(Match { start: 3, end: 8 }));
+
+        let re = Regex::ere("[[:upper:]][[:lower:]]+").unwrap();
+        assert_eq!(re.find("abc Def"), Some(Match { start: 4, end: 7 }));
+
+        // blank is space and tab, and not newline.
+        let re = Regex::ere("a[[:blank:]]b").unwrap();
+        assert!(re.is_match("a b"));
+        assert!(re.is_match("a\tb"));
+        assert!(!re.is_match("a\nb"));
+
+        let re = Regex::ere("[^[:space:]]+").unwrap();
+        assert_eq!(re.find(" \t xy z"), Some(Match { start: 3, end: 5 }));
+
+        let re = Regex::bre("[[:punct:]]").unwrap();
+        assert_eq!(re.find("ab,c"), Some(Match { start: 2, end: 3 }));
+
+        assert!(Regex::bre("[[:nosuchclass:]]").is_err());
+    }
+
+    #[test]
+    fn ignore_case_ranges_and_backreferences() {
+        let re = Regex::new("[a-c]x", RegexFlags::bre().ignore_case()).unwrap();
+        assert_eq!(re.find("zBX"), Some(Match { start: 1, end: 3 }));
+
+        // The group itself ignores case. Whether the back-reference then
+        // matches its text in another case differs: glibc's does, musl's
+        // (Windows) compares bytes.
+        let re = Regex::new(r"\(ab\)\1", RegexFlags::bre().ignore_case()).unwrap();
+        assert!(re.is_match("ABAB"));
+        assert!(re.is_match("xAbAb"));
+    }
+
+    #[test]
+    fn notbol_suppresses_caret_only() {
+        let re = Regex::bre("^a").unwrap();
+        assert_eq!(re.find("abc"), Some(Match { start: 0, end: 1 }));
+        assert_eq!(re.find_notbol("abc"), None);
+
+        let re = Regex::bre("a").unwrap();
+        assert_eq!(re.find_notbol("abc"), Some(Match { start: 0, end: 1 }));
+
+        let re = Regex::bre("c$").unwrap();
+        assert_eq!(re.find_notbol("abc"), Some(Match { start: 2, end: 3 }));
+    }
+
+    /// Restores `LC_CTYPE` when dropped, so a failing assertion cannot leave
+    /// the process in another locale for the tests after it.
+    struct CtypeRestore(Vec<u8>);
+
+    impl Drop for CtypeRestore {
+        fn drop(&mut self) {
+            gettextrs::setlocale(gettextrs::LocaleCategory::LcCType, self.0.clone());
+        }
+    }
+
+    /// Switch `LC_CTYPE` to UTF-8 until the result is dropped. `None` when the
+    /// C runtime has no UTF-8 locale: a Unix host may have none installed,
+    /// and the msvcrt that the Windows `-gnu` targets link (as under Wine)
+    /// has none at all. The UCRT of an MSVC build always has one.
+    fn utf8_ctype() -> Option<CtypeRestore> {
+        use gettextrs::{setlocale, LocaleCategory};
+        const NAMES: &[&str] = if cfg!(windows) {
+            &[".UTF-8"]
+        } else {
+            &["C.UTF-8", "C.utf8", "en_US.UTF-8", "en_US.utf8"]
+        };
+        // SAFETY: a null locale only queries; the returned string is copied
+        // before the next setlocale call can invalidate it.
+        let saved = unsafe {
+            let p = libc::setlocale(libc::LC_CTYPE, ptr::null());
+            assert!(!p.is_null(), "LC_CTYPE has a name");
+            std::ffi::CStr::from_ptr(p).to_bytes().to_vec()
+        };
+        let restore = CtypeRestore(saved);
+        let found = NAMES
+            .iter()
+            .any(|name| setlocale(LocaleCategory::LcCType, *name).is_some());
+        #[cfg(target_env = "msvc")]
+        assert!(found, "the UCRT accepts setlocale(LC_CTYPE, \".UTF-8\")");
+        found.then_some(restore)
+    }
+
+    /// Under a UTF-8 `LC_CTYPE` a multibyte character is one character to the
+    /// pattern, and offsets are still bytes.
+    #[test]
+    fn utf8_multibyte_pattern() {
+        let _guard = crate::locale_test_lock();
+        let Some(_ctype) = utf8_ctype() else {
+            return;
+        };
+
+        // "é" is two bytes but one character, so `.` takes all of it.
+        let re = Regex::bre("^.$").unwrap();
+        assert!(re.is_match("é"));
+        let re = Regex::bre("^..$").unwrap();
+        assert!(!re.is_match("é"));
+
+        let re = Regex::ere("é+").unwrap();
+        assert_eq!(re.find("xééy"), Some(Match { start: 1, end: 5 }));
+
+        let re = Regex::ere("[àé]x").unwrap();
+        assert_eq!(re.find("aàx"), Some(Match { start: 1, end: 4 }));
+
+        let re = Regex::ere("[^é]").unwrap();
+        assert_eq!(re.find("éa"), Some(Match { start: 2, end: 3 }));
+
+        // Back-references after a multibyte character: musl's backtracking
+        // matcher took every character to be one byte here, which the vendored
+        // copy fixes (see vendor/musl-regex/README.md). Apple's libc regex
+        // comes from the same TRE code and still has the flaw, and on macOS
+        // plib uses the system engine, so these hold everywhere but there.
+        if cfg!(not(target_vendor = "apple")) {
+            let re = Regex::bre(r"\(ü\)\1").unwrap();
+            assert_eq!(re.find("aüü"), Some(Match { start: 1, end: 5 }));
+            let re = Regex::bre(r"\(a\)\1").unwrap();
+            assert_eq!(re.find("üaa"), Some(Match { start: 2, end: 4 }));
+            let re = Regex::bre(r"\(.\)\1").unwrap();
+            assert_eq!(re.find("xéüü"), Some(Match { start: 3, end: 7 }));
+        }
     }
 }

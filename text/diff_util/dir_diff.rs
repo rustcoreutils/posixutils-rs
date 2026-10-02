@@ -11,7 +11,6 @@ use std::{
     collections::HashSet,
     ffi::OsString,
     fs, io,
-    os::unix::fs::{FileTypeExt, MetadataExt},
     path::{Path, PathBuf},
 };
 
@@ -21,6 +20,52 @@ use crate::diff_util::{
 };
 
 use super::{common::FormatOptions, dir_data::DirData};
+
+/// What identifies a directory for loop detection: (device, inode) on Unix.
+#[cfg(unix)]
+type DirId = (u64, u64);
+
+/// Stable Rust does not expose a Windows file's volume serial number and file
+/// index, so a directory is identified by its canonical path instead:
+/// canonicalizing resolves symlinks and junctions to the directory they reach,
+/// and Windows has no hard links to directories, so the path is unique.
+#[cfg(windows)]
+type DirId = PathBuf;
+
+/// The identity of the directory `path` resolves to.
+#[cfg(unix)]
+fn dir_id(path: &Path) -> io::Result<DirId> {
+    use std::os::unix::fs::MetadataExt;
+    let md = fs::metadata(path)?;
+    Ok((md.dev(), md.ino()))
+}
+
+#[cfg(windows)]
+fn dir_id(path: &Path) -> io::Result<DirId> {
+    fs::canonicalize(path)
+}
+
+/// What kind of special file `file_type` (neither a regular file nor a
+/// directory) is, as diff names it.
+#[cfg(unix)]
+fn special_kind(file_type: fs::FileType) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    if file_type.is_fifo() {
+        "fifo"
+    } else if file_type.is_block_device() {
+        "block special file"
+    } else if file_type.is_char_device() {
+        "character special file"
+    } else {
+        "special file"
+    }
+}
+
+/// Windows has no FIFOs or device files in the file system.
+#[cfg(windows)]
+fn special_kind(_file_type: fs::FileType) -> &'static str {
+    "special file"
+}
 
 /// A path as it appears in output.
 fn display(path: &Path) -> String {
@@ -104,13 +149,13 @@ impl<'a> DirDiff<'a> {
         format_options: &FormatOptions,
         recursive: bool,
         options: &[String],
-        visited: &mut HashSet<(u64, u64)>,
+        visited: &mut HashSet<DirId>,
     ) -> DiffExitStatus {
         // The two operands themselves go in before anything descends, so a
         // link back to either of them is caught as a loop.
         for path in [&path1, &path2] {
-            if let Ok(md) = fs::metadata(path) {
-                visited.insert((md.dev(), md.ino()));
+            if let Ok(id) = dir_id(path) {
+                visited.insert(id);
             }
         }
 
@@ -141,31 +186,23 @@ impl<'a> DirDiff<'a> {
     /// out, so it describes the current path rather than everything ever seen
     /// -- two sibling links to one directory are now both compared instead of
     /// the second silently disappearing.
-    fn descend(
-        &self,
-        path1: &Path,
-        path2: &Path,
-        visited: &mut HashSet<(u64, u64)>,
-    ) -> DiffExitStatus {
+    fn descend(&self, path1: &Path, path2: &Path, visited: &mut HashSet<DirId>) -> DiffExitStatus {
         let mut ids = Vec::new();
         for path in [path1, path2] {
-            let md = match fs::metadata(path) {
-                Ok(md) => md,
+            let id = match dir_id(path) {
+                Ok(id) => id,
                 Err(e) => {
                     Self::report(&io_error_at(path, e));
                     return DiffExitStatus::Trouble;
                 }
             };
-            let id = (md.dev(), md.ino());
             if visited.contains(&id) {
                 eprintln!("diff: {}: recursive directory loop", display(path));
                 return DiffExitStatus::Trouble;
             }
             ids.push(id);
         }
-        for id in &ids {
-            visited.insert(*id);
-        }
+        visited.extend(ids.iter().cloned());
 
         let result = Self::dir_diff_inner(
             path1.to_path_buf(),
@@ -217,19 +254,11 @@ impl<'a> DirDiff<'a> {
         } else if file_type.is_file() {
             EntryKind::File
         } else {
-            EntryKind::Special(if file_type.is_fifo() {
-                "fifo"
-            } else if file_type.is_block_device() {
-                "block special file"
-            } else if file_type.is_char_device() {
-                "character special file"
-            } else {
-                "special file"
-            })
+            EntryKind::Special(special_kind(file_type))
         })
     }
 
-    fn analyze(&mut self, visited: &mut HashSet<(u64, u64)>) -> DiffExitStatus {
+    fn analyze(&mut self, visited: &mut HashSet<DirId>) -> DiffExitStatus {
         let mut exit_status = DiffExitStatus::NotDifferent;
 
         let mut dir1_files_name = self.dir1.files().keys().collect::<Vec<&OsString>>();

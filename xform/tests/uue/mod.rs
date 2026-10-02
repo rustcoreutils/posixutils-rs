@@ -11,15 +11,22 @@ use plib::testing::{run_test, run_test_base, TestPlan};
 use std::{
     fs::{File, Permissions},
     io::Read,
-    os::unix::fs::PermissionsExt,
     path::PathBuf,
 };
 
 const RWX: u32 = 0o7;
 const UUCODE_PERMISSION_PLACEHOLDER: &str = "#PERM#";
 
+/// The header digits uuencode writes for a file with `perm`: its mode on
+/// Unix, its read-only attribute as the owner-write bit on Windows.
 fn get_permission_values(perm: Permissions) -> String {
-    let perm_mode = perm.mode();
+    #[cfg(unix)]
+    let perm_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        perm.mode()
+    };
+    #[cfg(windows)]
+    let perm_mode: u32 = if perm.readonly() { 0o444 } else { 0o644 };
 
     let others_perm = perm_mode & RWX;
     let group_perm = (perm_mode >> 3) & RWX;
@@ -338,8 +345,33 @@ fn unique_tmp(name: &str) -> PathBuf {
     p
 }
 
+/// Whether write permission checks are bypassed, as they are for root.
+/// Windows has no such account for a read-only attribute.
 fn running_as_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() == 0 }
+    }
+    #[cfg(windows)]
+    {
+        false
+    }
+}
+
+/// Make `path` read-only, or writable again so it can be removed (a
+/// read-only file cannot be deleted under Wine or on older Windows).
+fn set_read_only(path: &std::path::Path, read_only: bool) {
+    let mut perm = std::fs::metadata(path).unwrap().permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        perm.set_mode(if read_only { 0o444 } else { 0o644 });
+    }
+    #[cfg(windows)]
+    {
+        perm.set_readonly(read_only);
+    }
+    std::fs::set_permissions(path, perm).unwrap();
 }
 
 #[test]
@@ -428,9 +460,7 @@ fn uudecode_readonly_target_errors() {
     }
     let target = unique_tmp("readonly.txt");
     std::fs::write(&target, b"KEEP").unwrap();
-    let mut perm = std::fs::metadata(&target).unwrap().permissions();
-    perm.set_mode(0o444);
-    std::fs::set_permissions(&target, perm).unwrap();
+    set_read_only(&target, true);
 
     let output = run_test_base(
         &String::from("uudecode"),
@@ -439,9 +469,7 @@ fn uudecode_readonly_target_errors() {
     );
 
     // Restore perms so cleanup can remove it.
-    let mut perm = std::fs::metadata(&target).unwrap().permissions();
-    perm.set_mode(0o644);
-    let _ = std::fs::set_permissions(&target, perm);
+    set_read_only(&target, false);
     let content = std::fs::read(&target).unwrap();
     let _ = std::fs::remove_file(&target);
 

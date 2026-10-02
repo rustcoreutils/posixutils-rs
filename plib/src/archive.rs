@@ -157,7 +157,7 @@ impl NameTable {
         w.write_all(&pad_metadata_field::<10>(&self.table.len().to_string())?)?;
         w.write_all(TERMINATOR)?;
         w.write_all(&self.table)?;
-        if self.table.len() % 2 != 0 {
+        if !self.table.len().is_multiple_of(2) {
             w.write_all(b"\n")?;
         }
         Ok(())
@@ -227,7 +227,7 @@ pub fn write_sysv_symtab<W: Write>(
 
     let mut table_size = (4 + symbol_count * 4 + symbol_bytes) as u32;
     // 2-byte alignment for the member payload.
-    if table_size % 2 != 0 {
+    if !table_size.is_multiple_of(2) {
         table_size += 1;
     }
 

@@ -127,7 +127,7 @@ pub(crate) fn block_chunks(bytes: i64) -> impl Iterator<Item = (i64, Chunk)> {
 /// when the object ends a page.
 pub(crate) fn overlapping_halves(bits: u32) -> Option<(i64, i64)> {
     let bytes = i64::from(bits / 8);
-    if bits % 8 != 0 || bytes == 0 || bytes > 8 || bytes.count_ones() == 1 {
+    if !bits.is_multiple_of(8) || bytes == 0 || bytes > 8 || bytes.count_ones() == 1 {
         return None;
     }
     let width = 1i64 << (63 - bytes.leading_zeros() as i64);

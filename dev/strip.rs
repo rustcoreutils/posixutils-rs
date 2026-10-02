@@ -246,7 +246,7 @@ fn write_member(
     )?)?;
     w.write_all(plib::archive::TERMINATOR)?;
     w.write_all(&m.data)?;
-    if m.data.len() % 2 != 0 {
+    if !m.data.len().is_multiple_of(2) {
         w.write_all(b"\n")?;
     }
     Ok(())

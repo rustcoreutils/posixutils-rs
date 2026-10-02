@@ -11,6 +11,7 @@
 
 use super::types::{FilePatch, Hunk, LineOp, PatchConfig, PatchError};
 use gettextrs::gettext;
+use plib::io::{open_terminal_input, open_terminal_output};
 use std::{
     collections::HashSet,
     fs::{self, File, OpenOptions},
@@ -97,9 +98,18 @@ pub fn determine_target_file(
 /// patch in; applying it would let a downloaded patch write anywhere the user
 /// can. Refuse those. A name the user supplied -- the `file` operand or `-o` --
 /// is their own instruction and is not subject to this.
+///
+/// "Absolute" is any name with a root or a prefix. On Unix that is exactly
+/// `is_absolute`; on Windows `/etc/passwd` (rooted on the current drive) and
+/// `C:file` (relative to that drive's own current directory) are not
+/// `is_absolute`, yet reach outside the directory just the same.
 fn is_safe_patch_path(path: &str) -> bool {
-    let path = Path::new(path);
-    !path.is_absolute() && !path.components().any(|c| c == Component::ParentDir)
+    !Path::new(path).components().any(|c| {
+        matches!(
+            c,
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir
+        )
+    })
 }
 
 /// Report a refused file name, in the same terms GNU patch uses.
@@ -111,17 +121,14 @@ fn warn_dangerous_name(name: &str) {
     );
 }
 
-/// Prompt on the controlling terminal (/dev/tty) for a filename to patch.
-/// Returns None if /dev/tty cannot be opened or nothing was read.
-fn prompt_for_filename() -> Option<String> {
-    let mut tty = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .ok()?;
-    write!(tty, "File to patch: ").ok()?;
+/// Write `prompt` to the controlling terminal (/dev/tty; the console on
+/// Windows) and read one line of answer from it. Returns None if the terminal
+/// cannot be opened or nothing was read.
+fn ask_terminal(prompt: &str) -> Option<String> {
+    let mut tty = open_terminal_output().ok()?;
+    write!(tty, "{}", prompt).ok()?;
     tty.flush().ok()?;
-    let mut reader = io::BufReader::new(tty);
+    let mut reader = io::BufReader::new(open_terminal_input().ok()?);
     let mut line = String::new();
     let n = reader.read_line(&mut line).ok()?;
     if n == 0 {
@@ -130,23 +137,17 @@ fn prompt_for_filename() -> Option<String> {
     Some(line)
 }
 
-/// Prompt a yes/no question on the controlling terminal (/dev/tty).
+/// Prompt on the controlling terminal for a filename to patch.
+/// Returns None if the terminal cannot be opened or nothing was read.
+fn prompt_for_filename() -> Option<String> {
+    ask_terminal("File to patch: ")
+}
+
+/// Prompt a yes/no question on the controlling terminal.
 /// Returns Some(true) for an affirmative (or empty/default) answer, Some(false)
-/// for a negative answer, or None if /dev/tty is unavailable.
+/// for a negative answer, or None if the terminal is unavailable.
 pub fn prompt_yes_no(prompt: &str) -> Option<bool> {
-    let mut tty = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .ok()?;
-    write!(tty, "{}", prompt).ok()?;
-    tty.flush().ok()?;
-    let mut reader = io::BufReader::new(tty);
-    let mut line = String::new();
-    let n = reader.read_line(&mut line).ok()?;
-    if n == 0 {
-        return None;
-    }
+    let line = ask_terminal(prompt)?;
     let answer = line.trim();
     // Default (empty) answer is affirmative, matching the "[y]" prompt; a
     // non-empty answer is matched against the locale's YESEXPR.

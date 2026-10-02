@@ -150,7 +150,7 @@ fn write_terminfo(
     push(table.len() as i16, &mut out);
     out.extend_from_slice(names.as_bytes());
     out.extend_from_slice(&bools);
-    if (names.len() + bools.len()) % 2 != 0 {
+    if !(names.len() + bools.len()).is_multiple_of(2) {
         out.push(0);
     }
     for n in &numbers {

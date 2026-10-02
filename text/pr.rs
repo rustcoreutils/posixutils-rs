@@ -11,13 +11,13 @@ mod pr_util;
 
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use chrono::{DateTime, Local};
 use gettextrs::gettext;
-use plib::io::input_stream;
+use plib::io::{input_stream, open_terminal_input};
 
 use self::pr_util::{line_transform, Args, PageIterator, Parameters};
 
@@ -73,19 +73,17 @@ fn pause() -> io::Result<()> {
     // the process merely *had* a controlling terminal — which is every script
     // run from a shell. The alert is part of the pause, so it is not written
     // either.
-    //
-    // SAFETY: isatty is thread-safe and side-effect-free on any fd number.
-    if unsafe { libc::isatty(libc::STDOUT_FILENO) } != 1 {
+    if !io::stdout().is_terminal() {
         return Ok(());
     }
 
     // Must print \a to stderr.
     eprint!("{ALERT}");
 
-    // Read the response from the controlling terminal, never from stdin. If
-    // /dev/tty cannot be opened (e.g. no controlling terminal), skip the pause
-    // gracefully rather than aborting.
-    let tty = match fs::File::open("/dev/tty") {
+    // Read the response from the controlling terminal (the console on
+    // Windows), never from stdin. If it cannot be opened (e.g. no controlling
+    // terminal), skip the pause gracefully rather than aborting.
+    let tty = match open_terminal_input() {
         Ok(f) => f,
         Err(_) => return Ok(()),
     };
@@ -114,7 +112,8 @@ fn pause() -> io::Result<()> {
 /// flush all accumulated error messages to the screen before terminating."
 /// We flush any buffered output streams, restore the default disposition, and
 /// re-raise so the process dies from the signal (and the parent observes a
-/// signal death).
+/// signal death). The Windows C runtime has the same `signal`, `raise` and
+/// `fflush`, and runs a console Ctrl-C through this handler too.
 extern "C" fn handle_sigint(signal_code: libc::c_int) {
     unsafe {
         // Flush all open stdio output streams so any pending diagnostic
@@ -128,8 +127,7 @@ extern "C" fn handle_sigint(signal_code: libc::c_int) {
 /// Install the SIGINT handler only when writing to a terminal; otherwise the
 /// default disposition (terminate) already applies.
 fn install_sigint_handler() {
-    let stdout_is_terminal = unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 };
-    if stdout_is_terminal {
+    if io::stdout().is_terminal() {
         unsafe {
             libc::signal(
                 libc::SIGINT,

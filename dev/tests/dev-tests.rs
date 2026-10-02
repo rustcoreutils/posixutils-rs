@@ -697,7 +697,7 @@ fn test_strip_rejects_bsd_variant_archive() {
     // inline, immediately after the header, and counts it in the size field.
     let name = b"a_long_bsd_member_name.o";
     let mut padded_name = name.to_vec();
-    while padded_name.len() % 8 != 0 {
+    while !padded_name.len().is_multiple_of(8) {
         padded_name.push(0);
     }
     let payload = b"\x7fELF fake object payload";

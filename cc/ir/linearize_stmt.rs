@@ -17,8 +17,8 @@ use crate::constexpr::ConstScope;
 use crate::diag::{error, Position};
 use crate::float::FloatVal;
 use crate::parse::ast::{
-    AsmOperand, BinaryOp, BlockItem, Declaration, Expr, ExprKind, ForInit, InitElement, Stmt,
-    UnaryOp,
+    AsmOperand, BinaryOp, BlockItem, Declaration, Expr, ExprKind, ForInit, InitElement, Label,
+    Stmt, UnaryOp,
 };
 use crate::strings::StringId;
 use crate::symbol::SymbolId;
@@ -371,23 +371,23 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.current_bb = None;
             }
 
-            Stmt::Label { name, stmt, .. } => {
-                self.place_label(*name);
+            Stmt::Labeled { labels, stmt } => {
+                // A `case` or `default` label is placed by `linearize_switch`;
+                // reaching one here means it is outside a switch, which
+                // `check_jumps_into_protected_scopes` has already diagnosed.
+                // The statement it labels is still ordinary code and is
+                // lowered, so the rest of the function is not lost behind one
+                // bad label.
+                for label in labels {
+                    if let Label::Named { name, .. } = label {
+                        self.place_label(*name);
+                    }
+                }
                 self.linearize_stmt(stmt);
             }
 
             Stmt::Switch { expr, body } => {
                 self.linearize_switch(expr, body);
-            }
-
-            Stmt::Case(_, _, body) | Stmt::Default(_, body) => {
-                // The label itself is placed by `linearize_switch`; reaching
-                // one here means it is outside a switch, which
-                // `check_jumps_into_protected_scopes` has already
-                // diagnosed. The statement it labels is still ordinary code
-                // and is lowered, so the rest of the function is not lost
-                // behind one bad label.
-                self.linearize_stmt(body);
             }
 
             Stmt::Asm {
@@ -2120,6 +2120,89 @@ impl<'a> super::linearize::Linearizer<'a> {
         converted
     }
 
+    /// Record one `case` label's value, or range, for its switch.
+    fn collect_case_label(&self, expr: &Expr, high: Option<&Expr>, case_values: &mut CaseSet) {
+        // Extract constant value from case expression
+        let Some(raw_lo) = self.eval_const_expr(expr) else {
+            self.report_unfoldable_case(expr);
+            return;
+        };
+        // A GNU range `case lo ... hi:`. An absent high endpoint is
+        // the ordinary label, held as the degenerate range `(v, v)` so
+        // that everything downstream has one shape.
+        let raw_hi = match high {
+            None => Some(raw_lo),
+            Some(hi_expr) => match self.eval_const_expr(hi_expr) {
+                Some(h) => Some(h),
+                None => {
+                    self.report_unfoldable_case(hi_expr);
+                    None
+                }
+            },
+        };
+        let Some(raw_hi) = raw_hi else { return };
+
+        // C17 6.8.4.2p5: each case constant is converted to the
+        // promoted type of the controlling expression. Evaluating the
+        // label at full width and never converting it left c17's two
+        // lowerings disagreeing about the same switch -- a runtime
+        // selector kept the unconverted label in the `switch`
+        // instruction, where the backend truncated it, while the
+        // constant-selector path compared at 128 bits and did not
+        // match at all. `case 4294967296LL:` in an `int` switch is
+        // `case 0:`, and has to be that for both.
+        let conv = case_values.conv();
+        let lo = self.convert_case_label(expr, raw_lo, conv);
+        let hi = match high {
+            None => lo,
+            Some(hi_expr) => self.convert_case_label(hi_expr, raw_hi, conv),
+        };
+
+        // 6.8.4.2p3 forbids two equal case constants, and GCC
+        // extends that to overlapping ranges -- an overlap would
+        // otherwise make one arm silently unreachable, since the
+        // body walk resolves a label by finding the first match.
+        // Both tests run on the converted values, since that is what
+        // "equal" means once p5 has been applied: `case 0:` beside
+        // `case 4294967296LL:` in an `int` switch is one value twice.
+        //
+        // Order by the switch type's own signedness. The endpoints are
+        // carried as `i128`, and an unsigned 64-bit bound above
+        // `i64::MAX` is still positive there -- but an unsigned
+        // *128-bit* one is not, so the reinterpretation is still
+        // needed: `case 0ul ... ULONG_MAX:` read as an empty range and
+        // never matched.
+        if conv.lt(hi, lo) {
+            // GCC accepts an empty range, warns, and never matches
+            // it. Nothing is recorded, so nothing can overlap it.
+            crate::diag::warning(expr.pos, "empty range specified");
+            return;
+        }
+        if let Some((lo2, hi2)) = case_values.overlap(lo, hi) {
+            let what = if lo == hi && lo2 == hi2 {
+                format!("duplicate case value '{}' in switch", lo)
+            } else {
+                format!(
+                    "duplicate (or overlapping) case value: {}..{} overlaps {}..{}",
+                    lo, hi, lo2, hi2
+                )
+            };
+            error(expr.pos, &what);
+        }
+        case_values.insert(lo, hi);
+    }
+
+    fn collect_default_label(&self, has_default: &mut bool) {
+        // C99 6.8.4.2p3: at most one default label per switch.
+        if *has_default {
+            error(
+                self.current_pos.unwrap_or_default(),
+                "multiple default labels in one switch",
+            );
+        }
+        *has_default = true;
+    }
+
     pub(crate) fn collect_cases_from_stmt(
         &self,
         stmt: &Stmt,
@@ -2127,90 +2210,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         has_default: &mut bool,
     ) {
         match stmt {
-            Stmt::Case(expr, high, body) => {
-                self.collect_cases_from_stmt(body, case_values, has_default);
-                // Extract constant value from case expression
-                let Some(raw_lo) = self.eval_const_expr(expr) else {
-                    self.report_unfoldable_case(expr);
-                    return;
-                };
-                // A GNU range `case lo ... hi:`. An absent high endpoint is
-                // the ordinary label, held as the degenerate range `(v, v)` so
-                // that everything downstream has one shape.
-                let raw_hi = match high {
-                    None => Some(raw_lo),
-                    Some(hi_expr) => match self.eval_const_expr(hi_expr) {
-                        Some(h) => Some(h),
-                        None => {
-                            self.report_unfoldable_case(hi_expr);
-                            None
+            Stmt::Labeled { labels, stmt } => {
+                for label in labels {
+                    match label {
+                        Label::Case(expr, high) => {
+                            self.collect_case_label(expr, high.as_ref(), case_values)
                         }
-                    },
-                };
-                let Some(raw_hi) = raw_hi else { return };
-
-                // C17 6.8.4.2p5: each case constant is converted to the
-                // promoted type of the controlling expression. Evaluating the
-                // label at full width and never converting it left c17's two
-                // lowerings disagreeing about the same switch -- a runtime
-                // selector kept the unconverted label in the `switch`
-                // instruction, where the backend truncated it, while the
-                // constant-selector path compared at 128 bits and did not
-                // match at all. `case 4294967296LL:` in an `int` switch is
-                // `case 0:`, and has to be that for both.
-                let conv = case_values.conv();
-                let lo = self.convert_case_label(expr, raw_lo, conv);
-                let hi = match high {
-                    None => lo,
-                    Some(hi_expr) => self.convert_case_label(hi_expr, raw_hi, conv),
-                };
-
-                // 6.8.4.2p3 forbids two equal case constants, and GCC
-                // extends that to overlapping ranges -- an overlap would
-                // otherwise make one arm silently unreachable, since the
-                // body walk resolves a label by finding the first match.
-                // Both tests run on the converted values, since that is what
-                // "equal" means once p5 has been applied: `case 0:` beside
-                // `case 4294967296LL:` in an `int` switch is one value twice.
-                //
-                // Order by the switch type's own signedness. The endpoints are
-                // carried as `i128`, and an unsigned 64-bit bound above
-                // `i64::MAX` is still positive there -- but an unsigned
-                // *128-bit* one is not, so the reinterpretation is still
-                // needed: `case 0ul ... ULONG_MAX:` read as an empty range and
-                // never matched.
-                if conv.lt(hi, lo) {
-                    // GCC accepts an empty range, warns, and never matches
-                    // it. Nothing is recorded, so nothing can overlap it.
-                    crate::diag::warning(expr.pos, "empty range specified");
-                    return;
+                        Label::Default(_) => self.collect_default_label(has_default),
+                        Label::Named { .. } => {}
+                    }
                 }
-                if let Some((lo2, hi2)) = case_values.overlap(lo, hi) {
-                    let what = if lo == hi && lo2 == hi2 {
-                        format!("duplicate case value '{}' in switch", lo)
-                    } else {
-                        format!(
-                            "duplicate (or overlapping) case value: {}..{} overlaps {}..{}",
-                            lo, hi, lo2, hi2
-                        )
-                    };
-                    error(expr.pos, &what);
-                }
-                case_values.insert(lo, hi);
-            }
-            Stmt::Default(_, body) => {
-                self.collect_cases_from_stmt(body, case_values, has_default);
-                // C99 6.8.4.2p3: at most one default label per switch.
-                if *has_default {
-                    error(
-                        self.current_pos.unwrap_or_default(),
-                        "multiple default labels in one switch",
-                    );
-                }
-                *has_default = true;
-            }
-            // Recursively check labeled statements
-            Stmt::Label { stmt, .. } => {
                 self.collect_cases_from_stmt(stmt, case_values, has_default);
             }
             // Recurse into nested statements for Duff's device pattern
@@ -2773,6 +2782,47 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
+    /// Start the block of the `case` label `expr` (or `expr ... high`).
+    ///
+    /// The endpoints are the label's raw constants; `CaseIndex::lookup`
+    /// converts them to the promoted controlling type with the very
+    /// conversion the collector used, which is what keeps this lookup from
+    /// missing and dropping the case body into the wrong block.
+    fn enter_case_label(
+        &mut self,
+        expr: &Expr,
+        high: Option<&Expr>,
+        case_values: &CaseIndex,
+        case_bbs: &[BasicBlockId],
+        case_idx: &mut usize,
+    ) {
+        let Some(lo) = self.eval_const_expr(expr) else {
+            return;
+        };
+        let hi = match high {
+            None => Some(lo),
+            Some(hi_expr) => self.eval_const_expr(hi_expr),
+        };
+        let Some(idx) = hi.and_then(|hi| case_values.lookup(lo, hi)) else {
+            return;
+        };
+        self.fall_into_case_block(case_bbs[idx]);
+        *case_idx = idx + 1;
+    }
+
+    /// Make `bb`, a `case` or `default` label's block, current, falling
+    /// through into it from the code before the label if that code does not
+    /// already end in a jump.
+    fn fall_into_case_block(&mut self, bb: BasicBlockId) {
+        if !self.is_terminated() {
+            if let Some(current) = self.current_bb {
+                self.emit(Instruction::br(bb));
+                self.link_bb(current, bb);
+            }
+        }
+        self.switch_bb(bb);
+    }
+
     pub(crate) fn linearize_switch_stmt(
         &mut self,
         stmt: &Stmt,
@@ -2782,50 +2832,27 @@ impl<'a> super::linearize::Linearizer<'a> {
         case_idx: &mut usize,
     ) {
         match stmt {
-            Stmt::Case(expr, high, body) => {
-                // Find the matching case block. The endpoints are the label's
-                // raw constants; `CaseIndex::lookup` converts them to the
-                // promoted controlling type with the very conversion the
-                // collector used, which is what keeps this lookup from missing
-                // and dropping the case body into the wrong block.
-                if let Some(lo) = self.eval_const_expr(expr) {
-                    let hi = match high {
-                        None => Some(lo),
-                        Some(hi_expr) => self.eval_const_expr(hi_expr),
-                    };
-                    let Some(hi) = hi else { return };
-                    if let Some(idx) = case_values.lookup(lo, hi) {
-                        let case_bb = case_bbs[idx];
-
-                        // Fall through from previous case if not terminated
-                        if !self.is_terminated() {
-                            if let Some(current) = self.current_bb {
-                                self.emit(Instruction::br(case_bb));
-                                self.link_bb(current, case_bb);
+            Stmt::Labeled { labels, stmt } => {
+                for label in labels {
+                    match label {
+                        Label::Case(expr, high) => self.enter_case_label(
+                            expr,
+                            high.as_ref(),
+                            case_values,
+                            case_bbs,
+                            case_idx,
+                        ),
+                        Label::Default(_) => {
+                            if let Some(def_bb) = default_bb {
+                                self.fall_into_case_block(def_bb);
                             }
                         }
-
-                        self.switch_bb(case_bb);
-                        *case_idx = idx + 1;
+                        Label::Named { name, .. } => self.place_label(*name),
                     }
                 }
-                // Then the statement the label prefixes, which is where its
+                // Then the statement the labels prefix, which is where their
                 // code actually is.
-                self.linearize_switch_stmt(body, case_values, case_bbs, default_bb, case_idx);
-            }
-            Stmt::Default(_, body) => {
-                if let Some(def_bb) = default_bb {
-                    // Fall through from previous case if not terminated
-                    if !self.is_terminated() {
-                        if let Some(current) = self.current_bb {
-                            self.emit(Instruction::br(def_bb));
-                            self.link_bb(current, def_bb);
-                        }
-                    }
-
-                    self.switch_bb(def_bb);
-                }
-                self.linearize_switch_stmt(body, case_values, case_bbs, default_bb, case_idx);
+                self.linearize_switch_stmt(stmt, case_values, case_bbs, default_bb, case_idx);
             }
 
             // Duff's device: case labels can appear inside loops/blocks
@@ -2956,11 +2983,6 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
 
                 self.switch_bb(merge_bb);
-            }
-
-            Stmt::Label { name, stmt, .. } => {
-                self.place_label(*name);
-                self.linearize_switch_stmt(stmt, case_values, case_bbs, default_bb, case_idx);
             }
 
             // Inner switch owns its own cases — delegate to normal linearizer
@@ -3878,8 +3900,22 @@ impl JumpScopeWalk {
         match stmt {
             Stmt::Block(items) => self.walk_items(items, switch_scopes),
 
-            Stmt::Label { name, stmt, pos } => {
-                self.labels.push((*name, self.open.clone(), *pos));
+            Stmt::Labeled { labels, stmt } => {
+                for label in labels {
+                    match label {
+                        Label::Named { name, pos } => {
+                            self.labels.push((*name, self.open.clone(), *pos));
+                        }
+                        Label::Case(low, high) => {
+                            self.walk_case(low.pos, "case", switch_scopes);
+                            self.walk_expr(low, switch_scopes);
+                            if let Some(high) = high {
+                                self.walk_expr(high, switch_scopes);
+                            }
+                        }
+                        Label::Default(pos) => self.walk_case(*pos, "default", switch_scopes),
+                    }
+                }
                 self.walk(stmt, switch_scopes);
             }
             Stmt::Goto { name, pos } => self.gotos.push(JumpRecord {
@@ -3905,8 +3941,6 @@ impl JumpScopeWalk {
                     self.stray_jumps.push((*pos, "continue"));
                 }
             }
-
-            Stmt::Case(..) | Stmt::Default(..) => self.walk_case(stmt, switch_scopes),
 
             // A `switch` becomes the reference point for the labels inside it.
             // Its own scopes are captured before the body is walked, and its
@@ -3987,12 +4021,13 @@ impl JumpScopeWalk {
         }
     }
 
-    fn walk_case(&mut self, stmt: &Stmt, switch_scopes: Option<&[usize]>) {
-        let (label_pos, what, bounds, labeled) = match stmt {
-            Stmt::Case(low, high, body) => (low.pos, "case", Some((low, high)), body),
-            Stmt::Default(pos, body) => (*pos, "default", None, body),
-            _ => unreachable!("only a case or default reaches walk_case"),
-        };
+    /// A `case` or `default` label -- `what` says which -- at `label_pos`.
+    fn walk_case(
+        &mut self,
+        label_pos: Position,
+        what: &'static str,
+        switch_scopes: Option<&[usize]>,
+    ) {
         // 6.8.1p2: a `case` or `default` belongs to a `switch`.
         if self.switch_depth == 0 {
             self.stray_jumps.push((label_pos, what));
@@ -4016,16 +4051,6 @@ impl JumpScopeWalk {
                 self.bad_case_ids.push((id, label_pos));
             }
         }
-
-        if let Some((low, high)) = bounds {
-            self.walk_expr(low, switch_scopes);
-            if let Some(high) = high {
-                self.walk_expr(high, switch_scopes);
-            }
-        }
-        // The label carries the statement it prefixes, so the walk continues
-        // through it.
-        self.walk(labeled, switch_scopes);
     }
 
     /// Walk the statement expressions inside `expr`, each a scope of its own.

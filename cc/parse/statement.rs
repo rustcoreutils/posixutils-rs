@@ -9,14 +9,82 @@
 // Statement parsing (C17 6.8) and GNU statement expressions
 //
 
-use super::ast::{BlockItem, Expr, ExprKind, ForInit, Stmt};
+use super::ast::{BlockItem, Expr, ExprKind, ForInit, Label, Stmt};
 use super::parser::{ParseError, ParseResult, Parser};
 use crate::diag;
 use crate::token::lexer::{Position, SpecialToken, TokenType};
 use gettextrs::gettext;
 
 impl Parser<'_> {
+    /// Parse a statement, gathering every label in front of it into one
+    /// [`Stmt::Labeled`].
+    ///
+    /// The labels are read in a loop rather than by recursing into the
+    /// statement each one prefixes: a generated `switch` can carry tens of
+    /// thousands of consecutive `case` labels, and one recursion per label
+    /// overflowed the compiler's stack.
     pub fn parse_statement(&mut self) -> ParseResult<Stmt> {
+        let mut labels = Vec::new();
+        while let Some(label) = self.parse_label()? {
+            labels.push(label);
+        }
+        if labels.is_empty() {
+            return self.parse_unlabeled_statement();
+        }
+        // C17 6.8.1 requires a statement after the label, and a label at the
+        // end of a block therefore needs the empty one written out. gcc and
+        // clang both accept it without, C23 made it legal, and the idiom is
+        // common enough in code that jumps to a cleanup label at the end of a
+        // function -- `asm goto`'s own torture test is written that way.
+        // Accepted with a warning rather than invented silently.
+        let stmt = if self.is_special(b'}') {
+            diag::warning(
+                self.current_pos(),
+                &gettext("a label at the end of a compound statement needs a statement in C17"),
+            );
+            Stmt::Empty
+        } else {
+            self.parse_unlabeled_statement()?
+        };
+        Ok(Stmt::Labeled {
+            labels,
+            stmt: Box::new(stmt),
+        })
+    }
+
+    /// Parse one label and its colon, or nothing if the statement does not
+    /// start with one.
+    ///
+    /// A statement keyword is never a goto label: `else:` and `break:` are
+    /// errors, not labels named after them.
+    fn parse_label(&mut self) -> ParseResult<Option<Label>> {
+        match self.current_ident() {
+            Some(crate::kw::CASE) => return self.parse_case_label().map(Some),
+            Some(crate::kw::DEFAULT) => return self.parse_default_label().map(Some),
+            Some(id) if crate::kw::has_tag(id, crate::kw::STMT_KW | crate::kw::ASM_KW) => {
+                return Ok(None);
+            }
+            _ => {}
+        }
+        if self.peek() != TokenType::Ident {
+            return Ok(None);
+        }
+        // Save position for potential backtrack
+        let saved_pos = self.pos;
+        let pos = self.current_pos();
+        let name = self.expect_identifier()?;
+        if self.is_special(b':') {
+            self.advance();
+            return Ok(Some(Label::Named { name, pos }));
+        }
+        // Not a label, backtrack
+        self.pos = saved_pos;
+        Ok(None)
+    }
+
+    /// A statement with no label in front of it, which [`Self::parse_label`]
+    /// has already ruled out.
+    fn parse_unlabeled_statement(&mut self) -> ParseResult<Stmt> {
         if self.at_attribute_declaration() {
             return self.parse_attribute_statement();
         }
@@ -55,8 +123,6 @@ impl Parser<'_> {
                     return Ok(Stmt::Goto { name, pos });
                 }
                 crate::kw::SWITCH => return self.parse_switch_stmt(),
-                crate::kw::CASE => return self.parse_case_label(),
-                crate::kw::DEFAULT => return self.parse_default_label(),
                 // GCC extended inline assembly
                 crate::kw::ASM | crate::kw::GNU_ASM | crate::kw::GNU_ASM2 => {
                     return self.parse_asm_statement();
@@ -74,32 +140,6 @@ impl Parser<'_> {
         if self.is_special(b';') {
             self.advance();
             return Ok(Stmt::Empty);
-        }
-
-        // Check for labeled statement
-        if self.peek() == TokenType::Ident {
-            // Save position for potential backtrack
-            let saved_pos = self.pos;
-            let pos = self.current_pos();
-            let name = self.expect_identifier()?;
-            if self.is_special(b':') {
-                self.advance();
-                // C17 6.8.1 requires a statement after the label, and a label
-                // at the end of a block therefore needs the empty one written
-                // out. gcc and clang both accept it without, C23 made it
-                // legal, and the idiom is common enough in code that jumps to
-                // a cleanup label at the end of a function -- `asm goto`'s own
-                // torture test is written that way. Accepted with a warning
-                // rather than invented silently.
-                let stmt = self.parse_labeled_statement()?;
-                return Ok(Stmt::Label {
-                    name,
-                    stmt: Box::new(stmt),
-                    pos,
-                });
-            }
-            // Not a label, backtrack
-            self.pos = saved_pos;
         }
 
         // Expression statement
@@ -297,13 +337,6 @@ impl Parser<'_> {
     }
 
     /// Parse a `switch` body, which C17 6.8.4 says is one statement.
-    ///
-    /// `case E : statement` is a single *labeled statement* in the grammar, but
-    /// the AST flattens the label into a sibling marker -- `Stmt::Case` carries
-    /// the value, not the statement it labels -- which is only sound inside a
-    /// block, where the two stay adjacent items of one list. So a labeled
-    /// non-compound body gains the block that flattening assumes; a compound
-    /// or unlabeled body is returned unchanged.
     fn parse_switch_body(&mut self) -> ParseResult<Stmt> {
         // One statement, as C17 6.8.4 says. This used to re-block a run of
         // labels into a synthetic compound statement, because a label was a
@@ -321,7 +354,7 @@ impl Parser<'_> {
     /// GCC requires whitespace around the `...`: `case 1...9:` lexes as one
     /// pp-number and is rejected there too ("too many decimal points in
     /// number"), so only the spaced form is accepted here as well.
-    fn parse_case_label(&mut self) -> ParseResult<Stmt> {
+    fn parse_case_label(&mut self) -> ParseResult<Label> {
         self.advance(); // consume 'case'
         let expr = self.parse_conditional_expr()?;
         let high = if self.is_special_token(SpecialToken::Ellipsis) {
@@ -331,32 +364,14 @@ impl Parser<'_> {
             None
         };
         self.expect_special(b':')?;
-        let stmt = self.parse_labeled_statement()?;
-        Ok(Stmt::Case(expr, high, Box::new(stmt)))
+        Ok(Label::Case(expr, high))
     }
 
-    /// The statement a `case`, `default` or goto label prefixes.
-    ///
-    /// C17 6.8.1 requires one. A label at the end of a compound statement is
-    /// accepted with a warning -- gcc and clang both take it, and C23 made it
-    /// legal -- rather than failing on the `}`.
-    fn parse_labeled_statement(&mut self) -> ParseResult<Stmt> {
-        if self.is_special(b'}') {
-            diag::warning(
-                self.current_pos(),
-                &gettext("a label at the end of a compound statement needs a statement in C17"),
-            );
-            return Ok(Stmt::Empty);
-        }
-        self.parse_statement()
-    }
-
-    fn parse_default_label(&mut self) -> ParseResult<Stmt> {
+    fn parse_default_label(&mut self) -> ParseResult<Label> {
         let pos = self.current_pos();
         self.advance(); // consume 'default'
         self.expect_special(b':')?;
-        let stmt = self.parse_labeled_statement()?;
-        Ok(Stmt::Default(pos, Box::new(stmt)))
+        Ok(Label::Default(pos))
     }
 
     /// Parse block items (declarations and statements) until closing brace
@@ -462,45 +477,31 @@ impl Parser<'_> {
     }
 
     /// Whether a statement expression's final statement gives it a value: an
-    /// expression statement, or one under any number of labels. GCC takes
-    /// `({ a: 1; })` as 1 (compile/pr17913). A `case` or `default` label
-    /// cannot end a statement expression in a valid program -- its switch
-    /// would jump into the statement expression -- but it is still a label,
-    /// and giving the expression a value leaves "switch jumps into statement
-    /// expression" as the one error, where calling it `void` added another.
+    /// expression statement, labeled or not. GCC takes `({ a: 1; })` as 1
+    /// (compile/pr17913). A `case` or `default` label cannot end a statement
+    /// expression in a valid program -- its switch would jump into the
+    /// statement expression -- but it is still a label, and giving the
+    /// expression a value leaves "switch jumps into statement expression" as
+    /// the one error, where calling it `void` added another.
     fn ends_in_expr_stmt(stmt: &Stmt) -> bool {
         match stmt {
-            Stmt::Expr(_) => true,
-            Stmt::Label { stmt, .. } | Stmt::Case(_, _, stmt) | Stmt::Default(_, stmt) => {
-                Self::ends_in_expr_stmt(stmt)
-            }
-            _ => false,
+            Stmt::Labeled { stmt, .. } => matches!(**stmt, Stmt::Expr(_)),
+            stmt => matches!(stmt, Stmt::Expr(_)),
         }
     }
 
     /// Split a final statement accepted by [`Self::ends_in_expr_stmt`] into
-    /// its value and the labels in front of it. `L: e;` is `L: ; e;`, so each
-    /// label is pushed onto `items` labelling an empty statement, and the
+    /// its value and the labels in front of it. `L: e;` is `L: ; e;`, so the
+    /// labels are pushed onto `items` labelling an empty statement, and the
     /// value is evaluated after them exactly where the labels were.
     fn split_labeled_expr_stmt(stmt: Stmt, items: &mut Vec<BlockItem>) -> Expr {
         match stmt {
             Stmt::Expr(expr) => expr,
-            Stmt::Label { name, stmt, pos } => {
-                items.push(BlockItem::Statement(Box::new(Stmt::Label {
-                    name,
+            Stmt::Labeled { labels, stmt } => {
+                items.push(BlockItem::Statement(Box::new(Stmt::Labeled {
+                    labels,
                     stmt: Box::new(Stmt::Empty),
-                    pos,
                 })));
-                Self::split_labeled_expr_stmt(*stmt, items)
-            }
-            Stmt::Case(low, high, stmt) => {
-                let label = Stmt::Case(low, high, Box::new(Stmt::Empty));
-                items.push(BlockItem::Statement(Box::new(label)));
-                Self::split_labeled_expr_stmt(*stmt, items)
-            }
-            Stmt::Default(pos, stmt) => {
-                let label = Stmt::Default(pos, Box::new(Stmt::Empty));
-                items.push(BlockItem::Statement(Box::new(label)));
                 Self::split_labeled_expr_stmt(*stmt, items)
             }
             _ => unreachable!("checked by ends_in_expr_stmt"),

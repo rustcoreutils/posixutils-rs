@@ -16,7 +16,7 @@ use super::*;
 use crate::ir::linearize_emit::{compound_assign_arith_type, compound_assign_opcode};
 use crate::parse::ast::{
     AsmOperand, AssignOp, BinaryOp, BlockItem, Declaration, Designator, ExprKind, ExternalDecl,
-    ForInit, FunctionDef, InitDeclarator, InitElement, ParamStyle, Parameter, Stmt, UnaryOp,
+    ForInit, FunctionDef, InitDeclarator, InitElement, Label, ParamStyle, Parameter, Stmt, UnaryOp,
 };
 use crate::strings::StringTable;
 use crate::symbol::Symbol;
@@ -571,20 +571,18 @@ fn test_switch_basic() {
     // A label carries the statement it prefixes (C17 6.8.1), so each arm is
     // one `BlockItem` rather than a marker followed by a sibling.
     let switch_body = Stmt::Block(vec![
-        BlockItem::Statement(Box::new(Stmt::Case(
-            Expr::int(1, &ctx.types),
-            None,
-            Box::new(Stmt::Return(Some(Expr::int(10, &ctx.types)))),
-        ))),
-        BlockItem::Statement(Box::new(Stmt::Case(
-            Expr::int(2, &ctx.types),
-            None,
-            Box::new(Stmt::Return(Some(Expr::int(20, &ctx.types)))),
-        ))),
-        BlockItem::Statement(Box::new(Stmt::Default(
-            test_pos(),
-            Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
-        ))),
+        BlockItem::Statement(Box::new(Stmt::Labeled {
+            labels: vec![Label::Case(Expr::int(1, &ctx.types), None)],
+            stmt: Box::new(Stmt::Return(Some(Expr::int(10, &ctx.types)))),
+        })),
+        BlockItem::Statement(Box::new(Stmt::Labeled {
+            labels: vec![Label::Case(Expr::int(2, &ctx.types), None)],
+            stmt: Box::new(Stmt::Return(Some(Expr::int(20, &ctx.types)))),
+        })),
+        BlockItem::Statement(Box::new(Stmt::Labeled {
+            labels: vec![Label::Default(test_pos())],
+            stmt: Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types)))),
+        })),
     ]);
 
     let switch_stmt = Stmt::Switch {
@@ -645,10 +643,9 @@ fn test_switch_with_break() {
     let x_sym = ctx.var("x", int_type);
 
     let switch_body = Stmt::Block(vec![
-        BlockItem::Statement(Box::new(Stmt::Case(
-            Expr::int(1, &ctx.types),
-            None,
-            Box::new(Stmt::Expr(Expr::typed_unpositioned(
+        BlockItem::Statement(Box::new(Stmt::Labeled {
+            labels: vec![Label::Case(Expr::int(1, &ctx.types), None)],
+            stmt: Box::new(Stmt::Expr(Expr::typed_unpositioned(
                 ExprKind::Assign {
                     op: AssignOp::Assign,
                     target: Box::new(Expr::var_typed(x_sym, int_type)),
@@ -656,9 +653,12 @@ fn test_switch_with_break() {
                 },
                 int_type,
             ))),
-        ))),
+        })),
         BlockItem::Statement(Box::new(Stmt::Break(test_pos()))),
-        BlockItem::Statement(Box::new(Stmt::Default(test_pos(), Box::new(Stmt::Empty)))),
+        BlockItem::Statement(Box::new(Stmt::Labeled {
+            labels: vec![Label::Default(test_pos())],
+            stmt: Box::new(Stmt::Empty),
+        })),
         BlockItem::Statement(Box::new(Stmt::Expr(Expr::typed_unpositioned(
             ExprKind::Assign {
                 op: AssignOp::Assign,
@@ -907,8 +907,11 @@ fn test_goto_forward() {
             },
             int_type,
         )))),
-        BlockItem::Statement(Box::new(Stmt::Label {
-            name: end_id,
+        BlockItem::Statement(Box::new(Stmt::Labeled {
+            labels: vec![Label::Named {
+                name: end_id,
+                pos: test_pos(),
+            }],
             stmt: Box::new(Stmt::Expr(Expr::typed_unpositioned(
                 ExprKind::Assign {
                     op: AssignOp::Assign,
@@ -917,7 +920,6 @@ fn test_goto_forward() {
                 },
                 int_type,
             ))),
-            pos: test_pos(),
         })),
         BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
             x_sym, int_type,
@@ -998,10 +1000,12 @@ fn test_goto_backward() {
     };
 
     let body = Stmt::Block(vec![
-        BlockItem::Statement(Box::new(Stmt::Label {
-            name: loop_id,
+        BlockItem::Statement(Box::new(Stmt::Labeled {
+            labels: vec![Label::Named {
+                name: loop_id,
+                pos: test_pos(),
+            }],
             stmt: Box::new(increment),
-            pos: test_pos(),
         })),
         BlockItem::Statement(Box::new(if_goto)),
         BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
@@ -7493,10 +7497,12 @@ fn test_asm_goto_output_written_back_on_the_label_edge() {
             goto_labels: vec![out_id],
         })),
         BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
-        BlockItem::Statement(Box::new(Stmt::Label {
-            name: out_id,
+        BlockItem::Statement(Box::new(Stmt::Labeled {
+            labels: vec![Label::Named {
+                name: out_id,
+                pos: test_pos(),
+            }],
             stmt: Box::new(Stmt::Return(Some(Expr::var_typed(x_sym, int_type)))),
-            pos: test_pos(),
         })),
     ]);
     let func = FunctionDef {
@@ -8270,10 +8276,12 @@ fn test_cfg_edges_are_recorded_once_in_both_lists() {
             }))
         })
         .collect();
-    items.push(BlockItem::Statement(Box::new(Stmt::Label {
-        name: end_id,
+    items.push(BlockItem::Statement(Box::new(Stmt::Labeled {
+        labels: vec![Label::Named {
+            name: end_id,
+            pos: test_pos(),
+        }],
         stmt: Box::new(Stmt::Return(Some(Expr::var_typed(x_sym, int_type)))),
-        pos: test_pos(),
     })));
     let mut func = make_simple_func(test_id, Stmt::Block(items), &ctx.types);
     func.params = vec![Parameter {

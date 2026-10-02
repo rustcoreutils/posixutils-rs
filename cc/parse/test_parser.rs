@@ -14,7 +14,7 @@
 use crate::float::IntegralRounding;
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, CalleeBinding, Declaration, Expr, ExprKind, ExternalDecl,
-    ForInit, FpTest, FunctionDef, InlineLibraryFn, LibFn, MathErrno, MemoryFn, Stmt,
+    ForInit, FpTest, FunctionDef, InlineLibraryFn, Label, LibFn, MathErrno, MemoryFn, Stmt,
     TranslationUnit, UnaryOp,
 };
 use crate::parse::parser::{ParseResult, Parser};
@@ -1790,12 +1790,41 @@ fn test_goto_stmt() {
 fn test_labeled_stmt() {
     let (stmt, strings) = parse_stmt("label: x = 1;").unwrap();
     match stmt {
-        Stmt::Label { name, stmt, .. } => {
-            check_name(&strings, name, "label");
+        Stmt::Labeled { labels, stmt } => {
+            let [Label::Named { name, .. }] = labels.as_slice() else {
+                panic!("expected one goto label: {labels:?}");
+            };
+            check_name(&strings, *name, "label");
             assert!(matches!(*stmt, Stmt::Expr(_)));
         }
         _ => panic!("Expected Label"),
     }
+}
+
+/// A run of labels is one labeled statement holding every label in source
+/// order, not a chain of statements each labelling the next.
+#[test]
+fn test_consecutive_labels_are_one_list() {
+    let (stmt, strings) =
+        parse_stmt_with_vars("case 1: a: default: case 2 ... 3: b: x = 1;", &["x"]).unwrap();
+    let Stmt::Labeled { labels, stmt } = stmt else {
+        panic!("expected a labeled statement: {stmt:?}");
+    };
+    let [Label::Case(_, None), Label::Named { name: a, .. }, Label::Default(_), Label::Case(_, Some(_)), Label::Named { name: b, .. }] =
+        labels.as_slice()
+    else {
+        panic!("labels out of order: {labels:?}");
+    };
+    check_name(&strings, *a, "a");
+    check_name(&strings, *b, "b");
+    assert!(matches!(*stmt, Stmt::Expr(_)), "{stmt:?}");
+}
+
+/// A statement keyword is not a goto label: `else:` is an error, not a label
+/// named `else`.
+#[test]
+fn test_statement_keyword_is_not_a_label() {
+    assert!(parse_stmt("else: x = 1;").is_err());
 }
 
 #[test]
@@ -7231,11 +7260,10 @@ fn test_size_specifier_order_preserves_signedness() {
 /// A `switch` body that is not a compound statement must still contain the
 /// statement its `case` label prefixes.
 ///
-/// `Stmt::Case` is a marker carrying the value and not the labeled statement,
-/// which is sound only inside a block where the two stay adjacent items. Given
-/// `switch (x) case 1: return 2;` the marker took the entire body and the
-/// `return` became a *sibling* of the switch -- reached whatever the value of
-/// `x`. The parser now rebuilds the block that flattening assumes.
+/// When a `case` label was a marker carrying the value and not the labeled
+/// statement, `switch (x) case 1: return 2;` gave the marker the entire body
+/// and made the `return` a *sibling* of the switch -- reached whatever the
+/// value of `x`.
 #[test]
 fn test_switch_with_non_compound_body_keeps_its_labelled_statement() {
     let (func, _types, _strings, _symbols) =
@@ -7261,9 +7289,17 @@ fn test_switch_with_non_compound_body_keeps_its_labelled_statement() {
         panic!("first item is not a switch: {first:#?}");
     };
     // One statement, as C17 6.8.4 says: the label, carrying its own.
-    let Stmt::Case(_, _, labelled) = &**body else {
+    let Stmt::Labeled {
+        labels,
+        stmt: labelled,
+    } = &**body
+    else {
         panic!("switch body is not the case label: {body:#?}");
     };
+    assert!(
+        matches!(labels.as_slice(), [Label::Case(..)]),
+        "{labels:#?}"
+    );
     assert!(matches!(**labelled, Stmt::Return(Some(_))), "{labelled:#?}");
 }
 
@@ -8393,7 +8429,7 @@ fn test_zero_length_compare_is_zero_with_its_arguments_evaluated() {
 
 /// A statement expression whose last statement is a labeled expression
 /// statement takes that expression's value, as gcc does (compile/pr17913).
-/// The labels stay where they were, each labelling an empty statement.
+/// The labels stay where they were, labelling an empty statement.
 #[test]
 fn test_stmt_expr_labeled_last_statement_has_its_value() {
     let (expr, types, _, _) = parse_expr("({ a: b: 5; })").unwrap();
@@ -8402,13 +8438,17 @@ fn test_stmt_expr_labeled_last_statement_has_its_value() {
     };
     assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Int);
     assert!(matches!(result.kind, ExprKind::IntLit(5)));
-    assert_eq!(stmts.len(), 2);
-    for item in stmts {
-        let BlockItem::Statement(stmt) = item else {
-            panic!("expected a statement");
-        };
-        assert!(matches!(&**stmt, Stmt::Label { stmt, .. } if matches!(**stmt, Stmt::Empty)));
-    }
+    let [BlockItem::Statement(stmt)] = stmts.as_slice() else {
+        panic!("expected one labeled statement: {stmts:#?}");
+    };
+    let Stmt::Labeled { labels, stmt } = &**stmt else {
+        panic!("expected a labeled statement: {stmt:#?}");
+    };
+    assert!(matches!(
+        labels.as_slice(),
+        [Label::Named { .. }, Label::Named { .. }]
+    ));
+    assert!(matches!(**stmt, Stmt::Empty));
 }
 
 /// A `case` or `default` label in front of the last statement is a label like
@@ -8428,7 +8468,9 @@ fn test_stmt_expr_case_labeled_last_statement_has_its_value() {
             panic!("{src}: expected one label");
         };
         assert!(
-            matches!(&**label, Stmt::Case(_, _, s) | Stmt::Default(_, s) if matches!(**s, Stmt::Empty)),
+            matches!(&**label, Stmt::Labeled { labels, stmt }
+                if matches!(labels.as_slice(), [Label::Case(..) | Label::Default(_)])
+                    && matches!(**stmt, Stmt::Empty)),
             "{src}"
         );
     }
@@ -9007,9 +9049,14 @@ fn test_fallthrough_attribute_is_a_null_statement() {
     let BlockItem::Statement(case2) = &items[2] else {
         panic!("case 2 is not a statement");
     };
-    let Stmt::Case(_, _, labeled) = case2.as_ref() else {
+    let Stmt::Labeled {
+        labels,
+        stmt: labeled,
+    } = case2.as_ref()
+    else {
         panic!("not a case: {case2:?}");
     };
+    assert!(matches!(labels.as_slice(), [Label::Case(..)]), "{labels:?}");
     assert!(matches!(**labeled, Stmt::Empty), "{labeled:?}");
 }
 

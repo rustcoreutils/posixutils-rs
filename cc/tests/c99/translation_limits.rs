@@ -123,3 +123,44 @@ int main(void) {
         0
     );
 }
+
+/// Consecutive labels in front of one statement, as generated code writes
+/// them: `case 0: l0: case 1: l1: ... r += 1;`, a run of 60,000 `case` and
+/// goto labels.
+///
+/// The grammar nests each label around the statement after it, and parsing
+/// and lowering that nesting by recursion took one round of frames per label
+/// -- enough, in a debug build, to overflow the compiler's stack at two
+/// thirds of this count. A run of labels is held, and walked, as a list.
+#[test]
+fn consecutive_labels_do_not_recurse_per_label() {
+    const N: usize = 30_000;
+    let labels: String = (0..N).map(|v| format!("    case {v}: l{v}:\n")).collect();
+    let code = format!(
+        r#"
+int classify(int i, int jump)
+{{
+    int r = 0;
+    if (jump)
+        goto l{mid};
+    switch (i) {{
+{labels}        r += 1;
+    }}
+    return r;
+}}
+
+int main(void)
+{{
+    if (classify(-1, 0) != 0) return 1;
+    if (classify(0, 0) != 1) return 2;
+    if (classify({last}, 0) != 1) return 3;
+    if (classify({N}, 0) != 0) return 4;
+    if (classify(-1, 1) != 1) return 5;
+    return 0;
+}}
+"#,
+        mid = N / 2,
+        last = N - 1,
+    );
+    assert_eq!(compile_and_run("consecutive_labels", &code, &[]), 0);
+}

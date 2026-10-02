@@ -1758,9 +1758,7 @@ impl<'a> Linearizer<'a> {
             crate::parse::ast::Stmt::While { body, .. }
             | crate::parse::ast::Stmt::DoWhile { body, .. }
             | crate::parse::ast::Stmt::Switch { body, .. }
-            | crate::parse::ast::Stmt::Label { stmt: body, .. }
-            | crate::parse::ast::Stmt::Case(_, _, body)
-            | crate::parse::ast::Stmt::Default(_, body) => Self::declares_vla(body),
+            | crate::parse::ast::Stmt::Labeled { stmt: body, .. } => Self::declares_vla(body),
             crate::parse::ast::Stmt::For { init, body, .. } => {
                 init.as_ref().is_some_and(|i| match i {
                     crate::parse::ast::ForInit::Declaration(decl) => {

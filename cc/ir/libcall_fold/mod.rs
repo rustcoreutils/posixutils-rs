@@ -219,7 +219,7 @@ impl<'a> CallSite<'a> {
         if consts.root(a, bits) == consts.root(b, bits) {
             return true;
         }
-        let loc = |p| self.am.resolve(self.func, p, 0, 0, None);
+        let loc = |p| self.am.object_of(self.func, p);
         let (la, lb) = (loc(a), loc(b));
         la.base != MemBase::Unknown
             && la.offset.is_some()

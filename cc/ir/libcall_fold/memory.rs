@@ -20,10 +20,11 @@
 //   6.4.5p7) or a `const` object defined here (6.7.3p6), by the rule
 //   `strdata` reads such objects by -- since a destination inside it would
 //   be a write to it;
-// - both are automatic objects of this function, and not the same one;
-// - one is an automatic object and the other has a linker symbol.
-// Two different named objects are not enough: an alias or a weak definition
-// can put two names at one address.
+// - the two objects cannot be one, by `memloc::may_alias` -- two automatic
+//   objects, or an automatic object and a named one -- and they are not
+//   both named. `may_alias` separates two named objects this unit defines,
+//   neither weak, but this rewrite does not rely on it: a move between two
+//   named objects stays a move.
 //
 // The rewrite happens in place: the operands and the result are the
 // `Memmove`'s, and only the operation and the function it calls change.
@@ -31,8 +32,7 @@
 
 use super::{callee_symbol, is_the_function, Callee, FoldCtx};
 use crate::ir::memexpand::BlockOp;
-use crate::ir::memloc::{AddrMap, MemBase};
-use crate::ir::strdata::ConstBytes;
+use crate::ir::memloc::{may_alias, AddrMap, MemBase, MemLoc};
 use crate::ir::{Function, Instruction, Opcode};
 
 /// The function a `Memcpy` calls.
@@ -49,7 +49,7 @@ pub(super) fn run(func: &mut Function, ctx: &FoldCtx) -> bool {
     let mut disjoint = Vec::new();
     for (b, bb) in func.blocks.iter().enumerate() {
         for (i, insn) in bb.insns.iter().enumerate() {
-            if insn.op == Opcode::Memmove && cannot_overlap(func, &am, ctx.bytes, insn) {
+            if insn.op == Opcode::Memmove && cannot_overlap(func, &am, ctx, insn) {
                 disjoint.push((b, i));
             }
         }
@@ -65,17 +65,14 @@ pub(super) fn run(func: &mut Function, ctx: &FoldCtx) -> bool {
 
 /// Whether the destination and source of the move `insn` are in different
 /// objects.
-fn cannot_overlap(func: &Function, am: &AddrMap, bytes: &ConstBytes, insn: &Instruction) -> bool {
+fn cannot_overlap(func: &Function, am: &AddrMap, ctx: &FoldCtx, insn: &Instruction) -> bool {
     let &[dest, src, _] = insn.src.as_slice() else {
         return false;
     };
-    let object = |p| am.resolve(func, p, 0, 0, None).base;
-    match (object(dest), object(src)) {
-        (_, MemBase::Global(name)) if bytes.is_read_only(&name) => true,
-        (MemBase::Local(d), MemBase::Local(s)) => d != s,
-        (MemBase::Local(_), MemBase::Global(_)) | (MemBase::Global(_), MemBase::Local(_)) => true,
-        _ => false,
-    }
+    let (dest, src) = (am.object_of(func, dest), am.object_of(func, src));
+    let read_only = matches!(&src.base, MemBase::Global(name) if ctx.bytes.is_read_only(name));
+    let named = |m: &MemLoc| matches!(m.base, MemBase::Global(_));
+    read_only || (!(named(&dest) && named(&src)) && !may_alias(&dest, &src, ctx.mi))
 }
 
 #[cfg(test)]
@@ -195,10 +192,9 @@ mod tests {
         assert!(!is_memcpy(&mut fx, t));
     }
 
-    /// An automatic object and a named one are disjoint either way round;
-    /// two named ones may be one object under two names.
+    /// An automatic object and a named one are disjoint either way round.
     #[test]
-    fn a_local_and_a_global_are_disjoint_but_two_globals_are_not() {
+    fn a_local_and_a_global_are_disjoint() {
         for local_is_dest in [true, false] {
             let mut fx = Fixture::new();
             global(&mut fx, "g", false, |_| {});
@@ -208,13 +204,37 @@ mod tests {
             let t = memmove(&mut fx, dest, src);
             assert!(is_memcpy(&mut fx, t), "local is dest: {local_is_dest}");
         }
+    }
+
+    /// Two named objects stay a move, whatever their definitions: two
+    /// strong ones, a weak one, a name this unit does not define, or one
+    /// object under one name.
+    #[test]
+    fn two_globals_stay_a_move() {
+        type Tweak = fn(&mut GlobalDef);
+        let tweaks: [Tweak; 2] = [|_| {}, |g| g.symbol_attrs.weak = true];
+        for tweak in tweaks {
+            let mut fx = Fixture::new();
+            global(&mut fx, "g", false, |_| {});
+            global(&mut fx, "h", false, tweak);
+            let (g, h) = (fx.addr("g"), fx.addr("h"));
+            let t = memmove(&mut fx, g, h);
+            assert!(!is_memcpy(&mut fx, t));
+        }
 
         let mut fx = Fixture::new();
         global(&mut fx, "g", false, |_| {});
-        global(&mut fx, "h", false, |_| {});
-        let (g, h) = (fx.addr("g"), fx.addr("h"));
-        let t = memmove(&mut fx, g, h);
-        assert!(!is_memcpy(&mut fx, t));
+        let (g, ext) = (fx.addr("g"), fx.addr("ext"));
+        let t = memmove(&mut fx, ext, g);
+        assert!(!is_memcpy(&mut fx, t), "a name this unit does not define");
+
+        let mut fx = Fixture::new();
+        global(&mut fx, "g", false, |_| {});
+        let g = fx.addr("g");
+        let eight = fx.konst(8);
+        let g8 = fx.op(Opcode::Add, g, eight);
+        let t = memmove(&mut fx, g8, g);
+        assert!(!is_memcpy(&mut fx, t), "one object");
     }
 
     /// Two pointers nothing is known about may overlap.

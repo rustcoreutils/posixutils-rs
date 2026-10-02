@@ -112,8 +112,9 @@ changing something leaves work undone. The rules every pass follows:
   `constfold`. "What constant is this?" is `facts::ConstMap`. Rewriting a
   proven constant or branch is `propagate`. A sparse conditional analysis is a
   lattice plugged into `dataflow`. Memory questions go to `memloc` (where does
-  this point), `escape` (can anything else reach this local) and `effects`
-  (what can this call touch).
+  this point, and what may this instruction read and write: `AddrMap::access`),
+  `escape` (can anything else reach this local) and `effects` (what can this
+  call touch).
 - **Respect what is observable.** A volatile access
   (`is_volatile_access`) is never deleted, merged or moved. An opcode with
   `has_side_effects` is a root for DCE. `may_access_memory` says how far an
@@ -592,7 +593,7 @@ after that, because merging would undo the splitting the copies depend on. See
 | `constfold.rs` | Evaluates one operation over constants, at the operand's width and the signedness the opcode implies, for integer and floating types. It is the one copy of these rules, shared by `instcombine`, `sccp`, `vrp`, `copyprop` and both back ends |
 | `facts.rs` | Function-wide queries a pass builds before rewriting anything: `ConstMap` (the constant a pseudo holds) and `CmpFacts` (the comparison that defined it). They are sound without dominance only because of SSA's single definition, so they must not be used after `lower` |
 | `propagate.rs` | The rewrites a pass performs once it has proved something: a value becomes a copy of an integer constant (`sccp`, `vrp`, `instcombine`), a target becomes the constant its `SetVal` defines (`instcombine`, `constglobal`), a conditional terminator becomes a `br` (`sccp`, `vrp`). Each guards its own admissibility, so no pass rewrites a constant by hand |
-| `memloc.rs` | What an address points to (a base, a constant byte offset and a width), whether two accesses can overlap, and module-wide facts about globals |
+| `memloc.rs` | What an address points to (a base, a constant byte offset and a width), whether two accesses can overlap, what each instruction may read and write (the one opcode table `loadfwd`, `dse` and `effects` project), and module-wide facts about globals |
 | `escape.rs` | Which locals' addresses can reach a callee, an asm statement or another thread. A call cannot write a local that does not escape |
 | `effects.rs` | What a call may do to memory, from the callee's attributes and from its body within this translation unit |
 | `strdata.rs` | The bytes of objects whose contents hold for the whole run (string literals, and `const` `char` arrays under `constglobal`'s rule), and the string a pointer into one reads. For a length it also gives the one length every `sel` and φ arm agree on, which for a local array comes from what `MemOracle` says the earlier stores left in it |

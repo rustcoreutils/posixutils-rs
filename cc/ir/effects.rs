@@ -33,8 +33,8 @@
 //
 
 use super::escape::EscapeInfo;
-use super::memloc::{AddrMap, MemBase};
-use super::{Function, Module, Opcode};
+use super::memloc::{AddrMap, Footprint};
+use super::{Function, Instruction, Module, Opcode};
 use crate::parse::ast::MemEffect;
 use crate::types::TypeTable;
 use std::collections::{HashMap, VecDeque};
@@ -214,42 +214,44 @@ fn is_inferable(f: &Function) -> bool {
     f.is_static && !f.symbol_attrs.weak && !f.blocks.is_empty()
 }
 
-/// What one instruction that is not a call does to observable memory.
-fn insn_effect(
-    f: &Function,
-    esc: &EscapeInfo,
-    am: &AddrMap,
-    insn: &super::Instruction,
-) -> MemEffect {
-    match insn.op {
-        // Touching a local this function never let out is invisible to the
-        // caller, and before SSA promotion that is most of what a body does.
-        Opcode::Load | Opcode::Store => {
-            // Reading or writing a volatile object is itself observable
-            // (C17 5.1.2.3p6), whatever the object: a function that does it
-            // cannot be called fewer times, or in a different order, than
-            // written, and neither `Const` nor `Pure` may say otherwise.
-            if insn.is_volatile_access() {
-                return MemEffect::Unknown;
-            }
-            let loc = am.location_of(f, insn);
-            if matches!(&loc.base, MemBase::Local(p) if !esc.is_captured(&MemBase::Local(*p))) {
-                MemEffect::Const
-            } else if insn.op == Opcode::Load {
-                MemEffect::Pure
-            } else {
-                MemEffect::Unknown
-            }
-        }
+/// What one instruction that is not a call does to observable memory: the
+/// join over everything `AddrMap::access` says it touches.
+///
+/// Touching a local this function never let out is invisible to the caller,
+/// and before SSA promotion that is most of what a body does -- through
+/// loads and stores, or a `memset` or `memcpy` of a buffer of its own.
+fn insn_effect(f: &Function, esc: &EscapeInfo, am: &AddrMap, insn: &Instruction) -> MemEffect {
+    // Reading or writing a volatile object is itself observable (C17
+    // 5.1.2.3p6), whatever the object: a function that does it cannot be
+    // called fewer times, or in a different order, than written, and neither
+    // `Const` nor `Pure` may say otherwise.
+    if insn.is_volatile_access() {
+        return MemEffect::Unknown;
+    }
+    // Calls are `Summary::callees`, resolved by the fixed point, and never
+    // reach here; a callee nothing is known about is the honest answer.
+    let access = am.access(f, insn, |_| MemEffect::Unknown);
+    if access.writes.iter().any(|w| !w.is_private(esc)) {
+        return MemEffect::Unknown;
+    }
+    access
+        .reads
+        .iter()
+        .filter(|r| !r.is_private(esc))
+        .map(read_effect)
+        .fold(MemEffect::Const, MemEffect::join)
+}
 
-        // Calls are `Summary::callees`, resolved by the fixed point.
-        Opcode::Call => MemEffect::Const,
-
-        _ if !insn.op.may_access_memory() => MemEffect::Const,
-
-        // `Asm`, the mem intrinsics, the `Va*` family, the atomics: all
-        // reach memory in ways this does not model.
-        _ => MemEffect::Unknown,
+/// What reading `r`, which a caller can see, makes a function.
+///
+/// Only an exact access is known not to be volatile, by the instruction's
+/// marker, which `insn_effect` has already asked. A block operation reads
+/// bytes of no stated type, and they may be a volatile object's, whose read
+/// is observable.
+fn read_effect(r: &Footprint) -> MemEffect {
+    match r {
+        Footprint::At(_) => MemEffect::Pure,
+        Footprint::Object(_) | Footprint::Escaped | Footprint::Anything => MemEffect::Unknown,
     }
 }
 
@@ -409,6 +411,161 @@ mod tests {
         });
         let table = EffectTable::build(&module(vec![f]), &types());
         assert_eq!(table.of("f"), MemEffect::Unknown);
+    }
+
+    /// A block operation, as the linearizer makes `memset(dest, 0, n)` and
+    /// `memcpy(dest, src, n)`.
+    fn block_op(op: Opcode, dest: PseudoId, src: PseudoId) -> Instruction {
+        Instruction::new(op)
+            .with_src3(dest, src, PseudoId(9))
+            .with_type_and_size(types().void_ptr_id, 64)
+    }
+
+    /// The effect of a static function with two local buffers
+    /// `@a.0` (`%10`) and `@b.0` (`%11`), a global `g` (`%12`), a pointer
+    /// argument (`%13`) and the instructions `body` adds.
+    fn effect_of(body: impl FnOnce(&mut Function, &mut BasicBlock)) -> MemEffect {
+        let t = types();
+        let f = func("f", true, |f, bb| {
+            f.add_pseudo(Pseudo::sym(PseudoId(0), "a.0".into()));
+            f.add_pseudo(Pseudo::sym(PseudoId(1), "b.0".into()));
+            f.add_pseudo(Pseudo::sym(PseudoId(12), "g".into()));
+            f.add_pseudo(Pseudo::arg(PseudoId(13), 0));
+            f.add_pseudo(Pseudo::val(PseudoId(9), 200));
+            f.add_local("a.0", PseudoId(0), t.long_id, None, None);
+            f.add_local("b.0", PseudoId(1), t.long_id, None, None);
+            bb.add_insn(Instruction::sym_addr(
+                PseudoId(10),
+                PseudoId(0),
+                t.void_ptr_id,
+            ));
+            bb.add_insn(Instruction::sym_addr(
+                PseudoId(11),
+                PseudoId(1),
+                t.void_ptr_id,
+            ));
+            body(f, bb);
+        });
+        EffectTable::build(&module(vec![f]), &types()).of("f")
+    }
+
+    /// **The precision block ops add.** A `memset` or `memcpy` that touches
+    /// only the function's own buffers is as invisible to a caller as the
+    /// stores it stands for.
+    #[test]
+    fn effects_a_block_op_on_private_buffers_contributes_nothing() {
+        let e = effect_of(|_, bb| {
+            bb.add_insn(block_op(Opcode::Memset, PseudoId(10), PseudoId(9)));
+        });
+        assert_eq!(e, MemEffect::Const, "memset of a private buffer");
+        for op in [Opcode::Memcpy, Opcode::Memmove] {
+            let e = effect_of(|_, bb| {
+                bb.add_insn(block_op(op, PseudoId(10), PseudoId(11)));
+            });
+            assert_eq!(e, MemEffect::Const, "{op:?} between private buffers");
+        }
+        // The result is a pointer into the buffer, and reading through it
+        // is still private.
+        let e = effect_of(|_, bb| {
+            let t = types();
+            bb.add_insn(
+                block_op(Opcode::Memset, PseudoId(10), PseudoId(9)).with_target(PseudoId(20)),
+            );
+            bb.add_insn(Instruction::load(
+                PseudoId(21),
+                PseudoId(20),
+                0,
+                t.int_id,
+                32,
+            ));
+        });
+        assert_eq!(e, MemEffect::Pure, "a load through an unresolved pointer");
+    }
+
+    /// A function body under construction, for a table of them.
+    type Body = Box<dyn FnOnce(&mut Function, &mut BasicBlock)>;
+
+    /// The conservative answers stay conservative: a block op that writes a
+    /// global, writes through a pointer it was given, reads anything a caller
+    /// can see, or touches a buffer whose address escaped is a write -- and
+    /// so is everything the table does not model.
+    #[test]
+    fn effects_a_block_op_on_visible_memory_is_unknown() {
+        let t = types();
+        let cases: Vec<(&str, Body)> = vec![
+            (
+                "memset of a global",
+                Box::new(|_, bb| bb.add_insn(block_op(Opcode::Memset, PseudoId(12), PseudoId(9)))),
+            ),
+            (
+                "memset through an argument",
+                Box::new(|_, bb| bb.add_insn(block_op(Opcode::Memset, PseudoId(13), PseudoId(9)))),
+            ),
+            (
+                "memcpy into an argument",
+                Box::new(|_, bb| bb.add_insn(block_op(Opcode::Memcpy, PseudoId(13), PseudoId(10)))),
+            ),
+            (
+                "memcpy out of a global",
+                Box::new(|_, bb| bb.add_insn(block_op(Opcode::Memcpy, PseudoId(10), PseudoId(12)))),
+            ),
+            (
+                "memcpy out of an argument",
+                Box::new(|_, bb| bb.add_insn(block_op(Opcode::Memcpy, PseudoId(10), PseudoId(13)))),
+            ),
+            (
+                "memset of an escaped buffer",
+                Box::new(move |_, bb| {
+                    bb.add_insn(block_op(Opcode::Memset, PseudoId(10), PseudoId(9)));
+                    bb.add_insn(Instruction::call(
+                        None,
+                        "keep",
+                        vec![PseudoId(10)],
+                        vec![t.void_ptr_id],
+                        t.void_id,
+                        0,
+                    ));
+                }),
+            ),
+            (
+                "inline asm",
+                Box::new(|_, bb| bb.add_insn(Instruction::new(Opcode::Asm))),
+            ),
+            (
+                "an atomic on a private buffer",
+                Box::new(move |_, bb| {
+                    bb.add_insn(
+                        Instruction::new(Opcode::AtomicLoad)
+                            .with_target(PseudoId(20))
+                            .with_src(PseudoId(10))
+                            .with_type_and_size(t.int_id, 32),
+                    )
+                }),
+            ),
+            (
+                "a volatile store to a private buffer",
+                Box::new(move |_, bb| {
+                    bb.add_insn(
+                        Instruction::store(PseudoId(9), PseudoId(10), 0, t.int_id, 32)
+                            .with_volatile(true),
+                    )
+                }),
+            ),
+        ];
+        for (what, body) in cases {
+            assert_eq!(effect_of(body), MemEffect::Unknown, "{what}");
+        }
+        // A plain load of the global beside them is only a read.
+        let e = effect_of(|_, bb| {
+            bb.add_insn(Instruction::load(
+                PseudoId(20),
+                PseudoId(12),
+                0,
+                t.int_id,
+                32,
+            ));
+        });
+        assert_eq!(e, MemEffect::Pure);
     }
 
     /// A caller is as dirty as its callee, and the sweep propagates it.

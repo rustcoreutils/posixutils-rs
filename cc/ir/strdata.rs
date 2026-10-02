@@ -213,7 +213,7 @@ impl<'a> StrReader<'a> {
     /// The object `p` points into, and how far into it, when it is known and
     /// `p` is inside it.
     fn object_at(&self, p: PseudoId) -> Option<(&'a [u8], usize)> {
-        let loc = self.am.resolve(self.func, p, 0, 0, None);
+        let loc = self.am.object_of(self.func, p);
         let MemBase::Global(name) = loc.base else {
             return None;
         };
@@ -246,7 +246,7 @@ impl<'a> StrReader<'a> {
         // An address with a place -- a local, or outside the object -- is
         // not a string this knows, whatever its arithmetic looks like;
         // unless it is a local whose bytes are known here.
-        let loc = self.am.resolve(self.func, p, 0, 0, None);
+        let loc = self.am.object_of(self.func, p);
         match loc.base {
             MemBase::Local(_) => return self.local_len(&loc).map(|n| Walk::Len(Len::Const(n))),
             MemBase::Global(_) => return None,

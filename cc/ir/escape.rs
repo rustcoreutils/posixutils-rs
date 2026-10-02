@@ -149,14 +149,10 @@ enum Effect {
 }
 
 fn holder_effect(insn: &Instruction, p: PseudoId) -> Effect {
+    if let Some(e) = dereferenced(insn, p) {
+        return e;
+    }
     match insn.op {
-        // Reading through the address is an access.
-        Opcode::Load if insn.src.first() == Some(&p) => Effect::Access,
-        // Writing *through* it is an access; writing *it* is an escape, and
-        // the order of these two arms is what distinguishes them.
-        Opcode::Store if insn.src.get(1) == Some(&p) => Effect::Escapes,
-        Opcode::Store if insn.src.first() == Some(&p) => Effect::Access,
-
         // Another name for the same address.
         Opcode::SymAddr | Opcode::Copy if insn.src.first() == Some(&p) => match insn.target {
             Some(t) => Effect::Holds(t),
@@ -176,6 +172,40 @@ fn holder_effect(insn: &Instruction, p: PseudoId) -> Effect {
         // `ssa::analyze_variable` makes, and for the same reason.
         _ => Effect::Escapes,
     }
+}
+
+/// The use of `p` by an instruction that reads or writes through it in
+/// place -- `memloc::accessed_slots` -- or `None` when the instruction does
+/// something else with it.
+///
+/// Every slot `p` fills has to be one of those: a `Store` of the address
+/// through itself writes the address, and a `memset` filling a block with
+/// its own address converts it to a byte. Either is an escape, however
+/// another slot uses it.
+///
+/// A block operation keeps neither pointer -- `memcpy`, `memmove` and
+/// `memset` read and write the bytes and return (C17 7.24.2.1p3, 7.24.2.2p3,
+/// 7.24.6.1p3) -- but it does return its destination, so a result that
+/// holds the address holds it as surely as a `Copy` would.
+fn dereferenced(insn: &Instruction, p: PseudoId) -> Option<Effect> {
+    let slots = super::memloc::accessed_slots(insn.op);
+    let mut used = false;
+    for (i, s) in insn.src.iter().enumerate() {
+        if *s == p {
+            if !slots.contains(&i) {
+                return None;
+            }
+            used = true;
+        }
+    }
+    if !used || insn.target == Some(p) {
+        return None;
+    }
+    let returns_dest = matches!(insn.op, Opcode::Memset | Opcode::Memcpy | Opcode::Memmove);
+    Some(match insn.target {
+        Some(t) if returns_dest && insn.src.first() == Some(&p) => Effect::Holds(t),
+        _ => Effect::Access,
+    })
 }
 
 #[cfg(test)]
@@ -284,6 +314,81 @@ mod tests {
             bb.add_insn(Instruction::store(PseudoId(11), PseudoId(5), 0, t, 64));
         });
         assert!(captured(&itself));
+    }
+
+    fn block_op(op: Opcode, dest: PseudoId, src: PseudoId, len: PseudoId) -> Instruction {
+        Instruction::new(op)
+            .with_src3(dest, src, len)
+            .with_type_and_size(host_types().void_ptr_id, 64)
+    }
+
+    /// A block operation reads and writes through its pointers and keeps
+    /// neither: a local it is given as destination or source has not
+    /// escaped, exactly as one it loads and stores through has not.
+    #[test]
+    fn escape_a_block_op_is_an_access() {
+        let other = PseudoId(6);
+        for (op, dest, src) in [
+            (Opcode::Memset, PseudoId(11), PseudoId(5)),
+            (Opcode::Memcpy, PseudoId(11), other),
+            (Opcode::Memcpy, other, PseudoId(11)),
+            (Opcode::Memmove, PseudoId(11), PseudoId(10)),
+        ] {
+            let mut f = with_local(|_, bb| bb.add_insn(block_op(op, dest, src, PseudoId(5))));
+            f.add_pseudo(Pseudo::val(other, 0));
+            assert!(!captured(&f), "{op:?} {dest:?} {src:?}");
+        }
+    }
+
+    /// The address in any other operand of a block op is a value: filling a
+    /// block with it, or using it as a length, lets it out -- and so does
+    /// one such slot when another is an access.
+    #[test]
+    fn escape_a_block_op_operand_that_is_not_a_pointer_escapes() {
+        for (op, dest, src, len) in [
+            (Opcode::Memset, PseudoId(5), PseudoId(11), PseudoId(5)),
+            (Opcode::Memset, PseudoId(11), PseudoId(11), PseudoId(5)),
+            (Opcode::Memcpy, PseudoId(5), PseudoId(5), PseudoId(11)),
+            (Opcode::Memmove, PseudoId(11), PseudoId(5), PseudoId(11)),
+        ] {
+            let f = with_local(|_, bb| bb.add_insn(block_op(op, dest, src, len)));
+            assert!(captured(&f), "{op:?} {dest:?} {src:?} {len:?}");
+        }
+    }
+
+    /// A block op returns its destination, so its result holds the address:
+    /// passing that on is an escape, while a result only loaded through is
+    /// not. A result of an op the local was only the *source* of is the
+    /// other pointer, and does not hold it.
+    #[test]
+    fn escape_a_block_op_result_holds_its_destination() {
+        let types = host_types();
+        let pass_on = |dest: PseudoId, src: PseudoId| {
+            with_local(|t, bb| {
+                bb.add_insn(
+                    block_op(Opcode::Memcpy, dest, src, PseudoId(5)).with_target(PseudoId(20)),
+                );
+                bb.add_insn(Instruction::call(
+                    None,
+                    "g",
+                    vec![PseudoId(20)],
+                    vec![t],
+                    types.void_id,
+                    0,
+                ));
+            })
+        };
+        assert!(captured(&pass_on(PseudoId(11), PseudoId(5))));
+        assert!(!captured(&pass_on(PseudoId(5), PseudoId(11))));
+
+        let read_back = with_local(|t, bb| {
+            bb.add_insn(
+                block_op(Opcode::Memset, PseudoId(11), PseudoId(5), PseudoId(5))
+                    .with_target(PseudoId(20)),
+            );
+            bb.add_insn(Instruction::load(PseudoId(21), PseudoId(20), 0, t, 64));
+        });
+        assert!(!captured(&read_back));
     }
 
     /// An opcode the walk does not model fails closed.

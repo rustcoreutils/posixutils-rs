@@ -33,6 +33,7 @@ mod inline_asm;
 mod inlining;
 mod int128;
 mod memopt;
+mod memopt_blockops;
 mod ms_abi;
 mod optimizer;
 mod pic;

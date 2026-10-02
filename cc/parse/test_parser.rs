@@ -6427,6 +6427,63 @@ fn test_library_builtin_result_is_not_an_lvalue() {
     }
 }
 
+/// A null pointer constant is an integer constant expression with the value
+/// 0, or one cast to `void *` (C17 6.3.2.3p3) -- no other cast, and no
+/// integer constant that a pointer was converted to reach (6.6p6).
+#[test]
+fn test_null_pointer_constants() {
+    let decls = "int *p; enum { Z };";
+    for (stmt, null) in [
+        ("0", true),
+        ("0L", true),
+        ("'\\0'", true),
+        ("1 - 1", true),
+        ("Z", true),
+        ("(long)0", true),
+        ("(int)0.0", true),
+        ("(void *)0", true),
+        ("(void *)(1 - 1)", true),
+        ("sizeof p - sizeof p", true),
+        ("1", false),
+        ("(void *)1", false),
+        ("(char *)0", false),
+        ("(int *)0", false),
+        ("(const void *)0", false),
+        ("(int)(char *)0", false),
+        ("(int)(long)(char *)0", false),
+        ("(void *)(long)(char *)0", false),
+        ("p", false),
+    ] {
+        let got = with_statement_expr(decls, stmt, |p, e| p.is_null_pointer_constant(e));
+        assert_eq!(got, null, "{stmt}");
+    }
+}
+
+/// `return` is checked by the parser against the enclosing function's
+/// declared return type, with the simple-assignment constraints.
+#[test]
+fn test_return_is_checked_against_the_declared_type() {
+    for src in [
+        "int f(void) { return; }",
+        "void f(void) { return 1; }",
+        "void h(void); int f(void) { return h(); }",
+        "struct A { int x; }; struct B { int x; }; struct A f(struct B b) { return b; }",
+    ] {
+        let before = crate::diag::error_count();
+        let _ = parse_tu(src);
+        assert!(crate::diag::error_count() > before, "{src}: accepted");
+    }
+    for src in [
+        "int *f(void) { return 5; }",
+        "int *f(void) { return (char *)0; }",
+        "int *f(void) { return (int)(char *)0; }",
+    ] {
+        let before = crate::diag::warning_count();
+        let _ = parse_tu(src);
+        assert!(crate::diag::warning_count() > before, "{src}: not warned");
+    }
+}
+
 /// An argument the prototype rejects, or the wrong number of them, is
 /// reported by the ordinary call checks, and the call is not lowered: a zero
 /// of the return type stands in for it, so nothing converts a structure to

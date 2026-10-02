@@ -21,6 +21,7 @@
 mod asm_constraints;
 mod asm_templates;
 mod cast_to_union;
+mod return_conversion;
 mod va_arg_pack;
 
 use crate::common::{
@@ -1270,12 +1271,12 @@ fn diagnostics_incompatible_assignment_is_rejected() {
         (
             "return_ptr_from_double",
             "int *f(void){ return 1.5; }\n",
-            "incompatible types returning",
+            "incompatible types when returning",
         ),
         (
             "return_struct_mismatch",
             "struct A{int x;}; struct B{int x;};\nstruct A f(void){ struct B b; return b; }\n",
-            "incompatible types returning",
+            "incompatible types when returning",
         ),
         (
             "argument_ptr_from_double",

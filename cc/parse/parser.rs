@@ -148,7 +148,8 @@ pub(crate) struct ParsedDeclarator {
 
 // Parser
 
-/// The function whose body is being parsed, as the variadic builtins see it.
+/// The function whose body is being parsed, as `return` and the variadic
+/// builtins see it.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct EnclosingFunction {
     /// Declared with `...`: `__builtin_va_start` needs it to be.
@@ -162,6 +163,9 @@ pub(crate) struct EnclosingFunction {
     /// The function's calling convention, which decides which of
     /// `__builtin_va_start` and `__builtin_ms_va_start` it may use.
     pub(crate) conv: crate::abi::CallingConv,
+    /// The declared return type, which a `return` converts its value to.
+    /// `None` outside a function body.
+    pub(crate) return_type: Option<TypeId>,
 }
 
 /// C expression parser using recursive descent with precedence climbing

@@ -22,6 +22,18 @@ use crate::token::lexer::Position;
 use crate::types::{AssignFault, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
 
+/// Where a value is converted as if by assignment (C17 6.5.16.1). The
+/// constraints are the same in each; only the wording of a fault differs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConversionSite {
+    /// `=` (6.5.16.1) and the store-back of a compound assignment.
+    Assignment,
+    /// The initializer of a scalar (6.7.9p11).
+    Initialization,
+    /// A `return` statement's value (6.8.6.4p3).
+    Return,
+}
+
 impl Parser<'_> {
     /// Check a call's arguments against the function type it calls: their
     /// number, then each one's type (C17 6.5.2.2p2).
@@ -549,7 +561,7 @@ impl Parser<'_> {
             return;
         };
         let null_constant = self.is_null_pointer_constant(value);
-        self.check_assignment_conversion(t, v, null_constant, pos);
+        self.check_assignment_conversion(ConversionSite::Assignment, t, v, null_constant, pos);
     }
 
     /// Report a compound assignment whose operands the operator rejects
@@ -573,14 +585,65 @@ impl Parser<'_> {
         let Some(t) = target.typ else { return };
         let left = self.lvalue_converted_type(t);
         let result = self.binary_result_type(op, left, value);
-        self.check_assignment_conversion(t, result, false, pos);
+        self.check_assignment_conversion(ConversionSite::Assignment, t, result, false, pos);
+    }
+
+    /// Check a `return` statement against the enclosing function's declared
+    /// return type (C17 6.8.6.4). `pos` is the `return` keyword's.
+    ///
+    /// p1 forbids returning a *value* from a void function. An expression of
+    /// type `void` has none, so `return f();` where `f` returns void -- the
+    /// ordinary tail-call wrapper, which gcc and Clang both accept -- is not a
+    /// violation. p3 converts a returned value "as if by assignment", so the
+    /// simple-assignment constraints govern it, asked in exactly the same
+    /// way as for `=`.
+    ///
+    /// A value-ness mismatch is an error, as the constraint makes it. gcc
+    /// warns and compiles, and code that does this is old rather than clever
+    /// -- so `-fpermissive`, which already relaxes implicit `int` and
+    /// implicit function declarations for exactly that reason, relaxes these
+    /// too. The value is discarded either way, and a missing one leaves the
+    /// returned value indeterminate, which is what gcc's program does as well.
+    pub(super) fn check_return(&mut self, value: Option<&Expr>, pos: Position) {
+        let Some(declared) = self.enclosing_function.return_type else {
+            return;
+        };
+        let returns_void = self.types.kind(declared) == TypeKind::Void;
+        match value {
+            None if !returns_void => diag::permissive_error(
+                pos,
+                &gettext("'return' with no value in a function returning non-void"),
+            ),
+            Some(e) if returns_void => {
+                if e.typ.is_some_and(|t| self.types.kind(t) != TypeKind::Void) {
+                    diag::permissive_error(
+                        e.pos,
+                        &gettext("'return' with a value in a function returning void"),
+                    );
+                }
+            }
+            Some(e) => {
+                if let Some(v) = e.typ {
+                    let null_constant = self.is_null_pointer_constant(e);
+                    self.check_assignment_conversion(
+                        ConversionSite::Return,
+                        declared,
+                        v,
+                        null_constant,
+                        e.pos,
+                    );
+                }
+            }
+            None => {}
+        }
     }
 
     /// Report a value of type `v` that cannot be converted to the type `t`
-    /// as if by assignment (C17 6.5.16.1p1). `null_constant` says whether the
-    /// value is a null pointer constant.
+    /// as if by assignment (C17 6.5.16.1p1), in the words `site` calls for.
+    /// `null_constant` says whether the value is a null pointer constant.
     fn check_assignment_conversion(
         &mut self,
+        site: ConversionSite,
         t: TypeId,
         v: TypeId,
         null_constant: bool,
@@ -593,18 +656,32 @@ impl Parser<'_> {
         };
         if fault == AssignFault::FunctionPointerVoid {
             if diag::warning_group_enabled(crate::types::FUNCTION_POINTER_CONV) {
-                diag::warning(
-                    pos,
-                    &gettext("ISO C forbids assignment between function pointer and 'void *'"),
-                );
+                let msg = match site {
+                    ConversionSite::Assignment => {
+                        gettext("ISO C forbids assignment between function pointer and 'void *'")
+                    }
+                    ConversionSite::Initialization => gettext(
+                        "ISO C forbids initialization between function pointer and 'void *'",
+                    ),
+                    ConversionSite::Return => {
+                        gettext("ISO C forbids return between function pointer and 'void *'")
+                    }
+                };
+                diag::warning(pos, &msg);
             }
             return;
         }
-        let (t_name, v_name) = (
-            self.types.format_type(t, Some(self.idents)),
-            self.types.format_type(v, Some(self.idents)),
-        );
         if fault.is_error() {
+            // An aggregate initialized from something that is not a
+            // compatible aggregate is "invalid initializer" in gcc, not a
+            // type mismatch -- and the wording is the useful part, being what
+            // a user searches for. gcc says so even of a `void` value.
+            if site == ConversionSite::Initialization
+                && matches!(self.types.kind(t), TypeKind::Struct | TypeKind::Union)
+            {
+                diag::error(pos, &gettext("invalid initializer"));
+                return;
+            }
             // gcc words this one case differently, and it is the clearer
             // phrasing: the problem is not the types but that there is no
             // value at all.
@@ -612,17 +689,32 @@ impl Parser<'_> {
                 diag::error(pos, &gettext("void value not ignored as it ought to be"));
                 return;
             }
-            diag::error_args(
-                pos,
-                "incompatible types when assigning to type '{0}' from type '{1}'",
-                &[&t_name, &v_name],
-            );
+        }
+        let (t_name, v_name) = (
+            self.types.format_type(t, Some(self.idents)),
+            self.types.format_type(v, Some(self.idents)),
+        );
+        let template = match (site, fault.is_error()) {
+            (ConversionSite::Assignment, true) => {
+                "incompatible types when assigning to type '{0}' from type '{1}'"
+            }
+            (ConversionSite::Initialization, true) => {
+                "incompatible types when initializing type '{0}' using type '{1}'"
+            }
+            (ConversionSite::Return, true) => {
+                "incompatible types when returning type '{1}' but '{0}' was expected"
+            }
+            (ConversionSite::Assignment, false) => "assignment to '{0}' from '{1}' {2}",
+            (ConversionSite::Initialization, false) => "initialization of '{0}' from '{1}' {2}",
+            (ConversionSite::Return, false) => {
+                "returning '{1}' from a function with return type '{0}' {2}"
+            }
+        };
+        let args: &[&str] = &[&t_name, &v_name, fault.describe()];
+        if fault.is_error() {
+            diag::error_args(pos, template, args);
         } else {
-            diag::warning_args(
-                pos,
-                "assignment to '{0}' from '{1}' {2}",
-                &[&t_name, &v_name, fault.describe()],
-            );
+            diag::warning_args(pos, template, args);
         }
     }
 
@@ -663,57 +755,14 @@ impl Parser<'_> {
             return;
         }
 
-        let t = self.decayed_type(target);
-        let v = self.decayed_type(v);
-        let Some(fault) = self
-            .types
-            .assignment_fault(t, v, self.is_null_pointer_constant(init))
-        else {
-            return;
-        };
-
-        // An aggregate initialized from something that is not a compatible
-        // aggregate is "invalid initializer" in gcc, not a type mismatch --
-        // and the wording is the useful part, being what a user searches for.
-        if fault.is_error() && matches!(self.types.kind(t), TypeKind::Struct | TypeKind::Union) {
-            diag::error(init.pos, &gettext("invalid initializer"));
-            return;
-        }
-
-        if fault == AssignFault::FunctionPointerVoid {
-            if diag::warning_group_enabled(crate::types::FUNCTION_POINTER_CONV) {
-                diag::warning(
-                    init.pos,
-                    &gettext("ISO C forbids initialization between function pointer and 'void *'"),
-                );
-            }
-            return;
-        }
-
-        let (t_name, v_name) = (
-            self.types.format_type(t, Some(self.idents)),
-            self.types.format_type(v, Some(self.idents)),
+        let null_constant = self.is_null_pointer_constant(init);
+        self.check_assignment_conversion(
+            ConversionSite::Initialization,
+            target,
+            v,
+            null_constant,
+            init.pos,
         );
-        if fault.is_error() {
-            if self.types.kind(v) == TypeKind::Void {
-                diag::error(
-                    init.pos,
-                    &gettext("void value not ignored as it ought to be"),
-                );
-                return;
-            }
-            diag::error_args(
-                init.pos,
-                "incompatible types when initializing type '{0}' using type '{1}'",
-                &[&t_name, &v_name],
-            );
-        } else {
-            diag::warning_args(
-                init.pos,
-                "initialization of '{0}' from '{1}' {2}",
-                &[&t_name, &v_name, fault.describe()],
-            );
-        }
     }
 
     /// C11 6.5.2.3p5: naming a member of an atomic structure or union is
@@ -797,15 +846,58 @@ impl Parser<'_> {
     }
 
     /// Is this expression a null pointer constant (C17 6.3.2.3p3) -- an
-    /// integer constant expression with the value 0, possibly cast to
-    /// `void *`?
-    fn is_null_pointer_constant(&self, expr: &Expr) -> bool {
+    /// integer constant expression with the value 0, or such an expression
+    /// cast to `void *`?
+    ///
+    /// Only a cast to `void *` itself qualifies: `(char *)0` is a null
+    /// *pointer* of type `char *`, which converts to an `int *` no more than
+    /// any other `char *` does, and `(const void *)0` keeps its qualifier.
+    pub(super) fn is_null_pointer_constant(&self, expr: &Expr) -> bool {
         let inner = match &expr.kind {
-            ExprKind::Cast { expr: inner, .. } => inner,
+            ExprKind::Cast {
+                cast_type,
+                expr: inner,
+            } if self.is_unqualified_void_pointer(*cast_type) => inner,
             _ => expr,
         };
-        self.types.kind(inner.typ.unwrap_or(self.types.int_id)) != TypeKind::Pointer
+        self.types
+            .is_integer(inner.typ.unwrap_or(self.types.int_id))
             && self.eval_const_expr(inner) == Some(0)
+            && !self.evaluates_a_pointer(inner)
+    }
+
+    /// Is `typ` exactly `void *`, the one type a null pointer constant may
+    /// be cast to and remain one?
+    fn is_unqualified_void_pointer(&self, typ: TypeId) -> bool {
+        self.types.kind(typ) == TypeKind::Pointer
+            && self.types.base_type(typ).is_some_and(|base| {
+                self.types.kind(base) == TypeKind::Void && self.types.qualifiers(base).is_empty()
+            })
+    }
+
+    /// Does evaluating `expr` involve a pointer, an array or a function?
+    ///
+    /// An integer constant expression may cast only arithmetic types to
+    /// integer types (C17 6.6p6), so `(int)(char *)0` folds to zero but is no
+    /// integer constant expression, and so no null pointer constant. The
+    /// operand of `sizeof`, `_Alignof` and `__builtin_constant_p` is not
+    /// evaluated, and may be anything.
+    fn evaluates_a_pointer(&self, expr: &Expr) -> bool {
+        if matches!(
+            expr.kind,
+            ExprKind::SizeofExpr(_) | ExprKind::AlignofExpr(_) | ExprKind::ConstantP(_)
+        ) {
+            return false;
+        }
+        expr.typ.is_some_and(|t| {
+            matches!(
+                self.types.kind(t),
+                TypeKind::Pointer | TypeKind::Array | TypeKind::Function
+            )
+        }) || expr
+            .operands()
+            .into_iter()
+            .any(|e| self.evaluates_a_pointer(e))
     }
 
     /// Does this expression designate an object (C17 6.3.2.1p1)?

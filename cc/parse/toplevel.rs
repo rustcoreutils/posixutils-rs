@@ -157,6 +157,7 @@ impl Parser<'_> {
                 forwarding: is_variadic && attrs.always_inline,
                 last_param,
                 conv: func.conv,
+                return_type: func.base,
             },
         );
         let body = self.parse_block_stmt_no_scope();

@@ -307,15 +307,19 @@ impl Parser<'_> {
     }
 
     fn parse_return_stmt(&mut self) -> ParseResult<Stmt> {
+        let pos = self.current_pos();
         self.advance(); // consume 'return'
 
         if self.is_special(b';') {
             self.advance();
+            self.check_return(None, pos);
             return Ok(Stmt::Return(None));
         }
 
         let expr = self.parse_expression()?;
-        self.check_not_vector_value(expr.typ, expr.pos);
+        if !self.check_not_vector_value(expr.typ, expr.pos) {
+            self.check_return(Some(&expr), pos);
+        }
         self.expect_special(b';')?;
         Ok(Stmt::Return(Some(expr)))
     }

@@ -26,18 +26,6 @@ use crate::strings::StringId;
 use crate::symbol::SymbolId;
 use crate::types::TypeTable;
 
-/// A `return` whose value-ness does not match the function's type.
-///
-/// C17 6.8.6.4p1 makes both a constraint violation, and c17 reports them as
-/// errors. gcc warns and compiles, and code that does this is old rather than
-/// clever -- so `-fpermissive`, which already relaxes implicit `int` and
-/// implicit function declarations for exactly that reason, relaxes these too.
-/// The value is discarded either way, and a missing one leaves the returned
-/// value indeterminate, which is what gcc's program does as well.
-fn return_value_ness_violation(pos: Position, msg: &str) {
-    crate::diag::permissive_error(pos, msg);
-}
-
 use crate::types::{TypeId, TypeKind, TypeModifiers};
 
 /// The `-Wno-<name>` group for a case label the switch's promoted controlling
@@ -187,40 +175,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             Stmt::Return(expr) => {
-                // C99 6.8.6.4p1: a `return` with an expression may not appear
-                // in a void function, and one without an expression may not
-                // appear in a function that returns a value.
-                let declared_ret = self.current_func.as_ref().map(|f| f.return_type);
-                if let Some(rt) = declared_ret {
-                    let returns_void = self.types.kind(rt) == TypeKind::Void;
-                    match expr {
-                        // 6.8.6.4p1 forbids returning a *value*. An expression
-                        // of type `void` has none, so `return f();` where `f`
-                        // returns void — the ordinary tail-call wrapper, which
-                        // GCC and Clang both accept — is not a violation.
-                        Some(e)
-                            if returns_void
-                                && self.types.kind(self.expr_type(e)) != TypeKind::Void =>
-                        {
-                            return_value_ness_violation(
-                                e.pos,
-                                "'return' with a value in a function returning void",
-                            )
-                        }
-                        None if !returns_void => return_value_ness_violation(
-                            // `Stmt` carries no position, so fall back to the
-                            // last expression lowered in this function.
-                            self.current_pos.unwrap_or_default(),
-                            "'return' with no value in a function returning non-void",
-                        ),
-                        // 6.8.6.4p3 converts the value "as if by assignment",
-                        // so the simple-assignment constraints of 6.5.16.1
-                        // govern it and are asked in exactly the same words.
-                        Some(e) if !returns_void => self.check_return_type(rt, e),
-                        _ => {}
-                    }
-                }
-
+                // The parser has checked the value against the declared
+                // return type (C17 6.8.6.4).
                 if let Some(e) = expr {
                     let expr_typ = self.expr_type(e);
                     // Get the function's actual return type for proper conversion
@@ -941,45 +897,6 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// Linearize an initializer list for arrays or structs
-    /// Check a returned value against the function's declared return type
-    /// (C17 6.8.6.4p3, whose constraints are 6.5.16.1's).
-    fn check_return_type(&mut self, declared: TypeId, expr: &Expr) {
-        let value = self.expr_type(expr);
-        let null_constant =
-            self.types.kind(value) != TypeKind::Pointer && self.eval_const_expr(expr) == Some(0);
-        let Some(fault) = self.types.assignment_fault(declared, value, null_constant) else {
-            return;
-        };
-        if fault == crate::types::AssignFault::FunctionPointerVoid {
-            if crate::diag::warning_group_enabled(crate::types::FUNCTION_POINTER_CONV) {
-                crate::diag::warning(
-                    expr.pos,
-                    &gettextrs::gettext(
-                        "ISO C forbids return between function pointer and 'void *'",
-                    ),
-                );
-            }
-            return;
-        }
-        let (d_name, v_name) = (
-            self.types.format_type(declared, Some(self.strings)),
-            self.types.format_type(value, Some(self.strings)),
-        );
-        if fault.is_error() {
-            crate::diag::error_args(
-                expr.pos,
-                "incompatible types returning '{0}' from a function returning '{1}'",
-                &[&v_name, &d_name],
-            );
-        } else {
-            crate::diag::warning_args(
-                expr.pos,
-                "returning '{0}' from a function with return type '{1}' {2}",
-                &[&v_name, &d_name, fault.describe()],
-            );
-        }
-    }
-
     pub(crate) fn linearize_init_list(
         &mut self,
         base_sym: PseudoId,

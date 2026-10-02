@@ -206,7 +206,7 @@ The result is `typ`/`size`; the operands' type and width are
 | `setlt`, `setle`, `setgt`, `setge` | Signed `<`, `<=`, `>`, `>=` |
 | `setb`, `setbe`, `seta`, `setae` | Unsigned `<`, `<=`, `>`, `>=` ("below", "above") |
 | `fcmp_oeq`, `fcmp_olt`, `fcmp_ole`, `fcmp_ogt`, `fcmp_oge` | Ordered `==`, `<`, `<=`, `>`, `>=`: false when either operand is a NaN |
-| `fcmp_one` | C's `!=`, which despite the name is **unordered**: true when either operand is a NaN (`constfold::fcmp_mask`) |
+| `fcmp_one` | C's `!=`, which despite the name is **unordered**: true when either operand is a NaN (`constfold::Outcomes::of_op`) |
 
 ### Type Conversions
 

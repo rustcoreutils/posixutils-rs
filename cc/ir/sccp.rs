@@ -33,7 +33,7 @@
 // `dominate::domtree_build` *fresh*, after the CFG edits here.
 //
 
-use super::constfold::{eval_int, get_cmp_info, int_fold_arity, is_int_foldable};
+use super::constfold::{eval_int, int_fold_arity, is_int_foldable, Outcomes};
 use super::dataflow::{Lattice, Selector, Sparse, SparseAnalysis};
 use super::facts::ConstMap;
 use super::propagate::cbr_taken;
@@ -113,10 +113,12 @@ impl Solver {
         }
         // A comparison of a value with itself is decided without knowing
         // the value, exactly as `instcombine` does it.
-        if let ([a, b], Some(info)) = (insn.src.as_slice(), get_cmp_info(insn.op)) {
+        if let ([a, b], Some((mask, domain))) = (insn.src.as_slice(), Outcomes::of_op(insn.op)) {
             let w = insn.operand_width();
             if self.consts.root(*a, w) == self.consts.root(*b, w) {
-                return Val::Const(info.identity_result);
+                if let Some(v) = mask.decide(domain.reflexive()) {
+                    return Val::Const(i128::from(v));
+                }
             }
         }
         if pending {

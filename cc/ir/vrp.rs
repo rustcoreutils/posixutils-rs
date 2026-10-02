@@ -39,11 +39,9 @@
 // `SparseAnalysis::run`.
 //
 
-use super::constfold::{
-    cmp_mask, eval_int, get_cmp_info, is_int_foldable, CMP_ALL, CMP_EQ, CMP_GT, CMP_LT,
-};
+use super::constfold::{eval_int, is_int_foldable, CmpDomain, Outcomes};
 use super::dataflow::{Lattice, Selector, Sparse, SparseAnalysis};
-use super::facts::{CmpDomain, CmpFacts, ConstMap};
+use super::facts::{CmpFacts, ConstMap};
 use super::propagate::cbr_taken;
 use super::range::{allowed_by_predicate, possible_orderings, Range};
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId, Site};
@@ -259,15 +257,19 @@ impl Solver {
             else {
                 continue;
             };
-            let m = if w { fact.mask } else { !fact.mask & CMP_ALL };
+            let m = if w {
+                fact.mask
+            } else {
+                fact.mask.complement(fact.domain)
+            };
             // `(_Bool)(x <= 0)` reaches a branch as `setne %t, 0` over the
             // real comparison, so the fact at the `Cbr` is about a boolean.
             // Peel through to what it tests, then keep going: `x != 0` also
             // refines `x` itself, exactly.
             if self.consts.get(fact.rhs) == Some(0) {
-                if fact.mask == CMP_EQ {
+                if fact.mask == Outcomes::EQ {
                     work.push((fact.lhs, !w));
-                } else if fact.mask == CMP_LT | CMP_GT {
+                } else if fact.mask == Outcomes::LT | Outcomes::GT {
                     work.push((fact.lhs, w));
                 }
             }
@@ -287,7 +289,7 @@ impl Solver {
             record_fact(
                 &mut out,
                 fact.rhs,
-                allowed_by_predicate(super::constfold::mirror_mask(m), signed, &lhs_r),
+                allowed_by_predicate(m.mirror(), signed, &lhs_r),
             );
         }
 
@@ -433,33 +435,28 @@ impl Solver {
         else {
             return RVal::Bottom;
         };
-        let Some(mask) = cmp_mask(insn.op) else {
+        let Some((mask, domain @ CmpDomain::Int { signed })) = Outcomes::of_op(insn.op) else {
             return RVal::Bottom;
         };
-        let signed = get_cmp_info(insn.op).map(|i| i.signed).unwrap_or(true);
         // Comparing a value with itself is decided without knowing it.
-        if self.consts.root(insn.src[0], ow) == self.consts.root(insn.src[1], ow) {
-            if let Some(info) = get_cmp_info(insn.op) {
-                return RVal::Known(Range::from_const(rw, info.identity_result));
-            }
-        }
-        let (RVal::Known(a), RVal::Known(b)) = (
-            self.operand(block, insn.src[0], ow),
-            self.operand(block, insn.src[1], ow),
-        ) else {
-            return RVal::Bottom;
+        let possible = if self.consts.root(insn.src[0], ow) == self.consts.root(insn.src[1], ow) {
+            domain.reflexive()
+        } else {
+            let (RVal::Known(a), RVal::Known(b)) = (
+                self.operand(block, insn.src[0], ow),
+                self.operand(block, insn.src[1], ow),
+            ) else {
+                return RVal::Bottom;
+            };
+            possible_orderings(&a, &b, signed)
         };
-        let possible = possible_orderings(&a, &b, signed);
-        if possible == 0 {
+        if possible.is_empty() {
             return RVal::Bottom;
         }
-        if possible & mask == 0 {
-            return RVal::Known(Range::from_const(rw, 0));
-        }
-        if possible & !mask & CMP_ALL == 0 {
-            return RVal::Known(Range::from_const(rw, 1));
-        }
-        RVal::Known(Range::inclusive(rw, 0, 1))
+        RVal::Known(match mask.decide(possible) {
+            Some(v) => Range::from_const(rw, i128::from(v)),
+            None => Range::inclusive(rw, 0, 1),
+        })
     }
 }
 

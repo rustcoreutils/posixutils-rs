@@ -26,10 +26,9 @@
 
 use super::constfold::{
     at_width, divmod_may_trap, eval_fbinop, eval_fcvt, eval_fcvtf, eval_fternop, eval_funop,
-    eval_int, fcmp_decided, fcmp_mask, fcmp_outcome, get_cmp_info, is_int_foldable, mirror_mask,
-    possible_against, FCMP_ALL,
+    eval_int, is_int_foldable, possible_against, CmpDomain, Outcomes,
 };
-use super::facts::{CmpDomain, CmpFacts, ConstMap, Relation};
+use super::facts::{CmpFacts, ConstMap, Relation};
 use super::propagate;
 use super::{ConstValue, Function, Instruction, Opcode, PseudoId};
 use crate::float::FloatVal;
@@ -540,9 +539,8 @@ fn simplify_bitwise(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
 /// Unified comparison simplification for all SetXX opcodes
 fn simplify_comparison(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
-    let info = match get_cmp_info(insn.op) {
-        Some(i) => i,
-        None => return Simplification::None,
+    let Some((mask, domain @ CmpDomain::Int { signed })) = Outcomes::of_op(insn.op) else {
+        return Simplification::None;
     };
 
     if insn.src.len() != 2 {
@@ -568,19 +566,22 @@ fn simplify_comparison(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> 
         }
     }
 
-    // Identity: x op x -> identity_result (comparison result is always i32/i64, never i128)
+    // Identity: `x op x` is decided by the outcomes a value has against
+    // itself.
     //
     // By root rather than by pseudo id: promotion out of memory gives every
     // use of a local its own `Copy`, so `x >> 0 != x` arrives as two distinct
     // pseudos naming one value.
     if consts.root(src1, width) == consts.root(src2, width) {
-        return Simplification::FoldToConst(info.identity_result);
+        if let Some(v) = mask.decide(domain.reflexive()) {
+            return Simplification::FoldToConst(i128::from(v));
+        }
     }
 
     // Constant folding. A comparison knows its operand width and signedness
     // from the opcode, so it can read a value `get` would refuse to guess at.
-    let val1 = consts.get_at(src1, width, info.signed);
-    let val2 = consts.get_at(src2, width, info.signed);
+    let val1 = consts.get_at(src1, width, signed);
+    let val2 = consts.get_at(src2, width, signed);
 
     if let (Some(a), Some(b)) = (val1, val2) {
         return fold_with(insn, &[a, b]);
@@ -688,10 +689,10 @@ fn simplify_fcmp(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simpli
     if insn.src.len() != 2 {
         return Simplification::None;
     }
-    let Some(mask) = fcmp_mask(insn.op) else {
+    let Some((mask, CmpDomain::Float)) = Outcomes::of_op(insn.op) else {
         return Simplification::None;
     };
-    match fcmp_decided(mask, possible_fcmp_outcomes(insn, consts, facts)) {
+    match mask.decide(possible_fcmp_outcomes(insn, consts, facts)) {
         Some(false) => fold_to_zero(),
         Some(true) => fold_to_const(1),
         None => Simplification::None,
@@ -701,7 +702,7 @@ fn simplify_fcmp(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simpli
 /// Which outcomes comparing `insn`'s two float operands can have, from what
 /// is known of each: whether it is a constant (and which), whether the two
 /// are the same value, and whether one is never below zero.
-fn possible_fcmp_outcomes(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> u8 {
+fn possible_fcmp_outcomes(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Outcomes {
     let (lhs, rhs) = (insn.src[0], insn.src[1]);
     let width = insn.operand_width().max(1);
     if consts.root(lhs, width) == consts.root(rhs, width) {
@@ -717,10 +718,10 @@ fn possible_fcmp_outcomes(insn: &Instruction, consts: &ConstMap, facts: &Facts) 
     let known = |id| Some(consts.fget(id, width)?.round_to_format(fmt?));
     let never_below = |id: PseudoId| facts.never_lt_zero.contains(&consts.root(id, width));
     match (known(lhs), known(rhs)) {
-        (Some(a), Some(b)) => fcmp_outcome(a.cmp_value(b)),
+        (Some(a), Some(b)) => Outcomes::of_ordering(a.cmp_value(b)),
         (None, Some(c)) => possible_against(c, never_below(lhs)),
-        (Some(c), None) => mirror_mask(possible_against(c, never_below(rhs))),
-        (None, None) => FCMP_ALL,
+        (Some(c), None) => possible_against(c, never_below(rhs)).mirror(),
+        (None, None) => CmpDomain::Float.all(),
     }
 }
 

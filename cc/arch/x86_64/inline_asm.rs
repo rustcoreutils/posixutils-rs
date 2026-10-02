@@ -17,7 +17,6 @@ use crate::arch::x86_64::codegen::X86_64CodeGen;
 use crate::arch::x86_64::lir::X86Inst;
 use crate::arch::x86_64::regalloc::{asm_pinned_regs, Loc, Reg, XmmReg};
 use crate::ir::{AsmConstraint, AsmData, Instruction, PseudoId};
-use crate::target::Os;
 
 /// Everything the two operand-building passes accumulate before any code is
 /// emitted, bundled because both passes touch nearly all of it: as separate
@@ -721,8 +720,8 @@ impl X86_64CodeGen {
             .map(|(bb_id, name)| {
                 // Through `Label` rather than a second spelling of the same
                 // format, so the quoting cannot be missed here.
-                let label_str =
-                    crate::arch::lir::Label::block(&self.base.current_fn, bb_id.0).name();
+                let label_str = crate::arch::lir::Label::block(&self.base.current_fn, bb_id.0)
+                    .name(&self.base.target);
                 (label_str, name.clone())
             })
             .collect();
@@ -1101,23 +1100,11 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Format a symbol name with platform-specific prefix.
-    ///
-    /// Decorates like [`Symbol::format_for_target`] but decides "local" from
-    /// the name's leading `.` rather than from a flag, because the callers
-    /// here have a bare `&str`. The quoting rule is shared, so the two cannot
-    /// disagree about *that* even while they still differ about decoration.
+    /// Format a symbol name with platform-specific decoration: the one rule,
+    /// [`Symbol::format_for_target`], on the symbol [`Symbol::named`] says
+    /// the bare name is.
     pub(super) fn format_symbol_name(&self, name: &str) -> String {
-        // An asm label is the final name; see `lir::VERBATIM_MARKER`.
-        if let Some(verbatim) = crate::arch::lir::strip_verbatim(name) {
-            return crate::arch::lir::quote_symbol_if_needed(verbatim);
-        }
-        let decorated = if self.base.target.os == Os::MacOS && !name.starts_with('.') {
-            format!("_{}", name)
-        } else {
-            name.to_string()
-        };
-        crate::arch::lir::quote_symbol_if_needed(&decorated)
+        crate::arch::lir::Symbol::named(name).format_for_target(&self.base.target)
     }
 
     /// Get the 64-bit register name

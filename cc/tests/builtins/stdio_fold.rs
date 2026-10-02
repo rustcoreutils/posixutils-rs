@@ -135,7 +135,12 @@ const PROTOTYPES: &str = "typedef struct F FILE;\n\
 
 /// The functions the assembly calls or jumps to, by name, less any `_`
 /// prefix.
+///
+/// A branch to one of the function's own blocks is not a call. Its label is
+/// spelled `.L…` on ELF; on Mach-O it is `L…` and a C name is the one with
+/// the `_`.
 fn called(asm: &str) -> Vec<String> {
+    let macho = asm.contains("__TEXT,");
     let mut names: Vec<String> = asm
         .lines()
         .filter_map(|l| {
@@ -145,7 +150,12 @@ fn called(asm: &str) -> Vec<String> {
                 return None;
             }
             let name = words.next()?.split('@').next()?;
-            (!name.starts_with('.')).then(|| name.trim_start_matches('_').to_string())
+            let is_c_name = if macho {
+                name.starts_with('_')
+            } else {
+                !name.starts_with('.')
+            };
+            is_c_name.then(|| name.trim_start_matches('_').to_string())
         })
         .collect();
     names.sort();

@@ -32,6 +32,7 @@ mod floating;
 mod inline_asm;
 mod inlining;
 mod int128;
+mod macho_labels;
 mod memopt;
 mod memopt_blockops;
 mod ms_abi;

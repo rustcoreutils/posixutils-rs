@@ -9,7 +9,7 @@
 // Architecture-independent code generation interface
 //
 
-use crate::arch::lir::{Directive, EmitAsm, LirInst, Symbol};
+use crate::arch::lir::{is_private_name, Directive, EmitAsm, LirInst, Symbol};
 use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
 use crate::float::{FloatVal, FpFormat};
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId};
@@ -382,9 +382,9 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             return;
         }
 
-        // Anonymous compound-literal globals (name starts with '.') are addressed
-        // as locals via `.LC`-style labels — they must remain ordinary data labels.
-        let is_local_label = global.name.starts_with('.');
+        // Anonymous compound-literal globals have a made-up name and are
+        // addressed as private labels -- they must remain ordinary data labels.
+        let is_local_label = is_private_name(&global.name);
 
         // Route zero-initialized non-TLS globals to BSS-class storage. This costs
         // nothing in the object file and lets the kernel lazy-allocate pages.
@@ -740,19 +740,11 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
                 }
             }
             Initializer::SymAddr(name) => {
-                let sym = if name.starts_with('.') {
-                    Symbol::local(name.clone())
-                } else {
-                    Symbol::global(name.clone())
-                };
+                let sym = Symbol::named(name.clone());
                 self.push_directive(Directive::QuadSym(sym));
             }
             Initializer::SymAddrOffset(name, offset) => {
-                let sym = if name.starts_with('.') {
-                    Symbol::local(name.clone())
-                } else {
-                    Symbol::global(name.clone())
-                };
+                let sym = Symbol::named(name.clone());
                 self.push_directive(Directive::QuadSymOffset(sym, *offset));
             }
         }

@@ -549,21 +549,45 @@ impl Label {
     /// assembler spelled two different ways -- `.Lmüller_1:` defined,
     /// `".Lmüller_1"(%rip)` referenced. GNU as resolves both to one symbol;
     /// Mach-O's assembler rejects the raw bytes, which is what the quoting is
-    /// for.
-    pub fn name(&self) -> String {
-        if self.internal {
-            return internal_label(&self.func_name, self.block_id);
-        }
-        quote_symbol_if_needed(
-            &crate::ir::BasicBlockId(self.block_id).label_symbol(&self.func_name),
-        )
+    /// for. Both go through [`Symbol::format_for_target`], which also
+    /// gives the name `target`'s private prefix.
+    pub fn name(&self, target: &Target) -> String {
+        let name = if self.internal {
+            internal_label(&self.func_name, self.block_id)
+        } else {
+            crate::ir::BasicBlockId(self.block_id).label_symbol(&self.func_name)
+        };
+        Symbol::local(name).format_for_target(target)
     }
 }
 
-impl fmt::Display for Label {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.name())
+/// How c17 spells the name of an assembler-private label -- a block label, a
+/// string literal, a constant-pool entry, a DWARF anchor -- from the IR to the
+/// LIR. It is the ELF spelling, and only that: the prefix the assembler reads
+/// is the target's ([`Target::private_label_prefix`]), substituted by
+/// [`private_spelling`] when the name is written out.
+pub const PRIVATE_PREFIX: &str = ".L";
+
+/// Whether `name` is one c17 made up rather than a C identifier: it starts
+/// with a `.`, which no identifier can. Such a symbol is local to the
+/// translation unit and gets no C-level decoration.
+pub fn is_private_name(name: &str) -> bool {
+    name.starts_with('.')
+}
+
+/// The spelling `target`'s assembler reads for the private name `name`.
+///
+/// ELF takes c17's own spelling. Mach-O's assembler keeps out of the symbol
+/// table only what starts with its prefix, so [`PRIVATE_PREFIX`] is swapped
+/// for it -- `.Lf_1` is `Lf_1`, as clang's `LBB0_1` -- and a name made up
+/// without it, a file-scope compound literal's `.CL0`, is prefixed whole.
+fn private_spelling(name: &str, target: &Target) -> String {
+    let prefix = target.private_label_prefix();
+    if prefix == PRIVATE_PREFIX || !is_private_name(name) {
+        return name.to_string();
     }
+    let rest = name.strip_prefix(PRIVATE_PREFIX).unwrap_or(name);
+    format!("{prefix}{rest}")
 }
 
 /// The spelling of a label a backend makes for itself -- a branch target
@@ -574,7 +598,7 @@ impl fmt::Display for Label {
 /// `.Ldbl_const_<bits>`, which a function named `dbl_const` defines as its
 /// block 0 whenever the constant is `0.0`.
 pub fn internal_label(prefix: &str, key: impl fmt::Display) -> String {
-    format!(".L.{prefix}.{key}")
+    format!("{PRIVATE_PREFIX}.{prefix}.{key}")
 }
 
 /// Global symbol reference (function, global variable, string literal)
@@ -582,7 +606,8 @@ pub fn internal_label(prefix: &str, key: impl fmt::Display) -> String {
 pub struct Symbol {
     /// Symbol name
     pub name: String,
-    /// Is this a local symbol (starts with '.')
+    /// Is this a name c17 made up ([`is_private_name`]), spelled with the
+    /// target's private prefix rather than as a C symbol
     pub is_local: bool,
     /// Is this an external symbol (declared extern, needs GOT on macOS)
     pub is_extern: bool,
@@ -605,6 +630,18 @@ impl Symbol {
         }
     }
 
+    /// The symbol an IR name refers to: local when c17 made the name up
+    /// ([`is_private_name`]: a string literal, a block label, a compound
+    /// literal), a C-level global otherwise.
+    pub fn named(name: impl Into<String>) -> Self {
+        let name = name.into();
+        if is_private_name(&name) {
+            Self::local(name)
+        } else {
+            Self::global(name)
+        }
+    }
+
     pub fn extern_sym(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -620,8 +657,9 @@ impl Symbol {
             return quote_symbol_if_needed(verbatim);
         }
         let decorated = if self.is_local {
-            // Local symbols don't get underscore prefix
-            self.name.clone()
+            // A made-up name takes the target's private prefix, not the
+            // C-level underscore.
+            private_spelling(&self.name, target)
         } else {
             match target.os {
                 Os::MacOS => format!("_{}", self.name),
@@ -924,6 +962,10 @@ pub enum Directive {
     /// linker has to relocate it as the units are combined.
     LongSym(Symbol),
 
+    /// .long end - start - emit the 32-bit distance between two labels, a
+    /// DWARF unit's length or a CU-relative DIE reference
+    LongDifference { end: Symbol, start: Symbol },
+
     /// .quad symbol+offset - emit 64-bit symbol address with offset (for member pointers)
     QuadSymOffset(Symbol, i64),
 
@@ -1143,7 +1185,7 @@ impl EmitAsm for Directive {
         match self {
             // Labels
             Directive::BlockLabel(lbl) => {
-                let _ = writeln!(out, "{}:", lbl.name());
+                let _ = writeln!(out, "{}:", lbl.name(target));
             }
             Directive::GlobalLabel(sym) => {
                 let _ = writeln!(out, "{}:", sym.format_for_target(target));
@@ -1438,6 +1480,14 @@ impl EmitAsm for Directive {
             Directive::LongSym(sym) => {
                 let _ = writeln!(out, "    .long {}", sym.format_for_target(target));
             }
+            Directive::LongDifference { end, start } => {
+                let _ = writeln!(
+                    out,
+                    "    .long {} - {}",
+                    end.format_for_target(target),
+                    start.format_for_target(target)
+                );
+            }
             Directive::QuadSymOffset(sym, offset) => {
                 if *offset >= 0 {
                     let _ = writeln!(
@@ -1664,6 +1714,11 @@ mod tests {
             Symbol::local("caf\u{e9}").format_for_target(&macos),
             "\"caf\u{e9}\""
         );
+        // A private one takes the target's private prefix, then the quotes.
+        assert_eq!(
+            Symbol::local(".Lcaf\u{e9}").format_for_target(&macos),
+            "\"Lcaf\u{e9}\""
+        );
 
         // An asm label is the final name: no underscore, but still quoted.
         let label = Symbol::global(verbatim("caf\u{e9}"));
@@ -1719,7 +1774,14 @@ mod tests {
     #[test]
     fn test_label() {
         let label = Label::block("main", 5);
-        assert_eq!(label.name(), ".Lmain_5");
+        let linux = Target::new(Arch::X86_64, Os::Linux);
+        let macos = Target::new(Arch::Aarch64, Os::MacOS);
+        assert_eq!(label.name(&linux), ".Lmain_5");
+        // Mach-O's assembler keeps only `L` names out of the symbol table.
+        assert_eq!(label.name(&macos), "Lmain_5");
+        let internal = Label::internal("i128", 2);
+        assert_eq!(internal.name(&linux), ".L.i128.2");
+        assert_eq!(internal.name(&macos), "L.i128.2");
     }
 
     #[test]
@@ -1734,7 +1796,14 @@ mod tests {
 
         // Local symbols don't get underscore
         let local = Symbol::local(".LC0");
-        assert_eq!(local.format_for_target(&macos), ".LC0");
+        assert_eq!(local.format_for_target(&linux), ".LC0");
+        assert_eq!(local.format_for_target(&macos), "LC0");
+
+        // A made-up name without the private prefix is prefixed whole.
+        let cl = Symbol::named(".CL0");
+        assert_eq!(cl.format_for_target(&linux), ".CL0");
+        assert_eq!(cl.format_for_target(&macos), "L.CL0");
+        assert_eq!(Symbol::named("g").format_for_target(&macos), "_g");
     }
 
     #[test]

@@ -116,11 +116,7 @@ impl X86_64CodeGen {
             Loc::Global(name) => {
                 // LIR: memory-to-register move
                 // Use local symbol for labels starting with '.' (e.g., .LC0 for string constants)
-                let symbol = if name.starts_with('.') {
-                    Symbol::local(name.clone())
-                } else {
-                    Symbol::global(name.clone())
-                };
+                let symbol = Symbol::named(name.clone());
 
                 if self.needs_got_access(&name) {
                     // External symbols on macOS: load address from GOT, then load value
@@ -321,11 +317,7 @@ impl X86_64CodeGen {
     /// `scratch`), external through the GOT (the address loaded into
     /// `scratch`), anything else RIP-relative.
     fn global_mem_operand(&mut self, name: &str, disp: i32, scratch: Reg) -> MemAddr {
-        let symbol = if name.starts_with('.') {
-            Symbol::local(name)
-        } else {
-            Symbol::global(name)
-        };
+        let symbol = Symbol::named(name);
         // TLS first: an external thread-local must not take the GOT path.
         if self.is_tls_symbol(name) {
             if !self.use_tls_ie(name) {
@@ -540,11 +532,7 @@ impl X86_64CodeGen {
                     // the address directly instead.
                     let dst_lo = self.int128_lo_mem_loc(&dst_loc);
                     let dst_hi = self.int128_hi_mem_loc(&dst_loc);
-                    let symbol = if name.starts_with('.') {
-                        Symbol::local(name.clone())
-                    } else {
-                        Symbol::global(name.clone())
-                    };
+                    let symbol = Symbol::named(name.clone());
                     if self.needs_got_access(name) {
                         // GOT: movq loads the address
                         self.push_lir(X86Inst::Mov {
@@ -776,11 +764,7 @@ impl X86_64CodeGen {
                         dst: GpOperand::Reg(Reg::R10),
                     });
                 } else {
-                    let symbol = if name.starts_with('.') {
-                        Symbol::local(name.clone())
-                    } else {
-                        Symbol::global(name.clone())
-                    };
+                    let symbol = Symbol::named(name.clone());
                     self.push_lir(X86Inst::Lea {
                         addr: MemAddr::RipRelative(symbol),
                         dst: Reg::R10,
@@ -846,11 +830,7 @@ impl X86_64CodeGen {
                         dst: GpOperand::Reg(Reg::R11),
                     });
                 } else {
-                    let symbol = if name.starts_with('.') {
-                        Symbol::local(name.clone())
-                    } else {
-                        Symbol::global(name.clone())
-                    };
+                    let symbol = Symbol::named(name.clone());
                     self.push_lir(X86Inst::Lea {
                         addr: MemAddr::RipRelative(symbol),
                         dst: Reg::R11,
@@ -1028,11 +1008,7 @@ impl X86_64CodeGen {
                         dst: GpOperand::Reg(Reg::R11),
                     });
                 } else {
-                    let symbol = if name.starts_with('.') {
-                        Symbol::local(name.clone())
-                    } else {
-                        Symbol::global(name.clone())
-                    };
+                    let symbol = Symbol::named(name.clone());
                     self.push_lir(X86Inst::Lea {
                         addr: MemAddr::RipRelative(symbol),
                         dst: Reg::R11,

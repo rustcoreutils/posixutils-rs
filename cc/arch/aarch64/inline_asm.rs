@@ -399,11 +399,7 @@ impl Aarch64CodeGen {
                 // with any offset on it -- see
                 // `ir::asm_operand::resolve_immediates`.
                 Loc::Global(name) if class.is_immediate_only() => {
-                    let sym = if name.starts_with('.') {
-                        Symbol::local(name)
-                    } else {
-                        Symbol::global(name)
-                    };
+                    let sym = Symbol::named(name);
                     let sym = sym.format_for_target(&self.base.target);
                     slots.push(mk(AsmOperandValue::Symbol(
                         crate::arch::codegen::asm_symbol_constant(&sym, input.offset),
@@ -631,8 +627,8 @@ impl Aarch64CodeGen {
             .map(|(bb_id, name)| {
                 // Through `Label` rather than a second spelling of the same
                 // format, so the quoting cannot be missed here.
-                let label_str =
-                    crate::arch::lir::Label::block(&self.base.current_fn, bb_id.0).name();
+                let label_str = crate::arch::lir::Label::block(&self.base.current_fn, bb_id.0)
+                    .name(&self.base.target);
                 (label_str, name.clone())
             })
             .collect();

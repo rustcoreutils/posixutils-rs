@@ -49,11 +49,7 @@ impl Aarch64CodeGen {
         }
 
         // Local labels (starting with '.') don't get the _ prefix on macOS
-        let sym = if name.starts_with('.') {
-            Symbol::local(name)
-        } else {
-            Symbol::global(name)
-        };
+        let sym = Symbol::named(name);
 
         if self.needs_got_access(name) {
             // External symbols on macOS: load address from GOT
@@ -110,11 +106,7 @@ impl Aarch64CodeGen {
         }
 
         // Local labels (starting with '.') don't get the _ prefix on macOS
-        let sym = if name.starts_with('.') {
-            Symbol::local(name)
-        } else {
-            Symbol::global(name)
-        };
+        let sym = Symbol::named(name);
 
         if self.needs_got_access(name) {
             // External symbols on macOS: load address from GOT, then load value

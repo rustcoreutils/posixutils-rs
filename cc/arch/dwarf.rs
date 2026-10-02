@@ -402,10 +402,10 @@ fn base_encoding(id: TypeId, types: &TypeTable) -> u64 {
 
 /// A CU-relative reference to another DIE (`DW_FORM_ref4`).
 fn type_ref<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>, label: &str) {
-    base.push_directive(Directive::Raw(format!(
-        "    .long {} - .Ldebug_info0",
-        label
-    )));
+    base.push_directive(Directive::LongDifference {
+        end: Symbol::local(label),
+        start: Symbol::local(".Ldebug_info0"),
+    });
 }
 
 /// Emit one DIE per collected type.
@@ -614,9 +614,10 @@ pub fn generate_debug_info<I: LirInst + EmitAsm>(
     // Unit length (will be computed by assembler/linker)
     // Use label arithmetic: .Ldebug_info_end - .Ldebug_info_start
     base.push_directive(Directive::local_label(".Ldebug_info0"));
-    base.push_directive(Directive::Raw(
-        "    .long .Ldebug_info_end - .Ldebug_info_start".into(),
-    ));
+    base.push_directive(Directive::LongDifference {
+        end: Symbol::local(".Ldebug_info_end"),
+        start: Symbol::local(".Ldebug_info_start"),
+    });
     base.push_directive(Directive::local_label(".Ldebug_info_start"));
 
     // DWARF version (2)

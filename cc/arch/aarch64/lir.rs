@@ -1163,16 +1163,25 @@ impl EmitAsm for Aarch64Inst {
             Aarch64Inst::Uxth { src, dst } => Self::emit_uxt("uxth", src, dst, out),
             // Control Flow
             Aarch64Inst::B { target: lbl } => {
-                let _ = writeln!(out, "    b {}", lbl.name());
+                let _ = writeln!(out, "    b {}", lbl.name(target));
             }
 
             Aarch64Inst::BCond { cond, target: lbl } => {
-                let _ = writeln!(out, "    b.{} {}", cond.aarch64_suffix(), lbl.name());
+                let _ = writeln!(out, "    b.{} {}", cond.aarch64_suffix(), lbl.name(target));
             }
 
-            Aarch64Inst::Cbnz { size, src, target } => {
+            Aarch64Inst::Cbnz {
+                size,
+                src,
+                target: lbl,
+            } => {
                 let sz = size.bits().max(32);
-                let _ = writeln!(out, "    cbnz {}, {}", src.name_for_size(sz), target.name());
+                let _ = writeln!(
+                    out,
+                    "    cbnz {}, {}",
+                    src.name_for_size(sz),
+                    lbl.name(target)
+                );
             }
 
             // `.+8` is the instruction after the `b`: the skip needs no label
@@ -1180,13 +1189,17 @@ impl EmitAsm for Aarch64Inst {
             Aarch64Inst::BCondFar { cond, target: lbl } => {
                 let inverse = cond.inverse().aarch64_suffix();
                 let _ = writeln!(out, "    b.{} .+8", inverse);
-                let _ = writeln!(out, "    b {}", lbl.name());
+                let _ = writeln!(out, "    b {}", lbl.name(target));
             }
 
-            Aarch64Inst::CbnzFar { size, src, target } => {
+            Aarch64Inst::CbnzFar {
+                size,
+                src,
+                target: lbl,
+            } => {
                 let sz = size.bits().max(32);
                 let _ = writeln!(out, "    cbz {}, .+8", src.name_for_size(sz));
-                let _ = writeln!(out, "    b {}", target.name());
+                let _ = writeln!(out, "    b {}", lbl.name(target));
             }
 
             Aarch64Inst::Bl {

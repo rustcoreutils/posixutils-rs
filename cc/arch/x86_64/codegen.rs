@@ -16,7 +16,7 @@
 use crate::arch::codegen::SelectOperands;
 use crate::arch::codegen::{AsmModifierError, AsmOperandSlot, AsmOperandValue};
 use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
-use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
+use crate::arch::lir::{is_private_name, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{FrameBase, Loc, Reg, X87ControlWords, X87Scratch, XmmReg};
 use crate::arch::x86_64::x87::{is_x87_float_to_int, is_x87_fp_cvt, is_x87_int_to_float};
@@ -253,11 +253,7 @@ impl X86_64CodeGen {
             Loc::FImm(_, _) => GpOperand::Imm(0), // FP immediates handled separately
             Loc::Xmm(_) => GpOperand::Imm(0),     // XMM handled separately
             Loc::Global(name) => {
-                let symbol = if name.starts_with('.') {
-                    Symbol::local(name.clone())
-                } else {
-                    Symbol::global(name.clone())
-                };
+                let symbol = Symbol::named(name.clone());
                 // Use TLS addressing for thread-local variables (Linux only)
                 if self.is_tls_symbol(name) {
                     GpOperand::Mem(MemAddr::TlsLocalExec(symbol))
@@ -402,9 +398,8 @@ impl X86_64CodeGen {
     pub(super) fn needs_got_access(&self, name: &str) -> bool {
         // In PIC mode, all non-local symbols need GOT access because they
         // could be interposed at runtime (the default for global symbols).
-        // Local symbols (starting with '.') don't need GOT access since
-        // they can't be interposed.
-        if self.pic_mode && !name.starts_with('.') {
+        // A name c17 made up is local and can't be interposed.
+        if self.pic_mode && !is_private_name(name) {
             return true;
         }
         // External symbols need GOT access on macOS for dynamic linking.
@@ -455,11 +450,7 @@ impl X86_64CodeGen {
                 offset,
             };
         }
-        let symbol = if name.starts_with('.') {
-            Symbol::local(name.to_string())
-        } else {
-            Symbol::global(name.to_string())
-        };
+        let symbol = Symbol::named(name.to_string());
         if offset == 0 {
             return MemAddr::RipRelative(symbol);
         }
@@ -907,8 +898,6 @@ impl X86_64CodeGen {
                     self.emit_tls_addr(&name, dst_reg);
                 }
                 Loc::Global(name) => {
-                    // Check if it's a local label (starts with '.') or global symbol
-                    let is_local_label = name.starts_with('.');
                     if self.needs_got_access(&name) {
                         // External symbols on macOS need GOT access
                         self.push_lir(X86Inst::Mov {
@@ -920,11 +909,7 @@ impl X86_64CodeGen {
                         });
                     } else {
                         self.push_lir(X86Inst::Lea {
-                            addr: MemAddr::RipRelative(Symbol {
-                                name: name.clone(),
-                                is_local: is_local_label,
-                                is_extern: false,
-                            }),
+                            addr: MemAddr::RipRelative(Symbol::named(name)),
                             dst: dst_reg,
                         });
                     }

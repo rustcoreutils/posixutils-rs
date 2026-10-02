@@ -84,14 +84,20 @@ fn codegen_debug_functions_have_a_size() {
 fn codegen_debug_stmt_list_is_relocatable() {
     let src = "int f(void) { return 1; }\n";
 
-    for triple in [X86_64_LINUX, AARCH64_LINUX, DARWIN] {
+    // The label is assembler-private, so it takes the target's private
+    // prefix: `.L` on ELF, `L` on Mach-O.
+    for (triple, label) in [
+        (X86_64_LINUX, ".Ldebug_line0"),
+        (AARCH64_LINUX, ".Ldebug_line0"),
+        (DARWIN, "Ldebug_line0"),
+    ] {
         let asm = asm_for_with("debug_stmt_list", triple, src, &["-g", "-O0"]);
         assert!(
-            asm.contains(".long .Ldebug_line0"),
+            asm.contains(&format!(".long {label}\n")),
             "{triple}: DW_AT_stmt_list must reference this unit's line program:\n{asm}"
         );
         assert!(
-            asm.contains(".Ldebug_line0:"),
+            asm.contains(&format!("\n{label}:")),
             "{triple}: the label DW_AT_stmt_list names must be defined, at the \
              start of this object's .debug_line contribution:\n{asm}"
         );

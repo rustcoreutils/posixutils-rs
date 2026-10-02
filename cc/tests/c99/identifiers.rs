@@ -155,7 +155,9 @@ int main(void) { return (müller(0) == 1 && müller(1) == 2) ? 0 : 1; }
     );
     for line in &mentions {
         assert!(
-            !line.contains(".Lmüller_") || line.contains("\".Lmüller_"),
+            !line.contains("Lmüller_")
+                || line.contains("\".Lmüller_")
+                || line.contains("\"Lmüller_"),
             "an unquoted label reached the assembler: {:?}\nin:\n{}",
             line,
             text

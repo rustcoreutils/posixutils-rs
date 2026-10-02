@@ -2119,7 +2119,9 @@ fn test_plain_declaration_is_not_a_function_declarator() {
 
 // Translation unit tests
 
-fn parse_tu(input: &str) -> ParseResult<(TranslationUnit, TypeTable, StringTable, SymbolTable)> {
+pub(super) fn parse_tu(
+    input: &str,
+) -> ParseResult<(TranslationUnit, TypeTable, StringTable, SymbolTable)> {
     parse_tu_for(input, &Target::host())
 }
 

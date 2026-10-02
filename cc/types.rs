@@ -1349,6 +1349,22 @@ impl TypeTable {
         typ.composite = Some(Box::new(composite));
     }
 
+    /// Complete a forward-declared enum with its definition, in place, as
+    /// [`Self::complete_struct`] does a struct: every typedef, member and
+    /// pointee declared through the forward reference sees the enum's size,
+    /// and its signedness when the underlying type is unsigned.
+    pub fn complete_enum(&mut self, id: TypeId, composite: CompositeType, unsigned: bool) {
+        let typ = &mut self.types[id.0 as usize];
+        debug_assert!(
+            typ.kind == TypeKind::Enum,
+            "complete_enum called on a non-enum type"
+        );
+        typ.composite = Some(Box::new(composite));
+        if unsigned {
+            typ.modifiers |= TypeModifiers::UNSIGNED;
+        }
+    }
+
     // Type query methods (moved from Type to TypeTable)
 
     pub fn kind(&self, id: TypeId) -> TypeKind {

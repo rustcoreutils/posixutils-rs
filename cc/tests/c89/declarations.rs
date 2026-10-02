@@ -1019,3 +1019,37 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("aligned_attr_reduces", code, &[]), 0);
 }
+
+/// A tag named before its enum is defined -- `typedef enum foo E;` ahead of
+/// `enum foo { ... }`, a GNU forward enum gcc accepts -- is the complete
+/// type once the definition is seen: a typedef, a member and a pointee
+/// declared through the forward reference all take the enum's size and
+/// signedness. The forward reference used to stay a 0-byte incomplete type,
+/// so `sizeof (E)` was rejected and a member of type `E` was stored in no
+/// bytes at all (gcc.c-torture/execute/930408-1).
+#[test]
+fn c89_forward_enum_is_completed_by_its_definition() {
+    let src = r#"
+typedef enum foo E;
+enum foo *fp;
+enum foo { e0, e1, e2 = 0x12345678 };
+enum big;
+typedef enum big B;
+enum big { HUGE = 0x80000000u };
+struct { E eval; int after; } s;
+struct { B b; } t;
+int main(void) {
+    enum foo v = e1;
+    fp = &v;
+    if (sizeof(E) != sizeof(int) || sizeof s != 2 * sizeof(int)) return 1;
+    s.eval = e2;
+    s.after = 7;
+    if (s.eval != e2 || s.after != 7 || *fp != e1) return 2;
+    t.b = HUGE;
+    if (t.b < 0 || sizeof(B) != 4) return 3;
+    switch (s.eval) { case e2: break; default: return 4; }
+    return 0;
+}
+"#;
+    crate::common::compile_and_run_everywhere("forward_enum", src);
+}

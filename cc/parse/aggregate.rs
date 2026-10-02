@@ -237,6 +237,21 @@ impl Parser<'_> {
                 anon_id: tag.is_none().then(|| self.types.fresh_anon_id()),
             };
 
+            let unsigned = self.types.is_unsigned(underlying);
+
+            // A forward reference to the tag made an incomplete enum; the
+            // definition completes that same type, as a struct's does.
+            if let Some(existing) = tag.and_then(|t| self.symbols.lookup_tag(t)) {
+                let existing_typ = existing.typ;
+                let forward = self.types.get(existing_typ);
+                if forward.kind == TypeKind::Enum
+                    && forward.composite.as_ref().is_some_and(|c| !c.is_complete)
+                {
+                    self.types.complete_enum(existing_typ, composite, unsigned);
+                    return Ok(self.types.get(existing_typ).clone());
+                }
+            }
+
             let mut enum_type = Type::enum_type(composite);
             // C17 6.7.2.2p4: the enumerated type shall represent every member.
             // `enum_underlying_type` picks a type that does, but the enum's own
@@ -245,7 +260,7 @@ impl Parser<'_> {
             // `enum E { BIG = 0x80000000u }; enum E e = BIG;` read back
             // -2147483648 and `e < 0` was true, while the constant `BIG` was
             // correct all along.
-            if self.types.is_unsigned(underlying) {
+            if unsigned {
                 enum_type.modifiers |= TypeModifiers::UNSIGNED;
             }
 
@@ -262,10 +277,15 @@ impl Parser<'_> {
             if let Some(tag_name) = tag {
                 // Look up or create incomplete type
                 if let Some(existing) = self.symbols.lookup_tag(tag_name) {
-                    // Return a clone of the underlying type
                     Ok(self.types.get(existing.typ).clone())
                 } else {
-                    Ok(Type::incomplete_enum(tag_name))
+                    // Registered, so that the definition completes this
+                    // same type rather than making another.
+                    let incomplete = Type::incomplete_enum(tag_name);
+                    let typ_id = self.types.intern(incomplete.clone());
+                    let sym = Symbol::tag(tag_name, typ_id, self.symbols.depth());
+                    let _ = self.symbols.declare(sym);
+                    Ok(incomplete)
                 }
             } else {
                 Err(ParseError::new(
@@ -807,5 +827,26 @@ impl Parser<'_> {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_parser::parse_tu;
+
+    /// A forward reference to an enum tag is the type its definition later
+    /// completes: the typedef made through it is the tag's own type, of the
+    /// enum's size and signedness.
+    #[test]
+    fn a_forward_enum_is_completed_in_place() {
+        let (_tu, types, strings, symbols) =
+            parse_tu("typedef enum foo E; enum foo { a, b = 0x80000000u };").unwrap();
+        let tag = symbols.lookup_tag(strings.lookup("foo").unwrap()).unwrap();
+        let e = symbols
+            .lookup_typedef(strings.lookup("E").unwrap())
+            .unwrap();
+        assert_eq!(e, tag.typ);
+        assert_eq!(types.size_bits(e), 32);
+        assert!(types.is_unsigned(e));
     }
 }

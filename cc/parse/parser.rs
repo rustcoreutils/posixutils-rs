@@ -644,15 +644,18 @@ impl<'a> Parser<'a> {
         type_id
     }
 
-    /// Intern a type, but for struct/union types with tags, check the symbol table
+    /// Intern a type, but for struct/union/enum types with tags, check the symbol table
     /// first to reuse the existing TypeId. This ensures forward-declared types
     /// are properly linked when the type is later completed.
     ///
     /// Important: Storage class modifiers (static, extern, etc.) are preserved from
     /// the input type even when reusing an existing struct TypeId.
     pub(super) fn intern_type_with_tag(&mut self, typ: &Type) -> TypeId {
-        // For struct/union types with a tag, use the existing TypeId from symbol table
-        if matches!(typ.kind, TypeKind::Struct | TypeKind::Union) {
+        // For a tagged type, use the existing TypeId from symbol table
+        if matches!(
+            typ.kind,
+            TypeKind::Struct | TypeKind::Union | TypeKind::Enum
+        ) {
             if let Some(ref composite) = typ.composite {
                 if let Some(tag) = composite.tag {
                     if let Some(existing) = self.symbols.lookup_tag(tag) {

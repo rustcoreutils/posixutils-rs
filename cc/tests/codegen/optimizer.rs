@@ -1237,6 +1237,47 @@ int main(void)
     }
 }
 
+/// An `if` that assigns several variables leaves one phi per variable at
+/// its merge, and if-conversion turns them all into selects at once -- each
+/// over its own pair of values, whatever its type -- or leaves the branch
+/// alone. Checked by value on both edges.
+#[test]
+fn codegen_ifconv_collapses_every_phi_at_a_merge() {
+    let code = r#"
+extern void abort(void);
+
+__attribute__((noinline)) static long merged(int c, int x, double dv)
+{
+    int a = 7;
+    long b = -5;
+    short s = 300;
+    double d = 0.5;
+    if (c > x) {
+        a = x + 1;
+        b = (long)x * 3;
+        s = (short)(x ^ 0x55);
+        d = dv;
+    }
+    return a + b + s + (long)(d * 4.0);
+}
+
+int main(void)
+{
+    if (merged(0, 10, 2.25) != 7 - 5 + 300 + 2) abort();
+    if (merged(20, 10, 2.25) != 11 + 30 + (10 ^ 0x55) + 9) abort();
+    if (merged(-1, -3, -1.0) != -2 - 9 + (short)(-3 ^ 0x55) - 4) abort();
+    return 0;
+}
+"#;
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_ifconv_every_phi", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
 /// A `const` global's initializer is its value for the whole run, so a load
 /// of one becomes that constant.
 ///

@@ -85,8 +85,9 @@ struct Diamond {
     merge: BasicBlockId,
     /// The branch condition.
     cond: PseudoId,
-    /// Whether `arm` is the branch's *true* target.
-    arm_on_true: bool,
+    /// Each phi at the merge, by position, with the values it takes when the
+    /// branch goes true and when it goes false: the select it becomes.
+    selects: Vec<(usize, PseudoId, PseudoId)>,
 }
 
 /// Collapse every short-circuit diamond whose arm is safe to speculate.
@@ -172,12 +173,15 @@ fn recognize(func: &Function, pred: BasicBlockId) -> Option<Diamond> {
         if m.parents.len() != 2 || !m.parents.contains(&pred) || !m.parents.contains(&arm) {
             continue;
         }
+        let Some(selects) = merge_selects(func, pred, arm, merge, arm_on_true) else {
+            continue;
+        };
         return Some(Diamond {
             pred,
             arm,
             merge,
             cond,
-            arm_on_true,
+            selects,
         });
     }
     None
@@ -192,11 +196,22 @@ fn phi_source_value(func: &Function, bb: BasicBlockId, psrc: PseudoId) -> Option
         .and_then(|i| i.src.first().copied())
 }
 
-fn collapse(func: &mut Function, d: &Diamond) {
-    // Each phi at the merge becomes a `select` over the two edges' values.
-    let mut selects: Vec<(usize, PseudoId, PseudoId)> = Vec::new();
-    let merge_idx = func.block_index(d.merge).expect("merge exists");
-    for (i, insn) in func.blocks[merge_idx].insns.iter().enumerate() {
+/// The select each phi at `merge` becomes, or `None` if any phi's value
+/// along either edge is not where the edge says it is.
+///
+/// All or nothing, because collapsing removes every `PhiSource` in `pred`
+/// and the arm's edge into the merge, and with them every merge phi's
+/// operands: a phi left behind would read a value nothing supplies.
+fn merge_selects(
+    func: &Function,
+    pred: BasicBlockId,
+    arm: BasicBlockId,
+    merge: BasicBlockId,
+    arm_on_true: bool,
+) -> Option<Vec<(usize, PseudoId, PseudoId)>> {
+    let m = func.get_block(merge)?;
+    let mut selects = Vec::new();
+    for (i, insn) in m.insns.iter().enumerate() {
         if insn.op != Opcode::Phi {
             continue;
         }
@@ -206,18 +221,20 @@ fn collapse(func: &mut Function, d: &Diamond) {
                 .find(|(pb, _)| *pb == b)
                 .and_then(|(_, ps)| phi_source_value(func, b, *ps))
         };
-        let (Some(v_pred), Some(v_arm)) = (from(d.pred), from(d.arm)) else {
-            continue;
-        };
+        let (v_pred, v_arm) = (from(pred)?, from(arm)?);
         // The arm runs on the branch's `arm_on_true` edge, so the *other*
         // value is the one reaching the merge directly from `pred`.
-        let (v_true, v_false) = if d.arm_on_true {
-            (v_arm, v_pred)
+        selects.push(if arm_on_true {
+            (i, v_arm, v_pred)
         } else {
-            (v_pred, v_arm)
-        };
-        selects.push((i, v_true, v_false));
+            (i, v_pred, v_arm)
+        });
     }
+    Some(selects)
+}
+
+fn collapse(func: &mut Function, d: &Diamond) {
+    let merge_idx = func.block_index(d.merge).expect("merge exists");
 
     // Move the arm's computation into the predecessor, ahead of its branch.
     // `PhiSource` does not come with it: the phi it fed is about to stop
@@ -237,7 +254,8 @@ fn collapse(func: &mut Function, d: &Diamond) {
         func.blocks[pred_idx].insns.insert(at + n, insn);
     }
 
-    // The predecessor's own `PhiSource` instructions go too.
+    // The predecessor's own `PhiSource` instructions go too: every phi they
+    // fed is one of `selects`.
     for insn in &mut func.blocks[pred_idx].insns {
         if insn.op == Opcode::PhiSource {
             insn.kill();
@@ -251,7 +269,7 @@ fn collapse(func: &mut Function, d: &Diamond) {
     func.blocks[pred_idx].insns[last].pos = pos;
 
     // Replace each phi with the select it turned out to be.
-    for (i, v_true, v_false) in selects {
+    for &(i, v_true, v_false) in &d.selects {
         let insn = &mut func.blocks[merge_idx].insns[i];
         let (target, typ, size) = (insn.target, insn.typ, insn.size);
         *insn = Instruction::select(
@@ -475,6 +493,85 @@ mod tests {
             .push(outside);
 
         assert!(!run(&mut func));
+    }
+
+    /// Collapsing removes the predecessor's `PhiSource`s and the arm's edge
+    /// into the merge, which takes every merge phi's operands with them. A
+    /// phi whose incoming values cannot both be found where the edges say
+    /// they are has no select to become, so the whole diamond stays: turning
+    /// the phis it can find into selects would leave this one reading a
+    /// value nothing supplies any more.
+    #[test]
+    fn ifconv_refuses_a_merge_phi_it_cannot_collapse() {
+        let types = TypeTable::new(&Target::host());
+        let int = types.int_id;
+        let mut func = diamond(pure_arm());
+        let (pred, arm, merge) = (BasicBlockId(0), BasicBlockId(1), BasicBlockId(2));
+        // A second phi, whose operand along `pred` names a pseudo no
+        // `PhiSource` in `pred` defines.
+        for id in 6..=8 {
+            func.add_pseudo(Pseudo::reg(PseudoId(id), id));
+        }
+        let mut ps = Instruction::phi_source(PseudoId(8), PseudoId(0), int, 32);
+        ps.phi_list = vec![(merge, PseudoId(6))];
+        func.get_block_mut(arm)
+            .unwrap()
+            .insert_before_terminator(ps);
+        let mut phi = Instruction::phi(PseudoId(6), int, 32);
+        phi.phi_list = vec![(pred, PseudoId(7)), (arm, PseudoId(8))];
+        func.get_block_mut(merge).unwrap().insns.insert(1, phi);
+
+        assert!(!run(&mut func), "the diamond must not be collapsed");
+        assert_eq!(func.blocks.len(), 3, "the arm must survive");
+        let merge = func.get_block(merge).unwrap();
+        assert!(
+            merge.insns[..2].iter().all(|i| i.op == Opcode::Phi),
+            "neither phi may become a select"
+        );
+        assert_eq!(
+            func.get_block(pred).unwrap().insns[1].op,
+            Opcode::PhiSource,
+            "the predecessor keeps its PhiSource"
+        );
+    }
+
+    /// Every phi at the merge becomes a select, each over its own pair of
+    /// incoming values, and every `PhiSource` that fed them goes.
+    #[test]
+    fn ifconv_collapses_every_merge_phi() {
+        let types = TypeTable::new(&Target::host());
+        let int = types.int_id;
+        let mut func = diamond(pure_arm());
+        let (pred, arm, merge) = (BasicBlockId(0), BasicBlockId(1), BasicBlockId(2));
+        for id in 6..=8 {
+            func.add_pseudo(Pseudo::reg(PseudoId(id), id));
+        }
+        let mut ps_pred = Instruction::phi_source(PseudoId(7), PseudoId(0), int, 32);
+        ps_pred.phi_list = vec![(merge, PseudoId(6))];
+        func.get_block_mut(pred)
+            .unwrap()
+            .insert_before_terminator(ps_pred);
+        let mut ps_arm = Instruction::phi_source(PseudoId(8), PseudoId(1), int, 32);
+        ps_arm.phi_list = vec![(merge, PseudoId(6))];
+        func.get_block_mut(arm)
+            .unwrap()
+            .insert_before_terminator(ps_arm);
+        let mut phi = Instruction::phi(PseudoId(6), int, 32);
+        phi.phi_list = vec![(pred, PseudoId(7)), (arm, PseudoId(8))];
+        func.get_block_mut(merge).unwrap().insns.insert(1, phi);
+
+        assert!(run(&mut func));
+        let m = func.get_block(merge).unwrap();
+        assert_eq!(m.insns[0].op, Opcode::Select);
+        assert_eq!(m.insns[0].src, vec![PseudoId(0), PseudoId(2), PseudoId(1)]);
+        assert_eq!(m.insns[1].op, Opcode::Select);
+        assert_eq!(m.insns[1].src, vec![PseudoId(0), PseudoId(1), PseudoId(0)]);
+        assert!(func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .all(|i| i.op != Opcode::PhiSource));
+        assert!(crate::ir::validate::validate_function(&func).is_ok());
     }
 
     #[test]

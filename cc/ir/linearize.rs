@@ -6696,8 +6696,29 @@ pub fn linearize(
 #[path = "test_linearize.rs"]
 pub(crate) mod test_linearize;
 #[cfg(test)]
+#[path = "test_linearize_asm.rs"]
+mod test_linearize_asm;
+#[cfg(test)]
+#[path = "test_linearize_assign.rs"]
+mod test_linearize_assign;
+#[cfg(test)]
+#[path = "test_linearize_builtin.rs"]
+mod test_linearize_builtin;
+#[cfg(test)]
 #[path = "test_linearize_call.rs"]
 mod test_linearize_call;
+#[cfg(test)]
+#[path = "test_linearize_cfg.rs"]
+mod test_linearize_cfg;
+#[cfg(test)]
+#[path = "test_linearize_expr.rs"]
+mod test_linearize_expr;
+#[cfg(test)]
+#[path = "test_linearize_init.rs"]
+mod test_linearize_init;
+#[cfg(test)]
+#[path = "test_linearize_memory.rs"]
+mod test_linearize_memory;
 #[cfg(test)]
 #[path = "test_linearize_win64.rs"]
 mod test_linearize_win64;

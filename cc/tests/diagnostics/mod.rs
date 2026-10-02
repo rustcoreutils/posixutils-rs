@@ -18,6 +18,8 @@
 // everything.
 //
 
+mod va_arg_pack;
+
 use crate::common::{
     compile_and_run, compile_and_run_two_units, compile_expect_error, compile_expect_no_diagnostic,
     compile_expect_ok, compile_expect_warning, create_c_file, run_c17,

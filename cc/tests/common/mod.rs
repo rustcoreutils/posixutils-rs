@@ -720,6 +720,12 @@ pub fn compile_expect_error(name: &str, content: &str, expected: &str) {
 /// to stderr -- for a test that must see *every* diagnostic, such as one
 /// proving that an error is not followed by a cascade of others.
 pub fn compile_rejected(name: &str, content: &str) -> String {
+    compile_rejected_with(name, content, &[])
+}
+
+/// [`compile_rejected`] with extra driver flags, such as an `-O` level for a
+/// diagnostic that depends on what the optimizer leaves behind.
+pub fn compile_rejected_with(name: &str, content: &str, extra: &[&str]) -> String {
     let c_file = create_c_file(name, content);
     let asm = plib::tmp::Builder::new()
         .prefix(&format!("c17_reject_{}_", name))
@@ -727,12 +733,13 @@ pub fn compile_rejected(name: &str, content: &str) -> String {
         .tempfile()
         .expect("failed to create temp file");
 
-    let args = vec![
+    let mut args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+    args.extend([
         "-S".to_string(),
         "-o".to_string(),
         asm.path().to_string_lossy().to_string(),
         c_file.path().to_string_lossy().to_string(),
-    ];
+    ]);
     let output = run_test_base("c17", &args, &[]);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 

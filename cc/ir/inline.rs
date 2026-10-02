@@ -1764,7 +1764,7 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
 }
 
 /// Collect all function address references from an initializer (recursive)
-fn collect_func_refs_from_initializer(
+pub(crate) fn collect_func_refs_from_initializer(
     init: &super::Initializer,
     func_names: &HashSet<String>,
     address_taken: &mut HashSet<String>,

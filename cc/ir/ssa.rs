@@ -11,7 +11,7 @@
 //
 
 use super::dominate::{domtree_build, idf_compute, DomTree};
-use super::{BasicBlockId, Function, Instruction, Opcode, Pseudo, PseudoId, PseudoKind, Site};
+use super::{BasicBlockId, Function, Instruction, Opcode, Pseudo, PseudoId, Site};
 use crate::types::{TypeId, TypeTable};
 use std::collections::HashMap;
 
@@ -47,79 +47,29 @@ struct SsaConverter<'a> {
 
     /// Stores to remove after conversion
     dead_stores: Vec<Site>,
-
-    /// Counter for generating new pseudo IDs
-    next_pseudo_id: u32,
-
-    /// Counter for generating new register numbers
-    next_reg_nr: u32,
 }
 
 impl<'a> SsaConverter<'a> {
     fn new(func: &'a mut Function, dom: DomTree) -> Self {
-        // Find the maximum pseudo ID and reg number currently in use
-        // Must scan BOTH func.pseudos AND all instruction targets/sources,
-        // since alloc_pseudo() in the linearizer doesn't add to func.pseudos
-        let mut max_pseudo_id = func.pseudos.iter().map(|p| p.id.0).max().unwrap_or(0);
-
-        // Also scan all instruction targets and sources
-        for bb in &func.blocks {
-            for insn in &bb.insns {
-                if let Some(target) = insn.target {
-                    max_pseudo_id = max_pseudo_id.max(target.0);
-                }
-                for src in &insn.src {
-                    max_pseudo_id = max_pseudo_id.max(src.0);
-                }
-                if let Some(indirect) = insn.extra().indirect_target {
-                    max_pseudo_id = max_pseudo_id.max(indirect.0);
-                }
-                for (_, phi_src) in &insn.phi_list {
-                    max_pseudo_id = max_pseudo_id.max(phi_src.0);
-                }
-            }
-        }
-
-        let max_reg_nr = func
-            .pseudos
-            .iter()
-            .filter_map(|p| match &p.kind {
-                PseudoKind::Reg(nr) => Some(*nr),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0);
-
         Self {
             func,
             dom,
             to_rename: HashMap::with_capacity(DEFAULT_SSA_RENAME_CAPACITY),
             phis: HashMap::new(),
             dead_stores: Vec::with_capacity(DEFAULT_SSA_PHI_CAPACITY),
-            next_pseudo_id: max_pseudo_id + 1,
-            next_reg_nr: max_reg_nr + 1,
         }
     }
 
     /// Allocate a new phi pseudo
     fn alloc_phi(&mut self) -> PseudoId {
-        let id = PseudoId(self.next_pseudo_id);
-        self.next_pseudo_id += 1;
-
-        let nr = self.next_reg_nr;
-        self.next_reg_nr += 1;
-
-        let pseudo = Pseudo::phi(id, nr);
-        self.func.add_pseudo(pseudo);
+        let id = self.func.alloc_pseudo();
+        self.func.add_pseudo(Pseudo::phi(id, id.0));
         id
     }
 
     fn undef_pseudo(&mut self) -> PseudoId {
-        let id = PseudoId(self.next_pseudo_id);
-        self.next_pseudo_id += 1;
-
-        let pseudo = Pseudo::undef(id);
-        self.func.add_pseudo(pseudo);
+        let id = self.func.alloc_pseudo();
+        self.func.add_pseudo(Pseudo::undef(id));
         id
     }
 }
@@ -523,7 +473,7 @@ fn fill_phi_operands(converter: &mut SsaConverter) {
     // Collect phi info first. Within each block, sort by variable
     // name so the per-variable order of PhiSource allocation is
     // deterministic across runs — `alloc_phi` and the undef-pseudo
-    // path both bump `next_pseudo_id`, and HashMap iteration of
+    // path both bump `func.next_pseudo`, and HashMap iteration of
     // the phi table would otherwise vary that ordering.
     let phi_info: Vec<(BasicBlockId, usize, String)> = converter
         .func
@@ -585,13 +535,7 @@ fn fill_phi_operands(converter: &mut SsaConverter) {
                 &var_name,
                 sym,
             )
-            .unwrap_or_else(|| {
-                let id = PseudoId(converter.next_pseudo_id);
-                converter.next_pseudo_id += 1;
-                let pseudo = Pseudo::undef(id);
-                converter.func.add_pseudo(pseudo);
-                id
-            });
+            .unwrap_or_else(|| converter.undef_pseudo());
 
             // Allocate PhiSource target pseudo
             let phisrc_pseudo = converter.alloc_phi();
@@ -687,6 +631,9 @@ fn remove_dead_stores(func: &mut Function, dead_stores: &[Site]) {
 /// This promotes eligible local variables from memory to SSA registers,
 /// inserting phi nodes at each variable's iterated dominance frontier. The
 /// phases are marked in the body.
+///
+/// New pseudos come from `func.alloc_pseudo`, so `func.next_pseudo` must
+/// already be above every id the function names (validator I13).
 pub fn ssa_convert(func: &mut Function, types: &TypeTable) {
     convert(func, types);
 }
@@ -756,8 +703,6 @@ fn convert(func: &mut Function, types: &TypeTable) -> Phis {
     let dead_stores = std::mem::take(&mut converter.dead_stores);
     remove_dead_stores(converter.func, &dead_stores);
 
-    // Update function's next_pseudo to avoid ID collisions with later allocations
-    converter.func.next_pseudo = converter.next_pseudo_id;
     converter.phis
 }
 
@@ -766,6 +711,10 @@ mod tests {
     use super::*;
     use crate::ir::BasicBlock;
     use crate::target::Target;
+
+    /// Above every id a fixture here names, as the linearizer leaves
+    /// `next_pseudo` above every id it handed out.
+    const FIXTURE_NEXT_PSEUDO: u32 = 100;
 
     /// The phi conversion gave `var` in block `bb`, if it gave one.
     fn phi_of<'f>(
@@ -787,6 +736,7 @@ mod tests {
 
         let int_id = types.int_id;
         let mut func = Function::new("test", int_id);
+        func.next_pseudo = FIXTURE_NEXT_PSEUDO;
 
         // Create symbol pseudo for local variable 'x'
         let x_sym = PseudoId(0);
@@ -884,43 +834,29 @@ mod tests {
         assert_eq!(dom.idom(BasicBlockId(3)), Some(BasicBlockId(0)));
     }
 
-    // Verifies that SSA conversion correctly finds max pseudo ID from
-    // instruction operands, not just func.pseudos
-
+    /// Conversion allocates through the function: the phi, and the
+    /// `PhiSource` on each incoming edge, take the ids from `next_pseudo` on,
+    /// and the counter moves past them.
     #[test]
-    fn test_max_pseudo_id_from_instructions() {
-        // Regression test: pseudo IDs allocated but not in func.pseudos are tracked
+    fn test_new_ids_come_from_next_pseudo() {
         let types = TypeTable::new(&Target::host());
-        let int_id = types.int_id;
-        let mut func = Function::new("test", int_id);
+        let mut func = make_simple_if_cfg(&types);
+        func.next_pseudo = 50;
+        let before: Vec<PseudoId> = func.pseudos.iter().map(|p| p.id).collect();
 
-        // Only add ONE pseudo to func.pseudos with ID 0
-        let x_sym = PseudoId(0);
-        func.add_pseudo(Pseudo::sym(x_sym, "x".to_string()));
-        func.add_local("x", x_sym, int_id, Some(BasicBlockId(0)), None);
-
-        // Create an instruction that uses a HIGHER pseudo ID (say, 100)
-        // that is NOT in func.pseudos. This simulates what the linearizer does
-        // when it allocates pseudos via alloc_pseudo() without adding to func.pseudos
-        let high_id = PseudoId(100);
-        // Note: we intentionally DON'T add this to func.pseudos
-
-        // Build minimal CFG
-        let mut entry = BasicBlock::new(BasicBlockId(0));
-        entry.add_insn(Instruction::new(Opcode::Entry));
-        // Store using the high pseudo ID as source (simulating linearizer output)
-        entry.add_insn(Instruction::store(high_id, x_sym, 0, int_id, 32));
-        entry.add_insn(Instruction::ret(None));
-
-        func.entry = BasicBlockId(0);
-        func.blocks = vec![entry];
-        func.rebuild_block_idx();
-
-        // This should NOT panic - the SSA converter should find max ID from instructions
         ssa_convert(&mut func, &types);
 
-        // The converter should have found PseudoId(100) from scanning instructions
-        // and used next_pseudo_id >= 101 for any new IDs
+        let mut new: Vec<u32> = func
+            .pseudos
+            .iter()
+            .map(|p| p.id)
+            .filter(|id| !before.contains(id))
+            .map(|id| id.0)
+            .collect();
+        new.sort_unstable();
+        assert_eq!(new, vec![50, 51, 52]);
+        assert_eq!(func.next_pseudo, 53);
+        assert!(crate::ir::validate::validate_function(&func).is_ok());
     }
 
     // Regression test: phi insertion in goto-dispatch CFG
@@ -953,6 +889,7 @@ mod tests {
 
         let int_id = types.int_id;
         let mut func = Function::new("test_dispatch", int_id);
+        func.next_pseudo = FIXTURE_NEXT_PSEUDO;
 
         // Symbol pseudo for local variable 'x' (declared at function scope = entry block)
         let x_sym = PseudoId(0);
@@ -1240,6 +1177,7 @@ mod tests {
     fn make_straight_line_cfg(types: &TypeTable) -> Function {
         let int_id = types.int_id;
         let mut func = Function::new("test", int_id);
+        func.next_pseudo = FIXTURE_NEXT_PSEUDO;
 
         let x_sym = PseudoId(0);
         func.add_pseudo(Pseudo::sym(x_sym, "x".to_string()));
@@ -1316,6 +1254,7 @@ mod tests {
         let types = TypeTable::new(&Target::host());
         let int_id = types.int_id;
         let mut func = Function::new("test", int_id);
+        func.next_pseudo = FIXTURE_NEXT_PSEUDO;
 
         let z_sym = PseudoId(0);
         func.add_pseudo(Pseudo::sym(z_sym, "z".to_string()));
@@ -1366,6 +1305,7 @@ mod tests {
         let types = TypeTable::new(&Target::host());
         let int_id = types.int_id;
         let mut func = Function::new("test", int_id);
+        func.next_pseudo = FIXTURE_NEXT_PSEUDO;
 
         let x_sym = PseudoId(0);
         func.add_pseudo(Pseudo::sym(x_sym, "x".to_string()));
@@ -1406,6 +1346,7 @@ mod tests {
         let int_id = types.int_id;
         let ptr_id = types.void_ptr_id;
         let mut func = Function::new("test", int_id);
+        func.next_pseudo = FIXTURE_NEXT_PSEUDO;
 
         let (a, b, c) = (PseudoId(0), PseudoId(1), PseudoId(2));
         for (id, name, typ) in [(a, "a", int_id), (b, "b", ptr_id), (c, "c", int_id)] {
@@ -1448,6 +1389,7 @@ mod tests {
         let types = TypeTable::new(&Target::host());
         let int_id = types.int_id;
         let mut func = Function::new("test", int_id);
+        func.next_pseudo = FIXTURE_NEXT_PSEUDO;
 
         let local_sym = PseudoId(0);
         func.add_pseudo(Pseudo::sym(local_sym, "v".to_string()));
@@ -1502,6 +1444,7 @@ mod tests {
         let types = TypeTable::new(&Target::host());
         let int_id = types.int_id;
         let mut func = Function::new("test", int_id);
+        func.next_pseudo = FIXTURE_NEXT_PSEUDO;
 
         let t_sym = PseudoId(0);
         func.add_pseudo(Pseudo::sym(t_sym, "t".to_string()));

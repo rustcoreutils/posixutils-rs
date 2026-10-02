@@ -2150,19 +2150,15 @@ impl<'a> Linearizer<'a> {
             ir_func.remove_unreachable_blocks();
         }
 
-        // Run SSA conversion if enabled
-        if self.run_ssa {
-            if let Some(ref mut ir_func) = self.current_func {
+        if let Some(ref mut ir_func) = self.current_func {
+            // Every id the linearizer handed out is below its counter; from
+            // here on the function allocates its own.
+            ir_func.next_pseudo = self.next_pseudo;
+            if self.run_ssa {
                 ssa_convert(ir_func, self.types);
-                // Note: ssa_convert sets ir_func.next_pseudo to account for phi nodes
                 // Drop func.locals entries whose Sym is now unused, so the
                 // backend regalloc allocates no stack slot for them.
                 mem2reg(ir_func);
-            }
-        } else {
-            // Only set next_pseudo if SSA was NOT run (SSA sets its own)
-            if let Some(ref mut ir_func) = self.current_func {
-                ir_func.next_pseudo = self.next_pseudo;
             }
         }
 

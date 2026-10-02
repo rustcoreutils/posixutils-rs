@@ -96,9 +96,16 @@
 //        at `src_size` and a truncation's at `size` without asking which of
 //        the two is the narrower.
 //
+//   I13 — EVERY PSEUDO ID IS BELOW THE ALLOCATOR
+//        `Function::alloc_pseudo` hands out `next_pseudo` and counts up, so
+//        every id already in the function -- registered in `pseudos`, a
+//        target, an operand -- must be below it. One at or past it is an id
+//        the next allocation hands out again, giving a fresh value the name
+//        of an existing one.
+//
 // I2 and I5 hold for every program or for none: `Opcode::has_side_effects`
 // is derived from `may_access_memory`, and unit tests in `ir/mod.rs` check
-// both over `Opcode::ALL`. The validator checks the other ten.
+// both over `Opcode::ALL`. The validator checks the other eleven.
 //
 // The validator runs always, in every build, through [`verify`]: after
 // linearization, after optimization, and after lowering. It is one walk over
@@ -183,6 +190,9 @@ pub enum Invariant {
     /// I12: an integer width change from `from` bits to `to` that does not
     /// change the width the way its opcode says.
     WidthChangeBackwards { from: u32, to: u32 },
+    /// I13: `pseudo`, the highest id in the function, is not below
+    /// `next_pseudo`.
+    PseudoPastAllocator { pseudo: PseudoId, next_pseudo: u32 },
 }
 
 impl Invariant {
@@ -201,6 +211,7 @@ impl Invariant {
             Invariant::MissingOperandType => "I10",
             Invariant::StrayLifetimeEnd => "I11",
             Invariant::WidthChangeBackwards { .. } => "I12",
+            Invariant::PseudoPastAllocator { .. } => "I13",
         }
     }
 }
@@ -268,6 +279,14 @@ impl fmt::Display for Invariant {
             Invariant::WidthChangeBackwards { from, to } => {
                 write!(f, "converts {from} bits to {to}, against its opcode")
             }
+            Invariant::PseudoPastAllocator {
+                pseudo,
+                next_pseudo,
+            } => write!(
+                f,
+                "pseudo {pseudo:?} is not below next_pseudo {next_pseudo}; \
+                 the allocator will hand it out again"
+            ),
         }
     }
 }
@@ -381,6 +400,8 @@ struct Walk<'a> {
     phis: Vec<(Location, &'a Instruction)>,
     /// I8: the parents each block should have, by its predecessors' children.
     expected_parents: HashMap<BasicBlockId, HashSet<BasicBlockId>>,
+    /// I13: the highest pseudo id the instructions name.
+    max_pseudo: Option<PseudoId>,
     out: Vec<ValidationError>,
 }
 
@@ -407,6 +428,7 @@ impl<'a> Walk<'a> {
             defs: HashMap::new(),
             phis: Vec::new(),
             expected_parents: HashMap::new(),
+            max_pseudo: None,
             out: Vec::new(),
         }
     }
@@ -467,6 +489,15 @@ impl<'a> Walk<'a> {
                 self.defs.entry(t).or_default().push(at);
             }
         }
+
+        // I13 -- recorded here, judged in `finish`.
+        let named = insn.target.into_iter().chain(insn.uses()).chain(
+            insn.extra()
+                .asm_data
+                .iter()
+                .flat_map(|asm| asm.outputs.iter().map(|o| o.pseudo)),
+        );
+        self.max_pseudo = named.chain(self.max_pseudo).max();
 
         // I3, and I8's record of the successors this block names.
         for target in insn.control_targets() {
@@ -605,8 +636,8 @@ impl<'a> Walk<'a> {
         }
     }
 
-    /// The checks that need the whole walk: I1, I7, I8's parent lists, and
-    /// I9's `PhiSource` behind each phi operand.
+    /// The checks that need the whole walk: I1, I7, I8's parent lists, I9's
+    /// `PhiSource` behind each phi operand, and I13.
     fn finish(mut self) -> Result<(), Vec<ValidationError>> {
         // I1
         let mut multi: Vec<(PseudoId, Vec<Location>)> = self
@@ -625,6 +656,21 @@ impl<'a> Walk<'a> {
 
         // I7
         check_pseudo_index(self.func, &mut self.out);
+
+        // I13
+        let registered = self.func.pseudos.iter().map(|p| p.id);
+        if let Some(pseudo) = registered.chain(self.max_pseudo).max() {
+            let next_pseudo = self.func.next_pseudo;
+            if pseudo.0 >= next_pseudo {
+                self.report(
+                    Location::Function,
+                    Invariant::PseudoPastAllocator {
+                        pseudo,
+                        next_pseudo,
+                    },
+                );
+            }
+        }
 
         // I8: `parents` is exactly the inverse of `children`.
         let func = self.func;
@@ -702,9 +748,13 @@ mod tests {
     use crate::target::Target;
     use crate::types::{TypeId, TypeTable};
 
+    /// Above every id a test here names, which I13 asks of a function.
+    const NEXT_PSEUDO: u32 = 100;
+
     fn fresh_func(name: &str) -> Function {
         let types = TypeTable::new(&Target::host());
         let mut func = Function::new(name, types.int_id);
+        func.next_pseudo = NEXT_PSEUDO;
         func.entry = BasicBlockId(0);
         let mut bb = BasicBlock::new(BasicBlockId(0));
         bb.insns.push(Instruction::new(Opcode::Entry));
@@ -954,11 +1004,38 @@ mod tests {
         )));
     }
 
+    /// I13: an id at or past `next_pseudo`, whether only an operand or
+    /// registered in `pseudos`, is one the allocator will hand out again.
+    #[test]
+    fn i13_an_id_the_allocator_would_reissue_is_flagged() {
+        let past = |func: &Function| match validate_function(func) {
+            Ok(()) => None,
+            Err(errors) => match errors.as_slice() {
+                [ValidationError {
+                    kind: Invariant::PseudoPastAllocator { pseudo, .. },
+                    ..
+                }] => Some(*pseudo),
+                _ => panic!("{errors:?}"),
+            },
+        };
+
+        let mut func = fresh_func("operand");
+        push(&mut func, copy_insn(1, NEXT_PSEUDO - 1));
+        assert_eq!(past(&func), None);
+        func.next_pseudo -= 1;
+        assert_eq!(past(&func), Some(PseudoId(NEXT_PSEUDO - 1)));
+
+        let mut func = fresh_func("registered");
+        func.add_pseudo(Pseudo::reg(PseudoId(NEXT_PSEUDO), NEXT_PSEUDO));
+        assert_eq!(past(&func), Some(PseudoId(NEXT_PSEUDO)));
+    }
+
     /// I11: a lifetime marker must name one of the function's own locals.
     #[test]
     fn i11_rejects_a_lifetime_end_of_no_local() {
         let types = crate::types::TypeTable::new(&crate::target::Target::host());
         let mut f = Function::new("f", types.void_id);
+        f.next_pseudo = NEXT_PSEUDO;
         f.add_pseudo(crate::ir::Pseudo::sym(PseudoId(0), "x.0".into()));
         f.add_local("x.0", PseudoId(0), types.int_id, None, None);
         let mut bb = BasicBlock::new(BasicBlockId(0));
@@ -988,6 +1065,7 @@ mod tests {
         let types = TypeTable::new(&Target::host());
         let int = types.int_id;
         let mut func = Function::new("diamond", int);
+        func.next_pseudo = NEXT_PSEUDO;
         func.entry = BasicBlockId(0);
         for i in 0..8 {
             func.add_pseudo(Pseudo::reg(PseudoId(i), i));

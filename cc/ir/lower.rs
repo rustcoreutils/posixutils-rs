@@ -913,6 +913,7 @@ mod tests {
         for i in 0..8 {
             f.add_pseudo(Pseudo::reg(PseudoId(i), i));
         }
+        f.next_pseudo = 8;
         let mut b0 = BasicBlock::new(BasicBlockId(0));
         b0.add_insn(Instruction::new(Opcode::Entry));
         let mut s0 = Instruction::phi_source(PseudoId(5), PseudoId(1), int, 32);
@@ -998,6 +999,7 @@ mod tests {
         for i in 0..8 {
             f.add_pseudo(Pseudo::reg(PseudoId(i), i));
         }
+        f.next_pseudo = 8;
         // .L0 -> .L1 (label) directly, and to .L3 (dispatch); .L3 jumps to
         // .L1 or .L2 by address. .L1 merges a value from .L0 and from .L3.
         let mut b0 = BasicBlock::new(BasicBlockId(0));

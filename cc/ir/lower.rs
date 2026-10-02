@@ -349,10 +349,7 @@ mod tests {
         entry.children = vec![BasicBlockId(1)];
         entry.add_insn(Instruction::new(Opcode::Entry));
         // %1 = setval 0 (initial value)
-        let mut setval = Instruction::new(Opcode::SetVal);
-        setval.target = Some(PseudoId(1));
-        setval.size = 32;
-        entry.add_insn(setval);
+        entry.add_insn(Instruction::set_val(PseudoId(1), int_type, 32));
         // PhiSource: %5 = phisrc %1 (-> .L1:%3)
         let mut phisrc1 = Instruction::phi_source(phisrc1_id, PseudoId(1), int_type, 32);
         phisrc1.phi_list = vec![(BasicBlockId(1), PseudoId(3))];
@@ -774,14 +771,8 @@ mod tests {
         let mut entry = BasicBlock::new(BasicBlockId(0));
         entry.children = vec![BasicBlockId(1)];
         entry.add_insn(Instruction::new(Opcode::Entry));
-        let mut sv1 = Instruction::new(Opcode::SetVal);
-        sv1.target = Some(PseudoId(1));
-        sv1.size = 32;
-        entry.add_insn(sv1);
-        let mut sv2 = Instruction::new(Opcode::SetVal);
-        sv2.target = Some(PseudoId(2));
-        sv2.size = 32;
-        entry.add_insn(sv2);
+        entry.add_insn(Instruction::set_val(PseudoId(1), int_type, 32));
+        entry.add_insn(Instruction::set_val(PseudoId(2), int_type, 32));
         // PhiSource for phi_a (%3): src=%1
         let mut ps1 = Instruction::phi_source(phisrc1_id, PseudoId(1), int_type, 32);
         ps1.phi_list = vec![(BasicBlockId(1), PseudoId(3))];

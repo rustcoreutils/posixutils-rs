@@ -30,10 +30,11 @@ use super::constfold::{
     mirror_mask, possible_against, FCMP_ALL,
 };
 use super::facts::{CmpDomain, CmpFacts, ConstMap, Relation};
+use super::propagate;
 use super::{ConstValue, Function, Instruction, Opcode, PseudoId};
 use crate::float::FloatVal;
 use crate::types::{TypeId, TypeTable};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 // Constant Resolution
 
@@ -94,7 +95,7 @@ enum Simplification {
     ///
     /// Not "copy from one": a float constant is a pseudo kind, so the fold
     /// converts the target itself and rewrites the instruction to the
-    /// `SetVal` that gives it a width. See `Function::make_float_const`.
+    /// `SetVal` that gives it a width. See `propagate::fold_target_to_setval`.
     FoldToFloat(FloatVal),
 }
 
@@ -114,10 +115,8 @@ pub fn run(func: &mut Function, types: &TypeTable) -> bool {
         for (insn_idx, insn) in bb.insns.iter().enumerate() {
             let mut result = try_simplify(insn, &consts, &facts);
             // A float fold converts the target pseudo itself, and only a
-            // `Reg` may be converted. Deciding that here rather than when
-            // the fold is applied is what keeps `record` honest: a recorded
-            // constant the apply loop then declines would be read by every
-            // later instruction in this same pass.
+            // `Reg` may be converted, so a fold of any other target is not
+            // collected at all.
             if matches!(result, Simplification::FoldToFloat(_))
                 && !insn.target.is_some_and(|t| func.is_plain_temp(t))
             {
@@ -137,43 +136,28 @@ pub fn run(func: &mut Function, types: &TypeTable) -> bool {
         }
     }
 
-    // Apply simplifications
+    // Apply simplifications. A constant goes through `propagate`, whose
+    // guards may still decline the rewrite -- a 128-bit integer, for one.
+    // What was recorded above stays true when they do: it is the value the
+    // target holds, not the shape the instruction is rewritten to.
+    let mut minted: HashMap<i128, PseudoId> = HashMap::new();
     for (bb_idx, insn_idx, simplification) in simplifications {
-        // Extract necessary data from the instruction before any mutation
-        let (target, typ, size) = {
-            let insn = &func.blocks[bb_idx].insns[insn_idx];
-            (insn.target, insn.typ, insn.size)
-        };
-
-        let new_insn = match simplification {
-            Simplification::None => continue,
-            Simplification::CopyFrom(src) => make_copy_from_parts(target, typ, size, src),
+        let site = (bb_idx, insn_idx);
+        changed |= match simplification {
+            Simplification::None => false,
+            Simplification::CopyFrom(src) => {
+                let insn = &func.blocks[bb_idx].insns[insn_idx];
+                let copy = make_copy_from_parts(insn.target, insn.typ, insn.size, src);
+                func.blocks[bb_idx].insns[insn_idx] = copy;
+                true
+            }
             Simplification::FoldToConst(value) => {
-                // Create a new constant pseudo
-                let const_id = func.create_const_pseudo(value);
-                make_copy_from_parts(target, typ, size, const_id)
+                propagate::fold_target_to_const(func, site, value, &mut minted)
             }
             Simplification::FoldToFloat(value) => {
-                // The target becomes the constant, and the instruction
-                // becomes the `SetVal` that carries its width -- which is
-                // the shape a float literal is linearized into, and the
-                // only one both allocators resolve.
-                let Some(target_id) = target else { continue };
-                if !func.make_const(target_id, ConstValue::Float(value)) {
-                    continue;
-                }
-                Instruction {
-                    op: Opcode::SetVal,
-                    target,
-                    src: Vec::new(),
-                    typ,
-                    size,
-                    ..Default::default()
-                }
+                propagate::fold_target_to_setval(func, site, ConstValue::Float(value))
             }
         };
-        func.blocks[bb_idx].insns[insn_idx] = new_insn;
-        changed = true;
     }
 
     changed
@@ -1262,6 +1246,54 @@ mod tests {
 
         let new_const = func.get_pseudo(result_insn.src[0]).unwrap();
         assert_eq!(new_const.kind, PseudoKind::Val(0));
+    }
+
+    /// A 128-bit result proved constant is left alone, as `sccp` leaves it:
+    /// a copy of a minted constant has no `SetVal` to give it its sixteen
+    /// bytes. The 32-bit fold beside it still happens, and two folds to one
+    /// value share one minted constant.
+    #[test]
+    fn a_128_bit_fold_is_declined_and_mints_are_shared() {
+        let types = host_types();
+        let mut func = make_test_func_with_insn(
+            Instruction::binop(
+                Opcode::Shl,
+                PseudoId(2),
+                PseudoId(0),
+                PseudoId(1),
+                types.uint128_id,
+                128,
+            ),
+            vec![
+                Pseudo::val(PseudoId(0), 0),
+                Pseudo::reg(PseudoId(1), 1),
+                Pseudo::reg(PseudoId(2), 2),
+                Pseudo::reg(PseudoId(3), 3),
+                Pseudo::reg(PseudoId(4), 4),
+                Pseudo::reg(PseudoId(5), 5),
+            ],
+        );
+        for t in [3, 4] {
+            func.blocks[0].insns.insert(
+                2,
+                Instruction::binop(
+                    Opcode::Mul,
+                    PseudoId(t),
+                    PseudoId(5),
+                    PseudoId(0),
+                    types.int_id,
+                    32,
+                ),
+            );
+        }
+        let before = func.pseudos.len();
+
+        assert!(run(&mut func, &types));
+        let insns = &func.blocks[0].insns;
+        assert_eq!(insns[1].op, Opcode::Shl, "the 128-bit shift stays");
+        assert_eq!((insns[2].op, insns[3].op), (Opcode::Copy, Opcode::Copy));
+        assert_eq!(insns[2].src, insns[3].src, "one minted zero");
+        assert_eq!(func.pseudos.len(), before + 1);
     }
 
     #[test]

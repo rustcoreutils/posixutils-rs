@@ -1015,11 +1015,10 @@ fn clone_instruction(
             // A constant carries its value on the pseudo, so the pseudo has
             // to be replaced rather than reused.
             ctx.const_pseudos.push(Pseudo::val(target, count));
-            let mut set = Instruction::new(Opcode::SetVal);
-            set.target = Some(target);
-            set.typ = insn.typ;
-            set.size = insn.size;
-            vec![set]
+            let typ = insn
+                .typ
+                .expect("the linearizer types every va_arg_pack_len as int");
+            vec![Instruction::set_val(target, typ, insn.size)]
         }
 
         // SymAddr on an Arg pseudo: after inlining, the Arg maps to call_args[n]

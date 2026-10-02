@@ -1854,6 +1854,15 @@ impl Instruction {
             .with_type_and_size(typ, size)
     }
 
+    /// The `SetVal` that defines the constant pseudo `target` at `typ` and
+    /// `size` bits. The value lives in `target` (`PseudoKind::Val`/`FVal`),
+    /// never in the instruction.
+    pub fn set_val(target: PseudoId, typ: TypeId, size: u32) -> Self {
+        Self::new(Opcode::SetVal)
+            .with_target(target)
+            .with_type_and_size(typ, size)
+    }
+
     /// Create a phi source instruction (placed in predecessor block).
     /// Back-pointer to owning phi is stored in phi_list by the caller.
     pub fn phi_source(target: PseudoId, src: PseudoId, typ: TypeId, size: u32) -> Self {
@@ -2699,11 +2708,12 @@ impl Function {
     ///
     /// `false`, and nothing done, for an id [`Self::is_plain_temp`] rejects.
     ///
-    /// The caller owes that `SetVal`. It is not optional for a float: an
+    /// Half of a rewrite: `propagate::fold_target_to_setval` is the whole of
+    /// it, and the only caller, because the `SetVal` is not optional. An
     /// `FVal` without one is resolved at a default width of 64 bits, so a
-    /// folded `float` would be read out of eight bytes. For an integer it
+    /// folded `float` would be read out of eight bytes; for an integer it
     /// decides the stack slot in x86-64's sixteen-byte case.
-    pub fn make_const(&mut self, id: PseudoId, value: ConstValue) -> bool {
+    fn make_const(&mut self, id: PseudoId, value: ConstValue) -> bool {
         if !self.is_plain_temp(id) {
             return false;
         }
@@ -3547,11 +3557,7 @@ mod tests {
         func.add_pseudo(Pseudo::val(k, 42));
 
         let mut entry = BasicBlock::new(BasicBlockId(0));
-        entry.add_insn(
-            Instruction::new(Opcode::SetVal)
-                .with_target(k)
-                .with_type_and_size(types.int_id, 32),
-        );
+        entry.add_insn(Instruction::set_val(k, types.int_id, 32));
         entry.add_insn(Instruction::ret(Some(k)));
         func.add_block(entry);
 

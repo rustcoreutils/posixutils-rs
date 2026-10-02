@@ -277,11 +277,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             func.add_pseudo(pseudo);
         }
 
-        // Emit setval instruction
-        let insn = Instruction::new(Opcode::SetVal)
-            .with_target(id)
-            .with_type_and_size(typ, self.types.size_bits(typ));
-        self.emit(insn);
+        self.emit(Instruction::set_val(id, typ, self.types.size_bits(typ)));
 
         id
     }
@@ -293,11 +289,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             func.add_pseudo(pseudo);
         }
 
-        // Emit setval instruction
-        let insn = Instruction::new(Opcode::SetVal)
-            .with_target(id)
-            .with_type_and_size(typ, self.types.size_bits(typ));
-        self.emit(insn);
+        self.emit(Instruction::set_val(id, typ, self.types.size_bits(typ)));
 
         id
     }

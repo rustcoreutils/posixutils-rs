@@ -30,6 +30,7 @@
 //
 
 use super::memloc::{AddrMap, MemBase};
+use super::propagate;
 use super::{ConstValue, Function, Initializer, Instruction, Module, Opcode};
 use crate::types::{TypeId, TypeTable};
 use std::collections::HashMap;
@@ -144,22 +145,7 @@ fn propagate(func: &mut Function, types: &TypeTable, known: &HashMap<String, Kno
 
     let mut changed = false;
     for (b, i, value) in sites {
-        let Some(target) = func.blocks[b].insns[i].target else {
-            continue;
-        };
-        if !func.make_const(target, value) {
-            continue;
-        }
-        let insn = &mut func.blocks[b].insns[i];
-        *insn = Instruction {
-            op: Opcode::SetVal,
-            target: Some(target),
-            src: Vec::new(),
-            typ: insn.typ,
-            size: insn.size,
-            ..Default::default()
-        };
-        changed = true;
+        changed |= propagate::fold_target_to_setval(func, (b, i), value);
     }
     changed
 }

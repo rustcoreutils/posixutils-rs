@@ -152,8 +152,9 @@ impl ConstMap {
 
     /// Record a simplification this run is about to apply.
     ///
-    /// Every collected simplification is applied unconditionally, so this is
-    /// a fact rather than a guess. It is what lets `a = 2+3; b = a*4;
+    /// A collected simplification states what its target holds, whether or
+    /// not the rewrite is then admitted, so this is a fact rather than a
+    /// guess. It is what lets `a = 2+3; b = a*4;
     /// c = b+1;` fold all the way down in a single pass instead of needing
     /// one `opt.rs` iteration per level of expression depth.
     /// Note that `target` will hold the integer constant `v`.

@@ -112,11 +112,7 @@ mod tests {
         let f = fx.func();
         let p = f.alloc_pseudo();
         f.add_pseudo(Pseudo::fval(p, FloatVal::from_f64(v)));
-        fx.push(
-            Instruction::new(Opcode::SetVal)
-                .with_target(p)
-                .with_type_and_size(typ, size),
-        );
+        fx.push(Instruction::set_val(p, typ, size));
         p
     }
 

@@ -9,7 +9,9 @@
 // __int128: arithmetic, shifts, conversions and passing.
 //
 
-use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_optimized};
+use crate::common::{
+    compile_and_run, compile_and_run_aarch64, compile_and_run_everywhere, compile_and_run_optimized,
+};
 
 /// Test __int128 / __uint128_t / __int128_t type support.
 /// Validates sizeof, alignof, struct members, arrays, and pointer declarations.
@@ -1509,4 +1511,85 @@ int main(void) {
         compile_and_run("cg_complex_int128_mem_o2", code, &["-O2".to_string()]),
         0
     );
+}
+
+/// A 128-bit instruction `instcombine` proves constant -- `0 << n`, `0 >> n`
+/// and an all-ones `>> n`, with `n` unknown -- keeps the shape a 128-bit
+/// constant needs. Rewritten into a copy of a constant with no `SetVal` of its
+/// own, the constant was forwarded into a call, a return and a phi with no
+/// width to say it is sixteen bytes: x86-64 aborted the compiler
+/// (`int128_lo_mem_loc` on an immediate) and aarch64 dropped the high half of
+/// both arms of the phi. Each result is combined with values whose high halves
+/// are not zero, so a lost half shows.
+#[test]
+fn codegen_int128_folded_shift_of_constant() {
+    let code = r#"
+typedef __int128 i128;
+typedef unsigned __int128 u128;
+
+static const u128 BIG = ((u128)0x1122334455667788ull << 64) | 0x99aabbccddeeff00ull;
+
+__attribute__((noinline)) u128 idu(u128 x) { return x; }
+__attribute__((noinline)) i128 idi(i128 x) { return x; }
+__attribute__((noinline)) int idn(int x) { return x; }
+static u128 gu;
+
+__attribute__((noinline)) u128 z_ret(int n) { u128 z = (u128)0; return z << n; }
+__attribute__((noinline)) u128 z_arg(int n) { u128 z = (u128)0; return idu(z >> n); }
+__attribute__((noinline)) i128 z_sar(int n) { i128 z = (i128)0; return idi(z >> n); }
+__attribute__((noinline)) void z_store(int n) { u128 z = (u128)0; gu = z << n; }
+__attribute__((noinline)) u128 z_add(int n) { u128 z = (u128)0; return (z << n) + BIG; }
+__attribute__((noinline)) u128 z_or(int n) { u128 z = (u128)0; return (z >> n) | BIG; }
+__attribute__((noinline)) u128 z_shift(int n) {
+    u128 z = (u128)0;
+    return BIG >> ((z << n) + 4);
+}
+__attribute__((noinline)) u128 z_sel(int n, int c) {
+    u128 z = (u128)0;
+    u128 a = z << n;
+    return c ? a : BIG;
+}
+__attribute__((noinline)) u128 z_phi(int n, int c) {
+    u128 z = (u128)0, r = BIG;
+    if (c)
+        r = z << n;
+    return r;
+}
+__attribute__((noinline)) int z_cmp(int n) { u128 z = (u128)0; return (z << n) == 0; }
+__attribute__((noinline)) u128 z_mul(int n) { u128 z = (u128)0; return (z << n) * BIG; }
+__attribute__((noinline)) u128 z_two(int n) {
+    u128 z = (u128)0;
+    u128 a = z << n;
+    u128 b = z >> n;
+    return idu(a) + idu(b) + idu(a) + BIG;
+}
+__attribute__((noinline)) i128 m_sar(int n) { i128 m = (i128)-1; return idi(m >> n); }
+
+int main(void) {
+    int n = idn(5);
+    if (z_ret(n) != 0) return 1;
+    if (z_arg(n) != 0) return 2;
+    if (z_sar(n) != 0) return 3;
+    gu = BIG;
+    z_store(n);
+    if (gu != 0) return 4;
+    if (z_add(n) != BIG) return 5;
+    if (z_or(n) != BIG) return 6;
+    if (z_shift(n) != BIG >> 4) return 7;
+    if (z_sel(n, 1) != 0) return 8;
+    if (z_sel(n, 0) != BIG) return 9;
+    if (z_phi(n, 1) != 0) return 10;
+    if (z_phi(n, 0) != BIG) return 11;
+    if (z_cmp(n) != 1) return 12;
+    if (z_mul(n) != 0) return 13;
+    if (z_two(n) != BIG) return 14;
+    if (m_sar(n) != (i128)-1) return 15;
+    if ((u128)m_sar(n) >> 64 != 0xffffffffffffffffull) return 16;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("cg_int128_folded_shift", code);
+    if let Some(rc) = compile_and_run_aarch64("cg_int128_folded_shift_a64_o1", code, "-O1") {
+        assert_eq!(rc, 0, "aarch64 at -O1");
+    }
 }

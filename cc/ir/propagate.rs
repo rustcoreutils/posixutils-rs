@@ -9,20 +9,20 @@
 // Rewriting what an analysis has proved: replacing a value with a constant,
 // and a conditional terminator with an unconditional one.
 //
-// Neither routine decides anything. Each takes a conclusion its caller has
+// No routine here decides anything. Each takes a conclusion its caller has
 // already reached -- "this target is the constant `v`", "this branch goes to
 // `taken`" -- and performs the edit, with the guards that make the edit safe
 // and the pass idempotent.
 //
-// This is shared rather than copied because the terminator rewrite is forty
-// lines of CFG bookkeeping whose failure mode is a jump to a block that no
-// longer exists, discovered somewhere else entirely. Two analyses now reach
-// these conclusions, `sccp` from a constant lattice and `vrp` from a range
-// one, and a second copy of this code is a second place for the two to
-// drift.
+// This is shared rather than copied because each guard is a miscompile when
+// a copy forgets it: a terminator rewrite that leaves a jump to a block that
+// no longer exists, a phi source folded over, a sixteen-byte constant with
+// no `SetVal` to say so. `sccp`, `vrp` and `instcombine` fold values to
+// integer constants; `instcombine` and `constglobal` turn a target itself
+// into a constant, float or integer.
 //
 
-use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
+use super::{BasicBlockId, ConstValue, Function, Instruction, Opcode, PseudoId};
 use std::collections::HashMap;
 
 /// A `(block index, instruction index)` pair.
@@ -43,17 +43,7 @@ pub(crate) fn fold_target_to_const(
     minted: &mut HashMap<i128, PseudoId>,
 ) -> bool {
     let insn = &func.blocks[b].insns[i];
-    if insn.target.is_none() {
-        return false;
-    }
-    // A `PhiSource` is how `lower::eliminate_phi_nodes` finds a phi's
-    // incoming value: it scans for the opcode, not for `Phi.phi_list`.
-    // Turning one into a `Copy` silently deletes that incoming value.
-    // Propagate *through* it, never over it.
-    if matches!(
-        insn.op,
-        Opcode::PhiSource | Opcode::SetVal | Opcode::Nop | Opcode::Entry
-    ) {
+    if !rewritable(insn) {
         return false;
     }
     // Both allocators resolve a `Val` pseudo with no defining `SetVal` to
@@ -90,6 +80,51 @@ pub(crate) fn fold_target_to_const(
     // makes the now-unread `PhiSource` instructions dead, for the `dce`
     // run that follows to collect.
     insn.phi_list.clear();
+    true
+}
+
+/// Whether the instruction is one a fold may rewrite at all: it defines a
+/// value, and is not one whose opcode something else looks for.
+fn rewritable(insn: &Instruction) -> bool {
+    // A `PhiSource` is how `lower::eliminate_phi_nodes` finds a phi's
+    // incoming value: it scans for the opcode, not for `Phi.phi_list`.
+    // Rewriting one silently deletes that incoming value. Propagate
+    // *through* it, never over it. A `SetVal` is already a constant.
+    insn.target.is_some()
+        && !matches!(
+            insn.op,
+            Opcode::PhiSource | Opcode::SetVal | Opcode::Nop | Opcode::Entry
+        )
+}
+
+/// Make the target of the instruction at `site` the constant `value` itself,
+/// and the instruction the `SetVal` that gives it a width.
+///
+/// The other way round from [`fold_target_to_const`]: the target keeps its
+/// identity, so every use already names the constant. This is the only form
+/// a float constant can take -- an `FVal` with no `SetVal` is read at 64
+/// bits, so a folded `float` would be read out of eight bytes -- and the
+/// form a sixteen-byte integer needs, whose stack slot x86-64 sizes from the
+/// `SetVal`.
+///
+/// Declined, with nothing changed, for a target that is not a plain
+/// temporary (`Function::is_plain_temp`) and for an instruction with no
+/// type to give the `SetVal`. Returns whether anything changed.
+pub(crate) fn fold_target_to_setval(func: &mut Function, (b, i): Site, value: ConstValue) -> bool {
+    let insn = &func.blocks[b].insns[i];
+    if !rewritable(insn) {
+        return false;
+    }
+    let (Some(target), Some(typ)) = (insn.target, insn.typ) else {
+        return false;
+    };
+    let (size, pos) = (insn.size, insn.pos);
+    if !func.make_const(target, value) {
+        return false;
+    }
+    let mut set = Instruction::set_val(target, typ, size);
+    set.pos = pos;
+    func.blocks[b].insns[i] = set;
     true
 }
 
@@ -266,6 +301,65 @@ mod tests {
             "a PhiSource"
         );
         assert_eq!(f.blocks[1].insns[0].op, Opcode::PhiSource);
+    }
+
+    /// A 128-bit target is never rewritten into a copy of a minted
+    /// constant: nothing would give the constant its sixteen bytes.
+    #[test]
+    fn a_128_bit_value_is_not_folded_to_a_copy() {
+        let mut f = diamond();
+        f.blocks[0].insns[1].size = 128;
+        let mut minted = HashMap::new();
+        assert!(!fold_target_to_const(&mut f, (0, 1), 1 << 70, &mut minted));
+        assert_eq!(f.blocks[0].insns[1].op, Opcode::Add);
+        assert!(minted.is_empty());
+    }
+
+    /// A target folded to a `SetVal` becomes the constant itself, keeps its
+    /// width, type and source position, and is not folded twice. One that
+    /// is not a plain temporary, or a phi source, is left alone.
+    #[test]
+    fn a_target_becomes_the_constant_its_setval_defines() {
+        let mut f = diamond();
+        let pos = crate::diag::Position {
+            line: 7,
+            ..Default::default()
+        };
+        f.blocks[0].insns[1].pos = Some(pos);
+        f.blocks[0].insns[1].size = 128;
+        let typ = f.blocks[0].insns[1].typ;
+
+        assert!(fold_target_to_setval(
+            &mut f,
+            (0, 1),
+            ConstValue::Int(1 << 70)
+        ));
+        let insn = &f.blocks[0].insns[1];
+        assert_eq!(
+            (insn.op, insn.target, insn.typ, insn.size, insn.pos),
+            (Opcode::SetVal, Some(PseudoId(2)), typ, 128, Some(pos))
+        );
+        assert!(insn.src.is_empty());
+        assert_eq!(f.const_val(PseudoId(2)), Some(1 << 70));
+        assert!(
+            !fold_target_to_setval(&mut f, (0, 1), ConstValue::Int(1 << 70)),
+            "already a SetVal"
+        );
+
+        assert!(
+            !fold_target_to_setval(&mut f, (1, 0), ConstValue::Int(6)),
+            "a PhiSource"
+        );
+        assert_eq!(f.blocks[1].insns[0].op, Opcode::PhiSource);
+
+        let mut g = diamond();
+        let arg = g.blocks[0].insns[1].src[0];
+        g.blocks[0].insns[1].target = Some(arg);
+        assert!(
+            !fold_target_to_setval(&mut g, (0, 1), ConstValue::Int(6)),
+            "an argument is not a plain temporary"
+        );
+        assert_eq!(g.blocks[0].insns[1].op, Opcode::Add);
     }
 
     /// Folding a branch drops the edge it can no longer take. The arm it

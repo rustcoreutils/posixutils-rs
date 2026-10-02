@@ -73,11 +73,7 @@ impl<'a> Builder<'a> {
     /// that gives it its width.
     pub(crate) fn constant(&mut self, v: i128, typ: TypeId, size: u32) -> PseudoId {
         let id = self.func.create_const_pseudo(at_width(v, size, true));
-        self.push(
-            Instruction::new(Opcode::SetVal)
-                .with_target(id)
-                .with_type_and_size(typ, size),
-        );
+        self.push(Instruction::set_val(id, typ, size));
         id
     }
 
@@ -86,11 +82,7 @@ impl<'a> Builder<'a> {
     pub(crate) fn float_constant(&mut self, v: FloatVal, typ: TypeId, size: u32) -> PseudoId {
         let id = self.func.alloc_pseudo();
         self.func.add_pseudo(Pseudo::fval(id, v));
-        self.push(
-            Instruction::new(Opcode::SetVal)
-                .with_target(id)
-                .with_type_and_size(typ, size),
-        );
+        self.push(Instruction::set_val(id, typ, size));
         id
     }
 

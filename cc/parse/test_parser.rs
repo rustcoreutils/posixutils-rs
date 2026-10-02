@@ -13,9 +13,9 @@
 
 use crate::float::IntegralRounding;
 use crate::parse::ast::{
-    AssignOp, BinaryOp, BlockItem, CalleeBinding, Declaration, Expr, ExprKind, ExternalDecl,
-    ForInit, FpTest, FunctionDef, InlineLibraryFn, Label, LibFn, MathErrno, MemoryFn, Stmt,
-    TranslationUnit, UnaryOp,
+    AssignOp, BinaryOp, BlockItem, CalleeBinding, Declaration, Designator, Expr, ExprKind,
+    ExternalDecl, ForInit, FpTest, FunctionDef, InlineLibraryFn, Label, LibFn, MathErrno, MemoryFn,
+    Stmt, TranslationUnit, UnaryOp,
 };
 use crate::parse::parser::{ParseResult, Parser};
 use crate::strings::{StringId, StringTable};
@@ -4329,6 +4329,29 @@ fn test_compound_literal_in_expression() {
         ExprKind::Member { .. } => {}
         _ => panic!("Expected member access on compound literal"),
     }
+}
+
+/// A GNU cast to union is the compound literal `(U){ .member = operand }`
+/// for the member whose type the operand has, inside a cast to `U` that
+/// keeps the result an rvalue. Converting the operand to the union's width
+/// stored a `double` operand as integer bits.
+#[test]
+fn test_cast_to_union_initializes_the_matching_member() {
+    let (expr, types, strings, _symbols) = parse_expr("(union { long l; double d; })1.5").unwrap();
+    let ExprKind::Cast { cast_type, expr } = &expr.kind else {
+        panic!("expected a cast, got {:?}", expr.kind);
+    };
+    assert_eq!(types.kind(*cast_type), TypeKind::Union);
+    let ExprKind::CompoundLiteral { typ, elements } = &expr.kind else {
+        panic!("expected a compound literal, got {:?}", expr.kind);
+    };
+    assert_eq!(typ, cast_type);
+    assert_eq!(elements.len(), 1);
+    match elements[0].designators.as_slice() {
+        [Designator::Field(name)] => assert_eq!(strings.get(*name), "d"),
+        other => panic!("expected .d, got {other:?}"),
+    }
+    assert_eq!(elements[0].value.typ, Some(types.double_id));
 }
 
 // __builtin_offsetof tests

@@ -18,6 +18,7 @@
 // everything.
 //
 
+mod cast_to_union;
 mod va_arg_pack;
 
 use crate::common::{

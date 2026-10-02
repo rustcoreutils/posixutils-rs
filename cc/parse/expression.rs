@@ -1002,6 +1002,62 @@ impl<'a> Parser<'a> {
         Ok(self.with_type_name_extents(dims, literal))
     }
 
+    /// A GNU cast to union type, `(union U)expr`.
+    ///
+    /// The operand must have the type of one of the members -- see
+    /// [`crate::types::TypeTable::union_member_for_cast`] -- and the result is
+    /// the union with that member initialized: `(union U){ .member = expr }`,
+    /// every other byte zero. It is built as exactly that compound literal,
+    /// so the initializer, constant and aggregate-value paths all treat it as
+    /// one, and wrapped in a cast to its own type, which converts nothing but
+    /// keeps the result from being an lvalue as a compound literal is.
+    ///
+    /// An operand of the union's own type is an ordinary no-op cast. One that
+    /// matches no member is diagnosed as gcc does. A vector operand is the
+    /// vector-value error every other cast reports: the array model would
+    /// see it decay, and so match no vector member.
+    fn cast_to_union(&mut self, union_typ: TypeId, operand: Expr, pos: Position) -> Expr {
+        let union_typ = self.types.unqualified(union_typ);
+        let is_vector = self.check_not_vector_value(operand.typ, operand.pos);
+        let value = match operand.typ {
+            Some(_) if is_vector => operand,
+            Some(t) => {
+                let t = self.lvalue_converted_type(t);
+                if self.types.types_compatible(t, union_typ) {
+                    operand
+                } else if let Some(name) = self.types.union_member_for_cast(union_typ, t) {
+                    let elements = vec![InitElement {
+                        designators: vec![Designator::Field(name)],
+                        value: Box::new(operand),
+                    }];
+                    Self::typed_expr(
+                        ExprKind::CompoundLiteral {
+                            typ: union_typ,
+                            elements,
+                        },
+                        union_typ,
+                        pos,
+                    )
+                } else {
+                    diag::error(
+                        pos,
+                        &gettext("cast to union type from type not present in union"),
+                    );
+                    operand
+                }
+            }
+            None => operand,
+        };
+        Self::typed_expr(
+            ExprKind::Cast {
+                cast_type: union_typ,
+                expr: Box::new(value),
+            },
+            union_typ,
+            pos,
+        )
+    }
+
     /// [`Self::parse_compound_literal_tail`] from its `{`.
     fn parse_compound_literal_body(
         &mut self,
@@ -2404,13 +2460,17 @@ impl<'a> Parser<'a> {
                         // C17 6.5.4p2: a cast names a scalar type or `void`.
                         // An array was converted as if it were its first
                         // element's address. (A union stays: gcc casts to
-                        // one, and so does c17.)
+                        // one, and so does c17 -- see `cast_to_union`.)
                         match self.types.kind(typ) {
                             TypeKind::Array => {
                                 diag::error(paren_pos, &gettext("cast specifies array type"))
                             }
                             TypeKind::Function => {
                                 diag::error(paren_pos, &gettext("cast specifies function type"))
+                            }
+                            TypeKind::Union => {
+                                let cast = self.cast_to_union(typ, expr, paren_pos);
+                                return Ok(self.with_type_name_extents(dims, cast));
                             }
                             _ => {}
                         }

@@ -1533,6 +1533,26 @@ impl TypeTable {
             .map(|m| m.typ)
     }
 
+    /// The member a GNU cast to union type `id` initializes from an operand
+    /// of type `operand`, which the caller has already lvalue-converted.
+    ///
+    /// gcc selects the first member whose type is compatible with the
+    /// operand's, qualifiers ignored. Nothing converts the operand to find a
+    /// match: a `long` selects no `int` member. A bit-field never matches,
+    /// and neither can an unnamed member, which no designator could name.
+    /// `None` when nothing matches, or `id` is not a union.
+    pub fn union_member_for_cast(&self, id: TypeId, operand: TypeId) -> Option<StringId> {
+        if self.kind(id) != TypeKind::Union {
+            return None;
+        }
+        self.composite(id)?
+            .members
+            .iter()
+            .filter(|m| m.bit_width.is_none() && m.name != StringId::EMPTY)
+            .find(|m| self.types_compatible(m.typ, operand))
+            .map(|m| m.name)
+    }
+
     /// Format a type for display (with recursive base type printing).
     ///
     /// Used by diagnostics that have to name the types they are complaining
@@ -3766,6 +3786,67 @@ mod tests {
         ])));
         types.set_transparent_union(zw);
         assert_eq!(types.transparent_union_first_member(zw), Some(char_ptr));
+    }
+
+    /// A cast to union selects a member by type compatibility alone: the
+    /// first named, non-bit-field member whose type matches, a qualified
+    /// member included, and nothing a conversion would reach.
+    #[test]
+    fn test_union_member_for_cast() {
+        let mut types = TypeTable::new(&Target::host());
+        let mut idents = crate::strings::StringTable::new();
+        let (bf, ci, l, d, d2) = (
+            idents.intern("bf"),
+            idents.intern("ci"),
+            idents.intern("l"),
+            idents.intern("d"),
+            idents.intern("d2"),
+        );
+        let const_int = types.qualified_with(types.int_id, TypeModifiers::CONST);
+        let member = |name, typ, bit_width| StructMember {
+            name,
+            typ,
+            offset: 0,
+            bit_offset: None,
+            bit_width,
+            access_bytes: None,
+            align: MemberAlign::NATURAL,
+        };
+        let composite = |members| CompositeType {
+            tag: None,
+            members,
+            enum_constants: Vec::new(),
+            size: 8,
+            align: 8,
+            member_align: 8,
+            is_complete: true,
+            transparent: false,
+            anon_id: None,
+        };
+        let members = vec![
+            member(bf, types.int_id, Some(3)),
+            member(StringId::EMPTY, types.char_id, None),
+            member(ci, const_int, None),
+            member(l, types.long_id, None),
+            member(d, types.double_id, None),
+            member(d2, types.double_id, None),
+        ];
+        let u = types.intern(Type::union_type(composite(members.clone())));
+
+        // The bit-field is skipped; the const member matches a plain `int`.
+        assert_eq!(types.union_member_for_cast(u, types.int_id), Some(ci));
+        assert_eq!(types.union_member_for_cast(u, types.long_id), Some(l));
+        // The first of two matching members.
+        assert_eq!(types.union_member_for_cast(u, types.double_id), Some(d));
+        // No conversion: neither `float` nor `short` matches, and the
+        // unnamed `char` member cannot be designated.
+        assert_eq!(types.union_member_for_cast(u, types.float_id), None);
+        assert_eq!(types.union_member_for_cast(u, types.short_id), None);
+        assert_eq!(types.union_member_for_cast(u, types.char_id), None);
+
+        // A struct is not cast to by member.
+        let st = types.intern(Type::struct_type(composite(members)));
+        assert_eq!(types.union_member_for_cast(st, types.long_id), None);
     }
 
     #[test]

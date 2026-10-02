@@ -568,13 +568,13 @@ impl Linearizer<'_> {
         }
 
         let lv = self.atomic_lvalue(target)?;
-        let value_typ = self.expr_type(value);
-        let rhs = self.linearize_expr(value);
-
         if op == AssignOp::Assign {
-            let converted = self.emit_convert(rhs, value_typ, target_typ);
+            let converted = self.linearize_converted(value, target_typ);
             return Some(self.emit_atomic_store(&lv, converted));
         }
+
+        let value_typ = self.expr_type(value);
+        let rhs = self.linearize_expr(value);
 
         // Pointer arithmetic scales by the element size. The ordinary path does
         // this *after* the point we branched from, so it has to be repeated.

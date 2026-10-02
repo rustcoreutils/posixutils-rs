@@ -534,7 +534,7 @@ impl Parser<'_> {
         let is_array = self.types.kind(typ) == TypeKind::Array;
         match scope {
             DeclScope::File => {
-                if !is_array && !self.is_complete_type(typ) {
+                if !is_array && !self.types.is_composite_complete(typ) {
                     self.tentative_definitions.push((typ, pos));
                 }
             }
@@ -544,7 +544,7 @@ impl Parser<'_> {
                 }
             }
             DeclScope::Block { .. } => {
-                if !self.is_complete_type(typ) {
+                if !self.types.is_composite_complete(typ) {
                     let named = self.types.format_type(typ, Some(self.idents));
                     diag::error_args(
                         pos,
@@ -581,15 +581,5 @@ impl Parser<'_> {
                 &[self.idents.get(name)],
             );
         }
-    }
-
-    /// Whether a structure or union type is complete now.
-    ///
-    /// Asks the *tag*, not the recorded id: a qualified spelling is interned
-    /// as a snapshot of the tag's data as it stood then
-    /// (`intern_type_with_tag`), which completing the tag never updates.
-    fn is_complete_type(&self, typ: TypeId) -> bool {
-        self.types
-            .is_composite_complete(self.symbols.resolve_struct_type(self.types, typ))
     }
 }

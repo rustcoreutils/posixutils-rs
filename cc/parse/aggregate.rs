@@ -235,7 +235,7 @@ impl Parser<'_> {
                 is_complete: true,
                 transparent: false,
                 anon_id: tag.is_none().then(|| self.types.fresh_anon_id()),
-                forward_of: None,
+                tag_type: None,
             };
 
             let unsigned = self.types.is_unsigned(underlying);
@@ -265,11 +265,13 @@ impl Parser<'_> {
                 enum_type.modifiers |= TypeModifiers::UNSIGNED;
             }
 
-            // Register tag if present
+            // Register tag if present, and answer with the interned type,
+            // which carries the tag's identity.
             if let Some(tag_name) = tag {
-                let enum_type_id = self.types.intern(enum_type.clone());
+                let enum_type_id = self.types.intern(enum_type);
                 let sym = Symbol::tag(tag_name, enum_type_id, self.symbols.depth());
                 let _ = self.symbols.declare(sym);
+                return Ok(self.types.get(enum_type_id).clone());
             }
 
             Ok(enum_type)
@@ -312,7 +314,14 @@ impl Parser<'_> {
     /// Parse a struct or union specifier
     /// struct-or-union-specifier: ('struct'|'union') identifier? '{' struct-declaration-list? '}'
     ///                          | ('struct'|'union') identifier
-    pub(crate) fn parse_struct_or_union_specifier(&mut self, is_union: bool) -> ParseResult<Type> {
+    ///
+    /// `alone`: nothing precedes the specifier in its declaration, so if a
+    /// `;` follows it, it is the declaration `struct S;`.
+    pub(crate) fn parse_struct_or_union_specifier(
+        &mut self,
+        is_union: bool,
+        alone: bool,
+    ) -> ParseResult<Type> {
         let specifier_pos = self.current_pos();
         self.advance(); // consume 'struct' or 'union'
 
@@ -424,7 +433,7 @@ impl Parser<'_> {
                 is_complete: true,
                 transparent: is_transparent && is_union,
                 anon_id: tag.is_none().then(|| self.types.fresh_anon_id()),
-                forward_of: None,
+                tag_type: None,
             };
 
             // Check if there's an existing forward declaration that we should complete
@@ -452,11 +461,13 @@ impl Parser<'_> {
                 Type::struct_type(composite)
             };
 
-            // Register tag if present
+            // Register tag if present, and answer with the interned type,
+            // which carries the tag's identity.
             if let Some(tag_name) = tag {
-                let typ_id = self.types.intern(struct_type.clone());
+                let typ_id = self.types.intern(struct_type);
                 let sym = Symbol::tag(tag_name, typ_id, self.symbols.depth());
                 let _ = self.symbols.declare(sym);
+                return Ok(self.types.get(typ_id).clone());
             }
 
             Ok(struct_type)
@@ -469,8 +480,16 @@ impl Parser<'_> {
                 self.raise_pending_alignas(align);
             }
             if let Some(tag_name) = tag {
-                // Look up existing tag
-                if let Some(existing) = self.symbols.lookup_tag(tag_name) {
+                // C17 6.7.2.3p7: `struct S;` by itself declares the tag in
+                // this scope, a new incomplete type that hides any `struct S`
+                // of an enclosing one. Every other reference names the tag
+                // that is visible.
+                let existing = if alone && self.is_special(b';') {
+                    self.symbols.lookup_tag_in_current_scope(tag_name)
+                } else {
+                    self.symbols.lookup_tag(tag_name)
+                };
+                if let Some(existing) = existing {
                     Ok(self.types.get(existing.typ).clone())
                 } else {
                     // Create new incomplete type and register it in symbol table
@@ -894,5 +913,83 @@ mod tests {
             .lookup_typedef(strings.lookup("CS").unwrap())
             .unwrap();
         assert_eq!(types.size_bytes(cs), 16);
+    }
+
+    /// The types of the variables declared at the top of function `func`'s
+    /// body, by name.
+    fn locals_of(
+        tu: &crate::parse::ast::TranslationUnit,
+        strings: &crate::strings::StringTable,
+        symbols: &crate::symbol::SymbolTable,
+        func: &str,
+    ) -> Vec<(String, crate::types::TypeId)> {
+        use crate::parse::ast::{BlockItem, ExternalDecl, Stmt};
+        let f = tu
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ExternalDecl::FunctionDef(f) if strings.get(f.name) == func => Some(f),
+                _ => None,
+            })
+            .unwrap();
+        let Stmt::Block(items) = &f.body else {
+            panic!("expected a block");
+        };
+        items
+            .iter()
+            .filter_map(|item| match item {
+                BlockItem::Declaration(decl) => Some(decl),
+                BlockItem::Statement(_) => None,
+            })
+            .flat_map(|decl| decl.declarators.iter())
+            .map(|d| (strings.get(symbols.get(d.symbol).name).to_string(), d.typ))
+            .collect()
+    }
+
+    /// A typedef name names the tag that was visible where the typedef was
+    /// declared, even in a block that has given the tag's name to a new type.
+    #[test]
+    fn a_typedef_keeps_its_tag_under_an_inner_one() {
+        let (tu, types, strings, symbols) = parse_tu(
+            "struct S { int a; }; typedef struct S TS; typedef const struct S CTS;\n\
+             void f(void) { struct S { char c[50]; }; TS x; CTS y; struct S z; }",
+        )
+        .unwrap();
+        let outer = symbols
+            .lookup_tag(strings.lookup("S").unwrap())
+            .unwrap()
+            .typ;
+        let locals = locals_of(&tu, &strings, &symbols, "f");
+        let typ = |name: &str| locals.iter().find(|(n, _)| n == name).unwrap().1;
+        assert_eq!(typ("x"), outer);
+        assert_eq!(types.size_bytes(typ("y")), 4);
+        assert_eq!(types.qualifiers(typ("y")), TypeModifiers::CONST);
+        assert_eq!(types.size_bytes(typ("z")), 50);
+    }
+
+    /// `struct S;` by itself declares a new tag in its block, which the
+    /// block's definition completes; with a qualifier ahead of it, it names
+    /// the visible tag and declares nothing.
+    #[test]
+    fn a_bare_tag_declaration_hides_the_outer_tag() {
+        let (tu, types, strings, symbols) = parse_tu(
+            "struct S { int a; };\n\
+             void f(void) { struct S; struct S *p; struct S { char c[50]; } *q; }\n\
+             void g(void) { const struct S; struct S *p; }",
+        )
+        .unwrap();
+        let outer = symbols
+            .lookup_tag(strings.lookup("S").unwrap())
+            .unwrap()
+            .typ;
+        let pointee = |func: &str, name: &str| {
+            let locals = locals_of(&tu, &strings, &symbols, func);
+            let p = locals.iter().find(|(n, _)| n == name).unwrap().1;
+            types.base_type(p).unwrap()
+        };
+        assert_ne!(pointee("f", "p"), outer);
+        assert_eq!(pointee("f", "p"), pointee("f", "q"));
+        assert_eq!(types.size_bytes(pointee("f", "p")), 50);
+        assert_eq!(pointee("g", "p"), outer);
     }
 }

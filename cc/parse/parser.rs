@@ -608,45 +608,36 @@ impl<'a> Parser<'a> {
         false
     }
 
-    /// Intern a type, but for struct/union/enum types with tags, check the symbol table
-    /// first to reuse the existing TypeId. This ensures forward-declared types
-    /// are properly linked when the type is later completed.
+    /// Intern a type, answering a tagged struct, union or enum with the tag's
+    /// own `TypeId` -- or a qualified copy of it -- rather than a new one.
     ///
-    /// Important: Storage class modifiers (static, extern, etc.) are preserved from
-    /// the input type even when reusing an existing struct TypeId.
+    /// Which tag a type is comes from the type itself
+    /// ([`CompositeType::tag_type`]), not from looking its tag's name up
+    /// here: a typedef name or `typeof` names the tag that was visible where
+    /// *it* was declared, and an inner scope may since have given the name to
+    /// a different type. `typedef struct S TS;` used as `TS x;` in a block
+    /// that defines its own `struct S` declared `x` with the inner type.
+    ///
+    /// Only the type qualifiers carry over. A storage class -- `typedef`
+    /// above all -- is the declaration's, not the type's: keeping it would
+    /// make `typedef struct Foo Foo;` a different `TypeId` from the tag.
+    ///
+    /// [`CompositeType::tag_type`]: crate::types::CompositeType::tag_type
     pub(super) fn intern_type_with_tag(&mut self, typ: &Type) -> TypeId {
-        // For a tagged type, use the existing TypeId from symbol table
-        if matches!(
-            typ.kind,
-            TypeKind::Struct | TypeKind::Union | TypeKind::Enum
-        ) {
-            if let Some(ref composite) = typ.composite {
-                if let Some(tag) = composite.tag {
-                    if let Some(existing) = self.symbols.lookup_tag(tag) {
-                        // Check if we need to preserve type qualifiers (not storage class)
-                        // Storage class (TYPEDEF, EXTERN, STATIC, etc.) is a property of
-                        // the declaration, not the type. TYPEDEF especially must NOT create
-                        // a new TypeId, otherwise "typedef struct Foo Foo;" creates a different
-                        // TypeId than the tag, and when "struct Foo { ... };" completes the tag,
-                        // the typedef still points to the incomplete type.
-                        let type_qualifier_mask = TypeModifiers::CONST
-                            | TypeModifiers::VOLATILE
-                            | TypeModifiers::RESTRICT
-                            | TypeModifiers::ATOMIC;
-                        let new_qualifiers = typ.modifiers & type_qualifier_mask;
-                        if !new_qualifiers.is_empty() {
-                            // Create a new type with the existing struct's data but new qualifiers
-                            let mut existing_type = self.types.get(existing.typ).clone();
-                            existing_type.modifiers |= new_qualifiers;
-                            return self.types.intern(existing_type);
-                        }
-                        return existing.typ;
-                    }
-                }
-            }
+        let Some(tag_type) = typ.composite.as_ref().and_then(|c| c.tag_type) else {
+            return self.types.intern(typ.clone());
+        };
+        let type_qualifier_mask = TypeModifiers::CONST
+            | TypeModifiers::VOLATILE
+            | TypeModifiers::RESTRICT
+            | TypeModifiers::ATOMIC;
+        let qualifiers = typ.modifiers & type_qualifier_mask;
+        if qualifiers.is_empty() {
+            return tag_type;
         }
-        // For other types, just intern normally
-        self.types.intern(typ.clone())
+        let mut qualified = self.types.get(tag_type).clone();
+        qualified.modifiers |= qualifiers;
+        self.types.intern(qualified)
     }
 
     /// Skip StreamBegin tokens (but not StreamEnd - that marks EOF)
@@ -856,13 +847,23 @@ impl crate::constexpr::ConstEnv for Parser<'_> {
     /// An enumeration constant is the only identifier with a value in the
     /// parser: a `const` object's value lives in an emitted global, which does
     /// not exist yet here, and no parse-time context would accept one.
+    /// No object has a value in the parser, for the reason
+    /// [`Self::ident_value`] gives.
+    fn subobject_value(&self, _expr: &Expr, _scope: ConstScope) -> Option<i128> {
+        None
+    }
+
+    fn float_subobject_value(
+        &self,
+        _expr: &Expr,
+        _scope: ConstScope,
+    ) -> Option<crate::float::FloatVal> {
+        None
+    }
+
     fn ident_value(&self, sym: crate::symbol::SymbolId, _scope: ConstScope) -> Option<i128> {
         let symbol = self.symbols.get(sym);
         symbol.is_enum_constant().then_some(symbol.enum_value)?
-    }
-
-    fn struct_of(&self, typ: TypeId) -> TypeId {
-        self.symbols.resolve_struct_type(self.types, typ)
     }
 
     /// No floating identifier has a value in the parser, for the reason

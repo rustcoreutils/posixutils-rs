@@ -1270,14 +1270,29 @@ impl<'a> Parser<'a> {
     /// a[]; sizeof a` answered 0 where gcc rejects it, while a local VLA's
     /// `sizeof` had to keep working.
     ///
-    /// Only an identifier is examined. A subscript or a member reaches an
-    /// element whose type is complete by construction, and a call cannot
-    /// return an array.
+    /// An incomplete structure, union or enumeration is incomplete whatever
+    /// the expression -- `sizeof *p` for a `struct S *p` whose tag has no
+    /// definition yet. For an array only an identifier is examined: a
+    /// subscript or a member reaches an element whose type is complete by
+    /// construction, and a call cannot return an array.
     fn check_sizeof_expr_operand(&self, expr: &Expr, pos: Position) {
-        let ExprKind::Ident(symbol_id) = expr.kind else {
+        let Some(typ) = expr.typ else {
             return;
         };
-        let Some(typ) = expr.typ else {
+        if matches!(
+            self.types.kind(typ),
+            TypeKind::Struct | TypeKind::Union | TypeKind::Enum
+        ) && self.type_name_is_incomplete(typ, 0)
+        {
+            let named = self.types.format_type(typ, Some(self.idents));
+            diag::error_args(
+                pos,
+                "invalid application of 'sizeof' to incomplete type '{0}'",
+                &[&named],
+            );
+            return;
+        }
+        let ExprKind::Ident(symbol_id) = expr.kind else {
             return;
         };
         if self.types.kind(typ) != TypeKind::Array
@@ -1474,19 +1489,16 @@ impl<'a> Parser<'a> {
                 let dot_pos = self.current_pos();
                 self.advance();
                 let member = self.expect_identifier()?;
-                // Get member type from struct type, resolving incomplete types first
                 let member_type = if let Some(t) = expr.typ {
-                    let resolved = self.symbols.resolve_struct_type(self.types, t);
-                    let kind = self.types.kind(resolved);
+                    let kind = self.types.kind(t);
                     if kind != TypeKind::Struct && kind != TypeKind::Union {
                         diag::error(
                             dot_pos,
                             &gettext("request for member in something not a structure or union"),
                         );
                         self.types.int_id
-                    } else if let Some(typ) = self.types.member_access_type(t, resolved, member) {
-                        // C17 6.5.2.3p3: so-qualified by the object, whose
-                        // qualifiers are on `t` -- `resolved` has lost them.
+                    } else if let Some(typ) = self.types.member_access_type(t, member) {
+                        // C17 6.5.2.3p3: so-qualified by the object.
                         typ
                     } else {
                         let member_name = self.idents.get_opt(member).unwrap_or("<unknown>");
@@ -1512,11 +1524,10 @@ impl<'a> Parser<'a> {
                 let arrow_pos = self.current_pos();
                 self.advance();
                 let member = self.expect_identifier()?;
-                // Get member type: dereference pointer to get struct, resolve if incomplete, then find member
+                // Get member type: dereference the pointer, then find the member
                 let member_type = if let Some(t) = expr.typ {
                     if let Some(struct_type) = self.types.base_type(t) {
-                        let resolved = self.symbols.resolve_struct_type(self.types, struct_type);
-                        let kind = self.types.kind(resolved);
+                        let kind = self.types.kind(struct_type);
                         if kind != TypeKind::Struct && kind != TypeKind::Union {
                             diag::error(
                                 arrow_pos,
@@ -1525,8 +1536,7 @@ impl<'a> Parser<'a> {
                                 ),
                             );
                             self.types.int_id
-                        } else if let Some(typ) =
-                            self.types.member_access_type(struct_type, resolved, member)
+                        } else if let Some(typ) = self.types.member_access_type(struct_type, member)
                         {
                             // C17 6.5.2.3p4: so-qualified by the *pointee*.
                             // `struct S *volatile p` qualifies `p`, not `*p`.
@@ -1983,8 +1993,7 @@ impl<'a> Parser<'a> {
             ExprKind::Arrow { expr, member } => (self.types.base_type(expr.typ?)?, *member),
             _ => return None,
         };
-        let resolved = self.symbols.resolve_struct_type(self.types, base_typ);
-        let info = self.types.find_member(resolved, member)?;
+        let info = self.types.find_member(base_typ, member)?;
         Some((info.bit_width?, info.typ))
     }
 

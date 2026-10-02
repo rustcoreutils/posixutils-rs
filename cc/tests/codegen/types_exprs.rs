@@ -1537,9 +1537,9 @@ fn codegen_function_and_array_convert_from_their_address() {
 #include <stdint.h>
 #include <stdarg.h>
 
-static long h(void) { return 7; }
+__attribute__((aligned(256))) static long h(void) { return 7; }
 static long g(void) { return 9; }
-static int arr[4] = {1, 2, 3, 4};
+static int arr[4] __attribute__((aligned(256))) = {1, 2, 3, 4};
 
 static long via_mem(long (*volatile *pp)(void)) { return (long)*pp; }
 static long arr_via_mem(int *volatile *pp) { return (long)*pp; }
@@ -1608,6 +1608,131 @@ int main(void) {
 static long take_old(x) long (*x)(void); { return (long)x; }
 "#;
     compile_and_run_everywhere("fn_array_convert_from_address", src);
+}
+
+/// A function designator or an array passed to a `_Bool` parameter, or
+/// converted to `_Bool` at any other site, is converted from the address it
+/// decays to: true, since no function or object is at the null address.
+///
+/// The argument path decayed the operand and then passed the pointer with no
+/// conversion to the parameter's type, so at -O0 the callee read the
+/// address's low byte -- zero for anything aligned to 256, which is why the
+/// `_Bool` checks above are aligned that way. A static `_Bool` initialized
+/// with an array or a function stored the same low byte.
+#[test]
+fn codegen_decaying_operand_converts_to_bool_from_its_address() {
+    let src = r#"
+__attribute__((aligned(256))) static long h(void) { return 7; }
+static int arr[4] __attribute__((aligned(256))) = {1, 2, 3, 4};
+static int grid[2][64] __attribute__((aligned(256)));
+struct holder { int a[64]; } __attribute__((aligned(256))) hold;
+__attribute__((noinline)) static _Bool take_bool(_Bool b) { return b; }
+__attribute__((noinline)) static int take_two(int n, _Bool b) { return n + b; }
+static _Bool ret_h(void) { return h; }
+static _Bool ret_arr(void) { return arr; }
+struct flags { _Bool f; };
+_Bool file_scope_arr = (_Bool)arr;
+
+int main(void) {
+    if (!take_bool(h)) return 1;
+    if (!take_bool(arr)) return 2;
+    if (!take_bool("str")) return 3;
+    if (!take_bool(grid[1])) return 4;
+    if (!take_bool(hold.a)) return 5;
+    if (!take_bool((int[]){0})) return 6;
+    if (take_two(1, h) != 2 || take_two(2, arr) != 3) return 7;
+    if (!ret_h() || !ret_arr()) return 8;
+    _Bool b = h;
+    if (!b) return 9;
+    b = 0;
+    b = arr;
+    if (!b) return 10;
+    _Bool bs[3] = { h, arr, "x" };
+    if (!bs[0] || !bs[1] || !bs[2]) return 11;
+    struct flags s = { arr };
+    if (!s.f) return 12;
+    _Bool cl = (_Bool){ h };
+    if (!cl) return 13;
+    _Atomic _Bool ab = 0;
+    ab = arr;
+    if (!ab) return 14;
+    struct flags ss = { .f = grid[0] };
+    if (!ss.f) return 15;
+    _Bool (*fp)(_Bool) = take_bool;
+    if (!fp(arr) || !fp(h)) return 16;
+    if (!file_scope_arr) return 17;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("decaying_operand_to_bool", src);
+}
+
+/// GNU C rejects a static `_Bool` initialized with a bare array or function,
+/// as not computable at load time; c17 folds it as the cast form folds,
+/// since an address constant is never null.
+#[test]
+fn codegen_static_bool_from_an_address_constant_is_true() {
+    let src = r#"
+static int arr[4] __attribute__((aligned(256)));
+__attribute__((aligned(256))) static long h(void) { return 7; }
+_Bool gb = arr, gs = "x", ga = &arr[1], gz = 0, gf = 0.5;
+int main(void) {
+    static _Bool sb = arr, sf = h;
+    if (!gb || !gs || !ga || gz || !gf) return 1;
+    if (!sb || !sf) return 2;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("static_bool_from_address", src);
+}
+
+/// An element or member of a `const` object whose initializer folded is
+/// folded in a static initializer, as the object named whole is -- gcc does
+/// both. The subscript or member access was taken as an address, so
+/// `int w = a[0];` was initialized with eight bytes of relocation to `a`.
+#[test]
+fn codegen_const_subobject_folds_in_a_static_initializer() {
+    let src = r#"
+struct P { int x; double d; short v[3]; };
+const int a[3] = {1, 2, 3};
+const struct P p = { 4, 2.5, { 7, 8 } };
+const struct P ps[2] = { { 1, 0.5, {0} }, { 9, 1.25, { 5, 6, 7 } } };
+const double da[2] = { 1.5, 3.5 };
+int w0 = a[0], w2 = a[2] + 1;
+long wx = p.x;
+double wd = p.d * 2;
+int wv = p.v[1];
+int ww = ps[1].v[2] + ps[1].x;
+double wf = da[1];
+float wq = ps[1].d;
+int main(void) {
+    if (w0 != 1 || w2 != 4 || wx != 4 || wd != 5.0) return 1;
+    if (wv != 8 || ww != 16 || wf != 3.5 || wq != 1.25f) return 2;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("const_subobject_static_init", src);
+}
+
+/// An address does not fit an integer object narrower than a pointer, so it
+/// is no initializer for one -- gcc's "not computable at load time". The
+/// relocation was emitted as eight bytes over the one- or four-byte object.
+#[test]
+fn codegen_address_into_a_narrow_integer_is_not_a_static_initializer() {
+    let what = "cannot initialize an object with static storage duration";
+    for (name, src) in [
+        (
+            "narrow_addr_char",
+            "static int arr[4];\nchar k = (long)arr;\n",
+        ),
+        (
+            "narrow_addr_int",
+            "static int arr[4];\nint j = (long)arr + 1;\n",
+        ),
+        ("narrow_addr_fn", "long h(void);\nshort s = (long)&h;\n"),
+    ] {
+        compile_expect_error(name, src, what);
+    }
 }
 
 /// The x86-64 shape of the defect above, where a non-PIE link would put the

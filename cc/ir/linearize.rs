@@ -2223,8 +2223,7 @@ impl<'a> Linearizer<'a> {
             // A scalar the convention returns through the pointer -- a Win64
             // `long double` -- is converted as `return` converts any value
             // (C17 6.8.6.4p3) and stored there.
-            let val = self.linearize_expr(e);
-            let val = self.emit_convert(val, self.expr_type(e), ret_type);
+            let val = self.linearize_converted(e, ret_type);
             let size = self.types.size_bits(ret_type);
             self.emit(Instruction::store(val, sret_ptr, 0, ret_type, size));
             self.emit(Instruction::ret_typed(
@@ -2234,12 +2233,10 @@ impl<'a> Linearizer<'a> {
             ));
             return;
         }
-        let src_addr = if !self.types.is_complex(ret_type) {
-            self.linearize_lvalue(e)
-        } else if self.types.is_complex(self.expr_type(e)) {
-            self.complex_operand_at_precision(e, ret_type)
+        let src_addr = if self.types.is_complex(ret_type) {
+            self.linearize_converted(e, ret_type)
         } else {
-            self.promote_real_to_complex(e, ret_type)
+            self.linearize_lvalue(e)
         };
         let struct_bytes = self.types.size_bytes(ret_type);
         // The shared block copy, for the same two reasons the parameter
@@ -2804,11 +2801,7 @@ impl<'a> Linearizer<'a> {
             } => {
                 // s.m as lvalue = &s + offset(m)
                 let base = self.linearize_lvalue(inner);
-                let base_struct_type = self.expr_type(inner);
-                // Resolve if the struct type is incomplete (forward-declared)
-                let struct_type = self
-                    .symbols
-                    .resolve_struct_type(self.types, base_struct_type);
+                let struct_type = self.expr_type(inner);
                 let member_info = self
                     .types
                     .find_member(struct_type, *member)
@@ -2823,14 +2816,10 @@ impl<'a> Linearizer<'a> {
                 // ptr->m as lvalue = ptr + offset(m)
                 let ptr = self.linearize_expr(inner);
                 let ptr_type = self.expr_type(inner);
-                let base_struct_type = self
+                let struct_type = self
                     .types
                     .base_type(ptr_type)
                     .unwrap_or_else(|| self.expr_type(expr));
-                // Resolve if the struct type is incomplete (forward-declared)
-                let struct_type = self
-                    .symbols
-                    .resolve_struct_type(self.types, base_struct_type);
                 let member_info = self
                     .types
                     .find_member(struct_type, *member)
@@ -2941,102 +2930,27 @@ impl<'a> Linearizer<'a> {
     }
 
     /// Linearize a type cast expression
-    /// A cast to a complex type (C17 6.3.1.7p1).
-    ///
-    /// From a real: the value becomes the real part and the imaginary part is
-    /// zero. From a complex: each half is converted to the new precision,
-    /// which is what makes `(_Complex double)(_Complex float)z` widen both
-    /// halves rather than only one.
-    ///
-    /// Built the same way `__builtin_complex` is -- a local of the target type
-    /// and two stores -- so the result travels by address like every other
-    /// complex value.
-    fn emit_cast_to_complex(
-        &mut self,
-        inner_expr: &Expr,
-        src_type: TypeId,
-        cast_type: TypeId,
-    ) -> PseudoId {
-        let base_typ = self.types.complex_base(cast_type);
-        let base_bits = self.types.size_bits(base_typ);
-        let base_bytes = (base_bits / 8) as i64;
-
-        let (real_val, imag_val) = if self.types.is_complex(src_type) {
-            // Each half, converted to the destination's precision.
-            let src_base = self.types.complex_base(src_type);
-            let addr = self.complex_operand_addr(inner_expr);
-            let src_bits = self.types.size_bits(src_base);
-            let src_bytes = (src_bits / 8) as i64;
-
-            let re = self.alloc_pseudo();
-            self.emit(Instruction::load(re, addr, 0, src_base, src_bits));
-            let im = self.alloc_pseudo();
-            self.emit(Instruction::load(im, addr, src_bytes, src_base, src_bits));
-
-            (
-                self.emit_convert(re, src_base, base_typ),
-                self.emit_convert(im, src_base, base_typ),
-            )
-        } else {
-            // A real source: convert it, and pair it with a zero of the
-            // destination's base type.
-            let v = self.linearize_expr(inner_expr);
-            let re = self.emit_convert(v, src_type, base_typ);
-            let zero = self.emit_fconst(crate::float::FloatVal::ZERO, base_typ);
-            (re, zero)
-        };
-
-        let result = self.frame_temp_addr("__ctmp", cast_type);
-        self.emit(Instruction::store(real_val, result, 0, base_typ, base_bits));
-        self.emit(Instruction::store(
-            imag_val, result, base_bytes, base_typ, base_bits,
-        ));
-        result
-    }
-
     pub(crate) fn linearize_cast(&mut self, inner_expr: &Expr, cast_type: TypeId) -> PseudoId {
         // The operand's value, not the designator: a function or an array is
         // converted from the pointer it decays to.
         let src_type = self.types.decayed_value(self.expr_type(inner_expr));
 
-        // C17 6.3.1.7p2: converting a complex value to a real type keeps the
-        // real part and discards the imaginary one. Falling through to the
-        // scalar path reinterpreted the address the complex value travels by
-        // as the value itself, so `(double) z` produced a number in the range
-        // of a pointer bit pattern.
-        // `_Bool` is the exception: 6.3.1.2 converts by comparing against 0,
-        // and for a complex value that comparison is against `0.0 + 0.0i`, so
-        // the imaginary half decides the answer too. Keeping only the real
-        // part here made `(_Bool)(0.0 + 3.0i)` false.
-        if self.types.is_complex(src_type) && self.types.kind(cast_type) == TypeKind::Bool {
-            return self.emit_complex_nonzero(inner_expr);
-        }
-
         // C17 6.3.2.2: a cast to `void` evaluates the operand and discards
         // the value, converting nothing. This has to come before the complex
-        // arms as well as before the arithmetic ones: `void` is neither
-        // complex nor floating, so a complex operand took the
-        // complex-to-real arm just below and a floating one the
-        // float-to-integer arm further down, and `(void)z` became a
-        // `cvttsd2si` that raises `FE_INVALID` for a NaN. The optimizer
-        // deleted the dead conversion at -O1 and above, so only -O0 raised
-        // it.
+        // arm as well as before the arithmetic ones: `void` is neither
+        // complex nor floating, so a complex operand took the complex-to-real
+        // conversion and a floating one the float-to-integer arm further
+        // down, and `(void)z` became a `cvttsd2si` that raises `FE_INVALID`
+        // for a NaN. The optimizer deleted the dead conversion at -O1 and
+        // above, so only -O0 raised it.
         if self.types.kind(cast_type) == TypeKind::Void {
             return self.linearize_expr(inner_expr);
         }
 
-        if self.types.is_complex(src_type) && !self.types.is_complex(cast_type) {
-            return self.emit_complex_to_real(inner_expr, cast_type);
-        }
-
-        // C17 6.3.1.7p1: converting a real to a complex type gives the real
-        // value as the real part and a zero imaginary part; converting complex
-        // to complex converts each part. Neither had a branch here, so a cast
-        // *to* a complex type fell through to the scalar path and returned a
-        // value where a complex address was expected -- `(_Complex double)0.0`
-        // segfaulted at every precision, from a real or from a complex source.
-        if self.types.is_complex(cast_type) {
-            return self.emit_cast_to_complex(inner_expr, src_type, cast_type);
+        // Into or out of a complex type (C17 6.3.1.7), by the rule every
+        // converting site shares.
+        if self.types.is_complex(src_type) || self.types.is_complex(cast_type) {
+            return self.linearize_converted(inner_expr, cast_type);
         }
 
         let src = self.linearize_expr(inner_expr);
@@ -3131,10 +3045,7 @@ impl<'a> Linearizer<'a> {
         member: StringId,
     ) -> PseudoId {
         let base = self.linearize_lvalue(inner_expr);
-        let base_struct_type = self.expr_type(inner_expr);
-        let struct_type = self
-            .symbols
-            .resolve_struct_type(self.types, base_struct_type);
+        let struct_type = self.expr_type(inner_expr);
         self.emit_member_access(base, struct_type, member, self.expr_type(expr))
     }
 
@@ -3147,13 +3058,10 @@ impl<'a> Linearizer<'a> {
     ) -> PseudoId {
         let ptr = self.linearize_expr(inner_expr);
         let ptr_type = self.expr_type(inner_expr);
-        let base_struct_type = self
+        let struct_type = self
             .types
             .base_type(ptr_type)
             .unwrap_or_else(|| self.expr_type(expr));
-        let struct_type = self
-            .symbols
-            .resolve_struct_type(self.types, base_struct_type);
         self.emit_member_access(ptr, struct_type, member, self.expr_type(expr))
     }
 
@@ -3993,50 +3901,27 @@ impl<'a> Linearizer<'a> {
             && (self.types.size_bits(arg_type) > 64 || self.passed_by_reference(arg_type, conv))
         {
             self.lower_struct_arg(a, arg_type, conv)
-        } else if let Some(pt) = param
-            .filter(|pt| self.types.is_complex(arg_type) && self.types.kind(*pt) == TypeKind::Bool)
-        {
-            // A complex argument bound to a `_Bool` parameter converts by
-            // comparing against zero, so it must not take the
-            // pass-the-address arm below -- see `complex_to_bool`.
-            (self.emit_complex_nonzero(a), pt)
         } else if let Some(pt) =
-            param.filter(|pt| self.types.is_complex(*pt) && !self.types.is_complex(arg_type))
+            param.filter(|pt| self.types.is_complex(arg_type) || self.types.is_complex(*pt))
         {
-            // A *real* argument bound to a complex parameter. C17
-            // 6.5.2.2p2 converts it as if by assignment, and 6.3.1.7p1
-            // gives the imaginary half a zero -- so the callee is handed a
-            // complex object, by address, like any other complex argument.
-            //
-            // The arm below keys on the *argument's* type, so this case
-            // reached the ordinary scalar path and the raw value was
-            // passed where an address was expected: `f(7)` with a
-            // `_Complex double` parameter arrived as garbage, and with a
-            // `_Complex int` one the callee dereferenced the number 7.
-            (self.promote_real_to_complex(a, pt), pt)
+            // A complex argument or a complex parameter: C17 6.5.2.2p7
+            // converts the argument as if by assignment, and a complex value
+            // -- here or in the callee -- travels by address, which the
+            // backend loads into registers. Converted to the parameter's
+            // precision too: a complex value is read with its base type's
+            // stride, so a `float _Complex` handed unconverted to a
+            // `double _Complex` parameter arrived as `2+1i` for `1+2i`. The
+            // type recorded for the ABI moves with it, or the classification
+            // is made for a width that is no longer there.
+            (self.linearize_converted(a, pt), pt)
         } else if self.types.is_complex(arg_type) {
-            // Complex types: pass address, codegen loads real/imag into XMM registers
-            // Type stays as complex (not pointer) so codegen knows it's complex.
-            //
-            // Converted to the parameter's own precision first. A complex
-            // value is read with its base type's stride, so handing a
-            // `float _Complex` to a `double _Complex` parameter without
-            // converting had the callee read an 8-byte-strided pair out of
-            // 4-byte-strided storage: `1.0f + 2.0f*I` arrived as `2+1i`.
-            // The type recorded for the ABI has to move with it, or the
-            // classification is made for a width that is no longer there.
-            match param.filter(|pt| self.types.is_complex(*pt)) {
-                Some(pt) => (self.complex_operand_at_precision(a, pt), pt),
-                // No prototype, or a variadic argument: nothing says what
-                // precision the callee wants, so it travels as written.
-                None => (self.complex_operand_addr(a), arg_type),
-            }
+            // No prototype, or a variadic argument: nothing says what
+            // precision the callee wants, so it travels as written.
+            (self.complex_operand_addr(a), arg_type)
         } else if arg_kind == TypeKind::Array {
             // Array decay to pointer (C99 6.3.2.1)
             // This applies to both fixed-size arrays and VLAs
-            let elem_type = self.types.base_type(arg_type).unwrap_or(self.types.int_id);
-            let passed = self.types.pointer_to(elem_type);
-            (self.linearize_expr(a), passed)
+            self.lower_decaying_arg(a, arg_type, param)
         } else if arg_kind == TypeKind::VaList && !self.types.va_list_is_pointer() {
             // va_list decay to pointer (C99 7.15.1)
             // va_list is defined as __va_list_tag[1] (an array), so it decays to
@@ -4048,12 +3933,32 @@ impl<'a> Linearizer<'a> {
         } else if arg_kind == TypeKind::Function {
             // Function decay to pointer (C99 6.3.2.1)
             // Function names passed as arguments decay to function pointers
-            let passed = self.types.pointer_to(arg_type);
-            (self.linearize_expr(a), passed)
+            self.lower_decaying_arg(a, arg_type, param)
         } else {
             self.lower_scalar_arg(a, arg_idx, arg_type, param, sig)
         };
         (self.pass_by_convention(arg_val, passed, conv), passed)
+    }
+
+    /// An array or function-designator argument: the pointer it decays to
+    /// (C17 6.3.2.1p3-4), converted to its parameter's type as if by
+    /// assignment when a prototype gives one (6.5.2.2p7).
+    ///
+    /// The conversion is not always the identity: a `_Bool` parameter
+    /// receives whether the address is null. Passing the decayed pointer as
+    /// it stood handed `take_bool(h)` the raw address, which the callee
+    /// read through its low byte -- zero for a function or array aligned to
+    /// 256, so `take_bool(arr)` was false.
+    fn lower_decaying_arg(
+        &mut self,
+        a: &Expr,
+        arg_type: TypeId,
+        param: Option<TypeId>,
+    ) -> (PseudoId, TypeId) {
+        match param {
+            Some(pt) => (self.linearize_converted(a, pt), pt),
+            None => (self.linearize_expr(a), self.types.decayed_value(arg_type)),
+        }
     }
 
     /// A struct or union argument wider than a register, or one the
@@ -4448,31 +4353,15 @@ impl<'a> Linearizer<'a> {
             // false for a complex type, so it emitted an integer compare over
             // a 128-bit operand and answered from the real half alone.
             let common = self.types.common_type(left_typ, right_typ);
-            let left_addr = if self.types.is_complex(left_typ) {
-                self.complex_operand_at_precision(left, common)
-            } else {
-                self.promote_real_to_complex(left, common)
-            };
-            let right_addr = if self.types.is_complex(right_typ) {
-                self.complex_operand_at_precision(right, common)
-            } else {
-                self.promote_real_to_complex(right, common)
-            };
+            let left_addr = self.linearize_converted(left, common);
+            let right_addr = self.linearize_converted(right, common);
             self.emit_complex_equality(op, left_addr, right_addr, common)
         } else if self.types.is_complex(result_typ) {
             // Complex arithmetic: expand to real/imaginary operations
             // For complex types, we need addresses to load real/imag parts
             // If an operand is not complex (e.g., real scalar), promote it
-            let left_addr = if self.types.is_complex(left_typ) {
-                self.complex_operand_at_precision(left, result_typ)
-            } else {
-                self.promote_real_to_complex(left, result_typ)
-            };
-            let right_addr = if self.types.is_complex(right_typ) {
-                self.complex_operand_at_precision(right, result_typ)
-            } else {
-                self.promote_real_to_complex(right, result_typ)
-            };
+            let left_addr = self.linearize_converted(left, result_typ);
+            let right_addr = self.linearize_converted(right, result_typ);
             self.emit_complex_binary(op, left_addr, right_addr, result_typ)
         } else {
             // For comparisons, compute common type for both operands
@@ -4960,18 +4849,6 @@ impl<'a> Linearizer<'a> {
         }
     }
 
-    /// One arm of a complex conditional, as the address of a `result_typ` value.
-    ///
-    /// The arms need not be complex themselves: `c ? 1 : z` has an `int` arm,
-    /// and C17 6.5.15p5 converts it to the common type like any other operand.
-    fn complex_arm_addr(&mut self, arm: &Expr, result_typ: TypeId) -> PseudoId {
-        if self.types.is_complex(self.expr_type(arm)) {
-            self.complex_operand_at_precision(arm, result_typ)
-        } else {
-            self.promote_real_to_complex(arm, result_typ)
-        }
-    }
-
     /// `c ? a : b` where the result is complex, merged **by address**.
     ///
     /// A complex value is two floats wide, so every other site in the
@@ -5000,8 +4877,8 @@ impl<'a> Linearizer<'a> {
             cond_bool,
             ptr_typ,
             ptr_bits,
-            |lin| lin.complex_arm_addr(then_expr, result_typ),
-            |lin| lin.complex_arm_addr(else_expr, result_typ),
+            |lin| lin.linearize_converted(then_expr, result_typ),
+            |lin| lin.linearize_converted(else_expr, result_typ),
         )
     }
 
@@ -5152,7 +5029,7 @@ impl<'a> Linearizer<'a> {
                     lin.promote_real_value_to_complex(evaluated, cond_typ, result_typ)
                 }
             },
-            |lin| lin.complex_arm_addr(else_expr, result_typ),
+            |lin| lin.linearize_converted(else_expr, result_typ),
         )
     }
 
@@ -5160,12 +5037,7 @@ impl<'a> Linearizer<'a> {
     /// selected `taken`, converted to the conditional's own type.
     fn linearize_constant_arm(&mut self, expr: &Expr, taken: &Expr) -> PseudoId {
         let result_typ = self.expr_type(expr);
-        if self.types.is_complex(result_typ) {
-            return self.complex_arm_addr(taken, result_typ);
-        }
-        let value = self.linearize_expr(taken);
-        let taken_typ = self.expr_type(taken);
-        self.emit_convert(value, taken_typ, result_typ)
+        self.linearize_converted(taken, result_typ)
     }
 
     pub(crate) fn linearize_elvis(

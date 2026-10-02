@@ -858,7 +858,7 @@ mod tests {
             is_complete: true,
             transparent: false,
             anon_id: None,
-            forward_of: None,
+            tag_type: None,
         };
         let vol_struct = types.intern(crate::types::Type::struct_type(composite(vec![member(
             vol_int,

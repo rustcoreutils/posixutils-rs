@@ -1261,14 +1261,13 @@ fn test_linearize_with_symbols(
 
 #[test]
 fn test_incomplete_struct_type_resolution() {
-    // This test verifies that when a typedef refers to an incomplete struct,
-    // the linearizer correctly resolves it to the complete struct definition
-    // when processing struct initializers.
+    // A typedef made through a forward reference names the tag's own type,
+    // which the definition completes in place; the linearizer sees the
+    // complete struct through that same type, with no lookup by tag name.
     //
-    // Pattern being tested:
     //   typedef struct foo foo_t;  // incomplete at this point
-    //   struct foo { int x; int y; };  // complete definition
-    //   foo_t f = {1, 2};  // should use complete struct's size (8 bytes), not 0
+    //   struct foo { int x; int y; };  // completes the same type
+    //   foo_t f = {1, 2};  // uses the complete struct's size (8 bytes), not 0
     //
     let mut ctx = TestContext::new();
     let test_id = ctx.str("test");
@@ -1277,71 +1276,41 @@ fn test_incomplete_struct_type_resolution() {
     let y_id = ctx.str("y");
     let int_type = ctx.int_type();
 
-    // Create the complete struct type: struct foo { int x; int y; }
-    let complete_composite = CompositeType {
-        tag: Some(foo_tag),
-        members: vec![
-            StructMember {
-                name: x_id,
-                typ: int_type,
-                offset: 0,
-                bit_offset: None,
-                bit_width: None,
-                access_bytes: None,
-                align: MemberAlign::NATURAL,
-            },
-            StructMember {
-                name: y_id,
-                typ: int_type,
-                offset: 4, // Second int at offset 4 bytes
-                bit_offset: None,
-                bit_width: None,
-                access_bytes: None,
-                align: MemberAlign::NATURAL,
-            },
-        ],
-        enum_constants: vec![],
-        size: 8,  // 2 ints = 8 bytes
-        align: 4, // int alignment
-        member_align: 4,
-        is_complete: true,
-        transparent: false,
-        anon_id: None,
-        forward_of: None,
-    };
-    let complete_struct_type = ctx.types.intern(Type::struct_type(complete_composite));
-
-    // Register the complete struct in the symbol table as a tag
-    ctx.symbols
-        .declare(Symbol::tag(foo_tag, complete_struct_type, 0))
-        .expect("Failed to declare tag");
-
-    // Verify the symbol table is correctly set up
-    let looked_up = ctx.symbols.lookup_tag(foo_tag);
-    assert!(
-        looked_up.is_some(),
-        "Symbol table should contain tag for 'foo'"
-    );
-    assert_eq!(
-        looked_up.unwrap().typ,
-        complete_struct_type,
-        "Tag should point to complete struct type"
-    );
-
-    // Create an incomplete struct type with the same tag
-    // This simulates what happens with: typedef struct foo foo_t; (before struct foo is defined)
-    let incomplete_composite = CompositeType::incomplete(Some(foo_tag));
-    let incomplete_struct_type = ctx.types.intern(Type::struct_type(incomplete_composite));
-
-    // Create a symbol for the local variable
+    let incomplete_struct_type = ctx
+        .types
+        .intern(Type::struct_type(CompositeType::incomplete(Some(foo_tag))));
     let f_sym = ctx.var("f", incomplete_struct_type);
-
-    // Verify the incomplete type has size 0 before resolution
     assert_eq!(
         ctx.types.size_bytes(incomplete_struct_type),
         0,
         "Incomplete struct should have size 0"
     );
+
+    // The definition: struct foo { int x; int y; }
+    let member = |name, offset| StructMember {
+        name,
+        typ: int_type,
+        offset,
+        bit_offset: None,
+        bit_width: None,
+        access_bytes: None,
+        align: MemberAlign::NATURAL,
+    };
+    let complete_composite = CompositeType {
+        tag: Some(foo_tag),
+        members: vec![member(x_id, 0), member(y_id, 4)],
+        enum_constants: vec![],
+        size: 8,
+        align: 4,
+        member_align: 4,
+        is_complete: true,
+        transparent: false,
+        anon_id: None,
+        tag_type: None,
+    };
+    ctx.types
+        .complete_struct(incomplete_struct_type, complete_composite);
+    assert_eq!(ctx.types.size_bytes(incomplete_struct_type), 8);
 
     // Create an initializer list: {1, 2}
     let init_list = Expr::typed_unpositioned(
@@ -1390,7 +1359,6 @@ fn test_incomplete_struct_type_resolution() {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
 
-    // Linearize with the symbol table that has the complete struct registered
     let module = test_linearize_with_symbols(&tu, &ctx.symbols, &ctx.types, &ctx.strings);
     let ir = format!("{}", module.display(&ctx.types));
 
@@ -1398,7 +1366,7 @@ fn test_incomplete_struct_type_resolution() {
     assert!(
         has_op(&module, &[Opcode::Store]),
         "Struct initializer should generate store instructions. \
-         This would fail if incomplete struct type was not resolved. IR:\n{}",
+         This would fail if the forward reference were not completed. IR:\n{}",
         ir
     );
 

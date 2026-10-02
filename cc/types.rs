@@ -284,18 +284,22 @@ pub struct CompositeType {
     /// was accepted, where gcc rejects it. A qualified variant of the type
     /// clones the composite, and so keeps the identity.
     pub anon_id: Option<u32>,
-    /// For a tag referenced before its definition: the tag's own `TypeId`,
-    /// the one its definition completes in place.
+    /// For a tagged struct, union or enum: the tag's own `TypeId`, the type
+    /// its first declaration created and its definition completes in place.
     ///
-    /// A qualified reference -- `const enum E`, `volatile struct S` -- is a
-    /// separate `TypeId` holding a clone of this composite, so the clone
-    /// carries the tag's identity, and [`TypeTable::intern`] records every
-    /// such copy. The definition then completes the copies with the tag: a
-    /// `typedef const enum E CE;` ahead of the list has the enum's size and
-    /// signedness, and a `const enum E *` parameter declared before it is
-    /// the same type as one declared after. Set by `intern`; `None` once the
-    /// composite is complete.
-    pub forward_of: Option<TypeId>,
+    /// The type's identity, carried by every copy of the composite. A
+    /// qualified reference -- `const enum E`, `volatile struct S` -- is a
+    /// separate `TypeId` holding a clone of this composite, and so is the
+    /// `Type` a typedef name or `typeof` hands a declaration; each says which
+    /// tag it is through this, never through its tag's *name*, which an
+    /// inner scope may have given to a different type. [`TypeTable::intern`]
+    /// records every copy of an incomplete tag, and the definition completes
+    /// the copies with the tag: a `typedef const enum E CE;` ahead of the
+    /// list has the enum's size and signedness, and a `const enum E *`
+    /// parameter declared before it is the same type as one declared after.
+    /// Set by `intern`; `None` for a tagless composite, whose identity is
+    /// [`Self::anon_id`].
+    pub tag_type: Option<TypeId>,
 }
 
 impl CompositeType {
@@ -311,7 +315,7 @@ impl CompositeType {
             is_complete: false,
             transparent: false,
             anon_id: None,
-            forward_of: None,
+            tag_type: None,
         }
     }
 
@@ -1000,7 +1004,7 @@ pub struct TypeTable {
     /// The last identity [`TypeTable::fresh_anon_id`] handed out.
     next_anon_id: u32,
     /// The qualified copies of each incomplete tagged type, by the tag's own
-    /// `TypeId`; see [`CompositeType::forward_of`].
+    /// `TypeId`; see [`CompositeType::tag_type`].
     forward_copies: HashMap<TypeId, Vec<TypeId>>,
     /// Pointer size in bits (target-dependent, defaults to 64 for LP64)
     pointer_width: u32,
@@ -1321,25 +1325,25 @@ impl TypeTable {
         } else {
             // Types with composite data (structs) are not deduplicated
             let id = TypeId(self.types.len() as u32);
-            self.note_forward_copy(&mut typ, id);
+            self.note_tag_type(&mut typ, id);
             self.types.push(typ);
             id
         }
     }
 
-    /// Tie an incomplete tagged type being interned as `id` to the tag it
-    /// stands for, so that the tag's definition completes it too: the first
-    /// one interned is the tag's own type, and every later one is a copy of
-    /// it. See [`CompositeType::forward_of`].
-    fn note_forward_copy(&mut self, typ: &mut Type, id: TypeId) {
+    /// Tie a tagged type being interned as `id` to the tag it stands for:
+    /// the first one interned is the tag's own type, and every later one is a
+    /// copy of it. A copy of an incomplete tag is recorded, so that the tag's
+    /// definition completes it too. See [`CompositeType::tag_type`].
+    fn note_tag_type(&mut self, typ: &mut Type, id: TypeId) {
         let Some(composite) = typ.composite.as_deref_mut() else {
             return;
         };
-        if composite.is_complete || composite.tag.is_none() {
+        if composite.tag.is_none() {
             return;
         }
-        let tag_type = *composite.forward_of.get_or_insert(id);
-        if tag_type != id {
+        let tag_type = *composite.tag_type.get_or_insert(id);
+        if tag_type != id && !composite.is_complete {
             self.forward_copies.entry(tag_type).or_default().push(id);
         }
     }
@@ -1416,8 +1420,12 @@ impl TypeTable {
     /// definition's composite and `added` modifiers. Each copy keeps its own
     /// qualifiers.
     fn complete_tag(&mut self, id: TypeId, composite: CompositeType, added: TypeModifiers) {
-        let tag_type = self.composite(id).and_then(|c| c.forward_of).unwrap_or(id);
+        let tag_type = self.composite(id).and_then(|c| c.tag_type).unwrap_or(id);
         let copies = self.forward_copies.remove(&tag_type).unwrap_or_default();
+        let composite = CompositeType {
+            tag_type: Some(tag_type),
+            ..composite
+        };
         for copy in std::iter::once(tag_type).chain(copies) {
             let typ = &mut self.types[copy.0 as usize];
             typ.composite = Some(Box::new(composite.clone()));
@@ -2926,21 +2934,10 @@ impl TypeTable {
     /// a bit-field's width -- so the rule lives here, beside it, rather than in
     /// each of the two expression forms that need it.
     ///
-    /// The two type ids are not redundant. `members` is `object` after the
-    /// parser resolved an incomplete tag to its definition, which is where the
-    /// member list is; the qualifiers have to come from `object`, because
-    /// resolving answers with the *tag's* type and a tag is never qualified --
-    /// resolving first is how `volatile struct S` loses the `volatile`.
-    ///
     /// For `p->m` the object is the pointee: `struct S *volatile p` qualifies
     /// the pointer, not what it points at.
-    pub fn member_access_type(
-        &mut self,
-        object: TypeId,
-        members: TypeId,
-        name: StringId,
-    ) -> Option<TypeId> {
-        let info = self.find_member(members, name)?;
+    pub fn member_access_type(&mut self, object: TypeId, name: StringId) -> Option<TypeId> {
+        let info = self.find_member(object, name)?;
         Some(self.subobject_type(info.typ, self.qualifiers(object) | info.quals))
     }
 
@@ -3607,7 +3604,7 @@ mod tests {
             is_complete: true,
             transparent: false,
             anon_id: None,
-            forward_of: None,
+            tag_type: None,
         };
 
         // The plain scalars.
@@ -3741,48 +3738,40 @@ mod tests {
             is_complete: true,
             transparent: false,
             anon_id: None,
-            forward_of: None,
+            tag_type: None,
         };
         let plain = types.intern(Type::struct_type(composite));
 
         // An unqualified object: the declared types, unchanged.
-        assert_eq!(types.member_access_type(plain, plain, a), Some(int));
-        assert_eq!(types.member_access_type(plain, plain, v), Some(vol_int));
-        assert_eq!(types.member_access_type(plain, plain, tag), None);
+        assert_eq!(types.member_access_type(plain, a), Some(int));
+        assert_eq!(types.member_access_type(plain, v), Some(vol_int));
+        assert_eq!(types.member_access_type(plain, tag), None);
 
         // A `volatile` object makes every member volatile, and a `const` one
         // makes every member `const`.
         let vol_obj = types.qualified_with(plain, TypeModifiers::VOLATILE);
-        let from_vol = types.member_access_type(vol_obj, vol_obj, a).unwrap();
+        let from_vol = types.member_access_type(vol_obj, a).unwrap();
         assert_eq!(types.qualifiers(from_vol), TypeModifiers::VOLATILE);
         assert!(types.contains_volatile(from_vol));
         let const_obj = types.qualified_with(plain, TypeModifiers::CONST);
-        let from_const = types.member_access_type(const_obj, const_obj, a).unwrap();
+        let from_const = types.member_access_type(const_obj, a).unwrap();
         assert_eq!(types.qualifiers(from_const), TypeModifiers::CONST);
 
         // `_Atomic` does not travel: a member of an `_Atomic` struct cannot be
         // read atomically, and gcc does not claim it can.
         let atomic_obj = types.qualified_with(plain, TypeModifiers::ATOMIC);
-        assert_eq!(
-            types.member_access_type(atomic_obj, atomic_obj, a),
-            Some(int)
-        );
+        assert_eq!(types.member_access_type(atomic_obj, a), Some(int));
 
-        // The two type ids are not interchangeable. The qualifiers come from
-        // the object as written; the members come from the type the parser
-        // resolved it to, which is the tag's and is never qualified. Reading
-        // the qualifiers from the resolved type is how `volatile struct S`
-        // loses its `volatile`.
+        // A `volatile struct S` written before the definition is a copy of
+        // the tag that the definition completes, and keeps its `volatile`:
+        // the members come from the copy itself, not from the tag found by
+        // name, and the qualifiers with them.
         let incomplete = types.intern(Type::struct_type(CompositeType::incomplete(Some(tag))));
         let vol_incomplete = types.qualified_with(incomplete, TypeModifiers::VOLATILE);
-        assert_eq!(
-            types.member_access_type(vol_incomplete, plain, a),
-            Some(vol_int)
-        );
-        assert_eq!(
-            types.member_access_type(vol_incomplete, vol_incomplete, a),
-            None
-        );
+        assert_eq!(types.member_access_type(vol_incomplete, a), None);
+        let definition = types.get(plain).composite.as_deref().unwrap().clone();
+        types.complete_struct(incomplete, definition);
+        assert_eq!(types.member_access_type(vol_incomplete, a), Some(vol_int));
     }
 
     use super::*;
@@ -3998,7 +3987,7 @@ mod tests {
             is_complete: true,
             transparent: false,
             anon_id: None,
-            forward_of: None,
+            tag_type: None,
         };
 
         // An ordinary union answers None even though it has members.
@@ -4062,7 +4051,7 @@ mod tests {
             is_complete: true,
             transparent: false,
             anon_id: None,
-            forward_of: None,
+            tag_type: None,
         };
         let members = vec![
             member(bf, types.int_id, Some(3)),
@@ -4712,7 +4701,7 @@ mod tests {
             is_complete: true,
             transparent: false,
             anon_id: None,
-            forward_of: None,
+            tag_type: None,
         };
         let mut typ = Type::enum_type(composite);
         if unsigned {

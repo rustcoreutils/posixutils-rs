@@ -680,7 +680,7 @@ mod tests {
             is_complete: true,
             transparent: false,
             anon_id: None,
-            forward_of: None,
+            tag_type: None,
         }))
     }
 
@@ -839,7 +839,7 @@ mod tests {
             is_complete: true,
             transparent: false,
             anon_id: None,
-            forward_of: None,
+            tag_type: None,
         }));
         assert!(
             matches!(abi.classify_param(mixed, &types),

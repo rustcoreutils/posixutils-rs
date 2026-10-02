@@ -962,12 +962,19 @@ impl<'a> Parser<'a> {
                     vm_dims = dims;
                 }
                 crate::kw::ENUM | crate::kw::STRUCT | crate::kw::UNION => {
+                    // Nothing written ahead of it, so a `;` right after makes
+                    // this the declaration `struct S;` (C17 6.7.2.3p7). A
+                    // qualifier or storage class ahead of it makes an empty
+                    // declaration that redeclares nothing.
+                    let alone = ctx == SpecContext::Declaration
+                        && modifiers.is_empty()
+                        && !tally.has_type_specifier();
                     tally.note_data_type(idents.get(name_id), pos);
                     let tag_start = self.pos;
                     let parsed = if name_id == crate::kw::ENUM {
                         self.parse_enum_specifier()
                     } else {
-                        self.parse_struct_or_union_specifier(name_id == crate::kw::UNION)
+                        self.parse_struct_or_union_specifier(name_id == crate::kw::UNION, alone)
                     };
                     resolved = Some(match parsed {
                         Ok(typ) => Resolved::Built(typ),

@@ -646,7 +646,7 @@ fn test_struct_deref_returns_address() {
         is_complete: true,
         transparent: false,
         anon_id: None,
-        forward_of: None,
+        tag_type: None,
     });
     let struct_type_id = ctx.types.intern(struct_type);
     let struct_ptr_type_id = ctx.types.intern(Type::pointer(struct_type_id));
@@ -1819,4 +1819,60 @@ fn test_bit_counts_record_their_operand() {
         assert_eq!(insn.operand_width(), operand, "{:?}", insn.op);
         assert!(insn.src_typ.is_some(), "{:?}", insn.op);
     }
+}
+
+/// A conversion into or out of a complex type is never a scalar conversion
+/// instruction, at any site that converts as if by assignment.
+///
+/// A complex value travels by the address of its two halves, so the scalar
+/// conversion of one is meaningless: `return 1;` from a `double _Complex`
+/// function sign-extended the 1 to 128 bits and returned it where the caller
+/// reads an address, and `double d = z;` converted the 128-bit load of `z`
+/// to `double` as though it were an integer.
+#[test]
+fn test_complex_conversions_are_never_scalar() {
+    let src = "double _Complex r1(void) { return 1; }\n\
+               float _Complex r2(double d) { return d; }\n\
+               long double _Complex r3(void) { return 2.5f; }\n\
+               int r4(double _Complex z) { return z; }\n\
+               _Bool r5(float _Complex z) { return z; }\n\
+               double i1(double _Complex z) { double d = z; return d; }\n\
+               double a1(double _Complex z) { double d; d = z; return d; }\n\
+               double c1(double _Complex z) { double d = 1; d += z; return d; }\n\
+               double take(double);\n\
+               double p1(double _Complex z) { return take(z); }\n\
+               double _Complex takec(double _Complex);\n\
+               double _Complex p2(void) { return takec(3); }\n\
+               int l1(double _Complex z) {\n\
+               double a[2] = { z, 1 }; struct { int i : 4; } s = { z };\n\
+               return a[0] + s.i; }\n";
+    let (module, types) = linearize_source_with_types(src, &Target::host());
+    for f in &module.functions {
+        for insn in f.blocks.iter().flat_map(|bb| bb.insns.iter()) {
+            if !insn.op.is_conversion() {
+                continue;
+            }
+            for t in [insn.typ, insn.src_typ].into_iter().flatten() {
+                assert!(
+                    !types.is_complex(t),
+                    "{}: scalar conversion of a complex value: {:?}",
+                    f.name,
+                    insn.op
+                );
+            }
+        }
+    }
+
+    // And a real returned as a complex is returned as the address of the
+    // temporary that holds both halves.
+    let r1 = module.functions.iter().find(|f| f.name == "r1").unwrap();
+    let insns: Vec<&Instruction> = r1.blocks.iter().flat_map(|bb| bb.insns.iter()).collect();
+    let ret = insns.iter().find(|i| i.op == Opcode::Ret).unwrap();
+    let returned = ret.src[0];
+    assert!(
+        insns
+            .iter()
+            .any(|i| i.op == Opcode::SymAddr && i.target == Some(returned)),
+        "r1 must return the address of its complex temporary"
+    );
 }

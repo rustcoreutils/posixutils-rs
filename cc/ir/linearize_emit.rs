@@ -1460,17 +1460,23 @@ impl<'a> super::linearize::Linearizer<'a> {
         result
     }
 
-    /// The real part of a complex value, as the real type `target_typ`.
+    /// The complex value at `addr` converted to the real type `target_typ`.
     ///
-    /// C17 6.3.1.7p2: converting a complex value to a real type discards the
-    /// imaginary part. The conversion path treated the operand as an ordinary
-    /// scalar, so `(double) z` reinterpreted the *address* as a double.
-    pub(crate) fn emit_complex_to_real(&mut self, operand: &Expr, target_typ: TypeId) -> PseudoId {
-        let src_typ = self.expr_type(operand);
-        let base_typ = self.types.complex_base(src_typ);
+    /// C17 6.3.1.7p2 keeps the real part and discards the imaginary one --
+    /// except for `_Bool`, which 6.3.1.2 converts by comparing against 0, and
+    /// for a complex value that comparison is against `0 + 0i`, so the
+    /// imaginary half decides the answer too.
+    pub(crate) fn complex_to_real_at(
+        &mut self,
+        addr: PseudoId,
+        complex_typ: TypeId,
+        target_typ: TypeId,
+    ) -> PseudoId {
+        if self.types.kind(target_typ) == TypeKind::Bool {
+            return self.emit_complex_nonzero_at(addr, complex_typ);
+        }
+        let base_typ = self.types.complex_base(complex_typ);
         let base_bits = self.types.size_bits(base_typ);
-
-        let addr = self.complex_operand_addr(operand);
         let real = self.alloc_pseudo();
         self.emit(Instruction::load(real, addr, 0, base_typ, base_bits));
         self.emit_convert(real, base_typ, target_typ)
@@ -2311,20 +2317,42 @@ impl<'a> super::linearize::Linearizer<'a> {
         result
     }
 
-    /// `expr` converted to `_Bool`, when the source is complex.
+    /// The value of `expr` converted to `to_typ` as if by assignment, in the
+    /// form a value of `to_typ` travels in: a complex one by the address of
+    /// its two halves, any other as its value.
     ///
-    /// `None` when this does not apply, so a caller can fall through to its
-    /// ordinary conversion. Handed the *expression* rather than a value on
-    /// purpose: a complex operand is sometimes materialized as its two halves
-    /// and sometimes as a pointer to them, and only re-addressing the
-    /// expression tells the two apart. The backends have no 128-bit compare
-    /// either, so the ordinary path silently narrowed to the real half.
-    pub(crate) fn complex_to_bool(&mut self, expr: &Expr, target_typ: TypeId) -> Option<PseudoId> {
-        let src_typ = self.expr_type(expr);
-        if self.types.is_complex(src_typ) && self.types.kind(target_typ) == TypeKind::Bool {
-            return Some(self.emit_complex_nonzero(expr));
+    /// The one conversion for an operand whose source or destination may be
+    /// complex, so every site that converts -- `return`, initialization,
+    /// assignment, a prototyped argument, a cast, an operand of the usual
+    /// arithmetic conversions -- applies the same rule:
+    ///
+    /// - to a complex type, the operand at that precision, or a real operand
+    ///   as the real half with a zero imaginary half (C17 6.3.1.7p1);
+    /// - from a complex type to a real one, [`Self::complex_to_real_at`];
+    /// - otherwise the scalar conversion, [`Self::emit_convert`].
+    ///
+    /// It is handed the *expression* rather than a value because only the
+    /// expression says how to address a complex operand
+    /// ([`Self::complex_operand_addr`]). Sites that linearized the operand
+    /// and called `emit_convert` handed one representation where the other
+    /// belongs: `return 1;` from a `double _Complex` function returned the
+    /// number where its caller read an address, and `double d = z;` stored
+    /// the address's bit pattern.
+    pub(crate) fn linearize_converted(&mut self, expr: &Expr, to_typ: TypeId) -> PseudoId {
+        let from_typ = self.expr_type(expr);
+        if self.types.is_complex(to_typ) {
+            return if self.types.is_complex(from_typ) {
+                self.complex_operand_at_precision(expr, to_typ)
+            } else {
+                self.promote_real_to_complex(expr, to_typ)
+            };
         }
-        None
+        if self.types.is_complex(from_typ) {
+            let addr = self.complex_operand_addr(expr);
+            return self.complex_to_real_at(addr, from_typ, to_typ);
+        }
+        let val = self.linearize_expr(expr);
+        self.emit_convert(val, from_typ, to_typ)
     }
 
     /// Turn `expr` into the 0/1 truth value a branch or logical operator wants.
@@ -2668,23 +2696,16 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
             ExprKind::Member { expr, member } => {
                 let base = self.linearize_lvalue(expr);
-                let struct_type = {
-                    let declared = self.expr_type(expr);
-                    self.symbols.resolve_struct_type(self.types, declared)
-                };
+                let struct_type = self.expr_type(expr);
                 self.member_place(base, struct_type, *member, target)
             }
             ExprKind::Arrow { expr, member } => {
                 // The pointer's *value* is the base address.
                 let base = self.linearize_expr(expr);
-                let struct_type = {
-                    let ptr_type = self.expr_type(expr);
-                    let declared = self
-                        .types
-                        .base_type(ptr_type)
-                        .unwrap_or_else(|| self.expr_type(target));
-                    self.symbols.resolve_struct_type(self.types, declared)
-                };
+                let struct_type = self
+                    .types
+                    .base_type(self.expr_type(expr))
+                    .unwrap_or_else(|| self.expr_type(target));
                 self.member_place(base, struct_type, *member, target)
             }
             // Every other lvalue has one address and no bit-field placement.
@@ -2864,6 +2885,66 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
+    /// `target op= value` where either side is complex: `t = t op v`
+    /// computed at the complex common type of the two and converted back to
+    /// the target's type (C17 6.5.16.2p3), resolving the target once.
+    ///
+    /// A real target is read, widened to the common type, and given back the
+    /// result's real part (or, for `_Bool`, whether it is nonzero); computing
+    /// it on the scalar path added the *address* a complex operand travels by
+    /// as though it were the number. A complex target is computed at the
+    /// common precision too, not its own, as for any other compound
+    /// assignment.
+    fn emit_complex_compound_assign(
+        &mut self,
+        binop: BinaryOp,
+        target: &Expr,
+        value: &Expr,
+    ) -> PseudoId {
+        let target_typ = self.expr_type(target);
+        let common = self.types.common_type(target_typ, self.expr_type(value));
+        if self.types.is_complex(target_typ) {
+            let target_addr = self.linearize_lvalue(target);
+            let lhs = self.complex_addr_at_precision(target_addr, target_typ, common);
+            let rhs = self.linearize_converted(value, common);
+            let result = self.emit_complex_binary(binop, lhs, rhs, common);
+            let result = self.complex_addr_at_precision(result, common, target_typ);
+            self.copy_complex(target_addr, 0, result, target_typ);
+            return target_addr;
+        }
+        let place = self.resolve_rmw_place(target);
+        let old = self.load_rmw_place(&place, target_typ);
+        let lhs = self.promote_real_value_to_complex(old, target_typ, common);
+        let rhs = self.linearize_converted(value, common);
+        let result = self.emit_complex_binary(binop, lhs, rhs, common);
+        let new = self.complex_to_real_at(result, common, target_typ);
+        match self.store_rmw_place(&place, new, target_typ) {
+            Some((bit_width, typ)) => self.narrow_to_bitfield(new, bit_width, typ),
+            None => new,
+        }
+    }
+
+    /// Copy the complex value at `src` to `dst + offset`, both of type
+    /// `complex_typ`, as its two halves.
+    pub(crate) fn copy_complex(
+        &mut self,
+        dst: PseudoId,
+        offset: i64,
+        src: PseudoId,
+        complex_typ: TypeId,
+    ) {
+        let (real, imag, base_typ, base_bits) = self.load_complex_halves(src, complex_typ);
+        let imag_offset = offset + (base_bits / 8) as i64;
+        self.emit(Instruction::store(real, dst, offset, base_typ, base_bits));
+        self.emit(Instruction::store(
+            imag,
+            dst,
+            imag_offset,
+            base_typ,
+            base_bits,
+        ));
+    }
+
     pub(crate) fn emit_assign(&mut self, op: AssignOp, target: &Expr, value: &Expr) -> PseudoId {
         let target_typ = self.expr_type(target);
         let value_typ = self.expr_type(value);
@@ -2878,12 +2959,12 @@ impl<'a> super::linearize::Linearizer<'a> {
             return result;
         }
 
-        // A compound assignment on a complex object is `t = t op v`
-        // (C17 6.5.16.2p3), and both sides travel by address. The scalar path
-        // below loaded the target's *address* as though it were the number, so
-        // `z += 1.0` computed on a pointer bit pattern and stored the result
-        // over the object -- the program then died reading it back.
-        if self.types.is_complex(target_typ) && op != AssignOp::Assign {
+        // A compound assignment with a complex operand on either side is
+        // `t = t op v` computed at the complex common type (C17 6.5.16.2p3)
+        // and converted back to the target's.
+        if op != AssignOp::Assign
+            && (self.types.is_complex(target_typ) || self.types.is_complex(value_typ))
+        {
             // Every other compound operator is a constraint violation on a
             // complex operand, which the parser has reported.
             let binop = op.binary_op().filter(|b| {
@@ -2892,120 +2973,21 @@ impl<'a> super::linearize::Linearizer<'a> {
                     BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div
                 )
             });
-
             if let Some(binop) = binop {
-                let target_addr = self.linearize_lvalue(target);
-                let value_addr = if self.types.is_complex(value_typ) {
-                    self.complex_operand_at_precision(value, target_typ)
-                } else {
-                    self.promote_real_to_complex(value, target_typ)
-                };
-                let result_addr =
-                    self.emit_complex_binary(binop, target_addr, value_addr, target_typ);
-
-                let base_typ = self.types.complex_base(target_typ);
-                let base_bits = self.types.size_bits(base_typ);
-                let base_bytes = (base_bits / 8) as i64;
-                for offset in [0, base_bytes] {
-                    let part = self.alloc_pseudo();
-                    self.emit(Instruction::load(
-                        part,
-                        result_addr,
-                        offset,
-                        base_typ,
-                        base_bits,
-                    ));
-                    self.emit(Instruction::store(
-                        part,
-                        target_addr,
-                        offset,
-                        base_typ,
-                        base_bits,
-                    ));
-                }
-                return target_addr;
+                return self.emit_complex_compound_assign(binop, target, value);
             }
         }
 
-        // For complex type assignment, handle specially - copy real and imag parts
+        // An assignment to a complex object copies the two halves of the
+        // value converted to the target's type. The value of the assignment
+        // is the object assigned to, and a complex object travels by
+        // *address*: handing back the real part's value gave every consumer a
+        // `double` where a pointer belongs, so `c = a` was fine as a
+        // statement and `if (c = a)` segfaulted.
         if self.types.is_complex(target_typ) && op == AssignOp::Assign {
             let target_addr = self.linearize_lvalue(target);
-
-            // Assigning a *real* to a complex is a conversion, not a copy:
-            // C99 6.3.1.7 gives the result that value as its real part and a
-            // zero imaginary part. Taking the address of the right-hand side
-            // here treated a non-lvalue as one -- `dc = 1.0` produced
-            // `movabsq $4607182418800017408, %r11` (the bit pattern of 1.0)
-            // followed by a dereference of it, so any such assignment
-            // segfaulted, for locals and globals alike.
-            if !self.types.is_complex(value_typ) {
-                let dst_base = self.types.complex_base(target_typ);
-                let dst_size = self.types.size_bits(dst_base);
-                let dst_stride = (dst_size / 8) as i64;
-
-                let real = self.linearize_expr(value);
-                let real = self.emit_convert(real, value_typ, dst_base);
-                self.emit(Instruction::store(real, target_addr, 0, dst_base, dst_size));
-
-                let zero = if self.types.is_float(dst_base) {
-                    self.emit_fconst(FloatVal::ZERO, dst_base)
-                } else {
-                    self.emit_const(0, dst_base)
-                };
-                self.emit(Instruction::store(
-                    zero,
-                    target_addr,
-                    dst_stride,
-                    dst_base,
-                    dst_size,
-                ));
-                return target_addr;
-            }
-
-            let value_addr = self.complex_operand_addr(value);
-
-            // The two sides may have *different* base precisions — assigning a
-            // `double _Complex` to a `long double _Complex` is an ordinary
-            // conversion. Reading the source with the target's base type and
-            // stride, as this did, loaded 16 bytes from an 8-byte real part
-            // and then read 16 bytes past the end of the source object.
-            let dst_base = self.types.complex_base(target_typ);
-            let dst_size = self.types.size_bits(dst_base);
-            let dst_stride = (dst_size / 8) as i64;
-
-            let src_base = if self.types.is_complex(value_typ) {
-                self.types.complex_base(value_typ)
-            } else {
-                dst_base
-            };
-            let src_size = self.types.size_bits(src_base);
-            let src_stride = (src_size / 8) as i64;
-
-            // Real part
-            let real = self.alloc_pseudo();
-            self.emit(Instruction::load(real, value_addr, 0, src_base, src_size));
-            let real = self.emit_convert(real, src_base, dst_base);
-            self.emit(Instruction::store(real, target_addr, 0, dst_base, dst_size));
-
-            // Imaginary part
-            let imag = self.alloc_pseudo();
-            self.emit(Instruction::load(
-                imag, value_addr, src_stride, src_base, src_size,
-            ));
-            let imag = self.emit_convert(imag, src_base, dst_base);
-            self.emit(Instruction::store(
-                imag,
-                target_addr,
-                dst_stride,
-                dst_base,
-                dst_size,
-            ));
-
-            // The value of the assignment is the object assigned to, and a
-            // complex object travels by *address* -- as the real-to-complex
-            // branch above already returns. Handing back the real part's value
-            // gave every consumer a `double` where a pointer belongs, so
-            // `c = a` was fine as a statement and `if (c = a)` segfaulted.
+            let value_addr = self.linearize_converted(value, target_typ);
+            self.copy_complex(target_addr, 0, value_addr, target_typ);
             return target_addr;
         }
 
@@ -3039,18 +3021,6 @@ impl<'a> super::linearize::Linearizer<'a> {
             return target_addr;
         }
 
-        // A complex right-hand side assigned to a `_Bool` needs the
-        // expression, not its value -- see `complex_to_bool`. Already the
-        // target type when it fires, so the conversion below is skipped.
-        let bool_rhs = match op {
-            AssignOp::Assign => self.complex_to_bool(value, target_typ),
-            _ => None,
-        };
-        let rhs = match bool_rhs {
-            Some(b) => b,
-            None => self.linearize_expr(value),
-        };
-
         // Check for pointer compound assignment (p += n or p -= n)
         let is_ptr_arith = self.types.kind(target_typ) == TypeKind::Pointer
             && self.types.is_integer(value_typ)
@@ -3059,6 +3029,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Convert RHS to target type if needed (but not for pointer arithmetic)
         let rhs = if is_ptr_arith {
             // For pointer arithmetic, scale the integer by element size
+            let rhs = self.linearize_expr(value);
             let scale = self.pointer_step_bytes(target, target_typ);
 
             // Extend the integer to 64-bit for proper arithmetic
@@ -3074,16 +3045,16 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.types.size_bits(self.types.long_id),
             ));
             scaled
-        } else if bool_rhs.is_some() || op != AssignOp::Assign {
+        } else if op != AssignOp::Assign {
             // A compound assignment leaves its right operand alone here. It
             // is converted to the *common* type by `compound_assign_value`,
             // not down to the target's:
             // narrowing `-5` to `unsigned char` first made `x /= y` divide
             // 50 by 251 and store 0, where C17 6.5.16.2p3 computes `50 / -5`
             // at `int` and stores `(unsigned char)-10`.
-            rhs
+            self.linearize_expr(value)
         } else {
-            self.emit_convert(rhs, value_typ, target_typ)
+            self.linearize_converted(value, target_typ)
         };
 
         // The target is resolved exactly once (C17 6.5.16.2p3) and the same

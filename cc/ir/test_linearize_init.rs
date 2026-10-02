@@ -580,7 +580,7 @@ fn test_mixed_designated_positional_struct_init() {
         is_complete: true,
         transparent: false,
         anon_id: None,
-        forward_of: None,
+        tag_type: None,
     };
     let struct_type = ctx.types.intern(Type::struct_type(struct_composite));
     let s_sym = ctx.var("s", struct_type);
@@ -807,7 +807,7 @@ fn test_designator_chain_nested_struct_init() {
         is_complete: true,
         transparent: false,
         anon_id: None,
-        forward_of: None,
+        tag_type: None,
     }));
 
     let pt_id = ctx.str("pt");
@@ -842,7 +842,7 @@ fn test_designator_chain_nested_struct_init() {
         is_complete: true,
         transparent: false,
         anon_id: None,
-        forward_of: None,
+        tag_type: None,
     }));
     let outer_sym = ctx.var("s", outer_type);
 
@@ -935,7 +935,7 @@ fn test_designator_chain_array_member_init() {
         is_complete: true,
         transparent: false,
         anon_id: None,
-        forward_of: None,
+        tag_type: None,
     }));
     let s_sym = ctx.var("s", struct_type);
 
@@ -1104,7 +1104,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
         is_complete: true,
         transparent: false,
         anon_id: None,
-        forward_of: None,
+        tag_type: None,
     }));
     let s_sym = ctx.var("s", struct_type);
 
@@ -1202,7 +1202,7 @@ fn test_union_first_named_member_positional_init() {
         is_complete: true,
         transparent: false,
         anon_id: None,
-        forward_of: None,
+        tag_type: None,
     }));
     let u_sym = ctx.var("u", union_type);
 
@@ -1325,7 +1325,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             is_complete: true,
             transparent: false,
             anon_id: None,
-            forward_of: None,
+            tag_type: None,
         })),
         ..Default::default()
     });
@@ -1477,7 +1477,7 @@ fn test_bitfield_designated_init_local_var() {
         is_complete: true,
         transparent: false,
         anon_id: None,
-        forward_of: None,
+        tag_type: None,
     }));
 
     let s_sym = ctx.var("s", struct_type);
@@ -1632,7 +1632,7 @@ fn test_compound_literal_zero_init_lvalue() {
             is_complete: true,
             transparent: false,
             anon_id: None,
-            forward_of: None,
+            tag_type: None,
         })),
         ..Default::default()
     });
@@ -1791,7 +1791,7 @@ fn test_complex_struct_member_init_stores_both_halves() {
         is_complete: true,
         transparent: false,
         anon_id: None,
-        forward_of: None,
+        tag_type: None,
     });
     let struct_type_id = ctx.types.intern(struct_type);
     let s_sym = ctx.var("s", struct_type_id);
@@ -2354,4 +2354,42 @@ fn test_a_value_initialized_union_agrees_with_any_member() {
     let mut named0 = UnionMembers::default();
     named0.record(0, u, 0);
     assert_eq!(UnionFold::new(&value, &named0, 0).agreed(u), None);
+}
+
+/// An address constant converted to `_Bool` -- implicitly, by a cast, or
+/// through a pointer cast -- is true, never the address's low byte; and the
+/// fold is the value of a wider integer the cast initializes.
+#[test]
+fn test_address_constant_to_bool_is_true() {
+    let src = "int arr[4];\nlong h(void);\n\
+               _Bool a = arr, b = h, c = \"x\", d = (_Bool)arr, e = (_Bool)(char *)arr;\n\
+               _Bool z = (_Bool)(void *)0;\n\
+               int n = (_Bool)arr;\n";
+    let module = linearize_source(src, &Target::host());
+    for name in ["a", "b", "c", "d", "e", "n"] {
+        assert!(
+            matches!(global_init(&module, name), Initializer::Int(1)),
+            "{name}: {:?}",
+            global_init(&module, name)
+        );
+    }
+    assert!(global_init(&module, "z").is_all_zero());
+}
+
+/// An element or member of a `const` object folds to its value in a static
+/// initializer, not to its address.
+#[test]
+fn test_const_subobject_folds_to_its_value() {
+    let src = "struct P { int x; double d; };\n\
+               const int a[2] = {1, 2};\n\
+               const struct P p = {4, 2.5};\n\
+               int w = a[1];\nlong x = p.x;\ndouble d = p.d;\n";
+    let module = linearize_source(src, &Target::host());
+    assert!(matches!(global_init(&module, "w"), Initializer::Int(2)));
+    assert!(matches!(global_init(&module, "x"), Initializer::Int(4)));
+    assert!(
+        matches!(global_init(&module, "d"), Initializer::Float(v) if v.to_f64() == 2.5),
+        "{:?}",
+        global_init(&module, "d")
+    );
 }

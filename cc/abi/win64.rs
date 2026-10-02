@@ -182,7 +182,7 @@ mod tests {
             is_complete: true,
             transparent: false,
             anon_id: None,
-            forward_of: None,
+            tag_type: None,
         }))
     }
 

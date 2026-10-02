@@ -183,49 +183,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                         self.emit_sret_return(e, sret_ptr, func_ret_type);
                     } else if let Some(ret_type) = self.reg_aggregate_return_type {
                         self.emit_reg_aggregate_return(e, ret_type);
-                    } else if let Some(b) = self.complex_to_bool(e, func_ret_type) {
-                        // Ahead of the complex arm below: that one keys off the
-                        // *expression* being complex and returns its address,
-                        // which for a `_Bool` function returned the address as
-                        // the answer.
-                        let typ_size = self.types.size_bits(func_ret_type);
-                        self.emit(Instruction::ret_typed(Some(b), func_ret_type, typ_size));
-                    } else if self.types.is_complex(expr_typ)
-                        && self.types.is_complex(func_ret_type)
-                    {
-                        // At the return type's precision, for the reason the
-                        // argument path converts: the caller reads the result
-                        // with the *declared* base type's stride, so returning
-                        // a `float _Complex` from a `double _Complex` function
-                        // unconverted handed back 4-byte-strided storage to be
-                        // read 8 bytes at a time.
-                        let addr = self.complex_operand_at_precision(e, func_ret_type);
-                        let typ_size = self.types.size_bits(func_ret_type);
-                        self.emit(Instruction::ret_typed(Some(addr), func_ret_type, typ_size));
-                    } else if self.types.is_complex(expr_typ) {
-                        // A complex value returned from a real-typed function
-                        // keeps its real part (C17 6.3.1.7p2). This arm used to
-                        // be reached on the expression's type alone, so it
-                        // returned the *address* the complex travels by as the
-                        // answer -- `double f(double _Complex z){return z;}`
-                        // gave a pointer bit pattern.
-                        let real = self.emit_complex_to_real(e, func_ret_type);
-                        let typ_size = self.types.size_bits(func_ret_type);
-                        self.emit(Instruction::ret_typed(Some(real), func_ret_type, typ_size));
                     } else {
-                        let converted_val = match self.complex_to_bool(e, func_ret_type) {
-                            Some(b) => b,
-                            None => {
-                                let val = self.linearize_expr(e);
-                                // Convert to the function's return type if needed
-                                if expr_typ != func_ret_type
-                                    && self.types.kind(func_ret_type) != TypeKind::Void
-                                {
-                                    self.emit_convert(val, expr_typ, func_ret_type)
-                                } else {
-                                    val
-                                }
-                            }
+                        // Converted as if by assignment (C17 6.8.6.4p3).
+                        let converted_val = if self.types.kind(func_ret_type) == TypeKind::Void {
+                            self.linearize_expr(e)
+                        } else {
+                            self.linearize_converted(e, func_ret_type)
                         };
                         // Function types decay to pointers when returned
                         let typ_size = if self.types.kind(func_ret_type) == TypeKind::Function {
@@ -563,17 +526,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                         let vol = self.block_volatility(typ, self.expr_type(init));
                         self.emit_block_copy(sym_id, value_addr, type_size_bytes as i64, vol);
                     } else {
-                        // Simple scalar initializer
-                        let init_type = self.expr_type(init);
-                        let converted = match self.complex_to_bool(init, typ) {
-                            Some(b) => b,
-                            None => {
-                                let val = self.linearize_expr(init);
-                                // Convert the value to the target type
-                                // (important for _Bool normalization)
-                                self.emit_convert(val, init_type, typ)
-                            }
-                        };
+                        // Simple scalar initializer, converted as if by
+                        // assignment (C17 6.7.9p11).
+                        let converted = self.linearize_converted(init, typ);
                         let size = self.types.size_bits(typ);
                         self.emit(Instruction::store(converted, sym_id, 0, typ, size));
                     }
@@ -940,9 +895,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         self.store_complex_at(base_sym, offset, elem_type, &last.value);
                         continue;
                     }
-                    let val = self.linearize_expr(&last.value);
-                    let val_type = self.expr_type(&last.value);
-                    let converted = self.emit_convert(val, val_type, elem_type);
+                    let converted = self.linearize_converted(&last.value, elem_type);
                     let elem_size = self.types.size_bits(elem_type);
                     self.emit(Instruction::store(
                         converted, base_sym, offset, elem_type, elem_size,
@@ -976,16 +929,14 @@ impl<'a> super::linearize::Linearizer<'a> {
                     }
                 }
 
-                // What every member inherits from the object: taken before
-                // resolving, which answers with the tag's unqualified type.
+                // What every member inherits from the object.
                 let object_quals = self.types.qualifiers(typ);
-                let resolved_typ = self.symbols.resolve_struct_type(self.types, typ);
-                if let Some(composite) = self.types.get(resolved_typ).composite.as_ref() {
+                if let Some(composite) = self.types.get(typ).composite.as_ref() {
                     let members: Vec<_> = composite.members.clone();
-                    let is_union = self.types.kind(resolved_typ) == TypeKind::Union;
+                    let is_union = self.types.kind(typ) == TypeKind::Union;
 
                     let mut visits =
-                        self.walk_struct_init_fields(resolved_typ, &members, is_union, elements);
+                        self.walk_struct_init_fields(typ, &members, is_union, elements);
                     self.admit_fam_visits(&mut visits, &members, InitStorage::Automatic);
 
                     // C17 6.7.9p19 resolves two initializers for overlapping
@@ -1036,15 +987,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                             }
                             StructFieldVisitKind::Expr(expr) => {
                                 if let Some(bf) = bitfield {
-                                    let val = self.linearize_expr(&expr);
-                                    let val_type = self.expr_type(&expr);
-
                                     // C17 6.7.9p11 initializes a member by
                                     // converting to the *member's* type, not the
                                     // storage unit's: for `_Bool` that is the
                                     // conversion normalizing to 0/1 (6.3.1.2), so
                                     // `struct { _Bool f:1; } v = {2};` stores 1.
-                                    let member_val = self.emit_convert(val, val_type, field_type);
+                                    let member_val = self.linearize_converted(&expr, field_type);
                                     self.emit_bitfield_store(base_sym, bf, member_val, field_type);
                                 } else {
                                     self.linearize_struct_field_init(
@@ -1066,9 +1014,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         self.store_complex_at(base_sym, base_offset, typ, &element.value);
                         return;
                     }
-                    let val = self.linearize_expr(&element.value);
-                    let val_type = self.expr_type(&element.value);
-                    let converted = self.emit_convert(val, val_type, typ);
+                    let converted = self.linearize_converted(&element.value, typ);
                     let typ_size = self.types.size_bits(typ);
                     self.emit(Instruction::store(
                         converted,
@@ -1214,8 +1160,8 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// The initializer's base precision need not match the object's -- and
     /// usually does not, because `I` is `__builtin_complex(0.0, 1.0)`, a
     /// *double* complex, so `float _Complex f = 2.0f + 3.0f*I;` is a
-    /// conversion. Reading the source with the target's base type and stride
-    /// would mismatch both the width and the step.
+    /// conversion, and so is a real initializer. Both are converted by
+    /// [`Self::linearize_converted`] before the halves are copied.
     pub(crate) fn store_complex_at(
         &mut self,
         base_sym: PseudoId,
@@ -1223,54 +1169,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         complex_typ: TypeId,
         init: &Expr,
     ) {
-        let init_typ = self.expr_type(init);
-        let base_typ = self.types.complex_base(complex_typ);
-        let base_bits = self.types.size_bits(base_typ);
-        let base_bytes = (base_bits / 8) as i64;
-
-        if self.types.is_complex(init_typ) {
-            let value_addr = self.complex_operand_addr(init);
-            let src_base = self.types.complex_base(init_typ);
-            let src_bits = self.types.size_bits(src_base);
-            let src_bytes = (src_bits / 8) as i64;
-
-            let val_real = self.alloc_pseudo();
-            let val_imag = self.alloc_pseudo();
-            self.emit(Instruction::load(
-                val_real, value_addr, 0, src_base, src_bits,
-            ));
-            self.emit(Instruction::load(
-                val_imag, value_addr, src_bytes, src_base, src_bits,
-            ));
-            let val_real = self.emit_convert(val_real, src_base, base_typ);
-            let val_imag = self.emit_convert(val_imag, src_base, base_typ);
-            self.emit(Instruction::store(
-                val_real, base_sym, offset, base_typ, base_bits,
-            ));
-            self.emit(Instruction::store(
-                val_imag,
-                base_sym,
-                offset + base_bytes,
-                base_typ,
-                base_bits,
-            ));
-        } else {
-            // A real scalar names only the real half; C99 6.3.1.7 gives the
-            // imaginary half a positive zero.
-            let val = self.linearize_expr(init);
-            let converted = self.emit_convert(val, init_typ, base_typ);
-            self.emit(Instruction::store(
-                converted, base_sym, offset, base_typ, base_bits,
-            ));
-            let zero = self.complex_half_zero(base_typ);
-            self.emit(Instruction::store(
-                zero,
-                base_sym,
-                offset + base_bytes,
-                base_typ,
-                base_bits,
-            ));
-        }
+        let value_addr = self.linearize_converted(init, complex_typ);
+        self.copy_complex(base_sym, offset, value_addr, complex_typ);
     }
 
     pub(crate) fn linearize_struct_field_init(
@@ -1315,9 +1215,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     );
                 }
             } else {
-                let val = self.linearize_expr(value);
-                let val_type = self.expr_type(value);
-                let converted = self.emit_convert(val, val_type, field_type);
+                let converted = self.linearize_converted(value, field_type);
                 let size = self.types.size_bits(field_type);
                 self.emit(Instruction::store(
                     converted, base_sym, offset, field_type, size,
@@ -1332,9 +1230,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             } else {
                 (field_type, self.types.size_bits(field_type))
             };
-            let val = self.linearize_expr(value);
-            let val_type = self.expr_type(value);
-            let converted = self.emit_convert(val, val_type, actual_type);
+            let converted = self.linearize_converted(value, actual_type);
             self.emit(Instruction::store(
                 converted,
                 base_sym,
@@ -2307,6 +2203,55 @@ impl<'a> super::linearize::Linearizer<'a> {
             .find(|g| g.name == global_name && g.is_const)?;
         match &global.init {
             crate::ir::Initializer::Int(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    /// The scalar initializer an element or member of a `const` object was
+    /// given -- `a[1]`, `s.m`, `t.v[2].m` -- when the object's own
+    /// initializer folded, as [`Self::const_object_value`] answers for the
+    /// object named whole. gcc folds these in a static initializer too.
+    ///
+    /// Without it, `const int a[2] = {1, 2}; int w = a[1];` was initialized
+    /// with the element's *address*: eight bytes of relocation over a
+    /// four-byte `int`.
+    fn const_subobject_init(&self, expr: &Expr) -> Option<&crate::ir::Initializer> {
+        let (symbol_id, offset) = self.const_subobject_place(expr)?;
+        let global_name = self.global_name_of(symbol_id)?;
+        let global = self
+            .module
+            .globals
+            .iter()
+            .find(|g| g.name == global_name && g.is_const)?;
+        let size = self.types.size_bytes(expr.typ?);
+        let whole = self.types.size_bytes(global.typ);
+        initializer_leaf(&global.init, offset, size, whole)
+    }
+
+    /// The object `expr` designates a subobject of, and the subobject's byte
+    /// offset in it. Only a path of constant subscripts into arrays and of
+    /// members that are not bit-fields qualifies.
+    fn const_subobject_place(&self, expr: &Expr) -> Option<(crate::symbol::SymbolId, usize)> {
+        match &expr.kind {
+            ExprKind::Ident(symbol_id) => Some((*symbol_id, 0)),
+            ExprKind::Index { array, index } if self.types.kind(array.typ?) == TypeKind::Array => {
+                let (symbol_id, base) = self.const_subobject_place(array)?;
+                let i = crate::constexpr::eval(self, ConstScope::StaticInitializer, index)?;
+                let step = self.types.size_bytes(expr.typ?);
+                let at = usize::try_from(i).ok()?.checked_mul(step)?;
+                Some((symbol_id, base.checked_add(at)?))
+            }
+            ExprKind::Member {
+                expr: inner,
+                member,
+            } => {
+                let info = self.types.find_member(inner.typ?, *member)?;
+                if info.bit_width.is_some() {
+                    return None;
+                }
+                let (symbol_id, base) = self.const_subobject_place(inner)?;
+                Some((symbol_id, base + info.offset))
+            }
             _ => None,
         }
     }
@@ -3747,8 +3692,21 @@ impl crate::constexpr::ConstEnv for Linearizer<'_> {
         }
     }
 
-    fn struct_of(&self, typ: TypeId) -> TypeId {
-        self.symbols.resolve_struct_type(self.types, typ)
+    fn subobject_value(&self, expr: &Expr, scope: ConstScope) -> Option<i128> {
+        match (scope, self.const_subobject_init(expr)?) {
+            (ConstScope::StaticInitializer, crate::ir::Initializer::Int(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    fn float_subobject_value(&self, expr: &Expr, scope: ConstScope) -> Option<FloatVal> {
+        match (scope, self.const_subobject_init(expr)?) {
+            (ConstScope::StaticInitializer, crate::ir::Initializer::Float(v)) => Some(*v),
+            (ConstScope::StaticInitializer, crate::ir::Initializer::Int(v)) => {
+                Some(FloatVal::from_i128(*v))
+            }
+            _ => None,
+        }
     }
 
     /// A `const` floating object folds only in a static initializer, as its
@@ -4291,5 +4249,39 @@ mod asm_operand_tests {
             .map(|c| c.size)
             .collect();
         assert_eq!(sizes, [64, 64, 256]);
+    }
+}
+
+/// The scalar initializer of `size` bytes at `offset` in `init`, which spans
+/// `span` bytes, or `None` when none is there to read. A subobject the
+/// initializer leaves out is zero, but has no entry to answer with.
+fn initializer_leaf(
+    init: &crate::ir::Initializer,
+    offset: usize,
+    size: usize,
+    span: usize,
+) -> Option<&crate::ir::Initializer> {
+    use crate::ir::Initializer;
+    match init {
+        Initializer::Int(_) | Initializer::Float(_) => {
+            (offset == 0 && size == span).then_some(init)
+        }
+        Initializer::Array {
+            elem_size,
+            elements,
+            ..
+        } => {
+            let (start, element) = elements
+                .iter()
+                .find(|(start, _)| (*start..*start + *elem_size).contains(&offset))?;
+            initializer_leaf(element, offset - start, size, *elem_size)
+        }
+        Initializer::Struct { fields, .. } => {
+            let (start, field_size, field) = fields
+                .iter()
+                .find(|(start, len, _)| (*start..*start + *len).contains(&offset))?;
+            initializer_leaf(field, offset - start, size, *field_size)
+        }
+        _ => None,
     }
 }

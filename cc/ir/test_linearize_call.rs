@@ -412,3 +412,32 @@ fn test_every_register_returned_aggregate_carries_its_class() {
         "an address-returned aggregate is inlinable"
     );
 }
+
+/// An array or a function designator bound to a `_Bool` parameter is passed
+/// as whether its address is null -- the result of a comparison, classified
+/// as `_Bool` -- not as the address it decays to. Under no prototype it
+/// travels as the pointer.
+#[test]
+fn a_decaying_argument_converts_to_its_parameter() {
+    let src = "_Bool take(_Bool);\n\
+               int old();\n\
+               long h(void);\n\
+               int arr[4];\n\
+               int f(void) { return take(arr) + take(h) + old(arr); }\n";
+    let (module, types) = linearize_source_with_types(src, &x86());
+    let f = func(&module, "f");
+    let all = insns(f);
+    let calls = calls(f);
+    assert_eq!(calls.len(), 3);
+    for call in &calls[..2] {
+        assert_eq!(kinds(&types, call), vec![TypeKind::Bool]);
+        let arg = call.src[0];
+        let def = all.iter().find(|i| i.target == Some(arg)).unwrap();
+        assert!(
+            def.op.is_comparison(),
+            "a `_Bool` argument is a comparison, not {:?}",
+            def.op
+        );
+    }
+    assert_eq!(kinds(&types, calls[2]), vec![TypeKind::Pointer]);
+}

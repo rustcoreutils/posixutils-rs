@@ -65,13 +65,18 @@ pub(crate) trait ConstEnv {
     /// and folding its condition here decides it as 0 forever.
     fn deferred_constant_p(&self, scope: ConstScope) -> Option<i128>;
 
-    /// The struct or union a `.`/`->` member lookup should start from, with
-    /// typedefs and qualifiers stripped.
-    fn struct_of(&self, typ: TypeId) -> TypeId;
-
     /// The value of an identifier of floating type, or `None` when it is not
     /// a constant in this scope: [`Self::ident_value`] for a `const double`.
     fn float_ident_value(&self, sym: SymbolId, scope: ConstScope) -> Option<FloatVal>;
+
+    /// The value of an element or member of an object -- `a[1]`, `s.m` --
+    /// or `None` when it is not a constant in this scope. Like a `const`
+    /// object named whole ([`Self::ident_value`]), one answers only in
+    /// [`ConstScope::StaticInitializer`].
+    fn subobject_value(&self, expr: &Expr, scope: ConstScope) -> Option<i128>;
+
+    /// [`Self::subobject_value`] for a floating subobject.
+    fn float_subobject_value(&self, expr: &Expr, scope: ConstScope) -> Option<FloatVal>;
 }
 
 /// Reduce a value to what its type can hold.
@@ -149,6 +154,7 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
         ExprKind::CharLit(c) => Some(*c as i128),
 
         ExprKind::Ident(symbol_id) => env.ident_value(*symbol_id, scope),
+        ExprKind::Index { .. } | ExprKind::Member { .. } => env.subobject_value(expr, scope),
 
         // A deferred `__builtin_constant_p`. Whether it answers at all is
         // the asker's business: see [`ConstEnv::deferred_constant_p`].
@@ -354,8 +360,7 @@ pub(crate) fn offset_of(env: &impl ConstEnv, typ: TypeId, path: &[OffsetOfPath])
 }
 
 /// The byte offset of `member` inside an object of type `aggregate`, and the
-/// member's declared type -- resolving an incomplete tag to its definition
-/// first. `None` if the aggregate has no such member.
+/// member's declared type. `None` if the aggregate has no such member.
 ///
 /// The step `s.m`, `p->m` (with `aggregate` the pointee) and `offsetof` all
 /// take, whether folding a constant or placing a static address.
@@ -364,7 +369,7 @@ pub(crate) fn member_at(
     aggregate: TypeId,
     member: StringId,
 ) -> Option<(i128, TypeId)> {
-    let info = env.types().find_member(env.struct_of(aggregate), member)?;
+    let info = env.types().find_member(aggregate, member)?;
     Some((info.offset as i128, info.typ))
 }
 
@@ -536,6 +541,7 @@ pub(crate) fn eval_float(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) ->
         ExprKind::FloatLit(v) => Some(fmt.map_or(*v, |f| v.round_to_format(f))),
 
         ExprKind::Ident(sym) => env.float_ident_value(*sym, scope),
+        ExprKind::Index { .. } | ExprKind::Member { .. } => env.float_subobject_value(expr, scope),
 
         ExprKind::Unary {
             op: UnaryOp::Neg,

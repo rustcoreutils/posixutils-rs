@@ -304,7 +304,7 @@ fn test_large_struct_copy_from_array() {
             is_complete: true,
             transparent: false,
             anon_id: None,
-            forward_of: None,
+            tag_type: None,
         })),
         ..Default::default()
     });

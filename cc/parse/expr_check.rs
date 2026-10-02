@@ -792,10 +792,7 @@ impl Parser<'_> {
         if !self.types.is_atomic(object) {
             return;
         }
-        let what = match self
-            .types
-            .kind(self.symbols.resolve_struct_type(self.types, object))
-        {
+        let what = match self.types.kind(object) {
             TypeKind::Struct => "structure",
             TypeKind::Union => "union",
             _ => return,

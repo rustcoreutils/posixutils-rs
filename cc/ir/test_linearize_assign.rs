@@ -400,7 +400,7 @@ fn test_atomic_aggregate_assign_uses_atomic_store() {
         is_complete: true,
         transparent: false,
         anon_id: None,
-        forward_of: None,
+        tag_type: None,
     }));
     let atomic_struct = {
         let mut t = ctx.types.get(struct_type).clone();

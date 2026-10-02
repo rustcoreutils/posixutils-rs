@@ -3886,7 +3886,7 @@ fn test_forward_declared_struct_member_access() {
 #[test]
 fn test_forward_declared_struct_via_pointer_param() {
     // More complex case: struct declared after function, used via pointer
-    // This tests that resolve_struct_type works for arrow operator
+    // The definition completes the type the parameter already named
     let (tu, _types, _strings, _symbols) = parse_tu(
         "struct Node; \
          int get_val(struct Node *n); \

@@ -25,9 +25,9 @@
 //
 
 use super::constfold::{
-    at_width, bit_opcode, divmod_may_trap, eval_binop, eval_fbinop, eval_fcvt, eval_fcvtf,
-    eval_fternop, eval_funop, eval_unop, fcmp_decided, fcmp_mask, fcmp_outcome, get_cmp_info,
-    mirror_mask, possible_against, FCMP_ALL,
+    at_width, divmod_may_trap, eval_fbinop, eval_fcvt, eval_fcvtf, eval_fternop, eval_funop,
+    eval_int, fcmp_decided, fcmp_mask, fcmp_outcome, get_cmp_info, is_int_foldable, mirror_mask,
+    possible_against, FCMP_ALL,
 };
 use super::facts::{CmpDomain, CmpFacts, ConstMap, Relation};
 use super::propagate;
@@ -211,10 +211,10 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplif
         Opcode::FCvtS | Opcode::FCvtU | Opcode::Signbit => simplify_fcvt(insn, consts, facts),
 
         // Unary
-        Opcode::Neg => simplify_neg(insn, consts),
-        Opcode::Not => simplify_unary_of_const(insn, consts),
-        op if bit_opcode(op).is_some() => simplify_unary_of_const(insn, consts),
         Opcode::Sext | Opcode::Zext | Opcode::Trunc => simplify_convert(insn, consts),
+        // Every other integer operation `constfold` evaluates -- `-x`, `~x`,
+        // a population count -- has no algebraic identity here.
+        op if is_int_foldable(op) => simplify_of_consts(insn, consts),
 
         _ => Simplification::None,
     }
@@ -225,20 +225,12 @@ fn fold_to_zero() -> Simplification {
     Simplification::FoldToConst(0)
 }
 
-/// Fold `insn` over two known constants, deferring to `constfold` for the
-/// width and signedness rules. `None` there means the operation is undefined
-/// for these operands -- a zero divisor, an out-of-range shift count -- and
-/// the instruction is left alone.
-fn fold_with(insn: &Instruction, a: i128, b: i128) -> Simplification {
-    match eval_binop(insn, a, b) {
-        Some(v) => Simplification::FoldToConst(v),
-        None => Simplification::None,
-    }
-}
-
-/// The unary counterpart of [`fold_with`].
-fn fold_unary_with(insn: &Instruction, a: i128) -> Simplification {
-    match eval_unop(insn, a) {
+/// Fold `insn` over known constants, one per operand, deferring to
+/// `constfold` for the width and signedness rules. `None` there means the
+/// operation is undefined for these operands -- a zero divisor, an
+/// out-of-range shift count -- and the instruction is left alone.
+fn fold_with(insn: &Instruction, ops: &[i128]) -> Simplification {
+    match eval_int(insn, ops) {
         Some(v) => Simplification::FoldToConst(v),
         None => Simplification::None,
     }
@@ -280,7 +272,7 @@ fn simplify_add(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
     match (val1, val2) {
         // Constant folding: a + b -> (a + b)
-        (Some(a), Some(b)) => fold_with(insn, a, b),
+        (Some(a), Some(b)) => fold_with(insn, &[a, b]),
 
         // Algebraic: x + 0 -> x
         (None, Some(0)) => Simplification::CopyFrom(src1),
@@ -313,7 +305,7 @@ fn simplify_sub(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
     match (val1, val2) {
         // Constant folding: a - b -> (a - b)
-        (Some(a), Some(b)) => fold_with(insn, a, b),
+        (Some(a), Some(b)) => fold_with(insn, &[a, b]),
 
         // Algebraic: x - 0 -> x
         (None, Some(0)) => Simplification::CopyFrom(src1),
@@ -336,7 +328,7 @@ fn simplify_mul(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
     match (val1, val2) {
         // Constant folding: a * b -> (a * b)
-        (Some(a), Some(b)) => fold_with(insn, a, b),
+        (Some(a), Some(b)) => fold_with(insn, &[a, b]),
 
         // Algebraic: x * 0 -> 0
         (None, Some(0)) => fold_to_zero(),
@@ -381,7 +373,7 @@ fn simplify_div(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
     match (val1, val2) {
         // Constant folding: a / b -> (a / b)
-        (Some(a), Some(b)) => fold_with(insn, a, b),
+        (Some(a), Some(b)) => fold_with(insn, &[a, b]),
 
         // Algebraic: x / 1 -> x
         (None, Some(1)) => Simplification::CopyFrom(src1),
@@ -415,7 +407,7 @@ fn simplify_mod(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
     match (val1, val2) {
         // Constant folding: a % b -> (a % b)
-        (Some(a), Some(b)) => fold_with(insn, a, b),
+        (Some(a), Some(b)) => fold_with(insn, &[a, b]),
 
         // Algebraic: x % 1 -> 0
         (None, Some(1)) => fold_to_zero(),
@@ -448,7 +440,7 @@ fn simplify_shift(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
     match (val1, val2) {
         // Constant folding (shift amount must be in [0, type_width))
-        (Some(a), Some(b)) => fold_with(insn, a, b),
+        (Some(a), Some(b)) => fold_with(insn, &[a, b]),
 
         // Algebraic: x op 0 -> x
         (None, Some(0)) => Simplification::CopyFrom(src1),
@@ -530,7 +522,7 @@ fn simplify_bitwise(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
     match (val1, val2) {
         // Constant folding: a op b
-        (Some(a), Some(b)) => fold_with(insn, a, b),
+        (Some(a), Some(b)) => fold_with(insn, &[a, b]),
 
         // Algebraic: x op identity -> x
         (None, Some(v)) if v == info.identity => Simplification::CopyFrom(src1),
@@ -591,7 +583,7 @@ fn simplify_comparison(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> 
     let val2 = consts.get_at(src2, width, info.signed);
 
     if let (Some(a), Some(b)) = (val1, val2) {
-        return fold_with(insn, a, b);
+        return fold_with(insn, &[a, b]);
     }
 
     Simplification::None
@@ -669,7 +661,7 @@ fn simplify_convert(insn: &Instruction, consts: &ConstMap) -> Simplification {
         _ => return Simplification::None,
     };
     match consts.get_at(insn.src[0], width, signed) {
-        Some(a) => fold_unary_with(insn, a),
+        Some(a) => fold_with(insn, &[a]),
         None => Simplification::None,
     }
 }
@@ -842,36 +834,27 @@ fn simplify_fcvt(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simpli
     }
 }
 
-fn simplify_neg(insn: &Instruction, consts: &ConstMap) -> Simplification {
-    if insn.src.len() != 1 {
+/// Fold an operation with no algebraic identities -- `-x`, `~x`, a
+/// population count -- when every operand is a known constant.
+fn simplify_of_consts(insn: &Instruction, consts: &ConstMap) -> Simplification {
+    let mut ops = [0i128; 2];
+    if insn.src.len() > ops.len() {
         return Simplification::None;
     }
-
-    let src = insn.src[0];
-    match consts.get(src) {
-        Some(val) => fold_unary_with(insn, val),
-        None => Simplification::None,
+    for (slot, s) in ops.iter_mut().zip(&insn.src) {
+        match consts.get(*s) {
+            Some(v) => *slot = v,
+            None => return Simplification::None,
+        }
     }
-}
-
-/// Fold a unary operation with no algebraic identities -- `~x`, a
-/// population count -- when its operand is a known constant.
-fn simplify_unary_of_const(insn: &Instruction, consts: &ConstMap) -> Simplification {
-    if insn.src.len() != 1 {
-        return Simplification::None;
-    }
-
-    let src = insn.src[0];
-    match consts.get(src) {
-        Some(val) => fold_unary_with(insn, val),
-        None => Simplification::None,
-    }
+    fold_with(insn, &ops[..insn.src.len()])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::float::{FpFormat, NanKind};
+    use crate::ir::constfold::bit_opcode;
     use crate::ir::{BasicBlock, BasicBlockId, Pseudo, PseudoKind};
     use crate::target::Target;
     use crate::types::TypeTable;

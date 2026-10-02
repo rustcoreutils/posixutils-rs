@@ -1066,6 +1066,44 @@ int main(void)
     }
 }
 
+/// A bit builtin over a value only a branch pins down folds like any other
+/// operation over a constant. `k` is an argument, so the constant exists only
+/// on the edge `k == 8` (or `k == 256`) proves -- which is value-range
+/// propagation's to see, and it used to give up on every bit operation even
+/// over a one-value range. `link_error` is never defined, so a missed fold
+/// fails the link.
+#[test]
+fn codegen_vrp_folds_a_bit_builtin_over_an_edge_constant() {
+    let code = r#"
+extern void link_error(void);
+
+__attribute__((noinline)) int f(unsigned k, unsigned long l)
+{
+    int r = 0;
+    if (k == 8) {
+        if (__builtin_popcount(k) != 1) link_error();
+        if (__builtin_ctz(k) != 3) link_error();
+        if (__builtin_clz(k) != 28) link_error();
+        r += 1;
+    }
+    if (l == 256) {
+        if (__builtin_bswap64(l) != 0x0001000000000000ul) link_error();
+        r += 2;
+    }
+    return r;
+}
+
+int main(void)
+{
+    return f(8, 256) == 3 && f(1, 1) == 0 ? 0 : 1;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_vrp_bit_builtin", code, &["-O2".to_string()]),
+        0
+    );
+}
+
 /// Shift identities that hold for *every* shift count, and the comparisons
 /// that prove them.
 ///

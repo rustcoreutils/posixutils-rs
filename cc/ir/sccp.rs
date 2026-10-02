@@ -33,8 +33,9 @@
 // `dominate::domtree_build` *fresh*, after the CFG edits here.
 //
 
-use super::constfold::{bit_opcode, eval_binop, eval_unop, get_cmp_info};
+use super::constfold::{eval_int, get_cmp_info, int_fold_arity, is_int_foldable};
 use super::dataflow::{Lattice, Selector, Sparse, SparseAnalysis};
+use super::facts::ConstMap;
 use super::propagate::cbr_taken;
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
 
@@ -71,12 +72,16 @@ impl Lattice for Val {
 
 struct Solver {
     core: Sparse<Val>,
+    /// Which pseudos are copies of which, for deciding `x - x` and `x == x`
+    /// when the two sides are one value under two names.
+    consts: ConstMap,
 }
 
 /// Run SCCP over `func`, returning whether anything changed.
 pub fn run(func: &mut Function) -> bool {
     Solver {
         core: Sparse::new(func, Val::Const),
+        consts: ConstMap::new(func),
     }
     .run(func)
 }
@@ -86,16 +91,38 @@ impl Solver {
         self.core.get(id)
     }
 
-    /// A unary operation `constfold` evaluates, over its operand's lattice
-    /// value.
-    fn unary(&self, insn: &Instruction) -> Val {
-        match insn.src.first().map(|s| self.get(*s)) {
-            Some(Val::Const(a)) => match eval_unop(insn, a) {
-                Some(v) => Val::Const(v),
-                None => Val::Bottom,
-            },
-            Some(Val::Top) => Val::Top,
-            _ => Val::Bottom,
+    /// An integer operation `constfold` evaluates, over its operands'
+    /// lattice values.
+    fn int_op(&self, insn: &Instruction) -> Val {
+        if int_fold_arity(insn.op) != Some(insn.src.len()) {
+            return Val::Bottom;
+        }
+        let mut ops = [0i128; 2];
+        let (mut known, mut pending) = (true, false);
+        for (slot, s) in ops.iter_mut().zip(&insn.src) {
+            match self.get(*s) {
+                Val::Const(c) => *slot = c,
+                Val::Top => (known, pending) = (false, true),
+                Val::Bottom => known = false,
+            }
+        }
+        if known {
+            // `None` is an operation undefined for these operands -- a zero
+            // divisor, an out-of-range shift count. Not a constant.
+            return eval_int(insn, &ops[..insn.src.len()]).map_or(Val::Bottom, Val::Const);
+        }
+        // A comparison of a value with itself is decided without knowing
+        // the value, exactly as `instcombine` does it.
+        if let ([a, b], Some(info)) = (insn.src.as_slice(), get_cmp_info(insn.op)) {
+            let w = insn.operand_width();
+            if self.consts.root(*a, w) == self.consts.root(*b, w) {
+                return Val::Const(info.identity_result);
+            }
+        }
+        if pending {
+            Val::Top
+        } else {
+            Val::Bottom
         }
     }
 }
@@ -179,34 +206,7 @@ impl SparseAnalysis for Solver {
                 _ => Val::Const(0),
             },
 
-            Opcode::Neg | Opcode::Not | Opcode::Sext | Opcode::Zext | Opcode::Trunc => {
-                self.unary(insn)
-            }
-            op if bit_opcode(op).is_some() => self.unary(insn),
-
-            _ if insn.op.is_int_arith() || insn.op.is_int_comparison() => {
-                if insn.src.len() != 2 {
-                    return Val::Bottom;
-                }
-                let a = self.get(insn.src[0]);
-                let b = self.get(insn.src[1]);
-                match (a, b) {
-                    (Val::Const(x), Val::Const(y)) => match eval_binop(insn, x, y) {
-                        Some(v) => Val::Const(v),
-                        // Undefined for these operands -- a zero divisor, an
-                        // out-of-range shift count. Not a constant.
-                        None => Val::Bottom,
-                    },
-                    // A comparison of a pseudo with itself is decided without
-                    // knowing the value, exactly as `instcombine` does it.
-                    _ if insn.src[0] == insn.src[1] => match get_cmp_info(insn.op) {
-                        Some(info) => Val::Const(info.identity_result),
-                        None => Val::Bottom,
-                    },
-                    (Val::Top, _) | (_, Val::Top) => Val::Top,
-                    _ => Val::Bottom,
-                }
-            }
+            op if is_int_foldable(op) => self.int_op(insn),
 
             // Everything else. See the doc comment above.
             //
@@ -448,6 +448,57 @@ mod tests {
             assert_eq!(t.op, Opcode::Br, "{op:?}");
             assert_eq!(t.bb_true, Some(taken), "{op:?}");
         }
+    }
+
+    /// `x == y` with `y` a copy of an unknown `x` is decided by the two
+    /// being one value, which is a question about where `y` came from and
+    /// not about its pseudo id: after promotion out of memory every read of
+    /// a local is its own `Copy`.
+    #[test]
+    fn sccp_decides_a_comparison_of_a_value_with_its_copy() {
+        let types = TypeTable::new(&Target::host());
+        let int = types.int_id;
+        let mut func = Function::new("t", int);
+        func.add_pseudo(Pseudo::arg(PseudoId(1), 0));
+        for id in 2..=3 {
+            func.add_pseudo(Pseudo::reg(PseudoId(id), id));
+        }
+        func.next_pseudo = 5;
+
+        let mut b0 = BasicBlock::new(BasicBlockId(0));
+        b0.add_insn(Instruction::new(Opcode::Entry));
+        b0.add_insn(
+            Instruction::new(Opcode::Copy)
+                .with_target(PseudoId(2))
+                .with_src(PseudoId(1))
+                .with_type_and_size(int, 32),
+        );
+        b0.add_insn(Instruction::compare(
+            Opcode::SetEq,
+            PseudoId(3),
+            (PseudoId(1), PseudoId(2)),
+            (int, 32),
+            (int, 32),
+        ));
+        b0.add_insn(Instruction::cbr(
+            PseudoId(3),
+            BasicBlockId(1),
+            BasicBlockId(2),
+        ));
+        b0.children = vec![BasicBlockId(1), BasicBlockId(2)];
+        func.add_block(b0);
+        for id in [BasicBlockId(1), BasicBlockId(2)] {
+            let mut bb = BasicBlock::new(id);
+            bb.add_insn(Instruction::ret(None));
+            bb.parents = vec![BasicBlockId(0)];
+            func.add_block(bb);
+        }
+        func.entry = BasicBlockId(0);
+
+        assert!(run(&mut func));
+        let t = terminator(&func, 0);
+        assert_eq!(t.op, Opcode::Br, "x == copy(x) is always true");
+        assert_eq!(t.bb_true, Some(BasicBlockId(1)));
     }
 
     // Safety

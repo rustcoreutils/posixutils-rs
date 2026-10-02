@@ -266,7 +266,7 @@ pub(crate) fn mirror_mask(mask: u8) -> u8 {
 /// The operands are raw: every narrowing this needs is applied here, and
 /// narrowing is idempotent, so a caller that has already read them at their
 /// own width may pass those instead.
-pub(crate) fn eval_binop(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
+fn eval_binop(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
     match insn.op {
         // Congruent modulo 2^n, so the width does not enter into it.
         Opcode::Add => Some(a.wrapping_add(b)),
@@ -539,6 +539,44 @@ pub(crate) fn eval_fcvt(op: Opcode, dst_size: u32, src_fmt: FpFormat, a: FloatVa
         .to_integer(dst_size.clamp(1, 128), signed)
 }
 
+/// How many integer operands `op` takes when [`eval_int`] evaluates it, or
+/// `None` when it evaluates no such opcode.
+pub(crate) fn int_fold_arity(op: Opcode) -> Option<usize> {
+    if matches!(
+        op,
+        Opcode::Neg | Opcode::Not | Opcode::Sext | Opcode::Zext | Opcode::Trunc
+    ) || bit_opcode(op).is_some()
+    {
+        Some(1)
+    } else if op.is_int_arith() || op.is_int_comparison() {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// Whether [`eval_int`] evaluates `op`.
+pub(crate) fn is_int_foldable(op: Opcode) -> bool {
+    int_fold_arity(op).is_some()
+}
+
+/// `insn`'s integer operation applied to the constants `ops`, one per
+/// operand: the single dispatch every pass that folds over known operands
+/// goes through, so that none of them can model an opcode the others do not.
+///
+/// `None` when the opcode is not one this folds, `ops` is the wrong arity
+/// for it, or the operation is undefined for these operands.
+pub(crate) fn eval_int(insn: &Instruction, ops: &[i128]) -> Option<i128> {
+    if int_fold_arity(insn.op)? != ops.len() {
+        return None;
+    }
+    match *ops {
+        [a] => eval_unop(insn, a),
+        [a, b] => eval_binop(insn, a, b),
+        _ => None,
+    }
+}
+
 /// `insn`'s unary operation applied to a constant.
 ///
 /// Includes the integer width conversions, which are unary in the IR and
@@ -547,7 +585,7 @@ pub(crate) fn eval_fcvt(op: Opcode, dst_size: u32, src_fmt: FpFormat, a: FloatVa
 /// every `char` or `short` read is widened before anything is done with it,
 /// so a fold that stops at the conversion stops one instruction after it
 /// started.
-pub(crate) fn eval_unop(insn: &Instruction, a: i128) -> Option<i128> {
+fn eval_unop(insn: &Instruction, a: i128) -> Option<i128> {
     match insn.op {
         Opcode::Neg => Some(a.wrapping_neg()),
         Opcode::Not => Some(!a),
@@ -969,6 +1007,31 @@ mod tests {
         ] {
             let insn = Instruction::new(op).with_size(32);
             assert_eq!(eval_unop(&insn, a), Some(want), "{op:?} of {a:#x}");
+        }
+    }
+
+    /// The one dispatch folds an operation only at its own arity, and
+    /// nothing it does not model: an operand list of the wrong length is a
+    /// malformed instruction, not one to guess at.
+    #[test]
+    fn eval_int_folds_each_operation_at_its_own_arity() {
+        for (op, ops, want) in [
+            (Opcode::Neg, &[5][..], Some(-5)),
+            (Opcode::Popcount32, &[0xF0], Some(4)),
+            (Opcode::Sub, &[7, 2], Some(5)),
+            (Opcode::SetLt, &[1, 2], Some(1)),
+            (Opcode::Neg, &[5, 5], None),
+            (Opcode::Sub, &[7], None),
+            (Opcode::Popcount32, &[], None),
+            (Opcode::DivS, &[1, 0], None),
+            (Opcode::Load, &[1], None),
+            (Opcode::UMulHi, &[1, 1], None),
+        ] {
+            let insn = Instruction::new(op).with_size(32);
+            assert_eq!(eval_int(&insn, ops), want, "{op:?} of {ops:?}");
+        }
+        for op in [Opcode::Load, Opcode::UMulHi, Opcode::FAdd, Opcode::Lo64] {
+            assert!(!is_int_foldable(op), "{op:?}");
         }
     }
 }

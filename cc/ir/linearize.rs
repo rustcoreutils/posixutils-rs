@@ -558,6 +558,47 @@ pub(crate) struct HiddenReturnSlot {
     pub(crate) arg_typ: TypeId,
 }
 
+/// What a call calls.
+enum CallTarget {
+    /// A function, by name.
+    Direct(String),
+    /// The function pointer the callee expression evaluated to.
+    Indirect(PseudoId),
+}
+
+/// What a callee's type says about a call to it: what lowering the
+/// arguments and building the call instruction both read.
+struct CalleeSignature {
+    /// The convention that classifies the return, the arguments taken by
+    /// reference, and the registers.
+    conv: CallingConv,
+    /// The prototype's parameter types; `None` without a prototype.
+    params: Option<Vec<TypeId>>,
+    /// A function type with no prototype (C17 6.5.2.2p6).
+    unprototyped: bool,
+    /// Where the variadic arguments start, for a variadic callee.
+    variadic_arg_start: Option<usize>,
+    /// The callee does not return.
+    is_noreturn: bool,
+}
+
+/// A call's lowered arguments: the values and, in step, the types the ABI
+/// classifies them by.
+struct CallArgs {
+    vals: Vec<PseudoId>,
+    types: Vec<TypeId>,
+}
+
+/// What a call instruction records beyond its operands.
+struct CallFacts {
+    variadic_arg_start: Option<usize>,
+    ends_with_va_arg_pack: bool,
+    is_noreturn: bool,
+    binding: crate::parse::ast::CalleeBinding,
+    known: Option<crate::parse::ast::LibFn>,
+    abi_info: Box<CallAbiInfo>,
+}
+
 /// Where a jump whose VLA restore is still undecided may land.
 pub(crate) enum GotoTarget {
     /// `goto L;`, or one label edge of an `asm goto`: a single block.
@@ -1989,36 +2030,14 @@ impl<'a> Linearizer<'a> {
                 // size, and the prologue writes them into the local -- so it
                 // must not also get the small-struct store below, which would
                 // overwrite what the prologue just put there.
-                let is_hfa_param = {
-                    let abi = get_abi_for_conv(self.current_calling_conv, self.target);
-                    matches!(
-                        abi.classify_param(param.typ, self.types),
-                        crate::abi::ArgClass::Hfa { count, .. }
-                            if count >= 2 || size > 64
-                    )
-                };
-                let is_two_fp_regs = is_hfa_param
-                    || size > 64 && size <= 128 && {
-                        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
-                        let class = abi.classify_param(param.typ, self.types);
-                        // Any all-SSE aggregate, whether that is two registers of
-                        // eight bytes or one of sixteen.
-                        let all_sse = matches!(
-                            class,
-                            crate::abi::ArgClass::Direct { ref classes, .. }
-                                if !classes.is_empty()
-                                    && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
-                        ) || matches!(class, crate::abi::ArgClass::Hfa { .. });
-                        // Two eightbytes of any classes -- both integer, or one
-                        // of each -- arrive in two registers on both targets:
-                        // AAPCS64 §5.4.2 C.10 and SysV AMD64 §3.2.3 agree.
-                        let reg_pair = matches!(
-                            class,
-                            crate::abi::ArgClass::Direct { ref classes, .. }
-                                if classes.len() == 2
-                        );
-                        all_sse || reg_pair
-                    };
+                let class = get_abi_for_conv(self.current_calling_conv, self.target)
+                    .classify_param(param.typ, self.types);
+                let is_hfa_param = matches!(
+                    class,
+                    crate::abi::ArgClass::Hfa { count, .. } if count >= 2 || size > 64
+                );
+                let is_two_fp_regs =
+                    is_hfa_param || size > 64 && size <= 128 && class.is_register_aggregate();
                 if is_two_fp_regs {
                     complex_params.push((
                         name,
@@ -3785,83 +3804,16 @@ impl<'a> Linearizer<'a> {
         binding: crate::parse::ast::CalleeBinding,
         known: Option<crate::parse::ast::LibFn>,
     ) -> PseudoId {
-        // Determine if this is a direct or indirect call.
-        // We need to check the TYPE of the function expression:
-        // - If it's TypeKind::Function, it's a direct call to a function
-        // - If it's TypeKind::Pointer to Function, it's an indirect call through function pointer
-        let is_function_pointer = func_expr.typ.is_some_and(|t| {
-            let typ = self.types.get(t);
-            typ.kind == TypeKind::Pointer
-        });
-
-        let (func_name, indirect_target) = match &func_expr.kind {
-            ExprKind::Ident(symbol_id) if !is_function_pointer => {
-                // Direct call to named function (not a function pointer variable)
-                (self.symbol_name(*symbol_id), None)
-            }
-            ExprKind::Unary {
-                op: UnaryOp::Deref,
-                operand,
-            } => {
-                // Explicit dereference form: (*fp)(args) or (*fpp)(args)
-                // Check the type of the operand to determine behavior:
-                // - If operand is function pointer (*fn): call through operand value
-                // - If operand is pointer-to-function-pointer (**fn): dereference first
-                let operand_type = self.expr_type(operand);
-                let operand_kind = self.types.kind(operand_type);
-                if operand_kind == TypeKind::Pointer {
-                    // Check what it points to
-                    let base_type = self.types.base_type(operand_type);
-                    let base_kind = base_type.map(|t| self.types.kind(t));
-                    if base_kind == Some(TypeKind::Function) {
-                        // Operand is function pointer - use its value directly
-                        let func_addr = self.linearize_expr(operand);
-                        ("<indirect>".to_string(), Some(func_addr))
-                    } else {
-                        // Operand is pointer-to-pointer - dereference to get function pointer
-                        let func_addr = self.linearize_expr(func_expr);
-                        ("<indirect>".to_string(), Some(func_addr))
-                    }
-                } else {
-                    // Unknown case - try to linearize the full expression
-                    let func_addr = self.linearize_expr(func_expr);
-                    ("<indirect>".to_string(), Some(func_addr))
-                }
-            }
-            _ => {
-                // Indirect call through function pointer variable: fp(args)
-                // This includes identifiers that are function pointer variables
-                let func_addr = self.linearize_expr(func_expr);
-                ("<indirect>".to_string(), Some(func_addr))
-            }
-        };
+        let target = self.lower_callee(func_expr);
 
         let typ = self.expr_type(expr); // Use evaluated type (function return type)
 
-        // The callee's convention classifies everything below: its return,
-        // which arguments it takes by reference, and the registers.
-        let conv = func_expr
-            .typ
-            .map_or(CallingConv::C, |t| CallingConv::of_callee(t, self.types));
+        let sig = self.callee_signature(func_expr);
+        let conv = sig.conv;
         // A library function is known by its System V signature: what folds
         // or lowers a call to `memcpy` makes a System V call, and a callee
         // declared `ms_abi` is some other function of that name.
         let known = known.filter(|_| conv == CallingConv::C);
-
-        // Check if this is a variadic function call and if it's noreturn
-        // If the function expression has a type, check its variadic and noreturn flags
-        let (variadic_arg_start, is_noreturn_call) = if let Some(func_type) = func_expr.typ {
-            let ft = self.types.get(func_type);
-            let variadic = if ft.variadic {
-                // Variadic args start after the fixed parameters
-                ft.params.as_ref().map(|p| p.len())
-            } else {
-                None
-            };
-            (variadic, ft.noreturn)
-        } else {
-            (None, false) // No type info, assume non-variadic and returns
-        };
 
         // Check if function returns a large struct or complex type
         // Large structs: allocate space and pass address as hidden first argument
@@ -3907,51 +3859,6 @@ impl<'a> Linearizer<'a> {
             (result, Vec::new(), Vec::new())
         };
 
-        // Get formal parameter types for implicit widening conversions.
-        // When a narrow int (e.g., int) is passed to a wider parameter (e.g., long),
-        // C requires implicit promotion. This is transparent for non-inlined calls
-        // (the ABI handles it), but inlining exposes the mismatch since the argument
-        // pseudo is used directly without conversion.
-        // C17 6.5.2.2p1 lets the function designator be a function *or* a
-        // pointer to one, and the prototype lives on the function type either
-        // way. Reading `params` off the pointer found nothing, so a call
-        // through a pointer converted no argument at all:
-        //
-        //   void f(double); void (*p)(double) = f; p(1);
-        //
-        // passed the integer 1 where a `double` was expected and the callee
-        // read 0. With a mixed list every later argument moved as well.
-        let formal_param_types: Option<Vec<TypeId>> = func_expr.typ.and_then(|ft_id| {
-            let resolved = if self.types.kind(ft_id) == TypeKind::Pointer {
-                self.types.base_type(ft_id).unwrap_or(ft_id)
-            } else {
-                ft_id
-            };
-            self.types.get(resolved).params.clone()
-        });
-        // A call through a function type with no prototype: C17 6.5.2.2p6
-        // gives every argument the default argument promotions, as it does
-        // a variadic one, and an identifier-list definition receives them so
-        // (see `ParamStyle`). Passing a `float` as a float had a gcc-compiled
-        // K&R callee read a double out of a register that held a single, and
-        // a `char` took Apple arm64's one-byte stack slot where the callee
-        // reads an `int`.
-        let unprototyped = func_expr.typ.is_some_and(|ft_id| {
-            let resolved = if self.types.kind(ft_id) == TypeKind::Pointer {
-                self.types.base_type(ft_id).unwrap_or(ft_id)
-            } else {
-                ft_id
-            };
-            self.types.kind(resolved) == TypeKind::Function
-                && self.types.get(resolved).params.is_none()
-        });
-
-        // Linearize regular arguments
-        // For large structs, pass by reference (address) instead of by value
-        // Note: We pass structs > 64 bits by reference. While the ABI allows
-        // two-register passing for 9-16 byte structs, we don't implement that yet.
-        // For complex types, pass address so codegen can load real/imag into XMM registers
-        // For arrays (including VLAs), decay to pointer
         // `__builtin_va_arg_pack()` is not an argument -- it stands for the
         // caller's whole argument list, which is not known until the enclosing
         // function is inlined. Lift it off here and record it on the call; the
@@ -3967,217 +3874,9 @@ impl<'a> Linearizer<'a> {
         };
 
         for (arg_idx, a) in args.iter().enumerate() {
-            let mut arg_type = self.expr_type(a);
-            let arg_kind = self.types.kind(arg_type);
-            // Computed before the dispatch below so the complex-argument arm
-            // can be skipped for a `_Bool` parameter without re-borrowing.
-            let bool_param_for_complex_arg = formal_param_types
-                .as_ref()
-                .and_then(|params| params.get(arg_idx).copied())
-                .filter(|pt| {
-                    self.types.is_complex(arg_type) && self.types.kind(*pt) == TypeKind::Bool
-                });
-            let arg_val = if (arg_kind == TypeKind::Struct || arg_kind == TypeKind::Union)
-                && (self.types.size_bits(arg_type) > 64 || self.passed_by_reference(arg_type, conv))
-            {
-                let size_bits = self.types.size_bits(arg_type);
-                let abi = get_abi_for_conv(conv, self.target);
-                let class = abi.classify_param(arg_type, self.types);
-                if size_bits > 128 {
-                    // Large struct (> 16 bytes): keep struct type so ABI classifies as
-                    // Indirect/MEMORY. The pseudo is the struct's address: System V
-                    // copies its bytes to the stack there, and AAPCS64 is handed a
-                    // copy of it below.
-                    arg_types_vec.push(arg_type);
-                } else {
-                    // Medium struct (9-16 bytes): the ABI classification decides
-                    let is_two_fp_regs = matches!(
-                        class,
-                        crate::abi::ArgClass::Direct { ref classes, .. }
-                            if !classes.is_empty()
-                                && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
-                    ) || matches!(class, crate::abi::ArgClass::Hfa { .. });
-                    // MEMORY class means the bytes go on the stack by value,
-                    // exactly as an over-sixteen-byte struct already does.
-                    // Reachable at this size only when an eightbyte holds a
-                    // `long double`, directly or merged with something else;
-                    // passing a pointer instead disagreed with gcc silently.
-                    let is_memory = matches!(class, crate::abi::ArgClass::Indirect { .. });
-                    // Any other two-eightbyte `Direct` class -- two integer
-                    // registers, or one of each -- travels in registers too,
-                    // on both targets. The pseudo still carries the address;
-                    // it is the backend that loads the pair out of it.
-                    let is_reg_pair = matches!(
-                        class,
-                        crate::abi::ArgClass::Direct { ref classes, .. }
-                            if classes.len() == 2
-                    );
-                    if is_two_fp_regs || is_memory || is_reg_pair {
-                        // Keep the struct type: the ABI decides from it, and
-                        // the pseudo carries the address either way.
-                        arg_types_vec.push(arg_type);
-                    } else {
-                        // Integer or mixed struct: pass as pointer (existing behavior)
-                        arg_types_vec.push(self.types.pointer_to(arg_type));
-                    }
-                }
-                // A struct argument travels by address. `linearize_lvalue`
-                // materializes an rvalue -- a call returning a struct -- and
-                // hands back the temporary's address, so both cases are the
-                // same call.
-                let addr = self.linearize_lvalue(a);
-                if self.passed_by_reference(arg_type, conv) {
-                    let vol = self.block_volatility(arg_type, self.expr_type(a));
-                    self.argument_copy(addr, arg_type, true, vol)
-                } else {
-                    addr
-                }
-            } else if bool_param_for_complex_arg.is_some() {
-                // A complex argument bound to a `_Bool` parameter converts by
-                // comparing against zero, so it must not take the
-                // pass-the-address arm below -- see `complex_to_bool`.
-                let pt = bool_param_for_complex_arg.unwrap();
-                arg_types_vec.push(pt);
-                self.emit_complex_nonzero(a)
-            } else if let Some(pt) = formal_param_types
-                .as_ref()
-                .and_then(|params| params.get(arg_idx).copied())
-                .filter(|pt| self.types.is_complex(*pt) && !self.types.is_complex(arg_type))
-            {
-                // A *real* argument bound to a complex parameter. C17
-                // 6.5.2.2p2 converts it as if by assignment, and 6.3.1.7p1
-                // gives the imaginary half a zero -- so the callee is handed a
-                // complex object, by address, like any other complex argument.
-                //
-                // The arm below keys on the *argument's* type, so this case
-                // reached the ordinary scalar path and the raw value was
-                // passed where an address was expected: `f(7)` with a
-                // `_Complex double` parameter arrived as garbage, and with a
-                // `_Complex int` one the callee dereferenced the number 7.
-                arg_types_vec.push(pt);
-                self.promote_real_to_complex(a, pt)
-            } else if self.types.is_complex(arg_type) {
-                // Complex types: pass address, codegen loads real/imag into XMM registers
-                // Type stays as complex (not pointer) so codegen knows it's complex.
-                //
-                // Converted to the parameter's own precision first. A complex
-                // value is read with its base type's stride, so handing a
-                // `float _Complex` to a `double _Complex` parameter without
-                // converting had the callee read an 8-byte-strided pair out of
-                // 4-byte-strided storage: `1.0f + 2.0f*I` arrived as `2+1i`.
-                // The type recorded for the ABI has to move with it, or the
-                // classification is made for a width that is no longer there.
-                let param_typ = formal_param_types
-                    .as_ref()
-                    .and_then(|params| params.get(arg_idx).copied())
-                    .filter(|pt| self.types.is_complex(*pt));
-                match param_typ {
-                    Some(pt) => {
-                        arg_types_vec.push(pt);
-                        self.complex_operand_at_precision(a, pt)
-                    }
-                    // No prototype, or a variadic argument: nothing says what
-                    // precision the callee wants, so it travels as written.
-                    None => {
-                        arg_types_vec.push(arg_type);
-                        self.complex_operand_addr(a)
-                    }
-                }
-            } else if arg_kind == TypeKind::Array {
-                // Array decay to pointer (C99 6.3.2.1)
-                // This applies to both fixed-size arrays and VLAs
-                let elem_type = self.types.base_type(arg_type).unwrap_or(self.types.int_id);
-                arg_types_vec.push(self.types.pointer_to(elem_type));
-                self.linearize_expr(a)
-            } else if arg_kind == TypeKind::VaList && !self.types.va_list_is_pointer() {
-                // va_list decay to pointer (C99 7.15.1)
-                // va_list is defined as __va_list_tag[1] (an array), so it decays to
-                // a pointer when passed to a function taking va_list parameter.
-                // Where va_list is already a pointer there is nothing to decay, and
-                // the ordinary scalar path below passes it by value.
-                arg_types_vec.push(self.types.pointer_to(arg_type));
-                self.linearize_lvalue(a)
-            } else if arg_kind == TypeKind::Function {
-                // Function decay to pointer (C99 6.3.2.1)
-                // Function names passed as arguments decay to function pointers
-                arg_types_vec.push(self.types.pointer_to(arg_type));
-                self.linearize_expr(a)
-            } else {
-                let mut val = self.linearize_expr(a);
-
-                // Implicit argument conversion when actual type differs from
-                // formal parameter type. Covers:
-                // - Integer widening: int→long (sign/zero extend)
-                // - FP widening/narrowing: float↔double↔long double
-                // - Int→FP: uint32_t→double (e.g., log10(uint32_t_val))
-                // - FP→Int: rare but legal
-                if let Some(ref params) = formal_param_types {
-                    if arg_idx < params.len() {
-                        let param_type = params[arg_idx];
-                        let arg_size = self.types.size_bits(arg_type);
-                        let param_size = self.types.size_bits(param_type);
-                        let arg_is_int = self.types.is_integer(arg_type);
-                        let param_is_int = self.types.is_integer(param_type);
-                        let arg_is_fp = self.types.is_float(arg_type);
-                        let param_is_fp = self.types.is_float(param_type);
-
-                        let needs_convert =
-                            // Integer widening (int→long, long→__int128, ...),
-                            // decided by the two sizes alone: nothing about it
-                            // stops at 64 bits.
-                            (arg_is_int && param_is_int && arg_size < param_size)
-                            // Integer narrowing (long→int, int→char, ...).
-                            // The callee reads only the parameter's own bytes,
-                            // but the ABI places the argument by the
-                            // *parameter's* type: Apple arm64 stacks a `char`
-                            // in one byte, so `f(..., 'a')` recorded as `int`
-                            // took four and moved every later argument.
-                            || (arg_is_int && param_is_int && arg_size > param_size)
-                            // FP size mismatch (float→double, long double→double, etc.)
-                            || (arg_is_fp && param_is_fp && arg_size != param_size)
-                            // Integer to FP (uint32_t→double, int→float, etc.)
-                            || (arg_is_int && param_is_fp)
-                            // FP to integer (rare but legal)
-                            || (arg_is_fp && param_is_int)
-                            // To `_Bool`, whose conversion is `!= 0` and not
-                            // a truncation (C17 6.3.1.2): `f(42)` with a
-                            // `_Bool` parameter must pass 1.
-                            || self.types.kind(param_type) == TypeKind::Bool;
-
-                        if needs_convert {
-                            val = self.emit_convert(val, arg_type, param_type);
-                            arg_type = param_type;
-                        }
-                    }
-                }
-
-                // C99 6.5.2.2p7: default argument promotions for variadic args,
-                // and 6.5.2.2p6 for every argument of an unprototyped call.
-                //
-                // Both halves have to happen here. The formal-parameter
-                // conversion above is guarded by `arg_idx < params.len()`, and
-                // a variadic argument is by definition at or past that bound,
-                // so it never runs for these. The cast itself emits no IR
-                // either, because emit_convert short-circuits same-size integer
-                // conversions -- without an explicit promotion the pseudo still
-                // holds the sign-extended load, and `printf("%02x", (unsigned
-                // char)c)` prints ffffff80 for a negative `signed char`.
-                if unprototyped || variadic_arg_start.is_some_and(|v| arg_idx >= v) {
-                    let promoted = self.types.default_argument_promote(arg_type);
-                    if promoted != arg_type {
-                        val = self.emit_convert(val, arg_type, promoted);
-                        arg_type = promoted;
-                    }
-                }
-
-                arg_types_vec.push(arg_type);
-                val
-            };
-            let passed = *arg_types_vec
-                .last()
-                .expect("every argument records its type");
-            let arg_val = self.pass_by_convention(arg_val, passed, conv);
-            arg_vals.push(arg_val);
+            let (val, passed) = self.lower_call_arg(a, arg_idx, &sig);
+            arg_vals.push(val);
+            arg_types_vec.push(passed);
         }
 
         // Compute ABI classification for parameters and return value.
@@ -4203,46 +3902,25 @@ impl<'a> Linearizer<'a> {
             .map(|&t| abi.classify_param(t, self.types))
             .collect();
         let ret_class = abi.classify_return(typ, self.types);
-        let call_abi_info = Box::new(CallAbiInfo::with_conv(param_classes, ret_class, conv));
+        let facts = CallFacts {
+            variadic_arg_start: sig.variadic_arg_start,
+            ends_with_va_arg_pack,
+            is_noreturn: sig.is_noreturn,
+            binding,
+            known,
+            abi_info: Box::new(CallAbiInfo::with_conv(param_classes, ret_class, conv)),
+        };
 
         if returns_large_struct {
-            // For large struct returns, the return value is the address
-            // stored in result_sym (which is a local symbol containing the struct)
+            // For large struct returns, the call's value is the address of
+            // the local the callee wrote, and the pointer is 64 bits wide.
             let result = self.alloc_reg_pseudo();
             let ptr_typ = self.types.pointer_to(typ);
-            let mut call_insn = if let Some(func_addr) = indirect_target {
-                // Indirect call through function pointer
-                Instruction::call_indirect(
-                    Some(result),
-                    func_addr,
-                    arg_vals,
-                    arg_types_vec,
-                    ptr_typ,
-                    64, // pointers are 64-bit
-                )
-            } else {
-                // Direct call
-                Instruction::call(
-                    Some(result),
-                    &func_name,
-                    arg_vals,
-                    arg_types_vec,
-                    ptr_typ,
-                    64, // pointers are 64-bit
-                )
+            let call_args = CallArgs {
+                vals: arg_vals,
+                types: arg_types_vec,
             };
-            call_insn.extra_mut().variadic_arg_start = variadic_arg_start;
-            call_insn.extra_mut().ends_with_va_arg_pack = ends_with_va_arg_pack;
-            call_insn.extra_mut().is_noreturn_call = is_noreturn_call;
-            call_insn.extra_mut().callee_binding = binding;
-            call_insn.extra_mut().known = known;
-            call_insn.extra_mut().abi_info = Some(call_abi_info);
-            self.emit(call_insn);
-            if is_noreturn_call {
-                self.emit_no_return(
-                    Instruction::new(Opcode::Unreachable).with_type(self.types.void_id),
-                );
-            }
+            self.build_call(target, call_args, result, (ptr_typ, 64), facts);
             // A scalar returned through the pointer is read back as the
             // call's value; anything else is used by address, as stored.
             if self.types.is_scalar(typ) && !self.types.is_complex(typ) {
@@ -4251,44 +3929,384 @@ impl<'a> Linearizer<'a> {
                 self.emit(Instruction::load(val, result_sym, 0, typ, size));
                 return val;
             }
-            // Return the symbol (address) where struct is stored
-            result_sym
         } else {
             let ret_size = self.types.size_bits(typ);
-            let mut call_insn = if let Some(func_addr) = indirect_target {
-                // Indirect call through function pointer
-                Instruction::call_indirect(
-                    Some(result_sym),
-                    func_addr,
-                    arg_vals,
-                    arg_types_vec,
-                    typ,
-                    ret_size,
-                )
-            } else {
-                // Direct call
-                Instruction::call(
-                    Some(result_sym),
-                    &func_name,
-                    arg_vals,
-                    arg_types_vec,
-                    typ,
-                    ret_size,
-                )
+            let call_args = CallArgs {
+                vals: arg_vals,
+                types: arg_types_vec,
             };
-            call_insn.extra_mut().variadic_arg_start = variadic_arg_start;
-            call_insn.extra_mut().ends_with_va_arg_pack = ends_with_va_arg_pack;
-            call_insn.extra_mut().is_noreturn_call = is_noreturn_call;
-            call_insn.extra_mut().callee_binding = binding;
-            call_insn.extra_mut().known = known;
-            call_insn.extra_mut().abi_info = Some(call_abi_info);
-            self.emit(call_insn);
-            if is_noreturn_call {
-                self.emit_no_return(
-                    Instruction::new(Opcode::Unreachable).with_type(self.types.void_id),
-                );
+            self.build_call(target, call_args, result_sym, (typ, ret_size), facts);
+        }
+        result_sym
+    }
+
+    /// What a call calls: the named function, or the function pointer the
+    /// callee expression evaluates to. Emits that evaluation, so it runs
+    /// before the arguments are lowered.
+    fn lower_callee(&mut self, func_expr: &Expr) -> CallTarget {
+        // Determine if this is a direct or indirect call.
+        // We need to check the TYPE of the function expression:
+        // - If it's TypeKind::Function, it's a direct call to a function
+        // - If it's TypeKind::Pointer to Function, it's an indirect call through function pointer
+        let is_function_pointer = func_expr.typ.is_some_and(|t| {
+            let typ = self.types.get(t);
+            typ.kind == TypeKind::Pointer
+        });
+
+        match &func_expr.kind {
+            ExprKind::Ident(symbol_id) if !is_function_pointer => {
+                // Direct call to named function (not a function pointer variable)
+                CallTarget::Direct(self.symbol_name(*symbol_id))
             }
-            result_sym
+            ExprKind::Unary {
+                op: UnaryOp::Deref,
+                operand,
+            } => {
+                // Explicit dereference form: (*fp)(args) or (*fpp)(args)
+                // Check the type of the operand to determine behavior:
+                // - If operand is function pointer (*fn): call through operand value
+                // - If operand is pointer-to-function-pointer (**fn): dereference first
+                let operand_type = self.expr_type(operand);
+                let operand_kind = self.types.kind(operand_type);
+                if operand_kind == TypeKind::Pointer {
+                    // Check what it points to
+                    let base_type = self.types.base_type(operand_type);
+                    let base_kind = base_type.map(|t| self.types.kind(t));
+                    if base_kind == Some(TypeKind::Function) {
+                        // Operand is function pointer - use its value directly
+                        CallTarget::Indirect(self.linearize_expr(operand))
+                    } else {
+                        // Operand is pointer-to-pointer - dereference to get function pointer
+                        CallTarget::Indirect(self.linearize_expr(func_expr))
+                    }
+                } else {
+                    // Unknown case - try to linearize the full expression
+                    CallTarget::Indirect(self.linearize_expr(func_expr))
+                }
+            }
+            _ => {
+                // Indirect call through function pointer variable: fp(args)
+                // This includes identifiers that are function pointer variables
+                CallTarget::Indirect(self.linearize_expr(func_expr))
+            }
+        }
+    }
+
+    /// What the callee expression's type says about the call: see
+    /// [`CalleeSignature`].
+    fn callee_signature(&self, func_expr: &Expr) -> CalleeSignature {
+        // The callee's convention classifies everything below: its return,
+        // which arguments it takes by reference, and the registers.
+        let conv = func_expr
+            .typ
+            .map_or(CallingConv::C, |t| CallingConv::of_callee(t, self.types));
+
+        // Check if this is a variadic function call and if it's noreturn
+        // If the function expression has a type, check its variadic and noreturn flags
+        let (variadic_arg_start, is_noreturn) = if let Some(func_type) = func_expr.typ {
+            let ft = self.types.get(func_type);
+            let variadic = if ft.variadic {
+                // Variadic args start after the fixed parameters
+                ft.params.as_ref().map(|p| p.len())
+            } else {
+                None
+            };
+            (variadic, ft.noreturn)
+        } else {
+            (None, false) // No type info, assume non-variadic and returns
+        };
+
+        // Get formal parameter types for implicit widening conversions.
+        // When a narrow int (e.g., int) is passed to a wider parameter (e.g., long),
+        // C requires implicit promotion. This is transparent for non-inlined calls
+        // (the ABI handles it), but inlining exposes the mismatch since the argument
+        // pseudo is used directly without conversion.
+        // C17 6.5.2.2p1 lets the function designator be a function *or* a
+        // pointer to one, and the prototype lives on the function type either
+        // way. Reading `params` off the pointer found nothing, so a call
+        // through a pointer converted no argument at all:
+        //
+        //   void f(double); void (*p)(double) = f; p(1);
+        //
+        // passed the integer 1 where a `double` was expected and the callee
+        // read 0. With a mixed list every later argument moved as well.
+        let callee = func_expr
+            .typ
+            .and_then(|t| self.types.callee_function_type(t));
+        let params = callee.and_then(|f| self.types.get(f).params.clone());
+        // A call through a function type with no prototype: C17 6.5.2.2p6
+        // gives every argument the default argument promotions, as it does
+        // a variadic one, and an identifier-list definition receives them so
+        // (see `ParamStyle`). Passing a `float` as a float had a gcc-compiled
+        // K&R callee read a double out of a register that held a single, and
+        // a `char` took Apple arm64's one-byte stack slot where the callee
+        // reads an `int`.
+        let unprototyped = callee.is_some_and(|f| self.types.get(f).params.is_none());
+
+        CalleeSignature {
+            conv,
+            params,
+            unprototyped,
+            variadic_arg_start,
+            is_noreturn,
+        }
+    }
+
+    /// Lower the call argument `a`, the `arg_idx`-th, to the value the call
+    /// passes and the type the ABI classifies it by.
+    ///
+    /// For large structs, pass by reference (address) instead of by value.
+    /// For complex types, pass address so codegen can load real/imag into XMM
+    /// registers. For arrays (including VLAs), decay to pointer.
+    fn lower_call_arg(
+        &mut self,
+        a: &Expr,
+        arg_idx: usize,
+        sig: &CalleeSignature,
+    ) -> (PseudoId, TypeId) {
+        let conv = sig.conv;
+        let arg_type = self.expr_type(a);
+        let arg_kind = self.types.kind(arg_type);
+        let param = sig
+            .params
+            .as_ref()
+            .and_then(|params| params.get(arg_idx).copied());
+        let (arg_val, passed) = if (arg_kind == TypeKind::Struct || arg_kind == TypeKind::Union)
+            && (self.types.size_bits(arg_type) > 64 || self.passed_by_reference(arg_type, conv))
+        {
+            self.lower_struct_arg(a, arg_type, conv)
+        } else if let Some(pt) = param
+            .filter(|pt| self.types.is_complex(arg_type) && self.types.kind(*pt) == TypeKind::Bool)
+        {
+            // A complex argument bound to a `_Bool` parameter converts by
+            // comparing against zero, so it must not take the
+            // pass-the-address arm below -- see `complex_to_bool`.
+            (self.emit_complex_nonzero(a), pt)
+        } else if let Some(pt) =
+            param.filter(|pt| self.types.is_complex(*pt) && !self.types.is_complex(arg_type))
+        {
+            // A *real* argument bound to a complex parameter. C17
+            // 6.5.2.2p2 converts it as if by assignment, and 6.3.1.7p1
+            // gives the imaginary half a zero -- so the callee is handed a
+            // complex object, by address, like any other complex argument.
+            //
+            // The arm below keys on the *argument's* type, so this case
+            // reached the ordinary scalar path and the raw value was
+            // passed where an address was expected: `f(7)` with a
+            // `_Complex double` parameter arrived as garbage, and with a
+            // `_Complex int` one the callee dereferenced the number 7.
+            (self.promote_real_to_complex(a, pt), pt)
+        } else if self.types.is_complex(arg_type) {
+            // Complex types: pass address, codegen loads real/imag into XMM registers
+            // Type stays as complex (not pointer) so codegen knows it's complex.
+            //
+            // Converted to the parameter's own precision first. A complex
+            // value is read with its base type's stride, so handing a
+            // `float _Complex` to a `double _Complex` parameter without
+            // converting had the callee read an 8-byte-strided pair out of
+            // 4-byte-strided storage: `1.0f + 2.0f*I` arrived as `2+1i`.
+            // The type recorded for the ABI has to move with it, or the
+            // classification is made for a width that is no longer there.
+            match param.filter(|pt| self.types.is_complex(*pt)) {
+                Some(pt) => (self.complex_operand_at_precision(a, pt), pt),
+                // No prototype, or a variadic argument: nothing says what
+                // precision the callee wants, so it travels as written.
+                None => (self.complex_operand_addr(a), arg_type),
+            }
+        } else if arg_kind == TypeKind::Array {
+            // Array decay to pointer (C99 6.3.2.1)
+            // This applies to both fixed-size arrays and VLAs
+            let elem_type = self.types.base_type(arg_type).unwrap_or(self.types.int_id);
+            let passed = self.types.pointer_to(elem_type);
+            (self.linearize_expr(a), passed)
+        } else if arg_kind == TypeKind::VaList && !self.types.va_list_is_pointer() {
+            // va_list decay to pointer (C99 7.15.1)
+            // va_list is defined as __va_list_tag[1] (an array), so it decays to
+            // a pointer when passed to a function taking va_list parameter.
+            // Where va_list is already a pointer there is nothing to decay, and
+            // the ordinary scalar path below passes it by value.
+            let passed = self.types.pointer_to(arg_type);
+            (self.linearize_lvalue(a), passed)
+        } else if arg_kind == TypeKind::Function {
+            // Function decay to pointer (C99 6.3.2.1)
+            // Function names passed as arguments decay to function pointers
+            let passed = self.types.pointer_to(arg_type);
+            (self.linearize_expr(a), passed)
+        } else {
+            self.lower_scalar_arg(a, arg_idx, arg_type, param, sig)
+        };
+        (self.pass_by_convention(arg_val, passed, conv), passed)
+    }
+
+    /// A struct or union argument wider than a register, or one the
+    /// convention passes by reference: its address, and the type the ABI
+    /// classifies it by.
+    fn lower_struct_arg(
+        &mut self,
+        a: &Expr,
+        arg_type: TypeId,
+        conv: CallingConv,
+    ) -> (PseudoId, TypeId) {
+        let size_bits = self.types.size_bits(arg_type);
+        let abi = get_abi_for_conv(conv, self.target);
+        let class = abi.classify_param(arg_type, self.types);
+        let passed = if size_bits > 128 {
+            // Large struct (> 16 bytes): keep struct type so ABI classifies as
+            // Indirect/MEMORY. The pseudo is the struct's address: System V
+            // copies its bytes to the stack there, and AAPCS64 is handed a
+            // copy of it below.
+            arg_type
+        } else if class.is_register_aggregate()
+            // MEMORY class means the bytes go on the stack by value,
+            // exactly as an over-sixteen-byte struct already does.
+            // Reachable at this size only when an eightbyte holds a
+            // `long double`, directly or merged with something else;
+            // passing a pointer instead disagreed with gcc silently.
+            || matches!(class, crate::abi::ArgClass::Indirect { .. })
+        {
+            // Medium struct (9-16 bytes) that travels in registers or in
+            // memory: keep the struct type, as the ABI decides from it. The
+            // pseudo still carries the address; it is the backend that loads
+            // the registers out of it.
+            arg_type
+        } else {
+            // Integer or mixed struct: pass as pointer (existing behavior)
+            self.types.pointer_to(arg_type)
+        };
+        // A struct argument travels by address. `linearize_lvalue`
+        // materializes an rvalue -- a call returning a struct -- and
+        // hands back the temporary's address, so both cases are the
+        // same call.
+        let addr = self.linearize_lvalue(a);
+        let val = if self.passed_by_reference(arg_type, conv) {
+            let vol = self.block_volatility(arg_type, self.expr_type(a));
+            self.argument_copy(addr, arg_type, true, vol)
+        } else {
+            addr
+        };
+        (val, passed)
+    }
+
+    /// A scalar argument, converted to its parameter's type `param` when
+    /// there is one, and given the default argument promotions where no
+    /// prototype covers it.
+    fn lower_scalar_arg(
+        &mut self,
+        a: &Expr,
+        arg_idx: usize,
+        mut arg_type: TypeId,
+        param: Option<TypeId>,
+        sig: &CalleeSignature,
+    ) -> (PseudoId, TypeId) {
+        let mut val = self.linearize_expr(a);
+
+        // Implicit argument conversion when actual type differs from
+        // formal parameter type. Covers:
+        // - Integer widening: int→long (sign/zero extend)
+        // - FP widening/narrowing: float↔double↔long double
+        // - Int→FP: uint32_t→double (e.g., log10(uint32_t_val))
+        // - FP→Int: rare but legal
+        if let Some(param_type) = param {
+            let arg_size = self.types.size_bits(arg_type);
+            let param_size = self.types.size_bits(param_type);
+            let arg_is_int = self.types.is_integer(arg_type);
+            let param_is_int = self.types.is_integer(param_type);
+            let arg_is_fp = self.types.is_float(arg_type);
+            let param_is_fp = self.types.is_float(param_type);
+
+            let needs_convert =
+                // Integer widening (int→long, long→__int128, ...),
+                // decided by the two sizes alone: nothing about it
+                // stops at 64 bits.
+                (arg_is_int && param_is_int && arg_size < param_size)
+                // Integer narrowing (long→int, int→char, ...).
+                // The callee reads only the parameter's own bytes,
+                // but the ABI places the argument by the
+                // *parameter's* type: Apple arm64 stacks a `char`
+                // in one byte, so `f(..., 'a')` recorded as `int`
+                // took four and moved every later argument.
+                || (arg_is_int && param_is_int && arg_size > param_size)
+                // FP size mismatch (float→double, long double→double, etc.)
+                || (arg_is_fp && param_is_fp && arg_size != param_size)
+                // Integer to FP (uint32_t→double, int→float, etc.)
+                || (arg_is_int && param_is_fp)
+                // FP to integer (rare but legal)
+                || (arg_is_fp && param_is_int)
+                // To `_Bool`, whose conversion is `!= 0` and not
+                // a truncation (C17 6.3.1.2): `f(42)` with a
+                // `_Bool` parameter must pass 1.
+                || self.types.kind(param_type) == TypeKind::Bool;
+
+            if needs_convert {
+                val = self.emit_convert(val, arg_type, param_type);
+                arg_type = param_type;
+            }
+        }
+
+        // C99 6.5.2.2p7: default argument promotions for variadic args,
+        // and 6.5.2.2p6 for every argument of an unprototyped call.
+        //
+        // Both halves have to happen here. The formal-parameter
+        // conversion above only runs for an argument a parameter covers,
+        // and a variadic argument is by definition past them, so it never
+        // runs for these. The cast itself emits no IR either, because
+        // emit_convert short-circuits same-size integer conversions --
+        // without an explicit promotion the pseudo still holds the
+        // sign-extended load, and `printf("%02x", (unsigned char)c)`
+        // prints ffffff80 for a negative `signed char`.
+        if sig.unprototyped || sig.variadic_arg_start.is_some_and(|v| arg_idx >= v) {
+            let promoted = self.types.default_argument_promote(arg_type);
+            if promoted != arg_type {
+                val = self.emit_convert(val, arg_type, promoted);
+                arg_type = promoted;
+            }
+        }
+
+        (val, arg_type)
+    }
+
+    /// Emit the call instruction itself, and the `Unreachable` after a call
+    /// that does not return. `result` receives the value of type and width
+    /// `ret`.
+    fn build_call(
+        &mut self,
+        target: CallTarget,
+        args: CallArgs,
+        result: PseudoId,
+        ret: (TypeId, u32),
+        facts: CallFacts,
+    ) {
+        let (ret_typ, ret_size) = ret;
+        let mut call_insn = match target {
+            CallTarget::Indirect(func_addr) => Instruction::call_indirect(
+                Some(result),
+                func_addr,
+                args.vals,
+                args.types,
+                ret_typ,
+                ret_size,
+            ),
+            CallTarget::Direct(func_name) => Instruction::call(
+                Some(result),
+                &func_name,
+                args.vals,
+                args.types,
+                ret_typ,
+                ret_size,
+            ),
+        };
+        let extra = call_insn.extra_mut();
+        extra.variadic_arg_start = facts.variadic_arg_start;
+        extra.ends_with_va_arg_pack = facts.ends_with_va_arg_pack;
+        extra.is_noreturn_call = facts.is_noreturn;
+        extra.callee_binding = facts.binding;
+        extra.known = facts.known;
+        extra.abi_info = Some(facts.abi_info);
+        self.emit(call_insn);
+        if facts.is_noreturn {
+            self.emit_no_return(
+                Instruction::new(Opcode::Unreachable).with_type(self.types.void_id),
+            );
         }
     }
 
@@ -6775,6 +6793,9 @@ pub fn linearize(
 #[cfg(test)]
 #[path = "test_linearize.rs"]
 pub(crate) mod test_linearize;
+#[cfg(test)]
+#[path = "test_linearize_call.rs"]
+mod test_linearize_call;
 #[cfg(test)]
 #[path = "test_linearize_win64.rs"]
 mod test_linearize_win64;

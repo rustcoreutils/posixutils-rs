@@ -204,6 +204,28 @@ pub enum ArgClass {
     Ignore,
 }
 
+impl ArgClass {
+    /// Whether an aggregate of this class travels in registers that the
+    /// backend fills from, or spills to, the aggregate's memory: any all-SSE
+    /// classification (two eightbytes, or one of sixteen), an HFA, or two
+    /// eightbytes of any classes -- AAPCS64 C.10 and System V AMD64 3.2.3
+    /// agree on the pair.
+    ///
+    /// The one statement both ends of a call read: the caller keeps such an
+    /// argument's aggregate type, and the callee stores the registers into
+    /// its parameter's local.
+    pub fn is_register_aggregate(&self) -> bool {
+        match self {
+            ArgClass::Direct { classes, .. } => {
+                classes.len() == 2
+                    || (!classes.is_empty() && classes.iter().all(|c| *c == RegClass::Sse))
+            }
+            ArgClass::Hfa { .. } => true,
+            _ => false,
+        }
+    }
+}
+
 // Calling Convention
 
 /// The calling convention of a function type.
@@ -232,15 +254,9 @@ impl CallingConv {
     /// type -- an implicit declaration, a diagnosed expression -- is called
     /// with the target's own.
     pub fn of_callee(callee: TypeId, types: &TypeTable) -> CallingConv {
-        let func = match types.kind(callee) {
-            TypeKind::Pointer => types.base_type(callee).unwrap_or(callee),
-            _ => callee,
-        };
-        if types.kind(func) == TypeKind::Function {
-            types.get(func).conv
-        } else {
-            CallingConv::C
-        }
+        types
+            .callee_function_type(callee)
+            .map_or(CallingConv::C, |func| types.get(func).conv)
     }
 }
 
@@ -527,5 +543,32 @@ mod tests {
         // AArch64 macOS also gets AAPCS64
         let darwin_target = Target::new(Arch::Aarch64, Os::MacOS);
         let _darwin_abi = get_abi(&darwin_target);
+    }
+
+    /// The register aggregates: all-SSE, any two eightbytes, an HFA.
+    #[test]
+    fn test_is_register_aggregate() {
+        use RegClass::*;
+        let direct = |classes: Vec<RegClass>| ArgClass::Direct {
+            classes,
+            size_bits: 128,
+        };
+        assert!(direct(vec![Sse]).is_register_aggregate());
+        assert!(direct(vec![Sse, Sse]).is_register_aggregate());
+        assert!(direct(vec![Integer, Integer]).is_register_aggregate());
+        assert!(direct(vec![Integer, Sse]).is_register_aggregate());
+        assert!(ArgClass::Hfa {
+            base: HfaBase::Float32,
+            count: 1
+        }
+        .is_register_aggregate());
+        assert!(!direct(vec![]).is_register_aggregate());
+        assert!(!direct(vec![Integer]).is_register_aggregate());
+        assert!(!ArgClass::Indirect {
+            align: 8,
+            size_bytes: 16
+        }
+        .is_register_aggregate());
+        assert!(!ArgClass::Ignore.is_register_aggregate());
     }
 }

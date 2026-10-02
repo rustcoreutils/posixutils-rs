@@ -2113,6 +2113,18 @@ impl TypeTable {
         }
     }
 
+    /// The function type a call through a callee of type `typ` calls: `typ`
+    /// itself, or the pointed-to type for a call through a pointer (C17
+    /// 6.5.2.2p1 allows either). `None` when that is not a function type --
+    /// an implicit declaration, a diagnosed expression.
+    pub fn callee_function_type(&self, typ: TypeId) -> Option<TypeId> {
+        let func = match self.kind(typ) {
+            TypeKind::Pointer => self.base_type(typ).unwrap_or(typ),
+            _ => typ,
+        };
+        (self.kind(func) == TypeKind::Function).then_some(func)
+    }
+
     /// What an array or a function decays to a pointer *to*: the element
     /// type, or the function type itself. `None` for a type that does not
     /// decay. The one statement of C17 6.3.2.1p3-4 that the decays above
@@ -5030,6 +5042,21 @@ mod tests {
         }
         let long_none = t.intern(Type::function_no_prototype(t.long_id, false));
         assert!(!t.types_compatible(long_none, void_args));
+    }
+
+    /// A call's function type is the callee's own, or the one a pointer
+    /// callee points to; anything else names none.
+    #[test]
+    fn callee_function_type_looks_through_one_pointer() {
+        let mut t = TypeTable::new(&Target::host());
+        let f = t.intern(Type::function(t.int_id, vec![], false, false));
+        let pf = t.intern(Type::pointer(f));
+        let ppf = t.intern(Type::pointer(pf));
+        assert_eq!(t.callee_function_type(f), Some(f));
+        assert_eq!(t.callee_function_type(pf), Some(f));
+        assert_eq!(t.callee_function_type(ppf), None);
+        assert_eq!(t.callee_function_type(t.int_id), None);
+        assert_eq!(t.callee_function_type(t.void_ptr_id), None);
     }
 
     /// The composite type takes the known array extent and the prototype,

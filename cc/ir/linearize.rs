@@ -3244,7 +3244,10 @@ impl<'a> Linearizer<'a> {
         if let Some(stride) = self.vm_index_stride(ptr_expr) {
             return stride;
         }
-        let elem_type = self.types.base_type(ptr_typ).unwrap_or(self.types.char_id);
+        let elem_type = self
+            .types
+            .arithmetic_pointee(ptr_typ)
+            .unwrap_or(self.types.char_id);
         let elem_size = self.types.size_bytes(elem_type);
         self.emit_const(elem_size as i128, self.types.long_id)
     }
@@ -4455,11 +4458,10 @@ impl<'a> Linearizer<'a> {
         let right_typ = self.expr_type(right);
         let result_typ = self.expr_type(expr);
 
-        // Check for pointer arithmetic: ptr +/- int or int + ptr
-        let left_kind = self.types.kind(left_typ);
-        let right_kind = self.types.kind(right_typ);
-        let left_is_ptr_or_arr = left_kind == TypeKind::Pointer || left_kind == TypeKind::Array;
-        let right_is_ptr_or_arr = right_kind == TypeKind::Pointer || right_kind == TypeKind::Array;
+        // Check for pointer arithmetic: ptr +/- int or int + ptr. An array or
+        // a function designator is a pointer here, as it decays to one.
+        let left_is_ptr_or_arr = self.types.arithmetic_pointee(left_typ).is_some();
+        let right_is_ptr_or_arr = self.types.arithmetic_pointee(right_typ).is_some();
         let is_ptr_arith = (op == BinaryOp::Add || op == BinaryOp::Sub)
             && ((left_is_ptr_or_arr && self.types.is_integer(right_typ))
                 || (self.types.is_integer(left_typ) && right_is_ptr_or_arr));

@@ -304,6 +304,18 @@ impl Parser<'_> {
         // legal C. But exactly one side may be the pointer -- `p[q]` with two
         // pointers has nothing to scale by.
         if (points(b) && integral(i)) || (points(i) && integral(b)) {
+            // 6.5.2.1p1 wants a pointer to a complete object type. gcc's
+            // arithmetic on a pointer to a function stops short of indexing
+            // one, and so does c17.
+            let pointer = if points(b) { b } else { i };
+            let to_function = self.types.kind(pointer) == TypeKind::Pointer
+                && self
+                    .types
+                    .base_type(pointer)
+                    .is_some_and(|t| self.types.kind(t) == TypeKind::Function);
+            if to_function {
+                diag::error(pos, &gettext("subscripted value is pointer to function"));
+            }
             return;
         }
         if points(b) || points(i) {

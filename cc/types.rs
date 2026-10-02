@@ -2099,6 +2099,20 @@ impl TypeTable {
         self.decay_pointee(typ).is_some()
     }
 
+    /// What one step of pointer arithmetic on a value of type `typ` spans
+    /// (C17 6.5.6p8-9): the type a pointer references, or the one an array or
+    /// a function decays to a pointer to. `None` for a type that is not a
+    /// pointer once decayed.
+    ///
+    /// Not [`Self::base_type`], which answers a function type's *return*
+    /// type: `f + 1` stepped by `sizeof(int)` in a static initializer.
+    pub fn arithmetic_pointee(&self, typ: TypeId) -> Option<TypeId> {
+        match self.kind(typ) {
+            TypeKind::Pointer => self.base_type(typ),
+            _ => self.decay_pointee(typ),
+        }
+    }
+
     /// What an array or a function decays to a pointer *to*: the element
     /// type, or the function type itself. `None` for a type that does not
     /// decay. The one statement of C17 6.3.2.1p3-4 that the decays above
@@ -2679,6 +2693,12 @@ impl TypeTable {
                 typ.composite.as_ref().map(|c| c.size).unwrap_or(0)
             }
             TypeKind::Enum => typ.composite.as_ref().map(|c| c.size).unwrap_or(4),
+            // GCC extension: a function type is 1 byte, as `void` is, so
+            // `sizeof(f)` is 1 and a pointer to a function steps by one byte
+            // -- `fp + 1`, `fp++`, and `fp - fq` dividing by this size. It is
+            // an object size only: a function has no value width, and
+            // `size_bits` still answers 0 for it.
+            TypeKind::Function => 1,
             TypeKind::Array => {
                 let elem = typ.base.map(|b| self.size_bytes(b)).unwrap_or(0);
                 let count = typ.array_size.unwrap_or(0);
@@ -4057,6 +4077,30 @@ mod tests {
         assert!(!types.decays(types.long_id));
         assert_eq!(types.decayed_value(types.long_id), types.long_id);
         assert!(!types.decays(int_ptr));
+    }
+
+    /// gcc's `sizeof` of a function type is 1, as `void`'s is, and it is
+    /// what arithmetic on a pointer to one steps by; the type still has no
+    /// value width. `arithmetic_pointee` answers the function itself for a
+    /// function and a pointer to one, where `base_type` answers its return
+    /// type.
+    #[test]
+    fn test_function_type_steps_by_one_byte() {
+        let mut types = TypeTable::new(&Target::host());
+        let func = types.intern(Type::function(types.long_id, vec![], false, false));
+        let fn_ptr = types.decayed(func);
+        let arr = types.intern(Type::array(types.int_id, 10));
+        assert_eq!(types.size_bytes(func), 1);
+        assert_eq!(types.size_bits(func), 0);
+        assert_eq!(types.arithmetic_pointee(func), Some(func));
+        assert_eq!(types.arithmetic_pointee(fn_ptr), Some(func));
+        assert_eq!(types.base_type(func), Some(types.long_id));
+        assert_eq!(types.arithmetic_pointee(arr), Some(types.int_id));
+        assert_eq!(
+            types.arithmetic_pointee(types.void_ptr_id),
+            Some(types.void_id)
+        );
+        assert_eq!(types.arithmetic_pointee(types.long_id), None);
     }
 
     #[test]

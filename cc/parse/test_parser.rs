@@ -9240,6 +9240,43 @@ fn test_at_attribute_declaration_lookahead() {
     }
 }
 
+/// A function designator decays before the additive operators type it, as an
+/// array does: `f - g` is a `ptrdiff_t` and `f + 1` a pointer to `f`'s type,
+/// the same as the operators give a function pointer.
+#[test]
+fn test_additive_operators_decay_a_function_designator() {
+    let decls = "int f(int); int g(int); int (*fp)(int);";
+    for stmt in ["f - g", "fp - f", "f - fp", "fp - fp"] {
+        with_statement_expr(decls, stmt, |p, e| {
+            assert_eq!(e.typ, Some(p.types.long_id), "{stmt}: result type");
+        });
+    }
+    for stmt in ["f + 1", "1 + f", "f - 1", "fp + 1"] {
+        with_statement_expr(decls, stmt, |p, e| {
+            let t = e.typ.expect("typed");
+            assert_eq!(p.types.kind(t), TypeKind::Pointer, "{stmt}");
+            let pointee = p.types.base_type(t).unwrap();
+            assert_eq!(p.types.kind(pointee), TypeKind::Function, "{stmt}");
+        });
+    }
+}
+
+/// Indexing wants a pointer to a complete object type (C17 6.5.2.1p1), so a
+/// pointer to a function is refused on either side of the brackets, though
+/// gcc's arithmetic on one is accepted.
+#[test]
+fn test_subscripting_a_function_pointer_is_rejected() {
+    let decls = "int f(int); int (*fp)(int);";
+    for stmt in ["fp[0]", "0[fp]", "(&f)[1]"] {
+        let before = crate::diag::error_count();
+        with_statement_expr(decls, stmt, |_, _| {
+            // The count is process-wide and only grows, so a concurrent test
+            // can add to it but never hide this one's error.
+            assert!(crate::diag::error_count() > before, "{stmt}: accepted");
+        });
+    }
+}
+
 /// `__builtin_assume_aligned` is a call through gcc's prototype
 /// `void *(const void *, size_t, ...)`: its result is a `void *` -- whatever
 /// the pointer's pointee and qualifiers -- and every argument that is more

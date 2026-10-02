@@ -552,7 +552,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         // Get the pointee size for pointer arithmetic scaling
                         let pointee_size = ptr_expr
                             .typ
-                            .and_then(|t| self.types.base_type(t))
+                            .and_then(|t| self.types.arithmetic_pointee(t))
                             .map(|t| self.types.size_bytes(t) as i64)
                             .unwrap_or(1);
                         let byte_offset = if is_sub {
@@ -695,7 +695,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         // `(void *)&v.p[0] - (void *)&v` unfoldable.
         let elem = left
             .typ
-            .and_then(|t| self.types.base_type(t))
+            .and_then(|t| self.types.arithmetic_pointee(t))
             .map(|t| self.types.size_bytes(t) as i64)
             .unwrap_or(1)
             .max(1);

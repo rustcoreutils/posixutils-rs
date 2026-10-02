@@ -1879,41 +1879,21 @@ impl<'a> Parser<'a> {
             | BinaryOp::LogAnd
             | BinaryOp::LogOr => self.types.int_id,
 
-            // Arithmetic operators use usual arithmetic conversions
-            // But Add/Sub with pointers/arrays need special handling
+            // The additive operators take their pointer forms on the decayed
+            // operands (6.3.2.1p3-4): an array is a pointer to its element and
+            // a function a pointer to itself, so `f - g` is a `ptrdiff_t` and
+            // `f + 1` a pointer, as `fp - gp` and `fp + 1` are.
             BinaryOp::Add | BinaryOp::Sub => {
-                let left_kind = self.types.kind(left_type);
-                let right_kind = self.types.kind(right_type);
-                let left_is_ptr_or_arr =
-                    left_kind == TypeKind::Pointer || left_kind == TypeKind::Array;
-                let right_is_ptr_or_arr =
-                    right_kind == TypeKind::Pointer || right_kind == TypeKind::Array;
+                let left_type = self.types.decayed(left_type);
+                let right_type = self.types.decayed(right_type);
+                let left_is_ptr = self.types.kind(left_type) == TypeKind::Pointer;
+                let right_is_ptr = self.types.kind(right_type) == TypeKind::Pointer;
 
-                if left_is_ptr_or_arr && self.types.is_integer(right_type) {
-                    // ptr + int or arr + int -> pointer to element type
-                    if left_kind == TypeKind::Array {
-                        // Array decays to pointer
-                        let elem_type =
-                            self.types.base_type(left_type).unwrap_or(self.types.int_id);
-                        self.types.intern(Type::pointer(elem_type))
-                    } else {
-                        left_type
-                    }
-                } else if self.types.is_integer(left_type)
-                    && right_is_ptr_or_arr
-                    && op == BinaryOp::Add
-                {
-                    // int + ptr or int + arr -> pointer to element type
-                    if right_kind == TypeKind::Array {
-                        let elem_type = self
-                            .types
-                            .base_type(right_type)
-                            .unwrap_or(self.types.int_id);
-                        self.types.intern(Type::pointer(elem_type))
-                    } else {
-                        right_type
-                    }
-                } else if left_is_ptr_or_arr && right_is_ptr_or_arr && op == BinaryOp::Sub {
+                if left_is_ptr && self.types.is_integer(right_type) {
+                    left_type
+                } else if self.types.is_integer(left_type) && right_is_ptr && op == BinaryOp::Add {
+                    right_type
+                } else if left_is_ptr && right_is_ptr && op == BinaryOp::Sub {
                     // ptr - ptr -> ptrdiff_t (long)
                     self.types.long_id
                 } else {

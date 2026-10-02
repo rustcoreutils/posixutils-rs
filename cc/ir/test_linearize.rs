@@ -1561,6 +1561,41 @@ fn test_pointer_difference() {
     );
 }
 
+/// Arithmetic on a function pointer steps by gcc's `sizeof` of a function
+/// type, 1: the difference divides by 1 and the addend is scaled by 1. A
+/// function designator is a pointer operand too, once it decays. The
+/// difference used to divide by the function type's size of 0.
+#[test]
+fn test_function_pointer_arithmetic_steps_by_one() {
+    let src = "int f(int);\n\
+        long d(int (*a)(void), int (*b)(void)) { return a - b; }\n\
+        long e(void) { return f - f; }\n\
+        int (*s(int (*p)(void), long n))(void) { return p + n; }\n\
+        int (*t(long n))(int) { return n + f; }\n";
+    let module = linearize_source(src, &Target::host());
+    for (name, op) in [
+        ("d", Opcode::DivS),
+        ("e", Opcode::DivS),
+        ("s", Opcode::Mul),
+        ("t", Opcode::Mul),
+    ] {
+        let func = module.functions.iter().find(|f| f.name == name).unwrap();
+        let insn = func
+            .blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .find(|i| i.op == op)
+            .unwrap_or_else(|| panic!("{name}: no {op:?}"));
+        assert!(
+            matches!(
+                func.get_pseudo(insn.src[1]).map(|p| &p.kind),
+                Some(crate::ir::PseudoKind::Val(1))
+            ),
+            "{name}: the step is not 1"
+        );
+    }
+}
+
 // Floating-point operation tests
 
 #[test]

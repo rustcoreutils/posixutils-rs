@@ -65,14 +65,6 @@ enum JumpKind {
 
 /// A `for` loop whose body is being lowered: what
 /// [`Linearizer::open_for`] set up and [`Linearizer::close_for`] finishes.
-///
-/// `for` is lowered from two places -- the ordinary statement walk and the
-/// switch-body walk, which must keep lowering the body through itself so the
-/// `case` labels inside stay reachable -- and the two differ *only* in how
-/// they lower the body. Everything else lives here, so a fix lands once
-/// instead of twice: the loop's back edge had to be repaired in both copies,
-/// and the release of a VLA declared in the init clause was missing from
-/// both.
 #[must_use = "an opened `for` loop must be finished with close_for"]
 struct OpenFor {
     /// The scope the init clause declares into, ended after `exit_bb`.
@@ -331,17 +323,15 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             Stmt::Labeled { labels, stmt } => {
-                // A `case` or `default` label is placed by `linearize_switch`;
-                // reaching one here means it is outside a switch, which
-                // `check_jumps_into_protected_scopes` has already diagnosed.
-                // The statement it labels is still ordinary code and is
-                // lowered, so the rest of the function is not lost behind one
-                // bad label.
                 for label in labels {
-                    if let Label::Named { name, .. } = label {
-                        self.place_label(*name);
+                    match label {
+                        Label::Case(expr, high) => self.enter_case_label(expr, high.as_ref()),
+                        Label::Default(_) => self.enter_default_label(),
+                        Label::Named { name, .. } => self.place_label(*name),
                     }
                 }
+                // Then the statement the labels prefix, which is where their
+                // code actually is.
                 self.linearize_stmt(stmt);
             }
 
@@ -1627,8 +1617,8 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Collect case labels and create basic blocks for each. C17 6.8.4.2p5
         // converts every label to `cmp_type`, and `conv` is that conversion:
-        // the collector applies it, and the body walk below reaches the labels
-        // back through the same value, so the two cannot drift apart.
+        // the collector applies it, and the body's lowering below reaches the
+        // labels back through the same value, so the two cannot drift apart.
         let conv = CaseConv::of(self.types, cmp_type);
         let (case_values, has_default) = self.collect_switch_cases(body, conv);
         let case_bbs: Vec<BasicBlockId> = case_values
@@ -1716,11 +1706,17 @@ impl<'a> super::linearize::Linearizer<'a> {
         // block via `switch_bb`.
         self.current_bb = None;
 
-        // Linearize body with case block switching. The index carries the
-        // collector's own conversion, so the walk finds a label under exactly
-        // the key the collector filed it under.
-        let case_index = CaseIndex::of(&case_values);
-        self.linearize_switch_body(body, &case_index, &case_bbs, default_bb);
+        // The body is ordinary code; its `case` and `default` labels find
+        // their blocks through the context pushed here, wherever they sit in
+        // it. The index carries the collector's own conversion, so a label is
+        // found under exactly the key the collector filed it under.
+        self.switch_stack.push(SwitchCtx {
+            index: CaseIndex::of(&case_values),
+            case_bbs,
+            default_bb,
+        });
+        self.linearize_stmt(body);
+        self.switch_stack.pop();
 
         // If not terminated after body, jump to exit
         if !self.is_terminated() {
@@ -1743,22 +1739,11 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// one. `switch (x) while (n < 3) { case 1: n++; }` is legal, and matching
     /// only `Stmt::Block` here collected no cases from it -- so the switch was
     /// emitted with an empty table and every value took the default edge.
-    /// A non-compound body is one statement, so it is walked as one.
+    /// The body is walked as any statement is, compound or not.
     pub(crate) fn collect_switch_cases(&self, body: &Stmt, conv: CaseConv) -> (CaseSet, bool) {
         let mut case_values = CaseSet::new(conv);
         let mut has_default = false;
-
-        match body {
-            Stmt::Block(items) => {
-                for item in items {
-                    if let BlockItem::Statement(stmt) = item {
-                        self.collect_cases_from_stmt(stmt, &mut case_values, &mut has_default);
-                    }
-                }
-            }
-            stmt => self.collect_cases_from_stmt(stmt, &mut case_values, &mut has_default),
-        }
-
+        self.collect_cases_from_stmt(body, &mut case_values, &mut has_default);
         (case_values, has_default)
     }
 
@@ -2128,6 +2113,9 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
             // Stop at inner switch — its case labels belong to it
             Stmt::Switch { .. } => {}
+            // The rest hold statements only inside statement expressions,
+            // which no switch jump may enter; their lowering hides the
+            // enclosing switches as well.
             _ => {}
         }
     }
@@ -2546,7 +2534,6 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// Linearize switch body, switching basic blocks at case/default labels
     /// Lower a `switch` whose controlling expression is wider than a general
     /// register into explicit comparisons.
     ///
@@ -2604,62 +2591,17 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.link_to_merge_if_needed(default_target);
     }
 
-    pub(crate) fn linearize_switch_body(
-        &mut self,
-        body: &Stmt,
-        case_values: &CaseIndex,
-        case_bbs: &[BasicBlockId],
-        default_bb: Option<BasicBlockId>,
-    ) {
-        let mut case_idx = 0;
-
-        // A non-compound body is one statement; lowering it through the same
-        // walker is what keeps the labels inside it reachable. See
-        // `collect_switch_cases`, which has to agree about this.
-        match body {
-            Stmt::Block(items) => {
-                // The same scope as the ordinary block arm: a switch body is
-                // lowered by its own walk, and leaving the rule out here let
-                // `switch (c) { case 0: { int v[n]; break; } }` inside a loop
-                // grow the stack without bound, and let the body's
-                // declarations outlive the switch.
-                let scope = self.push_scope();
-                for item in items {
-                    match item {
-                        BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
-                        BlockItem::Statement(stmt) => {
-                            self.linearize_switch_stmt(
-                                stmt,
-                                case_values,
-                                case_bbs,
-                                default_bb,
-                                &mut case_idx,
-                            );
-                        }
-                    }
-                }
-                self.pop_scope(scope);
-            }
-            stmt => {
-                self.linearize_switch_stmt(stmt, case_values, case_bbs, default_bb, &mut case_idx)
-            }
-        }
-    }
-
-    /// Start the block of the `case` label `expr` (or `expr ... high`).
+    /// Start the block of the `case` label `expr` (or `expr ... high`), in
+    /// the innermost `switch` being lowered.
     ///
     /// The endpoints are the label's raw constants; `CaseIndex::lookup`
     /// converts them to the promoted controlling type with the very
     /// conversion the collector used, which is what keeps this lookup from
-    /// missing and dropping the case body into the wrong block.
-    fn enter_case_label(
-        &mut self,
-        expr: &Expr,
-        high: Option<&Expr>,
-        case_values: &CaseIndex,
-        case_bbs: &[BasicBlockId],
-        case_idx: &mut usize,
-    ) {
+    /// missing and dropping the case body into the wrong block. With no
+    /// `switch` open the label is stray, which
+    /// `check_jumps_into_protected_scopes` reports; the statement it labels
+    /// is still lowered, so the rest of the function is not lost behind it.
+    fn enter_case_label(&mut self, expr: &Expr, high: Option<&Expr>) {
         let Some(lo) = self.eval_const_expr(expr) else {
             return;
         };
@@ -2667,11 +2609,21 @@ impl<'a> super::linearize::Linearizer<'a> {
             None => Some(lo),
             Some(hi_expr) => self.eval_const_expr(hi_expr),
         };
-        let Some(idx) = hi.and_then(|hi| case_values.lookup(lo, hi)) else {
+        let Some(ctx) = self.switch_stack.last() else {
             return;
         };
-        self.fall_into_case_block(case_bbs[idx]);
-        *case_idx = idx + 1;
+        let Some(idx) = hi.and_then(|hi| ctx.index.lookup(lo, hi)) else {
+            return;
+        };
+        self.fall_into_case_block(ctx.case_bbs[idx]);
+    }
+
+    /// Start the block of a `default` label, in the innermost `switch` being
+    /// lowered. As for `case`, a stray one has been reported already.
+    fn enter_default_label(&mut self) {
+        if let Some(bb) = self.switch_stack.last().and_then(|ctx| ctx.default_bb) {
+            self.fall_into_case_block(bb);
+        }
     }
 
     /// Make `bb`, a `case` or `default` label's block, current, falling
@@ -2685,180 +2637,6 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
         }
         self.switch_bb(bb);
-    }
-
-    pub(crate) fn linearize_switch_stmt(
-        &mut self,
-        stmt: &Stmt,
-        case_values: &CaseIndex,
-        case_bbs: &[BasicBlockId],
-        default_bb: Option<BasicBlockId>,
-        case_idx: &mut usize,
-    ) {
-        match stmt {
-            Stmt::Labeled { labels, stmt } => {
-                for label in labels {
-                    match label {
-                        Label::Case(expr, high) => self.enter_case_label(
-                            expr,
-                            high.as_ref(),
-                            case_values,
-                            case_bbs,
-                            case_idx,
-                        ),
-                        Label::Default(_) => {
-                            if let Some(def_bb) = default_bb {
-                                self.fall_into_case_block(def_bb);
-                            }
-                        }
-                        Label::Named { name, .. } => self.place_label(*name),
-                    }
-                }
-                // Then the statement the labels prefix, which is where their
-                // code actually is.
-                self.linearize_switch_stmt(stmt, case_values, case_bbs, default_bb, case_idx);
-            }
-
-            // Duff's device: case labels can appear inside loops/blocks
-            // within a switch body. Propagate switch context through them.
-            Stmt::DoWhile { body, cond } => {
-                let body_bb = self.alloc_bb();
-                let cond_bb = self.alloc_bb();
-                let exit_bb = self.alloc_bb();
-
-                if let Some(current) = self.current_bb {
-                    if !self.is_terminated() {
-                        self.emit(Instruction::br(body_bb));
-                        self.link_bb(current, body_bb);
-                    }
-                }
-
-                self.break_targets.push(exit_bb);
-                self.continue_targets.push(cond_bb);
-
-                self.switch_bb(body_bb);
-                self.linearize_switch_stmt(body, case_values, case_bbs, default_bb, case_idx);
-                if !self.is_terminated() {
-                    if let Some(current) = self.current_bb {
-                        self.emit(Instruction::br(cond_bb));
-                        self.link_bb(current, cond_bb);
-                    }
-                }
-
-                self.break_targets.pop();
-                self.continue_targets.pop();
-
-                self.switch_bb(cond_bb);
-                self.branch_on_condition(cond, body_bb, exit_bb);
-
-                self.switch_bb(exit_bb);
-            }
-
-            Stmt::While { cond, body } => {
-                let cond_bb = self.alloc_bb();
-                let body_bb = self.alloc_bb();
-                let exit_bb = self.alloc_bb();
-
-                if let Some(current) = self.current_bb {
-                    if !self.is_terminated() {
-                        self.emit(Instruction::br(cond_bb));
-                        self.link_bb(current, cond_bb);
-                    }
-                }
-
-                self.switch_bb(cond_bb);
-                self.branch_on_condition(cond, body_bb, exit_bb);
-
-                self.break_targets.push(exit_bb);
-                self.continue_targets.push(cond_bb);
-
-                self.switch_bb(body_bb);
-                self.linearize_switch_stmt(body, case_values, case_bbs, default_bb, case_idx);
-                if !self.is_terminated() {
-                    if let Some(current) = self.current_bb {
-                        self.emit(Instruction::br(cond_bb));
-                        self.link_bb(current, cond_bb);
-                    }
-                }
-
-                self.break_targets.pop();
-                self.continue_targets.pop();
-
-                self.switch_bb(exit_bb);
-            }
-
-            // Everything but the body is the ordinary `for` lowering; only
-            // the body has to go back through this walk, so the `case`
-            // labels inside it stay reachable. See `OpenFor`.
-            Stmt::For {
-                init,
-                cond,
-                post,
-                body,
-            } => {
-                let open = self.open_for(init.as_ref(), cond.as_ref());
-                self.linearize_switch_stmt(body, case_values, case_bbs, default_bb, case_idx);
-                self.close_for(open, post.as_ref());
-            }
-
-            Stmt::Block(items) => {
-                // See the sibling arm in `linearize_switch_body`.
-                let scope = self.push_scope();
-                for item in items {
-                    match item {
-                        BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
-                        BlockItem::Statement(s) => {
-                            self.linearize_switch_stmt(
-                                s,
-                                case_values,
-                                case_bbs,
-                                default_bb,
-                                case_idx,
-                            );
-                        }
-                    }
-                }
-                self.pop_scope(scope);
-            }
-
-            Stmt::If {
-                cond,
-                then_stmt,
-                else_stmt,
-            } => {
-                let then_bb = self.alloc_bb();
-                let merge_bb = self.alloc_bb();
-                let else_bb = if else_stmt.is_some() {
-                    self.alloc_bb()
-                } else {
-                    merge_bb
-                };
-
-                self.branch_on_condition(cond, then_bb, else_bb);
-
-                self.switch_bb(then_bb);
-                self.linearize_switch_stmt(then_stmt, case_values, case_bbs, default_bb, case_idx);
-                self.link_to_merge_if_needed(merge_bb);
-
-                if let Some(else_s) = else_stmt {
-                    self.switch_bb(else_bb);
-                    self.linearize_switch_stmt(else_s, case_values, case_bbs, default_bb, case_idx);
-                    self.link_to_merge_if_needed(merge_bb);
-                }
-
-                self.switch_bb(merge_bb);
-            }
-
-            // Inner switch owns its own cases — delegate to normal linearizer
-            Stmt::Switch { .. } => {
-                self.linearize_stmt(stmt);
-            }
-
-            _ => {
-                // Regular statement - linearize it
-                self.linearize_stmt(stmt);
-            }
-        }
     }
 
     // Inline assembly linearization
@@ -3530,10 +3308,9 @@ impl<'a> super::linearize::Linearizer<'a> {
 
     /// Define label `name` here: fall into its block and continue there.
     ///
-    /// Every labeled statement is placed through this, whichever lowering
-    /// walks it. The switch-body walk had a copy of its own that never
-    /// recorded the label as defined, so `&&lbl` naming a label between the
-    /// case labels of a `switch` was rejected as undefined.
+    /// Every named label is placed through this, which is what records it as
+    /// defined -- `&&lbl` naming a label between the case labels of a
+    /// `switch` included.
     fn place_label(&mut self, name: StringId) {
         let name_str = self.str(name).to_string();
         self.defined_labels.insert(name_str.clone());
@@ -3780,9 +3557,9 @@ impl JumpScopeWalk {
             // switch and a `continue` an enclosing loop. Checked here rather
             // than in the `linearize_stmt` arms, which look like the obvious
             // place -- they fail exactly when the target stack is empty -- but
-            // a switch body is lowered by `linearize_switch_stmt`, which
-            // delegates back for nested constructs, so an arm there cannot
-            // tell "outside every construct" from "reached by delegation".
+            // the lowering pushes a loop's targets only around its body, while
+            // this walk counts enclosing loops and switches by the rule itself
+            // and reports these beside the stray `case` and `default` labels.
             Stmt::Break(pos) => {
                 if self.loop_depth == 0 && self.switch_depth == 0 {
                     self.stray_jumps.push((*pos, "break"));
@@ -4101,6 +3878,21 @@ impl CaseConv {
     pub(crate) fn contains(self, lo: i128, hi: i128, v: i128) -> bool {
         !self.lt(v, lo) && !self.lt(hi, v)
     }
+}
+
+/// A `switch` whose body is being lowered: where each of its labels starts.
+///
+/// [`Linearizer::linearize_switch`] pushes one on `switch_stack` around its
+/// body, and the ordinary `Stmt::Labeled` arm places a `case` or `default`
+/// label against the innermost -- so a label inside a loop, `if` or block in
+/// the body belongs to this switch, and one inside a nested switch to that.
+pub(crate) struct SwitchCtx {
+    /// The labels `collect_switch_cases` found, by range.
+    pub(crate) index: CaseIndex,
+    /// Each label's block, parallel to the collected ranges.
+    pub(crate) case_bbs: Vec<BasicBlockId>,
+    /// The `default` label's block, if there is one.
+    pub(crate) default_bb: Option<BasicBlockId>,
 }
 
 /// Each case range's position among a switch's labels, keyed by the range as

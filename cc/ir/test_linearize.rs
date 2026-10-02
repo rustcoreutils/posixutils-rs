@@ -9291,8 +9291,7 @@ fn cfg_inconsistency(func: &Function) -> Option<String> {
 /// `&&`, `||` and `?:` leave `current_bb` on their merge block, so
 /// `link_bb(post_bb, cond_bb)` recorded an edge out of a block that no longer
 /// holds the terminator -- the loop's back edge went missing from the CFG while
-/// a merge block gained an unrecorded one. Both `for` arms had it: the one in
-/// `linearize_for` and its copy in the switch-body walker.
+/// a merge block gained an unrecorded one.
 ///
 /// Stated on the CFG rather than on the program's answer because the defect
 /// makes the compiled loop non-terminating, which a runtime test cannot
@@ -9372,8 +9371,8 @@ fn cfg_inconsistency_sees_a_misrecorded_edge() {
 
 /// The same audit over every other lowering that can end a block with a
 /// terminator after evaluating an expression: `while`, `do`/`while`, `switch`,
-/// `if`, `?:`, `goto`, `break`/`continue` and the loop lowerings' copies in the
-/// switch-body walker.
+/// `if`, `?:`, `goto`, `break`/`continue`, and the loops inside a `switch`
+/// body.
 ///
 /// Each source puts a short-circuit operator or a `?:` -- the things that split
 /// the block and move `current_bb` to a merge block -- where the construct
@@ -10069,7 +10068,7 @@ fn a_vla_scope_releases_the_stack_on_every_exit() {
             1,
             1,
         ),
-        // The switch-body walker carries a second copy of the `for` lowering.
+        // The same `for`, inside a switch arm.
         (
             "for_init_in_switch",
             "void s(int*); int f(int n,int x){ switch(x){ case 1: \
@@ -10231,9 +10230,9 @@ fn a_loop_body_vla_is_released_on_break_as_well_as_fallthrough() {
     );
 }
 
-/// A `switch` body is lowered by a walk of its own, and its braces are a
-/// declaration scope there too: a VLA declared directly in it is released
-/// when the switch ends, not left for the enclosing loop to accumulate.
+/// A `switch` body's braces are a declaration scope like any other: a VLA
+/// declared directly in it is released when the switch ends, not left for
+/// the enclosing loop to accumulate.
 #[test]
 fn a_switch_body_block_is_a_scope() {
     assert_eq!(
@@ -10244,6 +10243,109 @@ fn a_switch_body_block_is_a_scope() {
         (1, 1),
         "the switch body's block releases what it declared"
     );
+}
+
+/// Where each `switch` in `f` sends each of its labels, named by the first
+/// function the label's block calls: per switch, in block order, the
+/// `(low endpoint, callee)` of every case and then `("default", callee)`.
+fn switch_arms(src: &str) -> Vec<Vec<(String, String)>> {
+    let module = linearize_source(src, &Target::host());
+    let func = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let callee = |bb: BasicBlockId| {
+        func.get_block(bb)
+            .unwrap()
+            .insns
+            .iter()
+            .find(|i| i.op == Opcode::Call)
+            .and_then(|i| i.extra().func_name.clone())
+            .unwrap_or_else(|| panic!("{bb:?} calls nothing"))
+    };
+    func.blocks
+        .iter()
+        .flat_map(|bb| bb.insns.iter())
+        .filter(|i| i.op == Opcode::Switch)
+        .map(|i| {
+            let extra = i.extra();
+            let mut arms: Vec<(String, String)> = extra
+                .switch_cases
+                .iter()
+                .map(|&(lo, _, bb)| (lo.to_string(), callee(bb)))
+                .collect();
+            if let Some(bb) = extra.switch_default {
+                arms.push(("default".to_string(), callee(bb)));
+            }
+            arms
+        })
+        .collect()
+}
+
+/// The `(label, callee)` pairs `pairs` spells.
+fn arms(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|&(l, c)| (l.to_string(), c.to_string()))
+        .collect()
+}
+
+/// A `case` belongs to the innermost enclosing `switch`: the inner switch's
+/// labels shadow the outer's equal ones, and an outer label written after
+/// the inner switch -- in the same block -- goes back to the outer one.
+#[test]
+fn nested_switch_labels_belong_to_the_innermost_switch() {
+    let got = switch_arms(
+        "void o1(void); void o2(void); void od(void); void i1(void); \
+         void i2(void); void id(void); \
+         void f(int x, int y){ switch(x){ case 1: o1(); \
+         { switch(y){ case 1: i1(); break; default: id(); case 2: i2(); } \
+         case 2: o2(); } default: od(); } }",
+    );
+    assert_eq!(
+        got,
+        vec![
+            arms(&[("1", "o1"), ("2", "o2"), ("default", "od")]),
+            arms(&[("1", "i1"), ("2", "i2"), ("default", "id")]),
+        ]
+    );
+}
+
+/// Labels inside a loop, an `if`-`else` and a `for` within the body all belong
+/// to the switch, as in Duff's device.
+#[test]
+fn case_labels_inside_nested_statements_reach_the_switch() {
+    let got = switch_arms(
+        "void c0(void); void c1(void); void c2(void); void c3(void); void d(void); \
+         void f(int x, int y){ switch(x){ case 0: c0(); \
+         while (y--) { case 1: c1(); if (y) { case 2: c2(); } else case 3: c3(); } \
+         for (;;) { default: d(); break; } } }",
+    );
+    assert_eq!(
+        got,
+        vec![arms(&[
+            ("0", "c0"),
+            ("1", "c1"),
+            ("2", "c2"),
+            ("3", "c3"),
+            ("default", "d")
+        ])]
+    );
+}
+
+/// `default` may stand anywhere among the case labels.
+#[test]
+fn default_label_first_middle_or_last() {
+    let decls = "void a(void); void b(void); void d(void); ";
+    for body in [
+        "default: d(); case 1: a(); case 2: b();",
+        "case 1: a(); default: d(); case 2: b();",
+        "case 1: a(); case 2: b(); default: d();",
+    ] {
+        let got = switch_arms(&format!("{decls} void f(int x){{ switch(x){{ {body} }} }}"));
+        assert_eq!(
+            got,
+            vec![arms(&[("1", "a"), ("2", "b"), ("default", "d")])],
+            "{body}"
+        );
+    }
 }
 
 /// A backward `goto` to a label ahead of a VLA declaration leaves that

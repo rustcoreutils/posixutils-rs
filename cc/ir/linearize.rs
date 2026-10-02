@@ -20,6 +20,7 @@ use crate::diag::{get_all_stream_names, Position};
 use crate::float::FloatVal;
 use crate::ir::linearize_atomic::{AtomicLvalue, OrderedAccess};
 use crate::ir::linearize_emit::CompoundAssign;
+use crate::ir::linearize_stmt::SwitchCtx;
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef,
     GnuAtomicOp, InitElement, InlineLibraryFn, MemoryFn, NarrowedLibraryCall, OffsetOfPath,
@@ -623,6 +624,9 @@ pub struct Linearizer<'a> {
     pub(crate) break_targets: Vec<BasicBlockId>,
     /// Continue target stack (for loops)
     pub(crate) continue_targets: Vec<BasicBlockId>,
+    /// The `switch` statements whose bodies are being lowered, innermost
+    /// last. A `case` or `default` label belongs to the innermost one.
+    pub(crate) switch_stack: Vec<SwitchCtx>,
     /// Whether to run SSA conversion after linearization
     pub(crate) run_ssa: bool,
     /// Symbol table for looking up enum constants, etc.
@@ -790,6 +794,7 @@ impl<'a> Linearizer<'a> {
             label_map: HashMap::with_capacity(DEFAULT_LABEL_MAP_CAPACITY),
             break_targets: Vec::with_capacity(DEFAULT_LOOP_DEPTH_CAPACITY),
             continue_targets: Vec::with_capacity(DEFAULT_LOOP_DEPTH_CAPACITY),
+            switch_stack: Vec::new(),
             run_ssa: true, // Enable SSA conversion by default
             symbols,
             types,
@@ -1729,6 +1734,7 @@ impl<'a> Linearizer<'a> {
         self.label_map.clear();
         self.break_targets.clear();
         self.continue_targets.clear();
+        self.switch_stack.clear();
         self.struct_return_ptr = None;
         self.reg_aggregate_return_type = None;
         self.current_func_name = self.emitted_name(func.name);
@@ -6702,6 +6708,14 @@ impl<'a> Linearizer<'a> {
                 // scope, `for (...) (void)({ int a[n]; ... });` allocated
                 // every time round and released nothing.
                 let scope = self.push_scope();
+                // A `case` or `default` label in here cannot belong to a
+                // `switch` outside: entering a statement expression by a
+                // switch jump is an error, already reported by
+                // `check_jumps_into_protected_scopes`, and the label was never
+                // collected for that switch. Hiding the enclosing switches
+                // keeps the lowering from placing it there anyway; a switch
+                // wholly inside the statement expression still pushes its own.
+                let enclosing_switches = std::mem::take(&mut self.switch_stack);
                 // Linearize all the statements first
                 for item in stmts {
                     match item {
@@ -6712,6 +6726,7 @@ impl<'a> Linearizer<'a> {
                 // The result is the value of the final expression, computed
                 // before the scope ends: it may read the VLA being released.
                 let value = self.linearize_expr(result);
+                self.switch_stack = enclosing_switches;
                 self.pop_scope(scope);
                 value
             }

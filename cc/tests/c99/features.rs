@@ -11,7 +11,7 @@
 // Consolidates: VLA, inline, varargs, array_param_qualifiers tests
 //
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_and_run_everywhere};
 
 // ============================================================================
 // Mega-test: C99 features (VLA, inline, varargs, array params)
@@ -1097,6 +1097,104 @@ int main(void) {
     assert_eq!(compile_and_run("nested_case_labels", code, &[]), 0);
 }
 
+/// Every `case` and `default` label belongs to the innermost enclosing
+/// `switch`, wherever it sits in that switch's body: inside a `do` loop
+/// (Duff's device), in either arm of an `if`, in a `for` body, and after a
+/// nested switch in the same block -- whose own equal labels shadow the outer
+/// ones. `default` stands first, in the middle and last.
+#[test]
+fn c99_labels_belong_to_the_innermost_switch() {
+    let code = r#"
+/* Duff's device: case labels inside a do-while inside the switch. */
+static int duff_sum(const int *a, int count) {
+    int s = 0, n = (count + 3) / 4;
+    if (count == 0) return 0;
+    switch (count % 4) {
+    case 0: do { s += *a++;
+    case 3:      s += *a++;
+    case 2:      s += *a++;
+    case 1:      s += *a++;
+            } while (--n > 0);
+    }
+    return s;
+}
+
+/* Nested switches: the inner switch's labels shadow the outer's equal ones,
+   and an outer label after the inner switch, in the same block, is the
+   outer's again. `default` stands first, in the middle and last. */
+static int nested(int x, int y) {
+    int r = 0;
+    switch (x) {
+    default: r += 1000;
+    case 1:
+        r += 1;
+        {
+            switch (y) {
+            case 1: r += 10; break;
+            default: r += 30;
+            case 2: r += 20; break;
+            }
+    case 2:
+            r += 2;
+        }
+        break;
+    case 3:
+        switch (y) { case 3: r += 300; break; case 1: r += 100; default: r += 400; }
+        break;
+    }
+    return r;
+}
+
+/* Case labels in both arms of an if-else, and in a `for`, inside the switch. */
+static int in_if(int x, int c) {
+    int r = 0, i = 0;
+    switch (x) {
+    case 0:
+        if (c) {
+    case 1:
+            r += 1;
+        } else {
+    case 2:
+            r += 2;
+        }
+        r += 10;
+        break;
+    case 3:
+        for (; i < 2; i++) {
+            r += 100;
+    default:
+            r += 1000;
+        }
+    }
+    return r;
+}
+
+int main(void) {
+    int a[9] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    for (int k = 0; k <= 9; k++) {
+        int want = k * (k + 1) / 2;
+        if (duff_sum(a, k) != want) return 1 + k;
+    }
+    if (nested(1, 1) != 13) return 20;
+    if (nested(1, 2) != 23) return 21;
+    if (nested(1, 7) != 53) return 22;
+    if (nested(2, 1) != 2) return 23;
+    if (nested(3, 3) != 300) return 24;
+    if (nested(3, 1) != 500) return 25;
+    if (nested(3, 9) != 400) return 26;
+    if (nested(9, 1) != 1013) return 27;
+    if (in_if(0, 1) != 11) return 30;
+    if (in_if(0, 0) != 12) return 31;
+    if (in_if(1, 0) != 11) return 32;
+    if (in_if(2, 1) != 12) return 33;
+    if (in_if(3, 0) != 2200) return 34;
+    if (in_if(9, 0) != 2100) return 35;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("labels_innermost_switch", code);
+}
+
 /// A label at the end of a compound statement. C17 requires a statement after
 /// it; gcc and clang accept it without, and C23 made it legal, so c17 accepts
 /// it with a warning rather than failing on the `}`.
@@ -1223,7 +1321,7 @@ static int for_init(int n) {
     return 0;
 }
 
-/* The same shape, lowered by the switch-body walk instead. */
+/* The same shape, inside a switch arm. */
 static int for_init_in_switch(int n, int x) {
     void *first = 0;
     switch (x) {
@@ -1308,10 +1406,9 @@ int main(void) {
     );
 }
 
-/// A block inside a `switch` body is a declaration scope there too: the
-/// switch-body walk has a lowering of its own, and it used to release a VLA
-/// declared in such a block without ever entering the declaration scope, so
-/// the block's ordinary declarations outlived it.
+/// A block inside a `switch` body is a declaration scope there too: its
+/// ordinary declarations do not outlive it, and a VLA declared in it is
+/// released when it ends.
 #[test]
 fn c99_a_switch_body_block_is_a_declaration_scope() {
     let code = r#"

@@ -13,6 +13,7 @@ use super::linearize_emit::Controlling;
 use super::{
     AsmConstraint, AsmData, BasicBlockId, Initializer, Instruction, Opcode, Pseudo, PseudoId,
 };
+use crate::arch::asm_constraints::{AsmAccess, AsmOperandClass};
 use crate::constexpr::ConstScope;
 use crate::diag::{error, Position};
 use crate::float::FloatVal;
@@ -3011,6 +3012,13 @@ impl<'a> super::linearize::Linearizer<'a> {
         None
     }
 
+    /// What an operand's constraint allows on the target being compiled.
+    /// Classified here once and stored on the operand, so liveness, the
+    /// allocator and the backend all read the same answer.
+    fn asm_operand_class(&self, constraint: &str) -> AsmOperandClass {
+        AsmOperandClass::parse(constraint, self.target.arch)
+    }
+
     pub(crate) fn linearize_asm(
         &mut self,
         template: &str,
@@ -3041,8 +3049,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let tied_inputs: Vec<bool> = {
             let mut out_has_tied_input = vec![false; outputs.len()];
             for op in inputs {
-                let (_, _, matching) = self.parse_asm_constraint(&op.constraint);
-                if let Some(idx) = matching {
+                if let Some(idx) = self.asm_operand_class(&op.constraint).tied {
                     if idx < out_has_tied_input.len() {
                         out_has_tied_input[idx] = true;
                     }
@@ -3061,8 +3068,9 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Process output operands
         for (output_idx, op) in outputs.iter().enumerate() {
-            // Parse constraint to get flags
-            let (is_memory, is_readwrite, _matching) = self.parse_asm_constraint(&op.constraint);
+            let class = self.asm_operand_class(&op.constraint);
+            let is_memory = class.is_memory_only();
+            let is_readwrite = class.access == AsmAccess::ReadWrite;
             let place = self.resolve_rmw_place(&op.expr);
 
             // Get symbolic name if present
@@ -3097,6 +3105,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         name: name.clone(),
                         matching_output: Some(ir_outputs.len()),
                         constraint: op.constraint.clone(),
+                        class,
                         size,
                         offset,
                     });
@@ -3107,6 +3116,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     name,
                     matching_output: None,
                     constraint: op.constraint.clone(),
+                    class,
                     size,
                     offset,
                 });
@@ -3166,6 +3176,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     name: name.clone(),
                     matching_output: Some(ir_outputs.len()), // matches the output about to be pushed
                     constraint: op.constraint.clone(),
+                    class,
                     size,
                     offset: 0,
                 });
@@ -3176,6 +3187,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 name,
                 matching_output: None,
                 constraint: op.constraint.clone(),
+                class,
                 size,
                 offset: 0,
             });
@@ -3188,7 +3200,9 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Process input operands
         for op in inputs {
-            let (is_memory, _, matching) = self.parse_asm_constraint(&op.constraint);
+            let class = self.asm_operand_class(&op.constraint);
+            let is_memory = class.is_memory_only();
+            let matching = class.tied;
 
             // Get symbolic name if present
             let name = op.name.map(|n| self.str(n).to_string());
@@ -3246,6 +3260,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 name,
                 matching_output: matching,
                 constraint: op.constraint.clone(),
+                class,
                 size,
                 offset: memory_offset,
             });
@@ -3435,51 +3450,6 @@ impl<'a> super::linearize::Linearizer<'a> {
             types: self.types,
         };
         walk.object(addr).unwrap_or((addr, 0))
-    }
-
-    /// Parse an asm constraint string to extract flags.
-    /// Returns `(is_memory, is_readwrite, matching_output)`.
-    ///
-    /// `is_memory` is true iff the constraint *requires* memory — i.e.,
-    /// every alternative listed is a memory class (`m`, `o`, `V`, `Q`).
-    /// For multi-alt constraints like `"rm"` / `"rmi"` / `"g"` that also
-    /// list a register or immediate class, the linearizer evaluates the
-    /// operand as a value (`linearize_expr`) and lets the codegen
-    /// substitute register vs memory syntax based on the operand's
-    /// actual location. Taking the lvalue (address) for a multi-alt
-    /// like `"rm"` would force every asm substitution to use the
-    /// address bits as if they were the value — broken for the very
-    /// common `"+rm"` increment pattern.
-    ///
-    /// Note: Early clobber (&) is parsed but not used since our simple
-    /// register allocator doesn't share registers between inputs and
-    /// outputs anyway.
-    pub(crate) fn parse_asm_constraint(&self, constraint: &str) -> (bool, bool, Option<usize>) {
-        let mut is_readwrite = false;
-        let mut matching = None;
-
-        for c in constraint.chars() {
-            match c {
-                '+' => is_readwrite = true,
-                '0'..='9' => matching = Some((c as u8 - b'0') as usize),
-                _ => {}
-            }
-        }
-
-        // The memory decision lives on `AsmConstraint::is_memory` so that
-        // liveness analysis, which cannot reach the linearizer, applies the
-        // identical rule. Two copies of these letter sets is exactly how a
-        // memory output came to look write-only to DCE.
-        let probe = AsmConstraint {
-            pseudo: PseudoId(0),
-            name: None,
-            matching_output: None,
-            constraint: constraint.to_string(),
-            size: 0,
-            offset: 0,
-        };
-
-        (probe.is_memory(), is_readwrite, matching)
     }
 
     /// Capture the stack pointer ahead of a VLA's allocation.

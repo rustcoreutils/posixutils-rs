@@ -6,120 +6,248 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// GCC-style inline-asm constraint vocabulary and parser.
+// GCC-style inline-asm constraint letters, classified once per operand.
 //
-// This module sits alongside `cc/arch/regalloc.rs::ConstraintPoint`.
-// The ConstraintPoint mechanism (a per-instruction set of
-// hard-clobbered physical registers plus an "involved pseudos"
-// exemption set) is enough to express opcode-level hardware clobbers
-// like x86_64 idiv → {RAX, RDX} or shifts → {RCX}, plus the
-// inline-asm clobber list and the caller-saved set across libc-call-
-// emitting opcodes.
+// A constraint string is read in exactly one place, `AsmOperandClass::parse`,
+// for the target being compiled, and the result is stored on the operand
+// (`AsmConstraint::class`). The linearizer, liveness, the register allocator
+// and both backends read that classification; none of them reads the letters.
+// Each used to keep its own letter set, and they disagreed: aarch64 `w` was a
+// register class to the backend and an unknown letter to liveness, so `"+wm"`
+// was a register to one and memory to the other; x86 `Q` is a register class
+// and was read as memory; the allocator's parser rejected `"=&d"`.
 //
-// It is *not* enough to express the *per-operand* shape of GCC's
-// inline-asm constraint strings:
-//
-//   * `"a"(x)`  — operand x must be in RAX (Fixed)
-//   * `"=r"(y)` — operand y is a write-only output (Def)
-//   * `"+r"(z)` — operand z is read+modified (UseDef)
-//   * `"0"(w)`  — operand w must share a slot with output #0 (Match)
-//   * `"&=r"(t)` — operand t is an early-clobber output (allocator
-//                  must keep it disjoint from every input)
-//   * `"m"(p)`  — operand p must be a memory operand
+// The letters mean different things on different targets -- `Q` is a
+// register class on x86-64 and base-register memory on aarch64, `S` a
+// register on one and a symbolic constant on the other -- which is why the
+// classifier takes the target.
 
-use crate::ir::PseudoId;
+use crate::ir::{AsmData, PseudoId};
+use crate::target::Arch;
 
-/// What the allocator should do with this operand.
-#[derive(Debug, Clone)]
-pub enum OperandConstraint<R> {
-    /// `"r"` (GP) / `"w"` (V/XMM) — allocator chooses any register
-    /// in the appropriate bank.
-    Any,
-    /// `"a"` / `"b"` / `"c"` / `"d"` / `"S"` / `"D"` on x86_64 —
-    /// must be this exact physical register. Per-arch parsers
-    /// supply the letter→register mapping.
-    Fixed(R),
-    /// `"0"` / `"1"` / ... — the operand shares its physical location
-    /// with the output at that index. Which output is carried by
-    /// `AsmConstraint::matching_output`, the one place it is read.
-    Match,
-    /// `"m"` / `"Q"` — must be a memory operand. The allocator
-    /// places the value in a stack slot (or any base-reg+offset
-    /// addressing mode) and substitutes the memory operand into
-    /// the asm template.
-    Mem,
-    /// `"i"` / `"n"` — must be an immediate. No register is
-    /// allocated; the value is substituted as a literal into the
-    /// asm template.
-    Imm,
-    /// `"rm"`, `"ri"`, `"rmi"`, `"g"` — the operand satisfies any
-    /// one of these alternatives. The list is non-empty,
-    /// deduplicated, and flattened (no nested `Alternatives`).
-    /// The allocator picks the cheapest fit at lowering time based
-    /// on what the operand's actual location can satisfy.
-    /// Alternatives are restricted to `Any` / `Mem` / `Imm` only —
-    /// `Fixed` and `Match` cannot appear inside `Alternatives`
-    /// (mixing pin-to-physreg or pin-to-other-operand with "or
-    /// memory" makes no sense and GCC rejects it too).
-    Alternatives(Vec<OperandConstraint<R>>),
-}
-
-/// Per-operand semantics — whether the operand is read, written, or
-/// both, and the GCC early-clobber distinction.
+/// How the template accesses an operand: `=` writes it, `+` reads and
+/// writes it, and an operand with neither is only read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OperandKind {
-    /// Read-only input (`"r"`, `"m"`, `"i"`).
-    Use,
-    /// Write-only output (`"=r"`). The new value isn't visible
-    /// until after the asm completes; the allocator may share the
-    /// physical location with any input that's already been read.
-    Def,
-    /// Read+write (`"+r"`). The same physical location is read,
-    /// modified by the asm, and written back.
-    UseDef,
-    /// Like `Def`, but the asm may write the output before all
-    /// inputs are read (`"&=r"`). The allocator must keep the
-    /// output's physical location disjoint from every input.
-    EarlyClobber,
+pub enum AsmAccess {
+    Read,
+    Write,
+    ReadWrite,
 }
 
-/// Per-instruction operand+clobber constraints, lowered to
-/// `ConstraintPoint`.
+/// The x87 stack position an operand takes: `f` any, `t` the top, `u` the
+/// register below it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum X87Slot {
+    Any,
+    Top,
+    Second,
+}
+
+/// A general register one x86-64 letter names: `a`, `b`, `c`, `d`, `S`, `D`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinnedGp {
+    Rax,
+    Rbx,
+    Rcx,
+    Rdx,
+    Rsi,
+    Rdi,
+}
+
+/// The register class an operand may be given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsmRegClass {
+    /// Any general register: `r`, and x86-64 `q`, `R`, `l`.
+    General,
+    /// The one general register an x86-64 letter names.
+    Pinned(PinnedGp),
+    /// x86-64 `Q`: a general register with an addressable high byte -- one
+    /// of `a`, `b`, `c`, `d`, which the backend chooses per statement.
+    HighByte,
+    /// A floating-point/SIMD register: x86-64 `x`, `v`, `Y`; aarch64 `w`,
+    /// `x`, `y`.
+    Vector,
+    /// The x86-64 x87 register stack.
+    X87(X87Slot),
+}
+
+impl AsmRegClass {
+    /// Which class wins when a constraint lists several: a register the
+    /// letter names outright, then the narrower classes, then any general
+    /// register.
+    fn rank(self) -> u8 {
+        match self {
+            AsmRegClass::Pinned(_) => 6,
+            AsmRegClass::HighByte => 5,
+            AsmRegClass::X87(X87Slot::Top) => 4,
+            AsmRegClass::X87(X87Slot::Second) => 3,
+            AsmRegClass::X87(X87Slot::Any) => 2,
+            AsmRegClass::Vector => 1,
+            AsmRegClass::General => 0,
+        }
+    }
+}
+
+/// The memory an operand may be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsmMemClass {
+    /// Any addressing mode: `m`, `o`, `V`.
+    Any,
+    /// aarch64 `Q`: a base register alone, with no offset -- what the
+    /// exclusive loads and stores encode.
+    BaseOnly,
+}
+
+/// What one operand's constraint string allows, read once for the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AsmOperandClass {
+    pub access: AsmAccess,
+    /// `&`: an output written before the template has read every input, so
+    /// it may share a register with none of them.
+    pub early_clobber: bool,
+    /// The register class the operand may take, if any.
+    pub reg: Option<AsmRegClass>,
+    /// The memory it may be, if any.
+    pub mem: Option<AsmMemClass>,
+    /// Whether a constant may be substituted as an immediate.
+    pub imm: bool,
+    /// A matching constraint: the output operand number it names, which may
+    /// have more than one digit.
+    pub tied: Option<usize>,
+}
+
+/// What one letter contributes to a class.
+enum Letter {
+    Reg(AsmRegClass),
+    Mem(AsmMemClass),
+    Imm,
+    /// `g` and `X`: a general register, memory or an immediate.
+    Any,
+}
+
+impl AsmOperandClass {
+    /// Classify `constraint` for `arch`.
+    ///
+    /// Alternatives listed in one string (`"rm"`, `"ri"`, `"g"`) accumulate:
+    /// the operand may be any of them. Letters this compiler does not model
+    /// (and modifiers such as `%`, `,`, `*`, `?`, `!`) contribute nothing.
+    pub fn parse(constraint: &str, arch: Arch) -> Self {
+        let mut class = AsmOperandClass {
+            access: AsmAccess::Read,
+            early_clobber: false,
+            reg: None,
+            mem: None,
+            imm: false,
+            tied: None,
+        };
+        let mut chars = constraint.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '=' if class.access == AsmAccess::Read => class.access = AsmAccess::Write,
+                '+' => class.access = AsmAccess::ReadWrite,
+                '&' => class.early_clobber = true,
+                '0'..='9' => {
+                    let mut n = c.to_digit(10).unwrap() as usize;
+                    while let Some(d) = chars.peek().and_then(|d| d.to_digit(10)) {
+                        n = n * 10 + d as usize;
+                        chars.next();
+                    }
+                    class.tied = Some(n);
+                }
+                _ => match letter(c, arch) {
+                    Some(Letter::Reg(r)) => class.add_reg(r),
+                    Some(Letter::Mem(m)) => class.add_mem(m),
+                    Some(Letter::Imm) => class.imm = true,
+                    Some(Letter::Any) => {
+                        class.add_reg(AsmRegClass::General);
+                        class.add_mem(AsmMemClass::Any);
+                        class.imm = true;
+                    }
+                    None => {}
+                },
+            }
+        }
+        class
+    }
+
+    fn add_reg(&mut self, r: AsmRegClass) {
+        if self.reg.is_none_or(|have| r.rank() > have.rank()) {
+            self.reg = Some(r);
+        }
+    }
+
+    /// Any addressing mode is a wider alternative than base-register only.
+    fn add_mem(&mut self, m: AsmMemClass) {
+        if self.mem != Some(AsmMemClass::Any) {
+            self.mem = Some(m);
+        }
+    }
+
+    /// True when the operand can only be memory: no register and no
+    /// immediate alternative is offered.
+    pub fn is_memory_only(&self) -> bool {
+        self.mem.is_some() && self.reg.is_none() && !self.imm
+    }
+}
+
+/// What `c` means on `arch`, or `None` for a letter c17 does not model.
+fn letter(c: char, arch: Arch) -> Option<Letter> {
+    use AsmRegClass::*;
+    Some(match (arch, c) {
+        (_, 'r') => Letter::Reg(General),
+        (_, 'm' | 'o' | 'V') => Letter::Mem(AsmMemClass::Any),
+        (_, 'i' | 'n' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' | 'Z') => Letter::Imm,
+        (_, 'g' | 'X') => Letter::Any,
+
+        (Arch::X86_64, 'q' | 'R' | 'l') => Letter::Reg(General),
+        (Arch::X86_64, 'a') => Letter::Reg(Pinned(PinnedGp::Rax)),
+        (Arch::X86_64, 'b') => Letter::Reg(Pinned(PinnedGp::Rbx)),
+        (Arch::X86_64, 'c') => Letter::Reg(Pinned(PinnedGp::Rcx)),
+        (Arch::X86_64, 'd') => Letter::Reg(Pinned(PinnedGp::Rdx)),
+        (Arch::X86_64, 'S') => Letter::Reg(Pinned(PinnedGp::Rsi)),
+        (Arch::X86_64, 'D') => Letter::Reg(Pinned(PinnedGp::Rdi)),
+        (Arch::X86_64, 'Q') => Letter::Reg(HighByte),
+        (Arch::X86_64, 'x' | 'v' | 'Y') => Letter::Reg(Vector),
+        (Arch::X86_64, 'f') => Letter::Reg(X87(X87Slot::Any)),
+        (Arch::X86_64, 't') => Letter::Reg(X87(X87Slot::Top)),
+        (Arch::X86_64, 'u') => Letter::Reg(X87(X87Slot::Second)),
+        (Arch::X86_64, 'e' | 's') => Letter::Imm,
+
+        (Arch::Aarch64, 'w' | 'x' | 'y') => Letter::Reg(Vector),
+        (Arch::Aarch64, 'Q') => Letter::Mem(AsmMemClass::BaseOnly),
+        (Arch::Aarch64, 'S' | 'Y') => Letter::Imm,
+
+        _ => return None,
+    })
+}
+
+/// The register-allocator view of one inline-asm statement: the operands
+/// pinned to one register, and the registers the statement clobbers.
 #[derive(Debug, Clone)]
 pub struct InstrConstraints<R> {
-    /// Per-operand constraint, in the order the operands appear
-    /// in the inline-asm operand list (outputs first, then inputs).
-    pub operands: Vec<OperandSpec<R>>,
-    /// Hard clobbers in addition to whatever the operands imply.
-    /// A `"memory"` clobber is not one of these: it orders memory rather
-    /// than claiming a register, and is answered by
-    /// `Instruction::is_memory_barrier`.
+    /// Each operand the statement pins, with its register.
+    pub pinned: Vec<(PseudoId, R)>,
+    /// Hard clobbers in addition to the pinned registers. A `"memory"`
+    /// clobber is not one of these: it orders memory rather than claiming a
+    /// register, and is answered by `Instruction::is_memory_barrier`.
     pub clobbers: Vec<R>,
 }
 
 impl<R: Copy + Ord> InstrConstraints<R> {
-    /// The constraints of one inline-asm statement, given the target's
-    /// fixed-register letters, class letters and clobber names. One
-    /// implementation for both backends, which differ only in those three.
+    /// The constraints of one inline-asm statement, given the register each
+    /// operand is pinned to (outputs, then inputs, in order) and the target's
+    /// clobber names. One implementation for both backends.
     pub fn of_asm(
-        asm_data: &crate::ir::AsmData,
-        fixed_letter: impl Fn(char) -> Option<R> + Copy,
-        class_letter: impl Fn(char) -> Option<OperandConstraint<R>> + Copy,
+        asm_data: &AsmData,
+        pins: &[Option<R>],
         clobber_name: impl Fn(&str) -> Option<R>,
     ) -> Self {
-        let operands = asm_data
+        let pinned = asm_data
             .outputs
             .iter()
             .chain(asm_data.inputs.iter())
-            .filter_map(|ac| {
-                let (_, constraint) =
-                    parse_constraint_with_classes(&ac.constraint, fixed_letter, class_letter)
-                        .ok()?;
-                Some(OperandSpec {
-                    pseudo: ac.pseudo,
-                    constraint,
-                })
-            })
+            .zip(pins)
+            .filter_map(|(ac, pin)| pin.map(|r| (ac.pseudo, r)))
             .collect();
         let mut clobbers: Vec<R> = asm_data
             .clobbers
@@ -128,30 +256,27 @@ impl<R: Copy + Ord> InstrConstraints<R> {
             .collect();
         clobbers.sort();
         clobbers.dedup();
-        Self { operands, clobbers }
+        Self { pinned, clobbers }
     }
 
     /// The statement as the allocator's `ConstraintPoint`: the registers it
     /// claims, and the operands exempt from that claim.
     ///
-    /// It claims its declared clobbers and every register a `Fixed`
-    /// constraint pins. gcc's rule is that no operand may live in a
-    /// clobbered register -- the template may write it before reading them --
-    /// nor in a register another operand is pinned to. So only the pinned
-    /// operands themselves are exempt: each is precolored to its own register
-    /// and must not be forbidden it. Exempting every operand, as both
-    /// backends did, let an input or a memory operand's address land in a
-    /// declared clobber, and a template that wrote it first destroyed the
-    /// operand.
+    /// It claims its declared clobbers and every register an operand is
+    /// pinned to. gcc's rule is that no operand may live in a clobbered
+    /// register -- the template may write it before reading them -- nor in a
+    /// register another operand is pinned to. So only the pinned operands
+    /// themselves are exempt: each is precolored to its own register and must
+    /// not be forbidden it. Exempting every operand, as both backends did,
+    /// let an input or a memory operand's address land in a declared
+    /// clobber, and a template that wrote it first destroyed the operand.
     pub fn to_constraint_point(&self) -> (Vec<R>, Vec<PseudoId>) {
         let mut clobbers = self.clobbers.clone();
         let mut pinned = Vec::new();
-        for op in &self.operands {
-            if let OperandConstraint::Fixed(r) = op.constraint {
-                clobbers.push(r);
-                if !pinned.contains(&op.pseudo) {
-                    pinned.push(op.pseudo);
-                }
+        for &(pseudo, r) in &self.pinned {
+            clobbers.push(r);
+            if !pinned.contains(&pseudo) {
+                pinned.push(pseudo);
             }
         }
         clobbers.sort();
@@ -160,526 +285,178 @@ impl<R: Copy + Ord> InstrConstraints<R> {
     }
 }
 
-/// One operand's constraint description.
-#[derive(Debug, Clone)]
-pub struct OperandSpec<R> {
-    pub pseudo: PseudoId,
-    pub constraint: OperandConstraint<R>,
-}
-
-/// Parse a GCC constraint string into a `(kind, constraint)` pair.
-///
-/// Supported syntax:
-///
-/// ```text
-///   modifiers ::= '&'? ('=' | '+')?
-///   constraint ::= modifiers body
-///   body ::= class_letter+ | single_letter
-///   class_letter ::= 'r' | 'w' | 'm' | 'Q' | 'i' | 'n' | 'g'
-///                  | <arch class letter from `class_letter_map`>
-///   single_letter ::= class_letter | '0'..'9' | <Fixed letter>
-/// ```
-///
-/// Multi-character bodies build an `OperandConstraint::Alternatives`
-/// (e.g. `"rm"` → register OR memory; `"g"` is sugar for `"rmi"`).
-/// `Fixed` register letters and `Match` digits cannot appear inside
-/// a multi-character body — GCC's `"ra"` / `"r0"` are nonsensical
-/// (you can't be "either register-class or pinned-to-RAX").
-///
-/// `letter_map` is the per-arch resolver for Fixed-register letters
-/// (e.g. x86_64's `a` → Rax, `D` → Rdi).
-///
-/// `class_letter_map` is the per-arch resolver for rare *class*
-/// letters that map to a generic `OperandConstraint` rather than a
-/// physical register (e.g. x86_64's `q` (byte-class register) → `Any`,
-/// `I` (immediate in `[0, 31]`) → `Imm`, aarch64's `L` (logical-
-/// immediate) → `Imm`). c17 does not validate immediate ranges; if
-/// the supplied operand is out of range, the assembler rejects the
-/// resulting asm template — the same failure mode GCC defaults to
-/// with mismatched immediates.
-pub fn parse_constraint_with_classes<R: Copy>(
-    s: &str,
-    letter_map: impl Fn(char) -> Option<R>,
-    class_letter_map: impl Fn(char) -> Option<OperandConstraint<R>>,
-) -> Result<(OperandKind, OperandConstraint<R>), ConstraintParseError> {
-    // Strip leading `&` (early-clobber modifier).
-    let (early, after_amp) = match s.strip_prefix('&') {
-        Some(rest) => (true, rest),
-        None => (false, s),
-    };
-    // Strip `=` (Def) or `+` (UseDef). No modifier → Use.
-    let (kind, body) = if let Some(rest) = after_amp.strip_prefix('=') {
-        (
-            if early {
-                OperandKind::EarlyClobber
-            } else {
-                OperandKind::Def
-            },
-            rest,
-        )
-    } else if let Some(rest) = after_amp.strip_prefix('+') {
-        // `&+r` would mean early-clobber UseDef which is rare and
-        // semantically equivalent to EarlyClobber for our purposes.
-        if early {
-            (OperandKind::EarlyClobber, rest)
-        } else {
-            (OperandKind::UseDef, rest)
-        }
-    } else {
-        if early {
-            return Err(ConstraintParseError::EarlyClobberOnInput(s.to_string()));
-        }
-        (OperandKind::Use, after_amp)
-    };
-
-    let body_chars: Vec<char> = body.chars().collect();
-    if body_chars.is_empty() {
-        return Err(ConstraintParseError::Empty(s.to_string()));
-    }
-
-    // Single-character body — fast path. Handles Fixed letters and
-    // Match digits, which are illegal inside multi-char bodies.
-    if body_chars.len() == 1 {
-        return Ok((
-            kind,
-            parse_single_letter(body_chars[0], &letter_map, &class_letter_map, s)?,
-        ));
-    }
-
-    // Multi-character body: every letter must be a class letter
-    // (Any / Mem / Imm, or `g` sugar, or a per-arch class letter
-    // that resolves to one of those). Build the alternatives in
-    // appearance order, dedup, and flatten `g` (which itself is
-    // `Alternatives([Any, Mem, Imm])`).
-    let mut alts: Vec<OperandConstraint<R>> = Vec::with_capacity(body_chars.len());
-    for &c in &body_chars {
-        let sub = parse_single_letter(c, &letter_map, &class_letter_map, s)?;
-        match sub {
-            OperandConstraint::Any | OperandConstraint::Mem | OperandConstraint::Imm => {
-                push_dedup(&mut alts, sub);
-            }
-            OperandConstraint::Alternatives(inner) => {
-                // `g` sugar — flatten in place.
-                for a in inner {
-                    push_dedup(&mut alts, a);
-                }
-            }
-            OperandConstraint::Fixed(_) | OperandConstraint::Match => {
-                return Err(ConstraintParseError::AlternativeWithFixed(c, s.to_string()));
-            }
-        }
-    }
-
-    // Single-alternative collapse — e.g. `"rr"` → `Any`. Spec-legal:
-    // duplicates have no semantic meaning.
-    let con = if alts.len() == 1 {
-        alts.into_iter().next().unwrap()
-    } else {
-        OperandConstraint::Alternatives(alts)
-    };
-    Ok((kind, con))
-}
-
-/// Parse a single constraint letter into its `OperandConstraint`.
-/// Shared by the single-char fast path and the multi-char alternatives
-/// loop.
-///
-/// Resolution order:
-///   1. Built-in class letters (`r`, `w`, `m`, `Q`, `i`, `n`, `g`).
-///   2. Match-operand digits (`0`–`9`).
-///   3. Arch-specific class letters via `class_letter_map`
-///      (e.g. x86_64's `q`/`I`/`J`, aarch64's `K`/`L`).
-///   4. Arch-specific Fixed-register letters via `letter_map`
-///      (e.g. x86_64's `a`/`b`/`c`/`d`/`S`/`D`).
-///   5. Unknown → `UnknownLetter` error.
-fn parse_single_letter<R: Copy>(
-    letter: char,
-    letter_map: &impl Fn(char) -> Option<R>,
-    class_letter_map: &impl Fn(char) -> Option<OperandConstraint<R>>,
-    full: &str,
-) -> Result<OperandConstraint<R>, ConstraintParseError> {
-    Ok(match letter {
-        'r' | 'w' => OperandConstraint::Any,
-        'm' | 'Q' => OperandConstraint::Mem,
-        'i' | 'n' => OperandConstraint::Imm,
-        // GCC `g` is shorthand for "any general-purpose operand":
-        // register, memory, or immediate. Same as `"rmi"`.
-        'g' => OperandConstraint::Alternatives(vec![
-            OperandConstraint::Any,
-            OperandConstraint::Mem,
-            OperandConstraint::Imm,
-        ]),
-        '0'..='9' => OperandConstraint::Match,
-        _ => {
-            // Try arch-specific class letters before Fixed-register
-            // letters. The two letter sets don't overlap on any
-            // current arch, but class letters take precedence for
-            // future extensibility.
-            if let Some(c) = class_letter_map(letter) {
-                c
-            } else if let Some(r) = letter_map(letter) {
-                OperandConstraint::Fixed(r)
-            } else {
-                return Err(ConstraintParseError::UnknownLetter(
-                    letter,
-                    full.to_string(),
-                ));
-            }
-        }
-    })
-}
-
-/// Insert `con` into `alts` if no kind-equal element is already there.
-/// Alternatives within `Alternatives` are restricted to `Any`/`Mem`/
-/// `Imm` by parse_constraint's check, so a tag-only comparison is
-/// sufficient.
-fn push_dedup<R: Copy>(alts: &mut Vec<OperandConstraint<R>>, con: OperandConstraint<R>) {
-    let same = |a: &OperandConstraint<R>, b: &OperandConstraint<R>| {
-        std::mem::discriminant(a) == std::mem::discriminant(b)
-    };
-    if !alts.iter().any(|a| same(a, &con)) {
-        alts.push(con);
-    }
-}
-
-/// Errors from `parse_constraint`. Carried as a diagnostic into the
-/// front end's existing inline-asm error path in C3+.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConstraintParseError {
-    /// `""` — no letter after the modifiers.
-    Empty(String),
-    /// `"&"` followed by no `=` or `+` — early-clobber on a non-
-    /// output makes no sense.
-    EarlyClobberOnInput(String),
-    /// A multi-character constraint body mixed a class letter
-    /// (`r`/`m`/`i`/`g`) with a Fixed-register letter or a Match
-    /// digit (e.g. `"ra"`, `"r0"`). GCC rejects these; we do too.
-    /// Carried char is the offending letter inside the body.
-    AlternativeWithFixed(char, String),
-    /// Letter not recognised by this arch.
-    UnknownLetter(char, String),
-}
-
-impl std::fmt::Display for ConstraintParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConstraintParseError::Empty(s) => {
-                write!(f, "empty inline-asm constraint string: {s:?}")
-            }
-            ConstraintParseError::EarlyClobberOnInput(s) => {
-                write!(
-                    f,
-                    "early-clobber `&` modifier requires `=` or `+` output marker: {s:?}"
-                )
-            }
-            ConstraintParseError::AlternativeWithFixed(c, s) => {
-                write!(
-                    f,
-                    "inline-asm constraint {s:?} cannot mix class letters (r/m/i/g) \
-                     with the Fixed-register / Match-operand letter {c:?}"
-                )
-            }
-            ConstraintParseError::UnknownLetter(c, s) => {
-                write!(f, "unknown inline-asm constraint letter {c:?} in {s:?}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ConstraintParseError {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use AsmRegClass::*;
 
-    // A dummy register type for arch-agnostic parser tests.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Fake {
-        A,
-        B,
+    fn x86(s: &str) -> AsmOperandClass {
+        AsmOperandClass::parse(s, Arch::X86_64)
     }
 
-    fn fake_map(c: char) -> Option<Fake> {
-        match c {
-            'a' => Some(Fake::A),
-            'b' => Some(Fake::B),
-            _ => None,
+    fn a64(s: &str) -> AsmOperandClass {
+        AsmOperandClass::parse(s, Arch::Aarch64)
+    }
+
+    /// `(reg, mem, imm)` for a constraint body.
+    type Allows = (Option<AsmRegClass>, Option<AsmMemClass>, bool);
+
+    const MEM: Option<AsmMemClass> = Some(AsmMemClass::Any);
+
+    fn allows(c: AsmOperandClass) -> Allows {
+        (c.reg, c.mem, c.imm)
+    }
+
+    /// The letters both targets share mean the same on each.
+    #[test]
+    fn common_letters() {
+        let table: &[(&str, Allows)] = &[
+            ("r", (Some(General), None, false)),
+            ("m", (None, MEM, false)),
+            ("o", (None, MEM, false)),
+            ("V", (None, MEM, false)),
+            ("i", (None, None, true)),
+            ("n", (None, None, true)),
+            ("I", (None, None, true)),
+            ("rm", (Some(General), MEM, false)),
+            ("ri", (Some(General), None, true)),
+            ("rmi", (Some(General), MEM, true)),
+            ("g", (Some(General), MEM, true)),
+            ("X", (Some(General), MEM, true)),
+        ];
+        for &(s, want) in table {
+            assert_eq!(allows(x86(s)), want, "x86-64 {s:?}");
+            assert_eq!(allows(a64(s)), want, "aarch64 {s:?}");
         }
     }
 
     #[test]
-    fn parse_use_any() {
-        let (k, c) = parse_constraint_with_classes::<Fake>("r", fake_map, |_| None).unwrap();
-        assert_eq!(k, OperandKind::Use);
-        assert!(matches!(c, OperandConstraint::Any));
-    }
-
-    #[test]
-    fn parse_def_any() {
-        let (k, c) = parse_constraint_with_classes::<Fake>("=r", fake_map, |_| None).unwrap();
-        assert_eq!(k, OperandKind::Def);
-        assert!(matches!(c, OperandConstraint::Any));
-    }
-
-    #[test]
-    fn parse_usedef_any() {
-        let (k, c) = parse_constraint_with_classes::<Fake>("+r", fake_map, |_| None).unwrap();
-        assert_eq!(k, OperandKind::UseDef);
-        assert!(matches!(c, OperandConstraint::Any));
-    }
-
-    #[test]
-    fn parse_early_clobber() {
-        let (k, c) = parse_constraint_with_classes::<Fake>("&=r", fake_map, |_| None).unwrap();
-        assert_eq!(k, OperandKind::EarlyClobber);
-        assert!(matches!(c, OperandConstraint::Any));
-        // `&+r` also maps to EarlyClobber (read+write that may
-        // overwrite an input before all inputs are read).
-        let (k, _) = parse_constraint_with_classes::<Fake>("&+r", fake_map, |_| None).unwrap();
-        assert_eq!(k, OperandKind::EarlyClobber);
-    }
-
-    #[test]
-    fn parse_fixed_register() {
-        let (k, c) = parse_constraint_with_classes::<Fake>("=a", fake_map, |_| None).unwrap();
-        assert_eq!(k, OperandKind::Def);
-        assert!(matches!(c, OperandConstraint::Fixed(Fake::A)));
-        let (k, c) = parse_constraint_with_classes::<Fake>("b", fake_map, |_| None).unwrap();
-        assert_eq!(k, OperandKind::Use);
-        assert!(matches!(c, OperandConstraint::Fixed(Fake::B)));
-    }
-
-    #[test]
-    fn parse_match_operand() {
-        let (k, c) = parse_constraint_with_classes::<Fake>("0", fake_map, |_| None).unwrap();
-        assert_eq!(k, OperandKind::Use);
-        assert!(matches!(c, OperandConstraint::Match));
-        let (k, c) = parse_constraint_with_classes::<Fake>("3", fake_map, |_| None).unwrap();
-        assert_eq!(k, OperandKind::Use);
-        assert!(matches!(c, OperandConstraint::Match));
-    }
-
-    #[test]
-    fn parse_memory_operand() {
-        let (k, c) = parse_constraint_with_classes::<Fake>("m", fake_map, |_| None).unwrap();
-        assert_eq!(k, OperandKind::Use);
-        assert!(matches!(c, OperandConstraint::Mem));
-        let (k, c) = parse_constraint_with_classes::<Fake>("=m", fake_map, |_| None).unwrap();
-        assert_eq!(k, OperandKind::Def);
-        assert!(matches!(c, OperandConstraint::Mem));
-    }
-
-    #[test]
-    fn parse_immediate() {
-        let (_, c) = parse_constraint_with_classes::<Fake>("i", fake_map, |_| None).unwrap();
-        assert!(matches!(c, OperandConstraint::Imm));
-        let (_, c) = parse_constraint_with_classes::<Fake>("n", fake_map, |_| None).unwrap();
-        assert!(matches!(c, OperandConstraint::Imm));
-    }
-
-    #[test]
-    fn reject_empty() {
-        assert!(matches!(
-            parse_constraint_with_classes::<Fake>("", fake_map, |_| None),
-            Err(ConstraintParseError::Empty(_))
-        ));
-        // `&` alone has no `=` or `+`.
-        assert!(matches!(
-            parse_constraint_with_classes::<Fake>("&", fake_map, |_| None),
-            Err(ConstraintParseError::EarlyClobberOnInput(_))
-        ));
-    }
-
-    #[test]
-    fn reject_unknown_letter() {
-        assert!(matches!(
-            parse_constraint_with_classes::<Fake>("z", fake_map, |_| None),
-            Err(ConstraintParseError::UnknownLetter('z', _))
-        ));
-    }
-
-    // Multi-alternative constraints
-
-    fn alternative_kinds<R: Copy>(c: &OperandConstraint<R>) -> Vec<&'static str> {
-        match c {
-            OperandConstraint::Alternatives(alts) => alts
-                .iter()
-                .map(|a| match a {
-                    OperandConstraint::Any => "any",
-                    OperandConstraint::Mem => "mem",
-                    OperandConstraint::Imm => "imm",
-                    OperandConstraint::Fixed(_) => "fixed",
-                    OperandConstraint::Match => "match",
-                    OperandConstraint::Alternatives(_) => "nested",
-                })
-                .collect(),
-            _ => vec![],
+    fn x86_64_letters() {
+        let table: &[(&str, Allows)] = &[
+            ("a", (Some(Pinned(PinnedGp::Rax)), None, false)),
+            ("b", (Some(Pinned(PinnedGp::Rbx)), None, false)),
+            ("c", (Some(Pinned(PinnedGp::Rcx)), None, false)),
+            ("d", (Some(Pinned(PinnedGp::Rdx)), None, false)),
+            ("S", (Some(Pinned(PinnedGp::Rsi)), None, false)),
+            ("D", (Some(Pinned(PinnedGp::Rdi)), None, false)),
+            // A register class, not memory as on aarch64.
+            ("Q", (Some(HighByte), None, false)),
+            ("q", (Some(General), None, false)),
+            ("R", (Some(General), None, false)),
+            ("l", (Some(General), None, false)),
+            ("x", (Some(Vector), None, false)),
+            ("v", (Some(Vector), None, false)),
+            ("xm", (Some(Vector), MEM, false)),
+            ("f", (Some(X87(X87Slot::Any)), None, false)),
+            ("t", (Some(X87(X87Slot::Top)), None, false)),
+            ("u", (Some(X87(X87Slot::Second)), None, false)),
+            ("e", (None, None, true)),
+            ("Z", (None, None, true)),
+            ("s", (None, None, true)),
+            // A named register outranks a class listed beside it.
+            ("ra", (Some(Pinned(PinnedGp::Rax)), None, false)),
+            // aarch64's register letter is no x86-64 class.
+            ("w", (None, None, false)),
+        ];
+        for &(s, want) in table {
+            assert_eq!(allows(x86(s)), want, "{s:?}");
         }
     }
 
     #[test]
-    fn parse_multi_alt_rm() {
-        // `"rm"` — register or memory. The most common kernel/UAPI
-        // multi-alt constraint.
-        let (k, c) = parse_constraint_with_classes::<Fake>("rm", fake_map, |_| None).unwrap();
-        assert_eq!(k, OperandKind::Use);
-        assert_eq!(alternative_kinds(&c), vec!["any", "mem"]);
-
-        let (k, c) = parse_constraint_with_classes::<Fake>("=rm", fake_map, |_| None).unwrap();
-        assert_eq!(k, OperandKind::Def);
-        assert_eq!(alternative_kinds(&c), vec!["any", "mem"]);
-
-        let (k, c) = parse_constraint_with_classes::<Fake>("+rm", fake_map, |_| None).unwrap();
-        assert_eq!(k, OperandKind::UseDef);
-        assert_eq!(alternative_kinds(&c), vec!["any", "mem"]);
-    }
-
-    #[test]
-    fn parse_multi_alt_ri() {
-        let (k, c) = parse_constraint_with_classes::<Fake>("ri", fake_map, |_| None).unwrap();
-        assert_eq!(k, OperandKind::Use);
-        assert_eq!(alternative_kinds(&c), vec!["any", "imm"]);
-    }
-
-    #[test]
-    fn parse_multi_alt_rmi() {
-        let (k, c) = parse_constraint_with_classes::<Fake>("rmi", fake_map, |_| None).unwrap();
-        assert_eq!(k, OperandKind::Use);
-        assert_eq!(alternative_kinds(&c), vec!["any", "mem", "imm"]);
-    }
-
-    #[test]
-    fn parse_g_is_sugar_for_rmi() {
-        // GCC `g` ≡ "register, memory, or immediate" — same as `rmi`.
-        let (k, c) = parse_constraint_with_classes::<Fake>("g", fake_map, |_| None).unwrap();
-        assert_eq!(k, OperandKind::Use);
-        assert_eq!(alternative_kinds(&c), vec!["any", "mem", "imm"]);
-    }
-
-    #[test]
-    fn parse_multi_alt_g_flattens() {
-        // `g` inside a multi-char body flattens; the resulting
-        // Alternatives carries Any/Mem/Imm exactly once each.
-        let (_, c) = parse_constraint_with_classes::<Fake>("rg", fake_map, |_| None).unwrap();
-        assert_eq!(alternative_kinds(&c), vec!["any", "mem", "imm"]);
-    }
-
-    #[test]
-    fn parse_multi_alt_dedup() {
-        // `"rr"` collapses to a single `Any` — the duplicate has no
-        // semantic value, just dedupes.
-        let (_, c) = parse_constraint_with_classes::<Fake>("rr", fake_map, |_| None).unwrap();
-        assert!(matches!(c, OperandConstraint::Any));
-
-        // `"rmm"` collapses to `[Any, Mem]`.
-        let (_, c) = parse_constraint_with_classes::<Fake>("rmm", fake_map, |_| None).unwrap();
-        assert_eq!(alternative_kinds(&c), vec!["any", "mem"]);
-    }
-
-    #[test]
-    fn reject_alternative_with_fixed_letter() {
-        // Mixing a class letter with a Fixed register letter is
-        // nonsensical — GCC rejects, we reject.
-        assert!(matches!(
-            parse_constraint_with_classes::<Fake>("ra", fake_map, |_| None),
-            Err(ConstraintParseError::AlternativeWithFixed('a', _))
-        ));
-        // Same for `=` outputs.
-        assert!(matches!(
-            parse_constraint_with_classes::<Fake>("=mb", fake_map, |_| None),
-            Err(ConstraintParseError::AlternativeWithFixed('b', _))
-        ));
-    }
-
-    #[test]
-    fn reject_alternative_with_match_digit() {
-        // Match digits also can't appear inside multi-alt bodies.
-        assert!(matches!(
-            parse_constraint_with_classes::<Fake>("r0", fake_map, |_| None),
-            Err(ConstraintParseError::AlternativeWithFixed('0', _))
-        ));
-    }
-
-    #[test]
-    fn single_char_fixed_still_works() {
-        // Single-char Fixed letters produce `OperandConstraint::Fixed(_)`,
-        // not Alternatives.
-        let (_, c) = parse_constraint_with_classes::<Fake>("=a", fake_map, |_| None).unwrap();
-        assert!(matches!(c, OperandConstraint::Fixed(Fake::A)));
-    }
-
-    #[test]
-    fn single_char_match_still_works() {
-        let (_, c) = parse_constraint_with_classes::<Fake>("0", fake_map, |_| None).unwrap();
-        assert!(matches!(c, OperandConstraint::Match));
-    }
-
-    // Per-arch class letters
-
-    /// A fake class-letter mapper for the parser tests: `J` → `Any`
-    /// (register-class synonym), `K` → `Imm`. Lets us exercise the
-    /// resolution path without coupling to either real arch.
-    fn fake_class_map(c: char) -> Option<OperandConstraint<Fake>> {
-        match c {
-            'J' => Some(OperandConstraint::Any),
-            'K' => Some(OperandConstraint::Imm),
-            _ => None,
+    fn aarch64_letters() {
+        let table: &[(&str, Allows)] = &[
+            ("w", (Some(Vector), None, false)),
+            ("x", (Some(Vector), None, false)),
+            ("y", (Some(Vector), None, false)),
+            // A register class with a memory alternative: not memory-only.
+            ("wm", (Some(Vector), MEM, false)),
+            // Memory, by a base register alone.
+            ("Q", (None, Some(AsmMemClass::BaseOnly), false)),
+            ("Qm", (None, MEM, false)),
+            ("S", (None, None, true)),
+            ("Y", (None, None, true)),
+            ("Z", (None, None, true)),
+            ("K", (None, None, true)),
+            // x86-64's pinned letters name nothing here.
+            ("a", (None, None, false)),
+            ("D", (None, None, false)),
+        ];
+        for &(s, want) in table {
+            assert_eq!(allows(a64(s)), want, "{s:?}");
         }
     }
 
     #[test]
-    fn class_letter_resolves_to_any() {
-        let (k, c) = parse_constraint_with_classes::<Fake>("J", fake_map, fake_class_map).unwrap();
-        assert_eq!(k, OperandKind::Use);
-        assert!(matches!(c, OperandConstraint::Any));
+    fn modifiers() {
+        let table: &[(&str, AsmAccess, bool)] = &[
+            ("r", AsmAccess::Read, false),
+            ("=r", AsmAccess::Write, false),
+            ("+r", AsmAccess::ReadWrite, false),
+            ("=&r", AsmAccess::Write, true),
+            ("&=r", AsmAccess::Write, true),
+            ("+&r", AsmAccess::ReadWrite, true),
+            ("=&d", AsmAccess::Write, true),
+            ("=m", AsmAccess::Write, false),
+            ("0", AsmAccess::Read, false),
+        ];
+        for &(s, access, early) in table {
+            let c = x86(s);
+            assert_eq!((c.access, c.early_clobber), (access, early), "{s:?}");
+        }
+        // The modifiers do not disturb the class.
+        assert_eq!(x86("=&d").reg, Some(Pinned(PinnedGp::Rdx)));
+        assert_eq!(a64("+wm").reg, Some(Vector));
+    }
+
+    /// A matching constraint is an operand number, and may have two digits.
+    #[test]
+    fn matching_digits() {
+        assert_eq!(x86("0").tied, Some(0));
+        assert_eq!(x86("9").tied, Some(9));
+        assert_eq!(x86("10").tied, Some(10));
+        assert_eq!(a64("12").tied, Some(12));
+        assert_eq!(x86("r").tied, None);
+        let tied = x86("1");
+        assert_eq!((tied.reg, tied.mem, tied.imm), (None, None, false));
     }
 
     #[test]
-    fn class_letter_resolves_to_imm() {
-        let (k, c) = parse_constraint_with_classes::<Fake>("K", fake_map, fake_class_map).unwrap();
-        assert_eq!(k, OperandKind::Use);
-        assert!(matches!(c, OperandConstraint::Imm));
+    fn memory_only() {
+        for s in ["m", "=m", "+m", "o", "V", "mo"] {
+            assert!(x86(s).is_memory_only(), "x86-64 {s:?}");
+            assert!(a64(s).is_memory_only(), "aarch64 {s:?}");
+        }
+        assert!(a64("Q").is_memory_only());
+        for s in ["rm", "g", "X", "mi", "r", "i", "0"] {
+            assert!(!x86(s).is_memory_only(), "x86-64 {s:?}");
+            assert!(!a64(s).is_memory_only(), "aarch64 {s:?}");
+        }
+        for s in ["Q", "xm", "tm"] {
+            assert!(!x86(s).is_memory_only(), "x86-64 {s:?}");
+        }
+        assert!(!a64("wm").is_memory_only());
+    }
+
+    fn operand(pseudo: u32, constraint: &str) -> crate::ir::AsmConstraint {
+        crate::ir::AsmConstraint::new(PseudoId(pseudo), constraint, Arch::X86_64, 64)
     }
 
     #[test]
-    fn class_letter_with_def_modifier() {
-        let (k, c) = parse_constraint_with_classes::<Fake>("=J", fake_map, fake_class_map).unwrap();
-        assert_eq!(k, OperandKind::Def);
-        assert!(matches!(c, OperandConstraint::Any));
-    }
-
-    #[test]
-    fn class_letter_in_multi_alt() {
-        // `"rK"` — register OR immediate-via-class-letter. The
-        // class-letter `K` maps to Imm, so the multi-alt becomes
-        // [Any, Imm].
-        let (_, c) = parse_constraint_with_classes::<Fake>("rK", fake_map, fake_class_map).unwrap();
-        assert_eq!(alternative_kinds(&c), vec!["any", "imm"]);
-    }
-
-    #[test]
-    fn class_letter_takes_precedence_over_fixed_letter() {
-        // If a letter is in both maps, class_letter_map wins. Build a
-        // scenario where Fake::A would also match 'J'. The class
-        // resolver returns Any first, so we get Any not Fixed.
-        let fixed_collides = |c: char| -> Option<Fake> {
-            if c == 'J' {
-                Some(Fake::A)
-            } else {
-                None
-            }
+    fn constraint_point_claims_pins_and_clobbers() {
+        let asm = AsmData {
+            template: String::new(),
+            outputs: vec![operand(1, "=a")],
+            inputs: vec![operand(2, "r"), operand(3, "D")],
+            clobbers: vec!["b".into(), "z".into()],
+            goto_labels: Vec::new(),
         };
-        let (_, c) =
-            parse_constraint_with_classes::<Fake>("J", fixed_collides, fake_class_map).unwrap();
-        assert!(matches!(c, OperandConstraint::Any));
-    }
-
-    #[test]
-    fn class_letter_unknown_still_errors() {
-        // 'z' is in neither letter map.
-        assert!(matches!(
-            parse_constraint_with_classes::<Fake>("z", fake_map, fake_class_map),
-            Err(ConstraintParseError::UnknownLetter('z', _))
-        ));
+        let ic = InstrConstraints::of_asm(&asm, &[Some(10u8), None, Some(5u8)], |n| {
+            (n == "b").then_some(7u8)
+        });
+        assert_eq!(ic.pinned, vec![(PseudoId(1), 10), (PseudoId(3), 5)]);
+        let (claimed, exempt) = ic.to_constraint_point();
+        assert_eq!(claimed, vec![5, 7, 10]);
+        assert_eq!(exempt, vec![PseudoId(1), PseudoId(3)]);
     }
 }

@@ -48,9 +48,10 @@ pub mod validate;
 pub mod vrp;
 
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
+use crate::arch::asm_constraints::{AsmAccess, AsmOperandClass};
 use crate::diag::Position;
 use crate::float::{FloatVal, IntegralRounding};
-use crate::target::Target;
+use crate::target::{Arch, Target};
 use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -998,12 +999,16 @@ pub struct AsmConstraint {
     pub pseudo: PseudoId,
     /// Optional symbolic name for the operand (e.g., [result])
     pub name: Option<String>,
-    /// Matching output operand index (for constraints like "0")
+    /// The output operand this input shares its operand with: an explicit
+    /// matching constraint (`"0"`), or the hidden input a `"+"` output
+    /// implies.
     pub matching_output: Option<usize>,
-    /// The constraint string (e.g., "r", "a", "=r", "+m", "=&r").
-    /// Used by codegen to determine specific register requirements; an
-    /// early-clobber `&` is read through [`AsmConstraint::is_early_clobber`].
+    /// The constraint string as written (e.g. "r", "=r", "+m", "=&r"). Only
+    /// diagnostics and dumps read it; what it allows is [`Self::class`].
     pub constraint: String,
+    /// What the constraint allows, classified once for the target. Every
+    /// question about the operand's letters is answered from here.
+    pub class: AsmOperandClass,
     /// Size of the operand in bits (8, 16, 32, 64), derived from the C type
     pub size: u32,
     /// For a memory operand whose `pseudo` is a `Sym` -- the object itself,
@@ -1020,6 +1025,20 @@ pub struct AsmConstraint {
 }
 
 impl AsmConstraint {
+    /// An operand of `constraint` on `arch`, `size` bits wide, with no name,
+    /// matching output or object offset.
+    pub fn new(pseudo: PseudoId, constraint: &str, arch: Arch, size: u32) -> Self {
+        Self {
+            pseudo,
+            name: None,
+            matching_output: None,
+            constraint: constraint.to_string(),
+            class: AsmOperandClass::parse(constraint, arch),
+            size,
+            offset: 0,
+        }
+    }
+
     /// True when the assembler receives this operand as a memory reference
     /// rather than a value in a register.
     ///
@@ -1031,46 +1050,21 @@ impl AsmConstraint {
     /// A constraint may offer several alternatives (`"rm"`); it is only a
     /// memory operand if no register/immediate alternative is available.
     pub fn is_memory(&self) -> bool {
-        let mut has_memory_class = false;
-        let mut has_non_memory_class = false;
-
-        for c in self.constraint.chars() {
-            match c {
-                'm' | 'o' | 'V' | 'Q' => has_memory_class = true,
-                // Register classes.
-                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' | 'l' => {
-                    has_non_memory_class = true
-                }
-                // Immediate / general classes. `g` and `X` allow memory but
-                // also allow a register, so they do not force one.
-                'i' | 'n' | 'g' | 'X' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' | 'Y' | 'Z' => {
-                    has_non_memory_class = true
-                }
-                // Modifiers, matching digits, anything unknown.
-                _ => {}
-            }
-        }
-
-        has_memory_class && !has_non_memory_class
+        self.class.is_memory_only()
     }
 
     /// True for an early-clobber output (`"=&r"`, `"+&r"`, `"&=r"`): the
     /// template writes it before it has read every input, so it may not share
     /// a register with any input, even one whose value dies at the asm.
     pub fn is_early_clobber(&self) -> bool {
-        self.constraint.contains('&')
+        self.class.early_clobber
     }
 
     /// True when the operand may be given a register: a register class
-    /// (`r`, a named register letter, `g`, ...) rather than only memory or
-    /// only an immediate (`i`, `n`).
+    /// (`r`, a named register letter, `g`, ...) or a matching constraint,
+    /// rather than only memory or only an immediate (`i`, `n`).
     pub fn wants_register(&self) -> bool {
-        self.constraint.chars().any(|c| {
-            matches!(
-                c,
-                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' | 'l' | 'g' | 'x' | 'w' | 'y'
-            ) || c.is_ascii_digit()
-        })
+        self.class.reg.is_some() || self.class.tied.is_some()
     }
 
     /// True for the input a `"+"` output implies: it carries the output's
@@ -1082,7 +1076,7 @@ impl AsmConstraint {
     /// input takes the *last* operand numbers, never one between the explicit
     /// ones.
     pub fn is_hidden_readwrite_input(&self) -> bool {
-        self.matching_output.is_some() && self.constraint.contains('+')
+        self.matching_output.is_some() && self.class.access == AsmAccess::ReadWrite
     }
 }
 
@@ -4386,12 +4380,8 @@ mod tests {
 
     fn constraint(c: &str, matching_output: Option<usize>) -> AsmConstraint {
         AsmConstraint {
-            pseudo: PseudoId(0),
-            name: None,
             matching_output,
-            constraint: c.to_string(),
-            size: 64,
-            offset: 0,
+            ..AsmConstraint::new(PseudoId(0), c, crate::target::Arch::X86_64, 64)
         }
     }
 
@@ -4425,6 +4415,36 @@ mod tests {
         for c in ["m", "=m", "i", "n", "I"] {
             assert!(!constraint(c, None).wants_register(), "{c}");
         }
+        // aarch64's register letter is a register class there.
+        assert!(AsmConstraint::new(PseudoId(0), "=w", Arch::Aarch64, 64).wants_register());
+    }
+
+    /// Liveness asks `is_memory` of each output, so it must read the letters
+    /// as the target does: a register alternative beside `m` makes the
+    /// operand a value, and `Q` is memory on aarch64 but a register on
+    /// x86-64.
+    #[test]
+    fn test_asm_constraint_is_memory_per_target() {
+        let on = |c: &str, arch| AsmConstraint::new(PseudoId(0), c, arch, 64).is_memory();
+        assert!(on("=m", Arch::X86_64) && on("=m", Arch::Aarch64));
+        assert!(!on("+wm", Arch::Aarch64));
+        assert!(on("Q", Arch::Aarch64));
+        assert!(!on("=Q", Arch::X86_64));
+        assert!(!on("xm", Arch::X86_64));
+
+        // A register output defines its pseudo; it is no use of it.
+        let mut asm = Instruction::new(Opcode::Asm);
+        asm.extra_mut().asm_data = Some(Box::new(AsmData {
+            template: String::new(),
+            outputs: vec![
+                AsmConstraint::new(PseudoId(1), "+wm", Arch::Aarch64, 64),
+                AsmConstraint::new(PseudoId(2), "=Q", Arch::Aarch64, 64),
+            ],
+            inputs: Vec::new(),
+            clobbers: Vec::new(),
+            goto_labels: Vec::new(),
+        }));
+        assert_eq!(asm.uses(), vec![PseudoId(2)]);
     }
 
     #[test]

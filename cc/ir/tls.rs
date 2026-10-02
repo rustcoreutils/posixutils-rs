@@ -206,12 +206,8 @@ mod tests {
         func.add_pseudo(Pseudo::reg(out, 1));
         func.next_pseudo = 2;
         let operand = |pseudo, constraint: &str, offset| AsmConstraint {
-            pseudo,
-            name: None,
-            matching_output: None,
-            constraint: constraint.to_string(),
-            size: 64,
             offset,
+            ..AsmConstraint::new(pseudo, constraint, Target::host().arch, 64)
         };
         let mut entry = BasicBlock::new(BasicBlockId(0));
         entry.add_insn(Instruction::new(Opcode::Entry));

@@ -1516,10 +1516,22 @@ impl crate::arch::AsmOperandFormatter for X86_64CodeGen {
     type Reg = Reg;
 
     fn size_modifiers(&self) -> &'static [char] {
-        &['b', 'w', 'k', 'q'] // 8, 16, 32, 64-bit
+        // 8, 16, 32, 64-bit, and `h` the high byte of %ax..%dx
+        &['b', 'w', 'k', 'q', 'h']
     }
 
     fn format_reg_sized(&self, reg: Reg, size_mod: char) -> String {
+        if size_mod == 'h' {
+            return match reg {
+                Reg::Rax => "%ah".to_string(),
+                Reg::Rbx => "%bh".to_string(),
+                Reg::Rcx => "%ch".to_string(),
+                Reg::Rdx => "%dh".to_string(),
+                // No high byte: left for the assembler to reject, as gcc
+                // rejects it.
+                _ => format!("%{}h", self.reg_name_64(reg)),
+            };
+        }
         format!("%{}", self.sized_reg_name(reg, size_mod))
     }
 

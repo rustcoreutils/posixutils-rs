@@ -14,6 +14,7 @@ use crate::arch::aarch64::codegen::Aarch64CodeGen;
 use crate::arch::aarch64::legalize::{single_offset_fits, LEGALIZE_REG};
 use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{parse_gp_clobber_name, Loc, Reg, VReg};
+use crate::arch::asm_constraints::{AsmAccess, AsmMemClass, AsmOperandClass, AsmRegClass};
 use crate::arch::lir::{Directive, FpSize, OperandSize};
 use crate::ir::{Instruction, PseudoId};
 
@@ -187,6 +188,11 @@ pub(super) fn asm_reg_name_32(reg: Reg) -> &'static str {
     }
 }
 
+/// Whether the class asks for a vector (SIMD/FP) register.
+fn requires_vector(class: &AsmOperandClass) -> bool {
+    class.reg == Some(AsmRegClass::Vector)
+}
+
 // AsmOperandFormatter trait implementation
 
 impl Aarch64CodeGen {
@@ -229,7 +235,8 @@ impl Aarch64CodeGen {
         // Process output operands (they go first: %0, %1, etc.)
         for output in &asm_data.outputs {
             let loc = self.get_location(output.pseudo);
-            let requires_mem = Self::constraint_requires_memory(&output.constraint);
+            let requires_mem = output.is_memory();
+            let read_write = output.class.access == AsmAccess::ReadWrite;
             let op_size = output.size;
             let op_name = output.name.clone();
             let mk = |reg: Option<Reg>, mem: Option<String>| crate::arch::AsmOperandSlot {
@@ -252,25 +259,23 @@ impl Aarch64CodeGen {
                 // takes whatever the allocator gave the pseudo -- a general
                 // register -- and emits `fmov d17, x0` around a template the
                 // assembler rejects.
-                _ if Self::constraint_requires_vector(&output.constraint) => {
-                    match v_scratch.pop() {
-                        Some(v) => {
-                            slots.push(mk(None, Some(Self::vreg_name(v, op_size).to_string())));
-                            vec_output_moves.push((v, loc.clone(), op_size));
-                            if output.constraint.contains('+') {
-                                vec_input_moves.push((v, loc.clone(), op_size));
-                            }
-                        }
-                        None => {
-                            crate::diag::error(
-                                insn.pos.unwrap_or_default(),
-                                "too many vector register constraints in one asm \
-                                 statement; c17 has three scratch registers to give",
-                            );
-                            slots.push(mk(None, Some(VReg::V16.name_d().to_string())));
+                _ if requires_vector(&output.class) => match v_scratch.pop() {
+                    Some(v) => {
+                        slots.push(mk(None, Some(Self::vreg_name(v, op_size).to_string())));
+                        vec_output_moves.push((v, loc.clone(), op_size));
+                        if read_write {
+                            vec_input_moves.push((v, loc.clone(), op_size));
                         }
                     }
-                }
+                    None => {
+                        crate::diag::error(
+                            insn.pos.unwrap_or_default(),
+                            "too many vector register constraints in one asm \
+                             statement; c17 has three scratch registers to give",
+                        );
+                        slots.push(mk(None, Some(VReg::V16.name_d().to_string())));
+                    }
+                },
                 Loc::Reg(r) => {
                     slots.push(mk(Some(r), None));
                 }
@@ -279,7 +284,7 @@ impl Aarch64CodeGen {
                 // Rendering the slot instead named memory where the template
                 // wants a register (`mov [x29, #104], #0`).
                 Loc::Stack(_) | Loc::IncomingArg(_) | Loc::Global(_)
-                    if !requires_mem && Self::constraint_requires_reg_class(&output.constraint) =>
+                    if !requires_mem && output.class.reg.is_some() =>
                 {
                     let Some(reg) = addr_regs.take(&mut gp_scratch, false) else {
                         crate::diag::error(
@@ -292,7 +297,7 @@ impl Aarch64CodeGen {
                     };
                     slots.push(mk(Some(reg), None));
                     gp_output_moves.push((reg, loc.clone(), op_size));
-                    if output.constraint.contains('+') {
+                    if read_write {
                         addr_regs.setups.push((
                             reg,
                             OperandSetup::Value {
@@ -306,6 +311,7 @@ impl Aarch64CodeGen {
                     let mem_str = self.memory_operand(
                         output.pseudo,
                         output.offset,
+                        output.class.mem,
                         &loc,
                         op_size,
                         &mut addr_regs,
@@ -372,7 +378,8 @@ impl Aarch64CodeGen {
             } else {
                 self.get_location(input.pseudo)
             };
-            let requires_mem = Self::constraint_requires_memory(&input.constraint);
+            let class = &input.class;
+            let requires_mem = input.is_memory();
             let op_size = input.size;
             let op_name = input.name.clone();
             let mk = |reg: Option<Reg>, mem: Option<String>| crate::arch::AsmOperandSlot {
@@ -392,8 +399,9 @@ impl Aarch64CodeGen {
                 }
                 // A constant under a register-only constraint still goes in a
                 // register: the template may use it where no immediate
-                // encodes (`add x0, #100, #100`).
-                Loc::Imm(v) if !Self::constraint_allows_immediate(&input.constraint) => {
+                // encodes (`add x0, #100, #100`). A class that offers no
+                // register at all takes the constant as written.
+                Loc::Imm(v) if class.reg.is_some() && !class.imm => {
                     let Some(reg) = addr_regs.take(&mut gp_scratch, true) else {
                         crate::diag::error(
                             insn.pos.unwrap_or_default(),
@@ -422,9 +430,7 @@ impl Aarch64CodeGen {
                 // A register-class constraint wants the value in a register,
                 // and a constant is never allocated one. Materialize it into
                 // a scratch: nothing else is live there across the asm.
-                Loc::FImm(v, imm_size)
-                    if Self::constraint_requires_reg_class(&input.constraint) =>
-                {
+                Loc::FImm(v, imm_size) if class.reg.is_some() => {
                     let bits = v.to_bits_at_width(imm_size);
                     let Some(scratch) = gp_scratch.pop() else {
                         crate::diag::error(
@@ -436,7 +442,7 @@ impl Aarch64CodeGen {
                         continue;
                     };
                     self.emit_mov_imm(scratch, bits, 64);
-                    if Self::constraint_requires_vector(&input.constraint) {
+                    if requires_vector(class) {
                         // Three scratch V registers are reserved, not one.
                         let Some(vreg) = v_scratch.pop() else {
                             crate::diag::error(
@@ -478,13 +484,13 @@ impl Aarch64CodeGen {
                 // computed as `fneg` of zero.
                 // Already in a vector register, and that is what was asked
                 // for: name it directly at the operand's width.
-                Loc::VReg(v) if Self::constraint_requires_vector(&input.constraint) => {
+                Loc::VReg(v) if requires_vector(class) => {
                     slots.push(mk(None, Some(Self::vreg_name(v, op_size).to_string())));
                 }
                 // A vector-class input that is not in a vector register. The
                 // output loop's note applies: without this the operand named
                 // whatever the allocator gave the pseudo.
-                _ if Self::constraint_requires_vector(&input.constraint) => {
+                _ if requires_vector(class) => {
                     let Some(vreg) = v_scratch.pop() else {
                         crate::diag::error(
                             insn.pos.unwrap_or_default(),
@@ -497,7 +503,7 @@ impl Aarch64CodeGen {
                     slots.push(mk(None, Some(Self::vreg_name(vreg, op_size).to_string())));
                     vec_input_moves.push((vreg, loc.clone(), op_size));
                 }
-                Loc::VReg(v) if !Self::constraint_requires_vector(&input.constraint) => {
+                Loc::VReg(v) if !requires_vector(class) => {
                     let Some(scratch) = gp_scratch.pop() else {
                         crate::diag::error(
                             insn.pos.unwrap_or_default(),
@@ -522,7 +528,7 @@ impl Aarch64CodeGen {
                 // A register input the allocator gave no register: loaded into
                 // a scratch before the template.
                 Loc::Stack(_) | Loc::IncomingArg(_) | Loc::Global(_)
-                    if !requires_mem && Self::constraint_requires_reg_class(&input.constraint) =>
+                    if !requires_mem && class.reg.is_some() =>
                 {
                     let setup = OperandSetup::Value {
                         pseudo: input.pseudo,
@@ -553,6 +559,7 @@ impl Aarch64CodeGen {
                     let mem_str = self.memory_operand(
                         pseudo,
                         offset,
+                        class.mem,
                         &loc,
                         op_size,
                         &mut addr_regs,
@@ -662,13 +669,15 @@ impl Aarch64CodeGen {
     /// When the pseudo is a stack object itself, its slot is the operand, and
     /// is rendered in place if the template's access can encode the offset:
     /// the operand's own size decides the scaled range, and an operand of no
-    /// natural access size gets only the unscaled one. Otherwise the object's
-    /// address goes in a register.
+    /// natural access size gets only the unscaled one -- and a `Q` operand,
+    /// which encodes a base register alone, no offset at all. Otherwise the
+    /// object's address goes in a register.
     #[allow(clippy::too_many_arguments)]
     fn memory_operand(
         &mut self,
         pseudo: PseudoId,
         object_offset: i64,
+        mem: Option<AsmMemClass>,
         loc: &Loc,
         size_bits: u32,
         regs: &mut OperandRegs,
@@ -693,7 +702,9 @@ impl Aarch64CodeGen {
                 let (base, offset) = self.loc_addr_parts(loc).unwrap();
                 let offset = offset + object_offset;
                 let bytes = i64::from(size_bits / 8);
-                let fits = if matches!(bytes, 1 | 2 | 4 | 8 | 16) {
+                let fits = if mem == Some(AsmMemClass::BaseOnly) {
+                    offset == 0
+                } else if matches!(bytes, 1 | 2 | 4 | 8 | 16) {
                     single_offset_fits(offset.into(), bytes)
                 } else {
                     (-256..=255).contains(&offset)
@@ -783,14 +794,6 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Check whether an inline-asm constraint string requires the
-    /// operand to be a memory operand. Mirrors x86_64's equivalent —
-    /// memory-class only (`m`/`o`/`V`/`Q`) returns true; any non-
-    /// memory class letter (`r`/`w`/`i`/`n`/`g`/`X`/`I`...`O` and the
-    /// aarch64 class letters `S`/`Y`/`Z`) defeats the requirement
-    /// because the operand can take its non-memory form. A
-    /// multi-alternative `"rm"` returns false (register or
-    /// memory both work; codegen picks register if available).
     /// Move an operand's value into a scratch vector register.
     fn emit_vec_load_from_loc(
         &mut self,
@@ -889,43 +892,6 @@ impl Aarch64CodeGen {
             64 => v.name_d(),
             _ => v.name_q(),
         }
-    }
-
-    /// Whether the constraint asks for a vector (SIMD/FP) register.
-    fn constraint_requires_vector(constraint: &str) -> bool {
-        constraint.chars().any(|c| matches!(c, 'w' | 'x' | 'y'))
-    }
-
-    /// Whether the constraint asks for the operand in a register at all,
-    /// general or vector — as opposed to an immediate or memory class.
-    /// Whether the constraint offers an immediate alternative.
-    fn constraint_allows_immediate(constraint: &str) -> bool {
-        constraint.chars().any(|c| {
-            matches!(
-                c,
-                'i' | 'n' | 'g' | 'X' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' | 'S' | 'Y' | 'Z'
-            )
-        }) || !Self::constraint_requires_reg_class(constraint)
-    }
-
-    fn constraint_requires_reg_class(constraint: &str) -> bool {
-        constraint
-            .chars()
-            .any(|c| matches!(c, 'r' | 'w' | 'x' | 'y'))
-    }
-
-    fn constraint_requires_memory(constraint: &str) -> bool {
-        let mut has_mem_class = false;
-        let mut has_non_mem_class = false;
-        for c in constraint.chars() {
-            match c {
-                'm' | 'o' | 'V' | 'Q' => has_mem_class = true,
-                'r' | 'w' | 'i' | 'n' | 'g' | 'X' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O'
-                | 'S' | 'Y' | 'Z' => has_non_mem_class = true,
-                _ => {}
-            }
-        }
-        has_mem_class && !has_non_mem_class
     }
 
     /// Convert a location to an asm operand string for AArch64

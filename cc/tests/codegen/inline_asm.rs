@@ -722,12 +722,9 @@ int main(void) {
 //
 // `"rm"`, `"ri"`, `"rmi"`, and `"g"` (= `"rmi"`) let the compiler choose
 // register vs memory vs immediate based on what fits cheapest given the
-// operand's location. C9a teaches the parser to build
-// `OperandConstraint::Alternatives`; C9b makes the x86_64 codegen's
-// `constraint_requires_register` / `constraint_requires_memory` honor
-// the alternatives (a constraint that lists any non-register class no
-// longer force-loads a spilled value into a temp register; a constraint
-// that lists any non-memory class no longer forces a memory operand).
+// operand's location. A constraint that lists any non-register class does
+// not force-load a spilled value into a temp register, and one that lists
+// any non-memory class does not force a memory operand.
 //
 // These tests are arch-independent — the patterns work on both x86_64
 // and aarch64 because the assembly inside the asm template uses

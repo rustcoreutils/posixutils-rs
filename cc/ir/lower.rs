@@ -329,7 +329,7 @@ fn resolve_constant_p(func: &mut Function) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::validate::{validate_function_at, Stage, ValidationError};
+    use crate::ir::validate::{validate_function_at, Invariant, Stage};
     use crate::ir::{BasicBlock, Instruction, Opcode, Pseudo, PseudoId};
     use crate::target::Target;
     use crate::types::TypeTable;
@@ -888,7 +888,7 @@ mod tests {
         let errors = validate_function_at(&func, Stage::Lowered).unwrap_err();
         assert!(errors
             .iter()
-            .all(|e| matches!(e, ValidationError::UnresolvedPlaceholder { .. })));
+            .all(|e| e.kind == Invariant::UnresolvedPlaceholder));
         lower_function(&mut func);
 
         let insn = &func.blocks[0].insns[1];

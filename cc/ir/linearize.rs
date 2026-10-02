@@ -10,6 +10,7 @@
 //
 
 use super::mem2reg::mem2reg;
+use super::memexpand::BlockOp;
 use super::ssa::ssa_convert;
 use super::{
     BasicBlock, BasicBlockId, CallAbiInfo, FenceScope, Function, Initializer, Instruction,
@@ -1020,6 +1021,11 @@ impl<'a> Linearizer<'a> {
             .and_then(|s| s.asm_label.as_deref())
             .map(crate::arch::lir::verbatim)
             .unwrap_or_else(|| self.str(name).to_string())
+    }
+
+    /// The width of a pointer: an address, and a saved stack pointer.
+    pub(crate) fn ptr_bits(&self) -> u32 {
+        self.types.size_bits(self.types.void_ptr_id)
     }
 
     /// The assembler name of the C library function `name`, for a call the
@@ -4651,26 +4657,27 @@ impl<'a> Linearizer<'a> {
     /// the call's value.
     fn emit_memory_fn(&mut self, mem: MemoryFn, args: [PseudoId; 3]) -> PseudoId {
         let [a, b, n] = args;
-        let (op, callee, dest, second) = match mem {
-            MemoryFn::Copy | MemoryFn::CopyToEnd => (Opcode::Memcpy, "memcpy", a, b),
-            MemoryFn::Set => (Opcode::Memset, "memset", a, b),
-            MemoryFn::Move => (Opcode::Memmove, "memmove", a, b),
-            MemoryFn::MoveSourceFirst => (Opcode::Memmove, "memmove", b, a),
+        let (op, dest, second) = match mem {
+            MemoryFn::Copy | MemoryFn::CopyToEnd => (BlockOp::Copy, a, b),
+            MemoryFn::Set => (BlockOp::Set, a, b),
+            MemoryFn::Move => (BlockOp::Move, a, b),
+            MemoryFn::MoveSourceFirst => (BlockOp::Move, b, a),
         };
         let ptr = self.types.void_ptr_id;
+        let ptr_bits = self.types.size_bits(ptr);
         let result = self.alloc_pseudo();
-        let callee = self.library_function_name(callee);
+        let callee = self.library_function_name(op.c_name());
         self.emit(
-            Instruction::new(op)
+            Instruction::new(op.opcode())
                 .with_func(callee)
                 .with_target(result)
                 .with_src3(dest, second, n)
-                .with_type_and_size(ptr, 64),
+                .with_type_and_size(ptr, ptr_bits),
         );
         match mem {
             MemoryFn::CopyToEnd => {
                 let end = self.alloc_pseudo();
-                self.emit(Instruction::binop(Opcode::Add, end, dest, n, ptr, 64));
+                self.emit(Instruction::binop(Opcode::Add, end, dest, n, ptr, ptr_bits));
                 end
             }
             // `bcopy` answers nothing: its `void` value is never read.
@@ -5583,7 +5590,7 @@ impl<'a> Linearizer<'a> {
                 let insn = Instruction::new(Opcode::Alloca)
                     .with_target(result)
                     .with_src(size_val)
-                    .with_type_and_size(self.types.void_ptr_id, 64);
+                    .with_type_and_size(self.types.void_ptr_id, self.ptr_bits());
                 self.emit(insn);
                 result
             }

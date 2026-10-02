@@ -64,18 +64,18 @@ pub(crate) fn run(func: &mut Function, types: &TypeTable, mi: &ModuleInfo) -> bo
         return false;
     }
     let am = AddrMap::build(func);
-    let facts = Facts {
+    let ctx = DseCtx {
         func,
         types,
         esc: &esc,
         am: &am,
         mi,
     };
-    let dead_at_end = facts.dead_locals_at_block_end();
+    let dead_at_end = ctx.dead_locals_at_block_end();
 
     let mut kills: Vec<(usize, usize)> = Vec::new();
     for b in 0..func.blocks.len() {
-        facts.scan_block(b, &dead_at_end, &mut kills);
+        ctx.scan_block(b, &dead_at_end, &mut kills);
     }
 
     for (b, i) in &kills {
@@ -92,7 +92,7 @@ struct Pending {
 
 /// What the pass knows about the function it is scanning.
 #[derive(Clone, Copy)]
-struct Facts<'a> {
+struct DseCtx<'a> {
     func: &'a Function,
     types: &'a TypeTable,
     esc: &'a EscapeInfo,
@@ -100,7 +100,7 @@ struct Facts<'a> {
     mi: &'a ModuleInfo,
 }
 
-impl Facts<'_> {
+impl DseCtx<'_> {
     /// Collect the dead stores in one block.
     fn scan_block(
         &self,
@@ -108,7 +108,7 @@ impl Facts<'_> {
         dead_at_end: &HashMap<BasicBlockId, HashSet<PseudoId>>,
         kills: &mut Vec<(usize, usize)>,
     ) {
-        let Facts {
+        let DseCtx {
             func,
             types,
             am,
@@ -173,7 +173,7 @@ impl Facts<'_> {
 
     /// Could `insn` read any byte of `loc`?
     fn may_read(&self, insn: &Instruction, loc: &MemLoc) -> bool {
-        let Facts {
+        let DseCtx {
             func, esc, am, mi, ..
         } = *self;
         match insn.op {
@@ -232,7 +232,7 @@ fn covers(later: &MemLoc, earlier: &MemLoc) -> bool {
     }
 }
 
-impl Facts<'_> {
+impl DseCtx<'_> {
     /// Which locals are never read again, at the end of each block.
     ///
     /// A backward "not read on any path from here" analysis, keyed by the
@@ -245,7 +245,7 @@ impl Facts<'_> {
     /// block-scope `static` is a `Global` here and so is never a candidate,
     /// which is the trap this guards.
     fn dead_locals_at_block_end(&self) -> HashMap<BasicBlockId, HashSet<PseudoId>> {
-        let Facts {
+        let DseCtx {
             func, types, esc, ..
         } = *self;
         let mut candidates: HashSet<PseudoId> = HashSet::new();

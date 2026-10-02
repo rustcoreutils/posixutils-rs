@@ -29,19 +29,20 @@
 // `Memmove`'s, and only the operation and the function it calls change.
 //
 
-use super::{callee_symbol, is_the_function, FoldCtx};
+use super::{callee_symbol, is_the_function, Callee, FoldCtx};
+use crate::ir::memexpand::BlockOp;
 use crate::ir::memloc::{AddrMap, MemBase};
 use crate::ir::strdata::ConstBytes;
 use crate::ir::{Function, Instruction, Opcode};
 
-/// The C name of the function a `Memcpy` calls.
-const MEMCPY: &str = "memcpy";
+/// The function a `Memcpy` calls.
+const MEMCPY: Callee = Callee::Block(BlockOp::Copy);
 
 /// Make every `Memmove` in `func` that cannot overlap a `Memcpy`. Answers
 /// whether anything changed.
 pub(super) fn run(func: &mut Function, ctx: &FoldCtx) -> bool {
     // `memcpy` written with `memmove` must not become a call to itself.
-    if is_the_function(func, ctx, MEMCPY) {
+    if is_the_function(func, ctx, MEMCPY.c_name()) {
         return false;
     }
     let am = AddrMap::build(func);
@@ -56,7 +57,7 @@ pub(super) fn run(func: &mut Function, ctx: &FoldCtx) -> bool {
     let symbol = callee_symbol(ctx, MEMCPY);
     for &(b, i) in &disjoint {
         let insn = &mut func.blocks[b].insns[i];
-        insn.op = Opcode::Memcpy;
+        insn.op = BlockOp::Copy.opcode();
         insn.extra_mut().func_name = Some(symbol.to_string());
     }
     !disjoint.is_empty()

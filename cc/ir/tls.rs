@@ -34,7 +34,7 @@
 //! allocator on Linux, and a plain non-TLS reference was printed on Darwin.
 
 use super::{Function, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
-use crate::types::TypeId;
+use crate::types::{TypeId, TypeTable};
 use std::collections::{BTreeMap, HashSet};
 
 /// Rewrite every thread-local access in `module` into an explicit address
@@ -44,9 +44,9 @@ use std::collections::{BTreeMap, HashSet};
 /// the backend uses to choose the dynamic model, and the two must agree, since
 /// the backend's own thread-local paths are what handle the other models.
 ///
-/// `ptr_type` types the addresses this pass introduces. What is accessed
+/// The addresses this pass introduces are `void *`s. What is accessed
 /// through them is irrelevant to how they are held.
-pub fn expand_dynamic_tls(module: &mut Module, dynamic: bool, ptr_type: TypeId) {
+pub fn expand_dynamic_tls(module: &mut Module, dynamic: bool, types: &TypeTable) {
     if !dynamic {
         return;
     }
@@ -63,8 +63,10 @@ pub fn expand_dynamic_tls(module: &mut Module, dynamic: bool, ptr_type: TypeId) 
         return;
     }
 
+    let ptr_type = types.void_ptr_id;
+    let ptr = (ptr_type, types.size_bits(ptr_type));
     for func in &mut module.functions {
-        expand_function(func, &tls, ptr_type);
+        expand_function(func, &tls, ptr);
     }
 }
 
@@ -86,7 +88,9 @@ fn tls_name(func: &Function, id: super::PseudoId, tls: &HashSet<String>) -> Opti
     }
 }
 
-fn expand_function(func: &mut Function, tls: &HashSet<String>, ptr_type: TypeId) {
+/// `ptr` is the type and width of the addresses it introduces.
+fn expand_function(func: &mut Function, tls: &HashSet<String>, ptr: (TypeId, u32)) {
+    let (ptr_type, ptr_bits) = ptr;
     for block_idx in 0..func.blocks.len() {
         let old = std::mem::take(&mut func.blocks[block_idx].insns);
         let mut new = Vec::with_capacity(old.len());
@@ -147,7 +151,7 @@ fn expand_function(func: &mut Function, tls: &HashSet<String>, ptr_type: TypeId)
                             base,
                             delta,
                             ptr_type,
-                            64,
+                            ptr_bits,
                         ));
                         addr
                     };
@@ -228,7 +232,7 @@ mod tests {
         let mut module = Module::default();
         module.globals.push(global);
         module.add_function(func);
-        expand_dynamic_tls(&mut module, true, types.void_ptr_id);
+        expand_dynamic_tls(&mut module, true, &types);
 
         let insns = &module.functions[0].blocks[0].insns;
         let tls: Vec<_> = insns.iter().filter(|i| i.op == Opcode::TlsAddr).collect();
@@ -294,7 +298,7 @@ mod tests {
         let mut module = Module::default();
         module.extern_tls_symbols.insert("x".to_string());
         module.add_function(func);
-        expand_dynamic_tls(&mut module, true, types.void_ptr_id);
+        expand_dynamic_tls(&mut module, true, &types);
 
         let insns = &module.functions[0].blocks[0].insns;
         let tls: Vec<_> = insns.iter().filter(|i| i.op == Opcode::TlsAddr).collect();

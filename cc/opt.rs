@@ -585,13 +585,14 @@ fn optimize_functions(
     let known = constglobal::KnownGlobals::collect(module, types);
     let mi = memloc::ModuleInfo::build(module, types);
     let bytes = ConstBytes::build(module, types);
-    let literals = libcall_fold::NewLiterals::new(&module.strings);
+    let (functions, strings, callees) = module.split_for_rewrite();
+    let literals = libcall_fold::NewLiterals::new(strings);
     let fold = libcall_fold::FoldCtx {
         types,
         target,
         mi: &mi,
         bytes: &bytes,
-        callees: &module.library_symbols,
+        callees,
         literals: &literals,
     };
     let ctx = PassCtx {
@@ -601,7 +602,7 @@ fn optimize_functions(
         fold: &fold,
     };
     let mut report = OptReport::default();
-    for func in &mut module.functions {
+    for func in functions {
         let c = optimize_function(func, &ctx, max_iterations);
         if !c.converged() {
             report.unconverged.push(c);
@@ -609,8 +610,6 @@ fn optimize_functions(
         // A local whose every access was forwarded or deleted needs no slot.
         mem2reg(func);
     }
-    let added = literals.into_added();
-    module.strings.extend(added);
     report
 }
 

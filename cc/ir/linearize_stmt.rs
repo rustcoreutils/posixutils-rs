@@ -300,7 +300,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // one dispatch block, which is the only place that fans out to
                 // the labels. See `Linearizer::indirect_dispatch`.
                 let void_ptr = self.types.void_ptr_id;
-                self.emit(Instruction::store(addr, slot, 0, void_ptr, 64));
+                self.emit(Instruction::store(addr, slot, 0, void_ptr, self.ptr_bits()));
                 self.emit(Instruction::br(dispatch_bb));
                 if let Some(current) = self.current_bb {
                     self.link_bb(current, dispatch_bb);
@@ -670,7 +670,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         );
 
         // Store num_elements into the hidden size variable
-        let store_size_insn = Instruction::store(num_elements, size_sym_id, 0, ulong_type, 64);
+        let ulong_bits = self.types.size_bits(ulong_type);
+        let store_size_insn =
+            Instruction::store(num_elements, size_sym_id, 0, ulong_type, ulong_bits);
         self.emit(store_size_insn);
 
         // Compute total size in bytes: num_elements * sizeof(element)
@@ -680,8 +682,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             .with_target(total_size)
             .with_src(num_elements)
             .with_src(elem_size_const)
-            .with_size(64)
-            .with_type(self.types.ulong_id);
+            .with_size(ulong_bits)
+            .with_type(ulong_type);
         self.emit(mul_insn);
 
         // Capture the stack pointer before this array is allocated, so
@@ -695,7 +697,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let alloca_insn = Instruction::new(Opcode::Alloca)
             .with_target(alloca_result)
             .with_src(total_size)
-            .with_type_and_size(self.types.void_ptr_id, 64);
+            .with_type_and_size(self.types.void_ptr_id, self.ptr_bits());
         self.emit(alloca_insn);
 
         // Create a symbol pseudo for the VLA pointer variable
@@ -717,7 +719,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         );
 
         // Store the Alloca result (pointer) into the VLA symbol
-        let store_insn = Instruction::store(alloca_result, sym_id, 0, ptr_type, 64);
+        let store_insn = Instruction::store(alloca_result, sym_id, 0, ptr_type, self.ptr_bits());
         self.emit(store_insn);
 
         // Track in linearizer's locals map with pointer type and VLA size info
@@ -1759,7 +1761,13 @@ impl<'a> super::linearize::Linearizer<'a> {
         let saved = self.current_bb;
         self.switch_bb(dispatch_bb);
         let loaded = self.alloc_pseudo();
-        self.emit(Instruction::load(loaded, slot, 0, void_ptr, 64));
+        self.emit(Instruction::load(
+            loaded,
+            slot,
+            0,
+            void_ptr,
+            self.ptr_bits(),
+        ));
         self.emit(Instruction::indirect_br(loaded));
         self.current_bb = saved;
 
@@ -3108,7 +3116,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.emit(
             Instruction::new(Opcode::StackSave)
                 .with_target(mark)
-                .with_type_and_size(self.types.void_ptr_id, 64),
+                .with_type_and_size(self.types.void_ptr_id, self.ptr_bits()),
         );
         self.vla_marks.push(super::linearize::VlaMark {
             mark,
@@ -3136,6 +3144,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let mut pending = std::mem::take(&mut self.pending_goto_vla);
         pending.sort_by_key(|p| (p.bb.0, std::cmp::Reverse(p.at)));
         let void_ptr = self.types.void_ptr_id;
+        let ptr_bits = self.ptr_bits();
         for p in pending {
             let Some(depth) = self.goto_target_vla_depth(&p.target) else {
                 continue;
@@ -3145,7 +3154,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             };
             let insn = Instruction::new(Opcode::StackRestore)
                 .with_src(mark)
-                .with_type_and_size(void_ptr, 64);
+                .with_type_and_size(void_ptr, ptr_bits);
             if let Some(func) = self.current_func.as_mut() {
                 if let Some(bb) = func.get_block_mut(p.bb) {
                     if p.at <= bb.insns.len() {
@@ -3255,7 +3264,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.emit(
             Instruction::new(Opcode::StackRestore)
                 .with_src(mark)
-                .with_type_and_size(self.types.void_ptr_id, 64),
+                .with_type_and_size(self.types.void_ptr_id, self.ptr_bits()),
         );
     }
 

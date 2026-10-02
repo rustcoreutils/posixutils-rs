@@ -1242,8 +1242,8 @@ fn implicit_param_copy(
     )
 }
 
-/// A pseudo to save the stack pointer in, with its type, when the callee
-/// `alloca`s.
+/// A pseudo to save the stack pointer in, with its type and width, when the
+/// callee `alloca`s.
 ///
 /// A call to a function that `alloca`s releases that memory when it
 /// returns. Spliced into the caller, the allocation would instead live
@@ -1253,17 +1253,29 @@ fn implicit_param_copy(
 /// inlined body is bracketed with a stack-pointer save and restore
 /// (`bracket_alloca`), which is exactly the lifetime the call had.
 ///
-/// The pointer type comes from the callee's own `Alloca`, which is what a
-/// saved stack pointer is: taking it from there needs no type table, which
-/// this pass does not have.
-fn alloca_stack_mark(ctx: &mut InlineContext, callee: &Function) -> Option<(PseudoId, TypeId)> {
-    callee
+/// The pointer type and width come from the callee's own `Alloca`, which is
+/// what a saved stack pointer is: taking them from there needs no type table,
+/// which this pass does not have.
+fn alloca_stack_mark(ctx: &mut InlineContext, callee: &Function) -> Option<StackMark> {
+    let alloca = callee
         .blocks
         .iter()
         .flat_map(|b| &b.insns)
-        .find(|i| i.op == Opcode::Alloca)
-        .and_then(|i| i.typ)
-        .map(|typ| (ctx.alloc_pseudo_id(), typ))
+        .find(|i| i.op == Opcode::Alloca)?;
+    let typ = alloca.typ?;
+    Some(StackMark {
+        pseudo: ctx.alloc_pseudo_id(),
+        typ,
+        size: alloca.size,
+    })
+}
+
+/// Where an inlined body that `alloca`s saves the stack pointer.
+#[derive(Clone, Copy)]
+struct StackMark {
+    pseudo: PseudoId,
+    typ: TypeId,
+    size: u32,
 }
 
 /// Save the stack pointer into `mark` just before the call block's branch
@@ -1272,7 +1284,7 @@ fn bracket_alloca(
     caller: &mut Function,
     call_bb_idx: usize,
     continuation_bb: &mut BasicBlock,
-    (mark, typ): (PseudoId, TypeId),
+    mark: StackMark,
 ) {
     // Before the branch into the body, which `split_caller_at_call` has
     // just put where the call was.
@@ -1281,8 +1293,8 @@ fn bracket_alloca(
     call_bb.insns.insert(
         at,
         Instruction::new(Opcode::StackSave)
-            .with_target(mark)
-            .with_type_and_size(typ, 64),
+            .with_target(mark.pseudo)
+            .with_type_and_size(mark.typ, mark.size),
     );
 
     // After any Phi, which has to stay at the head of the block, and before
@@ -1297,8 +1309,8 @@ fn bracket_alloca(
     continuation_bb.insns.insert(
         at,
         Instruction::new(Opcode::StackRestore)
-            .with_src(mark)
-            .with_type_and_size(typ, 64),
+            .with_src(mark.pseudo)
+            .with_type_and_size(mark.typ, mark.size),
     );
 }
 
@@ -1362,13 +1374,13 @@ fn add_inlined_pseudos(
     ctx: &mut InlineContext,
     cloned: Vec<Pseudo>,
     copy_temps: Vec<Pseudo>,
-    stack_mark: Option<(PseudoId, TypeId)>,
+    stack_mark: Option<StackMark>,
 ) {
     for pseudo in cloned.into_iter().chain(copy_temps) {
         ctx.caller.add_pseudo(pseudo);
     }
-    if let Some((mark, _)) = stack_mark {
-        ctx.caller.add_pseudo(Pseudo::undef(mark));
+    if let Some(mark) = stack_mark {
+        ctx.caller.add_pseudo(Pseudo::undef(mark.pseudo));
     }
     // A constant replaces the placeholder the clone made for the same id.
     for pseudo in std::mem::take(&mut ctx.const_pseudos) {

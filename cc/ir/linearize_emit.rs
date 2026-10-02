@@ -9,7 +9,7 @@
 //! Emit helpers for the linearizer (constants, block copies, bitfields, operators, assignments)
 
 use super::linearize::{BlockVolatility, LocalBinding, ObjectPlace, Storage};
-use super::memexpand;
+use super::memexpand::{self, BlockOp};
 use super::{BasicBlockId, CallAbiInfo, Instruction, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::abi::get_abi_for_conv;
 use crate::constexpr::ConstScope;
@@ -366,11 +366,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         let n = self.emit_const(size_bytes as i128, self.types.ulong_id);
         let result = self.alloc_pseudo();
         self.emit(
-            Instruction::new(Opcode::Memset)
-                .with_func(self.library_function_name("memset"))
+            Instruction::new(BlockOp::Set.opcode())
+                .with_func(self.library_function_name(BlockOp::Set.c_name()))
                 .with_target(result)
                 .with_src3(dst_ptr, byte, n)
-                .with_type_and_size(self.types.void_ptr_id, 64),
+                .with_type_and_size(self.types.void_ptr_id, self.ptr_bits()),
         );
     }
 
@@ -457,11 +457,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         let n = self.emit_const(size_bytes as i128, self.types.ulong_id);
         let result = self.alloc_pseudo();
         self.emit(
-            Instruction::new(Opcode::Memcpy)
-                .with_func(self.library_function_name("memcpy"))
+            Instruction::new(BlockOp::Copy.opcode())
+                .with_func(self.library_function_name(BlockOp::Copy.c_name()))
                 .with_target(result)
                 .with_src3(dst_ptr, src, n)
-                .with_type_and_size(self.types.void_ptr_id, 64),
+                .with_type_and_size(self.types.void_ptr_id, self.ptr_bits()),
         );
     }
 
@@ -2188,7 +2188,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 arg_vals,
                 arg_types,
                 arg_typ,
-                64,
+                self.ptr_bits(),
             )
         } else {
             Instruction::call(
@@ -2737,7 +2737,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             base,
             delta,
             self.types.long_id,
-            64,
+            self.types.size_bits(self.types.long_id),
         ));
         addr
     }
@@ -3068,7 +3068,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 rhs_extended,
                 scale,
                 self.types.long_id,
-                64,
+                self.types.size_bits(self.types.long_id),
             ));
             scaled
         } else if bool_rhs.is_some() || op != AssignOp::Assign {

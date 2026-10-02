@@ -3283,6 +3283,33 @@ pub const FOLD_CALLEES: &[&str] = &[
     "strlen", "strchr", "strcpy", "memcpy", "memset", "puts", "putchar", "fputs", "fputc", "fwrite",
 ];
 
+/// [`Module::strings`] and its index, borrowed apart from the rest of the
+/// module so that a pass rewriting its functions can add literals.
+pub struct StringPool<'a> {
+    strings: &'a mut Vec<(String, String)>,
+    idx: &'a mut AppendIndex,
+}
+
+impl StringPool<'_> {
+    /// The label of the literal holding `content`, added if there is none.
+    pub fn add(&mut self, content: String) -> String {
+        // One label per distinct contents. Minting a fresh one per occurrence
+        // made two identical literals two objects, which C17 6.4.5p7 permits
+        // but which no compiler does -- and it made `&"Foobar"[1] -
+        // &"Foobar"[0]` a difference between *different* symbols, so the
+        // static initializer could not be folded at all.
+        let found = self
+            .idx
+            .find(self.strings, |(_, c)| c.as_str(), content.as_str());
+        if let Some(i) = found {
+            return self.strings[i].0.clone();
+        }
+        let label = string_label(self.strings.len());
+        self.strings.push((label.clone(), content));
+        label
+    }
+}
+
 /// The label of the `index`th string literal in [`Module::strings`].
 pub(crate) fn string_label(index: usize) -> String {
     format!(".LC{index}")
@@ -3387,20 +3414,31 @@ impl Module {
 
     /// Add a string literal and return its label
     pub fn add_string(&mut self, content: String) -> String {
-        // One label per distinct contents. Minting a fresh one per occurrence
-        // made two identical literals two objects, which C17 6.4.5p7 permits
-        // but which no compiler does -- and it made `&"Foobar"[1] -
-        // &"Foobar"[0]` a difference between *different* symbols, so the
-        // static initializer could not be folded at all.
-        let found = self
-            .string_idx
-            .find(&self.strings, |(_, c)| c.as_str(), content.as_str());
-        if let Some(i) = found {
-            return self.strings[i].0.clone();
+        self.string_pool().add(content)
+    }
+
+    fn string_pool(&mut self) -> StringPool<'_> {
+        StringPool {
+            strings: &mut self.strings,
+            idx: &mut self.string_idx,
         }
-        let label = string_label(self.strings.len());
-        self.strings.push((label.clone(), content));
-        label
+    }
+
+    /// The functions, for a pass to rewrite, beside the literal pool the
+    /// rewrite may add to and the library functions it may call
+    /// (`library_symbols`).
+    pub fn split_for_rewrite(
+        &mut self,
+    ) -> (
+        &mut Vec<Function>,
+        StringPool<'_>,
+        &HashMap<&'static str, String>,
+    ) {
+        let pool = StringPool {
+            strings: &mut self.strings,
+            idx: &mut self.string_idx,
+        };
+        (&mut self.functions, pool, &self.library_symbols)
     }
 
     /// Intern a `u"..."` literal and return its label.

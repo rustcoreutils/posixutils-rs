@@ -1238,7 +1238,7 @@ fn process_file(
     ir::tls::expand_dynamic_tls(
         &mut module,
         target.tls_access(shared_mode).is_call(),
-        types.void_ptr_id,
+        &types,
     );
 
     dump_ir(args, &module, &types, "post-tls");

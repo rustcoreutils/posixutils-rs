@@ -50,38 +50,47 @@ impl<'a> Builder<'a> {
         self.out.push(insn);
     }
 
-    /// A load of `typ`, `size` bits wide, from `addr + at`.
+    /// The width a value of `typ` has in the IR.
+    fn bits(&self, typ: TypeId) -> u32 {
+        self.types.size_bits(typ)
+    }
+
+    /// A load of a `typ` from `addr + at`.
     ///
     /// Marked volatile when `typ` is, for the same reason and by the same rule
     /// as `Linearizer::mark_volatile_access`: an access this builds is as
     /// observable as one the program wrote, and a pass must not be able to
     /// introduce an unmarked access to a volatile object.
-    pub(crate) fn load(&mut self, addr: PseudoId, at: i64, typ: TypeId, size: u32) -> PseudoId {
+    pub(crate) fn load(&mut self, addr: PseudoId, at: i64, typ: TypeId) -> PseudoId {
         let v = self.func.alloc_pseudo();
         let vol = self.types.contains_volatile(typ);
+        let size = self.bits(typ);
         self.push(Instruction::load(v, addr, at, typ, size).with_volatile(vol));
         v
     }
 
-    /// A store of `v`, of `typ` and `size` bits wide, to `addr + at`.
-    pub(crate) fn store(&mut self, v: PseudoId, addr: PseudoId, at: i64, typ: TypeId, size: u32) {
+    /// A store of `v`, a `typ`, to `addr + at`.
+    pub(crate) fn store(&mut self, v: PseudoId, addr: PseudoId, at: i64, typ: TypeId) {
         let vol = self.types.contains_volatile(typ);
+        let size = self.bits(typ);
         self.push(Instruction::store(v, addr, at, typ, size).with_volatile(vol));
     }
 
-    /// A new integer constant of `typ` at `size` bits, with the `SetVal`
-    /// that gives it its width.
-    pub(crate) fn constant(&mut self, v: i128, typ: TypeId, size: u32) -> PseudoId {
+    /// A new integer constant of `typ`, with the `SetVal` that gives it its
+    /// width.
+    pub(crate) fn constant(&mut self, v: i128, typ: TypeId) -> PseudoId {
+        let size = self.bits(typ);
         let id = self.func.create_const_pseudo(at_width(v, size, true));
         self.push(Instruction::set_val(id, typ, size));
         id
     }
 
-    /// A new float constant of `typ` at `size` bits, with the `SetVal` that
-    /// gives it its width -- without one it would be read at 64 bits.
-    pub(crate) fn float_constant(&mut self, v: FloatVal, typ: TypeId, size: u32) -> PseudoId {
+    /// A new float constant of `typ`, with the `SetVal` that gives it its
+    /// width -- without one it would be read at 64 bits.
+    pub(crate) fn float_constant(&mut self, v: FloatVal, typ: TypeId) -> PseudoId {
         let id = self.func.alloc_pseudo();
         self.func.add_pseudo(Pseudo::fval(id, v));
+        let size = self.bits(typ);
         self.push(Instruction::set_val(id, typ, size));
         id
     }
@@ -95,78 +104,120 @@ impl<'a> Builder<'a> {
         p
     }
 
-    /// `op` of `a` and `b` into a new pseudo of `typ` at `size` bits.
-    pub(crate) fn binop(
-        &mut self,
-        op: Opcode,
-        a: PseudoId,
-        b: PseudoId,
-        typ: TypeId,
-        size: u32,
-    ) -> PseudoId {
+    /// `op` of `a` and `b` into a new pseudo of `typ`.
+    pub(crate) fn binop(&mut self, op: Opcode, a: PseudoId, b: PseudoId, typ: TypeId) -> PseudoId {
         let t = self.func.alloc_pseudo();
+        let size = self.bits(typ);
         self.push(Instruction::binop(op, t, a, b, typ, size));
         t
     }
 
-    /// A comparison `op` of `a` and `b`, of `typ` at `size` bits, into a new
-    /// `int` pseudo that is 0 or 1.
+    /// A comparison `op` of `a` and `b`, each a `typ`, into a new `int`
+    /// pseudo that is 0 or 1.
     pub(crate) fn compare(
         &mut self,
         op: Opcode,
         a: PseudoId,
         b: PseudoId,
         typ: TypeId,
-        size: u32,
     ) -> PseudoId {
         let t = self.func.alloc_pseudo();
         let int = self.types.int_id;
-        let int_bits = self.types.size_bits(int);
+        let operands = (typ, self.bits(typ));
         self.push(Instruction::compare(
             op,
             t,
             (a, b),
-            (typ, size),
-            (int, int_bits),
+            operands,
+            (int, self.bits(int)),
         ));
         t
     }
 
-    /// A conversion `op` of `src`, of `from` at `from_size` bits, to `to` at
-    /// `size` bits.
+    /// A conversion `op` of `src`, a `from`, to a `to`.
     pub(crate) fn convert(
         &mut self,
         op: Opcode,
         src: PseudoId,
-        (from, from_size): (TypeId, u32),
-        (to, size): (TypeId, u32),
+        from: TypeId,
+        to: TypeId,
     ) -> PseudoId {
         let t = self.func.alloc_pseudo();
-        let mut insn = Instruction::unop(op, t, src, to, size);
-        insn.src_size = from_size;
+        let mut insn = Instruction::unop(op, t, src, to, self.bits(to));
+        insn.src_size = self.bits(from);
         insn.src_typ = Some(from);
         self.push(insn);
         t
     }
 
-    /// `cond ? a : b`, of `typ` at `size` bits.
+    /// `cond ? a : b`, of `typ`.
     pub(crate) fn select(
         &mut self,
         cond: PseudoId,
         a: PseudoId,
         b: PseudoId,
         typ: TypeId,
-        size: u32,
     ) -> PseudoId {
         let t = self.func.alloc_pseudo();
+        let size = self.bits(typ);
         self.push(Instruction::select(t, cond, a, b, typ, size));
         t
     }
 
-    /// `target` defined as a copy of `src`, of `typ` at `size` bits: how a
-    /// rewritten instruction's own result is given its new value, keeping the
-    /// pseudo every use already names.
-    pub(crate) fn copy_into(&mut self, target: PseudoId, src: PseudoId, typ: TypeId, size: u32) {
+    /// `target` defined as a copy of `src`, of `typ`: how a rewritten
+    /// instruction's own result is given its new value, keeping the pseudo
+    /// every use already names.
+    pub(crate) fn copy_into(&mut self, target: PseudoId, src: PseudoId, typ: TypeId) {
+        let size = self.bits(typ);
         self.push(Instruction::unop(Opcode::Copy, target, src, typ, size));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::target::Target;
+
+    /// Every value the builder makes is as wide as its type: a pass names
+    /// the type, and the target's widths follow from it.
+    #[test]
+    fn widths_follow_from_types() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = Function::new("f", types.void_id);
+        let mut out = Vec::new();
+        let mut b = Builder::new(&mut func, &types, None, &mut out);
+        let (uchar, int, ulong) = (types.uchar_id, types.int_id, types.ulong_id);
+        let (ptr, dbl) = (types.void_ptr_id, types.double_id);
+        let p = b.load(PseudoId(0), 0, ptr);
+        let c = b.load(p, 0, uchar);
+        let w = b.convert(Opcode::Zext, c, uchar, int);
+        let k = b.constant(3, ulong);
+        let sum = b.binop(Opcode::Add, p, k, ptr);
+        let lt = b.compare(Opcode::SetB, k, k, ulong);
+        b.select(lt, sum, p, ptr);
+        let f = b.float_constant(FloatVal::from_f64(1.0), dbl);
+        b.store(w, p, 0, int);
+        b.store(f, p, 8, dbl);
+        b.copy_into(PseudoId(1), sum, ptr);
+        let bits = |t| types.size_bits(t);
+        let widths: Vec<_> = out.iter().map(|i| (i.op, i.size)).collect();
+        assert_eq!(
+            widths,
+            [
+                (Opcode::Load, bits(ptr)),
+                (Opcode::Load, bits(uchar)),
+                (Opcode::Zext, bits(int)),
+                (Opcode::SetVal, bits(ulong)),
+                (Opcode::Add, bits(ptr)),
+                (Opcode::SetB, bits(int)),
+                (Opcode::Select, bits(ptr)),
+                (Opcode::SetVal, bits(dbl)),
+                (Opcode::Store, bits(int)),
+                (Opcode::Store, bits(dbl)),
+                (Opcode::Copy, bits(ptr)),
+            ]
+        );
+        assert_eq!(out[2].src_size, bits(uchar));
+        assert_eq!(out[5].operand_width(), bits(ulong));
     }
 }

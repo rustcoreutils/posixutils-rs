@@ -190,25 +190,107 @@ pub enum LibFn {
     DivComplex,
 }
 
+/// The kinds of [`LibFn`], by what a call to one does: the optimizer folds
+/// each kind by its own rules (`ir::libcall_fold`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibFamily {
+    /// A `<string.h>` function that reads strings and computes a value,
+    /// writing nothing.
+    StringQuery,
+    /// A function that writes a string: `strcpy` and its kin, and `sprintf`.
+    StringWrite,
+    /// A `<stdio.h>` output function.
+    Output,
+    /// A libgcc complex `*` or `/` routine.
+    ComplexArith,
+}
+
 impl LibFn {
+    /// What kind of function this is.
+    pub fn family(self) -> LibFamily {
+        use LibFn as L;
+        match self {
+            L::Strlen
+            | L::Strnlen
+            | L::Strcmp
+            | L::Strncmp
+            | L::Memcmp
+            | L::Strchr
+            | L::Strrchr
+            | L::Memchr
+            | L::Strstr
+            | L::Strpbrk
+            | L::Strcspn => LibFamily::StringQuery,
+            L::Strcpy | L::Stpcpy | L::Strncpy | L::Strcat | L::Strncat | L::Sprintf => {
+                LibFamily::StringWrite
+            }
+            L::Printf
+            | L::PrintfUnlocked
+            | L::Vprintf
+            | L::PrintfChk
+            | L::VprintfChk
+            | L::Fprintf
+            | L::FprintfUnlocked
+            | L::Vfprintf
+            | L::FprintfChk
+            | L::VfprintfChk
+            | L::Fputs
+            | L::FputsUnlocked
+            | L::Puts
+            | L::Putchar
+            | L::Fputc
+            | L::Fwrite => LibFamily::Output,
+            L::MulComplex | L::DivComplex => LibFamily::ComplexArith,
+        }
+    }
+
     /// Whether the function reads memory and writes none, so a call to it
     /// leaves every object as it found it.
     pub fn only_reads(self) -> bool {
+        self.family() == LibFamily::StringQuery
+    }
+
+    /// The function's name in C, which a call an optimizer pass makes to it
+    /// calls: `strchr`, never its old spelling `index`. None for the libgcc
+    /// complex routines, which are named by the format they compute in.
+    pub fn c_name(self) -> Option<&'static str> {
         use LibFn as L;
-        matches!(
-            self,
-            L::Strlen
-                | L::Strnlen
-                | L::Strcmp
-                | L::Strncmp
-                | L::Memcmp
-                | L::Strchr
-                | L::Strrchr
-                | L::Memchr
-                | L::Strstr
-                | L::Strpbrk
-                | L::Strcspn
-        )
+        Some(match self {
+            L::Strlen => "strlen",
+            L::Strnlen => "strnlen",
+            L::Strcmp => "strcmp",
+            L::Strncmp => "strncmp",
+            L::Memcmp => "memcmp",
+            L::Strchr => "strchr",
+            L::Strrchr => "strrchr",
+            L::Memchr => "memchr",
+            L::Strstr => "strstr",
+            L::Strpbrk => "strpbrk",
+            L::Strcspn => "strcspn",
+            L::Strcpy => "strcpy",
+            L::Stpcpy => "stpcpy",
+            L::Strncpy => "strncpy",
+            L::Strcat => "strcat",
+            L::Strncat => "strncat",
+            L::Sprintf => "sprintf",
+            L::Printf => "printf",
+            L::PrintfUnlocked => "printf_unlocked",
+            L::Vprintf => "vprintf",
+            L::PrintfChk => "__printf_chk",
+            L::VprintfChk => "__vprintf_chk",
+            L::Fprintf => "fprintf",
+            L::FprintfUnlocked => "fprintf_unlocked",
+            L::Vfprintf => "vfprintf",
+            L::FprintfChk => "__fprintf_chk",
+            L::VfprintfChk => "__vfprintf_chk",
+            L::Fputs => "fputs",
+            L::FputsUnlocked => "fputs_unlocked",
+            L::Puts => "puts",
+            L::Putchar => "putchar",
+            L::Fputc => "fputc",
+            L::Fwrite => "fwrite",
+            L::MulComplex | L::DivComplex => return None,
+        })
     }
 }
 

@@ -165,7 +165,7 @@ pub(crate) fn overlapping_halves(bits: u32) -> Option<(i64, i64)> {
 
 /// The three block memory operations, and how far each is expanded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BlockOp {
+pub(crate) enum BlockOp {
     Copy,
     Set,
     Move,
@@ -181,6 +181,24 @@ impl BlockOp {
         }
     }
 
+    /// The IR operation that performs it.
+    pub(crate) fn opcode(self) -> Opcode {
+        match self {
+            BlockOp::Copy => Opcode::Memcpy,
+            BlockOp::Set => Opcode::Memset,
+            BlockOp::Move => Opcode::Memmove,
+        }
+    }
+
+    /// The library function it calls where it is not expanded.
+    pub(crate) fn c_name(self) -> &'static str {
+        match self {
+            BlockOp::Copy => "memcpy",
+            BlockOp::Set => "memset",
+            BlockOp::Move => "memmove",
+        }
+    }
+
     fn limit(self) -> i64 {
         match self {
             BlockOp::Copy | BlockOp::Set => INLINE_LIMIT_BYTES,
@@ -193,12 +211,13 @@ impl BlockOp {
 /// constant. Answers whether anything changed.
 pub fn run(func: &mut Function, types: &TypeTable) -> bool {
     let consts = ConstMap::new(func);
+    let size_t_bits = types.size_bits(types.ulong_id);
     let mut changed = false;
     for b in 0..func.blocks.len() {
         let insns = std::mem::take(&mut func.blocks[b].insns);
         let mut out = Vec::with_capacity(insns.len());
         for insn in insns {
-            match expandable(&insn, &consts) {
+            match expandable(&insn, &consts, size_t_bits) {
                 Some((op, n)) => {
                     Expander {
                         b: Builder::new(&mut *func, types, insn.pos, &mut out),
@@ -217,12 +236,12 @@ pub fn run(func: &mut Function, types: &TypeTable) -> bool {
 }
 
 /// The operation `insn` is and its length, when it is one to expand.
-fn expandable(insn: &Instruction, consts: &ConstMap) -> Option<(BlockOp, i64)> {
+fn expandable(insn: &Instruction, consts: &ConstMap, size_t_bits: u32) -> Option<(BlockOp, i64)> {
     let op = BlockOp::of(insn.op)?;
     let &[_, _, n] = insn.src.as_slice() else {
         return None;
     };
-    let n = i64::try_from(consts.get_at(n, 64, false)?).ok()?;
+    let n = i64::try_from(consts.get_at(n, size_t_bits, false)?).ok()?;
     (0..=op.limit()).contains(&n).then_some((op, n))
 }
 
@@ -265,18 +284,18 @@ impl Expander<'_> {
         // Each returns its destination.
         if let Some(target) = self.model.target {
             let typ = self.model.typ.unwrap_or(self.b.types.void_ptr_id);
-            self.b.copy_into(target, dest, typ, 64);
+            self.b.copy_into(target, dest, typ);
         }
     }
 
     fn load(&mut self, addr: PseudoId, at: i64, chunk: Chunk) -> PseudoId {
         let typ = chunk.typ(self.b.types);
-        self.b.load(addr, at, typ, chunk.bits())
+        self.b.load(addr, at, typ)
     }
 
     fn store(&mut self, v: PseudoId, addr: PseudoId, at: i64, chunk: Chunk) {
         let typ = chunk.typ(self.b.types);
-        self.b.store(v, addr, at, typ, chunk.bits());
+        self.b.store(v, addr, at, typ);
     }
 }
 
@@ -313,17 +332,12 @@ impl Fill {
         }
         let typ = chunk.typ(ex.types);
         let v = match self.byte {
-            Some(byte) => ex.constant(i128::from(byte) * BYTE_REPEAT, typ, chunk.bits()),
+            Some(byte) => ex.constant(i128::from(byte) * BYTE_REPEAT, typ),
             None => {
                 let word = self.word(ex);
                 match chunk {
                     Chunk::B8 => word,
-                    _ => ex.convert(
-                        Opcode::Trunc,
-                        word,
-                        (ex.types.ulong_id, 64),
-                        (typ, chunk.bits()),
-                    ),
+                    _ => ex.convert(Opcode::Trunc, word, ex.types.ulong_id, typ),
                 }
             }
         };
@@ -337,11 +351,11 @@ impl Fill {
             return w;
         }
         let (uint, ulong) = (ex.types.uint_id, ex.types.ulong_id);
-        let mask = ex.constant(0xff, uint, 32);
-        let byte = ex.binop(Opcode::And, self.c, mask, uint, 32);
-        let wide = ex.convert(Opcode::Zext, byte, (uint, 32), (ulong, 64));
-        let repeat = ex.constant(BYTE_REPEAT, ulong, 64);
-        let w = ex.binop(Opcode::Mul, wide, repeat, ulong, 64);
+        let mask = ex.constant(0xff, uint);
+        let byte = ex.binop(Opcode::And, self.c, mask, uint);
+        let wide = ex.convert(Opcode::Zext, byte, uint, ulong);
+        let repeat = ex.constant(BYTE_REPEAT, ulong);
+        let w = ex.binop(Opcode::Mul, wide, repeat, ulong);
         self.word = Some(w);
         w
     }

@@ -168,6 +168,8 @@ pub(crate) struct StrReader<'a> {
     data: &'a ConstBytes,
     func: &'a Function,
     am: &'a AddrMap,
+    /// The width of an address: what pointer arithmetic is done at.
+    ptr_bits: u32,
     /// Where a local array's bytes are read, when they are.
     locals: Option<LocalBytes<'a>>,
 }
@@ -184,11 +186,17 @@ pub(crate) struct LocalBytes<'a> {
 }
 
 impl<'a> StrReader<'a> {
-    pub(crate) fn new(data: &'a ConstBytes, func: &'a Function, am: &'a AddrMap) -> Self {
+    pub(crate) fn new(
+        data: &'a ConstBytes,
+        func: &'a Function,
+        am: &'a AddrMap,
+        types: &TypeTable,
+    ) -> Self {
         StrReader {
             data,
             func,
             am,
+            ptr_bits: types.size_bits(types.void_ptr_id),
             locals: None,
         }
     }
@@ -257,7 +265,7 @@ impl<'a> StrReader<'a> {
                 open.remove(&p);
                 joined
             }
-            (Opcode::Add, &[a, b]) if def.size == 64 => {
+            (Opcode::Add, &[a, b]) if def.size == self.ptr_bits => {
                 self.minus_offset(a, b).or_else(|| self.minus_offset(b, a))
             }
             _ => None,
@@ -493,7 +501,7 @@ pub(crate) mod fixture {
             let bytes = ConstBytes::build(&self.module, &self.types);
             let f = &self.module.functions[0];
             let am = AddrMap::build(f);
-            StrReader::new(&bytes, f, &am).string_len(p)
+            StrReader::new(&bytes, f, &am, &self.types).string_len(p)
         }
 
         /// What `string_len` answers for `p` reading local arrays too, as
@@ -510,7 +518,7 @@ pub(crate) mod fixture {
                 site: (0, f.blocks[0].insns.len()),
                 little_endian: true,
             };
-            StrReader::new(&bytes, f, &am)
+            StrReader::new(&bytes, f, &am, &self.types)
                 .with_locals(locals)
                 .string_len(p)
         }
@@ -520,7 +528,7 @@ pub(crate) mod fixture {
             let bytes = ConstBytes::build(&self.module, &self.types);
             let f = &self.module.functions[0];
             let am = AddrMap::build(f);
-            let s = StrReader::new(&bytes, f, &am).string_at(p)?;
+            let s = StrReader::new(&bytes, f, &am, &self.types).string_at(p)?;
             s.c_str().map(<[u8]>::to_vec)
         }
     }

@@ -627,7 +627,7 @@ impl Linearizer<'_> {
             extended,
             scale,
             self.types.long_id,
-            64,
+            self.types.size_bits(self.types.long_id),
         ));
         scaled
     }

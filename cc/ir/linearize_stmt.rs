@@ -12,7 +12,8 @@ use super::asm_operand::AddrWalk;
 use super::linearize::*;
 use super::linearize_emit::Controlling;
 use super::{
-    AsmConstraint, AsmData, BasicBlockId, Initializer, Instruction, Opcode, Pseudo, PseudoId,
+    AsmConstraint, AsmData, BasicBlockId, GlobalStorage, Initializer, Instruction, Opcode, Pseudo,
+    PseudoId,
 };
 use crate::arch::asm_constraints::{AsmAccess, AsmOperandClass};
 use crate::constexpr::ConstScope;
@@ -872,28 +873,21 @@ impl<'a> super::linearize::Linearizer<'a> {
         // anything about the type: a structure's type is its tag's and never
         // carries one, so asking the type made `static _Thread_local struct S
         // s;` one object shared by every thread.
-        if declarator
-            .storage_class
-            .contains(TypeModifiers::THREAD_LOCAL)
-        {
-            self.module.add_global_tls_aligned(
-                &global_name,
-                declarator.typ,
-                init,
-                declarator.explicit_align,
-                true, // static locals always have internal linkage
-                is_const,
-            );
-        } else {
-            self.module.add_global_aligned(
-                &global_name,
-                declarator.typ,
-                init,
-                declarator.explicit_align,
-                true, // static locals always have internal linkage
-                is_const,
-            );
-        }
+        let storage = GlobalStorage {
+            // Static locals always have internal linkage.
+            is_static: true,
+            is_const,
+            is_thread_local: declarator
+                .storage_class
+                .contains(TypeModifiers::THREAD_LOCAL),
+        };
+        self.module.define_global(
+            &global_name,
+            declarator.typ,
+            init,
+            declarator.explicit_align,
+            storage,
+        );
     }
 
     /// Linearize an initializer list for arrays or structs

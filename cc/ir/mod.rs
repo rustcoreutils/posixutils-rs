@@ -3011,13 +3011,16 @@ impl fmt::Display for Initializer {
 
 /// How a global is stored, as three facts that always travel together.
 ///
-/// Passed as one value because they are three of the eight arguments
-/// `add_global_impl` otherwise takes, and three adjacent booleans at a call
-/// site say nothing about which is which.
-struct GlobalStorage {
-    is_static: bool,
-    is_const: bool,
-    is_thread_local: bool,
+/// Passed to [`Module::define_global`] as one value because three adjacent
+/// booleans at a call site say nothing about which is which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GlobalStorage {
+    /// Internal linkage.
+    pub(crate) is_static: bool,
+    /// A `const`-qualified object: see `GlobalDef::is_const`.
+    pub(crate) is_const: bool,
+    /// C11 `_Thread_local` / GCC `__thread`.
+    pub(crate) is_thread_local: bool,
 }
 
 /// A global variable definition with full metadata
@@ -3173,38 +3176,43 @@ pub struct Module {
     /// "may a fold call this?" and "by what name?".
     pub library_symbols: HashMap<&'static str, String>,
     /// Where each global is in `globals`, by name: see `Module::global_mut`.
-    global_idx: GlobalIndex,
+    global_idx: AppendIndex,
+    /// Where each literal is in `strings`, by contents: see
+    /// `Module::add_string`.
+    string_idx: AppendIndex,
 }
 
-/// The position of each global in `Module::globals`, by name.
+/// The position of each item in one of `Module`'s lists, by a key the item
+/// carries: a global's name, a literal's contents.
 ///
-/// `globals` is only ever appended to, by this module and by the passes that
-/// push to it directly, so the index catches up with whatever was appended
-/// since it last looked, and each global is indexed once. A hit is checked
-/// against the name it claims, and a mismatch -- which an append cannot
-/// cause -- rebuilds the whole index rather than answering wrongly.
+/// Those lists are only ever appended to, by this module and by the passes
+/// that push to them directly, so the index catches up with whatever was
+/// appended since it last looked, and each item is indexed once. A hit is
+/// checked against the key it claims, and a mismatch -- which an append
+/// cannot cause -- rebuilds the whole index rather than answering wrongly.
 #[derive(Debug, Clone, Default)]
-struct GlobalIndex {
+struct AppendIndex {
     pos: HashMap<String, usize>,
     indexed: usize,
 }
 
-impl GlobalIndex {
-    fn find(&mut self, globals: &[GlobalDef], name: &str) -> Option<usize> {
-        if self.indexed > globals.len() {
-            *self = GlobalIndex::default();
+impl AppendIndex {
+    /// The position of the first item in `items` whose `key` is `want`.
+    fn find<T>(&mut self, items: &[T], key: impl Fn(&T) -> &str, want: &str) -> Option<usize> {
+        if self.indexed > items.len() {
+            *self = AppendIndex::default();
         }
-        for (i, g) in globals.iter().enumerate().skip(self.indexed) {
-            // The first definition of a name is the one a lookup finds.
-            self.pos.entry(g.name.clone()).or_insert(i);
+        for (i, item) in items.iter().enumerate().skip(self.indexed) {
+            // The first item with a key is the one a lookup finds.
+            self.pos.entry(key(item).to_string()).or_insert(i);
         }
-        self.indexed = globals.len();
-        let i = *self.pos.get(name)?;
-        if globals[i].name == name {
+        self.indexed = items.len();
+        let i = *self.pos.get(want)?;
+        if key(&items[i]) == want {
             return Some(i);
         }
-        *self = GlobalIndex::default();
-        self.find(globals, name)
+        *self = AppendIndex::default();
+        self.find(items, key, want)
     }
 }
 
@@ -3231,68 +3239,19 @@ impl Module {
         self.globals.push(GlobalDef::new(name, typ, init));
     }
 
-    /// Add a global variable with explicit alignment (C11 _Alignas)
-    /// Handles C tentative definitions: if a global with the same name exists
-    /// and has Initializer::None (tentative), replace it with the new definition.
-    pub fn add_global_aligned(
-        &mut self,
-        name: impl Into<String>,
-        typ: TypeId,
-        init: Initializer,
-        align: Option<u32>,
-        is_static: bool,
-        is_const: bool,
-    ) {
-        self.add_global_impl(
-            name,
-            typ,
-            init,
-            align,
-            GlobalStorage {
-                is_static,
-                is_const,
-                is_thread_local: false,
-            },
-        );
-    }
-
-    /// Add a thread-local global variable with explicit alignment (C11 _Alignas)
-    /// Handles C tentative definitions: if a global with the same name exists
-    /// and has Initializer::None (tentative), replace it with the new definition.
-    pub fn add_global_tls_aligned(
-        &mut self,
-        name: impl Into<String>,
-        typ: TypeId,
-        init: Initializer,
-        align: Option<u32>,
-        is_static: bool,
-        is_const: bool,
-    ) {
-        self.add_global_impl(
-            name,
-            typ,
-            init,
-            align,
-            GlobalStorage {
-                is_static,
-                is_const,
-                is_thread_local: true,
-            },
-        );
-    }
-
     /// The global named `name`, without a walk of every global: a unit with
     /// 100,000 of them spent fifteen seconds finding each one.
     fn global_mut(&mut self, name: &str) -> Option<&mut GlobalDef> {
-        let i = self.global_idx.find(&self.globals, name)?;
+        let i = self
+            .global_idx
+            .find(&self.globals, |g| g.name.as_str(), name)?;
         Some(&mut self.globals[i])
     }
 
     /// Attach the symbol-emission attributes to a global already added.
     ///
-    /// Set after the fact rather than threaded through `add_global_impl`,
-    /// which already takes four positional booleans; a fifth positional
-    /// argument that is a struct would be worse to read at every call site.
+    /// Set after the fact rather than passed to `define_global`, because only
+    /// a file-scope definition carries any; a static local has none to pass.
     pub fn set_symbol_attrs(&mut self, name: &str, attrs: crate::parse::ast::SymbolAttrs) {
         if attrs.is_empty() {
             return;
@@ -3311,7 +3270,13 @@ impl Module {
         self.declared_symbol_attrs.insert(name.to_string(), attrs);
     }
 
-    fn add_global_impl(
+    /// Define a global, with its explicit alignment (C11 `_Alignas`) if it
+    /// has one.
+    ///
+    /// A C tentative definition is completed rather than duplicated: if a
+    /// global of the same name exists with `Initializer::None`, this
+    /// definition replaces it.
+    pub(crate) fn define_global(
         &mut self,
         name: impl Into<String>,
         typ: TypeId,
@@ -3367,8 +3332,11 @@ impl Module {
         // but which no compiler does -- and it made `&"Foobar"[1] -
         // &"Foobar"[0]` a difference between *different* symbols, so the
         // static initializer could not be folded at all.
-        if let Some((label, _)) = self.strings.iter().find(|(_, c)| *c == content) {
-            return label.clone();
+        let found = self
+            .string_idx
+            .find(&self.strings, |(_, c)| c.as_str(), content.as_str());
+        if let Some(i) = found {
+            return self.strings[i].0.clone();
         }
         let label = string_label(self.strings.len());
         self.strings.push((label.clone(), content));
@@ -3952,74 +3920,171 @@ mod tests {
         }
     }
 
+    fn storage(is_static: bool, is_const: bool, is_thread_local: bool) -> GlobalStorage {
+        GlobalStorage {
+            is_static,
+            is_const,
+            is_thread_local,
+        }
+    }
+
     #[test]
-    fn test_add_global_aligned_tentative_definition() {
+    fn test_define_global_tentative_definition() {
         let types = TypeTable::new(&Target::host());
         let mut module = Module::default();
+        let plain = storage(false, false, false);
 
         // Add a tentative definition (no initializer)
-        module.add_global_aligned("x", types.int_id, Initializer::None, None, false, false);
+        module.define_global("x", types.int_id, Initializer::None, None, plain);
         assert_eq!(module.globals.len(), 1);
         assert!(matches!(module.globals[0].init, Initializer::None));
 
         // Add actual definition - should replace the tentative one
-        module.add_global_aligned(
-            "x",
-            types.int_id,
-            Initializer::Int(42),
-            Some(4),
-            false,
-            false,
-        );
+        module.define_global("x", types.int_id, Initializer::Int(42), Some(4), plain);
         assert_eq!(module.globals.len(), 1); // Still only one global
         assert!(matches!(module.globals[0].init, Initializer::Int(42)));
         assert_eq!(module.globals[0].explicit_align, Some(4));
     }
 
     #[test]
-    fn test_add_global_aligned_non_tentative_not_replaced() {
+    fn test_define_global_non_tentative_not_replaced() {
         let types = TypeTable::new(&Target::host());
         let mut module = Module::default();
+        let plain = storage(false, false, false);
 
         // Add a real definition (with initializer)
-        module.add_global_aligned("x", types.int_id, Initializer::Int(10), None, false, false);
+        module.define_global("x", types.int_id, Initializer::Int(10), None, plain);
         assert_eq!(module.globals.len(), 1);
 
         // Add another definition with same name - should NOT replace (adds new entry)
-        module.add_global_aligned("x", types.int_id, Initializer::Int(20), None, false, false);
+        module.define_global("x", types.int_id, Initializer::Int(20), None, plain);
         assert_eq!(module.globals.len(), 2); // Two globals now (linker will error)
     }
 
     #[test]
-    fn test_add_global_tls_aligned_tentative_definition() {
+    fn test_define_global_tls_tentative_definition() {
         let types = TypeTable::new(&Target::host());
         let mut module = Module::default();
+        let tls = storage(false, false, true);
 
         // Add a TLS tentative definition
-        module.add_global_tls_aligned(
-            "tls_var",
-            types.int_id,
-            Initializer::None,
-            None,
-            false,
-            false,
-        );
+        module.define_global("tls_var", types.int_id, Initializer::None, None, tls);
         assert_eq!(module.globals.len(), 1);
         assert!(matches!(module.globals[0].init, Initializer::None));
 
         // Add actual TLS definition - should replace
-        module.add_global_tls_aligned(
-            "tls_var",
-            types.int_id,
-            Initializer::Int(100),
-            Some(8),
-            false,
-            false,
-        );
+        let init = Initializer::Int(100);
+        module.define_global("tls_var", types.int_id, init, Some(8), tls);
         assert_eq!(module.globals.len(), 1);
         assert!(matches!(module.globals[0].init, Initializer::Int(100)));
         assert!(module.globals[0].is_thread_local);
         assert_eq!(module.globals[0].explicit_align, Some(8));
+    }
+
+    /// Each of the eight storages reaches the definition as given.
+    #[test]
+    fn test_define_global_every_storage() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::default();
+        let mut all = Vec::new();
+        for bits in 0..8u8 {
+            let st = storage(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+            let name = format!("g{bits}");
+            module.define_global(&name, types.int_id, Initializer::Int(1), None, st);
+            all.push((name, st));
+        }
+        assert_eq!(module.globals.len(), 8);
+        for (g, (name, st)) in module.globals.iter().zip(&all) {
+            assert_eq!(&g.name, name);
+            let got = storage(g.is_static, g.is_const, g.is_thread_local);
+            assert_eq!(got, *st, "{name}");
+        }
+    }
+
+    /// Completing a tentative definition takes the definition's linkage,
+    /// keeps `const` and thread-local storage from either declaration, and
+    /// keeps the tentative one's alignment when the definition has none.
+    #[test]
+    fn test_define_global_completion_merges_storage() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::default();
+        let int = types.int_id;
+        module.define_global(
+            "a",
+            int,
+            Initializer::None,
+            Some(16),
+            storage(true, true, true),
+        );
+        module.define_global(
+            "a",
+            int,
+            Initializer::Int(1),
+            None,
+            storage(false, false, false),
+        );
+        let a = &module.globals[0];
+        assert_eq!(
+            storage(a.is_static, a.is_const, a.is_thread_local),
+            storage(false, true, true)
+        );
+        assert_eq!(a.explicit_align, Some(16));
+
+        module.define_global(
+            "b",
+            int,
+            Initializer::None,
+            None,
+            storage(false, false, false),
+        );
+        module.define_global(
+            "b",
+            int,
+            Initializer::Int(2),
+            None,
+            storage(true, true, true),
+        );
+        let b = &module.globals[1];
+        assert_eq!(
+            storage(b.is_static, b.is_const, b.is_thread_local),
+            storage(true, true, true)
+        );
+        assert_eq!(module.globals.len(), 2);
+    }
+
+    /// One label per distinct contents, from the index and from a linear
+    /// search alike, including for literals a pass appended directly.
+    #[test]
+    fn test_add_string_dedupes() {
+        let mut module = Module::default();
+        let a = module.add_string("a".to_string());
+        let b = module.add_string("b".to_string());
+        assert_ne!(a, b);
+        assert_eq!(module.add_string("a".to_string()), a);
+        assert_eq!(module.add_string("b".to_string()), b);
+        assert_eq!(module.strings.len(), 2);
+
+        // A literal appended behind `add_string`'s back, as the libcall
+        // folds do, is found too.
+        let c = string_label(module.strings.len());
+        module.strings.push((c.clone(), "c".to_string()));
+        assert_eq!(module.add_string("c".to_string()), c);
+        let d = module.add_string("d".to_string());
+        assert_eq!(module.strings.len(), 4);
+        for (label, content) in module.strings.clone() {
+            let first = module.strings.iter().find(|(_, s)| *s == content).unwrap();
+            assert_eq!(first.0, label);
+            assert_eq!(module.add_string(content), label);
+        }
+        assert_eq!(module.strings.len(), 4);
+        assert_eq!(module.strings[3].0, d);
+
+        // A list replaced wholesale is reindexed, not answered from stale
+        // positions.
+        module.strings = vec![(string_label(0), "d".to_string())];
+        assert_eq!(module.add_string("d".to_string()), string_label(0));
+        assert_eq!(module.add_string("a".to_string()), string_label(1));
+        assert_eq!(module.strings.len(), 2);
     }
 
     #[test]

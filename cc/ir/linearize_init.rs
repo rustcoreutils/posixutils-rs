@@ -9,7 +9,7 @@
 //! Initializer and global declaration linearization
 
 use super::linearize::*;
-use super::{Initializer, SymbolAlias};
+use super::{GlobalStorage, Initializer, SymbolAlias};
 use crate::constexpr;
 use crate::constexpr::ConstScope;
 use crate::diag::error;
@@ -264,31 +264,23 @@ impl<'a> super::linearize::Linearizer<'a> {
             self.module.extern_symbols.remove(&name);
             self.module.extern_object_align.remove(&name);
 
-            // Check for thread-local storage
             let is_static = storage_class.contains(TypeModifiers::STATIC);
             // Const-qualified at the object level. For arrays, the element type
             // carries the qualifier (e.g., `const int a[10]`), so look through
             // arrays to their element type.
             let is_const = is_const_object_type(self.types, declarator.typ);
-            if storage_class.contains(TypeModifiers::THREAD_LOCAL) {
-                self.module.add_global_tls_aligned(
-                    &name,
-                    declarator.typ,
-                    init,
-                    declarator.explicit_align,
-                    is_static,
-                    is_const,
-                );
-            } else {
-                self.module.add_global_aligned(
-                    &name,
-                    declarator.typ,
-                    init,
-                    declarator.explicit_align,
-                    is_static,
-                    is_const,
-                );
-            }
+            let storage = GlobalStorage {
+                is_static,
+                is_const,
+                is_thread_local: storage_class.contains(TypeModifiers::THREAD_LOCAL),
+            };
+            self.module.define_global(
+                &name,
+                declarator.typ,
+                init,
+                declarator.explicit_align,
+                storage,
+            );
             self.module
                 .set_symbol_attrs(&name, declarator.symbol_attrs.clone());
         }

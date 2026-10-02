@@ -1426,20 +1426,18 @@ impl Instruction {
     ///   only as the compiler left it, though no instruction is emitted.
     /// - `Opcode::Atomic*` — every atomic memory op (including
     ///   `Relaxed`-ordered ones — see note below).
-    /// - `Opcode::Call` — c17 has no escape/alias analysis; any
-    ///   external call may read or write any memory location the
-    ///   callee can reach. Conservative.
+    /// - `Opcode::Call` — a callee may read or write any memory it can
+    ///   reach, and this predicate does not ask what that is.
     /// - `Opcode::Setjmp` / `Opcode::Longjmp` — non-local control flow
     ///   makes register/memory state observable at any saved jmp_buf.
     ///
-    /// **Contract**: an IR pass that consults this predicate MUST NOT
-    /// reorder memory operations across an instruction for which it
-    /// returns `true`. This is the load-bearing invariant that lets
-    /// inline `asm("..." ::: "memory")` actually mean something —
-    /// today no pass reorders memory at all (see module docs in
-    /// `cc/ir/dce.rs` and `cc/ir/instcombine.rs`), and any future
-    /// pass that does (GVN, LICM, load-store forwarding, machine
-    /// scheduler) MUST query this before crossing.
+    /// **Contract**: an IR pass MUST NOT move a memory operation across an
+    /// instruction for which this returns `true`. This is the load-bearing
+    /// invariant that lets inline `asm("..." ::: "memory")` actually mean
+    /// something. No pass moves a memory operation: `loadfwd` and `dse`
+    /// remove loads and stores rather than move them, and decide what a
+    /// call can reach from `escape.rs` and the callee's effects; every other
+    /// barrier opcode they treat as touching all memory.
     ///
     /// **This predicate answers *ordering*, not *extent*, and it is not the
     /// list of instructions that touch memory.** `Store`, `Memset`,
@@ -1578,7 +1576,6 @@ impl Instruction {
         Self::new(Opcode::Br).with_bb_true(target)
     }
 
-    /// Create a conditional branch
     /// The end of `local`'s lifetime: see [`Opcode::LifetimeEnd`].
     pub fn lifetime_end(local: PseudoId) -> Self {
         let mut insn = Self::new(Opcode::LifetimeEnd);
@@ -1586,6 +1583,7 @@ impl Instruction {
         insn
     }
 
+    /// Create a conditional branch
     pub fn cbr(cond: PseudoId, bb_true: BasicBlockId, bb_false: BasicBlockId) -> Self {
         Self::new(Opcode::Cbr)
             .with_src(cond)
@@ -1593,12 +1591,12 @@ impl Instruction {
             .with_bb_false(bb_false)
     }
 
-    /// Create a switch instruction
     /// GNU computed goto: branch to the address held in `target`.
     pub fn indirect_br(target: PseudoId) -> Self {
         Self::new(Opcode::IndirectBr).with_src(target)
     }
 
+    /// Create a switch instruction
     pub fn switch_insn(
         value: PseudoId,
         cases: Vec<(i64, i64, BasicBlockId)>,
@@ -1905,7 +1903,6 @@ impl Instruction {
             .unwrap_or(false)
     }
 
-    /// Check if this call/return uses two registers for the return value.
     /// True when this `Ret` hands its value back in st(0).
     ///
     /// The source is then the value's *address*, not the value: an x87 return
@@ -1919,6 +1916,7 @@ impl Instruction {
             .unwrap_or(false)
     }
 
+    /// Check if this call/return uses two registers for the return value.
     pub fn returns_two_regs(&self) -> bool {
         self.extra()
             .abi_info
@@ -2483,7 +2481,6 @@ impl Function {
         self.blocks.push(block);
     }
 
-    /// Get a block by ID
     /// Where `id` sits in `blocks`.
     ///
     /// For a pass that needs the *index* rather than the block -- to index
@@ -2494,6 +2491,7 @@ impl Function {
         self.block_idx.get(&id).copied()
     }
 
+    /// Get a block by ID
     pub fn get_block(&self, id: BasicBlockId) -> Option<&BasicBlock> {
         self.block_idx
             .get(&id)

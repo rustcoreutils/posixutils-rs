@@ -8,8 +8,9 @@
 //
 // Propagating a `const` global's initializer into the loads that read it.
 //
-// This is the only pass that reads memory, and it needs neither alias
-// information nor escape analysis, because C says the answer outright:
+// Unlike `loadfwd`, which forwards a value the function itself stored and so
+// needs alias and escape analysis, this needs neither, because C says the
+// answer outright:
 // modifying an object defined with a `const`-qualified type is undefined
 // behaviour (C17 6.7.3p6). A pointer to one may escape anywhere at all --
 // the program still may not store through it, so the initializer is the

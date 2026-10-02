@@ -34,7 +34,6 @@
 use super::constfold::at_width;
 use std::cmp::Ordering;
 
-/// The low `width` bits set.
 /// The signed range a `width`-bit value spans.
 ///
 /// Not `-(1i128 << (w - 1))`: at `w == 128` that shift yields `i128::MIN`
@@ -48,6 +47,7 @@ const fn signed_bounds(width: u32) -> (i128, i128) {
     }
 }
 
+/// The low `width` bits set.
 const fn mask(width: u32) -> u128 {
     if width >= 128 {
         u128::MAX
@@ -782,15 +782,15 @@ pub(crate) fn allowed_by_predicate(mask: u8, signed: bool, other: &Range) -> Ran
     }
 }
 
-fn allowed_unsigned(mask: u8, other: &Range) -> Range {
+fn allowed_unsigned(cmp: u8, other: &Range) -> Range {
     use super::constfold::{CMP_ALL, CMP_EQ, CMP_GT, CMP_LT};
     let w = other.width;
-    if other.is_empty() || mask == 0 {
+    if other.is_empty() || cmp == 0 {
         return Range::empty(w);
     }
     let (omin, omax) = (other.unsigned_min(), other.unsigned_max());
-    let top = mask_of(w);
-    match mask & CMP_ALL {
+    let top = mask(w);
+    match cmp & CMP_ALL {
         CMP_EQ => *other,
         CMP_LT if omax == 0 => Range::empty(w),
         CMP_LT => Range::inclusive(w, 0, omax - 1),
@@ -855,11 +855,6 @@ fn hull_orderings<T: Ord>(amin: T, amax: T, bmin: T, bmax: T) -> u8 {
         m |= CMP_EQ;
     }
     m
-}
-
-/// `mask` as a free function, for the module-level routines above.
-const fn mask_of(width: u32) -> u128 {
-    mask(width)
 }
 
 #[cfg(test)]

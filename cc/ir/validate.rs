@@ -339,23 +339,14 @@ pub fn validate_module_at(module: &Module, stage: Stage) -> Result<(), Vec<Valid
     }
 }
 
-/// Validate every function in a module in SSA form.
-pub fn validate_module(module: &Module) -> Result<(), Vec<ValidationError>> {
-    validate_module_at(module, Stage::Ssa)
-}
-
-/// I4 -- no placeholder opcode survives to codegen.
-///
-/// Separate from [`validate_function`] because it is the one check that
-/// holds on *lowered* IR: phi elimination deliberately creates multi-def
-/// copies, so I1 does not, and calling the whole validator after lowering
-/// would report those instead.
+/// I4 -- no placeholder opcode survives to codegen. Checked at
+/// [`Stage::Lowered`] only: before lowering, a placeholder is legal.
 ///
 /// A function codegen skips (`Function::emit` false) is exempt. Its body is
 /// kept only for the inliner, and a `__builtin_va_arg_pack_len()` in one
 /// that forwards its caller's arguments has nothing to resolve against: the
 /// pack exists only at a call site, and every one has been spliced.
-pub fn check_no_placeholders(func: &Function) -> Result<(), Vec<ValidationError>> {
+fn check_no_placeholders(func: &Function) -> Result<(), Vec<ValidationError>> {
     if !func.emit {
         return Ok(());
     }

@@ -7,8 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 // IR-to-IR passes that lower high-level constructs to a form the code
-// generator accepts. Currently: phi elimination, which converts SSA phi
-// nodes to copy instructions.
+// generator accepts: `__builtin_constant_p` placeholders resolved to 0,
+// critical edges split, and SSA phi nodes converted to copy instructions.
 //
 
 use super::{BasicBlockId, Function, Instruction, Module, Opcode, PseudoKind};
@@ -329,6 +329,7 @@ fn resolve_constant_p(func: &mut Function) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::validate::{validate_function_at, Stage, ValidationError};
     use crate::ir::{BasicBlock, Instruction, Opcode, Pseudo, PseudoId};
     use crate::target::Target;
     use crate::types::TypeTable;
@@ -884,13 +885,16 @@ mod tests {
         func.add_block(b0);
         func.entry = BasicBlockId(0);
 
-        assert!(crate::ir::validate::check_no_placeholders(&func).is_err());
+        let errors = validate_function_at(&func, Stage::Lowered).unwrap_err();
+        assert!(errors
+            .iter()
+            .all(|e| matches!(e, ValidationError::UnresolvedPlaceholder { .. })));
         lower_function(&mut func);
 
         let insn = &func.blocks[0].insns[1];
         assert_eq!(insn.op, Opcode::Copy);
         assert_eq!(func.const_val(insn.src[0]), Some(0));
-        assert!(crate::ir::validate::check_no_placeholders(&func).is_ok());
+        assert!(validate_function_at(&func, Stage::Lowered).is_ok());
     }
 
     /// The lost-copy shape: a loop whose header is also its own latch, with

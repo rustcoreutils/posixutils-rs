@@ -407,7 +407,7 @@ Arg(u32)    - function argument %arg{n}
 Phi(u32)    - phi result %phi{n}
 Sym(String) - symbol reference
 Val(i128)   - integer constant ${n} (wide enough for `__int128` constants)
-FVal(f64)   - float constant ${n}
+FVal(FloatVal) - float constant ${n}
 ```
 
 ### Instruction Fields
@@ -477,21 +477,33 @@ read it.
 
 ```
 name                    - function name
+symbol_attrs            - weak, used, section, visibility
+align                   - aligned(N) for the function's code
 return_type             - return TypeId
 params                  - [(name, TypeId), ...]
+conv                    - calling convention of the function's type
 blocks                  - basic blocks
 entry                   - entry block ID
-pseudos                 - all pseudos
+pseudos                 - all pseudos, indexed by PseudoId
+next_pseudo             - next PseudoId to allocate
 locals                  - local variable map
-is_static/inline/noreturn - attributes
+emit                    - false for a body kept only for the inliner
+is_static/is_inline/is_noreturn - linkage and declaration attributes
+is_noinline/is_always_inline    - inliner attributes
+declared_effect         - pure/const, as written
+takes_label_addr        - takes the address of one of its own labels
+saves_label_in_static   - a label address initializes a static object
+constructor/destructor  - .init_array/.fini_array entry, optional priority
 ```
 
 ### Module
 
 ```
 functions               - all functions
-globals                 - [(name, TypeId, Initializer), ...]
-strings/wide_strings    - string literals
+globals                 - [GlobalDef, ...]
+strings                 - narrow string literals, (label, content)
+utf16_strings           - `u"..."` literals, as 2-byte code units
+utf32_strings           - `U"..."` and `L"..."` literals, as 4-byte code units
 extern_symbols          - symbols needing GOT
 ```
 
@@ -573,7 +585,7 @@ after that, because merging would undo the splitting the copies depend on. See
 
 | File | Purpose |
 |------|---------|
-| `validate.rs` | The IR invariants: single definition; phi arity matching the predecessors; one terminator, at the end of the block; `parents`/`children` matching what the instructions name; branch targets that exist; operand types; paired lifetime markers; displacements in range; and every memory access or barrier counted as a side effect. Run at every stage listed above |
+| `validate.rs` | The IR invariants: single definition; phi arity matching the predecessors; one terminator, at the end of the block; `parents`/`children` matching what the instructions name; branch targets that exist; operand types; every lifetime marker naming a local of its function; displacements in range; and every memory access or barrier counted as a side effect. Run at every stage listed above |
 | `dominate.rs` | Dominator tree by Lengauer–Tarjan (simple form, O(E log V)), and iterated dominance frontiers by Sreedhar–Gao. It returns a `DomTree` snapshot rather than writing into the blocks |
 | `dataflow.rs` | The sparse conditional solver that `sccp` and `vrp` share: seeding, executable-edge marking, the worklists, the step budget, and rewriting what a solution proves. A pass supplies only the lattice and the transfer functions |
 | `range.rs` | A set of W-bit integers as one interval that may wrap, which answers signed and unsigned questions alike, plus its transfer functions. It has no IR types, so it is tested exhaustively at four bits |

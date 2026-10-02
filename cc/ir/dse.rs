@@ -177,21 +177,6 @@ impl Facts<'_> {
             func, esc, am, mi, ..
         } = *self;
         match insn.op {
-            // Nothing here reaches memory.
-            Opcode::Nop
-            | Opcode::Entry
-            | Opcode::Phi
-            | Opcode::PhiSource
-            | Opcode::Copy
-            | Opcode::SetVal
-            | Opcode::SymAddr
-            | Opcode::Select
-            | Opcode::Br
-            | Opcode::Cbr
-            | Opcode::Switch
-            | Opcode::IndirectBr
-            | Opcode::Unreachable => false,
-
             Opcode::Load => may_alias(&am.location_of(func, insn), loc, mi),
 
             // A store *writes*; the bytes it does not cover stay as they were,
@@ -229,7 +214,7 @@ impl Facts<'_> {
             _ if !insn.op.may_access_memory() => false,
 
             // `Asm`, `Alloca`, `StackSave`/`StackRestore`, the `Va*` family,
-            // every atomic, and anything unlisted. A `"memory"` clobber can name
+            // every atomic, and any other memory opcode. A `"memory"` clobber can name
             // a frame slot without naming an operand.
             _ => true,
         }

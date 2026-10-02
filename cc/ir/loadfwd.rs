@@ -357,12 +357,12 @@ impl<'a> MemOracle<'a> {
 
     /// Could `insn` write `loc`?
     ///
-    /// An allowlist read the safe way round: an opcode this does not
-    /// recognize is assumed to write, so a new one is conservative by
-    /// default. That is the same discipline `ifconv::is_speculatable` uses,
-    /// and the reason `Instruction::is_memory_barrier` is not enough on its
-    /// own -- it answers ordering, and omits `Store`, the mem intrinsics, the
-    /// `Va*` family, `Alloca` and `StackSave` entirely.
+    /// Fail-closed at `Opcode::may_access_memory`: an opcode outside it
+    /// writes nothing, and one inside it that this does not handle by name is
+    /// assumed to write, so a new memory opcode is conservative by default.
+    /// `Instruction::is_memory_barrier` is not enough on its own -- it
+    /// answers ordering, and omits `Store`, the mem intrinsics, the `Va*`
+    /// family, `Alloca` and `StackSave` entirely.
     fn writes(&self, paths: &Paths, insn: &Instruction, loc: &MemLoc) -> bool {
         let (func, am, mi) = (self.func, self.am, self.mi);
         // A `Sym` target *is* storage, so an instruction that targets one
@@ -381,22 +381,8 @@ impl<'a> MemOracle<'a> {
         }
 
         match insn.op {
-            // Nothing here reaches memory.
-            Opcode::Nop
-            | Opcode::Entry
-            | Opcode::Phi
-            | Opcode::PhiSource
-            | Opcode::Copy
-            | Opcode::SetVal
-            | Opcode::SymAddr
-            | Opcode::Select
-            | Opcode::Br
-            | Opcode::Cbr
-            | Opcode::Switch
-            | Opcode::IndirectBr
-            | Opcode::Ret
-            | Opcode::Unreachable
-            | Opcode::Load => false,
+            // A load reaches memory but writes none of it.
+            Opcode::Load => false,
 
             Opcode::Store => {
                 let s = am.location_of(func, insn);
@@ -427,7 +413,7 @@ impl<'a> MemOracle<'a> {
             _ if !insn.op.may_access_memory() => false,
 
             // `Asm`, `Fence`, `Alloca`, `StackSave`/`StackRestore`, the `Va*`
-            // family, every atomic, and anything unlisted. A `"memory"`
+            // family, every atomic, and any other memory opcode. A `"memory"`
             // clobber can name a frame slot without naming an operand --
             // `asm("movl $1, -8(%rbp)")` is legal and reaches a local no
             // analysis saw -- so being blunt here costs nothing and removes

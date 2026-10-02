@@ -113,7 +113,7 @@ pub struct CodeGenBase<I: LirInst> {
     pub lir_buffer: Vec<I>,
     /// Current function name (for label generation)
     pub current_fn: String,
-    /// Whether to emit basic unwind tables (cfi_startproc/cfi_endproc)
+    /// Whether to emit unwind tables (the CFI procedures and their frame rules)
     pub emit_unwind_tables: bool,
     /// A source position for the function being emitted, for a backend
     /// diagnostic that has no nearer one -- `crate::abi::slot_bytes` and
@@ -1152,7 +1152,7 @@ pub trait CodeGenerator {
     /// Generate assembly code for the given IR module
     fn generate(&mut self, module: &Module, types: &TypeTable) -> String;
 
-    /// Set whether to emit basic unwind tables (cfi_startproc/cfi_endproc)
+    /// Set whether to emit unwind tables (the CFI procedures and their frame rules)
     fn set_emit_unwind_tables(&mut self, emit: bool);
 
     /// Set position-independent code mode (for shared libraries and PIE)

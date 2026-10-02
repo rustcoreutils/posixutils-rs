@@ -54,10 +54,11 @@ int main() {
         asm.contains(".cfi_endproc"),
         "Missing .cfi_endproc in assembly output"
     );
-    // Detailed CFI should NOT be present without -g
+    // The rules are part of the unwind tables, not of -g: without them the
+    // brackets describe a frame that does not exist.
     assert!(
-        !asm.contains(".cfi_def_cfa"),
-        "Unexpected .cfi_def_cfa in assembly output without -g"
+        asm.contains(".cfi_def_cfa"),
+        "Missing .cfi_def_cfa in assembly output without -g"
     );
 }
 

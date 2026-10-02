@@ -1401,7 +1401,8 @@ fn codegen_over_aligned_frame_keeps_no_local_at_an_rbp_displacement() {
         let strays: Vec<&str> = main
             .lines()
             .map(str::trim)
-            .filter(|l| l.contains("%rbp"))
+            // A `.cfi_*` rule names the register; it addresses nothing.
+            .filter(|l| l.contains("%rbp") && !l.starts_with(".cfi_"))
             .filter(|l| {
                 *l != "pushq %rbp"
                     && *l != "popq %rbp"

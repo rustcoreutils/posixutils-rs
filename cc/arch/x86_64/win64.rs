@@ -195,13 +195,11 @@ impl X86_64CodeGen {
                     offset,
                 }),
             });
-            if self.base.emit_debug {
-                // The CFA is `%rbp + 16` from here on.
-                self.push_lir(X86Inst::Directive(Directive::cfi_offset(
-                    xmm.dwarf_number().to_string(),
-                    offset - 16,
-                )));
-            }
+            // The CFA is `%rbp + 16` from here on.
+            self.push_cfi(Directive::cfi_offset(
+                xmm.dwarf_number().to_string(),
+                offset - 16,
+            ));
         }
     }
 
@@ -217,6 +215,7 @@ impl X86_64CodeGen {
                 }),
                 dst: XmmOperand::Reg(xmm),
             });
+            self.push_cfi(Directive::cfi_restore(xmm.dwarf_number().to_string()));
         }
     }
 

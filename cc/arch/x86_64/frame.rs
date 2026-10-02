@@ -467,6 +467,19 @@ impl X86_64CodeGen {
             .collect()
     }
 
+    /// Push a CFI rule, when unwind tables are on.
+    ///
+    /// The rules are what lets anything walk out of the function --
+    /// `backtrace()`, a debugger, a profiler, the C++ runtime -- so they come
+    /// with `.cfi_startproc`, as gcc's `-fasynchronous-unwind-tables` does,
+    /// not with `-g`. Each follows the instruction that makes it true, so the
+    /// CFA and every saved register are described at every instruction.
+    pub(super) fn push_cfi(&mut self, rule: Directive) {
+        if self.base.emit_unwind_tables {
+            self.push_lir(X86Inst::Directive(rule));
+        }
+    }
+
     /// Emit function prologue: push rbp, save callee-saved registers, allocate stack
     ///
     /// `homes` are the register positions an `ms_abi` function spills to its
@@ -484,11 +497,9 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::Push {
             src: GpOperand::Reg(bp),
         });
-        if self.base.emit_debug {
-            // After pushq %rbp: CFA is now at %rsp+16, and %rbp is saved at CFA-16
-            self.push_lir(X86Inst::Directive(Directive::CfiDefCfaOffset(16)));
-            self.push_lir(X86Inst::Directive(Directive::cfi_offset("%rbp", -16)));
-        }
+        // After pushq %rbp: CFA is now at %rsp+16, and %rbp is saved at CFA-16
+        self.push_cfi(Directive::CfiDefCfaOffset(16));
+        self.push_cfi(Directive::cfi_offset("%rbp", -16));
 
         // Set up frame pointer
         self.push_lir(X86Inst::Mov {
@@ -496,10 +507,8 @@ impl X86_64CodeGen {
             src: GpOperand::Reg(sp),
             dst: GpOperand::Reg(bp),
         });
-        if self.base.emit_debug {
-            // After movq %rsp, %rbp: CFA is now tracked by %rbp+16
-            self.push_lir(X86Inst::Directive(Directive::cfi_def_cfa_register("%rbp")));
-        }
+        // After movq %rsp, %rbp: CFA is now tracked by %rbp+16
+        self.push_cfi(Directive::cfi_def_cfa_register("%rbp"));
         self.emit_win64_homing(homes);
 
         // Save callee-saved registers
@@ -508,12 +517,7 @@ impl X86_64CodeGen {
             self.push_lir(X86Inst::Push {
                 src: GpOperand::Reg(*reg),
             });
-            if self.base.emit_debug {
-                self.push_lir(X86Inst::Directive(Directive::cfi_offset(
-                    reg.name64(),
-                    cfi_offset,
-                )));
-            }
+            self.push_cfi(Directive::cfi_offset(reg.name64(), cfi_offset));
             cfi_offset -= 8;
         }
         self.emit_win64_xmm_saves();
@@ -1422,7 +1426,11 @@ impl X86_64CodeGen {
     }
 
     /// Restore what the prologue saved, and return.
+    ///
+    /// An epilogue can sit mid-function, with more of the body after it, so
+    /// its rules are bracketed: the body's come back after the `ret`.
     fn emit_epilogue(&mut self) {
+        self.push_cfi(Directive::CfiRememberState);
         self.emit_win64_xmm_restores();
         let bp = Reg::bp();
         let num_callee_saved = self.callee_saved_regs.len();
@@ -1438,6 +1446,8 @@ impl X86_64CodeGen {
             let callee_saved: Vec<Reg> = self.callee_saved_regs.iter().rev().copied().collect();
             for reg in callee_saved {
                 self.push_lir(X86Inst::Pop { dst: reg });
+                // Its slot is below %rsp now, where a signal frame may land.
+                self.push_cfi(Directive::cfi_restore(reg.name64()));
             }
         } else {
             self.push_lir(X86Inst::Mov {
@@ -1447,6 +1457,10 @@ impl X86_64CodeGen {
             });
         }
         self.push_lir(X86Inst::Pop { dst: bp });
+        // %rbp is the caller's again, so the CFA follows %rsp.
+        self.push_cfi(Directive::cfi_def_cfa("%rsp", 8));
+        self.push_cfi(Directive::cfi_restore("%rbp"));
         self.push_lir(X86Inst::Ret);
+        self.push_cfi(Directive::CfiRestoreState);
     }
 }

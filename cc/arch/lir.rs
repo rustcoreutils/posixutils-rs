@@ -950,6 +950,15 @@ pub enum Directive {
     /// .cfi_def_cfa_register register - CFA is now based on this register
     CfiDefCfaRegister(String),
 
+    /// .cfi_restore register - register holds its value from entry again
+    CfiRestore(String),
+
+    /// .cfi_remember_state - push the current rules
+    CfiRememberState,
+
+    /// .cfi_restore_state - pop the rules the last remember pushed
+    CfiRestoreState,
+
     // ========================================================================
     // Debug Information
     // ========================================================================
@@ -1115,6 +1124,10 @@ impl Directive {
 
     pub fn cfi_def_cfa_register(reg: impl Into<String>) -> Self {
         Directive::CfiDefCfaRegister(reg.into())
+    }
+
+    pub fn cfi_restore(reg: impl Into<String>) -> Self {
+        Directive::CfiRestore(reg.into())
     }
 
     pub fn cfi_def_cfa(reg: impl Into<String>, offset: i32) -> Self {
@@ -1456,6 +1469,15 @@ impl EmitAsm for Directive {
             }
             Directive::CfiDefCfaRegister(reg) => {
                 let _ = writeln!(out, "    .cfi_def_cfa_register {}", reg);
+            }
+            Directive::CfiRestore(reg) => {
+                let _ = writeln!(out, "    .cfi_restore {}", reg);
+            }
+            Directive::CfiRememberState => {
+                let _ = writeln!(out, "    .cfi_remember_state");
+            }
+            Directive::CfiRestoreState => {
+                let _ = writeln!(out, "    .cfi_restore_state");
             }
 
             // Debug info
@@ -1840,6 +1862,15 @@ mod tests {
         let mut out = String::new();
         Directive::cfi_offset("%rbp", -16).emit(&target, &mut out);
         assert_eq!(out, "    .cfi_offset %rbp, -16\n");
+
+        let mut out = String::new();
+        Directive::CfiRememberState.emit(&target, &mut out);
+        Directive::cfi_restore("%rbp").emit(&target, &mut out);
+        Directive::CfiRestoreState.emit(&target, &mut out);
+        assert_eq!(
+            out,
+            "    .cfi_remember_state\n    .cfi_restore %rbp\n    .cfi_restore_state\n"
+        );
     }
 
     /// `.bss` storage as a *definition*, which is the whole point: a common

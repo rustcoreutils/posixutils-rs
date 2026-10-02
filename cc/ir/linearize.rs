@@ -1131,7 +1131,7 @@ impl<'a> Linearizer<'a> {
         insn
     }
 
-    /// Keep a load's or store's constant offset inside a machine displacement.
+    /// Keep a memory access's constant offset inside a machine displacement.
     ///
     /// Both backends address `src[0] + offset` with a signed 32-bit
     /// displacement, so an offset past `i32` -- a member more than 2 GiB into a
@@ -1143,7 +1143,7 @@ impl<'a> Linearizer<'a> {
     /// [`Instruction::displacement`] can rely on the result
     /// (`validate.rs` I6 checks it).
     fn displacement_in_range(&mut self, mut insn: Instruction) -> Instruction {
-        if !matches!(insn.op, Opcode::Load | Opcode::Store) || i32::try_from(insn.offset).is_ok() {
+        if !insn.op.addresses_memory() || i32::try_from(insn.offset).is_ok() {
             return insn;
         }
         let Some(&base) = insn.src.first() else {

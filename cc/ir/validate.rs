@@ -43,9 +43,10 @@
 //        immediately rather than waiting for a memory-reordering pass to
 //        miscompile a real program.
 //
-//   I6 — A LOAD OR STORE OFFSET IS A MACHINE DISPLACEMENT
-//        Both backends address `src[0] + offset` with a signed 32-bit
-//        displacement and read it through `Instruction::displacement`.
+//   I6 — A MEMORY ACCESS OFFSET IS A MACHINE DISPLACEMENT
+//        A load, store or atomic is addressed at `src[0] + offset` with a
+//        signed 32-bit displacement read through `Instruction::displacement`,
+//        on both backends.
 //        `Linearizer::emit` folds a larger offset into the address; a pass
 //        that later produced one would reintroduce the truncation that sent
 //        a member past 2 GiB gigabytes away.
@@ -137,7 +138,7 @@ pub enum ValidationError {
         index: usize,
         opcode: Opcode,
     },
-    /// I6 violation: a load or store carries an offset no signed 32-bit
+    /// I6 violation: a memory access carries an offset no signed 32-bit
     /// displacement holds.
     DisplacementOutOfRange {
         function: String,
@@ -243,7 +244,7 @@ impl fmt::Display for ValidationError {
             } => write!(
                 f,
                 "[ir-validate I6] in function `{function}`: bb={block} insn={index} \
-                 load/store offset {offset} does not fit a 32-bit displacement"
+                 memory access offset {offset} does not fit a 32-bit displacement"
             ),
             ValidationError::CfgInconsistent {
                 function,
@@ -452,13 +453,11 @@ pub fn check_pseudo_index(func: &Function, out: &mut Vec<ValidationError>) {
     }
 }
 
-/// I6 — every load and store offset fits a signed 32-bit displacement.
+/// I6 — every memory access offset fits a signed 32-bit displacement.
 fn check_displacements_in_range(func: &Function, out: &mut Vec<ValidationError>) {
     for (bb_idx, bb) in func.blocks.iter().enumerate() {
         for (insn_idx, insn) in bb.insns.iter().enumerate() {
-            if matches!(insn.op, Opcode::Load | Opcode::Store)
-                && i32::try_from(insn.offset).is_err()
-            {
+            if insn.op.addresses_memory() && i32::try_from(insn.offset).is_err() {
                 out.push(ValidationError::DisplacementOutOfRange {
                     function: func.name.clone(),
                     block: bb_idx,
@@ -792,23 +791,32 @@ mod tests {
         i
     }
 
-    /// I6: a load whose offset no 32-bit displacement holds is flagged, and
-    /// the largest one that fits is not.
+    /// I6: a load or atomic whose offset no 32-bit displacement holds is
+    /// flagged, and the largest one that fits is not.
     #[test]
     fn validate_flags_a_displacement_past_i32() {
         let types = TypeTable::new(&Target::host());
-        for (offset, ok) in [
-            (i64::from(i32::MAX), true),
-            (i64::from(i32::MAX) + 1, false),
+        let load = |offset| Instruction::load(PseudoId(1), PseudoId(0), offset, types.int_id, 32);
+        let atomic = |offset| {
+            Instruction::new(Opcode::AtomicLoad)
+                .with_target(PseudoId(1))
+                .with_src(PseudoId(0))
+                .with_offset(offset)
+                .with_type_and_size(types.int_id, 32)
+        };
+        let max = i64::from(i32::MAX);
+        for (insn, ok) in [
+            (load(max), true),
+            (load(max + 1), false),
+            (atomic(max), true),
+            (atomic(max + 1), false),
         ] {
+            let offset = insn.offset;
             let mut func = fresh_func("t");
             for i in 0..=1 {
                 func.add_pseudo(Pseudo::reg(PseudoId(i), i));
             }
-            push(
-                &mut func,
-                Instruction::load(PseudoId(1), PseudoId(0), offset, types.int_id, 32),
-            );
+            push(&mut func, insn);
             let result = validate_function(&func);
             assert_eq!(result.is_ok(), ok, "offset {offset}: {result:?}");
             if !ok {

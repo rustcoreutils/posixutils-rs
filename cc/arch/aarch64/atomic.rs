@@ -99,7 +99,7 @@ impl Aarch64CodeGen {
         let size = insn.size;
         let op_size = OperandSize::from_bits(size);
 
-        self.emit_addr_into(addr, Reg::X10);
+        self.emit_addr_into(addr, insn.displacement(), Reg::X10);
 
         let addr = MemAddr::Base(Reg::X10);
         let (size, dst) = (op_size, Reg::X9);
@@ -122,7 +122,7 @@ impl Aarch64CodeGen {
 
         // Load the pointer first, so a value in the same register is
         // still readable when it is loaded next.
-        self.emit_addr_into(addr, Reg::X10);
+        self.emit_addr_into(addr, insn.displacement(), Reg::X10);
 
         // Load the value
         self.emit_mov_to_reg(value_loc, Reg::X9, size);
@@ -156,7 +156,7 @@ impl Aarch64CodeGen {
 
         // Load the pointer first, so a value in the same register is
         // still readable when it is loaded next.
-        self.emit_addr_into(addr, Reg::X10);
+        self.emit_addr_into(addr, insn.displacement(), Reg::X10);
 
         // Load the operand
         self.emit_mov_to_reg(value_loc, Reg::X9, size);
@@ -264,11 +264,11 @@ impl Aarch64CodeGen {
 
         // Load pointer to atomic variable into X10 FIRST
         // (before the other loads, so none of them can clobber it)
-        self.emit_addr_into(addr, Reg::X10);
+        self.emit_addr_into(addr, insn.displacement(), Reg::X10);
 
         // Load expected_ptr (pointer to expected value) into X11
         // Then load the expected value from that address into X9
-        self.emit_addr_into(expected_ptr, Reg::X11);
+        self.emit_addr_into(expected_ptr, 0, Reg::X11);
         self.push_lir(Aarch64Inst::Ldr {
             size: op_size,
             addr: MemAddr::Base(Reg::X11),

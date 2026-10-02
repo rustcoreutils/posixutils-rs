@@ -595,6 +595,12 @@ impl Opcode {
         )
     }
 
+    /// True for the memory accesses a backend addresses as `src[0] + offset`:
+    /// plain loads and stores, and the atomic operations.
+    pub fn addresses_memory(self) -> bool {
+        matches!(self, Opcode::Load | Opcode::Store) || self.is_atomic()
+    }
+
     /// Get the opcode name for display
     pub fn name(&self) -> &'static str {
         match self {
@@ -1733,7 +1739,7 @@ impl Instruction {
         self.offset as u32
     }
 
-    /// A load's or store's offset as the machine displacement it becomes.
+    /// A memory access's offset as the machine displacement it becomes.
     ///
     /// Always in range: `Linearizer::emit` folds any offset past `i32` into
     /// the address before the instruction enters the IR, and no pass rewrites
@@ -1741,9 +1747,9 @@ impl Instruction {
     /// with `as i32`, which wrapped a member more than 2 GiB into a struct to
     /// a displacement gigabytes away.
     pub fn displacement(&self) -> i32 {
-        debug_assert!(matches!(self.op, Opcode::Load | Opcode::Store));
+        debug_assert!(self.op.addresses_memory());
         i32::try_from(self.offset)
-            .expect("a load or store offset past i32 reached a backend; Linearizer::emit folds it")
+            .expect("a memory access offset past i32 reached a backend; Linearizer::emit folds it")
     }
 
     pub fn load(target: PseudoId, addr: PseudoId, offset: i64, typ: TypeId, size: u32) -> Self {
@@ -3430,6 +3436,28 @@ mod tests {
         assert!(Opcode::Cbr.is_terminator());
         assert!(!Opcode::Add.is_terminator());
         assert!(!Opcode::Load.is_terminator());
+    }
+
+    /// Every op a backend addresses as `src[0] + offset` has a displacement:
+    /// the atomics as well as plain loads and stores.
+    #[test]
+    fn every_memory_access_has_a_displacement() {
+        for op in [
+            Opcode::Load,
+            Opcode::Store,
+            Opcode::AtomicLoad,
+            Opcode::AtomicStore,
+            Opcode::AtomicSwap,
+            Opcode::AtomicCas,
+            Opcode::AtomicFetchAdd,
+            Opcode::AtomicFetchSub,
+            Opcode::AtomicFetchAnd,
+            Opcode::AtomicFetchOr,
+            Opcode::AtomicFetchXor,
+        ] {
+            let insn = Instruction::new(op).with_src(PseudoId(0)).with_offset(-8);
+            assert_eq!(insn.displacement(), -8, "{op:?}");
+        }
     }
 
     #[test]

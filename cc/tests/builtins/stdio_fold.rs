@@ -150,8 +150,11 @@ fn called(asm: &str) -> Vec<String> {
                 return None;
             }
             let name = words.next()?.split('@').next()?;
+            // A compiler-made label is private: `L...` on Mach-O, `.L...` on
+            // ELF. Anything else is a callee, including an `asm` label,
+            // which Mach-O spells verbatim, without the `_`.
             let is_c_name = if macho {
-                name.starts_with('_')
+                !name.trim_start_matches('"').starts_with('L')
             } else {
                 !name.starts_with('.')
             };

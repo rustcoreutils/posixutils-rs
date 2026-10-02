@@ -761,14 +761,21 @@ fn driver_dash_s_strips_symbols() {
     assert!(run_c17(&[&s(&src), "-o", &s(&plain)]).success);
     assert!(run_c17(&["-s", &s(&src), "-o", &s(&stripped)]).success);
 
-    let plain_len = std::fs::metadata(&plain).unwrap().len();
-    let stripped_len = std::fs::metadata(&stripped).unwrap().len();
+    // Asked of the symbol table itself: the file size is no measure, since
+    // Mach-O pads an executable to 16 KiB pages and a few symbols fit in
+    // the padding.
+    let has_helper = |exe: &std::path::Path| {
+        let out = std::process::Command::new("nm")
+            .arg(exe)
+            .output()
+            .expect("nm runs");
+        String::from_utf8_lossy(&out.stdout).contains("helper_symbol")
+    };
     assert!(
-        stripped_len < plain_len,
-        "-s should shrink the binary: {} vs {}",
-        stripped_len,
-        plain_len
+        has_helper(&plain),
+        "an unstripped binary lists helper_symbol"
     );
+    assert!(!has_helper(&stripped), "-s must remove helper_symbol");
     assert_eq!(run_exe(&stripped), 0, "stripped binary must still run");
 }
 

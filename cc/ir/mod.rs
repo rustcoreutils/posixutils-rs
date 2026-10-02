@@ -11,6 +11,7 @@
 // once so that dataflow analysis and the optimization passes stay simple.
 //
 
+pub mod asm_operand;
 mod build;
 pub mod cfg;
 pub(crate) mod constfold;
@@ -51,7 +52,7 @@ use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
 use crate::arch::asm_constraints::{AsmAccess, AsmOperandClass};
 use crate::diag::Position;
 use crate::float::{FloatVal, IntegralRounding};
-use crate::target::{Arch, Target};
+use crate::target::Target;
 use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -1027,13 +1028,14 @@ pub struct AsmConstraint {
 impl AsmConstraint {
     /// An operand of `constraint` on `arch`, `size` bits wide, with no name,
     /// matching output or object offset.
-    pub fn new(pseudo: PseudoId, constraint: &str, arch: Arch, size: u32) -> Self {
+    #[cfg(test)]
+    pub fn new(pseudo: PseudoId, constraint: &str, arch: crate::target::Arch, size: u32) -> Self {
         Self {
             pseudo,
             name: None,
             matching_output: None,
             constraint: constraint.to_string(),
-            class: AsmOperandClass::parse(constraint, arch),
+            class: AsmOperandClass::parse(constraint, arch).expect("a modelled constraint"),
             size,
             offset: 0,
         }
@@ -3431,7 +3433,7 @@ impl fmt::Display for ModuleDisplay<'_> {
 mod tests {
     use super::*;
     use crate::abi::{ArgClass, RegClass};
-    use crate::target::Target;
+    use crate::target::{Arch, Target};
     use crate::types::{Type, TypeTable};
 
     #[test]

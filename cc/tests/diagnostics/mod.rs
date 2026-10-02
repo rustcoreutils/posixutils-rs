@@ -18,6 +18,7 @@
 // everything.
 //
 
+mod asm_constraints;
 mod cast_to_union;
 mod va_arg_pack;
 

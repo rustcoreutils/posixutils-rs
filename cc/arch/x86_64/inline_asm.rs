@@ -587,6 +587,20 @@ impl X86_64CodeGen {
                             );
                             slots.push(mk(None, Some(mem_str)));
                         }
+                        // A symbolic constant: the global's address, written
+                        // into the template as an immediate. The operand
+                        // names the global's `Sym`, with any offset on it --
+                        // see `ir::asm_operand::resolve_immediates`.
+                        Loc::Global(name) if class.is_immediate_only() => {
+                            let sym = self.format_symbol_name(&name);
+                            slots.push(mk(
+                                None,
+                                Some(format!(
+                                    "${}",
+                                    crate::arch::codegen::asm_symbol_constant(&sym, input.offset)
+                                )),
+                            ));
+                        }
                         Loc::Reg(r) => {
                             // Check if allocated reg conflicts with reserved
                             if reserved_regs.contains(&r) {
@@ -604,7 +618,7 @@ impl X86_64CodeGen {
                         // A constant under a register-only constraint still goes
                         // in a register: the template may use it where no
                         // immediate is allowed (`leaq 8($100), %rax`).
-                        Loc::Imm(_) if requires_reg && !class.imm => {
+                        Loc::Imm(_) if requires_reg && !class.imm.int => {
                             let temp = find_temp_reg(reserved_regs, used_regs, insn.pos);
                             used_regs.insert(temp);
                             slots.push(mk(Some(temp), None));

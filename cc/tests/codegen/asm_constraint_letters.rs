@@ -163,3 +163,87 @@ int main(void) {
 "#;
     run_aarch64_levels("asm_a64_q_base_only", src);
 }
+
+/// An immediate-only operand is written into the template as the constant
+/// it is: a global's address with its offset (`$g`, `$x+8`), `sizeof`, an
+/// enumeration constant -- and, once a `static inline` helper is inlined at
+/// -O1 and above, the literal its caller passed to `"i"(param)`, the Linux
+/// kernel's idiom. c17 used to substitute whatever register held the value,
+/// so `"i"(&g)` gave `%rax`. `-no-pie`, because an absolute address is not
+/// position-independent: gcc writes the same `$g`, and a PIE link refuses it.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn codegen_asm_x86_64_immediates_are_written_as_constants() {
+    let src = r#"
+long g = 42;
+long x[2] = {5, 7};
+enum { E = 5 };
+int main(void) {
+    long *p, *q, v;
+    __asm__("movq %1, %0" : "=r"(p) : "i"(&g));
+    if (*p != 42)
+        return 1;
+    __asm__("movq %1, %0" : "=r"(q) : "i"(&x[1]));
+    if (*q != 7)
+        return 2;
+    __asm__("movq %1, %0" : "=r"(v) : "n"(sizeof(long) * E));
+    if (v != 40)
+        return 3;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        let opts = vec![opt.to_string(), "-no-pie".to_string()];
+        assert_eq!(compile_and_run("asm_x86_imm", src, &opts), 0, "at {opt}");
+    }
+    let inlined = r#"
+static inline long add_const(long a, int k) {
+    __asm__("addq %1, %0" : "+r"(a) : "i"(k));
+    return a;
+}
+int main(void) {
+    return add_const(1, 9) == 10 && add_const(5, -5) == 0 ? 0 : 1;
+}
+"#;
+    for opt in ["-O1", "-O2"] {
+        let opts = vec![opt.to_string()];
+        assert_eq!(
+            compile_and_run("asm_x86_imm_inl", inlined, &opts),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// aarch64 `S` writes a global's address with its offset into the template
+/// (`x+8`), as an `adrp`/`:lo12:` pair needs; the inlined-literal idiom
+/// works through `"i"` at -O2.
+#[test]
+fn codegen_asm_aarch64_immediates_are_written_as_constants() {
+    let src = r#"
+long g = 42;
+long x[2] = {5, 7};
+static inline long add_const(long a, int k) {
+    __asm__("add %0, %0, %1" : "+r"(a) : "i"(k));
+    return a;
+}
+int main(void) {
+    long *p, *q, v;
+    __asm__("adrp %0, %1\n\tadd %0, %0, :lo12:%1" : "=r"(p) : "S"(&g));
+    if (*p != 42)
+        return 1;
+    __asm__("adrp %0, %1\n\tadd %0, %0, :lo12:%1" : "=r"(q) : "S"(&x[1]));
+    if (*q != 7)
+        return 2;
+    __asm__("mov %0, %1" : "=r"(v) : "n"(sizeof(long) * 5));
+    if (v != 40)
+        return 3;
+#ifdef __OPTIMIZE__
+    if (add_const(1, 9) != 10)
+        return 4;
+#endif
+    return 0;
+}
+"#;
+    run_aarch64_levels("asm_a64_imm", src);
+}

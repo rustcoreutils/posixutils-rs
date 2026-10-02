@@ -1649,6 +1649,9 @@ fn reorder_blocks_topologically(func: &mut Function) {
 /// intrinsics headers -- is usually relying on the body being spliced in.
 pub fn run(module: &mut Module, opt: Optimization) -> bool {
     if !opt.inlines_generally() && !module.functions.iter().any(|f| f.is_always_inline) {
+        // Nothing to inline, but the dead statics go all the same: see the
+        // end of this function.
+        remove_dead_functions(module, !opt.optimizes());
         return false;
     }
 
@@ -1748,16 +1751,18 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
 
     // Remove dead static functions.
     //
-    // Only above -O0: dropping an unreferenced static function is an
-    // optimization in its own right, and at -O0 gcc still emits one.
+    // Above -O0, every one: dropping an unreferenced static function is an
+    // optimization in its own right. At -O0 gcc still emits a plain static
+    // one, but never an unreferenced `static inline` one -- the helper a
+    // header defines for whoever wants it. Emitting it anyway compiled a body
+    // gcc never looks at, and one written to be inlined need not compile on
+    // its own: `"i"(param)` is satisfied only once a literal is inlined.
     //
     // Not gated on anything having been inlined. It was, and that meant a
     // translation unit where the inliner declined every call kept its
     // unreferenced statics at every level -- including the one whose body
     // referenced an undefined symbol.
-    if opt.optimizes() {
-        remove_dead_functions(module);
-    }
+    remove_dead_functions(module, !opt.optimizes());
 
     any_changed
 }
@@ -1797,8 +1802,9 @@ pub(crate) fn collect_func_refs_from_initializer(
     }
 }
 
-/// Remove functions that are static and have no callers
-fn remove_dead_functions(module: &mut Module) {
+/// Remove functions that are static and have no callers -- with
+/// `only_inline`, only those declared `inline`.
+fn remove_dead_functions(module: &mut Module, only_inline: bool) {
     // To a fixpoint: a reference held only by a function that is itself about
     // to go is not a reference. One round leaves exactly that behind -- an
     // unreferenced `bar` calling `foo` keeps `foo` alive on a count that its
@@ -1809,6 +1815,7 @@ fn remove_dead_functions(module: &mut Module) {
         module.functions.retain(|f| {
             f.name == "main"
                 || !f.is_static
+                || (only_inline && !f.is_inline)
                 // `__attribute__((used))` means exactly "keep this even
                 // though nothing refers to it".
                 || f.symbol_attrs.used
@@ -1847,9 +1854,11 @@ fn collect_referenced_functions(module: &Module) -> HashSet<String> {
                             }
                         }
                     }
-                    // The single funnel for every way an address is taken:
-                    // `&f`, `f` as an argument, `f == f`, an `"i"`/`"s"` asm
-                    // operand, a function-pointer assignment.
+                    // The funnel for every way an address is taken: `&f`,
+                    // `f` as an argument, `f == f`, a function-pointer
+                    // assignment -- and an `"i"`/`"s"` asm operand until
+                    // `asm_operand::resolve_immediates` names the function's
+                    // `Sym` directly, which the asm arm below counts.
                     Opcode::SymAddr => {
                         if let Some(src) = insn.src.first() {
                             if let Some(name) = func.sym_name_of(*src) {
@@ -1865,6 +1874,13 @@ fn collect_referenced_functions(module: &Module) -> HashSet<String> {
                 // foo")` -- reaches the assembler with no IR reference at all.
                 if let Some(ref asm) = insn.extra().asm_data {
                     collect_names_in_asm(&asm.template, &func_names, &mut referenced);
+                    for operand in &asm.inputs {
+                        if let Some(name) = func.sym_name_of(operand.pseudo) {
+                            if func_names.contains(name) {
+                                referenced.insert(name.to_string());
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2253,7 +2269,7 @@ mod tests {
         assert!(module.functions.iter().any(|f| f.name == "main"));
 
         // Run remove_dead_functions
-        remove_dead_functions(&mut module);
+        remove_dead_functions(&mut module, false);
 
         // Handler should NOT be removed because its address is taken
         assert_eq!(module.functions.len(), 2);
@@ -2298,7 +2314,7 @@ mod tests {
         module.functions.push(static_fn(&types, "bar", Some("foo")));
         module.functions.push(Function::new("main", types.int_id));
 
-        remove_dead_functions(&mut module);
+        remove_dead_functions(&mut module, false);
 
         assert!(
             !module.functions.iter().any(|f| f.name == "bar"),
@@ -2323,7 +2339,7 @@ mod tests {
         module.functions.push(static_fn(&types, "dropped", None));
         module.functions.push(Function::new("main", types.int_id));
 
-        remove_dead_functions(&mut module);
+        remove_dead_functions(&mut module, false);
 
         assert!(module.functions.iter().any(|f| f.name == "kept"));
         assert!(!module.functions.iter().any(|f| f.name == "dropped"));
@@ -2348,7 +2364,7 @@ mod tests {
             visibility: None,
         });
 
-        remove_dead_functions(&mut module);
+        remove_dead_functions(&mut module, false);
 
         assert!(module.functions.iter().any(|f| f.name == "impl"));
         assert!(!module.functions.iter().any(|f| f.name == "dropped"));
@@ -2403,7 +2419,7 @@ mod tests {
         main_func.entry = BasicBlockId(0);
         module.functions.push(main_func);
 
-        remove_dead_functions(&mut module);
+        remove_dead_functions(&mut module, false);
 
         assert!(
             module.functions.iter().any(|f| f.name == "helper"),
@@ -2483,7 +2499,7 @@ mod tests {
         assert!(module.functions.iter().any(|f| f.name == "callback"));
 
         // Run remove_dead_functions
-        remove_dead_functions(&mut module);
+        remove_dead_functions(&mut module, false);
 
         // callback should NOT be removed because it's referenced in global initializer
         assert!(
@@ -2537,7 +2553,7 @@ mod tests {
             },
         ));
 
-        remove_dead_functions(&mut module);
+        remove_dead_functions(&mut module, false);
 
         assert!(
             module.functions.iter().any(|f| f.name == "my_handler"),
@@ -2591,7 +2607,7 @@ mod tests {
             },
         ));
 
-        remove_dead_functions(&mut module);
+        remove_dead_functions(&mut module, false);
 
         assert!(
             module.functions.iter().any(|f| f.name == "arr_func"),

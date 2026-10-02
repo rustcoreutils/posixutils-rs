@@ -8,6 +8,7 @@
 
 //! Statement linearization
 
+use super::asm_operand::AddrWalk;
 use super::linearize::*;
 use super::linearize_emit::Controlling;
 use super::{
@@ -3012,11 +3013,65 @@ impl<'a> super::linearize::Linearizer<'a> {
         None
     }
 
-    /// What an operand's constraint allows on the target being compiled.
-    /// Classified here once and stored on the operand, so liveness, the
-    /// allocator and the backend all read the same answer.
-    fn asm_operand_class(&self, constraint: &str) -> AsmOperandClass {
-        AsmOperandClass::parse(constraint, self.target.arch)
+    /// What each operand's constraint allows on the target being compiled,
+    /// outputs then inputs. Classified here once and stored on the operand,
+    /// so liveness, the allocator and the backend all read the same answer.
+    ///
+    /// A constraint c17 cannot honour is reported here, at its operand --
+    /// one it does not model, or one at odds with its side of the colon, with
+    /// gcc's wording for the latter. Such an operand is then given a plain
+    /// register class so the statement can still be linearized; the error
+    /// stops the compilation.
+    fn asm_operand_classes(
+        &self,
+        outputs: &[AsmOperand],
+        inputs: &[AsmOperand],
+    ) -> (Vec<AsmOperandClass>, Vec<AsmOperandClass>) {
+        let classify = |op: &AsmOperand, is_output: bool| {
+            let reason = match AsmOperandClass::parse(&op.constraint, self.target.arch) {
+                Err(e) => Err(e.message(&op.constraint)),
+                Ok(class) => asm_operand_misuse(&class, is_output, outputs.len())
+                    .map_or(Ok(class), |why| Err(why.to_string())),
+            };
+            reason.unwrap_or_else(|msg| {
+                error(op.expr.pos, &msg);
+                let plain = if is_output { "=r" } else { "r" };
+                AsmOperandClass::parse(plain, self.target.arch).expect("a register class")
+            })
+        };
+        (
+            outputs.iter().map(|op| classify(op, true)).collect(),
+            inputs.iter().map(|op| classify(op, false)).collect(),
+        )
+    }
+
+    /// An immediate-only operand that is a constant expression, as the
+    /// constant: gcc's front end folds it at every level, so `"i"(~MASK)` or
+    /// `"i"(-1.0)` at -O0 must not reach the backend as an instruction
+    /// computing it. `None` for any other operand, which is linearized as
+    /// usual and left for `ir::asm_operand::resolve_immediates` to judge.
+    fn asm_constant_operand(
+        &mut self,
+        expr: &Expr,
+        typ: TypeId,
+        class: &AsmOperandClass,
+    ) -> Option<PseudoId> {
+        if !class.is_immediate_only() {
+            return None;
+        }
+        // As `linearize_expr` would: the statement takes its position from
+        // its operands, and a diagnostic about this one is reported there.
+        self.current_pos = Some(expr.pos);
+        if self.types.is_integer(typ) {
+            let v = self.eval_const_expr(expr)?;
+            return Some(self.emit_const(v, typ));
+        }
+        let fmt = self
+            .types
+            .fp_format(typ)
+            .filter(|_| self.types.is_float(typ))?;
+        let v = crate::constexpr::eval_as_float(self, ConstScope::Standard, expr, typ)?;
+        Some(self.emit_fconst(v.round_to_format(fmt), typ))
     }
 
     pub(crate) fn linearize_asm(
@@ -3046,10 +3101,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Bare `+r` with no tied input must still load the lvalue's
         // current value (only producer of the initial register contents),
         // so the load is gated on whether any input matches this output.
+        let (output_classes, input_classes) = self.asm_operand_classes(outputs, inputs);
         let tied_inputs: Vec<bool> = {
             let mut out_has_tied_input = vec![false; outputs.len()];
-            for op in inputs {
-                if let Some(idx) = self.asm_operand_class(&op.constraint).tied {
+            for class in &input_classes {
+                if let Some(idx) = class.tied {
                     if idx < out_has_tied_input.len() {
                         out_has_tied_input[idx] = true;
                     }
@@ -3068,7 +3124,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Process output operands
         for (output_idx, op) in outputs.iter().enumerate() {
-            let class = self.asm_operand_class(&op.constraint);
+            let class = output_classes[output_idx];
             let is_memory = class.is_memory_only();
             let is_readwrite = class.access == AsmAccess::ReadWrite;
             let place = self.resolve_rmw_place(&op.expr);
@@ -3199,8 +3255,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
 
         // Process input operands
-        for op in inputs {
-            let class = self.asm_operand_class(&op.constraint);
+        for (op, &class) in inputs.iter().zip(&input_classes) {
             let is_memory = class.is_memory_only();
             let matching = class.tied;
 
@@ -3250,6 +3305,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let (pseudo, offset) = self.asm_memory_operand(addr);
                 memory_offset = offset;
                 pseudo
+            } else if let Some(k) = self.asm_constant_operand(&op.expr, typ, &class) {
+                k
             } else {
                 // For register operands, evaluate the expression
                 self.linearize_expr(&op.expr)
@@ -3437,19 +3494,22 @@ impl<'a> super::linearize::Linearizer<'a> {
         let Some(bb) = func.get_block(bb_id) else {
             return (addr, 0);
         };
-        let defs: std::collections::HashMap<PseudoId, usize> = bb
+        let defs: std::collections::HashMap<PseudoId, &Instruction> = bb
             .insns
             .iter()
-            .enumerate()
-            .filter_map(|(i, insn)| insn.target.map(|t| (t, i)))
+            .filter_map(|insn| insn.target.map(|t| (t, insn)))
             .collect();
-        let walk = AddrWalk {
-            func,
-            insns: &bb.insns,
-            defs: &defs,
-            types: self.types,
+        let walk = AddrWalk { func, defs: &defs };
+        // Storage an operand can be addressed in: a local, or a global that
+        // is not a function.
+        let data_object = |sym: PseudoId, symaddr: &Instruction| {
+            func.local_of(sym).is_some()
+                || symaddr
+                    .typ
+                    .and_then(|t| self.types.base_type(t))
+                    .is_some_and(|t| self.types.kind(t) != TypeKind::Function)
         };
-        walk.object(addr).unwrap_or((addr, 0))
+        walk.object(addr, &data_object).unwrap_or((addr, 0))
     }
 
     /// Capture the stack pointer ahead of a VLA's allocation.
@@ -4106,92 +4166,38 @@ impl crate::constexpr::ConstEnv for Linearizer<'_> {
     }
 }
 
-/// Follows the address arithmetic of one memory operand back to the object
-/// it names. Only within the block being built, where `linearize_lvalue` has
-/// just emitted it. It only reads: the arithmetic stays for whatever else
-/// uses it, and DCE removes the rest.
-struct AddrWalk<'w> {
-    func: &'w super::Function,
-    insns: &'w [Instruction],
-    defs: &'w std::collections::HashMap<PseudoId, usize>,
-    types: &'w TypeTable,
-}
-
-impl AddrWalk<'_> {
-    /// `p` as (object `Sym`, constant byte offset).
-    fn object(&self, p: PseudoId) -> Option<(PseudoId, i64)> {
-        let insn = &self.insns[*self.defs.get(&p)?];
-        match insn.op {
-            Opcode::SymAddr => {
-                let sym = *insn.src.first()?;
-                if !self.names_data_object(sym, insn) {
-                    return None;
-                }
-                Some((sym, 0))
-            }
-            Opcode::Copy => self.object(*insn.src.first()?),
-            Opcode::Add => {
-                let (a, b) = (*insn.src.first()?, *insn.src.get(1)?);
-                match self.object(a) {
-                    Some((sym, off)) => Some((sym, off.checked_add(self.constant(b)?)?)),
-                    None => {
-                        let (sym, off) = self.object(b)?;
-                        Some((sym, off.checked_add(self.constant(a)?)?))
-                    }
-                }
-            }
-            Opcode::Sub => {
-                let (sym, off) = self.object(*insn.src.first()?)?;
-                Some((sym, off.checked_sub(self.constant(*insn.src.get(1)?)?)?))
-            }
-            _ => None,
+/// Why an operand's class cannot stand on its side of the colon, in gcc's
+/// words, or `None` when it can.
+///
+/// An output must be written (`=` or `+`) and be somewhere a value can be
+/// written: a register or memory, never only a constant. An input is only
+/// read, so `=`, `+` and `&` make no sense there, and a matching constraint
+/// must name an output that exists.
+fn asm_operand_misuse(
+    class: &AsmOperandClass,
+    is_output: bool,
+    num_outputs: usize,
+) -> Option<&'static str> {
+    if is_output {
+        if class.access == AsmAccess::Read {
+            Some("output operand constraint lacks '='")
+        } else if class.tied.is_some() {
+            Some("matching constraint not valid in output operand")
+        } else if class.reg.is_none() && class.mem.is_none() {
+            Some("impossible constraint in 'asm'")
+        } else {
+            None
         }
-    }
-
-    /// `p` as a constant, folding the widening and scaling a subscript is
-    /// linearized into.
-    fn constant(&self, p: PseudoId) -> Option<i64> {
-        if let Some(super::PseudoKind::Val(v)) = self.func.get_pseudo(p).map(|x| &x.kind) {
-            return i64::try_from(*v).ok();
-        }
-        let insn = &self.insns[*self.defs.get(&p)?];
-        match insn.op {
-            Opcode::Sext | Opcode::Zext => {
-                let v = self.constant(*insn.src.first()?)?;
-                let bits = insn.src_size;
-                Some(if bits == 0 || bits >= 64 {
-                    v
-                } else if insn.op == Opcode::Sext {
-                    (v << (64 - bits)) >> (64 - bits)
-                } else {
-                    v & ((1i64 << bits) - 1)
-                })
+    } else {
+        match class.access {
+            AsmAccess::Write => Some("input operand constraint contains '='"),
+            AsmAccess::ReadWrite => Some("input operand constraint contains '+'"),
+            AsmAccess::Read if class.early_clobber => Some("input operand constraint contains '&'"),
+            AsmAccess::Read if class.tied.is_some_and(|n| n >= num_outputs) => {
+                Some("matching constraint references invalid operand number")
             }
-            Opcode::Mul => {
-                let a = self.constant(*insn.src.first()?)?;
-                a.checked_mul(self.constant(*insn.src.get(1)?)?)
-            }
-            Opcode::Copy => self.constant(*insn.src.first()?),
-            _ => None,
+            AsmAccess::Read => None,
         }
-    }
-
-    /// Whether `sym` is storage an operand can be addressed in: a local, or
-    /// a global that is not a function.
-    fn names_data_object(&self, sym: PseudoId, symaddr: &Instruction) -> bool {
-        if !matches!(
-            self.func.get_pseudo(sym).map(|x| &x.kind),
-            Some(super::PseudoKind::Sym(_))
-        ) {
-            return false;
-        }
-        if self.func.local_of(sym).is_some() {
-            return true;
-        }
-        symaddr
-            .typ
-            .and_then(|t| self.types.base_type(t))
-            .is_some_and(|t| self.types.kind(t) != TypeKind::Function)
     }
 }
 

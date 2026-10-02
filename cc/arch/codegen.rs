@@ -921,6 +921,15 @@ pub struct AsmOperandSlot<R> {
     pub name: Option<String>,
 }
 
+/// A symbolic inline-asm constant: the already-decorated symbol `sym`
+/// displaced by `offset` bytes, as an assembler expression (`x+4`, `g-12`).
+pub fn asm_symbol_constant(sym: &str, offset: i64) -> String {
+    match offset {
+        0 => sym.to_string(),
+        _ => format!("{sym}{offset:+}"),
+    }
+}
+
 /// Substitute `%N`, `%[name]`, `%lN`, `%l[name]`, and size modifiers in
 /// an asm template. Architecture-specific register formatting is handled
 /// via the [`AsmOperandFormatter`] trait.

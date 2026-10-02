@@ -15,7 +15,7 @@ use crate::arch::aarch64::legalize::{single_offset_fits, LEGALIZE_REG};
 use crate::arch::aarch64::lir::{Aarch64Inst, GpOperand, MemAddr};
 use crate::arch::aarch64::regalloc::{parse_gp_clobber_name, Loc, Reg, VReg};
 use crate::arch::asm_constraints::{AsmAccess, AsmMemClass, AsmOperandClass, AsmRegClass};
-use crate::arch::lir::{Directive, FpSize, OperandSize};
+use crate::arch::lir::{Directive, FpSize, OperandSize, Symbol};
 use crate::ir::{Instruction, PseudoId};
 
 /// What goes in a scratch register before the template: a memory operand's
@@ -389,6 +389,25 @@ impl Aarch64CodeGen {
                 name: op_name.clone(),
             };
             match loc {
+                // A symbolic constant (`"S"`): the global's address, written
+                // into the template. The operand names the global's `Sym`,
+                // with any offset on it -- see
+                // `ir::asm_operand::resolve_immediates`.
+                Loc::Global(name) if class.is_immediate_only() => {
+                    let sym = if name.starts_with('.') {
+                        Symbol::local(name)
+                    } else {
+                        Symbol::global(name)
+                    };
+                    let sym = sym.format_for_target(&self.base.target);
+                    slots.push(mk(
+                        None,
+                        Some(crate::arch::codegen::asm_symbol_constant(
+                            &sym,
+                            input.offset,
+                        )),
+                    ));
+                }
                 Loc::Reg(r) if requires_mem => {
                     // See output-side note: memory-class input with
                     // its address in a register renders as `[xN]`.
@@ -401,7 +420,7 @@ impl Aarch64CodeGen {
                 // register: the template may use it where no immediate
                 // encodes (`add x0, #100, #100`). A class that offers no
                 // register at all takes the constant as written.
-                Loc::Imm(v) if class.reg.is_some() && !class.imm => {
+                Loc::Imm(v) if class.reg.is_some() && !class.imm.int => {
                     let Some(reg) = addr_regs.take(&mut gp_scratch, true) else {
                         crate::diag::error(
                             insn.pos.unwrap_or_default(),

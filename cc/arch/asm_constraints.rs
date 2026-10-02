@@ -98,6 +98,103 @@ pub enum AsmMemClass {
     BaseOnly,
 }
 
+/// The constants an operand may be written into the template as.
+///
+/// gcc distinguishes three kinds, and so must the classification: `n` takes
+/// an integer and nothing else, `s` a link-time symbolic address and never an
+/// integer, `i` either -- and a floating constant's bit pattern too. Which
+/// letters take a symbolic address also differs by target: under the
+/// position-independent code both targets build by default, gcc substitutes
+/// `$sym` for x86-64 `i`, while on aarch64 only `S` names a symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AsmImm {
+    /// An integer constant.
+    pub int: bool,
+    /// A floating constant, substituted as its bit pattern.
+    pub float: bool,
+    /// The address of a global object or function, plus a constant offset.
+    pub symbol: bool,
+}
+
+impl AsmImm {
+    const INT: Self = Self {
+        int: true,
+        float: false,
+        symbol: false,
+    };
+    const NUMBER: Self = Self {
+        int: true,
+        float: true,
+        symbol: false,
+    };
+    const SYMBOL: Self = Self {
+        int: false,
+        float: false,
+        symbol: true,
+    };
+    const FLOAT: Self = Self {
+        int: false,
+        float: true,
+        symbol: false,
+    };
+    const ANY: Self = Self {
+        int: true,
+        float: true,
+        symbol: true,
+    };
+
+    /// Whether any constant is allowed.
+    pub fn any(self) -> bool {
+        self.int || self.float || self.symbol
+    }
+
+    fn union(self, other: Self) -> Self {
+        Self {
+            int: self.int || other.int,
+            float: self.float || other.float,
+            symbol: self.symbol || other.symbol,
+        }
+    }
+
+    /// What the operand must be, for a diagnostic.
+    pub fn describe(self) -> &'static str {
+        match (self.int || self.float, self.symbol) {
+            (true, true) => "a constant",
+            (false, true) => "a symbolic address constant",
+            _ if !self.float => "an integer constant",
+            _ if !self.int => "a floating constant",
+            _ => "a numeric constant",
+        }
+    }
+}
+
+/// A constraint string c17 does not classify, and so rejects rather than
+/// read as some other class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConstraintError {
+    /// A letter, or a multi-letter sequence, that c17 does not model on the
+    /// target.
+    Unsupported(String),
+    /// A condition-code output, `=@cc<cond>`: the operand is a flag, which
+    /// c17 does not materialize.
+    FlagOutput,
+}
+
+impl ConstraintError {
+    /// The diagnostic for `constraint`.
+    pub fn message(&self, constraint: &str) -> String {
+        match self {
+            ConstraintError::Unsupported(what) => {
+                format!("unsupported constraint '{what}' in asm operand \"{constraint}\"")
+            }
+            ConstraintError::FlagOutput => format!(
+                "unsupported flag output constraint \"{constraint}\" in asm \
+                 operand; c17 does not support condition-code outputs"
+            ),
+        }
+    }
+}
+
 /// What one operand's constraint string allows, read once for the target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AsmOperandClass {
@@ -109,8 +206,8 @@ pub struct AsmOperandClass {
     pub reg: Option<AsmRegClass>,
     /// The memory it may be, if any.
     pub mem: Option<AsmMemClass>,
-    /// Whether a constant may be substituted as an immediate.
-    pub imm: bool,
+    /// The constants that may be substituted as an immediate.
+    pub imm: AsmImm,
     /// A matching constraint: the output operand number it names, which may
     /// have more than one digit.
     pub tied: Option<usize>,
@@ -120,24 +217,30 @@ pub struct AsmOperandClass {
 enum Letter {
     Reg(AsmRegClass),
     Mem(AsmMemClass),
-    Imm,
+    Imm(AsmImm),
     /// `g` and `X`: a general register, memory or an immediate.
     Any,
+    /// A modifier that leaves the class as it is: `%` (commutative), `,`
+    /// (between alternatives), and the register-preference and
+    /// auto-increment markers `*`, `?`, `!`, `^`, `$`, `<`, `>`.
+    Modifier,
 }
 
 impl AsmOperandClass {
     /// Classify `constraint` for `arch`.
     ///
     /// Alternatives listed in one string (`"rm"`, `"ri"`, `"g"`) accumulate:
-    /// the operand may be any of them. Letters this compiler does not model
-    /// (and modifiers such as `%`, `,`, `*`, `?`, `!`) contribute nothing.
-    pub fn parse(constraint: &str, arch: Arch) -> Self {
+    /// the operand may be any of them. A letter or sequence c17 does not
+    /// model is an error naming it: read as nothing, it left the operand to
+    /// whatever class the rest of the string gave it, and `"Yz"` became an
+    /// arbitrary vector register, `"=@ccz"` a general one.
+    pub fn parse(constraint: &str, arch: Arch) -> Result<Self, ConstraintError> {
         let mut class = AsmOperandClass {
             access: AsmAccess::Read,
             early_clobber: false,
             reg: None,
             mem: None,
-            imm: false,
+            imm: AsmImm::default(),
             tied: None,
         };
         let mut chars = constraint.chars().peekable();
@@ -146,6 +249,10 @@ impl AsmOperandClass {
                 '=' if class.access == AsmAccess::Read => class.access = AsmAccess::Write,
                 '+' => class.access = AsmAccess::ReadWrite,
                 '&' => class.early_clobber = true,
+                '@' => return Err(ConstraintError::FlagOutput),
+                // `#`: the rest of the alternative only steers register
+                // preference; it is not part of the constraint.
+                '#' => while chars.next_if(|&d| d != ',').is_some() {},
                 '0'..='9' => {
                     let mut n = c.to_digit(10).unwrap() as usize;
                     while let Some(d) = chars.peek().and_then(|d| d.to_digit(10)) {
@@ -157,17 +264,24 @@ impl AsmOperandClass {
                 _ => match letter(c, arch) {
                     Some(Letter::Reg(r)) => class.add_reg(r),
                     Some(Letter::Mem(m)) => class.add_mem(m),
-                    Some(Letter::Imm) => class.imm = true,
+                    Some(Letter::Imm(k)) => class.imm = class.imm.union(k),
                     Some(Letter::Any) => {
                         class.add_reg(AsmRegClass::General);
                         class.add_mem(AsmMemClass::Any);
-                        class.imm = true;
+                        class.imm = AsmImm::ANY;
                     }
-                    None => {}
+                    Some(Letter::Modifier) => {}
+                    None => {
+                        let mut what = c.to_string();
+                        for _ in 0..sequence_tail(c, arch) {
+                            what.extend(chars.next());
+                        }
+                        return Err(ConstraintError::Unsupported(what));
+                    }
                 },
             }
         }
-        class
+        Ok(class)
     }
 
     fn add_reg(&mut self, r: AsmRegClass) {
@@ -186,7 +300,13 @@ impl AsmOperandClass {
     /// True when the operand can only be memory: no register and no
     /// immediate alternative is offered.
     pub fn is_memory_only(&self) -> bool {
-        self.mem.is_some() && self.reg.is_none() && !self.imm
+        self.mem.is_some() && self.reg.is_none() && !self.imm.any()
+    }
+
+    /// True when the operand can only be a constant written into the
+    /// template: no register, memory or matching alternative is offered.
+    pub fn is_immediate_only(&self) -> bool {
+        self.imm.any() && self.reg.is_none() && self.mem.is_none() && self.tied.is_none()
     }
 }
 
@@ -194,11 +314,15 @@ impl AsmOperandClass {
 fn letter(c: char, arch: Arch) -> Option<Letter> {
     use AsmRegClass::*;
     Some(match (arch, c) {
+        (_, '%' | ',' | '*' | '?' | '!' | '^' | '$' | '<' | '>') => Letter::Modifier,
         (_, 'r') => Letter::Reg(General),
         (_, 'm' | 'o' | 'V') => Letter::Mem(AsmMemClass::Any),
-        (_, 'i' | 'n' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' | 'Z') => Letter::Imm,
+        (_, 'n' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'Z') => Letter::Imm(AsmImm::INT),
         (_, 'g' | 'X') => Letter::Any,
 
+        (Arch::X86_64, 'i') => Letter::Imm(AsmImm::ANY),
+        (Arch::X86_64, 'O' | 'e') => Letter::Imm(AsmImm::INT),
+        (Arch::X86_64, 's') => Letter::Imm(AsmImm::SYMBOL),
         (Arch::X86_64, 'q' | 'R' | 'l') => Letter::Reg(General),
         (Arch::X86_64, 'a') => Letter::Reg(Pinned(PinnedGp::Rax)),
         (Arch::X86_64, 'b') => Letter::Reg(Pinned(PinnedGp::Rbx)),
@@ -207,18 +331,32 @@ fn letter(c: char, arch: Arch) -> Option<Letter> {
         (Arch::X86_64, 'S') => Letter::Reg(Pinned(PinnedGp::Rsi)),
         (Arch::X86_64, 'D') => Letter::Reg(Pinned(PinnedGp::Rdi)),
         (Arch::X86_64, 'Q') => Letter::Reg(HighByte),
-        (Arch::X86_64, 'x' | 'v' | 'Y') => Letter::Reg(Vector),
+        (Arch::X86_64, 'x' | 'v') => Letter::Reg(Vector),
         (Arch::X86_64, 'f') => Letter::Reg(X87(X87Slot::Any)),
         (Arch::X86_64, 't') => Letter::Reg(X87(X87Slot::Top)),
         (Arch::X86_64, 'u') => Letter::Reg(X87(X87Slot::Second)),
-        (Arch::X86_64, 'e' | 's') => Letter::Imm,
 
+        (Arch::Aarch64, 'i') => Letter::Imm(AsmImm::NUMBER),
+        (Arch::Aarch64, 'S') => Letter::Imm(AsmImm::SYMBOL),
+        (Arch::Aarch64, 'Y') => Letter::Imm(AsmImm::FLOAT),
         (Arch::Aarch64, 'w' | 'x' | 'y') => Letter::Reg(Vector),
         (Arch::Aarch64, 'Q') => Letter::Mem(AsmMemClass::BaseOnly),
-        (Arch::Aarch64, 'S' | 'Y') => Letter::Imm,
 
         _ => return None,
     })
+}
+
+/// How many characters after `c` belong to the same constraint, for the
+/// letters that open a multi-letter one on `arch` (x86-64 `Yz`, `Bm`, `Wz`,
+/// `Tv`; aarch64 `Ump`, `Dz`). Only the diagnostic reads it: none of these
+/// is modelled, and naming `Y` alone for `"Yz"` would misdescribe it.
+fn sequence_tail(c: char, arch: Arch) -> usize {
+    match (arch, c) {
+        (Arch::X86_64, 'Y' | 'B' | 'W' | 'T') => 1,
+        (Arch::Aarch64, 'U') => 2,
+        (Arch::Aarch64, 'D') => 1,
+        _ => 0,
+    }
 }
 
 /// The register-allocator view of one inline-asm statement: the operands
@@ -291,11 +429,11 @@ mod tests {
     use AsmRegClass::*;
 
     fn x86(s: &str) -> AsmOperandClass {
-        AsmOperandClass::parse(s, Arch::X86_64)
+        AsmOperandClass::parse(s, Arch::X86_64).unwrap()
     }
 
     fn a64(s: &str) -> AsmOperandClass {
-        AsmOperandClass::parse(s, Arch::Aarch64)
+        AsmOperandClass::parse(s, Arch::Aarch64).unwrap()
     }
 
     /// `(reg, mem, imm)` for a constraint body.
@@ -304,7 +442,7 @@ mod tests {
     const MEM: Option<AsmMemClass> = Some(AsmMemClass::Any);
 
     fn allows(c: AsmOperandClass) -> Allows {
-        (c.reg, c.mem, c.imm)
+        (c.reg, c.mem, c.imm.any())
     }
 
     /// The letters both targets share mean the same on each.
@@ -353,10 +491,9 @@ mod tests {
             ("e", (None, None, true)),
             ("Z", (None, None, true)),
             ("s", (None, None, true)),
+            ("O", (None, None, true)),
             // A named register outranks a class listed beside it.
             ("ra", (Some(Pinned(PinnedGp::Rax)), None, false)),
-            // aarch64's register letter is no x86-64 class.
-            ("w", (None, None, false)),
         ];
         for &(s, want) in table {
             assert_eq!(allows(x86(s)), want, "{s:?}");
@@ -378,9 +515,6 @@ mod tests {
             ("Y", (None, None, true)),
             ("Z", (None, None, true)),
             ("K", (None, None, true)),
-            // x86-64's pinned letters name nothing here.
-            ("a", (None, None, false)),
-            ("D", (None, None, false)),
         ];
         for &(s, want) in table {
             assert_eq!(allows(a64(s)), want, "{s:?}");
@@ -418,7 +552,7 @@ mod tests {
         assert_eq!(a64("12").tied, Some(12));
         assert_eq!(x86("r").tied, None);
         let tied = x86("1");
-        assert_eq!((tied.reg, tied.mem, tied.imm), (None, None, false));
+        assert_eq!((tied.reg, tied.mem, tied.imm.any()), (None, None, false));
     }
 
     #[test]
@@ -436,6 +570,120 @@ mod tests {
             assert!(!x86(s).is_memory_only(), "x86-64 {s:?}");
         }
         assert!(!a64("wm").is_memory_only());
+    }
+
+    /// Which constants each immediate letter takes, per target.
+    #[test]
+    fn immediate_kinds() {
+        const INT: AsmImm = AsmImm::INT;
+        const SYM: AsmImm = AsmImm::SYMBOL;
+        let table: &[(Arch, &str, AsmImm)] = &[
+            // x86-64 `i` substitutes `$sym`; aarch64's takes numbers only.
+            (Arch::X86_64, "i", AsmImm::ANY),
+            (Arch::Aarch64, "i", AsmImm::NUMBER),
+            (Arch::X86_64, "n", INT),
+            (Arch::Aarch64, "n", INT),
+            (Arch::X86_64, "s", SYM),
+            (Arch::Aarch64, "S", SYM),
+            (Arch::X86_64, "e", INT),
+            (Arch::X86_64, "I", INT),
+            (Arch::Aarch64, "Z", INT),
+            (Arch::Aarch64, "Y", AsmImm::FLOAT),
+            (
+                Arch::X86_64,
+                "ns",
+                AsmImm {
+                    symbol: true,
+                    ..INT
+                },
+            ),
+            (Arch::X86_64, "g", AsmImm::ANY),
+            (Arch::X86_64, "r", AsmImm::default()),
+        ];
+        for &(arch, s, want) in table {
+            let got = AsmOperandClass::parse(s, arch).unwrap().imm;
+            assert_eq!(got, want, "{arch:?} {s:?}");
+        }
+    }
+
+    #[test]
+    fn immediate_only() {
+        for s in ["i", "n", "s", "I", "e"] {
+            assert!(x86(s).is_immediate_only(), "{s:?}");
+        }
+        for s in ["ri", "mi", "g", "X", "0", "r", "m", "i0"] {
+            assert!(!x86(s).is_immediate_only(), "{s:?}");
+        }
+        assert!(a64("S").is_immediate_only());
+        assert!(!a64("rS").is_immediate_only());
+    }
+
+    /// `#` hides the rest of its alternative from the constraint.
+    #[test]
+    fn hash_ends_the_alternative() {
+        assert!(x86("i#*X").is_immediate_only());
+        assert_eq!(x86("r#m").mem, None);
+        assert_eq!(x86("r#m,m").mem, Some(AsmMemClass::Any));
+    }
+
+    /// Every letter or sequence c17 does not model is an error naming it,
+    /// never a class it was silently read as.
+    #[test]
+    fn unsupported_constraints_are_errors() {
+        use ConstraintError::*;
+        let err = |s: &str, arch| AsmOperandClass::parse(s, arch).unwrap_err();
+        let x86_table: &[(&str, &str)] = &[
+            ("Yz", "Yz"),
+            ("Y", "Y"),
+            ("=Yk", "Yk"),
+            ("Bm", "Bm"),
+            ("Wz", "Wz"),
+            ("Tv", "Tv"),
+            ("p", "p"),
+            ("A", "A"),
+            ("y", "y"),
+            ("k", "k"),
+            ("C", "C"),
+            ("G", "G"),
+            ("E", "E"),
+            ("F", "F"),
+            ("r ", " "),
+            ("-r", "-"),
+            // aarch64's register letter is no x86-64 class.
+            ("w", "w"),
+        ];
+        for &(s, what) in x86_table {
+            assert_eq!(
+                err(s, Arch::X86_64),
+                Unsupported(what.into()),
+                "x86-64 {s:?}"
+            );
+        }
+        let a64_table: &[(&str, &str)] = &[
+            ("Ump", "Ump"),
+            ("=Utf", "Utf"),
+            ("Dz", "Dz"),
+            ("k", "k"),
+            ("s", "s"),
+            ("O", "O"),
+            // x86-64's pinned letters name nothing here.
+            ("a", "a"),
+            ("D", "D"),
+        ];
+        for &(s, what) in a64_table {
+            assert_eq!(
+                err(s, Arch::Aarch64),
+                Unsupported(what.into()),
+                "aarch64 {s:?}"
+            );
+        }
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            assert_eq!(err("=@ccz", arch), FlagOutput);
+            assert_eq!(err("=@ccnae", arch), FlagOutput);
+        }
+        assert!(err("Yz", Arch::X86_64)
+            .message("Yz")
+            .contains("'Yz' in asm operand \"Yz\""));
     }
 
     fn operand(pseudo: u32, constraint: &str) -> crate::ir::AsmConstraint {

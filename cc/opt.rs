@@ -13,6 +13,7 @@ use gettextrs::gettext;
 use std::collections::{BTreeMap, HashSet};
 
 use crate::diag::Position;
+use crate::ir::asm_operand;
 use crate::ir::constglobal;
 use crate::ir::copyprop;
 use crate::ir::dce;
@@ -552,6 +553,18 @@ pub fn optimize_module(
     } else {
         OptReport::default()
     };
+
+    // An immediate-only asm operand must be a constant by now, which is when
+    // gcc decides too: inlining a literal into `"i"(param)` satisfies it at
+    // -O2 and nothing does at -O0. The copies and address arithmetic that
+    // carried the constant are dead once the operand names it.
+    let thread_locals = asm_operand::thread_locals(module);
+    for func in &mut module.functions {
+        if asm_operand::resolve_immediates(func, &thread_locals) && opt.optimizes() {
+            dce::run(func);
+            func.remove_nops();
+        }
+    }
 
     // An address that survived everything above would reach the link as an
     // undefined reference to the suppressed body.

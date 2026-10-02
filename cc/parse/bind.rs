@@ -12,7 +12,7 @@
 
 use super::ast::{Declaration, Expr, ExternalDecl, FunctionAttrs, InitDeclarator};
 use super::attribute::SpecifierAttrs;
-use super::declaration::SpecContext;
+use super::declaration::{Redeclared, SpecContext};
 use super::parser::{DeclaratorContext, ParseError, ParseResult, ParsedDeclarator, Parser};
 use crate::diag;
 use crate::strings::StringId;
@@ -309,7 +309,7 @@ impl Parser<'_> {
             // C17 6.2.7p4: two declarations of one object with linkage
             // describe it by their composite type.
             typ = self.composite_with_prior_declaration(name, typ, specs.storage_class);
-            self.check_redeclaration(name, typ, pos);
+            self.check_redeclaration(name, typ, pos, Redeclared::Declaration);
             let sym = self
                 .declared_symbol(name, typ, align)
                 .with_variably_modified_array(!vla.is_empty());

@@ -14,7 +14,7 @@ use super::ast::{
     ExternalDecl, FunctionAttrs, FunctionDef, ParamStyle, Parameter, Stmt, TranslationUnit,
 };
 use super::bind::{DeclScope, DeclSpecs};
-use super::declaration::SpecContext;
+use super::declaration::{Redeclared, SpecContext};
 use super::parser::{
     DeclaratorContext, EnclosingFunction, ParseError, ParseResult, ParsedDeclarator, Parser,
     RawParam,
@@ -253,7 +253,11 @@ impl Parser<'_> {
         };
         let return_type = func.base.expect("a function type has a return type");
 
-        self.check_redeclaration(name, typ, pos);
+        let form = match param_style {
+            ParamStyle::Prototype => Redeclared::Declaration,
+            ParamStyle::IdentifierList => Redeclared::IdentifierListDefinition,
+        };
+        self.check_redeclaration(name, typ, pos, form);
         let _ = self
             .symbols
             .declare(Symbol::function(name, typ, self.symbols.depth()));

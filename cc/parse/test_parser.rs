@@ -9730,3 +9730,69 @@ fn test_array_suffix_derivation_order() {
     assert_eq!(types.get(elem).array_size, Some(3));
     assert_eq!(types.kind(types.base_type(elem).unwrap()), TypeKind::Int);
 }
+
+/// The type of a conditional expression whose arms are pointers, or a pointer
+/// and something else (C17 6.5.15p6), spelled as gcc's `_Generic` reports it.
+///
+/// A null pointer constant takes the other arm's type, even when it is
+/// `(void *)0` -- which is a pointer, but is not what the arm contributes.
+/// Compatible pointees merge to their composite type, so an array of unknown
+/// size meets `[3]` as `[3]` and a function without a prototype meets
+/// `(void)` as `(void)`. Pointers to incompatible types give `void *`, which
+/// is gcc's answer, and a pointer beside a nonzero integer stays a pointer.
+#[test]
+fn test_conditional_pointer_result_types() {
+    let decls = "int c; int *p; char *cp; const int *cip; volatile int *vip; \
+                 void *vp; const void *cvp; int (*fp)(void); int (*fnp)(); \
+                 const int (*cap)[]; int (*a3)[3]; unsigned *up;";
+    for (expr, want) in [
+        ("c ? p : (void *)0", "int *"),
+        ("c ? (void *)0 : p", "int *"),
+        ("c ? cip : (void *)0", "const int *"),
+        ("c ? fp : (void *)0", "int (*)(void)"),
+        ("c ? p : 0", "int *"),
+        ("c ? p : 0L", "int *"),
+        ("c ? p : (const void *)0", "const void *"),
+        ("c ? p : (char *)0", "void *"),
+        ("c ? p : cp", "void *"),
+        ("c ? cip : cp", "void *"),
+        ("c ? p : up", "void *"),
+        ("c ? p : 1", "int *"),
+        ("c ? 5 : vip", "volatile int *"),
+        ("c ? p : vp", "void *"),
+        ("c ? cip : vp", "const void *"),
+        ("c ? cvp : vip", "const volatile void *"),
+        ("c ? cip : vip", "const volatile int *"),
+        ("c ? cap : a3", "const int (*)[3]"),
+        ("c ? a3 : cap", "const int (*)[3]"),
+        ("c ? fnp : fp", "int (*)(void)"),
+        ("c ? fp : fnp", "int (*)(void)"),
+        ("c ? fp : vp", "void *"),
+    ] {
+        let src = format!("{decls} __typeof__({expr}) r;");
+        let (tu, types, _, _) = parse_tu(&src).unwrap();
+        let Some(ExternalDecl::Declaration(decl)) = tu.items.last() else {
+            panic!("{expr}: expected a declaration");
+        };
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.format_type(typ, None), want, "{expr}");
+    }
+}
+
+/// C17 6.5.15p3 admits only these pairs of arms; any other is an error, which
+/// leaves the conditional untyped so no enclosing operator reports it again.
+/// The accepted pairs are proved in `cc/tests/diagnostics`, where a stray
+/// error from a concurrent test cannot reach the count.
+#[test]
+fn test_conditional_mismatched_arms_are_errors() {
+    for src in [
+        "struct S { int a; } s; struct T { int a; } t; int c; void f(void) { c ? s : t; }",
+        "struct S { int a; } s; int c; void f(void) { c ? s : 1; }",
+        "int *p; int c; void f(void) { c ? 1.0 : p; }",
+        "int *p; int c; void f(void) { c ? p : 0.0; }",
+    ] {
+        let before = crate::diag::error_count();
+        parse_tu(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        assert!(crate::diag::error_count() > before, "{src}: accepted");
+    }
+}

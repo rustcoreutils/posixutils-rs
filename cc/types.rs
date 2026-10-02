@@ -732,8 +732,10 @@ impl Type {
             _ => {}
         }
 
-        // Compare variadic flag
-        if self.variadic != other.variadic {
+        // Compare variadic flag. A function type without a prototype says
+        // nothing about its parameters, so the caller settles one against a
+        // prototype.
+        if self.params.is_some() && other.params.is_some() && self.variadic != other.variadic {
             return false;
         }
 
@@ -752,17 +754,17 @@ impl Type {
         // complaint about two spellings of one type. Storage class is a
         // property of a declaration, never of a type.
 
-        // Only the *shape* of the parameter list is settled here: whether a
-        // prototype was supplied at all, and how many parameters it has. The
-        // parameter types themselves are compared by the caller, which can
-        // recurse -- comparing them by TypeId called two identical
-        // `void *(Parser *)` different whenever a declaration specifier had
-        // settled on an inner type, which is 19 lines of CPython's generated
-        // parser.
-        match (&self.params, &other.params) {
-            (Some(a), Some(b)) if a.len() == b.len() => {}
-            (None, None) => {}
-            _ => return false,
+        // Only the *shape* of two prototypes is settled here: how many
+        // parameters each has. The parameter types themselves are compared by
+        // the caller, which can recurse -- comparing them by TypeId called two
+        // identical `void *(Parser *)` different whenever a declaration
+        // specifier had settled on an inner type, which is 19 lines of
+        // CPython's generated parser. So is a prototype against a function
+        // type without one.
+        if let (Some(a), Some(b)) = (&self.params, &other.params) {
+            if a.len() != b.len() {
+                return false;
+            }
         }
 
         // Compare composite types (struct, union, enum)
@@ -2982,8 +2984,27 @@ impl TypeTable {
                 .iter()
                 .zip(b.iter())
                 .all(|(&x, &y)| self.parameters_compatible(x, y, enums)),
-            _ => true,
+            (Some(_), None) => self.prototype_matches_unprototyped(id1, enums),
+            (None, Some(_)) => self.prototype_matches_unprototyped(id2, enums),
+            (None, None) => true,
         }
+    }
+
+    /// Is the function type `proto`, which has a prototype, compatible with
+    /// one of the same return type that has none (C17 6.2.7p3)?
+    ///
+    /// Only when a call through either would pass the same arguments: no
+    /// ellipsis, and every parameter of a type the default argument
+    /// promotions leave alone. `int (void)` and `int (double)` match `int ()`,
+    /// while `int (char)` and `int (float)` -- whose arguments a call without
+    /// a prototype passes as `int` and `double` -- do not.
+    fn prototype_matches_unprototyped(&self, proto: TypeId, enums: EnumMatch) -> bool {
+        let typ = self.get(proto);
+        !typ.variadic
+            && typ.params.iter().flatten().all(|&p| {
+                let promoted = self.default_argument_promote(p);
+                self.compatible(p, promoted, TopLevelQualifiers::Ignored, enums)
+            })
     }
 
     /// An enumerated type meeting a type that is not one, with the enum
@@ -3071,6 +3092,84 @@ impl TypeTable {
             TopLevelQualifiers::Significant,
             EnumMatch::Integer,
         )
+    }
+
+    /// The composite type of two compatible types (C17 6.2.7p3), carrying
+    /// `a`'s qualifiers at every level where the two may differ only in
+    /// derivation.
+    ///
+    /// An array of known size beats one of unknown size, a function with a
+    /// prototype beats one without, and the referenced type, element type,
+    /// return type and parameter types are composed in turn. Any other pair
+    /// of compatible types has nothing to choose between, and is `a`.
+    pub fn composite_type(&mut self, a: TypeId, b: TypeId) -> TypeId {
+        if a == b || self.kind(a) != self.kind(b) {
+            return a;
+        }
+        let mut composite = self.get(a).clone();
+        let other = self.get(b).clone();
+        match composite.kind {
+            TypeKind::Pointer | TypeKind::Array | TypeKind::Function => {}
+            _ => return a,
+        }
+        if let (Some(x), Some(y)) = (composite.base, other.base) {
+            composite.base = Some(self.composite_type(x, y));
+        }
+        match composite.kind {
+            // "Unknown" is spelled both as no size and as zero; see
+            // `redeclaration_compatible`.
+            TypeKind::Array if matches!(composite.array_size, None | Some(0)) => {
+                composite.array_size = other.array_size.or(composite.array_size);
+            }
+            TypeKind::Function => match (&composite.params, &other.params) {
+                (None, Some(_)) => {
+                    composite.params = other.params.clone();
+                    composite.variadic = other.variadic;
+                }
+                (Some(x), Some(y)) if x.len() == y.len() => {
+                    let (x, y) = (x.clone(), y.clone());
+                    composite.params = Some(
+                        x.iter()
+                            .zip(&y)
+                            .map(|(&p, &q)| self.composite_type(p, q))
+                            .collect(),
+                    );
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        self.intern(composite)
+    }
+
+    /// The qualifiers of `id`, where those of an array type are its element
+    /// type's (C17 6.7.3p10): `const int[3]` is as `const` as `const int`.
+    pub fn qualifiers_through_arrays(&self, id: TypeId) -> TypeModifiers {
+        match self.kind(id) {
+            TypeKind::Array => self
+                .base_type(id)
+                .map_or_else(TypeModifiers::empty, |e| self.qualifiers_through_arrays(e)),
+            _ => self.qualifiers(id),
+        }
+    }
+
+    /// The unqualified version of `id`, where an array's qualifiers are its
+    /// element type's: the inverse of [`Self::qualified_with`], which puts a
+    /// qualifier of an array on its elements.
+    pub fn unqualified_through_arrays(&mut self, id: TypeId) -> TypeId {
+        if self.kind(id) != TypeKind::Array {
+            return self.unqualified(id);
+        }
+        let Some(elem) = self.base_type(id) else {
+            return id;
+        };
+        let bare = self.unqualified_through_arrays(elem);
+        if bare == elem {
+            return id;
+        }
+        let mut array = self.get(id).clone();
+        array.base = Some(bare);
+        self.intern(array)
     }
 
     /// Compute struct layout with natural alignment
@@ -4842,5 +4941,84 @@ mod tests {
         let chars = types.intern(Type::array(types.char_id, usize::MAX - 1));
         let mut m = vec![member(types.int_id), member(chars)];
         assert_eq!(types.compute_union_layout(&mut m, None).0, usize::MAX);
+    }
+
+    /// C17 6.2.7p3: a prototype is compatible with no prototype exactly when
+    /// it has no ellipsis and no parameter the default argument promotions
+    /// change.
+    #[test]
+    fn prototype_against_no_prototype() {
+        let mut t = TypeTable::new(&Target::host());
+        let none = t.intern(Type::function_no_prototype(t.int_id, false));
+        let proto = |t: &mut TypeTable, params: Vec<TypeId>, variadic: bool| {
+            let int = t.int_id;
+            t.intern(Type::function(int, params, variadic, false))
+        };
+        let (int, double, char, float) = (t.int_id, t.double_id, t.char_id, t.float_id);
+        let void_args = proto(&mut t, vec![], false);
+        let int_double = proto(&mut t, vec![int, double], false);
+        let char_arg = proto(&mut t, vec![char], false);
+        let float_arg = proto(&mut t, vec![float], false);
+        let variadic = proto(&mut t, vec![int], true);
+        for f in [void_args, int_double] {
+            assert!(t.types_compatible(none, f));
+            assert!(t.types_compatible(f, none));
+        }
+        for f in [char_arg, float_arg, variadic] {
+            assert!(!t.types_compatible(none, f));
+            assert!(!t.types_compatible(f, none));
+        }
+        let long_none = t.intern(Type::function_no_prototype(t.long_id, false));
+        assert!(!t.types_compatible(long_none, void_args));
+    }
+
+    /// The composite type takes the known array extent and the prototype,
+    /// at any depth, and keeps the first type's qualifiers.
+    #[test]
+    fn composite_type_of_compatible_types() {
+        let mut t = TypeTable::new(&Target::host());
+        let unknown = t.intern(Type {
+            array_size: None,
+            ..Type::array(t.int_id, 0)
+        });
+        let three = t.intern(Type::array(t.int_id, 3));
+        assert_eq!(t.composite_type(unknown, three), three);
+        assert_eq!(t.composite_type(three, unknown), three);
+
+        let p_unknown = t.intern(Type::pointer(unknown));
+        let p_three = t.intern(Type::pointer(three));
+        assert_eq!(t.composite_type(p_unknown, p_three), p_three);
+
+        let none = t.intern(Type::function_no_prototype(t.int_id, false));
+        let void_args = t.intern(Type::function(t.int_id, vec![], false, false));
+        assert_eq!(t.composite_type(none, void_args), void_args);
+        assert_eq!(t.composite_type(void_args, none), void_args);
+
+        // A parameter of pointer-to-array type composes too.
+        let takes_unknown = t.intern(Type::function(t.int_id, vec![p_unknown], false, false));
+        let takes_three = t.intern(Type::function(t.int_id, vec![p_three], false, false));
+        assert_eq!(t.composite_type(takes_unknown, takes_three), takes_three);
+
+        let const_unknown = t.qualified_with(p_unknown, TypeModifiers::CONST);
+        let composite = t.composite_type(const_unknown, p_three);
+        assert_eq!(t.qualifiers(composite), TypeModifiers::CONST);
+        assert_eq!(t.base_type(composite), Some(three));
+    }
+
+    /// An array's qualifiers are its element type's, in both directions.
+    #[test]
+    fn qualifiers_through_arrays() {
+        let mut t = TypeTable::new(&Target::host());
+        let const_int = t.qualified_with(t.int_id, TypeModifiers::CONST);
+        let arr = t.intern(Type::array(const_int, 3));
+        let grid = t.intern(Type::array(arr, 2));
+        assert_eq!(t.qualifiers(grid), TypeModifiers::empty());
+        assert_eq!(t.qualifiers_through_arrays(grid), TypeModifiers::CONST);
+
+        let bare = t.unqualified_through_arrays(grid);
+        assert_eq!(t.qualifiers_through_arrays(bare), TypeModifiers::empty());
+        let plain = t.intern(Type::array(t.int_id, 3));
+        assert_eq!(t.base_type(bare), Some(plain));
+        assert_eq!(t.qualified_with(bare, TypeModifiers::CONST), grid);
     }
 }

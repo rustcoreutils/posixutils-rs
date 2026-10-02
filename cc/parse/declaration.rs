@@ -212,6 +212,15 @@ pub(crate) enum SpecContext {
     TypeName,
 }
 
+/// The declaration a redeclaration check is for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Redeclared {
+    /// Any declaration, or a definition with a prototype.
+    Declaration,
+    /// A function definition with an identifier list, `int f(c) char c;`.
+    IdentifierListDefinition,
+}
+
 /// The type a list of declaration specifiers names, and what came with it.
 pub(crate) struct DeclSpecifiers {
     /// The type, still carrying the storage-class and function specifiers,
@@ -1305,7 +1314,16 @@ impl Parser<'_> {
     /// repeat *in the same scope* is a redeclaration, so shadowing survives,
     /// and the declaration-only modifiers come off first, so `extern int x;`
     /// followed by `int x = 5;` is one type, not two.
-    pub(super) fn check_redeclaration(&mut self, name: StringId, new_type: TypeId, pos: Position) {
+    ///
+    /// `form` says whether the new one is a function definition with an
+    /// identifier list, which gcc holds to a looser rule.
+    pub(super) fn check_redeclaration(
+        &mut self,
+        name: StringId,
+        new_type: TypeId,
+        pos: Position,
+        form: Redeclared,
+    ) {
         let Some(existing_id) = self.symbols.lookup_id(name, Namespace::Ordinary) else {
             return;
         };
@@ -1353,7 +1371,7 @@ impl Parser<'_> {
         let old_type = existing.typ;
         let old_type = self.types.without_decl_specifiers(old_type);
         let new_type = self.types.without_decl_specifiers(new_type);
-        if self.redeclaration_compatible(old_type, new_type) {
+        if self.redeclaration_compatible(old_type, new_type, form) {
             return;
         }
 
@@ -1385,11 +1403,16 @@ impl Parser<'_> {
 
     /// Are these two declarations of one name compatible (C17 6.2.7)?
     ///
-    /// Beyond ordinary type compatibility, 6.2.7p2 pairs a declarator with no
-    /// prototype against one that has a prototype: `int f(); int f(int);` is a
-    /// composite type, not a conflict. That case is only expressible because
-    /// the function type now records whether a prototype was supplied.
-    fn redeclaration_compatible(&self, old: TypeId, new: TypeId) -> bool {
+    /// Ordinary type compatibility -- which already pairs a function type
+    /// without a prototype against one with a prototype, so `int f(); int
+    /// f(int);` is a composite type and `int f(); int f(char);` a conflict --
+    /// and a zero extent as an unknown one.
+    ///
+    /// A definition with an identifier list after a prototype is held only
+    /// to its return type. 6.2.7p3 would compare each prototype parameter
+    /// with the promoted type of its identifier, but gcc accepts `int f(char);
+    /// int f(c) char c; { ... }` and objects only under `-pedantic`.
+    fn redeclaration_compatible(&self, old: TypeId, new: TypeId, form: Redeclared) -> bool {
         if self.types.types_compatible(old, new) {
             return true;
         }
@@ -1413,13 +1436,10 @@ impl Parser<'_> {
             }
         }
 
-        if o.kind != TypeKind::Function || n.kind != TypeKind::Function {
-            return false;
-        }
-        // Exactly one side lacks a prototype: compatible when the return types
-        // agree. Checking the parameters against their promoted types as well
-        // would be stricter than gcc, which accepts the pairing outright.
-        if o.params.is_some() == n.params.is_some() {
+        if form != Redeclared::IdentifierListDefinition
+            || o.kind != TypeKind::Function
+            || o.params.is_none()
+        {
             return false;
         }
         match (o.base, n.base) {

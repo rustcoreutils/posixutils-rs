@@ -505,18 +505,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             // Track in linearizer's locals map using SymbolId as key
-            self.insert_local(
-                declarator.symbol,
-                LocalVarInfo {
-                    sym: sym_id,
-                    typ,
-                    vla_size_sym: None,
-                    vla_outer_extent: None,
-                    vla_elem_type: None,
-                    vm_row_dims: vec![],
-                    storage: crate::ir::linearize::Storage::InSlot,
-                },
-            );
+            self.insert_local(declarator.symbol, LocalVarInfo::frame(sym_id, typ));
 
             // A pointer to a variably-modified array: the extents are the
             // pointee's, and they are what one index step off the pointer
@@ -643,18 +632,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         typ: TypeId,
         dims: &[Expr],
     ) {
-        self.insert_local(
-            symbol,
-            LocalVarInfo {
-                sym: PseudoId(u32::MAX),
-                typ,
-                vla_size_sym: None,
-                vla_outer_extent: None,
-                vla_elem_type: None,
-                vm_row_dims: vec![],
-                storage: crate::ir::linearize::Storage::InSlot,
-            },
-        );
+        self.insert_local(symbol, LocalVarInfo::new(LocalBinding::ExtentsOnly, typ));
         self.record_pointee_extents(symbol, typ, dims);
     }
 
@@ -770,16 +748,20 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.insert_local(
             declarator.symbol,
             LocalVarInfo {
-                sym: sym_id,
-                typ: ptr_type,
                 vla_size_sym: Some(size_sym_id),
                 vla_outer_extent: dims.first().copied(),
                 vla_elem_type: Some(elem_type),
                 // One index step consumes the outermost extent, so what a row
                 // still spans is everything after it.
                 vm_row_dims: dims[1..].to_vec(),
-                // The slot holds the `alloca` result, not the elements.
-                storage: crate::ir::linearize::Storage::Indirect(ptr_type),
+                ..LocalVarInfo::new(
+                    LocalBinding::Frame {
+                        sym: sym_id,
+                        // The slot holds the `alloca` result, not the elements.
+                        storage: Storage::Indirect(ptr_type),
+                    },
+                    ptr_type,
+                )
             },
         );
     }
@@ -829,31 +811,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         );
         self.static_local_counter += 1;
 
-        // Track mapping from local name to global name for this function's scope
-        // Use a key that includes function name to handle same-named statics in different functions
-        let key = format!("{}.{}", self.current_func_name, name_str);
-        self.static_locals.insert(
-            key,
-            StaticLocalInfo {
-                global_name: global_name.clone(),
-                typ: declarator.typ,
-            },
-        );
-
-        // Also insert with the SymbolId for the current function scope
-        // This is used during expression linearization
+        // The name is bound in this scope like any local, so an inner
+        // declaration shadows it and leaving the scope ends it.
         self.insert_local(
             declarator.symbol,
-            LocalVarInfo {
-                // Use a sentinel value - we'll handle static locals specially
-                sym: PseudoId(u32::MAX),
-                typ: declarator.typ,
-                vla_size_sym: None,
-                vla_outer_extent: None,
-                vla_elem_type: None,
-                vm_row_dims: vec![],
-                storage: crate::ir::linearize::Storage::InSlot,
-            },
+            LocalVarInfo::new(
+                LocalBinding::Static {
+                    global: global_name.clone(),
+                },
+                declarator.typ,
+            ),
         );
 
         // A static pointer to a VLA -- the one variably modified type static
@@ -2346,12 +2313,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// for an object defined earlier in the translation unit -- which is what
     /// "visible value" means.
     fn const_object_value(&self, symbol_id: crate::symbol::SymbolId) -> Option<i128> {
-        let name = self.symbol_name(symbol_id);
-        let key = format!("{}.{}", self.current_func_name, name);
-        let global_name = match self.static_locals.get(&key) {
-            Some(info) => info.global_name.as_str(),
-            None => name.as_str(),
-        };
+        let global_name = self.global_name_of(symbol_id)?;
         let global = self
             .module
             .globals
@@ -2365,12 +2327,7 @@ impl<'a> super::linearize::Linearizer<'a> {
 
     /// [`Self::const_object_value`] for a floating `const` object.
     fn const_object_float_value(&self, symbol_id: crate::symbol::SymbolId) -> Option<FloatVal> {
-        let name = self.symbol_name(symbol_id);
-        let key = format!("{}.{}", self.current_func_name, name);
-        let global_name = match self.static_locals.get(&key) {
-            Some(info) => info.global_name.as_str(),
-            None => name.as_str(),
-        };
+        let global_name = self.global_name_of(symbol_id)?;
         let global = self
             .module
             .globals
@@ -2511,16 +2468,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             // Simple identifier: &symbol
-            ExprKind::Ident(symbol_id) => {
-                let name_str = self.symbol_name(*symbol_id);
-                // Check if this is a static local variable
-                let key = format!("{}.{}", self.current_func_name, name_str);
-                if let Some(static_info) = self.static_locals.get(&key) {
-                    Some((static_info.global_name.clone(), 0))
-                } else {
-                    Some((name_str, 0))
-                }
-            }
+            ExprKind::Ident(symbol_id) => Some((self.global_name_of(*symbol_id)?, 0)),
 
             // Member access: expr.member
             ExprKind::Member { expr: base, member } => {
@@ -3020,7 +2968,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         // sides used to call `linearize_lvalue` on the operand expression --
         // so `asm("" : "+r"(*bar()))` called `bar` twice. Same rule as any
         // other read-modify-write (see `RmwPlace`).
-        let mut output_places: Vec<Option<super::linearize_emit::RmwPlace>> =
+        let mut output_places: Vec<super::linearize_emit::RmwPlace> =
             Vec::with_capacity(outputs.len());
 
         // Process output operands
@@ -3044,10 +2992,9 @@ impl<'a> super::linearize::Linearizer<'a> {
             // level. Just use the lvalue address as the asm operand
             // pseudo directly.
             if is_memory {
-                // A memory operand is the lvalue's address. `None` is a bare
-                // identifier, which has nothing to re-evaluate; a bit-field
-                // has no address at all and keeps the old path's behaviour.
-                let addr = match place.as_ref().and_then(Self::rmw_place_address) {
+                // A memory operand is the lvalue's address. A bit-field has
+                // no address at all and keeps the old path's behaviour.
+                let addr = match Self::rmw_place_address(&place) {
                     Some(addr) => addr,
                     None => self.linearize_lvalue(&op.expr),
                 };
@@ -3094,22 +3041,16 @@ impl<'a> super::linearize::Linearizer<'a> {
             // validator invariant after optimization).
             if is_readwrite {
                 if !tied_inputs[output_idx] {
-                    if let Some(p) = &place {
-                        // Through the resolved place, so the operand
-                        // expression runs once for the read and the write.
-                        let val = self.load_rmw_place(p, typ);
-                        self.emit(
-                            Instruction::new(Opcode::Copy)
-                                .with_target(pseudo)
-                                .with_src(val)
-                                .with_type(typ)
-                                .with_size(size),
-                        );
-                    } else {
-                        // A bare identifier: nothing to evaluate twice.
-                        let addr = self.linearize_lvalue(&op.expr);
-                        self.emit(Instruction::load(pseudo, addr, 0, typ, size));
-                    }
+                    // Through the resolved place, so the operand expression
+                    // runs once for the read and the write.
+                    let val = self.load_rmw_place(&place, typ);
+                    self.emit(
+                        Instruction::new(Opcode::Copy)
+                            .with_target(pseudo)
+                            .with_src(val)
+                            .with_type(typ)
+                            .with_size(size),
+                    );
                 }
 
                 // Also add as input, using the SAME pseudo and marking as matching
@@ -3317,7 +3258,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         outputs: &[AsmOperand],
         ir_outputs: &[AsmConstraint],
         skip_post_handling: &[bool],
-        output_places: &[Option<super::linearize_emit::RmwPlace>],
+        output_places: &[super::linearize_emit::RmwPlace],
     ) {
         // store(value, addr, ...) - value first, then address
         for (i, op) in outputs.iter().enumerate() {
@@ -3331,16 +3272,9 @@ impl<'a> super::linearize::Linearizer<'a> {
             let out_pseudo = ir_outputs[i].pseudo;
 
             let typ = self.expr_type(&op.expr);
-            let size = self.types.size_bits(typ);
             // Back through the place the read came from, so the operand
             // expression is not evaluated a second time.
-            if let Some(p) = &output_places[i] {
-                self.store_rmw_place(p, out_pseudo, typ);
-            } else {
-                // A bare identifier: nothing to evaluate twice.
-                let addr = self.linearize_lvalue(&op.expr);
-                self.emit(Instruction::store(out_pseudo, addr, 0, typ, size));
-            }
+            self.store_rmw_place(&output_places[i], out_pseudo, typ);
         }
     }
 

@@ -3263,384 +3263,242 @@ fn test_incomplete_struct_type_resolution() {
     );
 }
 
-// Static local variable increment/decrement tests
+// Static local variables
 
 use crate::types::TypeModifiers;
 
-#[test]
-fn test_static_local_pre_increment() {
-    // Test: static int counter = 0; return ++counter;
-    // Regression: pre-increment on static locals should store to the global symbol,
-    // not to the sentinel value (u32::MAX)
+/// Linearize, without SSA, `int test(void) { static int counter = 7; <e>;
+/// return 0; }`, where `build` makes `e` from an expression naming
+/// `counter`. Answers the module and its dump.
+fn linearize_static_local_stmt(build: impl FnOnce(&TestContext, Expr) -> Expr) -> (Module, String) {
     let mut ctx = TestContext::new();
     let test_id = ctx.str("test");
+    let int_type = ctx.types.int_id;
+    let counter_sym = ctx.var("counter", int_type);
 
-    // Create static int type
     // STATIC goes in storage_class, not type modifiers (matches parser behavior)
-    let static_int_type = ctx.types.int_id;
-    let counter_sym = ctx.var("counter", static_int_type);
-
-    // Create declaration: static int counter = 0;
     let decl = Declaration {
         declarators: vec![InitDeclarator {
             fn_effect: Default::default(),
             symbol_attrs: Default::default(),
             pos: Position::default(),
             symbol: counter_sym,
-            typ: static_int_type,
+            typ: int_type,
             storage_class: TypeModifiers::STATIC,
-            init: Some(Expr::int(0, &ctx.types)),
+            init: Some(Expr::int(7, &ctx.types)),
             vla_sizes: vec![],
             explicit_align: None,
         }],
     };
-
-    // Create pre-increment expression: ++counter
-    let inc_expr = Expr::typed_unpositioned(
-        ExprKind::Unary {
-            op: UnaryOp::PreInc,
-            operand: Box::new(Expr::var_typed(counter_sym, static_int_type)),
-        },
-        static_int_type,
-    );
-
-    // Function: int test() { static int counter = 0; return ++counter; }
-    let func = FunctionDef {
-        attrs: Default::default(),
-        return_type: ctx.types.int_id,
-        name: test_id,
-        params: vec![],
-        body: Stmt::Block(vec![
-            BlockItem::Declaration(decl),
-            BlockItem::Statement(Box::new(Stmt::Return(Some(inc_expr)))),
-        ]),
-        pos: test_pos(),
-        is_static: false,
-        is_inline: false,
-        calling_conv: crate::abi::CallingConv::default(),
-        param_style: ParamStyle::Prototype,
-    };
-
+    let stmt = build(&ctx, Expr::var_typed(counter_sym, int_type));
+    let body = Stmt::Block(vec![
+        BlockItem::Declaration(decl),
+        BlockItem::Statement(Box::new(Stmt::Expr(stmt))),
+        BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
+    ]);
     let tu = TranslationUnit {
-        items: vec![ExternalDecl::FunctionDef(func)],
+        items: vec![ExternalDecl::FunctionDef(make_simple_func(
+            test_id, body, &ctx.types,
+        ))],
     };
-
-    let module = ctx.linearize(&tu);
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
     let ir = format!("{}", module.display(&ctx.types));
+    (module, ir)
+}
 
-    // The IR should NOT contain the sentinel value %4294967295
-    assert!(
-        !ir.contains("%4294967295"),
-        "Static local pre-increment should NOT use sentinel pseudo (u32::MAX). IR:\n{}",
-        ir
-    );
+/// The address operands of every load and store in `module`'s one function
+/// that names the global `name`, in order, as `(opcode, address)`.
+fn global_accesses(module: &Module, name: &str) -> Vec<(Opcode, PseudoId)> {
+    let func = &module.functions[0];
+    func.blocks
+        .iter()
+        .flat_map(|b| &b.insns)
+        .filter(|i| matches!(i.op, Opcode::Load | Opcode::Store))
+        .filter(|i| {
+            matches!(
+                func.get_pseudo(i.src[0]).map(|p| &p.kind),
+                Some(PseudoKind::Sym(n)) if n == name
+            )
+        })
+        .map(|i| (i.op, i.src[0]))
+        .collect()
+}
 
-    // Should have a store instruction (storing back to the static variable)
+/// A read-modify-write of a static local loads the global and stores back
+/// through the very same symbol: one place, resolved once.
+fn assert_static_local_rmw((module, ir): (Module, String)) {
+    let accesses = global_accesses(&module, "test.counter.0");
+    match accesses.as_slice() {
+        [(Opcode::Load, load), (Opcode::Store, store)] => {
+            assert_eq!(
+                load, store,
+                "load and store must share one place. IR:\n{ir}"
+            )
+        }
+        other => {
+            panic!("expected one load then one store of test.counter.0, got {other:?}. IR:\n{ir}")
+        }
+    }
     assert!(
-        has_op(&module, &[Opcode::Store]),
-        "Static local pre-increment should generate store. IR:\n{}",
-        ir
+        func_has_no_local(&module, "counter"),
+        "a static local must not get a frame slot. IR:\n{ir}"
     );
+}
 
-    // Should have a global symbol reference (test.counter.0)
-    assert!(
-        ir.contains("test.counter"),
-        "Static local should use global name 'test.counter'. IR:\n{}",
-        ir
-    );
+/// Whether no frame local of `module`'s one function is named after `name`.
+fn func_has_no_local(module: &Module, name: &str) -> bool {
+    let prefix = format!("{name}.");
+    !module.functions[0]
+        .locals
+        .keys()
+        .any(|k| k == name || k.starts_with(&prefix))
+}
+
+#[test]
+fn test_static_local_pre_increment() {
+    let rmw = linearize_static_local_stmt(|ctx, counter| {
+        Expr::typed_unpositioned(
+            ExprKind::Unary {
+                op: UnaryOp::PreInc,
+                operand: Box::new(counter),
+            },
+            ctx.types.int_id,
+        )
+    });
+    assert_static_local_rmw(rmw);
 }
 
 #[test]
 fn test_static_local_pre_decrement() {
-    // Test: static int counter = 10; return --counter;
-    // Regression: pre-decrement on static locals should store to the global symbol
-    let mut ctx = TestContext::new();
-    let test_id = ctx.str("test");
-
-    // STATIC goes in storage_class, not type modifiers (matches parser behavior)
-    let static_int_type = ctx.types.int_id;
-    let counter_sym = ctx.var("counter", static_int_type);
-
-    let decl = Declaration {
-        declarators: vec![InitDeclarator {
-            fn_effect: Default::default(),
-            symbol_attrs: Default::default(),
-            pos: Position::default(),
-            symbol: counter_sym,
-            typ: static_int_type,
-            storage_class: TypeModifiers::STATIC,
-            init: Some(Expr::int(10, &ctx.types)),
-            vla_sizes: vec![],
-            explicit_align: None,
-        }],
-    };
-
-    let dec_expr = Expr::typed_unpositioned(
-        ExprKind::Unary {
-            op: UnaryOp::PreDec,
-            operand: Box::new(Expr::var_typed(counter_sym, static_int_type)),
-        },
-        static_int_type,
-    );
-
-    let func = FunctionDef {
-        attrs: Default::default(),
-        return_type: ctx.types.int_id,
-        name: test_id,
-        params: vec![],
-        body: Stmt::Block(vec![
-            BlockItem::Declaration(decl),
-            BlockItem::Statement(Box::new(Stmt::Return(Some(dec_expr)))),
-        ]),
-        pos: test_pos(),
-        is_static: false,
-        is_inline: false,
-        calling_conv: crate::abi::CallingConv::default(),
-        param_style: ParamStyle::Prototype,
-    };
-
-    let tu = TranslationUnit {
-        items: vec![ExternalDecl::FunctionDef(func)],
-    };
-
-    let module = ctx.linearize(&tu);
-    let ir = format!("{}", module.display(&ctx.types));
-
-    assert!(
-        !ir.contains("%4294967295"),
-        "Static local pre-decrement should NOT use sentinel pseudo (u32::MAX). IR:\n{}",
-        ir
-    );
-    assert!(
-        has_op(&module, &[Opcode::Store]),
-        "Static local pre-decrement should generate store. IR:\n{}",
-        ir
-    );
-    assert!(
-        ir.contains("test.counter"),
-        "Static local should use global name 'test.counter'. IR:\n{}",
-        ir
-    );
+    let rmw = linearize_static_local_stmt(|ctx, counter| {
+        Expr::typed_unpositioned(
+            ExprKind::Unary {
+                op: UnaryOp::PreDec,
+                operand: Box::new(counter),
+            },
+            ctx.types.int_id,
+        )
+    });
+    assert_static_local_rmw(rmw);
 }
 
 #[test]
 fn test_static_local_post_increment() {
-    // Test: static int counter = 0; return counter++;
-    // Regression: post-increment on static locals should store to the global symbol
-    let mut ctx = TestContext::new();
-    let test_id = ctx.str("test");
-
-    // STATIC goes in storage_class, not type modifiers (matches parser behavior)
-    let static_int_type = ctx.types.int_id;
-    let counter_sym = ctx.var("counter", static_int_type);
-
-    let decl = Declaration {
-        declarators: vec![InitDeclarator {
-            fn_effect: Default::default(),
-            symbol_attrs: Default::default(),
-            pos: Position::default(),
-            symbol: counter_sym,
-            typ: static_int_type,
-            storage_class: TypeModifiers::STATIC,
-            init: Some(Expr::int(0, &ctx.types)),
-            vla_sizes: vec![],
-            explicit_align: None,
-        }],
-    };
-
-    // Post-increment is ExprKind::PostInc, not UnaryOp
-    let inc_expr = Expr::typed_unpositioned(
-        ExprKind::PostInc(Box::new(Expr::var_typed(counter_sym, static_int_type))),
-        static_int_type,
-    );
-
-    let func = FunctionDef {
-        attrs: Default::default(),
-        return_type: ctx.types.int_id,
-        name: test_id,
-        params: vec![],
-        body: Stmt::Block(vec![
-            BlockItem::Declaration(decl),
-            BlockItem::Statement(Box::new(Stmt::Return(Some(inc_expr)))),
-        ]),
-        pos: test_pos(),
-        is_static: false,
-        is_inline: false,
-        calling_conv: crate::abi::CallingConv::default(),
-        param_style: ParamStyle::Prototype,
-    };
-
-    let tu = TranslationUnit {
-        items: vec![ExternalDecl::FunctionDef(func)],
-    };
-
-    let module = ctx.linearize(&tu);
-    let ir = format!("{}", module.display(&ctx.types));
-
-    assert!(
-        !ir.contains("%4294967295"),
-        "Static local post-increment should NOT use sentinel pseudo (u32::MAX). IR:\n{}",
-        ir
-    );
-    assert!(
-        has_op(&module, &[Opcode::Store]),
-        "Static local post-increment should generate store. IR:\n{}",
-        ir
-    );
-    assert!(
-        ir.contains("test.counter"),
-        "Static local should use global name 'test.counter'. IR:\n{}",
-        ir
-    );
+    let rmw = linearize_static_local_stmt(|ctx, counter| {
+        Expr::typed_unpositioned(ExprKind::PostInc(Box::new(counter)), ctx.types.int_id)
+    });
+    assert_static_local_rmw(rmw);
 }
 
 #[test]
 fn test_static_local_post_decrement() {
-    // Test: static int counter = 10; return counter--;
-    // Regression: post-decrement on static locals should store to the global symbol
-    let mut ctx = TestContext::new();
-    let test_id = ctx.str("test");
-
-    // STATIC goes in storage_class, not type modifiers (matches parser behavior)
-    let static_int_type = ctx.types.int_id;
-    let counter_sym = ctx.var("counter", static_int_type);
-
-    let decl = Declaration {
-        declarators: vec![InitDeclarator {
-            fn_effect: Default::default(),
-            symbol_attrs: Default::default(),
-            pos: Position::default(),
-            symbol: counter_sym,
-            typ: static_int_type,
-            storage_class: TypeModifiers::STATIC,
-            init: Some(Expr::int(10, &ctx.types)),
-            vla_sizes: vec![],
-            explicit_align: None,
-        }],
-    };
-
-    // Post-decrement is ExprKind::PostDec, not UnaryOp
-    let dec_expr = Expr::typed_unpositioned(
-        ExprKind::PostDec(Box::new(Expr::var_typed(counter_sym, static_int_type))),
-        static_int_type,
-    );
-
-    let func = FunctionDef {
-        attrs: Default::default(),
-        return_type: ctx.types.int_id,
-        name: test_id,
-        params: vec![],
-        body: Stmt::Block(vec![
-            BlockItem::Declaration(decl),
-            BlockItem::Statement(Box::new(Stmt::Return(Some(dec_expr)))),
-        ]),
-        pos: test_pos(),
-        is_static: false,
-        is_inline: false,
-        calling_conv: crate::abi::CallingConv::default(),
-        param_style: ParamStyle::Prototype,
-    };
-
-    let tu = TranslationUnit {
-        items: vec![ExternalDecl::FunctionDef(func)],
-    };
-
-    let module = ctx.linearize(&tu);
-    let ir = format!("{}", module.display(&ctx.types));
-
-    assert!(
-        !ir.contains("%4294967295"),
-        "Static local post-decrement should NOT use sentinel pseudo (u32::MAX). IR:\n{}",
-        ir
-    );
-    assert!(
-        has_op(&module, &[Opcode::Store]),
-        "Static local post-decrement should generate store. IR:\n{}",
-        ir
-    );
-    assert!(
-        ir.contains("test.counter"),
-        "Static local should use global name 'test.counter'. IR:\n{}",
-        ir
-    );
+    let rmw = linearize_static_local_stmt(|ctx, counter| {
+        Expr::typed_unpositioned(ExprKind::PostDec(Box::new(counter)), ctx.types.int_id)
+    });
+    assert_static_local_rmw(rmw);
 }
 
 #[test]
 fn test_static_local_compound_assignment() {
-    // Test: static int sum = 0; sum += 5; return sum;
-    // Verifies compound assignment on static locals uses proper global symbol
+    let rmw = linearize_static_local_stmt(|ctx, counter| {
+        Expr::typed_unpositioned(
+            ExprKind::Assign {
+                op: AssignOp::AddAssign,
+                target: Box::new(counter),
+                value: Box::new(Expr::int(5, &ctx.types)),
+            },
+            ctx.types.int_id,
+        )
+    });
+    assert_static_local_rmw(rmw);
+}
+
+#[test]
+fn test_static_local_assignment_stores_without_reading() {
+    let (module, ir) = linearize_static_local_stmt(|ctx, counter| {
+        Expr::typed_unpositioned(
+            ExprKind::Assign {
+                op: AssignOp::Assign,
+                target: Box::new(counter),
+                value: Box::new(Expr::int(5, &ctx.types)),
+            },
+            ctx.types.int_id,
+        )
+    });
+    let accesses = global_accesses(&module, "test.counter.0");
+    assert!(
+        matches!(accesses.as_slice(), [(Opcode::Store, _)]),
+        "expected exactly one store to test.counter.0, got {accesses:?}. IR:\n{ir}"
+    );
+    assert!(func_has_no_local(&module, "counter"), "IR:\n{ir}");
+}
+
+/// The symbol a type name's extents are recorded under names no object: it
+/// gets no frame slot and no `Sym` of its own, only the hidden locals that
+/// hold the extents.
+#[test]
+fn test_type_name_extents_get_no_storage() {
+    // int (*test(int n, int *p))[] { return (int (*)[n])p; }
     let mut ctx = TestContext::new();
     let test_id = ctx.str("test");
+    let int_type = ctx.types.int_id;
+    let int_ptr = ctx.ptr(int_type);
+    let vla_row = ctx.types.intern(Type {
+        array_size: None,
+        ..Type::array(int_type, 0)
+    });
+    let row_ptr = ctx.types.intern(Type::pointer(vla_row));
+    let n_sym = ctx.var("n", int_type);
+    let p_sym = ctx.var("p", int_ptr);
+    let tn_sym = ctx.var("tyname", row_ptr);
 
-    // STATIC goes in storage_class, not type modifiers (matches parser behavior)
-    let static_int_type = ctx.types.int_id;
-    let sum_sym = ctx.var("sum", static_int_type);
-
-    let decl = Declaration {
-        declarators: vec![InitDeclarator {
-            fn_effect: Default::default(),
-            symbol_attrs: Default::default(),
-            pos: Position::default(),
-            symbol: sum_sym,
-            typ: static_int_type,
-            storage_class: TypeModifiers::STATIC,
-            init: Some(Expr::int(0, &ctx.types)),
-            vla_sizes: vec![],
-            explicit_align: None,
-        }],
-    };
-
-    // sum += 5
-    let compound_assign = Expr::typed_unpositioned(
-        ExprKind::Assign {
-            op: AssignOp::AddAssign,
-            target: Box::new(Expr::var_typed(sum_sym, static_int_type)),
-            value: Box::new(Expr::int(5, &ctx.types)),
+    let cast = Expr::typed_unpositioned(
+        ExprKind::VmTypeName {
+            symbol: tn_sym,
+            dims: vec![Expr::var_typed(n_sym, int_type)],
+            expr: Box::new(Expr::typed_unpositioned(
+                ExprKind::Cast {
+                    cast_type: row_ptr,
+                    expr: Box::new(Expr::var_typed(p_sym, int_ptr)),
+                },
+                row_ptr,
+            )),
         },
-        static_int_type,
+        row_ptr,
     );
-
-    let func = FunctionDef {
-        attrs: Default::default(),
-        return_type: ctx.types.int_id,
-        name: test_id,
-        params: vec![],
-        body: Stmt::Block(vec![
-            BlockItem::Declaration(decl),
-            BlockItem::Statement(Box::new(Stmt::Expr(compound_assign))),
-            BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::var_typed(
-                sum_sym,
-                static_int_type,
-            ))))),
-        ]),
-        pos: test_pos(),
-        is_static: false,
-        is_inline: false,
-        calling_conv: crate::abi::CallingConv::default(),
-        param_style: ParamStyle::Prototype,
+    let param = |symbol, typ| Parameter {
+        symbol: Some(symbol),
+        typ,
+        vm_dims: vec![],
+        discarded_dims: vec![],
     };
-
+    // A pure expression statement is dropped unevaluated, so the cast is
+    // returned.
+    let func = FunctionDef {
+        return_type: row_ptr,
+        params: vec![param(n_sym, int_type), param(p_sym, int_ptr)],
+        ..make_simple_func(test_id, Stmt::Return(Some(cast)), &ctx.types)
+    };
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
-
-    let module = ctx.linearize(&tu);
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
     let ir = format!("{}", module.display(&ctx.types));
+    let f = &module.functions[0];
 
     assert!(
-        !ir.contains("%4294967295"),
-        "Static local compound assignment should NOT use sentinel pseudo. IR:\n{}",
-        ir
+        f.locals.keys().any(|k| k.starts_with("__vla_dim0_tyname.")),
+        "the extent should be recorded. IR:\n{ir}"
     );
     assert!(
-        has_op(&module, &[Opcode::Store]),
-        "Static local compound assignment should generate store. IR:\n{}",
-        ir
+        func_has_no_local(&module, "tyname"),
+        "a type name's symbol must not get a slot. IR:\n{ir}"
     );
     assert!(
-        ir.contains("test.sum"),
-        "Static local should use global name 'test.sum'. IR:\n{}",
-        ir
+        !f.pseudos
+            .iter()
+            .any(|p| matches!(&p.kind, PseudoKind::Sym(n) if n.starts_with("tyname"))),
+        "a type name's symbol must not be named by any Sym. IR:\n{ir}"
     );
 }
 
@@ -7561,7 +7419,9 @@ fn test_asm_goto_output_written_back_on_the_label_edge() {
     let tu = TranslationUnit {
         items: vec![ExternalDecl::FunctionDef(func)],
     };
-    let module = ctx.linearize(&tu);
+    // Before SSA: once it runs, `x` is promoted and the store on the edge
+    // becomes the phi argument the label block reads.
+    let module = linearize_no_ssa(&tu, &ctx.types, &ctx.strings, &ctx.symbols);
     let func = &module.functions[0];
 
     let asm = func

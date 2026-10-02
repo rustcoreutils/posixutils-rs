@@ -469,16 +469,15 @@ impl<'a> super::linearize::Linearizer<'a> {
             // `int *q = p;` for a pointer object `p` initialize `q` with the
             // address of `p` rather than reject a value read.
             ExprKind::Ident(symbol_id) => {
-                if self.types.decays(self.expr_type(expr)) {
-                    let name_str = self.symbol_name(*symbol_id);
-                    // Check if this is a static local variable
-                    // Static locals have mangled names like "func_name.var_name.N"
-                    let key = format!("{}.{}", self.current_func_name, name_str);
-                    if let Some(static_info) = self.static_locals.get(&key) {
-                        Initializer::SymAddr(static_info.global_name.clone())
-                    } else {
-                        Initializer::SymAddr(name_str)
-                    }
+                // A frame local has no address a relocation can name, so its
+                // array decays to nothing constant.
+                let global = self
+                    .types
+                    .decays(self.expr_type(expr))
+                    .then(|| self.global_name_of(*symbol_id))
+                    .flatten();
+                if let Some(name) = global {
+                    Initializer::SymAddr(name)
                 } else {
                     // Check if it's an enum constant
                     let sym = self.symbols.get(*symbol_id);

@@ -69,11 +69,27 @@ struct ScalarParam {
     arg: PseudoId,
 }
 
+/// What a block-scope name stands for, which decides how it is read,
+/// stored and addressed.
+#[derive(Clone)]
+pub(crate) enum LocalBinding {
+    /// An object in this function's frame: `sym` is its stack slot.
+    Frame { sym: PseudoId, storage: Storage },
+    /// A block-scope `static`: an object with static storage duration,
+    /// emitted as a global under `global`, a name of the form
+    /// `funcname.varname.N` no other declaration can spell.
+    Static { global: String },
+    /// No object at all: the extents of a type name's variably modified
+    /// type, recorded under a symbol no identifier names (see
+    /// [`Linearizer::record_type_name_extents`]).
+    ExtentsOnly,
+}
+
 /// Information about a local variable
 #[derive(Clone)]
 pub(crate) struct LocalVarInfo {
-    /// Symbol pseudo (address of the variable)
-    pub(crate) sym: PseudoId,
+    /// What the name stands for.
+    pub(crate) binding: LocalBinding,
     /// Type of the variable
     pub(crate) typ: TypeId,
     /// For VLAs: symbol holding the number of elements (for runtime sizeof)
@@ -95,8 +111,39 @@ pub(crate) struct LocalVarInfo {
     /// sizeof(vla_elem_type)` -- a variably-modified type reports a
     /// compile-time size of 0, so without this every such stride would be 0.
     pub(crate) vm_row_dims: Vec<VmDim>,
-    /// Where the object lives relative to this local's stack slot.
-    pub(crate) storage: Storage,
+}
+
+impl LocalVarInfo {
+    /// A name bound to `binding`, with no variably modified extents.
+    pub(crate) fn new(binding: LocalBinding, typ: TypeId) -> Self {
+        Self {
+            binding,
+            typ,
+            vla_size_sym: None,
+            vla_elem_type: None,
+            vla_outer_extent: None,
+            vm_row_dims: vec![],
+        }
+    }
+
+    /// An object that lives in its stack slot `sym`.
+    pub(crate) fn frame(sym: PseudoId, typ: TypeId) -> Self {
+        Self::new(
+            LocalBinding::Frame {
+                sym,
+                storage: Storage::InSlot,
+            },
+            typ,
+        )
+    }
+
+    /// The stack slot, for a name bound to one.
+    pub(crate) fn frame_sym(&self) -> Option<PseudoId> {
+        match self.binding {
+            LocalBinding::Frame { sym, .. } => Some(sym),
+            LocalBinding::Static { .. } | LocalBinding::ExtentsOnly => None,
+        }
+    }
 }
 
 /// Where an object an expression designates lives, for
@@ -465,15 +512,6 @@ pub(crate) enum StructFieldVisitKind {
     BraceElision(Vec<InitElement>),
 }
 
-/// Information about a static local variable
-#[derive(Clone)]
-pub(crate) struct StaticLocalInfo {
-    /// Global symbol name (unique across translation unit)
-    pub(crate) global_name: String,
-    /// Type of the variable
-    pub(crate) typ: TypeId,
-}
-
 // Linearizer
 
 /// A declaration scope the linearizer has entered.
@@ -703,9 +741,6 @@ pub struct Linearizer<'a> {
     pub(crate) static_local_counter: u32,
     /// Counter for generating unique compound literal names (for file-scope compound literals)
     pub(crate) compound_literal_counter: u32,
-    /// Static local variables (local name -> static local info)
-    /// This is persistent across function calls (not cleared per function)
-    pub(crate) static_locals: HashMap<String, StaticLocalInfo>,
     /// Current source position for debug info
     pub(crate) current_pos: Option<Position>,
     /// Target configuration (architecture, ABI details)
@@ -775,7 +810,6 @@ impl<'a> Linearizer<'a> {
             indirect_dispatch: None,
             static_local_counter: 0,
             compound_literal_counter: 0,
-            static_locals: HashMap::with_capacity(DEFAULT_LABEL_MAP_CAPACITY),
             current_pos: None,
             target,
             current_func_is_inline_definition: false,
@@ -865,8 +899,7 @@ impl<'a> Linearizer<'a> {
         };
         let ending: Vec<PseudoId> = entries
             .iter()
-            .filter_map(|(sym, _)| self.locals.get(sym))
-            .map(|info| info.sym)
+            .filter_map(|(sym, _)| self.locals.get(sym)?.frame_sym())
             .filter(|&p| func.local_of(p).is_some())
             .collect();
         for local in ending {
@@ -880,6 +913,28 @@ impl<'a> Linearizer<'a> {
         if let Some(scope) = self.local_scope_stack.last_mut() {
             scope.push((sym, prev));
         }
+    }
+
+    /// The symbol an identifier names when it names one: a static local's
+    /// global, or the identifier itself for a file-scope or `extern` name.
+    /// `None` for a frame local, which a static initializer can neither read
+    /// nor take the address of, and for a type name's extents.
+    pub(crate) fn global_name_of(&self, symbol_id: SymbolId) -> Option<String> {
+        match self.locals.get(&symbol_id).map(|local| &local.binding) {
+            None => Some(self.symbol_name(symbol_id)),
+            Some(LocalBinding::Static { global }) => Some(global.clone()),
+            Some(LocalBinding::Frame { .. } | LocalBinding::ExtentsOnly) => None,
+        }
+    }
+
+    /// A `Sym` pseudo naming the global `name`.
+    pub(crate) fn global_sym(&mut self, name: String) -> PseudoId {
+        let sym_id = self.alloc_pseudo();
+        let pseudo = Pseudo::sym(sym_id, name);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(pseudo);
+        }
+        sym_id
     }
 
     /// Convert a StringId to a &str using the string table
@@ -1468,18 +1523,16 @@ impl<'a> Linearizer<'a> {
             if let Some(symbol_id) = symbol_id_opt {
                 self.insert_local(
                     symbol_id,
-                    LocalVarInfo {
-                        sym: local_sym,
+                    LocalVarInfo::new(
+                        LocalBinding::Frame {
+                            sym: local_sym,
+                            // va_list param: the slot holds a pointer to the
+                            // caller's va_list, array decay having happened
+                            // at the call site.
+                            storage: Storage::Indirect(ptr_type),
+                        },
                         typ, // Keep original va_list type for type checking
-                        vla_size_sym: None,
-                        vla_outer_extent: None,
-                        vla_elem_type: None,
-                        vm_row_dims: vec![],
-                        // va_list param: the slot holds a pointer to the
-                        // caller's va_list, array decay having happened at
-                        // the call site.
-                        storage: Storage::Indirect(ptr_type),
-                    },
+                    ),
                 );
             }
         }
@@ -1570,18 +1623,7 @@ impl<'a> Linearizer<'a> {
 
             // Register as a local variable (only if named parameter)
             if let Some(symbol_id) = symbol_id_opt {
-                self.insert_local(
-                    symbol_id,
-                    LocalVarInfo {
-                        sym: local_sym,
-                        typ,
-                        vla_size_sym: None,
-                        vla_outer_extent: None,
-                        vla_elem_type: None,
-                        vm_row_dims: vec![],
-                        storage: Storage::InSlot,
-                    },
-                );
+                self.insert_local(symbol_id, LocalVarInfo::frame(local_sym, typ));
             }
         }
     }
@@ -1626,18 +1668,7 @@ impl<'a> Linearizer<'a> {
 
             // Register as a local variable for name lookup (only if named parameter)
             if let Some(symbol_id) = symbol_id_opt {
-                self.insert_local(
-                    symbol_id,
-                    LocalVarInfo {
-                        sym: local_sym,
-                        typ,
-                        vla_size_sym: None,
-                        vla_outer_extent: None,
-                        vla_elem_type: None,
-                        vm_row_dims: vec![],
-                        storage: Storage::InSlot,
-                    },
-                );
+                self.insert_local(symbol_id, LocalVarInfo::frame(local_sym, typ));
             }
         }
     }
@@ -1676,26 +1707,12 @@ impl<'a> Linearizer<'a> {
 
             // Register as a local variable for name lookup (only if named parameter)
             if let Some(symbol_id) = symbol_id_opt {
-                self.insert_local(
-                    symbol_id,
-                    LocalVarInfo {
-                        sym: local_sym,
-                        typ,
-                        vla_size_sym: None,
-                        vla_outer_extent: None,
-                        vla_elem_type: None,
-                        vm_row_dims: vec![],
-                        storage: Storage::InSlot,
-                    },
-                );
+                self.insert_local(symbol_id, LocalVarInfo::frame(local_sym, typ));
             }
         }
     }
 
     /// Clear the per-function state carried on the linearizer.
-    ///
-    /// `static_locals` is deliberately not cleared: it persists across
-    /// functions.
     ///
     /// Returns the function-level [`Scope`], which `linearize_function` gives
     /// back once the body is lowered. Nothing is released there -- the
@@ -1725,7 +1742,6 @@ impl<'a> Linearizer<'a> {
         self.indirect_dispatch = None;
         // Remove from extern_symbols since we're defining this function
         self.module.extern_symbols.remove(&self.current_func_name);
-        // Note: static_locals is NOT cleared - it persists across functions
 
         // After `vla_marks.clear()`: the scope records the depth it starts
         // at, which for the function scope has to be zero.
@@ -2757,66 +2773,48 @@ impl<'a> Linearizer<'a> {
                 self.linearize_lvalue(expr)
             }
             ExprKind::Ident(symbol_id) => {
-                let name_str = self.symbol_name(*symbol_id);
-                // For local variables, emit SymAddr to get the stack address
-                if let Some(local) = self.locals.get(symbol_id).cloned() {
-                    // Check if this is a static local (sentinel value)
-                    if local.sym.0 == u32::MAX {
-                        // Static local - look up the global name
-                        let key = format!("{}.{}", self.current_func_name, name_str);
-                        if let Some(static_info) = self.static_locals.get(&key).cloned() {
-                            let sym_id = self.alloc_pseudo();
-                            let pseudo = Pseudo::sym(sym_id, static_info.global_name);
-                            if let Some(func) = &mut self.current_func {
-                                func.add_pseudo(pseudo);
-                            }
+                let local = self.locals.get(symbol_id).cloned();
+                let (sym, typ) = match local {
+                    Some(LocalVarInfo {
+                        binding: LocalBinding::Frame { sym, storage },
+                        typ,
+                        ..
+                    }) => {
+                        // When the slot holds a pointer to the object -- a
+                        // VLA's `alloca`d storage, or a `va_list` parameter
+                        // -- the object's address is that pointer's value,
+                        // not the slot's. Taking the slot's address made `&a`
+                        // differ from `a` for every VLA, so `int (*p)[n] =
+                        // &a` pointed at the pointer and read back garbage.
+                        if let Storage::Indirect(ptr_type) = storage {
                             let result = self.alloc_pseudo();
-                            self.emit(Instruction::sym_addr(
-                                result,
-                                sym_id,
-                                self.types.pointer_to(static_info.typ),
-                            ));
+                            let size = self.types.size_bits(ptr_type);
+                            self.emit(Instruction::load(result, sym, 0, ptr_type, size));
                             return result;
-                        } else {
-                            unreachable!("static local sentinel without static_locals entry");
                         }
+                        (sym, typ)
                     }
-                    // When the slot holds a pointer to the object -- a VLA's
-                    // `alloca`d storage, or a `va_list` parameter -- the
-                    // object's address is that pointer's value, not the
-                    // slot's. Taking the slot's address made `&a` differ from
-                    // `a` for every VLA, so `int (*p)[n] = &a` pointed at the
-                    // pointer and read back garbage.
-                    if let Storage::Indirect(ptr_type) = local.storage {
-                        let result = self.alloc_pseudo();
-                        let size = self.types.size_bits(ptr_type);
-                        self.emit(Instruction::load(result, local.sym, 0, ptr_type, size));
-                        return result;
+                    Some(LocalVarInfo {
+                        binding: LocalBinding::Static { global },
+                        typ,
+                        ..
+                    }) => (self.global_sym(global), typ),
+                    Some(LocalVarInfo {
+                        binding: LocalBinding::ExtentsOnly,
+                        ..
+                    }) => unreachable!("no identifier names a type name's extents"),
+                    None => {
+                        let name = self.symbol_name(*symbol_id);
+                        (self.global_sym(name), self.expr_type(expr))
                     }
-
-                    let result = self.alloc_pseudo();
-                    self.emit(Instruction::sym_addr(
-                        result,
-                        local.sym,
-                        self.types.pointer_to(local.typ),
-                    ));
-                    result
-                } else {
-                    // Global variable - emit SymAddr to get its address
-                    let sym_id = self.alloc_pseudo();
-                    let pseudo = Pseudo::sym(sym_id, name_str.clone());
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(pseudo);
-                    }
-                    let result = self.alloc_pseudo();
-                    let typ = self.expr_type(expr);
-                    self.emit(Instruction::sym_addr(
-                        result,
-                        sym_id,
-                        self.types.pointer_to(typ),
-                    ));
-                    result
-                }
+                };
+                let result = self.alloc_pseudo();
+                self.emit(Instruction::sym_addr(
+                    result,
+                    sym,
+                    self.types.pointer_to(typ),
+                ));
+                result
             }
             ExprKind::Unary {
                 op: UnaryOp::Deref,
@@ -4300,14 +4298,10 @@ impl<'a> Linearizer<'a> {
         // resolved here and serves both the read and the store-back. Reading
         // from the expression and then re-deriving the address for the store
         // ran every subexpression twice: `b[i++]++` incremented `i` twice and
-        // updated the wrong element. `None` is a bare identifier, which has
-        // no subexpressions to re-run.
+        // updated the wrong element.
         let place = self.resolve_rmw_place(operand);
         let typ = self.expr_type(operand);
-        let val = match &place {
-            Some(p) => self.load_rmw_place(p, typ),
-            None => self.linearize_expr(operand),
-        };
+        let val = self.load_rmw_place(&place, typ);
         let is_float = self.types.is_float(typ);
         let is_ptr = self.types.kind(typ) == TypeKind::Pointer;
 
@@ -4367,49 +4361,12 @@ impl<'a> Linearizer<'a> {
             result
         };
 
-        // Store to local, update parameter mapping, or store through pointer
-        let store_size = self.types.size_bits(typ);
-        if let Some(p) = &place {
-            // Through the address the read came from. The postfix forms hand
-            // back the value from *before* the update, which is already
-            // narrowed for a bit-field because `emit_bitfield_load` produced
-            // it -- so the store's answer is not needed here.
-            self.store_rmw_place(p, final_result, typ);
-            return old_val;
-        }
-        // Only a bare identifier reaches here: `resolve_rmw_place`
-        // answers `Some` for every other lvalue and the branch above
-        // stores through it. The arms that used to be here re-derived
-        // an address that had already been computed, which is exactly
-        // what ran the target a second time.
-        if let ExprKind::Ident(symbol_id) = &operand.kind {
-            let name_str = self.symbol_name(*symbol_id);
-            if let Some(local) = self.locals.get(symbol_id).cloned() {
-                // Check if this is a static local (sentinel value)
-                if local.sym.0 == u32::MAX {
-                    self.emit_static_local_store(&name_str, final_result, typ, store_size);
-                } else {
-                    // Regular local variable
-                    self.emit(Instruction::store(
-                        final_result,
-                        local.sym,
-                        0,
-                        typ,
-                        store_size,
-                    ));
-                }
-            } else {
-                // Global variable - emit store
-                let sym_id = self.alloc_pseudo();
-                let pseudo = Pseudo::sym(sym_id, name_str.clone());
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(pseudo);
-                }
-                self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
-            }
-        }
-
-        old_val // Return old value
+        // Through the address the read came from. The postfix forms hand back
+        // the value from *before* the update, which is already narrowed for a
+        // bit-field because `emit_bitfield_load` produced it -- so the store's
+        // answer is not needed here.
+        self.store_rmw_place(&place, final_result, typ);
+        old_val
     }
 
     /// Linearize a binary expression (arithmetic, comparison, logical operators)
@@ -4831,14 +4788,10 @@ impl<'a> Linearizer<'a> {
             // store-back. This used to pre-compute the address for a `Deref`
             // target only -- the one shape someone had hit -- and every other
             // side-effecting target still ran twice: `++c[j++]` incremented
-            // `j` twice and updated the wrong element. `None` is a bare
-            // identifier, which has no subexpressions to re-run.
+            // `j` twice and updated the wrong element.
             let place = self.resolve_rmw_place(operand);
             let typ = self.expr_type(operand);
-            let val = match &place {
-                Some(p) => self.load_rmw_place(p, typ),
-                None => self.linearize_expr(operand),
-            };
+            let val = self.load_rmw_place(&place, typ);
             let is_float = self.types.is_float(typ);
             let is_ptr = self.types.kind(typ) == TypeKind::Pointer;
 
@@ -4874,61 +4827,18 @@ impl<'a> Linearizer<'a> {
                 result
             };
 
-            // Store back to the lvalue
-            let store_size = self.types.size_bits(typ);
-            if let Some(p) = &place {
-                // Through the address the read came from.
-                let narrowed = self.store_rmw_place(p, final_result, typ);
-                // `++x.f` is `x.f += 1`, whose value is what the field now
-                // holds (C17 6.5.16.1p2) -- so `signed int f : 3` at 3 gives
-                // -4, not 4.
-                return match narrowed {
-                    Some((bit_width, field_typ)) => {
-                        self.narrow_to_bitfield(final_result, bit_width, field_typ)
-                    }
-                    None => final_result,
-                };
-            }
-            // Only a bare identifier reaches here: `resolve_rmw_place`
-            // answers `Some` for every other lvalue and the branch above
-            // stores through it. The arms that used to be here re-derived
-            // an address that had already been computed, which is exactly
-            // what ran the target a second time.
-            if let ExprKind::Ident(symbol_id) = &operand.kind {
-                let name_str = self.symbol_name(*symbol_id);
-                if let Some(local) = self.locals.get(symbol_id).cloned() {
-                    // Check if this is a static local (sentinel value)
-                    if local.sym.0 == u32::MAX {
-                        self.emit_static_local_store(&name_str, final_result, typ, store_size);
-                    } else {
-                        // Regular local variable
-                        self.emit(Instruction::store(
-                            final_result,
-                            local.sym,
-                            0,
-                            typ,
-                            store_size,
-                        ));
-                    }
-                } else {
-                    // Global variable - emit store
-                    let sym_id = self.alloc_pseudo();
-                    let pseudo = Pseudo::sym(sym_id, name_str.clone());
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(pseudo);
-                    }
-                    self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
+            // Store back through the address the read came from. `++x.f` is
+            // `x.f += 1`, whose value is what the field now holds (C17
+            // 6.5.16.1p2) -- so `signed int f : 3` at 3 gives -4, not 4. The
+            // postfix forms need no such care: they hand back the value
+            // loaded before the update, which `emit_bitfield_load` already
+            // narrowed.
+            return match self.store_rmw_place(&place, final_result, typ) {
+                Some((bit_width, field_typ)) => {
+                    self.narrow_to_bitfield(final_result, bit_width, field_typ)
                 }
-            }
-
-            // `++x.f` is `x.f += 1`, whose value is the value stored in the
-            // field (C17 6.5.16.1p2) -- so `signed int f : 3` at 3 gives -4,
-            // not 4. The postfix forms need no such care: they hand back the
-            // value loaded before the update, which `emit_bitfield_load`
-            // already narrowed.
-            // A bare identifier is never a bit-field, so there is nothing
-            // to reduce: the bit-field answer comes from `store_rmw_place`.
-            return final_result;
+                None => final_result,
+            };
         }
 
         // `!z` on a complex operand is `z == 0`, and a complex value is zero
@@ -4982,7 +4892,6 @@ impl<'a> Linearizer<'a> {
 
     pub(crate) fn linearize_ident(&mut self, expr: &Expr, symbol_id: SymbolId) -> PseudoId {
         let sym = self.symbols.get(symbol_id);
-        let name_str = self.symbol_name(symbol_id);
 
         // First check if it's an enum constant
         if sym.is_enum_constant() {
@@ -4996,64 +4905,55 @@ impl<'a> Linearizer<'a> {
 
         // Check if it's a local variable
         if let Some(local) = self.locals.get(&symbol_id).cloned() {
-            // Check if this is a static local (sentinel value)
-            if local.sym.0 == u32::MAX {
-                // Static local - look up the global name and treat as global
-                let key = format!("{}.{}", self.current_func_name, name_str);
-                let Some(static_info) = self.static_locals.get(&key).cloned() else {
-                    unreachable!("static local sentinel without static_locals entry");
-                };
-                let sym_id = self.alloc_pseudo();
-                let pseudo = Pseudo::sym(sym_id, static_info.global_name);
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(pseudo);
-                }
-                return self.read_object(ObjectPlace::Sym(sym_id), static_info.typ);
-            }
-            let place = match local.storage {
+            let place = match local.binding {
                 // A `va_list` parameter where `va_list` is an array: the
                 // caller's argument decayed, so the slot holds a pointer to
                 // the caller's object (C17 7.16p3).
-                Storage::Indirect(ptr_type)
-                    if self.types.kind(local.typ) == TypeKind::VaList
-                        && !self.types.va_list_is_pointer() =>
+                LocalBinding::Frame {
+                    sym,
+                    storage: Storage::Indirect(ptr_type),
+                } if self.types.kind(local.typ) == TypeKind::VaList
+                    && !self.types.va_list_is_pointer() =>
                 {
                     let ptr = self.alloc_reg_pseudo();
                     let ptr_size = self.types.size_bits(ptr_type);
-                    self.emit(Instruction::load(ptr, local.sym, 0, ptr_type, ptr_size));
+                    self.emit(Instruction::load(ptr, sym, 0, ptr_type, ptr_size));
                     ObjectPlace::At(ptr, 0)
                 }
-                _ => ObjectPlace::Sym(local.sym),
+                LocalBinding::Frame { sym, .. } => ObjectPlace::Sym(sym),
+                LocalBinding::Static { global } => ObjectPlace::Sym(self.global_sym(global)),
+                LocalBinding::ExtentsOnly => {
+                    unreachable!("no identifier names a type name's extents")
+                }
             };
             self.read_object(place, local.typ)
         }
         // Global variable - create symbol reference and load
         else {
-            // C99 6.7.4p3: A non-static inline function cannot refer to
-            // a file-scope static variable
-            if self.current_func_is_inline_definition && self.file_scope_statics.contains(&name_str)
-            {
-                if let Some(pos) = self.current_pos {
-                    let msg = format!(
-                        "inline definition of '{}' cannot reference file-scope static variable '{}'",
-                        self.current_func_name, name_str
-                    );
-                    // gcc does not enforce this one, so real source contains
-                    // it -- ffmpeg's `dv_guess_qnos` reads a file-scope
-                    // `static const int` from an inline definition. It is
-                    // relaxed by `-fpermissive`, which is where c17 keeps the
-                    // constraints gcc lets through.
-                    crate::diag::permissive_error(pos, &msg);
-                }
-            }
-
-            let sym_id = self.alloc_pseudo();
-            let pseudo = Pseudo::sym(sym_id, name_str.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(pseudo);
-            }
+            let name_str = self.symbol_name(symbol_id);
+            self.check_inline_static_reference(&name_str);
+            let sym_id = self.global_sym(name_str);
             let typ = self.expr_type(expr);
             self.read_object(ObjectPlace::Sym(sym_id), typ)
+        }
+    }
+
+    /// C99 6.7.4p3: a non-static inline definition cannot refer to a
+    /// file-scope static variable.
+    pub(crate) fn check_inline_static_reference(&self, name: &str) {
+        if !self.current_func_is_inline_definition || !self.file_scope_statics.contains(name) {
+            return;
+        }
+        if let Some(pos) = self.current_pos {
+            let msg = format!(
+                "inline definition of '{}' cannot reference file-scope static variable '{}'",
+                self.current_func_name, name
+            );
+            // gcc does not enforce this one, so real source contains it --
+            // ffmpeg's `dv_guess_qnos` reads a file-scope `static const int`
+            // from an inline definition. It is relaxed by `-fpermissive`,
+            // which is where c17 keeps the constraints gcc lets through.
+            crate::diag::permissive_error(pos, &msg);
         }
     }
 

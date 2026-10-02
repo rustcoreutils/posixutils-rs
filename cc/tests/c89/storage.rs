@@ -11,7 +11,7 @@
 // Consolidates: storage.rs + static_local.rs tests
 //
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_expect_error};
 
 // ============================================================================
 // Mega-test: C89 storage classes (auto, static, register, extern)
@@ -325,4 +325,66 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("c89_block_scope_fn_decl", code, &[]), 0);
+}
+
+/// A block-scope `static` is a name like any other: an inner one shadows only
+/// inside its block, and it never stands in for a file-scope name it does not
+/// hide. Each used to be found by spelling alone, function name plus
+/// identifier, so the last same-named static declared in a function answered
+/// for every later use of that name in it.
+#[test]
+fn c89_static_local_is_scoped_like_any_name() {
+    let code = r#"
+int g = 100;
+const int c = 5;
+
+int outer_after_inner(void) {
+    static int x = 1;
+    { static int x = 2; x++; }
+    x += 10;
+    return x;
+}
+
+int file_scope_address(void) {
+    { static int g = 5; (void)g; }
+    static int *p = &g;
+    return *p;
+}
+
+int file_scope_const(void) {
+    { static const int c = 9; (void)c; }
+    static int w = c;
+    return w;
+}
+
+int main(void) {
+    if (outer_after_inner() != 11) return 1;
+    if (file_scope_address() != 100) return 2;
+    if (file_scope_const() != 5) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c89_static_local_scoped", code, &[]), 0);
+}
+
+/// An automatic object has no address a static initializer can name, and its
+/// value is not a constant: a same-named file-scope object must not be used
+/// in its place, and nothing may be relocated against its bare name.
+#[test]
+fn c89_static_initializer_cannot_name_an_automatic() {
+    compile_expect_error(
+        "c89_static_init_auto_address",
+        "int a; int f(void) { int a = 1; static int *p = &a; return *p; }\n",
+        "not a constant expression",
+    );
+    compile_expect_error(
+        "c89_static_init_auto_array",
+        "int a[2]; int f(void) { int a[2] = {1, 2}; static int *p = a; return *p; }\n",
+        "not a constant expression",
+    );
+    compile_expect_error(
+        "c89_static_init_auto_const",
+        "const int c = 5; int f(void) { const int c = 7; static int w = c; return w; }\n",
+        "not a constant expression",
+    );
 }

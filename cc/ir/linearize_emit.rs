@@ -8,9 +8,9 @@
 
 //! Emit helpers for the linearizer (constants, block copies, bitfields, operators, assignments)
 
-use super::linearize::{BlockVolatility, ObjectPlace};
+use super::linearize::{BlockVolatility, LocalBinding, ObjectPlace, Storage};
 use super::memexpand;
-use super::{BasicBlockId, CallAbiInfo, Instruction, Opcode, Pseudo, PseudoId};
+use super::{BasicBlockId, CallAbiInfo, Instruction, Opcode, Pseudo, PseudoId, PseudoKind};
 use crate::abi::get_abi_for_conv;
 use crate::constexpr::ConstScope;
 use crate::diag::{error, Position};
@@ -29,9 +29,9 @@ use crate::types::{MemberInfo, TypeId, TypeKind, TypeTable};
 /// `b[i++] += 5` incremented `i` twice and updated the wrong element,
 /// `*p++ += 1` advanced `p` by two, and `a[f()] |= 1` called `f` twice.
 ///
-/// `base` addresses the object, or its storage unit when `bitfield` is set --
-/// a bit-field has no address of its own, so it carries its placement
-/// instead.
+/// `base` addresses the object -- a `Sym` pseudo when the target names a
+/// symbol's own storage -- or its storage unit when `bitfield` is set: a
+/// bit-field has no address of its own, so it carries its placement instead.
 pub(crate) struct RmwPlace {
     base: PseudoId,
     /// The bit-field's placement and its type as the access reaches it.
@@ -292,29 +292,6 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.emit(Instruction::set_val(id, typ, self.types.size_bits(typ)));
 
         id
-    }
-
-    /// Emit a store to a static local variable.
-    /// The caller must have already verified that `name_str` refers to a static local
-    /// (i.e., the local's sym is the sentinel value u32::MAX).
-    pub(crate) fn emit_static_local_store(
-        &mut self,
-        name_str: &str,
-        value: PseudoId,
-        typ: TypeId,
-        size: u32,
-    ) {
-        let key = format!("{}.{}", self.current_func_name, name_str);
-        if let Some(static_info) = self.static_locals.get(&key).cloned() {
-            let sym_id = self.alloc_pseudo();
-            let pseudo = Pseudo::sym(sym_id, static_info.global_name);
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(pseudo);
-            }
-            self.emit(Instruction::store(value, sym_id, 0, typ, size));
-        } else {
-            unreachable!("static local sentinel without static_locals entry");
-        }
     }
 
     /// Zero a whole aggregate (struct, union or array), which is what C17
@@ -2624,20 +2601,43 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// Resolve a read-modify-write target, evaluating its subexpressions once.
-    ///
-    /// `None` for a bare identifier: it has no subexpressions, so nothing can
-    /// be evaluated twice, and the name-based paths handle the shape that
-    /// has no address of its own -- a static local behind its sentinel.
-    pub(crate) fn resolve_rmw_place(&mut self, target: &Expr) -> Option<RmwPlace> {
+    pub(crate) fn resolve_rmw_place(&mut self, target: &Expr) -> RmwPlace {
         match &target.kind {
-            ExprKind::Ident(_) => None,
+            // A name stands for its symbol: the frame slot, or the global a
+            // static local or a file-scope object is emitted as.
+            ExprKind::Ident(symbol_id) => {
+                let binding = self.locals.get(symbol_id).map(|l| l.binding.clone());
+                let base = match binding {
+                    Some(LocalBinding::Frame {
+                        sym,
+                        storage: Storage::InSlot,
+                    }) => sym,
+                    // The slot holds a pointer to the object.
+                    Some(LocalBinding::Frame {
+                        storage: Storage::Indirect(_),
+                        ..
+                    }) => self.linearize_lvalue(target),
+                    Some(LocalBinding::Static { global }) => self.global_sym(global),
+                    Some(LocalBinding::ExtentsOnly) => {
+                        unreachable!("no identifier names a type name's extents")
+                    }
+                    None => {
+                        let name = self.symbol_name(*symbol_id);
+                        self.global_sym(name)
+                    }
+                };
+                RmwPlace {
+                    base,
+                    bitfield: None,
+                }
+            }
             ExprKind::Member { expr, member } => {
                 let base = self.linearize_lvalue(expr);
                 let struct_type = {
                     let declared = self.expr_type(expr);
                     self.resolve_struct_type(declared)
                 };
-                Some(self.member_place(base, struct_type, *member, target))
+                self.member_place(base, struct_type, *member, target)
             }
             ExprKind::Arrow { expr, member } => {
                 // The pointer's *value* is the base address.
@@ -2650,15 +2650,15 @@ impl<'a> super::linearize::Linearizer<'a> {
                         .unwrap_or_else(|| self.expr_type(target));
                     self.resolve_struct_type(declared)
                 };
-                Some(self.member_place(base, struct_type, *member, target))
+                self.member_place(base, struct_type, *member, target)
             }
             // Every other lvalue has one address and no bit-field placement.
             // `linearize_lvalue` is what evaluates the subexpressions, and it
             // does so once.
-            _ => Some(RmwPlace {
+            _ => RmwPlace {
                 base: self.linearize_lvalue(target),
                 bitfield: None,
-            }),
+            },
         }
     }
 
@@ -2716,6 +2716,19 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn load_rmw_place(&mut self, place: &RmwPlace, typ: TypeId) -> PseudoId {
         if let Some((bf, field_typ)) = place.bitfield {
             return self.emit_bitfield_load(place.base, bf, field_typ);
+        }
+        // A read of a global by name is a read like `linearize_ident`'s, and
+        // answers to the same inline-definition constraint.
+        let global = self
+            .current_func
+            .as_ref()
+            .and_then(|func| func.get_pseudo(place.base))
+            .and_then(|p| match &p.kind {
+                PseudoKind::Sym(name) => Some(name.clone()),
+                _ => None,
+            });
+        if let Some(name) = global {
+            self.check_inline_static_reference(&name);
         }
         let size = self.types.size_bits(typ);
         let val = self.alloc_reg_pseudo();
@@ -3056,10 +3069,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             AssignOp::Assign => rhs,
             _ => {
                 // Compound assignment - get current value and apply operation
-                let lhs = match &place {
-                    Some(p) => self.load_rmw_place(p, target_typ),
-                    None => self.linearize_expr(target),
-                };
+                let lhs = self.load_rmw_place(&place, target_typ);
                 // One helper owns the whole of C17 6.5.16.2p3's arithmetic,
                 // shared with the `_Atomic` lowering, which used to carry its
                 // own copy of these rules and disagree with this one.
@@ -3071,56 +3081,10 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
         };
 
-        // Store based on target expression type
-        let target_size = self.types.size_bits(target_typ);
-        if let Some(p) = &place {
-            // The address the load came from, so no subexpression runs twice.
-            let narrowed = self.store_rmw_place(p, final_val, target_typ);
-            return match narrowed {
-                Some((bit_width, typ)) => self.narrow_to_bitfield(final_val, bit_width, typ),
-                None => final_val,
-            };
+        // The address the load came from, so no subexpression runs twice.
+        match self.store_rmw_place(&place, final_val, target_typ) {
+            Some((bit_width, typ)) => self.narrow_to_bitfield(final_val, bit_width, typ),
+            None => final_val,
         }
-        // Only a bare identifier reaches here: `resolve_rmw_place`
-        // answers `Some` for every other lvalue and the branch above
-        // stores through it. The arms that used to be here re-derived
-        // an address that had already been computed, which is exactly
-        // what ran the target a second time.
-        if let ExprKind::Ident(symbol_id) = &target.kind {
-            let name_str = self.symbol_name(*symbol_id);
-            if let Some(local) = self.locals.get(symbol_id).cloned() {
-                // Check if this is a static local (sentinel value)
-                if local.sym.0 == u32::MAX {
-                    self.emit_static_local_store(&name_str, final_val, target_typ, target_size);
-                } else {
-                    // Regular local variable: emit Store
-                    self.emit(Instruction::store(
-                        final_val,
-                        local.sym,
-                        0,
-                        target_typ,
-                        target_size,
-                    ));
-                }
-            } else {
-                // Global variable - emit store
-                let sym_id = self.alloc_pseudo();
-                let pseudo = Pseudo::sym(sym_id, name_str);
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(pseudo);
-                }
-                self.emit(Instruction::store(
-                    final_val,
-                    sym_id,
-                    0,
-                    target_typ,
-                    target_size,
-                ));
-            }
-        }
-
-        // A bare identifier is never a bit-field, so there is nothing to
-        // reduce: the bit-field answer comes from `store_rmw_place` above.
-        final_val
     }
 }

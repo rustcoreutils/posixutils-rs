@@ -5839,6 +5839,11 @@ fn diagnostics_permissive_relaxes_the_constraints_gcc_warns_about() {
             "static const int k = 3;\ninline int f(void) { return k; }\nint main(void){ return f() - 3; }\n",
             "cannot reference file-scope static",
         ),
+        (
+            "inline_updates_a_file_scope_static",
+            "static int k;\ninline void f(void) { k += 3; }\nint main(void){ f(); return k - 3; }\n",
+            "cannot reference file-scope static",
+        ),
     ];
 
     for (name, src, needle) in CASES {

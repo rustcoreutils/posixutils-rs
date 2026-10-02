@@ -31,18 +31,6 @@
 //        The targets are `Instruction::control_targets`: a branch's and a
 //        switch's, and an `asm goto`'s labels.
 //
-//   I2 — MEMORY BARRIERS ARE DCE ROOTS
-//        Every instruction for which `Instruction::is_memory_barrier()`
-//        returns `true` must also have `op.has_side_effects() == true`.
-//        Otherwise mark-sweep DCE could delete a barrier whose result is
-//        unused, silently dropping a `Fence`, an `Atomic*`, a Call, or an
-//        `asm("..." ::: "memory")` from the program — a source of
-//        kernel-style spinlock breakage that is invisible at compile
-//        time. The two predicates are kept structurally aligned by this
-//        invariant; if either set drifts, the validator surfaces it
-//        immediately rather than waiting for a memory-reordering pass to
-//        miscompile a real program.
-//
 //   I6 — A MEMORY ACCESS OFFSET IS A MACHINE DISPLACEMENT
 //        A load, store or atomic is addressed at `src[0] + offset` with a
 //        signed 32-bit displacement read through `Instruction::displacement`,
@@ -82,6 +70,11 @@
 //        other, and every `PhiSource` feeds a phi in a successor of its own
 //        block. Only while the IR is in SSA form; lowering removes both.
 //
+// I2 (a memory barrier is a DCE root) and I5 (a memory access other than a
+// `Load` is one) are properties of the opcode table, not of any program:
+// `Opcode::has_side_effects` is derived from `may_access_memory`, and unit
+// tests in `ir/mod.rs` check both over `Opcode::ALL`.
+//
 // The validator runs always, in every build, through [`verify`]: after
 // linearization, after optimization, and after lowering. It is a linear walk,
 // and a structural error it catches is a miscompile it would otherwise have
@@ -110,14 +103,6 @@ pub enum ValidationError {
         pseudo: PseudoId,
         sites: Vec<(usize, usize, Opcode)>,
     },
-    /// I2 violation: an instruction satisfies `is_memory_barrier()` but
-    /// its opcode is not in `has_side_effects()`. DCE would delete it.
-    BarrierWithoutSideEffect {
-        function: String,
-        block: usize,
-        index: usize,
-        opcode: Opcode,
-    },
     /// I3 violation: a branch-style instruction references a
     /// `BasicBlockId` that doesn't exist in `func.blocks`. Carries
     /// the offending block id and the location of the bad
@@ -128,15 +113,6 @@ pub enum ValidationError {
         index: usize,
         opcode: Opcode,
         target: BasicBlockId,
-    },
-    /// I5 violation: an instruction reaches memory but is not in
-    /// `has_side_effects()`, so DCE would delete it while a memory pass
-    /// would still have to reason about it.
-    MemoryAccessWithoutSideEffect {
-        function: String,
-        block: usize,
-        index: usize,
-        opcode: Opcode,
     },
     /// I6 violation: a memory access carries an offset no signed 32-bit
     /// displacement holds.
@@ -205,16 +181,6 @@ impl fmt::Display for ValidationError {
                 }
                 Ok(())
             }
-            ValidationError::BarrierWithoutSideEffect {
-                function,
-                block,
-                index,
-                opcode,
-            } => write!(
-                f,
-                "[ir-validate I2] in function `{function}`: bb={block} insn={index} op={opcode:?} \
-                 is a memory barrier but not in has_side_effects() — DCE would delete it"
-            ),
             ValidationError::InvalidBranchTarget {
                 function,
                 block,
@@ -225,16 +191,6 @@ impl fmt::Display for ValidationError {
                 f,
                 "[ir-validate I3] in function `{function}`: bb={block} insn={index} op={opcode:?} \
                  references unknown BasicBlockId {target:?}"
-            ),
-            ValidationError::MemoryAccessWithoutSideEffect {
-                function,
-                block,
-                index,
-                opcode,
-            } => write!(
-                f,
-                "[ir-validate I5] in function `{function}`: bb={block} insn={index} \
-                 op={opcode:?} may access memory but is not in has_side_effects()"
             ),
             ValidationError::DisplacementOutOfRange {
                 function,
@@ -390,8 +346,6 @@ pub fn validate_function_at(func: &Function, stage: Stage) -> Result<(), Vec<Val
             }
         }
     }
-    check_barrier_implies_side_effect(func, &mut errors);
-    check_memory_access_implies_side_effect(func, &mut errors);
     check_branch_targets_valid(func, &mut errors);
     check_displacements_in_range(func, &mut errors);
     check_pseudo_index(func, &mut errors);
@@ -493,56 +447,6 @@ fn check_branch_targets_valid(func: &Function, out: &mut Vec<ValidationError>) {
         for (insn_idx, insn) in bb.insns.iter().enumerate() {
             for t in insn.control_targets() {
                 check(bb_idx, insn_idx, insn.op, t, out);
-            }
-        }
-    }
-}
-
-/// I2 — every memory-barrier instruction must also have side effects, or
-/// DCE would silently delete it. See the module-level documentation for
-/// the contract this protects.
-fn check_barrier_implies_side_effect(func: &Function, out: &mut Vec<ValidationError>) {
-    for (bb_idx, bb) in func.blocks.iter().enumerate() {
-        for (insn_idx, insn) in bb.insns.iter().enumerate() {
-            if insn.is_memory_barrier() && !insn.op.has_side_effects() {
-                out.push(ValidationError::BarrierWithoutSideEffect {
-                    function: func.name.clone(),
-                    block: bb_idx,
-                    index: insn_idx,
-                    opcode: insn.op,
-                });
-            }
-        }
-    }
-}
-
-/// I5 — a memory-accessing instruction is side-effecting, or is a `Load`.
-///
-/// `Opcode::may_access_memory` answers *extent* ("does this reach memory")
-/// and `has_side_effects` answers *deletability* ("may DCE remove this").
-/// A pass that removes or moves memory operations consults both, so if the
-/// two drift an opcode that writes memory becomes invisible to DCE *and*
-/// to the access scan — which is how a store gets deleted, or a load
-/// forwarded across one.
-///
-/// `Load` is the one deliberate exception: it reaches memory and DCE may
-/// delete it, because reading a non-volatile location has no effect. Reading a
-/// `volatile` one is observable, and that is refused per *access*, by
-/// `Instruction::is_volatile_access`, which `dce::is_root` consults alongside
-/// this predicate.
-fn check_memory_access_implies_side_effect(func: &Function, out: &mut Vec<ValidationError>) {
-    for (block, bb) in func.blocks.iter().enumerate() {
-        for (index, insn) in bb.insns.iter().enumerate() {
-            if insn.op == Opcode::Load || !insn.op.may_access_memory() {
-                continue;
-            }
-            if !insn.op.has_side_effects() {
-                out.push(ValidationError::MemoryAccessWithoutSideEffect {
-                    function: func.name.clone(),
-                    block,
-                    index,
-                    opcode: insn.op,
-                });
             }
         }
     }
@@ -958,134 +862,6 @@ mod tests {
                 .any(|e| matches!(e, ValidationError::MultipleDefinitions { .. })),
             "{errors:?}"
         );
-    }
-
-    /// I2 — structural enforcement that every barrier opcode is also in
-    /// `has_side_effects()`. This is a meta-test: it walks the cartesian
-    /// product of "is barrier" and "has side effects" for every opcode
-    /// the predicates know about and asserts the implication. If a future
-    /// change adds a new barrier opcode without updating
-    /// `has_side_effects`, this test fails before any miscompilation can
-    /// reach a user.
-    #[test]
-    fn i2_barrier_implies_side_effect_structural() {
-        use crate::ir::AsmData;
-
-        // Every opcode that can return true from is_memory_barrier() under
-        // any input. We can't iterate Opcode directly, so we enumerate
-        // representatives that hit each match arm in is_memory_barrier.
-        let mut samples: Vec<Instruction> = vec![
-            Instruction::new(Opcode::Fence),
-            Instruction::new(Opcode::Call),
-            Instruction::new(Opcode::Setjmp),
-            Instruction::new(Opcode::Longjmp),
-            Instruction::new(Opcode::AtomicLoad),
-            Instruction::new(Opcode::AtomicStore),
-            Instruction::new(Opcode::AtomicSwap),
-            Instruction::new(Opcode::AtomicCas),
-            Instruction::new(Opcode::AtomicFetchAdd),
-            Instruction::new(Opcode::AtomicFetchSub),
-            Instruction::new(Opcode::AtomicFetchAnd),
-            Instruction::new(Opcode::AtomicFetchOr),
-            Instruction::new(Opcode::AtomicFetchXor),
-        ];
-        let mut asm = Instruction::new(Opcode::Asm);
-        asm.extra_mut().asm_data = Some(Box::new(AsmData {
-            template: String::new(),
-            outputs: Vec::new(),
-            inputs: Vec::new(),
-            clobbers: vec!["memory".to_string()],
-            goto_labels: Vec::new(),
-        }));
-        samples.push(asm);
-
-        for insn in &samples {
-            assert!(
-                insn.is_memory_barrier(),
-                "{:?} should be a barrier",
-                insn.op
-            );
-            assert!(
-                insn.op.has_side_effects(),
-                "{:?} is a barrier but not has_side_effects — DCE would delete it",
-                insn.op
-            );
-        }
-    }
-
-    /// I5 — every memory-accessing opcode in real IR is side-effecting or
-    /// is a `Load`. Representative sample; the exhaustive coverage comes
-    /// from the runtime check, which sees every instruction c17 compiles.
-    #[test]
-    fn i5_memory_access_implies_side_effect_or_load() {
-        for op in [
-            Opcode::Store,
-            Opcode::Call,
-            Opcode::Memcpy,
-            Opcode::Memset,
-            Opcode::VaArg,
-            Opcode::Alloca,
-            Opcode::Asm,
-            Opcode::AtomicStore,
-        ] {
-            assert!(op.may_access_memory(), "{op:?} reaches memory");
-            assert!(
-                op.has_side_effects(),
-                "{op:?} reaches memory but DCE may delete it"
-            );
-        }
-        // The one deliberate exception.
-        assert!(Opcode::Load.may_access_memory());
-        assert!(!Opcode::Load.has_side_effects());
-    }
-
-    /// The reverse direction is *not* an invariant and this records why: a
-    /// terminator has side effects and touches no memory, so
-    /// `has_side_effects` is strictly wider.
-    #[test]
-    fn i5_side_effects_does_not_imply_memory_access() {
-        assert!(Opcode::Br.has_side_effects());
-        assert!(!Opcode::Br.may_access_memory());
-        assert!(Opcode::Ret.has_side_effects());
-        assert!(!Opcode::Ret.may_access_memory());
-    }
-
-    /// I5 — runtime: a memory-accessing instruction that DCE may delete.
-    #[test]
-    fn i5_runtime_rejects_a_deletable_memory_access() {
-        let types = TypeTable::new(&Target::host());
-        let mut func = Function::new("t", types.int_id);
-        let mut bb = BasicBlock::new(BasicBlockId(0));
-        bb.add_insn(Instruction::new(Opcode::Entry));
-        // `Nop` reaches no memory, so claiming otherwise needs a real
-        // opcode; `Load` is the sanctioned exception and must pass.
-        bb.add_insn(Instruction::new(Opcode::Load).with_target(PseudoId(1)));
-        bb.add_insn(Instruction::ret(None));
-        func.add_block(bb);
-        func.entry = BasicBlockId(0);
-        assert!(validate_function(&func).is_ok(), "a Load is allowed");
-    }
-
-    /// I2 — runtime check: a hand-crafted IR with a barrier-but-not-
-    /// side-effect (constructed by abusing AsmData on a non-Asm op) is
-    /// not actually reachable through normal c17 pipelines, but the
-    /// validator's check covers the contract end-to-end. A simpler
-    /// sanity case: a normal asm-with-memory-clobber passes I2.
-    #[test]
-    fn i2_asm_with_memory_clobber_validates() {
-        use crate::ir::AsmData;
-
-        let mut func = fresh_func("asm_mem_barrier");
-        let mut asm = Instruction::new(Opcode::Asm);
-        asm.extra_mut().asm_data = Some(Box::new(AsmData {
-            template: "mfence".into(),
-            outputs: vec![],
-            inputs: vec![],
-            clobbers: vec!["memory".to_string()],
-            goto_labels: vec![],
-        }));
-        push(&mut func, asm);
-        assert!(validate_function(&func).is_ok());
     }
 
     /// I3 — a valid CFG. Br targets an existing block; validator

@@ -488,11 +488,9 @@ impl Opcode {
     /// memory operation must consult this to know what lies between two
     /// points, and `is_memory_barrier` to know what it may cross.
     ///
-    /// Deliberately an allowlist read the other way round: everything that
-    /// might touch memory is named, so a new opcode is conservative by
-    /// default only if it is *also* added to [`Self::has_side_effects`] --
-    /// which invariant I5 in `ir/validate.rs` enforces mechanically, so the
-    /// two sets cannot drift.
+    /// Everything that might touch memory is named. [`Self::has_side_effects`]
+    /// is derived from this set, so an opcode added here is a DCE root unless
+    /// it is a `Load`.
     pub fn may_access_memory(&self) -> bool {
         matches!(
             self,
@@ -513,16 +511,7 @@ impl Opcode {
                 | Opcode::Longjmp
                 | Opcode::Asm
                 | Opcode::Fence
-                | Opcode::AtomicLoad
-                | Opcode::AtomicStore
-                | Opcode::AtomicSwap
-                | Opcode::AtomicCas
-                | Opcode::AtomicFetchAdd
-                | Opcode::AtomicFetchSub
-                | Opcode::AtomicFetchAnd
-                | Opcode::AtomicFetchOr
-                | Opcode::AtomicFetchXor
-        )
+        ) || self.is_atomic()
     }
 
     /// Whether this opcode computes a libm function, which its instruction
@@ -536,45 +525,19 @@ impl Opcode {
 
     /// Check if this opcode has side effects (cannot be deleted even if unused).
     /// These are "root" instructions for dead code elimination.
+    ///
+    /// Derived from the other predicates, so that a memory access or a memory
+    /// barrier (every barrier opcode reaches memory) is a root by construction.
     pub fn has_side_effects(&self) -> bool {
-        matches!(
-            self,
-            Opcode::Ret
-                | Opcode::Br
-                | Opcode::Cbr
-                | Opcode::Switch
-                | Opcode::IndirectBr
-                | Opcode::Unreachable
-                | Opcode::Store
-                | Opcode::Call
-                | Opcode::Entry
-                | Opcode::VaStart
-                | Opcode::VaEnd
-                | Opcode::VaCopy
-                | Opcode::VaArg
-                | Opcode::Alloca
-                | Opcode::StackSave
-                | Opcode::StackRestore
-                | Opcode::Memset
-                | Opcode::Memcpy
-                | Opcode::Memmove
-                | Opcode::Setjmp
-                | Opcode::Longjmp
-                | Opcode::Asm
-                | Opcode::AtomicLoad
-                | Opcode::AtomicStore
-                | Opcode::AtomicSwap
-                | Opcode::AtomicCas
-                | Opcode::AtomicFetchAdd
-                | Opcode::AtomicFetchSub
-                | Opcode::AtomicFetchAnd
-                | Opcode::AtomicFetchOr
-                | Opcode::AtomicFetchXor
-                | Opcode::Fence
-                // Not an effect of the program's, but a fact the allocator
-                // reads, which deleting would lose.
-                | Opcode::LifetimeEnd
-        )
+        self.is_terminator()
+            // A read of non-volatile memory has no effect, so DCE may delete
+            // a `Load`; a volatile one is kept per access, by
+            // `Instruction::is_volatile_access`, which `dce::is_root` consults.
+            || (self.may_access_memory() && *self != Opcode::Load)
+            // `Entry` marks where the function begins. `LifetimeEnd` is not
+            // an effect of the program's, but a fact the allocator reads,
+            // which deleting would lose.
+            || matches!(self, Opcode::Entry | Opcode::LifetimeEnd)
     }
 
     /// True for the atomic memory operations (not `Fence`, which touches no
@@ -730,6 +693,59 @@ impl Opcode {
             Opcode::LifetimeEnd => "lifetime.end",
         }
     }
+}
+
+/// Declares [`Opcode::ALL`] and [`Opcode::is_listed`] from one list of the
+/// payload-free variants, so the two cannot disagree: `is_listed` matches
+/// without a wildcard, and a variant added to `Opcode` or to
+/// `IntegralRounding` does not compile until it is listed here, which also
+/// puts it in `ALL`.
+#[cfg(test)]
+macro_rules! every_opcode {
+    ($($op:ident),* $(,)?) => {
+        impl Opcode {
+            /// Every opcode, with `RoundToIntegral` once per rounding, for a
+            /// test that checks a property of the whole opcode table.
+            pub(crate) const ALL: &'static [Opcode] = &[
+                $(Opcode::$op,)*
+                Opcode::RoundToIntegral(IntegralRounding::Floor),
+                Opcode::RoundToIntegral(IntegralRounding::Ceil),
+                Opcode::RoundToIntegral(IntegralRounding::Trunc),
+                Opcode::RoundToIntegral(IntegralRounding::Round),
+                Opcode::RoundToIntegral(IntegralRounding::Rint),
+                Opcode::RoundToIntegral(IntegralRounding::NearbyInt),
+            ];
+
+            /// The exhaustiveness guard behind [`Opcode::ALL`]; always true.
+            fn is_listed(self) -> bool {
+                match self {
+                    $(Opcode::$op)|* => true,
+                    Opcode::RoundToIntegral(
+                        IntegralRounding::Floor
+                        | IntegralRounding::Ceil
+                        | IntegralRounding::Trunc
+                        | IntegralRounding::Round
+                        | IntegralRounding::Rint
+                        | IntegralRounding::NearbyInt,
+                    ) => true,
+                }
+            }
+        }
+    };
+}
+
+#[cfg(test)]
+every_opcode! {
+    Entry, Ret, Br, Cbr, Switch, IndirectBr, Add, Sub, Mul, DivU, DivS, ModU, ModS, Shl, Lsr, Asr,
+    FAdd, FSub, FMul, FDiv, And, Or, Xor, SetEq, SetNe, SetLt, SetLe, SetGt, SetGe, SetB, SetBe,
+    SetA, SetAe, FCmpOEq, FCmpONe, FCmpOLt, FCmpOLe, FCmpOGt, FCmpOGe, Not, Neg, FNeg, Fabs,
+    CopySign, Sqrt, FMin, FMax, Fma, Trunc, Zext, Sext, FCvtU, FCvtS, UCvtF, SCvtF, FCvtF, Load,
+    Store, Phi, PhiSource, Copy, SymAddr, TlsAddr, Call, Select, SetVal, Nop, VaStart, VaArg,
+    VaEnd, VaCopy, VaArgPackLen, ConstantP, Bswap16, Bswap32, Bswap64, Ctz32, Ctz64, Clz32, Clz64,
+    Popcount32, Popcount64, Alloca, StackSave, StackRestore, Memset, Memcpy, Memmove, Signbit,
+    Unreachable, FrameAddress, ReturnAddress, Setjmp, Longjmp, Asm, AtomicLoad, AtomicStore,
+    AtomicSwap, AtomicCas, AtomicFetchAdd, AtomicFetchSub, AtomicFetchAnd, AtomicFetchOr,
+    AtomicFetchXor, Fence, Lo64, Hi64, Pair64, AddC, AdcC, SubC, SbcC, UMulHi, LifetimeEnd,
 }
 
 impl fmt::Display for Opcode {
@@ -1462,20 +1478,8 @@ impl Instruction {
                 .asm_data
                 .as_ref()
                 .is_some_and(|d| d.clobbers.iter().any(|c| c == "memory")),
-            Opcode::Fence
-            | Opcode::Call
-            | Opcode::Setjmp
-            | Opcode::Longjmp
-            | Opcode::AtomicLoad
-            | Opcode::AtomicStore
-            | Opcode::AtomicSwap
-            | Opcode::AtomicCas
-            | Opcode::AtomicFetchAdd
-            | Opcode::AtomicFetchSub
-            | Opcode::AtomicFetchAnd
-            | Opcode::AtomicFetchOr
-            | Opcode::AtomicFetchXor => true,
-            _ => false,
+            Opcode::Fence | Opcode::Call | Opcode::Setjmp | Opcode::Longjmp => true,
+            op => op.is_atomic(),
         }
     }
 
@@ -3433,6 +3437,60 @@ mod tests {
     use crate::abi::{ArgClass, RegClass};
     use crate::target::{Arch, Target};
     use crate::types::{Type, TypeTable};
+
+    #[test]
+    fn opcode_all_lists_every_opcode_once() {
+        for (i, op) in Opcode::ALL.iter().enumerate() {
+            assert!(op.is_listed());
+            assert!(!Opcode::ALL[..i].contains(op), "{op:?} is listed twice");
+        }
+    }
+
+    /// I5 -- a memory access is a DCE root, except a `Load`. Over the whole
+    /// table, so an opcode added in breach of it fails here.
+    #[test]
+    fn memory_access_is_a_side_effect_except_load() {
+        for &op in Opcode::ALL {
+            if op.may_access_memory() && op != Opcode::Load {
+                assert!(
+                    op.has_side_effects(),
+                    "{op:?} reaches memory but DCE may delete it"
+                );
+            }
+        }
+        assert!(Opcode::Load.may_access_memory());
+        assert!(!Opcode::Load.has_side_effects());
+        // The converse does not hold: a branch is a root and touches no memory.
+        assert!(Opcode::Br.has_side_effects());
+        assert!(!Opcode::Br.may_access_memory());
+    }
+
+    /// I2 -- a memory barrier is a DCE root, or DCE could drop a `Fence`, an
+    /// atomic, a call or an `asm("" ::: "memory")` whose result is unused.
+    /// Every opcode is tried bare and carrying a `"memory"` clobber, which
+    /// only `Asm` reads.
+    #[test]
+    fn memory_barrier_is_a_side_effect() {
+        let mut barriers = 0;
+        for &op in Opcode::ALL {
+            let mut clobbering = Instruction::new(op);
+            clobbering.extra_mut().asm_data = Some(Box::new(AsmData {
+                template: String::new(),
+                outputs: Vec::new(),
+                inputs: Vec::new(),
+                clobbers: vec!["memory".to_string()],
+                goto_labels: Vec::new(),
+            }));
+            for insn in [Instruction::new(op), clobbering] {
+                if insn.is_memory_barrier() {
+                    barriers += 1;
+                    assert!(op.has_side_effects(), "{op:?} is a barrier DCE may delete");
+                }
+            }
+        }
+        // Fence, Call, Setjmp, Longjmp and the atomics, each twice, and Asm once.
+        assert_eq!(barriers, 2 * 13 + 1);
+    }
 
     #[test]
     fn test_opcode_is_terminator() {

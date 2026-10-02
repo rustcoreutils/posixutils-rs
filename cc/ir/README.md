@@ -585,7 +585,7 @@ after that, because merging would undo the splitting the copies depend on. See
 
 | File | Purpose |
 |------|---------|
-| `validate.rs` | The IR invariants: single definition; phi arity matching the predecessors; one terminator, at the end of the block; `parents`/`children` matching what the instructions name; branch targets that exist; operand types; every lifetime marker naming a local of its function; displacements in range; and every memory access or barrier counted as a side effect. Run at every stage listed above |
+| `validate.rs` | The IR invariants: single definition; phi arity matching the predecessors; one terminator, at the end of the block; `parents`/`children` matching what the instructions name; branch targets that exist; operand types; every lifetime marker naming a local of its function; and displacements in range. Run at every stage listed above. That every memory access or barrier counts as a side effect is a property of the opcode table, tested over `Opcode::ALL` |
 | `dominate.rs` | Dominator tree by Lengauer–Tarjan (simple form, O(E log V)), and iterated dominance frontiers by Sreedhar–Gao. It returns a `DomTree` snapshot rather than writing into the blocks |
 | `dataflow.rs` | The sparse conditional solver that `sccp` and `vrp` share: seeding, executable-edge marking, the worklists, the step budget, and rewriting what a solution proves. A pass supplies only the lattice and the transfer functions |
 | `range.rs` | A set of W-bit integers as one interval that may wrap, which answers signed and unsigned questions alike, plus its transfer functions. It has no IR types, so it is tested exhaustively at four bits |

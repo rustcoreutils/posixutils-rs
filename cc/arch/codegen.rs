@@ -1192,12 +1192,11 @@ pub fn check_tls_reached_only_by_address(
             continue;
         }
         for id in insn.mentioned() {
-            let Some(crate::ir::PseudoKind::Sym(name)) = func.get_pseudo(id).map(|p| &p.kind)
-            else {
+            // A local whose name collides with a thread-local is a stack slot.
+            let Some(name) = func.global_sym_name(id) else {
                 continue;
             };
-            // A local whose name collides with a thread-local is a stack slot.
-            if tls_symbols.contains(name) && func.local_of(id).is_none() {
+            if tls_symbols.contains(name) {
                 crate::diag::error_args(
                     pos,
                     "internal error: the thread-local '{0}' reached code generation \

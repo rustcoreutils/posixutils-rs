@@ -33,7 +33,7 @@
 //! as a global, where the descriptor call was emitted invisibly to the
 //! allocator on Linux, and a plain non-TLS reference was printed on Darwin.
 
-use super::{Function, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
+use super::{Function, Instruction, Module, Opcode, Pseudo, PseudoId};
 use crate::types::{TypeId, TypeTable};
 use std::collections::{BTreeMap, HashSet};
 
@@ -76,16 +76,12 @@ pub fn expand_dynamic_tls(module: &mut Module, dynamic: bool, types: &TypeTable)
 /// thread-local are two *different* `Sym` pseudos carrying the same name --
 /// which is what the address cache has to key on.
 fn tls_name(func: &Function, id: super::PseudoId, tls: &HashSet<String>) -> Option<String> {
-    match func.get_pseudo(id).map(|p| &p.kind) {
-        // A `Sym` pseudo that *is* a local is a stack slot whose name merely
-        // collides with a global's; only the global is thread-local. Asked by
-        // identity, since a parameter and a block-scope `extern` can share a
-        // name.
-        Some(PseudoKind::Sym(name)) if tls.contains(name) && func.local_of(id).is_none() => {
-            Some(name.clone())
-        }
-        _ => None,
-    }
+    // A `Sym` pseudo that *is* a local is a stack slot whose name merely
+    // collides with a global's; only the global is thread-local. Asked by
+    // identity, since a parameter and a block-scope `extern` can share a name.
+    func.global_sym_name(id)
+        .filter(|name| tls.contains(*name))
+        .map(str::to_string)
 }
 
 /// `ptr` is the type and width of the addresses it introduces.
@@ -192,7 +188,9 @@ fn address_of(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{AsmConstraint, AsmData, BasicBlock, BasicBlockId, GlobalDef, Initializer};
+    use crate::ir::{
+        AsmConstraint, AsmData, BasicBlock, BasicBlockId, GlobalDef, Initializer, PseudoKind,
+    };
     use crate::target::Target;
     use crate::types::TypeTable;
 

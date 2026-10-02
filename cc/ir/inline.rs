@@ -1702,7 +1702,7 @@ fn collect_referenced_functions(module: &Module) -> HashSet<String> {
                     // `Sym` directly, which the asm arm below counts.
                     Opcode::SymAddr => {
                         if let Some(src) = insn.src.first() {
-                            if let Some(name) = func.sym_name_of(*src) {
+                            if let Some(name) = func.global_sym_name(*src) {
                                 if func_names.contains(name) {
                                     referenced.insert(name.to_string());
                                 }
@@ -1716,7 +1716,7 @@ fn collect_referenced_functions(module: &Module) -> HashSet<String> {
                 if let Some(ref asm) = insn.extra().asm_data {
                     collect_names_in_asm(&asm.template, &func_names, &mut referenced);
                     for operand in &asm.inputs {
-                        if let Some(name) = func.sym_name_of(operand.pseudo) {
+                        if let Some(name) = func.global_sym_name(operand.pseudo) {
                             if func_names.contains(name) {
                                 referenced.insert(name.to_string());
                             }
@@ -1775,7 +1775,7 @@ mod tests {
     fn opt_at(level: u8) -> Optimization {
         Optimization::from_flag(&level.to_string()).expect("valid level")
     }
-    use crate::ir::{AsmData, GlobalDef, Initializer};
+    use crate::ir::{AsmConstraint, AsmData, GlobalDef, Initializer};
     use crate::target::Target;
     use crate::types::TypeTable;
 
@@ -2166,6 +2166,50 @@ mod tests {
             "and so must one whose only caller went with it"
         );
         assert!(module.functions.iter().any(|f| f.name == "main"));
+    }
+
+    /// `int f(int helper) { sink(&helper); }` takes the address of a
+    /// parameter, not of the static function `helper`, so it keeps nothing
+    /// alive -- through a `SymAddr` or an asm operand alike.
+    #[test]
+    fn test_object_spelled_like_a_static_does_not_keep_it() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::default();
+        module.functions.push(static_fn(&types, "helper", None));
+        let mut user = Function::new("main", types.int_id);
+        user.add_pseudo(Pseudo::sym(PseudoId(1), "helper".to_string()));
+        user.add_local("helper", PseudoId(1), types.int_id, None, None);
+        user.next_pseudo = 3;
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        bb.add_insn(Instruction::sym_addr(
+            PseudoId(2),
+            PseudoId(1),
+            types.int_id,
+        ));
+        bb.add_insn(Instruction::asm(AsmData {
+            template: String::new(),
+            outputs: Vec::new(),
+            inputs: vec![AsmConstraint::new(
+                PseudoId(1),
+                "m",
+                Target::host().arch,
+                32,
+            )],
+            clobbers: Vec::new(),
+            goto_labels: Vec::new(),
+        }));
+        bb.add_insn(Instruction::ret(None));
+        user.add_block(bb);
+        user.entry = BasicBlockId(0);
+        module.functions.push(user);
+
+        remove_dead_functions(&mut module, false);
+
+        assert!(
+            !module.functions.iter().any(|f| f.name == "helper"),
+            "a local spelled like the static is not a reference to it"
+        );
     }
 
     /// `__attribute__((used))` means exactly "keep this even though nothing

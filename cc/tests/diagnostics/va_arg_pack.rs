@@ -155,3 +155,23 @@ fn va_arg_pack_forwarder_address_without_copy_accepted() {
         expect_accepted("pack_sizeof_addr", &unevaluated, opt);
     }
 }
+
+/// A parameter or local spelled like the forwarder is an object of its own,
+/// and taking its address asks for no copy of the forwarder. gcc accepts both.
+#[test]
+fn va_arg_pack_forwarder_name_shadowed_by_an_object_accepted() {
+    let param = format!(
+        "{COUNT}extern void sink(int *);\n\
+         int use(int count) {{ sink(&count); return count; }}\n\
+         int main(void) {{ return count(\"x\", 1, 2) - 2; }}\n"
+    );
+    let local = format!(
+        "{COUNT}extern void sink(int *);\n\
+         int use(void) {{ int count = 3; sink(&count); return count; }}\n\
+         int main(void) {{ return count(\"x\", 1, 2) - 2; }}\n"
+    );
+    for opt in OPTS {
+        expect_accepted("pack_shadow_param", &param, opt);
+        expect_accepted("pack_shadow_local", &local, opt);
+    }
+}

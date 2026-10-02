@@ -2839,6 +2839,16 @@ impl Function {
             _ => None,
         })
     }
+
+    /// The global a `Sym` pseudo names, if it names one.
+    ///
+    /// A local's `Sym` carries the local's name, which may be spelled like a
+    /// global's -- a parameter `count` beside a function `count` -- so a
+    /// lookup of global names by `sym_name_of` alone mistakes the one for the
+    /// other. Decided by identity, through [`Self::local_of`].
+    pub fn global_sym_name(&self, id: PseudoId) -> Option<&str> {
+        self.sym_name_of(id).filter(|_| self.local_of(id).is_none())
+    }
 }
 
 /// A scalar constant a pseudo can be turned into.
@@ -4260,6 +4270,27 @@ mod tests {
         func.add_pseudo(reg);
         assert_eq!(func.sym_name_of(reg_id), None);
         assert_eq!(func.sym_name_of(PseudoId(9999)), None);
+    }
+
+    /// A local's `Sym` carries the local's name, which a global may share;
+    /// only the global's `Sym` names a global.
+    #[test]
+    fn test_function_global_sym_name_asks_identity() {
+        let target = Target::host();
+        let types = TypeTable::new(&target);
+        let mut func = Function::new("f", types.int_id);
+        let global = func.alloc_pseudo();
+        func.add_pseudo(Pseudo::sym(global, "count".to_string()));
+        let local = func.alloc_pseudo();
+        func.add_pseudo(Pseudo::sym(local, "count".to_string()));
+        func.add_local("count", local, types.int_id, None, None);
+        let reg = func.alloc_pseudo();
+        func.add_pseudo(Pseudo::reg(reg, reg.0));
+
+        assert_eq!(func.global_sym_name(global), Some("count"));
+        assert_eq!(func.global_sym_name(local), None, "the parameter");
+        assert_eq!(func.sym_name_of(local), Some("count"));
+        assert_eq!(func.global_sym_name(reg), None);
     }
 
     /// The global index follows `globals` however it grew: through the

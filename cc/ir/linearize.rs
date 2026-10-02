@@ -4869,20 +4869,34 @@ impl<'a> Linearizer<'a> {
         }
         // Global variable - create symbol reference and load
         else {
+            self.check_inline_static_reference(symbol_id);
             let name_str = self.symbol_name(symbol_id);
-            self.check_inline_static_reference(&name_str);
             let sym_id = self.sym_pseudo(name_str);
             let typ = self.expr_type(expr);
             self.read_object(ObjectPlace::Sym(sym_id), typ)
         }
     }
 
-    /// C99 6.7.4p3: a non-static inline definition cannot refer to a
-    /// file-scope static variable.
-    pub(crate) fn check_inline_static_reference(&self, name: &str) {
-        if !self.current_func_is_inline_definition || !self.file_scope_statics.contains(name) {
-            return;
+    /// The file-scope static that a reference to `symbol_id` in the current
+    /// function would break C99 6.7.4p3 by naming, if any: a non-static
+    /// inline definition cannot refer to one.
+    ///
+    /// Decided by what the identifier resolves to. A parameter or block-scope
+    /// object spelled like the static has a local binding and is the
+    /// function's own object, not the static.
+    pub(crate) fn inline_static_reference(&self, symbol_id: SymbolId) -> Option<String> {
+        if !self.current_func_is_inline_definition || self.locals.contains_key(&symbol_id) {
+            return None;
         }
+        let name = self.symbol_name(symbol_id);
+        self.file_scope_statics.contains(&name).then_some(name)
+    }
+
+    /// Report a reference [`Self::inline_static_reference`] refuses.
+    pub(crate) fn check_inline_static_reference(&self, symbol_id: SymbolId) {
+        let Some(name) = self.inline_static_reference(symbol_id) else {
+            return;
+        };
         if let Some(pos) = self.current_pos {
             let msg = format!(
                 "inline definition of '{}' cannot reference file-scope static variable '{}'",

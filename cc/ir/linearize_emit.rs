@@ -10,13 +10,14 @@
 
 use super::linearize::{BlockVolatility, LocalBinding, ObjectPlace, Storage};
 use super::memexpand::{self, BlockOp};
-use super::{BasicBlockId, CallAbiInfo, Instruction, Opcode, Pseudo, PseudoId, PseudoKind};
+use super::{BasicBlockId, CallAbiInfo, Instruction, Opcode, Pseudo, PseudoId};
 use crate::abi::get_abi_for_conv;
 use crate::constexpr::ConstScope;
 use crate::diag::{error, Position};
 use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, FpCompare, LibFn, MathErrno, UnaryOp};
 use crate::strings::StringId;
+use crate::symbol::SymbolId;
 use crate::types::Bitfield;
 use crate::types::{MemberInfo, TypeId, TypeKind, TypeTable};
 
@@ -36,6 +37,9 @@ pub(crate) struct RmwPlace {
     base: PseudoId,
     /// The bit-field's placement and its type as the access reaches it.
     bitfield: Option<(Bitfield, TypeId)>,
+    /// The identifier the target is, when it is a bare name: a read through
+    /// the place is then a reference to whatever that identifier resolves to.
+    ident: Option<SymbolId>,
 }
 
 /// Everything `E1 op= E2` needs beyond the two operand *values*: the operator
@@ -2659,6 +2663,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 RmwPlace {
                     base,
                     bitfield: None,
+                    ident: Some(*symbol_id),
                 }
             }
             ExprKind::Member { expr, member } => {
@@ -2688,6 +2693,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             _ => RmwPlace {
                 base: self.linearize_lvalue(target),
                 bitfield: None,
+                ident: None,
             },
         }
     }
@@ -2718,10 +2724,15 @@ impl<'a> super::linearize::Linearizer<'a> {
                 return RmwPlace {
                     base,
                     bitfield: None,
+                    ident: None,
                 };
             }
         };
-        RmwPlace { base, bitfield }
+        RmwPlace {
+            base,
+            bitfield,
+            ident: None,
+        }
     }
 
     /// `base + offset` as an address, or `base` itself when the offset is zero.
@@ -2747,18 +2758,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         if let Some((bf, field_typ)) = place.bitfield {
             return self.emit_bitfield_load(place.base, bf, field_typ);
         }
-        // A read of a global by name is a read like `linearize_ident`'s, and
-        // answers to the same inline-definition constraint.
-        let global = self
-            .current_func
-            .as_ref()
-            .and_then(|func| func.get_pseudo(place.base))
-            .and_then(|p| match &p.kind {
-                PseudoKind::Sym(name) => Some(name.clone()),
-                _ => None,
-            });
-        if let Some(name) = global {
-            self.check_inline_static_reference(&name);
+        // A read of a name is a read like `linearize_ident`'s, and answers to
+        // the same inline-definition constraint.
+        if let Some(ident) = place.ident {
+            self.check_inline_static_reference(ident);
         }
         let size = self.types.size_bits(typ);
         let val = self.alloc_reg_pseudo();

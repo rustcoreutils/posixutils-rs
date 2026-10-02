@@ -372,7 +372,7 @@ fn forwarder_addresses(
             if insn.op != Opcode::SymAddr {
                 continue;
             }
-            let Some(name) = insn.src.first().and_then(|&s| func.sym_name_of(s)) else {
+            let Some(name) = insn.src.first().and_then(|&s| func.global_sym_name(s)) else {
                 continue;
             };
             if let Some((name, pack)) = forwarders.get_key_value(name) {
@@ -766,6 +766,19 @@ mod tests {
         // Taken only inside a function that is not emitted: nothing calls it.
         taken.functions[1].emit = false;
         assert!(forwarder_addresses(&taken, &forwarders).is_empty());
+
+        // `int use(int count) { sink(&count); }`: the address of a parameter
+        // spelled like the forwarder, which is not the forwarder.
+        let mut shadowed = module_with_forwarder(
+            &types,
+            vec![Instruction::sym_addr(
+                PseudoId(2),
+                PseudoId(1),
+                types.int_id,
+            )],
+        );
+        shadowed.functions[1].add_local("count", PseudoId(1), types.int_id, None, None);
+        assert!(forwarder_addresses(&shadowed, &static_forwarders(&shadowed)).is_empty());
     }
 
     /// Only an emitted, non-`static` forwarder is an external definition; an

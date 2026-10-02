@@ -1062,6 +1062,31 @@ int main(void) { return 0; }
     }
 }
 
+/// A parameter or local spelled like a static function is not a reference to
+/// it, even when its address is taken.
+///
+/// `&helper` below takes the parameter's address. The prune counted it as an
+/// address of the function `helper`, kept that function, and the program
+/// failed to link on the symbol `helper` names but nothing defines.
+#[test]
+fn codegen_object_spelled_like_a_dead_static_does_not_keep_it() {
+    let code = r#"
+extern int never_defined(void);
+static int helper(void) { return never_defined(); }
+void sink(int *p) { *p += 1; }
+int by_param(int helper) { sink(&helper); return helper; }
+int by_local(void) { int helper = 1; __asm__("" : : "m"(helper)); return helper + 1; }
+int main(void) { return by_param(41) + by_local() - 44; }
+"#;
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_shadowed_dead_static", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
 /// An initialized global is a *definition*, not a common symbol.
 ///
 /// `.comm` declares a common symbol, and those merge across translation

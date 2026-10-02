@@ -23,6 +23,7 @@ mod asm_templates;
 mod cast_to_union;
 mod conditional_operands;
 mod function_compatibility;
+mod inline_static_reference;
 mod return_conversion;
 mod va_arg_pack;
 

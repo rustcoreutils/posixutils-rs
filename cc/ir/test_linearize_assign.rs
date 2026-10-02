@@ -16,6 +16,7 @@ use crate::ir::linearize_emit::{compound_assign_arith_type, compound_assign_opco
 use crate::parse::ast::{
     AssignOp, BlockItem, ExprKind, ExternalDecl, FunctionDef, ParamStyle, Parameter, Stmt, UnaryOp,
 };
+use crate::symbol::Symbol;
 use crate::target::Target;
 use crate::types::{CompositeType, MemberAlign, StructMember, Type, TypeModifiers, TypeTable};
 
@@ -726,5 +727,44 @@ fn test_atomic_bool_compound_assign_cannot_use_a_native_fetch_op() {
     assert!(
         count_op(&module, Opcode::SetNe) >= 1,
         "the CAS loop must convert the result to _Bool before storing it"
+    );
+}
+
+/// C99 6.7.4p3 asks what an identifier resolves to, not how it is spelled.
+///
+/// `static int counter; inline int next(int counter) { return counter++; }`
+/// reads the parameter. The check once looked the place's `Sym` up by name in
+/// the set of file-scope statics, and a parameter's frame slot carries the
+/// parameter's name, so the read was refused as a reference to the static.
+#[test]
+fn test_inline_static_reference_is_decided_by_the_binding() {
+    let mut ctx = TestContext::new();
+    let int_type = ctx.int_type();
+    let global = ctx.var("counter", int_type);
+    ctx.symbols.enter_scope();
+    let param = {
+        let name = ctx.str("counter");
+        let sym = Symbol::parameter(name, int_type, ctx.symbols.depth());
+        ctx.symbols.declare(sym).unwrap()
+    };
+    let target = Target::host();
+    let mut lin = Linearizer::new(&ctx.symbols, &ctx.types, &ctx.strings, &target);
+    lin.file_scope_statics.insert("counter".to_string());
+    lin.locals
+        .insert(param, LocalVarInfo::frame(PseudoId(1), int_type));
+
+    // Outside an inline definition nothing is refused.
+    assert_eq!(lin.inline_static_reference(global), None);
+
+    lin.current_func_is_inline_definition = true;
+    assert_eq!(
+        lin.inline_static_reference(global).as_deref(),
+        Some("counter"),
+        "the file-scope static itself"
+    );
+    assert_eq!(
+        lin.inline_static_reference(param),
+        None,
+        "a parameter spelled like the static is the function's own object"
     );
 }

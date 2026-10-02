@@ -2585,10 +2585,11 @@ impl Function {
     /// `extern` gets its own pseudo carrying the same name, so a name matches
     /// two different objects. Only block-scope locals are mangled `name.<id>`
     /// and so cannot collide. Answering by pseudo identity is what keeps a
-    /// global from being handed the parameter's stack slot.
+    /// global from being handed the parameter's stack slot, and a thread-local
+    /// from being mistaken for one and left unexpanded.
     ///
-    /// `ir/ssa.rs` and `ir/tls.rs` both carry their own version of this
-    /// reasoning; this is the shared form.
+    /// Every "is this `Sym` a local" question asks here, the thread-local
+    /// expansion and the backend's check of it included.
     pub fn local_of(&self, sym: PseudoId) -> Option<&LocalVar> {
         self.get_pseudo(sym)
             .and_then(|p| match &p.kind {

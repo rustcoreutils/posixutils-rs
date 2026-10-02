@@ -1212,7 +1212,7 @@ pub fn check_tls_reached_only_by_address(
                 continue;
             };
             // A local whose name collides with a thread-local is a stack slot.
-            if tls_symbols.contains(name) && !func.locals.contains_key(name) {
+            if tls_symbols.contains(name) && func.local_of(id).is_none() {
                 crate::diag::error_args(
                     pos,
                     "internal error: the thread-local '{0}' reached code generation \

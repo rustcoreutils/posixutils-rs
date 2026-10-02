@@ -75,9 +75,11 @@ pub fn expand_dynamic_tls(module: &mut Module, dynamic: bool, ptr_type: TypeId) 
 /// which is what the address cache has to key on.
 fn tls_name(func: &Function, id: super::PseudoId, tls: &HashSet<String>) -> Option<String> {
     match func.get_pseudo(id).map(|p| &p.kind) {
-        // A `Sym` pseudo that also appears in `locals` is a stack slot whose
-        // name merely collides with a global's; only the global is thread-local.
-        Some(PseudoKind::Sym(name)) if tls.contains(name) && !func.locals.contains_key(name) => {
+        // A `Sym` pseudo that *is* a local is a stack slot whose name merely
+        // collides with a global's; only the global is thread-local. Asked by
+        // identity, since a parameter and a block-scope `extern` can share a
+        // name.
+        Some(PseudoKind::Sym(name)) if tls.contains(name) && func.local_of(id).is_none() => {
             Some(name.clone())
         }
         _ => None,
@@ -256,5 +258,68 @@ mod tests {
         assert!(matches!(delta.kind, PseudoKind::Val(16)));
         // The register operand is untouched.
         assert_eq!(asm.outputs[0].pseudo, out);
+    }
+
+    /// A parameter is registered in `locals` under its bare name, and a
+    /// thread-local reached through a block-scope `extern` of the same name
+    /// is a different `Sym` carrying that name. Only the parameter's own
+    /// pseudo is the stack slot; the global's store, load and address-of are
+    /// all thread-local accesses.
+    #[test]
+    fn thread_local_shadowed_by_a_parameter_is_still_expanded() {
+        let types = TypeTable::new(&Target::host());
+        let int = types.int_id;
+        let mut func = Function::new("f", int);
+        let param = PseudoId(0);
+        func.add_pseudo(Pseudo::sym(param, "x".to_string()));
+        func.add_local("x", param, int, None, None);
+        let global = PseudoId(1);
+        func.add_pseudo(Pseudo::sym(global, "x".to_string()));
+        let one = PseudoId(2);
+        func.add_pseudo(Pseudo::val(one, 1));
+        let loaded = PseudoId(3);
+        func.add_pseudo(Pseudo::reg(loaded, 3));
+        let addr = PseudoId(4);
+        func.add_pseudo(Pseudo::reg(addr, 4));
+        let from_param = PseudoId(5);
+        func.add_pseudo(Pseudo::reg(from_param, 5));
+        func.next_pseudo = 6;
+        let mut entry = BasicBlock::new(BasicBlockId(0));
+        entry.add_insn(Instruction::new(Opcode::Entry));
+        entry.add_insn(Instruction::store(one, global, 0, int, 32));
+        entry.add_insn(Instruction::load(loaded, global, 0, int, 32));
+        entry.add_insn(Instruction::sym_addr(addr, global, types.void_ptr_id));
+        entry.add_insn(Instruction::load(from_param, param, 0, int, 32));
+        entry.add_insn(Instruction::ret(None));
+        func.entry = BasicBlockId(0);
+        func.blocks = vec![entry];
+        func.rebuild_block_idx();
+
+        let mut module = Module::default();
+        module.extern_tls_symbols.insert("x".to_string());
+        module.add_function(func);
+        expand_dynamic_tls(&mut module, true, types.void_ptr_id);
+
+        let insns = &module.functions[0].blocks[0].insns;
+        let tls: Vec<_> = insns.iter().filter(|i| i.op == Opcode::TlsAddr).collect();
+        // One computed for the store and reused by the load, and the
+        // address-of converted in place.
+        assert_eq!(tls.len(), 2, "{insns:?}");
+        assert!(tls.iter().all(|i| i.src == [global]), "{insns:?}");
+        let computed = tls[0].target.unwrap();
+        let store = insns.iter().find(|i| i.op == Opcode::Store).unwrap();
+        assert_eq!(store.src[0], computed);
+        let load = insns
+            .iter()
+            .find(|i| i.op == Opcode::Load && i.target == Some(loaded))
+            .unwrap();
+        assert_eq!(load.src[0], computed);
+        assert!(tls.iter().any(|i| i.target == Some(addr)), "{insns:?}");
+        // The parameter's own slot is untouched.
+        let param_load = insns
+            .iter()
+            .find(|i| i.op == Opcode::Load && i.target == Some(from_param))
+            .unwrap();
+        assert_eq!(param_load.src[0], param);
     }
 }

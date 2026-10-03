@@ -480,10 +480,10 @@ impl Target {
     }
 
     /// `wint_t` (C17 7.29.1), which has to hold every `wchar_t` value *plus*
-    /// `WEOF`, and the two platforms solve that differently. glibc makes it
+    /// `WEOF`, and the platforms solve that differently. glibc makes it
     /// `unsigned int`, so `WEOF` -- `(wint_t)-1` -- is `0xffffffff`, a value
-    /// no `wchar_t` reaches. Darwin makes it `int`, following
-    /// `__darwin_ct_rune_t`, and spends the negative half of the range
+    /// no `wchar_t` reaches. Darwin and FreeBSD make it `int`, following
+    /// their `__ct_rune_t`, and spend the negative half of the range
     /// instead.
     ///
     /// It has to be the platform's choice rather than ours: the C library's
@@ -491,8 +491,8 @@ impl Target {
     /// `__mbstate_t` holds one.
     pub fn wint_type(&self) -> IntType {
         match self.os {
-            Os::MacOS => IntType::Int,
-            Os::Linux | Os::FreeBSD => IntType::UInt,
+            Os::MacOS | Os::FreeBSD => IntType::Int,
+            Os::Linux => IntType::UInt,
         }
     }
 
@@ -627,9 +627,14 @@ impl Target {
             Os::MacOS
         } else if triple.contains("freebsd") {
             Os::FreeBSD
-        } else {
-            // Default based on arch
+        } else if parts.len() == 1 {
+            // A bare architecture means the usual system for it.
             Os::Linux
+        } else {
+            // An operating system c17 has no support for -- Windows, another
+            // BSD, bare metal. Taking it for Linux defined `__linux__` and
+            // `__ELF__` for a target that is neither.
+            return None;
         };
 
         Some(Self::new(arch, os))
@@ -639,6 +644,46 @@ impl Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A triple names an OS c17 supports, or it is refused; a bare
+    /// architecture is the usual system for it.
+    #[test]
+    fn test_from_triple_refuses_unknown_systems() {
+        assert_eq!(
+            Target::from_triple("x86_64-unknown-linux-gnu").map(|t| t.os),
+            Some(Os::Linux)
+        );
+        assert_eq!(
+            Target::from_triple("aarch64-apple-darwin").map(|t| t.os),
+            Some(Os::MacOS)
+        );
+        assert_eq!(
+            Target::from_triple("x86_64-unknown-freebsd").map(|t| t.os),
+            Some(Os::FreeBSD)
+        );
+        assert_eq!(
+            Target::from_triple("aarch64").map(|t| t.os),
+            Some(Os::Linux)
+        );
+        for triple in [
+            "x86_64-pc-windows-msvc",
+            "x86_64-w64-mingw32",
+            "aarch64-unknown-none",
+        ] {
+            assert!(Target::from_triple(triple).is_none(), "{triple}");
+        }
+    }
+
+    /// `wint_t` is the C library's: `unsigned int` for glibc, `int` for
+    /// Darwin and FreeBSD.
+    #[test]
+    fn test_wint_type_per_os() {
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            assert_eq!(Target::new(arch, Os::Linux).wint_type(), IntType::UInt);
+            assert_eq!(Target::new(arch, Os::MacOS).wint_type(), IntType::Int);
+            assert_eq!(Target::new(arch, Os::FreeBSD).wint_type(), IntType::Int);
+        }
+    }
 
     /// Mach-O always calls the TLV getter; ELF calls only for shared code,
     /// and only Linux takes the descriptor model; FreeBSD is ELF too.

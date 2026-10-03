@@ -161,10 +161,7 @@ fn macro_redefinition_conflict(old: &Macro, new: &Macro) -> Option<&'static str>
 /// 2.2.1), such as `_GNU_SOURCE`, `_XOPEN_SOURCE` or `_POSIX_C_SOURCE`.
 fn is_feature_test_macro(name: &str) -> bool {
     name.starts_with('_')
-        && (name.ends_with("_SOURCE")
-            || name.ends_with("_SOURCE_EXTENDED")
-            || name == "_REENTRANT"
-            || name == "__BSD_VISIBLE")
+        && (name.ends_with("_SOURCE") || name.ends_with("_SOURCE_EXTENDED") || name == "_REENTRANT")
 }
 
 /// A name C17 6.10.8 predefines, which p2 says may be neither `#define`d nor

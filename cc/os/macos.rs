@@ -16,13 +16,13 @@ pub fn get_macros() -> Vec<(&'static str, Option<String>)> {
         // Every C identifier picks up a leading underscore in the object
         // file, which is what a GCC asm label has to spell out for itself.
         ("__USER_LABEL_PREFIX__", Some("_".into())),
+        // What Apple clang defines to say "Darwin": `__APPLE__` and
+        // `__MACH__`. Neither `__DARWIN__` nor `__MACH_O__` is one of its
+        // macros, so no Darwin code tests them; `__APPLE_CC__` is clang's
+        // fixed 6000.
         ("__APPLE__", Some("1".into())),
         ("__MACH__", Some("1".into())),
-        ("__DARWIN__", Some("1".into())),
-        // Mach-O binary format
-        ("__MACH_O__", Some("1".into())),
-        // Apple extensions
-        ("__APPLE_CC__", Some("1".into())),
+        ("__APPLE_CC__", Some("6000".into())),
         // Disable _FORTIFY_SOURCE — macOS headers redirect memset/memcpy/strcpy
         // to __memset_chk etc. which requires full fortification builtin support
         ("_FORTIFY_SOURCE", Some("0".into())),

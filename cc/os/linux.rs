@@ -82,15 +82,14 @@ pub fn get_macros(target: &Target) -> Vec<(&'static str, Option<String>)> {
         ("__GLIBC_MINOR__", Some(glibc_minor)),
         // Thread model
         ("_REENTRANT", Some("1".into())),
-        // Feature test macros.
-        //
-        // These are predefined unconditionally, before any user -D/-U, so a
-        // translation unit cannot get a strictly-POSIX view of the system
-        // headers by leaving them out. POSIX only *encourages* restricting
-        // visibility here (88196-88203), so this is a deliberate divergence
-        // rather than a violation -- it matches what a GCC install on a glibc
-        // system effectively provides, and unsetting them breaks a great deal
-        // of code that assumes GNU extensions are visible.
+        // Feature test macros, predefined -- which gcc does not do (its C
+        // modes predefine none; `gnu17` gets glibc's `_DEFAULT_SOURCE` from
+        // <features.h>). A deliberate divergence, recorded in DECISIONS.md
+        // with what it costs: the whole GNU namespace is visible to every
+        // program, and glibc 2.38+ binds `strtol` and the `scanf` family to
+        // its C2X forms. POSIX only *encourages* restricting visibility here
+        // (88196-88203). Defined before any -D/-U, so `-U_GNU_SOURCE`
+        // withdraws it.
         ("_GNU_SOURCE", Some("1".into())),
         ("_DEFAULT_SOURCE", Some("1".into())),
         ("_XOPEN_SOURCE", Some("800".into())),

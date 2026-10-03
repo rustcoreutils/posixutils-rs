@@ -43,6 +43,11 @@ pub enum LinkArg {
     RunPath(String),
     /// A pathname operand: a source, object, archive, or shared library.
     Operand(String),
+    /// An argument for the link step, from `-Wl,`, `-Xlinker`, `-pthread`
+    /// and the like (`--c17-linker-flag=` once normalized). Position matters
+    /// as much as for a library: `-Wl,--whole-archive` applies to the
+    /// archives that follow it and `-Wl,--no-whole-archive` ends that.
+    Flag(String),
 }
 
 /// Options that consume the argument that follows them, in the vector as
@@ -212,6 +217,9 @@ where
             _ if VALUE_OPTIONS.contains(&arg.as_str()) => {
                 let _ = it.next();
             }
+            _ if arg.starts_with("--c17-linker-flag=") => {
+                out.push(LinkArg::Flag(arg["--c17-linker-flag=".len()..].to_string()));
+            }
             // A bare `-` is the stdin operand, not an option.
             _ if arg.starts_with('-') && arg != "-" => {}
             _ => out.push(LinkArg::Operand(arg)),
@@ -359,6 +367,29 @@ mod tests {
         // ...until the user puts one there.
         std::fs::write(dir.path().join("libxnet.a"), b"").unwrap();
         assert!(!drop_standard_library("xnet", &paths));
+    }
+
+    /// A link-step flag keeps its place among the operands and libraries:
+    /// `-Wl,--whole-archive` applies only to what follows it.
+    #[test]
+    fn linker_flags_keep_their_position() {
+        assert_eq!(
+            scan(argv(&[
+                "a.c",
+                "--c17-linker-flag=-Wl,--whole-archive",
+                "libx.a",
+                "--c17-linker-flag=-Wl,--no-whole-archive",
+                "-l",
+                "m",
+            ])),
+            vec![
+                LinkArg::Operand("a.c".into()),
+                LinkArg::Flag("-Wl,--whole-archive".into()),
+                LinkArg::Operand("libx.a".into()),
+                LinkArg::Flag("-Wl,--no-whole-archive".into()),
+                LinkArg::Library("m".into()),
+            ]
+        );
     }
 
     #[test]

@@ -3182,6 +3182,38 @@ pub struct SymbolAlias {
 
 // Module (Translation Unit)
 
+impl Module {
+    /// `-fvisibility=how`: give every definition with external linkage that
+    /// asked for no visibility of its own -- function, object or alias --
+    /// this one. A declaration of something defined elsewhere is not
+    /// affected, as in gcc, and `visibility(...)` on the symbol still wins.
+    ///
+    /// Ignoring the flag exported every symbol of a shared object built with
+    /// `-fvisibility=hidden`, and its calls between its own functions then
+    /// bound, through the PLT, to whatever the executable exported under the
+    /// same names: a CPython extension carrying its own copy of the parser
+    /// ran the interpreter's instead.
+    pub fn apply_default_visibility(&mut self, how: &str) {
+        if how == "default" {
+            return;
+        }
+        let set = |slot: &mut Option<String>, is_static: bool| {
+            if !is_static && slot.is_none() {
+                *slot = Some(how.to_string());
+            }
+        };
+        for func in &mut self.functions {
+            set(&mut func.symbol_attrs.visibility, func.is_static);
+        }
+        for global in &mut self.globals {
+            set(&mut global.symbol_attrs.visibility, global.is_static);
+        }
+        for alias in &mut self.aliases {
+            set(&mut alias.visibility, alias.is_static);
+        }
+    }
+}
+
 /// A module containing multiple functions
 #[derive(Debug, Clone, Default)]
 pub struct Module {
@@ -3354,17 +3386,21 @@ impl Module {
             return;
         }
         if let Some(g) = self.global_mut(name) {
-            g.symbol_attrs = attrs;
+            g.symbol_attrs.merge(&attrs);
         }
     }
 
-    /// Record attributes on a symbol declared but not defined here. A later
-    /// definition in the same unit takes precedence and clears this.
+    /// Record attributes on a symbol declared but not defined here, folded
+    /// together over every such declaration. A later definition in the same
+    /// unit takes them over: see `take_declared_symbol_attrs`.
     pub fn set_declared_symbol_attrs(&mut self, name: &str, attrs: crate::parse::ast::SymbolAttrs) {
         if attrs.is_empty() {
             return;
         }
-        self.declared_symbol_attrs.insert(name.to_string(), attrs);
+        self.declared_symbol_attrs
+            .entry(name.to_string())
+            .or_default()
+            .merge(&attrs);
     }
 
     /// Define a global, with its explicit alignment (C11 `_Alignas`) if it
@@ -3528,6 +3564,50 @@ mod tests {
     use crate::abi::{ArgClass, RegClass};
     use crate::target::{Arch, Target};
     use crate::types::{Type, TypeTable};
+
+    /// `-fvisibility=` reaches every external definition that named none,
+    /// and nothing else.
+    #[test]
+    fn default_visibility_applies_to_external_definitions_only() {
+        let types = TypeTable::new(&Target::host());
+        let mut public = Function::new("public", types.int_id);
+        public.symbol_attrs.visibility = Some("default".into());
+        let plain = Function::new("plain", types.int_id);
+        let mut local = Function::new("local", types.int_id);
+        local.is_static = true;
+        let mut module = Module {
+            functions: vec![public, plain, local],
+            globals: vec![GlobalDef::new("g", types.int_id, Initializer::None)],
+            aliases: vec![SymbolAlias {
+                name: "a".into(),
+                target: "plain".into(),
+                is_static: false,
+                weak: false,
+                visibility: None,
+            }],
+            ..Default::default()
+        };
+
+        module.apply_default_visibility("hidden");
+        let vis: Vec<Option<&str>> = module
+            .functions
+            .iter()
+            .map(|f| f.symbol_attrs.visibility.as_deref())
+            .collect();
+        assert_eq!(vis, [Some("default"), Some("hidden"), None]);
+        assert_eq!(
+            module.globals[0].symbol_attrs.visibility.as_deref(),
+            Some("hidden")
+        );
+        assert_eq!(module.aliases[0].visibility.as_deref(), Some("hidden"));
+
+        let mut untouched = Module {
+            functions: vec![Function::new("f", types.int_id)],
+            ..Default::default()
+        };
+        untouched.apply_default_visibility("default");
+        assert_eq!(untouched.functions[0].symbol_attrs.visibility, None);
+    }
 
     #[test]
     fn opcode_all_lists_every_opcode_once() {

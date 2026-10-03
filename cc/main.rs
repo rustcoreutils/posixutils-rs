@@ -386,6 +386,10 @@ struct Args {
     #[arg(long = "c17-mflag", action = clap::ArgAction::Append, value_name = "flag", hide = true)]
     mflags: Vec<String>,
 
+    /// `-fvisibility=`: the visibility of every definition that names none.
+    #[arg(long = "c17-visibility", value_name = "visibility", hide = true)]
+    default_visibility: Option<String>,
+
     /// `-x LANG` as it applied to each operand after it, as `LANG:path`
     /// (rewritten by `preprocess_args_from`); see [`Args::lang_of`].
     #[arg(long = "c17-x", action = clap::ArgAction::Append, value_name = "lang:path", hide = true)]
@@ -1199,6 +1203,9 @@ fn process_file(
         args.debug > 0,
         !args.fno_trapping_math,
     );
+    if let Some(how) = &args.default_visibility {
+        module.apply_default_visibility(how);
+    }
 
     // Check for errors during linearization (e.g., unsupported global initializers)
     if diag::has_error() != 0 {
@@ -1390,6 +1397,10 @@ enum LinkItem {
     LibPath(String),
     Library(String),
     RunPath(String),
+    /// An argument for the host driver's link step -- `-Wl,...`, `-pthread`,
+    /// `-rdynamic` -- in its place among the others: `-Wl,--whole-archive`
+    /// governs the archives after it.
+    Flag(String),
 }
 
 /// How `-s` removes the symbol table from the linked executable.
@@ -1489,6 +1500,9 @@ fn link_objects(
             LinkItem::RunPath(d) => {
                 link_cmd.arg(format!("-Wl,-rpath,{}", d));
             }
+            LinkItem::Flag(f) => {
+                link_cmd.arg(f);
+            }
         }
     }
 
@@ -1502,10 +1516,6 @@ fn link_objects(
     let strip = args.strip.then(|| StripBy::for_os(target.os));
     if strip == Some(StripBy::LinkerFlag) {
         link_cmd.arg("-s");
-    }
-
-    for flag in &args.linker_flags {
-        link_cmd.arg(flag);
     }
 
     if !link_cmd.status()?.success() {
@@ -1647,7 +1657,7 @@ fn is_known_ignorable_f_flag(arg: &str) -> bool {
         "-fno-semantic-interposition",
         "-fsemantic-interposition",
     ];
-    const PREFIX: &[&str] = &["-fvisibility=", "-fpack-struct=", "-fstack-protector"];
+    const PREFIX: &[&str] = &["-fpack-struct=", "-fstack-protector"];
     EXACT.contains(&arg) || PREFIX.iter().any(|p| arg.starts_with(p))
 }
 
@@ -1817,8 +1827,17 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             // Machine flags are judged once the target is known.
             result.push(format!("--c17-mflag={}", arg));
             i += 1;
-        } else if arg.starts_with("-fvisibility")
-            || arg == "-fno-semantic-interposition"
+        } else if let Some(how) = arg.strip_prefix("-fvisibility=") {
+            // The visibility a definition gets when it names none; see
+            // `ir::Module::apply_default_visibility`. gcc rejects a value it
+            // does not know, and so does this.
+            if !matches!(how, "default" | "hidden" | "internal" | "protected") {
+                eprintln!("c17: {}: {}", gettext("unrecognized visibility value"), how);
+                std::process::exit(1);
+            }
+            result.push(format!("--c17-visibility={}", how));
+            i += 1;
+        } else if arg == "-fno-semantic-interposition"
             || arg.starts_with("-fstack-protector")
             || arg == "-fno-reorder-blocks-and-partition"
             || arg == "-fno-plt"
@@ -1968,15 +1987,17 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             result.push("--c17-fno-pie".to_string());
             result.push("--c17-linker-flag=-no-pie".to_string());
             i += 1;
-        } else if let Some(wl_args) = arg.strip_prefix("-Wl,") {
-            // -Wl,flag1,flag2 -> pass each flag to linker
-            for flag in wl_args.split(',') {
-                result.push(format!("--c17-linker-flag={}", flag));
-            }
+        } else if arg.starts_with("-Wl,") {
+            // Handed to the host driver as written, which is what splits the
+            // commas and gives each piece to the linker. Splitting here made
+            // `-Wl,--as-needed` a driver option `--as-needed` it rejects, and
+            // `-Wl,-soname,libx.so` two unrelated arguments.
+            result.push(format!("--c17-linker-flag={}", arg));
             i += 1;
         } else if arg == "-Xlinker" {
-            // -Xlinker <arg> -> pass next arg to linker
+            // -Xlinker <arg> -> the same pair, for the host driver
             if i + 1 < raw_args.len() {
+                result.push("--c17-linker-flag=-Xlinker".to_string());
                 result.push(format!("--c17-linker-flag={}", raw_args[i + 1]));
                 i += 2;
             } else {
@@ -2357,6 +2378,7 @@ fn build_link_line(
         out.extend(args.lib_paths.iter().cloned().map(LinkItem::LibPath));
         out.extend(args.libraries.iter().cloned().map(LinkItem::Library));
         out.extend(args.run_paths.iter().cloned().map(LinkItem::RunPath));
+        out.extend(args.linker_flags.iter().cloned().map(LinkItem::Flag));
         return out;
     }
 
@@ -2373,6 +2395,7 @@ fn build_link_line(
             linkargs::LinkArg::LibPath(d) => out.push(LinkItem::LibPath(d.clone())),
             linkargs::LinkArg::Library(l) => out.push(LinkItem::Library(l.clone())),
             linkargs::LinkArg::RunPath(d) => out.push(LinkItem::RunPath(d.clone())),
+            linkargs::LinkArg::Flag(f) => out.push(LinkItem::Flag(f.clone())),
         }
     }
     out
@@ -2921,8 +2944,9 @@ mod tests {
     // Tests for silently-ignored flags
 
     #[test]
-    fn test_preprocess_fvisibility_ignored() {
+    fn test_preprocess_fvisibility_is_kept() {
         let result = run_preprocess(&["-fvisibility=hidden", "foo.c"]);
+        assert!(result.contains(&"--c17-visibility=hidden".to_string()));
         assert!(!result.contains(&"-fvisibility=hidden".to_string()));
         assert!(result.contains(&"foo.c".to_string()));
     }
@@ -3071,16 +3095,21 @@ mod tests {
 
     #[test]
     fn test_preprocess_wl_flags() {
+        // Kept whole: the host driver splits the commas, and the pieces of
+        // `-z,now` only mean something together.
         let result = run_preprocess(&["-Wl,-z,now", "foo.c"]);
-        assert!(result.contains(&"--c17-linker-flag=-z".to_string()));
-        assert!(result.contains(&"--c17-linker-flag=now".to_string()));
+        assert!(result.contains(&"--c17-linker-flag=-Wl,-z,now".to_string()));
         assert!(!result.contains(&"-Wl,-z,now".to_string()));
     }
 
     #[test]
     fn test_preprocess_xlinker() {
         let result = run_preprocess(&["-Xlinker", "--hash-style=gnu", "foo.c"]);
-        assert!(result.contains(&"--c17-linker-flag=--hash-style=gnu".to_string()));
+        let at = result
+            .iter()
+            .position(|a| a == "--c17-linker-flag=-Xlinker")
+            .expect("-Xlinker kept");
+        assert_eq!(result[at + 1], "--c17-linker-flag=--hash-style=gnu");
         assert!(!result.contains(&"-Xlinker".to_string()));
     }
 

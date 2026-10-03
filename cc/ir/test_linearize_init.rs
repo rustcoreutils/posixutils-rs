@@ -2393,3 +2393,29 @@ fn test_const_subobject_folds_to_its_value() {
         global_init(&module, "d")
     );
 }
+
+/// An object's definition carries the attributes of every declaration of it,
+/// before or after: CPython's `PyAPI_DATA` puts `visibility("default")` on
+/// the `extern` declaration and none on the definition.
+#[test]
+fn test_object_definition_inherits_declaration_attrs() {
+    let module = linearize_source(
+        "extern __attribute__((visibility(\"default\"))) int a;\nint a = 1;\n\
+         int b = 2;\nextern int b __attribute__((visibility(\"protected\")));\n\
+         extern __attribute__((weak)) int c;\nextern __attribute__((visibility(\"hidden\"))) int c;\nint c;\n",
+        &Target::host(),
+    );
+    let attrs = |name: &str| {
+        module
+            .globals
+            .iter()
+            .find(|g| g.name == name)
+            .map(|g| g.symbol_attrs.clone())
+            .expect("defined")
+    };
+    assert_eq!(attrs("a").visibility.as_deref(), Some("default"));
+    assert_eq!(attrs("b").visibility.as_deref(), Some("protected"));
+    assert!(attrs("c").weak);
+    assert_eq!(attrs("c").visibility.as_deref(), Some("hidden"));
+    assert!(module.declared_symbol_attrs.is_empty());
+}

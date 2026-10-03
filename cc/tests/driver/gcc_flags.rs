@@ -186,3 +186,182 @@ fn gcc_flags_pic_macros_follow_the_code() {
         assert!(out.contains("PIC=2"), "Mach-O is always PIC: {out}");
     }
 }
+
+/// `-Wl,...` reaches the linker as written and where it was written. It was
+/// split at its commas and moved to the end of the link line, so
+/// `-Wl,--whole-archive` arrived as a driver option the host `cc` rejects,
+/// `-Wl,-soname,x` as two unrelated words, and nothing kept its place
+/// relative to the archive it governs.
+#[cfg(target_os = "linux")]
+#[test]
+fn gcc_flags_linker_flags_keep_form_and_position() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_wl_")
+        .tempdir()
+        .expect("tempdir");
+    let p = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+
+    // A member nothing references: only `--whole-archive` brings it in, and
+    // its constructor then sets the exit status main returns.
+    std::fs::write(
+        p("member.c"),
+        "extern int c17_flag;\n__attribute__((constructor)) static void init(void) { c17_flag = 42; }\n",
+    )
+    .unwrap();
+    let r = run_c17(&["-c", "-o", &p("member.o"), &p("member.c")]);
+    assert!(r.success, "{}", r.stderr);
+    let status = std::process::Command::new("ar")
+        .args(["rcs", &p("libmember.a"), &p("member.o")])
+        .status()
+        .expect("ar");
+    assert!(status.success());
+    std::fs::write(
+        p("main.c"),
+        "int c17_flag;\nint main(void) { return c17_flag; }\n",
+    )
+    .unwrap();
+
+    let r = run_c17(&[
+        "-o",
+        &p("whole"),
+        &p("main.c"),
+        "-Wl,--whole-archive",
+        &p("libmember.a"),
+        "-Wl,--no-whole-archive",
+        "-Wl,--as-needed",
+        "-Xlinker",
+        "-z",
+        "-Xlinker",
+        "now",
+    ]);
+    assert!(r.success, "{}", r.stderr);
+    let code = std::process::Command::new(p("whole"))
+        .status()
+        .unwrap()
+        .code();
+    assert_eq!(code, Some(42), "the archive member was not linked whole");
+
+    // Without the flag the member stays out.
+    let r = run_c17(&["-o", &p("plain"), &p("main.c"), &p("libmember.a")]);
+    assert!(r.success, "{}", r.stderr);
+    let code = std::process::Command::new(p("plain"))
+        .status()
+        .unwrap()
+        .code();
+    assert_eq!(code, Some(0));
+
+    // A shared object named through `-Wl,-soname,...`.
+    std::fs::write(p("lib.c"), "int c17_lib(void) { return 7; }\n").unwrap();
+    let r = run_c17(&[
+        "-shared",
+        "-fPIC",
+        "-o",
+        &p("libsoname.so"),
+        "-Wl,-soname,libc17test.so.1",
+        &p("lib.c"),
+    ]);
+    assert!(r.success, "{}", r.stderr);
+    let dynamic = std::process::Command::new("readelf")
+        .args(["-d", &p("libsoname.so")])
+        .output();
+    if let Ok(out) = dynamic {
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("libc17test.so.1"), "{text}");
+    }
+}
+
+/// `-fvisibility=hidden` keeps a shared object's own functions to itself: a
+/// call inside it binds to its own definition even when the executable
+/// exports one of the same name. It was ignored, so the library's symbols
+/// were exported and the call bound, through the PLT, to the executable's --
+/// which is how a CPython extension carrying its own parser ran the
+/// interpreter's instead (test_peg_generator).
+#[cfg(target_os = "linux")]
+#[test]
+fn gcc_flags_fvisibility_hidden_binds_locally() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_vis_")
+        .tempdir()
+        .expect("tempdir");
+    let p = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+    std::fs::write(
+        p("lib.c"),
+        "int helper(void) { return 1; }\n\
+         __attribute__((visibility(\"default\"))) int lib_entry(void) { return helper(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        p("main.c"),
+        "int helper(void) { return 2; }\nint lib_entry(void);\n\
+         int main(void) { return lib_entry() * 10 + helper(); }\n",
+    )
+    .unwrap();
+    let r = run_c17(&[
+        "-shared",
+        "-fPIC",
+        "-fvisibility=hidden",
+        "-o",
+        &p("libvis.so"),
+        &p("lib.c"),
+    ]);
+    assert!(r.success, "{}", r.stderr);
+    let r = run_c17(&[
+        "-rdynamic",
+        "-o",
+        &p("main"),
+        &p("main.c"),
+        &p("libvis.so"),
+        &format!("-Wl,-rpath,{}", dir.path().display()),
+    ]);
+    assert!(r.success, "{}", r.stderr);
+    let code = std::process::Command::new(p("main"))
+        .status()
+        .unwrap()
+        .code();
+    assert_eq!(code, Some(12), "the library called the executable's helper");
+
+    if let Ok(out) = std::process::Command::new("nm")
+        .args(["-D", "--defined-only", &p("libvis.so")])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("lib_entry"), "{text}");
+        assert!(!text.contains("helper"), "{text}");
+    }
+
+    let r = compile_with("vis.c", MAIN, &["-fvisibility=bogus"]);
+    assert!(!r.success);
+    assert!(
+        r.stderr.contains("unrecognized visibility value"),
+        "{}",
+        r.stderr
+    );
+}
+
+/// Under `-fvisibility=hidden` an object keeps the visibility its `extern`
+/// declaration gave it: CPython declares every exported object
+/// `PyAPI_DATA(...)`, `visibility("default")`, and defines it without the
+/// attribute. Without this its extension modules could not find
+/// `PyFloat_Type`.
+#[cfg(target_os = "linux")]
+#[test]
+fn gcc_flags_object_visibility_comes_from_its_declaration() {
+    let (dir, path) = scratch(
+        "objvis.c",
+        "extern __attribute__((visibility(\"default\"))) int pub_obj;\nint pub_obj = 1;\n\
+         int hid_obj = 2;\nint late = 3;\nextern int late __attribute__((visibility(\"default\")));\n",
+    );
+    let asm = dir.path().join("objvis.s");
+    let r = run_c17(&[
+        "-fvisibility=hidden",
+        "-S",
+        "-o",
+        asm.to_str().unwrap(),
+        path.to_str().unwrap(),
+    ]);
+    assert!(r.success, "{}", r.stderr);
+    let text = std::fs::read_to_string(&asm).unwrap();
+    assert!(text.contains(".hidden hid_obj"), "{text}");
+    assert!(!text.contains(".hidden pub_obj"), "{text}");
+    assert!(!text.contains(".hidden late"), "{text}");
+}

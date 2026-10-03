@@ -232,7 +232,12 @@ impl<'a> super::linearize::Linearizer<'a> {
             // int x = 1; extern int x;  - x is defined, not extern)
             if storage_class.contains(TypeModifiers::EXTERN) {
                 // Check if this symbol is already defined in globals
-                if !self.module.globals.iter().any(|g| g.name == name) {
+                if self.module.globals.iter().any(|g| g.name == name) {
+                    // An attribute on a declaration after the definition is
+                    // still the object's, as in gcc.
+                    self.module
+                        .set_symbol_attrs(&name, declarator.symbol_attrs.clone());
+                } else {
                     self.module
                         .set_declared_symbol_attrs(&name, declarator.symbol_attrs.clone());
                     self.module.extern_symbols.insert(name.clone());
@@ -259,8 +264,17 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.file_scope_statics.insert(name.clone());
             }
 
-            // A definition here outranks anything recorded for the declaration.
-            self.module.declared_symbol_attrs.remove(&name);
+            // The definition takes over what the declarations before it asked
+            // for -- `extern int x __attribute__((visibility("default")));`
+            // then `int x = 1;` is a default-visibility `x`, which is how
+            // CPython's PyAPI_DATA exports its objects -- and its own
+            // attributes come last, so they win.
+            let mut attrs = self
+                .module
+                .declared_symbol_attrs
+                .remove(&name)
+                .unwrap_or_default();
+            attrs.merge(&declarator.symbol_attrs);
             self.module.extern_symbols.remove(&name);
             self.module.extern_object_align.remove(&name);
 
@@ -281,8 +295,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 declarator.explicit_align,
                 storage,
             );
-            self.module
-                .set_symbol_attrs(&name, declarator.symbol_attrs.clone());
+            self.module.set_symbol_attrs(&name, attrs);
         }
     }
 

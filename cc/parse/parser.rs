@@ -80,6 +80,10 @@ pub(crate) struct ParameterList {
     pub variadic: bool,
     /// False for `()` and for an identifier list.
     pub prototyped: bool,
+    /// Where a `[*]` is written directly in this list -- not in a nested
+    /// prototype -- which a function body following it does not allow
+    /// (C17 6.7.6.2p4).
+    pub star: Option<Position>,
 }
 
 /// Where a declarator is written, which settles what it may contain.
@@ -141,9 +145,9 @@ pub(crate) struct ParsedDeclarator {
     /// Where the first run-time extent is written, for the diagnostic that
     /// refuses one where it may not appear.
     pub(crate) vla_pos: Option<Position>,
-    /// A function declarator's parameters, with their names, for a
+    /// A function declarator's parameter list, with the names, for a
     /// definition to bind.
-    pub(crate) params: Option<Vec<RawParam>>,
+    pub(crate) params: Option<ParameterList>,
     /// Whether the declarator is only its identifier, perhaps parenthesized
     /// -- `a` or `(a)` -- deriving nothing, and with no attribute in its
     /// parentheses. An array suffix on one is the declared object's own,
@@ -311,6 +315,11 @@ pub struct Parser<'a> {
     /// Every identifier with linkage declared so far, in any scope; see
     /// [`super::linkage`].
     pub(super) linked_names: std::collections::HashMap<StringId, super::linkage::LinkedName>,
+    /// How many parameter lists are being parsed, one inside another.
+    pub(super) param_list_depth: u32,
+    /// Where a `[*]` was written directly in the parameter list being
+    /// parsed; see [`ParameterList::star`].
+    pub(super) star_in_params: Option<Position>,
     /// `#pragma pack` directives, and where they stood in the token stream.
     ///
     /// Sorted by index; `pack_cursor` is how far the parser has consumed
@@ -382,6 +391,8 @@ impl<'a> Parser<'a> {
             declared_non_inline_fns: std::collections::BTreeSet::new(),
             defined_functions: std::collections::HashSet::new(),
             linked_names: std::collections::HashMap::new(),
+            param_list_depth: 0,
+            star_in_params: None,
             pack_directives,
             pack_cursor: 0,
             vm_typedefs: HashMap::new(),

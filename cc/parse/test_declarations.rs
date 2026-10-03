@@ -106,12 +106,39 @@ fn test_declarator_and_storage_rules() {
     parse_tu("int * restrict p; typedef int *IP; restrict IP r; int (*fp(void))[3];").unwrap();
 }
 
+#[test]
+fn test_star_array_only_in_prototypes() {
+    assert_rejected("void g(int n, int a[*]) {}");
+    parse_tu("void h(int n, int a[*]); void k(void (*cb)(int n, int a[*])) {}").unwrap();
+}
+
 /// Parse `src`, requiring it to be accepted: no parse error and no error
 /// diagnostic.
 fn assert_accepted(src: &str) {
     let before = crate::diag::error_count();
     assert!(parse_tu(src).is_ok(), "{src}: parse error");
     assert_eq!(crate::diag::error_count(), before, "{src}: rejected");
+}
+
+/// C17 6.7.6.2p4: `[*]` is refused in the parameter list a function body
+/// follows -- the defined function's own, which for a function returning a
+/// function pointer is the inner list, not the return type's.
+#[test]
+fn test_star_array_scope_is_the_defined_functions_own_list() {
+    for src in [
+        "void (*fp(int x))(int n, int a[*]) { return 0; }",
+        "void (*fr(int n, int a[*]))(int m, int b[*]);",
+        "void f(void (*g)(int n, int a[*])) {}",
+    ] {
+        assert_accepted(src);
+    }
+    for src in [
+        "void (*fq(int n, int a[*]))(int) { return 0; }",
+        "void (*fq(int n, int a[*]))(int m, int b[*]) { return 0; }",
+        "void f(int n, int (*a)[*]) {}",
+    ] {
+        assert_rejected(src);
+    }
 }
 
 /// C17 6.7.6.3p7: `static` and qualifiers in `[ ]` belong to the parameter's

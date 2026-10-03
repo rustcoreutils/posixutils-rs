@@ -328,6 +328,34 @@ fn derived_types_c_forbids() {
     );
 }
 
+/// `[*]` belongs to a prototype only; a definition's parameters are in its
+/// block's scope (C17 6.7.6.2p4). A nested prototype -- a parameter that is
+/// a pointer to a function -- may still use it.
+#[test]
+fn star_array_only_in_prototypes() {
+    compile_expect_error(
+        "star_in_definition",
+        "void g(int n, int a[*]) { (void)n; (void)a; }\n",
+        "'[*]' not allowed in other than function prototype scope",
+    );
+    compile_expect_ok(
+        "star_in_prototype",
+        "void h(int n, int a[*]);\nvoid h(int n, int a[n]) { (void)a; }\n\
+         void k(void (*cb)(int n, int a[*])) { (void)cb; }\n",
+    );
+    // A function returning a function pointer: its own parameters are the
+    // inner list, and the return type's list is a prototype.
+    compile_expect_ok(
+        "star_in_returned_prototype",
+        "void (*fp(int x))(int n, int a[*]) { (void)x; return 0; }\n",
+    );
+    compile_expect_error(
+        "star_in_definition_returning_fn_ptr",
+        "void (*fq(int n, int a[*]))(int) { (void)n; (void)a; return 0; }\n",
+        "'[*]' not allowed in other than function prototype scope",
+    );
+}
+
 /// `static` and qualifiers in `[ ]` qualify the parameter's own array type,
 /// however its name is parenthesized; through a pointer they do not.
 #[test]

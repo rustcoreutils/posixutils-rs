@@ -328,6 +328,15 @@ impl Parser<'_> {
         if let Some(attrs) = &fn_attrs {
             let body_follows = self.is_special(b'{') || self.is_declaration_start();
             if scope == DeclScope::File && first && body_follows {
+                // A definition's parameters are in its block's scope, not a
+                // prototype's, so `[*]` has no business there (6.7.6.2p4).
+                if let Some(star) = params.as_ref().and_then(|list| list.star) {
+                    diag::error(
+                        star,
+                        &gettext("'[*]' not allowed in other than function prototype scope"),
+                    );
+                }
+                let params = params.map(|list| list.params);
                 let def = self.define_function(specs, name, pos, typ, params, attrs.clone())?;
                 return Ok(Bound::FuncDef(def));
             }

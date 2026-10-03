@@ -256,6 +256,7 @@ impl Parser<'_> {
                 }
             }
 
+            self.warn_tag_in_parameter_list("enum", tag);
             let mut enum_type = Type::enum_type(composite);
             // C17 6.7.2.2p4: the enumerated type shall represent every member.
             // `enum_underlying_type` picks a type that does, but the enum's own
@@ -300,6 +301,29 @@ impl Parser<'_> {
                     self.current_pos(),
                 ))
             }
+        }
+    }
+
+    /// A tag first declared in a parameter list has prototype scope (C17
+    /// 6.2.1p4), so no other declaration can ever name the same type -- a
+    /// definition of the function that repeats `struct S *` has a different
+    /// `struct S`. gcc warns, and so does c17.
+    fn warn_tag_in_parameter_list(&self, keyword: &str, tag: Option<StringId>) {
+        if self.param_list_depth == 0 {
+            return;
+        }
+        let pos = self.current_pos();
+        match tag.and_then(|t| self.idents.get_opt(t)) {
+            Some(name) => diag::warning_args(
+                pos,
+                "'{0} {1}' declared inside parameter list will not be visible outside of this definition or declaration",
+                &[keyword, name],
+            ),
+            None => diag::warning_args(
+                pos,
+                "anonymous {0} declared inside parameter list will not be visible outside of this definition or declaration",
+                &[keyword],
+            ),
         }
     }
 
@@ -532,6 +556,7 @@ impl Parser<'_> {
             }
 
             // No existing forward declaration - create new type
+            self.warn_tag_in_parameter_list(if is_union { "union" } else { "struct" }, tag);
             let struct_type = if is_union {
                 Type::union_type(composite)
             } else {
@@ -579,6 +604,8 @@ impl Parser<'_> {
                     // Create new incomplete type and register it in symbol table
                     // This ensures that when the type is completed later, we can update
                     // this same TypeId rather than creating a new one
+                    let keyword = if is_union { "union" } else { "struct" };
+                    self.warn_tag_in_parameter_list(keyword, Some(tag_name));
                     let incomplete_type = if is_union {
                         Type::incomplete_union(tag_name)
                     } else {

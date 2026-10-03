@@ -276,7 +276,7 @@ impl Parser<'_> {
         // Handle function declarators: void (*fp)(int, char)
         // This parses the parameter list after a grouped declarator
         // We keep both the TypeIds (for building the type) and raw params (for function defs)
-        let (func_params, full_func_params): (Option<FuncSignature>, Option<Vec<RawParam>>) =
+        let (func_params, full_func_params): (Option<FuncSignature>, Option<ParameterList>) =
             if self.is_special(b'(') {
                 self.advance();
                 let list = self.parse_parameter_list()?;
@@ -288,7 +288,7 @@ impl Parser<'_> {
                         variadic: list.variadic,
                         prototyped: list.prototyped,
                     }),
-                    Some(list.params),
+                    Some(list),
                 )
             } else {
                 (None, None)
@@ -411,6 +411,10 @@ impl Parser<'_> {
                     dim_pos,
                     "'[*]' not allowed in other than function prototype scope",
                 );
+            } else {
+                // Allowed only if no body follows this list, which is not
+                // known yet.
+                self.star_in_params.get_or_insert(dim_pos);
             }
             return Ok(Extent::Runtime);
         }
@@ -631,7 +635,16 @@ impl Parser<'_> {
         // that it is balanced however the inner parse exits. It used to be left
         // open on the `?` paths and on the trailing-comma `return Err`.
         self.symbols.enter_scope();
-        let result = self.parse_parameter_list_inner();
+        self.param_list_depth += 1;
+        // A nested list -- a parameter that is a pointer to a function --
+        // keeps its `[*]` to itself.
+        let enclosing_star = self.star_in_params.take();
+        let result = self.parse_parameter_list_inner().map(|mut list| {
+            list.star = self.star_in_params;
+            list
+        });
+        self.star_in_params = enclosing_star;
+        self.param_list_depth -= 1;
         self.symbols.leave_scope();
         self.pending_alignas = saved_align;
         self.pending_alignas_kw = saved_align_kw;
@@ -655,6 +668,7 @@ impl Parser<'_> {
                 params,
                 variadic,
                 prototyped: false,
+                star: None,
             });
         }
 
@@ -667,6 +681,7 @@ impl Parser<'_> {
                     params,
                     variadic,
                     prototyped: true,
+                    star: None,
                 });
             }
             // Not just void, backtrack
@@ -815,6 +830,7 @@ impl Parser<'_> {
                         params,
                         variadic,
                         prototyped: true,
+                        star: None,
                     });
                 }
                 // An unnamed `void` among other parameters is no parameter
@@ -892,6 +908,7 @@ impl Parser<'_> {
             params,
             variadic,
             prototyped,
+            star: None,
         })
     }
 }

@@ -13,6 +13,10 @@ libc.workspace = true
 errno.workspace = true
 gettext-rs.workspace = true
 
+# Formats times on Windows, which has no strftime(3) of its own (timefmt.rs).
+[target.'cfg(windows)'.dependencies]
+chrono.workspace = true
+
 # Compiles the vendored musl regex for a Windows target (see build.rs). Not
 # under [target.'cfg(windows)'.build-dependencies]: Cargo matches that against
 # the host, so a Linux host cross-building for Windows would not get it.

@@ -46,8 +46,8 @@
 //!
 //! Every public function splits ASCII from the rest the same way on both
 //! platforms; only the private helpers that answer each half are per-platform.
-//! [`strftime`] stays Unix-only: it needs `localtime_r` and `LC_TIME`, and
-//! plib carries no date library to replace them.
+//! [`strftime`] formats with [`crate::timefmt`]: `TZ` as the C runtime reads
+//! it, and the POSIX locale's names, `LC_TIME` having no Windows meaning.
 
 use std::ffi::CString;
 #[cfg(unix)]
@@ -682,6 +682,12 @@ pub fn strftime(fmt: &str, epoch_secs: i64) -> io::Result<String> {
         }
         buf.resize(buf.len() * 2, 0);
     }
+}
+
+/// Format a unix epoch timestamp in local time; see [`crate::timefmt`].
+#[cfg(windows)]
+pub fn strftime(fmt: &str, epoch_secs: i64) -> std::io::Result<String> {
+    crate::timefmt::format_time(fmt, epoch_secs, false)
 }
 
 /// Return `true` if `response` is an affirmative answer under the current `LC_MESSAGES`.

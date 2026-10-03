@@ -15,6 +15,17 @@
 // host's copy work in the first place.
 //
 
+/*
+ * A hosted glibc build uses the C library's own <stdint.h>, as gcc's does:
+ * glibc's headers include <stdint.h> expecting it to bring in <features.h>
+ * and <sys/cdefs.h> (`__BEGIN_DECLS`, `__THROW`, `__flexarr`), and
+ * <sys/eventfd.h>, <sys/inotify.h> and others include nothing else. Its guard
+ * is also `_STDINT_H`, so this test must come before the one below.
+ */
+#if __STDC_HOSTED__ && defined(__GLIBC__) && !defined(_STDINT_H)
+#include_next <stdint.h>
+#endif
+
 #ifndef _STDINT_H
 #define _STDINT_H
 

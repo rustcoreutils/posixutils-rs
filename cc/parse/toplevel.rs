@@ -11,7 +11,8 @@
 //
 
 use super::ast::{
-    ExternalDecl, FunctionAttrs, FunctionDef, ParamStyle, Parameter, Stmt, TranslationUnit,
+    ExprKind, ExternalDecl, FunctionAttrs, FunctionDef, ParamStyle, Parameter, Stmt,
+    TranslationUnit,
 };
 use super::bind::{DeclScope, DeclSpecs};
 use super::declaration::{Redeclared, SpecContext};
@@ -22,7 +23,7 @@ use super::parser::{
 use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::Symbol;
-use crate::token::lexer::{payload_text, Position, TokenType, TokenValue};
+use crate::token::lexer::{payload_text, Position, TokenType};
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
 
 impl Parser<'_> {
@@ -91,20 +92,27 @@ impl Parser<'_> {
         // Check for optional message (C23 allows omitting it)
         let message = if self.is_special(b',') {
             self.advance(); // consume ','
-                            // Expect string literal
-            if self.peek() != TokenType::String {
+                            // A string literal, which translation phase 6 has already made of
+                            // any adjacent ones: `"a" "b"` is one literal, as the
+                            // `BUILD_BUG_ON`-style macros that paste a message together rely
+                            // on. Any encoding prefix is allowed; only a narrow message is
+                            // shown.
+            if !matches!(
+                self.peek(),
+                TokenType::String
+                    | TokenType::WideString
+                    | TokenType::Utf16String
+                    | TokenType::Utf32String
+            ) {
                 return Err(ParseError::new(
                     "expected string literal in _Static_assert",
                     self.current_pos(),
                 ));
             }
-            let msg = if let TokenValue::String(s) = &self.current().value {
-                payload_text(s)
-            } else {
-                String::new()
-            };
-            self.advance(); // consume string
-            msg
+            match self.parse_string_literal_run()?.kind {
+                ExprKind::StringLit(bytes) => payload_text(&bytes),
+                _ => String::new(),
+            }
         } else {
             // C23: no message provided
             String::new()

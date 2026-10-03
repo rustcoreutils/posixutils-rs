@@ -6419,7 +6419,11 @@ fn test_bcopy_and_mempcpy_declarations() {
 
 /// Parse `decls` and a function `t` whose one statement is `stmt`, then hand
 /// that statement's expression to `f` along with the parser that built it.
-fn with_statement_expr<R>(decls: &str, stmt: &str, f: impl FnOnce(&mut Parser, &Expr) -> R) -> R {
+pub(super) fn with_statement_expr<R>(
+    decls: &str,
+    stmt: &str,
+    f: impl FnOnce(&mut Parser, &Expr) -> R,
+) -> R {
     let src = format!("{decls}\nvoid t(void) {{ {stmt}; }}");
     let mut strings = StringTable::new();
     let mut tokenizer = Tokenizer::new(src.as_bytes(), 0, &mut strings);

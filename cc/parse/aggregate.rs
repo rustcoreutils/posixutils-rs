@@ -520,6 +520,14 @@ impl Parser<'_> {
         let mut members = Vec::with_capacity(DEFAULT_MEMBER_CAPACITY);
 
         while !self.is_special(b'}') && !self.is_eof() {
+            // A stray `;` -- `int a;;` or a member list that opens with one.
+            // The grammar has no empty member declaration, but gcc accepts it
+            // (warning only under -pedantic), and <linux/nfc.h> has one.
+            if self.is_special(b';') {
+                self.advance();
+                continue;
+            }
+
             // Check for _Static_assert in struct (C11 6.7.2.1p1)
             if self.is_static_assert() {
                 self.parse_static_assert()?;
@@ -587,34 +595,9 @@ impl Parser<'_> {
                 continue;
             }
 
-            // Check for unnamed bitfield (starts with ':')
-            if self.is_special(b':') {
-                // Unnamed bitfield: parse width only
-                self.advance(); // consume ':'
-                let width = self.parse_bitfield_width()?;
-                // An unnamed bit-field is still a bit-field: its type has
-                // to be one a bit-field may have, and its width has to fit.
-                // Neither unnamed site validated anything, so
-                // `struct { float : 3; }` was accepted.
-                self.validate_bitfield(member_base_type_id, width, false)?;
-
-                members.push(StructMember {
-                    name: StringId::EMPTY,
-                    typ: member_base_type_id,
-                    offset: 0,
-                    bit_offset: None,
-                    bit_width: Some(width),
-                    access_bytes: None,
-                    align: MemberAlign::NATURAL, // padding: nothing written aligns it
-                });
-
-                self.expect_special(b';')?;
-                continue;
-            }
-
             loop {
-                // Check for unnamed bitfield (can appear after ',' too)
-                // e.g., "int a : 1, : 2, b : 3;"
+                // An unnamed bit-field, first in the list or after a comma:
+                // `int a : 1, : 2, b : 3;` and `unsigned char :1, :1, x:1;`
                 if self.is_special(b':') {
                     // Unnamed bitfield: parse width only
                     self.advance(); // consume ':'
@@ -833,11 +816,14 @@ impl Parser<'_> {
             return;
         }
         // A named member has to precede it: the array is a tail on something,
-        // and a struct that is nothing but a tail has no size to speak of.
+        // and a struct that is nothing but a tail has no size to speak of. An
+        // anonymous structure or union counts -- its members are members of
+        // this struct (C17 6.7.2.1p13), as <linux/bpf.h> relies on -- and only
+        // an unnamed bit-field, which is padding, does not.
         if members
             .iter()
             .take(first)
-            .all(|m| m.name == StringId::EMPTY)
+            .all(|m| m.name == StringId::EMPTY && m.bit_width.is_some())
         {
             diag::error(
                 pos,

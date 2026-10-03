@@ -1613,7 +1613,7 @@ impl<'a> Parser<'a> {
     /// C11 6.4.5p5: if any literal in the run has an encoding prefix, the
     /// result takes that encoding; a run mixing two *different* prefixes is a
     /// constraint violation (6.4.5p2).
-    fn parse_string_literal_run(&mut self) -> ParseResult<Expr> {
+    pub(super) fn parse_string_literal_run(&mut self) -> ParseResult<Expr> {
         let start_pos = self.current_pos();
         // Elements of the concatenated literal, still distinguishing a byte
         // from a named character so each encoding can ask for what it needs.

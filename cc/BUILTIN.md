@@ -400,6 +400,17 @@ open-coded, and divide uses Smith's method with truncating steps, exactly as
 gcc does, so `(-9 + 38i) / (5 + 6i)` is `6 + 1i`. `_Complex __int128` is
 32 bytes and travels in memory on both targets.
 
+## GNU Vectors
+
+| Builtin | Notes |
+|---------|-------|
+| `__builtin_shuffle(a, mask)`, `__builtin_shuffle(a, b, mask)` | `ExprKind::VectorShuffle` with a mask: lane `k` of the result, of `a`'s type, is lane `mask[k]` of `a` followed by `b`, the index taken modulo the lanes there are. The mask's lanes are integers as wide and as many as the operands' |
+| `__builtin_shufflevector(a, b, i...)` | `ExprKind::VectorShuffle` with constant indices into `a` followed by `b` -- which may differ in length -- or `-1` for a lane of any value (zero). The result has one lane of the operands' element type per index, a power of two of them |
+| `__builtin_convertvector(v, T)` | `ExprKind::ConvertVector`: each lane converted as a cast converts it, to the lane type of the vector type `T`, which has as many lanes |
+
+All three are lowered lane by lane in `ir/linearize_vector.rs`, and their
+constraints are gcc's, in gcc's words (`parse/vector_builtin.rs`).
+
 ## Checked Arithmetic
 
 C23 spells the generic three `ckd_add`, `ckd_sub`, `ckd_mul`. Each computes
@@ -452,7 +463,7 @@ implicit declaration of one of these names takes the row's return type.
 | `__builtin_printf`, `sprintf`, `snprintf`, `fprintf`, `puts`, `putchar`, `fputs`, `fputc`, `fwrite` | |
 | `__builtin_printf_unlocked`, `fprintf_unlocked`, `fputs_unlocked` | glibc defines none of these; a program using one supplies it (gcc.c-torture's `builtins/` tests do) |
 | `__builtin_pow`, `fmod`, `atan2`, `hypot`, `fdim`, `remainder`, `nextafter` and `f`/`l` forms | |
-| `__builtin_cbrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `exp`, `exp2`, `expm1`, `log`, `log2`, `log10`, `log1p`, `logb`, `tgamma`, `lgamma`, `erf`, `erfc` and `f`/`l` forms | |
+| `__builtin_cbrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `exp`, `exp2`, `expm1`, `log`, `log2`, `log10`, `log1p`, `logb`, `ilogb`, `tgamma`, `lgamma`, `erf`, `erfc` and `f`/`l` forms | |
 | `__builtin_modf`, `frexp`, `ldexp` and `f`/`l` forms | The second parameter is a pointer or an `int` |
 | `__builtin_ceill`, `floorl`, `truncl`, `roundl`, `rintl`, `nearbyintl`, `fminl`, `fmaxl`, `fmal` | The `long double` forms of functions computed in place |
 

@@ -652,6 +652,17 @@ impl Expr {
     }
 }
 
+/// Which lanes a vector shuffle takes; see [`ExprKind::VectorShuffle`].
+#[derive(Debug, Clone)]
+pub enum ShuffleSelector {
+    /// `__builtin_shuffle`'s mask: a vector of integer lanes, each taken
+    /// modulo the number of lanes the operands hold.
+    Mask(Box<Expr>),
+    /// `__builtin_shufflevector`'s constant indices; `None` is `-1`, a lane
+    /// whose value is unspecified.
+    Indices(Vec<Option<u32>>),
+}
+
 /// Expression kinds (variants)
 #[derive(Debug, Clone)]
 pub enum ExprKind {
@@ -1140,6 +1151,21 @@ pub enum ExprKind {
     Unreachable,
 
     /// __builtin_complex(real, imag) — construct complex value from two reals
+    /// `__builtin_shuffle(a, mask)`, `__builtin_shuffle(a, b, mask)` and
+    /// `__builtin_shufflevector(a, b, i...)`: a vector whose lane `k` is
+    /// lane `index(k)` of `first` followed by `second`.
+    VectorShuffle {
+        first: Box<Expr>,
+        second: Option<Box<Expr>>,
+        selector: ShuffleSelector,
+    },
+
+    /// `__builtin_convertvector(value, T)`: each lane of the vector `value`
+    /// converted to the lane type of the vector type `T`, the expression's.
+    ConvertVector {
+        value: Box<Expr>,
+    },
+
     BuiltinComplex {
         real: Box<Expr>,
         imag: Box<Expr>,
@@ -1958,6 +1984,19 @@ impl Expr {
             | K::ReturnAddress { .. }
             | K::OffsetOf { .. } => Vec::new(),
             K::StmtExpr { result, .. } => vec![result],
+            K::ConvertVector { value } => vec![value],
+            K::VectorShuffle {
+                first,
+                second,
+                selector,
+            } => {
+                let mut v: Vec<&Expr> = vec![first];
+                v.extend(second.as_deref());
+                if let ShuffleSelector::Mask(mask) = selector {
+                    v.push(mask);
+                }
+                v
+            }
             K::VmTypeName { dims, expr, .. } => dims.iter().chain([&**expr]).collect(),
             K::Unary { operand: a, .. }
             | K::PostInc(a)

@@ -145,3 +145,14 @@ fn test_vector_parameters_are_not_adjusted() {
     let rejected = parse_tu_for(small, &aarch64).is_err() || crate::diag::error_count() > before;
     assert!(rejected, "a vector of one float on aarch64");
 }
+
+#[test]
+fn test_vector_builtins_type_as_gcc() {
+    let src = format!(
+        "{TYPES} v4si a; v4sf f; v2si d;\
+         _Static_assert(_Generic(__builtin_shuffle(f, a), v4sf: 1, default: 0), \"shuffle\");\
+         _Static_assert(sizeof(__builtin_shufflevector(a, d, 0, 5)) == 8, \"two lanes\");\
+         _Static_assert(_Generic(__builtin_convertvector(a, v4sf), v4sf: 1, default: 0), \"convert\");"
+    );
+    parse_tu_for(&src, &x86_linux()).unwrap();
+}

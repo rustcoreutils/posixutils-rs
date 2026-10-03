@@ -121,11 +121,10 @@ Supported:
 
 Not yet implemented:
 - assembly peephole optimizations
-- the SIMD intrinsic headers (`immintrin.h` and friends), and
-  `__builtin_shuffle` / `__builtin_convertvector`. `vector_size` values are
-  computed lane by lane and passed and returned as gcc passes them, but for
-  a vector of floating lanes four bytes wide or less, which no type here
-  travels like
+- the SIMD intrinsic headers (`immintrin.h` and friends). `vector_size`
+  values are computed lane by lane, shuffled and converted with gcc's
+  builtins, and passed and returned as gcc passes them, but for a vector of
+  floating lanes four bytes wide or less, which no type here travels like
 
 Will not implement:
 - `__auto_type`; nested functions and `__label__`. Clang refuses nested

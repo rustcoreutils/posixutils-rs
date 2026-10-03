@@ -250,3 +250,72 @@ fn vector_operand_constraints() {
         );
     }
 }
+
+/// `__builtin_shuffle` (one or two operands, a run-time mask taken modulo
+/// the lanes), `__builtin_shufflevector` (constant indices, operands of
+/// different lengths, a result of a new length) and
+/// `__builtin_convertvector`.
+#[test]
+fn vector_shuffle_and_convert_builtins() {
+    run(
+        "vec_shuffle",
+        r#"
+typedef int v8si __attribute__((vector_size(32)));
+typedef char v16qi __attribute__((vector_size(16)));
+int main(void) {
+    v4si a = {10, 20, 30, 40}, b = {50, 60, 70, 80};
+    v4si m1 = {3, 2, 1, 0}, m2 = {0, 5, 2, 7}, mw = {4, 9, -1, 13};
+    v4su um = {1, 1, 6, 6};
+    v4sf f = {1.5f, -2.5f, 3.75f, 9.75f};
+    C4(__builtin_shuffle(a, m1), 40, 30, 20, 10);
+    C4(__builtin_shuffle(a, b, m2), 10, 60, 30, 80);
+    C4(__builtin_shuffle(a, mw), 10, 20, 40, 20);
+    C4(__builtin_shuffle(a, b, mw), 50, 20, 80, 60);
+    C4(__builtin_shuffle(a, b, um), 20, 20, 70, 70);
+    C4(__builtin_shuffle(f, m1), 9.75f, 3.75f, -2.5f, 1.5f);
+    C4(__builtin_shufflevector(a, b, 7, 0, 5, 2), 80, 10, 60, 30);
+    v2si half = __builtin_shufflevector(a, a, 1, 3);
+    C2(half, 20, 40);
+    v2si d = {1, 2};
+    C4(__builtin_shufflevector(a, d, 0, 4, 5, 3), 10, 1, 2, 40);
+    v8si wide = __builtin_shufflevector(a, a, 0, 1, 2, 3, 0, 1, 2, 3);
+    if (sizeof wide != 32 || wide[5] != 20) return 90;
+    C4(__builtin_convertvector(f, v4si), 1, -2, 3, 9);
+    C4(__builtin_convertvector(a, v4sf), 10, 20, 30, 40);
+    v2df dd = __builtin_convertvector(half, v2df);
+    C2(dd, 20, 40);
+    v16qi bytes = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    v16qi rev = {15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0};
+    v16qi r = __builtin_shuffle(bytes, rev);
+    if (r[0] != 16 || r[7] != 9 || r[15] != 1) return 91;
+    int k = 2;
+    m1[0] = k;
+    C4(__builtin_shuffle(a, m1), 30, 30, 20, 10);
+    return 0;
+}
+"#,
+    );
+}
+
+#[test]
+fn vector_builtin_constraints() {
+    for (name, expr, expected) in [
+        ("shuf_float_mask", "__builtin_shuffle(a, f)", "'__builtin_shuffle' last argument must be an integer vector"),
+        ("shuf_count", "__builtin_shuffle(a, l2)", "number of elements of the argument vector(s) and the mask vector should be the same"),
+        ("shuf_types", "__builtin_shuffle(a, f, a)", "'__builtin_shuffle' argument vectors must be of the same type"),
+        ("shuf_scalar", "__builtin_shuffle(l, a)", "'__builtin_shuffle' arguments must be vectors"),
+        ("sv_index", "__builtin_shufflevector(a, a, 0, 8)", "invalid element index '8' to '__builtin_shufflevector'"),
+        ("sv_pow2", "__builtin_shufflevector(a, a, 0, 1, 2)", "must specify a result with a power of two number of elements"),
+        ("sv_lane", "__builtin_shufflevector(a, f, 0, 1)", "argument vectors must have the same element type"),
+        ("cv_count", "__builtin_convertvector(a, v2si)", "number of elements of the first argument vector and the second argument vector type should be the same"),
+        ("cv_scalar", "__builtin_convertvector(a, int)", "second argument must be an integer or floating vector type"),
+    ] {
+        compile_expect_error(
+            name,
+            &format!(
+                "{PRELUDE}void g(long l) {{ v4si a = {{0}}; v4sf f = {{0}}; v2si l2 = {{0}}; (void)({expr}); }}\n"
+            ),
+            expected,
+        );
+    }
+}

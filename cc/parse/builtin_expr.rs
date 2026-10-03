@@ -2202,6 +2202,9 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_LOGB
                 | crate::kw::BUILTIN_LOGBF
                 | crate::kw::BUILTIN_LOGBL
+                | crate::kw::BUILTIN_ILOGB
+                | crate::kw::BUILTIN_ILOGBF
+                | crate::kw::BUILTIN_ILOGBL
                 | crate::kw::BUILTIN_TGAMMA
                 | crate::kw::BUILTIN_TGAMMAF
                 | crate::kw::BUILTIN_TGAMMAL

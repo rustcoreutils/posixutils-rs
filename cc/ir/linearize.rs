@@ -2689,7 +2689,9 @@ impl<'a> Linearizer<'a> {
             | ExprKind::C11AtomicFetchXor { .. }
             | ExprKind::C11AtomicThreadFence { .. }
             | ExprKind::C11AtomicSignalFence { .. }
-            | ExprKind::BuiltinComplex { .. } => false,
+            | ExprKind::BuiltinComplex { .. }
+            | ExprKind::VectorShuffle { .. }
+            | ExprKind::ConvertVector { .. } => false,
         }
     }
 
@@ -6717,6 +6719,20 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::BuiltinComplex { real, imag } => {
                 self.linearize_builtin_complex(real, imag, expr)
+            }
+
+            ExprKind::VectorShuffle {
+                first,
+                second,
+                selector,
+            } => {
+                let result_typ = self.expr_type(expr);
+                self.linearize_vector_shuffle(first, second.as_deref(), selector, result_typ)
+            }
+
+            ExprKind::ConvertVector { value } => {
+                let result_typ = self.expr_type(expr);
+                self.linearize_convert_vector(value, result_typ)
             }
         }
     }

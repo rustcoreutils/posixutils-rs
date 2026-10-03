@@ -20,7 +20,7 @@ use super::linearize::{BlockVolatility, Linearizer};
 use super::{Instruction, PseudoId};
 use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::float::FloatVal;
-use crate::parse::ast::{AssignOp, BinaryOp, Expr, UnaryOp};
+use crate::parse::ast::{AssignOp, BinaryOp, Expr, ShuffleSelector, UnaryOp};
 use crate::types::{TypeId, TypeKind};
 
 /// Where an operand's lane `i` comes from.
@@ -171,6 +171,99 @@ impl Linearizer<'_> {
         }
     }
 
+    /// `__builtin_shuffle` and `__builtin_shufflevector`: lane `k` of the
+    /// result is lane `index(k)` of `first` followed by `second`. A mask
+    /// lane is taken modulo the lanes the operands hold together, as gcc
+    /// does; a `-1` index of `__builtin_shufflevector` gives zero.
+    pub(crate) fn linearize_vector_shuffle(
+        &mut self,
+        first: &Expr,
+        second: Option<&Expr>,
+        selector: &ShuffleSelector,
+        result_typ: TypeId,
+    ) -> PseudoId {
+        let (lane, count, size) = self.vector_shape(result_typ);
+        let in_typ = self.expr_type(first);
+        let (_, in_count, _) = self.vector_shape(in_typ);
+        let a = self.vector_addr(first);
+        let b = second.map(|e| self.vector_addr(e));
+        let mask = match selector {
+            ShuffleSelector::Mask(m) => {
+                Some((self.vector_addr(m), self.vector_shape(self.expr_type(m))))
+            }
+            ShuffleSelector::Indices(_) => None,
+        };
+        let result = self.frame_temp_addr("__vec", result_typ);
+        let bits = self.types.size_bits(lane);
+        let long = self.types.long_id;
+        for k in 0..count {
+            let value = match (selector, mask) {
+                (ShuffleSelector::Indices(indices), _) => match indices[k] {
+                    None => self.emit_const(0, lane),
+                    Some(i) => {
+                        let i = i as usize;
+                        // The operands may differ in length.
+                        let (base, i) = if i < in_count {
+                            (a, i)
+                        } else {
+                            (b.unwrap_or(a), i - in_count)
+                        };
+                        self.load_lane(base, i as i64 * size, lane)
+                    }
+                },
+                (ShuffleSelector::Mask(_), Some((maddr, (mlane, _, msize)))) => {
+                    // The index, wrapped to the lanes there are.
+                    let m = self.load_lane(maddr, k as i64 * msize, mlane);
+                    let m = self.emit_convert(m, mlane, long);
+                    let total = if b.is_some() { 2 * in_count } else { in_count };
+                    let wrap = self.emit_const(total as i128 - 1, long);
+                    let idx = self.emit_binary(BinaryOp::BitAnd, m, wrap, long, long);
+                    let within = self.emit_const(in_count as i128 - 1, long);
+                    let lane_idx = self.emit_binary(BinaryOp::BitAnd, idx, within, long, long);
+                    let stride = self.emit_const(size as i128, long);
+                    let offset = self.emit_binary(BinaryOp::Mul, lane_idx, stride, long, long);
+                    let from_a = self.lane_at(a, offset, lane);
+                    match b {
+                        None => from_a,
+                        Some(b) => {
+                            let from_b = self.lane_at(b, offset, lane);
+                            let n = self.emit_const(in_count as i128, long);
+                            let high = self.emit_binary(BinaryOp::BitAnd, idx, n, long, long);
+                            let zero = self.emit_const(0, long);
+                            let int = self.types.int_id;
+                            let in_b = self.emit_binary(BinaryOp::Ne, high, zero, int, long);
+                            let chosen = self.alloc_reg_pseudo();
+                            self.emit(Instruction::select(
+                                chosen, in_b, from_b, from_a, lane, bits,
+                            ));
+                            chosen
+                        }
+                    }
+                }
+                (ShuffleSelector::Mask(_), None) => unreachable!("a mask has an address"),
+            };
+            self.emit(Instruction::store(
+                value,
+                result,
+                k as i64 * size,
+                lane,
+                bits,
+            ));
+        }
+        result
+    }
+
+    /// `__builtin_convertvector`: each lane converted, as by a cast.
+    pub(crate) fn linearize_convert_vector(
+        &mut self,
+        value: &Expr,
+        result_typ: TypeId,
+    ) -> PseudoId {
+        let from_typ = self.expr_type(value);
+        let src = self.vector_addr(value);
+        self.convert_vector_at(src, from_typ, result_typ)
+    }
+
     /// The vector at `src`, of type `from_typ`, with each lane converted to
     /// those of `result_typ`, as by a cast.
     fn convert_vector_at(
@@ -197,6 +290,13 @@ impl Linearizer<'_> {
         let value = self.alloc_reg_pseudo();
         self.emit(Instruction::load(value, addr, offset, lane, bits));
         value
+    }
+
+    /// The lane of type `lane` at `addr` plus the run-time byte `offset`.
+    fn lane_at(&mut self, addr: PseudoId, offset: PseudoId, lane: TypeId) -> PseudoId {
+        let long = self.types.long_id;
+        let at = self.emit_binary(BinaryOp::Add, addr, offset, long, long);
+        self.load_lane(at, 0, lane)
     }
 
     /// The lane type, lane count and lane size in bytes of vector `typ`.

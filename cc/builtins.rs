@@ -164,6 +164,9 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_log1pf",
     "__builtin_log1pl",
     "__builtin_logb",
+    "__builtin_ilogb",
+    "__builtin_ilogbf",
+    "__builtin_ilogbl",
     "__builtin_logbf",
     "__builtin_logbl",
     "__builtin_tgamma",
@@ -381,6 +384,10 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_signbitl",
     // Complex construction, used by <complex.h> for I and the CMPLX macros
     "__builtin_complex",
+    // GNU vectors
+    "__builtin_shuffle",
+    "__builtin_shufflevector",
+    "__builtin_convertvector",
     // NaN constants
     "__builtin_nan",
     "__builtin_nanf",

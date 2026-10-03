@@ -124,6 +124,9 @@ impl Parser<'_> {
         name_id: StringId,
         pos: Position,
     ) -> Option<ParseResult<Expr>> {
+        if let Some(call) = self.parse_vector_builtin(name_id, pos) {
+            return Some(call);
+        }
         if let Some(&(_, test, param)) = FP_TESTS.iter().find(|row| row.0 == name_id) {
             return Some(self.parse_fp_test(name_id, test, param, pos));
         }

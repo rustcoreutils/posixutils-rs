@@ -32,6 +32,7 @@ pub mod parser;
 mod statement;
 mod toplevel;
 mod typename;
+mod vector_builtin;
 mod vector_check;
 
 #[cfg(test)]

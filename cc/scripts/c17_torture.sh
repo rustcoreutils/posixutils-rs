@@ -654,12 +654,9 @@ OUT_OF_SCOPE_ISSIGNALING=" ieee/builtin-issignaling-1 \
  ieee/float32-builtin-issignaling-1 ieee/float32x-builtin-issignaling-1 \
  ieee/float64-builtin-issignaling-1 ieee/float64x-builtin-issignaling-1 "
 
-# Vector values c17 does not have yet: `__builtin_shuffle`,
-# `__builtin_shufflevector` and `__builtin_convertvector`, and a vector of
-# floating lanes four bytes wide or less at a call boundary, which gcc passes
-# like no type c17 has. Every other vector operation runs.
-OUT_OF_SCOPE_VECTOR_ARITH=" compile/pr108892 compile/pr52750 compile/pr96426 \
- execute/pr85331 execute/pr94591 ieee/fp-cmp-cond-1 "
+# A vector of floating lanes four bytes wide or less at a call boundary,
+# which gcc passes like no type c17 has. Every other vector operation runs.
+OUT_OF_SCOPE_VECTOR_ARITH=" ieee/fp-cmp-cond-1 "
 
 # `__label__`, a block-scope label declaration. cc/DECISIONS.md rules it out
 # together with nested functions, which are what it exists for.

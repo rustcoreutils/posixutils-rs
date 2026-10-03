@@ -19,7 +19,7 @@ use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId, SymbolKind};
 use crate::token::lexer::Position;
-use crate::types::{Type, TypeId, TypeKind, TypeModifiers, TypeTable};
+use crate::types::{FloatClass, Type, TypeId, TypeKind, TypeModifiers, TypeTable};
 use gettextrs::gettext;
 
 /// C17 6.7.2p2: the type specifiers must together name one of a
@@ -168,7 +168,17 @@ impl<'a> SpecifierTally<'a> {
         if let (Some(pos), Some(data)) = (self.complex, data_type) {
             let base_ok = matches!(
                 data,
-                "float" | "double" | "char" | "int" | "__int128" | "_Float16" | "__float128"
+                "float"
+                    | "double"
+                    | "char"
+                    | "int"
+                    | "__int128"
+                    | "_Float16"
+                    | "_Float32"
+                    | "_Float64"
+                    | "_Float32x"
+                    | "_Float64x"
+                    | "__float128"
             );
             if !base_ok {
                 diag::error_args(
@@ -829,6 +839,8 @@ impl<'a> Parser<'a> {
         let idents: &'a crate::strings::StringTable = self.idents;
         let mut modifiers = TypeModifiers::empty();
         let mut base_kind: Option<TypeKind> = None;
+        // Which `_FloatN`/`_FloatNx` name, if any, gave `base_kind`.
+        let mut float_class = FloatClass::Standard;
         let mut resolved: Option<Resolved> = None;
         let mut vm_dims = Vec::new();
         // Where `_Atomic` was written, for the constraint checked at the end.
@@ -1053,23 +1065,38 @@ impl<'a> Parser<'a> {
                     self.advance();
                     base_kind = Some(TypeKind::Float16);
                 }
-                crate::kw::FLOAT32 => {
-                    // _Float32 is an alias for float (TS 18661-3 / C23)
+                // C23's interchange and extended types (TS 18661-3): the
+                // format of a standard type, under a name of their own --
+                // see `FloatClass`.
+                crate::kw::FLOAT32
+                | crate::kw::FLOAT64
+                | crate::kw::FLOAT32X
+                | crate::kw::FLOAT64X => {
                     if tally.alias_is_declarator_name() {
                         break;
                     }
-                    tally.note_data_type("float", pos);
-                    self.advance();
-                    base_kind = Some(TypeKind::Float);
-                }
-                crate::kw::FLOAT64 => {
-                    // _Float64 is an alias for double (TS 18661-3 / C23)
-                    if tally.alias_is_declarator_name() {
-                        break;
+                    let (spelled, kind, class) = match name_id {
+                        crate::kw::FLOAT32 => {
+                            ("_Float32", TypeKind::Float, FloatClass::Interchange)
+                        }
+                        crate::kw::FLOAT64 => {
+                            ("_Float64", TypeKind::Double, FloatClass::Interchange)
+                        }
+                        crate::kw::FLOAT32X => {
+                            ("_Float32x", TypeKind::Double, FloatClass::Extended)
+                        }
+                        _ => ("_Float64x", TypeKind::LongDouble, FloatClass::Extended),
+                    };
+                    if kind == TypeKind::LongDouble && !self.types.has_float64x() {
+                        return Err(ParseError::new(
+                            "_Float64x is not supported on this target",
+                            pos,
+                        ));
                     }
-                    tally.note_data_type("double", pos);
+                    tally.note_data_type(spelled, pos);
                     self.advance();
-                    base_kind = Some(TypeKind::Double);
+                    base_kind = Some(kind);
+                    float_class = class;
                 }
                 crate::kw::FLOAT128 | crate::kw::FLOAT128_ALIAS => {
                     // IEEE binary128. `_Float128` is the C23/TS 18661-3
@@ -1284,7 +1311,13 @@ impl<'a> Parser<'a> {
                     }
                     None => TypeKind::Int,
                 };
-                (Type::with_modifiers(kind, modifiers), None)
+                (
+                    Type {
+                        float_class,
+                        ..Type::with_modifiers(kind, modifiers)
+                    },
+                    None,
+                )
             }
         };
 

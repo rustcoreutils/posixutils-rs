@@ -359,14 +359,14 @@ pub fn get_misc_macros(_target: &Target) -> Vec<(&'static str, &'static str)> {
 }
 
 /// Get floating-point limit macros (IEEE 754)
-pub fn get_float_limit_macros(target: &Target) -> Vec<(&'static str, &'static str)> {
+pub fn get_float_limit_macros(target: &Target) -> Vec<(String, String)> {
     // `long double` is three different types across our targets, and these
     // macros are the only description of it a program gets. Hardcoding the
     // x86_64 values everywhere told macOS/aarch64 code that LDBL_EPSILON was
     // 1.08e-19 when the type is really a 64-bit double, so `1.0L + LDBL_EPSILON`
     // compared equal to 1.0L and <float.h> was simply lying.
-    let ldbl = LongDoubleLimits::for_target(target);
-    let mut macros: Vec<(&'static str, &'static str)> = vec![
+    let ldbl = FormatLimits::long_double(target);
+    let fixed: Vec<(&'static str, &'static str)> = vec![
         // Float16 (16-bit IEEE 754 binary16, half precision)
         (
             "__FLT16_MIN__",
@@ -435,26 +435,29 @@ pub fn get_float_limit_macros(target: &Target) -> Vec<(&'static str, &'static st
         ("__DBL_HAS_DENORM__", "1"),
         ("__DBL_HAS_INFINITY__", "1"),
         ("__DBL_HAS_QUIET_NAN__", "1"),
-        // Long double — see `LongDoubleLimits`.
-        ("__LDBL_MIN__", ldbl.min),
-        ("__LDBL_MAX__", ldbl.max),
-        ("__LDBL_EPSILON__", ldbl.epsilon),
-        ("__LDBL_DENORM_MIN__", ldbl.denorm_min),
-        ("__LDBL_MANT_DIG__", ldbl.mant_dig),
-        ("__LDBL_DIG__", ldbl.dig),
-        ("__LDBL_MIN_EXP__", ldbl.min_exp),
-        ("__LDBL_MAX_EXP__", ldbl.max_exp),
-        ("__LDBL_MIN_10_EXP__", ldbl.min_10_exp),
-        ("__LDBL_MAX_10_EXP__", ldbl.max_10_exp),
-        ("__LDBL_HAS_DENORM__", "1"),
-        ("__LDBL_HAS_INFINITY__", "1"),
-        ("__LDBL_HAS_QUIET_NAN__", "1"),
         // Decimal digits for exact conversion
         ("__FLT_DECIMAL_DIG__", "9"),
         ("__DBL_DECIMAL_DIG__", "17"),
-        ("__LDBL_DECIMAL_DIG__", ldbl.decimal_dig),
         ("__DECIMAL_DIG__", ldbl.decimal_dig),
     ];
+    let mut macros: Vec<(String, String)> = fixed
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+
+    // Long double -- see `FormatLimits::long_double`.
+    macros.extend(ldbl.macros("LDBL", "L"));
+
+    // C23's `_Float32`, `_Float64` and `_Float32x` (TS 18661-3), in the
+    // formats of `float` and `double`; and `_Float64x` in `long double`'s,
+    // where that is wider than `double`. <float.h> and glibc's
+    // <bits/floatn.h> read these.
+    macros.extend(FormatLimits::BINARY32.macros("FLT32", "F32"));
+    macros.extend(FormatLimits::BINARY64.macros("FLT64", "F64"));
+    macros.extend(FormatLimits::BINARY64.macros("FLT32X", "F32x"));
+    if has_float64x(target) {
+        macros.extend(ldbl.macros("FLT64X", "F64x"));
+    }
 
     // __float128 / _Float128 (IEEE 754 binary128, quad precision).
     //
@@ -465,26 +468,17 @@ pub fn get_float_limit_macros(target: &Target) -> Vec<(&'static str, &'static st
     // that have it at all: describing a type the runtime cannot support would
     // have <float.h> advertise an FLT128_* family that fails at link time.
     if has_float128(target) {
-        macros.extend([
-            ("__FLT128_MIN__", "0x1p-16382q"),
-            ("__FLT128_MAX__", "0x1.ffffffffffffffffffffffffffffp+16383q"),
-            ("__FLT128_EPSILON__", "0x1p-112q"),
-            ("__FLT128_DENORM_MIN__", "0x1p-16494q"),
-            ("__FLT128_MANT_DIG__", "113"),
-            ("__FLT128_DIG__", "33"),
-            ("__FLT128_MIN_EXP__", "(-16381)"),
-            ("__FLT128_MAX_EXP__", "16384"),
-            ("__FLT128_MIN_10_EXP__", "(-4931)"),
-            ("__FLT128_MAX_10_EXP__", "4932"),
-            ("__FLT128_HAS_DENORM__", "1"),
-            ("__FLT128_HAS_INFINITY__", "1"),
-            ("__FLT128_HAS_QUIET_NAN__", "1"),
-            ("__FLT128_DECIMAL_DIG__", "36"),
-            ("__SIZEOF_FLOAT128__", "16"),
-        ]);
+        macros.extend(FormatLimits::BINARY128.macros("FLT128", "q"));
+        macros.push(("__SIZEOF_FLOAT128__".to_string(), "16".to_string()));
     }
 
     macros
+}
+
+/// Whether `_Float64x` exists on this target: it needs a format wider than
+/// `double`, which `long double` is everywhere but Apple's aarch64.
+pub fn has_float64x(target: &Target) -> bool {
+    !(target.arch == Arch::Aarch64 && target.os == Os::MacOS)
 }
 
 /// Whether `__float128` exists on this target; see `TypeTable::has_float128`,
@@ -493,13 +487,9 @@ pub fn has_float128(target: &Target) -> bool {
     target.os != Os::MacOS
 }
 
-/// The <float.h> description of `long double`, which is a different type on
-/// each of our targets:
-///
-/// - **x86_64**: the x87 80-bit extended format, padded to 16 bytes.
-/// - **aarch64 Linux/FreeBSD**: IEEE 754 binary128 (true quad precision).
-/// - **aarch64 macOS**: Apple makes `long double` an alias for `double`.
-struct LongDoubleLimits {
+/// The <float.h> description of one binary floating format, from which
+/// every `__<prefix>_*__` family of a type in that format is spelled.
+struct FormatLimits {
     min: &'static str,
     max: &'static str,
     epsilon: &'static str,
@@ -513,57 +503,117 @@ struct LongDoubleLimits {
     decimal_dig: &'static str,
 }
 
-impl LongDoubleLimits {
-    // The float-valued limits are spelled as hex literals, which reach the
-    // target format exactly. As decimal they were rounded through `f64` when
-    // parsed back, so `__LDBL_MAX__` expanded to a literal that had already
-    // become infinity and `__LDBL_MIN__` to one that had become zero.
+impl FormatLimits {
+    // The float-valued limits are spelled as hex literals, without a suffix,
+    // which reach the format exactly once a suffix names a type of it. As
+    // decimal they were rounded through `f64` when parsed back, so
+    // `__LDBL_MAX__` expanded to a literal that had already become infinity
+    // and `__LDBL_MIN__` to one that had become zero.
 
-    fn for_target(target: &Target) -> Self {
+    const BINARY32: Self = Self {
+        min: "0x1p-126",
+        max: "0x1.fffffep+127",
+        epsilon: "0x1p-23",
+        denorm_min: "0x1p-149",
+        mant_dig: "24",
+        dig: "6",
+        min_exp: "(-125)",
+        max_exp: "128",
+        min_10_exp: "(-37)",
+        max_10_exp: "38",
+        decimal_dig: "9",
+    };
+
+    const BINARY64: Self = Self {
+        min: "0x1p-1022",
+        max: "0x1.fffffffffffffp+1023",
+        epsilon: "0x1p-52",
+        denorm_min: "0x1p-1074",
+        mant_dig: "53",
+        dig: "15",
+        min_exp: "(-1021)",
+        max_exp: "1024",
+        min_10_exp: "(-307)",
+        max_10_exp: "308",
+        decimal_dig: "17",
+    };
+
+    const BINARY128: Self = Self {
+        min: "0x1p-16382",
+        max: "0x1.ffffffffffffffffffffffffffffp+16383",
+        epsilon: "0x1p-112",
+        denorm_min: "0x1p-16494",
+        mant_dig: "113",
+        dig: "33",
+        min_exp: "(-16381)",
+        max_exp: "16384",
+        min_10_exp: "(-4931)",
+        max_10_exp: "4932",
+        decimal_dig: "36",
+    };
+
+    const X87_EXTENDED: Self = Self {
+        min: "0x1p-16382",
+        max: "0x1.fffffffffffffffep+16383",
+        epsilon: "0x1p-63",
+        denorm_min: "0x1p-16445",
+        mant_dig: "64",
+        dig: "18",
+        min_exp: "(-16381)",
+        max_exp: "16384",
+        min_10_exp: "(-4931)",
+        max_10_exp: "4932",
+        decimal_dig: "21",
+    };
+
+    /// The format of `long double`, which is a different one on each of
+    /// our targets:
+    ///
+    /// - **x86_64**: the x87 80-bit extended format, padded to 16 bytes.
+    /// - **aarch64 Linux/FreeBSD**: IEEE 754 binary128 (true quad precision).
+    /// - **aarch64 macOS**: Apple makes `long double` an alias for `double`.
+    fn long_double(target: &Target) -> Self {
         match (target.arch, target.os) {
             // Apple aarch64: long double *is* double.
-            (Arch::Aarch64, Os::MacOS) => Self {
-                min: "0x1p-1022L",
-                max: "0x1.fffffffffffffp+1023L",
-                epsilon: "0x1p-52L",
-                denorm_min: "0x1p-1074L",
-                mant_dig: "53",
-                dig: "15",
-                min_exp: "(-1021)",
-                max_exp: "1024",
-                min_10_exp: "(-307)",
-                max_10_exp: "308",
-                decimal_dig: "17",
-            },
+            (Arch::Aarch64, Os::MacOS) => Self::BINARY64,
             // aarch64 elsewhere: IEEE binary128.
-            (Arch::Aarch64, _) => Self {
-                min: "0x1p-16382L",
-                max: "0x1.ffffffffffffffffffffffffffffp+16383L",
-                epsilon: "0x1p-112L",
-                denorm_min: "0x1p-16494L",
-                mant_dig: "113",
-                dig: "33",
-                min_exp: "(-16381)",
-                max_exp: "16384",
-                min_10_exp: "(-4931)",
-                max_10_exp: "4932",
-                decimal_dig: "36",
-            },
+            (Arch::Aarch64, _) => Self::BINARY128,
             // x86_64: x87 80-bit extended.
-            _ => Self {
-                min: "0x1p-16382L",
-                max: "0x1.fffffffffffffffep+16383L",
-                epsilon: "0x1p-63L",
-                denorm_min: "0x1p-16445L",
-                mant_dig: "64",
-                dig: "18",
-                min_exp: "(-16381)",
-                max_exp: "16384",
-                min_10_exp: "(-4931)",
-                max_10_exp: "4932",
-                decimal_dig: "21",
-            },
+            _ => Self::X87_EXTENDED,
         }
+    }
+
+    /// The `__<prefix>_*__` family describing this format, its float-valued
+    /// limits carrying `suffix` so they have the family's type.
+    fn macros(&self, prefix: &str, suffix: &str) -> Vec<(String, String)> {
+        let valued = [
+            ("MIN", self.min),
+            ("MAX", self.max),
+            ("EPSILON", self.epsilon),
+            ("DENORM_MIN", self.denorm_min),
+        ];
+        let counted = [
+            ("MANT_DIG", self.mant_dig),
+            ("DIG", self.dig),
+            ("MIN_EXP", self.min_exp),
+            ("MAX_EXP", self.max_exp),
+            ("MIN_10_EXP", self.min_10_exp),
+            ("MAX_10_EXP", self.max_10_exp),
+            ("DECIMAL_DIG", self.decimal_dig),
+            ("HAS_DENORM", "1"),
+            ("HAS_INFINITY", "1"),
+            ("HAS_QUIET_NAN", "1"),
+        ];
+        let valued = valued
+            .into_iter()
+            .map(|(field, value)| (field, format!("{value}{suffix}")));
+        let counted = counted
+            .into_iter()
+            .map(|(field, value)| (field, value.to_string()));
+        valued
+            .chain(counted)
+            .map(|(field, value)| (format!("__{prefix}_{field}__"), value))
+            .collect()
     }
 }
 

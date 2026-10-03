@@ -453,6 +453,53 @@ impl fmt::Display for TypeKind {
     }
 }
 
+/// Which of C23's families of binary floating types (TS 18661-3) a
+/// floating type of kind `Float`, `Double` or `LongDouble` belongs to.
+///
+/// `_Float32` has `float`'s format and is still a different type: not
+/// compatible with it, a separate `_Generic` association, never promoted
+/// through `...`. glibc's <math.h> lists `float:` and `_Float32:` in one
+/// `_Generic` once the compiler claims gcc 7, so treating the names as
+/// aliases rejects the header. The kind stays the format's, so everything
+/// below the type system -- layout, ABI, code generation -- sees one type.
+/// `_Float16` and `_Float128` have kinds of their own and stay `Standard`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FloatClass {
+    /// `float`, `double`, `long double`.
+    #[default]
+    Standard,
+    /// `_Float32` and `_Float64`.
+    Interchange,
+    /// `_Float32x` and `_Float64x`.
+    Extended,
+}
+
+impl FloatClass {
+    /// The `_FloatN`/`_FloatNx` keyword for a type of this class and `kind`,
+    /// or `None` for the standard types, which their kind spells.
+    pub fn keyword(self, kind: TypeKind) -> Option<&'static str> {
+        match (self, kind) {
+            (FloatClass::Interchange, TypeKind::Float) => Some("_Float32"),
+            (FloatClass::Interchange, TypeKind::Double) => Some("_Float64"),
+            (FloatClass::Extended, TypeKind::Double) => Some("_Float32x"),
+            (FloatClass::Extended, TypeKind::LongDouble) => Some("_Float64x"),
+            _ => None,
+        }
+    }
+
+    /// C23 6.3.1.8p1: of two types with the same format, an interchange type
+    /// wins over a standard one, which wins over an extended one -- gcc's
+    /// reading: `_Float32 + float` is `_Float32`, `_Float32x + double` is
+    /// `double`.
+    fn preference(self) -> u8 {
+        match self {
+            FloatClass::Interchange => 2,
+            FloatClass::Standard => 1,
+            FloatClass::Extended => 0,
+        }
+    }
+}
+
 // Type Representation
 
 /// A C type (compositional structure)
@@ -498,6 +545,10 @@ pub struct Type {
     /// Explicit alignment from __attribute__((aligned(N))) on typedef.
     /// When set, overrides the natural alignment returned by alignment().
     pub explicit_align: Option<u32>,
+
+    /// For a floating kind, which `_FloatN`/`_FloatNx` name, if any, this
+    /// type is; see [`FloatClass`].
+    pub float_class: FloatClass,
 }
 
 impl Default for Type {
@@ -513,6 +564,7 @@ impl Default for Type {
             conv: CallingConv::C,
             composite: None,
             explicit_align: None,
+            float_class: FloatClass::Standard,
         }
     }
 }
@@ -691,8 +743,8 @@ impl Type {
     /// With TypeId interning, base types are compared by TypeId equality.
     /// For full recursive comparison, use TypeTable::types_compatible().
     fn compatible_ignoring_base(&self, other: &Type) -> bool {
-        // Compare kinds first
-        if self.kind != other.kind {
+        // Compare kinds first, and `float` is not `_Float32`.
+        if self.kind != other.kind || self.float_class != other.float_class {
             return false;
         }
 
@@ -889,8 +941,8 @@ impl fmt::Display for Type {
 /// Key for type lookup/deduplication (hashable representation)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum TypeKey {
-    /// Basic type: kind + modifiers
-    Basic(TypeKind, u32),
+    /// Basic type: kind + modifiers + floating class
+    Basic(TypeKind, u32, FloatClass),
     /// Pointer to interned type
     Pointer(TypeId, u32), // base_id, modifiers
     /// Array of interned type
@@ -1235,6 +1287,24 @@ impl TypeTable {
             ));
             table.complex_of.insert(base, cplx);
         }
+        // `_Float32`, `_Float64`, `_Float32x` and `_Float64x`, real and
+        // complex, so `floating` can answer through `&self`.
+        for (kind, class) in [
+            (TypeKind::Float, FloatClass::Interchange),
+            (TypeKind::Double, FloatClass::Interchange),
+            (TypeKind::Double, FloatClass::Extended),
+            (TypeKind::LongDouble, FloatClass::Extended),
+        ] {
+            let real = table.intern(Type {
+                float_class: class,
+                ..Type::basic(kind)
+            });
+            let cplx = table.intern(Type {
+                float_class: class,
+                ..Type::with_modifiers(kind, TypeModifiers::COMPLEX)
+            });
+            table.complex_of.insert(real, cplx);
+        }
         for (real, cplx) in [
             (table.float_id, table.complex_float_id),
             (table.double_id, table.complex_double_id),
@@ -1379,7 +1449,11 @@ impl TypeTable {
                     modifiers: typ.modifiers.bits(),
                 })
             }
-            _ => Some(TypeKey::Basic(typ.kind, typ.modifiers.bits())),
+            _ => Some(TypeKey::Basic(
+                typ.kind,
+                typ.modifiers.bits(),
+                typ.float_class,
+            )),
         }
     }
 
@@ -1787,7 +1861,10 @@ impl TypeTable {
                             }
                         }
                     }
-                    _ => result.push_str(&typ.kind.to_string()),
+                    _ => match typ.float_class.keyword(typ.kind) {
+                        Some(keyword) => result.push_str(keyword),
+                        None => result.push_str(&typ.kind.to_string()),
+                    },
                 }
 
                 // `_Complex` is a modifier, not a kind, so the kind name alone
@@ -1882,10 +1959,11 @@ impl TypeTable {
     /// 32-byte type.
     fn canonical_arithmetic_base(&self, id: TypeId) -> Option<TypeId> {
         let unsigned = self.is_unsigned(id);
-        Some(match self.get(id).kind {
-            TypeKind::Float => self.float_id,
-            TypeKind::Double => self.double_id,
-            TypeKind::LongDouble => self.longdouble_id,
+        let typ = self.get(id);
+        Some(match typ.kind {
+            TypeKind::Float | TypeKind::Double | TypeKind::LongDouble => {
+                self.floating(typ.kind, typ.float_class)
+            }
             TypeKind::Float16 => self.float16_id,
             TypeKind::Float128 => self.float128_id,
             // GNU complex integers. Answering `id` here -- the complex type
@@ -2491,18 +2569,33 @@ impl TypeTable {
             let (l, r) = (self.kind(left), self.kind(right));
             let either = |k| l == k || r == k;
             // Widest first. binary128 outranks x87 extended: equal in range,
-            // wider in the significand.
-            return if either(TypeKind::Float128) {
-                self.pick_complex(complex, self.float128_id, self.complex_float128_id)
-            } else if either(TypeKind::LongDouble) {
-                self.pick_complex(complex, self.longdouble_id, self.complex_longdouble_id)
-            } else if either(TypeKind::Double) {
-                self.pick_complex(complex, self.double_id, self.complex_double_id)
-            } else if either(TypeKind::Float) {
-                self.pick_complex(complex, self.float_id, self.complex_float_id)
+            // wider in the significand. Both are _Float16 if nothing else,
+            // which C23 keeps as itself.
+            let kind = [
+                TypeKind::Float128,
+                TypeKind::LongDouble,
+                TypeKind::Double,
+                TypeKind::Float,
+            ]
+            .into_iter()
+            .find(|&k| either(k))
+            .unwrap_or(TypeKind::Float16);
+            // Then, between two names for that format, the preferred one.
+            let class = [left, right]
+                .into_iter()
+                .filter(|&t| self.kind(t) == kind)
+                .map(|t| self.get(t).float_class)
+                .max_by_key(|c| c.preference())
+                .unwrap_or_default();
+            let real = match kind {
+                TypeKind::Float128 => self.float128_id,
+                TypeKind::Float16 => self.float16_id,
+                _ => self.floating(kind, class),
+            };
+            return if complex {
+                self.complex_of.get(&real).copied().unwrap_or(real)
             } else {
-                // Both are _Float16, which C23 keeps as itself.
-                self.pick_complex(complex, self.float16_id, self.complex_float16_id)
+                real
             };
         }
 
@@ -2633,8 +2726,10 @@ impl TypeTable {
         if self.is_complex(id) {
             return id;
         }
+        // `_Float32` is not `float` and goes as itself (C23 6.5.2.2p6).
         match self.kind(id) {
-            TypeKind::Float | TypeKind::Float16 => self.double_id,
+            TypeKind::Float if self.get(id).float_class == FloatClass::Standard => self.double_id,
+            TypeKind::Float16 => self.double_id,
             _ => self.integer_promote(id),
         }
     }
@@ -2863,6 +2958,28 @@ impl TypeTable {
     /// `Target` is derived from those two.
     pub fn target(&self) -> Target {
         Target::new(self.target_arch, self.target_os)
+    }
+
+    /// The unqualified real floating type of `kind` and `class`: `float`,
+    /// `_Float32x`, ... A class `kind` has no member of falls back to the
+    /// standard type of that kind.
+    pub fn floating(&self, kind: TypeKind, class: FloatClass) -> TypeId {
+        let key = TypeKey::Basic(kind, 0, class);
+        let standard = TypeKey::Basic(kind, 0, FloatClass::Standard);
+        self.lookup
+            .get(&key)
+            .or_else(|| self.lookup.get(&standard))
+            .copied()
+            .expect("the real floating types are pre-interned")
+    }
+
+    /// Whether `_Float64x` exists here; see `arch::has_float64x`.
+    pub fn has_float64x(&self) -> bool {
+        crate::arch::has_float64x(&Target {
+            arch: self.target_arch,
+            os: self.target_os,
+            ..Target::host()
+        })
     }
 
     pub fn has_float128(&self) -> bool {

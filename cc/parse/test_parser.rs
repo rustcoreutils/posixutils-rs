@@ -22,7 +22,7 @@ use crate::strings::{StringId, StringTable};
 use crate::symbol::{Symbol, SymbolTable};
 use crate::target::Target;
 use crate::token::lexer::Tokenizer;
-use crate::types::{TypeId, TypeKind, TypeModifiers, TypeTable};
+use crate::types::{FloatClass, TypeId, TypeKind, TypeModifiers, TypeTable};
 
 fn parse_expr(input: &str) -> ParseResult<(Expr, TypeTable, StringTable, SymbolTable)> {
     parse_expr_with_vars(input, &[])
@@ -50,7 +50,7 @@ fn parse_expr_under(
 /// family has -- x87 or binary128 `long double`, `__float128` -- names that
 /// target instead of taking the host's: on an arm64 Mac `long double` is
 /// `double` and there is no `__float128`.
-fn parse_expr_for(
+pub(super) fn parse_expr_for(
     input: &str,
     target: &Target,
 ) -> ParseResult<(Expr, TypeTable, StringTable, SymbolTable)> {
@@ -2126,7 +2126,7 @@ pub(super) fn parse_tu(
 }
 
 /// [`parse_tu`] for `target`; see [`parse_expr_for`] for when a test needs it.
-fn parse_tu_for(
+pub(super) fn parse_tu_for(
     input: &str,
     target: &Target,
 ) -> ParseResult<(TranslationUnit, TypeTable, StringTable, SymbolTable)> {
@@ -5269,7 +5269,7 @@ fn test_hex_float_with_float_n_suffix() {
 #[test]
 fn test_malformed_number_suffixes_are_rejected() {
     for src in [
-        "1.0lf", "1.0fl", "1f", "1lL", "1uu", "1lul", "1.0ff", "2.0f32x", "1.5e+",
+        "1.0lf", "1.0fl", "1f", "1lL", "1uu", "1lul", "1.0ff", "2.0f32xx", "2.0f16x", "1.5e+",
     ] {
         assert!(parse_expr(src).is_err(), "{src} should be rejected");
     }
@@ -5490,46 +5490,51 @@ fn test_builtin_float_n_constants() {
             Binary16,
             0x7c12,
         ),
-        ("__builtin_inff32()", |t| t.float_id, Binary32, 0x7f80_0000),
+        (
+            "__builtin_inff32()",
+            |t| t.floating(TypeKind::Float, FloatClass::Interchange),
+            Binary32,
+            0x7f80_0000,
+        ),
         (
             "__builtin_huge_valf32()",
-            |t| t.float_id,
+            |t| t.floating(TypeKind::Float, FloatClass::Interchange),
             Binary32,
             0x7f80_0000,
         ),
         (
             "__builtin_nanf32(\"0x5\")",
-            |t| t.float_id,
+            |t| t.floating(TypeKind::Float, FloatClass::Interchange),
             Binary32,
             0x7fc0_0005,
         ),
         (
             "__builtin_nansf32(\"\")",
-            |t| t.float_id,
+            |t| t.floating(TypeKind::Float, FloatClass::Interchange),
             Binary32,
             0x7fa0_0000,
         ),
         (
             "__builtin_inff64()",
-            |t| t.double_id,
+            |t| t.floating(TypeKind::Double, FloatClass::Interchange),
             Binary64,
             0x7ff0 << 48,
         ),
         (
             "__builtin_huge_valf64()",
-            |t| t.double_id,
+            |t| t.floating(TypeKind::Double, FloatClass::Interchange),
             Binary64,
             0x7ff0 << 48,
         ),
         (
             "__builtin_nanf64(\"0x5\")",
-            |t| t.double_id,
+            |t| t.floating(TypeKind::Double, FloatClass::Interchange),
             Binary64,
             0x7ff8_0000_0000_0005,
         ),
         (
             "__builtin_nansf64(\"\")",
-            |t| t.double_id,
+            |t| t.floating(TypeKind::Double, FloatClass::Interchange),
             Binary64,
             0x7ff4 << 48,
         ),
@@ -5574,7 +5579,7 @@ fn test_builtin_nan_float_n_of_a_malformed_string_is_a_call() {
         let want = if float16 {
             types.float16_id
         } else {
-            types.float_id
+            types.floating(TypeKind::Float, FloatClass::Interchange)
         };
         assert_eq!(expr.typ, Some(want), "{src}");
     }

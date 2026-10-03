@@ -18,7 +18,7 @@ use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol};
 use crate::token::lexer::{Position, SpecialToken, TokenType, TokenValue};
 use crate::token::literal;
-use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
+use crate::types::{FloatClass, Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
 
 const DEFAULT_ARG_LIST_CAPACITY: usize = 8;
@@ -2795,10 +2795,25 @@ impl<'a> Parser<'a> {
             };
             let typ = match float_suffix {
                 FloatSuffix::None => self.types.double_id,
-                // `_Float32` and `_Float64` are `float` and `double` here.
-                FloatSuffix::F | FloatSuffix::F32 => self.types.float_id,
-                FloatSuffix::F64 => self.types.double_id,
+                FloatSuffix::F => self.types.float_id,
                 FloatSuffix::L => self.types.longdouble_id,
+                FloatSuffix::F32 => self
+                    .types
+                    .floating(TypeKind::Float, FloatClass::Interchange),
+                FloatSuffix::F64 => self
+                    .types
+                    .floating(TypeKind::Double, FloatClass::Interchange),
+                FloatSuffix::F32x => self.types.floating(TypeKind::Double, FloatClass::Extended),
+                FloatSuffix::F64x => {
+                    if !self.types.has_float64x() {
+                        return Err(ParseError::new(
+                            format!("_Float64x is not supported on this target: {}", s),
+                            pos,
+                        ));
+                    }
+                    self.types
+                        .floating(TypeKind::LongDouble, FloatClass::Extended)
+                }
                 FloatSuffix::F16 => self.types.float16_id,
                 FloatSuffix::F128 => {
                     if !self.types.has_float128() {
@@ -3058,9 +3073,8 @@ impl<'a> NumberSpelling<'a> {
 }
 
 /// The suffixes of a floating constant (C17 6.4.4.2), with the `_FloatN`
-/// spellings of TS 18661-3 that c17 has types for and GNU's `q`.
-///
-/// `f32x` and `f64x` are not here: c17 has no `_Float32x` or `_Float64x`.
+/// and `_FloatNx` spellings of TS 18661-3 that c17 has types for and GNU's
+/// `q`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FloatSuffix {
     None,
@@ -3069,6 +3083,8 @@ enum FloatSuffix {
     F16,
     F32,
     F64,
+    F32x,
+    F64x,
     /// `f128`, or GNU's `q`.
     F128,
 }
@@ -3082,6 +3098,8 @@ impl FloatSuffix {
             "f16" => FloatSuffix::F16,
             "f32" => FloatSuffix::F32,
             "f64" => FloatSuffix::F64,
+            "f32x" => FloatSuffix::F32x,
+            "f64x" => FloatSuffix::F64x,
             "f128" | "q" => FloatSuffix::F128,
             _ => return None,
         })

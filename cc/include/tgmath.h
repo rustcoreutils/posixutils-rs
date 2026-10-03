@@ -38,7 +38,45 @@
    rather than the arguments themselves, so `pow(i, f)` for an `int i` and a
    `float f` is `pow`, not `powf` -- the usual arithmetic conversions alone
    would have made it `float` and rounded `i`. */
+/* C23's _FloatN and _FloatNx types (7.27): a real argument of one reaches
+   the function for that type, `sqrtf32` for a `_Float32`, where the C
+   library's <math.h> declares those -- glibc's does with its IEC 60559 types
+   extension on. Elsewhere, and for complex arguments (the <complex.h> here
+   declares only the standard functions), it reaches the standard function of
+   the same format, which computes the same value in a type of another name. `_Float64x` exists only
+   where `long double` is wider than `double`, and an association may not
+   name a type that does not. */
+#ifdef __FLT64X_MANT_DIG__
+#define __tg_f64x(e) _Float64x: e,
+#define __tg_cf64x(e) _Float64x _Complex: e,
+#else
+#define __tg_f64x(e)
+#define __tg_cf64x(e)
+#endif
+
+/* The same-format standard function, real and complex. */
+#define __tg_floatn_std(fn) _Float32: fn##f, _Float64: fn, _Float32x: fn, __tg_f64x(fn##l)
+#define __tg_cfloatn_std(fn) \
+    _Float32 _Complex: fn##f, _Float64 _Complex: fn, _Float32x _Complex: fn, \
+    __tg_cf64x(fn##l)
+
+#ifdef __GLIBC_USE
+#if __GLIBC_USE (IEC_60559_TYPES_EXT)
+#define __TG_FLOATN_FUNCTIONS 1
+#endif
+#endif
+
+#ifdef __TG_FLOATN_FUNCTIONS
+#define __tg_floatn(fn) \
+    _Float32: fn##f32, _Float64: fn##f64, _Float32x: fn##f32x, __tg_f64x(fn##f64x)
+#else
+#define __tg_floatn(fn) __tg_floatn_std(fn)
+#endif
+
 #define __tg_t(x) _Generic((x), \
+    _Float32: (x), _Float64: (x), _Float32x: (x), __tg_f64x((x)) \
+    _Float32 _Complex: (x), _Float64 _Complex: (x), _Float32x _Complex: (x), \
+    __tg_cf64x((x)) \
     float: (x), \
     long double: (x), \
     float _Complex: (x), \
@@ -48,12 +86,15 @@
 
 /* Real-only: float / double / long double, integers promoted to double. */
 #define __tg_real(fn, x) _Generic((x), \
+    __tg_floatn(fn) \
     float: fn##f, \
     long double: fn##l, \
     default: fn)
 
 /* Real or complex, one argument. */
 #define __tg_rc(fn, cfn, x) _Generic((x), \
+    __tg_floatn(fn) \
+    __tg_cfloatn_std(cfn) \
     float: fn##f, \
     long double: fn##l, \
     float _Complex: cfn##f, \
@@ -64,6 +105,8 @@
 /* Complex-only, one argument. A real argument is treated as the complex type
    of its own precision (C17 7.25p3), and an integer as `double`. */
 #define __tg_cplx(cfn, x) _Generic((x), \
+    __tg_floatn_std(cfn) \
+    __tg_cfloatn_std(cfn) \
     float: cfn##f, \
     float _Complex: cfn##f, \
     long double: cfn##l, \
@@ -137,8 +180,13 @@
 #define trunc(x)        __tg_real(trunc,     x)(x)
 
 /* nexttoward's second argument is always long double, so only the first
-   participates in the dispatch. */
-#define nexttoward(x, y) __tg_real(nexttoward, x)((x), (y))
+   participates in the dispatch. No C library has a `_FloatN` nexttoward,
+   so those reach the standard function of their format. */
+#define nexttoward(x, y) _Generic((x), \
+    __tg_floatn_std(nexttoward) \
+    float: nexttowardf, \
+    long double: nexttowardl, \
+    default: nexttoward)((x), (y))
 
 /* ------------------------------------------------------------------------
  * 7.25.4 - complex only

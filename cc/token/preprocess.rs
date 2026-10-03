@@ -1048,7 +1048,7 @@ impl<'a> Preprocessor<'a> {
         //
         // The claimed version is a statement about which header paths this
         // compiler can take, and it is measured rather than aspirational.
-        // 6.5.0 is the highest that works against glibc 2.39:
+        // 7.5.0 is the highest that works against glibc 2.39:
         //
         //   4.3  `bits/floatn.h` turns on __HAVE_FLOAT128 and needs the
         //        `__float128` keyword and `_Complex float` with mode(TC)
@@ -1059,10 +1059,13 @@ impl<'a> Preprocessor<'a> {
         //   4.9  __HAVE_GENERIC_SELECTION turns on, so __MATH_TG uses
         //        `_Generic` rather than __builtin_choose_expr
         //   6.0  `signbit` goes to __builtin_signbit*
-        //   7.0  __HAVE_FLOATN_NOT_TYPEDEF makes _FloatN native types, and
-        //        `stdlib.h` then declares `strtof32x` in terms of a `_Float32x`
-        //        this compiler does not have. That is the ceiling.
-        self.define_macro(Macro::predefined("__GNUC__", Some("6")));
+        //   7.0  __HAVE_FLOATN_NOT_TYPEDEF: `_Float32` .. `_Float64x` are the
+        //        compiler's own distinct types, __MATH_TG lists `_Float32`
+        //        beside `float`, and the `__builtin_*f32x` family is called
+        //        by name
+        //   8.0  <tgmath.h> needs `__builtin_tgmath`, and <sys/cdefs.h>
+        //        the `nonstring` attribute. That is the ceiling.
+        self.define_macro(Macro::predefined("__GNUC__", Some("7")));
         self.define_macro(Macro::predefined("__GNUC_MINOR__", Some("5")));
         self.define_macro(Macro::predefined("__GNUC_PATCHLEVEL__", Some("0")));
         self.define_macro(Macro::predefined(
@@ -1070,7 +1073,7 @@ impl<'a> Preprocessor<'a> {
             Some(concat!(
                 "\"c17 ",
                 env!("CARGO_PKG_VERSION"),
-                " (gcc compatible 6.5.0)\""
+                " (gcc compatible 7.5.0)\""
             )),
         ));
         self.define_macro(Macro::predefined("__GNUC_STDC_INLINE__", Some("1")));
@@ -1139,7 +1142,7 @@ impl<'a> Preprocessor<'a> {
 
         // Floating-point limit macros
         for (name, value) in arch::get_float_limit_macros(self.target) {
-            self.define_macro(Macro::predefined(name, Some(value)));
+            self.define_macro(Macro::predefined(&name, Some(&value)));
         }
 
         // OS macros, including the unreserved `unix` / `linux` spellings.

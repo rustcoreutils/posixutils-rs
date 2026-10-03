@@ -21,7 +21,7 @@ use crate::float::{FloatVal, NanKind};
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId};
 use crate::token::lexer::Position;
-use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
+use crate::types::{FloatClass, Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
 
 /// A statically known object, and where inside it a pointer points.
@@ -1728,12 +1728,20 @@ impl Parser<'_> {
     }
 
     /// The floating type `suffix` names, or `None` where the target has no
-    /// such type: `_Float128` is `__float128`, which macOS lacks.
+    /// such type: `_Float128` is `__float128`, which macOS lacks, and
+    /// `_Float64x` needs a format wider than `double`.
     fn float_suffix_type(&self, suffix: FloatSuffix) -> Option<TypeId> {
         let t = &self.types;
         Some(match suffix {
-            FloatSuffix::Double | FloatSuffix::F64 => t.double_id,
-            FloatSuffix::Float | FloatSuffix::F32 => t.float_id,
+            FloatSuffix::Double => t.double_id,
+            FloatSuffix::Float => t.float_id,
+            FloatSuffix::F32 => t.floating(TypeKind::Float, FloatClass::Interchange),
+            FloatSuffix::F64 => t.floating(TypeKind::Double, FloatClass::Interchange),
+            FloatSuffix::F32x => t.floating(TypeKind::Double, FloatClass::Extended),
+            FloatSuffix::F64x if t.has_float64x() => {
+                t.floating(TypeKind::LongDouble, FloatClass::Extended)
+            }
+            FloatSuffix::F64x => return None,
             FloatSuffix::LongDouble => t.longdouble_id,
             FloatSuffix::F16 => t.float16_id,
             FloatSuffix::F128 if t.has_float128() => t.float128_id,
@@ -2357,8 +2365,8 @@ impl Parser<'_> {
 }
 
 /// The floating type a builtin's suffix names: `__builtin_inf` is a
-/// `double`, `__builtin_inff16` a `_Float16`. `_Float32` and `_Float64` are
-/// `float` and `double` in c17, not types of their own.
+/// `double`, `__builtin_inff16` a `_Float16`, `__builtin_inff32x` a
+/// `_Float32x`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FloatSuffix {
     Double,
@@ -2367,6 +2375,8 @@ enum FloatSuffix {
     F16,
     F32,
     F64,
+    F32x,
+    F64x,
     F128,
 }
 
@@ -2380,6 +2390,8 @@ impl FloatSuffix {
             FloatSuffix::F16 => "f16",
             FloatSuffix::F32 => "f32",
             FloatSuffix::F64 => "f64",
+            FloatSuffix::F32x => "f32x",
+            FloatSuffix::F64x => "f64x",
             FloatSuffix::F128 => "f128",
         }
     }
@@ -2425,6 +2437,10 @@ const FLOAT_CONSTANT_BUILTINS: &[(StringId, FloatConstant, FloatSuffix)] = {
         (BUILTIN_HUGE_VALF32,   Inf,        F32),
         (BUILTIN_HUGE_VALF64,   Inf,        F64),
         (BUILTIN_HUGE_VALF128,  Inf,        F128),
+        (BUILTIN_INFF32X,       Inf,        F32x),
+        (BUILTIN_INFF64X,       Inf,        F64x),
+        (BUILTIN_HUGE_VALF32X,  Inf,        F32x),
+        (BUILTIN_HUGE_VALF64X,  Inf,        F64x),
         (BUILTIN_INFQ,          Inf,        F128),
         (BUILTIN_HUGE_VALQ,     Inf,        F128),
         (BUILTIN_NANQ,          QUIET,      F128),
@@ -2436,6 +2452,8 @@ const FLOAT_CONSTANT_BUILTINS: &[(StringId, FloatConstant, FloatSuffix)] = {
         (BUILTIN_NANF32,        QUIET,      F32),
         (BUILTIN_NANF64,        QUIET,      F64),
         (BUILTIN_NANF128,       QUIET,      F128),
+        (BUILTIN_NANF32X,       QUIET,      F32x),
+        (BUILTIN_NANF64X,       QUIET,      F64x),
         (BUILTIN_NANS,          SIGNALLING, Double),
         (BUILTIN_NANSF,         SIGNALLING, Float),
         (BUILTIN_NANSL,         SIGNALLING, LongDouble),
@@ -2443,6 +2461,8 @@ const FLOAT_CONSTANT_BUILTINS: &[(StringId, FloatConstant, FloatSuffix)] = {
         (BUILTIN_NANSF32,       SIGNALLING, F32),
         (BUILTIN_NANSF64,       SIGNALLING, F64),
         (BUILTIN_NANSF128,      SIGNALLING, F128),
+        (BUILTIN_NANSF32X,      SIGNALLING, F32x),
+        (BUILTIN_NANSF64X,      SIGNALLING, F64x),
     ]
 };
 

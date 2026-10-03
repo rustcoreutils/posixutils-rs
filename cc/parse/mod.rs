@@ -38,6 +38,8 @@ mod test_declarations;
 #[cfg(test)]
 mod test_expr_constraints;
 #[cfg(test)]
+mod test_float_n;
+#[cfg(test)]
 mod test_incomplete;
 #[cfg(test)]
 mod test_member_list;

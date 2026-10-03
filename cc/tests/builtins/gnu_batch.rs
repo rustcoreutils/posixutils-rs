@@ -28,8 +28,8 @@ int main(void) {
     if (__builtin_copysignf32(2.0f, -1.0f) != -2.0f) return 2;
     if (__builtin_fabsf64(-1.25) != 1.25) return 3;
     if (__builtin_copysignf64(3.0, -0.0) != -3.0) return 4;
-    if (_Generic(__builtin_fabsf32(1.0f), float: 0, default: 1)) return 5;
-    if (_Generic(__builtin_fabsf64(1.0), double: 0, default: 1)) return 6;
+    if (_Generic(__builtin_fabsf32(1.0f), _Float32: 0, default: 1)) return 5;
+    if (_Generic(__builtin_fabsf64(1.0), _Float64: 0, default: 1)) return 6;
 #ifdef __FLT128_MANT_DIG__
     _Float128 a = -2.5;
     if (__builtin_fabsq(a) != 2.5 || __builtin_fabsf128(a) != 2.5) return 10;

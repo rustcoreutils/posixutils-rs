@@ -32,7 +32,7 @@ Answered in `token/preprocess.rs` (`eval_has_builtin_expr`, inside `#if`) and
 `builtins.rs`: a name answers 1 when it is in `SUPPORTED_BUILTINS` (or tagged
 `kw::BUILTIN`, which `builtins.rs` tests keep identical) and `available_on`
 the target. `available_on` withholds the `f128` constants on macOS, which has
-no `_Float128`, and the `__builtin_ms_va_*` names off x86-64, where gcc has
+no `_Float128`, the `f64x` ones on Apple's aarch64, which has no `_Float64x`, and the `__builtin_ms_va_*` names off x86-64, where gcc has
 none of them.
 
 Differences from gcc's answers:
@@ -217,8 +217,9 @@ value gcc folds them to on both targets; at run time they stay undefined.
 One table, `LIBRARY_BUILTINS` in `parse/library_builtin.rs`, gives each of
 these its prototype and its `InlineLibraryFn`: `abs`, `labs`, `llabs`,
 `imaxabs`, `fabs`, `fabsf`, `fabsl`, `copysign`, `copysignf`, `copysignl`,
-their `_FloatN` and `q` forms (`fabsf32`, `fabsf64`, `fabsf128`, `fabsq`,
-`copysignf32`, ..., `copysignq`; on x86-64 the binary128 ones are calls to
+their `_FloatN`, `_FloatNx` and `q` forms (`fabsf32`, `fabsf64`,
+`fabsf32x`, `fabsf64x`, `fabsf128`, `fabsq`, `copysignf32`, ...,
+`copysignq`; on x86-64 the binary128 ones are calls to
 libm's `fabsf128` and `copysignf128`, there being no sign-bit instruction
 for an XMM-held binary128),
 `sqrt`, `sqrtf`, `sqrtl`, `floor`, `ceil`, `trunc`, `round`, `rint`,
@@ -298,12 +299,13 @@ weak definition can put two names at one address.
 | `__builtin_nan(str)`, `nanf`, `nanl` | Quiet NaN |
 | `__builtin_nans(str)`, `nansf`, `nansl` | Signalling NaN |
 
-Each also has `f16`, `f32`, `f64` and `f128` forms (`__builtin_inff16()`,
-`__builtin_nansf128(str)`, ...) giving `_Float16`, `float`, `double` and
-`_Float128`, and gcc's `q` forms (`__builtin_infq`, `huge_valq`, `nanq`,
+Each also has `f16`, `f32`, `f64`, `f32x`, `f64x` and `f128` forms
+(`__builtin_inff16()`, `__builtin_nansf128(str)`, ...) giving the type of
+that name -- `_Float32` is not `float`, but a distinct type of the same
+format -- and gcc's `q` forms (`__builtin_infq`, `huge_valq`, `nanq`,
 `nansq`) for `__float128`, which is `_Float128`; the `f128` and `q` forms
-exist only where `_Float128` does (not macOS), and are a parse error
-elsewhere. All come from `FLOAT_CONSTANT_BUILTINS` and
+exist only where `_Float128` does (not macOS), the `f64x` forms where
+`_Float64x` does (not Apple's aarch64), and are a parse error elsewhere. All come from `FLOAT_CONSTANT_BUILTINS` and
 are literals, so they are constants everywhere.
 
 A NaN's string literal names its payload, parsed as gcc's `strtoull`-based

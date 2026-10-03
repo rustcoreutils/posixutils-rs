@@ -65,7 +65,7 @@ impl From<&'static str> for ExecutionError {
 impl From<io::Error> for ExecutionError {
     fn from(e: io::Error) -> Self {
         Self {
-            message: format!("cannot write output: {e}"),
+            message: format!("cannot write output: {}", plib::diag::io_error_text(&e)),
             call_stack: Vec::new(),
         }
     }

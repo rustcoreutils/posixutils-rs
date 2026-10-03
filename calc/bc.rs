@@ -79,7 +79,7 @@ fn main() {
         }
         Err(e) => {
             diag::init("bc");
-            diag::error(&format!("{}", e));
+            diag::error(&diag::io_error_text(&e));
             std::process::exit(1);
         }
     }
@@ -90,6 +90,11 @@ fn main() {
 fn report(e: impl std::fmt::Display) -> bool {
     diag::error(&format!("{}", e));
     true
+}
+
+/// Report a failed write as the system names it. Returns true, as [`report`].
+fn report_io(e: std::io::Error) -> bool {
+    report(diag::io_error_text(&e))
 }
 
 /// Report each diagnostic of a parse failure at its own position.
@@ -164,14 +169,14 @@ fn run() {
                     had_error |= report(e);
                 }
                 if let Err(e) = out.flush() {
-                    had_error |= report(e);
+                    had_error |= report_io(e);
                 }
             }
             Err(e) => had_error |= report_parse_error(&e),
         }
         if interpreter.has_quit() {
             if let Err(e) = out.flush() {
-                had_error |= report(e);
+                had_error |= report_io(e);
             }
             std::process::exit(if had_error { 1 } else { 0 });
         }
@@ -180,7 +185,7 @@ fn run() {
     let mut repl = match DefaultEditor::new() {
         Ok(repl) => repl,
         Err(e) => {
-            diag::error(&format!("{}", e));
+            diag::error(&diag::error_text(&e));
             std::process::exit(1);
         }
     };
@@ -201,7 +206,7 @@ fn run() {
                             failed = report(e);
                         }
                         if let Err(e) = out.flush() {
-                            failed = report(e);
+                            failed = report_io(e);
                         }
                         had_error |= failed && !interactive;
                         line_buffer.clear();
@@ -218,7 +223,7 @@ fn run() {
             // End of input (Ctrl-D) or interrupt (Ctrl-C): exit silently.
             Err(ReadlineError::Eof) | Err(ReadlineError::Interrupted) => break,
             Err(e) => {
-                had_error |= report(format!("{:?}", e));
+                had_error |= report(diag::error_text(&e));
                 break;
             }
         }
@@ -234,7 +239,7 @@ fn run() {
     }
 
     if let Err(e) = out.flush() {
-        had_error |= report(e);
+        had_error |= report_io(e);
     }
     std::process::exit(if had_error { 1 } else { 0 });
 }

@@ -377,6 +377,10 @@ fn test_bc_write_error_is_reported() {
         stderr.contains("No space left on device"),
         "expected the write failure to be named, got {stderr:?}"
     );
+    assert!(
+        !stderr.contains("(os error"),
+        "Rust's errno parenthetical must not reach the user: {stderr:?}"
+    );
 }
 
 /// The math library carries guard digits through its argument reductions, so

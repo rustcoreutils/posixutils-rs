@@ -2981,6 +2981,11 @@ impl<'a> Linearizer<'a> {
             return self.linearize_converted(inner_expr, cast_type);
         }
 
+        // A GNU vector's bits, reinterpreted.
+        if self.types.is_vector(src_type) || self.types.is_vector(cast_type) {
+            return self.linearize_vector_cast(inner_expr, cast_type);
+        }
+
         let src = self.linearize_expr(inner_expr);
 
         // C17 6.3.1.2: a conversion to `_Bool` compares against zero. It is
@@ -4163,6 +4168,9 @@ impl<'a> Linearizer<'a> {
 
     /// Linearize a post-increment or post-decrement expression
     pub(crate) fn linearize_postop(&mut self, operand: &Expr, is_inc: bool) -> PseudoId {
+        if self.types.is_vector(self.expr_type(operand)) {
+            return self.emit_vector_step(operand, is_inc, false);
+        }
         // `x++` on an atomic object is one read-modify-write, and its value is
         // the value *before* the operation -- exactly what fetch-add returns.
         if let Some(result) = self.try_emit_atomic_incdec(operand, is_inc, false) {
@@ -4285,6 +4293,10 @@ impl<'a> Linearizer<'a> {
         let left_typ = self.expr_type(left);
         let right_typ = self.expr_type(right);
         let result_typ = self.expr_type(expr);
+
+        if self.types.is_vector(left_typ) || self.types.is_vector(right_typ) {
+            return self.linearize_vector_binary(op, left, right, result_typ);
+        }
 
         // Check for pointer arithmetic: ptr +/- int or int + ptr. An array or
         // a function designator is a pointer here, as it decays to one.
@@ -4616,6 +4628,16 @@ impl<'a> Linearizer<'a> {
         }
         if op == UnaryOp::Imag {
             return self.linearize_complex_half(operand, ComplexHalf::Imag);
+        }
+
+        // A vector is operated on lane by lane.
+        if self.types.is_vector(self.expr_type(operand)) {
+            return match op {
+                UnaryOp::PreInc | UnaryOp::PreDec => {
+                    self.emit_vector_step(operand, op == UnaryOp::PreInc, true)
+                }
+                _ => self.linearize_vector_unary(op, operand),
+            };
         }
 
         // A complex value travels by address, so the scalar path below would
@@ -4956,11 +4978,13 @@ impl<'a> Linearizer<'a> {
         // its arms are merged as addresses: a pointer-sized select or phi of
         // `rvalue_addr`s. It was merged at the aggregate's own size -- a phi
         // of 128 bits or more over pointers. One that fits in a register
-        // travels by value and is merged as one, below.
-        let aggregate = matches!(
+        // travels by value and is merged as one, below. A GNU vector always
+        // travels by address.
+        let aggregate = (matches!(
             self.types.kind(result_typ),
             TypeKind::Struct | TypeKind::Union
-        ) && !self.aggregate_travels_by_value(result_typ);
+        ) && !self.aggregate_travels_by_value(result_typ))
+            || self.types.is_vector(result_typ);
         let (merge_typ, size) = if aggregate {
             (self.types.pointer_to(result_typ), self.target.pointer_width)
         } else if self.types.kind(result_typ) == TypeKind::Function {

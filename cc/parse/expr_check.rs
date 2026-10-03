@@ -366,25 +366,19 @@ impl Parser<'_> {
         is_void
     }
 
-    /// Refuse to use a `vector_size` value where gcc gives it vector semantics.
+    /// Refuse a `vector_size` value as a function's argument, parameter or
+    /// return value.
     ///
-    /// c17 gives a vector type storage and nothing more (DECISIONS.md): it is
-    /// laid out as an array of its elements, which is what `<link.h>` needs.
-    /// An array used as a value decays to its address, though, and a vector
-    /// does not -- so `(long long)(V2SI){2, 2}` answered the compound
-    /// literal's address, `v + 1` did pointer arithmetic, and a vector passed
-    /// by value went as a pointer, each silently. What the array model gets
-    /// right -- declaring, `sizeof`, `&v`, `v[i]`, a member, an initializer --
-    /// is untouched; the operations it would get wrong are diagnosed here.
+    /// A vector is computed lane by lane, but not yet passed to or
+    /// returned from a function: the calling conventions put one in vector
+    /// registers, which c17 does not model, and passing it as the array it is
+    /// laid out as would hand the callee a pointer.
     pub(super) fn check_not_vector_value(&self, typ: Option<TypeId>, pos: Position) -> bool {
         let is_vector = typ.is_some_and(|t| self.types.is_vector(t));
         if is_vector {
             diag::error(
                 pos,
-                &gettext(
-                    "c17 implements 'vector_size' types as storage only; \
-                     a vector cannot be used as a value here",
-                ),
+                &gettext("c17 does not yet pass or return 'vector_size' values"),
             );
         }
         is_vector
@@ -406,7 +400,7 @@ impl Parser<'_> {
     ) -> bool {
         let Some(t) = operand.typ else { return true };
         if self.types.is_vector(t) {
-            return true;
+            return self.check_vector_unary(op, t, pos);
         }
         if self.types.kind(t) == TypeKind::Void {
             diag::error(pos, &gettext("invalid use of void expression"));
@@ -451,7 +445,7 @@ impl Parser<'_> {
     /// for the scalar type each requires. Worded as gcc words it.
     pub(super) fn check_truth_value(&mut self, cond: &Expr) -> bool {
         let Some(t) = cond.typ else { return true };
-        if self.check_not_void(cond, cond.pos) || self.check_not_vector_value(Some(t), cond.pos) {
+        if self.check_not_void(cond, cond.pos) || self.check_not_vector_operand(cond) {
             return false;
         }
         let t = self.decayed_type(t);
@@ -495,12 +489,24 @@ impl Parser<'_> {
         } else {
             self.check_has_value(left)
         };
-        if !(self.check_has_value(right) && left_ok) {
+        let right_ok = if logical {
+            !self.check_not_vector_operand(right)
+        } else {
+            true
+        };
+        if !(self.check_has_value(right) && left_ok && right_ok) {
             return false;
         }
         let (Some(lt), Some(rt)) = (left.typ, right.typ) else {
             return true;
         };
+        if self.types.is_vector(lt) || self.types.is_vector(rt) {
+            let types = (
+                self.lvalue_converted_type(lt),
+                self.lvalue_converted_type(rt),
+            );
+            return self.check_vector_operands(op, left, right, types, pos);
+        }
         let (lt, rt) = (self.decayed_type(lt), self.decayed_type(rt));
         let l = self.binary_operand(op, left, lt, rt);
         let r = self.binary_operand(op, right, rt, lt);
@@ -531,11 +537,19 @@ impl Parser<'_> {
     }
 
     /// C17 6.5.5-6.5.14 require operands with a value: `f() + 1`, where `f`
-    /// returns void, has none, and c17 gives a vector none it can compute
-    /// with.
+    /// returns void, has none.
     fn check_has_value(&self, operand: &Expr) -> bool {
         !self.check_not_void(operand, operand.pos)
-            && !self.check_not_vector_value(operand.typ, operand.pos)
+    }
+
+    /// Report a vector where a scalar is tested for truth -- a condition, or
+    /// an operand of `&&` or `||` -- which gcc's C does not take.
+    pub(super) fn check_not_vector_operand(&self, e: &Expr) -> bool {
+        let is_vector = e.typ.is_some_and(|t| self.types.is_vector(t));
+        if is_vector {
+            diag::error(e.pos, &gettext("used vector type where scalar is required"));
+        }
+        is_vector
     }
 
     /// One operand of `op`, with its decayed type `typ`, beside an operand of
@@ -791,8 +805,8 @@ impl Parser<'_> {
 
         // 6.7.9p14/p15: an array may be initialized by a string literal, with
         // or without braces, but only one whose element type it matches. Any
-        // other array needs a list.
-        if self.types.kind(target) == TypeKind::Array {
+        // other array needs a list. A vector takes a vector value.
+        if self.types.kind(target) == TypeKind::Array && !self.types.is_vector(target) {
             // A compound literal of the same array type initializes an array,
             // which gcc accepts and `ast_init_to_ir` already lowers -- only
             // this check stood in the way, having been written when a string
@@ -1102,9 +1116,9 @@ impl Parser<'_> {
             return;
         }
         // An array is an lvalue but never a modifiable one: it has no
-        // assignment operator, only its elements do.
+        // assignment operator, only its elements do. A vector has one.
         if let Some(typ) = target.typ {
-            if self.types.kind(typ) == TypeKind::Array {
+            if self.types.kind(typ) == TypeKind::Array && !self.types.is_vector(typ) {
                 diag::error(pos, &gettext("assignment to expression with array type"));
             }
         }

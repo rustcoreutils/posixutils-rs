@@ -309,7 +309,17 @@ impl<'a> Parser<'a> {
         // An arm diagnosed already, or one with no value -- whose mismatch
         // with a valued arm `check_not_void` has reported.
         let (then_typ, else_typ) = (then_expr.typ?, else_expr.typ?);
+        // GNU vectors: two of one type, and nothing else.
         if self.types.is_vector(then_typ) || self.types.is_vector(else_typ) {
+            let then_typ = self.types.unqualified(then_typ);
+            let else_typ = self.types.unqualified(else_typ);
+            if self.types.is_vector(then_typ)
+                && self.types.is_vector(else_typ)
+                && self.types.types_compatible(then_typ, else_typ)
+            {
+                return Some(then_typ);
+            }
+            diag::error(pos, &gettext("type mismatch in conditional expression"));
             return None;
         }
         let then_typ = self.lvalue_converted_type(then_typ);
@@ -518,9 +528,6 @@ impl<'a> Parser<'a> {
                 let culprit = if then_void { &then_expr } else { &else_expr };
                 self.check_not_void(culprit, culprit.pos);
             }
-
-            self.check_not_vector_value(then_expr.typ, then_expr.pos);
-            self.check_not_vector_value(else_expr.typ, else_expr.pos);
 
             let typ = self.conditional_result_type(&then_expr, &else_expr, colon_pos);
 
@@ -821,8 +828,16 @@ impl<'a> Parser<'a> {
                     }
                 })
                 .unwrap_or(self.types.int_id);
-            if !self.check_not_vector_value(operand.typ, operand.pos) {
-                self.check_dereferenceable(&operand, op_pos);
+            match operand.typ.filter(|&t| self.types.is_vector(t)) {
+                Some(t) => {
+                    let named = self.types.format_type(t, Some(self.idents));
+                    diag::error_args(
+                        op_pos,
+                        "invalid type argument of unary '*' (have '{0}')",
+                        &[&named],
+                    );
+                }
+                None => self.check_dereferenceable(&operand, op_pos),
             }
             return Ok(Self::typed_expr(
                 ExprKind::Unary {
@@ -897,7 +912,6 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
-            self.check_not_vector_value(operand.typ, operand.pos);
             let valid = self.check_unary_operand(UnaryOperator::Not, &operand, op_pos);
             // Logical not always produces int (0 or 1)
             let e = Self::typed_expr(
@@ -1151,14 +1165,10 @@ impl<'a> Parser<'a> {
     /// keeps the result from being an lvalue as a compound literal is.
     ///
     /// An operand of the union's own type is an ordinary no-op cast. One that
-    /// matches no member is diagnosed as gcc does. A vector operand is the
-    /// vector-value error every other cast reports: the array model would
-    /// see it decay, and so match no vector member.
+    /// matches no member is diagnosed as gcc does.
     fn cast_to_union(&mut self, union_typ: TypeId, operand: Expr, pos: Position) -> Expr {
         let union_typ = self.types.unqualified(union_typ);
-        let is_vector = self.check_not_vector_value(operand.typ, operand.pos);
         let value = match operand.typ {
-            Some(_) if is_vector => operand,
             Some(t) => {
                 let t = self.lvalue_converted_type(t);
                 if self.types.types_compatible(t, union_typ) {
@@ -1568,6 +1578,15 @@ impl<'a> Parser<'a> {
                     .and_then(|t| self.types.base_type(t))
                     .or_else(|| index.typ.and_then(|t| self.types.base_type(t)))
                     .unwrap_or(self.types.int_id);
+                // A vector is qualified as a whole, and an element of a
+                // `const` one is not to be written either.
+                let elem_type = match expr.typ.filter(|&t| self.types.is_vector(t)) {
+                    Some(v) => {
+                        let quals = self.types.qualifiers(v);
+                        self.types.qualified_with(elem_type, quals)
+                    }
+                    None => elem_type,
+                };
                 expr = Self::typed_expr(
                     ExprKind::Index {
                         array: Box::new(expr),
@@ -1970,7 +1989,8 @@ impl<'a> Parser<'a> {
             BinaryOp::Shl | BinaryOp::Shr => self.effective_bitfield_width(&left),
             _ => None,
         }
-        .filter(|bits| *bits < self.types.size_bits(result_type));
+        .filter(|bits| *bits < self.types.size_bits(result_type))
+        .filter(|_| !self.types.is_vector(result_type));
 
         let pos = left.pos;
         let mut e = Self::typed_expr(
@@ -1995,6 +2015,21 @@ impl<'a> Parser<'a> {
         right: &Expr,
     ) -> TypeId {
         let right_type = right.typ.unwrap_or(self.types.int_id);
+        // A vector operation yields the vector's type -- the left operand's
+        // when both are vectors, unless that one is a comparison's mask --
+        // and a comparison a vector of masks.
+        let vector = [left_type, right_type]
+            .into_iter()
+            .filter(|&t| self.types.is_vector(t))
+            .min_by_key(|&t| self.types.is_vector_mask(t));
+        if let Some(vector) = vector {
+            let vector = self.types.unqualified(vector);
+            return if op.is_comparison() {
+                self.types.vector_mask_type(vector)
+            } else {
+                vector
+            };
+        }
         match op {
             // Comparison and logical operators always return int
             BinaryOp::Eq
@@ -2163,7 +2198,11 @@ impl<'a> Parser<'a> {
     /// the one rule in one place: the binary operators already use it, and two
     /// copies of a promotion rule is how this went wrong to begin with.
     fn promote_unary_operand(&mut self, operand: Expr) -> (Expr, TypeId) {
-        self.check_not_vector_value(operand.typ, operand.pos);
+        // A vector is operated on lane by lane, with no promotion.
+        if let Some(t) = operand.typ.filter(|&t| self.types.is_vector(t)) {
+            let typ = self.types.unqualified(t);
+            return (operand, typ);
+        }
         let operand = self.promote_bitfield_operand(operand);
         let op_typ = operand.typ.unwrap_or(self.types.int_id);
         // A GNU complex integer is left alone. `integer_promote` switches on
@@ -2651,28 +2690,33 @@ impl<'a> Parser<'a> {
                         // An array was converted as if it were its first
                         // element's address. (A union stays: gcc casts to
                         // one, and so does c17 -- see `cast_to_union`.)
+                        let vector = self.types.is_vector(typ)
+                            || expr.typ.is_some_and(|t| self.types.is_vector(t));
                         match self.types.kind(typ) {
+                            TypeKind::Union => {
+                                let cast = self.cast_to_union(typ, expr, paren_pos);
+                                return Ok(self.with_type_name_extents(dims, cast));
+                            }
+                            // A vector's own rules, below.
+                            _ if vector => {}
                             TypeKind::Array => {
                                 diag::error(paren_pos, &gettext("cast specifies array type"))
                             }
                             TypeKind::Function => {
                                 diag::error(paren_pos, &gettext("cast specifies function type"))
                             }
-                            TypeKind::Union => {
-                                let cast = self.cast_to_union(typ, expr, paren_pos);
-                                return Ok(self.with_type_name_extents(dims, cast));
-                            }
                             _ => self.check_cast_operand(typ, &expr, paren_pos),
                         }
                         // gcc reinterprets the bits between a vector and a
-                        // same-sized scalar or vector; the array model would
-                        // convert an address instead. A cast to `void` reads
-                        // nothing -- `(void)v;` is how an unused vector is
-                        // marked used -- so it is not a value use.
-                        if self.types.kind(typ) != TypeKind::Void
-                            && !self.check_not_vector_value(expr.typ, expr.pos)
-                        {
-                            self.check_not_vector_value(Some(typ), paren_pos);
+                        // same-sized integer or vector. A cast to `void`
+                        // reads nothing -- `(void)v;` is how an unused vector
+                        // is marked used.
+                        if let Some(from) = expr.typ {
+                            let from = self.lvalue_converted_type(from);
+                            let vector = self.types.is_vector(from) || self.types.is_vector(typ);
+                            if vector && self.types.kind(typ) != TypeKind::Void {
+                                self.check_vector_cast(from, typ, paren_pos);
+                            }
                         }
 
                         // Fold cast-to-Int128 of constant expressions into Int128Lit

@@ -85,15 +85,11 @@ fn cast_to_union_is_not_an_lvalue() {
     );
 }
 
-/// A vector is storage only in c17, so a vector operand gets the error any
-/// other cast of a vector value gets -- not a claim that no member matches.
+/// A vector is a value, and a union with a member of its type takes it.
 #[test]
-fn cast_to_union_of_a_vector_is_the_vector_value_error() {
-    compile_expect_error(
-        "ctu_vector",
-        "typedef int v4 __attribute__((vector_size(16)));\n\
-         typedef union { v4 v; int a[4]; } U;\n\
-         U f(v4 x) { return (U)x; }\n",
-        "a vector cannot be used as a value here",
-    );
+fn cast_to_union_of_a_vector_selects_the_vector_member() {
+    let src = "typedef int v4 __attribute__((vector_size(16)));\n\
+               typedef union { v4 v; int a[4]; } U;\n\
+               int main(void) { v4 x = {1, 2, 3, 4}; U u = (U)x; return u.a[3] == 4 ? 0 : 1; }\n";
+    assert_eq!(crate::common::compile_and_run("ctu_vector", src, &[]), 0);
 }

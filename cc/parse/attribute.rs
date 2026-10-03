@@ -16,7 +16,7 @@ use super::parser::Parser;
 use crate::diag;
 use crate::symbol::Namespace;
 use crate::token::lexer::{payload_text, Position, TokenType};
-use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
+use crate::types::{TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
 use std::fmt;
 
@@ -611,9 +611,8 @@ impl Parser<'_> {
         // held here and applied with the other type attributes once the type
         // is final (`apply_pending_type_attrs`). Neither can be ignored: glibc
         // declares `register_t` with `__mode__(__word__)`, and a vector left
-        // scalar would compute on one element. `vector_size` gets a vector's
-        // storage -- size and alignment -- and not vector arithmetic. Only a
-        // recognised spelling is applied: one warned about as ignored is not.
+        // scalar would compute on one element. Only a recognised spelling is
+        // applied: one warned about as ignored is not.
         match (recognised, name.trim_matches('_'), args.first()) {
             (true, "mode", Some(AttributeArg::Ident(m))) => {
                 self.pending_mode = Some((m.trim_matches('_').to_string(), pos));
@@ -836,18 +835,9 @@ impl Parser<'_> {
 
     /// Apply `__attribute__((vector_size(N)))` to a declared type.
     ///
-    /// c17 gives such a type a vector's *storage* and not its arithmetic: it
-    /// becomes an array of `N / sizeof(element)` elements, aligned to `N`.
-    /// That is exactly the layout GCC gives it, so a struct or union holding
-    /// one -- which is all glibc's `<link.h>` does with `La_x86_64_xmm` and
-    /// its siblings -- lays out identically.
-    ///
-    /// What it deliberately does not get is element-wise `+`, `*` and the
-    /// rest. Those need a real vector type in the IR and both backends. An
-    /// array does not accept them, so the gap is a diagnostic at the point of
-    /// use rather than arithmetic that silently runs on one element -- which
-    /// is the failure the outright rejection was guarding against.
-    fn apply_pending_vector_size(&mut self, typ: TypeId) -> TypeId {
+    /// The type becomes a vector of `N / sizeof(element)` elements, laid out
+    /// as the array of them gcc lays it out as (see `TypeTable::vector_of`).
+    pub(super) fn apply_pending_vector_size(&mut self, typ: TypeId) -> TypeId {
         let Some((bytes, pos)) = self.pending_vector_size.take() else {
             return typ;
         };
@@ -880,30 +870,11 @@ impl Parser<'_> {
             return typ;
         }
         let count = bytes / elem_size as u64;
-        let mut vector = Type {
-            kind: TypeKind::Array,
-            base: Some(typ),
-            array_size: Some(count as usize),
-            modifiers: TypeModifiers::VECTOR,
-            ..Default::default()
-        };
-        // A vector aligns to its width rounded up to a power of two, capped
-        // at sixteen -- which is what GCC does by default on both targets c17
-        // supports. A 32-byte vector therefore aligns to 16, not 32; only
-        // `-mavx2` raises the cap, and c17 does not model that. Measured
-        // against gcc across widths 4 through 128 rather than assumed, because
-        // "aligns to its own width" is the obvious rule and is wrong.
-        //
-        // An `aligned(n)` written alongside takes precedence, which is what
-        // `<link.h>` does: `__vector_size__(32), __aligned__(16)`. It has to
-        // be applied here rather than left to the later attribute pass, since
-        // an explicit alignment may not reduce one already recorded.
-        const MAX_VECTOR_ALIGN: u32 = 16;
-        vector.explicit_align = Some(match self.pending_attr_align.take() {
-            Some(written) => written,
-            None => bytes.next_power_of_two().min(u64::from(MAX_VECTOR_ALIGN)) as u32,
-        });
-        self.types.intern(vector)
+        // An `aligned(n)` written alongside has to be applied here rather
+        // than left to the later attribute pass, since an explicit alignment
+        // may not reduce one already recorded.
+        let written = self.pending_attr_align.take();
+        self.types.vector_of(typ, count as usize, written)
     }
 
     /// Apply `__attribute__((mode(M)))` to a declared type.

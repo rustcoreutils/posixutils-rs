@@ -366,8 +366,8 @@ bitflags::bitflags! {
         const THREAD_LOCAL = 1 << 17;
 
         // A GNU `vector_size` type. c17 lays one out as an array of its
-        // elements -- storage only, see DECISIONS.md -- and this is what tells
-        // it apart from a real array, which decays where a vector would not.
+        // elements, and this is what tells it apart from a real array, which
+        // decays where a vector is a value.
         const VECTOR = 1 << 18;
 
         // `__builtin_ms_va_list`: a `char *` that `__builtin_va_arg` walks
@@ -376,6 +376,12 @@ bitflags::bitflags! {
         // still the one pointer `va_arg` walks as a list, and this bit is
         // that variant.
         const MS_VA_LIST = 1 << 19;
+
+        // The result of a vector comparison. gcc makes it "opaque": the
+        // signed integer vector of its shape to everything but assignment,
+        // where any vector of integer lanes of that shape takes it -- so
+        // `unsigned_v = a < b` is valid where `unsigned_v = signed_v` is not.
+        const VECTOR_MASK = 1 << 20;
     }
 }
 
@@ -769,12 +775,14 @@ impl Type {
         const REDUNDANT_SIZE: TypeModifiers = TypeModifiers::SHORT
             .union(TypeModifiers::LONG)
             .union(TypeModifiers::LONGLONG);
-        // `__builtin_ms_va_list` is a `char *` to everything but `va_arg`.
+        // `__builtin_ms_va_list` is a `char *` to everything but `va_arg`,
+        // and a vector comparison's mask the vector of its shape.
         let ignored = Self::QUALIFIERS
             .union(redundant_signed)
             .union(REDUNDANT_SIZE)
             .union(Self::DECL_SPECIFIERS)
-            .union(TypeModifiers::MS_VA_LIST);
+            .union(TypeModifiers::MS_VA_LIST)
+            .union(TypeModifiers::VECTOR_MASK);
 
         // Compare modifiers (ignoring top-level qualifiers)
         let self_mods = self.modifiers.difference(ignored);
@@ -1765,6 +1773,29 @@ impl TypeTable {
                 }
             }
 
+            // gcc's spelling, which names what the type is rather than how
+            // it is laid out.
+            TypeKind::Array if typ.modifiers.contains(TypeModifiers::VECTOR) => {
+                let mut name = String::new();
+                if typ.modifiers.contains(TypeModifiers::CONST) {
+                    name.push_str("const ");
+                }
+                if typ.modifiers.contains(TypeModifiers::VOLATILE) {
+                    name.push_str("volatile ");
+                }
+                let elem = typ.base.map(|b| self.format_type(b, idents));
+                name.push_str(&format!(
+                    "__vector({}) {}",
+                    typ.array_size.unwrap_or(0),
+                    elem.unwrap_or_default()
+                ));
+                if !decl.is_empty() {
+                    name.push(' ');
+                    name.push_str(&decl);
+                }
+                name
+            }
+
             TypeKind::Array => {
                 let mut extents = parenthesize_if_pointer(decl);
                 let mut cur = id;
@@ -1925,6 +1956,79 @@ impl TypeTable {
     /// Is this a GNU `vector_size` type?
     pub fn is_vector(&self, id: TypeId) -> bool {
         self.get(id).modifiers.contains(TypeModifiers::VECTOR)
+    }
+
+    /// A GNU vector of `count` elements of type `elem`.
+    ///
+    /// It aligns to its width rounded up to a power of two, capped at
+    /// sixteen -- which is what GCC does by default on both targets c17
+    /// supports. A 32-byte vector therefore aligns to 16, not 32; only
+    /// `-mavx2` raises the cap, and c17 does not model that. Measured
+    /// against gcc across widths 4 through 128 rather than assumed, because
+    /// "aligns to its own width" is the obvious rule and is wrong. An
+    /// `aligned(n)` written alongside, `align`, takes precedence, which is
+    /// what `<link.h>` does: `__vector_size__(32), __aligned__(16)`.
+    pub fn vector_of(&mut self, elem: TypeId, count: usize, align: Option<u32>) -> TypeId {
+        const MAX_VECTOR_ALIGN: usize = 16;
+        let bytes = self.size_bytes(elem) * count;
+        let natural = bytes.next_power_of_two().min(MAX_VECTOR_ALIGN) as u32;
+        self.intern(Type {
+            kind: TypeKind::Array,
+            base: Some(elem),
+            array_size: Some(count),
+            modifiers: TypeModifiers::VECTOR,
+            explicit_align: Some(align.unwrap_or(natural)),
+            ..Default::default()
+        })
+    }
+
+    /// The element type and the number of elements of a vector type, or
+    /// `None` for any other type.
+    pub fn vector_lanes(&self, id: TypeId) -> Option<(TypeId, usize)> {
+        if !self.is_vector(id) {
+            return None;
+        }
+        let typ = self.get(id);
+        Some((typ.base?, typ.array_size?))
+    }
+
+    /// The type of a comparison of two vectors of type `id`: as many lanes,
+    /// each a signed integer as wide as `id`'s, holding -1 for true and 0 for
+    /// false -- gcc's, which names an eight-byte lane `long`.
+    pub fn vector_mask_type(&mut self, id: TypeId) -> TypeId {
+        let Some((elem, count)) = self.vector_lanes(id) else {
+            return self.int_id;
+        };
+        let lane = match self.size_bytes(elem) {
+            1 => self.schar_id,
+            2 => self.short_id,
+            4 => self.int_id,
+            8 => self.long_id,
+            _ => self.int128_id,
+        };
+        let mask = self.vector_of(lane, count, None);
+        let mut typ = self.get(mask).clone();
+        typ.modifiers |= TypeModifiers::VECTOR_MASK;
+        self.intern(typ)
+    }
+
+    /// Is this the result type of a vector comparison? See
+    /// [`TypeModifiers::VECTOR_MASK`].
+    pub fn is_vector_mask(&self, id: TypeId) -> bool {
+        self.get(id).modifiers.contains(TypeModifiers::VECTOR_MASK)
+    }
+
+    /// Whether a vector comparison's mask of type `mask` assigns to the
+    /// vector type `target`: integer lanes, as many and as wide.
+    fn mask_assigns_to(&self, mask: TypeId, target: TypeId) -> bool {
+        let (Some((ml, mn)), Some((tl, tn))) = (self.vector_lanes(mask), self.vector_lanes(target))
+        else {
+            return false;
+        };
+        self.is_vector_mask(mask)
+            && mn == tn
+            && self.is_integer(tl)
+            && self.size_bits(ml) == self.size_bits(tl)
     }
 
     /// Is this `__builtin_ms_va_list`, the one pointer `__builtin_va_arg`
@@ -2129,14 +2233,16 @@ impl TypeTable {
 
         let t_ptr = t_kind == TypeKind::Pointer;
         let v_ptr = v_kind == TypeKind::Pointer;
-        let t_agg = matches!(t_kind, TypeKind::Struct | TypeKind::Union);
-        let v_agg = matches!(v_kind, TypeKind::Struct | TypeKind::Union);
+        let t_agg = matches!(t_kind, TypeKind::Struct | TypeKind::Union) || self.is_vector(target);
+        let v_agg = matches!(v_kind, TypeKind::Struct | TypeKind::Union) || self.is_vector(value);
 
         // An aggregate assigns only from a compatible aggregate. Compared
         // through `types_compatible` rather than by TypeId, because struct and
         // union types are deliberately not deduplicated -- they have identity.
         if t_agg || v_agg {
-            let ok = t_agg && v_agg && self.types_compatible(target, value);
+            let ok = t_agg
+                && v_agg
+                && (self.types_compatible(target, value) || self.mask_assigns_to(value, target));
             return (!ok).then_some(AssignFault::Incompatible);
         }
 
@@ -2277,6 +2383,8 @@ impl TypeTable {
     /// and assignment checking all read.
     fn decay_pointee(&self, typ: TypeId) -> Option<TypeId> {
         match self.kind(typ) {
+            // A vector is a value, laid out as an array but never decaying.
+            TypeKind::Array if self.is_vector(typ) => None,
             TypeKind::Array => Some(self.base_type(typ).unwrap_or(self.char_id)),
             TypeKind::Function => Some(typ),
             _ => None,
@@ -2394,7 +2502,8 @@ impl TypeTable {
         // qualifying the array instead would leave `cs.arr[0]` an ordinary
         // `int`, which the subscript reads from the element type, and a write
         // to it would be accepted.
-        if self.kind(id) == TypeKind::Array {
+        // A vector is no array here: it is qualified itself, as gcc does.
+        if self.kind(id) == TypeKind::Array && !self.is_vector(id) {
             let Some(elem) = self.base_type(id) else {
                 return id;
             };

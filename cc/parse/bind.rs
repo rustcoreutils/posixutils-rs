@@ -530,6 +530,8 @@ impl Parser<'_> {
                 let ret = t.base.expect("a function type has a return type");
                 let params = t.params.clone().unwrap_or_default();
                 match self.types.kind(ret) {
+                    // A GNU vector is a value, and may be returned.
+                    TypeKind::Array if self.types.is_vector(ret) => {}
                     TypeKind::Array => diag::error_args(
                         pos,
                         "'{0}' declared as function returning an array",

@@ -2982,6 +2982,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         if let Some(result) = self.try_emit_atomic_assign(op, target, value) {
             return result;
         }
+        if self.types.is_vector(target_typ) {
+            return self.emit_vector_assign(op, target, value);
+        }
 
         // A compound assignment with a complex operand on either side is
         // `t = t op v` computed at the complex common type (C17 6.5.16.2p3)

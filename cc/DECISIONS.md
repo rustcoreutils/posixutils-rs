@@ -184,17 +184,9 @@ compiled:
 #endif
 ```
 
-The choice is to bundle the intrinsic headers — thousands of functions, plus
-element-wise vector arithmetic in the IR and both backends — or to stop
-claiming the capability. The second is a few lines in the predefines and costs
-those projects only the speed of their own fallback path. This section's
-position is that advertising what c17 cannot deliver is the defect, and that
-adding SIMD to make the advertisement true would be the tail wagging the dog.
-It is not what the code does: see the next section.
-
-Vector *arithmetic* is the related non-goal. `vector_size` gives a type a
-vector's storage, which is what makes glibc's `<link.h>` compile, and that is
-deliberately where it stops.
+The predefines stay (see the next section), and the intrinsic headers are to
+be bundled: vector values are computed lane by lane, and the headers are
+written on top of them.
 
 ### Which macros may be withdrawn, and which may not
 
@@ -247,7 +239,7 @@ different test in `execute/` that passes.
 | Another target's backend | `OUT_OF_SCOPE_OTHER_TARGET` | `mipscop-1`..`-4` |
 | `__builtin_issignaling` | `OUT_OF_SCOPE_ISSIGNALING` | No system header uses the builtin (`<math.h>`'s `issignaling` is its own macro), and seven of the nine tests need a format c17 does not have (`_Float128`, `_Float64x`, `bfloat16`) |
 | Pre-C99 implicit `int` with no dialect request | `NEEDS_PRE_C99_DIALECT` | `compile/pr29201`. C17 6.7.2p2 requires a type specifier and GCC 14 made it an error too. A test that asks for `-fpermissive` passes; one that asks for `-std=gnu89` passes because the harness translates that to `-fpermissive` -- c17 itself ignores `-std=gnu89` |
-| Vector values | `OUT_OF_SCOPE_VECTOR_ARITH` | Arithmetic, copies, initializers and comparisons of whole vectors, `__builtin_convertvector`, `__builtin_shuffle`. `vector_size` gives storage only (see above), and a test that only declares vectors runs |
+| Vector values | `OUT_OF_SCOPE_VECTOR_ARITH` | Vectors passed to or returned from a function, `__builtin_convertvector`, `__builtin_shuffle`, none of which c17 has yet. Vector arithmetic, comparisons, casts and assignment run |
 | `__label__` | `OUT_OF_SCOPE_LOCAL_LABELS` | Block-scope label declarations, ruled out with nested functions |
 | Label difference as a constant | `OUT_OF_SCOPE_LABEL_DIFF` | `&&a - &&b` in a static initializer. Labels as values are supported; the difference needs a symbol-difference relocation |
 | A C17 constraint gcc only warns about | `C17_CONSTRAINT_GCC_WARNS` | `compile/pr38857`: 6.7.4p3, an external inline definition referring to a static. `-fpermissive` relaxes it |

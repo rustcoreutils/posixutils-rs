@@ -510,8 +510,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                         let size = self.types.size_bits(typ);
                         self.emit(Instruction::store(converted, sym_id, 0, typ, size));
                     }
-                } else if self.types.is_complex(typ) {
-                    self.store_complex_at(sym_id, 0, typ, init);
+                } else if self.types.is_complex(typ) || self.types.is_vector(typ) {
+                    self.store_addressed_value_at(sym_id, 0, typ, init);
                 } else {
                     // An aggregate that does not travel by value: the
                     // initializer yields its address, and it is block-copied
@@ -809,6 +809,18 @@ impl<'a> super::linearize::Linearizer<'a> {
         typ: TypeId,
         elements: &[InitElement],
     ) {
+        // A vector initialized by one vector value -- `v4si arr[2] = {a, b}`
+        // reaches here once per element -- takes it whole, as a struct does
+        // a struct value; read as a list, it was the first lane.
+        if let [only] = elements {
+            let whole = only.designators.is_empty()
+                && self.types.is_vector(typ)
+                && only.value.typ.is_some_and(|t| self.types.is_vector(t));
+            if whole {
+                self.store_addressed_value_at(base_sym, base_offset, typ, &only.value);
+                return;
+            }
+        }
         match self.types.kind(typ) {
             TypeKind::Array => {
                 // `qualified_with` already puts an array's qualifiers on its
@@ -888,11 +900,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let Some(last) = list.last() else {
                         continue;
                     };
-                    if self.types.is_complex(elem_type) {
-                        // A complex element is two halves, not the scalar the
-                        // store below assumes. `elem_is_aggregate` is false for
-                        // it, so it reaches here.
-                        self.store_complex_at(base_sym, offset, elem_type, &last.value);
+                    if self.types.is_complex(elem_type) || self.types.is_vector(elem_type) {
+                        // A complex element is two halves, and a vector one
+                        // its lanes, not the scalar the store below assumes.
+                        // `elem_is_aggregate` is false for them, so they
+                        // reach here.
+                        self.store_addressed_value_at(base_sym, offset, elem_type, &last.value);
                         continue;
                     }
                     let converted = self.linearize_converted(&last.value, elem_type);
@@ -1010,8 +1023,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                     // `double _Complex z = {1.0};` lands here rather than on
                     // the complex arm of `linearize_local_decl`, because the
                     // braces make it an initializer list first.
-                    if self.types.is_complex(typ) {
-                        self.store_complex_at(base_sym, base_offset, typ, &element.value);
+                    if self.types.is_complex(typ) || self.types.is_vector(typ) {
+                        self.store_addressed_value_at(base_sym, base_offset, typ, &element.value);
                         return;
                     }
                     let converted = self.linearize_converted(&element.value, typ);
@@ -1151,26 +1164,33 @@ impl<'a> super::linearize::Linearizer<'a> {
         reset
     }
 
-    /// Store a complex value into `base_sym` at `offset`, as two halves.
+    /// Store a complex value into `base_sym` at `offset`, as two halves, or
+    /// a GNU vector value, as its bytes.
     ///
-    /// A complex value lives in memory and travels by *address*, so storing it
-    /// the way a scalar member is stored would write the address instead of
-    /// the value.
+    /// Both live in memory and travel by *address*, so storing one the way a
+    /// scalar member is stored would write the address instead of the value.
     ///
     /// The initializer's base precision need not match the object's -- and
     /// usually does not, because `I` is `__builtin_complex(0.0, 1.0)`, a
     /// *double* complex, so `float _Complex f = 2.0f + 3.0f*I;` is a
     /// conversion, and so is a real initializer. Both are converted by
     /// [`Self::linearize_converted`] before the halves are copied.
-    pub(crate) fn store_complex_at(
+    pub(crate) fn store_addressed_value_at(
         &mut self,
         base_sym: PseudoId,
         offset: i64,
-        complex_typ: TypeId,
+        typ: TypeId,
         init: &Expr,
     ) {
-        let value_addr = self.linearize_converted(init, complex_typ);
-        self.copy_complex(base_sym, offset, value_addr, complex_typ);
+        if self.types.is_vector(typ) {
+            let value_addr = self.vector_addr(init);
+            let bytes = self.types.size_bytes(typ) as i64;
+            let vol = self.block_volatility(typ, self.expr_type(init));
+            self.emit_block_copy_at_offset(base_sym, offset, value_addr, bytes, vol);
+            return;
+        }
+        let value_addr = self.linearize_converted(init, typ);
+        self.copy_complex(base_sym, offset, value_addr, typ);
     }
 
     pub(crate) fn linearize_struct_field_init(
@@ -1221,8 +1241,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                     converted, base_sym, offset, field_type, size,
                 ));
             }
-        } else if self.types.is_complex(field_type) {
-            self.store_complex_at(base_sym, offset, field_type, value);
+        } else if self.types.is_complex(field_type) || self.types.is_vector(field_type) {
+            self.store_addressed_value_at(base_sym, offset, field_type, value);
         } else {
             let (actual_type, actual_size) = if self.types.kind(field_type) == TypeKind::Array {
                 let elem_type = self.types.base_type(field_type).unwrap_or(field_type);

@@ -6020,41 +6020,23 @@ fn diagnostics_static_object_larger_than_a_frame_slot_is_accepted() {
     }
 }
 
-/// A `vector_size` value where gcc gives it vector semantics is refused.
-///
-/// c17 implements a vector as storage only -- an array of its elements -- and
-/// an array used as a value decays to its address. So each of these used to
-/// compile to something other than what gcc means: `(long long)v` answered
-/// the vector's address rather than its bits, `v + 1` did pointer
-/// arithmetic, a vector argument or parameter went as a pointer. gcc's torture
-/// tests `20050316-2`, `20050607-1` and `simd-4` all returned wrong answers.
+/// A `vector_size` value passed to or returned from a function is refused:
+/// the calling conventions put one in vector registers, and passing it as
+/// the array it is laid out as handed the callee a pointer -- gcc's torture
+/// test `simd-4` returned wrong answers.
 #[test]
-fn diagnostics_vector_value_is_refused() {
+fn diagnostics_vector_passing_is_refused() {
     let prelude = "typedef int V2SI __attribute__((vector_size(8)));\n\
                    long f(); long l; int c;\n";
     for (name, body) in [
-        (
-            "cast_from",
-            "long t(void) { V2SI v = {1, 2}; return (long long)v; }",
-        ),
-        ("cast_to", "void t(void) { V2SI v = (V2SI)l; (void)&v; }"),
-        (
-            "binary",
-            "void t(void) { V2SI v = {1, 2}; l = (long)(v + 1 == 0); }",
-        ),
-        ("unary", "void t(void) { V2SI v = {1, 2}; c = !v; }"),
-        ("deref", "int t(void) { V2SI v = {1, 2}; return *v; }"),
         ("argument", "void t(void) { V2SI v = {1, 2}; f(v); }"),
-        (
-            "conditional",
-            "void t(void) { V2SI v = {1, 2}; (void)(c ? v : v); }",
-        ),
         ("parameter", "long t(V2SI v) { return 0; }"),
+        ("return", "V2SI t(void) { V2SI v = {1, 2}; return v; }"),
     ] {
         compile_expect_error(
             &format!("vector_value_{name}"),
             &format!("{prelude}{body}\n"),
-            "'vector_size' types as storage only",
+            "c17 does not yet pass or return 'vector_size' values",
         );
     }
 }

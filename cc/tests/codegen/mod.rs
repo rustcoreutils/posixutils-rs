@@ -51,3 +51,4 @@ mod trapping_folds;
 mod types_exprs;
 mod unwind;
 mod varargs;
+mod vectors;

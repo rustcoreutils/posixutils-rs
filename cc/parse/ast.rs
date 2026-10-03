@@ -1576,6 +1576,10 @@ pub fn is_brace_elision_candidate(
         {
             return false;
         }
+        // Likewise a GNU vector value for a vector.
+        if types.is_vector(elem_typ) && types.is_vector(target_type) {
+            return false;
+        }
     }
     true
 }

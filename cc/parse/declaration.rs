@@ -449,21 +449,13 @@ impl Parser<'_> {
                     _ => None,
                 };
                 // A non-list value for an aggregate member is brace elision:
-                // it consumes an unknown share of the elements after it.
-                // A string literal for a character array is not elision.
+                // it consumes an unknown share of the elements after it --
+                // unless it initializes the whole member, as a string
+                // literal for a character array or a value of the member's
+                // own type does.
                 let elided = sub.is_some_and(|t| {
-                    matches!(
-                        self.types.kind(t),
-                        TypeKind::Struct | TypeKind::Union | TypeKind::Array
-                    )
-                }) && !matches!(
-                    element.value.kind,
-                    ExprKind::InitList { .. }
-                        | ExprKind::StringLit(_)
-                        | ExprKind::WideStringLit(_)
-                        | ExprKind::Utf16StringLit(_)
-                        | ExprKind::Utf32StringLit(_)
-                );
+                    crate::parse::ast::is_brace_elision_candidate(self.types, element, t)
+                });
                 next = if elided { None } else { next.map(|i| i + 1) };
                 sub
             } else {
@@ -1343,6 +1335,24 @@ impl<'a> Parser<'a> {
         if ctx != SpecContext::Declaration {
             self.check_implicit_int(explicit, start);
         }
+
+        // A `vector_size` among the specifiers -- written before the type or
+        // inside it -- makes the type they name a vector, for every
+        // declarator, as gcc reads it. Held for the declarator, it reached
+        // the first one only, and a function's own type rather than its
+        // return type.
+        let (ty, id) = if self.pending_vector_size.is_some() {
+            let outer = ty.modifiers & (Type::DECL_SPECIFIERS | Type::QUALIFIERS);
+            let mut elem = ty;
+            elem.modifiers.remove(outer);
+            let elem = self.types.intern(elem);
+            let vector = self.apply_pending_vector_size(elem);
+            let mut ty = self.types.get(vector).clone();
+            ty.modifiers |= outer;
+            (ty, None)
+        } else {
+            (ty, id)
+        };
 
         Ok(DeclSpecifiers {
             ty,

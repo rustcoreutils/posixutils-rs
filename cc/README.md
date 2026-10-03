@@ -121,17 +121,11 @@ Supported:
 
 Not yet implemented:
 - assembly peephole optimizations
+- `vector_size` values passed to or returned from a function, and the SIMD
+  intrinsic headers (`immintrin.h` and friends). Vector arithmetic,
+  comparisons, casts and assignment are computed lane by lane
 
 Will not implement:
-- vector *arithmetic*. `vector_size` gives a type a vector's storage — the size
-  and alignment GCC gives it, which is what glibc's `<link.h>` needs — and that
-  is deliberately where it stops. Element-wise `+`, `*` and the rest need a
-  vector type in the IR and in both backends, so they are diagnosed rather than
-  silently computed on one element
-- SIMD intrinsic headers (`immintrin.h` and friends). Code guarded on
-  `#ifdef __SSE2__` reaches for one and fails. The macro is not the fault:
-  SSE2 is architectural baseline for x86-64 and gcc defines it unconditionally,
-  as c17 does — it describes the target, not the header set. See [DECISIONS.md](DECISIONS.md)
 - `__auto_type`; nested functions and `__label__`. Clang refuses nested
   functions too, and they need executable-stack trampolines
 - `_Imaginary` types, beyond what C17 requires of an implementation without

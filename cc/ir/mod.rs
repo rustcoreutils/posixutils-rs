@@ -33,6 +33,7 @@ mod linearize_atomic;
 mod linearize_emit;
 mod linearize_init;
 mod linearize_stmt;
+mod linearize_vector;
 pub mod loadfwd;
 pub mod lower;
 pub mod mach_o_dtors;

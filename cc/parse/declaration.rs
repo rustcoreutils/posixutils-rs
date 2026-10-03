@@ -362,6 +362,127 @@ impl Parser<'_> {
     /// Only the outermost list is walked, and only when the bound is known: an
     /// array sized *by* this initializer cannot overflow it, and a designator
     /// inside a nested list addresses a different object than `typ`.
+    /// C17 6.7.9p7: each designator names a member of, or an index into,
+    /// the current object -- `.y` in an initializer for a struct with no `y`
+    /// is a constraint violation, which was dropped in silence and its value
+    /// with it. Nested lists are followed wherever the subobject they
+    /// initialize is known: through a designator, or by position until brace
+    /// elision makes the position unclear.
+    pub(crate) fn check_designators(&self, typ: TypeId, elements: &[InitElement]) {
+        let kind = self.types.kind(typ);
+        let members: Vec<TypeId> = match kind {
+            TypeKind::Struct => self
+                .types
+                .composite(typ)
+                .map(|c| {
+                    c.members
+                        .iter()
+                        .filter(|m| m.name != StringId::EMPTY || m.bit_width.is_none())
+                        .map(|m| m.typ)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        // The position of the next positional element: an index into
+        // `members` for a struct, or `None` once it can no longer be known.
+        let mut next: Option<usize> = Some(0);
+        for element in elements {
+            let sub = if element.designators.is_empty() {
+                let sub = match kind {
+                    TypeKind::Array => self.types.base_type(typ),
+                    TypeKind::Struct => next.and_then(|i| members.get(i).copied()),
+                    _ => None,
+                };
+                // A non-list value for an aggregate member is brace elision:
+                // it consumes an unknown share of the elements after it.
+                // A string literal for a character array is not elision.
+                let elided = sub.is_some_and(|t| {
+                    matches!(
+                        self.types.kind(t),
+                        TypeKind::Struct | TypeKind::Union | TypeKind::Array
+                    )
+                }) && !matches!(
+                    element.value.kind,
+                    ExprKind::InitList { .. }
+                        | ExprKind::StringLit(_)
+                        | ExprKind::WideStringLit(_)
+                        | ExprKind::Utf16StringLit(_)
+                        | ExprKind::Utf32StringLit(_)
+                );
+                next = if elided { None } else { next.map(|i| i + 1) };
+                sub
+            } else {
+                let resolved =
+                    self.designated_subobject(typ, &element.designators, element.value.pos);
+                // After `.m = v` the next positional element is the member
+                // after `m`, which only a direct member pins down.
+                next = match element.designators.first() {
+                    Some(Designator::Field(name)) if kind == TypeKind::Struct => self
+                        .types
+                        .composite(typ)
+                        .and_then(|c| {
+                            c.members
+                                .iter()
+                                .filter(|m| m.name != StringId::EMPTY || m.bit_width.is_none())
+                                .position(|m| m.name == *name)
+                        })
+                        .map(|i| i + 1),
+                    _ => None,
+                };
+                resolved
+            };
+            if let (Some(sub), ExprKind::InitList { elements }) = (sub, &element.value.kind) {
+                self.check_designators(sub, elements);
+            }
+        }
+    }
+
+    /// The subobject a designator chain names in an object of type `typ`,
+    /// reporting the first designator that names nothing.
+    fn designated_subobject(
+        &self,
+        typ: TypeId,
+        designators: &[Designator],
+        pos: Position,
+    ) -> Option<TypeId> {
+        let mut current = typ;
+        for designator in designators {
+            current = match designator {
+                Designator::Field(name) => {
+                    if !matches!(self.types.kind(current), TypeKind::Struct | TypeKind::Union) {
+                        diag::error(
+                            pos,
+                            &gettext("field name not in record or union initializer"),
+                        );
+                        return None;
+                    }
+                    match self.types.find_member(current, *name) {
+                        Some(member) => member.typ,
+                        None => {
+                            let named = self.types.format_type(current, Some(self.idents));
+                            let spelled = self.idents.get_opt(*name).unwrap_or("");
+                            diag::error_args(
+                                pos,
+                                "'{0}' has no member named '{1}'",
+                                &[&named, spelled],
+                            );
+                            return None;
+                        }
+                    }
+                }
+                Designator::Index(_) | Designator::IndexRange(..) => {
+                    if self.types.kind(current) != TypeKind::Array {
+                        diag::error(pos, &gettext("array index in non-array initializer"));
+                        return None;
+                    }
+                    self.types.base_type(current)?
+                }
+            };
+        }
+        Some(current)
+    }
+
     fn check_designator_bounds(&self, typ: TypeId, elements: &[InitElement]) {
         if self.types.kind(typ) != TypeKind::Array {
             return;
@@ -405,6 +526,7 @@ impl Parser<'_> {
         let ExprKind::InitList { elements } = &init.kind else {
             return;
         };
+        self.check_designators(typ, elements);
         // A designator names its own position, so the *count* of elements says
         // nothing -- but the position itself can still be out of range, and
         // nothing checked that anywhere: `int a[4] = {[10] = 7};` compiled and
@@ -778,6 +900,15 @@ impl<'a> Parser<'a> {
                         ));
                     };
                     self.expect_special(b')')?;
+                    // C17 6.7.2.4p3: nor an atomic or qualified type.
+                    if self.types.modifiers(inner).intersects(
+                        TypeModifiers::CONST
+                            | TypeModifiers::VOLATILE
+                            | TypeModifiers::RESTRICT
+                            | TypeModifiers::ATOMIC,
+                    ) {
+                        diag::error(pos, &gettext("'_Atomic' applied to a qualified type"));
+                    }
                     tally.note_data_type("_Atomic", pos);
                     let mut atomic = self.types.get(inner).clone();
                     atomic.modifiers |= TypeModifiers::ATOMIC;
@@ -1324,6 +1455,19 @@ impl Parser<'_> {
                 ))
             }
         };
+        // C17 6.7.5p4: an alignment the implementation supports -- the same
+        // ceiling as the `aligned` attribute's.
+        if i128::from(align) > super::attribute::MAX_ATTR_ALIGN {
+            diag::error_args(
+                alignas_pos,
+                "requested alignment '{0}' exceeds object file maximum {1}",
+                &[
+                    &align.to_string(),
+                    &super::attribute::MAX_ATTR_ALIGN.to_string(),
+                ],
+            );
+            return Ok(());
+        }
         // Several may appear; the strictest wins (C11 6.7.5).
         self.pending_alignas = Some(match self.pending_alignas {
             Some(existing) => existing.max(align),

@@ -67,3 +67,21 @@ fn simple_escapes_are_units() {
         [Escaped::Unit(10), Escaped::Unit(0x71)]
     ));
 }
+
+/// C17 6.4.4.4p1: a character constant holds at least one character.
+#[test]
+fn empty_character_constant_is_reported() {
+    let before = crate::diag::error_count();
+    let (value, _) = char_literal_value("", None, crate::token::lexer::Position::default());
+    assert_eq!(value, 0);
+    assert!(crate::diag::error_count() > before);
+}
+
+/// A universal character name past U+10FFFF names no character at all.
+#[test]
+fn ucn_beyond_the_codespace_is_forbidden() {
+    assert!(crate::token::lexer::ucn_is_forbidden(0x110000));
+    assert!(crate::token::lexer::ucn_is_forbidden(0xFFFF_FFFF));
+    assert!(!crate::token::lexer::ucn_is_forbidden(0x10FFFF));
+    assert!(!crate::token::lexer::ucn_is_forbidden(0x1F600));
+}

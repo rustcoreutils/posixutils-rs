@@ -144,6 +144,11 @@ pub(crate) struct ParsedDeclarator {
     /// A function declarator's parameters, with their names, for a
     /// definition to bind.
     pub(crate) params: Option<Vec<RawParam>>,
+    /// Whether the declarator is only its identifier, perhaps parenthesized
+    /// -- `a` or `(a)` -- deriving nothing, and with no attribute in its
+    /// parentheses. An array suffix on one is the declared object's own,
+    /// whose `[static]` and qualifiers a parameter may carry.
+    pub(crate) plain_name: bool,
 }
 
 // Parser

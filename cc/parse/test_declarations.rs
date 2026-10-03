@@ -106,6 +106,40 @@ fn test_declarator_and_storage_rules() {
     parse_tu("int * restrict p; typedef int *IP; restrict IP r; int (*fp(void))[3];").unwrap();
 }
 
+/// Parse `src`, requiring it to be accepted: no parse error and no error
+/// diagnostic.
+fn assert_accepted(src: &str) {
+    let before = crate::diag::error_count();
+    assert!(parse_tu(src).is_ok(), "{src}: parse error");
+    assert_eq!(crate::diag::error_count(), before, "{src}: rejected");
+}
+
+/// C17 6.7.6.3p7: `static` and qualifiers in `[ ]` belong to the parameter's
+/// own array type; a parenthesized name, `(a)`, is still that declarator.
+#[test]
+fn test_static_array_parameter_with_parenthesized_name() {
+    for src in [
+        "void f3(int (a)[static 3]) {}",
+        "void f(int ((a))[static 3]) {}",
+        "void f(int (a)[const 3]) {}",
+        "void f(int (a)[static 3][4]) {}",
+        "void f(int (a[static 3])) {}",
+        "void f(int (*a[static 3])) {}",
+    ] {
+        assert_accepted(src);
+    }
+    for src in [
+        "void f(int (*a)[static 3]) {}",
+        "void f(int (a[3])[static 3]) {}",
+        "void f(void) { int (a)[static 3]; }",
+        // gcc's: an attribute in the parentheses makes them a declarator.
+        "void f(int (__attribute__((unused)) a)[static 3]) {}",
+        "void f(int ((__attribute__((unused)) a))[static 3]) {}",
+    ] {
+        assert_rejected(src);
+    }
+}
+
 /// C17 6.9.2p2-p3: a file-scope array declared without an extent is judged at
 /// the end of the translation unit -- a later declaration may complete it --
 /// and one still incomplete there gets one element, as gcc gives it, with a

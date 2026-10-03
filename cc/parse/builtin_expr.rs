@@ -867,6 +867,30 @@ impl Parser<'_> {
                     }
                 }
                 self.expect_special(b')')?;
+                // C17 7.19p3: the member designator is one whose address
+                // `&(t.member-designator)` is a constant -- so never a
+                // bit-field.
+                let mut current = type_id;
+                for step in &path {
+                    current = match step {
+                        OffsetOfPath::Field(name) => match self.types.find_member(current, *name) {
+                            Some(m) if m.bit_width.is_some() => {
+                                diag::error_args(
+                                    token_pos,
+                                    "attempt to take address of bit-field structure member '{0}'",
+                                    &[self.idents.get_opt(*name).unwrap_or("")],
+                                );
+                                break;
+                            }
+                            Some(m) => m.typ,
+                            None => break,
+                        },
+                        OffsetOfPath::Index(_) => match self.types.base_type(current) {
+                            Some(elem) => elem,
+                            None => break,
+                        },
+                    };
+                }
                 Ok(Self::typed_expr(
                     ExprKind::OffsetOf { type_id, path },
                     self.types.ulong_id, // size_t is typically unsigned long

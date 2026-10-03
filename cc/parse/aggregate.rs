@@ -303,6 +303,22 @@ impl Parser<'_> {
         }
     }
 
+    /// Every name `members` puts in a structure's name space: its named
+    /// members, and those of its anonymous structure and union members.
+    fn member_names(&self, members: &[StructMember]) -> Vec<StringId> {
+        let mut names = Vec::new();
+        for m in members {
+            if m.name != StringId::EMPTY {
+                names.push(m.name);
+            } else if m.bit_width.is_none() {
+                if let Some(c) = self.types.composite(m.typ) {
+                    names.extend(self.member_names(&c.members));
+                }
+            }
+        }
+        names
+    }
+
     /// For the definition of a tag of `kind` in this scope: the type to answer
     /// instead, when an earlier declaration of the tag here forbids it --
     /// one of another kind (C17 6.7.2.3p2), or one already defined
@@ -644,6 +660,18 @@ impl Parser<'_> {
                     self.advance(); // consume ';'
                     continue;
                 }
+                // The anonymous member's own members join this name space
+                // (C17 6.7.2.1p13), so they may not repeat one already here.
+                let existing = self.member_names(&members);
+                let added = self
+                    .types
+                    .composite(member_base_type_id)
+                    .map(|c| self.member_names(&c.members))
+                    .unwrap_or_default();
+                for name in added.iter().filter(|n| existing.contains(n)) {
+                    let spelled = self.idents.get_opt(*name).unwrap_or("").to_string();
+                    diag::error_args(self.current_pos(), "duplicate member '{0}'", &[&spelled]);
+                }
                 members.push(StructMember {
                     name: StringId::EMPTY,
                     typ: member_base_type_id,
@@ -738,6 +766,19 @@ impl Parser<'_> {
 
                 // What this declarator adds to the specifiers' alignment.
                 let member_align = specifier_align.merge(self.take_member_align());
+                // C11 6.7.5p5: the `_Alignas` keyword may not weaken a
+                // member's alignment either; the `aligned` attribute may.
+                if let (Some(written), Some(_)) = (member_align.written, self.pending_alignas_kw) {
+                    let natural = self.types.natural_alignment(typ) as u32;
+                    if written < natural {
+                        let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
+                        diag::error_args(
+                            self.current_pos(),
+                            "'_Alignas' specifiers cannot reduce alignment of '{0}'",
+                            &[&spelled],
+                        );
+                    }
+                }
 
                 // C17 6.7.2.1p3: no member of incomplete or function type,
                 // the flexible array member excepted. A member of the type
@@ -758,7 +799,7 @@ impl Parser<'_> {
                 // -- anonymous struct/union members and unnamed bitfields
                 // -- all carry the empty name and are not repeats of each
                 // other.
-                if name != StringId::EMPTY && members.iter().any(|m| m.name == name) {
+                if name != StringId::EMPTY && self.member_names(&members).contains(&name) {
                     let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
                     diag::error_args(self.current_pos(), "duplicate member '{0}'", &[&spelled]);
                 }
@@ -923,8 +964,22 @@ impl Parser<'_> {
             ));
         }
 
-        // Check that width doesn't exceed type size
-        let max_width = self.types.size_bits(typ_id);
+        // C17 6.7.2.1p5: not an atomic type, which no bit-field can be
+        // accessed as.
+        if self.types.modifiers(typ_id).contains(TypeModifiers::ATOMIC) {
+            return Err(ParseError::new(
+                "bit-field has atomic type",
+                self.current_pos(),
+            ));
+        }
+
+        // Check that width doesn't exceed type size: the type's width in
+        // bits (6.7.2.1p4), which for `_Bool` is one, not its eight-bit size.
+        let max_width = if self.types.kind(typ_id) == TypeKind::Bool {
+            1
+        } else {
+            self.types.size_bits(typ_id)
+        };
         if width > max_width {
             return Err(ParseError::new(
                 format!("bitfield width {} exceeds type size {}", width, max_width),

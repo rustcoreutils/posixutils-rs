@@ -1071,6 +1071,62 @@ impl<'a> Parser<'a> {
         Ok(self.with_type_name_extents(dims, literal))
     }
 
+    /// C17 6.5.4p2-p4 for a cast to anything but a union (gcc's extension)
+    /// or an array or function type (reported by the caller): the target is
+    /// `void` or a scalar type, the operand is a scalar, and neither side
+    /// pairs a pointer with a floating type. Each of these compiled -- a
+    /// structure reinterpreted as an integer, a `double`'s bits as an
+    /// address -- where gcc rejects them in its words.
+    fn check_cast_operand(&mut self, target: TypeId, expr: &Expr, pos: Position) {
+        let target_kind = self.types.kind(target);
+        if target_kind == TypeKind::Void {
+            return;
+        }
+        let Some(from) = expr.typ.map(|t| self.decayed_type(t)) else {
+            return;
+        };
+        // Vectors have their own rules, checked by the caller.
+        if self.types.is_vector(target) || self.types.is_vector(from) {
+            return;
+        }
+        // A cast to the operand's own structure type, qualifiers aside, is
+        // gcc's extension and converts nothing; any other is not a scalar
+        // conversion at all.
+        if matches!(target_kind, TypeKind::Struct) {
+            let target = self.types.unqualified(target);
+            let from = self.lvalue_converted_type(from);
+            if !self.types.types_compatible(from, target) {
+                diag::error(pos, &gettext("conversion to non-scalar type requested"));
+            } else if !self.types.is_composite_complete(target) {
+                let named = self.types.format_type(target, Some(self.idents));
+                diag::error_args(pos, "invalid use of undefined type '{0}'", &[&named]);
+            }
+            return;
+        }
+        let from_kind = self.types.kind(from);
+        let wanted = if self.types.is_float(target) {
+            "a floating-point"
+        } else if target_kind == TypeKind::Pointer {
+            "a pointer"
+        } else {
+            "an integer"
+        };
+        if matches!(from_kind, TypeKind::Struct | TypeKind::Union) {
+            diag::error_args(
+                pos,
+                "aggregate value used where {0} was expected",
+                &[wanted],
+            );
+        } else if from_kind == TypeKind::Pointer && self.types.is_float(target) {
+            diag::error(
+                pos,
+                &gettext("pointer value used where a floating-point was expected"),
+            );
+        } else if target_kind == TypeKind::Pointer && self.types.is_float(from) {
+            diag::error(pos, &gettext("cannot convert to a pointer type"));
+        }
+    }
+
     /// A GNU cast to union type, `(union U)expr`.
     ///
     /// The operand must have the type of one of the members -- see
@@ -1145,6 +1201,7 @@ impl<'a> Parser<'a> {
         // `Some(0)`, conflating it with the GNU zero-length array. Accept
         // both, since the declaration path (`infer_array_size_from_init`)
         // also does.
+        self.check_designators(typ, &elements);
         let final_typ = if self.types.kind(typ) == TypeKind::Array
             && matches!(self.types.get(typ).array_size, None | Some(0))
         {
@@ -1276,6 +1333,11 @@ impl<'a> Parser<'a> {
     /// subscript or a member reaches an element whose type is complete by
     /// construction, and a call cannot return an array.
     fn check_sizeof_expr_operand(&self, expr: &Expr, pos: Position) {
+        // C17 6.5.3.4p1: not a bit-field, which has no size in bytes.
+        if self.bit_field_designated(expr).is_some() {
+            diag::error(pos, &gettext("'sizeof' applied to a bit-field"));
+            return;
+        }
         let Some(typ) = expr.typ else {
             return;
         };
@@ -1368,6 +1430,20 @@ impl<'a> Parser<'a> {
                     let expr = self.parse_postfix_suffixes(literal)?;
                     return Ok(self.alignof_expr(expr, size_t, alignof_pos));
                 }
+                // C17 6.5.3.4p1: not an incomplete type. gcc answers 1 for
+                // `void`, as an extension, and so does c17. A variable length
+                // array's extents are its own size expressions, so `int[n]`
+                // is complete.
+                if self.types.kind(typ) != TypeKind::Void
+                    && self.type_name_is_incomplete(typ, dims.len())
+                {
+                    let named = self.types.format_type(typ, Some(self.idents));
+                    diag::error_args(
+                        alignof_pos,
+                        "invalid application of '_Alignof' to incomplete type '{0}'",
+                        &[&named],
+                    );
+                }
                 return Ok(Expr::typed(ExprKind::AlignofType(typ), size_t, alignof_pos));
             }
 
@@ -1403,6 +1479,9 @@ impl<'a> Parser<'a> {
     /// implementation: the constant evaluator and the linearizer each computed
     /// this from `expr.typ` alone and so disagreed with gcc identically.
     fn alignof_expr(&mut self, expr: Expr, size_t: TypeId, pos: Position) -> Expr {
+        if self.bit_field_designated(&expr).is_some() {
+            diag::error(pos, &gettext("'_Alignof' applied to a bit-field"));
+        }
         if let ExprKind::Ident(symbol_id) = &expr.kind {
             let symbol = self.symbols.get(*symbol_id);
             if let Some(align) = symbol.explicit_align {
@@ -1526,7 +1605,19 @@ impl<'a> Parser<'a> {
                 let member = self.expect_identifier()?;
                 // Get member type: dereference the pointer, then find the member
                 let member_type = if let Some(t) = expr.typ {
-                    if let Some(struct_type) = self.types.base_type(t) {
+                    // C17 6.5.2.3p2: the operand of `->` is a pointer (an
+                    // array decays to one). A structure there has a base type
+                    // of nothing, and the member access was dropped silently.
+                    let decayed = self.decayed_type(t);
+                    if self.types.kind(decayed) != TypeKind::Pointer {
+                        let have = self.types.format_type(t, Some(self.idents));
+                        diag::error_args(
+                            arrow_pos,
+                            "invalid type argument of '->' (have '{0}')",
+                            &[&have],
+                        );
+                        self.types.int_id
+                    } else if let Some(struct_type) = self.types.base_type(decayed) {
                         let kind = self.types.kind(struct_type);
                         if kind != TypeKind::Struct && kind != TypeKind::Union {
                             diag::error(
@@ -1641,6 +1732,9 @@ impl<'a> Parser<'a> {
         let mut pieces: Vec<(Position, Vec<literal::Escaped>)> = Vec::new();
         let mut encoding: Option<TokenType> = None;
         let mut mixed_reported = false;
+        // A `u8` literal folds into the narrow token type, so it is tracked
+        // apart: it may join a plain literal but not a wide one (6.4.5p2).
+        let mut saw_utf8 = false;
 
         loop {
             let kind = self.peek();
@@ -1650,6 +1744,7 @@ impl<'a> Parser<'a> {
                 | TokenType::Utf16String
                 | TokenType::Utf32String => {
                     let token = self.consume();
+                    saw_utf8 |= token.encoding_prefix() == "u8";
                     match &token.value {
                         TokenValue::String(s)
                         | TokenValue::WideString(s)
@@ -1664,20 +1759,21 @@ impl<'a> Parser<'a> {
             };
             pieces.push(piece);
 
+            // Two wide prefixes that differ, or a `u8` anywhere in a run that
+            // has a wide one -- judged once this piece's own prefix is
+            // recorded, so `u8"a" L"b"` is caught as `L"a" u8"b"` is.
+            let mut mixed = false;
             if kind != TokenType::String {
-                match encoding {
-                    None => encoding = Some(kind),
-                    Some(prev) if prev != kind && !mixed_reported => {
-                        diag::error(
-                            start_pos,
-                            &gettext(
-                                "concatenation of string literals with different encoding prefixes",
-                            ),
-                        );
-                        mixed_reported = true;
-                    }
-                    _ => {}
-                }
+                mixed = encoding.is_some_and(|prev| prev != kind);
+                encoding.get_or_insert(kind);
+            }
+            mixed |= saw_utf8 && encoding.is_some();
+            if mixed && !mixed_reported {
+                diag::error(
+                    start_pos,
+                    &gettext("concatenation of string literals with different encoding prefixes"),
+                );
+                mixed_reported = true;
             }
         }
 
@@ -2228,6 +2324,20 @@ impl<'a> Parser<'a> {
                         &gettext("'_Generic' association has variable length type"),
                     );
                 }
+                // ... and names a complete object type: a function type or
+                // an incomplete one can never be the controlling
+                // expression's.
+                if self.types.kind(assoc_typ) == TypeKind::Function {
+                    diag::error(
+                        assoc_pos,
+                        &gettext("'_Generic' association has function type"),
+                    );
+                } else if self.type_name_is_incomplete(assoc_typ, dims.len()) {
+                    diag::error(
+                        assoc_pos,
+                        &gettext("'_Generic' association has incomplete type"),
+                    );
+                }
                 self.expect_special(b':')?;
                 let expr = self.parse_assignment_expr()?;
 
@@ -2530,7 +2640,7 @@ impl<'a> Parser<'a> {
                                 let cast = self.cast_to_union(typ, expr, paren_pos);
                                 return Ok(self.with_type_name_extents(dims, cast));
                             }
-                            _ => {}
+                            _ => self.check_cast_operand(typ, &expr, paren_pos),
                         }
                         // gcc reinterprets the bits between a vector and a
                         // same-sized scalar or vector; the array model would

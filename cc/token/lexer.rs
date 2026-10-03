@@ -443,7 +443,11 @@ fn decode_utf8(lead: u8, peek: &mut Peek<'_>) -> Option<(char, usize)> {
 /// Takes the raw scalar rather than a `char` because a surrogate cannot be
 /// represented as one: `char::from_u32` rejects it.
 pub(crate) fn ucn_is_forbidden(val: u32) -> bool {
-    (val < 0xA0 && val != 0x24 && val != 0x40 && val != 0x60) || (0xD800..=0xDFFF).contains(&val)
+    (val < 0xA0 && val != 0x24 && val != 0x40 && val != 0x60)
+        || (0xD800..=0xDFFF).contains(&val)
+        // Past the last code point ISO/IEC 10646 has, so it names no
+        // character at all: `\U00110000`.
+        || val > 0x10FFFF
 }
 
 // Translation phase 2 (line splicing)

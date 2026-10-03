@@ -253,6 +253,8 @@ pub(crate) fn char_literal_value(
     let elements = parse_string_literal(s);
     check_elements(&elements, prefixed_bits.unwrap_or(CHAR_UNIT_BITS), pos);
     if elements.is_empty() {
+        // C17 6.4.4.4p1: a character constant holds at least one character.
+        crate::diag::error(pos, &gettextrs::gettext("empty character constant"));
         return (0, false);
     }
 

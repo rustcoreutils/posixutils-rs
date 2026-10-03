@@ -328,6 +328,29 @@ fn derived_types_c_forbids() {
     );
 }
 
+/// `static` and qualifiers in `[ ]` qualify the parameter's own array type,
+/// however its name is parenthesized; through a pointer they do not.
+#[test]
+fn static_array_parameter_with_parenthesized_name() {
+    let src = "static int sum(int (a)[static 3], int ((b))[const 2]) {\n\
+                   return a[0] + a[1] + a[2] + b[1];\n\
+               }\n\
+               int main(void) { int x[3] = {1, 2, 3}, y[2] = {0, 4};\n\
+                   return sum(x, y) == 10 ? 0 : 1; }\n";
+    assert_eq!(compile_and_run("static_param_paren", src, &[]), 0);
+    compile_expect_error(
+        "static_param_through_pointer",
+        "void f(int (*a)[static 3]) { (void)a; }\n",
+        "static or type qualifiers in non-parameter array declarator",
+    );
+    // gcc's: an attribute in the parentheses makes them a declarator.
+    compile_expect_error(
+        "static_param_attributed_group",
+        "void f(int (__attribute__((unused)) a)[static 3]) { (void)a; }\n",
+        "static or type qualifiers in non-parameter array declarator",
+    );
+}
+
 /// C17 6.9.2p2: a file-scope array declared without an extent is judged at
 /// the end of the unit. Completed by a later declaration it is that size,
 /// silently; still incomplete, it has one element and gcc's warning, once.

@@ -24,6 +24,7 @@ mod cast_to_union;
 mod complex_specifiers;
 mod conditional_operands;
 mod declarations;
+mod expressions;
 mod function_compatibility;
 mod incomplete_types;
 mod inline_static_reference;

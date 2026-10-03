@@ -42,7 +42,7 @@ pub enum AttributeArg {
 
 /// The largest alignment `aligned` may request: gcc's object-file maximum,
 /// 2^28 bytes.
-const MAX_ATTR_ALIGN: i128 = 1 << 28;
+pub(super) const MAX_ATTR_ALIGN: i128 = 1 << 28;
 
 /// How an attribute's arguments are read.
 ///

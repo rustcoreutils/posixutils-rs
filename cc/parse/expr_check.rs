@@ -765,6 +765,8 @@ impl Parser<'_> {
             }
             if !self.string_literal_suits_array(target, init) {
                 diag::error(init.pos, &gettext("invalid initializer"));
+            } else {
+                self.check_string_fits_array(target, init);
             }
             return;
         }
@@ -834,6 +836,30 @@ impl Parser<'_> {
     ///
     /// Returns false for a non-string initializer too: an array has no other
     /// unbraced form.
+    /// C17 6.7.9p2, p14: a string literal may fill an array exactly -- its
+    /// terminating null then has no room, and is dropped -- but may not
+    /// overrun it. gcc warns and truncates, and so does c17.
+    fn check_string_fits_array(&self, target: TypeId, init: &Expr) {
+        let Some(capacity) = self.types.array_size(target).filter(|&n| n > 0) else {
+            return;
+        };
+        let units = match &init.kind {
+            ExprKind::StringLit(bytes) => bytes.chars().count(),
+            ExprKind::WideStringLit(units) | ExprKind::Utf32StringLit(units) => units.len(),
+            ExprKind::Utf16StringLit(units) => units.len(),
+            _ => return,
+        };
+        if units > capacity {
+            let elem = self.types.base_type(target).unwrap_or(self.types.char_id);
+            let named = self.types.format_type(elem, Some(self.idents));
+            diag::warning_args(
+                init.pos,
+                "initializer-string for array of '{0}' is too long",
+                &[&named],
+            );
+        }
+    }
+
     fn string_literal_suits_array(&mut self, target: TypeId, init: &Expr) -> bool {
         let narrow = matches!(init.kind, ExprKind::StringLit(_));
         let wide = matches!(
@@ -958,6 +984,21 @@ impl Parser<'_> {
         }
     }
 
+    /// The member `expr` designates when it is a bit-field: `s.m` or `p->m`
+    /// where `m` was declared with a width.
+    pub(crate) fn bit_field_designated(&self, expr: &Expr) -> Option<StringId> {
+        let (aggregate, member) = match &expr.kind {
+            ExprKind::Member { expr, member } => (expr.typ?, *member),
+            // A pointer's pointee, or an array's element: the array decays.
+            ExprKind::Arrow { expr, member } => (self.types.base_type(expr.typ?)?, *member),
+            _ => return None,
+        };
+        self.types
+            .find_member(aggregate, member)
+            .and_then(|m| m.bit_width)
+            .map(|_| member)
+    }
+
     /// Report an operand of unary `&` that has no address (C17 6.5.3.2p1):
     /// one that is neither a function designator nor an lvalue, such as
     /// `&(i + 1)` or `&creal(z)` -- a call's result is a value, even when the
@@ -975,7 +1016,22 @@ impl Parser<'_> {
             diag::error_args(pos, "lvalue required as {0}", &["unary '&' operand"]);
             return;
         }
-        let ExprKind::Ident(symbol_id) = &operand.kind else {
+        // C17 6.5.3.2p1: never a bit-field, which has no address.
+        if let Some(member) = self.bit_field_designated(operand) {
+            diag::error_args(
+                pos,
+                "cannot take address of bit-field '{0}'",
+                &[self.str(member)],
+            );
+            return;
+        }
+        // The address of a member is the address of the object it is in, so
+        // `&s.a` of a `register` structure asks for the register's.
+        let mut root = operand;
+        while let ExprKind::Member { expr, .. } = &root.kind {
+            root = expr;
+        }
+        let ExprKind::Ident(symbol_id) = &root.kind else {
             return;
         };
         let sym = self.symbols.get(*symbol_id);
@@ -1050,7 +1106,38 @@ impl Parser<'_> {
                     "assignment of read-only variable{0}",
                     &[&var_name.to_string()],
                 );
+                return;
+            }
+            // C17 6.3.2.1p1: a structure or union with a `const` member,
+            // at any depth, is not a modifiable lvalue as a whole -- the
+            // assignment would write the member.
+            if self.has_read_only_member(typ_id) {
+                diag::error(
+                    pos,
+                    &gettext("assignment of a structure or union with a read-only member"),
+                );
             }
         }
+    }
+
+    /// Whether a structure or union has a `const`-qualified member,
+    /// directly, inside an array member, or inside a nested aggregate.
+    fn has_read_only_member(&self, typ: TypeId) -> bool {
+        if !matches!(self.types.kind(typ), TypeKind::Struct | TypeKind::Union) {
+            return false;
+        }
+        let Some(composite) = self.types.composite(typ) else {
+            return false;
+        };
+        composite.members.iter().any(|m| {
+            let mut t = m.typ;
+            while self.types.kind(t) == TypeKind::Array {
+                match self.types.base_type(t) {
+                    Some(elem) => t = elem,
+                    None => break,
+                }
+            }
+            self.types.modifiers(t).contains(TypeModifiers::CONST) || self.has_read_only_member(t)
+        })
     }
 }

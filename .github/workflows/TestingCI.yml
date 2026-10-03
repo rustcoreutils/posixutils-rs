@@ -17,7 +17,7 @@ env:
   # The crates that build and test on Windows. Utilities are ported a whole
   # crate at a time, because `cargo test -p` builds every binary in the
   # crate; add a crate here once all of its binaries and tests are portable.
-  WINDOWS_CRATES: -p gettext-rs -p plib -p posixutils-xform -p posixutils-text
+  WINDOWS_CRATES: -p gettext-rs -p plib -p posixutils-xform -p posixutils-text -p posixutils-datetime -p posixutils-calc
 
 jobs:
   lint:

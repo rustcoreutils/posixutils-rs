@@ -344,7 +344,8 @@ impl Linearizer<'_> {
     /// `left op right` with a vector operand, whose result has type
     /// `result_typ`: a vector of the operation's type, or of masks for a
     /// comparison. Two vectors of integer lanes differing in signedness
-    /// compute at the left operand's lane type, which is the result's.
+    /// compute at the left operand's lane type, which is the result's, but
+    /// compare unsigned whichever side is unsigned, as gcc does.
     pub(crate) fn linearize_vector_binary(
         &mut self,
         op: BinaryOp,
@@ -359,7 +360,10 @@ impl Linearizer<'_> {
         } else {
             right_typ
         };
-        let (lane, count, _) = self.vector_shape(vector_typ);
+        let (mut lane, count, _) = self.vector_shape(vector_typ);
+        if op.is_comparison() {
+            lane = self.comparison_lane(lane, left_typ, right_typ);
+        }
         let (result_lane, _, result_size) = self.vector_shape(result_typ);
         let l = self.vector_lanes_of(left, lane);
         let r = self.vector_lanes_of(right, lane);
@@ -388,6 +392,24 @@ impl Linearizer<'_> {
             ));
         }
         result
+    }
+
+    /// The lane type a comparison of two vectors computes at: unsigned when
+    /// either operand's integer lanes are.
+    fn comparison_lane(&self, lane: TypeId, left: TypeId, right: TypeId) -> TypeId {
+        if !self.types.is_vector(left) || !self.types.is_vector(right) {
+            return lane;
+        }
+        let unsigned = [left, right]
+            .into_iter()
+            .filter_map(|v| self.types.vector_lanes(v))
+            .any(|(l, _)| self.types.is_unsigned(l));
+        if !unsigned || self.types.is_float(lane) {
+            return lane;
+        }
+        self.types
+            .unsigned_of_size(self.types.size_bytes(lane))
+            .unwrap_or(lane)
     }
 
     /// `-v`, `+v` or `~v`, lane by lane.

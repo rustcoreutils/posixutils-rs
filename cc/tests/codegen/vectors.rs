@@ -379,3 +379,31 @@ int main(void) {
 "#;
     crate::common::compile_and_run_everywhere("vec_narrow_cmp", src);
 }
+
+/// Integer-lane vectors differing in signedness compare unsigned, whichever
+/// side is unsigned; arithmetic computes at the left operand's lane type,
+/// which is the result's. The values are gcc's.
+#[test]
+fn vector_mixed_signedness_operands() {
+    run(
+        "vec_mixed_sign",
+        r#"
+typedef unsigned short v8hu __attribute__((vector_size(16)));
+int main(void) {
+    v8hi a = {-1, 2, 1, 1, 1, 1, 1, 1};
+    v8hu b = {1, 1, 1, 1, 1, 1, 1, 1};
+    v8hi lt = a < b, gt = b > a, ge = a >= b;
+    if (lt[0] != 0 || lt[1] != 0 || gt[0] != 0 || gt[1] != 0 || ge[0] != -1) return 1;
+    v4si s = {-7, 1, 1, 1};
+    v4su u = {2, 1, 1, 1};
+    C4(s < u, 0, 0, 0, 0); C4(u > s, 0, 0, 0, 0); C4(s == u, 0, -1, -1, -1);
+    C4(s / u, -3, 1, 1, 1);
+    v4su q = (v4su){0xfffffff9u, 1, 1, 1} / (v4si){2, 1, 1, 1};
+    if (q[0] != 2147483644u) return 2;
+    C4(((v4si){-8, 1, 1, 1} >> (v4su){1, 1, 1, 1}), -4, 0, 0, 0);
+    if (_Generic(s + u, v4si: 0, default: 1) || _Generic(u + s, v4su: 0, default: 1)) return 3;
+    return 0;
+}
+"#,
+    );
+}

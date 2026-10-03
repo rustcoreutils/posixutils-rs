@@ -2580,6 +2580,9 @@ pub struct PreprocessConfig<'a> {
     pub dump_macros: bool,
     /// Collect the headers this translation unit depends on (the `-M` family).
     pub collect_dependencies: bool,
+    /// The position independence code generation uses; see
+    /// [`define_pic_macros`].
+    pub position: crate::target::PositionIndependence,
     /// What optimization was asked for.
     ///
     /// The same value the optimizer is given, so `__OPTIMIZE__`,
@@ -2612,6 +2615,29 @@ fn define_optimization_macros(pp: &mut Preprocessor, opt: crate::opt::Optimizati
     }
     if !opt.inlines_generally() {
         pp.define_macro(Macro::predefined("__NO_INLINE__", Some("1")));
+    }
+}
+
+/// Define `__PIC__`/`__pic__` and `__PIE__`/`__pie__`, as gcc and clang do,
+/// from the position independence the code is generated with. Code that
+/// tests them -- inline asm and `.S` files choosing between a GOT and a direct
+/// access -- otherwise took the absolute path in position-independent code.
+///
+/// The value is 2, the "large model" of `-fPIC`/`-fPIE`, which is what c17
+/// generates for `-fpic`/`-fpie` too. Mach-O code is always position
+/// independent, and clang defines `__PIC__` there unconditionally.
+fn define_pic_macros(
+    pp: &mut Preprocessor,
+    target: &Target,
+    pos: crate::target::PositionIndependence,
+) {
+    if pos.pic || target.os == crate::target::Os::MacOS {
+        pp.define_macro(Macro::predefined("__PIC__", Some("2")));
+        pp.define_macro(Macro::predefined("__pic__", Some("2")));
+    }
+    if pos.pie {
+        pp.define_macro(Macro::predefined("__PIE__", Some("2")));
+        pp.define_macro(Macro::predefined("__pie__", Some("2")));
     }
 }
 
@@ -2660,6 +2686,7 @@ pub fn preprocess_collecting(
     pp.collect_dependencies = config.collect_dependencies;
 
     define_optimization_macros(&mut pp, config.optimization);
+    define_pic_macros(&mut pp, target, config.position);
 
     // Add -I include paths
     for path in config.include_paths {
@@ -2728,6 +2755,10 @@ pub struct AsmPreprocessConfig<'a> {
     /// What optimization was asked for; see [`PreprocessConfig::optimization`].
     /// GCC defines these for `.S` files too.
     pub optimization: crate::opt::Optimization,
+    /// See [`PreprocessConfig::position`]; gcc defines the macros for `.S`
+    /// files too, where hand-written assembly chooses GOT or direct accesses
+    /// by them.
+    pub position: crate::target::PositionIndependence,
 }
 
 /// A `.S` operand that could not be preprocessed.
@@ -2798,6 +2829,7 @@ pub fn preprocess_asm_file(
     pp.define_macro(Macro::predefined("__ASSEMBLER__", Some("1")));
 
     define_optimization_macros(&mut pp, config.optimization);
+    define_pic_macros(&mut pp, target, config.position);
 
     // -nostdinc: the directories are dropped in `Preprocessor::new`; the
     // bundled headers go with them.

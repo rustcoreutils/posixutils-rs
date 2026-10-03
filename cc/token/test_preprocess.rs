@@ -2074,3 +2074,35 @@ fn test_if_conditional_operator() {
     );
     assert_eq!(get_token_strings(&tokens, &idents), ["A", "B"]);
 }
+
+/// `__PIC__`/`__pic__` and `__PIE__`/`__pie__` describe the position
+/// independence the code is generated with.
+#[test]
+fn test_pic_macros_follow_the_configuration() {
+    let expand = |pic: bool, pie: bool, target: &Target| {
+        let config = PreprocessConfig {
+            position: crate::target::PositionIndependence { pic, pie },
+            ..Default::default()
+        };
+        let mut idents = IdentTable::new();
+        let tokens = Tokenizer::new(b"__PIC__ __pic__ __PIE__ __pie__", 0, &mut idents).tokenize();
+        let (out, _) = preprocess_collecting(tokens, target, &mut idents, "<test>", &config);
+        get_token_strings(&out, &idents)
+    };
+    let linux = Target::from_triple("x86_64-unknown-linux-gnu").unwrap();
+    assert_eq!(expand(true, true, &linux), ["2", "2", "2", "2"]);
+    assert_eq!(
+        expand(true, false, &linux),
+        ["2", "2", "__PIE__", "__pie__"]
+    );
+    assert_eq!(
+        expand(false, false, &linux),
+        ["__PIC__", "__pic__", "__PIE__", "__pie__"]
+    );
+    // Mach-O code is position independent whatever was asked.
+    let darwin = Target::from_triple("aarch64-apple-darwin").unwrap();
+    assert_eq!(
+        expand(false, false, &darwin),
+        ["2", "2", "__PIE__", "__pie__"]
+    );
+}

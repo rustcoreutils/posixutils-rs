@@ -67,7 +67,8 @@ const VALUE_OPTIONS: &[&str] = &[
     "--dump-ir-func",
     "--c17-fno-builtin-func",
     "--c17-linker-flag",
-    "--c17-unsupported-mflag",
+    "--c17-mflag",
+    "--c17-x",
     "--sysroot",
     // Both spellings. `preprocess_args_from` rewrites the single-dash gcc
     // forms to double-dash before clap sees them, and `scan` runs on the

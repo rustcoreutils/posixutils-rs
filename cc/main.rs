@@ -381,9 +381,15 @@ struct Args {
     #[arg(long = "c17-linker-flag", action = clap::ArgAction::Append, value_name = "flag", hide = true)]
     linker_flags: Vec<String>,
 
-    /// Unsupported machine flags captured by preprocess_args
-    #[arg(long = "c17-unsupported-mflag", action = clap::ArgAction::Append, value_name = "flag", hide = true)]
-    unsupported_mflags: Vec<String>,
+    /// Machine (`-m`) flags captured by preprocess_args, judged against the
+    /// target once it is known: see [`check_machine_flags`].
+    #[arg(long = "c17-mflag", action = clap::ArgAction::Append, value_name = "flag", hide = true)]
+    mflags: Vec<String>,
+
+    /// `-x LANG` as it applied to each operand after it, as `LANG:path`
+    /// (rewritten by `preprocess_args_from`); see [`Args::lang_of`].
+    #[arg(long = "c17-x", action = clap::ArgAction::Append, value_name = "lang:path", hide = true)]
+    lang_overrides: Vec<String>,
 }
 
 /// The `-Wno-` name for the "`-std=` was not honoured" warning.
@@ -617,6 +623,7 @@ fn preprocess_asm_operand(
     let content = strip_bom(&std::fs::read(path)?).to_vec();
     let config = AsmPreprocessConfig {
         optimization: args.optimization(),
+        position: position_independence(args, target),
         defines: &args.defines,
         undefines: &args.undefines,
         include_paths: &args.include_paths,
@@ -1026,7 +1033,7 @@ fn process_file(
     // processing that produced it "shall not be repeated when the file is
     // compiled". Phases 1 and 2 are part of that processing, so neither runs
     // here; phase 4 is narrowed to GCC's allowlist inside the preprocessor.
-    let preprocessed = is_preprocessed_file(path);
+    let preprocessed = args.lang_of(path) == Lang::Preprocessed;
 
     // Translation phase 1, before anything else looks at the bytes.
     let buffer = if args.trigraphs && !preprocessed {
@@ -1099,6 +1106,7 @@ fn process_file(
             dump_macros: args.dump_macros,
             collect_dependencies: args.wants_dependencies(),
             optimization: args.optimization(),
+            position: position_independence(args, target),
         },
     );
 
@@ -1276,8 +1284,7 @@ fn process_file(
 
     // Generate assembly
     let emit_unwind_tables = !args.no_unwind_tables;
-    let pie_mode = pie_enabled(args, target);
-    let pic_mode = args.fpic || producing_shared(args) || pie_mode;
+    let pic_mode = position_independence(args, target).pic;
     // `shared_mode` selects the TLS model and nothing else; it is computed
     // above, before the expansion pass that depends on the same condition.
     // `-fPIC` asks for code that can live in a shared object, which is exactly
@@ -1526,6 +1533,28 @@ impl Args {
     /// The optimization the command line asked for: `-O...` combined with
     /// `-f[no-]inline`.
     ///
+    /// What `path` is to be read as: what the last `-x` before it said, or
+    /// else what its suffix says.
+    fn lang_of(&self, path: &str) -> Lang {
+        let overridden = self.lang_overrides.iter().rev().find_map(|o| {
+            o.split_once(':')
+                .filter(|(_, p)| *p == path)
+                .map(|(l, _)| l)
+        });
+        match overridden {
+            Some("c") => Lang::C,
+            Some("cpp-output") => Lang::Preprocessed,
+            Some("assembler") => Lang::Asm,
+            Some(_) => Lang::AsmCpp,
+            None if is_preprocessed_file(path) => Lang::Preprocessed,
+            None if is_source_file(path) => Lang::C,
+            None if path.ends_with(".S") => Lang::AsmCpp,
+            None if is_asm_file(path) => Lang::Asm,
+            None if is_object_file(path) => Lang::Object,
+            None => Lang::Unknown,
+        }
+    }
+
     /// One value, so that what the optimizer does and what `__OPTIMIZE__`,
     /// `__OPTIMIZE_SIZE__` and `__NO_INLINE__` claim cannot drift apart.
     fn optimization(&self) -> opt::Optimization {
@@ -1628,6 +1657,15 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     let mut o_flag_idx: Option<usize> = None; // index into result of the -O flag
     let mut std_flag_idx: Option<usize> = None; // index into result of the -std= value
     let mut seen_fpic = false;
+    // `-x LANG`: the language every operand after it is read as, until the
+    // next `-x` (`none` restores reading by suffix).
+    let mut lang: Option<&'static str> = None;
+    // The operands `-x` applied to, appended once the scan is done: an
+    // option's value is indistinguishable from an operand here, and a marker
+    // pushed in place would separate `-o` from its file.
+    let mut lang_overrides = Vec::new();
+    // `-g` and its levels, last one wins: `-g3 -g0` is no debug information.
+    let mut debug: Option<bool> = None;
 
     while i < raw_args.len() {
         let arg = &raw_args[i];
@@ -1699,6 +1737,46 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
                 result.push(spec.to_string());
             }
             i += 1;
+        } else if arg == "-ansi" {
+            // gcc's spelling of `-std=c90`, reported the same way.
+            if let Some(idx) = std_flag_idx {
+                result[idx] = "c90".to_string();
+            } else {
+                result.push("--c17-std".to_string());
+                std_flag_idx = Some(result.len());
+                result.push("c90".to_string());
+            }
+            i += 1;
+        } else if arg == "-pedantic" || arg == "-pedantic-errors" {
+            result.push("--pedantic".to_string());
+            i += 1;
+        } else if arg == "-x" || (arg.starts_with("-x") && arg.len() > 2) {
+            let (name, used) = match arg.strip_prefix("-x").filter(|n| !n.is_empty()) {
+                Some(name) => (name.to_string(), 1),
+                None => (raw_args.get(i + 1).cloned().unwrap_or_default(), 2),
+            };
+            lang = match source_language(&name) {
+                Some(l) => l,
+                None => {
+                    eprintln!(
+                        "c17: {}: {}",
+                        gettext("language not recognized"),
+                        if name.is_empty() { "-x" } else { &name }
+                    );
+                    std::process::exit(1);
+                }
+            };
+            i += used;
+        } else if let Some(level) = debug_flag_level(arg) {
+            debug = level.or(debug);
+            i += 1;
+        } else if arg.starts_with("-g") && arg.len() > 2 {
+            // Debug-format and debug-content tuning: c17 emits one kind of
+            // DWARF, so these change nothing it could honour.
+            if !is_known_ignorable_g_flag(arg) {
+                eprintln!("c17: {}: {}", gettext("unrecognized option, ignored"), arg);
+            }
+            i += 1;
         } else if arg == "-fPIC" || arg == "-fpic" {
             // -fPIC / -fpic → --c17-fpic (internal flag) (first one only)
             if !seen_fpic {
@@ -1736,8 +1814,8 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             // GCC optimization flags - silently ignore (c17 doesn't have these optimizations)
             i += 1;
         } else if arg.starts_with("-m") && arg.len() > 2 {
-            // Machine flags - unsupported (SIMD/arch not supported yet)
-            result.push(format!("--c17-unsupported-mflag={}", arg));
+            // Machine flags are judged once the target is known.
+            result.push(format!("--c17-mflag={}", arg));
             i += 1;
         } else if arg.starts_with("-fvisibility")
             || arg == "-fno-semantic-interposition"
@@ -1934,12 +2012,121 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             result.push(arg.clone());
             i += 1;
         } else {
+            // An operand, or an option's value -- the two cannot be told apart
+            // here, and recording a language for a value is harmless, since
+            // only operands are ever classified.
+            if let Some(l) = lang {
+                if !arg.starts_with('-') || arg == "-" {
+                    lang_overrides.push(format!("--c17-x={l}:{arg}"));
+                }
+            }
             result.push(arg.clone());
             i += 1;
         }
     }
 
+    // Options gathered over the whole scan, placed ahead of any `--`, after
+    // which everything is an operand.
+    let mut trailer = lang_overrides;
+    if debug == Some(true) {
+        trailer.push("-g".to_string());
+    }
+    let at = result
+        .iter()
+        .position(|a| a == "--")
+        .unwrap_or(result.len());
+    result.splice(at..at, trailer);
     result
+}
+
+/// Refuse the `-m` flags that ask for code c17 does not generate.
+///
+/// What stays is what changes nothing: the target's own word size, and
+/// choosing or tuning for a CPU, since c17 emits only the architecture's
+/// baseline instructions and baseline code runs on every CPU of it. A CPU
+/// choice does not define the feature macros (`__AVX2__`, ...) it would in
+/// gcc, so code that tests them takes its baseline path. On x86-64 `-msse`,
+/// `-msse2` and `-mfpmath=sse` name the baseline itself. Everything else --
+/// an instruction-set extension, an ABI or code-model change -- would make
+/// the code different from what was asked, so it is an error.
+fn check_machine_flags(flags: &[String], target: &Target) {
+    let accepted = |flag: &str| {
+        flag.starts_with("-march=")
+            || flag.starts_with("-mtune=")
+            || flag.starts_with("-mcpu=")
+            || match target.arch {
+                target::Arch::X86_64 => matches!(
+                    flag,
+                    "-m64" | "-msse" | "-msse2" | "-mmmx" | "-mfpmath=sse" | "-mcmodel=small"
+                ),
+                target::Arch::Aarch64 => {
+                    matches!(flag, "-mabi=lp64" | "-mlittle-endian" | "-mcmodel=small")
+                }
+            }
+    };
+    let refused: Vec<&String> = flags.iter().filter(|f| !accepted(f)).collect();
+    if refused.is_empty() {
+        return;
+    }
+    for flag in refused {
+        eprintln!("c17: {}: {}", gettext("unsupported machine flag"), flag);
+    }
+    std::process::exit(1);
+}
+
+/// The language a `-x` name selects: `Some(None)` for `none`, which goes back
+/// to reading operands by suffix; `None` for a language c17 does not compile.
+fn source_language(name: &str) -> Option<Option<&'static str>> {
+    match name {
+        "c" => Some(Some("c")),
+        "cpp-output" => Some(Some("cpp-output")),
+        "assembler" => Some(Some("assembler")),
+        "assembler-with-cpp" => Some(Some("assembler-with-cpp")),
+        "none" => Some(None),
+        _ => None,
+    }
+}
+
+/// What a `-g` option does to debug information: `Some(Some(on))` for one
+/// that turns it on or off, `Some(None)` for none of c17's business, `None`
+/// when `arg` is not one of these.
+///
+/// Every level from 1 up, `-ggdb` and `-gdwarf[-N]` are the DWARF c17 emits;
+/// level 0 is none. The level's detail (macro definitions at 3, line tables
+/// only at 1) is not something c17 varies.
+fn debug_flag_level(arg: &str) -> Option<Option<bool>> {
+    let level = match arg {
+        "-g" | "-ggdb" | "-gdwarf" => return Some(Some(true)),
+        _ => arg
+            .strip_prefix("-ggdb")
+            .or_else(|| arg.strip_prefix("-gdwarf-"))
+            .or_else(|| arg.strip_prefix("-g"))?,
+    };
+    match level {
+        "0" if !arg.starts_with("-gdwarf") => Some(Some(false)),
+        "1" | "2" | "3" => Some(Some(true)),
+        "4" | "5" if arg.starts_with("-gdwarf-") => Some(Some(true)),
+        _ => None,
+    }
+}
+
+/// `-g` options that tune how debug information is laid out rather than
+/// whether there is any.
+fn is_known_ignorable_g_flag(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-gsplit-dwarf"
+            | "-gz"
+            | "-grecord-gcc-switches"
+            | "-gno-record-gcc-switches"
+            | "-gstrict-dwarf"
+            | "-gno-strict-dwarf"
+            | "-gcolumn-info"
+            | "-gno-column-info"
+            | "-gline-tables-only"
+            | "-gpubnames"
+            | "-gno-pubnames"
+    ) || arg.starts_with("-gz=")
 }
 
 /// Check if a file is a C source file (by extension)
@@ -1990,16 +2177,30 @@ struct Operand {
     kind: OperandKind,
 }
 
+/// What an operand is read as: by `-x` when one applied to it, else by its
+/// suffix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lang {
+    /// C source: `.c`, `-`, or `-x c`.
+    C,
+    /// Already preprocessed: `.i`, or `-x cpp-output`.
+    Preprocessed,
+    /// Assembly: `.s`, or `-x assembler`.
+    Asm,
+    /// Assembly to preprocess first: `.S`, or `-x assembler-with-cpp`.
+    AsmCpp,
+    /// An object or a library.
+    Object,
+    Unknown,
+}
+
 impl Operand {
-    fn classify(path: String) -> Self {
-        let kind = if is_source_file(&path) {
-            OperandKind::Source
-        } else if is_asm_file(&path) {
-            OperandKind::Asm
-        } else if is_object_file(&path) {
-            OperandKind::Object
-        } else {
-            OperandKind::Unknown
+    fn classify(path: String, args: &Args) -> Self {
+        let kind = match args.lang_of(&path) {
+            Lang::C | Lang::Preprocessed => OperandKind::Source,
+            Lang::Asm | Lang::AsmCpp => OperandKind::Asm,
+            Lang::Object => OperandKind::Object,
+            Lang::Unknown => OperandKind::Unknown,
         };
         Operand { path, kind }
     }
@@ -2063,7 +2264,8 @@ fn assemble_operand(
     };
 
     // .S files need preprocessing, .s files do not.
-    let asm_to_assemble = if path.ends_with(".S") {
+    let needs_cpp = args.lang_of(path) == Lang::AsmCpp;
+    let asm_to_assemble = if needs_cpp {
         let temp_s = scratch_path(scratch, operand_id, stem, "s");
         // A BOM is stripped here for the same reason it is on every other
         // reader: translation phase 1 has no byte for it, and `as` reads the
@@ -2074,6 +2276,7 @@ fn assemble_operand(
         let content = strip_bom(&std::fs::read(path)?).to_vec();
         let asm_config = AsmPreprocessConfig {
             optimization: args.optimization(),
+            position: position_independence(args, target),
             defines: &args.defines,
             undefines: &args.undefines,
             include_paths: &args.include_paths,
@@ -2099,7 +2302,7 @@ fn assemble_operand(
     as_cmd.args(["-o", &obj_file, &asm_to_assemble]);
     let status = as_cmd.status()?;
 
-    if path.ends_with(".S") {
+    if needs_cpp {
         let _ = std::fs::remove_file(&asm_to_assemble);
     }
 
@@ -2183,6 +2386,15 @@ fn producing_shared(args: &Args) -> bool {
     args.shared || args.shared_object
 }
 
+/// The position independence this compilation generates code with.
+fn position_independence(args: &Args, target: &Target) -> target::PositionIndependence {
+    let pie = pie_enabled(args, target);
+    target::PositionIndependence {
+        pic: args.fpic || producing_shared(args) || pie,
+        pie,
+    }
+}
+
 /// Determine whether PIE should be enabled for this compilation.
 fn pie_enabled(args: &Args, target: &Target) -> bool {
     if producing_shared(args) || args.fno_pie {
@@ -2243,14 +2455,6 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     // failure still exits the usual way.
     let scanned = linkargs::scan(argv.iter().cloned());
     let args = Args::parse_from(argv);
-
-    // Handle unsupported machine flags early
-    if !args.unsupported_mflags.is_empty() {
-        for flag in &args.unsupported_mflags {
-            eprintln!("c17: {}: {}", gettext("unsupported machine flag"), flag);
-        }
-        std::process::exit(1);
-    }
 
     if args.no_warnings {
         diag::suppress_warnings();
@@ -2328,6 +2532,8 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
         Target::host()
     };
 
+    check_machine_flags(&args.mflags, &target);
+
     // Parse runtime library selection
     let _rtlib = match args.rtlib.as_deref() {
         Some("libgcc") => RuntimeLib::Libgcc,
@@ -2350,7 +2556,7 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     let operands: Vec<Operand> = args
         .files
         .iter()
-        .map(|f| Operand::classify(f.clone()))
+        .map(|f| Operand::classify(f.clone(), &args))
         .collect();
 
     for op in &operands {
@@ -2764,10 +2970,62 @@ mod tests {
     }
 
     #[test]
-    fn test_preprocess_m_flags_unsupported() {
+    fn test_preprocess_m_flags_are_kept_for_the_target_check() {
         let result = run_preprocess(&["-msse2", "foo.c"]);
-        assert!(result.contains(&"--c17-unsupported-mflag=-msse2".to_string()));
+        assert!(result.contains(&"--c17-mflag=-msse2".to_string()));
         assert!(result.contains(&"foo.c".to_string()));
+    }
+
+    #[test]
+    fn test_preprocess_x_applies_to_later_operands() {
+        let result = run_preprocess(&[
+            "a.h",
+            "-x",
+            "c",
+            "b.h",
+            "-xassembler-with-cpp",
+            "c.asm",
+            "-x",
+            "none",
+            "d.c",
+        ]);
+        assert!(!result.iter().any(|a| a.ends_with(":a.h")));
+        assert!(result.contains(&"--c17-x=c:b.h".to_string()));
+        assert!(result.contains(&"--c17-x=assembler-with-cpp:c.asm".to_string()));
+        assert!(!result.iter().any(|a| a.ends_with(":d.c")));
+        for operand in ["a.h", "b.h", "c.asm", "d.c"] {
+            assert!(result.contains(&operand.to_string()), "{operand}");
+        }
+    }
+
+    #[test]
+    fn test_preprocess_debug_levels_last_wins() {
+        for (flags, want) in [
+            (&["-g3"][..], true),
+            (&["-ggdb"][..], true),
+            (&["-gdwarf-4"][..], true),
+            (&["-g1", "-g0"][..], false),
+            (&["-g0", "-g2"][..], true),
+            (&["-gsplit-dwarf"][..], false),
+        ] {
+            let mut argv = flags.to_vec();
+            argv.push("foo.c");
+            let result = run_preprocess(&argv);
+            assert_eq!(result.contains(&"-g".to_string()), want, "{flags:?}");
+            assert!(
+                !result.iter().any(|a| a.starts_with("-g") && a != "-g"),
+                "{flags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_preprocess_ansi_and_pedantic() {
+        let result = run_preprocess(&["-ansi", "-pedantic-errors", "-pedantic", "foo.c"]);
+        assert!(result
+            .windows(2)
+            .any(|w| w[0] == "--c17-std" && w[1] == "c90"));
+        assert_eq!(result.iter().filter(|a| *a == "--pedantic").count(), 2);
     }
 
     #[test]

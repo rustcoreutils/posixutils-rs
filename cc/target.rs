@@ -79,6 +79,18 @@ impl fmt::Display for Arch {
     }
 }
 
+/// The position independence code is generated with.
+///
+/// One value drives both code generation and the `__PIC__`/`__PIE__` macros
+/// that describe it, so a header that tests the macro sees the code it gets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PositionIndependence {
+    /// Position-independent code: `-fPIC`, `-shared`, or a PIE.
+    pub pic: bool,
+    /// Code for a position-independent executable.
+    pub pie: bool,
+}
+
 /// Target operating system
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {

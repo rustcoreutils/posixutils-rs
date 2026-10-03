@@ -13,6 +13,8 @@
 // drive the binary with a raw argument vector instead.
 //
 
+mod gcc_flags;
+
 use crate::common::{create_c_file, run_c17};
 use std::path::{Path, PathBuf};
 use std::process::Command;

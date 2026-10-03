@@ -652,6 +652,17 @@ impl Expr {
     }
 }
 
+/// Which lanes a vector shuffle takes; see [`ExprKind::VectorShuffle`].
+#[derive(Debug, Clone)]
+pub enum ShuffleSelector {
+    /// `__builtin_shuffle`'s mask: a vector of integer lanes, each taken
+    /// modulo the number of lanes the operands hold.
+    Mask(Box<Expr>),
+    /// `__builtin_shufflevector`'s constant indices; `None` is `-1`, a lane
+    /// whose value is unspecified.
+    Indices(Vec<Option<u32>>),
+}
+
 /// Expression kinds (variants)
 #[derive(Debug, Clone)]
 pub enum ExprKind {
@@ -1140,6 +1151,21 @@ pub enum ExprKind {
     Unreachable,
 
     /// __builtin_complex(real, imag) — construct complex value from two reals
+    /// `__builtin_shuffle(a, mask)`, `__builtin_shuffle(a, b, mask)` and
+    /// `__builtin_shufflevector(a, b, i...)`: a vector whose lane `k` is
+    /// lane `index(k)` of `first` followed by `second`.
+    VectorShuffle {
+        first: Box<Expr>,
+        second: Option<Box<Expr>>,
+        selector: ShuffleSelector,
+    },
+
+    /// `__builtin_convertvector(value, T)`: each lane of the vector `value`
+    /// converted to the lane type of the vector type `T`, the expression's.
+    ConvertVector {
+        value: Box<Expr>,
+    },
+
     BuiltinComplex {
         real: Box<Expr>,
         imag: Box<Expr>,
@@ -1396,7 +1422,7 @@ pub enum OffsetOfPath {
 // Initializer List Support (C99)
 
 /// A designator for struct field or array index in an initializer
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Designator {
     /// Field designator: .field_name
     Field(StringId),
@@ -1407,6 +1433,12 @@ pub enum Designator {
     /// on a designator has to say what it does with a range, rather than
     /// silently treating one as its low endpoint.
     IndexRange(i64, i64),
+    /// The member at this position in its structure or union's member list.
+    /// Never written in source: the parser spells a positional element that
+    /// continues a designator chain into an *anonymous* member this way
+    /// ([`spell_out_designator_continuations`]), since that member has no
+    /// name to designate it by.
+    Member(usize),
 }
 
 /// A single element in an initializer list
@@ -1469,33 +1501,369 @@ pub(crate) fn vm_extent_count(types: &TypeTable, symbols: &SymbolTable, expr: &E
 }
 
 /// The elements of `elements` that brace elision gives to one `target_type`
-/// slot, starting at `start` (C17 6.7.9p20): the first, then as many more
-/// positional elements as the type has scalar fields, stopping early at a
-/// designated one -- which addresses the enclosing aggregate, not this slot.
+/// slot, starting at `start` (C17 6.7.9p20): "only enough initializers from
+/// the list are taken to account for the elements or members of the
+/// subaggregate". That count is not the type's scalar count -- a string
+/// literal fills a whole character array, and a braced list a whole
+/// subaggregate -- so the slot is walked the way its own list would be,
+/// member by member, each one taking one element or eliding further
+/// ([`ObjectWalk`]). A designated element after the first stops the span:
+/// it addresses the enclosing aggregate, not this slot.
 ///
 /// A slot with no bound at its end -- a flexible array member, or a structure
-/// ending in one -- has no scalar count to stop at, so it takes every
-/// positional element left, as gcc does: `static struct { int n; int a[]; }
-/// w = {1, 2, 3};` gives `a` both of the last two.
+/// ending in one -- takes every positional element left, as gcc does:
+/// `static struct { int n; int a[]; } w = {1, 2, 3};` gives `a` both of the
+/// last two.
 ///
-/// The parser sizing an incomplete array and the linearizer placing values
-/// both take elements this way, and each counted them with a loop of its own.
+/// The parser checking and sizing an initializer and the linearizer placing
+/// its values all take elements this way. Counting scalar fields instead put
+/// `{"abc", 7, {"de", 8}}` for two `struct { char s[4]; int n; }` members
+/// entirely into the first.
 pub fn brace_elision_span(
     types: &TypeTable,
     elements: &[InitElement],
     start: usize,
     target_type: TypeId,
 ) -> std::ops::Range<usize> {
-    let wanted = if types.has_unbounded_tail(target_type) {
-        usize::MAX
-    } else {
-        types.count_scalar_fields(target_type).max(1)
+    designated_span(types, elements, start, target_type, &[])
+}
+
+/// The elements that land in one subobject of type `slot_type` when the
+/// element at `start` addresses it further by the designators `rest`: that
+/// element, and the positional ones after it that continue inside the
+/// subobject (C17 6.7.9p17) or elide braces into it (p20). With `rest`
+/// empty this is [`brace_elision_span`]: `[1][0] = 5, 6` gives `pc[1][0]`
+/// both values, as `[1] = 5, 6` gives them to `pc[1]`.
+pub fn designated_span(
+    types: &TypeTable,
+    elements: &[InitElement],
+    start: usize,
+    slot_type: TypeId,
+    rest: &[Designator],
+) -> std::ops::Range<usize> {
+    // Only a path needs the slot's name, and this walk keeps none.
+    let slot = Subobject {
+        index: 0,
+        typ: slot_type,
+        name: Designator::Index(0),
     };
-    let mut end = (start + 1).min(elements.len());
-    while end - start < wanted && end < elements.len() && elements[end].designators.is_empty() {
-        end += 1;
+    let end = ObjectWalk::new(types, elements).slot_end(start, &slot, rest, None);
+    start..end.max((start + 1).min(elements.len()))
+}
+
+/// Where the brace list `elements`, initializing an object of type `typ`,
+/// runs out of subobjects: `elements.len()` unless the list has excess
+/// elements (C17 6.7.9p2), in which case the index of the first.
+pub fn initializer_list_end(types: &TypeTable, elements: &[InitElement], typ: TypeId) -> usize {
+    ObjectWalk::new(types, elements).level_end(0, typ, Level::list(elements))
+}
+
+/// Give every positional element that continues a designator chain the
+/// chain that names where it lands (C17 6.7.9p17).
+///
+/// After `.a.x = 1` the next positional element initializes `a.y` -- the
+/// subobject after the designated one, inside `a` -- and only when `a` is
+/// exhausted does the list move on to the member after `a`. Every consumer
+/// of an initializer keeps a cursor one level deep (the next member, the
+/// next index), so this rewrites `{.a.x = 1, 2, 3}` to `{.a.x = 1, .a.y =
+/// 2, 3}` once, in the parser, and the parser's checks, the array sizing
+/// and the linearizer all see the landing place spelled out instead of each
+/// tracking the current object at every depth. An element that only
+/// continues an elided span stays positional: `.a[1] = 2, 3` already says
+/// where the `3` goes.
+pub fn spell_out_designator_continuations(
+    types: &TypeTable,
+    elements: &mut [InitElement],
+    typ: TypeId,
+) {
+    let rewrites = {
+        let mut walk = ObjectWalk::new(types, elements);
+        walk.rewrites = Some(Vec::new());
+        walk.level_end(0, typ, Level::list(elements));
+        walk.rewrites.unwrap_or_default()
+    };
+    for (i, chain) in rewrites {
+        elements[i].designators = chain;
     }
-    start..end
+}
+
+/// How one level of [`ObjectWalk`] reads its elements.
+#[derive(Clone, Copy)]
+struct Level<'d> {
+    /// The designators of the level's first element, relative to the
+    /// level's object.
+    first: &'d [Designator],
+    /// A brace list of its own: a designator repositions the cursor. An
+    /// elided level ends at one instead -- it addresses the enclosing list.
+    braced: bool,
+    /// The path from the outermost list to this level's object, when one is
+    /// known -- the levels a designator chain passes through.
+    path: Option<&'d [Designator]>,
+    /// Whether a positional element starting a subobject here is given its
+    /// path: true in a level a designator chain entered.
+    spell: bool,
+}
+
+impl<'d> Level<'d> {
+    /// The outermost brace list of an initializer.
+    fn list(elements: &'d [InitElement]) -> Self {
+        Level {
+            first: elements.first().map_or(&[][..], |e| &e.designators[..]),
+            braced: true,
+            path: Some(&[]),
+            spell: false,
+        }
+    }
+}
+
+/// One subobject of an aggregate: its position among the aggregate's
+/// subobjects, its type, and the designator that names it.
+struct Subobject {
+    index: usize,
+    typ: TypeId,
+    name: Designator,
+}
+
+/// The "current object" of C17 6.7.9p17-20, walked over a list of
+/// initializer elements: each element lands in the subobject a designator
+/// names or in the one after the last, and a brace-less value for an
+/// aggregate subobject takes as many elements as that subobject's own
+/// subobjects do.
+///
+/// The one statement of the rule, for brace elision ([`brace_elision_span`]),
+/// excess elements ([`initializer_list_end`]) and designator continuation
+/// ([`spell_out_designator_continuations`]).
+struct ObjectWalk<'a> {
+    types: &'a TypeTable,
+    elements: &'a [InitElement],
+    /// Chains for positional elements, collected when asked for.
+    rewrites: Option<Vec<(usize, Vec<Designator>)>>,
+}
+
+impl<'a> ObjectWalk<'a> {
+    fn new(types: &'a TypeTable, elements: &'a [InitElement]) -> Self {
+        Self {
+            types,
+            elements,
+            rewrites: None,
+        }
+    }
+
+    /// Where the elements initializing an object of type `typ` from
+    /// `elements[at..]` end, when its braces are elided: one element for a
+    /// scalar, a braced list, or a value that initializes the whole object,
+    /// and otherwise as many as its subobjects take in turn.
+    fn elided_end(&mut self, at: usize, typ: TypeId) -> usize {
+        let Some(first) = self.elements.get(at) else {
+            return at;
+        };
+        if !is_brace_elision_candidate(self.types, first, typ) {
+            return at + 1;
+        }
+        let level = Level {
+            first: &[],
+            braced: false,
+            path: None,
+            spell: false,
+        };
+        self.level_end(at, typ, level)
+    }
+
+    /// Where the elements from `elements[at..]` that the subobjects of the
+    /// aggregate `typ` take end, following the cursor through designators.
+    fn level_end(&mut self, at: usize, typ: TypeId, level: Level<'_>) -> usize {
+        let elements = self.elements;
+        let mut cursor = 0;
+        let mut i = at;
+        while i < elements.len() {
+            let designators = if i == at {
+                level.first
+            } else {
+                &elements[i].designators[..]
+            };
+            if i != at && !level.braced && !designators.is_empty() {
+                break;
+            }
+            let (slot, rest) = match designators.split_first() {
+                Some((d, _)) => {
+                    let Some((slot, consumed)) = self.designated(typ, d) else {
+                        i += 1; // reported where designators are checked
+                        continue;
+                    };
+                    (slot, &designators[usize::from(consumed)..])
+                }
+                None => {
+                    let Some(slot) = self.positional(typ, cursor) else {
+                        break;
+                    };
+                    if let (true, Some(path)) = (level.spell, level.path) {
+                        self.spell(i, path, &slot.name);
+                    }
+                    (slot, &[][..])
+                }
+            };
+            let end = self.slot_end(i, &slot, rest, level.path);
+            cursor = slot.index + 1;
+            if end == i {
+                // A zero-length subobject takes nothing; an array of them
+                // never will.
+                if self.types.kind(typ) == TypeKind::Array {
+                    break;
+                }
+                continue;
+            }
+            i = end;
+        }
+        i
+    }
+
+    /// Where the elements for `slot` end, the first, at `at`, addressing it
+    /// further by `rest`; `path` is the enclosing level's.
+    fn slot_end(
+        &mut self,
+        at: usize,
+        slot: &Subobject,
+        rest: &[Designator],
+        path: Option<&[Designator]>,
+    ) -> usize {
+        if rest.is_empty() {
+            return self.elided_end(at, slot.typ);
+        }
+        if !matches!(
+            self.types.kind(slot.typ),
+            TypeKind::Array | TypeKind::Struct | TypeKind::Union
+        ) {
+            return at + 1;
+        }
+        // The slot's own path. A range `[lo ... hi]` is continued in its
+        // last element alone, as gcc does: `[0 ... 1].x = 1, 2` gives the 2
+        // to `[1].y`.
+        let inner: Option<Vec<Designator>> = path.map(|p| {
+            let mut p = p.to_vec();
+            p.push(match &slot.name {
+                Designator::IndexRange(_, hi) => Designator::Index(*hi),
+                other => other.clone(),
+            });
+            p
+        });
+        let level = Level {
+            first: rest,
+            braced: false,
+            path: inner.as_deref(),
+            spell: true,
+        };
+        self.level_end(at, slot.typ, level)
+    }
+
+    /// Record that element `i` lands in the subobject `name` of `path`.
+    fn spell(&mut self, i: usize, path: &[Designator], name: &Designator) {
+        if let Some(rewrites) = self.rewrites.as_mut() {
+            let mut chain = path.to_vec();
+            chain.push(name.clone());
+            rewrites.push((i, chain));
+        }
+    }
+
+    /// The members of `typ` an element can land in, each with its position
+    /// in the whole member list.
+    fn members(
+        &self,
+        typ: TypeId,
+    ) -> impl Iterator<Item = (usize, &'a crate::types::StructMember)> {
+        let types: &'a TypeTable = self.types;
+        types
+            .composite(typ)
+            .map_or(&[][..], |c| &c.members[..])
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.is_initializable())
+    }
+
+    /// The designator that names `member`, at `position` in its member
+    /// list: its name, or -- for an anonymous member, which has none -- its
+    /// position.
+    fn member_name(position: usize, member: &crate::types::StructMember) -> Designator {
+        if member.name == StringId::EMPTY {
+            Designator::Member(position)
+        } else {
+            Designator::Field(member.name)
+        }
+    }
+
+    /// The subobject at `cursor`, if `typ` has one there for a positional
+    /// element. A union has one, its first member, and only before any
+    /// member has been designated.
+    fn positional(&self, typ: TypeId, cursor: usize) -> Option<Subobject> {
+        match self.types.kind(typ) {
+            TypeKind::Array => {
+                let size = self.types.get(typ).array_size;
+                if size.is_some_and(|n| cursor >= n) {
+                    return None;
+                }
+                Some(Subobject {
+                    index: cursor,
+                    typ: self.types.base_type(typ).unwrap_or(self.types.int_id),
+                    name: Designator::Index(cursor as i64),
+                })
+            }
+            TypeKind::Union if cursor > 0 => None,
+            TypeKind::Struct | TypeKind::Union => {
+                let (position, m) = self.members(typ).nth(cursor)?;
+                Some(Subobject {
+                    index: cursor,
+                    typ: m.typ,
+                    name: Self::member_name(position, m),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The subobject of `typ` the designator `d` names, and whether naming it
+    /// used `d` up -- not when `d` names a member of an anonymous member,
+    /// which is then the subobject, and is addressed by `d` in turn.
+    fn designated(&self, typ: TypeId, d: &Designator) -> Option<(Subobject, bool)> {
+        match (d, self.types.kind(typ)) {
+            (Designator::Index(hi) | Designator::IndexRange(_, hi), TypeKind::Array) => {
+                let slot = Subobject {
+                    index: usize::try_from(*hi).ok()?,
+                    typ: self.types.base_type(typ)?,
+                    name: d.clone(),
+                };
+                Some((slot, true))
+            }
+            (Designator::Field(name), TypeKind::Struct | TypeKind::Union) => self
+                .members(typ)
+                .enumerate()
+                .find_map(|(index, (position, m))| {
+                    let direct = m.name == *name;
+                    let within = !direct
+                        && self.types.is_anonymous_aggregate(m)
+                        && self.types.find_member(m.typ, *name).is_some();
+                    (direct || within).then(|| {
+                        let slot = Subobject {
+                            index,
+                            typ: m.typ,
+                            name: Self::member_name(position, m),
+                        };
+                        (slot, direct)
+                    })
+                }),
+            (Designator::Member(wanted), TypeKind::Struct | TypeKind::Union) => self
+                .members(typ)
+                .enumerate()
+                .find(|(_, (position, _))| position == wanted)
+                .map(|(index, (position, m))| {
+                    let slot = Subobject {
+                        index,
+                        typ: m.typ,
+                        name: Self::member_name(position, m),
+                    };
+                    (slot, true)
+                }),
+            _ => None,
+        }
+    }
 }
 
 /// Where one element of an array's initializer list lands, given the
@@ -1516,7 +1884,7 @@ pub fn array_slot(designators: &[Designator], cursor: &mut i64) -> (i64, i64, Op
         let (lo, hi) = match d {
             Designator::Index(i) => (*i, *i),
             Designator::IndexRange(lo, hi) => (*lo, *hi),
-            Designator::Field(_) => continue,
+            Designator::Field(_) | Designator::Member(_) => continue,
         };
         *cursor = hi + 1;
         return (lo, hi, Some(pos));
@@ -1529,20 +1897,23 @@ pub fn array_slot(designators: &[Designator], cursor: &mut i64) -> (i64, i64, Op
 /// Does this initializer element initialize `target_type` by elided braces?
 ///
 /// C17 6.7.9p20: a brace-less initializer for an aggregate member takes as
-/// many elements from the enclosing list as the member has scalar fields.
-/// Deciding that needs both the AST element and the type table, so the rule
-/// lives here where the linearizer (which places the values) and the parser
-/// (which sizes an incomplete array by them) can each ask it. Two answers to
-/// this question is how `int a[][2] = {1,2,3,4}` came to be stored as two
-/// rows and sized as four.
+/// many elements from the enclosing list as the member's own subobjects do
+/// ([`brace_elision_span`]). Deciding that needs both the AST element and the
+/// type table, so the rule lives here where the linearizer (which places the
+/// values) and the parser (which checks them, and sizes an incomplete array
+/// by them) can each ask it. Two answers to this question is how `int
+/// a[][2] = {1,2,3,4}` came to be stored as two rows and sized as four.
+///
+/// The element's designators are the caller's business: they say *which*
+/// subobject the element lands in, and this answers for that subobject --
+/// so `[2] = "cd", 3` elides into the third `struct { char s[4]; int n; }`
+/// exactly as a positional `"cd", 3` would (6.7.9p20 applies to any
+/// initializer of a subaggregate, designated or not).
 pub fn is_brace_elision_candidate(
     types: &TypeTable,
     element: &InitElement,
     target_type: TypeId,
 ) -> bool {
-    if !element.designators.is_empty() {
-        return false;
-    }
     let target_is_aggregate = matches!(
         types.kind(target_type),
         TypeKind::Array | TypeKind::Struct | TypeKind::Union
@@ -1550,30 +1921,45 @@ pub fn is_brace_elision_candidate(
     if !target_is_aggregate {
         return false;
     }
-    // String/wide string literals can directly initialize char/wchar_t arrays
-    // without brace elision (C99 6.7.8p14)
-    if matches!(
-        element.value.kind,
-        ExprKind::InitList { .. }
-            | ExprKind::StringLit(_)
-            | ExprKind::WideStringLit(_)
-            | ExprKind::Utf16StringLit(_)
-            | ExprKind::Utf32StringLit(_)
-    ) {
+    if matches!(element.value.kind, ExprKind::InitList { .. }) {
+        return false;
+    }
+    // A string literal initializes a character array directly (C17
+    // 6.7.9p14-15). For a structure, a union, or an array of non-integers
+    // it is just the first element of an elided list -- `struct { char
+    // s[4]; int n; }` takes `"abc", 7`, the string going to `s`. Exempting
+    // every string literal gave it the whole structure, and the `7` to
+    // whatever came next.
+    //
+    // An array of integers the literal does not suit -- `unsigned s[3]`
+    // for an `int`-based `L"ab"`, or `short s[3]` for `"ab"` -- is still
+    // where gcc puts the string, and rejects it there. Eliding braces
+    // instead would make the string a pointer stored into `s[0]`, which is
+    // only a warning, so the mismatch would compile.
+    if element.value.is_string_literal()
+        && types.kind(target_type) == TypeKind::Array
+        && types
+            .base_type(target_type)
+            .is_some_and(|e| types.is_integer(e))
+    {
         return false;
     }
     // An element that is already an expression of the target's own type
     // initializes the whole aggregate by itself (C17 6.7.9p13). Eliding
-    // braces around it consumes `count_scalar_fields` *elements* instead
-    // of one, so `struct P a[2] = {p, p};` put both structs into a[0] and
-    // left a[1] uninitialized -- then assigned a struct where a scalar
-    // field was expected, producing garbage.
+    // braces around it hands it to the first scalar member and the
+    // elements after it to the rest, so `struct P a[2] = {p, p};` put both
+    // structs into a[0] and left a[1] uninitialized -- then assigned a
+    // struct where a scalar field was expected, producing garbage.
     if let Some(elem_typ) = element.value.typ {
         let elem_kind = types.kind(elem_typ);
         if matches!(elem_kind, TypeKind::Struct | TypeKind::Union)
             && elem_kind == types.kind(target_type)
             && types.size_bytes(elem_typ) == types.size_bytes(target_type)
         {
+            return false;
+        }
+        // Likewise a GNU vector value for a vector.
+        if types.is_vector(elem_typ) && types.is_vector(target_type) {
             return false;
         }
     }
@@ -1954,6 +2340,19 @@ impl Expr {
             | K::ReturnAddress { .. }
             | K::OffsetOf { .. } => Vec::new(),
             K::StmtExpr { result, .. } => vec![result],
+            K::ConvertVector { value } => vec![value],
+            K::VectorShuffle {
+                first,
+                second,
+                selector,
+            } => {
+                let mut v: Vec<&Expr> = vec![first];
+                v.extend(second.as_deref());
+                if let ShuffleSelector::Mask(mask) = selector {
+                    v.push(mask);
+                }
+                v
+            }
             K::VmTypeName { dims, expr, .. } => dims.iter().chain([&**expr]).collect(),
             K::Unary { operand: a, .. }
             | K::PostInc(a)

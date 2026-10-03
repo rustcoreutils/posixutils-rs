@@ -210,7 +210,6 @@ impl<'a> Preprocessor<'a> {
     /// `c17 -E` itself writes, and `#line` is deliberately *not* routed here
     /// (GCC honors only this form in a preprocessed file, and so does c17).
     fn handle_linemarker(&mut self, iter: &mut TokenCursor, number: &Token) {
-        let origin = self.physical_stream;
         let TokenValue::Number(ref text) = number.value else {
             self.skip_to_eol(iter);
             return;
@@ -222,11 +221,11 @@ impl<'a> Preprocessor<'a> {
 
         // An optional filename follows; without one the marker renumbers the
         // current file rather than renaming it.
-        let mut target = self.linemarker.map_or(origin, |lm| lm.target);
+        let mut name = None;
         if let Some(tok) = iter.peek() {
             if !tok.pos.newline && tok.typ == TokenType::String {
-                if let TokenValue::String(name) = &tok.value {
-                    target = diag::find_or_add_stream(&payload_text(name));
+                if let TokenValue::String(spelled) = &tok.value {
+                    name = Some(payload_text(spelled));
                 }
                 iter.next();
             }
@@ -248,15 +247,7 @@ impl<'a> Preprocessor<'a> {
             }
             iter.next();
         }
-        diag::set_stream_system(target, is_system);
-
-        // The marker names the line of the text *after* it, so the delta is
-        // measured against the next physical line.
-        self.linemarker = Some(LineMarker {
-            origin,
-            target,
-            delta: line as i64 - (self.physical_line as i64 + 1),
-        });
+        self.set_line_marker(line, name, is_system);
     }
 
     /// Skip tokens until end of line
@@ -271,6 +262,22 @@ impl<'a> Preprocessor<'a> {
         match iter.peek() {
             Some(token) if !token.pos.newline => iter.next(),
             _ => None,
+        }
+    }
+
+    /// C17 6.10.3p5: `__VA_ARGS__` occurs only in the replacement list of a
+    /// macro whose parameter list ends in `...`. gcc warns about any other
+    /// occurrence -- a macro or parameter name, a `#if` operand, ordinary
+    /// text, the body of a non-variadic or GNU-named variadic macro -- and so
+    /// does this, from each of those places.
+    pub(super) fn warn_stray_va_args(token: &Token, idents: &IdentTable) {
+        let is_va_args = matches!(&token.value, TokenValue::Ident(id)
+            if token.typ == TokenType::Ident && idents.get_opt(*id) == Some("__VA_ARGS__"));
+        if is_va_args {
+            diag::warning(
+                token.pos,
+                &gettext("__VA_ARGS__ can only appear in the expansion of a C99 variadic macro"),
+            );
         }
     }
 
@@ -290,6 +297,7 @@ impl<'a> Preprocessor<'a> {
             diag::error_args(pos, "no macro name given in #{0} directive", &[directive]);
             return None;
         };
+        Self::warn_stray_va_args(&token, idents);
         match &token.value {
             TokenValue::Ident(id) if token.typ == TokenType::Ident => {
                 Some(idents.get_opt(*id)?.to_string())
@@ -430,6 +438,7 @@ impl<'a> Preprocessor<'a> {
                                     break;
                                 }
                                 TokenValue::Ident(id) => {
+                                    Self::warn_stray_va_args(&param_tok, idents);
                                     if let Some(param_name) = idents.get_opt(*id) {
                                         // C17 6.10.3p6: the parameters have to
                                         // be distinct.
@@ -480,8 +489,27 @@ impl<'a> Preprocessor<'a> {
             return;
         }
 
+        // C17 6.10.3p3: an object-like macro's replacement list is separated
+        // from its name by white space. gcc diagnoses `#define A+1` and still
+        // defines `A` as `+1`, and so does this.
+        if !is_function {
+            if let Some(next) = iter.peek() {
+                if !next.pos.newline && !next.pos.whitespace {
+                    diag::warning(
+                        next.pos,
+                        &gettext("ISO C99 requires whitespace after the macro name"),
+                    );
+                }
+            }
+        }
+
         // Collect body tokens
         let body_tokens = self.collect_to_eol(iter);
+        if !(is_variadic && variadic_name.is_none()) {
+            for token in &body_tokens {
+                Self::warn_stray_va_args(token, idents);
+            }
+        }
         let body = self.tokens_to_macro_body(
             &body_tokens,
             &params,
@@ -522,11 +550,22 @@ impl<'a> Preprocessor<'a> {
             return;
         }
 
-        if let Some(name) = self.macro_name_operand(iter, idents, "undef", pos) {
+        let Some(name) = self.macro_name_operand(iter, idents, "undef", pos) else {
+            self.skip_to_eol(iter);
+            return;
+        };
+        // C17 6.10.8p2: the standard's predefined names may not be the
+        // subject of `#undef`; gcc warns, and so does this. `defined` is
+        // refused outright, as it is for `#define`.
+        if name == "defined" {
+            diag::error(pos, &gettext("\"defined\" cannot be used as a macro name"));
+        } else {
+            if is_standard_predefined(&name) {
+                diag::warning_args(pos, "undefining \"{0}\"", &[&name]);
+            }
             self.undef_macro(&name);
         }
-
-        self.skip_to_eol(iter);
+        self.warn_extra_tokens(iter, "undef");
     }
 
     fn handle_ifdef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
@@ -549,6 +588,9 @@ impl<'a> Preprocessor<'a> {
             None => false,
         };
 
+        if name.is_some() {
+            self.warn_extra_tokens(iter, "ifdef");
+        }
         self.skip_to_eol(iter);
         self.push_conditional(take_branch, pos);
     }
@@ -566,6 +608,9 @@ impl<'a> Preprocessor<'a> {
             None => false,
         };
 
+        if name.is_some() {
+            self.warn_extra_tokens(iter, "ifndef");
+        }
         self.skip_to_eol(iter);
         self.push_conditional(take_branch, pos);
     }
@@ -692,8 +737,8 @@ impl<'a> Preprocessor<'a> {
         // If the first token is not < or ", expand macros first
         let needs_expansion = match &path_tokens[0].value {
             TokenValue::Special(code) => *code != b'<' as u32,
-            TokenValue::String(_) => false, // Already a string literal
-            _ => true,                      // Identifier or other - needs expansion
+            TokenValue::String(_) | TokenValue::HeaderName(_) => false,
+            _ => true, // Identifier or other - needs expansion
         };
 
         let expanded_tokens = if needs_expansion {
@@ -713,7 +758,23 @@ impl<'a> Preprocessor<'a> {
         };
 
         // Determine if system include (<...>) or quoted ("...")
-        let (filename, is_system) = self.parse_include_path(&expanded_tokens, idents);
+        let Some((filename, is_system)) = self.parse_include_path(&expanded_tokens, idents) else {
+            diag::error(
+                hash_token.pos,
+                &gettext("#include expects \"FILENAME\" or <FILENAME>"),
+            );
+            return;
+        };
+        let header_name = matches!(
+            expanded_tokens[0].value,
+            TokenValue::String(_) | TokenValue::HeaderName(_)
+        );
+        if header_name && expanded_tokens.len() > 1 {
+            diag::warning(
+                expanded_tokens[1].pos,
+                &gettext("extra tokens at end of #include directive"),
+            );
+        }
 
         if filename.is_empty() {
             diag::error(hash_token.pos, &gettext("empty filename in #include"));
@@ -740,10 +801,11 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Parse include path from tokens
-    fn parse_include_path(&self, tokens: &[Token], idents: &IdentTable) -> (String, bool) {
+    /// The header a `#include` operand names, and whether it was spelled
+    /// `<...>`. `None` when the operand is neither form of C17 6.10.2p2-4.
+    fn parse_include_path(&self, tokens: &[Token], idents: &IdentTable) -> Option<(String, bool)> {
         if tokens.is_empty() {
-            return (String::new(), false);
+            return Some((String::new(), false));
         }
 
         // A header name the lexer already recognised (C99 6.4.7): one token,
@@ -755,7 +817,7 @@ impl<'a> Preprocessor<'a> {
                 .strip_prefix(['<', '"'])
                 .and_then(|r| r.strip_suffix(['>', '"']))
                 .unwrap_or(&spelled);
-            return (name.to_string(), is_system);
+            return Some((name.to_string(), is_system));
         }
 
         // Otherwise the header name came out of a macro expansion, and has to
@@ -776,21 +838,19 @@ impl<'a> Preprocessor<'a> {
                         filename.push_str(&self.token_to_string(token, idents));
                     }
                 }
-                return (filename, true);
+                return Some((filename, true));
             }
         }
 
         // Check for "filename"
         if let TokenValue::String(s) = &tokens[0].value {
-            return (payload_text(s), false);
+            return Some((payload_text(s), false));
         }
 
-        // Fallback: try to reconstruct from tokens
-        let mut filename = String::new();
-        for token in tokens {
-            filename.push_str(&self.token_to_string(token, idents));
-        }
-        (filename, false)
+        // C17 6.10.2p4: after replacement the operand has to match one of
+        // the two forms. A bare `#include stdio.h` matches neither, and gcc
+        // rejects it rather than guessing the delimiters.
+        None
     }
 
     /// Note a header this translation unit depends on, found at `pos` on the
@@ -868,7 +928,7 @@ impl<'a> Preprocessor<'a> {
         // its own limits.h or stddef.h must win — and ahead of the system's,
         // to which a bundled header may forward with `#include_next`.
         if start <= SearchPos::Bundled && self.use_builtin_headers {
-            if let Some(content) = builtin_headers::get_builtin_header(filename) {
+            if let Some(content) = builtin_headers::get_builtin_header(filename, self.target.arch) {
                 return Some((IncludeSource::Builtin(content), Some(SearchPos::Bundled)));
             }
         }
@@ -1409,31 +1469,30 @@ impl<'a> Preprocessor<'a> {
         &mut self,
         iter: &mut TokenCursor,
         output: &mut Vec<Token>,
+        pragma_pos: Position,
     ) {
-        // Expect '('
-        if let Some(token) = iter.next() {
-            if !matches!(&token.value, TokenValue::Special(code) if *code == b'(' as u32) {
-                // Not a valid _Pragma - just silently ignore
-                return;
-            }
-        } else {
+        // C17 6.10.9p1: the operand is `( string-literal )`. Each token is
+        // looked at before it is taken: one that does not belong to the
+        // operator -- the end of the stream above all, which every caller
+        // needs to see -- stays where it is.
+        let is_punct =
+            |t: &Token, c: u8| matches!(&t.value, TokenValue::Special(code) if *code == c as u32);
+        if !iter.peek().is_some_and(|t| is_punct(t, b'(')) {
+            Self::pragma_operand_error(pragma_pos);
             return;
         }
+        iter.next();
+        if !iter.peek().is_some_and(|t| t.typ == TokenType::String) {
+            Self::pragma_operand_error(pragma_pos);
+            return;
+        }
+        let token = iter.next().expect("peeked");
 
-        // Expect a string literal.
-        //
         // C99 6.10.9p1: destringify and re-tokenize as a `#pragma`. Only the
         // pragmas c17 acts on need that treatment; the rest stay no-ops. It
         // matters for `pack`, which changes layout -- and a `_Pragma` that
         // was quietly dropped while the `#pragma` spelling was honoured would
         // be the same wrong struct in the spelling nobody tested.
-        let Some(token) = iter.next() else {
-            return;
-        };
-        if !matches!(token.typ, TokenType::String) {
-            // Not a valid _Pragma - just silently ignore
-            return;
-        }
         if let TokenValue::String(body) = &token.value {
             let pos = self.remap_pos(token.pos);
             let mut marker = Token::new(TokenType::Pragma, pos);
@@ -1452,14 +1511,18 @@ impl<'a> Preprocessor<'a> {
             output.push(marker);
         }
 
-        // Expect ')' - if not found or malformed, silently ignore
-        // (we've already consumed the tokens, so just return either way)
-        if let Some(token) = iter.next() {
-            if !matches!(&token.value, TokenValue::Special(code) if *code == b')' as u32) {
-                // Not a valid _Pragma - silently ignored
-            }
+        if iter.peek().is_some_and(|t| is_punct(t, b')')) {
+            iter.next();
+        } else {
+            Self::pragma_operand_error(pragma_pos);
         }
-        // Successfully consumed _Pragma("...")
+    }
+
+    fn pragma_operand_error(pos: Position) {
+        diag::error(
+            pos,
+            &gettext("_Pragma takes a parenthesized string literal"),
+        );
     }
 
     fn handle_line(
@@ -1518,25 +1581,24 @@ impl<'a> Preprocessor<'a> {
             );
             return;
         }
+        // gcc warns and still takes the line number and file name.
         if tokens.len() > 2 {
-            diag::error(
+            diag::warning(
                 tokens[2].pos,
-                &gettext("extra tokens after #line directive"),
+                &gettext("extra tokens at end of #line directive"),
             );
-            return;
         }
 
-        // The #line directive takes effect on the next line, so
-        // current_physical_line is the line of the directive + 1
-        let current_physical_next_line = tokens[0].pos.line + 1;
-        self.line_offset = line_num as i32 - current_physical_next_line as i32;
-
-        // Optional second token: filename string
-        if tokens.len() > 1 {
-            if let TokenValue::String(s) = &tokens[1].value {
-                self.line_file_override = Some(s.clone());
-            }
-        }
+        // The same mapping a linemarker establishes (C17 6.10.4p3-p4), so
+        // diagnostics, `__LINE__`/`__FILE__`, the builtins that report a
+        // position and the debug line table all follow it. A file's name
+        // keeps the system-header status it had.
+        let name = tokens.get(1).and_then(|t| match &t.value {
+            TokenValue::String(s) => Some(payload_text(s)),
+            _ => None,
+        });
+        let is_system = diag::stream_is_system(self.physical_stream);
+        self.set_line_marker(line_num, name, is_system);
     }
 
     /// `__has_include` / `__has_include_next`: whether the `#include` or
@@ -1551,7 +1613,9 @@ impl<'a> Preprocessor<'a> {
             return false;
         }
 
-        let (filename, is_system) = self.parse_include_path(&args[0], idents);
+        let Some((filename, is_system)) = self.parse_include_path(&args[0], idents) else {
+            return false;
+        };
         self.find_include_file(&filename, is_system, is_include_next)
             .is_some()
     }

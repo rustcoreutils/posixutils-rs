@@ -67,3 +67,56 @@ fn simple_escapes_are_units() {
         [Escaped::Unit(10), Escaped::Unit(0x71)]
     ));
 }
+
+/// C17 6.4.4.4p1: a character constant holds at least one character.
+#[test]
+fn empty_character_constant_is_reported() {
+    let before = crate::diag::error_count();
+    let (value, _) = char_literal_value("", None, crate::token::lexer::Position::default());
+    assert_eq!(value, 0);
+    assert!(crate::diag::error_count() > before);
+}
+
+/// A universal character name past U+10FFFF names no character at all.
+#[test]
+fn ucn_beyond_the_codespace_is_forbidden() {
+    assert!(crate::token::lexer::ucn_is_forbidden(0x110000));
+    assert!(crate::token::lexer::ucn_is_forbidden(0xFFFF_FFFF));
+    assert!(!crate::token::lexer::ucn_is_forbidden(0x10FFFF));
+    assert!(!crate::token::lexer::ucn_is_forbidden(0x1F600));
+}
+
+/// C17 6.4.3p1: `\u` takes four hex digits and `\U` eight. Fewer names no
+/// character; the escape keeps what it has so the rest still decodes.
+#[test]
+fn incomplete_ucn_keeps_its_digits() {
+    for (payload, want_long, want_spelled, want_digits, rest) in [
+        ("\\u12", false, 0x12, 2, None),
+        ("\\u", false, 0, 0, None),
+        ("\\U1234567x", true, 0x123_4567, 7, Some(b'x')),
+        ("\\u12g", false, 0x12, 2, Some(b'g')),
+    ] {
+        let elements = parse_string_literal(payload);
+        match elements[0] {
+            Escaped::IncompleteUcn {
+                long,
+                spelled,
+                digits,
+            } => assert_eq!(
+                (long, spelled, digits),
+                (want_long, want_spelled, want_digits),
+                "{payload}"
+            ),
+            _ => panic!("{payload} is not an incomplete UCN"),
+        }
+        let next = elements.get(1).map(|e| match e {
+            Escaped::SourceByte(b) => *b,
+            _ => panic!("{payload}: the rest is not source text"),
+        });
+        assert_eq!(next, rest, "{payload}");
+    }
+    assert!(matches!(
+        parse_string_literal("\\u00e9")[..],
+        [Escaped::CodePoint('\u{e9}')]
+    ));
+}

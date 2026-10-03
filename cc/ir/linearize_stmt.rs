@@ -179,7 +179,15 @@ impl<'a> super::linearize::Linearizer<'a> {
                         .map(|f| f.return_type)
                         .unwrap_or(expr_typ);
 
-                    if let Some(sret_ptr) = self.struct_return_ptr {
+                    if let (Some(vec), None) = (self.vector_return, self.struct_return_ptr) {
+                        // A vector returned in a register, as its carrier's
+                        // bits; one returned in memory takes the sret path.
+                        let addr = self.vector_addr(e);
+                        let conv = self.current_calling_conv;
+                        let val = self.vector_return_value(addr, vec, func_ret_type, conv);
+                        let size = self.types.size_bits(func_ret_type);
+                        self.emit(Instruction::ret_typed(Some(val), func_ret_type, size));
+                    } else if let Some(sret_ptr) = self.struct_return_ptr {
                         self.emit_sret_return(e, sret_ptr, func_ret_type);
                     } else if let Some(ret_type) = self.reg_aggregate_return_type {
                         self.emit_reg_aggregate_return(e, ret_type);
@@ -510,8 +518,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                         let size = self.types.size_bits(typ);
                         self.emit(Instruction::store(converted, sym_id, 0, typ, size));
                     }
-                } else if self.types.is_complex(typ) {
-                    self.store_complex_at(sym_id, 0, typ, init);
+                } else if self.types.is_complex(typ) || self.types.is_vector(typ) {
+                    self.store_addressed_value_at(sym_id, 0, typ, init);
                 } else {
                     // An aggregate that does not travel by value: the
                     // initializer yields its address, and it is block-copied
@@ -809,6 +817,18 @@ impl<'a> super::linearize::Linearizer<'a> {
         typ: TypeId,
         elements: &[InitElement],
     ) {
+        // A vector initialized by one vector value -- `v4si arr[2] = {a, b}`
+        // reaches here once per element -- takes it whole, as a struct does
+        // a struct value; read as a list, it was the first lane.
+        if let [only] = elements {
+            let whole = only.designators.is_empty()
+                && self.types.is_vector(typ)
+                && only.value.typ.is_some_and(|t| self.types.is_vector(t));
+            if whole {
+                self.store_addressed_value_at(base_sym, base_offset, typ, &only.value);
+                return;
+            }
+        }
         match self.types.kind(typ) {
             TypeKind::Array => {
                 // `qualified_with` already puts an array's qualifiers on its
@@ -888,11 +908,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let Some(last) = list.last() else {
                         continue;
                     };
-                    if self.types.is_complex(elem_type) {
-                        // A complex element is two halves, not the scalar the
-                        // store below assumes. `elem_is_aggregate` is false for
-                        // it, so it reaches here.
-                        self.store_complex_at(base_sym, offset, elem_type, &last.value);
+                    if self.types.is_complex(elem_type) || self.types.is_vector(elem_type) {
+                        // A complex element is two halves, and a vector one
+                        // its lanes, not the scalar the store below assumes.
+                        // `elem_is_aggregate` is false for them, so they
+                        // reach here.
+                        self.store_addressed_value_at(base_sym, offset, elem_type, &last.value);
                         continue;
                     }
                     let converted = self.linearize_converted(&last.value, elem_type);
@@ -1010,8 +1031,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                     // `double _Complex z = {1.0};` lands here rather than on
                     // the complex arm of `linearize_local_decl`, because the
                     // braces make it an initializer list first.
-                    if self.types.is_complex(typ) {
-                        self.store_complex_at(base_sym, base_offset, typ, &element.value);
+                    if self.types.is_complex(typ) || self.types.is_vector(typ) {
+                        self.store_addressed_value_at(base_sym, base_offset, typ, &element.value);
                         return;
                     }
                     let converted = self.linearize_converted(&element.value, typ);
@@ -1151,26 +1172,33 @@ impl<'a> super::linearize::Linearizer<'a> {
         reset
     }
 
-    /// Store a complex value into `base_sym` at `offset`, as two halves.
+    /// Store a complex value into `base_sym` at `offset`, as two halves, or
+    /// a GNU vector value, as its bytes.
     ///
-    /// A complex value lives in memory and travels by *address*, so storing it
-    /// the way a scalar member is stored would write the address instead of
-    /// the value.
+    /// Both live in memory and travel by *address*, so storing one the way a
+    /// scalar member is stored would write the address instead of the value.
     ///
     /// The initializer's base precision need not match the object's -- and
     /// usually does not, because `I` is `__builtin_complex(0.0, 1.0)`, a
     /// *double* complex, so `float _Complex f = 2.0f + 3.0f*I;` is a
     /// conversion, and so is a real initializer. Both are converted by
     /// [`Self::linearize_converted`] before the halves are copied.
-    pub(crate) fn store_complex_at(
+    pub(crate) fn store_addressed_value_at(
         &mut self,
         base_sym: PseudoId,
         offset: i64,
-        complex_typ: TypeId,
+        typ: TypeId,
         init: &Expr,
     ) {
-        let value_addr = self.linearize_converted(init, complex_typ);
-        self.copy_complex(base_sym, offset, value_addr, complex_typ);
+        if self.types.is_vector(typ) {
+            let value_addr = self.vector_addr(init);
+            let bytes = self.types.size_bytes(typ) as i64;
+            let vol = self.block_volatility(typ, self.expr_type(init));
+            self.emit_block_copy_at_offset(base_sym, offset, value_addr, bytes, vol);
+            return;
+        }
+        let value_addr = self.linearize_converted(init, typ);
+        self.copy_complex(base_sym, offset, value_addr, typ);
     }
 
     pub(crate) fn linearize_struct_field_init(
@@ -1221,8 +1249,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                     converted, base_sym, offset, field_type, size,
                 ));
             }
-        } else if self.types.is_complex(field_type) {
-            self.store_complex_at(base_sym, offset, field_type, value);
+        } else if self.types.is_complex(field_type) || self.types.is_vector(field_type) {
+            self.store_addressed_value_at(base_sym, offset, field_type, value);
         } else {
             let (actual_type, actual_size) = if self.types.kind(field_type) == TypeKind::Array {
                 let elem_type = self.types.base_type(field_type).unwrap_or(field_type);
@@ -2702,7 +2730,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Get symbolic name if present
             let name = op.name.map(|n| self.str(n).to_string());
 
-            let typ = self.expr_type(&op.expr);
+            let typ = self.asm_operand_type(&op.expr, is_memory);
             let size = self.types.size_bits(typ);
 
             // For memory-class outputs (`=m`/`+m`/...): the asm operand
@@ -2814,8 +2842,10 @@ impl<'a> super::linearize::Linearizer<'a> {
             // function there has decayed to a pointer (C17 6.3.2.1p3-4): its
             // width is the pointer's, not the array's. A memory operand is the
             // object itself and keeps the object's size.
-            let typ = self.expr_type(&op.expr);
+            let declared = self.expr_type(&op.expr);
+            let typ = self.asm_operand_type(&op.expr, is_memory);
             let typ = match self.types.kind(typ) {
+                _ if typ != declared => typ,
                 TypeKind::Array if !is_memory => {
                     let elem = self.types.base_type(typ).unwrap_or(typ);
                     self.types.pointer_to(elem)
@@ -2833,7 +2863,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     // Use the matched output's pseudo
                     let out_pseudo = ir_outputs[match_idx].pseudo;
                     // Load the input value into the output's pseudo
-                    let val = self.linearize_expr(&op.expr);
+                    let val = self.asm_value(&op.expr, typ);
                     // Copy val to out_pseudo so they share the same register
                     self.emit(
                         Instruction::new(Opcode::Copy)
@@ -2844,7 +2874,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     );
                     out_pseudo
                 } else {
-                    self.linearize_expr(&op.expr)
+                    self.asm_value(&op.expr, typ)
                 }
             } else if is_memory {
                 // For memory operands, get the address -- or the object
@@ -2857,7 +2887,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 k
             } else {
                 // For register operands, evaluate the expression
-                self.linearize_expr(&op.expr)
+                self.asm_value(&op.expr, typ)
             };
 
             ir_inputs.push(AsmConstraint {
@@ -2992,11 +3022,34 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             let out_pseudo = ir_outputs[i].pseudo;
 
-            let typ = self.expr_type(&op.expr);
+            let typ = self.asm_operand_type(&op.expr, false);
             // Back through the place the read came from, so the operand
             // expression is not evaluated a second time.
             self.store_rmw_place(&output_places[i], out_pseudo, typ);
         }
+    }
+
+    /// The type a register operand of expression `e` is handled at: its own,
+    /// or for a GNU vector its carrier (`Abi::vector_carrier`) -- the value in
+    /// the register, where the IR otherwise keeps a vector at an address. A
+    /// sixteen-byte vector in an `"x"` operand was handed over as its address
+    /// in a general register, and read back eight bytes wide.
+    fn asm_operand_type(&self, e: &Expr, is_memory: bool) -> TypeId {
+        let typ = self.expr_type(e);
+        if is_memory || !self.types.is_vector(typ) {
+            return typ;
+        }
+        self.vector_carrier(typ, crate::abi::CallingConv::C)
+    }
+
+    /// The value of the register operand `e`, at its operand type `typ`
+    /// ([`Self::asm_operand_type`]).
+    fn asm_value(&mut self, e: &Expr, typ: TypeId) -> PseudoId {
+        if self.types.is_vector(self.expr_type(e)) && !self.types.is_vector(typ) {
+            let addr = self.vector_addr(e);
+            return self.vector_to_carrier(addr, typ);
+        }
+        self.linearize_expr(e)
     }
 
     /// A memory operand's address as the object it names and a constant byte

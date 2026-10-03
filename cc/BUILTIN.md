@@ -32,7 +32,7 @@ Answered in `token/preprocess.rs` (`eval_has_builtin_expr`, inside `#if`) and
 `builtins.rs`: a name answers 1 when it is in `SUPPORTED_BUILTINS` (or tagged
 `kw::BUILTIN`, which `builtins.rs` tests keep identical) and `available_on`
 the target. `available_on` withholds the `f128` constants on macOS, which has
-no `_Float128`, and the `__builtin_ms_va_*` names off x86-64, where gcc has
+no `_Float128`, the `f64x` ones on Apple's aarch64, which has no `_Float64x`, and the `__builtin_ms_va_*` names off x86-64, where gcc has
 none of them.
 
 Differences from gcc's answers:
@@ -217,6 +217,11 @@ value gcc folds them to on both targets; at run time they stay undefined.
 One table, `LIBRARY_BUILTINS` in `parse/library_builtin.rs`, gives each of
 these its prototype and its `InlineLibraryFn`: `abs`, `labs`, `llabs`,
 `imaxabs`, `fabs`, `fabsf`, `fabsl`, `copysign`, `copysignf`, `copysignl`,
+their `_FloatN`, `_FloatNx` and `q` forms (`fabsf32`, `fabsf64`,
+`fabsf32x`, `fabsf64x`, `fabsf128`, `fabsq`, `copysignf32`, ...,
+`copysignq`; on x86-64 the binary128 ones are calls to
+libm's `fabsf128` and `copysignf128`, there being no sign-bit instruction
+for an XMM-held binary128),
 `sqrt`, `sqrtf`, `sqrtl`, `floor`, `ceil`, `trunc`, `round`, `rint`,
 `nearbyint`, `fmin`, `fmax`, `fma` and their `f` forms, `creal`, `cimag` and
 `conj` in each precision, and `memcpy`, `memset`, `memmove`, `mempcpy` and
@@ -294,10 +299,13 @@ weak definition can put two names at one address.
 | `__builtin_nan(str)`, `nanf`, `nanl` | Quiet NaN |
 | `__builtin_nans(str)`, `nansf`, `nansl` | Signalling NaN |
 
-Each also has `f16`, `f32`, `f64` and `f128` forms (`__builtin_inff16()`,
-`__builtin_nansf128(str)`, ...) giving `_Float16`, `float`, `double` and
-`_Float128`; the `f128` forms exist only where `_Float128` does (not macOS),
-and are a parse error elsewhere. All come from `FLOAT_CONSTANT_BUILTINS` and
+Each also has `f16`, `f32`, `f64`, `f32x`, `f64x` and `f128` forms
+(`__builtin_inff16()`, `__builtin_nansf128(str)`, ...) giving the type of
+that name -- `_Float32` is not `float`, but a distinct type of the same
+format -- and gcc's `q` forms (`__builtin_infq`, `huge_valq`, `nanq`,
+`nansq`) for `__float128`, which is `_Float128`; the `f128` and `q` forms
+exist only where `_Float128` does (not macOS), the `f64x` forms where
+`_Float64x` does (not Apple's aarch64), and are a parse error elsewhere. All come from `FLOAT_CONSTANT_BUILTINS` and
 are literals, so they are constants everywhere.
 
 A NaN's string literal names its payload, parsed as gcc's `strtoull`-based
@@ -368,6 +376,9 @@ them.
 | `__builtin_unreachable()` | `Opcode::Unreachable`, a terminator: `ud2` on x86-64, `brk #1` on aarch64 where it survives. Optimizing, a branch to it is dead and is removed |
 | `__builtin_trap()` | A call to `abort` (gcc emits a trap instruction) |
 | `__builtin_expect(expr, c)` | Its value is `expr`. `c` is evaluated for its side effects unless it is a literal |
+| `__builtin_expect_with_probability(expr, c, p)` | As `__builtin_expect`; `p` must be a floating constant in [0, 1] |
+| `__builtin_FILE()`, `__builtin_LINE()`, `__builtin_FUNCTION()` | Where the call is written: the presumed file name and line (after `#line`), and the enclosing function's name, or `""` outside one |
+| `__builtin_cpu_init()`, `__builtin_cpu_supports(str)`, `__builtin_cpu_is(str)` | x86-64 only (`parse/cpu_builtin.rs`). `init` calls the runtime's `__cpu_indicator_init`; the other two read its `__cpu_model` / `__cpu_features2` words, with name tables read off gcc 13's own lowering, and answer 0 or 1. An unknown name is gcc's error |
 | `__builtin_assume_aligned(ptr, align[, misalign])` | A call through gcc's prototype `void *(const void *, size_t, ...)` (`parse/assume_aligned.rs`): the arguments are checked and converted as for any call, and the value is `ptr` as a `void *`, whatever its pointee's qualifiers. `align` and `misalign` are evaluated for their side effects unless they are literals; neither need be constant, nor `align` a power of two. More than three arguments, or a `misalign` that is not an integer, is an error, in gcc's words. The alignment itself is unused |
 
 ## Structure Layout
@@ -388,6 +399,17 @@ supported as two integers laid end to end; multiply and divide are
 open-coded, and divide uses Smith's method with truncating steps, exactly as
 gcc does, so `(-9 + 38i) / (5 + 6i)` is `6 + 1i`. `_Complex __int128` is
 32 bytes and travels in memory on both targets.
+
+## GNU Vectors
+
+| Builtin | Notes |
+|---------|-------|
+| `__builtin_shuffle(a, mask)`, `__builtin_shuffle(a, b, mask)` | `ExprKind::VectorShuffle` with a mask: lane `k` of the result, of `a`'s type, is lane `mask[k]` of `a` followed by `b`, the index taken modulo the lanes there are. The mask's lanes are integers as wide and as many as the operands' |
+| `__builtin_shufflevector(a, b, i...)` | `ExprKind::VectorShuffle` with constant indices into `a` followed by `b` -- which may differ in length -- or `-1` for a lane of any value (zero). The result has one lane of the operands' element type per index, a power of two of them |
+| `__builtin_convertvector(v, T)` | `ExprKind::ConvertVector`: each lane converted as a cast converts it, to the lane type of the vector type `T`, which has as many lanes |
+
+All three are lowered lane by lane in `ir/linearize_vector.rs`, and their
+constraints are gcc's, in gcc's words (`parse/vector_builtin.rs`).
 
 ## Checked Arithmetic
 
@@ -414,7 +436,8 @@ Argument checking).
 A builtin of the same name as a library function is a call to that function
 (`parse_library_builtin` strips `__builtin_`; `__builtin_trap` calls `abort`,
 `__builtin_memcmp_eq` calls `memcmp`). The usual library rules apply --
-`__builtin_pow` needs `-lm`. They exist so a translation unit may call one
+`__builtin_pow` needs `-lm`, and so do `__builtin_sqrtf128` and
+`__builtin_fmaf128`, which call glibc's binary128 `sqrtf128` and `fmaf128`. They exist so a translation unit may call one
 without the header that declares it, as gcc allows and glibc's fortified
 headers rely on. The call is `CalleeBinding::Library`: it reaches the
 library's function, never an inline definition of the same name, so an
@@ -440,7 +463,7 @@ implicit declaration of one of these names takes the row's return type.
 | `__builtin_printf`, `sprintf`, `snprintf`, `fprintf`, `puts`, `putchar`, `fputs`, `fputc`, `fwrite` | |
 | `__builtin_printf_unlocked`, `fprintf_unlocked`, `fputs_unlocked` | glibc defines none of these; a program using one supplies it (gcc.c-torture's `builtins/` tests do) |
 | `__builtin_pow`, `fmod`, `atan2`, `hypot`, `fdim`, `remainder`, `nextafter` and `f`/`l` forms | |
-| `__builtin_cbrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `exp`, `exp2`, `expm1`, `log`, `log2`, `log10`, `log1p`, `logb`, `tgamma`, `lgamma`, `erf`, `erfc` and `f`/`l` forms | |
+| `__builtin_cbrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `exp`, `exp2`, `expm1`, `log`, `log2`, `log10`, `log1p`, `logb`, `ilogb`, `tgamma`, `lgamma`, `erf`, `erfc` and `f`/`l` forms | |
 | `__builtin_modf`, `frexp`, `ldexp` and `f`/`l` forms | The second parameter is a pointer or an `int` |
 | `__builtin_ceill`, `floorl`, `truncl`, `roundl`, `rintl`, `nearbyintl`, `fminl`, `fmaxl`, `fmal` | The `long double` forms of functions computed in place |
 
@@ -482,6 +505,7 @@ incompatible declaration keep the bare name's call.
 | Builtin | Description |
 |---------|-------------|
 | `__builtin_object_size(ptr, type)` | Bytes left in the object `ptr` points into, folded **at parse time** (`parse_object_size`) from what the expression shows: an array, a string literal, `&lvalue`, member and constant-index chains, casts and constant pointer arithmetic. Unknown is `(size_t)-1` for types 0/1 and 0 for 2/3. `type` must be an integer constant from 0 to 3 |
+| `__builtin_dynamic_object_size(ptr, type)` | The same builtin: every static answer is a correct one for it, and c17 gives no run-time sizes |
 | `__builtin___memcpy_chk`, `memmove_chk`, `mempcpy_chk`, `memset_chk` | Calls to `__memcpy_chk` etc. |
 | `__builtin___strcpy_chk`, `stpcpy_chk`, `strncpy_chk`, `stpncpy_chk`, `strcat_chk`, `strncat_chk` | |
 | `__builtin___printf_chk`, `fprintf_chk`, `sprintf_chk`, `snprintf_chk`, `vsprintf_chk`, `vsnprintf_chk` | |
@@ -574,7 +598,6 @@ Their absence is silent and changes which branch a guarded header takes.
 
 | Builtin | Consequence |
 |---------|-------------|
-| `__builtin_dynamic_object_size` | glibc's `_FORTIFY_SOURCE=3` falls back to `__builtin_object_size` |
 | `__builtin_setjmp`, `__builtin_longjmp` | Use `setjmp`/`longjmp`, which are builtins (above) |
 | `__builtin_strnlen`, `__builtin_vprintf`, `__builtin_vfprintf` | `strnlen`, `vprintf`, `vfprintf` are known by their bare names only |
 | `__builtin_clear_padding` | Would have to walk a type to find its padding |

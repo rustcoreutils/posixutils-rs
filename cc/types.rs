@@ -366,8 +366,8 @@ bitflags::bitflags! {
         const THREAD_LOCAL = 1 << 17;
 
         // A GNU `vector_size` type. c17 lays one out as an array of its
-        // elements -- storage only, see DECISIONS.md -- and this is what tells
-        // it apart from a real array, which decays where a vector would not.
+        // elements, and this is what tells it apart from a real array, which
+        // decays where a vector is a value.
         const VECTOR = 1 << 18;
 
         // `__builtin_ms_va_list`: a `char *` that `__builtin_va_arg` walks
@@ -376,6 +376,12 @@ bitflags::bitflags! {
         // still the one pointer `va_arg` walks as a list, and this bit is
         // that variant.
         const MS_VA_LIST = 1 << 19;
+
+        // The result of a vector comparison. gcc makes it "opaque": the
+        // signed integer vector of its shape to everything but assignment,
+        // where any vector of integer lanes of that shape takes it -- so
+        // `unsigned_v = a < b` is valid where `unsigned_v = signed_v` is not.
+        const VECTOR_MASK = 1 << 20;
     }
 }
 
@@ -453,6 +459,53 @@ impl fmt::Display for TypeKind {
     }
 }
 
+/// Which of C23's families of binary floating types (TS 18661-3) a
+/// floating type of kind `Float`, `Double` or `LongDouble` belongs to.
+///
+/// `_Float32` has `float`'s format and is still a different type: not
+/// compatible with it, a separate `_Generic` association, never promoted
+/// through `...`. glibc's <math.h> lists `float:` and `_Float32:` in one
+/// `_Generic` once the compiler claims gcc 7, so treating the names as
+/// aliases rejects the header. The kind stays the format's, so everything
+/// below the type system -- layout, ABI, code generation -- sees one type.
+/// `_Float16` and `_Float128` have kinds of their own and stay `Standard`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum FloatClass {
+    /// `float`, `double`, `long double`.
+    #[default]
+    Standard,
+    /// `_Float32` and `_Float64`.
+    Interchange,
+    /// `_Float32x` and `_Float64x`.
+    Extended,
+}
+
+impl FloatClass {
+    /// The `_FloatN`/`_FloatNx` keyword for a type of this class and `kind`,
+    /// or `None` for the standard types, which their kind spells.
+    pub fn keyword(self, kind: TypeKind) -> Option<&'static str> {
+        match (self, kind) {
+            (FloatClass::Interchange, TypeKind::Float) => Some("_Float32"),
+            (FloatClass::Interchange, TypeKind::Double) => Some("_Float64"),
+            (FloatClass::Extended, TypeKind::Double) => Some("_Float32x"),
+            (FloatClass::Extended, TypeKind::LongDouble) => Some("_Float64x"),
+            _ => None,
+        }
+    }
+
+    /// C23 6.3.1.8p1: of two types with the same format, an interchange type
+    /// wins over a standard one, which wins over an extended one -- gcc's
+    /// reading: `_Float32 + float` is `_Float32`, `_Float32x + double` is
+    /// `double`.
+    fn preference(self) -> u8 {
+        match self {
+            FloatClass::Interchange => 2,
+            FloatClass::Standard => 1,
+            FloatClass::Extended => 0,
+        }
+    }
+}
+
 // Type Representation
 
 /// A C type (compositional structure)
@@ -498,6 +551,10 @@ pub struct Type {
     /// Explicit alignment from __attribute__((aligned(N))) on typedef.
     /// When set, overrides the natural alignment returned by alignment().
     pub explicit_align: Option<u32>,
+
+    /// For a floating kind, which `_FloatN`/`_FloatNx` name, if any, this
+    /// type is; see [`FloatClass`].
+    pub float_class: FloatClass,
 }
 
 impl Default for Type {
@@ -513,6 +570,7 @@ impl Default for Type {
             conv: CallingConv::C,
             composite: None,
             explicit_align: None,
+            float_class: FloatClass::Standard,
         }
     }
 }
@@ -691,8 +749,8 @@ impl Type {
     /// With TypeId interning, base types are compared by TypeId equality.
     /// For full recursive comparison, use TypeTable::types_compatible().
     fn compatible_ignoring_base(&self, other: &Type) -> bool {
-        // Compare kinds first
-        if self.kind != other.kind {
+        // Compare kinds first, and `float` is not `_Float32`.
+        if self.kind != other.kind || self.float_class != other.float_class {
             return false;
         }
 
@@ -717,12 +775,14 @@ impl Type {
         const REDUNDANT_SIZE: TypeModifiers = TypeModifiers::SHORT
             .union(TypeModifiers::LONG)
             .union(TypeModifiers::LONGLONG);
-        // `__builtin_ms_va_list` is a `char *` to everything but `va_arg`.
+        // `__builtin_ms_va_list` is a `char *` to everything but `va_arg`,
+        // and a vector comparison's mask the vector of its shape.
         let ignored = Self::QUALIFIERS
             .union(redundant_signed)
             .union(REDUNDANT_SIZE)
             .union(Self::DECL_SPECIFIERS)
-            .union(TypeModifiers::MS_VA_LIST);
+            .union(TypeModifiers::MS_VA_LIST)
+            .union(TypeModifiers::VECTOR_MASK);
 
         // Compare modifiers (ignoring top-level qualifiers)
         let self_mods = self.modifiers.difference(ignored);
@@ -889,8 +949,8 @@ impl fmt::Display for Type {
 /// Key for type lookup/deduplication (hashable representation)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum TypeKey {
-    /// Basic type: kind + modifiers
-    Basic(TypeKind, u32),
+    /// Basic type: kind + modifiers + floating class
+    Basic(TypeKind, u32, FloatClass),
     /// Pointer to interned type
     Pointer(TypeId, u32), // base_id, modifiers
     /// Array of interned type
@@ -1053,6 +1113,19 @@ pub struct TypeTable {
     /// GNU complex integers need thirteen more, and naming each of them would
     /// spread the same lookup over eighteen fields.
     complex_of: std::collections::HashMap<TypeId, TypeId>,
+    /// For each (size, alignment) of a vector over sixteen bytes, a struct
+    /// of that size and alignment holding nothing but bytes: what the
+    /// calling conventions pass and return such a vector as. See
+    /// [`Self::vector_memory_carrier`].
+    vector_memory_carriers: std::collections::HashMap<(usize, u32), TypeId>,
+    /// For each one-lane floating vector, a struct holding nothing but it:
+    /// what System V passes such a vector as. See
+    /// [`Self::vector_wrapper_carrier`].
+    vector_wrapper_carriers: std::collections::HashMap<(TypeId, u32), TypeId>,
+    /// For each integer vector of several lanes and four bytes or fewer, the
+    /// vector of as many lanes widened to fill eight bytes: what clang
+    /// returns it as on Darwin, by lane count. See [`Self::vector_widened`].
+    vector_widened: std::collections::HashMap<usize, TypeId>,
     pub complex_float_id: TypeId,
     pub complex_double_id: TypeId,
     pub complex_longdouble_id: TypeId,
@@ -1128,6 +1201,9 @@ impl TypeTable {
             char16_id: TypeId::INVALID,
             char32_id: TypeId::INVALID,
             complex_of: std::collections::HashMap::new(),
+            vector_memory_carriers: std::collections::HashMap::new(),
+            vector_wrapper_carriers: std::collections::HashMap::new(),
+            vector_widened: std::collections::HashMap::new(),
             complex_float_id: TypeId::INVALID,
             complex_double_id: TypeId::INVALID,
             complex_longdouble_id: TypeId::INVALID,
@@ -1234,6 +1310,24 @@ impl TypeTable {
                 typ.modifiers | TypeModifiers::COMPLEX,
             ));
             table.complex_of.insert(base, cplx);
+        }
+        // `_Float32`, `_Float64`, `_Float32x` and `_Float64x`, real and
+        // complex, so `floating` can answer through `&self`.
+        for (kind, class) in [
+            (TypeKind::Float, FloatClass::Interchange),
+            (TypeKind::Double, FloatClass::Interchange),
+            (TypeKind::Double, FloatClass::Extended),
+            (TypeKind::LongDouble, FloatClass::Extended),
+        ] {
+            let real = table.intern(Type {
+                float_class: class,
+                ..Type::basic(kind)
+            });
+            let cplx = table.intern(Type {
+                float_class: class,
+                ..Type::with_modifiers(kind, TypeModifiers::COMPLEX)
+            });
+            table.complex_of.insert(real, cplx);
         }
         for (real, cplx) in [
             (table.float_id, table.complex_float_id),
@@ -1379,7 +1473,11 @@ impl TypeTable {
                     modifiers: typ.modifiers.bits(),
                 })
             }
-            _ => Some(TypeKey::Basic(typ.kind, typ.modifiers.bits())),
+            _ => Some(TypeKey::Basic(
+                typ.kind,
+                typ.modifiers.bits(),
+                typ.float_class,
+            )),
         }
     }
 
@@ -1691,6 +1789,29 @@ impl TypeTable {
                 }
             }
 
+            // gcc's spelling, which names what the type is rather than how
+            // it is laid out.
+            TypeKind::Array if typ.modifiers.contains(TypeModifiers::VECTOR) => {
+                let mut name = String::new();
+                if typ.modifiers.contains(TypeModifiers::CONST) {
+                    name.push_str("const ");
+                }
+                if typ.modifiers.contains(TypeModifiers::VOLATILE) {
+                    name.push_str("volatile ");
+                }
+                let elem = typ.base.map(|b| self.format_type(b, idents));
+                name.push_str(&format!(
+                    "__vector({}) {}",
+                    typ.array_size.unwrap_or(0),
+                    elem.unwrap_or_default()
+                ));
+                if !decl.is_empty() {
+                    name.push(' ');
+                    name.push_str(&decl);
+                }
+                name
+            }
+
             TypeKind::Array => {
                 let mut extents = parenthesize_if_pointer(decl);
                 let mut cur = id;
@@ -1787,7 +1908,10 @@ impl TypeTable {
                             }
                         }
                     }
-                    _ => result.push_str(&typ.kind.to_string()),
+                    _ => match typ.float_class.keyword(typ.kind) {
+                        Some(keyword) => result.push_str(keyword),
+                        None => result.push_str(&typ.kind.to_string()),
+                    },
                 }
 
                 // `_Complex` is a modifier, not a kind, so the kind name alone
@@ -1845,9 +1969,244 @@ impl TypeTable {
         ) && !typ.modifiers.contains(TypeModifiers::COMPLEX)
     }
 
+    /// What `_Alignof` answers for `id`: its alignment, but for a vector on
+    /// x86-64 at most sixteen. gcc answers so there for a vector it still
+    /// lays out on a wider boundary; see [`Self::vector_of`].
+    pub fn alignof_value(&self, id: TypeId) -> usize {
+        let align = self.alignment(id);
+        if self.is_vector(id)
+            && self.target_arch == Arch::X86_64
+            && self.get(id).explicit_align == Some(self.natural_vector_align(id))
+        {
+            align.min(16)
+        } else {
+            align
+        }
+    }
+
+    /// The alignment a vector of `id`'s size has when none is written.
+    fn natural_vector_align(&self, id: TypeId) -> u32 {
+        self.size_bytes(id)
+            .next_power_of_two()
+            .min(self.vector_align_cap()) as u32
+    }
+
+    /// The most a vector aligns to when none is written; see
+    /// [`Self::vector_of`]. On x86-64 that is the object-file maximum, 2^28
+    /// bytes, where gcc stops too.
+    fn vector_align_cap(&self) -> usize {
+        match self.target_arch {
+            Arch::X86_64 => 1 << 28,
+            Arch::Aarch64 => 16,
+        }
+    }
+
     /// Is this a GNU `vector_size` type?
     pub fn is_vector(&self, id: TypeId) -> bool {
         self.get(id).modifiers.contains(TypeModifiers::VECTOR)
+    }
+
+    /// A GNU vector of `count` elements of type `elem`.
+    ///
+    /// It aligns to its width rounded up to a power of two -- capped at
+    /// sixteen on aarch64, and only at 2^28 on x86-64, where gcc lays a 32-byte
+    /// vector out on a 32-byte boundary in a struct and realigns the stack to
+    /// pass one, while `_Alignof` answers 16 for it (see
+    /// [`Self::alignof_value`]). Measured against gcc across widths 4
+    /// through 128: the `_Alignof` answer alone had been taken for the
+    /// layout. An `aligned(n)` written alongside, `align`, takes precedence,
+    /// which is what `<link.h>` does: `__vector_size__(32), __aligned__(16)`.
+    pub fn vector_of(&mut self, elem: TypeId, count: usize, align: Option<u32>) -> TypeId {
+        let bytes = self.size_bytes(elem) * count;
+        let natural = bytes.next_power_of_two().min(self.vector_align_cap()) as u32;
+        let align = align.unwrap_or(natural);
+        if bytes > 16 {
+            self.intern_vector_memory_carrier(bytes, align);
+        }
+        let vector = self.intern(Type {
+            kind: TypeKind::Array,
+            base: Some(elem),
+            array_size: Some(count),
+            modifiers: TypeModifiers::VECTOR,
+            explicit_align: Some(align),
+            ..Default::default()
+        });
+        if count == 1 && self.is_float(elem) {
+            self.intern_vector_wrapper_carrier(vector, elem, align);
+        }
+        if count > 1
+            && bytes <= 4
+            && self.is_integer(elem)
+            && !self.vector_widened.contains_key(&count)
+        {
+            let lane = self.unsigned_of_size(8 / count).unwrap_or(self.ulong_id);
+            let widened = self.vector_of(lane, count, None);
+            self.vector_widened.insert(count, widened);
+        }
+        vector
+    }
+
+    /// The vector of `vec`'s lane count whose lanes are widened to fill
+    /// eight bytes -- `v2hi` as two `unsigned int`, `v4qi` as four `unsigned
+    /// short` -- when `vec` is an integer vector of several lanes and four
+    /// bytes or fewer: the shape clang returns such a vector in, in D0, on
+    /// Darwin ([`crate::abi::Abi::vector_return_widened`]).
+    pub fn vector_widened(&self, vec: TypeId) -> Option<TypeId> {
+        let (elem, count) = self.vector_lanes(vec)?;
+        if count < 2 || self.size_bytes(vec) > 4 || !self.is_integer(elem) {
+            return None;
+        }
+        self.vector_widened.get(&count).copied()
+    }
+
+    /// Make the wrapper carrier for one-lane floating vectors of `elem`,
+    /// once; `vector` is one of them.
+    fn intern_vector_wrapper_carrier(&mut self, vector: TypeId, elem: TypeId, align: u32) {
+        let key = (self.float_lane_key(elem), align);
+        if self.vector_wrapper_carriers.contains_key(&key) {
+            return;
+        }
+        let bytes = self.size_bytes(vector);
+        let member = StructMember {
+            name: StringId::EMPTY,
+            typ: vector,
+            offset: 0,
+            bit_offset: None,
+            bit_width: None,
+            access_bytes: None,
+            align: MemberAlign::NATURAL,
+        };
+        let composite = CompositeType {
+            tag: None,
+            members: vec![member],
+            enum_constants: Vec::new(),
+            size: bytes,
+            align: align as usize,
+            member_align: align as usize,
+            is_complete: true,
+            transparent: false,
+            anon_id: None,
+            tag_type: None,
+        };
+        let id = self.intern(Type {
+            kind: TypeKind::Struct,
+            composite: Some(Box::new(composite)),
+            ..Default::default()
+        });
+        self.vector_wrapper_carriers.insert(key, id);
+    }
+
+    /// The struct holding nothing but a vector of type `vec`, when `vec` has
+    /// one floating lane: System V classes such a vector MEMORY, as it does
+    /// a struct holding one, and no scalar C type travels that way.
+    pub fn vector_wrapper_carrier(&self, vec: TypeId) -> Option<TypeId> {
+        let (elem, _) = self.vector_lanes(vec)?;
+        let align = self.get(vec).explicit_align?;
+        self.vector_wrapper_carriers
+            .get(&(self.float_lane_key(elem), align))
+            .copied()
+    }
+
+    /// The floating kind and class of `elem`, as a stable key: one-lane
+    /// vectors of `float` and of `_Float32` carry differently typed lanes.
+    fn float_lane_key(&self, elem: TypeId) -> TypeId {
+        let typ = self.get(elem);
+        self.floating(typ.kind, typ.float_class)
+    }
+
+    /// Make the memory carrier for vectors of `bytes` and `align`, once.
+    fn intern_vector_memory_carrier(&mut self, bytes: usize, align: u32) {
+        if self.vector_memory_carriers.contains_key(&(bytes, align)) {
+            return;
+        }
+        let array = self.intern(Type::array(self.uchar_id, bytes));
+        let member = StructMember {
+            name: StringId::EMPTY,
+            typ: array,
+            offset: 0,
+            bit_offset: None,
+            bit_width: None,
+            access_bytes: None,
+            align: MemberAlign::NATURAL,
+        };
+        let composite = CompositeType {
+            tag: None,
+            members: vec![member],
+            enum_constants: Vec::new(),
+            size: bytes,
+            align: align as usize,
+            member_align: align as usize,
+            is_complete: true,
+            transparent: false,
+            anon_id: None,
+            tag_type: None,
+        };
+        let id = self.intern(Type {
+            kind: TypeKind::Struct,
+            composite: Some(Box::new(composite)),
+            ..Default::default()
+        });
+        self.vector_memory_carriers.insert((bytes, align), id);
+    }
+
+    /// The struct a vector of type `vec`, over sixteen bytes, is passed and
+    /// returned as: gcc's conventions treat such a vector exactly as an
+    /// aggregate of its size and alignment -- MEMORY class on System V, by
+    /// reference on AAPCS64 and Win64, returned through a hidden pointer.
+    pub fn vector_memory_carrier(&self, vec: TypeId) -> Option<TypeId> {
+        let align = self.get(vec).explicit_align?;
+        self.vector_memory_carriers
+            .get(&(self.size_bytes(vec), align))
+            .copied()
+    }
+
+    /// The element type and the number of elements of a vector type, or
+    /// `None` for any other type.
+    pub fn vector_lanes(&self, id: TypeId) -> Option<(TypeId, usize)> {
+        if !self.is_vector(id) {
+            return None;
+        }
+        let typ = self.get(id);
+        Some((typ.base?, typ.array_size?))
+    }
+
+    /// The type of a comparison of two vectors of type `id`: as many lanes,
+    /// each a signed integer as wide as `id`'s, holding -1 for true and 0 for
+    /// false -- gcc's, which names an eight-byte lane `long`.
+    pub fn vector_mask_type(&mut self, id: TypeId) -> TypeId {
+        let Some((elem, count)) = self.vector_lanes(id) else {
+            return self.int_id;
+        };
+        let lane = match self.size_bytes(elem) {
+            1 => self.schar_id,
+            2 => self.short_id,
+            4 => self.int_id,
+            8 => self.long_id,
+            _ => self.int128_id,
+        };
+        let mask = self.vector_of(lane, count, None);
+        let mut typ = self.get(mask).clone();
+        typ.modifiers |= TypeModifiers::VECTOR_MASK;
+        self.intern(typ)
+    }
+
+    /// Is this the result type of a vector comparison? See
+    /// [`TypeModifiers::VECTOR_MASK`].
+    pub fn is_vector_mask(&self, id: TypeId) -> bool {
+        self.get(id).modifiers.contains(TypeModifiers::VECTOR_MASK)
+    }
+
+    /// Whether a vector comparison's mask of type `mask` assigns to the
+    /// vector type `target`: integer lanes, as many and as wide.
+    fn mask_assigns_to(&self, mask: TypeId, target: TypeId) -> bool {
+        let (Some((ml, mn)), Some((tl, tn))) = (self.vector_lanes(mask), self.vector_lanes(target))
+        else {
+            return false;
+        };
+        self.is_vector_mask(mask)
+            && mn == tn
+            && self.is_integer(tl)
+            && self.size_bits(ml) == self.size_bits(tl)
     }
 
     /// Is this `__builtin_ms_va_list`, the one pointer `__builtin_va_arg`
@@ -1882,10 +2241,11 @@ impl TypeTable {
     /// 32-byte type.
     fn canonical_arithmetic_base(&self, id: TypeId) -> Option<TypeId> {
         let unsigned = self.is_unsigned(id);
-        Some(match self.get(id).kind {
-            TypeKind::Float => self.float_id,
-            TypeKind::Double => self.double_id,
-            TypeKind::LongDouble => self.longdouble_id,
+        let typ = self.get(id);
+        Some(match typ.kind {
+            TypeKind::Float | TypeKind::Double | TypeKind::LongDouble => {
+                self.floating(typ.kind, typ.float_class)
+            }
             TypeKind::Float16 => self.float16_id,
             TypeKind::Float128 => self.float128_id,
             // GNU complex integers. Answering `id` here -- the complex type
@@ -2051,14 +2411,16 @@ impl TypeTable {
 
         let t_ptr = t_kind == TypeKind::Pointer;
         let v_ptr = v_kind == TypeKind::Pointer;
-        let t_agg = matches!(t_kind, TypeKind::Struct | TypeKind::Union);
-        let v_agg = matches!(v_kind, TypeKind::Struct | TypeKind::Union);
+        let t_agg = matches!(t_kind, TypeKind::Struct | TypeKind::Union) || self.is_vector(target);
+        let v_agg = matches!(v_kind, TypeKind::Struct | TypeKind::Union) || self.is_vector(value);
 
         // An aggregate assigns only from a compatible aggregate. Compared
         // through `types_compatible` rather than by TypeId, because struct and
         // union types are deliberately not deduplicated -- they have identity.
         if t_agg || v_agg {
-            let ok = t_agg && v_agg && self.types_compatible(target, value);
+            let ok = t_agg
+                && v_agg
+                && (self.types_compatible(target, value) || self.mask_assigns_to(value, target));
             return (!ok).then_some(AssignFault::Incompatible);
         }
 
@@ -2199,6 +2561,8 @@ impl TypeTable {
     /// and assignment checking all read.
     fn decay_pointee(&self, typ: TypeId) -> Option<TypeId> {
         match self.kind(typ) {
+            // A vector is a value, laid out as an array but never decaying.
+            TypeKind::Array if self.is_vector(typ) => None,
             TypeKind::Array => Some(self.base_type(typ).unwrap_or(self.char_id)),
             TypeKind::Function => Some(typ),
             _ => None,
@@ -2316,7 +2680,8 @@ impl TypeTable {
         // qualifying the array instead would leave `cs.arr[0]` an ordinary
         // `int`, which the subscript reads from the element type, and a write
         // to it would be accepted.
-        if self.kind(id) == TypeKind::Array {
+        // A vector is no array here: it is qualified itself, as gcc does.
+        if self.kind(id) == TypeKind::Array && !self.is_vector(id) {
             let Some(elem) = self.base_type(id) else {
                 return id;
             };
@@ -2349,55 +2714,6 @@ impl TypeTable {
         let mut unqualified = self.get(id).clone();
         unqualified.modifiers.remove(Type::QUALIFIERS);
         self.intern(unqualified)
-    }
-
-    /// How many scalar initializers it takes to fill this type.
-    ///
-    /// This is the measure brace elision runs on (C17 6.7.9p20): a brace-less
-    /// initializer for an aggregate member consumes exactly this many elements
-    /// from the enclosing list. The linearizer places values by it and the
-    /// parser sizes incomplete arrays by it, so it lives here rather than in
-    /// either -- when only the linearizer knew the rule, `int a[][2] =
-    /// {1,2,3,4}` was stored as two rows and sized as four.
-    pub fn count_scalar_fields(&self, id: TypeId) -> usize {
-        match self.kind(id) {
-            TypeKind::Array => {
-                let elem_type = self.base_type(id).unwrap_or(self.int_id);
-                let count = self.get(id).array_size.unwrap_or(0);
-                count * self.count_scalar_fields(elem_type)
-            }
-            TypeKind::Struct => {
-                if let Some(composite) = self.get(id).composite.as_ref() {
-                    composite
-                        .members
-                        .iter()
-                        .filter(|m| m.is_initializable())
-                        .map(|m| self.count_scalar_fields(m.typ))
-                        .sum()
-                } else {
-                    1
-                }
-            }
-            TypeKind::Union => {
-                // A union's initializer initializes its first member (C17
-                // 6.7.9p17) -- which may be an anonymous aggregate, so the
-                // test is the one positional initialization uses, not "has a
-                // name": asking for a name counted `q` in
-                // `union { struct { int a, b; }; long q; }` while the
-                // initializer walk filled `a` and `b`.
-                if let Some(composite) = self.get(id).composite.as_ref() {
-                    composite
-                        .members
-                        .iter()
-                        .find(|m| m.is_initializable())
-                        .map(|m| self.count_scalar_fields(m.typ))
-                        .unwrap_or(1)
-                } else {
-                    1
-                }
-            }
-            _ => 1,
-        }
     }
 
     /// Whether `id` is an unsigned integer type.
@@ -2491,18 +2807,33 @@ impl TypeTable {
             let (l, r) = (self.kind(left), self.kind(right));
             let either = |k| l == k || r == k;
             // Widest first. binary128 outranks x87 extended: equal in range,
-            // wider in the significand.
-            return if either(TypeKind::Float128) {
-                self.pick_complex(complex, self.float128_id, self.complex_float128_id)
-            } else if either(TypeKind::LongDouble) {
-                self.pick_complex(complex, self.longdouble_id, self.complex_longdouble_id)
-            } else if either(TypeKind::Double) {
-                self.pick_complex(complex, self.double_id, self.complex_double_id)
-            } else if either(TypeKind::Float) {
-                self.pick_complex(complex, self.float_id, self.complex_float_id)
+            // wider in the significand. Both are _Float16 if nothing else,
+            // which C23 keeps as itself.
+            let kind = [
+                TypeKind::Float128,
+                TypeKind::LongDouble,
+                TypeKind::Double,
+                TypeKind::Float,
+            ]
+            .into_iter()
+            .find(|&k| either(k))
+            .unwrap_or(TypeKind::Float16);
+            // Then, between two names for that format, the preferred one.
+            let class = [left, right]
+                .into_iter()
+                .filter(|&t| self.kind(t) == kind)
+                .map(|t| self.get(t).float_class)
+                .max_by_key(|c| c.preference())
+                .unwrap_or_default();
+            let real = match kind {
+                TypeKind::Float128 => self.float128_id,
+                TypeKind::Float16 => self.float16_id,
+                _ => self.floating(kind, class),
+            };
+            return if complex {
+                self.complex_of.get(&real).copied().unwrap_or(real)
             } else {
-                // Both are _Float16, which C23 keeps as itself.
-                self.pick_complex(complex, self.float16_id, self.complex_float16_id)
+                real
             };
         }
 
@@ -2633,8 +2964,10 @@ impl TypeTable {
         if self.is_complex(id) {
             return id;
         }
+        // `_Float32` is not `float` and goes as itself (C23 6.5.2.2p6).
         match self.kind(id) {
-            TypeKind::Float | TypeKind::Float16 => self.double_id,
+            TypeKind::Float if self.get(id).float_class == FloatClass::Standard => self.double_id,
+            TypeKind::Float16 => self.double_id,
             _ => self.integer_promote(id),
         }
     }
@@ -2863,6 +3196,28 @@ impl TypeTable {
     /// `Target` is derived from those two.
     pub fn target(&self) -> Target {
         Target::new(self.target_arch, self.target_os)
+    }
+
+    /// The unqualified real floating type of `kind` and `class`: `float`,
+    /// `_Float32x`, ... A class `kind` has no member of falls back to the
+    /// standard type of that kind.
+    pub fn floating(&self, kind: TypeKind, class: FloatClass) -> TypeId {
+        let key = TypeKey::Basic(kind, 0, class);
+        let standard = TypeKey::Basic(kind, 0, FloatClass::Standard);
+        self.lookup
+            .get(&key)
+            .or_else(|| self.lookup.get(&standard))
+            .copied()
+            .expect("the real floating types are pre-interned")
+    }
+
+    /// Whether `_Float64x` exists here; see `arch::has_float64x`.
+    pub fn has_float64x(&self) -> bool {
+        crate::arch::has_float64x(&Target {
+            arch: self.target_arch,
+            os: self.target_os,
+            ..Target::host()
+        })
     }
 
     pub fn has_float128(&self) -> bool {

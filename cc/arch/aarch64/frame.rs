@@ -675,8 +675,8 @@ impl Aarch64CodeGen {
             ArgClass::Hfa { base, .. } => match base {
                 HfaBase::Float16 => (FpSize::Half, 2),
                 HfaBase::Float32 => (FpSize::Single, 4),
-                HfaBase::Float64 => (FpSize::Double, 8),
-                HfaBase::Float128 => (FpSize::Quad, 16),
+                HfaBase::Float64 | HfaBase::ShortVector64 => (FpSize::Double, 8),
+                HfaBase::Float128 | HfaBase::ShortVector128 => (FpSize::Quad, 16),
             },
             _ => (FpSize::Double, 8),
         }
@@ -1120,8 +1120,8 @@ impl Aarch64CodeGen {
                                     match base {
                                         HfaBase::Float16 => FpSize::Half,
                                         HfaBase::Float32 => FpSize::Single,
-                                        HfaBase::Float64 => FpSize::Double,
-                                        HfaBase::Float128 => FpSize::Quad,
+                                        HfaBase::Float64 | HfaBase::ShortVector64 => FpSize::Double,
+                                        HfaBase::Float128 | HfaBase::ShortVector128 => FpSize::Quad,
                                     },
                                     count,
                                 ))

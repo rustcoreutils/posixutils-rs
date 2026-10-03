@@ -327,33 +327,6 @@ impl X86_64CodeGen {
             _ => Reg::R11,
         };
 
-        // Get src1 location to see if we need to move it
-        let src1_loc = self.get_location(src1);
-        let cmp_reg = match &src1_loc {
-            Loc::Reg(r) => *r, // Compare directly in src1's register
-            _ => {
-                // src1 is not in a register, move to work_reg
-                self.emit_move(src1, work_reg, size);
-                work_reg
-            }
-        };
-
-        let src2_loc = self.get_location(src2);
-        // Through a scratch other than the one holding the first operand.
-        let scratch = if work_reg == Reg::R10 {
-            Reg::R11
-        } else {
-            Reg::R10
-        };
-        let src2_gp = self.gp_operand_via(src2, &src2_loc, size, scratch);
-
-        // LIR: compare instruction
-        self.push_lir(X86Inst::Cmp {
-            size: op_size,
-            src: src2_gp,
-            dst: GpOperand::Reg(cmp_reg),
-        });
-
         // Map opcode to condition code
         let cc = match insn.op {
             Opcode::SetEq => CondCode::Eq,
@@ -368,6 +341,76 @@ impl X86_64CodeGen {
             Opcode::SetAe => CondCode::Uge,
             _ => return,
         };
+
+        // Through a scratch other than the work register.
+        let scratch = if work_reg == Reg::R10 {
+            Reg::R11
+        } else {
+            Reg::R10
+        };
+
+        // The IR does not say how a narrow operand is extended in its
+        // register or slot -- that is the consumer's decision -- so an
+        // operand narrower than 32 bits is extended here, the way the
+        // comparison reads it: signed for a signed one, zero otherwise. A
+        // 16-bit lane loaded with `movswl` was compared with a constant -128
+        // whose slot held it zero-extended, as 65408.
+        let narrow = insn
+            .operand_type()
+            .map(|t| types.size_bits(t))
+            .unwrap_or(insn.operand_width());
+        if narrow < 32 {
+            let signed = matches!(
+                cc,
+                CondCode::Slt | CondCode::Sle | CondCode::Sgt | CondCode::Sge
+            );
+            let from = OperandSize::from_bits(narrow);
+            // The second operand first, into a scratch no pseudo is
+            // allocated to: the work register may be the one it is in.
+            for (src, reg) in [(src2, scratch), (src1, work_reg)] {
+                self.emit_move(src, reg, 32);
+                let src = GpOperand::Reg(reg);
+                let dst_size = OperandSize::B32;
+                self.push_lir(if signed {
+                    X86Inst::Movsx {
+                        src_size: from,
+                        dst_size,
+                        src,
+                        dst: reg,
+                    }
+                } else {
+                    X86Inst::Movzx {
+                        src_size: from,
+                        dst_size,
+                        src,
+                        dst: reg,
+                    }
+                });
+            }
+            self.push_lir(X86Inst::Cmp {
+                size: OperandSize::B32,
+                src: GpOperand::Reg(scratch),
+                dst: GpOperand::Reg(work_reg),
+            });
+        } else {
+            // Get src1 location to see if we need to move it
+            let src1_loc = self.get_location(src1);
+            let cmp_reg = match &src1_loc {
+                Loc::Reg(r) => *r, // Compare directly in src1's register
+                _ => {
+                    // src1 is not in a register, move to work_reg
+                    self.emit_move(src1, work_reg, size);
+                    work_reg
+                }
+            };
+            let src2_loc = self.get_location(src2);
+            let src2_gp = self.gp_operand_via(src2, &src2_loc, size, scratch);
+            self.push_lir(X86Inst::Cmp {
+                size: op_size,
+                src: src2_gp,
+                dst: GpOperand::Reg(cmp_reg),
+            });
+        }
 
         // LIR: setCC instruction - use work_reg for the result
         self.push_lir(X86Inst::SetCC { cc, dst: work_reg });

@@ -1267,8 +1267,8 @@ impl Aarch64CodeGen {
         let (fp_size, elem_size) = match base {
             HfaBase::Float16 => (FpSize::Half, 2),
             HfaBase::Float32 => (FpSize::Single, 4),
-            HfaBase::Float64 => (FpSize::Double, 8),
-            HfaBase::Float128 => (FpSize::Quad, 16),
+            HfaBase::Float64 | HfaBase::ShortVector64 => (FpSize::Double, 8),
+            HfaBase::Float128 | HfaBase::ShortVector128 => (FpSize::Quad, 16),
         };
 
         let vregs = [VReg::V0, VReg::V1, VReg::V2, VReg::V3];
@@ -1316,8 +1316,8 @@ impl HfaElem {
         let size = match base {
             HfaBase::Float16 => FpSize::Half,
             HfaBase::Float32 => FpSize::Single,
-            HfaBase::Float64 => FpSize::Double,
-            HfaBase::Float128 => FpSize::Quad,
+            HfaBase::Float64 | HfaBase::ShortVector64 => FpSize::Double,
+            HfaBase::Float128 | HfaBase::ShortVector128 => FpSize::Quad,
         };
         HfaElem {
             size,

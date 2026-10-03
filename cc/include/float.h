@@ -109,7 +109,11 @@
 
 #endif // C11
 
-// _Float16 support (IEEE 754-2008 binary16)
+// The _FloatN and _FloatNx types of TS 18661-3 (C23). Their names are not
+// reserved in C17, so they appear only on request, as in gcc and glibc.
+#ifdef __STDC_WANT_IEC_60559_TYPES_EXT__
+
+// _Float16 (binary16)
 #ifdef __FLT16_MANT_DIG__
 #define FLT16_MANT_DIG __FLT16_MANT_DIG__
 #define FLT16_DIG __FLT16_DIG__
@@ -124,10 +128,37 @@
 #define FLT16_TRUE_MIN __FLT16_DENORM_MIN__
 #endif
 
-// __float128 / _Float128 support (IEEE 754 binary128).
-//
-// Unlike LDBL_*, these do not vary by target: binary128 is one format
-// everywhere it is offered.
+// _Float32 (binary32)
+#ifdef __FLT32_MANT_DIG__
+#define FLT32_MANT_DIG __FLT32_MANT_DIG__
+#define FLT32_DIG __FLT32_DIG__
+#define FLT32_MIN_EXP __FLT32_MIN_EXP__
+#define FLT32_MIN_10_EXP __FLT32_MIN_10_EXP__
+#define FLT32_MAX_EXP __FLT32_MAX_EXP__
+#define FLT32_MAX_10_EXP __FLT32_MAX_10_EXP__
+#define FLT32_MAX __FLT32_MAX__
+#define FLT32_EPSILON __FLT32_EPSILON__
+#define FLT32_MIN __FLT32_MIN__
+#define FLT32_DECIMAL_DIG __FLT32_DECIMAL_DIG__
+#define FLT32_TRUE_MIN __FLT32_DENORM_MIN__
+#endif
+
+// _Float64 (binary64)
+#ifdef __FLT64_MANT_DIG__
+#define FLT64_MANT_DIG __FLT64_MANT_DIG__
+#define FLT64_DIG __FLT64_DIG__
+#define FLT64_MIN_EXP __FLT64_MIN_EXP__
+#define FLT64_MIN_10_EXP __FLT64_MIN_10_EXP__
+#define FLT64_MAX_EXP __FLT64_MAX_EXP__
+#define FLT64_MAX_10_EXP __FLT64_MAX_10_EXP__
+#define FLT64_MAX __FLT64_MAX__
+#define FLT64_EPSILON __FLT64_EPSILON__
+#define FLT64_MIN __FLT64_MIN__
+#define FLT64_DECIMAL_DIG __FLT64_DECIMAL_DIG__
+#define FLT64_TRUE_MIN __FLT64_DENORM_MIN__
+#endif
+
+// _Float128 / __float128 (binary128), where the target has it
 #ifdef __FLT128_MANT_DIG__
 #define FLT128_MANT_DIG __FLT128_MANT_DIG__
 #define FLT128_DIG __FLT128_DIG__
@@ -141,5 +172,37 @@
 #define FLT128_DECIMAL_DIG __FLT128_DECIMAL_DIG__
 #define FLT128_TRUE_MIN __FLT128_DENORM_MIN__
 #endif
+
+// _Float32x (binary64)
+#ifdef __FLT32X_MANT_DIG__
+#define FLT32X_MANT_DIG __FLT32X_MANT_DIG__
+#define FLT32X_DIG __FLT32X_DIG__
+#define FLT32X_MIN_EXP __FLT32X_MIN_EXP__
+#define FLT32X_MIN_10_EXP __FLT32X_MIN_10_EXP__
+#define FLT32X_MAX_EXP __FLT32X_MAX_EXP__
+#define FLT32X_MAX_10_EXP __FLT32X_MAX_10_EXP__
+#define FLT32X_MAX __FLT32X_MAX__
+#define FLT32X_EPSILON __FLT32X_EPSILON__
+#define FLT32X_MIN __FLT32X_MIN__
+#define FLT32X_DECIMAL_DIG __FLT32X_DECIMAL_DIG__
+#define FLT32X_TRUE_MIN __FLT32X_DENORM_MIN__
+#endif
+
+// _Float64x (long double's format), where that is wider than double
+#ifdef __FLT64X_MANT_DIG__
+#define FLT64X_MANT_DIG __FLT64X_MANT_DIG__
+#define FLT64X_DIG __FLT64X_DIG__
+#define FLT64X_MIN_EXP __FLT64X_MIN_EXP__
+#define FLT64X_MIN_10_EXP __FLT64X_MIN_10_EXP__
+#define FLT64X_MAX_EXP __FLT64X_MAX_EXP__
+#define FLT64X_MAX_10_EXP __FLT64X_MAX_10_EXP__
+#define FLT64X_MAX __FLT64X_MAX__
+#define FLT64X_EPSILON __FLT64X_EPSILON__
+#define FLT64X_MIN __FLT64X_MIN__
+#define FLT64X_DECIMAL_DIG __FLT64X_DECIMAL_DIG__
+#define FLT64X_TRUE_MIN __FLT64X_DENORM_MIN__
+#endif
+
+#endif // __STDC_WANT_IEC_60559_TYPES_EXT__
 
 #endif // _C17_FLOAT_H

@@ -113,12 +113,24 @@ fn macro_redefinition_conflict(old: &Macro, new: &Macro) -> Option<&'static str>
         return Some("it is a built-in macro");
     }
     // The constraint governs redefinition "by another #define preprocessing
-    // directive". A macro the implementation supplied is not one, and holding
-    // headers to it is pure noise: we predefine __GLIBC_MINOR__ as 17 while
-    // the host's features.h defines the true value, so every compilation
-    // against glibc would warn.
+    // directive", which a predefine is not -- but gcc warns when a predefine
+    // or a `-D` is redefined to something else (`#define __linux__ 7`), and
+    // C17 6.10.8p2 forbids it outright for the standard's own names. A
+    // redefinition to the same thing is quiet. So is any redefinition in a
+    // system header, since warnings there are not shown.
+    //
+    // The feature-test macros are the exception. c17 predefines them where
+    // gcc does not (see `os::linux`), so a program's own
+    // `#define _GNU_SOURCE` or `#define _XOPEN_SOURCE 700` is not
+    // redefining anything as far as its author can tell.
     if old.predefined {
-        return None;
+        if is_feature_test_macro(&old.name) {
+            return None;
+        }
+        let same = old.is_function == new.is_function
+            && old.params.len() == new.params.len()
+            && replacement_lists_identical(&old.body, &new.body);
+        return (!same).then_some("it is predefined with a different definition");
     }
     if old.is_function != new.is_function {
         return Some("one definition is function-like and the other is not");
@@ -143,6 +155,22 @@ fn macro_redefinition_conflict(old: &Macro, new: &Macro) -> Option<&'static str>
         return Some("the replacement lists differ");
     }
     None
+}
+
+/// A feature-test macro: the program's request for a namespace (POSIX.1-2024
+/// 2.2.1), such as `_GNU_SOURCE`, `_XOPEN_SOURCE` or `_POSIX_C_SOURCE`.
+fn is_feature_test_macro(name: &str) -> bool {
+    name.starts_with('_')
+        && (name.ends_with("_SOURCE") || name.ends_with("_SOURCE_EXTENDED") || name == "_REENTRANT")
+}
+
+/// A name C17 6.10.8 predefines, which p2 says may be neither `#define`d nor
+/// `#undef`ined: `__FILE__`, `__LINE__`, `__DATE__`, `__TIME__`, and every
+/// `__STDC...` macro (the mandatory, conditional and environment ones).
+pub(super) fn is_standard_predefined(name: &str) -> bool {
+    matches!(name, "__FILE__" | "__LINE__" | "__DATE__" | "__TIME__")
+        || name.starts_with("__STDC_")
+        || name == "__STDC__"
 }
 
 /// A macro definition (object-like or function-like)
@@ -545,20 +573,18 @@ pub struct Preprocessor<'a> {
     /// Lexer mode for tokenizing included files (C or Assembly)
     lexer_mode: LexerMode,
 
-    /// Line offset from #line directive: actual_line = token_line + line_offset
-    line_offset: i32,
-
-    /// File name override from #line directive
-    line_file_override: Option<String>,
-
     /// The input is already the output of `c17 -E`, so translation phases 1
     /// through 4 must not run again (POSIX 87982-87983). See the allowlist in
     /// `handle_directive`.
     preprocessed: bool,
 
-    /// Attribution established by the most recent `# N "file" flags`
-    /// linemarker, if any. See [`LineMarker`].
-    linemarker: Option<LineMarker>,
+    /// Attribution established by the most recent `#line` or `# N "file"
+    /// flags` linemarker in each physical stream. See [`LineMarker`].
+    ///
+    /// Per stream, so that a `#line` in a file survives an `#include` in it:
+    /// the header's lines are its own, and when it ends the file's mapping is
+    /// still the one in force.
+    linemarkers: HashMap<u16, LineMarker>,
 
     /// Position of the token currently being dispatched, before [`LineMarker`]
     /// remapping. A linemarker's delta is measured from the physical line and
@@ -608,15 +634,14 @@ pub struct Preprocessor<'a> {
 /// `effective_position`, the include-chain note and the `-E` marker writer all
 /// keep working unchanged, and re-running `-E` over a `.i` re-emits markers
 /// naming the original source rather than the `.i` it is reading.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct LineMarker {
-    /// Only tokens from this stream are remapped. Text spliced in from an
-    /// `#include` carries its own attribution and must not be touched.
-    origin: u16,
     /// The stream the marker named.
     target: u16,
     /// Added to a physical line number to get the reported one.
     delta: i64,
+    /// The file name it gave, which `__FILE__` reports.
+    name: Option<String>,
 }
 
 /// The payload prefix a marker uses when it carries a pragma c17 does not act
@@ -942,10 +967,8 @@ impl<'a> Preprocessor<'a> {
             trigraphs: false,
             current_search_pos: None,
             lexer_mode: LexerMode::C,
-            line_offset: 0,
-            line_file_override: None,
             preprocessed: false,
-            linemarker: None,
+            linemarkers: HashMap::new(),
             physical_line: 0,
             physical_stream: 0,
             expansion_budget: EXPANSION_BUDGET,
@@ -1025,7 +1048,7 @@ impl<'a> Preprocessor<'a> {
         //
         // The claimed version is a statement about which header paths this
         // compiler can take, and it is measured rather than aspirational.
-        // 6.5.0 is the highest that works against glibc 2.39:
+        // 7.5.0 is the highest that works against glibc 2.39:
         //
         //   4.3  `bits/floatn.h` turns on __HAVE_FLOAT128 and needs the
         //        `__float128` keyword and `_Complex float` with mode(TC)
@@ -1036,10 +1059,13 @@ impl<'a> Preprocessor<'a> {
         //   4.9  __HAVE_GENERIC_SELECTION turns on, so __MATH_TG uses
         //        `_Generic` rather than __builtin_choose_expr
         //   6.0  `signbit` goes to __builtin_signbit*
-        //   7.0  __HAVE_FLOATN_NOT_TYPEDEF makes _FloatN native types, and
-        //        `stdlib.h` then declares `strtof32x` in terms of a `_Float32x`
-        //        this compiler does not have. That is the ceiling.
-        self.define_macro(Macro::predefined("__GNUC__", Some("6")));
+        //   7.0  __HAVE_FLOATN_NOT_TYPEDEF: `_Float32` .. `_Float64x` are the
+        //        compiler's own distinct types, __MATH_TG lists `_Float32`
+        //        beside `float`, and the `__builtin_*f32x` family is called
+        //        by name
+        //   8.0  <tgmath.h> needs `__builtin_tgmath`, and <sys/cdefs.h>
+        //        the `nonstring` attribute. That is the ceiling.
+        self.define_macro(Macro::predefined("__GNUC__", Some("7")));
         self.define_macro(Macro::predefined("__GNUC_MINOR__", Some("5")));
         self.define_macro(Macro::predefined("__GNUC_PATCHLEVEL__", Some("0")));
         self.define_macro(Macro::predefined(
@@ -1047,7 +1073,7 @@ impl<'a> Preprocessor<'a> {
             Some(concat!(
                 "\"c17 ",
                 env!("CARGO_PKG_VERSION"),
-                " (gcc compatible 6.5.0)\""
+                " (gcc compatible 7.5.0)\""
             )),
         ));
         self.define_macro(Macro::predefined("__GNUC_STDC_INLINE__", Some("1")));
@@ -1116,7 +1142,7 @@ impl<'a> Preprocessor<'a> {
 
         // Floating-point limit macros
         for (name, value) in arch::get_float_limit_macros(self.target) {
-            self.define_macro(Macro::predefined(name, Some(value)));
+            self.define_macro(Macro::predefined(&name, Some(&value)));
         }
 
         // OS macros, including the unreserved `unix` / `linux` spellings.
@@ -1388,6 +1414,9 @@ impl<'a> Preprocessor<'a> {
                             // was paid by programs that define no macros at
                             // all. The copy is needed only past this point,
                             // because expanding wants `idents` mutably.
+                            if cursor.provenance() == Provenance::Main {
+                                Self::warn_stray_va_args(&token, idents);
+                            }
                             let is_pragma = name == "_Pragma";
                             let is_macro = self.macros.contains_key(name);
                             let hidden = token.is_no_expand(name);
@@ -1395,7 +1424,7 @@ impl<'a> Preprocessor<'a> {
                             // Handle the _Pragma operator (C99):
                             // `_Pragma("string")` is `#pragma string`.
                             if is_pragma {
-                                self.handle_pragma_operator(&mut cursor, &mut output);
+                                self.handle_pragma_operator(&mut cursor, &mut output, token.pos);
                                 continue;
                             }
 
@@ -1484,14 +1513,49 @@ impl<'a> Preprocessor<'a> {
 
     /// Apply the active [`LineMarker`] to a position.
     fn remap_pos(&self, pos: Position) -> Position {
-        match self.linemarker {
-            Some(lm) if lm.origin == pos.stream => Position {
+        match self.linemarkers.get(&pos.stream) {
+            Some(lm) => Position {
                 stream: lm.target,
                 line: (pos.line as i64 + lm.delta).max(1) as u32,
                 ..pos
             },
-            _ => pos,
+            None => pos,
         }
+    }
+
+    /// The file name `__FILE__` reports for text in the current physical
+    /// stream: the one its last `#line` or linemarker named, else the file's.
+    fn presumed_file_name(&self) -> &str {
+        self.linemarkers
+            .get(&self.physical_stream)
+            .and_then(|lm| lm.name.as_deref())
+            .unwrap_or(&self.current_file)
+    }
+
+    /// Establish that the physical line after the current directive is line
+    /// `line` of `name` (or of the file it already belongs to): what `#line`
+    /// (C17 6.10.4) and a `# N "file"` linemarker both mean.
+    fn set_line_marker(&mut self, line: u32, name: Option<String>, is_system: bool) {
+        let origin = self.physical_stream;
+        let prior = self.linemarkers.get(&origin);
+        let (target, name) = match name {
+            Some(name) => (diag::find_or_add_stream(&name), Some(name)),
+            None => (
+                prior.map_or(origin, |lm| lm.target),
+                prior.and_then(|lm| lm.name.clone()),
+            ),
+        };
+        diag::set_stream_system(target, is_system);
+        // The marker names the line of the text *after* it, so the delta is
+        // measured against the next physical line.
+        self.linemarkers.insert(
+            origin,
+            LineMarker {
+                target,
+                delta: line as i64 - (self.physical_line as i64 + 1),
+                name,
+            },
+        );
     }
 
     /// Collect tokens until end of line
@@ -1786,26 +1850,36 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
     // ?: || && | ^ & ==/!= relational shift additive multiplicative unary
 
     /// Ternary operator has lowest precedence: cond ? true_val : false_val
+    ///
+    /// C17 6.5.15p4: only the chosen arm is evaluated, so the other is parsed
+    /// with its diagnostics suppressed, as `&&` and `||` do theirs -- `#if 1 ?
+    /// 2 : 1/0` is valid. The result still has the type the usual arithmetic
+    /// conversions give both arms (p5): `1 ? -1 : 0u` is a large unsigned.
     fn expr_ternary(&mut self) -> PpValue {
         let cond = self.expr_or();
-        if self.is_special(b'?' as u32) {
-            self.advance();
-            let true_val = self.expr_ternary();
-            if self.is_special(b':' as u32) {
-                self.advance();
-            } else {
-                let pos = self.current().map(|t| t.pos).unwrap_or_default();
-                diag::error(pos, &gettext("expected ':' in conditional expression"));
-            }
-            let false_val = self.expr_ternary();
-            if cond.is_true() {
-                true_val
-            } else {
-                false_val
-            }
-        } else {
-            cond
+        if !self.is_special(b'?' as u32) {
+            return cond;
         }
+        self.advance();
+        let true_val = self.expr_ternary_arm(cond.is_true());
+        if self.is_special(b':' as u32) {
+            self.advance();
+        } else {
+            let pos = self.current().map(|t| t.pos).unwrap_or_default();
+            diag::error(pos, &gettext("expected ':' in conditional expression"));
+        }
+        let false_val = self.expr_ternary_arm(!cond.is_true());
+        let (t, f, unsigned) = PpValue::promote(true_val, false_val);
+        PpValue::from_parts(if cond.is_true() { t } else { f }, unsigned)
+    }
+
+    /// One arm of `?:`, evaluated only when `taken`.
+    fn expr_ternary_arm(&mut self, taken: bool) -> PpValue {
+        let saved = self.suppressed;
+        self.suppressed |= !taken;
+        let value = self.expr_ternary();
+        self.suppressed = saved;
+        value
     }
 
     fn expr_or(&mut self) -> PpValue {
@@ -2536,6 +2610,11 @@ pub struct PreprocessConfig<'a> {
     pub dump_macros: bool,
     /// Collect the headers this translation unit depends on (the `-M` family).
     pub collect_dependencies: bool,
+    /// The position independence code generation uses; see
+    /// [`define_pic_macros`].
+    pub position: crate::target::PositionIndependence,
+    /// The x86-64 extensions the code may assume; see [`define_isa_macros`].
+    pub isa: crate::target::X86Isa,
     /// What optimization was asked for.
     ///
     /// The same value the optimizer is given, so `__OPTIMIZE__`,
@@ -2568,6 +2647,42 @@ fn define_optimization_macros(pp: &mut Preprocessor, opt: crate::opt::Optimizati
     }
     if !opt.inlines_generally() {
         pp.define_macro(Macro::predefined("__NO_INLINE__", Some("1")));
+    }
+}
+
+/// Define `__PIC__`/`__pic__` and `__PIE__`/`__pie__`, as gcc and clang do,
+/// from the position independence the code is generated with. Code that
+/// tests them -- inline asm and `.S` files choosing between a GOT and a direct
+/// access -- otherwise took the absolute path in position-independent code.
+///
+/// The value is 2, the "large model" of `-fPIC`/`-fPIE`, which is what c17
+/// generates for `-fpic`/`-fpie` too. Mach-O code is always position
+/// independent, and clang defines `__PIC__` there unconditionally.
+fn define_pic_macros(
+    pp: &mut Preprocessor,
+    target: &Target,
+    pos: crate::target::PositionIndependence,
+) {
+    if pos.pic || target.os == crate::target::Os::MacOS {
+        pp.define_macro(Macro::predefined("__PIC__", Some("2")));
+        pp.define_macro(Macro::predefined("__pic__", Some("2")));
+    }
+    if pos.pie {
+        pp.define_macro(Macro::predefined("__PIE__", Some("2")));
+        pp.define_macro(Macro::predefined("__pie__", Some("2")));
+    }
+}
+
+/// Define the feature macros of the x86-64 extensions `-msse3` ..
+/// `-msse4.2`, `-mpopcnt` and `-march=` ask for (`__SSE4_1__` and the rest),
+/// as gcc does. Code tests them to choose its path; the baseline's
+/// `__SSE2__` is among the target's own macros.
+fn define_isa_macros(pp: &mut Preprocessor, target: &Target, isa: crate::target::X86Isa) {
+    if target.arch != crate::target::Arch::X86_64 {
+        return;
+    }
+    for name in isa.macros() {
+        pp.define_macro(Macro::predefined(name, Some("1")));
     }
 }
 
@@ -2616,6 +2731,8 @@ pub fn preprocess_collecting(
     pp.collect_dependencies = config.collect_dependencies;
 
     define_optimization_macros(&mut pp, config.optimization);
+    define_pic_macros(&mut pp, target, config.position);
+    define_isa_macros(&mut pp, target, config.isa);
 
     // Add -I include paths
     for path in config.include_paths {
@@ -2684,6 +2801,12 @@ pub struct AsmPreprocessConfig<'a> {
     /// What optimization was asked for; see [`PreprocessConfig::optimization`].
     /// GCC defines these for `.S` files too.
     pub optimization: crate::opt::Optimization,
+    /// See [`PreprocessConfig::position`]; gcc defines the macros for `.S`
+    /// files too, where hand-written assembly chooses GOT or direct accesses
+    /// by them.
+    pub position: crate::target::PositionIndependence,
+    /// See [`PreprocessConfig::isa`].
+    pub isa: crate::target::X86Isa,
 }
 
 /// A `.S` operand that could not be preprocessed.
@@ -2754,6 +2877,8 @@ pub fn preprocess_asm_file(
     pp.define_macro(Macro::predefined("__ASSEMBLER__", Some("1")));
 
     define_optimization_macros(&mut pp, config.optimization);
+    define_pic_macros(&mut pp, target, config.position);
+    define_isa_macros(&mut pp, target, config.isa);
 
     // -nostdinc: the directories are dropped in `Preprocessor::new`; the
     // bundled headers go with them.

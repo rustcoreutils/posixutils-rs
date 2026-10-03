@@ -19,7 +19,7 @@ use crate::arch::asm_constraints::{
 };
 use crate::arch::codegen::{impossible_constant, AsmOperandValue};
 use crate::arch::lir::{Directive, FpSize, OperandSize, Symbol};
-use crate::ir::{Instruction, PseudoId};
+use crate::ir::{AsmData, Instruction, PseudoId};
 
 /// What goes in a scratch register before the template: a memory operand's
 /// address, or the value of a register operand the allocator gave no register.
@@ -194,6 +194,15 @@ pub(super) fn asm_reg_name_32(reg: Reg) -> &'static str {
 /// Whether the class asks for a vector (SIMD/FP) register.
 fn requires_vector(class: &AsmOperandClass) -> bool {
     class.reg == Some(AsmRegClass::Vector)
+}
+
+/// The pseudos of `asm`'s operands that sit in a vector register (`"w"`).
+pub(super) fn vector_operand_pseudos(asm: &AsmData) -> impl Iterator<Item = PseudoId> + '_ {
+    asm.outputs
+        .iter()
+        .chain(&asm.inputs)
+        .filter(|c| !c.is_memory() && requires_vector(&c.class))
+        .map(|c| c.pseudo)
 }
 
 // AsmOperandFormatter trait implementation
@@ -853,6 +862,9 @@ impl Aarch64CodeGen {
         let fp_size = match size {
             16 => FpSize::Half,
             32 => FpSize::Single,
+            // A sixteen-byte operand -- a vector, a binary128 -- is the
+            // whole Q register.
+            128 => FpSize::Quad,
             _ => FpSize::Double,
         };
         match loc {
@@ -896,6 +908,9 @@ impl Aarch64CodeGen {
         let fp_size = match size {
             16 => FpSize::Half,
             32 => FpSize::Single,
+            // A sixteen-byte operand -- a vector, a binary128 -- is the
+            // whole Q register.
+            128 => FpSize::Quad,
             _ => FpSize::Double,
         };
         match loc {

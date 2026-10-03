@@ -14,15 +14,19 @@
 // - initializers: designated init, compound literals
 //
 
+mod brace_elision;
 mod c99_features_gaps;
 mod complex;
 mod complex_abi;
 mod complex_conversion;
 mod expressions;
 mod features;
+mod func_name;
 mod identifiers;
 mod initializers;
+mod machine_modes;
 mod stdlib_headers;
+mod tgmath;
 mod translation_limits;
 mod type_macros;
 mod types;

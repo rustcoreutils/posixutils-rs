@@ -10,7 +10,6 @@ keeping one here reads as a backlog item nobody is picking up.
 
 - [Technical Debt](#technical-debt)
 - [Future Features](#future-features)
-- [Conformance](#conformance)
 - [Optimization Passes](#optimization-passes)
 - [Assembly Peephole Optimizations](#assembly-peephole-optimizations)
 
@@ -131,16 +130,6 @@ What it takes:
 - The prologue's `subq $N, %rsp` becomes `movabsq $N, %r11; subq %r11, %rsp`.
 - Stack probing: a frame larger than the guard gap touches each page on the
   way down, as gcc and clang do. No target probes.
-
----
-
-## Conformance
-
-### `restrict` on a non-pointer is accepted
-
-C17 6.7.3p2 is a constraint: `restrict` may only qualify a pointer to object
-type. c17 accepts `restrict int x;` silently, at file and block scope; gcc
-rejects it. Done is an error at the declaration.
 
 ---
 

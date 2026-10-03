@@ -13,6 +13,8 @@
 // implementations of standard headers like <stdarg.h> and <stddef.h>.
 //
 
+use crate::target::Arch;
+
 /// Builtin stdarg.h - variadic function support
 pub const STDARG_H: &str = include_str!("include/stdarg.h");
 
@@ -60,11 +62,43 @@ pub const CPUID_H: &str = include_str!("include/cpuid.h");
 /// wins: builtin headers are searched after the includer's directory and -I.
 pub const TGMATH_H: &str = include_str!("include/tgmath.h");
 
-/// Look up a builtin header by name
+/// The x86-64 intrinsic headers, SSE through SSE4.2 (`<immintrin.h>` and
+/// `<x86intrin.h>` gather them), and `<mm_malloc.h>`. Written in C over GNU
+/// vectors; see each header's preamble.
+const X86_INTRIN_HEADERS: &[(&str, &str)] = &[
+    ("mmintrin.h", include_str!("include/mmintrin.h")),
+    ("xmmintrin.h", include_str!("include/xmmintrin.h")),
+    ("emmintrin.h", include_str!("include/emmintrin.h")),
+    ("pmmintrin.h", include_str!("include/pmmintrin.h")),
+    ("tmmintrin.h", include_str!("include/tmmintrin.h")),
+    ("smmintrin.h", include_str!("include/smmintrin.h")),
+    ("nmmintrin.h", include_str!("include/nmmintrin.h")),
+    ("popcntintrin.h", include_str!("include/popcntintrin.h")),
+    ("immintrin.h", include_str!("include/immintrin.h")),
+    ("x86intrin.h", include_str!("include/x86intrin.h")),
+    ("mm_malloc.h", include_str!("include/mm_malloc.h")),
+];
+
+/// The AArch64 Advanced SIMD intrinsics, a core subset of the ACLE's.
+const ARM_NEON_H: &str = include_str!("include/arm_neon.h");
+
+/// Look up a builtin header by name for a target of architecture `arch`.
 ///
 /// Returns the header content if found, None otherwise.
 /// The name should be the basename without path (e.g., "stdarg.h").
-pub fn get_builtin_header(name: &str) -> Option<&'static str> {
+/// The intrinsic headers belong to their architecture: on another, the name
+/// is looked for as any other is, and found nowhere, as with gcc.
+pub fn get_builtin_header(name: &str, arch: Arch) -> Option<&'static str> {
+    let intrinsics = match arch {
+        Arch::X86_64 => X86_INTRIN_HEADERS
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, body)| *body),
+        Arch::Aarch64 => (name == "arm_neon.h").then_some(ARM_NEON_H),
+    };
+    if intrinsics.is_some() {
+        return intrinsics;
+    }
     match name {
         "stdarg.h" => Some(STDARG_H),
         "complex.h" => Some(COMPLEX_H),
@@ -79,10 +113,6 @@ pub fn get_builtin_header(name: &str) -> Option<&'static str> {
         "stdint.h" => Some(STDINT_H),
         "cpuid.h" => Some(CPUID_H),
         "tgmath.h" => Some(TGMATH_H),
-        // xmmintrin.h and emmintrin.h are deliberately NOT registered. Their
-        // bundled bodies are a bare #error, and registering them meant a user
-        // with a real SSE intrinsics header on the include path got our hard
-        // failure instead of theirs. Unregistered, the normal search finds it.
         _ => None,
     }
 }
@@ -91,9 +121,23 @@ pub fn get_builtin_header(name: &str) -> Option<&'static str> {
 mod tests {
     use super::*;
 
+    fn get_builtin_header_host(name: &str) -> Option<&'static str> {
+        get_builtin_header(name, Arch::X86_64)
+    }
+
+    /// The intrinsic headers exist for their own architecture only.
+    #[test]
+    fn test_intrinsic_headers_follow_the_architecture() {
+        assert!(get_builtin_header("emmintrin.h", Arch::X86_64).is_some());
+        assert!(get_builtin_header("immintrin.h", Arch::X86_64).is_some());
+        assert!(get_builtin_header("emmintrin.h", Arch::Aarch64).is_none());
+        assert!(get_builtin_header("arm_neon.h", Arch::Aarch64).is_some());
+        assert!(get_builtin_header("arm_neon.h", Arch::X86_64).is_none());
+    }
+
     #[test]
     fn test_stdarg_exists() {
-        let header = get_builtin_header("stdarg.h");
+        let header = get_builtin_header_host("stdarg.h");
         assert!(header.is_some());
         assert!(header.unwrap().contains("va_list"));
         assert!(header.unwrap().contains("va_start"));
@@ -101,7 +145,7 @@ mod tests {
 
     #[test]
     fn test_stddef_exists() {
-        let header = get_builtin_header("stddef.h");
+        let header = get_builtin_header_host("stddef.h");
         assert!(header.is_some());
         assert!(header.unwrap().contains("size_t"));
         assert!(header.unwrap().contains("NULL"));
@@ -109,7 +153,7 @@ mod tests {
 
     #[test]
     fn test_stdbool_exists() {
-        let header = get_builtin_header("stdbool.h");
+        let header = get_builtin_header_host("stdbool.h");
         assert!(header.is_some());
         assert!(header.unwrap().contains("bool"));
         assert!(header.unwrap().contains("true"));
@@ -118,7 +162,7 @@ mod tests {
 
     #[test]
     fn test_stdatomic_exists() {
-        let header = get_builtin_header("stdatomic.h");
+        let header = get_builtin_header_host("stdatomic.h");
         assert!(header.is_some());
         assert!(header.unwrap().contains("atomic_int"));
         assert!(header.unwrap().contains("atomic_load"));
@@ -127,7 +171,7 @@ mod tests {
 
     #[test]
     fn test_float_exists() {
-        let header = get_builtin_header("float.h");
+        let header = get_builtin_header_host("float.h");
         assert!(header.is_some());
         assert!(header.unwrap().contains("FLT_MAX"));
         assert!(header.unwrap().contains("DBL_MAX"));
@@ -136,6 +180,6 @@ mod tests {
 
     #[test]
     fn test_unknown_header() {
-        assert!(get_builtin_header("unknown.h").is_none());
+        assert!(get_builtin_header_host("unknown.h").is_none());
     }
 }

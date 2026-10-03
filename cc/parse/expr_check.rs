@@ -156,6 +156,17 @@ impl Parser<'_> {
             if self.check_not_vector_value(arg.typ, arg.pos) {
                 sound = false;
             }
+            // An argument is a value (C17 6.5.2.2p4), which a void
+            // expression is not -- under a prototype or not.
+            // `__builtin_va_arg_pack()` stands for the caller's arguments.
+            if !matches!(arg.kind, ExprKind::VaArgPack)
+                && arg
+                    .typ
+                    .is_some_and(|t| self.types.kind(t) == TypeKind::Void)
+            {
+                diag::error(arg.pos, &gettext("invalid use of void expression"));
+                sound = false;
+            }
         }
         let Some(func_type) = func_type else {
             return sound;
@@ -169,6 +180,15 @@ impl Parser<'_> {
             };
             let a = self.decayed_type(a);
             let param = self.decayed_type(param);
+            // C17 6.5.2.2p4 assigns the argument to the parameter, which
+            // needs an object of the parameter's type; a prototype may name an
+            // incomplete one, but a call cannot be made through it.
+            if self.type_name_is_incomplete(param, 0) && self.types.kind(param) != TypeKind::Void {
+                let n = (i + 1).to_string();
+                diag::error_args(arg.pos, "type of formal parameter {0} is incomplete", &[&n]);
+                sound = false;
+                continue;
+            }
             let Some(fault) =
                 self.types
                     .assignment_fault(param, a, self.is_null_pointer_constant(arg))
@@ -315,6 +335,8 @@ impl Parser<'_> {
                     .is_some_and(|t| self.types.kind(t) == TypeKind::Function);
             if to_function {
                 diag::error(pos, &gettext("subscripted value is pointer to function"));
+            } else if self.types.kind(pointer) == TypeKind::Pointer {
+                self.check_pointer_steps(pointer, pos);
             }
             return;
         }
@@ -344,28 +366,26 @@ impl Parser<'_> {
         is_void
     }
 
-    /// Refuse to use a `vector_size` value where gcc gives it vector semantics.
-    ///
-    /// c17 gives a vector type storage and nothing more (DECISIONS.md): it is
-    /// laid out as an array of its elements, which is what `<link.h>` needs.
-    /// An array used as a value decays to its address, though, and a vector
-    /// does not -- so `(long long)(V2SI){2, 2}` answered the compound
-    /// literal's address, `v + 1` did pointer arithmetic, and a vector passed
-    /// by value went as a pointer, each silently. What the array model gets
-    /// right -- declaring, `sizeof`, `&v`, `v[i]`, a member, an initializer --
-    /// is untouched; the operations it would get wrong are diagnosed here.
+    /// Refuse a `vector_size` value as a function's argument, parameter or
+    /// return value when the target's convention has no type that travels as
+    /// gcc passes it (`Abi::vector_carrier`): a one-lane `float` vector on
+    /// aarch64, which gcc passes on the stack with the arguments after it and
+    /// returns in a general register. Every other vector goes as its carrier.
     pub(super) fn check_not_vector_value(&self, typ: Option<TypeId>, pos: Position) -> bool {
-        let is_vector = typ.is_some_and(|t| self.types.is_vector(t));
-        if is_vector {
+        let Some(t) = typ.filter(|&t| self.types.is_vector(t)) else {
+            return false;
+        };
+        let target = self.types.target();
+        let unpassable = crate::abi::get_abi(&target)
+            .vector_carrier(t, self.types)
+            .is_none();
+        if unpassable {
             diag::error(
                 pos,
-                &gettext(
-                    "c17 implements 'vector_size' types as storage only; \
-                     a vector cannot be used as a value here",
-                ),
+                &gettext("c17 does not pass or return this vector type on this target"),
             );
         }
-        is_vector
+        unpassable
     }
 
     /// Check the operand of a unary operator against the type its operator
@@ -384,7 +404,7 @@ impl Parser<'_> {
     ) -> bool {
         let Some(t) = operand.typ else { return true };
         if self.types.is_vector(t) {
-            return true;
+            return self.check_vector_unary(op, t, pos);
         }
         if self.types.kind(t) == TypeKind::Void {
             diag::error(pos, &gettext("invalid use of void expression"));
@@ -392,10 +412,35 @@ impl Parser<'_> {
         }
         let t = self.decayed_type(t);
         if op.operand_class().admits(self.types, t) {
-            return true;
+            let steps = matches!(op, UnaryOperator::Increment | UnaryOperator::Decrement);
+            return !steps || self.check_pointer_steps(t, pos);
         }
         diag::error_args(pos, "wrong type argument to {0}", &[op.name()]);
         false
+    }
+
+    /// C17 6.5.6p2, 6.5.2.4p1: pointer arithmetic needs a pointer to a
+    /// complete object type, whose size is the step. A pointer to an
+    /// incomplete structure, union or enumeration was stepped by zero, and
+    /// `p - q` divided by it. (`void *` and function pointers stay gcc's
+    /// extension, stepping by one.) Answers whether `typ` may be stepped.
+    pub(super) fn check_pointer_steps(&self, typ: TypeId, pos: Position) -> bool {
+        if self.types.kind(typ) != TypeKind::Pointer {
+            return true;
+        }
+        let Some(pointee) = self.types.base_type(typ) else {
+            return true;
+        };
+        // An unsized array pointee is not tested: the type table interns
+        // `int[n]` and `int[]` alike, and stepping over the former is C.
+        let incomplete = matches!(
+            self.types.kind(pointee),
+            TypeKind::Struct | TypeKind::Union | TypeKind::Enum
+        ) && !self.types.is_composite_complete(pointee);
+        if incomplete {
+            diag::error(pos, &gettext("arithmetic on pointer to an incomplete type"));
+        }
+        !incomplete
     }
 
     /// Check an expression whose truth is tested -- the first operand of
@@ -404,7 +449,7 @@ impl Parser<'_> {
     /// for the scalar type each requires. Worded as gcc words it.
     pub(super) fn check_truth_value(&mut self, cond: &Expr) -> bool {
         let Some(t) = cond.typ else { return true };
-        if self.check_not_void(cond, cond.pos) || self.check_not_vector_value(Some(t), cond.pos) {
+        if self.check_not_void(cond, cond.pos) || self.check_not_vector_operand(cond) {
             return false;
         }
         let t = self.decayed_type(t);
@@ -448,16 +493,31 @@ impl Parser<'_> {
         } else {
             self.check_has_value(left)
         };
-        if !(self.check_has_value(right) && left_ok) {
+        let right_ok = if logical {
+            !self.check_not_vector_operand(right)
+        } else {
+            true
+        };
+        if !(self.check_has_value(right) && left_ok && right_ok) {
             return false;
         }
         let (Some(lt), Some(rt)) = (left.typ, right.typ) else {
             return true;
         };
+        if self.types.is_vector(lt) || self.types.is_vector(rt) {
+            let types = (
+                self.lvalue_converted_type(lt),
+                self.lvalue_converted_type(rt),
+            );
+            return self.check_vector_operands(op, left, right, types, pos);
+        }
         let (lt, rt) = (self.decayed_type(lt), self.decayed_type(rt));
         let l = self.binary_operand(op, left, lt, rt);
         let r = self.binary_operand(op, right, rt, lt);
         match binary_operand_verdict(self.types, op, l, r) {
+            OperandVerdict::Valid if matches!(op, BinaryOp::Add | BinaryOp::Sub) => {
+                self.check_pointer_steps(lt, pos) && self.check_pointer_steps(rt, pos)
+            }
             OperandVerdict::Valid => true,
             OperandVerdict::Invalid => {
                 // `&&` and `||` have tested the left operand for truth by
@@ -481,11 +541,19 @@ impl Parser<'_> {
     }
 
     /// C17 6.5.5-6.5.14 require operands with a value: `f() + 1`, where `f`
-    /// returns void, has none, and c17 gives a vector none it can compute
-    /// with.
+    /// returns void, has none.
     fn check_has_value(&self, operand: &Expr) -> bool {
         !self.check_not_void(operand, operand.pos)
-            && !self.check_not_vector_value(operand.typ, operand.pos)
+    }
+
+    /// Report a vector where a scalar is tested for truth -- a condition, or
+    /// an operand of `&&` or `||` -- which gcc's C does not take.
+    pub(super) fn check_not_vector_operand(&self, e: &Expr) -> bool {
+        let is_vector = e.typ.is_some_and(|t| self.types.is_vector(t));
+        if is_vector {
+            diag::error(e.pos, &gettext("used vector type where scalar is required"));
+        }
+        is_vector
     }
 
     /// One operand of `op`, with its decayed type `typ`, beside an operand of
@@ -741,8 +809,8 @@ impl Parser<'_> {
 
         // 6.7.9p14/p15: an array may be initialized by a string literal, with
         // or without braces, but only one whose element type it matches. Any
-        // other array needs a list.
-        if self.types.kind(target) == TypeKind::Array {
+        // other array needs a list. A vector takes a vector value.
+        if self.types.kind(target) == TypeKind::Array && !self.types.is_vector(target) {
             // A compound literal of the same array type initializes an array,
             // which gcc accepts and `ast_init_to_ir` already lowers -- only
             // this check stood in the way, having been written when a string
@@ -756,6 +824,8 @@ impl Parser<'_> {
             }
             if !self.string_literal_suits_array(target, init) {
                 diag::error(init.pos, &gettext("invalid initializer"));
+            } else {
+                self.check_string_fits_array(target, init);
             }
             return;
         }
@@ -825,6 +895,30 @@ impl Parser<'_> {
     ///
     /// Returns false for a non-string initializer too: an array has no other
     /// unbraced form.
+    /// C17 6.7.9p2, p14: a string literal may fill an array exactly -- its
+    /// terminating null then has no room, and is dropped -- but may not
+    /// overrun it. gcc warns and truncates, and so does c17.
+    fn check_string_fits_array(&self, target: TypeId, init: &Expr) {
+        let Some(capacity) = self.types.array_size(target).filter(|&n| n > 0) else {
+            return;
+        };
+        let units = match &init.kind {
+            ExprKind::StringLit(bytes) => bytes.chars().count(),
+            ExprKind::WideStringLit(units) | ExprKind::Utf32StringLit(units) => units.len(),
+            ExprKind::Utf16StringLit(units) => units.len(),
+            _ => return,
+        };
+        if units > capacity {
+            let elem = self.types.base_type(target).unwrap_or(self.types.char_id);
+            let named = self.types.format_type(elem, Some(self.idents));
+            diag::warning_args(
+                init.pos,
+                "initializer-string for array of '{0}' is too long",
+                &[&named],
+            );
+        }
+    }
+
     fn string_literal_suits_array(&mut self, target: TypeId, init: &Expr) -> bool {
         let narrow = matches!(init.kind, ExprKind::StringLit(_));
         let wide = matches!(
@@ -949,6 +1043,21 @@ impl Parser<'_> {
         }
     }
 
+    /// The member `expr` designates when it is a bit-field: `s.m` or `p->m`
+    /// where `m` was declared with a width.
+    pub(crate) fn bit_field_designated(&self, expr: &Expr) -> Option<StringId> {
+        let (aggregate, member) = match &expr.kind {
+            ExprKind::Member { expr, member } => (expr.typ?, *member),
+            // A pointer's pointee, or an array's element: the array decays.
+            ExprKind::Arrow { expr, member } => (self.types.base_type(expr.typ?)?, *member),
+            _ => return None,
+        };
+        self.types
+            .find_member(aggregate, member)
+            .and_then(|m| m.bit_width)
+            .map(|_| member)
+    }
+
     /// Report an operand of unary `&` that has no address (C17 6.5.3.2p1):
     /// one that is neither a function designator nor an lvalue, such as
     /// `&(i + 1)` or `&creal(z)` -- a call's result is a value, even when the
@@ -966,7 +1075,22 @@ impl Parser<'_> {
             diag::error_args(pos, "lvalue required as {0}", &["unary '&' operand"]);
             return;
         }
-        let ExprKind::Ident(symbol_id) = &operand.kind else {
+        // C17 6.5.3.2p1: never a bit-field, which has no address.
+        if let Some(member) = self.bit_field_designated(operand) {
+            diag::error_args(
+                pos,
+                "cannot take address of bit-field '{0}'",
+                &[self.str(member)],
+            );
+            return;
+        }
+        // The address of a member is the address of the object it is in, so
+        // `&s.a` of a `register` structure asks for the register's.
+        let mut root = operand;
+        while let ExprKind::Member { expr, .. } = &root.kind {
+            root = expr;
+        }
+        let ExprKind::Ident(symbol_id) = &root.kind else {
             return;
         };
         let sym = self.symbols.get(*symbol_id);
@@ -996,9 +1120,9 @@ impl Parser<'_> {
             return;
         }
         // An array is an lvalue but never a modifiable one: it has no
-        // assignment operator, only its elements do.
+        // assignment operator, only its elements do. A vector has one.
         if let Some(typ) = target.typ {
-            if self.types.kind(typ) == TypeKind::Array {
+            if self.types.kind(typ) == TypeKind::Array && !self.types.is_vector(typ) {
                 diag::error(pos, &gettext("assignment to expression with array type"));
             }
         }
@@ -1041,7 +1165,38 @@ impl Parser<'_> {
                     "assignment of read-only variable{0}",
                     &[&var_name.to_string()],
                 );
+                return;
+            }
+            // C17 6.3.2.1p1: a structure or union with a `const` member,
+            // at any depth, is not a modifiable lvalue as a whole -- the
+            // assignment would write the member.
+            if self.has_read_only_member(typ_id) {
+                diag::error(
+                    pos,
+                    &gettext("assignment of a structure or union with a read-only member"),
+                );
             }
         }
+    }
+
+    /// Whether a structure or union has a `const`-qualified member,
+    /// directly, inside an array member, or inside a nested aggregate.
+    fn has_read_only_member(&self, typ: TypeId) -> bool {
+        if !matches!(self.types.kind(typ), TypeKind::Struct | TypeKind::Union) {
+            return false;
+        }
+        let Some(composite) = self.types.composite(typ) else {
+            return false;
+        };
+        composite.members.iter().any(|m| {
+            let mut t = m.typ;
+            while self.types.kind(t) == TypeKind::Array {
+                match self.types.base_type(t) {
+                    Some(elem) => t = elem,
+                    None => break,
+                }
+            }
+            self.types.modifiers(t).contains(TypeModifiers::CONST) || self.has_read_only_member(t)
+        })
     }
 }

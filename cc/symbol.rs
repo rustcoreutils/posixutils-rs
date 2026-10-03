@@ -33,6 +33,22 @@ pub enum Namespace {
     Tag,
 }
 
+// Linkage
+
+/// The linkage of an identifier (C17 6.2.2): whether its declarations in
+/// different scopes, or different translation units, name one entity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Linkage {
+    /// Each declaration is its own entity: a block-scope object, a parameter,
+    /// a typedef name, an enumerator, a tag.
+    #[default]
+    None,
+    /// One entity within this translation unit: `static` at file scope.
+    Internal,
+    /// One entity across the program.
+    External,
+}
+
 // Symbol Kind
 
 /// What kind of entity this symbol represents
@@ -126,6 +142,9 @@ pub struct Symbol {
     /// `mpdecimal.c` defines it `inline __attribute__((always_inline))` -- and
     /// missing this left CPython's `_decimal` with an undefined symbol.
     pub has_non_inline_decl: bool,
+
+    /// The linkage this declaration gave the identifier.
+    pub linkage: Linkage,
 }
 
 impl Symbol {
@@ -143,6 +162,7 @@ impl Symbol {
             array_is_variably_modified: false,
             has_extern_decl: false,
             has_non_inline_decl: false,
+            linkage: Linkage::None,
         }
     }
 
@@ -160,6 +180,7 @@ impl Symbol {
             array_is_variably_modified: false,
             has_extern_decl: false,
             has_non_inline_decl: false,
+            linkage: Linkage::None,
         }
     }
 
@@ -177,6 +198,7 @@ impl Symbol {
             array_is_variably_modified: false,
             has_extern_decl: false,
             has_non_inline_decl: false,
+            linkage: Linkage::None,
         }
     }
 
@@ -195,6 +217,7 @@ impl Symbol {
             array_is_variably_modified: false,
             has_extern_decl: false,
             has_non_inline_decl: false,
+            linkage: Linkage::None,
         }
     }
 
@@ -213,6 +236,7 @@ impl Symbol {
             array_is_variably_modified: false,
             has_extern_decl: false,
             has_non_inline_decl: false,
+            linkage: Linkage::None,
         }
     }
 
@@ -230,7 +254,14 @@ impl Symbol {
             array_is_variably_modified: false,
             has_extern_decl: false,
             has_non_inline_decl: false,
+            linkage: Linkage::None,
         }
+    }
+
+    /// Record the linkage the declaration gave the identifier.
+    pub fn with_linkage(mut self, linkage: Linkage) -> Self {
+        self.linkage = linkage;
+        self
     }
 
     /// Set explicit alignment from _Alignas specifier (C11 6.7.5)

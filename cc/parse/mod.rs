@@ -19,20 +19,38 @@ mod bind;
 mod bit_builtin;
 mod builtin_args;
 mod builtin_expr;
+mod cpu_builtin;
 mod declaration;
 mod declarator;
 mod expr_check;
 mod expression;
 mod generic_builtin;
 mod library_builtin;
+mod linkage;
 mod operand_rule;
 pub mod parser;
 mod statement;
 mod toplevel;
 mod typename;
+mod vector_builtin;
+mod vector_check;
 
 #[cfg(test)]
+mod test_declarations;
+#[cfg(test)]
+mod test_expr_constraints;
+#[cfg(test)]
+mod test_float_n;
+#[cfg(test)]
+mod test_incomplete;
+#[cfg(test)]
+mod test_member_list;
+#[cfg(test)]
 mod test_parser;
+#[cfg(test)]
+mod test_specifiers;
+#[cfg(test)]
+mod test_vectors;
 
 // Re-export parser used by main.rs
 pub use library_builtin::LibraryCallPolicy;

@@ -19,7 +19,7 @@ use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId, SymbolKind};
 use crate::token::lexer::Position;
-use crate::types::{Type, TypeId, TypeKind, TypeModifiers, TypeTable};
+use crate::types::{FloatClass, Type, TypeId, TypeKind, TypeModifiers, TypeTable};
 use gettextrs::gettext;
 
 /// C17 6.7.2p2: the type specifiers must together name one of a
@@ -32,9 +32,10 @@ struct SpecifierTally<'a> {
     /// -- or, for a typedef name or `typeof`, as written. More than one is
     /// always a constraint violation.
     data_types: Vec<(&'a str, Position)>,
-    /// Whether `_Complex` appeared. It names no data type of its own, but it
-    /// is a type specifier, so a typedef name after it is the declarator.
-    complex: bool,
+    /// Where `_Complex` appeared, if it did. It names no data type of its
+    /// own, but it is a type specifier, so a typedef name after it is the
+    /// declarator.
+    complex: Option<Position>,
     short_count: u32,
     long_count: u32,
     signed_count: u32,
@@ -72,7 +73,7 @@ impl<'a> SpecifierTally<'a> {
     /// only whether a data type had been seen took it as the type.
     fn has_type_specifier(&self) -> bool {
         !self.data_types.is_empty()
-            || self.complex
+            || self.complex.is_some()
             || self.short_count + self.long_count + self.signed_count + self.unsigned_count > 0
     }
 
@@ -158,6 +159,35 @@ impl<'a> SpecifierTally<'a> {
         }
 
         let data_type = self.data_types.first().map(|(name, _)| *name);
+
+        // `_Complex` qualifies a floating type (C17 6.7.2p2), or an integer
+        // one as gcc's extension. Anything else -- a typedef name, `typeof`,
+        // a tag, `_Bool`, `void` -- is no complex type, and the keyword was
+        // silently dropped: `typedef double ty; ty _Complex z;` made `z` a
+        // plain `double`.
+        if let (Some(pos), Some(data)) = (self.complex, data_type) {
+            let base_ok = matches!(
+                data,
+                "float"
+                    | "double"
+                    | "char"
+                    | "int"
+                    | "__int128"
+                    | "_Float16"
+                    | "_Float32"
+                    | "_Float64"
+                    | "_Float32x"
+                    | "_Float64x"
+                    | "__float128"
+            );
+            if !base_ok {
+                diag::error_args(
+                    pos,
+                    "both '_Complex' and '{0}' in declaration specifiers",
+                    &[data],
+                );
+            }
+        }
 
         // `short` and `long` pair with `int`; `long` alone also pairs with
         // `double`. Nothing else.
@@ -337,6 +367,221 @@ impl Parser<'_> {
         .then_some(only.value.as_ref())
     }
 
+    /// Walk the initializer `init` for an object of type `typ`, in place:
+    ///
+    /// - C17 6.7.9p7: each designator names a member of, or an index into,
+    ///   the current object -- `.y` in an initializer for a struct with no
+    ///   `y` is a constraint violation, which was dropped in silence and its
+    ///   value with it.
+    /// - 6.7.9p11: a scalar's initializer is an expression, optionally in
+    ///   braces; the braces come off here, so nothing downstream meets a
+    ///   brace list for a scalar. More than one level is gcc's warning --
+    ///   and was an internal error for an automatic object's member.
+    ///
+    /// Nested lists are followed wherever the subobject they initialize is
+    /// known: through a designator, or by position until brace elision makes
+    /// the position unclear.
+    pub(crate) fn walk_initializer(&mut self, typ: TypeId, init: &mut Expr) {
+        if self.types.is_scalar(typ) {
+            self.strip_scalar_braces(init, 0);
+        } else if let ExprKind::InitList { elements } = &mut init.kind {
+            // `char s[4] = {"abc"}` is the string in optional braces
+            // (6.7.9p14), checked as the string -- not as a pointer stored
+            // into `s[0]`, which was a warning gcc does not give.
+            let braced_string = (self.types.kind(typ) == TypeKind::Array)
+                .then(|| self.types.base_type(typ))
+                .flatten()
+                .and_then(|elem| self.braced_string_initializer(elem, elements))
+                .cloned();
+            match braced_string {
+                Some(string) => self.check_initializer_types(typ, &string),
+                None => self.walk_initializer_elements(typ, elements),
+            }
+        }
+    }
+
+    /// Replace a braced initializer for a scalar with the expression it
+    /// holds; `levels` is how many braces enclose `init` already.
+    fn strip_scalar_braces(&self, init: &mut Expr, levels: u32) {
+        let ExprKind::InitList { elements } = &mut init.kind else {
+            return;
+        };
+        // `{}` is gcc's zero initializer, and a designator in a scalar's list
+        // is diagnosed where the list is checked; both stay lists.
+        if elements.is_empty() || !elements[0].designators.is_empty() {
+            return;
+        }
+        if levels > 0 {
+            diag::warning(init.pos, &gettext("braces around scalar initializer"));
+        }
+        // Only the first value initializes the scalar (6.7.9p11).
+        if elements.len() > 1 {
+            diag::warning(init.pos, &gettext("excess elements in scalar initializer"));
+        }
+        let mut first = elements.swap_remove(0).value;
+        self.strip_scalar_braces(&mut first, levels + 1);
+        *init = *first;
+    }
+
+    /// [`Self::walk_initializer`] for the elements of a brace list
+    /// initializing an aggregate of type `typ`.
+    pub(crate) fn walk_initializer_elements(&mut self, typ: TypeId, elements: &mut [InitElement]) {
+        // Positional elements after a designator chain continue inside it
+        // (6.7.9p17); spelling out where they land lets the one-level cursor
+        // below -- and everything downstream -- place them.
+        crate::parse::ast::spell_out_designator_continuations(self.types, elements, typ);
+        let kind = self.types.kind(typ);
+        let members: Vec<TypeId> = match kind {
+            // A union's positional initializer is for its first named member.
+            TypeKind::Struct | TypeKind::Union => self
+                .types
+                .composite(typ)
+                .map(|c| {
+                    c.members
+                        .iter()
+                        .filter(|m| m.name != StringId::EMPTY || m.bit_width.is_none())
+                        .map(|m| m.typ)
+                        .take(if kind == TypeKind::Union {
+                            1
+                        } else {
+                            usize::MAX
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        // The position of the next positional element: an index into
+        // `members` for a struct, or `None` once it can no longer be known.
+        let mut next: Option<usize> = Some(0);
+        let mut idx = 0;
+        while idx < elements.len() {
+            let element = &elements[idx];
+            let sub = if element.designators.is_empty() {
+                let sub = match kind {
+                    TypeKind::Array => self.types.base_type(typ),
+                    TypeKind::Struct | TypeKind::Union => {
+                        next.and_then(|i| members.get(i).copied())
+                    }
+                    _ => None,
+                };
+                next = next.map(|i| i + 1);
+                sub
+            } else {
+                let resolved =
+                    self.designated_subobject(typ, &element.designators, element.value.pos);
+                // After `.m = v` the next positional element is the member
+                // after `m`, which only a direct member pins down.
+                next = match element.designators.first() {
+                    Some(Designator::Field(name)) if kind == TypeKind::Struct => self
+                        .types
+                        .composite(typ)
+                        .and_then(|c| {
+                            c.members
+                                .iter()
+                                .filter(|m| m.name != StringId::EMPTY || m.bit_width.is_none())
+                                .position(|m| m.name == *name)
+                        })
+                        .map(|i| i + 1),
+                    // An anonymous member, by its place in the member list.
+                    Some(Designator::Member(position)) if kind == TypeKind::Struct => {
+                        self.types.composite(typ).map(|c| {
+                            c.members[..(*position + 1).min(c.members.len())]
+                                .iter()
+                                .filter(|m| m.is_initializable())
+                                .count()
+                        })
+                    }
+                    _ => None,
+                };
+                resolved
+            };
+            // A non-list value for an aggregate subobject is brace elision
+            // (6.7.9p20): it and the elements after it that the subobject
+            // takes are walked as the subobject's own list would be, so a
+            // designator inside a braced element among them is checked
+            // against the subobject it lands in.
+            if let Some(t) = sub
+                .filter(|&t| crate::parse::ast::is_brace_elision_candidate(self.types, element, t))
+            {
+                let span = crate::parse::ast::brace_elision_span(self.types, elements, idx, t);
+                // The first element's designators chose `t`; inside `t`'s list
+                // the element is positional.
+                let chosen = std::mem::take(&mut elements[idx].designators);
+                self.walk_initializer_elements(t, &mut elements[span.clone()]);
+                elements[idx].designators = chosen;
+                idx = span.end;
+                continue;
+            }
+            let element = &mut elements[idx];
+            idx += 1;
+            if let Some(sub) = sub {
+                self.walk_initializer(sub, &mut element.value);
+                // A nested list is counted against its own subobject, and a
+                // scalar's value converted to it as by assignment (6.7.9p11),
+                // as the outermost initializer is against the object.
+                self.check_excess_initializers(sub, &element.value);
+                // So is a string literal's fit to the array it initializes
+                // (6.7.9p14-15) -- the one unbraced form an array takes here.
+                let unbraced_array = self.types.kind(sub) == TypeKind::Array
+                    && !matches!(element.value.kind, ExprKind::InitList { .. });
+                if self.types.is_scalar(sub) || unbraced_array {
+                    self.check_initializer_types(sub, &element.value);
+                }
+            }
+        }
+    }
+
+    /// The subobject a designator chain names in an object of type `typ`,
+    /// reporting the first designator that names nothing.
+    fn designated_subobject(
+        &self,
+        typ: TypeId,
+        designators: &[Designator],
+        pos: Position,
+    ) -> Option<TypeId> {
+        let mut current = typ;
+        for designator in designators {
+            current = match designator {
+                Designator::Field(name) => {
+                    if !matches!(self.types.kind(current), TypeKind::Struct | TypeKind::Union) {
+                        diag::error(
+                            pos,
+                            &gettext("field name not in record or union initializer"),
+                        );
+                        return None;
+                    }
+                    match self.types.find_member(current, *name) {
+                        Some(member) => member.typ,
+                        None => {
+                            let named = self.types.format_type(current, Some(self.idents));
+                            let spelled = self.idents.get_opt(*name).unwrap_or("");
+                            diag::error_args(
+                                pos,
+                                "'{0}' has no member named '{1}'",
+                                &[&named, spelled],
+                            );
+                            return None;
+                        }
+                    }
+                }
+                Designator::Index(_) | Designator::IndexRange(..) => {
+                    if self.types.kind(current) != TypeKind::Array {
+                        diag::error(pos, &gettext("array index in non-array initializer"));
+                        return None;
+                    }
+                    self.types.base_type(current)?
+                }
+                // Only the parser writes one, and only for a member that is
+                // there.
+                Designator::Member(position) => {
+                    self.types.composite(current)?.members.get(*position)?.typ
+                }
+            };
+        }
+        Some(current)
+    }
+
     /// Report an array designator that addresses past the end of its array.
     ///
     /// Only the outermost list is walked, and only when the bound is known: an
@@ -356,7 +601,7 @@ impl Parser<'_> {
             let end = match designator {
                 Designator::Index(i) => *i,
                 Designator::IndexRange(_, hi) => *hi,
-                Designator::Field(_) => continue,
+                Designator::Field(_) | Designator::Member(_) => continue,
             };
             if end >= capacity as i64 {
                 diag::error_args(
@@ -372,68 +617,48 @@ impl Parser<'_> {
     /// Report an initializer list with more elements than the object it
     /// initializes can hold (C17 6.7.9p2).
     ///
-    /// Deliberately narrow, because the count is only unambiguous in the
-    /// simple cases. A designator places an element anywhere, so a list
-    /// containing one is left alone. Brace elision lets an aggregate member
-    /// consume several consecutive elements -- `struct P p[2] = {1,2,3,4}`
-    /// fills two two-field structs -- so only aggregates whose elements or
-    /// members are all scalars are counted. A union takes one initializer,
-    /// whatever it holds, and a flexible array member has no bound at all.
-    ///
-    /// Everything skipped is a missed warning rather than a wrong one.
+    /// Brace elision lets an aggregate member consume several consecutive
+    /// elements -- `struct P p[2] = {1,2,3,4}` fills two two-field structs,
+    /// and `union { struct { char s[4]; int n; } in; } u = {"ab", 4}` puts
+    /// both into the union's one member -- so the list is walked subobject
+    /// by subobject rather than counted. A designator moves the walk to the
+    /// subobject it names, and the elements after it continue from there
+    /// (6.7.9p17). An array with no bound, or a flexible array member, takes
+    /// every element left.
     pub(super) fn check_excess_initializers(&self, typ: TypeId, init: &Expr) {
         let ExprKind::InitList { elements } = &init.kind else {
             return;
         };
-        // A designator names its own position, so the *count* of elements says
-        // nothing -- but the position itself can still be out of range, and
-        // nothing checked that anywhere: `int a[4] = {[10] = 7};` compiled and
-        // wrote past the array. GCC rejects it. Ranges make it easy to write by
+        // A designator's position can itself be out of range, and nothing
+        // checked that anywhere: `int a[4] = {[10] = 7};` compiled and wrote
+        // past the array. GCC rejects it. Ranges make it easy to write by
         // accident, so the bound is checked here where the array's size is
-        // known; the element-count check below still stands aside.
+        // known.
         self.check_designator_bounds(typ, elements);
-        if elements.iter().any(|e| !e.designators.is_empty()) {
-            return;
-        }
 
-        match self.types.kind(typ) {
-            TypeKind::Array => {
-                let Some(elem) = self.types.base_type(typ) else {
-                    return;
-                };
-                if !self.types.is_scalar(elem) {
-                    return;
-                }
-                // An absent or zero size is an array whose bound came from
-                // this very initializer, so it cannot overflow.
-                let Some(capacity) = self.types.array_size(typ).filter(|&n| n > 0) else {
-                    return;
-                };
-                if elements.len() > capacity {
-                    diag::warning(init.pos, &gettext("excess elements in array initializer"));
-                }
+        let message = match self.types.kind(typ) {
+            // An absent or zero size is an array whose bound came from this
+            // very initializer, so it cannot overflow.
+            TypeKind::Array if self.types.array_size(typ).is_some_and(|n| n > 0) => {
+                "excess elements in array initializer"
             }
-            TypeKind::Struct => {
-                let Some(comp) = self.types.composite(typ) else {
-                    return;
-                };
-                if comp.members.is_empty()
-                    || comp.members.iter().any(|m| !self.types.is_scalar(m.typ))
-                {
-                    return;
-                }
-                if elements.len() > comp.members.len() {
-                    diag::warning(init.pos, &gettext("excess elements in struct initializer"));
-                }
+            TypeKind::Struct
+                if self
+                    .types
+                    .composite(typ)
+                    .is_some_and(|c| !c.members.is_empty()) =>
+            {
+                "excess elements in struct initializer"
             }
-            TypeKind::Union => {}
-            _ => {
-                // A scalar may be written in braces, but only the first value
-                // initializes it (6.7.9p11).
-                if elements.len() > 1 {
-                    diag::warning(init.pos, &gettext("excess elements in scalar initializer"));
-                }
-            }
+            TypeKind::Union => "excess elements in union initializer",
+            // A scalar's braces are gone by now: `strip_scalar_braces`
+            // warned about any excess as it took them off.
+            _ => return,
+        };
+        // The elements the subobjects take, each one or -- by brace
+        // elision -- as many as its own subobjects take (6.7.9p20).
+        if crate::parse::ast::initializer_list_end(self.types, elements, typ) < elements.len() {
+            diag::warning(init.pos, &gettext(message));
         }
     }
 
@@ -583,15 +808,12 @@ impl Parser<'_> {
                 crate::parse::ast::array_slot(&element.designators, &mut current_index);
             max_index = max_index.max(last);
 
-            // A brace-less aggregate element takes several list elements for
-            // this one slot.
-            idx = if designated.is_none()
-                && crate::parse::ast::is_brace_elision_candidate(self.types, element, elem_type)
-            {
-                crate::parse::ast::brace_elision_span(self.types, elements, idx, elem_type).end
-            } else {
-                idx + 1
-            };
+            // An element takes several list elements for this one slot when
+            // it elides braces into it, or continues a designator chain into
+            // it -- `[1].x = 1, 2` gives `[1]` the 2 as well.
+            let rest = designated.map_or(&[][..], |pos| &element.designators[pos + 1..]);
+            idx =
+                crate::parse::ast::designated_span(self.types, elements, idx, elem_type, rest).end;
         }
 
         if max_index < 0 {
@@ -631,6 +853,8 @@ impl<'a> Parser<'a> {
         let idents: &'a crate::strings::StringTable = self.idents;
         let mut modifiers = TypeModifiers::empty();
         let mut base_kind: Option<TypeKind> = None;
+        // Which `_FloatN`/`_FloatNx` name, if any, gave `base_kind`.
+        let mut float_class = FloatClass::Standard;
         let mut resolved: Option<Resolved> = None;
         let mut vm_dims = Vec::new();
         // Where `_Atomic` was written, for the constraint checked at the end.
@@ -711,7 +935,7 @@ impl<'a> Parser<'a> {
                     modifiers |= TypeModifiers::UNSIGNED;
                 }
                 crate::kw::COMPLEX | crate::kw::GNU_COMPLEX | crate::kw::GNU_COMPLEX2 => {
-                    tally.complex = true;
+                    tally.complex = Some(pos);
                     self.advance();
                     modifiers |= TypeModifiers::COMPLEX;
                 }
@@ -735,7 +959,7 @@ impl<'a> Parser<'a> {
                 // written, so nothing after it reports the same mistake again.
                 crate::kw::IMAGINARY => {
                     diag::error(pos, "imaginary types are not supported");
-                    tally.complex = true;
+                    tally.complex = Some(pos);
                     self.advance();
                     modifiers |= TypeModifiers::COMPLEX;
                 }
@@ -758,6 +982,15 @@ impl<'a> Parser<'a> {
                         ));
                     };
                     self.expect_special(b')')?;
+                    // C17 6.7.2.4p3: nor an atomic or qualified type.
+                    if self.types.modifiers(inner).intersects(
+                        TypeModifiers::CONST
+                            | TypeModifiers::VOLATILE
+                            | TypeModifiers::RESTRICT
+                            | TypeModifiers::ATOMIC,
+                    ) {
+                        diag::error(pos, &gettext("'_Atomic' applied to a qualified type"));
+                    }
                     tally.note_data_type("_Atomic", pos);
                     let mut atomic = self.types.get(inner).clone();
                     atomic.modifiers |= TypeModifiers::ATOMIC;
@@ -846,23 +1079,38 @@ impl<'a> Parser<'a> {
                     self.advance();
                     base_kind = Some(TypeKind::Float16);
                 }
-                crate::kw::FLOAT32 => {
-                    // _Float32 is an alias for float (TS 18661-3 / C23)
+                // C23's interchange and extended types (TS 18661-3): the
+                // format of a standard type, under a name of their own --
+                // see `FloatClass`.
+                crate::kw::FLOAT32
+                | crate::kw::FLOAT64
+                | crate::kw::FLOAT32X
+                | crate::kw::FLOAT64X => {
                     if tally.alias_is_declarator_name() {
                         break;
                     }
-                    tally.note_data_type("float", pos);
-                    self.advance();
-                    base_kind = Some(TypeKind::Float);
-                }
-                crate::kw::FLOAT64 => {
-                    // _Float64 is an alias for double (TS 18661-3 / C23)
-                    if tally.alias_is_declarator_name() {
-                        break;
+                    let (spelled, kind, class) = match name_id {
+                        crate::kw::FLOAT32 => {
+                            ("_Float32", TypeKind::Float, FloatClass::Interchange)
+                        }
+                        crate::kw::FLOAT64 => {
+                            ("_Float64", TypeKind::Double, FloatClass::Interchange)
+                        }
+                        crate::kw::FLOAT32X => {
+                            ("_Float32x", TypeKind::Double, FloatClass::Extended)
+                        }
+                        _ => ("_Float64x", TypeKind::LongDouble, FloatClass::Extended),
+                    };
+                    if kind == TypeKind::LongDouble && !self.types.has_float64x() {
+                        return Err(ParseError::new(
+                            "_Float64x is not supported on this target",
+                            pos,
+                        ));
                     }
-                    tally.note_data_type("double", pos);
+                    tally.note_data_type(spelled, pos);
                     self.advance();
-                    base_kind = Some(TypeKind::Double);
+                    base_kind = Some(kind);
+                    float_class = class;
                 }
                 crate::kw::FLOAT128 | crate::kw::FLOAT128_ALIAS => {
                     // IEEE binary128. `_Float128` is the C23/TS 18661-3
@@ -1022,7 +1270,20 @@ impl<'a> Parser<'a> {
                 match resolved {
                     Resolved::Id(rid) => {
                         let named = self.types.get(rid);
-                        if added.is_empty() && !named.modifiers.contains(TypeModifiers::TYPEDEF) {
+                        let quals = added & Type::QUALIFIERS;
+                        if named.kind == TypeKind::Array && !quals.is_empty() {
+                            // C17 6.7.3p10: a qualifier on an array typedef
+                            // qualifies its elements, as `const int a[3]`
+                            // does -- on the array itself it was ignored, so
+                            // `const A x` was writable and `x[0]` an `int`.
+                            let qualified = self.types.qualified_with(rid, quals);
+                            let mut ty = self.types.get(qualified).clone();
+                            ty.modifiers.remove(TypeModifiers::TYPEDEF);
+                            ty.modifiers |= added.difference(Type::QUALIFIERS);
+                            (ty, None)
+                        } else if added.is_empty()
+                            && !named.modifiers.contains(TypeModifiers::TYPEDEF)
+                        {
                             (named.clone(), Some(rid))
                         } else {
                             // Drop the TYPEDEF bit either way. It records how
@@ -1064,7 +1325,13 @@ impl<'a> Parser<'a> {
                     }
                     None => TypeKind::Int,
                 };
-                (Type::with_modifiers(kind, modifiers), None)
+                (
+                    Type {
+                        float_class,
+                        ..Type::with_modifiers(kind, modifiers)
+                    },
+                    None,
+                )
             }
         };
 
@@ -1090,6 +1357,27 @@ impl<'a> Parser<'a> {
         if ctx != SpecContext::Declaration {
             self.check_implicit_int(explicit, start);
         }
+
+        // A `vector_size` among the specifiers -- written before the type or
+        // inside it -- makes the type they name a vector, for every
+        // declarator, as gcc reads it. Held for the declarator, it reached
+        // the first one only, and a function's own type rather than its
+        // return type.
+        let (ty, id) = if self.pending_vector_size.is_some() {
+            let outer = ty.modifiers & (Type::DECL_SPECIFIERS | Type::QUALIFIERS);
+            let mut elem = ty;
+            elem.modifiers.remove(outer);
+            let elem = self.types.intern(elem);
+            // A mode written with it names the element's width, as in
+            // `int __attribute__((mode(SI), vector_size(8)))`.
+            let elem = self.apply_pending_mode(elem);
+            let vector = self.apply_pending_vector_size(elem);
+            let mut ty = self.types.get(vector).clone();
+            ty.modifiers |= outer;
+            (ty, None)
+        } else {
+            (ty, id)
+        };
 
         Ok(DeclSpecifiers {
             ty,
@@ -1304,6 +1592,19 @@ impl Parser<'_> {
                 ))
             }
         };
+        // C17 6.7.5p4: an alignment the implementation supports -- the same
+        // ceiling as the `aligned` attribute's.
+        if i128::from(align) > super::attribute::MAX_ATTR_ALIGN {
+            diag::error_args(
+                alignas_pos,
+                "requested alignment '{0}' exceeds object file maximum {1}",
+                &[
+                    &align.to_string(),
+                    &super::attribute::MAX_ATTR_ALIGN.to_string(),
+                ],
+            );
+            return Ok(());
+        }
         // Several may appear; the strictest wins (C11 6.7.5).
         self.pending_alignas = Some(match self.pending_alignas {
             Some(existing) => existing.max(align),
@@ -1419,7 +1720,12 @@ impl Parser<'_> {
     /// to its return type. 6.2.7p3 would compare each prototype parameter
     /// with the promoted type of its identifier, but gcc accepts `int f(char);
     /// int f(c) char c; { ... }` and objects only under `-pedantic`.
-    fn redeclaration_compatible(&self, old: TypeId, new: TypeId, form: Redeclared) -> bool {
+    pub(super) fn redeclaration_compatible(
+        &self,
+        old: TypeId,
+        new: TypeId,
+        form: Redeclared,
+    ) -> bool {
         if self.types.types_compatible(old, new) {
             return true;
         }
@@ -1581,11 +1887,23 @@ impl Parser<'_> {
     /// conforming, since 6.7p2 asks only for a diagnostic.)
     pub(super) fn check_declares_something(&mut self, pos: Position, base_type: &Type) {
         // A tag -- declared or defined -- is the thing this declaration form
-        // exists to express, so it always counts.
+        // exists to express, so it always counts. A structure or union with
+        // no tag declares nothing it could be named by again (an enumeration
+        // still declares its constants), which gcc warns about.
         if matches!(
             base_type.kind,
             TypeKind::Struct | TypeKind::Union | TypeKind::Enum
         ) {
+            let untagged = base_type
+                .composite
+                .as_ref()
+                .is_some_and(|c| c.tag.is_none());
+            if untagged && base_type.kind != TypeKind::Enum {
+                diag::warning(
+                    pos,
+                    &gettext("unnamed struct/union that defines no instances"),
+                );
+            }
             return;
         }
 

@@ -34,9 +34,9 @@ fn statement(body: &str) -> String {
 #[test]
 fn asm_unsupported_operand_modifiers() {
     let cases: &[(&str, [&str; 2], &str, &str)] = &[
-        ("asm_mod_z", X86, r##""# %z0" :: "r"(x)"##, "'%z'"),
+        ("asm_mod_y", X86, r##""# %y0" :: "r"(x)"##, "'%y'"),
         ("asm_mod_h_mem", X86, r##""# %H0" :: "m"(v)"##, "'%H'"),
-        ("asm_mod_x_sse", X86, r##""# %x0" :: "x"(dd)"##, "'%x'"),
+        ("asm_mod_r_sse", X86, r##""# %R0" :: "x"(dd)"##, "'%R'"),
         ("asm_mod_a64_h", A64, r##""// %H0" :: "r"(x)"##, "'%H'"),
         ("asm_mod_a64_q", A64, r##""// %Q0" :: "r"(x)"##, "'%Q'"),
     ];
@@ -57,6 +57,12 @@ fn asm_modifier_on_the_wrong_kind_of_operand() {
             X86,
             r##""# %c0" :: "r"(x)"##,
             "'%c' does not apply to a general register",
+        ),
+        (
+            "asm_mod_x_reg",
+            X86,
+            r##""# %x0" :: "r"(x)"##,
+            "'%x' does not apply to a general register",
         ),
         (
             "asm_mod_a_mem",

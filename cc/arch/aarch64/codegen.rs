@@ -1268,8 +1268,8 @@ impl crate::arch::AsmOperandFormatter for Aarch64CodeGen {
             (Some('x'), V::Reg(r)) => asm_reg_name_64(*r).to_string(),
             (Some('w'), v) if zero(v) => "wzr".to_string(),
             (Some('x'), v) if zero(v) => "xzr".to_string(),
-            // A vector operand is rendered at its own type's width; the
-            // modifier renames the same register at the width it names.
+            // A vector operand is rendered as `vN`; the modifier renames
+            // the same register at the width it names.
             (Some(m @ ('b' | 'h' | 's' | 'd' | 'q')), V::RegName(name)) => {
                 format!("{m}{}", &name[1..])
             }
@@ -1279,6 +1279,11 @@ impl crate::arch::AsmOperandFormatter for Aarch64CodeGen {
             (Some('b' | 'h' | 's' | 'd' | 'q' | 'a'), _) => {
                 return Err(AsmModifierError::Inapplicable)
             }
+            // Unmodified, a vector register is `vN`, whatever the operand's
+            // width -- gcc's spelling, which `%0.4s` and the other
+            // arrangement suffixes are written after. A scalar instruction
+            // names its width with a modifier, `%d0`.
+            (None, V::RegName(name)) => format!("v{}", &name[1..]),
             (None | Some('w' | 'x'), value) => match value {
                 V::Reg(r) if slot.size <= 32 => asm_reg_name_32(*r).to_string(),
                 V::Reg(r) => asm_reg_name_64(*r).to_string(),

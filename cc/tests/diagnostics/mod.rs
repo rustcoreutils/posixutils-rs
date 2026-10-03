@@ -21,8 +21,13 @@
 mod asm_constraints;
 mod asm_templates;
 mod cast_to_union;
+mod complex_specifiers;
 mod conditional_operands;
+mod constraint_sweep;
+mod declarations;
+mod expressions;
 mod function_compatibility;
+mod incomplete_types;
 mod inline_static_reference;
 mod return_conversion;
 mod va_arg_pack;
@@ -6015,43 +6020,51 @@ fn diagnostics_static_object_larger_than_a_frame_slot_is_accepted() {
     }
 }
 
-/// A `vector_size` value where gcc gives it vector semantics is refused.
-///
-/// c17 implements a vector as storage only -- an array of its elements -- and
-/// an array used as a value decays to its address. So each of these used to
-/// compile to something other than what gcc means: `(long long)v` answered
-/// the vector's address rather than its bits, `v + 1` did pointer
-/// arithmetic, a vector argument or parameter went as a pointer. gcc's torture
-/// tests `20050316-2`, `20050607-1` and `simd-4` all returned wrong answers.
+/// A `vector_size` value passed to or returned from a function is refused
+/// only where the target's convention has no type that travels as gcc
+/// passes it: a one-lane `float` vector on aarch64. On x86-64 it goes in
+/// memory, as gcc's does, and every other vector goes as its carrier.
 #[test]
-fn diagnostics_vector_value_is_refused() {
-    let prelude = "typedef int V2SI __attribute__((vector_size(8)));\n\
+fn diagnostics_vector_passing_is_refused_only_without_a_carrier() {
+    let prelude = "typedef float V1SF __attribute__((vector_size(4)));\n\
+                   typedef int V2SI __attribute__((vector_size(8)));\n\
                    long f(); long l; int c;\n";
+    let compile = |name: &str, body: &str, target: &str| {
+        let c = create_c_file(name, &format!("{prelude}{body}\n"));
+        let path = c.path().to_string_lossy().into_owned();
+        run_c17(&["--target", target, "-S", "-o", "/dev/null", &path])
+    };
     for (name, body) in [
-        (
-            "cast_from",
-            "long t(void) { V2SI v = {1, 2}; return (long long)v; }",
-        ),
-        ("cast_to", "void t(void) { V2SI v = (V2SI)l; (void)&v; }"),
-        (
-            "binary",
-            "void t(void) { V2SI v = {1, 2}; l = (long)(v + 1 == 0); }",
-        ),
-        ("unary", "void t(void) { V2SI v = {1, 2}; c = !v; }"),
-        ("deref", "int t(void) { V2SI v = {1, 2}; return *v; }"),
-        ("argument", "void t(void) { V2SI v = {1, 2}; f(v); }"),
-        (
-            "conditional",
-            "void t(void) { V2SI v = {1, 2}; (void)(c ? v : v); }",
-        ),
-        ("parameter", "long t(V2SI v) { return 0; }"),
+        ("argument", "void t(void) { V1SF v = {1}; f(v); }"),
+        ("parameter", "long t(V1SF v) { return 0; }"),
+        ("return", "V1SF t(void) { V1SF v = {1}; return v; }"),
     ] {
-        compile_expect_error(
+        let a64 = compile(
             &format!("vector_value_{name}"),
-            &format!("{prelude}{body}\n"),
-            "'vector_size' types as storage only",
+            body,
+            "aarch64-unknown-linux-gnu",
         );
+        assert!(!a64.success, "{name} accepted on aarch64");
+        assert!(
+            a64.stderr
+                .contains("c17 does not pass or return this vector type on this target"),
+            "{}",
+            a64.stderr
+        );
+        let x86 = compile(
+            &format!("vector_value_{name}_x86"),
+            body,
+            "x86_64-unknown-linux-gnu",
+        );
+        assert!(x86.success, "{name} on x86-64: {}", x86.stderr);
     }
+    compile_expect_ok(
+        "vector_value_passed",
+        &format!(
+            "{prelude}V2SI t(V2SI v) {{ return v; }}\n\
+             void u(void) {{ V2SI v = {{1, 2}}; f(v); (void)t(v); }}\n"
+        ),
+    );
 }
 
 /// What the storage model gets right is still accepted: declaring a vector,

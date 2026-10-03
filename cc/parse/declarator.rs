@@ -197,6 +197,7 @@ impl Parser<'_> {
         // Check for parenthesized declarator: int (*p)[3]
         // The paren comes AFTER pointers, e.g. int *(*p)[3] = pointer to (pointer to array of 3 ints)
         let mut name_pos = self.current_pos();
+        let mut group_attributed = false;
         let (name, inner) = if self.is_special(b'(') {
             // Check if this looks like a function parameter list or a grouped declarator
             // A grouped declarator will have * or identifier immediately after (
@@ -208,7 +209,9 @@ impl Parser<'_> {
                 // ((ms_abi)) *fp)(long)`, the spelling every Windows
                 // calling-convention macro expands to -- belongs to this
                 // declaration.
+                let group_start = self.pos;
                 self.skip_extensions();
+                group_attributed = self.pos != group_start;
                 // For int (*p)[3]: we're now at *p), base_type is int
                 let inner = self.parse_declarator_level(self.types.void_id, ctx, true)?;
                 self.expect_special(b')')?;
@@ -245,13 +248,27 @@ impl Parser<'_> {
         let mut vla_pos = inner.as_ref().and_then(|i| i.vla_pos);
         let mut vla_exprs: Vec<Expr> = inner.as_ref().map(|i| i.vla.clone()).unwrap_or_default();
 
+        // Only the parameter's own array type, the first `[]` written after a
+        // plain name, may carry `static` or qualifiers: `int (*p)[static 3]`
+        // and `int a[3][const 4]` qualify something that is not adjusted to a
+        // pointer. A name in parentheses, `int (a)[static 3]`, is still a
+        // plain name; one grouped with an attribute is not, to gcc.
+        let plain_inner = inner.as_ref().is_none_or(|i| i.plain_name) && !group_attributed;
+
         // Handle array declarators - collect all dimensions first
         let mut dimensions: Vec<(Extent, Position)> = Vec::new();
         while self.is_special(b'[') {
             let dim_pos = self.current_pos();
             self.advance();
-            let extent =
-                self.parse_array_extent(name, dim_pos, ctx, &mut vla_exprs, &mut vla_pos)?;
+            let outermost = dimensions.is_empty() && plain_inner;
+            let extent = self.parse_array_extent(
+                name,
+                dim_pos,
+                ctx,
+                outermost,
+                &mut vla_exprs,
+                &mut vla_pos,
+            )?;
             self.expect_special(b']')?;
             dimensions.push((extent, dim_pos));
         }
@@ -259,7 +276,7 @@ impl Parser<'_> {
         // Handle function declarators: void (*fp)(int, char)
         // This parses the parameter list after a grouped declarator
         // We keep both the TypeIds (for building the type) and raw params (for function defs)
-        let (func_params, full_func_params): (Option<FuncSignature>, Option<Vec<RawParam>>) =
+        let (func_params, full_func_params): (Option<FuncSignature>, Option<ParameterList>) =
             if self.is_special(b'(') {
                 self.advance();
                 let list = self.parse_parameter_list()?;
@@ -271,11 +288,16 @@ impl Parser<'_> {
                         variadic: list.variadic,
                         prototyped: list.prototyped,
                     }),
-                    Some(list.params),
+                    Some(list),
                 )
             } else {
                 (None, None)
             };
+
+        let plain_name = plain_inner
+            && pointer_modifiers.is_empty()
+            && dimensions.is_empty()
+            && func_params.is_none();
 
         // Build the type from the base type
         let mut result_type_id = base_type_id;
@@ -342,6 +364,7 @@ impl Parser<'_> {
             vla: vla_exprs,
             vla_pos,
             params,
+            plain_name,
         })
     }
 
@@ -353,6 +376,7 @@ impl Parser<'_> {
         name: StringId,
         dim_pos: Position,
         ctx: DeclaratorContext,
+        outermost: bool,
         vla: &mut Vec<Expr>,
         vla_pos: &mut Option<Position>,
     ) -> ParseResult<Extent> {
@@ -368,7 +392,7 @@ impl Parser<'_> {
             qualified = true;
             self.advance();
         }
-        if qualified && !ctx.is_parameter() {
+        if qualified && !(ctx.is_parameter() && outermost) {
             diag::error(
                 dim_pos,
                 "static or type qualifiers in non-parameter array declarator",
@@ -387,6 +411,10 @@ impl Parser<'_> {
                     dim_pos,
                     "'[*]' not allowed in other than function prototype scope",
                 );
+            } else {
+                // Allowed only if no body follows this list, which is not
+                // known yet.
+                self.star_in_params.get_or_insert(dim_pos);
             }
             return Ok(Extent::Runtime);
         }
@@ -607,7 +635,16 @@ impl Parser<'_> {
         // that it is balanced however the inner parse exits. It used to be left
         // open on the `?` paths and on the trailing-comma `return Err`.
         self.symbols.enter_scope();
-        let result = self.parse_parameter_list_inner();
+        self.param_list_depth += 1;
+        // A nested list -- a parameter that is a pointer to a function --
+        // keeps its `[*]` to itself.
+        let enclosing_star = self.star_in_params.take();
+        let result = self.parse_parameter_list_inner().map(|mut list| {
+            list.star = self.star_in_params;
+            list
+        });
+        self.star_in_params = enclosing_star;
+        self.param_list_depth -= 1;
         self.symbols.leave_scope();
         self.pending_alignas = saved_align;
         self.pending_alignas_kw = saved_align_kw;
@@ -631,6 +668,7 @@ impl Parser<'_> {
                 params,
                 variadic,
                 prototyped: false,
+                star: None,
             });
         }
 
@@ -643,6 +681,7 @@ impl Parser<'_> {
                     params,
                     variadic,
                     prototyped: true,
+                    star: None,
                 });
             }
             // Not just void, backtrack
@@ -707,15 +746,15 @@ impl Parser<'_> {
             // silently an `int`.
             typ_id = self.apply_pending_type_attrs(typ_id);
 
-            // A vector parameter is passed by value, which the array model
-            // cannot do: the adjustment below would make it a pointer.
+            // A vector parameter is passed by value, and is no array to be
+            // adjusted below.
             self.check_not_vector_value(Some(typ_id), self.current_pos());
 
             // C99 6.7.5.3: Array and function parameters are adjusted to pointers
             // - Array T[] becomes pointer to T
             // - Function type becomes pointer to function type
             let typ = self.types.get(typ_id);
-            if typ.kind == TypeKind::Array {
+            if typ.kind == TypeKind::Array && !self.types.is_vector(typ_id) {
                 // Convert array to pointer to element type
                 let element_type = typ.base.unwrap_or(self.types.void_id);
                 let ptr_type = Type {
@@ -787,17 +826,34 @@ impl Parser<'_> {
             // one-parameter prototype.
             if self.types.kind(typ_id) == TypeKind::Void {
                 if name_opt.is_none() && params.is_empty() && self.is_special(b')') {
+                    // ... and unqualified (6.7.6.3p10): `void f(const void)`.
+                    if self.types.modifiers(typ_id).intersects(Type::QUALIFIERS) {
+                        diag::error(
+                            self.current_pos(),
+                            &gettext("'void' as only parameter may not be qualified"),
+                        );
+                    }
                     return Ok(ParameterList {
                         params,
                         variadic,
                         prototyped: true,
+                        star: None,
                     });
                 }
-                diag::warning_args(
-                    self.current_pos(),
-                    "parameter {0} has void type",
-                    &[&(params.len() + 1).to_string()],
-                );
+                // An unnamed `void` among other parameters is no parameter
+                // at all, which gcc rejects; a named one it only warns about.
+                if name_opt.is_none() {
+                    diag::error(
+                        self.current_pos(),
+                        &gettext("'void' must be the only parameter"),
+                    );
+                } else {
+                    diag::warning_args(
+                        self.current_pos(),
+                        "parameter {0} has void type",
+                        &[&(params.len() + 1).to_string()],
+                    );
+                }
             }
 
             params.push(RawParam {
@@ -859,6 +915,7 @@ impl Parser<'_> {
             params,
             variadic,
             prototyped,
+            star: None,
         })
     }
 }

@@ -269,7 +269,6 @@ pub enum SpecialToken {
     HashHash,        // ##
     LeftShift,       // <<
     RightShift,      // >>
-    DotDot,          // ..
     ShlAssign,       // <<=
     ShrAssign,       // >>=
     Ellipsis,        // ...
@@ -444,7 +443,11 @@ fn decode_utf8(lead: u8, peek: &mut Peek<'_>) -> Option<(char, usize)> {
 /// Takes the raw scalar rather than a `char` because a surrogate cannot be
 /// represented as one: `char::from_u32` rejects it.
 pub(crate) fn ucn_is_forbidden(val: u32) -> bool {
-    (val < 0xA0 && val != 0x24 && val != 0x40 && val != 0x60) || (0xD800..=0xDFFF).contains(&val)
+    (val < 0xA0 && val != 0x24 && val != 0x40 && val != 0x60)
+        || (0xD800..=0xDFFF).contains(&val)
+        // Past the last code point ISO/IEC 10646 has, so it names no
+        // character at all: `\U00110000`.
+        || val > 0x10FFFF
 }
 
 // Translation phase 2 (line splicing)
@@ -536,7 +539,6 @@ impl SpecialToken {
             c if c == HashHash as u32 => HashHash,
             c if c == LeftShift as u32 => LeftShift,
             c if c == RightShift as u32 => RightShift,
-            c if c == DotDot as u32 => DotDot,
             c if c == ShlAssign as u32 => ShlAssign,
             c if c == ShrAssign as u32 => ShrAssign,
             c if c == Ellipsis as u32 => Ellipsis,
@@ -571,7 +573,6 @@ impl SpecialToken {
             HashHash => "##",
             LeftShift => "<<",
             RightShift => ">>",
-            DotDot => "..",
             ShlAssign => "<<=",
             ShrAssign => ">>=",
             Ellipsis => "...",
@@ -1326,6 +1327,20 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             if next != EOF && is_digit(next as u8) {
                 return Some(self.get_number(first));
             }
+            // `...` is the only punctuator beginning with `.` (C17 6.4.6p1).
+            // `..` is not one, so a `.` followed by a single `.` is the first
+            // of two `.` tokens -- which is what makes `.` ## `.` an invalid
+            // paste rather than a token nothing else can spell.
+            let mut ahead = self.peek_at(self.offset);
+            if ahead.next() == Some(b'.') && ahead.next() == Some(b'.') {
+                self.nextchar();
+                self.nextchar();
+                return Some(Token::with_value(
+                    TokenType::Special,
+                    pos,
+                    TokenValue::Special(SpecialToken::Ellipsis as u32),
+                ));
+            }
         }
 
         // Check for comments. Both modes strip `//` and `/* */`, as GCC does
@@ -1421,7 +1436,6 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             (b'#', b'#', SpecialToken::HashHash as u32),
             (b'<', b'<', SpecialToken::LeftShift as u32),
             (b'>', b'>', SpecialToken::RightShift as u32),
-            (b'.', b'.', SpecialToken::DotDot as u32),
         ];
 
         // Check for two-character operators
@@ -1454,15 +1468,6 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
                                     TokenType::Special,
                                     pos,
                                     TokenValue::Special(SpecialToken::ShrAssign as u32),
-                                ));
-                            }
-                            // ...
-                            if code == SpecialToken::DotDot as u32 && third_u8 == b'.' {
-                                self.nextchar();
-                                return Some(Token::with_value(
-                                    TokenType::Special,
-                                    pos,
-                                    TokenValue::Special(SpecialToken::Ellipsis as u32),
                                 ));
                             }
                         }
@@ -1652,8 +1657,13 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             }
         }
 
-        // Add stream end token
-        tokens.push(Token::new(TokenType::StreamEnd, self.pos()));
+        // The end of the stream ends the last line, whatever came before it:
+        // a file whose last line closes with a backslash-newline gave that
+        // line no newline of its own, and every directive reads to the next
+        // token that begins a line.
+        let mut end = Token::new(TokenType::StreamEnd, self.pos());
+        end.pos.newline = true;
+        tokens.push(end);
 
         tokens
     }

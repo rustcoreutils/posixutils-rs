@@ -18,7 +18,7 @@ use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol};
 use crate::token::lexer::{Position, SpecialToken, TokenType, TokenValue};
 use crate::token::literal;
-use crate::types::{Type, TypeId, TypeKind};
+use crate::types::{FloatClass, Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
 
 const DEFAULT_ARG_LIST_CAPACITY: usize = 8;
@@ -309,7 +309,17 @@ impl<'a> Parser<'a> {
         // An arm diagnosed already, or one with no value -- whose mismatch
         // with a valued arm `check_not_void` has reported.
         let (then_typ, else_typ) = (then_expr.typ?, else_expr.typ?);
+        // GNU vectors: two of one type, and nothing else.
         if self.types.is_vector(then_typ) || self.types.is_vector(else_typ) {
+            let then_typ = self.types.unqualified(then_typ);
+            let else_typ = self.types.unqualified(else_typ);
+            if self.types.is_vector(then_typ)
+                && self.types.is_vector(else_typ)
+                && self.types.types_compatible(then_typ, else_typ)
+            {
+                return Some(then_typ);
+            }
+            diag::error(pos, &gettext("type mismatch in conditional expression"));
             return None;
         }
         let then_typ = self.lvalue_converted_type(then_typ);
@@ -518,9 +528,6 @@ impl<'a> Parser<'a> {
                 let culprit = if then_void { &then_expr } else { &else_expr };
                 self.check_not_void(culprit, culprit.pos);
             }
-
-            self.check_not_vector_value(then_expr.typ, then_expr.pos);
-            self.check_not_vector_value(else_expr.typ, else_expr.pos);
 
             let typ = self.conditional_result_type(&then_expr, &else_expr, colon_pos);
 
@@ -821,8 +828,16 @@ impl<'a> Parser<'a> {
                     }
                 })
                 .unwrap_or(self.types.int_id);
-            if !self.check_not_vector_value(operand.typ, operand.pos) {
-                self.check_dereferenceable(&operand, op_pos);
+            match operand.typ.filter(|&t| self.types.is_vector(t)) {
+                Some(t) => {
+                    let named = self.types.format_type(t, Some(self.idents));
+                    diag::error_args(
+                        op_pos,
+                        "invalid type argument of unary '*' (have '{0}')",
+                        &[&named],
+                    );
+                }
+                None => self.check_dereferenceable(&operand, op_pos),
             }
             return Ok(Self::typed_expr(
                 ExprKind::Unary {
@@ -897,7 +912,6 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
-            self.check_not_vector_value(operand.typ, operand.pos);
             let valid = self.check_unary_operand(UnaryOperator::Not, &operand, op_pos);
             // Logical not always produces int (0 or 1)
             let e = Self::typed_expr(
@@ -1071,6 +1085,75 @@ impl<'a> Parser<'a> {
         Ok(self.with_type_name_extents(dims, literal))
     }
 
+    /// C17 6.5.4p2-p4 for a cast to anything but a union (gcc's extension)
+    /// or an array or function type (reported by the caller): the target is
+    /// `void` or a scalar type, the operand is a scalar, and neither side
+    /// pairs a pointer with a floating type. Each of these compiled -- a
+    /// structure reinterpreted as an integer, a `double`'s bits as an
+    /// address -- where gcc rejects them in its words.
+    fn check_cast_operand(&mut self, target: TypeId, expr: &Expr, pos: Position) {
+        let target_kind = self.types.kind(target);
+        if target_kind == TypeKind::Void {
+            return;
+        }
+        let Some(from) = expr.typ.map(|t| self.decayed_type(t)) else {
+            return;
+        };
+        // Vectors have their own rules, checked by the caller.
+        if self.types.is_vector(target) || self.types.is_vector(from) {
+            return;
+        }
+        // A cast to the operand's own structure type, qualifiers aside, is
+        // gcc's extension and converts nothing; any other is not a scalar
+        // conversion at all.
+        if matches!(target_kind, TypeKind::Struct) {
+            let target = self.types.unqualified(target);
+            let from = self.lvalue_converted_type(from);
+            if !self.types.types_compatible(from, target) {
+                diag::error(pos, &gettext("conversion to non-scalar type requested"));
+            } else if !self.types.is_composite_complete(target) {
+                let named = self.types.format_type(target, Some(self.idents));
+                diag::error_args(pos, "invalid use of undefined type '{0}'", &[&named]);
+            }
+            return;
+        }
+        let from_kind = self.types.kind(from);
+        // A void expression has no value to convert (C17 6.3.2.2): `(int)g()`
+        // for a `void g(void)` read whatever the return register held.
+        if from_kind == TypeKind::Void {
+            diag::error(pos, &gettext("invalid use of void expression"));
+            return;
+        }
+        let wanted = if self.types.is_float(target) {
+            "a floating-point"
+        } else if target_kind == TypeKind::Pointer {
+            "a pointer"
+        } else {
+            "an integer"
+        };
+        if matches!(from_kind, TypeKind::Struct | TypeKind::Union) {
+            diag::error_args(
+                pos,
+                "aggregate value used where {0} was expected",
+                &[wanted],
+            );
+        } else if from_kind == TypeKind::Pointer && self.types.is_complex(target) {
+            diag::error(
+                pos,
+                &gettext("pointer value used where a complex was expected"),
+            );
+        } else if target_kind == TypeKind::Pointer && self.types.is_complex(from) {
+            diag::error(pos, &gettext("cannot convert to a pointer type"));
+        } else if from_kind == TypeKind::Pointer && self.types.is_float(target) {
+            diag::error(
+                pos,
+                &gettext("pointer value used where a floating-point was expected"),
+            );
+        } else if target_kind == TypeKind::Pointer && self.types.is_float(from) {
+            diag::error(pos, &gettext("cannot convert to a pointer type"));
+        }
+    }
+
     /// A GNU cast to union type, `(union U)expr`.
     ///
     /// The operand must have the type of one of the members -- see
@@ -1082,14 +1165,10 @@ impl<'a> Parser<'a> {
     /// keeps the result from being an lvalue as a compound literal is.
     ///
     /// An operand of the union's own type is an ordinary no-op cast. One that
-    /// matches no member is diagnosed as gcc does. A vector operand is the
-    /// vector-value error every other cast reports: the array model would
-    /// see it decay, and so match no vector member.
+    /// matches no member is diagnosed as gcc does.
     fn cast_to_union(&mut self, union_typ: TypeId, operand: Expr, pos: Position) -> Expr {
         let union_typ = self.types.unqualified(union_typ);
-        let is_vector = self.check_not_vector_value(operand.typ, operand.pos);
         let value = match operand.typ {
-            Some(_) if is_vector => operand,
             Some(t) => {
                 let t = self.lvalue_converted_type(t);
                 if self.types.types_compatible(t, union_typ) {
@@ -1134,7 +1213,7 @@ impl<'a> Parser<'a> {
         paren_pos: Position,
     ) -> ParseResult<Expr> {
         let init_list = self.parse_initializer_list()?;
-        let elements = match init_list.kind {
+        let mut elements = match init_list.kind {
             ExprKind::InitList { elements } => elements,
             _ => unreachable!("parse_initializer_list returns an InitList"),
         };
@@ -1145,6 +1224,7 @@ impl<'a> Parser<'a> {
         // `Some(0)`, conflating it with the GNU zero-length array. Accept
         // both, since the declaration path (`infer_array_size_from_init`)
         // also does.
+        self.walk_initializer_elements(typ, &mut elements);
         let final_typ = if self.types.kind(typ) == TypeKind::Array
             && matches!(self.types.get(typ).array_size, None | Some(0))
         {
@@ -1276,6 +1356,11 @@ impl<'a> Parser<'a> {
     /// subscript or a member reaches an element whose type is complete by
     /// construction, and a call cannot return an array.
     fn check_sizeof_expr_operand(&self, expr: &Expr, pos: Position) {
+        // C17 6.5.3.4p1: not a bit-field, which has no size in bytes.
+        if self.bit_field_designated(expr).is_some() {
+            diag::error(pos, &gettext("'sizeof' applied to a bit-field"));
+            return;
+        }
         let Some(typ) = expr.typ else {
             return;
         };
@@ -1368,6 +1453,20 @@ impl<'a> Parser<'a> {
                     let expr = self.parse_postfix_suffixes(literal)?;
                     return Ok(self.alignof_expr(expr, size_t, alignof_pos));
                 }
+                // C17 6.5.3.4p1: not an incomplete type. gcc answers 1 for
+                // `void`, as an extension, and so does c17. A variable length
+                // array's extents are its own size expressions, so `int[n]`
+                // is complete.
+                if self.types.kind(typ) != TypeKind::Void
+                    && self.type_name_is_incomplete(typ, dims.len())
+                {
+                    let named = self.types.format_type(typ, Some(self.idents));
+                    diag::error_args(
+                        alignof_pos,
+                        "invalid application of '_Alignof' to incomplete type '{0}'",
+                        &[&named],
+                    );
+                }
                 return Ok(Expr::typed(ExprKind::AlignofType(typ), size_t, alignof_pos));
             }
 
@@ -1403,6 +1502,9 @@ impl<'a> Parser<'a> {
     /// implementation: the constant evaluator and the linearizer each computed
     /// this from `expr.typ` alone and so disagreed with gcc identically.
     fn alignof_expr(&mut self, expr: Expr, size_t: TypeId, pos: Position) -> Expr {
+        if self.bit_field_designated(&expr).is_some() {
+            diag::error(pos, &gettext("'_Alignof' applied to a bit-field"));
+        }
         if let ExprKind::Ident(symbol_id) = &expr.kind {
             let symbol = self.symbols.get(*symbol_id);
             if let Some(align) = symbol.explicit_align {
@@ -1476,6 +1578,15 @@ impl<'a> Parser<'a> {
                     .and_then(|t| self.types.base_type(t))
                     .or_else(|| index.typ.and_then(|t| self.types.base_type(t)))
                     .unwrap_or(self.types.int_id);
+                // A vector is qualified as a whole, and an element of a
+                // `const` one is not to be written either.
+                let elem_type = match expr.typ.filter(|&t| self.types.is_vector(t)) {
+                    Some(v) => {
+                        let quals = self.types.qualifiers(v);
+                        self.types.qualified_with(elem_type, quals)
+                    }
+                    None => elem_type,
+                };
                 expr = Self::typed_expr(
                     ExprKind::Index {
                         array: Box::new(expr),
@@ -1526,7 +1637,19 @@ impl<'a> Parser<'a> {
                 let member = self.expect_identifier()?;
                 // Get member type: dereference the pointer, then find the member
                 let member_type = if let Some(t) = expr.typ {
-                    if let Some(struct_type) = self.types.base_type(t) {
+                    // C17 6.5.2.3p2: the operand of `->` is a pointer (an
+                    // array decays to one). A structure there has a base type
+                    // of nothing, and the member access was dropped silently.
+                    let decayed = self.decayed_type(t);
+                    if self.types.kind(decayed) != TypeKind::Pointer {
+                        let have = self.types.format_type(t, Some(self.idents));
+                        diag::error_args(
+                            arrow_pos,
+                            "invalid type argument of '->' (have '{0}')",
+                            &[&have],
+                        );
+                        self.types.int_id
+                    } else if let Some(struct_type) = self.types.base_type(decayed) {
                         let kind = self.types.kind(struct_type);
                         if kind != TypeKind::Struct && kind != TypeKind::Union {
                             diag::error(
@@ -1588,6 +1711,15 @@ impl<'a> Parser<'a> {
                     .and_then(|f| self.types.base_type(f))
                     .unwrap_or(self.types.int_id);
                 let return_type = self.types.unqualified(return_type);
+                // 6.5.2.2p1: a call returns `void` or a complete object type;
+                // a prototype may name an incomplete one, but a call has a
+                // value of it to make.
+                if self.types.kind(return_type) != TypeKind::Void
+                    && self.type_name_is_incomplete(return_type, 0)
+                {
+                    let named = self.types.format_type(return_type, Some(self.idents));
+                    diag::error_args(call_pos, "invalid use of undefined type '{0}'", &[&named]);
+                }
 
                 let known = self.known_callee(&expr);
                 expr = self.fold_zero_length_compare(Self::typed_expr(
@@ -1608,18 +1740,42 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
+    /// The type of `__func__`: `const char[N]` for the enclosing function's
+    /// name. Outside a function gcc warns and gives it an empty name.
+    fn func_name_type(&mut self, spelled: StringId, pos: Position) -> TypeId {
+        let len = match self.enclosing_function.name {
+            Some(name) => self.idents.get_opt(name).map_or(0, str::len),
+            None => {
+                let spelled = self.idents.get_opt(spelled).unwrap_or("__func__");
+                diag::warning_args(
+                    pos,
+                    "'{0}' is not defined outside of function scope",
+                    &[spelled],
+                );
+                0
+            }
+        };
+        let const_char = self
+            .types
+            .qualified_with(self.types.char_id, TypeModifiers::CONST);
+        self.types.intern(Type::array(const_char, len + 1))
+    }
+
     /// Parse a run of adjacent string literals into one expression.
     ///
     /// C11 6.4.5p5: if any literal in the run has an encoding prefix, the
     /// result takes that encoding; a run mixing two *different* prefixes is a
     /// constraint violation (6.4.5p2).
-    fn parse_string_literal_run(&mut self) -> ParseResult<Expr> {
+    pub(super) fn parse_string_literal_run(&mut self) -> ParseResult<Expr> {
         let start_pos = self.current_pos();
         // Elements of the concatenated literal, still distinguishing a byte
         // from a named character so each encoding can ask for what it needs.
         let mut pieces: Vec<(Position, Vec<literal::Escaped>)> = Vec::new();
         let mut encoding: Option<TokenType> = None;
         let mut mixed_reported = false;
+        // A `u8` literal folds into the narrow token type, so it is tracked
+        // apart: it may join a plain literal but not a wide one (6.4.5p2).
+        let mut saw_utf8 = false;
 
         loop {
             let kind = self.peek();
@@ -1629,6 +1785,7 @@ impl<'a> Parser<'a> {
                 | TokenType::Utf16String
                 | TokenType::Utf32String => {
                     let token = self.consume();
+                    saw_utf8 |= token.encoding_prefix() == "u8";
                     match &token.value {
                         TokenValue::String(s)
                         | TokenValue::WideString(s)
@@ -1643,20 +1800,21 @@ impl<'a> Parser<'a> {
             };
             pieces.push(piece);
 
+            // Two wide prefixes that differ, or a `u8` anywhere in a run that
+            // has a wide one -- judged once this piece's own prefix is
+            // recorded, so `u8"a" L"b"` is caught as `L"a" u8"b"` is.
+            let mut mixed = false;
             if kind != TokenType::String {
-                match encoding {
-                    None => encoding = Some(kind),
-                    Some(prev) if prev != kind && !mixed_reported => {
-                        diag::error(
-                            start_pos,
-                            &gettext(
-                                "concatenation of string literals with different encoding prefixes",
-                            ),
-                        );
-                        mixed_reported = true;
-                    }
-                    _ => {}
-                }
+                mixed = encoding.is_some_and(|prev| prev != kind);
+                encoding.get_or_insert(kind);
+            }
+            mixed |= saw_utf8 && encoding.is_some();
+            if mixed && !mixed_reported {
+                diag::error(
+                    start_pos,
+                    &gettext("concatenation of string literals with different encoding prefixes"),
+                );
+                mixed_reported = true;
             }
         }
 
@@ -1831,7 +1989,8 @@ impl<'a> Parser<'a> {
             BinaryOp::Shl | BinaryOp::Shr => self.effective_bitfield_width(&left),
             _ => None,
         }
-        .filter(|bits| *bits < self.types.size_bits(result_type));
+        .filter(|bits| *bits < self.types.size_bits(result_type))
+        .filter(|_| !self.types.is_vector(result_type));
 
         let pos = left.pos;
         let mut e = Self::typed_expr(
@@ -1856,6 +2015,21 @@ impl<'a> Parser<'a> {
         right: &Expr,
     ) -> TypeId {
         let right_type = right.typ.unwrap_or(self.types.int_id);
+        // A vector operation yields the vector's type -- the left operand's
+        // when both are vectors, unless that one is a comparison's mask --
+        // and a comparison a vector of masks.
+        let vector = [left_type, right_type]
+            .into_iter()
+            .filter(|&t| self.types.is_vector(t))
+            .min_by_key(|&t| self.types.is_vector_mask(t));
+        if let Some(vector) = vector {
+            let vector = self.types.unqualified(vector);
+            return if op.is_comparison() {
+                self.types.vector_mask_type(vector)
+            } else {
+                vector
+            };
+        }
         match op {
             // Comparison and logical operators always return int
             BinaryOp::Eq
@@ -2024,7 +2198,11 @@ impl<'a> Parser<'a> {
     /// the one rule in one place: the binary operators already use it, and two
     /// copies of a promotion rule is how this went wrong to begin with.
     fn promote_unary_operand(&mut self, operand: Expr) -> (Expr, TypeId) {
-        self.check_not_vector_value(operand.typ, operand.pos);
+        // A vector is operated on lane by lane, with no promotion.
+        if let Some(t) = operand.typ.filter(|&t| self.types.is_vector(t)) {
+            let typ = self.types.unqualified(t);
+            return (operand, typ);
+        }
         let operand = self.promote_bitfield_operand(operand);
         let op_typ = operand.typ.unwrap_or(self.types.int_id);
         // A GNU complex integer is left alone. `integer_promote` switches on
@@ -2207,6 +2385,20 @@ impl<'a> Parser<'a> {
                         &gettext("'_Generic' association has variable length type"),
                     );
                 }
+                // ... and names a complete object type: a function type or
+                // an incomplete one can never be the controlling
+                // expression's.
+                if self.types.kind(assoc_typ) == TypeKind::Function {
+                    diag::error(
+                        assoc_pos,
+                        &gettext("'_Generic' association has function type"),
+                    );
+                } else if self.type_name_is_incomplete(assoc_typ, dims.len()) {
+                    diag::error(
+                        assoc_pos,
+                        &gettext("'_Generic' association has incomplete type"),
+                    );
+                }
                 self.expect_special(b':')?;
                 let expr = self.parse_assignment_expr()?;
 
@@ -2288,20 +2480,18 @@ impl<'a> Parser<'a> {
                         }
                     }
 
-                    // Look up symbol to get type (during parsing, symbol is in scope)
-                    // C99 6.4.2.2: __func__ is a predefined identifier with type const char[]
-                    // GCC extensions: __FUNCTION__ and __PRETTY_FUNCTION__ behave similarly
+                    // C17 6.4.2.2p1: `__func__` is implicitly declared
+                    // `static const char __func__[] = "function-name";`, so
+                    // its type is `const char[N]`: `sizeof __func__` is the
+                    // name's length plus one, and it decays like any array.
+                    // gcc's `__FUNCTION__` and `__PRETTY_FUNCTION__` are the
+                    // same in C.
                     if name_id == crate::kw::FUNC
                         || name_id == crate::kw::FUNCTION
                         || name_id == crate::kw::PRETTY_FUNCTION
                     {
-                        // These behave like a string literal (const char[])
-                        // Linearization handles mapping to __func__ behavior
-                        return Ok(Self::typed_expr(
-                            ExprKind::FuncName,
-                            self.types.char_ptr_id,
-                            token_pos,
-                        ));
+                        let typ = self.func_name_type(name_id, token_pos);
+                        return Ok(Self::typed_expr(ExprKind::FuncName, typ, token_pos));
                     }
 
                     // Check if this is an enum constant - if so, return IntLit
@@ -2364,11 +2554,14 @@ impl<'a> Parser<'a> {
                             params: None,
                             ..Default::default()
                         });
+                        // An implicit declaration is `extern int f();` (C89
+                        // 6.3.2.2), so it has external linkage.
                         let symbol = crate::symbol::Symbol::function(
                             name_id,
                             func_type,
                             self.symbols.depth(),
-                        );
+                        )
+                        .with_linkage(crate::symbol::Linkage::External);
                         let symbol_id = self.symbols.declare(symbol).unwrap_or_else(|_| {
                             self.symbols
                                 .lookup_id(name_id, crate::symbol::Namespace::Ordinary)
@@ -2497,28 +2690,33 @@ impl<'a> Parser<'a> {
                         // An array was converted as if it were its first
                         // element's address. (A union stays: gcc casts to
                         // one, and so does c17 -- see `cast_to_union`.)
+                        let vector = self.types.is_vector(typ)
+                            || expr.typ.is_some_and(|t| self.types.is_vector(t));
                         match self.types.kind(typ) {
+                            TypeKind::Union => {
+                                let cast = self.cast_to_union(typ, expr, paren_pos);
+                                return Ok(self.with_type_name_extents(dims, cast));
+                            }
+                            // A vector's own rules, below.
+                            _ if vector => {}
                             TypeKind::Array => {
                                 diag::error(paren_pos, &gettext("cast specifies array type"))
                             }
                             TypeKind::Function => {
                                 diag::error(paren_pos, &gettext("cast specifies function type"))
                             }
-                            TypeKind::Union => {
-                                let cast = self.cast_to_union(typ, expr, paren_pos);
-                                return Ok(self.with_type_name_extents(dims, cast));
-                            }
-                            _ => {}
+                            _ => self.check_cast_operand(typ, &expr, paren_pos),
                         }
                         // gcc reinterprets the bits between a vector and a
-                        // same-sized scalar or vector; the array model would
-                        // convert an address instead. A cast to `void` reads
-                        // nothing -- `(void)v;` is how an unused vector is
-                        // marked used -- so it is not a value use.
-                        if self.types.kind(typ) != TypeKind::Void
-                            && !self.check_not_vector_value(expr.typ, expr.pos)
-                        {
-                            self.check_not_vector_value(Some(typ), paren_pos);
+                        // same-sized integer or vector. A cast to `void`
+                        // reads nothing -- `(void)v;` is how an unused vector
+                        // is marked used.
+                        if let Some(from) = expr.typ {
+                            let from = self.lvalue_converted_type(from);
+                            let vector = self.types.is_vector(from) || self.types.is_vector(typ);
+                            if vector && self.types.kind(typ) != TypeKind::Void {
+                                self.check_vector_cast(from, typ, paren_pos);
+                            }
                         }
 
                         // Fold cast-to-Int128 of constant expressions into Int128Lit
@@ -2641,10 +2839,25 @@ impl<'a> Parser<'a> {
             };
             let typ = match float_suffix {
                 FloatSuffix::None => self.types.double_id,
-                // `_Float32` and `_Float64` are `float` and `double` here.
-                FloatSuffix::F | FloatSuffix::F32 => self.types.float_id,
-                FloatSuffix::F64 => self.types.double_id,
+                FloatSuffix::F => self.types.float_id,
                 FloatSuffix::L => self.types.longdouble_id,
+                FloatSuffix::F32 => self
+                    .types
+                    .floating(TypeKind::Float, FloatClass::Interchange),
+                FloatSuffix::F64 => self
+                    .types
+                    .floating(TypeKind::Double, FloatClass::Interchange),
+                FloatSuffix::F32x => self.types.floating(TypeKind::Double, FloatClass::Extended),
+                FloatSuffix::F64x => {
+                    if !self.types.has_float64x() {
+                        return Err(ParseError::new(
+                            format!("_Float64x is not supported on this target: {}", s),
+                            pos,
+                        ));
+                    }
+                    self.types
+                        .floating(TypeKind::LongDouble, FloatClass::Extended)
+                }
                 FloatSuffix::F16 => self.types.float16_id,
                 FloatSuffix::F128 => {
                     if !self.types.has_float128() {
@@ -2681,6 +2894,21 @@ impl<'a> Parser<'a> {
 
             // Reinterpret bits as i64 (preserves bit pattern for unsigned values)
             let value = value_u64 as i64;
+
+            // C17 6.4.4.1p6: a decimal constant without `u` that no signed
+            // type of its list can hold has no type at all. gcc gives it
+            // `__int128`, with a warning, and so does c17 -- it used to wrap
+            // to a negative `long long`, so `18446744073709551615 > 0` was 0.
+            let is_decimal = !is_hex && !body.starts_with('0') && !body.starts_with("0b");
+            if is_decimal && !is_unsigned && value_u64 > i64::MAX as u64 {
+                diag::warning(
+                    pos,
+                    &gettext("integer constant is so large that it is unsigned"),
+                );
+                let typ = self.types.int128_id;
+                let lit = Self::typed_expr(ExprKind::Int128Lit(i128::from(value_u64)), typ, pos);
+                return Ok(self.imaginary_if(lit, is_imaginary, typ, pos));
+            }
 
             // Determine type according to C99 6.4.4.1:
             // - Decimal constants: int, long int, long long int (signed only)
@@ -2889,9 +3117,8 @@ impl<'a> NumberSpelling<'a> {
 }
 
 /// The suffixes of a floating constant (C17 6.4.4.2), with the `_FloatN`
-/// spellings of TS 18661-3 that c17 has types for and GNU's `q`.
-///
-/// `f32x` and `f64x` are not here: c17 has no `_Float32x` or `_Float64x`.
+/// and `_FloatNx` spellings of TS 18661-3 that c17 has types for and GNU's
+/// `q`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FloatSuffix {
     None,
@@ -2900,6 +3127,8 @@ enum FloatSuffix {
     F16,
     F32,
     F64,
+    F32x,
+    F64x,
     /// `f128`, or GNU's `q`.
     F128,
 }
@@ -2913,6 +3142,8 @@ impl FloatSuffix {
             "f16" => FloatSuffix::F16,
             "f32" => FloatSuffix::F32,
             "f64" => FloatSuffix::F64,
+            "f32x" => FloatSuffix::F32x,
+            "f64x" => FloatSuffix::F64x,
             "f128" | "q" => FloatSuffix::F128,
             _ => return None,
         })

@@ -15,7 +15,7 @@ use super::parser::{DeclaratorContext, ParseError, ParseResult, ParsedDeclarator
 use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId};
-use crate::token::lexer::{Position, TokenType};
+use crate::token::lexer::{Position, TokenType, TokenValue};
 use crate::types::{
     CompositeType, EnumConstant, MemberAlign, StructMember, Type, TypeId, TypeKind, TypeModifiers,
 };
@@ -242,6 +242,9 @@ impl Parser<'_> {
 
             // A forward reference to the tag made an incomplete enum; the
             // definition completes that same type, as a struct's does.
+            if let Some(redefined) = tag.and_then(|t| self.reused_tag(t, TypeKind::Enum)) {
+                return Ok(self.types.get(redefined).clone());
+            }
             if let Some(existing) = tag.and_then(|t| self.symbols.lookup_tag_in_current_scope(t)) {
                 let existing_typ = existing.typ;
                 let forward = self.types.get(existing_typ);
@@ -253,6 +256,7 @@ impl Parser<'_> {
                 }
             }
 
+            self.warn_tag_in_parameter_list("enum", tag);
             let mut enum_type = Type::enum_type(composite);
             // C17 6.7.2.2p4: the enumerated type shall represent every member.
             // `enum_underlying_type` picks a type that does, but the enum's own
@@ -280,7 +284,9 @@ impl Parser<'_> {
             if let Some(tag_name) = tag {
                 // Look up or create incomplete type
                 if let Some(existing) = self.symbols.lookup_tag(tag_name) {
-                    Ok(self.types.get(existing.typ).clone())
+                    let existing = existing.typ;
+                    self.check_tag_kind(tag_name, existing, TypeKind::Enum);
+                    Ok(self.types.get(existing).clone())
                 } else {
                     // Registered, so that the definition completes this
                     // same type rather than making another.
@@ -296,6 +302,93 @@ impl Parser<'_> {
                 ))
             }
         }
+    }
+
+    /// A tag first declared in a parameter list has prototype scope (C17
+    /// 6.2.1p4), so no other declaration can ever name the same type -- a
+    /// definition of the function that repeats `struct S *` has a different
+    /// `struct S`. gcc warns, and so does c17.
+    fn warn_tag_in_parameter_list(&self, keyword: &str, tag: Option<StringId>) {
+        if self.param_list_depth == 0 {
+            return;
+        }
+        let pos = self.current_pos();
+        match tag.and_then(|t| self.idents.get_opt(t)) {
+            Some(name) => diag::warning_args(
+                pos,
+                "'{0} {1}' declared inside parameter list will not be visible outside of this definition or declaration",
+                &[keyword, name],
+            ),
+            None => diag::warning_args(
+                pos,
+                "anonymous {0} declared inside parameter list will not be visible outside of this definition or declaration",
+                &[keyword],
+            ),
+        }
+    }
+
+    /// Every name `members` puts in a structure's name space: its named
+    /// members, and those of its anonymous structure and union members.
+    fn member_names(&self, members: &[StructMember]) -> Vec<StringId> {
+        let mut names = Vec::new();
+        for m in members {
+            if m.name != StringId::EMPTY {
+                names.push(m.name);
+            } else if m.bit_width.is_none() {
+                if let Some(c) = self.types.composite(m.typ) {
+                    names.extend(self.member_names(&c.members));
+                }
+            }
+        }
+        names
+    }
+
+    /// For the definition of a tag of `kind` in this scope: the type to answer
+    /// instead, when an earlier declaration of the tag here forbids it --
+    /// one of another kind (C17 6.7.2.3p2), or one already defined
+    /// (6.7.2.3p1). `None` when the definition may go ahead.
+    fn reused_tag(&self, tag: StringId, kind: TypeKind) -> Option<TypeId> {
+        let existing = self.symbols.lookup_tag_in_current_scope(tag)?.typ;
+        if !self.check_tag_kind(tag, existing, kind) {
+            return Some(existing);
+        }
+        let complete = self
+            .types
+            .get(existing)
+            .composite
+            .as_ref()
+            .is_some_and(|c| c.is_complete);
+        if !complete {
+            return None;
+        }
+        let keyword = match kind {
+            TypeKind::Union => "union",
+            TypeKind::Enum => "enum",
+            _ => "struct",
+        };
+        let spelled = self.idents.get_opt(tag).unwrap_or("");
+        diag::error_args(
+            self.current_pos(),
+            "redefinition of '{0} {1}'",
+            &[keyword, spelled],
+        );
+        Some(existing)
+    }
+
+    /// C17 6.7.2.3p2: a tag names one kind of type. `struct S` and `union
+    /// S` in one scope are a constraint violation, reported here; answers
+    /// whether `existing` has the `kind` asked for.
+    fn check_tag_kind(&self, tag: StringId, existing: TypeId, kind: TypeKind) -> bool {
+        if self.types.kind(existing) == kind {
+            return true;
+        }
+        let spelled = self.idents.get_opt(tag).unwrap_or("");
+        diag::error_args(
+            self.current_pos(),
+            "'{0}' defined as wrong kind of tag",
+            &[spelled],
+        );
+        false
     }
 
     /// The attributes written between a tag keyword and its tag, and the
@@ -437,6 +530,14 @@ impl Parser<'_> {
             };
 
             // Check if there's an existing forward declaration that we should complete
+            let kind = if is_union {
+                TypeKind::Union
+            } else {
+                TypeKind::Struct
+            };
+            if let Some(redefined) = tag.and_then(|t| self.reused_tag(t, kind)) {
+                return Ok(self.types.get(redefined).clone());
+            }
             if let Some(tag_name) = tag {
                 if let Some(existing) = self.symbols.lookup_tag_in_current_scope(tag_name) {
                     // Complete the existing forward-declared type in place
@@ -455,6 +556,7 @@ impl Parser<'_> {
             }
 
             // No existing forward declaration - create new type
+            self.warn_tag_in_parameter_list(if is_union { "union" } else { "struct" }, tag);
             let struct_type = if is_union {
                 Type::union_type(composite)
             } else {
@@ -490,11 +592,20 @@ impl Parser<'_> {
                     self.symbols.lookup_tag(tag_name)
                 };
                 if let Some(existing) = existing {
-                    Ok(self.types.get(existing.typ).clone())
+                    let existing = existing.typ;
+                    let kind = if is_union {
+                        TypeKind::Union
+                    } else {
+                        TypeKind::Struct
+                    };
+                    self.check_tag_kind(tag_name, existing, kind);
+                    Ok(self.types.get(existing).clone())
                 } else {
                     // Create new incomplete type and register it in symbol table
                     // This ensures that when the type is completed later, we can update
                     // this same TypeId rather than creating a new one
+                    let keyword = if is_union { "union" } else { "struct" };
+                    self.warn_tag_in_parameter_list(keyword, Some(tag_name));
                     let incomplete_type = if is_union {
                         Type::incomplete_union(tag_name)
                     } else {
@@ -520,6 +631,14 @@ impl Parser<'_> {
         let mut members = Vec::with_capacity(DEFAULT_MEMBER_CAPACITY);
 
         while !self.is_special(b'}') && !self.is_eof() {
+            // A stray `;` -- `int a;;` or a member list that opens with one.
+            // The grammar has no empty member declaration, but gcc accepts it
+            // (warning only under -pedantic), and <linux/nfc.h> has one.
+            if self.is_special(b';') {
+                self.advance();
+                continue;
+            }
+
             // Check for _Static_assert in struct (C11 6.7.2.1p1)
             if self.is_static_assert() {
                 self.parse_static_assert()?;
@@ -531,7 +650,14 @@ impl Parser<'_> {
             self.pending_alignas_kw = None;
 
             // Parse member declaration
+            let specs_start = self.pos;
             let member_specs = self.parse_declaration_specifiers(SpecContext::Member)?;
+            // Whether the specifiers spell out a structure or union -- the
+            // only thing that can make an anonymous member -- rather than
+            // naming one through a typedef.
+            let spelled_tag = self.tokens[specs_start..self.pos].iter().any(|t| {
+                matches!(&t.value, TokenValue::Ident(id) if *id == crate::kw::STRUCT || *id == crate::kw::UNION)
+            });
             let member_base_type = &member_specs.ty;
             let is_struct_or_union =
                 matches!(member_base_type.kind, TypeKind::Struct | TypeKind::Union);
@@ -549,6 +675,41 @@ impl Parser<'_> {
             // C11 anonymous struct/union members: "struct { ... };" or "union { ... };"
             // These have no declarator name, just end with ';'
             if is_struct_or_union && self.is_special(b';') {
+                // C17 6.7.2.1p13: only a specifier with no tag makes an
+                // anonymous member. `struct T;` or `struct T { ... };` here
+                // declares the tag and nothing else, as gcc reads it --
+                // taking it as a member made `struct A { struct A; }`
+                // contain itself.
+                // A typedef name for one is not a specifier that makes an
+                // anonymous member either (6.7.2.1p13 asks for a
+                // struct-or-union-specifier): `T;` declares nothing, and
+                // taking it as a member changed the layout gcc gives.
+                let tagged = self
+                    .types
+                    .get(member_base_type_id)
+                    .composite
+                    .as_ref()
+                    .is_some_and(|c| c.tag.is_some());
+                if tagged || !spelled_tag {
+                    diag::warning(
+                        self.current_pos(),
+                        &gettext("declaration does not declare anything"),
+                    );
+                    self.advance(); // consume ';'
+                    continue;
+                }
+                // The anonymous member's own members join this name space
+                // (C17 6.7.2.1p13), so they may not repeat one already here.
+                let existing = self.member_names(&members);
+                let added = self
+                    .types
+                    .composite(member_base_type_id)
+                    .map(|c| self.member_names(&c.members))
+                    .unwrap_or_default();
+                for name in added.iter().filter(|n| existing.contains(n)) {
+                    let spelled = self.idents.get_opt(*name).unwrap_or("").to_string();
+                    diag::error_args(self.current_pos(), "duplicate member '{0}'", &[&spelled]);
+                }
                 members.push(StructMember {
                     name: StringId::EMPTY,
                     typ: member_base_type_id,
@@ -568,34 +729,9 @@ impl Parser<'_> {
                 continue;
             }
 
-            // Check for unnamed bitfield (starts with ':')
-            if self.is_special(b':') {
-                // Unnamed bitfield: parse width only
-                self.advance(); // consume ':'
-                let width = self.parse_bitfield_width()?;
-                // An unnamed bit-field is still a bit-field: its type has
-                // to be one a bit-field may have, and its width has to fit.
-                // Neither unnamed site validated anything, so
-                // `struct { float : 3; }` was accepted.
-                self.validate_bitfield(member_base_type_id, width, false)?;
-
-                members.push(StructMember {
-                    name: StringId::EMPTY,
-                    typ: member_base_type_id,
-                    offset: 0,
-                    bit_offset: None,
-                    bit_width: Some(width),
-                    access_bytes: None,
-                    align: MemberAlign::NATURAL, // padding: nothing written aligns it
-                });
-
-                self.expect_special(b';')?;
-                continue;
-            }
-
             loop {
-                // Check for unnamed bitfield (can appear after ',' too)
-                // e.g., "int a : 1, : 2, b : 3;"
+                // An unnamed bit-field, first in the list or after a comma:
+                // `int a : 1, : 2, b : 3;` and `unsigned char :1, :1, x:1;`
                 if self.is_special(b':') {
                     // Unnamed bitfield: parse width only
                     self.advance(); // consume ':'
@@ -668,13 +804,40 @@ impl Parser<'_> {
 
                 // What this declarator adds to the specifiers' alignment.
                 let member_align = specifier_align.merge(self.take_member_align());
+                // C11 6.7.5p5: the `_Alignas` keyword may not weaken a
+                // member's alignment either; the `aligned` attribute may.
+                if let (Some(written), Some(_)) = (member_align.written, self.pending_alignas_kw) {
+                    let natural = self.types.natural_alignment(typ) as u32;
+                    if written < natural {
+                        let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
+                        diag::error_args(
+                            self.current_pos(),
+                            "'_Alignas' specifiers cannot reduce alignment of '{0}'",
+                            &[&spelled],
+                        );
+                    }
+                }
+
+                // C17 6.7.2.1p3: no member of incomplete or function type,
+                // the flexible array member excepted. A member of the type
+                // being defined is the same violation -- the tag is
+                // incomplete until its `}` -- and one that got through made
+                // a type that contains itself, which every walk over its
+                // members followed forever.
+                if !self.check_member_type(name, typ) {
+                    if self.is_special(b',') {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
 
                 // C17 6.7.2.1p2: members share one name space, so a
                 // repeated name is a constraint violation. Unnamed members
                 // -- anonymous struct/union members and unnamed bitfields
                 // -- all carry the empty name and are not repeats of each
                 // other.
-                if name != StringId::EMPTY && members.iter().any(|m| m.name == name) {
+                if name != StringId::EMPTY && self.member_names(&members).contains(&name) {
                     let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
                     diag::error_args(self.current_pos(), "duplicate member '{0}'", &[&spelled]);
                 }
@@ -711,6 +874,23 @@ impl Parser<'_> {
             }
         }
         Ok(members)
+    }
+
+    /// Whether a member may have type `typ` (C17 6.7.2.1p3), diagnosing it
+    /// if not. An array passes: its declarator already refused an incomplete
+    /// element type, and whether an array of unknown size is a valid flexible
+    /// array member is `check_flexible_array_members`' question.
+    fn check_member_type(&self, name: StringId, typ: TypeId) -> bool {
+        let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
+        let message = match self.types.kind(typ) {
+            TypeKind::Function => "field '{0}' declared as a function",
+            // An array's element type was checked by its declarator.
+            TypeKind::Array => return true,
+            _ if self.type_name_is_incomplete(typ, 0) => "field '{0}' has incomplete type",
+            _ => return true,
+        };
+        diag::error_args(self.current_pos(), message, &[&spelled]);
+        false
     }
 
     /// The alignment and `packed` written since the last call, consumed: the
@@ -783,11 +963,14 @@ impl Parser<'_> {
             return;
         }
         // A named member has to precede it: the array is a tail on something,
-        // and a struct that is nothing but a tail has no size to speak of.
+        // and a struct that is nothing but a tail has no size to speak of. An
+        // anonymous structure or union counts -- its members are members of
+        // this struct (C17 6.7.2.1p13), as <linux/bpf.h> relies on -- and only
+        // an unnamed bit-field, which is padding, does not.
         if members
             .iter()
             .take(first)
-            .all(|m| m.name == StringId::EMPTY)
+            .all(|m| m.name == StringId::EMPTY && m.bit_width.is_some())
         {
             diag::error(
                 pos,
@@ -819,8 +1002,22 @@ impl Parser<'_> {
             ));
         }
 
-        // Check that width doesn't exceed type size
-        let max_width = self.types.size_bits(typ_id);
+        // C17 6.7.2.1p5: not an atomic type, which no bit-field can be
+        // accessed as.
+        if self.types.modifiers(typ_id).contains(TypeModifiers::ATOMIC) {
+            return Err(ParseError::new(
+                "bit-field has atomic type",
+                self.current_pos(),
+            ));
+        }
+
+        // Check that width doesn't exceed type size: the type's width in
+        // bits (6.7.2.1p4), which for `_Bool` is one, not its eight-bit size.
+        let max_width = if self.types.kind(typ_id) == TypeKind::Bool {
+            1
+        } else {
+            self.types.size_bits(typ_id)
+        };
         if width > max_width {
             return Err(ParseError::new(
                 format!("bitfield width {} exceeds type size {}", width, max_width),

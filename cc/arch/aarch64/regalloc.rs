@@ -1376,6 +1376,15 @@ impl RegAlloc {
         }
         // Use shared identify_fp_pseudos with type-checker closure
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
+        // An asm operand in a `"w"` register is defined only by the asm,
+        // which carries no type: without this it looked like an integer and
+        // got an X register, which a sixteen-byte vector does not fit.
+        for insn in func.blocks.iter().flat_map(|b| &b.insns) {
+            if let Some(asm) = insn.extra().asm_data.as_ref() {
+                self.fp_pseudos
+                    .extend(super::inline_asm::vector_operand_pseudos(asm));
+            }
+        }
         self.allocate_arguments(func, types);
 
         let result = self.compute_live_intervals(func);

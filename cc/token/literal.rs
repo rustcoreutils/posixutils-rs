@@ -56,6 +56,15 @@ pub(crate) enum Escaped {
     /// Carries the scalar so the diagnostic can name it -- a surrogate has no
     /// `char` to carry.
     ForbiddenUcn(u32),
+    /// `\u` or `\U` (`long`) followed by fewer hex digits than a universal
+    /// character name has -- four or eight (C17 6.4.3p1). It names nothing,
+    /// so it is an error; it decodes as its letter, and the digits it has
+    /// are consumed, so the rest of the literal still decodes.
+    IncompleteUcn {
+        long: bool,
+        spelled: u32,
+        digits: u8,
+    },
 }
 
 /// An octal or hexadecimal escape's value.
@@ -127,6 +136,23 @@ pub(crate) fn check_elements(elements: &[Escaped], unit_bits: u32, pos: Position
     for e in elements {
         match e {
             Escaped::ForbiddenUcn(val) => report_forbidden_ucn(pos, *val),
+            Escaped::IncompleteUcn {
+                long,
+                spelled,
+                digits,
+            } => {
+                let letter = if *long { 'U' } else { 'u' };
+                let width = usize::from(*digits);
+                let digits = if width == 0 {
+                    String::new()
+                } else {
+                    format!("{spelled:0width$x}")
+                };
+                crate::diag::error(
+                    pos,
+                    &format!("incomplete universal character name \\{letter}{digits}"),
+                );
+            }
             Escaped::Numeric(n) if !n.fits(unit_bits) => {
                 crate::diag::permissive_error(pos, n.out_of_range_message())
             }
@@ -137,6 +163,27 @@ pub(crate) fn check_elements(elements: &[Escaped], unit_bits: u32, pos: Position
 
 /// The width of a plain literal's element, `char`.
 pub(crate) const CHAR_UNIT_BITS: u32 = u8::BITS;
+
+/// `\u`/`\U` at `chars[i]` followed by too few hex digits: the escape and
+/// the digits it does have, which it consumes.
+fn incomplete_ucn(chars: &[char], i: usize, long: bool) -> (Escaped, usize) {
+    let max = if long { 8 } else { 4 };
+    let digits = chars[i + 1..]
+        .iter()
+        .take(max)
+        .take_while(|c| c.is_ascii_hexdigit())
+        .count();
+    let text: String = chars[i + 1..i + 1 + digits].iter().collect();
+    let spelled = u32::from_str_radix(&text, 16).unwrap_or(0);
+    (
+        Escaped::IncompleteUcn {
+            long,
+            spelled,
+            digits: digits as u8,
+        },
+        1 + digits,
+    )
+}
 
 /// Parse an escape sequence starting at position i (after the backslash).
 ///
@@ -188,7 +235,7 @@ pub(crate) fn parse_escape_sequence(chars: &[char], i: usize) -> (Escaped, usize
                     (Escaped::Unit(u32::from(b'u')), 1) // Invalid code point
                 }
             } else {
-                (Escaped::Unit(u32::from(b'u')), 1) // Not enough hex digits
+                incomplete_ucn(chars, i, false)
             }
         }
         'U' => {
@@ -204,7 +251,7 @@ pub(crate) fn parse_escape_sequence(chars: &[char], i: usize) -> (Escaped, usize
                     (Escaped::Unit(u32::from(b'U')), 1) // Invalid code point
                 }
             } else {
-                (Escaped::Unit(u32::from(b'U')), 1) // Not enough hex digits
+                incomplete_ucn(chars, i, true)
             }
         }
         c if c.is_ascii_digit() && c != '8' && c != '9' => {
@@ -253,6 +300,8 @@ pub(crate) fn char_literal_value(
     let elements = parse_string_literal(s);
     check_elements(&elements, prefixed_bits.unwrap_or(CHAR_UNIT_BITS), pos);
     if elements.is_empty() {
+        // C17 6.4.4.4p1: a character constant holds at least one character.
+        crate::diag::error(pos, &gettextrs::gettext("empty character constant"));
         return (0, false);
     }
 
@@ -332,6 +381,10 @@ pub(crate) fn literal_utf16_units(elements: &[Escaped]) -> Vec<u16> {
                 flush(&mut run, &mut out);
                 out.push(*v as u16);
             }
+            Escaped::IncompleteUcn { long, .. } => {
+                flush(&mut run, &mut out);
+                out.push(if *long { 'U' } else { 'u' } as u16);
+            }
         }
     }
     flush(&mut run, &mut out);
@@ -391,6 +444,7 @@ pub(crate) fn literal_bytes(elements: &[Escaped]) -> String {
             // Already diagnosed where the literal was parsed; encoded as
             // written so the rest of the literal still makes sense.
             Escaped::ForbiddenUcn(v) => out.push(*v as u8 as char),
+            Escaped::IncompleteUcn { long, .. } => out.push(if *long { 'U' } else { 'u' }),
             Escaped::CodePoint(c) => {
                 let mut buf = [0u8; 4];
                 for b in c.encode_utf8(&mut buf).as_bytes() {
@@ -430,6 +484,10 @@ pub(crate) fn literal_wide_chars(elements: &[Escaped]) -> Vec<u32> {
             Escaped::ForbiddenUcn(v) => {
                 flush(&mut run, &mut out);
                 out.push(*v);
+            }
+            Escaped::IncompleteUcn { long, .. } => {
+                flush(&mut run, &mut out);
+                out.push(if *long { 'U' } else { 'u' } as u32);
             }
             Escaped::CodePoint(c) => {
                 flush(&mut run, &mut out);

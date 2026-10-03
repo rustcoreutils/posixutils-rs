@@ -80,6 +80,10 @@ pub(crate) struct ParameterList {
     pub variadic: bool,
     /// False for `()` and for an identifier list.
     pub prototyped: bool,
+    /// Where a `[*]` is written directly in this list -- not in a nested
+    /// prototype -- which a function body following it does not allow
+    /// (C17 6.7.6.2p4).
+    pub star: Option<Position>,
 }
 
 /// Where a declarator is written, which settles what it may contain.
@@ -141,9 +145,14 @@ pub(crate) struct ParsedDeclarator {
     /// Where the first run-time extent is written, for the diagnostic that
     /// refuses one where it may not appear.
     pub(crate) vla_pos: Option<Position>,
-    /// A function declarator's parameters, with their names, for a
+    /// A function declarator's parameter list, with the names, for a
     /// definition to bind.
-    pub(crate) params: Option<Vec<RawParam>>,
+    pub(crate) params: Option<ParameterList>,
+    /// Whether the declarator is only its identifier, perhaps parenthesized
+    /// -- `a` or `(a)` -- deriving nothing, and with no attribute in its
+    /// parentheses. An array suffix on one is the declared object's own,
+    /// whose `[static]` and qualifiers a parameter may carry.
+    pub(crate) plain_name: bool,
 }
 
 // Parser
@@ -166,6 +175,10 @@ pub(crate) struct EnclosingFunction {
     /// The declared return type, which a `return` converts its value to.
     /// `None` outside a function body.
     pub(crate) return_type: Option<TypeId>,
+    /// The function's name as written, which `__func__` holds (C17
+    /// 6.4.2.2p1) -- not an asm label it is emitted under. `None` outside a
+    /// function body.
+    pub(crate) name: Option<StringId>,
 }
 
 /// C expression parser using recursive descent with precedence climbing
@@ -231,6 +244,10 @@ pub struct Parser<'a> {
     /// Judged at end of translation unit -- see
     /// [`Self::check_deferred_incomplete_definitions`].
     pub(super) tentative_definitions: Vec<(TypeId, Position)>,
+    /// File-scope array definitions written without an extent, each with
+    /// where it was declared. A later declaration may still give the extent
+    /// (C17 6.9.2p2); see [`Self::complete_tentative_arrays`].
+    pub(super) tentative_arrays: Vec<(SymbolId, Position)>,
     /// Alignment from an attribute written *after* a declarator.
     ///
     /// Kept apart from `pending_alignas` because the two have different
@@ -295,6 +312,14 @@ pub struct Parser<'a> {
     /// reason as `declared_extern_fns`: a later declaration binds a fresh
     /// symbol that knows nothing of the body.
     pub(super) defined_functions: std::collections::HashSet<StringId>,
+    /// Every identifier with linkage declared so far, in any scope; see
+    /// [`super::linkage`].
+    pub(super) linked_names: std::collections::HashMap<StringId, super::linkage::LinkedName>,
+    /// How many parameter lists are being parsed, one inside another.
+    pub(super) param_list_depth: u32,
+    /// Where a `[*]` was written directly in the parameter list being
+    /// parsed; see [`ParameterList::star`].
+    pub(super) star_in_params: Option<Position>,
     /// `#pragma pack` directives, and where they stood in the token stream.
     ///
     /// Sorted by index; `pack_cursor` is how far the parser has consumed
@@ -353,6 +378,7 @@ impl<'a> Parser<'a> {
             pending_attr_align: None,
             pending_transparent_union: None,
             tentative_definitions: Vec::new(),
+            tentative_arrays: Vec::new(),
             pending_declarator_align: None,
             pending_symbol_attrs: Default::default(),
             pending_fn_attrs: Default::default(),
@@ -364,6 +390,9 @@ impl<'a> Parser<'a> {
             declared_extern_fns: std::collections::BTreeSet::new(),
             declared_non_inline_fns: std::collections::BTreeSet::new(),
             defined_functions: std::collections::HashSet::new(),
+            linked_names: std::collections::HashMap::new(),
+            param_list_depth: 0,
+            star_in_params: None,
             pack_directives,
             pack_cursor: 0,
             vm_typedefs: HashMap::new(),

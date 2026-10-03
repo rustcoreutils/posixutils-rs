@@ -1212,7 +1212,7 @@ int main(void) {
 /// type initializes the whole aggregate (C17 6.7.9p13).
 ///
 /// It was instead treated as a brace-elision candidate, so filling one element
-/// consumed `count_scalar_fields` *elements* rather than one:
+/// consumed one *element* per scalar member rather than one:
 /// `struct P a[2] = {p, p};` put both structs into `a[0]`, left `a[1]`
 /// uninitialized, and assigned a struct where a scalar field was expected --
 /// giving `4 4 0 0` where gcc gives `4 5 4 5`. The nested case returned

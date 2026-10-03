@@ -1,0 +1,429 @@
+//
+// Copyright (c) 2025-2026 Jeff Garzik
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+// gcc driver flags real build systems pass, each of which used to stop c17
+// before it compiled anything: `-pedantic`, `-ansi`, `-x LANG`, the `-g`
+// levels and formats, and the `-m` flags that choose or tune for a CPU.
+// Also the `__PIC__`/`__PIE__` macros, which describe the code generated.
+//
+
+use crate::common::{preprocess_text, run_c17};
+use std::path::PathBuf;
+
+/// A scratch directory holding `name` with `content`.
+fn scratch(name: &str, content: &str) -> (plib::tmp::TempDir, PathBuf) {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_gcc_flags_")
+        .tempdir()
+        .expect("tempdir");
+    let path = dir.path().join(name);
+    std::fs::write(&path, content).expect("write");
+    (dir, path)
+}
+
+const MAIN: &str = "int main(void) { return 0; }\n";
+
+/// Compile `src` (written as `name`) to an object with `flags`.
+fn compile_with(name: &str, src: &str, flags: &[&str]) -> crate::common::C17Run {
+    let (dir, path) = scratch(name, src);
+    let obj = dir.path().join("out.o");
+    let mut args: Vec<&str> = flags.to_vec();
+    args.extend(["-c", "-o", obj.to_str().unwrap(), path.to_str().unwrap()]);
+    run_c17(&args)
+}
+
+#[test]
+fn gcc_flags_pedantic_and_ansi_are_accepted() {
+    for flags in [
+        &["-pedantic"][..],
+        &["-pedantic-errors"],
+        &["-pedantic", "-pedantic-errors"],
+        &["-Wpedantic"],
+    ] {
+        let r = compile_with("ped.c", MAIN, flags);
+        assert!(r.success, "{flags:?}: {}", r.stderr);
+    }
+    // `-ansi` is `-std=c90`, reported as any older revision is.
+    let r = compile_with("ansi.c", MAIN, &["-ansi"]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(r.stderr.contains("'-std=c90' ignored"), "{}", r.stderr);
+}
+
+#[test]
+fn gcc_flags_x_selects_the_language() {
+    // A header compiled as C.
+    let r = compile_with("hdr.h", MAIN, &["-x", "c"]);
+    assert!(r.success, "{}", r.stderr);
+    let r = compile_with("hdr.h", MAIN, &["-xc"]);
+    assert!(r.success, "{}", r.stderr);
+
+    // Assembly that needs the preprocessor, under a suffix that says neither.
+    let r = compile_with(
+        "code.asm",
+        "#define NAME c17_x_sym\n.globl NAME\nNAME:\n    ret\n",
+        &["-x", "assembler-with-cpp"],
+    );
+    assert!(r.success, "{}", r.stderr);
+
+    // `-x none` goes back to suffixes, so a later `.h` is not compiled.
+    let (dir, path) = scratch("later.h", MAIN);
+    let c = dir.path().join("first.c");
+    std::fs::write(&c, MAIN).unwrap();
+    let obj = dir.path().join("o.o");
+    let r = run_c17(&[
+        "-x",
+        "c",
+        c.to_str().unwrap(),
+        "-x",
+        "none",
+        path.to_str().unwrap(),
+        "-c",
+        "-o",
+        obj.to_str().unwrap(),
+    ]);
+    assert!(r.stderr.contains("unrecognized file type"), "{}", r.stderr);
+
+    // A language c17 does not compile is an error, not a guess.
+    let r = compile_with("c.c", MAIN, &["-x", "c++"]);
+    assert!(!r.success);
+    assert!(
+        r.stderr.contains("language not recognized: c++"),
+        "{}",
+        r.stderr
+    );
+}
+
+/// The debug levels, on an ELF and a Mach-O target: the section is
+/// `.debug_info` in ELF and `__DWARF,__debug_info` in Mach-O, which the
+/// test once took for "no debug information" on macOS.
+#[test]
+fn gcc_flags_debug_levels() {
+    let (dir, path) = scratch("dbg.c", "int f(int x) { return x + 1; }\n");
+    let asm = dir.path().join("dbg.s");
+    for (target, section) in [
+        ("--target=x86_64-unknown-linux-gnu", ".section .debug_info"),
+        (
+            "--target=aarch64-apple-darwin",
+            ".section __DWARF,__debug_info",
+        ),
+    ] {
+        for (flags, want_debug) in [
+            (&["-g3"][..], true),
+            (&["-ggdb"], true),
+            (&["-gdwarf-4"], true),
+            (&["-g2", "-gsplit-dwarf"], true),
+            (&["-g", "-g0"], false),
+            (&["-g0", "-g1"], true),
+        ] {
+            let mut args = vec![target];
+            args.extend(flags);
+            args.extend(["-S", "-o", asm.to_str().unwrap(), path.to_str().unwrap()]);
+            let r = run_c17(&args);
+            assert!(r.success, "{target} {flags:?}: {}", r.stderr);
+            let text = std::fs::read_to_string(&asm).unwrap();
+            assert_eq!(text.contains(section), want_debug, "{target} {flags:?}");
+        }
+    }
+}
+
+#[test]
+fn gcc_flags_cpu_selection_is_accepted() {
+    let mut flags = vec!["-march=native", "-mtune=generic", "-mcpu=native"];
+    if cfg!(target_arch = "x86_64") {
+        flags.extend([
+            "-m64",
+            "-march=x86-64",
+            "-march=x86-64-v2",
+            "-msse2",
+            "-mfpmath=sse",
+        ]);
+    }
+    for flag in flags {
+        let r = compile_with("cpu.c", MAIN, &[flag]);
+        assert!(r.success, "{flag}: {}", r.stderr);
+    }
+    // An instruction-set extension or an ABI change is still refused.
+    for flag in ["-mavx2", "-mno-red-zone", "-mgeneral-regs-only"] {
+        let r = compile_with("cpu.c", MAIN, &[flag]);
+        assert!(!r.success, "{flag} accepted");
+        assert!(
+            r.stderr.contains("unsupported machine flag"),
+            "{}",
+            r.stderr
+        );
+    }
+}
+
+/// `__PIC__`/`__pic__` whenever the code is position independent, and
+/// `__PIE__`/`__pie__` when it is for a PIE -- the macros a `.S` file or an
+/// inline asm statement tests before choosing a GOT access.
+#[test]
+fn gcc_flags_pic_macros_follow_the_code() {
+    let probe = "PIC=__PIC__ pic=__pic__ PIE=__PIE__ pie=__pie__\n";
+    let defined = |flags: &[&str]| {
+        let r = preprocess_text("pic_probe", probe, flags);
+        assert!(r.success, "{}", r.stderr);
+        r.stdout
+    };
+    let out = defined(&["-fPIC", "-fno-pie"]);
+    assert!(out.contains("PIC=2 pic=2 PIE=__PIE__"), "{out}");
+    let out = defined(&["-fpie"]);
+    assert!(out.contains("PIC=2 pic=2 PIE=2 pie=2"), "{out}");
+    if cfg!(target_os = "linux") {
+        // PIE is the Linux default, as it is for gcc there.
+        let out = defined(&[]);
+        assert!(out.contains("PIC=2 pic=2 PIE=2 pie=2"), "{out}");
+        let out = defined(&["-fno-pie"]);
+        assert!(out.contains("PIC=__PIC__"), "{out}");
+    }
+    if cfg!(target_os = "macos") {
+        let out = defined(&["-fno-pie"]);
+        assert!(out.contains("PIC=2"), "Mach-O is always PIC: {out}");
+    }
+}
+
+/// `-Wl,...` reaches the linker as written and where it was written. It was
+/// split at its commas and moved to the end of the link line, so
+/// `-Wl,--whole-archive` arrived as a driver option the host `cc` rejects,
+/// `-Wl,-soname,x` as two unrelated words, and nothing kept its place
+/// relative to the archive it governs.
+#[cfg(target_os = "linux")]
+#[test]
+fn gcc_flags_linker_flags_keep_form_and_position() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_wl_")
+        .tempdir()
+        .expect("tempdir");
+    let p = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+
+    // A member nothing references: only `--whole-archive` brings it in, and
+    // its constructor then sets the exit status main returns.
+    std::fs::write(
+        p("member.c"),
+        "extern int c17_flag;\n__attribute__((constructor)) static void init(void) { c17_flag = 42; }\n",
+    )
+    .unwrap();
+    let r = run_c17(&["-c", "-o", &p("member.o"), &p("member.c")]);
+    assert!(r.success, "{}", r.stderr);
+    let status = std::process::Command::new("ar")
+        .args(["rcs", &p("libmember.a"), &p("member.o")])
+        .status()
+        .expect("ar");
+    assert!(status.success());
+    std::fs::write(
+        p("main.c"),
+        "int c17_flag;\nint main(void) { return c17_flag; }\n",
+    )
+    .unwrap();
+
+    let r = run_c17(&[
+        "-o",
+        &p("whole"),
+        &p("main.c"),
+        "-Wl,--whole-archive",
+        &p("libmember.a"),
+        "-Wl,--no-whole-archive",
+        "-Wl,--as-needed",
+        "-Xlinker",
+        "-z",
+        "-Xlinker",
+        "now",
+    ]);
+    assert!(r.success, "{}", r.stderr);
+    let code = std::process::Command::new(p("whole"))
+        .status()
+        .unwrap()
+        .code();
+    assert_eq!(code, Some(42), "the archive member was not linked whole");
+
+    // Without the flag the member stays out.
+    let r = run_c17(&["-o", &p("plain"), &p("main.c"), &p("libmember.a")]);
+    assert!(r.success, "{}", r.stderr);
+    let code = std::process::Command::new(p("plain"))
+        .status()
+        .unwrap()
+        .code();
+    assert_eq!(code, Some(0));
+
+    // A shared object named through `-Wl,-soname,...`.
+    std::fs::write(p("lib.c"), "int c17_lib(void) { return 7; }\n").unwrap();
+    let r = run_c17(&[
+        "-shared",
+        "-fPIC",
+        "-o",
+        &p("libsoname.so"),
+        "-Wl,-soname,libc17test.so.1",
+        &p("lib.c"),
+    ]);
+    assert!(r.success, "{}", r.stderr);
+    let dynamic = std::process::Command::new("readelf")
+        .args(["-d", &p("libsoname.so")])
+        .output();
+    if let Ok(out) = dynamic {
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("libc17test.so.1"), "{text}");
+    }
+}
+
+/// `-fvisibility=hidden` keeps a shared object's own functions to itself: a
+/// call inside it binds to its own definition even when the executable
+/// exports one of the same name. It was ignored, so the library's symbols
+/// were exported and the call bound, through the PLT, to the executable's --
+/// which is how a CPython extension carrying its own parser ran the
+/// interpreter's instead (test_peg_generator).
+#[cfg(target_os = "linux")]
+#[test]
+fn gcc_flags_fvisibility_hidden_binds_locally() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_vis_")
+        .tempdir()
+        .expect("tempdir");
+    let p = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+    std::fs::write(
+        p("lib.c"),
+        "int helper(void) { return 1; }\n\
+         __attribute__((visibility(\"default\"))) int lib_entry(void) { return helper(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        p("main.c"),
+        "int helper(void) { return 2; }\nint lib_entry(void);\n\
+         int main(void) { return lib_entry() * 10 + helper(); }\n",
+    )
+    .unwrap();
+    let r = run_c17(&[
+        "-shared",
+        "-fPIC",
+        "-fvisibility=hidden",
+        "-o",
+        &p("libvis.so"),
+        &p("lib.c"),
+    ]);
+    assert!(r.success, "{}", r.stderr);
+    let r = run_c17(&[
+        "-rdynamic",
+        "-o",
+        &p("main"),
+        &p("main.c"),
+        &p("libvis.so"),
+        &format!("-Wl,-rpath,{}", dir.path().display()),
+    ]);
+    assert!(r.success, "{}", r.stderr);
+    let code = std::process::Command::new(p("main"))
+        .status()
+        .unwrap()
+        .code();
+    assert_eq!(code, Some(12), "the library called the executable's helper");
+
+    if let Ok(out) = std::process::Command::new("nm")
+        .args(["-D", "--defined-only", &p("libvis.so")])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("lib_entry"), "{text}");
+        assert!(!text.contains("helper"), "{text}");
+    }
+
+    let r = compile_with("vis.c", MAIN, &["-fvisibility=bogus"]);
+    assert!(!r.success);
+    assert!(
+        r.stderr.contains("unrecognized visibility value"),
+        "{}",
+        r.stderr
+    );
+}
+
+/// Under `-fvisibility=hidden` an object keeps the visibility its `extern`
+/// declaration gave it: CPython declares every exported object
+/// `PyAPI_DATA(...)`, `visibility("default")`, and defines it without the
+/// attribute. Without this its extension modules could not find
+/// `PyFloat_Type`.
+#[cfg(target_os = "linux")]
+#[test]
+fn gcc_flags_object_visibility_comes_from_its_declaration() {
+    let (dir, path) = scratch(
+        "objvis.c",
+        "extern __attribute__((visibility(\"default\"))) int pub_obj;\nint pub_obj = 1;\n\
+         int hid_obj = 2;\nint late = 3;\nextern int late __attribute__((visibility(\"default\")));\n",
+    );
+    let asm = dir.path().join("objvis.s");
+    let r = run_c17(&[
+        "-fvisibility=hidden",
+        "-S",
+        "-o",
+        asm.to_str().unwrap(),
+        path.to_str().unwrap(),
+    ]);
+    assert!(r.success, "{}", r.stderr);
+    let text = std::fs::read_to_string(&asm).unwrap();
+    assert!(text.contains(".hidden hid_obj"), "{text}");
+    assert!(!text.contains(".hidden pub_obj"), "{text}");
+    assert!(!text.contains(".hidden late"), "{text}");
+}
+
+/// `-msse3` .. `-msse4.2`, `-mpopcnt` and `-march=x86-64-v2` define the
+/// feature macros gcc's do, each level implying the ones below it -- and
+/// gcc's `-msse4.2` implying POPCNT. Without them, only the SSE2 baseline.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn gcc_flags_x86_simd_levels_define_feature_macros() {
+    let probe = "s3=__SSE3__ ss3=__SSSE3__ s41=__SSE4_1__ s42=__SSE4_2__ pc=__POPCNT__\n";
+    let defined = |flags: &[&str]| {
+        let r = preprocess_text("isa_probe", probe, flags);
+        assert!(r.success, "{}", r.stderr);
+        r.stdout
+    };
+    let none = "s3=__SSE3__ ss3=__SSSE3__ s41=__SSE4_1__ s42=__SSE4_2__ pc=__POPCNT__";
+    assert!(defined(&[]).contains(none));
+    assert!(defined(&["-msse3"]).contains("s3=1 ss3=__SSSE3__"));
+    assert!(defined(&["-msse4.1"]).contains("s3=1 ss3=1 s41=1 s42=__SSE4_2__ pc=__POPCNT__"));
+    let all = "s3=1 ss3=1 s41=1 s42=1 pc=1";
+    assert!(defined(&["-msse4.2"]).contains(all));
+    assert!(defined(&["-march=x86-64-v2"]).contains(all));
+    assert!(defined(&["-mpopcnt"])
+        .contains("s3=__SSE3__ ss3=__SSSE3__ s41=__SSE4_1__ s42=__SSE4_2__ pc=1"));
+}
+
+/// The last `-march=` wins, and `-m`/`-mno-` options apply on top of it
+/// in command-line order wherever they stand -- the macros gcc 13 defines.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn gcc_flags_x86_march_last_wins_and_mno_applies() {
+    let probe = "s3=__SSE3__ ss3=__SSSE3__ s41=__SSE4_1__ s42=__SSE4_2__ pc=__POPCNT__\n";
+    let defined = |flags: &[&str]| {
+        let r = preprocess_text("isa_order_probe", probe, flags);
+        assert!(r.success, "{flags:?}: {}", r.stderr);
+        r.stdout
+    };
+    let none = "s3=__SSE3__ ss3=__SSSE3__ s41=__SSE4_1__ s42=__SSE4_2__ pc=__POPCNT__";
+    let all = "s3=1 ss3=1 s41=1 s42=1 pc=1";
+    let cases: &[(&[&str], &str)] = &[
+        (&["-march=x86-64-v2", "-march=x86-64"], none),
+        (&["-march=x86-64", "-march=x86-64-v2"], all),
+        (&["-march=haswell"], all),
+        (&["-msse4.2", "-march=x86-64"], all),
+        (
+            &["-mno-sse4.2", "-march=x86-64-v2"],
+            "s3=1 ss3=1 s41=1 s42=__SSE4_2__ pc=1",
+        ),
+        (
+            &["-march=x86-64-v2", "-mno-popcnt"],
+            "s3=1 ss3=1 s41=1 s42=1 pc=__POPCNT__",
+        ),
+        (
+            &["-msse4.2", "-mno-sse4.1"],
+            "s3=1 ss3=1 s41=__SSE4_1__ s42=__SSE4_2__ pc=__POPCNT__",
+        ),
+        (&["-mno-sse4.1", "-msse4.2"], all),
+        (&["-msse4.2", "-mno-sse4.2"], none),
+    ];
+    for (flags, want) in cases {
+        let got = defined(flags);
+        assert!(got.contains(want), "{flags:?}: {got}");
+    }
+}

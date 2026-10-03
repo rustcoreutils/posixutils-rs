@@ -220,6 +220,20 @@ dg_scan() {
                 if (match(text, /^[ \t]*(compile|assemble|run|link|preprocess)/)) {
                     dgdo = substr(text, RSTART, RLENGTH)
                     gsub(/[ \t]/, "", dgdo)
+                    # `dg-do compile { target i?86-*-* x86_64-*-* }`: on any
+                    # other target DejaGnu reports the test unsupported, so it
+                    # is not built here either -- its body is another
+                    # target'"'"'s inline assembly. The words are a list, as
+                    # braces make them for `sel_eval`.
+                    sel = substr(text, RSTART + RLENGTH)
+                    if (sel ~ /^[ \t]*\{/) {
+                        sel = first_group(sel)
+                        sel = substr(sel, index(sel, "{") + 1)
+                        sub(/\}[ \t]*$/, "", sel)
+                        if (match(sel, /^[ \t]*target[ \t]/) &&
+                            sel_eval("{ " substr(sel, RLENGTH + 1) " }") == SEL_FALSE)
+                            skip = "dg-do target excludes this target"
+                    }
                 }
             }
             else if (d ~ /dg-skip-if/)   {
@@ -640,35 +654,9 @@ OUT_OF_SCOPE_ISSIGNALING=" ieee/builtin-issignaling-1 \
  ieee/float32-builtin-issignaling-1 ieee/float32x-builtin-issignaling-1 \
  ieee/float64-builtin-issignaling-1 ieee/float64x-builtin-issignaling-1 "
 
-# Vector values. `vector_size` gives a type a vector's storage -- what glibc's
-# `<link.h>` needs -- and cc/DECISIONS.md stops it there: arithmetic, copies,
-# initializers and comparisons of whole vectors, and `__builtin_convertvector`
-# and `__builtin_shuffle`, are the SIMD subsystem it declines. A test that
-# only declares vectors is not listed, and runs.
-OUT_OF_SCOPE_VECTOR_ARITH=" compile/icfmatch compile/pr100305 \
- compile/pr10153-1 compile/pr10153-2 compile/pr104499 compile/pr108237 \
- compile/pr108892 compile/pr111699-1 compile/pr123069 compile/pr124250 \
- compile/pr33614 compile/pr33617 compile/pr34856 compile/pr39928-1 \
- compile/pr52750 compile/pr53410-2 compile/pr53748 compile/pr54713-1 \
- compile/pr54713-2 compile/pr54713-3 compile/pr60502 compile/pr70061 \
- compile/pr70240 compile/pr70355 compile/pr85945 compile/pr90139 \
- compile/pr92618 compile/pr94488 compile/pr96426 compile/pr99225 \
- compile/pr99647 compile/simd-1 compile/simd-2 compile/simd-3 compile/simd-4 \
- compile/simd-5 compile/vector-1 compile/vector-2 compile/vector-3 \
- compile/vector-4 compile/vector-5 compile/vector-6 compile/vector-dup-1 \
- compile/vector-shift-1 execute/20050316-1 execute/20050316-2 \
- execute/20050316-3 execute/20050604-1 execute/20050607-1 execute/20060420-1 \
- execute/pr105613 execute/pr108292 execute/pr109040 execute/pr109938 \
- execute/pr109986 execute/pr110817-1 execute/pr110817-2 execute/pr110817-3 \
- execute/pr121957 execute/pr123625 execute/pr123625-2 execute/pr123625-3 \
- execute/pr123753 execute/pr126405 execute/pr126405-2 execute/pr126405-3 \
- execute/pr23135 execute/pr53645 execute/pr53645-2 execute/pr60960 \
- execute/pr65427 execute/pr70903 execute/pr71626-1 execute/pr71626-2 \
- execute/pr85169 execute/pr85331 execute/pr92618 execute/pr94412 \
- execute/pr94524-1 execute/pr94524-2 execute/pr94591 execute/scal-to-vec1 \
- execute/scal-to-vec2 execute/scal-to-vec3 execute/simd-1 execute/simd-2 \
- execute/simd-4 execute/simd-5 execute/simd-6 ieee/fp-cmp-cond-1 \
- ieee/pr72824-2 "
+# A vector of floating lanes four bytes wide or less at a call boundary,
+# which gcc passes like no type c17 has. Every other vector operation runs.
+OUT_OF_SCOPE_VECTOR_ARITH=" ieee/fp-cmp-cond-1 "
 
 # `__label__`, a block-scope label declaration. cc/DECISIONS.md rules it out
 # together with nested functions, which are what it exists for.
@@ -688,6 +676,12 @@ OUT_OF_SCOPE_LABEL_DIFF=" compile/labels-3 execute/pr70460 "
 # c17 diagnoses it as the constraint it is, and `-fpermissive` relaxes it;
 # the test passes neither.
 C17_CONSTRAINT_GCC_WARNS=" compile/pr38857 "
+
+# aarch64 only: `"s"` and `"i"` operands holding an address, which the test
+# guards with `nonpic`. c17 builds position-independent code by default, as
+# gcc does on these targets, and under it gcc rejects both operands too
+# ("impossible constraint"); x86-64 accepts them either way.
+NEEDS_NONPIC_AARCH64=" compile/pr27528 "
 
 # A local array of 2 GiB to 1 TiB. This is a gap in c17, not a decision: an
 # automatic object past `MAX_STACK_OBJECT_BYTES` is refused with a diagnostic,
@@ -802,6 +796,11 @@ run_one() {
     case "$NEEDS_64BIT_FRAMES" in
         *" $key "*) echo "SKIP	$tag	needs 64-bit frames"; return;;
     esac
+    if [ "$TORTURE_TARGET" = aarch64 ]; then
+        case "$NEEDS_NONPIC_AARCH64" in
+            *" $key "*) echo "SKIP	$tag	needs non-PIC code on aarch64"; return;;
+        esac
+    fi
     local scan skip flags mult stack dgdo errlines
     scan=$(dg_scan "$src" "$opt")
     skip=${scan%%|*}; scan=${scan#*|}
@@ -1033,7 +1032,7 @@ export OUT_OF_SCOPE_GCC_BEHAVIOUR OUT_OF_SCOPE_GCC_INTERNAL
 export OUT_OF_SCOPE_GNU89_INLINE OUT_OF_SCOPE_OTHER_TARGET
 export NEEDS_PRE_C99_DIALECT OUT_OF_SCOPE_ISSIGNALING
 export OUT_OF_SCOPE_GCC_INTERNAL_BUILTIN NEEDS_64BIT_FRAMES
-export OUT_OF_SCOPE_VECTOR_ARITH OUT_OF_SCOPE_LOCAL_LABELS OUT_OF_SCOPE_LABEL_DIFF C17_CONSTRAINT_GCC_WARNS
+export NEEDS_NONPIC_AARCH64 OUT_OF_SCOPE_VECTOR_ARITH OUT_OF_SCOPE_LOCAL_LABELS OUT_OF_SCOPE_LABEL_DIFF C17_CONSTRAINT_GCC_WARNS
 
 # ------------------------------------------------------------- collect tests
 # Each line is `<sub-suite>:<path>`, so a worker knows which sub-suite it is in

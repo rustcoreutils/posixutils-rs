@@ -16,11 +16,12 @@ pub fn get_macros() -> Vec<(&'static str, Option<String>)> {
         // ELF adds no prefix to a C identifier.
         ("__USER_LABEL_PREFIX__", Some("".into())),
         ("__FreeBSD__", Some("13".into())), // Conservative version
-        ("__FreeBSD_kernel__", Some("1".into())),
         // ELF binary format
         ("__ELF__", Some("1".into())),
-        // BSD visibility. (`BSD` itself is <sys/param.h>'s, not a predefine.)
-        ("__BSD_VISIBLE", Some("1".into())),
+        // Not `__FreeBSD_kernel__`, which names a FreeBSD kernel under a GNU
+        // userland (GNU/kFreeBSD), nor `__BSD_VISIBLE`, which <sys/cdefs.h>
+        // computes from the feature-test macros a program defines -- as the
+        // system compiler leaves it to.
         // POSIX threads
         ("_REENTRANT", Some("1".into())),
     ]

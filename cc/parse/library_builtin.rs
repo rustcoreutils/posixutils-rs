@@ -27,7 +27,7 @@ use crate::kw;
 use crate::strings::StringId;
 use crate::symbol::SymbolId;
 use crate::token::lexer::Position;
-use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::types::{FloatClass, TypeId, TypeKind, TypeTable};
 
 /// What the command line says about evaluating library calls in place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +121,12 @@ pub(super) enum ProtoType {
     Float16,
     /// `_Float128`, where the target has it.
     Float128,
+    /// `_Float32`, `_Float64`, `_Float32x` and `_Float64x`: distinct from
+    /// the standard types that share their formats.
+    Float32,
+    Float64,
+    Float32x,
+    Float64x,
     ComplexFloat,
     ComplexDouble,
     ComplexLongDouble,
@@ -163,6 +169,10 @@ impl ProtoType {
             ProtoType::LongDouble => t.longdouble_id,
             ProtoType::Float16 => t.float16_id,
             ProtoType::Float128 => t.float128_id,
+            ProtoType::Float32 => t.floating(TypeKind::Float, FloatClass::Interchange),
+            ProtoType::Float64 => t.floating(TypeKind::Double, FloatClass::Interchange),
+            ProtoType::Float32x => t.floating(TypeKind::Double, FloatClass::Extended),
+            ProtoType::Float64x => t.floating(TypeKind::LongDouble, FloatClass::Extended),
             ProtoType::ComplexFloat => t.complex_float_id,
             ProtoType::ComplexDouble => t.complex_double_id,
             ProtoType::ComplexLongDouble => t.complex_longdouble_id,
@@ -323,6 +333,18 @@ static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
         entry(kw::COPYSIGN,   kw::BUILTIN_COPYSIGN,    Double,            &[Double, Double],                F::CopySign),
         entry(kw::COPYSIGNF,  kw::BUILTIN_COPYSIGNF,   Float,             &[Float, Float],                  F::CopySign),
         entry(kw::COPYSIGNL,  kw::BUILTIN_COPYSIGNL,   LongDouble,        &[LongDouble, LongDouble],        F::CopySign),
+        entry(kw::FABSF32,    kw::BUILTIN_FABSF32,     Float32,           &[Float32],                       F::Fabs),
+        entry(kw::FABSF64,    kw::BUILTIN_FABSF64,     Float64,           &[Float64],                       F::Fabs),
+        entry(kw::FABSF32X,   kw::BUILTIN_FABSF32X,    Float32x,          &[Float32x],                      F::Fabs),
+        entry(kw::FABSF64X,   kw::BUILTIN_FABSF64X,    Float64x,          &[Float64x],                      F::Fabs),
+        entry(kw::FABSF128,   kw::BUILTIN_FABSF128,    Float128,          &[Float128],                      F::Fabs),
+        entry(kw::FABSQ,      kw::BUILTIN_FABSQ,       Float128,          &[Float128],                      F::Fabs),
+        entry(kw::COPYSIGNF32,  kw::BUILTIN_COPYSIGNF32,  Float32,        &[Float32, Float32],              F::CopySign),
+        entry(kw::COPYSIGNF64,  kw::BUILTIN_COPYSIGNF64,  Float64,        &[Float64, Float64],              F::CopySign),
+        entry(kw::COPYSIGNF32X, kw::BUILTIN_COPYSIGNF32X, Float32x,       &[Float32x, Float32x],            F::CopySign),
+        entry(kw::COPYSIGNF64X, kw::BUILTIN_COPYSIGNF64X, Float64x,       &[Float64x, Float64x],            F::CopySign),
+        entry(kw::COPYSIGNF128, kw::BUILTIN_COPYSIGNF128, Float128,       &[Float128, Float128],            F::CopySign),
+        entry(kw::COPYSIGNQ,    kw::BUILTIN_COPYSIGNQ,    Float128,       &[Float128, Float128],            F::CopySign),
         entry(kw::SQRT,       kw::BUILTIN_SQRT,        Double,            &[Double],                        SQRT),
         entry(kw::SQRTF,      kw::BUILTIN_SQRTF,       Float,             &[Float],                         SQRT),
         entry(kw::SQRTL,      kw::BUILTIN_SQRTL,       LongDouble,        &[LongDouble],                    SQRT),
@@ -456,6 +478,9 @@ static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
         plain(kw::LOG1PF,           Float,             &[Float],                 FIXED),
         plain(kw::LOG1PL,           LongDouble,        &[LongDouble],            FIXED),
         plain(kw::LOGB,             Double,            &[Double],                FIXED),
+        plain(kw::ILOGB,            Int,               &[Double],                FIXED),
+        plain(kw::ILOGBF,           Int,               &[Float],                 FIXED),
+        plain(kw::ILOGBL,           Int,               &[LongDouble],            FIXED),
         plain(kw::LOGBF,            Float,             &[Float],                 FIXED),
         plain(kw::LOGBL,            LongDouble,        &[LongDouble],            FIXED),
         plain(kw::TGAMMA,           Double,            &[Double],                FIXED),
@@ -513,9 +538,13 @@ static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
         plain(kw::NANF,             Float,             &[ConstCharPtr],          FIXED),
         plain(kw::NANL,             LongDouble,        &[ConstCharPtr],          FIXED),
         plain(kw::NANF16,           Float16,           &[ConstCharPtr],          FIXED),
-        plain(kw::NANF32,           Float,             &[ConstCharPtr],          FIXED),
-        plain(kw::NANF64,           Double,            &[ConstCharPtr],          FIXED),
+        plain(kw::NANF32,           Float32,           &[ConstCharPtr],          FIXED),
+        plain(kw::NANF64,           Float64,           &[ConstCharPtr],          FIXED),
+        plain(kw::NANF32X,          Float32x,          &[ConstCharPtr],          FIXED),
+        plain(kw::NANF64X,          Float64x,          &[ConstCharPtr],          FIXED),
         plain(kw::NANF128,          Float128,          &[ConstCharPtr],          FIXED),
+        plain(kw::SQRTF128,         Float128,          &[Float128],              FIXED),
+        plain(kw::FMAF128,          Float128,          &[Float128, Float128, Float128], FIXED),
         plain(kw::MEMCPY_CHK,       VoidPtr,           &[VoidPtr, ConstVoidPtr, SizeT, SizeT], FIXED),
         plain(kw::MEMMOVE_CHK,      VoidPtr,           &[VoidPtr, ConstVoidPtr, SizeT, SizeT], FIXED),
         plain(kw::MEMPCPY_CHK,      VoidPtr,           &[VoidPtr, ConstVoidPtr, SizeT, SizeT], FIXED),

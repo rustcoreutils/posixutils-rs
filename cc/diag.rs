@@ -10,10 +10,10 @@
 //
 
 use gettextrs::{gettext, gettext_args, ngettext_args};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // Source Position
 
@@ -214,6 +214,11 @@ pub fn find_or_add_stream(name: &str) -> u16 {
 }
 
 /// Mark a stream as a system header, silencing its warnings.
+/// Whether stream `id` is a system header's, whose warnings are not shown.
+pub fn stream_is_system(id: u16) -> bool {
+    STREAMS.with(|s| s.borrow().is_system(id))
+}
+
 pub fn set_stream_system(id: u16, is_system: bool) {
     STREAMS.with(|s| s.borrow_mut().set_system(id, is_system));
 }
@@ -271,10 +276,15 @@ pub fn get_all_stream_names() -> Vec<String> {
 /// Error phase flag
 pub const ERROR_CURR_PHASE: u32 = 1;
 
-// Global error state
-static HAS_ERROR: AtomicU32 = AtomicU32::new(0);
-static ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
-static WARNING_COUNT: AtomicU32 = AtomicU32::new(0);
+// Error state
+// Per thread: the compiler runs on one thread of its own, and a unit test's
+// translation unit on one of the test harness's, where a count shared with
+// every concurrent test made "did this report an error" unanswerable.
+thread_local! {
+    static HAS_ERROR: Cell<u32> = const { Cell::new(0) };
+    static ERROR_COUNT: Cell<u32> = const { Cell::new(0) };
+    static WARNING_COUNT: Cell<u32> = const { Cell::new(0) };
+}
 
 /// Set by `-w`: warnings are counted but not printed.
 ///
@@ -350,11 +360,11 @@ pub fn permissive_error(pos: Position, msg: &str) {
 }
 
 pub fn has_error() -> u32 {
-    HAS_ERROR.load(Ordering::Relaxed)
+    HAS_ERROR.get()
 }
 
 fn set_error(flag: u32) {
-    HAS_ERROR.fetch_or(flag, Ordering::Relaxed);
+    HAS_ERROR.set(HAS_ERROR.get() | flag);
 }
 
 /// How many errors have been reported so far.
@@ -365,12 +375,12 @@ fn set_error(flag: u32) {
 /// fallible step -- preprocessing a single operand, say -- snapshots this
 /// before and compares after.
 pub fn error_count() -> u32 {
-    ERROR_COUNT.load(Ordering::Relaxed)
+    ERROR_COUNT.get()
 }
 
 #[cfg(test)]
 pub fn warning_count() -> u32 {
-    WARNING_COUNT.load(Ordering::Relaxed)
+    WARNING_COUNT.get()
 }
 
 /// Reset error/warning counts.
@@ -380,9 +390,9 @@ pub fn warning_count() -> u32 {
 /// translation units — otherwise the first file's errors make every later file
 /// look like it failed too.
 pub fn reset_counts() {
-    ERROR_COUNT.store(0, Ordering::Relaxed);
-    WARNING_COUNT.store(0, Ordering::Relaxed);
-    HAS_ERROR.store(0, Ordering::Relaxed);
+    ERROR_COUNT.set(0);
+    WARNING_COUNT.set(0);
+    HAS_ERROR.set(0);
 }
 
 // Diagnostic Output
@@ -446,11 +456,11 @@ fn do_diag(level: DiagLevel, pos: Position, msg: &str) {
     // Track errors/warnings
     match level {
         DiagLevel::Error => {
-            ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
+            ERROR_COUNT.set(ERROR_COUNT.get() + 1);
             set_error(ERROR_CURR_PHASE);
         }
         DiagLevel::Warning => {
-            WARNING_COUNT.fetch_add(1, Ordering::Relaxed);
+            WARNING_COUNT.set(WARNING_COUNT.get() + 1);
             if warnings_suppressed() {
                 return;
             }

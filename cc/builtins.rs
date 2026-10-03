@@ -164,6 +164,9 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_log1pf",
     "__builtin_log1pl",
     "__builtin_logb",
+    "__builtin_ilogb",
+    "__builtin_ilogbf",
+    "__builtin_ilogbl",
     "__builtin_logbf",
     "__builtin_logbl",
     "__builtin_tgamma",
@@ -302,6 +305,10 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_huge_valf32",
     "__builtin_huge_valf64",
     "__builtin_huge_valf128",
+    "__builtin_inff32x",
+    "__builtin_inff64x",
+    "__builtin_huge_valf32x",
+    "__builtin_huge_valf64x",
     // Floating-point math
     "__builtin_fabs",
     "__builtin_fabsf",
@@ -377,6 +384,10 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_signbitl",
     // Complex construction, used by <complex.h> for I and the CMPLX macros
     "__builtin_complex",
+    // GNU vectors
+    "__builtin_shuffle",
+    "__builtin_shufflevector",
+    "__builtin_convertvector",
     // NaN constants
     "__builtin_nan",
     "__builtin_nanf",
@@ -392,8 +403,42 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_nansf32",
     "__builtin_nansf64",
     "__builtin_nansf128",
+    "__builtin_nanf32x",
+    "__builtin_nanf64x",
+    "__builtin_nansf32x",
+    "__builtin_nansf64x",
+    // gcc's `q` (`__float128`) and the `_FloatN` magnitude and sign builtins
+    "__builtin_infq",
+    "__builtin_huge_valq",
+    "__builtin_nanq",
+    "__builtin_nansq",
+    "__builtin_fabsf32",
+    "__builtin_fabsf64",
+    "__builtin_fabsf128",
+    "__builtin_fabsq",
+    "__builtin_copysignf32",
+    "__builtin_copysignf64",
+    "__builtin_copysignf128",
+    "__builtin_copysignq",
+    "__builtin_fabsf32x",
+    "__builtin_fabsf64x",
+    "__builtin_copysignf32x",
+    "__builtin_copysignf64x",
+    "__builtin_sqrtf128",
+    "__builtin_fmaf128",
+    // Position of the call
+    "__builtin_FILE",
+    "__builtin_LINE",
+    "__builtin_FUNCTION",
+    // x86-64 CPU detection
+    "__builtin_cpu_init",
+    "__builtin_cpu_supports",
+    "__builtin_cpu_is",
+    // Object size, with run-time answers allowed (c17 gives static ones)
+    "__builtin_dynamic_object_size",
     // Branch prediction
     "__builtin_expect",
+    "__builtin_expect_with_probability",
     // Pointer alignment hints
     "__builtin_assume_aligned",
     // Cache/memory prefetch
@@ -503,8 +548,24 @@ pub fn is_builtin(name: &str) -> bool {
 /// its siblings) need that type, which macOS does not have, and the
 /// Microsoft `va_list` builtins exist only on x86-64.
 pub fn available_on(name: &str, target: &crate::target::Target) -> bool {
-    (crate::arch::has_float128(target) || !name.ends_with("f128"))
+    (crate::arch::has_float128(target) || !needs_float128(name))
+        && (crate::arch::has_float64x(target) || !name.ends_with("f64x"))
         && crate::kw::spelling_exists_on(name, target.arch)
+}
+
+/// Whether builtin `name` computes in `_Float128`: its `f128` forms, and
+/// gcc's `q` forms for `__float128`.
+fn needs_float128(name: &str) -> bool {
+    name.ends_with("f128")
+        || matches!(
+            name,
+            "__builtin_infq"
+                | "__builtin_huge_valq"
+                | "__builtin_nanq"
+                | "__builtin_nansq"
+                | "__builtin_fabsq"
+                | "__builtin_copysignq"
+        )
 }
 
 /// Check if a StringId is a supported builtin function (O(1) via tag lookup).
@@ -536,12 +597,35 @@ mod tests {
             "__builtin_inff128",
             "__builtin_nansf128",
             "__builtin_huge_valf128",
+            "__builtin_fabsf128",
+            "__builtin_nanq",
+            "__builtin_copysignq",
         ] {
             assert!(is_builtin(name), "{name}");
             assert!(available_on(name, &linux), "{name}");
             assert!(!available_on(name, &macos), "{name}");
         }
         assert!(available_on("__builtin_nanf16", &macos));
+    }
+
+    /// `_Float64x` needs a format wider than `double`, which Apple's aarch64
+    /// lacks; `_Float32x` is `double`'s and exists everywhere.
+    #[test]
+    fn test_float64x_builtins_need_the_type() {
+        use crate::target::{Arch, Os, Target};
+        let linux = Target::new(Arch::Aarch64, Os::Linux);
+        let macos = Target::new(Arch::Aarch64, Os::MacOS);
+        for name in [
+            "__builtin_inff64x",
+            "__builtin_nansf64x",
+            "__builtin_fabsf64x",
+            "__builtin_copysignf64x",
+        ] {
+            assert!(is_builtin(name), "{name}");
+            assert!(available_on(name, &linux), "{name}");
+            assert!(!available_on(name, &macos), "{name}");
+        }
+        assert!(available_on("__builtin_huge_valf32x", &macos));
     }
 
     /// Verify every SUPPORTED_BUILTINS entry has the BUILTIN tag in kw.rs,

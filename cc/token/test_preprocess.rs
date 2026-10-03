@@ -2016,3 +2016,114 @@ fn test_has_builtin_float128_constants_follow_the_target() {
         assert_eq!(get_token_strings(&tokens, &idents), want, "{os:?}");
     }
 }
+
+/// Whatever a directive or `_Pragma` at the end of the file leaves unfinished,
+/// the end of the stream survives preprocessing: the parser stops there, and
+/// one that never saw it looped allocating without bound.
+#[test]
+fn test_stream_end_survives_unfinished_constructs() {
+    for src in [
+        "int x;\n#define X \\\n",
+        "int x;\n#undef X \\",
+        "int x;\n#error e \\\n",
+        "int x;\n_Pragma",
+        "int x;\n_Pragma(",
+        "int x;\n_Pragma(\"once\"",
+    ] {
+        let (tokens, _) = preprocess_str(src);
+        assert!(
+            tokens.iter().any(|t| t.typ == TokenType::StreamEnd),
+            "{src:?}: the end of the stream was consumed"
+        );
+    }
+}
+
+/// A malformed `_Pragma` operand is gcc's error and consumes nothing that is
+/// not part of the operator.
+#[test]
+fn test_malformed_pragma_operator_keeps_following_tokens() {
+    let before = crate::diag::error_count();
+    let (tokens, idents) = preprocess_str("_Pragma(x) int y;");
+    assert!(crate::diag::error_count() > before);
+    assert_eq!(
+        get_token_strings(&tokens, &idents),
+        ["x", ")", "int", "y", ";"]
+    );
+}
+
+/// `#__VA_ARGS__` keeps the spacing of the commas that separated the
+/// variadic arguments (C17 6.10.3.1p2), and a `##` result keeps its left
+/// operand's spacing.
+#[test]
+fn test_stringify_and_paste_spacing() {
+    let (tokens, idents) = preprocess_str(
+        "#define H(...) #__VA_ARGS__\n#define S(x) #x\n#define F(n) S(a[b##n])\nH(a , b) F(1)",
+    );
+    assert_eq!(
+        get_token_strings(&tokens, &idents),
+        ["\"a , b\"", "\"a[b1]\""]
+    );
+}
+
+/// `#if` evaluates only the arm of `?:` it takes, and converts both arms to
+/// their common type (C17 6.5.15p4-5).
+#[test]
+fn test_if_conditional_operator() {
+    let (tokens, idents) = preprocess_str(
+        "#if 1 ? 2 : (1/0)\nA\n#endif\n#if (1 ? -1 : 0u) > 0\nB\n#endif\n#if 0 ? -1 : 0u\nC\n#endif\n",
+    );
+    assert_eq!(get_token_strings(&tokens, &idents), ["A", "B"]);
+}
+
+/// `__PIC__`/`__pic__` and `__PIE__`/`__pie__` describe the position
+/// independence the code is generated with.
+#[test]
+fn test_pic_macros_follow_the_configuration() {
+    let expand = |pic: bool, pie: bool, target: &Target| {
+        let config = PreprocessConfig {
+            position: crate::target::PositionIndependence { pic, pie },
+            isa: Default::default(),
+            ..Default::default()
+        };
+        let mut idents = IdentTable::new();
+        let tokens = Tokenizer::new(b"__PIC__ __pic__ __PIE__ __pie__", 0, &mut idents).tokenize();
+        let (out, _) = preprocess_collecting(tokens, target, &mut idents, "<test>", &config);
+        get_token_strings(&out, &idents)
+    };
+    let linux = Target::from_triple("x86_64-unknown-linux-gnu").unwrap();
+    assert_eq!(expand(true, true, &linux), ["2", "2", "2", "2"]);
+    assert_eq!(
+        expand(true, false, &linux),
+        ["2", "2", "__PIE__", "__pie__"]
+    );
+    assert_eq!(
+        expand(false, false, &linux),
+        ["__PIC__", "__pic__", "__PIE__", "__pie__"]
+    );
+    // Mach-O code is position independent whatever was asked.
+    let darwin = Target::from_triple("aarch64-apple-darwin").unwrap();
+    assert_eq!(
+        expand(false, false, &darwin),
+        ["2", "2", "__PIE__", "__pie__"]
+    );
+}
+
+/// `#line` maps the positions of the tokens after it -- what diagnostics and
+/// debug info read -- the same way a `# N "file"` linemarker does, and the
+/// mapping of a file survives an `#include` in it.
+#[test]
+fn test_line_directive_maps_token_positions() {
+    let (tokens, idents) =
+        preprocess_str("#line 77 \"renamed.c\"\nint b = __LINE__;\n#line 5\nint c = __LINE__;\n");
+    let strings = get_token_strings(&tokens, &idents);
+    assert_eq!(
+        strings,
+        ["int", "b", "=", "77", ";", "int", "c", "=", "5", ";"]
+    );
+    let b = tokens
+        .iter()
+        .find(|t| matches!(&t.value, TokenValue::Ident(id) if idents.get_opt(*id) == Some("b")))
+        .expect("b");
+    assert_eq!(b.pos.line, 77);
+    assert_eq!(crate::diag::stream_name(b.pos.stream), "renamed.c");
+}

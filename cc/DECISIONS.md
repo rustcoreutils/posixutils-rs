@@ -135,6 +135,7 @@ themselves. No torture test depends on it.
 | `_FORTIFY_SOURCE` | Compiles the wrappers and emits `__*_chk` calls, but checks nothing; see the settled entry above |
 | Identifier characters U+FD3E, U+FD3F | Rejected here; GCC's binary accepts them. Ornate parentheses, which C17 Annex D excludes between its F900-FD3D and FD40-FDCF ranges -- GCC's own `ucnid.tab` does not list them and Clang's table does not either, so the table is followed rather than the binary |
 | Darwin: an over-aligned variadic aggregate | clang disagrees with itself, so no compiler satisfies this in both directions. Measured on macOS CI: its caller stacks the aggregate at the next eight-byte granule and its `va_arg` rounds the cursor up to the type's own alignment, reading somewhere else. A program built entirely with clang has the same defect. c17 follows `va_arg` -- its caller realigns the outgoing area so the argument really is that aligned -- which means a c17 caller reaches a clang callee and a clang caller does not reach a c17 callee. `codegen_over_aligned_argument_area` therefore does not put this shape through its host-compiler cross-check on Apple; the pure-c17 runs still cover it at every optimization level |
+| Feature-test macros are predefined | On Linux c17 predefines `_GNU_SOURCE`, `_DEFAULT_SOURCE`, `_XOPEN_SOURCE` (800) and `_XOPEN_SOURCE_EXTENDED`, plus `_REENTRANT` (and `_DARWIN_C_SOURCE` on macOS); gcc predefines none of them. The whole GNU and XSI namespace is therefore visible to every program: a program's own `getline`, `index`, `random` or `qsort_r` can conflict with the header's, and glibc 2.38 and later binds `strtol`, `strtoll` and the `scanf` family to their C2X forms, which also accept a `0b` prefix. Kept because a great deal of code assumes the GNU declarations are visible without asking. `-U_GNU_SOURCE` (and the others) withdraws them |
 | `max_align_t` | `long double` here (`<stddef.h>`: size 16, alignment 16); gcc's is a struct of `long long` and `long double` (size 32, alignment 16), on x86-64 and aarch64 alike. The alignment, which is what C17 7.19p2 specifies, agrees; `sizeof`, and the layout of any struct holding one, differ |
 
 ## GNU extensions: what c17 will and will not grow
@@ -154,7 +155,7 @@ the project's own filter before earning a verdict:
 
 | Extension | Verdict | Why |
 |---|---|---|
-| SIMD intrinsic headers | **No headers.** The predefines are disputed | `<emmintrin.h>`, `<arm_neon.h>` and the rest are not shipped. The code keeps `__SSE__`/`__SSE2__`/`__MMX__` and `__ARM_NEON` defined, as "Which macros may be withdrawn" argues; "SIMD headers" below argues for withdrawing them. The two have not been reconciled |
+| SIMD intrinsic headers | **SSE through SSE4.2, and core NEON** | Bundled and written in C over GNU vectors; see "SIMD headers" below. The AVX families are not |
 | `__auto_type` | **No** | Not in glibc's headers or CPython; `__typeof__`, which c17 has, does the same job in the macros that use it |
 | nested functions / `__label__` | **Never** | GCC-only, Clang refuses nested functions, so portable code already avoids them; they need executable-stack trampolines. See the c-torture section |
 | VLA as a struct member | **No** | GCC-only (Clang refuses it); needs struct layout computed at run time and `offsetof` through it |
@@ -166,34 +167,18 @@ scope unless a real corpus forces the question. The c-torture harness skips
 such tests with a named reason rather than counting them as failures -- what
 is left failing is then a list of defects, not a list of decisions.
 
-### SIMD headers — the case for withdrawing the predefines
+### SIMD headers
 
 On x86-64 c17 predefines `__SSE__`, `__SSE2__`, `__MMX__`, `__SSE_MATH__` and
 `__SSE2_MATH__`, matching GCC's x86-64 default; on aarch64 it predefines
-`__ARM_NEON`. GCC defines those *and* ships the intrinsic headers; c17 defines
-them and does not. So a project's `#ifdef __SSE2__` guard opens the door to a
-header that isn't there, when the same file's `#else` branch would have
-compiled:
-
-```c
-#ifdef __SSE2__
-#include <emmintrin.h>      /* c17: 'emmintrin.h': file not found */
-#else
-... portable fallback ...   /* builds clean; -U__SSE2__ proves it */
-#endif
-```
-
-The choice is to bundle the intrinsic headers — thousands of functions, plus
-element-wise vector arithmetic in the IR and both backends — or to stop
-claiming the capability. The second is a few lines in the predefines and costs
-those projects only the speed of their own fallback path. This section's
-position is that advertising what c17 cannot deliver is the defect, and that
-adding SIMD to make the advertisement true would be the tail wagging the dog.
-It is not what the code does: see the next section.
-
-Vector *arithmetic* is the related non-goal. `vector_size` gives a type a
-vector's storage, which is what makes glibc's `<link.h>` compile, and that is
-deliberately where it stops.
+`__ARM_NEON`. The intrinsic headers those macros lead a project to are
+bundled: `<mmintrin.h>` through `<nmmintrin.h>` (SSE4.2), `<immintrin.h>`,
+`<x86intrin.h>` and `<mm_malloc.h>` on x86-64, and a core `<arm_neon.h>` on
+aarch64. They are written in C over GNU vectors and checked against gcc on
+the hardware, so every function is available whatever the `-m` flags; only
+the feature macros (`__SSE4_1__` and the rest) follow `-msse3` .. `-msse4.2`,
+`-mpopcnt` and `-march=x86-64-v2`. The AVX families are not bundled, and no
+flag claims them.
 
 ### Which macros may be withdrawn, and which may not
 
@@ -209,13 +194,10 @@ The distinction is what the macro is a statement *about*:
   mandatory in the AArch64 base architecture. c17 defines both, and the code
   follows this section.
 
-Code that writes `#ifdef __SSE2__` around `#include <emmintrin.h>` is treating
-a target fact as though it implied a compiler fact. That inference holds for
-gcc and clang because they ship the intrinsic headers; c17 does not, so such a
-file fails on the missing header. This section's position is that the gap is
-the header, not the macro: withdrawing the macro would not make the header
-appear, and would also change code that tests `__SSE2__` without reaching
-for an intrinsic.
+Code that writes `#ifdef __SSE2__` around `#include <emmintrin.h>` treats a
+target fact as implying a compiler fact. That inference holds for gcc and
+clang because they ship the intrinsic headers, and for c17 because it ships
+them too (see "SIMD headers").
 
 `__ARM_NEON__` is not defined on aarch64: it is the AArch32 spelling, and gcc
 does not define it there.
@@ -246,7 +228,7 @@ different test in `execute/` that passes.
 | Another target's backend | `OUT_OF_SCOPE_OTHER_TARGET` | `mipscop-1`..`-4` |
 | `__builtin_issignaling` | `OUT_OF_SCOPE_ISSIGNALING` | No system header uses the builtin (`<math.h>`'s `issignaling` is its own macro), and seven of the nine tests need a format c17 does not have (`_Float128`, `_Float64x`, `bfloat16`) |
 | Pre-C99 implicit `int` with no dialect request | `NEEDS_PRE_C99_DIALECT` | `compile/pr29201`. C17 6.7.2p2 requires a type specifier and GCC 14 made it an error too. A test that asks for `-fpermissive` passes; one that asks for `-std=gnu89` passes because the harness translates that to `-fpermissive` -- c17 itself ignores `-std=gnu89` |
-| Vector values | `OUT_OF_SCOPE_VECTOR_ARITH` | Arithmetic, copies, initializers and comparisons of whole vectors, `__builtin_convertvector`, `__builtin_shuffle`. `vector_size` gives storage only (see above), and a test that only declares vectors runs |
+| Vector values | `OUT_OF_SCOPE_VECTOR_ARITH` | A vector of floating lanes four bytes wide or less at a call boundary, which gcc passes like no type c17 has. Every other vector operation runs |
 | `__label__` | `OUT_OF_SCOPE_LOCAL_LABELS` | Block-scope label declarations, ruled out with nested functions |
 | Label difference as a constant | `OUT_OF_SCOPE_LABEL_DIFF` | `&&a - &&b` in a static initializer. Labels as values are supported; the difference needs a symbol-difference relocation |
 | A C17 constraint gcc only warns about | `C17_CONSTRAINT_GCC_WARNS` | `compile/pr38857`: 6.7.4p3, an external inline definition referring to a static. `-fpermissive` relaxes it |

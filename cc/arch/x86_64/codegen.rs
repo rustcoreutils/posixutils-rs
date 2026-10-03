@@ -1502,10 +1502,12 @@ impl crate::arch::AsmOperandFormatter for X86_64CodeGen {
     type Reg = Reg;
 
     /// gcc's x86 operand modifiers, those real code uses: the register widths
-    /// `b`/`w`/`k`/`q` and the high byte `h`; `c` and `P`, a constant without
-    /// its `$`; `a`, an operand as an address; `V`, a register without its
-    /// `%`. A width or `P` leaves anything that is not a general register as
-    /// a bare `%0` prints it, as gcc does.
+    /// `b`/`w`/`k`/`q` and the high byte `h`; `c`, `P` and `p`, a constant or
+    /// symbol without its `$`; `a`, an operand as an address; `V`, a register
+    /// without its `%`; `z`, the instruction suffix for the operand's size
+    /// (`mov%z0`); and `x`/`t`/`g`, a vector register named as its XMM, YMM
+    /// or ZMM form. A width or `P` leaves anything that is not a general
+    /// register as a bare `%0` prints it, as gcc does.
     fn format_operand(
         &self,
         slot: &AsmOperandSlot<Reg>,
@@ -1525,8 +1527,31 @@ impl crate::arch::AsmOperandFormatter for X86_64CodeGen {
                 // rejects it.
                 _ => format!("%{}h", self.reg_name_64(*r)),
             },
-            (Some('P'), V::Int(v)) => v.to_string(),
-            (Some('P'), V::Symbol(sym)) => sym.clone(),
+            (Some('P' | 'p'), V::Int(v)) => v.to_string(),
+            (Some('P' | 'p'), V::Symbol(sym)) => sym.clone(),
+            (Some('z'), _) => match slot.size {
+                8 => "b",
+                16 => "w",
+                32 => "l",
+                64 => "q",
+                _ => return Err(AsmModifierError::Inapplicable),
+            }
+            .to_string(),
+            (Some(m @ ('x' | 't' | 'g')), V::RegName(text)) => {
+                let width = match m {
+                    'x' => "xmm",
+                    't' => "ymm",
+                    _ => "zmm",
+                };
+                match ["%xmm", "%ymm", "%zmm"]
+                    .iter()
+                    .find_map(|prefix| text.strip_prefix(prefix))
+                {
+                    Some(number) => format!("%{width}{number}"),
+                    None => return Err(AsmModifierError::Inapplicable),
+                }
+            }
+            (Some('x' | 't' | 'g'), _) => return Err(AsmModifierError::Inapplicable),
             (Some('a'), V::Reg(r)) => format!("(%{})", self.reg_name_64(*r)),
             (Some('a'), V::Int(v)) => v.to_string(),
             (Some('a'), V::Symbol(sym)) => format!("{sym}(%rip)"),
@@ -1534,7 +1559,7 @@ impl crate::arch::AsmOperandFormatter for X86_64CodeGen {
             (Some('a'), _) | (Some('V'), V::RegName(_)) => {
                 return Err(AsmModifierError::Inapplicable)
             }
-            (None | Some('b' | 'w' | 'k' | 'q' | 'h' | 'P' | 'V'), value) => match value {
+            (None | Some('b' | 'w' | 'k' | 'q' | 'h' | 'P' | 'p' | 'V'), value) => match value {
                 V::Reg(r) => format!("%{}", self.asm_default_reg(*r, slot.size)),
                 V::RegName(text) | V::Mem(text) => text.clone(),
                 V::Int(v) => format!("${v}"),

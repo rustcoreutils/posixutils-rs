@@ -21,7 +21,7 @@ use crate::float::{FloatVal, NanKind};
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId};
 use crate::token::lexer::Position;
-use crate::types::{Type, TypeId, TypeKind};
+use crate::types::{FloatClass, Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
 
 /// A statically known object, and where inside it a pointer points.
@@ -672,6 +672,78 @@ impl Parser<'_> {
                     pos,
                 ))
             })()),
+            // `__builtin_expect_with_probability(expr, c, p)`: the hint with a
+            // probability, which has to be a constant in [0, 1]. Its value is
+            // `expr`, as for `__builtin_expect`.
+            crate::kw::BUILTIN_EXPECT_WITH_PROBABILITY => Some((|| {
+                self.expect_special(b'(')?;
+                let expr = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let expected = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let probability = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                let in_range = crate::constexpr::eval_float(
+                    &*self,
+                    crate::constexpr::ConstScope::Standard,
+                    &probability,
+                )
+                .map(|v| v.to_f64())
+                .is_some_and(|p| (0.0..=1.0).contains(&p));
+                if !in_range {
+                    diag::error(
+                        probability.pos,
+                        &gettext("probability must be a constant floating-point expression between 0 and 1"),
+                    );
+                }
+                if Self::is_literal_constant(&expected) {
+                    return Ok(expr);
+                }
+                let typ = expr.typ.unwrap_or(self.types.int_id);
+                let pos = expr.pos;
+                Ok(Self::typed_expr(
+                    ExprKind::Comma(vec![expected, expr]),
+                    typ,
+                    pos,
+                ))
+            })()),
+            // Where the call is written, as gcc answers them in C: the
+            // presumed file name and line (after `#line`), and the enclosing
+            // function's name, or "" outside one.
+            crate::kw::BUILTIN_FILE | crate::kw::BUILTIN_FUNCTION => Some((|| {
+                self.expect_special(b'(')?;
+                self.expect_special(b')')?;
+                let text = if name_id == crate::kw::BUILTIN_FILE {
+                    diag::effective_position(token_pos).0
+                } else {
+                    self.enclosing_function
+                        .name
+                        .and_then(|n| self.idents.get_opt(n))
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let payload = crate::token::lexer::literal_payload(&text);
+                let len = payload.chars().count() + 1;
+                let const_char = self
+                    .types
+                    .qualified_with(self.types.char_id, TypeModifiers::CONST);
+                let typ = self.types.intern(Type::array(const_char, len));
+                Ok(Self::typed_expr(
+                    ExprKind::StringLit(payload),
+                    typ,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_LINE => Some((|| {
+                self.expect_special(b'(')?;
+                self.expect_special(b')')?;
+                let line = diag::effective_position(token_pos).1;
+                Ok(Self::typed_expr(
+                    ExprKind::IntLit(i64::from(line)),
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
             crate::kw::BUILTIN_ASSUME_ALIGNED => Some(self.parse_assume_aligned(token_pos)),
             crate::kw::BUILTIN_EXTRACT_RETURN_ADDR => Some((|| {
                 // Identity on both targets c17 has. The builtin exists for
@@ -867,6 +939,30 @@ impl Parser<'_> {
                     }
                 }
                 self.expect_special(b')')?;
+                // C17 7.19p3: the member designator is one whose address
+                // `&(t.member-designator)` is a constant -- so never a
+                // bit-field.
+                let mut current = type_id;
+                for step in &path {
+                    current = match step {
+                        OffsetOfPath::Field(name) => match self.types.find_member(current, *name) {
+                            Some(m) if m.bit_width.is_some() => {
+                                diag::error_args(
+                                    token_pos,
+                                    "attempt to take address of bit-field structure member '{0}'",
+                                    &[self.idents.get_opt(*name).unwrap_or("")],
+                                );
+                                break;
+                            }
+                            Some(m) => m.typ,
+                            None => break,
+                        },
+                        OffsetOfPath::Index(_) => match self.types.base_type(current) {
+                            Some(elem) => elem,
+                            None => break,
+                        },
+                    };
+                }
                 Ok(Self::typed_expr(
                     ExprKind::OffsetOf { type_id, path },
                     self.types.ulong_id, // size_t is typically unsigned long
@@ -1470,7 +1566,8 @@ impl Parser<'_> {
                     params: None,
                     ..Default::default()
                 });
-                let symbol = Symbol::function(name_id, func_type, self.symbols.depth());
+                let symbol = Symbol::function(name_id, func_type, self.symbols.depth())
+                    .with_linkage(crate::symbol::Linkage::External);
                 self.symbols
                     .declare(symbol)
                     .map_err(|_| ParseError::new("cannot declare an implicit function", pos))?
@@ -1631,12 +1728,20 @@ impl Parser<'_> {
     }
 
     /// The floating type `suffix` names, or `None` where the target has no
-    /// such type: `_Float128` is `__float128`, which macOS lacks.
+    /// such type: `_Float128` is `__float128`, which macOS lacks, and
+    /// `_Float64x` needs a format wider than `double`.
     fn float_suffix_type(&self, suffix: FloatSuffix) -> Option<TypeId> {
         let t = &self.types;
         Some(match suffix {
-            FloatSuffix::Double | FloatSuffix::F64 => t.double_id,
-            FloatSuffix::Float | FloatSuffix::F32 => t.float_id,
+            FloatSuffix::Double => t.double_id,
+            FloatSuffix::Float => t.float_id,
+            FloatSuffix::F32 => t.floating(TypeKind::Float, FloatClass::Interchange),
+            FloatSuffix::F64 => t.floating(TypeKind::Double, FloatClass::Interchange),
+            FloatSuffix::F32x => t.floating(TypeKind::Double, FloatClass::Extended),
+            FloatSuffix::F64x if t.has_float64x() => {
+                t.floating(TypeKind::LongDouble, FloatClass::Extended)
+            }
+            FloatSuffix::F64x => return None,
             FloatSuffix::LongDouble => t.longdouble_id,
             FloatSuffix::F16 => t.float16_id,
             FloatSuffix::F128 if t.has_float128() => t.float128_id,
@@ -1850,6 +1955,9 @@ impl Parser<'_> {
             return Some(result);
         }
         if let Some(result) = self.parse_bit_builtin(name_id, token_pos) {
+            return Some(result);
+        }
+        if let Some(result) = self.parse_cpu_builtin(name_id, token_pos) {
             return Some(result);
         }
         if let Some(result) = self.parse_choose_expr(name_id) {
@@ -2094,6 +2202,9 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_LOGB
                 | crate::kw::BUILTIN_LOGBF
                 | crate::kw::BUILTIN_LOGBL
+                | crate::kw::BUILTIN_ILOGB
+                | crate::kw::BUILTIN_ILOGBF
+                | crate::kw::BUILTIN_ILOGBL
                 | crate::kw::BUILTIN_TGAMMA
                 | crate::kw::BUILTIN_TGAMMAF
                 | crate::kw::BUILTIN_TGAMMAL
@@ -2133,6 +2244,8 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_LDEXP
                 | crate::kw::BUILTIN_LDEXPF
                 | crate::kw::BUILTIN_LDEXPL
+                | crate::kw::BUILTIN_SQRTF128
+                | crate::kw::BUILTIN_FMAF128
                 | crate::kw::BUILTIN_STRCASECMP
                 | crate::kw::BUILTIN_STRNCASECMP
                 | crate::kw::BUILTIN_STRDUP
@@ -2248,14 +2361,15 @@ impl Parser<'_> {
             }
             return Some(existing);
         }
-        let sym = Symbol::function(name_id, func_type, 0);
+        let sym =
+            Symbol::function(name_id, func_type, 0).with_linkage(crate::symbol::Linkage::External);
         self.symbols.declare(sym).ok()
     }
 }
 
 /// The floating type a builtin's suffix names: `__builtin_inf` is a
-/// `double`, `__builtin_inff16` a `_Float16`. `_Float32` and `_Float64` are
-/// `float` and `double` in c17, not types of their own.
+/// `double`, `__builtin_inff16` a `_Float16`, `__builtin_inff32x` a
+/// `_Float32x`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FloatSuffix {
     Double,
@@ -2264,6 +2378,8 @@ enum FloatSuffix {
     F16,
     F32,
     F64,
+    F32x,
+    F64x,
     F128,
 }
 
@@ -2277,6 +2393,8 @@ impl FloatSuffix {
             FloatSuffix::F16 => "f16",
             FloatSuffix::F32 => "f32",
             FloatSuffix::F64 => "f64",
+            FloatSuffix::F32x => "f32x",
+            FloatSuffix::F64x => "f64x",
             FloatSuffix::F128 => "f128",
         }
     }
@@ -2322,6 +2440,14 @@ const FLOAT_CONSTANT_BUILTINS: &[(StringId, FloatConstant, FloatSuffix)] = {
         (BUILTIN_HUGE_VALF32,   Inf,        F32),
         (BUILTIN_HUGE_VALF64,   Inf,        F64),
         (BUILTIN_HUGE_VALF128,  Inf,        F128),
+        (BUILTIN_INFF32X,       Inf,        F32x),
+        (BUILTIN_INFF64X,       Inf,        F64x),
+        (BUILTIN_HUGE_VALF32X,  Inf,        F32x),
+        (BUILTIN_HUGE_VALF64X,  Inf,        F64x),
+        (BUILTIN_INFQ,          Inf,        F128),
+        (BUILTIN_HUGE_VALQ,     Inf,        F128),
+        (BUILTIN_NANQ,          QUIET,      F128),
+        (BUILTIN_NANSQ,         SIGNALLING, F128),
         (BUILTIN_NAN,           QUIET,      Double),
         (BUILTIN_NANF,          QUIET,      Float),
         (BUILTIN_NANL,          QUIET,      LongDouble),
@@ -2329,6 +2455,8 @@ const FLOAT_CONSTANT_BUILTINS: &[(StringId, FloatConstant, FloatSuffix)] = {
         (BUILTIN_NANF32,        QUIET,      F32),
         (BUILTIN_NANF64,        QUIET,      F64),
         (BUILTIN_NANF128,       QUIET,      F128),
+        (BUILTIN_NANF32X,       QUIET,      F32x),
+        (BUILTIN_NANF64X,       QUIET,      F64x),
         (BUILTIN_NANS,          SIGNALLING, Double),
         (BUILTIN_NANSF,         SIGNALLING, Float),
         (BUILTIN_NANSL,         SIGNALLING, LongDouble),
@@ -2336,6 +2464,8 @@ const FLOAT_CONSTANT_BUILTINS: &[(StringId, FloatConstant, FloatSuffix)] = {
         (BUILTIN_NANSF32,       SIGNALLING, F32),
         (BUILTIN_NANSF64,       SIGNALLING, F64),
         (BUILTIN_NANSF128,      SIGNALLING, F128),
+        (BUILTIN_NANSF32X,      SIGNALLING, F32x),
+        (BUILTIN_NANSF64X,      SIGNALLING, F64x),
     ]
 };
 

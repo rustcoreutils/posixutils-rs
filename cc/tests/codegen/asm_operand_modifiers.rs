@@ -136,3 +136,30 @@ int main(void) {
         }
     }
 }
+
+/// x86-64: `%z`, the instruction suffix for the operand's size, which
+/// `mov%z0` idioms depend on; `%p`, a constant or symbol bare; `%x`, a vector
+/// register named as its XMM form. Each was "unsupported operand modifier".
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn codegen_asm_x86_64_size_and_vector_modifiers() {
+    let src = r#"
+static long g = 5;
+int main(void) {
+    int i = 3; long l = 0; short s = 7; unsigned char b = 1;
+    __asm__("mov%z1 %1, %0" : "=r"(l) : "r"(9L));
+    __asm__("add%z0 $2, %0" : "+r"(i));
+    __asm__("inc%z0 %0" : "+r"(s));
+    __asm__("add%z0 %1, %0" : "+q"(b) : "qi"((unsigned char)4));
+    long addr;
+    __asm__("lea %p1(%%rip), %0" : "=r"(addr) : "i"(&g));
+    float f = 1.5f;
+    __asm__("addss %x1, %x0" : "+x"(f) : "x"(f));
+    if (l != 9 || i != 5 || s != 8 || b != 5) return 1;
+    if ((long *)addr != &g) return 2;
+    if (f != 3.0f) return 3;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("asm_x86_64_z_p_x", src, &[]), 0);
+}

@@ -79,6 +79,253 @@ impl fmt::Display for Arch {
     }
 }
 
+/// The position independence code is generated with.
+///
+/// One value drives both code generation and the `__PIC__`/`__PIE__` macros
+/// that describe it, so a header that tests the macro sees the code it gets.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PositionIndependence {
+    /// Position-independent code: `-fPIC`, `-shared`, or a PIE.
+    pub pic: bool,
+    /// Code for a position-independent executable.
+    pub pie: bool,
+}
+
+/// The x86-64 SIMD extensions code may assume beyond the SSE2 baseline,
+/// in order: each implies the ones before it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum X86Simd {
+    #[default]
+    Sse2,
+    Sse3,
+    Ssse3,
+    Sse41,
+    Sse42,
+}
+
+/// The x86-64 instruction-set extensions a compilation may assume, from
+/// `-msse3` .. `-msse4.2`, `-mpopcnt`, their `-mno-` forms and `-march=`.
+/// They are statements about the target, which the feature macros
+/// (`__SSE4_1__` and the rest) report as gcc's do; c17's intrinsic headers
+/// provide every function whatever the level, since they are written in
+/// portable C. AVX and later are not modelled: `-march=x86-64-v3` claims
+/// only what v2 does.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct X86Isa {
+    pub simd: X86Simd,
+    pub popcnt: bool,
+}
+
+/// A set of the x86-64 extensions [`X86Isa`] models, as gcc's option
+/// handling sees them: one bit each.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct IsaSet(u8);
+
+impl IsaSet {
+    const SSE3: Self = Self(1);
+    const SSSE3: Self = Self(2);
+    const SSE41: Self = Self(4);
+    const SSE42: Self = Self(8);
+    const POPCNT: Self = Self(16);
+
+    /// SSE3 .. SSE4.2 up to `top`: an extension and every one it needs.
+    const fn and_below(top: Self) -> Self {
+        Self(top.0 | (top.0 - 1) & 15)
+    }
+
+    /// `bottom` and every SIMD extension that needs it.
+    const fn and_above(bottom: Self) -> Self {
+        Self(!(bottom.0 - 1) & 15)
+    }
+
+    const fn with(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+
+    const fn has(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// What `-march=cpu` enables, of these: gcc 13's `-dM -E` for each
+    /// 64-bit name in its roster. A name not listed here -- `x86-64`,
+    /// `k8`, `opteron`, `athlon64`, `athlon-fx` -- is the SSE2 baseline.
+    fn of_arch(cpu: &str) -> Self {
+        let sse42 = Self::and_below(Self::SSE42).with(Self::POPCNT);
+        match cpu {
+            "native" => Self::host(),
+            "nocona" | "k8-sse3" | "opteron-sse3" | "athlon64-sse3" | "eden-x2" => Self::SSE3,
+            "core2" | "bonnell" | "atom" | "nano" | "nano-1000" | "nano-2000" => {
+                Self::and_below(Self::SSSE3)
+            }
+            "nano-3000" | "nano-x2" | "eden-x4" | "nano-x4" => Self::and_below(Self::SSE41),
+            "amdfam10" | "barcelona" => Self::SSE3.with(Self::POPCNT),
+            "btver1" => Self::and_below(Self::SSSE3).with(Self::POPCNT),
+            "nehalem" | "corei7" | "westmere" | "sandybridge" | "corei7-avx" | "ivybridge"
+            | "core-avx-i" | "haswell" | "core-avx2" | "broadwell" | "skylake"
+            | "skylake-avx512" | "cannonlake" | "icelake-client" | "rocketlake"
+            | "icelake-server" | "cascadelake" | "tigerlake" | "cooperlake" | "sapphirerapids"
+            | "emeraldrapids" | "alderlake" | "raptorlake" | "meteorlake" | "graniterapids"
+            | "graniterapids-d" | "silvermont" | "slm" | "goldmont" | "goldmont-plus"
+            | "tremont" | "gracemont" | "sierraforest" | "grandridge" | "knl" | "knm"
+            | "x86-64-v2" | "x86-64-v3" | "x86-64-v4" | "lujiazui" | "bdver1" | "bdver2"
+            | "bdver3" | "bdver4" | "znver1" | "znver2" | "znver3" | "znver4" | "btver2" => sse42,
+            _ => Self::default(),
+        }
+    }
+
+    /// What `-march=native` finds on this machine, when it is an x86-64.
+    fn host() -> Self {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut set = Self::default();
+            for (on, ext) in [
+                (std::arch::is_x86_feature_detected!("sse3"), Self::SSE3),
+                (std::arch::is_x86_feature_detected!("ssse3"), Self::SSSE3),
+                (std::arch::is_x86_feature_detected!("sse4.1"), Self::SSE41),
+                (std::arch::is_x86_feature_detected!("sse4.2"), Self::SSE42),
+                (std::arch::is_x86_feature_detected!("popcnt"), Self::POPCNT),
+            ] {
+                if on {
+                    set = set.with(ext);
+                }
+            }
+            set
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            Self::default()
+        }
+    }
+}
+
+/// What one ISA `-m` option does: turn on an extension and those it needs,
+/// or turn off one and those that need it.
+#[derive(Clone, Copy)]
+enum IsaEdit {
+    Enable(IsaSet),
+    Disable(IsaSet),
+}
+
+/// The edit an ISA `-m` option makes, or `None` for any other flag.
+fn isa_edit(flag: &str) -> Option<IsaEdit> {
+    use IsaEdit::{Disable, Enable};
+    Some(match flag {
+        "-msse3" => Enable(IsaSet::and_below(IsaSet::SSE3)),
+        "-mssse3" => Enable(IsaSet::and_below(IsaSet::SSSE3)),
+        "-msse4.1" => Enable(IsaSet::and_below(IsaSet::SSE41)),
+        "-msse4.2" | "-msse4" => Enable(IsaSet::and_below(IsaSet::SSE42)),
+        "-mpopcnt" => Enable(IsaSet::POPCNT),
+        "-mno-sse3" => Disable(IsaSet::and_above(IsaSet::SSE3)),
+        "-mno-ssse3" => Disable(IsaSet::and_above(IsaSet::SSSE3)),
+        // gcc's -mno-sse4 is -mno-sse4.1, not the inverse of -msse4.
+        "-mno-sse4.1" | "-mno-sse4" => Disable(IsaSet::and_above(IsaSet::SSE41)),
+        "-mno-sse4.2" => Disable(IsaSet::SSE42),
+        "-mno-popcnt" => Disable(IsaSet::POPCNT),
+        _ => return None,
+    })
+}
+
+/// The option an ISA flag sets, whichever its sense: gcc's driver keeps
+/// only the last of `-mX` and `-mno-X`. `-msse4` and `-mno-sse4` are two
+/// options, each its own.
+fn isa_option(flag: &str) -> &str {
+    match flag {
+        "-msse4" | "-mno-sse4" => flag,
+        _ => flag.strip_prefix("-mno-").unwrap_or(&flag[2..]),
+    }
+}
+
+/// Whether `flag` is one of the ISA options [`X86Isa`] models: `-msse3` ..
+/// `-msse4.2`, `-msse4`, `-mpopcnt`, and their `-mno-` forms.
+pub fn is_isa_flag(flag: &str) -> bool {
+    isa_edit(flag).is_some()
+}
+
+impl X86Isa {
+    /// The extensions `flags` -- the `-m` options, in order -- ask for, as
+    /// gcc decides them: the last `-march=` gives a base, the ISA options
+    /// edit it in order wherever they stand, and an extension one of them
+    /// named keeps the state it gave, whatever the CPU has. SSE4.2 brings
+    /// POPCNT unless an option named POPCNT.
+    pub fn from_flags(flags: &[String]) -> Self {
+        let mut arch = IsaSet::default();
+        let mut set = IsaSet::default();
+        let mut named = IsaSet::default();
+        for (i, flag) in flags.iter().enumerate() {
+            if let Some(cpu) = flag.strip_prefix("-march=") {
+                arch = IsaSet::of_arch(cpu);
+                continue;
+            }
+            let Some(edit) = isa_edit(flag) else {
+                continue;
+            };
+            let option = isa_option(flag);
+            let overridden = flags[i + 1..]
+                .iter()
+                .any(|later| is_isa_flag(later) && isa_option(later) == option);
+            if overridden {
+                continue;
+            }
+            let exts = match edit {
+                IsaEdit::Enable(exts) => {
+                    set = set.with(exts);
+                    exts
+                }
+                IsaEdit::Disable(exts) => {
+                    set = set.without(exts);
+                    exts
+                }
+            };
+            named = named.with(exts);
+        }
+        set = set.with(arch.without(named));
+        if set.has(IsaSet::SSE42) && !named.has(IsaSet::POPCNT) {
+            set = set.with(IsaSet::POPCNT);
+        }
+        Self::from_set(set)
+    }
+
+    /// The level `set` reaches: SSE3 .. SSE4.2, each needing the one before.
+    fn from_set(set: IsaSet) -> Self {
+        let simd = [
+            (IsaSet::SSE42, X86Simd::Sse42),
+            (IsaSet::SSE41, X86Simd::Sse41),
+            (IsaSet::SSSE3, X86Simd::Ssse3),
+            (IsaSet::SSE3, X86Simd::Sse3),
+        ]
+        .into_iter()
+        .find(|&(ext, _)| set.has(IsaSet::and_below(ext)))
+        .map_or(X86Simd::Sse2, |(_, level)| level);
+        Self {
+            simd,
+            popcnt: set.has(IsaSet::POPCNT),
+        }
+    }
+
+    /// The feature macros this level defines, beyond the baseline's.
+    pub fn macros(self) -> Vec<&'static str> {
+        let mut m = Vec::new();
+        for (level, name) in [
+            (X86Simd::Sse3, "__SSE3__"),
+            (X86Simd::Ssse3, "__SSSE3__"),
+            (X86Simd::Sse41, "__SSE4_1__"),
+            (X86Simd::Sse42, "__SSE4_2__"),
+        ] {
+            if self.simd >= level {
+                m.push(name);
+            }
+        }
+        if self.popcnt {
+            m.push("__POPCNT__");
+        }
+        m
+    }
+}
+
 /// Target operating system
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Os {
@@ -468,10 +715,10 @@ impl Target {
     }
 
     /// `wint_t` (C17 7.29.1), which has to hold every `wchar_t` value *plus*
-    /// `WEOF`, and the two platforms solve that differently. glibc makes it
+    /// `WEOF`, and the platforms solve that differently. glibc makes it
     /// `unsigned int`, so `WEOF` -- `(wint_t)-1` -- is `0xffffffff`, a value
-    /// no `wchar_t` reaches. Darwin makes it `int`, following
-    /// `__darwin_ct_rune_t`, and spends the negative half of the range
+    /// no `wchar_t` reaches. Darwin and FreeBSD make it `int`, following
+    /// their `__ct_rune_t`, and spend the negative half of the range
     /// instead.
     ///
     /// It has to be the platform's choice rather than ours: the C library's
@@ -479,8 +726,8 @@ impl Target {
     /// `__mbstate_t` holds one.
     pub fn wint_type(&self) -> IntType {
         match self.os {
-            Os::MacOS => IntType::Int,
-            Os::Linux | Os::FreeBSD => IntType::UInt,
+            Os::MacOS | Os::FreeBSD => IntType::Int,
+            Os::Linux => IntType::UInt,
         }
     }
 
@@ -615,9 +862,14 @@ impl Target {
             Os::MacOS
         } else if triple.contains("freebsd") {
             Os::FreeBSD
-        } else {
-            // Default based on arch
+        } else if parts.len() == 1 {
+            // A bare architecture means the usual system for it.
             Os::Linux
+        } else {
+            // An operating system c17 has no support for -- Windows, another
+            // BSD, bare metal. Taking it for Linux defined `__linux__` and
+            // `__ELF__` for a target that is neither.
+            return None;
         };
 
         Some(Self::new(arch, os))
@@ -627,6 +879,126 @@ impl Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each level implies the ones below it, enabling options accumulate, and
+    /// gcc's -msse4.2 brings POPCNT with it.
+    #[test]
+    fn test_x86_isa_from_flags() {
+        let isa = |flags: &[&str]| {
+            let owned: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
+            X86Isa::from_flags(&owned)
+        };
+        assert_eq!(isa(&[]), X86Isa::default());
+        assert_eq!(isa(&["-msse4.1", "-msse3"]).simd, X86Simd::Sse41);
+        assert!(!isa(&["-msse4.1"]).popcnt);
+        assert_eq!(
+            isa(&["-msse4.2"]),
+            X86Isa {
+                simd: X86Simd::Sse42,
+                popcnt: true
+            }
+        );
+        assert_eq!(isa(&["-march=x86-64-v2"]), isa(&["-msse4.2"]));
+        assert_eq!(isa(&["-msse3"]).macros(), vec!["__SSE3__"]);
+        assert_eq!(isa(&["-mpopcnt"]).macros(), vec!["__POPCNT__"]);
+    }
+
+    /// The last `-march=` sets the base and the `-m` options, wherever they
+    /// stand, apply on top in order, as gcc 13's `-dM -E` reports.
+    #[test]
+    fn test_x86_isa_flag_order_matches_gcc() {
+        const ALL: &str = "SSE3 SSSE3 SSE4_1 SSE4_2 POPCNT";
+        let cases: &[(&str, &str)] = &[
+            ("-march=x86-64-v2 -march=x86-64", ""),
+            ("-march=x86-64 -march=x86-64-v2", ALL),
+            ("-march=haswell -march=x86-64", ""),
+            ("-msse4.2 -march=x86-64", ALL),
+            ("-march=x86-64-v2 -mno-sse4.2", "SSE3 SSSE3 SSE4_1 POPCNT"),
+            ("-mno-sse4.2 -march=x86-64-v2", "SSE3 SSSE3 SSE4_1 POPCNT"),
+            ("-mno-sse4.2 -march=haswell", "SSE3 SSSE3 SSE4_1 POPCNT"),
+            ("-march=x86-64-v2 -mno-sse4.1", "SSE3 SSSE3 POPCNT"),
+            ("-march=x86-64-v2 -mno-sse4", "SSE3 SSSE3 POPCNT"),
+            ("-march=x86-64-v2 -mno-ssse3", "SSE3 POPCNT"),
+            ("-march=x86-64-v2 -mno-sse3", "POPCNT"),
+            ("-march=x86-64-v2 -mno-popcnt", "SSE3 SSSE3 SSE4_1 SSE4_2"),
+            ("-mssse3 -march=x86-64-v2 -mno-sse3", "POPCNT"),
+            ("-msse4.2 -march=x86-64-v2 -mno-sse4.1", "SSE3 SSSE3 POPCNT"),
+            (
+                "-march=x86-64-v2 -msse4.2 -mno-sse4.2",
+                "SSE3 SSSE3 SSE4_1 POPCNT",
+            ),
+            ("-msse4.2 -mno-sse4.1", "SSE3 SSSE3"),
+            ("-mno-sse4.1 -msse4.2", ALL),
+            ("-msse4.2 -mno-sse4.2", ""),
+            ("-msse4.2 -msse3 -mno-sse4.2", "SSE3"),
+            ("-msse4.2 -mno-sse3 -mssse3", "SSE3 SSSE3"),
+            ("-msse4 -mno-sse4", "SSE3 SSSE3"),
+            ("-msse4 -mno-sse4.2", "SSE3 SSSE3 SSE4_1"),
+            ("-msse4.2 -mno-popcnt", "SSE3 SSSE3 SSE4_1 SSE4_2"),
+            ("-mno-popcnt -msse4.2", "SSE3 SSSE3 SSE4_1 SSE4_2"),
+            ("-mpopcnt -mno-sse4.2", "POPCNT"),
+            ("-msse4.2 -mpopcnt -mno-sse4.2", "POPCNT"),
+            ("-msse4.1 -mno-ssse3", "SSE3"),
+            ("-mno-ssse3 -msse4.1", "SSE3 SSSE3 SSE4_1"),
+            ("-march=k8", ""),
+            ("-march=nocona", "SSE3"),
+            ("-march=core2", "SSE3 SSSE3"),
+            ("-march=barcelona", "SSE3 POPCNT"),
+            ("-march=btver1", "SSE3 SSSE3 POPCNT"),
+            ("-march=nano-x2", "SSE3 SSSE3 SSE4_1"),
+            ("-march=znver4", ALL),
+            ("-march=x86-64-v4", ALL),
+        ];
+        for (flags, gcc) in cases {
+            let owned: Vec<String> = flags.split(' ').map(String::from).collect();
+            let got: Vec<String> = X86Isa::from_flags(&owned)
+                .macros()
+                .iter()
+                .map(|m| m.trim_matches('_').to_string())
+                .collect();
+            assert_eq!(got.join(" "), *gcc, "{flags}");
+        }
+    }
+
+    /// A triple names an OS c17 supports, or it is refused; a bare
+    /// architecture is the usual system for it.
+    #[test]
+    fn test_from_triple_refuses_unknown_systems() {
+        assert_eq!(
+            Target::from_triple("x86_64-unknown-linux-gnu").map(|t| t.os),
+            Some(Os::Linux)
+        );
+        assert_eq!(
+            Target::from_triple("aarch64-apple-darwin").map(|t| t.os),
+            Some(Os::MacOS)
+        );
+        assert_eq!(
+            Target::from_triple("x86_64-unknown-freebsd").map(|t| t.os),
+            Some(Os::FreeBSD)
+        );
+        assert_eq!(
+            Target::from_triple("aarch64").map(|t| t.os),
+            Some(Os::Linux)
+        );
+        for triple in [
+            "x86_64-pc-windows-msvc",
+            "x86_64-w64-mingw32",
+            "aarch64-unknown-none",
+        ] {
+            assert!(Target::from_triple(triple).is_none(), "{triple}");
+        }
+    }
+
+    /// `wint_t` is the C library's: `unsigned int` for glibc, `int` for
+    /// Darwin and FreeBSD.
+    #[test]
+    fn test_wint_type_per_os() {
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            assert_eq!(Target::new(arch, Os::Linux).wint_type(), IntType::UInt);
+            assert_eq!(Target::new(arch, Os::MacOS).wint_type(), IntType::Int);
+            assert_eq!(Target::new(arch, Os::FreeBSD).wint_type(), IntType::Int);
+        }
+    }
 
     /// Mach-O always calls the TLV getter; ELF calls only for shared code,
     /// and only Linux takes the descriptor model; FreeBSD is ELF too.

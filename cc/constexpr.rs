@@ -266,9 +266,9 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
             Some(env.types().size_bytes(typ) as i128)
         }
 
-        ExprKind::AlignofType(type_id) => Some(env.types().alignment(*type_id) as i128),
+        ExprKind::AlignofType(type_id) => Some(env.types().alignof_value(*type_id) as i128),
 
-        ExprKind::AlignofExpr(inner) => inner.typ.map(|typ| env.types().alignment(typ) as i128),
+        ExprKind::AlignofExpr(inner) => inner.typ.map(|typ| env.types().alignof_value(typ) as i128),
 
         ExprKind::Cast {
             expr: inner,
@@ -388,17 +388,16 @@ fn eval_binary(
         return eval_float_comparison(env, scope, op, left, right);
     }
     // `&&` and `||` ask whether each operand is zero, which a floating or
-    // complex operand answers as well as an integer one.
+    // complex operand answers as well as an integer one. The right operand
+    // is not evaluated when the left decides (C17 6.5.13p4, 6.5.14p4), and
+    // an operand that is not evaluated may be anything (6.6p3): `1 || 1/0`
+    // is the constant 1, as `0 ? 1/0 : 2` is 2.
     if matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr) {
-        let (l, r) = (
-            eval_truth(env, scope, left)?,
-            eval_truth(env, scope, right)?,
-        );
-        return Some(i128::from(if op == BinaryOp::LogAnd {
-            l && r
-        } else {
-            l || r
-        }));
+        let l = eval_truth(env, scope, left)?;
+        if l == (op == BinaryOp::LogOr) {
+            return Some(i128::from(l));
+        }
+        return Some(i128::from(eval_truth(env, scope, right)?));
     }
 
     let l = eval(env, scope, left)?;

@@ -2776,6 +2776,9 @@ impl<'a> super::linearize::Linearizer<'a> {
 
     /// The target's current value, read through an already-resolved place.
     pub(crate) fn load_rmw_place(&mut self, place: &RmwPlace, typ: TypeId) -> PseudoId {
+        if self.reject_incomplete_object(typ) {
+            return self.emit_const(0, self.types.int_id);
+        }
         if let Some((bf, field_typ)) = place.bitfield {
             return self.emit_bitfield_load(place.base, bf, field_typ);
         }
@@ -2948,6 +2951,9 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn emit_assign(&mut self, op: AssignOp, target: &Expr, value: &Expr) -> PseudoId {
         let target_typ = self.expr_type(target);
         let value_typ = self.expr_type(value);
+        if self.reject_incomplete_object(target_typ) {
+            return self.emit_const(0, self.types.int_id);
+        }
 
         // An assignment to an `_Atomic` object is an atomic store, and a
         // compound assignment is a single atomic read-modify-write

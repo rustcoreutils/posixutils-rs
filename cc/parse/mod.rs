@@ -32,6 +32,8 @@ mod toplevel;
 mod typename;
 
 #[cfg(test)]
+mod test_incomplete;
+#[cfg(test)]
 mod test_parser;
 
 // Re-export parser used by main.rs

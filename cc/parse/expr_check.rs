@@ -169,6 +169,15 @@ impl Parser<'_> {
             };
             let a = self.decayed_type(a);
             let param = self.decayed_type(param);
+            // C17 6.5.2.2p4 assigns the argument to the parameter, which
+            // needs an object of the parameter's type; a prototype may name an
+            // incomplete one, but a call cannot be made through it.
+            if self.type_name_is_incomplete(param, 0) && self.types.kind(param) != TypeKind::Void {
+                let n = (i + 1).to_string();
+                diag::error_args(arg.pos, "type of formal parameter {0} is incomplete", &[&n]);
+                sound = false;
+                continue;
+            }
             let Some(fault) =
                 self.types
                     .assignment_fault(param, a, self.is_null_pointer_constant(arg))

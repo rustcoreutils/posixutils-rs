@@ -2703,12 +2703,35 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// Whether an object of type `typ` has no value to read or write, which
+    /// is then reported: C17 6.3.2.1p2 leaves lvalue conversion of an
+    /// incomplete non-array type undefined, and gcc rejects it. Only reached
+    /// through a forward-declared `enum` (a GNU extension), or a structure or
+    /// union read where the parser let it through: every other value use of
+    /// an incomplete type is a constraint the parser enforces. Without this
+    /// the zero-width value reached a conversion that cannot be emitted.
+    pub(crate) fn reject_incomplete_object(&self, typ: TypeId) -> bool {
+        let incomplete = matches!(
+            self.types.kind(typ),
+            TypeKind::Enum | TypeKind::Struct | TypeKind::Union
+        ) && !self.types.is_composite_complete(typ);
+        if incomplete {
+            let named = self.types.format_type(typ, Some(self.strings));
+            let pos = self.current_pos.unwrap_or_default();
+            crate::diag::error_args(pos, "invalid use of incomplete type '{0}'", &[&named]);
+        }
+        incomplete
+    }
+
     /// Read the object of type `typ` at `place` as an rvalue: its address
     /// when [`Self::object_reads_as_address`] says so, else its value. Every
     /// expression that designates an object -- a name, `*p`, `s.m`, `a[i]`,
     /// a compound literal -- reads it here, so they cannot disagree about
     /// which objects travel by address.
     pub(crate) fn read_object(&mut self, place: ObjectPlace, typ: TypeId) -> PseudoId {
+        if self.reject_incomplete_object(typ) {
+            return self.emit_const(0, self.types.int_id);
+        }
         if self.object_reads_as_address(typ) {
             return match place {
                 ObjectPlace::Sym(sym) => {

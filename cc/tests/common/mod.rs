@@ -339,6 +339,47 @@ pub fn run_c17(args: &[&str]) -> C17Run {
     }
 }
 
+/// Compile `content` with `-S`, killing c17 if it has not finished within
+/// `secs` seconds. For an input that once made c17 loop: an unbounded run of
+/// a regression would not fail, it would hang the suite and eat memory.
+///
+/// Stderr goes to a file rather than a pipe, so a chatty run cannot block on
+/// a full pipe and be mistaken for a hang.
+pub fn compile_bounded(name: &str, content: &str, secs: u64) -> C17Run {
+    let c_file = create_c_file(name, content);
+    let err = plib::tmp::Builder::new()
+        .prefix(&format!("c17_bounded_{}_", name))
+        .suffix(".err")
+        .tempfile()
+        .expect("failed to create temp file");
+    let mut child = Command::new(plib::testing::get_binary_path("c17"))
+        .args(["-S", "-o", "/dev/null"])
+        .arg(c_file.path())
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(err.as_file().try_clone().expect("clone stderr file"))
+        .spawn()
+        .expect("spawn c17");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait for c17") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("'{}': c17 did not finish within {}s", name, secs);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    C17Run {
+        stdout: String::new(),
+        stderr: std::fs::read_to_string(err.path()).unwrap_or_default(),
+        success: status.success(),
+    }
+}
+
 /// Compile one translation unit with c17 and the other with the system C
 /// compiler, link them together and run the result. Returns the exit status,
 /// or `None` when no system compiler is available.

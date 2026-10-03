@@ -1097,3 +1097,23 @@ fn test_compound_literal_is_a_named_frame_local() {
         );
     }
 }
+
+/// A value of an incomplete type has no width to read or write it at
+/// (C17 6.3.2.1p2). Each access is reported, and nothing zero-width is
+/// emitted: a forward-declared `enum` read as a value used to reach a
+/// conversion the IR validator refused as an internal compiler error.
+#[test]
+fn test_incomplete_object_access_is_reported() {
+    for body in [
+        "int f(void) { return ve; }",
+        "void f(void) { ve = 1; }",
+        "void f(void) { ve++; }",
+        "void f(void) { ve *= 3; }",
+        "int f(enum e *p) { return *p; }",
+    ] {
+        let src = format!("extern enum e ve;\n{body}\n");
+        let before = crate::diag::error_count();
+        let _ = linearize_source(&src, &Target::host());
+        assert!(crate::diag::error_count() > before, "{body}: not reported");
+    }
+}

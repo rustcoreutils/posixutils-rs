@@ -1526,3 +1526,17 @@ fn test_strip_bom() {
     // A prefix of the mark is not the mark.
     assert_eq!(strip_bom(b"\xEF\xBB"), b"\xEF\xBB".as_slice());
 }
+
+/// The end of the stream begins a line, even when the last line closed with
+/// a backslash-newline and so has no newline of its own: every directive
+/// reads to the next token that begins a line, and one that read past this
+/// marker took the end of the file with it.
+#[test]
+fn test_stream_end_begins_a_line() {
+    for src in ["#define X \\\n", "#define X \\", "int x", ""] {
+        let (tokens, _) = tokenize_str(src);
+        let end = tokens.last().expect("a stream end");
+        assert_eq!(end.typ, TokenType::StreamEnd, "{src:?}");
+        assert!(end.pos.newline, "{src:?}: stream end does not begin a line");
+    }
+}

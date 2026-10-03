@@ -1395,7 +1395,7 @@ impl<'a> Preprocessor<'a> {
                             // Handle the _Pragma operator (C99):
                             // `_Pragma("string")` is `#pragma string`.
                             if is_pragma {
-                                self.handle_pragma_operator(&mut cursor, &mut output);
+                                self.handle_pragma_operator(&mut cursor, &mut output, token.pos);
                                 continue;
                             }
 

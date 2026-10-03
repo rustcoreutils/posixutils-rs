@@ -239,6 +239,7 @@ impl Parser<'_> {
     ) -> ParseResult<FunctionDef> {
         let mut params = params.unwrap_or_default();
         let typ = self.parse_old_style_parameters(typ, &mut params)?;
+        self.check_parameters_complete(&params, pos);
         let func = self.types.get(typ);
         // An identifier list records no parameter types (C17 6.7.6.3p14).
         let param_style = if func.params.is_some() {
@@ -300,6 +301,29 @@ impl Parser<'_> {
             calling_conv: self.types.get(typ).conv,
             attrs,
         })
+    }
+
+    /// C17 6.9.1p7: in a definition, each parameter has a complete object
+    /// type after adjustment, since the function body has an object for it.
+    /// A prototype that is not a definition may name an incomplete type.
+    fn check_parameters_complete(&self, params: &[RawParam], pos: Position) {
+        for (i, raw) in params.iter().enumerate() {
+            if self.types.kind(raw.typ) == TypeKind::Void
+                || !self.type_name_is_incomplete(raw.typ, 0)
+            {
+                continue;
+            }
+            let n = (i + 1).to_string();
+            let name = raw
+                .name
+                .and_then(|id| self.idents.get_opt(id))
+                .unwrap_or("");
+            diag::error_args(
+                pos,
+                "parameter {0} ('{1}') has incomplete type",
+                &[&n, name],
+            );
+        }
     }
 
     /// K&R (old-style) parameter declarations, between the declarator and the

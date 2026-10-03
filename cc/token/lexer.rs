@@ -1652,8 +1652,13 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             }
         }
 
-        // Add stream end token
-        tokens.push(Token::new(TokenType::StreamEnd, self.pos()));
+        // The end of the stream ends the last line, whatever came before it:
+        // a file whose last line closes with a backslash-newline gave that
+        // line no newline of its own, and every directive reads to the next
+        // token that begins a line.
+        let mut end = Token::new(TokenType::StreamEnd, self.pos());
+        end.pos.newline = true;
+        tokens.push(end);
 
         tokens
     }

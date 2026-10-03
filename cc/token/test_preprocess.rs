@@ -2016,3 +2016,37 @@ fn test_has_builtin_float128_constants_follow_the_target() {
         assert_eq!(get_token_strings(&tokens, &idents), want, "{os:?}");
     }
 }
+
+/// Whatever a directive or `_Pragma` at the end of the file leaves unfinished,
+/// the end of the stream survives preprocessing: the parser stops there, and
+/// one that never saw it looped allocating without bound.
+#[test]
+fn test_stream_end_survives_unfinished_constructs() {
+    for src in [
+        "int x;\n#define X \\\n",
+        "int x;\n#undef X \\",
+        "int x;\n#error e \\\n",
+        "int x;\n_Pragma",
+        "int x;\n_Pragma(",
+        "int x;\n_Pragma(\"once\"",
+    ] {
+        let (tokens, _) = preprocess_str(src);
+        assert!(
+            tokens.iter().any(|t| t.typ == TokenType::StreamEnd),
+            "{src:?}: the end of the stream was consumed"
+        );
+    }
+}
+
+/// A malformed `_Pragma` operand is gcc's error and consumes nothing that is
+/// not part of the operator.
+#[test]
+fn test_malformed_pragma_operator_keeps_following_tokens() {
+    let before = crate::diag::error_count();
+    let (tokens, idents) = preprocess_str("_Pragma(x) int y;");
+    assert!(crate::diag::error_count() > before);
+    assert_eq!(
+        get_token_strings(&tokens, &idents),
+        ["x", ")", "int", "y", ";"]
+    );
+}

@@ -1409,31 +1409,30 @@ impl<'a> Preprocessor<'a> {
         &mut self,
         iter: &mut TokenCursor,
         output: &mut Vec<Token>,
+        pragma_pos: Position,
     ) {
-        // Expect '('
-        if let Some(token) = iter.next() {
-            if !matches!(&token.value, TokenValue::Special(code) if *code == b'(' as u32) {
-                // Not a valid _Pragma - just silently ignore
-                return;
-            }
-        } else {
+        // C17 6.10.9p1: the operand is `( string-literal )`. Each token is
+        // looked at before it is taken: one that does not belong to the
+        // operator -- the end of the stream above all, which every caller
+        // needs to see -- stays where it is.
+        let is_punct =
+            |t: &Token, c: u8| matches!(&t.value, TokenValue::Special(code) if *code == c as u32);
+        if !iter.peek().is_some_and(|t| is_punct(t, b'(')) {
+            Self::pragma_operand_error(pragma_pos);
             return;
         }
+        iter.next();
+        if !iter.peek().is_some_and(|t| t.typ == TokenType::String) {
+            Self::pragma_operand_error(pragma_pos);
+            return;
+        }
+        let token = iter.next().expect("peeked");
 
-        // Expect a string literal.
-        //
         // C99 6.10.9p1: destringify and re-tokenize as a `#pragma`. Only the
         // pragmas c17 acts on need that treatment; the rest stay no-ops. It
         // matters for `pack`, which changes layout -- and a `_Pragma` that
         // was quietly dropped while the `#pragma` spelling was honoured would
         // be the same wrong struct in the spelling nobody tested.
-        let Some(token) = iter.next() else {
-            return;
-        };
-        if !matches!(token.typ, TokenType::String) {
-            // Not a valid _Pragma - just silently ignore
-            return;
-        }
         if let TokenValue::String(body) = &token.value {
             let pos = self.remap_pos(token.pos);
             let mut marker = Token::new(TokenType::Pragma, pos);
@@ -1452,14 +1451,18 @@ impl<'a> Preprocessor<'a> {
             output.push(marker);
         }
 
-        // Expect ')' - if not found or malformed, silently ignore
-        // (we've already consumed the tokens, so just return either way)
-        if let Some(token) = iter.next() {
-            if !matches!(&token.value, TokenValue::Special(code) if *code == b')' as u32) {
-                // Not a valid _Pragma - silently ignored
-            }
+        if iter.peek().is_some_and(|t| is_punct(t, b')')) {
+            iter.next();
+        } else {
+            Self::pragma_operand_error(pragma_pos);
         }
-        // Successfully consumed _Pragma("...")
+    }
+
+    fn pragma_operand_error(pos: Position) {
+        diag::error(
+            pos,
+            &gettext("_Pragma takes a parenthesized string literal"),
+        );
     }
 
     fn handle_line(

@@ -549,6 +549,25 @@ impl Parser<'_> {
             // C11 anonymous struct/union members: "struct { ... };" or "union { ... };"
             // These have no declarator name, just end with ';'
             if is_struct_or_union && self.is_special(b';') {
+                // C17 6.7.2.1p13: only a specifier with no tag makes an
+                // anonymous member. `struct T;` or `struct T { ... };` here
+                // declares the tag and nothing else, as gcc reads it --
+                // taking it as a member made `struct A { struct A; }`
+                // contain itself.
+                let tagged = self
+                    .types
+                    .get(member_base_type_id)
+                    .composite
+                    .as_ref()
+                    .is_some_and(|c| c.tag.is_some());
+                if tagged {
+                    diag::warning(
+                        self.current_pos(),
+                        &gettext("declaration does not declare anything"),
+                    );
+                    self.advance(); // consume ';'
+                    continue;
+                }
                 members.push(StructMember {
                     name: StringId::EMPTY,
                     typ: member_base_type_id,
@@ -669,6 +688,20 @@ impl Parser<'_> {
                 // What this declarator adds to the specifiers' alignment.
                 let member_align = specifier_align.merge(self.take_member_align());
 
+                // C17 6.7.2.1p3: no member of incomplete or function type,
+                // the flexible array member excepted. A member of the type
+                // being defined is the same violation -- the tag is
+                // incomplete until its `}` -- and one that got through made
+                // a type that contains itself, which every walk over its
+                // members followed forever.
+                if !self.check_member_type(name, typ) {
+                    if self.is_special(b',') {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+
                 // C17 6.7.2.1p2: members share one name space, so a
                 // repeated name is a constraint violation. Unnamed members
                 // -- anonymous struct/union members and unnamed bitfields
@@ -711,6 +744,23 @@ impl Parser<'_> {
             }
         }
         Ok(members)
+    }
+
+    /// Whether a member may have type `typ` (C17 6.7.2.1p3), diagnosing it
+    /// if not. An array passes: its declarator already refused an incomplete
+    /// element type, and whether an array of unknown size is a valid flexible
+    /// array member is `check_flexible_array_members`' question.
+    fn check_member_type(&self, name: StringId, typ: TypeId) -> bool {
+        let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
+        let message = match self.types.kind(typ) {
+            TypeKind::Function => "field '{0}' declared as a function",
+            // An array's element type was checked by its declarator.
+            TypeKind::Array => return true,
+            _ if self.type_name_is_incomplete(typ, 0) => "field '{0}' has incomplete type",
+            _ => return true,
+        };
+        diag::error_args(self.current_pos(), message, &[&spelled]);
+        false
     }
 
     /// The alignment and `packed` written since the last call, consumed: the

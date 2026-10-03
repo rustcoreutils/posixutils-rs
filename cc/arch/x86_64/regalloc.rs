@@ -2562,8 +2562,21 @@ impl RegAlloc {
                 start,
             );
             if let Some(interval) = by_pseudo.get(&spilled).copied() {
-                self.alloc_stack_slot(interval, 8, 8, true);
+                let bytes = self.fp_slot_bytes(spilled);
+                self.alloc_stack_slot(interval, bytes, bytes, true);
             }
+        }
+    }
+
+    /// The bytes, and alignment, of a stack slot holding the XMM value
+    /// `pseudo`: sixteen for a whole-register (`Quad`) value, eight for any
+    /// other. A spilled `__float128` once got eight, so a neighbouring
+    /// spill's store ran over it.
+    fn fp_slot_bytes(&self, pseudo: PseudoId) -> i32 {
+        if self.quad_pseudos.contains(&pseudo) {
+            16
+        } else {
+            8
         }
     }
 

@@ -441,10 +441,31 @@ impl Linearizer<'_> {
     fn vector_copy(&mut self, src: Lanes, typ: TypeId) -> PseudoId {
         let result = self.frame_temp_addr("__vec", typ);
         if let Lanes::Vector { addr, .. } = src {
-            let bytes = self.types.size_bytes(typ) as i64;
-            self.emit_block_copy(result, addr, bytes, BlockVolatility::default());
+            self.copy_vector(result, addr, typ, BlockVolatility::default());
         }
         result
+    }
+
+    /// Copy the vector of type `typ` at `src` to `dst`. A sixteen- or
+    /// eight-byte one moves as one value of its register-sized carrier --
+    /// a single XMM or Q (or D) register load and store -- rather than in
+    /// eight-byte general-register chunks; a volatile one keeps the block
+    /// copy, which accesses each byte as the object's qualifiers say.
+    fn copy_vector(&mut self, dst: PseudoId, src: PseudoId, typ: TypeId, vol: BlockVolatility) {
+        let bytes = self.types.size_bytes(typ);
+        let whole = match bytes {
+            16 => Some(self.types.float128_id),
+            8 => Some(self.types.double_id),
+            _ => None,
+        };
+        match whole {
+            Some(carrier) if !vol.dst && !vol.src => {
+                let value = self.vector_to_carrier(src, carrier);
+                let bits = self.types.size_bits(carrier);
+                self.emit(Instruction::store(value, dst, 0, carrier, bits));
+            }
+            _ => self.emit_block_copy(dst, src, bytes as i64, vol),
+        }
     }
 
     /// A cast with a vector on either side, which reinterprets the bits of a
@@ -457,7 +478,7 @@ impl Linearizer<'_> {
             let addr = self.vector_addr(inner);
             if self.types.is_vector(to) {
                 let result = self.frame_temp_addr("__vec", to);
-                self.emit_block_copy(result, addr, (bits / 8) as i64, BlockVolatility::default());
+                self.copy_vector(result, addr, to, BlockVolatility::default());
                 return result;
             }
             let value = self.alloc_reg_pseudo();
@@ -480,7 +501,6 @@ impl Linearizer<'_> {
         value: &Expr,
     ) -> PseudoId {
         let typ = self.expr_type(target);
-        let bytes = self.types.size_bytes(typ) as i64;
         let target_addr = self.linearize_lvalue(target);
         let source = match op.binary_op() {
             None => self.vector_addr(value),
@@ -503,7 +523,7 @@ impl Linearizer<'_> {
             }
         };
         let vol = self.block_volatility(self.expr_type(target), self.expr_type(value));
-        self.emit_block_copy(target_addr, source, bytes, vol);
+        self.copy_vector(target_addr, source, typ, vol);
         target_addr
     }
 

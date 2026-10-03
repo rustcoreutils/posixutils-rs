@@ -6799,6 +6799,11 @@ mod test_linearize_init;
 #[cfg(test)]
 #[path = "test_linearize_memory.rs"]
 mod test_linearize_memory;
+
+#[cfg(test)]
+#[path = "test_linearize_vector.rs"]
+mod test_linearize_vector;
+
 #[cfg(test)]
 #[path = "test_linearize_win64.rs"]
 mod test_linearize_win64;

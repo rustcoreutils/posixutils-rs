@@ -79,7 +79,10 @@ fn test_bc_missing_file() {
         args: vec!["/nonexistent-bc-file.bc".to_string()],
         stdin_data: String::new(),
         expected_out: String::new(),
-        expected_err: String::from("bc: /nonexistent-bc-file.bc: No such file or directory\n"),
+        expected_err: format!(
+            "bc: /nonexistent-bc-file.bc: {}\n",
+            crate::open_error("/nonexistent-bc-file.bc")
+        ),
         expected_exit_code: 1,
     });
 }
@@ -273,13 +276,32 @@ fn test_bc_sparse_array() {
     test_bc("a[16777215]=7\na[16777215]\na[5]\nquit\n", "7\n0\n");
 }
 
+/// A fresh directory for one test's files, removed when dropped.
+struct TestDir(std::path::PathBuf);
+
+impl TestDir {
+    fn new(tag: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("posixutils-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        TestDir(path)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// A file that exists but is not text is not an access failure.
 #[test]
 fn test_bc_non_text_file() {
-    let dir = plib::tmp::Builder::new()
-        .prefix("bc-nontext")
-        .tempdir()
-        .unwrap();
+    let dir = TestDir::new("bc-nontext");
     let path = dir.path().join("binary.bc");
     std::fs::write(&path, b"1+1\n\xff\xfe\n").unwrap();
     let output = plib::testing::run_test_base("bc", &[path.to_string_lossy().to_string()], b"");
@@ -317,10 +339,7 @@ fn test_bc_incomplete_input_at_eof() {
 /// operand or on standard input.
 #[test]
 fn test_bc_exit_status_is_consistent() {
-    let dir = plib::tmp::Builder::new()
-        .prefix("bc-status")
-        .tempdir()
-        .unwrap();
+    let dir = TestDir::new("bc-status");
     for program in ["1/0\n", "1+\n"] {
         let path = dir.path().join("program.bc");
         std::fs::write(&path, program).unwrap();
@@ -344,10 +363,7 @@ fn test_bc_write_error_is_reported() {
         Ok(file) => file,
         Err(_) => return, // no /dev/full on this host
     };
-    let dir = plib::tmp::Builder::new()
-        .prefix("bc-write")
-        .tempdir()
-        .unwrap();
+    let dir = TestDir::new("bc-write");
     let path = dir.path().join("program.bc");
     // Enough output to leave the buffer and reach the device.
     std::fs::write(&path, "for(i=0;i<5000;++i) i\n").unwrap();
@@ -374,7 +390,7 @@ fn test_bc_write_error_is_reported() {
         output.status.code()
     );
     assert!(
-        stderr.contains("No space left on device"),
+        stderr.contains(&crate::full_device_error()),
         "expected the write failure to be named, got {stderr:?}"
     );
     assert!(

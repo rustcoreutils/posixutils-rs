@@ -92,12 +92,23 @@ fn hide_in_expansion(
     }
 }
 
-/// A function-like macro's arguments, and what its closing `)` was hiding.
+/// A function-like macro's arguments, the commas that separated them, and
+/// what its closing `)` was hiding.
 ///
-/// The second half decides half of the invocation's own hide set (C17
-/// 6.10.3.4), so it has to travel with the arguments rather than be recovered
-/// afterwards -- by then the `)` has been consumed.
-type MacroCall = (Vec<Vec<Token>>, Option<HashSet<String>>);
+/// The commas are kept because `__VA_ARGS__` is the variadic arguments *with*
+/// their separators (C17 6.10.3.1p2), spelled as written: `#__VA_ARGS__` of
+/// `a , b` is `"a , b"`, and a comma rebuilt without its spacing gave
+/// `"a, b"`.
+///
+/// The hide set decides half of the invocation's own (C17 6.10.3.4), so it
+/// has to travel with the arguments rather than be recovered afterwards -- by
+/// then the `)` has been consumed.
+pub(super) struct MacroCall {
+    pub(super) args: Vec<Vec<Token>>,
+    /// `commas[j]` separated `args[j]` from `args[j + 1]`.
+    pub(super) commas: Vec<Token>,
+    pub(super) close_hide: Option<HashSet<String>>,
+}
 
 impl<'a> Preprocessor<'a> {
     /// Resolve one `defined` operator: `defined X` or `defined ( X )`.
@@ -703,29 +714,23 @@ impl<'a> Preprocessor<'a> {
         result
     }
 
-    /// The comma that separates two variadic arguments.
-    ///
-    /// It abuts what precedes it: whatever space the source had before it
-    /// belongs to the token that follows, which carries its own flag.
-    fn variadic_separator(pos: Position) -> Token {
-        let mut comma =
-            Token::with_value(TokenType::Special, pos, TokenValue::Special(b',' as u32));
-        comma.pos.whitespace = false;
+    /// The comma that separated argument `j - 1` from argument `j`, spaced as
+    /// it was written. A line break before it is spacing like any other: the
+    /// comma is now inside a line.
+    fn variadic_separator(commas: &[Token], j: usize) -> Token {
+        let mut comma = commas[j - 1].clone();
+        comma.pos.whitespace |= comma.pos.newline;
         comma.pos.newline = false;
         comma
     }
 
     /// The variadic arguments as the single token sequence `__VA_ARGS__`
-    /// denotes (6.10.3.1p2), with the separating commas restored.
-    fn join_variadic_args(args: &[Vec<Token>], start: usize) -> Vec<Token> {
+    /// denotes (6.10.3.1p2), with their separating commas.
+    fn join_variadic_args(args: &[Vec<Token>], commas: &[Token], start: usize) -> Vec<Token> {
         let mut out: Vec<Token> = Vec::new();
         for (j, arg) in args.iter().enumerate().skip(start) {
             if j > start {
-                let pos = arg.first().map_or_else(
-                    || out.last().map_or(Position::new(0, 1, 0), |t: &Token| t.pos),
-                    |t| t.pos,
-                );
-                out.push(Self::variadic_separator(pos));
+                out.push(Self::variadic_separator(commas, j));
             }
             out.extend(arg.iter().cloned());
         }
@@ -758,8 +763,7 @@ impl<'a> Preprocessor<'a> {
                         let open_paren = iter.next()?; // consume '('
                                                        // Returns None having pushed the '(' and everything
                                                        // after it back, so the macro name is emitted plain.
-                        let (args, close_hide) =
-                            self.collect_macro_args(iter, idents, pos, name, &open_paren)?;
+                        let call = self.collect_macro_args(iter, idents, pos, name, &open_paren)?;
                         // C17 6.10.3.4 by way of Prosser: a function-like
                         // invocation hides what *both* ends of the call were
                         // hiding, not what the name alone was. Propagating the
@@ -767,8 +771,15 @@ impl<'a> Preprocessor<'a> {
                         // comes from the file with nothing hidden at all:
                         // `#define f(a) a*g` with `#define g(a) f(a)` made
                         // `f(2)(9)` stop at `2*f(9)` instead of `2*9*g`.
-                        let hide = Self::intersect_hide(invoker_hide, close_hide.as_ref());
-                        return self.expand_function_macro(&mac, &args, pos, hide.as_ref(), idents);
+                        let hide = Self::intersect_hide(invoker_hide, call.close_hide.as_ref());
+                        return self.expand_function_macro(
+                            &mac,
+                            &call.args,
+                            &call.commas,
+                            pos,
+                            hide.as_ref(),
+                            idents,
+                        );
                     }
                 }
             }
@@ -790,6 +801,7 @@ impl<'a> Preprocessor<'a> {
         open_paren: &Token,
     ) -> Option<MacroCall> {
         let mut args = Vec::new();
+        let mut commas = Vec::new();
         let mut current_arg = Vec::new();
         // Start at depth 1 because the opening '(' has already been consumed
         // by the caller. This is important for handling multiline macro calls.
@@ -821,6 +833,7 @@ impl<'a> Preprocessor<'a> {
                     } else if *code == b',' as u32 && paren_depth == 1 {
                         // Argument separator at top level (paren_depth == 1 since we're inside the macro call)
                         args.push(std::mem::take(&mut current_arg));
+                        commas.push(token);
                     } else {
                         current_arg.push(token);
                     }
@@ -844,18 +857,24 @@ impl<'a> Preprocessor<'a> {
                 &[macro_name],
             );
             let mut back = vec![open_paren.clone()];
+            let mut commas = commas.into_iter();
             for (i, arg) in args.into_iter().enumerate() {
                 if i > 0 {
-                    back.push(Self::variadic_separator(*macro_pos));
+                    back.extend(commas.next());
                 }
                 back.extend(arg);
             }
+            back.extend(commas);
             back.extend(current_arg);
             iter.unread(back);
             return None;
         }
 
-        Some((args, close_hide))
+        Some(MacroCall {
+            args,
+            commas,
+            close_hide,
+        })
     }
 
     /// The names hidden at *both* ends of a function-like macro invocation.
@@ -914,6 +933,7 @@ impl<'a> Preprocessor<'a> {
         &self,
         mac: &Macro,
         args: &[Vec<Token>],
+        commas: &[Token],
         body: &[MacroToken],
         pos: &Position,
         idents: &mut IdentTable,
@@ -925,7 +945,7 @@ impl<'a> Preprocessor<'a> {
                     out.extend(args.get(*idx).cloned().unwrap_or_default())
                 }
                 MacroTokenValue::VaArgs => {
-                    out.extend(Self::join_variadic_args(args, mac.params.len()))
+                    out.extend(Self::join_variadic_args(args, commas, mac.params.len()))
                 }
                 // A nested group's markers contribute nothing of their own, and
                 // `#`/`##` inside a stringified group are spelled as written.
@@ -994,6 +1014,7 @@ impl<'a> Preprocessor<'a> {
         &mut self,
         mac: &Macro,
         args: &[Vec<Token>],
+        commas: &[Token],
         pos: &Position,
         invoker_hide: Option<&std::collections::HashSet<String>>,
         idents: &mut IdentTable,
@@ -1040,6 +1061,7 @@ impl<'a> Preprocessor<'a> {
                             let inner = self.substitute_unexpanded(
                                 mac,
                                 args,
+                                commas,
                                 &mac.body[i + 1..*end - 1],
                                 pos,
                                 idents,
@@ -1077,7 +1099,7 @@ impl<'a> Preprocessor<'a> {
                     // sequence, commas included -- 6.10.3.1p2 makes
                     // __VA_ARGS__ that sequence, not its first element.
                     let arg = if *idx >= mac.params.len() {
-                        Self::join_variadic_args(args, *idx)
+                        Self::join_variadic_args(args, commas, *idx)
                     } else {
                         args.get(*idx).cloned().unwrap_or_default()
                     };
@@ -1155,7 +1177,13 @@ impl<'a> Preprocessor<'a> {
                     let va_start = result.len();
                     for (j, arg) in args.iter().enumerate().skip(start) {
                         if j > start {
-                            result.push(Self::variadic_separator(*pos));
+                            let mut comma = Self::variadic_separator(commas, j);
+                            comma.pos = Position {
+                                whitespace: comma.pos.whitespace,
+                                newline: false,
+                                ..*pos
+                            };
+                            result.push(comma);
                         }
                         if next_is_paste || prev_was_paste {
                             result.extend(arg.clone());
@@ -1292,8 +1320,12 @@ impl<'a> Preprocessor<'a> {
         .into_iter()
         .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
         .map(|mut t| {
+            // The result stands where its left operand stood, spaced as that
+            // operand was: the invocation's own spacing belongs to the first
+            // token of the expansion, which `paste_one` need not produce.
             t.pos = *pos;
             t.pos.newline = false;
+            t.pos.whitespace = left.pos.whitespace;
             t
         })
         .collect();
@@ -1352,6 +1384,7 @@ impl<'a> Preprocessor<'a> {
         };
         let mut token = Token::with_value(typ, *pos, value);
         token.pos.newline = false;
+        token.pos.whitespace = left.pos.whitespace;
         // `u8"..."` is a narrow string in every respect but its spelling, so
         // the prefix lives on the spelling flag rather than in the token type.
         if prefix == "u8" {
@@ -1656,7 +1689,7 @@ impl<'a> Preprocessor<'a> {
                             let open_paren = iter.next()?;
                             let args = self
                                 .collect_macro_args(iter, idents, pos, &mac.name, &open_paren)
-                                .map(|(args, _)| args)
+                                .map(|call| call.args)
                                 .unwrap_or_default();
                             let result = self.eval_has_builtin(builtin, &args, idents);
                             return Some(vec![Token::with_value(
@@ -1681,7 +1714,7 @@ impl<'a> Preprocessor<'a> {
                             let open_paren = iter.next()?;
                             let args = self
                                 .collect_macro_args(iter, idents, pos, &mac.name, &open_paren)
-                                .map(|(args, _)| args)
+                                .map(|call| call.args)
                                 .unwrap_or_default();
                             let result = self.eval_has_include(
                                 &args,

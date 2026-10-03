@@ -2050,3 +2050,27 @@ fn test_malformed_pragma_operator_keeps_following_tokens() {
         ["x", ")", "int", "y", ";"]
     );
 }
+
+/// `#__VA_ARGS__` keeps the spacing of the commas that separated the
+/// variadic arguments (C17 6.10.3.1p2), and a `##` result keeps its left
+/// operand's spacing.
+#[test]
+fn test_stringify_and_paste_spacing() {
+    let (tokens, idents) = preprocess_str(
+        "#define H(...) #__VA_ARGS__\n#define S(x) #x\n#define F(n) S(a[b##n])\nH(a , b) F(1)",
+    );
+    assert_eq!(
+        get_token_strings(&tokens, &idents),
+        ["\"a , b\"", "\"a[b1]\""]
+    );
+}
+
+/// `#if` evaluates only the arm of `?:` it takes, and converts both arms to
+/// their common type (C17 6.5.15p4-5).
+#[test]
+fn test_if_conditional_operator() {
+    let (tokens, idents) = preprocess_str(
+        "#if 1 ? 2 : (1/0)\nA\n#endif\n#if (1 ? -1 : 0u) > 0\nB\n#endif\n#if 0 ? -1 : 0u\nC\n#endif\n",
+    );
+    assert_eq!(get_token_strings(&tokens, &idents), ["A", "B"]);
+}

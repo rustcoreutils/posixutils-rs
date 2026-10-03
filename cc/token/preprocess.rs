@@ -113,12 +113,24 @@ fn macro_redefinition_conflict(old: &Macro, new: &Macro) -> Option<&'static str>
         return Some("it is a built-in macro");
     }
     // The constraint governs redefinition "by another #define preprocessing
-    // directive". A macro the implementation supplied is not one, and holding
-    // headers to it is pure noise: we predefine __GLIBC_MINOR__ as 17 while
-    // the host's features.h defines the true value, so every compilation
-    // against glibc would warn.
+    // directive", which a predefine is not -- but gcc warns when a predefine
+    // or a `-D` is redefined to something else (`#define __linux__ 7`), and
+    // C17 6.10.8p2 forbids it outright for the standard's own names. A
+    // redefinition to the same thing is quiet. So is any redefinition in a
+    // system header, since warnings there are not shown.
+    //
+    // The feature-test macros are the exception. c17 predefines them where
+    // gcc does not (see `os::linux`), so a program's own
+    // `#define _GNU_SOURCE` or `#define _XOPEN_SOURCE 700` is not
+    // redefining anything as far as its author can tell.
     if old.predefined {
-        return None;
+        if is_feature_test_macro(&old.name) {
+            return None;
+        }
+        let same = old.is_function == new.is_function
+            && old.params.len() == new.params.len()
+            && replacement_lists_identical(&old.body, &new.body);
+        return (!same).then_some("it is predefined with a different definition");
     }
     if old.is_function != new.is_function {
         return Some("one definition is function-like and the other is not");
@@ -143,6 +155,25 @@ fn macro_redefinition_conflict(old: &Macro, new: &Macro) -> Option<&'static str>
         return Some("the replacement lists differ");
     }
     None
+}
+
+/// A feature-test macro: the program's request for a namespace (POSIX.1-2024
+/// 2.2.1), such as `_GNU_SOURCE`, `_XOPEN_SOURCE` or `_POSIX_C_SOURCE`.
+fn is_feature_test_macro(name: &str) -> bool {
+    name.starts_with('_')
+        && (name.ends_with("_SOURCE")
+            || name.ends_with("_SOURCE_EXTENDED")
+            || name == "_REENTRANT"
+            || name == "__BSD_VISIBLE")
+}
+
+/// A name C17 6.10.8 predefines, which p2 says may be neither `#define`d nor
+/// `#undef`ined: `__FILE__`, `__LINE__`, `__DATE__`, `__TIME__`, and every
+/// `__STDC...` macro (the mandatory, conditional and environment ones).
+pub(super) fn is_standard_predefined(name: &str) -> bool {
+    matches!(name, "__FILE__" | "__LINE__" | "__DATE__" | "__TIME__")
+        || name.starts_with("__STDC_")
+        || name == "__STDC__"
 }
 
 /// A macro definition (object-like or function-like)
@@ -1388,6 +1419,9 @@ impl<'a> Preprocessor<'a> {
                             // was paid by programs that define no macros at
                             // all. The copy is needed only past this point,
                             // because expanding wants `idents` mutably.
+                            if cursor.provenance() == Provenance::Main {
+                                Self::warn_stray_va_args(&token, idents);
+                            }
                             let is_pragma = name == "_Pragma";
                             let is_macro = self.macros.contains_key(name);
                             let hidden = token.is_no_expand(name);
@@ -1786,26 +1820,36 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
     // ?: || && | ^ & ==/!= relational shift additive multiplicative unary
 
     /// Ternary operator has lowest precedence: cond ? true_val : false_val
+    ///
+    /// C17 6.5.15p4: only the chosen arm is evaluated, so the other is parsed
+    /// with its diagnostics suppressed, as `&&` and `||` do theirs -- `#if 1 ?
+    /// 2 : 1/0` is valid. The result still has the type the usual arithmetic
+    /// conversions give both arms (p5): `1 ? -1 : 0u` is a large unsigned.
     fn expr_ternary(&mut self) -> PpValue {
         let cond = self.expr_or();
-        if self.is_special(b'?' as u32) {
-            self.advance();
-            let true_val = self.expr_ternary();
-            if self.is_special(b':' as u32) {
-                self.advance();
-            } else {
-                let pos = self.current().map(|t| t.pos).unwrap_or_default();
-                diag::error(pos, &gettext("expected ':' in conditional expression"));
-            }
-            let false_val = self.expr_ternary();
-            if cond.is_true() {
-                true_val
-            } else {
-                false_val
-            }
-        } else {
-            cond
+        if !self.is_special(b'?' as u32) {
+            return cond;
         }
+        self.advance();
+        let true_val = self.expr_ternary_arm(cond.is_true());
+        if self.is_special(b':' as u32) {
+            self.advance();
+        } else {
+            let pos = self.current().map(|t| t.pos).unwrap_or_default();
+            diag::error(pos, &gettext("expected ':' in conditional expression"));
+        }
+        let false_val = self.expr_ternary_arm(!cond.is_true());
+        let (t, f, unsigned) = PpValue::promote(true_val, false_val);
+        PpValue::from_parts(if cond.is_true() { t } else { f }, unsigned)
+    }
+
+    /// One arm of `?:`, evaluated only when `taken`.
+    fn expr_ternary_arm(&mut self, taken: bool) -> PpValue {
+        let saved = self.suppressed;
+        self.suppressed |= !taken;
+        let value = self.expr_ternary();
+        self.suppressed = saved;
+        value
     }
 
     fn expr_or(&mut self) -> PpValue {

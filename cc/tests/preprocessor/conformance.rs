@@ -301,26 +301,22 @@ fn preprocessor_va_args_takes_the_body_spacing() {
     assert_has(&r.stdout, "D (1,2)", "nor around the separators");
 }
 
-/// Pins a known divergence, so closing it is a deliberate change.
-///
-/// The argument splitter discards the separating comma, so the white space
-/// that preceded it is gone by the time `#__VA_ARGS__` rebuilds the sequence:
-/// `V(a , b)` stringifies as `"a, b"` where GCC gives `"a , b"`. Everything
-/// else about the sequence is right; only the space *before* a separator is
-/// lost, and only when the source writes one.
+/// `__VA_ARGS__` is the variadic arguments together with their separating
+/// commas (C17 6.10.3.1p2), and `#` keeps each comma's spacing: `V(a , b)`
+/// stringifies as `"a , b"`, as gcc gives. The splitter once discarded the
+/// commas and rebuilt them with no space before.
 #[test]
-fn preprocessor_va_args_loses_space_before_a_separator() {
+fn preprocessor_va_args_keeps_space_before_a_separator() {
     let r = preprocess_text(
         "va_args_sep_space",
         "#define V(...) #__VA_ARGS__\nA V(a , b)\nB V(a, b)\nC V(a ,b)\n",
         &[],
     );
     assert!(r.success, "-E failed: {}", r.stderr);
-    // What GCC gives is "a , b"; c17 drops the space before the comma.
-    assert_has(&r.stdout, "A \"a, b\"", "space before a separator");
+    assert_has(&r.stdout, "A \"a , b\"", "space before a separator");
     // Space *after* a separator is preserved, and so is its absence.
     assert_has(&r.stdout, "B \"a, b\"", "space after a separator");
-    assert_has(&r.stdout, "C \"a,b\"", "no space around a separator");
+    assert_has(&r.stdout, "C \"a ,b\"", "space only before a separator");
 }
 
 /// A non-ASCII byte outside a literal lexes as its own single-character
@@ -709,26 +705,27 @@ fn preprocessor_identical_redefinition_is_silent() {
     }
 }
 
-/// A `#define` that redefines a macro the *implementation* predefined is not
-/// the `#define`-versus-`#define` conflict the constraint governs.
+/// A `#define` that redefines a macro the implementation predefined, to
+/// something else, is diagnosed as gcc diagnoses it -- and still takes effect.
+/// The same definition again is quiet.
 #[test]
-fn preprocessor_redefining_a_predefine_is_silent() {
+fn preprocessor_redefining_a_predefine_differently_warns() {
     let r = preprocess_text(
         "redef_predefined",
         "#define __GNUC_MINOR__ 99\nint x = __GNUC_MINOR__;\n",
         &[],
     );
+    assert!(r.success, "a warning, not an error: {}", r.stderr);
     assert!(
-        !r.stderr.contains("redefined"),
-        "redefining an implementation predefine must not warn; stderr was:\n{}",
+        r.stderr.contains("'__GNUC_MINOR__' redefined"),
+        "redefining a predefine to something else must warn; stderr was:\n{}",
         r.stderr
     );
     assert_has(&r.stdout, "99", "the redefinition still takes effect");
 }
 
-/// The reason that exemption matters: glibc's `features.h` redefines several
-/// macros we predefine (`__GLIBC_MINOR__` among them, where we hardcode 17 and
-/// the host says 39). Without it, every compilation against glibc would warn.
+/// glibc's `features.h` redefines macros c17 predefines; a system header's
+/// warnings are not shown, so a plain include stays quiet.
 #[test]
 fn preprocessor_including_a_system_header_is_warning_free() {
     let r = preprocess_text("sys_header_quiet", "#include <stdio.h>\nint x;\n", &[]);

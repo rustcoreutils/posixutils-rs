@@ -371,17 +371,6 @@ fn test_hashhash_operator() {
 }
 
 #[test]
-fn test_dotdot_operator() {
-    // .. is a two-character operator (range extension)
-    let (tokens, idents) = tokenize_str("a .. b");
-    let ops: Vec<_> = tokens[1..tokens.len() - 1]
-        .iter()
-        .map(|t| show_token(t, &idents))
-        .collect();
-    assert_eq!(ops, vec!["a", "..", "b"]);
-}
-
-#[test]
 fn test_ternary_operators() {
     // ? and : for ternary expressions
     let (tokens, idents) = tokenize_str("a ? b : c");
@@ -396,7 +385,7 @@ fn test_ternary_operators() {
 fn test_all_two_char_operators() {
     // Comprehensive test of ALL 2-char operators
     let (tokens, idents) =
-        tokenize_str("+= ++ -= -- -> *= /= %= <= >= == != && &= || |= ^= ## << >> ..");
+        tokenize_str("+= ++ -= -- -> *= /= %= <= >= == != && &= || |= ^= ## << >>");
     let ops: Vec<_> = tokens[1..tokens.len() - 1]
         .iter()
         .map(|t| show_token(t, &idents))
@@ -405,7 +394,7 @@ fn test_all_two_char_operators() {
         ops,
         vec![
             "+=", "++", "-=", "--", "->", "*=", "/=", "%=", "<=", ">=", "==", "!=", "&&", "&=",
-            "||", "|=", "^=", "##", "<<", ">>", ".."
+            "||", "|=", "^=", "##", "<<", ">>"
         ]
     );
 }
@@ -1538,5 +1527,30 @@ fn test_stream_end_begins_a_line() {
         let end = tokens.last().expect("a stream end");
         assert_eq!(end.typ, TokenType::StreamEnd, "{src:?}");
         assert!(end.pos.newline, "{src:?}: stream end does not begin a line");
+    }
+}
+
+/// `...` is the only punctuator that begins with `.` (C17 6.4.6p1): `..` is
+/// two `.` tokens, and `....` an ellipsis then a `.`.
+#[test]
+fn test_dots_lex_as_c_punctuators() {
+    let dot = b'.' as u32;
+    let ellipsis = SpecialToken::Ellipsis as u32;
+    for (src, want) in [
+        ("..", vec![dot, dot]),
+        ("...", vec![ellipsis]),
+        ("....", vec![ellipsis, dot]),
+        (". ..", vec![dot, dot, dot]),
+        ("..\\\n.", vec![ellipsis]),
+    ] {
+        let (tokens, _) = tokenize_str(src);
+        let got: Vec<u32> = tokens
+            .iter()
+            .filter_map(|t| match t.value {
+                TokenValue::Special(code) => Some(code),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got, want, "{src:?}");
     }
 }

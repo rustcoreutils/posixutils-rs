@@ -274,6 +274,22 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
+    /// C17 6.10.3p5: `__VA_ARGS__` occurs only in the replacement list of a
+    /// macro whose parameter list ends in `...`. gcc warns about any other
+    /// occurrence -- a macro or parameter name, a `#if` operand, ordinary
+    /// text, the body of a non-variadic or GNU-named variadic macro -- and so
+    /// does this, from each of those places.
+    pub(super) fn warn_stray_va_args(token: &Token, idents: &IdentTable) {
+        let is_va_args = matches!(&token.value, TokenValue::Ident(id)
+            if token.typ == TokenType::Ident && idents.get_opt(*id) == Some("__VA_ARGS__"));
+        if is_va_args {
+            diag::warning(
+                token.pos,
+                &gettext("__VA_ARGS__ can only appear in the expansion of a C99 variadic macro"),
+            );
+        }
+    }
+
     /// The macro name a `#define`, `#undef`, `#ifdef` or `#ifndef` operates on.
     ///
     /// `None` means the directive was malformed and has been diagnosed; the
@@ -290,6 +306,7 @@ impl<'a> Preprocessor<'a> {
             diag::error_args(pos, "no macro name given in #{0} directive", &[directive]);
             return None;
         };
+        Self::warn_stray_va_args(&token, idents);
         match &token.value {
             TokenValue::Ident(id) if token.typ == TokenType::Ident => {
                 Some(idents.get_opt(*id)?.to_string())
@@ -430,6 +447,7 @@ impl<'a> Preprocessor<'a> {
                                     break;
                                 }
                                 TokenValue::Ident(id) => {
+                                    Self::warn_stray_va_args(&param_tok, idents);
                                     if let Some(param_name) = idents.get_opt(*id) {
                                         // C17 6.10.3p6: the parameters have to
                                         // be distinct.
@@ -480,8 +498,27 @@ impl<'a> Preprocessor<'a> {
             return;
         }
 
+        // C17 6.10.3p3: an object-like macro's replacement list is separated
+        // from its name by white space. gcc diagnoses `#define A+1` and still
+        // defines `A` as `+1`, and so does this.
+        if !is_function {
+            if let Some(next) = iter.peek() {
+                if !next.pos.newline && !next.pos.whitespace {
+                    diag::warning(
+                        next.pos,
+                        &gettext("ISO C99 requires whitespace after the macro name"),
+                    );
+                }
+            }
+        }
+
         // Collect body tokens
         let body_tokens = self.collect_to_eol(iter);
+        if !(is_variadic && variadic_name.is_none()) {
+            for token in &body_tokens {
+                Self::warn_stray_va_args(token, idents);
+            }
+        }
         let body = self.tokens_to_macro_body(
             &body_tokens,
             &params,
@@ -522,11 +559,22 @@ impl<'a> Preprocessor<'a> {
             return;
         }
 
-        if let Some(name) = self.macro_name_operand(iter, idents, "undef", pos) {
+        let Some(name) = self.macro_name_operand(iter, idents, "undef", pos) else {
+            self.skip_to_eol(iter);
+            return;
+        };
+        // C17 6.10.8p2: the standard's predefined names may not be the
+        // subject of `#undef`; gcc warns, and so does this. `defined` is
+        // refused outright, as it is for `#define`.
+        if name == "defined" {
+            diag::error(pos, &gettext("\"defined\" cannot be used as a macro name"));
+        } else {
+            if is_standard_predefined(&name) {
+                diag::warning_args(pos, "undefining \"{0}\"", &[&name]);
+            }
             self.undef_macro(&name);
         }
-
-        self.skip_to_eol(iter);
+        self.warn_extra_tokens(iter, "undef");
     }
 
     fn handle_ifdef(&mut self, iter: &mut TokenCursor, idents: &IdentTable, pos: Position) {
@@ -549,6 +597,9 @@ impl<'a> Preprocessor<'a> {
             None => false,
         };
 
+        if name.is_some() {
+            self.warn_extra_tokens(iter, "ifdef");
+        }
         self.skip_to_eol(iter);
         self.push_conditional(take_branch, pos);
     }
@@ -566,6 +617,9 @@ impl<'a> Preprocessor<'a> {
             None => false,
         };
 
+        if name.is_some() {
+            self.warn_extra_tokens(iter, "ifndef");
+        }
         self.skip_to_eol(iter);
         self.push_conditional(take_branch, pos);
     }
@@ -692,8 +746,8 @@ impl<'a> Preprocessor<'a> {
         // If the first token is not < or ", expand macros first
         let needs_expansion = match &path_tokens[0].value {
             TokenValue::Special(code) => *code != b'<' as u32,
-            TokenValue::String(_) => false, // Already a string literal
-            _ => true,                      // Identifier or other - needs expansion
+            TokenValue::String(_) | TokenValue::HeaderName(_) => false,
+            _ => true, // Identifier or other - needs expansion
         };
 
         let expanded_tokens = if needs_expansion {
@@ -713,7 +767,23 @@ impl<'a> Preprocessor<'a> {
         };
 
         // Determine if system include (<...>) or quoted ("...")
-        let (filename, is_system) = self.parse_include_path(&expanded_tokens, idents);
+        let Some((filename, is_system)) = self.parse_include_path(&expanded_tokens, idents) else {
+            diag::error(
+                hash_token.pos,
+                &gettext("#include expects \"FILENAME\" or <FILENAME>"),
+            );
+            return;
+        };
+        let header_name = matches!(
+            expanded_tokens[0].value,
+            TokenValue::String(_) | TokenValue::HeaderName(_)
+        );
+        if header_name && expanded_tokens.len() > 1 {
+            diag::warning(
+                expanded_tokens[1].pos,
+                &gettext("extra tokens at end of #include directive"),
+            );
+        }
 
         if filename.is_empty() {
             diag::error(hash_token.pos, &gettext("empty filename in #include"));
@@ -740,10 +810,11 @@ impl<'a> Preprocessor<'a> {
         }
     }
 
-    /// Parse include path from tokens
-    fn parse_include_path(&self, tokens: &[Token], idents: &IdentTable) -> (String, bool) {
+    /// The header a `#include` operand names, and whether it was spelled
+    /// `<...>`. `None` when the operand is neither form of C17 6.10.2p2-4.
+    fn parse_include_path(&self, tokens: &[Token], idents: &IdentTable) -> Option<(String, bool)> {
         if tokens.is_empty() {
-            return (String::new(), false);
+            return Some((String::new(), false));
         }
 
         // A header name the lexer already recognised (C99 6.4.7): one token,
@@ -755,7 +826,7 @@ impl<'a> Preprocessor<'a> {
                 .strip_prefix(['<', '"'])
                 .and_then(|r| r.strip_suffix(['>', '"']))
                 .unwrap_or(&spelled);
-            return (name.to_string(), is_system);
+            return Some((name.to_string(), is_system));
         }
 
         // Otherwise the header name came out of a macro expansion, and has to
@@ -776,21 +847,19 @@ impl<'a> Preprocessor<'a> {
                         filename.push_str(&self.token_to_string(token, idents));
                     }
                 }
-                return (filename, true);
+                return Some((filename, true));
             }
         }
 
         // Check for "filename"
         if let TokenValue::String(s) = &tokens[0].value {
-            return (payload_text(s), false);
+            return Some((payload_text(s), false));
         }
 
-        // Fallback: try to reconstruct from tokens
-        let mut filename = String::new();
-        for token in tokens {
-            filename.push_str(&self.token_to_string(token, idents));
-        }
-        (filename, false)
+        // C17 6.10.2p4: after replacement the operand has to match one of
+        // the two forms. A bare `#include stdio.h` matches neither, and gcc
+        // rejects it rather than guessing the delimiters.
+        None
     }
 
     /// Note a header this translation unit depends on, found at `pos` on the
@@ -1521,12 +1590,12 @@ impl<'a> Preprocessor<'a> {
             );
             return;
         }
+        // gcc warns and still takes the line number and file name.
         if tokens.len() > 2 {
-            diag::error(
+            diag::warning(
                 tokens[2].pos,
-                &gettext("extra tokens after #line directive"),
+                &gettext("extra tokens at end of #line directive"),
             );
-            return;
         }
 
         // The #line directive takes effect on the next line, so
@@ -1554,7 +1623,9 @@ impl<'a> Preprocessor<'a> {
             return false;
         }
 
-        let (filename, is_system) = self.parse_include_path(&args[0], idents);
+        let Some((filename, is_system)) = self.parse_include_path(&args[0], idents) else {
+            return false;
+        };
         self.find_include_file(&filename, is_system, is_include_next)
             .is_some()
     }

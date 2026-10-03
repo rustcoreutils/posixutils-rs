@@ -15,4 +15,5 @@ mod conformance;
 mod directives;
 mod end_of_file;
 mod macros;
+mod pp_diagnostics;
 mod std_dialect;

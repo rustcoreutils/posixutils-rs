@@ -27,8 +27,9 @@ fn main() {
 
     let args = Args::parse();
 
+    // Ignore the SIGALRM signal (Windows has none).
+    #[cfg(unix)]
     unsafe {
-        // Ignore the SIGALRM signal
         libc::signal(libc::SIGALRM, libc::SIG_IGN);
     }
 

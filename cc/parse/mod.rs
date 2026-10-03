@@ -25,12 +25,15 @@ mod expr_check;
 mod expression;
 mod generic_builtin;
 mod library_builtin;
+mod linkage;
 mod operand_rule;
 pub mod parser;
 mod statement;
 mod toplevel;
 mod typename;
 
+#[cfg(test)]
+mod test_declarations;
 #[cfg(test)]
 mod test_incomplete;
 #[cfg(test)]

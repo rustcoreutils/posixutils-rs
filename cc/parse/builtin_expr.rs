@@ -1470,7 +1470,8 @@ impl Parser<'_> {
                     params: None,
                     ..Default::default()
                 });
-                let symbol = Symbol::function(name_id, func_type, self.symbols.depth());
+                let symbol = Symbol::function(name_id, func_type, self.symbols.depth())
+                    .with_linkage(crate::symbol::Linkage::External);
                 self.symbols
                     .declare(symbol)
                     .map_err(|_| ParseError::new("cannot declare an implicit function", pos))?
@@ -2248,7 +2249,8 @@ impl Parser<'_> {
             }
             return Some(existing);
         }
-        let sym = Symbol::function(name_id, func_type, 0);
+        let sym =
+            Symbol::function(name_id, func_type, 0).with_linkage(crate::symbol::Linkage::External);
         self.symbols.declare(sym).ok()
     }
 }

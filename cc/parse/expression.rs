@@ -2383,11 +2383,14 @@ impl<'a> Parser<'a> {
                             params: None,
                             ..Default::default()
                         });
+                        // An implicit declaration is `extern int f();` (C89
+                        // 6.3.2.2), so it has external linkage.
                         let symbol = crate::symbol::Symbol::function(
                             name_id,
                             func_type,
                             self.symbols.depth(),
-                        );
+                        )
+                        .with_linkage(crate::symbol::Linkage::External);
                         let symbol_id = self.symbols.declare(symbol).unwrap_or_else(|_| {
                             self.symbols
                                 .lookup_id(name_id, crate::symbol::Namespace::Ordinary)

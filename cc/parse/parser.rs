@@ -235,6 +235,10 @@ pub struct Parser<'a> {
     /// Judged at end of translation unit -- see
     /// [`Self::check_deferred_incomplete_definitions`].
     pub(super) tentative_definitions: Vec<(TypeId, Position)>,
+    /// File-scope array definitions written without an extent, each with
+    /// where it was declared. A later declaration may still give the extent
+    /// (C17 6.9.2p2); see [`Self::complete_tentative_arrays`].
+    pub(super) tentative_arrays: Vec<(SymbolId, Position)>,
     /// Alignment from an attribute written *after* a declarator.
     ///
     /// Kept apart from `pending_alignas` because the two have different
@@ -299,6 +303,9 @@ pub struct Parser<'a> {
     /// reason as `declared_extern_fns`: a later declaration binds a fresh
     /// symbol that knows nothing of the body.
     pub(super) defined_functions: std::collections::HashSet<StringId>,
+    /// Every identifier with linkage declared so far, in any scope; see
+    /// [`super::linkage`].
+    pub(super) linked_names: std::collections::HashMap<StringId, super::linkage::LinkedName>,
     /// `#pragma pack` directives, and where they stood in the token stream.
     ///
     /// Sorted by index; `pack_cursor` is how far the parser has consumed
@@ -357,6 +364,7 @@ impl<'a> Parser<'a> {
             pending_attr_align: None,
             pending_transparent_union: None,
             tentative_definitions: Vec::new(),
+            tentative_arrays: Vec::new(),
             pending_declarator_align: None,
             pending_symbol_attrs: Default::default(),
             pending_fn_attrs: Default::default(),
@@ -368,6 +376,7 @@ impl<'a> Parser<'a> {
             declared_extern_fns: std::collections::BTreeSet::new(),
             declared_non_inline_fns: std::collections::BTreeSet::new(),
             defined_functions: std::collections::HashSet::new(),
+            linked_names: std::collections::HashMap::new(),
             pack_directives,
             pack_cursor: 0,
             vm_typedefs: HashMap::new(),

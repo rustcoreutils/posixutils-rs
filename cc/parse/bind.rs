@@ -13,6 +13,7 @@
 use super::ast::{Declaration, Expr, ExternalDecl, FunctionAttrs, InitDeclarator};
 use super::attribute::SpecifierAttrs;
 use super::declaration::{Redeclared, SpecContext};
+use super::linkage::Declared;
 use super::parser::{DeclaratorContext, ParseError, ParseResult, ParsedDeclarator, Parser};
 use crate::diag;
 use crate::strings::StringId;
@@ -119,6 +120,9 @@ impl Parser<'_> {
         }
 
         let mut specs = self.parse_decl_specs(scope)?;
+        if scope == (DeclScope::Block { for_init: true }) {
+            self.check_for_init_declares_no_tag(&specs);
+        }
         let mut declarators = Vec::new();
         if let DeclScope::Block { .. } = scope {
             // At file scope a variably modified specifier is refused with the
@@ -159,6 +163,28 @@ impl Parser<'_> {
         self.expect_special(b';')?;
         self.end_declaration();
         Ok(ExternalDecl::Declaration(Declaration { declarators }))
+    }
+
+    /// C17 6.8.5p3: the declaration in a `for` declares objects only, so a
+    /// tag it declares -- `for (struct S { int a; } s;;)` -- is refused. The
+    /// `for` has a scope of its own, so a tag in it was declared right here.
+    fn check_for_init_declares_no_tag(&self, specs: &DeclSpecs) {
+        let keyword = match specs.ty.kind {
+            TypeKind::Struct => "struct",
+            TypeKind::Union => "union",
+            TypeKind::Enum => "enum",
+            _ => return,
+        };
+        let Some(tag) = specs.ty.composite.as_ref().and_then(|c| c.tag) else {
+            return;
+        };
+        if self.symbols.lookup_tag_in_current_scope(tag).is_some() {
+            diag::error_args(
+                specs.pos,
+                "'{0} {1}' declared in 'for' loop initial declaration",
+                &[keyword, self.idents.get_opt(tag).unwrap_or("")],
+            );
+        }
     }
 
     /// Parse the declaration specifiers and check what they may combine.
@@ -217,11 +243,12 @@ impl Parser<'_> {
             }
         }
         // C11 6.7.1p2: _Thread_local shall not appear in a declaration with
-        // auto or register
+        // auto or register -- nor with typedef, which is a storage class too.
         if modifiers.contains(TypeModifiers::THREAD_LOCAL) {
             for (bit, what) in [
                 (TypeModifiers::AUTO, "auto"),
                 (TypeModifiers::REGISTER, "register"),
+                (TypeModifiers::TYPEDEF, "typedef"),
             ] {
                 if modifiers.contains(bit) {
                     return Err(ParseError::new(
@@ -280,6 +307,10 @@ impl Parser<'_> {
         }
 
         let is_fn = self.types.kind(typ) == TypeKind::Function;
+        self.check_derived_types(typ, name, pos);
+        if !is_typedef {
+            self.check_storage_for_declarator(specs, name, is_fn, scope, pos);
+        }
         let fn_attrs = if is_fn {
             self.function_declarator_attrs(specs, name, &mut typ)
         } else {
@@ -303,6 +334,13 @@ impl Parser<'_> {
         }
 
         let (symbol, init) = if is_typedef {
+            if scope == (DeclScope::Block { for_init: true }) {
+                diag::error_args(
+                    pos,
+                    "declaration of non-variable '{0}' in 'for' loop initial declaration",
+                    &[self.idents.get_opt(name).unwrap_or("")],
+                );
+            }
             typ = self.align_typedef_type(typ, align);
             (self.bind_typedef_name(scope, name, pos, typ, &vla)?, None)
         } else {
@@ -310,9 +348,21 @@ impl Parser<'_> {
             // describe it by their composite type.
             typ = self.composite_with_prior_declaration(name, typ, specs.storage_class);
             self.check_redeclaration(name, typ, pos, Redeclared::Declaration);
+            let linkage = self.declare_linkage(Declared {
+                name,
+                typ,
+                pos,
+                storage: specs.storage_class,
+                scope,
+                // An initializer makes an object's declaration a definition
+                // (6.9.2p1); one without is at most a tentative definition.
+                defines: !is_fn && self.is_special(b'='),
+                inline_only: false,
+            });
             let sym = self
                 .declared_symbol(name, typ, align)
-                .with_variably_modified_array(!vla.is_empty());
+                .with_variably_modified_array(!vla.is_empty())
+                .with_linkage(linkage);
             // Bound before the initializer: C99 6.2.1p7 starts the scope just
             // after the declarator, so `int *p = sizeof *p ...` sees `p`.
             let symbol = self.declare_in(scope, sym, name);
@@ -320,6 +370,18 @@ impl Parser<'_> {
                 self.parse_declarator_initializer(specs, scope, name, pos, &mut typ, symbol)?;
             if !is_fn && !specs.is_extern() {
                 self.check_object_complete(scope, name, typ, &vla, pos);
+            }
+            // A tentative definition of an array without its extent, which a
+            // later declaration in the unit may still supply (6.9.2p2).
+            if scope == DeclScope::File
+                && init.is_none()
+                && !specs.is_extern()
+                && self.types.kind(typ) == TypeKind::Array
+                && self.types.unsized_array_levels(typ) > 0
+            {
+                if let Some(id) = symbol {
+                    self.tentative_arrays.push((id, pos));
+                }
             }
             if !is_fn && !vla.is_empty() {
                 self.check_variably_modified_storage(specs.storage_class, name, typ, pos);
@@ -369,6 +431,112 @@ impl Parser<'_> {
         }))
     }
 
+    /// The storage-class and function specifiers a declarator of this kind,
+    /// at this scope, may not have.
+    fn check_storage_for_declarator(
+        &self,
+        specs: &DeclSpecs,
+        name: StringId,
+        is_fn: bool,
+        scope: DeclScope,
+        pos: Position,
+    ) {
+        let storage = specs.storage_class;
+        let spelled = self.idents.get_opt(name).unwrap_or("");
+        let file = scope == DeclScope::File;
+        if is_fn {
+            // 6.7.1p7 (block-scope `static` is reported with linkage).
+            if storage.intersects(
+                TypeModifiers::THREAD_LOCAL | TypeModifiers::AUTO | TypeModifiers::REGISTER,
+            ) {
+                diag::error_args(pos, "invalid storage class for function '{0}'", &[spelled]);
+            }
+            // 6.7.4p4: no function specifier on `main` in a hosted program.
+            if file && spelled == "main" && storage.contains(TypeModifiers::INLINE) {
+                diag::warning(pos, &gettext("cannot inline function 'main'"));
+            }
+            return;
+        }
+        // 6.7.4p1: the function specifiers are for functions only. gcc warns.
+        if storage.contains(TypeModifiers::INLINE) {
+            diag::warning_args(pos, "variable '{0}' declared 'inline'", &[spelled]);
+        }
+        if specs.ty.modifiers.contains(TypeModifiers::NORETURN) {
+            diag::warning_args(pos, "variable '{0}' declared '_Noreturn'", &[spelled]);
+        }
+        if file {
+            // 6.9p2: no `auto` or `register` on an external declaration --
+            // except gcc's global register variable, `register int r
+            // __asm__("r14");`, which names its register.
+            if storage.contains(TypeModifiers::AUTO) {
+                diag::error_args(
+                    pos,
+                    "file-scope declaration of '{0}' specifies 'auto'",
+                    &[spelled],
+                );
+            }
+            if storage.contains(TypeModifiers::REGISTER) && self.pending_asm_label.is_none() {
+                diag::error_args(pos, "register name not specified for '{0}'", &[spelled]);
+            }
+        } else if storage.contains(TypeModifiers::THREAD_LOCAL)
+            && !storage.intersects(TypeModifiers::STATIC | TypeModifiers::EXTERN)
+        {
+            // 6.7.1p3: at block scope `_Thread_local` needs `static` or
+            // `extern`; alone it was silently an automatic variable.
+            diag::error_args(
+                pos,
+                "function-scope '{0}' implicitly auto and declared '_Thread_local'",
+                &[spelled],
+            );
+        }
+    }
+
+    /// Report what C forbids in the type a declarator derived: a function
+    /// returning an array or a function (C17 6.7.6.3p1), and `restrict` on
+    /// anything but a pointer to an object type (6.7.3p2). The parameter
+    /// types of a function type are walked too, so `void f(restrict int x)`
+    /// is caught with its function.
+    pub(super) fn check_derived_types(&self, typ: TypeId, name: StringId, pos: Position) {
+        let spelled = self.idents.get_opt(name).unwrap_or("type name");
+        let t = self.types.get(typ);
+        if t.modifiers.contains(TypeModifiers::RESTRICT) {
+            let restrictable = t.kind == TypeKind::Pointer
+                && t.base
+                    .is_some_and(|b| self.types.kind(b) != TypeKind::Function);
+            if !restrictable {
+                diag::error(pos, &gettext("invalid use of 'restrict'"));
+            }
+        }
+        match t.kind {
+            TypeKind::Function => {
+                let ret = t.base.expect("a function type has a return type");
+                let params = t.params.clone().unwrap_or_default();
+                match self.types.kind(ret) {
+                    TypeKind::Array => diag::error_args(
+                        pos,
+                        "'{0}' declared as function returning an array",
+                        &[spelled],
+                    ),
+                    TypeKind::Function => diag::error_args(
+                        pos,
+                        "'{0}' declared as function returning a function",
+                        &[spelled],
+                    ),
+                    _ => self.check_derived_types(ret, name, pos),
+                }
+                for param in params {
+                    self.check_derived_types(param, StringId::EMPTY, pos);
+                }
+            }
+            TypeKind::Pointer | TypeKind::Array => {
+                if let Some(base) = t.base {
+                    self.check_derived_types(base, name, pos);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Bind a typedef name. A typedef takes no initializer, and one of a
     /// variably modified type remembers how many extents it carries, so a use
     /// can name each of them: they cannot be recovered from the type --
@@ -386,6 +554,25 @@ impl Parser<'_> {
                 "typedef cannot have initializer",
                 self.current_pos(),
             ));
+        }
+        // 6.7p3: a typedef name may be redefined in its scope only to the
+        // same type, which is never the case for a variably modified one --
+        // its extents are evaluated anew each time.
+        let existing_here = self
+            .symbols
+            .lookup_id(name, Namespace::Ordinary)
+            .filter(|&id| {
+                let s = self.symbols.get(id);
+                s.is_typedef() && s.scope_depth == self.symbols.depth()
+            });
+        if let Some(id) = existing_here {
+            if !extents.is_empty() || self.vm_typedefs.contains_key(&id) {
+                diag::error_args(
+                    pos,
+                    "redefinition of typedef '{0}' with variably modified type",
+                    &[self.idents.get_opt(name).unwrap_or("")],
+                );
+            }
         }
         self.check_typedef_redefinition(name, typ, pos);
         let sym = Symbol::typedef(name, typ, self.symbols.depth());

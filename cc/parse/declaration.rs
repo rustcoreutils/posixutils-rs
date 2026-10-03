@@ -1439,7 +1439,12 @@ impl Parser<'_> {
     /// to its return type. 6.2.7p3 would compare each prototype parameter
     /// with the promoted type of its identifier, but gcc accepts `int f(char);
     /// int f(c) char c; { ... }` and objects only under `-pedantic`.
-    fn redeclaration_compatible(&self, old: TypeId, new: TypeId, form: Redeclared) -> bool {
+    pub(super) fn redeclaration_compatible(
+        &self,
+        old: TypeId,
+        new: TypeId,
+        form: Redeclared,
+    ) -> bool {
         if self.types.types_compatible(old, new) {
             return true;
         }
@@ -1601,11 +1606,23 @@ impl Parser<'_> {
     /// conforming, since 6.7p2 asks only for a diagnostic.)
     pub(super) fn check_declares_something(&mut self, pos: Position, base_type: &Type) {
         // A tag -- declared or defined -- is the thing this declaration form
-        // exists to express, so it always counts.
+        // exists to express, so it always counts. A structure or union with
+        // no tag declares nothing it could be named by again (an enumeration
+        // still declares its constants), which gcc warns about.
         if matches!(
             base_type.kind,
             TypeKind::Struct | TypeKind::Union | TypeKind::Enum
         ) {
+            let untagged = base_type
+                .composite
+                .as_ref()
+                .is_some_and(|c| c.tag.is_none());
+            if untagged && base_type.kind != TypeKind::Enum {
+                diag::warning(
+                    pos,
+                    &gettext("unnamed struct/union that defines no instances"),
+                );
+            }
             return;
         }
 

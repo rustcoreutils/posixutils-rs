@@ -16,15 +16,17 @@ use super::ast::{
 };
 use super::bind::{DeclScope, DeclSpecs};
 use super::declaration::{Redeclared, SpecContext};
+use super::linkage::Declared;
 use super::parser::{
     DeclaratorContext, EnclosingFunction, ParseError, ParseResult, ParsedDeclarator, Parser,
     RawParam,
 };
 use crate::diag;
 use crate::strings::StringId;
-use crate::symbol::Symbol;
+use crate::symbol::{Symbol, SymbolId};
 use crate::token::lexer::{payload_text, Position, TokenType};
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
+use std::collections::HashMap;
 
 impl Parser<'_> {
     pub fn parse_translation_unit(&mut self) -> ParseResult<TranslationUnit> {
@@ -40,8 +42,76 @@ impl Parser<'_> {
         }
 
         self.check_deferred_incomplete_definitions();
+        self.complete_tentative_arrays(&mut tu);
 
         Ok(tu)
+    }
+
+    /// C17 6.9.2p2: an array defined without its extent -- `static int a[];`
+    /// -- may be completed by a later declaration in the unit, and only one
+    /// still incomplete at its end is an array of one element, which gcc
+    /// assumes with a warning. The warning is given here, at the object's
+    /// last definition, since the declaration itself cannot know what
+    /// follows it.
+    ///
+    /// Every declarator of the object then takes its final type, since any
+    /// of them may be the one whose storage is emitted: `int a[]; int a[3];`
+    /// reserved the first declaration's size, and `a[2]` overlapped the next
+    /// object.
+    fn complete_tentative_arrays(&mut self, tu: &mut TranslationUnit) {
+        let recorded = std::mem::take(&mut self.tentative_arrays);
+        if recorded.is_empty() {
+            return;
+        }
+        // Each object once, in declaration order, at its last definition.
+        let mut last: HashMap<SymbolId, Position> = HashMap::new();
+        let mut order: Vec<SymbolId> = Vec::new();
+        for (id, pos) in recorded {
+            if last.insert(id, pos).is_none() {
+                order.push(id);
+            }
+        }
+        for &id in &order {
+            let typ = self.symbols.get(id).typ;
+            if self.types.unsized_array_levels(typ) == 0 {
+                continue;
+            }
+            let name = self.symbols.get(id).name;
+            let spelled = self.idents.get_opt(name).unwrap_or("");
+            // A block-scope `extern` may have given the object its extent.
+            let completed = match self.linked_type(name) {
+                Some((linked, late)) if self.types.unsized_array_levels(linked) == 0 => {
+                    if late && self.types.get(linked).array_size != Some(1) {
+                        diag::error_args(
+                            last[&id],
+                            "type of array '{0}' completed incompatibly with implicit initialization",
+                            &[spelled],
+                        );
+                    }
+                    self.types.without_decl_specifiers(linked)
+                }
+                _ => {
+                    diag::warning_args(
+                        last[&id],
+                        "array '{0}' assumed to have one element",
+                        &[spelled],
+                    );
+                    let elem = self.types.base_type(typ).unwrap_or(self.types.int_id);
+                    self.types.intern(Type::array(elem, 1))
+                }
+            };
+            self.symbols.get_mut(id).typ = completed;
+        }
+        for item in &mut tu.items {
+            let ExternalDecl::Declaration(decl) = item else {
+                continue;
+            };
+            for d in &mut decl.declarators {
+                if last.contains_key(&d.symbol) && self.types.unsized_array_levels(d.typ) > 0 {
+                    d.typ = self.symbols.get(d.symbol).typ;
+                }
+            }
+        }
     }
 
     /// C17 6.7p7: an object's type must be complete where the object is
@@ -264,9 +334,25 @@ impl Parser<'_> {
             ParamStyle::IdentifierList => Redeclared::IdentifierListDefinition,
         };
         self.check_redeclaration(name, typ, pos, form);
+        // A GNU inline-only body -- `extern inline` under `gnu_inline`
+        // semantics -- emits nothing, so a real definition may join it.
+        let gnu_inline = attrs.gnu_inline || crate::builtins::gnu89_inline();
+        let inline_only = gnu_inline
+            && specs
+                .storage_class
+                .contains(TypeModifiers::EXTERN | TypeModifiers::INLINE);
+        let linkage = self.declare_linkage(Declared {
+            name,
+            typ,
+            pos,
+            storage: specs.storage_class,
+            scope: DeclScope::File,
+            defines: true,
+            inline_only,
+        });
         let _ = self
             .symbols
-            .declare(Symbol::function(name, typ, self.symbols.depth()));
+            .declare(Symbol::function(name, typ, self.symbols.depth()).with_linkage(linkage));
         // A weak definition may be replaced at link time, so gcc leaves the
         // builtin in place of it; so does this.
         if !attrs.symbol.weak {

@@ -897,8 +897,8 @@ int main(void) {
     long l = (long)a;
     if (l != 3L) return 33;
 
-    _Float16 neg = -3.5f16;
-    if ((int)neg != -3) return 34;
+    _Float16 neg_half = -3.5f16;
+    if ((int)neg_half != -3) return 34;
 
     _Float16 from_long = (_Float16)1234L;
     if ((float)from_long < 1233.0f || (float)from_long > 1235.0f) return 35;

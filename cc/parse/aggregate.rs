@@ -242,6 +242,9 @@ impl Parser<'_> {
 
             // A forward reference to the tag made an incomplete enum; the
             // definition completes that same type, as a struct's does.
+            if let Some(redefined) = tag.and_then(|t| self.reused_tag(t, TypeKind::Enum)) {
+                return Ok(self.types.get(redefined).clone());
+            }
             if let Some(existing) = tag.and_then(|t| self.symbols.lookup_tag_in_current_scope(t)) {
                 let existing_typ = existing.typ;
                 let forward = self.types.get(existing_typ);
@@ -280,7 +283,9 @@ impl Parser<'_> {
             if let Some(tag_name) = tag {
                 // Look up or create incomplete type
                 if let Some(existing) = self.symbols.lookup_tag(tag_name) {
-                    Ok(self.types.get(existing.typ).clone())
+                    let existing = existing.typ;
+                    self.check_tag_kind(tag_name, existing, TypeKind::Enum);
+                    Ok(self.types.get(existing).clone())
                 } else {
                     // Registered, so that the definition completes this
                     // same type rather than making another.
@@ -296,6 +301,54 @@ impl Parser<'_> {
                 ))
             }
         }
+    }
+
+    /// For the definition of a tag of `kind` in this scope: the type to answer
+    /// instead, when an earlier declaration of the tag here forbids it --
+    /// one of another kind (C17 6.7.2.3p2), or one already defined
+    /// (6.7.2.3p1). `None` when the definition may go ahead.
+    fn reused_tag(&self, tag: StringId, kind: TypeKind) -> Option<TypeId> {
+        let existing = self.symbols.lookup_tag_in_current_scope(tag)?.typ;
+        if !self.check_tag_kind(tag, existing, kind) {
+            return Some(existing);
+        }
+        let complete = self
+            .types
+            .get(existing)
+            .composite
+            .as_ref()
+            .is_some_and(|c| c.is_complete);
+        if !complete {
+            return None;
+        }
+        let keyword = match kind {
+            TypeKind::Union => "union",
+            TypeKind::Enum => "enum",
+            _ => "struct",
+        };
+        let spelled = self.idents.get_opt(tag).unwrap_or("");
+        diag::error_args(
+            self.current_pos(),
+            "redefinition of '{0} {1}'",
+            &[keyword, spelled],
+        );
+        Some(existing)
+    }
+
+    /// C17 6.7.2.3p2: a tag names one kind of type. `struct S` and `union
+    /// S` in one scope are a constraint violation, reported here; answers
+    /// whether `existing` has the `kind` asked for.
+    fn check_tag_kind(&self, tag: StringId, existing: TypeId, kind: TypeKind) -> bool {
+        if self.types.kind(existing) == kind {
+            return true;
+        }
+        let spelled = self.idents.get_opt(tag).unwrap_or("");
+        diag::error_args(
+            self.current_pos(),
+            "'{0}' defined as wrong kind of tag",
+            &[spelled],
+        );
+        false
     }
 
     /// The attributes written between a tag keyword and its tag, and the
@@ -437,6 +490,14 @@ impl Parser<'_> {
             };
 
             // Check if there's an existing forward declaration that we should complete
+            let kind = if is_union {
+                TypeKind::Union
+            } else {
+                TypeKind::Struct
+            };
+            if let Some(redefined) = tag.and_then(|t| self.reused_tag(t, kind)) {
+                return Ok(self.types.get(redefined).clone());
+            }
             if let Some(tag_name) = tag {
                 if let Some(existing) = self.symbols.lookup_tag_in_current_scope(tag_name) {
                     // Complete the existing forward-declared type in place
@@ -490,7 +551,14 @@ impl Parser<'_> {
                     self.symbols.lookup_tag(tag_name)
                 };
                 if let Some(existing) = existing {
-                    Ok(self.types.get(existing.typ).clone())
+                    let existing = existing.typ;
+                    let kind = if is_union {
+                        TypeKind::Union
+                    } else {
+                        TypeKind::Struct
+                    };
+                    self.check_tag_kind(tag_name, existing, kind);
+                    Ok(self.types.get(existing).clone())
                 } else {
                     // Create new incomplete type and register it in symbol table
                     // This ensures that when the type is completed later, we can update

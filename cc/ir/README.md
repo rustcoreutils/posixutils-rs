@@ -112,8 +112,9 @@ changing something leaves work undone. The rules every pass follows:
   `constfold`. "What constant is this?" is `facts::ConstMap`. Rewriting a
   proven constant or branch is `propagate`. A sparse conditional analysis is a
   lattice plugged into `dataflow`. Memory questions go to `memloc` (where does
-  this point), `escape` (can anything else reach this local) and `effects`
-  (what can this call touch).
+  this point, and what may this instruction read and write: `AddrMap::access`),
+  `escape` (can anything else reach this local) and `effects` (what can this
+  call touch).
 - **Respect what is observable.** A volatile access
   (`is_volatile_access`) is never deleted, merged or moved. An opcode with
   `has_side_effects` is a root for DCE. `may_access_memory` says how far an
@@ -206,7 +207,7 @@ The result is `typ`/`size`; the operands' type and width are
 | `setlt`, `setle`, `setgt`, `setge` | Signed `<`, `<=`, `>`, `>=` |
 | `setb`, `setbe`, `seta`, `setae` | Unsigned `<`, `<=`, `>`, `>=` ("below", "above") |
 | `fcmp_oeq`, `fcmp_olt`, `fcmp_ole`, `fcmp_ogt`, `fcmp_oge` | Ordered `==`, `<`, `<=`, `>`, `>=`: false when either operand is a NaN |
-| `fcmp_one` | C's `!=`, which despite the name is **unordered**: true when either operand is a NaN (`constfold::fcmp_mask`) |
+| `fcmp_one` | C's `!=`, which despite the name is **unordered**: true when either operand is a NaN (`constfold::Outcomes::of_op`) |
 
 ### Type Conversions
 
@@ -407,7 +408,7 @@ Arg(u32)    - function argument %arg{n}
 Phi(u32)    - phi result %phi{n}
 Sym(String) - symbol reference
 Val(i128)   - integer constant ${n} (wide enough for `__int128` constants)
-FVal(f64)   - float constant ${n}
+FVal(FloatVal) - float constant ${n}
 ```
 
 ### Instruction Fields
@@ -477,21 +478,33 @@ read it.
 
 ```
 name                    - function name
+symbol_attrs            - weak, used, section, visibility
+align                   - aligned(N) for the function's code
 return_type             - return TypeId
 params                  - [(name, TypeId), ...]
+conv                    - calling convention of the function's type
 blocks                  - basic blocks
 entry                   - entry block ID
-pseudos                 - all pseudos
+pseudos                 - all pseudos, indexed by PseudoId
+next_pseudo             - next PseudoId to allocate
 locals                  - local variable map
-is_static/inline/noreturn - attributes
+emit                    - false for a body kept only for the inliner
+is_static/is_inline/is_noreturn - linkage and declaration attributes
+is_noinline/is_always_inline    - inliner attributes
+declared_effect         - pure/const, as written
+takes_label_addr        - takes the address of one of its own labels
+saves_label_in_static   - a label address initializes a static object
+constructor/destructor  - .init_array/.fini_array entry, optional priority
 ```
 
 ### Module
 
 ```
 functions               - all functions
-globals                 - [(name, TypeId, Initializer), ...]
-strings/wide_strings    - string literals
+globals                 - [GlobalDef, ...]
+strings                 - narrow string literals, (label, content)
+utf16_strings           - `u"..."` literals, as 2-byte code units
+utf32_strings           - `U"..."` and `L"..."` literals, as 4-byte code units
 extern_symbols          - symbols needing GOT
 ```
 
@@ -573,14 +586,14 @@ after that, because merging would undo the splitting the copies depend on. See
 
 | File | Purpose |
 |------|---------|
-| `validate.rs` | The IR invariants: single definition; phi arity matching the predecessors; one terminator, at the end of the block; `parents`/`children` matching what the instructions name; branch targets that exist; operand types; paired lifetime markers; displacements in range; and every memory access or barrier counted as a side effect. Run at every stage listed above |
+| `validate.rs` | The IR invariants: single definition; phi arity matching the predecessors; one terminator, at the end of the block; `parents`/`children` matching what the instructions name; branch targets that exist; operand types; every lifetime marker naming a local of its function; and displacements in range. Run at every stage listed above. That every memory access or barrier counts as a side effect is a property of the opcode table, tested over `Opcode::ALL` |
 | `dominate.rs` | Dominator tree by Lengauer–Tarjan (simple form, O(E log V)), and iterated dominance frontiers by Sreedhar–Gao. It returns a `DomTree` snapshot rather than writing into the blocks |
 | `dataflow.rs` | The sparse conditional solver that `sccp` and `vrp` share: seeding, executable-edge marking, the worklists, the step budget, and rewriting what a solution proves. A pass supplies only the lattice and the transfer functions |
 | `range.rs` | A set of W-bit integers as one interval that may wrap, which answers signed and unsigned questions alike, plus its transfer functions. It has no IR types, so it is tested exhaustively at four bits |
 | `constfold.rs` | Evaluates one operation over constants, at the operand's width and the signedness the opcode implies, for integer and floating types. It is the one copy of these rules, shared by `instcombine`, `sccp`, `vrp`, `copyprop` and both back ends |
 | `facts.rs` | Function-wide queries a pass builds before rewriting anything: `ConstMap` (the constant a pseudo holds) and `CmpFacts` (the comparison that defined it). They are sound without dominance only because of SSA's single definition, so they must not be used after `lower` |
-| `propagate.rs` | The rewrites an analysis performs once it has proved something: a value becomes a constant, a conditional terminator a `br`. Shared by `sccp` and `vrp` |
-| `memloc.rs` | What an address points to (a base, a constant byte offset and a width), whether two accesses can overlap, and module-wide facts about globals |
+| `propagate.rs` | The rewrites a pass performs once it has proved something: a value becomes a copy of an integer constant (`sccp`, `vrp`, `instcombine`), a target becomes the constant its `SetVal` defines (`instcombine`, `constglobal`), a conditional terminator becomes a `br` (`sccp`, `vrp`). Each guards its own admissibility, so no pass rewrites a constant by hand |
+| `memloc.rs` | What an address points to (a base, a constant byte offset and a width), whether two accesses can overlap, what each instruction may read and write (the one opcode table `loadfwd`, `dse` and `effects` project), and module-wide facts about globals |
 | `escape.rs` | Which locals' addresses can reach a callee, an asm statement or another thread. A call cannot write a local that does not escape |
 | `effects.rs` | What a call may do to memory, from the callee's attributes and from its body within this translation unit |
 | `strdata.rs` | The bytes of objects whose contents hold for the whole run (string literals, and `const` `char` arrays under `constglobal`'s rule), and the string a pointer into one reads. For a length it also gives the one length every `sel` and φ arm agree on, which for a local array comes from what `MemOracle` says the earlier stores left in it |

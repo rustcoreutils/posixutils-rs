@@ -10,12 +10,13 @@
 // and the moves that place operands where a constraint demands
 //
 
+use crate::arch::asm_constraints::{canonical_int, AsmOperandClass, AsmRegClass, X87Slot};
+use crate::arch::codegen::{impossible_constant, AsmOperandValue};
 use crate::arch::lir::{Directive, FpSize};
 use crate::arch::x86_64::codegen::X86_64CodeGen;
 use crate::arch::x86_64::lir::X86Inst;
-use crate::arch::x86_64::regalloc::{Loc, Reg, XmmReg};
+use crate::arch::x86_64::regalloc::{asm_pinned_regs, Loc, Reg, XmmReg};
 use crate::ir::{AsmConstraint, AsmData, Instruction, PseudoId};
-use crate::target::Os;
 
 /// Everything the two operand-building passes accumulate before any code is
 /// emitted, bundled because both passes touch nearly all of it: as separate
@@ -78,26 +79,58 @@ struct X87Operand {
     size: u32,
 }
 
-/// Whether an asm constraint names the x87 register stack: `f` any of it,
-/// `t` its top and `u` the register below. On x86 these are not SSE classes.
+/// The x87 stack slot an operand's class asks for: `f` any of it, `t` its
+/// top and `u` the register below. On x86 these are not SSE classes.
 ///
 /// The register allocator asks the same question, so that an x87 operand
 /// gets a floating-point home -- and a `long double` one a stack slot, the
 /// only place an 80-bit value can live -- rather than a general register.
-pub(super) fn is_x87_constraint(constraint: &str) -> bool {
-    constraint.chars().any(|c| matches!(c, 'f' | 't' | 'u'))
+fn x87_slot(class: &AsmOperandClass) -> Option<X87Slot> {
+    match class.reg {
+        Some(AsmRegClass::X87(slot)) => Some(slot),
+        _ => None,
+    }
+}
+
+/// The class a template substitution follows: a tied input's is the output's
+/// it names.
+fn effective_class<'a>(asm: &'a AsmData, c: &'a AsmConstraint) -> &'a AsmOperandClass {
+    match c.matching_output {
+        Some(i) if i < asm.outputs.len() => &asm.outputs[i].class,
+        _ => &c.class,
+    }
 }
 
 /// The operands of an `asm` that live on the x87 stack: not in memory, and
 /// with an x87 constraint -- a tied input's being the output it names.
 pub(super) fn x87_operands(asm: &AsmData) -> impl Iterator<Item = &AsmConstraint> {
-    asm.outputs.iter().chain(&asm.inputs).filter(|c| {
-        let constraint = match c.matching_output {
-            Some(i) if i < asm.outputs.len() => &asm.outputs[i].constraint,
-            _ => &c.constraint,
-        };
-        !c.is_memory() && is_x87_constraint(constraint)
-    })
+    asm.outputs
+        .iter()
+        .chain(&asm.inputs)
+        .filter(|c| !c.is_memory() && x87_slot(effective_class(asm, c)).is_some())
+}
+
+/// Whether the class offers a general register.
+fn takes_gp_register(class: &AsmOperandClass) -> bool {
+    matches!(
+        class.reg,
+        Some(AsmRegClass::General | AsmRegClass::Pinned(_) | AsmRegClass::HighByte)
+    )
+}
+
+/// Whether the class asks for a general register and offers no memory: a
+/// value that lives in memory must be loaded into one.
+fn requires_gp_register(class: &AsmOperandClass) -> bool {
+    takes_gp_register(class) && class.mem.is_none()
+}
+
+/// Whether the class asks for an SSE register specifically.
+///
+/// Separate from `requires_gp_register`, which is about the general
+/// registers: an operand can be spilled to the stack and still satisfy
+/// `"x"`, but it cannot be handed over as a general register.
+fn requires_sse(class: &AsmOperandClass) -> bool {
+    class.reg == Some(AsmRegClass::Vector)
 }
 
 impl AsmOperandBuild {
@@ -168,30 +201,31 @@ impl X86_64CodeGen {
             None => return,
         };
 
-        let reserved_regs = Self::collect_reserved_regs(asm_data);
+        let pins = asm_pinned_regs(asm_data);
+        Self::check_high_byte_pins(insn, asm_data, &pins);
+        let reserved_regs: std::collections::HashSet<Reg> =
+            pins.iter().flatten().copied().collect();
         let mut build = AsmOperandBuild::new(asm_data, &reserved_regs);
-        self.build_output_slots(insn, asm_data, &reserved_regs, &mut build);
-        self.build_input_slots(insn, asm_data, &reserved_regs, &mut build);
+        self.build_output_slots(insn, asm_data, &pins, &reserved_regs, &mut build);
+        self.build_input_slots(insn, asm_data, &pins, &reserved_regs, &mut build);
         self.emit_asm_prologue_moves(&mut build);
-        self.emit_asm_template(asm_data, &build);
+        self.emit_asm_template(insn, asm_data, &build);
         self.emit_asm_epilogue_moves(insn, asm_data, &build);
     }
 
-    /// Collect the registers named by specific constraints (a, b, c, d, S, D).
-    /// Nothing else may be allocated to them for the duration of the statement.
-    fn collect_reserved_regs(asm_data: &AsmData) -> std::collections::HashSet<Reg> {
-        let mut reserved_regs: std::collections::HashSet<Reg> = std::collections::HashSet::new();
-        for output in &asm_data.outputs {
-            if let Some(r) = Self::constraint_to_specific_reg(&output.constraint) {
-                reserved_regs.insert(r);
-            }
+    /// A `Q` operand left without a register: the statement pins or
+    /// clobbers all four with a high byte. gcc reports the same.
+    fn check_high_byte_pins(insn: &Instruction, asm_data: &AsmData, pins: &[Option<Reg>]) {
+        let operands = asm_data.outputs.iter().chain(&asm_data.inputs);
+        if operands
+            .zip(pins)
+            .any(|(c, pin)| c.class.reg == Some(AsmRegClass::HighByte) && pin.is_none())
+        {
+            crate::diag::error(
+                insn.pos.unwrap_or_default(),
+                "no register with a high byte is left for a `Q` asm operand",
+            );
         }
-        for input in &asm_data.inputs {
-            if let Some(r) = Self::constraint_to_specific_reg(&input.constraint) {
-                reserved_regs.insert(r);
-            }
-        }
-        reserved_regs
     }
 
     /// Build the substitution slot for each output operand, recording the
@@ -200,6 +234,7 @@ impl X86_64CodeGen {
         &mut self,
         insn: &Instruction,
         asm_data: &AsmData,
+        pins: &[Option<Reg>],
         reserved_regs: &std::collections::HashSet<Reg>,
         build: &mut AsmOperandBuild,
     ) {
@@ -225,24 +260,56 @@ impl X86_64CodeGen {
             // Helper to build the slot with the shared per-operand
             // context already filled in. Each branch supplies the
             // (reg, mem) pair appropriate for its outcome.
-            let mk = |reg: Option<Reg>, mem: Option<String>| crate::arch::AsmOperandSlot {
-                reg,
-                mem,
+            let mk = |value: AsmOperandValue<Reg>| crate::arch::AsmOperandSlot {
+                value,
                 size: op_size,
                 name: op_name.clone(),
             };
 
-            // Check for specific register constraint
-            if let Some(specific_reg) = Self::constraint_to_specific_reg(&output.constraint) {
+            // An operand pinned to one register
+            if let Some(specific_reg) = pins[idx] {
                 // Output goes to specific register, then we'll move to actual loc after asm
-                slots.push(mk(Some(specific_reg), None));
+                slots.push(mk(AsmOperandValue::Reg(specific_reg)));
                 // Only need to move if actual loc is different from specific reg
                 if loc != Loc::Reg(specific_reg) {
                     output_moves.push((idx, specific_reg, loc, op_size));
                 }
             } else {
-                let requires_reg = Self::constraint_requires_register(&output.constraint);
-                let requires_mem = Self::constraint_requires_memory(&output.constraint);
+                let requires_reg = requires_gp_register(&output.class);
+                let requires_mem = output.is_memory();
+                // An x87-class output. Written back off the FP stack once
+                // the template has run; a read-write `"+t"` is also pushed
+                // before it, by its tied input, while a pure `"=t"` takes
+                // its value from the template.
+                if let Some(slot) = x87_slot(&output.class) {
+                    let depth = Self::x87_depth(slot, x87_slots);
+                    let operand = X87Operand {
+                        depth,
+                        pseudo: output.pseudo,
+                        size: op_size,
+                    };
+                    if x87_store.is_some() {
+                        // `x87_store` holds one operand. A second output
+                        // would overwrite it and the first result would be
+                        // dropped on the floor, with the stack depth no
+                        // longer matching what the template left.
+                        crate::diag::error(
+                            insn.pos.unwrap_or_default(),
+                            "only one x87 asm output is supported in one asm \
+                             statement",
+                        );
+                    } else if Self::x87_output_home(&loc, op_size) {
+                        *x87_store = Some((idx, operand));
+                    } else {
+                        crate::diag::error(
+                            insn.pos.unwrap_or_default(),
+                            "an x87 asm output cannot be written back to this \
+                             location",
+                        );
+                    }
+                    slots.push(mk(AsmOperandValue::RegName(Self::x87_slot_name(depth))));
+                    continue;
+                }
                 // No specific register - use allocated location
                 match loc {
                     // Memory-class output (`"=m"(x)`/`"+m"(*p)`). Without
@@ -259,44 +326,12 @@ impl X86_64CodeGen {
                             input_moves,
                             insn.pos,
                         );
-                        slots.push(mk(None, Some(mem_str)));
+                        slots.push(mk(AsmOperandValue::Mem(mem_str)));
                     }
-                    // An x87-class output. Written back off the FP stack once
-                    // the template has run; a read-write `"+t"` is also pushed
-                    // before it, by its tied input, while a pure `"=t"` takes
-                    // its value from the template.
-                    _ if is_x87_constraint(&output.constraint) => {
-                        let depth = Self::x87_depth(&output.constraint, x87_slots);
-                        let operand = X87Operand {
-                            depth,
-                            pseudo: output.pseudo,
-                            size: op_size,
-                        };
-                        if x87_store.is_some() {
-                            // `x87_store` holds one operand. A second output
-                            // would overwrite it and the first result would be
-                            // dropped on the floor, with the stack depth no
-                            // longer matching what the template left.
-                            crate::diag::error(
-                                insn.pos.unwrap_or_default(),
-                                "only one x87 asm output is supported in one asm \
-                                 statement",
-                            );
-                        } else if Self::x87_output_home(&loc, op_size) {
-                            *x87_store = Some((idx, operand));
-                        } else {
-                            crate::diag::error(
-                                insn.pos.unwrap_or_default(),
-                                "an x87 asm output cannot be written back to this \
-                                 location",
-                            );
-                        }
-                        slots.push(mk(None, Some(Self::x87_slot_name(depth))));
-                    }
-                    _ if Self::constraint_requires_sse(&output.constraint) => {
+                    _ if requires_sse(&output.class) => {
                         match sse_scratch.pop() {
                             Some(xmm) => {
-                                slots.push(mk(None, Some(xmm.name().to_string())));
+                                slots.push(mk(AsmOperandValue::RegName(xmm.name().to_string())));
                                 pseudo_to_xmm.insert(output.pseudo, xmm);
                                 // Copied back once the template has run. A
                                 // `Loc::Xmm` destination would already be the
@@ -313,7 +348,9 @@ impl X86_64CodeGen {
                                      statement; c17 has two scratch registers to \
                                      give",
                                 );
-                                slots.push(mk(None, Some(XmmReg::Xmm15.name().to_string())));
+                                slots.push(mk(AsmOperandValue::RegName(
+                                    XmmReg::Xmm15.name().to_string(),
+                                )));
                             }
                         }
                     }
@@ -323,13 +360,13 @@ impl X86_64CodeGen {
                             // Use a temp register instead
                             let temp = find_temp_reg(reserved_regs, used_regs, insn.pos);
                             used_regs.insert(temp);
-                            slots.push(mk(Some(temp), None));
+                            slots.push(mk(AsmOperandValue::Reg(temp)));
                             // For outputs, move from temp to actual loc after asm
                             remap_restore.push((temp, r, loc.clone(), op_size));
                             // Track this pseudo -> temp mapping for +r inputs
                             pseudo_to_temp.insert(output.pseudo, temp);
                         } else {
-                            slots.push(mk(Some(r), None));
+                            slots.push(mk(AsmOperandValue::Reg(r)));
                             used_regs.insert(r);
                         }
                     }
@@ -339,7 +376,7 @@ impl X86_64CodeGen {
                         // modified value — update the location map directly.
                         let temp = find_temp_reg(reserved_regs, used_regs, insn.pos);
                         used_regs.insert(temp);
-                        slots.push(mk(Some(temp), None));
+                        slots.push(mk(AsmOperandValue::Reg(temp)));
                         // Don't add to output_moves (can't store to Imm).
                         // Instead, update the pseudo's location to the temp reg after asm.
                         self.locations.set(output.pseudo, Loc::Reg(temp));
@@ -350,14 +387,13 @@ impl X86_64CodeGen {
                         // Allocate a temp register; move from temp to actual loc after asm.
                         let temp = find_temp_reg(reserved_regs, used_regs, insn.pos);
                         used_regs.insert(temp);
-                        slots.push(mk(Some(temp), None));
+                        slots.push(mk(AsmOperandValue::Reg(temp)));
                         output_moves.push((idx, temp, loc.clone(), op_size));
                         pseudo_to_temp.insert(output.pseudo, temp);
                     }
                     _ => {
                         // Memory or other location - emit as memory operand
-                        let mem_str = self.loc_to_asm_string(&loc);
-                        slots.push(mk(None, Some(mem_str)));
+                        slots.push(mk(self.loc_to_asm_operand(&loc, op_size)));
                     }
                 }
             }
@@ -370,6 +406,7 @@ impl X86_64CodeGen {
         &mut self,
         insn: &Instruction,
         asm_data: &AsmData,
+        pins: &[Option<Reg>],
         reserved_regs: &std::collections::HashSet<Reg>,
         build: &mut AsmOperandBuild,
     ) {
@@ -392,23 +429,17 @@ impl X86_64CodeGen {
         // input -- see `AsmConstraint::is_hidden_readwrite_input`.
         let mut hidden: Vec<usize> = Vec::new();
         // Process input operands
-        for input in &asm_data.inputs {
+        for (input_idx, input) in asm_data.inputs.iter().enumerate() {
             let op_size = input.size;
 
             // Handle matching constraints - use the matched output's location/register
-            let (loc, constraint_for_reg) = if let Some(match_idx) = input.matching_output {
-                if match_idx < num_outputs {
-                    // Use the same register/location as the matched output
-                    (
-                        self.get_location(asm_data.outputs[match_idx].pseudo),
-                        &asm_data.outputs[match_idx].constraint,
-                    )
-                } else {
-                    (self.get_location(input.pseudo), &input.constraint)
+            let loc = match input.matching_output {
+                Some(match_idx) if match_idx < num_outputs => {
+                    self.get_location(asm_data.outputs[match_idx].pseudo)
                 }
-            } else {
-                (self.get_location(input.pseudo), &input.constraint)
+                _ => self.get_location(input.pseudo),
             };
+            let class = effective_class(asm_data, input);
 
             // A tied input names the output's register, so its value is
             // loaded there before the template. An explicit `"0"` is an
@@ -418,7 +449,7 @@ impl X86_64CodeGen {
             // `addq %2, %0` with `"0"(a), "r"(b)` named nothing.
             if let Some(match_idx) = input.matching_output {
                 if match_idx < num_outputs {
-                    if let Some(reg) = slots[match_idx].reg {
+                    if let Some(reg) = slots[match_idx].reg() {
                         // Load initial value into the register before asm
                         input_moves.push((reg, loc, op_size));
                     } else if let Some(&xmm) =
@@ -451,17 +482,16 @@ impl X86_64CodeGen {
             }
 
             let op_name = input.name.clone();
-            let mk = |reg: Option<Reg>, mem: Option<String>| crate::arch::AsmOperandSlot {
-                reg,
-                mem,
+            let mk = |value: AsmOperandValue<Reg>| crate::arch::AsmOperandSlot {
+                value,
                 size: op_size,
                 name: op_name.clone(),
             };
 
-            // Check for specific register constraint
-            if let Some(specific_reg) = Self::constraint_to_specific_reg(constraint_for_reg) {
+            // An operand pinned to one register
+            if let Some(specific_reg) = pins[num_outputs + input_idx] {
                 // Input must go to specific register
-                slots.push(mk(Some(specific_reg), None));
+                slots.push(mk(AsmOperandValue::Reg(specific_reg)));
                 // Only need to move if actual loc is different from specific reg
                 if loc != Loc::Reg(specific_reg) {
                     input_moves.push((specific_reg, loc, op_size));
@@ -471,38 +501,39 @@ impl X86_64CodeGen {
                 // This happens with +r constraints where input and output share the same pseudo
                 if let Some(&temp) = pseudo_to_temp.get(&input.pseudo) {
                     // Reuse the same temp register as the output
-                    slots.push(mk(Some(temp), None));
+                    slots.push(mk(AsmOperandValue::Reg(temp)));
                     // Add setup move to load value into temp
                     remap_setup.push((temp, temp, loc.clone(), op_size));
                 } else {
-                    let requires_reg = Self::constraint_requires_register(constraint_for_reg);
-                    let requires_mem = Self::constraint_requires_memory(constraint_for_reg);
+                    let requires_reg = requires_gp_register(class);
+                    let requires_mem = class.is_memory_only();
+                    // An x87-class input: pushed onto the FP stack before the
+                    // template, which then names it `%st`/`%st(1)`. Without
+                    // this arm an x87 input fell through to the general path
+                    // and the template ran on whatever happened to be on the
+                    // stack -- `__asm__("fmulp" : "+t"(a) : "u"(b))` answered
+                    // -nan.
+                    if let Some(slot) = x87_slot(class) {
+                        let depth = Self::x87_depth(slot, x87_slots);
+                        let name = Self::x87_slot_name(depth);
+                        if Self::x87_input_home(&loc, input.size) {
+                            x87_pushes.push(X87Operand {
+                                depth,
+                                pseudo: input.pseudo,
+                                size: input.size,
+                            });
+                        } else {
+                            crate::diag::error(
+                                insn.pos.unwrap_or_default(),
+                                "a long double x87 asm operand must live somewhere \
+                                 addressable; c17 cannot spill one here",
+                            );
+                        }
+                        slots.push(mk(AsmOperandValue::RegName(name)));
+                        continue;
+                    }
                     // No specific register - use allocated location
                     match loc {
-                        // An x87-class input: pushed onto the FP stack before the
-                        // template, which then names it `%st`/`%st(1)`. Without
-                        // this arm an x87 input fell through to the general path
-                        // and the template ran on whatever happened to be on the
-                        // stack -- `__asm__("fmulp" : "+t"(a) : "u"(b))` answered
-                        // -nan.
-                        _ if is_x87_constraint(constraint_for_reg) => {
-                            let depth = Self::x87_depth(constraint_for_reg, x87_slots);
-                            let name = Self::x87_slot_name(depth);
-                            if Self::x87_input_home(&loc, input.size) {
-                                x87_pushes.push(X87Operand {
-                                    depth,
-                                    pseudo: input.pseudo,
-                                    size: input.size,
-                                });
-                            } else {
-                                crate::diag::error(
-                                    insn.pos.unwrap_or_default(),
-                                    "a long double x87 asm operand must live somewhere \
-                                     addressable; c17 cannot spill one here",
-                                );
-                            }
-                            slots.push(mk(None, Some(name)));
-                        }
                         Loc::FImm(..) if requires_mem => {
                             crate::diag::error(
                                 insn.pos.unwrap_or_default(),
@@ -511,15 +542,13 @@ impl X86_64CodeGen {
                                     slots.len()
                                 ),
                             );
-                            slots.push(mk(None, Some("(%rip)".to_string())));
+                            slots.push(mk(AsmOperandValue::Mem("(%rip)".to_string())));
                         }
                         // An SSE-class constraint wants the value in an XMM
                         // register, and a constant is never allocated one.
                         // Materialize it into the reserved scratch: nothing
                         // else is live there across the asm.
-                        Loc::FImm(v, imm_size)
-                            if Self::constraint_requires_sse(constraint_for_reg) =>
-                        {
+                        Loc::FImm(v, imm_size) if requires_sse(class) => {
                             // Only the scratch registers are free across the
                             // asm body, and there are two. Say so rather than
                             // hand the same one to two operands and emit wrong
@@ -527,7 +556,8 @@ impl X86_64CodeGen {
                             match sse_scratch.pop() {
                                 Some(xmm) => {
                                     self.emit_fp_imm_to_xmm(v, xmm, imm_size);
-                                    slots.push(mk(None, Some(xmm.name().to_string())));
+                                    slots
+                                        .push(mk(AsmOperandValue::RegName(xmm.name().to_string())));
                                 }
                                 None => {
                                     crate::diag::error(
@@ -536,7 +566,9 @@ impl X86_64CodeGen {
                                          statement; c17 has two scratch registers to \
                                          give",
                                     );
-                                    slots.push(mk(None, Some(XmmReg::Xmm15.name().to_string())));
+                                    slots.push(mk(AsmOperandValue::RegName(
+                                        XmmReg::Xmm15.name().to_string(),
+                                    )));
                                 }
                             }
                         }
@@ -548,7 +580,7 @@ impl X86_64CodeGen {
                             used_regs.insert(temp);
                             input_moves.push((temp, loc.clone(), op_size));
                             let mem_str = format!("(%{})", self.reg_name_64(temp));
-                            slots.push(mk(None, Some(mem_str)));
+                            slots.push(mk(AsmOperandValue::Mem(mem_str)));
                         }
                         _ if requires_mem => {
                             let mem_str = self.asm_memory_slot(
@@ -560,7 +592,17 @@ impl X86_64CodeGen {
                                 input_moves,
                                 insn.pos,
                             );
-                            slots.push(mk(None, Some(mem_str)));
+                            slots.push(mk(AsmOperandValue::Mem(mem_str)));
+                        }
+                        // A symbolic constant: the global's address, written
+                        // into the template as an immediate. The operand
+                        // names the global's `Sym`, with any offset on it --
+                        // see `ir::asm_operand::resolve_immediates`.
+                        Loc::Global(name) if class.is_immediate_only() => {
+                            let sym = self.format_symbol_name(&name);
+                            slots.push(mk(AsmOperandValue::Symbol(
+                                crate::arch::codegen::asm_symbol_constant(&sym, input.offset),
+                            )));
                         }
                         Loc::Reg(r) => {
                             // Check if allocated reg conflicts with reserved
@@ -568,42 +610,53 @@ impl X86_64CodeGen {
                                 // Use a temp register instead
                                 let temp = find_temp_reg(reserved_regs, used_regs, insn.pos);
                                 used_regs.insert(temp);
-                                slots.push(mk(Some(temp), None));
+                                slots.push(mk(AsmOperandValue::Reg(temp)));
                                 // For inputs, move from actual loc to temp before asm
                                 remap_setup.push((r, temp, loc.clone(), op_size));
                             } else {
-                                slots.push(mk(Some(r), None));
+                                slots.push(mk(AsmOperandValue::Reg(r)));
                                 used_regs.insert(r);
                             }
                         }
                         // A constant under a register-only constraint still goes
                         // in a register: the template may use it where no
                         // immediate is allowed (`leaq 8($100), %rax`).
-                        Loc::Imm(_)
-                            if requires_reg
-                                && !Self::constraint_allows_immediate(constraint_for_reg) =>
+                        // So does one no immediate alternative takes, when
+                        // a register is offered: `"rI"(100)`, `"rm"(5)`.
+                        Loc::Imm(v)
+                            if takes_gp_register(class)
+                                && !class.imm.int.admits(canonical_int(v, op_size)) =>
                         {
                             let temp = find_temp_reg(reserved_regs, used_regs, insn.pos);
                             used_regs.insert(temp);
-                            slots.push(mk(Some(temp), None));
+                            slots.push(mk(AsmOperandValue::Reg(temp)));
                             input_moves.push((temp, loc.clone(), op_size));
+                        }
+                        Loc::Imm(v)
+                            if !class.imm.int.is_empty()
+                                && !class.imm.int.admits(canonical_int(v, op_size)) =>
+                        {
+                            crate::diag::error(
+                                insn.pos.unwrap_or_default(),
+                                &impossible_constant(slots.len(), v, &input.constraint),
+                            );
+                            slots.push(mk(AsmOperandValue::Int(0)));
                         }
                         Loc::Imm(v) => {
                             // Immediate value
-                            slots.push(mk(None, Some(format!("${}", v as i64))));
+                            slots.push(mk(AsmOperandValue::Int(canonical_int(v, op_size))));
                         }
                         _ if requires_reg => {
                             // Constraint requires register but value is on stack/memory.
                             // Allocate a temp register and load value before asm.
                             let temp = find_temp_reg(reserved_regs, used_regs, insn.pos);
                             used_regs.insert(temp);
-                            slots.push(mk(Some(temp), None));
+                            slots.push(mk(AsmOperandValue::Reg(temp)));
                             input_moves.push((temp, loc.clone(), op_size));
                         }
                         _ => {
                             // Memory or other location
-                            let mem_str = self.loc_to_asm_string(&loc);
-                            slots.push(mk(None, Some(mem_str)));
+                            slots.push(mk(self.loc_to_asm_operand(&loc, op_size)));
                         }
                     }
                 }
@@ -653,7 +706,12 @@ impl X86_64CodeGen {
     }
 
     /// Substitute the operands into the template and emit it as raw text.
-    fn emit_asm_template(&mut self, asm_data: &AsmData, build: &AsmOperandBuild) {
+    fn emit_asm_template(
+        &mut self,
+        insn: &Instruction,
+        asm_data: &AsmData,
+        build: &AsmOperandBuild,
+    ) {
         let slots = &build.slots;
         // Convert goto_labels from (BasicBlockId, String) to (label_string, label_name)
         let goto_labels_formatted: Vec<(String, String)> = asm_data
@@ -662,15 +720,24 @@ impl X86_64CodeGen {
             .map(|(bb_id, name)| {
                 // Through `Label` rather than a second spelling of the same
                 // format, so the quoting cannot be missed here.
-                let label_str =
-                    crate::arch::lir::Label::block(&self.base.current_fn, bb_id.0).name();
+                let label_str = crate::arch::lir::Label::block(&self.base.current_fn, bb_id.0)
+                    .name(&self.base.target);
                 (label_str, name.clone())
             })
             .collect();
 
-        // Substitute %0, %1, %[name], %l0, %l[name], etc. in the template with actual operands
-        let asm_output =
-            self.substitute_asm_operands(&asm_data.template, slots, &goto_labels_formatted);
+        let asm_output = match crate::arch::substitute_asm_operands(
+            self,
+            &asm_data.template,
+            slots,
+            &goto_labels_formatted,
+        ) {
+            Ok(text) => text,
+            Err(msg) => {
+                crate::diag::error(insn.pos.unwrap_or_default(), &msg);
+                return;
+            }
+        };
 
         // Emit the inline assembly as raw text
         // Split by newlines and emit each line
@@ -1003,11 +1070,6 @@ impl X86_64CodeGen {
             }
             Loc::Imm(v) => format!("${}", *v as i64),
             Loc::Xmm(xmm) => xmm.name().to_string(),
-            // An immediate-class constraint takes the constant's bit pattern,
-            // which is what gcc substitutes: `"i"(1.0)` gives
-            // `$0x3ff0000000000000`. The register and memory classes never
-            // reach here; `emit_inline_asm` materializes or diagnoses them
-            // first.
             Loc::FImm(v, fp_size) => format!("${}", v.to_bits_at_width(*fp_size)),
             Loc::Global(name) => {
                 format!("{}(%rip)", self.format_symbol_name(name))
@@ -1015,27 +1077,38 @@ impl X86_64CodeGen {
         }
     }
 
-    /// Format a symbol name with platform-specific prefix.
-    ///
-    /// Decorates like [`Symbol::format_for_target`] but decides "local" from
-    /// the name's leading `.` rather than from a flag, because the callers
-    /// here have a bare `&str`. The quoting rule is shared, so the two cannot
-    /// disagree about *that* even while they still differ about decoration.
-    pub(super) fn format_symbol_name(&self, name: &str) -> String {
-        // An asm label is the final name; see `lir::VERBATIM_MARKER`.
-        if let Some(verbatim) = crate::arch::lir::strip_verbatim(name) {
-            return crate::arch::lir::quote_symbol_if_needed(verbatim);
+    /// A location as the template substitutes it, for an operand of
+    /// `size_bits`.
+    fn loc_to_asm_operand(&self, loc: &Loc, size_bits: u32) -> AsmOperandValue<Reg> {
+        match loc {
+            Loc::Reg(r) => AsmOperandValue::Reg(*r),
+            Loc::Stack(offset) => {
+                AsmOperandValue::Mem(self.stack_mem(*offset).format(&self.base.target))
+            }
+            Loc::IncomingArg(offset) => AsmOperandValue::Mem(format!("{}(%rbp)", offset)),
+            Loc::Imm(v) => AsmOperandValue::Int(canonical_int(*v, size_bits)),
+            Loc::Xmm(xmm) => AsmOperandValue::RegName(xmm.name().to_string()),
+            // An immediate-class constraint takes the constant's bit pattern,
+            // which is what gcc substitutes: `"i"(1.0)` gives
+            // `$0x3ff0000000000000`. The register and memory classes never
+            // reach here; `emit_inline_asm` materializes or diagnoses them
+            // first.
+            Loc::FImm(v, fp_size) => AsmOperandValue::Float(*v, *fp_size),
+            Loc::Global(name) => {
+                AsmOperandValue::Mem(format!("{}(%rip)", self.format_symbol_name(name)))
+            }
         }
-        let decorated = if self.base.target.os == Os::MacOS && !name.starts_with('.') {
-            format!("_{}", name)
-        } else {
-            name.to_string()
-        };
-        crate::arch::lir::quote_symbol_if_needed(&decorated)
+    }
+
+    /// Format a symbol name with platform-specific decoration: the one rule,
+    /// [`Symbol::format_for_target`], on the symbol [`Symbol::named`] says
+    /// the bare name is.
+    pub(super) fn format_symbol_name(&self, name: &str) -> String {
+        crate::arch::lir::Symbol::named(name).format_for_target(&self.base.target)
     }
 
     /// Get the 64-bit register name
-    fn reg_name_64(&self, reg: Reg) -> &'static str {
+    pub(super) fn reg_name_64(&self, reg: Reg) -> &'static str {
         match reg {
             Reg::Rax => "rax",
             Reg::Rbx => "rbx",
@@ -1054,41 +1127,6 @@ impl X86_64CodeGen {
             Reg::R14 => "r14",
             Reg::R15 => "r15",
         }
-    }
-
-    /// Extract the specific register required by an x86 asm constraint.
-    /// Returns Some(Reg) if the constraint requires a specific register,
-    /// None if any register is acceptable (e.g., "r").
-    fn constraint_to_specific_reg(constraint: &str) -> Option<Reg> {
-        // Scan constraint for specific register indicators
-        // Skip modifiers like =, +, &, %
-        for c in constraint.chars() {
-            match c {
-                'a' => return Some(Reg::Rax),
-                'b' => return Some(Reg::Rbx),
-                'c' => return Some(Reg::Rcx),
-                'd' => return Some(Reg::Rdx),
-                'S' => return Some(Reg::Rsi),
-                'D' => return Some(Reg::Rdi),
-                _ => {}
-            }
-        }
-        None
-    }
-
-    /// Whether the constraint asks for an SSE register specifically.
-    ///
-    /// These are separate from `constraint_requires_register`, which is about
-    /// the general registers: an operand can be spilled to the stack and still
-    /// satisfy `"x"`, but it cannot be handed over as a general register.
-    fn constraint_requires_sse(constraint: &str) -> bool {
-        // `f`, `t` and `u` are the **x87 stack** classes on x86, not SSE:
-        // `f` any x87 register, `t` st(0), `u` st(1). Counting them here sent
-        // a long double through an XMM scratch and emitted `movt ..., %xmm15`,
-        // which is not an instruction -- musl's
-        // `long double sqrtl(long double x){ __asm__("fsqrt" : "+t"(x)); }`
-        // failed to assemble. See `constraint_requires_x87`.
-        constraint.chars().any(|c| matches!(c, 'x' | 'v' | 'Y'))
     }
 
     /// Whether an x87 input at `loc` can be pushed; see `emit_x87_asm_push`.
@@ -1125,15 +1163,13 @@ impl X86_64CodeGen {
     ///
     /// `t` is the top of the stack and `u` the one below it, whatever order
     /// the operands are written in; `f` takes its operand number.
-    fn x87_depth(constraint: &str, count: &mut usize) -> usize {
+    fn x87_depth(slot: X87Slot, count: &mut usize) -> usize {
         let n = *count;
         *count += 1;
-        if constraint.contains('t') {
-            0
-        } else if constraint.contains('u') {
-            1
-        } else {
-            n
+        match slot {
+            X87Slot::Top => 0,
+            X87Slot::Second => 1,
+            X87Slot::Any => n,
         }
     }
 
@@ -1144,67 +1180,6 @@ impl X86_64CodeGen {
         } else {
             format!("%st({n})")
         }
-    }
-
-    /// Whether the constraint offers an immediate alternative.
-    fn constraint_allows_immediate(constraint: &str) -> bool {
-        constraint.chars().any(|c| {
-            matches!(
-                c,
-                'i' | 'n' | 'g' | 'X' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' | 'e' | 'Z' | 's'
-            )
-        })
-    }
-
-    fn constraint_requires_register(constraint: &str) -> bool {
-        let mut has_reg_class = false;
-        let mut has_mem_class = false;
-        for c in constraint.chars() {
-            match c {
-                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' | 'l' => has_reg_class = true,
-                'm' | 'o' | 'V' | 'Q' | 'g' | 'X' => has_mem_class = true,
-                // 'i' / 'n' / 'I' / 'J' / 'K' / 'L' / 'M' / 'N' / 'O'
-                // are immediate-class — substitute literal when the
-                // value is const-folded. They don't make memory
-                // acceptable, so they don't disable requires_register.
-                _ => {}
-            }
-        }
-        has_reg_class && !has_mem_class
-    }
-
-    /// Check if an inline asm constraint requires the operand to be
-    /// in memory — i.e., the codegen must produce a memory operand
-    /// reference rather than a register reference.
-    ///
-    /// Multi-alternative semantics: a constraint that lists any
-    /// non-memory class (`r`, `a`..`d`, `S`, `D`, `i`, `n`, `g`) does
-    /// NOT require memory, because the operand can use the register
-    /// or immediate form directly. Only constraints that are memory-
-    /// class-only force a memory operand.
-    fn constraint_requires_memory(constraint: &str) -> bool {
-        let mut has_mem_class = false;
-        let mut has_non_mem_class = false;
-        for c in constraint.chars() {
-            match c {
-                'm' | 'o' | 'V' | 'Q' => has_mem_class = true,
-                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' | 'l' | 'i' | 'n' | 'g'
-                | 'X' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' => has_non_mem_class = true,
-                _ => {}
-            }
-        }
-        has_mem_class && !has_non_mem_class
-    }
-
-    /// Substitute %0, %1, %[name], %l0, %l[name], etc. with actual operand strings
-    /// goto_labels: (label_string, label_name) - label_string is the fully formatted label
-    fn substitute_asm_operands(
-        &self,
-        template: &str,
-        slots: &[crate::arch::AsmOperandSlot<Reg>],
-        goto_labels: &[(String, String)],
-    ) -> String {
-        crate::arch::substitute_asm_operands(self, template, slots, goto_labels)
     }
 
     /// Get a sized register name based on modifier

@@ -891,6 +891,7 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse::ast::LibFamily;
 
     /// Each entry declares as many parameters as its function consumes
     /// arguments: the call is checked against the one and lowered by the
@@ -915,6 +916,58 @@ mod tests {
                 assert!(seen.insert(reserved), "{lb:?}");
             }
         }
+    }
+
+    /// Every library function the optimizer knows: each one the table calls,
+    /// and the libgcc complex routines, which no program names.
+    fn every_lib_fn() -> Vec<LibFn> {
+        let mut all: Vec<LibFn> = Vec::new();
+        for f in LIBRARY_BUILTINS.iter().filter_map(LibraryBuiltin::called) {
+            if !all.contains(&f) {
+                all.push(f);
+            }
+        }
+        all.extend([LibFn::MulComplex, LibFn::DivComplex]);
+        all
+    }
+
+    /// A function's C name is the bare name of a row that calls it, so a
+    /// call a fold makes by that name is to the function the fold means;
+    /// only the complex routines, which have no row, have none.
+    #[test]
+    fn every_c_name_spells_its_own_function() {
+        let strings = crate::strings::StringTable::new();
+        for f in every_lib_fn() {
+            match f.c_name() {
+                Some(name) => {
+                    let id = strings.lookup(name).unwrap_or_else(|| panic!("{name}"));
+                    assert_eq!(LibraryBuiltin::known_call(id), Some(f), "{name}");
+                }
+                None => assert_eq!(f.family(), LibFamily::ComplexArith, "{f:?}"),
+            }
+        }
+        let names: std::collections::HashSet<_> =
+            every_lib_fn().iter().filter_map(|f| f.c_name()).collect();
+        assert_eq!(
+            names.len(),
+            every_lib_fn().len() - 2,
+            "two functions, one name"
+        );
+    }
+
+    /// The string queries are exactly the functions that only read, and every
+    /// family has a member.
+    #[test]
+    fn families_partition_the_functions() {
+        use LibFamily as K;
+        let all = every_lib_fn();
+        for f in &all {
+            assert_eq!(f.only_reads(), f.family() == K::StringQuery, "{f:?}");
+        }
+        let count = |k| all.iter().filter(|f| f.family() == k).count();
+        let sizes = [K::StringQuery, K::StringWrite, K::Output, K::ComplexArith].map(count);
+        assert_eq!(sizes, [11, 6, 16, 2]);
+        assert_eq!(sizes.iter().sum::<usize>(), all.len());
     }
 
     /// Every `double` function that narrows has its `float` form in the

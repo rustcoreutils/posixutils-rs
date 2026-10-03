@@ -58,12 +58,46 @@ fn many_locals(n: usize) -> String {
     )
 }
 
+/// `n` labels, each with a division and a `goto` to a label far away, so the
+/// merged live range of every value spans most of the function and crosses
+/// every division, which clobbers fixed registers on x86-64: the forbidden
+/// registers were collected by visiting every clobbering point inside every
+/// range, 27 s at n = 10000. The duplicate-label and jump-scope checks also
+/// compared every label with every other and with every `goto`.
+fn many_gotos(n: usize) -> String {
+    let body: String = (0..n)
+        .map(|i| {
+            format!(
+                " l{i}: acc += x / d + {i};\n    x = (x * 3 + {i}) & 1023;\n    \
+                 if (++steps > 5000) return acc;\n    if (x % 5 == 0) goto l{};\n",
+                (i * 31 + 7) % n
+            )
+        })
+        .collect();
+    // The same walk, to know the answer.
+    let (mut i, mut x, mut acc, mut steps) = (0, 5usize, 0usize, 0);
+    while i < n {
+        acc += x / 3 + i;
+        x = (x * 3 + i) & 1023;
+        steps += 1;
+        if steps > 5000 {
+            break;
+        }
+        i = if x % 5 == 0 { (i * 31 + 7) % n } else { i + 1 };
+    }
+    format!(
+        "int deep(int x, int d)\n{{\n    int acc = 0, steps = 0;\n{body}    return acc;\n}}\n\
+         int main(void) {{ return deep(5, 3) == {acc} ? 0 : 1; }}\n"
+    )
+}
+
 #[test]
 fn codegen_large_functions_compile_and_run() {
     for (name, src) in [
         ("sequential_ifs", sequential_ifs(20000)),
         ("accumulating_ifs", accumulating_ifs(5000)),
         ("many_locals", many_locals(5000)),
+        ("many_gotos", many_gotos(3000)),
     ] {
         assert_eq!(compile_and_run(name, &src, &[]), 0, "{name} -O0");
         let opts = vec!["-O2".to_string()];

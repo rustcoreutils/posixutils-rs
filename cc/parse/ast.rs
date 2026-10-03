@@ -190,25 +190,107 @@ pub enum LibFn {
     DivComplex,
 }
 
+/// The kinds of [`LibFn`], by what a call to one does: the optimizer folds
+/// each kind by its own rules (`ir::libcall_fold`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibFamily {
+    /// A `<string.h>` function that reads strings and computes a value,
+    /// writing nothing.
+    StringQuery,
+    /// A function that writes a string: `strcpy` and its kin, and `sprintf`.
+    StringWrite,
+    /// A `<stdio.h>` output function.
+    Output,
+    /// A libgcc complex `*` or `/` routine.
+    ComplexArith,
+}
+
 impl LibFn {
+    /// What kind of function this is.
+    pub fn family(self) -> LibFamily {
+        use LibFn as L;
+        match self {
+            L::Strlen
+            | L::Strnlen
+            | L::Strcmp
+            | L::Strncmp
+            | L::Memcmp
+            | L::Strchr
+            | L::Strrchr
+            | L::Memchr
+            | L::Strstr
+            | L::Strpbrk
+            | L::Strcspn => LibFamily::StringQuery,
+            L::Strcpy | L::Stpcpy | L::Strncpy | L::Strcat | L::Strncat | L::Sprintf => {
+                LibFamily::StringWrite
+            }
+            L::Printf
+            | L::PrintfUnlocked
+            | L::Vprintf
+            | L::PrintfChk
+            | L::VprintfChk
+            | L::Fprintf
+            | L::FprintfUnlocked
+            | L::Vfprintf
+            | L::FprintfChk
+            | L::VfprintfChk
+            | L::Fputs
+            | L::FputsUnlocked
+            | L::Puts
+            | L::Putchar
+            | L::Fputc
+            | L::Fwrite => LibFamily::Output,
+            L::MulComplex | L::DivComplex => LibFamily::ComplexArith,
+        }
+    }
+
     /// Whether the function reads memory and writes none, so a call to it
     /// leaves every object as it found it.
     pub fn only_reads(self) -> bool {
+        self.family() == LibFamily::StringQuery
+    }
+
+    /// The function's name in C, which a call an optimizer pass makes to it
+    /// calls: `strchr`, never its old spelling `index`. None for the libgcc
+    /// complex routines, which are named by the format they compute in.
+    pub fn c_name(self) -> Option<&'static str> {
         use LibFn as L;
-        matches!(
-            self,
-            L::Strlen
-                | L::Strnlen
-                | L::Strcmp
-                | L::Strncmp
-                | L::Memcmp
-                | L::Strchr
-                | L::Strrchr
-                | L::Memchr
-                | L::Strstr
-                | L::Strpbrk
-                | L::Strcspn
-        )
+        Some(match self {
+            L::Strlen => "strlen",
+            L::Strnlen => "strnlen",
+            L::Strcmp => "strcmp",
+            L::Strncmp => "strncmp",
+            L::Memcmp => "memcmp",
+            L::Strchr => "strchr",
+            L::Strrchr => "strrchr",
+            L::Memchr => "memchr",
+            L::Strstr => "strstr",
+            L::Strpbrk => "strpbrk",
+            L::Strcspn => "strcspn",
+            L::Strcpy => "strcpy",
+            L::Stpcpy => "stpcpy",
+            L::Strncpy => "strncpy",
+            L::Strcat => "strcat",
+            L::Strncat => "strncat",
+            L::Sprintf => "sprintf",
+            L::Printf => "printf",
+            L::PrintfUnlocked => "printf_unlocked",
+            L::Vprintf => "vprintf",
+            L::PrintfChk => "__printf_chk",
+            L::VprintfChk => "__vprintf_chk",
+            L::Fprintf => "fprintf",
+            L::FprintfUnlocked => "fprintf_unlocked",
+            L::Vfprintf => "vfprintf",
+            L::FprintfChk => "__fprintf_chk",
+            L::VfprintfChk => "__vfprintf_chk",
+            L::Fputs => "fputs",
+            L::FputsUnlocked => "fputs_unlocked",
+            L::Puts => "puts",
+            L::Putchar => "putchar",
+            L::Fputc => "fputc",
+            L::Fwrite => "fwrite",
+            L::MulComplex | L::DivComplex => return None,
+        })
     }
 }
 
@@ -1624,6 +1706,23 @@ pub struct AsmOperand {
     pub expr: Expr,
 }
 
+/// One label of a [`Stmt::Labeled`] (C17 6.8.1).
+#[derive(Debug, Clone)]
+pub enum Label {
+    /// `name:`, the target of a `goto`.
+    Named { name: StringId, pos: Position },
+
+    /// Case label: `case expr:`, or the GNU range `case lo ... hi:`.
+    ///
+    /// The second endpoint is `None` for an ordinary label. A range is *not*
+    /// expanded into individual labels: `case 0 ... 1000000:` is legal and
+    /// compiles in GCC, and each label costs a basic block and a compare here.
+    Case(Expr, Option<Expr>),
+
+    /// `default:`
+    Default(Position),
+}
+
 // Statements
 
 /// A statement in the AST
@@ -1683,40 +1782,34 @@ pub enum Stmt {
     /// `void *`, so any pointer expression parses here.
     GotoIndirect { target: Expr, pos: Position },
 
-    /// Labeled statement: label: stmt
-    Label {
-        name: StringId,
-        stmt: Box<Stmt>,
-        pos: Position,
-    },
-
     /// Switch statement: switch (expr) { cases }
     Switch { expr: Expr, body: Box<Stmt> },
 
-    /// Case label: `case expr:`, or the GNU range `case lo ... hi:`.
+    /// A labeled statement (C17 6.8.1): the labels written in front of a
+    /// statement, in source order, and the statement itself.
     ///
-    /// The second endpoint is `None` for an ordinary label. A range is *not*
-    /// expanded into individual labels: `case 0 ... 1000000:` is legal and
-    /// compiles in GCC, and each label costs a basic block and a compare here.
-    /// `case <expr>:` (or the GNU range `case lo ... hi:`) and the statement
-    /// it labels.
+    /// The labels carry their statement because 6.8.1 makes a labeled
+    /// statement *one* statement. Holding a label as a flat sibling marker
+    /// worked inside a compound statement and nowhere else: in
+    /// `switch (c) case 1: if (d) case 2: case 3: f();` the `if` took the
+    /// bare `case 2:` as its whole then-branch, and `case 3: f();` fell out
+    /// of the switch entirely.
     ///
-    /// The label carries its statement, as `Label` does, because C17 6.8.1
-    /// makes a labeled statement *one* statement. Holding the label as a flat
-    /// sibling marker worked inside a compound statement and nowhere else:
-    /// in `switch (c) case 1: if (d) case 2: case 3: f();` the `if` took the
-    /// bare `case 2:` as its whole then-branch, and `case 3: f();` fell out of
-    /// the switch entirely -- reported as "case label not within a switch
-    /// statement", and as duplicate labels where two switches were involved.
-    Case(Expr, Option<Expr>, Box<Stmt>),
-
-    /// Default label (within switch body)
-    /// `default:` and the statement it labels. See [`Stmt::Case`].
-    Default(Position, Box<Stmt>),
+    /// A run of labels is one list rather than a chain of statements each
+    /// labelling the next. The grammar nests them, but nothing gives the
+    /// nesting a meaning, and a chain made every walk of the tree -- the
+    /// parser's, the linearizer's, the destructor's -- recurse once per
+    /// label: a generated `switch` with tens of thousands of consecutive
+    /// `case` labels overflowed the compiler's stack. So `labels` is never
+    /// empty, and `stmt` is never itself `Labeled`.
+    Labeled { labels: Vec<Label>, stmt: Box<Stmt> },
 
     /// Inline assembly statement (GCC extended asm)
     /// Format: asm [volatile] [goto] ( "template" : outputs : inputs : clobbers [: goto_labels] );
     Asm {
+        /// Where the statement starts: a diagnostic about a statement with no
+        /// operand to borrow a position from is reported here.
+        pos: Position,
         /// The assembly template string with %0, %1, etc. placeholders
         template: String,
         /// Output operands: [name] "=constraint" (lvalue)
@@ -2022,7 +2115,9 @@ impl Stmt {
     /// outside a statement expression may jump into one.
     pub fn defines_label(&self) -> bool {
         match self {
-            Stmt::Label { .. } => true,
+            Stmt::Labeled { labels, stmt } => {
+                labels.iter().any(|l| matches!(l, Label::Named { .. })) || stmt.defines_label()
+            }
             Stmt::Empty
             | Stmt::Break(_)
             | Stmt::Continue(_)
@@ -2061,7 +2156,6 @@ impl Stmt {
                     || body.defines_label()
             }
             Stmt::Switch { expr, body } => expr.defines_label() || body.defines_label(),
-            Stmt::Case(_, _, stmt) | Stmt::Default(_, stmt) => stmt.defines_label(),
             Stmt::Asm {
                 outputs, inputs, ..
             } => outputs.iter().chain(inputs).any(|o| o.expr.defines_label()),

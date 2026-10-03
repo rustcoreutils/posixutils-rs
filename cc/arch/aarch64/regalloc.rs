@@ -40,7 +40,6 @@
 // ============================================================================
 
 use crate::abi::aapcs64::{StackSlot, StackedArgs};
-use crate::arch::asm_constraints::OperandConstraint;
 use crate::arch::regalloc::{
     compute_live_intervals, find_call_positions, identify_fp_pseudos, interval_crosses_call,
     ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
@@ -336,20 +335,11 @@ pub enum FrameBase {
 }
 
 impl FrameBase {
-    /// Decide from the function's declared locals.
-    ///
-    /// Over-alignment can only originate here: every other caller of
-    /// `alloc_stack_slot` passes a spill size of at most 16. The alignment
-    /// expression must stay in step with the one the Sym arm applies when it
-    /// lays the slot out, or the frame would be padded for one alignment and
-    /// addressed for another.
-    /// Registers this function's inline asm claims for itself.
-    ///
-    /// Both spellings count: an explicit clobber, and a constraint that pins an
-    /// operand to a fixed register. Withholding the frame base from
-    /// `allocatable_regs` covers neither -- an asm pin bypasses allocation, and
-    /// a clobber reaches only the constraint points, which spill *pseudos*. The
-    /// frame base is not a pseudo.
+    /// Registers this function's inline asm claims for itself: its explicit
+    /// clobbers, since no aarch64 constraint letter pins an operand.
+    /// Withholding the frame base from `allocatable_regs` does not cover them
+    /// -- a clobber reaches only the constraint points, which spill
+    /// *pseudos*. The frame base is not a pseudo.
     fn asm_claimed_regs(func: &Function) -> std::collections::BTreeSet<Reg> {
         let mut claimed = std::collections::BTreeSet::new();
         for block in &func.blocks {
@@ -361,18 +351,18 @@ impl FrameBase {
                     continue;
                 };
                 claimed.extend(ic.clobbers.iter().copied());
-                for op in &ic.operands {
-                    if let crate::arch::asm_constraints::OperandConstraint::Fixed(r) =
-                        &op.constraint
-                    {
-                        claimed.insert(*r);
-                    }
-                }
             }
         }
         claimed
     }
 
+    /// Decide from the function's declared locals.
+    ///
+    /// Over-alignment can only originate here: every other caller of
+    /// `alloc_stack_slot` passes a spill size of at most 16. The alignment
+    /// expression must stay in step with the one the Sym arm applies when it
+    /// lays the slot out, or the frame would be padded for one alignment and
+    /// addressed for another.
     fn of(func: &Function, types: &TypeTable) -> FrameBase {
         let align = func
             .locals
@@ -1068,46 +1058,6 @@ fn fp_arg_bytes(
         .unwrap_or(8)
 }
 
-/// Map a single-letter GCC operand-constraint Fixed-register letter
-/// to the corresponding aarch64 GP register. AAPCS64 has no
-/// "specific register" constraint letters in this vocabulary;
-/// all aarch64 inline-asm register operands use `"r"` (Any GP) or
-/// `"w"` (Any V), both of which `parse_constraint` handles directly
-/// without consulting this table. So the current resolver returns
-/// `None` for every letter — but it exists for symmetry with
-/// `parse_x86_64_fixed_letter` and as the future-extension point
-/// for rare aarch64 letters (`"k"`/`"X"`/`"Z"`, ...) when they're
-/// brought in scope.
-pub fn parse_aarch64_fixed_letter(_letter: char) -> Option<Reg> {
-    None
-}
-
-/// Map a single-letter AAPCS64 operand-constraint *class* letter to
-/// an `OperandConstraint`.
-///
-/// Covered letters:
-/// - `I` — 12-bit positive immediate for ADD/SUB/MOVZ/MOVN.
-/// - `J` — negative `I` (the value `-x` where `x` matches `I`).
-/// - `K` — 32-bit logical (bitfield) immediate.
-/// - `L` — 64-bit logical immediate.
-/// - `M` — 32-bit MOVZ/MOVN immediate.
-/// - `N` — 64-bit MOVZ/MOVN immediate.
-/// - `S` — 32-bit absolute symbolic address (or its low bits).
-/// - `Y` — floating-point zero.
-/// - `Z` — integer zero (the `xzr`/`wzr` zero register; treated as
-///   immediate here since c17 does not directly model `xzr` as an
-///   allocator-visible register).
-///
-/// c17 does not range-check these immediates; the assembler will
-/// reject an out-of-range value, matching GCC's default behaviour.
-pub fn parse_aarch64_class_letter(letter: char) -> Option<OperandConstraint<Reg>> {
-    use OperandConstraint::*;
-    Some(match letter {
-        'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'S' | 'Y' | 'Z' => Imm,
-        _ => return None,
-    })
-}
-
 /// Map a clobber-list register name (lowercase, GCC-style) to the
 /// corresponding `Reg`. Accepts the 64-bit canonical name (`x0`, `x29`,
 /// ...), the 32-bit alias (`w0`, `w29`, ...), and special names
@@ -1302,45 +1252,16 @@ fn opcode_clobbers_aarch64_scratches(op: Opcode) -> bool {
     )
 }
 
-/// Build the per-operand `InstrConstraints` view of an inline-asm
-/// instruction. Mirror of `build_asm_instr_constraints_x86_64`.
+/// The allocator's view of an inline-asm instruction: its clobbers. No
+/// aarch64 constraint letter pins an operand to one register.
 pub fn build_asm_instr_constraints_aarch64(
     insn: &Instruction,
 ) -> Option<crate::arch::asm_constraints::InstrConstraints<Reg>> {
     Some(crate::arch::asm_constraints::InstrConstraints::of_asm(
         insn.extra().asm_data.as_ref()?,
-        parse_aarch64_fixed_letter,
-        parse_aarch64_class_letter,
+        &[],
         parse_gp_clobber_name,
     ))
-}
-
-/// Walk a function's inline-asm instructions and collect
-/// `(operand_pseudo, fixed_reg)` pairs. Mirror of
-/// `collect_asm_fixed_precolors_x86_64`. AAPCS64 currently has no
-/// Fixed letters in scope, so this function always returns an
-/// empty map today — but the plumbing is wired through
-/// `color_gp_bank` for symmetry and so that when a future
-/// constraint vocabulary expansion brings Fixed letters in scope
-/// the allocator pre-colors them without further changes.
-pub fn collect_asm_fixed_precolors_aarch64(func: &Function) -> BTreeMap<PseudoId, Reg> {
-    let mut out = BTreeMap::new();
-    for block in &func.blocks {
-        for insn in &block.insns {
-            if insn.op != Opcode::Asm {
-                continue;
-            }
-            let Some(ic) = build_asm_instr_constraints_aarch64(insn) else {
-                continue;
-            };
-            for op in &ic.operands {
-                if let crate::arch::asm_constraints::OperandConstraint::Fixed(r) = &op.constraint {
-                    out.entry(op.pseudo).or_insert(*r);
-                }
-            }
-        }
-    }
-    out
 }
 
 /// Opcodes whose aarch64 codegen lowering invokes an external function
@@ -1925,11 +1846,8 @@ impl RegAlloc {
         }
 
         // Pre-colored vertices: any pseudo already mapped to a GP reg
-        // (ABI-pinned args from allocate_arguments) plus inline-asm
-        // operands with `Fixed(R)` constraints. AAPCS64 has no C2-
-        // scope Fixed letters today so the asm-precolor call is
-        // currently a no-op, but the plumbing is in place for the
-        // future-extension point.
+        // (ABI-pinned args from allocate_arguments). No aarch64 asm
+        // constraint letter pins an operand.
         let mut pre_colored: BTreeMap<PseudoId, Reg> = BTreeMap::new();
         let mut all_vertices: std::collections::BTreeSet<PseudoId> = gp_candidates.clone();
         for (&pid, loc) in self.locations.iter() {
@@ -1937,20 +1855,6 @@ impl RegAlloc {
                 pre_colored.insert(pid, *r);
                 all_vertices.insert(pid);
             }
-        }
-        for (pid, reg) in collect_asm_fixed_precolors_aarch64(func) {
-            if !gp_candidates.contains(&pid) {
-                continue;
-            }
-            // See x86_64 mirror for the rationale: commit whatever
-            // the allocator's pre_colored map actually holds, not the
-            // register we just tried to add. Otherwise an earlier
-            // ABI/asm pin would win in `pre_colored` while
-            // `self.locations` would point at a different register,
-            // splitting coloring's view from codegen's view.
-            let committed = *pre_colored.entry(pid).or_insert(reg);
-            all_vertices.insert(pid);
-            self.locations.insert(pid, Loc::Reg(committed));
         }
 
         // GP coloring needs def-vs-src edges: aarch64 `csel` for
@@ -2489,18 +2393,12 @@ mod tests {
     }
 
     fn make_asm_insn(clobbers: &[&str], operands: &[(&str, PseudoId)]) -> Instruction {
+        use crate::arch::asm_constraints::AsmAccess;
         use crate::ir::{AsmConstraint, AsmData};
         let (outputs, inputs): (Vec<_>, Vec<_>) = operands
             .iter()
-            .map(|&(c, pseudo)| AsmConstraint {
-                pseudo,
-                name: None,
-                matching_output: None,
-                constraint: c.to_string(),
-                size: 64,
-                offset: 0,
-            })
-            .partition(|c| c.constraint.starts_with('=') || c.constraint.starts_with('+'));
+            .map(|&(c, pseudo)| AsmConstraint::new(pseudo, c, crate::target::Arch::Aarch64, 64))
+            .partition(|c| c.class.access != AsmAccess::Read);
         let mut insn = Instruction::new(Opcode::Asm);
         insn.extra_mut().asm_data = Some(Box::new(AsmData {
             template: String::new(),

@@ -59,7 +59,9 @@
 use super::constfold::unambiguous_at;
 use super::dominate::{domtree_build, DomTree};
 use super::escape::EscapeInfo;
-use super::memloc::{is_ordinary_object, is_same_access, may_alias, AddrMap, MemLoc, ModuleInfo};
+use super::memloc::{
+    is_ordinary_object, is_same_access, may_alias, Access, AddrMap, MemLoc, ModuleInfo,
+};
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeTable};
 use std::cell::OnceCell;
@@ -157,6 +159,10 @@ pub(crate) struct MemOracle<'a> {
 /// which locals a callee can reach.
 struct Paths {
     esc: EscapeInfo,
+    /// What each instruction touches, by `(block, index)`, computed once:
+    /// the walk asks it of every instruction between a definition and a use,
+    /// for every use.
+    access: Vec<Vec<Access>>,
     dom: DomTree,
     preds: HashMap<BasicBlockId, Vec<BasicBlockId>>,
     succs: HashMap<BasicBlockId, Vec<BasicBlockId>>,
@@ -185,8 +191,20 @@ impl<'a> MemOracle<'a> {
                 if esc.gave_up() {
                     return None;
                 }
+                let access = self
+                    .func
+                    .blocks
+                    .iter()
+                    .map(|bb| {
+                        bb.insns
+                            .iter()
+                            .map(|insn| self.mi.access(self.am, self.func, insn))
+                            .collect()
+                    })
+                    .collect();
                 Some(Paths {
                     esc,
+                    access,
                     dom: domtree_build(self.func),
                     preds: self.func.predecessor_map(),
                     succs: self.func.successor_map(),
@@ -199,7 +217,7 @@ impl<'a> MemOracle<'a> {
     /// would read.
     fn value_at(&self, site: (usize, usize), loc: &MemLoc) -> Option<Available> {
         let paths = self.paths()?;
-        self.nearest(paths, site, loc, |insn| self.candidate(paths, insn, loc))
+        self.nearest(paths, site, loc, |at| self.candidate(paths, at, loc))
     }
 
     /// The byte `loc` -- one byte wide -- holds just before `site`, when a
@@ -219,8 +237,8 @@ impl<'a> MemOracle<'a> {
             return None;
         }
         let paths = self.paths()?;
-        self.nearest(paths, site, loc, |insn| {
-            self.byte_candidate(paths, insn, loc, little_endian)
+        self.nearest(paths, site, loc, |at| {
+            self.byte_candidate(paths, at, loc, little_endian)
         })
     }
 
@@ -232,7 +250,7 @@ impl<'a> MemOracle<'a> {
         paths: &Paths,
         (bl, il): (usize, usize),
         loc: &MemLoc,
-        classify: impl Fn(&Instruction) -> Option<Candidate<T>>,
+        classify: impl Fn((usize, usize)) -> Option<Candidate<T>>,
     ) -> Option<T> {
         let func = self.func;
         if !is_ordinary_object(func, self.types, self.mi, loc) {
@@ -255,7 +273,7 @@ impl<'a> MemOracle<'a> {
                 if insn.op == Opcode::Nop {
                     continue;
                 }
-                match classify(insn) {
+                match classify((bi, i)) {
                     Some(Candidate::Value(v)) => {
                         return self
                             .no_clobber_between(paths, (bi, i), (bl, il), loc)
@@ -275,10 +293,11 @@ impl<'a> MemOracle<'a> {
     fn candidate(
         &self,
         paths: &Paths,
-        insn: &Instruction,
+        (b, i): (usize, usize),
         loc: &MemLoc,
     ) -> Option<Candidate<Available>> {
         let (func, types, am) = (self.func, self.types, self.am);
+        let insn = &func.blocks[b].insns[i];
         match insn.op {
             Opcode::Store => {
                 let s = am.location_of(func, insn);
@@ -309,7 +328,7 @@ impl<'a> MemOracle<'a> {
                 }
                 None
             }
-            _ if self.writes(paths, insn, loc) => Some(Candidate::Clobber),
+            _ if self.writes(paths, (b, i), loc) => Some(Candidate::Clobber),
             _ => None,
         }
     }
@@ -320,10 +339,11 @@ impl<'a> MemOracle<'a> {
     fn byte_candidate(
         &self,
         paths: &Paths,
-        insn: &Instruction,
+        (b, i): (usize, usize),
         loc: &MemLoc,
         little_endian: bool,
     ) -> Option<Candidate<u8>> {
+        let insn = &self.func.blocks[b].insns[i];
         match insn.op {
             Opcode::Store => {
                 let s = self.am.location_of(self.func, insn);
@@ -342,7 +362,7 @@ impl<'a> MemOracle<'a> {
                 let byte = insn
                     .src
                     .get(1)
-                    .and_then(|&v| self.am.const_operand(self.func, v))
+                    .and_then(|&v| self.am.const_operand(v, s.size))
                     .filter(|_| plain)
                     .and_then(|c| byte_of(c, s.size / 8, at, little_endian));
                 Some(byte.map_or(Candidate::Clobber, Candidate::Value))
@@ -350,90 +370,15 @@ impl<'a> MemOracle<'a> {
             // A load writes nothing, and what it read is a pseudo, not a
             // byte.
             Opcode::Load => None,
-            _ if self.writes(paths, insn, loc) => Some(Candidate::Clobber),
+            _ if self.writes(paths, (b, i), loc) => Some(Candidate::Clobber),
             _ => None,
         }
     }
 
-    /// Could `insn` write `loc`?
-    ///
-    /// An allowlist read the safe way round: an opcode this does not
-    /// recognize is assumed to write, so a new one is conservative by
-    /// default. That is the same discipline `ifconv::is_speculatable` uses,
-    /// and the reason `Instruction::is_memory_barrier` is not enough on its
-    /// own -- it answers ordering, and omits `Store`, the mem intrinsics, the
-    /// `Va*` family, `Alloca` and `StackSave` entirely.
-    fn writes(&self, paths: &Paths, insn: &Instruction, loc: &MemLoc) -> bool {
-        let (func, am, mi) = (self.func, self.am, self.mi);
-        // A `Sym` target *is* storage, so an instruction that targets one
-        // writes the object it names -- a struct-returning call writes its
-        // receiving local this way, with no `Store` anywhere. The extent is
-        // left unknown because `insn.size` describes a register, not the
-        // aggregate.
-        if let Some(t) = insn.target {
-            if matches!(
-                func.get_pseudo(t).map(|p| &p.kind),
-                Some(super::PseudoKind::Sym(_))
-            ) && may_alias(&am.resolve(func, t, 0, 0, None), loc, mi)
-            {
-                return true;
-            }
-        }
-
-        match insn.op {
-            // Nothing here reaches memory.
-            Opcode::Nop
-            | Opcode::Entry
-            | Opcode::Phi
-            | Opcode::PhiSource
-            | Opcode::Copy
-            | Opcode::SetVal
-            | Opcode::SymAddr
-            | Opcode::Select
-            | Opcode::Br
-            | Opcode::Cbr
-            | Opcode::Switch
-            | Opcode::IndirectBr
-            | Opcode::Ret
-            | Opcode::Unreachable
-            | Opcode::Load => false,
-
-            Opcode::Store => {
-                let s = am.location_of(func, insn);
-                may_alias(&s, loc, mi)
-            }
-
-            // The extent is in the operands; `insn.size` on these is the
-            // pointer's width, not the access's.
-            Opcode::Memset | Opcode::Memcpy | Opcode::Memmove => {
-                let dst = insn
-                    .src
-                    .first()
-                    .map(|a| am.resolve(func, *a, 0, 0, None))
-                    .unwrap_or_else(MemLoc::unknown);
-                may_alias(&dst, loc, mi)
-            }
-
-            // **The rule that closes `pure-1`**: a callee cannot write a
-            // local whose address never left this function, whatever it
-            // does. That needs nothing at all from the callee.
-            //
-            // What the callee's effect adds is the *global* case, which
-            // escape analysis can say nothing about: a `pure` or `const`
-            // function writes no memory the caller can observe, so a global
-            // survives across it too.
-            Opcode::Call => mi.call_effect(insn).may_write() && paths.esc.is_captured(&loc.base),
-
-            _ if !insn.op.may_access_memory() => false,
-
-            // `Asm`, `Fence`, `Alloca`, `StackSave`/`StackRestore`, the `Va*`
-            // family, every atomic, and anything unlisted. A `"memory"`
-            // clobber can name a frame slot without naming an operand --
-            // `asm("movl $1, -8(%rbp)")` is legal and reaches a local no
-            // analysis saw -- so being blunt here costs nothing and removes
-            // the class.
-            _ => true,
-        }
+    /// Could the instruction at `(b, i)` write `loc`? What `AddrMap::access`
+    /// says it writes, against `loc`.
+    fn writes(&self, paths: &Paths, (b, i): (usize, usize), loc: &MemLoc) -> bool {
+        paths.access[b][i].may_write(loc, self.mi, &paths.esc)
     }
 
     /// Is every path from the definition to the load free of a write to
@@ -450,9 +395,9 @@ impl<'a> MemOracle<'a> {
         let load_block = func.blocks[bl].id;
 
         let scan = |bi: usize, from: usize, to: usize| -> bool {
-            func.blocks[bi].insns[from..to]
-                .iter()
-                .all(|insn| insn.op == Opcode::Nop || !self.writes(paths, insn, loc))
+            (from..to).all(|i| {
+                func.blocks[bi].insns[i].op == Opcode::Nop || !self.writes(paths, (bi, i), loc)
+            })
         };
 
         // Every way back to the definition's block runs the definition
@@ -760,6 +705,70 @@ mod tests {
         );
         assert!(!b.run());
         assert_eq!(b.op(0, 4), Opcode::Load);
+    }
+
+    /// A block op from `src` to `dest`, `%5` bytes long.
+    fn block_op(op: Opcode, dest: PseudoId, src: PseudoId, types: &TypeTable) -> Instruction {
+        Instruction::new(op)
+            .with_src3(dest, src, PseudoId(5))
+            .with_type_and_size(types.void_ptr_id, 64)
+    }
+
+    /// A local whose address went only to a `memcpy` -- as its source -- has
+    /// not escaped, so a call cannot write it and what was stored before
+    /// both is still there after them.
+    #[test]
+    fn loadfwd_forwards_across_a_call_a_local_a_block_op_read() {
+        let mut b = Build::new();
+        let i32t = b.types.int_id;
+        b.f.add_pseudo(Pseudo::sym(PseudoId(1), "b.0".into()));
+        b.f.add_local("b.0", PseudoId(1), i32t, None, None);
+        let copy = block_op(Opcode::Memcpy, PseudoId(1), PseudoId(10), &b.types);
+        let c = call("unknown", &b.types);
+        b.block(
+            0,
+            vec![
+                entry(),
+                Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+                Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, 32),
+                copy,
+                c,
+                Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+            ],
+            vec![],
+        );
+        assert!(b.run());
+        assert_eq!(b.op(0, 5), Opcode::Copy);
+    }
+
+    /// A block op that writes the local -- directly, or through a pointer
+    /// nothing is known about -- is a clobber, whatever escape says.
+    #[test]
+    fn loadfwd_refuses_across_a_block_op_that_may_write_the_local() {
+        for (op, dest) in [
+            (Opcode::Memset, PseudoId(10)),
+            (Opcode::Memcpy, PseudoId(10)),
+            (Opcode::Memmove, PseudoId(10)),
+            (Opcode::Memset, PseudoId(30)),
+        ] {
+            let mut b = Build::new();
+            let i32t = b.types.int_id;
+            b.f.add_pseudo(Pseudo::arg(PseudoId(30), 0));
+            let write = block_op(op, dest, PseudoId(6), &b.types);
+            b.block(
+                0,
+                vec![
+                    entry(),
+                    Instruction::sym_addr(PseudoId(10), PseudoId(0), i32t),
+                    Instruction::store(PseudoId(6), PseudoId(10), 0, i32t, 32),
+                    write,
+                    Instruction::load(PseudoId(20), PseudoId(10), 0, i32t, 32),
+                ],
+                vec![],
+            );
+            b.run();
+            assert_eq!(b.op(0, 4), Opcode::Load, "{op:?} into {dest:?}");
+        }
     }
 
     /// The same shape on a *global*, which any externally-linked callee can

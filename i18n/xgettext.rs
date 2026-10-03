@@ -19,7 +19,7 @@ use clap::Parser;
 #[cfg(debug_assertions)]
 use gettextrs::bindtextdomain;
 use gettextrs::gettext;
-use posixutils_cc::parse::ast::{BlockItem, ExprKind, ExternalDecl, ForInit, Stmt};
+use posixutils_cc::parse::ast::{BlockItem, ExprKind, ExternalDecl, ForInit, Label, Stmt};
 use posixutils_cc::parse::Parser as CParser;
 use posixutils_cc::strings::StringTable;
 use posixutils_cc::symbol::SymbolTable;
@@ -896,21 +896,19 @@ impl Walker {
             Stmt::GotoIndirect { target, .. } => {
                 self.extract_from_c_expr(target, strings, symbols, streams, path);
             }
-            Stmt::Case(expr, high, body) => {
-                self.extract_from_c_expr(expr, strings, symbols, streams, path);
-                if let Some(high) = high {
-                    self.extract_from_c_expr(high, strings, symbols, streams, path);
+            Stmt::Labeled { labels, stmt } => {
+                for label in labels {
+                    if let Label::Case(expr, high) = label {
+                        self.extract_from_c_expr(expr, strings, symbols, streams, path);
+                        if let Some(high) = high {
+                            self.extract_from_c_expr(high, strings, symbols, streams, path);
+                        }
+                    }
                 }
-                self.extract_from_c_stmt(body, strings, symbols, streams, path);
-            }
-            Stmt::Default(_, body) => {
-                self.extract_from_c_stmt(body, strings, symbols, streams, path);
+                self.extract_from_c_stmt(stmt, strings, symbols, streams, path);
             }
             Stmt::Return(Some(expr)) => {
                 self.extract_from_c_expr(expr, strings, symbols, streams, path);
-            }
-            Stmt::Label { stmt, .. } => {
-                self.extract_from_c_stmt(stmt, strings, symbols, streams, path);
             }
             _ => {}
         }

@@ -8,33 +8,24 @@
 
 //! Statement linearization
 
+use super::asm_operand::AddrWalk;
 use super::linearize::*;
 use super::linearize_emit::Controlling;
 use super::{
-    AsmConstraint, AsmData, BasicBlockId, Initializer, Instruction, Opcode, Pseudo, PseudoId,
+    AsmConstraint, AsmData, BasicBlockId, GlobalStorage, Initializer, Instruction, Opcode, PseudoId,
 };
+use crate::arch::asm_constraints::{AsmAccess, AsmOperandClass};
 use crate::constexpr::ConstScope;
 use crate::diag::{error, Position};
 use crate::float::FloatVal;
 use crate::parse::ast::{
-    AsmOperand, BinaryOp, BlockItem, Declaration, Expr, ExprKind, ForInit, InitElement, Stmt,
-    UnaryOp,
+    AsmOperand, BinaryOp, BlockItem, Declaration, Expr, ExprKind, ForInit, InitElement, Label,
+    Stmt, UnaryOp,
 };
 use crate::strings::StringId;
 use crate::symbol::SymbolId;
+use crate::token::lexer::payload_bytes;
 use crate::types::TypeTable;
-
-/// A `return` whose value-ness does not match the function's type.
-///
-/// C17 6.8.6.4p1 makes both a constraint violation, and c17 reports them as
-/// errors. gcc warns and compiles, and code that does this is old rather than
-/// clever -- so `-fpermissive`, which already relaxes implicit `int` and
-/// implicit function declarations for exactly that reason, relaxes these too.
-/// The value is discarded either way, and a missing one leaves the returned
-/// value indeterminate, which is what gcc's program does as well.
-fn return_value_ness_violation(pos: Position, msg: &str) {
-    crate::diag::permissive_error(pos, msg);
-}
 
 use crate::types::{TypeId, TypeKind, TypeModifiers};
 
@@ -74,14 +65,6 @@ enum JumpKind {
 
 /// A `for` loop whose body is being lowered: what
 /// [`Linearizer::open_for`] set up and [`Linearizer::close_for`] finishes.
-///
-/// `for` is lowered from two places -- the ordinary statement walk and the
-/// switch-body walk, which must keep lowering the body through itself so the
-/// `case` labels inside stay reachable -- and the two differ *only* in how
-/// they lower the body. Everything else lives here, so a fix lands once
-/// instead of twice: the loop's back edge had to be repaired in both copies,
-/// and the release of a VLA declared in the init clause was missing from
-/// both.
 #[must_use = "an opened `for` loop must be finished with close_for"]
 struct OpenFor {
     /// The scope the init clause declares into, ended after `exit_bb`.
@@ -185,40 +168,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             Stmt::Return(expr) => {
-                // C99 6.8.6.4p1: a `return` with an expression may not appear
-                // in a void function, and one without an expression may not
-                // appear in a function that returns a value.
-                let declared_ret = self.current_func.as_ref().map(|f| f.return_type);
-                if let Some(rt) = declared_ret {
-                    let returns_void = self.types.kind(rt) == TypeKind::Void;
-                    match expr {
-                        // 6.8.6.4p1 forbids returning a *value*. An expression
-                        // of type `void` has none, so `return f();` where `f`
-                        // returns void — the ordinary tail-call wrapper, which
-                        // GCC and Clang both accept — is not a violation.
-                        Some(e)
-                            if returns_void
-                                && self.types.kind(self.expr_type(e)) != TypeKind::Void =>
-                        {
-                            return_value_ness_violation(
-                                e.pos,
-                                "'return' with a value in a function returning void",
-                            )
-                        }
-                        None if !returns_void => return_value_ness_violation(
-                            // `Stmt` carries no position, so fall back to the
-                            // last expression lowered in this function.
-                            self.current_pos.unwrap_or_default(),
-                            "'return' with no value in a function returning non-void",
-                        ),
-                        // 6.8.6.4p3 converts the value "as if by assignment",
-                        // so the simple-assignment constraints of 6.5.16.1
-                        // govern it and are asked in exactly the same words.
-                        Some(e) if !returns_void => self.check_return_type(rt, e),
-                        _ => {}
-                    }
-                }
-
+                // The parser has checked the value against the declared
+                // return type (C17 6.8.6.4).
                 if let Some(e) = expr {
                     let expr_typ = self.expr_type(e);
                     // Get the function's actual return type for proper conversion
@@ -232,49 +183,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                         self.emit_sret_return(e, sret_ptr, func_ret_type);
                     } else if let Some(ret_type) = self.reg_aggregate_return_type {
                         self.emit_reg_aggregate_return(e, ret_type);
-                    } else if let Some(b) = self.complex_to_bool(e, func_ret_type) {
-                        // Ahead of the complex arm below: that one keys off the
-                        // *expression* being complex and returns its address,
-                        // which for a `_Bool` function returned the address as
-                        // the answer.
-                        let typ_size = self.types.size_bits(func_ret_type);
-                        self.emit(Instruction::ret_typed(Some(b), func_ret_type, typ_size));
-                    } else if self.types.is_complex(expr_typ)
-                        && self.types.is_complex(func_ret_type)
-                    {
-                        // At the return type's precision, for the reason the
-                        // argument path converts: the caller reads the result
-                        // with the *declared* base type's stride, so returning
-                        // a `float _Complex` from a `double _Complex` function
-                        // unconverted handed back 4-byte-strided storage to be
-                        // read 8 bytes at a time.
-                        let addr = self.complex_operand_at_precision(e, func_ret_type);
-                        let typ_size = self.types.size_bits(func_ret_type);
-                        self.emit(Instruction::ret_typed(Some(addr), func_ret_type, typ_size));
-                    } else if self.types.is_complex(expr_typ) {
-                        // A complex value returned from a real-typed function
-                        // keeps its real part (C17 6.3.1.7p2). This arm used to
-                        // be reached on the expression's type alone, so it
-                        // returned the *address* the complex travels by as the
-                        // answer -- `double f(double _Complex z){return z;}`
-                        // gave a pointer bit pattern.
-                        let real = self.emit_complex_to_real(e, func_ret_type);
-                        let typ_size = self.types.size_bits(func_ret_type);
-                        self.emit(Instruction::ret_typed(Some(real), func_ret_type, typ_size));
                     } else {
-                        let converted_val = match self.complex_to_bool(e, func_ret_type) {
-                            Some(b) => b,
-                            None => {
-                                let val = self.linearize_expr(e);
-                                // Convert to the function's return type if needed
-                                if expr_typ != func_ret_type
-                                    && self.types.kind(func_ret_type) != TypeKind::Void
-                                {
-                                    self.emit_convert(val, expr_typ, func_ret_type)
-                                } else {
-                                    val
-                                }
-                            }
+                        // Converted as if by assignment (C17 6.8.6.4p3).
+                        let converted_val = if self.types.kind(func_ret_type) == TypeKind::Void {
+                            self.linearize_expr(e)
+                        } else {
+                            self.linearize_converted(e, func_ret_type)
                         };
                         // Function types decay to pointers when returned
                         let typ_size = if self.types.kind(func_ret_type) == TypeKind::Function {
@@ -349,7 +263,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // one dispatch block, which is the only place that fans out to
                 // the labels. See `Linearizer::indirect_dispatch`.
                 let void_ptr = self.types.void_ptr_id;
-                self.emit(Instruction::store(addr, slot, 0, void_ptr, 64));
+                self.emit(Instruction::store(addr, slot, 0, void_ptr, self.ptr_bits()));
                 self.emit(Instruction::br(dispatch_bb));
                 if let Some(current) = self.current_bb {
                     self.link_bb(current, dispatch_bb);
@@ -371,8 +285,16 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.current_bb = None;
             }
 
-            Stmt::Label { name, stmt, .. } => {
-                self.place_label(*name);
+            Stmt::Labeled { labels, stmt } => {
+                for label in labels {
+                    match label {
+                        Label::Case(expr, high) => self.enter_case_label(expr, high.as_ref()),
+                        Label::Default(_) => self.enter_default_label(),
+                        Label::Named { name, .. } => self.place_label(*name),
+                    }
+                }
+                // Then the statement the labels prefix, which is where their
+                // code actually is.
                 self.linearize_stmt(stmt);
             }
 
@@ -380,23 +302,16 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.linearize_switch(expr, body);
             }
 
-            Stmt::Case(_, _, body) | Stmt::Default(_, body) => {
-                // The label itself is placed by `linearize_switch`; reaching
-                // one here means it is outside a switch, which
-                // `check_jumps_into_protected_scopes` has already
-                // diagnosed. The statement it labels is still ordinary code
-                // and is lowered, so the rest of the function is not lost
-                // behind one bad label.
-                self.linearize_stmt(body);
-            }
-
             Stmt::Asm {
+                pos,
                 template,
                 outputs,
                 inputs,
                 clobbers,
                 goto_labels,
             } => {
+                // The statement's own position until an operand gives one.
+                self.current_pos = Some(*pos);
                 self.linearize_asm(template, outputs, inputs, clobbers, goto_labels);
             }
         }
@@ -528,33 +443,18 @@ impl<'a> super::linearize::Linearizer<'a> {
             let sym_id = self.alloc_pseudo();
             let name_str = self.symbol_name(declarator.symbol);
             let unique_name = format!("{}.{}", name_str, sym_id.0);
-            let sym = Pseudo::sym(sym_id, unique_name.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(sym);
-                // Register with function's local variable tracking for SSA
-                // Pass the current basic block as the declaration block for scope-aware phi placement
-                func.add_local(
-                    &unique_name,
-                    sym_id,
-                    typ,
-                    self.current_bb,
-                    declarator.explicit_align,
-                );
-            }
+            // The current block is the declaration block, for scope-aware phi
+            // placement.
+            self.named_local(
+                sym_id,
+                unique_name,
+                typ,
+                self.current_bb,
+                declarator.explicit_align,
+            );
 
             // Track in linearizer's locals map using SymbolId as key
-            self.insert_local(
-                declarator.symbol,
-                LocalVarInfo {
-                    sym: sym_id,
-                    typ,
-                    vla_size_sym: None,
-                    vla_outer_extent: None,
-                    vla_elem_type: None,
-                    vm_row_dims: vec![],
-                    storage: crate::ir::linearize::Storage::InSlot,
-                },
-            );
+            self.insert_local(declarator.symbol, LocalVarInfo::frame(sym_id, typ));
 
             // A pointer to a variably-modified array: the extents are the
             // pointee's, and they are what one index step off the pointer
@@ -613,31 +513,22 @@ impl<'a> super::linearize::Linearizer<'a> {
                 } else if self.types.is_complex(typ) {
                     self.store_complex_at(sym_id, 0, typ, init);
                 } else {
-                    // Check for large struct/union initialization (> 64 bits)
-                    // linearize_expr returns an address for large aggregates
+                    // An aggregate that does not travel by value: the
+                    // initializer yields its address, and it is block-copied
+                    // -- by nothing at all when it is zero-sized.
                     let type_kind = self.types.kind(typ);
-                    let type_size = self.types.size_bits(typ);
-                    if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union)
-                        && type_size > 64
+                    if matches!(type_kind, TypeKind::Struct | TypeKind::Union)
+                        && !self.aggregate_travels_by_value(typ)
                     {
-                        // Large struct/union init - source is an address, do block copy
                         let value_addr = self.linearize_expr(init);
                         let type_size_bytes = self.types.size_bytes(typ);
 
                         let vol = self.block_volatility(typ, self.expr_type(init));
                         self.emit_block_copy(sym_id, value_addr, type_size_bytes as i64, vol);
                     } else {
-                        // Simple scalar initializer
-                        let init_type = self.expr_type(init);
-                        let converted = match self.complex_to_bool(init, typ) {
-                            Some(b) => b,
-                            None => {
-                                let val = self.linearize_expr(init);
-                                // Convert the value to the target type
-                                // (important for _Bool normalization)
-                                self.emit_convert(val, init_type, typ)
-                            }
-                        };
+                        // Simple scalar initializer, converted as if by
+                        // assignment (C17 6.7.9p11).
+                        let converted = self.linearize_converted(init, typ);
                         let size = self.types.size_bits(typ);
                         self.emit(Instruction::store(converted, sym_id, 0, typ, size));
                     }
@@ -682,18 +573,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         typ: TypeId,
         dims: &[Expr],
     ) {
-        self.insert_local(
-            symbol,
-            LocalVarInfo {
-                sym: PseudoId(u32::MAX),
-                typ,
-                vla_size_sym: None,
-                vla_outer_extent: None,
-                vla_elem_type: None,
-                vm_row_dims: vec![],
-                storage: crate::ir::linearize::Storage::InSlot,
-            },
-        );
+        self.insert_local(symbol, LocalVarInfo::new(LocalBinding::ExtentsOnly, typ));
         self.record_pointee_extents(symbol, typ, dims);
     }
 
@@ -736,21 +616,18 @@ impl<'a> super::linearize::Linearizer<'a> {
         let size_sym_id = self.alloc_pseudo();
         let vla_name = self.symbol_name(declarator.symbol);
         let size_var_name = format!("__vla_size_{}.{}", vla_name, size_sym_id.0);
-        let size_sym = Pseudo::sym(size_sym_id, size_var_name.clone());
-
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(size_sym);
-            func.add_local(
-                &size_var_name,
-                size_sym_id,
-                ulong_type,
-                self.current_bb,
-                None, // no explicit alignment
-            );
-        }
+        self.named_local(
+            size_sym_id,
+            size_var_name,
+            ulong_type,
+            self.current_bb,
+            None,
+        );
 
         // Store num_elements into the hidden size variable
-        let store_size_insn = Instruction::store(num_elements, size_sym_id, 0, ulong_type, 64);
+        let ulong_bits = self.types.size_bits(ulong_type);
+        let store_size_insn =
+            Instruction::store(num_elements, size_sym_id, 0, ulong_type, ulong_bits);
         self.emit(store_size_insn);
 
         // Compute total size in bytes: num_elements * sizeof(element)
@@ -760,8 +637,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             .with_target(total_size)
             .with_src(num_elements)
             .with_src(elem_size_const)
-            .with_size(64)
-            .with_type(self.types.ulong_id);
+            .with_size(ulong_bits)
+            .with_type(ulong_type);
         self.emit(mul_insn);
 
         // Capture the stack pointer before this array is allocated, so
@@ -775,7 +652,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let alloca_insn = Instruction::new(Opcode::Alloca)
             .with_target(alloca_result)
             .with_src(total_size)
-            .with_type_and_size(self.types.void_ptr_id, 64);
+            .with_type_and_size(self.types.void_ptr_id, self.ptr_bits());
         self.emit(alloca_insn);
 
         // Create a symbol pseudo for the VLA pointer variable
@@ -783,25 +660,21 @@ impl<'a> super::linearize::Linearizer<'a> {
         let sym_id = self.alloc_pseudo();
         let sym_name = self.symbol_name(declarator.symbol);
         let unique_name = format!("{}.{}", sym_name, sym_id.0);
-        let sym = Pseudo::sym(sym_id, unique_name.clone());
 
         // Create a pointer type for the VLA (pointer to element type)
         let ptr_type = self.types.pointer_to(elem_type);
 
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(sym);
-            // Register as a pointer variable, not as the array type
-            func.add_local(
-                &unique_name,
-                sym_id,
-                ptr_type,
-                self.current_bb,
-                declarator.explicit_align, // VLA explicit alignment
-            );
-        }
+        // Register as a pointer variable, not as the array type
+        self.named_local(
+            sym_id,
+            unique_name,
+            ptr_type,
+            self.current_bb,
+            declarator.explicit_align,
+        );
 
         // Store the Alloca result (pointer) into the VLA symbol
-        let store_insn = Instruction::store(alloca_result, sym_id, 0, ptr_type, 64);
+        let store_insn = Instruction::store(alloca_result, sym_id, 0, ptr_type, self.ptr_bits());
         self.emit(store_insn);
 
         // Track in linearizer's locals map with pointer type and VLA size info
@@ -809,16 +682,20 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.insert_local(
             declarator.symbol,
             LocalVarInfo {
-                sym: sym_id,
-                typ: ptr_type,
                 vla_size_sym: Some(size_sym_id),
                 vla_outer_extent: dims.first().copied(),
                 vla_elem_type: Some(elem_type),
                 // One index step consumes the outermost extent, so what a row
                 // still spans is everything after it.
                 vm_row_dims: dims[1..].to_vec(),
-                // The slot holds the `alloca` result, not the elements.
-                storage: crate::ir::linearize::Storage::Indirect(ptr_type),
+                ..LocalVarInfo::new(
+                    LocalBinding::Frame {
+                        sym: sym_id,
+                        // The slot holds the `alloca` result, not the elements.
+                        storage: Storage::Indirect(ptr_type),
+                    },
+                    ptr_type,
+                )
             },
         );
     }
@@ -868,31 +745,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         );
         self.static_local_counter += 1;
 
-        // Track mapping from local name to global name for this function's scope
-        // Use a key that includes function name to handle same-named statics in different functions
-        let key = format!("{}.{}", self.current_func_name, name_str);
-        self.static_locals.insert(
-            key,
-            StaticLocalInfo {
-                global_name: global_name.clone(),
-                typ: declarator.typ,
-            },
-        );
-
-        // Also insert with the SymbolId for the current function scope
-        // This is used during expression linearization
+        // The name is bound in this scope like any local, so an inner
+        // declaration shadows it and leaving the scope ends it.
         self.insert_local(
             declarator.symbol,
-            LocalVarInfo {
-                // Use a sentinel value - we'll handle static locals specially
-                sym: PseudoId(u32::MAX),
-                typ: declarator.typ,
-                vla_size_sym: None,
-                vla_outer_extent: None,
-                vla_elem_type: None,
-                vm_row_dims: vec![],
-                storage: crate::ir::linearize::Storage::InSlot,
-            },
+            LocalVarInfo::new(
+                LocalBinding::Static {
+                    global: global_name.clone(),
+                },
+                declarator.typ,
+            ),
         );
 
         // A static pointer to a VLA -- the one variably modified type static
@@ -912,70 +774,24 @@ impl<'a> super::linearize::Linearizer<'a> {
         // anything about the type: a structure's type is its tag's and never
         // carries one, so asking the type made `static _Thread_local struct S
         // s;` one object shared by every thread.
-        if declarator
-            .storage_class
-            .contains(TypeModifiers::THREAD_LOCAL)
-        {
-            self.module.add_global_tls_aligned(
-                &global_name,
-                declarator.typ,
-                init,
-                declarator.explicit_align,
-                true, // static locals always have internal linkage
-                is_const,
-            );
-        } else {
-            self.module.add_global_aligned(
-                &global_name,
-                declarator.typ,
-                init,
-                declarator.explicit_align,
-                true, // static locals always have internal linkage
-                is_const,
-            );
-        }
+        let storage = GlobalStorage {
+            // Static locals always have internal linkage.
+            is_static: true,
+            is_const,
+            is_thread_local: declarator
+                .storage_class
+                .contains(TypeModifiers::THREAD_LOCAL),
+        };
+        self.module.define_global(
+            &global_name,
+            declarator.typ,
+            init,
+            declarator.explicit_align,
+            storage,
+        );
     }
 
     /// Linearize an initializer list for arrays or structs
-    /// Check a returned value against the function's declared return type
-    /// (C17 6.8.6.4p3, whose constraints are 6.5.16.1's).
-    fn check_return_type(&mut self, declared: TypeId, expr: &Expr) {
-        let value = self.expr_type(expr);
-        let null_constant =
-            self.types.kind(value) != TypeKind::Pointer && self.eval_const_expr(expr) == Some(0);
-        let Some(fault) = self.types.assignment_fault(declared, value, null_constant) else {
-            return;
-        };
-        if fault == crate::types::AssignFault::FunctionPointerVoid {
-            if crate::diag::warning_group_enabled(crate::types::FUNCTION_POINTER_CONV) {
-                crate::diag::warning(
-                    expr.pos,
-                    &gettextrs::gettext(
-                        "ISO C forbids return between function pointer and 'void *'",
-                    ),
-                );
-            }
-            return;
-        }
-        let (d_name, v_name) = (
-            self.types.format_type(declared, Some(self.strings)),
-            self.types.format_type(value, Some(self.strings)),
-        );
-        if fault.is_error() {
-            crate::diag::error_args(
-                expr.pos,
-                "incompatible types returning '{0}' from a function returning '{1}'",
-                &[&v_name, &d_name],
-            );
-        } else {
-            crate::diag::warning_args(
-                expr.pos,
-                "returning '{0}' from a function with return type '{1}' {2}",
-                &[&v_name, &d_name, fault.describe()],
-            );
-        }
-    }
-
     pub(crate) fn linearize_init_list(
         &mut self,
         base_sym: PseudoId,
@@ -1079,9 +895,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         self.store_complex_at(base_sym, offset, elem_type, &last.value);
                         continue;
                     }
-                    let val = self.linearize_expr(&last.value);
-                    let val_type = self.expr_type(&last.value);
-                    let converted = self.emit_convert(val, val_type, elem_type);
+                    let converted = self.linearize_converted(&last.value, elem_type);
                     let elem_size = self.types.size_bits(elem_type);
                     self.emit(Instruction::store(
                         converted, base_sym, offset, elem_type, elem_size,
@@ -1115,16 +929,14 @@ impl<'a> super::linearize::Linearizer<'a> {
                     }
                 }
 
-                // What every member inherits from the object: taken before
-                // resolving, which answers with the tag's unqualified type.
+                // What every member inherits from the object.
                 let object_quals = self.types.qualifiers(typ);
-                let resolved_typ = self.resolve_struct_type(typ);
-                if let Some(composite) = self.types.get(resolved_typ).composite.as_ref() {
+                if let Some(composite) = self.types.get(typ).composite.as_ref() {
                     let members: Vec<_> = composite.members.clone();
-                    let is_union = self.types.kind(resolved_typ) == TypeKind::Union;
+                    let is_union = self.types.kind(typ) == TypeKind::Union;
 
                     let mut visits =
-                        self.walk_struct_init_fields(resolved_typ, &members, is_union, elements);
+                        self.walk_struct_init_fields(typ, &members, is_union, elements);
                     self.admit_fam_visits(&mut visits, &members, InitStorage::Automatic);
 
                     // C17 6.7.9p19 resolves two initializers for overlapping
@@ -1175,15 +987,12 @@ impl<'a> super::linearize::Linearizer<'a> {
                             }
                             StructFieldVisitKind::Expr(expr) => {
                                 if let Some(bf) = bitfield {
-                                    let val = self.linearize_expr(&expr);
-                                    let val_type = self.expr_type(&expr);
-
                                     // C17 6.7.9p11 initializes a member by
                                     // converting to the *member's* type, not the
                                     // storage unit's: for `_Bool` that is the
                                     // conversion normalizing to 0/1 (6.3.1.2), so
                                     // `struct { _Bool f:1; } v = {2};` stores 1.
-                                    let member_val = self.emit_convert(val, val_type, field_type);
+                                    let member_val = self.linearize_converted(&expr, field_type);
                                     self.emit_bitfield_store(base_sym, bf, member_val, field_type);
                                 } else {
                                     self.linearize_struct_field_init(
@@ -1205,9 +1014,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         self.store_complex_at(base_sym, base_offset, typ, &element.value);
                         return;
                     }
-                    let val = self.linearize_expr(&element.value);
-                    let val_type = self.expr_type(&element.value);
-                    let converted = self.emit_convert(val, val_type, typ);
+                    let converted = self.linearize_converted(&element.value, typ);
                     let typ_size = self.types.size_bits(typ);
                     self.emit(Instruction::store(
                         converted,
@@ -1353,8 +1160,8 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// The initializer's base precision need not match the object's -- and
     /// usually does not, because `I` is `__builtin_complex(0.0, 1.0)`, a
     /// *double* complex, so `float _Complex f = 2.0f + 3.0f*I;` is a
-    /// conversion. Reading the source with the target's base type and stride
-    /// would mismatch both the width and the step.
+    /// conversion, and so is a real initializer. Both are converted by
+    /// [`Self::linearize_converted`] before the halves are copied.
     pub(crate) fn store_complex_at(
         &mut self,
         base_sym: PseudoId,
@@ -1362,54 +1169,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         complex_typ: TypeId,
         init: &Expr,
     ) {
-        let init_typ = self.expr_type(init);
-        let base_typ = self.types.complex_base(complex_typ);
-        let base_bits = self.types.size_bits(base_typ);
-        let base_bytes = (base_bits / 8) as i64;
-
-        if self.types.is_complex(init_typ) {
-            let value_addr = self.complex_operand_addr(init);
-            let src_base = self.types.complex_base(init_typ);
-            let src_bits = self.types.size_bits(src_base);
-            let src_bytes = (src_bits / 8) as i64;
-
-            let val_real = self.alloc_pseudo();
-            let val_imag = self.alloc_pseudo();
-            self.emit(Instruction::load(
-                val_real, value_addr, 0, src_base, src_bits,
-            ));
-            self.emit(Instruction::load(
-                val_imag, value_addr, src_bytes, src_base, src_bits,
-            ));
-            let val_real = self.emit_convert(val_real, src_base, base_typ);
-            let val_imag = self.emit_convert(val_imag, src_base, base_typ);
-            self.emit(Instruction::store(
-                val_real, base_sym, offset, base_typ, base_bits,
-            ));
-            self.emit(Instruction::store(
-                val_imag,
-                base_sym,
-                offset + base_bytes,
-                base_typ,
-                base_bits,
-            ));
-        } else {
-            // A real scalar names only the real half; C99 6.3.1.7 gives the
-            // imaginary half a positive zero.
-            let val = self.linearize_expr(init);
-            let converted = self.emit_convert(val, init_typ, base_typ);
-            self.emit(Instruction::store(
-                converted, base_sym, offset, base_typ, base_bits,
-            ));
-            let zero = self.complex_half_zero(base_typ);
-            self.emit(Instruction::store(
-                zero,
-                base_sym,
-                offset + base_bytes,
-                base_typ,
-                base_bits,
-            ));
-        }
+        let value_addr = self.linearize_converted(init, complex_typ);
+        self.copy_complex(base_sym, offset, value_addr, complex_typ);
     }
 
     pub(crate) fn linearize_struct_field_init(
@@ -1454,9 +1215,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     );
                 }
             } else {
-                let val = self.linearize_expr(value);
-                let val_type = self.expr_type(value);
-                let converted = self.emit_convert(val, val_type, field_type);
+                let converted = self.linearize_converted(value, field_type);
                 let size = self.types.size_bits(field_type);
                 self.emit(Instruction::store(
                     converted, base_sym, offset, field_type, size,
@@ -1471,9 +1230,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             } else {
                 (field_type, self.types.size_bits(field_type))
             };
-            let val = self.linearize_expr(value);
-            let val_type = self.expr_type(value);
-            let converted = self.emit_convert(val, val_type, actual_type);
+            let converted = self.linearize_converted(value, actual_type);
             self.emit(Instruction::store(
                 converted,
                 base_sym,
@@ -1745,8 +1502,8 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Collect case labels and create basic blocks for each. C17 6.8.4.2p5
         // converts every label to `cmp_type`, and `conv` is that conversion:
-        // the collector applies it, and the body walk below reaches the labels
-        // back through the same value, so the two cannot drift apart.
+        // the collector applies it, and the body's lowering below reaches the
+        // labels back through the same value, so the two cannot drift apart.
         let conv = CaseConv::of(self.types, cmp_type);
         let (case_values, has_default) = self.collect_switch_cases(body, conv);
         let case_bbs: Vec<BasicBlockId> = case_values
@@ -1834,11 +1591,17 @@ impl<'a> super::linearize::Linearizer<'a> {
         // block via `switch_bb`.
         self.current_bb = None;
 
-        // Linearize body with case block switching. The index carries the
-        // collector's own conversion, so the walk finds a label under exactly
-        // the key the collector filed it under.
-        let case_index = CaseIndex::of(&case_values);
-        self.linearize_switch_body(body, &case_index, &case_bbs, default_bb);
+        // The body is ordinary code; its `case` and `default` labels find
+        // their blocks through the context pushed here, wherever they sit in
+        // it. The index carries the collector's own conversion, so a label is
+        // found under exactly the key the collector filed it under.
+        self.switch_stack.push(SwitchCtx {
+            index: CaseIndex::of(&case_values),
+            case_bbs,
+            default_bb,
+        });
+        self.linearize_stmt(body);
+        self.switch_stack.pop();
 
         // If not terminated after body, jump to exit
         if !self.is_terminated() {
@@ -1861,22 +1624,11 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// one. `switch (x) while (n < 3) { case 1: n++; }` is legal, and matching
     /// only `Stmt::Block` here collected no cases from it -- so the switch was
     /// emitted with an empty table and every value took the default edge.
-    /// A non-compound body is one statement, so it is walked as one.
+    /// The body is walked as any statement is, compound or not.
     pub(crate) fn collect_switch_cases(&self, body: &Stmt, conv: CaseConv) -> (CaseSet, bool) {
         let mut case_values = CaseSet::new(conv);
         let mut has_default = false;
-
-        match body {
-            Stmt::Block(items) => {
-                for item in items {
-                    if let BlockItem::Statement(stmt) = item {
-                        self.collect_cases_from_stmt(stmt, &mut case_values, &mut has_default);
-                    }
-                }
-            }
-            stmt => self.collect_cases_from_stmt(stmt, &mut case_values, &mut has_default),
-        }
-
+        self.collect_cases_from_stmt(body, &mut case_values, &mut has_default);
         (case_values, has_default)
     }
 
@@ -1893,17 +1645,25 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
         let void_ptr = self.types.void_ptr_id;
         let slot = self.alloc_pseudo();
-        let name = format!("__goto_target.{}", slot.0);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(crate::ir::Pseudo::sym(slot, name.clone()));
-            func.add_local(&name, slot, void_ptr, None, None);
-        }
+        self.named_local(
+            slot,
+            format!("__goto_target.{}", slot.0),
+            void_ptr,
+            None,
+            None,
+        );
 
         let dispatch_bb = self.alloc_bb();
         let saved = self.current_bb;
         self.switch_bb(dispatch_bb);
         let loaded = self.alloc_pseudo();
-        self.emit(Instruction::load(loaded, slot, 0, void_ptr, 64));
+        self.emit(Instruction::load(
+            loaded,
+            slot,
+            0,
+            void_ptr,
+            self.ptr_bits(),
+        ));
         self.emit(Instruction::indirect_br(loaded));
         self.current_bb = saved;
 
@@ -1999,11 +1759,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         // 6.8.1p3: a label name is unique within the function it appears in.
         // Two labels of one name were silently merged into one basic block, so
         // `L: i++; if (i<2) goto L; L: return i;` looped forever.
-        for (i, (name, _, pos)) in w.labels.iter().enumerate() {
-            if w.labels[..i].iter().any(|(earlier, _, _)| earlier == name) {
-                let spelled = self.strings.get(*name).to_string();
-                crate::diag::error_args(*pos, "duplicate label '{0}'", &[&spelled]);
-            }
+        let (first_label, duplicates) = w.resolve_labels();
+        for i in duplicates {
+            let (name, _, pos) = &w.labels[i];
+            let spelled = self.strings.get(*name).to_string();
+            crate::diag::error_args(*pos, "duplicate label '{0}'", &[&spelled]);
         }
 
         // A `goto` is illegal exactly when its label sits inside a scope the
@@ -2011,10 +1771,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         for jump in &w.gotos {
             // A missing label is reported by `check_label_references` once
             // the body is lowered.
-            let Some((_, to, label_pos)) = w.labels.iter().find(|(n, _, _)| *n == jump.label)
-            else {
+            let Some(&i) = first_label.get(&jump.label) else {
                 continue;
             };
+            let (_, to, label_pos) = &w.labels[i];
             let pos = jump.pos.unwrap_or(*label_pos);
             for id in w.entered(&jump.from, to) {
                 self.report_protected_jump(&w.scopes[id], false, pos);
@@ -2120,6 +1880,89 @@ impl<'a> super::linearize::Linearizer<'a> {
         converted
     }
 
+    /// Record one `case` label's value, or range, for its switch.
+    fn collect_case_label(&self, expr: &Expr, high: Option<&Expr>, case_values: &mut CaseSet) {
+        // Extract constant value from case expression
+        let Some(raw_lo) = self.eval_const_expr(expr) else {
+            self.report_unfoldable_case(expr);
+            return;
+        };
+        // A GNU range `case lo ... hi:`. An absent high endpoint is
+        // the ordinary label, held as the degenerate range `(v, v)` so
+        // that everything downstream has one shape.
+        let raw_hi = match high {
+            None => Some(raw_lo),
+            Some(hi_expr) => match self.eval_const_expr(hi_expr) {
+                Some(h) => Some(h),
+                None => {
+                    self.report_unfoldable_case(hi_expr);
+                    None
+                }
+            },
+        };
+        let Some(raw_hi) = raw_hi else { return };
+
+        // C17 6.8.4.2p5: each case constant is converted to the
+        // promoted type of the controlling expression. Evaluating the
+        // label at full width and never converting it left c17's two
+        // lowerings disagreeing about the same switch -- a runtime
+        // selector kept the unconverted label in the `switch`
+        // instruction, where the backend truncated it, while the
+        // constant-selector path compared at 128 bits and did not
+        // match at all. `case 4294967296LL:` in an `int` switch is
+        // `case 0:`, and has to be that for both.
+        let conv = case_values.conv();
+        let lo = self.convert_case_label(expr, raw_lo, conv);
+        let hi = match high {
+            None => lo,
+            Some(hi_expr) => self.convert_case_label(hi_expr, raw_hi, conv),
+        };
+
+        // 6.8.4.2p3 forbids two equal case constants, and GCC
+        // extends that to overlapping ranges -- an overlap would
+        // otherwise make one arm silently unreachable, since the
+        // body walk resolves a label by finding the first match.
+        // Both tests run on the converted values, since that is what
+        // "equal" means once p5 has been applied: `case 0:` beside
+        // `case 4294967296LL:` in an `int` switch is one value twice.
+        //
+        // Order by the switch type's own signedness. The endpoints are
+        // carried as `i128`, and an unsigned 64-bit bound above
+        // `i64::MAX` is still positive there -- but an unsigned
+        // *128-bit* one is not, so the reinterpretation is still
+        // needed: `case 0ul ... ULONG_MAX:` read as an empty range and
+        // never matched.
+        if conv.lt(hi, lo) {
+            // GCC accepts an empty range, warns, and never matches
+            // it. Nothing is recorded, so nothing can overlap it.
+            crate::diag::warning(expr.pos, "empty range specified");
+            return;
+        }
+        if let Some((lo2, hi2)) = case_values.overlap(lo, hi) {
+            let what = if lo == hi && lo2 == hi2 {
+                format!("duplicate case value '{}' in switch", lo)
+            } else {
+                format!(
+                    "duplicate (or overlapping) case value: {}..{} overlaps {}..{}",
+                    lo, hi, lo2, hi2
+                )
+            };
+            error(expr.pos, &what);
+        }
+        case_values.insert(lo, hi);
+    }
+
+    fn collect_default_label(&self, has_default: &mut bool) {
+        // C99 6.8.4.2p3: at most one default label per switch.
+        if *has_default {
+            error(
+                self.current_pos.unwrap_or_default(),
+                "multiple default labels in one switch",
+            );
+        }
+        *has_default = true;
+    }
+
     pub(crate) fn collect_cases_from_stmt(
         &self,
         stmt: &Stmt,
@@ -2127,90 +1970,16 @@ impl<'a> super::linearize::Linearizer<'a> {
         has_default: &mut bool,
     ) {
         match stmt {
-            Stmt::Case(expr, high, body) => {
-                self.collect_cases_from_stmt(body, case_values, has_default);
-                // Extract constant value from case expression
-                let Some(raw_lo) = self.eval_const_expr(expr) else {
-                    self.report_unfoldable_case(expr);
-                    return;
-                };
-                // A GNU range `case lo ... hi:`. An absent high endpoint is
-                // the ordinary label, held as the degenerate range `(v, v)` so
-                // that everything downstream has one shape.
-                let raw_hi = match high {
-                    None => Some(raw_lo),
-                    Some(hi_expr) => match self.eval_const_expr(hi_expr) {
-                        Some(h) => Some(h),
-                        None => {
-                            self.report_unfoldable_case(hi_expr);
-                            None
+            Stmt::Labeled { labels, stmt } => {
+                for label in labels {
+                    match label {
+                        Label::Case(expr, high) => {
+                            self.collect_case_label(expr, high.as_ref(), case_values)
                         }
-                    },
-                };
-                let Some(raw_hi) = raw_hi else { return };
-
-                // C17 6.8.4.2p5: each case constant is converted to the
-                // promoted type of the controlling expression. Evaluating the
-                // label at full width and never converting it left c17's two
-                // lowerings disagreeing about the same switch -- a runtime
-                // selector kept the unconverted label in the `switch`
-                // instruction, where the backend truncated it, while the
-                // constant-selector path compared at 128 bits and did not
-                // match at all. `case 4294967296LL:` in an `int` switch is
-                // `case 0:`, and has to be that for both.
-                let conv = case_values.conv();
-                let lo = self.convert_case_label(expr, raw_lo, conv);
-                let hi = match high {
-                    None => lo,
-                    Some(hi_expr) => self.convert_case_label(hi_expr, raw_hi, conv),
-                };
-
-                // 6.8.4.2p3 forbids two equal case constants, and GCC
-                // extends that to overlapping ranges -- an overlap would
-                // otherwise make one arm silently unreachable, since the
-                // body walk resolves a label by finding the first match.
-                // Both tests run on the converted values, since that is what
-                // "equal" means once p5 has been applied: `case 0:` beside
-                // `case 4294967296LL:` in an `int` switch is one value twice.
-                //
-                // Order by the switch type's own signedness. The endpoints are
-                // carried as `i128`, and an unsigned 64-bit bound above
-                // `i64::MAX` is still positive there -- but an unsigned
-                // *128-bit* one is not, so the reinterpretation is still
-                // needed: `case 0ul ... ULONG_MAX:` read as an empty range and
-                // never matched.
-                if conv.lt(hi, lo) {
-                    // GCC accepts an empty range, warns, and never matches
-                    // it. Nothing is recorded, so nothing can overlap it.
-                    crate::diag::warning(expr.pos, "empty range specified");
-                    return;
+                        Label::Default(_) => self.collect_default_label(has_default),
+                        Label::Named { .. } => {}
+                    }
                 }
-                if let Some((lo2, hi2)) = case_values.overlap(lo, hi) {
-                    let what = if lo == hi && lo2 == hi2 {
-                        format!("duplicate case value '{}' in switch", lo)
-                    } else {
-                        format!(
-                            "duplicate (or overlapping) case value: {}..{} overlaps {}..{}",
-                            lo, hi, lo2, hi2
-                        )
-                    };
-                    error(expr.pos, &what);
-                }
-                case_values.insert(lo, hi);
-            }
-            Stmt::Default(_, body) => {
-                self.collect_cases_from_stmt(body, case_values, has_default);
-                // C99 6.8.4.2p3: at most one default label per switch.
-                if *has_default {
-                    error(
-                        self.current_pos.unwrap_or_default(),
-                        "multiple default labels in one switch",
-                    );
-                }
-                *has_default = true;
-            }
-            // Recursively check labeled statements
-            Stmt::Label { stmt, .. } => {
                 self.collect_cases_from_stmt(stmt, case_values, has_default);
             }
             // Recurse into nested statements for Duff's device pattern
@@ -2237,6 +2006,9 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
             // Stop at inner switch — its case labels belong to it
             Stmt::Switch { .. } => {}
+            // The rest hold statements only inside statement expressions,
+            // which no switch jump may enter; their lowering hides the
+            // enclosing switches as well.
             _ => {}
         }
     }
@@ -2331,13 +2103,14 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// The code units a string literal contributes to an array initializer,
     /// or `None` if this is not a string literal.
     ///
-    /// A narrow literal's parsed form holds one C byte per Rust `char`, so the
-    /// units are the scalar values — iterating `bytes()` UTF-8-encodes anything
-    /// at or above 0x80, which turned `char a[] = "\x80"` into the two bytes
-    /// 0xC2 0x80 and left the array one byte short of what `sizeof` reported.
+    /// A narrow literal's parsed form is a literal payload, one C byte per
+    /// Rust `char`, so its units are [`payload_bytes`] — iterating `bytes()`
+    /// UTF-8-encodes anything at or above 0x80, which turned
+    /// `char a[] = "\x80"` into the two bytes 0xC2 0x80 and left the array one
+    /// byte short of what `sizeof` reported.
     fn string_literal_units(kind: &ExprKind) -> Option<Vec<i128>> {
         match kind {
-            ExprKind::StringLit(s) => Some(s.chars().map(|c| (c as u32 as u8) as i128).collect()),
+            ExprKind::StringLit(s) => Some(payload_bytes(s).map(i128::from).collect()),
             ExprKind::Utf16StringLit(u) => Some(u.iter().map(|c| *c as i128).collect()),
             ExprKind::WideStringLit(u) | ExprKind::Utf32StringLit(u) => {
                 Some(u.iter().map(|c| *c as i128).collect())
@@ -2422,12 +2195,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// for an object defined earlier in the translation unit -- which is what
     /// "visible value" means.
     fn const_object_value(&self, symbol_id: crate::symbol::SymbolId) -> Option<i128> {
-        let name = self.symbol_name(symbol_id);
-        let key = format!("{}.{}", self.current_func_name, name);
-        let global_name = match self.static_locals.get(&key) {
-            Some(info) => info.global_name.as_str(),
-            None => name.as_str(),
-        };
+        let global_name = self.global_name_of(symbol_id)?;
         let global = self
             .module
             .globals
@@ -2439,14 +2207,58 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
+    /// The scalar initializer an element or member of a `const` object was
+    /// given -- `a[1]`, `s.m`, `t.v[2].m` -- when the object's own
+    /// initializer folded, as [`Self::const_object_value`] answers for the
+    /// object named whole. gcc folds these in a static initializer too.
+    ///
+    /// Without it, `const int a[2] = {1, 2}; int w = a[1];` was initialized
+    /// with the element's *address*: eight bytes of relocation over a
+    /// four-byte `int`.
+    fn const_subobject_init(&self, expr: &Expr) -> Option<&crate::ir::Initializer> {
+        let (symbol_id, offset) = self.const_subobject_place(expr)?;
+        let global_name = self.global_name_of(symbol_id)?;
+        let global = self
+            .module
+            .globals
+            .iter()
+            .find(|g| g.name == global_name && g.is_const)?;
+        let size = self.types.size_bytes(expr.typ?);
+        let whole = self.types.size_bytes(global.typ);
+        initializer_leaf(&global.init, offset, size, whole)
+    }
+
+    /// The object `expr` designates a subobject of, and the subobject's byte
+    /// offset in it. Only a path of constant subscripts into arrays and of
+    /// members that are not bit-fields qualifies.
+    fn const_subobject_place(&self, expr: &Expr) -> Option<(crate::symbol::SymbolId, usize)> {
+        match &expr.kind {
+            ExprKind::Ident(symbol_id) => Some((*symbol_id, 0)),
+            ExprKind::Index { array, index } if self.types.kind(array.typ?) == TypeKind::Array => {
+                let (symbol_id, base) = self.const_subobject_place(array)?;
+                let i = crate::constexpr::eval(self, ConstScope::StaticInitializer, index)?;
+                let step = self.types.size_bytes(expr.typ?);
+                let at = usize::try_from(i).ok()?.checked_mul(step)?;
+                Some((symbol_id, base.checked_add(at)?))
+            }
+            ExprKind::Member {
+                expr: inner,
+                member,
+            } => {
+                let info = self.types.find_member(inner.typ?, *member)?;
+                if info.bit_width.is_some() {
+                    return None;
+                }
+                let (symbol_id, base) = self.const_subobject_place(inner)?;
+                Some((symbol_id, base + info.offset))
+            }
+            _ => None,
+        }
+    }
+
     /// [`Self::const_object_value`] for a floating `const` object.
     fn const_object_float_value(&self, symbol_id: crate::symbol::SymbolId) -> Option<FloatVal> {
-        let name = self.symbol_name(symbol_id);
-        let key = format!("{}.{}", self.current_func_name, name);
-        let global_name = match self.static_locals.get(&key) {
-            Some(info) => info.global_name.as_str(),
-            None => name.as_str(),
-        };
+        let global_name = self.global_name_of(symbol_id)?;
         let global = self
             .module
             .globals
@@ -2500,9 +2312,10 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// or None if it can't be computed at compile time.
     /// Is this expression an *address*, whatever its type says?
     ///
-    /// A pointer or an array is one. So is a cast of one: `(unsigned long)&x`
-    /// has integer type and is still a relocation, which is how a kernel or a
-    /// linker script's C half writes an address constant.
+    /// A pointer is one, as are an array and a function, which decay to one.
+    /// So is a cast of one: `(unsigned long)&x` has integer type and is still
+    /// a relocation, which is how a kernel or a linker script's C half writes
+    /// an address constant.
     ///
     /// An object *read* is not one, however freely its address could be
     /// taken. `int v = 5; int w = v + 1;` is not a constant expression, and
@@ -2511,7 +2324,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     pub(crate) fn is_address_valued(&self, expr: &Expr) -> bool {
         if expr
             .typ
-            .is_some_and(|t| matches!(self.types.kind(t), TypeKind::Pointer | TypeKind::Array))
+            .is_some_and(|t| self.types.kind(self.types.decayed_value(t)) == TypeKind::Pointer)
         {
             return true;
         }
@@ -2586,16 +2399,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             // Simple identifier: &symbol
-            ExprKind::Ident(symbol_id) => {
-                let name_str = self.symbol_name(*symbol_id);
-                // Check if this is a static local variable
-                let key = format!("{}.{}", self.current_func_name, name_str);
-                if let Some(static_info) = self.static_locals.get(&key) {
-                    Some((static_info.global_name.clone(), 0))
-                } else {
-                    Some((name_str, 0))
-                }
-            }
+            ExprKind::Ident(symbol_id) => Some((self.global_name_of(*symbol_id)?, 0)),
 
             // Member access: expr.member
             ExprKind::Member { expr: base, member } => {
@@ -2657,7 +2461,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 // Scale by pointee size for pointer arithmetic
                 let pointee_size = ptr_expr
                     .typ
-                    .and_then(|t| self.types.base_type(t))
+                    .and_then(|t| self.types.arithmetic_pointee(t))
                     .map(|t| self.types.size_bytes(t) as i64)
                     .unwrap_or(1);
                 let byte_offset = if is_sub {
@@ -2673,7 +2477,6 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// Linearize switch body, switching basic blocks at case/default labels
     /// Lower a `switch` whose controlling expression is wider than a general
     /// register into explicit comparisons.
     ///
@@ -2731,265 +2534,118 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.link_to_merge_if_needed(default_target);
     }
 
-    pub(crate) fn linearize_switch_body(
-        &mut self,
-        body: &Stmt,
-        case_values: &CaseIndex,
-        case_bbs: &[BasicBlockId],
-        default_bb: Option<BasicBlockId>,
-    ) {
-        let mut case_idx = 0;
+    /// Start the block of the `case` label `expr` (or `expr ... high`), in
+    /// the innermost `switch` being lowered.
+    ///
+    /// The endpoints are the label's raw constants; `CaseIndex::lookup`
+    /// converts them to the promoted controlling type with the very
+    /// conversion the collector used, which is what keeps this lookup from
+    /// missing and dropping the case body into the wrong block. With no
+    /// `switch` open the label is stray, which
+    /// `check_jumps_into_protected_scopes` reports; the statement it labels
+    /// is still lowered, so the rest of the function is not lost behind it.
+    fn enter_case_label(&mut self, expr: &Expr, high: Option<&Expr>) {
+        let Some(lo) = self.eval_const_expr(expr) else {
+            return;
+        };
+        let hi = match high {
+            None => Some(lo),
+            Some(hi_expr) => self.eval_const_expr(hi_expr),
+        };
+        let Some(ctx) = self.switch_stack.last() else {
+            return;
+        };
+        let Some(idx) = hi.and_then(|hi| ctx.index.lookup(lo, hi)) else {
+            return;
+        };
+        self.fall_into_case_block(ctx.case_bbs[idx]);
+    }
 
-        // A non-compound body is one statement; lowering it through the same
-        // walker is what keeps the labels inside it reachable. See
-        // `collect_switch_cases`, which has to agree about this.
-        match body {
-            Stmt::Block(items) => {
-                // The same scope as the ordinary block arm: a switch body is
-                // lowered by its own walk, and leaving the rule out here let
-                // `switch (c) { case 0: { int v[n]; break; } }` inside a loop
-                // grow the stack without bound, and let the body's
-                // declarations outlive the switch.
-                let scope = self.push_scope();
-                for item in items {
-                    match item {
-                        BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
-                        BlockItem::Statement(stmt) => {
-                            self.linearize_switch_stmt(
-                                stmt,
-                                case_values,
-                                case_bbs,
-                                default_bb,
-                                &mut case_idx,
-                            );
-                        }
-                    }
-                }
-                self.pop_scope(scope);
-            }
-            stmt => {
-                self.linearize_switch_stmt(stmt, case_values, case_bbs, default_bb, &mut case_idx)
-            }
+    /// Start the block of a `default` label, in the innermost `switch` being
+    /// lowered. As for `case`, a stray one has been reported already.
+    fn enter_default_label(&mut self) {
+        if let Some(bb) = self.switch_stack.last().and_then(|ctx| ctx.default_bb) {
+            self.fall_into_case_block(bb);
         }
     }
 
-    pub(crate) fn linearize_switch_stmt(
-        &mut self,
-        stmt: &Stmt,
-        case_values: &CaseIndex,
-        case_bbs: &[BasicBlockId],
-        default_bb: Option<BasicBlockId>,
-        case_idx: &mut usize,
-    ) {
-        match stmt {
-            Stmt::Case(expr, high, body) => {
-                // Find the matching case block. The endpoints are the label's
-                // raw constants; `CaseIndex::lookup` converts them to the
-                // promoted controlling type with the very conversion the
-                // collector used, which is what keeps this lookup from missing
-                // and dropping the case body into the wrong block.
-                if let Some(lo) = self.eval_const_expr(expr) {
-                    let hi = match high {
-                        None => Some(lo),
-                        Some(hi_expr) => self.eval_const_expr(hi_expr),
-                    };
-                    let Some(hi) = hi else { return };
-                    if let Some(idx) = case_values.lookup(lo, hi) {
-                        let case_bb = case_bbs[idx];
-
-                        // Fall through from previous case if not terminated
-                        if !self.is_terminated() {
-                            if let Some(current) = self.current_bb {
-                                self.emit(Instruction::br(case_bb));
-                                self.link_bb(current, case_bb);
-                            }
-                        }
-
-                        self.switch_bb(case_bb);
-                        *case_idx = idx + 1;
-                    }
-                }
-                // Then the statement the label prefixes, which is where its
-                // code actually is.
-                self.linearize_switch_stmt(body, case_values, case_bbs, default_bb, case_idx);
-            }
-            Stmt::Default(_, body) => {
-                if let Some(def_bb) = default_bb {
-                    // Fall through from previous case if not terminated
-                    if !self.is_terminated() {
-                        if let Some(current) = self.current_bb {
-                            self.emit(Instruction::br(def_bb));
-                            self.link_bb(current, def_bb);
-                        }
-                    }
-
-                    self.switch_bb(def_bb);
-                }
-                self.linearize_switch_stmt(body, case_values, case_bbs, default_bb, case_idx);
-            }
-
-            // Duff's device: case labels can appear inside loops/blocks
-            // within a switch body. Propagate switch context through them.
-            Stmt::DoWhile { body, cond } => {
-                let body_bb = self.alloc_bb();
-                let cond_bb = self.alloc_bb();
-                let exit_bb = self.alloc_bb();
-
-                if let Some(current) = self.current_bb {
-                    if !self.is_terminated() {
-                        self.emit(Instruction::br(body_bb));
-                        self.link_bb(current, body_bb);
-                    }
-                }
-
-                self.break_targets.push(exit_bb);
-                self.continue_targets.push(cond_bb);
-
-                self.switch_bb(body_bb);
-                self.linearize_switch_stmt(body, case_values, case_bbs, default_bb, case_idx);
-                if !self.is_terminated() {
-                    if let Some(current) = self.current_bb {
-                        self.emit(Instruction::br(cond_bb));
-                        self.link_bb(current, cond_bb);
-                    }
-                }
-
-                self.break_targets.pop();
-                self.continue_targets.pop();
-
-                self.switch_bb(cond_bb);
-                self.branch_on_condition(cond, body_bb, exit_bb);
-
-                self.switch_bb(exit_bb);
-            }
-
-            Stmt::While { cond, body } => {
-                let cond_bb = self.alloc_bb();
-                let body_bb = self.alloc_bb();
-                let exit_bb = self.alloc_bb();
-
-                if let Some(current) = self.current_bb {
-                    if !self.is_terminated() {
-                        self.emit(Instruction::br(cond_bb));
-                        self.link_bb(current, cond_bb);
-                    }
-                }
-
-                self.switch_bb(cond_bb);
-                self.branch_on_condition(cond, body_bb, exit_bb);
-
-                self.break_targets.push(exit_bb);
-                self.continue_targets.push(cond_bb);
-
-                self.switch_bb(body_bb);
-                self.linearize_switch_stmt(body, case_values, case_bbs, default_bb, case_idx);
-                if !self.is_terminated() {
-                    if let Some(current) = self.current_bb {
-                        self.emit(Instruction::br(cond_bb));
-                        self.link_bb(current, cond_bb);
-                    }
-                }
-
-                self.break_targets.pop();
-                self.continue_targets.pop();
-
-                self.switch_bb(exit_bb);
-            }
-
-            // Everything but the body is the ordinary `for` lowering; only
-            // the body has to go back through this walk, so the `case`
-            // labels inside it stay reachable. See `OpenFor`.
-            Stmt::For {
-                init,
-                cond,
-                post,
-                body,
-            } => {
-                let open = self.open_for(init.as_ref(), cond.as_ref());
-                self.linearize_switch_stmt(body, case_values, case_bbs, default_bb, case_idx);
-                self.close_for(open, post.as_ref());
-            }
-
-            Stmt::Block(items) => {
-                // See the sibling arm in `linearize_switch_body`.
-                let scope = self.push_scope();
-                for item in items {
-                    match item {
-                        BlockItem::Declaration(decl) => self.linearize_local_decl(decl),
-                        BlockItem::Statement(s) => {
-                            self.linearize_switch_stmt(
-                                s,
-                                case_values,
-                                case_bbs,
-                                default_bb,
-                                case_idx,
-                            );
-                        }
-                    }
-                }
-                self.pop_scope(scope);
-            }
-
-            Stmt::If {
-                cond,
-                then_stmt,
-                else_stmt,
-            } => {
-                let then_bb = self.alloc_bb();
-                let merge_bb = self.alloc_bb();
-                let else_bb = if else_stmt.is_some() {
-                    self.alloc_bb()
-                } else {
-                    merge_bb
-                };
-
-                self.branch_on_condition(cond, then_bb, else_bb);
-
-                self.switch_bb(then_bb);
-                self.linearize_switch_stmt(then_stmt, case_values, case_bbs, default_bb, case_idx);
-                self.link_to_merge_if_needed(merge_bb);
-
-                if let Some(else_s) = else_stmt {
-                    self.switch_bb(else_bb);
-                    self.linearize_switch_stmt(else_s, case_values, case_bbs, default_bb, case_idx);
-                    self.link_to_merge_if_needed(merge_bb);
-                }
-
-                self.switch_bb(merge_bb);
-            }
-
-            Stmt::Label { name, stmt, .. } => {
-                self.place_label(*name);
-                self.linearize_switch_stmt(stmt, case_values, case_bbs, default_bb, case_idx);
-            }
-
-            // Inner switch owns its own cases — delegate to normal linearizer
-            Stmt::Switch { .. } => {
-                self.linearize_stmt(stmt);
-            }
-
-            _ => {
-                // Regular statement - linearize it
-                self.linearize_stmt(stmt);
+    /// Make `bb`, a `case` or `default` label's block, current, falling
+    /// through into it from the code before the label if that code does not
+    /// already end in a jump.
+    fn fall_into_case_block(&mut self, bb: BasicBlockId) {
+        if !self.is_terminated() {
+            if let Some(current) = self.current_bb {
+                self.emit(Instruction::br(bb));
+                self.link_bb(current, bb);
             }
         }
+        self.switch_bb(bb);
     }
 
     // Inline assembly linearization
 
-    /// Linearize an inline assembly statement
-    /// Check if an expression is a simple identifier that's a parameter (in var_map)
-    /// Returns Some((name, pseudo)) if it is, None otherwise
-    pub(crate) fn get_param_if_ident(&self, expr: &Expr) -> Option<(String, PseudoId)> {
-        if let ExprKind::Ident(symbol_id) = &expr.kind {
-            let name_str = self.symbol_name(*symbol_id);
-            if let Some(&pseudo) = self.var_map.get(&name_str) {
-                return Some((name_str, pseudo));
-            }
-        }
-        None
+    /// What each operand's constraint allows on the target being compiled,
+    /// outputs then inputs. Classified here once and stored on the operand,
+    /// so liveness, the allocator and the backend all read the same answer.
+    ///
+    /// A constraint c17 cannot honour is reported here, at its operand --
+    /// one it does not model, or one at odds with its side of the colon, with
+    /// gcc's wording for the latter. Such an operand is then given a plain
+    /// register class so the statement can still be linearized; the error
+    /// stops the compilation.
+    fn asm_operand_classes(
+        &self,
+        outputs: &[AsmOperand],
+        inputs: &[AsmOperand],
+    ) -> (Vec<AsmOperandClass>, Vec<AsmOperandClass>) {
+        let classify = |op: &AsmOperand, is_output: bool| {
+            let reason = match AsmOperandClass::parse(&op.constraint, self.target.arch) {
+                Err(e) => Err(e.message(&op.constraint)),
+                Ok(class) => asm_operand_misuse(&class, is_output, outputs.len())
+                    .map_or(Ok(class), |why| Err(why.to_string())),
+            };
+            reason.unwrap_or_else(|msg| {
+                error(op.expr.pos, &msg);
+                let plain = if is_output { "=r" } else { "r" };
+                AsmOperandClass::parse(plain, self.target.arch).expect("a register class")
+            })
+        };
+        (
+            outputs.iter().map(|op| classify(op, true)).collect(),
+            inputs.iter().map(|op| classify(op, false)).collect(),
+        )
     }
 
+    /// An immediate-only operand that is a constant expression, as the
+    /// constant: gcc's front end folds it at every level, so `"i"(~MASK)` or
+    /// `"i"(-1.0)` at -O0 must not reach the backend as an instruction
+    /// computing it. `None` for any other operand, which is linearized as
+    /// usual and left for `ir::asm_operand::resolve_immediates` to judge.
+    fn asm_constant_operand(
+        &mut self,
+        expr: &Expr,
+        typ: TypeId,
+        class: &AsmOperandClass,
+    ) -> Option<PseudoId> {
+        if !class.is_immediate_only() {
+            return None;
+        }
+        // As `linearize_expr` would: the statement takes its position from
+        // its operands, and a diagnostic about this one is reported there.
+        self.current_pos = Some(expr.pos);
+        if self.types.is_integer(typ) {
+            let v = self.eval_const_expr(expr)?;
+            return Some(self.emit_const(v, typ));
+        }
+        let fmt = self
+            .types
+            .fp_format(typ)
+            .filter(|_| self.types.is_float(typ))?;
+        let v = crate::constexpr::eval_as_float(self, ConstScope::Standard, expr, typ)?;
+        Some(self.emit_fconst(v.round_to_format(fmt), typ))
+    }
+
+    /// Linearize an inline assembly statement
     pub(crate) fn linearize_asm(
         &mut self,
         template: &str,
@@ -3000,8 +2656,6 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) {
         let mut ir_outputs = Vec::new();
         let mut ir_inputs = Vec::new();
-        // Track which outputs are parameters (need var_map update instead of store)
-        let mut param_outputs: Vec<Option<String>> = Vec::new();
         // Track which outputs need no post-asm processing — true for
         // memory-class outputs (`=m`/`+m`/`=o`/`+o`/...), where the asm
         // wrote the new value directly through the memory operand and
@@ -3017,11 +2671,11 @@ impl<'a> super::linearize::Linearizer<'a> {
         // Bare `+r` with no tied input must still load the lvalue's
         // current value (only producer of the initial register contents),
         // so the load is gated on whether any input matches this output.
+        let (output_classes, input_classes) = self.asm_operand_classes(outputs, inputs);
         let tied_inputs: Vec<bool> = {
             let mut out_has_tied_input = vec![false; outputs.len()];
-            for op in inputs {
-                let (_, _, matching) = self.parse_asm_constraint(&op.constraint);
-                if let Some(idx) = matching {
+            for class in &input_classes {
+                if let Some(idx) = class.tied {
                     if idx < out_has_tied_input.len() {
                         out_has_tied_input[idx] = true;
                     }
@@ -3035,13 +2689,14 @@ impl<'a> super::linearize::Linearizer<'a> {
         // sides used to call `linearize_lvalue` on the operand expression --
         // so `asm("" : "+r"(*bar()))` called `bar` twice. Same rule as any
         // other read-modify-write (see `RmwPlace`).
-        let mut output_places: Vec<Option<super::linearize_emit::RmwPlace>> =
+        let mut output_places: Vec<super::linearize_emit::RmwPlace> =
             Vec::with_capacity(outputs.len());
 
         // Process output operands
         for (output_idx, op) in outputs.iter().enumerate() {
-            // Parse constraint to get flags
-            let (is_memory, is_readwrite, _matching) = self.parse_asm_constraint(&op.constraint);
+            let class = output_classes[output_idx];
+            let is_memory = class.is_memory_only();
+            let is_readwrite = class.access == AsmAccess::ReadWrite;
             let place = self.resolve_rmw_place(&op.expr);
 
             // Get symbolic name if present
@@ -3058,10 +2713,9 @@ impl<'a> super::linearize::Linearizer<'a> {
             // level. Just use the lvalue address as the asm operand
             // pseudo directly.
             if is_memory {
-                // A memory operand is the lvalue's address. `None` is a bare
-                // identifier, which has nothing to re-evaluate; a bit-field
-                // has no address at all and keeps the old path's behaviour.
-                let addr = match place.as_ref().and_then(Self::rmw_place_address) {
+                // A memory operand is the lvalue's address. A bit-field has
+                // no address at all and keeps the old path's behaviour.
+                let addr = match Self::rmw_place_address(&place) {
                     Some(addr) => addr,
                     None => self.linearize_lvalue(&op.expr),
                 };
@@ -3076,6 +2730,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         name: name.clone(),
                         matching_output: Some(ir_outputs.len()),
                         constraint: op.constraint.clone(),
+                        class,
                         size,
                         offset,
                     });
@@ -3086,11 +2741,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                     name,
                     matching_output: None,
                     constraint: op.constraint.clone(),
+                    class,
                     size,
                     offset,
                 });
 
-                param_outputs.push(None);
                 skip_post_handling.push(true);
                 continue;
             }
@@ -3098,9 +2753,6 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Non-memory output (register or value class): allocate a
             // fresh pseudo for the asm to write into.
             let pseudo = self.alloc_pseudo();
-
-            // Check if this output is a parameter (SSA value, not memory location)
-            let param_info = self.get_param_if_ident(&op.expr);
 
             // For read-write outputs ("+r"), load the initial value into the SAME pseudo
             // so that input and output use the same register — unless a
@@ -3110,31 +2762,16 @@ impl<'a> super::linearize::Linearizer<'a> {
             // validator invariant after optimization).
             if is_readwrite {
                 if !tied_inputs[output_idx] {
-                    if let Some((_, param_pseudo)) = &param_info {
-                        // Parameter: copy value directly (no memory address)
-                        self.emit(
-                            Instruction::new(Opcode::Copy)
-                                .with_target(pseudo)
-                                .with_src(*param_pseudo)
-                                .with_type(typ)
-                                .with_size(size),
-                        );
-                    } else if let Some(p) = &place {
-                        // Through the resolved place, so the operand
-                        // expression runs once for the read and the write.
-                        let val = self.load_rmw_place(p, typ);
-                        self.emit(
-                            Instruction::new(Opcode::Copy)
-                                .with_target(pseudo)
-                                .with_src(val)
-                                .with_type(typ)
-                                .with_size(size),
-                        );
-                    } else {
-                        // A bare identifier: nothing to evaluate twice.
-                        let addr = self.linearize_lvalue(&op.expr);
-                        self.emit(Instruction::load(pseudo, addr, 0, typ, size));
-                    }
+                    // Through the resolved place, so the operand expression
+                    // runs once for the read and the write.
+                    let val = self.load_rmw_place(&place, typ);
+                    self.emit(
+                        Instruction::new(Opcode::Copy)
+                            .with_target(pseudo)
+                            .with_src(val)
+                            .with_type(typ)
+                            .with_size(size),
+                    );
                 }
 
                 // Also add as input, using the SAME pseudo and marking as matching
@@ -3145,6 +2782,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     name: name.clone(),
                     matching_output: Some(ir_outputs.len()), // matches the output about to be pushed
                     constraint: op.constraint.clone(),
+                    class,
                     size,
                     offset: 0,
                 });
@@ -3155,19 +2793,19 @@ impl<'a> super::linearize::Linearizer<'a> {
                 name,
                 matching_output: None,
                 constraint: op.constraint.clone(),
+                class,
                 size,
                 offset: 0,
             });
 
-            // Track if this is a parameter output
-            param_outputs.push(param_info.map(|(name, _)| name));
             skip_post_handling.push(false);
             output_places.push(place);
         }
 
         // Process input operands
-        for op in inputs {
-            let (is_memory, _, matching) = self.parse_asm_constraint(&op.constraint);
+        for (op, &class) in inputs.iter().zip(&input_classes) {
+            let is_memory = class.is_memory_only();
+            let matching = class.tied;
 
             // Get symbolic name if present
             let name = op.name.map(|n| self.str(n).to_string());
@@ -3215,6 +2853,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                 let (pseudo, offset) = self.asm_memory_operand(addr);
                 memory_offset = offset;
                 pseudo
+            } else if let Some(k) = self.asm_constant_operand(&op.expr, typ, &class) {
+                k
             } else {
                 // For register operands, evaluate the expression
                 self.linearize_expr(&op.expr)
@@ -3225,6 +2865,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 name,
                 matching_output: matching,
                 constraint: op.constraint.clone(),
+                class,
                 size,
                 offset: memory_offset,
             });
@@ -3313,7 +2954,6 @@ impl<'a> super::linearize::Linearizer<'a> {
                                 outputs,
                                 &ir_outputs,
                                 &skip_post_handling,
-                                &param_outputs,
                                 &output_places,
                             );
                         }
@@ -3330,13 +2970,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
         }
 
-        self.emit_asm_output_writeback(
-            outputs,
-            &ir_outputs,
-            &skip_post_handling,
-            &param_outputs,
-            &output_places,
-        );
+        self.emit_asm_output_writeback(outputs, &ir_outputs, &skip_post_handling, &output_places);
     }
 
     /// Store an asm statement's register outputs back to their destinations.
@@ -3345,8 +2979,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         outputs: &[AsmOperand],
         ir_outputs: &[AsmConstraint],
         skip_post_handling: &[bool],
-        param_outputs: &[Option<String>],
-        output_places: &[Option<super::linearize_emit::RmwPlace>],
+        output_places: &[super::linearize_emit::RmwPlace],
     ) {
         // store(value, addr, ...) - value first, then address
         for (i, op) in outputs.iter().enumerate() {
@@ -3359,23 +2992,10 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             let out_pseudo = ir_outputs[i].pseudo;
 
-            // Check if this output is a parameter (update var_map instead of memory store)
-            if let Some(param_name) = &param_outputs[i] {
-                // Parameter: update var_map with the new SSA value
-                self.var_map.insert(param_name.clone(), out_pseudo);
-            } else {
-                let typ = self.expr_type(&op.expr);
-                let size = self.types.size_bits(typ);
-                // Back through the place the read came from, so the operand
-                // expression is not evaluated a second time.
-                if let Some(p) = &output_places[i] {
-                    self.store_rmw_place(p, out_pseudo, typ);
-                } else {
-                    // A bare identifier: nothing to evaluate twice.
-                    let addr = self.linearize_lvalue(&op.expr);
-                    self.emit(Instruction::store(out_pseudo, addr, 0, typ, size));
-                }
-            }
+            let typ = self.expr_type(&op.expr);
+            // Back through the place the read came from, so the operand
+            // expression is not evaluated a second time.
+            self.store_rmw_place(&output_places[i], out_pseudo, typ);
         }
     }
 
@@ -3401,64 +3021,22 @@ impl<'a> super::linearize::Linearizer<'a> {
         let Some(bb) = func.get_block(bb_id) else {
             return (addr, 0);
         };
-        let defs: std::collections::HashMap<PseudoId, usize> = bb
+        let defs: std::collections::HashMap<PseudoId, &Instruction> = bb
             .insns
             .iter()
-            .enumerate()
-            .filter_map(|(i, insn)| insn.target.map(|t| (t, i)))
+            .filter_map(|insn| insn.target.map(|t| (t, insn)))
             .collect();
-        let walk = AddrWalk {
-            func,
-            insns: &bb.insns,
-            defs: &defs,
-            types: self.types,
+        let walk = AddrWalk { func, defs: &defs };
+        // Storage an operand can be addressed in: a local, or a global that
+        // is not a function.
+        let data_object = |sym: PseudoId, symaddr: &Instruction| {
+            func.local_of(sym).is_some()
+                || symaddr
+                    .typ
+                    .and_then(|t| self.types.base_type(t))
+                    .is_some_and(|t| self.types.kind(t) != TypeKind::Function)
         };
-        walk.object(addr).unwrap_or((addr, 0))
-    }
-
-    /// Parse an asm constraint string to extract flags.
-    /// Returns `(is_memory, is_readwrite, matching_output)`.
-    ///
-    /// `is_memory` is true iff the constraint *requires* memory — i.e.,
-    /// every alternative listed is a memory class (`m`, `o`, `V`, `Q`).
-    /// For multi-alt constraints like `"rm"` / `"rmi"` / `"g"` that also
-    /// list a register or immediate class, the linearizer evaluates the
-    /// operand as a value (`linearize_expr`) and lets the codegen
-    /// substitute register vs memory syntax based on the operand's
-    /// actual location. Taking the lvalue (address) for a multi-alt
-    /// like `"rm"` would force every asm substitution to use the
-    /// address bits as if they were the value — broken for the very
-    /// common `"+rm"` increment pattern.
-    ///
-    /// Note: Early clobber (&) is parsed but not used since our simple
-    /// register allocator doesn't share registers between inputs and
-    /// outputs anyway.
-    pub(crate) fn parse_asm_constraint(&self, constraint: &str) -> (bool, bool, Option<usize>) {
-        let mut is_readwrite = false;
-        let mut matching = None;
-
-        for c in constraint.chars() {
-            match c {
-                '+' => is_readwrite = true,
-                '0'..='9' => matching = Some((c as u8 - b'0') as usize),
-                _ => {}
-            }
-        }
-
-        // The memory decision lives on `AsmConstraint::is_memory` so that
-        // liveness analysis, which cannot reach the linearizer, applies the
-        // identical rule. Two copies of these letter sets is exactly how a
-        // memory output came to look write-only to DCE.
-        let probe = AsmConstraint {
-            pseudo: PseudoId(0),
-            name: None,
-            matching_output: None,
-            constraint: constraint.to_string(),
-            size: 0,
-            offset: 0,
-        };
-
-        (probe.is_memory(), is_readwrite, matching)
+        walk.object(addr, &data_object).unwrap_or((addr, 0))
     }
 
     /// Capture the stack pointer ahead of a VLA's allocation.
@@ -3483,7 +3061,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.emit(
             Instruction::new(Opcode::StackSave)
                 .with_target(mark)
-                .with_type_and_size(self.types.void_ptr_id, 64),
+                .with_type_and_size(self.types.void_ptr_id, self.ptr_bits()),
         );
         self.vla_marks.push(super::linearize::VlaMark {
             mark,
@@ -3511,6 +3089,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         let mut pending = std::mem::take(&mut self.pending_goto_vla);
         pending.sort_by_key(|p| (p.bb.0, std::cmp::Reverse(p.at)));
         let void_ptr = self.types.void_ptr_id;
+        let ptr_bits = self.ptr_bits();
         for p in pending {
             let Some(depth) = self.goto_target_vla_depth(&p.target) else {
                 continue;
@@ -3520,7 +3099,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             };
             let insn = Instruction::new(Opcode::StackRestore)
                 .with_src(mark)
-                .with_type_and_size(void_ptr, 64);
+                .with_type_and_size(void_ptr, ptr_bits);
             if let Some(func) = self.current_func.as_mut() {
                 if let Some(bb) = func.get_block_mut(p.bb) {
                     if p.at <= bb.insns.len() {
@@ -3630,7 +3209,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         self.emit(
             Instruction::new(Opcode::StackRestore)
                 .with_src(mark)
-                .with_type_and_size(self.types.void_ptr_id, 64),
+                .with_type_and_size(self.types.void_ptr_id, self.ptr_bits()),
         );
     }
 
@@ -3673,10 +3252,9 @@ impl<'a> super::linearize::Linearizer<'a> {
 
     /// Define label `name` here: fall into its block and continue there.
     ///
-    /// Every labeled statement is placed through this, whichever lowering
-    /// walks it. The switch-body walk had a copy of its own that never
-    /// recorded the label as defined, so `&&lbl` naming a label between the
-    /// case labels of a `switch` was rejected as undefined.
+    /// Every named label is placed through this, which is what records it as
+    /// defined -- `&&lbl` naming a label between the case labels of a
+    /// `switch` included.
     fn place_label(&mut self, name: StringId) {
         let name_str = self.str(name).to_string();
         self.defined_labels.insert(name_str.clone());
@@ -3828,6 +3406,23 @@ impl JumpScopeWalk {
         w
     }
 
+    /// The first label of each name, as an index into `labels`, which is the
+    /// one a `goto` reaches; and in order, every later label of a name already
+    /// seen. One lookup per label: comparing each label with the labels before
+    /// it, and each `goto` with every label, was quadratic in the labels.
+    fn resolve_labels(&self) -> (std::collections::HashMap<StringId, usize>, Vec<usize>) {
+        let mut first = std::collections::HashMap::with_capacity(self.labels.len());
+        let mut duplicates = Vec::new();
+        for (i, (name, _, _)) in self.labels.iter().enumerate() {
+            if first.contains_key(name) {
+                duplicates.push(i);
+            } else {
+                first.insert(*name, i);
+            }
+        }
+        (first, duplicates)
+    }
+
     /// The offending scopes. A variably modified scope is reported once
     /// however many `case` labels sit inside it; a statement expression once
     /// per label, as gcc does.
@@ -3878,8 +3473,22 @@ impl JumpScopeWalk {
         match stmt {
             Stmt::Block(items) => self.walk_items(items, switch_scopes),
 
-            Stmt::Label { name, stmt, pos } => {
-                self.labels.push((*name, self.open.clone(), *pos));
+            Stmt::Labeled { labels, stmt } => {
+                for label in labels {
+                    match label {
+                        Label::Named { name, pos } => {
+                            self.labels.push((*name, self.open.clone(), *pos));
+                        }
+                        Label::Case(low, high) => {
+                            self.walk_case(low.pos, "case", switch_scopes);
+                            self.walk_expr(low, switch_scopes);
+                            if let Some(high) = high {
+                                self.walk_expr(high, switch_scopes);
+                            }
+                        }
+                        Label::Default(pos) => self.walk_case(*pos, "default", switch_scopes),
+                    }
+                }
                 self.walk(stmt, switch_scopes);
             }
             Stmt::Goto { name, pos } => self.gotos.push(JumpRecord {
@@ -3892,9 +3501,9 @@ impl JumpScopeWalk {
             // switch and a `continue` an enclosing loop. Checked here rather
             // than in the `linearize_stmt` arms, which look like the obvious
             // place -- they fail exactly when the target stack is empty -- but
-            // a switch body is lowered by `linearize_switch_stmt`, which
-            // delegates back for nested constructs, so an arm there cannot
-            // tell "outside every construct" from "reached by delegation".
+            // the lowering pushes a loop's targets only around its body, while
+            // this walk counts enclosing loops and switches by the rule itself
+            // and reports these beside the stray `case` and `default` labels.
             Stmt::Break(pos) => {
                 if self.loop_depth == 0 && self.switch_depth == 0 {
                     self.stray_jumps.push((*pos, "break"));
@@ -3905,8 +3514,6 @@ impl JumpScopeWalk {
                     self.stray_jumps.push((*pos, "continue"));
                 }
             }
-
-            Stmt::Case(..) | Stmt::Default(..) => self.walk_case(stmt, switch_scopes),
 
             // A `switch` becomes the reference point for the labels inside it.
             // Its own scopes are captured before the body is walked, and its
@@ -3987,12 +3594,13 @@ impl JumpScopeWalk {
         }
     }
 
-    fn walk_case(&mut self, stmt: &Stmt, switch_scopes: Option<&[usize]>) {
-        let (label_pos, what, bounds, labeled) = match stmt {
-            Stmt::Case(low, high, body) => (low.pos, "case", Some((low, high)), body),
-            Stmt::Default(pos, body) => (*pos, "default", None, body),
-            _ => unreachable!("only a case or default reaches walk_case"),
-        };
+    /// A `case` or `default` label -- `what` says which -- at `label_pos`.
+    fn walk_case(
+        &mut self,
+        label_pos: Position,
+        what: &'static str,
+        switch_scopes: Option<&[usize]>,
+    ) {
         // 6.8.1p2: a `case` or `default` belongs to a `switch`.
         if self.switch_depth == 0 {
             self.stray_jumps.push((label_pos, what));
@@ -4016,16 +3624,6 @@ impl JumpScopeWalk {
                 self.bad_case_ids.push((id, label_pos));
             }
         }
-
-        if let Some((low, high)) = bounds {
-            self.walk_expr(low, switch_scopes);
-            if let Some(high) = high {
-                self.walk_expr(high, switch_scopes);
-            }
-        }
-        // The label carries the statement it prefixes, so the walk continues
-        // through it.
-        self.walk(labeled, switch_scopes);
     }
 
     /// Walk the statement expressions inside `expr`, each a scope of its own.
@@ -4094,8 +3692,21 @@ impl crate::constexpr::ConstEnv for Linearizer<'_> {
         }
     }
 
-    fn struct_of(&self, typ: TypeId) -> TypeId {
-        self.resolve_struct_type(typ)
+    fn subobject_value(&self, expr: &Expr, scope: ConstScope) -> Option<i128> {
+        match (scope, self.const_subobject_init(expr)?) {
+            (ConstScope::StaticInitializer, crate::ir::Initializer::Int(v)) => Some(*v),
+            _ => None,
+        }
+    }
+
+    fn float_subobject_value(&self, expr: &Expr, scope: ConstScope) -> Option<FloatVal> {
+        match (scope, self.const_subobject_init(expr)?) {
+            (ConstScope::StaticInitializer, crate::ir::Initializer::Float(v)) => Some(*v),
+            (ConstScope::StaticInitializer, crate::ir::Initializer::Int(v)) => {
+                Some(FloatVal::from_i128(*v))
+            }
+            _ => None,
+        }
     }
 
     /// A `const` floating object folds only in a static initializer, as its
@@ -4112,92 +3723,38 @@ impl crate::constexpr::ConstEnv for Linearizer<'_> {
     }
 }
 
-/// Follows the address arithmetic of one memory operand back to the object
-/// it names. Only within the block being built, where `linearize_lvalue` has
-/// just emitted it. It only reads: the arithmetic stays for whatever else
-/// uses it, and DCE removes the rest.
-struct AddrWalk<'w> {
-    func: &'w super::Function,
-    insns: &'w [Instruction],
-    defs: &'w std::collections::HashMap<PseudoId, usize>,
-    types: &'w TypeTable,
-}
-
-impl AddrWalk<'_> {
-    /// `p` as (object `Sym`, constant byte offset).
-    fn object(&self, p: PseudoId) -> Option<(PseudoId, i64)> {
-        let insn = &self.insns[*self.defs.get(&p)?];
-        match insn.op {
-            Opcode::SymAddr => {
-                let sym = *insn.src.first()?;
-                if !self.names_data_object(sym, insn) {
-                    return None;
-                }
-                Some((sym, 0))
-            }
-            Opcode::Copy => self.object(*insn.src.first()?),
-            Opcode::Add => {
-                let (a, b) = (*insn.src.first()?, *insn.src.get(1)?);
-                match self.object(a) {
-                    Some((sym, off)) => Some((sym, off.checked_add(self.constant(b)?)?)),
-                    None => {
-                        let (sym, off) = self.object(b)?;
-                        Some((sym, off.checked_add(self.constant(a)?)?))
-                    }
-                }
-            }
-            Opcode::Sub => {
-                let (sym, off) = self.object(*insn.src.first()?)?;
-                Some((sym, off.checked_sub(self.constant(*insn.src.get(1)?)?)?))
-            }
-            _ => None,
+/// Why an operand's class cannot stand on its side of the colon, in gcc's
+/// words, or `None` when it can.
+///
+/// An output must be written (`=` or `+`) and be somewhere a value can be
+/// written: a register or memory, never only a constant. An input is only
+/// read, so `=`, `+` and `&` make no sense there, and a matching constraint
+/// must name an output that exists.
+fn asm_operand_misuse(
+    class: &AsmOperandClass,
+    is_output: bool,
+    num_outputs: usize,
+) -> Option<&'static str> {
+    if is_output {
+        if class.access == AsmAccess::Read {
+            Some("output operand constraint lacks '='")
+        } else if class.tied.is_some() {
+            Some("matching constraint not valid in output operand")
+        } else if class.reg.is_none() && class.mem.is_none() {
+            Some("impossible constraint in 'asm'")
+        } else {
+            None
         }
-    }
-
-    /// `p` as a constant, folding the widening and scaling a subscript is
-    /// linearized into.
-    fn constant(&self, p: PseudoId) -> Option<i64> {
-        if let Some(super::PseudoKind::Val(v)) = self.func.get_pseudo(p).map(|x| &x.kind) {
-            return i64::try_from(*v).ok();
-        }
-        let insn = &self.insns[*self.defs.get(&p)?];
-        match insn.op {
-            Opcode::Sext | Opcode::Zext => {
-                let v = self.constant(*insn.src.first()?)?;
-                let bits = insn.src_size;
-                Some(if bits == 0 || bits >= 64 {
-                    v
-                } else if insn.op == Opcode::Sext {
-                    (v << (64 - bits)) >> (64 - bits)
-                } else {
-                    v & ((1i64 << bits) - 1)
-                })
+    } else {
+        match class.access {
+            AsmAccess::Write => Some("input operand constraint contains '='"),
+            AsmAccess::ReadWrite => Some("input operand constraint contains '+'"),
+            AsmAccess::Read if class.early_clobber => Some("input operand constraint contains '&'"),
+            AsmAccess::Read if class.tied.is_some_and(|n| n >= num_outputs) => {
+                Some("matching constraint references invalid operand number")
             }
-            Opcode::Mul => {
-                let a = self.constant(*insn.src.first()?)?;
-                a.checked_mul(self.constant(*insn.src.get(1)?)?)
-            }
-            Opcode::Copy => self.constant(*insn.src.first()?),
-            _ => None,
+            AsmAccess::Read => None,
         }
-    }
-
-    /// Whether `sym` is storage an operand can be addressed in: a local, or
-    /// a global that is not a function.
-    fn names_data_object(&self, sym: PseudoId, symaddr: &Instruction) -> bool {
-        if !matches!(
-            self.func.get_pseudo(sym).map(|x| &x.kind),
-            Some(super::PseudoKind::Sym(_))
-        ) {
-            return false;
-        }
-        if self.func.local_of(sym).is_some() {
-            return true;
-        }
-        symaddr
-            .typ
-            .and_then(|t| self.types.base_type(t))
-            .is_some_and(|t| self.types.kind(t) != TypeKind::Function)
     }
 }
 
@@ -4278,6 +3835,21 @@ impl CaseConv {
     pub(crate) fn contains(self, lo: i128, hi: i128, v: i128) -> bool {
         !self.lt(v, lo) && !self.lt(hi, v)
     }
+}
+
+/// A `switch` whose body is being lowered: where each of its labels starts.
+///
+/// [`Linearizer::linearize_switch`] pushes one on `switch_stack` around its
+/// body, and the ordinary `Stmt::Labeled` arm places a `case` or `default`
+/// label against the innermost -- so a label inside a loop, `if` or block in
+/// the body belongs to this switch, and one inside a nested switch to that.
+pub(crate) struct SwitchCtx {
+    /// The labels `collect_switch_cases` found, by range.
+    pub(crate) index: CaseIndex,
+    /// Each label's block, parallel to the collected ranges.
+    pub(crate) case_bbs: Vec<BasicBlockId>,
+    /// The `default` label's block, if there is one.
+    pub(crate) default_bb: Option<BasicBlockId>,
 }
 
 /// Each case range's position among a switch's labels, keyed by the range as
@@ -4564,8 +4136,9 @@ mod jump_scope_tests {
     /// Whether any `goto` in `src` enters a statement expression.
     fn goto_enters_stmt_expr(src: &str) -> bool {
         let w = walk_of(src);
+        let (first, _) = w.resolve_labels();
         w.gotos.iter().any(|jump| {
-            let (_, to, _) = w.labels.iter().find(|l| l.0 == jump.label).unwrap();
+            let (_, to, _) = &w.labels[first[&jump.label]];
             w.entered(&jump.from, to)
                 .iter()
                 .any(|id| matches!(w.scopes[*id], JumpScope::StmtExpr))
@@ -4623,6 +4196,21 @@ mod jump_scope_tests {
         let w = walk_of("int f(int x) { for (;;) { x = ({ if (x) break; x; }); } return x; }");
         assert!(w.stray_jumps.is_empty());
     }
+
+    /// A `goto` reaches the first label of its name; every later one is a
+    /// duplicate, each reported, a label in a statement expression included.
+    #[test]
+    fn labels_resolve_to_the_first_of_each_name() {
+        let w = walk_of(
+            "int f(int x) { A: x++; B: x++; A: x++; ({ B: x; }); A: goto B; C: return x; }",
+        );
+        let (first, duplicates) = w.resolve_labels();
+        let mut firsts: Vec<usize> = first.values().copied().collect();
+        firsts.sort_unstable();
+        assert_eq!(firsts, [0, 1, 5]);
+        assert_eq!(duplicates, [2, 3, 4]);
+        assert_eq!(first[&w.gotos[0].label], 1);
+    }
 }
 
 #[cfg(test)]
@@ -4661,5 +4249,39 @@ mod asm_operand_tests {
             .map(|c| c.size)
             .collect();
         assert_eq!(sizes, [64, 64, 256]);
+    }
+}
+
+/// The scalar initializer of `size` bytes at `offset` in `init`, which spans
+/// `span` bytes, or `None` when none is there to read. A subobject the
+/// initializer leaves out is zero, but has no entry to answer with.
+fn initializer_leaf(
+    init: &crate::ir::Initializer,
+    offset: usize,
+    size: usize,
+    span: usize,
+) -> Option<&crate::ir::Initializer> {
+    use crate::ir::Initializer;
+    match init {
+        Initializer::Int(_) | Initializer::Float(_) => {
+            (offset == 0 && size == span).then_some(init)
+        }
+        Initializer::Array {
+            elem_size,
+            elements,
+            ..
+        } => {
+            let (start, element) = elements
+                .iter()
+                .find(|(start, _)| (*start..*start + *elem_size).contains(&offset))?;
+            initializer_leaf(element, offset - start, size, *elem_size)
+        }
+        Initializer::Struct { fields, .. } => {
+            let (start, field_size, field) = fields
+                .iter()
+                .find(|(start, len, _)| (*start..*start + *len).contains(&offset))?;
+            initializer_leaf(field, offset - start, size, *field_size)
+        }
+        _ => None,
     }
 }

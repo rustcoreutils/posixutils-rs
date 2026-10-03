@@ -72,6 +72,42 @@ pub fn parse_posix_pid_list(stdout: &[u8]) -> Vec<u32> {
         .collect()
 }
 
+/// Block until `pid` has `path` open, or a short timeout elapses.
+///
+/// Polls `/proc/<pid>/fd` on Linux; elsewhere, with no `/proc` to poll, it
+/// just yields briefly.
+pub fn wait_for_open_fd(pid: u32, path: &str) {
+    use std::time::Duration;
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::time::Instant;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let fd_dir = format!("/proc/{}/fd", pid);
+            if let Ok(entries) = std::fs::read_dir(&fd_dir) {
+                for e in entries.flatten() {
+                    if let Ok(target) = std::fs::read_link(e.path()) {
+                        if target.to_string_lossy() == path {
+                            return;
+                        }
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    // No /proc to poll, so just yield long enough for the child to get its
+    // file open. Kept outside a loop: with nothing to re-check, iterating
+    // would only sleep again.
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, path);
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 pub fn fuser_test(
     args: Vec<String>,
     expected_err: &str,

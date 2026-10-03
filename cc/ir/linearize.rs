@@ -10,6 +10,7 @@
 //
 
 use super::mem2reg::mem2reg;
+use super::memexpand::BlockOp;
 use super::ssa::ssa_convert;
 use super::{
     BasicBlock, BasicBlockId, CallAbiInfo, FenceScope, Function, Initializer, Instruction,
@@ -20,6 +21,7 @@ use crate::diag::{get_all_stream_names, Position};
 use crate::float::FloatVal;
 use crate::ir::linearize_atomic::{AtomicLvalue, OrderedAccess};
 use crate::ir::linearize_emit::CompoundAssign;
+use crate::ir::linearize_stmt::SwitchCtx;
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef,
     GnuAtomicOp, InitElement, InlineLibraryFn, MemoryFn, NarrowedLibraryCall, OffsetOfPath,
@@ -31,7 +33,7 @@ use crate::target::Target;
 use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::{HashMap, HashSet};
 
-const DEFAULT_VAR_MAP_CAPACITY: usize = 64;
+const DEFAULT_LOCALS_CAPACITY: usize = 64;
 const DEFAULT_LABEL_MAP_CAPACITY: usize = 16;
 const DEFAULT_LOOP_DEPTH_CAPACITY: usize = 4;
 const DEFAULT_FILE_SCOPE_CAPACITY: usize = 16;
@@ -69,11 +71,27 @@ struct ScalarParam {
     arg: PseudoId,
 }
 
+/// What a block-scope name stands for, which decides how it is read,
+/// stored and addressed.
+#[derive(Clone)]
+pub(crate) enum LocalBinding {
+    /// An object in this function's frame: `sym` is its stack slot.
+    Frame { sym: PseudoId, storage: Storage },
+    /// A block-scope `static`: an object with static storage duration,
+    /// emitted as a global under `global`, a name of the form
+    /// `funcname.varname.N` no other declaration can spell.
+    Static { global: String },
+    /// No object at all: the extents of a type name's variably modified
+    /// type, recorded under a symbol no identifier names (see
+    /// [`Linearizer::record_type_name_extents`]).
+    ExtentsOnly,
+}
+
 /// Information about a local variable
 #[derive(Clone)]
 pub(crate) struct LocalVarInfo {
-    /// Symbol pseudo (address of the variable)
-    pub(crate) sym: PseudoId,
+    /// What the name stands for.
+    pub(crate) binding: LocalBinding,
     /// Type of the variable
     pub(crate) typ: TypeId,
     /// For VLAs: symbol holding the number of elements (for runtime sizeof)
@@ -95,8 +113,50 @@ pub(crate) struct LocalVarInfo {
     /// sizeof(vla_elem_type)` -- a variably-modified type reports a
     /// compile-time size of 0, so without this every such stride would be 0.
     pub(crate) vm_row_dims: Vec<VmDim>,
-    /// Where the object lives relative to this local's stack slot.
-    pub(crate) storage: Storage,
+}
+
+impl LocalVarInfo {
+    /// A name bound to `binding`, with no variably modified extents.
+    pub(crate) fn new(binding: LocalBinding, typ: TypeId) -> Self {
+        Self {
+            binding,
+            typ,
+            vla_size_sym: None,
+            vla_elem_type: None,
+            vla_outer_extent: None,
+            vm_row_dims: vec![],
+        }
+    }
+
+    /// An object that lives in its stack slot `sym`.
+    pub(crate) fn frame(sym: PseudoId, typ: TypeId) -> Self {
+        Self::new(
+            LocalBinding::Frame {
+                sym,
+                storage: Storage::InSlot,
+            },
+            typ,
+        )
+    }
+
+    /// The stack slot, for a name bound to one.
+    pub(crate) fn frame_sym(&self) -> Option<PseudoId> {
+        match self.binding {
+            LocalBinding::Frame { sym, .. } => Some(sym),
+            LocalBinding::Static { .. } | LocalBinding::ExtentsOnly => None,
+        }
+    }
+}
+
+/// Where an object an expression designates lives, for
+/// [`Linearizer::read_object`].
+#[derive(Clone, Copy)]
+pub(crate) enum ObjectPlace {
+    /// A symbol's own storage: a local's slot, a static, a global, a
+    /// compound literal.
+    Sym(PseudoId),
+    /// `offset` bytes past an address computed at run time.
+    At(PseudoId, i64),
 }
 
 /// Where a local's object lives relative to its stack slot.
@@ -454,15 +514,6 @@ pub(crate) enum StructFieldVisitKind {
     BraceElision(Vec<InitElement>),
 }
 
-/// Information about a static local variable
-#[derive(Clone)]
-pub(crate) struct StaticLocalInfo {
-    /// Global symbol name (unique across translation unit)
-    pub(crate) global_name: String,
-    /// Type of the variable
-    pub(crate) typ: TypeId,
-}
-
 // Linearizer
 
 /// A declaration scope the linearizer has entered.
@@ -506,6 +557,47 @@ pub(crate) struct HiddenReturnSlot {
     pub(crate) arg: PseudoId,
     /// The argument's type, a pointer to the returned type.
     pub(crate) arg_typ: TypeId,
+}
+
+/// What a call calls.
+enum CallTarget {
+    /// A function, by name.
+    Direct(String),
+    /// The function pointer the callee expression evaluated to.
+    Indirect(PseudoId),
+}
+
+/// What a callee's type says about a call to it: what lowering the
+/// arguments and building the call instruction both read.
+struct CalleeSignature {
+    /// The convention that classifies the return, the arguments taken by
+    /// reference, and the registers.
+    conv: CallingConv,
+    /// The prototype's parameter types; `None` without a prototype.
+    params: Option<Vec<TypeId>>,
+    /// A function type with no prototype (C17 6.5.2.2p6).
+    unprototyped: bool,
+    /// Where the variadic arguments start, for a variadic callee.
+    variadic_arg_start: Option<usize>,
+    /// The callee does not return.
+    is_noreturn: bool,
+}
+
+/// A call's lowered arguments: the values and, in step, the types the ABI
+/// classifies them by.
+struct CallArgs {
+    vals: Vec<PseudoId>,
+    types: Vec<TypeId>,
+}
+
+/// What a call instruction records beyond its operands.
+struct CallFacts {
+    variadic_arg_start: Option<usize>,
+    ends_with_va_arg_pack: bool,
+    is_noreturn: bool,
+    binding: crate::parse::ast::CalleeBinding,
+    known: Option<crate::parse::ast::LibFn>,
+    abi_info: Box<CallAbiInfo>,
 }
 
 /// Where a jump whose VLA restore is still undecided may land.
@@ -555,8 +647,6 @@ pub struct Linearizer<'a> {
     pub(crate) next_pseudo: u32,
     /// Next basic block ID
     pub(crate) next_bb: u32,
-    /// Parameter -> pseudo mapping (parameters are already SSA values)
-    pub(crate) var_map: HashMap<String, PseudoId>,
     /// Local variables (use Load/Store, converted to SSA later)
     /// Keyed by SymbolId for proper scope handling
     pub(crate) locals: HashMap<SymbolId, LocalVarInfo>,
@@ -576,6 +666,9 @@ pub struct Linearizer<'a> {
     pub(crate) break_targets: Vec<BasicBlockId>,
     /// Continue target stack (for loops)
     pub(crate) continue_targets: Vec<BasicBlockId>,
+    /// The `switch` statements whose bodies are being lowered, innermost
+    /// last. A `case` or `default` label belongs to the innermost one.
+    pub(crate) switch_stack: Vec<SwitchCtx>,
     /// Whether to run SSA conversion after linearization
     pub(crate) run_ssa: bool,
     /// Symbol table for looking up enum constants, etc.
@@ -694,9 +787,6 @@ pub struct Linearizer<'a> {
     pub(crate) static_local_counter: u32,
     /// Counter for generating unique compound literal names (for file-scope compound literals)
     pub(crate) compound_literal_counter: u32,
-    /// Static local variables (local name -> static local info)
-    /// This is persistent across function calls (not cleared per function)
-    pub(crate) static_locals: HashMap<String, StaticLocalInfo>,
     /// Current source position for debug info
     pub(crate) current_pos: Option<Position>,
     /// Target configuration (architecture, ABI details)
@@ -741,12 +831,12 @@ impl<'a> Linearizer<'a> {
             current_bb: None,
             next_pseudo: 0,
             next_bb: 0,
-            var_map: HashMap::with_capacity(DEFAULT_VAR_MAP_CAPACITY),
-            locals: HashMap::with_capacity(DEFAULT_VAR_MAP_CAPACITY),
+            locals: HashMap::with_capacity(DEFAULT_LOCALS_CAPACITY),
             vm_typedef_dims: HashMap::new(),
             label_map: HashMap::with_capacity(DEFAULT_LABEL_MAP_CAPACITY),
             break_targets: Vec::with_capacity(DEFAULT_LOOP_DEPTH_CAPACITY),
             continue_targets: Vec::with_capacity(DEFAULT_LOOP_DEPTH_CAPACITY),
+            switch_stack: Vec::new(),
             run_ssa: true, // Enable SSA conversion by default
             symbols,
             types,
@@ -767,7 +857,6 @@ impl<'a> Linearizer<'a> {
             indirect_dispatch: None,
             static_local_counter: 0,
             compound_literal_counter: 0,
-            static_locals: HashMap::with_capacity(DEFAULT_LABEL_MAP_CAPACITY),
             current_pos: None,
             target,
             current_func_is_inline_definition: false,
@@ -857,8 +946,7 @@ impl<'a> Linearizer<'a> {
         };
         let ending: Vec<PseudoId> = entries
             .iter()
-            .filter_map(|(sym, _)| self.locals.get(sym))
-            .map(|info| info.sym)
+            .filter_map(|(sym, _)| self.locals.get(sym)?.frame_sym())
             .filter(|&p| func.local_of(p).is_some())
             .collect();
         for local in ending {
@@ -872,6 +960,30 @@ impl<'a> Linearizer<'a> {
         if let Some(scope) = self.local_scope_stack.last_mut() {
             scope.push((sym, prev));
         }
+    }
+
+    /// The symbol an identifier names when it names one: a static local's
+    /// global, or the identifier itself for a file-scope or `extern` name.
+    /// `None` for a frame local, which a static initializer can neither read
+    /// nor take the address of, and for a type name's extents.
+    pub(crate) fn global_name_of(&self, symbol_id: SymbolId) -> Option<String> {
+        match self.locals.get(&symbol_id).map(|local| &local.binding) {
+            None => Some(self.symbol_name(symbol_id)),
+            Some(LocalBinding::Static { global }) => Some(global.clone()),
+            Some(LocalBinding::Frame { .. } | LocalBinding::ExtentsOnly) => None,
+        }
+    }
+
+    /// A `Sym` pseudo naming the assembler symbol `name`: a global, a string
+    /// literal's label, a code label. A frame local's is made by
+    /// [`Self::named_local`].
+    pub(crate) fn sym_pseudo(&mut self, name: String) -> PseudoId {
+        let sym_id = self.alloc_pseudo();
+        let pseudo = Pseudo::sym(sym_id, name);
+        if let Some(func) = &mut self.current_func {
+            func.add_pseudo(pseudo);
+        }
+        sym_id
     }
 
     /// Convert a StringId to a &str using the string table
@@ -909,6 +1021,11 @@ impl<'a> Linearizer<'a> {
             .and_then(|s| s.asm_label.as_deref())
             .map(crate::arch::lir::verbatim)
             .unwrap_or_else(|| self.str(name).to_string())
+    }
+
+    /// The width of a pointer: an address, and a saved stack pointer.
+    pub(crate) fn ptr_bits(&self) -> u32 {
+        self.types.size_bits(self.types.void_ptr_id)
     }
 
     /// The assembler name of the C library function `name`, for a call the
@@ -1024,12 +1141,11 @@ impl<'a> Linearizer<'a> {
     /// -- including a size no integer type could hold -- takes the default.
     pub(crate) fn bitfield_storage_type(&self, storage_size: usize) -> TypeId {
         match storage_size {
-            1 => self.types.uchar_id,
-            2 => self.types.ushort_id,
-            4 => self.types.uint_id,
-            8 => self.types.ulong_id,
             16 => self.types.uint128_id,
-            _ => self.types.uint_id,
+            _ => self
+                .types
+                .unsigned_of_size(storage_size)
+                .unwrap_or(self.types.uint_id),
         }
     }
 
@@ -1131,7 +1247,7 @@ impl<'a> Linearizer<'a> {
         insn
     }
 
-    /// Keep a load's or store's constant offset inside a machine displacement.
+    /// Keep a memory access's constant offset inside a machine displacement.
     ///
     /// Both backends address `src[0] + offset` with a signed 32-bit
     /// displacement, so an offset past `i32` -- a member more than 2 GiB into a
@@ -1143,7 +1259,7 @@ impl<'a> Linearizer<'a> {
     /// [`Instruction::displacement`] can rely on the result
     /// (`validate.rs` I6 checks it).
     fn displacement_in_range(&mut self, mut insn: Instruction) -> Instruction {
-        if !matches!(insn.op, Opcode::Load | Opcode::Store) || i32::try_from(insn.offset).is_ok() {
+        if !insn.op.addresses_memory() || i32::try_from(insn.offset).is_ok() {
             return insn;
         }
         let Some(&base) = insn.src.first() else {
@@ -1163,29 +1279,22 @@ impl<'a> Linearizer<'a> {
         from_typ: TypeId,
         to_typ: TypeId,
     ) -> PseudoId {
+        // Same type and size - no conversion needed
+        if self.types.kind(from_typ) == self.types.kind(to_typ)
+            && self.types.size_bits(from_typ) == self.types.size_bits(to_typ)
+        {
+            return val;
+        }
+
+        // An array or a function is converted as the pointer it decays to
+        // (C17 6.3.2.1p3-4), which is what its value already is: the address.
+        let from_typ = self.types.decayed_value(from_typ);
         let from_size = self.types.size_bits(from_typ);
         let to_size = self.types.size_bits(to_typ);
         let from_float = self.types.is_float(from_typ);
         let to_float = self.types.is_float(to_typ);
         let from_kind = self.types.kind(from_typ);
         let to_kind = self.types.kind(to_typ);
-
-        // Same type and size - no conversion needed
-        if from_kind == to_kind && from_size == to_size {
-            return val;
-        }
-
-        // Array to pointer conversion (decay) - no actual conversion needed
-        // The array value is already the address of the first element (64-bit)
-        if from_kind == TypeKind::Array && to_kind == TypeKind::Pointer {
-            return val;
-        }
-
-        // Function to pointer conversion (decay) - no actual conversion needed
-        // Function name decays to function pointer (64-bit address)
-        if from_kind == TypeKind::Function && to_kind == TypeKind::Pointer {
-            return val;
-        }
 
         // Pointer to pointer conversion - no actual conversion needed
         // All pointers are the same size (64-bit)
@@ -1455,11 +1564,7 @@ impl<'a> Linearizer<'a> {
             // Store the pointer value (8 bytes) to a local.
             let ptr_type = self.types.pointer_to(typ);
             let local_sym = self.alloc_pseudo();
-            let sym = Pseudo::sym(local_sym, name.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(sym);
-                func.add_local(&name, local_sym, ptr_type, None, None);
-            }
+            self.named_local(local_sym, name, ptr_type, None, None);
             let ptr_size = self.types.size_bits(ptr_type);
             self.emit(Instruction::store(
                 arg_pseudo, local_sym, 0, ptr_type, ptr_size,
@@ -1467,18 +1572,16 @@ impl<'a> Linearizer<'a> {
             if let Some(symbol_id) = symbol_id_opt {
                 self.insert_local(
                     symbol_id,
-                    LocalVarInfo {
-                        sym: local_sym,
+                    LocalVarInfo::new(
+                        LocalBinding::Frame {
+                            sym: local_sym,
+                            // va_list param: the slot holds a pointer to the
+                            // caller's va_list, array decay having happened
+                            // at the call site.
+                            storage: Storage::Indirect(ptr_type),
+                        },
                         typ, // Keep original va_list type for type checking
-                        vla_size_sym: None,
-                        vla_outer_extent: None,
-                        vla_elem_type: None,
-                        vm_row_dims: vec![],
-                        // va_list param: the slot holds a pointer to the
-                        // caller's va_list, array decay having happened at
-                        // the call site.
-                        storage: Storage::Indirect(ptr_type),
-                    },
+                    ),
                 );
             }
         }
@@ -1493,11 +1596,7 @@ impl<'a> Linearizer<'a> {
         for (name, symbol_id_opt, typ, arg_pseudo) in struct_params {
             // Create a symbol pseudo for this local variable (its address)
             let local_sym = self.alloc_pseudo();
-            let sym = Pseudo::sym(local_sym, name.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(sym);
-                func.add_local(&name, local_sym, typ, None, None);
-            }
+            self.named_local(local_sym, name, typ, None, None);
 
             let typ_size = self.types.size_bits(typ);
             // The copy length is an object size, so it is counted in bytes.
@@ -1552,12 +1651,15 @@ impl<'a> Linearizer<'a> {
                     src: false,
                 };
                 self.emit_block_copy(local_sym, arg_pseudo, typ_bytes, vol);
-            } else {
+            } else if typ_bytes > 0 {
                 // Small struct: arg_pseudo contains the value directly. A
                 // complex value passed that way (Win64) is its bits, stored
-                // as the integer they are.
+                // as the integer they are. A zero-sized one arrives in
+                // nothing (`ArgClass::Ignore`) and has nothing to store.
                 let as_typ = if self.types.is_complex(typ) {
-                    self.bits_type(typ_bytes as usize).unwrap_or(typ)
+                    self.types
+                        .unsigned_of_size(typ_bytes as usize)
+                        .unwrap_or(typ)
                 } else {
                     typ
                 };
@@ -1568,18 +1670,7 @@ impl<'a> Linearizer<'a> {
 
             // Register as a local variable (only if named parameter)
             if let Some(symbol_id) = symbol_id_opt {
-                self.insert_local(
-                    symbol_id,
-                    LocalVarInfo {
-                        sym: local_sym,
-                        typ,
-                        vla_size_sym: None,
-                        vla_outer_extent: None,
-                        vla_elem_type: None,
-                        vm_row_dims: vec![],
-                        storage: Storage::InSlot,
-                    },
-                );
+                self.insert_local(symbol_id, LocalVarInfo::frame(local_sym, typ));
             }
         }
     }
@@ -1599,11 +1690,9 @@ impl<'a> Linearizer<'a> {
             let is_complex = self.types.is_complex(typ);
             // Create a symbol pseudo for this local variable (its address)
             let local_sym = self.alloc_pseudo();
-            let sym = Pseudo::sym(local_sym, name.clone());
+            self.named_local(local_sym, name, typ, None, None);
             let typ_size_bytes = self.types.size_bytes(typ);
             if let Some(func) = &mut self.current_func {
-                func.add_pseudo(sym);
-                func.add_local(&name, local_sym, typ, None, None);
                 // Record for inliner: the backend prologue fills this local from
                 // registers; the inliner must generate an explicit copy instead.
                 func.implicit_param_copies.push(super::ImplicitParamCopy {
@@ -1624,18 +1713,7 @@ impl<'a> Linearizer<'a> {
 
             // Register as a local variable for name lookup (only if named parameter)
             if let Some(symbol_id) = symbol_id_opt {
-                self.insert_local(
-                    symbol_id,
-                    LocalVarInfo {
-                        sym: local_sym,
-                        typ,
-                        vla_size_sym: None,
-                        vla_outer_extent: None,
-                        vla_elem_type: None,
-                        vm_row_dims: vec![],
-                        storage: Storage::InSlot,
-                    },
-                );
+                self.insert_local(symbol_id, LocalVarInfo::frame(local_sym, typ));
             }
         }
     }
@@ -1656,11 +1734,7 @@ impl<'a> Linearizer<'a> {
         {
             // Create a symbol pseudo for this local variable (its address)
             let local_sym = self.alloc_pseudo();
-            let sym = Pseudo::sym(local_sym, name.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(sym);
-                func.add_local(&name, local_sym, typ, None, None);
-            }
+            self.named_local(local_sym, name, typ, None, None);
 
             // Store the incoming argument value to the local, converted from
             // its promoted type when an identifier list declared it.
@@ -1674,26 +1748,12 @@ impl<'a> Linearizer<'a> {
 
             // Register as a local variable for name lookup (only if named parameter)
             if let Some(symbol_id) = symbol_id_opt {
-                self.insert_local(
-                    symbol_id,
-                    LocalVarInfo {
-                        sym: local_sym,
-                        typ,
-                        vla_size_sym: None,
-                        vla_outer_extent: None,
-                        vla_elem_type: None,
-                        vm_row_dims: vec![],
-                        storage: Storage::InSlot,
-                    },
-                );
+                self.insert_local(symbol_id, LocalVarInfo::frame(local_sym, typ));
             }
         }
     }
 
     /// Clear the per-function state carried on the linearizer.
-    ///
-    /// `static_locals` is deliberately not cleared: it persists across
-    /// functions.
     ///
     /// Returns the function-level [`Scope`], which `linearize_function` gives
     /// back once the body is lowered. Nothing is released there -- the
@@ -1705,12 +1765,12 @@ impl<'a> Linearizer<'a> {
         // Reset per-function state
         self.next_pseudo = 0;
         self.next_bb = 0;
-        self.var_map.clear();
         self.locals.clear();
         self.local_scope_stack.clear();
         self.label_map.clear();
         self.break_targets.clear();
         self.continue_targets.clear();
+        self.switch_stack.clear();
         self.struct_return_ptr = None;
         self.reg_aggregate_return_type = None;
         self.current_func_name = self.emitted_name(func.name);
@@ -1724,7 +1784,6 @@ impl<'a> Linearizer<'a> {
         self.indirect_dispatch = None;
         // Remove from extern_symbols since we're defining this function
         self.module.extern_symbols.remove(&self.current_func_name);
-        // Note: static_locals is NOT cleared - it persists across functions
 
         // After `vla_marks.clear()`: the scope records the depth it starts
         // at, which for the function scope has to be zero.
@@ -1758,9 +1817,7 @@ impl<'a> Linearizer<'a> {
             crate::parse::ast::Stmt::While { body, .. }
             | crate::parse::ast::Stmt::DoWhile { body, .. }
             | crate::parse::ast::Stmt::Switch { body, .. }
-            | crate::parse::ast::Stmt::Label { stmt: body, .. }
-            | crate::parse::ast::Stmt::Case(_, _, body)
-            | crate::parse::ast::Stmt::Default(_, body) => Self::declares_vla(body),
+            | crate::parse::ast::Stmt::Labeled { stmt: body, .. } => Self::declares_vla(body),
             crate::parse::ast::Stmt::For { init, body, .. } => {
                 init.as_ref().is_some_and(|i| match i {
                     crate::parse::ast::ForInit::Declaration(decl) => {
@@ -1872,6 +1929,7 @@ impl<'a> Linearizer<'a> {
             let sret_id = self.alloc_pseudo();
             let sret_pseudo = Pseudo::arg(sret_id, 0).with_name("__sret");
             ir_func.add_pseudo(sret_pseudo);
+            ir_func.sret = Some(sret_id);
             self.struct_return_ptr = Some(sret_id);
         }
 
@@ -1967,36 +2025,14 @@ impl<'a> Linearizer<'a> {
                 // size, and the prologue writes them into the local -- so it
                 // must not also get the small-struct store below, which would
                 // overwrite what the prologue just put there.
-                let is_hfa_param = {
-                    let abi = get_abi_for_conv(self.current_calling_conv, self.target);
-                    matches!(
-                        abi.classify_param(param.typ, self.types),
-                        crate::abi::ArgClass::Hfa { count, .. }
-                            if count >= 2 || size > 64
-                    )
-                };
-                let is_two_fp_regs = is_hfa_param
-                    || size > 64 && size <= 128 && {
-                        let abi = get_abi_for_conv(self.current_calling_conv, self.target);
-                        let class = abi.classify_param(param.typ, self.types);
-                        // Any all-SSE aggregate, whether that is two registers of
-                        // eight bytes or one of sixteen.
-                        let all_sse = matches!(
-                            class,
-                            crate::abi::ArgClass::Direct { ref classes, .. }
-                                if !classes.is_empty()
-                                    && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
-                        ) || matches!(class, crate::abi::ArgClass::Hfa { .. });
-                        // Two eightbytes of any classes -- both integer, or one
-                        // of each -- arrive in two registers on both targets:
-                        // AAPCS64 §5.4.2 C.10 and SysV AMD64 §3.2.3 agree.
-                        let reg_pair = matches!(
-                            class,
-                            crate::abi::ArgClass::Direct { ref classes, .. }
-                                if classes.len() == 2
-                        );
-                        all_sse || reg_pair
-                    };
+                let class = get_abi_for_conv(self.current_calling_conv, self.target)
+                    .classify_param(param.typ, self.types);
+                let is_hfa_param = matches!(
+                    class,
+                    crate::abi::ArgClass::Hfa { count, .. } if count >= 2 || size > 64
+                );
+                let is_two_fp_regs =
+                    is_hfa_param || size > 64 && size <= 128 && class.is_register_aggregate();
                 if is_two_fp_regs {
                     complex_params.push((
                         name,
@@ -2150,19 +2186,15 @@ impl<'a> Linearizer<'a> {
             ir_func.remove_unreachable_blocks();
         }
 
-        // Run SSA conversion if enabled
-        if self.run_ssa {
-            if let Some(ref mut ir_func) = self.current_func {
+        if let Some(ref mut ir_func) = self.current_func {
+            // Every id the linearizer handed out is below its counter; from
+            // here on the function allocates its own.
+            ir_func.next_pseudo = self.next_pseudo;
+            if self.run_ssa {
                 ssa_convert(ir_func, self.types);
-                // Note: ssa_convert sets ir_func.next_pseudo to account for phi nodes
                 // Drop func.locals entries whose Sym is now unused, so the
                 // backend regalloc allocates no stack slot for them.
                 mem2reg(ir_func);
-            }
-        } else {
-            // Only set next_pseudo if SSA was NOT run (SSA sets its own)
-            if let Some(ref mut ir_func) = self.current_func {
-                ir_func.next_pseudo = self.next_pseudo;
             }
         }
 
@@ -2191,8 +2223,7 @@ impl<'a> Linearizer<'a> {
             // A scalar the convention returns through the pointer -- a Win64
             // `long double` -- is converted as `return` converts any value
             // (C17 6.8.6.4p3) and stored there.
-            let val = self.linearize_expr(e);
-            let val = self.emit_convert(val, self.expr_type(e), ret_type);
+            let val = self.linearize_converted(e, ret_type);
             let size = self.types.size_bits(ret_type);
             self.emit(Instruction::store(val, sret_ptr, 0, ret_type, size));
             self.emit(Instruction::ret_typed(
@@ -2202,12 +2233,10 @@ impl<'a> Linearizer<'a> {
             ));
             return;
         }
-        let src_addr = if !self.types.is_complex(ret_type) {
-            self.linearize_lvalue(e)
-        } else if self.types.is_complex(self.expr_type(e)) {
-            self.complex_operand_at_precision(e, ret_type)
+        let src_addr = if self.types.is_complex(ret_type) {
+            self.linearize_converted(e, ret_type)
         } else {
-            self.promote_real_to_complex(e, ret_type)
+            self.linearize_lvalue(e)
         };
         let struct_bytes = self.types.size_bytes(ret_type);
         // The shared block copy, for the same two reasons the parameter
@@ -2263,23 +2292,14 @@ impl<'a> Linearizer<'a> {
     /// bits of its value in one integer position rather than by address:
     /// Win64 passes and returns a complex number of 1, 2, 4 or 8 bytes the
     /// way it does an aggregate of that size. The value is then read as the
-    /// unsigned integer of that width -- [`Self::bits_type`].
+    /// unsigned integer of that width -- [`TypeTable::unsigned_of_size`].
     pub(crate) fn complex_travels_as_bits(&self, typ: TypeId, conv: CallingConv) -> bool {
         conv == CallingConv::Win64
             && self.types.is_complex(typ)
-            && self.bits_type(self.types.size_bytes(typ)).is_some()
-    }
-
-    /// The unsigned integer type `bytes` wide, for moving an object's bits
-    /// as a value; `None` for a width with no such type.
-    pub(crate) fn bits_type(&self, bytes: usize) -> Option<TypeId> {
-        match bytes {
-            1 => Some(self.types.uchar_id),
-            2 => Some(self.types.ushort_id),
-            4 => Some(self.types.uint_id),
-            8 => Some(self.types.ulong_id),
-            _ => None,
-        }
+            && self
+                .types
+                .unsigned_of_size(self.types.size_bytes(typ))
+                .is_some()
     }
 
     /// Return an aggregate the ABI returns in registers
@@ -2587,42 +2607,6 @@ impl<'a> Linearizer<'a> {
         }
     }
 
-    /// Resolve an incomplete struct/union type to its complete definition.
-    ///
-    /// When a struct is forward-declared (e.g., `struct foo;`) and later
-    /// defined, the forward declaration creates an incomplete TypeId.
-    /// Pointers to the forward-declared type still reference this incomplete
-    /// TypeId even after the struct is fully defined with a new TypeId.
-    ///
-    /// This method looks up the complete definition in the symbol table
-    /// using the struct's tag name, returning the complete TypeId if found.
-    pub(crate) fn resolve_struct_type(&self, type_id: TypeId) -> TypeId {
-        let typ = self.types.get(type_id);
-
-        // Only try to resolve struct/union types
-        if typ.kind != TypeKind::Struct && typ.kind != TypeKind::Union {
-            return type_id;
-        }
-
-        // Check if this is an incomplete type with a tag
-        if let Some(ref composite) = typ.composite {
-            if composite.is_complete {
-                // Already complete, no resolution needed
-                return type_id;
-            }
-            if let Some(tag) = composite.tag {
-                // Look up the tag in the symbol table to find the complete type
-                if let Some(symbol) = self.symbols.lookup_tag(tag) {
-                    // Return the complete type from the symbol table
-                    return symbol.typ;
-                }
-            }
-        }
-
-        // Couldn't resolve, return original
-        type_id
-    }
-
     /// The address of a complex-valued expression, whichever kind it is.
     ///
     /// Complex values live in memory and travel by address, and every complex
@@ -2694,11 +2678,61 @@ impl<'a> Linearizer<'a> {
 
     /// Whether a struct or union of this type travels in the IR as its value
     /// rather than its address: it does when it fits in one register, the
-    /// threshold `linearize_ident` applies. A complex value always travels by
-    /// address, and is not asked about here.
+    /// threshold [`Self::read_object`] applies. A complex value always
+    /// travels by address, and is not asked about here.
+    ///
+    /// A zero-sized one -- GNU's `struct {}`, or `struct { int a[0]; }` --
+    /// does not: it has no bits to carry, and loading "nothing" from it was
+    /// lowered as a one-byte access that stored over its neighbour.
     pub(crate) fn aggregate_travels_by_value(&self, typ: TypeId) -> bool {
         matches!(self.types.kind(typ), TypeKind::Struct | TypeKind::Union)
             && (1..=64).contains(&self.types.size_bits(typ))
+    }
+
+    /// Whether an object of type `typ`, read as an rvalue, yields its
+    /// address rather than its value: an array or a `va_list` that is one
+    /// decays (C17 6.3.2.1p3, 7.16p3), a function designator converts to a
+    /// pointer (6.3.2.1p4), and an aggregate that does not travel by value
+    /// ([`Self::aggregate_travels_by_value`]) is used where it lies.
+    pub(crate) fn object_reads_as_address(&self, typ: TypeId) -> bool {
+        match self.types.kind(typ) {
+            TypeKind::Array | TypeKind::Function => true,
+            TypeKind::VaList => !self.types.va_list_is_pointer(),
+            TypeKind::Struct | TypeKind::Union => !self.aggregate_travels_by_value(typ),
+            _ => false,
+        }
+    }
+
+    /// Read the object of type `typ` at `place` as an rvalue: its address
+    /// when [`Self::object_reads_as_address`] says so, else its value. Every
+    /// expression that designates an object -- a name, `*p`, `s.m`, `a[i]`,
+    /// a compound literal -- reads it here, so they cannot disagree about
+    /// which objects travel by address.
+    pub(crate) fn read_object(&mut self, place: ObjectPlace, typ: TypeId) -> PseudoId {
+        if self.object_reads_as_address(typ) {
+            return match place {
+                ObjectPlace::Sym(sym) => {
+                    // An array's address is its first element's (6.3.2.1p3).
+                    let pointee = match self.types.kind(typ) {
+                        TypeKind::Array => self.types.base_type(typ).unwrap_or(self.types.int_id),
+                        _ => typ,
+                    };
+                    let result = self.alloc_reg_pseudo();
+                    let ptr_type = self.types.pointer_to(pointee);
+                    self.emit(Instruction::sym_addr(result, sym, ptr_type));
+                    result
+                }
+                ObjectPlace::At(base, offset) => self.offset_address(base, offset),
+            };
+        }
+        let (base, offset) = match place {
+            ObjectPlace::Sym(sym) => (sym, 0),
+            ObjectPlace::At(base, offset) => (base, offset),
+        };
+        let result = self.alloc_reg_pseudo();
+        let size = self.types.size_bits(typ);
+        self.emit(Instruction::load(result, base, offset, typ, size));
+        result
     }
 
     /// Linearize an expression as an lvalue (get its address)
@@ -2711,139 +2745,48 @@ impl<'a> Linearizer<'a> {
                 self.linearize_lvalue(expr)
             }
             ExprKind::Ident(symbol_id) => {
-                let name_str = self.symbol_name(*symbol_id);
-                // For local variables, emit SymAddr to get the stack address
-                if let Some(local) = self.locals.get(symbol_id).cloned() {
-                    // Check if this is a static local (sentinel value)
-                    if local.sym.0 == u32::MAX {
-                        // Static local - look up the global name
-                        let key = format!("{}.{}", self.current_func_name, name_str);
-                        if let Some(static_info) = self.static_locals.get(&key).cloned() {
-                            let sym_id = self.alloc_pseudo();
-                            let pseudo = Pseudo::sym(sym_id, static_info.global_name);
-                            if let Some(func) = &mut self.current_func {
-                                func.add_pseudo(pseudo);
-                            }
+                let local = self.locals.get(symbol_id).cloned();
+                let (sym, typ) = match local {
+                    Some(LocalVarInfo {
+                        binding: LocalBinding::Frame { sym, storage },
+                        typ,
+                        ..
+                    }) => {
+                        // When the slot holds a pointer to the object -- a
+                        // VLA's `alloca`d storage, or a `va_list` parameter
+                        // -- the object's address is that pointer's value,
+                        // not the slot's. Taking the slot's address made `&a`
+                        // differ from `a` for every VLA, so `int (*p)[n] =
+                        // &a` pointed at the pointer and read back garbage.
+                        if let Storage::Indirect(ptr_type) = storage {
                             let result = self.alloc_pseudo();
-                            self.emit(Instruction::sym_addr(
-                                result,
-                                sym_id,
-                                self.types.pointer_to(static_info.typ),
-                            ));
+                            let size = self.types.size_bits(ptr_type);
+                            self.emit(Instruction::load(result, sym, 0, ptr_type, size));
                             return result;
-                        } else {
-                            unreachable!("static local sentinel without static_locals entry");
                         }
+                        (sym, typ)
                     }
-                    // When the slot holds a pointer to the object -- a VLA's
-                    // `alloca`d storage, or a `va_list` parameter -- the
-                    // object's address is that pointer's value, not the
-                    // slot's. Taking the slot's address made `&a` differ from
-                    // `a` for every VLA, so `int (*p)[n] = &a` pointed at the
-                    // pointer and read back garbage.
-                    if let Storage::Indirect(ptr_type) = local.storage {
-                        let result = self.alloc_pseudo();
-                        let size = self.types.size_bits(ptr_type);
-                        self.emit(Instruction::load(result, local.sym, 0, ptr_type, size));
-                        return result;
+                    Some(LocalVarInfo {
+                        binding: LocalBinding::Static { global },
+                        typ,
+                        ..
+                    }) => (self.sym_pseudo(global), typ),
+                    Some(LocalVarInfo {
+                        binding: LocalBinding::ExtentsOnly,
+                        ..
+                    }) => unreachable!("no identifier names a type name's extents"),
+                    None => {
+                        let name = self.symbol_name(*symbol_id);
+                        (self.sym_pseudo(name), self.expr_type(expr))
                     }
-
-                    let result = self.alloc_pseudo();
-                    self.emit(Instruction::sym_addr(
-                        result,
-                        local.sym,
-                        self.types.pointer_to(local.typ),
-                    ));
-                    result
-                } else if let Some(&param_pseudo) = self.var_map.get(&name_str) {
-                    // Parameter whose address is taken
-                    let param_type = self.expr_type(expr);
-                    let type_kind = self.types.kind(param_type);
-
-                    // va_list parameters are special: the parameter value IS already a pointer
-                    // to the va_list structure (due to array-to-pointer decay at call site).
-                    // Return the pointer value directly instead of spilling.
-                    //
-                    // Again only where `va_list` is an array. Where it is a
-                    // pointer, the object's address is the slot's, so the
-                    // parameter has to spill like any other.
-                    if type_kind == TypeKind::VaList && !self.types.va_list_is_pointer() {
-                        return param_pseudo;
-                    }
-
-                    // For other parameters, spill to local storage.
-                    // Parameters are pass-by-value in the IR (Arg pseudos), but if
-                    // their address is taken, we need to copy to a stack slot first.
-                    let size = self.types.size_bits(param_type);
-
-                    // Create a local variable to hold the parameter value
-                    let local_sym = self.alloc_pseudo();
-                    let local_pseudo = Pseudo::sym(local_sym, format!("{}_spill", name_str));
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(local_pseudo);
-                        func.locals.insert(
-                            format!("{}_spill", name_str),
-                            super::LocalVar {
-                                sym: local_sym,
-                                typ: param_type,
-                                decl_block: self.current_bb,
-                                explicit_align: None, // parameter spill storage
-                            },
-                        );
-                    }
-
-                    // Store the parameter value to the local
-                    self.emit(Instruction::store(
-                        param_pseudo,
-                        local_sym,
-                        0,
-                        param_type,
-                        size,
-                    ));
-
-                    // Update locals map so future accesses use the spilled location
-                    self.insert_local(
-                        *symbol_id,
-                        LocalVarInfo {
-                            sym: local_sym,
-                            typ: param_type,
-                            vla_size_sym: None,
-                            vla_outer_extent: None,
-                            vla_elem_type: None,
-                            vm_row_dims: vec![],
-                            storage: Storage::InSlot,
-                        },
-                    );
-
-                    // Also update var_map to point to the local for future value accesses
-                    // (so reads go through load instead of using the original Arg pseudo)
-                    // Note: We leave var_map unchanged here because reads should use
-                    // the stored value via load from the local.
-
-                    // Return address of the local
-                    let result = self.alloc_pseudo();
-                    self.emit(Instruction::sym_addr(
-                        result,
-                        local_sym,
-                        self.types.pointer_to(param_type),
-                    ));
-                    result
-                } else {
-                    // Global variable - emit SymAddr to get its address
-                    let sym_id = self.alloc_pseudo();
-                    let pseudo = Pseudo::sym(sym_id, name_str.clone());
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(pseudo);
-                    }
-                    let result = self.alloc_pseudo();
-                    let typ = self.expr_type(expr);
-                    self.emit(Instruction::sym_addr(
-                        result,
-                        sym_id,
-                        self.types.pointer_to(typ),
-                    ));
-                    result
-                }
+                };
+                let result = self.alloc_pseudo();
+                self.emit(Instruction::sym_addr(
+                    result,
+                    sym,
+                    self.types.pointer_to(typ),
+                ));
+                result
             }
             ExprKind::Unary {
                 op: UnaryOp::Deref,
@@ -2858,9 +2801,7 @@ impl<'a> Linearizer<'a> {
             } => {
                 // s.m as lvalue = &s + offset(m)
                 let base = self.linearize_lvalue(inner);
-                let base_struct_type = self.expr_type(inner);
-                // Resolve if the struct type is incomplete (forward-declared)
-                let struct_type = self.resolve_struct_type(base_struct_type);
+                let struct_type = self.expr_type(inner);
                 let member_info = self
                     .types
                     .find_member(struct_type, *member)
@@ -2875,12 +2816,10 @@ impl<'a> Linearizer<'a> {
                 // ptr->m as lvalue = ptr + offset(m)
                 let ptr = self.linearize_expr(inner);
                 let ptr_type = self.expr_type(inner);
-                let base_struct_type = self
+                let struct_type = self
                     .types
                     .base_type(ptr_type)
                     .unwrap_or_else(|| self.expr_type(expr));
-                // Resolve if the struct type is incomplete (forward-declared)
-                let struct_type = self.resolve_struct_type(base_struct_type);
                 let member_info = self
                     .types
                     .find_member(struct_type, *member)
@@ -2941,28 +2880,7 @@ impl<'a> Linearizer<'a> {
             ExprKind::CompoundLiteral { typ, elements } => {
                 // Compound literal as lvalue: create it and return its address
                 // This is used for &(struct S){...} and large struct assignment like *p = (struct S){...}
-                let sym_id = self.alloc_pseudo();
-                let unique_name = format!(".compound_literal.{}", sym_id.0);
-                let sym = Pseudo::sym(sym_id, unique_name.clone());
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(sym);
-                    func.add_local(&unique_name, sym_id, *typ, self.current_bb, None);
-                }
-
-                // For compound literals with partial initialization, C99 6.7.8p21 requires
-                // zero-initialization of all subobjects not explicitly initialized.
-                // Zero the entire compound literal first, then initialize specific members.
-                let type_kind = self.types.kind(*typ);
-                if type_kind == TypeKind::Struct
-                    || type_kind == TypeKind::Union
-                    || type_kind == TypeKind::Array
-                {
-                    self.emit_aggregate_zero(sym_id, *typ);
-                }
-
-                self.linearize_init_list(sym_id, *typ, elements);
-
-                // Return address of the compound literal
+                let sym_id = self.materialize_compound_literal(*typ, elements);
                 let result = self.alloc_reg_pseudo();
                 let ptr_type = self.types.pointer_to(*typ);
                 self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
@@ -3012,100 +2930,27 @@ impl<'a> Linearizer<'a> {
     }
 
     /// Linearize a type cast expression
-    /// A cast to a complex type (C17 6.3.1.7p1).
-    ///
-    /// From a real: the value becomes the real part and the imaginary part is
-    /// zero. From a complex: each half is converted to the new precision,
-    /// which is what makes `(_Complex double)(_Complex float)z` widen both
-    /// halves rather than only one.
-    ///
-    /// Built the same way `__builtin_complex` is -- a local of the target type
-    /// and two stores -- so the result travels by address like every other
-    /// complex value.
-    fn emit_cast_to_complex(
-        &mut self,
-        inner_expr: &Expr,
-        src_type: TypeId,
-        cast_type: TypeId,
-    ) -> PseudoId {
-        let base_typ = self.types.complex_base(cast_type);
-        let base_bits = self.types.size_bits(base_typ);
-        let base_bytes = (base_bits / 8) as i64;
-
-        let (real_val, imag_val) = if self.types.is_complex(src_type) {
-            // Each half, converted to the destination's precision.
-            let src_base = self.types.complex_base(src_type);
-            let addr = self.complex_operand_addr(inner_expr);
-            let src_bits = self.types.size_bits(src_base);
-            let src_bytes = (src_bits / 8) as i64;
-
-            let re = self.alloc_pseudo();
-            self.emit(Instruction::load(re, addr, 0, src_base, src_bits));
-            let im = self.alloc_pseudo();
-            self.emit(Instruction::load(im, addr, src_bytes, src_base, src_bits));
-
-            (
-                self.emit_convert(re, src_base, base_typ),
-                self.emit_convert(im, src_base, base_typ),
-            )
-        } else {
-            // A real source: convert it, and pair it with a zero of the
-            // destination's base type.
-            let v = self.linearize_expr(inner_expr);
-            let re = self.emit_convert(v, src_type, base_typ);
-            let zero = self.emit_fconst(crate::float::FloatVal::ZERO, base_typ);
-            (re, zero)
-        };
-
-        let result = self.frame_temp_addr("__ctmp", cast_type);
-        self.emit(Instruction::store(real_val, result, 0, base_typ, base_bits));
-        self.emit(Instruction::store(
-            imag_val, result, base_bytes, base_typ, base_bits,
-        ));
-        result
-    }
-
     pub(crate) fn linearize_cast(&mut self, inner_expr: &Expr, cast_type: TypeId) -> PseudoId {
-        let src_type = self.expr_type(inner_expr);
-
-        // C17 6.3.1.7p2: converting a complex value to a real type keeps the
-        // real part and discards the imaginary one. Falling through to the
-        // scalar path reinterpreted the address the complex value travels by
-        // as the value itself, so `(double) z` produced a number in the range
-        // of a pointer bit pattern.
-        // `_Bool` is the exception: 6.3.1.2 converts by comparing against 0,
-        // and for a complex value that comparison is against `0.0 + 0.0i`, so
-        // the imaginary half decides the answer too. Keeping only the real
-        // part here made `(_Bool)(0.0 + 3.0i)` false.
-        if self.types.is_complex(src_type) && self.types.kind(cast_type) == TypeKind::Bool {
-            return self.emit_complex_nonzero(inner_expr);
-        }
+        // The operand's value, not the designator: a function or an array is
+        // converted from the pointer it decays to.
+        let src_type = self.types.decayed_value(self.expr_type(inner_expr));
 
         // C17 6.3.2.2: a cast to `void` evaluates the operand and discards
         // the value, converting nothing. This has to come before the complex
-        // arms as well as before the arithmetic ones: `void` is neither
-        // complex nor floating, so a complex operand took the
-        // complex-to-real arm just below and a floating one the
-        // float-to-integer arm further down, and `(void)z` became a
-        // `cvttsd2si` that raises `FE_INVALID` for a NaN. The optimizer
-        // deleted the dead conversion at -O1 and above, so only -O0 raised
-        // it.
+        // arm as well as before the arithmetic ones: `void` is neither
+        // complex nor floating, so a complex operand took the complex-to-real
+        // conversion and a floating one the float-to-integer arm further
+        // down, and `(void)z` became a `cvttsd2si` that raises `FE_INVALID`
+        // for a NaN. The optimizer deleted the dead conversion at -O1 and
+        // above, so only -O0 raised it.
         if self.types.kind(cast_type) == TypeKind::Void {
             return self.linearize_expr(inner_expr);
         }
 
-        if self.types.is_complex(src_type) && !self.types.is_complex(cast_type) {
-            return self.emit_complex_to_real(inner_expr, cast_type);
-        }
-
-        // C17 6.3.1.7p1: converting a real to a complex type gives the real
-        // value as the real part and a zero imaginary part; converting complex
-        // to complex converts each part. Neither had a branch here, so a cast
-        // *to* a complex type fell through to the scalar path and returned a
-        // value where a complex address was expected -- `(_Complex double)0.0`
-        // segfaulted at every precision, from a real or from a complex source.
-        if self.types.is_complex(cast_type) {
-            return self.emit_cast_to_complex(inner_expr, src_type, cast_type);
+        // Into or out of a complex type (C17 6.3.1.7), by the rule every
+        // converting site shares.
+        if self.types.is_complex(src_type) || self.types.is_complex(cast_type) {
+            return self.linearize_converted(inner_expr, cast_type);
         }
 
         let src = self.linearize_expr(inner_expr);
@@ -3200,8 +3045,7 @@ impl<'a> Linearizer<'a> {
         member: StringId,
     ) -> PseudoId {
         let base = self.linearize_lvalue(inner_expr);
-        let base_struct_type = self.expr_type(inner_expr);
-        let struct_type = self.resolve_struct_type(base_struct_type);
+        let struct_type = self.expr_type(inner_expr);
         self.emit_member_access(base, struct_type, member, self.expr_type(expr))
     }
 
@@ -3214,11 +3058,10 @@ impl<'a> Linearizer<'a> {
     ) -> PseudoId {
         let ptr = self.linearize_expr(inner_expr);
         let ptr_type = self.expr_type(inner_expr);
-        let base_struct_type = self
+        let struct_type = self
             .types
             .base_type(ptr_type)
             .unwrap_or_else(|| self.expr_type(expr));
-        let struct_type = self.resolve_struct_type(base_struct_type);
         self.emit_member_access(ptr, struct_type, member, self.expr_type(expr))
     }
 
@@ -3231,11 +3074,11 @@ impl<'a> Linearizer<'a> {
     /// [`Self::mark_volatile_access`] sees the qualifier -- the type
     /// `find_member` answers with is the member's *declared* one and cannot
     /// carry it, which is why a member of a `volatile` struct read as an
-    /// ordinary `int` and DCE deleted the load from `-O1` up. Its width, sign
-    /// and kind still come from the member, so the two disagreeing (only
-    /// reachable once the parser has already reported an unknown member)
-    /// cannot change how the access is performed. It also stands in for the
-    /// member type entirely when the lookup fails here.
+    /// ordinary `int` and DCE deleted the load from `-O1` up. It differs from
+    /// the member's type only in qualifiers, so its width, sign and kind are
+    /// the member's; the two disagree otherwise only once the parser has
+    /// already reported an unknown member. It also stands in for the member
+    /// type entirely when the lookup fails here.
     pub(crate) fn emit_member_access(
         &mut self,
         base: PseudoId,
@@ -3248,30 +3091,10 @@ impl<'a> Linearizer<'a> {
             .find_member(struct_type, member)
             .unwrap_or_else(|| MemberInfo::standing_in(access_typ));
 
-        // If member type is an array, return the address (arrays decay to pointers)
-        if self.types.kind(member_info.typ) == TypeKind::Array {
-            self.offset_address(base, member_info.offset as i64)
-        } else if let Some(bf) = member_info.bitfield() {
-            self.emit_bitfield_load(base, bf, access_typ)
-        } else {
-            let size = self.types.size_bits(member_info.typ);
-            let member_kind = self.types.kind(member_info.typ);
-
-            // Large structs (size > 64) can't be loaded into registers - return address
-            if (member_kind == TypeKind::Struct || member_kind == TypeKind::Union) && size > 64 {
-                self.offset_address(base, member_info.offset as i64)
-            } else {
-                let result = self.alloc_pseudo();
-                self.emit(Instruction::load(
-                    result,
-                    base,
-                    member_info.offset as i64,
-                    access_typ,
-                    size,
-                ));
-                result
-            }
+        if let Some(bf) = member_info.bitfield() {
+            return self.emit_bitfield_load(base, bf, access_typ);
         }
+        self.read_object(ObjectPlace::At(base, member_info.offset as i64), access_typ)
     }
 
     /// Bytes that one step of `ptr_expr` spans, as a run-time value.
@@ -3285,7 +3108,10 @@ impl<'a> Linearizer<'a> {
         if let Some(stride) = self.vm_index_stride(ptr_expr) {
             return stride;
         }
-        let elem_type = self.types.base_type(ptr_typ).unwrap_or(self.types.char_id);
+        let elem_type = self
+            .types
+            .arithmetic_pointee(ptr_typ)
+            .unwrap_or(self.types.char_id);
         let elem_size = self.types.size_bytes(elem_type);
         self.emit_const(elem_size as i128, self.types.long_id)
     }
@@ -3343,17 +3169,7 @@ impl<'a> Linearizer<'a> {
 
             let dim_sym_id = self.alloc_pseudo();
             let dim_var_name = format!("__vla_dim{}_{}.{}", dims.len(), name, dim_sym_id.0);
-            let dim_sym = Pseudo::sym(dim_sym_id, dim_var_name.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(dim_sym);
-                func.add_local(
-                    &dim_var_name,
-                    dim_sym_id,
-                    ulong_type,
-                    self.current_bb,
-                    None, // no explicit alignment
-                );
-            }
+            self.named_local(dim_sym_id, dim_var_name, ulong_type, self.current_bb, None);
 
             // Widen to 64-bit before storing.
             let dim_expr_typ = size_expr.typ.unwrap_or(self.types.int_id);
@@ -3733,22 +3549,7 @@ impl<'a> Linearizer<'a> {
             64,
         ));
 
-        // If element type is an array, just return the address (arrays decay to pointers)
-        let elem_kind = self.types.kind(elem_type);
-        if elem_kind == TypeKind::Array {
-            addr
-        } else {
-            let size = self.types.size_bits(elem_type);
-            // Large structs/unions (> 64 bits) can't be loaded into registers - return address
-            // Assignment will handle the actual copy via emit_assign's large struct handling
-            if (elem_kind == TypeKind::Struct || elem_kind == TypeKind::Union) && size > 64 {
-                addr
-            } else {
-                let result = self.alloc_pseudo();
-                self.emit(Instruction::load(result, addr, 0, elem_type, size));
-                result
-            }
-        }
+        self.read_object(ObjectPlace::At(addr, 0), elem_type)
     }
 
     /// Storage for a call returning `typ` through the hidden pointer, and
@@ -3819,7 +3620,8 @@ impl<'a> Linearizer<'a> {
         if self.complex_travels_as_bits(passed, conv) {
             let bytes = self.types.size_bytes(passed);
             let bits = self
-                .bits_type(bytes)
+                .types
+                .unsigned_of_size(bytes)
                 .expect("checked by complex_travels_as_bits");
             let loaded = self.alloc_reg_pseudo();
             let size = self.types.size_bits(bits);
@@ -3838,90 +3640,22 @@ impl<'a> Linearizer<'a> {
         binding: crate::parse::ast::CalleeBinding,
         known: Option<crate::parse::ast::LibFn>,
     ) -> PseudoId {
-        // Determine if this is a direct or indirect call.
-        // We need to check the TYPE of the function expression:
-        // - If it's TypeKind::Function, it's a direct call to a function
-        // - If it's TypeKind::Pointer to Function, it's an indirect call through function pointer
-        let is_function_pointer = func_expr.typ.is_some_and(|t| {
-            let typ = self.types.get(t);
-            typ.kind == TypeKind::Pointer
-        });
-
-        let (func_name, indirect_target) = match &func_expr.kind {
-            ExprKind::Ident(symbol_id) if !is_function_pointer => {
-                // Direct call to named function (not a function pointer variable)
-                (self.symbol_name(*symbol_id), None)
-            }
-            ExprKind::Unary {
-                op: UnaryOp::Deref,
-                operand,
-            } => {
-                // Explicit dereference form: (*fp)(args) or (*fpp)(args)
-                // Check the type of the operand to determine behavior:
-                // - If operand is function pointer (*fn): call through operand value
-                // - If operand is pointer-to-function-pointer (**fn): dereference first
-                let operand_type = self.expr_type(operand);
-                let operand_kind = self.types.kind(operand_type);
-                if operand_kind == TypeKind::Pointer {
-                    // Check what it points to
-                    let base_type = self.types.base_type(operand_type);
-                    let base_kind = base_type.map(|t| self.types.kind(t));
-                    if base_kind == Some(TypeKind::Function) {
-                        // Operand is function pointer - use its value directly
-                        let func_addr = self.linearize_expr(operand);
-                        ("<indirect>".to_string(), Some(func_addr))
-                    } else {
-                        // Operand is pointer-to-pointer - dereference to get function pointer
-                        let func_addr = self.linearize_expr(func_expr);
-                        ("<indirect>".to_string(), Some(func_addr))
-                    }
-                } else {
-                    // Unknown case - try to linearize the full expression
-                    let func_addr = self.linearize_expr(func_expr);
-                    ("<indirect>".to_string(), Some(func_addr))
-                }
-            }
-            _ => {
-                // Indirect call through function pointer variable: fp(args)
-                // This includes identifiers that are function pointer variables
-                let func_addr = self.linearize_expr(func_expr);
-                ("<indirect>".to_string(), Some(func_addr))
-            }
-        };
+        let target = self.lower_callee(func_expr);
 
         let typ = self.expr_type(expr); // Use evaluated type (function return type)
 
-        // The callee's convention classifies everything below: its return,
-        // which arguments it takes by reference, and the registers.
-        let conv = func_expr
-            .typ
-            .map_or(CallingConv::C, |t| CallingConv::of_callee(t, self.types));
+        let sig = self.callee_signature(func_expr);
+        let conv = sig.conv;
         // A library function is known by its System V signature: what folds
         // or lowers a call to `memcpy` makes a System V call, and a callee
         // declared `ms_abi` is some other function of that name.
         let known = known.filter(|_| conv == CallingConv::C);
-
-        // Check if this is a variadic function call and if it's noreturn
-        // If the function expression has a type, check its variadic and noreturn flags
-        let (variadic_arg_start, is_noreturn_call) = if let Some(func_type) = func_expr.typ {
-            let ft = self.types.get(func_type);
-            let variadic = if ft.variadic {
-                // Variadic args start after the fixed parameters
-                ft.params.as_ref().map(|p| p.len())
-            } else {
-                None
-            };
-            (variadic, ft.noreturn)
-        } else {
-            (None, false) // No type info, assume non-variadic and returns
-        };
 
         // Check if function returns a large struct or complex type
         // Large structs: allocate space and pass address as hidden first argument
         // Complex types: allocate local storage for result (needs stack for 16-byte value)
         // Two-register structs (9-16 bytes): allocate local storage, codegen stores two regs
         let typ_kind = self.types.kind(typ);
-        let struct_size_bits = self.types.size_bits(typ);
         let returns_large_struct = self.returns_via_hidden_pointer(typ, conv);
         // An aggregate that comes back in registers still needs somewhere to
         // land, and the backend writes the registers into this local. There is
@@ -3947,15 +3681,13 @@ impl<'a> Linearizer<'a> {
             // Complex values are 16 bytes and need stack storage
             let local_sym = self.frame_temp("__cret", typ);
             (local_sym, Vec::new(), Vec::new())
-        } else if (typ_kind == TypeKind::Struct || typ_kind == TypeKind::Union)
-            && struct_size_bits > 0
-            && struct_size_bits <= 64
-        {
-            // Small struct/union returns (<=64 bits, single register):
-            // Allocate local storage so the result has a stable address.
-            // The codegen stores RAX (or XMM0) to this location.
-            // Without this, the result pseudo holds a raw value which
-            // emit_assign's block_copy would incorrectly dereference as a pointer.
+        } else if matches!(typ_kind, TypeKind::Struct | TypeKind::Union) {
+            // Every other struct/union return -- one register's worth, or a
+            // zero-sized one, which comes back in nothing: allocate local
+            // storage so the result has a stable address. The codegen
+            // stores RAX (or XMM0) to this location. Without this, the
+            // result pseudo holds a raw value which emit_assign's block_copy
+            // would incorrectly dereference as a pointer.
             let local_sym = self.frame_temp("__sret1", typ);
             (local_sym, Vec::new(), Vec::new())
         } else {
@@ -3963,51 +3695,6 @@ impl<'a> Linearizer<'a> {
             (result, Vec::new(), Vec::new())
         };
 
-        // Get formal parameter types for implicit widening conversions.
-        // When a narrow int (e.g., int) is passed to a wider parameter (e.g., long),
-        // C requires implicit promotion. This is transparent for non-inlined calls
-        // (the ABI handles it), but inlining exposes the mismatch since the argument
-        // pseudo is used directly without conversion.
-        // C17 6.5.2.2p1 lets the function designator be a function *or* a
-        // pointer to one, and the prototype lives on the function type either
-        // way. Reading `params` off the pointer found nothing, so a call
-        // through a pointer converted no argument at all:
-        //
-        //   void f(double); void (*p)(double) = f; p(1);
-        //
-        // passed the integer 1 where a `double` was expected and the callee
-        // read 0. With a mixed list every later argument moved as well.
-        let formal_param_types: Option<Vec<TypeId>> = func_expr.typ.and_then(|ft_id| {
-            let resolved = if self.types.kind(ft_id) == TypeKind::Pointer {
-                self.types.base_type(ft_id).unwrap_or(ft_id)
-            } else {
-                ft_id
-            };
-            self.types.get(resolved).params.clone()
-        });
-        // A call through a function type with no prototype: C17 6.5.2.2p6
-        // gives every argument the default argument promotions, as it does
-        // a variadic one, and an identifier-list definition receives them so
-        // (see `ParamStyle`). Passing a `float` as a float had a gcc-compiled
-        // K&R callee read a double out of a register that held a single, and
-        // a `char` took Apple arm64's one-byte stack slot where the callee
-        // reads an `int`.
-        let unprototyped = func_expr.typ.is_some_and(|ft_id| {
-            let resolved = if self.types.kind(ft_id) == TypeKind::Pointer {
-                self.types.base_type(ft_id).unwrap_or(ft_id)
-            } else {
-                ft_id
-            };
-            self.types.kind(resolved) == TypeKind::Function
-                && self.types.get(resolved).params.is_none()
-        });
-
-        // Linearize regular arguments
-        // For large structs, pass by reference (address) instead of by value
-        // Note: We pass structs > 64 bits by reference. While the ABI allows
-        // two-register passing for 9-16 byte structs, we don't implement that yet.
-        // For complex types, pass address so codegen can load real/imag into XMM registers
-        // For arrays (including VLAs), decay to pointer
         // `__builtin_va_arg_pack()` is not an argument -- it stands for the
         // caller's whole argument list, which is not known until the enclosing
         // function is inlined. Lift it off here and record it on the call; the
@@ -4023,217 +3710,9 @@ impl<'a> Linearizer<'a> {
         };
 
         for (arg_idx, a) in args.iter().enumerate() {
-            let mut arg_type = self.expr_type(a);
-            let arg_kind = self.types.kind(arg_type);
-            // Computed before the dispatch below so the complex-argument arm
-            // can be skipped for a `_Bool` parameter without re-borrowing.
-            let bool_param_for_complex_arg = formal_param_types
-                .as_ref()
-                .and_then(|params| params.get(arg_idx).copied())
-                .filter(|pt| {
-                    self.types.is_complex(arg_type) && self.types.kind(*pt) == TypeKind::Bool
-                });
-            let arg_val = if (arg_kind == TypeKind::Struct || arg_kind == TypeKind::Union)
-                && (self.types.size_bits(arg_type) > 64 || self.passed_by_reference(arg_type, conv))
-            {
-                let size_bits = self.types.size_bits(arg_type);
-                let abi = get_abi_for_conv(conv, self.target);
-                let class = abi.classify_param(arg_type, self.types);
-                if size_bits > 128 {
-                    // Large struct (> 16 bytes): keep struct type so ABI classifies as
-                    // Indirect/MEMORY. The pseudo is the struct's address: System V
-                    // copies its bytes to the stack there, and AAPCS64 is handed a
-                    // copy of it below.
-                    arg_types_vec.push(arg_type);
-                } else {
-                    // Medium struct (9-16 bytes): the ABI classification decides
-                    let is_two_fp_regs = matches!(
-                        class,
-                        crate::abi::ArgClass::Direct { ref classes, .. }
-                            if !classes.is_empty()
-                                && classes.iter().all(|c| *c == crate::abi::RegClass::Sse)
-                    ) || matches!(class, crate::abi::ArgClass::Hfa { .. });
-                    // MEMORY class means the bytes go on the stack by value,
-                    // exactly as an over-sixteen-byte struct already does.
-                    // Reachable at this size only when an eightbyte holds a
-                    // `long double`, directly or merged with something else;
-                    // passing a pointer instead disagreed with gcc silently.
-                    let is_memory = matches!(class, crate::abi::ArgClass::Indirect { .. });
-                    // Any other two-eightbyte `Direct` class -- two integer
-                    // registers, or one of each -- travels in registers too,
-                    // on both targets. The pseudo still carries the address;
-                    // it is the backend that loads the pair out of it.
-                    let is_reg_pair = matches!(
-                        class,
-                        crate::abi::ArgClass::Direct { ref classes, .. }
-                            if classes.len() == 2
-                    );
-                    if is_two_fp_regs || is_memory || is_reg_pair {
-                        // Keep the struct type: the ABI decides from it, and
-                        // the pseudo carries the address either way.
-                        arg_types_vec.push(arg_type);
-                    } else {
-                        // Integer or mixed struct: pass as pointer (existing behavior)
-                        arg_types_vec.push(self.types.pointer_to(arg_type));
-                    }
-                }
-                // A struct argument travels by address. `linearize_lvalue`
-                // materializes an rvalue -- a call returning a struct -- and
-                // hands back the temporary's address, so both cases are the
-                // same call.
-                let addr = self.linearize_lvalue(a);
-                if self.passed_by_reference(arg_type, conv) {
-                    let vol = self.block_volatility(arg_type, self.expr_type(a));
-                    self.argument_copy(addr, arg_type, true, vol)
-                } else {
-                    addr
-                }
-            } else if bool_param_for_complex_arg.is_some() {
-                // A complex argument bound to a `_Bool` parameter converts by
-                // comparing against zero, so it must not take the
-                // pass-the-address arm below -- see `complex_to_bool`.
-                let pt = bool_param_for_complex_arg.unwrap();
-                arg_types_vec.push(pt);
-                self.emit_complex_nonzero(a)
-            } else if let Some(pt) = formal_param_types
-                .as_ref()
-                .and_then(|params| params.get(arg_idx).copied())
-                .filter(|pt| self.types.is_complex(*pt) && !self.types.is_complex(arg_type))
-            {
-                // A *real* argument bound to a complex parameter. C17
-                // 6.5.2.2p2 converts it as if by assignment, and 6.3.1.7p1
-                // gives the imaginary half a zero -- so the callee is handed a
-                // complex object, by address, like any other complex argument.
-                //
-                // The arm below keys on the *argument's* type, so this case
-                // reached the ordinary scalar path and the raw value was
-                // passed where an address was expected: `f(7)` with a
-                // `_Complex double` parameter arrived as garbage, and with a
-                // `_Complex int` one the callee dereferenced the number 7.
-                arg_types_vec.push(pt);
-                self.promote_real_to_complex(a, pt)
-            } else if self.types.is_complex(arg_type) {
-                // Complex types: pass address, codegen loads real/imag into XMM registers
-                // Type stays as complex (not pointer) so codegen knows it's complex.
-                //
-                // Converted to the parameter's own precision first. A complex
-                // value is read with its base type's stride, so handing a
-                // `float _Complex` to a `double _Complex` parameter without
-                // converting had the callee read an 8-byte-strided pair out of
-                // 4-byte-strided storage: `1.0f + 2.0f*I` arrived as `2+1i`.
-                // The type recorded for the ABI has to move with it, or the
-                // classification is made for a width that is no longer there.
-                let param_typ = formal_param_types
-                    .as_ref()
-                    .and_then(|params| params.get(arg_idx).copied())
-                    .filter(|pt| self.types.is_complex(*pt));
-                match param_typ {
-                    Some(pt) => {
-                        arg_types_vec.push(pt);
-                        self.complex_operand_at_precision(a, pt)
-                    }
-                    // No prototype, or a variadic argument: nothing says what
-                    // precision the callee wants, so it travels as written.
-                    None => {
-                        arg_types_vec.push(arg_type);
-                        self.complex_operand_addr(a)
-                    }
-                }
-            } else if arg_kind == TypeKind::Array {
-                // Array decay to pointer (C99 6.3.2.1)
-                // This applies to both fixed-size arrays and VLAs
-                let elem_type = self.types.base_type(arg_type).unwrap_or(self.types.int_id);
-                arg_types_vec.push(self.types.pointer_to(elem_type));
-                self.linearize_expr(a)
-            } else if arg_kind == TypeKind::VaList && !self.types.va_list_is_pointer() {
-                // va_list decay to pointer (C99 7.15.1)
-                // va_list is defined as __va_list_tag[1] (an array), so it decays to
-                // a pointer when passed to a function taking va_list parameter.
-                // Where va_list is already a pointer there is nothing to decay, and
-                // the ordinary scalar path below passes it by value.
-                arg_types_vec.push(self.types.pointer_to(arg_type));
-                self.linearize_lvalue(a)
-            } else if arg_kind == TypeKind::Function {
-                // Function decay to pointer (C99 6.3.2.1)
-                // Function names passed as arguments decay to function pointers
-                arg_types_vec.push(self.types.pointer_to(arg_type));
-                self.linearize_expr(a)
-            } else {
-                let mut val = self.linearize_expr(a);
-
-                // Implicit argument conversion when actual type differs from
-                // formal parameter type. Covers:
-                // - Integer widening: int→long (sign/zero extend)
-                // - FP widening/narrowing: float↔double↔long double
-                // - Int→FP: uint32_t→double (e.g., log10(uint32_t_val))
-                // - FP→Int: rare but legal
-                if let Some(ref params) = formal_param_types {
-                    if arg_idx < params.len() {
-                        let param_type = params[arg_idx];
-                        let arg_size = self.types.size_bits(arg_type);
-                        let param_size = self.types.size_bits(param_type);
-                        let arg_is_int = self.types.is_integer(arg_type);
-                        let param_is_int = self.types.is_integer(param_type);
-                        let arg_is_fp = self.types.is_float(arg_type);
-                        let param_is_fp = self.types.is_float(param_type);
-
-                        let needs_convert =
-                            // Integer widening (int→long, long→__int128, ...),
-                            // decided by the two sizes alone: nothing about it
-                            // stops at 64 bits.
-                            (arg_is_int && param_is_int && arg_size < param_size)
-                            // Integer narrowing (long→int, int→char, ...).
-                            // The callee reads only the parameter's own bytes,
-                            // but the ABI places the argument by the
-                            // *parameter's* type: Apple arm64 stacks a `char`
-                            // in one byte, so `f(..., 'a')` recorded as `int`
-                            // took four and moved every later argument.
-                            || (arg_is_int && param_is_int && arg_size > param_size)
-                            // FP size mismatch (float→double, long double→double, etc.)
-                            || (arg_is_fp && param_is_fp && arg_size != param_size)
-                            // Integer to FP (uint32_t→double, int→float, etc.)
-                            || (arg_is_int && param_is_fp)
-                            // FP to integer (rare but legal)
-                            || (arg_is_fp && param_is_int)
-                            // To `_Bool`, whose conversion is `!= 0` and not
-                            // a truncation (C17 6.3.1.2): `f(42)` with a
-                            // `_Bool` parameter must pass 1.
-                            || self.types.kind(param_type) == TypeKind::Bool;
-
-                        if needs_convert {
-                            val = self.emit_convert(val, arg_type, param_type);
-                            arg_type = param_type;
-                        }
-                    }
-                }
-
-                // C99 6.5.2.2p7: default argument promotions for variadic args,
-                // and 6.5.2.2p6 for every argument of an unprototyped call.
-                //
-                // Both halves have to happen here. The formal-parameter
-                // conversion above is guarded by `arg_idx < params.len()`, and
-                // a variadic argument is by definition at or past that bound,
-                // so it never runs for these. The cast itself emits no IR
-                // either, because emit_convert short-circuits same-size integer
-                // conversions -- without an explicit promotion the pseudo still
-                // holds the sign-extended load, and `printf("%02x", (unsigned
-                // char)c)` prints ffffff80 for a negative `signed char`.
-                if unprototyped || variadic_arg_start.is_some_and(|v| arg_idx >= v) {
-                    let promoted = self.types.default_argument_promote(arg_type);
-                    if promoted != arg_type {
-                        val = self.emit_convert(val, arg_type, promoted);
-                        arg_type = promoted;
-                    }
-                }
-
-                arg_types_vec.push(arg_type);
-                val
-            };
-            let passed = *arg_types_vec
-                .last()
-                .expect("every argument records its type");
-            let arg_val = self.pass_by_convention(arg_val, passed, conv);
-            arg_vals.push(arg_val);
+            let (val, passed) = self.lower_call_arg(a, arg_idx, &sig);
+            arg_vals.push(val);
+            arg_types_vec.push(passed);
         }
 
         // Compute ABI classification for parameters and return value.
@@ -4259,46 +3738,25 @@ impl<'a> Linearizer<'a> {
             .map(|&t| abi.classify_param(t, self.types))
             .collect();
         let ret_class = abi.classify_return(typ, self.types);
-        let call_abi_info = Box::new(CallAbiInfo::with_conv(param_classes, ret_class, conv));
+        let facts = CallFacts {
+            variadic_arg_start: sig.variadic_arg_start,
+            ends_with_va_arg_pack,
+            is_noreturn: sig.is_noreturn,
+            binding,
+            known,
+            abi_info: Box::new(CallAbiInfo::with_conv(param_classes, ret_class, conv)),
+        };
 
         if returns_large_struct {
-            // For large struct returns, the return value is the address
-            // stored in result_sym (which is a local symbol containing the struct)
+            // For large struct returns, the call's value is the address of
+            // the local the callee wrote, and the pointer is 64 bits wide.
             let result = self.alloc_reg_pseudo();
             let ptr_typ = self.types.pointer_to(typ);
-            let mut call_insn = if let Some(func_addr) = indirect_target {
-                // Indirect call through function pointer
-                Instruction::call_indirect(
-                    Some(result),
-                    func_addr,
-                    arg_vals,
-                    arg_types_vec,
-                    ptr_typ,
-                    64, // pointers are 64-bit
-                )
-            } else {
-                // Direct call
-                Instruction::call(
-                    Some(result),
-                    &func_name,
-                    arg_vals,
-                    arg_types_vec,
-                    ptr_typ,
-                    64, // pointers are 64-bit
-                )
+            let call_args = CallArgs {
+                vals: arg_vals,
+                types: arg_types_vec,
             };
-            call_insn.extra_mut().variadic_arg_start = variadic_arg_start;
-            call_insn.extra_mut().ends_with_va_arg_pack = ends_with_va_arg_pack;
-            call_insn.extra_mut().is_noreturn_call = is_noreturn_call;
-            call_insn.extra_mut().callee_binding = binding;
-            call_insn.extra_mut().known = known;
-            call_insn.extra_mut().abi_info = Some(call_abi_info);
-            self.emit(call_insn);
-            if is_noreturn_call {
-                self.emit_no_return(
-                    Instruction::new(Opcode::Unreachable).with_type(self.types.void_id),
-                );
-            }
+            self.build_call(target, call_args, result, (ptr_typ, 64), facts);
             // A scalar returned through the pointer is read back as the
             // call's value; anything else is used by address, as stored.
             if self.types.is_scalar(typ) && !self.types.is_complex(typ) {
@@ -4307,44 +3765,371 @@ impl<'a> Linearizer<'a> {
                 self.emit(Instruction::load(val, result_sym, 0, typ, size));
                 return val;
             }
-            // Return the symbol (address) where struct is stored
-            result_sym
         } else {
             let ret_size = self.types.size_bits(typ);
-            let mut call_insn = if let Some(func_addr) = indirect_target {
-                // Indirect call through function pointer
-                Instruction::call_indirect(
-                    Some(result_sym),
-                    func_addr,
-                    arg_vals,
-                    arg_types_vec,
-                    typ,
-                    ret_size,
-                )
-            } else {
-                // Direct call
-                Instruction::call(
-                    Some(result_sym),
-                    &func_name,
-                    arg_vals,
-                    arg_types_vec,
-                    typ,
-                    ret_size,
-                )
+            let call_args = CallArgs {
+                vals: arg_vals,
+                types: arg_types_vec,
             };
-            call_insn.extra_mut().variadic_arg_start = variadic_arg_start;
-            call_insn.extra_mut().ends_with_va_arg_pack = ends_with_va_arg_pack;
-            call_insn.extra_mut().is_noreturn_call = is_noreturn_call;
-            call_insn.extra_mut().callee_binding = binding;
-            call_insn.extra_mut().known = known;
-            call_insn.extra_mut().abi_info = Some(call_abi_info);
-            self.emit(call_insn);
-            if is_noreturn_call {
-                self.emit_no_return(
-                    Instruction::new(Opcode::Unreachable).with_type(self.types.void_id),
-                );
+            self.build_call(target, call_args, result_sym, (typ, ret_size), facts);
+        }
+        result_sym
+    }
+
+    /// What a call calls: the named function, or the function pointer the
+    /// callee expression evaluates to. Emits that evaluation, so it runs
+    /// before the arguments are lowered.
+    fn lower_callee(&mut self, func_expr: &Expr) -> CallTarget {
+        // Determine if this is a direct or indirect call.
+        // We need to check the TYPE of the function expression:
+        // - If it's TypeKind::Function, it's a direct call to a function
+        // - If it's TypeKind::Pointer to Function, it's an indirect call through function pointer
+        let is_function_pointer = func_expr.typ.is_some_and(|t| {
+            let typ = self.types.get(t);
+            typ.kind == TypeKind::Pointer
+        });
+
+        match &func_expr.kind {
+            ExprKind::Ident(symbol_id) if !is_function_pointer => {
+                // Direct call to named function (not a function pointer variable)
+                CallTarget::Direct(self.symbol_name(*symbol_id))
             }
-            result_sym
+            ExprKind::Unary {
+                op: UnaryOp::Deref,
+                operand,
+            } => {
+                // Explicit dereference form: (*fp)(args) or (*fpp)(args)
+                // Check the type of the operand to determine behavior:
+                // - If operand is function pointer (*fn): call through operand value
+                // - If operand is pointer-to-function-pointer (**fn): dereference first
+                let operand_type = self.expr_type(operand);
+                let operand_kind = self.types.kind(operand_type);
+                if operand_kind == TypeKind::Pointer {
+                    // Check what it points to
+                    let base_type = self.types.base_type(operand_type);
+                    let base_kind = base_type.map(|t| self.types.kind(t));
+                    if base_kind == Some(TypeKind::Function) {
+                        // Operand is function pointer - use its value directly
+                        CallTarget::Indirect(self.linearize_expr(operand))
+                    } else {
+                        // Operand is pointer-to-pointer - dereference to get function pointer
+                        CallTarget::Indirect(self.linearize_expr(func_expr))
+                    }
+                } else {
+                    // Unknown case - try to linearize the full expression
+                    CallTarget::Indirect(self.linearize_expr(func_expr))
+                }
+            }
+            _ => {
+                // Indirect call through function pointer variable: fp(args)
+                // This includes identifiers that are function pointer variables
+                CallTarget::Indirect(self.linearize_expr(func_expr))
+            }
+        }
+    }
+
+    /// What the callee expression's type says about the call: see
+    /// [`CalleeSignature`].
+    fn callee_signature(&self, func_expr: &Expr) -> CalleeSignature {
+        // The callee's convention classifies everything below: its return,
+        // which arguments it takes by reference, and the registers.
+        let conv = func_expr
+            .typ
+            .map_or(CallingConv::C, |t| CallingConv::of_callee(t, self.types));
+
+        // C17 6.5.2.2p1 lets the function designator be a function *or* a
+        // pointer to one, and everything the call needs to know lives on the
+        // function type either way. Reading it off the pointer found nothing:
+        // a call through a pointer converted no argument to its parameter,
+        //
+        //   void f(double); void (*p)(double) = f; p(1);
+        //
+        // passing the integer 1 where the callee read a `double`, and a call
+        // through a pointer to a variadic function was no variadic call, so
+        // its trailing arguments took no default argument promotions.
+        let callee = func_expr
+            .typ
+            .and_then(|t| self.types.callee_function_type(t))
+            .map(|f| self.types.get(f));
+        // The parameter types, for the conversions to them: transparent for
+        // a call the ABI carries out, but an inlined callee reads the
+        // argument pseudo as it is.
+        let params = callee.and_then(|ft| ft.params.clone());
+        // A call through a function type with no prototype: C17 6.5.2.2p6
+        // gives every argument the default argument promotions, as it does
+        // a variadic one, and an identifier-list definition receives them so
+        // (see `ParamStyle`). Passing a `float` as a float had a gcc-compiled
+        // K&R callee read a double out of a register that held a single, and
+        // a `char` took Apple arm64's one-byte stack slot where the callee
+        // reads an `int`.
+        let unprototyped = callee.is_some_and(|ft| ft.params.is_none());
+        // The variadic arguments start after the fixed parameters.
+        let variadic_arg_start = callee
+            .filter(|ft| ft.variadic)
+            .and_then(|ft| ft.params.as_ref().map(|p| p.len()));
+        let is_noreturn = callee.is_some_and(|ft| ft.noreturn);
+
+        CalleeSignature {
+            conv,
+            params,
+            unprototyped,
+            variadic_arg_start,
+            is_noreturn,
+        }
+    }
+
+    /// Lower the call argument `a`, the `arg_idx`-th, to the value the call
+    /// passes and the type the ABI classifies it by.
+    ///
+    /// For large structs, pass by reference (address) instead of by value.
+    /// For complex types, pass address so codegen can load real/imag into XMM
+    /// registers. For arrays (including VLAs), decay to pointer.
+    fn lower_call_arg(
+        &mut self,
+        a: &Expr,
+        arg_idx: usize,
+        sig: &CalleeSignature,
+    ) -> (PseudoId, TypeId) {
+        let conv = sig.conv;
+        let arg_type = self.expr_type(a);
+        let arg_kind = self.types.kind(arg_type);
+        let param = sig
+            .params
+            .as_ref()
+            .and_then(|params| params.get(arg_idx).copied());
+        let (arg_val, passed) = if (arg_kind == TypeKind::Struct || arg_kind == TypeKind::Union)
+            && (self.types.size_bits(arg_type) > 64 || self.passed_by_reference(arg_type, conv))
+        {
+            self.lower_struct_arg(a, arg_type, conv)
+        } else if let Some(pt) =
+            param.filter(|pt| self.types.is_complex(arg_type) || self.types.is_complex(*pt))
+        {
+            // A complex argument or a complex parameter: C17 6.5.2.2p7
+            // converts the argument as if by assignment, and a complex value
+            // -- here or in the callee -- travels by address, which the
+            // backend loads into registers. Converted to the parameter's
+            // precision too: a complex value is read with its base type's
+            // stride, so a `float _Complex` handed unconverted to a
+            // `double _Complex` parameter arrived as `2+1i` for `1+2i`. The
+            // type recorded for the ABI moves with it, or the classification
+            // is made for a width that is no longer there.
+            (self.linearize_converted(a, pt), pt)
+        } else if self.types.is_complex(arg_type) {
+            // No prototype, or a variadic argument: nothing says what
+            // precision the callee wants, so it travels as written.
+            (self.complex_operand_addr(a), arg_type)
+        } else if arg_kind == TypeKind::Array {
+            // Array decay to pointer (C99 6.3.2.1)
+            // This applies to both fixed-size arrays and VLAs
+            self.lower_decaying_arg(a, arg_type, param)
+        } else if arg_kind == TypeKind::VaList && !self.types.va_list_is_pointer() {
+            // va_list decay to pointer (C99 7.15.1)
+            // va_list is defined as __va_list_tag[1] (an array), so it decays to
+            // a pointer when passed to a function taking va_list parameter.
+            // Where va_list is already a pointer there is nothing to decay, and
+            // the ordinary scalar path below passes it by value.
+            let passed = self.types.pointer_to(arg_type);
+            (self.linearize_lvalue(a), passed)
+        } else if arg_kind == TypeKind::Function {
+            // Function decay to pointer (C99 6.3.2.1)
+            // Function names passed as arguments decay to function pointers
+            self.lower_decaying_arg(a, arg_type, param)
+        } else {
+            self.lower_scalar_arg(a, arg_idx, arg_type, param, sig)
+        };
+        (self.pass_by_convention(arg_val, passed, conv), passed)
+    }
+
+    /// An array or function-designator argument: the pointer it decays to
+    /// (C17 6.3.2.1p3-4), converted to its parameter's type as if by
+    /// assignment when a prototype gives one (6.5.2.2p7).
+    ///
+    /// The conversion is not always the identity: a `_Bool` parameter
+    /// receives whether the address is null. Passing the decayed pointer as
+    /// it stood handed `take_bool(h)` the raw address, which the callee
+    /// read through its low byte -- zero for a function or array aligned to
+    /// 256, so `take_bool(arr)` was false.
+    fn lower_decaying_arg(
+        &mut self,
+        a: &Expr,
+        arg_type: TypeId,
+        param: Option<TypeId>,
+    ) -> (PseudoId, TypeId) {
+        match param {
+            Some(pt) => (self.linearize_converted(a, pt), pt),
+            None => (self.linearize_expr(a), self.types.decayed_value(arg_type)),
+        }
+    }
+
+    /// A struct or union argument wider than a register, or one the
+    /// convention passes by reference: its address, and the type the ABI
+    /// classifies it by.
+    fn lower_struct_arg(
+        &mut self,
+        a: &Expr,
+        arg_type: TypeId,
+        conv: CallingConv,
+    ) -> (PseudoId, TypeId) {
+        let size_bits = self.types.size_bits(arg_type);
+        let abi = get_abi_for_conv(conv, self.target);
+        let class = abi.classify_param(arg_type, self.types);
+        let passed = if size_bits > 128 {
+            // Large struct (> 16 bytes): keep struct type so ABI classifies as
+            // Indirect/MEMORY. The pseudo is the struct's address: System V
+            // copies its bytes to the stack there, and AAPCS64 is handed a
+            // copy of it below.
+            arg_type
+        } else if class.is_register_aggregate()
+            // MEMORY class means the bytes go on the stack by value,
+            // exactly as an over-sixteen-byte struct already does.
+            // Reachable at this size only when an eightbyte holds a
+            // `long double`, directly or merged with something else;
+            // passing a pointer instead disagreed with gcc silently.
+            || matches!(class, crate::abi::ArgClass::Indirect { .. })
+        {
+            // Medium struct (9-16 bytes) that travels in registers or in
+            // memory: keep the struct type, as the ABI decides from it. The
+            // pseudo still carries the address; it is the backend that loads
+            // the registers out of it.
+            arg_type
+        } else {
+            // Integer or mixed struct: pass as pointer (existing behavior)
+            self.types.pointer_to(arg_type)
+        };
+        // A struct argument travels by address. `linearize_lvalue`
+        // materializes an rvalue -- a call returning a struct -- and
+        // hands back the temporary's address, so both cases are the
+        // same call.
+        let addr = self.linearize_lvalue(a);
+        let val = if self.passed_by_reference(arg_type, conv) {
+            let vol = self.block_volatility(arg_type, self.expr_type(a));
+            self.argument_copy(addr, arg_type, true, vol)
+        } else {
+            addr
+        };
+        (val, passed)
+    }
+
+    /// A scalar argument, converted to its parameter's type `param` when
+    /// there is one, and given the default argument promotions where no
+    /// prototype covers it.
+    fn lower_scalar_arg(
+        &mut self,
+        a: &Expr,
+        arg_idx: usize,
+        mut arg_type: TypeId,
+        param: Option<TypeId>,
+        sig: &CalleeSignature,
+    ) -> (PseudoId, TypeId) {
+        let mut val = self.linearize_expr(a);
+
+        // Implicit argument conversion when actual type differs from
+        // formal parameter type. Covers:
+        // - Integer widening: int→long (sign/zero extend)
+        // - FP widening/narrowing: float↔double↔long double
+        // - Int→FP: uint32_t→double (e.g., log10(uint32_t_val))
+        // - FP→Int: rare but legal
+        if let Some(param_type) = param {
+            let arg_size = self.types.size_bits(arg_type);
+            let param_size = self.types.size_bits(param_type);
+            let arg_is_int = self.types.is_integer(arg_type);
+            let param_is_int = self.types.is_integer(param_type);
+            let arg_is_fp = self.types.is_float(arg_type);
+            let param_is_fp = self.types.is_float(param_type);
+
+            let needs_convert =
+                // Integer widening (int→long, long→__int128, ...),
+                // decided by the two sizes alone: nothing about it
+                // stops at 64 bits.
+                (arg_is_int && param_is_int && arg_size < param_size)
+                // Integer narrowing (long→int, int→char, ...).
+                // The callee reads only the parameter's own bytes,
+                // but the ABI places the argument by the
+                // *parameter's* type: Apple arm64 stacks a `char`
+                // in one byte, so `f(..., 'a')` recorded as `int`
+                // took four and moved every later argument.
+                || (arg_is_int && param_is_int && arg_size > param_size)
+                // FP size mismatch (float→double, long double→double, etc.)
+                || (arg_is_fp && param_is_fp && arg_size != param_size)
+                // Integer to FP (uint32_t→double, int→float, etc.)
+                || (arg_is_int && param_is_fp)
+                // FP to integer (rare but legal)
+                || (arg_is_fp && param_is_int)
+                // To `_Bool`, whose conversion is `!= 0` and not
+                // a truncation (C17 6.3.1.2): `f(42)` with a
+                // `_Bool` parameter must pass 1.
+                || self.types.kind(param_type) == TypeKind::Bool;
+
+            if needs_convert {
+                val = self.emit_convert(val, arg_type, param_type);
+                arg_type = param_type;
+            }
+        }
+
+        // C99 6.5.2.2p7: default argument promotions for variadic args,
+        // and 6.5.2.2p6 for every argument of an unprototyped call.
+        //
+        // Both halves have to happen here. The formal-parameter
+        // conversion above only runs for an argument a parameter covers,
+        // and a variadic argument is by definition past them, so it never
+        // runs for these. The cast itself emits no IR either, because
+        // emit_convert short-circuits same-size integer conversions --
+        // without an explicit promotion the pseudo still holds the
+        // sign-extended load, and `printf("%02x", (unsigned char)c)`
+        // prints ffffff80 for a negative `signed char`.
+        if sig.unprototyped || sig.variadic_arg_start.is_some_and(|v| arg_idx >= v) {
+            let promoted = self.types.default_argument_promote(arg_type);
+            if promoted != arg_type {
+                val = self.emit_convert(val, arg_type, promoted);
+                arg_type = promoted;
+            }
+        }
+
+        (val, arg_type)
+    }
+
+    /// Emit the call instruction itself, and the `Unreachable` after a call
+    /// that does not return. `result` receives the value of type and width
+    /// `ret`.
+    fn build_call(
+        &mut self,
+        target: CallTarget,
+        args: CallArgs,
+        result: PseudoId,
+        ret: (TypeId, u32),
+        facts: CallFacts,
+    ) {
+        let (ret_typ, ret_size) = ret;
+        let mut call_insn = match target {
+            CallTarget::Indirect(func_addr) => Instruction::call_indirect(
+                Some(result),
+                func_addr,
+                args.vals,
+                args.types,
+                ret_typ,
+                ret_size,
+            ),
+            CallTarget::Direct(func_name) => Instruction::call(
+                Some(result),
+                &func_name,
+                args.vals,
+                args.types,
+                ret_typ,
+                ret_size,
+            ),
+        };
+        let extra = call_insn.extra_mut();
+        extra.variadic_arg_start = facts.variadic_arg_start;
+        extra.ends_with_va_arg_pack = facts.ends_with_va_arg_pack;
+        extra.is_noreturn_call = facts.is_noreturn;
+        extra.callee_binding = facts.binding;
+        extra.known = facts.known;
+        extra.abi_info = Some(facts.abi_info);
+        self.emit(call_insn);
+        if facts.is_noreturn {
+            self.emit_no_return(
+                Instruction::new(Opcode::Unreachable).with_type(self.types.void_id),
+            );
         }
     }
 
@@ -4360,14 +4145,10 @@ impl<'a> Linearizer<'a> {
         // resolved here and serves both the read and the store-back. Reading
         // from the expression and then re-deriving the address for the store
         // ran every subexpression twice: `b[i++]++` incremented `i` twice and
-        // updated the wrong element. `None` is a bare identifier, which has
-        // no subexpressions to re-run.
+        // updated the wrong element.
         let place = self.resolve_rmw_place(operand);
         let typ = self.expr_type(operand);
-        let val = match &place {
-            Some(p) => self.load_rmw_place(p, typ),
-            None => self.linearize_expr(operand),
-        };
+        let val = self.load_rmw_place(&place, typ);
         let is_float = self.types.is_float(typ);
         let is_ptr = self.types.kind(typ) == TypeKind::Pointer;
 
@@ -4427,51 +4208,12 @@ impl<'a> Linearizer<'a> {
             result
         };
 
-        // Store to local, update parameter mapping, or store through pointer
-        let store_size = self.types.size_bits(typ);
-        if let Some(p) = &place {
-            // Through the address the read came from. The postfix forms hand
-            // back the value from *before* the update, which is already
-            // narrowed for a bit-field because `emit_bitfield_load` produced
-            // it -- so the store's answer is not needed here.
-            self.store_rmw_place(p, final_result, typ);
-            return old_val;
-        }
-        // Only a bare identifier reaches here: `resolve_rmw_place`
-        // answers `Some` for every other lvalue and the branch above
-        // stores through it. The arms that used to be here re-derived
-        // an address that had already been computed, which is exactly
-        // what ran the target a second time.
-        if let ExprKind::Ident(symbol_id) = &operand.kind {
-            let name_str = self.symbol_name(*symbol_id);
-            if let Some(local) = self.locals.get(symbol_id).cloned() {
-                // Check if this is a static local (sentinel value)
-                if local.sym.0 == u32::MAX {
-                    self.emit_static_local_store(&name_str, final_result, typ, store_size);
-                } else {
-                    // Regular local variable
-                    self.emit(Instruction::store(
-                        final_result,
-                        local.sym,
-                        0,
-                        typ,
-                        store_size,
-                    ));
-                }
-            } else if self.var_map.contains_key(&name_str) {
-                self.var_map.insert(name_str.clone(), final_result);
-            } else {
-                // Global variable - emit store
-                let sym_id = self.alloc_pseudo();
-                let pseudo = Pseudo::sym(sym_id, name_str.clone());
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(pseudo);
-                }
-                self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
-            }
-        }
-
-        old_val // Return old value
+        // Through the address the read came from. The postfix forms hand back
+        // the value from *before* the update, which is already narrowed for a
+        // bit-field because `emit_bitfield_load` produced it -- so the store's
+        // answer is not needed here.
+        self.store_rmw_place(&place, final_result, typ);
+        old_val
     }
 
     /// Linearize a binary expression (arithmetic, comparison, logical operators)
@@ -4516,11 +4258,10 @@ impl<'a> Linearizer<'a> {
         let right_typ = self.expr_type(right);
         let result_typ = self.expr_type(expr);
 
-        // Check for pointer arithmetic: ptr +/- int or int + ptr
-        let left_kind = self.types.kind(left_typ);
-        let right_kind = self.types.kind(right_typ);
-        let left_is_ptr_or_arr = left_kind == TypeKind::Pointer || left_kind == TypeKind::Array;
-        let right_is_ptr_or_arr = right_kind == TypeKind::Pointer || right_kind == TypeKind::Array;
+        // Check for pointer arithmetic: ptr +/- int or int + ptr. An array or
+        // a function designator is a pointer here, as it decays to one.
+        let left_is_ptr_or_arr = self.types.arithmetic_pointee(left_typ).is_some();
+        let right_is_ptr_or_arr = self.types.arithmetic_pointee(right_typ).is_some();
         let is_ptr_arith = (op == BinaryOp::Add || op == BinaryOp::Sub)
             && ((left_is_ptr_or_arr && self.types.is_integer(right_typ))
                 || (self.types.is_integer(left_typ) && right_is_ptr_or_arr));
@@ -4612,31 +4353,15 @@ impl<'a> Linearizer<'a> {
             // false for a complex type, so it emitted an integer compare over
             // a 128-bit operand and answered from the real half alone.
             let common = self.types.common_type(left_typ, right_typ);
-            let left_addr = if self.types.is_complex(left_typ) {
-                self.complex_operand_at_precision(left, common)
-            } else {
-                self.promote_real_to_complex(left, common)
-            };
-            let right_addr = if self.types.is_complex(right_typ) {
-                self.complex_operand_at_precision(right, common)
-            } else {
-                self.promote_real_to_complex(right, common)
-            };
+            let left_addr = self.linearize_converted(left, common);
+            let right_addr = self.linearize_converted(right, common);
             self.emit_complex_equality(op, left_addr, right_addr, common)
         } else if self.types.is_complex(result_typ) {
             // Complex arithmetic: expand to real/imaginary operations
             // For complex types, we need addresses to load real/imag parts
             // If an operand is not complex (e.g., real scalar), promote it
-            let left_addr = if self.types.is_complex(left_typ) {
-                self.complex_operand_at_precision(left, result_typ)
-            } else {
-                self.promote_real_to_complex(left, result_typ)
-            };
-            let right_addr = if self.types.is_complex(right_typ) {
-                self.complex_operand_at_precision(right, result_typ)
-            } else {
-                self.promote_real_to_complex(right, result_typ)
-            };
+            let left_addr = self.linearize_converted(left, result_typ);
+            let right_addr = self.linearize_converted(right, result_typ);
             self.emit_complex_binary(op, left_addr, right_addr, result_typ)
         } else {
             // For comparisons, compute common type for both operands
@@ -4821,26 +4546,27 @@ impl<'a> Linearizer<'a> {
     /// the call's value.
     fn emit_memory_fn(&mut self, mem: MemoryFn, args: [PseudoId; 3]) -> PseudoId {
         let [a, b, n] = args;
-        let (op, callee, dest, second) = match mem {
-            MemoryFn::Copy | MemoryFn::CopyToEnd => (Opcode::Memcpy, "memcpy", a, b),
-            MemoryFn::Set => (Opcode::Memset, "memset", a, b),
-            MemoryFn::Move => (Opcode::Memmove, "memmove", a, b),
-            MemoryFn::MoveSourceFirst => (Opcode::Memmove, "memmove", b, a),
+        let (op, dest, second) = match mem {
+            MemoryFn::Copy | MemoryFn::CopyToEnd => (BlockOp::Copy, a, b),
+            MemoryFn::Set => (BlockOp::Set, a, b),
+            MemoryFn::Move => (BlockOp::Move, a, b),
+            MemoryFn::MoveSourceFirst => (BlockOp::Move, b, a),
         };
         let ptr = self.types.void_ptr_id;
+        let ptr_bits = self.types.size_bits(ptr);
         let result = self.alloc_pseudo();
-        let callee = self.library_function_name(callee);
+        let callee = self.library_function_name(op.c_name());
         self.emit(
-            Instruction::new(op)
+            Instruction::new(op.opcode())
                 .with_func(callee)
                 .with_target(result)
                 .with_src3(dest, second, n)
-                .with_type_and_size(ptr, 64),
+                .with_type_and_size(ptr, ptr_bits),
         );
         match mem {
             MemoryFn::CopyToEnd => {
                 let end = self.alloc_pseudo();
-                self.emit(Instruction::binop(Opcode::Add, end, dest, n, ptr, 64));
+                self.emit(Instruction::binop(Opcode::Add, end, dest, n, ptr, ptr_bits));
                 end
             }
             // `bcopy` answers nothing: its `void` value is never read.
@@ -4894,14 +4620,10 @@ impl<'a> Linearizer<'a> {
             // store-back. This used to pre-compute the address for a `Deref`
             // target only -- the one shape someone had hit -- and every other
             // side-effecting target still ran twice: `++c[j++]` incremented
-            // `j` twice and updated the wrong element. `None` is a bare
-            // identifier, which has no subexpressions to re-run.
+            // `j` twice and updated the wrong element.
             let place = self.resolve_rmw_place(operand);
             let typ = self.expr_type(operand);
-            let val = match &place {
-                Some(p) => self.load_rmw_place(p, typ),
-                None => self.linearize_expr(operand),
-            };
+            let val = self.load_rmw_place(&place, typ);
             let is_float = self.types.is_float(typ);
             let is_ptr = self.types.kind(typ) == TypeKind::Pointer;
 
@@ -4937,63 +4659,18 @@ impl<'a> Linearizer<'a> {
                 result
             };
 
-            // Store back to the lvalue
-            let store_size = self.types.size_bits(typ);
-            if let Some(p) = &place {
-                // Through the address the read came from.
-                let narrowed = self.store_rmw_place(p, final_result, typ);
-                // `++x.f` is `x.f += 1`, whose value is what the field now
-                // holds (C17 6.5.16.1p2) -- so `signed int f : 3` at 3 gives
-                // -4, not 4.
-                return match narrowed {
-                    Some((bit_width, field_typ)) => {
-                        self.narrow_to_bitfield(final_result, bit_width, field_typ)
-                    }
-                    None => final_result,
-                };
-            }
-            // Only a bare identifier reaches here: `resolve_rmw_place`
-            // answers `Some` for every other lvalue and the branch above
-            // stores through it. The arms that used to be here re-derived
-            // an address that had already been computed, which is exactly
-            // what ran the target a second time.
-            if let ExprKind::Ident(symbol_id) = &operand.kind {
-                let name_str = self.symbol_name(*symbol_id);
-                if let Some(local) = self.locals.get(symbol_id).cloned() {
-                    // Check if this is a static local (sentinel value)
-                    if local.sym.0 == u32::MAX {
-                        self.emit_static_local_store(&name_str, final_result, typ, store_size);
-                    } else {
-                        // Regular local variable
-                        self.emit(Instruction::store(
-                            final_result,
-                            local.sym,
-                            0,
-                            typ,
-                            store_size,
-                        ));
-                    }
-                } else if self.var_map.contains_key(&name_str) {
-                    self.var_map.insert(name_str.clone(), final_result);
-                } else {
-                    // Global variable - emit store
-                    let sym_id = self.alloc_pseudo();
-                    let pseudo = Pseudo::sym(sym_id, name_str.clone());
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(pseudo);
-                    }
-                    self.emit(Instruction::store(final_result, sym_id, 0, typ, store_size));
+            // Store back through the address the read came from. `++x.f` is
+            // `x.f += 1`, whose value is what the field now holds (C17
+            // 6.5.16.1p2) -- so `signed int f : 3` at 3 gives -4, not 4. The
+            // postfix forms need no such care: they hand back the value
+            // loaded before the update, which `emit_bitfield_load` already
+            // narrowed.
+            return match self.store_rmw_place(&place, final_result, typ) {
+                Some((bit_width, field_typ)) => {
+                    self.narrow_to_bitfield(final_result, bit_width, field_typ)
                 }
-            }
-
-            // `++x.f` is `x.f += 1`, whose value is the value stored in the
-            // field (C17 6.5.16.1p2) -- so `signed int f : 3` at 3 gives -4,
-            // not 4. The postfix forms need no such care: they hand back the
-            // value loaded before the update, which `emit_bitfield_load`
-            // already narrowed.
-            // A bare identifier is never a bit-field, so there is nothing
-            // to reduce: the bit-field answer comes from `store_rmw_place`.
-            return final_result;
+                None => final_result,
+            };
         }
 
         // `!z` on a complex operand is `z == 0`, and a complex value is zero
@@ -5029,11 +4706,7 @@ impl<'a> Linearizer<'a> {
         let label = self.module.add_string(self.current_func_name.clone());
 
         // Create symbol pseudo for the string label
-        let sym_id = self.alloc_pseudo();
-        let sym_pseudo = Pseudo::sym(sym_id, label);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(sym_pseudo);
-        }
+        let sym_id = self.sym_pseudo(label);
 
         // Create result pseudo for the address
         let result = self.alloc_reg_pseudo();
@@ -5047,7 +4720,6 @@ impl<'a> Linearizer<'a> {
 
     pub(crate) fn linearize_ident(&mut self, expr: &Expr, symbol_id: SymbolId) -> PseudoId {
         let sym = self.symbols.get(symbol_id);
-        let name_str = self.symbol_name(symbol_id);
 
         // First check if it's an enum constant
         if sym.is_enum_constant() {
@@ -5061,146 +4733,75 @@ impl<'a> Linearizer<'a> {
 
         // Check if it's a local variable
         if let Some(local) = self.locals.get(&symbol_id).cloned() {
-            // Check if this is a static local (sentinel value)
-            if local.sym.0 == u32::MAX {
-                // Static local - look up the global name and treat as global
-                let key = format!("{}.{}", self.current_func_name, name_str);
-                if let Some(static_info) = self.static_locals.get(&key).cloned() {
-                    let sym_id = self.alloc_pseudo();
-                    let pseudo = Pseudo::sym(sym_id, static_info.global_name);
-                    if let Some(func) = &mut self.current_func {
-                        func.add_pseudo(pseudo);
-                    }
-                    let typ = static_info.typ;
-                    let type_kind = self.types.kind(typ);
-                    let size = self.types.size_bits(typ);
-                    // Arrays decay to pointers - get address, not value
-                    if type_kind == TypeKind::Array {
-                        let result = self.alloc_pseudo();
-                        let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
-                        let ptr_type = self.types.pointer_to(elem_type);
-                        self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
-                        return result;
-                    } else if type_kind == TypeKind::VaList {
-                        // va_list is defined as __va_list_tag[1] (an array type), so it decays to
-                        // a pointer when used in expressions (C99 6.3.2.1, 7.15.1)
-                        let result = self.alloc_pseudo();
-                        let ptr_type = self.types.pointer_to(typ);
-                        self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
-                        return result;
-                    } else if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union)
-                        && size > 64
-                    {
-                        // Large structs can't be loaded into registers - return address
-                        let result = self.alloc_pseudo();
-                        let ptr_type = self.types.pointer_to(typ);
-                        self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
-                        return result;
-                    } else {
-                        let result = self.alloc_pseudo();
-                        self.emit(Instruction::load(result, sym_id, 0, typ, size));
-                        return result;
-                    }
-                } else {
-                    unreachable!("static local sentinel without static_locals entry");
-                }
-            }
-            let result = self.alloc_reg_pseudo();
-            let type_kind = self.types.kind(local.typ);
-            let size = self.types.size_bits(local.typ);
-            // Arrays decay to pointers - get address, not value
-            if type_kind == TypeKind::Array {
-                let elem_type = self.types.base_type(local.typ).unwrap_or(self.types.int_id);
-                let ptr_type = self.types.pointer_to(elem_type);
-                self.emit(Instruction::sym_addr(result, local.sym, ptr_type));
-            } else if type_kind == TypeKind::VaList && !self.types.va_list_is_pointer() {
-                // va_list is defined as __va_list_tag[1] (an array type), so it decays to
-                // a pointer when used in expressions (C99 6.3.2.1, 7.15.1). A target
-                // whose va_list is itself a pointer falls through to the scalar load.
-                if let Storage::Indirect(ptr_type) = local.storage {
-                    // va_list parameter: local holds a pointer to the va_list struct
-                    // Load the pointer value (array decay already happened at call site)
+            let place = match local.binding {
+                // A `va_list` parameter where `va_list` is an array: the
+                // caller's argument decayed, so the slot holds a pointer to
+                // the caller's object (C17 7.16p3).
+                LocalBinding::Frame {
+                    sym,
+                    storage: Storage::Indirect(ptr_type),
+                } if self.types.kind(local.typ) == TypeKind::VaList
+                    && !self.types.va_list_is_pointer() =>
+                {
+                    let ptr = self.alloc_reg_pseudo();
                     let ptr_size = self.types.size_bits(ptr_type);
-                    self.emit(Instruction::load(result, local.sym, 0, ptr_type, ptr_size));
-                } else {
-                    // Regular va_list local: take address (normal array decay)
-                    let ptr_type = self.types.pointer_to(local.typ);
-                    self.emit(Instruction::sym_addr(result, local.sym, ptr_type));
+                    self.emit(Instruction::load(ptr, sym, 0, ptr_type, ptr_size));
+                    ObjectPlace::At(ptr, 0)
                 }
-            } else if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union) && size > 64 {
-                // Large structs can't be loaded into registers - return address
-                let ptr_type = self.types.pointer_to(local.typ);
-                self.emit(Instruction::sym_addr(result, local.sym, ptr_type));
-            } else {
-                self.emit(Instruction::load(result, local.sym, 0, local.typ, size));
-            }
-            result
-        }
-        // Check if it's a parameter (already SSA value)
-        else if let Some(&pseudo) = self.var_map.get(&name_str) {
-            pseudo
+                LocalBinding::Frame { sym, .. } => ObjectPlace::Sym(sym),
+                LocalBinding::Static { global } => ObjectPlace::Sym(self.sym_pseudo(global)),
+                LocalBinding::ExtentsOnly => {
+                    unreachable!("no identifier names a type name's extents")
+                }
+            };
+            self.read_object(place, local.typ)
         }
         // Global variable - create symbol reference and load
         else {
-            // C99 6.7.4p3: A non-static inline function cannot refer to
-            // a file-scope static variable
-            if self.current_func_is_inline_definition && self.file_scope_statics.contains(&name_str)
-            {
-                if let Some(pos) = self.current_pos {
-                    let msg = format!(
-                        "inline definition of '{}' cannot reference file-scope static variable '{}'",
-                        self.current_func_name, name_str
-                    );
-                    // gcc does not enforce this one, so real source contains
-                    // it -- ffmpeg's `dv_guess_qnos` reads a file-scope
-                    // `static const int` from an inline definition. It is
-                    // relaxed by `-fpermissive`, which is where c17 keeps the
-                    // constraints gcc lets through.
-                    crate::diag::permissive_error(pos, &msg);
-                }
-            }
-
-            let sym_id = self.alloc_pseudo();
-            let pseudo = Pseudo::sym(sym_id, name_str.clone());
-            if let Some(func) = &mut self.current_func {
-                func.add_pseudo(pseudo);
-            }
+            self.check_inline_static_reference(symbol_id);
+            let name_str = self.symbol_name(symbol_id);
+            let sym_id = self.sym_pseudo(name_str);
             let typ = self.expr_type(expr);
-            let type_kind = self.types.kind(typ);
-            let size = self.types.size_bits(typ);
-            // Arrays decay to pointers - get address, not value
-            if type_kind == TypeKind::Array {
-                let result = self.alloc_pseudo();
-                let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
-                let ptr_type = self.types.pointer_to(elem_type);
-                self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
-                result
-            }
-            // Functions decay to function pointers, va_list decays to pointer (C99 6.3.2.1, 7.15.1),
-            // and large structs can't be loaded into registers - for all cases, return the address
-            else if type_kind == TypeKind::Function
-                || (type_kind == TypeKind::VaList && !self.types.va_list_is_pointer())
-                || ((type_kind == TypeKind::Struct || type_kind == TypeKind::Union) && size > 64)
-            {
-                let result = self.alloc_pseudo();
-                let ptr_type = self.types.pointer_to(typ);
-                self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
-                result
-            } else {
-                let result = self.alloc_pseudo();
-                self.emit(Instruction::load(result, sym_id, 0, typ, size));
-                result
-            }
+            self.read_object(ObjectPlace::Sym(sym_id), typ)
+        }
+    }
+
+    /// The file-scope static that a reference to `symbol_id` in the current
+    /// function would break C99 6.7.4p3 by naming, if any: a non-static
+    /// inline definition cannot refer to one.
+    ///
+    /// Decided by what the identifier resolves to. A parameter or block-scope
+    /// object spelled like the static has a local binding and is the
+    /// function's own object, not the static.
+    pub(crate) fn inline_static_reference(&self, symbol_id: SymbolId) -> Option<String> {
+        if !self.current_func_is_inline_definition || self.locals.contains_key(&symbol_id) {
+            return None;
+        }
+        let name = self.symbol_name(symbol_id);
+        self.file_scope_statics.contains(&name).then_some(name)
+    }
+
+    /// Report a reference [`Self::inline_static_reference`] refuses.
+    pub(crate) fn check_inline_static_reference(&self, symbol_id: SymbolId) {
+        let Some(name) = self.inline_static_reference(symbol_id) else {
+            return;
+        };
+        if let Some(pos) = self.current_pos {
+            let msg = format!(
+                "inline definition of '{}' cannot reference file-scope static variable '{}'",
+                self.current_func_name, name
+            );
+            // gcc does not enforce this one, so real source contains it --
+            // ffmpeg's `dv_guess_qnos` reads a file-scope `static const int`
+            // from an inline definition. It is relaxed by `-fpermissive`,
+            // which is where c17 keeps the constraints gcc lets through.
+            crate::diag::permissive_error(pos, &msg);
         }
     }
 
     /// Emit a symbol address for a string/wide-string label.
     pub(crate) fn emit_string_sym(&mut self, expr: &Expr, label: String) -> PseudoId {
-        let sym_id = self.alloc_pseudo();
-        let sym_pseudo = Pseudo::sym(sym_id, label);
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(sym_pseudo);
-        }
+        let sym_id = self.sym_pseudo(label);
         let result = self.alloc_reg_pseudo();
         let typ = self.expr_type(expr);
         self.emit(Instruction::sym_addr(result, sym_id, typ));
@@ -5248,18 +4849,6 @@ impl<'a> Linearizer<'a> {
         }
     }
 
-    /// One arm of a complex conditional, as the address of a `result_typ` value.
-    ///
-    /// The arms need not be complex themselves: `c ? 1 : z` has an `int` arm,
-    /// and C17 6.5.15p5 converts it to the common type like any other operand.
-    fn complex_arm_addr(&mut self, arm: &Expr, result_typ: TypeId) -> PseudoId {
-        if self.types.is_complex(self.expr_type(arm)) {
-            self.complex_operand_at_precision(arm, result_typ)
-        } else {
-            self.promote_real_to_complex(arm, result_typ)
-        }
-    }
-
     /// `c ? a : b` where the result is complex, merged **by address**.
     ///
     /// A complex value is two floats wide, so every other site in the
@@ -5288,8 +4877,8 @@ impl<'a> Linearizer<'a> {
             cond_bool,
             ptr_typ,
             ptr_bits,
-            |lin| lin.complex_arm_addr(then_expr, result_typ),
-            |lin| lin.complex_arm_addr(else_expr, result_typ),
+            |lin| lin.linearize_converted(then_expr, result_typ),
+            |lin| lin.linearize_converted(else_expr, result_typ),
         )
     }
 
@@ -5440,7 +5029,7 @@ impl<'a> Linearizer<'a> {
                     lin.promote_real_value_to_complex(evaluated, cond_typ, result_typ)
                 }
             },
-            |lin| lin.complex_arm_addr(else_expr, result_typ),
+            |lin| lin.linearize_converted(else_expr, result_typ),
         )
     }
 
@@ -5448,12 +5037,7 @@ impl<'a> Linearizer<'a> {
     /// selected `taken`, converted to the conditional's own type.
     fn linearize_constant_arm(&mut self, expr: &Expr, taken: &Expr) -> PseudoId {
         let result_typ = self.expr_type(expr);
-        if self.types.is_complex(result_typ) {
-            return self.complex_arm_addr(taken, result_typ);
-        }
-        let value = self.linearize_expr(taken);
-        let taken_typ = self.expr_type(taken);
-        self.emit_convert(value, taken_typ, result_typ)
+        self.linearize_converted(taken, result_typ)
     }
 
     pub(crate) fn linearize_elvis(
@@ -5645,59 +5229,31 @@ impl<'a> Linearizer<'a> {
     pub(crate) fn linearize_compound_literal(&mut self, expr: &Expr) -> PseudoId {
         match &expr.kind {
             ExprKind::CompoundLiteral { typ, elements } => {
-                // Compound literals have automatic storage at block scope
-                // Create an anonymous local variable, similar to how local variables work
-
-                // Create a symbol pseudo for the compound literal (its address)
-                let sym_id = self.alloc_pseudo();
-                let unique_name = format!(".compound_literal.{}", sym_id.0);
-                let sym = Pseudo::sym(sym_id, unique_name.clone());
-                if let Some(func) = &mut self.current_func {
-                    func.add_pseudo(sym);
-                    // Register as local for proper stack allocation
-                    func.add_local(&unique_name, sym_id, *typ, self.current_bb, None);
-                }
-
-                // For compound literals with partial initialization, C99 6.7.8p21 requires
-                // zero-initialization of all subobjects not explicitly initialized.
-                // Zero the entire compound literal first, then initialize specific members.
-                let type_kind = self.types.kind(*typ);
-                if type_kind == TypeKind::Struct
-                    || type_kind == TypeKind::Union
-                    || type_kind == TypeKind::Array
-                {
-                    self.emit_aggregate_zero(sym_id, *typ);
-                }
-
-                // Initialize using existing init list machinery
-                self.linearize_init_list(sym_id, *typ, elements);
-
-                // For arrays: return pointer (array-to-pointer decay)
-                // For structs/scalars: load and return the value
-                let result = self.alloc_reg_pseudo();
-
-                let type_kind = self.types.kind(*typ);
-                let size = self.types.size_bits(*typ);
-                if type_kind == TypeKind::Array {
-                    // Array compound literal - decay to pointer to first element
-                    let elem_type = self.types.base_type(*typ).unwrap_or(self.types.int_id);
-                    let ptr_type = self.types.pointer_to(elem_type);
-                    self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
-                } else if (type_kind == TypeKind::Struct || type_kind == TypeKind::Union)
-                    && size > 64
-                {
-                    // Large struct/union compound literal - return address
-                    // Large structs can't be "loaded" into registers; assignment handles copying
-                    let ptr_type = self.types.pointer_to(*typ);
-                    self.emit(Instruction::sym_addr(result, sym_id, ptr_type));
-                } else {
-                    // Scalar or small struct compound literal - load the value
-                    self.emit(Instruction::load(result, sym_id, 0, *typ, size));
-                }
-                result
+                let sym_id = self.materialize_compound_literal(*typ, elements);
+                self.read_object(ObjectPlace::Sym(sym_id), *typ)
             }
             _ => unreachable!(),
         }
+    }
+
+    /// Create a compound literal's object and initialize it; its `Sym`.
+    ///
+    /// A compound literal at block scope has automatic storage, so it is an
+    /// anonymous frame local. C17 6.7.9p21 zero-initializes every subobject
+    /// the list does not name, so an aggregate is zeroed whole first and the
+    /// list then writes the members it names.
+    fn materialize_compound_literal(&mut self, typ: TypeId, elements: &[InitElement]) -> PseudoId {
+        let sym_id = self.alloc_pseudo();
+        let name = format!(".compound_literal.{}", sym_id.0);
+        self.named_local(sym_id, name, typ, self.current_bb, None);
+        if matches!(
+            self.types.kind(typ),
+            TypeKind::Struct | TypeKind::Union | TypeKind::Array
+        ) {
+            self.emit_aggregate_zero(sym_id, typ);
+        }
+        self.linearize_init_list(sym_id, typ, elements);
+        sym_id
     }
 
     pub(crate) fn linearize_va_op(&mut self, expr: &Expr) -> PseudoId {
@@ -5920,7 +5476,7 @@ impl<'a> Linearizer<'a> {
                 let insn = Instruction::new(Opcode::Alloca)
                     .with_target(result)
                     .with_src(size_val)
-                    .with_type_and_size(self.types.void_ptr_id, 64);
+                    .with_type_and_size(self.types.void_ptr_id, self.ptr_bits());
                 self.emit(insn);
                 result
             }
@@ -6553,10 +6109,7 @@ impl<'a> Linearizer<'a> {
         let Some(sym) = self.take_label_address(*name, expr.pos) else {
             return self.emit_const(0, self.types.void_ptr_id);
         };
-        let sym_pseudo = self.alloc_pseudo();
-        if let Some(func) = &mut self.current_func {
-            func.add_pseudo(Pseudo::sym(sym_pseudo, sym));
-        }
+        let sym_pseudo = self.sym_pseudo(sym);
         let dst = self.alloc_pseudo();
         let void_ptr = self.types.void_ptr_id;
         self.emit(Instruction::sym_addr(dst, sym_pseudo, void_ptr));
@@ -6961,6 +6514,14 @@ impl<'a> Linearizer<'a> {
                 // scope, `for (...) (void)({ int a[n]; ... });` allocated
                 // every time round and released nothing.
                 let scope = self.push_scope();
+                // A `case` or `default` label in here cannot belong to a
+                // `switch` outside: entering a statement expression by a
+                // switch jump is an error, already reported by
+                // `check_jumps_into_protected_scopes`, and the label was never
+                // collected for that switch. Hiding the enclosing switches
+                // keeps the lowering from placing it there anyway; a switch
+                // wholly inside the statement expression still pushes its own.
+                let enclosing_switches = std::mem::take(&mut self.switch_stack);
                 // Linearize all the statements first
                 for item in stmts {
                     match item {
@@ -6971,6 +6532,7 @@ impl<'a> Linearizer<'a> {
                 // The result is the value of the final expression, computed
                 // before the scope ends: it may read the VLA being released.
                 let value = self.linearize_expr(result);
+                self.switch_stack = enclosing_switches;
                 self.pop_scope(scope);
                 value
             }
@@ -7019,6 +6581,30 @@ pub fn linearize(
 #[cfg(test)]
 #[path = "test_linearize.rs"]
 pub(crate) mod test_linearize;
+#[cfg(test)]
+#[path = "test_linearize_asm.rs"]
+mod test_linearize_asm;
+#[cfg(test)]
+#[path = "test_linearize_assign.rs"]
+mod test_linearize_assign;
+#[cfg(test)]
+#[path = "test_linearize_builtin.rs"]
+mod test_linearize_builtin;
+#[cfg(test)]
+#[path = "test_linearize_call.rs"]
+mod test_linearize_call;
+#[cfg(test)]
+#[path = "test_linearize_cfg.rs"]
+mod test_linearize_cfg;
+#[cfg(test)]
+#[path = "test_linearize_expr.rs"]
+mod test_linearize_expr;
+#[cfg(test)]
+#[path = "test_linearize_init.rs"]
+mod test_linearize_init;
+#[cfg(test)]
+#[path = "test_linearize_memory.rs"]
+mod test_linearize_memory;
 #[cfg(test)]
 #[path = "test_linearize_win64.rs"]
 mod test_linearize_win64;

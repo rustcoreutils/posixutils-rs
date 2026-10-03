@@ -188,6 +188,83 @@ int main(void)
 }
 "#;
 
+/// A thread-local reached through a block-scope `extern` inside a function
+/// whose parameter has the same name. The parameter's address is taken, so it
+/// keeps a stack slot registered under the bare name `x`, and the global's
+/// `Sym` carries that name too: telling the two apart by name took the
+/// global for the parameter, so its access was never expanded. On aarch64
+/// the descriptor call then clobbered `p` and `y` behind the allocator's
+/// back, x86-64 fell back to Initial Exec inside a shared object, and at -O2
+/// the backend's own check rejected the function.
+const SHADOW_LIB: &str = r#"
+_Thread_local int x = 5;
+int get_x(void) { return x; }
+int set_shadowed(int x, int y)
+{
+    int *p = &x;
+    {
+        extern _Thread_local int x;
+        x = *p + y;
+    }
+    return *p + y;
+}
+int get_shadowed(int x, int y)
+{
+    int *p = &x;
+    *p += y;
+    {
+        extern _Thread_local int x;
+        return x + *p + y;
+    }
+}
+int *addr_shadowed(int x)
+{
+    int *p = &x;
+    *p = 0;
+    {
+        extern _Thread_local int x;
+        return &x;
+    }
+}
+"#;
+
+const SHADOW_MAIN: &str = r#"
+#include <pthread.h>
+int get_x(void);
+int set_shadowed(int, int);
+int get_shadowed(int, int);
+int *addr_shadowed(int);
+
+static void *worker(void *arg)
+{
+    (void)arg;
+    if (get_x() != 5) return (void *)1;
+    if (set_shadowed(20, 2) != 22) return (void *)2;
+    if (get_x() != 22) return (void *)3;
+    if (addr_shadowed(9) != addr_shadowed(8)) return (void *)4;
+    *addr_shadowed(1) = 30;
+    if (get_x() != 30) return (void *)5;
+    return 0;
+}
+
+int main(void)
+{
+    if (set_shadowed(7, 3) != 10) return 1;
+    if (get_x() != 10) return 2;
+    if (get_shadowed(1, 2) != 10 + 3 + 2) return 3;
+    *addr_shadowed(4) = 40;
+    if (get_x() != 40) return 4;
+    pthread_t t;
+    void *r;
+    if (pthread_create(&t, 0, worker, 0)) return 5;
+    pthread_join(t, &r);
+    if (r) return 10 + (int)(long)r;
+    /* The worker wrote its own copy, not this thread's. */
+    if (get_x() != 40) return 6;
+    return 0;
+}
+"#;
+
 /// c17's aarch64 assembly for a source, removed when dropped along with the
 /// source it was compiled from.
 struct Aarch64Asm {
@@ -252,7 +329,11 @@ fn tls_models_aarch64_executable() {
 /// loader.
 #[test]
 fn tls_models_aarch64_shared_library() {
-    for (lib_src, main_src) in [(LIB, LIB_MAIN), (PARAM_LIB, PARAM_MAIN)] {
+    for (lib_src, main_src) in [
+        (LIB, LIB_MAIN),
+        (PARAM_LIB, PARAM_MAIN),
+        (SHADOW_LIB, SHADOW_MAIN),
+    ] {
         run_aarch64_shared_library(lib_src, main_src);
     }
 }
@@ -284,6 +365,7 @@ fn run_aarch64_shared_library(lib_src: &str, main_src: &str) {
         let main = create_c_file("tls_lib_main", main_src);
         let exe = d.join("tls_main");
         let linked = Command::new("aarch64-linux-gnu-gcc")
+            .arg("-pthread")
             .arg(main.path())
             .arg("-L")
             .arg(d)
@@ -323,8 +405,8 @@ fn tls_models_x86_64_shared_library() {
         .tempdir()
         .expect("tempdir");
     let d = dir.path();
-    // `LIB` carries aarch64 inline assembly, so only the parameter program.
-    for (lib_src, main_src) in [(PARAM_LIB, PARAM_MAIN)] {
+    // `LIB` carries aarch64 inline assembly, so not that program.
+    for (lib_src, main_src) in [(PARAM_LIB, PARAM_MAIN), (SHADOW_LIB, SHADOW_MAIN)] {
         for opt in ["-O0", "-O2"] {
             let c = create_c_file("tls_lib_x86", lib_src);
             let s = d.join("lib.s");
@@ -352,6 +434,7 @@ fn tls_models_x86_64_shared_library() {
             let main = create_c_file("tls_lib_main_x86", main_src);
             let exe = d.join("tls_main_x86");
             let linked = Command::new("cc")
+                .arg("-pthread")
                 .arg(main.path())
                 .arg("-L")
                 .arg(d)
@@ -539,6 +622,60 @@ fn tls_macho_every_access_calls_the_getter() {
                     assert!(
                         !asm.contains(&plain),
                         "{triple} {opt}: {name} reached as plain data ({plain}):\n{asm}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// [`SHADOW_LIB`]'s thread-local, reached past a parameter of the same name,
+/// goes through its descriptor in every function under every call-based
+/// model. Missed, it was reached as plain data on Darwin -- a store wrote
+/// over the descriptor itself -- and by Initial Exec in x86-64 shared code.
+#[test]
+fn tls_shadowed_by_a_parameter_is_reached_through_its_descriptor() {
+    let funcs = ["set_shadowed", "get_shadowed", "addr_shadowed"];
+    for (triple, flags, call, plain) in [
+        (
+            "x86_64-unknown-linux-gnu",
+            &["-fPIC"][..],
+            "    leaq x@TLSDESC(%rip), %rax\n    call *x@TLSCALL(%rax)\n",
+            &["x@GOTTPOFF", "x@TPOFF", "x(%rip)", "x@GOTPCREL"][..],
+        ),
+        (
+            "aarch64-unknown-linux-gnu",
+            &["-fPIC"][..],
+            "    .tlsdesccall x\n",
+            &[":gottprel:x", ":tprel_", ":lo12:x", ":got:x"][..],
+        ),
+        (
+            DARWIN_AARCH64,
+            &[][..],
+            "    adrp x0, _x@TLVPPAGE\n    ldr x0, [x0, _x@TLVPPAGEOFF]\n    ldr x16, [x0]\n    blr x16\n",
+            &["_x@PAGE", "_x@GOTPAGE"][..],
+        ),
+        (
+            DARWIN_X86_64,
+            &[][..],
+            "    movq _x@TLVP(%rip), %rdi\n    call *(%rdi)\n",
+            &["_x(%rip)", "_x@GOTPCREL"][..],
+        ),
+    ] {
+        for opt in ["-O0", "-O2"] {
+            let mut opts = vec![opt];
+            opts.extend_from_slice(flags);
+            let asm = asm_for_with("tls_shadowed", triple, SHADOW_LIB, &opts);
+            for func in funcs {
+                let body = body_of(&asm, func);
+                assert!(
+                    body.contains(call),
+                    "{triple} {opt}: {func} does not reach x through its descriptor:\n{body}"
+                );
+                for p in plain {
+                    assert!(
+                        !body.contains(p),
+                        "{triple} {opt}: {func} reaches x as {p}:\n{body}"
                     );
                 }
             }

@@ -1238,7 +1238,7 @@ fn process_file(
     ir::tls::expand_dynamic_tls(
         &mut module,
         target.tls_access(shared_mode).is_call(),
-        types.void_ptr_id,
+        &types,
     );
 
     dump_ir(args, &module, &types, "post-tls");
@@ -1385,6 +1385,25 @@ enum LinkItem {
     RunPath(String),
 }
 
+/// How `-s` removes the symbol table from the linked executable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StripBy {
+    /// The linker does it: `-s` is passed through to GNU ld.
+    LinkerFlag,
+    /// `strip` runs on the output: Apple's ld64 accepts `-s` but ignores it
+    /// as obsolete, leaving every symbol in place.
+    StripTool,
+}
+
+impl StripBy {
+    fn for_os(os: Os) -> Self {
+        match os {
+            Os::MacOS => StripBy::StripTool,
+            Os::Linux | Os::FreeBSD => StripBy::LinkerFlag,
+        }
+    }
+}
+
 /// Link `link_line` into `exe_file`, preserving the order given.
 fn link_objects(
     link_line: &[LinkItem],
@@ -1473,7 +1492,8 @@ fn link_objects(
         link_cmd.arg("-Wl,-Bdynamic");
     }
 
-    if args.strip {
+    let strip = args.strip.then(|| StripBy::for_os(target.os));
+    if strip == Some(StripBy::LinkerFlag) {
         link_cmd.arg("-s");
     }
 
@@ -1483,6 +1503,11 @@ fn link_objects(
 
     if !link_cmd.status()?.success() {
         return Err(io::Error::other("linker failed"));
+    }
+
+    if strip == Some(StripBy::StripTool) && !Command::new("strip").arg(exe_file).status()?.success()
+    {
+        return Err(io::Error::other("strip failed"));
     }
 
     if args.verbose {
@@ -2505,6 +2530,15 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `-s` reaches GNU ld as a flag; on macOS, whose ld64 ignores it, the
+    /// output is run through `strip` instead.
+    #[test]
+    fn test_strip_by_os() {
+        assert_eq!(StripBy::for_os(Os::Linux), StripBy::LinkerFlag);
+        assert_eq!(StripBy::for_os(Os::FreeBSD), StripBy::LinkerFlag);
+        assert_eq!(StripBy::for_os(Os::MacOS), StripBy::StripTool);
+    }
 
     // Tests for is_object_file()
 

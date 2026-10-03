@@ -7,8 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 // IR-to-IR passes that lower high-level constructs to a form the code
-// generator accepts. Currently: phi elimination, which converts SSA phi
-// nodes to copy instructions.
+// generator accepts: `__builtin_constant_p` placeholders resolved to 0,
+// critical edges split, and SSA phi nodes converted to copy instructions.
 //
 
 use super::{BasicBlockId, Function, Instruction, Module, Opcode, PseudoKind};
@@ -53,15 +53,15 @@ pub fn eliminate_phi_nodes(func: &mut Function) {
                 Opcode::PhiSource => {
                     // PhiSource: target=phisrc_pseudo, src[0]=value,
                     //            phi_list[0]=(phi_bb, phi_target)
-                    if !insn.phi_list.is_empty() && !insn.src.is_empty() {
+                    if let (Some((_phi_bb, phi_target)), Some(&source)) =
+                        (insn.phi_source_dest(), insn.src.first())
+                    {
                         debug_assert_eq!(
                             insn.phi_list.len(),
                             1,
                             "PhiSource must have exactly one back-pointer"
                         );
-                        let (_phi_bb, phi_target) = insn.phi_list[0];
                         let phi_target = routed.get(&phi_target).copied().unwrap_or(phi_target);
-                        let source = insn.src[0];
 
                         // Skip copies from undef sources
                         let is_undef = func
@@ -329,6 +329,7 @@ fn resolve_constant_p(func: &mut Function) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::validate::{validate_function_at, Invariant, Stage};
     use crate::ir::{BasicBlock, Instruction, Opcode, Pseudo, PseudoId};
     use crate::target::Target;
     use crate::types::TypeTable;
@@ -349,10 +350,7 @@ mod tests {
         entry.children = vec![BasicBlockId(1)];
         entry.add_insn(Instruction::new(Opcode::Entry));
         // %1 = setval 0 (initial value)
-        let mut setval = Instruction::new(Opcode::SetVal);
-        setval.target = Some(PseudoId(1));
-        setval.size = 32;
-        entry.add_insn(setval);
+        entry.add_insn(Instruction::set_val(PseudoId(1), int_type, 32));
         // PhiSource: %5 = phisrc %1 (-> .L1:%3)
         let mut phisrc1 = Instruction::phi_source(phisrc1_id, PseudoId(1), int_type, 32);
         phisrc1.phi_list = vec![(BasicBlockId(1), PseudoId(3))];
@@ -774,14 +772,8 @@ mod tests {
         let mut entry = BasicBlock::new(BasicBlockId(0));
         entry.children = vec![BasicBlockId(1)];
         entry.add_insn(Instruction::new(Opcode::Entry));
-        let mut sv1 = Instruction::new(Opcode::SetVal);
-        sv1.target = Some(PseudoId(1));
-        sv1.size = 32;
-        entry.add_insn(sv1);
-        let mut sv2 = Instruction::new(Opcode::SetVal);
-        sv2.target = Some(PseudoId(2));
-        sv2.size = 32;
-        entry.add_insn(sv2);
+        entry.add_insn(Instruction::set_val(PseudoId(1), int_type, 32));
+        entry.add_insn(Instruction::set_val(PseudoId(2), int_type, 32));
         // PhiSource for phi_a (%3): src=%1
         let mut ps1 = Instruction::phi_source(phisrc1_id, PseudoId(1), int_type, 32);
         ps1.phi_list = vec![(BasicBlockId(1), PseudoId(3))];
@@ -893,13 +885,16 @@ mod tests {
         func.add_block(b0);
         func.entry = BasicBlockId(0);
 
-        assert!(crate::ir::validate::check_no_placeholders(&func).is_err());
+        let errors = validate_function_at(&func, Stage::Lowered).unwrap_err();
+        assert!(errors
+            .iter()
+            .all(|e| e.kind == Invariant::UnresolvedPlaceholder));
         lower_function(&mut func);
 
         let insn = &func.blocks[0].insns[1];
         assert_eq!(insn.op, Opcode::Copy);
         assert_eq!(func.const_val(insn.src[0]), Some(0));
-        assert!(crate::ir::validate::check_no_placeholders(&func).is_ok());
+        assert!(validate_function_at(&func, Stage::Lowered).is_ok());
     }
 
     /// The lost-copy shape: a loop whose header is also its own latch, with
@@ -918,6 +913,7 @@ mod tests {
         for i in 0..8 {
             f.add_pseudo(Pseudo::reg(PseudoId(i), i));
         }
+        f.next_pseudo = 8;
         let mut b0 = BasicBlock::new(BasicBlockId(0));
         b0.add_insn(Instruction::new(Opcode::Entry));
         let mut s0 = Instruction::phi_source(PseudoId(5), PseudoId(1), int, 32);
@@ -1003,6 +999,7 @@ mod tests {
         for i in 0..8 {
             f.add_pseudo(Pseudo::reg(PseudoId(i), i));
         }
+        f.next_pseudo = 8;
         // .L0 -> .L1 (label) directly, and to .L3 (dispatch); .L3 jumps to
         // .L1 or .L2 by address. .L1 merges a value from .L0 and from .L3.
         let mut b0 = BasicBlock::new(BasicBlockId(0));

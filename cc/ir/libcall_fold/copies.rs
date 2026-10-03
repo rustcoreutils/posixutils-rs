@@ -23,10 +23,11 @@
 //
 
 use super::{
-    callee_symbol, is_pointer, make_call, offset, Facts, FoldCtx, Folded, NewCall, Operand,
+    callee_symbol, is_pointer, make_call, offset, CallSite, Callee, FoldCtx, Folded, NewCall,
+    Operand, ValueFold,
 };
 use crate::ir::build::Builder;
-use crate::ir::memexpand::INLINE_LIMIT_BYTES;
+use crate::ir::memexpand::{BlockOp, INLINE_LIMIT_BYTES};
 use crate::ir::strdata::Len;
 use crate::ir::{Instruction, Opcode, PseudoId};
 use crate::parse::ast::LibFn;
@@ -66,22 +67,29 @@ pub(crate) enum Answer {
 }
 
 impl Write {
-    /// The library functions this calls, by their C names.
-    pub(super) fn calls(&self) -> &'static [&'static str] {
+    /// The library functions this calls: what `materialize` makes.
+    pub(super) fn calls(&self) -> &'static [Callee] {
+        const END: Callee = Callee::Known(FIND_END);
+        const COPY: Callee = Callee::Block(BlockOp::Copy);
+        const PAD: Callee = Callee::Block(BlockOp::Set);
+        const STRCPY: Callee = Callee::Known(LibFn::Strcpy);
         match self {
             Write::Copy {
                 to: Place::End(_), ..
-            } => &["strlen", "memcpy"],
-            Write::Copy { zeros: 0, .. } => &["memcpy"],
-            Write::Copy { .. } => &["memcpy", "memset"],
-            Write::Strcpy { .. } => &["strcpy"],
+            } => &[END, COPY],
+            Write::Copy { zeros: 0, .. } => &[COPY],
+            Write::Copy { .. } => &[COPY, PAD],
+            Write::Strcpy { .. } => &[STRCPY],
         }
     }
 }
 
+/// The function that finds where [`Place::End`] is.
+const FIND_END: LibFn = LibFn::Strlen;
+
 /// What the call `insn` to `f`, one of the functions that write a string,
 /// folds to.
-pub(super) fn fold(f: LibFn, insn: &Instruction, facts: &Facts) -> Option<Folded> {
+pub(super) fn fold(f: LibFn, insn: &Instruction, facts: &CallSite) -> Option<Folded> {
     // `sprintf` reads an argument's type below, and the two are indexed in
     // parallel; `stdio::fold` requires the same.
     if insn.src.len() != insn.extra().arg_types.len() {
@@ -102,7 +110,7 @@ pub(super) fn fold(f: LibFn, insn: &Instruction, facts: &Facts) -> Option<Folded
 }
 
 /// The length of the string `p` points at, when it is a constant.
-fn known_len(facts: &Facts, p: PseudoId) -> Option<u64> {
+fn known_len(facts: &CallSite, p: PseudoId) -> Option<u64> {
     match facts.strings.string_len(p)? {
         Len::Const(len) => Some(len),
         Len::MinusOffset { .. } => None,
@@ -122,7 +130,7 @@ fn copy_string(to: Place, src: PseudoId, len: u64, answer: Answer) -> Folded {
 }
 
 /// `stpcpy(d, s)` answers the terminator it wrote: `d` plus the length.
-fn stpcpy(facts: &Facts, insn: &Instruction, d: PseudoId, s: PseudoId) -> Option<Folded> {
+fn stpcpy(facts: &CallSite, insn: &Instruction, d: PseudoId, s: PseudoId) -> Option<Folded> {
     match known_len(facts, s) {
         Some(len) => Some(copy_string(
             Place::At(d),
@@ -136,7 +144,7 @@ fn stpcpy(facts: &Facts, insn: &Instruction, d: PseudoId, s: PseudoId) -> Option
 
 /// `strcpy(d, s)` in place of a call that copies the same bytes, when
 /// nothing reads what it answers.
-fn unused_strcpy(facts: &Facts, insn: &Instruction, d: PseudoId, s: PseudoId) -> Option<Folded> {
+fn unused_strcpy(facts: &CallSite, insn: &Instruction, d: PseudoId, s: PseudoId) -> Option<Folded> {
     facts
         .result_unused(insn)
         .then_some(Folded::Write(Write::Strcpy { dest: d, src: s }))
@@ -145,10 +153,10 @@ fn unused_strcpy(facts: &Facts, insn: &Instruction, d: PseudoId, s: PseudoId) ->
 /// `strncpy(d, s, n)` writes exactly `n` bytes: the string, cut short or
 /// padded out with zeros (C17 7.24.2.4p3). The padding is written only when
 /// all of it is short enough to be stores.
-fn strncpy(facts: &Facts, d: PseudoId, s: PseudoId, n: PseudoId) -> Option<Folded> {
-    let n = u64::try_from(facts.unsigned(n, 64)?).ok()?;
+fn strncpy(facts: &CallSite, d: PseudoId, s: PseudoId, n: PseudoId) -> Option<Folded> {
+    let n = u64::try_from(facts.size_t(n)?).ok()?;
     if n == 0 {
-        return Some(Folded::Offset(d, 0));
+        return Some(Folded::Value(ValueFold::Offset(d, 0)));
     }
     let len = known_len(facts, s)?;
     let copied = n.min(len + 1);
@@ -166,7 +174,7 @@ fn strncpy(facts: &Facts, d: PseudoId, s: PseudoId, n: PseudoId) -> Option<Folde
 }
 
 /// `strcat(d, s)`: `s` copied over the terminator of `d`, and `d` answered.
-fn strcat(facts: &Facts, d: PseudoId, s: PseudoId) -> Option<Folded> {
+fn strcat(facts: &CallSite, d: PseudoId, s: PseudoId) -> Option<Folded> {
     let len = known_len(facts, s)?;
     Some(append(d, s, len))
 }
@@ -175,7 +183,7 @@ fn strcat(facts: &Facts, d: PseudoId, s: PseudoId) -> Option<Folded> {
 /// `s`.
 fn append(d: PseudoId, s: PseudoId, len: u64) -> Folded {
     if len == 0 {
-        return Folded::Offset(d, 0);
+        return Folded::Value(ValueFold::Offset(d, 0));
     }
     copy_string(Place::End(d), s, len, Answer::Ptr(d, 0))
 }
@@ -183,10 +191,10 @@ fn append(d: PseudoId, s: PseudoId, len: u64) -> Folded {
 /// `strncat(d, s, n)` appends at most `n` characters and then a terminator
 /// (C17 7.24.3.2p2), so a bound of 0 or an empty `s` appends nothing, and a
 /// bound of at least the length is `strcat`.
-fn strncat(facts: &Facts, d: PseudoId, s: PseudoId, n: PseudoId) -> Option<Folded> {
-    let n = facts.unsigned(n, 64);
+fn strncat(facts: &CallSite, d: PseudoId, s: PseudoId, n: PseudoId) -> Option<Folded> {
+    let n = facts.size_t(n);
     if n == Some(0) {
-        return Some(Folded::Offset(d, 0));
+        return Some(Folded::Value(ValueFold::Offset(d, 0)));
     }
     let len = known_len(facts, s)?;
     (len == 0 || n.is_some_and(|n| n >= u128::from(len))).then(|| append(d, s, len))
@@ -195,7 +203,7 @@ fn strncat(facts: &Facts, d: PseudoId, s: PseudoId, n: PseudoId) -> Option<Folde
 /// `sprintf(d, fmt)` of a format with no conversion, and `sprintf(d, "%s",
 /// s)`: each writes a string and answers its length.
 fn sprintf(
-    facts: &Facts,
+    facts: &CallSite,
     insn: &Instruction,
     d: PseudoId,
     fmt: PseudoId,
@@ -229,14 +237,13 @@ pub(super) fn materialize(
     b: &mut Builder,
     ctx: &FoldCtx,
     write: Write,
-    result: Option<(PseudoId, TypeId, u32)>,
+    result: Option<(PseudoId, TypeId)>,
 ) {
     let char_ptr = b.types.char_ptr_id;
     let answer = match write {
         Write::Strcpy { dest, src } => {
             let call = NewCall {
                 func: LibFn::Strcpy,
-                name: "strcpy",
                 args: vec![
                     Operand::Value(dest, char_ptr),
                     Operand::Value(src, b.types.const_char_ptr_id),
@@ -253,24 +260,23 @@ pub(super) fn materialize(
             answer,
         } => {
             let at = place(b, ctx, to);
-            block(b, ctx, Opcode::Memcpy, at, src, n);
+            block(b, ctx, BlockOp::Copy, at, src, n);
             if zeros > 0 {
-                let end = offset(b, at, n as i64, char_ptr, 64);
-                let int = b.types.int_id;
-                let zero = b.constant(0, int, 32);
-                block(b, ctx, Opcode::Memset, end, zero, zeros);
+                let end = offset(b, at, n as i64, char_ptr);
+                let zero = b.constant(0, b.types.int_id);
+                block(b, ctx, BlockOp::Set, end, zero, zeros);
             }
             answer
         }
     };
-    let Some((target, typ, size)) = result else {
+    let Some((target, typ)) = result else {
         return;
     };
     let value = match answer {
-        Answer::Ptr(p, k) => offset(b, p, k, typ, size),
-        Answer::Int(v) => b.constant(v, typ, size),
+        Answer::Ptr(p, k) => offset(b, p, k, typ),
+        Answer::Int(v) => b.constant(v, typ),
     };
-    b.copy_into(target, value, typ, size);
+    b.copy_into(target, value, typ);
 }
 
 /// The address `to` names: for the end of a string, a call to `strlen`,
@@ -282,34 +288,28 @@ fn place(b: &mut Builder, ctx: &FoldCtx, to: Place) -> PseudoId {
             let ulong = b.types.ulong_id;
             let len = b.func.alloc_pseudo();
             let call = NewCall {
-                func: LibFn::Strlen,
-                name: "strlen",
+                func: FIND_END,
                 args: vec![Operand::Value(p, b.types.const_char_ptr_id)],
             };
             make_call(b, ctx, Some(len), ulong, call);
-            b.binop(Opcode::Add, p, len, b.types.char_ptr_id, 64)
+            b.binop(Opcode::Add, p, len, b.types.char_ptr_id)
         }
     }
 }
 
-/// `op` -- `Memcpy` or `Memset` -- of `n` bytes at `dest` from `second`, a
-/// call to the program's own name for the function.
-fn block(b: &mut Builder, ctx: &FoldCtx, op: Opcode, dest: PseudoId, second: PseudoId, n: u64) {
-    let ulong = b.types.ulong_id;
-    let n = b.constant(i128::from(n), ulong, 64);
-    let name = match op {
-        Opcode::Memcpy => "memcpy",
-        _ => "memset",
-    };
-    let callee = callee_symbol(ctx, name);
+/// `op` of `n` bytes at `dest` from `second`, a call to the program's own
+/// name for the function.
+fn block(b: &mut Builder, ctx: &FoldCtx, op: BlockOp, dest: PseudoId, second: PseudoId, n: u64) {
+    let n = b.constant(i128::from(n), b.types.ulong_id);
+    let callee = callee_symbol(ctx, Callee::Block(op));
     let void_ptr = b.types.void_ptr_id;
     let result = b.func.alloc_pseudo();
     b.push(
-        Instruction::new(op)
+        Instruction::new(op.opcode())
             .with_func(callee)
             .with_target(result)
             .with_src3(dest, second, n)
-            .with_type_and_size(void_ptr, 64),
+            .with_type_and_size(void_ptr, b.types.size_bits(void_ptr)),
     );
 }
 
@@ -350,6 +350,49 @@ mod tests {
             zeros,
             answer,
         }))
+    }
+
+    /// What `Write::calls` says each write calls is what its instructions
+    /// call, in order, so the checks made of those names before a fold --
+    /// is the function available, is it the one being compiled -- are of
+    /// the calls it makes.
+    #[test]
+    fn a_write_calls_what_it_says_it_calls() {
+        /// A call to fold, made in a fixture: what it calls, and of what.
+        type Case = fn(&mut Fixture) -> (LibFn, Vec<PseudoId>);
+        let cases: [Case; 4] = [
+            |fx| {
+                let lc = fx.literal("abc");
+                (LibFn::Strcpy, vec![fx.unknown(), fx.addr(&lc)])
+            },
+            |fx| {
+                let lc = fx.literal("ab");
+                let n = fx.konst(8);
+                (LibFn::Strncpy, vec![fx.unknown(), fx.addr(&lc), n])
+            },
+            |fx| {
+                let lc = fx.literal("abc");
+                (LibFn::Strcat, vec![fx.unknown(), fx.addr(&lc)])
+            },
+            |fx| (LibFn::Stpcpy, vec![fx.unknown(), fx.unknown()]),
+        ];
+        for case in cases {
+            let mut fx = Fixture::new();
+            let (f, args) = case(&mut fx);
+            let ptr = fx.types.char_ptr_id;
+            let Some(Folded::Write(write)) = fold1(&mut fx, f, &args, ptr) else {
+                panic!("{f:?} folds to a write");
+            };
+            let said: Vec<_> = write.calls().iter().map(|c| c.c_name()).collect();
+            let insns = run_on(&mut fx, &[]);
+            let made: Vec<_> = insns
+                .iter()
+                .filter(|i| matches!(i.op, Opcode::Call | Opcode::Memcpy | Opcode::Memset))
+                .filter_map(|i| i.extra().func_name.as_deref())
+                .filter(|&name| name != "callee")
+                .collect();
+            assert_eq!(made, said, "{f:?}");
+        }
     }
 
     /// A known length is a copy of it and the terminator; an unknown one
@@ -407,7 +450,7 @@ mod tests {
         let r = fx.call(LibFn::Stpcpy, "stpcpy", &[d, u], ptr);
         fx.op(Opcode::Add, r, d);
         let at = fx.func().blocks[0].insns.len() - 2;
-        assert!(folds(&fx).iter().all(|&(i, _)| i != at));
+        assert!(folds(&mut fx).iter().all(|&(i, _)| i != at));
     }
 
     /// `strncpy` copies at most the string and its terminator, pads with
@@ -430,7 +473,7 @@ mod tests {
         let ans = Answer::Ptr(d, 0);
         assert_eq!(
             fold1(&mut fx, LibFn::Strncpy, &[d, u, zero], ptr),
-            Some(Folded::Offset(d, 0))
+            Some(Folded::Value(ValueFold::Offset(d, 0)))
         );
         assert_eq!(
             fold1(&mut fx, LibFn::Strncpy, &[d, s, four], ptr),
@@ -458,7 +501,7 @@ mod tests {
         let (zero, two, three, big) = (fx.konst(0), fx.konst(2), fx.konst(3), fx.konst(100));
         let ptr = fx.types.char_ptr_id;
         let end = copy(Place::End(d), s, 4, 0, Answer::Ptr(d, 0));
-        let nothing = Some(Folded::Offset(d, 0));
+        let nothing = Some(Folded::Value(ValueFold::Offset(d, 0)));
         assert_eq!(fold1(&mut fx, LibFn::Strcat, &[d, s], ptr), end);
         assert_eq!(fold1(&mut fx, LibFn::Strcat, &[d, e], ptr), nothing);
         assert_eq!(fold1(&mut fx, LibFn::Strcat, &[d, u], ptr), None);
@@ -655,7 +698,7 @@ mod tests {
             let ptr = fx.types.char_ptr_id;
             let src = if f == LibFn::Strcat { s } else { u };
             fx.call(f, "callee", &[d, src], ptr);
-            assert!(folds(&fx).is_empty(), "{inside}");
+            assert!(folds(&mut fx).is_empty(), "{inside}");
         }
     }
 }

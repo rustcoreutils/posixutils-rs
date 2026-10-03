@@ -107,6 +107,35 @@ pub(crate) fn block_chunks(bytes: i64) -> impl Iterator<Item = (i64, Chunk)> {
     })
 }
 
+/// A copy of `bytes` bytes from `src` to `dst + dst_offset`, as a load and a
+/// store per [`block_chunks`] piece, in rising offset.
+///
+/// `typ` names the access type of each piece and `alloc` the temporary that
+/// carries it, so the copy needs no `TypeTable` and no function to build
+/// into: the inliner has neither, and the linearizer marks the accesses
+/// volatile and emits them itself. Each temporary is allocated in the order
+/// its piece is copied, the order a hand-written loop allocated them.
+///
+/// No bound: a caller copying something the program sized checks it against
+/// [`INLINE_LIMIT_BYTES`] first.
+pub(crate) fn chunk_copy(
+    src: PseudoId,
+    dst: PseudoId,
+    dst_offset: i64,
+    bytes: i64,
+    typ: impl Fn(Chunk) -> TypeId,
+    mut alloc: impl FnMut() -> PseudoId,
+) -> Vec<Instruction> {
+    let mut out = Vec::new();
+    for (at, chunk) in block_chunks(bytes) {
+        let (t, bits) = (typ(chunk), chunk.bits());
+        let v = alloc();
+        out.push(Instruction::load(v, src, at, t, bits));
+        out.push(Instruction::store(v, dst, dst_offset + at, t, bits));
+    }
+    out
+}
+
 /// How to read a whole object of `bytes` bytes into one register when
 /// `bytes` is not a natural access width -- 3, 5, 6 or 7, which is what a
 /// small composite gives.
@@ -136,7 +165,7 @@ pub(crate) fn overlapping_halves(bits: u32) -> Option<(i64, i64)> {
 
 /// The three block memory operations, and how far each is expanded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BlockOp {
+pub(crate) enum BlockOp {
     Copy,
     Set,
     Move,
@@ -152,6 +181,24 @@ impl BlockOp {
         }
     }
 
+    /// The IR operation that performs it.
+    pub(crate) fn opcode(self) -> Opcode {
+        match self {
+            BlockOp::Copy => Opcode::Memcpy,
+            BlockOp::Set => Opcode::Memset,
+            BlockOp::Move => Opcode::Memmove,
+        }
+    }
+
+    /// The library function it calls where it is not expanded.
+    pub(crate) fn c_name(self) -> &'static str {
+        match self {
+            BlockOp::Copy => "memcpy",
+            BlockOp::Set => "memset",
+            BlockOp::Move => "memmove",
+        }
+    }
+
     fn limit(self) -> i64 {
         match self {
             BlockOp::Copy | BlockOp::Set => INLINE_LIMIT_BYTES,
@@ -164,12 +211,13 @@ impl BlockOp {
 /// constant. Answers whether anything changed.
 pub fn run(func: &mut Function, types: &TypeTable) -> bool {
     let consts = ConstMap::new(func);
+    let size_t_bits = types.size_bits(types.ulong_id);
     let mut changed = false;
     for b in 0..func.blocks.len() {
         let insns = std::mem::take(&mut func.blocks[b].insns);
         let mut out = Vec::with_capacity(insns.len());
         for insn in insns {
-            match expandable(&insn, &consts) {
+            match expandable(&insn, &consts, size_t_bits) {
                 Some((op, n)) => {
                     Expander {
                         b: Builder::new(&mut *func, types, insn.pos, &mut out),
@@ -188,12 +236,12 @@ pub fn run(func: &mut Function, types: &TypeTable) -> bool {
 }
 
 /// The operation `insn` is and its length, when it is one to expand.
-fn expandable(insn: &Instruction, consts: &ConstMap) -> Option<(BlockOp, i64)> {
+fn expandable(insn: &Instruction, consts: &ConstMap, size_t_bits: u32) -> Option<(BlockOp, i64)> {
     let op = BlockOp::of(insn.op)?;
     let &[_, _, n] = insn.src.as_slice() else {
         return None;
     };
-    let n = i64::try_from(consts.get_at(n, 64, false)?).ok()?;
+    let n = i64::try_from(consts.get_at(n, size_t_bits, false)?).ok()?;
     (0..=op.limit()).contains(&n).then_some((op, n))
 }
 
@@ -210,9 +258,11 @@ impl Expander<'_> {
         let (dest, second) = (self.model.src[0], self.model.src[1]);
         match op {
             BlockOp::Copy => {
-                for (at, chunk) in block_chunks(n) {
-                    let v = self.load(second, at, chunk);
-                    self.store(v, dest, at, chunk);
+                let types = self.b.types;
+                let func = &mut *self.b.func;
+                for insn in chunk_copy(second, dest, 0, n, |c| c.typ(types), || func.alloc_pseudo())
+                {
+                    self.b.push(insn);
                 }
             }
             BlockOp::Move => {
@@ -234,18 +284,18 @@ impl Expander<'_> {
         // Each returns its destination.
         if let Some(target) = self.model.target {
             let typ = self.model.typ.unwrap_or(self.b.types.void_ptr_id);
-            self.b.copy_into(target, dest, typ, 64);
+            self.b.copy_into(target, dest, typ);
         }
     }
 
     fn load(&mut self, addr: PseudoId, at: i64, chunk: Chunk) -> PseudoId {
         let typ = chunk.typ(self.b.types);
-        self.b.load(addr, at, typ, chunk.bits())
+        self.b.load(addr, at, typ)
     }
 
     fn store(&mut self, v: PseudoId, addr: PseudoId, at: i64, chunk: Chunk) {
         let typ = chunk.typ(self.b.types);
-        self.b.store(v, addr, at, typ, chunk.bits());
+        self.b.store(v, addr, at, typ);
     }
 }
 
@@ -282,17 +332,12 @@ impl Fill {
         }
         let typ = chunk.typ(ex.types);
         let v = match self.byte {
-            Some(byte) => ex.constant(i128::from(byte) * BYTE_REPEAT, typ, chunk.bits()),
+            Some(byte) => ex.constant(i128::from(byte) * BYTE_REPEAT, typ),
             None => {
                 let word = self.word(ex);
                 match chunk {
                     Chunk::B8 => word,
-                    _ => ex.convert(
-                        Opcode::Trunc,
-                        word,
-                        (ex.types.ulong_id, 64),
-                        (typ, chunk.bits()),
-                    ),
+                    _ => ex.convert(Opcode::Trunc, word, ex.types.ulong_id, typ),
                 }
             }
         };
@@ -306,11 +351,11 @@ impl Fill {
             return w;
         }
         let (uint, ulong) = (ex.types.uint_id, ex.types.ulong_id);
-        let mask = ex.constant(0xff, uint, 32);
-        let byte = ex.binop(Opcode::And, self.c, mask, uint, 32);
-        let wide = ex.convert(Opcode::Zext, byte, (uint, 32), (ulong, 64));
-        let repeat = ex.constant(BYTE_REPEAT, ulong, 64);
-        let w = ex.binop(Opcode::Mul, wide, repeat, ulong, 64);
+        let mask = ex.constant(0xff, uint);
+        let byte = ex.binop(Opcode::And, self.c, mask, uint);
+        let wide = ex.convert(Opcode::Zext, byte, uint, ulong);
+        let repeat = ex.constant(BYTE_REPEAT, ulong);
+        let w = ex.binop(Opcode::Mul, wide, repeat, ulong);
         self.word = Some(w);
         w
     }
@@ -322,6 +367,65 @@ mod tests {
     use crate::ir::constfold::at_width;
     use crate::ir::{BasicBlock, BasicBlockId, Pseudo, PseudoKind};
     use crate::target::Target;
+
+    /// A chunked copy is a load and a store per piece, each through a
+    /// temporary of its own allocated in order, the store displaced by the
+    /// destination offset and both of the piece's width and type.
+    #[test]
+    fn chunk_copy_loads_and_stores_each_piece_in_order() {
+        let (src, dst) = (PseudoId(1), PseudoId(2));
+        let width_type = |c: Chunk| TypeId(c.bytes() as u32 + 100);
+        for n in 0..=24 {
+            let mut next = 50;
+            let insns = chunk_copy(src, dst, 1000, n, width_type, || {
+                next += 1;
+                PseudoId(next)
+            });
+            let pieces: Vec<(i64, Chunk)> = block_chunks(n).collect();
+            assert_eq!(insns.len(), 2 * pieces.len(), "{n} bytes");
+            for (k, ((at, chunk), pair)) in pieces.iter().zip(insns.chunks(2)).enumerate() {
+                let v = PseudoId(51 + k as u32);
+                let (typ, bits) = (Some(width_type(*chunk)), chunk.bits());
+                let (load, store) = (&pair[0], &pair[1]);
+                assert_eq!(
+                    (
+                        load.op,
+                        load.target,
+                        &load.src[..],
+                        load.offset,
+                        load.typ,
+                        load.size
+                    ),
+                    (Opcode::Load, Some(v), &[src][..], *at, typ, bits),
+                    "{n} bytes, piece {k}"
+                );
+                assert_eq!(
+                    (
+                        store.op,
+                        &store.src[..],
+                        store.offset,
+                        store.typ,
+                        store.size
+                    ),
+                    (Opcode::Store, &[dst, v][..], 1000 + at, typ, bits),
+                    "{n} bytes, piece {k}"
+                );
+            }
+            assert_eq!(next, 50 + pieces.len() as u32, "one temporary per piece");
+        }
+        let widths = |n| {
+            chunk_copy(src, dst, 0, n, width_type, || PseudoId(0))
+                .iter()
+                .step_by(2)
+                .map(|i| (i.offset, i.size / 8))
+                .collect::<Vec<_>>()
+        };
+        assert!(widths(0).is_empty());
+        assert_eq!(widths(7), [(0, 4), (4, 2), (6, 1)]);
+        assert_eq!(widths(13), [(0, 8), (8, 4), (12, 1)]);
+        assert_eq!(widths(23), [(0, 8), (8, 8), (16, 4), (20, 2), (22, 1)]);
+        assert_eq!(widths(24), [(0, 8), (8, 8), (16, 8)]);
+    }
 
     #[test]
     fn chunks_cover_the_block_widest_first() {

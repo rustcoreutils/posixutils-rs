@@ -14,8 +14,9 @@
 //
 
 use crate::arch::codegen::SelectOperands;
+use crate::arch::codegen::{AsmModifierError, AsmOperandSlot, AsmOperandValue};
 use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
-use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
+use crate::arch::lir::{is_private_name, CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{FrameBase, Loc, Reg, X87ControlWords, X87Scratch, XmmReg};
 use crate::arch::x86_64::x87::{is_x87_float_to_int, is_x87_fp_cvt, is_x87_int_to_float};
@@ -252,11 +253,7 @@ impl X86_64CodeGen {
             Loc::FImm(_, _) => GpOperand::Imm(0), // FP immediates handled separately
             Loc::Xmm(_) => GpOperand::Imm(0),     // XMM handled separately
             Loc::Global(name) => {
-                let symbol = if name.starts_with('.') {
-                    Symbol::local(name.clone())
-                } else {
-                    Symbol::global(name.clone())
-                };
+                let symbol = Symbol::named(name.clone());
                 // Use TLS addressing for thread-local variables (Linux only)
                 if self.is_tls_symbol(name) {
                     GpOperand::Mem(MemAddr::TlsLocalExec(symbol))
@@ -401,9 +398,8 @@ impl X86_64CodeGen {
     pub(super) fn needs_got_access(&self, name: &str) -> bool {
         // In PIC mode, all non-local symbols need GOT access because they
         // could be interposed at runtime (the default for global symbols).
-        // Local symbols (starting with '.') don't need GOT access since
-        // they can't be interposed.
-        if self.pic_mode && !name.starts_with('.') {
+        // A name c17 made up is local and can't be interposed.
+        if self.pic_mode && !is_private_name(name) {
             return true;
         }
         // External symbols need GOT access on macOS for dynamic linking.
@@ -454,11 +450,7 @@ impl X86_64CodeGen {
                 offset,
             };
         }
-        let symbol = if name.starts_with('.') {
-            Symbol::local(name.to_string())
-        } else {
-            Symbol::global(name.to_string())
-        };
+        let symbol = Symbol::named(name.to_string());
         if offset == 0 {
             return MemAddr::RipRelative(symbol);
         }
@@ -906,8 +898,6 @@ impl X86_64CodeGen {
                     self.emit_tls_addr(&name, dst_reg);
                 }
                 Loc::Global(name) => {
-                    // Check if it's a local label (starts with '.') or global symbol
-                    let is_local_label = name.starts_with('.');
                     if self.needs_got_access(&name) {
                         // External symbols on macOS need GOT access
                         self.push_lir(X86Inst::Mov {
@@ -919,11 +909,7 @@ impl X86_64CodeGen {
                         });
                     } else {
                         self.push_lir(X86Inst::Lea {
-                            addr: MemAddr::RipRelative(Symbol {
-                                name: name.clone(),
-                                is_local: is_local_label,
-                                is_extern: false,
-                            }),
+                            addr: MemAddr::RipRelative(Symbol::named(name)),
                             dst: dst_reg,
                         });
                     }
@@ -1515,23 +1501,61 @@ impl X86_64CodeGen {
 impl crate::arch::AsmOperandFormatter for X86_64CodeGen {
     type Reg = Reg;
 
-    fn size_modifiers(&self) -> &'static [char] {
-        &['b', 'w', 'k', 'q'] // 8, 16, 32, 64-bit
+    /// gcc's x86 operand modifiers, those real code uses: the register widths
+    /// `b`/`w`/`k`/`q` and the high byte `h`; `c` and `P`, a constant without
+    /// its `$`; `a`, an operand as an address; `V`, a register without its
+    /// `%`. A width or `P` leaves anything that is not a general register as
+    /// a bare `%0` prints it, as gcc does.
+    fn format_operand(
+        &self,
+        slot: &AsmOperandSlot<Reg>,
+        modifier: Option<char>,
+    ) -> Result<String, AsmModifierError> {
+        use AsmOperandValue as V;
+        Ok(match (modifier, &slot.value) {
+            (Some(m @ ('b' | 'w' | 'k' | 'q')), V::Reg(r)) => {
+                format!("%{}", self.sized_reg_name(*r, m))
+            }
+            (Some('h'), V::Reg(r)) => match r {
+                Reg::Rax => "%ah".to_string(),
+                Reg::Rbx => "%bh".to_string(),
+                Reg::Rcx => "%ch".to_string(),
+                Reg::Rdx => "%dh".to_string(),
+                // No high byte: left for the assembler to reject, as gcc
+                // rejects it.
+                _ => format!("%{}h", self.reg_name_64(*r)),
+            },
+            (Some('P'), V::Int(v)) => v.to_string(),
+            (Some('P'), V::Symbol(sym)) => sym.clone(),
+            (Some('a'), V::Reg(r)) => format!("(%{})", self.reg_name_64(*r)),
+            (Some('a'), V::Int(v)) => v.to_string(),
+            (Some('a'), V::Symbol(sym)) => format!("{sym}(%rip)"),
+            (Some('V'), V::Reg(r)) => self.asm_default_reg(*r, slot.size),
+            (Some('a'), _) | (Some('V'), V::RegName(_)) => {
+                return Err(AsmModifierError::Inapplicable)
+            }
+            (None | Some('b' | 'w' | 'k' | 'q' | 'h' | 'P' | 'V'), value) => match value {
+                V::Reg(r) => format!("%{}", self.asm_default_reg(*r, slot.size)),
+                V::RegName(text) | V::Mem(text) => text.clone(),
+                V::Int(v) => format!("${v}"),
+                V::Float(v, bits) => format!("${}", v.to_bits_at_width(*bits)),
+                V::Symbol(sym) => format!("${sym}"),
+            },
+            _ => return Err(AsmModifierError::Unsupported),
+        })
     }
+}
 
-    fn format_reg_sized(&self, reg: Reg, size_mod: char) -> String {
-        format!("%{}", self.sized_reg_name(reg, size_mod))
-    }
-
-    fn format_reg_default(&self, reg: Reg, size_bits: u32) -> String {
-        // Select register width matching the operand's declared size
+impl X86_64CodeGen {
+    /// A general register at the operand's width, without the `%`.
+    fn asm_default_reg(&self, reg: Reg, size_bits: u32) -> String {
         let size_mod = match size_bits {
             8 => 'b',
             16 => 'w',
             64 => 'q',
             _ => 'k', // 32-bit default
         };
-        format!("%{}", self.sized_reg_name(reg, size_mod))
+        self.sized_reg_name(reg, size_mod).to_string()
     }
 }
 

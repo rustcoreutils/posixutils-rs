@@ -10,7 +10,10 @@
 //
 
 use gettextrs::gettext;
+use std::collections::{BTreeMap, HashSet};
 
+use crate::diag::Position;
+use crate::ir::asm_operand;
 use crate::ir::constglobal;
 use crate::ir::copyprop;
 use crate::ir::dce;
@@ -26,7 +29,7 @@ use crate::ir::memloc;
 use crate::ir::sccp;
 use crate::ir::strdata::ConstBytes;
 use crate::ir::vrp;
-use crate::ir::{Function, Module};
+use crate::ir::{Function, Module, Opcode};
 use crate::target::Target;
 use crate::types::TypeTable;
 
@@ -266,13 +269,156 @@ pub struct OptReport {
 
 // Pass Runner
 
+/// Where a forwarding function names its caller's variadic arguments: the
+/// first `__builtin_va_arg_pack()` or `__builtin_va_arg_pack_len()` in its
+/// body, by spelling and position.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PackUse {
+    builtin: &'static str,
+    pos: Position,
+}
+
+/// The first pack builtin `func` uses, or `None` for a function that forwards
+/// nothing.
+fn pack_use(func: &Function) -> Option<PackUse> {
+    func.blocks.iter().flat_map(|b| &b.insns).find_map(|i| {
+        let builtin = if i.op == Opcode::VaArgPackLen {
+            "__builtin_va_arg_pack_len"
+        } else if i.extra().ends_with_va_arg_pack {
+            "__builtin_va_arg_pack"
+        } else {
+            return None;
+        };
+        Some(PackUse {
+            builtin,
+            pos: i.pos.unwrap_or_default(),
+        })
+    })
+}
+
 /// Whether `func` names its caller's variadic arguments -- that is, whether
 /// its body contains `__builtin_va_arg_pack()` or `__builtin_va_arg_pack_len()`.
 fn forwards_caller_arguments(func: &Function) -> bool {
-    func.blocks
+    pack_use(func).is_some()
+}
+
+/// What would need an out-of-line copy of a forwarding function.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CopyDemand {
+    /// The function is an external definition, which must be emitted.
+    ExternalDefinition,
+    /// Its address survives optimization, so something may call it there.
+    AddressTaken,
+}
+
+/// A forwarding function something needs as an object of its own, which it
+/// cannot be: what it forwards exists only at a call site it is inlined into.
+#[derive(Debug, PartialEq)]
+struct ForwarderCopy {
+    function: String,
+    pack: PackUse,
+    /// Where the copy is asked for: the address-taking instruction, or the
+    /// pack builtin when nothing nearer has a position.
+    pos: Position,
+    why: CopyDemand,
+}
+
+/// The forwarding functions that are external definitions.
+///
+/// Asked before `suppress_forwarding_bodies` clears `emit`, which until then
+/// says whether the function provides its definition: an inline definition
+/// (C17 6.7.4p7, or `gnu_inline`) leaves that to another translation unit,
+/// and a `static` one needs a copy only if its address is taken.
+fn external_forwarders(module: &Module) -> Vec<ForwarderCopy> {
+    module
+        .functions
         .iter()
-        .flat_map(|b| &b.insns)
-        .any(|i| i.extra().ends_with_va_arg_pack || i.op == crate::ir::Opcode::VaArgPackLen)
+        .filter(|f| f.emit && !f.is_static)
+        .filter_map(|f| {
+            pack_use(f).map(|pack| ForwarderCopy {
+                function: f.name.clone(),
+                pack,
+                pos: pack.pos,
+                why: CopyDemand::ExternalDefinition,
+            })
+        })
+        .collect()
+}
+
+/// The `static` forwarding functions, whose address would need a copy.
+///
+/// Recorded before optimization, which may rewrite a forwarder's own body.
+fn static_forwarders(module: &Module) -> BTreeMap<String, PackUse> {
+    module
+        .functions
+        .iter()
+        .filter(|f| f.emit && f.is_static)
+        .filter_map(|f| pack_use(f).map(|pack| (f.name.clone(), pack)))
+        .collect()
+}
+
+/// The forwarders in `forwarders` whose address is still taken: by an emitted
+/// function, or in a global's initializer. One each, at the first place found.
+///
+/// Asked after optimization, as gcc does: an address that is never used is
+/// deleted at `-O1` and above, and then nothing needs the copy.
+fn forwarder_addresses(
+    module: &Module,
+    forwarders: &BTreeMap<String, PackUse>,
+) -> Vec<ForwarderCopy> {
+    let mut found: BTreeMap<&str, Position> = BTreeMap::new();
+    for func in module.functions.iter().filter(|f| f.emit) {
+        for insn in func.blocks.iter().flat_map(|b| &b.insns) {
+            if insn.op != Opcode::SymAddr {
+                continue;
+            }
+            let Some(name) = insn.src.first().and_then(|&s| func.global_sym_name(s)) else {
+                continue;
+            };
+            if let Some((name, pack)) = forwarders.get_key_value(name) {
+                found
+                    .entry(name.as_str())
+                    .or_insert(insn.pos.unwrap_or(pack.pos));
+            }
+        }
+    }
+    // A global's initializer has no position of its own.
+    let names: HashSet<String> = forwarders.keys().cloned().collect();
+    let mut in_initializers = HashSet::new();
+    for global in &module.globals {
+        inline::collect_func_refs_from_initializer(&global.init, &names, &mut in_initializers);
+    }
+    for (name, pack) in forwarders {
+        if in_initializers.contains(name) {
+            found.entry(name.as_str()).or_insert(pack.pos);
+        }
+    }
+
+    found
+        .into_iter()
+        .map(|(name, pos)| ForwarderCopy {
+            function: name.to_string(),
+            pack: forwarders[name],
+            pos,
+            why: CopyDemand::AddressTaken,
+        })
+        .collect()
+}
+
+/// Report each forwarder that would need a copy. GCC rejects the same
+/// programs: "invalid use of '__builtin_va_arg_pack ()'".
+fn report_forwarder_copies(copies: &[ForwarderCopy]) {
+    for copy in copies {
+        let template = match copy.why {
+            CopyDemand::ExternalDefinition => {
+                "invalid use of '{0} ()': '{1}' forwards its caller's arguments, so it cannot be an external definition"
+            }
+            CopyDemand::AddressTaken => {
+                "invalid use of '{0} ()': '{1}' forwards its caller's arguments, so its address cannot be taken"
+            }
+        };
+        crate::diag::error_args(copy.pos, template, &[copy.pack.builtin, &copy.function]);
+    }
 }
 
 /// Keep a forwarding function's body out of the object file.
@@ -377,7 +523,9 @@ pub fn optimize_module(
     // no-op for a module that has none.
     // A function that forwards its caller's variadic arguments has no
     // out-of-line form: what it forwards exists only at a call site. GCC emits
-    // no standalone copy of one either.
+    // no standalone copy of one either, and rejects a program that needs one.
+    report_forwarder_copies(&external_forwarders(module));
+    let forwarders = static_forwarders(module);
     suppress_forwarding_bodies(module);
 
     if opt.optimizes() {
@@ -400,11 +548,28 @@ pub fn optimize_module(
         memexpand::run(func, types);
     }
 
-    if !opt.optimizes() {
-        return OptReport::default();
+    let report = if opt.optimizes() {
+        optimize_functions(module, types, target, MAX_ITERATIONS)
+    } else {
+        OptReport::default()
+    };
+
+    // An immediate-only asm operand must be a constant by now, which is when
+    // gcc decides too: inlining a literal into `"i"(param)` satisfies it at
+    // -O2 and nothing does at -O0. The copies and address arithmetic that
+    // carried the constant are dead once the operand names it.
+    let thread_locals = asm_operand::thread_locals(module);
+    for func in &mut module.functions {
+        if asm_operand::resolve_immediates(func, &thread_locals) && opt.optimizes() {
+            dce::run(func);
+            func.remove_nops();
+        }
     }
 
-    optimize_functions(module, types, target, MAX_ITERATIONS)
+    // An address that survived everything above would reach the link as an
+    // undefined reference to the suppressed body.
+    report_forwarder_copies(&forwarder_addresses(module, &forwarders));
+    report
 }
 
 /// Run the per-function passes over every function, each for at most
@@ -420,13 +585,14 @@ fn optimize_functions(
     let known = constglobal::KnownGlobals::collect(module, types);
     let mi = memloc::ModuleInfo::build(module, types);
     let bytes = ConstBytes::build(module, types);
-    let literals = libcall_fold::NewLiterals::new(&module.strings);
+    let (functions, strings, callees) = module.split_for_rewrite();
+    let literals = libcall_fold::NewLiterals::new(strings);
     let fold = libcall_fold::FoldCtx {
         types,
         target,
         mi: &mi,
         bytes: &bytes,
-        callees: &module.library_symbols,
+        callees,
         literals: &literals,
     };
     let ctx = PassCtx {
@@ -436,7 +602,7 @@ fn optimize_functions(
         fold: &fold,
     };
     let mut report = OptReport::default();
-    for func in &mut module.functions {
+    for func in functions {
         let c = optimize_function(func, &ctx, max_iterations);
         if !c.converged() {
             report.unconverged.push(c);
@@ -444,8 +610,6 @@ fn optimize_functions(
         // A local whose every access was forwarded or deleted needs no slot.
         mem2reg(func);
     }
-    let added = literals.into_added();
-    module.strings.extend(added);
     report
 }
 
@@ -505,6 +669,136 @@ mod tests {
         let mut module = Module::default();
         module.functions.push(func);
         module
+    }
+
+    fn at_line(line: u32) -> Position {
+        Position {
+            line,
+            ..Default::default()
+        }
+    }
+
+    /// A function whose single block holds `insns` and returns.
+    fn function_of(name: &str, types: &TypeTable, insns: Vec<Instruction>) -> Function {
+        let mut func = Function::new(name, types.int_id);
+        let mut b = BasicBlock::new(BasicBlockId(0));
+        b.add_insn(Instruction::new(Opcode::Entry));
+        for insn in insns {
+            b.add_insn(insn);
+        }
+        b.add_insn(Instruction::ret(None));
+        func.add_block(b);
+        func.entry = BasicBlockId(0);
+        func
+    }
+
+    /// `static int count(const char *, ...)` using
+    /// `__builtin_va_arg_pack_len()` on line 2, and `main`, made of `body`.
+    fn module_with_forwarder(types: &TypeTable, body: Vec<Instruction>) -> Module {
+        let mut count = function_of(
+            "count",
+            types,
+            vec![Instruction::new(Opcode::VaArgPackLen)
+                .with_target(PseudoId(1))
+                .with_pos(at_line(2))],
+        );
+        count.is_static = true;
+        let mut main = function_of("main", types, body);
+        main.add_pseudo(Pseudo::sym(PseudoId(1), "count".to_string()));
+        main.next_pseudo = 3;
+        let mut module = Module::default();
+        module.functions.extend([count, main]);
+        module
+    }
+
+    /// A taken address is found where it is taken, a call is not an address,
+    /// and an address in an initializer falls back to the builtin's position.
+    #[test]
+    fn forwarder_addresses_are_found_where_taken() {
+        let target = Target::host();
+        let types = TypeTable::new(&target);
+        let pack = PackUse {
+            builtin: "__builtin_va_arg_pack_len",
+            pos: at_line(2),
+        };
+
+        let mut taken = module_with_forwarder(
+            &types,
+            vec![
+                Instruction::sym_addr(PseudoId(2), PseudoId(1), types.int_id).with_pos(at_line(5)),
+            ],
+        );
+        let forwarders = static_forwarders(&taken);
+        assert_eq!(forwarders.get("count"), Some(&pack));
+        assert_eq!(
+            forwarder_addresses(&taken, &forwarders),
+            vec![ForwarderCopy {
+                function: "count".to_string(),
+                pack,
+                pos: at_line(5),
+                why: CopyDemand::AddressTaken,
+            }]
+        );
+
+        let called = module_with_forwarder(
+            &types,
+            vec![Instruction::call(
+                None,
+                "count",
+                vec![],
+                vec![],
+                types.int_id,
+                32,
+            )],
+        );
+        assert!(forwarder_addresses(&called, &static_forwarders(&called)).is_empty());
+
+        let mut tabled = module_with_forwarder(&types, vec![]);
+        tabled.globals.push(crate::ir::GlobalDef::new(
+            "tbl",
+            types.int_id,
+            crate::ir::Initializer::SymAddr("count".to_string()),
+        ));
+        let copies = forwarder_addresses(&tabled, &static_forwarders(&tabled));
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].pos, at_line(2));
+
+        // Taken only inside a function that is not emitted: nothing calls it.
+        taken.functions[1].emit = false;
+        assert!(forwarder_addresses(&taken, &forwarders).is_empty());
+
+        // `int use(int count) { sink(&count); }`: the address of a parameter
+        // spelled like the forwarder, which is not the forwarder.
+        let mut shadowed = module_with_forwarder(
+            &types,
+            vec![Instruction::sym_addr(
+                PseudoId(2),
+                PseudoId(1),
+                types.int_id,
+            )],
+        );
+        shadowed.functions[1].add_local("count", PseudoId(1), types.int_id, None, None);
+        assert!(forwarder_addresses(&shadowed, &static_forwarders(&shadowed)).is_empty());
+    }
+
+    /// Only an emitted, non-`static` forwarder is an external definition; an
+    /// inline definition leaves that to another translation unit.
+    #[test]
+    fn external_forwarders_are_the_emitted_external_ones() {
+        let target = Target::host();
+        let types = TypeTable::new(&target);
+        let mut module = module_with_forwarder(&types, vec![]);
+        assert!(external_forwarders(&module).is_empty(), "static");
+
+        module.functions[0].is_static = false;
+        let copies = external_forwarders(&module);
+        assert_eq!(copies.len(), 1);
+        assert_eq!(copies[0].why, CopyDemand::ExternalDefinition);
+        assert_eq!(copies[0].pos, at_line(2));
+        assert!(static_forwarders(&module).is_empty());
+
+        module.functions[0].emit = false;
+        assert!(external_forwarders(&module).is_empty(), "inline definition");
     }
 
     /// A loop cut off by its iteration cap says so, and names what was still

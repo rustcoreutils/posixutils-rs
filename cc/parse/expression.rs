@@ -291,75 +291,147 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// The type of a conditional expression whose arms have types `then_typ`
-    /// and `else_typ`, already decayed (C17 6.5.15p3-6).
+    /// The type of a conditional expression with arms `then_expr` and
+    /// `else_expr` (C17 6.5.15p5-6), after checking that they are a pair
+    /// 6.5.15p3 admits. `None` after an error, so the conditional is left
+    /// untyped and what encloses it does not report the same mistake again.
     ///
     /// The result is a value, so it is unqualified whatever the arms were.
-    fn ternary_common_type(&mut self, then_typ: TypeId, else_typ: TypeId) -> TypeId {
+    /// gcc's warnings for pointers to incompatible types and for a pointer
+    /// beside an integer leave the conditional typed, as gcc does: `void *`
+    /// for the first, the pointer's type for the second.
+    fn conditional_result_type(
+        &mut self,
+        then_expr: &Expr,
+        else_expr: &Expr,
+        pos: Position,
+    ) -> Option<TypeId> {
+        // An arm diagnosed already, or one with no value -- whose mismatch
+        // with a valued arm `check_not_void` has reported.
+        let (then_typ, else_typ) = (then_expr.typ?, else_expr.typ?);
+        if self.types.is_vector(then_typ) || self.types.is_vector(else_typ) {
+            return None;
+        }
         let then_typ = self.lvalue_converted_type(then_typ);
         let else_typ = self.lvalue_converted_type(else_typ);
-        let then_ptr = self.types.kind(then_typ) == TypeKind::Pointer;
-        let else_ptr = self.types.kind(else_typ) == TypeKind::Pointer;
-
-        // Two pointers: a pointer to the composite type, qualified with the
-        // qualifiers of *both* pointees (6.5.15p6) -- or to void, so
-        // qualified, when either points to void. Taking whichever arm came
-        // first dropped `const` from `c ? p : cp` and kept it for `c ? cp : p`.
-        if then_ptr && else_ptr {
-            let (Some(tp), Some(ep)) = (
-                self.types.base_type(then_typ),
-                self.types.base_type(else_typ),
-            ) else {
-                return then_typ;
-            };
-            let quals = self.types.qualifiers(tp) | self.types.qualifiers(ep);
-            let target = if self.types.kind(tp) == TypeKind::Void {
-                tp
-            } else if self.types.kind(ep) == TypeKind::Void {
-                ep
-            } else {
-                tp
-            };
-            let target = self.types.unqualified(target);
-            let target = self.types.qualified_with(target, quals);
-            return self.types.intern(crate::types::Type::pointer(target));
-        }
-        // One pointer: the other arm is a null pointer constant (6.5.15p6).
-        if then_ptr {
-            return then_typ;
-        }
-        if else_ptr {
-            return else_typ;
+        let kinds = (self.types.kind(then_typ), self.types.kind(else_typ));
+        if kinds.0 == TypeKind::Void || kinds.1 == TypeKind::Void {
+            return Some(self.types.void_id);
         }
 
-        // If either is void, result is void
-        if self.types.kind(then_typ) == TypeKind::Void
-            || self.types.kind(else_typ) == TypeKind::Void
-        {
-            return self.types.void_id;
-        }
-
-        // Both arithmetic: the usual arithmetic conversions, which C17 6.5.15p5
-        // sends the arms through -- the same ones the binary operators use.
-        // Delegated rather than restated, so the answer follows conversion
-        // *rank* and not bit width, and does not depend on which arm was
-        // written first.
-        //
-        // Complex included. It used to be held back, because the linearizer
-        // phi-ed a complex conditional's arms by value where the convention is
-        // by address, and widening the type here would have turned "quietly
-        // drops the imaginary part" into a segfault. `linearize_complex_ternary`
-        // merges by address now, so the shared answer -- `c ? 1 : z` is
-        // `double _Complex`, whichever arm the complex one is -- is the one to
-        // give.
+        // Both arithmetic: the usual arithmetic conversions (6.5.15p5) --
+        // the same ones the binary operators use, so the answer follows
+        // conversion *rank* and not bit width, and does not depend on which
+        // arm was written first. Complex included: `c ? 1 : z` is `double
+        // _Complex`, and `linearize_complex_ternary` merges it by address.
         if self.types.is_arithmetic(then_typ) && self.types.is_arithmetic(else_typ) {
-            return self.usual_arithmetic_conversions(then_typ, else_typ);
+            return Some(self.usual_arithmetic_conversions(then_typ, else_typ));
         }
 
-        // Neither arithmetic nor a pointer: a struct or union, where C17
-        // 6.5.15p3 has already required both arms to have the same type and
-        // there is nothing to convert.
-        then_typ
+        let pointers = (kinds.0 == TypeKind::Pointer, kinds.1 == TypeKind::Pointer);
+        match pointers {
+            (true, true) => {
+                // A null pointer constant takes the other arm's type, even
+                // spelled `(void *)0`: that is what makes `c ? fp : NULL` a
+                // function pointer and not a `void *`.
+                if self.is_null_pointer_constant(else_expr) {
+                    return Some(then_typ);
+                }
+                if self.is_null_pointer_constant(then_expr) {
+                    return Some(else_typ);
+                }
+                Some(self.pointer_conditional_type(then_typ, else_typ, pos))
+            }
+            (true, false) | (false, true) => {
+                let (ptr, other, other_typ) = if pointers.0 {
+                    (then_typ, else_expr, else_typ)
+                } else {
+                    (else_typ, then_expr, then_typ)
+                };
+                if !self.types.is_integer(other_typ) {
+                    return self.report_conditional_mismatch(pos);
+                }
+                if !self.is_null_pointer_constant(other) {
+                    diag::warning(
+                        pos,
+                        &gettext("pointer/integer type mismatch in conditional expression"),
+                    );
+                }
+                Some(ptr)
+            }
+            // The same structure or union; anything else, such as a
+            // structure beside a number, is no pair at all.
+            (false, false) if self.types.types_compatible(then_typ, else_typ) => Some(then_typ),
+            (false, false) => self.report_conditional_mismatch(pos),
+        }
+    }
+
+    /// gcc's "type mismatch in conditional expression", an error: these arms
+    /// are no pair 6.5.15p3 admits, so the conditional has no type.
+    fn report_conditional_mismatch(&self, pos: Position) -> Option<TypeId> {
+        diag::error(pos, &gettext("type mismatch in conditional expression"));
+        None
+    }
+
+    /// The type of a conditional whose arms are the pointers `then_typ` and
+    /// `else_typ`, neither of them a null pointer constant (C17 6.5.15p6).
+    ///
+    /// A pointer to the composite type, or to `void` when either arm points
+    /// to `void`, qualified with the qualifiers of *both* referenced types:
+    /// `c ? (const int *)a : (volatile int *)b` is `const volatile int *`,
+    /// whichever arm comes first. An array's qualifiers are its elements',
+    /// as gcc reads them, so `const int (*)[]` meets `int (*)[3]` as
+    /// `const int (*)[3]`.
+    fn pointer_conditional_type(
+        &mut self,
+        then_typ: TypeId,
+        else_typ: TypeId,
+        pos: Position,
+    ) -> TypeId {
+        let (Some(tp), Some(ep)) = (
+            self.types.base_type(then_typ),
+            self.types.base_type(else_typ),
+        ) else {
+            return then_typ;
+        };
+        let quals =
+            self.types.qualifiers_through_arrays(tp) | self.types.qualifiers_through_arrays(ep);
+        let (tp, ep) = (
+            self.types.unqualified_through_arrays(tp),
+            self.types.unqualified_through_arrays(ep),
+        );
+        let (t_void, e_void) = (
+            self.types.kind(tp) == TypeKind::Void,
+            self.types.kind(ep) == TypeKind::Void,
+        );
+        let target = if t_void || e_void {
+            // The `void *` carve-out is for pointers to objects. gcc objects
+            // to a function pointer only under `-pedantic`; c17 warns in the
+            // group that assignment uses for the same conversion.
+            let function = |k| k == TypeKind::Function;
+            if (function(self.types.kind(tp)) || function(self.types.kind(ep)))
+                && diag::warning_group_enabled(crate::types::FUNCTION_POINTER_CONV)
+            {
+                diag::warning(
+                    pos,
+                    &gettext(
+                        "ISO C forbids conditional expr between 'void *' and function pointer",
+                    ),
+                );
+            }
+            self.types.void_id
+        } else if self.types.types_compatible(tp, ep) {
+            self.types.composite_type(tp, ep)
+        } else {
+            // gcc's answer, unqualified whatever the arms pointed to.
+            diag::warning(
+                pos,
+                &gettext("pointer type mismatch in conditional expression"),
+            );
+            return self.types.void_ptr_id;
+        };
+        let target = self.types.qualified_with(target, quals);
+        self.types.intern(Type::pointer(target))
     }
 
     /// Apply the array-to-pointer and function-to-pointer decays of C17
@@ -398,40 +470,42 @@ impl<'a> Parser<'a> {
 
         if self.is_special(b'?') {
             self.advance();
-            self.check_truth_value(&cond);
+            let cond_tested = self.check_truth_value(&cond);
 
             // GNU `a ?: b`: the middle operand may be omitted, and then the
             // condition is also the value when it is true. Kept as its own
             // node rather than rewritten to `a ? a : b`, because 6.5.15 would
             // then evaluate `a` twice -- `f() ?: 0` must call `f` once.
+            let colon_pos = self.current_pos();
             if self.is_special(b':') {
                 self.advance();
                 let else_expr = self.parse_conditional_expr()?;
 
-                let cond_typ = cond.typ.unwrap_or(self.types.int_id);
-                let else_typ = else_expr.typ.unwrap_or(self.types.int_id);
-                let cond_decayed = self.decayed_type(cond_typ);
-                let else_decayed = self.decayed_type(else_typ);
-                let typ = self.ternary_common_type(cond_decayed, else_decayed);
+                // The condition is also an arm here, so one that cannot be
+                // tested has been reported as the operand it is.
+                let typ = if cond_tested {
+                    self.conditional_result_type(&cond, &else_expr, colon_pos)
+                } else {
+                    None
+                };
 
                 let pos = cond.pos;
-                return Ok(Self::typed_expr(
-                    ExprKind::CondElvis {
-                        cond: Box::new(cond),
-                        else_expr: Box::new(else_expr),
-                    },
+                let e = ExprKind::CondElvis {
+                    cond: Box::new(cond),
+                    else_expr: Box::new(else_expr),
+                };
+                return Ok(Expr {
                     typ,
-                    pos,
-                ));
+                    ..Expr::new(e, pos)
+                });
             }
 
             let then_expr = self.parse_expression()?;
+            let colon_pos = self.current_pos();
             self.expect_special(b':')?;
             // Right-to-left: parse else as another conditional
             let else_expr = self.parse_conditional_expr()?;
 
-            // The result type is the common type of then and else branches
-            // Apply array-to-pointer and function-to-pointer decay (C99 6.3.2.1)
             let then_typ = then_expr.typ.unwrap_or(self.types.int_id);
             let else_typ = else_expr.typ.unwrap_or(self.types.int_id);
 
@@ -448,23 +522,18 @@ impl<'a> Parser<'a> {
             self.check_not_vector_value(then_expr.typ, then_expr.pos);
             self.check_not_vector_value(else_expr.typ, else_expr.pos);
 
-            // Decay arrays to pointers, functions to pointer-to-function
-            let then_decayed = self.decayed_type(then_typ);
-            let else_decayed = self.decayed_type(else_typ);
-
-            // Compute common type of then and else branches (C99 6.5.15)
-            let typ = self.ternary_common_type(then_decayed, else_decayed);
+            let typ = self.conditional_result_type(&then_expr, &else_expr, colon_pos);
 
             let pos = cond.pos;
-            Ok(Self::typed_expr(
-                ExprKind::Conditional {
-                    cond: Box::new(cond),
-                    then_expr: Box::new(then_expr),
-                    else_expr: Box::new(else_expr),
-                },
+            let e = ExprKind::Conditional {
+                cond: Box::new(cond),
+                then_expr: Box::new(then_expr),
+                else_expr: Box::new(else_expr),
+            };
+            Ok(Expr {
                 typ,
-                pos,
-            ))
+                ..Expr::new(e, pos)
+            })
         } else {
             Ok(cond)
         }
@@ -1002,6 +1071,62 @@ impl<'a> Parser<'a> {
         Ok(self.with_type_name_extents(dims, literal))
     }
 
+    /// A GNU cast to union type, `(union U)expr`.
+    ///
+    /// The operand must have the type of one of the members -- see
+    /// [`crate::types::TypeTable::union_member_for_cast`] -- and the result is
+    /// the union with that member initialized: `(union U){ .member = expr }`,
+    /// every other byte zero. It is built as exactly that compound literal,
+    /// so the initializer, constant and aggregate-value paths all treat it as
+    /// one, and wrapped in a cast to its own type, which converts nothing but
+    /// keeps the result from being an lvalue as a compound literal is.
+    ///
+    /// An operand of the union's own type is an ordinary no-op cast. One that
+    /// matches no member is diagnosed as gcc does. A vector operand is the
+    /// vector-value error every other cast reports: the array model would
+    /// see it decay, and so match no vector member.
+    fn cast_to_union(&mut self, union_typ: TypeId, operand: Expr, pos: Position) -> Expr {
+        let union_typ = self.types.unqualified(union_typ);
+        let is_vector = self.check_not_vector_value(operand.typ, operand.pos);
+        let value = match operand.typ {
+            Some(_) if is_vector => operand,
+            Some(t) => {
+                let t = self.lvalue_converted_type(t);
+                if self.types.types_compatible(t, union_typ) {
+                    operand
+                } else if let Some(name) = self.types.union_member_for_cast(union_typ, t) {
+                    let elements = vec![InitElement {
+                        designators: vec![Designator::Field(name)],
+                        value: Box::new(operand),
+                    }];
+                    Self::typed_expr(
+                        ExprKind::CompoundLiteral {
+                            typ: union_typ,
+                            elements,
+                        },
+                        union_typ,
+                        pos,
+                    )
+                } else {
+                    diag::error(
+                        pos,
+                        &gettext("cast to union type from type not present in union"),
+                    );
+                    operand
+                }
+            }
+            None => operand,
+        };
+        Self::typed_expr(
+            ExprKind::Cast {
+                cast_type: union_typ,
+                expr: Box::new(value),
+            },
+            union_typ,
+            pos,
+        )
+    }
+
     /// [`Self::parse_compound_literal_tail`] from its `{`.
     fn parse_compound_literal_body(
         &mut self,
@@ -1145,14 +1270,29 @@ impl<'a> Parser<'a> {
     /// a[]; sizeof a` answered 0 where gcc rejects it, while a local VLA's
     /// `sizeof` had to keep working.
     ///
-    /// Only an identifier is examined. A subscript or a member reaches an
-    /// element whose type is complete by construction, and a call cannot
-    /// return an array.
+    /// An incomplete structure, union or enumeration is incomplete whatever
+    /// the expression -- `sizeof *p` for a `struct S *p` whose tag has no
+    /// definition yet. For an array only an identifier is examined: a
+    /// subscript or a member reaches an element whose type is complete by
+    /// construction, and a call cannot return an array.
     fn check_sizeof_expr_operand(&self, expr: &Expr, pos: Position) {
-        let ExprKind::Ident(symbol_id) = expr.kind else {
+        let Some(typ) = expr.typ else {
             return;
         };
-        let Some(typ) = expr.typ else {
+        if matches!(
+            self.types.kind(typ),
+            TypeKind::Struct | TypeKind::Union | TypeKind::Enum
+        ) && self.type_name_is_incomplete(typ, 0)
+        {
+            let named = self.types.format_type(typ, Some(self.idents));
+            diag::error_args(
+                pos,
+                "invalid application of 'sizeof' to incomplete type '{0}'",
+                &[&named],
+            );
+            return;
+        }
+        let ExprKind::Ident(symbol_id) = expr.kind else {
             return;
         };
         if self.types.kind(typ) != TypeKind::Array
@@ -1349,19 +1489,16 @@ impl<'a> Parser<'a> {
                 let dot_pos = self.current_pos();
                 self.advance();
                 let member = self.expect_identifier()?;
-                // Get member type from struct type, resolving incomplete types first
                 let member_type = if let Some(t) = expr.typ {
-                    let resolved = self.resolve_struct_type(t);
-                    let kind = self.types.kind(resolved);
+                    let kind = self.types.kind(t);
                     if kind != TypeKind::Struct && kind != TypeKind::Union {
                         diag::error(
                             dot_pos,
                             &gettext("request for member in something not a structure or union"),
                         );
                         self.types.int_id
-                    } else if let Some(typ) = self.types.member_access_type(t, resolved, member) {
-                        // C17 6.5.2.3p3: so-qualified by the object, whose
-                        // qualifiers are on `t` -- `resolved` has lost them.
+                    } else if let Some(typ) = self.types.member_access_type(t, member) {
+                        // C17 6.5.2.3p3: so-qualified by the object.
                         typ
                     } else {
                         let member_name = self.idents.get_opt(member).unwrap_or("<unknown>");
@@ -1387,11 +1524,10 @@ impl<'a> Parser<'a> {
                 let arrow_pos = self.current_pos();
                 self.advance();
                 let member = self.expect_identifier()?;
-                // Get member type: dereference pointer to get struct, resolve if incomplete, then find member
+                // Get member type: dereference the pointer, then find the member
                 let member_type = if let Some(t) = expr.typ {
                     if let Some(struct_type) = self.types.base_type(t) {
-                        let resolved = self.resolve_struct_type(struct_type);
-                        let kind = self.types.kind(resolved);
+                        let kind = self.types.kind(struct_type);
                         if kind != TypeKind::Struct && kind != TypeKind::Union {
                             diag::error(
                                 arrow_pos,
@@ -1400,8 +1536,7 @@ impl<'a> Parser<'a> {
                                 ),
                             );
                             self.types.int_id
-                        } else if let Some(typ) =
-                            self.types.member_access_type(struct_type, resolved, member)
+                        } else if let Some(typ) = self.types.member_access_type(struct_type, member)
                         {
                             // C17 6.5.2.3p4: so-qualified by the *pointee*.
                             // `struct S *volatile p` qualifies `p`, not `*p`.
@@ -1445,35 +1580,13 @@ impl<'a> Parser<'a> {
                 let callee = self.callee_name(&expr);
                 self.check_call(func_type, callee, &args, call_pos);
 
-                // Get the return type from the function type
-                // The func expression should have type TypeKind::Function
-                // and the return type is stored in base.
-                // For function pointers (TypeKind::Pointer to Function),
-                // we need to dereference first to get the function type.
-                let return_type = expr
-                    .typ
-                    .and_then(|t| {
-                        let kind = self.types.kind(t);
-                        if kind == TypeKind::Function {
-                            // Direct function call
-                            self.types.base_type(t)
-                        } else if kind == TypeKind::Pointer {
-                            // Function pointer call - get the pointee (function type)
-                            self.types.base_type(t).and_then(|func_type| {
-                                if self.types.kind(func_type) == TypeKind::Function {
-                                    // Get return type from function type
-                                    self.types.base_type(func_type)
-                                } else {
-                                    None
-                                }
-                            })
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(self.types.int_id); // Default to int
-                                                   // A call's value has the unqualified version of the return
-                                                   // type (C17 6.7.6.3p4 makes that the function's return type).
+                // The return type, from the function type the call calls --
+                // through a pointer for a call through one -- or `int` when
+                // there is none. A call's value has the unqualified version
+                // of it (C17 6.7.6.3p4 makes that the function's return type).
+                let return_type = func_type
+                    .and_then(|f| self.types.base_type(f))
+                    .unwrap_or(self.types.int_id);
                 let return_type = self.types.unqualified(return_type);
 
                 let known = self.known_callee(&expr);
@@ -1754,41 +1867,21 @@ impl<'a> Parser<'a> {
             | BinaryOp::LogAnd
             | BinaryOp::LogOr => self.types.int_id,
 
-            // Arithmetic operators use usual arithmetic conversions
-            // But Add/Sub with pointers/arrays need special handling
+            // The additive operators take their pointer forms on the decayed
+            // operands (6.3.2.1p3-4): an array is a pointer to its element and
+            // a function a pointer to itself, so `f - g` is a `ptrdiff_t` and
+            // `f + 1` a pointer, as `fp - gp` and `fp + 1` are.
             BinaryOp::Add | BinaryOp::Sub => {
-                let left_kind = self.types.kind(left_type);
-                let right_kind = self.types.kind(right_type);
-                let left_is_ptr_or_arr =
-                    left_kind == TypeKind::Pointer || left_kind == TypeKind::Array;
-                let right_is_ptr_or_arr =
-                    right_kind == TypeKind::Pointer || right_kind == TypeKind::Array;
+                let left_type = self.types.decayed(left_type);
+                let right_type = self.types.decayed(right_type);
+                let left_is_ptr = self.types.kind(left_type) == TypeKind::Pointer;
+                let right_is_ptr = self.types.kind(right_type) == TypeKind::Pointer;
 
-                if left_is_ptr_or_arr && self.types.is_integer(right_type) {
-                    // ptr + int or arr + int -> pointer to element type
-                    if left_kind == TypeKind::Array {
-                        // Array decays to pointer
-                        let elem_type =
-                            self.types.base_type(left_type).unwrap_or(self.types.int_id);
-                        self.types.intern(Type::pointer(elem_type))
-                    } else {
-                        left_type
-                    }
-                } else if self.types.is_integer(left_type)
-                    && right_is_ptr_or_arr
-                    && op == BinaryOp::Add
-                {
-                    // int + ptr or int + arr -> pointer to element type
-                    if right_kind == TypeKind::Array {
-                        let elem_type = self
-                            .types
-                            .base_type(right_type)
-                            .unwrap_or(self.types.int_id);
-                        self.types.intern(Type::pointer(elem_type))
-                    } else {
-                        right_type
-                    }
-                } else if left_is_ptr_or_arr && right_is_ptr_or_arr && op == BinaryOp::Sub {
+                if left_is_ptr && self.types.is_integer(right_type) {
+                    left_type
+                } else if self.types.is_integer(left_type) && right_is_ptr && op == BinaryOp::Add {
+                    right_type
+                } else if left_is_ptr && right_is_ptr && op == BinaryOp::Sub {
                     // ptr - ptr -> ptrdiff_t (long)
                     self.types.long_id
                 } else {
@@ -1900,8 +1993,7 @@ impl<'a> Parser<'a> {
             ExprKind::Arrow { expr, member } => (self.types.base_type(expr.typ?)?, *member),
             _ => return None,
         };
-        let resolved = self.resolve_struct_type(base_typ);
-        let info = self.types.find_member(resolved, member)?;
+        let info = self.types.find_member(base_typ, member)?;
         Some((info.bit_width?, info.typ))
     }
 
@@ -2404,13 +2496,17 @@ impl<'a> Parser<'a> {
                         // C17 6.5.4p2: a cast names a scalar type or `void`.
                         // An array was converted as if it were its first
                         // element's address. (A union stays: gcc casts to
-                        // one, and so does c17.)
+                        // one, and so does c17 -- see `cast_to_union`.)
                         match self.types.kind(typ) {
                             TypeKind::Array => {
                                 diag::error(paren_pos, &gettext("cast specifies array type"))
                             }
                             TypeKind::Function => {
                                 diag::error(paren_pos, &gettext("cast specifies function type"))
+                            }
+                            TypeKind::Union => {
+                                let cast = self.cast_to_union(typ, expr, paren_pos);
+                                return Ok(self.with_type_name_extents(dims, cast));
                             }
                             _ => {}
                         }

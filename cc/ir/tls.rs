@@ -33,8 +33,8 @@
 //! as a global, where the descriptor call was emitted invisibly to the
 //! allocator on Linux, and a plain non-TLS reference was printed on Darwin.
 
-use super::{Function, Instruction, Module, Opcode, Pseudo, PseudoId, PseudoKind};
-use crate::types::TypeId;
+use super::{Function, Instruction, Module, Opcode, Pseudo, PseudoId};
+use crate::types::{TypeId, TypeTable};
 use std::collections::{BTreeMap, HashSet};
 
 /// Rewrite every thread-local access in `module` into an explicit address
@@ -44,9 +44,9 @@ use std::collections::{BTreeMap, HashSet};
 /// the backend uses to choose the dynamic model, and the two must agree, since
 /// the backend's own thread-local paths are what handle the other models.
 ///
-/// `ptr_type` types the addresses this pass introduces. What is accessed
+/// The addresses this pass introduces are `void *`s. What is accessed
 /// through them is irrelevant to how they are held.
-pub fn expand_dynamic_tls(module: &mut Module, dynamic: bool, ptr_type: TypeId) {
+pub fn expand_dynamic_tls(module: &mut Module, dynamic: bool, types: &TypeTable) {
     if !dynamic {
         return;
     }
@@ -63,8 +63,10 @@ pub fn expand_dynamic_tls(module: &mut Module, dynamic: bool, ptr_type: TypeId) 
         return;
     }
 
+    let ptr_type = types.void_ptr_id;
+    let ptr = (ptr_type, types.size_bits(ptr_type));
     for func in &mut module.functions {
-        expand_function(func, &tls, ptr_type);
+        expand_function(func, &tls, ptr);
     }
 }
 
@@ -74,17 +76,17 @@ pub fn expand_dynamic_tls(module: &mut Module, dynamic: bool, ptr_type: TypeId) 
 /// thread-local are two *different* `Sym` pseudos carrying the same name --
 /// which is what the address cache has to key on.
 fn tls_name(func: &Function, id: super::PseudoId, tls: &HashSet<String>) -> Option<String> {
-    match func.get_pseudo(id).map(|p| &p.kind) {
-        // A `Sym` pseudo that also appears in `locals` is a stack slot whose
-        // name merely collides with a global's; only the global is thread-local.
-        Some(PseudoKind::Sym(name)) if tls.contains(name) && !func.locals.contains_key(name) => {
-            Some(name.clone())
-        }
-        _ => None,
-    }
+    // A `Sym` pseudo that *is* a local is a stack slot whose name merely
+    // collides with a global's; only the global is thread-local. Asked by
+    // identity, since a parameter and a block-scope `extern` can share a name.
+    func.global_sym_name(id)
+        .filter(|name| tls.contains(*name))
+        .map(str::to_string)
 }
 
-fn expand_function(func: &mut Function, tls: &HashSet<String>, ptr_type: TypeId) {
+/// `ptr` is the type and width of the addresses it introduces.
+fn expand_function(func: &mut Function, tls: &HashSet<String>, ptr: (TypeId, u32)) {
+    let (ptr_type, ptr_bits) = ptr;
     for block_idx in 0..func.blocks.len() {
         let old = std::mem::take(&mut func.blocks[block_idx].insns);
         let mut new = Vec::with_capacity(old.len());
@@ -145,7 +147,7 @@ fn expand_function(func: &mut Function, tls: &HashSet<String>, ptr_type: TypeId)
                             base,
                             delta,
                             ptr_type,
-                            64,
+                            ptr_bits,
                         ));
                         addr
                     };
@@ -186,7 +188,9 @@ fn address_of(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{AsmConstraint, AsmData, BasicBlock, BasicBlockId, GlobalDef, Initializer};
+    use crate::ir::{
+        AsmConstraint, AsmData, BasicBlock, BasicBlockId, GlobalDef, Initializer, PseudoKind,
+    };
     use crate::target::Target;
     use crate::types::TypeTable;
 
@@ -204,12 +208,8 @@ mod tests {
         func.add_pseudo(Pseudo::reg(out, 1));
         func.next_pseudo = 2;
         let operand = |pseudo, constraint: &str, offset| AsmConstraint {
-            pseudo,
-            name: None,
-            matching_output: None,
-            constraint: constraint.to_string(),
-            size: 64,
             offset,
+            ..AsmConstraint::new(pseudo, constraint, Target::host().arch, 64)
         };
         let mut entry = BasicBlock::new(BasicBlockId(0));
         entry.add_insn(Instruction::new(Opcode::Entry));
@@ -230,7 +230,7 @@ mod tests {
         let mut module = Module::default();
         module.globals.push(global);
         module.add_function(func);
-        expand_dynamic_tls(&mut module, true, types.void_ptr_id);
+        expand_dynamic_tls(&mut module, true, &types);
 
         let insns = &module.functions[0].blocks[0].insns;
         let tls: Vec<_> = insns.iter().filter(|i| i.op == Opcode::TlsAddr).collect();
@@ -256,5 +256,68 @@ mod tests {
         assert!(matches!(delta.kind, PseudoKind::Val(16)));
         // The register operand is untouched.
         assert_eq!(asm.outputs[0].pseudo, out);
+    }
+
+    /// A parameter is registered in `locals` under its bare name, and a
+    /// thread-local reached through a block-scope `extern` of the same name
+    /// is a different `Sym` carrying that name. Only the parameter's own
+    /// pseudo is the stack slot; the global's store, load and address-of are
+    /// all thread-local accesses.
+    #[test]
+    fn thread_local_shadowed_by_a_parameter_is_still_expanded() {
+        let types = TypeTable::new(&Target::host());
+        let int = types.int_id;
+        let mut func = Function::new("f", int);
+        let param = PseudoId(0);
+        func.add_pseudo(Pseudo::sym(param, "x".to_string()));
+        func.add_local("x", param, int, None, None);
+        let global = PseudoId(1);
+        func.add_pseudo(Pseudo::sym(global, "x".to_string()));
+        let one = PseudoId(2);
+        func.add_pseudo(Pseudo::val(one, 1));
+        let loaded = PseudoId(3);
+        func.add_pseudo(Pseudo::reg(loaded, 3));
+        let addr = PseudoId(4);
+        func.add_pseudo(Pseudo::reg(addr, 4));
+        let from_param = PseudoId(5);
+        func.add_pseudo(Pseudo::reg(from_param, 5));
+        func.next_pseudo = 6;
+        let mut entry = BasicBlock::new(BasicBlockId(0));
+        entry.add_insn(Instruction::new(Opcode::Entry));
+        entry.add_insn(Instruction::store(one, global, 0, int, 32));
+        entry.add_insn(Instruction::load(loaded, global, 0, int, 32));
+        entry.add_insn(Instruction::sym_addr(addr, global, types.void_ptr_id));
+        entry.add_insn(Instruction::load(from_param, param, 0, int, 32));
+        entry.add_insn(Instruction::ret(None));
+        func.entry = BasicBlockId(0);
+        func.blocks = vec![entry];
+        func.rebuild_block_idx();
+
+        let mut module = Module::default();
+        module.extern_tls_symbols.insert("x".to_string());
+        module.add_function(func);
+        expand_dynamic_tls(&mut module, true, &types);
+
+        let insns = &module.functions[0].blocks[0].insns;
+        let tls: Vec<_> = insns.iter().filter(|i| i.op == Opcode::TlsAddr).collect();
+        // One computed for the store and reused by the load, and the
+        // address-of converted in place.
+        assert_eq!(tls.len(), 2, "{insns:?}");
+        assert!(tls.iter().all(|i| i.src == [global]), "{insns:?}");
+        let computed = tls[0].target.unwrap();
+        let store = insns.iter().find(|i| i.op == Opcode::Store).unwrap();
+        assert_eq!(store.src[0], computed);
+        let load = insns
+            .iter()
+            .find(|i| i.op == Opcode::Load && i.target == Some(loaded))
+            .unwrap();
+        assert_eq!(load.src[0], computed);
+        assert!(tls.iter().any(|i| i.target == Some(addr)), "{insns:?}");
+        // The parameter's own slot is untouched.
+        let param_load = insns
+            .iter()
+            .find(|i| i.op == Opcode::Load && i.target == Some(from_param))
+            .unwrap();
+        assert_eq!(param_load.src[0], param);
     }
 }

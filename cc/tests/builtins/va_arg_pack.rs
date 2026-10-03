@@ -49,6 +49,10 @@ int main(void) {
 #[test]
 fn builtins_va_arg_pack_forwards_the_callers_arguments() {
     assert_eq!(compile_and_run("builtins_va_arg_pack", FORWARDING, &[]), 0);
+    assert_eq!(
+        compile_and_run("builtins_va_arg_pack_o0", FORWARDING, &["-O0".to_string()]),
+        0
+    );
 }
 
 /// The splice happens in the inliner, and `always_inline` fires at every
@@ -111,6 +115,50 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("builtins_va_arg_pack_len", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("builtins_va_arg_pack_len_o0", code, &["-O0".to_string()]),
+        0
+    );
+}
+
+/// At `-O0` nothing removes a static forwarder once every call is spliced,
+/// and an extern `gnu_inline` one -- glibc's `open` in `bits/fcntl2.h` -- is
+/// never removed at any level. Either way its body is still in the module
+/// with its `__builtin_va_arg_pack_len()` unresolved, which is right: it has
+/// no out-of-line form and is never emitted. Lowering used to reject it as a
+/// placeholder reaching codegen and stop the compiler.
+#[test]
+fn builtins_va_arg_pack_unemitted_forwarder_is_not_codegen() {
+    let forwarder = |linkage: &str| {
+        format!(
+            r#"
+{linkage} __attribute__((always_inline)) int count(const char *tag, ...) {{
+    (void)tag;
+    return __builtin_va_arg_pack_len();
+}}
+
+int main(void) {{
+    if (count("a") != 0) return 1;
+    if (count("a", 1, 2, 3, 4, 5) != 5) return 2;
+    return 0;
+}}
+"#
+        )
+    };
+    for (tag, linkage) in [
+        ("static", "static inline"),
+        ("gnu_inline", "extern inline __attribute__((gnu_inline))"),
+    ] {
+        let code = forwarder(linkage);
+        for opt in ["-O0", "-O2"] {
+            let name = format!("va_pack_unemitted_{tag}{opt}");
+            assert_eq!(
+                compile_and_run(&name, &code, &[opt.to_string()]),
+                0,
+                "{tag} at {opt}"
+            );
+        }
+    }
 }
 
 /// Both builtins are meaningless outside an `always_inline` variadic

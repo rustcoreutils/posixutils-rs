@@ -11,7 +11,7 @@
 // Consolidates: bitfield, mixed_cmp, ops_struct, short_circuit tests
 //
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_and_run_everywhere};
 
 // ============================================================================
 // Mega-test: C89 operators (bitfield, mixed_cmp, ops_struct, short_circuit)
@@ -690,6 +690,16 @@ fn c89_operand_constraints_are_diagnosed_as_gcc_does() {
             "(void)(p - vp);",
             "invalid operands to binary - (have 'int *' and 'void *')",
         ),
+        // subscript (6.5.2.1p1): the pointer must be to a complete object
+        // type, and gcc's arithmetic on function pointers does not reach it
+        (
+            "(void)((&fn)[0]);",
+            "subscripted value is pointer to function",
+        ),
+        (
+            "(void)(0[&fn]);",
+            "subscripted value is pointer to function",
+        ),
         (
             "(void)(p - as);",
             "invalid operands to binary - (have 'int *' and 'struct S *')",
@@ -995,6 +1005,8 @@ fn c89_valid_unusual_operands_compile_silently() {
         "(void)(b + e); (void)(e & b); (void)(b % 2); b += 1; e += 1; (void)(s.a + 1);",
         "if (p) {} while (z) {} for (; d;) {} do {} while (fn);",
         "(void)(p ? 1 : 2); (void)(as[0].a << 1);",
+        "long l = fn - fn; int (*g)(int) = fn + 1; g = 1 + fn; g = fn - 1; l = g - fn;",
+        "int (*g)(int) = &fn + 1; g += 2; g -= 1; g++; --g; (void)(g < fn); (void)sizeof fn;",
     ]
     .into_iter()
     .enumerate()
@@ -1006,4 +1018,58 @@ fn c89_valid_unusual_operands_compile_silently() {
         );
         assert!(stderr.is_empty(), "{body}: expected silence\n{stderr}");
     }
+}
+
+/// Arithmetic on a pointer to a function, which gcc accepts silently as a GNU
+/// extension: it steps by 1, as `void *` arithmetic does, and `sizeof` a
+/// function type is 1. A function designator decays first, so `f - f` is a
+/// `ptrdiff_t` and `f + 3` a pointer. The difference of two function pointers
+/// used to divide by the function type's size of 0 and trap.
+#[test]
+fn c89_function_pointer_arithmetic_steps_by_one() {
+    compile_and_run_everywhere(
+        "fnptr_arith",
+        r#"typedef int fn_t(int);
+int f(int x) { return x; }
+int h(int x) { return x + 1; }
+static long diff(int (*a)(void), int (*b)(void)) { return a - b; }
+static long designators(void) { return f - f; }
+static long bytes(void *a, void *b) { return (char *)a - (char *)b; }
+int (*gp)(int) = f + 3;
+int (*gq)(int) = &f - 2;
+static const unsigned long gsz = sizeof(fn_t);
+int main(void) {
+    int (*fp)(int) = f;
+    int (*q)(int) = fp + 1;
+    int (*r)(int) = 2 + fp;
+    volatile long zero = 0;
+    if (diff((int (*)(void))zero, (int (*)(void))zero) != 0) return 1;
+    if (designators() != 0) return 2;
+    if (h - f != bytes((void *)h, (void *)f)) return 3;
+    if (bytes((void *)q, (void *)fp) != 1) return 4;
+    if (bytes((void *)r, (void *)fp) != 2) return 5;
+    if (bytes((void *)(fp - 1), (void *)fp) != -1) return 6;
+    if (q - fp != 1 || fp - q != -1) return 7;
+    int (*s)(int) = fp;
+    s++;
+    ++s;
+    s += 3;
+    s -= 1;
+    s--;
+    if (bytes((void *)s, (void *)fp) != 3) return 8;
+    if (bytes((void *)(&f + 1), (void *)f) != 1) return 9;
+    if (bytes((void *)gp, (void *)f) != 3) return 10;
+    if (bytes((void *)gq, (void *)f) != -2) return 11;
+    if (sizeof(f) != 1 || sizeof(*fp) != 1 || gsz != 1) return 12;
+    if (!(fp < q) || fp >= q || q - 1 != fp) return 13;
+    void *vp = (void *)fp;
+    if (bytes((void *)((char *)vp + 5), vp) != 5 || (char *)(vp + 5) - (char *)vp != 5) return 14;
+    if (sizeof(void) != 1) return 15;
+    long n = zero + 4;
+    if ((fp + n) - fp != 4) return 16;
+    if (bytes((void *)(f + 1), (void *)f) != 1 || bytes((void *)(n + f), (void *)f) != 4) return 17;
+    return fp(0);
+}
+"#,
+    );
 }

@@ -359,6 +359,21 @@ impl Target {
         }
     }
 
+    /// The prefix that makes an assembler symbol private: a label the
+    /// assembler resolves itself and never writes to the symbol table.
+    ///
+    /// ELF assemblers treat `.L` that way. Mach-O's treats only `L` (and
+    /// `l`), so on Mach-O a `.L` name is an ordinary symbol, and an ordinary
+    /// symbol in `__text` starts a new atom: a CFI advance across a block
+    /// label stops being a constant, and Apple's assembler rejects it
+    /// ("invalid CFI advance_loc expression").
+    pub fn private_label_prefix(&self) -> &'static str {
+        match self.os {
+            Os::MacOS => "L",
+            Os::Linux | Os::FreeBSD => ".L",
+        }
+    }
+
     /// The width in bits of an integer type on this target.
     pub fn int_width(&self, t: IntType) -> u32 {
         match t {

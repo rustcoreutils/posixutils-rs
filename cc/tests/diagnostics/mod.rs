@@ -18,6 +18,15 @@
 // everything.
 //
 
+mod asm_constraints;
+mod asm_templates;
+mod cast_to_union;
+mod conditional_operands;
+mod function_compatibility;
+mod inline_static_reference;
+mod return_conversion;
+mod va_arg_pack;
+
 use crate::common::{
     compile_and_run, compile_and_run_two_units, compile_expect_error, compile_expect_no_diagnostic,
     compile_expect_ok, compile_expect_warning, create_c_file, run_c17,
@@ -1265,12 +1274,12 @@ fn diagnostics_incompatible_assignment_is_rejected() {
         (
             "return_ptr_from_double",
             "int *f(void){ return 1.5; }\n",
-            "incompatible types returning",
+            "incompatible types when returning",
         ),
         (
             "return_struct_mismatch",
             "struct A{int x;}; struct B{int x;};\nstruct A f(void){ struct B b; return b; }\n",
-            "incompatible types returning",
+            "incompatible types when returning",
         ),
         (
             "argument_ptr_from_double",
@@ -5829,6 +5838,11 @@ fn diagnostics_permissive_relaxes_the_constraints_gcc_warns_about() {
         (
             "inline_reads_a_file_scope_static",
             "static const int k = 3;\ninline int f(void) { return k; }\nint main(void){ return f() - 3; }\n",
+            "cannot reference file-scope static",
+        ),
+        (
+            "inline_updates_a_file_scope_static",
+            "static int k;\ninline void f(void) { k += 3; }\nint main(void){ f(); return k - 3; }\n",
             "cannot reference file-scope static",
         ),
     ];

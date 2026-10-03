@@ -31,23 +31,18 @@
 // intervals frightening.
 //
 
-use super::constfold::at_width;
+use super::constfold::{at_width, signed_min_at, Outcomes};
 use std::cmp::Ordering;
 
-/// The low `width` bits set.
-/// The signed range a `width`-bit value spans.
-///
-/// Not `-(1i128 << (w - 1))`: at `w == 128` that shift yields `i128::MIN`
-/// and negating it overflows, which panics a debug build -- and CI runs the
-/// tests in debug.
+/// The signed range a `width`-bit value spans. The maximum is the
+/// complement of the minimum, which unlike negating it cannot overflow at
+/// 128 bits.
 const fn signed_bounds(width: u32) -> (i128, i128) {
-    if width >= 128 {
-        (i128::MIN, i128::MAX)
-    } else {
-        (-(1i128 << (width - 1)), (1i128 << (width - 1)) - 1)
-    }
+    let min = signed_min_at(width);
+    (min, !min)
 }
 
+/// The low `width` bits set.
 const fn mask(width: u32) -> u128 {
     if width >= 128 {
         u128::MAX
@@ -773,8 +768,9 @@ fn fill_ones(v: u128) -> u128 {
 /// range below the truth, prove a live comparison constant, and delete a
 /// live branch arm -- in real code the error path or the bounds check.
 ///
-/// `mask` is `constfold`'s `CMP_LT | CMP_EQ | CMP_GT` encoding.
-pub(crate) fn allowed_by_predicate(mask: u8, signed: bool, other: &Range) -> Range {
+/// Only the ordered outcomes in `mask` are read: an integer comparison has
+/// no other.
+pub(crate) fn allowed_by_predicate(mask: Outcomes, signed: bool, other: &Range) -> Range {
     if signed {
         allowed_unsigned(mask, &other.signed_view()).signed_view()
     } else {
@@ -782,26 +778,28 @@ pub(crate) fn allowed_by_predicate(mask: u8, signed: bool, other: &Range) -> Ran
     }
 }
 
-fn allowed_unsigned(mask: u8, other: &Range) -> Range {
-    use super::constfold::{CMP_ALL, CMP_EQ, CMP_GT, CMP_LT};
+fn allowed_unsigned(cmp: Outcomes, other: &Range) -> Range {
+    const LT: Outcomes = Outcomes::LT;
+    const EQ: Outcomes = Outcomes::EQ;
+    const GT: Outcomes = Outcomes::GT;
     let w = other.width;
-    if other.is_empty() || mask == 0 {
+    if other.is_empty() || cmp.is_empty() {
         return Range::empty(w);
     }
     let (omin, omax) = (other.unsigned_min(), other.unsigned_max());
-    let top = mask_of(w);
-    match mask & CMP_ALL {
-        CMP_EQ => *other,
-        CMP_LT if omax == 0 => Range::empty(w),
-        CMP_LT => Range::inclusive(w, 0, omax - 1),
-        m if m == CMP_LT | CMP_EQ => Range::inclusive(w, 0, omax),
-        CMP_GT if omin == top => Range::empty(w),
-        CMP_GT => Range::inclusive(w, omin + 1, top),
-        m if m == CMP_GT | CMP_EQ => Range::inclusive(w, omin, top),
+    let top = mask(w);
+    match cmp & Outcomes::ORDERED {
+        EQ => *other,
+        LT if omax == 0 => Range::empty(w),
+        LT => Range::inclusive(w, 0, omax - 1),
+        m if m == LT | EQ => Range::inclusive(w, 0, omax),
+        GT if omin == top => Range::empty(w),
+        GT => Range::inclusive(w, omin + 1, top),
+        m if m == GT | EQ => Range::inclusive(w, omin, top),
         // `x != y` for some `y`: everything, unless `other` is one value,
         // in which case the exact complement -- which only a wrapped
         // interval can say.
-        m if m == CMP_LT | CMP_GT => match other.single_value() {
+        m if m == LT | GT => match other.single_value() {
             Some(v) => Range::half_open(w, v.wrapping_add(1) & top, v),
             None => Range::full(w),
         },
@@ -815,9 +813,9 @@ fn allowed_unsigned(mask: u8, other: &Range) -> Range {
 /// A superset of the truth: computed from the min/max hulls, so a set with a
 /// gap may report an ordering it cannot actually achieve. That direction
 /// only ever prevents a fold.
-pub(crate) fn possible_orderings(a: &Range, b: &Range, signed: bool) -> u8 {
+pub(crate) fn possible_orderings(a: &Range, b: &Range, signed: bool) -> Outcomes {
     if a.is_empty() || b.is_empty() || a.width != b.width {
-        return 0;
+        return Outcomes::NONE;
     }
     // Each question is answered in its own domain. Casting the unsigned
     // hulls to `i128` to share one body is wrong at width 128, where a value
@@ -842,24 +840,18 @@ pub(crate) fn possible_orderings(a: &Range, b: &Range, signed: bool) -> u8 {
 }
 
 /// The orderings two min/max hulls admit, over any totally ordered domain.
-fn hull_orderings<T: Ord>(amin: T, amax: T, bmin: T, bmax: T) -> u8 {
-    use super::constfold::{CMP_EQ, CMP_GT, CMP_LT};
-    let mut m = 0;
+fn hull_orderings<T: Ord>(amin: T, amax: T, bmin: T, bmax: T) -> Outcomes {
+    let mut m = Outcomes::NONE;
     if amin < bmax {
-        m |= CMP_LT;
+        m = m | Outcomes::LT;
     }
     if amax > bmin {
-        m |= CMP_GT;
+        m = m | Outcomes::GT;
     }
     if amin <= bmax && bmin <= amax {
-        m |= CMP_EQ;
+        m = m | Outcomes::EQ;
     }
     m
-}
-
-/// `mask` as a free function, for the module-level routines above.
-const fn mask_of(width: u32) -> u128 {
-    mask(width)
 }
 
 #[cfg(test)]
@@ -1176,9 +1168,8 @@ mod tests {
     /// a live comparison constant and deletes a live branch.
     #[test]
     fn allowed_by_predicate_contains_every_consistent_value() {
-        use crate::ir::constfold::CMP_ALL;
         for other in all_ranges() {
-            for m in 0..=CMP_ALL {
+            for m in Outcomes::ORDERED.subsets() {
                 for signed in [false, true] {
                     let got = allowed_by_predicate(m, signed, &other);
                     for x in 0..N {
@@ -1188,17 +1179,12 @@ mod tests {
                             } else {
                                 (x as i128, y as i128)
                             };
-                            let ord = match a.cmp(&b) {
-                                Ordering::Less => 1,
-                                Ordering::Equal => 2,
-                                Ordering::Greater => 4,
-                            };
-                            m & ord != 0
+                            m.contains(Outcomes::of_ordering(Some(a.cmp(&b))))
                         });
                         if consistent {
                             assert!(
                                 got.contains(x),
-                                "mask={m} signed={signed} other={other:?}: \
+                                "mask={m:?} signed={signed} other={other:?}: \
                                  {x} is consistent but missing from {got:?}"
                             );
                         }
@@ -1213,9 +1199,8 @@ mod tests {
     /// to be exact, so it should hold.
     #[test]
     fn allowed_by_predicate_is_tight() {
-        use crate::ir::constfold::CMP_ALL;
         for other in all_ranges() {
-            for m in 0..=CMP_ALL {
+            for m in Outcomes::ORDERED.subsets() {
                 for signed in [false, true] {
                     // Only exact where `other` is an unbroken run in the
                     // order being asked about; a hull is all the arms use.
@@ -1242,16 +1227,11 @@ mod tests {
                             } else {
                                 (x as i128, y as i128)
                             };
-                            let ord = match a.cmp(&b) {
-                                Ordering::Less => 1,
-                                Ordering::Equal => 2,
-                                Ordering::Greater => 4,
-                            };
-                            m & ord != 0
+                            m.contains(Outcomes::of_ordering(Some(a.cmp(&b))))
                         });
                         assert!(
                             consistent,
-                            "mask={m} signed={signed} other={other:?}: \
+                            "mask={m:?} signed={signed} other={other:?}: \
                              {x} is in {got:?} but satisfies nothing"
                         );
                     }
@@ -1273,15 +1253,11 @@ mod tests {
                             } else {
                                 (x as i128, y as i128)
                             };
-                            let ord = match p.cmp(&q) {
-                                Ordering::Less => 1,
-                                Ordering::Equal => 2,
-                                Ordering::Greater => 4,
-                            };
+                            let ord = Outcomes::of_ordering(Some(p.cmp(&q)));
                             assert!(
-                                m & ord != 0,
+                                m.contains(ord),
                                 "{a:?} vs {b:?} signed={signed}: {x},{y} achieves \
-                                 ordering {ord} not in mask {m}"
+                                 ordering {ord:?} not in mask {m:?}"
                             );
                         }
                     }
@@ -1293,10 +1269,10 @@ mod tests {
     /// `x != 0` is the case a non-wrapping interval must throw away.
     #[test]
     fn not_equal_to_a_singleton_is_the_exact_complement() {
-        use crate::ir::constfold::{CMP_GT, CMP_LT};
-        let got = allowed_by_predicate(CMP_LT | CMP_GT, false, &Range::singleton(W, 0));
+        let ne = Outcomes::LT | Outcomes::GT;
+        let got = allowed_by_predicate(ne, false, &Range::singleton(W, 0));
         assert_eq!(bits(&got), 0xFFFF & !1, "everything but zero");
-        let got = allowed_by_predicate(CMP_LT | CMP_GT, false, &Range::singleton(W, 7));
+        let got = allowed_by_predicate(ne, false, &Range::singleton(W, 7));
         assert_eq!(bits(&got), 0xFFFF & !(1 << 7));
     }
 
@@ -1304,14 +1280,15 @@ mod tests {
     /// `var >= 1`, read signed.
     #[test]
     fn negating_a_signed_le_gives_the_positive_half() {
-        use crate::ir::constfold::{CMP_ALL, CMP_EQ, CMP_GT, CMP_LT};
+        use crate::ir::constfold::CmpDomain;
         let zero = Range::singleton(32, 0);
-        let le = CMP_LT | CMP_EQ;
-        let got = allowed_by_predicate(!le & CMP_ALL, true, &zero);
+        let le = Outcomes::LT | Outcomes::EQ;
+        let gt = le.complement(CmpDomain::Int { signed: true });
+        let got = allowed_by_predicate(gt, true, &zero);
         assert_eq!(got, Range::inclusive(32, 1, 0x7FFF_FFFF));
         assert_eq!(got.signed_min(), 1);
         assert_eq!(got.signed_max(), i32::MAX as i128);
-        assert_eq!(CMP_GT, !le & CMP_ALL);
+        assert_eq!(gt, Outcomes::GT);
     }
 
     /// The IR stores `(int)0xFFFFFFFFu` as `4294967295`, not `-1`, so the one
@@ -1393,26 +1370,26 @@ mod tests {
     /// made everything at or above `2^127` look negative.
     #[test]
     fn range_possible_orderings_are_unsigned_at_128_bits() {
-        use crate::ir::constfold::{CMP_EQ, CMP_GT, CMP_LT};
         let full = Range::full(128);
         let high = Range::singleton(128, SIGN);
 
         let m = possible_orderings(&full, &high, false);
-        assert!(m & CMP_LT != 0, "0 < 2^127");
-        assert!(m & CMP_EQ != 0, "2^127 is in the full set");
-        assert!(m & CMP_GT != 0, "u128::MAX > 2^127");
+        assert!(m.contains(Outcomes::LT), "0 < 2^127");
+        assert!(m.contains(Outcomes::EQ), "2^127 is in the full set");
+        assert!(m.contains(Outcomes::GT), "u128::MAX > 2^127");
 
         // The signed reading of the same pair is a different question and
         // must still be answered in its own domain.
         let ms = possible_orderings(&full, &high, true);
-        assert!(ms & CMP_LT != 0 || ms & CMP_EQ != 0 || ms & CMP_GT != 0);
+        assert!(!ms.is_empty());
 
         // Two disjoint unsigned runs, both above the sign bit.
         let lo = Range::inclusive(128, SIGN, SIGN + 3);
         let hi = Range::inclusive(128, SIGN + 10, SIGN + 20);
         let m = possible_orderings(&lo, &hi, false);
         assert_eq!(
-            m, CMP_LT,
+            m,
+            Outcomes::LT,
             "every member of `lo` is below every member of `hi`"
         );
     }

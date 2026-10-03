@@ -1066,6 +1066,44 @@ int main(void)
     }
 }
 
+/// A bit builtin over a value only a branch pins down folds like any other
+/// operation over a constant. `k` is an argument, so the constant exists only
+/// on the edge `k == 8` (or `k == 256`) proves -- which is value-range
+/// propagation's to see, and it used to give up on every bit operation even
+/// over a one-value range. `link_error` is never defined, so a missed fold
+/// fails the link.
+#[test]
+fn codegen_vrp_folds_a_bit_builtin_over_an_edge_constant() {
+    let code = r#"
+extern void link_error(void);
+
+__attribute__((noinline)) int f(unsigned k, unsigned long l)
+{
+    int r = 0;
+    if (k == 8) {
+        if (__builtin_popcount(k) != 1) link_error();
+        if (__builtin_ctz(k) != 3) link_error();
+        if (__builtin_clz(k) != 28) link_error();
+        r += 1;
+    }
+    if (l == 256) {
+        if (__builtin_bswap64(l) != 0x0001000000000000ul) link_error();
+        r += 2;
+    }
+    return r;
+}
+
+int main(void)
+{
+    return f(8, 256) == 3 && f(1, 1) == 0 ? 0 : 1;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_vrp_bit_builtin", code, &["-O2".to_string()]),
+        0
+    );
+}
+
 /// Shift identities that hold for *every* shift count, and the comparisons
 /// that prove them.
 ///
@@ -1193,6 +1231,47 @@ int main(void)
     for opt in ["-O1", "-O2"] {
         assert_eq!(
             compile_and_run("c17_relational_pairs", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// An `if` that assigns several variables leaves one phi per variable at
+/// its merge, and if-conversion turns them all into selects at once -- each
+/// over its own pair of values, whatever its type -- or leaves the branch
+/// alone. Checked by value on both edges.
+#[test]
+fn codegen_ifconv_collapses_every_phi_at_a_merge() {
+    let code = r#"
+extern void abort(void);
+
+__attribute__((noinline)) static long merged(int c, int x, double dv)
+{
+    int a = 7;
+    long b = -5;
+    short s = 300;
+    double d = 0.5;
+    if (c > x) {
+        a = x + 1;
+        b = (long)x * 3;
+        s = (short)(x ^ 0x55);
+        d = dv;
+    }
+    return a + b + s + (long)(d * 4.0);
+}
+
+int main(void)
+{
+    if (merged(0, 10, 2.25) != 7 - 5 + 300 + 2) abort();
+    if (merged(20, 10, 2.25) != 11 + 30 + (10 ^ 0x55) + 9) abort();
+    if (merged(-1, -3, -1.0) != -2 - 9 + (short)(-3 ^ 0x55) - 4) abort();
+    return 0;
+}
+"#;
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("c17_ifconv_every_phi", code, &[opt.to_string()]),
             0,
             "at {opt}"
         );
@@ -1836,6 +1915,48 @@ int main(void) {
             "{level}"
         );
         if let Some(rc) = compile_and_run_aarch64("narrow_values_a64", run, level) {
+            assert_eq!(rc, 0, "aarch64 {level}");
+        }
+    }
+}
+
+/// Every conversion of a constant folds to the value the conversion produces
+/// at run time: the operand is read at the width the conversion records for
+/// it, never at its result's width. An extension read at its destination
+/// width is the identity, so a negative `char` would come back positive; a
+/// `double` read at the 32 bits of the `float` or `int` it becomes is not
+/// the `double` at all.
+#[test]
+fn codegen_a_conversion_of_a_constant_reads_its_source_width() {
+    let src = r#"
+#include <math.h>
+int main(void) {
+    signed char sc = -56;
+    unsigned char uc = 200;
+    long long wide = 0x123456789LL;
+    if ((int)sc != -56 || (unsigned)sc != 4294967240u) return 1;
+    if ((int)uc != 200 || (long long)(short)-2 != -2) return 2;
+    if ((int)wide != 0x23456789 || (short)wide != 0x6789) return 3;
+    double d = 0.1;
+    float f = (float)d;
+    if (f != 0.1f || (double)f == d) return 4;
+    if ((int)-3.75 != -3 || (unsigned)3e9 != 3000000000u) return 5;
+    if ((long long)-1e15 != -1000000000000000LL) return 6;
+    if ((double)sc != -56.0 || (float)uc != 200.0f) return 7;
+    if ((double)18446744073709551615ull != 18446744073709551616.0) return 8;
+    long double ld = -0.0L;
+    if (!signbit(ld) || !signbit(-2.5) || signbit(2.5f) || (long double)d != 0.1) return 9;
+    return 0;
+}
+"#;
+    for level in ["-O0", "-O1", "-O2"] {
+        let opts = vec![level.to_string(), "-lm".to_string()];
+        assert_eq!(
+            compile_and_run(&format!("convert_const{level}"), src, &opts),
+            0,
+            "{level}"
+        );
+        if let Some(rc) = compile_and_run_aarch64("convert_const_a64", src, level) {
             assert_eq!(rc, 0, "aarch64 {level}");
         }
     }

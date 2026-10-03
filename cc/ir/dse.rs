@@ -40,8 +40,8 @@
 //
 
 use super::escape::EscapeInfo;
-use super::memloc::{is_ordinary_object, may_alias, AddrMap, MemBase, MemLoc, ModuleInfo};
-use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
+use super::memloc::{is_ordinary_object, may_alias, Access, AddrMap, MemBase, MemLoc, ModuleInfo};
+use super::{BasicBlockId, Function, Opcode, PseudoId};
 use crate::types::TypeTable;
 use std::collections::{HashMap, HashSet};
 
@@ -64,18 +64,18 @@ pub(crate) fn run(func: &mut Function, types: &TypeTable, mi: &ModuleInfo) -> bo
         return false;
     }
     let am = AddrMap::build(func);
-    let facts = Facts {
+    let ctx = DseCtx {
         func,
         types,
         esc: &esc,
         am: &am,
         mi,
     };
-    let dead_at_end = facts.dead_locals_at_block_end();
+    let dead_at_end = ctx.dead_locals_at_block_end();
 
     let mut kills: Vec<(usize, usize)> = Vec::new();
     for b in 0..func.blocks.len() {
-        facts.scan_block(b, &dead_at_end, &mut kills);
+        ctx.scan_block(b, &dead_at_end, &mut kills);
     }
 
     for (b, i) in &kills {
@@ -92,7 +92,7 @@ struct Pending {
 
 /// What the pass knows about the function it is scanning.
 #[derive(Clone, Copy)]
-struct Facts<'a> {
+struct DseCtx<'a> {
     func: &'a Function,
     types: &'a TypeTable,
     esc: &'a EscapeInfo,
@@ -100,7 +100,7 @@ struct Facts<'a> {
     mi: &'a ModuleInfo,
 }
 
-impl Facts<'_> {
+impl DseCtx<'_> {
     /// Collect the dead stores in one block.
     fn scan_block(
         &self,
@@ -108,7 +108,7 @@ impl Facts<'_> {
         dead_at_end: &HashMap<BasicBlockId, HashSet<PseudoId>>,
         kills: &mut Vec<(usize, usize)>,
     ) {
-        let Facts {
+        let DseCtx {
             func,
             types,
             am,
@@ -125,7 +125,10 @@ impl Facts<'_> {
             // Anything that may read one of the pending locations makes it live
             // again. This runs before the store rule below, because a
             // read-modify-write reads the bytes it is about to write.
-            pending.retain(|p| !self.may_read(insn, &p.loc));
+            if !pending.is_empty() {
+                let access = mi.access(am, func, insn);
+                pending.retain(|p| !self.may_read(&access, &p.loc));
+            }
 
             if insn.op != Opcode::Store {
                 continue;
@@ -171,68 +174,16 @@ impl Facts<'_> {
         }
     }
 
-    /// Could `insn` read any byte of `loc`?
-    fn may_read(&self, insn: &Instruction, loc: &MemLoc) -> bool {
-        let Facts {
-            func, esc, am, mi, ..
-        } = *self;
-        match insn.op {
-            // Nothing here reaches memory.
-            Opcode::Nop
-            | Opcode::Entry
-            | Opcode::Phi
-            | Opcode::PhiSource
-            | Opcode::Copy
-            | Opcode::SetVal
-            | Opcode::SymAddr
-            | Opcode::Select
-            | Opcode::Br
-            | Opcode::Cbr
-            | Opcode::Switch
-            | Opcode::IndirectBr
-            | Opcode::Unreachable => false,
-
-            Opcode::Load => may_alias(&am.location_of(func, insn), loc, mi),
-
-            // A store *writes*; the bytes it does not cover stay as they were,
-            // so it reads nothing. The covering rule above is what uses it.
-            Opcode::Store => false,
-
-            // `memcpy` reads its source and writes its destination, and
-            // `memmove` may do both to overlapping ranges. Neither extent is
-            // `insn.size`, which is the pointer's width.
-            Opcode::Memcpy | Opcode::Memmove => insn
-                .src
-                .iter()
-                .take(2)
-                .any(|a| may_alias(&am.resolve(func, *a, 0, 0, None), loc, mi)),
-            // `memset` writes a constant; it reads nothing.
-            Opcode::Memset => false,
-
-            // A callee reads what it can reach. A local whose address never left
-            // this function is not that, and a `pure` callee reads but a `const`
-            // one does not -- except that reading is exactly what is being asked
-            // about, so only the escape question helps here.
-            Opcode::Call => esc.is_captured(&loc.base),
-
-            // A `Ret` hands the object to the caller, which is a read by any
-            // other name -- an aggregate return carries an address rather than a
-            // value. But the operand of a scalar return is a *value*, and
-            // resolving one as an address answers `Unknown`, which aliases
-            // everything and made every `return 0;` revive every pending store.
-            //
-            // The escape question settles it instead: a local whose address
-            // reaches a `Ret` has escaped by that very fact, so a local that did
-            // not escape cannot be what is being returned.
-            Opcode::Ret => esc.is_captured(&loc.base),
-
-            _ if !insn.op.may_access_memory() => false,
-
-            // `Asm`, `Alloca`, `StackSave`/`StackRestore`, the `Va*` family,
-            // every atomic, and anything unlisted. A `"memory"` clobber can name
-            // a frame slot without naming an operand.
-            _ => true,
-        }
+    /// Could an instruction that touches `access` read any byte of `loc`?
+    ///
+    /// What `AddrMap::access` says it reads, against `loc`. A `Ret` reads
+    /// nothing there, which is right for both kinds of object this pass
+    /// tracks: a local that did not escape cannot be what is returned -- an
+    /// address reaching a `Ret` is an escape -- and a store to anything else
+    /// is never dead at exit, so no answer about a `Ret`, the last
+    /// instruction of its block, could kill one.
+    fn may_read(&self, access: &Access, loc: &MemLoc) -> bool {
+        access.may_read(loc, self.mi, self.esc)
     }
 }
 
@@ -247,7 +198,7 @@ fn covers(later: &MemLoc, earlier: &MemLoc) -> bool {
     }
 }
 
-impl Facts<'_> {
+impl DseCtx<'_> {
     /// Which locals are never read again, at the end of each block.
     ///
     /// A backward "not read on any path from here" analysis, keyed by the
@@ -260,8 +211,12 @@ impl Facts<'_> {
     /// block-scope `static` is a `Global` here and so is never a candidate,
     /// which is the trap this guards.
     fn dead_locals_at_block_end(&self) -> HashMap<BasicBlockId, HashSet<PseudoId>> {
-        let Facts {
-            func, types, esc, ..
+        let DseCtx {
+            func,
+            types,
+            esc,
+            am,
+            mi,
         } = *self;
         let mut candidates: HashSet<PseudoId> = HashSet::new();
         for p in &func.pseudos {
@@ -282,23 +237,34 @@ impl Facts<'_> {
             return out;
         }
 
-        // What each block reads, computed once.
+        // What each block reads, computed once, and each instruction's
+        // footprint once rather than once per candidate.
+        let wholes: Vec<(PseudoId, MemLoc)> = candidates
+            .iter()
+            .map(|&c| {
+                let whole = MemLoc {
+                    base: MemBase::Local(c),
+                    offset: Some(0),
+                    size: 0,
+                    typ: None,
+                };
+                (c, whole)
+            })
+            .collect();
         let mut reads: HashMap<BasicBlockId, HashSet<PseudoId>> = HashMap::new();
         for bb in &func.blocks {
             let mut r = HashSet::new();
             for insn in &bb.insns {
-                for &c in &candidates {
-                    if r.contains(&c) {
-                        continue;
-                    }
-                    let whole = MemLoc {
-                        base: MemBase::Local(c),
-                        offset: Some(0),
-                        size: 0,
-                        typ: None,
-                    };
-                    if self.may_read(insn, &whole) {
-                        r.insert(c);
+                if r.len() == wholes.len() {
+                    break;
+                }
+                let access = mi.access(am, func, insn);
+                if access.reads.is_empty() {
+                    continue;
+                }
+                for (c, whole) in &wholes {
+                    if !r.contains(c) && self.may_read(&access, whole) {
+                        r.insert(*c);
                     }
                 }
             }
@@ -354,7 +320,7 @@ impl Facts<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{BasicBlock, FenceScope, MemoryOrder, Module, Pseudo};
+    use crate::ir::{BasicBlock, FenceScope, Instruction, MemoryOrder, Module, Pseudo};
     use crate::target::Target;
 
     fn host_types() -> TypeTable {
@@ -791,6 +757,67 @@ mod tests {
         assert!(!b.run());
         assert_eq!(b.op(0, 1), Opcode::Store);
         assert_eq!(b.op(0, 2), Opcode::Store);
+    }
+
+    /// A block op from `src` to `dest`, `%5` bytes long.
+    fn block_op(op: Opcode, dest: PseudoId, src: PseudoId, types: &TypeTable) -> Instruction {
+        Instruction::new(op)
+            .with_src3(dest, src, PseudoId(5))
+            .with_type_and_size(types.void_ptr_id, 64)
+    }
+
+    /// A local whose address went only to a block op has not escaped, so a
+    /// store to it that nothing reads before the frame goes is dead -- a
+    /// `memset` reads nothing.
+    #[test]
+    fn dse_a_local_only_a_block_op_wrote_is_dead_at_exit() {
+        let mut b = Build::new();
+        let i32t = b.types.int_id;
+        let set = block_op(Opcode::Memset, PseudoId(0), PseudoId(6), &b.types);
+        b.block(
+            0,
+            vec![
+                entry(),
+                Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, 32),
+                set,
+                Instruction::new(Opcode::Ret),
+            ],
+            vec![],
+        );
+        assert!(b.run());
+        assert_eq!(b.op(0, 1), Opcode::Nop);
+    }
+
+    /// A block op that reads the local -- as `memcpy`'s source, or its
+    /// destination, which counts as read too -- revives a store to it, and
+    /// so does one whose pointer nothing is known about.
+    #[test]
+    fn dse_a_block_op_that_may_read_revives_the_store() {
+        for (op, dest, src) in [
+            (Opcode::Memcpy, PseudoId(1), PseudoId(0)),
+            (Opcode::Memmove, PseudoId(1), PseudoId(0)),
+            (Opcode::Memcpy, PseudoId(0), PseudoId(1)),
+            (Opcode::Memcpy, PseudoId(1), PseudoId(30)),
+        ] {
+            let mut b = Build::new();
+            let i32t = b.types.int_id;
+            b.f.add_pseudo(Pseudo::arg(PseudoId(30), 0));
+            let copy = block_op(op, dest, src, &b.types);
+            b.block(
+                0,
+                vec![
+                    entry(),
+                    Instruction::store(PseudoId(5), PseudoId(0), 0, i32t, 32),
+                    copy,
+                    Instruction::store(PseudoId(6), PseudoId(0), 0, i32t, 32),
+                    Instruction::load(PseudoId(20), PseudoId(0), 0, i32t, 32),
+                    Instruction::new(Opcode::Ret).with_src(PseudoId(20)),
+                ],
+                vec![],
+            );
+            b.run();
+            assert_eq!(b.op(0, 1), Opcode::Store, "{op:?} {dest:?} <- {src:?}");
+        }
     }
 
     /// `covers` is the byte-range question, and both ends of it matter.

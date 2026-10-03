@@ -39,14 +39,12 @@
 // `SparseAnalysis::run`.
 //
 
-use super::constfold::{
-    cmp_mask, eval_binop, eval_unop, get_cmp_info, CMP_ALL, CMP_EQ, CMP_GT, CMP_LT,
-};
+use super::constfold::{eval_int, is_int_foldable, CmpDomain, Outcomes};
 use super::dataflow::{Lattice, Selector, Sparse, SparseAnalysis};
-use super::facts::{CmpDomain, CmpFacts, ConstMap};
-use super::propagate::{cbr_taken, Site};
+use super::facts::{CmpFacts, ConstMap};
+use super::propagate::cbr_taken;
 use super::range::{allowed_by_predicate, possible_orderings, Range};
-use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
+use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId, Site};
 use std::collections::{BTreeMap, HashMap};
 
 /// How many times one cell may move before it is pinned at the bottom of its
@@ -259,15 +257,19 @@ impl Solver {
             else {
                 continue;
             };
-            let m = if w { fact.mask } else { !fact.mask & CMP_ALL };
+            let m = if w {
+                fact.mask
+            } else {
+                fact.mask.complement(fact.domain)
+            };
             // `(_Bool)(x <= 0)` reaches a branch as `setne %t, 0` over the
             // real comparison, so the fact at the `Cbr` is about a boolean.
             // Peel through to what it tests, then keep going: `x != 0` also
             // refines `x` itself, exactly.
             if self.consts.get(fact.rhs) == Some(0) {
-                if fact.mask == CMP_EQ {
+                if fact.mask == Outcomes::EQ {
                     work.push((fact.lhs, !w));
-                } else if fact.mask == CMP_LT | CMP_GT {
+                } else if fact.mask == Outcomes::LT | Outcomes::GT {
                     work.push((fact.lhs, w));
                 }
             }
@@ -287,7 +289,7 @@ impl Solver {
             record_fact(
                 &mut out,
                 fact.rhs,
-                allowed_by_predicate(super::constfold::mirror_mask(m), signed, &lhs_r),
+                allowed_by_predicate(m.mirror(), signed, &lhs_r),
             );
         }
 
@@ -317,29 +319,40 @@ impl Solver {
     /// refusal it makes for undefined behaviour.
     fn folded(&self, insn: &Instruction, block: BasicBlockId, width: u32) -> Option<RVal> {
         let w = Range::at(width)?;
-        let vals: Option<Vec<i128>> = insn
-            .src
-            .iter()
-            .map(|s| match self.operand(block, *s, insn.operand_width()) {
-                RVal::Known(r) => r.single_value().map(|v| v as i128),
-                _ => None,
-            })
-            .collect();
-        let vals = vals?;
-        let v = match vals.len() {
-            1 => eval_unop(insn, vals[0])?,
-            2 => eval_binop(insn, vals[0], vals[1])?,
-            _ => return None,
-        };
+        let mut ops = [0i128; 2];
+        if insn.src.len() > ops.len() {
+            return None;
+        }
+        for (slot, s) in ops.iter_mut().zip(&insn.src) {
+            let RVal::Known(r) = self.operand(block, *s, insn.operand_width()) else {
+                return None;
+            };
+            *slot = r.single_value()? as i128;
+        }
+        let v = eval_int(insn, &ops[..insn.src.len()])?;
         Some(RVal::Known(Range::from_const(w, v)))
     }
 
-    fn unary(&self, insn: &Instruction, block: BasicBlockId, width: u32) -> RVal {
-        if insn.src.len() != 1 {
-            return RVal::Bottom;
-        }
+    /// An integer operation `constfold` evaluates: folded outright when
+    /// every operand is one value, and otherwise by range arithmetic where
+    /// this pass has a rule for the opcode.
+    fn int_op(&self, insn: &Instruction, block: BasicBlockId, width: u32) -> RVal {
         if let Some(v) = self.folded(insn, block, width) {
             return v;
+        }
+        match insn.op {
+            Opcode::Neg | Opcode::Not => self.unary(insn, block),
+            Opcode::Zext | Opcode::Sext | Opcode::Trunc => self.convert(insn, block),
+            op if op.is_int_comparison() => self.compare(insn, block, width),
+            op if op.is_int_arith() => self.binop(insn, block),
+            // The bit operations, which have no range rule.
+            _ => RVal::Bottom,
+        }
+    }
+
+    fn unary(&self, insn: &Instruction, block: BasicBlockId) -> RVal {
+        if insn.src.len() != 1 {
+            return RVal::Bottom;
         }
         let Some(w) = Range::at(insn.size) else {
             return RVal::Bottom;
@@ -358,21 +371,13 @@ impl Solver {
         if insn.src.len() != 1 {
             return RVal::Bottom;
         }
-        let dst = insn.size;
-        let src = if insn.op == Opcode::Trunc {
-            insn.size.max(insn.src_size)
-        } else {
-            insn.src_size
-        };
-        // An extension with no recorded source width cannot be read at all;
-        // guessing from the destination makes it the identity, which is how
-        // a negative `char` comes back positive.
-        let (Some(src), Some(dst)) = (Range::at(src), Range::at(dst)) else {
+        // The operand is read at its own width, which every width change
+        // records (validator I10): reading an extension at its destination
+        // width would make it the identity, which is how a negative `char`
+        // comes back positive.
+        let (Some(src), Some(dst)) = (Range::at(insn.operand_width()), Range::at(insn.size)) else {
             return RVal::Bottom;
         };
-        if let Some(v) = self.folded(insn, block, dst) {
-            return v;
-        }
         let RVal::Known(a) = self.operand(block, insn.src[0], src) else {
             return RVal::Bottom;
         };
@@ -384,12 +389,9 @@ impl Solver {
         })
     }
 
-    fn binop(&self, insn: &Instruction, block: BasicBlockId, width: u32) -> RVal {
+    fn binop(&self, insn: &Instruction, block: BasicBlockId) -> RVal {
         if insn.src.len() != 2 {
             return RVal::Bottom;
-        }
-        if let Some(v) = self.folded(insn, block, width) {
-            return v;
         }
         let Some(w) = Range::at(insn.size) else {
             return RVal::Bottom;
@@ -408,7 +410,7 @@ impl Solver {
             Opcode::ModU => a.umod(&b),
             // Signed division has the `SMIN / -1` overflow and a rounding
             // discontinuity at zero; the singleton case is already answered
-            // by the `constfold` path above.
+            // by `int_op` before this is reached.
             Opcode::DivS | Opcode::ModS => Range::full(w),
             Opcode::And => a.and(&b),
             Opcode::Or => a.or(&b),
@@ -428,33 +430,28 @@ impl Solver {
         else {
             return RVal::Bottom;
         };
-        let Some(mask) = cmp_mask(insn.op) else {
+        let Some((mask, domain @ CmpDomain::Int { signed })) = Outcomes::of_op(insn.op) else {
             return RVal::Bottom;
         };
-        let signed = get_cmp_info(insn.op).map(|i| i.signed).unwrap_or(true);
         // Comparing a value with itself is decided without knowing it.
-        if self.consts.root(insn.src[0], ow) == self.consts.root(insn.src[1], ow) {
-            if let Some(info) = get_cmp_info(insn.op) {
-                return RVal::Known(Range::from_const(rw, info.identity_result));
-            }
-        }
-        let (RVal::Known(a), RVal::Known(b)) = (
-            self.operand(block, insn.src[0], ow),
-            self.operand(block, insn.src[1], ow),
-        ) else {
-            return RVal::Bottom;
+        let possible = if self.consts.same(insn.src[0], insn.src[1], ow) {
+            domain.reflexive()
+        } else {
+            let (RVal::Known(a), RVal::Known(b)) = (
+                self.operand(block, insn.src[0], ow),
+                self.operand(block, insn.src[1], ow),
+            ) else {
+                return RVal::Bottom;
+            };
+            possible_orderings(&a, &b, signed)
         };
-        let possible = possible_orderings(&a, &b, signed);
-        if possible == 0 {
+        if possible.is_empty() {
             return RVal::Bottom;
         }
-        if possible & mask == 0 {
-            return RVal::Known(Range::from_const(rw, 0));
-        }
-        if possible & !mask & CMP_ALL == 0 {
-            return RVal::Known(Range::from_const(rw, 1));
-        }
-        RVal::Known(Range::inclusive(rw, 0, 1))
+        RVal::Known(match mask.decide(possible) {
+            Some(v) => Range::from_const(rw, i128::from(v)),
+            None => Range::inclusive(rw, 0, 1),
+        })
     }
 }
 
@@ -504,12 +501,7 @@ impl SparseAnalysis for Solver {
                     .meet(self.operand(block, insn.src[2], insn.size)),
             },
 
-            Opcode::Neg | Opcode::Not => self.unary(insn, block, target_width),
-            Opcode::Zext | Opcode::Sext | Opcode::Trunc => self.convert(insn, block),
-
-            _ if insn.op.is_int_comparison() => self.compare(insn, block, target_width),
-
-            _ if insn.op.is_int_arith() => self.binop(insn, block, target_width),
+            op if is_int_foldable(op) => self.int_op(insn, block, target_width),
 
             // Everything else. An unmodelled opcode answering anything but
             // `Bottom` would be a licence to prove any branch below it dead,
@@ -676,6 +668,7 @@ mod tests {
             .with_target(PseudoId(11))
             .with_src(PseudoId(10))
             .with_type_and_size(i64t, 64);
+        zext.src_typ = Some(i32t);
         zext.src_size = 32;
         l1.add_insn(zext);
         l1.add_insn(Instruction::compare(
@@ -1110,6 +1103,102 @@ mod tests {
             readers.contains(&site),
             "the branch must be re-evaluated when the bound's range moves"
         );
+    }
+
+    /// A bit operation over a value an edge pins to one number folds like
+    /// any other operation over a constant.
+    ///
+    /// ```text
+    /// .L0: %1 = seteq.32 %x, 8
+    ///      cbr %1, .L1, .L2
+    /// .L1: %3 = popcount32 %x           ; x == 8 on this edge
+    ///      %4 = setne.32 %3, 1
+    ///      cbr %4, .L3, .L2             ; .L3 is the arm to delete
+    /// ```
+    ///
+    /// `%x` is an argument, so only the edge says what it is: `sccp` has no
+    /// edge facts and must not be able to do this, or the test proves
+    /// nothing about this pass.
+    fn popcount_under_an_edge() -> Function {
+        let types = host_types();
+        let int = types.int_id;
+        let mut f = Function::new("t", types.void_id);
+        f.add_pseudo(Pseudo::arg(PseudoId(0), 0));
+        f.add_pseudo(Pseudo::val(PseudoId(2), 8));
+        f.add_pseudo(Pseudo::val(PseudoId(5), 1));
+        f.next_pseudo = 10;
+
+        let (l0, l1, l2, l3) = (
+            BasicBlockId(0),
+            BasicBlockId(1),
+            BasicBlockId(2),
+            BasicBlockId(3),
+        );
+        let mut b0 = BasicBlock::new(l0);
+        b0.add_insn(Instruction::new(Opcode::Entry));
+        b0.add_insn(Instruction::compare(
+            Opcode::SetEq,
+            PseudoId(1),
+            (PseudoId(0), PseudoId(2)),
+            (int, 32),
+            (int, 32),
+        ));
+        b0.add_insn(Instruction::cbr(PseudoId(1), l1, l2));
+        b0.children = vec![l1, l2];
+
+        let mut b1 = BasicBlock::new(l1);
+        let mut count = Instruction::unop(Opcode::Popcount32, PseudoId(3), PseudoId(0), int, 32);
+        count.src_typ = Some(int);
+        count.src_size = 32;
+        b1.add_insn(count);
+        b1.add_insn(Instruction::compare(
+            Opcode::SetNe,
+            PseudoId(4),
+            (PseudoId(3), PseudoId(5)),
+            (int, 32),
+            (int, 32),
+        ));
+        b1.add_insn(Instruction::cbr(PseudoId(4), l3, l2));
+        b1.parents = vec![l0];
+        b1.children = vec![l3, l2];
+
+        let mut b2 = BasicBlock::new(l2);
+        b2.add_insn(Instruction::ret(None));
+        b2.parents = vec![l0, l1];
+
+        let mut b3 = BasicBlock::new(l3);
+        b3.add_insn(Instruction::call(
+            None,
+            "link_failure",
+            vec![],
+            vec![],
+            types.void_id,
+            0,
+        ));
+        b3.add_insn(Instruction::ret(None));
+        b3.parents = vec![l1];
+
+        for bb in [b0, b1, b2, b3] {
+            f.add_block(bb);
+        }
+        f.entry = l0;
+        f
+    }
+
+    #[test]
+    fn vrp_folds_a_constant_popcount() {
+        let decided = |f: &Function| {
+            let t = f.get_block(BasicBlockId(1)).unwrap().insns.last().unwrap();
+            t.op == Opcode::Br && t.bb_true == Some(BasicBlockId(2))
+        };
+
+        let mut other = popcount_under_an_edge();
+        crate::ir::sccp::run(&mut other);
+        assert!(!decided(&other), "sccp has no edge facts to do this with");
+
+        let mut func = popcount_under_an_edge();
+        assert!(run(&mut func));
+        assert!(decided(&func), "popcount(8) is 1:\n{func:?}");
     }
 
     /// Undefined behaviour is not assumed away: a divisor that could be

@@ -11,6 +11,7 @@
 // Tests for setjmp/longjmp, statement expressions, and other misc features.
 //
 
+mod cast_to_union;
 mod no_current_block;
 mod setjmp;
 mod statement_attributes;

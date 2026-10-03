@@ -31,7 +31,7 @@
 // `fwrite_unlocked`, so there is nothing to call instead.
 //
 
-use super::{is_pointer, Facts, Folded, NewCall, Operand};
+use super::{is_pointer, CallSite, Folded, NewCall, Operand};
 use crate::ir::strdata::Len;
 use crate::ir::{Instruction, PseudoId};
 use crate::parse::ast::LibFn;
@@ -41,7 +41,7 @@ use crate::types::{TypeId, TypeKind, TypeTable};
 type Arg = (PseudoId, TypeId);
 
 /// What the call `insn` to `f`, one of the output functions, folds to.
-pub(super) fn fold(f: LibFn, insn: &Instruction, facts: &Facts) -> Option<Folded> {
+pub(super) fn fold(f: LibFn, insn: &Instruction, facts: &CallSite) -> Option<Folded> {
     if !facts.result_unused(insn) || insn.src.len() != insn.extra().arg_types.len() {
         return None;
     }
@@ -130,9 +130,9 @@ impl<'a> Print<'a> {
         })
     }
 
-    fn fold(&self, facts: &Facts) -> Option<Folded> {
+    fn fold(&self, facts: &CallSite) -> Option<Folded> {
         let types = facts.types;
-        let fmt = c_str(facts, self.fmt)?;
+        let fmt = facts.c_str(self.fmt)?;
         if !fmt.contains(&b'%') {
             return match self.rest {
                 Rest::Args([_, ..]) => None,
@@ -144,9 +144,7 @@ impl<'a> Print<'a> {
         };
         let (p, t) = arg;
         match (fmt, self.stream) {
-            (b"%s", Stream::Stdout) if is_pointer(types, t) => {
-                self.text(types, c_str(facts, p)?, p)
-            }
+            (b"%s", Stream::Stdout) if is_pointer(types, t) => self.text(types, facts.c_str(p)?, p),
             (b"%s", Stream::File(fp)) if is_pointer(types, t) => {
                 self.locking.call(fputs_call(Operand::Value(p, t), fp))
             }
@@ -183,7 +181,7 @@ impl<'a> Print<'a> {
 }
 
 /// `fputs(s, fp)`, for an `s` whose length is known.
-fn fputs(facts: &Facts, s: PseudoId, fp: Arg, locking: Locking) -> Option<Folded> {
+fn fputs(facts: &CallSite, s: PseudoId, fp: Arg, locking: Locking) -> Option<Folded> {
     let Len::Const(len) = facts.strings.string_len(s)? else {
         return None;
     };
@@ -199,13 +197,12 @@ fn fputs(facts: &Facts, s: PseudoId, fp: Arg, locking: Locking) -> Option<Folded
         return None;
     }
     let types = facts.types;
-    if let Some(&[c]) = c_str(facts, s) {
+    if let Some(&[c]) = facts.c_str(s) {
         return locking.call(put_char(char_operand(types, c), Stream::File(fp)));
     }
     let size_t = LibFn::Fwrite.return_type(types);
     locking.call(NewCall {
         func: LibFn::Fwrite,
-        name: "fwrite",
         args: vec![
             Operand::Value(s, types.const_void_ptr_id),
             Operand::Int(1, size_t),
@@ -213,11 +210,6 @@ fn fputs(facts: &Facts, s: PseudoId, fp: Arg, locking: Locking) -> Option<Folded
             Operand::Value(fp.0, fp.1),
         ],
     })
-}
-
-/// The C string `p` points at, when it is known.
-fn c_str<'a>(facts: &Facts<'a>, p: PseudoId) -> Option<&'a [u8]> {
-    facts.strings.string_at(p)?.c_str()
 }
 
 /// The character `c`, as the `int` `putchar` takes.
@@ -230,12 +222,10 @@ fn put_char(c: Operand, stream: Stream) -> NewCall {
     match stream {
         Stream::Stdout => NewCall {
             func: LibFn::Putchar,
-            name: "putchar",
             args: vec![c],
         },
         Stream::File((fp, t)) => NewCall {
             func: LibFn::Fputc,
-            name: "fputc",
             args: vec![c, Operand::Value(fp, t)],
         },
     }
@@ -244,7 +234,6 @@ fn put_char(c: Operand, stream: Stream) -> NewCall {
 fn puts_call(s: Operand) -> NewCall {
     NewCall {
         func: LibFn::Puts,
-        name: "puts",
         args: vec![s],
     }
 }
@@ -252,7 +241,6 @@ fn puts_call(s: Operand) -> NewCall {
 fn fputs_call(s: Operand, (fp, t): Arg) -> NewCall {
     NewCall {
         func: LibFn::Fputs,
-        name: "fputs",
         args: vec![s, Operand::Value(fp, t)],
     }
 }
@@ -310,12 +298,12 @@ mod tests {
         Operand::Value(p, t)
     }
 
-    fn made(func: LibFn, name: &'static str, args: Vec<Operand>) -> Option<Folded> {
-        Some(Folded::Discard(Some(NewCall { func, name, args })))
+    fn made(func: LibFn, args: Vec<Operand>) -> Option<Folded> {
+        Some(Folded::Discard(Some(NewCall { func, args })))
     }
 
     fn puts_literal(text: &[u8]) -> Option<Folded> {
-        made(LibFn::Puts, "puts", vec![Operand::Literal(text.to_vec())])
+        made(LibFn::Puts, vec![Operand::Literal(text.to_vec())])
     }
 
     #[test]
@@ -326,13 +314,13 @@ mod tests {
         let empty = lit(&mut fx, "");
         assert_eq!(fold1(&mut fx, LibFn::Printf, &[empty]), None);
         let a = lit(&mut fx, "a");
-        let want = made(LibFn::Putchar, "putchar", vec![int(&fx, b'a')]);
+        let want = made(LibFn::Putchar, vec![int(&fx, b'a')]);
         assert_eq!(fold1(&mut fx, LibFn::Printf, &[a]), want);
         let line = lit(&mut fx, "hi\n");
         assert_eq!(fold1(&mut fx, LibFn::Printf, &[line]), puts_literal(b"hi"));
         // A lone newline is one character.
         let nl = lit(&mut fx, "\n");
-        let want = made(LibFn::Putchar, "putchar", vec![int(&fx, b'\n')]);
+        let want = made(LibFn::Putchar, vec![int(&fx, b'\n')]);
         assert_eq!(fold1(&mut fx, LibFn::Printf, &[nl]), want);
     }
 
@@ -352,11 +340,11 @@ mod tests {
         let mut fx = Fixture::new();
         let s_nl = lit(&mut fx, "%s\n");
         let s = unknown(&mut fx, |t| t.char_ptr_id);
-        let want = made(LibFn::Puts, "puts", vec![val(s)]);
+        let want = made(LibFn::Puts, vec![val(s)]);
         assert_eq!(fold1(&mut fx, LibFn::Printf, &[s_nl, s]), want);
         let pc = lit(&mut fx, "%c");
         let c = unknown(&mut fx, |t| t.int_id);
-        let want = made(LibFn::Putchar, "putchar", vec![val(c)]);
+        let want = made(LibFn::Putchar, vec![val(c)]);
         assert_eq!(fold1(&mut fx, LibFn::Printf, &[pc, c]), want);
         // `%s` of a known string prints it as text, `%` and all.
         let ps = lit(&mut fx, "%s");
@@ -410,11 +398,11 @@ mod tests {
         let empty = lit(&mut fx, "");
         let r = call(&mut fx, LibFn::Printf, &[empty]);
         fx.push(Instruction::ret(Some(r)));
-        assert!(folds(&fx).is_empty());
+        assert!(folds(&mut fx).is_empty());
         let fp = stream(&mut fx);
         let r = call(&mut fx, LibFn::Fputs, &[empty, fp]);
         fx.push(Instruction::ret(Some(r)));
-        assert!(folds(&fx).is_empty());
+        assert!(folds(&mut fx).is_empty());
     }
 
     #[test]
@@ -426,7 +414,7 @@ mod tests {
         let a = lit(&mut fx, "a");
         call(&mut fx, LibFn::Printf, &[a]);
         fx.func().blocks[0].insns.last_mut().unwrap().target = None;
-        assert_eq!(folds(&fx).len(), 1);
+        assert_eq!(folds(&mut fx).len(), 1);
     }
 
     #[test]
@@ -482,7 +470,7 @@ mod tests {
         assert_eq!(fold1(&mut fx, LibFn::PrintfChk, &[flag, nl]), want);
         let s = unknown(&mut fx, |t| t.char_ptr_id);
         assert_eq!(fold1(&mut fx, LibFn::PrintfChk, &[flag, pd, s]), None);
-        let want = made(LibFn::Fputs, "fputs", vec![val(nl), val(fp)]);
+        let want = made(LibFn::Fputs, vec![val(nl), val(fp)]);
         assert_eq!(fold1(&mut fx, LibFn::Vfprintf, &[fp, nl, ap]), want);
         assert_eq!(
             fold1(&mut fx, LibFn::VfprintfChk, &[fp, flag, nl, ap]),
@@ -508,13 +496,13 @@ mod tests {
         // `fprintf(fp, "%s", "")` takes the ordinary `%s` rewrite now that
         // the empty case no longer short-circuits to a discard: `fputs` of
         // the empty string, which writes nothing and orients the stream.
-        let want = made(LibFn::Fputs, "fputs", vec![val(empty), val(fp)]);
+        let want = made(LibFn::Fputs, vec![val(empty), val(fp)]);
         assert_eq!(fold1(&mut fx, LibFn::Fprintf, &[fp, ps, empty]), want);
-        let want = made(LibFn::Fputs, "fputs", vec![val(hello), val(fp)]);
+        let want = made(LibFn::Fputs, vec![val(hello), val(fp)]);
         assert_eq!(fold1(&mut fx, LibFn::Fprintf, &[fp, hello]), want);
-        let want = made(LibFn::Fputs, "fputs", vec![val(s), val(fp)]);
+        let want = made(LibFn::Fputs, vec![val(s), val(fp)]);
         assert_eq!(fold1(&mut fx, LibFn::Fprintf, &[fp, ps, s]), want);
-        let want = made(LibFn::Fputc, "fputc", vec![val(c), val(fp)]);
+        let want = made(LibFn::Fputc, vec![val(c), val(fp)]);
         assert_eq!(fold1(&mut fx, LibFn::Fprintf, &[fp, pc, c]), want);
         let pd = lit(&mut fx, "%d");
         assert_eq!(fold1(&mut fx, LibFn::Fprintf, &[fp, pd, c]), None);
@@ -529,7 +517,7 @@ mod tests {
         // Writes nothing, but orients the stream (C17 7.21.2p4), so it is
         // not dropped. Every empty write is alike in this.
         assert_eq!(fold1(&mut fx, LibFn::Fputs, &[empty, fp]), None);
-        let want = made(LibFn::Fputc, "fputc", vec![int(&fx, b'\n'), val(fp)]);
+        let want = made(LibFn::Fputc, vec![int(&fx, b'\n'), val(fp)]);
         assert_eq!(fold1(&mut fx, LibFn::Fputs, &[nl, fp]), want);
         let want = fwrite(&fx, hello.0, 5, fp);
         assert_eq!(fold1(&mut fx, LibFn::Fputs, &[hello, fp]), want);
@@ -545,7 +533,7 @@ mod tests {
             Operand::Int(len, ulong),
             val(fp),
         ];
-        made(LibFn::Fwrite, "fwrite", args)
+        made(LibFn::Fwrite, args)
     }
 
     /// `fputs(i ? "f" : "x", fp)`: one length but no one character, so

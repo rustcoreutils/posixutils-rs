@@ -11,6 +11,7 @@
 // once so that dataflow analysis and the optimization passes stay simple.
 //
 
+pub mod asm_operand;
 mod build;
 pub mod cfg;
 pub(crate) mod constfold;
@@ -48,6 +49,7 @@ pub mod validate;
 pub mod vrp;
 
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
+use crate::arch::asm_constraints::{AsmAccess, AsmOperandClass};
 use crate::diag::Position;
 use crate::float::{FloatVal, IntegralRounding};
 use crate::target::Target;
@@ -130,20 +132,11 @@ pub fn aggregate_ret_is_address(ret: &ArgClass, size_bits: u32) -> bool {
         }
 }
 
-// Instruction Reference - for def-use chains
+// Instruction sites
 
-/// Reference to an instruction by (basic block id, instruction index)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct InsnRef {
-    pub bb: BasicBlockId,
-    pub idx: usize,
-}
-
-impl InsnRef {
-    pub fn new(bb: BasicBlockId, idx: usize) -> Self {
-        Self { bb, idx }
-    }
-}
+/// An instruction's place in a function: `(block index, instruction index)`,
+/// both positions in the vectors rather than ids.
+pub(crate) type Site = (usize, usize);
 
 // Opcodes
 
@@ -434,22 +427,36 @@ impl Opcode {
     /// result, as for every opcode?
     ///
     /// The conversions, the comparisons (which read any type and produce an
-    /// `int` or a `_Bool`), and the bit counts (which count a 32- or 64-bit
-    /// operand into an `int`).
+    /// `int` or a `_Bool`), the bit counts (which count a 32- or 64-bit
+    /// operand into an `int`), and `Signbit` (which tests a floating operand
+    /// into an `int`).
+    ///
+    /// Every one records a nonzero `src_size`, which the validator checks
+    /// (I10), so [`Instruction::operand_width`] is never an unknown 0.
     pub fn reads_another_type(self) -> bool {
         self.is_comparison()
+            || self.is_conversion()
+            || self.is_bit_count()
+            || self == Opcode::Signbit
+    }
+
+    /// The conversions: an integer width change (`Sext`, `Zext`, `Trunc`)
+    /// or a change between an integer and a floating type, or between two
+    /// floating types.
+    pub fn is_conversion(self) -> bool {
+        self.is_int_width_change()
             || matches!(
                 self,
-                Opcode::Sext
-                    | Opcode::Zext
-                    | Opcode::Trunc
-                    | Opcode::FCvtS
-                    | Opcode::FCvtU
-                    | Opcode::SCvtF
-                    | Opcode::UCvtF
-                    | Opcode::FCvtF
+                Opcode::FCvtS | Opcode::FCvtU | Opcode::SCvtF | Opcode::UCvtF | Opcode::FCvtF
             )
-            || self.is_bit_count()
+    }
+
+    /// The integer width changes. An extension reads a narrower operand
+    /// than its result and a truncation a wider one -- never the same
+    /// width, which is no conversion at all -- and the validator checks it
+    /// (I12).
+    pub fn is_int_width_change(self) -> bool {
+        matches!(self, Opcode::Sext | Opcode::Zext | Opcode::Trunc)
     }
 
     /// The bit counts: an `int` count of the bits of a 32- or 64-bit operand.
@@ -486,11 +493,9 @@ impl Opcode {
     /// memory operation must consult this to know what lies between two
     /// points, and `is_memory_barrier` to know what it may cross.
     ///
-    /// Deliberately an allowlist read the other way round: everything that
-    /// might touch memory is named, so a new opcode is conservative by
-    /// default only if it is *also* added to [`Self::has_side_effects`] --
-    /// which invariant I5 in `ir/validate.rs` enforces mechanically, so the
-    /// two sets cannot drift.
+    /// Everything that might touch memory is named. [`Self::has_side_effects`]
+    /// is derived from this set, so an opcode added here is a DCE root unless
+    /// it is a `Load`.
     pub fn may_access_memory(&self) -> bool {
         matches!(
             self,
@@ -511,16 +516,7 @@ impl Opcode {
                 | Opcode::Longjmp
                 | Opcode::Asm
                 | Opcode::Fence
-                | Opcode::AtomicLoad
-                | Opcode::AtomicStore
-                | Opcode::AtomicSwap
-                | Opcode::AtomicCas
-                | Opcode::AtomicFetchAdd
-                | Opcode::AtomicFetchSub
-                | Opcode::AtomicFetchAnd
-                | Opcode::AtomicFetchOr
-                | Opcode::AtomicFetchXor
-        )
+        ) || self.is_atomic()
     }
 
     /// Whether this opcode computes a libm function, which its instruction
@@ -534,45 +530,19 @@ impl Opcode {
 
     /// Check if this opcode has side effects (cannot be deleted even if unused).
     /// These are "root" instructions for dead code elimination.
+    ///
+    /// Derived from the other predicates, so that a memory access or a memory
+    /// barrier (every barrier opcode reaches memory) is a root by construction.
     pub fn has_side_effects(&self) -> bool {
-        matches!(
-            self,
-            Opcode::Ret
-                | Opcode::Br
-                | Opcode::Cbr
-                | Opcode::Switch
-                | Opcode::IndirectBr
-                | Opcode::Unreachable
-                | Opcode::Store
-                | Opcode::Call
-                | Opcode::Entry
-                | Opcode::VaStart
-                | Opcode::VaEnd
-                | Opcode::VaCopy
-                | Opcode::VaArg
-                | Opcode::Alloca
-                | Opcode::StackSave
-                | Opcode::StackRestore
-                | Opcode::Memset
-                | Opcode::Memcpy
-                | Opcode::Memmove
-                | Opcode::Setjmp
-                | Opcode::Longjmp
-                | Opcode::Asm
-                | Opcode::AtomicLoad
-                | Opcode::AtomicStore
-                | Opcode::AtomicSwap
-                | Opcode::AtomicCas
-                | Opcode::AtomicFetchAdd
-                | Opcode::AtomicFetchSub
-                | Opcode::AtomicFetchAnd
-                | Opcode::AtomicFetchOr
-                | Opcode::AtomicFetchXor
-                | Opcode::Fence
-                // Not an effect of the program's, but a fact the allocator
-                // reads, which deleting would lose.
-                | Opcode::LifetimeEnd
-        )
+        self.is_terminator()
+            // A read of non-volatile memory has no effect, so DCE may delete
+            // a `Load`; a volatile one is kept per access, by
+            // `Instruction::is_volatile_access`, which `dce::is_root` consults.
+            || (self.may_access_memory() && *self != Opcode::Load)
+            // `Entry` marks where the function begins. `LifetimeEnd` is not
+            // an effect of the program's, but a fact the allocator reads,
+            // which deleting would lose.
+            || matches!(self, Opcode::Entry | Opcode::LifetimeEnd)
     }
 
     /// True for the atomic memory operations (not `Fence`, which touches no
@@ -593,6 +563,12 @@ impl Opcode {
                 | Opcode::AtomicFetchOr
                 | Opcode::AtomicFetchXor
         )
+    }
+
+    /// True for the memory accesses a backend addresses as `src[0] + offset`:
+    /// plain loads and stores, and the atomic operations.
+    pub fn addresses_memory(self) -> bool {
+        matches!(self, Opcode::Load | Opcode::Store) || self.is_atomic()
     }
 
     /// Get the opcode name for display
@@ -722,6 +698,59 @@ impl Opcode {
             Opcode::LifetimeEnd => "lifetime.end",
         }
     }
+}
+
+/// Declares [`Opcode::ALL`] and [`Opcode::is_listed`] from one list of the
+/// payload-free variants, so the two cannot disagree: `is_listed` matches
+/// without a wildcard, and a variant added to `Opcode` or to
+/// `IntegralRounding` does not compile until it is listed here, which also
+/// puts it in `ALL`.
+#[cfg(test)]
+macro_rules! every_opcode {
+    ($($op:ident),* $(,)?) => {
+        impl Opcode {
+            /// Every opcode, with `RoundToIntegral` once per rounding, for a
+            /// test that checks a property of the whole opcode table.
+            pub(crate) const ALL: &'static [Opcode] = &[
+                $(Opcode::$op,)*
+                Opcode::RoundToIntegral(IntegralRounding::Floor),
+                Opcode::RoundToIntegral(IntegralRounding::Ceil),
+                Opcode::RoundToIntegral(IntegralRounding::Trunc),
+                Opcode::RoundToIntegral(IntegralRounding::Round),
+                Opcode::RoundToIntegral(IntegralRounding::Rint),
+                Opcode::RoundToIntegral(IntegralRounding::NearbyInt),
+            ];
+
+            /// The exhaustiveness guard behind [`Opcode::ALL`]; always true.
+            fn is_listed(self) -> bool {
+                match self {
+                    $(Opcode::$op)|* => true,
+                    Opcode::RoundToIntegral(
+                        IntegralRounding::Floor
+                        | IntegralRounding::Ceil
+                        | IntegralRounding::Trunc
+                        | IntegralRounding::Round
+                        | IntegralRounding::Rint
+                        | IntegralRounding::NearbyInt,
+                    ) => true,
+                }
+            }
+        }
+    };
+}
+
+#[cfg(test)]
+every_opcode! {
+    Entry, Ret, Br, Cbr, Switch, IndirectBr, Add, Sub, Mul, DivU, DivS, ModU, ModS, Shl, Lsr, Asr,
+    FAdd, FSub, FMul, FDiv, And, Or, Xor, SetEq, SetNe, SetLt, SetLe, SetGt, SetGe, SetB, SetBe,
+    SetA, SetAe, FCmpOEq, FCmpONe, FCmpOLt, FCmpOLe, FCmpOGt, FCmpOGe, Not, Neg, FNeg, Fabs,
+    CopySign, Sqrt, FMin, FMax, Fma, Trunc, Zext, Sext, FCvtU, FCvtS, UCvtF, SCvtF, FCvtF, Load,
+    Store, Phi, PhiSource, Copy, SymAddr, TlsAddr, Call, Select, SetVal, Nop, VaStart, VaArg,
+    VaEnd, VaCopy, VaArgPackLen, ConstantP, Bswap16, Bswap32, Bswap64, Ctz32, Ctz64, Clz32, Clz64,
+    Popcount32, Popcount64, Alloca, StackSave, StackRestore, Memset, Memcpy, Memmove, Signbit,
+    Unreachable, FrameAddress, ReturnAddress, Setjmp, Longjmp, Asm, AtomicLoad, AtomicStore,
+    AtomicSwap, AtomicCas, AtomicFetchAdd, AtomicFetchSub, AtomicFetchAnd, AtomicFetchOr,
+    AtomicFetchXor, Fence, Lo64, Hi64, Pair64, AddC, AdcC, SubC, SbcC, UMulHi, LifetimeEnd,
 }
 
 impl fmt::Display for Opcode {
@@ -992,12 +1021,16 @@ pub struct AsmConstraint {
     pub pseudo: PseudoId,
     /// Optional symbolic name for the operand (e.g., [result])
     pub name: Option<String>,
-    /// Matching output operand index (for constraints like "0")
+    /// The output operand this input shares its operand with: an explicit
+    /// matching constraint (`"0"`), or the hidden input a `"+"` output
+    /// implies.
     pub matching_output: Option<usize>,
-    /// The constraint string (e.g., "r", "a", "=r", "+m", "=&r").
-    /// Used by codegen to determine specific register requirements; an
-    /// early-clobber `&` is read through [`AsmConstraint::is_early_clobber`].
+    /// The constraint string as written (e.g. "r", "=r", "+m", "=&r"). Only
+    /// diagnostics and dumps read it; what it allows is [`Self::class`].
     pub constraint: String,
+    /// What the constraint allows, classified once for the target. Every
+    /// question about the operand's letters is answered from here.
+    pub class: AsmOperandClass,
     /// Size of the operand in bits (8, 16, 32, 64), derived from the C type
     pub size: u32,
     /// For a memory operand whose `pseudo` is a `Sym` -- the object itself,
@@ -1014,6 +1047,21 @@ pub struct AsmConstraint {
 }
 
 impl AsmConstraint {
+    /// An operand of `constraint` on `arch`, `size` bits wide, with no name,
+    /// matching output or object offset.
+    #[cfg(test)]
+    pub fn new(pseudo: PseudoId, constraint: &str, arch: crate::target::Arch, size: u32) -> Self {
+        Self {
+            pseudo,
+            name: None,
+            matching_output: None,
+            constraint: constraint.to_string(),
+            class: AsmOperandClass::parse(constraint, arch).expect("a modelled constraint"),
+            size,
+            offset: 0,
+        }
+    }
+
     /// True when the assembler receives this operand as a memory reference
     /// rather than a value in a register.
     ///
@@ -1025,46 +1073,21 @@ impl AsmConstraint {
     /// A constraint may offer several alternatives (`"rm"`); it is only a
     /// memory operand if no register/immediate alternative is available.
     pub fn is_memory(&self) -> bool {
-        let mut has_memory_class = false;
-        let mut has_non_memory_class = false;
-
-        for c in self.constraint.chars() {
-            match c {
-                'm' | 'o' | 'V' | 'Q' => has_memory_class = true,
-                // Register classes.
-                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' | 'l' => {
-                    has_non_memory_class = true
-                }
-                // Immediate / general classes. `g` and `X` allow memory but
-                // also allow a register, so they do not force one.
-                'i' | 'n' | 'g' | 'X' | 'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' | 'Y' | 'Z' => {
-                    has_non_memory_class = true
-                }
-                // Modifiers, matching digits, anything unknown.
-                _ => {}
-            }
-        }
-
-        has_memory_class && !has_non_memory_class
+        self.class.is_memory_only()
     }
 
     /// True for an early-clobber output (`"=&r"`, `"+&r"`, `"&=r"`): the
     /// template writes it before it has read every input, so it may not share
     /// a register with any input, even one whose value dies at the asm.
     pub fn is_early_clobber(&self) -> bool {
-        self.constraint.contains('&')
+        self.class.early_clobber
     }
 
     /// True when the operand may be given a register: a register class
-    /// (`r`, a named register letter, `g`, ...) rather than only memory or
-    /// only an immediate (`i`, `n`).
+    /// (`r`, a named register letter, `g`, ...) or a matching constraint,
+    /// rather than only memory or only an immediate (`i`, `n`).
     pub fn wants_register(&self) -> bool {
-        self.constraint.chars().any(|c| {
-            matches!(
-                c,
-                'r' | 'a' | 'b' | 'c' | 'd' | 'S' | 'D' | 'q' | 'R' | 'l' | 'g' | 'x' | 'w' | 'y'
-            ) || c.is_ascii_digit()
-        })
+        self.class.reg.is_some() || self.class.tied.is_some()
     }
 
     /// True for the input a `"+"` output implies: it carries the output's
@@ -1076,7 +1099,7 @@ impl AsmConstraint {
     /// input takes the *last* operand numbers, never one between the explicit
     /// ones.
     pub fn is_hidden_readwrite_input(&self) -> bool {
-        self.matching_output.is_some() && self.constraint.contains('+')
+        self.matching_output.is_some() && self.class.access == AsmAccess::ReadWrite
     }
 }
 
@@ -1097,6 +1120,48 @@ pub struct AsmData {
 }
 
 // Instruction
+
+/// Every `PseudoId` slot of an [`Instruction`] that [`Instruction::mentioned`]
+/// reads, as an iterator of references: target, sources, indirect call
+/// target, phi operands, then asm outputs and inputs. Expanded once over a
+/// shared instruction and once (with `mut`) over a unique one, so the walk
+/// that reads the slots and the walk that rewrites them are one list.
+///
+/// The order is the inliner's: it allocates a caller pseudo for each callee
+/// pseudo in the order it first meets them.
+macro_rules! mention_slots {
+    ($insn:expr $(, $m:tt)?) => {{
+        let Instruction {
+            target,
+            src,
+            phi_list,
+            extra,
+            ..
+        } = $insn;
+        let (indirect, asm) = match extra {
+            Some(e) => {
+                let InsnExtra {
+                    indirect_target,
+                    asm_data,
+                    ..
+                } = &$($m)? **e;
+                (Some(indirect_target), Some(asm_data))
+            }
+            None => (None, None),
+        };
+        target
+            .into_iter()
+            .chain(src)
+            .chain(indirect.into_iter().flatten())
+            .chain(phi_list.into_iter().map(|(_, p)| p))
+            .chain(
+                asm.into_iter()
+                    .flatten()
+                    .flat_map(|d| (&$($m)? d.outputs).into_iter().chain(&$($m)? d.inputs))
+                    .map(|c| &$($m)? c.pseudo),
+            )
+    }};
+}
 
 /// An IR instruction
 #[derive(Debug, Clone)]
@@ -1424,20 +1489,18 @@ impl Instruction {
     ///   only as the compiler left it, though no instruction is emitted.
     /// - `Opcode::Atomic*` — every atomic memory op (including
     ///   `Relaxed`-ordered ones — see note below).
-    /// - `Opcode::Call` — c17 has no escape/alias analysis; any
-    ///   external call may read or write any memory location the
-    ///   callee can reach. Conservative.
+    /// - `Opcode::Call` — a callee may read or write any memory it can
+    ///   reach, and this predicate does not ask what that is.
     /// - `Opcode::Setjmp` / `Opcode::Longjmp` — non-local control flow
     ///   makes register/memory state observable at any saved jmp_buf.
     ///
-    /// **Contract**: an IR pass that consults this predicate MUST NOT
-    /// reorder memory operations across an instruction for which it
-    /// returns `true`. This is the load-bearing invariant that lets
-    /// inline `asm("..." ::: "memory")` actually mean something —
-    /// today no pass reorders memory at all (see module docs in
-    /// `cc/ir/dce.rs` and `cc/ir/instcombine.rs`), and any future
-    /// pass that does (GVN, LICM, load-store forwarding, machine
-    /// scheduler) MUST query this before crossing.
+    /// **Contract**: an IR pass MUST NOT move a memory operation across an
+    /// instruction for which this returns `true`. This is the load-bearing
+    /// invariant that lets inline `asm("..." ::: "memory")` actually mean
+    /// something. No pass moves a memory operation: `loadfwd` and `dse`
+    /// remove loads and stores rather than move them, and decide what a
+    /// call can reach from `escape.rs` and the callee's effects; every other
+    /// barrier opcode they treat as touching all memory.
     ///
     /// **This predicate answers *ordering*, not *extent*, and it is not the
     /// list of instructions that touch memory.** `Store`, `Memset`,
@@ -1462,20 +1525,8 @@ impl Instruction {
                 .asm_data
                 .as_ref()
                 .is_some_and(|d| d.clobbers.iter().any(|c| c == "memory")),
-            Opcode::Fence
-            | Opcode::Call
-            | Opcode::Setjmp
-            | Opcode::Longjmp
-            | Opcode::AtomicLoad
-            | Opcode::AtomicStore
-            | Opcode::AtomicSwap
-            | Opcode::AtomicCas
-            | Opcode::AtomicFetchAdd
-            | Opcode::AtomicFetchSub
-            | Opcode::AtomicFetchAnd
-            | Opcode::AtomicFetchOr
-            | Opcode::AtomicFetchXor => true,
-            _ => false,
+            Opcode::Fence | Opcode::Call | Opcode::Setjmp | Opcode::Longjmp => true,
+            op => op.is_atomic(),
         }
     }
 
@@ -1489,7 +1540,9 @@ impl Instruction {
     /// model reads as an escape rather than as nothing.
     ///
     /// If a field that can hold a `PseudoId` is ever added to `Instruction`,
-    /// it must be added here too, or an address escapes invisibly.
+    /// it must be added to `mention_slots`, which this walks, or an address
+    /// escapes invisibly. The one field left out is `lifetime_of`: a
+    /// lifetime marker is out of band, and is not a mention of its local.
     pub fn mentions(&self, id: PseudoId) -> bool {
         self.mentioned().any(|p| p == id)
     }
@@ -1499,19 +1552,21 @@ impl Instruction {
     /// time. For a pass that needs the answer for every symbol at once, which
     /// asking `mentions` per symbol per instruction makes quadratic.
     pub fn mentioned(&self) -> impl Iterator<Item = PseudoId> + '_ {
-        let asm = self
-            .extra()
-            .asm_data
-            .iter()
-            .flat_map(|d| d.inputs.iter().chain(d.outputs.iter()))
-            .map(|c| c.pseudo);
-        self.src
-            .iter()
-            .copied()
-            .chain(self.target)
-            .chain(self.extra().indirect_target)
-            .chain(self.phi_list.iter().map(|&(_, p)| p))
-            .chain(asm)
+        mention_slots!(self).copied()
+    }
+
+    /// Rewrite every pseudo this instruction names: each slot
+    /// [`Self::mentioned`] reads, in the same order, and then the local a
+    /// `LifetimeEnd` names.
+    ///
+    /// That last one is the only `PseudoId` field `mentioned` leaves out (see
+    /// [`Self::mentions`]), but renaming the local renames it too. Built on
+    /// the same slot walk as `mentioned`, so the two cannot drift apart.
+    pub fn for_each_pseudo_mut(&mut self, mut f: impl FnMut(&mut PseudoId)) {
+        mention_slots!(self, mut).for_each(&mut f);
+        if let Some(extra) = self.extra.as_deref_mut() {
+            extra.lifetime_of.iter_mut().for_each(f);
+        }
     }
 
     /// Every pseudo this instruction reads.
@@ -1576,7 +1631,6 @@ impl Instruction {
         Self::new(Opcode::Br).with_bb_true(target)
     }
 
-    /// Create a conditional branch
     /// The end of `local`'s lifetime: see [`Opcode::LifetimeEnd`].
     pub fn lifetime_end(local: PseudoId) -> Self {
         let mut insn = Self::new(Opcode::LifetimeEnd);
@@ -1584,6 +1638,7 @@ impl Instruction {
         insn
     }
 
+    /// Create a conditional branch
     pub fn cbr(cond: PseudoId, bb_true: BasicBlockId, bb_false: BasicBlockId) -> Self {
         Self::new(Opcode::Cbr)
             .with_src(cond)
@@ -1591,12 +1646,12 @@ impl Instruction {
             .with_bb_false(bb_false)
     }
 
-    /// Create a switch instruction
     /// GNU computed goto: branch to the address held in `target`.
     pub fn indirect_br(target: PseudoId) -> Self {
         Self::new(Opcode::IndirectBr).with_src(target)
     }
 
+    /// Create a switch instruction
     pub fn switch_insn(
         value: PseudoId,
         cases: Vec<(i64, i64, BasicBlockId)>,
@@ -1733,7 +1788,7 @@ impl Instruction {
         self.offset as u32
     }
 
-    /// A load's or store's offset as the machine displacement it becomes.
+    /// A memory access's offset as the machine displacement it becomes.
     ///
     /// Always in range: `Linearizer::emit` folds any offset past `i32` into
     /// the address before the instruction enters the IR, and no pass rewrites
@@ -1741,9 +1796,9 @@ impl Instruction {
     /// with `as i32`, which wrapped a member more than 2 GiB into a struct to
     /// a displacement gigabytes away.
     pub fn displacement(&self) -> i32 {
-        debug_assert!(matches!(self.op, Opcode::Load | Opcode::Store));
+        debug_assert!(self.op.addresses_memory());
         i32::try_from(self.offset)
-            .expect("a load or store offset past i32 reached a backend; Linearizer::emit folds it")
+            .expect("a memory access offset past i32 reached a backend; Linearizer::emit folds it")
     }
 
     pub fn load(target: PseudoId, addr: PseudoId, offset: i64, typ: TypeId, size: u32) -> Self {
@@ -1848,6 +1903,15 @@ impl Instruction {
             .with_type_and_size(typ, size)
     }
 
+    /// The `SetVal` that defines the constant pseudo `target` at `typ` and
+    /// `size` bits. The value lives in `target` (`PseudoKind::Val`/`FVal`),
+    /// never in the instruction.
+    pub fn set_val(target: PseudoId, typ: TypeId, size: u32) -> Self {
+        Self::new(Opcode::SetVal)
+            .with_target(target)
+            .with_type_and_size(typ, size)
+    }
+
     /// Create a phi source instruction (placed in predecessor block).
     /// Back-pointer to owning phi is stored in phi_list by the caller.
     pub fn phi_source(target: PseudoId, src: PseudoId, typ: TypeId, size: u32) -> Self {
@@ -1855,6 +1919,17 @@ impl Instruction {
             .with_target(target)
             .with_src(src)
             .with_type_and_size(typ, size)
+    }
+
+    /// The phi a `PhiSource` feeds: the phi's block and its target, read from
+    /// the back-pointer in `phi_list`. `None` for any other opcode, whose
+    /// `phi_list` (a phi's incoming pairs, or nothing) is no back-pointer.
+    pub fn phi_source_dest(&self) -> Option<(BasicBlockId, PseudoId)> {
+        if self.op == Opcode::PhiSource {
+            self.phi_list.first().copied()
+        } else {
+            None
+        }
     }
 
     /// Create a select (ternary) instruction for pure expressions
@@ -1885,38 +1960,29 @@ impl Instruction {
         }
     }
 
-    /// Check if this call/return uses a hidden sret pointer for the return value.
-    pub fn returns_via_sret(&self) -> bool {
-        self.extra()
-            .abi_info
-            .as_ref()
-            .map(|ai| matches!(ai.ret, ArgClass::Indirect { .. }))
-            .unwrap_or(false)
+    /// The ABI classification of this call's or return's value, when the
+    /// instruction carries one.
+    pub fn ret_class(&self) -> Option<&ArgClass> {
+        self.extra().abi_info.as_ref().map(|ai| &ai.ret)
     }
 
-    /// Check if this call/return uses two registers for the return value.
+    /// Check if this call/return uses a hidden sret pointer for the return value.
+    pub fn returns_via_sret(&self) -> bool {
+        matches!(self.ret_class(), Some(ArgClass::Indirect { .. }))
+    }
+
     /// True when this `Ret` hands its value back in st(0).
     ///
     /// The source is then the value's *address*, not the value: an x87 return
     /// is loaded onto the FPU stack from memory, since nothing else can hold
     /// an 80-bit value.
     pub fn returns_via_x87(&self) -> bool {
-        self.extra()
-            .abi_info
-            .as_ref()
-            .map(|ai| matches!(ai.ret, ArgClass::X87 { .. }))
-            .unwrap_or(false)
+        matches!(self.ret_class(), Some(ArgClass::X87 { .. }))
     }
 
+    /// Check if this call/return uses two registers for the return value.
     pub fn returns_two_regs(&self) -> bool {
-        self.extra()
-            .abi_info
-            .as_ref()
-            .map(|ai| match &ai.ret {
-                ArgClass::Direct { classes, .. } => classes.len() == 2,
-                _ => false,
-            })
-            .unwrap_or(false)
+        matches!(self.ret_class(), Some(ArgClass::Direct { classes, .. }) if classes.len() == 2)
     }
 
     /// True when this `Ret` hands back an aggregate by *address*: its source
@@ -1929,10 +1995,8 @@ impl Instruction {
     /// puts `abi_info` on a `Ret`, and only for a struct or union, so no
     /// scalar reaches this.
     pub fn returns_aggregate_address(&self) -> bool {
-        self.extra()
-            .abi_info
-            .as_ref()
-            .is_some_and(|ai| aggregate_ret_is_address(&ai.ret, self.size))
+        self.ret_class()
+            .is_some_and(|ret| aggregate_ret_is_address(ret, self.size))
     }
 
     /// Turn this instruction into a `Nop` that holds nothing at all.
@@ -2074,7 +2138,7 @@ impl fmt::Display for InstructionDisplay<'_> {
                 if let Some(src) = this.src.first() {
                     write!(f, " {}", ctx.pseudo(*src))?;
                 }
-                if let Some((bb, pseudo)) = this.phi_list.first() {
+                if let Some((bb, pseudo)) = this.phi_source_dest() {
                     write!(f, " (-> {}:{})", bb, pseudo)?;
                 }
             }
@@ -2286,6 +2350,11 @@ impl<'a> ArgTypes<'a> {
         let i = arg.checked_sub(u32::from(self.sret.is_some()))?;
         self.params.get(i as usize).map(|(_, typ)| *typ)
     }
+
+    /// The `Arg` number the `i`-th declared parameter arrives as.
+    pub fn arg_of_param(&self, i: usize) -> u32 {
+        i as u32 + u32::from(self.sret.is_some())
+    }
 }
 
 /// A parameter whose local storage is filled implicitly by the backend prologue
@@ -2412,6 +2481,11 @@ pub struct Function {
     /// this set: its `Ret` carries the ABI classification that lets the
     /// inliner copy the bytes (`Instruction::returns_aggregate_address`).
     pub ret_is_address: bool,
+    /// The hidden struct-return pointer, when the function returns through
+    /// one: the `Arg(0)` pseudo the linearizer creates for it, which shifts
+    /// every declared parameter one `Arg` along. Read it through
+    /// [`Function::sret_arg`].
+    pub sret: Option<PseudoId>,
     /// Block ID -> index in `blocks` vec (O(1) lookup)
     block_idx: HashMap<BasicBlockId, usize>,
     /// Pseudo ID -> index in `pseudos` vec (O(1) lookup)
@@ -2445,6 +2519,7 @@ impl Default for Function {
             is_inline: false,
             implicit_param_copies: Vec::new(),
             ret_is_address: false,
+            sret: None,
             block_idx: HashMap::new(),
             pseudo_idx: HashMap::new(),
         }
@@ -2472,7 +2547,6 @@ impl Function {
         self.blocks.push(block);
     }
 
-    /// Get a block by ID
     /// Where `id` sits in `blocks`.
     ///
     /// For a pass that needs the *index* rather than the block -- to index
@@ -2483,6 +2557,7 @@ impl Function {
         self.block_idx.get(&id).copied()
     }
 
+    /// Get a block by ID
     pub fn get_block(&self, id: BasicBlockId) -> Option<&BasicBlock> {
         self.block_idx
             .get(&id)
@@ -2579,10 +2654,11 @@ impl Function {
     /// `extern` gets its own pseudo carrying the same name, so a name matches
     /// two different objects. Only block-scope locals are mangled `name.<id>`
     /// and so cannot collide. Answering by pseudo identity is what keeps a
-    /// global from being handed the parameter's stack slot.
+    /// global from being handed the parameter's stack slot, and a thread-local
+    /// from being mistaken for one and left unexpanded.
     ///
-    /// `ir/ssa.rs` and `ir/tls.rs` both carry their own version of this
-    /// reasoning; this is the shared form.
+    /// Every "is this `Sym` a local" question asks here, the thread-local
+    /// expansion and the backend's check of it included.
     pub fn local_of(&self, sym: PseudoId) -> Option<&LocalVar> {
         self.get_pseudo(sym)
             .and_then(|p| match &p.kind {
@@ -2609,13 +2685,28 @@ impl Function {
 
     /// The hidden struct-return pointer, if this function has one.
     ///
-    /// The linearizer emits it as `Arg(0)` under the literal name `__sret`,
-    /// which shifts every declared parameter one `Arg` along.
+    /// The linearizer emits it as `Arg(0)` and records it in
+    /// [`Function::sret`]; it shifts every declared parameter one `Arg` along.
     pub fn sret_arg(&self) -> Option<PseudoId> {
-        self.pseudos
+        self.sret
+    }
+
+    /// The pseudos an inline `asm` writes as outputs.
+    ///
+    /// An asm output is a second definition of its pseudo, the one invariant
+    /// I1 deliberately exempts, so for these "the instruction that defines
+    /// %n" says nothing about the value: a tied operand (`"0"(x)`) is even
+    /// written as a `Copy` into the output pseudo *before* the asm. Every
+    /// pass that follows a pseudo to its definition, or folds a use of it,
+    /// leaves these alone; asking here keeps them answering alike, because a
+    /// pass that folds what the others would not is the one that miscompiles.
+    pub fn asm_defined_pseudos(&self) -> HashSet<PseudoId> {
+        self.blocks
             .iter()
-            .find(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"))
-            .map(|p| p.id)
+            .flat_map(|bb| &bb.insns)
+            .filter_map(|insn| insn.extra().asm_data.as_deref())
+            .flat_map(|asm| asm.outputs.iter().map(|o| o.pseudo))
+            .collect()
     }
 
     /// The type the caller passes for the parameter an `Arg(arg)` pseudo
@@ -2629,10 +2720,8 @@ impl Function {
         self.arg_types().of(arg)
     }
 
-    /// [`Function::param_type_of_arg`] for many arguments: finding the sret
-    /// pointer is a walk of the pseudo table, done here once rather than per
-    /// argument -- which, over a function of 100,000 parameters, was 10^10
-    /// steps.
+    /// [`Function::param_type_of_arg`] for many arguments, and the `Arg`
+    /// each declared parameter arrives as.
     pub fn arg_types(&self) -> ArgTypes<'_> {
         ArgTypes::new(self.sret_arg(), &self.params)
     }
@@ -2692,11 +2781,12 @@ impl Function {
     ///
     /// `false`, and nothing done, for an id [`Self::is_plain_temp`] rejects.
     ///
-    /// The caller owes that `SetVal`. It is not optional for a float: an
+    /// Half of a rewrite: `propagate::fold_target_to_setval` is the whole of
+    /// it, and the only caller, because the `SetVal` is not optional. An
     /// `FVal` without one is resolved at a default width of 64 bits, so a
-    /// folded `float` would be read out of eight bytes. For an integer it
+    /// folded `float` would be read out of eight bytes; for an integer it
     /// decides the stack slot in x86-64's sixteen-byte case.
-    pub fn make_const(&mut self, id: PseudoId, value: ConstValue) -> bool {
+    fn make_const(&mut self, id: PseudoId, value: ConstValue) -> bool {
         if !self.is_plain_temp(id) {
             return false;
         }
@@ -2748,6 +2838,16 @@ impl Function {
             PseudoKind::Sym(name) => Some(name.as_str()),
             _ => None,
         })
+    }
+
+    /// The global a `Sym` pseudo names, if it names one.
+    ///
+    /// A local's `Sym` carries the local's name, which may be spelled like a
+    /// global's -- a parameter `count` beside a function `count` -- so a
+    /// lookup of global names by `sym_name_of` alone mistakes the one for the
+    /// other. Decided by identity, through [`Self::local_of`].
+    pub fn global_sym_name(&self, id: PseudoId) -> Option<&str> {
+        self.sym_name_of(id).filter(|_| self.local_of(id).is_none())
     }
 }
 
@@ -2981,13 +3081,16 @@ impl fmt::Display for Initializer {
 
 /// How a global is stored, as three facts that always travel together.
 ///
-/// Passed as one value because they are three of the eight arguments
-/// `add_global_impl` otherwise takes, and three adjacent booleans at a call
-/// site say nothing about which is which.
-struct GlobalStorage {
-    is_static: bool,
-    is_const: bool,
-    is_thread_local: bool,
+/// Passed to [`Module::define_global`] as one value because three adjacent
+/// booleans at a call site say nothing about which is which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GlobalStorage {
+    /// Internal linkage.
+    pub(crate) is_static: bool,
+    /// A `const`-qualified object: see `GlobalDef::is_const`.
+    pub(crate) is_const: bool,
+    /// C11 `_Thread_local` / GCC `__thread`.
+    pub(crate) is_thread_local: bool,
 }
 
 /// A global variable definition with full metadata
@@ -3143,38 +3246,43 @@ pub struct Module {
     /// "may a fold call this?" and "by what name?".
     pub library_symbols: HashMap<&'static str, String>,
     /// Where each global is in `globals`, by name: see `Module::global_mut`.
-    global_idx: GlobalIndex,
+    global_idx: AppendIndex,
+    /// Where each literal is in `strings`, by contents: see
+    /// `Module::add_string`.
+    string_idx: AppendIndex,
 }
 
-/// The position of each global in `Module::globals`, by name.
+/// The position of each item in one of `Module`'s lists, by a key the item
+/// carries: a global's name, a literal's contents.
 ///
-/// `globals` is only ever appended to, by this module and by the passes that
-/// push to it directly, so the index catches up with whatever was appended
-/// since it last looked, and each global is indexed once. A hit is checked
-/// against the name it claims, and a mismatch -- which an append cannot
-/// cause -- rebuilds the whole index rather than answering wrongly.
+/// Those lists are only ever appended to, by this module and by the passes
+/// that push to them directly, so the index catches up with whatever was
+/// appended since it last looked, and each item is indexed once. A hit is
+/// checked against the key it claims, and a mismatch -- which an append
+/// cannot cause -- rebuilds the whole index rather than answering wrongly.
 #[derive(Debug, Clone, Default)]
-struct GlobalIndex {
+struct AppendIndex {
     pos: HashMap<String, usize>,
     indexed: usize,
 }
 
-impl GlobalIndex {
-    fn find(&mut self, globals: &[GlobalDef], name: &str) -> Option<usize> {
-        if self.indexed > globals.len() {
-            *self = GlobalIndex::default();
+impl AppendIndex {
+    /// The position of the first item in `items` whose `key` is `want`.
+    fn find<T>(&mut self, items: &[T], key: impl Fn(&T) -> &str, want: &str) -> Option<usize> {
+        if self.indexed > items.len() {
+            *self = AppendIndex::default();
         }
-        for (i, g) in globals.iter().enumerate().skip(self.indexed) {
-            // The first definition of a name is the one a lookup finds.
-            self.pos.entry(g.name.clone()).or_insert(i);
+        for (i, item) in items.iter().enumerate().skip(self.indexed) {
+            // The first item with a key is the one a lookup finds.
+            self.pos.entry(key(item).to_string()).or_insert(i);
         }
-        self.indexed = globals.len();
-        let i = *self.pos.get(name)?;
-        if globals[i].name == name {
+        self.indexed = items.len();
+        let i = *self.pos.get(want)?;
+        if key(&items[i]) == want {
             return Some(i);
         }
-        *self = GlobalIndex::default();
-        self.find(globals, name)
+        *self = AppendIndex::default();
+        self.find(items, key, want)
     }
 }
 
@@ -3184,6 +3292,33 @@ impl GlobalIndex {
 pub const FOLD_CALLEES: &[&str] = &[
     "strlen", "strchr", "strcpy", "memcpy", "memset", "puts", "putchar", "fputs", "fputc", "fwrite",
 ];
+
+/// [`Module::strings`] and its index, borrowed apart from the rest of the
+/// module so that a pass rewriting its functions can add literals.
+pub struct StringPool<'a> {
+    strings: &'a mut Vec<(String, String)>,
+    idx: &'a mut AppendIndex,
+}
+
+impl StringPool<'_> {
+    /// The label of the literal holding `content`, added if there is none.
+    pub fn add(&mut self, content: String) -> String {
+        // One label per distinct contents. Minting a fresh one per occurrence
+        // made two identical literals two objects, which C17 6.4.5p7 permits
+        // but which no compiler does -- and it made `&"Foobar"[1] -
+        // &"Foobar"[0]` a difference between *different* symbols, so the
+        // static initializer could not be folded at all.
+        let found = self
+            .idx
+            .find(self.strings, |(_, c)| c.as_str(), content.as_str());
+        if let Some(i) = found {
+            return self.strings[i].0.clone();
+        }
+        let label = string_label(self.strings.len());
+        self.strings.push((label.clone(), content));
+        label
+    }
+}
 
 /// The label of the `index`th string literal in [`Module::strings`].
 pub(crate) fn string_label(index: usize) -> String {
@@ -3201,68 +3336,19 @@ impl Module {
         self.globals.push(GlobalDef::new(name, typ, init));
     }
 
-    /// Add a global variable with explicit alignment (C11 _Alignas)
-    /// Handles C tentative definitions: if a global with the same name exists
-    /// and has Initializer::None (tentative), replace it with the new definition.
-    pub fn add_global_aligned(
-        &mut self,
-        name: impl Into<String>,
-        typ: TypeId,
-        init: Initializer,
-        align: Option<u32>,
-        is_static: bool,
-        is_const: bool,
-    ) {
-        self.add_global_impl(
-            name,
-            typ,
-            init,
-            align,
-            GlobalStorage {
-                is_static,
-                is_const,
-                is_thread_local: false,
-            },
-        );
-    }
-
-    /// Add a thread-local global variable with explicit alignment (C11 _Alignas)
-    /// Handles C tentative definitions: if a global with the same name exists
-    /// and has Initializer::None (tentative), replace it with the new definition.
-    pub fn add_global_tls_aligned(
-        &mut self,
-        name: impl Into<String>,
-        typ: TypeId,
-        init: Initializer,
-        align: Option<u32>,
-        is_static: bool,
-        is_const: bool,
-    ) {
-        self.add_global_impl(
-            name,
-            typ,
-            init,
-            align,
-            GlobalStorage {
-                is_static,
-                is_const,
-                is_thread_local: true,
-            },
-        );
-    }
-
     /// The global named `name`, without a walk of every global: a unit with
     /// 100,000 of them spent fifteen seconds finding each one.
     fn global_mut(&mut self, name: &str) -> Option<&mut GlobalDef> {
-        let i = self.global_idx.find(&self.globals, name)?;
+        let i = self
+            .global_idx
+            .find(&self.globals, |g| g.name.as_str(), name)?;
         Some(&mut self.globals[i])
     }
 
     /// Attach the symbol-emission attributes to a global already added.
     ///
-    /// Set after the fact rather than threaded through `add_global_impl`,
-    /// which already takes four positional booleans; a fifth positional
-    /// argument that is a struct would be worse to read at every call site.
+    /// Set after the fact rather than passed to `define_global`, because only
+    /// a file-scope definition carries any; a static local has none to pass.
     pub fn set_symbol_attrs(&mut self, name: &str, attrs: crate::parse::ast::SymbolAttrs) {
         if attrs.is_empty() {
             return;
@@ -3281,7 +3367,13 @@ impl Module {
         self.declared_symbol_attrs.insert(name.to_string(), attrs);
     }
 
-    fn add_global_impl(
+    /// Define a global, with its explicit alignment (C11 `_Alignas`) if it
+    /// has one.
+    ///
+    /// A C tentative definition is completed rather than duplicated: if a
+    /// global of the same name exists with `Initializer::None`, this
+    /// definition replaces it.
+    pub(crate) fn define_global(
         &mut self,
         name: impl Into<String>,
         typ: TypeId,
@@ -3332,17 +3424,31 @@ impl Module {
 
     /// Add a string literal and return its label
     pub fn add_string(&mut self, content: String) -> String {
-        // One label per distinct contents. Minting a fresh one per occurrence
-        // made two identical literals two objects, which C17 6.4.5p7 permits
-        // but which no compiler does -- and it made `&"Foobar"[1] -
-        // &"Foobar"[0]` a difference between *different* symbols, so the
-        // static initializer could not be folded at all.
-        if let Some((label, _)) = self.strings.iter().find(|(_, c)| *c == content) {
-            return label.clone();
+        self.string_pool().add(content)
+    }
+
+    fn string_pool(&mut self) -> StringPool<'_> {
+        StringPool {
+            strings: &mut self.strings,
+            idx: &mut self.string_idx,
         }
-        let label = string_label(self.strings.len());
-        self.strings.push((label.clone(), content));
-        label
+    }
+
+    /// The functions, for a pass to rewrite, beside the literal pool the
+    /// rewrite may add to and the library functions it may call
+    /// (`library_symbols`).
+    pub fn split_for_rewrite(
+        &mut self,
+    ) -> (
+        &mut Vec<Function>,
+        StringPool<'_>,
+        &HashMap<&'static str, String>,
+    ) {
+        let pool = StringPool {
+            strings: &mut self.strings,
+            idx: &mut self.string_idx,
+        };
+        (&mut self.functions, pool, &self.library_symbols)
     }
 
     /// Intern a `u"..."` literal and return its label.
@@ -3420,8 +3526,62 @@ impl fmt::Display for ModuleDisplay<'_> {
 mod tests {
     use super::*;
     use crate::abi::{ArgClass, RegClass};
-    use crate::target::Target;
+    use crate::target::{Arch, Target};
     use crate::types::{Type, TypeTable};
+
+    #[test]
+    fn opcode_all_lists_every_opcode_once() {
+        for (i, op) in Opcode::ALL.iter().enumerate() {
+            assert!(op.is_listed());
+            assert!(!Opcode::ALL[..i].contains(op), "{op:?} is listed twice");
+        }
+    }
+
+    /// I5 -- a memory access is a DCE root, except a `Load`. Over the whole
+    /// table, so an opcode added in breach of it fails here.
+    #[test]
+    fn memory_access_is_a_side_effect_except_load() {
+        for &op in Opcode::ALL {
+            if op.may_access_memory() && op != Opcode::Load {
+                assert!(
+                    op.has_side_effects(),
+                    "{op:?} reaches memory but DCE may delete it"
+                );
+            }
+        }
+        assert!(Opcode::Load.may_access_memory());
+        assert!(!Opcode::Load.has_side_effects());
+        // The converse does not hold: a branch is a root and touches no memory.
+        assert!(Opcode::Br.has_side_effects());
+        assert!(!Opcode::Br.may_access_memory());
+    }
+
+    /// I2 -- a memory barrier is a DCE root, or DCE could drop a `Fence`, an
+    /// atomic, a call or an `asm("" ::: "memory")` whose result is unused.
+    /// Every opcode is tried bare and carrying a `"memory"` clobber, which
+    /// only `Asm` reads.
+    #[test]
+    fn memory_barrier_is_a_side_effect() {
+        let mut barriers = 0;
+        for &op in Opcode::ALL {
+            let mut clobbering = Instruction::new(op);
+            clobbering.extra_mut().asm_data = Some(Box::new(AsmData {
+                template: String::new(),
+                outputs: Vec::new(),
+                inputs: Vec::new(),
+                clobbers: vec!["memory".to_string()],
+                goto_labels: Vec::new(),
+            }));
+            for insn in [Instruction::new(op), clobbering] {
+                if insn.is_memory_barrier() {
+                    barriers += 1;
+                    assert!(op.has_side_effects(), "{op:?} is a barrier DCE may delete");
+                }
+            }
+        }
+        // Fence, Call, Setjmp, Longjmp and the atomics, each twice, and Asm once.
+        assert_eq!(barriers, 2 * 13 + 1);
+    }
 
     #[test]
     fn test_opcode_is_terminator() {
@@ -3430,6 +3590,28 @@ mod tests {
         assert!(Opcode::Cbr.is_terminator());
         assert!(!Opcode::Add.is_terminator());
         assert!(!Opcode::Load.is_terminator());
+    }
+
+    /// Every op a backend addresses as `src[0] + offset` has a displacement:
+    /// the atomics as well as plain loads and stores.
+    #[test]
+    fn every_memory_access_has_a_displacement() {
+        for op in [
+            Opcode::Load,
+            Opcode::Store,
+            Opcode::AtomicLoad,
+            Opcode::AtomicStore,
+            Opcode::AtomicSwap,
+            Opcode::AtomicCas,
+            Opcode::AtomicFetchAdd,
+            Opcode::AtomicFetchSub,
+            Opcode::AtomicFetchAnd,
+            Opcode::AtomicFetchOr,
+            Opcode::AtomicFetchXor,
+        ] {
+            let insn = Instruction::new(op).with_src(PseudoId(0)).with_offset(-8);
+            assert_eq!(insn.displacement(), -8, "{op:?}");
+        }
     }
 
     #[test]
@@ -3518,11 +3700,7 @@ mod tests {
         func.add_pseudo(Pseudo::val(k, 42));
 
         let mut entry = BasicBlock::new(BasicBlockId(0));
-        entry.add_insn(
-            Instruction::new(Opcode::SetVal)
-                .with_target(k)
-                .with_type_and_size(types.int_id, 32),
-        );
+        entry.add_insn(Instruction::set_val(k, types.int_id, 32));
         entry.add_insn(Instruction::ret(Some(k)));
         func.add_block(entry);
 
@@ -3850,74 +4028,171 @@ mod tests {
         }
     }
 
+    fn storage(is_static: bool, is_const: bool, is_thread_local: bool) -> GlobalStorage {
+        GlobalStorage {
+            is_static,
+            is_const,
+            is_thread_local,
+        }
+    }
+
     #[test]
-    fn test_add_global_aligned_tentative_definition() {
+    fn test_define_global_tentative_definition() {
         let types = TypeTable::new(&Target::host());
         let mut module = Module::default();
+        let plain = storage(false, false, false);
 
         // Add a tentative definition (no initializer)
-        module.add_global_aligned("x", types.int_id, Initializer::None, None, false, false);
+        module.define_global("x", types.int_id, Initializer::None, None, plain);
         assert_eq!(module.globals.len(), 1);
         assert!(matches!(module.globals[0].init, Initializer::None));
 
         // Add actual definition - should replace the tentative one
-        module.add_global_aligned(
-            "x",
-            types.int_id,
-            Initializer::Int(42),
-            Some(4),
-            false,
-            false,
-        );
+        module.define_global("x", types.int_id, Initializer::Int(42), Some(4), plain);
         assert_eq!(module.globals.len(), 1); // Still only one global
         assert!(matches!(module.globals[0].init, Initializer::Int(42)));
         assert_eq!(module.globals[0].explicit_align, Some(4));
     }
 
     #[test]
-    fn test_add_global_aligned_non_tentative_not_replaced() {
+    fn test_define_global_non_tentative_not_replaced() {
         let types = TypeTable::new(&Target::host());
         let mut module = Module::default();
+        let plain = storage(false, false, false);
 
         // Add a real definition (with initializer)
-        module.add_global_aligned("x", types.int_id, Initializer::Int(10), None, false, false);
+        module.define_global("x", types.int_id, Initializer::Int(10), None, plain);
         assert_eq!(module.globals.len(), 1);
 
         // Add another definition with same name - should NOT replace (adds new entry)
-        module.add_global_aligned("x", types.int_id, Initializer::Int(20), None, false, false);
+        module.define_global("x", types.int_id, Initializer::Int(20), None, plain);
         assert_eq!(module.globals.len(), 2); // Two globals now (linker will error)
     }
 
     #[test]
-    fn test_add_global_tls_aligned_tentative_definition() {
+    fn test_define_global_tls_tentative_definition() {
         let types = TypeTable::new(&Target::host());
         let mut module = Module::default();
+        let tls = storage(false, false, true);
 
         // Add a TLS tentative definition
-        module.add_global_tls_aligned(
-            "tls_var",
-            types.int_id,
-            Initializer::None,
-            None,
-            false,
-            false,
-        );
+        module.define_global("tls_var", types.int_id, Initializer::None, None, tls);
         assert_eq!(module.globals.len(), 1);
         assert!(matches!(module.globals[0].init, Initializer::None));
 
         // Add actual TLS definition - should replace
-        module.add_global_tls_aligned(
-            "tls_var",
-            types.int_id,
-            Initializer::Int(100),
-            Some(8),
-            false,
-            false,
-        );
+        let init = Initializer::Int(100);
+        module.define_global("tls_var", types.int_id, init, Some(8), tls);
         assert_eq!(module.globals.len(), 1);
         assert!(matches!(module.globals[0].init, Initializer::Int(100)));
         assert!(module.globals[0].is_thread_local);
         assert_eq!(module.globals[0].explicit_align, Some(8));
+    }
+
+    /// Each of the eight storages reaches the definition as given.
+    #[test]
+    fn test_define_global_every_storage() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::default();
+        let mut all = Vec::new();
+        for bits in 0..8u8 {
+            let st = storage(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
+            let name = format!("g{bits}");
+            module.define_global(&name, types.int_id, Initializer::Int(1), None, st);
+            all.push((name, st));
+        }
+        assert_eq!(module.globals.len(), 8);
+        for (g, (name, st)) in module.globals.iter().zip(&all) {
+            assert_eq!(&g.name, name);
+            let got = storage(g.is_static, g.is_const, g.is_thread_local);
+            assert_eq!(got, *st, "{name}");
+        }
+    }
+
+    /// Completing a tentative definition takes the definition's linkage,
+    /// keeps `const` and thread-local storage from either declaration, and
+    /// keeps the tentative one's alignment when the definition has none.
+    #[test]
+    fn test_define_global_completion_merges_storage() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::default();
+        let int = types.int_id;
+        module.define_global(
+            "a",
+            int,
+            Initializer::None,
+            Some(16),
+            storage(true, true, true),
+        );
+        module.define_global(
+            "a",
+            int,
+            Initializer::Int(1),
+            None,
+            storage(false, false, false),
+        );
+        let a = &module.globals[0];
+        assert_eq!(
+            storage(a.is_static, a.is_const, a.is_thread_local),
+            storage(false, true, true)
+        );
+        assert_eq!(a.explicit_align, Some(16));
+
+        module.define_global(
+            "b",
+            int,
+            Initializer::None,
+            None,
+            storage(false, false, false),
+        );
+        module.define_global(
+            "b",
+            int,
+            Initializer::Int(2),
+            None,
+            storage(true, true, true),
+        );
+        let b = &module.globals[1];
+        assert_eq!(
+            storage(b.is_static, b.is_const, b.is_thread_local),
+            storage(true, true, true)
+        );
+        assert_eq!(module.globals.len(), 2);
+    }
+
+    /// One label per distinct contents, from the index and from a linear
+    /// search alike, including for literals a pass appended directly.
+    #[test]
+    fn test_add_string_dedupes() {
+        let mut module = Module::default();
+        let a = module.add_string("a".to_string());
+        let b = module.add_string("b".to_string());
+        assert_ne!(a, b);
+        assert_eq!(module.add_string("a".to_string()), a);
+        assert_eq!(module.add_string("b".to_string()), b);
+        assert_eq!(module.strings.len(), 2);
+
+        // A literal appended behind `add_string`'s back, as the libcall
+        // folds do, is found too.
+        let c = string_label(module.strings.len());
+        module.strings.push((c.clone(), "c".to_string()));
+        assert_eq!(module.add_string("c".to_string()), c);
+        let d = module.add_string("d".to_string());
+        assert_eq!(module.strings.len(), 4);
+        for (label, content) in module.strings.clone() {
+            let first = module.strings.iter().find(|(_, s)| *s == content).unwrap();
+            assert_eq!(first.0, label);
+            assert_eq!(module.add_string(content), label);
+        }
+        assert_eq!(module.strings.len(), 4);
+        assert_eq!(module.strings[3].0, d);
+
+        // A list replaced wholesale is reindexed, not answered from stale
+        // positions.
+        module.strings = vec![(string_label(0), "d".to_string())];
+        assert_eq!(module.add_string("d".to_string()), string_label(0));
+        assert_eq!(module.add_string("a".to_string()), string_label(1));
+        assert_eq!(module.strings.len(), 2);
     }
 
     #[test]
@@ -3997,6 +4272,27 @@ mod tests {
         assert_eq!(func.sym_name_of(PseudoId(9999)), None);
     }
 
+    /// A local's `Sym` carries the local's name, which a global may share;
+    /// only the global's `Sym` names a global.
+    #[test]
+    fn test_function_global_sym_name_asks_identity() {
+        let target = Target::host();
+        let types = TypeTable::new(&target);
+        let mut func = Function::new("f", types.int_id);
+        let global = func.alloc_pseudo();
+        func.add_pseudo(Pseudo::sym(global, "count".to_string()));
+        let local = func.alloc_pseudo();
+        func.add_pseudo(Pseudo::sym(local, "count".to_string()));
+        func.add_local("count", local, types.int_id, None, None);
+        let reg = func.alloc_pseudo();
+        func.add_pseudo(Pseudo::reg(reg, reg.0));
+
+        assert_eq!(func.global_sym_name(global), Some("count"));
+        assert_eq!(func.global_sym_name(local), None, "the parameter");
+        assert_eq!(func.sym_name_of(local), Some("count"));
+        assert_eq!(func.global_sym_name(reg), None);
+    }
+
     /// The global index follows `globals` however it grew: through the
     /// module, pushed to directly, or -- which nothing does, but which must
     /// still not be answered wrongly -- reordered.
@@ -4037,6 +4333,7 @@ mod tests {
             let off = u32::from(sret);
             if sret {
                 f.add_pseudo(Pseudo::arg(PseudoId(9), 0).with_name("__sret"));
+                f.sret = Some(PseudoId(9));
             }
             let params = [
                 types.char_id,
@@ -4061,7 +4358,60 @@ mod tests {
                 assert_eq!(args.of(arg), f.param_type_of_arg(arg), "Arg({arg})");
             }
             assert_eq!(args.of(off), Some(types.char_id));
+            for (i, t) in params.iter().enumerate() {
+                assert_eq!(args.of(args.arg_of_param(i)), Some(*t));
+            }
         }
+    }
+
+    /// Only a `PhiSource`'s `phi_list` is a back-pointer; a phi's is its
+    /// incoming pairs.
+    #[test]
+    fn test_phi_source_dest() {
+        let types = TypeTable::new(&Target::host());
+        let mut src = Instruction::phi_source(PseudoId(1), PseudoId(0), types.int_id, 32);
+        assert_eq!(src.phi_source_dest(), None, "no back-pointer yet");
+        src.phi_list = vec![(BasicBlockId(3), PseudoId(2))];
+        assert_eq!(src.phi_source_dest(), Some((BasicBlockId(3), PseudoId(2))));
+        let mut phi = Instruction::phi(PseudoId(2), types.int_id, 32);
+        phi.phi_list = vec![(BasicBlockId(1), PseudoId(1))];
+        assert_eq!(phi.phi_source_dest(), None, "a phi feeds nothing");
+    }
+
+    /// Every asm output across the function, and nothing else.
+    #[test]
+    fn test_asm_defined_pseudos() {
+        let types = TypeTable::new(&Target::host());
+        let asm = |outs: &[u32]| {
+            Instruction::asm(AsmData {
+                template: String::new(),
+                outputs: outs
+                    .iter()
+                    .map(|&n| AsmConstraint::new(PseudoId(n), "=r", Arch::X86_64, 32))
+                    .collect(),
+                inputs: vec![AsmConstraint::new(PseudoId(9), "r", Arch::X86_64, 32)],
+                clobbers: vec![],
+                goto_labels: vec![],
+            })
+        };
+        let mut f = Function::new("f", types.void_id);
+        assert!(f.asm_defined_pseudos().is_empty());
+        let mut b0 = BasicBlock::new(BasicBlockId(0));
+        b0.add_insn(asm(&[1, 2]));
+        b0.add_insn(Instruction::unop(
+            Opcode::Copy,
+            PseudoId(3),
+            PseudoId(1),
+            types.int_id,
+            32,
+        ));
+        let mut b1 = BasicBlock::new(BasicBlockId(1));
+        b1.add_insn(asm(&[4]));
+        f.add_block(b0);
+        f.add_block(b1);
+        let got = f.asm_defined_pseudos();
+        let want: HashSet<PseudoId> = [1, 2, 4].into_iter().map(PseudoId).collect();
+        assert_eq!(got, want);
     }
 
     #[test]
@@ -4351,12 +4701,8 @@ mod tests {
 
     fn constraint(c: &str, matching_output: Option<usize>) -> AsmConstraint {
         AsmConstraint {
-            pseudo: PseudoId(0),
-            name: None,
             matching_output,
-            constraint: c.to_string(),
-            size: 64,
-            offset: 0,
+            ..AsmConstraint::new(PseudoId(0), c, crate::target::Arch::X86_64, 64)
         }
     }
 
@@ -4390,6 +4736,36 @@ mod tests {
         for c in ["m", "=m", "i", "n", "I"] {
             assert!(!constraint(c, None).wants_register(), "{c}");
         }
+        // aarch64's register letter is a register class there.
+        assert!(AsmConstraint::new(PseudoId(0), "=w", Arch::Aarch64, 64).wants_register());
+    }
+
+    /// Liveness asks `is_memory` of each output, so it must read the letters
+    /// as the target does: a register alternative beside `m` makes the
+    /// operand a value, and `Q` is memory on aarch64 but a register on
+    /// x86-64.
+    #[test]
+    fn test_asm_constraint_is_memory_per_target() {
+        let on = |c: &str, arch| AsmConstraint::new(PseudoId(0), c, arch, 64).is_memory();
+        assert!(on("=m", Arch::X86_64) && on("=m", Arch::Aarch64));
+        assert!(!on("+wm", Arch::Aarch64));
+        assert!(on("Q", Arch::Aarch64));
+        assert!(!on("=Q", Arch::X86_64));
+        assert!(!on("xm", Arch::X86_64));
+
+        // A register output defines its pseudo; it is no use of it.
+        let mut asm = Instruction::new(Opcode::Asm);
+        asm.extra_mut().asm_data = Some(Box::new(AsmData {
+            template: String::new(),
+            outputs: vec![
+                AsmConstraint::new(PseudoId(1), "+wm", Arch::Aarch64, 64),
+                AsmConstraint::new(PseudoId(2), "=Q", Arch::Aarch64, 64),
+            ],
+            inputs: Vec::new(),
+            clobbers: Vec::new(),
+            goto_labels: Vec::new(),
+        }));
+        assert_eq!(asm.uses(), vec![PseudoId(2)]);
     }
 
     #[test]
@@ -4426,5 +4802,111 @@ mod tests {
         // robust).
         let no_data = Instruction::new(Opcode::Asm);
         assert!(!no_data.is_memory_barrier());
+    }
+
+    /// An instruction of `op` with every `PseudoId` and block slot filled,
+    /// each with its own id, whether or not `op` uses the field.
+    fn every_slot_filled(op: Opcode) -> Instruction {
+        let operand =
+            |pseudo: u32| AsmConstraint::new(PseudoId(pseudo), "r", Target::host().arch, 64);
+        let mut insn = Instruction::new(op);
+        insn.target = Some(PseudoId(1));
+        insn.src = vec![PseudoId(2), PseudoId(3)];
+        insn.phi_list = vec![
+            (BasicBlockId(1), PseudoId(4)),
+            (BasicBlockId(2), PseudoId(5)),
+        ];
+        insn.bb_true = Some(BasicBlockId(3));
+        insn.bb_false = Some(BasicBlockId(4));
+        let extra = insn.extra_mut();
+        extra.indirect_target = Some(PseudoId(6));
+        extra.lifetime_of = Some(PseudoId(7));
+        extra.switch_cases = vec![(0, 0, BasicBlockId(5)), (1, 9, BasicBlockId(6))];
+        extra.switch_default = Some(BasicBlockId(7));
+        extra.asm_data = Some(Box::new(AsmData {
+            template: String::new(),
+            outputs: vec![operand(8), operand(9)],
+            inputs: vec![operand(10), operand(11)],
+            clobbers: Vec::new(),
+            goto_labels: vec![(BasicBlockId(8), "l".to_string())],
+        }));
+        insn
+    }
+
+    /// `for_each_pseudo_mut` rewrites every slot `mentioned` reads, in its
+    /// order, and then `lifetime_of` -- and nothing else: what it leaves
+    /// alone reads back unchanged.
+    #[test]
+    fn test_for_each_pseudo_mut_visits_what_mentioned_reads() {
+        for &op in Opcode::ALL {
+            let mut insn = every_slot_filled(op);
+            let mentioned: Vec<PseudoId> = insn.mentioned().collect();
+            assert_eq!(
+                mentioned,
+                [1, 2, 3, 6, 4, 5, 8, 9, 10, 11].map(PseudoId),
+                "{op:?}: target, sources, indirect target, phi operands, asm outputs then inputs"
+            );
+
+            let mut visited = Vec::new();
+            insn.for_each_pseudo_mut(|p| {
+                visited.push(*p);
+                p.0 += 100;
+            });
+            let mut expected = mentioned.clone();
+            expected.push(PseudoId(7));
+            assert_eq!(visited, expected, "{op:?}: mentioned, then lifetime_of");
+
+            let shifted: Vec<PseudoId> = mentioned.iter().map(|p| PseudoId(p.0 + 100)).collect();
+            assert_eq!(insn.mentioned().collect::<Vec<_>>(), shifted, "{op:?}");
+            assert_eq!(insn.extra().lifetime_of, Some(PseudoId(107)), "{op:?}");
+        }
+
+        // No extra box: nothing to visit there, and none is allocated.
+        let mut bare = Instruction::new(Opcode::Add);
+        bare.target = Some(PseudoId(1));
+        bare.src = vec![PseudoId(2)];
+        let mut visited = Vec::new();
+        bare.for_each_pseudo_mut(|p| visited.push(*p));
+        assert_eq!(visited, [PseudoId(1), PseudoId(2)]);
+        assert!(bare.extra.is_none());
+    }
+
+    /// `for_each_block_mut` rewrites every block slot -- the control targets
+    /// `control_targets` reads, then each phi operand's predecessor -- and
+    /// leaves the operation width, type and position alone.
+    #[test]
+    fn test_for_each_block_mut_visits_every_block_slot() {
+        for &op in Opcode::ALL {
+            let mut insn = every_slot_filled(op);
+            insn.size = 64;
+            insn.pos = Some(Position {
+                line: 7,
+                ..Default::default()
+            });
+            assert_eq!(
+                insn.control_targets(),
+                [3, 4, 5, 6, 7, 8].map(BasicBlockId),
+                "{op:?}"
+            );
+
+            let mut visited = Vec::new();
+            insn.for_each_block_mut(|b| {
+                visited.push(*b);
+                b.0 += 100;
+            });
+            assert_eq!(
+                visited,
+                [3, 4, 5, 6, 7, 8, 1, 2].map(BasicBlockId),
+                "{op:?}"
+            );
+            assert_eq!(
+                insn.control_targets(),
+                [103, 104, 105, 106, 107, 108].map(BasicBlockId),
+                "{op:?}"
+            );
+            let preds: Vec<BasicBlockId> = insn.phi_list.iter().map(|&(b, _)| b).collect();
+            assert_eq!(preds, [101, 102].map(BasicBlockId), "{op:?}");
+            assert_eq!((insn.size, insn.pos.map(|p| p.line)), (64, Some(7)));
+        }
     }
 }

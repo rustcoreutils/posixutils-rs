@@ -25,22 +25,22 @@
 //
 
 use super::constfold::{
-    at_width, bit_opcode, divmod_may_trap, eval_binop, eval_fbinop, eval_fcvt, eval_fcvtf,
-    eval_fternop, eval_funop, eval_unop, fcmp_decided, fcmp_mask, fcmp_outcome, get_cmp_info,
-    mirror_mask, possible_against, FCMP_ALL,
+    at_width, divmod_may_trap, eval_fbinop, eval_fcvt, eval_fcvtf, eval_fternop, eval_funop,
+    eval_int, is_int_foldable, possible_against, CmpDomain, Outcomes,
 };
-use super::facts::{CmpDomain, CmpFacts, ConstMap, Relation};
+use super::facts::{CmpFacts, ConstMap, Relation};
+use super::propagate;
 use super::{ConstValue, Function, Instruction, Opcode, PseudoId};
 use crate::float::FloatVal;
 use crate::types::{TypeId, TypeTable};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 // Constant Resolution
 
 /// Everything one run of this pass knows that is fixed for the whole
 /// function, gathered so the dispatch keeps a stable arity as rules are
 /// added.
-struct Facts<'a> {
+struct RunFacts<'a> {
     cmps: CmpFacts,
     /// Pseudos whose value is never *less than* zero -- which is not the
     /// same as non-negative, and is deliberately the weaker fact: `fabs` of
@@ -52,7 +52,7 @@ struct Facts<'a> {
     types: &'a TypeTable,
 }
 
-impl<'a> Facts<'a> {
+impl<'a> RunFacts<'a> {
     pub(crate) fn new(func: &Function, consts: &ConstMap, types: &'a TypeTable) -> Self {
         let mut never_lt_zero = HashSet::new();
         for bb in &func.blocks {
@@ -84,8 +84,6 @@ impl<'a> Facts<'a> {
 
 /// Result of trying to simplify an instruction
 enum Simplification {
-    /// No simplification possible
-    None,
     /// Copy from an existing pseudo (algebraic identity)
     CopyFrom(PseudoId),
     /// Create a new constant with this value and copy from it
@@ -94,7 +92,7 @@ enum Simplification {
     ///
     /// Not "copy from one": a float constant is a pseudo kind, so the fold
     /// converts the target itself and rewrites the instruction to the
-    /// `SetVal` that gives it a width. See `Function::make_float_const`.
+    /// `SetVal` that gives it a width. See `propagate::fold_target_to_setval`.
     FoldToFloat(FloatVal),
 }
 
@@ -108,72 +106,53 @@ pub fn run(func: &mut Function, types: &TypeTable) -> bool {
     // Collect all simplifications first (to avoid borrow conflicts)
     let mut simplifications: Vec<(usize, usize, Simplification)> = Vec::new();
     let mut consts = ConstMap::new(func);
-    let facts = Facts::new(func, &consts, types);
+    let facts = RunFacts::new(func, &consts, types);
 
     for (bb_idx, bb) in func.blocks.iter().enumerate() {
         for (insn_idx, insn) in bb.insns.iter().enumerate() {
-            let mut result = try_simplify(insn, &consts, &facts);
+            let Some(result) = try_simplify(insn, &consts, &facts) else {
+                continue;
+            };
             // A float fold converts the target pseudo itself, and only a
-            // `Reg` may be converted. Deciding that here rather than when
-            // the fold is applied is what keeps `record` honest: a recorded
-            // constant the apply loop then declines would be read by every
-            // later instruction in this same pass.
+            // `Reg` may be converted, so a fold of any other target is not
+            // collected at all.
             if matches!(result, Simplification::FoldToFloat(_))
                 && !insn.target.is_some_and(|t| func.is_plain_temp(t))
             {
-                result = Simplification::None;
+                continue;
             }
             if let Some(target) = insn.target {
                 match &result {
                     Simplification::FoldToConst(v) => consts.record_int(target, insn.size, *v),
                     Simplification::CopyFrom(src) => consts.record_copy(target, insn.size, *src),
                     Simplification::FoldToFloat(v) => consts.record_float(target, *v),
-                    Simplification::None => {}
                 }
             }
-            if !matches!(result, Simplification::None) {
-                simplifications.push((bb_idx, insn_idx, result));
-            }
+            simplifications.push((bb_idx, insn_idx, result));
         }
     }
 
-    // Apply simplifications
+    // Apply simplifications. A constant goes through `propagate`, whose
+    // guards may still decline the rewrite -- a 128-bit integer, for one.
+    // What was recorded above stays true when they do: it is the value the
+    // target holds, not the shape the instruction is rewritten to.
+    let mut minted: HashMap<i128, PseudoId> = HashMap::new();
     for (bb_idx, insn_idx, simplification) in simplifications {
-        // Extract necessary data from the instruction before any mutation
-        let (target, typ, size) = {
-            let insn = &func.blocks[bb_idx].insns[insn_idx];
-            (insn.target, insn.typ, insn.size)
-        };
-
-        let new_insn = match simplification {
-            Simplification::None => continue,
-            Simplification::CopyFrom(src) => make_copy_from_parts(target, typ, size, src),
+        let site = (bb_idx, insn_idx);
+        changed |= match simplification {
+            Simplification::CopyFrom(src) => {
+                let insn = &func.blocks[bb_idx].insns[insn_idx];
+                let copy = make_copy_from_parts(insn.target, insn.typ, insn.size, src);
+                func.blocks[bb_idx].insns[insn_idx] = copy;
+                true
+            }
             Simplification::FoldToConst(value) => {
-                // Create a new constant pseudo
-                let const_id = func.create_const_pseudo(value);
-                make_copy_from_parts(target, typ, size, const_id)
+                propagate::fold_target_to_const(func, site, value, &mut minted)
             }
             Simplification::FoldToFloat(value) => {
-                // The target becomes the constant, and the instruction
-                // becomes the `SetVal` that carries its width -- which is
-                // the shape a float literal is linearized into, and the
-                // only one both allocators resolve.
-                let Some(target_id) = target else { continue };
-                if !func.make_const(target_id, ConstValue::Float(value)) {
-                    continue;
-                }
-                Instruction {
-                    op: Opcode::SetVal,
-                    target,
-                    src: Vec::new(),
-                    typ,
-                    size,
-                    ..Default::default()
-                }
+                propagate::fold_target_to_setval(func, site, ConstValue::Float(value))
             }
         };
-        func.blocks[bb_idx].insns[insn_idx] = new_insn;
-        changed = true;
     }
 
     changed
@@ -181,8 +160,9 @@ pub fn run(func: &mut Function, types: &TypeTable) -> bool {
 
 // Simplification Dispatch
 
-/// Try to simplify an instruction. Returns the simplification to apply.
-fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
+/// Try to simplify an instruction. Returns the simplification to apply, or
+/// `None` when there is none.
+fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &RunFacts) -> Option<Simplification> {
     match insn.op {
         // Integer arithmetic
         Opcode::Add => simplify_add(insn, consts),
@@ -196,16 +176,13 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplif
 
         // Bitwise (all handled by unified simplify_bitwise)
         Opcode::And | Opcode::Or | Opcode::Xor => {
-            or_decided(simplify_bitwise(insn, consts), insn, consts, facts)
+            simplify_bitwise(insn, consts).or_else(|| decided(insn, consts, facts))
         }
 
         // Comparisons (all handled by unified simplify_comparison)
-        op if op.is_int_comparison() => or_decided(
-            simplify_comparison(insn, consts, facts),
-            insn,
-            consts,
-            facts,
-        ),
+        op if op.is_int_comparison() => {
+            simplify_comparison(insn, consts, facts).or_else(|| decided(insn, consts, facts))
+        }
 
         // A short-circuit `&&`/`||` after if-conversion.
         Opcode::Select => simplify_select(insn, consts, facts),
@@ -227,42 +204,21 @@ fn try_simplify(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplif
         Opcode::FCvtS | Opcode::FCvtU | Opcode::Signbit => simplify_fcvt(insn, consts, facts),
 
         // Unary
-        Opcode::Neg => simplify_neg(insn, consts),
-        Opcode::Not => simplify_unary_of_const(insn, consts),
-        op if bit_opcode(op).is_some() => simplify_unary_of_const(insn, consts),
         Opcode::Sext | Opcode::Zext | Opcode::Trunc => simplify_convert(insn, consts),
+        // Every other integer operation `constfold` evaluates -- `-x`, `~x`,
+        // a population count -- has no algebraic identity here.
+        op if is_int_foldable(op) => simplify_of_consts(insn, consts),
 
-        _ => Simplification::None,
+        _ => None,
     }
 }
 
-/// Return FoldToConst(0).
-fn fold_to_zero() -> Simplification {
-    Simplification::FoldToConst(0)
-}
-
-/// Fold `insn` over two known constants, deferring to `constfold` for the
-/// width and signedness rules. `None` there means the operation is undefined
-/// for these operands -- a zero divisor, an out-of-range shift count -- and
-/// the instruction is left alone.
-fn fold_with(insn: &Instruction, a: i128, b: i128) -> Simplification {
-    match eval_binop(insn, a, b) {
-        Some(v) => Simplification::FoldToConst(v),
-        None => Simplification::None,
-    }
-}
-
-/// The unary counterpart of [`fold_with`].
-fn fold_unary_with(insn: &Instruction, a: i128) -> Simplification {
-    match eval_unop(insn, a) {
-        Some(v) => Simplification::FoldToConst(v),
-        None => Simplification::None,
-    }
-}
-
-/// Return FoldToConst for an absorbing/identity constant.
-fn fold_to_const(value: i128) -> Simplification {
-    Simplification::FoldToConst(value)
+/// Fold `insn` over known constants, one per operand, deferring to
+/// `constfold` for the width and signedness rules. `None` there means the
+/// operation is undefined for these operands -- a zero divisor, an
+/// out-of-range shift count -- and the instruction is left alone.
+fn fold_with(insn: &Instruction, ops: &[i128]) -> Option<Simplification> {
+    eval_int(insn, ops).map(Simplification::FoldToConst)
 }
 
 /// Create a Copy instruction from extracted parts.
@@ -284,9 +240,9 @@ fn make_copy_from_parts(
 
 // Add Simplification
 
-fn simplify_add(insn: &Instruction, consts: &ConstMap) -> Simplification {
+fn simplify_add(insn: &Instruction, consts: &ConstMap) -> Option<Simplification> {
     if insn.src.len() != 2 {
-        return Simplification::None;
+        return None;
     }
 
     let src1 = insn.src[0];
@@ -296,23 +252,23 @@ fn simplify_add(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
     match (val1, val2) {
         // Constant folding: a + b -> (a + b)
-        (Some(a), Some(b)) => fold_with(insn, a, b),
+        (Some(a), Some(b)) => fold_with(insn, &[a, b]),
 
         // Algebraic: x + 0 -> x
-        (None, Some(0)) => Simplification::CopyFrom(src1),
+        (None, Some(0)) => Some(Simplification::CopyFrom(src1)),
 
         // Algebraic: 0 + x -> x
-        (Some(0), None) => Simplification::CopyFrom(src2),
+        (Some(0), None) => Some(Simplification::CopyFrom(src2)),
 
-        _ => Simplification::None,
+        _ => None,
     }
 }
 
 // Sub Simplification
 
-fn simplify_sub(insn: &Instruction, consts: &ConstMap) -> Simplification {
+fn simplify_sub(insn: &Instruction, consts: &ConstMap) -> Option<Simplification> {
     if insn.src.len() != 2 {
-        return Simplification::None;
+        return None;
     }
 
     let src1 = insn.src[0];
@@ -320,8 +276,8 @@ fn simplify_sub(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
     // Identity: x - x -> 0, by root: the two sides are usually distinct
     // copies of one value.
-    if consts.root(src1, insn.size.max(1)) == consts.root(src2, insn.size.max(1)) {
-        return fold_to_zero();
+    if consts.same(src1, src2, insn.size.max(1)) {
+        return Some(Simplification::FoldToConst(0));
     }
 
     let val1 = consts.get(src1);
@@ -329,20 +285,20 @@ fn simplify_sub(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
     match (val1, val2) {
         // Constant folding: a - b -> (a - b)
-        (Some(a), Some(b)) => fold_with(insn, a, b),
+        (Some(a), Some(b)) => fold_with(insn, &[a, b]),
 
         // Algebraic: x - 0 -> x
-        (None, Some(0)) => Simplification::CopyFrom(src1),
+        (None, Some(0)) => Some(Simplification::CopyFrom(src1)),
 
-        _ => Simplification::None,
+        _ => None,
     }
 }
 
 // Mul Simplification
 
-fn simplify_mul(insn: &Instruction, consts: &ConstMap) -> Simplification {
+fn simplify_mul(insn: &Instruction, consts: &ConstMap) -> Option<Simplification> {
     if insn.src.len() != 2 {
-        return Simplification::None;
+        return None;
     }
 
     let src1 = insn.src[0];
@@ -352,25 +308,25 @@ fn simplify_mul(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
     match (val1, val2) {
         // Constant folding: a * b -> (a * b)
-        (Some(a), Some(b)) => fold_with(insn, a, b),
+        (Some(a), Some(b)) => fold_with(insn, &[a, b]),
 
         // Algebraic: x * 0 -> 0
-        (None, Some(0)) => fold_to_zero(),
-        (Some(0), None) => fold_to_zero(),
+        (None, Some(0)) => Some(Simplification::FoldToConst(0)),
+        (Some(0), None) => Some(Simplification::FoldToConst(0)),
 
         // Algebraic: x * 1 -> x
-        (None, Some(1)) => Simplification::CopyFrom(src1),
-        (Some(1), None) => Simplification::CopyFrom(src2),
+        (None, Some(1)) => Some(Simplification::CopyFrom(src1)),
+        (Some(1), None) => Some(Simplification::CopyFrom(src2)),
 
-        _ => Simplification::None,
+        _ => None,
     }
 }
 
 // Div Simplification
 
-fn simplify_div(insn: &Instruction, consts: &ConstMap) -> Simplification {
+fn simplify_div(insn: &Instruction, consts: &ConstMap) -> Option<Simplification> {
     if insn.src.len() != 2 {
-        return Simplification::None;
+        return None;
     }
 
     let src1 = insn.src[0];
@@ -392,25 +348,25 @@ fn simplify_div(insn: &Instruction, consts: &ConstMap) -> Simplification {
     // a divisor of -1 is only safe once the dividend is known not to be the
     // most negative value.
     if divmod_may_trap(insn.op, size, val1, val2) {
-        return Simplification::None;
+        return None;
     }
 
     match (val1, val2) {
         // Constant folding: a / b -> (a / b)
-        (Some(a), Some(b)) => fold_with(insn, a, b),
+        (Some(a), Some(b)) => fold_with(insn, &[a, b]),
 
         // Algebraic: x / 1 -> x
-        (None, Some(1)) => Simplification::CopyFrom(src1),
+        (None, Some(1)) => Some(Simplification::CopyFrom(src1)),
 
-        _ => Simplification::None,
+        _ => None,
     }
 }
 
 // Mod Simplification
 
-fn simplify_mod(insn: &Instruction, consts: &ConstMap) -> Simplification {
+fn simplify_mod(insn: &Instruction, consts: &ConstMap) -> Option<Simplification> {
     if insn.src.len() != 2 {
-        return Simplification::None;
+        return None;
     }
 
     let src1 = insn.src[0];
@@ -426,25 +382,25 @@ fn simplify_mod(insn: &Instruction, consts: &ConstMap) -> Simplification {
     // question. `0 % x` folded to zero here for an unknown `x`, and
     // `INT_MIN % -1` folded to zero through `fold_with`.
     if divmod_may_trap(insn.op, size, val1, val2) {
-        return Simplification::None;
+        return None;
     }
 
     match (val1, val2) {
         // Constant folding: a % b -> (a % b)
-        (Some(a), Some(b)) => fold_with(insn, a, b),
+        (Some(a), Some(b)) => fold_with(insn, &[a, b]),
 
         // Algebraic: x % 1 -> 0
-        (None, Some(1)) => fold_to_zero(),
+        (None, Some(1)) => Some(Simplification::FoldToConst(0)),
 
-        _ => Simplification::None,
+        _ => None,
     }
 }
 
 // Shift Simplifications
 
-fn simplify_shift(insn: &Instruction, consts: &ConstMap) -> Simplification {
+fn simplify_shift(insn: &Instruction, consts: &ConstMap) -> Option<Simplification> {
     if insn.src.len() != 2 {
-        return Simplification::None;
+        return None;
     }
 
     let src1 = insn.src[0];
@@ -459,20 +415,20 @@ fn simplify_shift(insn: &Instruction, consts: &ConstMap) -> Simplification {
     // to guess.
     let size = insn.size.max(1);
     if insn.op == Opcode::Asr && consts.get_at(src1, size, true) == Some(-1) {
-        return Simplification::FoldToConst(at_width(-1, size, true));
+        return Some(Simplification::FoldToConst(at_width(-1, size, true)));
     }
 
     match (val1, val2) {
         // Constant folding (shift amount must be in [0, type_width))
-        (Some(a), Some(b)) => fold_with(insn, a, b),
+        (Some(a), Some(b)) => fold_with(insn, &[a, b]),
 
         // Algebraic: x op 0 -> x
-        (None, Some(0)) => Simplification::CopyFrom(src1),
+        (None, Some(0)) => Some(Simplification::CopyFrom(src1)),
 
         // Algebraic: 0 op n -> 0
-        (Some(0), None) => fold_to_zero(),
+        (Some(0), None) => Some(Simplification::FoldToConst(0)),
 
-        _ => Simplification::None,
+        _ => None,
     }
 }
 
@@ -520,24 +476,21 @@ fn get_bitwise_info(op: Opcode) -> Option<BitwiseInfo> {
 }
 
 /// Unified bitwise simplification for And/Or/Xor
-fn simplify_bitwise(insn: &Instruction, consts: &ConstMap) -> Simplification {
-    let info = match get_bitwise_info(insn.op) {
-        Some(i) => i,
-        None => return Simplification::None,
-    };
+fn simplify_bitwise(insn: &Instruction, consts: &ConstMap) -> Option<Simplification> {
+    let info = get_bitwise_info(insn.op)?;
 
     if insn.src.len() != 2 {
-        return Simplification::None;
+        return None;
     }
 
     let src1 = insn.src[0];
     let src2 = insn.src[1];
 
     // x op x -> self_result, by root as above.
-    if consts.root(src1, insn.size.max(1)) == consts.root(src2, insn.size.max(1)) {
+    if consts.same(src1, src2, insn.size.max(1)) {
         return match info.self_result {
-            SelfOpResult::CopySrc => Simplification::CopyFrom(src1),
-            SelfOpResult::Const(c) => fold_to_const(c),
+            SelfOpResult::CopySrc => Some(Simplification::CopyFrom(src1)),
+            SelfOpResult::Const(c) => Some(Simplification::FoldToConst(c)),
         };
     }
 
@@ -546,31 +499,34 @@ fn simplify_bitwise(insn: &Instruction, consts: &ConstMap) -> Simplification {
 
     match (val1, val2) {
         // Constant folding: a op b
-        (Some(a), Some(b)) => fold_with(insn, a, b),
+        (Some(a), Some(b)) => fold_with(insn, &[a, b]),
 
         // Algebraic: x op identity -> x
-        (None, Some(v)) if v == info.identity => Simplification::CopyFrom(src1),
-        (Some(v), None) if v == info.identity => Simplification::CopyFrom(src2),
+        (None, Some(v)) if v == info.identity => Some(Simplification::CopyFrom(src1)),
+        (Some(v), None) if v == info.identity => Some(Simplification::CopyFrom(src2)),
 
         // Algebraic: x op absorbing -> absorbing (if exists)
-        (None, Some(v)) if info.absorbing == Some(v) => fold_to_const(v),
-        (Some(v), None) if info.absorbing == Some(v) => fold_to_const(v),
+        (None, Some(v)) if info.absorbing == Some(v) => Some(Simplification::FoldToConst(v)),
+        (Some(v), None) if info.absorbing == Some(v) => Some(Simplification::FoldToConst(v)),
 
-        _ => Simplification::None,
+        _ => None,
     }
 }
 
 // Comparison Simplifications
 
 /// Unified comparison simplification for all SetXX opcodes
-fn simplify_comparison(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
-    let info = match get_cmp_info(insn.op) {
-        Some(i) => i,
-        None => return Simplification::None,
+fn simplify_comparison(
+    insn: &Instruction,
+    consts: &ConstMap,
+    facts: &RunFacts,
+) -> Option<Simplification> {
+    let Some((mask, domain @ CmpDomain::Int { signed })) = Outcomes::of_op(insn.op) else {
+        return None;
     };
 
     if insn.src.len() != 2 {
-        return Simplification::None;
+        return None;
     }
 
     let src1 = insn.src[0];
@@ -587,30 +543,33 @@ fn simplify_comparison(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> 
             if consts.get(zero_side) == Some(0)
                 && facts.cmps.get_through(consts, bool_side, width).is_some()
             {
-                return Simplification::CopyFrom(bool_side);
+                return Some(Simplification::CopyFrom(bool_side));
             }
         }
     }
 
-    // Identity: x op x -> identity_result (comparison result is always i32/i64, never i128)
+    // Identity: `x op x` is decided by the outcomes a value has against
+    // itself.
     //
     // By root rather than by pseudo id: promotion out of memory gives every
     // use of a local its own `Copy`, so `x >> 0 != x` arrives as two distinct
     // pseudos naming one value.
-    if consts.root(src1, width) == consts.root(src2, width) {
-        return Simplification::FoldToConst(info.identity_result);
+    if consts.same(src1, src2, width) {
+        if let Some(v) = mask.decide(domain.reflexive()) {
+            return Some(Simplification::FoldToConst(i128::from(v)));
+        }
     }
 
     // Constant folding. A comparison knows its operand width and signedness
     // from the opcode, so it can read a value `get` would refuse to guess at.
-    let val1 = consts.get_at(src1, width, info.signed);
-    let val2 = consts.get_at(src2, width, info.signed);
+    let val1 = consts.get_at(src1, width, signed);
+    let val2 = consts.get_at(src2, width, signed);
 
     if let (Some(a), Some(b)) = (val1, val2) {
-        return fold_with(insn, a, b);
+        return fold_with(insn, &[a, b]);
     }
 
-    Simplification::None
+    None
 }
 
 /// A 0-or-1 value decided by the comparisons it combines, whatever their
@@ -624,70 +583,59 @@ fn simplify_comparison(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> 
 /// is. The operands may be written either way round -- `(x < y) && (y < x)`
 /// is also never true. See `CmpFacts::relation` for the algebra, and for why
 /// a float `(x >= y) || (x < y)` is not decided.
-fn decided(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Option<Simplification> {
+fn decided(insn: &Instruction, consts: &ConstMap, facts: &RunFacts) -> Option<Simplification> {
     let target = insn.target?;
     match facts.cmps.relation(consts, target, insn.size.max(1))? {
-        Relation::Known(v) => Some(fold_to_const(i128::from(v))),
+        Relation::Known(v) => Some(Simplification::FoldToConst(i128::from(v))),
         Relation::Holds(_) => None,
-    }
-}
-
-/// `s`, or when that found nothing, whatever [`decided`] finds.
-fn or_decided(
-    s: Simplification,
-    insn: &Instruction,
-    consts: &ConstMap,
-    facts: &Facts,
-) -> Simplification {
-    match s {
-        Simplification::None => decided(insn, consts, facts).unwrap_or(Simplification::None),
-        s => s,
     }
 }
 
 /// `select(c, t, f)`, which is also the shape of a short-circuit `&&`/`||`
 /// after if-conversion: see [`decided`].
-fn simplify_select(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
+fn simplify_select(
+    insn: &Instruction,
+    consts: &ConstMap,
+    facts: &RunFacts,
+) -> Option<Simplification> {
     if insn.src.len() != 3 {
-        return Simplification::None;
+        return None;
     }
     let (cond, t, f) = (insn.src[0], insn.src[1], insn.src[2]);
 
     // A constant condition needs no facts at all.
     if let Some(c) = consts.get(cond) {
-        return Simplification::CopyFrom(if c != 0 { t } else { f });
+        return Some(Simplification::CopyFrom(if c != 0 { t } else { f }));
     }
     // Both arms the same value, whatever the condition.
     let width = insn.size.max(1);
-    if consts.root(t, width) == consts.root(f, width) {
-        return Simplification::CopyFrom(t);
+    if consts.same(t, f, width) {
+        return Some(Simplification::CopyFrom(t));
     }
 
-    decided(insn, consts, facts).unwrap_or(Simplification::None)
+    decided(insn, consts, facts)
 }
 
 // Unary Simplifications
 
 /// Fold an integer width conversion of a constant.
 ///
-/// The operand is read at the width the conversion says it was stored in,
-/// which is not `insn.size` -- that is the destination. `get_at` is the
-/// accessor that takes both, and it is right here for the same reason it is
-/// right for a comparison: the opcode carries the signedness.
-fn simplify_convert(insn: &Instruction, consts: &ConstMap) -> Simplification {
+/// An extension's operand is read at the width the conversion says it was
+/// stored in, which is not `insn.size` -- that is the destination. `get_at`
+/// is the accessor that takes both, and it is right here for the same reason
+/// it is right for a comparison: the opcode carries the signedness.
+///
+/// A truncation's operand is read at `size` instead: its source is wider
+/// (validator I12), and the low `size` bits are all the result keeps.
+fn simplify_convert(insn: &Instruction, consts: &ConstMap) -> Option<Simplification> {
     if insn.src.len() != 1 {
-        return Simplification::None;
+        return None;
     }
     let (width, signed) = match insn.op {
-        Opcode::Trunc => (insn.size.max(1), true),
-        _ if insn.src_size != 0 => (insn.src_size, insn.op == Opcode::Sext),
-        // Without a source width an extension cannot be read at all.
-        _ => return Simplification::None,
+        Opcode::Trunc => (insn.size, true),
+        _ => (insn.operand_width(), insn.op == Opcode::Sext),
     };
-    match consts.get_at(insn.src[0], width, signed) {
-        Some(a) => fold_unary_with(insn, a),
-        None => Simplification::None,
-    }
+    fold_with(insn, &[consts.get_at(insn.src[0], width, signed)?])
 }
 
 // Floating-Point Simplification
@@ -708,27 +656,28 @@ fn simplify_convert(insn: &Instruction, consts: &ConstMap) -> Simplification {
 /// with a NaN is specified to raise, as gcc does. Neither backend raises it
 /// in the first place: both emit the quiet compare (`ucomis*`, `fucomip`,
 /// aarch64 `fcmp`), which signals only for a signaling NaN.
-fn simplify_fcmp(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
+fn simplify_fcmp(
+    insn: &Instruction,
+    consts: &ConstMap,
+    facts: &RunFacts,
+) -> Option<Simplification> {
     if insn.src.len() != 2 {
-        return Simplification::None;
+        return None;
     }
-    let Some(mask) = fcmp_mask(insn.op) else {
-        return Simplification::None;
+    let Some((mask, CmpDomain::Float)) = Outcomes::of_op(insn.op) else {
+        return None;
     };
-    match fcmp_decided(mask, possible_fcmp_outcomes(insn, consts, facts)) {
-        Some(false) => fold_to_zero(),
-        Some(true) => fold_to_const(1),
-        None => Simplification::None,
-    }
+    mask.decide(possible_fcmp_outcomes(insn, consts, facts))
+        .map(|v| Simplification::FoldToConst(i128::from(v)))
 }
 
 /// Which outcomes comparing `insn`'s two float operands can have, from what
 /// is known of each: whether it is a constant (and which), whether the two
 /// are the same value, and whether one is never below zero.
-fn possible_fcmp_outcomes(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> u8 {
+fn possible_fcmp_outcomes(insn: &Instruction, consts: &ConstMap, facts: &RunFacts) -> Outcomes {
     let (lhs, rhs) = (insn.src[0], insn.src[1]);
     let width = insn.operand_width().max(1);
-    if consts.root(lhs, width) == consts.root(rhs, width) {
+    if consts.same(lhs, rhs, width) {
         return CmpDomain::Float.reflexive();
     }
     // A constant is compared as the value it has in the operands' format. A
@@ -741,51 +690,43 @@ fn possible_fcmp_outcomes(insn: &Instruction, consts: &ConstMap, facts: &Facts) 
     let known = |id| Some(consts.fget(id, width)?.round_to_format(fmt?));
     let never_below = |id: PseudoId| facts.never_lt_zero.contains(&consts.root(id, width));
     match (known(lhs), known(rhs)) {
-        (Some(a), Some(b)) => fcmp_outcome(a.cmp_value(b)),
+        (Some(a), Some(b)) => Outcomes::of_ordering(a.cmp_value(b)),
         (None, Some(c)) => possible_against(c, never_below(lhs)),
-        (Some(c), None) => mirror_mask(possible_against(c, never_below(rhs))),
-        (None, None) => FCMP_ALL,
+        (Some(c), None) => possible_against(c, never_below(rhs)).mirror(),
+        (None, None) => CmpDomain::Float.all(),
     }
 }
 
 /// Fold float arithmetic over two constants.
-fn simplify_fbinop(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
+fn simplify_fbinop(
+    insn: &Instruction,
+    consts: &ConstMap,
+    facts: &RunFacts,
+) -> Option<Simplification> {
     if insn.src.len() != 2 {
-        return Simplification::None;
+        return None;
     }
     let width = insn.size.max(1);
-    let (Some(a), Some(b)) = (
-        consts.fget(insn.src[0], width),
-        consts.fget(insn.src[1], width),
-    ) else {
-        return Simplification::None;
-    };
-    let Some(fmt) = facts.fp_format(insn.typ) else {
-        return Simplification::None;
-    };
-    match eval_fbinop(insn.op, fmt, a, b) {
-        Some(v) => Simplification::FoldToFloat(v),
-        None => Simplification::None,
-    }
+    let a = consts.fget(insn.src[0], width)?;
+    let b = consts.fget(insn.src[1], width)?;
+    let fmt = facts.fp_format(insn.typ)?;
+    eval_fbinop(insn.op, fmt, a, b).map(Simplification::FoldToFloat)
 }
 
 /// Fold `Fma` of three constants.
-fn simplify_fternop(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
+fn simplify_fternop(
+    insn: &Instruction,
+    consts: &ConstMap,
+    facts: &RunFacts,
+) -> Option<Simplification> {
     let width = insn.size.max(1);
     let (Some(fmt), [a, b, c]) = (facts.fp_format(insn.typ), insn.src.as_slice()) else {
-        return Simplification::None;
+        return None;
     };
-    let (Some(a), Some(b), Some(c)) = (
-        consts.fget(*a, width),
-        consts.fget(*b, width),
-        consts.fget(*c, width),
-    ) else {
-        return Simplification::None;
-    };
-    match eval_fternop(insn.op, fmt, a, b, c) {
-        Some(v) => Simplification::FoldToFloat(v),
-        None => Simplification::None,
-    }
+    let a = consts.fget(*a, width)?;
+    let b = consts.fget(*b, width)?;
+    let c = consts.fget(*c, width)?;
+    eval_fternop(insn.op, fmt, a, b, c).map(Simplification::FoldToFloat)
 }
 
 /// Fold `FNeg` of a constant.
@@ -793,101 +734,71 @@ fn simplify_fternop(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Sim
 /// This is what makes a negative float literal a constant at all: `-1.5` is
 /// parsed as a negation of `1.5`, exactly as `-1` is of `1`, and the integer
 /// half has always folded here.
-fn simplify_funop(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
+fn simplify_funop(
+    insn: &Instruction,
+    consts: &ConstMap,
+    facts: &RunFacts,
+) -> Option<Simplification> {
     if insn.src.len() != 1 {
-        return Simplification::None;
+        return None;
     }
-    let Some(a) = consts.fget(insn.src[0], insn.size.max(1)) else {
-        return Simplification::None;
-    };
-    let Some(fmt) = facts.fp_format(insn.typ) else {
-        return Simplification::None;
-    };
-    match eval_funop(insn.op, fmt, a) {
-        Some(v) => Simplification::FoldToFloat(v),
-        None => Simplification::None,
-    }
+    let a = consts.fget(insn.src[0], insn.size.max(1))?;
+    let fmt = facts.fp_format(insn.typ)?;
+    eval_funop(insn.op, fmt, a).map(Simplification::FoldToFloat)
 }
 
 /// Fold a float-to-float conversion of a constant, to `typ`'s format.
-fn simplify_fcvtf(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
+fn simplify_fcvtf(
+    insn: &Instruction,
+    consts: &ConstMap,
+    facts: &RunFacts,
+) -> Option<Simplification> {
     if insn.src.len() != 1 {
-        return Simplification::None;
+        return None;
     }
-    let src_width = if insn.src_size != 0 {
-        insn.src_size
-    } else {
-        insn.size.max(1)
-    };
-    let Some(a) = consts.fget(insn.src[0], src_width) else {
-        return Simplification::None;
-    };
-    let (Some(src_fmt), Some(dst_fmt)) = (facts.fp_format(insn.src_typ), facts.fp_format(insn.typ))
-    else {
-        return Simplification::None;
-    };
-    match eval_fcvtf(insn.op, src_fmt, dst_fmt, a) {
-        Some(v) => Simplification::FoldToFloat(v),
-        None => Simplification::None,
-    }
+    let a = consts.fget(insn.src[0], insn.operand_width())?;
+    let src_fmt = facts.fp_format(insn.operand_type())?;
+    let dst_fmt = facts.fp_format(insn.typ)?;
+    eval_fcvtf(insn.op, src_fmt, dst_fmt, a).map(Simplification::FoldToFloat)
 }
 
 /// Fold a float-to-integer conversion of a constant, or a `Signbit` of one,
 /// which has the same shape.
 ///
 /// The source format comes from `src_typ`, not `typ`: a conversion's `typ` is
-/// the integer it produces, and the width it reads is the separate `src_size`.
-fn simplify_fcvt(insn: &Instruction, consts: &ConstMap, facts: &Facts) -> Simplification {
+/// the integer it produces, and the width it reads is the separate
+/// `src_size` ([`Instruction::operand_width`]).
+fn simplify_fcvt(
+    insn: &Instruction,
+    consts: &ConstMap,
+    facts: &RunFacts,
+) -> Option<Simplification> {
     if insn.src.len() != 1 {
-        return Simplification::None;
+        return None;
     }
-    let src_width = if insn.src_size != 0 {
-        insn.src_size
-    } else {
-        insn.size.max(1)
-    };
-    let Some(a) = consts.fget(insn.src[0], src_width) else {
-        return Simplification::None;
-    };
-    let Some(fmt) = facts.fp_format(insn.src_typ) else {
-        return Simplification::None;
-    };
-    match eval_fcvt(insn.op, insn.size.max(1), fmt, a) {
-        Some(v) => Simplification::FoldToConst(v),
-        None => Simplification::None,
-    }
+    let a = consts.fget(insn.src[0], insn.operand_width())?;
+    let fmt = facts.fp_format(insn.operand_type())?;
+    eval_fcvt(insn.op, insn.size.max(1), fmt, a).map(Simplification::FoldToConst)
 }
 
-fn simplify_neg(insn: &Instruction, consts: &ConstMap) -> Simplification {
-    if insn.src.len() != 1 {
-        return Simplification::None;
+/// Fold an operation with no algebraic identities -- `-x`, `~x`, a
+/// population count -- when every operand is a known constant.
+fn simplify_of_consts(insn: &Instruction, consts: &ConstMap) -> Option<Simplification> {
+    let mut ops = [0i128; 2];
+    if insn.src.len() > ops.len() {
+        return None;
     }
-
-    let src = insn.src[0];
-    match consts.get(src) {
-        Some(val) => fold_unary_with(insn, val),
-        None => Simplification::None,
+    for (slot, s) in ops.iter_mut().zip(&insn.src) {
+        *slot = consts.get(*s)?;
     }
-}
-
-/// Fold a unary operation with no algebraic identities -- `~x`, a
-/// population count -- when its operand is a known constant.
-fn simplify_unary_of_const(insn: &Instruction, consts: &ConstMap) -> Simplification {
-    if insn.src.len() != 1 {
-        return Simplification::None;
-    }
-
-    let src = insn.src[0];
-    match consts.get(src) {
-        Some(val) => fold_unary_with(insn, val),
-        None => Simplification::None,
-    }
+    fold_with(insn, &ops[..insn.src.len()])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::float::{FpFormat, NanKind};
+    use crate::ir::constfold::bit_opcode;
     use crate::ir::{BasicBlock, BasicBlockId, Pseudo, PseudoKind};
     use crate::target::Target;
     use crate::types::TypeTable;
@@ -1262,6 +1173,54 @@ mod tests {
 
         let new_const = func.get_pseudo(result_insn.src[0]).unwrap();
         assert_eq!(new_const.kind, PseudoKind::Val(0));
+    }
+
+    /// A 128-bit result proved constant is left alone, as `sccp` leaves it:
+    /// a copy of a minted constant has no `SetVal` to give it its sixteen
+    /// bytes. The 32-bit fold beside it still happens, and two folds to one
+    /// value share one minted constant.
+    #[test]
+    fn a_128_bit_fold_is_declined_and_mints_are_shared() {
+        let types = host_types();
+        let mut func = make_test_func_with_insn(
+            Instruction::binop(
+                Opcode::Shl,
+                PseudoId(2),
+                PseudoId(0),
+                PseudoId(1),
+                types.uint128_id,
+                128,
+            ),
+            vec![
+                Pseudo::val(PseudoId(0), 0),
+                Pseudo::reg(PseudoId(1), 1),
+                Pseudo::reg(PseudoId(2), 2),
+                Pseudo::reg(PseudoId(3), 3),
+                Pseudo::reg(PseudoId(4), 4),
+                Pseudo::reg(PseudoId(5), 5),
+            ],
+        );
+        for t in [3, 4] {
+            func.blocks[0].insns.insert(
+                2,
+                Instruction::binop(
+                    Opcode::Mul,
+                    PseudoId(t),
+                    PseudoId(5),
+                    PseudoId(0),
+                    types.int_id,
+                    32,
+                ),
+            );
+        }
+        let before = func.pseudos.len();
+
+        assert!(run(&mut func, &types));
+        let insns = &func.blocks[0].insns;
+        assert_eq!(insns[1].op, Opcode::Shl, "the 128-bit shift stays");
+        assert_eq!((insns[2].op, insns[3].op), (Opcode::Copy, Opcode::Copy));
+        assert_eq!(insns[2].src, insns[3].src, "one minted zero");
+        assert_eq!(func.pseudos.len(), before + 1);
     }
 
     #[test]
@@ -2135,14 +2094,12 @@ mod tests {
             ],
         );
         let consts = ConstMap::new(&func);
-        assert_ne!(
-            consts.root(PseudoId(1), 32),
-            consts.root(PseudoId(2), 32),
+        assert!(
+            !consts.same(PseudoId(1), PseudoId(2), 32),
             "an 8-bit copy is not the 32-bit value"
         );
-        assert_eq!(
-            consts.root(PseudoId(1), 8),
-            consts.root(PseudoId(2), 8),
+        assert!(
+            consts.same(PseudoId(1), PseudoId(2), 8),
             "at 8 bits they agree"
         );
     }
@@ -3428,13 +3385,5 @@ mod tests {
         // These read the same either way, so they fold.
         assert_eq!(fold_convert(Opcode::Trunc, 0x1200, 32, 8), Some(0));
         assert_eq!(fold_convert(Opcode::Trunc, 100, 32, 8), Some(100));
-    }
-
-    /// Without a source width an extension cannot be read at all, and
-    /// falling back on `size` would make it the identity.
-    #[test]
-    fn an_extension_with_no_source_width_is_left_alone() {
-        assert_eq!(fold_convert(Opcode::Sext, 200, 0, 32), None);
-        assert_eq!(fold_convert(Opcode::Zext, 200, 0, 32), None);
     }
 }

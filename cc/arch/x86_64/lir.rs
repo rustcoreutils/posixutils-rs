@@ -840,14 +840,14 @@ impl EmitAsm for X86Inst {
 
             // Control Flow
             X86Inst::Jmp { target: lbl } => {
-                let _ = writeln!(out, "    jmp {}", lbl.name());
+                let _ = writeln!(out, "    jmp {}", lbl.name(target));
             }
             X86Inst::JmpIndirect { reg } => {
                 let _ = writeln!(out, "    jmp *{}", reg.name64());
             }
 
             X86Inst::Jcc { cc, target: lbl } => {
-                let _ = writeln!(out, "    j{} {}", cc.x86_suffix(), lbl.name());
+                let _ = writeln!(out, "    j{} {}", cc.x86_suffix(), lbl.name(target));
             }
 
             X86Inst::TlvCall => {

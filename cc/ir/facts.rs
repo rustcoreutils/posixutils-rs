@@ -26,10 +26,7 @@
 // canonical operands, domain, width)` -- the form an edge fact wants.
 //
 
-use super::constfold::{
-    at_width, cmp_mask, fcmp_mask, get_cmp_info, mirror_mask, unambiguous_at, CMP_ALL, CMP_EQ,
-    CMP_UN, FCMP_ALL,
-};
+use super::constfold::{at_width, unambiguous_at, CmpDomain, Outcomes};
 use super::{Function, Opcode, PseudoId, PseudoKind};
 use crate::float::FloatVal;
 use std::collections::HashMap;
@@ -118,24 +115,9 @@ impl ConstMap {
                 }
             }
         }
-        // An inline-asm output is a second definition of its pseudo that
-        // invariant I1 deliberately exempts, so nothing else notices the
-        // pseudo has two defs. A tied operand (`"0"(x)`) is written as a
-        // `Copy` into the output pseudo *before* the asm, so following that
-        // copy answers with the asm's input where the question was about its
-        // result. `dataflow::Sparse` already refuses these for the same
-        // reason, for `sccp` and `vrp`; they must agree, because a pass that
-        // folds what those would not is the one that miscompiles.
-        for bb in &func.blocks {
-            for insn in &bb.insns {
-                let Some(ref asm) = insn.extra().asm_data else {
-                    continue;
-                };
-                for out in &asm.outputs {
-                    poisoned.push(out.pseudo);
-                }
-            }
-        }
+        // An inline-asm output's recorded definition says nothing about its
+        // value; see `Function::asm_defined_pseudos`.
+        poisoned.extend(func.asm_defined_pseudos());
 
         for id in poisoned {
             copies.remove(&id);
@@ -152,8 +134,9 @@ impl ConstMap {
 
     /// Record a simplification this run is about to apply.
     ///
-    /// Every collected simplification is applied unconditionally, so this is
-    /// a fact rather than a guess. It is what lets `a = 2+3; b = a*4;
+    /// A collected simplification states what its target holds, whether or
+    /// not the rewrite is then admitted, so this is a fact rather than a
+    /// guess. It is what lets `a = 2+3; b = a*4;
     /// c = b+1;` fold all the way down in a single pass instead of needing
     /// one `opt.rs` iteration per level of expression depth.
     /// Note that `target` will hold the integer constant `v`.
@@ -198,6 +181,12 @@ impl ConstMap {
         cur
     }
 
+    /// Whether `a` and `b` are the same value read at `width` bits: whether
+    /// they share a [`Self::root`].
+    pub(crate) fn same(&self, a: PseudoId, b: PseudoId, width: u32) -> bool {
+        self.root(a, width) == self.root(b, width)
+    }
+
     /// The constant at `id`, read at `size` bits in the given signedness.
     ///
     /// For a consumer that *knows* how to read its operands -- a comparison
@@ -209,20 +198,10 @@ impl ConstMap {
     /// Still `None` when the chain narrows *below* `size`, since the value
     /// was truncated before it got here.
     pub(crate) fn get_at(&self, id: PseudoId, size: u32, signed: bool) -> Option<i128> {
-        let mut cur = id;
-        let mut narrowest: Option<u32> = None;
-        for _ in 0..=self.copies.len() {
-            if let Some(&v) = self.vals.get(&cur) {
-                return match narrowest {
-                    Some(w) if w < size => None,
-                    _ => Some(at_width(v, size, signed)),
-                };
-            }
-            let &(src, width) = self.copies.get(&cur)?;
-            narrowest = Some(narrowest.map_or(width, |w: u32| w.min(width)));
-            cur = src;
+        match self.walk(id)? {
+            (_, Some(w)) if w < size => None,
+            (v, _) => Some(at_width(v, size, signed)),
         }
-        None
     }
 
     /// The float constant at `id`, following `Copy` chains to their source.
@@ -243,60 +222,30 @@ impl ConstMap {
     /// `Phi`, a `Load` or `Call` result, an `Arg`, an `Undef`, a float, or a
     /// chain whose value does not fit the width it is copied at.
     pub(crate) fn get(&self, id: PseudoId) -> Option<i128> {
-        let mut cur = id;
-        // The narrowest width the value is observed through bounds what the
-        // final answer is allowed to be.
-        let mut narrowest: Option<u32> = None;
+        match self.walk(id)? {
+            (v, Some(w)) if !unambiguous_at(v, w) => None,
+            (v, _) => Some(v),
+        }
+    }
 
-        // Bounded rather than visited-set: a cycle terminates instead of
-        // hanging, without relying on I1 having actually been checked.
+    /// The integer constant at the end of `id`'s copy chain, with the
+    /// narrowest width the chain observes it through -- which bounds what the
+    /// final answer is allowed to be, and is `None` for no copy at all.
+    ///
+    /// Bounded rather than visited-set: a cycle terminates instead of
+    /// hanging, without relying on I1 having actually been checked.
+    fn walk(&self, id: PseudoId) -> Option<(i128, Option<u32>)> {
+        let mut cur = id;
+        let mut narrowest: Option<u32> = None;
         for _ in 0..=self.copies.len() {
             if let Some(&v) = self.vals.get(&cur) {
-                return match narrowest {
-                    Some(w) if !unambiguous_at(v, w) => None,
-                    _ => Some(v),
-                };
+                return Some((v, narrowest));
             }
             let &(src, width) = self.copies.get(&cur)?;
             narrowest = Some(narrowest.map_or(width, |w: u32| w.min(width)));
             cur = src;
         }
         None
-    }
-}
-
-/// Which kind of comparison a fact came from, and so which outcomes it has.
-///
-/// The two are never combined. An integer comparison has three outcomes and
-/// a signedness; a float one has no signedness and a fourth outcome,
-/// [`CMP_UN`], which is what makes `(x < y) || (x >= y)` true for integers
-/// and false for a NaN.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum CmpDomain {
-    /// A signed and an unsigned comparison over one pair are *not*
-    /// comparable: `x < y` and `x > y` read signed are not complementary with
-    /// the unsigned forms.
-    Int { signed: bool },
-    /// IEEE: less, equal, greater or unordered.
-    Float,
-}
-
-impl CmpDomain {
-    /// Every outcome a comparison in this domain can have.
-    pub(crate) fn all(self) -> u8 {
-        match self {
-            CmpDomain::Int { .. } => CMP_ALL,
-            CmpDomain::Float => FCMP_ALL,
-        }
-    }
-
-    /// The outcomes a value compared with *itself* can have: equal, and for
-    /// a float also unordered -- a NaN is not equal to itself.
-    pub(crate) fn reflexive(self) -> u8 {
-        match self {
-            CmpDomain::Int { .. } => CMP_EQ,
-            CmpDomain::Float => CMP_EQ | CMP_UN,
-        }
     }
 }
 
@@ -308,8 +257,8 @@ impl CmpDomain {
 #[derive(Clone, Copy)]
 pub(crate) struct CmpFact {
     /// Which outcomes make it true: less, equal, greater, and for a float
-    /// also unordered (`constfold::CMP_*`).
-    pub(crate) mask: u8,
+    /// also unordered.
+    pub(crate) mask: Outcomes,
     pub(crate) lhs: PseudoId,
     pub(crate) rhs: PseudoId,
     pub(crate) domain: CmpDomain,
@@ -366,12 +315,7 @@ impl CmpFacts {
                 if let Some(c) = Combinator::of(insn.op, &insn.src) {
                     combinators.insert(target, c);
                 }
-                let (mask, domain) = if let Some(mask) = cmp_mask(insn.op) {
-                    let signed = get_cmp_info(insn.op).map(|i| i.signed).unwrap_or(true);
-                    (mask, CmpDomain::Int { signed })
-                } else if let Some(mask) = fcmp_mask(insn.op) {
-                    (mask, CmpDomain::Float)
-                } else {
+                let Some((mask, domain)) = Outcomes::of_op(insn.op) else {
                     continue;
                 };
                 if insn.src.len() != 2 {
@@ -499,19 +443,18 @@ fn normalize(f: CmpFact) -> Relation {
     } else {
         f.domain.all()
     };
-    let mask = f.mask & possible;
-    if mask == 0 {
-        Relation::Known(false)
-    } else if mask == possible {
-        Relation::Known(true)
-    } else {
-        Relation::Holds(CmpFact { mask, ..f })
+    match f.mask.decide(possible) {
+        Some(v) => Relation::Known(v),
+        None => Relation::Holds(CmpFact {
+            mask: f.mask & possible,
+            ..f
+        }),
     }
 }
 
 /// `other`'s mask over `base`'s operand order, or `None` when the two are
 /// not comparisons of the same pair in the same domain at the same width.
-fn aligned_mask(base: CmpFact, other: CmpFact) -> Option<u8> {
+fn aligned_mask(base: CmpFact, other: CmpFact) -> Option<Outcomes> {
     if base.domain != other.domain || base.width != other.width {
         return None;
     }
@@ -519,27 +462,32 @@ fn aligned_mask(base: CmpFact, other: CmpFact) -> Option<u8> {
         return Some(other.mask);
     }
     if base.lhs == other.rhs && base.rhs == other.lhs {
-        return Some(mirror_mask(other.mask));
+        return Some(other.mask.mirror());
     }
     None
 }
 
 /// The value a float self-comparison tests, when it holds exactly when that
-/// value is a NaN (`want == CMP_UN`) or exactly when it is not (`CMP_EQ`).
-/// `f` is normalized, so `x != x` arrives here as `CMP_UN`.
-fn self_test(f: CmpFact, want: u8) -> Option<PseudoId> {
+/// value is a NaN (`want == Outcomes::UN`) or exactly when it is not
+/// (`Outcomes::EQ`). `f` is normalized, so `x != x` arrives here as
+/// `Outcomes::UN`.
+fn self_test(f: CmpFact, want: Outcomes) -> Option<PseudoId> {
     (f.domain == CmpDomain::Float && f.lhs == f.rhs && f.mask == want).then_some(f.lhs)
 }
 
 /// Both operands tested one at a time, as `__builtin_isunordered` lowers:
-/// `x != x || y != y` (`want == CMP_UN`) is `x` and `y` unordered, and
-/// `x == x && y == y` (`CMP_EQ`) is the two ordered.
-fn pair_of_self_tests(a: CmpFact, b: CmpFact, want: u8) -> Option<Relation> {
+/// `x != x || y != y` (`want == Outcomes::UN`) is `x` and `y` unordered,
+/// and `x == x && y == y` (`Outcomes::EQ`) is the two ordered.
+fn pair_of_self_tests(a: CmpFact, b: CmpFact, want: Outcomes) -> Option<Relation> {
     if a.width != b.width {
         return None;
     }
     let (x, y) = (self_test(a, want)?, self_test(b, want)?);
-    let mask = if want == CMP_UN { CMP_UN } else { CMP_ALL };
+    let mask = if want == Outcomes::UN {
+        Outcomes::UN
+    } else {
+        Outcomes::ORDERED
+    };
     Some(normalize(CmpFact {
         mask,
         lhs: x,
@@ -557,7 +505,7 @@ fn and(a: Relation, b: Relation) -> Option<Relation> {
                 mask: x.mask & m,
                 ..x
             })),
-            None => pair_of_self_tests(x, y, CMP_EQ),
+            None => pair_of_self_tests(x, y, Outcomes::EQ),
         },
     }
 }
@@ -571,7 +519,7 @@ fn or(a: Relation, b: Relation) -> Option<Relation> {
                 mask: x.mask | m,
                 ..x
             })),
-            None => pair_of_self_tests(x, y, CMP_UN),
+            None => pair_of_self_tests(x, y, Outcomes::UN),
         },
     }
 }
@@ -580,7 +528,7 @@ fn not(a: Relation) -> Relation {
     match a {
         Relation::Known(v) => Relation::Known(!v),
         Relation::Holds(f) => normalize(CmpFact {
-            mask: !f.mask & f.domain.all(),
+            mask: f.mask.complement(f.domain),
             ..f
         }),
     }
@@ -589,7 +537,6 @@ fn not(a: Relation) -> Relation {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::constfold::CMP_LT;
     use crate::ir::{BasicBlock, BasicBlockId, Instruction, Pseudo};
     use crate::target::Target;
     use crate::types::TypeTable;
@@ -692,13 +639,13 @@ mod tests {
         let fact = cmps.get(PseudoId(4)).expect("setlt records a fact");
         assert_eq!(fact.lhs, PseudoId(1), "through the copy to the constant");
         assert_eq!(fact.rhs, PseudoId(5));
-        assert_eq!(fact.mask, CMP_LT);
+        assert_eq!(fact.mask, Outcomes::LT);
         assert_eq!(fact.width, 32);
         assert!(matches!(fact.domain, CmpDomain::Int { signed: true }));
         assert!(cmps.get(PseudoId(6)).is_none());
         assert_eq!(
             cmps.get_through(&consts, PseudoId(6), 32).map(|f| f.mask),
-            Some(CMP_LT)
+            Some(Outcomes::LT)
         );
     }
 
@@ -710,14 +657,12 @@ mod tests {
         let mut asm = Instruction::new(Opcode::Asm);
         asm.extra_mut().asm_data = Some(Box::new(crate::ir::AsmData {
             template: String::new(),
-            outputs: vec![crate::ir::AsmConstraint {
-                pseudo: PseudoId(2),
-                name: None,
-                matching_output: None,
-                constraint: "=r".into(),
-                size: 32,
-                offset: 0,
-            }],
+            outputs: vec![crate::ir::AsmConstraint::new(
+                PseudoId(2),
+                "=r",
+                crate::target::Arch::X86_64,
+                32,
+            )],
             inputs: vec![],
             clobbers: vec![],
             goto_labels: vec![],

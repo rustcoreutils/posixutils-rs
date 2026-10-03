@@ -284,6 +284,22 @@ pub struct CompositeType {
     /// was accepted, where gcc rejects it. A qualified variant of the type
     /// clones the composite, and so keeps the identity.
     pub anon_id: Option<u32>,
+    /// For a tagged struct, union or enum: the tag's own `TypeId`, the type
+    /// its first declaration created and its definition completes in place.
+    ///
+    /// The type's identity, carried by every copy of the composite. A
+    /// qualified reference -- `const enum E`, `volatile struct S` -- is a
+    /// separate `TypeId` holding a clone of this composite, and so is the
+    /// `Type` a typedef name or `typeof` hands a declaration; each says which
+    /// tag it is through this, never through its tag's *name*, which an
+    /// inner scope may have given to a different type. [`TypeTable::intern`]
+    /// records every copy of an incomplete tag, and the definition completes
+    /// the copies with the tag: a `typedef const enum E CE;` ahead of the
+    /// list has the enum's size and signedness, and a `const enum E *`
+    /// parameter declared before it is the same type as one declared after.
+    /// Set by `intern`; `None` for a tagless composite, whose identity is
+    /// [`Self::anon_id`].
+    pub tag_type: Option<TypeId>,
 }
 
 impl CompositeType {
@@ -299,6 +315,7 @@ impl CompositeType {
             is_complete: false,
             transparent: false,
             anon_id: None,
+            tag_type: None,
         }
     }
 
@@ -732,8 +749,10 @@ impl Type {
             _ => {}
         }
 
-        // Compare variadic flag
-        if self.variadic != other.variadic {
+        // Compare variadic flag. A function type without a prototype says
+        // nothing about its parameters, so the caller settles one against a
+        // prototype.
+        if self.params.is_some() && other.params.is_some() && self.variadic != other.variadic {
             return false;
         }
 
@@ -752,17 +771,17 @@ impl Type {
         // complaint about two spellings of one type. Storage class is a
         // property of a declaration, never of a type.
 
-        // Only the *shape* of the parameter list is settled here: whether a
-        // prototype was supplied at all, and how many parameters it has. The
-        // parameter types themselves are compared by the caller, which can
-        // recurse -- comparing them by TypeId called two identical
-        // `void *(Parser *)` different whenever a declaration specifier had
-        // settled on an inner type, which is 19 lines of CPython's generated
-        // parser.
-        match (&self.params, &other.params) {
-            (Some(a), Some(b)) if a.len() == b.len() => {}
-            (None, None) => {}
-            _ => return false,
+        // Only the *shape* of two prototypes is settled here: how many
+        // parameters each has. The parameter types themselves are compared by
+        // the caller, which can recurse -- comparing them by TypeId called two
+        // identical `void *(Parser *)` different whenever a declaration
+        // specifier had settled on an inner type, which is 19 lines of
+        // CPython's generated parser. So is a prototype against a function
+        // type without one.
+        if let (Some(a), Some(b)) = (&self.params, &other.params) {
+            if a.len() != b.len() {
+                return false;
+            }
         }
 
         // Compare composite types (struct, union, enum)
@@ -984,6 +1003,9 @@ pub struct TypeTable {
     lookup: HashMap<TypeKey, TypeId>,
     /// The last identity [`TypeTable::fresh_anon_id`] handed out.
     next_anon_id: u32,
+    /// The qualified copies of each incomplete tagged type, by the tag's own
+    /// `TypeId`; see [`CompositeType::tag_type`].
+    forward_copies: HashMap<TypeId, Vec<TypeId>>,
     /// Pointer size in bits (target-dependent, defaults to 64 for LP64)
     pointer_width: u32,
     /// Target architecture for runtime type size calculations
@@ -1077,6 +1099,7 @@ impl TypeTable {
             types: Vec::with_capacity(DEFAULT_TYPE_TABLE_CAPACITY),
             lookup: HashMap::with_capacity(DEFAULT_TYPE_TABLE_CAPACITY),
             next_anon_id: 0,
+            forward_copies: HashMap::new(),
             pointer_width: target.pointer_width,
             target_arch: target.arch,
             target_os: target.os,
@@ -1268,6 +1291,18 @@ impl TypeTable {
         }
     }
 
+    /// The unsigned integer type `bytes` wide, for moving an object's bits
+    /// as a value; `None` for a width with no such type.
+    pub fn unsigned_of_size(&self, bytes: usize) -> Option<TypeId> {
+        match bytes {
+            1 => Some(self.uchar_id),
+            2 => Some(self.ushort_id),
+            4 => Some(self.uint_id),
+            8 => Some(self.ulong_id),
+            _ => None,
+        }
+    }
+
     /// A fresh identity for a tagless composite definition; see
     /// [`CompositeType::anon_id`].
     pub fn fresh_anon_id(&mut self) -> u32 {
@@ -1277,7 +1312,7 @@ impl TypeTable {
 
     /// Intern a type, returning its unique ID.
     /// Deduplicates equivalent types (same ID for equivalent types).
-    pub fn intern(&mut self, typ: Type) -> TypeId {
+    pub fn intern(&mut self, mut typ: Type) -> TypeId {
         // Try to create a key for deduplication
         if let Some(key) = self.make_key(&typ) {
             if let Some(&existing_id) = self.lookup.get(&key) {
@@ -1290,8 +1325,26 @@ impl TypeTable {
         } else {
             // Types with composite data (structs) are not deduplicated
             let id = TypeId(self.types.len() as u32);
+            self.note_tag_type(&mut typ, id);
             self.types.push(typ);
             id
+        }
+    }
+
+    /// Tie a tagged type being interned as `id` to the tag it stands for:
+    /// the first one interned is the tag's own type, and every later one is a
+    /// copy of it. A copy of an incomplete tag is recorded, so that the tag's
+    /// definition completes it too. See [`CompositeType::tag_type`].
+    fn note_tag_type(&mut self, typ: &mut Type, id: TypeId) {
+        let Some(composite) = typ.composite.as_deref_mut() else {
+            return;
+        };
+        if composite.tag.is_none() {
+            return;
+        }
+        let tag_type = *composite.tag_type.get_or_insert(id);
+        if tag_type != id && !composite.is_complete {
+            self.forward_copies.entry(tag_type).or_default().push(id);
         }
     }
 
@@ -1339,12 +1392,45 @@ impl TypeTable {
     /// This updates the type in place so that all existing pointers to
     /// the incomplete type will now see the complete type.
     pub fn complete_struct(&mut self, id: TypeId, composite: CompositeType) {
-        let typ = &mut self.types[id.0 as usize];
         debug_assert!(
-            matches!(typ.kind, TypeKind::Struct | TypeKind::Union),
+            matches!(self.kind(id), TypeKind::Struct | TypeKind::Union),
             "complete_struct called on non-struct/union type"
         );
-        typ.composite = Some(Box::new(composite));
+        self.complete_tag(id, composite, TypeModifiers::empty());
+    }
+
+    /// Complete a forward-declared enum with its definition, in place, as
+    /// [`Self::complete_struct`] does a struct: every typedef, member and
+    /// pointee declared through the forward reference sees the enum's size,
+    /// and its signedness when the underlying type is unsigned.
+    pub fn complete_enum(&mut self, id: TypeId, composite: CompositeType, unsigned: bool) {
+        debug_assert!(
+            self.kind(id) == TypeKind::Enum,
+            "complete_enum called on a non-enum type"
+        );
+        let sign = if unsigned {
+            TypeModifiers::UNSIGNED
+        } else {
+            TypeModifiers::empty()
+        };
+        self.complete_tag(id, composite, sign);
+    }
+
+    /// Give the tag's type `id`, and every qualified copy of it, the
+    /// definition's composite and `added` modifiers. Each copy keeps its own
+    /// qualifiers.
+    fn complete_tag(&mut self, id: TypeId, composite: CompositeType, added: TypeModifiers) {
+        let tag_type = self.composite(id).and_then(|c| c.tag_type).unwrap_or(id);
+        let copies = self.forward_copies.remove(&tag_type).unwrap_or_default();
+        let composite = CompositeType {
+            tag_type: Some(tag_type),
+            ..composite
+        };
+        for copy in std::iter::once(tag_type).chain(copies) {
+            let typ = &mut self.types[copy.0 as usize];
+            typ.composite = Some(Box::new(composite.clone()));
+            typ.modifiers |= added;
+        }
     }
 
     // Type query methods (moved from Type to TypeTable)
@@ -1531,6 +1617,26 @@ impl TypeTable {
             .iter()
             .find(|m| m.bit_width != Some(0))
             .map(|m| m.typ)
+    }
+
+    /// The member a GNU cast to union type `id` initializes from an operand
+    /// of type `operand`, which the caller has already lvalue-converted.
+    ///
+    /// gcc selects the first member whose type is compatible with the
+    /// operand's, qualifiers ignored. Nothing converts the operand to find a
+    /// match: a `long` selects no `int` member. A bit-field never matches,
+    /// and neither can an unnamed member, which no designator could name.
+    /// `None` when nothing matches, or `id` is not a union.
+    pub fn union_member_for_cast(&self, id: TypeId, operand: TypeId) -> Option<StringId> {
+        if self.kind(id) != TypeKind::Union {
+            return None;
+        }
+        self.composite(id)?
+            .members
+            .iter()
+            .filter(|m| m.bit_width.is_none() && m.name != StringId::EMPTY)
+            .find(|m| self.types_compatible(m.typ, operand))
+            .map(|m| m.name)
     }
 
     /// Format a type for display (with recursive base type printing).
@@ -1909,9 +2015,10 @@ impl TypeTable {
     /// Reported as a kind plus the referenced type rather than by interning a
     /// pointer, so a caller holding the table immutably can still ask.
     fn as_assigned(&self, id: TypeId) -> (TypeKind, Option<TypeId>) {
+        if let Some(pointee) = self.decay_pointee(id) {
+            return (TypeKind::Pointer, Some(pointee));
+        }
         match self.kind(id) {
-            TypeKind::Array => (TypeKind::Pointer, self.base_type(id)),
-            TypeKind::Function => (TypeKind::Pointer, Some(id)),
             TypeKind::Pointer => (TypeKind::Pointer, self.base_type(id)),
             other => (other, None),
         }
@@ -2033,13 +2140,68 @@ impl TypeTable {
     /// converts an array to a pointer to its first element and a function to a
     /// pointer to itself. Every other type is its own.
     pub fn decayed(&mut self, typ: TypeId) -> TypeId {
+        match self.decay_pointee(typ) {
+            Some(pointee) => self.intern(Type::pointer(pointee)),
+            None => typ,
+        }
+    }
+
+    /// [`Self::decayed`] for a caller holding the table immutably, as the
+    /// linearizer does: the pointer type when it has been interned, `void *`
+    /// otherwise. Either has the kind, width and signedness of the pointer,
+    /// which is everything a conversion of the value reads.
+    ///
+    /// Typed as itself, a function has no width and an array has its whole
+    /// size, so a value converted from that type was converted from the
+    /// wrong width -- `(long)f` kept 32 bits of the address.
+    pub fn decayed_value(&self, typ: TypeId) -> TypeId {
+        match self.decay_pointee(typ) {
+            Some(pointee) => self.pointer_to(pointee),
+            None => typ,
+        }
+    }
+
+    /// Whether a value of this type is the address it decays to: an array or
+    /// a function.
+    pub fn decays(&self, typ: TypeId) -> bool {
+        self.decay_pointee(typ).is_some()
+    }
+
+    /// What one step of pointer arithmetic on a value of type `typ` spans
+    /// (C17 6.5.6p8-9): the type a pointer references, or the one an array or
+    /// a function decays to a pointer to. `None` for a type that is not a
+    /// pointer once decayed.
+    ///
+    /// Not [`Self::base_type`], which answers a function type's *return*
+    /// type: `f + 1` stepped by `sizeof(int)` in a static initializer.
+    pub fn arithmetic_pointee(&self, typ: TypeId) -> Option<TypeId> {
         match self.kind(typ) {
-            TypeKind::Array => {
-                let elem = self.base_type(typ).unwrap_or(self.char_id);
-                self.intern(Type::pointer(elem))
-            }
-            TypeKind::Function => self.intern(Type::pointer(typ)),
+            TypeKind::Pointer => self.base_type(typ),
+            _ => self.decay_pointee(typ),
+        }
+    }
+
+    /// The function type a call through a callee of type `typ` calls: `typ`
+    /// itself, or the pointed-to type for a call through a pointer (C17
+    /// 6.5.2.2p1 allows either). `None` when that is not a function type --
+    /// an implicit declaration, a diagnosed expression.
+    pub fn callee_function_type(&self, typ: TypeId) -> Option<TypeId> {
+        let func = match self.kind(typ) {
+            TypeKind::Pointer => self.base_type(typ).unwrap_or(typ),
             _ => typ,
+        };
+        (self.kind(func) == TypeKind::Function).then_some(func)
+    }
+
+    /// What an array or a function decays to a pointer *to*: the element
+    /// type, or the function type itself. `None` for a type that does not
+    /// decay. The one statement of C17 6.3.2.1p3-4 that the decays above
+    /// and assignment checking all read.
+    fn decay_pointee(&self, typ: TypeId) -> Option<TypeId> {
+        match self.kind(typ) {
+            TypeKind::Array => Some(self.base_type(typ).unwrap_or(self.char_id)),
+            TypeKind::Function => Some(typ),
+            _ => None,
         }
     }
 
@@ -2611,6 +2773,12 @@ impl TypeTable {
                 typ.composite.as_ref().map(|c| c.size).unwrap_or(0)
             }
             TypeKind::Enum => typ.composite.as_ref().map(|c| c.size).unwrap_or(4),
+            // GCC extension: a function type is 1 byte, as `void` is, so
+            // `sizeof(f)` is 1 and a pointer to a function steps by one byte
+            // -- `fp + 1`, `fp++`, and `fp - fq` dividing by this size. It is
+            // an object size only: a function has no value width, and
+            // `size_bits` still answers 0 for it.
+            TypeKind::Function => 1,
             TypeKind::Array => {
                 let elem = typ.base.map(|b| self.size_bytes(b)).unwrap_or(0);
                 let count = typ.array_size.unwrap_or(0);
@@ -2766,21 +2934,10 @@ impl TypeTable {
     /// a bit-field's width -- so the rule lives here, beside it, rather than in
     /// each of the two expression forms that need it.
     ///
-    /// The two type ids are not redundant. `members` is `object` after the
-    /// parser resolved an incomplete tag to its definition, which is where the
-    /// member list is; the qualifiers have to come from `object`, because
-    /// resolving answers with the *tag's* type and a tag is never qualified --
-    /// resolving first is how `volatile struct S` loses the `volatile`.
-    ///
     /// For `p->m` the object is the pointee: `struct S *volatile p` qualifies
     /// the pointer, not what it points at.
-    pub fn member_access_type(
-        &mut self,
-        object: TypeId,
-        members: TypeId,
-        name: StringId,
-    ) -> Option<TypeId> {
-        let info = self.find_member(members, name)?;
+    pub fn member_access_type(&mut self, object: TypeId, name: StringId) -> Option<TypeId> {
+        let info = self.find_member(object, name)?;
         Some(self.subobject_type(info.typ, self.qualifiers(object) | info.quals))
     }
 
@@ -2932,8 +3089,27 @@ impl TypeTable {
                 .iter()
                 .zip(b.iter())
                 .all(|(&x, &y)| self.parameters_compatible(x, y, enums)),
-            _ => true,
+            (Some(_), None) => self.prototype_matches_unprototyped(id1, enums),
+            (None, Some(_)) => self.prototype_matches_unprototyped(id2, enums),
+            (None, None) => true,
         }
+    }
+
+    /// Is the function type `proto`, which has a prototype, compatible with
+    /// one of the same return type that has none (C17 6.2.7p3)?
+    ///
+    /// Only when a call through either would pass the same arguments: no
+    /// ellipsis, and every parameter of a type the default argument
+    /// promotions leave alone. `int (void)` and `int (double)` match `int ()`,
+    /// while `int (char)` and `int (float)` -- whose arguments a call without
+    /// a prototype passes as `int` and `double` -- do not.
+    fn prototype_matches_unprototyped(&self, proto: TypeId, enums: EnumMatch) -> bool {
+        let typ = self.get(proto);
+        !typ.variadic
+            && typ.params.iter().flatten().all(|&p| {
+                let promoted = self.default_argument_promote(p);
+                self.compatible(p, promoted, TopLevelQualifiers::Ignored, enums)
+            })
     }
 
     /// An enumerated type meeting a type that is not one, with the enum
@@ -3021,6 +3197,84 @@ impl TypeTable {
             TopLevelQualifiers::Significant,
             EnumMatch::Integer,
         )
+    }
+
+    /// The composite type of two compatible types (C17 6.2.7p3), carrying
+    /// `a`'s qualifiers at every level where the two may differ only in
+    /// derivation.
+    ///
+    /// An array of known size beats one of unknown size, a function with a
+    /// prototype beats one without, and the referenced type, element type,
+    /// return type and parameter types are composed in turn. Any other pair
+    /// of compatible types has nothing to choose between, and is `a`.
+    pub fn composite_type(&mut self, a: TypeId, b: TypeId) -> TypeId {
+        if a == b || self.kind(a) != self.kind(b) {
+            return a;
+        }
+        let mut composite = self.get(a).clone();
+        let other = self.get(b).clone();
+        match composite.kind {
+            TypeKind::Pointer | TypeKind::Array | TypeKind::Function => {}
+            _ => return a,
+        }
+        if let (Some(x), Some(y)) = (composite.base, other.base) {
+            composite.base = Some(self.composite_type(x, y));
+        }
+        match composite.kind {
+            // "Unknown" is spelled both as no size and as zero; see
+            // `redeclaration_compatible`.
+            TypeKind::Array if matches!(composite.array_size, None | Some(0)) => {
+                composite.array_size = other.array_size.or(composite.array_size);
+            }
+            TypeKind::Function => match (&composite.params, &other.params) {
+                (None, Some(_)) => {
+                    composite.params = other.params.clone();
+                    composite.variadic = other.variadic;
+                }
+                (Some(x), Some(y)) if x.len() == y.len() => {
+                    let (x, y) = (x.clone(), y.clone());
+                    composite.params = Some(
+                        x.iter()
+                            .zip(&y)
+                            .map(|(&p, &q)| self.composite_type(p, q))
+                            .collect(),
+                    );
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        self.intern(composite)
+    }
+
+    /// The qualifiers of `id`, where those of an array type are its element
+    /// type's (C17 6.7.3p10): `const int[3]` is as `const` as `const int`.
+    pub fn qualifiers_through_arrays(&self, id: TypeId) -> TypeModifiers {
+        match self.kind(id) {
+            TypeKind::Array => self
+                .base_type(id)
+                .map_or_else(TypeModifiers::empty, |e| self.qualifiers_through_arrays(e)),
+            _ => self.qualifiers(id),
+        }
+    }
+
+    /// The unqualified version of `id`, where an array's qualifiers are its
+    /// element type's: the inverse of [`Self::qualified_with`], which puts a
+    /// qualifier of an array on its elements.
+    pub fn unqualified_through_arrays(&mut self, id: TypeId) -> TypeId {
+        if self.kind(id) != TypeKind::Array {
+            return self.unqualified(id);
+        }
+        let Some(elem) = self.base_type(id) else {
+            return id;
+        };
+        let bare = self.unqualified_through_arrays(elem);
+        if bare == elem {
+            return id;
+        }
+        let mut array = self.get(id).clone();
+        array.base = Some(bare);
+        self.intern(array)
     }
 
     /// Compute struct layout with natural alignment
@@ -3350,6 +3604,7 @@ mod tests {
             is_complete: true,
             transparent: false,
             anon_id: None,
+            tag_type: None,
         };
 
         // The plain scalars.
@@ -3483,47 +3738,40 @@ mod tests {
             is_complete: true,
             transparent: false,
             anon_id: None,
+            tag_type: None,
         };
         let plain = types.intern(Type::struct_type(composite));
 
         // An unqualified object: the declared types, unchanged.
-        assert_eq!(types.member_access_type(plain, plain, a), Some(int));
-        assert_eq!(types.member_access_type(plain, plain, v), Some(vol_int));
-        assert_eq!(types.member_access_type(plain, plain, tag), None);
+        assert_eq!(types.member_access_type(plain, a), Some(int));
+        assert_eq!(types.member_access_type(plain, v), Some(vol_int));
+        assert_eq!(types.member_access_type(plain, tag), None);
 
         // A `volatile` object makes every member volatile, and a `const` one
         // makes every member `const`.
         let vol_obj = types.qualified_with(plain, TypeModifiers::VOLATILE);
-        let from_vol = types.member_access_type(vol_obj, vol_obj, a).unwrap();
+        let from_vol = types.member_access_type(vol_obj, a).unwrap();
         assert_eq!(types.qualifiers(from_vol), TypeModifiers::VOLATILE);
         assert!(types.contains_volatile(from_vol));
         let const_obj = types.qualified_with(plain, TypeModifiers::CONST);
-        let from_const = types.member_access_type(const_obj, const_obj, a).unwrap();
+        let from_const = types.member_access_type(const_obj, a).unwrap();
         assert_eq!(types.qualifiers(from_const), TypeModifiers::CONST);
 
         // `_Atomic` does not travel: a member of an `_Atomic` struct cannot be
         // read atomically, and gcc does not claim it can.
         let atomic_obj = types.qualified_with(plain, TypeModifiers::ATOMIC);
-        assert_eq!(
-            types.member_access_type(atomic_obj, atomic_obj, a),
-            Some(int)
-        );
+        assert_eq!(types.member_access_type(atomic_obj, a), Some(int));
 
-        // The two type ids are not interchangeable. The qualifiers come from
-        // the object as written; the members come from the type the parser
-        // resolved it to, which is the tag's and is never qualified. Reading
-        // the qualifiers from the resolved type is how `volatile struct S`
-        // loses its `volatile`.
+        // A `volatile struct S` written before the definition is a copy of
+        // the tag that the definition completes, and keeps its `volatile`:
+        // the members come from the copy itself, not from the tag found by
+        // name, and the qualifiers with them.
         let incomplete = types.intern(Type::struct_type(CompositeType::incomplete(Some(tag))));
         let vol_incomplete = types.qualified_with(incomplete, TypeModifiers::VOLATILE);
-        assert_eq!(
-            types.member_access_type(vol_incomplete, plain, a),
-            Some(vol_int)
-        );
-        assert_eq!(
-            types.member_access_type(vol_incomplete, vol_incomplete, a),
-            None
-        );
+        assert_eq!(types.member_access_type(vol_incomplete, a), None);
+        let definition = types.get(plain).composite.as_deref().unwrap().clone();
+        types.complete_struct(incomplete, definition);
+        assert_eq!(types.member_access_type(vol_incomplete, a), Some(vol_int));
     }
 
     use super::*;
@@ -3739,6 +3987,7 @@ mod tests {
             is_complete: true,
             transparent: false,
             anon_id: None,
+            tag_type: None,
         };
 
         // An ordinary union answers None even though it has members.
@@ -3766,6 +4015,68 @@ mod tests {
         ])));
         types.set_transparent_union(zw);
         assert_eq!(types.transparent_union_first_member(zw), Some(char_ptr));
+    }
+
+    /// A cast to union selects a member by type compatibility alone: the
+    /// first named, non-bit-field member whose type matches, a qualified
+    /// member included, and nothing a conversion would reach.
+    #[test]
+    fn test_union_member_for_cast() {
+        let mut types = TypeTable::new(&Target::host());
+        let mut idents = crate::strings::StringTable::new();
+        let (bf, ci, l, d, d2) = (
+            idents.intern("bf"),
+            idents.intern("ci"),
+            idents.intern("l"),
+            idents.intern("d"),
+            idents.intern("d2"),
+        );
+        let const_int = types.qualified_with(types.int_id, TypeModifiers::CONST);
+        let member = |name, typ, bit_width| StructMember {
+            name,
+            typ,
+            offset: 0,
+            bit_offset: None,
+            bit_width,
+            access_bytes: None,
+            align: MemberAlign::NATURAL,
+        };
+        let composite = |members| CompositeType {
+            tag: None,
+            members,
+            enum_constants: Vec::new(),
+            size: 8,
+            align: 8,
+            member_align: 8,
+            is_complete: true,
+            transparent: false,
+            anon_id: None,
+            tag_type: None,
+        };
+        let members = vec![
+            member(bf, types.int_id, Some(3)),
+            member(StringId::EMPTY, types.char_id, None),
+            member(ci, const_int, None),
+            member(l, types.long_id, None),
+            member(d, types.double_id, None),
+            member(d2, types.double_id, None),
+        ];
+        let u = types.intern(Type::union_type(composite(members.clone())));
+
+        // The bit-field is skipped; the const member matches a plain `int`.
+        assert_eq!(types.union_member_for_cast(u, types.int_id), Some(ci));
+        assert_eq!(types.union_member_for_cast(u, types.long_id), Some(l));
+        // The first of two matching members.
+        assert_eq!(types.union_member_for_cast(u, types.double_id), Some(d));
+        // No conversion: neither `float` nor `short` matches, and the
+        // unnamed `char` member cannot be designated.
+        assert_eq!(types.union_member_for_cast(u, types.float_id), None);
+        assert_eq!(types.union_member_for_cast(u, types.short_id), None);
+        assert_eq!(types.union_member_for_cast(u, types.char_id), None);
+
+        // A struct is not cast to by member.
+        let st = types.intern(Type::struct_type(composite(members)));
+        assert_eq!(types.union_member_for_cast(st, types.long_id), None);
     }
 
     #[test]
@@ -3809,11 +4120,70 @@ mod tests {
         assert_eq!(types.kind(params[1]), TypeKind::Char);
     }
 
+    /// An array and a function decay to a pointer; the immutable lookup gives
+    /// the interned pointer when there is one and `void *` otherwise, and
+    /// either is a full-width pointer.
+    #[test]
+    fn test_decayed_value_is_an_address() {
+        let mut types = TypeTable::new(&Target::host());
+        let arr = types.intern(Type::array(types.int_id, 10));
+        let func = types.intern(Type::function(types.long_id, vec![], false, false));
+        let ptr_bits = types.size_bits(types.void_ptr_id);
+        for t in [arr, func] {
+            assert!(types.decays(t));
+            let v = types.decayed_value(t);
+            assert_eq!(types.kind(v), TypeKind::Pointer);
+            assert_eq!(types.size_bits(v), ptr_bits);
+        }
+        let int_ptr = types.decayed(arr);
+        assert_eq!(types.decayed_value(arr), int_ptr);
+        let fn_ptr = types.decayed(func);
+        assert_eq!(types.decayed_value(func), fn_ptr);
+        assert!(!types.decays(types.long_id));
+        assert_eq!(types.decayed_value(types.long_id), types.long_id);
+        assert!(!types.decays(int_ptr));
+    }
+
+    /// gcc's `sizeof` of a function type is 1, as `void`'s is, and it is
+    /// what arithmetic on a pointer to one steps by; the type still has no
+    /// value width. `arithmetic_pointee` answers the function itself for a
+    /// function and a pointer to one, where `base_type` answers its return
+    /// type.
+    #[test]
+    fn test_function_type_steps_by_one_byte() {
+        let mut types = TypeTable::new(&Target::host());
+        let func = types.intern(Type::function(types.long_id, vec![], false, false));
+        let fn_ptr = types.decayed(func);
+        let arr = types.intern(Type::array(types.int_id, 10));
+        assert_eq!(types.size_bytes(func), 1);
+        assert_eq!(types.size_bits(func), 0);
+        assert_eq!(types.arithmetic_pointee(func), Some(func));
+        assert_eq!(types.arithmetic_pointee(fn_ptr), Some(func));
+        assert_eq!(types.base_type(func), Some(types.long_id));
+        assert_eq!(types.arithmetic_pointee(arr), Some(types.int_id));
+        assert_eq!(
+            types.arithmetic_pointee(types.void_ptr_id),
+            Some(types.void_id)
+        );
+        assert_eq!(types.arithmetic_pointee(types.long_id), None);
+    }
+
     #[test]
     fn test_unsigned_modifier() {
         let types = TypeTable::new(&Target::host());
         assert!(types.is_unsigned(types.uint_id));
         assert!(!types.is_unsigned(types.int_id));
+    }
+
+    #[test]
+    fn test_unsigned_of_size() {
+        let types = TypeTable::new(&Target::host());
+        assert_eq!(types.unsigned_of_size(1), Some(types.uchar_id));
+        assert_eq!(types.unsigned_of_size(2), Some(types.ushort_id));
+        assert_eq!(types.unsigned_of_size(4), Some(types.uint_id));
+        assert_eq!(types.unsigned_of_size(8), Some(types.ulong_id));
+        assert_eq!(types.unsigned_of_size(3), None);
+        assert_eq!(types.unsigned_of_size(16), None);
     }
 
     /// Plain `char`'s signedness is the target's (C17 6.2.5p15), and it is a
@@ -4331,6 +4701,7 @@ mod tests {
             is_complete: true,
             transparent: false,
             anon_id: None,
+            tag_type: None,
         };
         let mut typ = Type::enum_type(composite);
         if unsigned {
@@ -4707,5 +5078,99 @@ mod tests {
         let chars = types.intern(Type::array(types.char_id, usize::MAX - 1));
         let mut m = vec![member(types.int_id), member(chars)];
         assert_eq!(types.compute_union_layout(&mut m, None).0, usize::MAX);
+    }
+
+    /// C17 6.2.7p3: a prototype is compatible with no prototype exactly when
+    /// it has no ellipsis and no parameter the default argument promotions
+    /// change.
+    #[test]
+    fn prototype_against_no_prototype() {
+        let mut t = TypeTable::new(&Target::host());
+        let none = t.intern(Type::function_no_prototype(t.int_id, false));
+        let proto = |t: &mut TypeTable, params: Vec<TypeId>, variadic: bool| {
+            let int = t.int_id;
+            t.intern(Type::function(int, params, variadic, false))
+        };
+        let (int, double, char, float) = (t.int_id, t.double_id, t.char_id, t.float_id);
+        let void_args = proto(&mut t, vec![], false);
+        let int_double = proto(&mut t, vec![int, double], false);
+        let char_arg = proto(&mut t, vec![char], false);
+        let float_arg = proto(&mut t, vec![float], false);
+        let variadic = proto(&mut t, vec![int], true);
+        for f in [void_args, int_double] {
+            assert!(t.types_compatible(none, f));
+            assert!(t.types_compatible(f, none));
+        }
+        for f in [char_arg, float_arg, variadic] {
+            assert!(!t.types_compatible(none, f));
+            assert!(!t.types_compatible(f, none));
+        }
+        let long_none = t.intern(Type::function_no_prototype(t.long_id, false));
+        assert!(!t.types_compatible(long_none, void_args));
+    }
+
+    /// A call's function type is the callee's own, or the one a pointer
+    /// callee points to; anything else names none.
+    #[test]
+    fn callee_function_type_looks_through_one_pointer() {
+        let mut t = TypeTable::new(&Target::host());
+        let f = t.intern(Type::function(t.int_id, vec![], false, false));
+        let pf = t.intern(Type::pointer(f));
+        let ppf = t.intern(Type::pointer(pf));
+        assert_eq!(t.callee_function_type(f), Some(f));
+        assert_eq!(t.callee_function_type(pf), Some(f));
+        assert_eq!(t.callee_function_type(ppf), None);
+        assert_eq!(t.callee_function_type(t.int_id), None);
+        assert_eq!(t.callee_function_type(t.void_ptr_id), None);
+    }
+
+    /// The composite type takes the known array extent and the prototype,
+    /// at any depth, and keeps the first type's qualifiers.
+    #[test]
+    fn composite_type_of_compatible_types() {
+        let mut t = TypeTable::new(&Target::host());
+        let unknown = t.intern(Type {
+            array_size: None,
+            ..Type::array(t.int_id, 0)
+        });
+        let three = t.intern(Type::array(t.int_id, 3));
+        assert_eq!(t.composite_type(unknown, three), three);
+        assert_eq!(t.composite_type(three, unknown), three);
+
+        let p_unknown = t.intern(Type::pointer(unknown));
+        let p_three = t.intern(Type::pointer(three));
+        assert_eq!(t.composite_type(p_unknown, p_three), p_three);
+
+        let none = t.intern(Type::function_no_prototype(t.int_id, false));
+        let void_args = t.intern(Type::function(t.int_id, vec![], false, false));
+        assert_eq!(t.composite_type(none, void_args), void_args);
+        assert_eq!(t.composite_type(void_args, none), void_args);
+
+        // A parameter of pointer-to-array type composes too.
+        let takes_unknown = t.intern(Type::function(t.int_id, vec![p_unknown], false, false));
+        let takes_three = t.intern(Type::function(t.int_id, vec![p_three], false, false));
+        assert_eq!(t.composite_type(takes_unknown, takes_three), takes_three);
+
+        let const_unknown = t.qualified_with(p_unknown, TypeModifiers::CONST);
+        let composite = t.composite_type(const_unknown, p_three);
+        assert_eq!(t.qualifiers(composite), TypeModifiers::CONST);
+        assert_eq!(t.base_type(composite), Some(three));
+    }
+
+    /// An array's qualifiers are its element type's, in both directions.
+    #[test]
+    fn qualifiers_through_arrays() {
+        let mut t = TypeTable::new(&Target::host());
+        let const_int = t.qualified_with(t.int_id, TypeModifiers::CONST);
+        let arr = t.intern(Type::array(const_int, 3));
+        let grid = t.intern(Type::array(arr, 2));
+        assert_eq!(t.qualifiers(grid), TypeModifiers::empty());
+        assert_eq!(t.qualifiers_through_arrays(grid), TypeModifiers::CONST);
+
+        let bare = t.unqualified_through_arrays(grid);
+        assert_eq!(t.qualifiers_through_arrays(bare), TypeModifiers::empty());
+        let plain = t.intern(Type::array(t.int_id, 3));
+        assert_eq!(t.base_type(bare), Some(plain));
+        assert_eq!(t.qualified_with(bare, TypeModifiers::CONST), grid);
     }
 }

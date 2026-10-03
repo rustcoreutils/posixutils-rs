@@ -14,7 +14,7 @@
 
 use clap::Parser;
 use gettextrs::gettext;
-use posixutils_cc::parse::ast::{ExprKind, ExternalDecl, Stmt};
+use posixutils_cc::parse::ast::{ExprKind, ExternalDecl, Label, Stmt};
 use posixutils_cc::parse::Parser as CParser;
 use posixutils_cc::ppargs;
 use posixutils_cc::strings::StringTable;
@@ -397,20 +397,18 @@ fn extract_calls_from_stmt(
         Stmt::GotoIndirect { target, .. } => {
             extract_calls_from_expr(target, strings, symbols, calls);
         }
-        Stmt::Case(expr, high, body) => {
-            extract_calls_from_expr(expr, strings, symbols, calls);
-            // A range label has a second endpoint, and a call can appear in
-            // either -- `case f() ... g():` is invalid C, but a constant
-            // expression naming an enumerator is not.
-            if let Some(high) = high {
-                extract_calls_from_expr(high, strings, symbols, calls);
+        Stmt::Labeled { labels, stmt } => {
+            for label in labels {
+                if let Label::Case(expr, high) = label {
+                    extract_calls_from_expr(expr, strings, symbols, calls);
+                    // A range label has a second endpoint, and a call can
+                    // appear in either -- `case f() ... g():` is invalid C,
+                    // but a constant expression naming an enumerator is not.
+                    if let Some(high) = high {
+                        extract_calls_from_expr(high, strings, symbols, calls);
+                    }
+                }
             }
-            extract_calls_from_stmt(body, strings, symbols, calls);
-        }
-        Stmt::Default(_, body) => {
-            extract_calls_from_stmt(body, strings, symbols, calls);
-        }
-        Stmt::Label { stmt, .. } => {
             extract_calls_from_stmt(stmt, strings, symbols, calls);
         }
         _ => {}
@@ -574,15 +572,17 @@ fn visit_stmt_exprs(stmt: &Stmt, f: &mut dyn FnMut(&posixutils_cc::parse::ast::E
             f(expr);
             visit_stmt_exprs(body, f);
         }
-        Stmt::Case(e, high, body) => {
-            f(e);
-            if let Some(high) = high {
-                f(high);
+        Stmt::Labeled { labels, stmt } => {
+            for label in labels {
+                if let Label::Case(e, high) = label {
+                    f(e);
+                    if let Some(high) = high {
+                        f(high);
+                    }
+                }
             }
-            visit_stmt_exprs(body, f);
+            visit_stmt_exprs(stmt, f);
         }
-        Stmt::Default(_, body) => visit_stmt_exprs(body, f),
-        Stmt::Label { stmt, .. } => visit_stmt_exprs(stmt, f),
         _ => {}
     }
 }

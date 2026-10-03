@@ -13,9 +13,9 @@
 
 use crate::float::IntegralRounding;
 use crate::parse::ast::{
-    AssignOp, BinaryOp, BlockItem, CalleeBinding, Declaration, Expr, ExprKind, ExternalDecl,
-    ForInit, FpTest, FunctionDef, InlineLibraryFn, LibFn, MathErrno, MemoryFn, Stmt,
-    TranslationUnit, UnaryOp,
+    AssignOp, BinaryOp, BlockItem, CalleeBinding, Declaration, Designator, Expr, ExprKind,
+    ExternalDecl, ForInit, FpTest, FunctionDef, InlineLibraryFn, Label, LibFn, MathErrno, MemoryFn,
+    Stmt, TranslationUnit, UnaryOp,
 };
 use crate::parse::parser::{ParseResult, Parser};
 use crate::strings::{StringId, StringTable};
@@ -1786,16 +1786,68 @@ fn test_goto_stmt() {
     }
 }
 
+/// Basic asm is emitted verbatim, so every `%` in it is escaped for the
+/// substitution extended asm shares; extended asm, even with no operands,
+/// keeps its template as written.
+#[test]
+fn test_asm_basic_template_escapes_percent() {
+    let template = |src| match parse_stmt(src).unwrap().0 {
+        Stmt::Asm { template, .. } => template,
+        other => panic!("expected asm: {other:?}"),
+    };
+    assert_eq!(
+        template("__asm__(\"mov %eax, %%ebx\");"),
+        "mov %%eax, %%%%ebx"
+    );
+    assert_eq!(
+        template("__asm__(\"mov %eax, %%ebx\" ::);"),
+        "mov %eax, %%ebx"
+    );
+    assert_eq!(
+        template("__asm__(\"mov %0, %%ebx\" :: \"r\"(1));"),
+        "mov %0, %%ebx"
+    );
+}
+
 #[test]
 fn test_labeled_stmt() {
     let (stmt, strings) = parse_stmt("label: x = 1;").unwrap();
     match stmt {
-        Stmt::Label { name, stmt, .. } => {
-            check_name(&strings, name, "label");
+        Stmt::Labeled { labels, stmt } => {
+            let [Label::Named { name, .. }] = labels.as_slice() else {
+                panic!("expected one goto label: {labels:?}");
+            };
+            check_name(&strings, *name, "label");
             assert!(matches!(*stmt, Stmt::Expr(_)));
         }
         _ => panic!("Expected Label"),
     }
+}
+
+/// A run of labels is one labeled statement holding every label in source
+/// order, not a chain of statements each labelling the next.
+#[test]
+fn test_consecutive_labels_are_one_list() {
+    let (stmt, strings) =
+        parse_stmt_with_vars("case 1: a: default: case 2 ... 3: b: x = 1;", &["x"]).unwrap();
+    let Stmt::Labeled { labels, stmt } = stmt else {
+        panic!("expected a labeled statement: {stmt:?}");
+    };
+    let [Label::Case(_, None), Label::Named { name: a, .. }, Label::Default(_), Label::Case(_, Some(_)), Label::Named { name: b, .. }] =
+        labels.as_slice()
+    else {
+        panic!("labels out of order: {labels:?}");
+    };
+    check_name(&strings, *a, "a");
+    check_name(&strings, *b, "b");
+    assert!(matches!(*stmt, Stmt::Expr(_)), "{stmt:?}");
+}
+
+/// A statement keyword is not a goto label: `else:` is an error, not a label
+/// named `else`.
+#[test]
+fn test_statement_keyword_is_not_a_label() {
+    assert!(parse_stmt("else: x = 1;").is_err());
 }
 
 #[test]
@@ -2067,7 +2119,9 @@ fn test_plain_declaration_is_not_a_function_declarator() {
 
 // Translation unit tests
 
-fn parse_tu(input: &str) -> ParseResult<(TranslationUnit, TypeTable, StringTable, SymbolTable)> {
+pub(super) fn parse_tu(
+    input: &str,
+) -> ParseResult<(TranslationUnit, TypeTable, StringTable, SymbolTable)> {
     parse_tu_for(input, &Target::host())
 }
 
@@ -3832,7 +3886,7 @@ fn test_forward_declared_struct_member_access() {
 #[test]
 fn test_forward_declared_struct_via_pointer_param() {
     // More complex case: struct declared after function, used via pointer
-    // This tests that resolve_struct_type works for arrow operator
+    // The definition completes the type the parameter already named
     let (tu, _types, _strings, _symbols) = parse_tu(
         "struct Node; \
          int get_val(struct Node *n); \
@@ -3884,6 +3938,32 @@ fn test_typedef_function_pointer_call() {
     )
     .unwrap();
     assert_eq!(tu.items.len(), 3);
+}
+
+/// A call's value has its callee's return type, unqualified, however the
+/// callee is reached: a function, a pointer to one -- a variable, a typedef,
+/// a member, a call returning one -- or the explicit `(*p)` form.
+#[test]
+fn test_call_type_is_the_callee_return_type() {
+    let decls = "const short f(int); \
+                 const short (*p)(int); \
+                 typedef const short (*F)(int); F q; \
+                 struct S { F m; } s; \
+                 F get(void);";
+    for call in ["f(1)", "p(1)", "(*p)(1)", "q(1)", "s.m(1)", "get()(1)"] {
+        let src = format!("{decls} void g(void) {{ {call}; }}");
+        let (tu, types, _, _) = parse_tu(&src).unwrap();
+        let Stmt::Expr(e) = first_statement_of(&tu, 0) else {
+            panic!("{call}: expected an expression statement");
+        };
+        assert!(matches!(e.kind, ExprKind::Call { .. }), "{call}");
+        let typ = e.typ.expect("typed");
+        assert_eq!(types.kind(typ), TypeKind::Short, "{call}");
+        assert!(
+            !types.modifiers(typ).contains(TypeModifiers::CONST),
+            "{call}: the value is unqualified"
+        );
+    }
 }
 
 // Designated Initializer Edge Cases
@@ -4300,6 +4380,29 @@ fn test_compound_literal_in_expression() {
         ExprKind::Member { .. } => {}
         _ => panic!("Expected member access on compound literal"),
     }
+}
+
+/// A GNU cast to union is the compound literal `(U){ .member = operand }`
+/// for the member whose type the operand has, inside a cast to `U` that
+/// keeps the result an rvalue. Converting the operand to the union's width
+/// stored a `double` operand as integer bits.
+#[test]
+fn test_cast_to_union_initializes_the_matching_member() {
+    let (expr, types, strings, _symbols) = parse_expr("(union { long l; double d; })1.5").unwrap();
+    let ExprKind::Cast { cast_type, expr } = &expr.kind else {
+        panic!("expected a cast, got {:?}", expr.kind);
+    };
+    assert_eq!(types.kind(*cast_type), TypeKind::Union);
+    let ExprKind::CompoundLiteral { typ, elements } = &expr.kind else {
+        panic!("expected a compound literal, got {:?}", expr.kind);
+    };
+    assert_eq!(typ, cast_type);
+    assert_eq!(elements.len(), 1);
+    match elements[0].designators.as_slice() {
+        [Designator::Field(name)] => assert_eq!(strings.get(*name), "d"),
+        other => panic!("expected .d, got {other:?}"),
+    }
+    assert_eq!(elements[0].value.typ, Some(types.double_id));
 }
 
 // __builtin_offsetof tests
@@ -6352,6 +6455,63 @@ fn test_library_builtin_result_is_not_an_lvalue() {
     }
 }
 
+/// A null pointer constant is an integer constant expression with the value
+/// 0, or one cast to `void *` (C17 6.3.2.3p3) -- no other cast, and no
+/// integer constant that a pointer was converted to reach (6.6p6).
+#[test]
+fn test_null_pointer_constants() {
+    let decls = "int *p; enum { Z };";
+    for (stmt, null) in [
+        ("0", true),
+        ("0L", true),
+        ("'\\0'", true),
+        ("1 - 1", true),
+        ("Z", true),
+        ("(long)0", true),
+        ("(int)0.0", true),
+        ("(void *)0", true),
+        ("(void *)(1 - 1)", true),
+        ("sizeof p - sizeof p", true),
+        ("1", false),
+        ("(void *)1", false),
+        ("(char *)0", false),
+        ("(int *)0", false),
+        ("(const void *)0", false),
+        ("(int)(char *)0", false),
+        ("(int)(long)(char *)0", false),
+        ("(void *)(long)(char *)0", false),
+        ("p", false),
+    ] {
+        let got = with_statement_expr(decls, stmt, |p, e| p.is_null_pointer_constant(e));
+        assert_eq!(got, null, "{stmt}");
+    }
+}
+
+/// `return` is checked by the parser against the enclosing function's
+/// declared return type, with the simple-assignment constraints.
+#[test]
+fn test_return_is_checked_against_the_declared_type() {
+    for src in [
+        "int f(void) { return; }",
+        "void f(void) { return 1; }",
+        "void h(void); int f(void) { return h(); }",
+        "struct A { int x; }; struct B { int x; }; struct A f(struct B b) { return b; }",
+    ] {
+        let before = crate::diag::error_count();
+        let _ = parse_tu(src);
+        assert!(crate::diag::error_count() > before, "{src}: accepted");
+    }
+    for src in [
+        "int *f(void) { return 5; }",
+        "int *f(void) { return (char *)0; }",
+        "int *f(void) { return (int)(char *)0; }",
+    ] {
+        let before = crate::diag::warning_count();
+        let _ = parse_tu(src);
+        assert!(crate::diag::warning_count() > before, "{src}: not warned");
+    }
+}
+
 /// An argument the prototype rejects, or the wrong number of them, is
 /// reported by the ordinary call checks, and the call is not lowered: a zero
 /// of the return type stands in for it, so nothing converts a structure to
@@ -7231,11 +7391,10 @@ fn test_size_specifier_order_preserves_signedness() {
 /// A `switch` body that is not a compound statement must still contain the
 /// statement its `case` label prefixes.
 ///
-/// `Stmt::Case` is a marker carrying the value and not the labeled statement,
-/// which is sound only inside a block where the two stay adjacent items. Given
-/// `switch (x) case 1: return 2;` the marker took the entire body and the
-/// `return` became a *sibling* of the switch -- reached whatever the value of
-/// `x`. The parser now rebuilds the block that flattening assumes.
+/// When a `case` label was a marker carrying the value and not the labeled
+/// statement, `switch (x) case 1: return 2;` gave the marker the entire body
+/// and made the `return` a *sibling* of the switch -- reached whatever the
+/// value of `x`.
 #[test]
 fn test_switch_with_non_compound_body_keeps_its_labelled_statement() {
     let (func, _types, _strings, _symbols) =
@@ -7261,9 +7420,17 @@ fn test_switch_with_non_compound_body_keeps_its_labelled_statement() {
         panic!("first item is not a switch: {first:#?}");
     };
     // One statement, as C17 6.8.4 says: the label, carrying its own.
-    let Stmt::Case(_, _, labelled) = &**body else {
+    let Stmt::Labeled {
+        labels,
+        stmt: labelled,
+    } = &**body
+    else {
         panic!("switch body is not the case label: {body:#?}");
     };
+    assert!(
+        matches!(labels.as_slice(), [Label::Case(..)]),
+        "{labels:#?}"
+    );
     assert!(matches!(**labelled, Stmt::Return(Some(_))), "{labelled:#?}");
 }
 
@@ -8393,7 +8560,7 @@ fn test_zero_length_compare_is_zero_with_its_arguments_evaluated() {
 
 /// A statement expression whose last statement is a labeled expression
 /// statement takes that expression's value, as gcc does (compile/pr17913).
-/// The labels stay where they were, each labelling an empty statement.
+/// The labels stay where they were, labelling an empty statement.
 #[test]
 fn test_stmt_expr_labeled_last_statement_has_its_value() {
     let (expr, types, _, _) = parse_expr("({ a: b: 5; })").unwrap();
@@ -8402,13 +8569,17 @@ fn test_stmt_expr_labeled_last_statement_has_its_value() {
     };
     assert_eq!(types.kind(expr.typ.unwrap()), TypeKind::Int);
     assert!(matches!(result.kind, ExprKind::IntLit(5)));
-    assert_eq!(stmts.len(), 2);
-    for item in stmts {
-        let BlockItem::Statement(stmt) = item else {
-            panic!("expected a statement");
-        };
-        assert!(matches!(&**stmt, Stmt::Label { stmt, .. } if matches!(**stmt, Stmt::Empty)));
-    }
+    let [BlockItem::Statement(stmt)] = stmts.as_slice() else {
+        panic!("expected one labeled statement: {stmts:#?}");
+    };
+    let Stmt::Labeled { labels, stmt } = &**stmt else {
+        panic!("expected a labeled statement: {stmt:#?}");
+    };
+    assert!(matches!(
+        labels.as_slice(),
+        [Label::Named { .. }, Label::Named { .. }]
+    ));
+    assert!(matches!(**stmt, Stmt::Empty));
 }
 
 /// A `case` or `default` label in front of the last statement is a label like
@@ -8428,7 +8599,9 @@ fn test_stmt_expr_case_labeled_last_statement_has_its_value() {
             panic!("{src}: expected one label");
         };
         assert!(
-            matches!(&**label, Stmt::Case(_, _, s) | Stmt::Default(_, s) if matches!(**s, Stmt::Empty)),
+            matches!(&**label, Stmt::Labeled { labels, stmt }
+                if matches!(labels.as_slice(), [Label::Case(..) | Label::Default(_)])
+                    && matches!(**stmt, Stmt::Empty)),
             "{src}"
         );
     }
@@ -9007,9 +9180,14 @@ fn test_fallthrough_attribute_is_a_null_statement() {
     let BlockItem::Statement(case2) = &items[2] else {
         panic!("case 2 is not a statement");
     };
-    let Stmt::Case(_, _, labeled) = case2.as_ref() else {
+    let Stmt::Labeled {
+        labels,
+        stmt: labeled,
+    } = case2.as_ref()
+    else {
         panic!("not a case: {case2:?}");
     };
+    assert!(matches!(labels.as_slice(), [Label::Case(..)]), "{labels:?}");
     assert!(matches!(**labeled, Stmt::Empty), "{labeled:?}");
 }
 
@@ -9085,6 +9263,43 @@ fn test_at_attribute_declaration_lookahead() {
         let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
         parser.skip_stream_tokens();
         assert_eq!(parser.at_attribute_declaration(), expected, "{src}");
+    }
+}
+
+/// A function designator decays before the additive operators type it, as an
+/// array does: `f - g` is a `ptrdiff_t` and `f + 1` a pointer to `f`'s type,
+/// the same as the operators give a function pointer.
+#[test]
+fn test_additive_operators_decay_a_function_designator() {
+    let decls = "int f(int); int g(int); int (*fp)(int);";
+    for stmt in ["f - g", "fp - f", "f - fp", "fp - fp"] {
+        with_statement_expr(decls, stmt, |p, e| {
+            assert_eq!(e.typ, Some(p.types.long_id), "{stmt}: result type");
+        });
+    }
+    for stmt in ["f + 1", "1 + f", "f - 1", "fp + 1"] {
+        with_statement_expr(decls, stmt, |p, e| {
+            let t = e.typ.expect("typed");
+            assert_eq!(p.types.kind(t), TypeKind::Pointer, "{stmt}");
+            let pointee = p.types.base_type(t).unwrap();
+            assert_eq!(p.types.kind(pointee), TypeKind::Function, "{stmt}");
+        });
+    }
+}
+
+/// Indexing wants a pointer to a complete object type (C17 6.5.2.1p1), so a
+/// pointer to a function is refused on either side of the brackets, though
+/// gcc's arithmetic on one is accepted.
+#[test]
+fn test_subscripting_a_function_pointer_is_rejected() {
+    let decls = "int f(int); int (*fp)(int);";
+    for stmt in ["fp[0]", "0[fp]", "(&f)[1]"] {
+        let before = crate::diag::error_count();
+        with_statement_expr(decls, stmt, |_, _| {
+            // The count is process-wide and only grows, so a concurrent test
+            // can add to it but never hide this one's error.
+            assert!(crate::diag::error_count() > before, "{stmt}: accepted");
+        });
     }
 }
 
@@ -9579,4 +9794,70 @@ fn test_array_suffix_derivation_order() {
     let elem = types.base_type(typ).unwrap();
     assert_eq!(types.get(elem).array_size, Some(3));
     assert_eq!(types.kind(types.base_type(elem).unwrap()), TypeKind::Int);
+}
+
+/// The type of a conditional expression whose arms are pointers, or a pointer
+/// and something else (C17 6.5.15p6), spelled as gcc's `_Generic` reports it.
+///
+/// A null pointer constant takes the other arm's type, even when it is
+/// `(void *)0` -- which is a pointer, but is not what the arm contributes.
+/// Compatible pointees merge to their composite type, so an array of unknown
+/// size meets `[3]` as `[3]` and a function without a prototype meets
+/// `(void)` as `(void)`. Pointers to incompatible types give `void *`, which
+/// is gcc's answer, and a pointer beside a nonzero integer stays a pointer.
+#[test]
+fn test_conditional_pointer_result_types() {
+    let decls = "int c; int *p; char *cp; const int *cip; volatile int *vip; \
+                 void *vp; const void *cvp; int (*fp)(void); int (*fnp)(); \
+                 const int (*cap)[]; int (*a3)[3]; unsigned *up;";
+    for (expr, want) in [
+        ("c ? p : (void *)0", "int *"),
+        ("c ? (void *)0 : p", "int *"),
+        ("c ? cip : (void *)0", "const int *"),
+        ("c ? fp : (void *)0", "int (*)(void)"),
+        ("c ? p : 0", "int *"),
+        ("c ? p : 0L", "int *"),
+        ("c ? p : (const void *)0", "const void *"),
+        ("c ? p : (char *)0", "void *"),
+        ("c ? p : cp", "void *"),
+        ("c ? cip : cp", "void *"),
+        ("c ? p : up", "void *"),
+        ("c ? p : 1", "int *"),
+        ("c ? 5 : vip", "volatile int *"),
+        ("c ? p : vp", "void *"),
+        ("c ? cip : vp", "const void *"),
+        ("c ? cvp : vip", "const volatile void *"),
+        ("c ? cip : vip", "const volatile int *"),
+        ("c ? cap : a3", "const int (*)[3]"),
+        ("c ? a3 : cap", "const int (*)[3]"),
+        ("c ? fnp : fp", "int (*)(void)"),
+        ("c ? fp : fnp", "int (*)(void)"),
+        ("c ? fp : vp", "void *"),
+    ] {
+        let src = format!("{decls} __typeof__({expr}) r;");
+        let (tu, types, _, _) = parse_tu(&src).unwrap();
+        let Some(ExternalDecl::Declaration(decl)) = tu.items.last() else {
+            panic!("{expr}: expected a declaration");
+        };
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.format_type(typ, None), want, "{expr}");
+    }
+}
+
+/// C17 6.5.15p3 admits only these pairs of arms; any other is an error, which
+/// leaves the conditional untyped so no enclosing operator reports it again.
+/// The accepted pairs are proved in `cc/tests/diagnostics`, where a stray
+/// error from a concurrent test cannot reach the count.
+#[test]
+fn test_conditional_mismatched_arms_are_errors() {
+    for src in [
+        "struct S { int a; } s; struct T { int a; } t; int c; void f(void) { c ? s : t; }",
+        "struct S { int a; } s; int c; void f(void) { c ? s : 1; }",
+        "int *p; int c; void f(void) { c ? 1.0 : p; }",
+        "int *p; int c; void f(void) { c ? p : 0.0; }",
+    ] {
+        let before = crate::diag::error_count();
+        parse_tu(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+        assert!(crate::diag::error_count() > before, "{src}: accepted");
+    }
 }

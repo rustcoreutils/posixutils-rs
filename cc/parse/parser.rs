@@ -148,7 +148,8 @@ pub(crate) struct ParsedDeclarator {
 
 // Parser
 
-/// The function whose body is being parsed, as the variadic builtins see it.
+/// The function whose body is being parsed, as `return` and the variadic
+/// builtins see it.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct EnclosingFunction {
     /// Declared with `...`: `__builtin_va_start` needs it to be.
@@ -162,6 +163,9 @@ pub(crate) struct EnclosingFunction {
     /// The function's calling convention, which decides which of
     /// `__builtin_va_start` and `__builtin_ms_va_start` it may use.
     pub(crate) conv: crate::abi::CallingConv,
+    /// The declared return type, which a `return` converts its value to.
+    /// `None` outside a function body.
+    pub(crate) return_type: Option<TypeId>,
 }
 
 /// C expression parser using recursive descent with precedence climbing
@@ -604,78 +608,36 @@ impl<'a> Parser<'a> {
         false
     }
 
-    /// Resolve an incomplete struct/union type to its complete definition.
+    /// Intern a type, answering a tagged struct, union or enum with the tag's
+    /// own `TypeId` -- or a qualified copy of it -- rather than a new one.
     ///
-    /// When a struct is forward-declared (e.g., `struct foo;`) and later
-    /// defined, the forward declaration creates an incomplete TypeId.
-    /// Pointers to the forward-declared type still reference this incomplete
-    /// TypeId even after the struct is fully defined with a new TypeId.
+    /// Which tag a type is comes from the type itself
+    /// ([`CompositeType::tag_type`]), not from looking its tag's name up
+    /// here: a typedef name or `typeof` names the tag that was visible where
+    /// *it* was declared, and an inner scope may since have given the name to
+    /// a different type. `typedef struct S TS;` used as `TS x;` in a block
+    /// that defines its own `struct S` declared `x` with the inner type.
     ///
-    /// This method looks up the complete definition in the symbol table
-    /// using the struct's tag name, returning the complete TypeId if found.
-    pub(crate) fn resolve_struct_type(&self, type_id: TypeId) -> TypeId {
-        let typ = self.types.get(type_id);
-
-        // Only try to resolve struct/union types
-        if typ.kind != TypeKind::Struct && typ.kind != TypeKind::Union {
-            return type_id;
-        }
-
-        // Check if this is an incomplete type with a tag
-        if let Some(ref composite) = typ.composite {
-            if composite.is_complete {
-                // Already complete, no resolution needed
-                return type_id;
-            }
-            if let Some(tag) = composite.tag {
-                // Look up the tag in the symbol table to find the complete type
-                if let Some(symbol) = self.symbols.lookup_tag(tag) {
-                    // Return the complete type from the symbol table
-                    return symbol.typ;
-                }
-            }
-        }
-
-        // Couldn't resolve, return original
-        type_id
-    }
-
-    /// Intern a type, but for struct/union types with tags, check the symbol table
-    /// first to reuse the existing TypeId. This ensures forward-declared types
-    /// are properly linked when the type is later completed.
+    /// Only the type qualifiers carry over. A storage class -- `typedef`
+    /// above all -- is the declaration's, not the type's: keeping it would
+    /// make `typedef struct Foo Foo;` a different `TypeId` from the tag.
     ///
-    /// Important: Storage class modifiers (static, extern, etc.) are preserved from
-    /// the input type even when reusing an existing struct TypeId.
+    /// [`CompositeType::tag_type`]: crate::types::CompositeType::tag_type
     pub(super) fn intern_type_with_tag(&mut self, typ: &Type) -> TypeId {
-        // For struct/union types with a tag, use the existing TypeId from symbol table
-        if matches!(typ.kind, TypeKind::Struct | TypeKind::Union) {
-            if let Some(ref composite) = typ.composite {
-                if let Some(tag) = composite.tag {
-                    if let Some(existing) = self.symbols.lookup_tag(tag) {
-                        // Check if we need to preserve type qualifiers (not storage class)
-                        // Storage class (TYPEDEF, EXTERN, STATIC, etc.) is a property of
-                        // the declaration, not the type. TYPEDEF especially must NOT create
-                        // a new TypeId, otherwise "typedef struct Foo Foo;" creates a different
-                        // TypeId than the tag, and when "struct Foo { ... };" completes the tag,
-                        // the typedef still points to the incomplete type.
-                        let type_qualifier_mask = TypeModifiers::CONST
-                            | TypeModifiers::VOLATILE
-                            | TypeModifiers::RESTRICT
-                            | TypeModifiers::ATOMIC;
-                        let new_qualifiers = typ.modifiers & type_qualifier_mask;
-                        if !new_qualifiers.is_empty() {
-                            // Create a new type with the existing struct's data but new qualifiers
-                            let mut existing_type = self.types.get(existing.typ).clone();
-                            existing_type.modifiers |= new_qualifiers;
-                            return self.types.intern(existing_type);
-                        }
-                        return existing.typ;
-                    }
-                }
-            }
+        let Some(tag_type) = typ.composite.as_ref().and_then(|c| c.tag_type) else {
+            return self.types.intern(typ.clone());
+        };
+        let type_qualifier_mask = TypeModifiers::CONST
+            | TypeModifiers::VOLATILE
+            | TypeModifiers::RESTRICT
+            | TypeModifiers::ATOMIC;
+        let qualifiers = typ.modifiers & type_qualifier_mask;
+        if qualifiers.is_empty() {
+            return tag_type;
         }
-        // For other types, just intern normally
-        self.types.intern(typ.clone())
+        let mut qualified = self.types.get(tag_type).clone();
+        qualified.modifiers |= qualifiers;
+        self.types.intern(qualified)
     }
 
     /// Skip StreamBegin tokens (but not StreamEnd - that marks EOF)
@@ -885,13 +847,23 @@ impl crate::constexpr::ConstEnv for Parser<'_> {
     /// An enumeration constant is the only identifier with a value in the
     /// parser: a `const` object's value lives in an emitted global, which does
     /// not exist yet here, and no parse-time context would accept one.
+    /// No object has a value in the parser, for the reason
+    /// [`Self::ident_value`] gives.
+    fn subobject_value(&self, _expr: &Expr, _scope: ConstScope) -> Option<i128> {
+        None
+    }
+
+    fn float_subobject_value(
+        &self,
+        _expr: &Expr,
+        _scope: ConstScope,
+    ) -> Option<crate::float::FloatVal> {
+        None
+    }
+
     fn ident_value(&self, sym: crate::symbol::SymbolId, _scope: ConstScope) -> Option<i128> {
         let symbol = self.symbols.get(sym);
         symbol.is_enum_constant().then_some(symbol.enum_value)?
-    }
-
-    fn struct_of(&self, typ: TypeId) -> TypeId {
-        self.resolve_struct_type(typ)
     }
 
     /// No floating identifier has a value in the parser, for the reason

@@ -36,8 +36,8 @@
 // Blocks left unreachable are deleted by the `dce` that follows.
 //
 
-use super::propagate::{self, cbr_taken, switch_taken, Site};
-use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind};
+use super::propagate::{self, cbr_taken, switch_taken};
+use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId, PseudoKind, Site};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 /// A lattice a solve descends: `TOP` is "not reached yet", `BOTTOM`
@@ -130,17 +130,11 @@ impl<V: Lattice> Sparse<V> {
                 _ => V::TOP,
             };
         }
-        for bb in &func.blocks {
-            for insn in &bb.insns {
-                let Some(asm) = &insn.extra().asm_data else {
-                    continue;
-                };
-                for out in &asm.outputs {
-                    self.unfoldable.insert(out.pseudo);
-                    if let Some(cell) = self.vals.get_mut(out.pseudo.0 as usize) {
-                        *cell = V::BOTTOM;
-                    }
-                }
+        // See `Function::asm_defined_pseudos`.
+        for out in func.asm_defined_pseudos() {
+            self.unfoldable.insert(out);
+            if let Some(cell) = self.vals.get_mut(out.0 as usize) {
+                *cell = V::BOTTOM;
             }
         }
     }

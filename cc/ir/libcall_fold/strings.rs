@@ -16,23 +16,23 @@
 // the program passed.
 //
 
-use super::{Byte, Facts, Folded, NewCall, Operand};
+use super::{Byte, CallSite, Folded, NewCall, Operand, ValueFold};
 use crate::ir::strdata::{Len, StrRef};
 use crate::ir::{Instruction, PseudoId};
 use crate::parse::ast::LibFn;
 
 /// What the call `insn` to `f`, one of the string functions, folds to.
-pub(super) fn fold(f: LibFn, insn: &Instruction, facts: &Facts) -> Option<Folded> {
+pub(super) fn fold(f: LibFn, insn: &Instruction, facts: &CallSite) -> Option<Folded> {
     match (f, insn.src.as_slice()) {
         (LibFn::Strlen, &[s]) => strlen(facts, s),
         (LibFn::Strnlen, &[s, n]) => strnlen(facts, s, n),
         (LibFn::Strcmp, &[a, b]) => compare(facts, a, b, Limit::Terminator),
         (LibFn::Strncmp, &[a, b, n]) => {
-            let n = facts.unsigned(n, 64)?;
+            let n = facts.size_t(n)?;
             compare(facts, a, b, Limit::Bytes(n, Stop::AtTerminator))
         }
         (LibFn::Memcmp, &[a, b, n]) => {
-            let n = facts.unsigned(n, 64)?;
+            let n = facts.size_t(n)?;
             compare(facts, a, b, Limit::Bytes(n, Stop::Never))
         }
         (LibFn::Strchr, &[s, c]) => find_char(facts, s, c, Direction::First),
@@ -45,42 +45,37 @@ pub(super) fn fold(f: LibFn, insn: &Instruction, facts: &Facts) -> Option<Folded
     }
 }
 
-/// The C string `p` points at, when it is known.
-fn c_str<'a>(facts: &Facts<'a>, p: PseudoId) -> Option<&'a [u8]> {
-    facts.strings.string_at(p)?.c_str()
-}
-
 /// An offset into a string, as the pointer arithmetic it becomes.
 fn offset(p: PseudoId, at: usize) -> Option<Folded> {
-    Some(Folded::Offset(p, i64::try_from(at).ok()?))
+    Some(Folded::Value(ValueFold::Offset(p, i64::try_from(at).ok()?)))
 }
 
-fn strlen(facts: &Facts, s: PseudoId) -> Option<Folded> {
+fn strlen(facts: &CallSite, s: PseudoId) -> Option<Folded> {
     Some(match facts.strings.string_len(s)? {
-        Len::Const(len) => Folded::Int(i128::from(len)),
-        Len::MinusOffset { len, var } => Folded::LenMinus {
+        Len::Const(len) => Folded::Value(ValueFold::Int(i128::from(len))),
+        Len::MinusOffset { len, var } => Folded::Value(ValueFold::LenMinus {
             len: i64::try_from(len).ok()?,
             var,
-        },
+        }),
     })
 }
 
 /// `strnlen(s, n)`: the smaller of the two, which needs no read of `s`
 /// past its terminator or past `n` bytes.
-fn strnlen(facts: &Facts, s: PseudoId, n: PseudoId) -> Option<Folded> {
-    let n_const = facts.unsigned(n, 64);
+fn strnlen(facts: &CallSite, s: PseudoId, n: PseudoId) -> Option<Folded> {
+    let n_const = facts.size_t(n);
     if n_const == Some(0) {
-        return Some(Folded::Int(0));
+        return Some(Folded::Value(ValueFold::Int(0)));
     }
     let Len::Const(len) = facts.strings.string_len(s)? else {
         return None;
     };
     Some(match n_const {
-        Some(n) => Folded::Int(i128::from(len).min(n as i128)),
-        None => Folded::AtMost {
+        Some(n) => Folded::Value(ValueFold::Int(i128::from(len).min(n as i128))),
+        None => Folded::Value(ValueFold::AtMost {
             n,
             len: i64::try_from(len).ok()?,
-        },
+        }),
     })
 }
 
@@ -113,14 +108,14 @@ impl Limit {
 }
 
 /// `strcmp`, `strncmp` or `memcmp` of `a` and `b`.
-fn compare(facts: &Facts, a: PseudoId, b: PseudoId, limit: Limit) -> Option<Folded> {
+fn compare(facts: &CallSite, a: PseudoId, b: PseudoId, limit: Limit) -> Option<Folded> {
     if !limit.allows(0) || facts.same_pointer(a, b) {
-        return Some(Folded::Int(0));
+        return Some(Folded::Value(ValueFold::Int(0)));
     }
     let (sa, sb) = (facts.strings.string_at(a), facts.strings.string_at(b));
     if let (Some(sa), Some(sb)) = (sa, sb) {
         if let Some(v) = compare_known(sa, sb, limit) {
-            return Some(Folded::Int(v));
+            return Some(Folded::Value(ValueFold::Int(v)));
         }
     }
     let first = |s: Option<StrRef>, p| match s.and_then(|s| s.bytes().first().copied()) {
@@ -132,7 +127,7 @@ fn compare(facts: &Facts, a: PseudoId, b: PseudoId, limit: Limit) -> Option<Fold
     // limit of one: either way the first bytes' difference is the answer.
     let decided_by_first = !limit.allows(1)
         || (limit.stops_at_terminator() && (x == Byte::Known(0) || y == Byte::Known(0)));
-    decided_by_first.then_some(Folded::ByteDiff(x, y))
+    decided_by_first.then_some(Folded::Value(ValueFold::ByteDiff(x, y)))
 }
 
 /// The comparison of two known byte strings, as the difference of the
@@ -163,9 +158,9 @@ enum Direction {
 /// `char` (C17 7.24.5.2p2), and the terminator found where it is. The last
 /// terminator of any string is its first, so `strrchr(s, 0)` is
 /// `strchr(s, 0)`, which need not scan backwards.
-fn find_char(facts: &Facts, s: PseudoId, c: PseudoId, dir: Direction) -> Option<Folded> {
+fn find_char(facts: &CallSite, s: PseudoId, c: PseudoId, dir: Direction) -> Option<Folded> {
     let c = facts.unsigned(c, 8)? as u8;
-    let Some(text) = c_str(facts, s) else {
+    let Some(text) = facts.c_str(s) else {
         return (c == 0 && matches!(dir, Direction::Last)).then(|| strchr_call(facts, s, 0));
     };
     if c == 0 {
@@ -177,33 +172,32 @@ fn find_char(facts: &Facts, s: PseudoId, c: PseudoId, dir: Direction) -> Option<
     };
     match at {
         Some(at) => offset(s, at),
-        None => Some(Folded::Null),
+        None => Some(Folded::Value(ValueFold::Null)),
     }
 }
 
 /// `memchr(s, c, n)` over a known object: found within the first `n`
 /// bytes, or not there when all `n` are inside the object.
-fn memchr(facts: &Facts, s: PseudoId, c: PseudoId, n: PseudoId) -> Option<Folded> {
-    let n = facts.unsigned(n, 64)?;
+fn memchr(facts: &CallSite, s: PseudoId, c: PseudoId, n: PseudoId) -> Option<Folded> {
+    let n = facts.size_t(n)?;
     if n == 0 {
-        return Some(Folded::Null);
+        return Some(Folded::Value(ValueFold::Null));
     }
     let c = facts.unsigned(c, 8)? as u8;
     let bytes = facts.strings.string_at(s)?.bytes();
     let window = usize::try_from(n).map_or(bytes.len(), |n| n.min(bytes.len()));
     match bytes[..window].iter().position(|&b| b == c) {
         Some(at) => offset(s, at),
-        None if n <= bytes.len() as u128 => Some(Folded::Null),
+        None if n <= bytes.len() as u128 => Some(Folded::Value(ValueFold::Null)),
         None => None,
     }
 }
 
 /// `strchr(s, c)`, the call a one-character search becomes.
-fn strchr_call(facts: &Facts, s: PseudoId, c: u8) -> Folded {
+fn strchr_call(facts: &CallSite, s: PseudoId, c: u8) -> Folded {
     let types = facts.types;
     Folded::Call(NewCall {
         func: LibFn::Strchr,
-        name: "strchr",
         args: vec![
             Operand::Value(s, types.const_char_ptr_id),
             Operand::Int(i128::from(c), types.int_id),
@@ -211,48 +205,47 @@ fn strchr_call(facts: &Facts, s: PseudoId, c: u8) -> Folded {
     })
 }
 
-fn strstr(facts: &Facts, h: PseudoId, n: PseudoId) -> Option<Folded> {
-    let needle = c_str(facts, n)?;
+fn strstr(facts: &CallSite, h: PseudoId, n: PseudoId) -> Option<Folded> {
+    let needle = facts.c_str(n)?;
     if needle.is_empty() {
         return offset(h, 0);
     }
-    match c_str(facts, h) {
+    match facts.c_str(h) {
         Some(hay) => match hay.windows(needle.len()).position(|w| w == needle) {
             Some(at) => offset(h, at),
-            None => Some(Folded::Null),
+            None => Some(Folded::Value(ValueFold::Null)),
         },
         None => (needle.len() == 1).then(|| strchr_call(facts, h, needle[0])),
     }
 }
 
-fn strpbrk(facts: &Facts, s: PseudoId, set: PseudoId) -> Option<Folded> {
-    let set = c_str(facts, set)?;
+fn strpbrk(facts: &CallSite, s: PseudoId, set: PseudoId) -> Option<Folded> {
+    let set = facts.c_str(set)?;
     if set.is_empty() {
-        return Some(Folded::Null);
+        return Some(Folded::Value(ValueFold::Null));
     }
-    match c_str(facts, s) {
+    match facts.c_str(s) {
         Some(text) => match text.iter().position(|b| set.contains(b)) {
             Some(at) => offset(s, at),
-            None => Some(Folded::Null),
+            None => Some(Folded::Value(ValueFold::Null)),
         },
         None => (set.len() == 1).then(|| strchr_call(facts, s, set[0])),
     }
 }
 
-fn strcspn(facts: &Facts, s: PseudoId, reject: PseudoId) -> Option<Folded> {
-    let text = c_str(facts, s);
+fn strcspn(facts: &CallSite, s: PseudoId, reject: PseudoId) -> Option<Folded> {
+    let text = facts.c_str(s);
     if text.is_some_and(<[u8]>::is_empty) {
-        return Some(Folded::Int(0));
+        return Some(Folded::Value(ValueFold::Int(0)));
     }
-    let reject = c_str(facts, reject)?;
+    let reject = facts.c_str(reject)?;
     match text {
         Some(text) => {
             let span = text.iter().take_while(|b| !reject.contains(b)).count();
-            Some(Folded::Int(span as i128))
+            Some(Folded::Value(ValueFold::Int(span as i128)))
         }
         None if reject.is_empty() => Some(Folded::Call(NewCall {
             func: LibFn::Strlen,
-            name: "strlen",
             args: vec![Operand::Value(s, facts.types.const_char_ptr_id)],
         })),
         None => None,
@@ -281,12 +274,15 @@ mod tests {
         let mut fx = Fixture::new();
         let lc = fx.literal("hello");
         let p = fx.addr(&lc);
-        assert_eq!(fold1(&mut fx, LibFn::Strlen, &[p]), Some(Folded::Int(5)));
+        assert_eq!(
+            fold1(&mut fx, LibFn::Strlen, &[p]),
+            Some(Folded::Value(ValueFold::Int(5)))
+        );
         let i = fx.unknown();
         let q = fx.op(Opcode::Add, p, i);
         assert_eq!(
             fold1(&mut fx, LibFn::Strlen, &[q]),
-            Some(Folded::LenMinus { len: 5, var: i })
+            Some(Folded::Value(ValueFold::LenMinus { len: 5, var: i }))
         );
         let u = fx.unknown();
         assert_eq!(fold1(&mut fx, LibFn::Strlen, &[u]), None);
@@ -301,14 +297,20 @@ mod tests {
         let (a, z) = (fx.konst(b'a'.into()), fx.konst(0));
         fx.store_byte(s, 0, a);
         fx.store_byte(s, 1, z);
-        assert_eq!(fold1(&mut fx, LibFn::Strlen, &[s]), Some(Folded::Int(1)));
+        assert_eq!(
+            fold1(&mut fx, LibFn::Strlen, &[s]),
+            Some(Folded::Value(ValueFold::Int(1)))
+        );
         fx.store_byte(s, 1, a);
         fx.store_byte(s, 2, z);
-        assert_eq!(fold1(&mut fx, LibFn::Strlen, &[s]), Some(Folded::Int(2)));
+        assert_eq!(
+            fold1(&mut fx, LibFn::Strlen, &[s]),
+            Some(Folded::Value(ValueFold::Int(2)))
+        );
         let n = fx.unknown();
         assert_eq!(
             fold1(&mut fx, LibFn::Strnlen, &[s, n]),
-            Some(Folded::AtMost { n, len: 2 })
+            Some(Folded::Value(ValueFold::AtMost { n, len: 2 }))
         );
     }
 
@@ -322,19 +324,19 @@ mod tests {
         let u = fx.unknown();
         assert_eq!(
             fold1(&mut fx, LibFn::Strnlen, &[p, two]),
-            Some(Folded::Int(2))
+            Some(Folded::Value(ValueFold::Int(2)))
         );
         assert_eq!(
             fold1(&mut fx, LibFn::Strnlen, &[p, nine]),
-            Some(Folded::Int(3))
+            Some(Folded::Value(ValueFold::Int(3)))
         );
         assert_eq!(
             fold1(&mut fx, LibFn::Strnlen, &[p, n]),
-            Some(Folded::AtMost { n, len: 3 })
+            Some(Folded::Value(ValueFold::AtMost { n, len: 3 }))
         );
         assert_eq!(
             fold1(&mut fx, LibFn::Strnlen, &[u, zero]),
-            Some(Folded::Int(0))
+            Some(Folded::Value(ValueFold::Int(0)))
         );
         assert_eq!(fold1(&mut fx, LibFn::Strnlen, &[u, two]), None);
     }
@@ -356,30 +358,42 @@ mod tests {
         let u = fx.unknown();
         let v = fx.unknown();
         let (zero, one, two, three) = (fx.konst(0), fx.konst(1), fx.konst(2), fx.konst(3));
-        let int = |v: u8, w: u8| Some(Folded::Int(i128::from(v) - i128::from(w)));
+        let int = |v: u8, w: u8| Some(Folded::Value(ValueFold::Int(i128::from(v) - i128::from(w))));
         assert_eq!(fold1(&mut fx, LibFn::Strcmp, &[a, b]), int(b'l', b'p'));
         // A payload is one `char` per source byte: "\u{ff}" is the byte 0xff.
         assert_eq!(fold1(&mut fx, LibFn::Strcmp, &[c, a]), int(0xff, b'h'));
         assert_eq!(
             fold1(&mut fx, LibFn::Strncmp, &[a, b, three]),
-            Some(Folded::Int(0))
+            Some(Folded::Value(ValueFold::Int(0)))
         );
-        assert_eq!(fold1(&mut fx, LibFn::Strcmp, &[u, u]), Some(Folded::Int(0)));
+        assert_eq!(
+            fold1(&mut fx, LibFn::Strcmp, &[u, u]),
+            Some(Folded::Value(ValueFold::Int(0)))
+        );
         assert_eq!(
             fold1(&mut fx, LibFn::Strcmp, &[u, e]),
-            Some(Folded::ByteDiff(Byte::At(u), Byte::Known(0)))
+            Some(Folded::Value(ValueFold::ByteDiff(
+                Byte::At(u),
+                Byte::Known(0)
+            )))
         );
         assert_eq!(
             fold1(&mut fx, LibFn::Strncmp, &[e, u, two]),
-            Some(Folded::ByteDiff(Byte::Known(0), Byte::At(u)))
+            Some(Folded::Value(ValueFold::ByteDiff(
+                Byte::Known(0),
+                Byte::At(u)
+            )))
         );
         assert_eq!(
             fold1(&mut fx, LibFn::Strncmp, &[u, v, zero]),
-            Some(Folded::Int(0))
+            Some(Folded::Value(ValueFold::Int(0)))
         );
         assert_eq!(
             fold1(&mut fx, LibFn::Strncmp, &[u, a, one]),
-            Some(Folded::ByteDiff(Byte::At(u), Byte::Known(b'h')))
+            Some(Folded::Value(ValueFold::ByteDiff(
+                Byte::At(u),
+                Byte::Known(b'h')
+            )))
         );
         assert_eq!(fold1(&mut fx, LibFn::Strncmp, &[u, v, two]), None);
         assert_eq!(fold1(&mut fx, LibFn::Strcmp, &[u, a]), None);
@@ -387,11 +401,11 @@ mod tests {
         assert_eq!(fold1(&mut fx, LibFn::Memcmp, &[u, e, two]), None);
         assert_eq!(
             fold1(&mut fx, LibFn::Memcmp, &[u, v, one]),
-            Some(Folded::ByteDiff(Byte::At(u), Byte::At(v)))
+            Some(Folded::Value(ValueFold::ByteDiff(Byte::At(u), Byte::At(v))))
         );
         assert_eq!(
             fold1(&mut fx, LibFn::Memcmp, &[a, b, three]),
-            Some(Folded::Int(0))
+            Some(Folded::Value(ValueFold::Int(0)))
         );
     }
 
@@ -408,18 +422,20 @@ mod tests {
         // "ab\0" against "c\0": decided at the first byte.
         assert_eq!(
             fold1(&mut fx, LibFn::Memcmp, &[a, b1, four]),
-            Some(Folded::Int(i128::from(b'a') - i128::from(b'c')))
+            Some(Folded::Value(ValueFold::Int(
+                i128::from(b'a') - i128::from(b'c')
+            )))
         );
         // "b\0" against "c\0": decided at the first byte too.
         assert_eq!(
             fold1(&mut fx, LibFn::Memcmp, &[a1, b1, four]),
-            Some(Folded::Int(-1))
+            Some(Folded::Value(ValueFold::Int(-1)))
         );
         // "b\0" against "b\0", four bytes: equal as far as both go, and
         // then past the end.
         assert_eq!(
             fold1(&mut fx, LibFn::Memcmp, &[a1, a1, four]),
-            Some(Folded::Int(0))
+            Some(Folded::Value(ValueFold::Int(0)))
         );
         let aa = fx.literal("xb");
         let x = fx.addr(&aa);
@@ -437,17 +453,20 @@ mod tests {
         let wide_o = fx.konst(0x16f);
         let (five, eleven, twelve) = (fx.konst(5), fx.konst(11), fx.konst(12));
         let u = fx.unknown();
-        let at = |k| Some(Folded::Offset(p, k));
+        let at = |k| Some(Folded::Value(ValueFold::Offset(p, k)));
         assert_eq!(fold1(&mut fx, LibFn::Strchr, &[p, o]), at(4));
         assert_eq!(fold1(&mut fx, LibFn::Strchr, &[p, wide_o]), at(4));
         assert_eq!(fold1(&mut fx, LibFn::Strrchr, &[p, o]), at(7));
-        assert_eq!(fold1(&mut fx, LibFn::Strchr, &[p, x]), Some(Folded::Null));
+        assert_eq!(
+            fold1(&mut fx, LibFn::Strchr, &[p, x]),
+            Some(Folded::Value(ValueFold::Null))
+        );
         assert_eq!(fold1(&mut fx, LibFn::Strchr, &[p, nul]), at(11));
         assert_eq!(fold1(&mut fx, LibFn::Strchr, &[u, o]), None);
         let Some(Folded::Call(call)) = fold1(&mut fx, LibFn::Strrchr, &[u, nul]) else {
             panic!("strrchr(s, 0) should become strchr(s, 0)");
         };
-        assert_eq!((call.func, call.name), (LibFn::Strchr, "strchr"));
+        assert_eq!(call.func, LibFn::Strchr);
         assert_eq!(
             call.args,
             vec![
@@ -459,11 +478,11 @@ mod tests {
         assert_eq!(fold1(&mut fx, LibFn::Memchr, &[p, o, five]), at(4));
         assert_eq!(
             fold1(&mut fx, LibFn::Memchr, &[p, x, eleven]),
-            Some(Folded::Null)
+            Some(Folded::Value(ValueFold::Null))
         );
         assert_eq!(
             fold1(&mut fx, LibFn::Memchr, &[p, nul, eleven]),
-            Some(Folded::Null)
+            Some(Folded::Value(ValueFold::Null))
         );
         assert_eq!(fold1(&mut fx, LibFn::Memchr, &[p, nul, twelve]), at(11));
         // Not found, and the search would run past the object.
@@ -485,22 +504,28 @@ mod tests {
         let becomes = |folded: Option<Folded>, f: LibFn| matches!(folded, Some(Folded::Call(NewCall { func, .. })) if func == f);
         assert_eq!(
             fold1(&mut fx, LibFn::Strstr, &[u, e]),
-            Some(Folded::Offset(u, 0))
+            Some(Folded::Value(ValueFold::Offset(u, 0)))
         );
         assert_eq!(
             fold1(&mut fx, LibFn::Strstr, &[h, wp]),
-            Some(Folded::Offset(h, 6))
+            Some(Folded::Value(ValueFold::Offset(h, 6)))
         );
-        assert_eq!(fold1(&mut fx, LibFn::Strstr, &[wp, h]), Some(Folded::Null));
+        assert_eq!(
+            fold1(&mut fx, LibFn::Strstr, &[wp, h]),
+            Some(Folded::Value(ValueFold::Null))
+        );
         assert!(becomes(
             fold1(&mut fx, LibFn::Strstr, &[u, op]),
             LibFn::Strchr
         ));
         assert_eq!(fold1(&mut fx, LibFn::Strstr, &[u, wp]), None);
-        assert_eq!(fold1(&mut fx, LibFn::Strpbrk, &[u, e]), Some(Folded::Null));
+        assert_eq!(
+            fold1(&mut fx, LibFn::Strpbrk, &[u, e]),
+            Some(Folded::Value(ValueFold::Null))
+        );
         assert_eq!(
             fold1(&mut fx, LibFn::Strpbrk, &[h, wp]),
-            Some(Folded::Offset(h, 2))
+            Some(Folded::Value(ValueFold::Offset(h, 2)))
         );
         assert!(becomes(
             fold1(&mut fx, LibFn::Strpbrk, &[u, op]),
@@ -508,11 +533,11 @@ mod tests {
         ));
         assert_eq!(
             fold1(&mut fx, LibFn::Strcspn, &[h, lp]),
-            Some(Folded::Int(2))
+            Some(Folded::Value(ValueFold::Int(2)))
         );
         assert_eq!(
             fold1(&mut fx, LibFn::Strcspn, &[e, u]),
-            Some(Folded::Int(0))
+            Some(Folded::Value(ValueFold::Int(0)))
         );
         assert!(becomes(
             fold1(&mut fx, LibFn::Strcspn, &[u, e]),

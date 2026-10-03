@@ -636,21 +636,24 @@ constants go in `FLOAT_CONSTANT_BUILTINS`.
    `with_src`, `with_type_and_size` (result type and width). If the operand
    type differs from the result's, set `src_typ`/`src_size`.
 3. **Opcode.** Add the variant to `Opcode` in `ir/mod.rs`, its dump spelling
-   in `Opcode::name`, and a row in the opcode table in `ir/README.md`. Then
+   in `Opcode::name`, its name in the `every_opcode!` list that makes
+   `Opcode::ALL` (test builds fail until it is there), and a row in the
+   opcode table in `ir/README.md`. Then
    decide each predicate:
    - `is_terminator` if control does not fall through;
-   - `may_access_memory` if it reads or writes memory, and then also
-     `has_side_effects` (validator invariant I5) unless it is a pure load;
-   - `has_side_effects` if it must not be deleted when its result is unused;
+   - `may_access_memory` if it reads or writes memory, which makes it a
+     side effect unless it is a `Load`;
+   - the explicit list in `has_side_effects` if it must not be deleted when
+     its result is unused and neither terminates a block nor reaches memory;
    - `Instruction::is_memory_barrier` if memory operations may not move
-     across it (I2 requires it also be in `has_side_effects`);
+     across it (it must then also reach memory);
    - `reads_another_type` if its operand type differs from its result type
      (I10 then requires `src_typ`/`src_size` on every instance);
    - `is_libm` if it computes a libm function a target may lack (it must
      then carry the library name via `with_func`, read back by
      `Instruction::library_callee`);
    - `is_atomic` for an atomic memory operation (the allocator reserves
-     scratch registers for these).
+     scratch registers for these; it is also a memory access and a barrier).
 
    A placeholder resolved before code generation (like `ConstantP`, answered
    in `sccp` and `ir::lower`) must be added to `check_no_placeholders` (I4).
@@ -658,10 +661,11 @@ constants go in `FLOAT_CONSTANT_BUILTINS`.
    treats it as overdefined. If it can fold, add it to `constfold.rs`
    (`eval_unop`, `eval_funop`, `eval_fbinop`, `eval_fcvt`) and to the
    opcode list in `sccp::transfer`; algebraic simplifications go in
-   `instcombine::try_simplify`. A memory-touching opcode is opaque to
-   `effects::insn_effect` (`MemEffect::Unknown`), `escape.rs`, `loadfwd.rs`
-   and `dse.rs` until taught otherwise -- conservative, but teach them if it
-   matters (`Memcpy`/`Memset`/`Memmove` are the examples).
+   `instcombine::try_simplify`. A memory-touching opcode may read and write
+   anything until `memloc::AddrMap::access` names what it touches, which is
+   what `loadfwd`, `dse` and `effects` all ask; and its pointer operands
+   escape until `memloc::accessed_slots` names them -- conservative, but
+   teach them if it matters (`Memcpy`/`Memset`/`Memmove` are the examples).
 5. **Target mapping.** If a target has no instruction for it: a libm opcode
    gets a case in each `ArchMapper::computes_in_place`
    (`arch/x86_64/mapping.rs`, `arch/aarch64/mapping.rs`), and

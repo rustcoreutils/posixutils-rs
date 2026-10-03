@@ -556,7 +556,7 @@ fn xargs_insert_mode_preserves_internal_spaces() {
 #[test]
 fn xargs_exit_code_126_cannot_invoke() {
     // Create a file that exists but is not executable
-    let test_dir = std::env::temp_dir().join("xargs_test_126");
+    let test_dir = std::env::temp_dir().join(format!("xargs_test_126_{}", std::process::id()));
     let _ = fs::create_dir_all(&test_dir);
     let non_exec_file = test_dir.join("not_executable");
 

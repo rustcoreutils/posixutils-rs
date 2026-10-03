@@ -122,11 +122,7 @@ impl Aarch64CodeGen {
                     && self.lo12_folds(&name, bytes)
                 {
                     // A global defined here, at its own address: ADRP + LDR.
-                    let sym = if name.starts_with('.') {
-                        Symbol::local(&name)
-                    } else {
-                        Symbol::global(&name)
-                    };
+                    let sym = Symbol::named(&name);
                     self.push_lir(Aarch64Inst::Adrp {
                         sym: sym.clone(),
                         dst: scratch0,

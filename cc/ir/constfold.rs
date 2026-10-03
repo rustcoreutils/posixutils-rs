@@ -71,148 +71,177 @@ pub(crate) fn at_width(v: i128, size: u32, signed: bool) -> i128 {
     }
 }
 
-/// Comparison behavior for identity (x op x) and constant folding
-pub(crate) struct CmpInfo {
-    /// Result when comparing x to itself (e.g., x == x -> 1, x < x -> 0)
-    pub identity_result: i128,
-    /// Constant comparison function
-    pub compare: fn(i128, i128) -> bool,
+/// Which kind of comparison an opcode is, and so which outcomes it has.
+///
+/// The two are never combined. An integer comparison has three outcomes and
+/// a signedness; a float one has no signedness and a fourth outcome,
+/// [`Outcomes::UN`], which is what makes `(x < y) || (x >= y)` true for
+/// integers and false for a NaN.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CmpDomain {
     /// How to read the operands at their own width before comparing.
     ///
     /// The opcode is the only thing that carries this: `SetLt`/`Le`/`Gt`/`Ge`
     /// are the signed forms and `SetB`/`Be`/`A`/`Ae` the unsigned ones.
     /// `SetEq`/`SetNe` do not care which, as long as both sides are read the
-    /// same way -- but they do care about the width.
-    pub signed: bool,
+    /// same way, and are recorded as signed. A signed and an unsigned
+    /// comparison over one pair are *not* comparable: `x < y` and `x > y`
+    /// read signed are not complementary with the unsigned forms.
+    Int { signed: bool },
+    /// IEEE: less, equal, greater or unordered.
+    Float,
 }
 
-/// Get comparison info for the given opcode
-pub(crate) fn get_cmp_info(op: Opcode) -> Option<CmpInfo> {
-    match op {
-        Opcode::SetEq => Some(CmpInfo {
-            identity_result: 1,
-            compare: |a, b| a == b,
-            signed: true,
-        }),
-        Opcode::SetNe => Some(CmpInfo {
-            identity_result: 0,
-            compare: |a, b| a != b,
-            signed: true,
-        }),
-        Opcode::SetLt => Some(CmpInfo {
-            identity_result: 0,
-            compare: |a, b| a < b,
-            signed: true,
-        }),
-        Opcode::SetLe => Some(CmpInfo {
-            identity_result: 1,
-            compare: |a, b| a <= b,
-            signed: true,
-        }),
-        Opcode::SetGt => Some(CmpInfo {
-            identity_result: 0,
-            compare: |a, b| a > b,
-            signed: true,
-        }),
-        Opcode::SetGe => Some(CmpInfo {
-            identity_result: 1,
-            compare: |a, b| a >= b,
-            signed: true,
-        }),
-        Opcode::SetB => Some(CmpInfo {
-            identity_result: 0,
-            compare: |a, b| (a as u128) < (b as u128),
-            signed: false,
-        }),
-        Opcode::SetBe => Some(CmpInfo {
-            identity_result: 1,
-            compare: |a, b| (a as u128) <= (b as u128),
-            signed: false,
-        }),
-        Opcode::SetA => Some(CmpInfo {
-            identity_result: 0,
-            compare: |a, b| (a as u128) > (b as u128),
-            signed: false,
-        }),
-        Opcode::SetAe => Some(CmpInfo {
-            identity_result: 1,
-            compare: |a, b| (a as u128) >= (b as u128),
-            signed: false,
-        }),
-        _ => None,
+impl CmpDomain {
+    /// Every outcome a comparison in this domain can have.
+    pub(crate) fn all(self) -> Outcomes {
+        match self {
+            CmpDomain::Int { .. } => Outcomes::ORDERED,
+            CmpDomain::Float => Outcomes::ORDERED | Outcomes::UN,
+        }
+    }
+
+    /// The outcomes a value compared with *itself* can have: equal, and for
+    /// a float also unordered -- a NaN is not equal to itself.
+    pub(crate) fn reflexive(self) -> Outcomes {
+        match self {
+            CmpDomain::Int { .. } => Outcomes::EQ,
+            CmpDomain::Float => Outcomes::EQ | Outcomes::UN,
+        }
     }
 }
 
-/// Which orderings of its two operands make a comparison true.
+/// A set of the outcomes comparing two operands can have: less, equal,
+/// greater, and for a float also unordered.
 ///
-/// Every integer comparison is a subset of `{less, equal, greater}`, and the
-/// opcode names which subset. Two comparisons over the *same* operand pair can
-/// then be answered without knowing the operands at all: `a && b` is never
-/// true when their subsets are disjoint, and `a || b` is always true when
-/// together they cover all three.
-pub(crate) const CMP_LT: u8 = 1;
-pub(crate) const CMP_EQ: u8 = 2;
-pub(crate) const CMP_GT: u8 = 4;
-/// Every ordering: a comparison that is always true.
-pub(crate) const CMP_ALL: u8 = CMP_LT | CMP_EQ | CMP_GT;
+/// The same set answers two questions. Of an opcode it is which outcomes make
+/// the comparison true ([`Outcomes::of_op`]); of a pair of operands it is
+/// which outcomes they can possibly have. A comparison is then decided by one
+/// rule, [`Outcomes::decide`], whatever is known about the operands -- two
+/// constants, two ranges, a value and itself, a float and an infinity. And two
+/// comparisons over the *same* operand pair can be combined without knowing
+/// the operands at all: `a && b` is never true when their sets are disjoint,
+/// and `a || b` is always true when together they cover every outcome.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Outcomes(u8);
 
-/// The orderings `op` is true for, or `None` if it is not a comparison.
-pub(crate) fn cmp_mask(op: Opcode) -> Option<u8> {
-    Some(match op {
-        Opcode::SetEq => CMP_EQ,
-        Opcode::SetNe => CMP_LT | CMP_GT,
-        Opcode::SetLt | Opcode::SetB => CMP_LT,
-        Opcode::SetLe | Opcode::SetBe => CMP_LT | CMP_EQ,
-        Opcode::SetGt | Opcode::SetA => CMP_GT,
-        Opcode::SetGe | Opcode::SetAe => CMP_GT | CMP_EQ,
-        _ => return None,
-    })
-}
+impl Outcomes {
+    /// No outcome: a comparison that is never true.
+    pub(crate) const NONE: Outcomes = Outcomes(0);
+    pub(crate) const LT: Outcomes = Outcomes(1);
+    pub(crate) const EQ: Outcomes = Outcomes(2);
+    pub(crate) const GT: Outcomes = Outcomes(4);
+    /// The fourth outcome a float comparison has and an integer one does
+    /// not: the operands are *unordered*, because at least one is a NaN.
+    pub(crate) const UN: Outcomes = Outcomes(8);
+    /// Less, equal or greater: every outcome of an integer comparison.
+    pub(crate) const ORDERED: Outcomes = Outcomes(1 | 2 | 4);
 
-/// The fourth outcome a float comparison has and an integer one does not:
-/// the operands are *unordered*, because at least one is a NaN.
-pub(crate) const CMP_UN: u8 = 8;
-/// Every outcome of a float comparison.
-pub(crate) const FCMP_ALL: u8 = CMP_ALL | CMP_UN;
+    /// The outcomes `op` is true for, and the domain it compares in, or
+    /// `None` if it is not a comparison.
+    ///
+    /// Every float arm but one is ordered and so excludes [`Outcomes::UN`].
+    /// The exception is `FCmpONe`, which despite its name is C's `!=` -- true
+    /// when either operand is a NaN -- and is emitted that way by both
+    /// backends: `setne` OR'd with `setp` on x86-64, `cset ne` (which is
+    /// taken on unordered) on aarch64.
+    pub(crate) fn of_op(op: Opcode) -> Option<(Outcomes, CmpDomain)> {
+        const LT: Outcomes = Outcomes::LT;
+        const EQ: Outcomes = Outcomes::EQ;
+        const GT: Outcomes = Outcomes::GT;
+        let signed = CmpDomain::Int { signed: true };
+        let unsigned = CmpDomain::Int { signed: false };
+        let float = CmpDomain::Float;
+        Some(match op {
+            Opcode::SetEq => (EQ, signed),
+            Opcode::SetNe => (LT | GT, signed),
+            Opcode::SetLt => (LT, signed),
+            Opcode::SetLe => (LT | EQ, signed),
+            Opcode::SetGt => (GT, signed),
+            Opcode::SetGe => (GT | EQ, signed),
+            Opcode::SetB => (LT, unsigned),
+            Opcode::SetBe => (LT | EQ, unsigned),
+            Opcode::SetA => (GT, unsigned),
+            Opcode::SetAe => (GT | EQ, unsigned),
+            Opcode::FCmpOEq => (EQ, float),
+            Opcode::FCmpONe => (LT | GT | Outcomes::UN, float),
+            Opcode::FCmpOLt => (LT, float),
+            Opcode::FCmpOLe => (LT | EQ, float),
+            Opcode::FCmpOGt => (GT, float),
+            Opcode::FCmpOGe => (GT | EQ, float),
+            _ => return None,
+        })
+    }
 
-/// The outcomes `op` is true for, or `None` if it is not a float comparison.
-///
-/// Every arm but one is ordered and so excludes [`CMP_UN`]. The exception is
-/// `FCmpONe`, which despite its name is C's `!=` -- true when either operand
-/// is a NaN -- and is emitted that way by both backends: `setne` OR'd with
-/// `setp` on x86-64, `cset ne` (which is taken on unordered) on aarch64.
-pub(crate) fn fcmp_mask(op: Opcode) -> Option<u8> {
-    Some(match op {
-        Opcode::FCmpOEq => CMP_EQ,
-        Opcode::FCmpONe => CMP_LT | CMP_GT | CMP_UN,
-        Opcode::FCmpOLt => CMP_LT,
-        Opcode::FCmpOLe => CMP_LT | CMP_EQ,
-        Opcode::FCmpOGt => CMP_GT,
-        Opcode::FCmpOGe => CMP_GT | CMP_EQ,
-        _ => return None,
-    })
-}
+    /// The one outcome two known values have; `None` is unordered.
+    pub(crate) fn of_ordering(ord: Option<Ordering>) -> Outcomes {
+        match ord {
+            Some(Ordering::Less) => Outcomes::LT,
+            Some(Ordering::Equal) => Outcomes::EQ,
+            Some(Ordering::Greater) => Outcomes::GT,
+            None => Outcomes::UN,
+        }
+    }
 
-/// The one outcome two known float values have.
-pub(crate) fn fcmp_outcome(ord: Option<Ordering>) -> u8 {
-    match ord {
-        Some(Ordering::Less) => CMP_LT,
-        Some(Ordering::Equal) => CMP_EQ,
-        Some(Ordering::Greater) => CMP_GT,
-        None => CMP_UN,
+    /// Whether every outcome in `other` is in `self`.
+    pub(crate) fn contains(self, other: Outcomes) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub(crate) fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The same set read with the operands the other way round: `a < b` and
+    /// `b < a` are the same comparison with less and greater exchanged.
+    /// Equal and unordered are symmetric and stay where they are.
+    pub(crate) fn mirror(self) -> Outcomes {
+        let mut m = self & (Outcomes::EQ | Outcomes::UN);
+        if self.contains(Outcomes::LT) {
+            m = m | Outcomes::GT;
+        }
+        if self.contains(Outcomes::GT) {
+            m = m | Outcomes::LT;
+        }
+        m
+    }
+
+    /// The outcomes of `domain` not in `self`: the comparison's negation.
+    pub(crate) fn complement(self, domain: CmpDomain) -> Outcomes {
+        Outcomes(!self.0 & domain.all().0)
+    }
+
+    /// The answer of a comparison true for the outcomes in `self`, when every
+    /// outcome in `possible` gives the same one: false when none of them makes
+    /// it true, true when all of them do, and `None` when they disagree.
+    pub(crate) fn decide(self, possible: Outcomes) -> Option<bool> {
+        if (self & possible).is_empty() {
+            Some(false)
+        } else if self.contains(possible) {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    /// Every subset of `self`, the empty set included.
+    #[cfg(test)]
+    pub(crate) fn subsets(self) -> impl Iterator<Item = Outcomes> {
+        (0..=self.0).filter(move |m| m & !self.0 == 0).map(Outcomes)
     }
 }
 
-/// The answer of a float comparison true for the outcomes in `mask`, when
-/// every outcome in `possible` gives the same one: 0 when none of them makes
-/// it true, 1 when all of them do.
-pub(crate) fn fcmp_decided(mask: u8, possible: u8) -> Option<bool> {
-    if possible & mask == 0 {
-        Some(false)
-    } else if possible & !mask & FCMP_ALL == 0 {
-        Some(true)
-    } else {
-        None
+impl std::ops::BitOr for Outcomes {
+    type Output = Outcomes;
+    fn bitor(self, rhs: Outcomes) -> Outcomes {
+        Outcomes(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitAnd for Outcomes {
+    type Output = Outcomes;
+    fn bitand(self, rhs: Outcomes) -> Outcomes {
+        Outcomes(self.0 & rhs.0)
     }
 }
 
@@ -223,18 +252,19 @@ pub(crate) fn fcmp_decided(mask: u8, possible: u8) -> Option<bool> {
 /// is ordered with a NaN -- including a NaN `x`, which is why an infinity
 /// still leaves *unordered* possible. A NaN `x` also leaves `never_below`
 /// true, since it is not less than zero either.
-pub(crate) fn possible_against(c: FloatVal, never_below: bool) -> u8 {
+pub(crate) fn possible_against(c: FloatVal, never_below: bool) -> Outcomes {
     let inf = FloatVal::infinity(false);
-    let mut possible = match (c.cmp_value(inf), c.cmp_value(inf.negated())) {
-        (None, _) => return CMP_UN,
-        (Some(Ordering::Equal), _) => FCMP_ALL & !CMP_GT,
-        (_, Some(Ordering::Equal)) => FCMP_ALL & !CMP_LT,
-        _ => FCMP_ALL,
+    let possible = match (c.cmp_value(inf), c.cmp_value(inf.negated())) {
+        (None, _) => return Outcomes::UN,
+        (Some(Ordering::Equal), _) => Outcomes::GT.complement(CmpDomain::Float),
+        (_, Some(Ordering::Equal)) => Outcomes::LT.complement(CmpDomain::Float),
+        _ => CmpDomain::Float.all(),
     };
     if never_below && c.cmp_value(FloatVal::from_f64(0.0)) != Some(Ordering::Greater) {
-        possible &= !CMP_LT;
+        possible & Outcomes::LT.complement(CmpDomain::Float)
+    } else {
+        possible
     }
-    possible
 }
 
 /// The answer of `op` comparing an unknown value with the constant `c`
@@ -242,22 +272,16 @@ pub(crate) fn possible_against(c: FloatVal, never_below: bool) -> u8 {
 /// change it: `x > +Inf` is 0, `x != NaN` is 1. The one rule the optimizer
 /// folds by, and the linearizer too under `-fno-trapping-math`.
 pub(crate) fn fcmp_against_constant(op: Opcode, c: FloatVal, const_first: bool) -> Option<bool> {
+    let (mask, CmpDomain::Float) = Outcomes::of_op(op)? else {
+        return None;
+    };
     let possible = possible_against(c, false);
     let possible = if const_first {
-        mirror_mask(possible)
+        possible.mirror()
     } else {
         possible
     };
-    fcmp_decided(fcmp_mask(op)?, possible)
-}
-
-/// The same mask read with the operands the other way round: `a < b` and
-/// `b < a` are the same comparison with `less` and `greater` exchanged.
-/// Equal and unordered are symmetric and stay where they are.
-pub(crate) fn mirror_mask(mask: u8) -> u8 {
-    (mask & (CMP_EQ | CMP_UN))
-        | if mask & CMP_LT != 0 { CMP_GT } else { 0 }
-        | if mask & CMP_GT != 0 { CMP_LT } else { 0 }
+    mask.decide(possible)
 }
 
 /// `insn`'s operation applied to two constants, or `None` if the opcode is
@@ -266,7 +290,7 @@ pub(crate) fn mirror_mask(mask: u8) -> u8 {
 /// The operands are raw: every narrowing this needs is applied here, and
 /// narrowing is idempotent, so a caller that has already read them at their
 /// own width may pass those instead.
-pub(crate) fn eval_binop(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
+fn eval_binop(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
     match insn.op {
         // Congruent modulo 2^n, so the width does not enter into it.
         Opcode::Add => Some(a.wrapping_add(b)),
@@ -281,11 +305,19 @@ pub(crate) fn eval_binop(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
         Opcode::Shl | Opcode::Lsr | Opcode::Asr => eval_shift(insn, a, b),
 
         _ => {
-            let info = get_cmp_info(insn.op)?;
+            let (mask, CmpDomain::Int { signed }) = Outcomes::of_op(insn.op)? else {
+                return None;
+            };
             let size = insn.operand_width();
-            let a = at_width(a, size, info.signed);
-            let b = at_width(b, size, info.signed);
-            Some(if (info.compare)(a, b) { 1 } else { 0 })
+            let a = at_width(a, size, signed);
+            let b = at_width(b, size, signed);
+            let ord = if signed {
+                a.cmp(&b)
+            } else {
+                (a as u128).cmp(&(b as u128))
+            };
+            mask.decide(Outcomes::of_ordering(Some(ord)))
+                .map(i128::from)
         }
     }
 }
@@ -295,7 +327,7 @@ pub(crate) fn eval_binop(insn: &Instruction, a: i128, b: i128) -> Option<i128> {
 ///
 /// `size == 0` and `size >= 128` both answer `i128::MIN`, matching
 /// [`at_width`], which leaves a value alone at those widths.
-fn signed_min_at(size: u32) -> i128 {
+pub(crate) const fn signed_min_at(size: u32) -> i128 {
     if size == 0 || size >= 128 {
         i128::MIN
     } else {
@@ -539,6 +571,44 @@ pub(crate) fn eval_fcvt(op: Opcode, dst_size: u32, src_fmt: FpFormat, a: FloatVa
         .to_integer(dst_size.clamp(1, 128), signed)
 }
 
+/// How many integer operands `op` takes when [`eval_int`] evaluates it, or
+/// `None` when it evaluates no such opcode.
+pub(crate) fn int_fold_arity(op: Opcode) -> Option<usize> {
+    if matches!(
+        op,
+        Opcode::Neg | Opcode::Not | Opcode::Sext | Opcode::Zext | Opcode::Trunc
+    ) || bit_opcode(op).is_some()
+    {
+        Some(1)
+    } else if op.is_int_arith() || op.is_int_comparison() {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// Whether [`eval_int`] evaluates `op`.
+pub(crate) fn is_int_foldable(op: Opcode) -> bool {
+    int_fold_arity(op).is_some()
+}
+
+/// `insn`'s integer operation applied to the constants `ops`, one per
+/// operand: the single dispatch every pass that folds over known operands
+/// goes through, so that none of them can model an opcode the others do not.
+///
+/// `None` when the opcode is not one this folds, `ops` is the wrong arity
+/// for it, or the operation is undefined for these operands.
+pub(crate) fn eval_int(insn: &Instruction, ops: &[i128]) -> Option<i128> {
+    if int_fold_arity(insn.op)? != ops.len() {
+        return None;
+    }
+    match *ops {
+        [a] => eval_unop(insn, a),
+        [a, b] => eval_binop(insn, a, b),
+        _ => None,
+    }
+}
+
 /// `insn`'s unary operation applied to a constant.
 ///
 /// Includes the integer width conversions, which are unary in the IR and
@@ -547,7 +617,7 @@ pub(crate) fn eval_fcvt(op: Opcode, dst_size: u32, src_fmt: FpFormat, a: FloatVa
 /// every `char` or `short` read is widened before anything is done with it,
 /// so a fold that stops at the conversion stops one instruction after it
 /// started.
-pub(crate) fn eval_unop(insn: &Instruction, a: i128) -> Option<i128> {
+fn eval_unop(insn: &Instruction, a: i128) -> Option<i128> {
     match insn.op {
         Opcode::Neg => Some(a.wrapping_neg()),
         Opcode::Not => Some(!a),
@@ -556,8 +626,7 @@ pub(crate) fn eval_unop(insn: &Instruction, a: i128) -> Option<i128> {
         // Read the operand at the width it was stored in, in the signedness
         // the opcode names, and leave it there: the destination is wider.
         Opcode::Sext | Opcode::Zext => {
-            let src = conversion_src_width(insn)?;
-            Some(at_width(a, src, insn.op == Opcode::Sext))
+            Some(at_width(a, insn.operand_width(), insn.op == Opcode::Sext))
         }
         // Truncation keeps the low `size` bits -- but *which value* those
         // bits are is decided by the consumer, not here, and the IR does not
@@ -645,19 +714,204 @@ pub(crate) fn eval_bit_op(op: BitOp, width: u32, a: i128) -> i128 {
     }
 }
 
-/// The width a conversion reads its operand at, or `None` when the
-/// instruction does not say.
-///
-/// Refusing is right rather than guessing from `size`: that is the
-/// *destination* width, so an extension read at it is the identity and a
-/// negative `char` would come back positive.
-fn conversion_src_width(insn: &Instruction) -> Option<u32> {
-    (insn.src_size != 0).then_some(insn.src_size)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DOMAINS: [CmpDomain; 3] = [
+        CmpDomain::Int { signed: true },
+        CmpDomain::Int { signed: false },
+        CmpDomain::Float,
+    ];
+
+    const SINGLES: [Outcomes; 4] = [Outcomes::LT, Outcomes::EQ, Outcomes::GT, Outcomes::UN];
+
+    /// `decide` against its definition, over every mask and every set of
+    /// possible outcomes: decided only when every possible outcome gives the
+    /// same answer, and false when there is none to give.
+    #[test]
+    fn outcomes_decide_is_unanimity() {
+        let all = CmpDomain::Float.all();
+        for mask in all.subsets() {
+            for possible in all.subsets() {
+                let answers: Vec<bool> = SINGLES
+                    .into_iter()
+                    .filter(|o| possible.contains(*o))
+                    .map(|o| mask.contains(o))
+                    .collect();
+                let want = if answers.iter().all(|a| !a) {
+                    Some(false)
+                } else if answers.iter().all(|a| *a) {
+                    Some(true)
+                } else {
+                    None
+                };
+                assert_eq!(mask.decide(possible), want, "{mask:?} of {possible:?}");
+            }
+        }
+    }
+
+    /// Swapping the operands exchanges less and greater and nothing else,
+    /// and doing it twice is no change.
+    #[test]
+    fn outcomes_mirror_exchanges_less_and_greater() {
+        let swap = |o| match o {
+            Outcomes::LT => Outcomes::GT,
+            Outcomes::GT => Outcomes::LT,
+            o => o,
+        };
+        for mask in CmpDomain::Float.all().subsets() {
+            for o in SINGLES {
+                assert_eq!(
+                    mask.mirror().contains(swap(o)),
+                    mask.contains(o),
+                    "{mask:?}"
+                );
+            }
+            assert_eq!(mask.mirror().mirror(), mask);
+        }
+    }
+
+    /// The complement is the rest of the domain: disjoint from the mask,
+    /// together the whole domain, and its own inverse.
+    #[test]
+    fn outcomes_complement_is_the_rest_of_the_domain() {
+        for domain in DOMAINS {
+            let all = domain.all();
+            for mask in all.subsets() {
+                let not = mask.complement(domain);
+                assert!((mask & not).is_empty(), "{mask:?} in {domain:?}");
+                assert_eq!(mask | not, all, "{mask:?} in {domain:?}");
+                assert_eq!(not.complement(domain), mask, "{mask:?} in {domain:?}");
+            }
+        }
+    }
+
+    /// The negation of every comparison opcode is the opcode's complement,
+    /// in the same domain -- except for a float, whose ordered predicates
+    /// are all false on a NaN and so are not one another's negations.
+    #[test]
+    fn outcomes_complement_of_an_int_op_is_its_negation() {
+        for (op, neg) in [
+            (Opcode::SetEq, Opcode::SetNe),
+            (Opcode::SetLt, Opcode::SetGe),
+            (Opcode::SetLe, Opcode::SetGt),
+            (Opcode::SetB, Opcode::SetAe),
+            (Opcode::SetBe, Opcode::SetA),
+        ] {
+            let (m, d) = Outcomes::of_op(op).unwrap();
+            let (n, e) = Outcomes::of_op(neg).unwrap();
+            assert_eq!(d, e, "{op:?}");
+            assert_eq!(m.complement(d), n, "{op:?}");
+            assert_eq!(n.complement(d), m, "{neg:?}");
+        }
+        let (lt, d) = Outcomes::of_op(Opcode::FCmpOLt).unwrap();
+        let (ge, _) = Outcomes::of_op(Opcode::FCmpOGe).unwrap();
+        assert_eq!(lt.complement(d), ge | Outcomes::UN);
+    }
+
+    /// `of_op` names exactly the comparisons, each in its own domain, with
+    /// a mask inside that domain; and swapping operands is the mirrored
+    /// opcode.
+    #[test]
+    fn outcomes_of_op_covers_exactly_the_comparisons() {
+        for &op in Opcode::ALL {
+            match Outcomes::of_op(op) {
+                Some((mask, domain)) => {
+                    assert!(domain.all().contains(mask), "{op:?}");
+                    assert_eq!(op.is_float_comparison(), domain == CmpDomain::Float);
+                    assert!(op.is_comparison(), "{op:?}");
+                }
+                None => assert!(!op.is_comparison(), "{op:?}"),
+            }
+        }
+        for (op, swapped) in [
+            (Opcode::SetLt, Opcode::SetGt),
+            (Opcode::SetLe, Opcode::SetGe),
+            (Opcode::SetB, Opcode::SetA),
+            (Opcode::SetBe, Opcode::SetAe),
+            (Opcode::SetEq, Opcode::SetEq),
+            (Opcode::SetNe, Opcode::SetNe),
+            (Opcode::FCmpOLt, Opcode::FCmpOGt),
+            (Opcode::FCmpOLe, Opcode::FCmpOGe),
+            (Opcode::FCmpOEq, Opcode::FCmpOEq),
+            (Opcode::FCmpONe, Opcode::FCmpONe),
+        ] {
+            let (m, d) = Outcomes::of_op(op).unwrap();
+            assert_eq!(Some((m.mirror(), d)), Outcomes::of_op(swapped), "{op:?}");
+        }
+    }
+
+    /// A value compared with itself: decided for every integer comparison
+    /// by whether it admits equality, and for a float only when it admits
+    /// neither equal nor unordered -- `x == x` is false for a NaN.
+    #[test]
+    fn outcomes_decide_a_self_comparison() {
+        for (op, want) in [
+            (Opcode::SetEq, Some(true)),
+            (Opcode::SetNe, Some(false)),
+            (Opcode::SetLt, Some(false)),
+            (Opcode::SetLe, Some(true)),
+            (Opcode::SetGt, Some(false)),
+            (Opcode::SetGe, Some(true)),
+            (Opcode::SetB, Some(false)),
+            (Opcode::SetBe, Some(true)),
+            (Opcode::SetA, Some(false)),
+            (Opcode::SetAe, Some(true)),
+            (Opcode::FCmpOEq, None),
+            (Opcode::FCmpONe, None),
+            (Opcode::FCmpOLt, Some(false)),
+            (Opcode::FCmpOLe, None),
+            (Opcode::FCmpOGt, Some(false)),
+            (Opcode::FCmpOGe, None),
+        ] {
+            let (mask, domain) = Outcomes::of_op(op).unwrap();
+            assert_eq!(mask.decide(domain.reflexive()), want, "{op:?}");
+        }
+    }
+
+    /// Two constants compare as the opcode reads them: at the operand width,
+    /// signed or unsigned, including at 128 bits where the unsigned reading
+    /// of a negative `i128` is the larger.
+    #[test]
+    fn eval_binop_compares_in_the_opcodes_signedness() {
+        let values = [0i128, 1, -1, 0x7f, 0x80, 0xff, i128::MIN, i128::MAX];
+        for &op in Opcode::ALL.iter().filter(|op| op.is_int_comparison()) {
+            let (_, domain) = Outcomes::of_op(op).unwrap();
+            let CmpDomain::Int { signed } = domain else {
+                unreachable!()
+            };
+            for size in [8, 128] {
+                // A comparison's operand width is its source width; the
+                // result is an `int`.
+                let mut insn = binop_at(op, 32);
+                insn.src_size = size;
+                for a in values {
+                    for b in values {
+                        let (x, y) = (at_width(a, size, signed), at_width(b, size, signed));
+                        let holds = match op {
+                            Opcode::SetEq => x == y,
+                            Opcode::SetNe => x != y,
+                            Opcode::SetLt => x < y,
+                            Opcode::SetLe => x <= y,
+                            Opcode::SetGt => x > y,
+                            Opcode::SetGe => x >= y,
+                            Opcode::SetB => (x as u128) < (y as u128),
+                            Opcode::SetBe => (x as u128) <= (y as u128),
+                            Opcode::SetA => (x as u128) > (y as u128),
+                            Opcode::SetAe => (x as u128) >= (y as u128),
+                            _ => unreachable!(),
+                        };
+                        assert_eq!(
+                            eval_binop(&insn, a, b),
+                            Some(i128::from(holds)),
+                            "{op:?}.{size} {a} {b}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// The rule both the optimizer and the linearizer fold by: decided only
     /// when every value of the unknown side, a NaN included, gives the same
@@ -969,6 +1223,31 @@ mod tests {
         ] {
             let insn = Instruction::new(op).with_size(32);
             assert_eq!(eval_unop(&insn, a), Some(want), "{op:?} of {a:#x}");
+        }
+    }
+
+    /// The one dispatch folds an operation only at its own arity, and
+    /// nothing it does not model: an operand list of the wrong length is a
+    /// malformed instruction, not one to guess at.
+    #[test]
+    fn eval_int_folds_each_operation_at_its_own_arity() {
+        for (op, ops, want) in [
+            (Opcode::Neg, &[5][..], Some(-5)),
+            (Opcode::Popcount32, &[0xF0], Some(4)),
+            (Opcode::Sub, &[7, 2], Some(5)),
+            (Opcode::SetLt, &[1, 2], Some(1)),
+            (Opcode::Neg, &[5, 5], None),
+            (Opcode::Sub, &[7], None),
+            (Opcode::Popcount32, &[], None),
+            (Opcode::DivS, &[1, 0], None),
+            (Opcode::Load, &[1], None),
+            (Opcode::UMulHi, &[1, 1], None),
+        ] {
+            let insn = Instruction::new(op).with_size(32);
+            assert_eq!(eval_int(&insn, ops), want, "{op:?} of {ops:?}");
+        }
+        for op in [Opcode::Load, Opcode::UMulHi, Opcode::FAdd, Opcode::Lo64] {
+            assert!(!is_int_foldable(op), "{op:?}");
         }
     }
 }

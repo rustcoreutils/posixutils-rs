@@ -28,7 +28,8 @@ pub const COMPILE_MATRIX: &[(&str, &[&str])] = &[
     ("debug_opt", &["-g", "-O"]),
 ];
 
-/// Default compile config: -O -g only (fastest while still catching optimization bugs).
+/// Default compile config: -g -O (that is, -O1) only, the fastest that still
+/// catches optimization bugs.
 #[cfg(not(feature = "test_matrix"))]
 pub const COMPILE_MATRIX: &[(&str, &[&str])] = &[("debug_opt", &["-g", "-O"])];
 
@@ -284,21 +285,30 @@ pub fn compile_and_run(name: &str, content: &str, extra_opts: &[String]) -> i32 
     0
 }
 
-/// Run `src` at -O0 and -O2 on the host, and on aarch64 under qemu when the
-/// cross toolchain is present; every run must exit 0.
+/// Run `src` on the host at the [`COMPILE_MATRIX`] levels, at -O0 and at -O2,
+/// and on aarch64 under qemu at -O0 and -O2 when the cross toolchain is
+/// present; every run must exit 0.
+///
+/// The -O0 level is named explicitly: the matrix passes `-O`, so a host run
+/// with no level of its own is -O1, never -O0.
 pub fn compile_and_run_everywhere(name: &str, src: &str) {
-    let o2 = vec!["-O2".to_string()];
-    assert_eq!(compile_and_run(name, src, &[]), 0, "{name} at -O0");
-    assert_eq!(compile_and_run(name, src, &o2), 0, "{name} at -O2");
+    assert_eq!(
+        compile_and_run(name, src, &[]),
+        0,
+        "{name} at the matrix levels"
+    );
     for opt in ["-O0", "-O2"] {
+        let level = vec![opt.to_string()];
+        assert_eq!(compile_and_run(name, src, &level), 0, "{name} at {opt}");
         if let Some(code) = compile_and_run_aarch64(name, src, opt) {
             assert_eq!(code, 0, "{name} on aarch64 at {opt}");
         }
     }
 }
 
-/// Compile inline C code with optimization and run (single config, skips matrix).
-/// This is used by tests that specifically test optimization behavior.
+/// Compile inline C code at -O1 and run it (single config, skips matrix).
+/// This is used by tests that specifically test optimization behavior; a
+/// defect that needs -O2 to appear needs an explicit `-O2` run instead.
 pub fn compile_and_run_optimized(name: &str, content: &str) -> i32 {
     compile_and_run_single(name, content, &["-O1".to_string()], "optimized_only")
 }
@@ -710,6 +720,12 @@ pub fn compile_expect_error(name: &str, content: &str, expected: &str) {
 /// to stderr -- for a test that must see *every* diagnostic, such as one
 /// proving that an error is not followed by a cascade of others.
 pub fn compile_rejected(name: &str, content: &str) -> String {
+    compile_rejected_with(name, content, &[])
+}
+
+/// [`compile_rejected`] with extra driver flags, such as an `-O` level for a
+/// diagnostic that depends on what the optimizer leaves behind.
+pub fn compile_rejected_with(name: &str, content: &str, extra: &[&str]) -> String {
     let c_file = create_c_file(name, content);
     let asm = plib::tmp::Builder::new()
         .prefix(&format!("c17_reject_{}_", name))
@@ -717,12 +733,13 @@ pub fn compile_rejected(name: &str, content: &str) -> String {
         .tempfile()
         .expect("failed to create temp file");
 
-    let args = vec![
+    let mut args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+    args.extend([
         "-S".to_string(),
         "-o".to_string(),
         asm.path().to_string_lossy().to_string(),
         c_file.path().to_string_lossy().to_string(),
-    ];
+    ]);
     let output = run_test_base("c17", &args, &[]);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 

@@ -206,6 +206,62 @@ int main(void) {
     assert_eq!(compile_and_run("c11_rvalue_unqualified", code, &[]), 0);
 }
 
+/// The type of a conditional whose arms are pointers (C17 6.5.15p6), as
+/// `_Generic`, `sizeof` and pointer arithmetic see it. Every expected type is
+/// gcc's.
+///
+/// A null pointer constant takes the other arm's type even spelled
+/// `(void *)0`; compatible pointees merge to the composite type, so the
+/// result knows the array extent and the prototype one arm supplied;
+/// incompatible pointees give `void *`, and a pointer beside a nonzero
+/// integer stays a pointer.
+#[test]
+fn c11_conditional_pointer_result_type() {
+    let code = r#"
+#define T(x) _Generic((x), int *: 1, const int *: 2, const volatile int *: 3, \
+    void *: 4, const void *: 5, int (*)[3]: 6, const int (*)[3]: 7, \
+    int (*)(void): 8, char *: 9, default: 0)
+int c = 1;
+int a[3] = {10, 20, 30};
+int *p = a; char *cp; const int *cip; volatile int *vip; void *vp;
+int (*a3)[3] = &a; int (*ap)[] = &a; const int (*cap)[];
+int f(void) { return 42; }
+int (*fp)(void) = f; int (*fnp)() = f;
+int main(void) {
+    if (T(c ? p : (void *)0) != 1) return 1;
+    if (T(c ? (void *)0 : p) != 1) return 2;
+    if (T(c ? cip : (void *)0) != 2) return 3;
+    if (T(c ? fp : (void *)0) != 8) return 4;
+    if (T(c ? p : 0) != 1) return 5;
+    if (T(c ? p : (const void *)0) != 5) return 6;
+    if (T(c ? p : (char *)0) != 4) return 7;
+    if (T(c ? cp : p) != 4) return 8;
+    if (T(c ? p : 1) != 1) return 9;
+    if (T(c ? cip : vip) != 3) return 10;
+    if (T(c ? vip : cip) != 3) return 11;
+    if (T(c ? cip : vp) != 5) return 12;
+    if (T(c ? ap : a3) != 6) return 13;
+    if (T(c ? cap : a3) != 7) return 14;
+    if (T(c ? fnp : fp) != 8) return 15;
+    if (T(c ? fp : fnp) != 8) return 16;
+    /* The composite type is complete where one arm was. */
+    if (sizeof *(c ? ap : a3) != 3 * sizeof(int)) return 17;
+    if ((c ? ap : a3)[0][2] != 30) return 18;
+    if (*((c ? p : (void *)0) + 1) != 20) return 19;
+    if ((c ? fp : (void *)0)() != 42) return 20;
+    if ((c ? fnp : fp)() != 42) return 21;
+    /* GNU `a ?: b` follows the same rules. */
+    if (T(p ?: (void *)0) != 1) return 22;
+    if (T(p ?: (char *)0) != 4) return 23;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c11_conditional_pointer_result_type", code, &[]),
+        0
+    );
+}
+
 /// Each enumerated type is compatible with one integer type (C17 6.7.2.2p4),
 /// the one the implementation chooses to represent it -- for gcc, `unsigned
 /// int` when no enumerator is negative and `int` otherwise. c17 made an enum

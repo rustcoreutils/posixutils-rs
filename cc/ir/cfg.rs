@@ -41,8 +41,48 @@
 // to simplify after lowering would reintroduce every lost copy.
 //
 
-use super::{BasicBlock, BasicBlockId, Function, Instruction, Opcode};
+use super::{BasicBlock, BasicBlockId, Function, InsnExtra, Instruction, Opcode};
 use std::collections::{HashMap, HashSet};
+
+/// Every block an [`Instruction`] can transfer control to, as an iterator of
+/// references to its slots, repeats included: the true and false targets,
+/// each switch case and the default, then the `asm goto` labels. Expanded
+/// once over a shared instruction and once (with `mut`) over a unique one,
+/// so the walk that reads the targets and the walks that rewrite them are
+/// one list.
+macro_rules! target_slots {
+    ($insn:expr $(, $m:tt)?) => {{
+        let Instruction {
+            bb_true,
+            bb_false,
+            extra,
+            ..
+        } = $insn;
+        let (cases, default, asm) = match extra {
+            Some(e) => {
+                let InsnExtra {
+                    switch_cases,
+                    switch_default,
+                    asm_data,
+                    ..
+                } = &$($m)? **e;
+                (Some(switch_cases), Some(switch_default), Some(asm_data))
+            }
+            None => (None, None, None),
+        };
+        bb_true
+            .into_iter()
+            .chain(bb_false)
+            .chain(cases.into_iter().flatten().map(|(_, _, b)| b))
+            .chain(default.into_iter().flatten())
+            .chain(
+                asm.into_iter()
+                    .flatten()
+                    .flat_map(|d| &$($m)? d.goto_labels)
+                    .map(|(b, _)| b),
+            )
+    }};
+}
 
 impl Instruction {
     /// Every block this instruction can transfer control to: a branch's and a
@@ -57,16 +97,7 @@ impl Instruction {
                 out.push(b);
             }
         };
-        self.bb_true.into_iter().for_each(&mut add);
-        self.bb_false.into_iter().for_each(&mut add);
-        self.extra()
-            .switch_cases
-            .iter()
-            .for_each(|(_, _, b)| add(*b));
-        self.extra().switch_default.into_iter().for_each(&mut add);
-        if let Some(asm) = &self.extra().asm_data {
-            asm.goto_labels.iter().for_each(|(b, _)| add(*b));
-        }
+        target_slots!(self).copied().for_each(&mut add);
         out
     }
 
@@ -76,22 +107,26 @@ impl Instruction {
     /// One pass over the instruction whatever the map holds: a switch whose
     /// thousands of edges are all being split is rewritten once, not once per
     /// edge.
+    ///
+    /// Only the control targets: a `Phi`'s predecessors name the edges *into*
+    /// its block, which no change to this block's successors moves.
     fn retarget(&mut self, map: &HashMap<BasicBlockId, BasicBlockId>) {
-        let swap = |b: &mut BasicBlockId| {
+        for b in target_slots!(self, mut) {
             if let Some(to) = map.get(b) {
                 *b = *to;
             }
-        };
-        self.bb_true.iter_mut().for_each(swap);
-        self.bb_false.iter_mut().for_each(swap);
-        let Some(extra) = self.extra.as_deref_mut() else {
-            return;
-        };
-        extra.switch_cases.iter_mut().for_each(|(_, _, b)| swap(b));
-        extra.switch_default.iter_mut().for_each(swap);
-        if let Some(asm) = &mut extra.asm_data {
-            asm.goto_labels.iter_mut().for_each(|(b, _)| swap(b));
         }
+    }
+
+    /// Rewrite every block this instruction names: each control target
+    /// [`Self::control_targets`] reads, then the predecessor of each phi
+    /// operand -- for a `PhiSource`, the block of the `Phi` it feeds.
+    ///
+    /// For copying an instruction into another block numbering, where every
+    /// block id changes; an edit to one edge wants [`Self::retarget`].
+    pub fn for_each_block_mut(&mut self, mut f: impl FnMut(&mut BasicBlockId)) {
+        target_slots!(self, mut).for_each(&mut f);
+        self.phi_list.iter_mut().for_each(|(b, _)| f(b));
     }
 }
 
@@ -144,7 +179,7 @@ impl BasicBlock {
     /// Make every record of `old` as a predecessor of this block -- in
     /// `parents`, and as the edge each phi takes an operand along -- name
     /// `new` instead.
-    fn rename_predecessor(&mut self, old: BasicBlockId, new: BasicBlockId) {
+    pub(super) fn rename_predecessor(&mut self, old: BasicBlockId, new: BasicBlockId) {
         for p in &mut self.parents {
             if *p == old {
                 *p = new;
@@ -194,6 +229,28 @@ impl Function {
         }
     }
 
+    /// Block `to` has taken over every instruction of `from` that named a
+    /// successor -- the tail of a block split in two -- so move the edges
+    /// with them: each successor of `from` becomes one of `to` instead, and
+    /// takes `to` as its predecessor where it had `from`, phi operands
+    /// included, keeping its place in each list. `from` is left with no
+    /// successors and `to` must have none yet.
+    pub fn move_successors(&mut self, from: BasicBlockId, to: BasicBlockId) {
+        let moved = self
+            .get_block_mut(from)
+            .map(|b| std::mem::take(&mut b.children))
+            .unwrap_or_default();
+        for &c in &moved {
+            if let Some(b) = self.get_block_mut(c) {
+                b.rename_predecessor(from, to);
+            }
+        }
+        if let Some(b) = self.get_block_mut(to) {
+            debug_assert!(b.children.is_empty(), "{to} already has successors");
+            b.children = moved;
+        }
+    }
+
     /// Forget the edge `from` -> `to`, which no instruction of `from` names any
     /// more (or `from` is about to be deleted).
     ///
@@ -205,7 +262,9 @@ impl Function {
         if let Some(b) = self.get_block_mut(from) {
             b.children.retain(|c| *c != to);
             for insn in &mut b.insns {
-                if insn.op == Opcode::PhiSource && insn.phi_list.first().is_some_and(|p| p.0 == to)
+                if insn
+                    .phi_source_dest()
+                    .is_some_and(|(phi_bb, _)| phi_bb == to)
                 {
                     insn.kill();
                 }
@@ -294,9 +353,9 @@ impl Function {
         let mut moved: HashMap<BasicBlockId, Vec<Instruction>> = HashMap::new();
         let mut kept = Vec::with_capacity(src.insns.len());
         for mut insn in std::mem::take(&mut src.insns) {
-            let feeds = (insn.op == Opcode::PhiSource)
-                .then(|| insn.phi_list.first().map(|p| p.0))
-                .flatten()
+            let feeds = insn
+                .phi_source_dest()
+                .map(|(to, _)| to)
                 .filter(|to| map.contains_key(to));
             match feeds {
                 Some(to) => moved.entry(to).or_default().push(insn),
@@ -546,7 +605,10 @@ impl Function {
         let block = &mut self.blocks[a];
         block.insns.pop();
         for insn in &mut block.insns {
-            if insn.op == Opcode::PhiSource && insn.phi_list.first().is_some_and(|p| p.0 == b) {
+            if insn
+                .phi_source_dest()
+                .is_some_and(|(phi_bb, _)| phi_bb == b)
+            {
                 insn.op = Opcode::Copy;
                 insn.phi_list.clear();
             }
@@ -785,5 +847,77 @@ mod tests {
             ids(&f)
         );
         valid(&f);
+    }
+
+    /// Splitting a block moves its successors to the tail: each keeps its
+    /// place in its successor's predecessor list, and the phi operands taken
+    /// along the old edge are taken along the new one.
+    #[test]
+    fn move_successors_hands_the_edges_to_the_tail() {
+        let int = TypeTable::new(&Target::host()).int_id;
+        let mut src0 = Instruction::phi_source(PseudoId(10), PseudoId(2), int, 32);
+        src0.phi_list = vec![(BasicBlockId(2), PseudoId(11))];
+        let mut src1 = Instruction::phi_source(PseudoId(12), PseudoId(2), int, 32);
+        src1.phi_list = vec![(BasicBlockId(2), PseudoId(11))];
+        let mut phi = Instruction::phi(PseudoId(11), int, 32);
+        phi.phi_list = vec![
+            (BasicBlockId(0), PseudoId(10)),
+            (BasicBlockId(1), PseudoId(12)),
+        ];
+        let mut f = function(vec![
+            (0, vec![entry(), src0, cbr(1, 2)], vec![1, 2]),
+            (1, vec![src1, br(2)], vec![2]),
+            (2, vec![phi, Instruction::ret(Some(PseudoId(11)))], vec![]),
+        ]);
+        f.rebuild_block_idx();
+        assert_eq!(
+            f.get_block(BasicBlockId(2)).unwrap().parents,
+            [0, 1].map(BasicBlockId)
+        );
+
+        // Block 0's tail moves to a new block 3, and 0 branches to it.
+        let mut tail = BasicBlock::new(BasicBlockId(3));
+        tail.insns = f.blocks[0].insns.split_off(1);
+        f.blocks[0].insns.push(br(3));
+        f.add_block(tail);
+        f.move_successors(BasicBlockId(0), BasicBlockId(3));
+        f.add_edge(BasicBlockId(0), BasicBlockId(3));
+
+        let block = |id| f.get_block(BasicBlockId(id)).unwrap();
+        assert_eq!(block(0).children, [BasicBlockId(3)]);
+        assert_eq!(block(3).children, [1, 2].map(BasicBlockId));
+        assert_eq!(block(3).parents, [BasicBlockId(0)]);
+        assert_eq!(block(1).parents, [BasicBlockId(3)]);
+        assert_eq!(block(2).parents, [3, 1].map(BasicBlockId));
+        assert_eq!(
+            block(2).insns[0].phi_list,
+            [
+                (BasicBlockId(3), PseudoId(10)),
+                (BasicBlockId(1), PseudoId(12))
+            ]
+        );
+        valid(&f);
+    }
+
+    /// Retargeting moves control targets only. A phi operand's predecessor
+    /// names an edge *into* the block, so a loop's back edge -- the block
+    /// both branching to `1` and receiving from it -- keeps its phi operand
+    /// when the branch is split.
+    #[test]
+    fn retarget_moves_control_targets_and_not_phi_predecessors() {
+        let types = TypeTable::new(&Target::host());
+        let mut phi = Instruction::phi(PseudoId(9), types.int_id, 32);
+        phi.phi_list = vec![(BasicBlockId(1), PseudoId(2))];
+        let mut sw = Instruction::switch_insn(
+            PseudoId(1),
+            vec![(0, 0, BasicBlockId(1)), (1, 1, BasicBlockId(2))],
+            Some(BasicBlockId(1)),
+            32,
+        );
+        let map = std::collections::HashMap::from([(BasicBlockId(1), BasicBlockId(5))]);
+        phi.retarget(&map);
+        sw.retarget(&map);
+        assert_eq!(phi.phi_list, [(BasicBlockId(1), PseudoId(2))]);
+        assert_eq!(sw.control_targets(), [5, 2].map(BasicBlockId));
     }
 }

@@ -43,14 +43,14 @@
 // ============================================================================
 
 use super::x87::{is_x87_float_to_int, uses_x87_scratch};
-use crate::arch::asm_constraints::OperandConstraint;
+use crate::arch::asm_constraints::{AsmOperandClass, AsmRegClass, PinnedGp};
 use crate::arch::lir::FpSize;
 use crate::arch::regalloc::{
     compute_live_intervals, find_call_positions, identify_fp_pseudos, interval_crosses_call,
     ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
 };
 use crate::float::FloatVal;
-use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
+use crate::ir::{AsmConstraint, AsmData, Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::types::TypeTable;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -423,58 +423,49 @@ pub fn is_call_like_x86_64(op: Opcode) -> bool {
     )
 }
 
-/// Map a single-letter GCC operand-constraint Fixed-register letter
-/// to the corresponding x86_64 GP register.
+/// The register each operand of an inline-asm statement is pinned to --
+/// outputs, then inputs, in order -- or `None` for one the allocator places.
 ///
-/// The vocabulary covers `a` (rax), `b` (rbx), `c` (rcx), `d`
-/// (rdx), `S` (rsi), `D` (rdi). The class-letter resolver
-/// `parse_x86_64_class_letter` takes `q`/`R`/`l` (treated as `Any`)
-/// and the constant-range letters `I`/`J`/`K`/`L`/`M`/`N`/`O`/`X`
-/// (treated as `Imm`).
-pub fn parse_x86_64_fixed_letter(letter: char) -> Option<Reg> {
-    Some(match letter {
-        'a' => Reg::Rax,
-        'b' => Reg::Rbx,
-        'c' => Reg::Rcx,
-        'd' => Reg::Rdx,
-        'S' => Reg::Rsi,
-        'D' => Reg::Rdi,
-        _ => return None,
-    })
-}
-
-/// Map a single-letter GCC operand-constraint *class* letter to an
-/// `OperandConstraint`. Class letters specify a register class or a
-/// constant range; they're distinct from `parse_x86_64_fixed_letter`
-/// which pins to one specific register.
-///
-/// Covered letters:
-/// - `q` — class of registers usable for 8-bit operations. On modern
-///   x86_64 every GP register has a low-byte alias, so we widen this
-///   to `Any` GP register.
-/// - `R` — legacy 8-register set (rax–rdi, rsp, rbp). Same as `r` on
-///   x86_64; we map to `Any`.
-/// - `l` — index registers (rsi, rdi). Same as `r` on x86_64; we map
-///   to `Any`.
-/// - `I`, `J`, `K`, `L`, `M`, `N`, `O` — constant-range constraints
-///   used for shift counts and small-immediate operands. c17 does not
-///   range-check; the assembler will reject if the operand is out of
-///   range, the same failure mode GCC defaults to with mismatched
-///   immediates.
-/// - `X` — any operand (register, memory, immediate). Same as `g`.
-///
-/// Out of scope:
-/// - `t` (top of x87 FP stack) — c17's register model doesn't expose
-///   ST(0) to the allocator. Code that needs `t` must use clobber
-///   declarations instead.
-pub fn parse_x86_64_class_letter(letter: char) -> Option<OperandConstraint<Reg>> {
-    use OperandConstraint::*;
-    Some(match letter {
-        'q' | 'R' | 'l' => Any,
-        'I' | 'J' | 'K' | 'L' | 'M' | 'N' | 'O' => Imm,
-        'X' => Alternatives(vec![Any, Mem, Imm]),
-        _ => return None,
-    })
+/// A letter that names a register (`a` ... `D`) pins its operand there. `Q`
+/// asks for any register with an addressable high byte, and gets the first of
+/// %rax, %rbx, %rcx, %rdx the statement neither pins nor clobbers: the
+/// allocator has no such class, so the choice is made here, once, and both
+/// the allocator and the template substitution read it. A tied input takes
+/// its output's register.
+pub fn asm_pinned_regs(asm: &AsmData) -> Vec<Option<Reg>> {
+    let named = |c: &AsmOperandClass| match c.reg {
+        Some(AsmRegClass::Pinned(p)) => Some(match p {
+            PinnedGp::Rax => Reg::Rax,
+            PinnedGp::Rbx => Reg::Rbx,
+            PinnedGp::Rcx => Reg::Rcx,
+            PinnedGp::Rdx => Reg::Rdx,
+            PinnedGp::Rsi => Reg::Rsi,
+            PinnedGp::Rdi => Reg::Rdi,
+        }),
+        _ => None,
+    };
+    let operands: Vec<&AsmConstraint> = asm.outputs.iter().chain(&asm.inputs).collect();
+    let mut taken: Vec<Reg> = operands.iter().filter_map(|c| named(&c.class)).collect();
+    taken.extend(asm.clobbers.iter().filter_map(|c| parse_gp_clobber_name(c)));
+    let mut pins: Vec<Option<Reg>> = Vec::with_capacity(operands.len());
+    for (idx, c) in operands.iter().enumerate() {
+        let tied = c
+            .matching_output
+            .filter(|&i| idx >= asm.outputs.len() && i < asm.outputs.len());
+        let pin = if let Some(i) = tied {
+            pins[i]
+        } else if c.class.reg == Some(AsmRegClass::HighByte) {
+            let free = [Reg::Rax, Reg::Rbx, Reg::Rcx, Reg::Rdx]
+                .into_iter()
+                .find(|r| !taken.contains(r));
+            taken.extend(free);
+            free
+        } else {
+            named(&c.class)
+        };
+        pins.push(pin);
+    }
+    pins
 }
 
 /// Map a clobber-list register name (lowercase, GCC-style) to the
@@ -506,31 +497,22 @@ pub(super) fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
     })
 }
 
-/// Build the per-operand `InstrConstraints` view of an inline-asm
-/// instruction. Walks `AsmData.outputs` + `AsmData.inputs` + the
-/// clobber list and produces a single structured value. Returns
-/// `None` if the instruction has no `AsmData` (shouldn't happen for
-/// `Opcode::Asm` in well-formed IR).
-///
-/// Constraint-string parse errors are reported by `c17`'s front end
-/// at IR-construction time (the parser already accepts these
-/// strings). Here we treat a parse error as "ignore this operand" —
-/// the inline-asm codegen falls back to the raw constraint string
-/// for letters this vocabulary does not cover.
+/// The allocator's view of an inline-asm instruction: its pinned operands
+/// and its clobbers. `None` if the instruction has no `AsmData`.
 pub fn build_asm_instr_constraints_x86_64(
     insn: &Instruction,
 ) -> Option<crate::arch::asm_constraints::InstrConstraints<Reg>> {
+    let asm = insn.extra().asm_data.as_ref()?;
     Some(crate::arch::asm_constraints::InstrConstraints::of_asm(
-        insn.extra().asm_data.as_ref()?,
-        parse_x86_64_fixed_letter,
-        parse_x86_64_class_letter,
+        asm,
+        &asm_pinned_regs(asm),
         parse_gp_clobber_name,
     ))
 }
 
 /// Walk a function's inline-asm instructions and collect
-/// `(operand_pseudo, fixed_reg)` pairs from every `Fixed`-constrained
-/// operand. Used by the chordal allocator to pre-color those
+/// `(operand_pseudo, fixed_reg)` pairs from every pinned operand
+/// (see `asm_pinned_regs`). Used by the chordal allocator to pre-color those
 /// operands so they land in the constraint-required register
 /// directly instead of being placed elsewhere and moved into the
 /// fixed register by the inline-asm codegen.
@@ -549,13 +531,11 @@ pub fn collect_asm_fixed_precolors_x86_64(func: &Function) -> BTreeMap<PseudoId,
             let Some(ic) = build_asm_instr_constraints_x86_64(insn) else {
                 continue;
             };
-            for op in &ic.operands {
-                if let crate::arch::asm_constraints::OperandConstraint::Fixed(r) = &op.constraint {
-                    // First Fixed seen wins. Duplicate pins on the
-                    // same pseudo across multiple asm blocks would be
-                    // a source bug; ignore the second pin.
-                    out.entry(op.pseudo).or_insert(*r);
-                }
+            for &(pseudo, r) in &ic.pinned {
+                // First pin seen wins. Duplicate pins on the same pseudo
+                // across multiple asm blocks would be a source bug; ignore
+                // the second pin.
+                out.entry(pseudo).or_insert(r);
             }
         }
     }
@@ -577,7 +557,7 @@ pub fn get_constraint_info(
         let (mut clobbers, involved) = ic.to_constraint_point();
         // The R10/R11 scratch clobbers apply to the inline-asm path
         // too: `emit_inline_asm` in `cc/arch/x86_64/codegen.rs` uses
-        // R10/R11 to shuffle operands into Fixed-letter registers,
+        // R10/R11 to shuffle operands into pinned registers,
         // remap allocated regs that collide with the reserved-scratch
         // set (`find_temp_reg` falls back to R10 / R11), and host
         // input/output spill helpers around the asm body.
@@ -892,13 +872,7 @@ impl FrameBase {
                     continue;
                 };
                 claimed.extend(ic.clobbers.iter().copied());
-                for op in &ic.operands {
-                    if let crate::arch::asm_constraints::OperandConstraint::Fixed(r) =
-                        &op.constraint
-                    {
-                        claimed.insert(*r);
-                    }
-                }
+                claimed.extend(ic.pinned.iter().map(|&(_, r)| r));
             }
         }
         claimed
@@ -2210,7 +2184,7 @@ impl RegAlloc {
 
         // Pre-colored vertices: any pseudo already mapped to a GP reg
         // (ABI-pinned args from allocate_arguments) plus inline-asm
-        // operands with `Fixed(R)` constraints (e.g. `"a"(x)` pins x
+        // operands pinned to one register (e.g. `"a"(x)` pins x
         // to RAX). Add them to the graph so live conflicts are
         // respected and the operand lands directly in the
         // constraint-required register — no codegen move needed.
@@ -2224,7 +2198,7 @@ impl RegAlloc {
         }
         for (pid, reg) in collect_asm_fixed_precolors_x86_64(func) {
             // Only pre-color if the pseudo is a GP candidate. The
-            // lowering already routes Fixed-operand registers
+            // lowering already routes pinned-operand registers
             // into the ConstraintPoint clobber set, so even if
             // pre-coloring is skipped here the operand remains
             // exempt via `involved_pseudos`.
@@ -2245,7 +2219,7 @@ impl RegAlloc {
             // assumption that their locations are already in
             // `self.locations` (true for ABI-pinned args, which
             // `allocate_arguments` inserts before chordal runs).
-            // Inline-asm Fixed pre-colors arrive here without going
+            // Inline-asm pin pre-colors arrive here without going
             // through `allocate_arguments`, so we insert directly. If
             // missed, `get_location` defaults to `Loc::Imm(0)` and
             // every Store/Load involving the operand silently
@@ -2424,7 +2398,7 @@ impl RegAlloc {
         // function, try to migrate `t`'s location to `s`'s location
         // (so the Copy becomes identity and M9a elides it). Skip if:
         // - `t` or `s` isn't a GP candidate
-        // - `t` is pre-colored (ABI-pinned or asm-Fixed; moving it
+        // - `t` is pre-colored (ABI-pinned or asm-pinned; moving it
         //   would violate the constraint)
         // - `t` and `s` interfere (a Copy whose targets interfere
         //   means the IR is asking for `t = s` while both must hold
@@ -2757,18 +2731,12 @@ mod tests {
     }
 
     fn make_asm_insn(clobbers: &[&str], operands: &[(&str, PseudoId)]) -> Instruction {
+        use crate::arch::asm_constraints::AsmAccess;
         use crate::ir::{AsmConstraint, AsmData};
         let (outputs, inputs): (Vec<_>, Vec<_>) = operands
             .iter()
-            .map(|&(c, pseudo)| AsmConstraint {
-                pseudo,
-                name: None,
-                matching_output: None,
-                constraint: c.to_string(),
-                size: 64,
-                offset: 0,
-            })
-            .partition(|c| c.constraint.starts_with('=') || c.constraint.starts_with('+'));
+            .map(|&(c, pseudo)| AsmConstraint::new(pseudo, c, crate::target::Arch::X86_64, 64))
+            .partition(|c| c.class.access != AsmAccess::Read);
         let mut insn = Instruction::new(Opcode::Asm);
         insn.extra_mut().asm_data = Some(Box::new(AsmData {
             template: String::new(),
@@ -2870,6 +2838,51 @@ mod tests {
         assert!(!ra.fp_pseudos.contains(&PseudoId(2)));
         assert!(ra.ld_pseudos.contains(&PseudoId(5)));
         assert!(!ra.ld_pseudos.contains(&PseudoId(1)));
+    }
+
+    /// A `Q` operand is pinned to the first of %rax..%rdx that the statement
+    /// neither pins nor clobbers, each to a different one; a tied input takes
+    /// its output's register, and the allocator sees every pin.
+    #[test]
+    fn asm_q_operand_is_pinned_to_a_free_high_byte_register() {
+        let mut insn = make_asm_insn(
+            &["rbx"],
+            &[
+                ("=Q", PseudoId(1)),
+                ("a", PseudoId(2)),
+                ("Q", PseudoId(3)),
+                ("0", PseudoId(1)),
+                ("r", PseudoId(4)),
+            ],
+        );
+        let data = insn.extra_mut().asm_data.as_mut().unwrap();
+        data.inputs[2].matching_output = Some(0);
+        assert_eq!(
+            asm_pinned_regs(data),
+            vec![
+                Some(Reg::Rcx),
+                Some(Reg::Rax),
+                Some(Reg::Rdx),
+                Some(Reg::Rcx),
+                None
+            ]
+        );
+        let (clobbers, exempt) =
+            get_constraint_info(&insn, crate::target::TlsAccess::ElfStatic).unwrap();
+        // R10 and R11 are the inline-asm codegen's own scratch.
+        assert_eq!(
+            clobbers,
+            vec![Reg::Rax, Reg::Rbx, Reg::Rcx, Reg::Rdx, Reg::R10, Reg::R11]
+        );
+        assert_eq!(exempt, vec![PseudoId(1), PseudoId(2), PseudoId(3)]);
+
+        // With all four taken there is none to give.
+        let full = make_asm_insn(
+            &["rax", "rbx", "rcx"],
+            &[("=d", PseudoId(1)), ("Q", PseudoId(2))],
+        );
+        let data = full.extra().asm_data.as_ref().unwrap();
+        assert_eq!(asm_pinned_regs(data), vec![Some(Reg::Rdx), None]);
     }
 }
 

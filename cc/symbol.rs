@@ -440,6 +440,15 @@ impl SymbolTable {
         self.lookup(name, Namespace::Tag)
     }
 
+    /// The tag of this name declared in the current scope -- the one a
+    /// definition here completes (C17 6.7.2.3p5). A tag visible only from an
+    /// enclosing scope is not: a definition in an inner scope declares a new
+    /// type that hides it, and must not complete the outer one.
+    pub fn lookup_tag_in_current_scope(&self, name: StringId) -> Option<&Symbol> {
+        self.lookup_tag(name)
+            .filter(|sym| sym.scope_depth == self.depth())
+    }
+
     /// Look up a typedef by name, returning its symbol as well as its type.
     ///
     /// A variably modified typedef's array extents cannot live in the

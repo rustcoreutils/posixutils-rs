@@ -49,11 +49,7 @@ impl Aarch64CodeGen {
         }
 
         // Local labels (starting with '.') don't get the _ prefix on macOS
-        let sym = if name.starts_with('.') {
-            Symbol::local(name)
-        } else {
-            Symbol::global(name)
-        };
+        let sym = Symbol::named(name);
 
         if self.needs_got_access(name) {
             // External symbols on macOS: load address from GOT
@@ -110,11 +106,7 @@ impl Aarch64CodeGen {
         }
 
         // Local labels (starting with '.') don't get the _ prefix on macOS
-        let sym = if name.starts_with('.') {
-            Symbol::local(name)
-        } else {
-            Symbol::global(name)
-        };
+        let sym = Symbol::named(name);
 
         if self.needs_got_access(name) {
             // External symbols on macOS: load address from GOT, then load value
@@ -377,17 +369,22 @@ impl Aarch64CodeGen {
         }
     }
 
-    /// Put the address `addr` designates into `dst`, for an access that
-    /// takes a bare base register: an exclusive, acquire or release load or
-    /// store.
+    /// Put the address `addr` designates, plus `disp`, into `dst`, for an
+    /// access that takes a bare base register: an exclusive, acquire or
+    /// release load or store. `disp` is the access's
+    /// [`Instruction::displacement`], so an atomic reaches `src[0] + offset`
+    /// as every other memory access does.
     ///
     /// The address comes from [`Self::compute_mem_addr`], the rule every load
     /// and store uses: a `Sym`'s slot is the object, so its address is taken;
     /// any other pseudo's slot holds a pointer, which is loaded. Loading every
     /// operand as a value read a local object's contents as its address.
-    pub(super) fn emit_addr_into(&mut self, addr: PseudoId, dst: Reg) {
-        let (base, offset) = match self.compute_mem_addr(addr, 0, dst) {
-            ComputedAddr::Global(name) => return self.emit_load_addr(&name, dst),
+    pub(super) fn emit_addr_into(&mut self, addr: PseudoId, disp: i32, dst: Reg) {
+        let (base, offset) = match self.compute_mem_addr(addr, disp, dst) {
+            ComputedAddr::Global(name) => {
+                self.emit_load_addr(&name, dst);
+                (dst, disp)
+            }
             ComputedAddr::Direct(MemAddr::BaseOffset { base, offset })
             | ComputedAddr::WithSetup(MemAddr::BaseOffset { base, offset }) => (base, offset),
             ComputedAddr::Direct(mem) | ComputedAddr::WithSetup(mem) => {
@@ -1009,7 +1006,7 @@ mod tests {
             panic!("a stack slot is base+offset");
         };
 
-        cg.emit_addr_into(sym, Reg::X10);
+        cg.emit_addr_into(sym, 0, Reg::X10);
         assert!(matches!(
             cg.base.lir_buffer.as_slice(),
             [Aarch64Inst::Add {
@@ -1021,7 +1018,7 @@ mod tests {
         ));
 
         cg.base.lir_buffer.clear();
-        cg.emit_addr_into(ptr, Reg::X10);
+        cg.emit_addr_into(ptr, 0, Reg::X10);
         assert!(matches!(
             cg.base.lir_buffer.as_slice(),
             [Aarch64Inst::Ldr {
@@ -1029,6 +1026,27 @@ mod tests {
                 addr: MemAddr::BaseOffset { base: b, offset: o },
                 dst: Reg::X10,
             }] if *b == base && *o == offset
+        ));
+    }
+
+    /// An atomic addresses `src[0] + offset`, as a plain load or store does:
+    /// the displacement is added to the pointer, not dropped.
+    #[test]
+    fn an_atomic_address_adds_its_displacement() {
+        let ptr = PseudoId(1);
+        let mut cg = Aarch64CodeGen::new(Target::new(Arch::Aarch64, Os::Linux));
+        cg.pseudos = PseudoTable::new(&[Pseudo::reg(ptr, 1)]);
+        cg.locations.set(ptr, Loc::Reg(Reg::X19));
+
+        cg.emit_addr_into(ptr, 24, Reg::X10);
+        assert!(matches!(
+            cg.base.lir_buffer.as_slice(),
+            [Aarch64Inst::Add {
+                size: OperandSize::B64,
+                src1: Reg::X19,
+                src2: GpOperand::Imm(24),
+                dst: Reg::X10,
+            }]
         ));
     }
 }

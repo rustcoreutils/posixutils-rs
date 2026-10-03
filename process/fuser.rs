@@ -438,8 +438,11 @@ mod linux {
                     Err(_) => continue,
                 };
 
-                let st = fs::metadata(entry.path())?;
-                let uid = st.uid();
+                let uid = match fs::metadata(entry.path()) {
+                    Ok(st) => st.uid(),
+                    Err(e) if process_gone(&e) => continue,
+                    Err(e) => return Err(e),
+                };
 
                 check_root_access(names, pid, uid, &root_stat, device_list, inode_list)?;
                 check_cwd_access(names, pid, uid, &cwd_stat, device_list, inode_list)?;
@@ -653,6 +656,7 @@ mod linux {
                 ));
                 return Ok(());
             }
+            Err(err) if process_gone(&err) => return Ok(()),
             Err(err) => {
                 diag::warning(&format!(
                     "{} {:?}: {:?}",
@@ -664,7 +668,11 @@ mod linux {
             }
         };
         for entry in dir_entries {
-            let entry = entry?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(e) if process_gone(&e) => return Ok(()),
+                Err(e) => return Err(e),
+            };
             let path = entry.path();
             let path_str = path.to_string_lossy();
 
@@ -740,11 +748,19 @@ mod linux {
         }
 
         let pathname = format!("/proc/{}/{}", pid, filename);
-        let file = File::open(&pathname)?;
+        let file = match File::open(&pathname) {
+            Ok(file) => file,
+            Err(e) if process_gone(&e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
         let reader = io::BufReader::new(file);
 
         for line in reader.lines() {
-            let line = line?;
+            let line = match line {
+                Ok(line) => line,
+                Err(e) if process_gone(&e) => return Ok(()),
+                Err(e) => return Err(e),
+            };
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() >= 5 {
                 let dev_info: Vec<&str> = parts[3].split(':').collect();
@@ -775,6 +791,16 @@ mod linux {
             }
         }
         Ok(())
+    }
+
+    /// Whether `err` means the process being examined has exited.
+    ///
+    /// `/proc` is not a snapshot: a process listed by the scan can exit, and
+    /// its entries vanish (or its reads fail with ESRCH), before or while its
+    /// files are examined. A process that is gone uses no file, so that is no
+    /// match rather than a reason to abandon the whole scan.
+    fn process_gone(err: &io::Error) -> bool {
+        err.kind() == ErrorKind::NotFound || err.raw_os_error() == Some(libc::ESRCH)
     }
 
     /// get stat of current /proc/{pid}/{filename}
@@ -1227,6 +1253,59 @@ mod linux {
             .collect();
 
         (names_vec, UnixSocketList::default(), MountList::default())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The PID of a process that has exited and been reaped.
+        fn exited_pid() -> i32 {
+            let mut child = std::process::Command::new("true")
+                .spawn()
+                .expect("spawn true");
+            let pid = child.id() as i32;
+            child.wait().expect("reap true");
+            pid
+        }
+
+        // The scan lists /proc and then examines each process in turn, so a
+        // process can exit after it was listed. Its vanished `fd` directory
+        // must read as no match, not abort the scan of every other process.
+        #[test]
+        fn exited_process_fd_dir_is_no_match() {
+            let mut names = Names::default();
+            let result = check_dir(
+                &mut names,
+                exited_pid(),
+                "fd",
+                &DeviceList::default(),
+                &InodeList::default(),
+                0,
+                Access::File,
+                &UnixSocketList::default(),
+                0,
+            );
+            assert!(result.is_ok(), "{result:?}");
+            assert!(names.matched_procs.is_empty());
+        }
+
+        // The same for the `maps` scan that a block-device operand or `-c`
+        // turns on.
+        #[test]
+        fn exited_process_maps_is_no_match() {
+            let mut names = Names::default();
+            let result = check_map(
+                &mut names,
+                exited_pid(),
+                "maps",
+                &DeviceList::default(),
+                0,
+                Access::Mmap,
+            );
+            assert!(result.is_ok(), "{result:?}");
+            assert!(names.matched_procs.is_empty());
+        }
     }
 }
 

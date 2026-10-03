@@ -1978,7 +1978,7 @@ int main(void) {
         int a[i % 500 + 1]; a[0] = 1; p = a;
         for (int j = 0; j < 2; j++) { int b[j + 1]; b[0] = 2; p = b; if (j) break; }
     }
-    /* A VLA inside a switch arm, which the switch body's own walk lowers. */
+    /* A VLA inside a switch arm. */
     for (int i = 0; i < 200000; i++) {
         switch (i & 1) {
         case 0: { int c[i % 500 + 1]; c[0] = 3; p = c; break; }

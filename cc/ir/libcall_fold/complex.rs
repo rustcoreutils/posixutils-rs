@@ -29,7 +29,7 @@
 //   intermediate reaches, to run time.
 //
 
-use super::{Facts, Folded};
+use super::{CallSite, Folded};
 use crate::float::FloatVal;
 #[cfg(test)]
 use crate::float::{ComplexDivision, ComplexRoutineFormat, Contraction};
@@ -42,7 +42,7 @@ use crate::target::{Arch, Os, Target};
 /// What the call `insn` to `__mul?c3` (`MulComplex`) or `__div?c3`
 /// (`DivComplex`) computes, when its four halves are finite constants and so
 /// is its result.
-pub(super) fn fold(known: LibFn, insn: &Instruction, facts: &Facts) -> Option<Folded> {
+pub(super) fn fold(known: LibFn, insn: &Instruction, facts: &CallSite) -> Option<Folded> {
     // The halves are the last four arguments: a hidden pointer to the
     // result, where the ABI returns it through one, comes first.
     let first = insn.src.len().checked_sub(4)?;
@@ -77,19 +77,19 @@ pub(super) fn materialize(b: &mut Builder, call: &Instruction, (re, im): (FloatV
         .arg_types
         .last()
         .expect("a complex routine takes halves");
-    let size = b.types.size_bits(typ);
     let dest = if call.returns_via_sret() {
         let slot = call.src[0];
         if let (Some(t), Some(ptr)) = (call.target, call.typ) {
-            b.copy_into(t, slot, ptr, call.size);
+            b.copy_into(t, slot, ptr);
         }
         slot
     } else {
         call.target.expect("a complex routine's result has storage")
     };
-    for (half, at) in [(re, 0), (im, i64::from(size / 8))] {
-        let v = b.float_constant(half, typ, size);
-        b.store(v, dest, at, typ, size);
+    let half_bytes = i64::from(b.types.size_bits(typ) / 8);
+    for (half, at) in [(re, 0), (im, half_bytes)] {
+        let v = b.float_constant(half, typ);
+        b.store(v, dest, at, typ);
     }
 }
 
@@ -112,11 +112,7 @@ mod tests {
         let f = fx.func();
         let p = f.alloc_pseudo();
         f.add_pseudo(Pseudo::fval(p, FloatVal::from_f64(v)));
-        fx.push(
-            Instruction::new(Opcode::SetVal)
-                .with_target(p)
-                .with_type_and_size(typ, size),
-        );
+        fx.push(Instruction::set_val(p, typ, size));
         p
     }
 

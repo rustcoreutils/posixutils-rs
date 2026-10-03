@@ -9,7 +9,7 @@
 //! Initializer and global declaration linearization
 
 use super::linearize::*;
-use super::{Initializer, SymbolAlias};
+use super::{GlobalStorage, Initializer, SymbolAlias};
 use crate::constexpr;
 use crate::constexpr::ConstScope;
 use crate::diag::error;
@@ -264,31 +264,23 @@ impl<'a> super::linearize::Linearizer<'a> {
             self.module.extern_symbols.remove(&name);
             self.module.extern_object_align.remove(&name);
 
-            // Check for thread-local storage
             let is_static = storage_class.contains(TypeModifiers::STATIC);
             // Const-qualified at the object level. For arrays, the element type
             // carries the qualifier (e.g., `const int a[10]`), so look through
             // arrays to their element type.
             let is_const = is_const_object_type(self.types, declarator.typ);
-            if storage_class.contains(TypeModifiers::THREAD_LOCAL) {
-                self.module.add_global_tls_aligned(
-                    &name,
-                    declarator.typ,
-                    init,
-                    declarator.explicit_align,
-                    is_static,
-                    is_const,
-                );
-            } else {
-                self.module.add_global_aligned(
-                    &name,
-                    declarator.typ,
-                    init,
-                    declarator.explicit_align,
-                    is_static,
-                    is_const,
-                );
-            }
+            let storage = GlobalStorage {
+                is_static,
+                is_const,
+                is_thread_local: storage_class.contains(TypeModifiers::THREAD_LOCAL),
+            };
+            self.module.define_global(
+                &name,
+                declarator.typ,
+                init,
+                declarator.explicit_align,
+                storage,
+            );
             self.module
                 .set_symbol_attrs(&name, declarator.symbol_attrs.clone());
         }
@@ -304,7 +296,30 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// - Address-of expressions (&symbol)
     /// - Nested initializers
     /// - Compound literals (C99 6.5.2.5)
+    ///
+    /// An address is as wide as a pointer, so an integer object narrower
+    /// than one cannot hold it: gcc rejects `char k = (long)arr;` as not
+    /// computable at load time, where emitting the relocation wrote eight
+    /// bytes over a one-byte object and its neighbours.
     pub(crate) fn ast_init_to_ir(&mut self, expr: &Expr, typ: TypeId) -> Initializer {
+        let init = self.ast_init_value(expr, typ);
+        let is_address = matches!(
+            init,
+            Initializer::SymAddr(_) | Initializer::SymAddrOffset(..)
+        );
+        if is_address
+            && self.types.is_integer(typ)
+            && self.types.size_bits(typ) < self.target.pointer_width
+        {
+            self.reject_initializer(expr);
+            return Initializer::None;
+        }
+        init
+    }
+
+    /// [`Self::ast_init_to_ir`] before the check that an address fits the
+    /// object.
+    fn ast_init_value(&mut self, expr: &Expr, typ: TypeId) -> Initializer {
         // An object of complex type needs both halves, whatever shape the
         // initializer takes, so it is handled before the by-expression arms
         // below -- several of which would otherwise match and keep only the
@@ -434,6 +449,22 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
 
+            // A cast to `_Bool` asks whether the operand is zero, and an
+            // address constant never is (C17 6.3.1.2): stripping the cast
+            // initialized `int n = (_Bool)arr;` with the address itself.
+            ExprKind::Cast {
+                expr: inner,
+                cast_type,
+            } if self.types.kind(*cast_type) == TypeKind::Bool => {
+                match self.const_condition(inner) {
+                    Some(truth) => Initializer::Int(i128::from(truth)),
+                    None => {
+                        self.reject_initializer(expr);
+                        Initializer::None
+                    }
+                }
+            }
+
             // Cast expression - evaluate the inner expression
             ExprKind::Cast { expr: inner, .. } => self.ast_init_to_ir(inner, typ),
 
@@ -467,21 +498,25 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
 
-            // Identifier - for constant addresses (function pointers, array decay, etc.)
-            // or enum constants
+            // Identifier: an address constant when it names an array or a
+            // function, which decay to their address (C17 6.3.2.1p3-4), or an
+            // enum constant.
+            //
+            // The name's own type decides, not the type it initializes.
+            // Asking the target made `long l = (long)f;` a diagnostic, when
+            // it is as much a relocation as `long (*p)(void) = f;`, and made
+            // `int *q = p;` for a pointer object `p` initialize `q` with the
+            // address of `p` rather than reject a value read.
             ExprKind::Ident(symbol_id) => {
-                let type_kind = self.types.kind(typ);
-                // For pointer types, this is likely a function address or array decay
-                if type_kind == TypeKind::Pointer {
-                    let name_str = self.symbol_name(*symbol_id);
-                    // Check if this is a static local variable
-                    // Static locals have mangled names like "func_name.var_name.N"
-                    let key = format!("{}.{}", self.current_func_name, name_str);
-                    if let Some(static_info) = self.static_locals.get(&key) {
-                        Initializer::SymAddr(static_info.global_name.clone())
-                    } else {
-                        Initializer::SymAddr(name_str)
-                    }
+                // A frame local has no address a relocation can name, so its
+                // array decays to nothing constant.
+                let global = self
+                    .types
+                    .decays(self.expr_type(expr))
+                    .then(|| self.global_name_of(*symbol_id))
+                    .flatten();
+                if let Some(name) = global {
+                    Initializer::SymAddr(name)
                 } else {
                     // Check if it's an enum constant
                     let sym = self.symbols.get(*symbol_id);
@@ -555,7 +590,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         // Get the pointee size for pointer arithmetic scaling
                         let pointee_size = ptr_expr
                             .typ
-                            .and_then(|t| self.types.base_type(t))
+                            .and_then(|t| self.types.arithmetic_pointee(t))
                             .map(|t| self.types.size_bytes(t) as i64)
                             .unwrap_or(1);
                         let byte_offset = if is_sub {
@@ -698,7 +733,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         // `(void *)&v.p[0] - (void *)&v` unfoldable.
         let elem = left
             .typ
-            .and_then(|t| self.types.base_type(t))
+            .and_then(|t| self.types.arithmetic_pointee(t))
             .map(|t| self.types.size_bytes(t) as i64)
             .unwrap_or(1)
             .max(1);
@@ -807,9 +842,13 @@ impl<'a> super::linearize::Linearizer<'a> {
             // A bare identifier is an address constant only when it decays --
             // an array or a function. Anything else is an object's *value*,
             // which is not a constant expression at file scope.
-            ExprKind::Ident(_) => {
-                let kind = self.types.kind(cond.typ?);
-                matches!(kind, TypeKind::Array | TypeKind::Function).then_some(true)
+            ExprKind::Ident(_) => self.types.decays(cond.typ?).then_some(true),
+            // A conversion between pointer types keeps a null pointer null
+            // and any other pointer non-null (C17 6.3.2.3p4).
+            ExprKind::Cast { expr: inner, .. }
+                if self.types.kind(cond.typ?) == TypeKind::Pointer =>
+            {
+                self.const_condition(inner)
             }
             _ => None,
         }
@@ -852,7 +891,15 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         // Converting to `_Bool` is not a truncation: every non-zero value
         // becomes 1, so 0.5 is `true` where `(int)0.5` is 0 (C17 6.3.1.2).
+        // An address constant is never null, so it is `true` too: an array
+        // or a function initializing a `_Bool` took the address's low byte,
+        // which is 0 for one aligned to 256.
         let is_bool = self.types.kind(typ) == TypeKind::Bool;
+        if is_bool {
+            if let Some(truth) = self.const_condition(expr) {
+                return Some(Initializer::Int(i128::from(truth)));
+            }
+        }
 
         if let Some(val) = self.eval_const_init_expr(expr) {
             return Some(Initializer::Int(if is_bool {
@@ -1042,7 +1089,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// and brace elision. Shared between static and runtime init paths.
     pub(crate) fn walk_struct_init_fields(
         &self,
-        resolved_typ: TypeId,
+        typ: TypeId,
         members: &[crate::types::StructMember],
         is_union: bool,
         elements: &[InitElement],
@@ -1108,7 +1155,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             // Designated path
-            let resolved = self.resolve_designator_chain(resolved_typ, 0, &element.designators);
+            let resolved = self.resolve_designator_chain(typ, 0, &element.designators);
             let Some(ResolvedDesignator {
                 offset,
                 typ: field_type,
@@ -1253,7 +1300,6 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// included. Pointers are not looked through, so this terminates on the
     /// self-referential types C allows.
     fn type_holds_union(&self, typ: TypeId) -> bool {
-        let typ = self.resolve_struct_type(typ);
         match self.types.kind(typ) {
             TypeKind::Union => true,
             TypeKind::Struct => self
@@ -1282,7 +1328,6 @@ impl<'a> super::linearize::Linearizer<'a> {
         base: usize,
         held: &mut UnionMembers,
     ) {
-        let typ = self.resolve_struct_type(typ);
         match self.types.kind(typ) {
             TypeKind::Struct | TypeKind::Union => {
                 let Some(composite) = self.types.get(typ).composite.as_ref() else {
@@ -1405,7 +1450,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         bitfield: bool,
         unions: UnionFold<'_>,
     ) -> SubobjectPlace {
-        let mut typ = self.resolve_struct_type(typ);
+        let mut typ = typ;
         let mut base = 0usize;
         let mut unions = unions;
 
@@ -1435,7 +1480,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     };
                     base += member.0;
                     unions = unions.inside(member.0);
-                    typ = self.resolve_struct_type(member.1);
+                    typ = member.1;
                 }
                 TypeKind::Struct => {
                     let Some(composite) = self.types.get(typ).composite.as_ref() else {
@@ -1470,7 +1515,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     };
                     base += member.offset;
                     unions = unions.inside(member.offset);
-                    typ = self.resolve_struct_type(member.typ);
+                    typ = member.typ;
                 }
                 TypeKind::Array => {
                     let Some(elem_type) = self.types.base_type(typ) else {
@@ -1486,7 +1531,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     }
                     unions = unions.inside(elem_start - base);
                     base = elem_start;
-                    typ = self.resolve_struct_type(elem_type);
+                    typ = elem_type;
                 }
                 // A scalar with something strictly inside it: only a union or
                 // a bit-field carrier can produce that, and neither is a
@@ -1602,7 +1647,6 @@ impl<'a> super::linearize::Linearizer<'a> {
         size: usize,
         unions: UnionFold<'_>,
     ) -> Option<&'i mut Initializer> {
-        let typ = self.resolve_struct_type(typ);
         if offset == 0 && size == self.types.size_bytes(typ) {
             return Some(init);
         }
@@ -2049,14 +2093,13 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             TypeKind::Struct | TypeKind::Union => {
-                let resolved_typ = self.resolve_struct_type(typ);
-                let resolved_size = self.types.size_bytes(resolved_typ);
-                if let Some(composite) = self.types.get(resolved_typ).composite.as_ref() {
+                let struct_size = self.types.size_bytes(typ);
+                if let Some(composite) = self.types.get(typ).composite.as_ref() {
                     let members: Vec<_> = composite.members.clone();
-                    let is_union = self.types.kind(resolved_typ) == TypeKind::Union;
+                    let is_union = self.types.kind(typ) == TypeKind::Union;
 
                     let mut visits =
-                        self.walk_struct_init_fields(resolved_typ, &members, is_union, elements);
+                        self.walk_struct_init_fields(typ, &members, is_union, elements);
                     let storage = InitStorage::Static(self.static_init_nesting);
                     self.admit_fam_visits(&mut visits, &members, storage);
 
@@ -2133,7 +2176,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     init_fields.sort_by_key(|(offset, _, _)| *offset);
 
                     Initializer::Struct {
-                        total_size: resolved_size,
+                        total_size: struct_size,
                         fields: init_fields,
                     }
                 } else {
@@ -2174,7 +2217,6 @@ impl<'a> super::linearize::Linearizer<'a> {
                     if self.types.kind(resolved) == TypeKind::Array {
                         resolved = self.types.base_type(resolved)?;
                     }
-                    resolved = self.resolve_struct_type(resolved);
                     // Naming a member of a union says which member the
                     // initializer is for, and nothing downstream can recover
                     // that: every member of a union begins at `offset`.

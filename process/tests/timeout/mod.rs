@@ -8,14 +8,13 @@
 //
 
 use std::{
-    io::Write,
+    io::{BufRead, BufReader, Read, Write},
     process::{Command, Output, Stdio},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use plib::testing::get_binary_path;
-use sysinfo::System;
 
 pub struct TestPlan {
     pub cmd: String,
@@ -27,7 +26,7 @@ pub struct TestPlan {
     pub has_subprocesses: bool,
 }
 
-fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> (Output, i32) {
+fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> (Output, u32) {
     let test_bin_path = get_binary_path(cmd);
 
     let mut command = Command::new(test_bin_path);
@@ -39,7 +38,7 @@ fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> (Output, i
         .spawn()
         .unwrap_or_else(|_| panic!("failed to spawn command {}", cmd));
 
-    let pgid = unsafe { libc::getpgid(child.id() as i32) };
+    let pid = child.id();
 
     // Separate the mutable borrow of stdin from the child process
     if let Some(mut stdin) = child.stdin.take() {
@@ -65,11 +64,37 @@ fn run_test_base(cmd: &str, args: &Vec<String>, stdin_data: &[u8]) -> (Output, i
 
     // Ensure we wait for the process to complete after writing to stdin
     let output = child.wait_with_output().expect("failed to wait for child");
-    (output, pgid)
+    (output, pid)
+}
+
+/// Whether any process, zombies included, is still a member of group `pgid`.
+fn process_group_exists(pgid: u32) -> bool {
+    let rc = unsafe { libc::kill(-(pgid as libc::pid_t), 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Without `-f`, timeout makes itself a process-group leader, so its group is
+/// the one whose PGID is its PID and holds only what timeout started. Once
+/// timeout has exited, a member it killed may still be a zombie awaiting its
+/// new parent's reap, so poll for the group to empty rather than look once.
+/// With `-f` timeout stays in the test runner's group, which is shared with
+/// every concurrently running test, so there is nothing to check.
+fn assert_no_leftover_subprocesses(args: &[String], timeout_pid: u32) {
+    if args.iter().any(|a| a == "-f" || a == "--foreground") {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_group_exists(timeout_pid) {
+        assert!(
+            Instant::now() < deadline,
+            "timeout's process group {timeout_pid} still has members after it exited"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 pub fn run_test(plan: TestPlan) {
-    let (output, pgid) = run_test_base(&plan.cmd, &plan.args, plan.stdin_data.as_bytes());
+    let (output, pid) = run_test_base(&plan.cmd, &plan.args, plan.stdin_data.as_bytes());
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout, plan.expected_out);
@@ -82,14 +107,8 @@ pub fn run_test(plan: TestPlan) {
         assert!(output.status.success());
     }
 
-    let mut system = System::new_all();
-    system.refresh_all();
-    for process in system.processes().values() {
-        if let Some(gid) = process.group_id() {
-            if *gid == pgid as u32 {
-                assert!(plan.has_subprocesses)
-            }
-        }
+    if !plan.has_subprocesses {
+        assert_no_leftover_subprocesses(&plan.args, pid);
     }
 }
 
@@ -429,35 +448,7 @@ fn test_child_does_not_inherit_ignored_sigttin_when_parent_does_not() {
 // child merely dying.
 #[test]
 fn test_forwards_sigusr1_to_the_child() {
-    let timeout_bin = get_binary_path("timeout");
-
-    let child = Command::new(&timeout_bin)
-        .args([
-            "20",
-            "sh",
-            "-c",
-            "trap 'echo GOT-USR1; exit 0' USR1; while :; do sleep 0.1; done",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn timeout");
-
-    // Let the child install its trap.
-    thread::sleep(Duration::from_millis(500));
-
-    unsafe { libc::kill(child.id() as i32, libc::SIGUSR1) };
-
-    let out = child
-        .wait_with_output()
-        .expect("failed to wait for timeout");
-    assert!(
-        String::from_utf8_lossy(&out.stdout).contains("GOT-USR1"),
-        "SIGUSR1 must be forwarded to the child, got stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    assert_signal_forwarded("USR1", libc::SIGUSR1);
 }
 
 // Same for SIGPIPE, the case the audit called out specifically: its default
@@ -465,32 +456,51 @@ fn test_forwards_sigusr1_to_the_child() {
 // timeout and orphaning the child.
 #[test]
 fn test_forwards_sigpipe_to_the_child() {
-    let timeout_bin = get_binary_path("timeout");
+    assert_signal_forwarded("PIPE", libc::SIGPIPE);
+}
 
-    let child = Command::new(&timeout_bin)
-        .args([
-            "20",
-            "sh",
-            "-c",
-            "trap 'echo GOT-PIPE; exit 0' PIPE; while :; do sleep 0.1; done",
-        ])
+/// Run `timeout 20 sh` with a child that traps `name`, send `signal` to
+/// timeout, and require that the child's trap ran.
+///
+/// The signal is sent only once the child has written READY, which it does
+/// after installing its trap. timeout installs its own handlers before it
+/// spawns the child, so READY also proves timeout is ready to forward. A fixed
+/// delay instead lets a loaded machine deliver the signal before either
+/// handler exists.
+fn assert_signal_forwarded(name: &str, signal: libc::c_int) {
+    let timeout_bin = get_binary_path("timeout");
+    let script =
+        format!("trap 'echo GOT-{name}; exit 0' {name}; echo READY; while :; do sleep 0.1; done");
+
+    let mut child = Command::new(&timeout_bin)
+        .args(["20", "sh", "-c", &script])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to spawn timeout");
 
-    thread::sleep(Duration::from_millis(500));
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).expect("failed to read child");
+    assert_eq!(
+        ready, "READY\n",
+        "the child must start and install its trap"
+    );
 
-    unsafe { libc::kill(child.id() as i32, libc::SIGPIPE) };
+    unsafe { libc::kill(child.id() as i32, signal) };
 
+    let mut rest = String::new();
+    stdout
+        .read_to_string(&mut rest)
+        .expect("failed to read child");
     let out = child
         .wait_with_output()
         .expect("failed to wait for timeout");
     assert!(
-        String::from_utf8_lossy(&out.stdout).contains("GOT-PIPE"),
-        "SIGPIPE must be forwarded to the child, got stdout={:?} stderr={:?}",
-        String::from_utf8_lossy(&out.stdout),
+        rest.contains(&format!("GOT-{name}")),
+        "SIG{name} must be forwarded to the child, got stdout={:?} stderr={:?}",
+        rest,
         String::from_utf8_lossy(&out.stderr)
     );
 }

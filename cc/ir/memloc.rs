@@ -32,7 +32,9 @@
 // that `i.0` and `symaddr i.0` name one object.
 //
 
-use super::{Function, Instruction, Opcode, PseudoId, PseudoKind};
+use super::escape::EscapeInfo;
+use super::facts::ConstMap;
+use super::{Function, GlobalDef, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::parse::ast::MemEffect;
 use crate::types::{TypeId, TypeTable};
 use std::collections::HashMap;
@@ -92,7 +94,8 @@ impl MemLoc {
     }
 }
 
-/// Every pseudo's unique defining instruction.
+/// Every pseudo's unique defining instruction, and the constant each one
+/// carries.
 ///
 /// Sound as a whole-function map with no dominance query, for the same
 /// reason `facts::ConstMap` is: SSA invariant I1 makes each target's
@@ -102,6 +105,7 @@ impl MemLoc {
 /// on `Function`.
 pub(crate) struct AddrMap {
     defs: HashMap<PseudoId, (usize, usize)>,
+    consts: ConstMap,
 }
 
 impl AddrMap {
@@ -117,20 +121,21 @@ impl AddrMap {
                 }
             }
         }
-        // An inline-asm output is the one second definition invariant I1
-        // exempts, so for those pseudos "the instruction that defines %n" is
-        // not a fact about the function. Leaving them out of the map makes
+        // An inline-asm output has no one defining instruction (see
+        // `Function::asm_defined_pseudos`). Leaving them out of the map makes
         // the walk stop there and answer `Unknown`, which is the safe end.
-        for bb in &func.blocks {
-            for insn in &bb.insns {
-                if let Some(ref asm) = insn.extra().asm_data {
-                    for out in &asm.outputs {
-                        defs.remove(&out.pseudo);
-                    }
-                }
-            }
+        for out in func.asm_defined_pseudos() {
+            defs.remove(&out);
         }
-        AddrMap { defs }
+        AddrMap {
+            defs,
+            consts: ConstMap::new(func),
+        }
+    }
+
+    /// The constants this function's pseudos carry, through their copies.
+    pub(crate) fn consts(&self) -> &ConstMap {
+        &self.consts
     }
 
     /// The one instruction defining `id`, if this function has it.
@@ -165,26 +170,15 @@ impl AddrMap {
             .map(|t| (types.size_bits(t), Some(t)))
     }
 
-    /// The constant a pseudo carries, if any: an address-arithmetic operand,
-    /// or the value of a store.
+    /// The constant a pseudo carries, if any, read as the `width`-bit
+    /// operand of the instruction consuming it: an address-arithmetic
+    /// operand, or the value of a store.
     ///
-    /// Only `Copy` is followed. A `SetVal` needs no arm of its own: its
-    /// constant lives in its *target pseudo*, so `func.const_val` above has
-    /// already answered for it, and an arm that asked `const_val` a second
-    /// time about the same pseudo could only repeat the `None` that got it
-    /// there.
-    pub(crate) fn const_operand(&self, func: &Function, id: PseudoId) -> Option<i128> {
-        let mut cur = id;
-        for _ in 0..MAX_ADDR_DEPTH {
-            if let Some(v) = func.const_val(cur) {
-                return Some(v);
-            }
-            match self.def(func, cur) {
-                Some(d) if d.op == Opcode::Copy && d.src.len() == 1 => cur = d.src[0],
-                _ => return None,
-            }
-        }
-        None
+    /// `ConstMap::get_at`, sign-extended: address arithmetic is modular at
+    /// pointer width, so `p + 0xff..f8` is `p - 8`, and a store's bytes are
+    /// the low `width` bits whichever extension holds them.
+    pub(crate) fn const_operand(&self, id: PseudoId, width: u32) -> Option<i128> {
+        self.consts.get_at(id, width, true)
     }
 
     /// The location `insn` accesses, for a `Load` or `Store`.
@@ -193,6 +187,120 @@ impl AddrMap {
             return MemLoc::unknown();
         };
         self.resolve(func, addr, insn.offset, insn.size, insn.typ)
+    }
+
+    /// The whole object `p` points into: its base and how far in `p` is,
+    /// with the extent left unknown.
+    pub(crate) fn object_of(&self, func: &Function, p: PseudoId) -> MemLoc {
+        self.resolve(func, p, 0, 0, None)
+    }
+
+    /// What memory `insn` may read and may write.
+    ///
+    /// **The one table of what an opcode touches.** Every memory pass asks
+    /// its question of this answer -- `loadfwd` whether a write may reach a
+    /// location, `dse` whether a read may, `effects` whether anything
+    /// touched is visible to a caller -- so the passes cannot disagree about
+    /// an opcode.
+    ///
+    /// Fail-closed at `Opcode::may_access_memory`: an opcode outside it
+    /// touches nothing, and one inside it that is not named here may touch
+    /// anything, so a new memory opcode is conservative by default.
+    /// `Instruction::is_memory_barrier` is not this question -- it answers
+    /// ordering, and omits `Store`, the block operations, the `Va*` family,
+    /// `Alloca` and `StackSave` entirely.
+    ///
+    /// `callee` says what a `Call` may do; it is asked of nothing else.
+    pub(crate) fn access(
+        &self,
+        func: &Function,
+        insn: &Instruction,
+        callee: impl FnOnce(&Instruction) -> MemEffect,
+    ) -> Access {
+        let mut access = self.access_by_opcode(func, insn, callee);
+        // A `Sym` target *is* storage, so an instruction that targets one
+        // writes the object it names -- a call returning a struct in
+        // registers writes its receiving local this way, with no `Store`
+        // anywhere. The extent is left unknown because `insn.size` describes
+        // a register, not the aggregate.
+        if let Some(t) = insn.target {
+            if matches!(
+                func.get_pseudo(t).map(|p| &p.kind),
+                Some(PseudoKind::Sym(_))
+            ) {
+                access
+                    .writes
+                    .push(Footprint::Object(self.object_of(func, t)));
+            }
+        }
+        access
+    }
+
+    fn access_by_opcode(
+        &self,
+        func: &Function,
+        insn: &Instruction,
+        callee: impl FnOnce(&Instruction) -> MemEffect,
+    ) -> Access {
+        let object = |slot: usize| match insn.src.get(slot) {
+            Some(&p) => Footprint::Object(self.object_of(func, p)),
+            None => Footprint::Anything,
+        };
+        match insn.op {
+            Opcode::Load => Access {
+                reads: vec![Footprint::At(self.location_of(func, insn))],
+                writes: Vec::new(),
+            },
+            // A store reads nothing: the bytes it does not cover stay as
+            // they were.
+            Opcode::Store => Access {
+                reads: Vec::new(),
+                writes: vec![Footprint::At(self.location_of(func, insn))],
+            },
+
+            // The extent is in the operands; `insn.size` on these is the
+            // pointer's width, not the access's. `memset` writes a constant
+            // and reads nothing.
+            Opcode::Memset => Access {
+                reads: Vec::new(),
+                writes: vec![object(0)],
+            },
+            // The destination is counted as read as well as written. Nothing
+            // requires it -- an overlapping source is the source's own
+            // footprint -- but it is the conservative side, and narrowing it
+            // would change which stores `dse` keeps.
+            Opcode::Memcpy | Opcode::Memmove => Access {
+                reads: vec![object(0), object(1)],
+                writes: vec![object(0)],
+            },
+
+            // A callee reaches what has escaped, and nothing else: **a call
+            // cannot touch a local whose address never left this function**,
+            // whatever it does. What its effect adds is that a `pure` or
+            // `const` callee writes none of it. Its reads are not narrowed
+            // by the effect: no pass needs a `const` callee to read nothing.
+            Opcode::Call => Access {
+                reads: vec![Footprint::Escaped],
+                writes: if callee(insn).may_write() {
+                    vec![Footprint::Escaped]
+                } else {
+                    Vec::new()
+                },
+            },
+
+            _ if !insn.op.may_access_memory() => Access::default(),
+
+            // `Asm`, `Fence`, `Alloca`, `StackSave`/`StackRestore`, the `Va*`
+            // family, `Setjmp`/`Longjmp`, every atomic, and any other memory
+            // opcode. A `"memory"` clobber can name a frame slot without
+            // naming an operand -- `asm("movl $1, -8(%rbp)")` is legal and
+            // reaches a local no analysis saw -- so being blunt here costs
+            // nothing and removes the class.
+            _ => Access {
+                reads: vec![Footprint::Anything],
+                writes: vec![Footprint::Anything],
+            },
+        }
     }
 
     /// Resolve an address pseudo to a base and a constant displacement.
@@ -230,13 +338,13 @@ impl AddrMap {
                 Opcode::Copy | Opcode::SymAddr if d.src.len() == 1 => cur = d.src[0],
                 Opcode::Add if d.src.len() == 2 => {
                     let (a, b) = (d.src[0], d.src[1]);
-                    if let Some(c) = self.const_operand(func, b) {
+                    if let Some(c) = self.const_operand(b, d.size) {
                         let Some(n) = add_offset(off, c) else {
                             return MemLoc::unknown();
                         };
                         off = n;
                         cur = a;
-                    } else if let Some(c) = self.const_operand(func, a) {
+                    } else if let Some(c) = self.const_operand(a, d.size) {
                         let Some(n) = add_offset(off, c) else {
                             return MemLoc::unknown();
                         };
@@ -247,7 +355,7 @@ impl AddrMap {
                     }
                 }
                 Opcode::Sub if d.src.len() == 2 => {
-                    let Some(c) = self.const_operand(func, d.src[1]) else {
+                    let Some(c) = self.const_operand(d.src[1], d.size) else {
                         return MemLoc::unknown();
                     };
                     let Some(n) = c.checked_neg().and_then(|n| add_offset(off, n)) else {
@@ -262,6 +370,78 @@ impl AddrMap {
             }
         }
         MemLoc::unknown()
+    }
+}
+
+/// The operand slots `op` dereferences in place: memory it reads or writes
+/// *through* the pointer there, which it does not keep.
+///
+/// `AddrMap::access` resolves exactly these slots, and escape analysis
+/// counts a use in one of them as an access rather than an escape -- so a
+/// pointer an instruction is given anywhere else (the value a `Store`
+/// writes, the byte a `Memset` fills with, a length) still escapes.
+pub(crate) fn accessed_slots(op: Opcode) -> &'static [usize] {
+    match op {
+        Opcode::Load | Opcode::Store | Opcode::Memset => &[0],
+        Opcode::Memcpy | Opcode::Memmove => &[0, 1],
+        _ => &[],
+    }
+}
+
+/// Somewhere an instruction may read or write.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) enum Footprint {
+    /// Exactly these bytes: a `Load` or `Store`, whose own width and
+    /// displacement are the access's.
+    At(MemLoc),
+    /// Somewhere inside the object this location is in, extent unknown: a
+    /// block operation, or a `Sym` an instruction targets.
+    Object(MemLoc),
+    /// Whatever a callee can reach: every global, every unknown address,
+    /// and every local whose address left this function.
+    Escaped,
+    /// Any memory at all, including a local whose address never left.
+    Anything,
+}
+
+impl Footprint {
+    /// May this footprint include any byte of `loc`?
+    pub(crate) fn may_touch(&self, loc: &MemLoc, mi: &ModuleInfo, esc: &EscapeInfo) -> bool {
+        match self {
+            Footprint::At(m) | Footprint::Object(m) => may_alias(m, loc, mi),
+            Footprint::Escaped => esc.is_captured(&loc.base),
+            Footprint::Anything => true,
+        }
+    }
+
+    /// Is everything this footprint may include in a local of this function
+    /// that nothing outside it can reach?
+    pub(crate) fn is_private(&self, esc: &EscapeInfo) -> bool {
+        match self {
+            Footprint::At(m) | Footprint::Object(m) => {
+                matches!(m.base, MemBase::Local(_)) && !esc.is_captured(&m.base)
+            }
+            Footprint::Escaped | Footprint::Anything => false,
+        }
+    }
+}
+
+/// What one instruction may read and may write.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub(crate) struct Access {
+    pub(crate) reads: Vec<Footprint>,
+    pub(crate) writes: Vec<Footprint>,
+}
+
+impl Access {
+    /// May this instruction read any byte of `loc`?
+    pub(crate) fn may_read(&self, loc: &MemLoc, mi: &ModuleInfo, esc: &EscapeInfo) -> bool {
+        self.reads.iter().any(|f| f.may_touch(loc, mi, esc))
+    }
+
+    /// May this instruction write any byte of `loc`?
+    pub(crate) fn may_write(&self, loc: &MemLoc, mi: &ModuleInfo, esc: &EscapeInfo) -> bool {
+        self.writes.iter().any(|f| f.may_touch(loc, mi, esc))
     }
 }
 
@@ -281,6 +461,27 @@ pub(crate) struct GlobalFacts {
 }
 
 impl GlobalFacts {
+    /// What `g`'s definition says. The one place a pass reads these three
+    /// flags off a `GlobalDef`.
+    pub(crate) fn of(g: &GlobalDef, types: &TypeTable) -> GlobalFacts {
+        GlobalFacts {
+            // Anywhere inside, not only on the object itself: a
+            // `struct { volatile int v; ... }` is not volatile-qualified, but
+            // every access to it still has to happen as written (C17 6.7.3p7).
+            is_volatile: types.contains_volatile(g.typ),
+            // A weak definition exists to be replaced at link time.
+            is_weak: g.symbol_attrs.weak,
+            // Thread-local storage is per-thread.
+            is_thread_local: g.is_thread_local,
+        }
+    }
+
+    /// Whether every access to this object happens in this program, to one
+    /// copy of it, defined here: none of the three flags is set.
+    pub(crate) fn is_plain(&self) -> bool {
+        !self.is_volatile && !self.is_weak && !self.is_thread_local
+    }
+
     /// What is assumed about a name this translation unit does not define.
     ///
     /// Everything. `extern volatile int x;` never reaches `module.globals`,
@@ -303,21 +504,11 @@ pub(crate) struct ModuleInfo {
 
 impl ModuleInfo {
     pub(crate) fn build(module: &super::Module, types: &TypeTable) -> ModuleInfo {
-        let mut globals = HashMap::new();
-        for g in &module.globals {
-            globals.insert(
-                g.name.clone(),
-                GlobalFacts {
-                    // Anywhere inside, not only on the object itself: a
-                    // `struct { volatile int v; ... }` is not
-                    // volatile-qualified, but every access to it still has to
-                    // happen as written (C17 6.7.3p7).
-                    is_volatile: types.contains_volatile(g.typ),
-                    is_weak: g.symbol_attrs.weak,
-                    is_thread_local: g.is_thread_local,
-                },
-            );
-        }
+        let globals = module
+            .globals
+            .iter()
+            .map(|g| (g.name.clone(), GlobalFacts::of(g, types)))
+            .collect();
         ModuleInfo {
             globals,
             effects: super::effects::EffectTable::build(module, types),
@@ -347,6 +538,11 @@ impl ModuleInfo {
             Some(f) if f.only_reads() => effect.min(MemEffect::Pure),
             _ => effect,
         }
+    }
+
+    /// `AddrMap::access`, with each call's effect from this module.
+    pub(crate) fn access(&self, am: &AddrMap, func: &Function, insn: &Instruction) -> Access {
+        am.access(func, insn, |call| self.call_effect(call))
     }
 }
 
@@ -413,14 +609,24 @@ pub(crate) fn may_alias(a: &MemLoc, b: &MemLoc, mi: &ModuleInfo) -> bool {
     }
 }
 
-/// Are these the same access -- the same bytes, read as the same kind of
-/// value?
+/// Do values of types `a` and `b` live in the same register file -- may one
+/// be handed over as the other without a conversion?
 ///
-/// The type test is `constglobal`'s pun guard: forwarding a `double` store
-/// into a `long` load hands over bits in the wrong register file. Comparing
-/// the *formats* catches it in both directions and distinguishes the two
-/// 128-bit float formats that a width cannot, while `int` against `long` at
-/// one width passes, which is right -- both are general registers.
+/// The pun guard: answering a `long` load with a `double` store's value, or
+/// with a `double` initializer, hands over bits in the wrong register file.
+/// Comparing the *formats* catches it in both directions and distinguishes
+/// the two 128-bit float formats that a width cannot, while `int` against
+/// `long` passes, which is right -- both are general registers.
+///
+/// A missing type has no float format, so it counts as a general register:
+/// only a floating type names the other file.
+pub(crate) fn same_register_file(types: &TypeTable, a: Option<TypeId>, b: Option<TypeId>) -> bool {
+    let format = |t: Option<TypeId>| t.and_then(|t| types.fp_format(t));
+    format(a) == format(b)
+}
+
+/// Are these the same access -- the same bytes, read as the same kind of
+/// value (`same_register_file`)?
 pub(crate) fn is_same_access(a: &MemLoc, b: &MemLoc, types: &TypeTable) -> bool {
     a.is_known()
         && a.base == b.base
@@ -428,8 +634,7 @@ pub(crate) fn is_same_access(a: &MemLoc, b: &MemLoc, types: &TypeTable) -> bool 
         && a.offset == b.offset
         && a.size == b.size
         && a.size != 0
-        && types.fp_format(a.typ.unwrap_or(types.int_id))
-            == types.fp_format(b.typ.unwrap_or(types.int_id))
+        && same_register_file(types, a.typ, b.typ)
 }
 
 #[cfg(test)]
@@ -653,6 +858,7 @@ mod tests {
             is_complete: true,
             transparent: false,
             anon_id: None,
+            tag_type: None,
         };
         let vol_struct = types.intern(crate::types::Type::struct_type(composite(vec![member(
             vol_int,
@@ -794,14 +1000,12 @@ mod tests {
         let mut asm = Instruction::new(Opcode::Asm);
         asm.extra_mut().asm_data = Some(Box::new(crate::ir::AsmData {
             template: String::new(),
-            outputs: vec![crate::ir::AsmConstraint {
-                pseudo: PseudoId(10),
-                name: None,
-                matching_output: None,
-                constraint: "=r".into(),
-                size: 64,
-                offset: 0,
-            }],
+            outputs: vec![crate::ir::AsmConstraint::new(
+                PseudoId(10),
+                "=r",
+                crate::target::Arch::X86_64,
+                64,
+            )],
             inputs: vec![],
             clobbers: vec![],
             goto_labels: vec![],
@@ -817,6 +1021,306 @@ mod tests {
             loc.base,
             MemBase::Unknown,
             "the asm redefines %10, so its pre-asm Copy says nothing about it"
+        );
+    }
+
+    /// The pun guard compares float formats, so a missing type is a general
+    /// register: it matches an integer and not a float.
+    #[test]
+    fn memloc_same_register_file_reads_float_formats() {
+        let types = host_types();
+        let (int, long, double) = (types.int_id, types.long_id, types.double_id);
+        assert!(same_register_file(&types, Some(int), Some(long)));
+        assert!(!same_register_file(&types, Some(long), Some(double)));
+        assert!(!same_register_file(
+            &types,
+            Some(types.float_id),
+            Some(double)
+        ));
+        assert!(same_register_file(&types, None, Some(int)));
+        assert!(!same_register_file(&types, None, Some(double)));
+        assert!(same_register_file(&types, None, None));
+    }
+
+    /// `GlobalFacts::of` reads the three flags off the definition, and a
+    /// global is plain only when none is set.
+    #[test]
+    fn memloc_global_facts_of_a_definition() {
+        let types = host_types();
+        let int = types.int_id;
+        let mut module = super::super::Module::default();
+        module.add_global("g", int, super::super::Initializer::None);
+        let plain = GlobalFacts::of(&module.globals[0], &types);
+        assert!(plain.is_plain());
+
+        let mut weak = module.globals[0].clone();
+        weak.symbol_attrs.weak = true;
+        let facts = GlobalFacts::of(&weak, &types);
+        assert!(facts.is_weak && !facts.is_plain());
+
+        let mut tls = module.globals[0].clone();
+        tls.is_thread_local = true;
+        let facts = GlobalFacts::of(&tls, &types);
+        assert!(facts.is_thread_local && !facts.is_plain());
+
+        assert!(!GlobalFacts::unknown().is_plain());
+    }
+
+    /// `two_locals` with one more instruction appended, and what `access`
+    /// says of it with every call `callee`.
+    fn access_of(insn: Instruction, callee: MemEffect) -> (Access, Function) {
+        let (mut f, _types) = two_locals();
+        f.blocks[0].add_insn(insn);
+        let am = AddrMap::build(&f);
+        let last = f.blocks[0].insns.last().unwrap();
+        (am.access(&f, last, |_| callee), f)
+    }
+
+    fn local_object(p: u32) -> Footprint {
+        Footprint::Object(MemLoc {
+            base: MemBase::Local(PseudoId(p)),
+            offset: Some(0),
+            size: 0,
+            typ: None,
+        })
+    }
+
+    fn block_op(op: Opcode, dest: PseudoId, src: PseudoId) -> Instruction {
+        Instruction::new(op)
+            .with_src3(dest, src, PseudoId(11))
+            .with_type_and_size(host_types().void_ptr_id, 64)
+    }
+
+    /// The opcode table: a load and a store touch exactly their bytes; a
+    /// block operation the objects its operands point into -- `memset`
+    /// writing one, `memcpy` and `memmove` reading both and writing the
+    /// first.
+    #[test]
+    fn memloc_access_of_loads_stores_and_block_ops() {
+        let (f, _types) = two_locals();
+        let am = AddrMap::build(&f);
+        let none = |_: &Instruction| MemEffect::Unknown;
+        let store = am.access(&f, insn_at(&f, 3), none);
+        assert!(store.reads.is_empty());
+        assert_eq!(
+            store.writes,
+            vec![Footprint::At(am.location_of(&f, insn_at(&f, 3)))]
+        );
+        let load = am.access(&f, insn_at(&f, 4), none);
+        assert_eq!(
+            load.reads,
+            vec![Footprint::At(am.location_of(&f, insn_at(&f, 4)))]
+        );
+        assert!(load.writes.is_empty());
+
+        // memset(&a, 8, 8): writes a, reads nothing.
+        let (set, _) = access_of(
+            block_op(Opcode::Memset, PseudoId(10), PseudoId(11)),
+            MemEffect::Unknown,
+        );
+        assert!(set.reads.is_empty());
+        assert_eq!(set.writes, vec![local_object(0)]);
+
+        // memcpy(&a, b, 8) and memmove: write a, read both.
+        for op in [Opcode::Memcpy, Opcode::Memmove] {
+            let (copy, _) = access_of(block_op(op, PseudoId(10), PseudoId(1)), MemEffect::Unknown);
+            assert_eq!(copy.reads, vec![local_object(0), local_object(1)], "{op:?}");
+            assert_eq!(copy.writes, vec![local_object(0)], "{op:?}");
+        }
+
+        // A block op with its destination 8 bytes in is still in `a`, at an
+        // unknown extent.
+        let (into, _) = access_of(
+            block_op(Opcode::Memset, PseudoId(12), PseudoId(11)),
+            MemEffect::Unknown,
+        );
+        let Footprint::Object(m) = &into.writes[0] else {
+            panic!("an object footprint");
+        };
+        assert_eq!(
+            (m.base.clone(), m.offset, m.size),
+            (MemBase::Local(PseudoId(0)), Some(8), 0)
+        );
+    }
+
+    /// A call reaches what has escaped: it reads it always, and writes it
+    /// unless its effect says it writes nothing. A `Sym` target is a write to
+    /// that object whatever the callee is.
+    #[test]
+    fn memloc_access_of_a_call() {
+        let types = host_types();
+        let call = |target| Instruction::call(target, "f", vec![], vec![], types.int_id, 32);
+        let (dirty, _) = access_of(call(None), MemEffect::Unknown);
+        assert_eq!(dirty.reads, vec![Footprint::Escaped]);
+        assert_eq!(dirty.writes, vec![Footprint::Escaped]);
+        for clean in [MemEffect::Pure, MemEffect::Const] {
+            let (a, _) = access_of(call(None), clean);
+            assert_eq!(a.reads, vec![Footprint::Escaped], "{clean:?}");
+            assert!(a.writes.is_empty(), "{clean:?}");
+        }
+        let (sret, _) = access_of(call(Some(PseudoId(1))), MemEffect::Const);
+        assert_eq!(sret.writes, vec![local_object(1)]);
+    }
+
+    /// What the table does not model may touch anything -- an asm, a fence,
+    /// an atomic, the `Va*` family, `Alloca` -- and an opcode that reaches no
+    /// memory, or a `Ret`, touches nothing.
+    #[test]
+    fn memloc_access_fails_closed() {
+        let anything = Access {
+            reads: vec![Footprint::Anything],
+            writes: vec![Footprint::Anything],
+        };
+        for op in [
+            Opcode::Asm,
+            Opcode::Fence,
+            Opcode::AtomicLoad,
+            Opcode::AtomicStore,
+            Opcode::AtomicFetchAdd,
+            Opcode::VaStart,
+            Opcode::VaCopy,
+            Opcode::Alloca,
+            Opcode::StackRestore,
+            Opcode::Setjmp,
+        ] {
+            let insn = Instruction::new(op).with_src(PseudoId(10));
+            assert_eq!(access_of(insn, MemEffect::Unknown).0, anything, "{op:?}");
+        }
+        for op in [Opcode::Ret, Opcode::Add, Opcode::Copy, Opcode::SymAddr] {
+            let insn = Instruction::new(op).with_src(PseudoId(10));
+            assert_eq!(
+                access_of(insn, MemEffect::Unknown).0,
+                Access::default(),
+                "{op:?}"
+            );
+        }
+    }
+
+    /// `accessed_slots` names exactly the operands `access` resolves, so
+    /// escape analysis and the memory passes agree about which pointer an
+    /// instruction dereferences.
+    #[test]
+    fn memloc_accessed_slots_are_what_access_resolves() {
+        let (f, _types) = two_locals();
+        let am = AddrMap::build(&f);
+        let insns = [
+            Instruction::load(PseudoId(30), PseudoId(1), 0, host_types().int_id, 32),
+            Instruction::store(PseudoId(11), PseudoId(1), 0, host_types().int_id, 32),
+            block_op(Opcode::Memset, PseudoId(1), PseudoId(11)),
+            block_op(Opcode::Memcpy, PseudoId(1), PseudoId(0)),
+            block_op(Opcode::Memmove, PseudoId(1), PseudoId(0)),
+        ];
+        for insn in &insns {
+            let access = am.access(&f, insn, |_| MemEffect::Unknown);
+            let mut touched: Vec<MemBase> = access
+                .reads
+                .iter()
+                .chain(&access.writes)
+                .map(|fp| match fp {
+                    Footprint::At(m) | Footprint::Object(m) => m.base.clone(),
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            touched.sort_by_key(|b| format!("{b:?}"));
+            touched.dedup();
+            let mut slots: Vec<MemBase> = accessed_slots(insn.op)
+                .iter()
+                .map(|&s| am.object_of(&f, insn.src[s]).base)
+                .collect();
+            slots.sort_by_key(|b| format!("{b:?}"));
+            assert_eq!(touched, slots, "{:?}", insn.op);
+        }
+        assert!(accessed_slots(Opcode::Call).is_empty());
+        assert!(accessed_slots(Opcode::Asm).is_empty());
+    }
+
+    /// A footprint against a location: an exact or object footprint by
+    /// `may_alias`; what a callee reaches only what has escaped; and only a
+    /// non-escaping local is private.
+    #[test]
+    fn memloc_footprint_touches_and_privacy() {
+        let (mut f, types) = two_locals();
+        // `b` escapes: its address goes to a call.
+        f.blocks[0].add_insn(Instruction::sym_addr(
+            PseudoId(16),
+            PseudoId(1),
+            types.long_id,
+        ));
+        f.blocks[0].add_insn(Instruction::call(
+            None,
+            "g",
+            vec![PseudoId(16)],
+            vec![types.long_id],
+            types.void_id,
+            0,
+        ));
+        let esc = EscapeInfo::analyze(&f, &types);
+        let mi = empty_module_info();
+        let at = |base: MemBase| MemLoc {
+            base,
+            offset: Some(0),
+            size: 32,
+            typ: None,
+        };
+        let (a, b, g) = (
+            at(MemBase::Local(PseudoId(0))),
+            at(MemBase::Local(PseudoId(1))),
+            at(MemBase::Global("g".into())),
+        );
+
+        assert!(local_object(0).may_touch(&a, &mi, &esc));
+        assert!(!local_object(0).may_touch(&b, &mi, &esc));
+        assert!(!Footprint::Escaped.may_touch(&a, &mi, &esc), "a never left");
+        assert!(Footprint::Escaped.may_touch(&b, &mi, &esc));
+        assert!(Footprint::Escaped.may_touch(&g, &mi, &esc));
+        assert!(Footprint::Anything.may_touch(&a, &mi, &esc));
+
+        assert!(local_object(0).is_private(&esc));
+        assert!(Footprint::At(a.clone()).is_private(&esc));
+        assert!(!local_object(1).is_private(&esc), "b escaped");
+        assert!(!Footprint::At(g).is_private(&esc));
+        assert!(!Footprint::Object(MemLoc::unknown()).is_private(&esc));
+        assert!(!Footprint::Escaped.is_private(&esc));
+        assert!(!Footprint::Anything.is_private(&esc));
+    }
+
+    /// `const_operand` answers through `ConstMap`: through a `Copy` or a
+    /// `Trunc`, sign-extended at the consumer's width, and not through a
+    /// chain narrower than that width.
+    #[test]
+    fn memloc_const_operand_reads_at_the_consumer_width() {
+        let types = host_types();
+        let (i8t, i32t, i64t) = (types.char_id, types.int_id, types.long_id);
+        let mut f = Function::new("f", types.void_id);
+        f.add_pseudo(Pseudo::val(PseudoId(1), -8));
+        f.add_pseudo(Pseudo::val(PseudoId(2), 0xffff_fff8));
+        f.add_pseudo(Pseudo::val(PseudoId(3), 300));
+        f.next_pseudo = 40;
+
+        let insn = |op, target, src, typ, size| {
+            Instruction::new(op)
+                .with_target(PseudoId(target))
+                .with_src(PseudoId(src))
+                .with_type_and_size(typ, size)
+        };
+        let mut bb = BasicBlock::new(BasicBlockId(0));
+        bb.add_insn(Instruction::new(Opcode::Entry));
+        bb.add_insn(insn(Opcode::Copy, 10, 1, i64t, 64));
+        bb.add_insn(insn(Opcode::Copy, 11, 10, i64t, 64));
+        bb.add_insn(insn(Opcode::Copy, 12, 2, i32t, 32));
+        bb.add_insn(insn(Opcode::Trunc, 13, 3, i8t, 8));
+        f.blocks.push(bb);
+        f.entry = BasicBlockId(0);
+
+        let am = AddrMap::build(&f);
+        assert_eq!(am.const_operand(PseudoId(1), 64), Some(-8));
+        assert_eq!(am.const_operand(PseudoId(11), 64), Some(-8), "copies");
+        assert_eq!(am.const_operand(PseudoId(12), 32), Some(-8), "at width");
+        assert_eq!(am.const_operand(PseudoId(12), 64), None, "narrower chain");
+        assert_eq!(am.const_operand(PseudoId(13), 8), Some(44), "a trunc");
+        assert_eq!(
+            am.const_operand(PseudoId(10), 64),
+            am.consts().get_at(PseudoId(10), 64, true)
         );
     }
 }

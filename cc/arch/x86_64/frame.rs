@@ -467,6 +467,19 @@ impl X86_64CodeGen {
             .collect()
     }
 
+    /// Push a CFI rule, when unwind tables are on.
+    ///
+    /// The rules are what lets anything walk out of the function --
+    /// `backtrace()`, a debugger, a profiler, the C++ runtime -- so they come
+    /// with `.cfi_startproc`, as gcc's `-fasynchronous-unwind-tables` does,
+    /// not with `-g`. Each follows the instruction that makes it true, so the
+    /// CFA and every saved register are described at every instruction.
+    pub(super) fn push_cfi(&mut self, rule: Directive) {
+        if self.base.emit_unwind_tables {
+            self.push_lir(X86Inst::Directive(rule));
+        }
+    }
+
     /// Emit function prologue: push rbp, save callee-saved registers, allocate stack
     ///
     /// `homes` are the register positions an `ms_abi` function spills to its
@@ -484,11 +497,9 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::Push {
             src: GpOperand::Reg(bp),
         });
-        if self.base.emit_debug {
-            // After pushq %rbp: CFA is now at %rsp+16, and %rbp is saved at CFA-16
-            self.push_lir(X86Inst::Directive(Directive::CfiDefCfaOffset(16)));
-            self.push_lir(X86Inst::Directive(Directive::cfi_offset("%rbp", -16)));
-        }
+        // After pushq %rbp: CFA is now at %rsp+16, and %rbp is saved at CFA-16
+        self.push_cfi(Directive::CfiDefCfaOffset(16));
+        self.push_cfi(Directive::cfi_offset("%rbp", -16));
 
         // Set up frame pointer
         self.push_lir(X86Inst::Mov {
@@ -496,10 +507,8 @@ impl X86_64CodeGen {
             src: GpOperand::Reg(sp),
             dst: GpOperand::Reg(bp),
         });
-        if self.base.emit_debug {
-            // After movq %rsp, %rbp: CFA is now tracked by %rbp+16
-            self.push_lir(X86Inst::Directive(Directive::cfi_def_cfa_register("%rbp")));
-        }
+        // After movq %rsp, %rbp: CFA is now tracked by %rbp+16
+        self.push_cfi(Directive::cfi_def_cfa_register("%rbp"));
         self.emit_win64_homing(homes);
 
         // Save callee-saved registers
@@ -508,12 +517,7 @@ impl X86_64CodeGen {
             self.push_lir(X86Inst::Push {
                 src: GpOperand::Reg(*reg),
             });
-            if self.base.emit_debug {
-                self.push_lir(X86Inst::Directive(Directive::cfi_offset(
-                    reg.name64(),
-                    cfi_offset,
-                )));
-            }
+            self.push_cfi(Directive::cfi_offset(reg.name64(), cfi_offset));
             cfi_offset -= 8;
         }
         self.emit_win64_xmm_saves();
@@ -721,17 +725,13 @@ impl X86_64CodeGen {
             .chain(alloc.spilled_xmm_args().iter().map(|s| s.pseudo))
             .collect();
 
-        // Detect if there's a hidden return pointer (for functions returning large structs)
-        // The __sret pseudo has arg_idx=0 and shifts all other arg indices by 1
-        let has_sret = func
-            .pseudos
-            .iter()
-            .any(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"));
-        let arg_idx_offset: u32 = if has_sret { 1 } else { 0 };
+        // A hidden return pointer (for functions returning large structs) is
+        // `Arg(0)` and shifts every declared parameter one `Arg` along.
+        let args = func.arg_types();
         let arg_pseudos = func.arg_pseudos();
 
         // If there's a hidden return pointer, it takes RDI, so params start from RSI
-        if has_sret {
+        if args.sret.is_some() {
             int_arg_idx = 1;
         }
 
@@ -743,7 +743,7 @@ impl X86_64CodeGen {
             if crate::abi::param_is_memory_class(*typ, types) {
                 continue;
             }
-            if !arg_pseudos.contains_key(&((i as u32) + arg_idx_offset)) {
+            if !arg_pseudos.contains_key(&args.arg_of_param(i)) {
                 Self::advance_arg_regs(
                     *typ,
                     types,
@@ -756,7 +756,7 @@ impl X86_64CodeGen {
             }
             // The pseudo for this argument; each early exit leaves the block.
             'arg: {
-                let Some(pseudo) = arg_pseudos.get(&((i as u32) + arg_idx_offset)) else {
+                let Some(pseudo) = arg_pseudos.get(&args.arg_of_param(i)) else {
                     break 'arg;
                 };
                 // A MEMORY-class struct arrives on the stack by
@@ -1100,10 +1100,10 @@ impl X86_64CodeGen {
                 .map(|t| types.size_bits(t).max(32))
                 .unwrap_or(insn.size.max(32));
 
-            let one_sse_ret = insn.extra().abi_info.as_ref().is_some_and(|ai| {
-                matches!(&ai.ret, ArgClass::Direct { classes, .. }
-                         if classes.len() == 1 && classes[0] == RegClass::Sse)
-            });
+            let one_sse_ret = matches!(
+                insn.ret_class(),
+                Some(ArgClass::Direct { classes, .. }) if classes.as_slice() == [RegClass::Sse]
+            );
             if one_sse_ret && is_struct_or_union && !is_complex {
                 // One SSE register holding the whole aggregate. The `Ret`
                 // carries its address, so move every byte at once: a lone
@@ -1422,7 +1422,11 @@ impl X86_64CodeGen {
     }
 
     /// Restore what the prologue saved, and return.
+    ///
+    /// An epilogue can sit mid-function, with more of the body after it, so
+    /// its rules are bracketed: the body's come back after the `ret`.
     fn emit_epilogue(&mut self) {
+        self.push_cfi(Directive::CfiRememberState);
         self.emit_win64_xmm_restores();
         let bp = Reg::bp();
         let num_callee_saved = self.callee_saved_regs.len();
@@ -1438,6 +1442,8 @@ impl X86_64CodeGen {
             let callee_saved: Vec<Reg> = self.callee_saved_regs.iter().rev().copied().collect();
             for reg in callee_saved {
                 self.push_lir(X86Inst::Pop { dst: reg });
+                // Its slot is below %rsp now, where a signal frame may land.
+                self.push_cfi(Directive::cfi_restore(reg.name64()));
             }
         } else {
             self.push_lir(X86Inst::Mov {
@@ -1447,6 +1453,10 @@ impl X86_64CodeGen {
             });
         }
         self.push_lir(X86Inst::Pop { dst: bp });
+        // %rbp is the caller's again, so the CFA follows %rsp.
+        self.push_cfi(Directive::cfi_def_cfa("%rsp", 8));
+        self.push_cfi(Directive::cfi_restore("%rbp"));
         self.push_lir(X86Inst::Ret);
+        self.push_cfi(Directive::CfiRestoreState);
     }
 }

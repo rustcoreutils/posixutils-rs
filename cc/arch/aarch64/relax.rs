@@ -11,7 +11,7 @@
 //
 
 use super::lir::Aarch64Inst;
-use crate::arch::lir::{Directive, EmitAsm};
+use crate::arch::lir::{Directive, EmitAsm, Label};
 use crate::target::Target;
 use std::collections::HashMap;
 
@@ -41,12 +41,12 @@ pub(super) fn relax_branches(insts: &mut [Aarch64Inst], target: &Target) {
     };
     loop {
         let mut offsets = Vec::with_capacity(insts.len());
-        let mut labels: HashMap<String, i64> = HashMap::new();
+        let mut labels: HashMap<Label, i64> = HashMap::new();
         let mut at = 0i64;
         for (inst, size) in insts.iter().zip(&sizes) {
             offsets.push(at);
             if let Aarch64Inst::Directive(Directive::BlockLabel(label)) = inst {
-                labels.insert(label.name(), at);
+                labels.insert(label.clone(), at);
             }
             at += i64::from(*size);
         }
@@ -58,7 +58,7 @@ pub(super) fn relax_branches(insts: &mut [Aarch64Inst], target: &Target) {
             };
             // A label this function does not define is out of reach of any
             // measurement, so it is out of range.
-            let in_range = labels.get(&label.name()).is_some_and(|&to| {
+            let in_range = labels.get(label).is_some_and(|&to| {
                 (COND_BRANCH_MIN..=COND_BRANCH_MAX).contains(&(to - offsets[i]))
             });
             if !in_range {

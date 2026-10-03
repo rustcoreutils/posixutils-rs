@@ -105,14 +105,12 @@ mod tests {
         let mut asm = Instruction::new(Opcode::Asm);
         asm.extra_mut().asm_data = Some(Box::new(AsmData {
             template: String::new(),
-            outputs: vec![AsmConstraint {
-                pseudo: PseudoId(0),
-                name: None,
-                matching_output: None,
-                constraint: "=m".into(),
-                size: 64,
-                offset: 0,
-            }],
+            outputs: vec![AsmConstraint::new(
+                PseudoId(0),
+                "=m",
+                crate::target::Arch::X86_64,
+                64,
+            )],
             inputs: vec![],
             clobbers: vec![],
             goto_labels: vec![],

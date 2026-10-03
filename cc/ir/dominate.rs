@@ -348,11 +348,6 @@ impl LevelQueue {
 /// Uses the linear time algorithm from:
 /// "A Linear Time Algorithm for Placing phi-nodes" by Sreedhar and Gao
 pub fn idf_compute(func: &Function, dom: &DomTree, alpha: &[BasicBlockId]) -> Vec<BasicBlockId> {
-    if dom.max_level() == 0 && func.blocks.len() > 1 {
-        // Dominator tree not built
-        return Vec::new();
-    }
-
     let mut walk = IdfWalk {
         func,
         dom,

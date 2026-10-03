@@ -21,7 +21,7 @@ use crate::arch::codegen::is_variadic_function;
 use crate::arch::lir::{
     complex_fp_info, plan_pair_move, CondCode, Directive, FpSize, OperandSize, PairMove, Symbol,
 };
-use crate::ir::{Function, Instruction, PseudoId, PseudoKind};
+use crate::ir::{Function, Instruction, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::HashSet;
 
@@ -324,7 +324,62 @@ impl Aarch64CodeGen {
         }
     }
 
+    /// Push a CFI rule, when unwind tables are on.
+    ///
+    /// The rules are what lets anything walk out of the function --
+    /// `backtrace()`, a debugger, a profiler, the C++ runtime -- so they come
+    /// with `.cfi_startproc`, as gcc's `-fasynchronous-unwind-tables` does,
+    /// not with `-g`. Each follows the instruction that makes it true, so the
+    /// CFA and every saved register are described at every instruction.
+    fn push_cfi(&mut self, rule: Directive) {
+        if self.base.emit_unwind_tables {
+            self.push_lir(Aarch64Inst::Directive(rule));
+        }
+    }
+
+    /// Move SP by `delta` bytes (negative allocates), the CFA being `cfa`
+    /// bytes above SP beforehand, describing the CFA after each instruction.
+    ///
+    /// The legalizer would split an immediate past 4095 into two
+    /// instructions behind one LIR entry, leaving the CFA wrong between them,
+    /// so the split is made here: the shifted part, then the rest.
+    fn emit_sp_adjust(&mut self, delta: i32, mut cfa: i32) {
+        let bytes = delta.abs();
+        let hi = bytes & !0xFFF;
+        let parts = if hi != 0 && hi != bytes && bytes < 1 << 24 {
+            vec![hi, bytes - hi]
+        } else {
+            vec![bytes]
+        };
+        for part in parts {
+            let (src1, src2, dst) = (Reg::SP, GpOperand::Imm(part.into()), Reg::SP);
+            let size = OperandSize::B64;
+            if delta < 0 {
+                self.push_lir(Aarch64Inst::Sub {
+                    size,
+                    src1,
+                    src2,
+                    dst,
+                });
+                cfa += part;
+            } else {
+                self.push_lir(Aarch64Inst::Add {
+                    size,
+                    src1,
+                    src2,
+                    dst,
+                });
+                cfa -= part;
+            }
+            self.push_cfi(Directive::CfiDefCfaOffset(cfa));
+        }
+    }
+
     /// Emit prologue: save fp/lr, allocate stack, save callee-saved registers
+    ///
+    /// The frame record sits at the bottom of the frame, so once X29 points at
+    /// it the CFA is X29 + `total_frame` for the rest of the function, however
+    /// `alloca` moves SP.
     fn emit_prologue(&mut self, total_frame: i32, callee_saved: &[Reg], callee_saved_fp: &[VReg]) {
         let fp = Reg::fp();
         let lr = Reg::lr();
@@ -333,97 +388,46 @@ impl Aarch64CodeGen {
         // For large frames, we must use separate sub/add and stp/ldp instructions
         const MAX_STP_OFFSET: i32 = 504;
 
-        if total_frame > 0 {
-            if total_frame <= MAX_STP_OFFSET {
-                // Combined push and allocate: stp x29, x30, [sp, #-N]!
-                self.push_lir(Aarch64Inst::Stp {
-                    size: OperandSize::B64,
-                    src1: fp,
-                    src2: lr,
-                    addr: MemAddr::PreIndex {
-                        base: Reg::SP,
-                        offset: -total_frame,
-                    },
-                });
-            } else {
-                // Large frame: separate sub and stp
-                self.push_lir(Aarch64Inst::Sub {
-                    size: OperandSize::B64,
-                    src1: Reg::SP,
-                    src2: GpOperand::Imm(total_frame.into()),
-                    dst: Reg::SP,
-                });
-                // stp x29, x30, [sp]
-                self.push_lir(Aarch64Inst::Stp {
-                    size: OperandSize::B64,
-                    src1: fp,
-                    src2: lr,
-                    addr: MemAddr::Base(Reg::SP),
-                });
-            }
-            if self.base.emit_debug {
-                // CFA is now at sp + total_frame (previous SP value)
-                self.push_lir(Aarch64Inst::Directive(Directive::cfi_def_cfa(
-                    "sp",
-                    total_frame,
-                )));
-                // x29 (fp) is saved at [sp+0], x30 (lr) is saved at [sp+8]
-                self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
-                    "x29",
-                    -total_frame,
-                )));
-                self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
-                    "x30",
-                    -(total_frame - 8),
-                )));
-            }
-            // Set up frame pointer: mov x29, sp
-            self.push_lir(Aarch64Inst::Mov {
-                size: OperandSize::B64,
-                src: GpOperand::Reg(Reg::SP),
-                dst: fp,
-            });
-            if self.base.emit_debug {
-                // CFA is now tracked by x29 + total_frame
-                self.push_lir(Aarch64Inst::Directive(Directive::cfi_def_cfa_register(
-                    "x29",
-                )));
-            }
-
-            // Save callee-saved GP registers in pairs
-            self.save_callee_saved_gp_regs(total_frame, callee_saved);
-
-            // Save callee-saved FP registers in pairs
-            let gp_offset = 16 + (callee_saved.len().div_ceil(2) as i32 * 16);
-            self.save_callee_saved_fp_regs(total_frame, callee_saved_fp, gp_offset);
-        } else {
-            // Minimal frame: stp x29, x30, [sp, #-16]!
+        if total_frame <= MAX_STP_OFFSET {
+            // Combined push and allocate: stp x29, x30, [sp, #-N]!
             self.push_lir(Aarch64Inst::Stp {
                 size: OperandSize::B64,
                 src1: fp,
                 src2: lr,
                 addr: MemAddr::PreIndex {
                     base: Reg::SP,
-                    offset: -16,
+                    offset: -total_frame,
                 },
             });
-            if self.base.emit_debug {
-                self.push_lir(Aarch64Inst::Directive(Directive::cfi_def_cfa("sp", 16)));
-                self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset("x29", -16)));
-                self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset("x30", -8)));
-            }
-            // mov x29, sp
-            self.push_lir(Aarch64Inst::Mov {
+            self.push_cfi(Directive::CfiDefCfaOffset(total_frame));
+        } else {
+            // Large frame: separate sub and stp
+            self.emit_sp_adjust(-total_frame, 0);
+            // stp x29, x30, [sp]
+            self.push_lir(Aarch64Inst::Stp {
                 size: OperandSize::B64,
-                src: GpOperand::Reg(Reg::SP),
-                dst: fp,
+                src1: fp,
+                src2: lr,
+                addr: MemAddr::Base(Reg::SP),
             });
-            if self.base.emit_debug {
-                self.push_lir(Aarch64Inst::Directive(Directive::cfi_def_cfa_register(
-                    "x29",
-                )));
-            }
         }
+        // x29 (fp) is saved at [sp+0], x30 (lr) is saved at [sp+8]
+        self.push_cfi(Directive::cfi_offset("x29", -total_frame));
+        self.push_cfi(Directive::cfi_offset("x30", -(total_frame - 8)));
+        // Set up frame pointer: mov x29, sp
+        self.push_lir(Aarch64Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::SP),
+            dst: fp,
+        });
+        self.push_cfi(Directive::cfi_def_cfa_register("x29"));
+
+        // Save callee-saved GP registers in pairs
+        self.save_callee_saved_gp_regs(total_frame, callee_saved);
+
+        // Save callee-saved FP registers in pairs
+        let gp_offset = 16 + (callee_saved.len().div_ceil(2) as i32 * 16);
+        self.save_callee_saved_fp_regs(total_frame, callee_saved_fp, gp_offset);
     }
 
     /// Copy `bytes` bytes from `[src]` to `[dst]`, in a counted loop over the
@@ -516,18 +520,14 @@ impl Aarch64CodeGen {
                         offset,
                     },
                 });
-                if self.base.emit_debug {
-                    let cfi_offset1 = -(total_frame - offset);
-                    let cfi_offset2 = -(total_frame - offset - 8);
-                    self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
-                        callee_saved[i].name64(),
-                        cfi_offset1,
-                    )));
-                    self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
-                        callee_saved[i + 1].name64(),
-                        cfi_offset2,
-                    )));
-                }
+                self.push_cfi(Directive::cfi_offset(
+                    callee_saved[i].name64(),
+                    -(total_frame - offset),
+                ));
+                self.push_cfi(Directive::cfi_offset(
+                    callee_saved[i + 1].name64(),
+                    -(total_frame - offset - 8),
+                ));
                 i += 2;
             } else {
                 self.push_lir(Aarch64Inst::Str {
@@ -538,13 +538,10 @@ impl Aarch64CodeGen {
                         offset,
                     },
                 });
-                if self.base.emit_debug {
-                    let cfi_offset = -(total_frame - offset);
-                    self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
-                        callee_saved[i].name64(),
-                        cfi_offset,
-                    )));
-                }
+                self.push_cfi(Directive::cfi_offset(
+                    callee_saved[i].name64(),
+                    -(total_frame - offset),
+                ));
                 i += 1;
             }
             offset += 16;
@@ -571,18 +568,14 @@ impl Aarch64CodeGen {
                         offset,
                     },
                 });
-                if self.base.emit_debug {
-                    let cfi_offset1 = -(total_frame - offset);
-                    let cfi_offset2 = -(total_frame - offset - 8);
-                    self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
-                        callee_saved_fp[i].name_d(),
-                        cfi_offset1,
-                    )));
-                    self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
-                        callee_saved_fp[i + 1].name_d(),
-                        cfi_offset2,
-                    )));
-                }
+                self.push_cfi(Directive::cfi_offset(
+                    callee_saved_fp[i].name_d(),
+                    -(total_frame - offset),
+                ));
+                self.push_cfi(Directive::cfi_offset(
+                    callee_saved_fp[i + 1].name_d(),
+                    -(total_frame - offset - 8),
+                ));
                 i += 2;
             } else {
                 self.push_lir(Aarch64Inst::StrFp {
@@ -593,13 +586,10 @@ impl Aarch64CodeGen {
                         offset,
                     },
                 });
-                if self.base.emit_debug {
-                    let cfi_offset = -(total_frame - offset);
-                    self.push_lir(Aarch64Inst::Directive(Directive::cfi_offset(
-                        callee_saved_fp[i].name_d(),
-                        cfi_offset,
-                    )));
-                }
+                self.push_cfi(Directive::cfi_offset(
+                    callee_saved_fp[i].name_d(),
+                    -(total_frame - offset),
+                ));
                 i += 1;
             }
             offset += 16;
@@ -781,12 +771,7 @@ impl Aarch64CodeGen {
         let spilled_pseudos: HashSet<PseudoId> =
             alloc.spilled_args().iter().map(|s| s.pseudo).collect();
 
-        // Detect sret for arg_idx offset
-        let has_sret = func
-            .pseudos
-            .iter()
-            .any(|p| matches!(p.kind, PseudoKind::Arg(0)) && p.name.as_deref() == Some("__sret"));
-        let arg_idx_offset: u32 = if has_sret { 1 } else { 0 };
+        let args = func.arg_types();
         let arg_pseudos = func.arg_pseudos();
 
         for (i, (_name, typ)) in func.params.iter().enumerate() {
@@ -837,7 +822,7 @@ impl Aarch64CodeGen {
             // The pseudo for this argument; each early exit leaves the block.
             // With sret, params have arg_idx = i + 1, but still use arg_regs[i].
             'arg: {
-                let Some(pseudo) = arg_pseudos.get(&((i as u32) + arg_idx_offset)) else {
+                let Some(pseudo) = arg_pseudos.get(&args.arg_of_param(i)) else {
                     break 'arg;
                 };
                 // Skip pseudos already stored via spilled_args
@@ -1456,14 +1441,22 @@ impl Aarch64CodeGen {
             }
         }
 
+        // An epilogue can sit mid-function, with more of the body after it,
+        // so its rules are bracketed: the body's come back after the `ret`.
+        self.push_cfi(Directive::CfiRememberState);
+
         // Epilogue: reset SP to FP
         self.push_lir(Aarch64Inst::Mov {
             size: OperandSize::B64,
             src: GpOperand::Reg(Reg::X29),
             dst: Reg::SP,
         });
+        // From here the CFA follows SP, since X29 is about to be reloaded.
+        self.push_cfi(Directive::cfi_def_cfa("sp", self.frame_size));
 
-        // Restore callee-saved registers
+        // Restore callee-saved registers. Each is described as restored once
+        // reloaded: its slot is about to fall below SP, where a signal frame
+        // may overwrite it.
         if self.frame_size > 16 {
             let mut offset = 16;
             let mut i = 0;
@@ -1478,6 +1471,8 @@ impl Aarch64CodeGen {
                         dst1: callee_saved[i],
                         dst2: callee_saved[i + 1],
                     });
+                    self.push_cfi(Directive::cfi_restore(callee_saved[i].name64()));
+                    self.push_cfi(Directive::cfi_restore(callee_saved[i + 1].name64()));
                     i += 2;
                 } else {
                     self.push_lir(Aarch64Inst::Ldr {
@@ -1488,6 +1483,7 @@ impl Aarch64CodeGen {
                         },
                         dst: callee_saved[i],
                     });
+                    self.push_cfi(Directive::cfi_restore(callee_saved[i].name64()));
                     i += 1;
                 }
                 offset += 16;
@@ -1506,6 +1502,8 @@ impl Aarch64CodeGen {
                         dst1: callee_saved_fp[i],
                         dst2: callee_saved_fp[i + 1],
                     });
+                    self.push_cfi(Directive::cfi_restore(callee_saved_fp[i].name_d()));
+                    self.push_cfi(Directive::cfi_restore(callee_saved_fp[i + 1].name_d()));
                     i += 2;
                 } else {
                     self.push_lir(Aarch64Inst::LdrFp {
@@ -1516,6 +1514,7 @@ impl Aarch64CodeGen {
                         },
                         dst: callee_saved_fp[i],
                     });
+                    self.push_cfi(Directive::cfi_restore(callee_saved_fp[i].name_d()));
                     i += 1;
                 }
                 offset += 16;
@@ -1525,11 +1524,7 @@ impl Aarch64CodeGen {
         // Restore fp/lr and deallocate stack
         // AArch64 ldp post-indexed addressing has a limited offset range: [-512, 504]
         const MAX_LDP_OFFSET: i32 = 504;
-        let dealloc = if self.frame_size > 0 {
-            self.frame_size
-        } else {
-            16
-        };
+        let dealloc = self.frame_size;
 
         if dealloc <= MAX_LDP_OFFSET {
             // Combined restore and deallocate: ldp x29, x30, [sp], #N
@@ -1542,6 +1537,9 @@ impl Aarch64CodeGen {
                 dst1: Reg::fp(),
                 dst2: Reg::lr(),
             });
+            self.push_cfi(Directive::cfi_restore("x30"));
+            self.push_cfi(Directive::cfi_restore("x29"));
+            self.push_cfi(Directive::CfiDefCfaOffset(0));
         } else {
             // Large frame: separate ldp and add
             // ldp x29, x30, [sp]
@@ -1551,14 +1549,11 @@ impl Aarch64CodeGen {
                 dst1: Reg::fp(),
                 dst2: Reg::lr(),
             });
-            // add sp, sp, #dealloc
-            self.push_lir(Aarch64Inst::Add {
-                size: OperandSize::B64,
-                src1: Reg::SP,
-                src2: GpOperand::Imm(dealloc.into()),
-                dst: Reg::SP,
-            });
+            self.push_cfi(Directive::cfi_restore("x30"));
+            self.push_cfi(Directive::cfi_restore("x29"));
+            self.emit_sp_adjust(dealloc, dealloc);
         }
         self.push_lir(Aarch64Inst::Ret);
+        self.push_cfi(Directive::CfiRestoreState);
     }
 }

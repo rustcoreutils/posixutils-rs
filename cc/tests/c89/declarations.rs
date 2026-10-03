@@ -1019,3 +1019,222 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("aligned_attr_reduces", code, &[]), 0);
 }
+
+/// A tag named before its enum is defined -- `typedef enum foo E;` ahead of
+/// `enum foo { ... }`, a GNU forward enum gcc accepts -- is the complete
+/// type once the definition is seen: a typedef, a member and a pointee
+/// declared through the forward reference all take the enum's size and
+/// signedness. The forward reference used to stay a 0-byte incomplete type,
+/// so `sizeof (E)` was rejected and a member of type `E` was stored in no
+/// bytes at all (gcc.c-torture/execute/930408-1).
+#[test]
+fn c89_forward_enum_is_completed_by_its_definition() {
+    let src = r#"
+typedef enum foo E;
+enum foo *fp;
+enum foo { e0, e1, e2 = 0x12345678 };
+enum big;
+typedef enum big B;
+enum big { HUGE = 0x80000000u };
+struct { E eval; int after; } s;
+struct { B b; } t;
+int main(void) {
+    enum foo v = e1;
+    fp = &v;
+    if (sizeof(E) != sizeof(int) || sizeof s != 2 * sizeof(int)) return 1;
+    s.eval = e2;
+    s.after = 7;
+    if (s.eval != e2 || s.after != 7 || *fp != e1) return 2;
+    t.b = HUGE;
+    if (t.b < 0 || sizeof(B) != 4) return 3;
+    switch (s.eval) { case e2: break; default: return 4; }
+    return 0;
+}
+"#;
+    crate::common::compile_and_run_everywhere("forward_enum", src);
+}
+
+/// A *qualified* reference to a tag before its definition -- `const enum E`,
+/// `volatile enum E`, `const struct S` -- is the same type as the tag once
+/// the definition is seen, qualifiers and all. Each such reference is its
+/// own `TypeId` (a qualified copy of the tag's type), and the definition
+/// used to complete only the tag's own entry: the copies stayed incomplete,
+/// so `sizeof` of a `const enum` typedef was rejected, a large enumerator
+/// would have been truncated through it, and `void show(const enum col *)`
+/// declared before the enum and defined after it was "conflicting types".
+#[test]
+fn c89_qualified_forward_tag_is_completed_by_its_definition() {
+    let src = r#"
+enum big;
+typedef const enum big CB;
+typedef volatile enum big VB;
+enum pos;
+typedef const enum pos CP;
+enum col;
+void show(const enum col *);
+struct holder { const enum col *p; volatile enum col *q; };
+struct S;
+typedef const struct S CS;
+enum big { NEG = -1, LARGE = 0x7fffffffffLL };
+enum pos { P0, PHIGH = 0x80000000u };
+enum col { RED, GREEN = 5 };
+struct S { long a, b; };
+static int seen;
+void show(const enum col *c) { seen = *c; }
+int main(void) {
+    CB cb = LARGE;
+    VB vb = LARGE;
+    CP cp = PHIGH;
+    CS cs = { 1, 2 };
+    enum col c = GREEN, *pc = &c;
+    const enum col *qc = pc;
+    struct holder h = { qc, &c };
+    if (sizeof(CB) != sizeof(long long) || sizeof(VB) != sizeof(long long)) return 1;
+    if (cb != LARGE || vb != LARGE || cb >> 32 != 0x7f) return 2;
+    vb = NEG;
+    if (vb >= 0) return 3;
+    if (sizeof(CP) != 4 || cp <= 0 || cp != 0x80000000u) return 4;
+    if (sizeof(CS) != 2 * sizeof(long) || cs.b != 2) return 5;
+    show(h.p);
+    if (seen != GREEN) return 6;
+    *h.q = RED;
+    show(qc);
+    if (seen != RED || sizeof *h.p != sizeof(int)) return 7;
+    return 0;
+}
+"#;
+    crate::common::compile_and_run_everywhere("qualified_forward_tag", src);
+}
+
+/// A tag defined in an inner scope is a new type that hides the outer one
+/// (C17 6.7.2.3p5), even while the outer tag is still incomplete: the
+/// definition inside `inner` must not complete the file-scope `struct S` or
+/// `enum E`, which get their own definitions later. The inner definition used
+/// to complete the outer forward declaration, so `g->y` named no member. A
+/// qualified redeclaration on either side of the enum's definition --
+/// `extern const enum E ce;` -- is one object, not "conflicting types".
+#[test]
+fn c89_inner_tag_definition_does_not_complete_the_outer_tag() {
+    let src = r#"
+struct S;
+const struct S *g;
+enum E;
+extern const enum E ce;
+static int inner(void) {
+    struct S { int a; } s = { 3 };
+    enum E { IA = 7 } e = IA;
+    return s.a + (int)sizeof s + e;
+}
+struct S { long x, y; };
+enum E { EA, EB = 3000000000u };
+extern const enum E ce;
+const enum E ce = EB;
+int main(void) {
+    static struct S t = { 1, 2 };
+    g = &t;
+    if (inner() != 3 + (int)sizeof(int) + 7) return 1;
+    if (sizeof *g != 2 * sizeof(long) || g->y != 2) return 2;
+    if (sizeof ce != 4 || ce <= 0 || ce != 3000000000u) return 3;
+    return 0;
+}
+"#;
+    crate::common::compile_and_run_everywhere("inner_tag_definition", src);
+}
+
+/// A typedef name or `typeof` names the tag visible where *it* was declared,
+/// not whatever an inner scope has since given that tag's name to.
+///
+/// The type behind `TS` used to be found again by looking its tag up by name
+/// at the point of use, so in a block that defines its own `struct S`, `TS x;`
+/// declared `x` with the inner type: `sizeof x` was the inner one's, and
+/// `v.a` had "no member named 'a'".
+#[test]
+fn c89_typedef_names_its_own_tag_under_an_inner_one() {
+    let src = r#"
+struct S { int a; };
+typedef struct S TS;
+typedef const struct S CTS;
+struct S *gp;
+static int f1(void) { struct S { char c[50]; }; TS x; return sizeof x; }
+static int f2(void) { struct S { char c[50]; }; CTS x = { 0 }; return sizeof x; }
+static int f3(void) { struct S { char c[50]; }; TS *p = 0; return sizeof *p; }
+static int f4(void) { struct S { char c[50]; }; return sizeof *gp; }
+static int f5(void) { struct S { char c[50]; }; __typeof__(*gp) y; return sizeof y; }
+static int f6(void) { struct S { char c[50]; }; struct W { TS m; int k; } w; return sizeof w; }
+static int f7(void) { struct S { char c[50]; }; TS arr[2]; return sizeof arr; }
+static int f8(void) { struct S { char c[50]; }; TS v = { 7 }; return v.a; }
+int main(void) {
+    if (f1() != sizeof(int) || f2() != sizeof(int) || f3() != sizeof(int)) return 1;
+    if (f4() != sizeof(int) || f5() != sizeof(int)) return 2;
+    if (f6() != 2 * sizeof(int) || f7() != 2 * sizeof(int)) return 3;
+    if (f8() != 7) return 4;
+    return 0;
+}
+"#;
+    crate::common::compile_and_run_everywhere("typedef_under_inner_tag", src);
+}
+
+/// C17 6.7.2.3p7: `struct S;` alone declares a new incomplete type in its
+/// scope, hiding an outer `struct S`, and a definition later in that scope
+/// completes the new one. It used to name the outer tag, so a pointer
+/// declared between the two pointed at the outer type: `sizeof *p` was 4 for
+/// a 50-byte struct. With anything else written ahead of it (`const`,
+/// `static`) it is an empty declaration that redeclares nothing.
+#[test]
+fn c89_bare_tag_declaration_hides_the_outer_tag() {
+    let src = r#"
+struct S { int a; };
+static int hidden(void) {
+    struct S;
+    struct S *p = 0;
+    struct S { char c[50]; };
+    return sizeof *p;
+}
+static int qualified(void) {
+    const struct S;
+    struct S *p = 0;
+    return sizeof *p;
+}
+static int nested(void) {
+    struct S;
+    {
+        struct S { char c[9]; } inner;
+        (void)inner;
+    }
+    struct S { char c[3]; } x;
+    return sizeof x;
+}
+int main(void) {
+    if (hidden() != 50) return 1;
+    if (qualified() != sizeof(int)) return 2;
+    if (nested() != 3) return 3;
+    return 0;
+}
+"#;
+    crate::common::compile_and_run_everywhere("bare_tag_declaration", src);
+}
+
+/// `sizeof` of an expression of incomplete structure type is a constraint
+/// violation (C17 6.5.3.4p1), whichever tag is incomplete: one never
+/// defined, one hidden by `struct S;`, or one whose name an inner scope has
+/// given a complete definition. The last was accepted because the pointee's
+/// tag was looked up by name and found the inner definition.
+#[test]
+fn c89_sizeof_an_incomplete_struct_expression_is_rejected() {
+    let what = "invalid application of 'sizeof' to incomplete type 'struct S'";
+    crate::common::compile_expect_error(
+        "sizeof_incomplete_never_defined",
+        "struct S; int f(struct S *p) { return sizeof *p; }\n",
+        what,
+    );
+    crate::common::compile_expect_error(
+        "sizeof_incomplete_hidden",
+        "struct S { int a; };\nint f(void) { struct S; struct S *p = 0; return sizeof *p; }\n",
+        what,
+    );
+    crate::common::compile_expect_error(
+        "sizeof_incomplete_under_inner_tag",
+        "struct S; struct S *gp;\nint f(void) { struct S { char c; }; return sizeof(*gp); }\n",
+        what,
+    );
+}

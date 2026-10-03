@@ -385,7 +385,18 @@ impl Parser<'_> {
         if self.types.is_scalar(typ) {
             self.strip_scalar_braces(init, 0);
         } else if let ExprKind::InitList { elements } = &mut init.kind {
-            self.walk_initializer_elements(typ, elements);
+            // `char s[4] = {"abc"}` is the string in optional braces
+            // (6.7.9p14), checked as the string -- not as a pointer stored
+            // into `s[0]`, which was a warning gcc does not give.
+            let braced_string = (self.types.kind(typ) == TypeKind::Array)
+                .then(|| self.types.base_type(typ))
+                .flatten()
+                .and_then(|elem| self.braced_string_initializer(elem, elements))
+                .cloned();
+            match braced_string {
+                Some(string) => self.check_initializer_types(typ, &string),
+                None => self.walk_initializer_elements(typ, elements),
+            }
         }
     }
 
@@ -415,6 +426,10 @@ impl Parser<'_> {
     /// [`Self::walk_initializer`] for the elements of a brace list
     /// initializing an aggregate of type `typ`.
     pub(crate) fn walk_initializer_elements(&mut self, typ: TypeId, elements: &mut [InitElement]) {
+        // Positional elements after a designator chain continue inside it
+        // (6.7.9p17); spelling out where they land lets the one-level cursor
+        // below -- and everything downstream -- place them.
+        crate::parse::ast::spell_out_designator_continuations(self.types, elements, typ);
         let kind = self.types.kind(typ);
         let members: Vec<TypeId> = match kind {
             // A union's positional initializer is for its first named member.
@@ -439,7 +454,9 @@ impl Parser<'_> {
         // The position of the next positional element: an index into
         // `members` for a struct, or `None` once it can no longer be known.
         let mut next: Option<usize> = Some(0);
-        for element in elements {
+        let mut idx = 0;
+        while idx < elements.len() {
+            let element = &elements[idx];
             let sub = if element.designators.is_empty() {
                 let sub = match kind {
                     TypeKind::Array => self.types.base_type(typ),
@@ -448,15 +465,7 @@ impl Parser<'_> {
                     }
                     _ => None,
                 };
-                // A non-list value for an aggregate member is brace elision:
-                // it consumes an unknown share of the elements after it --
-                // unless it initializes the whole member, as a string
-                // literal for a character array or a value of the member's
-                // own type does.
-                let elided = sub.is_some_and(|t| {
-                    crate::parse::ast::is_brace_elision_candidate(self.types, element, t)
-                });
-                next = if elided { None } else { next.map(|i| i + 1) };
+                next = next.map(|i| i + 1);
                 sub
             } else {
                 let resolved =
@@ -474,17 +483,49 @@ impl Parser<'_> {
                                 .position(|m| m.name == *name)
                         })
                         .map(|i| i + 1),
+                    // An anonymous member, by its place in the member list.
+                    Some(Designator::Member(position)) if kind == TypeKind::Struct => {
+                        self.types.composite(typ).map(|c| {
+                            c.members[..(*position + 1).min(c.members.len())]
+                                .iter()
+                                .filter(|m| m.is_initializable())
+                                .count()
+                        })
+                    }
                     _ => None,
                 };
                 resolved
             };
+            // A non-list value for an aggregate subobject is brace elision
+            // (6.7.9p20): it and the elements after it that the subobject
+            // takes are walked as the subobject's own list would be, so a
+            // designator inside a braced element among them is checked
+            // against the subobject it lands in.
+            if let Some(t) = sub
+                .filter(|&t| crate::parse::ast::is_brace_elision_candidate(self.types, element, t))
+            {
+                let span = crate::parse::ast::brace_elision_span(self.types, elements, idx, t);
+                // The first element's designators chose `t`; inside `t`'s list
+                // the element is positional.
+                let chosen = std::mem::take(&mut elements[idx].designators);
+                self.walk_initializer_elements(t, &mut elements[span.clone()]);
+                elements[idx].designators = chosen;
+                idx = span.end;
+                continue;
+            }
+            let element = &mut elements[idx];
+            idx += 1;
             if let Some(sub) = sub {
                 self.walk_initializer(sub, &mut element.value);
                 // A nested list is counted against its own subobject, and a
                 // scalar's value converted to it as by assignment (6.7.9p11),
                 // as the outermost initializer is against the object.
                 self.check_excess_initializers(sub, &element.value);
-                if self.types.is_scalar(sub) {
+                // So is a string literal's fit to the array it initializes
+                // (6.7.9p14-15) -- the one unbraced form an array takes here.
+                let unbraced_array = self.types.kind(sub) == TypeKind::Array
+                    && !matches!(element.value.kind, ExprKind::InitList { .. });
+                if self.types.is_scalar(sub) || unbraced_array {
                     self.check_initializer_types(sub, &element.value);
                 }
             }
@@ -531,6 +572,11 @@ impl Parser<'_> {
                     }
                     self.types.base_type(current)?
                 }
+                // Only the parser writes one, and only for a member that is
+                // there.
+                Designator::Member(position) => {
+                    self.types.composite(current)?.members.get(*position)?.typ
+                }
             };
         }
         Some(current)
@@ -555,7 +601,7 @@ impl Parser<'_> {
             let end = match designator {
                 Designator::Index(i) => *i,
                 Designator::IndexRange(_, hi) => *hi,
-                Designator::Field(_) => continue,
+                Designator::Field(_) | Designator::Member(_) => continue,
             };
             if end >= capacity as i64 {
                 diag::error_args(
@@ -571,69 +617,48 @@ impl Parser<'_> {
     /// Report an initializer list with more elements than the object it
     /// initializes can hold (C17 6.7.9p2).
     ///
-    /// Deliberately narrow, because the count is only unambiguous in the
-    /// simple cases. A designator places an element anywhere, so a list
-    /// containing one is left alone. Brace elision lets an aggregate member
-    /// consume several consecutive elements -- `struct P p[2] = {1,2,3,4}`
-    /// fills two two-field structs -- so only aggregates whose elements or
-    /// members are all scalars are counted. A union takes one initializer,
-    /// whatever it holds, and a flexible array member has no bound at all.
-    ///
-    /// Everything skipped is a missed warning rather than a wrong one.
+    /// Brace elision lets an aggregate member consume several consecutive
+    /// elements -- `struct P p[2] = {1,2,3,4}` fills two two-field structs,
+    /// and `union { struct { char s[4]; int n; } in; } u = {"ab", 4}` puts
+    /// both into the union's one member -- so the list is walked subobject
+    /// by subobject rather than counted. A designator moves the walk to the
+    /// subobject it names, and the elements after it continue from there
+    /// (6.7.9p17). An array with no bound, or a flexible array member, takes
+    /// every element left.
     pub(super) fn check_excess_initializers(&self, typ: TypeId, init: &Expr) {
         let ExprKind::InitList { elements } = &init.kind else {
             return;
         };
-        // A designator names its own position, so the *count* of elements says
-        // nothing -- but the position itself can still be out of range, and
-        // nothing checked that anywhere: `int a[4] = {[10] = 7};` compiled and
-        // wrote past the array. GCC rejects it. Ranges make it easy to write by
+        // A designator's position can itself be out of range, and nothing
+        // checked that anywhere: `int a[4] = {[10] = 7};` compiled and wrote
+        // past the array. GCC rejects it. Ranges make it easy to write by
         // accident, so the bound is checked here where the array's size is
-        // known; the element-count check below still stands aside.
+        // known.
         self.check_designator_bounds(typ, elements);
-        if elements.iter().any(|e| !e.designators.is_empty()) {
-            return;
-        }
 
-        match self.types.kind(typ) {
-            TypeKind::Array => {
-                let Some(elem) = self.types.base_type(typ) else {
-                    return;
-                };
-                if !self.types.is_scalar(elem) {
-                    return;
-                }
-                // An absent or zero size is an array whose bound came from
-                // this very initializer, so it cannot overflow.
-                let Some(capacity) = self.types.array_size(typ).filter(|&n| n > 0) else {
-                    return;
-                };
-                if elements.len() > capacity {
-                    diag::warning(init.pos, &gettext("excess elements in array initializer"));
-                }
+        let message = match self.types.kind(typ) {
+            // An absent or zero size is an array whose bound came from this
+            // very initializer, so it cannot overflow.
+            TypeKind::Array if self.types.array_size(typ).is_some_and(|n| n > 0) => {
+                "excess elements in array initializer"
             }
-            TypeKind::Struct => {
-                let Some(comp) = self.types.composite(typ) else {
-                    return;
-                };
-                if comp.members.is_empty()
-                    || comp.members.iter().any(|m| !self.types.is_scalar(m.typ))
-                {
-                    return;
-                }
-                if elements.len() > comp.members.len() {
-                    diag::warning(init.pos, &gettext("excess elements in struct initializer"));
-                }
+            TypeKind::Struct
+                if self
+                    .types
+                    .composite(typ)
+                    .is_some_and(|c| !c.members.is_empty()) =>
+            {
+                "excess elements in struct initializer"
             }
-            // A union takes one initializer (6.7.9p17 ends at its first
-            // named member); gcc warns about more.
-            TypeKind::Union if elements.len() > 1 => {
-                diag::warning(init.pos, &gettext("excess elements in union initializer"));
-            }
+            TypeKind::Union => "excess elements in union initializer",
             // A scalar's braces are gone by now: `strip_scalar_braces`
-            // warned about any excess as it took them off. A union with one
-            // initializer has none.
-            _ => {}
+            // warned about any excess as it took them off.
+            _ => return,
+        };
+        // The elements the subobjects take, each one or -- by brace
+        // elision -- as many as its own subobjects take (6.7.9p20).
+        if crate::parse::ast::initializer_list_end(self.types, elements, typ) < elements.len() {
+            diag::warning(init.pos, &gettext(message));
         }
     }
 
@@ -783,15 +808,12 @@ impl Parser<'_> {
                 crate::parse::ast::array_slot(&element.designators, &mut current_index);
             max_index = max_index.max(last);
 
-            // A brace-less aggregate element takes several list elements for
-            // this one slot.
-            idx = if designated.is_none()
-                && crate::parse::ast::is_brace_elision_candidate(self.types, element, elem_type)
-            {
-                crate::parse::ast::brace_elision_span(self.types, elements, idx, elem_type).end
-            } else {
-                idx + 1
-            };
+            // An element takes several list elements for this one slot when
+            // it elides braces into it, or continues a designator chain into
+            // it -- `[1].x = 1, 2` gives `[1]` the 2 as well.
+            let rest = designated.map_or(&[][..], |pos| &element.designators[pos + 1..]);
+            idx =
+                crate::parse::ast::designated_span(self.types, elements, idx, elem_type, rest).end;
         }
 
         if max_index < 0 {

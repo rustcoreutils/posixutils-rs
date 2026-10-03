@@ -9,8 +9,13 @@
 // Parser tests for linkage, redeclaration, tags and declarator constraints.
 //
 
-use super::test_parser::parse_tu;
+use super::ast::{
+    brace_elision_span, is_brace_elision_candidate, Designator, ExprKind, ExternalDecl, InitElement,
+};
+use super::test_parser::{parse_tu, parse_tu_for};
 use crate::symbol::{Linkage, Namespace};
+use crate::target::{Arch, Os, Target};
+use crate::types::{TypeId, TypeTable};
 
 /// Parse `src`, requiring it to be rejected: a parse error, or a diagnostic.
 fn assert_rejected(src: &str) {
@@ -224,5 +229,286 @@ fn test_incomplete_array_definition_is_judged_at_end_of_unit() {
         "static int a[]; int *g(void) { extern int a[5]; return a; }",
     ] {
         assert_rejected(src);
+    }
+}
+
+/// The target the initializer tests parse for: one whose `wchar_t` is `int`,
+/// so `int s[3]` suits `L"ab"` wherever the tests run.
+fn wchar_is_int() -> Target {
+    Target::new(Arch::X86_64, Os::Linux)
+}
+
+/// Parse `src`, requiring it to compile with no diagnostic at all.
+fn assert_clean(src: &str) {
+    let (errors, warnings) = (crate::diag::error_count(), crate::diag::warning_count());
+    parse_tu_for(src, &wchar_is_int()).unwrap();
+    assert_eq!(crate::diag::error_count(), errors, "{src}: error");
+    assert_eq!(crate::diag::warning_count(), warnings, "{src}: warning");
+}
+
+/// The last declarator of `src`'s last file-scope declaration: its type and
+/// the elements of its initializer list.
+fn last_initializer(src: &str) -> (TypeTable, TypeId, Vec<InitElement>) {
+    let (tu, types, _, _) = parse_tu_for(src, &wchar_is_int()).unwrap();
+    let Some(ExternalDecl::Declaration(decl)) = tu.items.last() else {
+        panic!("{src}: no declaration last");
+    };
+    let d = decl.declarators.last().unwrap();
+    let Some(ExprKind::InitList { elements }) = d.init.as_ref().map(|e| &e.kind) else {
+        panic!("{src}: no initializer list");
+    };
+    (types, d.typ, elements.clone())
+}
+
+/// C17 6.7.9p20: an elided slot takes as many elements as its subobjects
+/// do, each one element or -- itself elided -- as many as its own take. A
+/// string literal fills a whole character array and a braced list a whole
+/// subaggregate, so neither counts as its scalars; the count used to.
+#[test]
+fn test_brace_elision_span_walks_subobjects() {
+    let cases: &[(&str, &[usize])] = &[
+        // Each `struct In` slot takes the string and the int.
+        (
+            "struct In { char s[4]; int n; }; \
+             struct Out { struct In in; struct In j; } v[1] = {\"abc\", 7, {\"de\", 8}};",
+            &[3],
+        ),
+        // A braced element ends a row of two structs after three elements.
+        (
+            "struct Pt { int x, y; }; struct Pt g[2][2] = {1, 2, {.y = 5}, 7};",
+            &[3, 1],
+        ),
+        // Two strings fill `m`; `n` takes the third element.
+        (
+            "struct E { char m[2][4]; int n; } e[2] = {\"ab\", \"cd\", 5, \"ef\", \"gh\", 6};",
+            &[3, 3],
+        ),
+        // A wide string fills a `wchar_t` array that suits it.
+        (
+            "struct W { int s[3]; int n; } w[2] = {L\"ab\", 3, L\"c\", 4};",
+            &[2, 2],
+        ),
+        // A pointer member takes a string as one scalar.
+        (
+            "struct D { char *p; int n; } d[2] = {\"x\", 1, \"yz\", 2};",
+            &[2, 2],
+        ),
+        // A designated element after the first ends the span, and starts
+        // one of its own.
+        (
+            "struct G { char s[4]; int n; } g[3] = {\"ab\", [2] = \"cd\", 3};",
+            &[1, 2],
+        ),
+    ];
+    for (src, spans) in cases {
+        let (types, typ, elements) = last_initializer(src);
+        let slot = types.base_type(typ).unwrap();
+        let mut at = 0;
+        for want in *spans {
+            assert!(
+                is_brace_elision_candidate(&types, &elements[at], slot),
+                "{src}: element {at} not elided"
+            );
+            let span = brace_elision_span(&types, &elements, at, slot);
+            assert_eq!(span.len(), *want, "{src}: span at {at}");
+            at = span.end;
+        }
+        assert_eq!(at, elements.len(), "{src}: elements left over");
+    }
+}
+
+/// A string literal is an elided list's first element unless the slot is an
+/// array of integers, which takes it whole (6.7.9p14-15) -- and, when it does
+/// not suit, rejects it there as gcc does.
+#[test]
+fn test_string_literal_elides_into_non_character_aggregates() {
+    let (types, typ, elements) =
+        last_initializer("struct In { char s[4]; double d; }; struct In v[1] = {\"abc\", 2.5};");
+    let slot = types.base_type(typ).unwrap();
+    assert!(is_brace_elision_candidate(&types, &elements[0], slot));
+    let char_array = types.composite(slot).unwrap().members[0].typ;
+    assert!(!is_brace_elision_candidate(
+        &types,
+        &elements[0],
+        char_array
+    ));
+}
+
+/// The parser's walk follows elided braces, so each element is checked
+/// against the subobject it initializes -- `{.y = 5}` against `struct Pt`,
+/// not the row of them, and `2.5` against the `double`, not the pointer.
+#[test]
+fn test_initializer_walk_follows_brace_elision() {
+    for src in [
+        "struct In { char s[4]; double d; }; \
+         struct Out { struct In in; int *p; } v = {\"abc\", 2.5, 0};",
+        "struct Pt { int x, y; }; struct Pt grid[2][2] = {1, 2, {.y = 5}, 7};",
+        "struct In { int s[3]; int n; }; struct In a[2] = {L\"ab\", 3, L\"c\", 4};",
+        "struct In { char s[4]; int n; }; \
+         struct Out { int a; struct In in; struct In j; } o = {.in = \"abc\", 7, \"de\", 8};",
+        "struct Pt { int x, y; }; struct Pt pa[3] = {1, 2, [2] = 3, 4};",
+        "union U { struct { char s[4]; int n; } in; int k; } u = {\"uv\", 4};",
+        "struct S { char s[4]; int n; } s = {{\"abc\"}, 1};",
+        "char c[4] = {\"abc\"};",
+    ] {
+        assert_clean(src);
+    }
+    for src in [
+        // An array of integers the string does not suit takes it and fails.
+        "struct S { short h[3]; int n; } s = {\"ab\", 1};",
+        "struct S { _Bool b[3]; int n; } s = {\"ab\", 1};",
+        // The walk still finds a real mismatch after a string.
+        "struct In { char s[4]; double d; }; struct In v = {\"abc\", \"x\"};",
+        "struct Pt { int x, y; }; struct Pt g[2][2] = {1, 2, {.z = 5}};",
+    ] {
+        assert_rejected(src);
+    }
+}
+
+/// The excess-element count walks elided braces too: the union's one member
+/// takes both elements, and a third `struct In` member does not exist.
+#[test]
+fn test_excess_initializers_count_by_subobject() {
+    assert_clean("union U { struct { char s[4]; int n; } in; int k; } u = {\"uv\", 4};");
+    for src in [
+        "union U { struct { int x, y; } p; int n; } u = {1, 2, 3};",
+        "struct In { char s[4]; int n; } x = {\"ab\", 1, 2};",
+        "struct Pt { int x, y; }; struct Pt a[1] = {1, 2, 3};",
+    ] {
+        let warnings = crate::diag::warning_count();
+        parse_tu(src).unwrap();
+        assert!(crate::diag::warning_count() > warnings, "{src}: no warning");
+    }
+}
+
+/// C17 6.7.9p17: a positional element after a designator chain lands in the
+/// subobject after the one the chain named. The parser spells that landing
+/// place out as the element's own designator chain, so everything after it
+/// -- its checks, the array's size, the linearizer -- sees where it goes.
+#[test]
+fn test_designator_chain_continuation_is_spelled_out() {
+    let field = |s: &str, strings: &crate::strings::StringTable| {
+        Designator::Field(strings.lookup(s).expect("interned"))
+    };
+    let src = "struct Pt { int x, y; }; struct E3 { int k; struct Pt a[2]; int z; } \
+               e = {.a[0].y = 1, 2, 3, 4};";
+    let (tu, _, strings, _) = parse_tu_for(src, &wchar_is_int()).unwrap();
+    let Some(ExternalDecl::Declaration(decl)) = tu.items.last() else {
+        panic!("no declaration");
+    };
+    let Some(ExprKind::InitList { elements }) = decl.declarators[0].init.as_ref().map(|e| &e.kind)
+    else {
+        panic!("no initializer list");
+    };
+    let chains: Vec<_> = elements.iter().map(|e| e.designators.clone()).collect();
+    assert_eq!(
+        chains,
+        vec![
+            vec![
+                field("a", &strings),
+                Designator::Index(0),
+                field("y", &strings)
+            ],
+            // `2` starts `a[1]` and elides into it, taking `3` with it...
+            vec![field("a", &strings), Designator::Index(1)],
+            vec![],
+            // ...and `4` is the enclosing list's next member, after `a`.
+            vec![],
+        ]
+    );
+}
+
+/// The continuation is checked against the subobject it lands in, counted
+/// for excess there, and counted where it lands when it sizes an array.
+#[test]
+fn test_designator_chain_continuation_checks_and_sizes() {
+    assert_clean(
+        "struct Pt { int x, y; }; struct S { struct Pt a; double *p; } s = {.a.x = 1, 2, 0};",
+    );
+    assert_clean("struct Pt { int x, y; }; struct Pt pc[2][2] = {[1][0] = 5, 6};");
+    for src in [
+        "struct Pt { int x, y; }; struct E2 { struct Pt a; int t[2]; } e = {.a.x = 1, 2, 3, 4, 5};",
+        "struct Pt { int x, y; }; struct Pt p[1] = {[0].x = 1, 2, 3};",
+        "union U { int i; float f; } u = {.f = 1.0f, 2};",
+    ] {
+        let warnings = crate::diag::warning_count();
+        parse_tu_for(src, &wchar_is_int()).unwrap();
+        assert!(crate::diag::warning_count() > warnings, "{src}: no warning");
+    }
+    for (src, len) in [
+        (
+            "struct Pt { int x, y; }; struct Pt q[] = {[1].x = 1, 2, 3, 4};",
+            3,
+        ),
+        (
+            "struct Pt { int x, y; }; struct Pt q[] = {[3].y = 1, 2, 3};",
+            5,
+        ),
+    ] {
+        let (types, typ, _) = last_initializer(src);
+        assert_eq!(types.array_size(typ), Some(len), "{src}");
+    }
+}
+
+/// A continuation that lands on an anonymous member has no name to spell,
+/// so its chain names the member by its position in the member list --
+/// and a braced list there initializes that member, not a scalar inside it.
+#[test]
+fn test_continuation_into_an_anonymous_member_is_spelled_by_position() {
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "struct A { int k; struct { int p, q; }; int z; }; \
+             struct B { struct A a; int w; } b = {.a.k = 1, {2, 3}, 4, 5};",
+            &[
+                "[Field(_), Field(_)]",
+                "[Field(_), Member(1)]",
+                "[Field(_), Field(_)]",
+                "[]",
+            ],
+        ),
+        (
+            "struct A2 { int k; union { int p; float f; }; int z; }; \
+             struct B2 { struct A2 a; int w; } b = {.a.k = 1, {2}, 4, 5};",
+            &[
+                "[Field(_), Field(_)]",
+                "[Field(_), Member(1)]",
+                "[Field(_), Field(_)]",
+                "[]",
+            ],
+        ),
+        // `.p` reaches through the anonymous member at position 1, and the
+        // braced list lands on the one nested inside it, at its position 1.
+        (
+            "struct C { int k; struct { int p; struct { int r, s; }; }; int z; } \
+             c = {.p = 1, {2, 3}, 4};",
+            &["[Field(_)]", "[Member(1), Member(1)]", "[]"],
+        ),
+    ];
+    for (src, want) in cases {
+        let (_, _, elements) = last_initializer(src);
+        let got: Vec<String> = elements
+            .iter()
+            .map(|e| {
+                let names: Vec<String> = e
+                    .designators
+                    .iter()
+                    .map(|d| match d {
+                        Designator::Field(_) => "Field(_)".to_string(),
+                        other => format!("{other:?}"),
+                    })
+                    .collect();
+                format!("[{}]", names.join(", "))
+            })
+            .collect();
+        assert_eq!(got, *want, "{src}");
+    }
+    for src in [
+        "struct A { int k; struct { int p, q; }; int z; }; \
+         struct B { struct A a; int w; } b = {.a.k = 1, {2, 3}, 4, 5};",
+        "struct A { int k; struct { int p, q; }; int z; } a = {1, {2, 3}, 4};",
+        "struct C { int k; struct { int p; struct { int r, s; }; }; int z; }; \
+         struct D { struct C c; int w; } d = {.c.k = 1, {2, {3, 4}}, 5, 6};",
+    ] {
+        assert_clean(src);
     }
 }

@@ -12,7 +12,8 @@
 //
 
 use crate::common::{
-    compile_and_run, compile_expect_error, compile_expect_ok, compile_expect_warning,
+    compile_and_run, compile_expect_error, compile_expect_no_diagnostic, compile_expect_ok,
+    compile_expect_warning,
 };
 
 fn rejects(cases: &[(&str, &str, &str)]) {
@@ -256,6 +257,145 @@ fn remaining_constraints() {
         (
             "nested_array_excess",
             "struct { int a[2]; } s = {{1, 2, 3}};\n",
+            "excess elements in array initializer",
+        ),
+    ] {
+        compile_expect_warning(name, src, expected);
+    }
+}
+
+/// Brace elision around string literals and braced elements (C17 6.7.9p20):
+/// each element is checked against the subobject it initializes, so none of
+/// these valid initializers -- all accepted by gcc -- may be diagnosed.
+#[test]
+fn brace_elision_initializers_accepted() {
+    for (name, src) in [
+        (
+            "elide_string_then_double",
+            "struct In { char s[4]; double d; };\n\
+             struct Out { struct In in; int *p; } v = {\"abc\", 2.5, 0};\n",
+        ),
+        (
+            "elide_braced_designated_row",
+            "struct Pt { int x, y; };\nstruct Pt grid[2][2] = {1, 2, {.y = 5}, 7};\n",
+        ),
+        (
+            "elide_wide_string_rows",
+            "#include <stddef.h>\nstruct In { wchar_t s[3]; int n; };\n\
+             struct In a[2] = {L\"ab\", 3, L\"c\", 4};\n",
+        ),
+        (
+            "elide_designated_member",
+            "struct In { char s[4]; int n; };\n\
+             struct O { int a; struct In in; struct In j; } o = {.in = \"abc\", 7, \"de\", 8};\n",
+        ),
+        (
+            "elide_union_member",
+            "union U { struct { char s[4]; int n; } in; int k; } u = {\"uv\", 4};\n",
+        ),
+        (
+            "braced_string_member",
+            "struct S { char s[4]; int n; } s = {{\"abc\"}, 1};\nchar c[4] = {\"abc\"};\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+        for forbidden in ["warning", "error"] {
+            compile_expect_no_diagnostic(name, src, forbidden);
+        }
+    }
+    // An array of integers takes a string literal whole, as gcc does, and
+    // rejects one that does not suit it -- rather than eliding braces and
+    // storing the string's address into its first element.
+    rejects(&[
+        (
+            "string_for_short_array_member",
+            "struct S { short h[3]; int n; } s = {\"ab\", 1};\n",
+            "invalid initializer",
+        ),
+        (
+            "string_for_bool_array_member",
+            "struct S { _Bool b[3]; int n; } s = {\"ab\", 1};\n",
+            "invalid initializer",
+        ),
+    ]);
+    // Excess elements are counted subobject by subobject.
+    for (name, src, expected) in [
+        (
+            "elided_union_excess",
+            "union U { struct { int x, y; } p; int n; } u = {1, 2, 3};\n",
+            "excess elements in union initializer",
+        ),
+        (
+            "elided_struct_excess",
+            "struct In { char s[4]; int n; } x = {\"ab\", 1, 2};\n",
+            "excess elements in struct initializer",
+        ),
+        (
+            "elided_array_excess",
+            "struct Pt { int x, y; };\nstruct Pt a[1] = {1, 2, 3};\n",
+            "excess elements in array initializer",
+        ),
+        (
+            "member_string_too_long",
+            "struct S { char s[2]; int n; } s = {\"abc\", 1};\n",
+            "initializer-string for array of 'char' is too long",
+        ),
+    ] {
+        compile_expect_warning(name, src, expected);
+    }
+}
+
+/// Positional elements after a designator chain continue inside the chain's
+/// aggregate (C17 6.7.9p17), so they are checked -- and counted -- against
+/// the subobjects they really land in.
+#[test]
+fn designator_chain_continuation() {
+    for (name, src) in [
+        (
+            "chain_then_pointer",
+            "struct Pt { int x, y; };\n\
+             struct S { struct Pt a; double *p; } s = {.a.x = 1, 2, 0};\n",
+        ),
+        (
+            "chain_fills_enclosing",
+            "struct Pt { int x, y; };\nstruct E2 { struct Pt a; int t[2]; };\n\
+             struct E2 e = {.a.x = 1, 2, 3, 4};\n",
+        ),
+        (
+            "array_chain_elides",
+            "struct Pt { int x, y; };\nstruct Pt pc[2][2] = {[1][0] = 5, 6};\n",
+        ),
+    ] {
+        compile_expect_ok(name, src);
+        for forbidden in ["warning", "error"] {
+            compile_expect_no_diagnostic(name, src, forbidden);
+        }
+    }
+    for (name, src, expected) in [
+        (
+            "chain_struct_excess",
+            "struct Pt { int x, y; };\nstruct E2 { struct Pt a; int t[2]; };\n\
+             struct E2 e = {.a.x = 1, 2, 3, 4, 5};\n",
+            "excess elements in struct initializer",
+        ),
+        (
+            "chain_array_excess",
+            "struct Pt { int x, y; };\nstruct Pt p[1] = {[0].x = 1, 2, 3};\n",
+            "excess elements in array initializer",
+        ),
+        (
+            "designated_union_excess",
+            "union U { int i; float f; } u = {.f = 1.0f, 2};\n",
+            "excess elements in union initializer",
+        ),
+        (
+            "union_chain_excess",
+            "struct UZ { union { int i; float f; } u; int z; } s = {.u.f = 1.0f, 2, 3};\n",
+            "excess elements in struct initializer",
+        ),
+        (
+            "array_chain_row_excess",
+            "struct Pt { int x, y; };\nstruct Pt g[2][2] = {[1][1] = 5, 6, 7};\n",
             "excess elements in array initializer",
         ),
     ] {

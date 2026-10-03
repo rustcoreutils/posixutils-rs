@@ -14,6 +14,7 @@
 // - initializers: designated init, compound literals
 //
 
+mod brace_elision;
 mod c99_features_gaps;
 mod complex;
 mod complex_abi;

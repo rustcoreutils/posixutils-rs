@@ -2716,55 +2716,6 @@ impl TypeTable {
         self.intern(unqualified)
     }
 
-    /// How many scalar initializers it takes to fill this type.
-    ///
-    /// This is the measure brace elision runs on (C17 6.7.9p20): a brace-less
-    /// initializer for an aggregate member consumes exactly this many elements
-    /// from the enclosing list. The linearizer places values by it and the
-    /// parser sizes incomplete arrays by it, so it lives here rather than in
-    /// either -- when only the linearizer knew the rule, `int a[][2] =
-    /// {1,2,3,4}` was stored as two rows and sized as four.
-    pub fn count_scalar_fields(&self, id: TypeId) -> usize {
-        match self.kind(id) {
-            TypeKind::Array => {
-                let elem_type = self.base_type(id).unwrap_or(self.int_id);
-                let count = self.get(id).array_size.unwrap_or(0);
-                count * self.count_scalar_fields(elem_type)
-            }
-            TypeKind::Struct => {
-                if let Some(composite) = self.get(id).composite.as_ref() {
-                    composite
-                        .members
-                        .iter()
-                        .filter(|m| m.is_initializable())
-                        .map(|m| self.count_scalar_fields(m.typ))
-                        .sum()
-                } else {
-                    1
-                }
-            }
-            TypeKind::Union => {
-                // A union's initializer initializes its first member (C17
-                // 6.7.9p17) -- which may be an anonymous aggregate, so the
-                // test is the one positional initialization uses, not "has a
-                // name": asking for a name counted `q` in
-                // `union { struct { int a, b; }; long q; }` while the
-                // initializer walk filled `a` and `b`.
-                if let Some(composite) = self.get(id).composite.as_ref() {
-                    composite
-                        .members
-                        .iter()
-                        .find(|m| m.is_initializable())
-                        .map(|m| self.count_scalar_fields(m.typ))
-                        .unwrap_or(1)
-                } else {
-                    1
-                }
-            }
-            _ => 1,
-        }
-    }
-
     /// Whether `id` is an unsigned integer type.
     ///
     /// Not the same question as "was the keyword `unsigned` written" -- see

@@ -965,9 +965,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// Check if brace elision applies: the element is a positional scalar targeting
-    /// an aggregate member, and is NOT a string literal initializing a char array
-    /// (C99 6.7.8p14: string literals are a special case for char arrays).
+    /// Does `element`, landing in a subobject of type `target_type`, start
+    /// brace elision into it? See [`crate::parse::ast::is_brace_elision_candidate`].
     pub(crate) fn is_brace_elision_candidate(
         &self,
         element: &InitElement,
@@ -1071,6 +1070,21 @@ impl<'a> super::linearize::Linearizer<'a> {
             // keeps the loop off the excess indices rather than walking one
             // iteration per discarded element, which matters for an endpoint
             // far past the array.
+            // `[i].m = v` addresses part of the slot, and the positional
+            // elements after it that continue inside the slot or elide into
+            // its part (6.7.9p17, p20) go with it.
+            let span = if remaining_designators.is_empty() {
+                elem_idx..elem_idx + 1
+            } else {
+                crate::parse::ast::designated_span(
+                    self.types,
+                    elements,
+                    elem_idx,
+                    elem_type,
+                    &remaining_designators,
+                )
+            };
+            let continuation = &elements[span.start + 1..span.end];
             let span_end = last_index.map_or(span_end, |last| span_end.min(last));
             if in_bounds(element_index) {
                 for target_index in element_index..=span_end {
@@ -1093,9 +1107,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                         designators: remaining_designators.clone(),
                         value: element.value.clone(),
                     });
+                    // A range is continued in its last element alone.
+                    if target_index == span_end {
+                        entry.extend(continuation.iter().cloned());
+                    }
                 }
             }
-            elem_idx += 1;
+            elem_idx = span.end;
         }
 
         element_indices.sort();
@@ -1191,6 +1209,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                 continue;
             };
             let mut member_index = None;
+            // An anonymous member named by its place: the next positional
+            // element takes the member after it.
+            if let Some(Designator::Member(position)) = element.designators.first() {
+                member_index = Some(*position);
+                current_field_idx = position + 1;
+                anon_cont = None;
+            }
             if let Some(Designator::Field(name)) = element.designators.first() {
                 if let Some(result) = self.member_index_for_designator(members, *name) {
                     match result {
@@ -1208,11 +1233,19 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
             let field_size = self.types.size_bytes(field_type);
+            // `.m = v, w` elides braces into `m` as a positional `v, w` would.
+            let kind = if self.is_brace_elision_candidate(element, field_type) {
+                let sub_elements = self.consume_brace_elision(elements, &mut elem_idx, field_type);
+                StructFieldVisitKind::BraceElision(sub_elements)
+            } else {
+                elem_idx += 1;
+                StructFieldVisitKind::Expr(element.value.clone())
+            };
             visits.push(StructFieldVisit {
                 offset,
                 typ: field_type,
                 field_size,
-                kind: StructFieldVisitKind::Expr(element.value.clone()),
+                kind,
                 bit_offset,
                 bit_width,
                 access_bytes,
@@ -1220,7 +1253,6 @@ impl<'a> super::linearize::Linearizer<'a> {
                 unions,
                 quals,
             });
-            elem_idx += 1;
         }
 
         visits
@@ -2262,6 +2294,27 @@ impl<'a> super::linearize::Linearizer<'a> {
                         bit_width = None;
                         access_bytes = None;
                     }
+                }
+                // An anonymous member, named by its place in the member list
+                // because it has no name (see `Designator::Member`).
+                Designator::Member(position) => {
+                    let resolved = if self.types.kind(typ) == TypeKind::Array {
+                        self.types.base_type(typ)?
+                    } else {
+                        typ
+                    };
+                    let member = self.types.composite(resolved)?.members.get(*position)?;
+                    if self.types.kind(resolved) == TypeKind::Union {
+                        unions.record(offset, resolved, *position);
+                    }
+                    if idx > 0 {
+                        quals |= self.types.qualifiers(typ);
+                    }
+                    offset += member.offset;
+                    typ = member.typ;
+                    bit_offset = None;
+                    bit_width = None;
+                    access_bytes = None;
                 }
                 // A range inside a *chain* -- `.m[0 ... 3] = v` -- names many
                 // offsets, and this resolves to one. Refused rather than

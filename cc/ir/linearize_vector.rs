@@ -6,18 +6,20 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// GNU `vector_size` values, lowered lane by lane.
+// GNU `vector_size` values.
 //
 // A vector travels by address, as a complex value does: every expression of
 // vector type linearizes to the address of storage holding its lanes -- the
 // object itself for a name, a member or an element, a fresh frame temporary
-// for anything computed. An operation reads each operand's lanes, computes
-// each lane with the scalar opcode of the lane type, and stores the result
-// into a temporary. Nothing below the linearizer sees a vector.
+// for anything computed. An operation the target computes with packed
+// instructions (`arch::simd::native`) is one `Opcode::Simd` on the operands'
+// whole bits, held in a register-sized carrier (binary128 or `double`); any
+// other reads each operand's lanes, computes each lane with the scalar opcode
+// of the lane type, and stores the result into a temporary.
 //
 
 use super::linearize::{BlockVolatility, Linearizer};
-use super::{Instruction, PseudoId};
+use super::{Instruction, Opcode, PseudoId, SimdOp};
 use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, BinaryOp, Expr, ShuffleSelector, UnaryOp};
@@ -364,9 +366,33 @@ impl Linearizer<'_> {
         if op.is_comparison() {
             lane = self.comparison_lane(lane, left_typ, right_typ);
         }
-        let (result_lane, _, result_size) = self.vector_shape(result_typ);
         let l = self.vector_lanes_of(left, lane);
         let r = self.vector_lanes_of(right, lane);
+        self.vector_binary_of(op, l, r, (lane, count), vector_typ, result_typ)
+    }
+
+    /// `l op r`, lane by lane at `lane`, for `count` lanes, into a vector of
+    /// `result_typ` -- with the target's packed instruction where it has one
+    /// for the operation on `vector_typ` (`arch::simd::native`). The binary
+    /// operators and their compound assignments both come here.
+    fn vector_binary_of(
+        &mut self,
+        op: BinaryOp,
+        l: Lanes,
+        r: Lanes,
+        (lane, count): (TypeId, usize),
+        vector_typ: TypeId,
+        result_typ: TypeId,
+    ) -> PseudoId {
+        if let (Lanes::Vector { addr: a, .. }, Lanes::Vector { addr: b, .. }) = (l, r) {
+            let float = self.types.is_float(lane);
+            if let Some(simd) = Self::simd_binary(op, float) {
+                if self.simd_native(simd, vector_typ) {
+                    return self.emit_simd(simd, &[a, b], vector_typ, result_typ);
+                }
+            }
+        }
+        let (result_lane, _, result_size) = self.vector_shape(result_typ);
         let result = self.frame_temp_addr("__vec", result_typ);
         let lane_bits = self.types.size_bits(result_lane);
         for i in 0..count {
@@ -421,6 +447,16 @@ impl Linearizer<'_> {
             // `+v` is the value itself, at a fresh place as any result is.
             return self.vector_copy(src, typ);
         }
+        if let Lanes::Vector { addr, .. } = src {
+            let simd = match (op, self.types.is_float(lane)) {
+                (UnaryOp::Neg, true) => SimdOp::FNeg,
+                (UnaryOp::Neg, false) => SimdOp::Neg,
+                _ => SimdOp::Not,
+            };
+            if self.simd_native(simd, typ) {
+                return self.emit_simd(simd, &[addr], typ, typ);
+            }
+        }
         let result = self.frame_temp_addr("__vec", typ);
         let bits = self.types.size_bits(lane);
         for i in 0..count {
@@ -446,6 +482,69 @@ impl Linearizer<'_> {
         result
     }
 
+    /// The scalar type a vector of type `typ` is held in when it is one
+    /// register's worth: binary128 for sixteen bytes (an XMM or Q register),
+    /// `double` for eight. `None` for any other size.
+    fn register_carrier(&self, typ: TypeId) -> Option<TypeId> {
+        match self.types.size_bytes(typ) {
+            16 => Some(self.types.float128_id),
+            8 => Some(self.types.double_id),
+            _ => None,
+        }
+    }
+
+    /// The packed operation for C's `op` on lanes that are floating or not.
+    fn simd_binary(op: BinaryOp, float: bool) -> Option<SimdOp> {
+        Some(match (op, float) {
+            (BinaryOp::Add, false) => SimdOp::Add,
+            (BinaryOp::Sub, false) => SimdOp::Sub,
+            (BinaryOp::BitAnd, false) => SimdOp::And,
+            (BinaryOp::BitOr, false) => SimdOp::Or,
+            (BinaryOp::BitXor, false) => SimdOp::Xor,
+            (BinaryOp::Add, true) => SimdOp::FAdd,
+            (BinaryOp::Sub, true) => SimdOp::FSub,
+            (BinaryOp::Mul, true) => SimdOp::FMul,
+            (BinaryOp::Div, true) => SimdOp::FDiv,
+            _ => return None,
+        })
+    }
+
+    /// Whether the target computes `op` on vectors of type `vec` with a
+    /// packed instruction.
+    fn simd_native(&self, op: SimdOp, vec: TypeId) -> bool {
+        crate::arch::simd::native(self.target, op, vec, self.types)
+    }
+
+    /// `op` on the vectors at `operands`, of type `vec`, as one packed
+    /// instruction: each operand loaded whole as its register carrier, and
+    /// the result stored whole to a fresh vector of `result_typ`.
+    fn emit_simd(
+        &mut self,
+        op: SimdOp,
+        operands: &[PseudoId],
+        vec: TypeId,
+        result_typ: TypeId,
+    ) -> PseudoId {
+        let carrier = self
+            .register_carrier(vec)
+            .expect("a native vector is one register's worth");
+        let bits = self.types.size_bits(carrier);
+        let values: Vec<PseudoId> = operands
+            .iter()
+            .map(|&addr| self.vector_to_carrier(addr, carrier))
+            .collect();
+        let value = self.alloc_reg_pseudo();
+        let insn = match values[..] {
+            [a] => Instruction::unop(Opcode::Simd(op), value, a, vec, bits),
+            [a, b] => Instruction::binop(Opcode::Simd(op), value, a, b, vec, bits),
+            _ => unreachable!("a vector operation has one or two operands"),
+        };
+        self.emit(insn);
+        let result = self.frame_temp_addr("__vec", result_typ);
+        self.emit(Instruction::store(value, result, 0, carrier, bits));
+        result
+    }
+
     /// Copy the vector of type `typ` at `src` to `dst`. A sixteen- or
     /// eight-byte one moves as one value of its register-sized carrier --
     /// a single XMM or Q (or D) register load and store -- rather than in
@@ -453,12 +552,7 @@ impl Linearizer<'_> {
     /// copy, which accesses each byte as the object's qualifiers say.
     fn copy_vector(&mut self, dst: PseudoId, src: PseudoId, typ: TypeId, vol: BlockVolatility) {
         let bytes = self.types.size_bytes(typ);
-        let whole = match bytes {
-            16 => Some(self.types.float128_id),
-            8 => Some(self.types.double_id),
-            _ => None,
-        };
-        match whole {
+        match self.register_carrier(typ) {
             Some(carrier) if !vol.dst && !vol.src => {
                 let value = self.vector_to_carrier(src, carrier);
                 let bits = self.types.size_bits(carrier);
@@ -505,21 +599,13 @@ impl Linearizer<'_> {
         let source = match op.binary_op() {
             None => self.vector_addr(value),
             Some(binop) => {
-                let (lane, count, size) = self.vector_shape(typ);
+                let (lane, count, _) = self.vector_shape(typ);
                 let l = Lanes::Vector {
                     addr: target_addr,
                     lane,
                 };
                 let r = self.vector_lanes_of(value, lane);
-                let result = self.frame_temp_addr("__vec", typ);
-                let bits = self.types.size_bits(lane);
-                for i in 0..count {
-                    let a = self.vector_lane(l, i, lane);
-                    let b = self.vector_lane(r, i, lane);
-                    let v = self.emit_binary(binop, a, b, lane, lane);
-                    self.emit(Instruction::store(v, result, i as i64 * size, lane, bits));
-                }
-                result
+                self.vector_binary_of(binop, l, r, (lane, count), typ, typ)
             }
         };
         let vol = self.block_volatility(self.expr_type(target), self.expr_type(value));

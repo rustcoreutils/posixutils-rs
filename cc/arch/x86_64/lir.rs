@@ -219,6 +219,109 @@ impl X87IntWidth {
 
 // x86-64 LIR Instructions
 
+/// The width of a packed integer lane: the `b`, `w`, `d` or `q` of
+/// `paddd`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntLane {
+    B,
+    W,
+    D,
+    Q,
+}
+
+impl IntLane {
+    /// The lane of `bytes` bytes.
+    pub fn of_bytes(bytes: usize) -> Self {
+        match bytes {
+            1 => IntLane::B,
+            2 => IntLane::W,
+            4 => IntLane::D,
+            8 => IntLane::Q,
+            _ => panic!("no packed integer lane of {bytes} bytes"),
+        }
+    }
+
+    pub fn suffix(self) -> &'static str {
+        match self {
+            IntLane::B => "b",
+            IntLane::W => "w",
+            IntLane::D => "d",
+            IntLane::Q => "q",
+        }
+    }
+}
+
+/// The width of a packed floating lane: the `s` or `d` of `addps`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatLane {
+    S,
+    D,
+}
+
+impl FloatLane {
+    /// The lane of `bytes` bytes.
+    pub fn of_bytes(bytes: usize) -> Self {
+        match bytes {
+            4 => FloatLane::S,
+            8 => FloatLane::D,
+            _ => panic!("no packed floating lane of {bytes} bytes"),
+        }
+    }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            FloatLane::S => "ps",
+            FloatLane::D => "pd",
+        }
+    }
+}
+
+/// A packed SSE2 operation of two XMM registers ([`X86Inst::Packed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackedOp {
+    /// PADDB/W/D/Q
+    Add(IntLane),
+    /// PSUBB/W/D/Q
+    Sub(IntLane),
+    /// PAND
+    And,
+    /// POR
+    Or,
+    /// PXOR
+    Xor,
+    /// PCMPEQB/W/D: all ones in each lane that is equal.
+    CmpEq(IntLane),
+    /// ADDPS/PD
+    FAdd(FloatLane),
+    /// SUBPS/PD
+    FSub(FloatLane),
+    /// MULPS/PD
+    FMul(FloatLane),
+    /// DIVPS/PD
+    FDiv(FloatLane),
+    /// XORPS/PD
+    FXor(FloatLane),
+}
+
+impl PackedOp {
+    /// The instruction's name.
+    pub fn mnemonic(self) -> String {
+        match self {
+            PackedOp::Add(l) => format!("padd{}", l.suffix()),
+            PackedOp::Sub(l) => format!("psub{}", l.suffix()),
+            PackedOp::And => "pand".into(),
+            PackedOp::Or => "por".into(),
+            PackedOp::Xor => "pxor".into(),
+            PackedOp::CmpEq(l) => format!("pcmpeq{}", l.suffix()),
+            PackedOp::FAdd(l) => format!("add{}", l.suffix()),
+            PackedOp::FSub(l) => format!("sub{}", l.suffix()),
+            PackedOp::FMul(l) => format!("mul{}", l.suffix()),
+            PackedOp::FDiv(l) => format!("div{}", l.suffix()),
+            PackedOp::FXor(l) => format!("xor{}", l.suffix()),
+        }
+    }
+}
+
 /// x86-64 Low-level IR instruction
 #[derive(Debug, Clone)]
 pub enum X86Inst {
@@ -661,6 +764,21 @@ pub enum X86Inst {
     /// XORPS with same register - Fast zero XMM register
     XorpsSelf { reg: XmmReg },
 
+    /// A packed operation on whole XMM registers, `op src, dst`: `dst` is
+    /// both the first operand and the result.
+    Packed {
+        op: PackedOp,
+        src: XmmReg,
+        dst: XmmReg,
+    },
+
+    /// PSLLW/PSLLD/PSLLQ by an immediate: shift each lane of `dst` left.
+    PackedShiftLeftImm {
+        lane: IntLane,
+        count: u8,
+        dst: XmmReg,
+    },
+
     // ========================================================================
     // Atomic Instructions (C11 _Atomic support)
     // ========================================================================
@@ -1054,6 +1172,12 @@ impl EmitAsm for X86Inst {
             }
             X86Inst::XorpsSelf { reg } => {
                 let _ = writeln!(out, "    xorps {}, {}", reg.name(), reg.name());
+            }
+            X86Inst::Packed { op, src, dst } => {
+                let _ = writeln!(out, "    {} {}, {}", op.mnemonic(), src.name(), dst.name());
+            }
+            X86Inst::PackedShiftLeftImm { lane, count, dst } => {
+                let _ = writeln!(out, "    psll{} ${}, {}", lane.suffix(), count, dst.name());
             }
 
             // Atomic Instructions

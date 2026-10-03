@@ -364,6 +364,85 @@ pub enum Opcode {
     /// out of band, never in `src`, so no analysis counts it as a use, an
     /// escape or a reason to keep the local. See `arch::regalloc::LocalLifetimes`.
     LifetimeEnd,
+    /// A lane-wise operation on whole GNU vectors, computed by the target's
+    /// packed instructions: `typ` is the vector type, which says the lanes,
+    /// and `size` its width, 128 or 64. Each operand and the result is the
+    /// vector's bits, held as its register-sized carrier (a binary128 or a
+    /// `double`). Built only for what `arch::simd::native` lists for the
+    /// target; anything else is computed lane by lane.
+    Simd(SimdOp),
+}
+
+/// The lane-wise operation of an [`Opcode::Simd`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SimdOp {
+    /// Integer lanes: src[0] + src[1], wrapping.
+    Add,
+    /// Integer lanes: src[0] - src[1], wrapping.
+    Sub,
+    /// Integer lanes, bitwise.
+    And,
+    Or,
+    Xor,
+    /// Integer lanes: ~src[0].
+    Not,
+    /// Integer lanes: -src[0], wrapping.
+    Neg,
+    /// Floating lanes, IEEE.
+    FAdd,
+    FSub,
+    FMul,
+    FDiv,
+    /// Floating lanes: src[0] with each sign bit flipped.
+    FNeg,
+}
+
+impl SimdOp {
+    /// Every operation, for tests over the whole set.
+    pub const ALL: [SimdOp; 12] = [
+        SimdOp::Add,
+        SimdOp::Sub,
+        SimdOp::And,
+        SimdOp::Or,
+        SimdOp::Xor,
+        SimdOp::Not,
+        SimdOp::Neg,
+        SimdOp::FAdd,
+        SimdOp::FSub,
+        SimdOp::FMul,
+        SimdOp::FDiv,
+        SimdOp::FNeg,
+    ];
+
+    /// Whether the operation takes one operand.
+    pub fn is_unary(self) -> bool {
+        matches!(self, SimdOp::Not | SimdOp::Neg | SimdOp::FNeg)
+    }
+
+    /// Whether its lanes are floating.
+    pub fn is_float(self) -> bool {
+        matches!(
+            self,
+            SimdOp::FAdd | SimdOp::FSub | SimdOp::FMul | SimdOp::FDiv | SimdOp::FNeg
+        )
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            SimdOp::Add => "vadd",
+            SimdOp::Sub => "vsub",
+            SimdOp::And => "vand",
+            SimdOp::Or => "vor",
+            SimdOp::Xor => "vxor",
+            SimdOp::Not => "vnot",
+            SimdOp::Neg => "vneg",
+            SimdOp::FAdd => "vfadd",
+            SimdOp::FSub => "vfsub",
+            SimdOp::FMul => "vfmul",
+            SimdOp::FDiv => "vfdiv",
+            SimdOp::FNeg => "vfneg",
+        }
+    }
 }
 
 impl Opcode {
@@ -623,6 +702,7 @@ impl Opcode {
             Opcode::FMin => "fmin",
             Opcode::FMax => "fmax",
             Opcode::Fma => "fma",
+            Opcode::Simd(op) => op.name(),
             Opcode::RoundToIntegral(how) => match how {
                 IntegralRounding::Floor => "ffloor",
                 IntegralRounding::Ceil => "fceil",
@@ -720,6 +800,18 @@ macro_rules! every_opcode {
                 Opcode::RoundToIntegral(IntegralRounding::Round),
                 Opcode::RoundToIntegral(IntegralRounding::Rint),
                 Opcode::RoundToIntegral(IntegralRounding::NearbyInt),
+                Opcode::Simd(SimdOp::Add),
+                Opcode::Simd(SimdOp::Sub),
+                Opcode::Simd(SimdOp::And),
+                Opcode::Simd(SimdOp::Or),
+                Opcode::Simd(SimdOp::Xor),
+                Opcode::Simd(SimdOp::Not),
+                Opcode::Simd(SimdOp::Neg),
+                Opcode::Simd(SimdOp::FAdd),
+                Opcode::Simd(SimdOp::FSub),
+                Opcode::Simd(SimdOp::FMul),
+                Opcode::Simd(SimdOp::FDiv),
+                Opcode::Simd(SimdOp::FNeg),
             ];
 
             /// The exhaustiveness guard behind [`Opcode::ALL`]; always true.
@@ -733,6 +825,20 @@ macro_rules! every_opcode {
                         | IntegralRounding::Round
                         | IntegralRounding::Rint
                         | IntegralRounding::NearbyInt,
+                    ) => true,
+                    Opcode::Simd(
+                        SimdOp::Add
+                        | SimdOp::Sub
+                        | SimdOp::And
+                        | SimdOp::Or
+                        | SimdOp::Xor
+                        | SimdOp::Not
+                        | SimdOp::Neg
+                        | SimdOp::FAdd
+                        | SimdOp::FSub
+                        | SimdOp::FMul
+                        | SimdOp::FDiv
+                        | SimdOp::FNeg,
                     ) => true,
                 }
             }
@@ -3662,6 +3768,17 @@ mod tests {
         }
         // Fence, Call, Setjmp, Longjmp and the atomics, each twice, and Asm once.
         assert_eq!(barriers, 2 * 13 + 1);
+    }
+
+    /// A vector operation computes in registers: it touches no memory, so
+    /// nothing orders around it and dead-code elimination may delete it.
+    #[test]
+    fn test_simd_opcodes_are_pure() {
+        for op in SimdOp::ALL {
+            let op = Opcode::Simd(op);
+            assert!(!op.may_access_memory() && !op.has_side_effects(), "{op:?}");
+            assert!(!op.is_terminator() && !op.is_comparison(), "{op:?}");
+        }
     }
 
     #[test]

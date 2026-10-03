@@ -1406,9 +1406,12 @@ impl RegAlloc {
         }
         for block in &func.blocks {
             for insn in &block.insns {
+                // A 16-byte vector operation's operands and result are its
+                // carrier's whole XMM register, as a binary128's are.
                 let is_quad = insn
                     .typ
-                    .is_some_and(|t| types.kind(t) == crate::types::TypeKind::Float128);
+                    .is_some_and(|t| types.kind(t) == crate::types::TypeKind::Float128)
+                    || (matches!(insn.op, Opcode::Simd(_)) && insn.size > 64);
                 if is_quad {
                     if let Some(target) = insn.target {
                         self.quad_pseudos.insert(target);

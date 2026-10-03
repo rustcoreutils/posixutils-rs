@@ -23,6 +23,7 @@ mod asm_templates;
 mod cast_to_union;
 mod complex_specifiers;
 mod conditional_operands;
+mod constraint_sweep;
 mod declarations;
 mod expressions;
 mod function_compatibility;

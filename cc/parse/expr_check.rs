@@ -156,6 +156,17 @@ impl Parser<'_> {
             if self.check_not_vector_value(arg.typ, arg.pos) {
                 sound = false;
             }
+            // An argument is a value (C17 6.5.2.2p4), which a void
+            // expression is not -- under a prototype or not.
+            // `__builtin_va_arg_pack()` stands for the caller's arguments.
+            if !matches!(arg.kind, ExprKind::VaArgPack)
+                && arg
+                    .typ
+                    .is_some_and(|t| self.types.kind(t) == TypeKind::Void)
+            {
+                diag::error(arg.pos, &gettext("invalid use of void expression"));
+                sound = false;
+            }
         }
         let Some(func_type) = func_type else {
             return sound;
@@ -324,6 +335,8 @@ impl Parser<'_> {
                     .is_some_and(|t| self.types.kind(t) == TypeKind::Function);
             if to_function {
                 diag::error(pos, &gettext("subscripted value is pointer to function"));
+            } else if self.types.kind(pointer) == TypeKind::Pointer {
+                self.check_pointer_steps(pointer, pos);
             }
             return;
         }
@@ -401,10 +414,35 @@ impl Parser<'_> {
         }
         let t = self.decayed_type(t);
         if op.operand_class().admits(self.types, t) {
-            return true;
+            let steps = matches!(op, UnaryOperator::Increment | UnaryOperator::Decrement);
+            return !steps || self.check_pointer_steps(t, pos);
         }
         diag::error_args(pos, "wrong type argument to {0}", &[op.name()]);
         false
+    }
+
+    /// C17 6.5.6p2, 6.5.2.4p1: pointer arithmetic needs a pointer to a
+    /// complete object type, whose size is the step. A pointer to an
+    /// incomplete structure, union or enumeration was stepped by zero, and
+    /// `p - q` divided by it. (`void *` and function pointers stay gcc's
+    /// extension, stepping by one.) Answers whether `typ` may be stepped.
+    pub(super) fn check_pointer_steps(&self, typ: TypeId, pos: Position) -> bool {
+        if self.types.kind(typ) != TypeKind::Pointer {
+            return true;
+        }
+        let Some(pointee) = self.types.base_type(typ) else {
+            return true;
+        };
+        // An unsized array pointee is not tested: the type table interns
+        // `int[n]` and `int[]` alike, and stepping over the former is C.
+        let incomplete = matches!(
+            self.types.kind(pointee),
+            TypeKind::Struct | TypeKind::Union | TypeKind::Enum
+        ) && !self.types.is_composite_complete(pointee);
+        if incomplete {
+            diag::error(pos, &gettext("arithmetic on pointer to an incomplete type"));
+        }
+        !incomplete
     }
 
     /// Check an expression whose truth is tested -- the first operand of
@@ -467,6 +505,9 @@ impl Parser<'_> {
         let l = self.binary_operand(op, left, lt, rt);
         let r = self.binary_operand(op, right, rt, lt);
         match binary_operand_verdict(self.types, op, l, r) {
+            OperandVerdict::Valid if matches!(op, BinaryOp::Add | BinaryOp::Sub) => {
+                self.check_pointer_steps(lt, pos) && self.check_pointer_steps(rt, pos)
+            }
             OperandVerdict::Valid => true,
             OperandVerdict::Invalid => {
                 // `&&` and `||` have tested the left operand for truth by

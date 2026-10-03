@@ -357,21 +357,58 @@ impl Parser<'_> {
         .then_some(only.value.as_ref())
     }
 
-    /// Report an array designator that addresses past the end of its array.
+    /// Walk the initializer `init` for an object of type `typ`, in place:
     ///
-    /// Only the outermost list is walked, and only when the bound is known: an
-    /// array sized *by* this initializer cannot overflow it, and a designator
-    /// inside a nested list addresses a different object than `typ`.
-    /// C17 6.7.9p7: each designator names a member of, or an index into,
-    /// the current object -- `.y` in an initializer for a struct with no `y`
-    /// is a constraint violation, which was dropped in silence and its value
-    /// with it. Nested lists are followed wherever the subobject they
-    /// initialize is known: through a designator, or by position until brace
-    /// elision makes the position unclear.
-    pub(crate) fn check_designators(&self, typ: TypeId, elements: &[InitElement]) {
+    /// - C17 6.7.9p7: each designator names a member of, or an index into,
+    ///   the current object -- `.y` in an initializer for a struct with no
+    ///   `y` is a constraint violation, which was dropped in silence and its
+    ///   value with it.
+    /// - 6.7.9p11: a scalar's initializer is an expression, optionally in
+    ///   braces; the braces come off here, so nothing downstream meets a
+    ///   brace list for a scalar. More than one level is gcc's warning --
+    ///   and was an internal error for an automatic object's member.
+    ///
+    /// Nested lists are followed wherever the subobject they initialize is
+    /// known: through a designator, or by position until brace elision makes
+    /// the position unclear.
+    pub(crate) fn walk_initializer(&mut self, typ: TypeId, init: &mut Expr) {
+        if self.types.is_scalar(typ) {
+            self.strip_scalar_braces(init, 0);
+        } else if let ExprKind::InitList { elements } = &mut init.kind {
+            self.walk_initializer_elements(typ, elements);
+        }
+    }
+
+    /// Replace a braced initializer for a scalar with the expression it
+    /// holds; `levels` is how many braces enclose `init` already.
+    fn strip_scalar_braces(&self, init: &mut Expr, levels: u32) {
+        let ExprKind::InitList { elements } = &mut init.kind else {
+            return;
+        };
+        // `{}` is gcc's zero initializer, and a designator in a scalar's list
+        // is diagnosed where the list is checked; both stay lists.
+        if elements.is_empty() || !elements[0].designators.is_empty() {
+            return;
+        }
+        if levels > 0 {
+            diag::warning(init.pos, &gettext("braces around scalar initializer"));
+        }
+        // Only the first value initializes the scalar (6.7.9p11).
+        if elements.len() > 1 {
+            diag::warning(init.pos, &gettext("excess elements in scalar initializer"));
+        }
+        let mut first = elements.swap_remove(0).value;
+        self.strip_scalar_braces(&mut first, levels + 1);
+        *init = *first;
+    }
+
+    /// [`Self::walk_initializer`] for the elements of a brace list
+    /// initializing an aggregate of type `typ`.
+    pub(crate) fn walk_initializer_elements(&mut self, typ: TypeId, elements: &mut [InitElement]) {
         let kind = self.types.kind(typ);
         let members: Vec<TypeId> = match kind {
-            TypeKind::Struct => self
+            // A union's positional initializer is for its first named member.
+            TypeKind::Struct | TypeKind::Union => self
                 .types
                 .composite(typ)
                 .map(|c| {
@@ -379,6 +416,11 @@ impl Parser<'_> {
                         .iter()
                         .filter(|m| m.name != StringId::EMPTY || m.bit_width.is_none())
                         .map(|m| m.typ)
+                        .take(if kind == TypeKind::Union {
+                            1
+                        } else {
+                            usize::MAX
+                        })
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -391,7 +433,9 @@ impl Parser<'_> {
             let sub = if element.designators.is_empty() {
                 let sub = match kind {
                     TypeKind::Array => self.types.base_type(typ),
-                    TypeKind::Struct => next.and_then(|i| members.get(i).copied()),
+                    TypeKind::Struct | TypeKind::Union => {
+                        next.and_then(|i| members.get(i).copied())
+                    }
                     _ => None,
                 };
                 // A non-list value for an aggregate member is brace elision:
@@ -432,8 +476,15 @@ impl Parser<'_> {
                 };
                 resolved
             };
-            if let (Some(sub), ExprKind::InitList { elements }) = (sub, &element.value.kind) {
-                self.check_designators(sub, elements);
+            if let Some(sub) = sub {
+                self.walk_initializer(sub, &mut element.value);
+                // A nested list is counted against its own subobject, and a
+                // scalar's value converted to it as by assignment (6.7.9p11),
+                // as the outermost initializer is against the object.
+                self.check_excess_initializers(sub, &element.value);
+                if self.types.is_scalar(sub) {
+                    self.check_initializer_types(sub, &element.value);
+                }
             }
         }
     }
@@ -483,6 +534,11 @@ impl Parser<'_> {
         Some(current)
     }
 
+    /// Report an array designator that addresses past the end of its array.
+    ///
+    /// Only the outermost list is walked, and only when the bound is known: an
+    /// array sized *by* this initializer cannot overflow it, and a designator
+    /// inside a nested list addresses a different object than `typ`.
     fn check_designator_bounds(&self, typ: TypeId, elements: &[InitElement]) {
         if self.types.kind(typ) != TypeKind::Array {
             return;
@@ -526,7 +582,6 @@ impl Parser<'_> {
         let ExprKind::InitList { elements } = &init.kind else {
             return;
         };
-        self.check_designators(typ, elements);
         // A designator names its own position, so the *count* of elements says
         // nothing -- but the position itself can still be out of range, and
         // nothing checked that anywhere: `int a[4] = {[10] = 7};` compiled and
@@ -568,14 +623,15 @@ impl Parser<'_> {
                     diag::warning(init.pos, &gettext("excess elements in struct initializer"));
                 }
             }
-            TypeKind::Union => {}
-            _ => {
-                // A scalar may be written in braces, but only the first value
-                // initializes it (6.7.9p11).
-                if elements.len() > 1 {
-                    diag::warning(init.pos, &gettext("excess elements in scalar initializer"));
-                }
+            // A union takes one initializer (6.7.9p17 ends at its first
+            // named member); gcc warns about more.
+            TypeKind::Union if elements.len() > 1 => {
+                diag::warning(init.pos, &gettext("excess elements in union initializer"));
             }
+            // A scalar's braces are gone by now: `strip_scalar_braces`
+            // warned about any excess as it took them off. A union with one
+            // initializer has none.
+            _ => {}
         }
     }
 
@@ -1173,7 +1229,20 @@ impl<'a> Parser<'a> {
                 match resolved {
                     Resolved::Id(rid) => {
                         let named = self.types.get(rid);
-                        if added.is_empty() && !named.modifiers.contains(TypeModifiers::TYPEDEF) {
+                        let quals = added & Type::QUALIFIERS;
+                        if named.kind == TypeKind::Array && !quals.is_empty() {
+                            // C17 6.7.3p10: a qualifier on an array typedef
+                            // qualifies its elements, as `const int a[3]`
+                            // does -- on the array itself it was ignored, so
+                            // `const A x` was writable and `x[0]` an `int`.
+                            let qualified = self.types.qualified_with(rid, quals);
+                            let mut ty = self.types.get(qualified).clone();
+                            ty.modifiers.remove(TypeModifiers::TYPEDEF);
+                            ty.modifiers |= added.difference(Type::QUALIFIERS);
+                            (ty, None)
+                        } else if added.is_empty()
+                            && !named.modifiers.contains(TypeModifiers::TYPEDEF)
+                        {
                             (named.clone(), Some(rid))
                         } else {
                             // Drop the TYPEDEF bit either way. It records how

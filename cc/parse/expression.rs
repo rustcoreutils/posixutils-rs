@@ -1104,6 +1104,12 @@ impl<'a> Parser<'a> {
             return;
         }
         let from_kind = self.types.kind(from);
+        // A void expression has no value to convert (C17 6.3.2.2): `(int)g()`
+        // for a `void g(void)` read whatever the return register held.
+        if from_kind == TypeKind::Void {
+            diag::error(pos, &gettext("invalid use of void expression"));
+            return;
+        }
         let wanted = if self.types.is_float(target) {
             "a floating-point"
         } else if target_kind == TypeKind::Pointer {
@@ -1117,6 +1123,13 @@ impl<'a> Parser<'a> {
                 "aggregate value used where {0} was expected",
                 &[wanted],
             );
+        } else if from_kind == TypeKind::Pointer && self.types.is_complex(target) {
+            diag::error(
+                pos,
+                &gettext("pointer value used where a complex was expected"),
+            );
+        } else if target_kind == TypeKind::Pointer && self.types.is_complex(from) {
+            diag::error(pos, &gettext("cannot convert to a pointer type"));
         } else if from_kind == TypeKind::Pointer && self.types.is_float(target) {
             diag::error(
                 pos,
@@ -1190,7 +1203,7 @@ impl<'a> Parser<'a> {
         paren_pos: Position,
     ) -> ParseResult<Expr> {
         let init_list = self.parse_initializer_list()?;
-        let elements = match init_list.kind {
+        let mut elements = match init_list.kind {
             ExprKind::InitList { elements } => elements,
             _ => unreachable!("parse_initializer_list returns an InitList"),
         };
@@ -1201,7 +1214,7 @@ impl<'a> Parser<'a> {
         // `Some(0)`, conflating it with the GNU zero-length array. Accept
         // both, since the declaration path (`infer_array_size_from_init`)
         // also does.
-        self.check_designators(typ, &elements);
+        self.walk_initializer_elements(typ, &mut elements);
         let final_typ = if self.types.kind(typ) == TypeKind::Array
             && matches!(self.types.get(typ).array_size, None | Some(0))
         {
@@ -1679,6 +1692,15 @@ impl<'a> Parser<'a> {
                     .and_then(|f| self.types.base_type(f))
                     .unwrap_or(self.types.int_id);
                 let return_type = self.types.unqualified(return_type);
+                // 6.5.2.2p1: a call returns `void` or a complete object type;
+                // a prototype may name an incomplete one, but a call has a
+                // value of it to make.
+                if self.types.kind(return_type) != TypeKind::Void
+                    && self.type_name_is_incomplete(return_type, 0)
+                {
+                    let named = self.types.format_type(return_type, Some(self.idents));
+                    diag::error_args(call_pos, "invalid use of undefined type '{0}'", &[&named]);
+                }
 
                 let known = self.known_callee(&expr);
                 expr = self.fold_zero_length_compare(Self::typed_expr(
@@ -2813,6 +2835,21 @@ impl<'a> Parser<'a> {
 
             // Reinterpret bits as i64 (preserves bit pattern for unsigned values)
             let value = value_u64 as i64;
+
+            // C17 6.4.4.1p6: a decimal constant without `u` that no signed
+            // type of its list can hold has no type at all. gcc gives it
+            // `__int128`, with a warning, and so does c17 -- it used to wrap
+            // to a negative `long long`, so `18446744073709551615 > 0` was 0.
+            let is_decimal = !is_hex && !body.starts_with('0') && !body.starts_with("0b");
+            if is_decimal && !is_unsigned && value_u64 > i64::MAX as u64 {
+                diag::warning(
+                    pos,
+                    &gettext("integer constant is so large that it is unsigned"),
+                );
+                let typ = self.types.int128_id;
+                let lit = Self::typed_expr(ExprKind::Int128Lit(i128::from(value_u64)), typ, pos);
+                return Ok(self.imaginary_if(lit, is_imaginary, typ, pos));
+            }
 
             // Determine type according to C99 6.4.4.1:
             // - Decimal constants: int, long int, long long int (signed only)

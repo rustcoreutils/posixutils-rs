@@ -76,6 +76,37 @@ fn test_bit_field_and_type_name_rules() {
         .unwrap();
 }
 
+#[test]
+fn test_constraint_sweep_rules() {
+    for src in [
+        "int f(int); int f(a) double a; { return (int)a; }",
+        "int f(int, int); int f(a) int a; { return a; }",
+        "int f(a) int a, b; { return a; }",
+        "int f(a) int a; int a; { return a; }",
+        "int f(a) void a; { return 0; }",
+        "void g(void); int f(void) { return (int)g(); }",
+        "void v(void); int g(); void f(void) { g(v()); }",
+        "struct S; struct S *f(struct S *p) { return p + 1; }",
+        "struct S; long f(struct S *p, struct S *q) { return p - q; }",
+        "struct S; void f(struct S *p) { p++; }",
+        "struct S; struct S f(void) {}",
+        "typedef void F(void); F f {}",
+        "struct S; struct S g(void); void f(void) { g(); }",
+        "int *f(double _Complex z) { return (int *)z; }",
+        "void f(const void);",
+        "struct S { int a, b; }; struct S g(void); void f(void) { struct S s = {g()}; }",
+        "typedef int A[3]; const A x = {1, 2, 3}; void f(void) { x[0] = 1; }",
+    ] {
+        assert_rejected(src);
+    }
+    parse_tu(
+        "struct S { int a : 3; int b; }; void f(void) { struct S s = {{1}, 2}; double d = {2.5}; }\
+         int g(char); int g(c) char c; { return c; }\
+         typedef struct { int a; } T; struct U { T; int b; };",
+    )
+    .unwrap();
+}
+
 /// Parse `src`, requiring it to be accepted: no parse error and no error
 /// diagnostic. `parse_tu(..).unwrap()` alone says nothing about the latter.
 fn assert_accepted(src: &str) {

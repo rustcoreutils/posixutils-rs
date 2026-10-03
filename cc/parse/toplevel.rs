@@ -26,6 +26,7 @@ use crate::strings::StringId;
 use crate::symbol::{Symbol, SymbolId};
 use crate::token::lexer::{payload_text, Position, TokenType};
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
+use gettextrs::gettext;
 use std::collections::HashMap;
 
 impl Parser<'_> {
@@ -320,6 +321,7 @@ impl Parser<'_> {
         let mut params = params.unwrap_or_default();
         let typ = self.parse_old_style_parameters(typ, &mut params)?;
         self.check_parameters_complete(&params, pos);
+        self.check_identifier_list_against_prototype(name, typ, &params, pos);
         let func = self.types.get(typ);
         // An identifier list records no parameter types (C17 6.7.6.3p14).
         let param_style = if func.params.is_some() {
@@ -328,6 +330,13 @@ impl Parser<'_> {
             ParamStyle::IdentifierList
         };
         let return_type = func.base.expect("a function type has a return type");
+        // C17 6.9.1p3: a definition returns `void` or a complete object
+        // type, since its `return` makes one.
+        if self.types.kind(return_type) != TypeKind::Void
+            && self.type_name_is_incomplete(return_type, 0)
+        {
+            diag::error(pos, &gettext("return type is an incomplete type"));
+        }
 
         let form = match param_style {
             ParamStyle::Prototype => Redeclared::Declaration,
@@ -422,6 +431,51 @@ impl Parser<'_> {
         }
     }
 
+    /// C17 6.7.6.3p15, 6.9.1p7: a definition with an identifier list after a
+    /// prototype takes as many parameters as the prototype, each of a type
+    /// compatible with the prototype's once the default argument promotions
+    /// are applied -- `int f(int); int f(a) double a; { ... }` called `f`
+    /// with an `int` and read a `double`. gcc's errors.
+    fn check_identifier_list_against_prototype(
+        &mut self,
+        name: StringId,
+        typ: TypeId,
+        params: &[RawParam],
+        pos: Position,
+    ) {
+        if self.types.get(typ).params.is_some() {
+            return;
+        }
+        let Some(prior) = self
+            .symbols
+            .lookup(name, crate::symbol::Namespace::Ordinary)
+        else {
+            return;
+        };
+        let Some(proto) = self.types.get(prior.typ).params.clone() else {
+            return;
+        };
+        if proto.len() != params.len() {
+            diag::error(pos, &gettext("number of arguments doesn't match prototype"));
+            return;
+        }
+        for (declared, raw) in proto.iter().zip(params) {
+            let declared = self.types.decayed(*declared);
+            let promoted = self.types.default_argument_promote(raw.typ);
+            if self.types.types_compatible(declared, raw.typ)
+                || self.types.types_compatible(declared, promoted)
+            {
+                continue;
+            }
+            let spelled = raw
+                .name
+                .and_then(|n| self.idents.get_opt(n))
+                .unwrap_or("")
+                .to_string();
+            diag::error_args(pos, "argument '{0}' doesn't match prototype", &[&spelled]);
+        }
+    }
+
     /// K&R (old-style) parameter declarations, between the declarator and the
     /// body: `int add(a, b) int a; int b; { ... }`.
     ///
@@ -435,6 +489,10 @@ impl Parser<'_> {
         params: &mut [RawParam],
     ) -> ParseResult<TypeId> {
         let mut declared = false;
+        // C17 6.9.1p6: each declaration declares an identifier in the list,
+        // once, and every identifier in the list is declared.
+        let identifier_list = self.types.get(typ).params.is_none();
+        let mut seen: Vec<StringId> = Vec::new();
         while self.is_declaration_start() {
             declared = true;
             let knr_pos = self.current_pos();
@@ -471,6 +529,25 @@ impl Parser<'_> {
                 // stack-slot bound can be asked of it.
                 // `parse_parameter_list_inner` never saw it.
                 self.check_stack_object_size(decl_typ, self.current_pos(), "a by-value parameter")?;
+                if identifier_list {
+                    let spelled = self.idents.get_opt(decl_name).unwrap_or("").to_string();
+                    if !params.iter().any(|p| p.name == Some(decl_name)) {
+                        diag::error_args(
+                            knr_pos,
+                            "declaration for parameter '{0}' but no such parameter",
+                            &[&spelled],
+                        );
+                    } else if seen.contains(&decl_name) {
+                        diag::error_args(knr_pos, "redefinition of parameter '{0}'", &[&spelled]);
+                    } else if self.types.kind(decl_typ) == TypeKind::Void {
+                        diag::error_args(
+                            knr_pos,
+                            "parameter '{0}' declared with void type",
+                            &[&spelled],
+                        );
+                    }
+                    seen.push(decl_name);
+                }
                 for param in params.iter_mut() {
                     if param.name == Some(decl_name) {
                         param.typ = decl_typ;
@@ -482,6 +559,22 @@ impl Parser<'_> {
                 self.advance();
             }
             self.expect_special(b';')?;
+        }
+
+        // An identifier the declarations left out is `int`, the C89 rule
+        // gcc keeps with a warning. C17 6.9.1p6 requires the declaration,
+        // but as a semantic rule, not a constraint.
+        if identifier_list {
+            for param in params.iter() {
+                let Some(name) = param.name.filter(|n| !seen.contains(n)) else {
+                    continue;
+                };
+                let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
+                diag::warning(
+                    self.current_pos(),
+                    &format!("type of '{spelled}' defaults to 'int'"),
+                );
+            }
         }
 
         let mut func = self.types.get(typ).clone();

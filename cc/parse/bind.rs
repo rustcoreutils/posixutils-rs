@@ -328,6 +328,15 @@ impl Parser<'_> {
         if let Some(attrs) = &fn_attrs {
             let body_follows = self.is_special(b'{') || self.is_declaration_start();
             if scope == DeclScope::File && first && body_follows {
+                // C17 6.9.1p2: the declarator itself gives a definition its
+                // function type; one that came from a typedef has no
+                // parameter list for the body to name.
+                if params.is_none() {
+                    diag::error(
+                        pos,
+                        &gettext("function definition declared through a typedef"),
+                    );
+                }
                 // A definition's parameters are in its block's scope, not a
                 // prototype's, so `[*]` has no business there (6.7.6.2p4).
                 if let Some(star) = params.as_ref().and_then(|list| list.star) {
@@ -682,7 +691,8 @@ impl Parser<'_> {
             ));
         }
         self.advance();
-        let init = self.parse_initializer()?;
+        let mut init = self.parse_initializer()?;
+        self.walk_initializer(*typ, &mut init);
 
         // 6.7.9p5: an identifier declared `extern` at block scope has
         // linkage, so it refers to a definition elsewhere and cannot carry

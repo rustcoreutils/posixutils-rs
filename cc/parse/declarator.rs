@@ -826,6 +826,13 @@ impl Parser<'_> {
             // one-parameter prototype.
             if self.types.kind(typ_id) == TypeKind::Void {
                 if name_opt.is_none() && params.is_empty() && self.is_special(b')') {
+                    // ... and unqualified (6.7.6.3p10): `void f(const void)`.
+                    if self.types.modifiers(typ_id).intersects(Type::QUALIFIERS) {
+                        diag::error(
+                            self.current_pos(),
+                            &gettext("'void' as only parameter may not be qualified"),
+                        );
+                    }
                     return Ok(ParameterList {
                         params,
                         variadic,

@@ -15,7 +15,7 @@ use super::parser::{DeclaratorContext, ParseError, ParseResult, ParsedDeclarator
 use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId};
-use crate::token::lexer::{Position, TokenType};
+use crate::token::lexer::{Position, TokenType, TokenValue};
 use crate::types::{
     CompositeType, EnumConstant, MemberAlign, StructMember, Type, TypeId, TypeKind, TypeModifiers,
 };
@@ -650,7 +650,14 @@ impl Parser<'_> {
             self.pending_alignas_kw = None;
 
             // Parse member declaration
+            let specs_start = self.pos;
             let member_specs = self.parse_declaration_specifiers(SpecContext::Member)?;
+            // Whether the specifiers spell out a structure or union -- the
+            // only thing that can make an anonymous member -- rather than
+            // naming one through a typedef.
+            let spelled_tag = self.tokens[specs_start..self.pos].iter().any(|t| {
+                matches!(&t.value, TokenValue::Ident(id) if *id == crate::kw::STRUCT || *id == crate::kw::UNION)
+            });
             let member_base_type = &member_specs.ty;
             let is_struct_or_union =
                 matches!(member_base_type.kind, TypeKind::Struct | TypeKind::Union);
@@ -673,13 +680,17 @@ impl Parser<'_> {
                 // declares the tag and nothing else, as gcc reads it --
                 // taking it as a member made `struct A { struct A; }`
                 // contain itself.
+                // A typedef name for one is not a specifier that makes an
+                // anonymous member either (6.7.2.1p13 asks for a
+                // struct-or-union-specifier): `T;` declares nothing, and
+                // taking it as a member changed the layout gcc gives.
                 let tagged = self
                     .types
                     .get(member_base_type_id)
                     .composite
                     .as_ref()
                     .is_some_and(|c| c.tag.is_some());
-                if tagged {
+                if tagged || !spelled_tag {
                     diag::warning(
                         self.current_pos(),
                         &gettext("declaration does not declare anything"),

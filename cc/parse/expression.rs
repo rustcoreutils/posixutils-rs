@@ -18,7 +18,7 @@ use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol};
 use crate::token::lexer::{Position, SpecialToken, TokenType, TokenValue};
 use crate::token::literal;
-use crate::types::{Type, TypeId, TypeKind};
+use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
 
 const DEFAULT_ARG_LIST_CAPACITY: usize = 8;
@@ -1608,6 +1608,27 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
+    /// The type of `__func__`: `const char[N]` for the enclosing function's
+    /// name. Outside a function gcc warns and gives it an empty name.
+    fn func_name_type(&mut self, spelled: StringId, pos: Position) -> TypeId {
+        let len = match self.enclosing_function.name {
+            Some(name) => self.idents.get_opt(name).map_or(0, str::len),
+            None => {
+                let spelled = self.idents.get_opt(spelled).unwrap_or("__func__");
+                diag::warning_args(
+                    pos,
+                    "'{0}' is not defined outside of function scope",
+                    &[spelled],
+                );
+                0
+            }
+        };
+        let const_char = self
+            .types
+            .qualified_with(self.types.char_id, TypeModifiers::CONST);
+        self.types.intern(Type::array(const_char, len + 1))
+    }
+
     /// Parse a run of adjacent string literals into one expression.
     ///
     /// C11 6.4.5p5: if any literal in the run has an encoding prefix, the
@@ -2288,20 +2309,18 @@ impl<'a> Parser<'a> {
                         }
                     }
 
-                    // Look up symbol to get type (during parsing, symbol is in scope)
-                    // C99 6.4.2.2: __func__ is a predefined identifier with type const char[]
-                    // GCC extensions: __FUNCTION__ and __PRETTY_FUNCTION__ behave similarly
+                    // C17 6.4.2.2p1: `__func__` is implicitly declared
+                    // `static const char __func__[] = "function-name";`, so
+                    // its type is `const char[N]`: `sizeof __func__` is the
+                    // name's length plus one, and it decays like any array.
+                    // gcc's `__FUNCTION__` and `__PRETTY_FUNCTION__` are the
+                    // same in C.
                     if name_id == crate::kw::FUNC
                         || name_id == crate::kw::FUNCTION
                         || name_id == crate::kw::PRETTY_FUNCTION
                     {
-                        // These behave like a string literal (const char[])
-                        // Linearization handles mapping to __func__ behavior
-                        return Ok(Self::typed_expr(
-                            ExprKind::FuncName,
-                            self.types.char_ptr_id,
-                            token_pos,
-                        ));
+                        let typ = self.func_name_type(name_id, token_pos);
+                        return Ok(Self::typed_expr(ExprKind::FuncName, typ, token_pos));
                     }
 
                     // Check if this is an enum constant - if so, return IntLit

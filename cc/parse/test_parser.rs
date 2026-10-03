@@ -4820,28 +4820,30 @@ fn test_function_param_array_adjusted_to_pointer() {
 
 #[test]
 fn test_gcc_function_identifier_parsing() {
-    // __FUNCTION__ should parse as FuncName with char* type
+    // __FUNCTION__ is `__func__` in C: a `const char` array, here outside any
+    // function and so holding only the terminator.
     let (expr, types, _, _) = parse_expr("__FUNCTION__").unwrap();
     match &expr.kind {
         ExprKind::FuncName => {}
         _ => panic!("Expected FuncName, got {:?}", expr.kind),
     }
-    // Type should be char*
     let typ = expr.typ.unwrap();
-    assert_eq!(types.kind(typ), TypeKind::Pointer);
+    assert_eq!(types.kind(typ), TypeKind::Array);
+    assert_eq!(types.size_bytes(typ), 1);
 }
 
 #[test]
 fn test_gcc_pretty_function_identifier_parsing() {
-    // __PRETTY_FUNCTION__ should parse as FuncName with char* type
+    // __PRETTY_FUNCTION__ is `__func__` in C: a `const char` array, here outside any
+    // function and so holding only the terminator.
     let (expr, types, _, _) = parse_expr("__PRETTY_FUNCTION__").unwrap();
     match &expr.kind {
         ExprKind::FuncName => {}
         _ => panic!("Expected FuncName, got {:?}", expr.kind),
     }
-    // Type should be char*
     let typ = expr.typ.unwrap();
-    assert_eq!(types.kind(typ), TypeKind::Pointer);
+    assert_eq!(types.kind(typ), TypeKind::Array);
+    assert_eq!(types.size_bytes(typ), 1);
 }
 
 // Long double type parsing tests

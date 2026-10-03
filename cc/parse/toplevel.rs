@@ -147,6 +147,7 @@ impl Parser<'_> {
     /// need to know of the function (see [`EnclosingFunction`]).
     fn parse_function_body(
         &mut self,
+        name: StringId,
         attrs: &FunctionAttrs,
         typ: TypeId,
         last_param: Option<StringId>,
@@ -161,6 +162,7 @@ impl Parser<'_> {
                 last_param,
                 conv: func.conv,
                 return_type: func.base,
+                name: Some(name),
             },
         );
         let body = self.parse_block_stmt_no_scope();
@@ -294,7 +296,7 @@ impl Parser<'_> {
             })
             .collect();
         // Parse body without creating another scope
-        let body = self.parse_function_body(&attrs, typ, last_param)?;
+        let body = self.parse_function_body(name, &attrs, typ, last_param)?;
         self.symbols.leave_scope();
 
         Ok(FunctionDef {

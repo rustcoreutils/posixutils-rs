@@ -37,6 +37,8 @@ mod test_incomplete;
 mod test_member_list;
 #[cfg(test)]
 mod test_parser;
+#[cfg(test)]
+mod test_specifiers;
 
 // Re-export parser used by main.rs
 pub use library_builtin::LibraryCallPolicy;

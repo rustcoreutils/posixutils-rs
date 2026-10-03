@@ -9,8 +9,9 @@
 /* C99 7.3.1: macros */
 #define complex _Complex
 
-/* I macro: imaginary unit constant */
-#define _Complex_I __builtin_complex(0.0, 1.0)
+/* C17 7.3.1p4: _Complex_I has type `const float _Complex`. A double one
+   widened every float complex expression it touched. */
+#define _Complex_I __builtin_complex(0.0f, 1.0f)
 #define I _Complex_I
 
 /* C99 7.3.9: manipulation functions (implemented by libm) */

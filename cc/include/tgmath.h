@@ -27,9 +27,24 @@
  * The controlling expression of a _Generic is not evaluated (C17 6.5.1.1p2);
  * only its type is used, after lvalue conversion. That is what lets these
  * dispatch on an argument that has side effects, and what lets the
- * two-argument forms dispatch on `(x)+(y)` -- the usual arithmetic conversions
- * pick the common type without either operand being evaluated.
+ * multi-argument forms dispatch on a sum of their arguments (see __tg_t) --
+ * the usual arithmetic conversions pick the common type without any operand
+ * being evaluated.
  * ------------------------------------------------------------------------ */
+
+/* C17 7.25p3: an argument of integer type counts as `double` when choosing
+   the function. A one-argument macro gets that from `default:`; for the
+   multi-argument ones the arguments' common type is taken over these stand-ins
+   rather than the arguments themselves, so `pow(i, f)` for an `int i` and a
+   `float f` is `pow`, not `powf` -- the usual arithmetic conversions alone
+   would have made it `float` and rounded `i`. */
+#define __tg_t(x) _Generic((x), \
+    float: (x), \
+    long double: (x), \
+    float _Complex: (x), \
+    double _Complex: (x), \
+    long double _Complex: (x), \
+    default: 0.0)
 
 /* Real-only: float / double / long double, integers promoted to double. */
 #define __tg_real(fn, x) _Generic((x), \
@@ -46,10 +61,12 @@
     long double _Complex: cfn##l, \
     default: fn)
 
-/* Complex-only, one argument. A real argument is treated as a complex value
-   with a zero imaginary part, so the real types map to the double forms. */
+/* Complex-only, one argument. A real argument is treated as the complex type
+   of its own precision (C17 7.25p3), and an integer as `double`. */
 #define __tg_cplx(cfn, x) _Generic((x), \
+    float: cfn##f, \
     float _Complex: cfn##f, \
+    long double: cfn##l, \
     long double _Complex: cfn##l, \
     default: cfn)
 
@@ -75,28 +92,28 @@
 #define fabs(x)  __tg_rc(fabs,  cabs,   x)(x)
 
 /* pow dispatches on the combined type of both arguments. */
-#define pow(x, y) __tg_rc(pow, cpow, (x) + (y))((x), (y))
+#define pow(x, y) __tg_rc(pow, cpow, __tg_t(x) + __tg_t(y))((x), (y))
 
 /* ------------------------------------------------------------------------
  * 7.25.3 - real only
  * ------------------------------------------------------------------------ */
 
-#define atan2(x, y)     __tg_real(atan2,     (x) + (y))((x), (y))
+#define atan2(x, y)     __tg_real(atan2,     __tg_t(x) + __tg_t(y))((x), (y))
 #define cbrt(x)         __tg_real(cbrt,      x)(x)
 #define ceil(x)         __tg_real(ceil,      x)(x)
-#define copysign(x, y)  __tg_real(copysign,  (x) + (y))((x), (y))
+#define copysign(x, y)  __tg_real(copysign,  __tg_t(x) + __tg_t(y))((x), (y))
 #define erf(x)          __tg_real(erf,       x)(x)
 #define erfc(x)         __tg_real(erfc,      x)(x)
 #define exp2(x)         __tg_real(exp2,      x)(x)
 #define expm1(x)        __tg_real(expm1,     x)(x)
-#define fdim(x, y)      __tg_real(fdim,      (x) + (y))((x), (y))
+#define fdim(x, y)      __tg_real(fdim,      __tg_t(x) + __tg_t(y))((x), (y))
 #define floor(x)        __tg_real(floor,     x)(x)
-#define fma(x, y, z)    __tg_real(fma,       (x) + (y) + (z))((x), (y), (z))
-#define fmax(x, y)      __tg_real(fmax,      (x) + (y))((x), (y))
-#define fmin(x, y)      __tg_real(fmin,      (x) + (y))((x), (y))
-#define fmod(x, y)      __tg_real(fmod,      (x) + (y))((x), (y))
+#define fma(x, y, z)    __tg_real(fma,       __tg_t(x) + __tg_t(y) + __tg_t(z))((x), (y), (z))
+#define fmax(x, y)      __tg_real(fmax,      __tg_t(x) + __tg_t(y))((x), (y))
+#define fmin(x, y)      __tg_real(fmin,      __tg_t(x) + __tg_t(y))((x), (y))
+#define fmod(x, y)      __tg_real(fmod,      __tg_t(x) + __tg_t(y))((x), (y))
 #define frexp(x, p)     __tg_real(frexp,     x)((x), (p))
-#define hypot(x, y)     __tg_real(hypot,     (x) + (y))((x), (y))
+#define hypot(x, y)     __tg_real(hypot,     __tg_t(x) + __tg_t(y))((x), (y))
 #define ilogb(x)        __tg_real(ilogb,     x)(x)
 #define ldexp(x, n)     __tg_real(ldexp,     x)((x), (n))
 #define lgamma(x)       __tg_real(lgamma,    x)(x)
@@ -109,9 +126,9 @@
 #define lrint(x)        __tg_real(lrint,     x)(x)
 #define lround(x)       __tg_real(lround,    x)(x)
 #define nearbyint(x)    __tg_real(nearbyint, x)(x)
-#define nextafter(x, y) __tg_real(nextafter, (x) + (y))((x), (y))
-#define remainder(x, y) __tg_real(remainder, (x) + (y))((x), (y))
-#define remquo(x, y, q) __tg_real(remquo,    (x) + (y))((x), (y), (q))
+#define nextafter(x, y) __tg_real(nextafter, __tg_t(x) + __tg_t(y))((x), (y))
+#define remainder(x, y) __tg_real(remainder, __tg_t(x) + __tg_t(y))((x), (y))
+#define remquo(x, y, q) __tg_real(remquo,    __tg_t(x) + __tg_t(y))((x), (y), (q))
 #define rint(x)         __tg_real(rint,      x)(x)
 #define round(x)        __tg_real(round,     x)(x)
 #define scalbln(x, n)   __tg_real(scalbln,   x)((x), (n))

@@ -32,9 +32,10 @@ struct SpecifierTally<'a> {
     /// -- or, for a typedef name or `typeof`, as written. More than one is
     /// always a constraint violation.
     data_types: Vec<(&'a str, Position)>,
-    /// Whether `_Complex` appeared. It names no data type of its own, but it
-    /// is a type specifier, so a typedef name after it is the declarator.
-    complex: bool,
+    /// Where `_Complex` appeared, if it did. It names no data type of its
+    /// own, but it is a type specifier, so a typedef name after it is the
+    /// declarator.
+    complex: Option<Position>,
     short_count: u32,
     long_count: u32,
     signed_count: u32,
@@ -72,7 +73,7 @@ impl<'a> SpecifierTally<'a> {
     /// only whether a data type had been seen took it as the type.
     fn has_type_specifier(&self) -> bool {
         !self.data_types.is_empty()
-            || self.complex
+            || self.complex.is_some()
             || self.short_count + self.long_count + self.signed_count + self.unsigned_count > 0
     }
 
@@ -158,6 +159,25 @@ impl<'a> SpecifierTally<'a> {
         }
 
         let data_type = self.data_types.first().map(|(name, _)| *name);
+
+        // `_Complex` qualifies a floating type (C17 6.7.2p2), or an integer
+        // one as gcc's extension. Anything else -- a typedef name, `typeof`,
+        // a tag, `_Bool`, `void` -- is no complex type, and the keyword was
+        // silently dropped: `typedef double ty; ty _Complex z;` made `z` a
+        // plain `double`.
+        if let (Some(pos), Some(data)) = (self.complex, data_type) {
+            let base_ok = matches!(
+                data,
+                "float" | "double" | "char" | "int" | "__int128" | "_Float16" | "__float128"
+            );
+            if !base_ok {
+                diag::error_args(
+                    pos,
+                    "both '_Complex' and '{0}' in declaration specifiers",
+                    &[data],
+                );
+            }
+        }
 
         // `short` and `long` pair with `int`; `long` alone also pairs with
         // `double`. Nothing else.
@@ -711,7 +731,7 @@ impl<'a> Parser<'a> {
                     modifiers |= TypeModifiers::UNSIGNED;
                 }
                 crate::kw::COMPLEX | crate::kw::GNU_COMPLEX | crate::kw::GNU_COMPLEX2 => {
-                    tally.complex = true;
+                    tally.complex = Some(pos);
                     self.advance();
                     modifiers |= TypeModifiers::COMPLEX;
                 }
@@ -735,7 +755,7 @@ impl<'a> Parser<'a> {
                 // written, so nothing after it reports the same mistake again.
                 crate::kw::IMAGINARY => {
                     diag::error(pos, "imaginary types are not supported");
-                    tally.complex = true;
+                    tally.complex = Some(pos);
                     self.advance();
                     modifiers |= TypeModifiers::COMPLEX;
                 }

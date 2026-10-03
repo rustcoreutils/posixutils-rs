@@ -166,6 +166,10 @@ pub(crate) struct EnclosingFunction {
     /// The declared return type, which a `return` converts its value to.
     /// `None` outside a function body.
     pub(crate) return_type: Option<TypeId>,
+    /// The function's name as written, which `__func__` holds (C17
+    /// 6.4.2.2p1) -- not an asm label it is emitted under. `None` outside a
+    /// function body.
+    pub(crate) name: Option<StringId>,
 }
 
 /// C expression parser using recursive descent with precedence climbing

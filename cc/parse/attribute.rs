@@ -926,10 +926,14 @@ impl Parser<'_> {
         let t = &self.types;
         let mapped = match mode.as_str() {
             // Integer modes, named for their width in bytes.
-            "QI" => Some(if unsigned { t.uchar_id } else { t.schar_id }),
+            // `byte` is a byte, and `word`, `pointer` and `unwind_word` are
+            // eight bytes on every target c17 has.
+            "QI" | "byte" => Some(if unsigned { t.uchar_id } else { t.schar_id }),
             "HI" => Some(if unsigned { t.ushort_id } else { t.short_id }),
             "SI" => Some(if unsigned { t.uint_id } else { t.int_id }),
-            "DI" | "word" | "pointer" => Some(if unsigned { t.ulong_id } else { t.long_id }),
+            "DI" | "word" | "pointer" | "unwind_word" => {
+                Some(if unsigned { t.ulong_id } else { t.long_id })
+            }
             "TI" => Some(if unsigned { t.uint128_id } else { t.int128_id }),
             // Floating modes. `XF` is the x87 extended format and `TF` IEEE
             // binary128 -- both sixteen bytes on x86-64 and *not*

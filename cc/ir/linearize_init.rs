@@ -378,6 +378,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                 }
             }
 
+            // `__func__` is a static array (C17 6.4.2.2p1), so its address is
+            // an address constant: `static const char *p = __func__;`.
+            ExprKind::FuncName if self.types.kind(typ) != TypeKind::Array => {
+                let name = self.str(self.current_func_ident).to_string();
+                Initializer::SymAddr(self.module.add_string(name))
+            }
+
             // Prefixed string literals: embedded for an array, interned and
             // referenced otherwise.
             ExprKind::Utf16StringLit(units) => {
@@ -832,6 +839,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         // true without needing a value.
         match &cond.kind {
             ExprKind::StringLit(_)
+            | ExprKind::FuncName
             | ExprKind::WideStringLit(_)
             | ExprKind::Utf16StringLit(_)
             | ExprKind::Utf32StringLit(_) => Some(true),

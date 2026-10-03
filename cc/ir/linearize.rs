@@ -685,6 +685,9 @@ pub struct Linearizer<'a> {
     pub(crate) reg_aggregate_return_type: Option<TypeId>,
     /// Current function name (for generating unique static local names)
     pub(crate) current_func_name: String,
+    /// The function's name as written, which `__func__` holds; the emitted
+    /// name above is an asm label's when it has one.
+    pub(crate) current_func_ident: StringId,
 
     /// Blocks whose address is taken by `&&label` in the function being
     /// linearized. Every indirect `goto` may reach any of them, so each is
@@ -844,6 +847,7 @@ impl<'a> Linearizer<'a> {
             struct_return_ptr: None,
             reg_aggregate_return_type: None,
             current_func_name: String::new(),
+            current_func_ident: StringId::EMPTY,
             addr_taken_labels: Vec::new(),
             label_refs: Vec::new(),
             defined_labels: std::collections::HashSet::new(),
@@ -1774,6 +1778,7 @@ impl<'a> Linearizer<'a> {
         self.struct_return_ptr = None;
         self.reg_aggregate_return_type = None;
         self.current_func_name = self.emitted_name(func.name);
+        self.current_func_ident = func.name;
         self.addr_taken_labels.clear();
         self.label_refs.clear();
         self.defined_labels.clear();
@@ -4725,8 +4730,11 @@ impl<'a> Linearizer<'a> {
         // static const char __func__[] = "function-name";
         // GCC extensions: __FUNCTION__ and __PRETTY_FUNCTION__ behave the same way
 
-        // Add function name as a string literal to the module
-        let label = self.module.add_string(self.current_func_name.clone());
+        // The name as written, not an asm label: `int f(void) __asm__("g")`
+        // has `__func__` "f", as in gcc.
+        let label = self
+            .module
+            .add_string(self.str(self.current_func_ident).to_string());
 
         // Create symbol pseudo for the string label
         let sym_id = self.sym_pseudo(label);

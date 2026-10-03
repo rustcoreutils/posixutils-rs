@@ -1123,8 +1123,10 @@ impl X86_64CodeGen {
                     crate::abi::HfaBase::Float64 => 64,
                     // System V has no HFA concept and `long double` is x87
                     // there, so this classification never reaches x86_64.
-                    crate::abi::HfaBase::Float128 => {
-                        unreachable!("binary128 HFA is an AAPCS64 classification")
+                    crate::abi::HfaBase::Float128
+                    | crate::abi::HfaBase::ShortVector64
+                    | crate::abi::HfaBase::ShortVector128 => {
+                        unreachable!("binary128 and short-vector HFAs are AAPCS64 classifications")
                     }
                 };
                 self.emit_fp_move_from_xmm(

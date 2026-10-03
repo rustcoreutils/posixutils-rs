@@ -508,9 +508,10 @@ impl Parser<'_> {
                 } = self.parse_declarator(knr_base_id, DeclaratorContext::OldStyleParameter)?;
                 self.check_parameter_specifiers(knr_type.modifiers, decl_name, knr_pos);
                 self.check_not_vector_value(Some(decl_typ), self.current_pos());
-                // C99 6.7.5.3: array/function params adjusted to pointers
+                // C99 6.7.5.3: array/function params adjusted to pointers;
+                // a vector is passed by value.
                 let adjusted = self.types.get(decl_typ);
-                if adjusted.kind == TypeKind::Array {
+                if adjusted.kind == TypeKind::Array && !self.types.is_vector(decl_typ) {
                     let elem = adjusted.base.unwrap_or(self.types.void_id);
                     decl_typ = self.types.intern(Type {
                         kind: TypeKind::Pointer,

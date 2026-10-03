@@ -18,9 +18,10 @@
 
 use super::linearize::{BlockVolatility, Linearizer};
 use super::{Instruction, PseudoId};
+use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, BinaryOp, Expr, UnaryOp};
-use crate::types::TypeId;
+use crate::types::{TypeId, TypeKind};
 
 /// Where an operand's lane `i` comes from.
 #[derive(Clone, Copy)]
@@ -32,6 +33,172 @@ enum Lanes {
 }
 
 impl Linearizer<'_> {
+    /// The type the convention `conv` passes and returns vectors of type
+    /// `vec` as (`Abi::vector_carrier`). The parser refuses a vector at a
+    /// call boundary that has none, so a missing one is the vector itself,
+    /// which every path below then refuses to take apart.
+    pub(crate) fn vector_carrier(&self, vec: TypeId, conv: CallingConv) -> TypeId {
+        get_abi_for_conv(conv, self.target)
+            .vector_carrier(vec, self.types)
+            .unwrap_or(vec)
+    }
+
+    /// `typ`, or the carrier of `typ` if it is a vector: what a parameter or
+    /// argument of type `typ` travels as.
+    pub(crate) fn abi_type(&self, typ: TypeId, conv: CallingConv) -> TypeId {
+        if self.types.is_vector(typ) {
+            self.vector_carrier(typ, conv)
+        } else {
+            typ
+        }
+    }
+
+    /// `typ`, or what a vector of type `typ` is returned as
+    /// (`Abi::vector_return_carrier`): what a return value of type `typ`
+    /// travels as.
+    pub(crate) fn abi_return_type(&self, typ: TypeId, conv: CallingConv) -> TypeId {
+        if !self.types.is_vector(typ) {
+            return typ;
+        }
+        get_abi_for_conv(conv, self.target)
+            .vector_return_carrier(typ, self.types)
+            .unwrap_or(typ)
+    }
+
+    /// The vector `vec` is widened to, lane by lane, to be returned under
+    /// `conv` (`Abi::vector_return_widened`).
+    fn vector_return_widened(&self, vec: TypeId, conv: CallingConv) -> Option<TypeId> {
+        get_abi_for_conv(conv, self.target).vector_return_widened(vec, self.types)
+    }
+
+    /// The value a function returning the vector of type `vec` at `addr`
+    /// returns, as its return `carrier`: the vector's bits, or those of the
+    /// vector it is widened to.
+    pub(crate) fn vector_return_value(
+        &mut self,
+        addr: PseudoId,
+        vec: TypeId,
+        carrier: TypeId,
+        conv: CallingConv,
+    ) -> PseudoId {
+        let addr = match self.vector_return_widened(vec, conv) {
+            Some(widened) => self.convert_vector_at(addr, vec, widened),
+            None => addr,
+        };
+        self.vector_to_carrier(addr, carrier)
+    }
+
+    /// The vector of type `vec` a call under `conv` returned as `carrier` in
+    /// `result` ([`Self::vector_call_result`]), narrowed back where it was
+    /// returned widened.
+    pub(crate) fn vector_returned(
+        &mut self,
+        result: PseudoId,
+        carrier: TypeId,
+        vec: TypeId,
+        conv: CallingConv,
+    ) -> PseudoId {
+        match self.vector_return_widened(vec, conv) {
+            Some(widened) => {
+                let wide = self.vector_from_carrier(result, carrier, widened);
+                self.convert_vector_at(wide, widened, vec)
+            }
+            None => self.vector_call_result(result, carrier, vec),
+        }
+    }
+
+    /// Whether `carrier` travels as an aggregate, by address, rather than as
+    /// a value in a register.
+    fn carrier_is_aggregate(&self, carrier: TypeId) -> bool {
+        matches!(self.types.kind(carrier), TypeKind::Struct | TypeKind::Union)
+    }
+
+    /// A vector argument, as the convention passes it: the value of its
+    /// carrier, loaded from the vector's lanes, or -- for a carrier that is
+    /// an aggregate -- the vector's address under the carrier's type, copied
+    /// first where the convention passes it by reference.
+    pub(crate) fn lower_vector_arg(&mut self, a: &Expr, conv: CallingConv) -> (PseudoId, TypeId) {
+        let vec = self.expr_type(a);
+        let carrier = self.vector_carrier(vec, conv);
+        let addr = self.vector_addr(a);
+        if !self.carrier_is_aggregate(carrier) {
+            return (self.vector_to_carrier(addr, carrier), carrier);
+        }
+        let val = if self.passed_by_reference(carrier, conv) {
+            let vol = self.block_volatility(carrier, vec);
+            self.argument_copy(addr, carrier, true, vol)
+        } else {
+            addr
+        };
+        (val, carrier)
+    }
+
+    /// The bits of the vector at `addr`, as a value of the scalar `carrier`.
+    pub(crate) fn vector_to_carrier(&mut self, addr: PseudoId, carrier: TypeId) -> PseudoId {
+        let bits = self.types.size_bits(carrier);
+        let value = self.alloc_reg_pseudo();
+        self.emit(Instruction::load(value, addr, 0, carrier, bits));
+        value
+    }
+
+    /// The vector of type `vec` whose bits are `value`, of the scalar
+    /// `carrier`: stored to a fresh temporary, whose address is the vector.
+    pub(crate) fn vector_from_carrier(
+        &mut self,
+        value: PseudoId,
+        carrier: TypeId,
+        vec: TypeId,
+    ) -> PseudoId {
+        let result = self.frame_temp_addr("__vec", vec);
+        let bits = self.types.size_bits(carrier);
+        self.emit(Instruction::store(value, result, 0, carrier, bits));
+        result
+    }
+
+    /// The vector of type `vec` a call returning its `carrier` produced in
+    /// `result`: the carrier's bits, stored to a temporary, or the address
+    /// of the aggregate the callee wrote through the hidden pointer.
+    pub(crate) fn vector_call_result(
+        &mut self,
+        result: PseudoId,
+        carrier: TypeId,
+        vec: TypeId,
+    ) -> PseudoId {
+        if self.carrier_is_aggregate(carrier) {
+            self.rvalue_addr(result, carrier)
+        } else {
+            self.vector_from_carrier(result, carrier, vec)
+        }
+    }
+
+    /// The vector at `src`, of type `from_typ`, with each lane converted to
+    /// those of `result_typ`, as by a cast.
+    fn convert_vector_at(
+        &mut self,
+        src: PseudoId,
+        from_typ: TypeId,
+        result_typ: TypeId,
+    ) -> PseudoId {
+        let (to, count, to_size) = self.vector_shape(result_typ);
+        let (from, _, from_size) = self.vector_shape(from_typ);
+        let result = self.frame_temp_addr("__vec", result_typ);
+        let bits = self.types.size_bits(to);
+        for k in 0..count {
+            let v = self.load_lane(src, k as i64 * from_size, from);
+            let v = self.emit_convert(v, from, to);
+            self.emit(Instruction::store(v, result, k as i64 * to_size, to, bits));
+        }
+        result
+    }
+
+    /// The lane of type `lane` at `addr + offset`.
+    fn load_lane(&mut self, addr: PseudoId, offset: i64, lane: TypeId) -> PseudoId {
+        let bits = self.types.size_bits(lane);
+        let value = self.alloc_reg_pseudo();
+        self.emit(Instruction::load(value, addr, offset, lane, bits));
+        value
+    }
+
     /// The lane type, lane count and lane size in bytes of vector `typ`.
     fn vector_shape(&self, typ: TypeId) -> (TypeId, usize, i64) {
         let (lane, count) = self

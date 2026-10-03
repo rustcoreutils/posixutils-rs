@@ -87,7 +87,24 @@ fn is_sse_scalar(kind: TypeKind, ty: TypeId, types: &TypeTable) -> bool {
 }
 
 impl Abi for Win64Abi {
+    /// Win64 passes a vector by its size alone: eight bytes or fewer in a
+    /// general register, sixteen by reference and returned in XMM0 -- as a
+    /// plain `__int128` is -- and anything larger as an aggregate.
+    fn vector_carrier(&self, vec: TypeId, types: &TypeTable) -> Option<TypeId> {
+        match types.size_bytes(vec) {
+            17.. => types.vector_memory_carrier(vec),
+            16 => Some(types.int128_id),
+            bytes => types.unsigned_of_size(bytes),
+        }
+    }
+
     fn classify_param(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
+        if types.is_vector(ty) {
+            return match self.vector_carrier(ty, types) {
+                Some(carrier) => self.classify_param(carrier, types),
+                None => super::uncarried_vector_class(ty, types),
+            };
+        }
         if let Some(first) = types.transparent_union_first_member(ty) {
             return self.classify_param(first, types);
         }
@@ -118,6 +135,12 @@ impl Abi for Win64Abi {
     }
 
     fn classify_return(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
+        if types.is_vector(ty) {
+            return match self.vector_return_carrier(ty, types) {
+                Some(carrier) => self.classify_return(carrier, types),
+                None => super::uncarried_vector_class(ty, types),
+            };
+        }
         let kind = types.kind(ty);
         // gcc returns a bare `__int128` whole in XMM0, the way it returns a
         // 128-bit vector, rather than through the hidden pointer its size

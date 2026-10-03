@@ -746,15 +746,15 @@ impl Parser<'_> {
             // silently an `int`.
             typ_id = self.apply_pending_type_attrs(typ_id);
 
-            // A vector parameter is passed by value, which the array model
-            // cannot do: the adjustment below would make it a pointer.
+            // A vector parameter is passed by value, and is no array to be
+            // adjusted below.
             self.check_not_vector_value(Some(typ_id), self.current_pos());
 
             // C99 6.7.5.3: Array and function parameters are adjusted to pointers
             // - Array T[] becomes pointer to T
             // - Function type becomes pointer to function type
             let typ = self.types.get(typ_id);
-            if typ.kind == TypeKind::Array {
+            if typ.kind == TypeKind::Array && !self.types.is_vector(typ_id) {
                 // Convert array to pointer to element type
                 let element_type = typ.base.unwrap_or(self.types.void_id);
                 let ptr_type = Type {

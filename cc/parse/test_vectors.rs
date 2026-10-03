@@ -125,3 +125,23 @@ fn test_vector_masks_and_specifier_attributes() {
     assert!(rejected("u = a"));
     assert!(rejected("v2si x = a < b"));
 }
+
+/// A vector parameter is passed by value: it is no array, and C17
+/// 6.7.6.3p7's adjustment to a pointer does not reach it. A one-lane `float`
+/// vector on aarch64 is the one shape c17 cannot pass; x86-64 passes it in
+/// memory.
+#[test]
+fn test_vector_parameters_are_not_adjusted() {
+    let src = format!(
+        "{TYPES} v4si f(v4si a, v2si b);\
+         _Static_assert(_Generic(f, v4si (*)(v4si, v2si): 1, default: 0), \"by value\");\
+         v4si g(v4si a) {{ return a + 1; }}"
+    );
+    parse_tu_for(&src, &x86_linux()).unwrap();
+    let small = "typedef float v1sf __attribute__((vector_size(4))); v1sf h(v1sf a);";
+    parse_tu_for(small, &x86_linux()).unwrap();
+    let before = crate::diag::error_count();
+    let aarch64 = Target::new(Arch::Aarch64, Os::Linux);
+    let rejected = parse_tu_for(small, &aarch64).is_err() || crate::diag::error_count() > before;
+    assert!(rejected, "a vector of one float on aarch64");
+}

@@ -278,7 +278,11 @@ fn complex_hfa_base(ty: TypeId, types: &TypeTable) -> Option<HfaBase> {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct Aapcs64Abi;
+pub struct Aapcs64Abi {
+    /// Apple's variant: clang, Darwin's compiler, returns small integer
+    /// vectors in V0 where gcc returns them in a general register.
+    darwin: bool,
+}
 
 /// A GNU complex integer's argument or return class under AAPCS64.
 ///
@@ -308,7 +312,14 @@ fn classify_complex_integer(types: &TypeTable, ty: TypeId, size_bits: u32) -> Ar
 impl Aapcs64Abi {
     /// Create a new AAPCS64 ABI classifier.
     pub fn new() -> Self {
-        Self
+        Self { darwin: false }
+    }
+
+    /// The classifier for `os`'s variant of AAPCS64.
+    pub fn for_os(os: crate::target::Os) -> Self {
+        Self {
+            darwin: os == crate::target::Os::MacOS,
+        }
     }
 
     /// Check if a type is a potential HFA base type (float or double).
@@ -338,6 +349,17 @@ impl Aapcs64Abi {
     fn try_classify_hfa(&self, ty: TypeId, types: &TypeTable) -> Option<(HfaBase, u8)> {
         let kind = types.kind(ty);
         let typ = types.get(ty);
+
+        // A vector member is one short vector (AAPCS64 4.1.2), whatever its
+        // lanes: an aggregate of up to four of one size is a Homogeneous
+        // Short-Vector Aggregate, passed as an HFA is.
+        if types.is_vector(ty) {
+            return match types.size_bytes(ty) {
+                8 => Some((HfaBase::ShortVector64, 1)),
+                16 => Some((HfaBase::ShortVector128, 1)),
+                _ => None,
+            };
+        }
 
         // Only structs and arrays can be HFAs
         if !is_aggregate(kind) && kind != TypeKind::Array {
@@ -493,7 +515,41 @@ impl Abi for Aapcs64Abi {
         true
     }
 
+    fn vector_carrier(&self, vec: TypeId, types: &TypeTable) -> Option<TypeId> {
+        super::native_vector_carrier(vec, types)
+    }
+
+    /// clang on Darwin passes an integer vector of four bytes or fewer in a
+    /// general register, as gcc does, but returns it in V0: a single lane in
+    /// its low bits -- as a `float` carrying those bits travels -- and
+    /// several widened to fill D0 ([`Self::vector_return_widened`]).
+    fn vector_return_carrier(&self, vec: TypeId, types: &TypeTable) -> Option<TypeId> {
+        if let Some(widened) = self.vector_return_widened(vec, types) {
+            return self.vector_carrier(widened, types);
+        }
+        let small_integer = types
+            .vector_lanes(vec)
+            .is_some_and(|(lane, _)| types.is_integer(lane) && types.size_bytes(vec) <= 4);
+        if self.darwin && small_integer {
+            return Some(types.float_id);
+        }
+        self.vector_carrier(vec, types)
+    }
+
+    /// On Darwin, an integer vector of several lanes and four bytes or fewer
+    /// is returned with its lanes widened to fill D0: `v2hi` as two 32-bit
+    /// lanes, `v4qi` as four 16-bit ones, as LLVM legalizes the type.
+    fn vector_return_widened(&self, vec: TypeId, types: &TypeTable) -> Option<TypeId> {
+        self.darwin.then(|| types.vector_widened(vec)).flatten()
+    }
+
     fn classify_param(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
+        if types.is_vector(ty) {
+            return match self.vector_carrier(ty, types) {
+                Some(carrier) => self.classify_param(carrier, types),
+                None => super::uncarried_vector_class(ty, types),
+            };
+        }
         let kind = types.kind(ty);
         let size_bits = types.size_bits(ty);
         let size_bytes = types.size_bytes(ty);
@@ -609,6 +665,12 @@ impl Abi for Aapcs64Abi {
     }
 
     fn classify_return(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
+        if types.is_vector(ty) {
+            return match self.vector_return_carrier(ty, types) {
+                Some(carrier) => self.classify_return(carrier, types),
+                None => super::uncarried_vector_class(ty, types),
+            };
+        }
         let kind = types.kind(ty);
         let size_bits = types.size_bits(ty);
         let size_bytes = types.size_bytes(ty);
@@ -1011,9 +1073,9 @@ mod tests {
 
     #[test]
     fn test_abi_creation() {
-        let abi = Aapcs64Abi::new();
-        // Just ensure it constructs
-        assert_eq!(format!("{:?}", abi), "Aapcs64Abi");
+        assert!(!Aapcs64Abi::new().darwin);
+        assert!(!Aapcs64Abi::for_os(Os::Linux).darwin);
+        assert!(Aapcs64Abi::for_os(Os::MacOS).darwin);
     }
 
     /// A complex value is a two-member HFA whose element width — not whose

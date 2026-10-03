@@ -367,21 +367,25 @@ impl Parser<'_> {
     }
 
     /// Refuse a `vector_size` value as a function's argument, parameter or
-    /// return value.
-    ///
-    /// A vector is computed lane by lane, but not yet passed to or
-    /// returned from a function: the calling conventions put one in vector
-    /// registers, which c17 does not model, and passing it as the array it is
-    /// laid out as would hand the callee a pointer.
+    /// return value when the target's convention has no type that travels as
+    /// gcc passes it (`Abi::vector_carrier`): a one-lane `float` vector on
+    /// aarch64, which gcc passes on the stack with the arguments after it and
+    /// returns in a general register. Every other vector goes as its carrier.
     pub(super) fn check_not_vector_value(&self, typ: Option<TypeId>, pos: Position) -> bool {
-        let is_vector = typ.is_some_and(|t| self.types.is_vector(t));
-        if is_vector {
+        let Some(t) = typ.filter(|&t| self.types.is_vector(t)) else {
+            return false;
+        };
+        let target = self.types.target();
+        let unpassable = crate::abi::get_abi(&target)
+            .vector_carrier(t, self.types)
+            .is_none();
+        if unpassable {
             diag::error(
                 pos,
-                &gettext("c17 does not yet pass or return 'vector_size' values"),
+                &gettext("c17 does not pass or return this vector type on this target"),
             );
         }
-        is_vector
+        unpassable
     }
 
     /// Check the operand of a unary operator against the type its operator

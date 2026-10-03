@@ -266,9 +266,9 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
             Some(env.types().size_bytes(typ) as i128)
         }
 
-        ExprKind::AlignofType(type_id) => Some(env.types().alignment(*type_id) as i128),
+        ExprKind::AlignofType(type_id) => Some(env.types().alignof_value(*type_id) as i128),
 
-        ExprKind::AlignofExpr(inner) => inner.typ.map(|typ| env.types().alignment(typ) as i128),
+        ExprKind::AlignofExpr(inner) => inner.typ.map(|typ| env.types().alignof_value(typ) as i128),
 
         ExprKind::Cast {
             expr: inner,

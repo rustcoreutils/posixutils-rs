@@ -1346,6 +1346,9 @@ impl<'a> Parser<'a> {
             let mut elem = ty;
             elem.modifiers.remove(outer);
             let elem = self.types.intern(elem);
+            // A mode written with it names the element's width, as in
+            // `int __attribute__((mode(SI), vector_size(8)))`.
+            let elem = self.apply_pending_mode(elem);
             let vector = self.apply_pending_vector_size(elem);
             let mut ty = self.types.get(vector).clone();
             ty.modifiers |= outer;

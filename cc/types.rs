@@ -1113,6 +1113,19 @@ pub struct TypeTable {
     /// GNU complex integers need thirteen more, and naming each of them would
     /// spread the same lookup over eighteen fields.
     complex_of: std::collections::HashMap<TypeId, TypeId>,
+    /// For each (size, alignment) of a vector over sixteen bytes, a struct
+    /// of that size and alignment holding nothing but bytes: what the
+    /// calling conventions pass and return such a vector as. See
+    /// [`Self::vector_memory_carrier`].
+    vector_memory_carriers: std::collections::HashMap<(usize, u32), TypeId>,
+    /// For each one-lane floating vector, a struct holding nothing but it:
+    /// what System V passes such a vector as. See
+    /// [`Self::vector_wrapper_carrier`].
+    vector_wrapper_carriers: std::collections::HashMap<(TypeId, u32), TypeId>,
+    /// For each integer vector of several lanes and four bytes or fewer, the
+    /// vector of as many lanes widened to fill eight bytes: what clang
+    /// returns it as on Darwin, by lane count. See [`Self::vector_widened`].
+    vector_widened: std::collections::HashMap<usize, TypeId>,
     pub complex_float_id: TypeId,
     pub complex_double_id: TypeId,
     pub complex_longdouble_id: TypeId,
@@ -1188,6 +1201,9 @@ impl TypeTable {
             char16_id: TypeId::INVALID,
             char32_id: TypeId::INVALID,
             complex_of: std::collections::HashMap::new(),
+            vector_memory_carriers: std::collections::HashMap::new(),
+            vector_wrapper_carriers: std::collections::HashMap::new(),
+            vector_widened: std::collections::HashMap::new(),
             complex_float_id: TypeId::INVALID,
             complex_double_id: TypeId::INVALID,
             complex_longdouble_id: TypeId::INVALID,
@@ -1953,6 +1969,38 @@ impl TypeTable {
         ) && !typ.modifiers.contains(TypeModifiers::COMPLEX)
     }
 
+    /// What `_Alignof` answers for `id`: its alignment, but for a vector on
+    /// x86-64 at most sixteen. gcc answers so there for a vector it still
+    /// lays out on a wider boundary; see [`Self::vector_of`].
+    pub fn alignof_value(&self, id: TypeId) -> usize {
+        let align = self.alignment(id);
+        if self.is_vector(id)
+            && self.target_arch == Arch::X86_64
+            && self.get(id).explicit_align == Some(self.natural_vector_align(id))
+        {
+            align.min(16)
+        } else {
+            align
+        }
+    }
+
+    /// The alignment a vector of `id`'s size has when none is written.
+    fn natural_vector_align(&self, id: TypeId) -> u32 {
+        self.size_bytes(id)
+            .next_power_of_two()
+            .min(self.vector_align_cap()) as u32
+    }
+
+    /// The most a vector aligns to when none is written; see
+    /// [`Self::vector_of`]. On x86-64 that is the object-file maximum, 2^28
+    /// bytes, where gcc stops too.
+    fn vector_align_cap(&self) -> usize {
+        match self.target_arch {
+            Arch::X86_64 => 1 << 28,
+            Arch::Aarch64 => 16,
+        }
+    }
+
     /// Is this a GNU `vector_size` type?
     pub fn is_vector(&self, id: TypeId) -> bool {
         self.get(id).modifiers.contains(TypeModifiers::VECTOR)
@@ -1960,26 +2008,156 @@ impl TypeTable {
 
     /// A GNU vector of `count` elements of type `elem`.
     ///
-    /// It aligns to its width rounded up to a power of two, capped at
-    /// sixteen -- which is what GCC does by default on both targets c17
-    /// supports. A 32-byte vector therefore aligns to 16, not 32; only
-    /// `-mavx2` raises the cap, and c17 does not model that. Measured
-    /// against gcc across widths 4 through 128 rather than assumed, because
-    /// "aligns to its own width" is the obvious rule and is wrong. An
-    /// `aligned(n)` written alongside, `align`, takes precedence, which is
-    /// what `<link.h>` does: `__vector_size__(32), __aligned__(16)`.
+    /// It aligns to its width rounded up to a power of two -- capped at
+    /// sixteen on aarch64, and only at 2^28 on x86-64, where gcc lays a 32-byte
+    /// vector out on a 32-byte boundary in a struct and realigns the stack to
+    /// pass one, while `_Alignof` answers 16 for it (see
+    /// [`Self::alignof_value`]). Measured against gcc across widths 4
+    /// through 128: the `_Alignof` answer alone had been taken for the
+    /// layout. An `aligned(n)` written alongside, `align`, takes precedence,
+    /// which is what `<link.h>` does: `__vector_size__(32), __aligned__(16)`.
     pub fn vector_of(&mut self, elem: TypeId, count: usize, align: Option<u32>) -> TypeId {
-        const MAX_VECTOR_ALIGN: usize = 16;
         let bytes = self.size_bytes(elem) * count;
-        let natural = bytes.next_power_of_two().min(MAX_VECTOR_ALIGN) as u32;
-        self.intern(Type {
+        let natural = bytes.next_power_of_two().min(self.vector_align_cap()) as u32;
+        let align = align.unwrap_or(natural);
+        if bytes > 16 {
+            self.intern_vector_memory_carrier(bytes, align);
+        }
+        let vector = self.intern(Type {
             kind: TypeKind::Array,
             base: Some(elem),
             array_size: Some(count),
             modifiers: TypeModifiers::VECTOR,
-            explicit_align: Some(align.unwrap_or(natural)),
+            explicit_align: Some(align),
             ..Default::default()
-        })
+        });
+        if count == 1 && self.is_float(elem) {
+            self.intern_vector_wrapper_carrier(vector, elem, align);
+        }
+        if count > 1
+            && bytes <= 4
+            && self.is_integer(elem)
+            && !self.vector_widened.contains_key(&count)
+        {
+            let lane = self.unsigned_of_size(8 / count).unwrap_or(self.ulong_id);
+            let widened = self.vector_of(lane, count, None);
+            self.vector_widened.insert(count, widened);
+        }
+        vector
+    }
+
+    /// The vector of `vec`'s lane count whose lanes are widened to fill
+    /// eight bytes -- `v2hi` as two `unsigned int`, `v4qi` as four `unsigned
+    /// short` -- when `vec` is an integer vector of several lanes and four
+    /// bytes or fewer: the shape clang returns such a vector in, in D0, on
+    /// Darwin ([`crate::abi::Abi::vector_return_widened`]).
+    pub fn vector_widened(&self, vec: TypeId) -> Option<TypeId> {
+        let (elem, count) = self.vector_lanes(vec)?;
+        if count < 2 || self.size_bytes(vec) > 4 || !self.is_integer(elem) {
+            return None;
+        }
+        self.vector_widened.get(&count).copied()
+    }
+
+    /// Make the wrapper carrier for one-lane floating vectors of `elem`,
+    /// once; `vector` is one of them.
+    fn intern_vector_wrapper_carrier(&mut self, vector: TypeId, elem: TypeId, align: u32) {
+        let key = (self.float_lane_key(elem), align);
+        if self.vector_wrapper_carriers.contains_key(&key) {
+            return;
+        }
+        let bytes = self.size_bytes(vector);
+        let member = StructMember {
+            name: StringId::EMPTY,
+            typ: vector,
+            offset: 0,
+            bit_offset: None,
+            bit_width: None,
+            access_bytes: None,
+            align: MemberAlign::NATURAL,
+        };
+        let composite = CompositeType {
+            tag: None,
+            members: vec![member],
+            enum_constants: Vec::new(),
+            size: bytes,
+            align: align as usize,
+            member_align: align as usize,
+            is_complete: true,
+            transparent: false,
+            anon_id: None,
+            tag_type: None,
+        };
+        let id = self.intern(Type {
+            kind: TypeKind::Struct,
+            composite: Some(Box::new(composite)),
+            ..Default::default()
+        });
+        self.vector_wrapper_carriers.insert(key, id);
+    }
+
+    /// The struct holding nothing but a vector of type `vec`, when `vec` has
+    /// one floating lane: System V classes such a vector MEMORY, as it does
+    /// a struct holding one, and no scalar C type travels that way.
+    pub fn vector_wrapper_carrier(&self, vec: TypeId) -> Option<TypeId> {
+        let (elem, _) = self.vector_lanes(vec)?;
+        let align = self.get(vec).explicit_align?;
+        self.vector_wrapper_carriers
+            .get(&(self.float_lane_key(elem), align))
+            .copied()
+    }
+
+    /// The floating kind and class of `elem`, as a stable key: one-lane
+    /// vectors of `float` and of `_Float32` carry differently typed lanes.
+    fn float_lane_key(&self, elem: TypeId) -> TypeId {
+        let typ = self.get(elem);
+        self.floating(typ.kind, typ.float_class)
+    }
+
+    /// Make the memory carrier for vectors of `bytes` and `align`, once.
+    fn intern_vector_memory_carrier(&mut self, bytes: usize, align: u32) {
+        if self.vector_memory_carriers.contains_key(&(bytes, align)) {
+            return;
+        }
+        let array = self.intern(Type::array(self.uchar_id, bytes));
+        let member = StructMember {
+            name: StringId::EMPTY,
+            typ: array,
+            offset: 0,
+            bit_offset: None,
+            bit_width: None,
+            access_bytes: None,
+            align: MemberAlign::NATURAL,
+        };
+        let composite = CompositeType {
+            tag: None,
+            members: vec![member],
+            enum_constants: Vec::new(),
+            size: bytes,
+            align: align as usize,
+            member_align: align as usize,
+            is_complete: true,
+            transparent: false,
+            anon_id: None,
+            tag_type: None,
+        };
+        let id = self.intern(Type {
+            kind: TypeKind::Struct,
+            composite: Some(Box::new(composite)),
+            ..Default::default()
+        });
+        self.vector_memory_carriers.insert((bytes, align), id);
+    }
+
+    /// The struct a vector of type `vec`, over sixteen bytes, is passed and
+    /// returned as: gcc's conventions treat such a vector exactly as an
+    /// aggregate of its size and alignment -- MEMORY class on System V, by
+    /// reference on AAPCS64 and Win64, returned through a hidden pointer.
+    pub fn vector_memory_carrier(&self, vec: TypeId) -> Option<TypeId> {
+        let align = self.get(vec).explicit_align?;
+        self.vector_memory_carriers
+            .get(&(self.size_bytes(vec), align))
+            .copied()
     }
 
     /// The element type and the number of elements of a vector type, or

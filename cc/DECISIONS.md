@@ -239,7 +239,7 @@ different test in `execute/` that passes.
 | Another target's backend | `OUT_OF_SCOPE_OTHER_TARGET` | `mipscop-1`..`-4` |
 | `__builtin_issignaling` | `OUT_OF_SCOPE_ISSIGNALING` | No system header uses the builtin (`<math.h>`'s `issignaling` is its own macro), and seven of the nine tests need a format c17 does not have (`_Float128`, `_Float64x`, `bfloat16`) |
 | Pre-C99 implicit `int` with no dialect request | `NEEDS_PRE_C99_DIALECT` | `compile/pr29201`. C17 6.7.2p2 requires a type specifier and GCC 14 made it an error too. A test that asks for `-fpermissive` passes; one that asks for `-std=gnu89` passes because the harness translates that to `-fpermissive` -- c17 itself ignores `-std=gnu89` |
-| Vector values | `OUT_OF_SCOPE_VECTOR_ARITH` | Vectors passed to or returned from a function, `__builtin_convertvector`, `__builtin_shuffle`, none of which c17 has yet. Vector arithmetic, comparisons, casts and assignment run |
+| Vector values | `OUT_OF_SCOPE_VECTOR_ARITH` | `__builtin_convertvector` and `__builtin_shuffle`, which c17 does not have yet, and a vector of floating lanes four bytes wide or less at a call boundary. Vector arithmetic, comparisons, casts, assignment, passing and returning run |
 | `__label__` | `OUT_OF_SCOPE_LOCAL_LABELS` | Block-scope label declarations, ruled out with nested functions |
 | Label difference as a constant | `OUT_OF_SCOPE_LABEL_DIFF` | `&&a - &&b` in a static initializer. Labels as values are supported; the difference needs a symbol-difference relocation |
 | A C17 constraint gcc only warns about | `C17_CONSTRAINT_GCC_WARNS` | `compile/pr38857`: 6.7.4p3, an external inline definition referring to a static. `-fpermissive` relaxes it |

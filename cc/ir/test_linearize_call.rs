@@ -441,3 +441,37 @@ fn a_decaying_argument_converts_to_its_parameter() {
     }
     assert_eq!(kinds(&types, calls[2]), vec![TypeKind::Pointer]);
 }
+
+/// A small integer vector is returned as a general-register value on Linux,
+/// as gcc does, and in V0 on Darwin, as clang does: one lane as a `float`'s
+/// bits, several widened to fill a `double`'s. A call narrows the widened
+/// lanes back, so the caller sees the vector it declared.
+#[test]
+fn test_darwin_returns_small_integer_vectors_in_v0() {
+    let src = "typedef short v2hi __attribute__((vector_size(4)));\n\
+        typedef int v1si __attribute__((vector_size(4)));\n\
+        v2hi r2(v2hi a) { return a + a; }\n\
+        v1si r1(v1si a) { return a; }\n\
+        v2hi ext(v2hi);\n\
+        int c2(v2hi a) { return ext(a)[1]; }\n";
+    for os in [Os::Linux, Os::MacOS] {
+        let (module, types) = linearize_source_with_types(src, &Target::new(Arch::Aarch64, os));
+        let ret = |name: &str| {
+            let f = module.functions.iter().find(|f| f.name == name).unwrap();
+            f.return_type
+        };
+        let darwin = os == Os::MacOS;
+        assert_eq!(types.is_float(ret("r2")), darwin, "{os:?} r2");
+        assert_eq!(types.is_float(ret("r1")), darwin, "{os:?} r1");
+        if darwin {
+            assert_eq!(types.size_bytes(ret("r2")), 8);
+            assert_eq!(types.size_bytes(ret("r1")), 4);
+        }
+        // The call's result is taken at the width it was returned.
+        let call = insns_of(&module, "c2")
+            .into_iter()
+            .find(|i| i.op == Opcode::Call)
+            .unwrap();
+        assert_eq!(types.is_float(call.typ.unwrap()), darwin, "{os:?} call");
+    }
+}

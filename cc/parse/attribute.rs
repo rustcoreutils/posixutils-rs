@@ -889,7 +889,7 @@ impl Parser<'_> {
     /// An unrecognised mode -- `V4SF` and the other vector modes, which need
     /// vector types -- keeps the warning, because ignoring it would silently
     /// change what the program computes.
-    fn apply_pending_mode(&mut self, typ: TypeId) -> TypeId {
+    pub(super) fn apply_pending_mode(&mut self, typ: TypeId) -> TypeId {
         let Some((mode, pos)) = self.pending_mode.take() else {
             return typ;
         };

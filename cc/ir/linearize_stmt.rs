@@ -179,7 +179,15 @@ impl<'a> super::linearize::Linearizer<'a> {
                         .map(|f| f.return_type)
                         .unwrap_or(expr_typ);
 
-                    if let Some(sret_ptr) = self.struct_return_ptr {
+                    if let (Some(vec), None) = (self.vector_return, self.struct_return_ptr) {
+                        // A vector returned in a register, as its carrier's
+                        // bits; one returned in memory takes the sret path.
+                        let addr = self.vector_addr(e);
+                        let conv = self.current_calling_conv;
+                        let val = self.vector_return_value(addr, vec, func_ret_type, conv);
+                        let size = self.types.size_bits(func_ret_type);
+                        self.emit(Instruction::ret_typed(Some(val), func_ret_type, size));
+                    } else if let Some(sret_ptr) = self.struct_return_ptr {
                         self.emit_sret_return(e, sret_ptr, func_ret_type);
                     } else if let Some(ret_type) = self.reg_aggregate_return_type {
                         self.emit_reg_aggregate_return(e, ret_type);

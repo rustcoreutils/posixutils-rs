@@ -58,6 +58,16 @@ pub(crate) enum VmDim {
     Sym(PseudoId),
 }
 
+/// A vector parameter that arrives as its aggregate carrier, or by
+/// reference; see [`Linearizer::store_vector_memory_params`].
+struct VectorMemoryParam {
+    name: String,
+    symbol: Option<SymbolId>,
+    vector: TypeId,
+    carrier: TypeId,
+    arg: PseudoId,
+}
+
 /// A scalar parameter, which the prologue stores into a local of its own.
 struct ScalarParam {
     name: String,
@@ -683,6 +693,9 @@ pub struct Linearizer<'a> {
     /// The return type, when it is an aggregate the ABI returns in registers
     /// and wider than one. See [`Self::returns_reg_aggregate`].
     pub(crate) reg_aggregate_return_type: Option<TypeId>,
+    /// The current function's return type when it is a GNU vector, which
+    /// `return` converts to the vector's carrier.
+    pub(crate) vector_return: Option<TypeId>,
     /// Current function name (for generating unique static local names)
     pub(crate) current_func_name: String,
     /// The function's name as written, which `__func__` holds; the emitted
@@ -846,6 +859,7 @@ impl<'a> Linearizer<'a> {
             strings,
             struct_return_ptr: None,
             reg_aggregate_return_type: None,
+            vector_return: None,
             current_func_name: String::new(),
             current_func_ident: StringId::EMPTY,
             addr_taken_labels: Vec::new(),
@@ -1601,81 +1615,100 @@ impl<'a> Linearizer<'a> {
             // Create a symbol pseudo for this local variable (its address)
             let local_sym = self.alloc_pseudo();
             self.named_local(local_sym, name, typ, None, None);
-
-            let typ_size = self.types.size_bits(typ);
-            // The copy length is an object size, so it is counted in bytes.
-            // `typ_size` saturates for an aggregate past `u32::MAX` bits and is
-            // good only for the class tests below, which compare against 64.
-            let typ_bytes = self.types.size_bytes(typ) as i64;
-            let conv = self.current_calling_conv;
-            let abi = get_abi_for_conv(conv, self.target);
-            // MEMORY class: the caller left the bytes in the incoming argument
-            // area, so `arg_pseudo` names storage rather than pointing at it.
-            // Over sixteen bytes that is every aggregate; at or below, only one
-            // whose eightbyte holds a `long double`. On aarch64 every struct
-            // parameter still arrives as a pointer, so the deref path below is
-            // the right one there.
-            // Exactly the test the caller uses when it decides to push the
-            // bytes, so the two cannot drift: `long double _Complex` is
-            // COMPLEX_X87 and travels in memory too, and asking only about
-            // struct kinds sent it down the pointer path the caller had not
-            // taken.
-            //
-            // A convention that passes such a value by reference instead --
-            // AAPCS64, Win64 -- hands over a pointer to the caller's copy,
-            // which the pointer path below copies out of.
-            let arrived_by_value = !abi.indirect_param_is_reference()
-                && crate::arch::lir::memory_class_bytes(self.types, typ).is_some();
-            if arrived_by_value {
-                // Passed by value on the stack. `arg_pseudo` is an IncomingArg
-                // naming the struct data; take its address, then copy each
-                // 8-byte chunk.
-                let ptr_type = self.types.pointer_to(typ);
-                let addr_pseudo = self.alloc_reg_pseudo();
-                self.emit(Instruction::sym_addr(addr_pseudo, arg_pseudo, ptr_type));
-
-                // Through the shared block copy, which knows two things this
-                // loop did not: a copy past 128 bytes becomes a `memcpy` call
-                // rather than an unbounded unroll, and a size that is not a
-                // multiple of eight is copied exactly. Stepping 8 while
-                // `offset < size` rounds *up* -- a 12-byte struct wrote 16
-                // bytes, four of them past the local.
-                let vol = BlockVolatility {
-                    dst: self.types.contains_volatile(typ),
-                    src: false,
-                };
-                self.emit_block_copy(local_sym, addr_pseudo, typ_bytes, vol);
-            } else if typ_size > 64 || self.passed_by_reference(typ, conv) {
-                // Medium struct (9-16 bytes): arg_pseudo is a pointer (current behavior).
-                // So is anything passed by reference, at any size: a Win64
-                // three-byte struct or `long double`.
-                // Copy each 8-byte chunk through pointer dereference.
-                let vol = BlockVolatility {
-                    dst: self.types.contains_volatile(typ),
-                    src: false,
-                };
-                self.emit_block_copy(local_sym, arg_pseudo, typ_bytes, vol);
-            } else if typ_bytes > 0 {
-                // Small struct: arg_pseudo contains the value directly. A
-                // complex value passed that way (Win64) is its bits, stored
-                // as the integer they are. A zero-sized one arrives in
-                // nothing (`ArgClass::Ignore`) and has nothing to store.
-                let as_typ = if self.types.is_complex(typ) {
-                    self.types
-                        .unsigned_of_size(typ_bytes as usize)
-                        .unwrap_or(typ)
-                } else {
-                    typ
-                };
-                self.emit(Instruction::store(
-                    arg_pseudo, local_sym, 0, as_typ, typ_size,
-                ));
-            }
+            self.fill_struct_param(local_sym, typ, arg_pseudo);
 
             // Register as a local variable (only if named parameter)
             if let Some(symbol_id) = symbol_id_opt {
                 self.insert_local(symbol_id, LocalVarInfo::frame(local_sym, typ));
             }
+        }
+    }
+
+    /// A vector parameter that arrives as an aggregate carrier's bytes, or
+    /// by reference: its local is the vector, filled as a parameter of the
+    /// carrier type would be.
+    fn store_vector_memory_params(&mut self, params: Vec<VectorMemoryParam>) {
+        for p in params {
+            let local_sym = self.alloc_pseudo();
+            self.named_local(local_sym, p.name, p.vector, None, None);
+            self.fill_struct_param(local_sym, p.carrier, p.arg);
+            if let Some(symbol_id) = p.symbol {
+                self.insert_local(symbol_id, LocalVarInfo::frame(local_sym, p.vector));
+            }
+        }
+    }
+
+    /// Fill `local_sym` from the parameter `arg_pseudo` of the struct, union
+    /// or by-reference type `typ`, which arrived as the convention passes it.
+    fn fill_struct_param(&mut self, local_sym: PseudoId, typ: TypeId, arg_pseudo: PseudoId) {
+        let typ_size = self.types.size_bits(typ);
+        // The copy length is an object size, so it is counted in bytes.
+        // `typ_size` saturates for an aggregate past `u32::MAX` bits and is
+        // good only for the class tests below, which compare against 64.
+        let typ_bytes = self.types.size_bytes(typ) as i64;
+        let conv = self.current_calling_conv;
+        let abi = get_abi_for_conv(conv, self.target);
+        // MEMORY class: the caller left the bytes in the incoming argument
+        // area, so `arg_pseudo` names storage rather than pointing at it.
+        // Over sixteen bytes that is every aggregate; at or below, only one
+        // whose eightbyte holds a `long double`. On aarch64 every struct
+        // parameter still arrives as a pointer, so the deref path below is
+        // the right one there.
+        // Exactly the test the caller uses when it decides to push the
+        // bytes, so the two cannot drift: `long double _Complex` is
+        // COMPLEX_X87 and travels in memory too, and asking only about
+        // struct kinds sent it down the pointer path the caller had not
+        // taken.
+        //
+        // A convention that passes such a value by reference instead --
+        // AAPCS64, Win64 -- hands over a pointer to the caller's copy,
+        // which the pointer path below copies out of.
+        let arrived_by_value = !abi.indirect_param_is_reference()
+            && crate::arch::lir::memory_class_bytes(self.types, typ).is_some();
+        if arrived_by_value {
+            // Passed by value on the stack. `arg_pseudo` is an IncomingArg
+            // naming the struct data; take its address, then copy each
+            // 8-byte chunk.
+            let ptr_type = self.types.pointer_to(typ);
+            let addr_pseudo = self.alloc_reg_pseudo();
+            self.emit(Instruction::sym_addr(addr_pseudo, arg_pseudo, ptr_type));
+
+            // Through the shared block copy, which knows two things this
+            // loop did not: a copy past 128 bytes becomes a `memcpy` call
+            // rather than an unbounded unroll, and a size that is not a
+            // multiple of eight is copied exactly. Stepping 8 while
+            // `offset < size` rounds *up* -- a 12-byte struct wrote 16
+            // bytes, four of them past the local.
+            let vol = BlockVolatility {
+                dst: self.types.contains_volatile(typ),
+                src: false,
+            };
+            self.emit_block_copy(local_sym, addr_pseudo, typ_bytes, vol);
+        } else if typ_size > 64 || self.passed_by_reference(typ, conv) {
+            // Medium struct (9-16 bytes): arg_pseudo is a pointer (current behavior).
+            // So is anything passed by reference, at any size: a Win64
+            // three-byte struct or `long double`.
+            // Copy each 8-byte chunk through pointer dereference.
+            let vol = BlockVolatility {
+                dst: self.types.contains_volatile(typ),
+                src: false,
+            };
+            self.emit_block_copy(local_sym, arg_pseudo, typ_bytes, vol);
+        } else if typ_bytes > 0 {
+            // Small struct: arg_pseudo contains the value directly. A
+            // complex value passed that way (Win64) is its bits, stored
+            // as the integer they are. A zero-sized one arrives in
+            // nothing (`ArgClass::Ignore`) and has nothing to store.
+            let as_typ = if self.types.is_complex(typ) {
+                self.types
+                    .unsigned_of_size(typ_bytes as usize)
+                    .unwrap_or(typ)
+            } else {
+                typ
+            };
+            self.emit(Instruction::store(
+                arg_pseudo, local_sym, 0, as_typ, typ_size,
+            ));
         }
     }
 
@@ -1742,13 +1775,16 @@ impl<'a> Linearizer<'a> {
 
             // Store the incoming argument value to the local, converted from
             // its promoted type when an identifier list declared it.
-            let arg_pseudo = if passed_as == typ {
-                arg
+            // A vector's carrier holds its bits, which are stored as they are.
+            let (arg_pseudo, stored) = if passed_as == typ || self.types.is_vector(typ) {
+                (arg, passed_as)
             } else {
-                self.emit_convert(arg, passed_as, typ)
+                (self.emit_convert(arg, passed_as, typ), typ)
             };
-            let typ_size = self.types.size_bits(typ);
-            self.emit(Instruction::store(arg_pseudo, local_sym, 0, typ, typ_size));
+            let typ_size = self.types.size_bits(stored);
+            self.emit(Instruction::store(
+                arg_pseudo, local_sym, 0, stored, typ_size,
+            ));
 
             // Register as a local variable for name lookup (only if named parameter)
             if let Some(symbol_id) = symbol_id_opt {
@@ -1777,6 +1813,7 @@ impl<'a> Linearizer<'a> {
         self.switch_stack.clear();
         self.struct_return_ptr = None;
         self.reg_aggregate_return_type = None;
+        self.vector_return = None;
         self.current_func_name = self.emitted_name(func.name);
         self.current_func_ident = func.name;
         self.addr_taken_labels.clear();
@@ -1920,11 +1957,20 @@ impl<'a> Linearizer<'a> {
         ir_func.destructor = func.attrs.destructor;
 
         let ret_kind = self.types.kind(func.return_type);
+        // A vector is returned as its carrier, which is what the function
+        // returns as far as anything below here is concerned; `return`
+        // converts to it.
+        self.vector_return = self
+            .types
+            .is_vector(func.return_type)
+            .then_some(func.return_type);
+        let abi_return = self.abi_return_type(func.return_type, self.current_calling_conv);
+        ir_func.return_type = abi_return;
         // Check if function returns a large struct
         // Large structs are returned via a hidden first parameter (sret)
         // that points to caller-allocated space
         let returns_large_struct =
-            self.returns_via_hidden_pointer(func.return_type, self.current_calling_conv);
+            self.returns_via_hidden_pointer(abi_return, self.current_calling_conv);
 
         // Argument index offset: if returning large struct, first arg is hidden return pointer
         let arg_offset: u32 = if returns_large_struct { 1 } else { 0 };
@@ -1938,8 +1984,8 @@ impl<'a> Linearizer<'a> {
             self.struct_return_ptr = Some(sret_id);
         }
 
-        if self.returns_reg_aggregate(func.return_type, self.current_calling_conv) {
-            self.reg_aggregate_return_type = Some(func.return_type);
+        if self.returns_reg_aggregate(abi_return, self.current_calling_conv) {
+            self.reg_aggregate_return_type = Some(abi_return);
         }
 
         // A complex value comes back as the address of its halves, which the
@@ -1963,6 +2009,8 @@ impl<'a> Linearizer<'a> {
             Vec::with_capacity(func.params.len());
         // Scalar parameters need local storage for SSA-correct reassignment handling
         let mut scalar_params: Vec<ScalarParam> = Vec::with_capacity(func.params.len());
+        // Vector parameters arriving as an aggregate carrier, or by reference.
+        let mut vector_memory_params: Vec<VectorMemoryParam> = Vec::new();
         // va_list parameters need special handling (pointer storage)
         let mut valist_params: Vec<(String, Option<SymbolId>, TypeId, PseudoId)> =
             Vec::with_capacity(func.params.len());
@@ -1975,7 +2023,12 @@ impl<'a> Linearizer<'a> {
             // What the caller passes: the parameter's own type under a
             // prototype, its default argument promotion under an identifier
             // list -- converted back to the declared type on entry.
+            //
+            // A vector arrives as its carrier.
             let passed_as = match func.param_style {
+                _ if self.types.is_vector(param.typ) => {
+                    self.abi_type(param.typ, self.current_calling_conv)
+                }
                 ParamStyle::Prototype => param.typ,
                 ParamStyle::IdentifierList => self.types.default_argument_promote(param.typ),
             };
@@ -2004,7 +2057,33 @@ impl<'a> Linearizer<'a> {
             // For struct/union types, we'll copy to a local later
             // so member access works properly
             let param_kind = self.types.kind(param.typ);
-            if by_reference || self.complex_travels_as_bits(param.typ, conv) {
+            if self.types.is_vector(param.typ) {
+                // A vector arrives as its carrier: an aggregate's bytes, or a
+                // register's bits. The local is the carrier's size and
+                // alignment either way, so the carrier's own store fills it.
+                if by_reference
+                    || matches!(
+                        self.types.kind(passed_as),
+                        TypeKind::Struct | TypeKind::Union
+                    )
+                {
+                    vector_memory_params.push(VectorMemoryParam {
+                        name,
+                        symbol: param.symbol,
+                        vector: param.typ,
+                        carrier: passed_as,
+                        arg: pseudo_id,
+                    });
+                } else {
+                    scalar_params.push(ScalarParam {
+                        name,
+                        symbol: param.symbol,
+                        typ: param.typ,
+                        passed_as,
+                        arg: pseudo_id,
+                    });
+                }
+            } else if by_reference || self.complex_travels_as_bits(param.typ, conv) {
                 // Copied out of the caller's copy, or stored from the bits it
                 // arrived as: `store_struct_params` knows both.
                 struct_params.push((name, param.symbol, param.typ, pseudo_id));
@@ -2107,6 +2186,8 @@ impl<'a> Linearizer<'a> {
         self.store_valist_params(valist_params);
 
         self.store_struct_params(struct_params);
+
+        self.store_vector_memory_params(vector_memory_params);
 
         self.store_complex_params(complex_params);
 
@@ -3610,7 +3691,7 @@ impl<'a> Linearizer<'a> {
     /// otherwise. Passing the original's address instead was invisible
     /// c17-to-c17 -- a c17 callee copies out of it first -- but a gcc callee
     /// that assigned to its parameter wrote through into the caller's object.
-    fn argument_copy(
+    pub(crate) fn argument_copy(
         &mut self,
         val: PseudoId,
         typ: TypeId,
@@ -3675,10 +3756,12 @@ impl<'a> Linearizer<'a> {
     ) -> PseudoId {
         let target = self.lower_callee(func_expr);
 
-        let typ = self.expr_type(expr); // Use evaluated type (function return type)
-
         let sig = self.callee_signature(func_expr);
         let conv = sig.conv;
+        // The function's return type -- as a vector's carrier, which is what
+        // the call returns; it is made the vector again below.
+        let expr_typ = self.expr_type(expr);
+        let typ = self.abi_return_type(expr_typ, conv);
         // A library function is known by its System V signature: what folds
         // or lowers a call to `memcpy` makes a System V call, and a callee
         // declared `ms_abi` is some other function of that name.
@@ -3806,6 +3889,9 @@ impl<'a> Linearizer<'a> {
             };
             self.build_call(target, call_args, result_sym, (typ, ret_size), facts);
         }
+        if self.types.is_vector(expr_typ) {
+            return self.vector_returned(result_sym, typ, expr_typ, conv);
+        }
         result_sym
     }
 
@@ -3930,8 +4016,14 @@ impl<'a> Linearizer<'a> {
             .params
             .as_ref()
             .and_then(|params| params.get(arg_idx).copied());
-        let (arg_val, passed) = if (arg_kind == TypeKind::Struct || arg_kind == TypeKind::Union)
-            && (self.types.size_bits(arg_type) > 64 || self.passed_by_reference(arg_type, conv))
+        let (arg_val, passed) = if self.types.is_vector(arg_type) {
+            // As its carrier, which `pass_by_convention` then treats as any
+            // value of that type.
+            self.lower_vector_arg(a, conv)
+        } else if (arg_kind == TypeKind::Struct || arg_kind == TypeKind::Union)
+            && (self.types.size_bits(arg_type) > 64
+                || self.passed_by_reference(arg_type, conv)
+                || self.passed_in_memory(arg_type, conv))
         {
             self.lower_struct_arg(a, arg_type, conv)
         } else if let Some(pt) =
@@ -3992,6 +4084,17 @@ impl<'a> Linearizer<'a> {
             Some(pt) => (self.linearize_converted(a, pt), pt),
             None => (self.linearize_expr(a), self.types.decayed_value(arg_type)),
         }
+    }
+
+    /// Whether the convention passes an argument of type `typ` in memory: an
+    /// eight-byte struct holding a `long double`, or a one-lane floating
+    /// vector, is MEMORY class on System V however small. Taken for a value
+    /// in a register, its bytes were handed over as its address.
+    fn passed_in_memory(&self, typ: TypeId, conv: CallingConv) -> bool {
+        matches!(
+            get_abi_for_conv(conv, self.target).classify_param(typ, self.types),
+            crate::abi::ArgClass::Indirect { .. }
+        )
     }
 
     /// A struct or union argument wider than a register, or one the
@@ -5331,6 +5434,26 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
+            // A vector is fetched as its carrier, as it was passed.
+            ExprKind::VaArg { ap, arg_type } if self.types.is_vector(*arg_type) => {
+                // A Microsoft `va_list` walks Win64 arguments.
+                let conv = if self.types.is_ms_va_list(self.expr_type(ap)) {
+                    CallingConv::Win64
+                } else {
+                    self.current_calling_conv
+                };
+                let carrier = self.vector_carrier(*arg_type, conv);
+                let fetched = Expr {
+                    kind: ExprKind::VaArg {
+                        ap: ap.clone(),
+                        arg_type: carrier,
+                    },
+                    ..expr.clone()
+                };
+                let result = self.linearize_expr(&fetched);
+                self.vector_call_result(result, carrier, *arg_type)
+            }
+
             ExprKind::VaArg { ap, arg_type } if self.types.is_ms_va_list(self.expr_type(ap)) => {
                 let ap_addr = self.linearize_lvalue(ap);
                 self.linearize_ms_va_arg(ap_addr, *arg_type)
@@ -6476,7 +6599,7 @@ impl<'a> Linearizer<'a> {
             ExprKind::SizeofExpr(inner_expr) => self.linearize_sizeof_expr(inner_expr),
 
             ExprKind::AlignofType(typ) => {
-                let align = self.types.alignment(*typ);
+                let align = self.types.alignof_value(*typ);
                 // _Alignof returns size_t
                 let result_typ = self.types.ulong_id;
                 self.emit_const(align as i128, result_typ)
@@ -6484,7 +6607,7 @@ impl<'a> Linearizer<'a> {
 
             ExprKind::AlignofExpr(inner_expr) => {
                 let inner_typ = self.expr_type(inner_expr);
-                let align = self.types.alignment(inner_typ);
+                let align = self.types.alignof_value(inner_typ);
                 // _Alignof returns size_t
                 let result_typ = self.types.ulong_id;
                 self.emit_const(align as i128, result_typ)

@@ -169,6 +169,10 @@ fn sole_scalar_content(ty: TypeId, types: &TypeTable) -> Option<TypeId> {
                 _ => return None,
             }
         }
+        // A sixteen-byte vector is one SSE+SSEUP unit, as its carrier is.
+        TypeKind::Array if types.is_vector(ty) => {
+            return super::native_vector_carrier(ty, types).filter(|c| types.size_bytes(*c) == 16);
+        }
         TypeKind::Array => {
             let typ = types.get(ty);
             if typ.array_size != Some(1) {
@@ -289,6 +293,20 @@ impl SysVAmd64Abi {
         // Complex types: real part in one eightbyte, imaginary in another
         if types.is_complex(ty) {
             return RegClass::Sse;
+        }
+
+        // A vector member is classified as its carrier is: its eightbytes
+        // are SSE whatever its lanes, but for a small one of integer lanes.
+        // A one-lane floating one is MEMORY, and so is the aggregate holding
+        // it, as gcc classes them.
+        if types.is_vector(ty) {
+            if types.vector_wrapper_carrier(ty).is_some() {
+                return RegClass::Memory;
+            }
+            return match super::native_vector_carrier(ty, types) {
+                Some(carrier) => self.classify_eightbyte(carrier, _offset_bits, _size_bits, types),
+                None => RegClass::Memory,
+            };
         }
 
         // Arrays - classify element type
@@ -445,7 +463,24 @@ impl Abi for SysVAmd64Abi {
         false
     }
 
+    /// gcc's System V convention, but for one-lane floating vectors --
+    /// `float` or `double` -- which it passes in memory and returns through a
+    /// hidden pointer: those travel as a struct holding the vector, which is
+    /// classed MEMORY just as gcc classes them.
+    fn vector_carrier(&self, vec: TypeId, types: &TypeTable) -> Option<TypeId> {
+        if let Some(wrapper) = types.vector_wrapper_carrier(vec) {
+            return Some(wrapper);
+        }
+        super::native_vector_carrier(vec, types)
+    }
+
     fn classify_param(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
+        if types.is_vector(ty) {
+            return match self.vector_carrier(ty, types) {
+                Some(carrier) => self.classify_param(carrier, types),
+                None => super::uncarried_vector_class(ty, types),
+            };
+        }
         let kind = types.kind(ty);
         let size_bits = types.size_bits(ty);
         let size_bytes = types.size_bytes(ty);
@@ -551,6 +586,12 @@ impl Abi for SysVAmd64Abi {
     }
 
     fn classify_return(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
+        if types.is_vector(ty) {
+            return match self.vector_return_carrier(ty, types) {
+                Some(carrier) => self.classify_return(carrier, types),
+                None => super::uncarried_vector_class(ty, types),
+            };
+        }
         let kind = types.kind(ty);
         let size_bits = types.size_bits(ty);
         let size_bytes = types.size_bytes(ty);

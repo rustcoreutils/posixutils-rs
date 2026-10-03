@@ -169,7 +169,8 @@ int main(void) {
 }
 
 /// A `vector_size` among the declaration specifiers makes the type they name
-/// a vector -- for every declarator, and as a function's return type.
+/// a vector -- for every declarator, and as a function's return type -- of
+/// elements of the width a `mode` written with it names.
 #[test]
 fn vector_attribute_in_declaration_specifiers() {
     run(
@@ -178,6 +179,9 @@ fn vector_attribute_in_declaration_specifiers() {
 __attribute__((vector_size(8))) signed char v4, v5, v6;
 signed char __attribute__((vector_size(8))) w4, w5;
 _Static_assert(sizeof v6 == 8 && sizeof w5 == 8, "every declarator");
+/* The mode names the element's width; the vector is made of that. */
+typedef int __attribute__((mode(SI))) __attribute__((vector_size(8))) vecint;
+_Static_assert(sizeof(vecint) == 8 && sizeof(((vecint){0})[0]) == 4, "mode, then vector");
 int main(void) {
     v5 = (__typeof__(v5)){1, 2, 3, 4, 5, 6, 7, 8};
     v6 = v5 * 2;

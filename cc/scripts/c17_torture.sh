@@ -654,21 +654,12 @@ OUT_OF_SCOPE_ISSIGNALING=" ieee/builtin-issignaling-1 \
  ieee/float32-builtin-issignaling-1 ieee/float32x-builtin-issignaling-1 \
  ieee/float64-builtin-issignaling-1 ieee/float64x-builtin-issignaling-1 "
 
-# Vector values c17 does not have yet: a vector passed to or returned from a
-# function, `__builtin_convertvector` and `__builtin_shuffle`. Arithmetic,
-# comparisons, casts and assignment of vectors run.
-OUT_OF_SCOPE_VECTOR_ARITH=" compile/pr100305 compile/pr10153-1 compile/pr10153-2 compile/pr108237 \
- compile/pr108892 compile/pr33614 compile/pr33617 compile/pr34856 \
- compile/pr39928-1 compile/pr52750 compile/pr70061 compile/pr70240 \
- compile/pr70355 compile/pr96426 compile/pr99647 compile/vector-1 \
- compile/vector-2 compile/vector-3 compile/vector-5 compile/vector-6 \
- compile/vector-dup-1 compile/vector-shift-1 execute/20050316-1 \
- execute/20050316-2 execute/20050316-3 execute/pr105613 \
- execute/pr109040 execute/pr109938 execute/pr109986 execute/pr123753 \
- execute/pr126405-3 execute/pr23135 execute/pr60960 execute/pr70903 \
- execute/pr71626-1 execute/pr71626-2 execute/pr85331 execute/pr92618 \
- execute/pr94524-1 execute/pr94524-2 execute/pr94591 execute/simd-1 \
- execute/simd-4 execute/simd-6 ieee/fp-cmp-cond-1 ieee/pr72824-2 "
+# Vector values c17 does not have yet: `__builtin_shuffle`,
+# `__builtin_shufflevector` and `__builtin_convertvector`, and a vector of
+# floating lanes four bytes wide or less at a call boundary, which gcc passes
+# like no type c17 has. Every other vector operation runs.
+OUT_OF_SCOPE_VECTOR_ARITH=" compile/pr108892 compile/pr52750 compile/pr96426 \
+ execute/pr85331 execute/pr94591 ieee/fp-cmp-cond-1 "
 
 # `__label__`, a block-scope label declaration. cc/DECISIONS.md rules it out
 # together with nested functions, which are what it exists for.

@@ -7,10 +7,12 @@
 // SPDX-License-Identifier: MIT
 //
 
+#[cfg(unix)]
+use plib::testing::os_bytes;
 use plib::testing::{
-    locale_matching, os_bytes, run_test, run_test_os, run_test_with_env, utf8_locale, TestPlan,
-    TestPlanOs,
+    locale_matching, run_test, run_test_os, run_test_with_env, utf8_locale, TestPlan, TestPlanOs,
 };
+use std::ffi::OsString;
 
 // success: result is neither null nor zero (exit 0)
 fn expr_test(args: &[&str], expected_output: &str) {
@@ -222,7 +224,9 @@ fn expr_integer_out_of_range() {
 }
 
 /// POSIX operands are byte strings and need not be text; decoding argv as
-/// UTF-8 aborted the process on one that was not.
+/// UTF-8 aborted the process on one that was not. Unix only: a Windows
+/// command line is UTF-16 and cannot carry bytes that are not UTF-8.
+#[cfg(unix)]
 #[test]
 fn expr_non_utf8_operands() {
     // Printed back unchanged.
@@ -261,14 +265,18 @@ fn expr_non_utf8_operands() {
         expected_err: Vec::new(),
         expected_exit_code: 0,
     });
-    // A capture that lands inside a multibyte character returns those bytes,
-    // rather than aborting or substituting a replacement character.
+}
+
+/// A capture that lands inside a multibyte character returns those bytes,
+/// rather than aborting or substituting a replacement character.
+#[test]
+fn expr_capture_inside_a_multibyte_character() {
     run_test_os(TestPlanOs {
         cmd: String::from("expr"),
         args: vec![
-            os_bytes("日本語".as_bytes()),
-            os_bytes(b":"),
-            os_bytes(b"\\(..\\)"),
+            OsString::from("日本語"),
+            OsString::from(":"),
+            OsString::from("\\(..\\)"),
         ],
         stdin_data: Vec::new(),
         expected_out: b"\xe6\x97\n".to_vec(),
@@ -335,7 +343,7 @@ fn expr_write_error_is_reported() {
         output.status.code()
     );
     assert!(
-        stderr.contains("No space left on device"),
+        stderr.contains(&crate::full_device_error()),
         "expected the write failure to be named, got {stderr:?}"
     );
 }

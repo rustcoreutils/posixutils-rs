@@ -152,13 +152,13 @@ fn parse_token(arg: Vec<u8>) -> Token {
 
 // tokenize the command line arguments, all in a single pass
 fn tokenize() -> Vec<Token> {
-    use std::os::unix::ffi::OsStrExt;
-
     // POSIX operands are byte strings: a pathname or a compared string need
-    // not be text, and decoding argv as UTF-8 aborts on one that is not.
+    // not be text, and decoding argv as UTF-8 aborts on one that is not. On
+    // Unix these are the argument's own bytes; Windows arguments are UTF-16,
+    // read as UTF-8.
     let mut args: Vec<Vec<u8>> = std::env::args_os()
         .skip(1)
-        .map(|arg| arg.as_bytes().to_vec())
+        .map(|arg| arg.as_encoded_bytes().to_vec())
         .collect();
 
     // POSIX / XBD 12.2 Guideline 10: a leading "--" delimits the end of

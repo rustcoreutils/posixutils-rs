@@ -8,8 +8,7 @@
 //
 
 use std::io::{self, Write};
-use std::os::unix::process::ExitStatusExt;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::Instant;
 
 use clap::Parser;
@@ -65,18 +64,7 @@ enum TimeError {
 /// status, per POSIX EXIT STATUS).
 fn time(args: Args) -> Result<i32, TimeError> {
     let start_time = Instant::now();
-    // SAFETY: std::mem::zeroed() is used to create an instance of libc::tms with all fields set to zero.
-    // This is safe here because libc::tms is a Plain Old Data type, and zero is a valid value for all its fields.
-    let mut tms_start: libc::tms = unsafe { std::mem::zeroed() };
-    // SAFETY: sysconf is a POSIX function that returns the number of clock ticks per second.
-    // It is safe to call because it does not modify any memory and has no side effects.
-    let clock_ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) as f64 };
-
-    // Snapshot the process's accumulated CPU times *before* spawning the child.
-    // SAFETY: times is a POSIX function that fills the provided tms structure with time-accounting information.
-    // It is safe to call because we have correctly allocated and initialized tms_start, and the function
-    // only writes to this structure.
-    unsafe { libc::times(&mut tms_start) };
+    let cpu_start = CpuStart::now();
 
     let mut child = Command::new(&args.utility)
         .args(args.arguments)
@@ -91,22 +79,7 @@ fn time(args: Args) -> Result<i32, TimeError> {
     let status = child.wait().map_err(|_| TimeError::ExecTime)?;
 
     let elapsed = start_time.elapsed();
-
-    // Snapshot again *after* the child has been waited for, so the child's CPU
-    // usage has been folded into this process's tms_cutime/tms_cstime fields.
-    // SAFETY: same invariant as the tms_start call above.
-    let mut tms_end: libc::tms = unsafe { std::mem::zeroed() };
-    unsafe { libc::times(&mut tms_end) };
-
-    // POSIX: User CPU time is the sum of tms_utime and tms_cutime, System CPU
-    // time the sum of tms_stime and tms_cstime, for the process in which the
-    // utility is executed. The child's usage is in the c* fields after wait().
-    let user_ticks =
-        (tms_end.tms_utime + tms_end.tms_cutime) - (tms_start.tms_utime + tms_start.tms_cutime);
-    let system_ticks =
-        (tms_end.tms_stime + tms_end.tms_cstime) - (tms_start.tms_stime + tms_start.tms_cstime);
-    let user_time = user_ticks as f64 / clock_ticks_per_second;
-    let system_time = system_ticks as f64 / clock_ticks_per_second;
+    let (user_time, system_time) = cpu_start.used(&child);
 
     if args.posix {
         writeln!(
@@ -129,12 +102,116 @@ fn time(args: Args) -> Result<i32, TimeError> {
     }
 
     // EXIT STATUS: the exit status of time shall be the exit status of utility.
-    // A child terminated by a signal is reported as 128 + signal number.
-    let code = match status.code() {
+    Ok(exit_code(status))
+}
+
+/// This process's CPU times before the utility ran: `times(2)`, whose
+/// children's fields take in the utility's usage once it has been waited for.
+#[cfg(unix)]
+struct CpuStart(libc::tms);
+
+#[cfg(unix)]
+impl CpuStart {
+    fn now() -> Self {
+        // SAFETY: tms is plain data, and times only writes to it.
+        let mut tms: libc::tms = unsafe { std::mem::zeroed() };
+        unsafe { libc::times(&mut tms) };
+        CpuStart(tms)
+    }
+
+    /// User and system CPU seconds used since `now`, by this process and the
+    /// waited-for utility.
+    fn used(&self, _child: &Child) -> (f64, f64) {
+        let start = &self.0;
+        let end = CpuStart::now().0;
+        // SAFETY: sysconf has no side effects.
+        let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) as f64 };
+
+        // POSIX: User CPU time is the sum of tms_utime and tms_cutime, System
+        // CPU time the sum of tms_stime and tms_cstime, for the process in
+        // which the utility is executed.
+        let user = (end.tms_utime + end.tms_cutime) - (start.tms_utime + start.tms_cutime);
+        let system = (end.tms_stime + end.tms_cstime) - (start.tms_stime + start.tms_cstime);
+        (
+            user as f64 / ticks_per_second,
+            system as f64 / ticks_per_second,
+        )
+    }
+}
+
+/// Process CPU times, user then kernel, in 100-nanosecond units.
+#[cfg(windows)]
+fn process_times(process: std::os::windows::io::RawHandle) -> (u64, u64) {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetProcessTimes(
+            process: std::os::windows::io::RawHandle,
+            creation: *mut u64,
+            exit: *mut u64,
+            kernel: *mut u64,
+            user: *mut u64,
+        ) -> i32;
+    }
+    let (mut creation, mut exit, mut kernel, mut user) = (0, 0, 0, 0);
+    // SAFETY: each pointer is a FILETIME-sized out parameter; a failed call
+    // leaves them zero.
+    unsafe { GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user) };
+    (user, kernel)
+}
+
+/// This process's CPU times before the utility ran. Windows keeps no
+/// children's totals, so the utility's own times are read from its handle.
+#[cfg(windows)]
+struct CpuStart((u64, u64));
+
+#[cfg(windows)]
+impl CpuStart {
+    fn now() -> Self {
+        CpuStart(process_times(Self::current_process()))
+    }
+
+    fn current_process() -> std::os::windows::io::RawHandle {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetCurrentProcess() -> std::os::windows::io::RawHandle;
+        }
+        // SAFETY: returns a pseudo-handle; nothing to release.
+        unsafe { GetCurrentProcess() }
+    }
+
+    /// User and system CPU seconds used since `now`, by this process and the
+    /// waited-for utility.
+    fn used(&self, child: &Child) -> (f64, f64) {
+        use std::os::windows::io::AsRawHandle;
+        const TICKS_PER_SECOND: f64 = 10_000_000.0;
+
+        let (start_user, start_kernel) = self.0;
+        let (end_user, end_kernel) = process_times(Self::current_process());
+        let (child_user, child_kernel) = process_times(child.as_raw_handle());
+        let user = end_user - start_user + child_user;
+        let system = end_kernel - start_kernel + child_kernel;
+        (
+            user as f64 / TICKS_PER_SECOND,
+            system as f64 / TICKS_PER_SECOND,
+        )
+    }
+}
+
+/// The utility's exit status; one terminated by a signal is reported as
+/// 128 + the signal number.
+#[cfg(unix)]
+fn exit_code(status: ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    match status.code() {
         Some(code) => code,
         None => 128 + status.signal().unwrap_or(0),
-    };
-    Ok(code)
+    }
+}
+
+/// The utility's exit status; a Windows process always has an exit code.
+#[cfg(windows)]
+fn exit_code(status: ExitStatus) -> i32 {
+    status.code().unwrap_or(1)
 }
 
 enum Status {

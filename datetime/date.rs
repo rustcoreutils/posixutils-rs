@@ -11,8 +11,10 @@ use chrono::{DateTime, Datelike, Local, LocalResult, TimeZone, Utc};
 use clap::Parser;
 use gettextrs::gettext;
 use plib::diag;
+#[cfg(unix)]
 use std::ffi::CString;
 use std::io::{self, Write};
+#[cfg(unix)]
 use std::mem::MaybeUninit;
 use std::process;
 
@@ -20,6 +22,7 @@ const DEF_TIMESTR: &str = "%a %b %e %H:%M:%S %Z %Y";
 
 /// Upper bound for the `strftime` output buffer. A zero return at this size is
 /// treated as a legitimately-empty conversion rather than a buffer overflow.
+#[cfg(unix)]
 const STRFTIME_BUF_MAX: usize = 64 * 1024;
 
 /// Map a 2-digit year to a full year per POSIX: values in [00,68] refer to
@@ -59,19 +62,32 @@ fn show_time(utc: bool, formatstr: &str) {
         return;
     }
 
-    let c_format = match CString::new(formatstr) {
-        Ok(s) => s,
-        Err(_) => {
-            diag::error(&gettext("format string contains NUL byte"));
-            process::exit(1);
-        }
-    };
-
     let now = unsafe { libc::time(std::ptr::null_mut()) };
     if now == -1 {
         diag::error(&gettext("failed to get current time"));
         process::exit(1);
     }
+
+    match format_time(now, utc, formatstr) {
+        Ok(text) => {
+            // Write the raw bytes so non-UTF-8 locale output is preserved.
+            let mut out = io::stdout().lock();
+            let _ = out.write_all(&text);
+            let _ = out.write_all(b"\n");
+        }
+        Err(msg) => {
+            diag::error(&gettext(msg));
+            process::exit(1);
+        }
+    }
+}
+
+/// `now` formatted by `formatstr` with the C library's `strftime`, in UTC or
+/// local time.
+#[cfg(unix)]
+fn format_time(now: libc::time_t, utc: bool, formatstr: &str) -> Result<Vec<u8>, &'static str> {
+    let c_format = CString::new(formatstr).map_err(|_| "format string contains NUL byte")?;
+
     let mut tm = MaybeUninit::<libc::tm>::uninit();
 
     let tm_ptr = unsafe {
@@ -83,8 +99,7 @@ fn show_time(utc: bool, formatstr: &str) {
     };
 
     if tm_ptr.is_null() {
-        diag::error(&gettext("failed to get current time"));
-        process::exit(1);
+        return Err("failed to get current time");
     }
 
     let tm = unsafe { tm.assume_init() };
@@ -109,25 +124,28 @@ fn show_time(utc: bool, formatstr: &str) {
             )
         };
         if len > 0 {
-            // Write the raw bytes so non-UTF-8 locale output is preserved.
-            let mut out = io::stdout().lock();
-            let _ = out.write_all(&buf[..len]);
-            let _ = out.write_all(b"\n");
-            return;
+            buf.truncate(len);
+            return Ok(buf);
         }
         if buf[0] == 0 {
-            // Empty-but-valid conversion: a <newline> shall always be appended.
-            let _ = io::stdout().write_all(b"\n");
-            return;
+            // Empty-but-valid conversion: a <newline> shall still be appended.
+            return Ok(Vec::new());
         }
         // Output did not fit; grow and retry, capped to guard against a
         // pathologically large format silently allocating unbounded memory.
         if buf_size >= STRFTIME_BUF_MAX {
-            diag::error(&gettext("formatted output exceeds internal buffer limit"));
-            process::exit(1);
+            return Err("formatted output exceeds internal buffer limit");
         }
         buf_size *= 2;
     }
+}
+
+/// `now` formatted by `formatstr` in UTC or local time; see `plib::timefmt`.
+#[cfg(windows)]
+fn format_time(now: libc::time_t, utc: bool, formatstr: &str) -> Result<Vec<u8>, &'static str> {
+    plib::timefmt::format_time(formatstr, now, utc)
+        .map(String::into_bytes)
+        .map_err(|_| "failed to format the time")
 }
 
 fn set_time(utc: bool, timestr: &str) -> Result<(), &'static str> {
@@ -195,18 +213,65 @@ fn set_time(utc: bool, timestr: &str) -> Result<(), &'static str> {
         }
     };
 
+    set_clock(new_time)
+}
+
+/// Set the system clock to `secs` seconds since the Epoch.
+#[cfg(unix)]
+fn set_clock(secs: i64) -> Result<(), &'static str> {
     let new_time = libc::timespec {
-        tv_sec: new_time,
+        tv_sec: secs,
         tv_nsec: 0,
     };
 
-    // set system time
     unsafe {
         if libc::clock_settime(libc::CLOCK_REALTIME, &new_time) != 0 {
             return Err("failed to set time");
         }
     }
 
+    Ok(())
+}
+
+/// Set the system clock to `secs` seconds since the Epoch: `SetSystemTime`,
+/// which needs the system-time privilege.
+#[cfg(windows)]
+fn set_clock(secs: i64) -> Result<(), &'static str> {
+    use chrono::Timelike;
+
+    #[repr(C)]
+    struct SystemTime {
+        year: u16,
+        month: u16,
+        day_of_week: u16,
+        day: u16,
+        hour: u16,
+        minute: u16,
+        second: u16,
+        milliseconds: u16,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetSystemTime(time: *const SystemTime) -> i32;
+    }
+
+    let t = DateTime::from_timestamp(secs, 0).ok_or("invalid date")?;
+    let field = |v: u32| u16::try_from(v).map_err(|_| "invalid date");
+    let new_time = SystemTime {
+        year: u16::try_from(t.year()).map_err(|_| "invalid date")?,
+        month: field(t.month())?,
+        day_of_week: field(t.weekday().num_days_from_sunday())?,
+        day: field(t.day())?,
+        hour: field(t.hour())?,
+        minute: field(t.minute())?,
+        second: field(t.second())?,
+        milliseconds: 0,
+    };
+    // SAFETY: new_time is a valid SYSTEMTIME for the duration of the call.
+    if unsafe { SetSystemTime(&new_time) } == 0 {
+        return Err("failed to set time");
+    }
     Ok(())
 }
 

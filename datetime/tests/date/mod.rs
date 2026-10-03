@@ -41,6 +41,9 @@ fn test_tz_utc_flag() {
     });
 }
 
+// Unix only: a zoneinfo name needs the tz database, which the Windows C
+// runtime does not read.
+#[cfg(unix)]
 #[test]
 fn test_tz_named() {
     run_test_with_checker_and_env(
@@ -104,7 +107,9 @@ fn test_default_format_utc() {
 
 // Regression for the #D2 follow-up (Copilot): a format whose output exceeds
 // the internal 64 KiB strftime buffer must be reported as an error, not
-// silently truncated to a bare newline.
+// silently truncated to a bare newline. Unix only: the buffer is the C
+// library's strftime's, and a Windows command line cannot hold such a format.
+#[cfg(unix)]
 #[test]
 fn test_format_exceeds_buffer_errors() {
     let huge = format!("+{}", "x".repeat(70_000));
@@ -208,7 +213,9 @@ fn test_format_newline_tab_and_embedded_conversion() {
 // #D4: the `-u` *set* form. Setting the clock needs privilege, so an
 // unprivileged run must fail cleanly with a diagnostic and a non-zero status —
 // not panic, and not silently succeed. This exercises the set-time branch,
-// which no test reached before.
+// which no test reached before. Unix only: Windows CI runs as an
+// administrator, where the test would really set the clock.
+#[cfg(unix)]
 #[test]
 fn test_utc_set_form_fails_cleanly_without_privilege() {
     // Root would actually set the system clock; never do that in a test.

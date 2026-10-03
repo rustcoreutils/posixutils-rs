@@ -1,10 +1,64 @@
-# Porting a crate to Windows
+# Windows
 
-How a workspace crate is made to build, and its tests to pass, on Windows
-(`x86_64-pc-windows-msvc`), and how it then joins CI. Follow it in order; each
-step names what to check before going on.
+What builds on Windows (`x86_64-pc-windows-msvc`) and how it behaves there,
+then how another workspace crate is ported.
 
-## Rules
+## Using the utilities on Windows
+
+These crates build and are tested on Windows, natively with MSVC (no MinGW or
+Cygwin runtime):
+
+| Crate | Utilities |
+|---|---|
+| `calc` | `bc`, `expr` |
+| `datetime` | `cal`, `date`, `sleep`, `time` |
+| `text` | `asa`, `comm`, `csplit`, `cut`, `diff`, `expand`, `fold`, `grep`, `head`, `join`, `nl`, `paste`, `patch`, `pr`, `sed`, `sort`, `tail`, `tr`, `tsort`, `unexpand`, `uniq`, `wc` |
+| `xform` | `cksum`, `compress`, `uuencode`, `uudecode` |
+
+```sh
+cargo build --release -p posixutils-calc -p posixutils-datetime -p posixutils-text -p posixutils-xform
+```
+
+What behaves differently on Windows:
+
+- a file's POSIX mode is its read-only attribute, read as the owner-write bit
+  (`0444` or `0644`); setting a mode without owner write makes it read-only;
+- `compress` restores permissions and times but not ownership, and does not
+  warn about hard links; the `zcat` and `uncompress` aliases do not exist
+  (use `compress -c -d` and `compress -d`);
+- `LC_ALL`, `LC_*` and `LANG` set to `C` or `POSIX` select the C locale:
+  ASCII-only character classes and case mapping, one byte per character, and
+  byte-order collation; `C.UTF-8` (or any `C`/`POSIX` name with a codeset)
+  collates in byte order but reads UTF-8 and classifies and case-maps by
+  Unicode; any other value, or none, is the user's locale with UTF-8 input and
+  Unicode characters;
+- POSIX regular expressions are musl's (vendored in `plib/vendor/musl-regex`)
+  and do not support characters above U+FFFF;
+- `sort -n` always takes `.` as the decimal point, with no thousands
+  separator;
+- `diff` reports anything that is neither a file nor a directory as a
+  special file, and recognises a directory loop by its canonical path;
+- `pr -p` and `patch` prompt on the console; `csplit` removes its files on
+  Ctrl-C, Ctrl-Break and termination, Windows having no hangup or quit
+  signal;
+- `date` and `cal` name months and days as the POSIX locale does, whatever
+  `LC_TIME` says; `TZ` takes the C runtime's forms (`UTC0`, `EST5EDT`: a
+  three-letter name, an offset, an optional daylight name) and not zoneinfo
+  names such as `America/New_York`; unset, it is the system time zone;
+- `date` sets the clock only with the system-time privilege, and reads the
+  local time it is given in the system time zone, not `TZ`;
+- `time` reports its own CPU time plus the utility's, Windows keeping no
+  totals for a process's descendants;
+- `expr` operands are text: a Windows command line cannot carry bytes that
+  are not UTF-8.
+
+## Porting a crate
+
+How a workspace crate is made to build, and its tests to pass, on Windows,
+and how it then joins CI. Follow it in order; each step names what to check
+before going on.
+
+### Rules
 
 - **A whole crate at a time.** `cargo test -p <crate>` builds every binary in
   the crate, so a crate is ported when *all* of its binaries and tests compile
@@ -24,7 +78,7 @@ step names what to check before going on.
   (`mode_of`, `set_mode`, `remove_file`, `link_count`), called from shared
   code. Never scatter `cfg` through a function body twice for the same rule.
 
-## Windows meaning of Unix concepts
+### Windows meaning of Unix concepts
 
 | Unix | Windows |
 |---|---|
@@ -52,10 +106,15 @@ step names what to check before going on.
 | FIFOs, devices, sockets | none: neither a file nor a directory is "special" |
 | `SIGQUIT` | `SIGBREAK` (Ctrl-Break) where a quit key is meant |
 | absolute paths | a root (`\x`), a drive prefix (`C:x`) or `..` must all be refused where only relative names are allowed |
+| `localtime_r`, `gmtime_r`, `TZ` | the C runtime's `localtime_s` / `gmtime_s`, which read `TZ` in its own forms (no zoneinfo); the zone name is its `strftime("%Z")` |
+| `strftime`, `LC_TIME` | `plib::timefmt`: the POSIX locale's names and formats, `LC_TIME` ignored |
+| `clock_settime` | `SetSystemTime` (needs the system-time privilege) |
+| `times()` children's CPU | `GetProcessTimes` on the waited-for child's handle, added to the process's own |
+| argv as bytes (`OsStrExt::as_bytes`) | `OsStr::as_encoded_bytes`, portable: the same bytes on Unix, UTF-8 on Windows |
 
-## Steps
+### Steps
 
-### 1. Survey
+#### 1. Survey
 
 ```sh
 cargo check --target x86_64-pc-windows-msvc -p <crate> --all-targets 2>&1 | grep -E '^error'
@@ -67,18 +126,18 @@ Sort the errors into: missing `plib` modules (step 2), the crate's own sources
 Windows meaning; a binary that cannot be ported keeps the whole crate off
 Windows (or the crate is split), never stubbed.
 
-### 2. plib
+#### 2. plib
 
 `plib` is the base of every crate. Its modules with no Windows meaning are
 `#[cfg(unix)]` in `plib/src/lib.rs`; a crate that needs one ports that module
 (or the part it uses) first, as its own commit, with the module's unit tests
 running on Windows. Ported so far: `diag`, `io` (including the terminal for
-prompts), `locale` (characters and case), `lzw`, `regex`, `testing`,
+prompts), `locale` (characters, case and `strftime`), `lzw`, `regex`, `testing`,
 `archive`, `cscan`, `linediff`. Still
 Unix-only: `curuser`, `exec`, `group`, `modestr`, `platform`, `priority`,
 `projectdir`, `sccsfile`, `syslog`, `test_expr`, `tmp`, `tty`, `user`, `utmpx`.
 
-### 3. The crate's sources
+#### 3. The crate's sources
 
 Apply the table above through small cfg'd helpers. Prefer a portable std API
 that serves both platforms when it is exactly equivalent on Unix. Read every
@@ -86,7 +145,7 @@ that serves both platforms when it is exactly equivalent on Unix. Read every
 not the ones that compile and mean something else (a path with `/dev/stdout`,
 a `:`-separated list).
 
-### 4. Tests
+#### 4. Tests
 
 - Integration tests find binaries with `plib::testing::get_binary_path`, which
   already handles `.exe` and `--target` layouts.
@@ -101,7 +160,7 @@ a `:`-separated list).
 - Windows will not delete a read-only file under Wine: clear the attribute
   before cleanup.
 
-### 5. Verify
+#### 5. Verify
 
 Every commit, never two cargo commands at once:
 
@@ -128,17 +187,24 @@ A change to `plib::testing` or anything every crate uses gets the full
 Wine's limits: the `-gnu` target links `msvcrt`, which refuses the UTF-8
 locale, so UTF-8 multibyte regex behaviour is exercised only by CI's MSVC
 build; and Wine refuses to delete a read-only file even where current Windows
-does, which is the stricter behaviour to be correct against.
+does, which is the stricter behaviour to be correct against. Three
+`datetime` tests fail under Wine 9 and pass only on Windows: its `msvcrt`
+parses `TZ` wrongly (`TZ=UTC` names the zone `UT`), failing `date`'s
+`test_tz_utc` and `test_default_format_utc`; and its `GetProcessTimes`
+answers the caller's own times for another process, failing `time`'s
+`cpu_bound_child_reports_nonzero_cpu_time`. Wine maps `/dev/full` to the
+Linux device, so the tests that write to it run there and not on Windows.
 
-### 6. CI and docs
+#### 6. CI and docs
 
 Add `-p <crate>` to `WINDOWS_CRATES` in `.github/workflows/TestingCI.yml`; the
 `windows` job, the lint job's Windows clippy and the `msrv` job's Windows
-check all read it. List the crate's utilities in README's "Windows" section,
-with anything that behaves differently there, and add any new Unix→Windows
-meaning to the table above. Ported so far: `xform`, `text`.
+check all read it. Add the crate and its utilities to the table under "Using
+the utilities on Windows" and to its build command, anything that behaves
+differently to the list there, and any new Unix→Windows meaning to the table
+above. README only points here: it is not edited per crate.
 
-### 7. Commits
+#### 7. Commits
 
 A bisectable series, each commit building and passing clippy on both targets
 on its own: plib modules first, then the crate's sources, then its tests,

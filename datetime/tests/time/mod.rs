@@ -9,23 +9,26 @@
 
 use std::process::Output;
 
-use plib::testing::{run_test_base, TestPlan};
+use plib::testing::{get_binary_path, run_test_base, TestPlan};
+
+/// A utility to time: this crate's own `date`, which every platform has.
+fn date_path() -> String {
+    get_binary_path("date").to_string_lossy().into_owned()
+}
 
 fn get_output(plan: TestPlan) -> Output {
     run_test_base(&plan.cmd, &plan.args, plan.stdin_data.as_bytes())
 }
 
 fn run_test_time(
-    args: &[&str],
+    args: &[String],
     expected_output: &str,
     expected_error: &str,
     expected_exit_code: i32,
 ) {
-    let str_args: Vec<String> = args.iter().map(|s| String::from(*s)).collect();
-
     let output = get_output(TestPlan {
         cmd: String::from("time"),
-        args: str_args,
+        args: args.to_vec(),
         stdin_data: String::new(),
         expected_out: String::from(expected_output),
         expected_err: String::from(expected_error),
@@ -39,12 +42,17 @@ fn run_test_time(
 
 #[test]
 fn simple_test() {
-    run_test_time(&["--", "ls", "-l"], "", "User time", 0);
+    run_test_time(&["--".into(), date_path(), "-u".into()], "", "User time", 0);
 }
 
 #[test]
 fn p_test() {
-    run_test_time(&["-p", "--", "ls", "-l"], "", "user", 0);
+    run_test_time(
+        &["-p".into(), "--".into(), date_path(), "-u".into()],
+        "",
+        "user",
+        0,
+    );
 }
 
 #[test]
@@ -54,7 +62,12 @@ fn parse_error_test() {
 
 #[test]
 fn command_error_test() {
-    run_test_time(&["-s", "ls", "-l"], "", "unexpected argument '-s' found", 0);
+    run_test_time(
+        &["-s".into(), date_path(), "-u".into()],
+        "",
+        "unexpected argument '-s' found",
+        0,
+    );
 }
 
 /// Parse the `user`/`sys` seconds out of `time -p` output on stderr.
@@ -74,20 +87,34 @@ fn parse_p_user_sys(stderr: &str) -> (f64, f64) {
     )
 }
 
+/// Not a test of its own: the CPU-bound child of
+/// `cpu_bound_child_reports_nonzero_cpu_time`, which runs this test binary
+/// with `--ignored --exact`.
+#[test]
+#[ignore = "run as a child by cpu_bound_child_reports_nonzero_cpu_time"]
+fn busy_child() {
+    let start = std::time::Instant::now();
+    let mut n: u64 = 0;
+    while start.elapsed() < std::time::Duration::from_millis(300) {
+        n = std::hint::black_box(n.wrapping_add(1));
+    }
+}
+
 // Regression for #T1/#T2: a CPU-bound child must report non-zero CPU time.
 // The pre-fix code never refilled tms_end and read the parent's own counters,
 // so user/sys were always ~0 regardless of the child's work.
 #[test]
 fn cpu_bound_child_reports_nonzero_cpu_time() {
-    let busy = "i=0; while [ $i -lt 3000000 ]; do i=$((i+1)); done";
+    let this_test = std::env::current_exe().unwrap();
     let output = get_output(TestPlan {
         cmd: String::from("time"),
         args: vec![
             String::from("-p"),
             String::from("--"),
-            String::from("sh"),
-            String::from("-c"),
-            String::from(busy),
+            this_test.to_string_lossy().into_owned(),
+            String::from("--ignored"),
+            String::from("--exact"),
+            String::from("time::busy_child"),
         ],
         stdin_data: String::new(),
         expected_out: String::new(),
@@ -96,6 +123,11 @@ fn cpu_bound_child_reports_nonzero_cpu_time() {
     });
 
     assert!(output.status.success(), "time of busy child should exit 0");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("1 passed"),
+        "the busy child did not run: {stdout}"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     let (user, sys) = parse_p_user_sys(&stderr);
     assert!(
@@ -110,21 +142,21 @@ fn cpu_bound_child_reports_nonzero_cpu_time() {
 fn propagates_child_exit_status() {
     let output = get_output(TestPlan {
         cmd: String::from("time"),
+        // `sleep` rejects a non-numeric operand with status 2.
         args: vec![
             String::from("--"),
-            String::from("sh"),
-            String::from("-c"),
-            String::from("exit 7"),
+            get_binary_path("sleep").to_string_lossy().into_owned(),
+            String::from("abc"),
         ],
         stdin_data: String::new(),
         expected_out: String::new(),
         expected_err: String::new(),
-        expected_exit_code: 7,
+        expected_exit_code: 2,
     });
 
     assert_eq!(
         output.status.code(),
-        Some(7),
+        Some(2),
         "time should exit with the utility's exit status"
     );
     // Timing statistics are still written even when the utility fails.
@@ -148,16 +180,7 @@ fn reports_127_when_the_utility_is_not_found() {
 fn reports_126_when_the_utility_cannot_be_invoked() {
     // A regular, non-executable file: found, but not invocable.
     let path = std::env::temp_dir().join(format!("posixutils_time_noexec_{}", std::process::id()));
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        let _f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o644)
-            .open(&path)
-            .unwrap();
-    }
+    std::fs::write(&path, b"").unwrap();
 
     let output = run_test_base("time", &[path.to_string_lossy().into_owned()], b"");
     assert_eq!(output.status.code(), Some(126));
@@ -170,16 +193,12 @@ fn reports_126_when_the_utility_cannot_be_invoked() {
 // `allow_hyphen_values`, so clap tried to parse the utility's first hyphenated
 // argument as one of time's own and rejected it: `time ls -l` and
 // `time sh -c '...'` both failed. See `#C4` in the process/ audit — env, nice
-// and timeout had the identical defect.
+// and timeout had the identical defect. The timed utility here is `date -u`.
 #[test]
 fn utility_arguments_may_start_with_a_hyphen() {
     let output = run_test_base(
         "time",
-        &[
-            "sh".to_string(),
-            "-c".to_string(),
-            "echo passed-through".to_string(),
-        ],
+        &[date_path(), "-u".to_string(), "+passed-through".to_string()],
         b"",
     );
 
@@ -203,9 +222,9 @@ fn own_p_option_still_parses_before_the_utility() {
         "time",
         &[
             "-p".to_string(),
-            "sh".to_string(),
-            "-c".to_string(),
-            "echo ok".to_string(),
+            date_path(),
+            "-u".to_string(),
+            "+ok".to_string(),
         ],
         b"",
     );

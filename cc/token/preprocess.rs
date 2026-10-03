@@ -2613,6 +2613,8 @@ pub struct PreprocessConfig<'a> {
     /// The position independence code generation uses; see
     /// [`define_pic_macros`].
     pub position: crate::target::PositionIndependence,
+    /// The x86-64 extensions the code may assume; see [`define_isa_macros`].
+    pub isa: crate::target::X86Isa,
     /// What optimization was asked for.
     ///
     /// The same value the optimizer is given, so `__OPTIMIZE__`,
@@ -2671,6 +2673,19 @@ fn define_pic_macros(
     }
 }
 
+/// Define the feature macros of the x86-64 extensions `-msse3` ..
+/// `-msse4.2`, `-mpopcnt` and `-march=` ask for (`__SSE4_1__` and the rest),
+/// as gcc does. Code tests them to choose its path; the baseline's
+/// `__SSE2__` is among the target's own macros.
+fn define_isa_macros(pp: &mut Preprocessor, target: &Target, isa: crate::target::X86Isa) {
+    if target.arch != crate::target::Arch::X86_64 {
+        return;
+    }
+    for name in isa.macros() {
+        pp.define_macro(Macro::predefined(name, Some("1")));
+    }
+}
+
 /// What preprocessing found, beyond the tokens.
 ///
 /// The `Preprocessor` is a local of the function below and is dropped when it
@@ -2717,6 +2732,7 @@ pub fn preprocess_collecting(
 
     define_optimization_macros(&mut pp, config.optimization);
     define_pic_macros(&mut pp, target, config.position);
+    define_isa_macros(&mut pp, target, config.isa);
 
     // Add -I include paths
     for path in config.include_paths {
@@ -2789,6 +2805,8 @@ pub struct AsmPreprocessConfig<'a> {
     /// files too, where hand-written assembly chooses GOT or direct accesses
     /// by them.
     pub position: crate::target::PositionIndependence,
+    /// See [`PreprocessConfig::isa`].
+    pub isa: crate::target::X86Isa,
 }
 
 /// A `.S` operand that could not be preprocessed.
@@ -2860,6 +2878,7 @@ pub fn preprocess_asm_file(
 
     define_optimization_macros(&mut pp, config.optimization);
     define_pic_macros(&mut pp, target, config.position);
+    define_isa_macros(&mut pp, target, config.isa);
 
     // -nostdinc: the directories are dropped in `Preprocessor::new`; the
     // bundled headers go with them.

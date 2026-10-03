@@ -2082,6 +2082,7 @@ fn test_pic_macros_follow_the_configuration() {
     let expand = |pic: bool, pie: bool, target: &Target| {
         let config = PreprocessConfig {
             position: crate::target::PositionIndependence { pic, pie },
+            isa: Default::default(),
             ..Default::default()
         };
         let mut idents = IdentTable::new();

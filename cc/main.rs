@@ -628,6 +628,7 @@ fn preprocess_asm_operand(
     let config = AsmPreprocessConfig {
         optimization: args.optimization(),
         position: position_independence(args, target),
+        isa: target::X86Isa::from_flags(&args.mflags),
         defines: &args.defines,
         undefines: &args.undefines,
         include_paths: &args.include_paths,
@@ -1111,6 +1112,7 @@ fn process_file(
             collect_dependencies: args.wants_dependencies(),
             optimization: args.optimization(),
             position: position_independence(args, target),
+            isa: target::X86Isa::from_flags(&args.mflags),
         },
     );
 
@@ -2076,10 +2078,18 @@ fn check_machine_flags(flags: &[String], target: &Target) {
             || flag.starts_with("-mtune=")
             || flag.starts_with("-mcpu=")
             || match target.arch {
-                target::Arch::X86_64 => matches!(
-                    flag,
-                    "-m64" | "-msse" | "-msse2" | "-mmmx" | "-mfpmath=sse" | "-mcmodel=small"
-                ),
+                target::Arch::X86_64 => {
+                    target::is_isa_flag(flag)
+                        || matches!(
+                            flag,
+                            "-m64"
+                                | "-msse"
+                                | "-msse2"
+                                | "-mmmx"
+                                | "-mfpmath=sse"
+                                | "-mcmodel=small"
+                        )
+                }
                 target::Arch::Aarch64 => {
                     matches!(flag, "-mabi=lp64" | "-mlittle-endian" | "-mcmodel=small")
                 }
@@ -2298,6 +2308,7 @@ fn assemble_operand(
         let asm_config = AsmPreprocessConfig {
             optimization: args.optimization(),
             position: position_independence(args, target),
+            isa: target::X86Isa::from_flags(&args.mflags),
             defines: &args.defines,
             undefines: &args.undefines,
             include_paths: &args.include_paths,

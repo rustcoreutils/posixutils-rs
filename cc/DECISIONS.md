@@ -155,7 +155,7 @@ the project's own filter before earning a verdict:
 
 | Extension | Verdict | Why |
 |---|---|---|
-| SIMD intrinsic headers | **No headers.** The predefines are disputed | `<emmintrin.h>`, `<arm_neon.h>` and the rest are not shipped. The code keeps `__SSE__`/`__SSE2__`/`__MMX__` and `__ARM_NEON` defined, as "Which macros may be withdrawn" argues; "SIMD headers" below argues for withdrawing them. The two have not been reconciled |
+| SIMD intrinsic headers | **SSE through SSE4.2, and core NEON** | Bundled and written in C over GNU vectors; see "SIMD headers" below. The AVX families are not |
 | `__auto_type` | **No** | Not in glibc's headers or CPython; `__typeof__`, which c17 has, does the same job in the macros that use it |
 | nested functions / `__label__` | **Never** | GCC-only, Clang refuses nested functions, so portable code already avoids them; they need executable-stack trampolines. See the c-torture section |
 | VLA as a struct member | **No** | GCC-only (Clang refuses it); needs struct layout computed at run time and `offsetof` through it |
@@ -167,26 +167,18 @@ scope unless a real corpus forces the question. The c-torture harness skips
 such tests with a named reason rather than counting them as failures -- what
 is left failing is then a list of defects, not a list of decisions.
 
-### SIMD headers — the case for withdrawing the predefines
+### SIMD headers
 
 On x86-64 c17 predefines `__SSE__`, `__SSE2__`, `__MMX__`, `__SSE_MATH__` and
 `__SSE2_MATH__`, matching GCC's x86-64 default; on aarch64 it predefines
-`__ARM_NEON`. GCC defines those *and* ships the intrinsic headers; c17 defines
-them and does not. So a project's `#ifdef __SSE2__` guard opens the door to a
-header that isn't there, when the same file's `#else` branch would have
-compiled:
-
-```c
-#ifdef __SSE2__
-#include <emmintrin.h>      /* c17: 'emmintrin.h': file not found */
-#else
-... portable fallback ...   /* builds clean; -U__SSE2__ proves it */
-#endif
-```
-
-The predefines stay (see the next section), and the intrinsic headers are to
-be bundled: vector values are computed lane by lane, and the headers are
-written on top of them.
+`__ARM_NEON`. The intrinsic headers those macros lead a project to are
+bundled: `<mmintrin.h>` through `<nmmintrin.h>` (SSE4.2), `<immintrin.h>`,
+`<x86intrin.h>` and `<mm_malloc.h>` on x86-64, and a core `<arm_neon.h>` on
+aarch64. They are written in C over GNU vectors and checked against gcc on
+the hardware, so every function is available whatever the `-m` flags; only
+the feature macros (`__SSE4_1__` and the rest) follow `-msse3` .. `-msse4.2`,
+`-mpopcnt` and `-march=x86-64-v2`. The AVX families are not bundled, and no
+flag claims them.
 
 ### Which macros may be withdrawn, and which may not
 
@@ -202,13 +194,10 @@ The distinction is what the macro is a statement *about*:
   mandatory in the AArch64 base architecture. c17 defines both, and the code
   follows this section.
 
-Code that writes `#ifdef __SSE2__` around `#include <emmintrin.h>` is treating
-a target fact as though it implied a compiler fact. That inference holds for
-gcc and clang because they ship the intrinsic headers; c17 does not, so such a
-file fails on the missing header. This section's position is that the gap is
-the header, not the macro: withdrawing the macro would not make the header
-appear, and would also change code that tests `__SSE2__` without reaching
-for an intrinsic.
+Code that writes `#ifdef __SSE2__` around `#include <emmintrin.h>` treats a
+target fact as implying a compiler fact. That inference holds for gcc and
+clang because they ship the intrinsic headers, and for c17 because it ships
+them too (see "SIMD headers").
 
 `__ARM_NEON__` is not defined on aarch64: it is the AArch32 spelling, and gcc
 does not define it there.

@@ -564,6 +564,7 @@ fn process_file(
             // Not a compiler: nothing here optimizes, so nothing claims to.
             optimization: Default::default(),
             position: Default::default(),
+            isa: Default::default(),
             // Whatever else the driver grows, this tool wants none of it.
             ..Default::default()
         },

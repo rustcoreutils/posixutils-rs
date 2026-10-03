@@ -110,6 +110,15 @@ pub(super) fn x87_operands(asm: &AsmData) -> impl Iterator<Item = &AsmConstraint
         .filter(|c| !c.is_memory() && x87_slot(effective_class(asm, c)).is_some())
 }
 
+/// The operands of `asm` that sit in an SSE register: an `"x"` one, or one
+/// tied to such an output.
+pub(super) fn sse_operands(asm: &AsmData) -> impl Iterator<Item = &AsmConstraint> {
+    asm.outputs
+        .iter()
+        .chain(&asm.inputs)
+        .filter(|c| !c.is_memory() && requires_sse(effective_class(asm, c)))
+}
+
 /// Whether the class offers a general register.
 fn takes_gp_register(class: &AsmOperandClass) -> bool {
     matches!(
@@ -695,8 +704,10 @@ impl X86_64CodeGen {
 
         // Emit moves from actual locations to specific registers (for inputs)
         // Load `"+x"` operands into their scratch before the template runs.
+        // An SSE register operand: sixteen bytes is the whole register, never
+        // x87's extended format, which `from_bits` would pick for 128 bits.
         for (xmm, pseudo, size) in sse_input_moves.iter() {
-            let fp_size = FpSize::from_bits(*size, &self.base.target);
+            let fp_size = FpSize::for_sse_aggregate(*size);
             self.emit_fp_move(*pseudo, *xmm, fp_size);
         }
 
@@ -777,7 +788,7 @@ impl X86_64CodeGen {
                 );
                 continue;
             }
-            let fp_size = FpSize::from_bits(*size, &self.base.target);
+            let fp_size = FpSize::for_sse_aggregate(*size);
             self.emit_fp_move_from_xmm(*xmm, actual_loc, fp_size);
         }
 

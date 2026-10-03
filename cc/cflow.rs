@@ -775,6 +775,7 @@ fn preprocess_assembler(
         // Not a compiler: nothing here optimizes, so nothing claims to.
         optimization: Default::default(),
         position: Default::default(),
+        isa: Default::default(),
     };
     // A #error or a missing include makes the remaining bytes not worth
     // assembling: `as` would bury the real diagnostic under syntax errors.
@@ -1030,6 +1031,7 @@ fn process_file(
             // Not a compiler: nothing here optimizes, so nothing claims to.
             optimization: Default::default(),
             position: Default::default(),
+            isa: Default::default(),
             // Whatever else the driver grows, this tool wants none of it.
             ..Default::default()
         },

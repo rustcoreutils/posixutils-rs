@@ -319,3 +319,63 @@ fn vector_builtin_constraints() {
         );
     }
 }
+
+/// A vector in a register operand of inline asm is its value in the
+/// register: an x86 `"x"` operand, or an aarch64 `"w"` one. It was handed
+/// over as its address in a general register, and read back eight bytes
+/// wide.
+#[test]
+fn vector_inline_asm_register_operands() {
+    let src = r#"
+typedef double v2df __attribute__((__vector_size__(16)));
+int main(void) {
+    v2df a = {4.0, 9.0}, r;
+#if defined(__x86_64__)
+    __asm__("sqrtpd %1, %0" : "=x"(r) : "x"(a));
+    v2df s = a;
+    __asm__("addpd %0, %0" : "+x"(s));
+#else
+    __asm__("fsqrt %0.2d, %1.2d" : "=w"(r) : "w"(a));
+    v2df s = a;
+    __asm__("fadd %0.2d, %0.2d, %0.2d" : "+w"(s));
+#endif
+    return (r[0] == 2 && r[1] == 3 && s[0] == 8 && s[1] == 18) ? 0 : 1;
+}
+"#;
+    crate::common::compile_and_run_everywhere("vec_asm", src);
+}
+
+/// A comparison of 8- or 16-bit lanes widens both operands itself, as its
+/// signedness says. After inlining made one operand the constant -128,
+/// x86-64 kept that operand zero-extended in its slot -- 65408 -- and
+/// compared it with the other's sign-extended lane, so every lane of
+/// `v < -128` came out true.
+#[test]
+fn vector_narrow_lane_compare_against_a_constant() {
+    let src = r#"
+typedef short v8h __attribute__((vector_size(16)));
+typedef signed char v16b __attribute__((vector_size(16)));
+typedef unsigned short v8hu __attribute__((vector_size(16)));
+static inline __attribute__((always_inline)) v8h clamp_lo(v8h v, short lo)
+{
+    v8h m = v < lo;
+    return (v & ~m) | (((v8h){0} + lo) & m);
+}
+static inline __attribute__((always_inline)) v16b below(v16b v, signed char k) { return v < k; }
+static inline __attribute__((always_inline)) v8hu above(v8hu v, unsigned short k) { return (v8hu)(v > k); }
+int main(void) {
+    volatile short s = 1;
+    v8h w = {0, s, 1, -200, 0, 0, 0, 0};
+    v8h r = clamp_lo(w, -128);
+    if (r[0] != 0 || r[1] != 1 || r[3] != -128) return 1;
+    v16b b = {0, -100, -128, 5};
+    v16b m = below(b, -99);
+    if (m[0] != 0 || m[1] != -1 || m[2] != -1 || m[3] != 0) return 2;
+    v8hu u = {65535, 1, 32768, 0};
+    v8hu n = above(u, 32767);
+    if (n[0] != 65535 || n[1] != 0 || n[2] != 65535 || n[3] != 0) return 3;
+    return 0;
+}
+"#;
+    crate::common::compile_and_run_everywhere("vec_narrow_cmp", src);
+}

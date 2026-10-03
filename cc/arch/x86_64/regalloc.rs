@@ -1136,6 +1136,7 @@ impl RegAlloc {
         self.identify_ld_pseudos(func, types);
         self.reserve_x87_frame(func, types);
         self.identify_x87_asm_operands(func);
+        self.identify_sse_asm_operands(func);
         self.identify_quad_pseudos(func, types);
         // Identify 128-bit integer pseudos (always spill to 16-byte stack slots)
         self.identify_int128_pseudos(func, types);
@@ -1364,6 +1365,29 @@ impl RegAlloc {
                 self.fp_pseudos.insert(c.pseudo);
                 if c.size > 64 {
                     self.ld_pseudos.insert(c.pseudo);
+                }
+            }
+        }
+    }
+
+    /// Class the pseudos of SSE asm operands (`"x"`) as floating: defined
+    /// only by the asm, they looked like integers and got a general
+    /// register, which held eight bytes of a sixteen-byte vector. A sixteen
+    /// byte one needs the slot and the moves a `__float128` gets.
+    fn identify_sse_asm_operands(&mut self, func: &Function) {
+        for insn in func.blocks.iter().flat_map(|b| &b.insns) {
+            let Some(asm) = insn
+                .extra()
+                .asm_data
+                .as_ref()
+                .filter(|_| insn.op == Opcode::Asm)
+            else {
+                continue;
+            };
+            for c in super::inline_asm::sse_operands(asm) {
+                self.fp_pseudos.insert(c.pseudo);
+                if c.size > 64 {
+                    self.quad_pseudos.insert(c.pseudo);
                 }
             }
         }

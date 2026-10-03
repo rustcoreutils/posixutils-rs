@@ -44,6 +44,7 @@ mod promotion;
 mod regalloc;
 mod scaling;
 mod sections;
+mod simd_headers;
 mod stacked_args;
 mod symbols;
 mod tls_models;

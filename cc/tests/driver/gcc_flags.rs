@@ -365,3 +365,65 @@ fn gcc_flags_object_visibility_comes_from_its_declaration() {
     assert!(!text.contains(".hidden pub_obj"), "{text}");
     assert!(!text.contains(".hidden late"), "{text}");
 }
+
+/// `-msse3` .. `-msse4.2`, `-mpopcnt` and `-march=x86-64-v2` define the
+/// feature macros gcc's do, each level implying the ones below it -- and
+/// gcc's `-msse4.2` implying POPCNT. Without them, only the SSE2 baseline.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn gcc_flags_x86_simd_levels_define_feature_macros() {
+    let probe = "s3=__SSE3__ ss3=__SSSE3__ s41=__SSE4_1__ s42=__SSE4_2__ pc=__POPCNT__\n";
+    let defined = |flags: &[&str]| {
+        let r = preprocess_text("isa_probe", probe, flags);
+        assert!(r.success, "{}", r.stderr);
+        r.stdout
+    };
+    let none = "s3=__SSE3__ ss3=__SSSE3__ s41=__SSE4_1__ s42=__SSE4_2__ pc=__POPCNT__";
+    assert!(defined(&[]).contains(none));
+    assert!(defined(&["-msse3"]).contains("s3=1 ss3=__SSSE3__"));
+    assert!(defined(&["-msse4.1"]).contains("s3=1 ss3=1 s41=1 s42=__SSE4_2__ pc=__POPCNT__"));
+    let all = "s3=1 ss3=1 s41=1 s42=1 pc=1";
+    assert!(defined(&["-msse4.2"]).contains(all));
+    assert!(defined(&["-march=x86-64-v2"]).contains(all));
+    assert!(defined(&["-mpopcnt"])
+        .contains("s3=__SSE3__ ss3=__SSSE3__ s41=__SSE4_1__ s42=__SSE4_2__ pc=1"));
+}
+
+/// The last `-march=` wins, and `-m`/`-mno-` options apply on top of it
+/// in command-line order wherever they stand -- the macros gcc 13 defines.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn gcc_flags_x86_march_last_wins_and_mno_applies() {
+    let probe = "s3=__SSE3__ ss3=__SSSE3__ s41=__SSE4_1__ s42=__SSE4_2__ pc=__POPCNT__\n";
+    let defined = |flags: &[&str]| {
+        let r = preprocess_text("isa_order_probe", probe, flags);
+        assert!(r.success, "{flags:?}: {}", r.stderr);
+        r.stdout
+    };
+    let none = "s3=__SSE3__ ss3=__SSSE3__ s41=__SSE4_1__ s42=__SSE4_2__ pc=__POPCNT__";
+    let all = "s3=1 ss3=1 s41=1 s42=1 pc=1";
+    let cases: &[(&[&str], &str)] = &[
+        (&["-march=x86-64-v2", "-march=x86-64"], none),
+        (&["-march=x86-64", "-march=x86-64-v2"], all),
+        (&["-march=haswell"], all),
+        (&["-msse4.2", "-march=x86-64"], all),
+        (
+            &["-mno-sse4.2", "-march=x86-64-v2"],
+            "s3=1 ss3=1 s41=1 s42=__SSE4_2__ pc=1",
+        ),
+        (
+            &["-march=x86-64-v2", "-mno-popcnt"],
+            "s3=1 ss3=1 s41=1 s42=1 pc=__POPCNT__",
+        ),
+        (
+            &["-msse4.2", "-mno-sse4.1"],
+            "s3=1 ss3=1 s41=__SSE4_1__ s42=__SSE4_2__ pc=__POPCNT__",
+        ),
+        (&["-mno-sse4.1", "-msse4.2"], all),
+        (&["-msse4.2", "-mno-sse4.2"], none),
+    ];
+    for (flags, want) in cases {
+        let got = defined(flags);
+        assert!(got.contains(want), "{flags:?}: {got}");
+    }
+}

@@ -2730,7 +2730,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Get symbolic name if present
             let name = op.name.map(|n| self.str(n).to_string());
 
-            let typ = self.expr_type(&op.expr);
+            let typ = self.asm_operand_type(&op.expr, is_memory);
             let size = self.types.size_bits(typ);
 
             // For memory-class outputs (`=m`/`+m`/...): the asm operand
@@ -2842,8 +2842,10 @@ impl<'a> super::linearize::Linearizer<'a> {
             // function there has decayed to a pointer (C17 6.3.2.1p3-4): its
             // width is the pointer's, not the array's. A memory operand is the
             // object itself and keeps the object's size.
-            let typ = self.expr_type(&op.expr);
+            let declared = self.expr_type(&op.expr);
+            let typ = self.asm_operand_type(&op.expr, is_memory);
             let typ = match self.types.kind(typ) {
+                _ if typ != declared => typ,
                 TypeKind::Array if !is_memory => {
                     let elem = self.types.base_type(typ).unwrap_or(typ);
                     self.types.pointer_to(elem)
@@ -2861,7 +2863,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     // Use the matched output's pseudo
                     let out_pseudo = ir_outputs[match_idx].pseudo;
                     // Load the input value into the output's pseudo
-                    let val = self.linearize_expr(&op.expr);
+                    let val = self.asm_value(&op.expr, typ);
                     // Copy val to out_pseudo so they share the same register
                     self.emit(
                         Instruction::new(Opcode::Copy)
@@ -2872,7 +2874,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     );
                     out_pseudo
                 } else {
-                    self.linearize_expr(&op.expr)
+                    self.asm_value(&op.expr, typ)
                 }
             } else if is_memory {
                 // For memory operands, get the address -- or the object
@@ -2885,7 +2887,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 k
             } else {
                 // For register operands, evaluate the expression
-                self.linearize_expr(&op.expr)
+                self.asm_value(&op.expr, typ)
             };
 
             ir_inputs.push(AsmConstraint {
@@ -3020,11 +3022,34 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             let out_pseudo = ir_outputs[i].pseudo;
 
-            let typ = self.expr_type(&op.expr);
+            let typ = self.asm_operand_type(&op.expr, false);
             // Back through the place the read came from, so the operand
             // expression is not evaluated a second time.
             self.store_rmw_place(&output_places[i], out_pseudo, typ);
         }
+    }
+
+    /// The type a register operand of expression `e` is handled at: its own,
+    /// or for a GNU vector its carrier (`Abi::vector_carrier`) -- the value in
+    /// the register, where the IR otherwise keeps a vector at an address. A
+    /// sixteen-byte vector in an `"x"` operand was handed over as its address
+    /// in a general register, and read back eight bytes wide.
+    fn asm_operand_type(&self, e: &Expr, is_memory: bool) -> TypeId {
+        let typ = self.expr_type(e);
+        if is_memory || !self.types.is_vector(typ) {
+            return typ;
+        }
+        self.vector_carrier(typ, crate::abi::CallingConv::C)
+    }
+
+    /// The value of the register operand `e`, at its operand type `typ`
+    /// ([`Self::asm_operand_type`]).
+    fn asm_value(&mut self, e: &Expr, typ: TypeId) -> PseudoId {
+        if self.types.is_vector(self.expr_type(e)) && !self.types.is_vector(typ) {
+            let addr = self.vector_addr(e);
+            return self.vector_to_carrier(addr, typ);
+        }
+        self.linearize_expr(e)
     }
 
     /// A memory operand's address as the object it names and a constant byte

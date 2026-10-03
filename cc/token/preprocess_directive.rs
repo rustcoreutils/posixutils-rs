@@ -928,7 +928,7 @@ impl<'a> Preprocessor<'a> {
         // its own limits.h or stddef.h must win — and ahead of the system's,
         // to which a bundled header may forward with `#include_next`.
         if start <= SearchPos::Bundled && self.use_builtin_headers {
-            if let Some(content) = builtin_headers::get_builtin_header(filename) {
+            if let Some(content) = builtin_headers::get_builtin_header(filename, self.target.arch) {
                 return Some((IncludeSource::Builtin(content), Some(SearchPos::Bundled)));
             }
         }

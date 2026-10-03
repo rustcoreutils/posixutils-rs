@@ -573,20 +573,18 @@ pub struct Preprocessor<'a> {
     /// Lexer mode for tokenizing included files (C or Assembly)
     lexer_mode: LexerMode,
 
-    /// Line offset from #line directive: actual_line = token_line + line_offset
-    line_offset: i32,
-
-    /// File name override from #line directive
-    line_file_override: Option<String>,
-
     /// The input is already the output of `c17 -E`, so translation phases 1
     /// through 4 must not run again (POSIX 87982-87983). See the allowlist in
     /// `handle_directive`.
     preprocessed: bool,
 
-    /// Attribution established by the most recent `# N "file" flags`
-    /// linemarker, if any. See [`LineMarker`].
-    linemarker: Option<LineMarker>,
+    /// Attribution established by the most recent `#line` or `# N "file"
+    /// flags` linemarker in each physical stream. See [`LineMarker`].
+    ///
+    /// Per stream, so that a `#line` in a file survives an `#include` in it:
+    /// the header's lines are its own, and when it ends the file's mapping is
+    /// still the one in force.
+    linemarkers: HashMap<u16, LineMarker>,
 
     /// Position of the token currently being dispatched, before [`LineMarker`]
     /// remapping. A linemarker's delta is measured from the physical line and
@@ -636,15 +634,14 @@ pub struct Preprocessor<'a> {
 /// `effective_position`, the include-chain note and the `-E` marker writer all
 /// keep working unchanged, and re-running `-E` over a `.i` re-emits markers
 /// naming the original source rather than the `.i` it is reading.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct LineMarker {
-    /// Only tokens from this stream are remapped. Text spliced in from an
-    /// `#include` carries its own attribution and must not be touched.
-    origin: u16,
     /// The stream the marker named.
     target: u16,
     /// Added to a physical line number to get the reported one.
     delta: i64,
+    /// The file name it gave, which `__FILE__` reports.
+    name: Option<String>,
 }
 
 /// The payload prefix a marker uses when it carries a pragma c17 does not act
@@ -970,10 +967,8 @@ impl<'a> Preprocessor<'a> {
             trigraphs: false,
             current_search_pos: None,
             lexer_mode: LexerMode::C,
-            line_offset: 0,
-            line_file_override: None,
             preprocessed: false,
-            linemarker: None,
+            linemarkers: HashMap::new(),
             physical_line: 0,
             physical_stream: 0,
             expansion_budget: EXPANSION_BUDGET,
@@ -1515,14 +1510,49 @@ impl<'a> Preprocessor<'a> {
 
     /// Apply the active [`LineMarker`] to a position.
     fn remap_pos(&self, pos: Position) -> Position {
-        match self.linemarker {
-            Some(lm) if lm.origin == pos.stream => Position {
+        match self.linemarkers.get(&pos.stream) {
+            Some(lm) => Position {
                 stream: lm.target,
                 line: (pos.line as i64 + lm.delta).max(1) as u32,
                 ..pos
             },
-            _ => pos,
+            None => pos,
         }
+    }
+
+    /// The file name `__FILE__` reports for text in the current physical
+    /// stream: the one its last `#line` or linemarker named, else the file's.
+    fn presumed_file_name(&self) -> &str {
+        self.linemarkers
+            .get(&self.physical_stream)
+            .and_then(|lm| lm.name.as_deref())
+            .unwrap_or(&self.current_file)
+    }
+
+    /// Establish that the physical line after the current directive is line
+    /// `line` of `name` (or of the file it already belongs to): what `#line`
+    /// (C17 6.10.4) and a `# N "file"` linemarker both mean.
+    fn set_line_marker(&mut self, line: u32, name: Option<String>, is_system: bool) {
+        let origin = self.physical_stream;
+        let prior = self.linemarkers.get(&origin);
+        let (target, name) = match name {
+            Some(name) => (diag::find_or_add_stream(&name), Some(name)),
+            None => (
+                prior.map_or(origin, |lm| lm.target),
+                prior.and_then(|lm| lm.name.clone()),
+            ),
+        };
+        diag::set_stream_system(target, is_system);
+        // The marker names the line of the text *after* it, so the delta is
+        // measured against the next physical line.
+        self.linemarkers.insert(
+            origin,
+            LineMarker {
+                target,
+                delta: line as i64 - (self.physical_line as i64 + 1),
+                name,
+            },
+        );
     }
 
     /// Collect tokens until end of line

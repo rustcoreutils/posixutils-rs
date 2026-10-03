@@ -2106,3 +2106,23 @@ fn test_pic_macros_follow_the_configuration() {
         ["2", "2", "__PIE__", "__pie__"]
     );
 }
+
+/// `#line` maps the positions of the tokens after it -- what diagnostics and
+/// debug info read -- the same way a `# N "file"` linemarker does, and the
+/// mapping of a file survives an `#include` in it.
+#[test]
+fn test_line_directive_maps_token_positions() {
+    let (tokens, idents) =
+        preprocess_str("#line 77 \"renamed.c\"\nint b = __LINE__;\n#line 5\nint c = __LINE__;\n");
+    let strings = get_token_strings(&tokens, &idents);
+    assert_eq!(
+        strings,
+        ["int", "b", "=", "77", ";", "int", "c", "=", "5", ";"]
+    );
+    let b = tokens
+        .iter()
+        .find(|t| matches!(&t.value, TokenValue::Ident(id) if idents.get_opt(*id) == Some("b")))
+        .expect("b");
+    assert_eq!(b.pos.line, 77);
+    assert_eq!(crate::diag::stream_name(b.pos.stream), "renamed.c");
+}

@@ -133,7 +133,9 @@ impl Parser<'_> {
         match name_id {
             kw::BUILTIN_FPCLASSIFY => Some(self.parse_fpclassify(pos)),
             kw::BUILTIN_COMPLEX => Some(self.parse_builtin_complex(pos)),
-            kw::BUILTIN_OBJECT_SIZE => Some(self.parse_object_size(pos)),
+            kw::BUILTIN_OBJECT_SIZE | kw::BUILTIN_DYNAMIC_OBJECT_SIZE => {
+                Some(self.parse_object_size(name_id, pos))
+            }
             kw::BUILTIN_PREFETCH => Some(self.parse_prefetch(pos)),
             _ => None,
         }
@@ -402,13 +404,17 @@ impl Parser<'_> {
     /// `__builtin_object_size(ptr, type)`: how many bytes remain in the
     /// object `ptr` points into, when that is known statically.
     ///
+    /// `__builtin_dynamic_object_size` takes the same arguments and may also
+    /// answer with a size known only at run time. Every answer the static
+    /// form gives is a correct one for it -- run-time sizes are a refinement
+    /// gcc offers, not a different meaning -- so it is the same builtin.
+    ///
     /// gcc declares it `size_t (const void *, int)`; the type must then be
     /// an integer constant from 0 to 3. Bit 0 selects the closest
     /// surrounding subobject over the whole object; bit 1 asks for a minimum
     /// rather than a maximum.
-    fn parse_object_size(&mut self, pos: Position) -> ParseResult<Expr> {
+    fn parse_object_size(&mut self, name: StringId, pos: Position) -> ParseResult<Expr> {
         use ProtoType::{ConstVoidPtr, Int, SizeT};
-        let name = kw::BUILTIN_OBJECT_SIZE;
         let size_t = self.types.ulong_id;
         let args = self.parse_prototyped_builtin(name, SizeT, &[ConstVoidPtr, Int], false)?;
         let Some([ptr, otype]) = args.and_then(|args| <[Expr; 2]>::try_from(args).ok()) else {

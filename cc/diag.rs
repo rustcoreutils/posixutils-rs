@@ -214,6 +214,11 @@ pub fn find_or_add_stream(name: &str) -> u16 {
 }
 
 /// Mark a stream as a system header, silencing its warnings.
+/// Whether stream `id` is a system header's, whose warnings are not shown.
+pub fn stream_is_system(id: u16) -> bool {
+    STREAMS.with(|s| s.borrow().is_system(id))
+}
+
 pub fn set_stream_system(id: u16, is_system: bool) {
     STREAMS.with(|s| s.borrow_mut().set_system(id, is_system));
 }

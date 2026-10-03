@@ -22,6 +22,7 @@ mod call_semantics;
 mod copy_fold;
 mod frame_address;
 mod gnu_atomics;
+mod gnu_batch;
 mod has_feature;
 mod intrinsics;
 mod libm;

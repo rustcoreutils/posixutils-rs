@@ -210,7 +210,6 @@ impl<'a> Preprocessor<'a> {
     /// `c17 -E` itself writes, and `#line` is deliberately *not* routed here
     /// (GCC honors only this form in a preprocessed file, and so does c17).
     fn handle_linemarker(&mut self, iter: &mut TokenCursor, number: &Token) {
-        let origin = self.physical_stream;
         let TokenValue::Number(ref text) = number.value else {
             self.skip_to_eol(iter);
             return;
@@ -222,11 +221,11 @@ impl<'a> Preprocessor<'a> {
 
         // An optional filename follows; without one the marker renumbers the
         // current file rather than renaming it.
-        let mut target = self.linemarker.map_or(origin, |lm| lm.target);
+        let mut name = None;
         if let Some(tok) = iter.peek() {
             if !tok.pos.newline && tok.typ == TokenType::String {
-                if let TokenValue::String(name) = &tok.value {
-                    target = diag::find_or_add_stream(&payload_text(name));
+                if let TokenValue::String(spelled) = &tok.value {
+                    name = Some(payload_text(spelled));
                 }
                 iter.next();
             }
@@ -248,15 +247,7 @@ impl<'a> Preprocessor<'a> {
             }
             iter.next();
         }
-        diag::set_stream_system(target, is_system);
-
-        // The marker names the line of the text *after* it, so the delta is
-        // measured against the next physical line.
-        self.linemarker = Some(LineMarker {
-            origin,
-            target,
-            delta: line as i64 - (self.physical_line as i64 + 1),
-        });
+        self.set_line_marker(line, name, is_system);
     }
 
     /// Skip tokens until end of line
@@ -1598,17 +1589,16 @@ impl<'a> Preprocessor<'a> {
             );
         }
 
-        // The #line directive takes effect on the next line, so
-        // current_physical_line is the line of the directive + 1
-        let current_physical_next_line = tokens[0].pos.line + 1;
-        self.line_offset = line_num as i32 - current_physical_next_line as i32;
-
-        // Optional second token: filename string
-        if tokens.len() > 1 {
-            if let TokenValue::String(s) = &tokens[1].value {
-                self.line_file_override = Some(s.clone());
-            }
-        }
+        // The same mapping a linemarker establishes (C17 6.10.4p3-p4), so
+        // diagnostics, `__LINE__`/`__FILE__`, the builtins that report a
+        // position and the debug line table all follow it. A file's name
+        // keeps the system-header status it had.
+        let name = tokens.get(1).and_then(|t| match &t.value {
+            TokenValue::String(s) => Some(payload_text(s)),
+            _ => None,
+        });
+        let is_system = diag::stream_is_system(self.physical_stream);
+        self.set_line_marker(line_num, name, is_system);
     }
 
     /// `__has_include` / `__has_include_next`: whether the `#include` or

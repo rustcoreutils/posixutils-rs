@@ -21,7 +21,7 @@ use crate::float::{FloatVal, NanKind};
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId};
 use crate::token::lexer::Position;
-use crate::types::{Type, TypeId, TypeKind};
+use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
 
 /// A statically known object, and where inside it a pointer points.
@@ -670,6 +670,78 @@ impl Parser<'_> {
                     ExprKind::Comma(vec![expected, expr]),
                     typ,
                     pos,
+                ))
+            })()),
+            // `__builtin_expect_with_probability(expr, c, p)`: the hint with a
+            // probability, which has to be a constant in [0, 1]. Its value is
+            // `expr`, as for `__builtin_expect`.
+            crate::kw::BUILTIN_EXPECT_WITH_PROBABILITY => Some((|| {
+                self.expect_special(b'(')?;
+                let expr = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let expected = self.parse_assignment_expr()?;
+                self.expect_special(b',')?;
+                let probability = self.parse_assignment_expr()?;
+                self.expect_special(b')')?;
+                let in_range = crate::constexpr::eval_float(
+                    &*self,
+                    crate::constexpr::ConstScope::Standard,
+                    &probability,
+                )
+                .map(|v| v.to_f64())
+                .is_some_and(|p| (0.0..=1.0).contains(&p));
+                if !in_range {
+                    diag::error(
+                        probability.pos,
+                        &gettext("probability must be a constant floating-point expression between 0 and 1"),
+                    );
+                }
+                if Self::is_literal_constant(&expected) {
+                    return Ok(expr);
+                }
+                let typ = expr.typ.unwrap_or(self.types.int_id);
+                let pos = expr.pos;
+                Ok(Self::typed_expr(
+                    ExprKind::Comma(vec![expected, expr]),
+                    typ,
+                    pos,
+                ))
+            })()),
+            // Where the call is written, as gcc answers them in C: the
+            // presumed file name and line (after `#line`), and the enclosing
+            // function's name, or "" outside one.
+            crate::kw::BUILTIN_FILE | crate::kw::BUILTIN_FUNCTION => Some((|| {
+                self.expect_special(b'(')?;
+                self.expect_special(b')')?;
+                let text = if name_id == crate::kw::BUILTIN_FILE {
+                    diag::effective_position(token_pos).0
+                } else {
+                    self.enclosing_function
+                        .name
+                        .and_then(|n| self.idents.get_opt(n))
+                        .unwrap_or("")
+                        .to_string()
+                };
+                let payload = crate::token::lexer::literal_payload(&text);
+                let len = payload.chars().count() + 1;
+                let const_char = self
+                    .types
+                    .qualified_with(self.types.char_id, TypeModifiers::CONST);
+                let typ = self.types.intern(Type::array(const_char, len));
+                Ok(Self::typed_expr(
+                    ExprKind::StringLit(payload),
+                    typ,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_LINE => Some((|| {
+                self.expect_special(b'(')?;
+                self.expect_special(b')')?;
+                let line = diag::effective_position(token_pos).1;
+                Ok(Self::typed_expr(
+                    ExprKind::IntLit(i64::from(line)),
+                    self.types.int_id,
+                    token_pos,
                 ))
             })()),
             crate::kw::BUILTIN_ASSUME_ALIGNED => Some(self.parse_assume_aligned(token_pos)),
@@ -1877,6 +1949,9 @@ impl Parser<'_> {
         if let Some(result) = self.parse_bit_builtin(name_id, token_pos) {
             return Some(result);
         }
+        if let Some(result) = self.parse_cpu_builtin(name_id, token_pos) {
+            return Some(result);
+        }
         if let Some(result) = self.parse_choose_expr(name_id) {
             return Some(result);
         }
@@ -2158,6 +2233,8 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_LDEXP
                 | crate::kw::BUILTIN_LDEXPF
                 | crate::kw::BUILTIN_LDEXPL
+                | crate::kw::BUILTIN_SQRTF128
+                | crate::kw::BUILTIN_FMAF128
                 | crate::kw::BUILTIN_STRCASECMP
                 | crate::kw::BUILTIN_STRNCASECMP
                 | crate::kw::BUILTIN_STRDUP
@@ -2348,6 +2425,10 @@ const FLOAT_CONSTANT_BUILTINS: &[(StringId, FloatConstant, FloatSuffix)] = {
         (BUILTIN_HUGE_VALF32,   Inf,        F32),
         (BUILTIN_HUGE_VALF64,   Inf,        F64),
         (BUILTIN_HUGE_VALF128,  Inf,        F128),
+        (BUILTIN_INFQ,          Inf,        F128),
+        (BUILTIN_HUGE_VALQ,     Inf,        F128),
+        (BUILTIN_NANQ,          QUIET,      F128),
+        (BUILTIN_NANSQ,         SIGNALLING, F128),
         (BUILTIN_NAN,           QUIET,      Double),
         (BUILTIN_NANF,          QUIET,      Float),
         (BUILTIN_NANL,          QUIET,      LongDouble),

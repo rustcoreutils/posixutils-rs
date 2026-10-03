@@ -392,8 +392,34 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_nansf32",
     "__builtin_nansf64",
     "__builtin_nansf128",
+    // gcc's `q` (`__float128`) and the `_FloatN` magnitude and sign builtins
+    "__builtin_infq",
+    "__builtin_huge_valq",
+    "__builtin_nanq",
+    "__builtin_nansq",
+    "__builtin_fabsf32",
+    "__builtin_fabsf64",
+    "__builtin_fabsf128",
+    "__builtin_fabsq",
+    "__builtin_copysignf32",
+    "__builtin_copysignf64",
+    "__builtin_copysignf128",
+    "__builtin_copysignq",
+    "__builtin_sqrtf128",
+    "__builtin_fmaf128",
+    // Position of the call
+    "__builtin_FILE",
+    "__builtin_LINE",
+    "__builtin_FUNCTION",
+    // x86-64 CPU detection
+    "__builtin_cpu_init",
+    "__builtin_cpu_supports",
+    "__builtin_cpu_is",
+    // Object size, with run-time answers allowed (c17 gives static ones)
+    "__builtin_dynamic_object_size",
     // Branch prediction
     "__builtin_expect",
+    "__builtin_expect_with_probability",
     // Pointer alignment hints
     "__builtin_assume_aligned",
     // Cache/memory prefetch
@@ -503,8 +529,23 @@ pub fn is_builtin(name: &str) -> bool {
 /// its siblings) need that type, which macOS does not have, and the
 /// Microsoft `va_list` builtins exist only on x86-64.
 pub fn available_on(name: &str, target: &crate::target::Target) -> bool {
-    (crate::arch::has_float128(target) || !name.ends_with("f128"))
+    (crate::arch::has_float128(target) || !needs_float128(name))
         && crate::kw::spelling_exists_on(name, target.arch)
+}
+
+/// Whether builtin `name` computes in `_Float128`: its `f128` forms, and
+/// gcc's `q` forms for `__float128`.
+fn needs_float128(name: &str) -> bool {
+    name.ends_with("f128")
+        || matches!(
+            name,
+            "__builtin_infq"
+                | "__builtin_huge_valq"
+                | "__builtin_nanq"
+                | "__builtin_nansq"
+                | "__builtin_fabsq"
+                | "__builtin_copysignq"
+        )
 }
 
 /// Check if a StringId is a supported builtin function (O(1) via tag lookup).
@@ -536,6 +577,9 @@ mod tests {
             "__builtin_inff128",
             "__builtin_nansf128",
             "__builtin_huge_valf128",
+            "__builtin_fabsf128",
+            "__builtin_nanq",
+            "__builtin_copysignq",
         ] {
             assert!(is_builtin(name), "{name}");
             assert!(available_on(name, &linux), "{name}");

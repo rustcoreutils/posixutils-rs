@@ -1814,6 +1814,10 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// the `Fabs` opcode, which both backends compute in place by clearing
     /// the sign bit -- never a call, so no program needs libm for it.
     pub(crate) fn emit_fabs(&mut self, x: PseudoId, typ: TypeId) -> PseudoId {
+        if self.sign_op_is_a_call(typ) {
+            let callee = self.library_function_name("fabsf128");
+            return self.emit_library_call(&callee, &[(x, typ)], typ);
+        }
         let size = self.types.size_bits(typ);
         let result = self.alloc_pseudo();
         let insn = Instruction::new(Opcode::Fabs)
@@ -1825,9 +1829,23 @@ impl<'a> super::linearize::Linearizer<'a> {
         result
     }
 
+    /// Whether `fabs`/`copysign` at `typ` is the C library's rather than the
+    /// `Fabs`/`CopySign` opcode: binary128 on x86-64, which keeps it in an
+    /// XMM register its backend has no sign-bit form for. (On aarch64 it is
+    /// `long double`, and the backend computes it in place.) glibc's libm
+    /// has `fabsf128` and `copysignf128`.
+    fn sign_op_is_a_call(&self, typ: TypeId) -> bool {
+        self.target.arch == crate::target::Arch::X86_64
+            && self.types.fp_format(typ) == Some(crate::float::FpFormat::Binary128)
+    }
+
     /// `copysign(x, y)` at `typ`: the `CopySign` opcode, computed in place
     /// by both backends like `Fabs`.
     pub(crate) fn emit_copysign(&mut self, x: PseudoId, y: PseudoId, typ: TypeId) -> PseudoId {
+        if self.sign_op_is_a_call(typ) {
+            let callee = self.library_function_name("copysignf128");
+            return self.emit_library_call(&callee, &[(x, typ), (y, typ)], typ);
+        }
         let size = self.types.size_bits(typ);
         let result = self.alloc_pseudo();
         let insn = Instruction::new(Opcode::CopySign)

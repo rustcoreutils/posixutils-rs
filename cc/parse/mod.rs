@@ -19,6 +19,7 @@ mod bind;
 mod bit_builtin;
 mod builtin_args;
 mod builtin_expr;
+mod cpu_builtin;
 mod declaration;
 mod declarator;
 mod expr_check;

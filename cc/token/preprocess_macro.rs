@@ -1629,20 +1629,14 @@ impl<'a> Preprocessor<'a> {
         idents: &mut IdentTable,
     ) -> Option<Vec<Token>> {
         match builtin {
-            BuiltinMacro::Line => {
-                let effective_line = (pos.line as i32 + self.line_offset) as u32;
-                Some(vec![Token::with_value(
-                    TokenType::Number,
-                    *pos,
-                    TokenValue::Number(effective_line.to_string()),
-                )])
-            }
+            // `pos` has already been through any `#line` mapping.
+            BuiltinMacro::Line => Some(vec![Token::with_value(
+                TokenType::Number,
+                *pos,
+                TokenValue::Number(pos.line.to_string()),
+            )]),
             BuiltinMacro::File => {
-                let effective_file = self
-                    .line_file_override
-                    .as_ref()
-                    .unwrap_or(&self.current_file)
-                    .clone();
+                let effective_file = self.presumed_file_name().to_string();
                 Some(vec![Token::with_value(
                     TokenType::String,
                     *pos,

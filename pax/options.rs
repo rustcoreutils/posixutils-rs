@@ -74,7 +74,11 @@ const INVALID_ACTIONS: &[(&str, bool)] = &[
 /// only" and forbids pax translating the data, so the value is an annotation
 /// pax neither acts on nor needs to understand; refusing an unlisted one would
 /// reject a conforming archive to no end.
-const HDRCHARSET_VALUES: &[&str] = &["ISO-IR 10646 2000 UTF-8", "BINARY"];
+/// POSIX's name for an unencoded header, as a constant because the writer
+/// branches on it as well as recording it.
+pub const BINARY_CHARSET: &str = "BINARY";
+
+const HDRCHARSET_VALUES: &[&str] = &["ISO-IR 10646 2000 UTF-8", BINARY_CHARSET];
 
 /// Check a `-o hdrcharset=` value and return POSIX's spelling of it, so that
 /// an archive records `BINARY` whichever case the operator typed.
@@ -340,6 +344,20 @@ impl FormatOptions {
         self.delete_patterns_compiled
             .iter()
             .any(|pattern| pattern.matches(keyword))
+    }
+
+    /// The header character set the operator asked for, if any.
+    ///
+    /// The per-file `hdrcharset:=` form wins over the global `hdrcharset=`
+    /// one, which is POSIX's keyword precedence. Both are already written as
+    /// extended-header records by the writer; this is for the decisions that
+    /// depend on the answer rather than for emitting it.
+    pub fn hdrcharset(&self) -> Option<&str> {
+        self.per_file
+            .get("hdrcharset")
+            .or_else(|| self.global.get("hdrcharset"))
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
     }
 
     /// Get the global options map for extended header generation

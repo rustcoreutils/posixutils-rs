@@ -1956,6 +1956,83 @@ fn test_option_hdrcharset_is_checked_and_still_recorded() {
     }
 }
 
+/// Under `-o hdrcharset=BINARY` the `path` record is what carries a name's
+/// bytes, so POSIX requires one for any non-ASCII name even when the ustar
+/// fields could hold it: RATIONALE, "an extended header path record is always
+/// required to be generated if the prefix or name fields contain non-ASCII
+/// characters even when hdrcharset=binary is also in effect for that file."
+///
+/// The option had no effect on the write path at all, so such a member was
+/// written with its name only in the ustar field, under a header declaring an
+/// encoding that field was not in.
+#[test]
+fn test_option_hdrcharset_binary_forces_a_path_record() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    fs::create_dir(&src_dir).unwrap();
+    // Short, and valid UTF-8: the ustar name field could hold it, so nothing
+    // but the operator's request makes a record necessary.
+    fs::write(src_dir.join("élan.txt"), b"x").unwrap();
+    fs::write(src_dir.join("plain.txt"), b"y").unwrap();
+
+    let write = |archive: &std::path::Path, extra: &[&str]| {
+        let mut args = vec!["-w", "-x", "pax"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["-f", archive.to_str().unwrap(), "élan.txt", "plain.txt"]);
+        assert_success(&run_pax_in_dir(&args, &src_dir), "write a pax archive");
+        fs::read(archive).unwrap()
+    };
+
+    let path_records = |bytes: &[u8]| bytes.windows(5).filter(|w| *w == b"path=").count();
+
+    // Without the option, a short UTF-8 name needs no record.
+    let plain = write(&temp.path().join("plain.pax"), &[]);
+    assert_eq!(
+        path_records(&plain),
+        0,
+        "a representable name must not get a path record on its own"
+    );
+
+    // With it, the non-ASCII name gets one -- and only that one.
+    let binary = write(
+        &temp.path().join("binary.pax"),
+        &["-o", "hdrcharset=BINARY"],
+    );
+    assert_eq!(
+        path_records(&binary),
+        1,
+        "-o hdrcharset=BINARY must force a path record for the non-ASCII name"
+    );
+    assert!(
+        binary.windows(14).any(|w| w == "path=élan.txt".as_bytes()),
+        "and the record must carry the name's bytes"
+    );
+
+    // The charset itself is announced once, as a global record, rather than
+    // repeated in every member's extended header.
+    assert_eq!(
+        binary
+            .windows(18)
+            .filter(|w| *w == b"hdrcharset=BINARY\n")
+            .count(),
+        1,
+        "the declared charset belongs in one global record"
+    );
+    // And it reaches the listing for every member it governs.
+    let listing = run_pax(&[
+        "-f",
+        temp.path().join("binary.pax").to_str().unwrap(),
+        "-o",
+        "listopt=%(hdrcharset)s",
+    ]);
+    assert_success(&listing, "list the BINARY archive");
+    assert!(
+        stdout_str(&listing).lines().all(|l| l == "BINARY"),
+        "a global hdrcharset governs every member: {:?}",
+        stdout_str(&listing)
+    );
+}
+
 /// Every `%(keyword)` POSIX rule 7 requires must resolve to a value.
 ///
 /// A keyword this implementation does not know is echoed back as its own

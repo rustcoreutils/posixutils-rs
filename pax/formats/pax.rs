@@ -479,8 +479,27 @@ impl ExtendedHeader {
     /// # Arguments
     /// * `entry` - The archive entry to generate extended headers for
     /// * `include_times` - If true, always include atime and mtime in extended headers
-    pub fn from_entry(entry: &ArchiveEntry, include_times: bool) -> Self {
+    pub fn from_entry(entry: &ArchiveEntry, options: &FormatOptions) -> Self {
         let mut header = ExtendedHeader::new();
+        let include_times = options.include_times;
+
+        // `-o hdrcharset=BINARY` is the operator saying the names in this
+        // archive are the underlying system's bytes rather than UTF-8, and
+        // under it the `path` record is what carries those bytes. POSIX's
+        // RATIONALE is explicit about the consequence: "an extended header
+        // path record is always required to be generated if the prefix or
+        // name fields contain non-ASCII characters even when
+        // hdrcharset=binary is also in effect for that file." So the trigger
+        // widens from "has no faithful UTF-8 reading" to "is not ASCII": a
+        // UTF-8 name that would fit the ustar fields still needs the record.
+        let binary = options.hdrcharset() == Some(crate::options::BINARY_CHARSET);
+        let needs_record = |bytes: &[u8]| {
+            if binary {
+                !bytes.is_ascii()
+            } else {
+                std::str::from_utf8(bytes).is_err()
+            }
+        };
 
         // Path needs an extended header whenever it cannot be represented
         // exactly by the ustar name/prefix pair. Length alone is not the test:
@@ -490,7 +509,7 @@ impl ExtendedHeader {
         // ustar fallback in split_path() silently truncates the name.
         let path_bytes = crate::rawpath::as_bytes(&entry.path);
         let ustar_spelling = ustar_path_bytes(entry);
-        let path_is_binary = std::str::from_utf8(path_bytes).is_err();
+        let path_is_binary = needs_record(path_bytes);
         if try_split_path(&ustar_spelling).is_none() || path_is_binary {
             // A non-UTF-8 name has no faithful ustar spelling, so it always
             // needs the record regardless of length.
@@ -501,7 +520,7 @@ impl ExtendedHeader {
         let mut link_is_binary = false;
         if let Some(ref link) = entry.link_target {
             let link_bytes = link.as_os_str().as_bytes();
-            link_is_binary = std::str::from_utf8(link_bytes).is_err();
+            link_is_binary = needs_record(link_bytes);
             if link_bytes.len() > LINKNAME_LEN || link_is_binary {
                 header.linkpath = Some(link_bytes.to_vec());
             }
@@ -512,8 +531,15 @@ impl ExtendedHeader {
         // pathname records carry unencoded bytes. Without this the name was run
         // through to_string_lossy and every invalid byte became U+FFFD --
         // irreversibly, and identically to -o invalid=write.
-        if path_is_binary || link_is_binary {
-            header.hdrcharset = Some("BINARY".to_string());
+        //
+        // Not needed when the operator asked for a charset: that value is
+        // already written once as a global `g` record, and repeating it in
+        // every member's `x` header would say nothing new. A name that is not
+        // valid UTF-8 still forces the per-file record, which overrides the
+        // global one -- announcing such a member as UTF-8 would declare an
+        // encoding its bytes are not in.
+        if !binary && (path_is_binary || link_is_binary) {
+            header.hdrcharset = Some(crate::options::BINARY_CHARSET.to_string());
         }
 
         // Size > 8GB needs extended header
@@ -1047,7 +1073,7 @@ impl<W: Write> ArchiveWriter for PaxWriter<W> {
         // extended header only when some field actually needs one; a pax archive
         // with no extended records is a valid ustar archive and reads back
         // identically, so there is no need to force an mtime record.
-        let ext_header = ExtendedHeader::from_entry(entry, self.options.include_times);
+        let ext_header = ExtendedHeader::from_entry(entry, &self.options);
 
         self.write_extended_header(&ext_header, entry)?;
 
@@ -1349,7 +1375,7 @@ mod tests {
         entry.uid = 3000000; // > 2097151
         entry.mtime_nsec = 500000000; // 0.5 seconds
 
-        let ext = ExtendedHeader::from_entry(&entry, false);
+        let ext = ExtendedHeader::from_entry(&entry, &FormatOptions::default());
         assert!(ext.uid.is_some());
         assert!(ext.mtime.is_some());
     }

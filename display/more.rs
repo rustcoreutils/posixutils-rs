@@ -1686,6 +1686,18 @@ impl SourceContext {
             .unwrap_or(1)
     }
 
+    /// The file line holding the display line at the top of the screen.
+    pub fn top_source_line(&mut self) -> usize {
+        let bottom = self.seek_positions.current_line();
+        let ended = self.seek_positions.is_ended;
+        let top = (bottom + 1).saturating_sub(self.screen_lines()).max(1);
+        self.seek_positions.set_current(top);
+        let line = self.seek_positions.current_source_line();
+        self.seek_positions.set_current(bottom);
+        self.seek_positions.is_ended = ended;
+        line
+    }
+
     /// Seek to previous line
     pub fn return_previous(&mut self) {
         self.seek_positions.set_current(self.last_line);
@@ -2926,6 +2938,10 @@ impl MoreControl {
 
     /// Call editor for current file as child process and handle output
     fn invoke_editor(&mut self) -> Result<(), MoreError> {
+        // POSIX 107618-107620: vi and ex take "-c linenumber", where
+        // linenumber is the file line containing the display line at the top
+        // of the screen.
+        let line_number = self.context.top_source_line().to_string();
         let Source::File(ref file_path) = self.context.current_source else {
             return Err(MoreError::FileRead("<none>".to_owned()));
         };
@@ -2948,9 +2964,6 @@ impl MoreControl {
             ));
         };
 
-        // POSIX 107618-107620: vi and ex take "-c linenumber", where
-        // linenumber is the line displayed as the first line of the screen.
-        let line_number = self.context.seek_positions.current_line().to_string();
         let args: &[&str] = if is_editor_vi_or_ex {
             &["-c", line_number.as_str(), "--", file_path]
         } else {

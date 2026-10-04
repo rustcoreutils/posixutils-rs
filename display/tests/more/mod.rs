@@ -1393,6 +1393,75 @@ fn test_audit_invoke_editor_arguments() {
     // The directory goes with the `TempDir` at end of scope.
 }
 
+/// The arguments `v` hands a `vi` named by EDITOR, after `keys`, with the
+/// file `content` on a `rows` x 20 screen.
+fn editor_args_after(content: &[u8], rows: u16, keys: &str) -> Vec<String> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = plib::tmp::tempdir().unwrap();
+    let record = dir.path().join("args");
+    let editor = dir.path().join("vi");
+    let mut script = std::fs::File::create(&editor).unwrap();
+    writeln!(script, "#!/bin/sh").unwrap();
+    writeln!(script, "[ \"$1\" = --probe ] && exit 0").unwrap();
+    writeln!(script, "printf '%s\\n' \"$@\" > {}", record.display()).unwrap();
+    drop(script);
+    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    wait_until_executable(&editor);
+
+    let path = dir.path().join("file.txt");
+    std::fs::write(&path, content).unwrap();
+    let Some(mut session) = MoreSession::spawn(
+        &[path.to_str().unwrap()],
+        &[("EDITOR", editor.to_str().unwrap())],
+        rows,
+        20,
+    ) else {
+        println!("Skipping PTY test: no pseudo-terminal available");
+        return Vec::new();
+    };
+    session.keys(keys);
+    session.keys("v");
+    assert_eq!(session.quit(), Some(0));
+    std::fs::read_to_string(&record)
+        .unwrap()
+        .lines()
+        .map(String::from)
+        .collect()
+}
+
+/// POSIX 107618-107620: `-c linenumber` names "the file line containing the
+/// display line currently displayed as the first line of the screen".
+#[test]
+fn test_pty_editor_line_is_the_top_line_of_the_screen() {
+    let content: String = (1..=30).map(|n| format!("l{n}\n")).collect();
+    let args = editor_args_after(content.as_bytes(), 5, "");
+    if !args.is_empty() {
+        assert_eq!(args[..2], ["-c", "1"], "first screen");
+    }
+    let args = editor_args_after(content.as_bytes(), 5, "jj");
+    if !args.is_empty() {
+        assert_eq!(args[..2], ["-c", "3"], "after two lines");
+    }
+
+    // A file line wider than the screen is several display lines; the
+    // number is the file line's, not the display line's. Line 1 folds into
+    // three display lines, so after one `j` the top of the screen is the
+    // second part of line 1, and after three it is line 2.
+    let mut folded = "x".repeat(50);
+    folded.push('\n');
+    folded.push_str(&content);
+    let args = editor_args_after(folded.as_bytes(), 5, "j");
+    if !args.is_empty() {
+        assert_eq!(args[..2], ["-c", "1"], "inside a folded line");
+    }
+    let args = editor_args_after(folded.as_bytes(), 5, "jjj");
+    if !args.is_empty() {
+        assert_eq!(args[..2], ["-c", "2"], "after the folded line");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PTY render tests
 //

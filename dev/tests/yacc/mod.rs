@@ -5237,3 +5237,51 @@ e : e '+' e | NUM ;
         code.lines().find(|l| l.contains("YYTRANSLATE_SIZE"))
     );
 }
+
+/// The grammar file's name goes into `#line` as a C string literal, so a `\`
+/// or `"` in it must be escaped -- every Windows path has backslashes.
+#[test]
+fn test_line_directive_escapes_the_file_name() {
+    let grammar = r#"
+%{
+int x;
+%}
+%token NUM
+%%
+expr : NUM { $$ = $1; }
+     ;
+"#;
+    let temp_dir = TempDir::new().unwrap();
+    // A name with both characters where the file system allows them, and a
+    // backslash-separated relative path on Windows.
+    #[cfg(unix)]
+    let name = "we\\ird\"name.y";
+    #[cfg(windows)]
+    let name = "sub\\name.y";
+    if let Some(parent) = std::path::Path::new(name).parent() {
+        fs::create_dir_all(temp_dir.path().join(parent)).unwrap();
+    }
+    fs::write(temp_dir.path().join(name), grammar).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .arg(name)
+        .output()
+        .expect("failed to execute yacc");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let code = fs::read_to_string(temp_dir.path().join("y.tab.c")).unwrap();
+    let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+    let lines: Vec<&str> = code.lines().filter(|l| l.starts_with("#line")).collect();
+    assert!(!lines.is_empty(), "no #line directives in:\n{code}");
+    for line in lines {
+        assert!(
+            line.ends_with(&format!(" \"{escaped}\"")),
+            "unescaped file name in {line:?}"
+        );
+    }
+}

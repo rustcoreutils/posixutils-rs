@@ -184,6 +184,12 @@ pub enum NeonOp {
     Fcmeq,
     Fcmgt,
     Fcmge,
+    /// Conversions at one width: signed or unsigned integer to floating,
+    /// and floating to signed or unsigned integer toward zero.
+    Scvtf,
+    Ucvtf,
+    Fcvtzs,
+    Fcvtzu,
 }
 
 impl NeonOp {
@@ -212,6 +218,10 @@ impl NeonOp {
             NeonOp::Fcmeq => "fcmeq",
             NeonOp::Fcmgt => "fcmgt",
             NeonOp::Fcmge => "fcmge",
+            NeonOp::Scvtf => "scvtf",
+            NeonOp::Ucvtf => "ucvtf",
+            NeonOp::Fcvtzs => "fcvtzs",
+            NeonOp::Fcvtzu => "fcvtzu",
         }
     }
 
@@ -892,6 +902,18 @@ pub enum Aarch64Inst {
         src1: VReg,
         src2: Option<VReg>,
         dst: VReg,
+    },
+
+    /// TBL: each byte of `dst` the byte of the table -- `table`, then
+    /// `second` (the register after it) when there is one -- that the same
+    /// byte of `index` numbers, or zero for an index past the table. `wide`
+    /// is the sixteen-byte form, else eight.
+    NeonTbl {
+        table: VReg,
+        second: Option<VReg>,
+        index: VReg,
+        dst: VReg,
+        wide: bool,
     },
 
     /// DUP from a general register: every lane of `dst` the low bits of
@@ -1636,6 +1658,28 @@ impl EmitAsm for Aarch64Inst {
                     let _ = write!(out, ", {}", arr.operand(*src2));
                 }
                 let _ = writeln!(out);
+            }
+
+            Aarch64Inst::NeonTbl {
+                table,
+                second,
+                index,
+                dst,
+                wide,
+            } => {
+                let arr = if *wide { "16b" } else { "8b" };
+                let table = match second {
+                    Some(second) => {
+                        format!("{{{}.16b, {}.16b}}", table.name_v(), second.name_v())
+                    }
+                    None => format!("{{{}.16b}}", table.name_v()),
+                };
+                let _ = writeln!(
+                    out,
+                    "    tbl {}.{arr}, {table}, {}.{arr}",
+                    dst.name_v(),
+                    index.name_v()
+                );
             }
 
             Aarch64Inst::NeonDupGp { arr, src, dst } => {

@@ -313,6 +313,10 @@ pub enum PackedOp {
     CmpGt(IntLane),
     /// CMPccPS/PD: all ones in each lane where `dst` pred `src` holds.
     FCmp(FloatCompare, FloatLane),
+    /// CVTDQ2PS: each signed dword of `src` to a float in `dst`.
+    CvtDwordsToFloats,
+    /// CVTTPS2DQ: each float of `src` to a signed dword in `dst`, truncated.
+    CvtFloatsToDwords,
 }
 
 /// The predicate of a packed floating compare: `cmpltps` and the rest.
@@ -355,6 +359,8 @@ pub enum PackedShuffleOp {
     Pshuflw,
     /// SHUFPS: two floats of `dst`, then two of `src`, by the selector.
     Shufps,
+    /// SHUFPD: a double of `dst`, then one of `src`, by the selector.
+    Shufpd,
 }
 
 impl PackedShuffleOp {
@@ -363,6 +369,7 @@ impl PackedShuffleOp {
             PackedShuffleOp::Pshufd => "pshufd",
             PackedShuffleOp::Pshuflw => "pshuflw",
             PackedShuffleOp::Shufps => "shufps",
+            PackedShuffleOp::Shufpd => "shufpd",
         }
     }
 }
@@ -404,6 +411,8 @@ impl PackedOp {
                 };
                 format!("cmp{pred}{}", l.suffix())
             }
+            PackedOp::CvtDwordsToFloats => "cvtdq2ps".into(),
+            PackedOp::CvtFloatsToDwords => "cvttps2dq".into(),
         }
     }
 }

@@ -21,6 +21,7 @@ use super::lir::{
 };
 use super::regalloc::{Loc, Reg, XmmReg};
 use crate::arch::lir::{FpSize, OperandSize};
+use crate::arch::simd::X86Shuffle;
 use crate::ir::{Instruction, PseudoId, SimdOp};
 use crate::types::TypeTable;
 
@@ -84,6 +85,28 @@ impl X86_64CodeGen {
                 self.push_lir(packed(PackedOp::FXor(flane), scratch, dst));
             }
             SimdOp::Splat => self.emit_splat(insn.src[0], dst, lane_bytes, types.is_float(lane)),
+            SimdOp::Shuffle => {
+                let form = crate::arch::simd::x86_64_shuffle(insn.shuffle_indices(), lane_bytes)
+                    .expect("arch::simd lists only shuffles SSE2 has");
+                self.emit_shuffle(insn, form, dst, scratch, size);
+            }
+            SimdOp::CvtSF | SimdOp::CvtFS => {
+                // The conversion reads its source whole, so the target may
+                // hold it.
+                let src = match self.get_location(insn.src[0]) {
+                    Loc::Xmm(x) => x,
+                    _ => {
+                        self.emit_fp_move(insn.src[0], dst, size);
+                        dst
+                    }
+                };
+                let cvt = if op == SimdOp::CvtSF {
+                    PackedOp::CvtDwordsToFloats
+                } else {
+                    PackedOp::CvtFloatsToDwords
+                };
+                self.push_lir(packed(cvt, src, dst));
+            }
             SimdOp::ShlScalar | SimdOp::LsrScalar | SimdOp::AsrScalar => {
                 let shift = match op {
                     SimdOp::ShlScalar => PackedShift::Left,
@@ -139,6 +162,59 @@ impl X86_64CodeGen {
         if !matches!(dst_loc, Loc::Xmm(x) if x == dst) {
             self.emit_fp_move_from_xmm(dst, &dst_loc, size);
         }
+    }
+
+    /// A constant shuffle in its SSE2 `form`, into `dst`.
+    fn emit_shuffle(
+        &mut self,
+        insn: &Instruction,
+        form: X86Shuffle,
+        dst: XmmReg,
+        scratch: XmmReg,
+        size: FpSize,
+    ) {
+        let (op, first, second, imm) = match form {
+            X86Shuffle::Pshufd { src, imm } => {
+                // One source, read whole: where it is, or loaded first.
+                let src = match self.get_location(insn.src[src]) {
+                    Loc::Xmm(x) => x,
+                    _ => {
+                        self.emit_fp_move(insn.src[src], scratch, size);
+                        scratch
+                    }
+                };
+                self.push_lir(X86Inst::PackedShuffle {
+                    op: PackedShuffleOp::Pshufd,
+                    imm,
+                    src,
+                    dst,
+                });
+                return;
+            }
+            X86Shuffle::Shufps { first, second, imm } => {
+                (PackedShuffleOp::Shufps, first, second, imm)
+            }
+            X86Shuffle::Shufpd { first, second, imm } => {
+                (PackedShuffleOp::Shufpd, first, second, imm)
+            }
+        };
+        // Two sources: the second secured before the first is moved into
+        // the target.
+        let (first, second) = (insn.src[first], insn.src[second]);
+        let second_reg = match self.get_location(second) {
+            Loc::Xmm(x) if x != dst => x,
+            _ => {
+                self.emit_fp_move(second, scratch, size);
+                scratch
+            }
+        };
+        self.emit_fp_move(first, dst, size);
+        self.push_lir(X86Inst::PackedShuffle {
+            op,
+            imm,
+            src: second_reg,
+            dst,
+        });
     }
 
     /// Every lane of `dst` the scalar `src`, of a lane `lane_bytes` wide:
@@ -256,7 +332,12 @@ impl X86_64CodeGen {
             | SimdOp::FCmpEq
             | SimdOp::FCmpNe
             | SimdOp::FCmpGt
-            | SimdOp::FCmpGe => unreachable!("{op:?} is not a plain two-register operation"),
+            | SimdOp::FCmpGe
+            | SimdOp::Shuffle
+            | SimdOp::CvtSF
+            | SimdOp::CvtUF
+            | SimdOp::CvtFS
+            | SimdOp::CvtFU => unreachable!("{op:?} is not a plain two-register operation"),
         }
     }
 }

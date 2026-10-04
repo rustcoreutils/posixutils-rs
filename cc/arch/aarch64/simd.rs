@@ -44,6 +44,9 @@ impl Aarch64CodeGen {
         };
         if op == SimdOp::Splat {
             self.emit_neon_splat(insn.src[0], dst, lane_bytes, types.is_float(lane), types);
+        } else if op == SimdOp::Shuffle {
+            let idx = *insn.shuffle_indices();
+            self.emit_neon_shuffle(insn, &idx, lane_bytes, dst, types);
         } else {
             let neon = Self::neon_op(op);
             let arr = if neon.is_bitwise() {
@@ -111,6 +114,96 @@ impl Aarch64CodeGen {
         }
     }
 
+    /// A constant shuffle as one `tbl`: the operands are the table -- one
+    /// register, or two consecutive ones (V17 and V18) -- and the byte
+    /// indices are built in `dst`, which the `tbl` then overwrites. Lane `i`
+    /// of the second operand is at byte 16 + `i` * `lane_bytes` whatever the
+    /// vector's width, the table registers being sixteen bytes. An
+    /// unspecified lane takes an index past the table, which gives zero.
+    fn emit_neon_shuffle(
+        &mut self,
+        insn: &Instruction,
+        idx: &crate::ir::ShuffleIndices,
+        lane_bytes: usize,
+        dst: VReg,
+        types: &TypeTable,
+    ) {
+        let total = insn.size as usize / 8;
+        let carrier = if total == 16 {
+            types.float128_id
+        } else {
+            types.double_id
+        };
+        let n = total / lane_bytes;
+        let second = (insn.src.len() == 2).then_some(VReg::V18);
+        let table = if second.is_some() {
+            self.simd_pair(insn.src[0], insn.src[1], dst, carrier, insn.size, types);
+            VReg::V17
+        } else {
+            match self.get_location(insn.src[0]) {
+                // Not the target's register, which the index is built in.
+                Loc::VReg(v) if v != dst => v,
+                _ => {
+                    self.emit_fp_move(insn.src[0], VReg::V17, Some(carrier), insn.size, types);
+                    VReg::V17
+                }
+            }
+        };
+        let mut bytes = [0xffu8; 16];
+        for k in 0..n {
+            if let Some(i) = idx.lane(k) {
+                let base = (i / n) * 16 + (i % n) * lane_bytes;
+                for b in 0..lane_bytes {
+                    bytes[k * lane_bytes + b] = (base + b) as u8;
+                }
+            }
+        }
+        let lo = u64::from_le_bytes(bytes[..8].try_into().expect("eight bytes"));
+        let hi = u64::from_le_bytes(bytes[8..].try_into().expect("eight bytes"));
+        self.emit_fp_bits(lo, hi, crate::arch::lir::FpSize::Quad, dst);
+        self.push_lir(Aarch64Inst::NeonTbl {
+            table,
+            second,
+            index: dst,
+            dst,
+            wide: total == 16,
+        });
+    }
+
+    /// Operands `a` and `b` moved to V17 and V18, the consecutive pair a
+    /// two-register `tbl` reads, whichever registers they start in: through
+    /// `tmp` -- free until the index is built there -- when they sit in each
+    /// other's.
+    fn simd_pair(
+        &mut self,
+        a: PseudoId,
+        b: PseudoId,
+        tmp: VReg,
+        carrier: TypeId,
+        size: u32,
+        types: &TypeTable,
+    ) {
+        let in_reg = |cg: &Self, p, r| matches!(cg.get_location(p), Loc::VReg(v) if v == r);
+        if in_reg(self, b, VReg::V17) {
+            if in_reg(self, a, VReg::V18) {
+                self.emit_fp_move(a, tmp, Some(carrier), size, types);
+                self.emit_fp_move(b, VReg::V18, Some(carrier), size, types);
+                let quad = crate::arch::lir::FpSize::Quad;
+                self.push_lir(Aarch64Inst::FmovReg {
+                    size: quad,
+                    src: tmp,
+                    dst: VReg::V17,
+                });
+                return;
+            }
+            self.emit_fp_move(b, VReg::V18, Some(carrier), size, types);
+            self.emit_fp_move(a, VReg::V17, Some(carrier), size, types);
+        } else {
+            self.emit_fp_move(a, VReg::V17, Some(carrier), size, types);
+            self.emit_fp_move(b, VReg::V18, Some(carrier), size, types);
+        }
+    }
+
     /// Every lane of `dst` the scalar `src`, of a lane `lane_bytes` wide: a
     /// `dup` from the general register an integer is in, or from lane 0 of
     /// the V register a float is in. The arrangement fills all sixteen
@@ -173,7 +266,15 @@ impl Aarch64CodeGen {
             SimdOp::FCmpEq | SimdOp::FCmpNe => NeonOp::Fcmeq,
             SimdOp::FCmpGt => NeonOp::Fcmgt,
             SimdOp::FCmpGe => NeonOp::Fcmge,
-            SimdOp::Splat | SimdOp::ShlScalar | SimdOp::LsrScalar | SimdOp::AsrScalar => {
+            SimdOp::CvtSF => NeonOp::Scvtf,
+            SimdOp::CvtUF => NeonOp::Ucvtf,
+            SimdOp::CvtFS => NeonOp::Fcvtzs,
+            SimdOp::CvtFU => NeonOp::Fcvtzu,
+            SimdOp::Splat
+            | SimdOp::Shuffle
+            | SimdOp::ShlScalar
+            | SimdOp::LsrScalar
+            | SimdOp::AsrScalar => {
                 unreachable!("{op:?} is not one NEON instruction")
             }
         }

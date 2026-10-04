@@ -397,3 +397,186 @@ void flts(v4si *d, v4sf *a, v4sf *b) { *d = (*a > *b) | (*a != *b) | (*a <= *b);
         }
     }
 }
+
+/// `__builtin_shufflevector` patterns over `n` lanes: each result lane an
+/// index into `a` then `b`, or `-1` for one whose value is unspecified.
+fn shuffle_patterns(n: usize) -> Vec<Vec<i32>> {
+    let n_i = n as i32;
+    let mut pats = vec![
+        (0..n_i).collect(),                                  // identity
+        (0..n_i).rev().collect(),                            // reverse
+        vec![1 % n_i; n],                                    // broadcast
+        (0..n_i).map(|k| (k / 2) + (k % 2) * n_i).collect(), // interleave low
+        (0..n_i)
+            .map(|k| {
+                if k < n_i / 2 {
+                    n_i / 2 - 1 - k
+                } else {
+                    n_i + k
+                }
+            })
+            .collect(), // a's low half reversed, then b's high half
+        (0..n_i).map(|k| n_i + (k + 1) % n_i).collect(),     // b only, rotated
+    ];
+    let mut with_unspecified: Vec<i32> = (0..n_i).rev().collect();
+    with_unspecified[n / 2] = -1;
+    pats.push(with_unspecified);
+    pats
+}
+
+/// The program checking every shuffle pattern on every shape, and every
+/// same-width conversion between integer and floating lanes, against
+/// scalar lanes.
+fn shuffle_convert_program() -> String {
+    let mut out = String::from(PRELUDE);
+    let shapes: &[(&str, &str, usize, bool)] = &[
+        ("v4si", "int", 4, false),
+        ("v4sf", "float", 4, true),
+        ("v2di", "long long", 2, false),
+        ("v2df", "double", 2, true),
+        ("v8hi", "short", 8, false),
+        ("v16qi", "signed char", 16, false),
+        ("v2si", "int", 2, false),
+        ("v8qi", "signed char", 8, false),
+        ("v4hi", "short", 4, false),
+        ("v2sf", "float", 2, true),
+    ];
+    let mut checks = Vec::new();
+    for &(vec, lane, n, float) in shapes {
+        let bytes = n * lane_bytes(lane);
+        out.push_str(&format!(
+            "typedef {lane} {vec} __attribute__((vector_size({bytes})));\n"
+        ));
+        let (src, nv) = if float {
+            ("fval", "NF")
+        } else {
+            ("ival", "NI")
+        };
+        for pat in shuffle_patterns(n) {
+            let id = checks.len();
+            let list: Vec<String> = pat.iter().map(|i| i.to_string()).collect();
+            let idx: Vec<String> = pat.iter().map(|i| i.to_string()).collect();
+            out.push_str(&format!(
+                "static int t{id}(void) {{\n\
+                 \x20   static const int idx[] = {{{}}};\n\
+                 \x20   for (int k = 0; k < {nv}; k++) {{\n\
+                 \x20       {vec} a, b;\n\
+                 \x20       for (int i = 0; i < {n}; i++) {{\n\
+                 \x20           a[i] = ({lane}){src}[(k + i) % {nv}];\n\
+                 \x20           b[i] = ({lane}){src}[(k * 5 + i + 3) % {nv}];\n\
+                 \x20       }}\n\
+                 \x20       {vec} r = __builtin_shufflevector(a, b, {});\n\
+                 \x20       for (int i = 0; i < {n}; i++) {{\n\
+                 \x20           if (idx[i] < 0) continue;\n\
+                 \x20           {lane} got = r[i], want = idx[i] < {n} ? a[idx[i]] : b[idx[i] - {n}];\n\
+                 \x20           if (memcmp(&got, &want, sizeof got)) return k * 64 + i + 1;\n\
+                 \x20       }}\n\
+                 \x20   }}\n\
+                 \x20   return 0;\n\
+                 }}\n",
+                idx.join(", "),
+                list.join(", ")
+            ));
+            checks.push(format!("shuffle {vec} {}", list.join(" ")));
+        }
+    }
+    // Conversions: values each conversion defines -- in range, and not
+    // negative for an unsigned result.
+    let conversions: &[(&str, &str, &str, &str, usize, &str)] = &[
+        ("v4si", "int", "v4sf", "float", 4, "ival"),
+        ("v4su", "unsigned", "v4sf", "float", 4, "ival"),
+        ("v4sf", "float", "v4si", "int", 4, "sval"),
+        ("v4sf", "float", "v4su", "unsigned", 4, "uval"),
+        ("v2di", "long long", "v2df", "double", 2, "ival"),
+        ("v2du", "unsigned long long", "v2df", "double", 2, "ival"),
+        ("v2df", "double", "v2di", "long long", 2, "sval"),
+        ("v2df", "double", "v2du", "unsigned long long", 2, "uval"),
+        ("v2si", "int", "v2sf", "float", 2, "ival"),
+        ("v2sf", "float", "v2si", "int", 2, "sval"),
+    ];
+    out.push_str(
+        "static volatile double sval[] = {0.0, -0.0, 1.5, -2.5, 1e6, -7.75, 123456.7, -2e9, 0.99};\n\
+         static volatile double uval[] = {0.0, 1.5, 1e6, 7.75, 123456.7, 3.9e9, 0.99, 2.5};\n",
+    );
+    let mut declared: Vec<&str> = shapes.iter().map(|s| s.0).collect();
+    for &(from, from_lane, to, to_lane, n, vals) in conversions {
+        for (v, lane) in [(from, from_lane), (to, to_lane)] {
+            if !declared.contains(&v) {
+                let bytes = n * lane_bytes(lane);
+                out.push_str(&format!(
+                    "typedef {lane} {v} __attribute__((vector_size({bytes})));\n"
+                ));
+                declared.push(v);
+            }
+        }
+        let id = checks.len();
+        let count = format!("(int)(sizeof {vals} / sizeof {vals}[0])");
+        out.push_str(&format!(
+            "static int t{id}(void) {{\n\
+             \x20   for (int k = 0; k < {count}; k++) {{\n\
+             \x20       {from} a;\n\
+             \x20       for (int i = 0; i < {n}; i++) a[i] = ({from_lane}){vals}[(k + i) % {count}];\n\
+             \x20       {to} r = __builtin_convertvector(a, {to});\n\
+             \x20       for (int i = 0; i < {n}; i++) {{\n\
+             \x20           {to_lane} got = r[i], want = ({to_lane})a[i];\n\
+             \x20           if (memcmp(&got, &want, sizeof got)) return k * 64 + i + 1;\n\
+             \x20       }}\n\
+             \x20   }}\n\
+             \x20   return 0;\n\
+             }}\n"
+        ));
+        checks.push(format!("convert {from} to {to}"));
+    }
+    out.push_str("int main(void) {\n    int r;\n");
+    for (id, what) in checks.iter().enumerate() {
+        out.push_str(&format!(
+            "    if ((r = t{id}())) {{ __builtin_printf(\"%s: %d\\n\", \"{what}\", r); return 1; }}\n"
+        ));
+    }
+    out.push_str("    return 0;\n}\n");
+    out
+}
+
+#[test]
+fn vector_native_shuffles_and_conversions_match_scalars() {
+    compile_and_run_everywhere("vec_native_shuffle", &shuffle_convert_program());
+}
+
+/// Constant shuffles and conversions: SSE2's pshufd, shufps and shufpd and
+/// cvtdq2ps/cvttps2dq; NEON's `tbl` -- one table register or a pair -- and
+/// scvtf/ucvtf/fcvtzs/fcvtzu.
+#[test]
+fn vector_native_shuffle_and_convert_instructions() {
+    let src = r#"
+typedef int v4si __attribute__((vector_size(16)));
+typedef unsigned v4su __attribute__((vector_size(16)));
+typedef float v4sf __attribute__((vector_size(16)));
+typedef double v2df __attribute__((vector_size(16)));
+void rev(v4si *d, v4si *a) { *d = __builtin_shufflevector(*a, *a, 3, 2, 1, 0); }
+void mix(v4sf *d, v4sf *a, v4sf *b) { *d = __builtin_shufflevector(*a, *b, 1, 0, 6, 7); }
+void pd(v2df *d, v2df *a, v2df *b) { *d = __builtin_shufflevector(*a, *b, 3, 0); }
+void cvt(v4si *d, v4sf *a) { *d = __builtin_convertvector(*a, v4si); }
+void ucvt(v4sf *d, v4su *a) { *d = __builtin_convertvector(*a, v4sf); }
+"#;
+    let x86 = asm_for("vec_shuf_x86", X86_64_LINUX, src);
+    let a64 = asm_for(
+        "vec_shuf_a64",
+        crate::codegen::asm_probe::AARCH64_LINUX,
+        src,
+    );
+    for (asm, f, want) in [
+        (&x86, "rev", &["pshufd $27"][..]),
+        (&x86, "mix", &["shufps $225"]),
+        (&x86, "pd", &["shufpd $1"]),
+        (&x86, "cvt", &["cvttps2dq"]),
+        (&a64, "rev", &["tbl v", "{v17.16b}"]),
+        (&a64, "mix", &["tbl v", "{v17.16b, v18.16b}"]),
+        (&a64, "cvt", &["fcvtzs v", ".4s"]),
+        (&a64, "ucvt", &["ucvtf v", ".4s"]),
+    ] {
+        let body = crate::codegen::asm_probe::body_of(asm, f);
+        for m in want {
+            assert!(body.contains(m), "{f}: no {m}:\n{body}");
+        }
+    }
+}

@@ -424,11 +424,70 @@ pub enum SimdOp {
     FCmpNe,
     FCmpGt,
     FCmpGe,
+    /// The lanes of src[0], followed by src[1]'s when there are two, picked
+    /// by the constant indices in `InsnExtra::shuffle`: result lane k is
+    /// lane `indices.lane(k)` of the two, or anything for an unspecified
+    /// one. Out of line, so every instruction does not pay for sixteen.
+    Shuffle,
+    /// Each lane converted, at the same width: signed or unsigned integer
+    /// to floating, and floating to signed or unsigned integer, truncated.
+    /// `typ` is the result's vector type.
+    CvtSF,
+    CvtUF,
+    CvtFS,
+    CvtFU,
+}
+
+/// The constant lane indices of a [`SimdOp::Shuffle`]: one per result
+/// lane, into the lanes of its operands in order, or
+/// [`ShuffleIndices::UNSPECIFIED`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ShuffleIndices {
+    lanes: [u8; 16],
+    count: u8,
+}
+
+impl ShuffleIndices {
+    /// A result lane whose value may be anything (`-1` to
+    /// `__builtin_shufflevector`).
+    pub const UNSPECIFIED: u8 = u8::MAX;
+
+    /// The indices of `lanes`, at most sixteen, each an operand lane or
+    /// `None` for an unspecified one.
+    pub fn new(lanes: &[Option<u32>]) -> Self {
+        assert!(lanes.len() <= 16, "a shuffle of more than 16 lanes");
+        let mut out = [Self::UNSPECIFIED; 16];
+        for (slot, lane) in out.iter_mut().zip(lanes) {
+            if let Some(i) = lane {
+                *slot = u8::try_from(*i).expect("a lane index below 32");
+            }
+        }
+        Self {
+            lanes: out,
+            count: lanes.len() as u8,
+        }
+    }
+
+    /// The operand lane of result lane `k`, or `None` when unspecified.
+    pub fn lane(&self, k: usize) -> Option<usize> {
+        let i = self.lanes[..self.count as usize][k];
+        (i != Self::UNSPECIFIED).then_some(i as usize)
+    }
+
+    /// The number of result lanes.
+    pub fn len(&self) -> usize {
+        self.count as usize
+    }
+
+    /// Whether there are no lanes; never, for a shuffle of a vector.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
 }
 
 impl SimdOp {
     /// Every operation, for tests over the whole set.
-    pub const ALL: [SimdOp; 30] = [
+    pub const ALL: [SimdOp; 35] = [
         SimdOp::Add,
         SimdOp::Sub,
         SimdOp::And,
@@ -459,13 +518,25 @@ impl SimdOp {
         SimdOp::FCmpNe,
         SimdOp::FCmpGt,
         SimdOp::FCmpGe,
+        SimdOp::Shuffle,
+        SimdOp::CvtSF,
+        SimdOp::CvtUF,
+        SimdOp::CvtFS,
+        SimdOp::CvtFU,
     ];
 
     /// Whether the operation takes one operand.
     pub fn is_unary(self) -> bool {
         matches!(
             self,
-            SimdOp::Not | SimdOp::Neg | SimdOp::FNeg | SimdOp::Splat
+            SimdOp::Not
+                | SimdOp::Neg
+                | SimdOp::FNeg
+                | SimdOp::Splat
+                | SimdOp::CvtSF
+                | SimdOp::CvtUF
+                | SimdOp::CvtFS
+                | SimdOp::CvtFU
         )
     }
 
@@ -481,8 +552,10 @@ impl SimdOp {
             | SimdOp::FCmpEq
             | SimdOp::FCmpNe
             | SimdOp::FCmpGt
-            | SimdOp::FCmpGe => Some(true),
-            SimdOp::Splat => None,
+            | SimdOp::FCmpGe
+            | SimdOp::CvtSF
+            | SimdOp::CvtUF => Some(true),
+            SimdOp::Splat | SimdOp::Shuffle => None,
             _ => Some(false),
         }
     }
@@ -530,6 +603,11 @@ impl SimdOp {
             SimdOp::FCmpNe => "vfcmp_ne",
             SimdOp::FCmpGt => "vfcmp_gt",
             SimdOp::FCmpGe => "vfcmp_ge",
+            SimdOp::Shuffle => "vshuffle",
+            SimdOp::CvtSF => "vcvt_sf",
+            SimdOp::CvtUF => "vcvt_uf",
+            SimdOp::CvtFS => "vcvt_fs",
+            SimdOp::CvtFU => "vcvt_fu",
         }
     }
 }
@@ -919,6 +997,11 @@ macro_rules! every_opcode {
                 Opcode::Simd(SimdOp::FCmpNe),
                 Opcode::Simd(SimdOp::FCmpGt),
                 Opcode::Simd(SimdOp::FCmpGe),
+                Opcode::Simd(SimdOp::Shuffle),
+                Opcode::Simd(SimdOp::CvtSF),
+                Opcode::Simd(SimdOp::CvtUF),
+                Opcode::Simd(SimdOp::CvtFS),
+                Opcode::Simd(SimdOp::CvtFU),
             ];
 
             /// The exhaustiveness guard behind [`Opcode::ALL`]; always true.
@@ -963,7 +1046,12 @@ macro_rules! every_opcode {
                         | SimdOp::FCmpEq
                         | SimdOp::FCmpNe
                         | SimdOp::FCmpGt
-                        | SimdOp::FCmpGe,
+                        | SimdOp::FCmpGe
+                        | SimdOp::Shuffle
+                        | SimdOp::CvtSF
+                        | SimdOp::CvtUF
+                        | SimdOp::CvtFS
+                        | SimdOp::CvtFU,
                     ) => true,
                 }
             }
@@ -1502,6 +1590,8 @@ pub struct InsnExtra {
     pub fence_scope: FenceScope,
     /// For `LifetimeEnd`: the local whose lifetime ends.
     pub lifetime_of: Option<PseudoId>,
+    /// For `Simd(Shuffle)`: the lanes it picks.
+    pub shuffle: Option<ShuffleIndices>,
 }
 
 /// What an instruction with no extra fields answers: every one empty.
@@ -1521,6 +1611,7 @@ static NO_EXTRA: InsnExtra = InsnExtra {
     memory_order: MemoryOrder::Relaxed,
     fence_scope: FenceScope::Thread,
     lifetime_of: None,
+    shuffle: None,
 };
 
 impl Default for Instruction {
@@ -1553,6 +1644,14 @@ impl Instruction {
     /// The fields only a few opcodes use, for setting.
     pub fn extra_mut(&mut self) -> &mut InsnExtra {
         self.extra.get_or_insert_with(Default::default)
+    }
+
+    /// The lanes a `Simd(Shuffle)` picks.
+    pub fn shuffle_indices(&self) -> &ShuffleIndices {
+        self.extra()
+            .shuffle
+            .as_ref()
+            .expect("a shuffle carries its indices")
     }
 
     pub fn new(op: Opcode) -> Self {

@@ -215,3 +215,43 @@ fn test_native_comparisons() {
         assert_eq!(simds(src, &a64), [a64_want], "{src}");
     }
 }
+
+/// A constant shuffle keeping the operands' shape, and a same-width
+/// conversion between integer and floating lanes, are one packed operation
+/// where the target has one: any shuffle on NEON (`tbl`), dword and qword
+/// ones on SSE2; signed 32-bit conversions on SSE2, all on NEON. A shuffle
+/// to another length stays lane by lane.
+#[test]
+fn test_native_shuffles_and_conversions() {
+    use crate::ir::SimdOp;
+    use crate::target::{Arch, Os};
+    let x86 = Target::new(Arch::X86_64, Os::Linux);
+    let a64 = Target::new(Arch::Aarch64, Os::Linux);
+    let count = |src: &str, target: &Target| {
+        ops_of(src, "f", target)
+            .into_iter()
+            .filter(|o| matches!(o, Opcode::Simd(_)))
+            .count()
+    };
+    let shuffle = |src: &str, target: &Target| {
+        ops_of(src, "f", target)
+            .into_iter()
+            .any(|o| matches!(o, Opcode::Simd(SimdOp::Shuffle)))
+    };
+    let rev = "void f(v4si *d, v4si *a) { *d = __builtin_shufflevector(*a, *a, 3, 2, 1, 0); }";
+    let words = "typedef short v8hi __attribute__((vector_size(16)));\n\
+                 void f(v8hi *d, v8hi *a, v8hi *b) \
+                 { *d = __builtin_shufflevector(*a, *b, 0, 8, 1, 9, 2, 10, 3, 11); }";
+    let narrow = "void f(v2si *d, v4si *a) { *d = __builtin_shufflevector(*a, *a, 1, 0); }";
+    assert!(shuffle(rev, &x86) && shuffle(rev, &a64));
+    assert!(!shuffle(words, &x86) && shuffle(words, &a64));
+    assert!(!shuffle(narrow, &x86) && !shuffle(narrow, &a64));
+    let to_float = "void f(v4sf *d, v4si *a) { *d = __builtin_convertvector(*a, v4sf); }";
+    let unsigned = "typedef unsigned v4su __attribute__((vector_size(16)));\n\
+                    void f(v4sf *d, v4su *a) { *d = __builtin_convertvector(*a, v4sf); }";
+    for t in [&x86, &a64] {
+        assert!(ops_of(to_float, "f", t).contains(&Opcode::Simd(SimdOp::CvtSF)));
+    }
+    assert_eq!(count(unsigned, &x86), 0);
+    assert!(ops_of(unsigned, "f", &a64).contains(&Opcode::Simd(SimdOp::CvtUF)));
+}

@@ -19,11 +19,19 @@
 //
 
 use super::linearize::{BlockVolatility, Linearizer};
-use super::{Instruction, Opcode, PseudoId, SimdOp};
+use super::{Instruction, Opcode, PseudoId, ShuffleIndices, SimdOp};
 use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, BinaryOp, Expr, ShuffleSelector, UnaryOp};
 use crate::types::{TypeId, TypeKind};
+
+/// Which operands of a shuffle its lanes come from.
+#[derive(Clone, Copy)]
+enum ShuffleFrom {
+    First,
+    Second,
+    Both,
+}
 
 /// Where an operand's lane `i` comes from.
 #[derive(Clone, Copy)]
@@ -184,6 +192,27 @@ impl Linearizer<'_> {
         selector: &ShuffleSelector,
         result_typ: TypeId,
     ) -> PseudoId {
+        if let ShuffleSelector::Indices(indices) = selector {
+            if let Some((idx, from)) = self.native_shuffle(first, second, indices, result_typ) {
+                // Both operands are evaluated; the shuffle reads the ones
+                // its lanes come from.
+                let a = self.vector_addr(first);
+                let b = second.map(|e| self.vector_addr(e));
+                let operands = match (from, b) {
+                    (ShuffleFrom::Both, Some(b)) => vec![a, b],
+                    (ShuffleFrom::Second, Some(b)) => vec![b],
+                    _ => vec![a],
+                };
+                let values: Vec<PseudoId> = operands
+                    .iter()
+                    .map(|&addr| self.carrier_of(addr, result_typ))
+                    .collect();
+                let (value, mut insn) = self.simd_insn(SimdOp::Shuffle, &values, result_typ);
+                insn.extra_mut().shuffle = Some(idx);
+                self.emit(insn);
+                return self.simd_result(value, result_typ, result_typ);
+            }
+        }
         let (lane, count, size) = self.vector_shape(result_typ);
         let in_typ = self.expr_type(first);
         let (_, in_count, _) = self.vector_shape(in_typ);
@@ -255,6 +284,42 @@ impl Linearizer<'_> {
         result
     }
 
+    /// The packed shuffle of `__builtin_shufflevector`'s constant `indices`
+    /// of `first` (and `second`), when the result is the operands' own shape
+    /// and the target has an instruction for it, and which operands its
+    /// lanes come from: a shuffle of one operand's lanes takes that operand
+    /// alone, its indices counted within it.
+    fn native_shuffle(
+        &self,
+        first: &Expr,
+        second: Option<&Expr>,
+        indices: &[Option<u32>],
+        result_typ: TypeId,
+    ) -> Option<(ShuffleIndices, ShuffleFrom)> {
+        let same_shape = |e: &Expr| {
+            let t = self.expr_type(e);
+            self.types.size_bytes(t) == self.types.size_bytes(result_typ)
+                && self.types.vector_lanes(t).map(|(_, n)| n)
+                    == self.types.vector_lanes(result_typ).map(|(_, n)| n)
+        };
+        if !same_shape(first) || !second.is_none_or(same_shape) || indices.len() > 16 {
+            return None;
+        }
+        let n = indices.len() as u32;
+        let picked = || indices.iter().flatten();
+        let (from, indices): (ShuffleFrom, Vec<Option<u32>>) = if picked().all(|&i| i < n) {
+            (ShuffleFrom::First, indices.to_vec())
+        } else if picked().all(|&i| i >= n) {
+            let within = indices.iter().map(|i| i.map(|i| i - n)).collect();
+            (ShuffleFrom::Second, within)
+        } else {
+            (ShuffleFrom::Both, indices.to_vec())
+        };
+        let idx = ShuffleIndices::new(&indices);
+        crate::arch::simd::native_shuffle(self.target, &idx, result_typ, self.types)
+            .then_some((idx, from))
+    }
+
     /// `__builtin_convertvector`: each lane converted, as by a cast.
     pub(crate) fn linearize_convert_vector(
         &mut self,
@@ -263,7 +328,28 @@ impl Linearizer<'_> {
     ) -> PseudoId {
         let from_typ = self.expr_type(value);
         let src = self.vector_addr(value);
+        if let Some(op) = self.native_convert(from_typ, result_typ) {
+            return self.emit_simd(op, &[src], result_typ, result_typ);
+        }
         self.convert_vector_at(src, from_typ, result_typ)
+    }
+
+    /// The packed conversion from vectors of `from` to `to`: between
+    /// integer and floating lanes of one width, where the target has it.
+    fn native_convert(&self, from: TypeId, to: TypeId) -> Option<SimdOp> {
+        let (from_lane, from_n) = self.types.vector_lanes(from)?;
+        let (to_lane, to_n) = self.types.vector_lanes(to)?;
+        if from_n != to_n || self.types.size_bytes(from_lane) != self.types.size_bytes(to_lane) {
+            return None;
+        }
+        let op = match (self.types.is_float(from_lane), self.types.is_float(to_lane)) {
+            (false, true) if self.types.is_unsigned(from_lane) => SimdOp::CvtUF,
+            (false, true) => SimdOp::CvtSF,
+            (true, false) if self.types.is_unsigned(to_lane) => SimdOp::CvtFU,
+            (true, false) => SimdOp::CvtFS,
+            _ => return None,
+        };
+        self.simd_native(op, to).then_some(op)
     }
 
     /// The vector at `src`, of type `from_typ`, with each lane converted to
@@ -617,6 +703,19 @@ impl Linearizer<'_> {
     /// The `Simd(op)` instruction on `values` -- carriers, or a scalar for a
     /// splat or a shift count -- giving a vector of type `vec`.
     fn simd_value(&mut self, op: SimdOp, values: &[PseudoId], vec: TypeId) -> PseudoId {
+        let (value, insn) = self.simd_insn(op, values, vec);
+        self.emit(insn);
+        value
+    }
+
+    /// The `Simd(op)` instruction of [`Self::simd_value`], not yet emitted,
+    /// and the pseudo it defines.
+    fn simd_insn(
+        &mut self,
+        op: SimdOp,
+        values: &[PseudoId],
+        vec: TypeId,
+    ) -> (PseudoId, Instruction) {
         let bits = self.types.size_bits(self.native_carrier(vec));
         let value = self.alloc_reg_pseudo();
         let insn = match values[..] {
@@ -624,8 +723,7 @@ impl Linearizer<'_> {
             [a, b] => Instruction::binop(Opcode::Simd(op), value, a, b, vec, bits),
             _ => unreachable!("a vector operation has one or two operands"),
         };
-        self.emit(insn);
-        value
+        (value, insn)
     }
 
     /// The vector `value`, of type `vec` in its carrier, stored whole to a

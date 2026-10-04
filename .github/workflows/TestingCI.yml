@@ -17,7 +17,7 @@ env:
   # The crates that build and test on Windows. Utilities are ported a whole
   # crate at a time, because `cargo test -p` builds every binary in the
   # crate; add a crate here once all of its binaries and tests are portable.
-  WINDOWS_CRATES: -p gettext-rs -p plib -p posixutils-xform -p posixutils-text -p posixutils-datetime -p posixutils-calc
+  WINDOWS_CRATES: -p gettext-rs -p plib -p posixutils-xform -p posixutils-text -p posixutils-datetime -p posixutils-calc -p posixutils-dev -p posixutils-display
 
 jobs:
   lint:
@@ -165,6 +165,8 @@ jobs:
           echo "=== Toolchain ==="
           rustc --version --verbose
           cargo --version
+          # dev's tests compile the C that lex and yacc generate with it.
+          gcc --version
       - name: Build
         run: cargo build --release --verbose $WINDOWS_CRATES
       - name: Run tests

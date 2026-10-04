@@ -273,8 +273,9 @@ int main(void) {
 /// pointer -- the hidden return pointer ahead of four more arguments, and
 /// the wide scalars: `long double`, `__int128` (returned whole in XMM0),
 /// complex values, `_Float16` (in the integer position, as gcc has it) and
-/// `__float128`. The last three are not cross-checked on Apple, whose
-/// compiler lowers them differently; see the note in `TYPES_CALLEE`.
+/// `__float128`. `long double` and `_Float16` are not cross-checked on Apple,
+/// whose compiler lowers them differently, and `__float128` is absent there;
+/// see the note in `TYPES_CALLEE`.
 #[test]
 fn codegen_ms_abi_types_interoperate_with_gcc() {
     if !cfg!(target_arch = "x86_64") {

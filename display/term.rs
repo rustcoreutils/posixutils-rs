@@ -13,6 +13,25 @@
 use std::fmt;
 use std::io::{self, Read, Write};
 
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+use unix as sys;
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows as sys;
+
+pub use sys::{take_pending, terminal_size, CommandIO, Reader};
+
+/// Events that arrived from outside since the pager last looked.
+pub struct Pending {
+    /// The process was resumed after a stop: redraw the screen.
+    pub resumed: bool,
+    /// The window may have changed size: fetch it again.
+    pub resized: bool,
+}
+
 /// Show the cursor.
 pub const SHOW_CURSOR: &str = "\x1b[?25h";
 /// Hide the cursor.
@@ -57,17 +76,6 @@ impl<W: Write> Drop for AlternateScreen<W> {
         let _ = self.0.write_all(TO_MAIN_SCREEN.as_bytes());
         let _ = self.0.flush();
     }
-}
-
-/// The terminal's size as (columns, rows), asked of standard output.
-#[cfg(unix)]
-pub fn terminal_size() -> io::Result<(u16, u16)> {
-    // SAFETY: TIOCGWINSZ fills the winsize it is handed and nothing else.
-    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok((size.ws_col, size.ws_row))
 }
 
 /// One complete unit of terminal input.

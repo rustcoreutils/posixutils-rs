@@ -17,30 +17,24 @@
 //! The `:=` form is used for per-file options (pax format),
 //! while `=` is used for global options.
 
-use crate::archive::EntryType;
+use crate::archive::{ArchiveEntry, EntryType};
 use crate::error::{PaxError, PaxResult};
 use crate::pattern::Pattern;
 use std::collections::HashMap;
 
 /// Information about an archive entry for list formatting
+///
+/// The member is borrowed whole rather than copied field by field. POSIX
+/// listopt rule 7 admits every ustar and cpio header field name and every pax
+/// extended-header keyword as a `%(keyword)`, so the set of fields a format
+/// string can reach is the entry's own; a hand-copied subset is a list that
+/// silently falls behind the one `keyword_value` is meant to resolve.
 #[derive(Debug, Clone)]
 pub struct ListEntryInfo<'a> {
-    pub path: &'a std::path::Path,
-    pub mode: u32,
-    pub size: u64,
-    pub mtime: u64,
-    /// Access time, when the archive member carried an `atime` record.
-    pub atime: Option<u64>,
-    /// Change time, when the archive member carried a `ctime` record.
-    pub ctime: Option<u64>,
-    pub uid: u32,
-    pub gid: u32,
-    pub uname: Option<&'a str>,
-    pub gname: Option<&'a str>,
-    pub link_target: Option<&'a std::path::Path>,
-    pub entry_type: EntryType,
-    pub devmajor: u32,
-    pub devminor: u32,
+    /// The member as the reader produced it, after the name rewrites list mode
+    /// applies first (`-s`, `--strip-components`, `-o keyword:=value`), so a
+    /// keyword reports what extracting this archive would use.
+    pub entry: &'a ArchiveEntry,
     /// Whether the *substituted values* get escaped.
     ///
     /// Only the values, never the rendered result: the format string is
@@ -445,18 +439,18 @@ fn expand_global_header_template(template: &str, sequence: u64) -> String {
 
 // Format specifier handlers for list entry formatting
 fn fmt_basename(info: &ListEntryInfo) -> Vec<u8> {
-    match info.path.file_name() {
+    match info.entry.path.file_name() {
         Some(name) => escaped(info, crate::rawpath::as_bytes(std::path::Path::new(name))),
         None => fmt_fullpath(info),
     }
 }
 
 fn fmt_fullpath(info: &ListEntryInfo) -> Vec<u8> {
-    escaped(info, crate::rawpath::as_bytes(info.path))
+    escaped(info, crate::rawpath::as_bytes(&info.entry.path))
 }
 
 fn fmt_link_target(info: &ListEntryInfo) -> Vec<u8> {
-    match info.link_target {
+    match info.entry.link_target.as_deref() {
         Some(p) => escaped(info, crate::rawpath::as_bytes(p)),
         None => Vec::new(),
     }
@@ -474,15 +468,15 @@ fn escaped(info: &ListEntryInfo, bytes: &[u8]) -> Vec<u8> {
 }
 
 fn fmt_mode_octal(info: &ListEntryInfo) -> Vec<u8> {
-    format!("{:o}", info.mode & 0o7777).into_bytes()
+    format!("{:o}", info.entry.mode & 0o7777).into_bytes()
 }
 
 fn fmt_mode_symbolic(info: &ListEntryInfo) -> Vec<u8> {
-    format_mode_symbolic(info.mode, info.entry_type).into_bytes()
+    format_mode_symbolic(info.entry.mode, info.entry.entry_type).into_bytes()
 }
 
 fn fmt_device(info: &ListEntryInfo) -> Vec<u8> {
-    format!("{},{}", info.devmajor, info.devminor).into_bytes()
+    format!("{},{}", info.entry.devmajor, info.entry.devminor).into_bytes()
 }
 
 /// Bare `%D`. Rule 10: with no keyword to fall back on, a non-device entry
@@ -496,39 +490,41 @@ fn fmt_device_or_space(info: &ListEntryInfo) -> Vec<u8> {
 }
 
 fn fmt_size(info: &ListEntryInfo) -> Vec<u8> {
-    info.size.to_string().into_bytes()
+    info.entry.size.to_string().into_bytes()
 }
 
 fn fmt_mtime_trad(info: &ListEntryInfo) -> Vec<u8> {
-    format_time_traditional(info.mtime).into_bytes()
+    format_time_traditional(info.entry.mtime).into_bytes()
 }
 
 /// Bare `%T`. Rule 8: the default keyword is mtime and the default subformat is
 /// `%b %e %H:%M %Y`.
 fn fmt_mtime_posix(info: &ListEntryInfo) -> Vec<u8> {
-    strftime_or_secs(info.mtime, DEFAULT_TIME_SUBFORMAT).into_bytes()
+    strftime_or_secs(info.entry.mtime, DEFAULT_TIME_SUBFORMAT).into_bytes()
 }
 
 fn fmt_username(info: &ListEntryInfo) -> Vec<u8> {
-    info.uname
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| info.uid.to_string())
+    info.entry
+        .uname
+        .clone()
+        .unwrap_or_else(|| info.entry.uid.to_string())
         .into_bytes()
 }
 
 fn fmt_groupname(info: &ListEntryInfo) -> Vec<u8> {
-    info.gname
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| info.gid.to_string())
+    info.entry
+        .gname
+        .clone()
+        .unwrap_or_else(|| info.entry.gid.to_string())
         .into_bytes()
 }
 
 fn fmt_uid(info: &ListEntryInfo) -> Vec<u8> {
-    info.uid.to_string().into_bytes()
+    info.entry.uid.to_string().into_bytes()
 }
 
 fn fmt_gid(info: &ListEntryInfo) -> Vec<u8> {
-    info.gid.to_string().into_bytes()
+    info.entry.gid.to_string().into_bytes()
 }
 
 fn fmt_newline(_info: &ListEntryInfo) -> Vec<u8> {
@@ -779,13 +775,13 @@ enum KeywordValue {
 /// The outer `Option` distinguishes "not a time keyword" from "no record".
 fn time_keyword(info: &ListEntryInfo, keyword: &str) -> Option<Option<u64>> {
     match keyword {
-        "mtime" => Some(Some(info.mtime)),
-        "atime" => Some(info.atime),
+        "mtime" => Some(Some(info.entry.mtime)),
+        "atime" => Some(info.entry.atime),
         // ctime is not a POSIX keyword (it was removed by
         // IEEE Std 1003.1-2001/Cor 2-2004 because st_ctime is not a creation
         // time), but it is written by star/GNU tar and rule 7 admits
         // implementation extensions, so archives carrying one can be listed.
-        "ctime" => Some(info.ctime),
+        "ctime" => Some(info.entry.ctime),
         _ => None,
     }
 }
@@ -793,7 +789,7 @@ fn time_keyword(info: &ListEntryInfo, keyword: &str) -> Option<Option<u64>> {
 /// Whether the `D` conversion's device rendering applies to this entry.
 fn is_device(info: &ListEntryInfo) -> bool {
     matches!(
-        info.entry_type,
+        info.entry.entry_type,
         EntryType::BlockDevice | EntryType::CharDevice
     )
 }
@@ -824,13 +820,13 @@ fn keyword_value(info: &ListEntryInfo, field: &str, conversion: char) -> Keyword
 
     let value: Vec<u8> = match keyword {
         "path" | "name" => fmt_fullpath(info),
-        "size" => info.size.to_string().into_bytes(),
-        "uid" => info.uid.to_string().into_bytes(),
-        "gid" => info.gid.to_string().into_bytes(),
-        "uname" => info.uname.unwrap_or("").as_bytes().to_vec(),
-        "gname" => info.gname.unwrap_or("").as_bytes().to_vec(),
+        "size" => info.entry.size.to_string().into_bytes(),
+        "uid" => info.entry.uid.to_string().into_bytes(),
+        "gid" => info.entry.gid.to_string().into_bytes(),
+        "uname" => info.entry.uname.clone().unwrap_or_default().into_bytes(),
+        "gname" => info.entry.gname.clone().unwrap_or_default().into_bytes(),
         "linkpath" => fmt_link_target(info),
-        "mode" => format!("{:o}", info.mode).into_bytes(),
+        "mode" => format!("{:o}", info.entry.mode).into_bytes(),
         _ => return KeywordValue::Unknown,
     };
 
@@ -838,7 +834,7 @@ fn keyword_value(info: &ListEntryInfo, field: &str, conversion: char) -> Keyword
     // rather than which field to read, so they still apply when a keyword was
     // given (e.g. `%(path)F`).
     let rendered = match conversion {
-        'M' => format_mode_symbolic(info.mode, info.entry_type).into_bytes(),
+        'M' => format_mode_symbolic(info.entry.mode, info.entry.entry_type).into_bytes(),
         'F' => fmt_fullpath(info),
         'L' => fmt_link_target(info),
         // Rule 10: D names the device of a block/character special file. When
@@ -1053,27 +1049,31 @@ mod tests {
         String::from_utf8(format_list_entry(format, info)).expect("ASCII fixture")
     }
 
+    /// The formatter's view of a member, with escaping off.
+    ///
+    /// `ArchiveEntry` is `Default`, so a fixture below names only the fields
+    /// its assertions depend on -- which is the point of borrowing the entry
+    /// rather than copying a fixed subset of it into `ListEntryInfo`.
+    fn info(entry: &ArchiveEntry) -> ListEntryInfo<'_> {
+        ListEntryInfo {
+            entry,
+            style: crate::escape::Style::RAW,
+        }
+    }
+
     #[test]
     fn test_format_list_entry_basic() {
-        let info = ListEntryInfo {
-            path: std::path::Path::new("path/to/file.txt"),
+        let e = ArchiveEntry {
+            path: "path/to/file.txt".into(),
             mode: 0o644,
             size: 1234,
-            mtime: 0,
-            atime: None,
-            ctime: None,
             uid: 1000,
             gid: 1000,
-            uname: Some("user"),
-            gname: Some("group"),
-            link_target: None,
-            entry_type: EntryType::Regular,
-            devmajor: 0,
-            devminor: 0,
-            style: crate::escape::Style::RAW,
+            uname: Some("user".into()),
+            gname: Some("group".into()),
+            ..Default::default()
         };
-        let result = fmt("%F", &info);
-        assert_eq!(result, "path/to/file.txt");
+        assert_eq!(fmt("%F", &info(&e)), "path/to/file.txt");
     }
 
     /// `%.N` is a precision on the string, so it counts characters. Applying it
@@ -1081,23 +1081,13 @@ mod tests {
     /// character -- `%.1F` on any name with a non-ASCII first character.
     #[test]
     fn test_format_list_entry_precision_is_char_counted() {
-        let info = ListEntryInfo {
-            path: std::path::Path::new("élan.txt"),
+        let e = ArchiveEntry {
+            path: "élan.txt".into(),
             mode: 0o644,
-            size: 0,
-            mtime: 0,
-            atime: None,
-            ctime: None,
-            uid: 0,
-            gid: 0,
-            uname: Some("ünïcode"),
-            gname: None,
-            link_target: None,
-            entry_type: EntryType::Regular,
-            devmajor: 0,
-            devminor: 0,
-            style: crate::escape::Style::RAW,
+            uname: Some("ünïcode".into()),
+            ..Default::default()
         };
+        let info = info(&e);
 
         // 'é' is two bytes; a byte-indexed truncate(1) split it and aborted.
         assert_eq!(fmt("%.1F", &info), "é");
@@ -1113,46 +1103,33 @@ mod tests {
 
     #[test]
     fn test_format_list_entry_complex() {
-        let info = ListEntryInfo {
-            path: std::path::Path::new("dir/file.txt"),
+        let e = ArchiveEntry {
+            path: "dir/file.txt".into(),
             mode: 0o755,
             size: 4096,
-            mtime: 0,
-            atime: None,
-            ctime: None,
             uid: 1000,
             gid: 1000,
-            uname: Some("alice"),
-            gname: Some("users"),
-            link_target: None,
-            entry_type: EntryType::Regular,
-            devmajor: 0,
-            devminor: 0,
-            style: crate::escape::Style::RAW,
+            uname: Some("alice".into()),
+            gname: Some("users".into()),
+            ..Default::default()
         };
-        let result = fmt("%M %u %g %s %f", &info);
+        let result = fmt("%M %u %g %s %f", &info(&e));
         assert_eq!(result, "-rwxr-xr-x alice users 4096 file.txt");
     }
 
     #[test]
     fn test_format_list_entry_keyword_substitution() {
-        let info = ListEntryInfo {
-            path: std::path::Path::new("dir/file.txt"),
+        let e = ArchiveEntry {
+            path: "dir/file.txt".into(),
             mode: 0o644,
             size: 4096,
-            mtime: 0,
-            atime: None,
-            ctime: None,
             uid: 1000,
             gid: 1000,
-            uname: Some("alice"),
-            gname: Some("users"),
-            link_target: None,
-            entry_type: EntryType::Regular,
-            devmajor: 0,
-            devminor: 0,
-            style: crate::escape::Style::RAW,
+            uname: Some("alice".into()),
+            gname: Some("users".into()),
+            ..Default::default()
         };
+        let info = info(&e);
 
         // POSIX `%(keyword)s`/`%(keyword)d` substitution.
         assert_eq!(fmt("%(path)s %(size)d", &info), "dir/file.txt 4096");
@@ -1228,24 +1205,17 @@ mod tests {
     #[test]
     fn test_format_list_entry_device() {
         // Test %D format specifier for device major,minor
-        let info = ListEntryInfo {
-            path: std::path::Path::new("/dev/sda"),
+        let e = ArchiveEntry {
+            path: "/dev/sda".into(),
             mode: 0o660,
-            size: 0,
-            mtime: 0,
-            atime: None,
-            ctime: None,
-            uid: 0,
-            gid: 0,
-            uname: Some("root"),
-            gname: Some("disk"),
-            link_target: None,
+            uname: Some("root".into()),
+            gname: Some("disk".into()),
             entry_type: EntryType::BlockDevice,
             devmajor: 8,
             devminor: 0,
-            style: crate::escape::Style::RAW,
+            ..Default::default()
         };
-        let result = fmt("%M %D %f", &info);
+        let result = fmt("%M %D %f", &info(&e));
         assert_eq!(result, "brw-rw---- 8,0 sda");
     }
 
@@ -1253,46 +1223,23 @@ mod tests {
     fn test_format_list_entry_different_types() {
         // Test that %M correctly uses entry_type for file type character
         // Directory
-        let info = ListEntryInfo {
-            path: std::path::Path::new("mydir"),
+        let e = ArchiveEntry {
+            path: "mydir".into(),
             mode: 0o755,
-            size: 0,
-            mtime: 0,
-            atime: None,
-            ctime: None,
-            uid: 0,
-            gid: 0,
-            uname: None,
-            gname: None,
-            link_target: None,
             entry_type: EntryType::Directory,
-            devmajor: 0,
-            devminor: 0,
-            style: crate::escape::Style::RAW,
+            ..Default::default()
         };
-        let result = fmt("%M", &info);
-        assert_eq!(result, "drwxr-xr-x");
+        assert_eq!(fmt("%M", &info(&e)), "drwxr-xr-x");
 
         // Symlink
-        let info = ListEntryInfo {
-            path: std::path::Path::new("mylink"),
+        let e = ArchiveEntry {
+            path: "mylink".into(),
             mode: 0o777,
-            size: 0,
-            mtime: 0,
-            atime: None,
-            ctime: None,
-            uid: 0,
-            gid: 0,
-            uname: None,
-            gname: None,
-            link_target: Some(std::path::Path::new("target")),
+            link_target: Some("target".into()),
             entry_type: EntryType::Symlink,
-            devmajor: 0,
-            devminor: 0,
-            style: crate::escape::Style::RAW,
+            ..Default::default()
         };
-        let result = fmt("%M", &info);
-        assert_eq!(result, "lrwxrwxrwx");
+        assert_eq!(fmt("%M", &info(&e)), "lrwxrwxrwx");
     }
 
     #[test]

@@ -228,21 +228,8 @@ fn print_entry<W: Write>(
     // Check for custom list format (listopt)
     if let Some(ref format) = options.format_options.list_format {
         let info = ListEntryInfo {
-            path: &entry.path,
+            entry,
             style: crate::escape::stdout_style(),
-            mode: entry.mode,
-            size: entry.size,
-            mtime: entry.mtime,
-            atime: entry.atime,
-            ctime: entry.ctime,
-            uid: entry.uid,
-            gid: entry.gid,
-            uname: entry.uname.as_deref(),
-            gname: entry.gname.as_deref(),
-            link_target: entry.link_target.as_deref(),
-            entry_type: entry.entry_type,
-            devmajor: entry.devmajor,
-            devminor: entry.devminor,
         };
         let output = format_list_entry(format, &info);
         writer.write_all(&output)?;

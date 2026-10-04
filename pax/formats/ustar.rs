@@ -9,6 +9,11 @@
 
 //! POSIX ustar (tar) format implementation
 //!
+//! This module owns the header layout. The pax interchange format is an
+//! extension of ustar and reads the same 512-byte block, so it imports these
+//! offsets rather than restating them -- two copies of a field offset is one
+//! copy that can be wrong.
+//!
 //! Header format (512 bytes):
 //! - name:     100 bytes (offset 0)
 //! - mode:       8 bytes (offset 100)
@@ -27,49 +32,51 @@
 //! - devminor:   8 bytes (offset 337)
 //! - prefix:   155 bytes (offset 345)
 
-use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
+use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType, SourceHeader};
 use crate::error::{PaxError, PaxResult};
 use std::io::{Read, Write};
 
-const BLOCK_SIZE: usize = 512;
+pub(crate) const BLOCK_SIZE: usize = 512;
 /// Static zero buffer for padding and end-of-archive markers
-static ZERO_BLOCK: [u8; BLOCK_SIZE] = [0u8; BLOCK_SIZE];
-const NAME_LEN: usize = 100;
-const PREFIX_LEN: usize = 155;
-const LINKNAME_LEN: usize = 100;
-const UNAME_LEN: usize = 32;
-const GNAME_LEN: usize = 32;
+pub(crate) static ZERO_BLOCK: [u8; BLOCK_SIZE] = [0u8; BLOCK_SIZE];
+pub(crate) const NAME_LEN: usize = 100;
+pub(crate) const PREFIX_LEN: usize = 155;
+pub(crate) const LINKNAME_LEN: usize = 100;
+const MAGIC_LEN: usize = 6;
+const VERSION_LEN: usize = 2;
+pub(crate) const UNAME_LEN: usize = 32;
+pub(crate) const GNAME_LEN: usize = 32;
 
 // Header field offsets
-const NAME_OFF: usize = 0;
-const MODE_OFF: usize = 100;
-const UID_OFF: usize = 108;
-const GID_OFF: usize = 116;
-const SIZE_OFF: usize = 124;
-const MTIME_OFF: usize = 136;
-const CHKSUM_OFF: usize = 148;
-const TYPEFLAG_OFF: usize = 156;
-const LINKNAME_OFF: usize = 157;
-const MAGIC_OFF: usize = 257;
-const VERSION_OFF: usize = 263;
-const UNAME_OFF: usize = 265;
-const GNAME_OFF: usize = 297;
-const PREFIX_OFF: usize = 345;
+pub(crate) const NAME_OFF: usize = 0;
+pub(crate) const MODE_OFF: usize = 100;
+pub(crate) const UID_OFF: usize = 108;
+pub(crate) const GID_OFF: usize = 116;
+pub(crate) const SIZE_OFF: usize = 124;
+pub(crate) const MTIME_OFF: usize = 136;
+pub(crate) const CHKSUM_OFF: usize = 148;
+pub(crate) const TYPEFLAG_OFF: usize = 156;
+pub(crate) const LINKNAME_OFF: usize = 157;
+pub(crate) const MAGIC_OFF: usize = 257;
+pub(crate) const VERSION_OFF: usize = 263;
+pub(crate) const UNAME_OFF: usize = 265;
+pub(crate) const GNAME_OFF: usize = 297;
+pub(crate) const PREFIX_OFF: usize = 345;
 
 // Type flags
-const REGTYPE: u8 = b'0';
+pub(crate) const REGTYPE: u8 = b'0';
 const AREGTYPE: u8 = b'\0';
-const LNKTYPE: u8 = b'1';
-const SYMTYPE: u8 = b'2';
-const CHRTYPE: u8 = b'3';
-const BLKTYPE: u8 = b'4';
-const DIRTYPE: u8 = b'5';
-const FIFOTYPE: u8 = b'6';
+pub(crate) const LNKTYPE: u8 = b'1';
+pub(crate) const SYMTYPE: u8 = b'2';
+pub(crate) const CHRTYPE: u8 = b'3';
+pub(crate) const BLKTYPE: u8 = b'4';
+pub(crate) const DIRTYPE: u8 = b'5';
+pub(crate) const FIFOTYPE: u8 = b'6';
 const CONTTYPE: u8 = b'7';
 
 // Device number field offsets and lengths
-const DEVMAJOR_OFF: usize = 329;
-const DEVMINOR_OFF: usize = 337;
+pub(crate) const DEVMAJOR_OFF: usize = 329;
+pub(crate) const DEVMINOR_OFF: usize = 337;
 
 /// ustar archive reader
 pub struct UstarReader<R: Read> {
@@ -315,8 +322,8 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
         );
     }
 
-    let uname = parse_string(&header[UNAME_OFF..UNAME_OFF + UNAME_LEN]);
-    let gname = parse_string(&header[GNAME_OFF..GNAME_OFF + GNAME_LEN]);
+    let uname = name_field(&header[UNAME_OFF..UNAME_OFF + UNAME_LEN]);
+    let gname = name_field(&header[GNAME_OFF..GNAME_OFF + GNAME_LEN]);
 
     // Parse device major/minor for block/char devices
     let devmajor = parse_octal(&header[DEVMAJOR_OFF..DEVMAJOR_OFF + 8])? as u32;
@@ -331,10 +338,37 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
         mtime,
         entry_type,
         link_target,
-        uname: if uname.is_empty() { None } else { Some(uname) },
-        gname: if gname.is_empty() { None } else { Some(gname) },
+        uname: if uname.is_empty() {
+            None
+        } else {
+            Some(uname.to_vec())
+        },
+        gname: if gname.is_empty() {
+            None
+        } else {
+            Some(gname.to_vec())
+        },
         devmajor,
         devminor,
+        // ustar has no link-count field, and `Default` would leave this 0 --
+        // a member with no names at all, which `pax -v` then printed. A
+        // member that exists has at least one name; cpio's `header_nlink`
+        // floors the same field for the same reason.
+        nlink: 1,
+        // Kept only so `-o listopt=%(magic)s` and the other three can report
+        // what this header actually held. The checksum is read leniently
+        // because `multivolume::read_entry` parses a header without verifying
+        // it first, and a junk field there must not newly fail the read.
+        source_header: Some(SourceHeader::Ustar {
+            magic: header[MAGIC_OFF..MAGIC_OFF + MAGIC_LEN]
+                .try_into()
+                .expect("slice of MAGIC_LEN"),
+            version: header[VERSION_OFF..VERSION_OFF + VERSION_LEN]
+                .try_into()
+                .expect("slice of VERSION_LEN"),
+            chksum: parse_octal(&header[CHKSUM_OFF..CHKSUM_OFF + 8]).unwrap_or(0),
+            typeflag,
+        }),
         ..Default::default()
     })
 }
@@ -360,6 +394,22 @@ pub(crate) fn parse_string(bytes: &[u8]) -> String {
 pub(crate) fn path_field(bytes: &[u8]) -> &[u8] {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     &bytes[..end]
+}
+
+/// The value of a user or group name field (uname, gname), as bytes.
+///
+/// POSIX makes these NUL-terminated character strings, and historical writers
+/// space-pad them, so both delimit the value -- which is what `parse_string`
+/// has always done for these two fields. Bytes rather than a `String` because
+/// under `hdrcharset=BINARY` a name is the underlying system's bytes and need
+/// not decode.
+pub(crate) fn name_field(bytes: &[u8]) -> &[u8] {
+    let value = path_field(bytes);
+    let end = value
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(0, |i| i + 1);
+    &value[..end]
 }
 
 /// Parse an octal number from bytes
@@ -672,10 +722,10 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
 
     // uname and gname
     if let Some(ref uname) = entry.uname {
-        write_field(&mut header[UNAME_OFF..], uname.as_bytes(), UNAME_LEN);
+        write_field(&mut header[UNAME_OFF..], uname, UNAME_LEN);
     }
     if let Some(ref gname) = entry.gname {
-        write_field(&mut header[GNAME_OFF..], gname.as_bytes(), GNAME_LEN);
+        write_field(&mut header[GNAME_OFF..], gname, GNAME_LEN);
     }
 
     // Device major/minor (always written for POSIX compliance)
@@ -719,14 +769,20 @@ pub(crate) fn ustar_path_bytes(entry: &ArchiveEntry) -> Vec<u8> {
 /// header record and leaves these fields as a fallback for readers that ignore
 /// it.
 pub(crate) fn try_split_path(path: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    split_name_prefix(path).map(|(name, prefix)| (name.to_vec(), prefix.to_vec()))
+}
+
+/// The same split, as borrowed halves, for a caller that only needs to look at
+/// them -- `-o listopt=%(name)s` and `%(prefix)s`.
+pub(crate) fn split_name_prefix(path: &[u8]) -> Option<(&[u8], &[u8])> {
     if path.len() <= NAME_LEN {
-        return Some((path.to_vec(), Vec::new()));
+        return Some((path, b""));
     }
 
     // Split at the highest '/' that leaves a name of at most NAME_LEN bytes.
     for i in (1..=PREFIX_LEN.min(path.len().saturating_sub(1))).rev() {
         if path[i] == b'/' && path.len() - (i + 1) <= NAME_LEN {
-            return Some((path[i + 1..].to_vec(), path[..i].to_vec()));
+            return Some((&path[i + 1..], &path[..i]));
         }
     }
 
@@ -812,6 +868,22 @@ fn skip_bytes<R: Read>(reader: &mut R, count: u64) -> PaxResult<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// uname and gname are bytes now, so they stop going through
+    /// `parse_string`. `name_field` has to keep its delimiting: POSIX
+    /// NUL-terminates these fields and historical writers space-pad them, so
+    /// both end the value -- and a byte that does not decode has to survive,
+    /// which is the whole point of the change.
+    #[test]
+    fn test_name_field_delimiters() {
+        assert_eq!(name_field(b"root\0\0\0\0"), b"root");
+        assert_eq!(name_field(b"root    "), b"root");
+        assert_eq!(name_field(b"root \0  "), b"root");
+        assert_eq!(name_field(b"        "), b"");
+        assert_eq!(name_field(b"\0root"), b"");
+        // Not UTF-8, and preserved rather than replaced.
+        assert_eq!(name_field(b"gr\xffup\0"), b"gr\xffup");
+    }
 
     #[test]
     fn test_parse_octal() {

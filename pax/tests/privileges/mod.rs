@@ -433,3 +433,56 @@ fn test_priv_suid_preserved_with_owner() {
         mode
     );
 }
+
+/// POSIX, ustar Interchange Format: "the user and group databases shall be
+/// scanned for these names. If found, the user and group IDs contained within
+/// these files shall be used rather than the values contained within the uid
+/// and gid fields."
+///
+/// Extraction chowned by the numeric fields alone. This is observable without
+/// root because the names here resolve to the caller's own ids, which it may
+/// set, while the numeric fields are an account it may not: unfixed, `-p o`
+/// hits EPERM, diagnoses "cannot change owner" and exits non-zero.
+#[cfg(unix)]
+#[test]
+fn test_priv_owner_name_overrides_the_numeric_id() {
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+    // A uid with no database entry leaves nothing to assert.
+    let (Some(user), Some(group)) = (plib::user::get_by_uid(euid), plib::group::get_by_gid(egid))
+    else {
+        return;
+    };
+
+    let archive = Ustar {
+        name: b"owned.txt",
+        body: b"x\n",
+        // An account this caller certainly cannot become.
+        uid: 0o7654321,
+        gid: 0o7654321,
+        uname: user.name.as_bytes(),
+        gname: group.name.as_bytes(),
+        ..Default::default()
+    }
+    .archive();
+
+    let temp = TempDir::new().unwrap();
+    let dst = temp.path().join("dest");
+    fs::create_dir(&dst).unwrap();
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r", "-p", "o"], &archive, &dst);
+    assert_success(&output, "extract with -p o");
+    assert!(
+        !stderr_str(&output).contains("cannot change owner"),
+        "the recorded names resolve to ids the caller may set, so nothing \
+         should have been refused: {}",
+        stderr_str(&output)
+    );
+
+    let meta = fs::metadata(dst.join("owned.txt")).unwrap();
+    assert_eq!(
+        (meta.uid(), meta.gid()),
+        (euid, egid),
+        "uname and gname must override the numeric uid and gid fields"
+    );
+}

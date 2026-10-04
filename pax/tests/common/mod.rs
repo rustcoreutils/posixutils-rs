@@ -303,6 +303,22 @@ pub struct Ustar<'a> {
     pub linkname: &'a [u8],
     pub mode: u32,
     pub body: &'a [u8],
+    /// The `prefix` field (offset 345). A member whose pathname needs more
+    /// than the 100-byte `name` field carries the leading components here,
+    /// joined back with a `/` on read.
+    pub prefix: &'a [u8],
+    /// `devmajor`/`devminor` (329, 337). Only a block or character special
+    /// member uses them, and writing one by hand is how a test reaches the
+    /// device keywords without `mknod` and therefore without root.
+    pub devmajor: u32,
+    pub devminor: u32,
+    /// `uid`/`gid` (108, 116) and `uname`/`gname` (265, 297). Settable so a
+    /// test can make the names disagree with the numbers, which is the state
+    /// an archive carried between hosts arrives in.
+    pub uid: u32,
+    pub gid: u32,
+    pub uname: &'a [u8],
+    pub gname: &'a [u8],
     /// What to write in the size field. `None` writes `body.len()`, which is
     /// what a well-formed member has; `Some` is how a fixture makes the header
     /// lie about how much data follows.
@@ -317,6 +333,13 @@ impl Default for Ustar<'_> {
             linkname: b"",
             mode: 0o644,
             body: b"",
+            prefix: b"",
+            devmajor: 0,
+            devminor: 0,
+            uid: 0,
+            gid: 0,
+            uname: b"",
+            gname: b"",
             size: None,
         }
     }
@@ -329,8 +352,8 @@ impl Ustar<'_> {
         let mut h = [0u8; BLOCK];
         h[..self.name.len()].copy_from_slice(self.name);
         h[100..108].copy_from_slice(format!("{:07o}\0", self.mode).as_bytes());
-        h[108..116].copy_from_slice(b"0000000\0"); // uid
-        h[116..124].copy_from_slice(b"0000000\0"); // gid
+        h[108..116].copy_from_slice(format!("{:07o}\0", self.uid).as_bytes());
+        h[116..124].copy_from_slice(format!("{:07o}\0", self.gid).as_bytes());
         let size = self.size.unwrap_or(self.body.len() as u64);
         h[124..136].copy_from_slice(format!("{:011o}\0", size).as_bytes());
         h[136..148].copy_from_slice(b"00000000000\0"); // mtime
@@ -339,6 +362,11 @@ impl Ustar<'_> {
         h[157..157 + self.linkname.len()].copy_from_slice(self.linkname);
         h[257..263].copy_from_slice(b"ustar\0");
         h[263..265].copy_from_slice(b"00");
+        h[329..337].copy_from_slice(format!("{:07o}\0", self.devmajor).as_bytes());
+        h[337..345].copy_from_slice(format!("{:07o}\0", self.devminor).as_bytes());
+        h[265..265 + self.uname.len()].copy_from_slice(self.uname);
+        h[297..297 + self.gname.len()].copy_from_slice(self.gname);
+        h[345..345 + self.prefix.len()].copy_from_slice(self.prefix);
 
         let sum: u32 = h.iter().map(|&b| b as u32).sum();
         h[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
@@ -443,6 +471,11 @@ pub struct CpioNewc<'a> {
     pub namesize: Option<u32>,
     /// `c_filesize`. `None` writes `body.len()`.
     pub filesize: Option<u32>,
+    /// `c_ino`, `c_nlink` and `c_mtime`. Settable so a test can tell the
+    /// fields apart in a listing instead of reading four identical ones.
+    pub ino: u32,
+    pub nlink: u32,
+    pub mtime: u32,
 }
 
 impl Default for CpioNewc<'_> {
@@ -453,6 +486,9 @@ impl Default for CpioNewc<'_> {
             body: b"",
             namesize: None,
             filesize: None,
+            ino: 1,
+            nlink: 1,
+            mtime: 0,
         }
     }
 }
@@ -462,12 +498,12 @@ impl CpioNewc<'_> {
     pub fn member(&self) -> Vec<u8> {
         let mut out = b"070701".to_vec();
         for v in [
-            1u32,                                                // c_ino
+            self.ino,                                            // c_ino
             self.mode,                                           // c_mode
             0,                                                   // c_uid
             0,                                                   // c_gid
-            1,                                                   // c_nlink
-            0,                                                   // c_mtime
+            self.nlink,                                          // c_nlink
+            self.mtime,                                          // c_mtime
             self.filesize.unwrap_or(self.body.len() as u32),     // c_filesize
             0,                                                   // c_devmajor
             0,                                                   // c_devminor
@@ -489,6 +525,19 @@ impl CpioNewc<'_> {
         while !out.len().is_multiple_of(4) {
             out.push(0);
         }
+        out
+    }
+
+    /// A complete one-member archive, closed by cpio's `TRAILER!!!` member.
+    pub fn archive(&self) -> Vec<u8> {
+        let mut out = self.member();
+        out.extend_from_slice(
+            &CpioNewc {
+                name: b"TRAILER!!!",
+                ..Default::default()
+            }
+            .member(),
+        );
         out
     }
 }

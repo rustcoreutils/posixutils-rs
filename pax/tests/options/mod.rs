@@ -1475,3 +1475,693 @@ fn listopt_with(archive: &std::path::Path, format: &str, extra: &[&str]) -> Stri
     assert_success(&out, "pax list with listopt");
     stdout_str(&out).trim_end().to_string()
 }
+
+/// The listopt format string for `archive`, which is given on stdin.
+///
+/// Hand-built fixtures reach fields a real write cannot set without root (a
+/// device's major and minor) or without a 100-byte-plus pathname (`prefix`),
+/// and pin the header-identity fields exactly.
+fn listopt_bytes(archive: &[u8], format: &str) -> String {
+    let out = run_pax_with_stdin_bytes(&["-o", &format!("listopt={}", format)], archive);
+    assert_success(&out, "pax list with listopt");
+    stdout_str(&out).trim_end().to_string()
+}
+
+/// POSIX listopt rule 7 requires every Field Name entry of the ustar Header
+/// Block table as a `%(keyword)`. `magic`, `version`, `typeflag` and `chksum`
+/// were echoed back as their own specification, because `parse_header`
+/// discarded all four.
+#[test]
+fn test_option_listopt_ustar_header_identity_keywords() {
+    let member = Ustar {
+        name: b"hdr.txt",
+        body: b"hi\n",
+        ..Default::default()
+    };
+    let archive = member.archive();
+
+    // The fixture computes its own checksum, so read the expectation out of
+    // the header it built rather than hard-coding a sum of its bytes.
+    let header = member.header();
+    let field = std::str::from_utf8(&header[148..154]).unwrap();
+    let stored = u32::from_str_radix(field, 8).expect("octal chksum field");
+
+    assert_eq!(
+        listopt_bytes(&archive, "%(magic)s|%(version)s|%(typeflag)s|%(chksum)s"),
+        format!("ustar|00|0|{:o}", stored),
+        "every ustar header-identity field must report what the header stored"
+    );
+}
+
+/// Rule 7 admits `devmajor` and `devminor`, which `ListEntryInfo` already
+/// carried for `%D` and which no keyword could reach. A hand-built character
+/// special member gets there without `mknod`, so without root.
+#[test]
+fn test_option_listopt_device_keywords_need_no_privileges() {
+    let archive = Ustar {
+        name: b"chr",
+        typeflag: b'3',
+        devmajor: 8,
+        devminor: 0,
+        ..Default::default()
+    }
+    .archive();
+
+    assert_eq!(
+        listopt_bytes(&archive, "%(devmajor)s,%(devminor)s %D %M"),
+        "8,0 8,0 crw-r--r--",
+        "the device keywords must agree with the %D conversion"
+    );
+}
+
+/// A pathname too long for the 100-byte `name` field lives in both halves of
+/// the ustar spelling, and rule 11 makes `(prefix,name)` the fallback `%F`
+/// uses -- so the halves have to rebuild exactly what `%F` prints.
+#[test]
+fn test_option_listopt_prefix_and_name_rebuild_the_path() {
+    let prefix = vec![b'd'; 110];
+    let archive = Ustar {
+        name: b"deep.txt",
+        prefix: &prefix,
+        body: b"x\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let dir = String::from_utf8(prefix).unwrap();
+    assert_eq!(
+        listopt_bytes(&archive, "%(prefix)s|%(name)s"),
+        format!("{dir}|deep.txt")
+    );
+    assert_eq!(
+        listopt_bytes(&archive, "%(prefix)s/%(name)s"),
+        listopt_bytes(&archive, "%F"),
+        "the two halves must reconstruct the pathname the listing reports"
+    );
+}
+
+/// `name` is derived from the pathname the listing reports, not read back from
+/// the stored field, so it follows the rewrites list mode applies first. A
+/// stored value would disagree with `%F` on the same line.
+#[test]
+fn test_option_listopt_name_follows_a_path_rewrite() {
+    let archive = Ustar {
+        name: b"before.txt",
+        body: b"x\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let out = run_pax_with_stdin_bytes(
+        &[
+            "-s",
+            ",^before.txt$,after.txt,",
+            "-o",
+            "listopt=%(name)s|%F",
+        ],
+        &archive,
+    );
+    assert_success(&out, "listopt with -s");
+    assert_eq!(stdout_str(&out).trim_end(), "after.txt|after.txt");
+}
+
+/// POSIX listopt rule 7 requires every Field Name entry of the Octet-Oriented
+/// cpio Archive Entry table as a `%(keyword)`, and permits the same names
+/// without the leading `c_`. None of them resolved; all were echoed back.
+#[test]
+fn test_option_listopt_cpio_keywords() {
+    let archive = CpioNewc {
+        name: b"c.txt",
+        body: b"hello\n",
+        ino: 7,
+        nlink: 2,
+        mtime: 99,
+        ..Default::default()
+    }
+    .archive();
+
+    assert_eq!(
+        listopt_bytes(
+            &archive,
+            "%(c_magic)s|%(c_ino)s|%(c_mode)s|%(c_nlink)s|%(c_mtime)s|\
+             %(c_namesize)s|%(c_filesize)s|%(c_name)s|%(c_rdev)s"
+        ),
+        "070701|7|100644|2|99|6|6|c.txt|0"
+    );
+
+    // The unprefixed spellings rule 7 permits report the same values.
+    assert_eq!(
+        listopt_bytes(
+            &archive,
+            "%(ino)s|%(nlink)s|%(namesize)s|%(filesize)s|%(rdev)s"
+        ),
+        "7|2|6|6|0"
+    );
+
+    // A cpio header has no typeflag, version or chksum, so those report
+    // nothing -- while a name in no table still echoes, so a typo is visible.
+    assert_eq!(
+        listopt_bytes(&archive, "[%(typeflag)s%(version)s%(chksum)s]%(c_bogus)s"),
+        "[]%(c_bogus)s"
+    );
+    // And a ustar member has no c_magic, while the unprefixed `magic` -- the
+    // ustar table's own name -- answers from whichever header it came from.
+    let tar = Ustar {
+        name: b"t.txt",
+        ..Default::default()
+    }
+    .archive();
+    assert_eq!(listopt_bytes(&tar, "[%(c_magic)s]|%(magic)s"), "[]|ustar");
+}
+
+/// The same keywords over an archive pax wrote itself, in the ODC format
+/// POSIX defines and `-x cpio` selects.
+#[test]
+fn test_option_listopt_cpio_odc_keywords_round_trip() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.cpio");
+
+    fs::create_dir(&src_dir).unwrap();
+    fs::write(src_dir.join("odc.txt"), b"12345").unwrap();
+
+    run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "cpio",
+            "-f",
+            archive.to_str().unwrap(),
+            "odc.txt",
+        ],
+        &src_dir,
+    );
+
+    let out = run_pax(&[
+        "-f",
+        archive.to_str().unwrap(),
+        "-o",
+        "listopt=%(c_magic)s|%(c_mode)s|%(c_nlink)s|%(c_namesize)s|%(c_filesize)s|%(c_name)s",
+    ]);
+    assert_success(&out, "list an ODC archive with the cpio keywords");
+    assert_eq!(
+        stdout_str(&out).trim_end(),
+        "070707|100644|1|8|5|odc.txt",
+        "the POSIX ODC format identifies itself with 070707"
+    );
+
+    // c_ino comes from the file's own inode, so pin its shape rather than a
+    // value: what matters is that the keyword resolves to a number.
+    let ino = listopt(&archive, "%(c_ino)s");
+    assert!(
+        !ino.is_empty() && ino.bytes().all(|b| b.is_ascii_digit()),
+        "%(c_ino)s must report the recorded inode (got {:?})",
+        ino
+    );
+}
+
+/// cpio stores a symbolic link's target as the member's data, so c_filesize
+/// counts the target while the pax `size` keyword reports the entry's own
+/// zero. The two keywords name different fields and must not be aliases.
+#[cfg(unix)]
+#[test]
+fn test_option_listopt_cpio_symlink_filesize() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("link.cpio");
+
+    fs::create_dir(&src_dir).unwrap();
+    std::os::unix::fs::symlink("target", src_dir.join("l")).unwrap();
+
+    run_pax_in_dir(
+        &["-w", "-x", "cpio", "-f", archive.to_str().unwrap(), "l"],
+        &src_dir,
+    );
+
+    let out = run_pax(&[
+        "-f",
+        archive.to_str().unwrap(),
+        "-o",
+        "listopt=%(size)s|%(c_filesize)s|%(linkname)s",
+    ]);
+    assert_success(&out, "list a cpio symlink");
+    assert_eq!(stdout_str(&out).trim_end(), "0|6|target");
+
+    // c_mode carries the file type over the permission bits. Only the type is
+    // asserted: a symbolic link's permissions are 0777 on Linux and 0755 on
+    // macOS, and neither is this keyword's business.
+    let octal = |format: &str| {
+        let text = listopt(&archive, format);
+        u32::from_str_radix(&text, 8).unwrap_or_else(|_| panic!("{format} gave {text:?}"))
+    };
+    assert_eq!(
+        octal("%(c_mode)s"),
+        0o120000 | octal("%(mode)s"),
+        "%(c_mode)s must be S_IFLNK over the permission bits %(mode)s reports"
+    );
+}
+
+/// POSIX rule 7 requires every pax extended-header keyword, and names
+/// `"%(charset)s"` as its own example. The reader dropped `charset`,
+/// `hdrcharset`, `comment` and every implementation extension on the way to
+/// the entry, so the listing had nothing to report and echoed the request.
+#[test]
+fn test_option_listopt_pax_extended_header_records() {
+    let records = [
+        pax_record("charset", b"ISO-IR 10646 2000 UTF-8"),
+        pax_record("comment", b"hi there"),
+        pax_record("hdrcharset", b"BINARY"),
+        pax_record("SCHILY.fflags", b"nodump"),
+    ]
+    .concat();
+    let archive = archive_with_ext_records(&records);
+
+    assert_eq!(
+        listopt_bytes(
+            &archive,
+            "%(charset)s|%(comment)s|%(hdrcharset)s|%(SCHILY.fflags)s"
+        ),
+        "ISO-IR 10646 2000 UTF-8|hi there|BINARY|nodump"
+    );
+}
+
+/// A member that declared none of them reports nothing rather than echoing the
+/// request, because the keywords are POSIX's whether or not this archive used
+/// them -- and rather than POSIX's implicit UTF-8 default, which would make
+/// "declared UTF-8" and "declared nothing" indistinguishable.
+#[test]
+fn test_option_listopt_pax_records_absent_renders_empty() {
+    let archive = Ustar {
+        name: b"plain.txt",
+        body: b"x\n",
+        ..Default::default()
+    }
+    .archive();
+
+    assert_eq!(
+        listopt_bytes(&archive, "[%(charset)s%(hdrcharset)s%(comment)s]"),
+        "[]"
+    );
+    // While a name in no table at all keeps the literal echo.
+    assert_eq!(
+        listopt_bytes(&archive, "%(nosuchkeyword)s"),
+        "%(nosuchkeyword)s"
+    );
+}
+
+/// A global `g` header applies to every following member, and `-o
+/// keyword=value` writes one. The record has to survive the round trip into
+/// the listing, which is the whole path from the option parser through the
+/// writer's global header and back out of the reader.
+#[test]
+fn test_option_listopt_global_comment_record_round_trips() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("global.pax");
+
+    fs::create_dir(&src_dir).unwrap();
+    fs::write(src_dir.join("g.txt"), b"x").unwrap();
+
+    run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-o",
+            "comment=written for the test",
+            "-f",
+            archive.to_str().unwrap(),
+            "g.txt",
+        ],
+        &src_dir,
+    );
+
+    assert_eq!(listopt(&archive, "%(comment)s"), "written for the test");
+}
+
+/// `-o keyword:=value` forces a record for each member, and `-o delete=`
+/// removes one -- the listing must follow both, as it already does for the
+/// keywords that map onto an entry field.
+#[cfg(unix)]
+#[test]
+fn test_option_listopt_record_override_and_delete() {
+    let records = [pax_record("charset", b"BINARY")].concat();
+    let archive_bytes = archive_with_ext_records(&records);
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("rec.pax");
+    fs::write(&archive, &archive_bytes).unwrap();
+
+    assert_eq!(listopt(&archive, "%(charset)s"), "BINARY");
+    assert_eq!(
+        listopt_with(&archive, "%(charset)s", &["-o", "charset:=ISO-IR 646 1990"]),
+        "ISO-IR 646 1990",
+        "-o keyword:=value must force the value the listing reports"
+    );
+    assert_eq!(
+        listopt_with(&archive, "[%(charset)s]", &["-o", "delete=charset"]),
+        "[]",
+        "-o delete= must remove the record from the listing too"
+    );
+}
+
+/// POSIX rule 11 makes `(prefix,name)` the `%F` default for a member with no
+/// `path` record, and the <comma>-separated keyword list was not parsed at
+/// all: the whole specification echoed back.
+#[test]
+fn test_option_listopt_f_conversion_concatenates_keywords() {
+    let prefix = vec![b'd'; 110];
+    let archive = Ustar {
+        name: b"deep.txt",
+        prefix: &prefix,
+        body: b"x\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let dir = String::from_utf8(prefix).unwrap();
+    assert_eq!(
+        listopt_bytes(&archive, "%(prefix,name)F"),
+        format!("{dir}/deep.txt")
+    );
+    assert_eq!(
+        listopt_bytes(&archive, "%(prefix,name)F"),
+        listopt_bytes(&archive, "%F"),
+        "rule 11's default must rebuild exactly the pathname %F prints"
+    );
+}
+
+/// POSIX rule 12: `%L` expands a symbolic link to `"%s -> %s"` of the pathname
+/// and the link's contents, and is the equivalent of `%F` for anything else.
+/// Bare `%L` had no handler and printed itself.
+#[cfg(unix)]
+#[test]
+fn test_option_listopt_l_conversion_expands_a_symlink() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("l.tar");
+
+    fs::create_dir(&src_dir).unwrap();
+    fs::write(src_dir.join("real.txt"), b"x").unwrap();
+    std::os::unix::fs::symlink("real.txt", src_dir.join("alias")).unwrap();
+
+    run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "ustar",
+            "-f",
+            archive.to_str().unwrap(),
+            "alias",
+            "real.txt",
+        ],
+        &src_dir,
+    );
+
+    let listing = listopt(&archive, "%L");
+    let lines: Vec<&str> = listing.lines().collect();
+    assert!(
+        lines.contains(&"alias -> real.txt"),
+        "a symbolic link must expand to `name -> contents`: {:?}",
+        lines
+    );
+    assert!(
+        lines.contains(&"real.txt"),
+        "and anything else must render as %F does: {:?}",
+        lines
+    );
+}
+
+/// `-o hdrcharset=` has to be checked and still reach the archive. Validating
+/// it by intercepting the keyword would stop the extended-header record being
+/// written at all, which is the trap this pins.
+#[test]
+fn test_option_hdrcharset_is_checked_and_still_recorded() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    fs::create_dir(&src_dir).unwrap();
+    fs::write(src_dir.join("h.txt"), b"x").unwrap();
+
+    // A name pax cannot encode to is refused before anything is written.
+    let out = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-o",
+            "hdrcharset=ISO-8859-1",
+            "-f",
+            temp.path().join("bad.pax").to_str().unwrap(),
+            "h.txt",
+        ],
+        &src_dir,
+    );
+    assert_failure(&out, "an unsupported hdrcharset must be refused");
+    assert!(
+        stderr_str(&out).contains("BINARY"),
+        "the refusal must name the supported values: {}",
+        stderr_str(&out)
+    );
+
+    // POSIX's spelling contains spaces, which the comma tokenizer must not
+    // mangle, and the record has to end up in the archive.
+    for (given, recorded) in [
+        ("binary", "hdrcharset=BINARY"),
+        (
+            "ISO-IR 10646 2000 UTF-8",
+            "hdrcharset=ISO-IR 10646 2000 UTF-8",
+        ),
+    ] {
+        let archive = temp.path().join("ok.pax");
+        assert_success(
+            &run_pax_in_dir(
+                &[
+                    "-w",
+                    "-x",
+                    "pax",
+                    "-o",
+                    &format!("hdrcharset={given}"),
+                    "-f",
+                    archive.to_str().unwrap(),
+                    "h.txt",
+                ],
+                &src_dir,
+            ),
+            given,
+        );
+
+        let bytes = fs::read(&archive).unwrap();
+        assert!(
+            bytes
+                .windows(recorded.len())
+                .any(|w| w == recorded.as_bytes()),
+            "`-o hdrcharset={given}' must record {recorded:?} in the archive"
+        );
+        assert_eq!(
+            listopt(&archive, "%(hdrcharset)s"),
+            recorded.trim_start_matches("hdrcharset="),
+            "and the listing must report it"
+        );
+    }
+}
+
+/// Under `-o hdrcharset=BINARY` the `path` record is what carries a name's
+/// bytes, so POSIX requires one for any non-ASCII name even when the ustar
+/// fields could hold it: RATIONALE, "an extended header path record is always
+/// required to be generated if the prefix or name fields contain non-ASCII
+/// characters even when hdrcharset=binary is also in effect for that file."
+///
+/// The option had no effect on the write path at all, so such a member was
+/// written with its name only in the ustar field, under a header declaring an
+/// encoding that field was not in.
+#[test]
+fn test_option_hdrcharset_binary_forces_a_path_record() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    fs::create_dir(&src_dir).unwrap();
+    // Short, and valid UTF-8: the ustar name field could hold it, so nothing
+    // but the operator's request makes a record necessary.
+    fs::write(src_dir.join("élan.txt"), b"x").unwrap();
+    fs::write(src_dir.join("plain.txt"), b"y").unwrap();
+
+    let write = |archive: &std::path::Path, extra: &[&str]| {
+        let mut args = vec!["-w", "-x", "pax"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["-f", archive.to_str().unwrap(), "élan.txt", "plain.txt"]);
+        assert_success(&run_pax_in_dir(&args, &src_dir), "write a pax archive");
+        fs::read(archive).unwrap()
+    };
+
+    let path_records = |bytes: &[u8]| bytes.windows(5).filter(|w| *w == b"path=").count();
+
+    // Without the option, a short UTF-8 name needs no record.
+    let plain = write(&temp.path().join("plain.pax"), &[]);
+    assert_eq!(
+        path_records(&plain),
+        0,
+        "a representable name must not get a path record on its own"
+    );
+
+    // With it, the non-ASCII name gets one -- and only that one.
+    let binary = write(
+        &temp.path().join("binary.pax"),
+        &["-o", "hdrcharset=BINARY"],
+    );
+    assert_eq!(
+        path_records(&binary),
+        1,
+        "-o hdrcharset=BINARY must force a path record for the non-ASCII name"
+    );
+    assert!(
+        binary.windows(14).any(|w| w == "path=élan.txt".as_bytes()),
+        "and the record must carry the name's bytes"
+    );
+
+    // The charset itself is announced once, as a global record, rather than
+    // repeated in every member's extended header.
+    assert_eq!(
+        binary
+            .windows(18)
+            .filter(|w| *w == b"hdrcharset=BINARY\n")
+            .count(),
+        1,
+        "the declared charset belongs in one global record"
+    );
+    // And it reaches the listing for every member it governs.
+    let listing = run_pax(&[
+        "-f",
+        temp.path().join("binary.pax").to_str().unwrap(),
+        "-o",
+        "listopt=%(hdrcharset)s",
+    ]);
+    assert_success(&listing, "list the BINARY archive");
+    assert!(
+        stdout_str(&listing).lines().all(|l| l == "BINARY"),
+        "a global hdrcharset governs every member: {:?}",
+        stdout_str(&listing)
+    );
+}
+
+/// `hdrcharset=BINARY` says the gname, linkpath, path and uname records "are
+/// unencoded binary data from the underlying system". path and linkpath were
+/// already carried as bytes; uname and gname went through from_utf8_lossy, so
+/// a group name with a high byte came back as U+FFFD -- irreversibly, and
+/// under a header declaring the bytes had been preserved.
+#[test]
+fn test_option_listopt_binary_group_name_round_trips() {
+    let records = [
+        pax_record("hdrcharset", b"BINARY"),
+        pax_record("gname", b"gr\xffup"),
+        pax_record("uname", b"us\xfer"),
+    ]
+    .concat();
+    let archive = archive_with_ext_records(&records);
+
+    let out = run_pax_with_stdin_bytes(&["-o", "listopt=%(uname)s:%(gname)s"], &archive);
+    assert_success(&out, "list a BINARY member");
+    assert_eq!(
+        out.stdout, b"us\xfer:gr\xffup\n",
+        "a BINARY uname and gname must reach the listing byte for byte"
+    );
+}
+
+/// Every `%(keyword)` POSIX rule 7 requires must resolve to a value.
+///
+/// A keyword this implementation does not know is echoed back as its own
+/// specification (`options.rs` `KeywordValue::Unknown`), so a listing that
+/// still contains `%(` is exactly the reported bug: the ustar header field
+/// names, the whole cpio set with and without the `c_` prefix, and the pax
+/// `charset`/`hdrcharset` records all came back literally.
+///
+/// Rule 7 admits a keyword the member's format has no field for -- the value
+/// is then "the value from the applicable header field", of which there is
+/// none -- so this asserts only that the specification is consumed, not that
+/// it produced text. The per-keyword values are pinned by the tests below.
+#[test]
+fn test_option_listopt_posix_rule7_keywords_all_resolve() {
+    // Every Field Name entry in POSIX's ustar Header Block table.
+    const USTAR: &[&str] = &[
+        "name", "mode", "uid", "gid", "size", "mtime", "chksum", "typeflag", "linkname", "magic",
+        "version", "uname", "gname", "devmajor", "devminor", "prefix",
+    ];
+    // Every Field Name entry in its Octet-Oriented cpio Archive Entry table,
+    // which rule 7 also permits without the leading `c_`.
+    const CPIO: &[&str] = &[
+        "c_magic",
+        "c_dev",
+        "c_ino",
+        "c_mode",
+        "c_uid",
+        "c_gid",
+        "c_nlink",
+        "c_rdev",
+        "c_mtime",
+        "c_namesize",
+        "c_filesize",
+        "c_name",
+        "dev",
+        "ino",
+        "nlink",
+        "rdev",
+        "namesize",
+        "filesize",
+    ];
+    // Every keyword defined for the pax extended header.
+    const PAX: &[&str] = &[
+        "atime",
+        "charset",
+        "comment",
+        "gid",
+        "gname",
+        "hdrcharset",
+        "linkpath",
+        "mtime",
+        "path",
+        "size",
+        "uid",
+        "uname",
+    ];
+
+    let ustar = Ustar {
+        name: b"f.txt",
+        body: b"hi\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let mut cpio = CpioNewc {
+        name: b"f.txt",
+        body: b"hi\n",
+        ..Default::default()
+    }
+    .member();
+    cpio.extend_from_slice(
+        &CpioNewc {
+            name: b"TRAILER!!!",
+            ..Default::default()
+        }
+        .member(),
+    );
+
+    for (format_name, archive) in [("ustar", &ustar), ("cpio", &cpio)] {
+        for keyword in USTAR.iter().chain(CPIO).chain(PAX) {
+            let listopt = format!("listopt=%({})s", keyword);
+            let out = run_pax_with_stdin_bytes(&["-o", &listopt], archive);
+            assert_success(&out, &listopt);
+            let listing = stdout_str(&out);
+            assert!(
+                !listing.contains("%("),
+                "%({})s must resolve in a {} archive rather than echo back \
+                 (got {:?})",
+                keyword,
+                format_name,
+                listing
+            );
+        }
+    }
+
+    // ... while a name in none of those tables keeps the literal echo, which is
+    // how an operator sees a typo instead of a silently empty column.
+    let out = run_pax_with_stdin_bytes(&["-o", "listopt=%(bogus)s"], &ustar);
+    assert_success(&out, "listopt=%(bogus)s");
+    assert_eq!(stdout_str(&out).trim_end(), "%(bogus)s");
+}

@@ -48,7 +48,7 @@
 //! Followed by filename padded to 4-byte boundary,
 //! then file data padded to 4-byte boundary.
 
-use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
+use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType, SourceHeader};
 use crate::error::{is_eof_error, PaxError, PaxResult};
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -92,6 +92,18 @@ impl CpioFormat {
             CpioFormat::Odc => 1,
             CpioFormat::Newc | CpioFormat::NewcCrc => 4,
             CpioFormat::Binary => 2,
+        }
+    }
+
+    /// The `c_magic` value this flavor identifies itself with, which is what
+    /// `-o listopt=%(c_magic)s` reports. ODC and the old binary format share
+    /// "070707"; they differ in how the rest of the header is encoded, not in
+    /// the magic.
+    pub(crate) fn magic_str(self) -> &'static str {
+        match self {
+            CpioFormat::Odc | CpioFormat::Binary => "070707",
+            CpioFormat::Newc => "070701",
+            CpioFormat::NewcCrc => "070702",
         }
     }
 
@@ -185,7 +197,7 @@ impl<R: Read> ArchiveReader for CpioReader<R> {
         let is_binary = magic16_le == BIN_MAGIC || magic16_be == BIN_MAGIC;
         let is_swapped = magic16_be == BIN_MAGIC && magic16_le != BIN_MAGIC;
 
-        let (format, entry, data_padding) = if is_binary {
+        let (format, mut entry, data_padding) = if is_binary {
             // Binary format - read remaining 24 bytes of header
             let mut header = [0u8; BIN_HEADER_SIZE - 2];
             self.read_exact(&mut header)?;
@@ -224,6 +236,11 @@ impl<R: Read> ArchiveReader for CpioReader<R> {
             }
         };
         self.format = Some(format);
+        // Recorded for `-o listopt=%(c_magic)s` and the other cpio field
+        // keywords. Set here rather than in the three header parsers because
+        // this is where the flavor is known: parse_newc_header serves both
+        // 070701 and 070702 and cannot tell them apart.
+        entry.source_header = Some(SourceHeader::Cpio { format });
 
         // Check for trailer
         if crate::rawpath::as_bytes(&entry.path) == TRAILER.as_bytes() {
@@ -754,10 +771,16 @@ fn parse_mode_type(mode: u32) -> EntryType {
 /// Device major/minor packed into a single traditional cpio c_rdev field.
 fn packed_rdev(entry: &ArchiveEntry) -> u64 {
     if entry.is_device() {
-        ((entry.devmajor as u64 & 0xff) << 8) | (entry.devminor as u64 & 0xff)
+        pack_rdev(entry.devmajor, entry.devminor)
     } else {
         0
     }
+}
+
+/// The packing itself, for a caller holding the numbers rather than an entry --
+/// `-o listopt=%(c_rdev)s`.
+pub(crate) fn pack_rdev(devmajor: u32, devminor: u32) -> u64 {
+    ((devmajor as u64 & 0xff) << 8) | (devminor as u64 & 0xff)
 }
 
 /// Link count as recorded in a header.
@@ -916,7 +939,14 @@ fn build_bin_header(entry: &ArchiveEntry, ino: u64, namesize: usize) -> PaxResul
 
 /// Build c_mode from entry
 fn build_mode(entry: &ArchiveEntry) -> u32 {
-    let type_bits = match entry.entry_type {
+    cpio_mode(entry.mode, entry.entry_type)
+}
+
+/// The c_mode field's value: the file type bits POSIX's table assigns, over the
+/// permission bits. Split out of `build_mode` for a caller holding the values
+/// rather than an entry -- `-o listopt=%(c_mode)s`.
+pub(crate) fn cpio_mode(mode: u32, entry_type: EntryType) -> u32 {
+    let type_bits = match entry_type {
         EntryType::Regular => C_ISREG,
         EntryType::Directory => C_ISDIR,
         EntryType::Symlink => C_ISLNK,
@@ -926,7 +956,7 @@ fn build_mode(entry: &ArchiveEntry) -> u32 {
         EntryType::Fifo => C_ISFIFO,
         EntryType::Socket => C_ISSOCK,
     };
-    type_bits | (entry.mode & C_PERM_MASK)
+    type_bits | (mode & C_PERM_MASK)
 }
 
 /// Write a stream-framing octal field (c_namesize, c_filesize, c_mtime) for the

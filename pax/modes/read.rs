@@ -248,10 +248,11 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
 /// Apply `-o keyword:=value` per-file overrides to an entry on extract.
 ///
 /// The `:=` form forces the value regardless of what the archive carried, so it
-/// is applied after the reader has merged any extended-header records. Only the
-/// standard keywords that map onto an entry field are handled; unknown keywords
-/// have no extraction effect. `delete=` is handled in the pax reader (so the
-/// ustar value remains), not here.
+/// is applied after the reader has merged any extended-header records. The
+/// standard keywords that map onto an entry field are applied to it; every
+/// other keyword is recorded as an extended-header value, which has no
+/// extraction effect but is what `-o listopt=%(keyword)` reports. `delete=` is
+/// handled in the pax reader (so the ustar value remains), not here.
 pub(crate) fn apply_keyword_overrides(
     entry: &mut ArchiveEntry,
     opts: &crate::options::FormatOptions,
@@ -268,8 +269,8 @@ pub(crate) fn apply_keyword_overrides(
                     entry.gid = v;
                 }
             }
-            "uname" => entry.uname = Some(value.clone()),
-            "gname" => entry.gname = Some(value.clone()),
+            "uname" => entry.uname = Some(value.clone().into_bytes()),
+            "gname" => entry.gname = Some(value.clone().into_bytes()),
             "path" => entry.path = PathBuf::from(value),
             "linkpath" => entry.link_target = Some(PathBuf::from(value)),
             "size" => {
@@ -295,7 +296,11 @@ pub(crate) fn apply_keyword_overrides(
                     entry.ctime_nsec = (t.fract() * 1_000_000_000.0) as u32;
                 }
             }
-            _ => {}
+            // Every remaining keyword is an extended-header record with no
+            // extraction effect -- `charset`, `comment`, `hdrcharset`, an
+            // implementation extension. It still has to reach the entry, or
+            // `-o charset:=x` would force a value the listing then denied.
+            other => entry.set_ext_record(other, value),
         }
     }
 }
@@ -815,12 +820,46 @@ fn is_archive_newer_at(entry: &ArchiveEntry, dirfd: BorrowedFd<'_>, name: &CStr)
     entry.mtime as i64 > st.st_mtime
 }
 
+/// The ids to give an extracted file.
+///
+/// POSIX, ustar Interchange Format: "When the file is restored by a
+/// privileged, protection-preserving version of the utility, the user and
+/// group databases shall be scanned for these names. If found, the user and
+/// group IDs contained within these files shall be used rather than the values
+/// contained within the uid and gid fields." The pax `uname` record says it
+/// more strongly: it "shall override the uid and uname fields in the following
+/// header block(s), and any uid extended header record."
+///
+/// A name this host's database does not know leaves the numeric field in
+/// force, which is the "If found" in that sentence.
+///
+/// The scan is not conditioned on being privileged. An unprivileged
+/// extraction may still legitimately set a file's group to one the caller
+/// belongs to, and where it may not, the chown fails with EPERM exactly as it
+/// would have with the numeric id -- already diagnosed, in one place, by
+/// `set_attrs_fd`. Testing euid here would only make the resolved id depend on
+/// who ran pax.
+fn owner_ids(entry: &ArchiveEntry) -> (u32, u32) {
+    let uid = entry
+        .uname
+        .as_deref()
+        .and_then(crate::userdb::uid_for_name)
+        .unwrap_or(entry.uid);
+    let gid = entry
+        .gname
+        .as_deref()
+        .and_then(crate::userdb::gid_for_name)
+        .unwrap_or(entry.gid);
+    (uid, gid)
+}
+
 /// The archived attributes of a member, in the shared shape.
 fn attrs_of(entry: &ArchiveEntry) -> Attrs {
+    let (uid, gid) = owner_ids(entry);
     Attrs {
         mode: entry.mode,
-        uid: entry.uid,
-        gid: entry.gid,
+        uid,
+        gid,
         mtime: entry.mtime as i64,
         mtime_nsec: entry.mtime_nsec as i64,
         atime: entry.atime.map(|a| a as i64),
@@ -882,12 +921,13 @@ fn set_owner_at(
         return Ok(());
     }
 
+    let (uid, gid) = owner_ids(entry);
     let result = unsafe {
         libc::fchownat(
             dirfd.as_raw_fd(),
             name.as_ptr(),
-            entry.uid,
-            entry.gid,
+            uid,
+            gid,
             libc::AT_SYMLINK_NOFOLLOW,
         )
     };
@@ -994,6 +1034,69 @@ mod tests {
     use super::*;
     use plib::tmp::TempDir;
     use std::os::unix::fs::PermissionsExt;
+
+    /// POSIX, ustar Interchange Format: "When the file is restored by a
+    /// privileged, protection-preserving version of the utility, the user and
+    /// group databases shall be scanned for these names. If found, the user
+    /// and group IDs contained within these files shall be used rather than
+    /// the values contained within the uid and gid fields." The pax `uname`
+    /// record puts it more strongly still: it "shall override the uid and
+    /// uname fields in the following header block(s), and any uid extended
+    /// header record."
+    ///
+    /// Extraction chowned by the numeric fields alone, so an archive carried
+    /// between hosts restored each file to whichever account happened to hold
+    /// the originating host's uid -- the problem uname exists to solve.
+    #[test]
+    fn test_owner_prefers_the_recorded_name_over_the_numeric_id() {
+        let euid = unsafe { libc::geteuid() };
+        let egid = unsafe { libc::getegid() };
+        // A uid with no database entry (a sparse container) leaves nothing to
+        // assert about; every real account has one.
+        let (Some(user), Some(group)) =
+            (plib::user::get_by_uid(euid), plib::group::get_by_gid(egid))
+        else {
+            return;
+        };
+
+        // The numeric fields deliberately disagree with the names, as they
+        // would after an archive moved between hosts.
+        let named = ArchiveEntry {
+            uid: 0xffff_fff0,
+            gid: 0xffff_fff0,
+            uname: Some(user.name.clone().into_bytes()),
+            gname: Some(group.name.clone().into_bytes()),
+            ..Default::default()
+        };
+        let attrs = attrs_of(&named);
+        assert_eq!(
+            (attrs.uid, attrs.gid),
+            (euid, egid),
+            "a name the database knows must override the numeric field"
+        );
+
+        // "If found": a name this host does not know leaves the numeric field
+        // in force rather than failing or extracting as the caller.
+        let unknown = ArchiveEntry {
+            uid: 4242,
+            gid: 4243,
+            uname: Some(b"nosuchuser.pax.test".to_vec()),
+            gname: Some(b"nosuchgroup.pax.test".to_vec()),
+            ..Default::default()
+        };
+        let attrs = attrs_of(&unknown);
+        assert_eq!((attrs.uid, attrs.gid), (4242, 4243));
+
+        // And a format that records no name at all -- cpio has no such field
+        // -- is unaffected.
+        let bare = ArchiveEntry {
+            uid: 7,
+            gid: 8,
+            ..Default::default()
+        };
+        let attrs = attrs_of(&bare);
+        assert_eq!((attrs.uid, attrs.gid), (7, 8));
+    }
 
     #[test]
     fn test_strip_leading_components() {

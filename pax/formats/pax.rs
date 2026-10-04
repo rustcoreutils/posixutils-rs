@@ -27,7 +27,11 @@ use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
 use crate::error::{PaxError, PaxResult};
 use crate::formats::ustar::{
     calculate_checksum, parse_header as parse_ustar_header, parse_octal, try_split_path,
-    ustar_path_bytes, verify_checksum, write_field, SizeRule,
+    ustar_path_bytes, verify_checksum, write_field, SizeRule, BLKTYPE, BLOCK_SIZE, CHKSUM_OFF,
+    CHRTYPE, DEVMAJOR_OFF, DEVMINOR_OFF, DIRTYPE, FIFOTYPE, GID_OFF, GNAME_LEN, GNAME_OFF,
+    LINKNAME_LEN, LINKNAME_OFF, LNKTYPE, MAGIC_OFF, MODE_OFF, MTIME_OFF, NAME_LEN, NAME_OFF,
+    PREFIX_LEN, PREFIX_OFF, REGTYPE, SIZE_OFF, SYMTYPE, TYPEFLAG_OFF, UID_OFF, UNAME_LEN,
+    UNAME_OFF, VERSION_OFF, ZERO_BLOCK,
 };
 use crate::options::FormatOptions;
 use std::collections::HashMap;
@@ -36,46 +40,13 @@ use std::io::{Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
-const BLOCK_SIZE: usize = 512;
-/// Static zero buffer for padding and end-of-archive markers
-static ZERO_BLOCK: [u8; BLOCK_SIZE] = [0u8; BLOCK_SIZE];
+// The header block layout, the typeflags and the zero block all come from
+// `formats::ustar`: a pax archive *is* a ustar archive with extra headers, and
+// a second copy of an offset is a second thing to get wrong.
 
-// Extended header typeflags
+// Extended header typeflags, which are pax's own.
 const PAX_XHDR: u8 = b'x'; // Per-file extended header
 const PAX_GHDR: u8 = b'g'; // Global extended header
-
-// Regular ustar typeflags (for reference)
-const REGTYPE: u8 = b'0';
-const LNKTYPE: u8 = b'1';
-const SYMTYPE: u8 = b'2';
-const CHRTYPE: u8 = b'3';
-const BLKTYPE: u8 = b'4';
-const DIRTYPE: u8 = b'5';
-const FIFOTYPE: u8 = b'6';
-
-// Header field offsets (same as ustar)
-const NAME_OFF: usize = 0;
-const MODE_OFF: usize = 100;
-const UID_OFF: usize = 108;
-const GID_OFF: usize = 116;
-const SIZE_OFF: usize = 124;
-const MTIME_OFF: usize = 136;
-const CHKSUM_OFF: usize = 148;
-const TYPEFLAG_OFF: usize = 156;
-const LINKNAME_OFF: usize = 157;
-const MAGIC_OFF: usize = 257;
-const VERSION_OFF: usize = 263;
-const UNAME_OFF: usize = 265;
-const GNAME_OFF: usize = 297;
-const DEVMAJOR_OFF: usize = 329;
-const DEVMINOR_OFF: usize = 337;
-const PREFIX_OFF: usize = 345;
-
-const NAME_LEN: usize = 100;
-const PREFIX_LEN: usize = 155;
-const LINKNAME_LEN: usize = 100;
-const UNAME_LEN: usize = 32;
-const GNAME_LEN: usize = 32;
 
 /// A pax extended-header timestamp, held exactly as integer seconds plus
 /// nanoseconds. `f64` cannot represent nanosecond precision for present-day
@@ -118,10 +89,15 @@ pub struct ExtendedHeader {
     pub uid: Option<u32>,
     /// gid - group ID
     pub gid: Option<u32>,
-    /// uname - user name
-    pub uname: Option<String>,
-    /// gname - group name
-    pub gname: Option<String>,
+    /// uname - user name, as raw bytes.
+    ///
+    /// Not a `String`, for the reason `path` is not: under `hdrcharset=BINARY`
+    /// POSIX defines this record as "unencoded binary data from the underlying
+    /// system", and a lossy decode would destroy the bytes the archive set out
+    /// to preserve.
+    pub uname: Option<Vec<u8>>,
+    /// gname - group name, as raw bytes. See `uname`.
+    pub gname: Option<Vec<u8>>,
     /// hdrcharset - character encoding for path/linkpath/uname/gname
     /// Values: "BINARY" (ISO/IEC 646:1991 aka ASCII, non-UTF-8 bytes allowed)
     ///         "ISO-IR 10646 2000 UTF-8" (default, UTF-8 encoded)
@@ -130,10 +106,50 @@ pub struct ExtendedHeader {
     pub extra: HashMap<String, String>,
 }
 
+/// The extended-header keywords `ExtendedHeader` holds in a typed field, as
+/// opposed to the ones that land in `extra`.
+///
+/// One list: `serialize` needs it twice and `set_keyword` has an arm per name,
+/// and the three had been written out separately, so adding a keyword to one
+/// and not the others was a silent mistake. `test_standard_keywords_are_typed`
+/// pins them together.
+const STANDARD_KEYWORDS: &[&str] = &[
+    "hdrcharset",
+    "atime",
+    "mtime",
+    "ctime",
+    "path",
+    "linkpath",
+    "size",
+    "uid",
+    "gid",
+    "uname",
+    "gname",
+];
+
 impl ExtendedHeader {
     /// Create a new empty extended header
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether this header already carries a value for one of
+    /// [`STANDARD_KEYWORDS`], and so has already written its record.
+    fn holds(&self, keyword: &str) -> bool {
+        match keyword {
+            "hdrcharset" => self.hdrcharset.is_some(),
+            "atime" => self.atime.is_some(),
+            "mtime" => self.mtime.is_some(),
+            "ctime" => self.ctime.is_some(),
+            "path" => self.path.is_some(),
+            "linkpath" => self.linkpath.is_some(),
+            "size" => self.size.is_some(),
+            "uid" => self.uid.is_some(),
+            "gid" => self.gid.is_some(),
+            "uname" => self.uname.is_some(),
+            "gname" => self.gname.is_some(),
+            _ => false,
+        }
     }
 
     /// Parse extended header records from data
@@ -179,6 +195,18 @@ impl ExtendedHeader {
             }
             "linkpath" => {
                 self.linkpath = Some(value_bytes.to_vec());
+                return Ok(());
+            }
+            // The other two records hdrcharset governs. Under BINARY they are
+            // the underlying system's bytes, and the lossy decode below turned
+            // every one that is not UTF-8 into U+FFFD -- irreversibly, under a
+            // header that had just promised to preserve them.
+            "uname" => {
+                self.uname = Some(value_bytes.to_vec());
+                return Ok(());
+            }
+            "gname" => {
+                self.gname = Some(value_bytes.to_vec());
                 return Ok(());
             }
             _ => {}
@@ -234,10 +262,10 @@ impl ExtendedHeader {
                 );
             }
             "uname" => {
-                self.uname = Some(value.to_string());
+                self.uname = Some(value.as_bytes().to_vec());
             }
             "gname" => {
-                self.gname = Some(value.to_string());
+                self.gname = Some(value.as_bytes().to_vec());
             }
             "hdrcharset" => {
                 self.hdrcharset = Some(value.to_string());
@@ -327,10 +355,10 @@ impl ExtendedHeader {
             rec!("gid", &gid.to_string());
         }
         if let Some(ref uname) = self.uname {
-            rec!("uname", uname);
+            rec_bytes!("uname", uname);
         }
         if let Some(ref gname) = self.gname {
-            rec!("gname", gname);
+            rec_bytes!("gname", gname);
         }
         // Sorted: iterating a HashMap made the record order differ between runs
         // of the same command, so two invocations produced different bytes for
@@ -346,21 +374,8 @@ impl ExtendedHeader {
         // an override when the entry carried the field, but a forced value such
         // as `-o gname:=other` / `-o uid:=N` on an entry with no gname/uid must
         // still produce a record.
-        let standard_emitted = [
-            ("hdrcharset", self.hdrcharset.is_some()),
-            ("atime", self.atime.is_some()),
-            ("mtime", self.mtime.is_some()),
-            ("ctime", self.ctime.is_some()),
-            ("path", self.path.is_some()),
-            ("linkpath", self.linkpath.is_some()),
-            ("size", self.size.is_some()),
-            ("uid", self.uid.is_some()),
-            ("gid", self.gid.is_some()),
-            ("uname", self.uname.is_some()),
-            ("gname", self.gname.is_some()),
-        ];
-        for (keyword, already_emitted) in standard_emitted {
-            if already_emitted || options.should_delete_keyword(keyword) {
+        for &keyword in STANDARD_KEYWORDS {
+            if self.holds(keyword) || options.should_delete_keyword(keyword) {
                 continue;
             }
             if let Some(value) = per_file.get(keyword) {
@@ -377,20 +392,7 @@ impl ExtendedHeader {
                 continue;
             }
             // Skip standard keywords that were already handled above
-            let standard_keywords = [
-                "hdrcharset",
-                "atime",
-                "mtime",
-                "ctime",
-                "path",
-                "linkpath",
-                "size",
-                "uid",
-                "gid",
-                "uname",
-                "gname",
-            ];
-            if !standard_keywords.contains(&key.as_str()) && !self.extra.contains_key(key) {
+            if !STANDARD_KEYWORDS.contains(&key.as_str()) && !self.extra.contains_key(key) {
                 write_pax_record(&mut data, key, value);
             }
         }
@@ -458,15 +460,56 @@ impl ExtendedHeader {
                 entry.ctime_nsec = ctime.nsec;
             }
         }
+        // The records nothing above holds: `charset`, `comment`, `hdrcharset`
+        // and any implementation extension. None affects extraction; POSIX
+        // listopt rule 7 admits every one of them as a `%(keyword)`, and
+        // without this the listing had no way to report what the archive said.
+        if keep("hdrcharset") {
+            if let Some(ref hdrcharset) = self.hdrcharset {
+                entry.set_ext_record("hdrcharset", hdrcharset);
+            }
+        }
+        for (keyword, value) in &self.extra {
+            if keep(keyword) {
+                entry.set_ext_record(keyword, value);
+            }
+        }
     }
 
-    /// Create extended header with options controlling what to include
+    /// The extended-header records this member needs, if any.
     ///
-    /// # Arguments
-    /// * `entry` - The archive entry to generate extended headers for
-    /// * `include_times` - If true, always include atime and mtime in extended headers
-    pub fn from_entry(entry: &ArchiveEntry, include_times: bool) -> Self {
+    /// A record is written only where the ustar header cannot carry the value:
+    /// a pathname or link target with no faithful ustar spelling, a size or an
+    /// id too large for its octal field, a user or group name outside the
+    /// portable character set or too long for its field, a time with
+    /// sub-second precision.
+    ///
+    /// `options` supplies the two things the operator can change. `-o times`
+    /// forces atime and mtime records for every member rather than only where
+    /// one is needed, and `-o hdrcharset=` both widens the rule for which
+    /// names need a record and decides whether this member declares a charset
+    /// of its own.
+    pub fn from_entry(entry: &ArchiveEntry, options: &FormatOptions) -> Self {
         let mut header = ExtendedHeader::new();
+        let include_times = options.include_times;
+
+        // `-o hdrcharset=BINARY` is the operator saying the names in this
+        // archive are the underlying system's bytes rather than UTF-8, and
+        // under it the `path` record is what carries those bytes. POSIX's
+        // RATIONALE is explicit about the consequence: "an extended header
+        // path record is always required to be generated if the prefix or
+        // name fields contain non-ASCII characters even when
+        // hdrcharset=binary is also in effect for that file." So the trigger
+        // widens from "has no faithful UTF-8 reading" to "is not ASCII": a
+        // UTF-8 name that would fit the ustar fields still needs the record.
+        let binary = options.hdrcharset() == Some(crate::options::BINARY_CHARSET);
+        let needs_record = |bytes: &[u8]| {
+            if binary {
+                !bytes.is_ascii()
+            } else {
+                std::str::from_utf8(bytes).is_err()
+            }
+        };
 
         // Path needs an extended header whenever it cannot be represented
         // exactly by the ustar name/prefix pair. Length alone is not the test:
@@ -476,7 +519,7 @@ impl ExtendedHeader {
         // ustar fallback in split_path() silently truncates the name.
         let path_bytes = crate::rawpath::as_bytes(&entry.path);
         let ustar_spelling = ustar_path_bytes(entry);
-        let path_is_binary = std::str::from_utf8(path_bytes).is_err();
+        let path_is_binary = needs_record(path_bytes);
         if try_split_path(&ustar_spelling).is_none() || path_is_binary {
             // A non-UTF-8 name has no faithful ustar spelling, so it always
             // needs the record regardless of length.
@@ -487,7 +530,7 @@ impl ExtendedHeader {
         let mut link_is_binary = false;
         if let Some(ref link) = entry.link_target {
             let link_bytes = link.as_os_str().as_bytes();
-            link_is_binary = std::str::from_utf8(link_bytes).is_err();
+            link_is_binary = needs_record(link_bytes);
             if link_bytes.len() > LINKNAME_LEN || link_is_binary {
                 header.linkpath = Some(link_bytes.to_vec());
             }
@@ -498,8 +541,23 @@ impl ExtendedHeader {
         // pathname records carry unencoded bytes. Without this the name was run
         // through to_string_lossy and every invalid byte became U+FFFD --
         // irreversibly, and identically to -o invalid=write.
-        if path_is_binary || link_is_binary {
-            header.hdrcharset = Some("BINARY".to_string());
+        //
+        // Not needed when the operator asked for a charset: that value is
+        // already written once as a global `g` record, and repeating it in
+        // every member's `x` header would say nothing new. A name that is not
+        // valid UTF-8 still forces the per-file record, which overrides the
+        // global one -- announcing such a member as UTF-8 would declare an
+        // encoding its bytes are not in.
+        //
+        // hdrcharset governs four records -- path, linkpath, uname and gname --
+        // so any of the four forces the declaration, not just the two
+        // pathnames. A user or group name is bytes from the local database and
+        // need not be UTF-8 either.
+        let not_utf8 = |bytes: &[u8]| std::str::from_utf8(bytes).is_err();
+        let name_is_binary = entry.uname.as_deref().is_some_and(not_utf8)
+            || entry.gname.as_deref().is_some_and(not_utf8);
+        if !binary && (path_is_binary || link_is_binary || name_is_binary) {
+            header.hdrcharset = Some(crate::options::BINARY_CHARSET.to_string());
         }
 
         // Size > 8GB needs extended header
@@ -1033,7 +1091,7 @@ impl<W: Write> ArchiveWriter for PaxWriter<W> {
         // extended header only when some field actually needs one; a pax archive
         // with no extended records is a valid ustar archive and reads back
         // identically, so there is no need to force an mtime record.
-        let ext_header = ExtendedHeader::from_entry(entry, self.options.include_times);
+        let ext_header = ExtendedHeader::from_entry(entry, &self.options);
 
         self.write_extended_header(&ext_header, entry)?;
 
@@ -1128,10 +1186,10 @@ fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
 
     // uname and gname
     if let Some(ref uname) = entry.uname {
-        write_field(&mut header[UNAME_OFF..], uname.as_bytes(), UNAME_LEN);
+        write_field(&mut header[UNAME_OFF..], uname, UNAME_LEN);
     }
     if let Some(ref gname) = entry.gname {
-        write_field(&mut header[GNAME_OFF..], gname.as_bytes(), GNAME_LEN);
+        write_field(&mut header[GNAME_OFF..], gname, GNAME_LEN);
     }
 
     // Device major/minor (always written for POSIX compliance)
@@ -1247,6 +1305,82 @@ fn skip_bytes<R: Read>(reader: &mut R, count: u64) -> PaxResult<()> {
 mod tests {
     use super::*;
 
+    /// STANDARD_KEYWORDS, `set_keyword` and `holds` describe the same set of
+    /// typed fields from three directions, and used to be three separately
+    /// written-out lists. A keyword added to one and not the others is silent:
+    /// it would be parsed into `extra`, then serialized twice, or be unable to
+    /// take a `-o keyword:=value` override. This is what keeps them together.
+    /// `hdrcharset` governs the path, linkpath, uname and gname records
+    /// alike, so a value that is not valid UTF-8 in *any* of the four has to
+    /// bring the BINARY declaration with it. Only the two pathnames did, so a
+    /// host whose passwd database holds a non-UTF-8 account name wrote
+    /// `uname=<raw bytes>` under a header declaring POSIX's implicit UTF-8 --
+    /// bytes a conforming reader must then decode as UTF-8.
+    #[test]
+    fn test_binary_user_name_declares_the_header_charset() {
+        let opts = FormatOptions::default();
+
+        let mut entry = ArchiveEntry::new(PathBuf::from("ascii.txt"), EntryType::Regular);
+        entry.uname = Some(b"us\xffr".to_vec());
+        let header = ExtendedHeader::from_entry(&entry, &opts);
+        assert_eq!(
+            header.hdrcharset.as_deref(),
+            Some("BINARY"),
+            "a uname that is not UTF-8 must be announced as BINARY"
+        );
+        assert_eq!(header.uname.as_deref(), Some(b"us\xffr".as_slice()));
+
+        // The group name alone is enough too.
+        let mut entry = ArchiveEntry::new(PathBuf::from("ascii.txt"), EntryType::Regular);
+        entry.gname = Some(b"gr\xffup".to_vec());
+        assert_eq!(
+            ExtendedHeader::from_entry(&entry, &opts)
+                .hdrcharset
+                .as_deref(),
+            Some("BINARY")
+        );
+
+        // A name that is non-ASCII but valid UTF-8 needs the record, because
+        // the ustar field is limited to the portable character set -- but no
+        // declaration, since UTF-8 is the default the archive already implies.
+        let mut entry = ArchiveEntry::new(PathBuf::from("ascii.txt"), EntryType::Regular);
+        entry.uname = Some("ünïcode".as_bytes().to_vec());
+        let header = ExtendedHeader::from_entry(&entry, &opts);
+        assert_eq!(header.hdrcharset, None);
+        assert_eq!(header.uname.as_deref(), Some("ünïcode".as_bytes()));
+
+        // And a plain ASCII name needs neither.
+        let mut entry = ArchiveEntry::new(PathBuf::from("ascii.txt"), EntryType::Regular);
+        entry.uname = Some(b"root".to_vec());
+        let header = ExtendedHeader::from_entry(&entry, &opts);
+        assert_eq!(header.hdrcharset, None);
+        assert_eq!(header.uname, None);
+    }
+
+    #[test]
+    fn test_standard_keywords_are_typed() {
+        for &keyword in STANDARD_KEYWORDS {
+            let mut header = ExtendedHeader::new();
+            // "1" parses as a time, a size, an id and a name alike.
+            header.set_keyword(keyword, "1").unwrap();
+            assert!(
+                header.extra.is_empty(),
+                "{keyword} is in STANDARD_KEYWORDS but set_keyword put it in `extra`"
+            );
+            assert!(
+                header.holds(keyword),
+                "{keyword} is in STANDARD_KEYWORDS but `holds` does not see it"
+            );
+        }
+
+        // And the converse: a keyword outside the list does land in `extra`,
+        // which is what makes `holds` the right test for "already written".
+        let mut header = ExtendedHeader::new();
+        header.set_keyword("charset", "BINARY").unwrap();
+        assert!(!header.holds("charset"));
+        assert_eq!(header.extra.len(), 1);
+    }
+
     #[test]
     fn test_write_pax_record() {
         let mut data = Vec::new();
@@ -1335,7 +1469,7 @@ mod tests {
         entry.uid = 3000000; // > 2097151
         entry.mtime_nsec = 500000000; // 0.5 seconds
 
-        let ext = ExtendedHeader::from_entry(&entry, false);
+        let ext = ExtendedHeader::from_entry(&entry, &FormatOptions::default());
         assert!(ext.uid.is_some());
         assert!(ext.mtime.is_some());
     }

@@ -688,70 +688,11 @@ fn build_entry(
     // Try to get user/group names
     #[cfg(unix)]
     {
-        entry.uname = cached_username(entry.uid);
-        entry.gname = cached_groupname(entry.gid);
+        entry.uname = crate::userdb::name_for_uid(entry.uid);
+        entry.gname = crate::userdb::name_for_gid(entry.gid);
     }
 
     Ok(entry)
-}
-
-/// Get username from uid
-#[cfg(unix)]
-/// uid/gid to name lookups, memoized for the life of the process.
-///
-/// build_entry needs both for every member, and getpwuid/getgrgid are not
-/// cached by libc: under a `files` backend each call is an open/read/close of
-/// /etc/passwd or /etc/group, and under LDAP or SSSD a network round trip. A
-/// file hierarchy almost always has one or two distinct owners, so a tree of
-/// 100,000 files made 200,000 lookups where two would do.
-fn cached_username(uid: u32) -> Option<String> {
-    thread_local! {
-        static USERS: std::cell::RefCell<std::collections::HashMap<u32, Option<String>>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
-    }
-    USERS.with(|c| {
-        c.borrow_mut()
-            .entry(uid)
-            .or_insert_with(|| get_username(uid))
-            .clone()
-    })
-}
-
-fn cached_groupname(gid: u32) -> Option<String> {
-    thread_local! {
-        static GROUPS: std::cell::RefCell<std::collections::HashMap<u32, Option<String>>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
-    }
-    GROUPS.with(|c| {
-        c.borrow_mut()
-            .entry(gid)
-            .or_insert_with(|| get_groupname(gid))
-            .clone()
-    })
-}
-
-fn get_username(uid: u32) -> Option<String> {
-    unsafe {
-        let pw = libc::getpwuid(uid);
-        if pw.is_null() {
-            return None;
-        }
-        let name = std::ffi::CStr::from_ptr((*pw).pw_name);
-        name.to_str().ok().map(|s| s.to_string())
-    }
-}
-
-/// Get group name from gid
-#[cfg(unix)]
-fn get_groupname(gid: u32) -> Option<String> {
-    unsafe {
-        let gr = libc::getgrgid(gid);
-        if gr.is_null() {
-            return None;
-        }
-        let name = std::ffi::CStr::from_ptr((*gr).gr_name);
-        name.to_str().ok().map(|s| s.to_string())
-    }
 }
 
 /// Write files to a pre-existing archive writer (for multi-volume support)

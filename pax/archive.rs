@@ -33,6 +33,45 @@ pub enum EntryType {
     Socket,
 }
 
+/// The header fields that describe a header rather than the file it names.
+///
+/// POSIX pax listopt rule 7 admits every field name in the ustar Header Block
+/// and Octet-Oriented cpio Archive Entry tables as a `%(keyword)`, and defines
+/// the value as the one "from the applicable header field". These four have no
+/// other use -- nothing extracts them -- so they are recorded only so a
+/// listing can report them.
+///
+/// Which variant a member carries also decides which of those keywords can be
+/// answered at all: a cpio header has no `typeflag`, `version` or `chksum`,
+/// and a ustar header no `c_dev`, `c_ino` or `c_nlink`, so a keyword from the
+/// other table renders as nothing rather than as a fabricated zero.
+///
+/// A writer must never consult this. It describes the header a member was
+/// *read* from, and carrying a foreign checksum or typeflag through a copy
+/// would write a header that disagrees with its own contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceHeader {
+    /// A ustar header block, which a pax member also has.
+    Ustar {
+        /// `magic` (offset 257, 6 octets), as stored -- "ustar\0" from a
+        /// conforming writer, "ustar " from GNU tar.
+        magic: [u8; 6],
+        /// `version` (263, 2), as stored.
+        version: [u8; 2],
+        /// `chksum` (148, 8), the value the header stored.
+        chksum: u64,
+        /// `typeflag` (156, 1), as stored.
+        typeflag: u8,
+    },
+    /// A cpio header, in whichever of the four flavors the reader matched.
+    Cpio {
+        /// The flavor, which is what `c_magic` reports. Kept as the enum
+        /// rather than the magic digits because the ODC and binary forms
+        /// share "070707" and only this distinguishes them.
+        format: crate::formats::cpio::CpioFormat,
+    },
+}
+
 /// Metadata for an archive entry
 #[derive(Debug, Clone, Default)]
 pub struct ArchiveEntry {
@@ -64,10 +103,16 @@ pub struct ArchiveEntry {
     pub entry_type: EntryType,
     /// Link target for symlinks and hardlinks
     pub link_target: Option<PathBuf>,
-    /// User name (optional)
-    pub uname: Option<String>,
-    /// Group name (optional)
-    pub gname: Option<String>,
+    /// User name (optional), as bytes.
+    ///
+    /// Not a `String`: under `hdrcharset=BINARY` POSIX defines the `uname` and
+    /// `gname` extended-header records as "unencoded binary data from the
+    /// underlying system", and a lossy decode would replace a byte the archive
+    /// deliberately preserved. A user or group name is a byte string on Unix
+    /// for the same reason a pathname is -- see `crate::rawpath`.
+    pub uname: Option<Vec<u8>>,
+    /// Group name (optional), as bytes. See `uname`.
+    pub gname: Option<Vec<u8>>,
     /// Device ID (for hard link tracking)
     pub dev: u64,
     /// Inode number (for hard link tracking)
@@ -85,6 +130,21 @@ pub struct ArchiveEntry {
     /// true from `ArchiveWriter::needs_data_checksum` asks its caller to fill
     /// this in first; every other format leaves it `None`.
     pub data_checksum: Option<u32>,
+    /// The pax extended-header records this member carried that no field
+    /// above already holds: `charset`, `hdrcharset`, `comment` and whatever
+    /// implementation extensions the archive used.
+    ///
+    /// POSIX listopt rule 7 admits all of them as a `%(keyword)`, which is the
+    /// only thing that reads them -- none has any effect on extraction. A
+    /// `Vec` rather than a map because it is empty for almost every member and
+    /// one to three entries long otherwise, and because the order records
+    /// arrive in is the order that decides precedence.
+    pub ext_records: Vec<(String, String)>,
+    /// The header this member was read from, when it was read from one.
+    ///
+    /// `None` for an entry built from a file on disk, which has no header yet.
+    /// Only `-o listopt=%(keyword)` consults it; see `SourceHeader`.
+    pub source_header: Option<SourceHeader>,
 }
 
 impl ArchiveEntry {
@@ -112,6 +172,31 @@ impl ArchiveEntry {
             devmajor: 0,
             devminor: 0,
             data_checksum: None,
+            ext_records: Vec::new(),
+            source_header: None,
+        }
+    }
+
+    /// The value of an extended-header record this member carried.
+    pub fn ext_record(&self, keyword: &str) -> Option<&str> {
+        self.ext_records
+            .iter()
+            .find(|(k, _)| k == keyword)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Record an extended-header value, replacing any already held under the
+    /// same keyword.
+    ///
+    /// Replacing is what gives POSIX's keyword precedence: a global `g` header
+    /// is applied before the per-file `x` header, and `-o keyword:=value`
+    /// after both, so the last writer of a keyword wins.
+    pub fn set_ext_record(&mut self, keyword: &str, value: &str) {
+        match self.ext_records.iter_mut().find(|(k, _)| k == keyword) {
+            Some(slot) => slot.1 = value.to_string(),
+            None => self
+                .ext_records
+                .push((keyword.to_string(), value.to_string())),
         }
     }
 

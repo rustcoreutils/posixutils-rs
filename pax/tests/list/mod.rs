@@ -234,3 +234,33 @@ fn test_list_directory_subtree_and_dash_d() {
         "-d must not list the subtree: {listing}"
     );
 }
+
+/// `pax -v` reports a link count, and ustar has no field to read one from.
+///
+/// `ustar::parse_header` finished with `..Default::default()`, which left
+/// `nlink` at 0, so every member of every tar archive listed as having no
+/// names at all. cpio floors the field at one for the same reason (see
+/// `cpio::header_nlink`); a member read from a ustar header gets the same
+/// treatment, because a member that exists has at least one name.
+#[test]
+fn test_verbose_list_reports_a_link_count_of_one() {
+    let archive = Ustar {
+        name: b"f.txt",
+        body: b"hi\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let output = run_pax_with_stdin_bytes(&["-v"], &archive);
+    assert_success(&output, "pax -v over a ustar archive");
+
+    let listing = stdout_str(&output);
+    let line = listing.lines().next().expect("one member");
+    // `print_verbose` writes mode, link count, owner, group, size, time, name.
+    let nlink = line.split_whitespace().nth(1).expect("link count column");
+    assert_eq!(
+        nlink, "1",
+        "a member read from a ustar header must list one link, not {} (line: {})",
+        nlink, line
+    );
+}

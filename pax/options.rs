@@ -17,30 +17,24 @@
 //! The `:=` form is used for per-file options (pax format),
 //! while `=` is used for global options.
 
-use crate::archive::EntryType;
+use crate::archive::{ArchiveEntry, EntryType, SourceHeader};
 use crate::error::{PaxError, PaxResult};
 use crate::pattern::Pattern;
 use std::collections::HashMap;
 
 /// Information about an archive entry for list formatting
+///
+/// The member is borrowed whole rather than copied field by field. POSIX
+/// listopt rule 7 admits every ustar and cpio header field name and every pax
+/// extended-header keyword as a `%(keyword)`, so the set of fields a format
+/// string can reach is the entry's own; a hand-copied subset is a list that
+/// silently falls behind the one `keyword_value` is meant to resolve.
 #[derive(Debug, Clone)]
 pub struct ListEntryInfo<'a> {
-    pub path: &'a std::path::Path,
-    pub mode: u32,
-    pub size: u64,
-    pub mtime: u64,
-    /// Access time, when the archive member carried an `atime` record.
-    pub atime: Option<u64>,
-    /// Change time, when the archive member carried a `ctime` record.
-    pub ctime: Option<u64>,
-    pub uid: u32,
-    pub gid: u32,
-    pub uname: Option<&'a str>,
-    pub gname: Option<&'a str>,
-    pub link_target: Option<&'a std::path::Path>,
-    pub entry_type: EntryType,
-    pub devmajor: u32,
-    pub devminor: u32,
+    /// The member as the reader produced it, after the name rewrites list mode
+    /// applies first (`-s`, `--strip-components`, `-o keyword:=value`), so a
+    /// keyword reports what extracting this archive would use.
+    pub entry: &'a ArchiveEntry,
     /// Whether the *substituted values* get escaped.
     ///
     /// Only the values, never the rendered result: the format string is
@@ -66,6 +60,42 @@ const INVALID_ACTIONS: &[(&str, bool)] = &[
     ("UTF-8", false),
     ("binary", false),
 ];
+
+/// The `hdrcharset` values POSIX defines, in the spelling it defines them in.
+///
+/// The spec allows more -- "additional names may be agreed between the
+/// originator and the recipient" -- but agreeing on a name is not the same as
+/// being able to encode to it, and pax performs no character-set conversion.
+/// Accepting a third name would write an archive declaring an encoding its
+/// values are not in, so a name outside this table is refused by name.
+///
+/// `charset` is deliberately not checked the same way. POSIX scopes it to the
+/// *file data*, says it "is included in an extended header for information
+/// only" and forbids pax translating the data, so the value is an annotation
+/// pax neither acts on nor needs to understand; refusing an unlisted one would
+/// reject a conforming archive to no end.
+/// POSIX's name for an unencoded header, as a constant because the writer
+/// branches on it as well as recording it.
+pub const BINARY_CHARSET: &str = "BINARY";
+
+const HDRCHARSET_VALUES: &[&str] = &["ISO-IR 10646 2000 UTF-8", BINARY_CHARSET];
+
+/// Check a `-o hdrcharset=` value and return POSIX's spelling of it, so that
+/// an archive records `BINARY` whichever case the operator typed.
+fn canonical_hdrcharset(value: &str) -> PaxResult<&'static str> {
+    HDRCHARSET_VALUES
+        .iter()
+        .copied()
+        .find(|known| known.eq_ignore_ascii_case(value))
+        .ok_or_else(|| {
+            PaxError::InvalidFormat(format!(
+                "hdrcharset={value} is not supported; pax performs no \
+                 character-set conversion, so the header encoding has to be \
+                 {}",
+                HDRCHARSET_VALUES.join(" or ")
+            ))
+        })
+}
 
 /// Parsed format options
 #[derive(Debug, Clone, Default)]
@@ -204,6 +234,17 @@ impl FormatOptions {
             (opt.trim(), None, false)
         };
 
+        // Checked here rather than through KNOWN_OPTIONS, because the value
+        // still has to reach the `g`/`x` extended header like any other
+        // keyword: intercepting it below would stop the record being written
+        // at all. An empty value is POSIX's deletion form ("If the <value>
+        // field is zero length, it shall delete any ... previously entered
+        // extended header value"), so it is left alone.
+        let value = match (keyword, value) {
+            ("hdrcharset", Some(v)) if !v.is_empty() => Some(canonical_hdrcharset(v)?),
+            _ => value,
+        };
+
         // Look up keyword in known options table
         if let Some((_, known_opt)) = KNOWN_OPTIONS.iter().find(|(k, _)| *k == keyword) {
             match known_opt {
@@ -303,6 +344,20 @@ impl FormatOptions {
         self.delete_patterns_compiled
             .iter()
             .any(|pattern| pattern.matches(keyword))
+    }
+
+    /// The header character set the operator asked for, if any.
+    ///
+    /// The per-file `hdrcharset:=` form wins over the global `hdrcharset=`
+    /// one, which is POSIX's keyword precedence. Both are already written as
+    /// extended-header records by the writer; this is for the decisions that
+    /// depend on the answer rather than for emitting it.
+    pub fn hdrcharset(&self) -> Option<&str> {
+        self.per_file
+            .get("hdrcharset")
+            .or_else(|| self.global.get("hdrcharset"))
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
     }
 
     /// Get the global options map for extended header generation
@@ -445,18 +500,18 @@ fn expand_global_header_template(template: &str, sequence: u64) -> String {
 
 // Format specifier handlers for list entry formatting
 fn fmt_basename(info: &ListEntryInfo) -> Vec<u8> {
-    match info.path.file_name() {
+    match info.entry.path.file_name() {
         Some(name) => escaped(info, crate::rawpath::as_bytes(std::path::Path::new(name))),
         None => fmt_fullpath(info),
     }
 }
 
 fn fmt_fullpath(info: &ListEntryInfo) -> Vec<u8> {
-    escaped(info, crate::rawpath::as_bytes(info.path))
+    escaped(info, crate::rawpath::as_bytes(&info.entry.path))
 }
 
 fn fmt_link_target(info: &ListEntryInfo) -> Vec<u8> {
-    match info.link_target {
+    match info.entry.link_target.as_deref() {
         Some(p) => escaped(info, crate::rawpath::as_bytes(p)),
         None => Vec::new(),
     }
@@ -474,15 +529,24 @@ fn escaped(info: &ListEntryInfo, bytes: &[u8]) -> Vec<u8> {
 }
 
 fn fmt_mode_octal(info: &ListEntryInfo) -> Vec<u8> {
-    format!("{:o}", info.mode & 0o7777).into_bytes()
+    format!("{:o}", info.entry.mode & 0o7777).into_bytes()
 }
 
 fn fmt_mode_symbolic(info: &ListEntryInfo) -> Vec<u8> {
-    format_mode_symbolic(info.mode, info.entry_type).into_bytes()
+    format_mode_symbolic(info.entry.mode, info.entry.entry_type).into_bytes()
 }
 
 fn fmt_device(info: &ListEntryInfo) -> Vec<u8> {
-    format!("{},{}", info.devmajor, info.devminor).into_bytes()
+    format!("{},{}", info.entry.devmajor, info.entry.devminor).into_bytes()
+}
+
+/// Bare `%L`. Rule 12: a symbolic link expands to `"%s -> %s"` of a pathname
+/// and the link's contents, and anything else is "the equivalent of %F". With
+/// no keyword given, the pathname is rule 11's `(path)` default.
+fn fmt_link_expansion(info: &ListEntryInfo) -> Vec<u8> {
+    let mut out = fmt_fullpath(info);
+    push_link_expansion(&mut out, info);
+    out
 }
 
 /// Bare `%D`. Rule 10: with no keyword to fall back on, a non-device entry
@@ -496,39 +560,39 @@ fn fmt_device_or_space(info: &ListEntryInfo) -> Vec<u8> {
 }
 
 fn fmt_size(info: &ListEntryInfo) -> Vec<u8> {
-    info.size.to_string().into_bytes()
+    info.entry.size.to_string().into_bytes()
 }
 
 fn fmt_mtime_trad(info: &ListEntryInfo) -> Vec<u8> {
-    format_time_traditional(info.mtime).into_bytes()
+    format_time_traditional(info.entry.mtime).into_bytes()
 }
 
 /// Bare `%T`. Rule 8: the default keyword is mtime and the default subformat is
 /// `%b %e %H:%M %Y`.
 fn fmt_mtime_posix(info: &ListEntryInfo) -> Vec<u8> {
-    strftime_or_secs(info.mtime, DEFAULT_TIME_SUBFORMAT).into_bytes()
+    strftime_or_secs(info.entry.mtime, DEFAULT_TIME_SUBFORMAT).into_bytes()
 }
 
 fn fmt_username(info: &ListEntryInfo) -> Vec<u8> {
-    info.uname
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| info.uid.to_string())
-        .into_bytes()
+    match info.entry.uname.as_deref() {
+        Some(uname) => escaped(info, uname),
+        None => info.entry.uid.to_string().into_bytes(),
+    }
 }
 
 fn fmt_groupname(info: &ListEntryInfo) -> Vec<u8> {
-    info.gname
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| info.gid.to_string())
-        .into_bytes()
+    match info.entry.gname.as_deref() {
+        Some(gname) => escaped(info, gname),
+        None => info.entry.gid.to_string().into_bytes(),
+    }
 }
 
 fn fmt_uid(info: &ListEntryInfo) -> Vec<u8> {
-    info.uid.to_string().into_bytes()
+    info.entry.uid.to_string().into_bytes()
 }
 
 fn fmt_gid(info: &ListEntryInfo) -> Vec<u8> {
-    info.gid.to_string().into_bytes()
+    info.entry.gid.to_string().into_bytes()
 }
 
 fn fmt_newline(_info: &ListEntryInfo) -> Vec<u8> {
@@ -547,6 +611,7 @@ const FORMAT_SPECIFIERS: &[(char, FormatHandler)] = &[
     ('f', fmt_basename),
     ('F', fmt_fullpath),
     ('l', fmt_link_target),
+    ('L', fmt_link_expansion),
     ('m', fmt_mode_octal),
     ('M', fmt_mode_symbolic),
     ('D', fmt_device_or_space),
@@ -614,6 +679,8 @@ fn unescape_backslashes(s: &str) -> String {
 /// - `%t` - modification time, `ls -l` style (extension)
 /// - `%T` - time, default keyword `mtime`, default subformat `%b %e %H:%M %Y`
 /// - `%D` - device of a block/char special file
+/// - `%F` - pathname, the non-null `(keyword[,keyword]...)` values joined by `/`
+/// - `%L` - a symbolic link as `pathname -> contents`, otherwise `%F`
 /// - `%u` - owner username
 /// - `%g` - group name
 /// - `%U` - owner uid
@@ -779,13 +846,13 @@ enum KeywordValue {
 /// The outer `Option` distinguishes "not a time keyword" from "no record".
 fn time_keyword(info: &ListEntryInfo, keyword: &str) -> Option<Option<u64>> {
     match keyword {
-        "mtime" => Some(Some(info.mtime)),
-        "atime" => Some(info.atime),
+        "mtime" => Some(Some(info.entry.mtime)),
+        "atime" => Some(info.entry.atime),
         // ctime is not a POSIX keyword (it was removed by
         // IEEE Std 1003.1-2001/Cor 2-2004 because st_ctime is not a creation
         // time), but it is written by star/GNU tar and rule 7 admits
         // implementation extensions, so archives carrying one can be listed.
-        "ctime" => Some(info.ctime),
+        "ctime" => Some(info.entry.ctime),
         _ => None,
     }
 }
@@ -793,9 +860,248 @@ fn time_keyword(info: &ListEntryInfo, keyword: &str) -> Option<Option<u64>> {
 /// Whether the `D` conversion's device rendering applies to this entry.
 fn is_device(info: &ListEntryInfo) -> bool {
     matches!(
-        info.entry_type,
+        info.entry.entry_type,
         EntryType::BlockDevice | EntryType::CharDevice
     )
+}
+
+/// What a keyword named, before the conversion character has its say.
+enum Field {
+    /// The keyword names a field, and this member carries this value.
+    Value(Vec<u8>),
+    /// The keyword names a field the member's format does not have. Rule 7
+    /// defines the result as "the value from the applicable header field", and
+    /// there is no such field, so it contributes nothing.
+    Absent,
+}
+
+/// A numeric field's value. Decimal: a count, an id, a size or a time is read
+/// in decimal, and the "Octal number" column of POSIX's field tables describes
+/// how the header encodes the value, not how to print it -- the same `size` and
+/// `uid` are spelled in decimal by the pax extended-header table.
+fn fmt_decimal(value: u64) -> Field {
+    Field::Value(value.to_string().into_bytes())
+}
+
+/// A bitfield's value, in the radix it is read in. Reserved for the three
+/// fields whose only meaning is as stored bits: a mode, a header checksum, and
+/// `c_rdev`, which packs a major and minor into one number that reads as
+/// nothing else (8,0 is 4000).
+///
+/// Not `c_dev`, despite that field also holding a packed value on some cpio
+/// flavors. POSIX pairs `c_dev` with `c_ino` as "values that uniquely identify
+/// the file within the archive ... determined in an unspecified manner", so it
+/// is an opaque identifier rather than a device, and printing one of a pair in
+/// octal and the other in decimal would be the worse inconsistency.
+fn fmt_octal(value: u64) -> Field {
+    Field::Value(format!("{:o}", value).into_bytes())
+}
+
+/// A fixed-width header field's text value, escaped for the output stream.
+///
+/// Rule 7: "without any trailing NULs" -- and nothing else. A trailing <space>
+/// is part of the value, which is why GNU tar's `magic` of "ustar " reports
+/// with its space rather than being trimmed to a conforming-looking "ustar".
+/// The bytes come from the archive, so they go through `escaped` like a name.
+fn fmt_header_text(info: &ListEntryInfo, bytes: &[u8]) -> Field {
+    Field::Value(escaped(info, crate::formats::ustar::path_field(bytes)))
+}
+
+/// The ustar `name` and `prefix` fields for this member's pathname.
+///
+/// Derived from the pathname rather than read back from the header. That keeps
+/// rule 11's `(prefix,name)` default reconstructing exactly the name `%F`
+/// prints -- after `-s`, `--strip-components` or `-o path:=` rewrote it, and
+/// for a pax member whose real name lives in a `path=` record and whose stored
+/// `name` field is only a truncated fallback for readers that ignore it.
+fn ustar_name_prefix(path: &[u8]) -> (&[u8], &[u8]) {
+    if let Some(halves) = crate::formats::ustar::split_name_prefix(path) {
+        return halves;
+    }
+    // No `/` sits where the ustar fields could split this name, so neither
+    // field can hold it. Split at the last `/` anyway, so that rule 11's
+    // `(prefix,name)` still concatenates back to the pathname.
+    //
+    // Not when that `/` is the leading one: the prefix would be empty, and
+    // rule 11 joins only "the keywords that are non-null", so the separator
+    // would be dropped along with it and an absolute name would come back
+    // relative. The whole name goes in `name` instead.
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(i) if i > 0 => (&path[i + 1..], &path[..i]),
+        _ => (path, b""),
+    }
+}
+
+/// Resolve a keyword naming a pax extended-header record (POSIX rule 7, second
+/// bullet). `None` when the name is not one of those keywords.
+fn pax_keyword(info: &ListEntryInfo, keyword: &str) -> Option<Field> {
+    Some(match keyword {
+        "path" => Field::Value(fmt_fullpath(info)),
+        "linkpath" => Field::Value(fmt_link_target(info)),
+        "size" => fmt_decimal(info.entry.size),
+        "uid" => fmt_decimal(info.entry.uid as u64),
+        "gid" => fmt_decimal(info.entry.gid as u64),
+        "uname" => Field::Value(escaped(info, info.entry.uname.as_deref().unwrap_or(b""))),
+        "gname" => Field::Value(escaped(info, info.entry.gname.as_deref().unwrap_or(b""))),
+        // Records that describe the member without affecting extraction. They
+        // are keywords whether or not the archive used them: an operator runs
+        // `%(hdrcharset)s` precisely to find out whether one was declared, so
+        // an archive that declared nothing must report nothing rather than
+        // echoing the request back as a typo -- and must not report POSIX's
+        // implicit UTF-8 default either, which would make the two cases
+        // indistinguishable. Rule 7 asks for "the value from the ... extended
+        // header", and there is none.
+        "charset" | "hdrcharset" | "comment" => ext_record(info, keyword).unwrap_or(Field::Absent),
+        _ => return None,
+    })
+}
+
+/// An extended-header record's value, or `None` when this member carried no
+/// record under that keyword.
+///
+/// This also resolves a keyword naming an implementation extension (POSIX rule
+/// 7, third bullet) -- a `SCHILY.*` or `GNU.*` record, say. In the resolution
+/// chain it comes last, after all three required tables, so that a crafted
+/// archive cannot change what a required keyword means by recording a value
+/// under its name.
+fn ext_record(info: &ListEntryInfo, keyword: &str) -> Option<Field> {
+    Some(Field::Value(escaped(
+        info,
+        info.entry.ext_record(keyword)?.as_bytes(),
+    )))
+}
+
+/// Resolve a keyword naming a ustar Header Block field (POSIX rule 7, first
+/// bullet). `None` when the name is not in that table.
+///
+/// `magic`, `version`, `chksum` and `typeflag` describe the header itself and
+/// cannot be derived from anything else, so they are `Absent` for a member
+/// that was not read from a ustar header. The rest are properties of the file
+/// the entry already holds, so they answer whatever header it came from.
+fn ustar_keyword(info: &ListEntryInfo, keyword: &str) -> Option<Field> {
+    let path = crate::rawpath::as_bytes(&info.entry.path);
+    let ustar = match info.entry.source_header {
+        Some(SourceHeader::Ustar {
+            ref magic,
+            ref version,
+            chksum,
+            typeflag,
+        }) => Some((magic, version, chksum, typeflag)),
+        _ => None,
+    };
+
+    Some(match keyword {
+        "name" => Field::Value(escaped(info, ustar_name_prefix(path).0)),
+        "prefix" => Field::Value(escaped(info, ustar_name_prefix(path).1)),
+        // The ustar field and the pax `linkpath` record are two spellings of
+        // one datum, and the entry holds the effective value: a `linkpath`
+        // record has already overridden a truncated header field.
+        "linkname" => Field::Value(fmt_link_target(info)),
+        "mode" => fmt_octal((info.entry.mode & 0o7777) as u64),
+        "devmajor" => fmt_decimal(info.entry.devmajor as u64),
+        "devminor" => fmt_decimal(info.entry.devminor as u64),
+        "magic" => return Some(header_magic(info)),
+        "version" => match ustar {
+            Some((_, version, _, _)) => fmt_header_text(info, version),
+            None => Field::Absent,
+        },
+        "chksum" => match ustar {
+            Some((_, _, chksum, _)) => fmt_octal(chksum),
+            None => Field::Absent,
+        },
+        "typeflag" => match ustar {
+            // A NUL typeflag is the historical spelling of a regular file. It
+            // is a trailing NUL, which rule 7 excludes, so it reports as
+            // nothing rather than as an embedded NUL in the listing.
+            Some((_, _, _, typeflag)) => fmt_header_text(info, &[typeflag]),
+            None => Field::Absent,
+        },
+        _ => return None,
+    })
+}
+
+/// The cpio field names POSIX permits without the leading `c_`.
+///
+/// Only the names no other table claims. `mode`, `uid`, `gid`, `mtime`, `size`,
+/// `name` and `magic` keep their ustar and pax readings, which differ from the
+/// cpio ones in value as well as radix -- `mode` is the permission bits and
+/// `c_mode` carries the file type over them -- so honoring an unprefixed alias
+/// for those would silently change what an existing format string reports.
+const CPIO_UNPREFIXED: &[&str] = &[
+    "dev", "ino", "nlink", "rdev", "namesize", "filesize", "filedata",
+];
+
+/// Resolve a keyword naming an Octet-Oriented cpio Archive Entry field (POSIX
+/// rule 7, first bullet). `None` when the name is not in that table.
+///
+/// Rule 7: "The implementation may support the cpio keywords without the
+/// leading c_ in addition to the form required". Both spellings resolve, but
+/// the `c_` is stripped only when what remains is a cpio field name, so
+/// `%(c_bogus)s` keeps the literal echo that tells an operator about a typo.
+///
+/// `c_dev`, `c_ino` and `c_nlink` are `Absent` for a member that did not come
+/// from a cpio header: a ustar header records none of them, and the entry's
+/// zeros are placeholders rather than values read from an archive.
+fn cpio_keyword(info: &ListEntryInfo, keyword: &str) -> Option<Field> {
+    let field = match keyword.strip_prefix("c_") {
+        Some(rest) => rest,
+        None if CPIO_UNPREFIXED.contains(&keyword) => keyword,
+        None => return None,
+    };
+
+    let cpio = matches!(info.entry.source_header, Some(SourceHeader::Cpio { .. }));
+    let path = crate::rawpath::as_bytes(&info.entry.path);
+
+    Some(match field {
+        // Only `c_magic` reaches here: the unprefixed `magic` is the ustar
+        // table's name, claimed by `ustar_keyword`, and answers from either
+        // header. `c_magic` names the cpio field specifically, so a ustar
+        // member has none -- the same reading as c_dev and c_ino below.
+        "magic" if cpio => return Some(header_magic(info)),
+        "magic" => Field::Absent,
+        "dev" if cpio => fmt_decimal(info.entry.dev),
+        "ino" if cpio => fmt_decimal(info.entry.ino),
+        "nlink" if cpio => fmt_decimal(info.entry.nlink as u64),
+        "dev" | "ino" | "nlink" => Field::Absent,
+        "mode" => fmt_octal(
+            crate::formats::cpio::cpio_mode(info.entry.mode, info.entry.entry_type) as u64,
+        ),
+        "uid" => fmt_decimal(info.entry.uid as u64),
+        "gid" => fmt_decimal(info.entry.gid as u64),
+        "mtime" => fmt_decimal(info.entry.mtime),
+        "rdev" if is_device(info) => fmt_octal(crate::formats::cpio::pack_rdev(
+            info.entry.devmajor,
+            info.entry.devminor,
+        )),
+        "rdev" => fmt_octal(0),
+        // c_namesize counts the NUL cpio stores after the pathname.
+        "namesize" => fmt_decimal(path.len() as u64 + 1),
+        // A symbolic link's target is cpio's file data, so it is what
+        // c_filesize counts; the entry's own size is zero for one, which is
+        // what the pax `size` keyword reports. A hard link also carries a
+        // target, but cpio has no link typeflag and stores it as a regular
+        // file with its full contents, so it is not one of these.
+        "filesize" => match (info.entry.entry_type, info.entry.link_target.as_deref()) {
+            (EntryType::Symlink, Some(target)) => {
+                fmt_decimal(crate::rawpath::as_bytes(target).len() as u64)
+            }
+            _ => fmt_decimal(info.entry.size),
+        },
+        "name" => Field::Value(fmt_fullpath(info)),
+        // c_filedata is the member's contents, not a value a listing reports.
+        "filedata" => Field::Absent,
+        _ => return None,
+    })
+}
+
+/// `magic` / `c_magic`: the identifying value of whichever header this member
+/// came from, so the keyword answers for a tar and a cpio archive alike.
+fn header_magic(info: &ListEntryInfo) -> Field {
+    match info.entry.source_header {
+        Some(SourceHeader::Ustar { ref magic, .. }) => fmt_header_text(info, magic),
+        Some(SourceHeader::Cpio { format }) => Field::Value(format.magic_str().as_bytes().to_vec()),
+        None => Field::Absent,
+    }
 }
 
 /// Resolve a POSIX `%(keyword)X` listopt substitution to its rendered value.
@@ -822,25 +1128,30 @@ fn keyword_value(info: &ListEntryInfo, field: &str, conversion: char) -> Keyword
         };
     }
 
-    let value: Vec<u8> = match keyword {
-        "path" | "name" => fmt_fullpath(info),
-        "size" => info.size.to_string().into_bytes(),
-        "uid" => info.uid.to_string().into_bytes(),
-        "gid" => info.gid.to_string().into_bytes(),
-        "uname" => info.uname.unwrap_or("").as_bytes().to_vec(),
-        "gname" => info.gname.unwrap_or("").as_bytes().to_vec(),
-        "linkpath" => fmt_link_target(info),
-        "mode" => format!("{:o}", info.mode).into_bytes(),
-        _ => return KeywordValue::Unknown,
+    // Rules 11 and 12: `F` names a pathname assembled from a list of keywords,
+    // and `L` renders a symbolic link in terms of that pathname. Both may name
+    // more than one keyword, so they resolve the field themselves.
+    if matches!(conversion, 'F' | 'L') {
+        let mut rendered = match path_conversion(info, field.trim()) {
+            KeywordValue::Value(v) => v,
+            other => return other,
+        };
+        if conversion == 'L' {
+            push_link_expansion(&mut rendered, info);
+        }
+        return KeywordValue::Value(rendered);
+    }
+
+    let value = match keyword_field(info, keyword) {
+        Some(Field::Value(v)) => v,
+        Some(Field::Absent) => return KeywordValue::Absent,
+        None => return KeywordValue::Unknown,
     };
 
-    // The mode/pathname/symlink conversions describe how to render the entry
-    // rather than which field to read, so they still apply when a keyword was
-    // given (e.g. `%(path)F`).
+    // The mode conversion describes how to render the entry rather than which
+    // field to read, so it still applies when a keyword was given.
     let rendered = match conversion {
-        'M' => format_mode_symbolic(info.mode, info.entry_type).into_bytes(),
-        'F' => fmt_fullpath(info),
-        'L' => fmt_link_target(info),
+        'M' => format_mode_symbolic(info.entry.mode, info.entry.entry_type).into_bytes(),
         // Rule 10: D names the device of a block/character special file. When
         // that does not apply and a keyword was given, it degrades to
         // `%(keyword)u` -- so `%(size)D` on a regular file prints the size.
@@ -849,6 +1160,57 @@ fn keyword_value(info: &ListEntryInfo, field: &str, conversion: char) -> Keyword
         _ => value,
     };
     KeywordValue::Value(rendered)
+}
+
+/// Resolve one keyword against rule 7's keyword tables, in the order it lists
+/// them.
+///
+/// The pax table comes first because it owns the required reading of the names
+/// the tables share -- `size` and `uid` are decimal there and octal in the
+/// ustar header -- so an existing format string keeps its answer. Extension
+/// records come last, so a crafted archive cannot redefine a required name.
+fn keyword_field(info: &ListEntryInfo, keyword: &str) -> Option<Field> {
+    if let Some(seconds) = time_keyword(info, keyword) {
+        return Some(match seconds {
+            Some(secs) => Field::Value(secs.to_string().into_bytes()),
+            None => Field::Absent,
+        });
+    }
+    pax_keyword(info, keyword)
+        .or_else(|| ustar_keyword(info, keyword))
+        .or_else(|| cpio_keyword(info, keyword))
+        .or_else(|| ext_record(info, keyword))
+}
+
+/// Rule 11's `F` conversion: "The values for all the keywords that are
+/// non-null shall be concatenated together, each separated by a '/'."
+///
+/// So `%(prefix,name)F` rebuilds a pathname whose ustar spelling needed both
+/// halves, and a half this member does not carry drops out rather than leaving
+/// a stray separator.
+fn path_conversion(info: &ListEntryInfo, field: &str) -> KeywordValue {
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    for keyword in field.split(',') {
+        match keyword_field(info, keyword.trim()) {
+            Some(Field::Value(value)) if !value.is_empty() => parts.push(value),
+            Some(_) => {}
+            None => return KeywordValue::Unknown,
+        }
+    }
+    KeywordValue::Value(parts.join(&b'/'))
+}
+
+/// The ` -> target` a symbolic link's rule 12 expansion ends with, appended to
+/// `out`. Nothing for anything that is not a symbolic link, which is that
+/// rule's fallback to `F`.
+fn push_link_expansion(out: &mut Vec<u8>, info: &ListEntryInfo) {
+    if info.entry.entry_type != EntryType::Symlink {
+        return;
+    }
+    if let Some(target) = info.entry.link_target.as_deref() {
+        out.extend_from_slice(b" -> ");
+        out.extend_from_slice(&escaped(info, crate::rawpath::as_bytes(target)));
+    }
 }
 
 /// Entry type to file type character mapping for symbolic mode display
@@ -1035,6 +1397,57 @@ mod tests {
         assert_eq!(default_globexthdr_template(None), "/tmp/GlobalHead.%p.%n");
     }
 
+    /// `-o hdrcharset=` named the encoding of the path, linkpath, uname and
+    /// gname records, and was accepted unchecked: any string at all went
+    /// straight into the archive. pax has no character-set conversion, so a
+    /// third name would declare an encoding the values are not in.
+    #[test]
+    fn test_parse_hdrcharset_value_is_checked() {
+        // POSIX's two values, in any case, canonicalized to its spelling.
+        for spelling in ["BINARY", "binary", "Binary"] {
+            let opts = FormatOptions::parse(&format!("hdrcharset={spelling}")).unwrap();
+            assert_eq!(
+                opts.global_options().get("hdrcharset").map(String::as_str),
+                Some("BINARY"),
+                "{spelling} must record as POSIX's spelling"
+            );
+        }
+        let utf8 = FormatOptions::parse("hdrcharset=iso-ir 10646 2000 utf-8").unwrap();
+        assert_eq!(
+            utf8.global_options().get("hdrcharset").map(String::as_str),
+            Some("ISO-IR 10646 2000 UTF-8")
+        );
+
+        // A name pax cannot encode to is refused, and the message names the
+        // values it can.
+        let err = FormatOptions::parse("hdrcharset=ISO-8859-1").unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("BINARY") && text.contains("ISO-IR 10646 2000 UTF-8"),
+            "the refusal must name the supported values (got {text:?})"
+        );
+
+        // An empty value is POSIX's form for deleting a previously entered
+        // extended header value, not a charset name.
+        assert!(FormatOptions::parse("hdrcharset=").is_ok());
+
+        // The per-file form is checked the same way.
+        assert!(FormatOptions::parse("hdrcharset:=BINARY").is_ok());
+        assert!(FormatOptions::parse("hdrcharset:=nonesuch").is_err());
+    }
+
+    /// `charset` names the encoding of the file *data*, which POSIX says is
+    /// "included in an extended header for information only" and forbids pax
+    /// translating. Its value is an annotation to carry, not a name to check.
+    #[test]
+    fn test_parse_charset_value_is_carried_unchecked() {
+        let opts = FormatOptions::parse("charset=ISO-IR 8859 1 1998").unwrap();
+        assert_eq!(
+            opts.global_options().get("charset").map(String::as_str),
+            Some("ISO-IR 8859 1 1998")
+        );
+    }
+
     #[test]
     fn test_merge_options() {
         let mut opts1 = FormatOptions::parse("times").unwrap();
@@ -1053,27 +1466,31 @@ mod tests {
         String::from_utf8(format_list_entry(format, info)).expect("ASCII fixture")
     }
 
+    /// The formatter's view of a member, with escaping off.
+    ///
+    /// `ArchiveEntry` is `Default`, so a fixture below names only the fields
+    /// its assertions depend on -- which is the point of borrowing the entry
+    /// rather than copying a fixed subset of it into `ListEntryInfo`.
+    fn info(entry: &ArchiveEntry) -> ListEntryInfo<'_> {
+        ListEntryInfo {
+            entry,
+            style: crate::escape::Style::RAW,
+        }
+    }
+
     #[test]
     fn test_format_list_entry_basic() {
-        let info = ListEntryInfo {
-            path: std::path::Path::new("path/to/file.txt"),
+        let e = ArchiveEntry {
+            path: "path/to/file.txt".into(),
             mode: 0o644,
             size: 1234,
-            mtime: 0,
-            atime: None,
-            ctime: None,
             uid: 1000,
             gid: 1000,
-            uname: Some("user"),
-            gname: Some("group"),
-            link_target: None,
-            entry_type: EntryType::Regular,
-            devmajor: 0,
-            devminor: 0,
-            style: crate::escape::Style::RAW,
+            uname: Some("user".as_bytes().to_vec()),
+            gname: Some("group".as_bytes().to_vec()),
+            ..Default::default()
         };
-        let result = fmt("%F", &info);
-        assert_eq!(result, "path/to/file.txt");
+        assert_eq!(fmt("%F", &info(&e)), "path/to/file.txt");
     }
 
     /// `%.N` is a precision on the string, so it counts characters. Applying it
@@ -1081,23 +1498,13 @@ mod tests {
     /// character -- `%.1F` on any name with a non-ASCII first character.
     #[test]
     fn test_format_list_entry_precision_is_char_counted() {
-        let info = ListEntryInfo {
-            path: std::path::Path::new("élan.txt"),
+        let e = ArchiveEntry {
+            path: "élan.txt".into(),
             mode: 0o644,
-            size: 0,
-            mtime: 0,
-            atime: None,
-            ctime: None,
-            uid: 0,
-            gid: 0,
-            uname: Some("ünïcode"),
-            gname: None,
-            link_target: None,
-            entry_type: EntryType::Regular,
-            devmajor: 0,
-            devminor: 0,
-            style: crate::escape::Style::RAW,
+            uname: Some("ünïcode".as_bytes().to_vec()),
+            ..Default::default()
         };
+        let info = info(&e);
 
         // 'é' is two bytes; a byte-indexed truncate(1) split it and aborted.
         assert_eq!(fmt("%.1F", &info), "é");
@@ -1113,46 +1520,33 @@ mod tests {
 
     #[test]
     fn test_format_list_entry_complex() {
-        let info = ListEntryInfo {
-            path: std::path::Path::new("dir/file.txt"),
+        let e = ArchiveEntry {
+            path: "dir/file.txt".into(),
             mode: 0o755,
             size: 4096,
-            mtime: 0,
-            atime: None,
-            ctime: None,
             uid: 1000,
             gid: 1000,
-            uname: Some("alice"),
-            gname: Some("users"),
-            link_target: None,
-            entry_type: EntryType::Regular,
-            devmajor: 0,
-            devminor: 0,
-            style: crate::escape::Style::RAW,
+            uname: Some("alice".as_bytes().to_vec()),
+            gname: Some("users".as_bytes().to_vec()),
+            ..Default::default()
         };
-        let result = fmt("%M %u %g %s %f", &info);
+        let result = fmt("%M %u %g %s %f", &info(&e));
         assert_eq!(result, "-rwxr-xr-x alice users 4096 file.txt");
     }
 
     #[test]
     fn test_format_list_entry_keyword_substitution() {
-        let info = ListEntryInfo {
-            path: std::path::Path::new("dir/file.txt"),
+        let e = ArchiveEntry {
+            path: "dir/file.txt".into(),
             mode: 0o644,
             size: 4096,
-            mtime: 0,
-            atime: None,
-            ctime: None,
             uid: 1000,
             gid: 1000,
-            uname: Some("alice"),
-            gname: Some("users"),
-            link_target: None,
-            entry_type: EntryType::Regular,
-            devmajor: 0,
-            devminor: 0,
-            style: crate::escape::Style::RAW,
+            uname: Some("alice".as_bytes().to_vec()),
+            gname: Some("users".as_bytes().to_vec()),
+            ..Default::default()
         };
+        let info = info(&e);
 
         // POSIX `%(keyword)s`/`%(keyword)d` substitution.
         assert_eq!(fmt("%(path)s %(size)d", &info), "dir/file.txt 4096");
@@ -1228,24 +1622,17 @@ mod tests {
     #[test]
     fn test_format_list_entry_device() {
         // Test %D format specifier for device major,minor
-        let info = ListEntryInfo {
-            path: std::path::Path::new("/dev/sda"),
+        let e = ArchiveEntry {
+            path: "/dev/sda".into(),
             mode: 0o660,
-            size: 0,
-            mtime: 0,
-            atime: None,
-            ctime: None,
-            uid: 0,
-            gid: 0,
-            uname: Some("root"),
-            gname: Some("disk"),
-            link_target: None,
+            uname: Some("root".as_bytes().to_vec()),
+            gname: Some("disk".as_bytes().to_vec()),
             entry_type: EntryType::BlockDevice,
             devmajor: 8,
             devminor: 0,
-            style: crate::escape::Style::RAW,
+            ..Default::default()
         };
-        let result = fmt("%M %D %f", &info);
+        let result = fmt("%M %D %f", &info(&e));
         assert_eq!(result, "brw-rw---- 8,0 sda");
     }
 
@@ -1253,46 +1640,435 @@ mod tests {
     fn test_format_list_entry_different_types() {
         // Test that %M correctly uses entry_type for file type character
         // Directory
-        let info = ListEntryInfo {
-            path: std::path::Path::new("mydir"),
+        let e = ArchiveEntry {
+            path: "mydir".into(),
             mode: 0o755,
-            size: 0,
-            mtime: 0,
-            atime: None,
-            ctime: None,
-            uid: 0,
-            gid: 0,
-            uname: None,
-            gname: None,
-            link_target: None,
             entry_type: EntryType::Directory,
-            devmajor: 0,
-            devminor: 0,
-            style: crate::escape::Style::RAW,
+            ..Default::default()
         };
-        let result = fmt("%M", &info);
-        assert_eq!(result, "drwxr-xr-x");
+        assert_eq!(fmt("%M", &info(&e)), "drwxr-xr-x");
 
         // Symlink
-        let info = ListEntryInfo {
-            path: std::path::Path::new("mylink"),
+        let e = ArchiveEntry {
+            path: "mylink".into(),
             mode: 0o777,
-            size: 0,
-            mtime: 0,
-            atime: None,
-            ctime: None,
-            uid: 0,
-            gid: 0,
-            uname: None,
-            gname: None,
-            link_target: Some(std::path::Path::new("target")),
+            link_target: Some("target".into()),
             entry_type: EntryType::Symlink,
-            devmajor: 0,
-            devminor: 0,
-            style: crate::escape::Style::RAW,
+            ..Default::default()
         };
-        let result = fmt("%M", &info);
-        assert_eq!(result, "lrwxrwxrwx");
+        assert_eq!(fmt("%M", &info(&e)), "lrwxrwxrwx");
+    }
+
+    /// A member as a ustar reader produces it, with the header-identity
+    /// fields a conforming writer puts there.
+    fn ustar_entry(path: &str, typeflag: u8) -> ArchiveEntry {
+        ArchiveEntry {
+            path: path.into(),
+            source_header: Some(SourceHeader::Ustar {
+                magic: *b"ustar\0",
+                version: *b"00",
+                chksum: 0o6414,
+                typeflag,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// POSIX listopt rule 7 requires every Field Name entry of the ustar
+    /// Header Block table as a `%(keyword)`. Eight of them resolved to nothing
+    /// and were echoed back as their own specification.
+    #[test]
+    fn test_keyword_ustar_header_fields() {
+        let e = ArchiveEntry {
+            mode: 0o644,
+            size: 1234,
+            uid: 1000,
+            gid: 100,
+            uname: Some("alice".as_bytes().to_vec()),
+            gname: Some("users".as_bytes().to_vec()),
+            ..ustar_entry("dir/file.txt", b'0')
+        };
+        let info = info(&e);
+
+        assert_eq!(fmt("%(magic)s", &info), "ustar");
+        assert_eq!(fmt("%(version)s", &info), "00");
+        assert_eq!(fmt("%(typeflag)s", &info), "0");
+        assert_eq!(fmt("%(chksum)s", &info), "6414");
+        assert_eq!(fmt("%(name)s", &info), "dir/file.txt");
+        assert_eq!(fmt("%(prefix)s", &info), "");
+        assert_eq!(fmt("%(mode)s", &info), "644");
+        assert_eq!(fmt("%(uid)s/%(gid)s", &info), "1000/100");
+        assert_eq!(fmt("%(size)s", &info), "1234");
+        assert_eq!(fmt("%(uname)s:%(gname)s", &info), "alice:users");
+        assert_eq!(fmt("%(devmajor)s,%(devminor)s", &info), "0,0");
+        assert_eq!(fmt("%(linkname)s", &info), "");
+    }
+
+    /// Rule 7 strips trailing NULs from a header field value and nothing else.
+    /// GNU tar writes `magic` as "ustar " and `version` as " \0", and trimming
+    /// the whitespace too would report a conforming-looking header that is not
+    /// what the archive holds.
+    #[test]
+    fn test_keyword_header_text_strips_nuls_only() {
+        let e = ArchiveEntry {
+            source_header: Some(SourceHeader::Ustar {
+                magic: *b"ustar ",
+                version: *b" \0",
+                chksum: 0,
+                typeflag: b'0',
+            }),
+            ..ustar_entry("f.txt", b'0')
+        };
+        assert_eq!(fmt("[%(magic)s]", &info(&e)), "[ustar ]");
+        assert_eq!(fmt("[%(version)s]", &info(&e)), "[ ]");
+
+        // A NUL typeflag is the historical spelling of a regular file, and is
+        // itself a trailing NUL: it reports as nothing, not as a NUL byte.
+        let areg = ustar_entry("f.txt", b'\0');
+        assert_eq!(fmt("[%(typeflag)s]", &info(&areg)), "[]");
+    }
+
+    /// `name` and `prefix` are the two halves of the ustar spelling of the
+    /// pathname, so concatenating them must give the name `%F` prints -- rule
+    /// 11 makes `(prefix,name)` the default for `%F` when `path` is undefined.
+    #[test]
+    fn test_keyword_name_prefix_reconstruct_the_path() {
+        // Short enough for the name field alone: prefix is empty.
+        let short = ustar_entry("dir/f.txt", b'0');
+        assert_eq!(fmt("%(name)s", &info(&short)), "dir/f.txt");
+        assert_eq!(fmt("%(prefix)s", &info(&short)), "");
+
+        // Long enough to need the split.
+        let long_dir = "d".repeat(110);
+        let split = ustar_entry(&format!("{long_dir}/f.txt"), b'0');
+        assert_eq!(fmt("%(name)s", &info(&split)), "f.txt");
+        assert_eq!(fmt("%(prefix)s", &info(&split)), long_dir);
+        assert_eq!(
+            fmt("%(prefix)s/%(name)s", &info(&split)),
+            fmt("%(path)s", &info(&split))
+        );
+
+        // Over-long with no `/` the ustar fields could split at. Neither field
+        // can hold this name, but the halves must still rebuild it.
+        let huge = "x".repeat(120);
+        let unsplittable = ustar_entry(&format!("d/{huge}"), b'0');
+        assert_eq!(fmt("%(prefix)s", &info(&unsplittable)), "d");
+        assert_eq!(fmt("%(name)s", &info(&unsplittable)), huge);
+        assert_eq!(
+            fmt("%(prefix)s/%(name)s", &info(&unsplittable)),
+            fmt("%(path)s", &info(&unsplittable))
+        );
+
+        // No `/` at all: the whole name is the name field.
+        let flat = ustar_entry(&"y".repeat(150), b'0');
+        assert_eq!(fmt("%(prefix)s", &info(&flat)), "");
+        assert_eq!(fmt("%(name)s", &info(&flat)), "y".repeat(150));
+
+        // An absolute name too long for the name field whose only `/` is the
+        // leading one. Splitting there leaves the prefix empty, and rule 11
+        // concatenates only "the keywords that are non-null" -- so the
+        // separator goes with the dropped prefix and the leading `/` vanishes
+        // from the reconstruction.
+        let abs = format!("/{}", "x".repeat(120));
+        let rooted = ustar_entry(&abs, b'0');
+        assert_eq!(fmt("%(name)s", &info(&rooted)), abs);
+        assert_eq!(fmt("%(prefix)s", &info(&rooted)), "");
+        assert_eq!(
+            fmt("%(prefix,name)F", &info(&rooted)),
+            fmt("%F", &info(&rooted)),
+            "rule 11's default must rebuild an absolute name too"
+        );
+    }
+
+    /// The four header-identity keywords describe a ustar header. A cpio
+    /// member has none of them, so rule 7 leaves them with no value to report
+    /// -- which is not the same as the name being unknown, and must not bring
+    /// back the literal echo.
+    #[test]
+    fn test_keyword_ustar_identity_absent_for_a_cpio_member() {
+        let e = ArchiveEntry {
+            path: "f.txt".into(),
+            source_header: Some(SourceHeader::Cpio {
+                format: crate::formats::cpio::CpioFormat::Odc,
+            }),
+            ..Default::default()
+        };
+        let info = info(&e);
+
+        assert_eq!(fmt("[%(version)s]", &info), "[]");
+        assert_eq!(fmt("[%(chksum)s]", &info), "[]");
+        assert_eq!(fmt("[%(typeflag)s]", &info), "[]");
+        // `magic` is in both tables, so it answers for either header.
+        assert_eq!(fmt("%(magic)s", &info), "070707");
+        // And a name in no table still echoes.
+        assert_eq!(fmt("%(bogus)s", &info), "%(bogus)s");
+    }
+
+    /// `%(mode)` formatted the whole mode word while `%m` masked it, so a
+    /// header carrying S_IFMT bits printed `644` and `100644` on one line.
+    #[test]
+    fn test_keyword_mode_masks_the_file_type_bits() {
+        let e = ArchiveEntry {
+            mode: 0o100644,
+            ..ustar_entry("f.txt", b'0')
+        };
+        assert_eq!(fmt("%m", &info(&e)), "644");
+        assert_eq!(fmt("%(mode)s", &info(&e)), "644");
+    }
+
+    /// A member as a cpio reader produces it: the flavor recorded, the mode
+    /// already stripped of its file type bits (`C_PERM_MASK`).
+    fn cpio_entry(path: &str, format: crate::formats::cpio::CpioFormat) -> ArchiveEntry {
+        ArchiveEntry {
+            path: path.into(),
+            source_header: Some(SourceHeader::Cpio { format }),
+            ..Default::default()
+        }
+    }
+
+    /// POSIX listopt rule 7 requires every Field Name entry of the
+    /// Octet-Oriented cpio Archive Entry table as a `%(keyword)`, and permits
+    /// the same names without the leading `c_`. None of them resolved.
+    #[test]
+    fn test_keyword_cpio_header_fields() {
+        use crate::formats::cpio::CpioFormat;
+        let e = ArchiveEntry {
+            mode: 0o644,
+            uid: 1000,
+            gid: 100,
+            size: 1234,
+            mtime: 99,
+            dev: 8,
+            ino: 64,
+            nlink: 9,
+            ..cpio_entry("a/b.txt", CpioFormat::Odc)
+        };
+        let info = info(&e);
+
+        assert_eq!(fmt("%(c_magic)s", &info), "070707");
+        assert_eq!(fmt("%(c_dev)s", &info), "8");
+        assert_eq!(fmt("%(c_ino)s", &info), "64");
+        assert_eq!(fmt("%(c_nlink)s", &info), "9");
+        assert_eq!(fmt("%(c_uid)s/%(c_gid)s", &info), "1000/100");
+        assert_eq!(fmt("%(c_mtime)s", &info), "99");
+        assert_eq!(fmt("%(c_filesize)s", &info), "1234");
+        assert_eq!(fmt("%(c_name)s", &info), "a/b.txt");
+        // c_namesize counts the NUL stored after the pathname.
+        assert_eq!(fmt("%(c_namesize)s", &info), "8");
+        // c_mode carries the file type over the permission bits, which is the
+        // one place the full mode word stays reachable.
+        assert_eq!(fmt("%(c_mode)s", &info), "100644");
+        // c_filedata is the contents, not a value a listing reports.
+        assert_eq!(fmt("[%(c_filedata)s]", &info), "[]");
+
+        // The unprefixed spellings rule 7 permits, for the names no other
+        // table claims.
+        assert_eq!(
+            fmt("%(dev)s|%(ino)s|%(nlink)s|%(namesize)s|%(filesize)s", &info),
+            "8|64|9|8|1234"
+        );
+    }
+
+    /// Each cpio flavor reports the `c_magic` it identifies itself with. ODC
+    /// and the old binary format share "070707", which is why the entry
+    /// records the flavor rather than the digits.
+    #[test]
+    fn test_keyword_cpio_magic_per_flavor() {
+        use crate::formats::cpio::CpioFormat;
+        for (format, magic) in [
+            (CpioFormat::Odc, "070707"),
+            (CpioFormat::Newc, "070701"),
+            (CpioFormat::NewcCrc, "070702"),
+            (CpioFormat::Binary, "070707"),
+        ] {
+            let e = cpio_entry("f", format);
+            assert_eq!(fmt("%(c_magic)s", &info(&e)), magic, "{:?}", format);
+            // `magic` is in both tables, so it answers for a cpio header too.
+            assert_eq!(fmt("%(magic)s", &info(&e)), magic, "{:?}", format);
+        }
+    }
+
+    /// `c_dev`, `c_ino` and `c_nlink` have no ustar counterpart, so a tar
+    /// member has no value to report -- which must stay distinct from the name
+    /// being unknown. An unprefixed cpio alias must not claim a name the ustar
+    /// or pax table owns, and a `c_`-prefixed typo must still echo.
+    #[test]
+    fn test_keyword_cpio_fields_absent_for_a_ustar_member() {
+        let e = ArchiveEntry {
+            mode: 0o644,
+            size: 7,
+            ..ustar_entry("f.txt", b'0')
+        };
+        let info = info(&e);
+
+        assert_eq!(
+            fmt("[%(c_dev)s%(c_ino)s%(c_nlink)s%(c_magic)s]", &info),
+            "[]"
+        );
+        // While the unprefixed `magic` is the ustar table's name, so it does
+        // answer -- and answers from a cpio header too.
+        assert_eq!(fmt("%(magic)s", &info), "ustar");
+        // Derivable from what the entry already holds, so these still answer.
+        assert_eq!(fmt("%(c_mode)s", &info), "100644");
+        assert_eq!(fmt("%(c_filesize)s", &info), "7");
+        assert_eq!(fmt("%(c_namesize)s", &info), "6");
+        // `mode` keeps its ustar reading; only `c_mode` carries the type bits.
+        assert_eq!(fmt("%(mode)s", &info), "644");
+        // A typo in either spelling is echoed, not silently empty.
+        assert_eq!(fmt("%(c_bogus)s", &info), "%(c_bogus)s");
+        assert_eq!(fmt("%(filedata)s", &info), "");
+        assert_eq!(fmt("%(bogus)s", &info), "%(bogus)s");
+    }
+
+    /// cpio packs a device number into one c_rdev field, and stores a symbolic
+    /// link's target as the member's data -- so c_filesize counts the target,
+    /// while the pax `size` keyword reports the entry's own zero.
+    #[test]
+    fn test_keyword_cpio_rdev_and_symlink_filesize() {
+        use crate::formats::cpio::CpioFormat;
+        let dev = ArchiveEntry {
+            mode: 0o660,
+            entry_type: EntryType::CharDevice,
+            devmajor: 8,
+            devminor: 0,
+            ..cpio_entry("chr", CpioFormat::Odc)
+        };
+        assert_eq!(fmt("%(c_rdev)s", &info(&dev)), "4000");
+        assert_eq!(fmt("%(devmajor)s,%(devminor)s", &info(&dev)), "8,0");
+        assert_eq!(fmt("%D", &info(&dev)), "8,0");
+
+        // Not a device: the field is zero, as the writer records it.
+        let plain = cpio_entry("f", CpioFormat::Odc);
+        assert_eq!(fmt("%(c_rdev)s", &info(&plain)), "0");
+
+        let link = ArchiveEntry {
+            entry_type: EntryType::Symlink,
+            link_target: Some("target".into()),
+            ..cpio_entry("l", CpioFormat::Odc)
+        };
+        assert_eq!(fmt("%(size)s", &info(&link)), "0");
+        assert_eq!(fmt("%(c_filesize)s", &info(&link)), "6");
+        assert_eq!(fmt("%(linkname)s", &info(&link)), "target");
+        assert_eq!(fmt("%(linkpath)s", &info(&link)), "target");
+
+        // A hard link also carries a target, but cpio stores it as a regular
+        // file with its own contents, so c_filesize is the size.
+        let hard = ArchiveEntry {
+            entry_type: EntryType::Hardlink,
+            link_target: Some("original.txt".into()),
+            size: 42,
+            ..cpio_entry("h", CpioFormat::Odc)
+        };
+        assert_eq!(fmt("%(c_filesize)s", &info(&hard)), "42");
+    }
+
+    /// POSIX listopt rule 7 requires every pax extended-header keyword as a
+    /// `%(keyword)`, and names `"%(charset)s"` as its own example. `charset`,
+    /// `hdrcharset` and `comment` resolved to nothing: the reader dropped the
+    /// records on the way to the entry, so the listing could not see them.
+    #[test]
+    fn test_keyword_pax_extended_header_records() {
+        let mut e = ustar_entry("f.txt", b'0');
+        e.set_ext_record("charset", "ISO-IR 10646 2000 UTF-8");
+        e.set_ext_record("hdrcharset", "BINARY");
+        e.set_ext_record("comment", "written by hand");
+        // Rule 7's third bullet: an implementation extension is a keyword too.
+        e.set_ext_record("SCHILY.fflags", "nodump");
+        let info = info(&e);
+
+        assert_eq!(fmt("%(charset)s", &info), "ISO-IR 10646 2000 UTF-8");
+        assert_eq!(fmt("%(hdrcharset)s", &info), "BINARY");
+        assert_eq!(fmt("%(comment)s", &info), "written by hand");
+        assert_eq!(fmt("%(SCHILY.fflags)s", &info), "nodump");
+    }
+
+    /// A member that declared none of them must report nothing, not POSIX's
+    /// implicit UTF-8 default: an operator runs `%(hdrcharset)s` to find out
+    /// whether a record was there, and synthesizing the default would make
+    /// "declared UTF-8" and "declared nothing" indistinguishable. A keyword in
+    /// no table at all still echoes, so a typo stays visible.
+    #[test]
+    fn test_keyword_pax_records_absent_but_not_unknown() {
+        let e = ustar_entry("f.txt", b'0');
+        let info = info(&e);
+
+        assert_eq!(fmt("[%(charset)s]", &info), "[]");
+        assert_eq!(fmt("[%(hdrcharset)s]", &info), "[]");
+        assert_eq!(fmt("[%(comment)s]", &info), "[]");
+        assert_eq!(fmt("%(SCHILY.fflags)s", &info), "%(SCHILY.fflags)s");
+        assert_eq!(fmt("%(bogus)s", &info), "%(bogus)s");
+    }
+
+    /// An extension record must not be able to redefine a required keyword: a
+    /// crafted archive recording `mode=rwx` has to leave `%(mode)s` reporting
+    /// the header field, which is why the extension lookup comes last.
+    #[test]
+    fn test_keyword_extension_record_cannot_shadow_a_required_name() {
+        let mut e = ArchiveEntry {
+            mode: 0o644,
+            ..ustar_entry("f.txt", b'0')
+        };
+        e.set_ext_record("mode", "rwx");
+        e.set_ext_record("typeflag", "9");
+        let info = info(&e);
+
+        assert_eq!(fmt("%(mode)s", &info), "644");
+        assert_eq!(fmt("%(typeflag)s", &info), "0");
+    }
+
+    /// Rule 11: the `F` conversion may name a <comma>-separated keyword list,
+    /// whose non-null values are joined with `/`. `%(prefix,name)F` is the
+    /// default POSIX gives for a member with no `path` record, and the list
+    /// form was not parsed at all -- the whole specification echoed back.
+    #[test]
+    fn test_conversion_f_concatenates_its_keywords() {
+        let long_dir = "d".repeat(110);
+        let e = ustar_entry(&format!("{long_dir}/f.txt"), b'0');
+        let split = info(&e);
+
+        assert_eq!(fmt("%(prefix,name)F", &split), format!("{long_dir}/f.txt"));
+        assert_eq!(fmt("%(prefix,name)F", &split), fmt("%F", &split));
+        // One keyword is the degenerate list, and names that keyword's value
+        // rather than the whole pathname.
+        assert_eq!(fmt("%(name)F", &split), "f.txt");
+        assert_eq!(fmt("%(prefix)F", &split), long_dir);
+
+        // "all the keywords that are non-null": an empty half contributes
+        // nothing, and leaves no separator behind.
+        let e = ustar_entry("f.txt", b'0');
+        assert_eq!(fmt("%(prefix,name)F", &info(&e)), "f.txt");
+
+        // A name in no table still echoes, even inside a list.
+        assert_eq!(fmt("%(prefix,bogus)F", &split), "%(prefix,bogus)F");
+    }
+
+    /// Rule 12: `%L` expands a symbolic link to `"%s -> %s"` of the pathname
+    /// and the link's contents, and is "the equivalent of %F" for anything
+    /// else. Bare `%L` had no handler and printed itself; the keyword form
+    /// printed only the target, dropping the name and the arrow.
+    #[test]
+    fn test_conversion_l_expands_a_symbolic_link() {
+        let link = ArchiveEntry {
+            entry_type: EntryType::Symlink,
+            link_target: Some("sub/target.txt".into()),
+            ..ustar_entry("mylink", b'2')
+        };
+        assert_eq!(fmt("%L", &info(&link)), "mylink -> sub/target.txt");
+        assert_eq!(fmt("%(path)L", &info(&link)), "mylink -> sub/target.txt");
+
+        // Not a link: equivalent to %F.
+        let plain = ustar_entry("f.txt", b'0');
+        assert_eq!(fmt("%L", &info(&plain)), fmt("%F", &info(&plain)));
+        assert_eq!(fmt("%(path)L", &info(&plain)), "f.txt");
+
+        // A hard link is not a symbolic link, so it is %F too -- its target is
+        // another member, not contents to follow.
+        let hard = ArchiveEntry {
+            entry_type: EntryType::Hardlink,
+            link_target: Some("original.txt".into()),
+            ..ustar_entry("h", b'1')
+        };
+        assert_eq!(fmt("%L", &info(&hard)), "h");
     }
 
     #[test]

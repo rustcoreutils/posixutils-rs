@@ -135,6 +135,16 @@ struct S8f { float a, b; };
 struct S16 { long a, b; };
 struct S24 { long p, q, r; };
 struct S200 { long v[25]; };
+/* Whether this source may use the shapes clang lowers differently under
+   `ms_abi`: `long double`, which clang returns in ST0 where gcc -- the
+   convention c17 follows -- writes it through the hidden pointer, and
+   `_Float16`, which it disagrees on too. True everywhere but Apple, where
+   clang is the other half of the interop pair -- and true there for the
+   single-unit runs, which c17 compiles alone and which define `C17_ALONE`.
+   `cc/DECISIONS.md` records the divergence. */
+#if !defined(__APPLE__) || defined(C17_ALONE)
+#define WIDE_SCALARS 1
+#endif
 "#;
 
 const TYPES_CALLEE: &str = r#"
@@ -160,12 +170,20 @@ MS struct S24 t_sret4(long a, long b, long c, double d) {
 }
 MS struct S3 t_rs3(char x) { struct S3 s = { x, (char)(x + 1), (char)(x + 2) }; return s; }
 MS struct S8f t_rs8f(float x) { struct S8f s = { x, x * 2 }; return s; }
+#ifdef WIDE_SCALARS
 MS long double t_ld(long double a, long x, long double b) { return a * 2 + x + b; }
+#endif
 MS __int128 t_i128(__int128 a, __int128 b) { return a * 3 + b; }
 MS float _Complex t_fc(float _Complex a, double _Complex b) { return a + (float _Complex)b; }
 MS double _Complex t_dc(double _Complex a) { return a * 2; }
+#ifdef WIDE_SCALARS
 MS _Float16 t_h(_Float16 a, _Float16 b) { return a + b; }
+#endif
+/* Apple's targets have no `__float128`: clang refuses it there and so
+   does c17, so it is out of this source on Apple altogether. */
+#ifndef __APPLE__
 MS __float128 t_q(__float128 a, long x) { return a + x; }
+#endif
 MS _Bool t_bool(_Bool b, unsigned char c, short s) { return b && c == 200 && s == -5; }
 MS long t_add6(long a, long b, long c, long d, long e, long f) {
     return a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6;
@@ -191,12 +209,18 @@ MS long t_big5(long, long, long, long, struct S200, double);
 MS struct S24 t_sret4(long, long, long, double);
 MS struct S3 t_rs3(char);
 MS struct S8f t_rs8f(float);
+#ifdef WIDE_SCALARS
 MS long double t_ld(long double, long, long double);
+#endif
 MS __int128 t_i128(__int128, __int128);
 MS float _Complex t_fc(float _Complex, double _Complex);
 MS double _Complex t_dc(double _Complex);
+#ifdef WIDE_SCALARS
 MS _Float16 t_h(_Float16, _Float16);
+#endif
+#ifndef __APPLE__
 MS __float128 t_q(__float128, long);
+#endif
 MS _Bool t_bool(_Bool, unsigned char, short);
 MS long t_add6(long, long, long, long, long, long);
 MS long t_call6(MS long (*)(long, long, long, long, long, long), long);
@@ -220,15 +244,21 @@ int main(void) {
     if (rs.a != 10 || rs.b != 11 || rs.c != 12) return 7;
     struct S8f rf = t_rs8f(1.5f);
     if (rf.a != 1.5f || rf.b != 3.0f) return 8;
+#ifdef WIDE_SCALARS
     if (t_ld(1.5L, 2, 0.25L) != 5.25L) return 9;
+#endif
     __int128 big = ((__int128)1 << 100) + 7;
     if (t_i128(big, 5) != big * 3 + 5) return 10;
     float _Complex fc = t_fc(1.0f + 2.0f * 1.0iF, 3.0 + 4.0 * 1.0i);
     if (__real__ fc != 4.0f || __imag__ fc != 6.0f) return 11;
     double _Complex dc = t_dc(1.5 + 2.5 * 1.0i);
     if (__real__ dc != 3.0 || __imag__ dc != 5.0) return 12;
+#ifdef WIDE_SCALARS
     if (t_h((_Float16)1.5, (_Float16)2.25) != (_Float16)3.75) return 13;
+#endif
+#ifndef __APPLE__
     if (t_q((__float128)0.5, 3) != (__float128)3.5) return 14;
+#endif
     if (t_bool(1, 200, -5) != 1) return 15;
     if (t_call6(t_add6, 1) != 1 + 4 + 9 + 16 + 25 + 36 + 91) return 16;
     if (t_aligned(3, 2.0) != 3 * 28 + 2) return 17;
@@ -243,7 +273,9 @@ int main(void) {
 /// pointer -- the hidden return pointer ahead of four more arguments, and
 /// the wide scalars: `long double`, `__int128` (returned whole in XMM0),
 /// complex values, `_Float16` (in the integer position, as gcc has it) and
-/// `__float128`.
+/// `__float128`. `long double` and `_Float16` are not cross-checked on Apple,
+/// whose compiler lowers them differently, and `__float128` is absent there;
+/// see the note in `TYPES_CALLEE`.
 #[test]
 fn codegen_ms_abi_types_interoperate_with_gcc() {
     if !cfg!(target_arch = "x86_64") {
@@ -385,7 +417,13 @@ __attribute__((noinline)) static int preserved(void) {
         "movq $116, %%rsi\n\tmovq $117, %%rdi\n\t"
         "movq %%rsp, %%rbx\n\tsubq $128, %%rsp\n\tandq $-16, %%rsp\n\tsubq $32, %%rsp\n\t"
         "movl $5, %%ecx\n\tmovq $0x3ff8000000000000, %%rax\n\tmovq %%rax, %%xmm1\n\t"
+        /* A C symbol is `_name` in Mach-O and `name` everywhere else, and
+           this `call` names one by hand. */
+#ifdef __APPLE__
+        "call _t_calls_sysv\n\t"
+#else
         "call t_calls_sysv\n\t"
+#endif
         "movq %%rbx, %%rsp\n\t"
         "movq %%xmm6, 0(%0)\n\tmovq %%xmm7, 8(%0)\n\tmovq %%xmm8, 16(%0)\n\t"
         "movq %%xmm9, 24(%0)\n\tmovq %%xmm10, 32(%0)\n\tmovq %%xmm11, 40(%0)\n\t"
@@ -444,6 +482,9 @@ fn codegen_ms_abi_preserves_registers_across_sysv_calls() {
 /// Both conventions in one translation unit, so the inliner meets them: an
 /// `ms_abi` function inlined into a System V caller and the reverse must
 /// agree on how each argument travels.
+///
+/// c17 compiles both halves here, so `C17_ALONE` keeps the shapes the host
+/// interop pair has to leave out on Apple -- see `TYPES`.
 #[test]
 fn codegen_ms_abi_inlines_across_conventions() {
     if !cfg!(target_arch = "x86_64") {
@@ -452,14 +493,22 @@ fn codegen_ms_abi_inlines_across_conventions() {
     let src = format!("{TYPES}{TYPES_CALLEE}{}", TYPES_CALLER);
     for opt in ["-O0", "-O1", "-O2", "-O3"] {
         assert_eq!(
-            compile_and_run("ms_abi_inline", &src, &[opt.to_string()]),
+            compile_and_run(
+                "ms_abi_inline",
+                &src,
+                &["-DC17_ALONE".to_string(), opt.to_string()]
+            ),
             0,
             "{opt}"
         );
     }
     let src = format!("{TYPES}{VARIADIC_CALLEE}{VARIADIC_CALLER}");
     assert_eq!(
-        compile_and_run("ms_abi_inline_va", &src, &["-O2".to_string()]),
+        compile_and_run(
+            "ms_abi_inline_va",
+            &src,
+            &["-DC17_ALONE".to_string(), "-O2".to_string()]
+        ),
         0
     );
 }

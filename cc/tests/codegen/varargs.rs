@@ -10,6 +10,8 @@
 // and many-argument calls.
 //
 
+// Used only by the assembly assertion below, which is linux-x86-64 only.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::floating::OVER_ALIGNED_LONG_DOUBLE;
 use crate::common::{
     compile_and_run, compile_and_run_aarch64, compile_and_run_everywhere,

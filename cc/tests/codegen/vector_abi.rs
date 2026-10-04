@@ -18,8 +18,10 @@
 // they are checked with c17 on both sides rather than against the host
 // compiler. `GCC_VECTORS` below marks them.
 //
+// The assembly and diagnostic checks compile in process, in
+// `cc/test_asm/codegen_vector_abi.rs`.
+//
 
-use super::asm_probe::{asm_for, body_of, AARCH64_DARWIN, AARCH64_LINUX};
 use crate::common::{
     aarch64_cross_available, compile_and_run_two_units, interop_aarch64, interop_host,
 };
@@ -136,7 +138,7 @@ struct s1sf gs1sf(struct s1sf x) { x.a *= x.f; x.f += 1; return x; }
 "#;
 
 const CALLER: &str = r#"
-int main(void) {
+static int run_vectors(void) {
     v4si a = {1, 2, 3, 4};
     v2si p = {3, 4};
     v2hi h = {10, 20}, h1 = {1, 2};
@@ -194,10 +196,67 @@ int main(void) {
 }
 "#;
 
+const SHIFT_DECLS: &str = r#"
+typedef int v4si __attribute__((vector_size(16)));
+typedef unsigned v4su __attribute__((vector_size(16)));
+typedef short v8hi __attribute__((vector_size(16)));
+v4si shl(v4si v, int n);
+v4su lsr(v4su v, int n);
+v4si asr(v4si v, int n);
+v8hi shlw(v8hi v, int n);
+"#;
+
+const SHIFT_CALLEE: &str = r#"
+v4si shl(v4si v, int n) { return v << n; }
+v4su lsr(v4su v, int n) { return v >> n; }
+v4si asr(v4si v, int n) { return v >> n; }
+v8hi shlw(v8hi v, int n) { return v << n; }
+"#;
+
+/// A vector shifted by a scalar count reads the count at its own width.
+/// SSE's shifts take the whole low quadword of the count register, and the
+/// System V convention leaves the bits above an `int` argument undefined:
+/// the count was moved 64 bits wide, so a caller's garbage there shifted
+/// every lane out. The caller here passes each count as a `long` with
+/// garbage above the 32 bits the callee's `int` reads.
+///
+/// The caller passes each count as a `long` with garbage above the 32 bits
+/// the callee's `int` reads. Run as part of `vector_abi_interop_host`, exit
+/// codes 31..=34.
+const SHIFT_CALLER: &str = r#"
+static int run_shift(void) {
+    v4si (*fl)(v4si, long) = (v4si (*)(v4si, long))shl;
+    v4su (*fr)(v4su, long) = (v4su (*)(v4su, long))lsr;
+    v4si (*fa)(v4si, long) = (v4si (*)(v4si, long))asr;
+    v8hi (*fw)(v8hi, long) = (v8hi (*)(v8hi, long))shlw;
+    v4si l = fl((v4si){1, 2, 3, 4}, 0x500000002L);
+    if (l[0] != 4 || l[3] != 16) return 1;
+    v4su r = fr((v4su){16, 32, 64, 0x80000000u}, 0x500000002L);
+    if (r[0] != 4 || r[3] != 0x20000000u) return 2;
+    v4si a = fa((v4si){-16, 32, -64, 128}, 0x500000002L);
+    if (a[0] != -4 || a[2] != -16) return 3;
+    v8hi w = fw((v8hi){1, 2, 3, 4, 5, 6, 7, 8}, 0x500000002L);
+    if (w[0] != 4 || w[7] != 32) return 4;
+    return 0;
+}
+"#;
+
+/// The vector shapes against gcc in every pairing, and with them the shift
+/// count check of `vector_abi_shift_count_reads_its_own_width` (consolidated
+/// here; see `SHIFT_CALLER`). Exit codes: the vector checks 1..=20, the shift
+/// counts 31..=34.
 #[test]
 fn vector_abi_interop_host() {
-    let callee = format!("{DECLS}{CALLEE}");
-    let caller = format!("{DECLS}{CALLER}");
+    let callee = format!("{DECLS}{CALLEE}{SHIFT_DECLS}{SHIFT_CALLEE}");
+    let caller = format!(
+        "{DECLS}{CALLER}{SHIFT_DECLS}{SHIFT_CALLER}\
+         int main(void) {{\n\
+             int r;\n\
+             if ((r = run_vectors()) != 0) return r;\n\
+             if ((r = run_shift()) != 0) return 30 + r;\n\
+             return 0;\n\
+         }}\n"
+    );
     interop_host("vec_abi", &callee, &caller);
     // The shapes gcc and clang lower differently sat out the pairings above
     // on Apple, where the host compiler is clang; c17 on both sides still
@@ -226,7 +285,7 @@ fn vector_abi_interop_aarch64() {
     interop_aarch64(
         "vec_abi",
         &format!("{DECLS}{CALLEE}"),
-        &format!("{DECLS}{CALLER}"),
+        &format!("{DECLS}{CALLER}int main(void) {{ return run_vectors(); }}\n"),
     );
 }
 
@@ -291,41 +350,6 @@ int main(void) {
     }
 }
 
-/// gcc's aarch64 passes a one-float vector on the stack along with the
-/// arguments after it, and returns it in a general register -- like no type
-/// c17 has. c17 refuses it there, and passes it in memory on System V as gcc
-/// does.
-#[test]
-fn vector_abi_small_float_vector_is_refused_on_aarch64() {
-    let src = "typedef float v1sf __attribute__((vector_size(4)));\nv1sf f(v1sf a) { return a; }\n";
-    let c = crate::common::create_c_file("vec_abi_v1sf", src);
-    let path = c.path().to_string_lossy().into_owned();
-    let a64 = crate::common::run_c17(&[
-        "--target",
-        "aarch64-unknown-linux-gnu",
-        "-S",
-        "-o",
-        "/dev/null",
-        &path,
-    ]);
-    assert!(!a64.success, "aarch64 accepted it");
-    assert!(
-        a64.stderr
-            .contains("c17 does not pass or return this vector type on this target"),
-        "{}",
-        a64.stderr
-    );
-    let x86 = crate::common::run_c17(&[
-        "--target",
-        "x86_64-unknown-linux-gnu",
-        "-S",
-        "-o",
-        "/dev/null",
-        &path,
-    ]);
-    assert!(x86.success, "{}", x86.stderr);
-}
-
 /// On x86-64 gcc lays a vector out on a boundary of its own size, while
 /// `_Alignof` answers at most sixteen; aarch64 caps both at sixteen.
 #[test]
@@ -346,83 +370,4 @@ int main(void) {
 }
 "#;
     crate::common::compile_and_run_everywhere("vec_align", src);
-}
-
-/// clang -- Darwin's compiler -- returns an integer vector of four bytes or
-/// fewer in V0: one lane in its low bits, several widened to fill D0
-/// (`v2hi` as two 32-bit lanes, `v4qi` as four 16-bit ones). It passes one
-/// in a general register, as gcc does on Linux, where the return stays in
-/// W0. Read off `llc -mtriple=arm64-apple-macos` for clang's lowering; a
-/// clang caller of a c17 callee returning one in W0 read garbage.
-#[test]
-fn vector_abi_darwin_returns_small_integer_vectors_in_v0() {
-    let src = r#"
-typedef short v2hi __attribute__((vector_size(4)));
-typedef unsigned char v4qi __attribute__((vector_size(4)));
-typedef int v1si __attribute__((vector_size(4)));
-v2hi r2(v2hi a, v2hi b) { return a - b; }
-v4qi r4(v4qi a) { return a + a; }
-v1si r1(v1si a) { return a + 1; }
-v2hi ext(v2hi);
-int c2(v2hi a) { return ext(a)[1]; }
-"#;
-    for triple in [AARCH64_DARWIN, AARCH64_LINUX] {
-        let asm = asm_for("vec_small_ret", triple, src);
-        let darwin = triple == AARCH64_DARWIN;
-        for f in ["r2", "r4", "r1"] {
-            let body = body_of(&asm, f);
-            assert_eq!(mentions_v0(body), darwin, "{triple} {f}:\n{body}");
-        }
-        // The caller takes the result from V0 on Darwin, W0 on Linux.
-        let body = body_of(&asm, "c2");
-        let after_call = body.split_once("bl").map(|(_, rest)| rest).unwrap_or("");
-        assert_eq!(mentions_v0(after_call), darwin, "{triple} c2:\n{body}");
-    }
-}
-
-/// Whether `asm` names V0 at any width: `v0`, `d0`, `s0`, `h0` or `b0`.
-fn mentions_v0(asm: &str) -> bool {
-    asm.split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|t| matches!(t, "v0" | "d0" | "s0" | "h0" | "b0"))
-}
-
-/// A vector shifted by a scalar count reads the count at its own width.
-/// SSE's shifts take the whole low quadword of the count register, and the
-/// System V convention leaves the bits above an `int` argument undefined:
-/// the count was moved 64 bits wide, so a caller's garbage there shifted
-/// every lane out. The caller here passes each count as a `long` with
-/// garbage above the 32 bits the callee's `int` reads.
-#[test]
-fn vector_abi_shift_count_reads_its_own_width() {
-    let decls = "typedef int v4si __attribute__((vector_size(16)));\n\
-                 typedef unsigned v4su __attribute__((vector_size(16)));\n\
-                 typedef short v8hi __attribute__((vector_size(16)));\n\
-                 v4si shl(v4si v, int n);\n\
-                 v4su lsr(v4su v, int n);\n\
-                 v4si asr(v4si v, int n);\n\
-                 v8hi shlw(v8hi v, int n);\n";
-    let callee = format!(
-        "{decls}v4si shl(v4si v, int n) {{ return v << n; }}\n\
-         v4su lsr(v4su v, int n) {{ return v >> n; }}\n\
-         v4si asr(v4si v, int n) {{ return v >> n; }}\n\
-         v8hi shlw(v8hi v, int n) {{ return v << n; }}\n"
-    );
-    let caller = format!(
-        "{decls}int main(void) {{\n\
-             v4si (*fl)(v4si, long) = (v4si (*)(v4si, long))shl;\n\
-             v4su (*fr)(v4su, long) = (v4su (*)(v4su, long))lsr;\n\
-             v4si (*fa)(v4si, long) = (v4si (*)(v4si, long))asr;\n\
-             v8hi (*fw)(v8hi, long) = (v8hi (*)(v8hi, long))shlw;\n\
-             v4si l = fl((v4si){{1, 2, 3, 4}}, 0x500000002L);\n\
-             if (l[0] != 4 || l[3] != 16) return 1;\n\
-             v4su r = fr((v4su){{16, 32, 64, 0x80000000u}}, 0x500000002L);\n\
-             if (r[0] != 4 || r[3] != 0x20000000u) return 2;\n\
-             v4si a = fa((v4si){{-16, 32, -64, 128}}, 0x500000002L);\n\
-             if (a[0] != -4 || a[2] != -16) return 3;\n\
-             v8hi w = fw((v8hi){{1, 2, 3, 4, 5, 6, 7, 8}}, 0x500000002L);\n\
-             if (w[0] != 4 || w[7] != 32) return 4;\n\
-             return 0;\n\
-         }}\n"
-    );
-    interop_host("vec_shift_count", &callee, &caller);
 }

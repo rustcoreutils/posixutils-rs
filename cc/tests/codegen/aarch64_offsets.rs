@@ -226,7 +226,11 @@ fn aarch64_far_offsets_assemble_and_run() {
 /// scaled load range, so a spill slot far from `x29` is legalized as well.
 /// gcc builds and runs it, within its 30-operand limit; before the fix c17
 /// returned 100 (the sum of the `"m"` inputs read pointers).
-fn spilled_memory_operands_source(through_pointers: bool, extra_inputs: usize) -> String {
+fn spilled_memory_operands_function(
+    through_pointers: bool,
+    extra_inputs: usize,
+    name: &str,
+) -> String {
     let mut plan = vec!["rw", "ch"];
     plan.extend(std::iter::repeat_n("wo", 10));
     plan.extend(std::iter::repeat_n("ro", 10));
@@ -282,12 +286,8 @@ fn spilled_memory_operands_source(through_pointers: bool, extra_inputs: usize) -
         }
     }
     format!(
-        r#"#define NI __attribute__((noinline))
-volatile long sink;
-NI void touch(void *p) {{ sink += *(volatile char *)p; }}
-NI void *opaque(void *p) {{ return p; }}
-
-NI int many_memory_operands(void)
+        r#"
+NI int {name}(void)
 {{
     volatile char lo[40000];
 {decls}
@@ -303,8 +303,6 @@ NI int many_memory_operands(void)
     if (sum != {sum}) return 100;
     return 0;
 }}
-
-int main(void) {{ return many_memory_operands(); }}
 "#,
         decls = decls.join("\n"),
         pointers = pointers.join("\n"),
@@ -314,19 +312,20 @@ int main(void) {{ return many_memory_operands(); }}
     )
 }
 
-#[test]
-fn aarch64_spilled_inline_asm_memory_operands() {
-    for (through_pointers, extra) in [(false, 0), (true, 0), (true, 1)] {
-        let src = spilled_memory_operands_source(through_pointers, extra);
-        for opt in ["-O0", "-O2"] {
-            if let Some(code) = compile_and_run_aarch64("a64_asm_spilled_mem", &src, opt) {
-                assert_eq!(
-                    code, 0,
-                    "at {opt}, through pointers: {through_pointers}+{extra}"
-                );
-            }
-        }
-    }
+/// What every `spilled_memory_operands_function` needs around it.
+const SPILLED_PRELUDE: &str = r#"#define NI __attribute__((noinline))
+volatile long sink;
+NI void touch(void *p) { sink += *(volatile char *)p; }
+NI void *opaque(void *p) { return p; }
+"#;
+
+/// The whole program for one shape: its function, `many_memory_operands`,
+/// is what `main` returns.
+fn spilled_memory_operands_source(through_pointers: bool, extra_inputs: usize) -> String {
+    format!(
+        "{SPILLED_PRELUDE}{}\nint main(void) {{ return many_memory_operands(); }}\n",
+        spilled_memory_operands_function(through_pointers, extra_inputs, "many_memory_operands")
+    )
 }
 
 /// Over the locals: every operand is addressed in place and no register is
@@ -487,7 +486,7 @@ NI long both(long n)
     }
     return s;
 }
-int main(void)
+static int far_branches(void)
 {
     if (forward(1) != 1) return 1;
     if (forward(5) != 11) return 2;
@@ -497,10 +496,36 @@ int main(void)
 }
 "#;
 
+/// One program under qemu at -O0 and -O2 for two tests:
+/// `aarch64_branches_across_a_megabyte_of_code` (`FAR_BRANCHES`, exit codes
+/// 1..=4) and `aarch64_spilled_inline_asm_memory_operands` (one function per
+/// shape of `spilled_memory_operands_function`: over the locals 21..=44 or
+/// 150, through pointers 51..=74 or 151, through pointers with one more
+/// input 81..=104 or 152 -- 150 and up being the shape's own 100, the `"m"`
+/// inputs read as pointers).
 #[test]
-fn aarch64_branches_across_a_megabyte_of_code() {
+fn aarch64_far_branches_and_spilled_inline_asm_memory_operands() {
+    let mut src = format!("{FAR_BRANCHES}{SPILLED_PRELUDE}");
+    let mut main = String::from("int main(void)\n{\n    int r;\n");
+    main.push_str("    if ((r = far_branches()) != 0) return r;\n");
+    for (k, (through_pointers, extra)) in [(false, 0), (true, 0), (true, 1)].into_iter().enumerate()
+    {
+        let name = format!("many_memory_operands_{k}");
+        src.push_str(&spilled_memory_operands_function(
+            through_pointers,
+            extra,
+            &name,
+        ));
+        main.push_str(&format!(
+            "    if ((r = {name}()) != 0) return r == 100 ? {} : {} + r;\n",
+            150 + k,
+            20 + 30 * k
+        ));
+    }
+    main.push_str("    return 0;\n}\n");
+    src.push_str(&main);
     for opt in ["-O0", "-O2"] {
-        if let Some(code) = compile_and_run_aarch64("a64_far_branches", FAR_BRANCHES, opt) {
+        if let Some(code) = compile_and_run_aarch64("a64_branches_asm_mem", &src, opt) {
             assert_eq!(code, 0, "at {opt}");
         }
     }

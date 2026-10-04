@@ -832,12 +832,6 @@ pub fn compile_expect_warning(name: &str, content: &str, expected: &str) {
     compile_expect_warning_named(name, content, expected, &[]);
 }
 
-/// [`compile_expect_warning`] with extra driver flags, returning what was
-/// written to stderr so the caller can look for more than one thing.
-pub fn compile_expect_warning_with(name: &str, content: &str, extra: &[String]) -> String {
-    compile_expect_warning_named(name, content, "", extra)
-}
-
 fn compile_expect_warning_named(
     name: &str,
     content: &str,

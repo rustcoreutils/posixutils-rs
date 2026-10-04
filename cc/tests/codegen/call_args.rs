@@ -19,9 +19,13 @@ use crate::common::{
 // Test: Large struct parameter ABI (> 16 bytes passed by value on stack)
 // ============================================================================
 
-#[test]
-fn codegen_large_struct_param_abi() {
-    let code = r#"
+/// One section per consolidated test, each under that test's own
+/// documentation. Exit codes:
+/// `codegen_large_struct_param_abi` 11..=40.
+/// `codegen_nullability_qualifiers` 51..=54.
+const LARGE_STRUCT_PARAMS_AND_NULLABILITY: &str = r#"
+/* ====================================================================== */
+/* codegen_large_struct_param_abi: exit codes 11..40 */
 #include <stdio.h>
 #include <string.h>
 
@@ -110,7 +114,7 @@ int nested_check(struct Big s) {
     return check_big(s);
 }
 
-int main(void) {
+static int t_codegen_large_struct_param_abi(void) {
     int rc;
 
     /* Section 1: Basic */
@@ -150,94 +154,70 @@ int main(void) {
     printf("OK\n");
     return 0;
 }
-"#;
 
-    let exit_code = compile_and_run("large_struct_param_abi", code, &[]);
-    assert_eq!(
-        exit_code, 0,
-        "Large struct param ABI test failed with exit code {}",
-        exit_code
-    );
+/* ====================================================================== */
+/* codegen_nullability_qualifiers: exit codes 51..54 */
+// Test: C11 nullability qualifiers (_Nonnull, _Nullable, _Null_unspecified)
+// are parsed and ignored in pointer declarators and function parameters.
+// macOS system headers use these extensively.
+/* Nullability qualifiers on pointer declarators */
+int * _Nonnull get_ptr(int * _Nullable p) {
+    static int fallback = 0;
+    return p ? p : &fallback;
 }
 
-/// `sizeof` of a variably-modified *type-name* is computed at run time, and
-/// evaluates its size expressions exactly once (C17 6.5.3.4p2).
-///
-/// The test above covers `sizeof` of a declared VLA *object*, which worked.
-/// The type-name form answered **0** at every shape, because the dimension
-/// expressions are dropped where the type-name is parsed and cannot be
-/// recovered afterwards -- `int[n]`, `int[m]` and `int[]` all intern to one
-/// `TypeId`, and the array arm of `size_bits` reads its absent extent as zero.
-///
-/// Two consequences beyond the wrong number, both covered here: the size
-/// expression was never evaluated at all, so `sizeof(int[f()])` called `f`
-/// zero times; and the bogus 0 was still an integer constant expression, so
-/// `int z[sizeof(int[n])];` silently became a zero-length array.
-#[test]
-fn codegen_sizeof_of_a_variably_modified_type_name() {
-    let code = r#"
-int calls;
-int f(void) { calls++; return 4; }
+/* Nullability on function pointer */
+typedef void (* _Nonnull callback_t)(int);
 
-int main(void) {
-    int n = 4, m = 3;
+void invoke(callback_t cb, int val) {
+    cb(val);
+}
 
-    /* ===== the value, at every shape (returns 1-9) ===== */
-    if (sizeof(int[n])      != 16) return 1;
-    if (sizeof(int[3][n])   != 48) return 2;
-    if (sizeof(int[n][3])   != 48) return 3;
-    if (sizeof(int[n][m])   != 48) return 4;
-    if (sizeof(int[n+1])    != 20) return 5;
-    if (sizeof(char[n])     != 4)  return 6;
-    if (sizeof(long[n])     != 32) return 7;
+static int captured = 0;
+void capture(int v) { captured = v; }
 
-    /* ===== controls that already worked (returns 10-19) ===== */
-    int a[n];
-    int b[3][n];
-    if (sizeof a           != 16) return 10;
-    if (sizeof b           != 48) return 11;
-    if (sizeof(int[4])     != 16) return 12;
-    if (sizeof(int[3][4])  != 48) return 13;
-    if (sizeof(int(*)[n])  != sizeof(void*)) return 14;   /* a pointer */
+/* _Null_unspecified variant */
+int * _Null_unspecified identity_ptr(int * _Null_unspecified p) {
+    return p;
+}
 
-    /* ===== the operand is evaluated, exactly once (returns 20-29) ===== */
-    calls = 0;
-    if (sizeof(int[f()]) != 16) return 20;
-    if (calls != 1) return 21;
+static int t_codegen_nullability_qualifiers(void) {
+    int x = 42;
+    int *p = get_ptr(&x);
+    if (*p != 42) return 1;
 
-    /* once per evaluation of the sizeof, i.e. per iteration */
-    calls = 0;
-    for (int i = 0; i < 3; i++) {
-        if (sizeof(int[f()]) != 16) return 22;
-    }
-    if (calls != 3) return 23;
+    int *q = get_ptr((int * _Nullable)0);
+    if (*q != 0) return 2;
 
-    /* not evaluated when control never reaches it */
-    calls = 0;
-    if (0 && sizeof(int[f()]) == 16) return 24;
-    if (calls != 0) return 25;
+    invoke(capture, 99);
+    if (captured != 99) return 3;
 
-    calls = 0;
-    { int cond = 0; unsigned long z = cond ? sizeof(int[f()]) : 7u; if (z != 7) return 26; }
-    if (calls != 0) return 27;
-
-    /* a pointer-to-VLA type-name does NOT evaluate its extent (gcc agrees) */
-    calls = 0;
-    if (sizeof(int(*)[f()]) != sizeof(void*)) return 28;
-    if (calls != 0) return 29;
-
-    /* ===== the result is not an integer constant expression (30-39) ===== */
-    /* it is a run-time value, so an array declared with it is itself a VLA */
-    { int z[sizeof(int[n])]; if (sizeof z != 64) return 30; }
+    int *r = identity_ptr(&x);
+    if (*r != 42) return 4;
 
     return 0;
 }
+
+int main(void)
+{
+    int r;
+    if ((r = t_codegen_large_struct_param_abi()) != 0) return 10 + r;
+    if ((r = t_codegen_nullability_qualifiers()) != 0) return 50 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("sizeof_vm_type_name", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("sizeof_vm_type_name_opt", code),
-        0
+
+/// Large structs passed by value, and nullability qualifiers on
+/// parameters, at the matrix levels. Consolidates
+/// `codegen_large_struct_param_abi` and `codegen_nullability_qualifiers`.
+#[test]
+fn codegen_large_struct_params_and_nullability() {
+    let exit_code = compile_and_run(
+        "large_struct_params_nullability",
+        LARGE_STRUCT_PARAMS_AND_NULLABILITY,
+        &[],
     );
+    assert_eq!(exit_code, 0, "failed with exit code {}", exit_code);
 }
 
 // ============================================================================
@@ -300,53 +280,6 @@ int main(void) {
         compile_and_run("xmm_spill_across_calls", code, &["-lm".to_string()]),
         0
     );
-}
-
-/// Test: C11 nullability qualifiers (_Nonnull, _Nullable, _Null_unspecified)
-/// are parsed and ignored in pointer declarators and function parameters.
-/// macOS system headers use these extensively.
-#[test]
-fn codegen_nullability_qualifiers() {
-    let code = r#"
-/* Nullability qualifiers on pointer declarators */
-int * _Nonnull get_ptr(int * _Nullable p) {
-    static int fallback = 0;
-    return p ? p : &fallback;
-}
-
-/* Nullability on function pointer */
-typedef void (* _Nonnull callback_t)(int);
-
-void invoke(callback_t cb, int val) {
-    cb(val);
-}
-
-static int captured = 0;
-void capture(int v) { captured = v; }
-
-/* _Null_unspecified variant */
-int * _Null_unspecified identity_ptr(int * _Null_unspecified p) {
-    return p;
-}
-
-int main(void) {
-    int x = 42;
-    int *p = get_ptr(&x);
-    if (*p != 42) return 1;
-
-    int *q = get_ptr((int * _Nullable)0);
-    if (*q != 0) return 2;
-
-    invoke(capture, 99);
-    if (captured != 99) return 3;
-
-    int *r = identity_ptr(&x);
-    if (*r != 42) return 4;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("nullability_qualifiers", code, &[]), 0);
 }
 
 /// AAPCS64 derives an argument's alignment from the members and ignores the
@@ -468,23 +401,28 @@ int main(void)
     }
 }
 
-/// An argument more aligned than the call boundary needs the outgoing area's
-/// *base* aligned, not just its offset within the area.
-///
-/// System V AMD64 places such an argument at an offset rounded to its own
-/// alignment, and gcc makes that meaningful by dynamically realigning the
-/// caller's stack so the area starts there too. c17 rounded the offset and
-/// left the base at 16, and `va_arg` rounded the overflow pointer to a fixed
-/// 16 rather than to the argument's alignment -- two errors in the same
-/// direction, so a c17-built program agreed with itself and disagreed with
-/// gcc by sixteen bytes.
-///
-/// That is why the load-bearing half of this test links c17 against the host
-/// compiler in both directions: the behavioural run below passes on the
-/// *unfixed* compiler too.
-#[test]
-fn codegen_over_aligned_argument_area() {
-    let code = r#"
+/// One section per consolidated test, each under that test's own
+/// documentation. Exit codes:
+/// `codegen_over_aligned_argument_area` 21..=26.
+/// `codegen_short_circuit_still_short_circuits` 41..=51.
+/// `codegen_two_way_lowering_in_unreachable_code_compiles` 61..=62.
+const OVER_ALIGNED_ARGS_SHORT_CIRCUITS_DEAD_LOWERING: &str = r#"
+/* ====================================================================== */
+/* codegen_over_aligned_argument_area: exit codes 21..26 */
+// An argument more aligned than the call boundary needs the outgoing area's
+// *base* aligned, not just its offset within the area.
+//
+// System V AMD64 places such an argument at an offset rounded to its own
+// alignment, and gcc makes that meaningful by dynamically realigning the
+// caller's stack so the area starts there too. c17 rounded the offset and
+// left the base at 16, and `va_arg` rounded the overflow pointer to a fixed
+// 16 rather than to the argument's alignment -- two errors in the same
+// direction, so a c17-built program agreed with itself and disagreed with
+// gcc by sixteen bytes.
+//
+// That is why the load-bearing half of this test links c17 against the host
+// compiler in both directions: the behavioural run below passes on the
+// *unfixed* compiler too.
 #include <stdarg.h>
 
 struct __attribute__((aligned (32))) A32 { double a, b, c, d; };
@@ -539,7 +477,7 @@ __attribute__((noinline)) static int mixed(struct A16 p, struct A32 q, int tail)
     return (p.a == 10 && p.b == 11 && q.a == 1 && q.d == 4 && tail == 55) ? 0 : 1;
 }
 
-int main(void)
+static int t_codegen_over_aligned_argument_area(void)
 {
     struct A32 s32 = { 1, 2, 3, 4 };
     struct A64 s64 = { { 5, 6, 7, 8 } };
@@ -560,19 +498,141 @@ int main(void)
     if (mixed(s16, s32, 55)) return 6;
     return 0;
 }
+
+/* ====================================================================== */
+/* codegen_short_circuit_still_short_circuits: exit codes 41..51 */
+// If-conversion must not make the right operand of `&&` run when the left
+// already decided.
+//
+// This is the guarantee C makes and the reason the diamond exists at all.
+// Collapsing one whose arm calls a function, touches memory, or can trap
+// would be a miscompile that only shows up when the guard was load-bearing --
+// which is the usual reason the guard was written.
+#include <stdlib.h>
+
+int calls;
+__attribute__((noinline)) static int bump(void) { calls++; return 1; }
+
+volatile int zero = 0;
+volatile int one = 1;
+
+static int t_codegen_short_circuit_still_short_circuits(void)
+{
+    /* A call on the right of && must not run when the left is false. */
+    if (zero && bump()) return 1;
+    if (calls != 0) return 2;
+    /* ...and must when it is true. */
+    if (!(one && bump())) return 3;
+    if (calls != 1) return 4;
+
+    /* The || mirror. */
+    if (!(one || bump())) return 5;
+    if (calls != 1) return 6;
+    if (!(zero || bump())) return 7;
+    if (calls != 2) return 8;
+
+    /* A division guarded by its own divisor must not be speculated: if the
+       right operand ran unconditionally this traps. */
+    { int d = zero; if (d != 0 && (100 / d) == 1) return 9; }
+
+    /* A load guarded by a null check, likewise. */
+    { int *p = (int *)0; if (p != 0 && *p == 0) return 10; }
+
+    /* Side effects in the right operand happen exactly once. */
+    { int n = 0; int r = (one && (n++, 1)); if (!r || n != 1) return 11; }
+
+    return 0;
+}
+
+/* ====================================================================== */
+/* codegen_two_way_lowering_in_unreachable_code_compiles: exit codes 61..62 */
+// A library call whose lowering builds control flow, standing where control
+// cannot arrive.
+//
+// `sqrt` is lowered with an errno check, which is a two-way branch, and the
+// builder took the block to hang it off with `current_bb.unwrap()`. After a
+// `goto`, and before a `switch`'s first `case`, there is no current block --
+// C17 6.8.4.2 gives such a statement no edge -- so the compiler panicked
+// outright on a statement it was about to throw away. Both forms are
+// checked, at every level, because the two-way is only built once the call
+// is lowered rather than left as a call.
+#include <math.h>
+double d;
+
+static int after_goto(void) {
+    goto skip;
+    d = sqrt(d);
+skip:
+    return 0;
+}
+
+static int before_first_case(int x) {
+    switch (x) {
+        d = sqrt(d);
+    case 1:
+        return 0;
+    }
+    return 0;
+}
+
+static int t_codegen_two_way_lowering_in_unreachable_code_compiles(void) {
+    d = 4.0;
+    if (after_goto()) return 1;
+    if (before_first_case(1)) return 2;
+    /* The dead statements must not have run: `d` is untouched. */
+    return d == 4.0 ? 0 : 3;
+}
+
+int main(void)
+{
+    int r;
+    if ((r = t_codegen_over_aligned_argument_area()) != 0) return 20 + r;
+    if ((r = t_codegen_short_circuit_still_short_circuits()) != 0) return 40 + r;
+    if ((r = t_codegen_two_way_lowering_in_unreachable_code_compiles()) != 0) return 60 + r;
+    return 0;
+}
 "#;
+
+/// Over-aligned arguments run c17-to-c17, short-circuit guards, and a
+/// two-way lowering in unreachable code, at -O0, -O1 and -O2. Consolidates
+/// the behavioural half of `codegen_over_aligned_argument_area` (its host
+/// compiler half is `codegen_over_aligned_argument_area_against_the_host_compiler`),
+/// `codegen_short_circuit_still_short_circuits` and
+/// `codegen_two_way_lowering_in_unreachable_code_compiles`.
+#[test]
+fn codegen_over_aligned_arguments_short_circuits_and_dead_lowering() {
     for opt in ["-O0", "-O1", "-O2"] {
         assert_eq!(
             compile_and_run(
-                &format!("codegen_over_aligned_arg{opt}"),
-                code,
+                &format!("over_aligned_guards{opt}"),
+                OVER_ALIGNED_ARGS_SHORT_CIRCUITS_DEAD_LOWERING,
                 &[opt.to_string()]
             ),
             0,
             "at {opt}"
         );
     }
+}
 
+/// An argument more aligned than the call boundary needs the outgoing area's
+/// *base* aligned, not just its offset within the area.
+///
+/// System V AMD64 places such an argument at an offset rounded to its own
+/// alignment, and gcc makes that meaningful by dynamically realigning the
+/// caller's stack so the area starts there too. c17 rounded the offset and
+/// left the base at 16, and `va_arg` rounded the overflow pointer to a fixed
+/// 16 rather than to the argument's alignment -- two errors in the same
+/// direction, so a c17-built program agreed with itself and disagreed with
+/// gcc by sixteen bytes.
+///
+/// That is why the load-bearing half of this test links c17 against the host
+/// compiler in both directions: the behavioural run below passes on the
+/// *unfixed* compiler too.
+///
+/// The behavioural half is `codegen_over_aligned_argument_area`; this is the
+/// half that links c17 against the host compiler.
+#[test]
+fn codegen_over_aligned_argument_area_against_the_host_compiler() {
     // The part that actually pins the ABI: one unit from c17, the other from
     // the host compiler, in both directions.
     const CALLEE: &str = r#"
@@ -629,65 +689,26 @@ int main(void)
     }
 }
 
-/// A local whose alignment exceeds the stack's own forces the frame to be
-/// addressed through a second base register. That register was still in the
-/// allocatable pool, so the colorer handed it to an ordinary value and the
-/// prologue's base was overwritten by the first thing that outlived a call --
-/// every later local access then read through whatever integer that was.
-///
-/// The call is what makes it bite: it forces a callee-saved register, and the
-/// base is callee-saved. The pressure below keeps enough values live across
-/// the call that the base is reached rather than left spare.
-#[test]
-fn codegen_over_aligned_frame_base_reserved() {
-    let code = r#"
-int sink(int v) { return v; }
-
-int over_aligned(int x) {
-    _Alignas(64) char buf[128];
-    int a = x + 1, b = x + 2, c = x + 3, d = x + 4;
-    int e = x + 5, f = x + 6, g = x + 7, h = x + 8;
-    buf[0] = 1;
-    buf[64] = 2;
-    /* every value above stays live across this call */
-    int r = sink(x);
-    if (((unsigned long)&buf[0] & 63UL) != 0UL) return 100;
-    if (buf[0] != 1 || buf[64] != 2) return 101;
-    if (a + b + c + d + e + f + g + h != 8 * x + 36) return 102;
-    return r;
-}
-
-int main(void) {
-    if (over_aligned(7) != 7) return 1;
-    if (over_aligned(0) != 0) return 2;
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("codegen_over_aligned_frame_base", code, &[]),
-        0
-    );
-    assert_eq!(
-        compile_and_run_optimized("codegen_over_aligned_frame_base_opt", code),
-        0
-    );
-}
-
-/// A struct small enough to travel in a register travels as its *value*, and
-/// the value has to be loaded at the struct's width -- not at the largest
-/// power of two that fits inside it.
-///
-/// Only three bytes reproduce this. Sizes 1, 2, 4 and 8 are machine widths;
-/// 5, 6 and 7 take a different path; 3 is the one size that rounded *down*,
-/// so a `struct { char b[3]; }` argument arrived with its first byte and two
-/// zeros.
-///
-/// It also only reproduces for an rvalue -- `p(r())` rather than
-/// `p(local)` -- because a named struct is passed from its address. Both
-/// forms are asserted here; only the second half ever failed.
-#[test]
-fn codegen_small_struct_argument_travels_at_its_own_width() {
-    let code = r#"
+/// One section per consolidated test, each under that test's own
+/// documentation. Exit codes:
+/// `codegen_small_struct_argument_travels_at_its_own_width` 1..=201.
+/// `codegen_sizeof_of_a_variably_modified_type_name` 211..=240.
+/// `codegen_over_aligned_frame_base_reserved` 251..=252.
+const ARGUMENT_WIDTHS_VM_SIZEOF_AND_FRAME_BASE: &str = r#"
+/* ====================================================================== */
+/* codegen_small_struct_argument_travels_at_its_own_width: exit codes 1..201 */
+// A struct small enough to travel in a register travels as its *value*, and
+// the value has to be loaded at the struct's width -- not at the largest
+// power of two that fits inside it.
+//
+// Only three bytes reproduce this. Sizes 1, 2, 4 and 8 are machine widths;
+// 5, 6 and 7 take a different path; 3 is the one size that rounded *down*,
+// so a `struct { char b[3]; }` argument arrived with its first byte and two
+// zeros.
+//
+// It also only reproduces for an rvalue -- `p(r())` rather than
+// `p(local)` -- because a named struct is passed from its address. Both
+// forms are asserted here; only the second half ever failed.
 #define DEF(N)                                                              \
     struct S##N { char b[N]; };                                             \
     __attribute__((noinline)) static long p##N(struct S##N v) {             \
@@ -718,7 +739,7 @@ static long expected(int n) {
         if (p##N(r##N()) != expected(N)) return 100 + N;                    \
     } while (0)
 
-int main(void) {
+static int t_codegen_small_struct_argument_travels_at_its_own_width(void) {
     CHECK(1);  CHECK(2);  CHECK(3);  CHECK(4);
     CHECK(5);  CHECK(6);  CHECK(7);  CHECK(8);
     CHECK(9);  CHECK(10); CHECK(11); CHECK(12);
@@ -735,33 +756,157 @@ int main(void) {
     }
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("codegen_small_struct_arg_width", code, &[]),
-        0
-    );
-    assert_eq!(
-        compile_and_run_optimized("codegen_small_struct_arg_width_opt", code),
-        0
-    );
+#undef DEF
+#undef CHECK
+
+/* ====================================================================== */
+/* codegen_sizeof_of_a_variably_modified_type_name: exit codes 211..240 */
+// `sizeof` of a variably-modified *type-name* is computed at run time, and
+// evaluates its size expressions exactly once (C17 6.5.3.4p2).
+//
+// The test above covers `sizeof` of a declared VLA *object*, which worked.
+// The type-name form answered **0** at every shape, because the dimension
+// expressions are dropped where the type-name is parsed and cannot be
+// recovered afterwards -- `int[n]`, `int[m]` and `int[]` all intern to one
+// `TypeId`, and the array arm of `size_bits` reads its absent extent as zero.
+//
+// Two consequences beyond the wrong number, both covered here: the size
+// expression was never evaluated at all, so `sizeof(int[f()])` called `f`
+// zero times; and the bogus 0 was still an integer constant expression, so
+// `int z[sizeof(int[n])];` silently became a zero-length array.
+int calls;
+int f(void) { calls++; return 4; }
+
+static int t_codegen_sizeof_of_a_variably_modified_type_name(void) {
+    int n = 4, m = 3;
+
+    /* ===== the value, at every shape (returns 1-9) ===== */
+    if (sizeof(int[n])      != 16) return 1;
+    if (sizeof(int[3][n])   != 48) return 2;
+    if (sizeof(int[n][3])   != 48) return 3;
+    if (sizeof(int[n][m])   != 48) return 4;
+    if (sizeof(int[n+1])    != 20) return 5;
+    if (sizeof(char[n])     != 4)  return 6;
+    if (sizeof(long[n])     != 32) return 7;
+
+    /* ===== controls that already worked (returns 10-19) ===== */
+    int a[n];
+    int b[3][n];
+    if (sizeof a           != 16) return 10;
+    if (sizeof b           != 48) return 11;
+    if (sizeof(int[4])     != 16) return 12;
+    if (sizeof(int[3][4])  != 48) return 13;
+    if (sizeof(int(*)[n])  != sizeof(void*)) return 14;   /* a pointer */
+
+    /* ===== the operand is evaluated, exactly once (returns 20-29) ===== */
+    calls = 0;
+    if (sizeof(int[f()]) != 16) return 20;
+    if (calls != 1) return 21;
+
+    /* once per evaluation of the sizeof, i.e. per iteration */
+    calls = 0;
+    for (int i = 0; i < 3; i++) {
+        if (sizeof(int[f()]) != 16) return 22;
+    }
+    if (calls != 3) return 23;
+
+    /* not evaluated when control never reaches it */
+    calls = 0;
+    if (0 && sizeof(int[f()]) == 16) return 24;
+    if (calls != 0) return 25;
+
+    calls = 0;
+    { int cond = 0; unsigned long z = cond ? sizeof(int[f()]) : 7u; if (z != 7) return 26; }
+    if (calls != 0) return 27;
+
+    /* a pointer-to-VLA type-name does NOT evaluate its extent (gcc agrees) */
+    calls = 0;
+    if (sizeof(int(*)[f()]) != sizeof(void*)) return 28;
+    if (calls != 0) return 29;
+
+    /* ===== the result is not an integer constant expression (30-39) ===== */
+    /* it is a run-time value, so an array declared with it is itself a VLA */
+    { int z[sizeof(int[n])]; if (sizeof z != 64) return 30; }
+
+    return 0;
 }
 
-/// A zero-sized parameter occupies neither a register nor a stack slot, and
-/// both sides of the call have to step over it the same way.
-///
-/// They did not. The call site's layout skipped it while the register setup
-/// and the callee's prologue each charged a general register for it, so every
-/// later argument was read from the register before the one it was written
-/// to -- `f(z, 1, 2, ...)` lost its first `int`. With nine arguments past the
-/// zero-sized one the index ran off the end of the six-register file and the
-/// **compiler panicked**: `index out of bounds: the len is 6 but the index is
-/// 6`, which is how `va-arg-22` failed to compile at all.
-///
-/// A zero-sized struct is a GNU extension, and `struct { char x[0]; }` and
-/// `struct { }` are both spellings of it.
+/* ====================================================================== */
+/* codegen_over_aligned_frame_base_reserved: exit codes 251..252 */
+// A local whose alignment exceeds the stack's own forces the frame to be
+// addressed through a second base register. That register was still in the
+// allocatable pool, so the colorer handed it to an ordinary value and the
+// prologue's base was overwritten by the first thing that outlived a call --
+// every later local access then read through whatever integer that was.
+//
+// The call is what makes it bite: it forces a callee-saved register, and the
+// base is callee-saved. The pressure below keeps enough values live across
+// the call that the base is reached rather than left spare.
+int sink(int v) { return v; }
+
+int over_aligned(int x) {
+    _Alignas(64) char buf[128];
+    int a = x + 1, b = x + 2, c = x + 3, d = x + 4;
+    int e = x + 5, f = x + 6, g = x + 7, h = x + 8;
+    buf[0] = 1;
+    buf[64] = 2;
+    /* every value above stays live across this call */
+    int r = sink(x);
+    if (((unsigned long)&buf[0] & 63UL) != 0UL) return 100;
+    if (buf[0] != 1 || buf[64] != 2) return 101;
+    if (a + b + c + d + e + f + g + h != 8 * x + 36) return 102;
+    return r;
+}
+
+static int t_codegen_over_aligned_frame_base_reserved(void) {
+    if (over_aligned(7) != 7) return 1;
+    if (over_aligned(0) != 0) return 2;
+    return 0;
+}
+
+int main(void)
+{
+    int r;
+    if ((r = t_codegen_small_struct_argument_travels_at_its_own_width()) != 0) return r;
+    if ((r = t_codegen_sizeof_of_a_variably_modified_type_name()) != 0) return 210 + r;
+    if ((r = t_codegen_over_aligned_frame_base_reserved()) != 0) return 250 + r;
+    return 0;
+}
+"#;
+
+/// Small structs passed at their own width, `sizeof` of a variably
+/// modified type-name, and an over-aligned frame's base register, at the
+/// matrix levels and at -O1. Consolidates
+/// `codegen_small_struct_argument_travels_at_its_own_width`,
+/// `codegen_sizeof_of_a_variably_modified_type_name` and
+/// `codegen_over_aligned_frame_base_reserved`.
 #[test]
-fn codegen_zero_sized_parameter_consumes_no_register() {
-    let code = r#"
+fn codegen_argument_widths_vm_sizeof_and_frame_base() {
+    let src = ARGUMENT_WIDTHS_VM_SIZEOF_AND_FRAME_BASE;
+    assert_eq!(compile_and_run("arg_widths_vm_frame", src, &[]), 0);
+    assert_eq!(compile_and_run_optimized("arg_widths_vm_frame_opt", src), 0);
+}
+
+/// One section per consolidated test, each under that test's own
+/// documentation. Exit codes:
+/// `codegen_zero_sized_parameter_consumes_no_register` 21..=31.
+/// `c99_call_through_a_pointer_uses_the_pointee_prototype` 41..=55.
+const ZERO_SIZED_AND_INDIRECT_CALL_ARGUMENTS: &str = r#"
+/* ====================================================================== */
+/* codegen_zero_sized_parameter_consumes_no_register: exit codes 21..31 */
+// A zero-sized parameter occupies neither a register nor a stack slot, and
+// both sides of the call have to step over it the same way.
+//
+// They did not. The call site's layout skipped it while the register setup
+// and the callee's prologue each charged a general register for it, so every
+// later argument was read from the register before the one it was written
+// to -- `f(z, 1, 2, ...)` lost its first `int`. With nine arguments past the
+// zero-sized one the index ran off the end of the six-register file and the
+// **compiler panicked**: `index out of bounds: the len is 6 but the index is
+// 6`, which is how `va-arg-22` failed to compile at all.
+//
+// A zero-sized struct is a GNU extension, and `struct { char x[0]; }` and
+// `struct { }` are both spellings of it.
 typedef struct { char x[0]; } Z;
 typedef struct { } E;
 Z z;
@@ -804,7 +949,7 @@ char narrow(char a, char b, char c, char d, char e2,
     return (char)(a + b + c + d + e2 + f + g + h + i + j);
 }
 
-int main(void) {
+static int t_codegen_zero_sized_parameter_consumes_no_register(void) {
     if (first(z, 1, 2, 3, 4, 5, 6, 7, 8) != 36) return 1;
     if (middle(1, 2, 3, z, 4, 5, 6, 7, 8) != 36) return 2;
     if (last(1, 2, 3, 4, 5, 6, 7, 8, z) != 36) return 3;
@@ -823,34 +968,26 @@ int main(void) {
     if (sizeof(Z) != 0 || sizeof(E) != 0) return 11;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("cg_zero_sized_param", code, &[]), 0);
-    assert_eq!(
-        compile_and_run("cg_zero_sized_param_o2", code, &["-O2".to_string()]),
-        0
-    );
-}
 
-/// A call through a function pointer converts its arguments to the pointee's
-/// prototype, and the pointer survives the argument setup.
-///
-/// Two defects, both reached by any indirect call.
-///
-/// C17 6.5.2.2p1 lets the function designator be a function *or* a pointer to
-/// one, and the prototype is on the function type either way. c17 read
-/// `params` off the pointer, found none, and converted nothing: `void
-/// (*p)(double) = f; p(1);` passed the integer 1 where a `double` was
-/// expected and the callee read 0. With a mixed argument list every later
-/// argument moved as well.
-///
-/// The pointer was then loaded into R11 *before* the arguments were set up --
-/// and R10/R11 are that setup's own scratch, so the target was overwritten
-/// and `call *%r11` jumped into whatever the last argument had addressed.
-///
-/// `930702-1` is the torture test, through a K&R definition.
-#[test]
-fn c99_call_through_a_pointer_uses_the_pointee_prototype() {
-    let code = r#"
+/* ====================================================================== */
+/* c99_call_through_a_pointer_uses_the_pointee_prototype: exit codes 41..55 */
+// A call through a function pointer converts its arguments to the pointee's
+// prototype, and the pointer survives the argument setup.
+//
+// Two defects, both reached by any indirect call.
+//
+// C17 6.5.2.2p1 lets the function designator be a function *or* a pointer to
+// one, and the prototype is on the function type either way. c17 read
+// `params` off the pointer, found none, and converted nothing: `void
+// (*p)(double) = f; p(1);` passed the integer 1 where a `double` was
+// expected and the callee read 0. With a mixed argument list every later
+// argument moved as well.
+//
+// The pointer was then loaded into R11 *before* the arguments were set up --
+// and R10/R11 are that setup's own scratch, so the target was overwritten
+// and `call *%r11` jumped into whatever the last argument had addressed.
+//
+// `930702-1` is the torture test, through a K&R definition.
 extern int printf(const char *, ...);
 
 static double seen_d;
@@ -887,7 +1024,7 @@ typedef void (*DI)(double, int);
 static DI tbl[2];
 static DI pick(int i) { return tbl[i]; }
 
-int main(void) {
+static int t_c99_call_through_a_pointer_uses_the_pointee_prototype(void) {
     /* The conversion the prototype asks for. */
     { void (*p)(double) = take_d; p(1); if (seen_d != 1.0) return 1; }
     { void (*p)(double, int) = take_di; p(2, 7);
@@ -937,67 +1074,28 @@ int main(void) {
     if (seen_d != 16.0) return 15;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_call_through_pointer", code, &[]), 0);
-    assert_eq!(
-        compile_and_run("c99_call_through_pointer_o2", code, &["-O2".to_string()]),
-        0
-    );
-}
-
-/// If-conversion must not make the right operand of `&&` run when the left
-/// already decided.
-///
-/// This is the guarantee C makes and the reason the diamond exists at all.
-/// Collapsing one whose arm calls a function, touches memory, or can trap
-/// would be a miscompile that only shows up when the guard was load-bearing --
-/// which is the usual reason the guard was written.
-#[test]
-fn codegen_short_circuit_still_short_circuits() {
-    let code = r#"
-#include <stdlib.h>
-
-int calls;
-__attribute__((noinline)) static int bump(void) { calls++; return 1; }
-
-volatile int zero = 0;
-volatile int one = 1;
 
 int main(void)
 {
-    /* A call on the right of && must not run when the left is false. */
-    if (zero && bump()) return 1;
-    if (calls != 0) return 2;
-    /* ...and must when it is true. */
-    if (!(one && bump())) return 3;
-    if (calls != 1) return 4;
-
-    /* The || mirror. */
-    if (!(one || bump())) return 5;
-    if (calls != 1) return 6;
-    if (!(zero || bump())) return 7;
-    if (calls != 2) return 8;
-
-    /* A division guarded by its own divisor must not be speculated: if the
-       right operand ran unconditionally this traps. */
-    { int d = zero; if (d != 0 && (100 / d) == 1) return 9; }
-
-    /* A load guarded by a null check, likewise. */
-    { int *p = (int *)0; if (p != 0 && *p == 0) return 10; }
-
-    /* Side effects in the right operand happen exactly once. */
-    { int n = 0; int r = (one && (n++, 1)); if (!r || n != 1) return 11; }
-
+    int r;
+    if ((r = t_codegen_zero_sized_parameter_consumes_no_register()) != 0) return 20 + r;
+    if ((r = t_c99_call_through_a_pointer_uses_the_pointee_prototype()) != 0) return 40 + r;
     return 0;
 }
 "#;
-    for opt in ["-O0", "-O1", "-O2"] {
-        assert_eq!(
-            compile_and_run("c17_short_circuit_guard", code, &[opt.to_string()]),
-            0,
-            "at {opt}"
-        );
-    }
+
+/// Zero-sized parameters, and calls through a function pointer, at the
+/// matrix levels and at -O2. Consolidates
+/// `codegen_zero_sized_parameter_consumes_no_register` and
+/// `c99_call_through_a_pointer_uses_the_pointee_prototype`.
+#[test]
+fn codegen_zero_sized_and_indirect_call_arguments() {
+    let src = ZERO_SIZED_AND_INDIRECT_CALL_ARGUMENTS;
+    assert_eq!(compile_and_run("zero_sized_indirect_args", src, &[]), 0);
+    assert_eq!(
+        compile_and_run("zero_sized_indirect_args_o2", src, &["-O2".to_string()]),
+        0
+    );
 }
 
 /// A C source whose function takes `n` parameters of mixed classes -- `int`,
@@ -1063,15 +1161,19 @@ fn codegen_many_mixed_params_arrive_in_place() {
     }
 }
 
-/// An attribute's integer argument is a constant expression, as it is to gcc.
-/// The attribute parser read one token, and read that with Rust's `i64`
-/// parser: `aligned(0x40)` and `aligned(16UL)` became 0 and were silently
-/// ignored, `aligned(A)` for an enum constant and `aligned(sizeof(T))` were
-/// dropped as unknown identifiers, and `vector_size(2 * sizeof(int))` was
-/// rejected as "2 bytes".
-#[test]
-fn codegen_attribute_arguments_are_constant_expressions() {
-    let src = r#"
+/// One section per consolidated test, each under that test's own
+/// documentation. Exit codes:
+/// `codegen_attribute_arguments_are_constant_expressions` 11..=20.
+/// `codegen_typeof_vla_extent_is_evaluated_once_per_declaration` 31..=60.
+const ATTRIBUTE_ARGUMENTS_AND_TYPEOF_VLA_EXTENTS: &str = r#"
+/* ====================================================================== */
+/* codegen_attribute_arguments_are_constant_expressions: exit codes 11..20 */
+// An attribute's integer argument is a constant expression, as it is to gcc.
+// The attribute parser read one token, and read that with Rust's `i64`
+// parser: `aligned(0x40)` and `aligned(16UL)` became 0 and were silently
+// ignored, `aligned(A)` for an enum constant and `aligned(sizeof(T))` were
+// dropped as unknown identifiers, and `vector_size(2 * sizeof(int))` was
+// rejected as "2 bytes".
 #include <stdint.h>
 enum { A = 64 };
 #define LINE 0x40
@@ -1088,7 +1190,7 @@ typedef int V __attribute__((vector_size(2 * sizeof(int))));
 typedef float W __attribute__((vector_size(sizeof(float) * 4)));
 typedef unsigned char U __attribute__((vector_size(0x10)));
 
-int main(void)
+static int t_codegen_attribute_arguments_are_constant_expressions(void)
 {
     char g __attribute__((aligned(0x20)));
     if (_Alignof(a) != 64 || (uintptr_t)&a % 64) return 1;
@@ -1103,20 +1205,17 @@ int main(void)
     if ((uintptr_t)&g % 32) return 10;
     return 0;
 }
-"#;
-    compile_and_run_everywhere("attribute_arguments", src);
-}
+#undef LINE
 
-/// The declaration specifiers are evaluated once per declaration, however
-/// many declarators share them, so in `typeof(int[n++]) a, b;` gcc increments
-/// `n` once and gives `a` and `b` one extent. c17 copied the size expression
-/// into every declarator and evaluated it once each: `n` ended at 5 and `b`
-/// was a different size from `a`. Also covered: a call as the extent, derived
-/// declarators, a `for`-init, re-evaluation each time a loop reaches the
-/// declaration, and `sizeof(typeof(int[n++]))` evaluating its operand once.
-#[test]
-fn codegen_typeof_vla_extent_is_evaluated_once_per_declaration() {
-    let src = r#"
+/* ====================================================================== */
+/* codegen_typeof_vla_extent_is_evaluated_once_per_declaration: exit codes 31..60 */
+// The declaration specifiers are evaluated once per declaration, however
+// many declarators share them, so in `typeof(int[n++]) a, b;` gcc increments
+// `n` once and gives `a` and `b` one extent. c17 copied the size expression
+// into every declarator and evaluated it once each: `n` ended at 5 and `b`
+// was a different size from `a`. Also covered: a call as the extent, derived
+// declarators, a `for`-init, re-evaluation each time a loop reaches the
+// declaration, and `sizeof(typeof(int[n++]))` evaluating its operand once.
 static int calls;
 static int bump(int *p) { calls++; return (*p)++; }
 
@@ -1182,64 +1281,33 @@ static int sizeof_once(void)
     return 0;
 }
 
-int main(void)
+static int t_codegen_typeof_vla_extent_is_evaluated_once_per_declaration(void)
 {
     int r;
     if ((r = one_declaration()) || (r = for_init()) || (r = in_a_loop()) || (r = sizeof_once()))
         return r;
     return 0;
 }
-"#;
-    compile_and_run_everywhere("typeof_vla_extent_evaluated_once", src);
-}
 
-/// A library call whose lowering builds control flow, standing where control
-/// cannot arrive.
-///
-/// `sqrt` is lowered with an errno check, which is a two-way branch, and the
-/// builder took the block to hang it off with `current_bb.unwrap()`. After a
-/// `goto`, and before a `switch`'s first `case`, there is no current block --
-/// C17 6.8.4.2 gives such a statement no edge -- so the compiler panicked
-/// outright on a statement it was about to throw away. Both forms are
-/// checked, at every level, because the two-way is only built once the call
-/// is lowered rather than left as a call.
+int main(void)
+{
+    int r;
+    if ((r = t_codegen_attribute_arguments_are_constant_expressions()) != 0) return 10 + r;
+    if ((r = t_codegen_typeof_vla_extent_is_evaluated_once_per_declaration()) != 0) return 30 + r;
+    return 0;
+}
+"#;
+
+/// Attribute arguments as constant expressions, and a `typeof` VLA extent
+/// evaluated once per declaration, everywhere. Consolidates
+/// `codegen_attribute_arguments_are_constant_expressions` and
+/// `codegen_typeof_vla_extent_is_evaluated_once_per_declaration`.
 #[test]
-fn codegen_two_way_lowering_in_unreachable_code_compiles() {
-    let code = r#"
-#include <math.h>
-double d;
-
-static int after_goto(void) {
-    goto skip;
-    d = sqrt(d);
-skip:
-    return 0;
-}
-
-static int before_first_case(int x) {
-    switch (x) {
-        d = sqrt(d);
-    case 1:
-        return 0;
-    }
-    return 0;
-}
-
-int main(void) {
-    d = 4.0;
-    if (after_goto()) return 1;
-    if (before_first_case(1)) return 2;
-    /* The dead statements must not have run: `d` is untouched. */
-    return d == 4.0 ? 0 : 3;
-}
-"#;
-    for opt in ["-O0", "-O1", "-O2"] {
-        assert_eq!(
-            compile_and_run("two_way_unreachable", code, &[opt.to_string()]),
-            0,
-            "{opt}"
-        );
-    }
+fn codegen_attribute_arguments_and_typeof_vla_extents() {
+    compile_and_run_everywhere(
+        "attribute_args_typeof_vla",
+        ATTRIBUTE_ARGUMENTS_AND_TYPEOF_VLA_EXTENTS,
+    );
 }
 
 /// An argument of every class survives being used after a call, and after

@@ -33,6 +33,45 @@ pub enum EntryType {
     Socket,
 }
 
+/// The header fields that describe a header rather than the file it names.
+///
+/// POSIX pax listopt rule 7 admits every field name in the ustar Header Block
+/// and Octet-Oriented cpio Archive Entry tables as a `%(keyword)`, and defines
+/// the value as the one "from the applicable header field". These four have no
+/// other use -- nothing extracts them -- so they are recorded only so a
+/// listing can report them.
+///
+/// Which variant a member carries also decides which of those keywords can be
+/// answered at all: a cpio header has no `typeflag`, `version` or `chksum`,
+/// and a ustar header no `c_dev`, `c_ino` or `c_nlink`, so a keyword from the
+/// other table renders as nothing rather than as a fabricated zero.
+///
+/// A writer must never consult this. It describes the header a member was
+/// *read* from, and carrying a foreign checksum or typeflag through a copy
+/// would write a header that disagrees with its own contents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceHeader {
+    /// A ustar header block, which a pax member also has.
+    Ustar {
+        /// `magic` (offset 257, 6 octets), as stored -- "ustar\0" from a
+        /// conforming writer, "ustar " from GNU tar.
+        magic: [u8; 6],
+        /// `version` (263, 2), as stored.
+        version: [u8; 2],
+        /// `chksum` (148, 8), the value the header stored.
+        chksum: u64,
+        /// `typeflag` (156, 1), as stored.
+        typeflag: u8,
+    },
+    /// A cpio header, in whichever of the four flavors the reader matched.
+    Cpio {
+        /// The flavor, which is what `c_magic` reports. Kept as the enum
+        /// rather than the magic digits because the ODC and binary forms
+        /// share "070707" and only this distinguishes them.
+        format: crate::formats::cpio::CpioFormat,
+    },
+}
+
 /// Metadata for an archive entry
 #[derive(Debug, Clone, Default)]
 pub struct ArchiveEntry {
@@ -85,6 +124,11 @@ pub struct ArchiveEntry {
     /// true from `ArchiveWriter::needs_data_checksum` asks its caller to fill
     /// this in first; every other format leaves it `None`.
     pub data_checksum: Option<u32>,
+    /// The header this member was read from, when it was read from one.
+    ///
+    /// `None` for an entry built from a file on disk, which has no header yet.
+    /// Only `-o listopt=%(keyword)` consults it; see `SourceHeader`.
+    pub source_header: Option<SourceHeader>,
 }
 
 impl ArchiveEntry {
@@ -112,6 +156,7 @@ impl ArchiveEntry {
             devmajor: 0,
             devminor: 0,
             data_checksum: None,
+            source_header: None,
         }
     }
 

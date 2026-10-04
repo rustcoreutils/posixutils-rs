@@ -27,7 +27,7 @@
 //! - devminor:   8 bytes (offset 337)
 //! - prefix:   155 bytes (offset 345)
 
-use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
+use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType, SourceHeader};
 use crate::error::{PaxError, PaxResult};
 use std::io::{Read, Write};
 
@@ -37,6 +37,8 @@ static ZERO_BLOCK: [u8; BLOCK_SIZE] = [0u8; BLOCK_SIZE];
 const NAME_LEN: usize = 100;
 const PREFIX_LEN: usize = 155;
 const LINKNAME_LEN: usize = 100;
+const MAGIC_LEN: usize = 6;
+const VERSION_LEN: usize = 2;
 const UNAME_LEN: usize = 32;
 const GNAME_LEN: usize = 32;
 
@@ -340,6 +342,20 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
         // member that exists has at least one name; cpio's `header_nlink`
         // floors the same field for the same reason.
         nlink: 1,
+        // Kept only so `-o listopt=%(magic)s` and the other three can report
+        // what this header actually held. The checksum is read leniently
+        // because `multivolume::read_entry` parses a header without verifying
+        // it first, and a junk field there must not newly fail the read.
+        source_header: Some(SourceHeader::Ustar {
+            magic: header[MAGIC_OFF..MAGIC_OFF + MAGIC_LEN]
+                .try_into()
+                .expect("slice of MAGIC_LEN"),
+            version: header[VERSION_OFF..VERSION_OFF + VERSION_LEN]
+                .try_into()
+                .expect("slice of VERSION_LEN"),
+            chksum: parse_octal(&header[CHKSUM_OFF..CHKSUM_OFF + 8]).unwrap_or(0),
+            typeflag,
+        }),
         ..Default::default()
     })
 }
@@ -724,14 +740,20 @@ pub(crate) fn ustar_path_bytes(entry: &ArchiveEntry) -> Vec<u8> {
 /// header record and leaves these fields as a fallback for readers that ignore
 /// it.
 pub(crate) fn try_split_path(path: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    split_name_prefix(path).map(|(name, prefix)| (name.to_vec(), prefix.to_vec()))
+}
+
+/// The same split, as borrowed halves, for a caller that only needs to look at
+/// them -- `-o listopt=%(name)s` and `%(prefix)s`.
+pub(crate) fn split_name_prefix(path: &[u8]) -> Option<(&[u8], &[u8])> {
     if path.len() <= NAME_LEN {
-        return Some((path.to_vec(), Vec::new()));
+        return Some((path, b""));
     }
 
     // Split at the highest '/' that leaves a name of at most NAME_LEN bytes.
     for i in (1..=PREFIX_LEN.min(path.len().saturating_sub(1))).rev() {
         if path[i] == b'/' && path.len() - (i + 1) <= NAME_LEN {
-            return Some((path[i + 1..].to_vec(), path[..i].to_vec()));
+            return Some((&path[i + 1..], &path[..i]));
         }
     }
 

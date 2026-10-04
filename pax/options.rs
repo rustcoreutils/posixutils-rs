@@ -17,7 +17,7 @@
 //! The `:=` form is used for per-file options (pax format),
 //! while `=` is used for global options.
 
-use crate::archive::{ArchiveEntry, EntryType};
+use crate::archive::{ArchiveEntry, EntryType, SourceHeader};
 use crate::error::{PaxError, PaxResult};
 use crate::pattern::Pattern;
 use std::collections::HashMap;
@@ -794,6 +794,135 @@ fn is_device(info: &ListEntryInfo) -> bool {
     )
 }
 
+/// What a keyword named, before the conversion character has its say.
+enum Field {
+    /// The keyword names a field, and this member carries this value.
+    Value(Vec<u8>),
+    /// The keyword names a field the member's format does not have. Rule 7
+    /// defines the result as "the value from the applicable header field", and
+    /// there is no such field, so it contributes nothing.
+    Absent,
+}
+
+/// A numeric field's value. Decimal: a count, an id, a size or a time is read
+/// in decimal, and the "Octal number" column of POSIX's field tables describes
+/// how the header encodes the value, not how to print it -- the same `size` and
+/// `uid` are spelled in decimal by the pax extended-header table.
+fn fmt_decimal(value: u64) -> Field {
+    Field::Value(value.to_string().into_bytes())
+}
+
+/// A bitfield's value, in the radix it is read in. Reserved for the fields
+/// whose only meaning is as stored bits: a mode, a header checksum, a packed
+/// device number.
+fn fmt_octal(value: u64) -> Field {
+    Field::Value(format!("{:o}", value).into_bytes())
+}
+
+/// A fixed-width header field's text value, escaped for the output stream.
+///
+/// Rule 7: "without any trailing NULs" -- and nothing else. A trailing <space>
+/// is part of the value, which is why GNU tar's `magic` of "ustar " reports
+/// with its space rather than being trimmed to a conforming-looking "ustar".
+/// The bytes come from the archive, so they go through `escaped` like a name.
+fn fmt_header_text(info: &ListEntryInfo, bytes: &[u8]) -> Field {
+    Field::Value(escaped(info, crate::formats::ustar::path_field(bytes)))
+}
+
+/// The ustar `name` and `prefix` fields for this member's pathname.
+///
+/// Derived from the pathname rather than read back from the header. That keeps
+/// rule 11's `(prefix,name)` default reconstructing exactly the name `%F`
+/// prints -- after `-s`, `--strip-components` or `-o path:=` rewrote it, and
+/// for a pax member whose real name lives in a `path=` record and whose stored
+/// `name` field is only a truncated fallback for readers that ignore it.
+fn ustar_name_prefix(path: &[u8]) -> (&[u8], &[u8]) {
+    if let Some(halves) = crate::formats::ustar::split_name_prefix(path) {
+        return halves;
+    }
+    // No `/` sits where the ustar fields could split this name, so neither
+    // field can hold it. Split at the last `/` anyway: it is the only choice
+    // that still satisfies rule 11's prefix + "/" + name == path.
+    match path.iter().rposition(|&b| b == b'/') {
+        Some(i) => (&path[i + 1..], &path[..i]),
+        None => (path, b""),
+    }
+}
+
+/// Resolve a keyword naming a pax extended-header record (POSIX rule 7, second
+/// bullet). `None` when the name is not one of those keywords.
+fn pax_keyword(info: &ListEntryInfo, keyword: &str) -> Option<Field> {
+    Some(match keyword {
+        "path" => Field::Value(fmt_fullpath(info)),
+        "linkpath" => Field::Value(fmt_link_target(info)),
+        "size" => fmt_decimal(info.entry.size),
+        "uid" => fmt_decimal(info.entry.uid as u64),
+        "gid" => fmt_decimal(info.entry.gid as u64),
+        "uname" => Field::Value(info.entry.uname.clone().unwrap_or_default().into_bytes()),
+        "gname" => Field::Value(info.entry.gname.clone().unwrap_or_default().into_bytes()),
+        _ => return None,
+    })
+}
+
+/// Resolve a keyword naming a ustar Header Block field (POSIX rule 7, first
+/// bullet). `None` when the name is not in that table.
+///
+/// `magic`, `version`, `chksum` and `typeflag` describe the header itself and
+/// cannot be derived from anything else, so they are `Absent` for a member
+/// that was not read from a ustar header. The rest are properties of the file
+/// the entry already holds, so they answer whatever header it came from.
+fn ustar_keyword(info: &ListEntryInfo, keyword: &str) -> Option<Field> {
+    let path = crate::rawpath::as_bytes(&info.entry.path);
+    let ustar = match info.entry.source_header {
+        Some(SourceHeader::Ustar {
+            ref magic,
+            ref version,
+            chksum,
+            typeflag,
+        }) => Some((magic, version, chksum, typeflag)),
+        _ => None,
+    };
+
+    Some(match keyword {
+        "name" => Field::Value(escaped(info, ustar_name_prefix(path).0)),
+        "prefix" => Field::Value(escaped(info, ustar_name_prefix(path).1)),
+        // The ustar field and the pax `linkpath` record are two spellings of
+        // one datum, and the entry holds the effective value: a `linkpath`
+        // record has already overridden a truncated header field.
+        "linkname" => Field::Value(fmt_link_target(info)),
+        "mode" => fmt_octal((info.entry.mode & 0o7777) as u64),
+        "devmajor" => fmt_decimal(info.entry.devmajor as u64),
+        "devminor" => fmt_decimal(info.entry.devminor as u64),
+        "magic" => return Some(header_magic(info)),
+        "version" => match ustar {
+            Some((_, version, _, _)) => fmt_header_text(info, version),
+            None => Field::Absent,
+        },
+        "chksum" => match ustar {
+            Some((_, _, chksum, _)) => fmt_octal(chksum),
+            None => Field::Absent,
+        },
+        "typeflag" => match ustar {
+            // A NUL typeflag is the historical spelling of a regular file. It
+            // is a trailing NUL, which rule 7 excludes, so it reports as
+            // nothing rather than as an embedded NUL in the listing.
+            Some((_, _, _, typeflag)) => fmt_header_text(info, &[typeflag]),
+            None => Field::Absent,
+        },
+        _ => return None,
+    })
+}
+
+/// `magic` / `c_magic`: the identifying value of whichever header this member
+/// came from, so the keyword answers for a tar and a cpio archive alike.
+fn header_magic(info: &ListEntryInfo) -> Field {
+    match info.entry.source_header {
+        Some(SourceHeader::Ustar { ref magic, .. }) => fmt_header_text(info, magic),
+        Some(SourceHeader::Cpio { format }) => Field::Value(format.magic_str().as_bytes().to_vec()),
+        None => Field::Absent,
+    }
+}
+
 /// Resolve a POSIX `%(keyword)X` listopt substitution to its rendered value.
 ///
 /// `field` is the text between the parentheses -- a keyword, optionally with an
@@ -818,16 +947,15 @@ fn keyword_value(info: &ListEntryInfo, field: &str, conversion: char) -> Keyword
         };
     }
 
-    let value: Vec<u8> = match keyword {
-        "path" | "name" => fmt_fullpath(info),
-        "size" => info.entry.size.to_string().into_bytes(),
-        "uid" => info.entry.uid.to_string().into_bytes(),
-        "gid" => info.entry.gid.to_string().into_bytes(),
-        "uname" => info.entry.uname.clone().unwrap_or_default().into_bytes(),
-        "gname" => info.entry.gname.clone().unwrap_or_default().into_bytes(),
-        "linkpath" => fmt_link_target(info),
-        "mode" => format!("{:o}", info.entry.mode).into_bytes(),
-        _ => return KeywordValue::Unknown,
+    // Rule 7's three keyword tables, consulted in the order they are listed
+    // there. The pax table comes first because it owns the required reading of
+    // the names the tables share -- `size` and `uid` are decimal there and
+    // octal in the ustar header -- so an existing format string keeps its
+    // answer.
+    let value = match pax_keyword(info, keyword).or_else(|| ustar_keyword(info, keyword)) {
+        Some(Field::Value(v)) => v,
+        Some(Field::Absent) => return KeywordValue::Absent,
+        None => return KeywordValue::Unknown,
     };
 
     // The mode/pathname/symlink conversions describe how to render the entry
@@ -1240,6 +1368,148 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(fmt("%M", &info(&e)), "lrwxrwxrwx");
+    }
+
+    /// A member as a ustar reader produces it, with the header-identity
+    /// fields a conforming writer puts there.
+    fn ustar_entry(path: &str, typeflag: u8) -> ArchiveEntry {
+        ArchiveEntry {
+            path: path.into(),
+            source_header: Some(SourceHeader::Ustar {
+                magic: *b"ustar\0",
+                version: *b"00",
+                chksum: 0o6414,
+                typeflag,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// POSIX listopt rule 7 requires every Field Name entry of the ustar
+    /// Header Block table as a `%(keyword)`. Eight of them resolved to nothing
+    /// and were echoed back as their own specification.
+    #[test]
+    fn test_keyword_ustar_header_fields() {
+        let e = ArchiveEntry {
+            mode: 0o644,
+            size: 1234,
+            uid: 1000,
+            gid: 100,
+            uname: Some("alice".into()),
+            gname: Some("users".into()),
+            ..ustar_entry("dir/file.txt", b'0')
+        };
+        let info = info(&e);
+
+        assert_eq!(fmt("%(magic)s", &info), "ustar");
+        assert_eq!(fmt("%(version)s", &info), "00");
+        assert_eq!(fmt("%(typeflag)s", &info), "0");
+        assert_eq!(fmt("%(chksum)s", &info), "6414");
+        assert_eq!(fmt("%(name)s", &info), "dir/file.txt");
+        assert_eq!(fmt("%(prefix)s", &info), "");
+        assert_eq!(fmt("%(mode)s", &info), "644");
+        assert_eq!(fmt("%(uid)s/%(gid)s", &info), "1000/100");
+        assert_eq!(fmt("%(size)s", &info), "1234");
+        assert_eq!(fmt("%(uname)s:%(gname)s", &info), "alice:users");
+        assert_eq!(fmt("%(devmajor)s,%(devminor)s", &info), "0,0");
+        assert_eq!(fmt("%(linkname)s", &info), "");
+    }
+
+    /// Rule 7 strips trailing NULs from a header field value and nothing else.
+    /// GNU tar writes `magic` as "ustar " and `version` as " \0", and trimming
+    /// the whitespace too would report a conforming-looking header that is not
+    /// what the archive holds.
+    #[test]
+    fn test_keyword_header_text_strips_nuls_only() {
+        let e = ArchiveEntry {
+            source_header: Some(SourceHeader::Ustar {
+                magic: *b"ustar ",
+                version: *b" \0",
+                chksum: 0,
+                typeflag: b'0',
+            }),
+            ..ustar_entry("f.txt", b'0')
+        };
+        assert_eq!(fmt("[%(magic)s]", &info(&e)), "[ustar ]");
+        assert_eq!(fmt("[%(version)s]", &info(&e)), "[ ]");
+
+        // A NUL typeflag is the historical spelling of a regular file, and is
+        // itself a trailing NUL: it reports as nothing, not as a NUL byte.
+        let areg = ustar_entry("f.txt", b'\0');
+        assert_eq!(fmt("[%(typeflag)s]", &info(&areg)), "[]");
+    }
+
+    /// `name` and `prefix` are the two halves of the ustar spelling of the
+    /// pathname, so concatenating them must give the name `%F` prints -- rule
+    /// 11 makes `(prefix,name)` the default for `%F` when `path` is undefined.
+    #[test]
+    fn test_keyword_name_prefix_reconstruct_the_path() {
+        // Short enough for the name field alone: prefix is empty.
+        let short = ustar_entry("dir/f.txt", b'0');
+        assert_eq!(fmt("%(name)s", &info(&short)), "dir/f.txt");
+        assert_eq!(fmt("%(prefix)s", &info(&short)), "");
+
+        // Long enough to need the split.
+        let long_dir = "d".repeat(110);
+        let split = ustar_entry(&format!("{long_dir}/f.txt"), b'0');
+        assert_eq!(fmt("%(name)s", &info(&split)), "f.txt");
+        assert_eq!(fmt("%(prefix)s", &info(&split)), long_dir);
+        assert_eq!(
+            fmt("%(prefix)s/%(name)s", &info(&split)),
+            fmt("%(path)s", &info(&split))
+        );
+
+        // Over-long with no `/` the ustar fields could split at. Neither field
+        // can hold this name, but the halves must still rebuild it.
+        let huge = "x".repeat(120);
+        let unsplittable = ustar_entry(&format!("d/{huge}"), b'0');
+        assert_eq!(fmt("%(prefix)s", &info(&unsplittable)), "d");
+        assert_eq!(fmt("%(name)s", &info(&unsplittable)), huge);
+        assert_eq!(
+            fmt("%(prefix)s/%(name)s", &info(&unsplittable)),
+            fmt("%(path)s", &info(&unsplittable))
+        );
+
+        // No `/` at all: the whole name is the name field.
+        let flat = ustar_entry(&"y".repeat(150), b'0');
+        assert_eq!(fmt("%(prefix)s", &info(&flat)), "");
+        assert_eq!(fmt("%(name)s", &info(&flat)), "y".repeat(150));
+    }
+
+    /// The four header-identity keywords describe a ustar header. A cpio
+    /// member has none of them, so rule 7 leaves them with no value to report
+    /// -- which is not the same as the name being unknown, and must not bring
+    /// back the literal echo.
+    #[test]
+    fn test_keyword_ustar_identity_absent_for_a_cpio_member() {
+        let e = ArchiveEntry {
+            path: "f.txt".into(),
+            source_header: Some(SourceHeader::Cpio {
+                format: crate::formats::cpio::CpioFormat::Odc,
+            }),
+            ..Default::default()
+        };
+        let info = info(&e);
+
+        assert_eq!(fmt("[%(version)s]", &info), "[]");
+        assert_eq!(fmt("[%(chksum)s]", &info), "[]");
+        assert_eq!(fmt("[%(typeflag)s]", &info), "[]");
+        // `magic` is in both tables, so it answers for either header.
+        assert_eq!(fmt("%(magic)s", &info), "070707");
+        // And a name in no table still echoes.
+        assert_eq!(fmt("%(bogus)s", &info), "%(bogus)s");
+    }
+
+    /// `%(mode)` formatted the whole mode word while `%m` masked it, so a
+    /// header carrying S_IFMT bits printed `644` and `100644` on one line.
+    #[test]
+    fn test_keyword_mode_masks_the_file_type_bits() {
+        let e = ArchiveEntry {
+            mode: 0o100644,
+            ..ustar_entry("f.txt", b'0')
+        };
+        assert_eq!(fmt("%m", &info(&e)), "644");
+        assert_eq!(fmt("%(mode)s", &info(&e)), "644");
     }
 
     #[test]

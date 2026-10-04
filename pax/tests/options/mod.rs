@@ -1475,3 +1475,112 @@ fn listopt_with(archive: &std::path::Path, format: &str, extra: &[&str]) -> Stri
     assert_success(&out, "pax list with listopt");
     stdout_str(&out).trim_end().to_string()
 }
+
+/// The listopt format string for `archive`, which is given on stdin.
+///
+/// Hand-built fixtures reach fields a real write cannot set without root (a
+/// device's major and minor) or without a 100-byte-plus pathname (`prefix`),
+/// and pin the header-identity fields exactly.
+fn listopt_bytes(archive: &[u8], format: &str) -> String {
+    let out = run_pax_with_stdin_bytes(&["-o", &format!("listopt={}", format)], archive);
+    assert_success(&out, "pax list with listopt");
+    stdout_str(&out).trim_end().to_string()
+}
+
+/// POSIX listopt rule 7 requires every Field Name entry of the ustar Header
+/// Block table as a `%(keyword)`. `magic`, `version`, `typeflag` and `chksum`
+/// were echoed back as their own specification, because `parse_header`
+/// discarded all four.
+#[test]
+fn test_option_listopt_ustar_header_identity_keywords() {
+    let member = Ustar {
+        name: b"hdr.txt",
+        body: b"hi\n",
+        ..Default::default()
+    };
+    let archive = member.archive();
+
+    // The fixture computes its own checksum, so read the expectation out of
+    // the header it built rather than hard-coding a sum of its bytes.
+    let header = member.header();
+    let field = std::str::from_utf8(&header[148..154]).unwrap();
+    let stored = u32::from_str_radix(field, 8).expect("octal chksum field");
+
+    assert_eq!(
+        listopt_bytes(&archive, "%(magic)s|%(version)s|%(typeflag)s|%(chksum)s"),
+        format!("ustar|00|0|{:o}", stored),
+        "every ustar header-identity field must report what the header stored"
+    );
+}
+
+/// Rule 7 admits `devmajor` and `devminor`, which `ListEntryInfo` already
+/// carried for `%D` and which no keyword could reach. A hand-built character
+/// special member gets there without `mknod`, so without root.
+#[test]
+fn test_option_listopt_device_keywords_need_no_privileges() {
+    let archive = Ustar {
+        name: b"chr",
+        typeflag: b'3',
+        devmajor: 8,
+        devminor: 0,
+        ..Default::default()
+    }
+    .archive();
+
+    assert_eq!(
+        listopt_bytes(&archive, "%(devmajor)s,%(devminor)s %D %M"),
+        "8,0 8,0 crw-r--r--",
+        "the device keywords must agree with the %D conversion"
+    );
+}
+
+/// A pathname too long for the 100-byte `name` field lives in both halves of
+/// the ustar spelling, and rule 11 makes `(prefix,name)` the fallback `%F`
+/// uses -- so the halves have to rebuild exactly what `%F` prints.
+#[test]
+fn test_option_listopt_prefix_and_name_rebuild_the_path() {
+    let prefix = vec![b'd'; 110];
+    let archive = Ustar {
+        name: b"deep.txt",
+        prefix: &prefix,
+        body: b"x\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let dir = String::from_utf8(prefix).unwrap();
+    assert_eq!(
+        listopt_bytes(&archive, "%(prefix)s|%(name)s"),
+        format!("{dir}|deep.txt")
+    );
+    assert_eq!(
+        listopt_bytes(&archive, "%(prefix)s/%(name)s"),
+        listopt_bytes(&archive, "%F"),
+        "the two halves must reconstruct the pathname the listing reports"
+    );
+}
+
+/// `name` is derived from the pathname the listing reports, not read back from
+/// the stored field, so it follows the rewrites list mode applies first. A
+/// stored value would disagree with `%F` on the same line.
+#[test]
+fn test_option_listopt_name_follows_a_path_rewrite() {
+    let archive = Ustar {
+        name: b"before.txt",
+        body: b"x\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let out = run_pax_with_stdin_bytes(
+        &[
+            "-s",
+            ",^before.txt$,after.txt,",
+            "-o",
+            "listopt=%(name)s|%F",
+        ],
+        &archive,
+    );
+    assert_success(&out, "listopt with -s");
+    assert_eq!(stdout_str(&out).trim_end(), "after.txt|after.txt");
+}

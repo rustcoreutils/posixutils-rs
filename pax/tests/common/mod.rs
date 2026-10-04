@@ -303,6 +303,15 @@ pub struct Ustar<'a> {
     pub linkname: &'a [u8],
     pub mode: u32,
     pub body: &'a [u8],
+    /// The `prefix` field (offset 345). A member whose pathname needs more
+    /// than the 100-byte `name` field carries the leading components here,
+    /// joined back with a `/` on read.
+    pub prefix: &'a [u8],
+    /// `devmajor`/`devminor` (329, 337). Only a block or character special
+    /// member uses them, and writing one by hand is how a test reaches the
+    /// device keywords without `mknod` and therefore without root.
+    pub devmajor: u32,
+    pub devminor: u32,
     /// What to write in the size field. `None` writes `body.len()`, which is
     /// what a well-formed member has; `Some` is how a fixture makes the header
     /// lie about how much data follows.
@@ -317,6 +326,9 @@ impl Default for Ustar<'_> {
             linkname: b"",
             mode: 0o644,
             body: b"",
+            prefix: b"",
+            devmajor: 0,
+            devminor: 0,
             size: None,
         }
     }
@@ -339,6 +351,9 @@ impl Ustar<'_> {
         h[157..157 + self.linkname.len()].copy_from_slice(self.linkname);
         h[257..263].copy_from_slice(b"ustar\0");
         h[263..265].copy_from_slice(b"00");
+        h[329..337].copy_from_slice(format!("{:07o}\0", self.devmajor).as_bytes());
+        h[337..345].copy_from_slice(format!("{:07o}\0", self.devminor).as_bytes());
+        h[345..345 + self.prefix.len()].copy_from_slice(self.prefix);
 
         let sum: u32 = h.iter().map(|&b| b as u32).sum();
         h[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());

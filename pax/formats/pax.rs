@@ -458,6 +458,20 @@ impl ExtendedHeader {
                 entry.ctime_nsec = ctime.nsec;
             }
         }
+        // The records nothing above holds: `charset`, `comment`, `hdrcharset`
+        // and any implementation extension. None affects extraction; POSIX
+        // listopt rule 7 admits every one of them as a `%(keyword)`, and
+        // without this the listing had no way to report what the archive said.
+        if keep("hdrcharset") {
+            if let Some(ref hdrcharset) = self.hdrcharset {
+                entry.set_ext_record("hdrcharset", hdrcharset);
+            }
+        }
+        for (keyword, value) in &self.extra {
+            if keep(keyword) {
+                entry.set_ext_record(keyword, value);
+            }
+        }
     }
 
     /// Create extended header with options controlling what to include

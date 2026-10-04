@@ -124,6 +124,16 @@ pub struct ArchiveEntry {
     /// true from `ArchiveWriter::needs_data_checksum` asks its caller to fill
     /// this in first; every other format leaves it `None`.
     pub data_checksum: Option<u32>,
+    /// The pax extended-header records this member carried that no field
+    /// above already holds: `charset`, `hdrcharset`, `comment` and whatever
+    /// implementation extensions the archive used.
+    ///
+    /// POSIX listopt rule 7 admits all of them as a `%(keyword)`, which is the
+    /// only thing that reads them -- none has any effect on extraction. A
+    /// `Vec` rather than a map because it is empty for almost every member and
+    /// one to three entries long otherwise, and because the order records
+    /// arrive in is the order that decides precedence.
+    pub ext_records: Vec<(String, String)>,
     /// The header this member was read from, when it was read from one.
     ///
     /// `None` for an entry built from a file on disk, which has no header yet.
@@ -156,7 +166,31 @@ impl ArchiveEntry {
             devmajor: 0,
             devminor: 0,
             data_checksum: None,
+            ext_records: Vec::new(),
             source_header: None,
+        }
+    }
+
+    /// The value of an extended-header record this member carried.
+    pub fn ext_record(&self, keyword: &str) -> Option<&str> {
+        self.ext_records
+            .iter()
+            .find(|(k, _)| k == keyword)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Record an extended-header value, replacing any already held under the
+    /// same keyword.
+    ///
+    /// Replacing is what gives POSIX's keyword precedence: a global `g` header
+    /// is applied before the per-file `x` header, and `-o keyword:=value`
+    /// after both, so the last writer of a keyword wins.
+    pub fn set_ext_record(&mut self, keyword: &str, value: &str) {
+        match self.ext_records.iter_mut().find(|(k, _)| k == keyword) {
+            Some(slot) => slot.1 = value.to_string(),
+            None => self
+                .ext_records
+                .push((keyword.to_string(), value.to_string())),
         }
     }
 

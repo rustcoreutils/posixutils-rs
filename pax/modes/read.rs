@@ -248,10 +248,11 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
 /// Apply `-o keyword:=value` per-file overrides to an entry on extract.
 ///
 /// The `:=` form forces the value regardless of what the archive carried, so it
-/// is applied after the reader has merged any extended-header records. Only the
-/// standard keywords that map onto an entry field are handled; unknown keywords
-/// have no extraction effect. `delete=` is handled in the pax reader (so the
-/// ustar value remains), not here.
+/// is applied after the reader has merged any extended-header records. The
+/// standard keywords that map onto an entry field are applied to it; every
+/// other keyword is recorded as an extended-header value, which has no
+/// extraction effect but is what `-o listopt=%(keyword)` reports. `delete=` is
+/// handled in the pax reader (so the ustar value remains), not here.
 pub(crate) fn apply_keyword_overrides(
     entry: &mut ArchiveEntry,
     opts: &crate::options::FormatOptions,
@@ -295,7 +296,11 @@ pub(crate) fn apply_keyword_overrides(
                     entry.ctime_nsec = (t.fract() * 1_000_000_000.0) as u32;
                 }
             }
-            _ => {}
+            // Every remaining keyword is an extended-header record with no
+            // extraction effect -- `charset`, `comment`, `hdrcharset`, an
+            // implementation extension. It still has to reach the entry, or
+            // `-o charset:=x` would force a value the listing then denied.
+            other => entry.set_ext_record(other, value),
         }
     }
 }

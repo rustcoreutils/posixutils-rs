@@ -860,8 +860,32 @@ fn pax_keyword(info: &ListEntryInfo, keyword: &str) -> Option<Field> {
         "gid" => fmt_decimal(info.entry.gid as u64),
         "uname" => Field::Value(info.entry.uname.clone().unwrap_or_default().into_bytes()),
         "gname" => Field::Value(info.entry.gname.clone().unwrap_or_default().into_bytes()),
+        // Records that describe the member without affecting extraction. They
+        // are keywords whether or not the archive used them: an operator runs
+        // `%(hdrcharset)s` precisely to find out whether one was declared, so
+        // an archive that declared nothing must report nothing rather than
+        // echoing the request back as a typo -- and must not report POSIX's
+        // implicit UTF-8 default either, which would make the two cases
+        // indistinguishable. Rule 7 asks for "the value from the ... extended
+        // header", and there is none.
+        "charset" | "hdrcharset" | "comment" => ext_record(info, keyword).unwrap_or(Field::Absent),
         _ => return None,
     })
+}
+
+/// An extended-header record's value, or `None` when this member carried no
+/// record under that keyword.
+///
+/// This also resolves a keyword naming an implementation extension (POSIX rule
+/// 7, third bullet) -- a `SCHILY.*` or `GNU.*` record, say. In the resolution
+/// chain it comes last, after all three required tables, so that a crafted
+/// archive cannot change what a required keyword means by recording a value
+/// under its name.
+fn ext_record(info: &ListEntryInfo, keyword: &str) -> Option<Field> {
+    Some(Field::Value(escaped(
+        info,
+        info.entry.ext_record(keyword)?.as_bytes(),
+    )))
 }
 
 /// Resolve a keyword naming a ustar Header Block field (POSIX rule 7, first
@@ -1024,6 +1048,7 @@ fn keyword_value(info: &ListEntryInfo, field: &str, conversion: char) -> Keyword
     let value = match pax_keyword(info, keyword)
         .or_else(|| ustar_keyword(info, keyword))
         .or_else(|| cpio_keyword(info, keyword))
+        .or_else(|| ext_record(info, keyword))
     {
         Some(Field::Value(v)) => v,
         Some(Field::Absent) => return KeywordValue::Absent,
@@ -1722,6 +1747,60 @@ mod tests {
             ..cpio_entry("h", CpioFormat::Odc)
         };
         assert_eq!(fmt("%(c_filesize)s", &info(&hard)), "42");
+    }
+
+    /// POSIX listopt rule 7 requires every pax extended-header keyword as a
+    /// `%(keyword)`, and names `"%(charset)s"` as its own example. `charset`,
+    /// `hdrcharset` and `comment` resolved to nothing: the reader dropped the
+    /// records on the way to the entry, so the listing could not see them.
+    #[test]
+    fn test_keyword_pax_extended_header_records() {
+        let mut e = ustar_entry("f.txt", b'0');
+        e.set_ext_record("charset", "ISO-IR 10646 2000 UTF-8");
+        e.set_ext_record("hdrcharset", "BINARY");
+        e.set_ext_record("comment", "written by hand");
+        // Rule 7's third bullet: an implementation extension is a keyword too.
+        e.set_ext_record("SCHILY.fflags", "nodump");
+        let info = info(&e);
+
+        assert_eq!(fmt("%(charset)s", &info), "ISO-IR 10646 2000 UTF-8");
+        assert_eq!(fmt("%(hdrcharset)s", &info), "BINARY");
+        assert_eq!(fmt("%(comment)s", &info), "written by hand");
+        assert_eq!(fmt("%(SCHILY.fflags)s", &info), "nodump");
+    }
+
+    /// A member that declared none of them must report nothing, not POSIX's
+    /// implicit UTF-8 default: an operator runs `%(hdrcharset)s` to find out
+    /// whether a record was there, and synthesizing the default would make
+    /// "declared UTF-8" and "declared nothing" indistinguishable. A keyword in
+    /// no table at all still echoes, so a typo stays visible.
+    #[test]
+    fn test_keyword_pax_records_absent_but_not_unknown() {
+        let e = ustar_entry("f.txt", b'0');
+        let info = info(&e);
+
+        assert_eq!(fmt("[%(charset)s]", &info), "[]");
+        assert_eq!(fmt("[%(hdrcharset)s]", &info), "[]");
+        assert_eq!(fmt("[%(comment)s]", &info), "[]");
+        assert_eq!(fmt("%(SCHILY.fflags)s", &info), "%(SCHILY.fflags)s");
+        assert_eq!(fmt("%(bogus)s", &info), "%(bogus)s");
+    }
+
+    /// An extension record must not be able to redefine a required keyword: a
+    /// crafted archive recording `mode=rwx` has to leave `%(mode)s` reporting
+    /// the header field, which is why the extension lookup comes last.
+    #[test]
+    fn test_keyword_extension_record_cannot_shadow_a_required_name() {
+        let mut e = ArchiveEntry {
+            mode: 0o644,
+            ..ustar_entry("f.txt", b'0')
+        };
+        e.set_ext_record("mode", "rwx");
+        e.set_ext_record("typeflag", "9");
+        let info = info(&e);
+
+        assert_eq!(fmt("%(mode)s", &info), "644");
+        assert_eq!(fmt("%(typeflag)s", &info), "0");
     }
 
     #[test]

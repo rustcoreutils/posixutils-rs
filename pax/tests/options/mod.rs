@@ -1712,3 +1712,208 @@ fn test_option_listopt_cpio_symlink_filesize() {
         "%(c_mode)s must be S_IFLNK over the permission bits %(mode)s reports"
     );
 }
+
+/// POSIX rule 7 requires every pax extended-header keyword, and names
+/// `"%(charset)s"` as its own example. The reader dropped `charset`,
+/// `hdrcharset`, `comment` and every implementation extension on the way to
+/// the entry, so the listing had nothing to report and echoed the request.
+#[test]
+fn test_option_listopt_pax_extended_header_records() {
+    let records = [
+        pax_record("charset", b"ISO-IR 10646 2000 UTF-8"),
+        pax_record("comment", b"hi there"),
+        pax_record("hdrcharset", b"BINARY"),
+        pax_record("SCHILY.fflags", b"nodump"),
+    ]
+    .concat();
+    let archive = archive_with_ext_records(&records);
+
+    assert_eq!(
+        listopt_bytes(
+            &archive,
+            "%(charset)s|%(comment)s|%(hdrcharset)s|%(SCHILY.fflags)s"
+        ),
+        "ISO-IR 10646 2000 UTF-8|hi there|BINARY|nodump"
+    );
+}
+
+/// A member that declared none of them reports nothing rather than echoing the
+/// request, because the keywords are POSIX's whether or not this archive used
+/// them -- and rather than POSIX's implicit UTF-8 default, which would make
+/// "declared UTF-8" and "declared nothing" indistinguishable.
+#[test]
+fn test_option_listopt_pax_records_absent_renders_empty() {
+    let archive = Ustar {
+        name: b"plain.txt",
+        body: b"x\n",
+        ..Default::default()
+    }
+    .archive();
+
+    assert_eq!(
+        listopt_bytes(&archive, "[%(charset)s%(hdrcharset)s%(comment)s]"),
+        "[]"
+    );
+    // While a name in no table at all keeps the literal echo.
+    assert_eq!(
+        listopt_bytes(&archive, "%(nosuchkeyword)s"),
+        "%(nosuchkeyword)s"
+    );
+}
+
+/// A global `g` header applies to every following member, and `-o
+/// keyword=value` writes one. The record has to survive the round trip into
+/// the listing, which is the whole path from the option parser through the
+/// writer's global header and back out of the reader.
+#[test]
+fn test_option_listopt_global_comment_record_round_trips() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("global.pax");
+
+    fs::create_dir(&src_dir).unwrap();
+    fs::write(src_dir.join("g.txt"), b"x").unwrap();
+
+    run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-o",
+            "comment=written for the test",
+            "-f",
+            archive.to_str().unwrap(),
+            "g.txt",
+        ],
+        &src_dir,
+    );
+
+    assert_eq!(listopt(&archive, "%(comment)s"), "written for the test");
+}
+
+/// `-o keyword:=value` forces a record for each member, and `-o delete=`
+/// removes one -- the listing must follow both, as it already does for the
+/// keywords that map onto an entry field.
+#[cfg(unix)]
+#[test]
+fn test_option_listopt_record_override_and_delete() {
+    let records = [pax_record("charset", b"BINARY")].concat();
+    let archive_bytes = archive_with_ext_records(&records);
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("rec.pax");
+    fs::write(&archive, &archive_bytes).unwrap();
+
+    assert_eq!(listopt(&archive, "%(charset)s"), "BINARY");
+    assert_eq!(
+        listopt_with(&archive, "%(charset)s", &["-o", "charset:=ISO-IR 646 1990"]),
+        "ISO-IR 646 1990",
+        "-o keyword:=value must force the value the listing reports"
+    );
+    assert_eq!(
+        listopt_with(&archive, "[%(charset)s]", &["-o", "delete=charset"]),
+        "[]",
+        "-o delete= must remove the record from the listing too"
+    );
+}
+
+/// Every `%(keyword)` POSIX rule 7 requires must resolve to a value.
+///
+/// A keyword this implementation does not know is echoed back as its own
+/// specification (`options.rs` `KeywordValue::Unknown`), so a listing that
+/// still contains `%(` is exactly the reported bug: the ustar header field
+/// names, the whole cpio set with and without the `c_` prefix, and the pax
+/// `charset`/`hdrcharset` records all came back literally.
+///
+/// Rule 7 admits a keyword the member's format has no field for -- the value
+/// is then "the value from the applicable header field", of which there is
+/// none -- so this asserts only that the specification is consumed, not that
+/// it produced text. The per-keyword values are pinned by the tests below.
+#[test]
+fn test_option_listopt_posix_rule7_keywords_all_resolve() {
+    // Every Field Name entry in POSIX's ustar Header Block table.
+    const USTAR: &[&str] = &[
+        "name", "mode", "uid", "gid", "size", "mtime", "chksum", "typeflag", "linkname", "magic",
+        "version", "uname", "gname", "devmajor", "devminor", "prefix",
+    ];
+    // Every Field Name entry in its Octet-Oriented cpio Archive Entry table,
+    // which rule 7 also permits without the leading `c_`.
+    const CPIO: &[&str] = &[
+        "c_magic",
+        "c_dev",
+        "c_ino",
+        "c_mode",
+        "c_uid",
+        "c_gid",
+        "c_nlink",
+        "c_rdev",
+        "c_mtime",
+        "c_namesize",
+        "c_filesize",
+        "c_name",
+        "dev",
+        "ino",
+        "nlink",
+        "rdev",
+        "namesize",
+        "filesize",
+    ];
+    // Every keyword defined for the pax extended header.
+    const PAX: &[&str] = &[
+        "atime",
+        "charset",
+        "comment",
+        "gid",
+        "gname",
+        "hdrcharset",
+        "linkpath",
+        "mtime",
+        "path",
+        "size",
+        "uid",
+        "uname",
+    ];
+
+    let ustar = Ustar {
+        name: b"f.txt",
+        body: b"hi\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let mut cpio = CpioNewc {
+        name: b"f.txt",
+        body: b"hi\n",
+        ..Default::default()
+    }
+    .member();
+    cpio.extend_from_slice(
+        &CpioNewc {
+            name: b"TRAILER!!!",
+            ..Default::default()
+        }
+        .member(),
+    );
+
+    for (format_name, archive) in [("ustar", &ustar), ("cpio", &cpio)] {
+        for keyword in USTAR.iter().chain(CPIO).chain(PAX) {
+            let listopt = format!("listopt=%({})s", keyword);
+            let out = run_pax_with_stdin_bytes(&["-o", &listopt], archive);
+            assert_success(&out, &listopt);
+            let listing = stdout_str(&out);
+            assert!(
+                !listing.contains("%("),
+                "%({})s must resolve in a {} archive rather than echo back \
+                 (got {:?})",
+                keyword,
+                format_name,
+                listing
+            );
+        }
+    }
+
+    // ... while a name in none of those tables keeps the literal echo, which is
+    // how an operator sees a typo instead of a silently empty column.
+    let out = run_pax_with_stdin_bytes(&["-o", "listopt=%(bogus)s"], &ustar);
+    assert_success(&out, "listopt=%(bogus)s");
+    assert_eq!(stdout_str(&out).trim_end(), "%(bogus)s");
+}

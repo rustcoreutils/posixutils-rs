@@ -476,11 +476,19 @@ impl ExtendedHeader {
         }
     }
 
-    /// Create extended header with options controlling what to include
+    /// The extended-header records this member needs, if any.
     ///
-    /// # Arguments
-    /// * `entry` - The archive entry to generate extended headers for
-    /// * `include_times` - If true, always include atime and mtime in extended headers
+    /// A record is written only where the ustar header cannot carry the value:
+    /// a pathname or link target with no faithful ustar spelling, a size or an
+    /// id too large for its octal field, a user or group name outside the
+    /// portable character set or too long for its field, a time with
+    /// sub-second precision.
+    ///
+    /// `options` supplies the two things the operator can change. `-o times`
+    /// forces atime and mtime records for every member rather than only where
+    /// one is needed, and `-o hdrcharset=` both widens the rule for which
+    /// names need a record and decides whether this member declares a charset
+    /// of its own.
     pub fn from_entry(entry: &ArchiveEntry, options: &FormatOptions) -> Self {
         let mut header = ExtendedHeader::new();
         let include_times = options.include_times;

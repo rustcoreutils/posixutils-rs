@@ -103,10 +103,16 @@ pub struct ArchiveEntry {
     pub entry_type: EntryType,
     /// Link target for symlinks and hardlinks
     pub link_target: Option<PathBuf>,
-    /// User name (optional)
-    pub uname: Option<String>,
-    /// Group name (optional)
-    pub gname: Option<String>,
+    /// User name (optional), as bytes.
+    ///
+    /// Not a `String`: under `hdrcharset=BINARY` POSIX defines the `uname` and
+    /// `gname` extended-header records as "unencoded binary data from the
+    /// underlying system", and a lossy decode would replace a byte the archive
+    /// deliberately preserved. A user or group name is a byte string on Unix
+    /// for the same reason a pathname is -- see `crate::rawpath`.
+    pub uname: Option<Vec<u8>>,
+    /// Group name (optional), as bytes. See `uname`.
+    pub gname: Option<Vec<u8>>,
     /// Device ID (for hard link tracking)
     pub dev: u64,
     /// Inode number (for hard link tracking)

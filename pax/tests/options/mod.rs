@@ -2033,6 +2033,29 @@ fn test_option_hdrcharset_binary_forces_a_path_record() {
     );
 }
 
+/// `hdrcharset=BINARY` says the gname, linkpath, path and uname records "are
+/// unencoded binary data from the underlying system". path and linkpath were
+/// already carried as bytes; uname and gname went through from_utf8_lossy, so
+/// a group name with a high byte came back as U+FFFD -- irreversibly, and
+/// under a header declaring the bytes had been preserved.
+#[test]
+fn test_option_listopt_binary_group_name_round_trips() {
+    let records = [
+        pax_record("hdrcharset", b"BINARY"),
+        pax_record("gname", b"gr\xffup"),
+        pax_record("uname", b"us\xfer"),
+    ]
+    .concat();
+    let archive = archive_with_ext_records(&records);
+
+    let out = run_pax_with_stdin_bytes(&["-o", "listopt=%(uname)s:%(gname)s"], &archive);
+    assert_success(&out, "list a BINARY member");
+    assert_eq!(
+        out.stdout, b"us\xfer:gr\xffup\n",
+        "a BINARY uname and gname must reach the listing byte for byte"
+    );
+}
+
 /// Every `%(keyword)` POSIX rule 7 requires must resolve to a value.
 ///
 /// A keyword this implementation does not know is echoed back as its own

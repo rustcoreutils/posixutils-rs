@@ -700,13 +700,11 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     header[263..265].copy_from_slice(b"00");
 
     // uname and gname
-    if let Some(ref uname) = entry.uname {
-        let bytes = uname.as_bytes();
+    if let Some(ref bytes) = entry.uname {
         let len = std::cmp::min(bytes.len(), 32);
         header[265..265 + len].copy_from_slice(&bytes[..len]);
     }
-    if let Some(ref gname) = entry.gname {
-        let bytes = gname.as_bytes();
+    if let Some(ref bytes) = entry.gname {
         let len = std::cmp::min(bytes.len(), 32);
         header[297..297 + len].copy_from_slice(&bytes[..len]);
     }

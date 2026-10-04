@@ -273,14 +273,26 @@ fn print_verbose<W: Write>(writer: &mut W, entry: &ArchiveEntry) -> PaxResult<()
     Ok(())
 }
 
-/// Format owner name or uid
+/// Format owner name or uid for the `-v` listing's aligned column.
+///
+/// A name is bytes, and this column is padded to a width, so it is rendered as
+/// display text rather than written through. A name that is not UTF-8 -- which
+/// `hdrcharset=BINARY` permits -- would otherwise mis-align every following
+/// column. `-o listopt=%(uname)s` is the lossless way to read one.
 fn format_owner(entry: &ArchiveEntry) -> String {
-    entry.uname.clone().unwrap_or_else(|| entry.uid.to_string())
+    display_name(entry.uname.as_deref(), entry.uid)
 }
 
-/// Format group name or gid
+/// Format group name or gid. See `format_owner`.
 fn format_group(entry: &ArchiveEntry) -> String {
-    entry.gname.clone().unwrap_or_else(|| entry.gid.to_string())
+    display_name(entry.gname.as_deref(), entry.gid)
+}
+
+fn display_name(name: Option<&[u8]>, id: u32) -> String {
+    match name {
+        Some(name) => String::from_utf8_lossy(name).into_owned(),
+        None => id.to_string(),
+    }
 }
 
 /// Write the ` -> target` / ` == target` suffix a link carries.

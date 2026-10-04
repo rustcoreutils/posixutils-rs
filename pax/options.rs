@@ -574,19 +574,17 @@ fn fmt_mtime_posix(info: &ListEntryInfo) -> Vec<u8> {
 }
 
 fn fmt_username(info: &ListEntryInfo) -> Vec<u8> {
-    info.entry
-        .uname
-        .clone()
-        .unwrap_or_else(|| info.entry.uid.to_string())
-        .into_bytes()
+    match info.entry.uname.as_deref() {
+        Some(uname) => escaped(info, uname),
+        None => info.entry.uid.to_string().into_bytes(),
+    }
 }
 
 fn fmt_groupname(info: &ListEntryInfo) -> Vec<u8> {
-    info.entry
-        .gname
-        .clone()
-        .unwrap_or_else(|| info.entry.gid.to_string())
-        .into_bytes()
+    match info.entry.gname.as_deref() {
+        Some(gname) => escaped(info, gname),
+        None => info.entry.gid.to_string().into_bytes(),
+    }
 }
 
 fn fmt_uid(info: &ListEntryInfo) -> Vec<u8> {
@@ -931,8 +929,8 @@ fn pax_keyword(info: &ListEntryInfo, keyword: &str) -> Option<Field> {
         "size" => fmt_decimal(info.entry.size),
         "uid" => fmt_decimal(info.entry.uid as u64),
         "gid" => fmt_decimal(info.entry.gid as u64),
-        "uname" => Field::Value(info.entry.uname.clone().unwrap_or_default().into_bytes()),
-        "gname" => Field::Value(info.entry.gname.clone().unwrap_or_default().into_bytes()),
+        "uname" => Field::Value(escaped(info, info.entry.uname.as_deref().unwrap_or(b""))),
+        "gname" => Field::Value(escaped(info, info.entry.gname.as_deref().unwrap_or(b""))),
         // Records that describe the member without affecting extraction. They
         // are keywords whether or not the archive used them: an operator runs
         // `%(hdrcharset)s` precisely to find out whether one was declared, so
@@ -1471,8 +1469,8 @@ mod tests {
             size: 1234,
             uid: 1000,
             gid: 1000,
-            uname: Some("user".into()),
-            gname: Some("group".into()),
+            uname: Some("user".as_bytes().to_vec()),
+            gname: Some("group".as_bytes().to_vec()),
             ..Default::default()
         };
         assert_eq!(fmt("%F", &info(&e)), "path/to/file.txt");
@@ -1486,7 +1484,7 @@ mod tests {
         let e = ArchiveEntry {
             path: "élan.txt".into(),
             mode: 0o644,
-            uname: Some("ünïcode".into()),
+            uname: Some("ünïcode".as_bytes().to_vec()),
             ..Default::default()
         };
         let info = info(&e);
@@ -1511,8 +1509,8 @@ mod tests {
             size: 4096,
             uid: 1000,
             gid: 1000,
-            uname: Some("alice".into()),
-            gname: Some("users".into()),
+            uname: Some("alice".as_bytes().to_vec()),
+            gname: Some("users".as_bytes().to_vec()),
             ..Default::default()
         };
         let result = fmt("%M %u %g %s %f", &info(&e));
@@ -1527,8 +1525,8 @@ mod tests {
             size: 4096,
             uid: 1000,
             gid: 1000,
-            uname: Some("alice".into()),
-            gname: Some("users".into()),
+            uname: Some("alice".as_bytes().to_vec()),
+            gname: Some("users".as_bytes().to_vec()),
             ..Default::default()
         };
         let info = info(&e);
@@ -1610,8 +1608,8 @@ mod tests {
         let e = ArchiveEntry {
             path: "/dev/sda".into(),
             mode: 0o660,
-            uname: Some("root".into()),
-            gname: Some("disk".into()),
+            uname: Some("root".as_bytes().to_vec()),
+            gname: Some("disk".as_bytes().to_vec()),
             entry_type: EntryType::BlockDevice,
             devmajor: 8,
             devminor: 0,
@@ -1669,8 +1667,8 @@ mod tests {
             size: 1234,
             uid: 1000,
             gid: 100,
-            uname: Some("alice".into()),
-            gname: Some("users".into()),
+            uname: Some("alice".as_bytes().to_vec()),
+            gname: Some("users".as_bytes().to_vec()),
             ..ustar_entry("dir/file.txt", b'0')
         };
         let info = info(&e);

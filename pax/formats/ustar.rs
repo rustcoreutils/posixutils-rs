@@ -317,8 +317,8 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
         );
     }
 
-    let uname = parse_string(&header[UNAME_OFF..UNAME_OFF + UNAME_LEN]);
-    let gname = parse_string(&header[GNAME_OFF..GNAME_OFF + GNAME_LEN]);
+    let uname = name_field(&header[UNAME_OFF..UNAME_OFF + UNAME_LEN]);
+    let gname = name_field(&header[GNAME_OFF..GNAME_OFF + GNAME_LEN]);
 
     // Parse device major/minor for block/char devices
     let devmajor = parse_octal(&header[DEVMAJOR_OFF..DEVMAJOR_OFF + 8])? as u32;
@@ -333,8 +333,16 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
         mtime,
         entry_type,
         link_target,
-        uname: if uname.is_empty() { None } else { Some(uname) },
-        gname: if gname.is_empty() { None } else { Some(gname) },
+        uname: if uname.is_empty() {
+            None
+        } else {
+            Some(uname.to_vec())
+        },
+        gname: if gname.is_empty() {
+            None
+        } else {
+            Some(gname.to_vec())
+        },
         devmajor,
         devminor,
         // ustar has no link-count field, and `Default` would leave this 0 --
@@ -381,6 +389,22 @@ pub(crate) fn parse_string(bytes: &[u8]) -> String {
 pub(crate) fn path_field(bytes: &[u8]) -> &[u8] {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     &bytes[..end]
+}
+
+/// The value of a user or group name field (uname, gname), as bytes.
+///
+/// POSIX makes these NUL-terminated character strings, and historical writers
+/// space-pad them, so both delimit the value -- which is what `parse_string`
+/// has always done for these two fields. Bytes rather than a `String` because
+/// under `hdrcharset=BINARY` a name is the underlying system's bytes and need
+/// not decode.
+pub(crate) fn name_field(bytes: &[u8]) -> &[u8] {
+    let value = path_field(bytes);
+    let end = value
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(0, |i| i + 1);
+    &value[..end]
 }
 
 /// Parse an octal number from bytes
@@ -693,10 +717,10 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
 
     // uname and gname
     if let Some(ref uname) = entry.uname {
-        write_field(&mut header[UNAME_OFF..], uname.as_bytes(), UNAME_LEN);
+        write_field(&mut header[UNAME_OFF..], uname, UNAME_LEN);
     }
     if let Some(ref gname) = entry.gname {
-        write_field(&mut header[GNAME_OFF..], gname.as_bytes(), GNAME_LEN);
+        write_field(&mut header[GNAME_OFF..], gname, GNAME_LEN);
     }
 
     // Device major/minor (always written for POSIX compliance)
@@ -839,6 +863,22 @@ fn skip_bytes<R: Read>(reader: &mut R, count: u64) -> PaxResult<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// uname and gname are bytes now, so they stop going through
+    /// `parse_string`. `name_field` has to keep its delimiting: POSIX
+    /// NUL-terminates these fields and historical writers space-pad them, so
+    /// both end the value -- and a byte that does not decode has to survive,
+    /// which is the whole point of the change.
+    #[test]
+    fn test_name_field_delimiters() {
+        assert_eq!(name_field(b"root\0\0\0\0"), b"root");
+        assert_eq!(name_field(b"root    "), b"root");
+        assert_eq!(name_field(b"root \0  "), b"root");
+        assert_eq!(name_field(b"        "), b"");
+        assert_eq!(name_field(b"\0root"), b"");
+        // Not UTF-8, and preserved rather than replaced.
+        assert_eq!(name_field(b"gr\xffup\0"), b"gr\xffup");
+    }
 
     #[test]
     fn test_parse_octal() {

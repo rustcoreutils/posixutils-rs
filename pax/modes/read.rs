@@ -269,8 +269,8 @@ pub(crate) fn apply_keyword_overrides(
                     entry.gid = v;
                 }
             }
-            "uname" => entry.uname = Some(value.clone()),
-            "gname" => entry.gname = Some(value.clone()),
+            "uname" => entry.uname = Some(value.clone().into_bytes()),
+            "gname" => entry.gname = Some(value.clone().into_bytes()),
             "path" => entry.path = PathBuf::from(value),
             "linkpath" => entry.link_target = Some(PathBuf::from(value)),
             "size" => {

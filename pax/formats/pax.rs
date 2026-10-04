@@ -118,10 +118,15 @@ pub struct ExtendedHeader {
     pub uid: Option<u32>,
     /// gid - group ID
     pub gid: Option<u32>,
-    /// uname - user name
-    pub uname: Option<String>,
-    /// gname - group name
-    pub gname: Option<String>,
+    /// uname - user name, as raw bytes.
+    ///
+    /// Not a `String`, for the reason `path` is not: under `hdrcharset=BINARY`
+    /// POSIX defines this record as "unencoded binary data from the underlying
+    /// system", and a lossy decode would destroy the bytes the archive set out
+    /// to preserve.
+    pub uname: Option<Vec<u8>>,
+    /// gname - group name, as raw bytes. See `uname`.
+    pub gname: Option<Vec<u8>>,
     /// hdrcharset - character encoding for path/linkpath/uname/gname
     /// Values: "BINARY" (ISO/IEC 646:1991 aka ASCII, non-UTF-8 bytes allowed)
     ///         "ISO-IR 10646 2000 UTF-8" (default, UTF-8 encoded)
@@ -181,6 +186,18 @@ impl ExtendedHeader {
                 self.linkpath = Some(value_bytes.to_vec());
                 return Ok(());
             }
+            // The other two records hdrcharset governs. Under BINARY they are
+            // the underlying system's bytes, and the lossy decode below turned
+            // every one that is not UTF-8 into U+FFFD -- irreversibly, under a
+            // header that had just promised to preserve them.
+            "uname" => {
+                self.uname = Some(value_bytes.to_vec());
+                return Ok(());
+            }
+            "gname" => {
+                self.gname = Some(value_bytes.to_vec());
+                return Ok(());
+            }
             _ => {}
         }
         if let Ok(value) = std::str::from_utf8(value_bytes) {
@@ -234,10 +251,10 @@ impl ExtendedHeader {
                 );
             }
             "uname" => {
-                self.uname = Some(value.to_string());
+                self.uname = Some(value.as_bytes().to_vec());
             }
             "gname" => {
-                self.gname = Some(value.to_string());
+                self.gname = Some(value.as_bytes().to_vec());
             }
             "hdrcharset" => {
                 self.hdrcharset = Some(value.to_string());
@@ -327,10 +344,10 @@ impl ExtendedHeader {
             rec!("gid", &gid.to_string());
         }
         if let Some(ref uname) = self.uname {
-            rec!("uname", uname);
+            rec_bytes!("uname", uname);
         }
         if let Some(ref gname) = self.gname {
-            rec!("gname", gname);
+            rec_bytes!("gname", gname);
         }
         // Sorted: iterating a HashMap made the record order differ between runs
         // of the same command, so two invocations produced different bytes for
@@ -1168,10 +1185,10 @@ fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
 
     // uname and gname
     if let Some(ref uname) = entry.uname {
-        write_field(&mut header[UNAME_OFF..], uname.as_bytes(), UNAME_LEN);
+        write_field(&mut header[UNAME_OFF..], uname, UNAME_LEN);
     }
     if let Some(ref gname) = entry.gname {
-        write_field(&mut header[GNAME_OFF..], gname.as_bytes(), GNAME_LEN);
+        write_field(&mut header[GNAME_OFF..], gname, GNAME_LEN);
     }
 
     // Device major/minor (always written for POSIX compliance)

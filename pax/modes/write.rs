@@ -688,8 +688,10 @@ fn build_entry(
     // Try to get user/group names
     #[cfg(unix)]
     {
-        entry.uname = cached_username(entry.uid);
-        entry.gname = cached_groupname(entry.gid);
+        // The databases hand back a C string; a name is bytes from here on,
+        // because `hdrcharset=BINARY` has to be able to record it unencoded.
+        entry.uname = cached_username(entry.uid).map(String::into_bytes);
+        entry.gname = cached_groupname(entry.gid).map(String::into_bytes);
     }
 
     Ok(entry)

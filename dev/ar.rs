@@ -863,6 +863,62 @@ fn truncate_name(name: &OsStr, max: usize) -> OsString {
         .into()
 }
 
+/// Whether `name` names a file directly in the current directory: a single
+/// path component, not `.` or `..`, so that a crafted archive cannot have a
+/// member written through `../`, an absolute path or a subdirectory.
+fn is_plain_file_name(name: &OsStr) -> bool {
+    let mut parts = Path::new(name).components();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    ) && !names_something_else(name)
+}
+
+/// Unix has no file names that mean something other than a file.
+#[cfg(unix)]
+fn names_something_else(_name: &OsStr) -> bool {
+    false
+}
+
+/// Whether a Windows file name means something other than a file in the
+/// directory: `file:stream` names an alternate data stream of `file`, and a
+/// device name (`CON`, `NUL`, `COM1`...) opens the device, whatever extension
+/// follows it and whatever dots and spaces end it.
+#[cfg(windows)]
+fn names_something_else(name: &OsStr) -> bool {
+    const DEVICES: [&str; 8] = [
+        "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM", "LPT",
+    ];
+    let bytes = name.as_encoded_bytes();
+    if bytes.contains(&b':') {
+        return true;
+    }
+    let stem = bytes.split(|&b| b == b'.').next().unwrap_or_default();
+    let stem = String::from_utf8_lossy(stem)
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    DEVICES.iter().any(|&device| match device {
+        // COM1-COM9 and LPT1-LPT9, the superscript digits included.
+        "COM" | "LPT" => stem.strip_prefix(device).is_some_and(|digit| {
+            matches!(
+                digit,
+                "1" | "2"
+                    | "3"
+                    | "4"
+                    | "5"
+                    | "6"
+                    | "7"
+                    | "8"
+                    | "9"
+                    | "\u{b9}"
+                    | "\u{b2}"
+                    | "\u{b3}"
+            )
+        }),
+        _ => stem == device,
+    })
+}
+
 fn extract_member(
     member: &ArchiveMember,
     dont_replace: bool,
@@ -887,6 +943,15 @@ fn extract_member(
     } else {
         member.name.clone()
     };
+
+    if !is_plain_file_name(&out_name) {
+        return Err(format!(
+            "{}: {}",
+            member.name.to_string_lossy(),
+            gettext("member name is not a file name in the current directory")
+        )
+        .into());
+    }
 
     let file_path = Path::new(&out_name);
     if file_path.exists() && dont_replace {

@@ -2251,3 +2251,82 @@ fn test_strip_leaves_input_intact_when_it_cannot_write() {
 
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
 }
+
+/// A one-member archive in the BSD layout, whose `#1/len` header puts the
+/// member's name -- any bytes at all -- in front of its data.
+fn ar_bsd_archive(name: &[u8], data: &[u8]) -> Vec<u8> {
+    fn field(v: &[u8], n: usize) -> Vec<u8> {
+        let mut f = v.to_vec();
+        f.resize(n, b' ');
+        f
+    }
+    let mut out = b"!<arch>\n".to_vec();
+    out.extend(field(format!("#1/{}", name.len()).as_bytes(), 16));
+    out.extend(field(b"0", 12));
+    out.extend(field(b"0", 6));
+    out.extend(field(b"0", 6));
+    out.extend(field(b"100644", 8));
+    out.extend(field((name.len() + data.len()).to_string().as_bytes(), 10));
+    out.extend(b"`\n");
+    out.extend(name);
+    out.extend(data);
+    if out.len() % 2 == 1 {
+        out.push(b'\n');
+    }
+    out
+}
+
+/// `ar -x` creates a member under the current directory, never elsewhere: a
+/// name that is a path out of it (`../`, absolute, or on Windows a drive, a
+/// stream or a device) is refused.
+#[test]
+fn test_ar_x_refuses_a_member_name_that_leaves_the_directory() {
+    let mut names = vec![
+        &b"../evil.o"[..],
+        b"/tmp/evil.o",
+        b"sub/evil.o",
+        b".",
+        b"..",
+    ];
+    if cfg!(windows) {
+        names.extend([&b"..\\evil.o"[..], b"C:evil.o", b"evil.o:stream"]);
+        // Device names, which open the device whatever the extension, and
+        // with the trailing dots and spaces Windows strips.
+        names.extend([
+            &b"CON"[..],
+            b"nul",
+            b"AUX.o",
+            b"COM1",
+            b"lpt9.txt",
+            b"PRN.",
+            b"NUL ",
+        ]);
+    }
+    for name in names {
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let xdir = dir.path().join("x");
+        fs::create_dir(&xdir).unwrap();
+        fs::create_dir(xdir.join("sub")).unwrap();
+        let arc = dir.path().join("t.a");
+        fs::write(&arc, ar_bsd_archive(name, b"PAYLOAD\n")).unwrap();
+
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+            .args(["-x", arc.to_str().unwrap()])
+            .current_dir(&xdir)
+            .output()
+            .expect("run ar -x");
+        let shown = String::from_utf8_lossy(name);
+        assert!(!out.status.success(), "{shown}: ar -x must fail");
+        // Refused for its name -- not by some later failure to create it,
+        // which is all that stops a device name under Wine.
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains("member name is not a file name in the current directory"),
+            "{shown}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!dir.path().join("evil.o").exists(), "{shown} escaped");
+        assert!(!xdir.join("sub/evil.o").exists(), "{shown} went into sub/");
+        assert!(!xdir.join("evil.o").exists(), "{shown} was written");
+    }
+}

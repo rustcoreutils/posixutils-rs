@@ -13,12 +13,12 @@
 // `void *`. The severities and wording follow gcc's.
 //
 
-use crate::common::{
-    compile_expect_error, compile_expect_no_diagnostic, compile_expect_warning, create_c_file,
-    run_c17,
+use crate::test_compile::{
+    compile, compile_expect_error, compile_expect_no_diagnostic, compile_expect_warning,
 };
 
 const INT_TO_POINTER: &str = "makes pointer from integer without a cast";
+
 const INCOMPATIBLE_POINTER: &str = "incompatible pointer type";
 
 /// Every null pointer constant, and every pointer of the right type, returns
@@ -169,12 +169,11 @@ fn return_void_value_from_non_void_is_rejected() {
 /// last expression before it happened to be.
 #[test]
 fn return_without_value_is_reported_at_the_return() {
-    let c_file = create_c_file(
+    let run = compile(
         "ret_no_value_pos",
         "int g(int x){\n  x++;\n  if (x)\n    return;\n  return 1;\n}\n",
+        &[],
     );
-    let path = c_file.path().to_string_lossy().to_string();
-    let run = run_c17(&["-S", "-o", "/dev/null", &path]);
     assert!(!run.success, "stderr:\n{}", run.stderr);
     assert!(
         run.stderr

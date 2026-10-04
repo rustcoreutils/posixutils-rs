@@ -10,7 +10,7 @@
 // concatenation, including the mixed-prefix rules.
 //
 
-use crate::common::{compile_and_run, compile_and_run_aarch64, compile_expect_error, run_c17};
+use crate::common::{compile_and_run, compile_and_run_aarch64, run_c17};
 
 /// Every prefix lexes, and each has the right element width. `u8"x"` used to
 /// give `undeclared identifier 'u8'` followed by a parse cascade.
@@ -135,16 +135,6 @@ fn c11_mixed_narrow_utf_concatenation() {
         }
     "#;
     assert_eq!(compile_and_run("c11_mixed_utf_concat", src, &[]), 0);
-}
-
-/// Two *different* prefixes in one run is a constraint violation (6.4.5p2).
-#[test]
-fn c11_conflicting_prefix_concatenation_is_rejected() {
-    compile_expect_error(
-        "c11_conflicting_concat",
-        "const void *p = L\"a\" u\"b\";\n",
-        "different encoding prefixes",
-    );
 }
 
 /// Plain and wide concatenation must keep working unchanged.

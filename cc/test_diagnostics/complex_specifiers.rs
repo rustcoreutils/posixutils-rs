@@ -11,7 +11,7 @@
 // `typedef double ty; ty _Complex z;` made `z` a plain `double`.
 //
 
-use crate::common::{compile_expect_error, compile_expect_ok};
+use crate::test_compile::{compile_expect_error, compile_expect_ok};
 
 #[test]
 fn complex_with_a_non_arithmetic_base_is_rejected() {

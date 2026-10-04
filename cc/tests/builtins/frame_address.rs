@@ -9,7 +9,7 @@
 // __builtin_return_address / __builtin_frame_address at a level above zero
 //
 
-use crate::common::{compile_and_run, compile_and_run_aarch64, compile_expect_error};
+use crate::common::{compile_and_run, compile_and_run_aarch64};
 
 /// Walks the frame chain one and two levels up, from two different call sites.
 ///
@@ -104,16 +104,5 @@ fn builtins_frame_chain_levels_aarch64() {
         if let Some(code) = compile_and_run_aarch64("frame_chain_a64", FRAME_CHAIN, opt) {
             assert_eq!(code, 0, "at {opt}");
         }
-    }
-}
-
-/// gcc requires the level to be an integer constant ("invalid argument to
-/// '__builtin_return_address'"): walking a run-time number of frames is not
-/// something either builtin does.
-#[test]
-fn builtins_frame_level_must_be_constant() {
-    for builtin in ["__builtin_return_address", "__builtin_frame_address"] {
-        let src = format!("void *f(int n) {{ return {builtin}(n); }}\n");
-        compile_expect_error("frame_level_nonconst", &src, builtin);
     }
 }

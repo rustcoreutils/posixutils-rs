@@ -1213,28 +1213,3 @@ int main(void) {
 "#;
     crate::common::compile_and_run_everywhere("bare_tag_declaration", src);
 }
-
-/// `sizeof` of an expression of incomplete structure type is a constraint
-/// violation (C17 6.5.3.4p1), whichever tag is incomplete: one never
-/// defined, one hidden by `struct S;`, or one whose name an inner scope has
-/// given a complete definition. The last was accepted because the pointee's
-/// tag was looked up by name and found the inner definition.
-#[test]
-fn c89_sizeof_an_incomplete_struct_expression_is_rejected() {
-    let what = "invalid application of 'sizeof' to incomplete type 'struct S'";
-    crate::common::compile_expect_error(
-        "sizeof_incomplete_never_defined",
-        "struct S; int f(struct S *p) { return sizeof *p; }\n",
-        what,
-    );
-    crate::common::compile_expect_error(
-        "sizeof_incomplete_hidden",
-        "struct S { int a; };\nint f(void) { struct S; struct S *p = 0; return sizeof *p; }\n",
-        what,
-    );
-    crate::common::compile_expect_error(
-        "sizeof_incomplete_under_inner_tag",
-        "struct S; struct S *gp;\nint f(void) { struct S { char c; }; return sizeof(*gp); }\n",
-        what,
-    );
-}

@@ -24,7 +24,6 @@ mod features;
 mod func_name;
 mod identifiers;
 mod initializers;
-mod machine_modes;
 mod stdlib_headers;
 mod tgmath;
 mod translation_limits;

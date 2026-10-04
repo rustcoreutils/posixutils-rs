@@ -11,7 +11,7 @@
 // are gcc's.
 //
 
-use crate::common::{compile_and_run_everywhere, compile_expect_error};
+use crate::common::compile_and_run_everywhere;
 
 const PRELUDE: &str = r#"
 typedef int v4si __attribute__((vector_size(16)));
@@ -192,65 +192,6 @@ int main(void) {
     );
 }
 
-#[test]
-fn vector_operand_constraints() {
-    for (name, expr, expected) in [
-        ("vec_mixed_lanes", "a + f", "invalid operands to binary +"),
-        (
-            "vec_float_splat",
-            "a + 1.5",
-            "cannot convert value to a vector",
-        ),
-        (
-            "vec_truncating_splat",
-            "a + l",
-            "conversion of scalar 'long' to vector '__vector(4) int' involves truncation",
-        ),
-        ("vec_float_mod", "f % f", "invalid operands to binary %"),
-        (
-            "vec_float_complement",
-            "~f",
-            "wrong type argument to bit-complement",
-        ),
-        (
-            "vec_not",
-            "!a",
-            "wrong type argument to unary exclamation mark",
-        ),
-        ("vec_deref", "*a", "invalid type argument of unary '*'"),
-        (
-            "vec_logical",
-            "a && a",
-            "used vector type where scalar is required",
-        ),
-        (
-            "vec_cond_mismatch",
-            "l ? a : u",
-            "type mismatch in conditional expression",
-        ),
-        (
-            "vec_assign_signedness",
-            "a = u",
-            "incompatible types when assigning",
-        ),
-        ("vec_cast_size", "(v2si)l2[0]", "which has different size"),
-        (
-            "vec_cast_float",
-            "(double)l2",
-            "aggregate value used where a floating-point was expected",
-        ),
-    ] {
-        compile_expect_error(
-            name,
-            &format!(
-                "{PRELUDE}void g(long l) {{ v4si a = {{0}}; v4su u = {{0}}; v4sf f = {{0}}; \
-                 v2si l2 = {{0}}; (void)({expr}); }}\n"
-            ),
-            expected,
-        );
-    }
-}
-
 /// `__builtin_shuffle` (one or two operands, a run-time mask taken modulo
 /// the lanes), `__builtin_shufflevector` (constant indices, operands of
 /// different lengths, a result of a new length) and
@@ -295,29 +236,6 @@ int main(void) {
 }
 "#,
     );
-}
-
-#[test]
-fn vector_builtin_constraints() {
-    for (name, expr, expected) in [
-        ("shuf_float_mask", "__builtin_shuffle(a, f)", "'__builtin_shuffle' last argument must be an integer vector"),
-        ("shuf_count", "__builtin_shuffle(a, l2)", "number of elements of the argument vector(s) and the mask vector should be the same"),
-        ("shuf_types", "__builtin_shuffle(a, f, a)", "'__builtin_shuffle' argument vectors must be of the same type"),
-        ("shuf_scalar", "__builtin_shuffle(l, a)", "'__builtin_shuffle' arguments must be vectors"),
-        ("sv_index", "__builtin_shufflevector(a, a, 0, 8)", "invalid element index '8' to '__builtin_shufflevector'"),
-        ("sv_pow2", "__builtin_shufflevector(a, a, 0, 1, 2)", "must specify a result with a power of two number of elements"),
-        ("sv_lane", "__builtin_shufflevector(a, f, 0, 1)", "argument vectors must have the same element type"),
-        ("cv_count", "__builtin_convertvector(a, v2si)", "number of elements of the first argument vector and the second argument vector type should be the same"),
-        ("cv_scalar", "__builtin_convertvector(a, int)", "second argument must be an integer or floating vector type"),
-    ] {
-        compile_expect_error(
-            name,
-            &format!(
-                "{PRELUDE}void g(long l) {{ v4si a = {{0}}; v4sf f = {{0}}; v2si l2 = {{0}}; (void)({expr}); }}\n"
-            ),
-            expected,
-        );
-    }
 }
 
 /// A vector in a register operand of inline asm is its value in the

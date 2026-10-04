@@ -161,32 +161,6 @@ int main(void) {{
     }
 }
 
-/// Both builtins are meaningless outside an `always_inline` variadic
-/// function -- there is no caller whose arguments they could name. GCC
-/// rejects the program; so must c17, rather than silently producing nothing.
-#[test]
-fn builtins_va_arg_pack_outside_a_forwarding_function_is_rejected() {
-    compile_expect_error(
-        "va_arg_pack_not_variadic",
-        "__attribute__((always_inline)) static inline int f(int x) {\n\
-         return x + __builtin_va_arg_pack_len(); }\n\
-         int main(void) { return f(1); }\n",
-        "va_arg_pack",
-    );
-    compile_expect_error(
-        "va_arg_pack_not_always_inline",
-        "static int f(const char *t, ...) {\n\
-         (void)t; return __builtin_va_arg_pack_len(); }\n\
-         int main(void) { return f(\"x\", 1); }\n",
-        "va_arg_pack",
-    );
-    compile_expect_error(
-        "va_arg_pack_at_file_scope",
-        "int x = __builtin_va_arg_pack_len();\nint main(void) { return x; }\n",
-        "va_arg_pack",
-    );
-}
-
 /// When the inliner refuses an `always_inline` forwarder for a reason of its
 /// own -- the callee also keeps a `va_list` of its own -- the pack has nothing
 /// to be resolved against and the body has already been suppressed.

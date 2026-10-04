@@ -497,30 +497,3 @@ fn c89_functions_identifier_list_parameters_interoperate_with_gcc_aarch64() {
     }
     crate::common::interop_aarch64("knr", KNR_CALLEE, KNR_CALLER);
 }
-
-/// Dropping a qualifier on the way to or from `void *` is diagnosed as it is
-/// between compatible pointees (C17 6.5.16.1p1), in a call, an
-/// initialization and the other direction alike; gcc warns on each.
-#[test]
-fn c89_functions_void_pointer_conversion_keeps_qualifiers() {
-    for (name, code) in [
-        (
-            "voidptr_init_const",
-            "const int *p; void f(void) { void *q = p; (void)q; }\n",
-        ),
-        (
-            "voidptr_arg_volatile",
-            "void h(const void *); volatile int *p; void f(void) { h(p); }\n",
-        ),
-        (
-            "voidptr_from_const_void",
-            "const void *p; void f(void) { int *q = p; (void)q; }\n",
-        ),
-    ] {
-        crate::common::compile_expect_warning(
-            name,
-            code,
-            "discards a qualifier from the pointer target type",
-        );
-    }
-}

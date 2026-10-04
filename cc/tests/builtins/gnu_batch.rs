@@ -86,16 +86,6 @@ int main(void) {
     );
 }
 
-/// `#line` moves diagnostics, as gcc's does, not only `__LINE__`.
-#[test]
-fn builtins_line_directive_moves_diagnostics() {
-    compile_expect_error(
-        "line_moves_diagnostics",
-        "int a;\n#line 77 \"renamed.c\"\nint b = undeclared_x;\n",
-        "renamed.c:77:",
-    );
-}
-
 /// x86-64 CPU detection reads libgcc's `__cpu_model` as gcc's code does.
 #[cfg(target_arch = "x86_64")]
 #[test]

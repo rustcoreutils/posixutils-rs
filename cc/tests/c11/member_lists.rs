@@ -12,7 +12,7 @@
 // evaluated.
 //
 
-use crate::common::{compile_and_run, compile_expect_error, compile_expect_ok};
+use crate::common::{compile_and_run, compile_expect_error};
 
 /// C17 6.7.2.1p13: an anonymous union's members are members of the
 /// containing struct, so they are the named members a flexible array member
@@ -73,25 +73,6 @@ int main(void) {
     );
 }
 
-/// Translation phase 6 makes one literal of adjacent ones, so a
-/// `_Static_assert` message may be written as several (`BUILD_BUG_ON_ZERO`
-/// pastes `#e " is true"`), with any encoding prefix.
-#[test]
-fn static_assert_message_is_a_concatenated_literal() {
-    compile_expect_ok(
-        "sa_concat_ok",
-        "_Static_assert(1, \"a\" \"b\");\n\
-         _Static_assert(1, L\"a\" L\"b\");\n\
-         struct S { int x; _Static_assert(sizeof(int) >= 2, \"int\" \" too small\"); };\n\
-         void f(void) { _Static_assert(1, \"in\" \" a block\"); }\n",
-    );
-    compile_expect_error(
-        "sa_concat_fail",
-        "_Static_assert(0, \"first \" \"second\");\n",
-        "static assertion failed: first second",
-    );
-}
-
 /// The right operand of `&&` and `||` is not evaluated when the left decides
 /// (C17 6.5.13p4, 6.5.14p4), and an operand that is not evaluated may be
 /// anything (6.6p3), as for the arm `?:` does not take.
@@ -117,22 +98,5 @@ int x;
         "const_short_circuit_taken",
         "int a = 0 || 1/0;\n",
         "not a constant expression",
-    );
-}
-
-/// glibc headers that include only <stdint.h> and expect it to bring in
-/// <sys/cdefs.h>, as glibc's own does: the bundled one hands a hosted glibc
-/// build to the C library's.
-#[cfg(target_os = "linux")]
-#[test]
-fn glibc_headers_that_lean_on_stdint() {
-    compile_expect_ok(
-        "glibc_stdint_users",
-        "#include <sys/eventfd.h>\n#include <sys/inotify.h>\n\
-         #include <sys/signalfd.h>\n#include <sys/fanotify.h>\n\
-         #include <stdint.h>\n#include <inttypes.h>\n\
-         _Static_assert(INT64_MAX == 0x7fffffffffffffff, \"int64\");\n\
-         _Static_assert(sizeof(intptr_t) == sizeof(void *), \"intptr\");\n\
-         int64_t v = INT64_C(5);\nint main(void) { return 0; }\n",
     );
 }

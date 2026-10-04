@@ -27,28 +27,16 @@ use crate::token::{preprocess_collecting, PreprocessConfig};
 /// stack is too small for the deep cases.
 const STACK_BYTES: usize = 256 * 1024 * 1024;
 
-/// What compiling one translation unit produced.
+/// What compiling one translation unit produced, shaped like the
+/// integration suite's `C17Run` so a case reads the same in either.
 pub struct Compiled {
+    /// Whether it compiled.
+    pub success: bool,
     /// Every diagnostic line, as `c17` would print it to stderr, including
-    /// the driver's final `c17: test.c: ...` line on failure.
-    pub diags: Vec<String>,
-    /// The assembly, if compilation succeeded.
+    /// the driver's final `c17: <name>.c: ...` line on failure.
+    pub stderr: String,
+    /// The assembly, if it compiled.
     pub asm: Option<String>,
-}
-
-impl Compiled {
-    pub fn ok(&self) -> bool {
-        self.asm.is_some()
-    }
-
-    /// All diagnostics as one string, as stderr would hold them.
-    pub fn stderr(&self) -> String {
-        let mut text = self.diags.join("\n");
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text
-    }
 }
 
 /// The command-line options a test may pass. Anything else is a test bug and
@@ -184,7 +172,15 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
             None
         }
     };
-    Compiled { diags, asm }
+    let mut stderr = diags.join("\n");
+    if !stderr.is_empty() {
+        stderr.push('\n');
+    }
+    Compiled {
+        success: asm.is_some(),
+        stderr,
+        asm,
+    }
 }
 
 /// Compile `src` as `<name>.c` with `flags`, as `c17 -S` would, on a thread
@@ -229,9 +225,9 @@ pub fn compile_rejected(name: &str, content: &str) -> String {
 #[track_caller]
 pub fn compile_rejected_with(name: &str, content: &str, extra: &[&str]) -> String {
     let c = compile(name, content, extra);
-    let stderr = c.stderr();
+    let stderr = c.stderr;
     assert!(
-        !c.ok(),
+        !c.success,
         "'{name}' should have been rejected but compiled cleanly.\nSource:\n{content}\nstderr:\n{stderr}"
     );
     stderr
@@ -247,9 +243,9 @@ pub fn compile_expect_ok(name: &str, content: &str) {
 #[track_caller]
 pub fn compile_accepted(name: &str, content: &str, extra: &[&str]) -> String {
     let c = compile(name, content, extra);
-    let stderr = c.stderr();
+    let stderr = c.stderr;
     assert!(
-        c.ok(),
+        c.success,
         "'{name}' should have compiled, but was rejected.\nSource:\n{content}\nstderr:\n{stderr}"
     );
     stderr
@@ -293,7 +289,7 @@ pub fn asm_for(name: &str, src: &str, flags: &[&str]) -> String {
         Some(asm) => asm,
         None => panic!(
             "'{name}' should have compiled:\n{}\nSource:\n{src}",
-            c.stderr()
+            c.stderr
         ),
     }
 }
@@ -305,17 +301,17 @@ mod tests {
     #[test]
     fn captures_errors_and_warnings() {
         let c = compile("t", "int f(void) { return undeclared; }\n", &[]);
-        assert!(!c.ok());
-        assert!(c.stderr().contains("t.c:1:"), "{}", c.stderr());
-        assert!(c.stderr().contains("error: "), "{}", c.stderr());
-        assert!(c.stderr().contains("c17: t.c: "), "{}", c.stderr());
+        assert!(!c.success);
+        assert!(c.stderr.contains("t.c:1:"), "{}", c.stderr);
+        assert!(c.stderr.contains("error: "), "{}", c.stderr);
+        assert!(c.stderr.contains("c17: t.c: "), "{}", c.stderr);
 
         let src = "int f(void) { int a[2] = {1, 2, 3}; return a[0]; }\n";
         let warned = compile("w", src, &[]);
         let quiet = compile("w", src, &["-w"]);
-        assert!(warned.ok() && quiet.ok());
-        assert!(warned.stderr().contains("warning: "), "{}", warned.stderr());
-        assert!(quiet.stderr().is_empty(), "{}", quiet.stderr());
+        assert!(warned.success && quiet.success);
+        assert!(warned.stderr.contains("warning: "), "{}", warned.stderr);
+        assert!(quiet.stderr.is_empty(), "{}", quiet.stderr);
     }
 
     #[test]
@@ -323,8 +319,8 @@ mod tests {
         // -fpermissive turns an implicit declaration into a warning, and must
         // not leak into the next compile.
         let src = "int main(void) { return f(); }\n";
-        assert!(compile("p", src, &["-fpermissive"]).ok());
-        assert!(!compile("p", src, &[]).ok());
+        assert!(compile("p", src, &["-fpermissive"]).success);
+        assert!(!compile("p", src, &[]).success);
     }
 
     #[test]

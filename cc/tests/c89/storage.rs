@@ -11,7 +11,7 @@
 // Consolidates: storage.rs + static_local.rs tests
 //
 
-use crate::common::{compile_and_run, compile_expect_error};
+use crate::common::compile_and_run;
 
 // ============================================================================
 // Mega-test: C89 storage classes (auto, static, register, extern)
@@ -365,26 +365,4 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("c89_static_local_scoped", code, &[]), 0);
-}
-
-/// An automatic object has no address a static initializer can name, and its
-/// value is not a constant: a same-named file-scope object must not be used
-/// in its place, and nothing may be relocated against its bare name.
-#[test]
-fn c89_static_initializer_cannot_name_an_automatic() {
-    compile_expect_error(
-        "c89_static_init_auto_address",
-        "int a; int f(void) { int a = 1; static int *p = &a; return *p; }\n",
-        "not a constant expression",
-    );
-    compile_expect_error(
-        "c89_static_init_auto_array",
-        "int a[2]; int f(void) { int a[2] = {1, 2}; static int *p = a; return *p; }\n",
-        "not a constant expression",
-    );
-    compile_expect_error(
-        "c89_static_init_auto_const",
-        "const int c = 5; int f(void) { const int c = 7; static int w = c; return w; }\n",
-        "not a constant expression",
-    );
 }

@@ -12,7 +12,7 @@
 // accepted; with an asm label it held the label rather than the name.
 //
 
-use crate::common::{compile_and_run, compile_expect_error, compile_expect_warning};
+use crate::common::compile_and_run;
 
 #[test]
 fn func_name_is_a_const_char_array() {
@@ -41,23 +41,4 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("func_name_array", src, &[]), 0);
-}
-
-#[test]
-fn func_name_is_read_only() {
-    compile_expect_error(
-        "func_name_write",
-        "void g(void) { __func__[0] = 'x'; }\n",
-        "read-only",
-    );
-}
-
-/// Outside a function gcc warns, and the name is empty.
-#[test]
-fn func_name_outside_a_function() {
-    compile_expect_warning(
-        "func_name_file_scope",
-        "const char *p = __func__;\nint n = sizeof __func__;\n",
-        "'__func__' is not defined outside of function scope",
-    );
 }

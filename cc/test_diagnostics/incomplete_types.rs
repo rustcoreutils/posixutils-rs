@@ -15,7 +15,7 @@
 // refused as an internal compiler error.
 //
 
-use crate::common::{compile_bounded, compile_expect_error, compile_expect_ok};
+use crate::test_compile::{compile, compile_expect_error, compile_expect_ok, Compiled};
 
 /// C17 6.7.2.1p3: a member has neither incomplete nor function type, and a
 /// tag is incomplete until its closing brace -- so a structure cannot
@@ -73,38 +73,6 @@ fn incomplete_member_types_accept_side() {
     );
 }
 
-/// C17 6.7.2.1p13: only a specifier with no tag makes an anonymous member.
-/// A tagged one inside a member list declares the tag and nothing else --
-/// taking it as a member made `struct A { struct A; }` contain itself.
-#[test]
-fn tagged_struct_in_member_list_is_not_a_member() {
-    let run = compile_bounded(
-        "itm_tagged_self",
-        "struct A { struct A; int x; };\nstruct A v = {0};\n\
-         _Static_assert(sizeof v == sizeof(int), \"only x\");\n",
-        30,
-    );
-    assert!(run.success, "{}", run.stderr);
-    assert!(
-        run.stderr.contains("declaration does not declare anything"),
-        "{}",
-        run.stderr
-    );
-
-    let run = compile_bounded(
-        "itm_tagged_inner",
-        "struct S { struct T { int b; }; int a; };\nstruct T t;\n\
-         _Static_assert(sizeof(struct S) == sizeof(int), \"only a\");\n",
-        30,
-    );
-    assert!(run.success, "{}", run.stderr);
-    assert!(
-        run.stderr.contains("declaration does not declare anything"),
-        "{}",
-        run.stderr
-    );
-}
-
 /// A value of an incomplete type cannot be read or written (C17 6.3.2.1p2,
 /// which gcc enforces). A forward-declared `enum` is the GNU extension that
 /// reaches this.
@@ -155,5 +123,58 @@ fn incomplete_parameter_types() {
         "ipt_completed_later",
         "struct S;\nvoid k(struct S s);\nstruct S { int a; };\n\
          void f(struct S *p) { k(*p); }\nvoid k(struct S s) { (void)s; }\n",
+    );
+}
+
+/// Compile `content`, failing the test if the compile has not finished
+/// within `secs` seconds: a regression here recurses without end.
+fn compile_bounded(name: &str, content: &str, secs: u64) -> Compiled {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (thread_name, src) = (name.to_string(), content.to_string());
+    let worker = std::thread::spawn(move || {
+        let _ = tx.send(compile(&thread_name, &src, &[]));
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(run) => run,
+        // The compile panicked: report its panic, not a timeout.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match worker.join() {
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(()) => unreachable!("the compile thread exited without a result"),
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("'{name}': c17 did not finish within {secs}s")
+        }
+    }
+}
+
+/// C17 6.7.2.1p13: only a specifier with no tag makes an anonymous member.
+/// A tagged one inside a member list declares the tag and nothing else --
+/// taking it as a member made `struct A { struct A; }` contain itself.
+#[test]
+fn tagged_struct_in_member_list_is_not_a_member() {
+    let run = compile_bounded(
+        "itm_tagged_self",
+        "struct A { struct A; int x; };\nstruct A v = {0};\n\
+         _Static_assert(sizeof v == sizeof(int), \"only x\");\n",
+        30,
+    );
+    assert!(run.success, "{}", run.stderr);
+    assert!(
+        run.stderr.contains("declaration does not declare anything"),
+        "{}",
+        run.stderr
+    );
+
+    let run = compile_bounded(
+        "itm_tagged_inner",
+        "struct S { struct T { int b; }; int a; };\nstruct T t;\n\
+         _Static_assert(sizeof(struct S) == sizeof(int), \"only a\");\n",
+        30,
+    );
+    assert!(run.success, "{}", run.stderr);
+    assert!(
+        run.stderr.contains("declaration does not declare anything"),
+        "{}",
+        run.stderr
     );
 }

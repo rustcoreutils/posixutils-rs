@@ -12,7 +12,7 @@
 // `_Float32:` in one `_Generic`.
 //
 
-use crate::common::{compile_and_run, compile_expect_error};
+use crate::common::compile_and_run;
 
 /// The glibc headers take their gcc 7 paths, and the type-generic macros of
 /// both <math.h> and <tgmath.h> reach the function of each argument's type --
@@ -86,18 +86,4 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("float_n_types", src, &[]), 0);
-}
-
-#[test]
-fn float_n_specifier_combinations() {
-    compile_expect_error(
-        "float_n_long",
-        "long _Float64 x;\n",
-        "both 'long' and '_Float64' in declaration specifiers",
-    );
-    compile_expect_error(
-        "float_n_unsigned",
-        "unsigned _Float32x x;\n",
-        "both 'unsigned' and '_Float32x' in declaration specifiers",
-    );
 }

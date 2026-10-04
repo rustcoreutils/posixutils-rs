@@ -13,7 +13,6 @@
 
 use crate::common::{
     asm_for_at, compile_and_run, compile_and_run_aarch64, compile_and_run_optimized,
-    compile_expect_error, compile_expect_warning,
 };
 
 // ============================================================================
@@ -395,36 +394,6 @@ int main(void) {
     return 0;
 }
 "#,
-    );
-}
-
-/// An argument the prototype cannot convert is diagnosed as in any call, in
-/// gcc's words: a structure is an error, a pointer the integer-from-pointer
-/// warning an ordinary call draws.
-#[test]
-fn builtins_bit_ops_check_their_argument() {
-    for (name, call, param) in [
-        ("ctz", "__builtin_ctz(s)", "unsigned int"),
-        ("parityl", "__builtin_parityl(s)", "unsigned long"),
-        ("bswap16", "__builtin_bswap16(s)", "unsigned short"),
-        ("clrsbll", "__builtin_clrsbll(s)", "long long"),
-        ("ffs", "__builtin_ffs(s)", "int"),
-    ] {
-        let builtin = call.split('(').next().unwrap();
-        compile_expect_error(
-            &format!("bit_ops_struct_{name}"),
-            &format!("struct S {{ int a; }};\nint f(struct S s) {{ return {call}; }}\n"),
-            &format!(
-                "incompatible type for argument 1 of '{builtin}': \
-                 expected '{param}', got 'struct S'"
-            ),
-        );
-    }
-    compile_expect_warning(
-        "bit_ops_pointer",
-        "int f(unsigned *p) { return __builtin_popcount(p); }\n",
-        "passing argument 1 of '__builtin_popcount' as 'unsigned int' from 'unsigned int *' \
-         makes integer from pointer without a cast",
     );
 }
 

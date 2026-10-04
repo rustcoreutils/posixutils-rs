@@ -35,6 +35,8 @@ pub mod symbol;
 pub mod target;
 #[cfg(test)]
 pub mod test_compile;
+#[cfg(test)]
+mod test_diagnostics;
 pub mod token;
 pub mod tools;
 pub mod types;

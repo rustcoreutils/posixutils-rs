@@ -10,9 +10,8 @@
 //
 
 use crate::common::{
-    aarch64_cross_available, asm_for_at, compile_and_run, compile_expect_error,
-    compile_expect_warning, compile_expect_warning_with, interop_aarch64, interop_host,
-    AARCH64_TARGET_ARGS,
+    aarch64_cross_available, asm_for_at, compile_and_run, compile_expect_warning_with,
+    interop_aarch64, interop_host, AARCH64_TARGET_ARGS,
 };
 
 const CALLEE: &str = r#"
@@ -510,51 +509,6 @@ fn codegen_ms_abi_inlines_across_conventions() {
             &["-DC17_ALONE".to_string(), "-O2".to_string()]
         ),
         0
-    );
-}
-
-/// The convention is part of the function type: a pointer to an `ms_abi`
-/// function and one to an ordinary function are incompatible, as gcc warns,
-/// and a redeclaration that changes the convention conflicts.
-#[test]
-fn codegen_ms_abi_function_types_are_distinct() {
-    if !cfg!(target_arch = "x86_64") {
-        return;
-    }
-    compile_expect_warning(
-        "ms_abi_ptr",
-        "long s(long);\n\
-         typedef __attribute__((ms_abi)) long (*msfp)(long);\n\
-         msfp p = s;\n",
-        "incompatible pointer type",
-    );
-    compile_expect_warning(
-        "ms_abi_ptr_rev",
-        "__attribute__((ms_abi)) long m(long);\n\
-         long (*p)(long) = m;\n",
-        "incompatible pointer type",
-    );
-    compile_expect_error(
-        "ms_abi_redecl",
-        "__attribute__((ms_abi)) long m(long);\n\
-         long m(long x) { return x; }\n",
-        "conflicting types",
-    );
-    compile_expect_error(
-        "ms_abi_both",
-        "__attribute__((ms_abi, sysv_abi)) long m(long);\n",
-        "'ms_abi' and 'sysv_abi' attributes are not compatible",
-    );
-    compile_expect_warning(
-        "ms_abi_object",
-        "__attribute__((ms_abi)) int x;\n",
-        "'ms_abi' attribute only applies to function types",
-    );
-    compile_expect_error(
-        "ms_abi_va_start",
-        "__attribute__((ms_abi)) int f(int n, ...) {\n\
-         __builtin_va_list ap; __builtin_va_start(ap, n); return 0; }\n",
-        "'va_start' used in Win64 ABI function",
     );
 }
 

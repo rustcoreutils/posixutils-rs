@@ -8,9 +8,7 @@
 //
 
 use plib::testing::{get_binary_path, run_test, run_test_u8, TestPlan, TestPlanU8};
-use std::ffi::OsStr;
 use std::fs::File;
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -206,8 +204,13 @@ fn test_echo_octal_escape_out_of_range() {
     echo_test_bytes(&["\\01011"], b"A1\n");
 }
 
+// Operands that are not UTF-8 are the subject: a Windows command line
+// cannot carry them.
+#[cfg(unix)]
 #[test]
 fn test_echo_non_utf8_operand() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
     // Audit #E1: operands are byte strings.  A non-UTF-8 operand must be
     // written through unchanged, not abort the process.
     let arg = OsStr::from_bytes(&[0xff, 0xfe]);
@@ -221,8 +224,11 @@ fn test_echo_non_utf8_operand() {
     assert!(output.stderr.is_empty());
 }
 
+#[cfg(unix)]
 #[test]
 fn test_echo_non_utf8_operand_mixed() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
     // Byte-faithful operands survive joining and escape expansion.
     let output = Command::new(get_binary_path("echo"))
         .arg("-n")

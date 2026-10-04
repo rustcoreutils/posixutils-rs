@@ -1319,6 +1319,7 @@ fn test_audit_next_file_error_affects_exit_status() {
 /// `more` reports such a failure honestly and exits 1, which is correct of
 /// it and useless to a test that wanted to ask about argument order. So the
 /// wait is here rather than a retry there.
+#[cfg(unix)]
 fn wait_until_executable(path: &std::path::Path) {
     for attempt in 0..10 {
         match std::process::Command::new(path).arg("--probe").status() {
@@ -1333,23 +1334,13 @@ fn wait_until_executable(path: &std::path::Path) {
     }
 }
 
-/// Audit #10/#11 / POSIX 107617-107620: the editor is chosen by the *last
-/// pathname component* of EDITOR, and vi/ex are invoked with `-c linenumber`.
-#[test]
-fn test_audit_invoke_editor_arguments() {
+/// A stand-in `vi` in `dir` that writes each argument it is given, one per
+/// line, to `record`: a shell script on Unix, a batch file on Windows.
+#[cfg(unix)]
+fn stand_in_vi(dir: &std::path::Path, record: &std::path::Path) -> std::path::PathBuf {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
 
-    // A *unique* directory, not a fixed path under the system temporary
-    // directory: two concurrent runs of this suite otherwise share it, and
-    // whichever starts second removes the first one's recording between the
-    // editor writing it and this test reading it back.
-    let dir = plib::tmp::tempdir().unwrap();
-    let dir = dir.path();
-
-    let record = dir.join("args");
-    // Named `vi`, but reached through a full path: the basename is what
-    // decides whether `-c linenumber` is passed.
     let editor = dir.join("vi");
     let mut script = std::fs::File::create(&editor).unwrap();
     writeln!(script, "#!/bin/sh").unwrap();
@@ -1361,6 +1352,39 @@ fn test_audit_invoke_editor_arguments() {
     drop(script);
     std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
     wait_until_executable(&editor);
+    editor
+}
+
+/// A stand-in `vi` in `dir` that writes each argument it is given, one per
+/// line, to `record`: a shell script on Unix, a batch file on Windows.
+#[cfg(windows)]
+fn stand_in_vi(dir: &std::path::Path, record: &std::path::Path) -> std::path::PathBuf {
+    let editor = dir.join("vi.cmd");
+    // The redirection comes first so that an argument such as `1` is not
+    // read as the handle of a `1>>` redirection.
+    let script = format!(
+        "@echo off\r\ntype nul > \"{0}\"\r\nfor %%a in (%*) do >>\"{0}\" echo %%~a\r\n",
+        record.display()
+    );
+    std::fs::write(&editor, script).unwrap();
+    editor
+}
+
+/// Audit #10/#11 / POSIX 107617-107620: the editor is chosen by the *last
+/// pathname component* of EDITOR, and vi/ex are invoked with `-c linenumber`.
+#[test]
+fn test_audit_invoke_editor_arguments() {
+    // A *unique* directory, not a fixed path under the system temporary
+    // directory: two concurrent runs of this suite otherwise share it, and
+    // whichever starts second removes the first one's recording between the
+    // editor writing it and this test reading it back.
+    let dir = plib::tmp::tempdir().unwrap();
+    let dir = dir.path();
+
+    let record = dir.join("args");
+    // Named `vi`, but reached through a full path: the basename is what
+    // decides whether `-c linenumber` is passed.
+    let editor = stand_in_vi(dir, &record);
 
     run_test_more_with_env(
         &["--test", "-p", "vq", "test_files/plain1.txt"],
@@ -1395,20 +1419,11 @@ fn test_audit_invoke_editor_arguments() {
 
 /// The arguments `v` hands a `vi` named by EDITOR, after `keys`, with the
 /// file `content` on a `rows` x 20 screen.
+#[cfg(unix)]
 fn editor_args_after(content: &[u8], rows: u16, keys: &str) -> Vec<String> {
-    use std::io::Write as _;
-    use std::os::unix::fs::PermissionsExt as _;
-
     let dir = plib::tmp::tempdir().unwrap();
     let record = dir.path().join("args");
-    let editor = dir.path().join("vi");
-    let mut script = std::fs::File::create(&editor).unwrap();
-    writeln!(script, "#!/bin/sh").unwrap();
-    writeln!(script, "[ \"$1\" = --probe ] && exit 0").unwrap();
-    writeln!(script, "printf '%s\\n' \"$@\" > {}", record.display()).unwrap();
-    drop(script);
-    std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
-    wait_until_executable(&editor);
+    let editor = stand_in_vi(dir.path(), &record);
 
     let path = dir.path().join("file.txt");
     std::fs::write(&path, content).unwrap();
@@ -1433,6 +1448,7 @@ fn editor_args_after(content: &[u8], rows: u16, keys: &str) -> Vec<String> {
 
 /// POSIX 107618-107620: `-c linenumber` names "the file line containing the
 /// display line currently displayed as the first line of the screen".
+#[cfg(unix)]
 #[test]
 fn test_pty_editor_line_is_the_top_line_of_the_screen() {
     let content: String = (1..=30).map(|n| format!("l{n}\n")).collect();
@@ -1471,6 +1487,7 @@ fn test_pty_editor_line_is_the_top_line_of_the_screen() {
 // as a clean diff.
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 use crate::common::MoreSession;
 
 /// Write `content` to a fresh file under a per-test temporary directory.
@@ -1482,6 +1499,7 @@ fn render_fixture(name: &str, content: &[u8]) -> std::path::PathBuf {
     path
 }
 
+#[cfg(unix)]
 #[test]
 fn test_pty_renders_plain_lines() {
     let path = render_fixture("plain.txt", b"alpha\nbravo\ncharlie\n");
@@ -1498,6 +1516,7 @@ fn test_pty_renders_plain_lines() {
     assert_eq!(session.quit(), Some(0));
 }
 
+#[cfg(unix)]
 #[test]
 fn test_pty_folds_without_losing_content() {
     // A line longer than the display is folded, not truncated (POSIX
@@ -1529,6 +1548,7 @@ fn test_pty_folds_without_losing_content() {
     assert_eq!(session.quit(), Some(0));
 }
 
+#[cfg(unix)]
 #[test]
 fn test_pty_scroll_forward_one_line() {
     let path = render_fixture("scroll.txt", b"l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n");
@@ -1547,6 +1567,7 @@ fn test_pty_scroll_forward_one_line() {
 /// The arrow keys scroll by a line, and another key the terminal encodes as
 /// an escape sequence does nothing: Page Up's `ESC [ 5 ~` must not leave a
 /// count of 5 for the next command.
+#[cfg(unix)]
 #[test]
 fn test_pty_arrow_keys_scroll_and_other_keys_do_nothing() {
     let content: String = (1..=20).map(|n| format!("l{n}\n")).collect();
@@ -1571,6 +1592,7 @@ fn test_pty_arrow_keys_scroll_and_other_keys_do_nothing() {
 
 /// Commands typed ahead arrive in one read; each of them runs, in order.
 /// Only `R` discards input that is waiting.
+#[cfg(unix)]
 #[test]
 fn test_pty_typed_ahead_commands_all_run() {
     let content: String = (1..=20).map(|n| format!("l{n}\n")).collect();
@@ -1592,6 +1614,7 @@ fn test_pty_typed_ahead_commands_all_run() {
 /// commands must be able to return to it. A file header three lines long is
 /// shown only when there are several files, but it was subtracted anyway,
 /// which made line 4 the lowest bottom line a screen could have.
+#[cfg(unix)]
 #[test]
 fn test_pty_four_rows_back_to_the_first_screen() {
     let content: String = (1..=20).map(|n| format!("l{n}\n")).collect();
@@ -1619,6 +1642,7 @@ fn test_pty_four_rows_back_to_the_first_screen() {
     assert_eq!(session.quit(), Some(0));
 }
 
+#[cfg(unix)]
 #[test]
 fn test_pty_prompt_reports_percentage() {
     // POSIX 107630: the prompt reports "what percentage of the file precedes
@@ -1684,6 +1708,7 @@ fn test_filter_mode_is_byte_exact() {
     assert_eq!(output.stdout, b"a\xff\xfeb\nsecond\n".to_vec());
 }
 
+#[cfg(unix)]
 #[test]
 fn test_pty_renders_non_printable_and_tabs() {
     // The four render-path items the audit deferred, end to end. Every one of
@@ -1711,6 +1736,7 @@ fn test_pty_renders_non_printable_and_tabs() {
     assert_eq!(session.quit(), Some(0));
 }
 
+#[cfg(unix)]
 #[test]
 fn test_pty_renders_full_width_non_ascii() {
     // A line of non-ASCII is many more bytes than columns. Folding used to be
@@ -1735,6 +1761,7 @@ fn test_pty_renders_full_width_non_ascii() {
     assert_eq!(session.quit(), Some(0));
 }
 
+#[cfg(unix)]
 #[test]
 fn test_pty_equals_reports_source_line() {
     // POSIX 107629: the `=` message reports "the line number in the file".

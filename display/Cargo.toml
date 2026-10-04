@@ -14,7 +14,7 @@ libc.workspace = true
 plib = { path = "../plib" }
 thiserror.workspace = true
 
-[dev-dependencies]
+[target.'cfg(unix)'.dev-dependencies]
 portable-pty = "0.9"
 
 [lints]

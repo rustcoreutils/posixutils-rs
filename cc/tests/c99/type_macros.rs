@@ -30,11 +30,143 @@ fn assert_defines(triple: &str, want: &[&str]) {
     }
 }
 
-/// Each `<stdint.h>` limit has to be a constant of the promoted type of the
-/// typedef it bounds, with the typedef's own extremes, and each `INTn_C`
-/// constant has to come out that type too. The limits were typed out one
-/// macro at a time, and `INT64_MAX` was `long long` where `int64_t` is `long`.
-const LIMITS_AGREE_WITH_TYPES: &str = r#"
+/// The integer predefines match gcc's for the same Linux target, and Darwin's
+/// `long long` `int64_t` beside its `long` `intmax_t`.
+#[test]
+fn integer_predefines_match_the_platform() {
+    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        assert_defines(
+            triple,
+            &[
+                "#define __INT64_TYPE__ long int",
+                "#define __INT64_MAX__ 0x7fffffffffffffffL",
+                "#define __UINT64_MAX__ 0xffffffffffffffffUL",
+                "#define __INT_LEAST64_MAX__ 0x7fffffffffffffffL",
+                "#define __INT64_FMTd__ \"ld\"",
+                "#define __UINT64_FMTu__ \"lu\"",
+                "#define __INT16_TYPE__ short int",
+                "#define __UINT16_MAX__ 0xffff",
+                "#define __UINT32_MAX__ 0xffffffffU",
+                "#define __LONG_LONG_MAX__ 0x7fffffffffffffffLL",
+                "#define __LONG_LONG_WIDTH__ 64",
+                "#define __SIG_ATOMIC_MIN__ (-__SIG_ATOMIC_MAX__ - 1)",
+                "#define __SIZE_MAX__ 0xffffffffffffffffUL",
+            ],
+        );
+    }
+    assert_defines(
+        "aarch64-apple-darwin",
+        &[
+            "#define __INT64_TYPE__ long long int",
+            "#define __INT64_MAX__ 0x7fffffffffffffffLL",
+            "#define __INT64_FMTd__ \"lld\"",
+            "#define __INTMAX_TYPE__ long int",
+            "#define __INTMAX_MAX__ 0x7fffffffffffffffL",
+            "#define __INTMAX_FMTd__ \"ld\"",
+        ],
+    );
+}
+
+/// The same facts as the predefines state them, against gcc's for Linux, and
+/// Darwin's exact-width choice.
+#[test]
+fn int_fast_predefines_match_the_platform() {
+    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        assert_defines(
+            triple,
+            &[
+                "#define __INT_FAST8_TYPE__ signed char",
+                "#define __INT_FAST16_TYPE__ long int",
+                "#define __INT_FAST16_MAX__ 0x7fffffffffffffffL",
+                "#define __INT_FAST16_WIDTH__ 64",
+                "#define __INT_FAST32_TYPE__ long int",
+                "#define __UINT_FAST16_TYPE__ long unsigned int",
+                "#define __UINT_FAST32_MAX__ 0xffffffffffffffffUL",
+            ],
+        );
+    }
+    assert_defines(
+        "aarch64-apple-darwin",
+        &[
+            "#define __INT_FAST16_TYPE__ short int",
+            "#define __INT_FAST32_TYPE__ int",
+            "#define __INT_FAST64_TYPE__ long long int",
+        ],
+    );
+}
+
+/// The predefines agree with gcc's for both Linux targets.
+#[test]
+fn wchar_predefines_match_the_platform() {
+    assert_defines(
+        "x86_64-unknown-linux-gnu",
+        &[
+            "#define __WCHAR_TYPE__ int",
+            "#define __WCHAR_MAX__ 0x7fffffff",
+            "#define __WCHAR_MIN__ (-__WCHAR_MAX__ - 1)",
+        ],
+    );
+    assert_defines(
+        "aarch64-unknown-linux-gnu",
+        &[
+            "#define __WCHAR_TYPE__ unsigned int",
+            "#define __WCHAR_MAX__ 0xffffffffU",
+            "#define __WCHAR_MIN__ 0U",
+        ],
+    );
+    assert_defines(
+        "aarch64-apple-darwin",
+        &[
+            "#define __WCHAR_TYPE__ int",
+            "#define __WCHAR_MIN__ (-__WCHAR_MAX__ - 1)",
+        ],
+    );
+}
+
+/// The `-dM` spelling matches gcc's, parameter name and `##` included.
+#[test]
+fn constant_fn_macros_match_gcc() {
+    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+        assert_defines(
+            triple,
+            &[
+                "#define __INT8_C(c) c",
+                "#define __UINT32_C(c) c ## U",
+                "#define __INT64_C(c) c ## L",
+                "#define __UINT64_C(c) c ## UL",
+                "#define __INTMAX_C(c) c ## L",
+                "#define __FLOAT_WORD_ORDER__ __ORDER_LITTLE_ENDIAN__",
+                "#define __FLT_EVAL_METHOD__ 0",
+            ],
+        );
+    }
+    assert_defines("aarch64-apple-darwin", &["#define __INT64_C(c) c ## LL"]);
+}
+
+/// The run-time half: every program checks a type macro against the type
+/// itself. One C section per former program, each with its original doc
+/// comment; on the host it runs at the matrix levels and on aarch64 Linux
+/// under qemu at -O0.
+///
+/// Consolidates the former programs and tests:
+/// - `LIMITS_AGREE_WITH_TYPES`: `integer_limits_agree_with_their_types`
+///   and `_aarch64` (exit codes 1..114)
+/// - `WCHAR_FOLLOWS_THE_ABI`: `wchar_follows_the_abi` and `_aarch64`
+///   (exit codes 115..127)
+/// - `ATOMIC_LOCK_FREE_MACROS`: `atomic_lock_free_macros_are_defined` and
+///   `_aarch64` (exit codes 128..151)
+/// - `REPRESENTATION_MACROS`: `representation_macros_are_defined` and
+///   `_aarch64` (exit codes 152..162)
+/// - `FAST_TYPES_ARE_GLIBCS`: `int_fast_types_are_glibcs` (host, Linux
+///   only -- the section is `#ifdef __linux__`, as the test was
+///   `#[cfg(target_os = "linux")]`) and `int_fast_types_are_glibcs_aarch64`
+///   (exit codes 163..174)
+const TYPE_MACRO_PROGRAMS: &str = r#"
+// ==== t_limits_agree: the former `LIMITS_AGREE_WITH_TYPES` program; exit codes 1..114 (local code + 0). ====
+// Each `<stdint.h>` limit has to be a constant of the promoted type of the
+// typedef it bounds, with the typedef's own extremes, and each `INTn_C`
+// constant has to come out that type too. The limits were typed out one
+// macro at a time, and `INT64_MAX` was `long long` where `int64_t` is `long`.
 #include <stdint.h>
 #include <stddef.h>
 
@@ -57,7 +189,7 @@ const LIMITS_AGREE_WITH_TYPES: &str = r#"
         if (MAX != (T)-1) return n + 1;                                  \
     } while (0)
 
-int main(void) {
+static int t_limits_agree(void) {
     CHECK_S(10, int8_t, INT8_MAX, INT8_MIN);
     CHECK_S(14, int16_t, INT16_MAX, INT16_MIN);
     CHECK_S(18, int32_t, INT32_MAX, INT32_MIN);
@@ -120,137 +252,18 @@ int main(void) {
 #endif
     return 0;
 }
-"#;
+#undef PROMOTED
+#undef IS
+#undef SMAX
+#undef CHECK_S
+#undef CHECK_U
 
-#[test]
-fn integer_limits_agree_with_their_types() {
-    assert_eq!(
-        compile_and_run("limits_agree_with_types", LIMITS_AGREE_WITH_TYPES, &[]),
-        0
-    );
-}
-
-#[test]
-fn integer_limits_agree_with_their_types_aarch64() {
-    if let Some(rc) = compile_and_run_aarch64(
-        "limits_agree_with_types_a64",
-        LIMITS_AGREE_WITH_TYPES,
-        "-O0",
-    ) {
-        assert_eq!(rc, 0);
-    }
-}
-
-/// The integer predefines match gcc's for the same Linux target, and Darwin's
-/// `long long` `int64_t` beside its `long` `intmax_t`.
-#[test]
-fn integer_predefines_match_the_platform() {
-    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
-        assert_defines(
-            triple,
-            &[
-                "#define __INT64_TYPE__ long int",
-                "#define __INT64_MAX__ 0x7fffffffffffffffL",
-                "#define __UINT64_MAX__ 0xffffffffffffffffUL",
-                "#define __INT_LEAST64_MAX__ 0x7fffffffffffffffL",
-                "#define __INT64_FMTd__ \"ld\"",
-                "#define __UINT64_FMTu__ \"lu\"",
-                "#define __INT16_TYPE__ short int",
-                "#define __UINT16_MAX__ 0xffff",
-                "#define __UINT32_MAX__ 0xffffffffU",
-                "#define __LONG_LONG_MAX__ 0x7fffffffffffffffLL",
-                "#define __LONG_LONG_WIDTH__ 64",
-                "#define __SIG_ATOMIC_MIN__ (-__SIG_ATOMIC_MAX__ - 1)",
-                "#define __SIZE_MAX__ 0xffffffffffffffffUL",
-            ],
-        );
-    }
-    assert_defines(
-        "aarch64-apple-darwin",
-        &[
-            "#define __INT64_TYPE__ long long int",
-            "#define __INT64_MAX__ 0x7fffffffffffffffLL",
-            "#define __INT64_FMTd__ \"lld\"",
-            "#define __INTMAX_TYPE__ long int",
-            "#define __INTMAX_MAX__ 0x7fffffffffffffffL",
-            "#define __INTMAX_FMTd__ \"ld\"",
-        ],
-    );
-}
-
-/// `int_fastN_t` is the C library's choice, and glibc makes the 16- and
-/// 32-bit ones `long` on a 64-bit target. c17 said `short` and `int`, so the
-/// same typedef was 2 bytes in c17 and 8 in gcc, and INT_FAST16_MAX was 32767.
-const FAST_TYPES_ARE_GLIBCS: &str = r#"
-#include <stdint.h>
-int main(void) {
-    if (!_Generic((int_fast8_t)0, signed char: 1, default: 0)) return 1;
-    if (!_Generic((int_fast16_t)0, long: 1, default: 0)) return 2;
-    if (!_Generic((int_fast32_t)0, long: 1, default: 0)) return 3;
-    if (!_Generic((int_fast64_t)0, long: 1, default: 0)) return 4;
-    if (!_Generic((uint_fast8_t)0, unsigned char: 1, default: 0)) return 5;
-    if (!_Generic((uint_fast16_t)0, unsigned long: 1, default: 0)) return 6;
-    if (!_Generic((uint_fast32_t)0, unsigned long: 1, default: 0)) return 7;
-    if (!_Generic((uint_fast64_t)0, unsigned long: 1, default: 0)) return 8;
-    if (INT_FAST16_MAX != 0x7fffffffffffffffL) return 9;
-    if (UINT_FAST32_MAX != 0xffffffffffffffffUL) return 10;
-    if (INT_FAST32_MIN != -0x7fffffffffffffffL - 1) return 11;
-    if (sizeof(int_fast16_t) != 8) return 12;
-    return 0;
-}
-"#;
-
-#[cfg(target_os = "linux")]
-#[test]
-fn int_fast_types_are_glibcs() {
-    assert_eq!(
-        compile_and_run("fast_types_glibc", FAST_TYPES_ARE_GLIBCS, &[]),
-        0
-    );
-}
-
-#[test]
-fn int_fast_types_are_glibcs_aarch64() {
-    if let Some(rc) = compile_and_run_aarch64("fast_types_glibc_a64", FAST_TYPES_ARE_GLIBCS, "-O0")
-    {
-        assert_eq!(rc, 0);
-    }
-}
-
-/// The same facts as the predefines state them, against gcc's for Linux, and
-/// Darwin's exact-width choice.
-#[test]
-fn int_fast_predefines_match_the_platform() {
-    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
-        assert_defines(
-            triple,
-            &[
-                "#define __INT_FAST8_TYPE__ signed char",
-                "#define __INT_FAST16_TYPE__ long int",
-                "#define __INT_FAST16_MAX__ 0x7fffffffffffffffL",
-                "#define __INT_FAST16_WIDTH__ 64",
-                "#define __INT_FAST32_TYPE__ long int",
-                "#define __UINT_FAST16_TYPE__ long unsigned int",
-                "#define __UINT_FAST32_MAX__ 0xffffffffffffffffUL",
-            ],
-        );
-    }
-    assert_defines(
-        "aarch64-apple-darwin",
-        &[
-            "#define __INT_FAST16_TYPE__ short int",
-            "#define __INT_FAST32_TYPE__ int",
-            "#define __INT_FAST64_TYPE__ long long int",
-        ],
-    );
-}
-
-/// `wchar_t` is `unsigned int` under AAPCS64, which Linux follows, and `int`
-/// on x86-64 and Apple arm64. c17 made it `int` everywhere -- the predefine,
-/// the type of `L'x'` and of `L"..."`'s elements alike -- so on aarch64 Linux
-/// `(wchar_t)-1 > 0` was false where gcc says true, and WCHAR_MIN was
-/// negative.
-const WCHAR_FOLLOWS_THE_ABI: &str = r#"
+// ==== t_wchar_follows_abi: the former `WCHAR_FOLLOWS_THE_ABI` program; exit codes 115..127 (local code + 114). ====
+// `wchar_t` is `unsigned int` under AAPCS64, which Linux follows, and `int`
+// on x86-64 and Apple arm64. c17 made it `int` everywhere -- the predefine,
+// the type of `L'x'` and of `L"..."`'s elements alike -- so on aarch64 Linux
+// `(wchar_t)-1 > 0` was false where gcc says true, and WCHAR_MIN was
+// negative.
 #include <stddef.h>
 #include <stdint.h>
 
@@ -267,7 +280,7 @@ const WCHAR_FOLLOWS_THE_ABI: &str = r#"
 #define PP_WCHAR_UNSIGNED 0
 #endif
 
-int main(void) {
+static int t_wchar_follows_abi(void) {
     if (!_Generic(L'a', wchar_t: 1, default: 0)) return 1;
     if (!_Generic(L"a"[0], wchar_t: 1, default: 0)) return 2;
     if (!_Generic(L'a', __WCHAR_TYPE__: 1, default: 0)) return 3;
@@ -289,58 +302,15 @@ int main(void) {
     if (sizeof(w) != 3 * sizeof(wchar_t) || w[1] != L'i') return 13;
     return 0;
 }
-"#;
+#undef WCHAR_UNSIGNED
+#undef PP_WCHAR_UNSIGNED
 
-#[test]
-fn wchar_follows_the_abi() {
-    assert_eq!(
-        compile_and_run("wchar_follows_abi", WCHAR_FOLLOWS_THE_ABI, &[]),
-        0
-    );
-}
-
-#[test]
-fn wchar_follows_the_abi_aarch64() {
-    if let Some(rc) = compile_and_run_aarch64("wchar_follows_abi_a64", WCHAR_FOLLOWS_THE_ABI, "-O0")
-    {
-        assert_eq!(rc, 0);
-    }
-}
-
-/// The predefines agree with gcc's for both Linux targets.
-#[test]
-fn wchar_predefines_match_the_platform() {
-    assert_defines(
-        "x86_64-unknown-linux-gnu",
-        &[
-            "#define __WCHAR_TYPE__ int",
-            "#define __WCHAR_MAX__ 0x7fffffff",
-            "#define __WCHAR_MIN__ (-__WCHAR_MAX__ - 1)",
-        ],
-    );
-    assert_defines(
-        "aarch64-unknown-linux-gnu",
-        &[
-            "#define __WCHAR_TYPE__ unsigned int",
-            "#define __WCHAR_MAX__ 0xffffffffU",
-            "#define __WCHAR_MIN__ 0U",
-        ],
-    );
-    assert_defines(
-        "aarch64-apple-darwin",
-        &[
-            "#define __WCHAR_TYPE__ int",
-            "#define __WCHAR_MIN__ (-__WCHAR_MAX__ - 1)",
-        ],
-    );
-}
-
-/// Every `ATOMIC_*_LOCK_FREE` of `<stdatomic.h>` (C17 7.17.1p2) expands to a
-/// constant, in code and in `#if`. `ATOMIC_CHAR16_T_LOCK_FREE`,
-/// `ATOMIC_CHAR32_T_LOCK_FREE` and `ATOMIC_WCHAR_T_LOCK_FREE` named
-/// `__GCC_ATOMIC_*` predefines c17 did not have, so each was an undeclared
-/// identifier -- and silently 0 in `#if`.
-const ATOMIC_LOCK_FREE_MACROS: &str = r#"
+// ==== t_atomic_lock_free: the former `ATOMIC_LOCK_FREE_MACROS` program; exit codes 128..151 (local code + 127). ====
+// Every `ATOMIC_*_LOCK_FREE` of `<stdatomic.h>` (C17 7.17.1p2) expands to a
+// constant, in code and in `#if`. `ATOMIC_CHAR16_T_LOCK_FREE`,
+// `ATOMIC_CHAR32_T_LOCK_FREE` and `ATOMIC_WCHAR_T_LOCK_FREE` named
+// `__GCC_ATOMIC_*` predefines c17 did not have, so each was an undeclared
+// identifier -- and silently 0 in `#if`.
 #include <stdatomic.h>
 #include <stddef.h>
 
@@ -349,7 +319,7 @@ const ATOMIC_LOCK_FREE_MACROS: &str = r#"
 #error prefixed character types are not lock-free
 #endif
 
-int main(void) {
+static int t_atomic_lock_free(void) {
     int all[] = {
         ATOMIC_BOOL_LOCK_FREE, ATOMIC_CHAR_LOCK_FREE,
         ATOMIC_CHAR16_T_LOCK_FREE, ATOMIC_CHAR32_T_LOCK_FREE,
@@ -367,31 +337,11 @@ int main(void) {
     if (*(unsigned char *)&f != __GCC_ATOMIC_TEST_AND_SET_TRUEVAL) return 24;
     return 0;
 }
-"#;
 
-#[test]
-fn atomic_lock_free_macros_are_defined() {
-    assert_eq!(
-        compile_and_run("atomic_lock_free_macros", ATOMIC_LOCK_FREE_MACROS, &[]),
-        0
-    );
-}
-
-#[test]
-fn atomic_lock_free_macros_are_defined_aarch64() {
-    if let Some(rc) = compile_and_run_aarch64(
-        "atomic_lock_free_macros_a64",
-        ATOMIC_LOCK_FREE_MACROS,
-        "-O0",
-    ) {
-        assert_eq!(rc, 0);
-    }
-}
-
-/// Representation facts gcc predefines and c17 did not: the evaluation
-/// method <float.h> and glibc's `float_t` read, the floating word order, and
-/// the `__INTN_C(c)` constant macros.
-const REPRESENTATION_MACROS: &str = r#"
+// ==== t_representation: the former `REPRESENTATION_MACROS` program; exit codes 152..162 (local code + 151). ====
+// Representation facts gcc predefines and c17 did not: the evaluation
+// method <float.h> and glibc's `float_t` read, the floating word order, and
+// the `__INTN_C(c)` constant macros.
 #include <float.h>
 #include <stdint.h>
 
@@ -405,7 +355,7 @@ const REPRESENTATION_MACROS: &str = r#"
 #error the float word order follows the byte order on these targets
 #endif
 
-int main(void) {
+static int t_representation(void) {
     if (!_Generic(__INT8_C(1), int: 1, default: 0)) return 1;
     if (!_Generic(__UINT16_C(1), int: 1, default: 0)) return 2;
     if (!_Generic(__UINT32_C(1), unsigned int: 1, default: 0)) return 3;
@@ -424,41 +374,56 @@ int main(void) {
     if (w[0] != 0 || w[1] != 0x3ff00000) return 11;
     return 0;
 }
+
+// ==== t_fast_types_glibc: the former `FAST_TYPES_ARE_GLIBCS` program; exit codes 163..174 (local code + 162). ====
+// `int_fastN_t` is the C library's choice, and glibc makes the 16- and
+// 32-bit ones `long` on a 64-bit target. c17 said `short` and `int`, so the
+// same typedef was 2 bytes in c17 and 8 in gcc, and INT_FAST16_MAX was 32767.
+#ifdef __linux__
+#include <stdint.h>
+static int t_fast_types_glibc(void) {
+    if (!_Generic((int_fast8_t)0, signed char: 1, default: 0)) return 1;
+    if (!_Generic((int_fast16_t)0, long: 1, default: 0)) return 2;
+    if (!_Generic((int_fast32_t)0, long: 1, default: 0)) return 3;
+    if (!_Generic((int_fast64_t)0, long: 1, default: 0)) return 4;
+    if (!_Generic((uint_fast8_t)0, unsigned char: 1, default: 0)) return 5;
+    if (!_Generic((uint_fast16_t)0, unsigned long: 1, default: 0)) return 6;
+    if (!_Generic((uint_fast32_t)0, unsigned long: 1, default: 0)) return 7;
+    if (!_Generic((uint_fast64_t)0, unsigned long: 1, default: 0)) return 8;
+    if (INT_FAST16_MAX != 0x7fffffffffffffffL) return 9;
+    if (UINT_FAST32_MAX != 0xffffffffffffffffUL) return 10;
+    if (INT_FAST32_MIN != -0x7fffffffffffffffL - 1) return 11;
+    if (sizeof(int_fast16_t) != 8) return 12;
+    return 0;
+}
+#endif
+
+/* Dispatcher: section k's failure code c is returned as base_k + c. */
+int main(void) {
+    int r;
+    if ((r = t_limits_agree()) != 0) return 0 + r;
+    if ((r = t_wchar_follows_abi()) != 0) return 114 + r;
+    if ((r = t_atomic_lock_free()) != 0) return 127 + r;
+    if ((r = t_representation()) != 0) return 151 + r;
+#ifdef __linux__
+    if ((r = t_fast_types_glibc()) != 0) return 162 + r;
+#endif
+    return 0;
+}
 "#;
 
 #[test]
-fn representation_macros_are_defined() {
+fn type_macros_agree_with_their_types() {
     assert_eq!(
-        compile_and_run("representation_macros", REPRESENTATION_MACROS, &[]),
+        compile_and_run("type_macro_programs", TYPE_MACRO_PROGRAMS, &[]),
         0
     );
 }
 
 #[test]
-fn representation_macros_are_defined_aarch64() {
-    if let Some(rc) =
-        compile_and_run_aarch64("representation_macros_a64", REPRESENTATION_MACROS, "-O0")
+fn type_macros_agree_with_their_types_aarch64() {
+    if let Some(rc) = compile_and_run_aarch64("type_macro_programs_a64", TYPE_MACRO_PROGRAMS, "-O0")
     {
         assert_eq!(rc, 0);
     }
-}
-
-/// The `-dM` spelling matches gcc's, parameter name and `##` included.
-#[test]
-fn constant_fn_macros_match_gcc() {
-    for triple in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
-        assert_defines(
-            triple,
-            &[
-                "#define __INT8_C(c) c",
-                "#define __UINT32_C(c) c ## U",
-                "#define __INT64_C(c) c ## L",
-                "#define __UINT64_C(c) c ## UL",
-                "#define __INTMAX_C(c) c ## L",
-                "#define __FLOAT_WORD_ORDER__ __ORDER_LITTLE_ENDIAN__",
-                "#define __FLT_EVAL_METHOD__ 0",
-            ],
-        );
-    }
-    assert_defines("aarch64-apple-darwin", &["#define __INT64_C(c) c ## LL"]);
 }

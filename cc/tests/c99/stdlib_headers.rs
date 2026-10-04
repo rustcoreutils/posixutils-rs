@@ -12,7 +12,7 @@
 // Headers come from system libc (glibc/macOS); our compiler just parses them.
 //
 
-use crate::common::{compile_and_run, compile_and_run_aarch64, compile_expect_no_diagnostic};
+use crate::common::{compile_and_run, compile_and_run_aarch64};
 
 #[test]
 fn c99_stdlib_headers_mega() {
@@ -416,68 +416,42 @@ int main(void) {
     assert_eq!(compile_and_run("wint_platform", code, &[]), 0);
 }
 
-/// `SSIZE_MAX` belongs to `<limits.h>` (POSIX), not to the compiler. It was
-/// predefined, so a program that defines its own, or tests `#ifndef
-/// SSIZE_MAX` to learn whether it has included `<limits.h>`, was wrong before
-/// it included anything. It comes from the system's `<limits.h>`, which the
-/// bundled one forwards to.
-const SSIZE_LIMIT: &str = r#"
+/// The `<limits.h>` cases, one program, compiled once per target.
+///
+/// Consolidates `c99_ssize_max_comes_from_limits_h`,
+/// `c99_ssize_max_has_ssize_t_type` and `c99_limits_h_has_the_posix_limits`
+/// (and the two `_aarch64` runs). The spurious-redefinition checks on the
+/// original programs live in `cc/test_asm/c99_stdlib_headers.rs`.
+///
+/// `c99_ssize_max_comes_from_limits_h`: `SSIZE_MAX` belongs to `<limits.h>`
+/// (POSIX), not to the compiler. It was predefined, so a program that defines
+/// its own, or tests `#ifndef SSIZE_MAX` to learn whether it has included
+/// `<limits.h>`, was wrong before it included anything. It comes from the
+/// system's `<limits.h>`, which the bundled one forwards to.
+///
+/// `c99_ssize_max_has_ssize_t_type`: and it is the C library's type:
+/// `ssize_t` itself, where `<sys/types.h>` declares it.
+///
+/// `c99_limits_h_has_the_posix_limits`: POSIX adds its limits to
+/// `<limits.h>`, which the system's header defines: the bundled one owns only
+/// the integer sizes and forwards to the system's for the rest. It used to
+/// stop at the sizes, so `LINE_MAX`, `NGROUPS_MAX`, `IOV_MAX` and the like
+/// were undeclared. The POSIX base names are checked everywhere, the XSI ones
+/// against glibc; the sizes must still be the compiler's.
+const LIMITS_H: &str = r#"
+/*
+ * Exit codes:
+ *   1..4   c99_ssize_max_comes_from_limits_h
+ *   11..16 c99_limits_h_has_the_posix_limits
+ *   21     c99_ssize_max_has_ssize_t_type
+ */
+
+/* SSIZE_MAX section: it must not be defined before <limits.h>. */
 #ifdef SSIZE_MAX
 #error "SSIZE_MAX is defined before <limits.h>"
 #endif
-#include <limits.h>
-#include <limits.h>
-#include <stddef.h>
-#include <stdint.h>
 
-#if !(SSIZE_MAX > 0 && SSIZE_MAX == SIZE_MAX / 2)
-#error "SSIZE_MAX is not usable in #if, or not size_t's signed half"
-#endif
-
-int main(void) {
-    /* ssize_t is the signed type of size_t's width. */
-    if (sizeof(SSIZE_MAX) != sizeof(size_t)) return 1;
-    if ((__typeof__(SSIZE_MAX))-1 >= 0) return 2;
-    if (SSIZE_MAX != PTRDIFF_MAX) return 3;
-    if (_POSIX_SSIZE_MAX != 32767 || SSIZE_MAX < _POSIX_SSIZE_MAX) return 4;
-    return 0;
-}
-"#;
-
-#[test]
-fn c99_ssize_max_comes_from_limits_h() {
-    assert_eq!(compile_and_run("ssize_limit", SSIZE_LIMIT, &[]), 0);
-    compile_expect_no_diagnostic("ssize_limit_clean", SSIZE_LIMIT, "redefin");
-}
-
-#[test]
-fn c99_ssize_max_comes_from_limits_h_aarch64() {
-    if let Some(rc) = compile_and_run_aarch64("ssize_limit", SSIZE_LIMIT, "-O0") {
-        assert_eq!(rc, 0);
-    }
-}
-
-/// And it is the C library's type: `ssize_t` itself, where `<sys/types.h>`
-/// declares it.
-#[test]
-fn c99_ssize_max_has_ssize_t_type() {
-    let code = r#"
-#include <limits.h>
-#include <sys/types.h>
-int main(void) {
-    return _Generic(SSIZE_MAX, ssize_t: 0, default: 1);
-}
-"#;
-    assert_eq!(compile_and_run("ssize_type", code, &[]), 0);
-}
-
-/// POSIX adds its limits to `<limits.h>`, which the system's header defines:
-/// the bundled one owns only the integer sizes and forwards to the system's
-/// for the rest. It used to stop at the sizes, so `LINE_MAX`, `NGROUPS_MAX`,
-/// `IOV_MAX` and the like were undeclared. The POSIX base names are checked
-/// everywhere, the XSI ones against glibc; the sizes must still be the
-/// compiler's.
-const POSIX_LIMITS: &str = r#"
+/* POSIX limits section: <limits.h>, then <stdio.h>, then <limits.h> again. */
 #include <limits.h>
 #include <stdio.h>
 #include <limits.h>
@@ -497,25 +471,58 @@ const POSIX_LIMITS: &str = r#"
 #endif
 #endif
 
+/* SSIZE_MAX section: <limits.h> twice, then <stddef.h> and <stdint.h>. */
+#include <limits.h>
+#include <limits.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#if !(SSIZE_MAX > 0 && SSIZE_MAX == SIZE_MAX / 2)
+#error "SSIZE_MAX is not usable in #if, or not size_t's signed half"
+#endif
+
+/* ssize_t section: <sys/types.h> declares it. */
+#include <sys/types.h>
+
+static int t_ssize_limit(void) {
+    /* ssize_t is the signed type of size_t's width. */
+    if (sizeof(SSIZE_MAX) != sizeof(size_t)) return 1;
+    if ((__typeof__(SSIZE_MAX))-1 >= 0) return 2;
+    if (SSIZE_MAX != PTRDIFF_MAX) return 3;
+    if (_POSIX_SSIZE_MAX != 32767 || SSIZE_MAX < _POSIX_SSIZE_MAX) return 4;
+    return 0;
+}
+
+static int t_posix_limits(void) {
+    if (_POSIX_ARG_MAX != 4096 || _POSIX2_LINE_MAX != 2048) return 11;
+    if (CHAR_BIT != __CHAR_BIT__ || INT_MAX != __INT_MAX__) return 13;
+    if (LLONG_MIN != -__LONG_LONG_MAX__ - 1 || ULLONG_MAX != (unsigned long long)-1) return 14;
+    if (SCHAR_MIN != -128 || UCHAR_MAX != 255 || USHRT_MAX != 65535) return 15;
+    if (MB_LEN_MAX < 1) return 16;
+    return 0;
+}
+
+static int t_ssize_type(void) {
+    return _Generic(SSIZE_MAX, ssize_t: 0, default: 21);
+}
+
 int main(void) {
-    if (_POSIX_ARG_MAX != 4096 || _POSIX2_LINE_MAX != 2048) return 1;
-    if (CHAR_BIT != __CHAR_BIT__ || INT_MAX != __INT_MAX__) return 3;
-    if (LLONG_MIN != -__LONG_LONG_MAX__ - 1 || ULLONG_MAX != (unsigned long long)-1) return 4;
-    if (SCHAR_MIN != -128 || UCHAR_MAX != 255 || USHRT_MAX != 65535) return 5;
-    if (MB_LEN_MAX < 1) return 6;
+    int rc;
+    if ((rc = t_ssize_limit()) != 0) return rc;
+    if ((rc = t_posix_limits()) != 0) return rc;
+    if ((rc = t_ssize_type()) != 0) return rc;
     return 0;
 }
 "#;
 
 #[test]
-fn c99_limits_h_has_the_posix_limits() {
-    assert_eq!(compile_and_run("posix_limits", POSIX_LIMITS, &[]), 0);
-    compile_expect_no_diagnostic("posix_limits_clean", POSIX_LIMITS, "redefin");
+fn c99_limits_h_mega() {
+    assert_eq!(compile_and_run("limits_h_mega", LIMITS_H, &[]), 0);
 }
 
 #[test]
-fn c99_limits_h_has_the_posix_limits_aarch64() {
-    if let Some(rc) = compile_and_run_aarch64("posix_limits", POSIX_LIMITS, "-O0") {
+fn c99_limits_h_mega_aarch64() {
+    if let Some(rc) = compile_and_run_aarch64("limits_h_mega", LIMITS_H, "-O0") {
         assert_eq!(rc, 0);
     }
 }

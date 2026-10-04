@@ -34,6 +34,8 @@ pub mod strings;
 pub mod symbol;
 pub mod target;
 #[cfg(test)]
+mod test_asm;
+#[cfg(test)]
 pub mod test_compile;
 #[cfg(test)]
 mod test_diagnostics;

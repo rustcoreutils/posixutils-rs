@@ -19,9 +19,24 @@
 
 use crate::common::compile_and_run;
 
+/// C99 types, keywords, qualifiers and specifier-order mega test.
+///
+/// Consolidates these single-program tests, one C section each; every
+/// original doc comment is the comment above its section:
+/// - `c99_types_keywords_mega` (exit codes 1..81)
+/// - `c99_size_specifiers_are_order_independent` (exit codes 82..107)
+/// - `c99_generic_matches_the_long_family` (exit codes 108..138)
+/// - `c99_enum_is_wide_enough_for_its_enumerators` (exit codes 139..157)
+/// - `c99_pragma_pack_caps_member_alignment` (exit codes 158..178)
+/// - `c99_gnu_const_spellings_are_accepted_everywhere` (exit codes 179..185)
+/// - `c99_storage_class_may_follow_a_struct_specifier` (exit codes 186..192)
+/// - `c99_bare_complex_is_complex_double` (exit codes 193..203)
 #[test]
 fn c99_types_keywords_mega() {
     let code = r#"
+/* ==== Section 1: t_c99_types_keywords_mega (was #[test] c99_types_keywords_mega) ====
+ * Exit codes 1..81 (local code + 0).
+ */
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -54,7 +69,7 @@ int sum_va(int n, ...) {
     return s;
 }
 
-int main(void) {
+static int t_c99_types_keywords_mega(void) {
     // ========== TYPE SPECIFIER SYNONYMS (returns 1-19) ==========
     {
         // All integer type synonyms — verify sizeof for each group
@@ -279,21 +294,19 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_types_keywords_mega", code, &[]), 0);
-}
 
-/// C17 6.7.2p2 gives the declaration specifiers as an unordered set, so a
-/// size specifier names the same type whichever side of `int` it falls on.
-///
-/// The specifier tally took the size only when it had not already settled on
-/// `int`, so `int long` was a four-byte `long` and `int short` a four-byte
-/// `short`. Declarations and type-names reach the specifiers from different
-/// places -- they once had a specifier loop each, and the defect had to be
-/// fixed in both -- so both spellings of both paths are asserted here.
-#[test]
-fn c99_size_specifiers_are_order_independent() {
-    let code = r#"
+/* ==== Section 2: t_c99_size_specifiers_are_order_independent (was #[test] c99_size_specifiers_are_order_independent) ====
+ * Exit codes 82..107 (local code + 81).
+ *
+ * C17 6.7.2p2 gives the declaration specifiers as an unordered set, so a
+ * size specifier names the same type whichever side of `int` it falls on.
+ *
+ * The specifier tally took the size only when it had not already settled on
+ * `int`, so `int long` was a four-byte `long` and `int short` a four-byte
+ * `short`. Declarations and type-names reach the specifiers from different
+ * places -- they once had a specifier loop each, and the defect had to be
+ * fixed in both -- so both spellings of both paths are asserted here.
+ */
 /* Declaration path. */
 long int a1;    int long a2;
 short int b1;   int short b2;
@@ -301,7 +314,7 @@ long long int c1;   int long long c2;   long int long c3;
 unsigned long int d1;   int unsigned long d2;   long unsigned int d3;
 signed short int e1;    int signed short e2;
 
-int main(void) {
+static int t_c99_size_specifiers_are_order_independent(void) {
     /* Declarations */
     if (sizeof a1 != sizeof a2) return 1;
     if (sizeof a1 != 8) return 2;
@@ -346,26 +359,21 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("c99_size_specifiers_order_independent", code, &[]),
-        0
-    );
-}
 
-/// `_Generic` selects on the controlling expression's type, and a type has
-/// to compare equal to itself for that to work.
-///
-/// `TypeKind` already carries the size, but a parsed specifier list also set
-/// a `SHORT`/`LONG`/`LONGLONG` modifier bit that the compatibility test then
-/// treated as significant. The canonical interned types -- what a literal's
-/// type and the result of the usual arithmetic conversions come from -- carry
-/// no such bit, so `1L` and `long` were two incompatible types both spelled
-/// "long". A variable of type `long` matched, because its type came from the
-/// same specifier path as the association.
-#[test]
-fn c99_generic_matches_the_long_family() {
-    let code = r#"
+/* ==== Section 3: t_c99_generic_matches_the_long_family (was #[test] c99_generic_matches_the_long_family) ====
+ * Exit codes 108..138 (local code + 107).
+ *
+ * `_Generic` selects on the controlling expression's type, and a type has
+ * to compare equal to itself for that to work.
+ *
+ * `TypeKind` already carries the size, but a parsed specifier list also set
+ * a `SHORT`/`LONG`/`LONGLONG` modifier bit that the compatibility test then
+ * treated as significant. The canonical interned types -- what a literal's
+ * type and the result of the usual arithmetic conversions come from -- carry
+ * no such bit, so `1L` and `long` were two incompatible types both spelled
+ * "long". A variable of type `long` matched, because its type came from the
+ * same specifier path as the association.
+ */
 #define SEL(x) _Generic((x),                                     \
     char: 1, signed char: 2, short: 3, int: 4, long: 5,          \
     long long: 6, unsigned char: 7, unsigned short: 8,           \
@@ -374,7 +382,7 @@ fn c99_generic_matches_the_long_family() {
 
 typedef long L;
 
-int main(void) {
+static int t_c99_generic_matches_the_long_family(void) {
     /* Literals: the half that never matched. */
     if (SEL(1L) != 5) return 1;
     if (SEL(1UL) != 10) return 2;
@@ -435,25 +443,21 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("c99_generic_matches_the_long_family", code, &[]),
-        0
-    );
-}
+#undef SEL
 
-/// An enumerated type must be able to represent every one of its members
-/// (C17 6.7.2.2p4). c17 gave every enum four signed bytes, so an enumerator
-/// that did not fit was silently truncated: `X = 5000000000` came back as
-/// 705032704 and `H = 0xFFFFFFFFU` as -1.
-///
-/// C17 6.7.2.2p2 makes an enumerator outside `int` range a constraint
-/// violation, so a diagnostic is required; gcc issues one under -pedantic and
-/// widens the type. c17 does both -- warn, and widen -- because truncating in
-/// silence is the one response that leaves a program running on a wrong value.
-#[test]
-fn c99_enum_is_wide_enough_for_its_enumerators() {
-    let code = r#"
+/* ==== Section 4: t_c99_enum_is_wide_enough_for_its_enumerators (was #[test] c99_enum_is_wide_enough_for_its_enumerators) ====
+ * Exit codes 139..157 (local code + 138).
+ *
+ * An enumerated type must be able to represent every one of its members
+ * (C17 6.7.2.2p4). c17 gave every enum four signed bytes, so an enumerator
+ * that did not fit was silently truncated: `X = 5000000000` came back as
+ * 705032704 and `H = 0xFFFFFFFFU` as -1.
+ *
+ * C17 6.7.2.2p2 makes an enumerator outside `int` range a constraint
+ * violation, so a diagnostic is required; gcc issues one under -pedantic and
+ * widens the type. c17 does both -- warn, and widen -- because truncating in
+ * silence is the one response that leaves a program running on a wrong value.
+ */
 enum Small  { S = 1 };
 enum Neg    { N = -1, NP = 1 };
 enum UMax   { U = 0xFFFFFFFFU };
@@ -461,7 +465,7 @@ enum Big    { B = 5000000000 };
 enum BigNeg { BN = -5000000000 };
 enum Mixed  { M0 = -1, M1 = 5000000000 };
 
-int main(void) {
+static int t_c99_enum_is_wide_enough_for_its_enumerators(void) {
     /* An enum that fits in int keeps int's size. */
     if (sizeof(enum Small) != 4) return 1;
     if (S != 1) return 2;
@@ -504,18 +508,16 @@ int main(void) {
     }
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_enum_underlying_type", code, &[]), 0);
-}
 
-/// `#pragma pack` caps the alignment of every member of the structures
-/// declared while it is in effect. c17 discarded every pragma in the
-/// preprocessor, so the pragma compiled and did nothing -- silently laying
-/// out a protocol structure at natural alignment and disagreeing with every
-/// gcc-compiled peer that shares it.
-#[test]
-fn c99_pragma_pack_caps_member_alignment() {
-    let code = r#"
+/* ==== Section 5: t_c99_pragma_pack_caps_member_alignment (was #[test] c99_pragma_pack_caps_member_alignment) ====
+ * Exit codes 158..178 (local code + 157).
+ *
+ * `#pragma pack` caps the alignment of every member of the structures
+ * declared while it is in effect. c17 discarded every pragma in the
+ * preprocessor, so the pragma compiled and did nothing -- silently laying
+ * out a protocol structure at natural alignment and disagreeing with every
+ * gcc-compiled peer that shares it.
+ */
 #include <stddef.h>
 
 #pragma pack(push, 1)
@@ -562,7 +564,7 @@ union U { char a; int b; };
 #pragma pack()
 union V { char a; int b; };
 
-int main(void) {
+static int t_c99_pragma_pack_caps_member_alignment(void) {
     if (sizeof(struct A) != 5 || offsetof(struct A, b) != 1) return 1;
     if (sizeof(struct B) != 8 || offsetof(struct B, b) != 4) return 2;
     if (sizeof(struct C) != 5) return 3;
@@ -596,22 +598,20 @@ int main(void) {
     }
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_pragma_pack", code, &[]), 0);
-}
 
-/// The GNU `__const` / `__const__` spellings of `const`, in every position a
-/// qualifier can appear.
-///
-/// Both spellings were already in the keyword table with the qualifier tag,
-/// but the parser wrote the `const` match out at five places and four of them
-/// listed only the standard spelling. So glibc's own `memcpy` prototype --
-/// which spells both `__restrict` and `__const` -- failed to parse:
-/// `expected ')', found identifier 'void'`. The five now ask one shared
-/// answer. The torture test is `20111208-1`.
-#[test]
-fn c99_gnu_const_spellings_are_accepted_everywhere() {
-    let code = r#"
+/* ==== Section 6: t_c99_gnu_const_spellings_are_accepted_everywhere (was #[test] c99_gnu_const_spellings_are_accepted_everywhere) ====
+ * Exit codes 179..185 (local code + 178).
+ *
+ * The GNU `__const` / `__const__` spellings of `const`, in every position a
+ * qualifier can appear.
+ *
+ * Both spellings were already in the keyword table with the qualifier tag,
+ * but the parser wrote the `const` match out at five places and four of them
+ * listed only the standard spelling. So glibc's own `memcpy` prototype --
+ * which spells both `__restrict` and `__const` -- failed to parse:
+ * `expected ')', found identifier 'void'`. The five now ask one shared
+ * answer. The torture test is `20111208-1`.
+ */
 extern int printf(const char *, ...);
 /* The glibc prototype shape that could not be parsed. */
 extern void *memcpy(void *__restrict __d, __const void *__restrict __s,
@@ -629,7 +629,7 @@ static int arr_param(int a[__const 4]) { return a[0]; }
 /* On a pointer, where the qualifier binds to the pointer itself. */
 static int deref(int *__const p) { return *p; }
 
-int main(void) {
+static int t_c99_gnu_const_spellings_are_accepted_everywhere(void) {
     char b[8];
     memcpy(b, "hi", 3);
     if (b[0] != 'h' || b[1] != 'i' || b[2] != '\0') return 1;
@@ -647,28 +647,27 @@ int main(void) {
     if (*(__const int *)&v != 5) return 7;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_gnu_const_spellings", code, &[]), 0);
-}
 
-/// Declaration specifiers may appear in any order (C17 6.7p1), including a
-/// storage class *after* a struct, union or enum specifier.
-///
-/// Only trailing *qualifiers* were consumed after such a specifier, so the
-/// storage class was then read as the declarator's name and
-/// `struct { int a; } static g = {1};` failed with
-/// `expected ';', found identifier 'g'`. The torture test is `20180921-1`.
-#[test]
-fn c99_storage_class_may_follow_a_struct_specifier() {
-    let code = r#"
+/* ==== Section 7: t_c99_storage_class_may_follow_a_struct_specifier (was #[test] c99_storage_class_may_follow_a_struct_specifier) ====
+ * Exit codes 186..192 (local code + 185).
+ *
+ * Declaration specifiers may appear in any order (C17 6.7p1), including a
+ * storage class *after* a struct, union or enum specifier.
+ *
+ * Only trailing *qualifiers* were consumed after such a specifier, so the
+ * storage class was then read as the declarator's name and
+ * `struct { int a; } static g = {1};` failed with
+ * `expected ';', found identifier 'g'`. The torture test is `20180921-1`.
+ * Renamed for the merge: U -> s6_U
+ */
 extern int printf(const char *, ...);
 struct S { int a; int b; };
-union U { int i; float f; };
+union s6_U { int i; float f; };
 
 struct S static s1 = {1, 2};
 struct S const static s2 = {3, 4};
 struct S static const s3 = {5, 6};
-union U static u1 = {7};
+union s6_U static u1 = {7};
 int static i1 = 8;
 const int static i2 = 9;
 static struct S s4 = {10, 11};   /* the ordinary order still works */
@@ -681,7 +680,7 @@ static int in_function(void) {
     return loc.a;
 }
 
-int main(void) {
+static int t_c99_storage_class_may_follow_a_struct_specifier(void) {
     T t = {0, 0};
     (void)t;
     if (s1.a != 1 || s1.b != 2) return 1;
@@ -693,30 +692,28 @@ int main(void) {
     if (sizeof(T) != sizeof(struct S)) return 7;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_specifier_order", code, &[]), 0);
-}
 
-/// A bare `_Complex` is `_Complex double`, as gcc reads it.
-///
-/// C17 6.7.2p2 lists only the three floating spellings, so a lone `_Complex`
-/// names no type and c17 reported "type specifier missing". gcc accepts it as
-/// `_Complex double`, and since c17 now has `_Complex int`, defaulting it to
-/// `int` like every other bare modifier would have made `_Complex v;` an
-/// eight-byte integer pair rather than gcc's sixteen-byte double one.
-///
-/// A signedness modifier still names an integer base of its own:
-/// `_Complex unsigned` is `_Complex unsigned int`, eight bytes. Both the
-/// declaration parser and the type-name parser have to agree, or `sizeof`
-/// disagrees with a declaration. The torture test is `20070614-1`.
-#[test]
-fn c99_bare_complex_is_complex_double() {
-    let code = r#"
+/* ==== Section 8: t_c99_bare_complex_is_complex_double (was #[test] c99_bare_complex_is_complex_double) ====
+ * Exit codes 193..203 (local code + 192).
+ *
+ * A bare `_Complex` is `_Complex double`, as gcc reads it.
+ *
+ * C17 6.7.2p2 lists only the three floating spellings, so a lone `_Complex`
+ * names no type and c17 reported "type specifier missing". gcc accepts it as
+ * `_Complex double`, and since c17 now has `_Complex int`, defaulting it to
+ * `int` like every other bare modifier would have made `_Complex v;` an
+ * eight-byte integer pair rather than gcc's sixteen-byte double one.
+ *
+ * A signedness modifier still names an integer base of its own:
+ * `_Complex unsigned` is `_Complex unsigned int`, eight bytes. Both the
+ * declaration parser and the type-name parser have to agree, or `sizeof`
+ * disagrees with a declaration. The torture test is `20070614-1`.
+ */
 extern int printf(const char *, ...);
 _Complex v = 3.0 + 1.0iF;
 static _Complex identity(_Complex z) { return z; }
 
-int main(void) {
+static int t_c99_bare_complex_is_complex_double(void) {
     if (sizeof(v) != 2 * sizeof(double)) return 1;
     if (__real__ v != 3.0 || __imag__ v != 1.0) return 2;
 
@@ -737,6 +734,20 @@ int main(void) {
     if (sizeof(_Complex double) != 2 * sizeof(double)) return 11;
     return 0;
 }
+
+/* Dispatcher: section k's failure code c is returned as base_k + c. */
+int main(void) {
+    int r;
+    if ((r = t_c99_types_keywords_mega()) != 0) return 0 + r;
+    if ((r = t_c99_size_specifiers_are_order_independent()) != 0) return 81 + r;
+    if ((r = t_c99_generic_matches_the_long_family()) != 0) return 107 + r;
+    if ((r = t_c99_enum_is_wide_enough_for_its_enumerators()) != 0) return 138 + r;
+    if ((r = t_c99_pragma_pack_caps_member_alignment()) != 0) return 157 + r;
+    if ((r = t_c99_gnu_const_spellings_are_accepted_everywhere()) != 0) return 178 + r;
+    if ((r = t_c99_storage_class_may_follow_a_struct_specifier()) != 0) return 185 + r;
+    if ((r = t_c99_bare_complex_is_complex_double()) != 0) return 192 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("c99_bare_complex", code, &[]), 0);
+    assert_eq!(compile_and_run("c99_types_keywords_mega", code, &[]), 0);
 }

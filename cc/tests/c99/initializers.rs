@@ -6,12 +6,22 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// C99 Initializers Mega-Test
+// C99 Initializers Mega-Tests
 //
-// Consolidates: designated initializers, compound literals tests
+// Consolidates: designated initializers, compound literals, and the
+// designated/struct initializer patterns real code (CPython) depends on.
+//
+// Split by topic: brace elision and string initializers are in
+// initializers_strings.rs, static-initializer constant folding in
+// initializers_static.rs, and designated overrides in
+// initializers_overrides.rs.
 //
 
-use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_optimized};
+use crate::common::compile_and_run;
+
+// ============================================================================
+// Mega-test: C99 initializers (designated init, compound literals)
+// ============================================================================
 
 // ============================================================================
 // Mega-test: C99 initializers (designated init, compound literals)
@@ -543,143 +553,210 @@ int main(void) {
     );
 }
 
+// ============================================================================
+// Mega-test: designated and struct initializer patterns
+// ============================================================================
+
+// Original test documentation, in section order:
+//
+// ---- c99_initializers_cpython_llist_pattern ----
+// ---- c99_initializers_cpython_opcode_pattern ----
+// ---- c99_initializers_cpython_pytypeobject_pattern ----
+// ---- c99_initializers_nested_designated_pattern ----
+// ---- c99_initializers_sizeof_inferred_array ----
+// Test that sizeof works correctly for arrays with size inferred from initializer
+// This tests the fix for GitHub issue where sizeof(arr) returned 0 for arr[] = {...}
+// ---- c99_initializers_bitfield_designated ----
+// Test designated initialization of multiple bitfields within the same storage unit
+// This tests the fix for a bug where only the last bitfield was initialized
+// (due to incorrect deduplication of fields at the same offset)
+// ---- c99_initializers_anon_struct_continuation ----
+// ============================================================================
+// BUG 2: Anonymous struct positional continuation after designator
+// ============================================================================
+
+// ---- c99_initializers_anon_struct_nested_continuation ----
+// ---- c99_initializers_compound_literal_type_mismatch ----
+// ============================================================================
+// BUG 3: CompoundLiteral type mismatch
+// ============================================================================
+
+// ---- c99_aggregate_element_initializes_whole_aggregate ----
+// An initializer element that is already an expression of the aggregate's own
+// type initializes the whole aggregate (C17 6.7.9p13).
+//
+// It was instead treated as a brace-elision candidate, so filling one element
+// consumed one *element* per scalar member rather than one:
+// `struct P a[2] = {p, p};` put both structs into `a[0]`, left `a[1]`
+// uninitialized, and assigned a struct where a scalar field was expected --
+// giving `4 4 0 0` where gcc gives `4 5 4 5`. The nested case returned
+// uninitialized stack, so this read whatever happened to be there.
+// ---- c99_an_anonymous_first_union_member_counts_for_brace_elision ----
+// A union whose first member is an anonymous structure takes that
+// structure's scalars when its braces are elided (C17 6.7.9p17, 6.7.2.1p13).
+//
+// The count brace elision runs on asked for the union's first *named*
+// member, which skips the anonymous one and found `q`, while the initializer
+// walk filled `a` and `b`: `union U u[] = {1, 2, 3, 4}` came out as four
+// elements, each holding one value.
+// ---- c99_an_override_inside_a_string_initializer_keeps_the_string ----
+// A designator naming one element of an array a string literal initialized
+// replaces that element and keeps the rest (C17 6.7.9p19).
+//
+// A literal is one initializer for the whole array, so a static object had
+// nothing to replace the element in and dropped the literal whole: `sc.s`
+// came out as `"\0z"`. The literal is taken apart into its elements first.
+//
+/// Designated, positional and anonymous-member struct initializers in the
+/// shapes real code uses, one C section per original test.
+///
+/// Consolidates (one C section each, a `t_<name>` function):
+/// - `c99_initializers_cpython_llist_pattern`
+/// - `c99_initializers_cpython_opcode_pattern`
+/// - `c99_initializers_cpython_pytypeobject_pattern`
+/// - `c99_initializers_nested_designated_pattern`
+/// - `c99_initializers_sizeof_inferred_array`
+/// - `c99_initializers_bitfield_designated`
+/// - `c99_initializers_anon_struct_continuation`
+/// - `c99_initializers_anon_struct_nested_continuation`
+/// - `c99_initializers_compound_literal_type_mismatch`
+/// - `c99_aggregate_element_initializes_whole_aggregate`
+/// - `c99_an_anonymous_first_union_member_counts_for_brace_elision`
+/// - `c99_an_override_inside_a_string_initializer_keeps_the_string`
+///
+/// Exit codes: see the map at the top of the program.
 #[test]
-fn c99_initializers_cpython_llist_pattern() {
+fn c99_initializers_patterns_mega() {
     let code = r#"
-struct llist_node {
-    struct llist_node *next;
-    struct llist_node *prev;
+/* Exit-code map: each section returns its original code, offset by
+   the base listed in its banner.
+       1..  2  c99_initializers_cpython_llist_pattern
+       3..  8  c99_initializers_cpython_opcode_pattern
+       9.. 13  c99_initializers_cpython_pytypeobject_pattern
+      14.. 16  c99_initializers_nested_designated_pattern
+      17.. 66  c99_initializers_sizeof_inferred_array
+      67..100  c99_initializers_bitfield_designated
+     101..121  c99_initializers_anon_struct_continuation
+     122..145  c99_initializers_anon_struct_nested_continuation
+     146..156  c99_initializers_compound_literal_type_mismatch
+     157..171  c99_aggregate_element_initializes_whole_aggregate
+     172..173  c99_an_anonymous_first_union_member_counts_for_brace_elision
+     174..188  c99_an_override_inside_a_string_initializer_keeps_the_string
+*/
+
+/* ==== c99_initializers_cpython_llist_pattern: exit codes 1..2 (original code + 0) ==== */
+struct ll_llist_node {
+    struct ll_llist_node *next;
+    struct ll_llist_node *prev;
 };
 
-#define LLIST_INIT(head) { &head, &head }
+#define ll_LLIST_INIT(head) { &head, &head }
 
-struct llist_node my_list = LLIST_INIT(my_list);
+struct ll_llist_node ll_my_list = ll_LLIST_INIT(ll_my_list);
 
-int main(void) {
-    if (my_list.next != &my_list) return 1;
-    if (my_list.prev != &my_list) return 2;
+static __attribute__((noinline)) int t_c99_initializers_cpython_llist_pattern(void) {
+    if (ll_my_list.next != &ll_my_list) return 1;
+    if (ll_my_list.prev != &ll_my_list) return 2;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("cpython_llist_init", code, &[]), 0);
-}
 
-#[test]
-fn c99_initializers_cpython_opcode_pattern() {
-    let code = r#"
-struct uop { int op; int arg; int off; };
-struct expansion { int nuops; struct uop uops[4]; };
+/* ==== c99_initializers_cpython_opcode_pattern: exit codes 3..8 (original code + 2) ==== */
+struct op_uop { int op; int arg; int off; };
+struct op_expansion { int nuops; struct op_uop uops[4]; };
 
-enum { OP_A = 5, OP_B = 10 };
+enum { op_OP_A = 5, op_OP_B = 10 };
 
-struct expansion table[16] = {
-    [OP_A] = { .nuops = 2, .uops = { {1, 2, 3}, {3, 4, 5} } },
-    [OP_B] = { .nuops = 1, .uops = { {5, 6, 7} } },
+struct op_expansion op_table[16] = {
+    [op_OP_A] = { .nuops = 2, .uops = { {1, 2, 3}, {3, 4, 5} } },
+    [op_OP_B] = { .nuops = 1, .uops = { {5, 6, 7} } },
 };
 
-int main(void) {
-    if (table[OP_A].nuops != 2) return 1;
-    if (table[OP_A].uops[0].op != 1) return 2;
-    if (table[OP_A].uops[1].arg != 4) return 3;
-    if (table[OP_B].nuops != 1) return 4;
-    if (table[OP_B].uops[0].op != 5) return 5;
-    if (table[0].nuops != 0) return 6;
+static __attribute__((noinline)) int t_c99_initializers_cpython_opcode_pattern(void) {
+    if (op_table[op_OP_A].nuops != 2) return 1;
+    if (op_table[op_OP_A].uops[0].op != 1) return 2;
+    if (op_table[op_OP_A].uops[1].arg != 4) return 3;
+    if (op_table[op_OP_B].nuops != 1) return 4;
+    if (op_table[op_OP_B].uops[0].op != 5) return 5;
+    if (op_table[0].nuops != 0) return 6;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("cpython_opcode_init", code, &[]), 0);
-}
 
-#[test]
-fn c99_initializers_cpython_pytypeobject_pattern() {
-    let code = r#"
-typedef void (*func_t)(void);
-struct PyTypeObject {
+/* ==== c99_initializers_cpython_pytypeobject_pattern: exit codes 9..13 (original code + 8) ==== */
+typedef void (*pt_func_t)(void);
+struct pt_PyTypeObject {
     long ob_refcnt;
     void *ob_type;
     char *tp_name;
     long tp_basicsize;
-    func_t tp_dealloc;
-    func_t tp_repr;
+    pt_func_t tp_dealloc;
+    pt_func_t tp_repr;
     void *tp_as_number;
     long tp_flags;
     char *tp_doc;
 };
 
-void my_dealloc(void) {}
+void pt_my_dealloc(void) {}
 
-struct PyTypeObject MyType = {
+struct pt_PyTypeObject pt_MyType = {
     1,
     0,
     "MyType",
     64,
-    my_dealloc,
+    pt_my_dealloc,
     0,
     0,
     .tp_flags = 0x1234,
     .tp_doc = "doc",
 };
 
-int main(void) {
-    if (MyType.ob_refcnt != 1) return 1;
-    if (MyType.tp_basicsize != 64) return 2;
-    if (MyType.tp_dealloc != my_dealloc) return 3;
-    if (MyType.tp_flags != 0x1234) return 4;
-    if (MyType.tp_doc[0] != 'd') return 5;
+static __attribute__((noinline)) int t_c99_initializers_cpython_pytypeobject_pattern(void) {
+    if (pt_MyType.ob_refcnt != 1) return 1;
+    if (pt_MyType.tp_basicsize != 64) return 2;
+    if (pt_MyType.tp_dealloc != pt_my_dealloc) return 3;
+    if (pt_MyType.tp_flags != 0x1234) return 4;
+    if (pt_MyType.tp_doc[0] != 'd') return 5;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("cpython_pytypeobject_init", code, &[]), 0);
-}
 
-#[test]
-fn c99_initializers_nested_designated_pattern() {
-    let code = r#"
-struct inner { int tag; int data; };
-struct outer {
+/* ==== c99_initializers_nested_designated_pattern: exit codes 14..16 (original code + 13) ==== */
+struct nd_inner { int tag; int data; };
+struct nd_outer {
     void *type;
-    struct inner value;
+    struct nd_inner value;
 };
 
-struct outer obj = {
+struct nd_outer nd_obj = {
     (void*)0x1234,
     { .tag = 42, .data = 99 }
 };
 
-int main(void) {
-    if (obj.type != (void*)0x1234) return 1;
-    if (obj.value.tag != 42) return 2;
-    if (obj.value.data != 99) return 3;
+static __attribute__((noinline)) int t_c99_initializers_nested_designated_pattern(void) {
+    if (nd_obj.type != (void*)0x1234) return 1;
+    if (nd_obj.value.tag != 42) return 2;
+    if (nd_obj.value.data != 99) return 3;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("nested_designated_init", code, &[]), 0);
-}
 
-/// Test that sizeof works correctly for arrays with size inferred from initializer
-/// This tests the fix for GitHub issue where sizeof(arr) returned 0 for arr[] = {...}
-#[test]
-fn c99_initializers_sizeof_inferred_array() {
-    let code = r#"
+/* ==== c99_initializers_sizeof_inferred_array: exit codes 17..66 (original code + 16) ==== */
 // Global arrays with inferred size
-int global_arr[] = {1, 2, 3, 4, 5};
-static int static_arr[] = {10, 20, 30, 40, 50, 60};
+int si_global_arr[] = {1, 2, 3, 4, 5};
+static int si_static_arr[] = {10, 20, 30, 40, 50, 60};
 
 // Array of structs
-struct Pair { int x; int y; };
-static struct Pair pairs[] = {{1, 2}, {3, 4}, {5, 6}};
+struct si_Pair { int x; int y; };
+static struct si_Pair si_pairs[] = {{1, 2}, {3, 4}, {5, 6}};
 
 // Pointer array
-static int *ptrs[] = {0, 0, 0};
+static int *si_ptrs[] = {0, 0, 0};
 
-int main(void) {
+static __attribute__((noinline)) int t_c99_initializers_sizeof_inferred_array(void) {
     // Test global array
-    if (sizeof(global_arr) != 20) return 1;  // 5 * 4 bytes
-    if (sizeof(global_arr) / sizeof(global_arr[0]) != 5) return 2;
+    if (sizeof(si_global_arr) != 20) return 1;  // 5 * 4 bytes
+    if (sizeof(si_global_arr) / sizeof(si_global_arr[0]) != 5) return 2;
 
     // Test static array
-    if (sizeof(static_arr) != 24) return 10;  // 6 * 4 bytes
-    if (sizeof(static_arr) / sizeof(static_arr[0]) != 6) return 11;
+    if (sizeof(si_static_arr) != 24) return 10;  // 6 * 4 bytes
+    if (sizeof(si_static_arr) / sizeof(si_static_arr[0]) != 6) return 11;
 
     // Test local array with inferred size
     int local_arr[] = {100, 200, 300};
@@ -687,12 +764,12 @@ int main(void) {
     if (sizeof(local_arr) / sizeof(local_arr[0]) != 3) return 21;
 
     // Test array of structs
-    if (sizeof(pairs) != 24) return 30;  // 3 * (4 + 4) bytes
-    if (sizeof(pairs) / sizeof(pairs[0]) != 3) return 31;
+    if (sizeof(si_pairs) != 24) return 30;  // 3 * (4 + 4) bytes
+    if (sizeof(si_pairs) / sizeof(si_pairs[0]) != 3) return 31;
 
     // Test pointer array
-    if (sizeof(ptrs) != 24) return 40;  // 3 * 8 bytes on 64-bit
-    if (sizeof(ptrs) / sizeof(ptrs[0]) != 3) return 41;
+    if (sizeof(si_ptrs) != 24) return 40;  // 3 * 8 bytes on 64-bit
+    if (sizeof(si_ptrs) / sizeof(si_ptrs[0]) != 3) return 41;
 
     // Test complex pattern like CPython's static_types[]
     typedef void *PyTypeObject;
@@ -706,20 +783,12 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("sizeof_inferred_array", code, &[]), 0);
-}
 
-/// Test designated initialization of multiple bitfields within the same storage unit
-/// This tests the fix for a bug where only the last bitfield was initialized
-/// (due to incorrect deduplication of fields at the same offset)
-#[test]
-fn c99_initializers_bitfield_designated() {
-    let code = r#"
+/* ==== c99_initializers_bitfield_designated: exit codes 67..100 (original code + 66) ==== */
 #include <stdio.h>
 
 // Bitfields all packed into a single storage unit (like CPython's PyASCIIObject state)
-struct state {
+struct bd_state {
     unsigned int interned:2;
     unsigned int kind:3;
     unsigned int compact:1;
@@ -727,19 +796,19 @@ struct state {
     unsigned int statically_allocated:1;
 };
 
-struct obj {
+struct bd_obj {
     void *ptr;
     long length;
     long hash;
-    struct state state;
+    struct bd_state bd_state;
 };
 
 // Test global designated initializer with multiple bitfields
-struct obj test_obj = {
+struct bd_obj bd_test_obj = {
     .ptr = (void*)0x12345678,
     .length = 8,
     .hash = -1,
-    .state = {
+    .bd_state = {
         .kind = 1,
         .compact = 1,
         .ascii = 1,
@@ -748,7 +817,7 @@ struct obj test_obj = {
 };
 
 // Test that all bitfields within the same byte can be initialized
-struct flags {
+struct bd_flags {
     unsigned int a:1;
     unsigned int b:1;
     unsigned int c:1;
@@ -759,114 +828,69 @@ struct flags {
     unsigned int h:1;
 };
 
-struct flags all_flags = {
+struct bd_flags bd_all_flags = {
     .a = 1, .b = 1, .c = 1, .d = 1,
     .e = 1, .f = 1, .g = 1, .h = 1,
 };
 
-struct flags some_flags = {
+struct bd_flags bd_some_flags = {
     .b = 1, .d = 1, .f = 1, .h = 1,
 };
 
-int main(void) {
+static __attribute__((noinline)) int t_c99_initializers_bitfield_designated(void) {
     // Verify global struct with nested bitfield struct
-    if (test_obj.ptr != (void*)0x12345678) return 1;
-    if (test_obj.length != 8) return 2;
-    if (test_obj.hash != -1) return 3;
-    if (test_obj.state.interned != 0) return 4;
-    if (test_obj.state.kind != 1) return 5;
-    if (test_obj.state.compact != 1) return 6;
-    if (test_obj.state.ascii != 1) return 7;
-    if (test_obj.state.statically_allocated != 1) return 8;
+    if (bd_test_obj.ptr != (void*)0x12345678) return 1;
+    if (bd_test_obj.length != 8) return 2;
+    if (bd_test_obj.hash != -1) return 3;
+    if (bd_test_obj.bd_state.interned != 0) return 4;
+    if (bd_test_obj.bd_state.kind != 1) return 5;
+    if (bd_test_obj.bd_state.compact != 1) return 6;
+    if (bd_test_obj.bd_state.ascii != 1) return 7;
+    if (bd_test_obj.bd_state.statically_allocated != 1) return 8;
 
     // Verify all flags set
-    if (all_flags.a != 1) return 10;
-    if (all_flags.b != 1) return 11;
-    if (all_flags.c != 1) return 12;
-    if (all_flags.d != 1) return 13;
-    if (all_flags.e != 1) return 14;
-    if (all_flags.f != 1) return 15;
-    if (all_flags.g != 1) return 16;
-    if (all_flags.h != 1) return 17;
+    if (bd_all_flags.a != 1) return 10;
+    if (bd_all_flags.b != 1) return 11;
+    if (bd_all_flags.c != 1) return 12;
+    if (bd_all_flags.d != 1) return 13;
+    if (bd_all_flags.e != 1) return 14;
+    if (bd_all_flags.f != 1) return 15;
+    if (bd_all_flags.g != 1) return 16;
+    if (bd_all_flags.h != 1) return 17;
 
     // Verify alternating flags
-    if (some_flags.a != 0) return 20;
-    if (some_flags.b != 1) return 21;
-    if (some_flags.c != 0) return 22;
-    if (some_flags.d != 1) return 23;
-    if (some_flags.e != 0) return 24;
-    if (some_flags.f != 1) return 25;
-    if (some_flags.g != 0) return 26;
-    if (some_flags.h != 1) return 27;
+    if (bd_some_flags.a != 0) return 20;
+    if (bd_some_flags.b != 1) return 21;
+    if (bd_some_flags.c != 0) return 22;
+    if (bd_some_flags.d != 1) return 23;
+    if (bd_some_flags.e != 0) return 24;
+    if (bd_some_flags.f != 1) return 25;
+    if (bd_some_flags.g != 0) return 26;
+    if (bd_some_flags.h != 1) return 27;
 
     // Local variable with bitfield designated init
-    struct obj local_obj = {
-        .state = {
+    struct bd_obj local_obj = {
+        .bd_state = {
             .interned = 2,
             .kind = 5,
             .compact = 0,
             .ascii = 1,
         },
     };
-    if (local_obj.state.interned != 2) return 30;
-    if (local_obj.state.kind != 5) return 31;
-    if (local_obj.state.compact != 0) return 32;
-    if (local_obj.state.ascii != 1) return 33;
-    if (local_obj.state.statically_allocated != 0) return 34;
+    if (local_obj.bd_state.interned != 2) return 30;
+    if (local_obj.bd_state.kind != 5) return 31;
+    if (local_obj.bd_state.compact != 0) return 32;
+    if (local_obj.bd_state.ascii != 1) return 33;
+    if (local_obj.bd_state.statically_allocated != 0) return 34;
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("bitfield_designated_init", code, &[]), 0);
-}
 
-// ============================================================================
-// BUG 1: Pointer arithmetic in global initializers + hard error for unknown exprs
-// ============================================================================
-
-#[test]
-fn c99_initializers_ptr_arithmetic_global() {
-    let code = r#"
-int arr[10] = {0,1,2,3,4,5,6,7,8,9};
-int *p1 = arr + 5;
-int *p2 = &arr[0] + 3;
-int *p3 = arr + 0;
-
-struct S { int x; int y; int z; };
-struct S global_s = {10, 20, 30};
-int *sp = (int*)&global_s + 1;
-
-// Pointer to middle of array
-int *mid = &arr[4];
-
-int main(void) {
-    if (*p1 != 5) return 1;
-    if (*p2 != 3) return 2;
-    if (*p3 != 0) return 3;
-    if (*sp != 20) return 4;
-    if (*mid != 4) return 5;
-
-    // Pointer subtraction in arithmetic
-    int *p4 = arr + 9;
-    if (*p4 != 9) return 6;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("ptr_arithmetic_global_init", code, &[]), 0);
-}
-
-// ============================================================================
-// BUG 2: Anonymous struct positional continuation after designator
-// ============================================================================
-
-#[test]
-fn c99_initializers_anon_struct_continuation() {
-    let code = r#"
+/* ==== c99_initializers_anon_struct_continuation: exit codes 101..121 (original code + 100) ==== */
 // Test: after designating a field in an anonymous struct,
 // the next positional should continue within that anonymous struct
 
-struct WithAnonStruct {
+struct ac_WithAnonStruct {
     int a;
     struct {
         int x;
@@ -876,9 +900,9 @@ struct WithAnonStruct {
     int c;
 };
 
-int main(void) {
+static __attribute__((noinline)) int t_c99_initializers_anon_struct_continuation(void) {
     // .x designates inside anon struct, 20 should go to y (not c)
-    struct WithAnonStruct s1 = {.a = 1, .x = 10, 20, 30, 99};
+    struct ac_WithAnonStruct s1 = {.a = 1, .x = 10, 20, 30, 99};
     if (s1.a != 1) return 1;
     if (s1.x != 10) return 2;
     if (s1.y != 20) return 3;
@@ -886,30 +910,25 @@ int main(void) {
     if (s1.c != 99) return 5;
 
     // Only designating inside anon struct
-    struct WithAnonStruct s2 = {.x = 100, 200};
+    struct ac_WithAnonStruct s2 = {.x = 100, 200};
     if (s2.a != 0) return 10;
     if (s2.x != 100) return 11;
     if (s2.y != 200) return 12;
     if (s2.z != 0) return 13;
 
     // Designate last field of anon struct, then positional goes to outer
-    struct WithAnonStruct s3 = {.z = 50, 60};
+    struct ac_WithAnonStruct s3 = {.z = 50, 60};
     if (s3.z != 50) return 20;
     if (s3.c != 60) return 21;
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("anon_struct_continuation", code, &[]), 0);
-}
 
-#[test]
-fn c99_initializers_anon_struct_nested_continuation() {
-    let code = r#"
+/* ==== c99_initializers_anon_struct_nested_continuation: exit codes 122..145 (original code + 121) ==== */
 // Test deeply nested anonymous structs: positional continuation must
 // walk through all nesting levels correctly (C11 6.7.2.1p13).
 
-struct Deep {
+struct an_Deep {
     int a;
     struct {
         int x;
@@ -922,9 +941,9 @@ struct Deep {
     int c;
 };
 
-int main(void) {
+static __attribute__((noinline)) int t_c99_initializers_anon_struct_nested_continuation(void) {
     // .p is inside nested anon struct; 20 should go to q, then z, then c
-    struct Deep d1 = {.a = 1, .p = 10, 20, 30, 40};
+    struct an_Deep d1 = {.a = 1, .p = 10, 20, 30, 40};
     if (d1.a != 1) return 1;
     if (d1.p != 10) return 2;
     if (d1.q != 20) return 3;
@@ -932,13 +951,13 @@ int main(void) {
     if (d1.c != 40) return 5;
 
     // .q is last in inner anon; next positional goes to z (outer anon), then c
-    struct Deep d2 = {.q = 100, 200, 300};
+    struct an_Deep d2 = {.q = 100, 200, 300};
     if (d2.q != 100) return 10;
     if (d2.z != 200) return 11;
     if (d2.c != 300) return 12;
 
     // .x is in outer anon; positional should descend into inner anon next
-    struct Deep d3 = {.x = 50, 60, 70, 80, 90};
+    struct an_Deep d3 = {.x = 50, 60, 70, 80, 90};
     if (d3.x != 50) return 20;
     if (d3.p != 60) return 21;
     if (d3.q != 70) return 22;
@@ -947,2269 +966,122 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("anon_struct_nested_continuation", code, &[]),
-        0
-    );
-}
 
-// ============================================================================
-// BUG 3: CompoundLiteral type mismatch
-// ============================================================================
-
-#[test]
-fn c99_initializers_compound_literal_type_mismatch() {
-    let code = r#"
-struct Small { int x; int y; };
-struct Big { int a; int b; int c; int d; };
+/* ==== c99_initializers_compound_literal_type_mismatch: exit codes 146..156 (original code + 145) ==== */
+struct cm_Small { int x; int y; };
+struct cm_Big { int a; int b; int c; int d; };
 
 // Global: compound literal type != target type, not pointer
 // This exercises the else branch where cl_type must be used instead of target type
-struct Big global_b = {.a = 1, .b = 2, .c = 3, .d = 4};
+struct cm_Big cm_global_b = {.a = 1, .b = 2, .c = 3, .d = 4};
 
-int main(void) {
+static __attribute__((noinline)) int t_c99_initializers_compound_literal_type_mismatch(void) {
     // Same-type compound literal (exercises the cl_type == typ branch)
-    struct Small s = (struct Small){42, 99};
+    struct cm_Small s = (struct cm_Small){42, 99};
     if (s.x != 42) return 1;
     if (s.y != 99) return 2;
 
     // Verify global init too
-    if (global_b.a != 1) return 10;
-    if (global_b.d != 4) return 11;
+    if (cm_global_b.a != 1) return 10;
+    if (cm_global_b.d != 4) return 11;
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("compound_literal_type_mismatch", code, &[]),
-        0
-    );
-}
 
-// ============================================================================
-// BUG 4: Brace elision (C99 6.7.8p17-20)
-// ============================================================================
-
-#[test]
-fn c99_initializers_brace_elision() {
-    let code = r#"
-int main(void) {
-    // 2D array without inner braces
-    int a[2][2] = {1, 2, 3, 4};
-    if (a[0][0] != 1) return 1;
-    if (a[0][1] != 2) return 2;
-    if (a[1][0] != 3) return 3;
-    if (a[1][1] != 4) return 4;
-
-    // 2D array with partial fill
-    int b[2][3] = {1, 2, 3, 4, 5, 6};
-    if (b[0][0] != 1) return 10;
-    if (b[0][2] != 3) return 11;
-    if (b[1][0] != 4) return 12;
-    if (b[1][2] != 6) return 13;
-
-    // Array of structs without inner braces
-    struct { int a; int b; } arr[2] = {1, 2, 3, 4};
-    if (arr[0].a != 1) return 20;
-    if (arr[0].b != 2) return 21;
-    if (arr[1].a != 3) return 22;
-    if (arr[1].b != 4) return 23;
-
-    // Struct containing array with brace elision
-    struct { int arr[3]; int val; } s = {10, 20, 30, 40};
-    if (s.arr[0] != 10) return 30;
-    if (s.arr[1] != 20) return 31;
-    if (s.arr[2] != 30) return 32;
-    if (s.val != 40) return 33;
-
-    // Mixed: braced and elided
-    int c[3][2] = {{1, 2}, 3, 4, {5, 6}};
-    if (c[0][0] != 1) return 40;
-    if (c[0][1] != 2) return 41;
-    if (c[1][0] != 3) return 42;
-    if (c[1][1] != 4) return 43;
-    if (c[2][0] != 5) return 44;
-    if (c[2][1] != 6) return 45;
-
-    // Partial brace elision (fewer elements than needed)
-    int d[2][2] = {1, 2, 3};
-    if (d[0][0] != 1) return 50;
-    if (d[0][1] != 2) return 51;
-    if (d[1][0] != 3) return 52;
-    if (d[1][1] != 0) return 53;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("brace_elision", code, &[]), 0);
-}
-
-#[test]
-fn c99_initializers_brace_elision_global() {
-    let code = r#"
-// Global 2D array with brace elision
-int g[2][2] = {1, 2, 3, 4};
-
-// Global array of structs with brace elision
-struct Pair { int x; int y; };
-struct Pair pairs[3] = {1, 2, 3, 4, 5, 6};
-
-// Nested struct with brace elision
-struct Inner { int a; int b; };
-struct Outer { struct Inner inner; int c; };
-struct Outer outer = {10, 20, 30};
-
-int main(void) {
-    if (g[0][0] != 1) return 1;
-    if (g[0][1] != 2) return 2;
-    if (g[1][0] != 3) return 3;
-    if (g[1][1] != 4) return 4;
-
-    if (pairs[0].x != 1) return 10;
-    if (pairs[0].y != 2) return 11;
-    if (pairs[1].x != 3) return 12;
-    if (pairs[1].y != 4) return 13;
-    if (pairs[2].x != 5) return 14;
-    if (pairs[2].y != 6) return 15;
-
-    if (outer.inner.a != 10) return 20;
-    if (outer.inner.b != 20) return 21;
-    if (outer.c != 30) return 22;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("brace_elision_global", code, &[]), 0);
-}
-
-// ============================================================================
-// String literals must NOT trigger brace elision (C99 6.7.8p14)
-// ============================================================================
-
-#[test]
-fn c99_initializers_string_no_brace_elision() {
-    let code = r#"
-// String literals initialize char arrays directly, not via brace elision
-struct WithCharArray {
-    char name[16];
-    int val;
-};
-
-// Global: string literal for char array member should not consume next elements
-struct WithCharArray g1 = {"hello", 42};
-
-// Array of structs with string members
-struct WithCharArray table[] = {
-    {"alpha", 1},
-    {"beta", 2},
-};
-
-int main(void) {
-    if (g1.name[0] != 'h') return 1;
-    if (g1.name[4] != 'o') return 2;
-    if (g1.val != 42) return 3;
-
-    // Local with brace elision NOT applied to string
-    struct WithCharArray local = {"world", 99};
-    if (local.name[0] != 'w') return 10;
-    if (local.val != 99) return 11;
-
-    // Array of structs
-    if (table[0].name[0] != 'a') return 20;
-    if (table[0].val != 1) return 21;
-    if (table[1].name[0] != 'b') return 22;
-    if (table[1].val != 2) return 23;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("string_no_brace_elision", code, &[]), 0);
-}
-
-// ============================================================================
-// Parity test: global (static) vs local initializers must produce same results
-// ============================================================================
-
-#[test]
-fn c99_initializers_global_local_parity() {
-    let code = r#"
-struct Point { int x; int y; int z; };
-struct Nested { struct Point p; int val; };
-struct WithArray { int arr[4]; int extra; };
-
-// Global initializers (static path: ast_init_list_to_ir)
-struct Point g_desig = {.z = 30, .x = 10, .y = 20};
-struct Point g_pos = {1, 2, 3};
-struct Nested g_nested = {{100, 200, 300}, 400};
-struct Nested g_nested_desig = {.p = {.y = 50, .x = 40}, .val = 60};
-struct WithArray g_arr = {{10, 20, 30, 40}, 50};
-struct WithArray g_arr_desig = {.arr = {[2] = 300, [0] = 100}, .extra = 99};
-int g_2d[2][3] = {1, 2, 3, 4, 5, 6};
-int g_2d_desig[2][3] = {[1] = {[2] = 99}};
-
-int main(void) {
-    // Local initializers (runtime path: linearize_init_list_at_offset)
-    struct Point l_desig = {.z = 30, .x = 10, .y = 20};
-    struct Point l_pos = {1, 2, 3};
-    struct Nested l_nested = {{100, 200, 300}, 400};
-    struct Nested l_nested_desig = {.p = {.y = 50, .x = 40}, .val = 60};
-    struct WithArray l_arr = {{10, 20, 30, 40}, 50};
-    struct WithArray l_arr_desig = {.arr = {[2] = 300, [0] = 100}, .extra = 99};
-    int l_2d[2][3] = {1, 2, 3, 4, 5, 6};
-    int l_2d_desig[2][3] = {[1] = {[2] = 99}};
-
-    // Designated struct: global vs local
-    if (g_desig.x != l_desig.x) return 1;
-    if (g_desig.y != l_desig.y) return 2;
-    if (g_desig.z != l_desig.z) return 3;
-
-    // Positional struct: global vs local
-    if (g_pos.x != l_pos.x) return 10;
-    if (g_pos.y != l_pos.y) return 11;
-    if (g_pos.z != l_pos.z) return 12;
-
-    // Nested struct: global vs local
-    if (g_nested.p.x != l_nested.p.x) return 20;
-    if (g_nested.p.y != l_nested.p.y) return 21;
-    if (g_nested.p.z != l_nested.p.z) return 22;
-    if (g_nested.val != l_nested.val) return 23;
-
-    // Nested designated: global vs local
-    if (g_nested_desig.p.x != l_nested_desig.p.x) return 30;
-    if (g_nested_desig.p.y != l_nested_desig.p.y) return 31;
-    if (g_nested_desig.val != l_nested_desig.val) return 32;
-
-    // Array in struct: global vs local
-    if (g_arr.arr[0] != l_arr.arr[0]) return 40;
-    if (g_arr.arr[3] != l_arr.arr[3]) return 41;
-    if (g_arr.extra != l_arr.extra) return 42;
-
-    // Designated array in struct: global vs local
-    if (g_arr_desig.arr[0] != l_arr_desig.arr[0]) return 50;
-    if (g_arr_desig.arr[1] != l_arr_desig.arr[1]) return 51;
-    if (g_arr_desig.arr[2] != l_arr_desig.arr[2]) return 52;
-    if (g_arr_desig.extra != l_arr_desig.extra) return 53;
-
-    // 2D array brace elision: global vs local
-    if (g_2d[0][0] != l_2d[0][0]) return 60;
-    if (g_2d[1][2] != l_2d[1][2]) return 61;
-
-    // 2D designated array: global vs local
-    if (g_2d_desig[0][0] != l_2d_desig[0][0]) return 70;
-    if (g_2d_desig[1][2] != l_2d_desig[1][2]) return 71;
-
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("initializers_global_local_parity", code, &[]),
-        0
-    );
-}
-
-/// An initializer element that is already an expression of the aggregate's own
-/// type initializes the whole aggregate (C17 6.7.9p13).
-///
-/// It was instead treated as a brace-elision candidate, so filling one element
-/// consumed one *element* per scalar member rather than one:
-/// `struct P a[2] = {p, p};` put both structs into `a[0]`, left `a[1]`
-/// uninitialized, and assigned a struct where a scalar field was expected --
-/// giving `4 4 0 0` where gcc gives `4 5 4 5`. The nested case returned
-/// uninitialized stack, so this read whatever happened to be there.
-#[test]
-fn c99_aggregate_element_initializes_whole_aggregate() {
-    let code = r#"
+/* ==== c99_aggregate_element_initializes_whole_aggregate: exit codes 157..171 (original code + 156) ==== */
 #include <string.h>
 
-struct P { int x, y; };
-struct N { int a[2]; struct { int x, y; } in; };
+struct ae_P { int x, y; };
+struct ae_N { int a[2]; struct { int x, y; } in; };
 
-int main(void) {
-    struct P p = {4, 5};
+static __attribute__((noinline)) int t_c99_aggregate_element_initializes_whole_aggregate(void) {
+    struct ae_P p = {4, 5};
 
     /* The case that was wrong: elements are struct expressions, not braces. */
-    struct P a2[2] = {p, p};
+    struct ae_P a2[2] = {p, p};
     if (a2[0].x != 4 || a2[0].y != 5) return 1;
     if (a2[1].x != 4 || a2[1].y != 5) return 2;
 
     /* Nested aggregate, where the old path returned uninitialized stack. */
-    struct N n = {{1, 2}, {4, 5}};
-    struct N b2[2] = {n, n};
+    struct ae_N n = {{1, 2}, {4, 5}};
+    struct ae_N b2[2] = {n, n};
     if (b2[0].a[0] != 1 || b2[0].in.x != 4) return 3;
     if (b2[1].a[0] != 1 || b2[1].in.x != 4) return 4;
     if (memcmp(&b2[0], &n, sizeof n) != 0) return 5;
     if (memcmp(&b2[1], &n, sizeof n) != 0) return 6;
 
     /* Mixing an expression element with a brace list must still work. */
-    struct P mix[2] = {p, {8, 9}};
+    struct ae_P mix[2] = {p, {8, 9}};
     if (mix[0].x != 4 || mix[0].y != 5) return 7;
     if (mix[1].x != 8 || mix[1].y != 9) return 8;
 
     /* Fewer initializers than elements: the rest are zeroed, not garbage. */
-    struct P few[3] = {p};
+    struct ae_P few[3] = {p};
     if (few[0].x != 4 || few[1].x != 0 || few[2].x != 0) return 9;
     if (few[1].y != 0 || few[2].y != 0) return 10;
 
     /* A single struct initialized from another, and one member from an
        expression -- the same rule one level down. */
-    struct N copy = n;
+    struct ae_N copy = n;
     if (copy.a[0] != 1 || copy.in.x != 4) return 11;
 
     /* The paths that always worked, pinned so this fix cannot regress them. */
-    struct P braces[2] = {{4, 5}, {6, 7}};
+    struct ae_P braces[2] = {{4, 5}, {6, 7}};
     if (braces[0].x != 4 || braces[1].x != 6) return 12;
-    static struct P statics[2] = {{4, 5}, {6, 7}};
+    static struct ae_P statics[2] = {{4, 5}, {6, 7}};
     if (statics[0].x != 4 || statics[1].x != 6) return 13;
-    struct P assigned[2];
+    struct ae_P assigned[2];
     assigned[0] = p; assigned[1] = p;
     if (assigned[0].x != 4 || assigned[1].x != 4) return 14;
-    struct N desig = {.in = {7, 8}};
+    struct ae_N desig = {.in = {7, 8}};
     if (desig.in.x != 7 || desig.in.y != 8) return 15;
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run(
-            "c99_aggregate_element_initializes_whole_aggregate",
-            code,
-            &[]
-        ),
-        0
-    );
-}
 
-// ============================================================================
-// Constant folding in global initializers
-// ============================================================================
-
-/// Arithmetic on floating constants must fold at file scope.
-///
-/// C99 6.6p8 allows any arithmetic constant expression as the initializer of
-/// an object with static storage duration. c17 folded `*` and `/` correctly
-/// but not `+` or `-`: those two were intercepted by the *pointer*-arithmetic
-/// arm, which fell back to an integer-only evaluator and then rejected the
-/// program. `double a = 1.0 + 2.0;` did not compile.
-///
-/// Worse, `-(1.0 + 2.0)` was accepted and silently became `0.0` -- the
-/// negation arm returned "no initializer" without a diagnostic, which lands
-/// the object in `.bss`. A wrong answer with a zero exit status.
-#[test]
-fn c99_global_initializer_folds_floating_arithmetic() {
-    let src = r#"
-#include <math.h>
-
-double d_add = 1.0 + 2.0;
-double d_sub = 5.0 - 2.0;
-double d_mul = 3.0 * 2.0;
-double d_div = 12.0 / 4.0;
-double d_mixed = 1.0 + 2;            /* int operand promotes */
-float  f_add = 1.5f + 1.5f;
-long double l_add = 1.0L + 2.0L;
-double d_nested = (1.0 + 2.0) * 3.0 - 6.0;
-
-/* The silent-zero cases: a negated constant expression. */
-double d_neg_sum = -(1.0 + 2.0);
-double d_neg_mul = -(2.0 * 1.5);
-double d_neg_lit = -3.0;
-
-/* Integer folding must keep working unchanged. */
-int i_add = 1 + 2;
-int i_sub = 5 - 2;
-
-int main(void)
-{
-    if (d_add != 3.0) return 1;
-    if (d_sub != 3.0) return 2;
-    if (d_mul != 6.0) return 3;
-    if (d_div != 3.0) return 4;
-    if (d_mixed != 3.0) return 5;
-    if (f_add != 3.0f) return 6;
-    if (l_add != 3.0L) return 7;
-    if (d_nested != 3.0) return 8;
-
-    if (d_neg_sum != -3.0) return 9;
-    if (d_neg_mul != -3.0) return 10;
-    if (d_neg_lit != -3.0) return 11;
-
-    if (i_add != 3) return 12;
-    if (i_sub != 3) return 13;
-
+/* ==== c99_an_anonymous_first_union_member_counts_for_brace_elision: exit codes 172..173 (original code + 171) ==== */
+union au_U { struct { int a, b; }; long q; };
+union au_U au_u[] = { 1, 2, 3, 4 };
+static __attribute__((noinline)) int t_c99_an_anonymous_first_union_member_counts_for_brace_elision(void) {
+    if (sizeof au_u / sizeof au_u[0] != 2) return 1;
+    if (au_u[0].a != 1 || au_u[0].b != 2 || au_u[1].a != 3 || au_u[1].b != 4) return 2;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("global_init_float_fold", src, &[]), 0);
-}
 
-/// Pointer arithmetic in a global initializer must keep working.
-///
-/// The float fix touches the arm that handles it, so this pins the behaviour
-/// the arm was written for: a symbol address plus a scaled constant offset.
-#[test]
-fn c99_global_initializer_folds_pointer_arithmetic() {
-    let src = r#"
-#include <string.h>
-static int arr[10] = {0,1,2,3,4,5,6,7,8,9};
-int *p_fwd = arr + 3;
-int *p_back = &arr[7] - 2;
-int *p_zero = arr + 0;
-
-/* A string literal has a static address too, but it only acquires a label
-   when it is interned -- which the address evaluator could not do, so this
-   was rejected while `arr + 1` was accepted. */
-const char *s_off = "hello" + 1;
-const char *s_end = "world" + 5;
-
-int main(void)
-{
-    if (*p_fwd != 3) return 1;
-    if (*p_back != 5) return 2;
-    if (*p_zero != 0) return 3;
-    if (p_fwd - arr != 3) return 4;
-    if (strcmp(s_off, "ello") != 0) return 5;
-    if (*s_end != '\0') return 6;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("global_init_ptr_fold", src, &[]), 0);
-}
-
-/// A `_Complex` object with static storage duration can be initialized.
-///
-/// Every spelling was rejected before: `__builtin_complex` had no arm at all,
-/// and `1.0 + 2.0*I` reached the arithmetic arm, which had no notion of a
-/// complex value. Only the function-local path worked.
-///
-/// Note `double _Complex z = {1.0, 2.0};` is *not* 1.0 + 2.0i. A complex type
-/// is a scalar type (C11 6.2.5p21), so that is a braced scalar initializer
-/// with an excess element; gcc warns and keeps only the first. Matching gcc
-/// here means the imaginary part stays zero.
-#[test]
-fn c99_global_initializer_accepts_complex() {
-    let src = r#"
-#include <complex.h>
-#include <stdio.h>
-
-double _Complex z_builtin = __builtin_complex(1.0, 2.0);
-double _Complex z_cmplx   = CMPLX(1.0, 2.0);
-double _Complex z_imag    = 1.0 + 2.0*I;
-double _Complex z_real    = 3.0;               /* real constant, zero imag */
-double _Complex z_neg     = -(1.0 + 2.0*I);
-double _Complex z_mul     = (1.0 + 2.0*I) * (3.0 + 4.0*I);   /* -5 + 10i */
-double _Complex z_brace   = {1.0};             /* braced scalar */
-float _Complex  f_imag    = 1.5f + 2.5f*I;     /* narrower base type */
-
-static double _Complex s_imag = 1.0 + 2.0*I;   /* internal linkage */
-
-int main(void)
-{
-    if (creal(z_builtin) != 1.0 || cimag(z_builtin) != 2.0) return 1;
-    if (creal(z_cmplx) != 1.0 || cimag(z_cmplx) != 2.0) return 2;
-    if (creal(z_imag) != 1.0 || cimag(z_imag) != 2.0) return 3;
-    if (creal(z_real) != 3.0 || cimag(z_real) != 0.0) return 4;
-    if (creal(z_neg) != -1.0 || cimag(z_neg) != -2.0) return 5;
-    if (creal(z_mul) != -5.0 || cimag(z_mul) != 10.0) return 6;
-    if (creal(z_brace) != 1.0 || cimag(z_brace) != 0.0) return 7;
-    if (crealf(f_imag) != 1.5f || cimagf(f_imag) != 2.5f) return 8;
-    if (creal(s_imag) != 1.0 || cimag(s_imag) != 2.0) return 9;
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("global_init_complex", src, &["-lm".to_string()]),
-        0
-    );
-}
-
-// ============================================================================
-// Decimal floating literals at the target's precision
-// ============================================================================
-
-/// A decimal literal must reach `long double` at full width.
-///
-/// Decimal literals went through `f64::from_str`, so a `long double` was
-/// correct only to 53 of its 64 significand bits, and one outside double's
-/// range collapsed entirely -- `LDBL_MAX` written in decimal became `inf` and
-/// `1e-4900L` became zero. Hex literals were already exact, which is what the
-/// comparisons below use as the reference: every right-hand side is a hex
-/// literal naming the value gcc produces for the decimal on its left.
-///
-/// `float` and `double` were never affected: `f64::from_str` is correctly
-/// rounded, and for those two the target format is `f64` or narrower.
-///
-/// Each reference is spelled for the format the target has. A decimal
-/// correctly rounded to binary128's 113 bits is *not* the same value as one
-/// correctly rounded to x87's 64, so one hex spelling cannot serve both --
-/// which is the whole claim being made here, that the literal reaches the
-/// width the target actually has. Both sets were taken from gcc.
-#[test]
-fn c99_decimal_literals_reach_long_double_precision() {
-    let src = r#"
-#include <float.h>
-
-#if LDBL_MANT_DIG == 113
-#define PI_REF    0x1.921fb54442d18469834ef156fa8fp+1L
-#define TENTH_REF 0x1.999999999999999999999999999ap-4L
-#define BIG_REF   0x1.fffffffffffffffdf5f7837da5b2p+16383L
-#define TINY_REF  0x1.7769bead75ec52e4d25544b1042ep-16278L
-#else
-/* x87's 64 bits. A target whose long double is double rounds both sides of
-   each comparison to the same value, so these serve there too. */
-#define PI_REF    0xc.90fdaa22168c235p-2L
-#define TENTH_REF 0xc.ccccccccccccccdp-7L
-#define BIG_REF   0xf.fffffffffffffffp+16380L
-#define TINY_REF  0xb.bb4df56baf62972p-16281L
-#endif
-
-int main(void)
-{
-    /* Needs every significand bit the format has: the tail is lost at 53. */
-    if (3.14159265358979323846L != PI_REF) return 1;
-
-    /* A value with no exact binary form, rounded at the wrong width. */
-    if (0.1L != TENTH_REF) return 2;
-
-    /* Outside double's range in both directions. */
-    if (1.18973149535723176502e+4932L != BIG_REF) return 3;
-    if (1e-4900L != TINY_REF) return 4;
-
-    /* Ordinary magnitudes must stay exact, not merely close. */
-    if (1.0L != 0x1p+0L) return 5;
-    if (0.5L != 0x1p-1L) return 6;
-    if (1e10L != 0x2.540be4p+32L) return 7;
-    if (123456789.0L != 0x7.5bcd15p+24L) return 8;
-
-    /* Zero, and a value that underflows to it, keep their sign. */
-    if (0.0L != 0x0p+0L) return 9;
-    if (1e-5000L != 0.0L) return 10;
-
-    /* float and double are unchanged. */
-    if (0.1 != 0x1.999999999999ap-4) return 11;
-    if (0.1f != 0x1.99999ap-4f) return 12;
-    if (DBL_MAX <= 0.0 || LDBL_MAX <= 0.0) return 13;
-
-    /* The exponent forms all agree. */
-    if (1.5e3L != 1500.0L) return 14;
-    if (15e2L != 1500.0L) return 15;
-    if (150000e-2L != 1500.0L) return 16;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("decimal_long_double", src, &[]), 0);
-}
-
-/// The address of a compound literal with static storage duration.
-///
-/// C99 6.5.2.5p5 gives a compound literal at file scope static storage
-/// duration, so its address is a constant expression and may initialize a
-/// pointer. c17 dropped the initializer silently: the object went to `.bss`,
-/// the pointer was null, and the program segfaulted on first use.
-///
-/// The address-of arm returned "no initializer" when it could not evaluate the
-/// operand, which is the same silent-zero shape that made `-(1.0 + 2.0)` come
-/// out as `0.0`. The other arms were fixed then; this one was missed because
-/// no test reached it.
-#[test]
-fn c99_address_of_a_static_compound_literal() {
-    let src = r#"
-#include <stdio.h>
-#include <string.h>
-
-struct P { int x, y; };
-
-static struct P *gp = &(struct P){1, 2};
-static int *ga = (int[]){10, 20, 30};
-static const char *gs = (const char[]){'h', 'i', 0};
-
-int main(void)
-{
-    if (gp->x != 1 || gp->y != 2) return 1;
-    if (ga[0] != 10 || ga[1] != 20 || ga[2] != 30) return 2;
-    if (strcmp(gs, "hi") != 0) return 3;
-
-    /* Writing through it must work: it is an object, not a constant. */
-    gp->x = 42;
-    if (gp->x != 42) return 5;
-
-    /* The block-scope forms already worked and must keep working. */
-    struct P *lp = &(struct P){7, 8};
-    if (lp->x != 7 || lp->y != 8) return 6;
-    int *la = (int[]){4, 5};
-    if (la[0] != 4 || la[1] != 5) return 7;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("static_compound_literal_addr", src, &[]), 0);
-}
-
-/// A static initializer is converted to the *object's* type, not kept in the
-/// constant's own.
-///
-/// Folding floating constants in global initializers made `int c = 1.0 + 2.0;`
-/// compile, which it should -- but it stored the IEEE bits of 3.0 into a
-/// 4-byte integer, so `c` read back as 1077936128. The mirror case,
-/// `double d = 1 + 2;`, stored the integer 3 into a double and read back as
-/// 1.5e-323. C17 6.7.9p11 converts the initializer as an assignment would.
-#[test]
-fn c99_scalar_initializers_take_the_objects_type() {
-    let code = r#"
-#include <limits.h>
-
-/* Floating constants initializing integer objects: the fraction is
-   discarded (C17 6.3.1.4), it is not reinterpreted. */
-int i_add = 1.0 + 2.0;
-int i_sub = 9.5 - 2.0;
-int i_mul = 2.5 * 2.0;
-int i_div = 7 / 2.0;
-int i_neg = -(1.5 + 2.0);
-long l_wide = 2.9 * 2.0;
-char c_narrow = 65.9;
-_Bool b_from_float = 0.5;
-short s_neg = -3.9;
-
-/* Integer constants initializing floating objects: widened exactly. */
-double d_add = 1 + 2;
-float f_int = 7;
-long double ld_int = -5;
-double d_big = 2147483647;
-
-/* And the same-type cases must not have moved. */
-double d_add_f = 1.0 + 2.0;
-int i_add_i = 1 + 2;
-
-struct S { int i; double d; };
-struct S agg = { 1.0 + 2.0, 1 + 2 };
-int arr[3] = { 1.5, 2.5, 3.5 };
-
-int main(void)
-{
-    if (i_add != 3) return 1;
-    if (i_sub != 7) return 2;
-    if (i_mul != 5) return 3;
-    if (i_div != 3) return 4;
-    if (i_neg != -3) return 5;
-    if (l_wide != 5) return 6;
-    if (c_narrow != 'A') return 7;
-    if (b_from_float != 1) return 8;
-    if (s_neg != -3) return 9;
-
-    if (d_add != 3.0) return 10;
-    if (f_int != 7.0f) return 11;
-    if (ld_int != -5.0L) return 12;
-    if (d_big != 2147483647.0) return 13;
-
-    if (d_add_f != 3.0) return 14;
-    if (i_add_i != 3) return 15;
-
-    if (agg.i != 3 || agg.d != 3.0) return 16;
-    if (arr[0] != 1 || arr[1] != 2 || arr[2] != 3) return 17;
-
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("c99_scalar_initializers_take_the_objects_type", code, &[]),
-        0
-    );
-}
-
-/// The pre-<stddef.h> spelling of offsetof is an integer constant expression.
-///
-/// `(size_t)&((struct S *)0)->member` dereferences nothing -- it is arithmetic
-/// on a null pointer -- so there is no symbol to relocate against and the
-/// whole thing folds to an integer. It used to fold to nothing: the static
-/// initializer silently became zero, and after global initializers started
-/// rejecting what they could not fold, it became a hard error instead.
-#[test]
-fn c99_offsetof_by_null_pointer_is_a_constant() {
-    let code = r#"
-#include <stddef.h>
-
-struct S { int a; double b; char c[8]; struct { int x, y; } n; };
-
-static const size_t off_a = (size_t)&((struct S *)0)->a;
-static const size_t off_b = (size_t)&((struct S *)0)->b;
-static const size_t off_c = (size_t)&((struct S *)0)->c;
-static const size_t off_c2 = (size_t)&((struct S *)0)->c[2];
-static const size_t off_ny = (size_t)&((struct S *)0)->n.y;
-
-/* An integer constant expression is usable as an array bound and a case
-   label, not only as an initializer. */
-static char sized[(size_t)&((struct S *)0)->b];
-
-int pick(int k)
-{
-    switch (k) {
-    case (int)(size_t)&((struct S *)0)->b: return 1;
-    default: return 0;
-    }
-}
-
-int main(void)
-{
-    if (off_a != offsetof(struct S, a)) return 1;
-    if (off_b != offsetof(struct S, b)) return 2;
-    if (off_c != offsetof(struct S, c)) return 3;
-    if (off_c2 != offsetof(struct S, c) + 2) return 4;
-    if (off_ny != offsetof(struct S, n.y)) return 5;
-    if (sizeof(sized) != offsetof(struct S, b)) return 6;
-    if (pick((int)offsetof(struct S, b)) != 1) return 7;
-
-    /* The address of a real object is still a relocation, not an integer. */
-    static int obj[4];
-    static int *p = &obj[2];
-    if (p != &obj[2]) return 8;
-
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("c99_offsetof_by_null_pointer_is_a_constant", code, &[]),
-        0
-    );
-}
-
-/// C17 6.7.9p14: the string literal initializing a character array may be
-/// enclosed in braces, and it still initializes that array -- `char b[] =
-/// {"hi"}` is `char[3]` holding `hi`, not an array of one element.
-///
-/// It was read as an ordinary initializer list, so the element count came out
-/// as 1 and the characters were never copied in: `sizeof b` was 1 and printing
-/// it gave garbage. `(char[]){"hi"}` was empty for the same reason, and an
-/// explicitly-sized `char c[6] = {"hi"}` had the right size with the wrong
-/// contents. Both the size deduction and the store path had the look-through
-/// one level down, for `char names[3][4] = {"Sun", "Mon"}`, and neither had it
-/// at the outermost level.
-///
-/// Every expectation here came from gcc on this source.
-#[test]
-fn c99_string_literal_initializer_may_be_braced() {
-    let code = r#"
-#include <wchar.h>
-
-char sb[] = {"hi"};
-char sc[6] = {"hi"};
-wchar_t sw[] = {L"hi"};
-const char *sp[] = {"aa", "bbb"};
-char nested[3][4] = {"Sun", "Mon", "Tue"};
-struct S { char tag[4]; int n; };
-struct S ss = { {"ab"}, 7 };
-
-int main(void) {
-    char b[] = {"hi"};
-    char c[6] = {"hi"};
-    wchar_t w[] = {L"hi"};
-    char *cl = (char[]){"hi"};
-    struct S as = { {"cd"}, 9 };
-
-    if (sizeof sb != 3 || sb[0] != 'h' || sb[1] != 'i' || sb[2] != 0) return 1;
-    if (sizeof sc != 6 || sc[1] != 'i' || sc[2] != 0 || sc[5] != 0) return 2;
-    if (sizeof sw / sizeof sw[0] != 3 || sw[1] != L'i' || sw[2] != 0) return 3;
-
-    /* An array of pointers is the same shape one level up, and must not be
-       swallowed by the look-through. */
-    if (sizeof sp / sizeof sp[0] != 2 || sp[1][2] != 'b') return 4;
-    if (nested[2][0] != 'T' || nested[0][3] != 0) return 5;
-    if (ss.tag[1] != 'b' || ss.tag[2] != 0 || ss.n != 7) return 6;
-
-    if (sizeof b != 3 || b[0] != 'h' || b[1] != 'i' || b[2] != 0) return 7;
-    if (sizeof c != 6 || c[1] != 'i' || c[2] != 0 || c[5] != 0) return 8;
-    if (sizeof w / sizeof w[0] != 3 || w[1] != L'i' || w[2] != 0) return 9;
-    if (cl[0] != 'h' || cl[1] != 'i' || cl[2] != 0) return 10;
-    if (as.tag[1] != 'd' || as.tag[2] != 0 || as.n != 9) return 11;
-
-    if (sizeof((char[]){"abcd"}) != 5) return 12;
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("c99_string_literal_initializer_may_be_braced", code, &[]),
-        0
-    );
-}
-
-/// C17 6.7.9p14: an array of character type may be exactly as long as the
-/// string literal initializing it, in which case the terminating null is
-/// dropped rather than written. `char b[2] = "hi"` holds two characters.
-///
-/// The store loop wrote the null unconditionally, one byte past the object.
-/// Pre-existing for the unbraced spelling; the braced one reached the same
-/// loop once the two shared a routine.
-#[test]
-fn c99_string_initializer_exactly_fills_its_array() {
-    let code = r#"
-#include <string.h>
-
-char g2[2] = "hi";
-char g3[3] = "hi";
-char gb2[2] = {"hi"};
-
-int main(void) {
-    /* Neighbours on the stack must survive an exactly-sized copy. */
-    char before[4];
-    char b2[2] = "hi";
-    char bb2[2] = {"hi"};
-    char after[4];
-    memset(before, 0x5a, sizeof before);
-    memset(after, 0x5a, sizeof after);
-
-    if (sizeof b2 != 2 || b2[0] != 'h' || b2[1] != 'i') return 1;
-    if (sizeof bb2 != 2 || bb2[0] != 'h' || bb2[1] != 'i') return 2;
-    for (int i = 0; i < 4; i++) {
-        if (before[i] != 0x5a) return 3;
-        if (after[i] != 0x5a) return 4;
-    }
-
-    if (sizeof g2 != 2 || g2[0] != 'h' || g2[1] != 'i') return 5;
-    if (sizeof gb2 != 2 || gb2[0] != 'h' || gb2[1] != 'i') return 6;
-
-    /* One byte longer, so the terminator is written and the rest zeroed. */
-    if (sizeof g3 != 3 || g3[2] != 0) return 7;
-    char b6[6] = "hi";
-    if (sizeof b6 != 6 || b6[2] != 0 || b6[5] != 0) return 8;
-
-    /* And an inferred bound still makes room for it. */
-    char inferred[] = "hi";
-    if (sizeof inferred != 3 || inferred[2] != 0) return 9;
-
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("c99_string_initializer_exactly_fills_its_array", code, &[]),
-        0
-    );
-}
-
-/// A universal character name denotes a *code point*, which the execution
-/// character set then encodes — UTF-8 here. It was returned as if it were a
-/// byte, so `"café"` was the five bytes `caf\xe9` (Latin-1) instead of the
-/// six `caf\xc3\xa9`, and `sizeof` said 5 where gcc says 6.
-///
-/// Fixing that in isolation would have broken the wide encodings, which had
-/// the opposite halves right: a UCN worked there and a character typed
-/// directly in the source did not. The parser sees the literal before escapes
-/// are resolved, so it *can* tell a source byte from one an escape named —
-/// `L"café"` is four wide characters and `L"caf\xc3\xa9"` is five, and only
-/// keeping the two apart gets both right.
-///
-/// Every expectation here came from gcc on this source.
-#[test]
-fn c99_universal_character_names_use_the_execution_encoding() {
-    let code = r#"
-#include <wchar.h>
-/* <uchar.h> does not exist on macOS, and the test needs only the two types. */
-typedef unsigned short char16_t;
-typedef unsigned int char32_t;
-
-int main(void) {
-    /* The same character, reaching the compiler two different ways: as source
-       text, and through the escape scanner. Those are separate code paths --
-       each was once correct for one spelling and wrong for the other -- so
-       every assertion below is made twice, once per spelling. */
-
-    /* Narrow: bytes. */
-    if (sizeof("café") != 6) return 1;
-    if (sizeof("caf\u00e9") != 6) return 2;
-    if ((unsigned char)"café"[3] != 0xc3) return 3;
-    if ((unsigned char)"café"[4] != 0xa9) return 4;
-    if ((unsigned char)"caf\u00e9"[3] != 0xc3) return 5;
-    if ((unsigned char)"caf\u00e9"[4] != 0xa9) return 6;
-    /* A byte escape stays one byte, and is a third path again. */
-    if (sizeof("caf\xc3\xa9") != 6) return 7;
-
-    /* Wide: characters. One element either way. */
-    if (wcslen(L"café") != 4 || L"café"[3] != 233) return 8;
-    if (wcslen(L"caf\u00e9") != 4 || L"caf\u00e9"[3] != 233) return 9;
-    /* But two byte escapes are two elements, not one character. */
-    if (wcslen(L"caf\xc3\xa9") != 5) return 10;
-    if (L"caf\xc3\xa9"[3] != 0xc3 || L"caf\xc3\xa9"[4] != 0xa9) return 11;
-
-    /* char16_t and char32_t behave the same way. */
-    if (u"café"[3] != 233) return 12;
-    if (u"caf\u00e9"[3] != 233) return 13;
-    if (U"café"[3] != 233) return 14;
-    if (U"caf\u00e9"[3] != 233) return 15;
-
-    /* Outside the BMP: char16_t splits into a surrogate pair. */
-    if (u"😀"[0] != 0xd83d || u"😀"[1] != 0xde00) return 16;
-    if (u"\U0001f600"[0] != 0xd83d || u"\U0001f600"[1] != 0xde00) return 17;
-    if (U"😀"[0] != 0x1f600) return 18;
-    if (U"\U0001f600"[0] != 0x1f600) return 19;
-    if (sizeof("😀") != 5) return 20;
-    if (sizeof("\U0001f600") != 5) return 21;
-
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run(
-            "c99_universal_character_names_use_the_execution_encoding",
-            code,
-            &[]
-        ),
-        0
-    );
-}
-
-/// A `char` array *member* initialized from a string literal was written with
-/// Rust's UTF-8 encoding of the parsed literal while its null terminator was
-/// placed by counting characters. For any byte at or above 0x80 the two
-/// disagree: the data runs one byte long and the terminator lands inside it.
-///
-/// `struct { char t[4]; int g; }` initialized with `"\xc2\x80"` wrote
-/// `c3 82 00 80` where gcc writes `c2 80 00 00`. Automatic storage only — the
-/// static path goes through a different routine and was already right, which
-/// is why the existing high-byte test did not catch it.
-#[test]
-fn c99_struct_member_string_initializer_keeps_its_bytes() {
-    let code = r#"
-struct G { char tag[4]; int guard; };
-struct G global = { "\xc2\x80", 0x5a5a5a5a };
-
-int main(void) {
-    struct G g = { "\xc2\x80", 0x5a5a5a5a };
-    if ((unsigned char)g.tag[0] != 0xc2) return 1;
-    if ((unsigned char)g.tag[1] != 0x80) return 2;
-    if (g.tag[2] != 0 || g.tag[3] != 0) return 3;
-    if (g.guard != 0x5a5a5a5a) return 4;
-
-    /* The static path, which was already correct, must stay so. */
-    if ((unsigned char)global.tag[0] != 0xc2) return 5;
-    if ((unsigned char)global.tag[1] != 0x80) return 6;
-    if (global.guard != 0x5a5a5a5a) return 7;
-
-    /* Plain ASCII, unaffected either way. */
-    struct G a = { "ab", 1 };
-    if (a.tag[0] != 'a' || a.tag[1] != 'b' || a.tag[2] != 0 || a.guard != 1) return 8;
-
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run(
-            "c99_struct_member_string_initializer_keeps_its_bytes",
-            code,
-            &[]
-        ),
-        0
-    );
-}
-
-/// An incomplete array's bound comes from the initializer, and with brace
-/// elision one array element consumes as many list elements as it has scalar
-/// fields (C17 6.7.9p20).
-///
-/// The parser's bound deduction counted one array element per list element,
-/// so `int a[][2] = {1,2,3,4}` got four rows instead of two. The values
-/// themselves landed correctly -- the linearizer knows the rule -- so only
-/// `sizeof` was wrong, and every idiomatic `for (i = 0; i < sizeof a /
-/// sizeof a[0]; i++)` walked twice as far as the object.
-#[test]
-fn c99_brace_elision_decides_the_deduced_array_bound() {
-    let code = r#"
-struct P { int x, y; };
-struct Q { int a; struct P p; };
-
-/* Elided braces: several scalars per element. */
-int   e1[][2]  = {1,2,3,4};
-int   e2[][3]  = {1,2,3,4};          /* partial final row */
-int   e3[][2]  = {1,2,3,4,5};        /* partial final row */
-struct P e4[]  = {1,2,3,4};
-struct Q e5[]  = {1,2,3,4,5,6};      /* three scalars each */
-
-/* Explicit braces: one element each -- these were always right. */
-int   b1[][2]  = {{1,2},{3,4}};
-struct P b2[]  = {{1,2},{3,4}};
-char  b3[][4]  = {"ab","cd"};
-
-/* A designator still places elements where it says. */
-int   d1[]     = {[3] = 4, [1] = 2};
-
-int main(void) {
-    if (sizeof e1 / sizeof e1[0] != 2) return 1;
-    if (e1[0][0] != 1 || e1[0][1] != 2) return 2;
-    if (e1[1][0] != 3 || e1[1][1] != 4) return 3;
-
-    if (sizeof e2 / sizeof e2[0] != 2) return 4;
-    if (e2[1][0] != 4 || e2[1][1] != 0 || e2[1][2] != 0) return 5;
-
-    if (sizeof e3 / sizeof e3[0] != 3) return 6;
-    if (e3[2][0] != 5 || e3[2][1] != 0) return 7;
-
-    if (sizeof e4 / sizeof e4[0] != 2) return 8;
-    if (e4[1].x != 3 || e4[1].y != 4) return 9;
-
-    if (sizeof e5 / sizeof e5[0] != 2) return 10;
-    if (e5[1].a != 4 || e5[1].p.x != 5 || e5[1].p.y != 6) return 11;
-
-    if (sizeof b1 / sizeof b1[0] != 2) return 12;
-    if (sizeof b2 / sizeof b2[0] != 2) return 13;
-    if (sizeof b3 / sizeof b3[0] != 2) return 14;
-    if (b3[1][0] != 'c') return 15;
-
-    if (sizeof d1 / sizeof d1[0] != 4) return 16;
-    if (d1[3] != 4 || d1[1] != 2 || d1[0] != 0) return 17;
-
-    /* The same rule at block scope. */
-    {
-        int l1[][2] = {1,2,3,4};
-        struct P l2[] = {1,2,3,4};
-        if (sizeof l1 / sizeof l1[0] != 2) return 18;
-        if (sizeof l2 / sizeof l2[0] != 2) return 19;
-        if (l1[1][1] != 4 || l2[1].y != 4) return 20;
-    }
-
-    /* An array of scalars is unaffected. */
-    {
-        int s[] = {1,2,3,4,5};
-        if (sizeof s / sizeof s[0] != 5) return 21;
-    }
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("c99_brace_elision_deduced_bound", code, &[]),
-        0
-    );
-}
-
-/// GNU designated-initializer ranges: `[lo ... hi] = v`.
-///
-/// The second-most-used extension c17 rejected — 357 files in the Linux tree,
-/// 82 in mesa, 5 in CPython. Both endpoints are inclusive; the positional
-/// cursor resumes past the *high* one, so `{[0 ... 2] = 1, 9}` puts 9 at index
-/// 3. A later range overwrites an earlier overlapping one.
-///
-/// The rule lives in two independent places — the initializer grouping and the
-/// array-size inference used for `int a[] = {...}` — and both are exercised
-/// here, because the tree already records a bug born of exactly that split.
-#[test]
-fn c99_designated_init_ranges() {
-    let code = r#"
-/* Static storage: the data-image path. */
-int basic[8]      = {[0 ... 3] = 7};
-int two[8]        = {[0 ... 3] = 1, [4 ... 7] = 2};
-int overlap[8]    = {[0 ... 5] = 1, [3 ... 7] = 2};
-int then_pos[8]   = {[0 ... 2] = 1, 9};
-int single[4]     = {[1 ... 1] = 5};
-int inferred[]    = {[0 ... 3] = 1};
-char chars[8]     = {[0 ... 6] = 65};
-
-struct P { int x, y; };
-struct P structs[4] = {[0 ... 2] = {1, 2}};
-
-struct V { int v[4]; };
-struct V nested = {.v = {[1 ... 2] = 8}};
-
-int main(void)
-{
-    if (basic[0] != 7 || basic[3] != 7) return 1;
-    if (basic[4] != 0 || basic[7] != 0) return 2;
-
-    if (two[0] != 1 || two[3] != 1 || two[4] != 2 || two[7] != 2) return 3;
-
-    /* A later range wins over an earlier one where they overlap. */
-    if (overlap[2] != 1 || overlap[3] != 2 || overlap[7] != 2) return 4;
-
-    /* The cursor resumes past the high endpoint. */
-    if (then_pos[2] != 1 || then_pos[3] != 9 || then_pos[4] != 0) return 5;
-
-    if (single[1] != 5 || single[0] != 0 || single[2] != 0) return 6;
-
-    /* Array size inferred from the range's high endpoint. */
-    if (sizeof inferred / sizeof inferred[0] != 4) return 7;
-    if (inferred[3] != 1) return 8;
-
-    if (chars[0] != 65 || chars[6] != 65 || chars[7] != 0) return 9;
-
-    if (structs[0].x != 1 || structs[2].y != 2) return 10;
-    if (structs[3].x != 0 || structs[3].y != 0) return 11;
-
-    if (nested.v[0] != 0 || nested.v[1] != 8 || nested.v[2] != 8 || nested.v[3] != 0) return 12;
-
-    /* Automatic storage: the runtime-store path, which must agree. */
-    {
-        int a[8] = {[0 ... 3] = 7};
-        int b[8] = {[0 ... 2] = 1, 9};
-        int c[8] = {[0 ... 5] = 1, [3 ... 7] = 2};
-        if (a[0] != 7 || a[3] != 7 || a[4] != 0) return 13;
-        if (b[2] != 1 || b[3] != 9 || b[4] != 0) return 14;
-        if (c[2] != 1 || c[3] != 2 || c[7] != 2) return 15;
-
-        struct P p[4] = {[0 ... 2] = {1, 2}};
-        if (p[2].y != 2 || p[3].y != 0) return 16;
-    }
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("designated_init_ranges", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("designated_init_ranges_opt", code),
-        0
-    );
-}
-
-/// A conditional in a static initializer is folded rather than emitted, so its
-/// condition is decided at compile time -- and that test used to be
-/// integer-only, which rejected every constant condition that is not an
-/// integer.
-#[test]
-fn c99_global_initializer_folds_non_integer_conditions() {
-    let code = r#"
-int arr[4];
-int fn(void) { return 9; }
-int obj;
-
-/* A string literal has storage of its own, so its address is never null. */
-static const char *g = "a" ?: "b";
-/* A floating constant is a constant condition too, and 1.5 is not zero. */
-static double d = 1.5 ?: 2.5;
-static double dz = 0.0 ? 1.5 : 2.5;
-/* An array and a function decay to addresses, which are never null. */
-static int *pa = arr ?: 0;
-static int (*pf)(void) = fn ?: 0;
-static int *po = &obj ?: 0;
-/* The integer path that already worked, kept as the control. */
-static int i = 0 ?: 7;
-
-int main(void) {
-    if (g[0] != 'a') return 1;
-    if (d != 1.5) return 2;
-    if (dz != 2.5) return 3;
-    if (pa != arr) return 4;
-    if (pf != fn) return 5;
-    if (po != &obj) return 6;
-    if (i != 7) return 7;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("global_init_cond", code, &[]), 0);
-}
-
-/// The same path's rejection: a condition that really is not constant is an
-/// error, reported at the expression rather than at line 0, and naming the
-/// mistake rather than dumping the AST.
-#[test]
-fn c99_global_initializer_rejects_non_constant_condition() {
-    let dir = plib::tmp::tempdir().unwrap();
-    let src = dir.path().join("nc.c");
-    std::fs::write(&src, "int obj;\nstatic int bad = obj ?: 1;\n").unwrap();
-
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_c17"))
-        .args(["-c", src.to_str().unwrap(), "-o"])
-        .arg(dir.path().join("nc.o"))
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-
-    assert!(!out.status.success(), "expected a rejection: {}", stderr);
-    assert!(
-        stderr.contains("is not a constant expression"),
-        "expected the shared wording: {}",
-        stderr
-    );
-    assert!(
-        stderr.contains("nc.c:2:"),
-        "expected the expression's own line, not line 0: {}",
-        stderr
-    );
-    assert!(
-        !stderr.contains("ExprKind") && !stderr.contains("Ident("),
-        "expected no AST dump: {}",
-        stderr
-    );
-}
-
-/// A string literal longer than the object it initializes is truncated, not
-/// written past the end.
-///
-/// gcc accepts the over-long form with a warning and keeps only what fits.
-/// c17 emitted the whole literal, so the excess landed on whatever came
-/// next: with `const char a[2][3] = { "1234", "xyz" };` the stray `4`
-/// overwrote the second row, and `struct { char n[3]; int tag; } s =
-/// { "wxyz", 7 };` pushed `tag` one byte along, reading back 1792 instead
-/// of 7.
-///
-/// The wide variants had the same defect, plus one of their own: the null
-/// terminator is part of the value only when there is room for it, so
-/// `wchar_t w[3] = L"abc"` holds three characters and no terminator.
-///
-/// The torture test is `pr86714`, which only reaches the narrow array case.
-#[test]
-fn c99_over_long_string_initializer_is_truncated() {
-    let code = r#"
-typedef __WCHAR_TYPE__ wch;
-typedef __CHAR16_TYPE__ c16;
-typedef __CHAR32_TYPE__ c32;
-
-struct S { char n[3]; int tag; };
-struct WS { wch n[3]; int tag; };
-struct US { c16 n[2]; int tag; };
-struct TS { c32 n[2]; int tag; };
-
-/* Narrow: an over-long row must not reach the next one. */
-const char rows[2][3] = { "1234", "xyz" };
-const char one[3] = "12345";
-const char tight[3] = "abc";          /* exactly fills, no terminator */
-const char roomy[2][4] = { "abc", "def" };   /* the ordinary case */
-const struct S s = { "wxyz", 7 };
-
-wch w_room[4] = L"abc";
-wch w_tight[3] = L"abc";
-wch w_over[2] = L"abcd";
-const struct WS ws = { L"abcd", 9 };
-
-c16 u16_tight[3] = u"abc";
-c16 u16_over[2] = u"abcd";
-const struct US us = { u"abcd", 5 };
-
-c32 u32_tight[3] = U"abc";
-const struct TS ts = { U"abcd", 6 };
-
-int main(void) {
-    if (rows[0][0] != '1' || rows[0][1] != '2' || rows[0][2] != '3') return 1;
-    if (rows[1][0] != 'x' || rows[1][1] != 'y' || rows[1][2] != 'z') return 2;
-    if (one[0] != '1' || one[1] != '2' || one[2] != '3') return 3;
-    if (tight[0] != 'a' || tight[1] != 'b' || tight[2] != 'c') return 4;
-    if (roomy[0][0] != 'a' || roomy[0][3] != '\0') return 5;
-    if (roomy[1][0] != 'd' || roomy[1][3] != '\0') return 6;
-    if (s.n[0] != 'w' || s.n[1] != 'x' || s.n[2] != 'y') return 7;
-    if (s.tag != 7) return 8;
-
-    /* Wide: the terminator only when it fits. */
-    if (w_room[0] != L'a' || w_room[2] != L'c' || w_room[3] != 0) return 9;
-    if (w_tight[0] != L'a' || w_tight[1] != L'b' || w_tight[2] != L'c') return 10;
-    if (w_over[0] != L'a' || w_over[1] != L'b') return 11;
-    if (ws.n[0] != L'a' || ws.n[2] != L'c' || ws.tag != 9) return 12;
-
-    if (u16_tight[0] != u'a' || u16_tight[2] != u'c') return 13;
-    if (u16_over[0] != u'a' || u16_over[1] != u'b') return 14;
-    if (us.n[0] != u'a' || us.n[1] != u'b' || us.tag != 5) return 15;
-
-    if (u32_tight[0] != U'a' || u32_tight[2] != U'c') return 16;
-    if (ts.n[0] != U'a' || ts.n[1] != U'b' || ts.tag != 6) return 17;
-
-    /* The same shapes as automatic and static-local objects, which take
-       their own emission paths. */
-    {
-        char a[2][3] = { "1234", "xyz" };
-        if (a[0][2] != '3' || a[1][0] != 'x') return 18;
-        struct S ls = { "wxyz", 7 };
-        if (ls.n[2] != 'y' || ls.tag != 7) return 19;
-    }
-    {
-        static char a[2][3] = { "1234", "xyz" };
-        if (a[0][2] != '3' || a[1][0] != 'x') return 20;
-        static struct S ls = { "wxyz", 7 };
-        if (ls.n[2] != 'y' || ls.tag != 7) return 21;
-    }
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("c99_over_long_string_init", code, &[]), 0);
-    assert_eq!(
-        compile_and_run("c99_over_long_string_init_o2", code, &["-O2".to_string()]),
-        0
-    );
-}
-
-/// A union's first member for a positional initializer may be an anonymous
-/// aggregate.
-///
-/// C17 6.7.9p17 initializes a union's first member, and 6.7.2.1p13 makes the
-/// members of an anonymous structure members of the union itself -- so the
-/// anonymous structure *is* that first member. c17 searched for the first
-/// member with a *name* and so skipped it:
-///
-///   union { struct { int a, b; }; long q; } u = {{1,2}};
-///
-/// wrote `{1,2}` into `q` and left `b` zero, and a union whose members are
-/// all anonymous found none at all and stayed entirely zero -- which is the
-/// torture test `pr87053`, where two anonymous structures overlay the same
-/// eight bytes.
-#[test]
-fn c99_union_first_member_may_be_anonymous() {
-    let code = r#"
-/* Two anonymous structures over the same bytes: the first one initializes,
-   and the second must read what it wrote. */
-const union {
-    struct { char x[4]; char y[4]; };
-    struct { char z[8]; };
-} overlay = {{"1234", "567"}};
-
-/* An anonymous structure ahead of a named member. */
-union AB { struct { int a; int b; }; long q; } ab = {{1, 2}};
-/* The designated spelling, which already worked, must keep working. */
-union AB ab_desig = {.a = 3, .b = 4};
-union AB ab_other = {.q = 5};
-/* A named first member is unchanged. */
-union NM { struct { int a; int b; } s; long q; } nm = {{6, 7}};
-/* A plain union, and an anonymous union inside a struct. */
-union P { int i; long q; } p = {8};
-struct WithAnon { struct { int a; int b; }; int t; } wa = {{9, 10}, 11};
-/* An unnamed bit-field must still be skipped, not chosen. */
-union BF { unsigned : 3; int v; } bf = {12};
-
-int main(void) {
-    if (sizeof(overlay) != 8) return 1;
-    if (overlay.x[0] != '1' || overlay.x[3] != '4') return 2;
-    if (overlay.y[0] != '5' || overlay.y[2] != '7') return 3;
-    if (overlay.z[0] != '1' || overlay.z[6] != '7' || overlay.z[7] != '\0') return 4;
-    if (__builtin_strlen(overlay.z) != 7) return 5;
-
-    if (ab.a != 1 || ab.b != 2) return 6;
-    if (ab_desig.a != 3 || ab_desig.b != 4) return 7;
-    if (ab_other.q != 5) return 8;
-    if (nm.s.a != 6 || nm.s.b != 7) return 9;
-    if (p.i != 8) return 10;
-    if (wa.a != 9 || wa.b != 10 || wa.t != 11) return 11;
-    if (bf.v != 12) return 12;
-
-    /* The same shapes as automatic and static-local objects. */
-    {
-        union AB l = {{13, 14}};
-        if (l.a != 13 || l.b != 14) return 13;
-        static union AB s = {{15, 16}};
-        if (s.a != 15 || s.b != 16) return 14;
-    }
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("c99_union_anon_first", code, &[]), 0);
-    assert_eq!(
-        compile_and_run("c99_union_anon_first_o2", code, &["-O2".to_string()]),
-        0
-    );
-}
-
-/// GNU's obsolete field designator, `fieldname: value`.
-///
-/// It predates C99's `.fieldname = value`; gcc still accepts it under
-/// `-Wdeprecated` and glibc-era sources use it. One token of lookahead
-/// settles the form: inside an initializer list an identifier followed by `:`
-/// cannot be anything else, because a conditional starts `x ?` and a label
-/// cannot appear there.
-///
-/// Four torture tests need it: `20030408-1`, `991228-1`, `compndlit-1` and
-/// `struct-ini-4`.
-#[test]
-fn c99_gnu_colon_field_designator() {
-    let code = r#"
-extern int printf(const char *, ...);
-
-struct s { int a[3]; int c[3]; };
-struct s g1 = { c: {1, 2, 3} };
-
-__extension__ union U { double d; int i[2]; } u = { d: -0.25 };
-
-struct P { int a, b, c; };
-struct P g2 = { b: 5, a: 6, c: 7 };
-/* Mixed with the C99 spelling in one list. */
-struct P g3 = { .b = 5, a: 6, c: 7 };
-/* Nested, at both levels. */
-struct Q { int x; struct P p; };
-struct Q g4 = { x: 1, p: { a: 2, b: 3, c: 4 } };
-/* An array of structs, reached through an index designator. */
-struct P g5[2] = { [1] = { a: 8, c: 9 } };
-
-int main(void) {
-    /* The designated member is set and the others stay zero. */
-    if (g1.c[0] != 1 || g1.c[1] != 2 || g1.c[2] != 3) return 1;
-    if (g1.a[0] != 0 || g1.a[1] != 0 || g1.a[2] != 0) return 2;
-
-    if (u.d != -0.25) return 3;
-
-    if (g2.a != 6 || g2.b != 5 || g2.c != 7) return 4;
-    if (g3.a != 6 || g3.b != 5 || g3.c != 7) return 5;
-    if (g4.x != 1 || g4.p.a != 2 || g4.p.b != 3 || g4.p.c != 4) return 6;
-    if (g5[0].a != 0 || g5[1].a != 8 || g5[1].b != 0 || g5[1].c != 9) return 7;
-
-    /* An automatic object and a compound literal take the same path. */
-    {
-        struct P l = { c: 9, a: 8 };
-        if (l.a != 8 || l.b != 0 || l.c != 9) return 8;
-        struct P cl = (struct P){ b: 1, a: 2, c: 3 };
-        if (cl.a != 2 || cl.b != 1 || cl.c != 3) return 9;
-    }
-    /* A conditional in an initializer must still parse as one. */
-    {
-        int k = 1;
-        struct P q = { k ? 4 : 5, 6, 7 };
-        if (q.a != 4 || q.b != 6 || q.c != 7) return 10;
-    }
-    /* And the C99 spelling on its own is untouched. */
-    {
-        struct P r = { .c = 11, .a = 12 };
-        if (r.a != 12 || r.b != 0 || r.c != 11) return 11;
-    }
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("c99_gnu_colon_designator", code, &[]), 0);
-    assert_eq!(
-        compile_and_run("c99_gnu_colon_designator_o2", code, &["-O2".to_string()]),
-        0
-    );
-}
-
-// A static initializer is evaluated at the precision of its operands' own
-// type. A `long double` constant carries 64 significand bits on x86-64 and
-// 113 on aarch64 Linux, so each value below is exact in both -- and was read
-// off gcc on both. They came out rounded to `double`: the float-to-integer
-// conversion and the complex arithmetic both went through `f64`. Apple
-// arm64's `long double` is `double`, where each sum rounds to its leading
-// term, so what is expected is the exact value in a wide `long double` and
-// that rounding in a `double` one.
-const LONG_DOUBLE_STATIC_INIT_PROGRAM: &str = r#"
-static long long a = 0x1p62L + 1.0L;
-static unsigned long long b = 0x1p63L + 3.0L;
-static long long c = -0x1p62L - 5.0L;
-static long double _Complex z = (1.0L + 0x1p-60L) + 2.0iL;
-static long double _Complex w = (1.0L + 0x1p-60L) * (1.0L + 1.0iL);
-static long double _Complex q = (2.0L + 0x1p-59L) / 2.0L;
-static long double _Complex s = (1.0L + 1.0iL) - 0x1p-60L;
-#define WIDE (__LDBL_MANT_DIG__ > 53)
-#define T60 (WIDE ? 0x1p-60L : 0.0L)
-int main(void) {
-    if (a != 4611686018427387904LL + WIDE) return 1;
-    if (b != 9223372036854775808ULL + 3 * WIDE) return 2;
-    if (c != -4611686018427387904LL - 5 * WIDE) return 3;
-    if (__real__ z - 1.0L != T60 || __imag__ z != 2.0L) return 4;
-    if (__real__ w - 1.0L != T60 || __imag__ w - 1.0L != T60) return 5;
-    if (__real__ q - 1.0L != T60 || __imag__ q != 0.0L) return 6;
-    if (1.0L - __real__ s != T60 || __imag__ s != 1.0L) return 7;
-    return 0;
-}
-"#;
-
-#[test]
-fn c99_long_double_static_initializers_keep_their_precision() {
-    assert_eq!(
-        compile_and_run("ld_static_init", LONG_DOUBLE_STATIC_INIT_PROGRAM, &[]),
-        0
-    );
-    if let Some(rc) =
-        compile_and_run_aarch64("ld_static_init_a64", LONG_DOUBLE_STATIC_INIT_PROGRAM, "-O0")
-    {
-        assert_eq!(rc, 0);
-    }
-}
-
-// The same expressions as above, and a few more, evaluated at run time from
-// `volatile` operands: a static initializer is folded by the compiler and an
-// automatic one computed by the program, and the two must agree, bit for
-// bit, on both targets. Complex `*` and `/` run through libgcc's `__mul?c3`
-// and `__div?c3`, which is what the fold models.
-const LONG_DOUBLE_FOLD_MATCHES_RUNTIME_PROGRAM: &str = r#"
-static long long a = 0x1p62L + 1.0L;
-static unsigned long long b = 0x1p63L + 3.0L;
-static long long c = -0x1p62L - 5.0L;
-static long double _Complex z = (1.0L + 0x1p-60L) + 2.0iL;
-static long double _Complex w = (1.0L + 0x1p-60L) * (1.0L + 1.0iL);
-static long double _Complex q = (2.0L + 0x1p-59L) / 2.0L;
-static long double _Complex s = (1.0L + 1.0iL) - 0x1p-60L;
-static long double _Complex r = (1.0L + 0x1p-60L + 1.0iL) / (1.0L + 1.0iL);
-static long double _Complex m = (3.0L + 0x1p-58L + 5.0iL) * (7.0L - 0x1p-57iL);
-static long double _Complex d = (3.0L + 0x1p-58L + 5.0iL) / (7.0L - 2.0iL);
-static _Complex int iq = (-9 + 38i) / (5 + 6i);
-
-/* The halves compared as C compares them, and their signs as well. */
-static int same(long double _Complex x, long double _Complex y) {
-    return __real__ x == __real__ y && __imag__ x == __imag__ y
-        && __builtin_signbit(__real__ x) == __builtin_signbit(__real__ y)
-        && __builtin_signbit(__imag__ x) == __builtin_signbit(__imag__ y);
-}
-
-int main(void) {
-    volatile long double one = 1.0L, two = 2.0L, three = 3.0L, seven = 7.0L;
-    volatile long double p62 = 0x1p62L, p63 = 0x1p63L, t58 = 0x1p-58L, t60 = 0x1p-60L;
-    volatile long double t59 = 0x1p-59L, t57 = 0x1p-57L;
-    volatile long double _Complex i = 1.0iL;
-
-    long long ra = p62 + one;
-    unsigned long long rb = p63 + 3.0L;
-    long long rc = -p62 - 5.0L;
-    if (a != ra) return 1;
-    if (b != rb) return 2;
-    if (c != rc) return 3;
-
-    if (!same(z, (one + t60) + two * i)) return 4;
-    if (!same(w, (one + t60) * (one + i))) return 5;
-    if (!same(q, (two + t59) / (long double _Complex)two)) return 6;
-    if (!same(s, (one + i) - t60)) return 7;
-    if (!same(r, (one + t60 + i) / (one + i))) return 8;
-    if (!same(m, (three + t58 + 5.0L * i) * (seven - t57 * i))) return 9;
-    /* Apple's `__divdc3` is compiler-rt's, which scales by `logb` where
-       libgcc's divides by Smith's method; c17 models both and folds as the
-       target's own routine computes, so the two agree here too. */
-    if (!same(d, (three + t58 + 5.0L * i) / (seven - two * i))) return 10;
-
-    volatile _Complex int n = -9 + 38i, e = 5 + 6i;
-    _Complex int rq = n / e;
-    if (__real__ iq != __real__ rq || __imag__ iq != __imag__ rq) return 11;
-    return 0;
-}
-"#;
-
-#[test]
-fn c99_long_double_static_initializers_match_run_time_evaluation() {
-    assert_eq!(
-        compile_and_run(
-            "ld_fold_vs_runtime",
-            LONG_DOUBLE_FOLD_MATCHES_RUNTIME_PROGRAM,
-            &[]
-        ),
-        0
-    );
-    if let Some(rc) = compile_and_run_aarch64(
-        "ld_fold_vs_runtime_a64",
-        LONG_DOUBLE_FOLD_MATCHES_RUNTIME_PROGRAM,
-        "-O0",
-    ) {
-        assert_eq!(rc, 0);
-    }
-}
-
-// Complex constants in the scalar shapes a static initializer can take. Each
-// value is gcc's, on both targets. `(_Complex float)(0.5) == 0.5` is
-// gcc.c-torture compile/pr30433.
-const COMPLEX_SCALAR_STATIC_INIT_PROGRAM: &str = r#"
-int f = (_Complex float)(0.5) == 0.5;
-int f2 = (1.0 + 2.0i) != (1.0 + 2.0i);
-int f3 = (1.0f + 2.0fi) == (1.0L + 2.0iL);
-int f4 = 3 == (3 + 0i);
-int f5 = (0.1f + 0i) == 0.1;
-int f6 = __builtin_complex(__builtin_nan(""), 0.0) == __builtin_complex(__builtin_nan(""), 0.0);
-double r1 = __real__ (1.5 + 2.5i);
-double r2 = __imag__ (1.5 + 2.5i);
-int r3 = __real__ (3 + 4i);
-int r4 = __imag__ (3 + 4i);
-double r5 = __imag__ 2.5;
-int n1 = !(0.0 + 0.0i);
-int n2 = !(0.0 + 1.0i);
-int n3 = !0.5;
-int l1 = (0.0 + 1.0i) && 1;
-int l2 = (0.0 + 0.0i) || 0.5;
-int c1 = (0.0 + 1.0i) ? 7 : 8;
-int c2 = (0.0 + 0.0i) ? 7 : 8;
-double k1 = (double)(1.5 + 2.5i);
-int k2 = (int)(3.75 + 2.5i);
-_Bool k3 = (_Bool)(0.0 + 1.0i);
-_Bool k4 = (_Bool)(0.0 + 0.0i);
-double k5 = 1.25 + 2.0i;
-int k6 = 3.75 + 2.5i;
-float k8 = (float)(0x1p-30L + 1.0L + 1.0iL);
-long long k9 = (long long)(0x1p62L + 1.0L + 1.0iL);
-int k10 = (int)(5 + 6i);
-double k11 = (double)(5 + 6i);
-_Complex double k12 = (_Complex double)(3 + 4i);
-double q1 = (1 ? 2.5 : 3) * 2;
-_Complex double q2 = 0 ? 1.0 : (2.0 + 3.0i);
-
-int main(void) {
-    if (f != 1 || f2 != 0 || f3 != 1 || f4 != 1 || f5 != 0 || f6 != 0) return 1;
-    if (r1 != 1.5 || r2 != 2.5 || r3 != 3 || r4 != 4 || r5 != 0.0) return 2;
-    if (n1 != 1 || n2 != 0 || n3 != 0 || l1 != 1 || l2 != 1) return 3;
-    if (c1 != 7 || c2 != 8) return 4;
-    if (k1 != 1.5 || k2 != 3 || k3 != 1 || k4 != 0 || k5 != 1.25 || k6 != 3) return 5;
-    /* 2^62 + 1 is exact in a wide long double, and 2^62 in Apple's. */
-    if (k8 != 1.0f || k9 != 4611686018427387904LL + (__LDBL_MANT_DIG__ > 53)) return 6;
-    if (k10 != 5 || k11 != 5.0) return 6;
-    if (__real__ k12 != 3.0 || __imag__ k12 != 4.0) return 7;
-    if (q1 != 5.0 || __real__ q2 != 2.0 || __imag__ q2 != 3.0) return 8;
-    return 0;
-}
-"#;
-
-#[test]
-fn c99_complex_constants_in_scalar_static_initializers() {
-    assert_eq!(
-        compile_and_run(
-            "complex_scalar_init",
-            COMPLEX_SCALAR_STATIC_INIT_PROGRAM,
-            &[]
-        ),
-        0
-    );
-    if let Some(rc) = compile_and_run_aarch64(
-        "complex_scalar_init_a64",
-        COMPLEX_SCALAR_STATIC_INIT_PROGRAM,
-        "-O0",
-    ) {
-        assert_eq!(rc, 0);
-    }
-}
-
-/// An excess array initializer is discarded, not written past the object.
-///
-/// C17 6.7.9p2 makes more initializers than elements a constraint violation;
-/// c17 already diagnoses it. The grouping pass never bounded its element
-/// cursor by the array size, so the extra value was still stored -- one element
-/// past the end, on top of whatever the frame put there. `int x[2] = {7, 8};`
-/// followed by `int a[2] = {1, 2, 3};` read back `x = {3, 8}`.
-#[test]
-fn c99_excess_array_initializers_do_not_write_past_the_object() {
-    let code = r#"
-int main(void)
-{
-    int x[2] = {7, 8};
-    int a[2] = {1, 2, 3};
-    if (a[0] != 1 || a[1] != 2) return 1;
-    if (x[0] != 7 || x[1] != 8) return 2;
-
-    /* Several excess elements, and a designator that jumps back first.
-       C17 6.7.9p17: a positional initializer after a designator resumes at
-       the next subobject, so after `[0] = 1` the cursor is at index 1 and the
-       9 overrides the earlier 2. Only the 10 and 11 are excess. Confirmed
-       against clang, which warns -Winitializer-overrides on the 9. */
-    short y[2] = {5, 6};
-    short b[2] = {[1] = 2, [0] = 1, 9, 10, 11};
-    if (b[0] != 1 || b[1] != 9) return 3;
-    if (y[0] != 5 || y[1] != 6) return 4;
-
-    /* The bound is on the index, not on the count. Here the array has three
-       elements and the initializer list has two, so a count-based rule keeps
-       the 1 -- but it resumes after `[2]`, i.e. at index 3, and is excess.
-       clang gives {0,0,3}. */
-    int guard_before[2] = {11, 12};
-    int d[3] = {[2] = 3, 1};
-    int guard_after[2] = {13, 14};
-    if (d[0] != 0 || d[1] != 0 || d[2] != 3) return 10;
-    if (guard_before[0] != 11 || guard_before[1] != 12) return 11;
-    if (guard_after[0] != 13 || guard_after[1] != 14) return 12;
-
-    /* A nested array: the excess belongs to the inner object. */
-    int z[2] = {8, 9};
-    int c[2][2] = {{1, 2, 3}, {4, 5}};
-    if (c[0][0] != 1 || c[0][1] != 2) return 5;
-    if (c[1][0] != 4 || c[1][1] != 5) return 6;
-    if (z[0] != 8 || z[1] != 9) return 7;
-
-    /* A char array from a string literal that does not fit: C17 6.7.9p14
-       allows exactly the terminator to be dropped, nothing more. */
-    char w[2] = {'a', 'b'};
-    char s[3] = "hello";
-    if (s[0] != 'h' || s[1] != 'e' || s[2] != 'l') return 8;
-    if (w[0] != 'a' || w[1] != 'b') return 9;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("excess_array_init", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("excess_array_init_opt", code), 0);
-}
-
-/// The static form of the same defect: the emitted object is exactly as wide
-/// as the array declares.
-///
-/// `int garr[2] = {1, 2, 3};` emitted three `.long`s under an eight-byte
-/// object, so the next symbol in the section absorbed the third.
-#[test]
-fn c99_excess_static_array_initializers_do_not_widen_the_object() {
-    let code = r#"
-int garr[2] = {1, 2, 3};
-int after = 42;
-short garr2[2] = {[1] = 2, [0] = 1, 9, 10};
-short after2 = 7;
-/* Bounded by index, not by count -- see the automatic case. */
-int garr3[3] = {[2] = 3, 1};
-int after3 = 5;
-
-int main(void)
-{
-    if (garr[0] != 1 || garr[1] != 2) return 1;
-    if (after != 42) return 2;
-    if (garr2[0] != 1 || garr2[1] != 9) return 3;
-    if (after2 != 7) return 4;
-    if (garr3[0] != 0 || garr3[1] != 0 || garr3[2] != 3) return 5;
-    if (after3 != 5) return 6;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("excess_static_array_init", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("excess_static_array_init_opt", code),
-        0
-    );
-}
-
-/// A string literal initializing a nested array element, in every encoding.
-///
-/// `is_string_for_char_array` accepts all four literal kinds, but the body that
-/// consumed them handled only the narrow one and silently `continue`d on the
-/// rest, so a wide element was dropped and left zero. The same loop stepped the
-/// destination by *bytes* while a wide element is 2 or 4 bytes wide, and it had
-/// no capacity clamp at all — a third hand-rolled copy of what
-/// `store_string_units` already does correctly for the non-nested form.
-///
-/// The static twin of each case was already right, which is how the two paths
-/// could disagree: `static wchar_t sw[2][4] = {L"ab", L"cd"}` read back 97/99
-/// while the automatic form read back 0/0.
-#[test]
-fn c99_a_nested_string_literal_element_is_stored_in_every_encoding() {
-    let code = r#"
-#include <wchar.h>
-/* <uchar.h> does not exist on macOS, and the test needs only the two types --
-   the same substitution the universal-character-name test above makes. */
-typedef unsigned short char16_t;
-typedef unsigned int char32_t;
-
-int main(void)
-{
-    /* Narrow, and the tail of a short element must be zero. */
-    char n[2][4] = {"ab", "cd"};
-    if (n[0][0] != 'a' || n[0][1] != 'b' || n[0][2] != 0 || n[0][3] != 0) return 1;
-    if (n[1][0] != 'c' || n[1][1] != 'd' || n[1][2] != 0 || n[1][3] != 0) return 2;
-
-    /* Wide: dropped entirely before the fix. */
-    wchar_t w[2][4] = {L"ab", L"cd"};
-    if ((int)w[0][0] != 'a' || (int)w[0][1] != 'b' || w[0][2] != 0) return 3;
-    if ((int)w[1][0] != 'c' || (int)w[1][1] != 'd' || w[1][2] != 0) return 4;
-
-    char16_t u[2][4] = {u"ab", u"cd"};
-    if ((int)u[0][0] != 'a' || (int)u[1][0] != 'c' || u[0][2] != 0) return 5;
-
-    char32_t U[2][4] = {U"ab", U"cd"};
-    if ((int)U[0][0] != 'a' || (int)U[1][0] != 'c' || U[0][2] != 0) return 6;
-
-    /* The static path was always correct; the two must now agree. */
-    static wchar_t sw[2][4] = {L"ab", L"cd"};
-    if ((int)sw[0][0] != 'a' || (int)sw[1][0] != 'c') return 7;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("nested_string_encodings", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("nested_string_encodings_opt", code),
-        0
-    );
-}
-
-/// A string literal too long for the array it initializes writes only as much
-/// as fits.
-///
-/// C17 6.7.9p14 allows exactly the terminating NUL to be dropped, and nothing
-/// more. The nested-array path had no clamp, so `char s[1][3] = {"hello"}`
-/// stored five bytes into a three-byte object — two of them past the whole
-/// local, not merely into the next row. The guards on either side are what make
-/// that visible rather than layout-dependent.
-#[test]
-fn c99_an_overlong_string_literal_does_not_write_past_its_array() {
-    let code = r#"
-int main(void)
-{
-    unsigned char lo = 0xA5;
-    char s[1][3] = {"hello"};
-    unsigned char hi = 0x5A;
-    if (s[0][0] != 'h' || s[0][1] != 'e' || s[0][2] != 'l') return 1;
-    if (lo != 0xA5 || hi != 0x5A) return 2;
-
-    /* Exactly the terminator dropped: this is legal and keeps all three. */
-    unsigned char lo2 = 0xA5;
-    char e[1][3] = {"abc"};
-    unsigned char hi2 = 0x5A;
-    if (e[0][0] != 'a' || e[0][1] != 'b' || e[0][2] != 'c') return 3;
-    if (lo2 != 0xA5 || hi2 != 0x5A) return 4;
-
-    /* Wide, where the stride is 4 bytes and a byte-stepped copy lands wrong. */
-    unsigned char lo3 = 0xA5;
-    __WCHAR_TYPE__ w[1][2] = {L"xyz"};
-    unsigned char hi3 = 0x5A;
-    if ((int)w[0][0] != 'x' || (int)w[0][1] != 'y') return 5;
-    if (lo3 != 0xA5 || hi3 != 0x5A) return 6;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("overlong_nested_string", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("overlong_nested_string_opt", code),
-        0
-    );
-}
-
-/// `char buf[N] = "str"` zero-fills the bytes the literal does not reach.
-///
-/// C17 6.7.9p21: the members not initialized explicitly are initialized as a
-/// static object would be, i.e. to zero. The `InitList` arm of a local
-/// declaration calls `emit_aggregate_zero` first; the string arm did not, so
-/// only the literal's own bytes were written.
-///
-/// On entry the backend zeroes the whole frame, which hides this the first time
-/// through — the declaration is inside a loop so the second pass sees what the
-/// first one left. All four encodings are affected.
-#[test]
-fn c99_a_string_initializer_zero_fills_the_rest_of_its_array() {
-    let code = r#"
-#include <wchar.h>
-
-int main(void)
-{
-    for (int pass = 0; pass < 2; pass++) {
-        char b[8] = "hi";
-        if (b[2] != 0 || b[3] != 0 || b[7] != 0) return 1;
-        b[3] = 'Z';
-        b[7] = 'Z';
-    }
-
-    for (int pass = 0; pass < 2; pass++) {
-        wchar_t w[4] = L"hi";
-        if (w[2] != 0 || w[3] != 0) return 2;
-        w[3] = 'Z';
-    }
-
-    /* The braced form went through the InitList arm and was already correct;
-       both spellings must now agree. */
-    for (int pass = 0; pass < 2; pass++) {
-        char c[8] = {"hi"};
-        if (c[3] != 0 || c[7] != 0) return 3;
-        c[3] = 'Z';
-    }
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("string_init_zero_fill", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("string_init_zero_fill_opt", code),
-        0
-    );
-}
-
-/// A later designated initializer replaces the subobject it names, not every
-/// object whose bytes it touches.
-///
-/// C17 6.7.9p19: an initializer for a subobject overrides any previously
-/// listed initializer *for that subobject*, and initializers for other
-/// subobjects are unaffected. The static path merged its field initializers by
-/// byte span and dropped an earlier entry whole on any intersection, so
-/// `.t = {1,2}` followed by `.t.y = 9` lost the `1` as well as the `2` -- while
-/// the automatic path, which just stores in order and lets the later store land
-/// on the earlier one, kept it. The two disagreed on the same initializer.
-///
-/// Every case here is checked in both storage durations, against the values
-/// gcc and clang produce.
-#[test]
-fn c99_a_designated_override_replaces_only_the_subobject_it_names() {
-    let code = r#"
-struct T { int x, y; };
-struct S { struct T t; int z; };
-struct A { int a[3]; int z; };
-
-struct S g1 = { .t = {1, 2}, .t.y = 9, .z = 7 };
-struct A g2 = { .a = {1, 2, 3}, .a[1] = 9, .z = 7 };
-
-int main(void)
-{
-    struct S l1 = { .t = {1, 2}, .t.y = 9, .z = 7 };
-    struct A l2 = { .a = {1, 2, 3}, .a[1] = 9, .z = 7 };
-
-    /* The override names .t.y, so .t.x keeps the 1 it was given. */
-    if (g1.t.x != 1 || g1.t.y != 9 || g1.z != 7) return 1;
-    if (l1.t.x != 1 || l1.t.y != 9 || l1.z != 7) return 2;
-
-    /* The same one level down: only element 1 is replaced. */
-    if (g2.a[0] != 1 || g2.a[1] != 9 || g2.a[2] != 3 || g2.z != 7) return 3;
-    if (l2.a[0] != 1 || l2.a[1] != 9 || l2.a[2] != 3 || l2.z != 7) return 4;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("designated_partial_override", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("designated_partial_override_opt", code),
-        0
-    );
-}
-
-/// "Later wins" means later in the initializer list, not later in the object.
-///
-/// The static path sorted its field initializers by address before resolving
-/// overlaps, so the rule was applied in the wrong order entirely: in
-/// `{ .z = 7, .t.y = 9, .t = {1,2} }` the `.t = {1,2}` is written last and must
-/// win, but after sorting it sat before `.t.y` and was the entry dropped.
-#[test]
-fn c99_a_designated_override_is_resolved_in_source_order() {
-    let code = r#"
-struct T { int x, y; };
-struct S { struct T t; int z; };
-
-/* The whole-field initializer comes last and wins, even though it names a
-   lower address than the override before it. */
-struct S g = { .z = 7, .t.y = 9, .t = {1, 2} };
-
-/* And the other order, where the narrower one wins. */
-struct S h = { .t = {1, 2}, .z = 7, .t.y = 9 };
-
-int main(void)
-{
-    struct S lg = { .z = 7, .t.y = 9, .t = {1, 2} };
-    struct S lh = { .t = {1, 2}, .z = 7, .t.y = 9 };
-
-    if (g.t.x != 1 || g.t.y != 2 || g.z != 7) return 1;
-    if (lg.t.x != 1 || lg.t.y != 2 || lg.z != 7) return 2;
-    if (h.t.x != 1 || h.t.y != 9 || h.z != 7) return 3;
-    if (lh.t.x != 1 || lh.t.y != 9 || lh.z != 7) return 4;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("designated_source_order", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("designated_source_order_opt", code),
-        0
-    );
-}
-
-/// Initializing a second member of a union resets it; it does not overlay the
-/// first.
-///
-/// This is the case where the two paths disagree the other way round. A union
-/// holds one member at a time, so `{ .u.i = 0x01020304, .u.s.b = 9 }` leaves
-/// the union holding `.u.s` with only `b` given a value and the rest zero --
-/// which is what the static path produced and what gcc and clang produce. The
-/// automatic path stored the `int` and then stored one byte over it, keeping
-/// the other three, so it read back `0x01020904`.
-///
-/// It is here as a guard on the fix above: making the static path store in
-/// source order the way the automatic path does would adopt this bug, so the
-/// merge has to keep the union case distinct from the struct and array cases.
-#[test]
-fn c99_initializing_a_second_union_member_resets_the_union() {
-    let code = r#"
-struct U { union { int i; struct { char a, b, c, d; } s; } u; };
-struct U g = { .u.i = 0x01020304, .u.s.b = 9 };
-
-int main(void)
-{
-    struct U l = { .u.i = 0x01020304, .u.s.b = 9 };
-    if (g.u.i != 0x900) return 1;
-    if (l.u.i != 0x900) return 2;
-    if (g.u.s.a != 0 || g.u.s.b != 9 || g.u.s.c != 0 || g.u.s.d != 0) return 3;
-    if (l.u.s.a != 0 || l.u.s.b != 9 || l.u.s.c != 0 || l.u.s.d != 0) return 4;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("union_member_reset", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("union_member_reset_opt", code), 0);
-}
-
-/// A designated override of a bit-field replaces only that bit-field.
-///
-/// The remaining half of the subobject rule. Bit-fields share a carrier, and
-/// the carrier's bytes are merged downstream of the `Initializer` tree, so the
-/// static path could not fold one override into an earlier initializer and fell
-/// back to dropping it whole -- losing `b` in `{ .t = {1,2}, .t.a = 3 }` --
-/// while the automatic path stored the carrier and then stored over part of it,
-/// keeping `b`. gcc keeps it. The two paths disagreeing is the defect; gcc's
-/// answer is which way to settle it.
-#[test]
-fn c99_a_designated_override_of_a_bitfield_keeps_its_neighbours() {
-    let code = r#"
-struct B { unsigned a : 4, b : 4; };
-struct S { struct B t; int z; };
-
-struct S g = { .t = {1, 2}, .t.a = 3, .z = 7 };
-struct S g2 = { .t = {1, 2}, .t.b = 5 };
-
-int main(void)
-{
-    struct S l = { .t = {1, 2}, .t.a = 3, .z = 7 };
-    struct S l2 = { .t = {1, 2}, .t.b = 5 };
-
-    if (g.t.a != 3 || g.t.b != 2 || g.z != 7) return 1;
-    if (l.t.a != 3 || l.t.b != 2 || l.z != 7) return 2;
-    if (g2.t.a != 1 || g2.t.b != 5) return 3;
-    if (l2.t.a != 1 || l2.t.b != 5) return 4;
-
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("designated_bitfield_override", code, &[]),
-        0
-    );
-    assert_eq!(
-        compile_and_run_optimized("designated_bitfield_override_opt", code),
-        0
-    );
-}
-
-/// An override naming a subobject of the union member already held keeps the
-/// rest of that member.
-///
-/// `{ .u = {1,2}, .u.p.y = 9 }` initializes the union's first member and then
-/// overrides one of *its* members, so the union still holds `p` and `p.x` keeps
-/// the 1 it was given. c17 reset the union instead, because the `Initializer`
-/// tree records no discriminant and the merge could not tell "the same member,
-/// deeper" from "a different member" -- and resetting is right only for the
-/// second. Both storage durations agreed on the wrong answer, so nothing caught
-/// it.
-///
-/// The companion case, where a *different* member is named and the union really
-/// is reset, is covered by
-/// `c99_initializing_a_second_union_member_resets_the_union`, which must keep
-/// passing: the two are what distinguish the rule.
-#[test]
-fn c99_an_override_inside_the_held_union_member_keeps_the_rest() {
-    let code = r#"
-struct P { int x, y; };
-struct N { union { struct P p; int i; } u; };
-
-struct N g = { .u = {1, 2}, .u.p.y = 9 };
-
-int main(void)
-{
-    struct N l = { .u = {1, 2}, .u.p.y = 9 };
-    if (g.u.p.x != 1 || g.u.p.y != 9) return 1;
-    if (l.u.p.x != 1 || l.u.p.y != 9) return 2;
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("union_member_deeper_override", code, &[]),
-        0
-    );
-    assert_eq!(
-        compile_and_run_optimized("union_member_deeper_override_opt", code),
-        0
-    );
-}
-
-/// An initializer for a whole struct supersedes an earlier one for a
-/// bit-field inside it, including the bit-fields it says nothing about.
-///
-/// The other direction of the bit-field rule, and the one the automatic path
-/// had wrong: it stored the bit-field, then stored the struct's own
-/// bit-fields over it, and `c` -- which `{1, 2}` does not mention -- kept the
-/// 7. The static path dropped the earlier entry whole and was right. gcc and
-/// clang zero it.
-///
-/// The objects here are deliberately wider than eight bytes, to keep the
-/// assertions clear of an unrelated x86-64 defect that widens a 32-bit store
-/// at offset 0 of an eight-byte local to 64 bits.
-#[test]
-fn c99_a_whole_struct_initializer_supersedes_an_earlier_bitfield() {
-    let code = r#"
-struct B { unsigned a : 4, b : 4, c : 4; };
-struct S { struct B t; int z; long pad; };
-
-struct S g = { .t.c = 7, .t = {1, 2} };
-
-int main(void)
-{
-    struct S l = { .t.c = 7, .t = {1, 2} };
-
-    if (g.t.a != 1 || g.t.b != 2 || g.t.c != 0) return 1;
-    if (l.t.a != 1 || l.t.b != 2 || l.t.c != 0) return 2;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("bitfield_superseded", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("bitfield_superseded_opt", code),
-        0
-    );
-}
-
-/// A bit-field naming a second member of a union resets the union, as any
-/// other initializer for a second member does.
-///
-/// A bit-field is stored by reading its carrier and writing it back, so the
-/// automatic path emitted no fill for it and three bytes of the `int` showed
-/// through the `struct` that replaced it. It is not that a bit-field clears
-/// nothing -- it clears nothing *of its own*, because its neighbours in the
-/// carrier are other objects -- but what the union it displaces requires.
-#[test]
-fn c99_a_bitfield_naming_a_second_union_member_resets_the_union() {
-    let code = r#"
-struct U { union { int i; struct { unsigned a : 4, b : 4; } s; } u; long pad; };
-
-struct U g = { .u.i = 0x01020304, .u.s.a = 3 };
-
-int main(void)
-{
-    struct U l = { .u.i = 0x01020304, .u.s.a = 3 };
-
-    if (g.u.i != 3 || g.u.s.a != 3 || g.u.s.b != 0) return 1;
-    if (l.u.i != 3 || l.u.s.a != 3 || l.u.s.b != 0) return 2;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("bitfield_union_reset", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("bitfield_union_reset_opt", code),
-        0
-    );
-}
-
-/// Naming a subobject of a union member the union does *not* hold resets it,
-/// even where the two members are the same size and the same shape.
-///
-/// The guard on the fold above. Knowing which member is held comes from the
-/// initializer list, not from the lowered bytes, so `struct P` and `struct Q`
-/// being indistinguishable once lowered costs nothing: `.u = {1, 2}` gives
-/// `p` a value and `.u.q.d = 9` names `q`, so the union comes to hold `q`
-/// with only `d` given a value. Reading it back through the *other* member
-/// would be undefined; `q.c` is not.
-#[test]
-fn c99_an_override_naming_another_union_member_resets_it_whatever_its_shape() {
-    let code = r#"
-struct P { int x, y; };
-struct Q { int c, d; };
-struct N { union { struct P p; struct Q q; } u; long pad; };
-
-struct N g = { .u = {1, 2}, .u.q.d = 9 };
-
-/* And the fold, in the same union, when the member named is the held one. */
-struct N h = { .u = {1, 2}, .u.p.y = 9 };
-
-int main(void)
-{
-    struct N l = { .u = {1, 2}, .u.q.d = 9 };
-    struct N m = { .u = {1, 2}, .u.p.y = 9 };
-
-    if (g.u.q.c != 0 || g.u.q.d != 9) return 1;
-    if (l.u.q.c != 0 || l.u.q.d != 9) return 2;
-    if (h.u.p.x != 1 || h.u.p.y != 9) return 3;
-    if (m.u.p.x != 1 || m.u.p.y != 9) return 4;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("union_other_member_reset", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("union_other_member_reset_opt", code),
-        0
-    );
-}
-
-/// A union whose first member is an anonymous structure takes that
-/// structure's scalars when its braces are elided (C17 6.7.9p17, 6.7.2.1p13).
-///
-/// The count brace elision runs on asked for the union's first *named*
-/// member, which skips the anonymous one and found `q`, while the initializer
-/// walk filled `a` and `b`: `union U u[] = {1, 2, 3, 4}` came out as four
-/// elements, each holding one value.
-#[test]
-fn c99_an_anonymous_first_union_member_counts_for_brace_elision() {
-    let code = r#"
-union U { struct { int a, b; }; long q; };
-union U u[] = { 1, 2, 3, 4 };
-int main(void) {
-    if (sizeof u / sizeof u[0] != 2) return 1;
-    if (u[0].a != 1 || u[0].b != 2 || u[1].a != 3 || u[1].b != 4) return 2;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("c99_anon_union_count", code, &[]), 0);
-}
-
-/// A later designator reaching inside something a whole *value* initialized
-/// keeps the rest of that value, through a union exactly as through a
-/// struct.
-///
-/// Which member a union value last had stored into it is a fact about the
-/// run, so c17 treats its bytes as a value and replaces only what the later
-/// designator names. A union initialized that way was reset instead, while
-/// the same shape through a struct kept its value. gcc discards the whole
-/// earlier initializer in both cases; see DECISIONS.md.
-#[test]
-fn c99_an_override_inside_a_value_initialized_union_keeps_the_value() {
-    let code = r#"
-struct P { int a, b; };
-union U { struct P s; long l; };
-struct O { union U u; int z; };
-struct Q { struct P t; int z; };
-int main(void) {
-    union U v = { .s = { 1, 2 } };
-    struct P p = { 5, 6 };
-    struct O o = { .u = v, .u.s.b = 9 };
-    struct Q q = { .t = p, .t.b = 9 };
-    if (o.u.s.a != 1 || o.u.s.b != 9) return 1;
-    if (q.t.a != 5 || q.t.b != 9) return 2;
-    return 0;
-}
-"#;
-    for level in ["-O0", "-O2"] {
-        assert_eq!(
-            compile_and_run(
-                &format!("c99_union_value_override{level}"),
-                code,
-                &[level.to_string()]
-            ),
-            0,
-            "{level}"
-        );
-    }
-}
-
-/// A designator naming one element of an array a string literal initialized
-/// replaces that element and keeps the rest (C17 6.7.9p19).
-///
-/// A literal is one initializer for the whole array, so a static object had
-/// nothing to replace the element in and dropped the literal whole: `sc.s`
-/// came out as `"\0z"`. The literal is taken apart into its elements first.
-#[test]
-fn c99_an_override_inside_a_string_initializer_keeps_the_string() {
-    let code = r#"
-struct C { char s[6]; int z; };
-static struct C sc = { .s = "abcd", .s[1] = 'z' };
-int main(void) {
-    struct C lc = { .s = "abcd", .s[1] = 'z' };
+/* ==== c99_an_override_inside_a_string_initializer_keeps_the_string: exit codes 174..188 (original code + 173) ==== */
+struct so_C { char s[6]; int z; };
+static struct so_C so_sc = { .s = "abcd", .s[1] = 'z' };
+static __attribute__((noinline)) int t_c99_an_override_inside_a_string_initializer_keeps_the_string(void) {
+    struct so_C lc = { .s = "abcd", .s[1] = 'z' };
     const char *want = "azcd";
     for (int i = 0; i < 6; i++) {
         char e = i < 4 ? want[i] : 0;
-        if (sc.s[i] != e) return 1 + i;
+        if (so_sc.s[i] != e) return 1 + i;
         if (lc.s[i] != e) return 10 + i;
     }
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_string_override", code, &[]), 0);
-}
 
-/// Two shapes a deleted branch once miscompiled, pinned now that they are
-/// right: a designated initializer of an eight-byte struct written out of
-/// member order (a store widened over the second member), and the tail of a
-/// short string in a longer array, which must read as zero however dirty the
-/// frame was before.
-#[test]
-fn c99_out_of_order_designators_and_string_tails_are_exact() {
-    let code = r#"
-struct T { int a, b; };
-__attribute__((noinline)) struct T mk(int x, int y) { struct T s = { .b = y, .a = x }; return s; }
-__attribute__((noinline)) int tail(void) {
-    char junk[64];
-    __builtin_memset(junk, 'X', sizeof junk);
-    __asm__ volatile("" :: "r"(junk) : "memory");
-    char s[13] = "ab";
-    for (int i = 2; i < 13; i++) if (s[i] != 0) return 100 + i;
-    return 0;
-}
-int main(void) {
-    struct T t = mk(3, 4);
-    if (t.a != 3 || t.b != 4) return 1;
-    for (int k = 0; k < 3; k++) { int r = tail(); if (r) return r; }
+int main(void)
+{
+    int r;
+    if ((r = t_c99_initializers_cpython_llist_pattern()) != 0) return 0 + r;
+    if ((r = t_c99_initializers_cpython_opcode_pattern()) != 0) return 2 + r;
+    if ((r = t_c99_initializers_cpython_pytypeobject_pattern()) != 0) return 8 + r;
+    if ((r = t_c99_initializers_nested_designated_pattern()) != 0) return 13 + r;
+    if ((r = t_c99_initializers_sizeof_inferred_array()) != 0) return 16 + r;
+    if ((r = t_c99_initializers_bitfield_designated()) != 0) return 66 + r;
+    if ((r = t_c99_initializers_anon_struct_continuation()) != 0) return 100 + r;
+    if ((r = t_c99_initializers_anon_struct_nested_continuation()) != 0) return 121 + r;
+    if ((r = t_c99_initializers_compound_literal_type_mismatch()) != 0) return 145 + r;
+    if ((r = t_c99_aggregate_element_initializes_whole_aggregate()) != 0) return 156 + r;
+    if ((r = t_c99_an_anonymous_first_union_member_counts_for_brace_elision()) != 0) return 171 + r;
+    if ((r = t_c99_an_override_inside_a_string_initializer_keeps_the_string()) != 0) return 173 + r;
     return 0;
 }
 "#;
-    for level in ["-O0", "-O2"] {
-        assert_eq!(
-            compile_and_run(&format!("c99_frame_a{level}"), code, &[level.to_string()]),
-            0,
-            "{level}"
-        );
-        if let Some(rc) = compile_and_run_aarch64("c99_frame_a_a64", code, level) {
-            assert_eq!(rc, 0, "aarch64 {level}");
-        }
-    }
+    assert_eq!(
+        compile_and_run("c99_initializers_patterns_mega", code, &[]),
+        0
+    );
 }

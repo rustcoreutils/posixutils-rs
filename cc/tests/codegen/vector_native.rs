@@ -580,3 +580,77 @@ void ucvt(v4sf *d, v4su *a) { *d = __builtin_convertvector(*a, v4sf); }
         }
     }
 }
+
+/// The lane matrices again with the `-m` flags that widen what x86-64 has
+/// packed -- SSSE3's `pshufb`, SSE4.1's `pmulld`, `pcmpeqq` and unsigned
+/// minima, SSE4.2's `pcmpgtq` -- on a host that runs them.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn vector_native_matrices_at_sse4() {
+    if !std::arch::is_x86_feature_detected!("sse4.2") {
+        eprintln!("vector_native_matrices_at_sse4: the host has no SSE4.2 to run it");
+        return;
+    }
+    for flag in ["-mssse3", "-msse4.2"] {
+        for (name, src) in [
+            ("vec_native_int_sse4", program(INT_SHAPES, INT_OPS)),
+            ("vec_native_shuffle_sse4", shuffle_convert_program()),
+        ] {
+            for opt in ["-O0", "-O2"] {
+                let args = [flag.to_string(), opt.to_string()];
+                assert_eq!(
+                    crate::common::compile_and_run(name, &src, &args),
+                    0,
+                    "{name} {flag} {opt}"
+                );
+            }
+        }
+    }
+}
+
+/// What each `-m` level adds to the packed instructions x86-64 uses.
+#[test]
+fn vector_native_x86_64_isa_levels() {
+    let src = r#"
+typedef int v4si __attribute__((vector_size(16)));
+typedef long long v2di __attribute__((vector_size(16)));
+typedef unsigned v4su __attribute__((vector_size(16)));
+typedef unsigned char v16qu __attribute__((vector_size(16)));
+typedef short v8hi __attribute__((vector_size(16)));
+void mul(v4si *d, v4si *a, v4si *b) { *d = *a * *b; }
+void eqq(v2di *d, v2di *a, v2di *b) { *d = *a == *b; }
+void gtq(v2di *d, v2di *a, v2di *b) { *d = *a > *b; }
+void geu(v4si *d, v4su *a, v4su *b) { *d = *a >= *b; }
+void gtub(v16qu *d, v16qu *a, v16qu *b) { *d = *a > *b; }
+void rev(v8hi *d, v8hi *a) { *d = __builtin_shufflevector(*a, *a, 7, 6, 5, 4, 3, 2, 1, 0); }
+"#;
+    let at = |flags: &[&str]| {
+        let mut args = vec!["-O"];
+        args.extend(flags);
+        crate::codegen::asm_probe::asm_for_with("vec_isa", X86_64_LINUX, src, &args)
+    };
+    let has = |asm: &str, f: &str, m: &str| crate::codegen::asm_probe::body_of(asm, f).contains(m);
+    let base = at(&[]);
+    assert!(
+        has(&base, "gtub", "pminub"),
+        "SSE2 has the unsigned byte order"
+    );
+    for (f, m) in [
+        ("mul", "pmulld"),
+        ("eqq", "pcmpeqq"),
+        ("gtq", "pcmpgtq"),
+        ("geu", "pminud"),
+        ("rev", "pshufb"),
+    ] {
+        assert!(!has(&base, f, m), "{f}: {m} without the flag");
+    }
+    let ssse3 = at(&["-mssse3"]);
+    assert!(has(&ssse3, "rev", "pshufb") && !has(&ssse3, "mul", "pmulld"));
+    let sse41 = at(&["-msse4.1"]);
+    for (f, m) in [("mul", "pmulld"), ("eqq", "pcmpeqq"), ("geu", "pminud")] {
+        assert!(has(&sse41, f, m), "{f}: no {m} at SSE4.1");
+    }
+    assert!(!has(&sse41, "gtq", "pcmpgtq"));
+    let sse42 = at(&["-msse4.2"]);
+    assert!(has(&sse42, "gtq", "pcmpgtq"));
+}

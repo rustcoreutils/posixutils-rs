@@ -14,7 +14,7 @@
 
 use crate::float::FpFormat;
 use crate::ir::{ShuffleIndices, SimdOp};
-use crate::target::{Arch, Target};
+use crate::target::{Arch, Target, X86Simd};
 use crate::types::{TypeId, TypeTable};
 
 /// Whether `target` computes `op` on vectors of type `vec` with packed
@@ -39,7 +39,7 @@ pub fn native(target: &Target, op: SimdOp, vec: TypeId, types: &TypeTable) -> bo
         return false;
     }
     match target.arch {
-        Arch::X86_64 => x86_64(op, bytes, lane_bytes, float),
+        Arch::X86_64 => x86_64(op, bytes, lane_bytes, float, target.x86_isa.simd),
         Arch::Aarch64 => aarch64(op, lane_bytes),
     }
 }
@@ -60,7 +60,12 @@ pub fn native_shuffle(
         return false;
     };
     match target.arch {
-        Arch::X86_64 => bytes == 16 && x86_64_shuffle(idx, lane_bytes).is_some(),
+        Arch::X86_64 => {
+            bytes == 16
+                && (x86_64_shuffle(idx, lane_bytes).is_some()
+                    || (target.x86_isa.simd >= X86Simd::Ssse3
+                        && x86_64_byte_shuffle(idx, lane_bytes).is_some()))
+        }
         Arch::Aarch64 => true,
     }
 }
@@ -105,25 +110,51 @@ fn whole_register(vec: TypeId, types: &TypeTable) -> Option<Whole> {
 /// for.
 ///
 /// SSE2 multiplies 16-bit lanes only (`pmullw`), and shifts every lane by
-/// one count -- no bytes, and no 64-bit arithmetic right shift.
-fn x86_64(op: SimdOp, bytes: usize, lane_bytes: usize, float: bool) -> bool {
+/// one count -- no bytes, and no 64-bit arithmetic right shift. `simd` adds
+/// what the flags allow: SSE4.1's `pmulld`, `pcmpeqq` and `pmaxuw`/`pmaxud`
+/// (unsigned order beyond bytes), SSE4.2's `pcmpgtq`.
+fn x86_64(op: SimdOp, bytes: usize, lane_bytes: usize, float: bool, simd: X86Simd) -> bool {
     if float && bytes != 16 {
         return false;
     }
+    let sse41 = simd >= X86Simd::Sse41;
     match op {
-        SimdOp::Mul => lane_bytes == 2,
+        SimdOp::Mul => lane_bytes == 2 || (sse41 && lane_bytes == 4),
         SimdOp::Shl | SimdOp::Lsr | SimdOp::Asr => false,
         SimdOp::ShlScalar | SimdOp::LsrScalar => lane_bytes >= 2,
         SimdOp::AsrScalar => matches!(lane_bytes, 2 | 4),
-        // pcmpeq and pcmpgt reach dwords; 64-bit lanes are SSE4.1 and 4.2,
-        // and an unsigned order has no SSE2 compare.
-        SimdOp::CmpEq | SimdOp::CmpNe | SimdOp::CmpGt | SimdOp::CmpGe => lane_bytes <= 4,
-        SimdOp::CmpGtU | SimdOp::CmpGeU => false,
+        // pcmpeq and pcmpgt reach dwords; pcmpeqq is SSE4.1, pcmpgtq 4.2.
+        SimdOp::CmpEq | SimdOp::CmpNe => lane_bytes <= 4 || sse41,
+        SimdOp::CmpGt | SimdOp::CmpGe => lane_bytes <= 4 || simd >= X86Simd::Sse42,
+        // An unsigned order is a maximum compared: pmaxub, pmaxuw/ud.
+        SimdOp::CmpGtU | SimdOp::CmpGeU => lane_bytes == 1 || (sse41 && lane_bytes <= 4),
         // cvtdq2ps and cvttps2dq: signed 32-bit lanes only.
         SimdOp::CvtSF | SimdOp::CvtFS => bytes == 16 && lane_bytes == 4,
         SimdOp::CvtUF | SimdOp::CvtFU => false,
         _ => true,
     }
+}
+
+/// The SSSE3 `pshufb` control of a one-source shuffle of byte or word
+/// lanes: each result byte the source byte it names, or (`0x80`) zero for an
+/// unspecified lane. `None` for a shuffle of two sources, or of wider lanes.
+pub fn x86_64_byte_shuffle(idx: &ShuffleIndices, lane_bytes: usize) -> Option<(usize, [u8; 16])> {
+    let n = 16 / lane_bytes;
+    if idx.len() != n || !matches!(lane_bytes, 1 | 2) {
+        return None;
+    }
+    let mut source = None;
+    let mut control = [0x80u8; 16];
+    for k in 0..n {
+        let Some(i) = idx.lane(k) else { continue };
+        if *source.get_or_insert(i / n) != i / n {
+            return None;
+        }
+        for b in 0..lane_bytes {
+            control[k * lane_bytes + b] = ((i % n) * lane_bytes + b) as u8;
+        }
+    }
+    Some((source.unwrap_or(0), control))
 }
 
 /// How SSE2 computes a sixteen-byte shuffle: one source's dwords
@@ -293,6 +324,47 @@ mod tests {
         assert!(!n(&a64, SimdOp::ShlScalar, v4si));
     }
 
+    /// What the `-m` flags add: 32-bit multiply, 64-bit compares, unsigned
+    /// orders of words and dwords, and byte and word shuffles.
+    #[test]
+    fn test_native_with_sse4() {
+        let mut x86 = Target::new(Arch::X86_64, Os::Linux);
+        let mut types = TypeTable::new(&x86);
+        let v4si = types.vector_of(types.int_id, 4, None);
+        let v2di = types.vector_of(types.long_id, 2, None);
+        let v8hu = types.vector_of(types.ushort_id, 8, None);
+        let v16qu = types.vector_of(types.uchar_id, 16, None);
+        let words = ShuffleIndices::new(&[
+            Some(7),
+            Some(6),
+            Some(5),
+            Some(4),
+            None,
+            Some(2),
+            Some(1),
+            Some(0),
+        ]);
+        // The baseline: unsigned order of bytes only.
+        assert!(!native(&x86, SimdOp::Mul, v4si, &types));
+        assert!(native(&x86, SimdOp::CmpGeU, v16qu, &types));
+        assert!(!native(&x86, SimdOp::CmpGeU, v8hu, &types));
+        assert!(!native_shuffle(&x86, &words, v8hu, &types));
+        x86.x86_isa.simd = X86Simd::Ssse3;
+        assert!(native_shuffle(&x86, &words, v8hu, &types));
+        x86.x86_isa.simd = X86Simd::Sse41;
+        assert!(native(&x86, SimdOp::Mul, v4si, &types));
+        assert!(native(&x86, SimdOp::CmpEq, v2di, &types));
+        assert!(!native(&x86, SimdOp::CmpGt, v2di, &types));
+        assert!(native(&x86, SimdOp::CmpGtU, v8hu, &types));
+        assert!(!native(&x86, SimdOp::CmpGtU, v2di, &types));
+        x86.x86_isa.simd = X86Simd::Sse42;
+        assert!(native(&x86, SimdOp::CmpGe, v2di, &types));
+        // The control of a word reversal, its unspecified lane zero.
+        let (src, ctl) = x86_64_byte_shuffle(&words, 2).unwrap();
+        assert_eq!(src, 0);
+        assert_eq!(&ctl[..10], &[14, 15, 12, 13, 10, 11, 8, 9, 0x80, 0x80]);
+    }
+
     #[test]
     fn test_native_comparisons() {
         let x86 = Target::new(Arch::X86_64, Os::Linux);
@@ -306,8 +378,9 @@ mod tests {
         let n = |t: &Target, op, v| native(t, op, v, &types);
         for v in [v16qi, v4si] {
             assert!(n(&x86, SimdOp::CmpEq, v) && n(&x86, SimdOp::CmpGe, v));
-            assert!(!n(&x86, SimdOp::CmpGtU, v));
         }
+        // SSE2's unsigned order is pmaxub's, bytes only.
+        assert!(n(&x86, SimdOp::CmpGtU, v16qi) && !n(&x86, SimdOp::CmpGtU, v4si));
         assert!(!n(&x86, SimdOp::CmpEq, v2di) && !n(&x86, SimdOp::CmpGt, v2di));
         assert!(n(&x86, SimdOp::FCmpNe, v4sf) && !n(&x86, SimdOp::FCmpNe, v2sf));
         assert!(!n(&x86, SimdOp::CmpEq, v4sf) && !n(&x86, SimdOp::FCmpEq, v4si));

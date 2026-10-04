@@ -313,6 +313,11 @@ pub enum PackedOp {
     CmpGt(IntLane),
     /// CMPccPS/PD: all ones in each lane where `dst` pred `src` holds.
     FCmp(FloatCompare, FloatLane),
+    /// PMINUB (SSE2), PMINUW/PMINUD (SSE4.1): the unsigned minimum.
+    MinU(IntLane),
+    /// PSHUFB (SSSE3): each byte of `dst` the byte of `dst` the same byte
+    /// of `src` names, or zero where its top bit is set.
+    ShuffleBytes,
     /// CVTDQ2PS: each signed dword of `src` to a float in `dst`.
     CvtDwordsToFloats,
     /// CVTTPS2DQ: each float of `src` to a signed dword in `dst`, truncated.
@@ -411,6 +416,8 @@ impl PackedOp {
                 };
                 format!("cmp{pred}{}", l.suffix())
             }
+            PackedOp::MinU(l) => format!("pminu{}", l.suffix()),
+            PackedOp::ShuffleBytes => "pshufb".into(),
             PackedOp::CvtDwordsToFloats => "cvtdq2ps".into(),
             PackedOp::CvtFloatsToDwords => "cvttps2dq".into(),
         }

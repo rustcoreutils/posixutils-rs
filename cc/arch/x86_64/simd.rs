@@ -25,6 +25,18 @@ use crate::arch::simd::X86Shuffle;
 use crate::ir::{Instruction, PseudoId, SimdOp};
 use crate::types::TypeTable;
 
+/// A two-operand operation as SSE computes it: `first` moved into the
+/// target, `op` applied with `second`, then -- for an unsigned order --
+/// compared for equality with `second` again, and inverted when the
+/// instruction answers the opposite question.
+struct PackedForm {
+    first: PseudoId,
+    second: PseudoId,
+    op: PackedOp,
+    then_equal: bool,
+    invert: bool,
+}
+
 impl X86_64CodeGen {
     /// `Opcode::Simd(op)`: the operation on whole XMM registers, computed in
     /// the target's register, or in XMM15 for a target that lives in memory.
@@ -86,9 +98,22 @@ impl X86_64CodeGen {
             }
             SimdOp::Splat => self.emit_splat(insn.src[0], dst, lane_bytes, types.is_float(lane)),
             SimdOp::Shuffle => {
-                let form = crate::arch::simd::x86_64_shuffle(insn.shuffle_indices(), lane_bytes)
-                    .expect("arch::simd lists only shuffles SSE2 has");
-                self.emit_shuffle(insn, form, dst, scratch, size);
+                let idx = insn.shuffle_indices();
+                match crate::arch::simd::x86_64_shuffle(idx, lane_bytes) {
+                    Some(form) => self.emit_shuffle(insn, form, dst, scratch, size),
+                    None => {
+                        // SSSE3: the source's bytes picked by a constant
+                        // control, which `arch::simd` listed.
+                        let (src, control) =
+                            crate::arch::simd::x86_64_byte_shuffle(idx, lane_bytes)
+                                .expect("arch::simd lists only shuffles SSSE3 has");
+                        self.emit_fp_move(insn.src[src], dst, size);
+                        let lo = u64::from_le_bytes(control[..8].try_into().expect("eight"));
+                        let hi = u64::from_le_bytes(control[8..].try_into().expect("eight"));
+                        self.emit_bits128_to_xmm(lo, hi, scratch);
+                        self.push_lir(packed(PackedOp::ShuffleBytes, scratch, dst));
+                    }
+                }
             }
             SimdOp::CvtSF | SimdOp::CvtFS => {
                 // The conversion reads its source whole, so the target may
@@ -140,19 +165,23 @@ impl X86_64CodeGen {
             }
             _ => {
                 let (a, b) = (insn.src[0], insn.src[1]);
-                let (first, second, packed_op, invert) = Self::packed_form(op, a, b, lane_bytes);
+                let form = Self::packed_form(op, a, b, lane_bytes);
                 // The second operand in a register other than the target's,
                 // secured before the first is moved into the target.
-                let second_reg = match self.get_location(second) {
+                let second_reg = match self.get_location(form.second) {
                     Loc::Xmm(x) if x != dst => x,
                     _ => {
-                        self.emit_fp_move(second, scratch, size);
+                        self.emit_fp_move(form.second, scratch, size);
                         scratch
                     }
                 };
-                self.emit_fp_move(first, dst, size);
-                self.push_lir(packed(packed_op, second_reg, dst));
-                if invert {
+                self.emit_fp_move(form.first, dst, size);
+                self.push_lir(packed(form.op, second_reg, dst));
+                if form.then_equal {
+                    let lane = IntLane::of_bytes(lane_bytes);
+                    self.push_lir(packed(PackedOp::CmpEq(lane), second_reg, dst));
+                }
+                if form.invert {
                     // The scratch register is free again: all ones, xored in.
                     self.push_lir(packed(PackedOp::CmpEq(IntLane::D), scratch, scratch));
                     self.push_lir(packed(PackedOp::Xor, scratch, dst));
@@ -269,31 +298,40 @@ impl X86_64CodeGen {
         }
     }
 
-    /// How SSE2 computes the two-operand `op` of `a` and `b` on lanes of
-    /// `lane_bytes`: the operand moved into the target, the one the
-    /// instruction takes, the instruction, and whether the result is then
-    /// inverted. SSE2 compares for equality and signed greater-than only, so
-    /// `!=` is the inverse of `==`, and `a >= b` the inverse of `b > a`; its
-    /// floating compares have every predicate C needs but greater-than,
-    /// which is less-than of the operands swapped.
-    fn packed_form(
-        op: SimdOp,
-        a: PseudoId,
-        b: PseudoId,
-        lane_bytes: usize,
-    ) -> (PseudoId, PseudoId, PackedOp, bool) {
+    /// How SSE computes the two-operand `op` of `a` and `b` on lanes of
+    /// `lane_bytes` ([`PackedForm`]). The integer compares are equality and
+    /// signed greater-than only, so `!=` is the inverse of `==`, and
+    /// `a >= b` the inverse of `b > a`; an unsigned `a >= b` is
+    /// `min(a, b) == b`, which reads `b` twice and `a` once, and `a > b` the
+    /// inverse of `b >= a`. The floating compares have every predicate C
+    /// needs but greater-than, which is less-than of the operands swapped.
+    fn packed_form(op: SimdOp, a: PseudoId, b: PseudoId, lane_bytes: usize) -> PackedForm {
         let int = || IntLane::of_bytes(lane_bytes);
         let float = || FloatLane::of_bytes(lane_bytes);
+        let form = |first, second, op| PackedForm {
+            first,
+            second,
+            op,
+            then_equal: false,
+            invert: false,
+        };
+        let inverse = |f: PackedForm| PackedForm { invert: true, ..f };
+        let min_equal = |first, second| PackedForm {
+            then_equal: true,
+            ..form(first, second, PackedOp::MinU(int()))
+        };
         match op {
-            SimdOp::CmpEq => (a, b, PackedOp::CmpEq(int()), false),
-            SimdOp::CmpNe => (a, b, PackedOp::CmpEq(int()), true),
-            SimdOp::CmpGt => (a, b, PackedOp::CmpGt(int()), false),
-            SimdOp::CmpGe => (b, a, PackedOp::CmpGt(int()), true),
-            SimdOp::FCmpEq => (a, b, PackedOp::FCmp(FloatCompare::Eq, float()), false),
-            SimdOp::FCmpNe => (a, b, PackedOp::FCmp(FloatCompare::Neq, float()), false),
-            SimdOp::FCmpGt => (b, a, PackedOp::FCmp(FloatCompare::Lt, float()), false),
-            SimdOp::FCmpGe => (b, a, PackedOp::FCmp(FloatCompare::Le, float()), false),
-            _ => (a, b, Self::packed_op(op, lane_bytes), false),
+            SimdOp::CmpEq => form(a, b, PackedOp::CmpEq(int())),
+            SimdOp::CmpNe => inverse(form(a, b, PackedOp::CmpEq(int()))),
+            SimdOp::CmpGt => form(a, b, PackedOp::CmpGt(int())),
+            SimdOp::CmpGe => inverse(form(b, a, PackedOp::CmpGt(int()))),
+            SimdOp::CmpGeU => min_equal(a, b),
+            SimdOp::CmpGtU => inverse(min_equal(b, a)),
+            SimdOp::FCmpEq => form(a, b, PackedOp::FCmp(FloatCompare::Eq, float())),
+            SimdOp::FCmpNe => form(a, b, PackedOp::FCmp(FloatCompare::Neq, float())),
+            SimdOp::FCmpGt => form(b, a, PackedOp::FCmp(FloatCompare::Lt, float())),
+            SimdOp::FCmpGe => form(b, a, PackedOp::FCmp(FloatCompare::Le, float())),
+            _ => form(a, b, Self::packed_op(op, lane_bytes)),
         }
     }
 

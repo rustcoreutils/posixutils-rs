@@ -479,6 +479,15 @@ fn fmt_device(info: &ListEntryInfo) -> Vec<u8> {
     format!("{},{}", info.entry.devmajor, info.entry.devminor).into_bytes()
 }
 
+/// Bare `%L`. Rule 12: a symbolic link expands to `"%s -> %s"` of a pathname
+/// and the link's contents, and anything else is "the equivalent of %F". With
+/// no keyword given, the pathname is rule 11's `(path)` default.
+fn fmt_link_expansion(info: &ListEntryInfo) -> Vec<u8> {
+    let mut out = fmt_fullpath(info);
+    push_link_expansion(&mut out, info);
+    out
+}
+
 /// Bare `%D`. Rule 10: with no keyword to fall back on, a non-device entry
 /// renders as a single <space>.
 fn fmt_device_or_space(info: &ListEntryInfo) -> Vec<u8> {
@@ -543,6 +552,7 @@ const FORMAT_SPECIFIERS: &[(char, FormatHandler)] = &[
     ('f', fmt_basename),
     ('F', fmt_fullpath),
     ('l', fmt_link_target),
+    ('L', fmt_link_expansion),
     ('m', fmt_mode_octal),
     ('M', fmt_mode_symbolic),
     ('D', fmt_device_or_space),
@@ -610,6 +620,8 @@ fn unescape_backslashes(s: &str) -> String {
 /// - `%t` - modification time, `ls -l` style (extension)
 /// - `%T` - time, default keyword `mtime`, default subformat `%b %e %H:%M %Y`
 /// - `%D` - device of a block/char special file
+/// - `%F` - pathname, the non-null `(keyword[,keyword]...)` values joined by `/`
+/// - `%L` - a symbolic link as `pathname -> contents`, otherwise `%F`
 /// - `%u` - owner username
 /// - `%g` - group name
 /// - `%U` - owner uid
@@ -1040,28 +1052,30 @@ fn keyword_value(info: &ListEntryInfo, field: &str, conversion: char) -> Keyword
         };
     }
 
-    // Rule 7's three keyword tables, consulted in the order they are listed
-    // there. The pax table comes first because it owns the required reading of
-    // the names the tables share -- `size` and `uid` are decimal there and
-    // octal in the ustar header -- so an existing format string keeps its
-    // answer.
-    let value = match pax_keyword(info, keyword)
-        .or_else(|| ustar_keyword(info, keyword))
-        .or_else(|| cpio_keyword(info, keyword))
-        .or_else(|| ext_record(info, keyword))
-    {
+    // Rules 11 and 12: `F` names a pathname assembled from a list of keywords,
+    // and `L` renders a symbolic link in terms of that pathname. Both may name
+    // more than one keyword, so they resolve the field themselves.
+    if matches!(conversion, 'F' | 'L') {
+        let mut rendered = match path_conversion(info, field.trim()) {
+            KeywordValue::Value(v) => v,
+            other => return other,
+        };
+        if conversion == 'L' {
+            push_link_expansion(&mut rendered, info);
+        }
+        return KeywordValue::Value(rendered);
+    }
+
+    let value = match keyword_field(info, keyword) {
         Some(Field::Value(v)) => v,
         Some(Field::Absent) => return KeywordValue::Absent,
         None => return KeywordValue::Unknown,
     };
 
-    // The mode/pathname/symlink conversions describe how to render the entry
-    // rather than which field to read, so they still apply when a keyword was
-    // given (e.g. `%(path)F`).
+    // The mode conversion describes how to render the entry rather than which
+    // field to read, so it still applies when a keyword was given.
     let rendered = match conversion {
         'M' => format_mode_symbolic(info.entry.mode, info.entry.entry_type).into_bytes(),
-        'F' => fmt_fullpath(info),
-        'L' => fmt_link_target(info),
         // Rule 10: D names the device of a block/character special file. When
         // that does not apply and a keyword was given, it degrades to
         // `%(keyword)u` -- so `%(size)D` on a regular file prints the size.
@@ -1070,6 +1084,57 @@ fn keyword_value(info: &ListEntryInfo, field: &str, conversion: char) -> Keyword
         _ => value,
     };
     KeywordValue::Value(rendered)
+}
+
+/// Resolve one keyword against rule 7's keyword tables, in the order it lists
+/// them.
+///
+/// The pax table comes first because it owns the required reading of the names
+/// the tables share -- `size` and `uid` are decimal there and octal in the
+/// ustar header -- so an existing format string keeps its answer. Extension
+/// records come last, so a crafted archive cannot redefine a required name.
+fn keyword_field(info: &ListEntryInfo, keyword: &str) -> Option<Field> {
+    if let Some(seconds) = time_keyword(info, keyword) {
+        return Some(match seconds {
+            Some(secs) => Field::Value(secs.to_string().into_bytes()),
+            None => Field::Absent,
+        });
+    }
+    pax_keyword(info, keyword)
+        .or_else(|| ustar_keyword(info, keyword))
+        .or_else(|| cpio_keyword(info, keyword))
+        .or_else(|| ext_record(info, keyword))
+}
+
+/// Rule 11's `F` conversion: "The values for all the keywords that are
+/// non-null shall be concatenated together, each separated by a '/'."
+///
+/// So `%(prefix,name)F` rebuilds a pathname whose ustar spelling needed both
+/// halves, and a half this member does not carry drops out rather than leaving
+/// a stray separator.
+fn path_conversion(info: &ListEntryInfo, field: &str) -> KeywordValue {
+    let mut parts: Vec<Vec<u8>> = Vec::new();
+    for keyword in field.split(',') {
+        match keyword_field(info, keyword.trim()) {
+            Some(Field::Value(value)) if !value.is_empty() => parts.push(value),
+            Some(_) => {}
+            None => return KeywordValue::Unknown,
+        }
+    }
+    KeywordValue::Value(parts.join(&b'/'))
+}
+
+/// The ` -> target` a symbolic link's rule 12 expansion ends with, appended to
+/// `out`. Nothing for anything that is not a symbolic link, which is that
+/// rule's fallback to `F`.
+fn push_link_expansion(out: &mut Vec<u8>, info: &ListEntryInfo) {
+    if info.entry.entry_type != EntryType::Symlink {
+        return;
+    }
+    if let Some(target) = info.entry.link_target.as_deref() {
+        out.extend_from_slice(b" -> ");
+        out.extend_from_slice(&escaped(info, crate::rawpath::as_bytes(target)));
+    }
 }
 
 /// Entry type to file type character mapping for symbolic mode display
@@ -1801,6 +1866,61 @@ mod tests {
 
         assert_eq!(fmt("%(mode)s", &info), "644");
         assert_eq!(fmt("%(typeflag)s", &info), "0");
+    }
+
+    /// Rule 11: the `F` conversion may name a <comma>-separated keyword list,
+    /// whose non-null values are joined with `/`. `%(prefix,name)F` is the
+    /// default POSIX gives for a member with no `path` record, and the list
+    /// form was not parsed at all -- the whole specification echoed back.
+    #[test]
+    fn test_conversion_f_concatenates_its_keywords() {
+        let long_dir = "d".repeat(110);
+        let e = ustar_entry(&format!("{long_dir}/f.txt"), b'0');
+        let split = info(&e);
+
+        assert_eq!(fmt("%(prefix,name)F", &split), format!("{long_dir}/f.txt"));
+        assert_eq!(fmt("%(prefix,name)F", &split), fmt("%F", &split));
+        // One keyword is the degenerate list, and names that keyword's value
+        // rather than the whole pathname.
+        assert_eq!(fmt("%(name)F", &split), "f.txt");
+        assert_eq!(fmt("%(prefix)F", &split), long_dir);
+
+        // "all the keywords that are non-null": an empty half contributes
+        // nothing, and leaves no separator behind.
+        let e = ustar_entry("f.txt", b'0');
+        assert_eq!(fmt("%(prefix,name)F", &info(&e)), "f.txt");
+
+        // A name in no table still echoes, even inside a list.
+        assert_eq!(fmt("%(prefix,bogus)F", &split), "%(prefix,bogus)F");
+    }
+
+    /// Rule 12: `%L` expands a symbolic link to `"%s -> %s"` of the pathname
+    /// and the link's contents, and is "the equivalent of %F" for anything
+    /// else. Bare `%L` had no handler and printed itself; the keyword form
+    /// printed only the target, dropping the name and the arrow.
+    #[test]
+    fn test_conversion_l_expands_a_symbolic_link() {
+        let link = ArchiveEntry {
+            entry_type: EntryType::Symlink,
+            link_target: Some("sub/target.txt".into()),
+            ..ustar_entry("mylink", b'2')
+        };
+        assert_eq!(fmt("%L", &info(&link)), "mylink -> sub/target.txt");
+        assert_eq!(fmt("%(path)L", &info(&link)), "mylink -> sub/target.txt");
+
+        // Not a link: equivalent to %F.
+        let plain = ustar_entry("f.txt", b'0');
+        assert_eq!(fmt("%L", &info(&plain)), fmt("%F", &info(&plain)));
+        assert_eq!(fmt("%(path)L", &info(&plain)), "f.txt");
+
+        // A hard link is not a symbolic link, so it is %F too -- its target is
+        // another member, not contents to follow.
+        let hard = ArchiveEntry {
+            entry_type: EntryType::Hardlink,
+            link_target: Some("original.txt".into()),
+            ..ustar_entry("h", b'1')
+        };
+        assert_eq!(fmt("%L", &info(&hard)), "h");
     }
 
     #[test]

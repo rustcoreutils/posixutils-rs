@@ -1816,6 +1816,73 @@ fn test_option_listopt_record_override_and_delete() {
     );
 }
 
+/// POSIX rule 11 makes `(prefix,name)` the `%F` default for a member with no
+/// `path` record, and the <comma>-separated keyword list was not parsed at
+/// all: the whole specification echoed back.
+#[test]
+fn test_option_listopt_f_conversion_concatenates_keywords() {
+    let prefix = vec![b'd'; 110];
+    let archive = Ustar {
+        name: b"deep.txt",
+        prefix: &prefix,
+        body: b"x\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let dir = String::from_utf8(prefix).unwrap();
+    assert_eq!(
+        listopt_bytes(&archive, "%(prefix,name)F"),
+        format!("{dir}/deep.txt")
+    );
+    assert_eq!(
+        listopt_bytes(&archive, "%(prefix,name)F"),
+        listopt_bytes(&archive, "%F"),
+        "rule 11's default must rebuild exactly the pathname %F prints"
+    );
+}
+
+/// POSIX rule 12: `%L` expands a symbolic link to `"%s -> %s"` of the pathname
+/// and the link's contents, and is the equivalent of `%F` for anything else.
+/// Bare `%L` had no handler and printed itself.
+#[cfg(unix)]
+#[test]
+fn test_option_listopt_l_conversion_expands_a_symlink() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("l.tar");
+
+    fs::create_dir(&src_dir).unwrap();
+    fs::write(src_dir.join("real.txt"), b"x").unwrap();
+    std::os::unix::fs::symlink("real.txt", src_dir.join("alias")).unwrap();
+
+    run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "ustar",
+            "-f",
+            archive.to_str().unwrap(),
+            "alias",
+            "real.txt",
+        ],
+        &src_dir,
+    );
+
+    let listing = listopt(&archive, "%L");
+    let lines: Vec<&str> = listing.lines().collect();
+    assert!(
+        lines.contains(&"alias -> real.txt"),
+        "a symbolic link must expand to `name -> contents`: {:?}",
+        lines
+    );
+    assert!(
+        lines.contains(&"real.txt"),
+        "and anything else must render as %F does: {:?}",
+        lines
+    );
+}
+
 /// Every `%(keyword)` POSIX rule 7 requires must resolve to a value.
 ///
 /// A keyword this implementation does not know is echoed back as its own

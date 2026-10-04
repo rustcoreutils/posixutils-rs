@@ -22,6 +22,7 @@ pub mod locale;
 pub mod lzw;
 #[cfg(unix)]
 pub mod modestr;
+pub mod perm;
 #[cfg(unix)]
 pub mod platform;
 #[cfg(unix)]

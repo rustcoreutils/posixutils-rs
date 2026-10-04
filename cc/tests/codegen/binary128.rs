@@ -199,6 +199,9 @@ fn binary128_float128_folds_exactly_on_the_host() {
 /// XMM registers. A 16-byte value that lost the coloring was given an
 /// 8-byte stack slot, so two spilled neighbours overlapped and the stores
 /// ran into the frame: the program crashed at every `-O` level.
+///
+/// Not on macOS: Apple's targets have no `_Float128`, as with clang.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn binary128_values_spilled_under_register_pressure() {
     const N: usize = 18;

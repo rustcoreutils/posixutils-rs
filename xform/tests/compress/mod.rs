@@ -1333,9 +1333,6 @@ fn test_compress_bits_16_accepted_and_roundtrips(/* #C4 */) {
 /// before any cleanup runs, and a scratch file left in the source tree is both
 /// repo trash and a hazard for the next `git add`. The `TempDir` the caller
 /// holds removes everything on unwind.
-///
-/// It and the tests using it are Unix-only while `plib::tmp` is.
-#[cfg(unix)]
 fn scratch_file(dir: &plib::tmp::TempDir, name: &str, contents: &[u8]) -> PathBuf {
     let path = dir.path().join(name);
     let mut f = File::create(&path).unwrap();
@@ -1345,7 +1342,6 @@ fn scratch_file(dir: &plib::tmp::TempDir, name: &str, contents: &[u8]) -> PathBu
 
 /// `-v` reports the compression achieved on stderr. The audit had no test for
 /// the *content* of that message, only that the flag was accepted.
-#[cfg(unix)]
 #[test]
 fn test_compress_verbose_reports_compression_percentage() {
     // Highly compressible, so the percentage is comfortably positive.
@@ -1401,7 +1397,6 @@ fn test_compress_verbose_reports_compression_percentage() {
 
 /// Without `-v` nothing is written to stderr — the counterpart assertion, so
 /// the test above cannot pass just because some other message happens to match.
-#[cfg(unix)]
 #[test]
 fn test_compress_without_verbose_is_silent() {
     let td = plib::tmp::tempdir().unwrap();

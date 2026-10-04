@@ -97,6 +97,7 @@ before going on.
 | path lists (`:`) | `std::env::split_paths` (`;` on Windows) |
 | argv[0] symlink aliases (`zcat`, `[`) | not created (`build.rs` is Unix-only); use the main name's flags |
 | deleting a read-only file | refused under Wine and older Windows: clear the attribute first, restore it on failure |
+| `mkstemp`, `mkdtemp`, unnamed temporaries | `plib::tmp`: `CREATE_NEW` under a random name; an unnamed temporary is a delete-on-close file, named until its last handle closes |
 | `/dev/tty` | the console, `CONIN$` / `CONOUT$`: `plib::io::open_terminal_input` / `open_terminal_output` |
 | `LC_ALL`, `LC_*`, `LANG` | read per category by `plib::diag::init_locale`: `C` or `POSIX` selects the C locale (the C runtime's `"C"`, and ASCII-only, byte-per-character `plib::locale`); `C.UTF-8` and other `C`/`POSIX` names with a codeset select the C runtime's `"C"` except for `LC_CTYPE`, which stays UTF-8; anything else, or unset, the user's locale in UTF-8 |
 | characters, case, multibyte | `plib::locale`: outside the C locale, Rust's Unicode rules with input decoded as UTF-8; before `init_locale`, the C locale |
@@ -133,9 +134,9 @@ Windows (or the crate is split), never stubbed.
 (or the part it uses) first, as its own commit, with the module's unit tests
 running on Windows. Ported so far: `diag`, `io` (including the terminal for
 prompts), `locale` (characters, case and `strftime`), `lzw`, `regex`, `testing`,
-`archive`, `cscan`, `linediff`. Still
+`archive`, `cscan`, `linediff`, `tmp`. Still
 Unix-only: `curuser`, `exec`, `group`, `modestr`, `platform`, `priority`,
-`projectdir`, `sccsfile`, `syslog`, `test_expr`, `tmp`, `tty`, `user`, `utmpx`.
+`projectdir`, `sccsfile`, `syslog`, `test_expr`, `tty`, `user`, `utmpx`.
 
 #### 3. The crate's sources
 
@@ -150,7 +151,7 @@ a `:`-separated list).
 - Integration tests find binaries with `plib::testing::get_binary_path`, which
   already handles `.exe` and `--target` layouts.
 - Gate a test `#[cfg(unix)]` only when its subject is Unix (modes, umask,
-  `utimensat`, root, signals, the argv[0] aliases, `plib::tmp`), and say why in
+  `utimensat`, root, signals, the argv[0] aliases), and say why in
   a comment. A test of portable behaviour that merely used a Unix helper is
   rewritten to run everywhere (pick the Windows equivalent, or a portable
   helper), not gated.

@@ -76,6 +76,16 @@ impl Aarch64CodeGen {
                 src2,
                 dst,
             });
+            if matches!(op, SimdOp::CmpNe | SimdOp::FCmpNe) {
+                // Not equal is the inverse of equal: a NaN is unequal.
+                self.push_lir(Aarch64Inst::Neon {
+                    op: NeonOp::Not,
+                    arr: Arrangement::of(1, total),
+                    src1: dst,
+                    src2: None,
+                    dst,
+                });
+            }
         }
         if !matches!(dst_loc, Loc::VReg(v) if v == dst) {
             self.emit_fp_move_to_loc(dst, &dst_loc, Some(carrier), insn.size, types);
@@ -155,6 +165,14 @@ impl Aarch64CodeGen {
             SimdOp::Mul => NeonOp::Mul,
             SimdOp::Shl | SimdOp::Lsr => NeonOp::Ushl,
             SimdOp::Asr => NeonOp::Sshl,
+            SimdOp::CmpEq | SimdOp::CmpNe => NeonOp::Cmeq,
+            SimdOp::CmpGt => NeonOp::Cmgt,
+            SimdOp::CmpGe => NeonOp::Cmge,
+            SimdOp::CmpGtU => NeonOp::Cmhi,
+            SimdOp::CmpGeU => NeonOp::Cmhs,
+            SimdOp::FCmpEq | SimdOp::FCmpNe => NeonOp::Fcmeq,
+            SimdOp::FCmpGt => NeonOp::Fcmgt,
+            SimdOp::FCmpGe => NeonOp::Fcmge,
             SimdOp::Splat | SimdOp::ShlScalar | SimdOp::LsrScalar | SimdOp::AsrScalar => {
                 unreachable!("{op:?} is not one NEON instruction")
             }

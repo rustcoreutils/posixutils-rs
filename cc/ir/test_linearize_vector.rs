@@ -155,3 +155,63 @@ fn test_native_splat_shift_and_multiply() {
     assert!(simds(mul, &x86).is_empty(), "SSE2 multiplies words only");
     assert_eq!(simds(mul, &a64), [SimdOp::Mul]);
 }
+
+/// A comparison of vectors is one packed compare giving the mask: `<` and
+/// `<=` are `>` and `>=` of the operands swapped, and the lane type of a
+/// mixed-signedness compare is unsigned. SSE2 has no unsigned order.
+#[test]
+fn test_native_comparisons() {
+    use crate::ir::SimdOp;
+    use crate::target::{Arch, Os};
+    let x86 = Target::new(Arch::X86_64, Os::Linux);
+    let a64 = Target::new(Arch::Aarch64, Os::Linux);
+    let simds = |src: &str, target: &Target| -> Vec<SimdOp> {
+        ops_of(src, "f", target)
+            .into_iter()
+            .filter_map(|o| match o {
+                Opcode::Simd(s) => Some(s),
+                _ => None,
+            })
+            .collect()
+    };
+    for (src, x86_want, a64_want) in [
+        (
+            "void f(v4si *d, v4si *a, v4si *b) { *d = *a == *b; }",
+            Some(SimdOp::CmpEq),
+            SimdOp::CmpEq,
+        ),
+        (
+            "void f(v4si *d, v4si *a, v4si *b) { *d = *a < *b; }",
+            Some(SimdOp::CmpGt),
+            SimdOp::CmpGt,
+        ),
+        (
+            "void f(v4si *d, v4si *a, v4si *b) { *d = *a >= *b; }",
+            Some(SimdOp::CmpGe),
+            SimdOp::CmpGe,
+        ),
+        (
+            "void f(v4si *d, v4sf *a, v4sf *b) { *d = *a != *b; }",
+            Some(SimdOp::FCmpNe),
+            SimdOp::FCmpNe,
+        ),
+        (
+            "void f(v4si *d, v4sf *a, v4sf *b) { *d = *a <= *b; }",
+            Some(SimdOp::FCmpGe),
+            SimdOp::FCmpGe,
+        ),
+        (
+            "typedef unsigned v4su __attribute__((vector_size(16)));\n\
+             void f(v4si *d, v4si *a, v4su *b) { *d = *a > *b; }",
+            None,
+            SimdOp::CmpGtU,
+        ),
+    ] {
+        assert_eq!(
+            simds(src, &x86),
+            x86_want.into_iter().collect::<Vec<_>>(),
+            "{src}"
+        );
+        assert_eq!(simds(src, &a64), [a64_want], "{src}");
+    }
+}

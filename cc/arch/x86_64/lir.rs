@@ -309,6 +309,23 @@ pub enum PackedOp {
     FUnpackLow(FloatLane),
     /// PSLL/PSRL/PSRA by the count in the low 64 bits of `src`.
     Shift(PackedShift, IntLane),
+    /// PCMPGTB/W/D: all ones in each lane where `dst`'s is greater, signed.
+    CmpGt(IntLane),
+    /// CMPccPS/PD: all ones in each lane where `dst` pred `src` holds.
+    FCmp(FloatCompare, FloatLane),
+}
+
+/// The predicate of a packed floating compare: `cmpltps` and the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatCompare {
+    /// Ordered and equal.
+    Eq,
+    /// Ordered and less.
+    Lt,
+    /// Ordered and less or equal.
+    Le,
+    /// Unordered or not equal.
+    Neq,
 }
 
 /// The direction and kind of a packed shift.
@@ -377,6 +394,16 @@ impl PackedOp {
             ),
             PackedOp::FUnpackLow(l) => format!("unpckl{}", l.suffix()),
             PackedOp::Shift(shift, l) => format!("{}{}", shift.prefix(), l.suffix()),
+            PackedOp::CmpGt(l) => format!("pcmpgt{}", l.suffix()),
+            PackedOp::FCmp(pred, l) => {
+                let pred = match pred {
+                    FloatCompare::Eq => "eq",
+                    FloatCompare::Lt => "lt",
+                    FloatCompare::Le => "le",
+                    FloatCompare::Neq => "neq",
+                };
+                format!("cmp{pred}{}", l.suffix())
+            }
         }
     }
 }

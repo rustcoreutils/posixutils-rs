@@ -488,9 +488,38 @@ impl Linearizer<'_> {
         }
     }
 
-    /// The packed operation for C's `op` on lanes of type `lane`.
-    fn simd_binary(&self, op: BinaryOp, lane: TypeId) -> Option<SimdOp> {
+    /// The packed operation for C's `op` on lanes of type `lane`, and
+    /// whether it takes the operands swapped: `a < b` is `b > a`.
+    fn simd_binary(&self, op: BinaryOp, lane: TypeId) -> Option<(SimdOp, bool)> {
         let float = self.types.is_float(lane);
+        let unsigned = self.types.is_unsigned(lane);
+        let compare = |gt, ge| match op {
+            BinaryOp::Gt => (gt, false),
+            BinaryOp::Ge => (ge, false),
+            BinaryOp::Lt => (gt, true),
+            _ => (ge, true),
+        };
+        Some(match (op, float) {
+            (BinaryOp::Eq, false) => (SimdOp::CmpEq, false),
+            (BinaryOp::Ne, false) => (SimdOp::CmpNe, false),
+            (BinaryOp::Eq, true) => (SimdOp::FCmpEq, false),
+            (BinaryOp::Ne, true) => (SimdOp::FCmpNe, false),
+            (BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge, true) => {
+                compare(SimdOp::FCmpGt, SimdOp::FCmpGe)
+            }
+            (BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge, false) if unsigned => {
+                compare(SimdOp::CmpGtU, SimdOp::CmpGeU)
+            }
+            (BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge, false) => {
+                compare(SimdOp::CmpGt, SimdOp::CmpGe)
+            }
+            _ => (Self::simd_arith(op, float, unsigned)?, false),
+        })
+    }
+
+    /// The packed arithmetic for C's `op` on lanes that are floating or not,
+    /// signed or not.
+    fn simd_arith(op: BinaryOp, float: bool, unsigned: bool) -> Option<SimdOp> {
         Some(match (op, float) {
             (BinaryOp::Add, false) => SimdOp::Add,
             (BinaryOp::Sub, false) => SimdOp::Sub,
@@ -499,7 +528,7 @@ impl Linearizer<'_> {
             (BinaryOp::BitOr, false) => SimdOp::Or,
             (BinaryOp::BitXor, false) => SimdOp::Xor,
             (BinaryOp::Shl, false) => SimdOp::Shl,
-            (BinaryOp::Shr, false) if self.types.is_unsigned(lane) => SimdOp::Lsr,
+            (BinaryOp::Shr, false) if unsigned => SimdOp::Lsr,
             (BinaryOp::Shr, false) => SimdOp::Asr,
             (BinaryOp::Add, true) => SimdOp::FAdd,
             (BinaryOp::Sub, true) => SimdOp::FSub,
@@ -512,7 +541,7 @@ impl Linearizer<'_> {
     /// `l op r` on lanes of `lane` as packed instructions, when the target
     /// has them for vectors of `vec`: a scalar operand is spread to every
     /// lane first, but a shift count stays one scalar where the target
-    /// shifts every lane by one count.
+    /// shifts every lane by one count. A comparison gives its mask.
     fn native_binary(
         &mut self,
         op: BinaryOp,
@@ -522,7 +551,8 @@ impl Linearizer<'_> {
         vec: TypeId,
         result_typ: TypeId,
     ) -> Option<PseudoId> {
-        let simd = self.simd_binary(op, lane)?;
+        let (simd, swap) = self.simd_binary(op, lane)?;
+        let (l, r) = if swap { (r, l) } else { (l, r) };
         if let (Lanes::Vector { addr, .. }, Lanes::Splat(count)) = (l, r) {
             if let Some(by_scalar) = simd.by_scalar().filter(|&s| self.simd_native(s, vec)) {
                 let a = self.carrier_of(addr, vec);

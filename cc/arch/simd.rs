@@ -65,6 +65,10 @@ fn x86_64(op: SimdOp, bytes: usize, lane_bytes: usize, float: bool) -> bool {
         SimdOp::Shl | SimdOp::Lsr | SimdOp::Asr => false,
         SimdOp::ShlScalar | SimdOp::LsrScalar => lane_bytes >= 2,
         SimdOp::AsrScalar => matches!(lane_bytes, 2 | 4),
+        // pcmpeq and pcmpgt reach dwords; 64-bit lanes are SSE4.1 and 4.2,
+        // and an unsigned order has no SSE2 compare.
+        SimdOp::CmpEq | SimdOp::CmpNe | SimdOp::CmpGt | SimdOp::CmpGe => lane_bytes <= 4,
+        SimdOp::CmpGtU | SimdOp::CmpGeU => false,
         _ => true,
     }
 }
@@ -157,5 +161,29 @@ mod tests {
         assert!(!n(&x86, SimdOp::Shl, v4si));
         assert!(n(&a64, SimdOp::Asr, v16qi) && n(&a64, SimdOp::Lsr, v2di));
         assert!(!n(&a64, SimdOp::ShlScalar, v4si));
+    }
+
+    #[test]
+    fn test_native_comparisons() {
+        let x86 = Target::new(Arch::X86_64, Os::Linux);
+        let a64 = Target::new(Arch::Aarch64, Os::Linux);
+        let mut types = TypeTable::new(&x86);
+        let v16qi = types.vector_of(types.char_id, 16, None);
+        let v4si = types.vector_of(types.int_id, 4, None);
+        let v2di = types.vector_of(types.long_id, 2, None);
+        let v4sf = types.vector_of(types.float_id, 4, None);
+        let v2sf = types.vector_of(types.float_id, 2, None);
+        let n = |t: &Target, op, v| native(t, op, v, &types);
+        for v in [v16qi, v4si] {
+            assert!(n(&x86, SimdOp::CmpEq, v) && n(&x86, SimdOp::CmpGe, v));
+            assert!(!n(&x86, SimdOp::CmpGtU, v));
+        }
+        assert!(!n(&x86, SimdOp::CmpEq, v2di) && !n(&x86, SimdOp::CmpGt, v2di));
+        assert!(n(&x86, SimdOp::FCmpNe, v4sf) && !n(&x86, SimdOp::FCmpNe, v2sf));
+        assert!(!n(&x86, SimdOp::CmpEq, v4sf) && !n(&x86, SimdOp::FCmpEq, v4si));
+        for v in [v16qi, v4si, v2di] {
+            assert!(n(&a64, SimdOp::CmpGtU, v) && n(&a64, SimdOp::CmpNe, v));
+        }
+        assert!(n(&a64, SimdOp::FCmpGe, v2sf));
     }
 }

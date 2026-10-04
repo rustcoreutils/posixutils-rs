@@ -368,3 +368,32 @@ void splati(v4si *d, v4si *a, int s) { *d = *a + s; }
         }
     }
 }
+
+/// Comparisons give their masks with packed compares: SSE2's `pcmpeq` and
+/// signed `pcmpgt` (with an inverse for `!=` and `>=`) and `cmpps` with C's
+/// predicates; NEON's `cmeq`/`cmgt`/`cmge`/`cmhi` and floating forms.
+#[test]
+fn vector_native_comparisons() {
+    let src = r#"
+typedef int v4si __attribute__((vector_size(16)));
+typedef unsigned v4su __attribute__((vector_size(16)));
+typedef float v4sf __attribute__((vector_size(16)));
+void ints(v4si *d, v4si *a, v4si *b) { *d = (*a < *b) | (*a >= *b) | (*a != *b); }
+void uns(v4si *d, v4su *a, v4su *b) { *d = *a > *b; }
+void flts(v4si *d, v4sf *a, v4sf *b) { *d = (*a > *b) | (*a != *b) | (*a <= *b); }
+"#;
+    let x86 = asm_for("vec_cmp_x86", X86_64_LINUX, src);
+    let a64 = asm_for("vec_cmp_a64", crate::codegen::asm_probe::AARCH64_LINUX, src);
+    for (asm, f, want) in [
+        (&x86, "ints", &["pcmpgtd", "pcmpeqd", "pxor"][..]),
+        (&x86, "flts", &["cmpltps", "cmpneqps", "cmpleps"]),
+        (&a64, "ints", &["cmgt v", "cmge v", "cmeq v", "not v"]),
+        (&a64, "uns", &["cmhi v"]),
+        (&a64, "flts", &["fcmgt v", "fcmeq v", "fcmge v"]),
+    ] {
+        let body = crate::codegen::asm_probe::body_of(asm, f);
+        for m in want {
+            assert!(body.contains(m), "{f}: no {m}:\n{body}");
+        }
+    }
+}

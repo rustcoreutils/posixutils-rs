@@ -409,11 +409,26 @@ pub enum SimdOp {
     ShlScalar,
     LsrScalar,
     AsrScalar,
+    /// Integer lanes compared, each lane of the result all ones where it
+    /// holds and zero where not: ==, !=, signed > and >=, unsigned > and
+    /// >=. A < or <= is the > or >= of the operands swapped.
+    CmpEq,
+    CmpNe,
+    CmpGt,
+    CmpGe,
+    CmpGtU,
+    CmpGeU,
+    /// Floating lanes compared, as C does: != holds for an unordered pair,
+    /// the others do not.
+    FCmpEq,
+    FCmpNe,
+    FCmpGt,
+    FCmpGe,
 }
 
 impl SimdOp {
     /// Every operation, for tests over the whole set.
-    pub const ALL: [SimdOp; 20] = [
+    pub const ALL: [SimdOp; 30] = [
         SimdOp::Add,
         SimdOp::Sub,
         SimdOp::And,
@@ -434,6 +449,16 @@ impl SimdOp {
         SimdOp::ShlScalar,
         SimdOp::LsrScalar,
         SimdOp::AsrScalar,
+        SimdOp::CmpEq,
+        SimdOp::CmpNe,
+        SimdOp::CmpGt,
+        SimdOp::CmpGe,
+        SimdOp::CmpGtU,
+        SimdOp::CmpGeU,
+        SimdOp::FCmpEq,
+        SimdOp::FCmpNe,
+        SimdOp::FCmpGt,
+        SimdOp::FCmpGe,
     ];
 
     /// Whether the operation takes one operand.
@@ -448,7 +473,15 @@ impl SimdOp {
     /// integer only, `None` either.
     pub fn float_lanes(self) -> Option<bool> {
         match self {
-            SimdOp::FAdd | SimdOp::FSub | SimdOp::FMul | SimdOp::FDiv | SimdOp::FNeg => Some(true),
+            SimdOp::FAdd
+            | SimdOp::FSub
+            | SimdOp::FMul
+            | SimdOp::FDiv
+            | SimdOp::FNeg
+            | SimdOp::FCmpEq
+            | SimdOp::FCmpNe
+            | SimdOp::FCmpGt
+            | SimdOp::FCmpGe => Some(true),
             SimdOp::Splat => None,
             _ => Some(false),
         }
@@ -487,6 +520,16 @@ impl SimdOp {
             SimdOp::ShlScalar => "vshl_s",
             SimdOp::LsrScalar => "vlsr_s",
             SimdOp::AsrScalar => "vasr_s",
+            SimdOp::CmpEq => "vcmp_eq",
+            SimdOp::CmpNe => "vcmp_ne",
+            SimdOp::CmpGt => "vcmp_gt",
+            SimdOp::CmpGe => "vcmp_ge",
+            SimdOp::CmpGtU => "vcmp_gtu",
+            SimdOp::CmpGeU => "vcmp_geu",
+            SimdOp::FCmpEq => "vfcmp_eq",
+            SimdOp::FCmpNe => "vfcmp_ne",
+            SimdOp::FCmpGt => "vfcmp_gt",
+            SimdOp::FCmpGe => "vfcmp_ge",
         }
     }
 }
@@ -866,6 +909,16 @@ macro_rules! every_opcode {
                 Opcode::Simd(SimdOp::ShlScalar),
                 Opcode::Simd(SimdOp::LsrScalar),
                 Opcode::Simd(SimdOp::AsrScalar),
+                Opcode::Simd(SimdOp::CmpEq),
+                Opcode::Simd(SimdOp::CmpNe),
+                Opcode::Simd(SimdOp::CmpGt),
+                Opcode::Simd(SimdOp::CmpGe),
+                Opcode::Simd(SimdOp::CmpGtU),
+                Opcode::Simd(SimdOp::CmpGeU),
+                Opcode::Simd(SimdOp::FCmpEq),
+                Opcode::Simd(SimdOp::FCmpNe),
+                Opcode::Simd(SimdOp::FCmpGt),
+                Opcode::Simd(SimdOp::FCmpGe),
             ];
 
             /// The exhaustiveness guard behind [`Opcode::ALL`]; always true.
@@ -900,7 +953,17 @@ macro_rules! every_opcode {
                         | SimdOp::Asr
                         | SimdOp::ShlScalar
                         | SimdOp::LsrScalar
-                        | SimdOp::AsrScalar,
+                        | SimdOp::AsrScalar
+                        | SimdOp::CmpEq
+                        | SimdOp::CmpNe
+                        | SimdOp::CmpGt
+                        | SimdOp::CmpGe
+                        | SimdOp::CmpGtU
+                        | SimdOp::CmpGeU
+                        | SimdOp::FCmpEq
+                        | SimdOp::FCmpNe
+                        | SimdOp::FCmpGt
+                        | SimdOp::FCmpGe,
                     ) => true,
                 }
             }

@@ -16,10 +16,11 @@
 //
 
 use super::codegen::X86_64CodeGen;
-use super::lir::{FloatLane, IntLane, PackedOp, PackedShift, PackedShuffleOp, X86Inst};
+use super::lir::{
+    FloatCompare, FloatLane, IntLane, PackedOp, PackedShift, PackedShuffleOp, X86Inst,
+};
 use super::regalloc::{Loc, Reg, XmmReg};
-use crate::arch::lir::FpSize;
-use crate::arch::lir::OperandSize;
+use crate::arch::lir::{FpSize, OperandSize};
 use crate::ir::{Instruction, PseudoId, SimdOp};
 use crate::types::TypeTable;
 
@@ -116,17 +117,23 @@ impl X86_64CodeGen {
             }
             _ => {
                 let (a, b) = (insn.src[0], insn.src[1]);
+                let (first, second, packed_op, invert) = Self::packed_form(op, a, b, lane_bytes);
                 // The second operand in a register other than the target's,
                 // secured before the first is moved into the target.
-                let b_reg = match self.get_location(b) {
+                let second_reg = match self.get_location(second) {
                     Loc::Xmm(x) if x != dst => x,
                     _ => {
-                        self.emit_fp_move(b, scratch, size);
+                        self.emit_fp_move(second, scratch, size);
                         scratch
                     }
                 };
-                self.emit_fp_move(a, dst, size);
-                self.push_lir(packed(Self::packed_op(op, lane_bytes), b_reg, dst));
+                self.emit_fp_move(first, dst, size);
+                self.push_lir(packed(packed_op, second_reg, dst));
+                if invert {
+                    // The scratch register is free again: all ones, xored in.
+                    self.push_lir(packed(PackedOp::CmpEq(IntLane::D), scratch, scratch));
+                    self.push_lir(packed(PackedOp::Xor, scratch, dst));
+                }
             }
         }
         if !matches!(dst_loc, Loc::Xmm(x) if x == dst) {
@@ -186,6 +193,34 @@ impl X86_64CodeGen {
         }
     }
 
+    /// How SSE2 computes the two-operand `op` of `a` and `b` on lanes of
+    /// `lane_bytes`: the operand moved into the target, the one the
+    /// instruction takes, the instruction, and whether the result is then
+    /// inverted. SSE2 compares for equality and signed greater-than only, so
+    /// `!=` is the inverse of `==`, and `a >= b` the inverse of `b > a`; its
+    /// floating compares have every predicate C needs but greater-than,
+    /// which is less-than of the operands swapped.
+    fn packed_form(
+        op: SimdOp,
+        a: PseudoId,
+        b: PseudoId,
+        lane_bytes: usize,
+    ) -> (PseudoId, PseudoId, PackedOp, bool) {
+        let int = || IntLane::of_bytes(lane_bytes);
+        let float = || FloatLane::of_bytes(lane_bytes);
+        match op {
+            SimdOp::CmpEq => (a, b, PackedOp::CmpEq(int()), false),
+            SimdOp::CmpNe => (a, b, PackedOp::CmpEq(int()), true),
+            SimdOp::CmpGt => (a, b, PackedOp::CmpGt(int()), false),
+            SimdOp::CmpGe => (b, a, PackedOp::CmpGt(int()), true),
+            SimdOp::FCmpEq => (a, b, PackedOp::FCmp(FloatCompare::Eq, float()), false),
+            SimdOp::FCmpNe => (a, b, PackedOp::FCmp(FloatCompare::Neq, float()), false),
+            SimdOp::FCmpGt => (b, a, PackedOp::FCmp(FloatCompare::Lt, float()), false),
+            SimdOp::FCmpGe => (b, a, PackedOp::FCmp(FloatCompare::Le, float()), false),
+            _ => (a, b, Self::packed_op(op, lane_bytes), false),
+        }
+    }
+
     /// The SSE2 instruction for the two-operand `op` on lanes of
     /// `lane_bytes`.
     fn packed_op(op: SimdOp, lane_bytes: usize) -> PackedOp {
@@ -211,7 +246,17 @@ impl X86_64CodeGen {
             | SimdOp::Asr
             | SimdOp::ShlScalar
             | SimdOp::LsrScalar
-            | SimdOp::AsrScalar => unreachable!("{op:?} is not a plain two-register operation"),
+            | SimdOp::AsrScalar
+            | SimdOp::CmpEq
+            | SimdOp::CmpNe
+            | SimdOp::CmpGt
+            | SimdOp::CmpGe
+            | SimdOp::CmpGtU
+            | SimdOp::CmpGeU
+            | SimdOp::FCmpEq
+            | SimdOp::FCmpNe
+            | SimdOp::FCmpGt
+            | SimdOp::FCmpGe => unreachable!("{op:?} is not a plain two-register operation"),
         }
     }
 }

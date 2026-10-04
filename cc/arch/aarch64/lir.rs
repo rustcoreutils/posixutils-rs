@@ -174,6 +174,16 @@ pub enum NeonOp {
     /// negative count shifts right.
     Ushl,
     Sshl,
+    /// Compares, each lane all ones where it holds: equal, signed greater
+    /// (or equal), unsigned higher (or same), and their floating forms.
+    Cmeq,
+    Cmgt,
+    Cmge,
+    Cmhi,
+    Cmhs,
+    Fcmeq,
+    Fcmgt,
+    Fcmge,
 }
 
 impl NeonOp {
@@ -194,6 +204,14 @@ impl NeonOp {
             NeonOp::Mul => "mul",
             NeonOp::Ushl => "ushl",
             NeonOp::Sshl => "sshl",
+            NeonOp::Cmeq => "cmeq",
+            NeonOp::Cmgt => "cmgt",
+            NeonOp::Cmge => "cmge",
+            NeonOp::Cmhi => "cmhi",
+            NeonOp::Cmhs => "cmhs",
+            NeonOp::Fcmeq => "fcmeq",
+            NeonOp::Fcmgt => "fcmgt",
+            NeonOp::Fcmge => "fcmge",
         }
     }
 

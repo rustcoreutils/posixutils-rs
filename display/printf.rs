@@ -13,7 +13,6 @@ use std::{
     error::Error,
     io::{self, Write},
     iter::Peekable,
-    os::unix::ffi::OsStrExt,
     process::ExitCode,
     slice::Iter,
     sync::OnceLock,
@@ -1380,9 +1379,10 @@ fn main() -> ExitCode {
 
     match args.as_slice() {
         &[ref _program_file_name, ref format, ref arguments @ ..] => {
-            let arguments_vec: Vec<&[u8]> = arguments.iter().map(|os| os.as_bytes()).collect();
+            let arguments_vec: Vec<&[u8]> =
+                arguments.iter().map(|os| os.as_encoded_bytes()).collect();
 
-            match do_printf(format.as_bytes(), &arguments_vec) {
+            match do_printf(format.as_encoded_bytes(), &arguments_vec) {
                 Ok(had_error) => {
                     if had_error {
                         ExitCode::FAILURE

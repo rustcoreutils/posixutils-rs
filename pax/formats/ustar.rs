@@ -335,6 +335,11 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
         gname: if gname.is_empty() { None } else { Some(gname) },
         devmajor,
         devminor,
+        // ustar has no link-count field, and `Default` would leave this 0 --
+        // a member with no names at all, which `pax -v` then printed. A
+        // member that exists has at least one name; cpio's `header_nlink`
+        // floors the same field for the same reason.
+        nlink: 1,
         ..Default::default()
     })
 }

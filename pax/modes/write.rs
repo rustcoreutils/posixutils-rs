@@ -695,8 +695,6 @@ fn build_entry(
     Ok(entry)
 }
 
-/// Get username from uid
-#[cfg(unix)]
 /// Write files to a pre-existing archive writer (for multi-volume support)
 pub fn write_files_to_archive<W: ArchiveWriter>(
     archive: &mut W,

@@ -27,11 +27,14 @@ pub mod linkargs;
 pub mod opt;
 pub mod os;
 pub mod parse;
+pub mod pipeline;
 pub mod ppargs;
 pub mod rtlib;
 pub mod strings;
 pub mod symbol;
 pub mod target;
+#[cfg(test)]
+pub mod test_compile;
 pub mod token;
 pub mod tools;
 pub mod types;

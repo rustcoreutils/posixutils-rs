@@ -13,7 +13,6 @@ use gettextrs::{gettext, gettext_args, ngettext_args};
 use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 // Source Position
 
@@ -286,40 +285,76 @@ thread_local! {
     static WARNING_COUNT: Cell<u32> = const { Cell::new(0) };
 }
 
-/// Set by `-w`: warnings are counted but not printed.
-///
-/// Counting them still is deliberate -- `-w` is about output, and a caller
-/// asking how many warnings a translation unit produced should get the truth.
-static SUPPRESS_WARNINGS: AtomicBool = AtomicBool::new(false);
+// The command-line switches below are per thread for the same reason as the
+// counts: the driver sets them on the compiler thread, and an in-process
+// test compiles on a thread of its own with switches of its own.
+thread_local! {
+    /// Set by `-w`: warnings are counted but not printed.
+    ///
+    /// Counting them still is deliberate -- `-w` is about output, and a
+    /// caller asking how many warnings a translation unit produced should get
+    /// the truth.
+    static SUPPRESS_WARNINGS: Cell<bool> = const { Cell::new(false) };
 
-/// Suppress warning output for the rest of the process (`-w`).
-pub fn suppress_warnings() {
-    SUPPRESS_WARNINGS.store(true, Ordering::Relaxed);
+    /// Warning groups turned off by `-Wno-<name>`.
+    ///
+    /// `-w` is all-or-nothing and lives in `SUPPRESS_WARNINGS`; this is the
+    /// named half. Set from the driver, because the code that emits a
+    /// warning is nowhere near the code that parsed the command line.
+    static SUPPRESSED_GROUPS: RefCell<std::collections::HashSet<String>> =
+        RefCell::new(std::collections::HashSet::new());
+
+    /// `-fpermissive`; see [`set_permissive`].
+    static PERMISSIVE: Cell<bool> = const { Cell::new(false) };
+
+    /// Where diagnostics go when not to stderr; see [`capture_diagnostics`].
+    static CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
 }
 
-/// Warning groups turned off by `-Wno-<name>`.
-///
-/// `-w` is all-or-nothing and lives in `SUPPRESS_WARNINGS`; this is the named
-/// half. Set once from the driver, because the code that emits a warning is
-/// nowhere near the code that parsed the command line.
-static SUPPRESSED_GROUPS: std::sync::OnceLock<std::collections::HashSet<String>> =
-    std::sync::OnceLock::new();
+/// Suppress warning output for the rest of this thread's compilation (`-w`).
+pub fn suppress_warnings() {
+    SUPPRESS_WARNINGS.set(true);
+}
 
-/// Record the `-Wno-<name>` groups. Ignored if called twice.
+/// Record the `-Wno-<name>` groups.
 pub fn suppress_warning_groups(names: std::collections::HashSet<String>) {
-    let _ = SUPPRESSED_GROUPS.set(names);
+    SUPPRESSED_GROUPS.replace(names);
 }
 
 /// Is the warning group `name` still on?
 pub fn warning_group_enabled(name: &str) -> bool {
-    !SUPPRESSED_GROUPS
-        .get()
-        .is_some_and(|groups| groups.contains(name))
+    !SUPPRESSED_GROUPS.with_borrow(|groups| groups.contains(name))
 }
 
 /// Are warnings being printed?
 pub fn warnings_suppressed() -> bool {
-    SUPPRESS_WARNINGS.load(Ordering::Relaxed)
+    SUPPRESS_WARNINGS.get()
+}
+
+/// Collect this thread's diagnostics instead of printing them, until
+/// [`take_captured_diagnostics`]. Each line is exactly what stderr would have
+/// received, so a test that reads them reads what a user sees.
+pub fn capture_diagnostics() {
+    CAPTURE.replace(Some(Vec::new()));
+}
+
+/// The lines collected since [`capture_diagnostics`]; printing resumes.
+pub fn take_captured_diagnostics() -> Vec<String> {
+    CAPTURE.take().unwrap_or_default()
+}
+
+/// Print one diagnostic line, or keep it if this thread is capturing.
+fn emit_line(line: String) {
+    let kept = CAPTURE.with_borrow_mut(|lines| match lines {
+        Some(lines) => {
+            lines.push(line.clone());
+            true
+        }
+        None => false,
+    });
+    if !kept {
+        let _ = writeln!(io::stderr(), "{line}");
+    }
 }
 
 /// `-fpermissive`: accept as warnings the pre-C99 constructs and the
@@ -336,16 +371,15 @@ pub fn warnings_suppressed() -> bool {
 /// line -- it rejects both by default too, and its own testsuite marks the
 /// cases that need them with `-fpermissive` or `-std=gnu89` rather than
 /// expecting them to compile.
-static PERMISSIVE: AtomicBool = AtomicBool::new(false);
-
-/// Turn on `-fpermissive` for the rest of the process.
+///
+/// Turns it on for the rest of this thread's compilation.
 pub fn set_permissive() {
-    PERMISSIVE.store(true, Ordering::Relaxed);
+    PERMISSIVE.set(true);
 }
 
 /// Is `-fpermissive` in effect?
 pub fn permissive() -> bool {
-    PERMISSIVE.load(Ordering::Relaxed)
+    PERMISSIVE.get()
 }
 
 /// A constraint violation gcc lets through with only a warning: an error
@@ -492,36 +526,21 @@ fn do_diag(level: DiagLevel, pos: Position, msg: &str) {
                 .map(|st| prettify_path(&st.name))
                 .unwrap_or_else(|| "<unknown>".to_string())
         });
-        eprintln!(
+        emit_line(format!(
             "{}: {}: {}{}:",
             base,
             gettext("note"),
             gettext("in included file"),
             chain
-        );
+        ));
     }
 
     // Print the diagnostic
-    let _ = if col > 0 {
-        writeln!(
-            io::stderr(),
-            "{}:{}:{}: {}{}",
-            filename,
-            line,
-            col,
-            level.prefix(),
-            msg
-        )
+    emit_line(if col > 0 {
+        format!("{}:{}:{}: {}{}", filename, line, col, level.prefix(), msg)
     } else {
-        writeln!(
-            io::stderr(),
-            "{}:{}: {}{}",
-            filename,
-            line,
-            level.prefix(),
-            msg
-        )
-    };
+        format!("{}:{}: {}{}", filename, line, level.prefix(), msg)
+    });
 }
 
 // Public Diagnostic Functions

@@ -11,13 +11,13 @@
 
 #![recursion_limit = "512"]
 
-use posixutils_cc::arch;
 use posixutils_cc::builtins;
 use posixutils_cc::diag;
 use posixutils_cc::ir;
 use posixutils_cc::linkargs;
 use posixutils_cc::opt;
 use posixutils_cc::parse;
+use posixutils_cc::pipeline;
 use posixutils_cc::strings;
 use posixutils_cc::symbol;
 use posixutils_cc::target;
@@ -31,15 +31,13 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::process::Command;
 
-use parse::Parser as CParser;
 use strings::StringTable;
 use symbol::SymbolTable;
 use target::Os;
 use target::{classify_std, StdRequest, Target};
 use token::{
-    preprocess_asm_file, preprocess_collecting, replace_trigraphs, show_token, strip_bom,
-    token_type_name, write_token, AsmPreprocessConfig, PreprocessConfig, StreamTable, TokenType,
-    Tokenizer,
+    preprocess_asm_file, preprocess_collecting, show_token, strip_bom, token_type_name,
+    write_token, AsmPreprocessConfig, PreprocessConfig, TokenType,
 };
 
 // Runtime Library Selection
@@ -495,6 +493,60 @@ fn note_unconverged(report: &opt::OptReport) {
             c.iterations,
             c.still_changing.join(", ")
         );
+    }
+}
+
+/// The driver's dumps and `--stats`, at the pipeline's points of interest.
+struct DriverObserver<'a> {
+    args: &'a Args,
+    path: &'a str,
+}
+
+impl pipeline::Observer for DriverObserver<'_> {
+    fn parsed(&mut self, ast: &parse::ast::TranslationUnit) -> io::Result<bool> {
+        if let Some(stage) = &self.args.dump_ir {
+            if let Err(msg) = validate_dump_ir_stage(stage) {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, msg));
+            }
+        }
+        if self.args.dump_ast {
+            println!("{:#?}", ast);
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn linearized(
+        &mut self,
+        module: &ir::Module,
+        strings: &StringTable,
+        types: &types::TypeTable,
+        symbols: &SymbolTable,
+    ) {
+        if self.args.stats {
+            print_stats(self.path, strings, types, symbols, module);
+        }
+    }
+
+    fn stage(
+        &mut self,
+        stage: &str,
+        module: &ir::Module,
+        types: &types::TypeTable,
+        report: Option<&opt::OptReport>,
+    ) -> bool {
+        let args = self.args;
+        dump_ir(args, module, types, stage);
+        if let Some(report) = report {
+            if should_dump_ir(args, stage) {
+                note_unconverged(report);
+            }
+        }
+        match stage {
+            "post-opt" => !(args.dump_ir.is_some() && !should_dump_ir(args, "post-lower")),
+            "post-lower" => args.dump_ir.is_none(),
+            _ => true,
+        }
     }
 }
 
@@ -1010,7 +1062,6 @@ fn emit_preprocessed(
 
 fn process_file(
     path: &str,
-    streams: &mut StreamTable,
     args: &Args,
     target: &Target,
     out: &mut Outputs,
@@ -1029,39 +1080,22 @@ fn process_file(
         path
     };
 
-    // Phase 0, before anything looks at the bytes: a byte order mark is not
-    // part of the program. Left in place it lexes as an identifier character,
-    // so the first line is never a directive.
-    let buffer = strip_bom(&buffer).to_vec();
-
     // POSIX 87981-87983: a `.i` operand is the output of `c17 -E`, and the
     // processing that produced it "shall not be repeated when the file is
     // compiled". Phases 1 and 2 are part of that processing, so neither runs
     // here; phase 4 is narrowed to GCC's allowlist inside the preprocessor.
     let preprocessed = args.lang_of(path) == Lang::Preprocessed;
 
-    // Translation phase 1, before anything else looks at the bytes.
-    let buffer = if args.trigraphs && !preprocessed {
-        replace_trigraphs(&buffer).into_owned()
-    } else {
-        buffer
-    };
-
-    // Create stream
-    let stream_id = streams.add(display_path.to_string());
-
     // Create shared string table for identifier interning
     let mut strings = StringTable::new();
 
-    // Tokenize
-    let tokens = {
-        let mut tokenizer = Tokenizer::new(&buffer, stream_id, &mut strings);
-        // Translation phase 2 likewise already ran.
-        if preprocessed {
-            tokenizer = tokenizer.without_splicing();
-        }
-        tokenizer.tokenize()
-    };
+    let (tokens, stream_id) = pipeline::source_tokens(
+        &buffer,
+        display_path,
+        args.trigraphs,
+        preprocessed,
+        &mut strings,
+    );
 
     // Dump raw tokens if requested
     if args.dump_tokens && !args.preprocess_only {
@@ -1093,7 +1127,7 @@ fn process_file(
     }
 
     // Preprocess (may add new identifiers from included files)
-    let (mut preprocessed, outcome) = preprocess_collecting(
+    let (preprocessed, outcome) = preprocess_collecting(
         tokens,
         target,
         &mut strings,
@@ -1148,179 +1182,29 @@ fn process_file(
         );
     }
 
-    // Create symbol table and type table BEFORE parsing
-    // symbols are bound during parsing
-    let mut symbols = SymbolTable::new();
-    let mut types = types::TypeTable::new(target);
-
-    // Pull the pragma markers out of the stream and note where they stood.
-    // Done here, on the finished token vector, because that is the first
-    // point at which the order is the translation unit's own -- an include is
-    // preprocessed separately and spliced in, so nothing recorded earlier
-    // survives with a usable index.
-    let pack_directives = token::preprocess::extract_pragma_directives(&mut preprocessed);
-
-    // Parse (this also binds symbols to the symbol table)
-    let mut parser = CParser::new(
-        &preprocessed,
-        &strings,
-        &mut symbols,
-        &mut types,
-        pack_directives,
-    );
-    parser.set_library_call_policy(parse::LibraryCallPolicy {
-        optimizing: args.optimization().optimizes(),
-        math_errno: !args.fno_math_errno,
-    });
-    let ast = parser
-        .parse_translation_unit()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse error: {}", e)))?;
-
-    // Check for semantic errors (e.g., undeclared identifiers) reported during parsing
-    if diag::has_error() != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "compilation failed",
-        ));
-    }
-
-    if let Some(stage) = &args.dump_ir {
-        if let Err(msg) = validate_dump_ir_stage(stage) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, msg));
-        }
-    }
-
-    if args.dump_ast {
-        println!("{:#?}", ast);
-        return Ok(Compiled::Nothing);
-    }
-
-    // Linearize to IR
-    let mut module = ir::linearize::linearize(
-        &ast,
-        &symbols,
-        &types,
-        &strings,
-        target,
-        args.debug > 0,
-        !args.fno_trapping_math,
-    );
-    if let Some(how) = &args.default_visibility {
-        module.apply_default_visibility(how);
-    }
-
-    // Check for errors during linearization (e.g., unsupported global initializers)
-    if diag::has_error() != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "compilation failed",
-        ));
-    }
-
-    // Print compilation statistics if requested
-    if args.stats {
-        print_stats(path, &strings, &types, &symbols, &module);
-    }
-
-    // Set DWARF metadata
-    module.source_name = Some(path.to_string());
-    module.comp_dir = std::env::current_dir()
-        .ok()
-        .map(|p| p.to_string_lossy().to_string());
-
-    dump_ir(args, &module, &types, "post-linearize");
-    ir::validate::verify(&module, ir::validate::Stage::Ssa, "linearization");
-
-    // A `destructor` on Mach-O is an `atexit` registration rather than a
-    // table entry; see `ir::mach_o_dtors`. Runs before mapping so the calls it
-    // synthesizes are classified with every other call.
-    ir::mach_o_dtors::register_destructors_with_atexit(
-        &mut module,
-        &types,
-        target,
-        target.os == target::Os::MacOS,
-    );
-
-    // Hardware mapping pass — centralized target-specific lowering decisions
-    arch::mapping::run_mapping(&mut module, &types, target);
-
-    dump_ir(args, &module, &types, "post-mapping");
-
-    // Expand thread-local accesses for the dynamic TLS model. Must run before
-    // `optimize_module`, because register allocation is downstream of it and
-    // has to see the address computation -- see `ir::tls`. `shared_mode` is
-    // computed here rather than beside `create_codegen` below so that the pass
-    // and the backend agree on the model from one expression.
     let shared_mode = producing_shared(args) || args.fpic;
-    ir::tls::expand_dynamic_tls(
-        &mut module,
-        target.tls_access(shared_mode).is_call(),
-        &types,
-    );
-
-    dump_ir(args, &module, &types, "post-tls");
-    ir::validate::verify(&module, ir::validate::Stage::Ssa, "target mapping");
-
-    // Optimize IR. Called even at -O0, where the only pass that does anything
-    // is inlining of `__attribute__((always_inline))` functions, which gcc
-    // honours with optimization off.
-    let report = opt::optimize_module(&mut module, &types, args.optimization(), target);
-
-    // An opcode the target computes by a library call -- a libm function it
-    // has no instruction for, any binary128 operation, or an x86-64
-    // `_Float16` one -- becomes that call after the optimizer, which could
-    // still fold it.
-    arch::mapping::call_library_fallbacks(&mut module, &types, target);
-    ir::validate::verify(&module, ir::validate::Stage::Ssa, "optimization");
-
-    dump_ir(args, &module, &types, "post-opt");
-    if should_dump_ir(args, "post-opt") {
-        note_unconverged(&report);
-    }
-
-    if args.dump_ir.is_some() && !should_dump_ir(args, "post-lower") {
-        return Ok(Compiled::Nothing);
-    }
-
-    // Lower IR (phi elimination, etc.)
-    ir::lower::lower_module(&mut module);
-
-    dump_ir(args, &module, &types, "post-lower");
-
-    if args.dump_ir.is_some() {
-        return Ok(Compiled::Nothing);
-    }
-
-    // Generate assembly
-    let emit_unwind_tables = !args.no_unwind_tables;
-    let pic_mode = position_independence(args, target).pic;
-    // `shared_mode` selects the TLS model and nothing else; it is computed
-    // above, before the expansion pass that depends on the same condition.
-    // `-fPIC` asks for code that can live in a shared object, which is exactly
-    // what Local Exec cannot satisfy, while `-fPIE` and the PIE default do not,
-    // because a PIE executable still resolves its own thread-locals at link
-    // time. gcc draws the line in the same place.
-    let mut codegen = arch::codegen::create_codegen(
-        target.clone(),
-        emit_unwind_tables,
-        pic_mode,
+    let codegen_opts = pipeline::CodegenOptions {
+        optimization: args.optimization(),
+        math_errno: !args.fno_math_errno,
+        debug: args.debug > 0,
+        trapping_math: !args.fno_trapping_math,
+        default_visibility: args.default_visibility.as_deref(),
         shared_mode,
-        args.verbose_asm,
-    );
-    let asm = codegen.generate(&module, &types);
-
-    // Codegen can diagnose too. Inline asm is the case that reaches here: a
-    // constraint's register class is only confronted with the operand's actual
-    // location once registers are allocated, so "memory input 0 is not
-    // directly addressable" cannot be raised any earlier. Without this
-    // checkpoint the error would be printed and the broken object written
-    // anyway.
-    if diag::has_error() != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "compilation failed",
-        ));
-    }
+        pic: position_independence(args, target).pic,
+        unwind_tables: !args.no_unwind_tables,
+        verbose_asm: args.verbose_asm,
+        source_name: path,
+    };
+    let compiled = pipeline::compile_tokens(
+        preprocessed,
+        &strings,
+        target,
+        &codegen_opts,
+        &mut DriverObserver { args, path },
+    )?;
+    let Some(asm) = compiled else {
+        return Ok(Compiled::Nothing);
+    };
 
     // Determine output file names
     // For stdin ("-"), use "stdin" as the default stem
@@ -2670,7 +2554,6 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     // drop, which is why no intermediate needs its own cleanup path.
     let scratch = plib::tmp::Builder::new().prefix("c17-").tempdir()?;
 
-    let mut streams = StreamTable::new();
     // Opened once, before the loop, so several source operands concatenate
     // into one `-E` output rather than each truncating the last.
     let mut pp_out = preprocess_sink(&args)?;
@@ -2715,15 +2598,7 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
                     object: &obj_name,
                     preprocessed: &mut pp_out,
                 };
-                match process_file(
-                    &op.path,
-                    &mut streams,
-                    &args,
-                    &target,
-                    &mut outputs,
-                    scratch.path(),
-                    idx,
-                ) {
+                match process_file(&op.path, &args, &target, &mut outputs, scratch.path(), idx) {
                     Ok(Compiled::Nothing) => {}
                     Ok(Compiled::Object { path, temporary }) => {
                         if temporary {

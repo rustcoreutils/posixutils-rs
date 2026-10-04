@@ -14,7 +14,7 @@
 
 /// All supported builtin function names.
 /// This is the single source of truth - add new builtins here.
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::{Cell, RefCell};
 
 pub const SUPPORTED_BUILTINS: &[&str] = &[
     // Variadic function support
@@ -479,53 +479,58 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__c11_atomic_signal_fence",
 ];
 
-/// `-fno-builtin` and `-fno-builtin-NAME`.
-///
-/// gcc's rule, which this follows exactly: the flag disables recognition of
-/// builtins **whose name does not begin with `__builtin_`**. The reserved
-/// spellings keep working, and `__has_builtin` keeps answering 1 for them --
-/// verified against gcc, which compiles `__builtin_strcpy` under
-/// `-fno-builtin` and fails to link a bare `alloca`.
-///
-/// So this affects exactly the bare names c17 answers to: `alloca`,
-/// `offsetof`, `alignof`, `setjmp`, `longjmp`. Those are also the only ones a
-/// user declaration may displace, which is the same boundary for the same
-/// reason -- they are not reserved to the implementation.
-static NO_BUILTIN: AtomicBool = AtomicBool::new(false);
+// Like every switch here, per thread: the driver sets them on the compiler
+// thread, and an in-process test compiles on a thread with switches of its
+// own.
+thread_local! {
+    /// `-fno-builtin` and `-fno-builtin-NAME`.
+    ///
+    /// gcc's rule, which this follows exactly: the flag disables recognition of
+    /// builtins **whose name does not begin with `__builtin_`**. The reserved
+    /// spellings keep working, and `__has_builtin` keeps answering 1 for them --
+    /// verified against gcc, which compiles `__builtin_strcpy` under
+    /// `-fno-builtin` and fails to link a bare `alloca`.
+    ///
+    /// So this affects exactly the bare names c17 answers to: `alloca`,
+    /// `offsetof`, `alignof`, `setjmp`, `longjmp`. Those are also the only ones a
+    /// user declaration may displace, which is the same boundary for the same
+    /// reason -- they are not reserved to the implementation.
+    static NO_BUILTIN: Cell<bool> = const { Cell::new(false) };
 
-/// Names disabled individually by `-fno-builtin-NAME`.
-static NO_BUILTIN_FUNCS: std::sync::OnceLock<std::collections::HashSet<String>> =
-    std::sync::OnceLock::new();
+    /// Names disabled individually by `-fno-builtin-NAME`.
+    static NO_BUILTIN_FUNCS: RefCell<std::collections::HashSet<String>> =
+        RefCell::new(std::collections::HashSet::new());
 
-/// `-fgnu89-inline`: every `inline` function takes GNU89 semantics.
-///
-/// The two rules are opposites on the `extern` question. C99 says a plain
-/// `inline` with no `extern` declaration provides *no* external definition;
-/// GNU89 says it is `extern inline` that provides none, and a plain `inline`
-/// emits an out-of-line body like any other function.
-///
-/// The per-function `__attribute__((__gnu_inline__))` already selects the
-/// GNU rule, and this makes it the default for the whole translation unit.
-static GNU89_INLINE: AtomicBool = AtomicBool::new(false);
+    /// `-fgnu89-inline`: every `inline` function takes GNU89 semantics.
+    ///
+    /// The two rules are opposites on the `extern` question. C99 says a
+    /// plain `inline` with no `extern` declaration provides *no* external
+    /// definition; GNU89 says it is `extern inline` that provides none, and a
+    /// plain `inline` emits an out-of-line body like any other function.
+    ///
+    /// The per-function `__attribute__((__gnu_inline__))` already selects the
+    /// GNU rule, and this makes it the default for the whole translation unit.
+    static GNU89_INLINE: Cell<bool> = const { Cell::new(false) };
+}
 
 /// Select GNU89 inline semantics for every `inline` function.
 pub fn set_gnu89_inline(on: bool) {
-    GNU89_INLINE.store(on, Ordering::Relaxed);
+    GNU89_INLINE.set(on);
 }
 
 /// Does an `inline` function without the attribute take the GNU89 rule?
 pub fn gnu89_inline() -> bool {
-    GNU89_INLINE.load(Ordering::Relaxed)
+    GNU89_INLINE.get()
 }
 
 /// Turn off all non-reserved builtins (`-fno-builtin`).
 pub fn set_no_builtin() {
-    NO_BUILTIN.store(true, Ordering::Relaxed);
+    NO_BUILTIN.set(true);
 }
 
-/// Record the `-fno-builtin-NAME` set. Ignored if called twice.
+/// Record the `-fno-builtin-NAME` set.
 pub fn set_no_builtin_funcs(names: std::collections::HashSet<String>) {
-    let _ = NO_BUILTIN_FUNCS.set(names);
+    NO_BUILTIN_FUNCS.replace(names);
 }
 
 /// Is the bare spelling `name` disabled?
@@ -533,8 +538,7 @@ pub fn set_no_builtin_funcs(names: std::collections::HashSet<String>) {
 /// Answers only about bare spellings; a `__builtin_*` caller never asks,
 /// because the flag does not reach them.
 pub fn bare_builtin_disabled(name: &str) -> bool {
-    NO_BUILTIN.load(Ordering::Relaxed)
-        || NO_BUILTIN_FUNCS.get().is_some_and(|set| set.contains(name))
+    NO_BUILTIN.get() || NO_BUILTIN_FUNCS.with_borrow(|set| set.contains(name))
 }
 
 /// Check if a name is a supported builtin function.

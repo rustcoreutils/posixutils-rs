@@ -52,6 +52,9 @@ struct Options {
     undefines: Vec<String>,
     include_paths: Vec<String>,
     target: Option<String>,
+    /// `-finline` / `-fno-inline`, last one winning, applied to whatever
+    /// level the `-O` options leave, as the driver does.
+    inlining: Option<bool>,
 }
 
 /// Apply `flags` the way the driver does: the switches that live in
@@ -76,6 +79,8 @@ fn apply_flags(flags: &[&str]) -> Options {
             "-fPIC" | "-fpic" => o.pic = true,
             "-fno-math-errno" => o.math_errno = false,
             "-fno-trapping-math" => o.trapping_math = false,
+            "-fno-inline" => o.inlining = Some(false),
+            "-finline" => o.inlining = Some(true),
             _ => {
                 if let Some(level) = flag.strip_prefix("-O") {
                     o.optimization = Optimization::from_flag(level).unwrap();
@@ -96,6 +101,9 @@ fn apply_flags(flags: &[&str]) -> Options {
                 }
             }
         }
+    }
+    if let Some(enabled) = o.inlining {
+        o.optimization.set_inlining(enabled);
     }
     diag::suppress_warning_groups(no_groups);
     crate::builtins::set_no_builtin_funcs(no_builtin_funcs);

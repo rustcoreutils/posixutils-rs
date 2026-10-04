@@ -67,3 +67,47 @@ pub fn body_of<'a>(asm: &'a str, name: &str) -> &'a str {
     let end = rest.find(".cfi_endproc").unwrap_or(rest.len());
     &rest[..end]
 }
+
+/// Assert that function `func` contains `needle`.
+pub fn assert_body_contains(asm: &str, func: &str, needle: &str, why: &str) {
+    let body = body_of(asm, func);
+    assert!(
+        body.contains(needle),
+        "{why}\nexpected `{needle}` in {func}:\n{body}"
+    );
+}
+
+/// Assert that function `func` does *not* contain `needle`.
+pub fn assert_body_lacks(asm: &str, func: &str, needle: &str, why: &str) {
+    let body = body_of(asm, func);
+    assert!(
+        !body.contains(needle),
+        "{why}\nunexpected `{needle}` in {func}:\n{body}"
+    );
+}
+
+/// How many times `needle` appears in function `func`.
+pub fn count_in_body(asm: &str, func: &str, needle: &str) -> usize {
+    body_of(asm, func).matches(needle).count()
+}
+
+/// Bytes of stack frame function `func` reserves in its prologue: the x86-64
+/// `subq $N, %rsp` or the aarch64 `sub sp, sp, #N`. `None` means the prologue
+/// reserves nothing this parser recognizes.
+pub fn frame_size(asm: &str, func: &str) -> Option<i64> {
+    let body = body_of(asm, func);
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("subq $") {
+            if let Some((imm, dst)) = rest.split_once(',') {
+                if dst.trim() == "%rsp" {
+                    return imm.trim().parse().ok();
+                }
+            }
+        }
+        if let Some(rest) = line.strip_prefix("sub sp, sp, #") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}

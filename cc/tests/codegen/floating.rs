@@ -13,15 +13,42 @@
 use super::symbols::FCMP_FOLD_LINK;
 use crate::codegen::asm_probe::{asm_for_with, AARCH64_LINUX, X86_64_LINUX};
 use crate::common::{
-    asm_for_at, compile_and_dlopen, compile_and_run, compile_and_run_aarch64,
-    compile_and_run_everywhere, compile_and_run_optimized,
+    compile_and_dlopen, compile_and_run, compile_and_run_aarch64, compile_and_run_everywhere,
+    compile_and_run_optimized,
 };
 
-/// Test: float-to-int and float-to-float casts produce correct size
+/// Floating-point conversions, comparisons, ABI and register-allocation
+/// regressions, one program run at the compile matrix levels.
+///
+/// Consolidates these tests, one section each (each original `main` is
+/// a `noinline` section function; the program exits with the section's
+/// base plus the original code):
+/// - `codegen_float_cast_sizes`: 1..=6
+/// - `codegen_double_to_bool`: 7..=13
+/// - `codegen_unsigned_long_to_double`: 14..=23
+/// - `codegen_fp_compare_xmm0_clobber`: 24..=30
+/// - `codegen_double_xmm_to_gpr_movq`: 31..=36
+/// - `codegen_ternary_fptr_return_type`: 37..=38
+/// - `codegen_nan_comparison`: 39..=52
+/// - `codegen_nan_comparison_comprehensive`: 53..=73
+/// - `codegen_fp_ternary_select`: 74..=81
+/// - `codegen_fp_move_no_rax_clobber`: 82..=84
+/// - `codegen_stack_coloring_interference`: 85..=90
+/// - `codegen_two_sse_struct_arg_spilled`: 91..=96
+/// - `codegen_variadic_float_promotion`: 97..=100
+/// - `codegen_float16_mega`: 101..=143
+/// - `codegen_long_double_initializer_keeps_its_value`: 144..=153
+/// - `codegen_variadic_floating_arguments`: 154..=161
+/// - `codegen_long_double_literals_keep_their_precision`: 162..=183
+/// - `codegen_long_double_nan_comparisons`: 184..=212
 #[test]
-fn codegen_float_cast_sizes() {
+fn codegen_floating_mega() {
     let code = r#"
-int main(void) {
+/* ---- codegen_float_cast_sizes: exits 1..6
+ * Test: float-to-int and float-to-float casts produce correct size
+ */
+static __attribute__((noinline)) int t_float_cast_sizes(void)
+{
     // Section 1: double to int
     double d = 42.7;
     int i = (int)d;
@@ -55,18 +82,11 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("float_cast_sizes", code, &[]), 0);
-}
 
-// ============================================================================
-// Regression: double-to-bool conversion must use ucomisd, not ucomiss
-// ============================================================================
-
-#[test]
-fn codegen_double_to_bool() {
-    let code = r#"
-int main(void) {
+/* ---- codegen_double_to_bool: exits 7..13
+ */
+static __attribute__((noinline)) int t_double_to_bool(void)
+{
     /* if(double) must compare as 64-bit, not truncate to 32-bit */
     double m = 0.5;
     if (!m) return 1;  /* 0.5 is truthy */
@@ -100,21 +120,14 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("double_to_bool", code, &[]), 0);
-}
 
-// ============================================================================
-// Regression: unsigned long to double must not use signed cvtsi2sd
-// ============================================================================
-
-#[test]
-fn codegen_unsigned_long_to_double() {
-    let code = r#"
+/* ---- codegen_unsigned_long_to_double: exits 14..23
+ */
 #include <limits.h>
 #include <stdio.h>
 
-int main(void) {
+static __attribute__((noinline)) int t_unsigned_long_to_double(void)
+{
     /* Values >= 2^63 require unsigned conversion path */
     unsigned long big = (unsigned long)LONG_MAX + 1;  /* 2^63 */
     double d = (double)big;
@@ -151,115 +164,12 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("unsigned_long_to_double", code, &[]), 0);
-}
 
-// ============================================================================
-// Regression: float to unsigned long long must not use signed cvttsd2si
-// ============================================================================
-
-/// The other direction of `codegen_unsigned_long_to_double`, and the same
-/// trap: `cvttsd2si`/`cvttss2si`/`fisttp` all answer as though the destination
-/// were signed, so every value at or above 2^63 came back as the "integer
-/// indefinite" 0x8000000000000000 -- silently, at every optimization level.
-///
-/// The cases below straddle 2^63 in both directions and cover all three source
-/// formats, because each has its own emitter: SSE for `float` and `double`,
-/// x87 for `long double`. The `unsigned int` rows are here because the x87
-/// path got its 32-bit answer from a signed 32-bit store, so any value at or
-/// above 2^31 was wrong there too.
-const FLOAT_TO_UNSIGNED: &str = r#"
-int main(void) {
-    volatile double d;
-    volatile float f;
-    volatile long double ld;
-
-    /* Below 2^63: the signed conversion was always right, and must stay. */
-    d = 9223372036854774784.0;              /* the double just below 2^63 */
-    if ((unsigned long long)d != 9223372036854774784ULL) return 1;
-    d = 1.0e10;
-    if ((unsigned long long)d != 10000000000ULL) return 2;
-    d = 0.5;
-    if ((unsigned long long)d != 0ULL) return 3;
-
-    /* At and above 2^63: this is what was broken. */
-    d = 9223372036854775808.0;              /* exactly 2^63 */
-    if ((unsigned long long)d != 9223372036854775808ULL) return 4;
-    d = 9700000000000000000.0;
-    if ((unsigned long long)d != 9700000000000000000ULL) return 5;
-    d = 18446744073709549568.0;             /* the double just below 2^64 */
-    if ((unsigned long long)d != 18446744073709549568ULL) return 6;
-
-    /* float has its own emitter path. */
-    f = 9223372036854775808.0f;
-    if ((unsigned long long)f != 9223372036854775808ULL) return 7;
-    f = 18446742974197923840.0f;            /* the float just below 2^64 */
-    if ((unsigned long long)f != 18446742974197923840ULL) return 8;
-    f = 100.5f;
-    if ((unsigned long long)f != 100ULL) return 9;
-
-    /* long double goes through x87 on x86-64. */
-    ld = 9223372036854775808.0L;
-    if ((unsigned long long)ld != 9223372036854775808ULL) return 10;
-    ld = 9700000000000000000.0L;
-    if ((unsigned long long)ld != 9700000000000000000ULL) return 11;
-    ld = 1.0e10L;
-    if ((unsigned long long)ld != 10000000000ULL) return 12;
-
-    /* unsigned int at and above 2^31, from each source format. */
-    d = 4294967295.0;
-    if ((unsigned int)d != 4294967295U) return 13;
-    f = 2147483648.0f;
-    if ((unsigned int)f != 2147483648U) return 14;
-    ld = 4294967295.0L;
-    if ((unsigned int)ld != 4294967295U) return 15;
-
-    /* Deliberately no out-of-range case: a value the destination cannot hold
-       is undefined, and the two targets disagree -- x86 keeps the low bits,
-       aarch64 saturates. Both are allowed, so asserting either would pin a
-       platform rather than the rule. */
-
-    /* The signed destinations must not have moved. */
-    d = -1.5;
-    if ((long long)d != -1LL) return 16;
-    ld = -1.5L;
-    if ((long long)ld != -1LL) return 17;
-    return 0;
-}
-"#;
-
-#[test]
-fn codegen_float_to_unsigned_long_long() {
-    assert_eq!(
-        compile_and_run("float_to_unsigned", FLOAT_TO_UNSIGNED, &[]),
-        0
-    );
-}
-
-#[test]
-fn codegen_float_to_unsigned_long_long_optimized() {
-    assert_eq!(
-        compile_and_run_optimized("float_to_unsigned_opt", FLOAT_TO_UNSIGNED),
-        0
-    );
-}
-
-#[test]
-fn codegen_float_to_unsigned_long_long_aarch64() {
-    // aarch64 has `fcvtzu` and was never wrong here; the test pins that, and
-    // catches a "fix" applied to the wrong target.
-    if let Some(code) = compile_and_run_aarch64("float_to_unsigned_a64", FLOAT_TO_UNSIGNED, "-O2") {
-        assert_eq!(code, 0);
-    }
-}
-
-/// Regression test: FP compare clobber when src2 is allocated to Xmm0.
-/// The codegen for `d < -(double)MIN` would move src1 into Xmm0, clobbering
-/// src2 if it was already in Xmm0, then compare Xmm0 with itself.
-#[test]
-fn codegen_fp_compare_xmm0_clobber() {
-    let code = r#"
+/* ---- codegen_fp_compare_xmm0_clobber: exits 24..30
+ * Regression test: FP compare clobber when src2 is allocated to Xmm0.
+ * The codegen for `d < -(double)MIN` would move src1 into Xmm0, clobbering
+ * src2 if it was already in Xmm0, then compare Xmm0 with itself.
+ */
 #include <stdint.h>
 #include <limits.h>
 
@@ -285,7 +195,8 @@ static int check(double value, long unit_to_ns) {
     return 0;  /* ok */
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_fp_compare_xmm0_clobber(void)
+{
     /* Small values should NOT overflow */
     if (check(0.001, 1000000000L) != 0) return 1;
     if (check(1.0, 1000000000L) != 0) return 2;
@@ -299,22 +210,20 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("fp_compare_xmm0_clobber", code, &[]), 0);
-}
+#undef _PyTime_MIN
 
-/// Regression test: XMM-to-GPR move used movd (32-bit) instead of movq (64-bit)
-/// for doubles. This truncated the upper 32 bits, causing double values like
-/// 1.0 (0x3FF0000000000000) to become 0.0 (lower 32 bits are zero).
-#[test]
-fn codegen_double_xmm_to_gpr_movq() {
-    let code = r#"
+/* ---- codegen_double_xmm_to_gpr_movq: exits 31..36
+ * Regression test: XMM-to-GPR move used movd (32-bit) instead of movq (64-bit)
+ * for doubles. This truncated the upper 32 bits, causing double values like
+ * 1.0 (0x3FF0000000000000) to become 0.0 (lower 32 bits are zero).
+ */
 double negate_if(double val, int neg) {
     if (neg) return -val;
     return val;
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_double_xmm_to_gpr_movq(void)
+{
     /* Without the fix, movd truncates to 32 bits.
        1.0 = 0x3FF0000000000000 → lower 32 bits = 0 → result is 0.0 */
     if (negate_if(1.0, 0) != 1.0) return 1;
@@ -333,17 +242,13 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("double_xmm_to_gpr_movq", code, &[]), 0);
-}
 
-/// Regression test: ternary selecting function pointers lost return type.
-/// `(cond ? func_a : func_b)(arg)` used pointer_to() which returned void*
-/// when the pointer-to-function type wasn't in the lookup table. The call's
-/// return type defaulted to int (32-bit), truncating pointer return values.
-#[test]
-fn codegen_ternary_fptr_return_type() {
-    let code = r#"
+/* ---- codegen_ternary_fptr_return_type: exits 37..38
+ * Regression test: ternary selecting function pointers lost return type.
+ * `(cond ? func_a : func_b)(arg)` used pointer_to() which returned void*
+ * when the pointer-to-function type wasn't in the lookup table. The call's
+ * return type defaulted to int (32-bit), truncating pointer return values.
+ */
 #include <stdlib.h>
 
 typedef struct { int x; } Obj;
@@ -351,7 +256,8 @@ typedef struct { int x; } Obj;
 Obj *func_a(int *p) { Obj *o = malloc(sizeof(*o)); o->x = *p + 100; return o; }
 Obj *func_b(int *p) { Obj *o = malloc(sizeof(*o)); o->x = *p + 200; return o; }
 
-int main(void) {
+static __attribute__((noinline)) int t_ternary_fptr_return_type(void)
+{
     int data = 42;
     int cond = 1;
 
@@ -367,18 +273,15 @@ int main(void) {
     free(result2);
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("ternary_fptr_return_type", code, &[]), 0);
-}
 
-/// Regression test: NaN comparisons must follow IEEE 754.
-/// ucomisd sets PF=1 for NaN. Ordered comparisons (==, <, <=) must
-/// return false for NaN; != must return true. sete/setb/setbe/setne
-/// alone don't check PF, so we need setnp AND / setp OR.
-#[test]
-fn codegen_nan_comparison() {
-    let code = r#"
-int main(void) {
+/* ---- codegen_nan_comparison: exits 39..52
+ * Regression test: NaN comparisons must follow IEEE 754.
+ * ucomisd sets PF=1 for NaN. Ordered comparisons (==, <, <=) must
+ * return false for NaN; != must return true. sete/setb/setbe/setne
+ * alone don't check PF, so we need setnp AND / setp OR.
+ */
+static __attribute__((noinline)) int t_nan_comparison(void)
+{
     double nan = __builtin_nan("");
     double x = 21.0;
 
@@ -404,16 +307,13 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("nan_comparison", code, &[]), 0);
-}
 
-/// Comprehensive NaN test: value comparisons, float (single), stored results,
-/// and NaN propagation through variables.
-#[test]
-fn codegen_nan_comparison_comprehensive() {
-    let code = r#"
-int main(void) {
+/* ---- codegen_nan_comparison_comprehensive: exits 53..73
+ * Comprehensive NaN test: value comparisons, float (single), stored results,
+ * and NaN propagation through variables.
+ */
+static __attribute__((noinline)) int t_nan_comparison_comprehensive(void)
+{
     /* Test NaN comparison results as stored integers (not just if-branches) */
     double nan = __builtin_nan("");
     double x = 42.0;
@@ -456,65 +356,12 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("nan_comparison_comprehensive", code, &[]),
-        0
-    );
-}
 
-/// Regression test: struct { double, double } must be passed in XMM registers
-/// per SysV AMD64 ABI, and return values in XMM0+XMM1 must be passable
-/// directly as arguments to another function taking the same struct type.
-#[test]
-fn codegen_two_sse_struct_abi() {
-    let code = r#"
-#include <stdio.h>
-
-typedef struct { double real; double imag; } Complex;
-
-static Complex c_1 = {1.0, 0.0};
-
-Complex identity(Complex x) { return x; }
-
-Complex divide(Complex a, Complex b) {
-    double d = b.real*b.real + b.imag*b.imag;
-    Complex r = {(a.real*b.real + a.imag*b.imag) / d,
-                 (a.imag*b.real - a.real*b.imag) / d};
-    return r;
-}
-
-/* Chain: divide(c_1, identity(x)) */
-Complex reciprocal(Complex x) {
-    return divide(c_1, identity(x));
-}
-
-int main(void) {
-    Complex x = {2.0, 1.0};
-    Complex r = reciprocal(x);
-    /* 1/(2+i) = (0.4, -0.2) */
-    if (r.real != 0.4) return 1;
-    if (r.imag != -0.2) return 2;
-
-    /* Direct chaining */
-    Complex a = {3.0, 4.0};
-    Complex b = divide(a, identity(a));
-    if (b.real != 1.0) return 3;
-    if (b.imag != 0.0) return 4;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("two_sse_struct_abi", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("two_sse_struct_abi_opt", code), 0);
-}
-
-/// Regression: FP negation clobbered RAX (used for sign mask), corrupting
-/// integer pseudos allocated to RAX. FP ternary select with CMov also
-/// failed because CMov doesn't work on XMM registers.
-#[test]
-fn codegen_fp_ternary_select() {
-    let code = r#"
+/* ---- codegen_fp_ternary_select: exits 74..81
+ * Regression: FP negation clobbered RAX (used for sign mask), corrupting
+ * integer pseudos allocated to RAX. FP ternary select with CMov also
+ * failed because CMov doesn't work on XMM registers.
+ */
 /* FP ternary with negation — tests that fneg doesn't clobber condition */
 double select_val(int negate) {
     return negate ? -1.0 : 1.0;
@@ -525,7 +372,8 @@ double negate_then_select(double v, int flag) {
     return flag ? neg : v;
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_fp_ternary_select(void)
+{
     /* Basic FP ternary */
     if (select_val(0) != 1.0) return 1;
     if (select_val(1) != -1.0) return 2;
@@ -545,15 +393,11 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("codegen_fp_ternary_select", code, &[]), 0);
-}
 
-/// Regression test: emit_fp_move Loc::Imm used RAX as scratch, clobbering a live
-/// integer value. Fixed by using R10 (reserved scratch) instead.
-#[test]
-fn codegen_fp_move_no_rax_clobber() {
-    let code = r#"
+/* ---- codegen_fp_move_no_rax_clobber: exits 82..84
+ * Regression test: emit_fp_move Loc::Imm used RAX as scratch, clobbering a live
+ * integer value. Fixed by using R10 (reserved scratch) instead.
+ */
 int printf(const char *, ...);
 
 /* Force RAX to hold a live integer value across an FP immediate load.
@@ -561,7 +405,8 @@ int printf(const char *, ...);
    must not clobber it. */
 int compute(int x) { return x * 7; }
 
-int main(void) {
+static __attribute__((noinline)) int t_fp_move_no_rax_clobber(void)
+{
     int a = compute(6);   /* a = 42, likely in RAX after call */
     double d = 3.14;      /* FP immediate load — must not clobber a */
     int b = a + 1;        /* uses a — would get wrong value if clobbered */
@@ -583,26 +428,20 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("codegen_fp_move_no_rax_clobber", code, &[]),
-        0
-    );
-}
 
-/// Regression test: stack coloring with interference-graph approach.
-/// Tests that variables with non-contiguous live ranges in complex control flow
-/// (gotos creating non-linear block ordering) correctly share or don't share slots
-/// based on actual block-level liveness.
-#[test]
-fn codegen_stack_coloring_interference() {
-    let code = r#"
+/* ---- codegen_stack_coloring_interference: exits 85..90
+ * Regression test: stack coloring with interference-graph approach.
+ * Tests that variables with non-contiguous live ranges in complex control flow
+ * (gotos creating non-linear block ordering) correctly share or don't share slots
+ * based on actual block-level liveness.
+ */
 int printf(const char *, ...);
 
 /* Volatile to prevent optimization */
 volatile int sink;
 
-int main(void) {
+static __attribute__((noinline)) int t_stack_coloring_interference(void)
+{
     /* Test 1: Non-overlapping locals can share stack space */
     {
         int a = 10;
@@ -672,20 +511,13 @@ done:
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("codegen_stack_coloring_interference", code, &[]),
-        0
-    );
-}
 
-/// Regression test: two-SSE struct (e.g., Py_complex {double, double}) passed as
-/// a call argument when the address pseudo is spilled to stack. The Loc::Stack
-/// case used LEA (address of stack slot) instead of MOV (load pointer from stack
-/// slot), producing garbage values.
-#[test]
-fn codegen_two_sse_struct_arg_spilled() {
-    let code = r#"
+/* ---- codegen_two_sse_struct_arg_spilled: exits 91..96
+ * Regression test: two-SSE struct (e.g., Py_complex {double, double}) passed as
+ * a call argument when the address pseudo is spilled to stack. The Loc::Stack
+ * case used LEA (address of stack slot) instead of MOV (load pointer from stack
+ * slot), producing garbage values.
+ */
 typedef struct { double real; double imag; } Complex;
 
 /* Prevent inlining so the struct goes through the ABI */
@@ -712,7 +544,8 @@ int check_complex(Complex c, double expect_real, double expect_imag) {
     return 0;
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_two_sse_struct_arg_spilled(void)
+{
     /* Basic: make and check */
     Complex a = make_complex(1.0, 2.0);
     if (check_complex(a, 1.0, 2.0)) return 1;
@@ -738,23 +571,17 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("codegen_two_sse_struct_arg_spilled", code, &[]),
-        0
-    );
-}
 
-/// Regression test: float arguments to variadic functions (e.g., printf) were
-/// not promoted to double per C99 6.5.2.2p7 "default argument promotions".
-/// The ABI requires xmm0 to hold a double, but c17 passed 32-bit float bits.
-#[test]
-fn codegen_variadic_float_promotion() {
-    let code = r#"
+/* ---- codegen_variadic_float_promotion: exits 97..100
+ * Regression test: float arguments to variadic functions (e.g., printf) were
+ * not promoted to double per C99 6.5.2.2p7 "default argument promotions".
+ * The ABI requires xmm0 to hold a double, but c17 passed 32-bit float bits.
+ */
 #include <stdio.h>
 #include <string.h>
 
-int main(void) {
+static __attribute__((noinline)) int t_variadic_float_promotion(void)
+{
     char buf[64];
     float f = 3.14f;
 
@@ -779,65 +606,11 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("codegen_variadic_float_promotion", code, &[]),
-        0
-    );
-}
 
-/// Regression test: FP binary operations (FMul, FDiv, etc.) clobbered src2
-/// when src2 was in the same XMM register as dst_xmm (Xmm0 for stack targets).
-/// emit_fp_move(src1, Xmm0) overwrote src2 before the operation.
-/// Manifested as `x *= scale` computing `x * x` instead of `x * scale`.
-#[test]
-fn codegen_fp_binop_src2_clobber() {
-    let code = r#"
-#include <math.h>
-
-/* Force enough register pressure that scale ends up in Xmm0 */
-__attribute__((noinline))
-double vector_norm_mini(int n, double *vec, double max) {
-    double x, scale, csum = 1.0, frac1 = 0.0;
-    int max_e;
-
-    frexp(max, &max_e);
-    scale = ldexp(1.0, -max_e);
-
-    for (int i = 0; i < n; i++) {
-        x = vec[i];
-        x *= scale;  /* Bug: became x *= x when scale was in Xmm0 */
-        double sq = x * x;
-        csum += sq;
-        frac1 += sq * 0.001;
-    }
-    double h = sqrt(csum - 1.0 + frac1);
-    return h / scale;
-}
-
-int main(void) {
-    double vec[] = {3.0, 4.0};
-    double r = vector_norm_mini(2, vec, 4.0);
-    /* Expected: sqrt((3/8)^2 + (4/8)^2 + frac) / (1/8) ≈ 5.0 */
-    if (r < 4.9 || r > 5.1) return 1;
-
-    double vec2[] = {5.0, 12.0};
-    r = vector_norm_mini(2, vec2, 12.0);
-    if (r < 12.9 || r > 13.1) return 2;
-
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("codegen_fp_binop_src2_clobber", code, &["-lm".to_string()]),
-        0
-    );
-}
-
-#[test]
-fn codegen_float16_mega() {
-    let code = r#"
-int main(void) {
+/* ---- codegen_float16_mega: exits 101..143
+ */
+static __attribute__((noinline)) int t_float16_mega(void)
+{
     /* Arithmetic */
     _Float16 a = 3.5f16;
     _Float16 b = 2.0f16;
@@ -929,76 +702,18 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("codegen_float16_mega", code, &[]), 0);
-}
 
-/// A `_Float16` store writes two bytes, not four.
-///
-/// x86-64 stored a half with `movss`, which writes four bytes: assigning one
-/// member of a struct of `_Float16`s overwrote the next member, and storing
-/// the imaginary half of a `_Float16 _Complex` wrote two bytes past the
-/// object. SSE2 has no two-byte store from an XMM register, so the value
-/// goes through a general register, as gcc does.
-#[test]
-fn codegen_float16_store_writes_two_bytes() {
-    let code = r#"
-typedef _Float16 _Complex hc;
-struct S { _Float16 a, b, c, d; };
-_Float16 g[4] = {1, 2, 3, 4};
-__attribute__((noinline)) void member(struct S *p, _Float16 v) { p->b = v; }
-__attribute__((noinline)) void global(_Float16 v) { g[1] = v; }
-__attribute__((noinline)) void whole(hc *p, hc v) { *p = v; }
-__attribute__((noinline)) void imag(hc *p, _Float16 v) { __imag__ *p = v; }
-__attribute__((noinline)) void real(hc *p, _Float16 v) { __real__ *p = v; }
-static hc mk(int r, int i) { return __builtin_complex((_Float16)r, (_Float16)i); }
-int main(void) {
-    struct S s = {1, 2, 3, 4};
-    member(&s, 9);
-    if (s.a != 1 || s.b != 9 || s.c != 3 || s.d != 4) return 1;
-    global(9);
-    if (g[0] != 1 || g[1] != 9 || g[2] != 3 || g[3] != 4) return 2;
-    hc arr[3] = {mk(1, 2), mk(3, 4), mk(5, 6)};
-    whole(&arr[1], mk(7, 8));
-    if (__imag__ arr[0] != 2 || __real__ arr[1] != 7 || __imag__ arr[1] != 8
-        || __real__ arr[2] != 5)
-        return 3;
-    imag(&arr[0], 10);
-    if (__real__ arr[0] != 1 || __imag__ arr[0] != 10 || __real__ arr[1] != 7) return 4;
-    real(&arr[1], 11);
-    if (__real__ arr[1] != 11 || __imag__ arr[1] != 8 || __real__ arr[2] != 5) return 5;
-    /* A local struct's member, addressed from the frame. */
-    struct S t = {1, 2, 3, 4};
-    volatile _Float16 v = 9;
-    t.b = v;
-    if (t.a != 1 || t.b != 9 || t.c != 3) return 6;
-    return 0;
-}
-"#;
-    for opt in ["-O0", "-O2"] {
-        assert_eq!(
-            compile_and_run(&format!("float16_store{opt}"), code, &[opt.to_string()]),
-            0,
-            "host {opt}"
-        );
-        if let Some(rc) = compile_and_run_aarch64(&format!("float16_store_a64{opt}"), code, opt) {
-            assert_eq!(rc, 0, "aarch64 {opt}");
-        }
-    }
-}
-
-/// A wide `long double` initializer must reach memory in the target's own
-/// format, not truncated to the `double` it was parsed into.
-///
-/// Both the global and the local path used to write the raw `f64` encoding:
-/// the global emitted a single 8-byte `.quad` under a `.size` of 16, and the
-/// local went through the 128-bit *integer* copy helper, which moves the low
-/// half through a general-purpose register and zero-fills the rest. On
-/// aarch64, where `long double` is binary128, `3.14159...L` therefore landed
-/// as a denormal near zero and compared less than `3.14L`.
-#[test]
-fn codegen_long_double_initializer_keeps_its_value() {
-    let code = r#"
+/* ---- codegen_long_double_initializer_keeps_its_value: exits 144..153
+ * A wide `long double` initializer must reach memory in the target's own
+ * format, not truncated to the `double` it was parsed into.
+ *
+ * Both the global and the local path used to write the raw `f64` encoding:
+ * the global emitted a single 8-byte `.quad` under a `.size` of 16, and the
+ * local went through the 128-bit *integer* copy helper, which moves the low
+ * half through a general-purpose register and zero-fills the rest. On
+ * aarch64, where `long double` is binary128, `3.14159...L` therefore landed
+ * as a denormal near zero and compared less than `3.14L`.
+ */
 #include <float.h>
 
 static long double g_pi = 3.14159265358979323846L;
@@ -1009,7 +724,8 @@ static short g_after_half = 0x1234;
 
 static long double ld_ident(long double v) { return v; }
 
-int main(void) {
+static __attribute__((noinline)) int t_long_double_initializer_keeps_its_value(void)
+{
     if (g_pi < 3.14L || g_pi > 3.15L) return 1;
     if (g_next != 7.5L) return 2;
     if (g_half != 1.5f) return 3;
@@ -1039,24 +755,17 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("codegen_long_double_initializer_keeps_its_value", code, &[]),
-        0
-    );
-}
 
-/// Floating-point variadic arguments must survive the callee's `va_arg`.
-///
-/// AAPCS64 hands unnamed floating arguments in v0-v7 and reads them back
-/// through `__vr_top` / `__vr_offs`, but the aarch64 backend saved only x0-x7
-/// and walked `ap` as a flat pointer over that GP area. Every
-/// `va_arg(ap, double)` therefore read a general-purpose slot while the actual
-/// values sat in v0-v7, unspilled. The cases past eight arguments also cover
-/// the spill to the caller's stack, which is a different path again.
-#[test]
-fn codegen_variadic_floating_arguments() {
-    let code = r#"
+/* ---- codegen_variadic_floating_arguments: exits 154..161
+ * Floating-point variadic arguments must survive the callee's `va_arg`.
+ *
+ * AAPCS64 hands unnamed floating arguments in v0-v7 and reads them back
+ * through `__vr_top` / `__vr_offs`, but the aarch64 backend saved only x0-x7
+ * and walked `ap` as a flat pointer over that GP area. Every
+ * `va_arg(ap, double)` therefore read a general-purpose slot while the actual
+ * values sat in v0-v7, unspilled. The cases past eight arguments also cover
+ * the spill to the caller's stack, which is a different path again.
+ */
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -1112,7 +821,8 @@ static int fmt(char *buf, size_t n, const char *f, ...) {
 
 static int near(double a, double b) { double d = a - b; return d < 0.01 && d > -0.01; }
 
-int main(void) {
+static __attribute__((noinline)) int t_variadic_floating_arguments(void)
+{
     if (!near(sum_d(2, 1.5, 2.5), 4.0)) return 1;
 
     /* Nine doubles: the ninth has to come off the stack. */
@@ -1136,29 +846,22 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("codegen_variadic_floating_arguments", code, &[]),
-        0
-    );
-}
 
-/// A `long double` literal keeps the precision and range of its target type.
-///
-/// Literals were carried as `f64` from the moment they were lexed, before the
-/// type of the literal was even known, so `LDBL_MAX` had already become
-/// infinity and `LDBL_MIN` zero. Hex literals now reach the target format
-/// exactly, and c17's own `__LDBL_*__` macros are spelled in hex for the same
-/// reason.
-///
-/// Decimal literals beyond double's range or precision are still rounded --
-/// that needs a big-integer decimal conversion and is tracked separately.
-///
-/// Every expectation was checked against gcc on the same source, at -O0 and
-/// -O2, where it returns 0 throughout.
-#[test]
-fn codegen_long_double_literals_keep_their_precision() {
-    let src = r##"
+/* ---- codegen_long_double_literals_keep_their_precision: exits 162..183
+ * A `long double` literal keeps the precision and range of its target type.
+ *
+ * Literals were carried as `f64` from the moment they were lexed, before the
+ * type of the literal was even known, so `LDBL_MAX` had already become
+ * infinity and `LDBL_MIN` zero. Hex literals now reach the target format
+ * exactly, and c17's own `__LDBL_*__` macros are spelled in hex for the same
+ * reason.
+ *
+ * Decimal literals beyond double's range or precision are still rounded --
+ * that needs a big-integer decimal conversion and is tracked separately.
+ *
+ * Every expectation was checked against gcc on the same source, at -O0 and
+ * -O2, where it returns 0 throughout.
+ */
 #include <float.h>
 
 /* Which long double the target has decides what can be asserted about it:
@@ -1194,7 +897,7 @@ static long double g_hex = 0x1.fffffffffffffp+1023L;
 #define ONE_ULP_BELOW_MAX 0x1.ffffffffffffep+1023L
 #endif
 
-int main(void)
+static __attribute__((noinline)) int t_long_double_literals_keep_their_precision(void)
 {
     if (!(g_max > 0.0L)) return 1;
     if (!(g_min > 0.0L)) return 2;
@@ -1247,30 +950,29 @@ int main(void)
 
     return 0;
 }
-"##;
-    assert_eq!(compile_and_run("long_double_literals", src, &[]), 0);
-}
+#undef WIDER_RANGE
+#undef WIDER_MANTISSA
+#undef ONE_ULP_BELOW_MAX
 
-/// `long double` comparisons follow IEEE unordered semantics.
-///
-/// The x87 path mapped every comparison onto an *unsigned* condition code,
-/// but x87 signals an unordered result by setting CF, ZF and PF together --
-/// exactly the flags those codes read as "below" and "equal". Six of the ten
-/// NaN comparisons came out inverted: `n == n` was true and `n != n` false,
-/// and `<` / `<=` were true in both operand orders. Only `>` and `>=` were
-/// right, because their codes are already false when CF is set.
-///
-/// The compare also used `fcomip`, which raises invalid-operation on a quiet
-/// NaN; C's relational operators other than the signalling ones want the
-/// quiet `fucomip`.
-///
-/// Every expectation is gcc's output on the same source.
-#[test]
-fn codegen_long_double_nan_comparisons() {
-    let src = r#"
+/* ---- codegen_long_double_nan_comparisons: exits 184..212
+ * `long double` comparisons follow IEEE unordered semantics.
+ *
+ * The x87 path mapped every comparison onto an *unsigned* condition code,
+ * but x87 signals an unordered result by setting CF, ZF and PF together --
+ * exactly the flags those codes read as "below" and "equal". Six of the ten
+ * NaN comparisons came out inverted: `n == n` was true and `n != n` false,
+ * and `<` / `<=` were true in both operand orders. Only `>` and `>=` were
+ * right, because their codes are already false when CF is set.
+ *
+ * The compare also used `fcomip`, which raises invalid-operation on a quiet
+ * NaN; C's relational operators other than the signalling ones want the
+ * quiet `fucomip`.
+ *
+ * Every expectation is gcc's output on the same source.
+ */
 static volatile double z = 0.0;
 
-int main(void)
+static __attribute__((noinline)) int t_long_double_nan_comparisons(void)
 {
     long double n = (long double)(z / z);   /* NaN */
     long double a = 1.0L, b = 2.0L;
@@ -1303,8 +1005,707 @@ int main(void)
 
     return 0;
 }
+
+int main(void)
+{
+    int r;
+    if ((r = t_float_cast_sizes()) != 0) return r;
+    if ((r = t_double_to_bool()) != 0) return 6 + r;
+    if ((r = t_unsigned_long_to_double()) != 0) return 13 + r;
+    if ((r = t_fp_compare_xmm0_clobber()) != 0) return 23 + r;
+    if ((r = t_double_xmm_to_gpr_movq()) != 0) return 30 + r;
+    if ((r = t_ternary_fptr_return_type()) != 0) return 36 + r;
+    if ((r = t_nan_comparison()) != 0) return 38 + r;
+    if ((r = t_nan_comparison_comprehensive()) != 0) return 52 + r;
+    if ((r = t_fp_ternary_select()) != 0) return 73 + r;
+    if ((r = t_fp_move_no_rax_clobber()) != 0) return 81 + r;
+    if ((r = t_stack_coloring_interference()) != 0) return 84 + r;
+    if ((r = t_two_sse_struct_arg_spilled()) != 0) return 90 + r;
+    if ((r = t_variadic_float_promotion()) != 0) return 96 + r;
+    if ((r = t_float16_mega()) != 0) return 100 + r;
+    if ((r = t_long_double_initializer_keeps_its_value()) != 0) return 143 + r;
+    if ((r = t_variadic_floating_arguments()) != 0) return 153 + r;
+    if ((r = t_long_double_literals_keep_their_precision()) != 0) return 161 + r;
+    if ((r = t_long_double_nan_comparisons()) != 0) return 183 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("long_double_nan_cmp", src, &[]), 0);
+    assert_eq!(compile_and_run("floating_mega", code, &[]), 0);
+}
+
+// ============================================================================
+// Regression: double-to-bool conversion must use ucomisd, not ucomiss
+// ============================================================================
+
+// ============================================================================
+// Regression: unsigned long to double must not use signed cvtsi2sd
+// ============================================================================
+
+// ============================================================================
+// Regression: float to unsigned long long must not use signed cvttsd2si
+// ============================================================================
+
+/// The other direction of `codegen_unsigned_long_to_double`, and the same
+/// trap: `cvttsd2si`/`cvttss2si`/`fisttp` all answer as though the destination
+/// were signed, so every value at or above 2^63 came back as the "integer
+/// indefinite" 0x8000000000000000 -- silently, at every optimization level.
+///
+/// The cases below straddle 2^63 in both directions and cover all three source
+/// formats, because each has its own emitter: SSE for `float` and `double`,
+/// x87 for `long double`. The `unsigned int` rows are here because the x87
+/// path got its 32-bit answer from a signed 32-bit store, so any value at or
+/// above 2^31 was wrong there too.
+const FLOAT_TO_UNSIGNED: &str = r#"
+int main(void) {
+    volatile double d;
+    volatile float f;
+    volatile long double ld;
+
+    /* Below 2^63: the signed conversion was always right, and must stay. */
+    d = 9223372036854774784.0;              /* the double just below 2^63 */
+    if ((unsigned long long)d != 9223372036854774784ULL) return 1;
+    d = 1.0e10;
+    if ((unsigned long long)d != 10000000000ULL) return 2;
+    d = 0.5;
+    if ((unsigned long long)d != 0ULL) return 3;
+
+    /* At and above 2^63: this is what was broken. */
+    d = 9223372036854775808.0;              /* exactly 2^63 */
+    if ((unsigned long long)d != 9223372036854775808ULL) return 4;
+    d = 9700000000000000000.0;
+    if ((unsigned long long)d != 9700000000000000000ULL) return 5;
+    d = 18446744073709549568.0;             /* the double just below 2^64 */
+    if ((unsigned long long)d != 18446744073709549568ULL) return 6;
+
+    /* float has its own emitter path. */
+    f = 9223372036854775808.0f;
+    if ((unsigned long long)f != 9223372036854775808ULL) return 7;
+    f = 18446742974197923840.0f;            /* the float just below 2^64 */
+    if ((unsigned long long)f != 18446742974197923840ULL) return 8;
+    f = 100.5f;
+    if ((unsigned long long)f != 100ULL) return 9;
+
+    /* long double goes through x87 on x86-64. */
+    ld = 9223372036854775808.0L;
+    if ((unsigned long long)ld != 9223372036854775808ULL) return 10;
+    ld = 9700000000000000000.0L;
+    if ((unsigned long long)ld != 9700000000000000000ULL) return 11;
+    ld = 1.0e10L;
+    if ((unsigned long long)ld != 10000000000ULL) return 12;
+
+    /* unsigned int at and above 2^31, from each source format. */
+    d = 4294967295.0;
+    if ((unsigned int)d != 4294967295U) return 13;
+    f = 2147483648.0f;
+    if ((unsigned int)f != 2147483648U) return 14;
+    ld = 4294967295.0L;
+    if ((unsigned int)ld != 4294967295U) return 15;
+
+    /* Deliberately no out-of-range case: a value the destination cannot hold
+       is undefined, and the two targets disagree -- x86 keeps the low bits,
+       aarch64 saturates. Both are allowed, so asserting either would pin a
+       platform rather than the rule. */
+
+    /* The signed destinations must not have moved. */
+    d = -1.5;
+    if ((long long)d != -1LL) return 16;
+    ld = -1.5L;
+    if ((long long)ld != -1LL) return 17;
+    return 0;
+}
+"#;
+
+/// Floating-point ABI and conversion regressions, one program run at the
+/// compile matrix levels and at -O1 (`compile_and_run_optimized`).
+///
+/// Consolidates these tests, one section each (each original `main` is
+/// a `noinline` section function; the program exits with the section's
+/// base plus the original code):
+/// - `codegen_float_to_unsigned_long_long` and `codegen_float_to_unsigned_long_long_optimized`: 1..=17
+/// - `codegen_two_sse_struct_abi`: 18..=21
+/// - `codegen_float16_struct_returns_in_a_register`: 22..=29
+/// - `codegen_long_double_aggregate_returns_in_st0`: 30..=42
+/// - `codegen_medium_struct_passes_in_registers`: 43..=54
+/// - `codegen_sse_aggregate_advances_fp_arg_count`: 55..=62
+/// - `codegen_overaligned_fp_locals`: 63..=68
+/// - `codegen_float16_constants_round_to_nearest_even`: 69..=80
+#[test]
+fn codegen_floating_abi_mega() {
+    let code = r#"
+/* ---- codegen_float_to_unsigned_long_long: exits 1..17
+ * The other direction of `codegen_unsigned_long_to_double`, and the same
+ * trap: `cvttsd2si`/`cvttss2si`/`fisttp` all answer as though the destination
+ * were signed, so every value at or above 2^63 came back as the "integer
+ * indefinite" 0x8000000000000000 -- silently, at every optimization level.
+ *
+ * The cases below straddle 2^63 in both directions and cover all three source
+ * formats, because each has its own emitter: SSE for `float` and `double`,
+ * x87 for `long double`. The `unsigned int` rows are here because the x87
+ * path got its 32-bit answer from a signed 32-bit store, so any value at or
+ * above 2^31 was wrong there too.
+ *
+ * (Also `codegen_float_to_unsigned_long_long_optimized`, which ran this program at another level.)
+ */
+static __attribute__((noinline)) int t_float_to_unsigned_long_long(void)
+{
+    volatile double d;
+    volatile float f;
+    volatile long double ld;
+
+    /* Below 2^63: the signed conversion was always right, and must stay. */
+    d = 9223372036854774784.0;              /* the double just below 2^63 */
+    if ((unsigned long long)d != 9223372036854774784ULL) return 1;
+    d = 1.0e10;
+    if ((unsigned long long)d != 10000000000ULL) return 2;
+    d = 0.5;
+    if ((unsigned long long)d != 0ULL) return 3;
+
+    /* At and above 2^63: this is what was broken. */
+    d = 9223372036854775808.0;              /* exactly 2^63 */
+    if ((unsigned long long)d != 9223372036854775808ULL) return 4;
+    d = 9700000000000000000.0;
+    if ((unsigned long long)d != 9700000000000000000ULL) return 5;
+    d = 18446744073709549568.0;             /* the double just below 2^64 */
+    if ((unsigned long long)d != 18446744073709549568ULL) return 6;
+
+    /* float has its own emitter path. */
+    f = 9223372036854775808.0f;
+    if ((unsigned long long)f != 9223372036854775808ULL) return 7;
+    f = 18446742974197923840.0f;            /* the float just below 2^64 */
+    if ((unsigned long long)f != 18446742974197923840ULL) return 8;
+    f = 100.5f;
+    if ((unsigned long long)f != 100ULL) return 9;
+
+    /* long double goes through x87 on x86-64. */
+    ld = 9223372036854775808.0L;
+    if ((unsigned long long)ld != 9223372036854775808ULL) return 10;
+    ld = 9700000000000000000.0L;
+    if ((unsigned long long)ld != 9700000000000000000ULL) return 11;
+    ld = 1.0e10L;
+    if ((unsigned long long)ld != 10000000000ULL) return 12;
+
+    /* unsigned int at and above 2^31, from each source format. */
+    d = 4294967295.0;
+    if ((unsigned int)d != 4294967295U) return 13;
+    f = 2147483648.0f;
+    if ((unsigned int)f != 2147483648U) return 14;
+    ld = 4294967295.0L;
+    if ((unsigned int)ld != 4294967295U) return 15;
+
+    /* Deliberately no out-of-range case: a value the destination cannot hold
+       is undefined, and the two targets disagree -- x86 keeps the low bits,
+       aarch64 saturates. Both are allowed, so asserting either would pin a
+       platform rather than the rule. */
+
+    /* The signed destinations must not have moved. */
+    d = -1.5;
+    if ((long long)d != -1LL) return 16;
+    ld = -1.5L;
+    if ((long long)ld != -1LL) return 17;
+    return 0;
+}
+
+/* ---- codegen_two_sse_struct_abi: exits 18..21
+ * Regression test: struct { double, double } must be passed in XMM registers
+ * per SysV AMD64 ABI, and return values in XMM0+XMM1 must be passable
+ * directly as arguments to another function taking the same struct type.
+ */
+#include <stdio.h>
+
+typedef struct { double real; double imag; } Complex;
+
+static Complex c_1 = {1.0, 0.0};
+
+Complex identity(Complex x) { return x; }
+
+Complex divide(Complex a, Complex b) {
+    double d = b.real*b.real + b.imag*b.imag;
+    Complex r = {(a.real*b.real + a.imag*b.imag) / d,
+                 (a.imag*b.real - a.real*b.imag) / d};
+    return r;
+}
+
+/* Chain: divide(c_1, identity(x)) */
+Complex reciprocal(Complex x) {
+    return divide(c_1, identity(x));
+}
+
+static __attribute__((noinline)) int t_two_sse_struct_abi(void)
+{
+    Complex x = {2.0, 1.0};
+    Complex r = reciprocal(x);
+    /* 1/(2+i) = (0.4, -0.2) */
+    if (r.real != 0.4) return 1;
+    if (r.imag != -0.2) return 2;
+
+    /* Direct chaining */
+    Complex a = {3.0, 4.0};
+    Complex b = divide(a, identity(a));
+    if (b.real != 1.0) return 3;
+    if (b.imag != 0.0) return 4;
+
+    return 0;
+}
+
+/* ---- codegen_float16_struct_returns_in_a_register: exits 22..29
+ * A struct holding `_Float16` is returned in an SSE register, not through a
+ * hidden pointer.
+ *
+ * `_Float16` was missing from the ABI classifier's notion of a floating type,
+ * so an eightbyte holding one answered MEMORY. The caller then expected the
+ * callee to have written the value through a hidden pointer, the callee
+ * returned it in registers instead, and the result read back as zero -- with
+ * no diagnostic. Checked against gcc, which returns it in xmm0.
+ */
+struct H  { _Float16 v; };
+struct H2 { _Float16 a, v; };
+struct F  { float v; };
+struct D  { double a, v; };
+
+__attribute__((noinline)) static struct H  mk(void)  { struct H r;  r.v = 2.5f16; return r; }
+__attribute__((noinline)) static struct H2 mk2(void) { struct H2 r; r.a = 1.5f16; r.v = 2.5f16; return r; }
+__attribute__((noinline)) static struct F  mkf(void) { struct F r;  r.v = 3.5f;   return r; }
+__attribute__((noinline)) static struct D  mkd(void) { struct D r;  r.a = 1.0; r.v = 4.5; return r; }
+
+__attribute__((noinline)) static _Float16 take(struct H a)  { return a.v; }
+__attribute__((noinline)) static _Float16 take2(struct H2 a) { return a.v; }
+__attribute__((noinline)) static _Float16 scalar(_Float16 a, _Float16 b) { return a + b; }
+
+static __attribute__((noinline)) int t_float16_struct_returns_in_a_register(void)
+{
+    if ((float)mk().v != 2.5f) return 1;
+    if ((float)mk2().v != 2.5f) return 2;
+    if ((float)mk2().a != 1.5f) return 3;
+
+    struct H h = mk();
+    if ((float)take(h) != 2.5f) return 4;
+    struct H2 h2 = mk2();
+    if ((float)take2(h2) != 2.5f) return 5;
+
+    /* A scalar `_Float16` is an SSE argument too; it used to be counted as an
+       integer one, which only worked because the two sides kept separate
+       indices. */
+    if ((float)scalar(1.5f16, 2.5f16) != 4.0f) return 6;
+
+    /* Controls: the float and two-double shapes were already right. */
+    if (mkf().v != 3.5f) return 7;
+    if (mkd().v != 4.5) return 8;
+
+    return 0;
+}
+
+/* ---- codegen_long_double_aggregate_returns_in_st0: exits 30..42
+ * An aggregate that is nothing but a `long double` is returned in st(0).
+ *
+ * System V classifies its two eightbytes X87 and X87UP, and X87UP is preceded
+ * by X87, so the merge-to-MEMORY rule does not fire: gcc emits `fld1; ret` for
+ * `struct R { long double v; } f(void)`. c17 decided sret by raw size instead
+ * -- and 128 bits is not *greater* than 128 -- so it took the two-register
+ * path, returned RAX:RDX, and the caller read a slot nothing had written.
+ * The value came back as zero.
+ *
+ * The moment anything shares an eightbyte the merge rules do apply, so
+ * `union { long double v; double d; }` is MEMORY and really is returned
+ * through a hidden pointer. Both halves are checked here, against gcc.
+ */
+struct R  { long double v; };
+struct I  { long double v; };
+struct N  { struct I v; };
+struct A  { long double v[1]; };
+union  U  { long double v; };
+union  M  { long double v; double d; };   /* X87 merged with SSE -> MEMORY */
+struct W  { long double v; int tag; };    /* over two eightbytes -> MEMORY */
+
+__attribute__((noinline)) static struct R fo4_mk(void)  { struct R r; r.v = 3.25L; return r; }
+__attribute__((noinline)) static struct N mkn(void) { struct N r; r.v.v = 3.25L; return r; }
+__attribute__((noinline)) static struct A mka(void) { struct A r; r.v[0] = 3.25L; return r; }
+__attribute__((noinline)) static union  U mku(void) { union  U r; r.v = 3.25L; return r; }
+__attribute__((noinline)) static union  M mkm(void) { union  M r; r.v = 3.25L; return r; }
+__attribute__((noinline)) static struct W mkw(void) { struct W r; r.v = 3.25L; r.tag = 7; return r; }
+
+/* Small enough to tempt the inliner: its `Ret` carries an address, which must
+   not be spliced into a caller expecting a value. */
+static struct R mk_inlinable(void) { struct R r; r.v = 6.5L; return r; }
+
+static __attribute__((noinline)) int t_long_double_aggregate_returns_in_st0(void)
+{
+    if (fo4_mk().v  != 3.25L) return 1;
+    if (mkn().v.v != 3.25L) return 2;
+    /* Through a local: indexing an array member of a call-result rvalue is a
+       separate, pre-existing defect that has nothing to do with the return
+       class -- it fails for `struct { int v[2]; }` too. */
+    struct A arr = mka();
+    if (arr.v[0] != 3.25L) return 3;
+    if (mku().v != 3.25L) return 4;
+    if (mkm().v != 3.25L) return 5;
+    if (mkw().v != 3.25L || mkw().tag != 7) return 6;
+
+    /* Assigned through a local, and used twice in one expression. */
+    struct R a = fo4_mk();
+    if (a.v != 3.25L) return 7;
+    if (fo4_mk().v + fo4_mk().v != 6.5L) return 8;
+
+    /* The inlinable one, twice, so a spliced body would be caught. */
+    if (mk_inlinable().v != 6.5L) return 9;
+    struct R b = mk_inlinable();
+    if (b.v != 6.5L) return 10;
+    if (mk_inlinable().v + mk_inlinable().v != 13.0L) return 11;
+
+    /* A long double local must survive all of it. */
+    long double keep = 1.5L;
+    if (fo4_mk().v != 3.25L) return 12;
+    if (keep != 1.5L) return 13;
+
+    return 0;
+}
+
+/* ---- codegen_medium_struct_passes_in_registers: exits 43..54
+ * A nine-to-sixteen-byte integer or mixed struct travels in two registers.
+ *
+ * System V classifies each eightbyte independently: `struct { long a, b; }` is
+ * two general registers, `struct { double a; int b; }` is an SSE register and
+ * a general one. c17 passed a *pointer* in one general register instead. Both
+ * sides of a c17 translation unit agreed, so running a program could never
+ * catch it -- it only bites against a gcc-compiled peer, which is why this is
+ * checked here for behaviour and by an assembly probe for the register file.
+ *
+ * Also covers the two accounting rules the register form needs: an argument
+ * that does not fit goes to memory *whole* (System V 3.2.3 step 5), and a
+ * struct before an ellipsis spends every register it occupies, or `va_start`
+ * reads the save area at the wrong index.
+ */
+#include <stdarg.h>
+
+struct LL { long a, b; };
+struct DI { double a; int b; };
+struct ID { int a; double b; };
+struct III { int a, b, c; };
+struct PAD { char pad[12]; int v; };
+struct DD { double a, b; };          /* control: already correct */
+struct I1 { int v; };                /* control: one eightbyte */
+
+__attribute__((noinline)) static long  ll(struct LL s)  { return s.a + s.b; }
+__attribute__((noinline)) static double di(struct DI s) { return s.a + s.b; }
+__attribute__((noinline)) static double id(struct ID s) { return s.a + s.b; }
+__attribute__((noinline)) static int   iii(struct III s){ return s.a + s.b + s.c; }
+__attribute__((noinline)) static int   pad(struct PAD s){ return s.v; }
+__attribute__((noinline)) static double dd(struct DD s) { return s.a + s.b; }
+__attribute__((noinline)) static int    i1(struct I1 s) { return s.v; }
+
+/* The struct runs out of registers and must go to memory whole. */
+__attribute__((noinline)) static long over(long a, long b, long c, long d,
+                                           long e, long f, struct LL s)
+{ return a + b + c + d + e + f + s.a + s.b; }
+__attribute__((noinline)) static double overf(double a, double b, double c, double d,
+                                              double e, double f, double g, double h,
+                                              struct DI s)
+{ return a + b + c + d + e + f + g + h + s.a + s.b; }
+
+/* A register-pair struct before the ellipsis. */
+__attribute__((noinline)) static long va(struct LL s, ...)
+{
+    va_list ap; va_start(ap, s);
+    long x = va_arg(ap, long), y = va_arg(ap, long);
+    va_end(ap);
+    return s.a + s.b + x + y;
+}
+
+/* The argument crosses a call, so it has to survive a spill. */
+__attribute__((noinline)) static long ident(long v) { return v; }
+__attribute__((noinline)) static long cross(struct LL s)
+{ long t = ident(5); return s.a + s.b + t; }
+
+static __attribute__((noinline)) int t_medium_struct_passes_in_registers(void)
+{
+    struct LL  l = { 3, 4 };
+    struct DI  m = { 1.5, 2 };
+    struct ID  n = { 2, 1.5 };
+    struct III o = { 1, 2, 3 };
+    struct PAD p = { { 0 }, 9 };
+    struct DD  d = { 1.5, 2.5 };
+    struct I1  i = { 7 };
+
+    if (ll(l) != 7) return 1;
+    if (di(m) != 3.5) return 2;
+    if (id(n) != 3.5) return 3;
+    if (iii(o) != 6) return 4;
+    if (pad(p) != 9) return 5;
+
+    /* Controls: an all-SSE pair and a single eightbyte must not move. */
+    if (dd(d) != 4.0) return 6;
+    if (i1(i) != 7) return 7;
+
+    if (over(1, 2, 3, 4, 5, 6, l) != 28) return 8;
+    if (overf(1, 2, 3, 4, 5, 6, 7, 8, m) != 39.5) return 9;
+    if (va(l, 10L, 20L) != 37) return 10;
+    if (cross(l) != 12) return 11;
+
+    /* Passed straight through, so both directions run in one expression. */
+    if (ll((struct LL){ 5, 6 }) != 11) return 12;
+
+    return 0;
+}
+
+/* ---- codegen_sse_aggregate_advances_fp_arg_count: exits 55..62
+ * An eight-byte all-float aggregate is one whole XMM register by its class,
+ * but the prologue's *counting-only* path for a spilled parameter asked the
+ * size instead -- `> 64 bits` -- and tallied it as a general register. Every
+ * FP argument behind it then read a register one too low: in `g(F2, D2)` the
+ * two-SSE `D2` was loaded from XMM0/XMM1, the second of which still held the
+ * `F2`.
+ *
+ * The register-emitting walk in the same function asks `sse_struct_regs` and
+ * was right all along, which is why this only shows when the parameter
+ * spills. `-O0`/`-O1` on x86-64; at `-O2` the callee inlines and the bug
+ * disappears. Values checked against `gcc -std=c17`.
+ */
+typedef struct { float a, b; } F2;
+typedef struct { float a; } F1;
+typedef struct { double a, b; } D2;
+typedef struct { long x; double y; } MIX;
+
+#define N __attribute__((noinline)) static
+N double g1(D2 f) { return f.a + f.b; }
+N double g2(F2 a, D2 f) { (void)a; return f.a + f.b; }
+N double g3(F1 a, D2 f) { (void)a; return f.a + f.b; }
+N double g4(F2 a, F2 b, D2 f) { (void)a; (void)b; return f.a + f.b; }
+N double g5(D2 f, F2 a) { (void)a; return f.a + f.b; }
+N double g6(F2 a, double x, D2 f) { (void)a; (void)x; return f.a + f.b; }
+N double g7(MIX m, D2 f) { (void)m; return f.a + f.b; }
+N double g8(F2 a, F2 b, F2 c, F2 d, F2 e, D2 f)
+{ return a.a + b.a + c.a + d.a + e.a + f.a + f.b; }
+
+static __attribute__((noinline)) int t_sse_aggregate_advances_fp_arg_count(void)
+{
+    F2 v = {2, 3};
+    F1 w = {4};
+    D2 r = {9, 10};
+    MIX m = {1, 2};
+
+    if (g1(r) != 19.0) return 1;
+    if (g2(v, r) != 19.0) return 2;
+    if (g3(w, r) != 19.0) return 3;
+    if (g4(v, v, r) != 19.0) return 4;
+    if (g5(r, v) != 19.0) return 5;
+    if (g6(v, 1.0, r) != 19.0) return 6;
+    if (g7(m, r) != 19.0) return 7;
+    if (g8(v, v, v, v, v, r) != 29.0) return 8;
+    return 0;
+}
+#undef N
+
+/* ---- codegen_overaligned_fp_locals: exits 63..68
+ * A frame whose locals are over-aligned addresses them through `%rsp`, since
+ * `andq $-64, %rsp` breaks the fixed relationship to `%rbp`. `stack_mem`
+ * exists to pick the right base, and the floating-point paths spelled the
+ * `%rbp` case out longhand instead -- eleven sites, every one of them losing
+ * the `%rsp` case. An over-aligned `double` array was zeroed at its real
+ * address and initialized somewhere else entirely.
+ *
+ * `long` was always fine, and so was `aligned(16)`: it takes an alignment
+ * past the natural one *and* a floating-point type to reach these paths.
+ */
+static __attribute__((noinline)) int t_overaligned_fp_locals(void)
+{
+    __attribute__((aligned(64))) double w[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    __attribute__((aligned(128))) float f[4] = {1.5f, 2.5f, 3.5f, 4.5f};
+    __attribute__((aligned(64))) double scalar = 2.25;
+    double s = 0;
+    float t = 0;
+    for (int i = 0; i < 10; i++) s += w[i];
+    for (int i = 0; i < 4; i++) t += f[i];
+
+    if (w[0] != 1.0 || w[9] != 10.0) return 1;
+    if (s != 55.0) return 2;
+    if (t != 12.0f) return 3;
+    if (scalar != 2.25) return 4;
+    /* Comparison and arithmetic read through the same paths. */
+    if (!(w[3] < w[4]) || !(w[9] > scalar)) return 5;
+    if (w[2] * w[3] != 12.0) return 6;
+    return 0;
+}
+
+/* ---- codegen_float16_constants_round_to_nearest_even: exits 69..80
+ * A `_Float16` constant rounds to nearest, ties to even.
+ *
+ * The conversion truncated the significand, which put every inexact
+ * `_Float16` constant one ulp below the value the source named: `0.3f16`
+ * came out 0.299805 where gcc gives 0.300049. So a program's constants
+ * disagreed with the same values computed at run time, and with every other
+ * compiler.
+ *
+ * The aarch64 backend carried a verbatim copy of the conversion, which is
+ * what would have kept this fix on one target.
+ */
+static __attribute__((noinline)) int t_float16_constants_round_to_nearest_even(void)
+{
+    /* The headline case: 0.3 is 1.2 x 2^-2, and 0.2 x 1024 is 204.8, so the
+       fraction rounds up to 205 -- truncation gave 204. */
+    _Float16 a = 0.3f16;
+    if ((float)a <= 0.30004f || (float)a >= 0.30006f) return 1;
+
+    /* Rounding up and rounding down both have to happen. */
+    _Float16 b = 1.0009765625f16;   /* exactly representable: 1 + 1/1024 */
+    if ((float)b != 1.0009765625f) return 2;
+
+    /* A tie rounds to even, not away from zero. Above 2048 the spacing is 2,
+       so every odd value is exactly halfway between two representable ones,
+       and the one with the even fraction wins -- which sends ties in both
+       directions. Truncation would send all four down. */
+    _Float16 t1 = 2049.0f16;   /* between 2048 and 2050; 2048 is even */
+    _Float16 t2 = 2051.0f16;   /* between 2050 and 2052; 2052 is even */
+    _Float16 t3 = 2053.0f16;   /* between 2052 and 2054; 2052 is even */
+    _Float16 t4 = 2055.0f16;   /* between 2054 and 2056; 2056 is even */
+    if ((float)t1 != 2048.0f) return 3;
+    if ((float)t2 != 2052.0f) return 4;
+    if ((float)t3 != 2052.0f) return 11;
+    if ((float)t4 != 2056.0f) return 12;
+
+    /* Exact values are unaffected. */
+    if ((float)(_Float16)1.0f16 != 1.0f) return 5;
+    if ((float)(_Float16)0.5f16 != 0.5f) return 6;
+    if ((float)(_Float16)(-2.0f16) != -2.0f) return 7;
+    if ((float)(_Float16)0.0f16 != 0.0f) return 8;
+
+    /* Overflow and underflow still saturate. */
+    _Float16 big = 1e30f16;
+    if (!(big > 60000.0f16 || big != big)) return 9;
+
+    /* A constant must agree with the same value converted at run time. */
+    volatile float src = 0.3f;
+    _Float16 converted = (_Float16)src;
+    if ((float)converted != (float)a) return 10;
+
+    return 0;
+}
+
+int main(void)
+{
+    int r;
+    if ((r = t_float_to_unsigned_long_long()) != 0) return r;
+    if ((r = t_two_sse_struct_abi()) != 0) return 17 + r;
+    if ((r = t_float16_struct_returns_in_a_register()) != 0) return 21 + r;
+    if ((r = t_long_double_aggregate_returns_in_st0()) != 0) return 29 + r;
+    if ((r = t_medium_struct_passes_in_registers()) != 0) return 42 + r;
+    if ((r = t_sse_aggregate_advances_fp_arg_count()) != 0) return 54 + r;
+    if ((r = t_overaligned_fp_locals()) != 0) return 62 + r;
+    if ((r = t_float16_constants_round_to_nearest_even()) != 0) return 68 + r;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("floating_abi_mega", code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("floating_abi_mega_opt", code), 0);
+}
+
+#[test]
+fn codegen_float_to_unsigned_long_long_aarch64() {
+    // aarch64 has `fcvtzu` and was never wrong here; the test pins that, and
+    // catches a "fix" applied to the wrong target.
+    if let Some(code) = compile_and_run_aarch64("float_to_unsigned_a64", FLOAT_TO_UNSIGNED, "-O2") {
+        assert_eq!(code, 0);
+    }
+}
+
+/// Regression test: FP binary operations (FMul, FDiv, etc.) clobbered src2
+/// when src2 was in the same XMM register as dst_xmm (Xmm0 for stack targets).
+/// emit_fp_move(src1, Xmm0) overwrote src2 before the operation.
+/// Manifested as `x *= scale` computing `x * x` instead of `x * scale`.
+#[test]
+fn codegen_fp_binop_src2_clobber() {
+    let code = r#"
+#include <math.h>
+
+/* Force enough register pressure that scale ends up in Xmm0 */
+__attribute__((noinline))
+double vector_norm_mini(int n, double *vec, double max) {
+    double x, scale, csum = 1.0, frac1 = 0.0;
+    int max_e;
+
+    frexp(max, &max_e);
+    scale = ldexp(1.0, -max_e);
+
+    for (int i = 0; i < n; i++) {
+        x = vec[i];
+        x *= scale;  /* Bug: became x *= x when scale was in Xmm0 */
+        double sq = x * x;
+        csum += sq;
+        frac1 += sq * 0.001;
+    }
+    double h = sqrt(csum - 1.0 + frac1);
+    return h / scale;
+}
+
+int main(void) {
+    double vec[] = {3.0, 4.0};
+    double r = vector_norm_mini(2, vec, 4.0);
+    /* Expected: sqrt((3/8)^2 + (4/8)^2 + frac) / (1/8) ≈ 5.0 */
+    if (r < 4.9 || r > 5.1) return 1;
+
+    double vec2[] = {5.0, 12.0};
+    r = vector_norm_mini(2, vec2, 12.0);
+    if (r < 12.9 || r > 13.1) return 2;
+
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("codegen_fp_binop_src2_clobber", code, &["-lm".to_string()]),
+        0
+    );
+}
+
+/// A `_Float16` store writes two bytes, not four.
+///
+/// x86-64 stored a half with `movss`, which writes four bytes: assigning one
+/// member of a struct of `_Float16`s overwrote the next member, and storing
+/// the imaginary half of a `_Float16 _Complex` wrote two bytes past the
+/// object. SSE2 has no two-byte store from an XMM register, so the value
+/// goes through a general register, as gcc does.
+#[test]
+fn codegen_float16_store_writes_two_bytes() {
+    let code = r#"
+typedef _Float16 _Complex hc;
+struct S { _Float16 a, b, c, d; };
+_Float16 g[4] = {1, 2, 3, 4};
+__attribute__((noinline)) void member(struct S *p, _Float16 v) { p->b = v; }
+__attribute__((noinline)) void global(_Float16 v) { g[1] = v; }
+__attribute__((noinline)) void whole(hc *p, hc v) { *p = v; }
+__attribute__((noinline)) void imag(hc *p, _Float16 v) { __imag__ *p = v; }
+__attribute__((noinline)) void real(hc *p, _Float16 v) { __real__ *p = v; }
+static hc mk(int r, int i) { return __builtin_complex((_Float16)r, (_Float16)i); }
+int main(void) {
+    struct S s = {1, 2, 3, 4};
+    member(&s, 9);
+    if (s.a != 1 || s.b != 9 || s.c != 3 || s.d != 4) return 1;
+    global(9);
+    if (g[0] != 1 || g[1] != 9 || g[2] != 3 || g[3] != 4) return 2;
+    hc arr[3] = {mk(1, 2), mk(3, 4), mk(5, 6)};
+    whole(&arr[1], mk(7, 8));
+    if (__imag__ arr[0] != 2 || __real__ arr[1] != 7 || __imag__ arr[1] != 8
+        || __real__ arr[2] != 5)
+        return 3;
+    imag(&arr[0], 10);
+    if (__real__ arr[0] != 1 || __imag__ arr[0] != 10 || __real__ arr[1] != 7) return 4;
+    real(&arr[1], 11);
+    if (__real__ arr[1] != 11 || __imag__ arr[1] != 8 || __real__ arr[2] != 5) return 5;
+    /* A local struct's member, addressed from the frame. */
+    struct S t = {1, 2, 3, 4};
+    volatile _Float16 v = 9;
+    t.b = v;
+    if (t.a != 1 || t.b != 9 || t.c != 3) return 6;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(&format!("float16_store{opt}"), code, &[opt.to_string()]),
+            0,
+            "host {opt}"
+        );
+        if let Some(rc) = compile_and_run_aarch64(&format!("float16_store_a64{opt}"), code, opt) {
+            assert_eq!(rc, 0, "aarch64 {opt}");
+        }
+    }
 }
 
 // ============================================================================
@@ -1469,393 +1870,6 @@ int main(void)
     );
     assert_eq!(
         compile_and_run_optimized("codegen_x87_scratch_no_clobber_opt", code),
-        0
-    );
-}
-
-/// A struct holding `_Float16` is returned in an SSE register, not through a
-/// hidden pointer.
-///
-/// `_Float16` was missing from the ABI classifier's notion of a floating type,
-/// so an eightbyte holding one answered MEMORY. The caller then expected the
-/// callee to have written the value through a hidden pointer, the callee
-/// returned it in registers instead, and the result read back as zero -- with
-/// no diagnostic. Checked against gcc, which returns it in xmm0.
-#[test]
-fn codegen_float16_struct_returns_in_a_register() {
-    let code = r#"
-struct H  { _Float16 v; };
-struct H2 { _Float16 a, v; };
-struct F  { float v; };
-struct D  { double a, v; };
-
-__attribute__((noinline)) static struct H  mk(void)  { struct H r;  r.v = 2.5f16; return r; }
-__attribute__((noinline)) static struct H2 mk2(void) { struct H2 r; r.a = 1.5f16; r.v = 2.5f16; return r; }
-__attribute__((noinline)) static struct F  mkf(void) { struct F r;  r.v = 3.5f;   return r; }
-__attribute__((noinline)) static struct D  mkd(void) { struct D r;  r.a = 1.0; r.v = 4.5; return r; }
-
-__attribute__((noinline)) static _Float16 take(struct H a)  { return a.v; }
-__attribute__((noinline)) static _Float16 take2(struct H2 a) { return a.v; }
-__attribute__((noinline)) static _Float16 scalar(_Float16 a, _Float16 b) { return a + b; }
-
-int main(void)
-{
-    if ((float)mk().v != 2.5f) return 1;
-    if ((float)mk2().v != 2.5f) return 2;
-    if ((float)mk2().a != 1.5f) return 3;
-
-    struct H h = mk();
-    if ((float)take(h) != 2.5f) return 4;
-    struct H2 h2 = mk2();
-    if ((float)take2(h2) != 2.5f) return 5;
-
-    /* A scalar `_Float16` is an SSE argument too; it used to be counted as an
-       integer one, which only worked because the two sides kept separate
-       indices. */
-    if ((float)scalar(1.5f16, 2.5f16) != 4.0f) return 6;
-
-    /* Controls: the float and two-double shapes were already right. */
-    if (mkf().v != 3.5f) return 7;
-    if (mkd().v != 4.5) return 8;
-
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("codegen_float16_struct_return", code, &[]),
-        0
-    );
-    assert_eq!(
-        compile_and_run_optimized("codegen_float16_struct_return_opt", code),
-        0
-    );
-}
-
-/// An aggregate that is nothing but a `long double` is returned in st(0).
-///
-/// System V classifies its two eightbytes X87 and X87UP, and X87UP is preceded
-/// by X87, so the merge-to-MEMORY rule does not fire: gcc emits `fld1; ret` for
-/// `struct R { long double v; } f(void)`. c17 decided sret by raw size instead
-/// -- and 128 bits is not *greater* than 128 -- so it took the two-register
-/// path, returned RAX:RDX, and the caller read a slot nothing had written.
-/// The value came back as zero.
-///
-/// The moment anything shares an eightbyte the merge rules do apply, so
-/// `union { long double v; double d; }` is MEMORY and really is returned
-/// through a hidden pointer. Both halves are checked here, against gcc.
-#[test]
-fn codegen_long_double_aggregate_returns_in_st0() {
-    let code = r#"
-struct R  { long double v; };
-struct I  { long double v; };
-struct N  { struct I v; };
-struct A  { long double v[1]; };
-union  U  { long double v; };
-union  M  { long double v; double d; };   /* X87 merged with SSE -> MEMORY */
-struct W  { long double v; int tag; };    /* over two eightbytes -> MEMORY */
-
-__attribute__((noinline)) static struct R mk(void)  { struct R r; r.v = 3.25L; return r; }
-__attribute__((noinline)) static struct N mkn(void) { struct N r; r.v.v = 3.25L; return r; }
-__attribute__((noinline)) static struct A mka(void) { struct A r; r.v[0] = 3.25L; return r; }
-__attribute__((noinline)) static union  U mku(void) { union  U r; r.v = 3.25L; return r; }
-__attribute__((noinline)) static union  M mkm(void) { union  M r; r.v = 3.25L; return r; }
-__attribute__((noinline)) static struct W mkw(void) { struct W r; r.v = 3.25L; r.tag = 7; return r; }
-
-/* Small enough to tempt the inliner: its `Ret` carries an address, which must
-   not be spliced into a caller expecting a value. */
-static struct R mk_inlinable(void) { struct R r; r.v = 6.5L; return r; }
-
-int main(void)
-{
-    if (mk().v  != 3.25L) return 1;
-    if (mkn().v.v != 3.25L) return 2;
-    /* Through a local: indexing an array member of a call-result rvalue is a
-       separate, pre-existing defect that has nothing to do with the return
-       class -- it fails for `struct { int v[2]; }` too. */
-    struct A arr = mka();
-    if (arr.v[0] != 3.25L) return 3;
-    if (mku().v != 3.25L) return 4;
-    if (mkm().v != 3.25L) return 5;
-    if (mkw().v != 3.25L || mkw().tag != 7) return 6;
-
-    /* Assigned through a local, and used twice in one expression. */
-    struct R a = mk();
-    if (a.v != 3.25L) return 7;
-    if (mk().v + mk().v != 6.5L) return 8;
-
-    /* The inlinable one, twice, so a spliced body would be caught. */
-    if (mk_inlinable().v != 6.5L) return 9;
-    struct R b = mk_inlinable();
-    if (b.v != 6.5L) return 10;
-    if (mk_inlinable().v + mk_inlinable().v != 13.0L) return 11;
-
-    /* A long double local must survive all of it. */
-    long double keep = 1.5L;
-    if (mk().v != 3.25L) return 12;
-    if (keep != 1.5L) return 13;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("codegen_ld_aggregate_return", code, &[]), 0);
-    // -O2 as well: the inliner sees an address-carrying `Ret` only there.
-    assert_eq!(
-        compile_and_run_optimized("codegen_ld_aggregate_return_opt", code),
-        0
-    );
-}
-
-/// A nine-to-sixteen-byte integer or mixed struct travels in two registers.
-///
-/// System V classifies each eightbyte independently: `struct { long a, b; }` is
-/// two general registers, `struct { double a; int b; }` is an SSE register and
-/// a general one. c17 passed a *pointer* in one general register instead. Both
-/// sides of a c17 translation unit agreed, so running a program could never
-/// catch it -- it only bites against a gcc-compiled peer, which is why this is
-/// checked here for behaviour and by an assembly probe for the register file.
-///
-/// Also covers the two accounting rules the register form needs: an argument
-/// that does not fit goes to memory *whole* (System V 3.2.3 step 5), and a
-/// struct before an ellipsis spends every register it occupies, or `va_start`
-/// reads the save area at the wrong index.
-#[test]
-fn codegen_medium_struct_passes_in_registers() {
-    let code = r#"
-#include <stdarg.h>
-
-struct LL { long a, b; };
-struct DI { double a; int b; };
-struct ID { int a; double b; };
-struct III { int a, b, c; };
-struct PAD { char pad[12]; int v; };
-struct DD { double a, b; };          /* control: already correct */
-struct I1 { int v; };                /* control: one eightbyte */
-
-__attribute__((noinline)) static long  ll(struct LL s)  { return s.a + s.b; }
-__attribute__((noinline)) static double di(struct DI s) { return s.a + s.b; }
-__attribute__((noinline)) static double id(struct ID s) { return s.a + s.b; }
-__attribute__((noinline)) static int   iii(struct III s){ return s.a + s.b + s.c; }
-__attribute__((noinline)) static int   pad(struct PAD s){ return s.v; }
-__attribute__((noinline)) static double dd(struct DD s) { return s.a + s.b; }
-__attribute__((noinline)) static int    i1(struct I1 s) { return s.v; }
-
-/* The struct runs out of registers and must go to memory whole. */
-__attribute__((noinline)) static long over(long a, long b, long c, long d,
-                                           long e, long f, struct LL s)
-{ return a + b + c + d + e + f + s.a + s.b; }
-__attribute__((noinline)) static double overf(double a, double b, double c, double d,
-                                              double e, double f, double g, double h,
-                                              struct DI s)
-{ return a + b + c + d + e + f + g + h + s.a + s.b; }
-
-/* A register-pair struct before the ellipsis. */
-__attribute__((noinline)) static long va(struct LL s, ...)
-{
-    va_list ap; va_start(ap, s);
-    long x = va_arg(ap, long), y = va_arg(ap, long);
-    va_end(ap);
-    return s.a + s.b + x + y;
-}
-
-/* The argument crosses a call, so it has to survive a spill. */
-__attribute__((noinline)) static long ident(long v) { return v; }
-__attribute__((noinline)) static long cross(struct LL s)
-{ long t = ident(5); return s.a + s.b + t; }
-
-int main(void)
-{
-    struct LL  l = { 3, 4 };
-    struct DI  m = { 1.5, 2 };
-    struct ID  n = { 2, 1.5 };
-    struct III o = { 1, 2, 3 };
-    struct PAD p = { { 0 }, 9 };
-    struct DD  d = { 1.5, 2.5 };
-    struct I1  i = { 7 };
-
-    if (ll(l) != 7) return 1;
-    if (di(m) != 3.5) return 2;
-    if (id(n) != 3.5) return 3;
-    if (iii(o) != 6) return 4;
-    if (pad(p) != 9) return 5;
-
-    /* Controls: an all-SSE pair and a single eightbyte must not move. */
-    if (dd(d) != 4.0) return 6;
-    if (i1(i) != 7) return 7;
-
-    if (over(1, 2, 3, 4, 5, 6, l) != 28) return 8;
-    if (overf(1, 2, 3, 4, 5, 6, 7, 8, m) != 39.5) return 9;
-    if (va(l, 10L, 20L) != 37) return 10;
-    if (cross(l) != 12) return 11;
-
-    /* Passed straight through, so both directions run in one expression. */
-    if (ll((struct LL){ 5, 6 }) != 11) return 12;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("codegen_medium_struct_regs", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("codegen_medium_struct_regs_opt", code),
-        0
-    );
-}
-
-/// An eight-byte all-float aggregate is one whole XMM register by its class,
-/// but the prologue's *counting-only* path for a spilled parameter asked the
-/// size instead -- `> 64 bits` -- and tallied it as a general register. Every
-/// FP argument behind it then read a register one too low: in `g(F2, D2)` the
-/// two-SSE `D2` was loaded from XMM0/XMM1, the second of which still held the
-/// `F2`.
-///
-/// The register-emitting walk in the same function asks `sse_struct_regs` and
-/// was right all along, which is why this only shows when the parameter
-/// spills. `-O0`/`-O1` on x86-64; at `-O2` the callee inlines and the bug
-/// disappears. Values checked against `gcc -std=c17`.
-#[test]
-fn codegen_sse_aggregate_advances_fp_arg_count() {
-    let code = r#"
-typedef struct { float a, b; } F2;
-typedef struct { float a; } F1;
-typedef struct { double a, b; } D2;
-typedef struct { long x; double y; } MIX;
-
-#define N __attribute__((noinline)) static
-N double g1(D2 f) { return f.a + f.b; }
-N double g2(F2 a, D2 f) { (void)a; return f.a + f.b; }
-N double g3(F1 a, D2 f) { (void)a; return f.a + f.b; }
-N double g4(F2 a, F2 b, D2 f) { (void)a; (void)b; return f.a + f.b; }
-N double g5(D2 f, F2 a) { (void)a; return f.a + f.b; }
-N double g6(F2 a, double x, D2 f) { (void)a; (void)x; return f.a + f.b; }
-N double g7(MIX m, D2 f) { (void)m; return f.a + f.b; }
-N double g8(F2 a, F2 b, F2 c, F2 d, F2 e, D2 f)
-{ return a.a + b.a + c.a + d.a + e.a + f.a + f.b; }
-
-int main(void) {
-    F2 v = {2, 3};
-    F1 w = {4};
-    D2 r = {9, 10};
-    MIX m = {1, 2};
-
-    if (g1(r) != 19.0) return 1;
-    if (g2(v, r) != 19.0) return 2;
-    if (g3(w, r) != 19.0) return 3;
-    if (g4(v, v, r) != 19.0) return 4;
-    if (g5(r, v) != 19.0) return 5;
-    if (g6(v, 1.0, r) != 19.0) return 6;
-    if (g7(m, r) != 19.0) return 7;
-    if (g8(v, v, v, v, v, r) != 29.0) return 8;
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("codegen_sse_aggregate_advances_fp_arg_count", code, &[]),
-        0
-    );
-    assert_eq!(
-        compile_and_run_optimized("codegen_sse_aggregate_advances_fp_arg_count_opt", code),
-        0
-    );
-}
-
-/// A frame whose locals are over-aligned addresses them through `%rsp`, since
-/// `andq $-64, %rsp` breaks the fixed relationship to `%rbp`. `stack_mem`
-/// exists to pick the right base, and the floating-point paths spelled the
-/// `%rbp` case out longhand instead -- eleven sites, every one of them losing
-/// the `%rsp` case. An over-aligned `double` array was zeroed at its real
-/// address and initialized somewhere else entirely.
-///
-/// `long` was always fine, and so was `aligned(16)`: it takes an alignment
-/// past the natural one *and* a floating-point type to reach these paths.
-#[test]
-fn codegen_overaligned_fp_locals() {
-    let code = r#"
-int main(void) {
-    __attribute__((aligned(64))) double w[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-    __attribute__((aligned(128))) float f[4] = {1.5f, 2.5f, 3.5f, 4.5f};
-    __attribute__((aligned(64))) double scalar = 2.25;
-    double s = 0;
-    float t = 0;
-    for (int i = 0; i < 10; i++) s += w[i];
-    for (int i = 0; i < 4; i++) t += f[i];
-
-    if (w[0] != 1.0 || w[9] != 10.0) return 1;
-    if (s != 55.0) return 2;
-    if (t != 12.0f) return 3;
-    if (scalar != 2.25) return 4;
-    /* Comparison and arithmetic read through the same paths. */
-    if (!(w[3] < w[4]) || !(w[9] > scalar)) return 5;
-    if (w[2] * w[3] != 12.0) return 6;
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("codegen_overaligned_fp_locals", code, &[]),
-        0
-    );
-    assert_eq!(
-        compile_and_run_optimized("codegen_overaligned_fp_locals_opt", code),
-        0
-    );
-}
-
-/// A `_Float16` constant rounds to nearest, ties to even.
-///
-/// The conversion truncated the significand, which put every inexact
-/// `_Float16` constant one ulp below the value the source named: `0.3f16`
-/// came out 0.299805 where gcc gives 0.300049. So a program's constants
-/// disagreed with the same values computed at run time, and with every other
-/// compiler.
-///
-/// The aarch64 backend carried a verbatim copy of the conversion, which is
-/// what would have kept this fix on one target.
-#[test]
-fn codegen_float16_constants_round_to_nearest_even() {
-    let code = r#"
-int main(void)
-{
-    /* The headline case: 0.3 is 1.2 x 2^-2, and 0.2 x 1024 is 204.8, so the
-       fraction rounds up to 205 -- truncation gave 204. */
-    _Float16 a = 0.3f16;
-    if ((float)a <= 0.30004f || (float)a >= 0.30006f) return 1;
-
-    /* Rounding up and rounding down both have to happen. */
-    _Float16 b = 1.0009765625f16;   /* exactly representable: 1 + 1/1024 */
-    if ((float)b != 1.0009765625f) return 2;
-
-    /* A tie rounds to even, not away from zero. Above 2048 the spacing is 2,
-       so every odd value is exactly halfway between two representable ones,
-       and the one with the even fraction wins -- which sends ties in both
-       directions. Truncation would send all four down. */
-    _Float16 t1 = 2049.0f16;   /* between 2048 and 2050; 2048 is even */
-    _Float16 t2 = 2051.0f16;   /* between 2050 and 2052; 2052 is even */
-    _Float16 t3 = 2053.0f16;   /* between 2052 and 2054; 2052 is even */
-    _Float16 t4 = 2055.0f16;   /* between 2054 and 2056; 2056 is even */
-    if ((float)t1 != 2048.0f) return 3;
-    if ((float)t2 != 2052.0f) return 4;
-    if ((float)t3 != 2052.0f) return 11;
-    if ((float)t4 != 2056.0f) return 12;
-
-    /* Exact values are unaffected. */
-    if ((float)(_Float16)1.0f16 != 1.0f) return 5;
-    if ((float)(_Float16)0.5f16 != 0.5f) return 6;
-    if ((float)(_Float16)(-2.0f16) != -2.0f) return 7;
-    if ((float)(_Float16)0.0f16 != 0.0f) return 8;
-
-    /* Overflow and underflow still saturate. */
-    _Float16 big = 1e30f16;
-    if (!(big > 60000.0f16 || big != big)) return 9;
-
-    /* A constant must agree with the same value converted at run time. */
-    volatile float src = 0.3f;
-    _Float16 converted = (_Float16)src;
-    if ((float)converted != (float)a) return 10;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("float16_round_nearest", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("float16_round_nearest_opt", code),
         0
     );
 }
@@ -2110,18 +2124,30 @@ int main(void)
     }
 }
 
-/// A complex value, a complex cast, `__builtin_complex`, a `__sync` CAS and an
-/// atomic floating-point read-modify-write each need a temporary in memory.
-/// They were `alloca`s, which grow the stack on every evaluation and are
-/// released only at return, so the same expression in a loop exhausted the
-/// stack: two million iterations is far past 8 MB.
+/// Floating-point builtins and folds, one program run on the host at the
+/// matrix levels, -O0 and -O2, and on aarch64 at -O0 and -O2.
 ///
-/// The halves are read through the array representation C17 6.2.5p13
-/// guarantees rather than `creal`/`conj`, which live in libm and would need a
-/// `-lm` this harness does not pass.
+/// Consolidates these tests, one section each (each original `main` is
+/// a `noinline` section function; the program exits with the section's
+/// base plus the original code):
+/// - `codegen_expression_temporaries_do_not_grow_the_stack`: 1..=5
+/// - `codegen_float_comparison_folds_agree_with_run_time`: 6..=8
+/// - `codegen_stdio_library_builtins`: 9..=17
+/// - `codegen_builtin_iseqsig`: 18..=30
 #[test]
-fn codegen_expression_temporaries_do_not_grow_the_stack() {
-    let src = r#"
+fn codegen_floating_everywhere_mega() {
+    let code = r#"
+/* ---- codegen_expression_temporaries_do_not_grow_the_stack: exits 1..5
+ * A complex value, a complex cast, `__builtin_complex`, a `__sync` CAS and an
+ * atomic floating-point read-modify-write each need a temporary in memory.
+ * They were `alloca`s, which grow the stack on every evaluation and are
+ * released only at return, so the same expression in a loop exhausted the
+ * stack: two million iterations is far past 8 MB.
+ *
+ * The halves are read through the array representation C17 6.2.5p13
+ * guarantees rather than `creal`/`conj`, which live in libm and would need a
+ * `-lm` this harness does not pass.
+ */
 #include <complex.h>
 
 volatile double v = 1.0;
@@ -2131,7 +2157,7 @@ _Atomic double ad;
 static double re(double complex c) { return ((double *)&c)[0]; }
 static double im(double complex c) { return ((double *)&c)[1]; }
 
-int main(void)
+static __attribute__((noinline)) int t_expression_temporaries_do_not_grow_the_stack(void)
 {
     double complex z = 0;
     double acc = 0;
@@ -2153,23 +2179,16 @@ int main(void)
     if (acc < 0) return 5;
     return 0;
 }
-"#;
-    compile_and_run_everywhere("expression_temporaries", src);
-}
 
-/// Every float comparison the optimizer decides without knowing its operands
-/// -- against a NaN or an infinity, a value against itself, and `&&`/`||`/`!`
-/// over comparisons of one pair -- must give the answer the unoptimized
-/// program gives, for NaN, both infinities and both zeros, in `float`,
-/// `double` and `long double`. The expected answers come from a rank table
-/// in integer arithmetic, never from a float comparison the compiler could
-/// fold the same wrong way; a fold that forgets a NaN is a wrong answer here.
-#[test]
-fn codegen_float_comparison_folds_agree_with_run_time() {
-    compile_and_run_everywhere("fcmp_fold_answers", FCMP_FOLD_ANSWERS);
-}
-
-const FCMP_FOLD_ANSWERS: &str = r#"
+/* ---- codegen_float_comparison_folds_agree_with_run_time: exits 6..8
+ * Every float comparison the optimizer decides without knowing its operands
+ * -- against a NaN or an infinity, a value against itself, and `&&`/`||`/`!`
+ * over comparisons of one pair -- must give the answer the unoptimized
+ * program gives, for NaN, both infinities and both zeros, in `float`,
+ * `double` and `long double`. The expected answers come from a rank table
+ * in integer arithmetic, never from a float comparison the compiler could
+ * fold the same wrong way; a fold that forgets a NaN is a wrong answer here.
+ */
 /* Every comparison c17 now folds must give the answer the unfolded program
    gives. The expected answers are computed in integer arithmetic from a
    rank table, never by a floating comparison the compiler could fold the
@@ -2267,7 +2286,7 @@ DEFINE(float, f)
 DEFINE(double, d)
 DEFINE(long double, l)
 
-int main(void)
+static __attribute__((noinline)) int t_float_comparison_folds_agree_with_run_time(void)
 {
     int r;
     if ((r = run_f())) return 1;
@@ -2275,33 +2294,17 @@ int main(void)
     if ((r = run_l())) return 3;
     return 0;
 }
-"#;
+#undef NV
+#undef T
+#undef MIR
+#undef SIX
+#undef DEFINE
 
-/// The same folds as proofs: every `link_error` below is behind a comparison
-/// that is false for every operand, NaN included -- gcc.c-torture's
-/// `ieee/fp-cmp-6`, `-7`, `-9` and `compare-fp-3` in one program -- so it
-/// links only when the optimizer deletes all of them. Not at -O0, where no
-/// branch is folded.
-#[test]
-fn codegen_float_comparison_folds_remove_dead_calls() {
-    for opt in ["-O1", "-O2"] {
-        assert_eq!(
-            compile_and_run("fcmp_fold_link", FCMP_FOLD_LINK, &[opt.to_string()]),
-            0,
-            "at {opt}"
-        );
-        if let Some(code) = compile_and_run_aarch64("fcmp_fold_link", FCMP_FOLD_LINK, opt) {
-            assert_eq!(code, 0, "on aarch64 at {opt}");
-        }
-    }
-}
-
-/// `__builtin_fprintf`, `__builtin_fputs`, `__builtin_fputc` and
-/// `__builtin_fwrite` are the library functions under gcc's reserved names
-/// (execute/builtins/fprintf.c, fputs.c).
-#[test]
-fn codegen_stdio_library_builtins() {
-    let src = r#"
+/* ---- codegen_stdio_library_builtins: exits 9..17
+ * `__builtin_fprintf`, `__builtin_fputs`, `__builtin_fputc` and
+ * `__builtin_fwrite` are the library functions under gcc's reserved names
+ * (execute/builtins/fprintf.c, fputs.c).
+ */
 /* No <stdio.h>: the builtins must not need their library declarations. */
 typedef struct stdio_file FILE;
 typedef __SIZE_TYPE__ size_t;
@@ -2313,7 +2316,8 @@ int fflush(FILE *);
 int fclose(FILE *);
 int strcmp(const char *, const char *);
 
-int main(void) {
+static __attribute__((noinline)) int t_stdio_library_builtins(void)
+{
     char buf[64];
     FILE *f = tmpfile();
     if (!f) return 1;
@@ -2333,23 +2337,20 @@ int main(void) {
     fflush(out);
     return 0;
 }
-"#;
-    compile_and_run_everywhere("stdio_builtins", src);
-}
 
-/// `__builtin_iseqsig` is C23's `iseqsig`: ordered and equal, so false for
-/// any NaN, with the usual arithmetic conversions applied to mixed operands
-/// and each operand evaluated once (compile/pr122588-1).
-#[test]
-fn codegen_builtin_iseqsig() {
-    let src = r#"
+/* ---- codegen_builtin_iseqsig: exits 18..30
+ * `__builtin_iseqsig` is C23's `iseqsig`: ordered and equal, so false for
+ * any NaN, with the usual arithmetic conversions applied to mixed operands
+ * and each operand evaluated once (compile/pr122588-1).
+ */
 static volatile double zero = 0.0;
 static int eq_d(double a, double b) { return __builtin_iseqsig(a, b); }
 static int eq_f(float a, float b) { return __builtin_iseqsig(a, b); }
 static int eq_l(long double a, long double b) { return __builtin_iseqsig(a, b); }
 static int calls;
 static double next(double v) { calls++; return v; }
-int main(void) {
+static __attribute__((noinline)) int t_builtin_iseqsig(void)
+{
     double nan = zero / zero;
     float fnan = (float)nan;
     if (eq_d(1.5, 1.5) != 1) return 1;
@@ -2369,8 +2370,37 @@ int main(void) {
     if (__builtin_iseqsig(next(1.0), next(1.0)) != 1 || calls != 2) return 13;
     return 0;
 }
+
+int main(void)
+{
+    int r;
+    if ((r = t_expression_temporaries_do_not_grow_the_stack()) != 0) return r;
+    if ((r = t_float_comparison_folds_agree_with_run_time()) != 0) return 5 + r;
+    if ((r = t_stdio_library_builtins()) != 0) return 8 + r;
+    if ((r = t_builtin_iseqsig()) != 0) return 17 + r;
+    return 0;
+}
 "#;
-    compile_and_run_everywhere("iseqsig", src);
+    compile_and_run_everywhere("floating_everywhere_mega", code);
+}
+
+/// The same folds as proofs: every `link_error` below is behind a comparison
+/// that is false for every operand, NaN included -- gcc.c-torture's
+/// `ieee/fp-cmp-6`, `-7`, `-9` and `compare-fp-3` in one program -- so it
+/// links only when the optimizer deletes all of them. Not at -O0, where no
+/// branch is folded.
+#[test]
+fn codegen_float_comparison_folds_remove_dead_calls() {
+    for opt in ["-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run("fcmp_fold_link", FCMP_FOLD_LINK, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+        if let Some(code) = compile_and_run_aarch64("fcmp_fold_link", FCMP_FOLD_LINK, opt) {
+            assert_eq!(code, 0, "on aarch64 at {opt}");
+        }
+    }
 }
 
 // ============================================================================
@@ -2425,16 +2455,10 @@ fn codegen_x86_64_long_double_to_integer_is_baseline() {
             0,
             "{opt}"
         );
-        let asm = asm_for_at(
-            "ld_to_int_asm",
-            "int f(long double x) { return (int)x; }\n\
-             long g(long double x) { return (long)x; }\n\
-             unsigned long h(long double x) { return (unsigned long)x; }\n\
-             short k(long double x) { return (short)x; }\n",
-            &[opt],
-        );
-        assert!(!asm.contains("fisttp"), "{opt}: fisttp emitted:\n{asm}");
     }
+    // The assembly half, no `fisttp` at either level, is
+    // `codegen_x86_64_long_double_to_integer_emits_no_fisttp` in
+    // `cc/test_asm/codegen_floating.rs`.
 }
 
 /// A cast to `void` discards the value (C17 6.3.2.2) and converts nothing.

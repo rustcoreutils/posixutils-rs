@@ -1624,6 +1624,14 @@ fn test_option_listopt_cpio_keywords() {
         listopt_bytes(&archive, "[%(typeflag)s%(version)s%(chksum)s]%(c_bogus)s"),
         "[]%(c_bogus)s"
     );
+    // And a ustar member has no c_magic, while the unprefixed `magic` -- the
+    // ustar table's own name -- answers from whichever header it came from.
+    let tar = Ustar {
+        name: b"t.txt",
+        ..Default::default()
+    }
+    .archive();
+    assert_eq!(listopt_bytes(&tar, "[%(c_magic)s]|%(magic)s"), "[]|ustar");
 }
 
 /// The same keywords over an archive pax wrote itself, in the ODC format

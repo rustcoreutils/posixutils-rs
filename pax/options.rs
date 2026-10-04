@@ -1041,7 +1041,12 @@ fn cpio_keyword(info: &ListEntryInfo, keyword: &str) -> Option<Field> {
     let path = crate::rawpath::as_bytes(&info.entry.path);
 
     Some(match field {
-        "magic" => return Some(header_magic(info)),
+        // Only `c_magic` reaches here: the unprefixed `magic` is the ustar
+        // table's name, claimed by `ustar_keyword`, and answers from either
+        // header. `c_magic` names the cpio field specifically, so a ustar
+        // member has none -- the same reading as c_dev and c_ino below.
+        "magic" if cpio => return Some(header_magic(info)),
+        "magic" => Field::Absent,
         "dev" if cpio => fmt_decimal(info.entry.dev),
         "ino" if cpio => fmt_decimal(info.entry.ino),
         "nlink" if cpio => fmt_decimal(info.entry.nlink as u64),
@@ -1869,7 +1874,13 @@ mod tests {
         };
         let info = info(&e);
 
-        assert_eq!(fmt("[%(c_dev)s%(c_ino)s%(c_nlink)s]", &info), "[]");
+        assert_eq!(
+            fmt("[%(c_dev)s%(c_ino)s%(c_nlink)s%(c_magic)s]", &info),
+            "[]"
+        );
+        // While the unprefixed `magic` is the ustar table's name, so it does
+        // answer -- and answers from a cpio header too.
+        assert_eq!(fmt("%(magic)s", &info), "ustar");
         // Derivable from what the entry already holds, so these still answer.
         assert_eq!(fmt("%(c_mode)s", &info), "100644");
         assert_eq!(fmt("%(c_filesize)s", &info), "7");

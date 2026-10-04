@@ -12,11 +12,14 @@ Cygwin runtime):
 |---|---|
 | `calc` | `bc`, `expr` |
 | `datetime` | `cal`, `date`, `sleep`, `time` |
+| `dev` | `ar`, `lex`, `nm`, `strings`, `strip`, `yacc` |
+| `display` | `echo`, `more`, `printf` |
 | `text` | `asa`, `comm`, `csplit`, `cut`, `diff`, `expand`, `fold`, `grep`, `head`, `join`, `nl`, `paste`, `patch`, `pr`, `sed`, `sort`, `tail`, `tr`, `tsort`, `unexpand`, `uniq`, `wc` |
 | `xform` | `cksum`, `compress`, `uuencode`, `uudecode` |
 
 ```sh
-cargo build --release -p posixutils-calc -p posixutils-datetime -p posixutils-text -p posixutils-xform
+cargo build --release -p posixutils-calc -p posixutils-datetime -p posixutils-dev -p posixutils-display \
+    -p posixutils-text -p posixutils-xform
 ```
 
 What behaves differently on Windows:
@@ -49,8 +52,20 @@ What behaves differently on Windows:
   local time it is given in the system time zone, not `TZ`;
 - `time` reports its own CPU time plus the utility's, Windows keeping no
   totals for a process's descendants;
-- `expr` operands are text: a Windows command line cannot carry bytes that
-  are not UTF-8.
+- `expr`, `echo` and `printf` operands are text: a Windows command line
+  cannot carry bytes that are not UTF-8;
+- `ar` records user and group 0 for a member it adds, and the member's mode
+  from the read-only attribute; a member name that is not UTF-8 is extracted
+  with U+FFFD in place of the bytes that are not; `-x` refuses a member named
+  for a device (`CON`, `NUL`, `COM1`...) or a stream (`file:stream`), and
+  counts NAME_MAX in characters (UTF-16 units), not bytes;
+- `more` needs Windows 10 or later (its console must take VT sequences); it
+  reads commands from the console, redraws when the window has been resized
+  the next time it looks for a key, and has no job control; `vi.exe`,
+  `vi.cmd` and the like count as `vi` for `v`'s `-c` line; `:e` expands a
+  leading `~` (`HOME`, else `USERPROFILE`) and `$NAME` or `${NAME}` and
+  removes quotes, but does no field splitting, pathname expansion or command
+  substitution, and `\` is a path separator, not an escape.
 
 ## Porting a crate
 
@@ -87,7 +102,8 @@ before going on.
 | uid, gid, `chown` | none: keep Unix-only |
 | `access(W_OK)` | "not read-only" |
 | `nlink` | not exposed by stable Rust: a file counts as its only link |
-| `pathconf(_PC_NAME_MAX)`, `PATH_MAX` | 255 (NTFS component), no path-length check |
+| `pathconf(_PC_NAME_MAX)`, `PATH_MAX` | 255 UTF-16 units (an NTFS component), counted as such, not as bytes; no path-length check |
+| a plain file name (one component, not `.` or `..`) | also no `:` (a drive or a stream) and no device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`, with any extension and trailing dots or spaces) |
 | `utimensat` | `File::set_times`, portable (set through an open write handle: a reopen can be refused) |
 | `isatty` | `std::io::IsTerminal`, portable |
 | `SIGPIPE` | none: a write to a closed pipe is an error; `restore_sigpipe` does nothing |
@@ -97,6 +113,14 @@ before going on.
 | path lists (`:`) | `std::env::split_paths` (`;` on Windows) |
 | argv[0] symlink aliases (`zcat`, `[`) | not created (`build.rs` is Unix-only); use the main name's flags |
 | deleting a read-only file | refused under Wine and older Windows: clear the attribute first, restore it on failure |
+| `mkstemp`, `mkdtemp`, unnamed temporaries | `plib::tmp`: `CREATE_NEW` under a random name; an unnamed temporary is a delete-on-close file, named until its last handle closes |
+| `/dev/tty` in raw mode (termios) | the console, `CONIN$` and `CONOUT$` opened read and write: input without line editing, echo or Ctrl-C processing, with `ENABLE_VIRTUAL_TERMINAL_INPUT`; output with `ENABLE_VIRTUAL_TERMINAL_PROCESSING` |
+| `TIOCGWINSZ`, `SIGWINCH` | `GetConsoleScreenBufferInfo`'s window; no resize signal, so ask again when the size matters |
+| `SIGTSTP`, `SIGCONT` | none: no job control |
+| `SIGHUP`, `SIGTERM` handlers that restore the terminal | `SetConsoleCtrlHandler`, which also sees Ctrl-Break, console close, logoff and shutdown |
+| set-user-ID, set-group-ID | none: keep Unix-only |
+| `wordexp` | none in the C runtime: `~` and `$NAME`/`${NAME}`, quotes removed, one word |
+| a program's name (`basename "$EDITOR"`) | the last component less a program extension (`.exe`, `.com`, `.bat`, `.cmd`) |
 | `/dev/tty` | the console, `CONIN$` / `CONOUT$`: `plib::io::open_terminal_input` / `open_terminal_output` |
 | `LC_ALL`, `LC_*`, `LANG` | read per category by `plib::diag::init_locale`: `C` or `POSIX` selects the C locale (the C runtime's `"C"`, and ASCII-only, byte-per-character `plib::locale`); `C.UTF-8` and other `C`/`POSIX` names with a codeset select the C runtime's `"C"` except for `LC_CTYPE`, which stays UTF-8; anything else, or unset, the user's locale in UTF-8 |
 | characters, case, multibyte | `plib::locale`: outside the C locale, Rust's Unicode rules with input decoded as UTF-8; before `init_locale`, the C locale |
@@ -133,9 +157,9 @@ Windows (or the crate is split), never stubbed.
 (or the part it uses) first, as its own commit, with the module's unit tests
 running on Windows. Ported so far: `diag`, `io` (including the terminal for
 prompts), `locale` (characters, case and `strftime`), `lzw`, `regex`, `testing`,
-`archive`, `cscan`, `linediff`. Still
+`archive`, `cscan`, `linediff`, `perm` (a file's mode, both platforms), `tmp`. Still
 Unix-only: `curuser`, `exec`, `group`, `modestr`, `platform`, `priority`,
-`projectdir`, `sccsfile`, `syslog`, `test_expr`, `tmp`, `tty`, `user`, `utmpx`.
+`projectdir`, `sccsfile`, `syslog`, `test_expr`, `tty`, `user`, `utmpx`.
 
 #### 3. The crate's sources
 
@@ -150,7 +174,7 @@ a `:`-separated list).
 - Integration tests find binaries with `plib::testing::get_binary_path`, which
   already handles `.exe` and `--target` layouts.
 - Gate a test `#[cfg(unix)]` only when its subject is Unix (modes, umask,
-  `utimensat`, root, signals, the argv[0] aliases, `plib::tmp`), and say why in
+  `utimensat`, root, signals, the argv[0] aliases), and say why in
   a comment. A test of portable behaviour that merely used a Unix helper is
   rewritten to run everywhere (pick the Windows equivalent, or a portable
   helper), not gated.
@@ -159,6 +183,20 @@ a `:`-separated list).
   `-text`.
 - Windows will not delete a read-only file under Wine: clear the attribute
   before cleanup.
+- A test that compiles C takes the compiler from `$CC`, else `cc`, or `gcc`
+  on Windows, where the runner has MinGW's on the path and no `cc`; a program
+  it builds is named with `std::env::consts::EXE_SUFFIX`, and what that
+  program writes to a text stream has CR LF line ends on Windows.
+- Tests that drive a program through a pseudo-terminal (`more`'s PTY
+  sessions) are Unix-only. On the Windows runner a program driven through
+  the pseudo-console (portable-pty over ConPTY) never has anything it writes
+  after the first input come back, `cmd.exe` included, so such a test
+  exercises the harness rather than the utility. The console path is checked
+  by hand under Wine's console instead.
+- A stand-in program a test runs (an `EDITOR`) is a shell script on Unix and
+  a batch file on Windows; in the batch file, put a redirection before its
+  command (`>>"file" echo %%~a`), which also keeps an argument such as `1`
+  from reading as a handle number.
 
 #### 5. Verify
 
@@ -194,6 +232,15 @@ parses `TZ` wrongly (`TZ=UTC` names the zone `UT`), failing `date`'s
 answers the caller's own times for another process, failing `time`'s
 `cpu_bound_child_reports_nonzero_cpu_time`. Wine maps `/dev/full` to the
 Linux device, so the tests that write to it run there and not on Windows.
+
+Wine's console neither interprets VT output nor sends keys as VT input, and
+its pseudo-console passes no output through at all. Wine starts a Linux
+program but cannot wait for it or read its status, so the tests that compile
+C need a Windows `gcc` inside Wine (a WinLibs MinGW build works): build the
+tests without `CC` set, since the `cc` crate reads it while building `plib`,
+then run each test executable under `wine` with `CC` naming that `gcc.exe`.
+Wine's `cmd` drops the arguments of a batch file whose loop is redirected as
+`(for ...) > file`, and does not know `echo(`.
 
 #### 6. CI and docs
 

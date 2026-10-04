@@ -146,7 +146,7 @@ fn generate_code_file(
     // Prologue code
     for code_block in &grammar.prologue {
         if !opts.omit_line_directives {
-            writeln!(w, "#line {} \"{}\"", code_block.line, opts.grammar_file)?;
+            write_line_directive(&mut w, code_block.line, opts)?;
         }
         writeln!(w, "{}", code_block.code)?;
     }
@@ -160,7 +160,7 @@ fn generate_code_file(
     if let Some(ref union_def) = grammar.union_def {
         writeln!(w, "#if ! defined YYSTYPE && ! defined YYSTYPE_IS_DECLARED")?;
         if !opts.omit_line_directives {
-            writeln!(w, "#line {} \"{}\"", union_def.line, opts.grammar_file)?;
+            write_line_directive(&mut w, union_def.line, opts)?;
         }
         writeln!(w, "typedef union YYSTYPE")?;
         writeln!(w, "{}", union_def.code)?;
@@ -210,7 +210,7 @@ typedef int YYSTYPE;
     // Epilogue code
     if let Some(ref epilogue) = grammar.epilogue {
         if !opts.omit_line_directives {
-            writeln!(w, "#line {} \"{}\"", epilogue.line, opts.grammar_file)?;
+            write_line_directive(&mut w, epilogue.line, opts)?;
         }
         writeln!(w, "{}", epilogue.code)?;
     }
@@ -943,6 +943,16 @@ fn get_translate_table_size(grammar: &Grammar) -> usize {
     (max_token + 1) as usize
 }
 
+/// Write a `#line` directive naming `line` of the grammar file.
+fn write_line_directive<W: Write>(w: &mut W, line: usize, opts: &Options) -> std::io::Result<()> {
+    writeln!(
+        w,
+        "#line {} \"{}\"",
+        line,
+        escape_c_string(&opts.grammar_file)
+    )
+}
+
 /// Escape a string for use in a C string literal
 fn escape_c_string(s: &str) -> String {
     let mut result = String::new();
@@ -1363,7 +1373,7 @@ fn generate_parser<W: Write>(
             let has_union = grammar.union_def.is_some();
             let transformed = transform_action(action, grammar, prod, prefix, has_union);
             if !opts.omit_line_directives {
-                writeln!(w, "#line {} \"{}\"", prod.line, opts.grammar_file)?;
+                write_line_directive(w, prod.line, opts)?;
             }
             writeln!(w, "        {}", transformed)?;
 
@@ -1795,7 +1805,7 @@ fn generate_header_file(path: &str, opts: &Options, grammar: &Grammar) -> Result
     if let Some(ref union_def) = grammar.union_def {
         writeln!(w, "#if ! defined YYSTYPE && ! defined YYSTYPE_IS_DECLARED")?;
         if !opts.omit_line_directives {
-            writeln!(w, "#line {} \"{}\"", union_def.line, opts.grammar_file)?;
+            write_line_directive(&mut w, union_def.line, opts)?;
         }
         writeln!(w, "typedef union YYSTYPE")?;
         writeln!(w, "{}", union_def.code)?;

@@ -10,7 +10,6 @@
 use gettextrs::gettext;
 use plib::diag;
 use std::io::{self, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::process::ExitCode;
 
 /// Expand the XSI escape sequences of POSIX.1-2024 `echo` (lines 93172-93186)
@@ -95,7 +94,7 @@ fn main() -> ExitCode {
 
     let mut args: Vec<Vec<u8>> = std::env::args_os()
         .skip(1)
-        .map(|arg| arg.as_bytes().to_vec())
+        .map(|arg| arg.as_encoded_bytes().to_vec())
         .collect();
 
     // Historical BSD behavior.  POSIX.1-2024 lines 93167-93169 (Austin Group

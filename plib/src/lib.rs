@@ -22,6 +22,7 @@ pub mod locale;
 pub mod lzw;
 #[cfg(unix)]
 pub mod modestr;
+pub mod perm;
 #[cfg(unix)]
 pub mod platform;
 #[cfg(unix)]
@@ -38,7 +39,6 @@ pub mod test_expr;
 pub mod testing;
 #[cfg(windows)]
 pub mod timefmt;
-#[cfg(unix)]
 pub mod tmp;
 #[cfg(unix)]
 pub mod tty;

@@ -85,9 +85,9 @@ fn run_end_to_end_with_mode(grammar: &str, test_name: &str, strict: bool) {
 
     // Compile
     let code_path = temp_dir.path().join("y.tab.c");
-    let exe_path = temp_dir.path().join(format!("{}_{}", test_name, mode_name));
+    let exe_path = crate::exe_path(temp_dir.path(), &format!("{}_{}", test_name, mode_name));
 
-    let compile = Command::new("cc")
+    let compile = crate::c_compiler()
         .current_dir(temp_dir.path())
         .args([
             "-Wall",
@@ -875,8 +875,8 @@ int main(void) {
     // Compile with -DYYDEBUG=1 even though -t was not given; the debug code
     // (including the yydebug variable main() references) must be present.
     let code_path = temp_dir.path().join("y.tab.c");
-    let exe_path = temp_dir.path().join("ydebug_parser");
-    let compile = Command::new("cc")
+    let exe_path = crate::exe_path(temp_dir.path(), "ydebug_parser");
+    let compile = crate::c_compiler()
         .current_dir(temp_dir.path())
         .args([
             "-DYYDEBUG=1",
@@ -1108,31 +1108,24 @@ int yylex(void) {
     let code_path = temp_dir.path().join("y.tab.c");
     assert!(code_path.exists(), "y.tab.c should exist");
 
-    // Check if cc is available
-    if Command::new("cc").arg("--version").output().is_ok() {
-        let exe_path = temp_dir.path().join("parser");
-        let compile_output = Command::new("cc")
-            .current_dir(temp_dir.path())
-            .args([
-                "-Wall",
-                "-O2",
-                "-Werror",
-                "-o",
-                exe_path.to_str().unwrap(),
-                code_path.to_str().unwrap(),
-            ])
-            .output()
-            .expect("failed to execute cc");
-
-        if !compile_output.status.success() {
-            let stderr = String::from_utf8_lossy(&compile_output.stderr);
-            eprintln!("Compilation failed: {}", stderr);
-        }
-
-        // Note: We don't assert success here because the generated code
-        // may have minor issues that need fixing for full C99 compliance.
-        // The important thing is that the structure is correct.
-    }
+    let exe_path = crate::exe_path(temp_dir.path(), "parser");
+    let compile_output = crate::c_compiler()
+        .current_dir(temp_dir.path())
+        .args([
+            "-Wall",
+            "-O2",
+            "-Werror",
+            "-o",
+            exe_path.to_str().unwrap(),
+            code_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to execute cc");
+    assert!(
+        compile_output.status.success(),
+        "the generated parser must compile: {}",
+        String::from_utf8_lossy(&compile_output.stderr)
+    );
 }
 
 #[test]
@@ -2301,8 +2294,8 @@ int main(void) {
     );
 
     // Compile and run to verify it works
-    let exe_path = temp_dir.path().join("default_val_test");
-    let compile = Command::new("cc")
+    let exe_path = crate::exe_path(temp_dir.path(), "default_val_test");
+    let compile = crate::c_compiler()
         .current_dir(temp_dir.path())
         .args([
             "-Wall",
@@ -2622,7 +2615,7 @@ fn python39_build_dir() -> PathBuf {
 
 /// Built parser executable path
 fn python39_parser_exe() -> PathBuf {
-    python39_build_dir().join("parser")
+    crate::exe_path(&python39_build_dir(), "parser")
 }
 
 /// Build the Python parser once (lazy initialization)
@@ -2673,7 +2666,7 @@ fn build_python39_parser() -> Result<(), String> {
     }
 
     // Compile parser
-    let compile = Command::new("cc")
+    let compile = crate::c_compiler()
         .current_dir(&build_dir)
         .args([
             "-Wall", "-O2", "-Werror", "-o", "parser", "y.tab.c", "lex.yy.c",
@@ -3663,7 +3656,7 @@ fn test_yyempty_matches_parser_empty_sentinel() {
     let temp_dir = TempDir::new().unwrap();
     let c_path = temp_dir.path().join("probe.c");
     fs::write(&c_path, probe).unwrap();
-    let compile = Command::new("cc")
+    let compile = crate::c_compiler()
         .args([
             "-Wall",
             "-Werror",
@@ -5108,8 +5101,8 @@ int main(void) { yydebug = 1; return yyparse(); }
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let exe = temp_dir.path().join("trace");
-    let compile = Command::new("cc")
+    let exe = crate::exe_path(temp_dir.path(), "trace");
+    let compile = crate::c_compiler()
         .current_dir(temp_dir.path())
         .args([
             "-Wall",
@@ -5236,4 +5229,52 @@ e : e '+' e | NUM ;
         "a byte-range literal must not inflate yytranslate, got: {:?}",
         code.lines().find(|l| l.contains("YYTRANSLATE_SIZE"))
     );
+}
+
+/// The grammar file's name goes into `#line` as a C string literal, so a `\`
+/// or `"` in it must be escaped -- every Windows path has backslashes.
+#[test]
+fn test_line_directive_escapes_the_file_name() {
+    let grammar = r#"
+%{
+int x;
+%}
+%token NUM
+%%
+expr : NUM { $$ = $1; }
+     ;
+"#;
+    let temp_dir = TempDir::new().unwrap();
+    // A name with both characters where the file system allows them, and a
+    // backslash-separated relative path on Windows.
+    #[cfg(unix)]
+    let name = "we\\ird\"name.y";
+    #[cfg(windows)]
+    let name = "sub\\name.y";
+    if let Some(parent) = std::path::Path::new(name).parent() {
+        fs::create_dir_all(temp_dir.path().join(parent)).unwrap();
+    }
+    fs::write(temp_dir.path().join(name), grammar).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yacc"))
+        .current_dir(temp_dir.path())
+        .arg(name)
+        .output()
+        .expect("failed to execute yacc");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let code = fs::read_to_string(temp_dir.path().join("y.tab.c")).unwrap();
+    let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+    let lines: Vec<&str> = code.lines().filter(|l| l.starts_with("#line")).collect();
+    assert!(!lines.is_empty(), "no #line directives in:\n{code}");
+    for line in lines {
+        assert!(
+            line.ends_with(&format!(" \"{escaped}\"")),
+            "unescaped file name in {line:?}"
+        );
+    }
 }

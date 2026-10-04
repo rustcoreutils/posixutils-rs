@@ -7,14 +7,17 @@
 // SPDX-License-Identifier: MIT
 //
 
-//! Temporary files and directories built on POSIX `mkstemp`/`mkdtemp`.
+//! Temporary files and directories built on POSIX `mkstemp`/`mkdtemp`, and
+//! on Windows on exclusive creation (`CREATE_NEW`) under a random name.
 //!
 //! # Cleanup guarantees
 //!
 //! [`tempfile`] hands back a file with no directory entry, so the kernel
 //! reclaims it when the last descriptor closes. That holds through
 //! `process::exit`, a signal, or a crash, because nothing in this process has
-//! to run for it to happen.
+//! to run for it to happen. Windows has no unnamed file: there it is a
+//! delete-on-close file, which keeps its name until the last handle closes
+//! and is then removed by the system, under the same guarantee.
 //!
 //! [`TempDir`] and [`NamedTempFile`] need a name to hand to a caller, so they
 //! can only unlink from `Drop`. A process that dies without unwinding leaves
@@ -24,12 +27,18 @@
 //!
 //! Names come from `mkstemp`/`mkdtemp`, which create with `O_EXCL` (mode 0600)
 //! and `0700` respectively, so neither call can be made to open or reuse an
-//! attacker-planted path.
+//! attacker-planted path. Windows creates with `CREATE_NEW`, which refuses an
+//! existing name the same way, and the new entry takes the temporary
+//! directory's access list, which is the user's own.
 
-use std::ffi::{c_char, CString, OsStr, OsString};
+#[cfg(unix)]
+use std::ffi::{c_char, CString};
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io::{self, Write};
+#[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
 use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 
@@ -40,6 +49,7 @@ const DEFAULT_PREFIX: &str = ".tmp";
 const RANDOM: &str = "XXXXXX";
 
 /// Where a set-id process puts temporaries, ignoring the environment.
+#[cfg(unix)]
 const SECURE_TEMP_DIR: &str = "/tmp";
 
 /// Whether the process runs with privileges its real user does not have.
@@ -50,6 +60,7 @@ const SECURE_TEMP_DIR: &str = "/tmp";
 /// setting `AT_SECURE`, and those are exactly the cases where trusting
 /// `$TMPDIR` would be a mistake. This is the flag glibc's
 /// `__libc_enable_secure` reads.
+#[cfg(unix)]
 fn is_set_id() -> bool {
     #[cfg(target_os = "linux")]
     // SAFETY: getauxval takes one integer and reports 0 for an absent entry.
@@ -79,6 +90,7 @@ fn is_set_id() -> bool {
 ///
 /// Split from [`is_set_id`] so the privileged branch can be asserted without
 /// the test having to be set-id itself.
+#[cfg(unix)]
 fn temp_dir_for(set_id: bool) -> PathBuf {
     if set_id {
         PathBuf::from(SECURE_TEMP_DIR)
@@ -88,8 +100,27 @@ fn temp_dir_for(set_id: bool) -> PathBuf {
 }
 
 /// [`temp_dir_for`], for this process.
+#[cfg(unix)]
 fn default_temp_dir() -> PathBuf {
     temp_dir_for(is_set_id())
+}
+
+/// The user's temporary directory: Windows has no set-id programs.
+#[cfg(windows)]
+fn default_temp_dir() -> PathBuf {
+    std::env::temp_dir()
+}
+
+/// Whether `b` ends a path component: `/`, and on Windows also `\` and the
+/// `:` of a drive prefix (`C:x`) or of an alternate data stream (`x:s`).
+#[cfg(unix)]
+fn is_name_separator(b: u8) -> bool {
+    b == b'/'
+}
+
+#[cfg(windows)]
+fn is_name_separator(b: u8) -> bool {
+    matches!(b, b'/' | b'\\' | b':')
 }
 
 /// Reject a name fragment that would move the temporary somewhere else.
@@ -100,7 +131,11 @@ fn default_temp_dir() -> PathBuf {
 /// placement guarantee callers rely on -- `plib::io::write_atomic_mode` needs
 /// the temporary beside its target so the `rename(2)` is atomic.
 fn reject_separator(what: &str, fragment: &OsStr) -> io::Result<()> {
-    if fragment.as_encoded_bytes().contains(&b'/') {
+    if fragment
+        .as_encoded_bytes()
+        .iter()
+        .any(|&b| is_name_separator(b))
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("temporary file {what} must not contain a path separator"),
@@ -113,6 +148,7 @@ fn reject_separator(what: &str, fragment: &OsStr) -> io::Result<()> {
 ///
 /// Returned as a byte vector rather than a `CString` because `mkstemp` and
 /// `mkdtemp` rewrite the template in place.
+#[cfg(unix)]
 fn template(dir: &Path, prefix: &OsStr, suffix: &OsStr) -> io::Result<Vec<u8>> {
     reject_separator("prefix", prefix)?;
     reject_separator("suffix", suffix)?;
@@ -130,6 +166,7 @@ fn template(dir: &Path, prefix: &OsStr, suffix: &OsStr) -> io::Result<Vec<u8>> {
 }
 
 /// Recover the path `mkstemp`/`mkdtemp` wrote back into `template`.
+#[cfg(unix)]
 fn filled_path(template: Vec<u8>) -> PathBuf {
     let mut bytes = template;
     // Drop the trailing NUL; libc rewrote only the X run, so the length holds.
@@ -138,6 +175,7 @@ fn filled_path(template: Vec<u8>) -> PathBuf {
 }
 
 /// Create a uniquely named file, returning it open along with its path.
+#[cfg(unix)]
 fn make_file(dir: &Path, prefix: &OsStr, suffix: &OsStr) -> io::Result<(File, PathBuf)> {
     let mut template = template(dir, prefix, suffix)?;
     let suffix_len = suffix.len() as libc::c_int;
@@ -187,16 +225,25 @@ fn make_file(dir: &Path, prefix: &OsStr, suffix: &OsStr) -> io::Result<(File, Pa
     Ok((file, path))
 }
 
-/// Create a uniquely named directory, returning its path.
-fn make_dir(dir: &Path, prefix: &OsStr, suffix: &OsStr) -> io::Result<PathBuf> {
-    // mkdtemp requires the template to *end* with the X run, so a suffix has to
-    // be rejected rather than silently dropped.
+/// Refuse a name suffix for a directory.
+///
+/// mkdtemp requires the template to *end* with the X run, so a suffix has to
+/// be rejected rather than silently dropped; Windows keeps the same rule, so
+/// a caller behaves alike on both.
+fn reject_dir_suffix(suffix: &OsStr) -> io::Result<()> {
     if !suffix.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "a temporary directory cannot have a name suffix",
         ));
     }
+    Ok(())
+}
+
+/// Create a uniquely named directory, returning its path.
+#[cfg(unix)]
+fn make_dir(dir: &Path, prefix: &OsStr, suffix: &OsStr) -> io::Result<PathBuf> {
+    reject_dir_suffix(suffix)?;
 
     let mut template = template(dir, prefix, suffix)?;
     // SAFETY: the template is a NUL-terminated buffer ending in the X run.
@@ -206,6 +253,95 @@ fn make_dir(dir: &Path, prefix: &OsStr, suffix: &OsStr) -> io::Result<PathBuf> {
     }
 
     Ok(filled_path(template))
+}
+
+/// How many names Windows creation tries before giving up, as `mkstemp` does.
+#[cfg(windows)]
+const ATTEMPTS: u32 = 1 << 16;
+
+/// `RANDOM.len()` characters from `[A-Za-z0-9]`, as `mkstemp` draws them.
+///
+/// std has no random-number API; `RandomState` is seeded from the system's
+/// random source once per thread and stepped per instance, and the counter
+/// and clock make every call differ even so. Unpredictability is not what
+/// keeps a temporary safe -- `CREATE_NEW` is -- so this need only rarely
+/// collide.
+#[cfg(windows)]
+fn random_name_part() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(COUNTER.fetch_add(1, Ordering::Relaxed));
+    hasher.write_u32(std::process::id());
+    if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        hasher.write_u128(now.as_nanos());
+    }
+    let mut bits = hasher.finish();
+    (0..RANDOM.len())
+        .map(|_| {
+            let c = CHARS[(bits % CHARS.len() as u64) as usize];
+            bits /= CHARS.len() as u64;
+            c as char
+        })
+        .collect()
+}
+
+/// Run `create` on fresh `<dir>/<prefix>RANDOM<suffix>` names until one does
+/// not exist yet, returning what it made and the name.
+///
+/// `create` must refuse an existing name with `AlreadyExists`; that is the
+/// only error that moves on to another name.
+#[cfg(windows)]
+fn create_unique<T>(
+    dir: &Path,
+    prefix: &OsStr,
+    suffix: &OsStr,
+    create: impl Fn(&Path) -> io::Result<T>,
+) -> io::Result<(T, PathBuf)> {
+    reject_separator("prefix", prefix)?;
+    reject_separator("suffix", suffix)?;
+
+    for _ in 0..ATTEMPTS {
+        let mut name = prefix.to_os_string();
+        name.push(random_name_part());
+        name.push(suffix);
+        let path = dir.join(name);
+        match create(&path) {
+            Ok(made) => return Ok((made, path)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "too many temporary names already exist",
+    ))
+}
+
+/// Create a uniquely named file, returning it open along with its path.
+///
+/// Rust opens Windows handles non-inheritable, so a spawned child does not
+/// receive it: the close-on-exec of the Unix side.
+#[cfg(windows)]
+fn make_file(dir: &Path, prefix: &OsStr, suffix: &OsStr) -> io::Result<(File, PathBuf)> {
+    create_unique(dir, prefix, suffix, |path| {
+        File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+    })
+}
+
+/// Create a uniquely named directory, returning its path.
+#[cfg(windows)]
+fn make_dir(dir: &Path, prefix: &OsStr, suffix: &OsStr) -> io::Result<PathBuf> {
+    reject_dir_suffix(suffix)?;
+    create_unique(dir, prefix, suffix, |path| fs::create_dir(path)).map(|((), path)| path)
 }
 
 /// Create an unnamed temporary file in the system temporary directory.
@@ -218,8 +354,12 @@ pub fn tempfile() -> io::Result<File> {
 
 /// [`tempfile`], in a caller-chosen directory.
 pub fn tempfile_in(dir: impl AsRef<Path>) -> io::Result<File> {
-    let dir = dir.as_ref();
+    anonymous_file(dir.as_ref())
+}
 
+/// A file only its open descriptor reaches.
+#[cfg(unix)]
+fn anonymous_file(dir: &Path) -> io::Result<File> {
     #[cfg(target_os = "linux")]
     {
         // O_TMPFILE allocates an inode that never had a name, so there is no
@@ -247,6 +387,33 @@ pub fn tempfile_in(dir: impl AsRef<Path>) -> io::Result<File> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(file),
         Err(e) => Err(e),
     }
+}
+
+/// A delete-on-close file: Windows removes it when its last handle closes,
+/// whether or not this process gets to run anything first.
+#[cfg(windows)]
+fn anonymous_file(dir: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    // Delete-on-close needs the right to delete.
+    const DELETE: u32 = 0x0001_0000;
+    const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x1 | 0x2 | 0x4;
+    const FILE_FLAG_DELETE_ON_CLOSE: u32 = 0x0400_0000;
+
+    let prefix = OsStr::new(DEFAULT_PREFIX);
+    create_unique(dir, prefix, OsStr::new(""), |path| {
+        File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+            .share_mode(FILE_SHARE_READ_WRITE_DELETE)
+            .custom_flags(FILE_FLAG_DELETE_ON_CLOSE)
+            .open(path)
+    })
+    .map(|(file, _)| file)
 }
 
 #[cfg(target_os = "linux")]
@@ -522,8 +689,9 @@ impl Default for Builder {
 mod tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
-    use std::os::unix::ffi::OsStrExt;
+    #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    #[cfg(unix)]
     use std::os::unix::io::AsRawFd;
 
     #[test]
@@ -539,6 +707,8 @@ mod tests {
         assert!(!path.exists(), "TempDir::drop must remove the tree");
     }
 
+    // Modes are the subject: Windows has the directory's access list instead.
+    #[cfg(unix)]
     #[test]
     fn tempdir_is_private() {
         let dir = tempdir().unwrap();
@@ -580,8 +750,11 @@ mod tests {
             tmp.write_all(b"hello").unwrap();
             tmp.flush().unwrap();
 
-            let mode = tmp.as_file().metadata().unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "mkstemp must create the file 0600");
+            #[cfg(unix)]
+            {
+                let mode = tmp.as_file().metadata().unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600, "mkstemp must create the file 0600");
+            }
 
             tmp.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
             let mut got = String::new();
@@ -637,6 +810,8 @@ mod tests {
         assert_eq!(err.file.path(), tmp_path);
     }
 
+    // The descriptor flag is the subject; see the Windows test below.
+    #[cfg(unix)]
     #[test]
     fn temporaries_are_close_on_exec() {
         // A temporary must not survive into a spawned child; every one of
@@ -675,6 +850,8 @@ mod tests {
         assert!(!path.exists());
     }
 
+    // An inode with no links is Unix's; see the delete-on-close test below.
+    #[cfg(unix)]
     #[test]
     fn tempfile_has_no_directory_entry() {
         let mut file = tempfile().unwrap();
@@ -693,12 +870,64 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn tempfile_in_uses_the_given_directory() {
         let dir = tempdir().unwrap();
         let file = tempfile_in(dir.path()).unwrap();
         assert_eq!(file.metadata().unwrap().nlink(), 0);
         // Nothing was left behind under the chosen parent.
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn tempfile_in_is_removed_when_closed() {
+        let dir = tempdir().unwrap();
+        let mut file = tempfile_in(dir.path()).unwrap();
+        file.write_all(b"anonymous").unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut got = String::new();
+        file.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "anonymous");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        // The system removes it on the last close; nothing here runs for it.
+        drop(file);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn temporaries_are_not_inherited() {
+        use std::os::windows::io::AsRawHandle;
+
+        const HANDLE_FLAG_INHERIT: u32 = 0x1;
+        extern "system" {
+            fn GetHandleInformation(handle: *mut std::ffi::c_void, flags: *mut u32) -> i32;
+        }
+
+        let named = NamedTempFile::new().unwrap();
+        let anon = tempfile().unwrap();
+        for handle in [named.as_file().as_raw_handle(), anon.as_raw_handle()] {
+            let mut flags = 0;
+            // SAFETY: the handle is open for the duration of the call.
+            assert_ne!(unsafe { GetHandleInformation(handle, &mut flags) }, 0);
+            assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_prefix_cannot_escape_the_chosen_directory() {
+        let dir = tempdir().unwrap();
+        for prefix in ["sub\\NESTED-", "C:ESCAPED-", "\\ROOTED-"] {
+            let err = Builder::new()
+                .prefix(prefix)
+                .tempfile_in(dir.path())
+                .unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{prefix}");
+        }
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
@@ -736,6 +965,7 @@ mod tests {
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_set_id_process_ignores_tmpdir() {
         // The security property: under set-id the directory is a fixed path,
@@ -745,11 +975,13 @@ mod tests {
         assert_eq!(temp_dir_for(true), Path::new(SECURE_TEMP_DIR));
     }
 
+    #[cfg(unix)]
     #[test]
     fn an_ordinary_process_honors_tmpdir() {
         assert_eq!(temp_dir_for(false), std::env::temp_dir());
     }
 
+    #[cfg(unix)]
     #[test]
     fn this_test_process_is_not_set_id() {
         // Guards the assumption the rest of these tests rest on: they create
@@ -761,7 +993,7 @@ mod tests {
     #[test]
     fn a_nul_in_the_path_is_rejected() {
         let err = Builder::new()
-            .prefix(OsStr::from_bytes(b"bad\0name"))
+            .prefix(OsStr::new("bad\0name"))
             .tempfile()
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);

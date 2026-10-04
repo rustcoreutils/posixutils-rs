@@ -9,30 +9,27 @@
 
 use clap::Parser;
 use gettextrs::gettext;
-use libc::{getegid, getgid, getuid, setgid, setuid};
 use plib::regex::{Regex, RegexFlags};
 use std::collections::{HashMap, VecDeque};
+#[cfg(unix)]
 use std::ffi::{CStr, CString};
 use std::fs::File;
-use std::io::{stdout, BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
-use std::mem::MaybeUninit;
+use std::io::{stdout, BufRead, BufReader, Cursor, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::ops::Not;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{exit, ExitStatus};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use termion::{clear::*, cursor::*, event::*, input::*, screen::*, style::*, *};
+use term::{AlternateScreen, Goto};
+
+mod term;
 
 const LINES_PER_PAGE: u16 = 24;
 const NUM_COLUMNS: u16 = 80;
 const DEFAULT_EDITOR: &str = "vi";
 
-/// Last acceptable pressed mouse button
-static LAST_MOUSE_BUTTON: Mutex<Option<MouseButton>> = Mutex::new(None);
 /// Inform terminal input handler thread that program is closing
 static NEED_QUIT: Mutex<bool> = Mutex::new(false);
 
@@ -1639,33 +1636,29 @@ impl SourceContext {
         if direction == Direction::Backward {
             count = -count;
         }
-        let header_lines_count = self.header_lines_count.unwrap_or(0);
         let next_line = self.seek_positions.current_line() as isize + count;
         let next_line = if next_line < 0 { 0 } else { next_line as usize };
-        let terminal_size = self.terminal_size.unwrap_or((1 + header_lines_count, 0));
-        let lines_count = if terminal_size.0 == 1 + header_lines_count {
-            terminal_size.0
-        } else {
-            terminal_size.0 - 1 - header_lines_count
-        };
-        self.seek_positions.set_current(if next_line < lines_count {
-            lines_count
-        } else {
-            next_line
-        });
+        self.seek_positions
+            .set_current(next_line.max(self.first_screen_bottom()));
         self.is_ended_file = self.seek_positions.is_ended;
+    }
+
+    /// The display line at the bottom of the first screen: the rows above the
+    /// prompt less the file header, which is shown only when there are
+    /// several files -- and at least one line.
+    fn first_screen_bottom(&self) -> usize {
+        let header = if self.is_many_files {
+            self.header_lines_count.unwrap_or(0)
+        } else {
+            0
+        };
+        let rows = self.terminal_size.map_or(1, |(rows, _)| rows);
+        rows.saturating_sub(1 + header).max(1)
     }
 
     /// Seek to buffer beginning with line count
     pub fn goto_beginning(&mut self, count: Option<usize>) {
-        let terminal_size = self.terminal_size.unwrap_or((1, 0));
-        let header_lines_count = self.header_lines_count.unwrap_or(0);
-        let next_line = if terminal_size.0 <= 1 + header_lines_count {
-            terminal_size.0
-        } else {
-            terminal_size.0 - 1 - header_lines_count
-        };
-        self.seek_positions.set_current(next_line);
+        self.seek_positions.set_current(self.first_screen_bottom());
         if let Some(count) = count {
             self.scroll(count, Direction::Forward);
         }
@@ -1688,6 +1681,18 @@ impl SourceContext {
         self.terminal_size
             .map(|(lines, _)| lines.saturating_sub(1).max(1))
             .unwrap_or(1)
+    }
+
+    /// The file line holding the display line at the top of the screen.
+    pub fn top_source_line(&mut self) -> usize {
+        let bottom = self.seek_positions.current_line();
+        let ended = self.seek_positions.is_ended;
+        let top = (bottom + 1).saturating_sub(self.screen_lines()).max(1);
+        self.seek_positions.set_current(top);
+        let line = self.seek_positions.current_source_line();
+        self.seek_positions.set_current(bottom);
+        self.seek_positions.is_ended = ended;
+        line
     }
 
     /// Seek to previous line
@@ -1836,362 +1841,6 @@ impl SourceContext {
     }
 }
 
-// === Signal handlers ============================================
-//
-// Why this exists:
-//   * POSIX `more` ASYNCHRONOUS EVENTS mandates handling SIGCONT (refetch
-//     winsize + redraw) and SIGWINCH (same, after Austin Group Defect 1185).
-//   * Without lifecycle-signal handlers, a SIGINT / SIGTERM / SIGHUP /
-//     SIGQUIT skips Rust's `Drop`, so the cooked-mode termios captured by
-//     [`CommandIO`] is never restored — leaving the user's shell unusable.
-//
-// Constraints:
-//   * Handlers run in async-signal context.  Only a tiny subset of libc is
-//     safe: `tcsetattr`, `_exit`, `raise`, `sigaction`, `write`, atomics.
-//     No mallocs, no Rust `Mutex` (parking-lot or std), no `println!`.
-//   * Cleanup handlers (TERM/INT/HUP/QUIT) call `tcsetattr` and `_exit`
-//     directly — there is no main-loop tick guaranteed before process death.
-//   * Event handlers (CONT/WINCH) just set an atomic flag; the pager loop
-//     polls these and performs the user-visible work in normal context.
-//
-// State synchronization:
-//   * `SIG_STATE_INIT` is the gate: a handler that observes `false` must
-//     not touch [`SAVED_FD`], [`SAVED_COOKED`], or [`SAVED_RAW`].
-//   * State is written **before** `SIG_STATE_INIT` is set to `true`
-//     (publish), and `SIG_STATE_INIT` is cleared **before** the state is
-//     torn down (unpublish).  Both orderings use `SeqCst`.
-//   * The termios snapshots are written exactly once by
-//     [`publish_signal_state`] and read by handlers; they are not mutated
-//     thereafter, so a non-atomic memcpy is safe under this discipline.
-
-static SIG_STATE_INIT: AtomicBool = AtomicBool::new(false);
-static SAVED_FD: AtomicI32 = AtomicI32::new(-1);
-static mut SAVED_COOKED: MaybeUninit<libc::termios> = MaybeUninit::uninit();
-static mut SAVED_RAW: MaybeUninit<libc::termios> = MaybeUninit::uninit();
-
-/// Set by the SIGCONT handler.  Main loop swaps this to `false` and forces a
-/// full redraw plus winsize refetch (POSIX: SIGCONT must refresh the screen
-/// regardless of whether the size actually changed).
-static SIGCONT_PENDING: AtomicBool = AtomicBool::new(false);
-/// Set by the SIGWINCH handler.  Main loop swaps this and re-fetches winsize.
-static SIGWINCH_PENDING: AtomicBool = AtomicBool::new(false);
-
-/// Publish the fd + cooked/raw termios snapshots that the handlers read.
-/// Call this **once**, before [`install_signal_handlers`].
-///
-/// # Safety
-///
-/// Caller must guarantee no handler is currently running on the static state
-/// (which is true at startup before `install_signal_handlers`).
-unsafe fn publish_signal_state(fd: RawFd, cooked: libc::termios, raw: libc::termios) {
-    // Write through raw pointers to avoid forming references to the
-    // mutable statics (deny-by-default in Rust 2024; warning under 2021).
-    let cooked_ptr = std::ptr::addr_of_mut!(SAVED_COOKED);
-    let raw_ptr = std::ptr::addr_of_mut!(SAVED_RAW);
-    (*cooked_ptr).write(cooked);
-    (*raw_ptr).write(raw);
-    SAVED_FD.store(fd, Ordering::SeqCst);
-    SIG_STATE_INIT.store(true, Ordering::SeqCst);
-}
-
-/// Clear the published signal state.  Call this **after**
-/// [`uninstall_signal_handlers`] so no in-flight handler races us.
-fn unpublish_signal_state() {
-    SIG_STATE_INIT.store(false, Ordering::SeqCst);
-    SAVED_FD.store(-1, Ordering::SeqCst);
-    // No need to clear SAVED_COOKED / SAVED_RAW — handlers gate on
-    // SIG_STATE_INIT before reading them.
-}
-
-/// Try to restore the cooked-mode termios.  Async-signal-safe: only calls
-/// `tcsetattr` and atomic loads.  No-op if state hasn't been published.
-fn try_restore_cooked() {
-    if !SIG_STATE_INIT.load(Ordering::SeqCst) {
-        return;
-    }
-    let fd = SAVED_FD.load(Ordering::SeqCst);
-    if fd < 0 {
-        return;
-    }
-    // SAFETY: SIG_STATE_INIT was true ⇒ publish_signal_state ran ⇒
-    // SAVED_COOKED is initialized and never mutated thereafter.  We hand a
-    // raw pointer to libc to avoid forming a reference to mutable static.
-    unsafe {
-        let ptr = std::ptr::addr_of!(SAVED_COOKED) as *const libc::termios;
-        libc::tcsetattr(fd, libc::TCSAFLUSH, ptr);
-    }
-}
-
-/// Try to (re)apply the raw-mode termios.  Used by the SIGCONT handler to
-/// re-engage raw mode after a SIGTSTP/SIGCONT job-control cycle.
-fn try_apply_raw() {
-    if !SIG_STATE_INIT.load(Ordering::SeqCst) {
-        return;
-    }
-    let fd = SAVED_FD.load(Ordering::SeqCst);
-    if fd < 0 {
-        return;
-    }
-    // SAFETY: see [`try_restore_cooked`].
-    unsafe {
-        let ptr = std::ptr::addr_of!(SAVED_RAW) as *const libc::termios;
-        libc::tcsetattr(fd, libc::TCSAFLUSH, ptr);
-    }
-}
-
-/// Handler for SIGINT, SIGTERM, SIGHUP, SIGQUIT.  Restores cooked-mode
-/// termios and then `_exit`s with `128 + signum` (the POSIX shell
-/// convention for signal-caused exits).  Drop impls are intentionally
-/// skipped — by the time these signals arrive we want to die *now*, before
-/// any further harm.
-extern "C" fn restore_and_exit(signum: libc::c_int) {
-    try_restore_cooked();
-    unsafe { libc::_exit(128 + signum) };
-}
-
-/// Handler for SIGTSTP (job-control stop, typically Ctrl-Z).  Restores
-/// cooked mode so the parent shell finds the terminal usable, then resets
-/// SIGTSTP to its default disposition and re-raises it so the kernel
-/// actually suspends us.  On resume, [`handle_cont`] re-engages raw mode
-/// and re-installs this handler.
-extern "C" fn handle_tstp(_signum: libc::c_int) {
-    try_restore_cooked();
-    unsafe {
-        let mut act: libc::sigaction = std::mem::zeroed();
-        act.sa_sigaction = libc::SIG_DFL;
-        libc::sigemptyset(&mut act.sa_mask);
-        libc::sigaction(libc::SIGTSTP, &act, std::ptr::null_mut());
-        libc::raise(libc::SIGTSTP);
-    }
-}
-
-/// Handler for SIGCONT (resume from suspend).  Re-applies raw mode (we
-/// were stopped in cooked mode by [`handle_tstp`]) and sets the pending
-/// flag so the main loop refreshes the screen.  Also re-installs the
-/// SIGTSTP handler that [`handle_tstp`] reset to `SIG_DFL`.
-extern "C" fn handle_cont(_signum: libc::c_int) {
-    try_apply_raw();
-    SIGCONT_PENDING.store(true, Ordering::SeqCst);
-    unsafe { install_tstp_handler() };
-}
-
-/// Handler for SIGWINCH (terminal-window-size change).  Just sets the
-/// pending flag — the main loop reads the new winsize via `tcgetwinsize`
-/// and triggers a redraw.
-extern "C" fn handle_winch(_signum: libc::c_int) {
-    SIGWINCH_PENDING.store(true, Ordering::SeqCst);
-}
-
-unsafe fn install_handler_raw(
-    signum: libc::c_int,
-    handler: extern "C" fn(libc::c_int),
-    flags: libc::c_int,
-) {
-    let mut act: libc::sigaction = std::mem::zeroed();
-    act.sa_sigaction = handler as libc::sighandler_t;
-    act.sa_flags = flags;
-    libc::sigemptyset(&mut act.sa_mask);
-    libc::sigaction(signum, &act, std::ptr::null_mut());
-}
-
-unsafe fn install_tstp_handler() {
-    install_handler_raw(libc::SIGTSTP, handle_tstp, 0);
-}
-
-/// Install handlers for every signal we care about.  Call **after**
-/// [`publish_signal_state`].
-fn install_signal_handlers() {
-    unsafe {
-        // Lifecycle: restore termios + _exit.  No SA_RESTART — we want
-        // these to interrupt syscalls and cause immediate termination.
-        install_handler_raw(libc::SIGINT, restore_and_exit, 0);
-        install_handler_raw(libc::SIGTERM, restore_and_exit, 0);
-        install_handler_raw(libc::SIGHUP, restore_and_exit, 0);
-        install_handler_raw(libc::SIGQUIT, restore_and_exit, 0);
-        // Job control.
-        install_tstp_handler();
-        // Async events: SA_RESTART so the input thread's read() keeps going.
-        install_handler_raw(libc::SIGCONT, handle_cont, libc::SA_RESTART);
-        install_handler_raw(libc::SIGWINCH, handle_winch, libc::SA_RESTART);
-    }
-}
-
-/// Restore SIG_DFL for every signal we installed.  Call **before**
-/// [`unpublish_signal_state`].
-fn uninstall_signal_handlers() {
-    unsafe {
-        for signum in &[
-            libc::SIGINT,
-            libc::SIGTERM,
-            libc::SIGHUP,
-            libc::SIGQUIT,
-            libc::SIGTSTP,
-            libc::SIGCONT,
-            libc::SIGWINCH,
-        ] {
-            let mut act: libc::sigaction = std::mem::zeroed();
-            act.sa_sigaction = libc::SIG_DFL;
-            libc::sigemptyset(&mut act.sa_mask);
-            libc::sigaction(*signum, &act, std::ptr::null_mut());
-        }
-    }
-}
-
-// === End of signal handlers ====================================
-
-/// Terminal channel used for reading user commands and writing the prompt.
-///
-/// POSIX.1-2024 (`more`, INPUT FILES / STDERR sections) requires that when
-/// standard output is a terminal, user commands are read from **standard
-/// error**; if standard error is not readable, the implementation may attempt
-/// to open the controlling terminal (`/dev/tty`); if neither is available it
-/// must terminate with an error.  The same channel is used to write the
-/// prompt and cursor-control sequences (`STDERR` section).
-///
-/// This struct owns a file descriptor opened on the chosen channel and places
-/// it in raw mode for the lifetime of the pager.  Reader and writer are
-/// independent `File` handles created from duplicated file descriptors so the
-/// input thread can take the reader by value while the main thread writes the
-/// prompt to the writer.  `Drop` restores the original termios and closes the
-/// owned fd; each `File` closes its own duplicate.
-struct CommandIO {
-    /// Owned fd in raw mode; closed (after termios restoration) by Drop.
-    fd: RawFd,
-    /// Cooked-mode termios captured at construction, restored by Drop.
-    original_termios: libc::termios,
-}
-
-impl CommandIO {
-    /// Open a command-input channel per the POSIX-literal precedence rule:
-    /// try stderr first (must be a terminal and readable); fall back to
-    /// `/dev/tty` (opened `O_RDWR | O_NOCTTY`); error if neither is usable.
-    ///
-    /// Returns `(channel, reader, writer)`.  The caller hands `reader` to the
-    /// input thread and `writer` to the prompt-rendering code; `channel`
-    /// retains the original-termios state for restoration on Drop.  Only
-    /// meaningful when standard output is a terminal — callers must check
-    /// `is_stdout_tty()` first and skip this in filter mode.
-    fn open() -> Result<(Self, File, File), MoreError> {
-        let fd = pick_command_fd()?;
-        // Save cooked-mode termios for restoration in Drop.
-        let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
-        if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
-            unsafe { libc::close(fd) };
-            return Err(MoreError::NoCommandSource);
-        }
-        // Derive raw-mode termios.
-        let mut raw = original;
-        unsafe { libc::cfmakeraw(&mut raw) };
-        // VMIN=1 / VTIME=0 — block until at least one byte is available.
-        raw.c_cc[libc::VMIN] = 1;
-        raw.c_cc[libc::VTIME] = 0;
-        // Publish (fd, cooked, raw) for the signal handlers BEFORE applying
-        // raw mode.  This ordering matters: if a signal fires during the
-        // tcsetattr below, the handler must already see the cooked snapshot
-        // so it can restore on _exit.  We then install handlers so they take
-        // over from the default dispositions before any raw-mode I/O begins.
-        unsafe { publish_signal_state(fd, original, raw) };
-        install_signal_handlers();
-        // Now apply raw mode.
-        if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &raw) } != 0 {
-            uninstall_signal_handlers();
-            unpublish_signal_state();
-            unsafe { libc::close(fd) };
-            return Err(MoreError::NoCommandSource);
-        }
-        // Duplicate fd twice so reader and writer each own a distinct
-        // descriptor — they are closed when each File is dropped.  The
-        // original fd remains owned by `self` for termios restoration.
-        let read_fd = unsafe { libc::dup(fd) };
-        let write_fd = unsafe { libc::dup(fd) };
-        if read_fd < 0 || write_fd < 0 {
-            if read_fd >= 0 {
-                unsafe { libc::close(read_fd) };
-            }
-            if write_fd >= 0 {
-                unsafe { libc::close(write_fd) };
-            }
-            unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &original) };
-            uninstall_signal_handlers();
-            unpublish_signal_state();
-            unsafe { libc::close(fd) };
-            return Err(MoreError::NoCommandSource);
-        }
-        let reader = unsafe { File::from_raw_fd(read_fd) };
-        let writer = unsafe { File::from_raw_fd(write_fd) };
-        Ok((
-            Self {
-                fd,
-                original_termios: original,
-            },
-            reader,
-            writer,
-        ))
-    }
-}
-
-impl Drop for CommandIO {
-    fn drop(&mut self) {
-        // Order matters:
-        //   1. Restore termios while handlers are still installed (so an
-        //      in-flight signal sees consistent state).
-        //   2. Uninstall handlers (revert to SIG_DFL).  Now any subsequent
-        //      signal takes the kernel's default action on the cooked tty.
-        //   3. Unpublish the static state so a handler that races us
-        //      cannot read freed fd values.
-        //   4. Close the owned fd.
-        unsafe {
-            libc::tcsetattr(self.fd, libc::TCSAFLUSH, &self.original_termios);
-        }
-        uninstall_signal_handlers();
-        unpublish_signal_state();
-        unsafe {
-            libc::close(self.fd);
-        }
-    }
-}
-
-/// True if the given fd refers to a terminal AND is open for reading.
-/// POSIX requires both checks before we use a descriptor as a command source.
-fn is_readable_terminal(fd: RawFd) -> bool {
-    if unsafe { libc::isatty(fd) } != 1 {
-        return false;
-    }
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        return false;
-    }
-    let access_mode = flags & libc::O_ACCMODE;
-    access_mode == libc::O_RDONLY || access_mode == libc::O_RDWR
-}
-
-/// True if standard output is connected to a terminal.  Filter mode is
-/// entered iff this returns false.
-fn is_stdout_tty() -> bool {
-    unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
-}
-
-/// Pick the file descriptor to use for reading user commands.
-///
-/// Returns an owned fd opened `O_RDWR` (or duped from stderr) that the caller
-/// must close.  Used by `CommandIO::open`.
-fn pick_command_fd() -> Result<RawFd, MoreError> {
-    // 1. stderr: only if it is itself a terminal AND open for reading.
-    if is_readable_terminal(libc::STDERR_FILENO) {
-        let dup = unsafe { libc::dup(libc::STDERR_FILENO) };
-        if dup >= 0 {
-            return Ok(dup);
-        }
-    }
-    // 2. /dev/tty fallback (POSIX permits this).
-    let path = c"/dev/tty";
-    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_NOCTTY) };
-    if fd >= 0 {
-        return Ok(fd);
-    }
-    Err(MoreError::NoCommandSource)
-}
-
 /// Wraps stdout for content rendering (alternate-screen-buffered when
 /// interactive) and holds the prompt-output writer plus the mpsc receiver
 /// fed by the spawned input thread.  Raw mode lives on the command channel
@@ -2236,13 +1885,13 @@ enum CommandReader {
     /// `--test` mode: read commands from stdin (the test harness pipes them in).
     Stdin,
     /// Interactive mode: raw-mode terminal fd (stderr or `/dev/tty`).
-    Tty(File),
+    Tty(term::Reader),
 }
 
 impl Terminal {
     /// Construct a `Terminal`.
     ///
-    /// `command_reader` selects the input thread's reader: `Tty(File)` for
+    /// `command_reader` selects the input thread's reader: `Tty(reader)` for
     /// real interactive use (caller has already opened a [`CommandIO`] and
     /// split off the reader), `Stdin` for the test harness, or `None` for
     /// filter mode where no command thread is needed.
@@ -2258,14 +1907,11 @@ impl Terminal {
     ) -> Result<Self, MoreError> {
         let mut _alternate_screen = None;
         if !is_test {
-            if !termion::is_tty(&std::io::stdout().as_raw_fd()) {
+            if !std::io::stdout().is_terminal() {
                 return Err(MoreError::TerminalInit);
             }
-            _alternate_screen = Some(
-                stdout()
-                    .into_alternate_screen()
-                    .map_err(|_| MoreError::TerminalInit)?,
-            );
+            _alternate_screen =
+                Some(AlternateScreen::new(stdout()).map_err(|_| MoreError::TerminalInit)?);
         }
 
         let (sender, receiver) = channel();
@@ -2365,9 +2011,9 @@ impl Terminal {
             self.prompt_out,
             "{}",
             if let Prompt::Input(_) = prompt {
-                Show.to_string()
+                term::SHOW_CURSOR
             } else {
-                Hide.to_string()
+                term::HIDE_CURSOR
             }
         );
         let line_position = if self.size.0 == 1 {
@@ -2391,7 +2037,7 @@ impl Terminal {
 
     /// Update terminal size for wrapper
     fn resize(&mut self) -> Result<(), MoreError> {
-        let (x, y) = terminal_size().map_err(|_| MoreError::SizeRead)?;
+        let (x, y) = term::terminal_size().map_err(|_| MoreError::SizeRead)?;
 
         // POSIX 107336 and 107357: COLUMNS and LINES "override the
         // system-selected" sizes.  They are consulted here, on every resize,
@@ -2420,56 +2066,23 @@ impl Terminal {
         *NEED_QUIT.lock().unwrap() = true;
         // Cursor-show + style-reset belong on the prompt channel (stderr in
         // interactive mode) — that is where the cursor was hidden and styled.
-        let _ = write!(self.prompt_out, "{}{}", Show, Reset);
+        let _ = write!(
+            self.prompt_out,
+            "{}{}",
+            term::SHOW_CURSOR,
+            term::RESET_STYLE
+        );
         self._alternate_screen = None;
-    }
-}
-
-/// Translate a parsed terminal event into the command string the pager loop
-/// consumes.  Returns `None` for events that don't map to a command (idle
-/// mouse motion, modifier-only keys, etc.).
-fn event_to_command(event: Event, bytes: Vec<u8>) -> Option<String> {
-    match event {
-        Event::Mouse(mouse_event) => {
-            let button = match mouse_event {
-                MouseEvent::Press(button, _, _) => Some(button),
-                _ => *LAST_MOUSE_BUTTON.lock().unwrap(),
-            };
-            let last_mouse_button = if let MouseEvent::Release(..) = mouse_event {
-                None
-            } else {
-                button
-            };
-            *LAST_MOUSE_BUTTON.lock().unwrap() = last_mouse_button;
-            match button {
-                Some(MouseButton::WheelDown) => Some("\n".to_string()),
-                Some(MouseButton::WheelUp) => Some("k".to_string()),
-                _ => None,
-            }
-        }
-        Event::Key(Key::Up) => Some("k".to_string()),
-        Event::Key(Key::Down) => Some("\n".to_string()),
-        Event::Key(key) => {
-            let mut s = String::from_utf8(bytes).ok();
-            if key == Key::Char('\n') {
-                if let Some(s) = &mut s {
-                    s.clear();
-                    s.push('\n');
-                }
-            }
-            s
-        }
-        _ => None,
     }
 }
 
 /// Emit an ANSI style escape sequence to `out`.  Used by both content
 /// rendering (writer = stdout) and prompt rendering (writer = stderr).
 fn set_style_on<W: Write + ?Sized>(out: &mut W, style: StyleType) -> std::io::Result<()> {
-    write!(out, "{}", Reset)?;
+    write!(out, "{}", term::RESET_STYLE)?;
     match style {
-        StyleType::Underscore => write!(out, "{}", Underline),
-        StyleType::Negative => write!(out, "{}", Invert),
+        StyleType::Underscore => write!(out, "{}", term::UNDERLINE),
+        StyleType::Negative => write!(out, "{}", term::INVERT),
         _ => Ok(()),
     }
 }
@@ -2482,7 +2095,7 @@ fn write_ch_on<W: Write + ?Sized>(out: &mut W, ch: char, x: u16, y: u16) {
 
 /// Erase the current cursor line.
 fn clear_current_line_on<W: Write + ?Sized>(out: &mut W) {
-    let _ = write!(out, "{}", CurrentLine);
+    let _ = write!(out, "{}", term::CLEAR_LINE);
 }
 
 /// Position the cursor at (`x`, `y`) (1-based, converted from 0-based) and
@@ -2492,7 +2105,7 @@ fn write_str_on<W: Write + ?Sized>(out: &mut W, s: &str, x: u16, y: u16) {
 }
 
 /// Background input thread body.  Takes ownership of the reader (so it can
-/// drive `events_and_raw` as a long-lived iterator) and pumps commands into
+/// drive [`term::Commands`] as a long-lived iterator) and pumps commands into
 /// the mpsc channel until the main loop signals quit.
 ///
 /// EOF on the reader is **not** treated as a fatal end-of-stream: the test
@@ -2506,23 +2119,21 @@ fn run_input_thread<R: Read>(
     reader: R,
     sender: std::sync::mpsc::Sender<Result<String, MoreError>>,
 ) {
-    let mut events = reader.events_and_raw();
+    let mut commands = term::Commands::new(reader);
     while !*NEED_QUIT.lock().unwrap() {
-        let Some(result) = events.next() else {
+        let Some(result) = commands.next() else {
             // Reader is exhausted (typically only in tests).  Hold the
             // sender alive and wait for the main loop to signal quit.
-            drop(events);
+            drop(commands);
             while !*NEED_QUIT.lock().unwrap() {
                 std::thread::sleep(Duration::from_millis(100));
             }
             return;
         };
         match result {
-            Ok((event, bytes)) => {
-                if let Some(cmd) = event_to_command(event, bytes) {
-                    if sender.send(Ok(cmd)).is_err() {
-                        return;
-                    }
+            Ok(cmd) => {
+                if sender.send(Ok(cmd)).is_err() {
+                    return;
                 }
             }
             Err(_) => {
@@ -2669,7 +2280,7 @@ struct MoreControl {
     /// so its `Drop` (which restores cooked-mode termios) runs **after**
     /// `terminal`'s `Drop` releases the alternate screen and the spawned
     /// input thread has been told to quit.
-    command_io: Option<CommandIO>,
+    command_io: Option<term::CommandIO>,
 }
 
 impl MoreControl {
@@ -2712,13 +2323,14 @@ impl MoreControl {
         // channel can be opened — `CommandIO::open` returns
         // `MoreError::NoCommandSource`, which propagates here.
         let (command_io, command_reader, prompt_out): (
-            Option<CommandIO>,
+            Option<term::CommandIO>,
             CommandReader,
             Box<dyn Write + Send>,
         ) = if args.test {
             (None, CommandReader::Stdin, Box::new(stdout()))
-        } else if is_stdout_tty() {
-            let (io, reader, writer) = CommandIO::open()?;
+        } else if stdout().is_terminal() {
+            let (io, reader, writer) =
+                term::CommandIO::open().map_err(|_| MoreError::NoCommandSource)?;
             (Some(io), CommandReader::Tty(reader), Box::new(writer))
         } else {
             (None, CommandReader::None, Box::new(std::io::sink()))
@@ -2940,8 +2552,10 @@ impl MoreControl {
     /// signal handler) is the only safe way to do non-trivial work — Rust
     /// `Drop`, allocation, and `Mutex` are all banned in handler context.
     fn handle_pending_signals(&mut self) -> Result<(), MoreError> {
-        let cont = SIGCONT_PENDING.swap(false, Ordering::SeqCst);
-        let winch = SIGWINCH_PENDING.swap(false, Ordering::SeqCst);
+        let term::Pending {
+            resumed: cont,
+            resized: winch,
+        } = term::take_pending();
         if cont {
             // Force-refresh independent of size change.  `resize` is the
             // single entry point that refetches winsize and re-renders.
@@ -2968,6 +2582,10 @@ impl MoreControl {
 
     /// Call editor for current file as child process and handle output
     fn invoke_editor(&mut self) -> Result<(), MoreError> {
+        // POSIX 107618-107620: vi and ex take "-c linenumber", where
+        // linenumber is the file line containing the display line at the top
+        // of the screen.
+        let line_number = self.context.top_source_line().to_string();
         let Source::File(ref file_path) = self.context.current_source else {
             return Err(MoreError::FileRead("<none>".to_owned()));
         };
@@ -2980,27 +2598,22 @@ impl MoreControl {
         // POSIX 107617-107618: "If the last pathname component in EDITOR is
         // either vi or ex" -- so compare the basename, not the whole string,
         // which would miss /usr/bin/vi.
-        let is_editor_vi_or_ex = Path::new(editor)
-            .file_name()
-            .map(|name| name == "vi" || name == "ex")
-            .unwrap_or(false);
+        let is_editor_vi_or_ex =
+            editor_name(Path::new(editor)).is_some_and(|name| name == "vi" || name == "ex");
         let Some(file_path) = file_path.as_os_str().to_str() else {
             return Err(MoreError::FileRead(
                 file_path.to_str().unwrap_or("<file>").to_owned(),
             ));
         };
 
-        // POSIX 107618-107620: vi and ex take "-c linenumber", where
-        // linenumber is the line displayed as the first line of the screen.
-        let line_number = self.context.seek_positions.current_line().to_string();
         let args: &[&str] = if is_editor_vi_or_ex {
             &["-c", line_number.as_str(), "--", file_path]
         } else {
             &[file_path]
         };
 
-        let _ = unsafe { getegid() != getuid() || getegid() != getgid() };
-        let _ = unsafe { setgid(getgid()) < 0 || setuid(getuid()) < 0 };
+        #[cfg(unix)]
+        drop_privileges();
         match std::process::Command::new(editor).args(args).status() {
             Ok(exit) if !ExitStatus::success(&exit) => Err(MoreError::EditorFailed),
             Err(_) => Err(MoreError::EditorFailed),
@@ -3718,7 +3331,16 @@ impl MoreControl {
                 let _ = self.display().inspect_err(|e| self.handle_error(e.clone()));
                 continue;
             }
-            match self.handle_events() {
+            // Commands typed ahead are run before waiting for more input.
+            let typed_ahead = matches!(
+                parse(self.commands_buffer.clone()),
+                Ok((command, _, _)) if command != Command::Unknown
+            );
+            match if typed_ahead {
+                Ok(())
+            } else {
+                self.handle_events()
+            } {
                 Err(e) => {
                     self.handle_error(e);
                     continue;
@@ -3738,7 +3360,7 @@ impl MoreControl {
                     }
                 }
             }
-            if let Ok((command, mut remainder, next_possible)) =
+            if let Ok((command, remainder, next_possible)) =
                 parse(self.commands_buffer.clone()).inspect_err(|e| self.handle_error(e.clone()))
             {
                 if let Some(Prompt::Eof { .. }) = self.prompt {
@@ -3755,12 +3377,11 @@ impl MoreControl {
                         },
                     });
                 }
-                match command {
-                    Command::Unknown => {
-                        continue;
-                    }
-                    _ => remainder.clear(),
+                if command == Command::Unknown {
+                    continue;
                 }
+                // What follows the command was typed ahead and is kept; `R`
+                // is the command that discards it.
                 self.commands_buffer = remainder;
                 let _ = self
                     .execute(command)
@@ -3781,10 +3402,43 @@ fn to_path(file_string: String) -> Result<PathBuf, MoreError> {
     Ok(file_path)
 }
 
+/// The name an editor goes by: the last component of its path.
+#[cfg(unix)]
+fn editor_name(path: &Path) -> Option<&std::ffi::OsStr> {
+    path.file_name()
+}
+
+/// The name an editor goes by: the last component of its path, less the
+/// extension that makes a file a Windows program (`C:\tools\vi.exe` and
+/// `vi.cmd` are vi).
+#[cfg(windows)]
+fn editor_name(path: &Path) -> Option<&std::ffi::OsStr> {
+    const PROGRAM_EXTENSIONS: [&str; 4] = ["exe", "com", "bat", "cmd"];
+    let is_program = path.extension().is_some_and(|ext| {
+        PROGRAM_EXTENSIONS
+            .iter()
+            .any(|program| ext.eq_ignore_ascii_case(program))
+    });
+    if is_program {
+        path.file_stem()
+    } else {
+        path.file_name()
+    }
+}
+
+/// Run the editor as the real user and group, not as any set-ID ones.
+#[cfg(unix)]
+fn drop_privileges() {
+    // SAFETY: plain system calls on the process's own IDs.
+    let _ = unsafe { libc::getegid() != libc::getuid() || libc::getegid() != libc::getgid() };
+    let _ = unsafe { libc::setgid(libc::getgid()) < 0 || libc::setuid(libc::getuid()) < 0 };
+}
+
 /// `wordexp_t` of `<wordexp.h>`.  Not exposed by the `libc` crate, but the
 /// layout is fixed by POSIX and identical on the platforms this project
 /// targets (glibc and macOS both declare exactly these three members, in
 /// this order).
+#[cfg(unix)]
 #[repr(C)]
 struct WordExp {
     we_wordc: libc::size_t,
@@ -3792,6 +3446,7 @@ struct WordExp {
     we_offs: libc::size_t,
 }
 
+#[cfg(unix)]
 extern "C" {
     fn wordexp(
         words: *const libc::c_char,
@@ -3808,6 +3463,7 @@ extern "C" {
 /// than one pathname; treat that, like a failed expansion, as an error, so
 /// that 107595-107597's "the current file and screen shall not change"
 /// applies.
+#[cfg(unix)]
 fn word_expand(word: &str) -> Result<String, MoreError> {
     let failed = || MoreError::FileRead(word.to_owned());
     let c_word = CString::new(word).map_err(|_| failed())?;
@@ -3833,6 +3489,77 @@ fn word_expand(word: &str) -> Result<String, MoreError> {
         wordfree(&mut we);
         expanded
     }
+}
+
+/// The `:e` filename operand, expanded as far as Windows has a meaning for
+/// shell word expansion: a leading unquoted `~` is the home directory
+/// (`HOME`, else `USERPROFILE`), `$NAME` and `${NAME}` outside single quotes
+/// are the variable's value, and quotes are removed. The result is one name:
+/// there is no field splitting, pathname expansion or command substitution,
+/// and `\` is a path separator, not an escape. A quote or `${` left open is
+/// an error.
+#[cfg(windows)]
+fn word_expand(word: &str) -> Result<String, MoreError> {
+    let failed = || MoreError::FileRead(word.to_owned());
+    let mut out = String::new();
+    let mut chars = word.chars().peekable();
+
+    if chars.peek() == Some(&'~') {
+        let mut rest = word[1..].chars();
+        if matches!(rest.next(), None | Some('/') | Some('\\')) {
+            chars.next();
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .map_err(|_| failed())?;
+            out.push_str(&home);
+        }
+    }
+
+    let mut quote = None;
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (None, '\'' | '"') => quote = Some(c),
+            (Some(q), _) if c == q => quote = None,
+            (None | Some('"'), '$') => {
+                let name: String = if chars.peek() == Some(&'{') {
+                    chars.next();
+                    let mut name = String::new();
+                    let mut closed = false;
+                    for c in chars.by_ref() {
+                        if c == '}' {
+                            closed = true;
+                            break;
+                        }
+                        name.push(c);
+                    }
+                    if !closed {
+                        return Err(failed());
+                    }
+                    name
+                } else {
+                    let mut name = String::new();
+                    while let Some(&c) = chars.peek() {
+                        if !(c.is_ascii_alphanumeric() || c == '_') {
+                            break;
+                        }
+                        name.push(c);
+                        chars.next();
+                    }
+                    if name.is_empty() {
+                        out.push('$');
+                        continue;
+                    }
+                    name
+                };
+                out.push_str(&std::env::var(&name).unwrap_or_default());
+            }
+            _ => out.push(c),
+        }
+    }
+    if quote.is_some() {
+        return Err(failed());
+    }
+    Ok(out)
 }
 
 /// Read a screen dimension from the environment, per POSIX 107336/107357.
@@ -4386,16 +4113,59 @@ mod tests {
             "/tmp/expanded"
         );
         assert_eq!(word_expand("plain_name").unwrap(), "plain_name");
+        #[cfg(unix)]
         assert!(word_expand("~").unwrap().starts_with('/'));
+        #[cfg(windows)]
+        assert_eq!(
+            word_expand("~").unwrap(),
+            std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap()
+        );
     }
 
+    #[test]
+    fn word_expand_rejects_an_open_quote() {
+        assert!(word_expand("'unterminated").is_err());
+    }
+
+    // Field splitting is the subject; Windows does none.
+    #[cfg(unix)]
     #[test]
     fn word_expand_rejects_multiple_pathnames() {
         // "if more than a single pathname results, the effects are
         // unspecified" -- treated as an error so the current file is kept.
         std::env::set_var("POSIXUTILS_MORE_TEST_TWO", "one two");
         assert!(word_expand("$POSIXUTILS_MORE_TEST_TWO").is_err());
-        assert!(word_expand("'unterminated").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn word_expand_on_windows_is_one_name() {
+        std::env::set_var("POSIXUTILS_MORE_TEST_WIN", "C:\\data dir");
+        let expanded = |w: &str| word_expand(w).unwrap();
+        assert_eq!(
+            expanded("${POSIXUTILS_MORE_TEST_WIN}\\f.txt"),
+            "C:\\data dir\\f.txt"
+        );
+        assert_eq!(expanded("\"$POSIXUTILS_MORE_TEST_WIN\""), "C:\\data dir");
+        assert_eq!(
+            expanded("'$POSIXUTILS_MORE_TEST_WIN'"),
+            "$POSIXUTILS_MORE_TEST_WIN"
+        );
+        assert_eq!(expanded("a b\\c$"), "a b\\c$");
+        assert!(word_expand("${POSIXUTILS_MORE_TEST_WIN").is_err());
+        assert!(word_expand("\"open").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_vi_is_vi() {
+        use super::editor_name;
+        assert_eq!(editor_name(Path::new("C:\\tools\\vi.exe")).unwrap(), "vi");
+        assert_eq!(editor_name(Path::new("ex.EXE")).unwrap(), "ex");
+        assert_eq!(editor_name(Path::new("vi.cmd")).unwrap(), "vi");
+        assert_eq!(editor_name(Path::new("vi.txt")).unwrap(), "vi.txt");
     }
 
     use super::{render_display_line, RenderOpts, StyleType, CELL_CONT};

@@ -11,7 +11,7 @@ use base64::prelude::*;
 use clap::Parser;
 use gettextrs::gettext;
 use plib::diag;
-use std::fs::{File, Permissions};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -75,22 +75,6 @@ fn is_writable(path: &Path) -> bool {
     #[cfg(windows)]
     {
         std::fs::metadata(path).is_ok_and(|m| !m.permissions().readonly())
-    }
-}
-
-/// Give `perm` the header's permission bits, keeping whatever else it holds.
-/// Windows keeps only a read-only attribute, the owner-write bit seen from
-/// POSIX, so there the file is read-only exactly when the header withholds
-/// owner write.
-fn set_mode(perm: &mut Permissions, mode: u32) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        perm.set_mode(((perm.mode() >> 9) << 9) | (mode & 0o7777));
-    }
-    #[cfg(windows)]
-    {
-        perm.set_readonly(mode & 0o200 == 0);
     }
 }
 
@@ -252,7 +236,7 @@ fn decode_file(args: &Args) -> io::Result<()> {
 
         let mut o_file = File::create(out_path)?;
         let mut o_file_perm = o_file.metadata()?.permissions();
-        set_mode(&mut o_file_perm, header.lower_perm_bits);
+        plib::perm::set_mode(&mut o_file_perm, header.lower_perm_bits);
 
         o_file.write_all(&out)?;
         // If the mode bits cannot be set, this is not an error (spec 119719-119720).

@@ -72,7 +72,8 @@ pub fn input_reader(
 ///
 /// If `path` already exists, the new file inherits its mode (`st_mode &
 /// 0o7777`). If it does not, the file is created `0o666 & ~umask`, which is
-/// what XCU 1.1.1.4 requires of a utility that creates a file.
+/// what XCU 1.1.1.4 requires of a utility that creates a file. On Windows the
+/// mode is the read-only attribute (see [`crate::perm`]).
 ///
 /// The mode has to be set explicitly because the temporary this writes through
 /// is created `O_EXCL|0600` — deliberately, since it is world-visible in the
@@ -81,19 +82,15 @@ pub fn input_reader(
 ///
 /// Used by utilities like `ar` and `strip` that rewrite a binary in place
 /// where a partial write would corrupt the artifact on disk.
-#[cfg(unix)]
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mode = match fs::metadata(path) {
-        Ok(meta) => {
-            use std::os::unix::fs::PermissionsExt;
-            meta.permissions().mode()
-        }
+        Ok(meta) => crate::perm::mode_of(&meta.permissions()),
         // Only "there is no file here" means a file is being created. Every
         // other stat failure is reported rather than read as absence: an
         // `Err(_)` arm would take, say, EACCES on a path component or ENOTDIR
         // on a parent as "missing" and go on to pick a mode for a file it
         // could not have looked at.
-        Err(e) if e.kind() == io::ErrorKind::NotFound => crate::modestr::default_create_mode(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => crate::perm::new_file_mode(),
         Err(e) => return Err(e),
     };
     write_atomic_mode(path, bytes, mode)
@@ -104,10 +101,8 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// For the callers whose spec, or whose security posture, fixes the mode
 /// rather than deriving it — `crontab` writes the spool copy `0600` whether or
 /// not one was already there.
-#[cfg(unix)]
 pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
 
     let parent = path
         .parent()
@@ -121,11 +116,60 @@ pub fn write_atomic_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()>
 
     // Before the rename, so the file is never visible at `path` under the
     // temporary's 0600.
-    tmp.as_file()
-        .set_permissions(std::fs::Permissions::from_mode(mode))?;
+    let mut perm = tmp.as_file().metadata()?.permissions();
+    crate::perm::set_mode(&mut perm, mode);
+    tmp.as_file().set_permissions(perm)?;
 
-    tmp.persist(path).map_err(|e| e.error)?;
-    Ok(())
+    replace_with(tmp, path)
+}
+
+/// Rename `tmp` over `path`, replacing whatever is there.
+#[cfg(unix)]
+fn replace_with(tmp: crate::tmp::NamedTempFile, path: &Path) -> io::Result<()> {
+    tmp.persist(path).map(drop).map_err(|e| e.error)
+}
+
+/// Rename `tmp` over `path`, replacing whatever is there.
+///
+/// Windows will not replace a read-only file, so a read-only target has its
+/// attribute cleared first and given back if the rename still fails. The new
+/// file carries its own attribute, set before the rename. On a failure the
+/// temporary is made writable again, so its cleanup can delete it wherever a
+/// read-only file cannot be deleted (Wine, older Windows).
+#[cfg(windows)]
+fn replace_with(tmp: crate::tmp::NamedTempFile, path: &Path) -> io::Result<()> {
+    let target = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.permissions().readonly() => Some(meta.permissions()),
+        Ok(_) => None,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    if let Some(original) = &target {
+        fs::set_permissions(path, writable(original.clone()))?;
+    }
+    tmp.persist(path).map(drop).map_err(|e| {
+        if let Some(original) = target {
+            let _ = fs::set_permissions(path, original);
+        }
+        if let Ok(meta) = e.file.as_file().metadata() {
+            let _ = e
+                .file
+                .as_file()
+                .set_permissions(writable(meta.permissions()));
+        }
+        e.error
+    })
+}
+
+/// `perm` without the read-only attribute.
+#[cfg(windows)]
+fn writable(mut perm: fs::Permissions) -> fs::Permissions {
+    #[expect(
+        clippy::permissions_set_readonly_false,
+        reason = "Windows only: clears the read-only attribute, no Unix mode bits"
+    )]
+    perm.set_readonly(false);
+    perm
 }
 
 /// Restore the default disposition for `SIGPIPE`.
@@ -284,10 +328,9 @@ fn open_free_std_fds() {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn input_stream_dashed_opens_file() {
@@ -334,8 +377,11 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"hello");
     }
 
+    // Modes are the subject; see the read-only test below for Windows.
+    #[cfg(unix)]
     #[test]
     fn write_atomic_preserves_mode() {
+        use std::os::unix::fs::PermissionsExt;
         let dir = crate::tmp::tempdir().unwrap();
         let path = dir.path().join("executable.bin");
         fs::write(&path, b"#!/bin/sh\necho hi\n").unwrap();
@@ -359,5 +405,26 @@ mod tests {
             .collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0], "file.bin");
+    }
+
+    /// A read-only target is replaced and stays read-only: the attribute is
+    /// Windows's whole mode, so this is `write_atomic_preserves_mode` there.
+    #[test]
+    fn write_atomic_replaces_a_read_only_file() {
+        let dir = crate::tmp::tempdir().unwrap();
+        let path = dir.path().join("ro.bin");
+        fs::write(&path, b"original").unwrap();
+        let mut perm = fs::metadata(&path).unwrap().permissions();
+        crate::perm::set_mode(&mut perm, 0o444);
+        fs::set_permissions(&path, perm).unwrap();
+
+        write_atomic(&path, b"replaced").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"replaced");
+        let mut perm = fs::metadata(&path).unwrap().permissions();
+        assert!(perm.readonly(), "the replacement must keep the mode");
+
+        // Wine will not delete a read-only file; clear it for the TempDir.
+        crate::perm::set_mode(&mut perm, 0o644);
+        fs::set_permissions(&path, perm).unwrap();
     }
 }

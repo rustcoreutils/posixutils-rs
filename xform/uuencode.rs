@@ -11,13 +11,11 @@ use base64::prelude::*;
 use clap::Parser;
 use gettextrs::gettext;
 use plib::diag;
-use std::fs::{File, Permissions};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 const PERMISSION_MASK: u32 = 0o7;
-#[cfg(unix)]
-const RW: u32 = 0o666;
 
 /// uuencode - encode a binary file
 #[derive(Parser)]
@@ -71,48 +69,6 @@ fn format_mode(mode: u32) -> String {
     format!("{user_perm}{group_perm}{others_perm}")
 }
 
-/// The permission bits of `perm`, as POSIX writes them.
-///
-/// Windows keeps only a read-only attribute, which is the owner-write bit
-/// seen from POSIX: such a file reads as `0444`, any other as `0644`.
-fn mode_of(perm: &Permissions) -> u32 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        perm.mode()
-    }
-    #[cfg(windows)]
-    {
-        if perm.readonly() {
-            0o444
-        } else {
-            0o644
-        }
-    }
-}
-
-/// The mode a newly created file gets: `0666` less the umask, read without
-/// leaving it changed (umask(2) has no read-only form). Windows has no umask,
-/// and a new file there is an ordinary writable one, `0644`.
-fn new_file_mode() -> u32 {
-    #[cfg(target_os = "macos")]
-    {
-        let old = unsafe { libc::umask(RW as u16) };
-        unsafe { libc::umask(old) };
-        RW & (!old as u32)
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let old = unsafe { libc::umask(RW) };
-        unsafe { libc::umask(old) };
-        RW & !old
-    }
-    #[cfg(windows)]
-    {
-        0o644
-    }
-}
-
 fn encode_base64_line(line: &[u8]) -> Vec<u8> {
     let mut out = BASE64_STANDARD.encode(line).as_bytes().to_vec();
     out.push(b'\n');
@@ -163,14 +119,14 @@ fn encode_file(base64: bool, file: Option<&Path>, decode_path: &str) -> io::Resu
 
     match file {
         None => {
-            let perm = format_mode(new_file_mode());
+            let perm = format_mode(plib::perm::new_file_mode());
             let header = format!("{header_init} {perm} {decode_path}\n");
             out.extend_from_slice(header.as_bytes());
             io::stdin().lock().read_to_end(&mut buf)?;
         }
         Some(path) => {
             let mut f = File::open(path)?;
-            let perm = format_mode(mode_of(&f.metadata()?.permissions()));
+            let perm = format_mode(plib::perm::mode_of(&f.metadata()?.permissions()));
             let header = format!("{header_init} {perm} {decode_path}\n");
             out.extend_from_slice(header.as_bytes());
             f.read_to_end(&mut buf)?;

@@ -175,6 +175,21 @@ impl MoreSession {
     }
 }
 
+impl Drop for MoreSession {
+    /// When the test failed, show what the terminal received: a screen that
+    /// came out wrong is diagnosed from the bytes, not from the grid.
+    fn drop(&mut self) {
+        if thread::panicking() {
+            let bytes = self.output.lock().map(|o| o.clone()).unwrap_or_default();
+            eprintln!(
+                "PTY output ({} bytes): {:?}",
+                bytes.len(),
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+    }
+}
+
 /// Replay a terminal byte stream into a screen grid.
 ///
 /// Deliberately minimal: `more` only ever emits absolute cursor positioning

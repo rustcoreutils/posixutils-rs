@@ -312,6 +312,13 @@ pub struct Ustar<'a> {
     /// device keywords without `mknod` and therefore without root.
     pub devmajor: u32,
     pub devminor: u32,
+    /// `uid`/`gid` (108, 116) and `uname`/`gname` (265, 297). Settable so a
+    /// test can make the names disagree with the numbers, which is the state
+    /// an archive carried between hosts arrives in.
+    pub uid: u32,
+    pub gid: u32,
+    pub uname: &'a [u8],
+    pub gname: &'a [u8],
     /// What to write in the size field. `None` writes `body.len()`, which is
     /// what a well-formed member has; `Some` is how a fixture makes the header
     /// lie about how much data follows.
@@ -329,6 +336,10 @@ impl Default for Ustar<'_> {
             prefix: b"",
             devmajor: 0,
             devminor: 0,
+            uid: 0,
+            gid: 0,
+            uname: b"",
+            gname: b"",
             size: None,
         }
     }
@@ -341,8 +352,8 @@ impl Ustar<'_> {
         let mut h = [0u8; BLOCK];
         h[..self.name.len()].copy_from_slice(self.name);
         h[100..108].copy_from_slice(format!("{:07o}\0", self.mode).as_bytes());
-        h[108..116].copy_from_slice(b"0000000\0"); // uid
-        h[116..124].copy_from_slice(b"0000000\0"); // gid
+        h[108..116].copy_from_slice(format!("{:07o}\0", self.uid).as_bytes());
+        h[116..124].copy_from_slice(format!("{:07o}\0", self.gid).as_bytes());
         let size = self.size.unwrap_or(self.body.len() as u64);
         h[124..136].copy_from_slice(format!("{:011o}\0", size).as_bytes());
         h[136..148].copy_from_slice(b"00000000000\0"); // mtime
@@ -353,6 +364,8 @@ impl Ustar<'_> {
         h[263..265].copy_from_slice(b"00");
         h[329..337].copy_from_slice(format!("{:07o}\0", self.devmajor).as_bytes());
         h[337..345].copy_from_slice(format!("{:07o}\0", self.devminor).as_bytes());
+        h[265..265 + self.uname.len()].copy_from_slice(self.uname);
+        h[297..297 + self.gname.len()].copy_from_slice(self.gname);
         h[345..345 + self.prefix.len()].copy_from_slice(self.prefix);
 
         let sum: u32 = h.iter().map(|&b| b as u32).sum();

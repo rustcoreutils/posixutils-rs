@@ -21,6 +21,7 @@ mod options;
 mod pattern;
 mod rawpath;
 mod subst;
+mod userdb;
 
 use archive::{ArchiveFormat, ArchiveWriter};
 use blocked_io::{

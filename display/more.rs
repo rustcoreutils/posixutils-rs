@@ -14,10 +14,10 @@ use plib::regex::{Regex, RegexFlags};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::fs::File;
-use std::io::{stdout, BufRead, BufReader, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{stdout, BufRead, BufReader, Cursor, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::mem::MaybeUninit;
 use std::ops::Not;
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{exit, ExitStatus};
 use std::str::FromStr;
@@ -25,14 +25,14 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use termion::{clear::*, cursor::*, event::*, input::*, screen::*, style::*, *};
+use term::{AlternateScreen, Goto};
+
+mod term;
 
 const LINES_PER_PAGE: u16 = 24;
 const NUM_COLUMNS: u16 = 80;
 const DEFAULT_EDITOR: &str = "vi";
 
-/// Last acceptable pressed mouse button
-static LAST_MOUSE_BUTTON: Mutex<Option<MouseButton>> = Mutex::new(None);
 /// Inform terminal input handler thread that program is closing
 static NEED_QUIT: Mutex<bool> = Mutex::new(false);
 
@@ -2258,14 +2258,11 @@ impl Terminal {
     ) -> Result<Self, MoreError> {
         let mut _alternate_screen = None;
         if !is_test {
-            if !termion::is_tty(&std::io::stdout().as_raw_fd()) {
+            if !std::io::stdout().is_terminal() {
                 return Err(MoreError::TerminalInit);
             }
-            _alternate_screen = Some(
-                stdout()
-                    .into_alternate_screen()
-                    .map_err(|_| MoreError::TerminalInit)?,
-            );
+            _alternate_screen =
+                Some(AlternateScreen::new(stdout()).map_err(|_| MoreError::TerminalInit)?);
         }
 
         let (sender, receiver) = channel();
@@ -2365,9 +2362,9 @@ impl Terminal {
             self.prompt_out,
             "{}",
             if let Prompt::Input(_) = prompt {
-                Show.to_string()
+                term::SHOW_CURSOR
             } else {
-                Hide.to_string()
+                term::HIDE_CURSOR
             }
         );
         let line_position = if self.size.0 == 1 {
@@ -2391,7 +2388,7 @@ impl Terminal {
 
     /// Update terminal size for wrapper
     fn resize(&mut self) -> Result<(), MoreError> {
-        let (x, y) = terminal_size().map_err(|_| MoreError::SizeRead)?;
+        let (x, y) = term::terminal_size().map_err(|_| MoreError::SizeRead)?;
 
         // POSIX 107336 and 107357: COLUMNS and LINES "override the
         // system-selected" sizes.  They are consulted here, on every resize,
@@ -2420,56 +2417,23 @@ impl Terminal {
         *NEED_QUIT.lock().unwrap() = true;
         // Cursor-show + style-reset belong on the prompt channel (stderr in
         // interactive mode) — that is where the cursor was hidden and styled.
-        let _ = write!(self.prompt_out, "{}{}", Show, Reset);
+        let _ = write!(
+            self.prompt_out,
+            "{}{}",
+            term::SHOW_CURSOR,
+            term::RESET_STYLE
+        );
         self._alternate_screen = None;
-    }
-}
-
-/// Translate a parsed terminal event into the command string the pager loop
-/// consumes.  Returns `None` for events that don't map to a command (idle
-/// mouse motion, modifier-only keys, etc.).
-fn event_to_command(event: Event, bytes: Vec<u8>) -> Option<String> {
-    match event {
-        Event::Mouse(mouse_event) => {
-            let button = match mouse_event {
-                MouseEvent::Press(button, _, _) => Some(button),
-                _ => *LAST_MOUSE_BUTTON.lock().unwrap(),
-            };
-            let last_mouse_button = if let MouseEvent::Release(..) = mouse_event {
-                None
-            } else {
-                button
-            };
-            *LAST_MOUSE_BUTTON.lock().unwrap() = last_mouse_button;
-            match button {
-                Some(MouseButton::WheelDown) => Some("\n".to_string()),
-                Some(MouseButton::WheelUp) => Some("k".to_string()),
-                _ => None,
-            }
-        }
-        Event::Key(Key::Up) => Some("k".to_string()),
-        Event::Key(Key::Down) => Some("\n".to_string()),
-        Event::Key(key) => {
-            let mut s = String::from_utf8(bytes).ok();
-            if key == Key::Char('\n') {
-                if let Some(s) = &mut s {
-                    s.clear();
-                    s.push('\n');
-                }
-            }
-            s
-        }
-        _ => None,
     }
 }
 
 /// Emit an ANSI style escape sequence to `out`.  Used by both content
 /// rendering (writer = stdout) and prompt rendering (writer = stderr).
 fn set_style_on<W: Write + ?Sized>(out: &mut W, style: StyleType) -> std::io::Result<()> {
-    write!(out, "{}", Reset)?;
+    write!(out, "{}", term::RESET_STYLE)?;
     match style {
-        StyleType::Underscore => write!(out, "{}", Underline),
-        StyleType::Negative => write!(out, "{}", Invert),
+        StyleType::Underscore => write!(out, "{}", term::UNDERLINE),
+        StyleType::Negative => write!(out, "{}", term::INVERT),
         _ => Ok(()),
     }
 }
@@ -2482,7 +2446,7 @@ fn write_ch_on<W: Write + ?Sized>(out: &mut W, ch: char, x: u16, y: u16) {
 
 /// Erase the current cursor line.
 fn clear_current_line_on<W: Write + ?Sized>(out: &mut W) {
-    let _ = write!(out, "{}", CurrentLine);
+    let _ = write!(out, "{}", term::CLEAR_LINE);
 }
 
 /// Position the cursor at (`x`, `y`) (1-based, converted from 0-based) and
@@ -2492,7 +2456,7 @@ fn write_str_on<W: Write + ?Sized>(out: &mut W, s: &str, x: u16, y: u16) {
 }
 
 /// Background input thread body.  Takes ownership of the reader (so it can
-/// drive `events_and_raw` as a long-lived iterator) and pumps commands into
+/// drive [`term::Commands`] as a long-lived iterator) and pumps commands into
 /// the mpsc channel until the main loop signals quit.
 ///
 /// EOF on the reader is **not** treated as a fatal end-of-stream: the test
@@ -2506,23 +2470,21 @@ fn run_input_thread<R: Read>(
     reader: R,
     sender: std::sync::mpsc::Sender<Result<String, MoreError>>,
 ) {
-    let mut events = reader.events_and_raw();
+    let mut commands = term::Commands::new(reader);
     while !*NEED_QUIT.lock().unwrap() {
-        let Some(result) = events.next() else {
+        let Some(result) = commands.next() else {
             // Reader is exhausted (typically only in tests).  Hold the
             // sender alive and wait for the main loop to signal quit.
-            drop(events);
+            drop(commands);
             while !*NEED_QUIT.lock().unwrap() {
                 std::thread::sleep(Duration::from_millis(100));
             }
             return;
         };
         match result {
-            Ok((event, bytes)) => {
-                if let Some(cmd) = event_to_command(event, bytes) {
-                    if sender.send(Ok(cmd)).is_err() {
-                        return;
-                    }
+            Ok(cmd) => {
+                if sender.send(Ok(cmd)).is_err() {
+                    return;
                 }
             }
             Err(_) => {

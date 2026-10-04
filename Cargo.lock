@@ -726,12 +726,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "numtoa"
-version = "0.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6aa2c4e539b869820a2b82e1aef6ff40aa85e65decdd5185e83fb4b1249cd00f"
-
-[[package]]
 name = "object"
 version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -974,7 +968,6 @@ dependencies = [
  "libc",
  "plib",
  "portable-pty",
- "termion",
  "thiserror 2.0.20",
 ]
 
@@ -1239,7 +1232,7 @@ dependencies = [
 name = "posixutils-xform"
 version = "0.9.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "flate2",
  "gettext-rs",
@@ -1552,16 +1545,6 @@ dependencies = [
  "nom",
  "phf 0.11.3",
  "phf_codegen",
-]
-
-[[package]]
-name = "termion"
-version = "4.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f44138a9ae08f0f502f24104d82517ef4da7330c35acd638f1f29d3cd5475ecb"
-dependencies = [
- "libc",
- "numtoa",
 ]
 
 [[package]]

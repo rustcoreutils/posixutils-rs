@@ -1475,6 +1475,31 @@ fn test_pty_scroll_forward_one_line() {
     assert_eq!(session.quit(), Some(0));
 }
 
+/// The arrow keys scroll by a line, and another key the terminal encodes as
+/// an escape sequence does nothing: Page Up's `ESC [ 5 ~` must not leave a
+/// count of 5 for the next command.
+#[test]
+fn test_pty_arrow_keys_scroll_and_other_keys_do_nothing() {
+    let content: String = (1..=20).map(|n| format!("l{n}\n")).collect();
+    let path = render_fixture("arrows.txt", content.as_bytes());
+    let Some(mut session) = MoreSession::spawn(&[path.to_str().unwrap()], &[], 5, 20) else {
+        println!("Skipping PTY test: no pseudo-terminal available");
+        return;
+    };
+
+    assert_eq!(session.row(0), "l1");
+    session.keys("\x1b[B");
+    assert_eq!(session.row(0), "l2", "Down scrolls forward a line");
+    session.keys("\x1b[A");
+    assert_eq!(session.row(0), "l1", "Up scrolls back a line");
+
+    session.keys("\x1b[5~");
+    session.keys("j");
+    assert_eq!(session.row(0), "l2", "Page Up must not become a count");
+
+    assert_eq!(session.quit(), Some(0));
+}
+
 #[test]
 fn test_pty_prompt_reports_percentage() {
     // POSIX 107630: the prompt reports "what percentage of the file precedes

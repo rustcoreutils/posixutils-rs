@@ -17,7 +17,7 @@
 
 use super::codegen::X86_64CodeGen;
 use super::lir::{
-    FloatCompare, FloatLane, IntLane, PackedOp, PackedShift, PackedShuffleOp, X86Inst,
+    FloatCompare, FloatLane, GpOperand, IntLane, PackedOp, PackedShift, PackedShuffleOp, X86Inst,
 };
 use super::regalloc::{Loc, Reg, XmmReg};
 use crate::arch::lir::{FpSize, OperandSize};
@@ -152,8 +152,21 @@ impl X86_64CodeGen {
                     });
                 } else {
                     // The count, from a general register into the low
-                    // quadword of a scratch XMM register.
-                    self.emit_move(count, Reg::R11, 64);
+                    // quadword of a scratch XMM register -- all of which the
+                    // shift reads, so it is moved at its own width and
+                    // zero-extended: the bits above an `int` argument are
+                    // the caller's garbage, and a count over the lane width
+                    // clears every lane.
+                    let bits = lane_bytes as u32 * 8;
+                    self.emit_move(count, Reg::R11, bits);
+                    if bits < 32 {
+                        self.push_lir(X86Inst::Movzx {
+                            src_size: OperandSize::from_bits(bits),
+                            dst_size: OperandSize::B32,
+                            src: GpOperand::Reg(Reg::R11),
+                            dst: Reg::R11,
+                        });
+                    }
                     self.push_lir(X86Inst::MovGpXmm {
                         size: OperandSize::B64,
                         src: Reg::R11,

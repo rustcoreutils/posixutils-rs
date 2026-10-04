@@ -883,9 +883,16 @@ fn fmt_decimal(value: u64) -> Field {
     Field::Value(value.to_string().into_bytes())
 }
 
-/// A bitfield's value, in the radix it is read in. Reserved for the fields
-/// whose only meaning is as stored bits: a mode, a header checksum, a packed
-/// device number.
+/// A bitfield's value, in the radix it is read in. Reserved for the three
+/// fields whose only meaning is as stored bits: a mode, a header checksum, and
+/// `c_rdev`, which packs a major and minor into one number that reads as
+/// nothing else (8,0 is 4000).
+///
+/// Not `c_dev`, despite that field also holding a packed value on some cpio
+/// flavors. POSIX pairs `c_dev` with `c_ino` as "values that uniquely identify
+/// the file within the archive ... determined in an unspecified manner", so it
+/// is an opaque identifier rather than a device, and printing one of a pair in
+/// octal and the other in decimal would be the worse inconsistency.
 fn fmt_octal(value: u64) -> Field {
     Field::Value(format!("{:o}", value).into_bytes())
 }
@@ -912,11 +919,16 @@ fn ustar_name_prefix(path: &[u8]) -> (&[u8], &[u8]) {
         return halves;
     }
     // No `/` sits where the ustar fields could split this name, so neither
-    // field can hold it. Split at the last `/` anyway: it is the only choice
-    // that still satisfies rule 11's prefix + "/" + name == path.
+    // field can hold it. Split at the last `/` anyway, so that rule 11's
+    // `(prefix,name)` still concatenates back to the pathname.
+    //
+    // Not when that `/` is the leading one: the prefix would be empty, and
+    // rule 11 joins only "the keywords that are non-null", so the separator
+    // would be dropped along with it and an absolute name would come back
+    // relative. The whole name goes in `name` instead.
     match path.iter().rposition(|&b| b == b'/') {
-        Some(i) => (&path[i + 1..], &path[..i]),
-        None => (path, b""),
+        Some(i) if i > 0 => (&path[i + 1..], &path[..i]),
+        _ => (path, b""),
     }
 }
 
@@ -1751,6 +1763,21 @@ mod tests {
         let flat = ustar_entry(&"y".repeat(150), b'0');
         assert_eq!(fmt("%(prefix)s", &info(&flat)), "");
         assert_eq!(fmt("%(name)s", &info(&flat)), "y".repeat(150));
+
+        // An absolute name too long for the name field whose only `/` is the
+        // leading one. Splitting there leaves the prefix empty, and rule 11
+        // concatenates only "the keywords that are non-null" -- so the
+        // separator goes with the dropped prefix and the leading `/` vanishes
+        // from the reconstruction.
+        let abs = format!("/{}", "x".repeat(120));
+        let rooted = ustar_entry(&abs, b'0');
+        assert_eq!(fmt("%(name)s", &info(&rooted)), abs);
+        assert_eq!(fmt("%(prefix)s", &info(&rooted)), "");
+        assert_eq!(
+            fmt("%(prefix,name)F", &info(&rooted)),
+            fmt("%F", &info(&rooted)),
+            "rule 11's default must rebuild an absolute name too"
+        );
     }
 
     /// The four header-identity keywords describe a ustar header. A cpio

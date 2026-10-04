@@ -3676,7 +3676,16 @@ impl MoreControl {
                 let _ = self.display().inspect_err(|e| self.handle_error(e.clone()));
                 continue;
             }
-            match self.handle_events() {
+            // Commands typed ahead are run before waiting for more input.
+            let typed_ahead = matches!(
+                parse(self.commands_buffer.clone()),
+                Ok((command, _, _)) if command != Command::Unknown
+            );
+            match if typed_ahead {
+                Ok(())
+            } else {
+                self.handle_events()
+            } {
                 Err(e) => {
                     self.handle_error(e);
                     continue;
@@ -3696,7 +3705,7 @@ impl MoreControl {
                     }
                 }
             }
-            if let Ok((command, mut remainder, next_possible)) =
+            if let Ok((command, remainder, next_possible)) =
                 parse(self.commands_buffer.clone()).inspect_err(|e| self.handle_error(e.clone()))
             {
                 if let Some(Prompt::Eof { .. }) = self.prompt {
@@ -3713,12 +3722,11 @@ impl MoreControl {
                         },
                     });
                 }
-                match command {
-                    Command::Unknown => {
-                        continue;
-                    }
-                    _ => remainder.clear(),
+                if command == Command::Unknown {
+                    continue;
                 }
+                // What follows the command was typed ahead and is kept; `R`
+                // is the command that discards it.
                 self.commands_buffer = remainder;
                 let _ = self
                     .execute(command)

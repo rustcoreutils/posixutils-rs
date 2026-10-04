@@ -1500,6 +1500,25 @@ fn test_pty_arrow_keys_scroll_and_other_keys_do_nothing() {
     assert_eq!(session.quit(), Some(0));
 }
 
+/// Commands typed ahead arrive in one read; each of them runs, in order.
+/// Only `R` discards input that is waiting.
+#[test]
+fn test_pty_typed_ahead_commands_all_run() {
+    let content: String = (1..=20).map(|n| format!("l{n}\n")).collect();
+    let path = render_fixture("typeahead.txt", content.as_bytes());
+    let Some(mut session) = MoreSession::spawn(&[path.to_str().unwrap()], &[], 5, 20) else {
+        println!("Skipping PTY test: no pseudo-terminal available");
+        return;
+    };
+
+    session.keys("jjj");
+    assert_eq!(session.row(0), "l4", "three j's scroll three lines");
+    session.keys("jjk");
+    assert_eq!(session.row(0), "l5", "j, j, then k");
+
+    assert_eq!(session.quit(), Some(0));
+}
+
 /// In a four-row terminal the first screen is lines 1-3, and the backward
 /// commands must be able to return to it. A file header three lines long is
 /// shown only when there are several files, but it was subtracted anyway,

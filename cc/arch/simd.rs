@@ -37,14 +37,13 @@ pub fn native(target: &Target, op: SimdOp, vec: TypeId, types: &TypeTable) -> bo
         None if types.is_integer(lane) && types.size_bytes(lane) <= 8 => false,
         None => return false,
     };
-    if op.is_float() != float {
+    if op.float_lanes().is_some_and(|f| f != float) {
         return false;
     }
+    let lane_bytes = types.size_bytes(lane);
     match target.arch {
-        Arch::X86_64 => x86_64(bytes, float),
-        // NEON has every listed operation at both widths: the Q register,
-        // or its D half.
-        Arch::Aarch64 => true,
+        Arch::X86_64 => x86_64(op, bytes, lane_bytes, float),
+        Arch::Aarch64 => aarch64(op, lane_bytes),
     }
 }
 
@@ -54,8 +53,31 @@ pub fn native(target: &Target, op: SimdOp, vec: TypeId, types: &TypeTable) -> bo
 /// at sixteen bytes: whatever the upper half holds, a packed operation on
 /// it could raise a floating-point exception flag the program never asked
 /// for.
-fn x86_64(bytes: usize, float: bool) -> bool {
-    !float || bytes == 16
+///
+/// SSE2 multiplies 16-bit lanes only (`pmullw`), and shifts every lane by
+/// one count -- no bytes, and no 64-bit arithmetic right shift.
+fn x86_64(op: SimdOp, bytes: usize, lane_bytes: usize, float: bool) -> bool {
+    if float && bytes != 16 {
+        return false;
+    }
+    match op {
+        SimdOp::Mul => lane_bytes == 2,
+        SimdOp::Shl | SimdOp::Lsr | SimdOp::Asr => false,
+        SimdOp::ShlScalar | SimdOp::LsrScalar => lane_bytes >= 2,
+        SimdOp::AsrScalar => matches!(lane_bytes, 2 | 4),
+        _ => true,
+    }
+}
+
+/// NEON has the operations at both widths, in the Q register or its D
+/// half. It multiplies lanes up to 32 bits, and shifts each lane by its own
+/// count (`ushl`/`sshl`); a single count is spread to every lane first.
+fn aarch64(op: SimdOp, lane_bytes: usize) -> bool {
+    match op {
+        SimdOp::Mul => lane_bytes <= 4,
+        SimdOp::ShlScalar | SimdOp::LsrScalar | SimdOp::AsrScalar => false,
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -107,5 +129,33 @@ mod tests {
             assert!(native(&a64, op, v, &types), "{op:?}");
         }
         assert!(!native(&a64, SimdOp::Add, v2hi, &types));
+    }
+
+    #[test]
+    fn test_native_splat_multiply_and_shift() {
+        let x86 = Target::new(Arch::X86_64, Os::Linux);
+        let a64 = Target::new(Arch::Aarch64, Os::Linux);
+        let mut types = TypeTable::new(&x86);
+        let v16qi = types.vector_of(types.char_id, 16, None);
+        let v8hi = types.vector_of(types.short_id, 8, None);
+        let v4si = types.vector_of(types.int_id, 4, None);
+        let v2di = types.vector_of(types.long_id, 2, None);
+        let v4sf = types.vector_of(types.float_id, 4, None);
+        let n = |t: &Target, op, v| native(t, op, v, &types);
+        // A splat of either lane kind.
+        for v in [v16qi, v4si, v2di, v4sf] {
+            assert!(n(&x86, SimdOp::Splat, v) && n(&a64, SimdOp::Splat, v));
+        }
+        // SSE2 multiplies words; NEON up to 32-bit lanes.
+        assert!(n(&x86, SimdOp::Mul, v8hi) && !n(&x86, SimdOp::Mul, v4si));
+        assert!(n(&a64, SimdOp::Mul, v4si) && !n(&a64, SimdOp::Mul, v2di));
+        assert!(!n(&x86, SimdOp::Mul, v4sf));
+        // SSE2 shifts by one count, not bytes, no 64-bit arithmetic shift;
+        // NEON by per-lane counts.
+        assert!(n(&x86, SimdOp::ShlScalar, v2di) && n(&x86, SimdOp::AsrScalar, v4si));
+        assert!(!n(&x86, SimdOp::ShlScalar, v16qi) && !n(&x86, SimdOp::AsrScalar, v2di));
+        assert!(!n(&x86, SimdOp::Shl, v4si));
+        assert!(n(&a64, SimdOp::Asr, v16qi) && n(&a64, SimdOp::Lsr, v2di));
+        assert!(!n(&a64, SimdOp::ShlScalar, v4si));
     }
 }

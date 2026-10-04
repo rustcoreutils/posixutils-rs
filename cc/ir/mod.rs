@@ -395,11 +395,25 @@ pub enum SimdOp {
     FDiv,
     /// Floating lanes: src[0] with each sign bit flipped.
     FNeg,
+    /// Every lane src[0], a scalar of the lane type.
+    Splat,
+    /// Integer lanes: src[0] * src[1], wrapping.
+    Mul,
+    /// Integer lanes: src[0] shifted by the count in the same lane of
+    /// src[1] -- left, right logically, right arithmetically.
+    Shl,
+    Lsr,
+    Asr,
+    /// Integer lanes: every lane of src[0] shifted by src[1], one scalar
+    /// count of the lane type.
+    ShlScalar,
+    LsrScalar,
+    AsrScalar,
 }
 
 impl SimdOp {
     /// Every operation, for tests over the whole set.
-    pub const ALL: [SimdOp; 12] = [
+    pub const ALL: [SimdOp; 20] = [
         SimdOp::Add,
         SimdOp::Sub,
         SimdOp::And,
@@ -412,19 +426,43 @@ impl SimdOp {
         SimdOp::FMul,
         SimdOp::FDiv,
         SimdOp::FNeg,
+        SimdOp::Splat,
+        SimdOp::Mul,
+        SimdOp::Shl,
+        SimdOp::Lsr,
+        SimdOp::Asr,
+        SimdOp::ShlScalar,
+        SimdOp::LsrScalar,
+        SimdOp::AsrScalar,
     ];
 
     /// Whether the operation takes one operand.
     pub fn is_unary(self) -> bool {
-        matches!(self, SimdOp::Not | SimdOp::Neg | SimdOp::FNeg)
-    }
-
-    /// Whether its lanes are floating.
-    pub fn is_float(self) -> bool {
         matches!(
             self,
-            SimdOp::FAdd | SimdOp::FSub | SimdOp::FMul | SimdOp::FDiv | SimdOp::FNeg
+            SimdOp::Not | SimdOp::Neg | SimdOp::FNeg | SimdOp::Splat
         )
+    }
+
+    /// The lanes it applies to: `Some(true)` floating only, `Some(false)`
+    /// integer only, `None` either.
+    pub fn float_lanes(self) -> Option<bool> {
+        match self {
+            SimdOp::FAdd | SimdOp::FSub | SimdOp::FMul | SimdOp::FDiv | SimdOp::FNeg => Some(true),
+            SimdOp::Splat => None,
+            _ => Some(false),
+        }
+    }
+
+    /// The form shifting every lane by one scalar count, of a shift by
+    /// per-lane counts.
+    pub fn by_scalar(self) -> Option<SimdOp> {
+        match self {
+            SimdOp::Shl => Some(SimdOp::ShlScalar),
+            SimdOp::Lsr => Some(SimdOp::LsrScalar),
+            SimdOp::Asr => Some(SimdOp::AsrScalar),
+            _ => None,
+        }
     }
 
     fn name(self) -> &'static str {
@@ -441,6 +479,14 @@ impl SimdOp {
             SimdOp::FMul => "vfmul",
             SimdOp::FDiv => "vfdiv",
             SimdOp::FNeg => "vfneg",
+            SimdOp::Splat => "vsplat",
+            SimdOp::Mul => "vmul",
+            SimdOp::Shl => "vshl",
+            SimdOp::Lsr => "vlsr",
+            SimdOp::Asr => "vasr",
+            SimdOp::ShlScalar => "vshl_s",
+            SimdOp::LsrScalar => "vlsr_s",
+            SimdOp::AsrScalar => "vasr_s",
         }
     }
 }
@@ -812,6 +858,14 @@ macro_rules! every_opcode {
                 Opcode::Simd(SimdOp::FMul),
                 Opcode::Simd(SimdOp::FDiv),
                 Opcode::Simd(SimdOp::FNeg),
+                Opcode::Simd(SimdOp::Splat),
+                Opcode::Simd(SimdOp::Mul),
+                Opcode::Simd(SimdOp::Shl),
+                Opcode::Simd(SimdOp::Lsr),
+                Opcode::Simd(SimdOp::Asr),
+                Opcode::Simd(SimdOp::ShlScalar),
+                Opcode::Simd(SimdOp::LsrScalar),
+                Opcode::Simd(SimdOp::AsrScalar),
             ];
 
             /// The exhaustiveness guard behind [`Opcode::ALL`]; always true.
@@ -838,7 +892,15 @@ macro_rules! every_opcode {
                         | SimdOp::FSub
                         | SimdOp::FMul
                         | SimdOp::FDiv
-                        | SimdOp::FNeg,
+                        | SimdOp::FNeg
+                        | SimdOp::Splat
+                        | SimdOp::Mul
+                        | SimdOp::Shl
+                        | SimdOp::Lsr
+                        | SimdOp::Asr
+                        | SimdOp::ShlScalar
+                        | SimdOp::LsrScalar
+                        | SimdOp::AsrScalar,
                     ) => true,
                 }
             }

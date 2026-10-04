@@ -16,10 +16,11 @@
 //
 
 use super::codegen::X86_64CodeGen;
-use super::lir::{FloatLane, IntLane, PackedOp, X86Inst};
-use super::regalloc::{Loc, XmmReg};
+use super::lir::{FloatLane, IntLane, PackedOp, PackedShift, PackedShuffleOp, X86Inst};
+use super::regalloc::{Loc, Reg, XmmReg};
 use crate::arch::lir::FpSize;
-use crate::ir::{Instruction, SimdOp};
+use crate::arch::lir::OperandSize;
+use crate::ir::{Instruction, PseudoId, SimdOp};
 use crate::types::TypeTable;
 
 impl X86_64CodeGen {
@@ -72,13 +73,46 @@ impl X86_64CodeGen {
                 self.push_lir(packed(PackedOp::CmpEq(IntLane::D), scratch, scratch));
                 let lane = IntLane::of_bytes(lane_bytes);
                 let count = (lane_bytes * 8 - 1) as u8;
-                self.push_lir(X86Inst::PackedShiftLeftImm {
+                self.push_lir(X86Inst::PackedShiftImm {
+                    shift: PackedShift::Left,
                     lane,
                     count,
                     dst: scratch,
                 });
                 let flane = FloatLane::of_bytes(lane_bytes);
                 self.push_lir(packed(PackedOp::FXor(flane), scratch, dst));
+            }
+            SimdOp::Splat => self.emit_splat(insn.src[0], dst, lane_bytes, types.is_float(lane)),
+            SimdOp::ShlScalar | SimdOp::LsrScalar | SimdOp::AsrScalar => {
+                let shift = match op {
+                    SimdOp::ShlScalar => PackedShift::Left,
+                    SimdOp::LsrScalar => PackedShift::LogicalRight,
+                    _ => PackedShift::ArithmeticRight,
+                };
+                let lane = IntLane::of_bytes(lane_bytes);
+                let count = insn.src[1];
+                if let Loc::Imm(n) = self.get_location(count) {
+                    // A count past the lane clears it (or fills it with
+                    // the sign); so does the largest immediate.
+                    self.emit_fp_move(insn.src[0], dst, size);
+                    self.push_lir(X86Inst::PackedShiftImm {
+                        shift,
+                        lane,
+                        count: n.clamp(0, 255) as u8,
+                        dst,
+                    });
+                } else {
+                    // The count, from a general register into the low
+                    // quadword of a scratch XMM register.
+                    self.emit_move(count, Reg::R11, 64);
+                    self.push_lir(X86Inst::MovGpXmm {
+                        size: OperandSize::B64,
+                        src: Reg::R11,
+                        dst: scratch,
+                    });
+                    self.emit_fp_move(insn.src[0], dst, size);
+                    self.push_lir(packed(PackedOp::Shift(shift, lane), scratch, dst));
+                }
             }
             _ => {
                 let (a, b) = (insn.src[0], insn.src[1]);
@@ -100,6 +134,58 @@ impl X86_64CodeGen {
         }
     }
 
+    /// Every lane of `dst` the scalar `src`, of a lane `lane_bytes` wide:
+    /// moved into the low lane, then copied up by interleaving and
+    /// shuffling.
+    fn emit_splat(&mut self, src: PseudoId, dst: XmmReg, lane_bytes: usize, float: bool) {
+        let packed = |op, r| X86Inst::Packed { op, src: r, dst: r };
+        let shuffle = |op, r| X86Inst::PackedShuffle {
+            op,
+            imm: 0,
+            src: r,
+            dst: r,
+        };
+        if float {
+            let single = lane_bytes == 4;
+            let size = if single {
+                FpSize::Single
+            } else {
+                FpSize::Double
+            };
+            self.emit_fp_move(src, dst, size);
+            if single {
+                self.push_lir(shuffle(PackedShuffleOp::Shufps, dst));
+            } else {
+                self.push_lir(packed(PackedOp::FUnpackLow(FloatLane::D), dst));
+            }
+            return;
+        }
+        let bits = lane_bytes as u32 * 8;
+        self.emit_move(src, Reg::R11, bits);
+        self.push_lir(X86Inst::MovGpXmm {
+            size: if bits > 32 {
+                OperandSize::B64
+            } else {
+                OperandSize::B32
+            },
+            src: Reg::R11,
+            dst,
+        });
+        match lane_bytes {
+            1 => {
+                self.push_lir(packed(PackedOp::UnpackLow(IntLane::B), dst));
+                self.push_lir(shuffle(PackedShuffleOp::Pshuflw, dst));
+                self.push_lir(shuffle(PackedShuffleOp::Pshufd, dst));
+            }
+            2 => {
+                self.push_lir(shuffle(PackedShuffleOp::Pshuflw, dst));
+                self.push_lir(shuffle(PackedShuffleOp::Pshufd, dst));
+            }
+            4 => self.push_lir(shuffle(PackedShuffleOp::Pshufd, dst)),
+            _ => self.push_lir(packed(PackedOp::UnpackLow(IntLane::Q), dst)),
+        }
+    }
+
     /// The SSE2 instruction for the two-operand `op` on lanes of
     /// `lane_bytes`.
     fn packed_op(op: SimdOp, lane_bytes: usize) -> PackedOp {
@@ -115,9 +201,17 @@ impl X86_64CodeGen {
             SimdOp::FSub => PackedOp::FSub(float()),
             SimdOp::FMul => PackedOp::FMul(float()),
             SimdOp::FDiv => PackedOp::FDiv(float()),
-            SimdOp::Not | SimdOp::Neg | SimdOp::FNeg => {
-                unreachable!("{op:?} has one operand")
-            }
+            SimdOp::Mul => PackedOp::MulLow(int()),
+            SimdOp::Not
+            | SimdOp::Neg
+            | SimdOp::FNeg
+            | SimdOp::Splat
+            | SimdOp::Shl
+            | SimdOp::Lsr
+            | SimdOp::Asr
+            | SimdOp::ShlScalar
+            | SimdOp::LsrScalar
+            | SimdOp::AsrScalar => unreachable!("{op:?} is not a plain two-register operation"),
         }
     }
 }

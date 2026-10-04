@@ -116,6 +116,26 @@ impl Arrangement {
         }
     }
 
+    /// The width of each lane, in bytes.
+    pub fn lane_bytes(self) -> u32 {
+        match self {
+            Arrangement::B8 | Arrangement::B16 => 1,
+            Arrangement::H4 | Arrangement::H8 => 2,
+            Arrangement::S2 | Arrangement::S4 => 4,
+            Arrangement::D1 | Arrangement::D2 => 8,
+        }
+    }
+
+    /// The element letter of a lane, the `s` of `v1.s[0]`.
+    fn element(self) -> &'static str {
+        match self.lane_bytes() {
+            1 => "b",
+            2 => "h",
+            4 => "s",
+            _ => "d",
+        }
+    }
+
     /// Register `r` at this arrangement, as an operand.
     fn operand(self, r: VReg) -> String {
         let suffix = match self {
@@ -148,6 +168,12 @@ pub enum NeonOp {
     Fmul,
     Fdiv,
     Fneg,
+    Mul,
+    /// Shift each lane left by the signed count in the same lane of the
+    /// second operand, logically (`ushl`) or arithmetically (`sshl`): a
+    /// negative count shifts right.
+    Ushl,
+    Sshl,
 }
 
 impl NeonOp {
@@ -165,6 +191,9 @@ impl NeonOp {
             NeonOp::Fmul => "fmul",
             NeonOp::Fdiv => "fdiv",
             NeonOp::Fneg => "fneg",
+            NeonOp::Mul => "mul",
+            NeonOp::Ushl => "ushl",
+            NeonOp::Sshl => "sshl",
         }
     }
 
@@ -844,6 +873,21 @@ pub enum Aarch64Inst {
         arr: Arrangement,
         src1: VReg,
         src2: Option<VReg>,
+        dst: VReg,
+    },
+
+    /// DUP from a general register: every lane of `dst` the low bits of
+    /// `src`.
+    NeonDupGp {
+        arr: Arrangement,
+        src: Reg,
+        dst: VReg,
+    },
+
+    /// DUP from an element: every lane of `dst` lane 0 of `src`.
+    NeonDupLane {
+        arr: Arrangement,
+        src: VReg,
         dst: VReg,
     },
 
@@ -1574,6 +1618,22 @@ impl EmitAsm for Aarch64Inst {
                     let _ = write!(out, ", {}", arr.operand(*src2));
                 }
                 let _ = writeln!(out);
+            }
+
+            Aarch64Inst::NeonDupGp { arr, src, dst } => {
+                let lane_bits = arr.lane_bytes() * 8;
+                let src = src.name_for_size(lane_bits.max(32));
+                let _ = writeln!(out, "    dup {}, {}", arr.operand(*dst), src);
+            }
+
+            Aarch64Inst::NeonDupLane { arr, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    dup {}, {}.{}[0]",
+                    arr.operand(*dst),
+                    src.name_v(),
+                    arr.element()
+                );
             }
 
             Aarch64Inst::Cnt { src, dst } => {

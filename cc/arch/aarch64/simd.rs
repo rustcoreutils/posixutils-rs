@@ -13,7 +13,7 @@
 
 use super::codegen::Aarch64CodeGen;
 use super::lir::{Aarch64Inst, Arrangement, NeonOp};
-use super::regalloc::{Loc, VReg};
+use super::regalloc::{Loc, Reg, VReg};
 use crate::ir::{Instruction, PseudoId, SimdOp};
 use crate::types::{TypeId, TypeTable};
 
@@ -36,29 +36,47 @@ impl Aarch64CodeGen {
         } else {
             types.double_id
         };
-        let neon = Self::neon_op(op);
-        let arr = if neon.is_bitwise() {
-            Arrangement::of(1, total)
-        } else {
-            Arrangement::of(types.size_bytes(lane), total)
-        };
-        let src1 = self.simd_operand(insn.src[0], VReg::V17, carrier, insn.size, types);
-        let src2 = insn
-            .src
-            .get(1)
-            .map(|&s| self.simd_operand(s, VReg::V18, carrier, insn.size, types));
+        let lane_bytes = types.size_bytes(lane);
         let dst_loc = self.get_location(target);
         let dst = match dst_loc {
             Loc::VReg(v) => v,
             _ => VReg::V16,
         };
-        self.push_lir(Aarch64Inst::Neon {
-            op: neon,
-            arr,
-            src1,
-            src2,
-            dst,
-        });
+        if op == SimdOp::Splat {
+            self.emit_neon_splat(insn.src[0], dst, lane_bytes, types.is_float(lane), types);
+        } else {
+            let neon = Self::neon_op(op);
+            let arr = if neon.is_bitwise() {
+                Arrangement::of(1, total)
+            } else {
+                Arrangement::of(lane_bytes, total)
+            };
+            let src1 = self.simd_operand(insn.src[0], VReg::V17, carrier, insn.size, types);
+            let mut src2 = insn
+                .src
+                .get(1)
+                .map(|&s| self.simd_operand(s, VReg::V18, carrier, insn.size, types));
+            if matches!(op, SimdOp::Lsr | SimdOp::Asr) {
+                // A right shift is a left shift by the negated counts,
+                // made in V18 so an operand's own register is untouched.
+                let counts = src2.expect("a shift has its counts");
+                self.push_lir(Aarch64Inst::Neon {
+                    op: NeonOp::Neg,
+                    arr,
+                    src1: counts,
+                    src2: None,
+                    dst: VReg::V18,
+                });
+                src2 = Some(VReg::V18);
+            }
+            self.push_lir(Aarch64Inst::Neon {
+                op: neon,
+                arr,
+                src1,
+                src2,
+                dst,
+            });
+        }
         if !matches!(dst_loc, Loc::VReg(v) if v == dst) {
             self.emit_fp_move_to_loc(dst, &dst_loc, Some(carrier), insn.size, types);
         }
@@ -83,6 +101,42 @@ impl Aarch64CodeGen {
         }
     }
 
+    /// Every lane of `dst` the scalar `src`, of a lane `lane_bytes` wide: a
+    /// `dup` from the general register an integer is in, or from lane 0 of
+    /// the V register a float is in. The arrangement fills all sixteen
+    /// bytes, which an eight-byte vector's D-register forms then ignore.
+    fn emit_neon_splat(
+        &mut self,
+        src: PseudoId,
+        dst: VReg,
+        lane_bytes: usize,
+        float: bool,
+        types: &TypeTable,
+    ) {
+        let arr = Arrangement::of(lane_bytes, 16);
+        let bits = lane_bytes as u32 * 8;
+        if float {
+            let typ = if lane_bytes == 4 {
+                types.float_id
+            } else {
+                types.double_id
+            };
+            self.emit_fp_move(src, VReg::V17, Some(typ), bits, types);
+            self.push_lir(Aarch64Inst::NeonDupLane {
+                arr,
+                src: VReg::V17,
+                dst,
+            });
+        } else {
+            self.emit_move(src, Reg::X16, bits);
+            self.push_lir(Aarch64Inst::NeonDupGp {
+                arr,
+                src: Reg::X16,
+                dst,
+            });
+        }
+    }
+
     /// The NEON instruction computing `op`.
     fn neon_op(op: SimdOp) -> NeonOp {
         match op {
@@ -98,6 +152,12 @@ impl Aarch64CodeGen {
             SimdOp::FMul => NeonOp::Fmul,
             SimdOp::FDiv => NeonOp::Fdiv,
             SimdOp::FNeg => NeonOp::Fneg,
+            SimdOp::Mul => NeonOp::Mul,
+            SimdOp::Shl | SimdOp::Lsr => NeonOp::Ushl,
+            SimdOp::Asr => NeonOp::Sshl,
+            SimdOp::Splat | SimdOp::ShlScalar | SimdOp::LsrScalar | SimdOp::AsrScalar => {
+                unreachable!("{op:?} is not one NEON instruction")
+            }
         }
     }
 }

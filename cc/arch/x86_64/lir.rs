@@ -301,6 +301,53 @@ pub enum PackedOp {
     FDiv(FloatLane),
     /// XORPS/PD
     FXor(FloatLane),
+    /// PMULLW: the low half of each product. SSE2 has only the word form.
+    MulLow(IntLane),
+    /// PUNPCKLBW/WD/DQ/QDQ: interleave the low halves' lanes.
+    UnpackLow(IntLane),
+    /// UNPCKLPD (and PS): interleave the low halves' floating lanes.
+    FUnpackLow(FloatLane),
+    /// PSLL/PSRL/PSRA by the count in the low 64 bits of `src`.
+    Shift(PackedShift, IntLane),
+}
+
+/// The direction and kind of a packed shift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackedShift {
+    Left,
+    LogicalRight,
+    ArithmeticRight,
+}
+
+impl PackedShift {
+    fn prefix(self) -> &'static str {
+        match self {
+            PackedShift::Left => "psll",
+            PackedShift::LogicalRight => "psrl",
+            PackedShift::ArithmeticRight => "psra",
+        }
+    }
+}
+
+/// A shuffle by an immediate selector ([`X86Inst::PackedShuffle`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackedShuffleOp {
+    /// PSHUFD: each dword of `dst` is the dword of `src` its two bits pick.
+    Pshufd,
+    /// PSHUFLW: the same for the low four words; the high ones are copied.
+    Pshuflw,
+    /// SHUFPS: two floats of `dst`, then two of `src`, by the selector.
+    Shufps,
+}
+
+impl PackedShuffleOp {
+    fn mnemonic(self) -> &'static str {
+        match self {
+            PackedShuffleOp::Pshufd => "pshufd",
+            PackedShuffleOp::Pshuflw => "pshuflw",
+            PackedShuffleOp::Shufps => "shufps",
+        }
+    }
 }
 
 impl PackedOp {
@@ -318,6 +365,18 @@ impl PackedOp {
             PackedOp::FMul(l) => format!("mul{}", l.suffix()),
             PackedOp::FDiv(l) => format!("div{}", l.suffix()),
             PackedOp::FXor(l) => format!("xor{}", l.suffix()),
+            PackedOp::MulLow(l) => format!("pmull{}", l.suffix()),
+            PackedOp::UnpackLow(l) => format!(
+                "punpckl{}",
+                match l {
+                    IntLane::B => "bw",
+                    IntLane::W => "wd",
+                    IntLane::D => "dq",
+                    IntLane::Q => "qdq",
+                }
+            ),
+            PackedOp::FUnpackLow(l) => format!("unpckl{}", l.suffix()),
+            PackedOp::Shift(shift, l) => format!("{}{}", shift.prefix(), l.suffix()),
         }
     }
 }
@@ -772,10 +831,19 @@ pub enum X86Inst {
         dst: XmmReg,
     },
 
-    /// PSLLW/PSLLD/PSLLQ by an immediate: shift each lane of `dst` left.
-    PackedShiftLeftImm {
+    /// PSLL/PSRL/PSRA by an immediate: shift each lane of `dst`.
+    PackedShiftImm {
+        shift: PackedShift,
         lane: IntLane,
         count: u8,
+        dst: XmmReg,
+    },
+
+    /// A lane shuffle by an immediate selector, `op $imm, src, dst`.
+    PackedShuffle {
+        op: PackedShuffleOp,
+        imm: u8,
+        src: XmmReg,
         dst: XmmReg,
     },
 
@@ -1176,8 +1244,30 @@ impl EmitAsm for X86Inst {
             X86Inst::Packed { op, src, dst } => {
                 let _ = writeln!(out, "    {} {}, {}", op.mnemonic(), src.name(), dst.name());
             }
-            X86Inst::PackedShiftLeftImm { lane, count, dst } => {
-                let _ = writeln!(out, "    psll{} ${}, {}", lane.suffix(), count, dst.name());
+            X86Inst::PackedShiftImm {
+                shift,
+                lane,
+                count,
+                dst,
+            } => {
+                let _ = writeln!(
+                    out,
+                    "    {}{} ${}, {}",
+                    shift.prefix(),
+                    lane.suffix(),
+                    count,
+                    dst.name()
+                );
+            }
+            X86Inst::PackedShuffle { op, imm, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    {} ${}, {}, {}",
+                    op.mnemonic(),
+                    imm,
+                    src.name(),
+                    dst.name()
+                );
             }
 
             // Atomic Instructions

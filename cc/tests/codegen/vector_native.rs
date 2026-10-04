@@ -325,3 +325,46 @@ void dops(v2df *d, v2df *a, v2df *b) { *d = *a * *b; }
         }
     }
 }
+
+/// Scalar operands, shifts and multiplies: SSE2 spreads a scalar with a
+/// shuffle, shifts every lane by one count (an immediate, or a count in an
+/// XMM register) and multiplies words; NEON spreads with `dup`, shifts by
+/// per-lane counts (right as a left shift by negated counts) and multiplies
+/// up to 32-bit lanes.
+#[test]
+fn vector_native_splat_shift_and_multiply() {
+    let src = r#"
+typedef short v8hi __attribute__((vector_size(16)));
+typedef int v4si __attribute__((vector_size(16)));
+typedef unsigned v4su __attribute__((vector_size(16)));
+typedef float v4sf __attribute__((vector_size(16)));
+void mulw(v8hi *d, v8hi *a, v8hi *b) { *d = *a * *b; }
+void shifts(v4si *d, v4si *a, int s) { *d = (*a << s) + (*a >> 3); }
+void lsr(v4su *d, v4su *a, unsigned s) { *d = *a >> s; }
+void splat(v4sf *d, v4sf *a, float s) { *d = *a * s; }
+void splati(v4si *d, v4si *a, int s) { *d = *a + s; }
+"#;
+    let x86 = asm_for("vec_native_x86_ext", X86_64_LINUX, src);
+    let a64 = asm_for(
+        "vec_native_a64_ext",
+        crate::codegen::asm_probe::AARCH64_LINUX,
+        src,
+    );
+    for (asm, f, want) in [
+        (&x86, "mulw", &["pmullw"][..]),
+        (&x86, "shifts", &["pslld", "psrad $3", "paddd"]),
+        (&x86, "lsr", &["psrld"]),
+        (&x86, "splat", &["shufps $0", "mulps"]),
+        (&x86, "splati", &["pshufd $0", "paddd"]),
+        (&a64, "mulw", &["mul v", ".8h"]),
+        (&a64, "shifts", &["dup v", "ushl v", "neg v", "sshl v"]),
+        (&a64, "lsr", &["neg v", "ushl v"]),
+        (&a64, "splat", &["dup v", ".s[0]", "fmul v"]),
+        (&a64, "splati", &["dup v", "add v"]),
+    ] {
+        let body = crate::codegen::asm_probe::body_of(asm, f);
+        for m in want {
+            assert!(body.contains(m), "{f}: no {m}:\n{body}");
+        }
+    }
+}

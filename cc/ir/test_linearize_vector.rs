@@ -120,3 +120,38 @@ fn test_native_vector_operations_are_one_instruction() {
     no_simd(v2sf, &x86);
     one_simd(v2sf, &a64, SimdOp::FAdd);
 }
+
+/// A scalar operand is spread to every lane (`Splat`) for the packed
+/// operation, but a shift count stays one scalar where the target shifts
+/// every lane by one count -- SSE2 does, NEON shifts by per-lane counts and
+/// takes the splat. A multiply is native where the target has the width.
+#[test]
+fn test_native_splat_shift_and_multiply() {
+    use crate::ir::SimdOp;
+    use crate::target::{Arch, Os};
+    let x86 = Target::new(Arch::X86_64, Os::Linux);
+    let a64 = Target::new(Arch::Aarch64, Os::Linux);
+    let simds = |src: &str, target: &Target| -> Vec<SimdOp> {
+        ops_of(src, "f", target)
+            .into_iter()
+            .filter_map(|o| match o {
+                Opcode::Simd(s) => Some(s),
+                _ => None,
+            })
+            .collect()
+    };
+    let splat_add = "void f(v4sf *d, v4sf *a, float s) { *d = *a + s; }";
+    for t in [&x86, &a64] {
+        assert_eq!(simds(splat_add, t), [SimdOp::Splat, SimdOp::FAdd]);
+    }
+    let shift = "void f(v4si *d, v4si *a, int s) { *d = *a << s; }";
+    assert_eq!(simds(shift, &x86), [SimdOp::ShlScalar]);
+    assert_eq!(simds(shift, &a64), [SimdOp::Splat, SimdOp::Shl]);
+    let right = "typedef unsigned v4su __attribute__((vector_size(16)));\n\
+                 void f(v4su *d, v4su *a, v4su *c) { *d = *a >> *c; }";
+    assert!(simds(right, &x86).is_empty(), "SSE2 has no per-lane counts");
+    assert_eq!(simds(right, &a64), [SimdOp::Lsr]);
+    let mul = "void f(v4si *d, v4si *a, v4si *b) { *d = *a * *b; }";
+    assert!(simds(mul, &x86).is_empty(), "SSE2 multiplies words only");
+    assert_eq!(simds(mul, &a64), [SimdOp::Mul]);
+}

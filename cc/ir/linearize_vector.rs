@@ -384,13 +384,8 @@ impl Linearizer<'_> {
         vector_typ: TypeId,
         result_typ: TypeId,
     ) -> PseudoId {
-        if let (Lanes::Vector { addr: a, .. }, Lanes::Vector { addr: b, .. }) = (l, r) {
-            let float = self.types.is_float(lane);
-            if let Some(simd) = Self::simd_binary(op, float) {
-                if self.simd_native(simd, vector_typ) {
-                    return self.emit_simd(simd, &[a, b], vector_typ, result_typ);
-                }
-            }
+        if let Some(result) = self.native_binary(op, l, r, lane, vector_typ, result_typ) {
+            return result;
         }
         let (result_lane, _, result_size) = self.vector_shape(result_typ);
         let result = self.frame_temp_addr("__vec", result_typ);
@@ -493,20 +488,65 @@ impl Linearizer<'_> {
         }
     }
 
-    /// The packed operation for C's `op` on lanes that are floating or not.
-    fn simd_binary(op: BinaryOp, float: bool) -> Option<SimdOp> {
+    /// The packed operation for C's `op` on lanes of type `lane`.
+    fn simd_binary(&self, op: BinaryOp, lane: TypeId) -> Option<SimdOp> {
+        let float = self.types.is_float(lane);
         Some(match (op, float) {
             (BinaryOp::Add, false) => SimdOp::Add,
             (BinaryOp::Sub, false) => SimdOp::Sub,
+            (BinaryOp::Mul, false) => SimdOp::Mul,
             (BinaryOp::BitAnd, false) => SimdOp::And,
             (BinaryOp::BitOr, false) => SimdOp::Or,
             (BinaryOp::BitXor, false) => SimdOp::Xor,
+            (BinaryOp::Shl, false) => SimdOp::Shl,
+            (BinaryOp::Shr, false) if self.types.is_unsigned(lane) => SimdOp::Lsr,
+            (BinaryOp::Shr, false) => SimdOp::Asr,
             (BinaryOp::Add, true) => SimdOp::FAdd,
             (BinaryOp::Sub, true) => SimdOp::FSub,
             (BinaryOp::Mul, true) => SimdOp::FMul,
             (BinaryOp::Div, true) => SimdOp::FDiv,
             _ => return None,
         })
+    }
+
+    /// `l op r` on lanes of `lane` as packed instructions, when the target
+    /// has them for vectors of `vec`: a scalar operand is spread to every
+    /// lane first, but a shift count stays one scalar where the target
+    /// shifts every lane by one count.
+    fn native_binary(
+        &mut self,
+        op: BinaryOp,
+        l: Lanes,
+        r: Lanes,
+        lane: TypeId,
+        vec: TypeId,
+        result_typ: TypeId,
+    ) -> Option<PseudoId> {
+        let simd = self.simd_binary(op, lane)?;
+        if let (Lanes::Vector { addr, .. }, Lanes::Splat(count)) = (l, r) {
+            if let Some(by_scalar) = simd.by_scalar().filter(|&s| self.simd_native(s, vec)) {
+                let a = self.carrier_of(addr, vec);
+                let value = self.simd_value(by_scalar, &[a, count], vec);
+                return Some(self.simd_result(value, vec, result_typ));
+            }
+        }
+        let splat = matches!(l, Lanes::Splat(_)) || matches!(r, Lanes::Splat(_));
+        if !self.simd_native(simd, vec) || (splat && !self.simd_native(SimdOp::Splat, vec)) {
+            return None;
+        }
+        let a = self.simd_operand(l, vec);
+        let b = self.simd_operand(r, vec);
+        let value = self.simd_value(simd, &[a, b], vec);
+        Some(self.simd_result(value, vec, result_typ))
+    }
+
+    /// Operand `lanes` of a packed operation on vectors of `vec`, as the
+    /// vector's carrier: loaded whole, or a scalar spread to every lane.
+    fn simd_operand(&mut self, lanes: Lanes, vec: TypeId) -> PseudoId {
+        match lanes {
+            Lanes::Vector { addr, .. } => self.carrier_of(addr, vec),
+            Lanes::Splat(value) => self.simd_value(SimdOp::Splat, &[value], vec),
+        }
     }
 
     /// Whether the target computes `op` on vectors of type `vec` with a
@@ -516,8 +556,7 @@ impl Linearizer<'_> {
     }
 
     /// `op` on the vectors at `operands`, of type `vec`, as one packed
-    /// instruction: each operand loaded whole as its register carrier, and
-    /// the result stored whole to a fresh vector of `result_typ`.
+    /// instruction, into a fresh vector of `result_typ`.
     fn emit_simd(
         &mut self,
         op: SimdOp,
@@ -525,14 +564,30 @@ impl Linearizer<'_> {
         vec: TypeId,
         result_typ: TypeId,
     ) -> PseudoId {
-        let carrier = self
-            .register_carrier(vec)
-            .expect("a native vector is one register's worth");
-        let bits = self.types.size_bits(carrier);
         let values: Vec<PseudoId> = operands
             .iter()
-            .map(|&addr| self.vector_to_carrier(addr, carrier))
+            .map(|&addr| self.carrier_of(addr, vec))
             .collect();
+        let value = self.simd_value(op, &values, vec);
+        self.simd_result(value, vec, result_typ)
+    }
+
+    /// The carrier a native vector of type `vec` is held in.
+    fn native_carrier(&self, vec: TypeId) -> TypeId {
+        self.register_carrier(vec)
+            .expect("a native vector is one register's worth")
+    }
+
+    /// The vector of type `vec` at `addr`, loaded whole as its carrier.
+    fn carrier_of(&mut self, addr: PseudoId, vec: TypeId) -> PseudoId {
+        let carrier = self.native_carrier(vec);
+        self.vector_to_carrier(addr, carrier)
+    }
+
+    /// The `Simd(op)` instruction on `values` -- carriers, or a scalar for a
+    /// splat or a shift count -- giving a vector of type `vec`.
+    fn simd_value(&mut self, op: SimdOp, values: &[PseudoId], vec: TypeId) -> PseudoId {
+        let bits = self.types.size_bits(self.native_carrier(vec));
         let value = self.alloc_reg_pseudo();
         let insn = match values[..] {
             [a] => Instruction::unop(Opcode::Simd(op), value, a, vec, bits),
@@ -540,6 +595,14 @@ impl Linearizer<'_> {
             _ => unreachable!("a vector operation has one or two operands"),
         };
         self.emit(insn);
+        value
+    }
+
+    /// The vector `value`, of type `vec` in its carrier, stored whole to a
+    /// fresh vector of `result_typ`.
+    fn simd_result(&mut self, value: PseudoId, vec: TypeId, result_typ: TypeId) -> PseudoId {
+        let carrier = self.native_carrier(vec);
+        let bits = self.types.size_bits(carrier);
         let result = self.frame_temp_addr("__vec", result_typ);
         self.emit(Instruction::store(value, result, 0, carrier, bits));
         result

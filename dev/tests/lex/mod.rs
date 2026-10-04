@@ -45,14 +45,14 @@ fn run_lex(input: &str) -> (String, bool) {
 fn compile_and_run(c_code: &str, input: &str) -> Result<String, String> {
     let temp_dir = TempDir::new().unwrap();
     let c_file = temp_dir.path().join("lexer.c");
-    let exe_file = temp_dir.path().join("lexer");
+    let exe_file = crate::exe_path(temp_dir.path(), "lexer");
     let input_file = temp_dir.path().join("input.txt");
 
     fs::write(&c_file, c_code).unwrap();
     fs::write(&input_file, input).unwrap();
 
     // Compile with strict warnings to catch codegen bugs
-    let compile = Command::new("cc")
+    let compile = crate::c_compiler()
         .args([
             "-Wall",
             "-O2",
@@ -78,7 +78,7 @@ fn compile_and_run(c_code: &str, input: &str) -> Result<String, String> {
         .output()
         .expect("Failed to run lexer");
 
-    Ok(String::from_utf8_lossy(&run.stdout).to_string())
+    Ok(crate::program_text(&run.stdout))
 }
 
 #[test]
@@ -2279,7 +2279,7 @@ fn test_default_main_and_yywrap_are_suppressible() {
     let temp_dir = TempDir::new().unwrap();
     let c_file = temp_dir.path().join("lexer.c");
     let app_file = temp_dir.path().join("app.c");
-    let exe_file = temp_dir.path().join("app");
+    let exe_file = crate::exe_path(temp_dir.path(), "app");
     fs::write(&c_file, &c_code).unwrap();
     fs::write(
         &app_file,
@@ -2292,7 +2292,7 @@ int main(void) { while (yylex() != 0) {} printf("app-main\n"); return 0; }
     )
     .unwrap();
 
-    let compile = Command::new("cc")
+    let compile = crate::c_compiler()
         .args([
             "-Wall",
             "-O2",
@@ -2318,7 +2318,7 @@ int main(void) { while (yylex() != 0) {} printf("app-main\n"); return 0; }
         .output()
         .expect("Failed to run");
     assert!(
-        String::from_utf8_lossy(&run.stdout).contains("app-main"),
+        crate::program_text(&run.stdout).contains("app-main"),
         "the application's main must be the one that runs"
     );
 }
@@ -3360,14 +3360,14 @@ fn compile_and_run_bounded(c_code: &str, input: &str, secs: u64) -> Result<Strin
 
     let temp_dir = TempDir::new().unwrap();
     let c_file = temp_dir.path().join("lexer.c");
-    let exe_file = temp_dir.path().join("lexer");
+    let exe_file = crate::exe_path(temp_dir.path(), "lexer");
     let input_file = temp_dir.path().join("input.txt");
     let out_file = temp_dir.path().join("out.txt");
 
     fs::write(&c_file, c_code).unwrap();
     fs::write(&input_file, input).unwrap();
 
-    let compile = Command::new("cc")
+    let compile = crate::c_compiler()
         .args([
             "-Wall",
             "-O2",
@@ -3507,13 +3507,13 @@ fn compile_and_run_status(c_code: &str, input: &str) -> (String, String, Option<
 
     let temp_dir = TempDir::new().unwrap();
     let c_file = temp_dir.path().join("lexer.c");
-    let exe_file = temp_dir.path().join("lexer");
+    let exe_file = crate::exe_path(temp_dir.path(), "lexer");
     let input_file = temp_dir.path().join("input.txt");
 
     fs::write(&c_file, c_code).unwrap();
     fs::write(&input_file, input).unwrap();
 
-    let compile = Command::new("cc")
+    let compile = crate::c_compiler()
         .args([
             "-Wall",
             "-O2",
@@ -3537,7 +3537,7 @@ fn compile_and_run_status(c_code: &str, input: &str) -> (String, String, Option<
         .expect("Failed to run lexer");
 
     (
-        String::from_utf8_lossy(&run.stdout).to_string(),
+        crate::program_text(&run.stdout),
         String::from_utf8_lossy(&run.stderr).to_string(),
         run.status.code(),
     )
@@ -4126,13 +4126,13 @@ fn test_action_brace_inside_string_literal() {
 fn compile_and_run_raw(c_code: &str, input: &[u8]) -> Result<String, String> {
     let temp_dir = TempDir::new().unwrap();
     let c_file = temp_dir.path().join("lexer.c");
-    let exe_file = temp_dir.path().join("lexer");
+    let exe_file = crate::exe_path(temp_dir.path(), "lexer");
     let input_file = temp_dir.path().join("input.bin");
 
     fs::write(&c_file, c_code).unwrap();
     fs::write(&input_file, input).unwrap();
 
-    let compile = Command::new("cc")
+    let compile = crate::c_compiler()
         .args([
             "-Wall",
             "-O2",
@@ -4155,7 +4155,7 @@ fn compile_and_run_raw(c_code: &str, input: &[u8]) -> Result<String, String> {
         .stdin(fs::File::open(&input_file).unwrap())
         .output()
         .expect("Failed to run lexer");
-    Ok(String::from_utf8_lossy(&run.stdout).to_string())
+    Ok(crate::program_text(&run.stdout))
 }
 
 #[test]

@@ -13,6 +13,32 @@ mod yacc;
 use object::{Object, ObjectSection, ObjectSymbol};
 use plib::testing::{run_test, run_test_with_checker, TestPlan};
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+/// The C compiler the tests build fixtures and generated code with: `$CC`,
+/// else `cc`, or on Windows, which has no `cc`, MinGW's `gcc`.
+pub fn c_compiler() -> Command {
+    let default = if cfg!(windows) { "gcc" } else { "cc" };
+    Command::new(std::env::var_os("CC").unwrap_or_else(|| default.into()))
+}
+
+/// The path of the program `stem` a compiler writes in `dir`: Windows
+/// programs end in `.exe`.
+pub fn exe_path(dir: &Path, stem: &str) -> PathBuf {
+    dir.join(format!("{stem}{}", std::env::consts::EXE_SUFFIX))
+}
+
+/// What a compiled C program wrote as text. A Windows C runtime writes each
+/// newline of a text stream as CR LF; the tests compare newlines.
+pub fn program_text(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    if cfg!(windows) {
+        text.replace("\r\n", "\n")
+    } else {
+        text.into_owned()
+    }
+}
 
 fn ar_compare_test(
     args: &[&str],
@@ -539,7 +565,7 @@ fn test_strip_executable_removes_symtab() {
     let src = dir.path().join("a.c");
     let exe = dir.path().join("a.out");
     fs::write(&src, "int main(void){return 0;}\n").unwrap();
-    let built = std::process::Command::new("cc")
+    let built = c_compiler()
         .args([
             "-no-pie",
             "-o",
@@ -580,7 +606,7 @@ fn test_strip_preserves_non_elf_archive_members() {
     let cpath = dir.path().join("o.c");
     let opath = dir.path().join("o.o");
     fs::write(&cpath, "int f(void){return 1;}\n").unwrap();
-    assert!(std::process::Command::new("cc")
+    assert!(c_compiler()
         .args(["-c", "-o", opath.to_str().unwrap(), cpath.to_str().unwrap()])
         .status()
         .expect("cc")
@@ -648,7 +674,7 @@ fn test_strip_preserves_long_archive_member_names() {
     let cpath = dir.path().join("s.c");
     let opath = dir.path().join(LONG);
     fs::write(&cpath, "int a_symbol_here(void){return 1;}\n").unwrap();
-    assert!(std::process::Command::new("cc")
+    assert!(c_compiler()
         .args(["-c", "-o", opath.to_str().unwrap(), cpath.to_str().unwrap()])
         .status()
         .expect("cc")
@@ -1620,6 +1646,8 @@ fn test_ar_print_verbose_uses_operand_prefix() {
     assert!(out.contains("PAYLOAD"));
 }
 
+// The set-user-ID bit is the subject; Windows has no such mode bit.
+#[cfg(unix)]
 #[test]
 fn test_ar_tv_shows_setuid_bit() {
     // #A9: the -tv mode column renders setuid/setgid/sticky like ls.
@@ -1678,7 +1706,7 @@ fn nm_compile_obj(dir: &std::path::Path, name: &str, src: &str) -> std::path::Pa
     let c = dir.join(format!("{}.c", name));
     let o = dir.join(format!("{}.o", name));
     fs::write(&c, src).unwrap();
-    let ok = std::process::Command::new("cc")
+    let ok = c_compiler()
         .args(["-c", "-o", o.to_str().unwrap(), c.to_str().unwrap()])
         .status()
         .expect("run cc")
@@ -2085,7 +2113,7 @@ fn test_strip_relocatable_object_still_links_and_runs() {
 
     let lib_o = td.path().join("lib.o");
     let compile = |src: &std::path::Path, obj: &std::path::Path| {
-        std::process::Command::new("cc")
+        c_compiler()
             .args(["-c", "-o", obj.to_str().unwrap(), src.to_str().unwrap()])
             .status()
             .expect("run cc")
@@ -2103,7 +2131,7 @@ fn test_strip_relocatable_object_still_links_and_runs() {
 
     // The link must still resolve `answer`, and the program must return 0.
     let exe = td.path().join("prog");
-    let linked = std::process::Command::new("cc")
+    let linked = c_compiler()
         .args([
             "-o",
             exe.to_str().unwrap(),
@@ -2144,7 +2172,7 @@ fn test_strip_archive_symbol_table_still_resolves() {
         let c = td.path().join(format!("{name}.c"));
         fs::write(&c, body).unwrap();
         let o = td.path().join(format!("{name}.o"));
-        assert!(std::process::Command::new("cc")
+        assert!(c_compiler()
             .args(["-c", "-o", o.to_str().unwrap(), c.to_str().unwrap()])
             .status()
             .expect("run cc")
@@ -2176,7 +2204,7 @@ fn test_strip_archive_symbol_table_still_resolves() {
     .unwrap();
 
     let exe = td.path().join("prog");
-    let linked = std::process::Command::new("cc")
+    let linked = c_compiler()
         .args([
             "-o",
             exe.to_str().unwrap(),
@@ -2202,6 +2230,8 @@ fn test_strip_archive_symbol_table_still_resolves() {
 // leave the original intact rather than a truncated file. Force the failure by
 // making the containing directory unwritable, which blocks creating the temp
 // file, and assert the input is byte-identical afterwards.
+// Staged with a directory's write permission bit, which Windows lacks.
+#[cfg(unix)]
 #[test]
 fn test_strip_leaves_input_intact_when_it_cannot_write() {
     use std::os::unix::fs::PermissionsExt;
@@ -2217,7 +2247,7 @@ fn test_strip_leaves_input_intact_when_it_cannot_write() {
     let c = dir.join("obj.c");
     fs::write(&c, "int keep_me(void) { return 7; }\n").unwrap();
     let obj = dir.join("obj.o");
-    assert!(std::process::Command::new("cc")
+    assert!(c_compiler()
         .args(["-c", "-o", obj.to_str().unwrap(), c.to_str().unwrap()])
         .status()
         .expect("run cc")

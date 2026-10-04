@@ -13,6 +13,7 @@ use crate::common::*;
 use plib::tmp::TempDir;
 use std::fs::{self, File};
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 
 #[test]
 fn test_option_listopt_filename() {
@@ -1644,6 +1645,8 @@ fn test_option_listopt_cpio_odc_keywords_round_trip() {
 
     fs::create_dir(&src_dir).unwrap();
     fs::write(src_dir.join("odc.txt"), b"12345").unwrap();
+    // The mode is asserted below, so it must not depend on the umask.
+    fs::set_permissions(src_dir.join("odc.txt"), fs::Permissions::from_mode(0o644)).unwrap();
 
     run_pax_in_dir(
         &[

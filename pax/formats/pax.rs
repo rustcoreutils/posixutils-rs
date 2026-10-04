@@ -540,7 +540,15 @@ impl ExtendedHeader {
         // valid UTF-8 still forces the per-file record, which overrides the
         // global one -- announcing such a member as UTF-8 would declare an
         // encoding its bytes are not in.
-        if !binary && (path_is_binary || link_is_binary) {
+        //
+        // hdrcharset governs four records -- path, linkpath, uname and gname --
+        // so any of the four forces the declaration, not just the two
+        // pathnames. A user or group name is bytes from the local database and
+        // need not be UTF-8 either.
+        let not_utf8 = |bytes: &[u8]| std::str::from_utf8(bytes).is_err();
+        let name_is_binary = entry.uname.as_deref().is_some_and(not_utf8)
+            || entry.gname.as_deref().is_some_and(not_utf8);
+        if !binary && (path_is_binary || link_is_binary || name_is_binary) {
             header.hdrcharset = Some(crate::options::BINARY_CHARSET.to_string());
         }
 
@@ -1294,6 +1302,53 @@ mod tests {
     /// written-out lists. A keyword added to one and not the others is silent:
     /// it would be parsed into `extra`, then serialized twice, or be unable to
     /// take a `-o keyword:=value` override. This is what keeps them together.
+    /// `hdrcharset` governs the path, linkpath, uname and gname records
+    /// alike, so a value that is not valid UTF-8 in *any* of the four has to
+    /// bring the BINARY declaration with it. Only the two pathnames did, so a
+    /// host whose passwd database holds a non-UTF-8 account name wrote
+    /// `uname=<raw bytes>` under a header declaring POSIX's implicit UTF-8 --
+    /// bytes a conforming reader must then decode as UTF-8.
+    #[test]
+    fn test_binary_user_name_declares_the_header_charset() {
+        let opts = FormatOptions::default();
+
+        let mut entry = ArchiveEntry::new(PathBuf::from("ascii.txt"), EntryType::Regular);
+        entry.uname = Some(b"us\xffr".to_vec());
+        let header = ExtendedHeader::from_entry(&entry, &opts);
+        assert_eq!(
+            header.hdrcharset.as_deref(),
+            Some("BINARY"),
+            "a uname that is not UTF-8 must be announced as BINARY"
+        );
+        assert_eq!(header.uname.as_deref(), Some(b"us\xffr".as_slice()));
+
+        // The group name alone is enough too.
+        let mut entry = ArchiveEntry::new(PathBuf::from("ascii.txt"), EntryType::Regular);
+        entry.gname = Some(b"gr\xffup".to_vec());
+        assert_eq!(
+            ExtendedHeader::from_entry(&entry, &opts)
+                .hdrcharset
+                .as_deref(),
+            Some("BINARY")
+        );
+
+        // A name that is non-ASCII but valid UTF-8 needs the record, because
+        // the ustar field is limited to the portable character set -- but no
+        // declaration, since UTF-8 is the default the archive already implies.
+        let mut entry = ArchiveEntry::new(PathBuf::from("ascii.txt"), EntryType::Regular);
+        entry.uname = Some("ünïcode".as_bytes().to_vec());
+        let header = ExtendedHeader::from_entry(&entry, &opts);
+        assert_eq!(header.hdrcharset, None);
+        assert_eq!(header.uname.as_deref(), Some("ünïcode".as_bytes()));
+
+        // And a plain ASCII name needs neither.
+        let mut entry = ArchiveEntry::new(PathBuf::from("ascii.txt"), EntryType::Regular);
+        entry.uname = Some(b"root".to_vec());
+        let header = ExtendedHeader::from_entry(&entry, &opts);
+        assert_eq!(header.hdrcharset, None);
+        assert_eq!(header.uname, None);
+    }
+
     #[test]
     fn test_standard_keywords_are_typed() {
         for &keyword in STANDARD_KEYWORDS {

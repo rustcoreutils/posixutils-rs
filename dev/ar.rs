@@ -13,8 +13,6 @@ use object::{Object, ObjectSymbol, SymbolKind};
 use plib::diag;
 use std::ffi::{OsStr, OsString};
 use std::io::{stdout, Write};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 #[derive(clap::Args)]
@@ -181,6 +179,7 @@ impl ArchiveMember {
         // we already checked that the path is to a file so unwrap is safe
         let name = file_path.file_name().unwrap().to_os_string();
 
+        let (uid, gid, mode) = owner_and_mode(&file_metadata);
         let data = std::fs::read(file_path)?;
         let symbols = read_member_symbols(&data);
         let symbol_bytes = symbols.iter().map(|s| s.len() as u64 + 1).sum::<u64>();
@@ -198,9 +197,9 @@ impl ArchiveMember {
         Ok(ArchiveMember {
             name,
             date,
-            uid: file_metadata.uid() as u64,
-            gid: file_metadata.gid() as u64,
-            mode: file_metadata.mode() as u64,
+            uid,
+            gid,
+            mode,
             size: file_metadata.len(),
             data,
             symbols,
@@ -274,7 +273,7 @@ impl Archive {
             let member = member.map_err(|_| gettext("invalid archive format"))?;
 
             let data = member.data(&*file_data)?;
-            let name = OsString::from_vec(member.name().to_vec());
+            let name = name_from_bytes(member.name());
             let symbols = read_member_symbols(data);
 
             archive_symbol_count += symbols.len() as u64;
@@ -310,7 +309,7 @@ impl Archive {
         // tools emit the same layout (#ST10).
         let mut names = plib::archive::NameTable::new();
         for m in &self.members {
-            names.push(m.name.as_bytes());
+            names.push(m.name.as_encoded_bytes());
         }
 
         // Member offsets recorded in the symbol table must account for the
@@ -437,9 +436,39 @@ fn pad_metadata_with_spaces<const N: usize>(s: String) -> ArResult<[u8; N]> {
 /// of 15 bytes, followed by a '/' character and space padding.
 fn format_name_for_header(name: &OsStr, long_name_offset: Option<usize>) -> ArResult<[u8; 16]> {
     Ok(plib::archive::format_name_field(
-        name.as_bytes(),
+        name.as_encoded_bytes(),
         long_name_offset,
     )?)
+}
+
+/// A member name from the archive's bytes.
+#[cfg(unix)]
+fn name_from_bytes(bytes: &[u8]) -> OsString {
+    use std::os::unix::ffi::OsStringExt;
+    OsString::from_vec(bytes.to_vec())
+}
+
+/// A member name from the archive's bytes, which a Windows name can hold
+/// only as text: bytes that are not UTF-8 become U+FFFD.
+#[cfg(windows)]
+fn name_from_bytes(bytes: &[u8]) -> OsString {
+    OsString::from(String::from_utf8_lossy(bytes).into_owned())
+}
+
+/// The user ID, group ID and mode an archive records for a file.
+#[cfg(unix)]
+fn owner_and_mode(meta: &std::fs::Metadata) -> (u64, u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.uid() as u64, meta.gid() as u64, meta.mode() as u64)
+}
+
+/// Windows has no user or group IDs: a member records 0 for both, and the
+/// mode of a regular file whose permissions are its read-only attribute.
+#[cfg(windows)]
+fn owner_and_mode(meta: &std::fs::Metadata) -> (u64, u64, u64) {
+    const S_IFREG: u32 = 0o100000;
+    let mode = S_IFREG | plib::perm::mode_of(&meta.permissions());
+    (0, 0, mode as u64)
 }
 
 fn member_symbol_bytes(member_symbols: &[String]) -> u64 {
@@ -776,6 +805,7 @@ fn list_cmd(args: ListArgs) -> ArResult<()> {
 }
 
 /// Largest filename (in bytes) the current directory's filesystem accepts.
+#[cfg(unix)]
 fn name_max_for_cwd() -> usize {
     let dot = std::ffi::CString::new(".").unwrap();
     let v = unsafe { libc::pathconf(dot.as_ptr(), libc::_PC_NAME_MAX) };
@@ -786,6 +816,53 @@ fn name_max_for_cwd() -> usize {
     }
 }
 
+/// Largest filename an NTFS directory accepts, in UTF-16 units; Windows has
+/// no `pathconf`.
+#[cfg(windows)]
+fn name_max_for_cwd() -> usize {
+    255
+}
+
+/// What NAME_MAX counts, for the diagnostic.
+#[cfg(unix)]
+const NAME_MAX_UNIT_SUFFIX: &str = "bytes); use -T to allow truncation";
+#[cfg(windows)]
+const NAME_MAX_UNIT_SUFFIX: &str = "characters); use -T to allow truncation";
+
+/// A file name's length as NAME_MAX counts it: bytes.
+#[cfg(unix)]
+fn name_len(name: &OsStr) -> usize {
+    name.as_encoded_bytes().len()
+}
+
+/// A file name's length as NTFS counts it: UTF-16 units.
+#[cfg(windows)]
+fn name_len(name: &OsStr) -> usize {
+    use std::os::windows::ffi::OsStrExt;
+    name.encode_wide().count()
+}
+
+/// The first `max` bytes of `name`.
+#[cfg(unix)]
+fn truncate_name(name: &OsStr, max: usize) -> OsString {
+    name_from_bytes(&name.as_encoded_bytes()[..max])
+}
+
+/// The longest run of whole characters from the start of `name` that fits in
+/// `max` UTF-16 units.
+#[cfg(windows)]
+fn truncate_name(name: &OsStr, max: usize) -> OsString {
+    let mut used = 0;
+    name.to_string_lossy()
+        .chars()
+        .take_while(|c| {
+            used += c.len_utf16();
+            used <= max
+        })
+        .collect::<String>()
+        .into()
+}
+
 fn extract_member(
     member: &ArchiveMember,
     dont_replace: bool,
@@ -794,20 +871,19 @@ fn extract_member(
 ) -> ArResult<()> {
     // POSIX 84418-84421 (#A4): extracting a name longer than NAME_MAX is an
     // error by default; -T allows the name to be truncated to fit.
-    let name_bytes = member.name.as_bytes();
     let name_max = name_max_for_cwd();
-    let out_name: OsString = if name_bytes.len() > name_max {
+    let out_name: OsString = if name_len(&member.name) > name_max {
         if !allow_truncation {
             return Err(format!(
                 "{}: {} {} {}",
                 member.name.to_string_lossy(),
                 gettext("file name too long (limit"),
                 name_max,
-                gettext("bytes); use -T to allow truncation")
+                gettext(NAME_MAX_UNIT_SUFFIX)
             )
             .into());
         }
-        OsString::from_vec(name_bytes[..name_max].to_vec())
+        truncate_name(&member.name, name_max)
     } else {
         member.name.clone()
     };
@@ -879,7 +955,7 @@ fn canonicalize_args(mut args: Vec<OsString>) -> Vec<OsString> {
     if args.len() < 2 {
         return args;
     }
-    let bytes = args[1].as_bytes();
+    let bytes = args[1].as_encoded_bytes();
     // Need "-" + at least two letters; leave "-d", "--", "--long" to clap.
     if bytes.len() <= 2 || bytes[0] != b'-' || bytes[1] == b'-' {
         return args;

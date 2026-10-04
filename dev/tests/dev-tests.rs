@@ -1489,6 +1489,51 @@ fn test_ar_extract_long_name_truncation() {
     );
 }
 
+/// NTFS limits a name to 255 UTF-16 units, not bytes: a name of 100 CJK
+/// characters (300 bytes) fits, and `-T` cuts a longer one at a character.
+#[cfg(windows)]
+#[test]
+fn test_ar_extract_name_max_counts_characters_on_windows() {
+    let extract = |name: &str, truncate: bool| {
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let arc = dir.path().join("cjk.a");
+        {
+            let f = fs::File::create(&arc).unwrap();
+            let mut builder = ar::GnuBuilder::new(f, vec![name.as_bytes().to_vec()]);
+            let header = ar::Header::new(name.as_bytes().to_vec(), 4);
+            builder.append(&header, &b"data"[..]).unwrap();
+        }
+        let mut args = vec!["-x"];
+        if truncate {
+            args.push("-T");
+        }
+        args.push(arc.to_str().unwrap());
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_ar"))
+            .args(&args)
+            .current_dir(dir.path())
+            .output()
+            .expect("ar -x");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        dir
+    };
+
+    let fits = "\u{6f22}".repeat(100);
+    let dir = extract(&fits, false);
+    assert!(dir.path().join(&fits).exists(), "a 100-character name fits");
+
+    let long = "\u{6f22}".repeat(300);
+    let dir = extract(&long, true);
+    let cut = "\u{6f22}".repeat(255);
+    assert!(
+        dir.path().join(&cut).exists(),
+        "-T keeps 255 whole characters"
+    );
+}
+
 #[test]
 fn test_ar_long_member_name() {
     // #A6: a member name longer than 15 bytes is stored via a "//" long-name

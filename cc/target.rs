@@ -106,10 +106,11 @@ pub enum X86Simd {
 /// The x86-64 instruction-set extensions a compilation may assume, from
 /// `-msse3` .. `-msse4.2`, `-mpopcnt`, their `-mno-` forms and `-march=`.
 /// They are statements about the target, which the feature macros
-/// (`__SSE4_1__` and the rest) report as gcc's do; c17's intrinsic headers
-/// provide every function whatever the level, since they are written in
-/// portable C. AVX and later are not modelled: `-march=x86-64-v3` claims
-/// only what v2 does.
+/// (`__SSE4_1__` and the rest) report as gcc's do, and which pick the packed
+/// instructions vector operations use (`arch::simd`). c17's intrinsic
+/// headers provide every function whatever the level, since they are
+/// written in portable C. AVX and later are not modelled:
+/// `-march=x86-64-v3` claims only what v2 does.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct X86Isa {
     pub simd: X86Simd,
@@ -545,6 +546,10 @@ pub struct Target {
     /// passed or returned by value in registers. Aggregates larger than this
     /// require indirect passing (pointer) or sret (struct return pointer).
     pub max_aggregate_register_bits: u32,
+    /// The x86-64 extensions code may use beyond SSE2, from the `-m` flags:
+    /// which packed instructions `arch::simd` lists. The baseline for any
+    /// other target, where it means nothing.
+    pub x86_isa: X86Isa,
 }
 
 impl Target {
@@ -578,6 +583,7 @@ impl Target {
             long_width,
             plain_char: CharSignedness::of(arch, os),
             max_aggregate_register_bits,
+            x86_isa: X86Isa::default(),
         }
     }
 

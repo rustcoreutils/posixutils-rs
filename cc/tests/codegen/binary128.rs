@@ -194,3 +194,33 @@ fn binary128_float128_folds_exactly_on_the_host() {
     let src = EXACT.replace("TY", "_Float128").replace("SFX", "F128");
     assert_eq!(compile_and_run("b128_exact_host", &src, &[]), 0);
 }
+
+/// Eighteen binary128 values live at once outrun the fourteen allocatable
+/// XMM registers. A 16-byte value that lost the coloring was given an
+/// 8-byte stack slot, so two spilled neighbours overlapped and the stores
+/// ran into the frame: the program crashed at every `-O` level.
+///
+/// Not on macOS: Apple's targets have no `_Float128`, as with clang.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn binary128_values_spilled_under_register_pressure() {
+    const N: usize = 18;
+    let decl: Vec<String> = (0..N).map(|i| format!("a{i} = s[{i}]")).collect();
+    let stores: String = (0..N)
+        .map(|i| format!("    d[{i}] = a{};\n", N - 1 - i))
+        .collect();
+    let src = format!(
+        "typedef _Float128 Q;\n\
+         __attribute__((noinline)) void rev(Q *d, const Q *s) {{\n    Q {};\n{stores}}}\n\
+         int main(void) {{\n\
+             Q s[{N}], d[{N}];\n\
+             for (int i = 0; i < {N}; i++) s[i] = (Q)(i * 3 + 1) / 7;\n\
+             rev(d, s);\n\
+             for (int i = 0; i < {N}; i++) if (d[i] != s[{} - i]) return i + 1;\n\
+             return 0;\n\
+         }}\n",
+        decl.join(", "),
+        N - 1
+    );
+    crate::common::compile_and_run_everywhere("binary128_spill_pressure", &src);
+}

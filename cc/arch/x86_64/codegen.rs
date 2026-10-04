@@ -1119,6 +1119,8 @@ impl X86_64CodeGen {
                 self.emit_compare(insn, types);
             }
 
+            Opcode::Simd(op) => self.emit_simd(insn, op, types),
+
             Opcode::Neg => self.emit_unary_op(insn, UnaryOp::Neg, types),
             Opcode::Not => self.emit_unary_op(insn, UnaryOp::Not, types),
 

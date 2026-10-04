@@ -283,3 +283,44 @@ fn mentions_v0(asm: &str) -> bool {
     asm.split(|c: char| !c.is_ascii_alphanumeric())
         .any(|t| matches!(t, "v0" | "d0" | "s0" | "h0" | "b0"))
 }
+
+/// A vector shifted by a scalar count reads the count at its own width.
+/// SSE's shifts take the whole low quadword of the count register, and the
+/// System V convention leaves the bits above an `int` argument undefined:
+/// the count was moved 64 bits wide, so a caller's garbage there shifted
+/// every lane out. The caller here passes each count as a `long` with
+/// garbage above the 32 bits the callee's `int` reads.
+#[test]
+fn vector_abi_shift_count_reads_its_own_width() {
+    let decls = "typedef int v4si __attribute__((vector_size(16)));\n\
+                 typedef unsigned v4su __attribute__((vector_size(16)));\n\
+                 typedef short v8hi __attribute__((vector_size(16)));\n\
+                 v4si shl(v4si v, int n);\n\
+                 v4su lsr(v4su v, int n);\n\
+                 v4si asr(v4si v, int n);\n\
+                 v8hi shlw(v8hi v, int n);\n";
+    let callee = format!(
+        "{decls}v4si shl(v4si v, int n) {{ return v << n; }}\n\
+         v4su lsr(v4su v, int n) {{ return v >> n; }}\n\
+         v4si asr(v4si v, int n) {{ return v >> n; }}\n\
+         v8hi shlw(v8hi v, int n) {{ return v << n; }}\n"
+    );
+    let caller = format!(
+        "{decls}int main(void) {{\n\
+             v4si (*fl)(v4si, long) = (v4si (*)(v4si, long))shl;\n\
+             v4su (*fr)(v4su, long) = (v4su (*)(v4su, long))lsr;\n\
+             v4si (*fa)(v4si, long) = (v4si (*)(v4si, long))asr;\n\
+             v8hi (*fw)(v8hi, long) = (v8hi (*)(v8hi, long))shlw;\n\
+             v4si l = fl((v4si){{1, 2, 3, 4}}, 0x500000002L);\n\
+             if (l[0] != 4 || l[3] != 16) return 1;\n\
+             v4su r = fr((v4su){{16, 32, 64, 0x80000000u}}, 0x500000002L);\n\
+             if (r[0] != 4 || r[3] != 0x20000000u) return 2;\n\
+             v4si a = fa((v4si){{-16, 32, -64, 128}}, 0x500000002L);\n\
+             if (a[0] != -4 || a[2] != -16) return 3;\n\
+             v8hi w = fw((v8hi){{1, 2, 3, 4, 5, 6, 7, 8}}, 0x500000002L);\n\
+             if (w[0] != 4 || w[7] != 32) return 4;\n\
+             return 0;\n\
+         }}\n"
+    );
+    interop_host("vec_shift_count", &callee, &caller);
+}

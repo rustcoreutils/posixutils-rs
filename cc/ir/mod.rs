@@ -364,6 +364,252 @@ pub enum Opcode {
     /// out of band, never in `src`, so no analysis counts it as a use, an
     /// escape or a reason to keep the local. See `arch::regalloc::LocalLifetimes`.
     LifetimeEnd,
+    /// A lane-wise operation on whole GNU vectors, computed by the target's
+    /// packed instructions: `typ` is the vector type, which says the lanes,
+    /// and `size` its width, 128 or 64. Each operand and the result is the
+    /// vector's bits, held as its register-sized carrier (a binary128 or a
+    /// `double`). Built only for what `arch::simd::native` lists for the
+    /// target; anything else is computed lane by lane.
+    Simd(SimdOp),
+}
+
+/// The lane-wise operation of an [`Opcode::Simd`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SimdOp {
+    /// Integer lanes: src[0] + src[1], wrapping.
+    Add,
+    /// Integer lanes: src[0] - src[1], wrapping.
+    Sub,
+    /// Integer lanes, bitwise.
+    And,
+    Or,
+    Xor,
+    /// Integer lanes: ~src[0].
+    Not,
+    /// Integer lanes: -src[0], wrapping.
+    Neg,
+    /// Floating lanes, IEEE.
+    FAdd,
+    FSub,
+    FMul,
+    FDiv,
+    /// Floating lanes: src[0] with each sign bit flipped.
+    FNeg,
+    /// Every lane src[0], a scalar of the lane type.
+    Splat,
+    /// Integer lanes: src[0] * src[1], wrapping.
+    Mul,
+    /// Integer lanes: src[0] shifted by the count in the same lane of
+    /// src[1] -- left, right logically, right arithmetically.
+    Shl,
+    Lsr,
+    Asr,
+    /// Integer lanes: every lane of src[0] shifted by src[1], one scalar
+    /// count of the lane type.
+    ShlScalar,
+    LsrScalar,
+    AsrScalar,
+    /// Integer lanes compared, each lane of the result all ones where it
+    /// holds and zero where not: ==, !=, signed > and >=, unsigned > and
+    /// >=. A < or <= is the > or >= of the operands swapped.
+    CmpEq,
+    CmpNe,
+    CmpGt,
+    CmpGe,
+    CmpGtU,
+    CmpGeU,
+    /// Floating lanes compared, as C does: != holds for an unordered pair,
+    /// the others do not.
+    FCmpEq,
+    FCmpNe,
+    FCmpGt,
+    FCmpGe,
+    /// The lanes of src[0], followed by src[1]'s when there are two, picked
+    /// by the constant indices in `InsnExtra::shuffle`: result lane k is
+    /// lane `indices.lane(k)` of the two, or anything for an unspecified
+    /// one. Out of line, so every instruction does not pay for sixteen.
+    Shuffle,
+    /// Each lane converted, at the same width: signed or unsigned integer
+    /// to floating, and floating to signed or unsigned integer, truncated.
+    /// `typ` is the result's vector type.
+    CvtSF,
+    CvtUF,
+    CvtFS,
+    CvtFU,
+}
+
+/// The constant lane indices of a [`SimdOp::Shuffle`]: one per result
+/// lane, into the lanes of its operands in order, or
+/// [`ShuffleIndices::UNSPECIFIED`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ShuffleIndices {
+    lanes: [u8; 16],
+    count: u8,
+}
+
+impl ShuffleIndices {
+    /// A result lane whose value may be anything (`-1` to
+    /// `__builtin_shufflevector`).
+    pub const UNSPECIFIED: u8 = u8::MAX;
+
+    /// The indices of `lanes`, at most sixteen, each an operand lane or
+    /// `None` for an unspecified one.
+    pub fn new(lanes: &[Option<u32>]) -> Self {
+        assert!(lanes.len() <= 16, "a shuffle of more than 16 lanes");
+        let mut out = [Self::UNSPECIFIED; 16];
+        for (slot, lane) in out.iter_mut().zip(lanes) {
+            if let Some(i) = lane {
+                *slot = u8::try_from(*i).expect("a lane index below 32");
+            }
+        }
+        Self {
+            lanes: out,
+            count: lanes.len() as u8,
+        }
+    }
+
+    /// The operand lane of result lane `k`, or `None` when unspecified.
+    pub fn lane(&self, k: usize) -> Option<usize> {
+        let i = self.lanes[..self.count as usize][k];
+        (i != Self::UNSPECIFIED).then_some(i as usize)
+    }
+
+    /// The number of result lanes.
+    pub fn len(&self) -> usize {
+        self.count as usize
+    }
+
+    /// Whether there are no lanes; never, for a shuffle of a vector.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+}
+
+impl SimdOp {
+    /// Every operation, for tests over the whole set.
+    pub const ALL: [SimdOp; 35] = [
+        SimdOp::Add,
+        SimdOp::Sub,
+        SimdOp::And,
+        SimdOp::Or,
+        SimdOp::Xor,
+        SimdOp::Not,
+        SimdOp::Neg,
+        SimdOp::FAdd,
+        SimdOp::FSub,
+        SimdOp::FMul,
+        SimdOp::FDiv,
+        SimdOp::FNeg,
+        SimdOp::Splat,
+        SimdOp::Mul,
+        SimdOp::Shl,
+        SimdOp::Lsr,
+        SimdOp::Asr,
+        SimdOp::ShlScalar,
+        SimdOp::LsrScalar,
+        SimdOp::AsrScalar,
+        SimdOp::CmpEq,
+        SimdOp::CmpNe,
+        SimdOp::CmpGt,
+        SimdOp::CmpGe,
+        SimdOp::CmpGtU,
+        SimdOp::CmpGeU,
+        SimdOp::FCmpEq,
+        SimdOp::FCmpNe,
+        SimdOp::FCmpGt,
+        SimdOp::FCmpGe,
+        SimdOp::Shuffle,
+        SimdOp::CvtSF,
+        SimdOp::CvtUF,
+        SimdOp::CvtFS,
+        SimdOp::CvtFU,
+    ];
+
+    /// Whether the operation takes one operand.
+    pub fn is_unary(self) -> bool {
+        matches!(
+            self,
+            SimdOp::Not
+                | SimdOp::Neg
+                | SimdOp::FNeg
+                | SimdOp::Splat
+                | SimdOp::CvtSF
+                | SimdOp::CvtUF
+                | SimdOp::CvtFS
+                | SimdOp::CvtFU
+        )
+    }
+
+    /// The lanes it applies to: `Some(true)` floating only, `Some(false)`
+    /// integer only, `None` either.
+    pub fn float_lanes(self) -> Option<bool> {
+        match self {
+            SimdOp::FAdd
+            | SimdOp::FSub
+            | SimdOp::FMul
+            | SimdOp::FDiv
+            | SimdOp::FNeg
+            | SimdOp::FCmpEq
+            | SimdOp::FCmpNe
+            | SimdOp::FCmpGt
+            | SimdOp::FCmpGe
+            | SimdOp::CvtSF
+            | SimdOp::CvtUF => Some(true),
+            SimdOp::Splat | SimdOp::Shuffle => None,
+            _ => Some(false),
+        }
+    }
+
+    /// The form shifting every lane by one scalar count, of a shift by
+    /// per-lane counts.
+    pub fn by_scalar(self) -> Option<SimdOp> {
+        match self {
+            SimdOp::Shl => Some(SimdOp::ShlScalar),
+            SimdOp::Lsr => Some(SimdOp::LsrScalar),
+            SimdOp::Asr => Some(SimdOp::AsrScalar),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            SimdOp::Add => "vadd",
+            SimdOp::Sub => "vsub",
+            SimdOp::And => "vand",
+            SimdOp::Or => "vor",
+            SimdOp::Xor => "vxor",
+            SimdOp::Not => "vnot",
+            SimdOp::Neg => "vneg",
+            SimdOp::FAdd => "vfadd",
+            SimdOp::FSub => "vfsub",
+            SimdOp::FMul => "vfmul",
+            SimdOp::FDiv => "vfdiv",
+            SimdOp::FNeg => "vfneg",
+            SimdOp::Splat => "vsplat",
+            SimdOp::Mul => "vmul",
+            SimdOp::Shl => "vshl",
+            SimdOp::Lsr => "vlsr",
+            SimdOp::Asr => "vasr",
+            SimdOp::ShlScalar => "vshl_s",
+            SimdOp::LsrScalar => "vlsr_s",
+            SimdOp::AsrScalar => "vasr_s",
+            SimdOp::CmpEq => "vcmp_eq",
+            SimdOp::CmpNe => "vcmp_ne",
+            SimdOp::CmpGt => "vcmp_gt",
+            SimdOp::CmpGe => "vcmp_ge",
+            SimdOp::CmpGtU => "vcmp_gtu",
+            SimdOp::CmpGeU => "vcmp_geu",
+            SimdOp::FCmpEq => "vfcmp_eq",
+            SimdOp::FCmpNe => "vfcmp_ne",
+            SimdOp::FCmpGt => "vfcmp_gt",
+            SimdOp::FCmpGe => "vfcmp_ge",
+            SimdOp::Shuffle => "vshuffle",
+            SimdOp::CvtSF => "vcvt_sf",
+            SimdOp::CvtUF => "vcvt_uf",
+            SimdOp::CvtFS => "vcvt_fs",
+            SimdOp::CvtFU => "vcvt_fu",
+        }
+    }
 }
 
 impl Opcode {
@@ -623,6 +869,7 @@ impl Opcode {
             Opcode::FMin => "fmin",
             Opcode::FMax => "fmax",
             Opcode::Fma => "fma",
+            Opcode::Simd(op) => op.name(),
             Opcode::RoundToIntegral(how) => match how {
                 IntegralRounding::Floor => "ffloor",
                 IntegralRounding::Ceil => "fceil",
@@ -720,6 +967,41 @@ macro_rules! every_opcode {
                 Opcode::RoundToIntegral(IntegralRounding::Round),
                 Opcode::RoundToIntegral(IntegralRounding::Rint),
                 Opcode::RoundToIntegral(IntegralRounding::NearbyInt),
+                Opcode::Simd(SimdOp::Add),
+                Opcode::Simd(SimdOp::Sub),
+                Opcode::Simd(SimdOp::And),
+                Opcode::Simd(SimdOp::Or),
+                Opcode::Simd(SimdOp::Xor),
+                Opcode::Simd(SimdOp::Not),
+                Opcode::Simd(SimdOp::Neg),
+                Opcode::Simd(SimdOp::FAdd),
+                Opcode::Simd(SimdOp::FSub),
+                Opcode::Simd(SimdOp::FMul),
+                Opcode::Simd(SimdOp::FDiv),
+                Opcode::Simd(SimdOp::FNeg),
+                Opcode::Simd(SimdOp::Splat),
+                Opcode::Simd(SimdOp::Mul),
+                Opcode::Simd(SimdOp::Shl),
+                Opcode::Simd(SimdOp::Lsr),
+                Opcode::Simd(SimdOp::Asr),
+                Opcode::Simd(SimdOp::ShlScalar),
+                Opcode::Simd(SimdOp::LsrScalar),
+                Opcode::Simd(SimdOp::AsrScalar),
+                Opcode::Simd(SimdOp::CmpEq),
+                Opcode::Simd(SimdOp::CmpNe),
+                Opcode::Simd(SimdOp::CmpGt),
+                Opcode::Simd(SimdOp::CmpGe),
+                Opcode::Simd(SimdOp::CmpGtU),
+                Opcode::Simd(SimdOp::CmpGeU),
+                Opcode::Simd(SimdOp::FCmpEq),
+                Opcode::Simd(SimdOp::FCmpNe),
+                Opcode::Simd(SimdOp::FCmpGt),
+                Opcode::Simd(SimdOp::FCmpGe),
+                Opcode::Simd(SimdOp::Shuffle),
+                Opcode::Simd(SimdOp::CvtSF),
+                Opcode::Simd(SimdOp::CvtUF),
+                Opcode::Simd(SimdOp::CvtFS),
+                Opcode::Simd(SimdOp::CvtFU),
             ];
 
             /// The exhaustiveness guard behind [`Opcode::ALL`]; always true.
@@ -733,6 +1015,43 @@ macro_rules! every_opcode {
                         | IntegralRounding::Round
                         | IntegralRounding::Rint
                         | IntegralRounding::NearbyInt,
+                    ) => true,
+                    Opcode::Simd(
+                        SimdOp::Add
+                        | SimdOp::Sub
+                        | SimdOp::And
+                        | SimdOp::Or
+                        | SimdOp::Xor
+                        | SimdOp::Not
+                        | SimdOp::Neg
+                        | SimdOp::FAdd
+                        | SimdOp::FSub
+                        | SimdOp::FMul
+                        | SimdOp::FDiv
+                        | SimdOp::FNeg
+                        | SimdOp::Splat
+                        | SimdOp::Mul
+                        | SimdOp::Shl
+                        | SimdOp::Lsr
+                        | SimdOp::Asr
+                        | SimdOp::ShlScalar
+                        | SimdOp::LsrScalar
+                        | SimdOp::AsrScalar
+                        | SimdOp::CmpEq
+                        | SimdOp::CmpNe
+                        | SimdOp::CmpGt
+                        | SimdOp::CmpGe
+                        | SimdOp::CmpGtU
+                        | SimdOp::CmpGeU
+                        | SimdOp::FCmpEq
+                        | SimdOp::FCmpNe
+                        | SimdOp::FCmpGt
+                        | SimdOp::FCmpGe
+                        | SimdOp::Shuffle
+                        | SimdOp::CvtSF
+                        | SimdOp::CvtUF
+                        | SimdOp::CvtFS
+                        | SimdOp::CvtFU,
                     ) => true,
                 }
             }
@@ -1271,6 +1590,8 @@ pub struct InsnExtra {
     pub fence_scope: FenceScope,
     /// For `LifetimeEnd`: the local whose lifetime ends.
     pub lifetime_of: Option<PseudoId>,
+    /// For `Simd(Shuffle)`: the lanes it picks.
+    pub shuffle: Option<ShuffleIndices>,
 }
 
 /// What an instruction with no extra fields answers: every one empty.
@@ -1290,6 +1611,7 @@ static NO_EXTRA: InsnExtra = InsnExtra {
     memory_order: MemoryOrder::Relaxed,
     fence_scope: FenceScope::Thread,
     lifetime_of: None,
+    shuffle: None,
 };
 
 impl Default for Instruction {
@@ -1322,6 +1644,14 @@ impl Instruction {
     /// The fields only a few opcodes use, for setting.
     pub fn extra_mut(&mut self) -> &mut InsnExtra {
         self.extra.get_or_insert_with(Default::default)
+    }
+
+    /// The lanes a `Simd(Shuffle)` picks.
+    pub fn shuffle_indices(&self) -> &ShuffleIndices {
+        self.extra()
+            .shuffle
+            .as_ref()
+            .expect("a shuffle carries its indices")
     }
 
     pub fn new(op: Opcode) -> Self {
@@ -3662,6 +3992,17 @@ mod tests {
         }
         // Fence, Call, Setjmp, Longjmp and the atomics, each twice, and Asm once.
         assert_eq!(barriers, 2 * 13 + 1);
+    }
+
+    /// A vector operation computes in registers: it touches no memory, so
+    /// nothing orders around it and dead-code elimination may delete it.
+    #[test]
+    fn test_simd_opcodes_are_pure() {
+        for op in SimdOp::ALL {
+            let op = Opcode::Simd(op);
+            assert!(!op.may_access_memory() && !op.has_side_effects(), "{op:?}");
+            assert!(!op.is_terminator() && !op.is_comparison(), "{op:?}");
+        }
     }
 
     #[test]

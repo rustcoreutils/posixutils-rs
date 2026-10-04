@@ -1498,4 +1498,41 @@ mod tests {
             assert_eq!(b.byte(0, true), want, "{known:?}");
         }
     }
+
+    /// A sixteen-byte vector moves as a binary128 carrier, and its lanes are
+    /// read back as integers or floats of their own width. A lane load must
+    /// never be fed from the carrier's register: the value is in an XMM or Q
+    /// register, which a truncation cannot take apart. The whole-width load
+    /// of the same carrier is forwarded.
+    #[test]
+    fn loadfwd_keeps_vector_lane_loads_off_the_carrier() {
+        for (lane, bits, forwarded) in [
+            (None, 128, true),
+            (Some("int"), 32, false),
+            (Some("double"), 64, false),
+        ] {
+            let mut b = Build::new();
+            let q = b.types.float128_id;
+            let typ = match lane {
+                None => q,
+                Some("int") => b.types.int_id,
+                _ => b.types.double_id,
+            };
+            b.f.add_param("v", q);
+            b.f.add_pseudo(Pseudo::arg(PseudoId(30), 0));
+            b.block(
+                0,
+                vec![
+                    entry(),
+                    Instruction::sym_addr(PseudoId(10), PseudoId(0), q),
+                    Instruction::store(PseudoId(30), PseudoId(10), 0, q, 128),
+                    Instruction::load(PseudoId(20), PseudoId(10), 0, typ, bits),
+                ],
+                vec![],
+            );
+            b.run();
+            let op = b.op(0, 3);
+            assert_eq!(op == Opcode::Load, !forwarded, "{lane:?}: {op:?}");
+        }
+    }
 }

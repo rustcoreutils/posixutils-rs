@@ -1435,6 +1435,12 @@ impl X86_64CodeGen {
     /// bits.
     fn emit_quad_const_to_xmm(&mut self, value: FloatVal, xmm: XmmReg) {
         let (lo, hi) = value.to_f128_bits();
+        self.emit_bits128_to_xmm(lo, hi, xmm);
+    }
+
+    /// Load the sixteen bytes `lo`, `hi` (little-endian halves) into `xmm`
+    /// from the read-only constant pool.
+    pub(super) fn emit_bits128_to_xmm(&mut self, lo: u64, hi: u64, xmm: XmmReg) {
         let mut bytes = [0u8; 16];
         bytes[..8].copy_from_slice(&lo.to_le_bytes());
         bytes[8..].copy_from_slice(&hi.to_le_bytes());

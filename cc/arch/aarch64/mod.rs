@@ -24,5 +24,6 @@ pub(crate) mod mapping;
 mod memory;
 pub mod regalloc;
 mod relax;
+mod simd;
 
 pub use macros::{get_darwin_macros, get_macros};

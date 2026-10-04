@@ -1879,30 +1879,49 @@ fn test_complex_conversions_are_never_scalar() {
 
 /// Two vectors of integer lanes differing in signedness compare unsigned,
 /// whichever side is unsigned, as gcc does; arithmetic keeps the left
-/// operand's lane type.
+/// operand's lane type. Asked of both targets, whatever the host: SSE2
+/// compares such words lane by lane, NEON with one unsigned `cmhi`.
 #[test]
 fn test_vector_mixed_signedness_compares_unsigned() {
+    use crate::ir::SimdOp;
     let src = "typedef short v8hi __attribute__((vector_size(16)));\n\
         typedef unsigned short v8hu __attribute__((vector_size(16)));\n\
         v8hi lt(v8hi a, v8hu b) { return a < b; }\n\
         v8hi gt(v8hu b, v8hi a) { return b > a; }\n\
         v8hi div(v8hi a, v8hu b) { return a / b; }\n";
-    let module = linearize_source(src, &Target::host());
-    let ops = |name: &str| -> Vec<Opcode> {
-        let func = module.functions.iter().find(|f| f.name == name).unwrap();
-        func.blocks
-            .iter()
-            .flat_map(|bb| bb.insns.iter().map(|i| i.op))
-            .collect()
-    };
-    for (name, unsigned, signed) in [
-        ("lt", Opcode::SetB, Opcode::SetLt),
-        ("gt", Opcode::SetA, Opcode::SetGt),
-    ] {
-        let ops = ops(name);
-        assert!(ops.contains(&unsigned), "{name}: no {unsigned:?}");
-        assert!(!ops.contains(&signed), "{name}: compares signed");
+    for arch in [Arch::X86_64, Arch::Aarch64] {
+        let module = linearize_source(src, &Target::new(arch, Os::Linux));
+        let ops = |name: &str| -> Vec<Opcode> {
+            let func = module.functions.iter().find(|f| f.name == name).unwrap();
+            func.blocks
+                .iter()
+                .flat_map(|bb| bb.insns.iter().map(|i| i.op))
+                .collect()
+        };
+        for (name, unsigned, signed) in [
+            ("lt", Opcode::SetB, Opcode::SetLt),
+            ("gt", Opcode::SetA, Opcode::SetGt),
+        ] {
+            let ops = ops(name);
+            let signed_ops = [
+                signed,
+                Opcode::Simd(SimdOp::CmpGt),
+                Opcode::Simd(SimdOp::CmpGe),
+            ];
+            assert!(
+                !ops.iter().any(|o| signed_ops.contains(o)),
+                "{arch:?} {name}: signed"
+            );
+            let want = match arch {
+                Arch::X86_64 => unsigned,
+                Arch::Aarch64 => Opcode::Simd(SimdOp::CmpGtU),
+            };
+            assert!(ops.contains(&want), "{arch:?} {name}: no {want:?}: {ops:?}");
+        }
+        let div = ops("div");
+        assert!(
+            div.contains(&Opcode::DivS) && !div.contains(&Opcode::DivU),
+            "{arch:?}"
+        );
     }
-    let div = ops("div");
-    assert!(div.contains(&Opcode::DivS) && !div.contains(&Opcode::DivU));
 }

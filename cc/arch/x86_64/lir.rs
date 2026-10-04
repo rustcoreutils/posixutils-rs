@@ -219,6 +219,211 @@ impl X87IntWidth {
 
 // x86-64 LIR Instructions
 
+/// The width of a packed integer lane: the `b`, `w`, `d` or `q` of
+/// `paddd`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntLane {
+    B,
+    W,
+    D,
+    Q,
+}
+
+impl IntLane {
+    /// The lane of `bytes` bytes.
+    pub fn of_bytes(bytes: usize) -> Self {
+        match bytes {
+            1 => IntLane::B,
+            2 => IntLane::W,
+            4 => IntLane::D,
+            8 => IntLane::Q,
+            _ => panic!("no packed integer lane of {bytes} bytes"),
+        }
+    }
+
+    pub fn suffix(self) -> &'static str {
+        match self {
+            IntLane::B => "b",
+            IntLane::W => "w",
+            IntLane::D => "d",
+            IntLane::Q => "q",
+        }
+    }
+}
+
+/// The width of a packed floating lane: the `s` or `d` of `addps`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatLane {
+    S,
+    D,
+}
+
+impl FloatLane {
+    /// The lane of `bytes` bytes.
+    pub fn of_bytes(bytes: usize) -> Self {
+        match bytes {
+            4 => FloatLane::S,
+            8 => FloatLane::D,
+            _ => panic!("no packed floating lane of {bytes} bytes"),
+        }
+    }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            FloatLane::S => "ps",
+            FloatLane::D => "pd",
+        }
+    }
+}
+
+/// A packed SSE2 operation of two XMM registers ([`X86Inst::Packed`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackedOp {
+    /// PADDB/W/D/Q
+    Add(IntLane),
+    /// PSUBB/W/D/Q
+    Sub(IntLane),
+    /// PAND
+    And,
+    /// POR
+    Or,
+    /// PXOR
+    Xor,
+    /// PCMPEQB/W/D: all ones in each lane that is equal.
+    CmpEq(IntLane),
+    /// ADDPS/PD
+    FAdd(FloatLane),
+    /// SUBPS/PD
+    FSub(FloatLane),
+    /// MULPS/PD
+    FMul(FloatLane),
+    /// DIVPS/PD
+    FDiv(FloatLane),
+    /// XORPS/PD
+    FXor(FloatLane),
+    /// PMULLW: the low half of each product. SSE2 has only the word form.
+    MulLow(IntLane),
+    /// PUNPCKLBW/WD/DQ/QDQ: interleave the low halves' lanes.
+    UnpackLow(IntLane),
+    /// UNPCKLPD (and PS): interleave the low halves' floating lanes.
+    FUnpackLow(FloatLane),
+    /// PSLL/PSRL/PSRA by the count in the low 64 bits of `src`.
+    Shift(PackedShift, IntLane),
+    /// PCMPGTB/W/D: all ones in each lane where `dst`'s is greater, signed.
+    CmpGt(IntLane),
+    /// CMPccPS/PD: all ones in each lane where `dst` pred `src` holds.
+    FCmp(FloatCompare, FloatLane),
+    /// PMINUB (SSE2), PMINUW/PMINUD (SSE4.1): the unsigned minimum.
+    MinU(IntLane),
+    /// PSHUFB (SSSE3): each byte of `dst` the byte of `dst` the same byte
+    /// of `src` names, or zero where its top bit is set.
+    ShuffleBytes,
+    /// CVTDQ2PS: each signed dword of `src` to a float in `dst`.
+    CvtDwordsToFloats,
+    /// CVTTPS2DQ: each float of `src` to a signed dword in `dst`, truncated.
+    CvtFloatsToDwords,
+}
+
+/// The predicate of a packed floating compare: `cmpltps` and the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FloatCompare {
+    /// Ordered and equal.
+    Eq,
+    /// Ordered and less.
+    Lt,
+    /// Ordered and less or equal.
+    Le,
+    /// Unordered or not equal.
+    Neq,
+}
+
+/// The direction and kind of a packed shift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackedShift {
+    Left,
+    LogicalRight,
+    ArithmeticRight,
+}
+
+impl PackedShift {
+    fn prefix(self) -> &'static str {
+        match self {
+            PackedShift::Left => "psll",
+            PackedShift::LogicalRight => "psrl",
+            PackedShift::ArithmeticRight => "psra",
+        }
+    }
+}
+
+/// A shuffle by an immediate selector ([`X86Inst::PackedShuffle`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackedShuffleOp {
+    /// PSHUFD: each dword of `dst` is the dword of `src` its two bits pick.
+    Pshufd,
+    /// PSHUFLW: the same for the low four words; the high ones are copied.
+    Pshuflw,
+    /// SHUFPS: two floats of `dst`, then two of `src`, by the selector.
+    Shufps,
+    /// SHUFPD: a double of `dst`, then one of `src`, by the selector.
+    Shufpd,
+}
+
+impl PackedShuffleOp {
+    fn mnemonic(self) -> &'static str {
+        match self {
+            PackedShuffleOp::Pshufd => "pshufd",
+            PackedShuffleOp::Pshuflw => "pshuflw",
+            PackedShuffleOp::Shufps => "shufps",
+            PackedShuffleOp::Shufpd => "shufpd",
+        }
+    }
+}
+
+impl PackedOp {
+    /// The instruction's name.
+    pub fn mnemonic(self) -> String {
+        match self {
+            PackedOp::Add(l) => format!("padd{}", l.suffix()),
+            PackedOp::Sub(l) => format!("psub{}", l.suffix()),
+            PackedOp::And => "pand".into(),
+            PackedOp::Or => "por".into(),
+            PackedOp::Xor => "pxor".into(),
+            PackedOp::CmpEq(l) => format!("pcmpeq{}", l.suffix()),
+            PackedOp::FAdd(l) => format!("add{}", l.suffix()),
+            PackedOp::FSub(l) => format!("sub{}", l.suffix()),
+            PackedOp::FMul(l) => format!("mul{}", l.suffix()),
+            PackedOp::FDiv(l) => format!("div{}", l.suffix()),
+            PackedOp::FXor(l) => format!("xor{}", l.suffix()),
+            PackedOp::MulLow(l) => format!("pmull{}", l.suffix()),
+            PackedOp::UnpackLow(l) => format!(
+                "punpckl{}",
+                match l {
+                    IntLane::B => "bw",
+                    IntLane::W => "wd",
+                    IntLane::D => "dq",
+                    IntLane::Q => "qdq",
+                }
+            ),
+            PackedOp::FUnpackLow(l) => format!("unpckl{}", l.suffix()),
+            PackedOp::Shift(shift, l) => format!("{}{}", shift.prefix(), l.suffix()),
+            PackedOp::CmpGt(l) => format!("pcmpgt{}", l.suffix()),
+            PackedOp::FCmp(pred, l) => {
+                let pred = match pred {
+                    FloatCompare::Eq => "eq",
+                    FloatCompare::Lt => "lt",
+                    FloatCompare::Le => "le",
+                    FloatCompare::Neq => "neq",
+                };
+                format!("cmp{pred}{}", l.suffix())
+            }
+            PackedOp::MinU(l) => format!("pminu{}", l.suffix()),
+            PackedOp::ShuffleBytes => "pshufb".into(),
+            PackedOp::CvtDwordsToFloats => "cvtdq2ps".into(),
+            PackedOp::CvtFloatsToDwords => "cvttps2dq".into(),
+        }
+    }
+}
+
 /// x86-64 Low-level IR instruction
 #[derive(Debug, Clone)]
 pub enum X86Inst {
@@ -661,6 +866,30 @@ pub enum X86Inst {
     /// XORPS with same register - Fast zero XMM register
     XorpsSelf { reg: XmmReg },
 
+    /// A packed operation on whole XMM registers, `op src, dst`: `dst` is
+    /// both the first operand and the result.
+    Packed {
+        op: PackedOp,
+        src: XmmReg,
+        dst: XmmReg,
+    },
+
+    /// PSLL/PSRL/PSRA by an immediate: shift each lane of `dst`.
+    PackedShiftImm {
+        shift: PackedShift,
+        lane: IntLane,
+        count: u8,
+        dst: XmmReg,
+    },
+
+    /// A lane shuffle by an immediate selector, `op $imm, src, dst`.
+    PackedShuffle {
+        op: PackedShuffleOp,
+        imm: u8,
+        src: XmmReg,
+        dst: XmmReg,
+    },
+
     // ========================================================================
     // Atomic Instructions (C11 _Atomic support)
     // ========================================================================
@@ -1054,6 +1283,34 @@ impl EmitAsm for X86Inst {
             }
             X86Inst::XorpsSelf { reg } => {
                 let _ = writeln!(out, "    xorps {}, {}", reg.name(), reg.name());
+            }
+            X86Inst::Packed { op, src, dst } => {
+                let _ = writeln!(out, "    {} {}, {}", op.mnemonic(), src.name(), dst.name());
+            }
+            X86Inst::PackedShiftImm {
+                shift,
+                lane,
+                count,
+                dst,
+            } => {
+                let _ = writeln!(
+                    out,
+                    "    {}{} ${}, {}",
+                    shift.prefix(),
+                    lane.suffix(),
+                    count,
+                    dst.name()
+                );
+            }
+            X86Inst::PackedShuffle { op, imm, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    {} ${}, {}, {}",
+                    op.mnemonic(),
+                    imm,
+                    src.name(),
+                    dst.name()
+                );
             }
 
             // Atomic Instructions

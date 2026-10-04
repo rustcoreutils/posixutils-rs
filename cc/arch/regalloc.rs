@@ -1117,6 +1117,7 @@ where
                     | Opcode::FCvtF
                     | Opcode::UCvtF
                     | Opcode::SCvtF
+                    | Opcode::Simd(_)
             );
 
             if is_fp_producing_op {

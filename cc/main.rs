@@ -2554,7 +2554,7 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Detect target (use --target if specified, otherwise detect host)
-    let target = if let Some(ref triple) = args.target {
+    let mut target = if let Some(ref triple) = args.target {
         match Target::from_triple(triple) {
             Some(t) => t,
             None => {
@@ -2567,6 +2567,9 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     check_machine_flags(&args.mflags, &target);
+    if target.arch == target::Arch::X86_64 {
+        target.x86_isa = target::X86Isa::from_flags(&args.mflags);
+    }
 
     // Parse runtime library selection
     let _rtlib = match args.rtlib.as_deref() {

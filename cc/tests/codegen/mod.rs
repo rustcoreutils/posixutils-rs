@@ -53,4 +53,5 @@ mod types_exprs;
 mod unwind;
 mod varargs;
 mod vector_abi;
+mod vector_native;
 mod vectors;

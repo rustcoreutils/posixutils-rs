@@ -18,6 +18,7 @@ pub mod dwarf;
 pub mod lir;
 pub mod mapping;
 pub mod regalloc;
+pub mod simd;
 pub mod x86_64;
 
 // Re-export inline asm support traits and functions

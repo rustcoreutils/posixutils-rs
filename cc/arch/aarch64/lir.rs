@@ -83,6 +83,154 @@ impl GpOperand {
 
 // AArch64 LIR Instructions
 
+/// A vector register's arrangement: how many lanes of what width, the
+/// `.4s` of `add v0.4s, v1.4s, v2.4s`. `D1`, one 64-bit lane, is written as
+/// the scalar `d` register: NEON's integer `add`/`sub`/`neg` and floating
+/// arithmetic have no `.1d` vector form, only the scalar one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arrangement {
+    B8,
+    B16,
+    H4,
+    H8,
+    S2,
+    S4,
+    D1,
+    D2,
+}
+
+impl Arrangement {
+    /// The arrangement of lanes of `lane_bytes` filling `total_bytes`
+    /// (eight or sixteen).
+    pub fn of(lane_bytes: usize, total_bytes: usize) -> Self {
+        match (lane_bytes, total_bytes) {
+            (1, 8) => Arrangement::B8,
+            (1, 16) => Arrangement::B16,
+            (2, 8) => Arrangement::H4,
+            (2, 16) => Arrangement::H8,
+            (4, 8) => Arrangement::S2,
+            (4, 16) => Arrangement::S4,
+            (8, 8) => Arrangement::D1,
+            (8, 16) => Arrangement::D2,
+            _ => panic!("no arrangement of {lane_bytes}-byte lanes in {total_bytes} bytes"),
+        }
+    }
+
+    /// The width of each lane, in bytes.
+    pub fn lane_bytes(self) -> u32 {
+        match self {
+            Arrangement::B8 | Arrangement::B16 => 1,
+            Arrangement::H4 | Arrangement::H8 => 2,
+            Arrangement::S2 | Arrangement::S4 => 4,
+            Arrangement::D1 | Arrangement::D2 => 8,
+        }
+    }
+
+    /// The element letter of a lane, the `s` of `v1.s[0]`.
+    fn element(self) -> &'static str {
+        match self.lane_bytes() {
+            1 => "b",
+            2 => "h",
+            4 => "s",
+            _ => "d",
+        }
+    }
+
+    /// Register `r` at this arrangement, as an operand.
+    fn operand(self, r: VReg) -> String {
+        let suffix = match self {
+            Arrangement::D1 => return r.name_d().to_string(),
+            Arrangement::B8 => "8b",
+            Arrangement::B16 => "16b",
+            Arrangement::H4 => "4h",
+            Arrangement::H8 => "8h",
+            Arrangement::S2 => "2s",
+            Arrangement::S4 => "4s",
+            Arrangement::D2 => "2d",
+        };
+        format!("{}.{suffix}", r.name_v())
+    }
+}
+
+/// A lane-wise NEON operation ([`Aarch64Inst::Neon`]). The bitwise ones
+/// take a byte arrangement, `.8b` or `.16b`, whatever the lanes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeonOp {
+    Add,
+    Sub,
+    And,
+    Orr,
+    Eor,
+    Not,
+    Neg,
+    Fadd,
+    Fsub,
+    Fmul,
+    Fdiv,
+    Fneg,
+    Mul,
+    /// Shift each lane left by the signed count in the same lane of the
+    /// second operand, logically (`ushl`) or arithmetically (`sshl`): a
+    /// negative count shifts right.
+    Ushl,
+    Sshl,
+    /// Compares, each lane all ones where it holds: equal, signed greater
+    /// (or equal), unsigned higher (or same), and their floating forms.
+    Cmeq,
+    Cmgt,
+    Cmge,
+    Cmhi,
+    Cmhs,
+    Fcmeq,
+    Fcmgt,
+    Fcmge,
+    /// Conversions at one width: signed or unsigned integer to floating,
+    /// and floating to signed or unsigned integer toward zero.
+    Scvtf,
+    Ucvtf,
+    Fcvtzs,
+    Fcvtzu,
+}
+
+impl NeonOp {
+    fn mnemonic(self) -> &'static str {
+        match self {
+            NeonOp::Add => "add",
+            NeonOp::Sub => "sub",
+            NeonOp::And => "and",
+            NeonOp::Orr => "orr",
+            NeonOp::Eor => "eor",
+            NeonOp::Not => "not",
+            NeonOp::Neg => "neg",
+            NeonOp::Fadd => "fadd",
+            NeonOp::Fsub => "fsub",
+            NeonOp::Fmul => "fmul",
+            NeonOp::Fdiv => "fdiv",
+            NeonOp::Fneg => "fneg",
+            NeonOp::Mul => "mul",
+            NeonOp::Ushl => "ushl",
+            NeonOp::Sshl => "sshl",
+            NeonOp::Cmeq => "cmeq",
+            NeonOp::Cmgt => "cmgt",
+            NeonOp::Cmge => "cmge",
+            NeonOp::Cmhi => "cmhi",
+            NeonOp::Cmhs => "cmhs",
+            NeonOp::Fcmeq => "fcmeq",
+            NeonOp::Fcmgt => "fcmgt",
+            NeonOp::Fcmge => "fcmge",
+            NeonOp::Scvtf => "scvtf",
+            NeonOp::Ucvtf => "ucvtf",
+            NeonOp::Fcvtzs => "fcvtzs",
+            NeonOp::Fcvtzu => "fcvtzu",
+        }
+    }
+
+    /// Whether the operation is bitwise, and so takes a byte arrangement.
+    pub fn is_bitwise(self) -> bool {
+        matches!(self, NeonOp::And | NeonOp::Orr | NeonOp::Eor | NeonOp::Not)
+    }
+}
+
 /// AArch64 Low-level IR instruction
 #[derive(Debug, Clone)]
 pub enum Aarch64Inst {
@@ -746,6 +894,43 @@ pub enum Aarch64Inst {
     // ========================================================================
     // SIMD/NEON Instructions for population count
     // ========================================================================
+    /// A lane-wise NEON operation on whole vector registers:
+    /// `op dst, src1[, src2]`, every register at the arrangement `arr`.
+    Neon {
+        op: NeonOp,
+        arr: Arrangement,
+        src1: VReg,
+        src2: Option<VReg>,
+        dst: VReg,
+    },
+
+    /// TBL: each byte of `dst` the byte of the table -- `table`, then
+    /// `second` (the register after it) when there is one -- that the same
+    /// byte of `index` numbers, or zero for an index past the table. `wide`
+    /// is the sixteen-byte form, else eight.
+    NeonTbl {
+        table: VReg,
+        second: Option<VReg>,
+        index: VReg,
+        dst: VReg,
+        wide: bool,
+    },
+
+    /// DUP from a general register: every lane of `dst` the low bits of
+    /// `src`.
+    NeonDupGp {
+        arr: Arrangement,
+        src: Reg,
+        dst: VReg,
+    },
+
+    /// DUP from an element: every lane of `dst` lane 0 of `src`.
+    NeonDupLane {
+        arr: Arrangement,
+        src: VReg,
+        dst: VReg,
+    },
+
     /// CNT - Count set bits per byte in vector
     /// Used for __builtin_popcount: counts 1-bits in each byte of a vector
     Cnt {
@@ -1455,6 +1640,64 @@ impl EmitAsm for Aarch64Inst {
             }
 
             // SIMD/NEON Instructions
+            Aarch64Inst::Neon {
+                op,
+                arr,
+                src1,
+                src2,
+                dst,
+            } => {
+                let _ = write!(
+                    out,
+                    "    {} {}, {}",
+                    op.mnemonic(),
+                    arr.operand(*dst),
+                    arr.operand(*src1)
+                );
+                if let Some(src2) = src2 {
+                    let _ = write!(out, ", {}", arr.operand(*src2));
+                }
+                let _ = writeln!(out);
+            }
+
+            Aarch64Inst::NeonTbl {
+                table,
+                second,
+                index,
+                dst,
+                wide,
+            } => {
+                let arr = if *wide { "16b" } else { "8b" };
+                let table = match second {
+                    Some(second) => {
+                        format!("{{{}.16b, {}.16b}}", table.name_v(), second.name_v())
+                    }
+                    None => format!("{{{}.16b}}", table.name_v()),
+                };
+                let _ = writeln!(
+                    out,
+                    "    tbl {}.{arr}, {table}, {}.{arr}",
+                    dst.name_v(),
+                    index.name_v()
+                );
+            }
+
+            Aarch64Inst::NeonDupGp { arr, src, dst } => {
+                let lane_bits = arr.lane_bytes() * 8;
+                let src = src.name_for_size(lane_bits.max(32));
+                let _ = writeln!(out, "    dup {}, {}", arr.operand(*dst), src);
+            }
+
+            Aarch64Inst::NeonDupLane { arr, src, dst } => {
+                let _ = writeln!(
+                    out,
+                    "    dup {}, {}.{}[0]",
+                    arr.operand(*dst),
+                    src.name_v(),
+                    arr.element()
+                );
+            }
+
             Aarch64Inst::Cnt { src, dst } => {
                 // CNT counts set bits per byte in a vector
                 // Use .8b arrangement for both 32-bit and 64-bit popcount
@@ -2339,6 +2582,39 @@ mod tests {
         };
         inst.emit(&target, &mut out);
         assert_eq!(out.trim(), "b.ne .Lmain_2");
+    }
+
+    #[test]
+    fn test_neon_instructions() {
+        let target = linux_target();
+        for (op, arr, src2, want) in [
+            (
+                NeonOp::Add,
+                Arrangement::S4,
+                Some(VReg::V1),
+                "add v2.4s, v0.4s, v1.4s",
+            ),
+            (
+                NeonOp::Eor,
+                Arrangement::B8,
+                Some(VReg::V1),
+                "eor v2.8b, v0.8b, v1.8b",
+            ),
+            (NeonOp::Fneg, Arrangement::D2, None, "fneg v2.2d, v0.2d"),
+            // One 64-bit lane is the scalar form.
+            (NeonOp::Neg, Arrangement::D1, None, "neg d2, d0"),
+        ] {
+            let mut out = String::new();
+            Aarch64Inst::Neon {
+                op,
+                arr,
+                src1: VReg::V0,
+                src2,
+                dst: VReg::V2,
+            }
+            .emit(&target, &mut out);
+            assert_eq!(out.trim(), want);
+        }
     }
 
     #[test]

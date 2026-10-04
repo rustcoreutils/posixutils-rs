@@ -385,7 +385,13 @@ __attribute__((noinline)) static int preserved(void) {
         "movq $116, %%rsi\n\tmovq $117, %%rdi\n\t"
         "movq %%rsp, %%rbx\n\tsubq $128, %%rsp\n\tandq $-16, %%rsp\n\tsubq $32, %%rsp\n\t"
         "movl $5, %%ecx\n\tmovq $0x3ff8000000000000, %%rax\n\tmovq %%rax, %%xmm1\n\t"
+        /* A C symbol is `_name` in Mach-O and `name` everywhere else, and
+           this `call` names one by hand. */
+#ifdef __APPLE__
+        "call _t_calls_sysv\n\t"
+#else
         "call t_calls_sysv\n\t"
+#endif
         "movq %%rbx, %%rsp\n\t"
         "movq %%xmm6, 0(%0)\n\tmovq %%xmm7, 8(%0)\n\tmovq %%xmm8, 16(%0)\n\t"
         "movq %%xmm9, 24(%0)\n\tmovq %%xmm10, 32(%0)\n\tmovq %%xmm11, 40(%0)\n\t"

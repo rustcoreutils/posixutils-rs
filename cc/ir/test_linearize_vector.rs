@@ -64,6 +64,31 @@ fn test_native_vector_operations_are_one_instruction() {
     use crate::target::{Arch, Os};
     let x86 = Target::new(Arch::X86_64, Os::Linux);
     let a64 = Target::new(Arch::Aarch64, Os::Linux);
+    let one_simd = |src: &str, target: &Target, simd: SimdOp| {
+        let ops = ops_of(src, "f", target);
+        assert_eq!(
+            ops.iter().filter(|&&o| o == Opcode::Simd(simd)).count(),
+            1,
+            "{src}: {ops:?}"
+        );
+        let lane_ops = [
+            Opcode::Add,
+            Opcode::Sub,
+            Opcode::Xor,
+            Opcode::Not,
+            Opcode::Neg,
+        ];
+        let fp_ops = [Opcode::FAdd, Opcode::FDiv, Opcode::FNeg];
+        assert!(
+            !ops.iter()
+                .any(|o| lane_ops.contains(o) || fp_ops.contains(o)),
+            "{src}: a lane loop is left: {ops:?}"
+        );
+    };
+    let no_simd = |src: &str, target: &Target| {
+        let ops = ops_of(src, "f", target);
+        assert!(!ops.iter().any(|o| matches!(o, Opcode::Simd(_))), "{src}");
+    };
     for (src, simd) in [
         (
             "void f(v4si *d, v4si *a, v4si *b) { *d = *a + *b; }",
@@ -82,36 +107,16 @@ fn test_native_vector_operations_are_one_instruction() {
         ),
         ("void f(v4sf *d, v4sf *a) { *d = -*a; }", SimdOp::FNeg),
     ] {
-        let ops = ops_of(src, "f", &x86);
-        assert_eq!(
-            ops.iter().filter(|&&o| o == Opcode::Simd(simd)).count(),
-            1,
-            "{src}: {ops:?}"
-        );
-        let lane_ops = [
-            Opcode::Add,
-            Opcode::Sub,
-            Opcode::Xor,
-            Opcode::Not,
-            Opcode::Neg,
-        ];
-        let fp_ops = [Opcode::FDiv, Opcode::FNeg];
-        assert!(
-            !ops.iter()
-                .any(|o| lane_ops.contains(o) || fp_ops.contains(o)),
-            "{src}: a lane loop is left: {ops:?}"
-        );
-        // aarch64 lists none of them yet: the lane loop, and no `Simd`.
-        let ops = ops_of(src, "f", &a64);
-        assert!(!ops.iter().any(|o| matches!(o, Opcode::Simd(_))), "{src}");
+        one_simd(src, &x86, simd);
+        one_simd(src, &a64, simd);
     }
-    // Division of integers, and eight bytes of floats, stay lane by lane.
-    for src in [
-        "void f(v4si *d, v4si *a, v4si *b) { *d = *a / *b; }",
-        "typedef float v2sf __attribute__((vector_size(8)));\n\
-         void f(v2sf *d, v2sf *a, v2sf *b) { *d = *a + *b; }",
-    ] {
-        let ops = ops_of(src, "f", &x86);
-        assert!(!ops.iter().any(|o| matches!(o, Opcode::Simd(_))), "{src}");
-    }
+    // Division of integers stays lane by lane everywhere; eight bytes of
+    // floats does on x86-64 alone.
+    let div = "void f(v4si *d, v4si *a, v4si *b) { *d = *a / *b; }";
+    no_simd(div, &x86);
+    no_simd(div, &a64);
+    let v2sf = "typedef float v2sf __attribute__((vector_size(8)));\n\
+                void f(v2sf *d, v2sf *a, v2sf *b) { *d = *a + *b; }";
+    no_simd(v2sf, &x86);
+    one_simd(v2sf, &a64, SimdOp::FAdd);
 }

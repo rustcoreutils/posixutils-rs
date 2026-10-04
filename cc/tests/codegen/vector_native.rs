@@ -281,3 +281,47 @@ void dops(v2df *d, v2df *a, v2df *b) { *d = -((*a + *b) * (*a - *b) / *b); }
         }
     }
 }
+
+/// On aarch64 every listed operation is one NEON instruction, at both
+/// widths -- the D-register forms for eight bytes, and the scalar `d` form
+/// for a single 64-bit lane -- with the standard syntax both Linux and
+/// Apple's assembler take.
+#[test]
+fn vector_native_aarch64_uses_neon_instructions() {
+    let src = r#"
+typedef signed char v16qi __attribute__((vector_size(16)));
+typedef short v4hi __attribute__((vector_size(8)));
+typedef int v4si __attribute__((vector_size(16)));
+typedef long long v1di __attribute__((vector_size(8)));
+typedef float v2sf __attribute__((vector_size(8)));
+typedef double v2df __attribute__((vector_size(16)));
+void addb(v16qi *d, v16qi *a, v16qi *b) { *d = *a + *b; }
+void subh(v4hi *d, v4hi *a, v4hi *b) { *d = *a - *b; }
+void bits(v4si *d, v4si *a, v4si *b) { *d = (*a & *b) | (*a ^ ~*b); }
+void neg1(v1di *d, v1di *a) { *d = -*a; }
+void fops(v2sf *d, v2sf *a, v2sf *b) { *d = -((*a + *b) * (*a - *b) / *b); }
+void dops(v2df *d, v2df *a, v2df *b) { *d = *a * *b; }
+"#;
+    for triple in [
+        crate::codegen::asm_probe::AARCH64_LINUX,
+        crate::codegen::asm_probe::AARCH64_DARWIN,
+    ] {
+        let asm = asm_for("vec_native_a64", triple, src);
+        for (f, want) in [
+            ("addb", &["add v", ".16b"][..]),
+            ("subh", &["sub v", ".4h"]),
+            ("bits", &["and v", "orr v", "eor v", "not v"]),
+            ("neg1", &["neg d"]),
+            (
+                "fops",
+                &["fadd v", "fsub v", "fmul v", "fdiv v", "fneg v", ".2s"],
+            ),
+            ("dops", &["fmul v", ".2d"]),
+        ] {
+            let body = crate::codegen::asm_probe::body_of(&asm, f);
+            for m in want {
+                assert!(body.contains(m), "{triple} {f}: no {m}:\n{body}");
+            }
+        }
+    }
+}

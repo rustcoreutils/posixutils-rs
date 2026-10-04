@@ -42,7 +42,9 @@ pub fn native(target: &Target, op: SimdOp, vec: TypeId, types: &TypeTable) -> bo
     }
     match target.arch {
         Arch::X86_64 => x86_64(bytes, float),
-        Arch::Aarch64 => false,
+        // NEON has every listed operation at both widths: the Q register,
+        // or its D half.
+        Arch::Aarch64 => true,
     }
 }
 
@@ -95,7 +97,15 @@ mod tests {
         assert!(!n(SimdOp::FAdd, v2sf));
         assert!(!n(SimdOp::Add, v2hi));
         assert!(!n(SimdOp::Add, v1ti));
+        // NEON has them all, eight-byte floats included.
         let a64 = Target::new(Arch::Aarch64, Os::Linux);
-        assert!(!native(&a64, SimdOp::Add, v4si, &types));
+        for (op, v) in [
+            (SimdOp::Add, v4si),
+            (SimdOp::FAdd, v2sf),
+            (SimdOp::Neg, v2si),
+        ] {
+            assert!(native(&a64, op, v, &types), "{op:?}");
+        }
+        assert!(!native(&a64, SimdOp::Add, v2hi, &types));
     }
 }

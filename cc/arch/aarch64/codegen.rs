@@ -741,9 +741,7 @@ impl Aarch64CodeGen {
                 }
             }
 
-            Opcode::Simd(op) => {
-                panic!("internal error: arch::simd::native lists no {op:?} for aarch64")
-            }
+            Opcode::Simd(op) => self.emit_simd(insn, op, types),
 
             Opcode::Select => {
                 self.emit_select(insn, types);

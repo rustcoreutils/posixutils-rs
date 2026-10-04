@@ -9,6 +9,11 @@
 
 //! POSIX ustar (tar) format implementation
 //!
+//! This module owns the header layout. The pax interchange format is an
+//! extension of ustar and reads the same 512-byte block, so it imports these
+//! offsets rather than restating them -- two copies of a field offset is one
+//! copy that can be wrong.
+//!
 //! Header format (512 bytes):
 //! - name:     100 bytes (offset 0)
 //! - mode:       8 bytes (offset 100)
@@ -31,47 +36,47 @@ use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType, Sour
 use crate::error::{PaxError, PaxResult};
 use std::io::{Read, Write};
 
-const BLOCK_SIZE: usize = 512;
+pub(crate) const BLOCK_SIZE: usize = 512;
 /// Static zero buffer for padding and end-of-archive markers
-static ZERO_BLOCK: [u8; BLOCK_SIZE] = [0u8; BLOCK_SIZE];
-const NAME_LEN: usize = 100;
-const PREFIX_LEN: usize = 155;
-const LINKNAME_LEN: usize = 100;
+pub(crate) static ZERO_BLOCK: [u8; BLOCK_SIZE] = [0u8; BLOCK_SIZE];
+pub(crate) const NAME_LEN: usize = 100;
+pub(crate) const PREFIX_LEN: usize = 155;
+pub(crate) const LINKNAME_LEN: usize = 100;
 const MAGIC_LEN: usize = 6;
 const VERSION_LEN: usize = 2;
-const UNAME_LEN: usize = 32;
-const GNAME_LEN: usize = 32;
+pub(crate) const UNAME_LEN: usize = 32;
+pub(crate) const GNAME_LEN: usize = 32;
 
 // Header field offsets
-const NAME_OFF: usize = 0;
-const MODE_OFF: usize = 100;
-const UID_OFF: usize = 108;
-const GID_OFF: usize = 116;
-const SIZE_OFF: usize = 124;
-const MTIME_OFF: usize = 136;
-const CHKSUM_OFF: usize = 148;
-const TYPEFLAG_OFF: usize = 156;
-const LINKNAME_OFF: usize = 157;
-const MAGIC_OFF: usize = 257;
-const VERSION_OFF: usize = 263;
-const UNAME_OFF: usize = 265;
-const GNAME_OFF: usize = 297;
-const PREFIX_OFF: usize = 345;
+pub(crate) const NAME_OFF: usize = 0;
+pub(crate) const MODE_OFF: usize = 100;
+pub(crate) const UID_OFF: usize = 108;
+pub(crate) const GID_OFF: usize = 116;
+pub(crate) const SIZE_OFF: usize = 124;
+pub(crate) const MTIME_OFF: usize = 136;
+pub(crate) const CHKSUM_OFF: usize = 148;
+pub(crate) const TYPEFLAG_OFF: usize = 156;
+pub(crate) const LINKNAME_OFF: usize = 157;
+pub(crate) const MAGIC_OFF: usize = 257;
+pub(crate) const VERSION_OFF: usize = 263;
+pub(crate) const UNAME_OFF: usize = 265;
+pub(crate) const GNAME_OFF: usize = 297;
+pub(crate) const PREFIX_OFF: usize = 345;
 
 // Type flags
-const REGTYPE: u8 = b'0';
+pub(crate) const REGTYPE: u8 = b'0';
 const AREGTYPE: u8 = b'\0';
-const LNKTYPE: u8 = b'1';
-const SYMTYPE: u8 = b'2';
-const CHRTYPE: u8 = b'3';
-const BLKTYPE: u8 = b'4';
-const DIRTYPE: u8 = b'5';
-const FIFOTYPE: u8 = b'6';
+pub(crate) const LNKTYPE: u8 = b'1';
+pub(crate) const SYMTYPE: u8 = b'2';
+pub(crate) const CHRTYPE: u8 = b'3';
+pub(crate) const BLKTYPE: u8 = b'4';
+pub(crate) const DIRTYPE: u8 = b'5';
+pub(crate) const FIFOTYPE: u8 = b'6';
 const CONTTYPE: u8 = b'7';
 
 // Device number field offsets and lengths
-const DEVMAJOR_OFF: usize = 329;
-const DEVMINOR_OFF: usize = 337;
+pub(crate) const DEVMAJOR_OFF: usize = 329;
+pub(crate) const DEVMINOR_OFF: usize = 337;
 
 /// ustar archive reader
 pub struct UstarReader<R: Read> {

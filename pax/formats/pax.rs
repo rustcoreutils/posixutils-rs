@@ -27,7 +27,11 @@ use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
 use crate::error::{PaxError, PaxResult};
 use crate::formats::ustar::{
     calculate_checksum, parse_header as parse_ustar_header, parse_octal, try_split_path,
-    ustar_path_bytes, verify_checksum, write_field, SizeRule,
+    ustar_path_bytes, verify_checksum, write_field, SizeRule, BLKTYPE, BLOCK_SIZE, CHKSUM_OFF,
+    CHRTYPE, DEVMAJOR_OFF, DEVMINOR_OFF, DIRTYPE, FIFOTYPE, GID_OFF, GNAME_LEN, GNAME_OFF,
+    LINKNAME_LEN, LINKNAME_OFF, LNKTYPE, MAGIC_OFF, MODE_OFF, MTIME_OFF, NAME_LEN, NAME_OFF,
+    PREFIX_LEN, PREFIX_OFF, REGTYPE, SIZE_OFF, SYMTYPE, TYPEFLAG_OFF, UID_OFF, UNAME_LEN,
+    UNAME_OFF, VERSION_OFF, ZERO_BLOCK,
 };
 use crate::options::FormatOptions;
 use std::collections::HashMap;
@@ -36,46 +40,13 @@ use std::io::{Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
-const BLOCK_SIZE: usize = 512;
-/// Static zero buffer for padding and end-of-archive markers
-static ZERO_BLOCK: [u8; BLOCK_SIZE] = [0u8; BLOCK_SIZE];
+// The header block layout, the typeflags and the zero block all come from
+// `formats::ustar`: a pax archive *is* a ustar archive with extra headers, and
+// a second copy of an offset is a second thing to get wrong.
 
-// Extended header typeflags
+// Extended header typeflags, which are pax's own.
 const PAX_XHDR: u8 = b'x'; // Per-file extended header
 const PAX_GHDR: u8 = b'g'; // Global extended header
-
-// Regular ustar typeflags (for reference)
-const REGTYPE: u8 = b'0';
-const LNKTYPE: u8 = b'1';
-const SYMTYPE: u8 = b'2';
-const CHRTYPE: u8 = b'3';
-const BLKTYPE: u8 = b'4';
-const DIRTYPE: u8 = b'5';
-const FIFOTYPE: u8 = b'6';
-
-// Header field offsets (same as ustar)
-const NAME_OFF: usize = 0;
-const MODE_OFF: usize = 100;
-const UID_OFF: usize = 108;
-const GID_OFF: usize = 116;
-const SIZE_OFF: usize = 124;
-const MTIME_OFF: usize = 136;
-const CHKSUM_OFF: usize = 148;
-const TYPEFLAG_OFF: usize = 156;
-const LINKNAME_OFF: usize = 157;
-const MAGIC_OFF: usize = 257;
-const VERSION_OFF: usize = 263;
-const UNAME_OFF: usize = 265;
-const GNAME_OFF: usize = 297;
-const DEVMAJOR_OFF: usize = 329;
-const DEVMINOR_OFF: usize = 337;
-const PREFIX_OFF: usize = 345;
-
-const NAME_LEN: usize = 100;
-const PREFIX_LEN: usize = 155;
-const LINKNAME_LEN: usize = 100;
-const UNAME_LEN: usize = 32;
-const GNAME_LEN: usize = 32;
 
 /// A pax extended-header timestamp, held exactly as integer seconds plus
 /// nanoseconds. `f64` cannot represent nanosecond precision for present-day

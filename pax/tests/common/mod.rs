@@ -458,6 +458,11 @@ pub struct CpioNewc<'a> {
     pub namesize: Option<u32>,
     /// `c_filesize`. `None` writes `body.len()`.
     pub filesize: Option<u32>,
+    /// `c_ino`, `c_nlink` and `c_mtime`. Settable so a test can tell the
+    /// fields apart in a listing instead of reading four identical ones.
+    pub ino: u32,
+    pub nlink: u32,
+    pub mtime: u32,
 }
 
 impl Default for CpioNewc<'_> {
@@ -468,6 +473,9 @@ impl Default for CpioNewc<'_> {
             body: b"",
             namesize: None,
             filesize: None,
+            ino: 1,
+            nlink: 1,
+            mtime: 0,
         }
     }
 }
@@ -477,12 +485,12 @@ impl CpioNewc<'_> {
     pub fn member(&self) -> Vec<u8> {
         let mut out = b"070701".to_vec();
         for v in [
-            1u32,                                                // c_ino
+            self.ino,                                            // c_ino
             self.mode,                                           // c_mode
             0,                                                   // c_uid
             0,                                                   // c_gid
-            1,                                                   // c_nlink
-            0,                                                   // c_mtime
+            self.nlink,                                          // c_nlink
+            self.mtime,                                          // c_mtime
             self.filesize.unwrap_or(self.body.len() as u32),     // c_filesize
             0,                                                   // c_devmajor
             0,                                                   // c_devminor
@@ -504,6 +512,19 @@ impl CpioNewc<'_> {
         while !out.len().is_multiple_of(4) {
             out.push(0);
         }
+        out
+    }
+
+    /// A complete one-member archive, closed by cpio's `TRAILER!!!` member.
+    pub fn archive(&self) -> Vec<u8> {
+        let mut out = self.member();
+        out.extend_from_slice(
+            &CpioNewc {
+                name: b"TRAILER!!!",
+                ..Default::default()
+            }
+            .member(),
+        );
         out
     }
 }

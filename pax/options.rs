@@ -913,6 +913,75 @@ fn ustar_keyword(info: &ListEntryInfo, keyword: &str) -> Option<Field> {
     })
 }
 
+/// The cpio field names POSIX permits without the leading `c_`.
+///
+/// Only the names no other table claims. `mode`, `uid`, `gid`, `mtime`, `size`,
+/// `name` and `magic` keep their ustar and pax readings, which differ from the
+/// cpio ones in value as well as radix -- `mode` is the permission bits and
+/// `c_mode` carries the file type over them -- so honoring an unprefixed alias
+/// for those would silently change what an existing format string reports.
+const CPIO_UNPREFIXED: &[&str] = &[
+    "dev", "ino", "nlink", "rdev", "namesize", "filesize", "filedata",
+];
+
+/// Resolve a keyword naming an Octet-Oriented cpio Archive Entry field (POSIX
+/// rule 7, first bullet). `None` when the name is not in that table.
+///
+/// Rule 7: "The implementation may support the cpio keywords without the
+/// leading c_ in addition to the form required". Both spellings resolve, but
+/// the `c_` is stripped only when what remains is a cpio field name, so
+/// `%(c_bogus)s` keeps the literal echo that tells an operator about a typo.
+///
+/// `c_dev`, `c_ino` and `c_nlink` are `Absent` for a member that did not come
+/// from a cpio header: a ustar header records none of them, and the entry's
+/// zeros are placeholders rather than values read from an archive.
+fn cpio_keyword(info: &ListEntryInfo, keyword: &str) -> Option<Field> {
+    let field = match keyword.strip_prefix("c_") {
+        Some(rest) => rest,
+        None if CPIO_UNPREFIXED.contains(&keyword) => keyword,
+        None => return None,
+    };
+
+    let cpio = matches!(info.entry.source_header, Some(SourceHeader::Cpio { .. }));
+    let path = crate::rawpath::as_bytes(&info.entry.path);
+
+    Some(match field {
+        "magic" => return Some(header_magic(info)),
+        "dev" if cpio => fmt_decimal(info.entry.dev),
+        "ino" if cpio => fmt_decimal(info.entry.ino),
+        "nlink" if cpio => fmt_decimal(info.entry.nlink as u64),
+        "dev" | "ino" | "nlink" => Field::Absent,
+        "mode" => fmt_octal(
+            crate::formats::cpio::cpio_mode(info.entry.mode, info.entry.entry_type) as u64,
+        ),
+        "uid" => fmt_decimal(info.entry.uid as u64),
+        "gid" => fmt_decimal(info.entry.gid as u64),
+        "mtime" => fmt_decimal(info.entry.mtime),
+        "rdev" if is_device(info) => fmt_octal(crate::formats::cpio::pack_rdev(
+            info.entry.devmajor,
+            info.entry.devminor,
+        )),
+        "rdev" => fmt_octal(0),
+        // c_namesize counts the NUL cpio stores after the pathname.
+        "namesize" => fmt_decimal(path.len() as u64 + 1),
+        // A symbolic link's target is cpio's file data, so it is what
+        // c_filesize counts; the entry's own size is zero for one, which is
+        // what the pax `size` keyword reports. A hard link also carries a
+        // target, but cpio has no link typeflag and stores it as a regular
+        // file with its full contents, so it is not one of these.
+        "filesize" => match (info.entry.entry_type, info.entry.link_target.as_deref()) {
+            (EntryType::Symlink, Some(target)) => {
+                fmt_decimal(crate::rawpath::as_bytes(target).len() as u64)
+            }
+            _ => fmt_decimal(info.entry.size),
+        },
+        "name" => Field::Value(fmt_fullpath(info)),
+        // c_filedata is the member's contents, not a value a listing reports.
+        "filedata" => Field::Absent,
+        _ => return None,
+    })
+}
+
 /// `magic` / `c_magic`: the identifying value of whichever header this member
 /// came from, so the keyword answers for a tar and a cpio archive alike.
 fn header_magic(info: &ListEntryInfo) -> Field {
@@ -952,7 +1021,10 @@ fn keyword_value(info: &ListEntryInfo, field: &str, conversion: char) -> Keyword
     // the names the tables share -- `size` and `uid` are decimal there and
     // octal in the ustar header -- so an existing format string keeps its
     // answer.
-    let value = match pax_keyword(info, keyword).or_else(|| ustar_keyword(info, keyword)) {
+    let value = match pax_keyword(info, keyword)
+        .or_else(|| ustar_keyword(info, keyword))
+        .or_else(|| cpio_keyword(info, keyword))
+    {
         Some(Field::Value(v)) => v,
         Some(Field::Absent) => return KeywordValue::Absent,
         None => return KeywordValue::Unknown,
@@ -1510,6 +1582,146 @@ mod tests {
         };
         assert_eq!(fmt("%m", &info(&e)), "644");
         assert_eq!(fmt("%(mode)s", &info(&e)), "644");
+    }
+
+    /// A member as a cpio reader produces it: the flavor recorded, the mode
+    /// already stripped of its file type bits (`C_PERM_MASK`).
+    fn cpio_entry(path: &str, format: crate::formats::cpio::CpioFormat) -> ArchiveEntry {
+        ArchiveEntry {
+            path: path.into(),
+            source_header: Some(SourceHeader::Cpio { format }),
+            ..Default::default()
+        }
+    }
+
+    /// POSIX listopt rule 7 requires every Field Name entry of the
+    /// Octet-Oriented cpio Archive Entry table as a `%(keyword)`, and permits
+    /// the same names without the leading `c_`. None of them resolved.
+    #[test]
+    fn test_keyword_cpio_header_fields() {
+        use crate::formats::cpio::CpioFormat;
+        let e = ArchiveEntry {
+            mode: 0o644,
+            uid: 1000,
+            gid: 100,
+            size: 1234,
+            mtime: 99,
+            dev: 8,
+            ino: 64,
+            nlink: 9,
+            ..cpio_entry("a/b.txt", CpioFormat::Odc)
+        };
+        let info = info(&e);
+
+        assert_eq!(fmt("%(c_magic)s", &info), "070707");
+        assert_eq!(fmt("%(c_dev)s", &info), "8");
+        assert_eq!(fmt("%(c_ino)s", &info), "64");
+        assert_eq!(fmt("%(c_nlink)s", &info), "9");
+        assert_eq!(fmt("%(c_uid)s/%(c_gid)s", &info), "1000/100");
+        assert_eq!(fmt("%(c_mtime)s", &info), "99");
+        assert_eq!(fmt("%(c_filesize)s", &info), "1234");
+        assert_eq!(fmt("%(c_name)s", &info), "a/b.txt");
+        // c_namesize counts the NUL stored after the pathname.
+        assert_eq!(fmt("%(c_namesize)s", &info), "8");
+        // c_mode carries the file type over the permission bits, which is the
+        // one place the full mode word stays reachable.
+        assert_eq!(fmt("%(c_mode)s", &info), "100644");
+        // c_filedata is the contents, not a value a listing reports.
+        assert_eq!(fmt("[%(c_filedata)s]", &info), "[]");
+
+        // The unprefixed spellings rule 7 permits, for the names no other
+        // table claims.
+        assert_eq!(
+            fmt("%(dev)s|%(ino)s|%(nlink)s|%(namesize)s|%(filesize)s", &info),
+            "8|64|9|8|1234"
+        );
+    }
+
+    /// Each cpio flavor reports the `c_magic` it identifies itself with. ODC
+    /// and the old binary format share "070707", which is why the entry
+    /// records the flavor rather than the digits.
+    #[test]
+    fn test_keyword_cpio_magic_per_flavor() {
+        use crate::formats::cpio::CpioFormat;
+        for (format, magic) in [
+            (CpioFormat::Odc, "070707"),
+            (CpioFormat::Newc, "070701"),
+            (CpioFormat::NewcCrc, "070702"),
+            (CpioFormat::Binary, "070707"),
+        ] {
+            let e = cpio_entry("f", format);
+            assert_eq!(fmt("%(c_magic)s", &info(&e)), magic, "{:?}", format);
+            // `magic` is in both tables, so it answers for a cpio header too.
+            assert_eq!(fmt("%(magic)s", &info(&e)), magic, "{:?}", format);
+        }
+    }
+
+    /// `c_dev`, `c_ino` and `c_nlink` have no ustar counterpart, so a tar
+    /// member has no value to report -- which must stay distinct from the name
+    /// being unknown. An unprefixed cpio alias must not claim a name the ustar
+    /// or pax table owns, and a `c_`-prefixed typo must still echo.
+    #[test]
+    fn test_keyword_cpio_fields_absent_for_a_ustar_member() {
+        let e = ArchiveEntry {
+            mode: 0o644,
+            size: 7,
+            ..ustar_entry("f.txt", b'0')
+        };
+        let info = info(&e);
+
+        assert_eq!(fmt("[%(c_dev)s%(c_ino)s%(c_nlink)s]", &info), "[]");
+        // Derivable from what the entry already holds, so these still answer.
+        assert_eq!(fmt("%(c_mode)s", &info), "100644");
+        assert_eq!(fmt("%(c_filesize)s", &info), "7");
+        assert_eq!(fmt("%(c_namesize)s", &info), "6");
+        // `mode` keeps its ustar reading; only `c_mode` carries the type bits.
+        assert_eq!(fmt("%(mode)s", &info), "644");
+        // A typo in either spelling is echoed, not silently empty.
+        assert_eq!(fmt("%(c_bogus)s", &info), "%(c_bogus)s");
+        assert_eq!(fmt("%(filedata)s", &info), "");
+        assert_eq!(fmt("%(bogus)s", &info), "%(bogus)s");
+    }
+
+    /// cpio packs a device number into one c_rdev field, and stores a symbolic
+    /// link's target as the member's data -- so c_filesize counts the target,
+    /// while the pax `size` keyword reports the entry's own zero.
+    #[test]
+    fn test_keyword_cpio_rdev_and_symlink_filesize() {
+        use crate::formats::cpio::CpioFormat;
+        let dev = ArchiveEntry {
+            mode: 0o660,
+            entry_type: EntryType::CharDevice,
+            devmajor: 8,
+            devminor: 0,
+            ..cpio_entry("chr", CpioFormat::Odc)
+        };
+        assert_eq!(fmt("%(c_rdev)s", &info(&dev)), "4000");
+        assert_eq!(fmt("%(devmajor)s,%(devminor)s", &info(&dev)), "8,0");
+        assert_eq!(fmt("%D", &info(&dev)), "8,0");
+
+        // Not a device: the field is zero, as the writer records it.
+        let plain = cpio_entry("f", CpioFormat::Odc);
+        assert_eq!(fmt("%(c_rdev)s", &info(&plain)), "0");
+
+        let link = ArchiveEntry {
+            entry_type: EntryType::Symlink,
+            link_target: Some("target".into()),
+            ..cpio_entry("l", CpioFormat::Odc)
+        };
+        assert_eq!(fmt("%(size)s", &info(&link)), "0");
+        assert_eq!(fmt("%(c_filesize)s", &info(&link)), "6");
+        assert_eq!(fmt("%(linkname)s", &info(&link)), "target");
+        assert_eq!(fmt("%(linkpath)s", &info(&link)), "target");
+
+        // A hard link also carries a target, but cpio stores it as a regular
+        // file with its own contents, so c_filesize is the size.
+        let hard = ArchiveEntry {
+            entry_type: EntryType::Hardlink,
+            link_target: Some("original.txt".into()),
+            size: 42,
+            ..cpio_entry("h", CpioFormat::Odc)
+        };
+        assert_eq!(fmt("%(c_filesize)s", &info(&hard)), "42");
     }
 
     #[test]

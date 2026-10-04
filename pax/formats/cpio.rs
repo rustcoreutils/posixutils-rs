@@ -771,10 +771,16 @@ fn parse_mode_type(mode: u32) -> EntryType {
 /// Device major/minor packed into a single traditional cpio c_rdev field.
 fn packed_rdev(entry: &ArchiveEntry) -> u64 {
     if entry.is_device() {
-        ((entry.devmajor as u64 & 0xff) << 8) | (entry.devminor as u64 & 0xff)
+        pack_rdev(entry.devmajor, entry.devminor)
     } else {
         0
     }
+}
+
+/// The packing itself, for a caller holding the numbers rather than an entry --
+/// `-o listopt=%(c_rdev)s`.
+pub(crate) fn pack_rdev(devmajor: u32, devminor: u32) -> u64 {
+    ((devmajor as u64 & 0xff) << 8) | (devminor as u64 & 0xff)
 }
 
 /// Link count as recorded in a header.
@@ -933,7 +939,14 @@ fn build_bin_header(entry: &ArchiveEntry, ino: u64, namesize: usize) -> PaxResul
 
 /// Build c_mode from entry
 fn build_mode(entry: &ArchiveEntry) -> u32 {
-    let type_bits = match entry.entry_type {
+    cpio_mode(entry.mode, entry.entry_type)
+}
+
+/// The c_mode field's value: the file type bits POSIX's table assigns, over the
+/// permission bits. Split out of `build_mode` for a caller holding the values
+/// rather than an entry -- `-o listopt=%(c_mode)s`.
+pub(crate) fn cpio_mode(mode: u32, entry_type: EntryType) -> u32 {
+    let type_bits = match entry_type {
         EntryType::Regular => C_ISREG,
         EntryType::Directory => C_ISDIR,
         EntryType::Symlink => C_ISLNK,
@@ -943,7 +956,7 @@ fn build_mode(entry: &ArchiveEntry) -> u32 {
         EntryType::Fifo => C_ISFIFO,
         EntryType::Socket => C_ISSOCK,
     };
-    type_bits | (entry.mode & C_PERM_MASK)
+    type_bits | (mode & C_PERM_MASK)
 }
 
 /// Write a stream-framing octal field (c_namesize, c_filesize, c_mtime) for the

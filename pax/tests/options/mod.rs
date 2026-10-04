@@ -1584,3 +1584,131 @@ fn test_option_listopt_name_follows_a_path_rewrite() {
     assert_success(&out, "listopt with -s");
     assert_eq!(stdout_str(&out).trim_end(), "after.txt|after.txt");
 }
+
+/// POSIX listopt rule 7 requires every Field Name entry of the Octet-Oriented
+/// cpio Archive Entry table as a `%(keyword)`, and permits the same names
+/// without the leading `c_`. None of them resolved; all were echoed back.
+#[test]
+fn test_option_listopt_cpio_keywords() {
+    let archive = CpioNewc {
+        name: b"c.txt",
+        body: b"hello\n",
+        ino: 7,
+        nlink: 2,
+        mtime: 99,
+        ..Default::default()
+    }
+    .archive();
+
+    assert_eq!(
+        listopt_bytes(
+            &archive,
+            "%(c_magic)s|%(c_ino)s|%(c_mode)s|%(c_nlink)s|%(c_mtime)s|\
+             %(c_namesize)s|%(c_filesize)s|%(c_name)s|%(c_rdev)s"
+        ),
+        "070701|7|100644|2|99|6|6|c.txt|0"
+    );
+
+    // The unprefixed spellings rule 7 permits report the same values.
+    assert_eq!(
+        listopt_bytes(
+            &archive,
+            "%(ino)s|%(nlink)s|%(namesize)s|%(filesize)s|%(rdev)s"
+        ),
+        "7|2|6|6|0"
+    );
+
+    // A cpio header has no typeflag, version or chksum, so those report
+    // nothing -- while a name in no table still echoes, so a typo is visible.
+    assert_eq!(
+        listopt_bytes(&archive, "[%(typeflag)s%(version)s%(chksum)s]%(c_bogus)s"),
+        "[]%(c_bogus)s"
+    );
+}
+
+/// The same keywords over an archive pax wrote itself, in the ODC format
+/// POSIX defines and `-x cpio` selects.
+#[test]
+fn test_option_listopt_cpio_odc_keywords_round_trip() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("test.cpio");
+
+    fs::create_dir(&src_dir).unwrap();
+    fs::write(src_dir.join("odc.txt"), b"12345").unwrap();
+
+    run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "cpio",
+            "-f",
+            archive.to_str().unwrap(),
+            "odc.txt",
+        ],
+        &src_dir,
+    );
+
+    let out = run_pax(&[
+        "-f",
+        archive.to_str().unwrap(),
+        "-o",
+        "listopt=%(c_magic)s|%(c_mode)s|%(c_nlink)s|%(c_namesize)s|%(c_filesize)s|%(c_name)s",
+    ]);
+    assert_success(&out, "list an ODC archive with the cpio keywords");
+    assert_eq!(
+        stdout_str(&out).trim_end(),
+        "070707|100644|1|8|5|odc.txt",
+        "the POSIX ODC format identifies itself with 070707"
+    );
+
+    // c_ino comes from the file's own inode, so pin its shape rather than a
+    // value: what matters is that the keyword resolves to a number.
+    let ino = listopt(&archive, "%(c_ino)s");
+    assert!(
+        !ino.is_empty() && ino.bytes().all(|b| b.is_ascii_digit()),
+        "%(c_ino)s must report the recorded inode (got {:?})",
+        ino
+    );
+}
+
+/// cpio stores a symbolic link's target as the member's data, so c_filesize
+/// counts the target while the pax `size` keyword reports the entry's own
+/// zero. The two keywords name different fields and must not be aliases.
+#[cfg(unix)]
+#[test]
+fn test_option_listopt_cpio_symlink_filesize() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    let archive = temp.path().join("link.cpio");
+
+    fs::create_dir(&src_dir).unwrap();
+    std::os::unix::fs::symlink("target", src_dir.join("l")).unwrap();
+
+    run_pax_in_dir(
+        &["-w", "-x", "cpio", "-f", archive.to_str().unwrap(), "l"],
+        &src_dir,
+    );
+
+    let out = run_pax(&[
+        "-f",
+        archive.to_str().unwrap(),
+        "-o",
+        "listopt=%(size)s|%(c_filesize)s|%(linkname)s",
+    ]);
+    assert_success(&out, "list a cpio symlink");
+    assert_eq!(stdout_str(&out).trim_end(), "0|6|target");
+
+    // c_mode carries the file type over the permission bits. Only the type is
+    // asserted: a symbolic link's permissions are 0777 on Linux and 0755 on
+    // macOS, and neither is this keyword's business.
+    let octal = |format: &str| {
+        let text = listopt(&archive, format);
+        u32::from_str_radix(&text, 8).unwrap_or_else(|_| panic!("{format} gave {text:?}"))
+    };
+    assert_eq!(
+        octal("%(c_mode)s"),
+        0o120000 | octal("%(mode)s"),
+        "%(c_mode)s must be S_IFLNK over the permission bits %(mode)s reports"
+    );
+}

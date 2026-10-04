@@ -1639,33 +1639,29 @@ impl SourceContext {
         if direction == Direction::Backward {
             count = -count;
         }
-        let header_lines_count = self.header_lines_count.unwrap_or(0);
         let next_line = self.seek_positions.current_line() as isize + count;
         let next_line = if next_line < 0 { 0 } else { next_line as usize };
-        let terminal_size = self.terminal_size.unwrap_or((1 + header_lines_count, 0));
-        let lines_count = if terminal_size.0 == 1 + header_lines_count {
-            terminal_size.0
-        } else {
-            terminal_size.0 - 1 - header_lines_count
-        };
-        self.seek_positions.set_current(if next_line < lines_count {
-            lines_count
-        } else {
-            next_line
-        });
+        self.seek_positions
+            .set_current(next_line.max(self.first_screen_bottom()));
         self.is_ended_file = self.seek_positions.is_ended;
+    }
+
+    /// The display line at the bottom of the first screen: the rows above the
+    /// prompt less the file header, which is shown only when there are
+    /// several files -- and at least one line.
+    fn first_screen_bottom(&self) -> usize {
+        let header = if self.is_many_files {
+            self.header_lines_count.unwrap_or(0)
+        } else {
+            0
+        };
+        let rows = self.terminal_size.map_or(1, |(rows, _)| rows);
+        rows.saturating_sub(1 + header).max(1)
     }
 
     /// Seek to buffer beginning with line count
     pub fn goto_beginning(&mut self, count: Option<usize>) {
-        let terminal_size = self.terminal_size.unwrap_or((1, 0));
-        let header_lines_count = self.header_lines_count.unwrap_or(0);
-        let next_line = if terminal_size.0 <= 1 + header_lines_count {
-            terminal_size.0
-        } else {
-            terminal_size.0 - 1 - header_lines_count
-        };
-        self.seek_positions.set_current(next_line);
+        self.seek_positions.set_current(self.first_screen_bottom());
         if let Some(count) = count {
             self.scroll(count, Direction::Forward);
         }

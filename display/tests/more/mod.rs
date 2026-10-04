@@ -1500,6 +1500,37 @@ fn test_pty_arrow_keys_scroll_and_other_keys_do_nothing() {
     assert_eq!(session.quit(), Some(0));
 }
 
+/// In a four-row terminal the first screen is lines 1-3, and the backward
+/// commands must be able to return to it. A file header three lines long is
+/// shown only when there are several files, but it was subtracted anyway,
+/// which made line 4 the lowest bottom line a screen could have.
+#[test]
+fn test_pty_four_rows_back_to_the_first_screen() {
+    let content: String = (1..=20).map(|n| format!("l{n}\n")).collect();
+    let path = render_fixture("fourrows.txt", content.as_bytes());
+    let Some(mut session) = MoreSession::spawn(&[path.to_str().unwrap()], &[], 4, 20) else {
+        println!("Skipping PTY test: no pseudo-terminal available");
+        return;
+    };
+
+    assert_eq!(session.row(0), "l1");
+    session.keys("j");
+    assert_eq!(session.row(0), "l2");
+    session.keys("k");
+    assert_eq!(session.row(0), "l1", "k returns to the first screen");
+
+    session.keys("f");
+    assert_eq!(session.row(0), "l4");
+    session.keys("b");
+    assert_eq!(session.row(0), "l1", "b returns to the first screen");
+
+    session.keys("f");
+    session.keys("g");
+    assert_eq!(session.row(0), "l1", "g goes to the first screen");
+
+    assert_eq!(session.quit(), Some(0));
+}
+
 #[test]
 fn test_pty_prompt_reports_percentage() {
     // POSIX 107630: the prompt reports "what percentage of the file precedes

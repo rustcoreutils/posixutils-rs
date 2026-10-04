@@ -106,10 +106,50 @@ pub struct ExtendedHeader {
     pub extra: HashMap<String, String>,
 }
 
+/// The extended-header keywords `ExtendedHeader` holds in a typed field, as
+/// opposed to the ones that land in `extra`.
+///
+/// One list: `serialize` needs it twice and `set_keyword` has an arm per name,
+/// and the three had been written out separately, so adding a keyword to one
+/// and not the others was a silent mistake. `test_standard_keywords_are_typed`
+/// pins them together.
+const STANDARD_KEYWORDS: &[&str] = &[
+    "hdrcharset",
+    "atime",
+    "mtime",
+    "ctime",
+    "path",
+    "linkpath",
+    "size",
+    "uid",
+    "gid",
+    "uname",
+    "gname",
+];
+
 impl ExtendedHeader {
     /// Create a new empty extended header
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether this header already carries a value for one of
+    /// [`STANDARD_KEYWORDS`], and so has already written its record.
+    fn holds(&self, keyword: &str) -> bool {
+        match keyword {
+            "hdrcharset" => self.hdrcharset.is_some(),
+            "atime" => self.atime.is_some(),
+            "mtime" => self.mtime.is_some(),
+            "ctime" => self.ctime.is_some(),
+            "path" => self.path.is_some(),
+            "linkpath" => self.linkpath.is_some(),
+            "size" => self.size.is_some(),
+            "uid" => self.uid.is_some(),
+            "gid" => self.gid.is_some(),
+            "uname" => self.uname.is_some(),
+            "gname" => self.gname.is_some(),
+            _ => false,
+        }
     }
 
     /// Parse extended header records from data
@@ -334,21 +374,8 @@ impl ExtendedHeader {
         // an override when the entry carried the field, but a forced value such
         // as `-o gname:=other` / `-o uid:=N` on an entry with no gname/uid must
         // still produce a record.
-        let standard_emitted = [
-            ("hdrcharset", self.hdrcharset.is_some()),
-            ("atime", self.atime.is_some()),
-            ("mtime", self.mtime.is_some()),
-            ("ctime", self.ctime.is_some()),
-            ("path", self.path.is_some()),
-            ("linkpath", self.linkpath.is_some()),
-            ("size", self.size.is_some()),
-            ("uid", self.uid.is_some()),
-            ("gid", self.gid.is_some()),
-            ("uname", self.uname.is_some()),
-            ("gname", self.gname.is_some()),
-        ];
-        for (keyword, already_emitted) in standard_emitted {
-            if already_emitted || options.should_delete_keyword(keyword) {
+        for &keyword in STANDARD_KEYWORDS {
+            if self.holds(keyword) || options.should_delete_keyword(keyword) {
                 continue;
             }
             if let Some(value) = per_file.get(keyword) {
@@ -365,20 +392,7 @@ impl ExtendedHeader {
                 continue;
             }
             // Skip standard keywords that were already handled above
-            let standard_keywords = [
-                "hdrcharset",
-                "atime",
-                "mtime",
-                "ctime",
-                "path",
-                "linkpath",
-                "size",
-                "uid",
-                "gid",
-                "uname",
-                "gname",
-            ];
-            if !standard_keywords.contains(&key.as_str()) && !self.extra.contains_key(key) {
+            if !STANDARD_KEYWORDS.contains(&key.as_str()) && !self.extra.contains_key(key) {
                 write_pax_record(&mut data, key, value);
             }
         }
@@ -1274,6 +1288,35 @@ fn skip_bytes<R: Read>(reader: &mut R, count: u64) -> PaxResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// STANDARD_KEYWORDS, `set_keyword` and `holds` describe the same set of
+    /// typed fields from three directions, and used to be three separately
+    /// written-out lists. A keyword added to one and not the others is silent:
+    /// it would be parsed into `extra`, then serialized twice, or be unable to
+    /// take a `-o keyword:=value` override. This is what keeps them together.
+    #[test]
+    fn test_standard_keywords_are_typed() {
+        for &keyword in STANDARD_KEYWORDS {
+            let mut header = ExtendedHeader::new();
+            // "1" parses as a time, a size, an id and a name alike.
+            header.set_keyword(keyword, "1").unwrap();
+            assert!(
+                header.extra.is_empty(),
+                "{keyword} is in STANDARD_KEYWORDS but set_keyword put it in `extra`"
+            );
+            assert!(
+                header.holds(keyword),
+                "{keyword} is in STANDARD_KEYWORDS but `holds` does not see it"
+            );
+        }
+
+        // And the converse: a keyword outside the list does land in `extra`,
+        // which is what makes `holds` the right test for "already written".
+        let mut header = ExtendedHeader::new();
+        header.set_keyword("charset", "BINARY").unwrap();
+        assert!(!header.holds("charset"));
+        assert_eq!(header.extra.len(), 1);
+    }
 
     #[test]
     fn test_write_pax_record() {

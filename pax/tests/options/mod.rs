@@ -1883,6 +1883,79 @@ fn test_option_listopt_l_conversion_expands_a_symlink() {
     );
 }
 
+/// `-o hdrcharset=` has to be checked and still reach the archive. Validating
+/// it by intercepting the keyword would stop the extended-header record being
+/// written at all, which is the trap this pins.
+#[test]
+fn test_option_hdrcharset_is_checked_and_still_recorded() {
+    let temp = TempDir::new().unwrap();
+    let src_dir = temp.path().join("source");
+    fs::create_dir(&src_dir).unwrap();
+    fs::write(src_dir.join("h.txt"), b"x").unwrap();
+
+    // A name pax cannot encode to is refused before anything is written.
+    let out = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-o",
+            "hdrcharset=ISO-8859-1",
+            "-f",
+            temp.path().join("bad.pax").to_str().unwrap(),
+            "h.txt",
+        ],
+        &src_dir,
+    );
+    assert_failure(&out, "an unsupported hdrcharset must be refused");
+    assert!(
+        stderr_str(&out).contains("BINARY"),
+        "the refusal must name the supported values: {}",
+        stderr_str(&out)
+    );
+
+    // POSIX's spelling contains spaces, which the comma tokenizer must not
+    // mangle, and the record has to end up in the archive.
+    for (given, recorded) in [
+        ("binary", "hdrcharset=BINARY"),
+        (
+            "ISO-IR 10646 2000 UTF-8",
+            "hdrcharset=ISO-IR 10646 2000 UTF-8",
+        ),
+    ] {
+        let archive = temp.path().join("ok.pax");
+        assert_success(
+            &run_pax_in_dir(
+                &[
+                    "-w",
+                    "-x",
+                    "pax",
+                    "-o",
+                    &format!("hdrcharset={given}"),
+                    "-f",
+                    archive.to_str().unwrap(),
+                    "h.txt",
+                ],
+                &src_dir,
+            ),
+            given,
+        );
+
+        let bytes = fs::read(&archive).unwrap();
+        assert!(
+            bytes
+                .windows(recorded.len())
+                .any(|w| w == recorded.as_bytes()),
+            "`-o hdrcharset={given}' must record {recorded:?} in the archive"
+        );
+        assert_eq!(
+            listopt(&archive, "%(hdrcharset)s"),
+            recorded.trim_start_matches("hdrcharset="),
+            "and the listing must report it"
+        );
+    }
+}
+
 /// Every `%(keyword)` POSIX rule 7 requires must resolve to a value.
 ///
 /// A keyword this implementation does not know is echoed back as its own

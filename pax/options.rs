@@ -61,6 +61,38 @@ const INVALID_ACTIONS: &[(&str, bool)] = &[
     ("binary", false),
 ];
 
+/// The `hdrcharset` values POSIX defines, in the spelling it defines them in.
+///
+/// The spec allows more -- "additional names may be agreed between the
+/// originator and the recipient" -- but agreeing on a name is not the same as
+/// being able to encode to it, and pax performs no character-set conversion.
+/// Accepting a third name would write an archive declaring an encoding its
+/// values are not in, so a name outside this table is refused by name.
+///
+/// `charset` is deliberately not checked the same way. POSIX scopes it to the
+/// *file data*, says it "is included in an extended header for information
+/// only" and forbids pax translating the data, so the value is an annotation
+/// pax neither acts on nor needs to understand; refusing an unlisted one would
+/// reject a conforming archive to no end.
+const HDRCHARSET_VALUES: &[&str] = &["ISO-IR 10646 2000 UTF-8", "BINARY"];
+
+/// Check a `-o hdrcharset=` value and return POSIX's spelling of it, so that
+/// an archive records `BINARY` whichever case the operator typed.
+fn canonical_hdrcharset(value: &str) -> PaxResult<&'static str> {
+    HDRCHARSET_VALUES
+        .iter()
+        .copied()
+        .find(|known| known.eq_ignore_ascii_case(value))
+        .ok_or_else(|| {
+            PaxError::InvalidFormat(format!(
+                "hdrcharset={value} is not supported; pax performs no \
+                 character-set conversion, so the header encoding has to be \
+                 {}",
+                HDRCHARSET_VALUES.join(" or ")
+            ))
+        })
+}
+
 /// Parsed format options
 #[derive(Debug, Clone, Default)]
 pub struct FormatOptions {
@@ -196,6 +228,17 @@ impl FormatOptions {
         } else {
             // Boolean keyword with no value
             (opt.trim(), None, false)
+        };
+
+        // Checked here rather than through KNOWN_OPTIONS, because the value
+        // still has to reach the `g`/`x` extended header like any other
+        // keyword: intercepting it below would stop the record being written
+        // at all. An empty value is POSIX's deletion form ("If the <value>
+        // field is zero length, it shall delete any ... previously entered
+        // extended header value"), so it is left alone.
+        let value = match (keyword, value) {
+            ("hdrcharset", Some(v)) if !v.is_empty() => Some(canonical_hdrcharset(v)?),
+            _ => value,
         };
 
         // Look up keyword in known options table
@@ -1319,6 +1362,57 @@ mod tests {
             "/custom/tmp/GlobalHead.%p.%n"
         );
         assert_eq!(default_globexthdr_template(None), "/tmp/GlobalHead.%p.%n");
+    }
+
+    /// `-o hdrcharset=` named the encoding of the path, linkpath, uname and
+    /// gname records, and was accepted unchecked: any string at all went
+    /// straight into the archive. pax has no character-set conversion, so a
+    /// third name would declare an encoding the values are not in.
+    #[test]
+    fn test_parse_hdrcharset_value_is_checked() {
+        // POSIX's two values, in any case, canonicalized to its spelling.
+        for spelling in ["BINARY", "binary", "Binary"] {
+            let opts = FormatOptions::parse(&format!("hdrcharset={spelling}")).unwrap();
+            assert_eq!(
+                opts.global_options().get("hdrcharset").map(String::as_str),
+                Some("BINARY"),
+                "{spelling} must record as POSIX's spelling"
+            );
+        }
+        let utf8 = FormatOptions::parse("hdrcharset=iso-ir 10646 2000 utf-8").unwrap();
+        assert_eq!(
+            utf8.global_options().get("hdrcharset").map(String::as_str),
+            Some("ISO-IR 10646 2000 UTF-8")
+        );
+
+        // A name pax cannot encode to is refused, and the message names the
+        // values it can.
+        let err = FormatOptions::parse("hdrcharset=ISO-8859-1").unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("BINARY") && text.contains("ISO-IR 10646 2000 UTF-8"),
+            "the refusal must name the supported values (got {text:?})"
+        );
+
+        // An empty value is POSIX's form for deleting a previously entered
+        // extended header value, not a charset name.
+        assert!(FormatOptions::parse("hdrcharset=").is_ok());
+
+        // The per-file form is checked the same way.
+        assert!(FormatOptions::parse("hdrcharset:=BINARY").is_ok());
+        assert!(FormatOptions::parse("hdrcharset:=nonesuch").is_err());
+    }
+
+    /// `charset` names the encoding of the file *data*, which POSIX says is
+    /// "included in an extended header for information only" and forbids pax
+    /// translating. Its value is an annotation to carry, not a name to check.
+    #[test]
+    fn test_parse_charset_value_is_carried_unchecked() {
+        let opts = FormatOptions::parse("charset=ISO-IR 8859 1 1998").unwrap();
+        assert_eq!(
+            opts.global_options().get("charset").map(String::as_str),
+            Some("ISO-IR 8859 1 1998")
+        );
     }
 
     #[test]

@@ -665,22 +665,42 @@ fn test_relational_operators_signal_and_everything_else_is_quiet() {
         ("__builtin_isunordered(a, b)", &[FCmpONe, FCmpONe]),
         ("__builtin_isfinite(a)", &[FCmpOLt, FCmpOGt]),
     ];
-    for t in ["float", "double", "long double"] {
+    // Every format with a quiet relational of its own. aarch64's binary128
+    // `long double` has none, and builds `isless` differently: see
+    // `test_quiet_binary128_relational_is_guarded_by_an_unordered_test`.
+    let x86 = Target::new(Arch::X86_64, Os::Linux);
+    let a64 = Target::new(Arch::Aarch64, Os::Linux);
+    let formats = [
+        (&x86, "float"),
+        (&x86, "double"),
+        (&x86, "long double"),
+        (&a64, "float"),
+        (&a64, "double"),
+    ];
+    for (target, t) in formats {
         for (expr, want) in cases {
             let src = format!("int f({t} a, {t} b) {{ return {expr}; }}");
-            let module = linearize_source(&src, &Target::host());
-            assert_eq!(float_cmps(&module, "f"), *want, "{t}: {expr}");
+            let module = linearize_source(&src, target);
+            assert_eq!(
+                float_cmps(&module, "f"),
+                *want,
+                "{:?} {t}: {expr}",
+                target.arch
+            );
         }
     }
     let src = "int f(double a) { return __builtin_fpclassify(0, 1, 2, 3, 4, a); }";
-    let module = linearize_source(src, &Target::host());
-    let cmps = float_cmps(&module, "f");
-    assert!(!cmps.is_empty());
-    assert!(
-        cmps.iter()
-            .all(|op| op.float_cmp().unwrap().nan() == NanCompare::Quiet),
-        "{cmps:?}"
-    );
+    for target in [&x86, &a64] {
+        let module = linearize_source(src, target);
+        let cmps = float_cmps(&module, "f");
+        assert!(!cmps.is_empty());
+        assert!(
+            cmps.iter()
+                .all(|op| op.float_cmp().unwrap().nan() == NanCompare::Quiet),
+            "{:?}: {cmps:?}",
+            target.arch
+        );
+    }
 }
 
 /// binary128 has no quiet relational of its own -- libgcc's ordering helpers

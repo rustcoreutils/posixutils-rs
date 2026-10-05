@@ -170,6 +170,19 @@ block afterward.
 
 ---
 
+### SSE2 sequences for the operations SSE4.1 made one instruction
+
+`arch::simd::native` lowers a vector operation natively only when one
+instruction does it, so at the x86-64 baseline (SSE2) a 32-bit lane multiply
+and an unsigned 16- or 32-bit lane comparison run lane by lane in scalar
+registers: `v4si * v4si` is four `imull`s. gcc builds both from SSE2 alone --
+the multiply from two `pmuludq`s and shuffles, the unsigned comparison by
+flipping each lane's sign bit and using `pcmpgt`. Done is those sequences
+emitted when SSE4.1 is not enabled, on the native path rather than the lane
+loop.
+
+---
+
 ## Assembly Peephole Optimizations
 
 Both patterns appear in bulk in `-O2` output on both targets:

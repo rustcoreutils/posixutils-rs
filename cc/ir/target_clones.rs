@@ -23,7 +23,7 @@
 use super::linearize::{FnVersion, Linearizer};
 use super::{BasicBlock, BasicBlockId, Function, Instruction, Opcode, Pseudo, PseudoId};
 use crate::abi::CallingConv;
-use crate::parse::ast::{AliasAttr, AliasForm, FunctionDef, SymbolAttrs};
+use crate::parse::ast::{AliasAttr, AliasForm, FunctionAttrs, FunctionDef, SymbolAttrs};
 use crate::target_attr::TargetClones;
 use crate::types::{TypeId, TypeTable};
 use std::collections::HashMap;
@@ -36,11 +36,80 @@ struct Choice {
     mask: u32,
 }
 
+/// The share of a `target_clones` function's emission attributes one version
+/// carries. See [`Division`].
+#[derive(Clone, Default)]
+pub(crate) struct VersionAttrs {
+    pub(crate) symbol: SymbolAttrs,
+    pub(crate) constructor: Option<Option<u16>>,
+    pub(crate) destructor: Option<Option<u16>>,
+}
+
+/// How a `target_clones` function's attributes divide among the symbols that
+/// stand for it -- the one place that decides it, as gcc 13 does:
+///
+/// | attribute                  | goes to                                  |
+/// |----------------------------|------------------------------------------|
+/// | `constructor`/`destructor` | `name.default`, with any priority: gcc   |
+/// |                            | registers the default version, not `name`|
+/// | `section`                  | every version                            |
+/// | `used`                     | every version and the resolver           |
+/// | `visibility`               | `name`                                   |
+/// | `weak`                     | nothing: `name` stays global, as in gcc  |
+/// | `alias`/`ifunc`            | nothing: `name` is the resolver's ifunc  |
+///
+/// What describes the body rather than a symbol -- `aligned`, `noinline`,
+/// `always_inline`, `pure`/`const`, `noreturn` -- every compilation of the
+/// body reads off the definition itself, so every version has it.
+///
+/// Two departures from gcc 13, which drops these on the floor: `section`
+/// also reaches `name.default` (gcc puts only the other versions there), and
+/// `visibility` reaches `name` (gcc exports a `hidden` function).
+struct Division {
+    default: VersionAttrs,
+    others: VersionAttrs,
+    resolver_used: bool,
+    name: SymbolAttrs,
+}
+
+impl Division {
+    fn of(attrs: &FunctionAttrs) -> Division {
+        let version = SymbolAttrs {
+            section: attrs.symbol.section.clone(),
+            used: attrs.symbol.used,
+            ..Default::default()
+        };
+        Division {
+            default: VersionAttrs {
+                symbol: version.clone(),
+                constructor: attrs.constructor,
+                destructor: attrs.destructor,
+            },
+            others: VersionAttrs {
+                symbol: version,
+                ..Default::default()
+            },
+            resolver_used: attrs.symbol.used,
+            name: SymbolAttrs {
+                visibility: attrs.symbol.visibility.clone(),
+                ..Default::default()
+            },
+        }
+    }
+}
+
 impl Linearizer<'_> {
     /// Linearize a `target_clones` function: each version of the body, the
     /// resolver, and the indirect function that names them.
     pub(crate) fn linearize_target_clones(&mut self, func: &FunctionDef, clones: &TargetClones) {
+        // Every version lowers the same source, so a diagnostic about it is
+        // given once, not once per version.
+        crate::diag::each_once(|| self.linearize_clones(func, clones));
+    }
+
+    fn linearize_clones(&mut self, func: &FunctionDef, clones: &TargetClones) {
         let name = self.emitted_name(func.name);
+        let division = Division::of(&func.attrs);
         let unit = self.function_isa(None);
         self.clone_statics = Some(HashMap::new());
         let default = format!("{name}.default");
@@ -49,6 +118,7 @@ impl Linearizer<'_> {
             Some(FnVersion {
                 name: default.clone(),
                 isa: unit,
+                attrs: division.default,
             }),
         );
         let mut choices = Vec::with_capacity(clones.versions.len());
@@ -59,6 +129,7 @@ impl Linearizer<'_> {
                 Some(FnVersion {
                     name: symbol.clone(),
                     isa: self.function_isa(Some(&version.request)),
+                    attrs: division.others.clone(),
                 }),
             );
             let (object, offset, mask) = crate::parse::cpu_feature_location(version.feature)
@@ -75,6 +146,7 @@ impl Linearizer<'_> {
         let mut resolver =
             build_resolver(&resolver_name, &default, &choices, self.types, self.target);
         resolver.is_static = func.is_static;
+        resolver.symbol_attrs.used = division.resolver_used;
         if !func.is_static {
             // gcc's: one resolver per program, however many units define the
             // function, in a group of its own.
@@ -101,8 +173,7 @@ impl Linearizer<'_> {
                 target: resolver_name,
                 form: AliasForm::Ifunc,
             }),
-            visibility: func.attrs.symbol.visibility.clone(),
-            ..Default::default()
+            ..division.name
         };
         self.declare_alias(&name, &attrs, func.is_static, typ, func.pos);
     }

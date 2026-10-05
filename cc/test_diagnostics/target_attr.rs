@@ -154,3 +154,25 @@ fn diagnostics_target_clones_on_mach_o_is_the_default_body() {
     let asm = c.asm.unwrap();
     assert!(asm.contains("_f:") && !asm.contains("resolver"), "{asm}");
 }
+
+/// A `target_clones` body is lowered once per version, but a diagnostic about
+/// its source is the source's, and is reported once.
+#[test]
+fn target_clones_body_diagnostics_are_reported_once() {
+    let src = "__attribute__((target_clones(\"sse4.2\", \"ssse3\", \"default\")))\n\
+               int h(int a) { if (a) goto nowhere; return a; }\n";
+    let c = crate::test_compile::compile(
+        "target_clones_diag_once",
+        src,
+        &["--target=x86_64-unknown-linux-gnu"],
+    );
+    assert!(!c.success);
+    assert_eq!(
+        c.stderr
+            .matches("label 'nowhere' used but not defined")
+            .count(),
+        1,
+        "{}",
+        c.stderr
+    );
+}

@@ -854,10 +854,12 @@ pub struct Linearizer<'a> {
 }
 
 /// One compilation of a function definition other than its own: a
-/// `target_clones` version, under its own name and ISA.
+/// `target_clones` version, under its own name and ISA, with the share of the
+/// function's attributes `target_clones::Division` gives it.
 pub(crate) struct FnVersion {
     pub(crate) name: String,
     pub(crate) isa: crate::target::X86Isa,
+    pub(crate) attrs: super::target_clones::VersionAttrs,
 }
 
 impl<'a> Linearizer<'a> {
@@ -2006,15 +2008,19 @@ impl<'a> Linearizer<'a> {
         ir_func.emit = !is_inline_definition;
         ir_func.is_noreturn = is_noreturn;
         ir_func.is_inline = is_inline;
-        ir_func.symbol_attrs = func.attrs.symbol.clone();
-        if version.is_some() {
-            // A version is a local copy of the body: the symbol's linkage
-            // attributes belong to the function's name, which the resolver
-            // binds. Only where the code goes carries over.
-            ir_func.symbol_attrs = crate::parse::ast::SymbolAttrs {
-                section: func.attrs.symbol.section.clone(),
-                ..Default::default()
-            };
+        // How the symbol is emitted: by the definition's own attributes, or
+        // by a version's share of them.
+        match &version {
+            Some(v) => {
+                ir_func.symbol_attrs = v.attrs.symbol.clone();
+                ir_func.constructor = v.attrs.constructor;
+                ir_func.destructor = v.attrs.destructor;
+            }
+            None => {
+                ir_func.symbol_attrs = func.attrs.symbol.clone();
+                ir_func.constructor = func.attrs.constructor;
+                ir_func.destructor = func.attrs.destructor;
+            }
         }
         // `alias` or `ifunc` on a definition -- written on it, or on an
         // earlier prototype -- asks for two things one symbol cannot be.
@@ -2030,10 +2036,6 @@ impl<'a> Linearizer<'a> {
         ir_func.is_noinline = func.attrs.noinline;
         ir_func.declared_effect = func.attrs.effect;
         ir_func.is_always_inline = func.attrs.always_inline;
-        if version.is_none() {
-            ir_func.constructor = func.attrs.constructor;
-            ir_func.destructor = func.attrs.destructor;
-        }
 
         let ret_kind = self.types.kind(func.return_type);
         // A vector is returned as its carrier, which is what the function

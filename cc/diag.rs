@@ -312,6 +312,42 @@ thread_local! {
 
     /// Where diagnostics go when not to stderr; see [`capture_diagnostics`].
     static CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+
+    /// The diagnostics given so far inside [`each_once`], which gives no
+    /// diagnostic twice; `None` outside it.
+    static GIVEN: RefCell<Option<std::collections::HashSet<DiagKey>>> =
+        const { RefCell::new(None) };
+}
+
+/// What makes two diagnostics the same one: severity, place and text.
+type DiagKey = (bool, u16, u32, u16, String);
+
+/// Run `f`, giving each distinct diagnostic it reports once, however many
+/// times it is reported: for work that lowers one piece of source several
+/// times, such as the versions of a `target_clones` body. A repeat is neither
+/// printed nor counted; the first report already counted it.
+pub fn each_once<R>(f: impl FnOnce() -> R) -> R {
+    let outer = GIVEN.replace(Some(std::collections::HashSet::new()));
+    let result = f();
+    GIVEN.set(outer);
+    result
+}
+
+/// Whether this diagnostic was given before inside [`each_once`]; the first
+/// time, it is recorded.
+fn given_before(level: DiagLevel, pos: Position, msg: &str) -> bool {
+    GIVEN.with_borrow_mut(|given| {
+        given.as_mut().is_some_and(|given| {
+            let key = (
+                level == DiagLevel::Error,
+                pos.stream,
+                pos.line,
+                pos.col,
+                msg.to_string(),
+            );
+            !given.insert(key)
+        })
+    })
 }
 
 /// Suppress warning output for the rest of this thread's compilation (`-w`).
@@ -571,6 +607,9 @@ fn prettify_path(path: &str) -> String {
 }
 
 fn do_diag(level: DiagLevel, pos: Position, msg: &str) {
+    if given_before(level, pos, msg) {
+        return;
+    }
     // Track errors/warnings
     match level {
         DiagLevel::Error => {
@@ -668,6 +707,30 @@ pub fn error_plural(pos: Position, singular: &str, plural: &str, n: usize, args:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Inside `each_once` a repeated diagnostic is neither printed nor
+    /// counted, a different one still is, and outside it repeats are given
+    /// again.
+    #[test]
+    fn each_once_gives_a_diagnostic_once() {
+        clear_streams();
+        let stream = init_stream("once.c");
+        let (a, b) = (Position::new(stream, 3, 7), Position::new(stream, 4, 1));
+        reset_counts();
+        capture_diagnostics();
+        each_once(|| {
+            for _ in 0..3 {
+                error(a, "bad goto");
+                warning(b, "odd");
+            }
+            error(b, "bad goto");
+        });
+        error(a, "bad goto");
+        let lines = take_captured_diagnostics();
+        assert_eq!(error_count(), 3, "{lines:?}");
+        assert_eq!(warning_count(), 1, "{lines:?}");
+        assert_eq!(lines.len(), 4, "{lines:?}");
+    }
 
     #[test]
     fn test_position_display() {

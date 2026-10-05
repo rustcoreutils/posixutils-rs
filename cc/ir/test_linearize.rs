@@ -1713,3 +1713,39 @@ fn test_target_clones_become_versions_and_a_resolver() {
         .collect();
     assert_eq!(statics.len(), 1, "one static shared by both versions");
 }
+
+/// A `target_clones` function's attributes divide among its symbols as gcc
+/// divides them: `constructor` and `destructor`, priority and all, register
+/// the default version; `section` and `used` reach every version and `used`
+/// the resolver; `visibility` stays with the name; `weak` goes nowhere.
+#[test]
+fn test_target_clones_divide_attributes_as_gcc() {
+    let src = "__attribute__((target_clones(\"sse4.2\", \"default\"), constructor(101), \
+               destructor, used, weak, section(\".text.hot\"), visibility(\"hidden\")))\n\
+               void init(void) { }\n";
+    let module = linearize_source(src, &x86_64_linux());
+    let func = |name: &str| {
+        module
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("no {name}"))
+    };
+    let default = func("init.default");
+    assert_eq!(default.constructor, Some(Some(101)));
+    assert_eq!(default.destructor, Some(None));
+    let other = func("init.sse4_2");
+    assert_eq!((other.constructor, other.destructor), (None, None));
+    for version in [default, other] {
+        assert!(version.symbol_attrs.used, "{}", version.name);
+        assert!(!version.symbol_attrs.weak, "{}", version.name);
+        assert_eq!(version.symbol_attrs.section.as_deref(), Some(".text.hot"));
+        assert_eq!(version.symbol_attrs.visibility, None, "{}", version.name);
+    }
+    let resolver = func("init.resolver");
+    assert!(resolver.symbol_attrs.used);
+    assert_eq!((resolver.constructor, resolver.destructor), (None, None));
+    let alias = module.aliases.iter().find(|a| a.name == "init").unwrap();
+    assert_eq!(alias.visibility.as_deref(), Some("hidden"));
+    assert!(!alias.weak);
+}

@@ -183,3 +183,26 @@ int main(void)
         );
     }
 }
+
+/// `constructor` and `destructor` on a `target_clones` function register the
+/// function (through its resolver) in .init_array / .fini_array, as gcc does:
+/// the constructor sets `ran` before main, and the destructor ends the
+/// process with status 0 after main returns 7. Both were silently dropped.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn codegen_target_clones_keep_constructor_and_destructor() {
+    let src = r#"
+#include <stdlib.h>
+static int ran;
+__attribute__((target_clones("sse4.2","default"), constructor)) void init(void) { ran = 1; }
+__attribute__((target_clones("sse4.2","default"), destructor)) void fini(void) { if (!ran) abort(); _Exit(0); }
+int main(void) { return ran ? 7 : 1; }
+"#;
+    for level in ["-O0", "-O2"] {
+        assert_eq!(
+            crate::common::compile_and_run("target_clones_ctor", src, &[level.to_string()]),
+            0,
+            "{level}"
+        );
+    }
+}

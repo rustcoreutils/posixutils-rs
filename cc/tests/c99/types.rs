@@ -17,12 +17,33 @@ use crate::common::{compile_and_run, compile_and_run_everywhere, compile_and_run
 // Mega-test: C99 types (long long, _Bool)
 // ============================================================================
 
+/// C99 types mega test: long long, _Bool, bit-fields and their layout, enums,
+/// `mode`, `packed`, `vector_size` and declarations that
+/// must be accepted.
+///
+/// Consolidates these single-program tests, one C section each; every
+/// original doc comment is the comment above its section:
+/// - `c99_types_mega` (exit codes 1..86)
+/// - `c99_signed_bitfields_sign_extend_at_every_declared_width` (exit codes 87..106)
+/// - `c99_bitfields_allocate_at_the_next_free_bit` (exit codes 107..135)
+/// - `c99_enum_bitfields_and_enum_signedness` (exit codes 136..149)
+/// - `c99_packed_bitfields_pack_to_the_bit` (exit codes 150..173)
+/// - `c99_mode_attribute_selects_the_type` (exit codes 174..194)
+/// - `c99_mode_attribute_applies_only_to_its_own_declarator` (exit codes 195..207)
+/// - `c99_wide_bitfields_read_only_their_own_bits` (exit codes 208..218)
+/// - `c99_null_constant_assigns_to_a_function_pointer` (exit codes 219..224)
+/// - `c99_block_scope_typedef_of_an_incomplete_type` (exit codes 225..225)
+/// - `c99_qualified_tentative_definition_is_completed_by_its_tag` (exit codes 226..229)
+/// - `c99_mode_attribute_binds_to_its_own_declarator` (exit codes 230..233)
+/// - `c99_vector_size_has_a_vector_s_storage` (exit codes 234..236)
 #[test]
 fn c99_types_mega() {
     let code = r#"
+// ==== Section 1: t_c99_types_mega (was #[test] c99_types_mega) ====
+// Exit codes 1..86 (local code + 0).
 #include <stdbool.h>
 
-int main(void) {
+static int t_c99_types_mega(void) {
     // ========== LONG LONG SECTION (returns 1-49) ==========
     {
         long long a, b;
@@ -210,29 +231,26 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_types_mega", code, &[]), 0);
-}
 
-/// A signed bitfield sign-extends on read whatever its declared type.
-///
-/// The extension shifted left and arithmetic-right by
-/// `storage_unit_bits - width`, but the machine operation is performed at the
-/// promoted width. For a field backed by a one-byte unit that shifted bit 2 up
-/// to bit 7 of a 32-bit register, where it is not the sign bit, so the
-/// arithmetic shift saw a positive value and extended nothing:
-///
-/// ```text
-///     andl $7, %eax     ; masked, = 4
-///     shll $5, %ecx     ; 4 << 5 = 128
-///     sarl $5, %eax     ; still 128 >> 5 = 4, never -4
-/// ```
-///
-/// `int a:4` was correct precisely because its storage unit is 32 bits, which
-/// happens to equal the operation width.
-#[test]
-fn c99_signed_bitfields_sign_extend_at_every_declared_width() {
-    let src = r#"
+// ==== Section 2: t_c99_signed_bitfields_sign_extend_at_every_declared_width (was #[test] c99_signed_bitfields_sign_extend_at_every_declared_width) ====
+// Exit codes 87..106 (local code + 86).
+//
+// A signed bitfield sign-extends on read whatever its declared type.
+//
+// The extension shifted left and arithmetic-right by
+// `storage_unit_bits - width`, but the machine operation is performed at the
+// promoted width. For a field backed by a one-byte unit that shifted bit 2 up
+// to bit 7 of a 32-bit register, where it is not the sign bit, so the
+// arithmetic shift saw a positive value and extended nothing:
+//
+// ```text
+//     andl $7, %eax     ; masked, = 4
+//     shll $5, %ecx     ; 4 << 5 = 128
+//     sarl $5, %eax     ; still 128 >> 5 = 4, never -4
+// ```
+//
+// `int a:4` was correct precisely because its storage unit is 32 bits, which
+// happens to equal the operation width.
 struct S {
     signed char  sc : 3;
     short        sh : 5;
@@ -247,8 +265,7 @@ struct U {
     unsigned int   ui : 4;
 };
 
-int main(void)
-{
+static int t_c99_signed_bitfields_sign_extend_at_every_declared_width(void) {
     struct S s = {0};
 
     /* Most negative and most positive at each width. */
@@ -285,110 +302,23 @@ int main(void)
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("bitfield_sign_extend", src, &[]), 0);
-}
 
-/// A `_Bool` bitfield holds 0 or 1, and reads back as 0 or 1.
-///
-/// C17 6.2.5p6 lists `_Bool` among the standard *unsigned* integer types, and
-/// 6.3.1.2 makes every conversion into it yield exactly 0 or 1. Two separate
-/// defects broke that, in opposite directions, so a test of only one value
-/// would have missed one of them:
-///
-/// ```text
-///   struct S { _Bool f:1; };
-///   struct S a = {1};   read back -1   -- the load sign-extended
-///   struct S b = {2};   read back  0   -- the initializer truncated 2 to
-///                                        one bit without normalizing first
-///   a.f == 1            was false
-/// ```
-///
-/// The load was extended because `_Bool` carries no `unsigned` modifier and the
-/// signedness predicate read that bit; for a one-bit field the extension is
-/// `shl 31; sar 31`, which turns 1 into -1. The initializer converted to the
-/// field's unsigned *storage* type instead of to `_Bool`, so it never reached
-/// the normalization every other conversion into `_Bool` gets.
-#[test]
-fn c99_bool_bitfields_hold_zero_or_one() {
-    let src = r#"
-struct S { _Bool f : 1; };
-struct M { _Bool a : 1; unsigned b : 1; int c : 3; _Bool d : 1; };
-
-__attribute__((noinline)) static int as_int(_Bool v) { return (int)v; }
-
-int main(void)
-{
-    /* Assignment: any non-zero stores as 1 (returns 1-9). */
-    struct S s = {0};
-    s.f = 1;    if ((int)s.f != 1) return 1;
-    s.f = 2;    if ((int)s.f != 1) return 2;
-    s.f = -1;   if ((int)s.f != 1) return 3;
-    s.f = 0;    if ((int)s.f != 0) return 4;
-    s.f = 3;    if ((int)s.f != 1) return 5;
-
-    /* Brace initializers -- the second, independent defect (returns 10-19). */
-    { struct S v = {0};  if ((int)v.f != 0) return 10; }
-    { struct S v = {1};  if ((int)v.f != 1) return 11; }
-    { struct S v = {2};  if ((int)v.f != 1) return 12; }
-    { struct S v = {3};  if ((int)v.f != 1) return 13; }
-    { struct S v = {-1}; if ((int)v.f != 1) return 14; }
-    { struct S v = {.f = 2}; if ((int)v.f != 1) return 15; }
-
-    /* The value must be usable as a value, not merely print as one (20-29). */
-    s.f = 1;
-    if (s.f != 1) return 20;
-    if (!(s.f == 1)) return 21;
-    if (s.f + 0 != 1) return 22;
-    if (s.f * 2 != 2) return 23;
-    if (s.f < 0) return 24;
-    if (!s.f) return 25;
-    if (as_int(s.f) != 1) return 26;
-
-    /* Compound assignment, increment, and struct copy all read the same
-       load, so each would have shown -1 too (returns 30-39). */
-    s.f = 0; s.f |= 1;      if ((int)s.f != 1) return 30;
-    s.f = 0; s.f++;         if ((int)s.f != 1) return 31;
-    s.f = 1; s.f ^= 0;      if ((int)s.f != 1) return 32;
-    { struct S c = s;       if ((int)c.f != 1) return 33; }
-
-    /* Neighbours keep their own signedness -- the control that stops this
-       passing by never extending anything (returns 40-49). */
-    struct M m = {0};
-    m.a = 1; m.b = 1; m.c = -4; m.d = 1;
-    if ((int)m.a != 1) return 40;
-    if ((int)m.b != 1) return 41;
-    if (m.c != -4) return 42;      /* a signed 3-bit field still extends */
-    if ((int)m.d != 1) return 43;
-    m.c = 3;
-    if (m.c != 3) return 44;
-
-    /* Two _Bool fields in one unit add up, rather than cancelling at -1. */
-    m.a = 1; m.d = 1;
-    if (m.a + m.d != 2) return 45;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("bool_bitfield", src, &[]), 0);
-    assert_eq!(compile_and_run_optimized("bool_bitfield_opt", src), 0);
-}
-
-/// Bitfield allocation is a running bit offset from the start of the struct.
-///
-/// c17 used to track a byte offset plus one open storage unit, and to close
-/// that unit whenever the declared type changed or a plain member intervened.
-/// Both are wrong: the System V ABI allocates a bitfield at the next free
-/// *bit*, and its storage unit is a window that advances to the next
-/// `sizeof(T) * 8` boundary only when the field would otherwise straddle one.
-/// The declared type sets the window's size and the struct's alignment, never
-/// a fresh allocation.
-///
-/// Every size here is gcc's. The old model gave 12 for `D`, 8 for `C`.
-/// This is ABI-visible, so the sizes matter as much as the values do.
-#[test]
-fn c99_bitfields_allocate_at_the_next_free_bit() {
-    let src = r#"
+// ==== Section 3: t_c99_bitfields_allocate_at_the_next_free_bit (was #[test] c99_bitfields_allocate_at_the_next_free_bit) ====
+// Exit codes 107..135 (local code + 106).
+//
+// Bitfield allocation is a running bit offset from the start of the struct.
+//
+// c17 used to track a byte offset plus one open storage unit, and to close
+// that unit whenever the declared type changed or a plain member intervened.
+// Both are wrong: the System V ABI allocates a bitfield at the next free
+// *bit*, and its storage unit is a window that advances to the next
+// `sizeof(T) * 8` boundary only when the field would otherwise straddle one.
+// The declared type sets the window's size and the struct's alignment, never
+// a fresh allocation.
+//
+// Every size here is gcc's. The old model gave 12 for `D`, 8 for `C`.
+// This is ABI-visible, so the sizes matter as much as the values do.
+// Renamed for the merge: U -> s2_U
 #include <stddef.h>
 
 /* A bitfield reuses the padding after a plain member. */
@@ -413,7 +343,7 @@ struct F { char pad[5]; unsigned a:1; };
 struct W { unsigned a:12; unsigned b:12; char y; };
 
 /* A union member is a bitfield too, however trivial its offset. */
-union U { int a:4; unsigned b; };
+union s2_U { int a:4; unsigned b; };
 
 /* Static initialization has to write the same bits the stores do. */
 static struct D sd = { 'p', 1, 'q' };
@@ -421,8 +351,7 @@ static struct C sc = { -8, 15, -4 };
 static struct W sw = { 0xabc, 0xdef, 7 };
 static struct D sdesig = { .y = 'q', .a = 1, .x = 'p' };
 
-int main(void)
-{
+static int t_c99_bitfields_allocate_at_the_next_free_bit(void) {
     if (sizeof(struct D) != 4) return 1;
     if (sizeof(struct C) != 4) return 2;
     if (sizeof(struct X) != 8) return 3;
@@ -474,7 +403,7 @@ int main(void)
     if (w.a != 1u || w.b != 0xdefu || w.y != 7) return 23;
 
     /* Reading a union's bitfield must see only its own bits. */
-    union U u;
+    union s2_U u;
     u.b = 15;
     if (u.a != -1) return 24;
 
@@ -491,26 +420,787 @@ int main(void)
 
     return 0;
 }
+
+// ==== Section 4: t_c99_enum_bitfields_and_enum_signedness (was #[test] c99_enum_bitfields_and_enum_signedness) ====
+// Exit codes 136..149 (local code + 135).
+//
+// An `enum` may be a bit-field's type, and a non-negative enumeration is
+// unsigned (#C104, #C105).
+//
+// `validate_bitfield` matched a hand-written list of `TypeKind`s that omitted
+// `Enum`, so `struct S { enum E e : 2; };` -- which real headers use heavily --
+// was rejected outright with "bitfield must have integer type". 6.7.2.1p5
+// allows "some other implementation-defined type" and gcc's set is every
+// integer type; `is_integer` already is that set.
+//
+// Accepting it exposed the second half. A bit-field's signedness follows its
+// declared type's, and `enum_underlying_type` preferred `int` for any list
+// fitting in `int` -- so a two-bit field of `enum { A, B, C, D }` holding `D`
+// read back **-1** where gcc gives 3. gcc's rule, which 6.7.2.2p4 leaves it
+// free to choose, is unsigned whenever no enumerator is negative; that is
+// observable well beyond bit-fields, since `(enum E)-1 > 0` is true there and
+// was false here.
+// Renamed for the merge: C -> s3_C, D -> s3_D
+enum Small { S0, S1, S2, S3 };
+enum Neg   { N_A = -2, N_B = 1 };
+enum Big   { B_HUGE = 0x100000000LL };
+enum Wide  { W_TOP = 0x80000000u };
+
+struct A { enum Small e : 2; };
+struct B { enum Neg   e : 3; };
+struct s3_C { enum Small e : 2; unsigned u : 3; };
+struct s3_D { enum Small e : 2; enum Neg n : 3; };
+
+static int t_c99_enum_bitfields_and_enum_signedness(void) {
+    /* An enumeration with no negative member is unsigned, as in gcc. */
+    if (!((enum Small)-1 > 0)) return 1;
+    if (!((enum Wide)-1 > 0))  return 2;
+    if (!((enum Big)-1 > 0))   return 3;
+    /* One with a negative member is signed. */
+    if ((enum Neg)-1 > 0)      return 4;
+
+    /* ...and the sizes are unchanged by the signedness choice. */
+    if (sizeof(enum Small) != 4) return 5;
+    if (sizeof(enum Neg)   != 4) return 6;
+    if (sizeof(enum Big)   != 8) return 7;
+
+    /* A bit-field of an unsigned enumeration does not sign-extend. */
+    struct A a; a.e = S3;
+    if ((int)a.e != 3) return 8;
+    a.e = S0; if ((int)a.e != 0) return 9;
+
+    /* A bit-field of a signed one does. */
+    struct B b; b.e = N_A;
+    if ((int)b.e != -2) return 10;
+    b.e = N_B; if ((int)b.e != 1) return 11;
+
+    /* Neighbours are undisturbed either way. */
+    struct s3_C c; c.e = S2; c.u = 5;
+    if ((int)c.e != 2 || c.u != 5) return 12;
+    if (sizeof(struct s3_C) != 4) return 13;
+
+    struct s3_D d; d.e = S1; d.n = N_A;
+    if ((int)d.e != 1 || (int)d.n != -2) return 14;
+
+    return 0;
+}
+
+// ==== Section 5: t_c99_packed_bitfields_pack_to_the_bit (was #[test] c99_packed_bitfields_pack_to_the_bit) ====
+// Exit codes 150..173 (local code + 149).
+//
+// `__attribute__((packed))` packs a bit-field to the bit (#C110).
+//
+// c17 refused to: the straddle test in `compute_struct_layout` ran whatever
+// the pack cap, because the access path addressed one power-of-two unit and
+// could not span an arbitrary byte range. `struct __attribute__((packed)) {
+// unsigned a:20, b:20; }` was 8 bytes where gcc gives 5 -- a silent ABI
+// mismatch with any gcc-compiled object.
+//
+// Under a cap the unit rule is switched off entirely, not narrowed to the cap:
+// `#pragma pack(2)` lets a 16-bit field starting at bit 1 straddle both the
+// 2- and the 4-byte boundary, which is the measurement that rules out the
+// narrowing reading. A span that is not 1, 2, 4 or 8 bytes is then assembled
+// byte by byte, as gcc does on both targets -- necessary, not merely
+// equivalent, since a packed struct can be smaller than any window covering
+// the field: `{ unsigned c:1; unsigned long long a:64; }` is nine bytes and
+// the field needs all nine.
+// Renamed for the merge: A -> s4_A, B -> s4_B, C -> s4_C, D -> s4_D, F -> s4_F
+struct __attribute__((packed)) s4_A { unsigned a:20, b:20; };
+struct __attribute__((packed)) s4_B { unsigned a:3, b:30, c:3; };
+struct __attribute__((packed)) s4_C { char pre; unsigned a:20; char post; };
+struct __attribute__((packed)) s4_D { unsigned c:1; unsigned long long a:64; };
+struct __attribute__((packed)) E { unsigned a:1; unsigned b:32; };
+struct __attribute__((packed)) s4_F { unsigned long long a:60; unsigned b:20; };
+struct __attribute__((packed)) G { signed a:20; signed b:20; };
+union  __attribute__((packed)) K { unsigned a:20; char c; };
+struct I { unsigned a:20, b:20; };   /* unpacked control */
+
+static struct s4_A init_a = { 0xABCDE, 0x12345 };
+static struct s4_C init_c = { 0x11, 0xFEDCB, 0x22 };
+static struct s4_D init_d = { 1, 0x0123456789ABCDEFULL };
+
+static int t_c99_packed_bitfields_pack_to_the_bit(void) {
+    /* Sizes, all of them gcc's. */
+    if (sizeof(struct s4_A) != 5)  return 1;
+    if (sizeof(struct s4_B) != 5)  return 2;
+    if (sizeof(struct s4_C) != 5)  return 3;
+    if (sizeof(struct s4_D) != 9)  return 4;
+    if (sizeof(struct E) != 5)  return 5;
+    if (sizeof(struct s4_F) != 10) return 6;
+    if (sizeof(union  K) != 3)  return 7;
+    /* The unpacked layout is untouched. */
+    if (sizeof(struct I) != 8)  return 8;
+
+    /* Values round-trip through a span that is not a storage unit. */
+    struct s4_A a; a.a = 0xABCDE; a.b = 0x12345;
+    if (a.a != 0xABCDEu || a.b != 0x12345u) return 9;
+
+    struct s4_B b; b.a = 5; b.b = 0x2AAAAAAA; b.c = 3;
+    if (b.a != 5u || b.b != 0x2AAAAAAAu || b.c != 3u) return 10;
+
+    /* Ordinary members either side must survive every write: a store is a
+       read-modify-write over the bytes the field shares with them. */
+    struct s4_C c; c.pre = 0x11; c.post = 0x22; c.a = 0xFEDCB;
+    if (c.pre != 0x11 || c.post != 0x22 || c.a != 0xFEDCBu) return 11;
+    c.a = 0;       if (c.pre != 0x11 || c.post != 0x22) return 12;
+    c.a = 0xFFFFF; if (c.pre != 0x11 || c.post != 0x22 || c.a != 0xFFFFFu) return 13;
+
+    /* Nine bytes, the widest span there is. */
+    struct s4_D d; d.c = 0; d.a = 0x0123456789ABCDEFULL;
+    if (d.a != 0x0123456789ABCDEFULL) return 14;
+    d.c = 1; if (d.a != 0x0123456789ABCDEFULL || d.c != 1u) return 15;
+    d.a = 0xFFFFFFFFFFFFFFFFULL;
+    if (d.a != 0xFFFFFFFFFFFFFFFFULL || d.c != 1u) return 16;
+
+    struct E e; e.a = 1; e.b = 0xDEADBEEF;
+    if (e.a != 1u || e.b != 0xDEADBEEFu) return 17;
+
+    struct s4_F f; f.a = 0x0FEDCBA987654321ULL; f.b = 0xFFFFF;
+    if (f.a != 0x0FEDCBA987654321ULL || f.b != 0xFFFFFu) return 18;
+
+    /* A signed packed field sign-extends from its own width. */
+    struct G g; g.a = -1; g.b = -2;
+    if (g.a != -1 || g.b != -2) return 19;
+    g.a = 0x7FFFF; if (g.a != 0x7FFFF || g.b != -2) return 20;
+
+    /* Static initializers go through the byte merge, not the access path. */
+    if (init_a.a != 0xABCDEu || init_a.b != 0x12345u) return 21;
+    if (init_c.pre != 0x11 || init_c.a != 0xFEDCBu || init_c.post != 0x22) return 22;
+    if (init_d.c != 1u || init_d.a != 0x0123456789ABCDEFULL) return 23;
+
+    /* The unpacked control still round-trips. */
+    struct I i; i.a = 0xABCDE; i.b = 0x12345;
+    if (i.a != 0xABCDEu || i.b != 0x12345u) return 24;
+
+    return 0;
+}
+
+// ==== Section 6: t_c99_mode_attribute_selects_the_type (was #[test] c99_mode_attribute_selects_the_type) ====
+// Exit codes 174..194 (local code + 173).
+//
+// `__attribute__((mode(M)))` selects the type of a machine mode (#C85).
+//
+// It was unimplemented and warned, which read as cosmetic and was not:
+// glibc declares `register_t` with `__mode__(__word__)`, so c17 sized it 4
+// bytes where gcc sizes it 8 -- a wrong type, silently, in a header any
+// program can include.
+//
+// The signedness comes from the *declared* type, not the mode, and `XF` and
+// `TF` are both sixteen bytes but not interchangeable -- one is the x87
+// extended format and the other IEEE binary128 -- so the arithmetic check at
+// the end distinguishes them rather than trusting the size.
+// Renamed for the merge: sc -> s5_sc
+typedef int qi  __attribute__((__mode__(__QI__)));
+typedef int hi  __attribute__((__mode__(__HI__)));
+typedef int si  __attribute__((__mode__(__SI__)));
+typedef int di  __attribute__((__mode__(__DI__)));
+typedef int ti  __attribute__((__mode__(__TI__)));
+typedef int wd  __attribute__((__mode__(__word__)));
+typedef int pt  __attribute__((__mode__(__pointer__)));
+typedef unsigned uqi __attribute__((__mode__(__QI__)));
+typedef unsigned udi __attribute__((__mode__(__DI__)));
+typedef float hf __attribute__((__mode__(__HF__)));
+typedef float sf __attribute__((__mode__(__SF__)));
+typedef float df __attribute__((__mode__(__DF__)));
+typedef _Complex float hc __attribute__((__mode__(HC)));
+typedef _Complex float s5_sc __attribute__((__mode__(SC)));
+typedef _Complex float dc __attribute__((__mode__(DC)));
+/* The binary128 modes exist only where the type does; c17 refuses them on a
+   target with no `__FLT128_*` family rather than handing back a type whose
+   arithmetic cannot link. */
+#ifdef __FLT128_MANT_DIG__
+typedef float tf __attribute__((__mode__(__TF__)));
+typedef _Complex float tc __attribute__((__mode__(TC)));
+#endif
+
+static int t_c99_mode_attribute_selects_the_type(void) {
+    if (sizeof(qi) != 1)  return 1;
+    if (sizeof(hi) != 2)  return 2;
+    if (sizeof(si) != 4)  return 3;
+    if (sizeof(di) != 8)  return 4;
+    if (sizeof(ti) != 16) return 5;
+    if (sizeof(wd) != sizeof(void *)) return 6;
+    if (sizeof(pt) != sizeof(void *)) return 7;
+
+    /* Signedness follows the declared type, not the mode. */
+    if (!((qi)-1 < 0))  return 8;
+    if ((uqi)-1 < 0)    return 9;
+    if (!((di)-1 < 0))  return 10;
+    if ((udi)-1 < 0)    return 11;
+
+    if (sizeof(hf) != 2) return 12;
+    if (sizeof(sf) != 4) return 13;
+    if (sizeof(df) != 8) return 14;
+
+    /* A mode is a type, not merely a width: binary128 divides to more
+       precision than double, which a size check alone would not show.
+       Guarded because c17 offers `_Float128` only where the runtime can
+       support it -- there are no `__FLT128_*` predefines on Apple targets,
+       and `mode(TF)` is refused there rather than handing back a type whose
+       every operation would fail to link. Same guard as
+       `c99_float128_is_a_first_class_type`. */
+#ifdef __FLT128_MANT_DIG__
+    tf third = (tf)1 / 3;
+    if ((int)(third * 3 * 1000000) != 1000000) return 15;
+#endif
+
+    /* Complex modes name the format of each half. glibc's <bits/floatn.h>
+       declares `__cfloat128` with `mode(TC)`, which was 285 of the warnings a
+       CPython build used to produce. */
+    if (sizeof(hc) != 2 * sizeof(hf)) return 17;
+    if (sizeof(s5_sc) != 2 * sizeof(sf)) return 18;
+    if (sizeof(dc) != 2 * sizeof(df)) return 19;
+#ifdef __FLT128_MANT_DIG__
+    if (sizeof(tf) != 16) return 20;
+    if (sizeof(tc) != 2 * sizeof(tf)) return 21;
+#endif
+
+    /* And the narrow integer modes really do wrap at their own width. */
+    qi small = 127;
+    small = (qi)(small + 1);
+    if (small != -128) return 16;
+
+    return 0;
+}
+
+// ==== Section 7: t_c99_mode_attribute_applies_only_to_its_own_declarator (was #[test] c99_mode_attribute_applies_only_to_its_own_declarator) ====
+// Exit codes 195..207 (local code + 194).
+//
+// A `mode` applies to the declarator it was written on, and to nothing else
+// (#C117).
+//
+// `apply_pending_mode` was called only at the three *typedef* sites, but
+// `pending_mode` is set for any declarator and -- unlike `pending_alignas`,
+// which is cleared at four declaration boundaries -- was never cleared. So a
+// mode on a non-typedef was silently dropped **and** survived to be applied to
+// whatever was declared next:
+//
+// ```c
+// int a __attribute__((__mode__(__QI__)));   /* was 4 bytes, gcc gives 1 */
+// typedef int T;                              /* became 1 byte  */
+// ```
+//
+// Both halves are checked here: the mode reaching its own declarator, and the
+// declaration after it being untouched.
+// Renamed for the merge: S -> s6_S
+int a __attribute__((__mode__(__QI__)));
+int after_a;                                   /* must stay 4 */
+
+int b, c __attribute__((__mode__(__HI__)));    /* only c is moded */
+int after_c;
+
+static int d __attribute__((__mode__(__DI__)));
+typedef int AfterD;                            /* must stay 4 */
+
+extern int e __attribute__((__mode__(__QI__)));
+struct s6_S { int m; } s;                         /* member must stay 4 */
+
+unsigned int u __attribute__((__mode__(__QI__)));
+int after_u;
+
+typedef int T __attribute__((__mode__(__HI__)));
+typedef int AfterT;                            /* must stay 4 */
+
+static int t_c99_mode_attribute_applies_only_to_its_own_declarator(void) {
+    if (sizeof a != 1) return 1;
+    if (sizeof after_a != 4) return 2;
+
+    if (sizeof b != 4) return 3;
+    if (sizeof c != 2) return 4;
+    if (sizeof after_c != 4) return 5;
+
+    if (sizeof d != 8) return 6;
+    if (sizeof(AfterD) != 4) return 7;
+
+    if (sizeof s.m != 4) return 8;
+
+    if (sizeof u != 1) return 9;
+    /* Still unsigned, and narrow: -1 wraps to 255 rather than sign-extending.
+       Tested by the stored value, not by `u - 1 < 0`, which the integer
+       promotions make an `int` comparison whatever `u` is. */
+    u = (unsigned)-1;
+    if (u != 255) return 10;
+    if (sizeof after_u != 4) return 11;
+
+    if (sizeof(T) != 2) return 12;
+    if (sizeof(AfterT) != 4) return 13;
+
+    return 0;
+}
+
+// ==== Section 8: t_c99_wide_bitfields_read_only_their_own_bits (was #[test] c99_wide_bitfields_read_only_their_own_bits) ====
+// Exit codes 208..218 (local code + 207).
+//
+// A bit-field must read only its own bits, and keep all of them through a
+// brace initializer (#C119, #C120).
+//
+// Two defects that meet on the wide bit-field. **The load** walked every byte
+// of the access span with no "does this byte hold any of the field's bits?"
+// test -- the skip its *store* sibling has always had -- so a field in a
+// window wider than itself read the object's **padding**. Every `__int128`
+// bit-field is such a field: its window is sixteen bytes. The stray bytes were
+// also shifted by more than the 64-bit carrier's width, which x86-64 masks
+// (folding padding into the result) and aarch64's assembler rejects outright,
+// so the same source would not even build there.
+//
+// **The brace initializer** then converted the value twice: to the member's
+// type, correctly, and again to a type derived from the *span*, where
+// `bitfield_storage_type` answers `unsigned int` for anything but 1, 2, 4 or 8
+// bytes. A 64-bit field in a sixteen-byte window, or in a packed nine-byte
+// span, kept 32 bits of its initializer. Assignment was unaffected, so
+// `p.a = ~0ULL` was right and `= {~0ULL}` was not.
+//
+// The padding is deliberately dirtied; with it zero the load bug is invisible.
+// Renamed for the merge: A -> s7_A, B -> s7_B, C -> s7_C, D -> s7_D
+struct s7_A { unsigned __int128 a:64; };
+struct s7_B { unsigned __int128 a:64, b:64; };
+struct s7_C { unsigned __int128 a:32; };
+struct s7_D { unsigned __int128 a:1; };
+struct __attribute__((packed)) P { unsigned c:1; unsigned long long a:64; };
+struct Q { unsigned __int128 a:64; };
+
+static int t_c99_wide_bitfields_read_only_their_own_bits(void) {
+    /* Reading: the window is wider than the field, so the bytes beyond it must
+       not contribute. */
+    struct s7_A x; __builtin_memset(&x, 0xAA, sizeof x);
+    x.a = 0x1122334455667788ULL;
+    if (x.a != 0x1122334455667788ULL) return 1;
+
+    struct s7_B y; __builtin_memset(&y, 0xAA, sizeof y);
+    y.a = 1; y.b = 2;
+    if (y.a != 1 || y.b != 2) return 2;
+
+    struct s7_C z; __builtin_memset(&z, 0xAA, sizeof z);
+    z.a = 0xDEADBEEFu;
+    if (z.a != 0xDEADBEEFu) return 3;
+
+    struct s7_D w; __builtin_memset(&w, 0xAA, sizeof w);
+    w.a = 1;
+    if (w.a != 1) return 4;
+    w.a = 0;
+    if (w.a != 0) return 5;
+
+    /* Initializing: the value must not be narrowed to a span-derived type. */
+    struct P p = { 0, 0xFFFFFFFFFFFFFFFFULL };
+    if (p.a != 0xFFFFFFFFFFFFFFFFULL) return 6;
+    struct Q q = { 0xFFFFFFFFFFFFFFFFULL };
+    if (q.a != 0xFFFFFFFFFFFFFFFFULL) return 7;
+
+    /* Assignment always worked and must continue to. */
+    p.a = 0x0123456789ABCDEFULL;
+    if (p.a != 0x0123456789ABCDEFULL) return 8;
+
+    /* The narrow and packed spans the same code serves. */
+    struct E { unsigned a:20, b:20; } e = { 0xABCDE, 0x12345 };
+    if (e.a != 0xABCDEu || e.b != 0x12345u) return 9;
+    struct F { char pre; unsigned a:20; char post; } f = { 1, 0xFEDCB, 2 };
+    if (f.pre != 1 || f.a != 0xFEDCBu || f.post != 2) return 10;
+
+    /* `_Bool` still normalises through its own type, not the storage unit. */
+    struct G { _Bool b:1; } g = { 2 };
+    if (g.b != 1) return 11;
+
+    return 0;
+}
+
+// ==== Section 9: t_c99_null_constant_assigns_to_a_function_pointer (was #[test] c99_null_constant_assigns_to_a_function_pointer) ====
+// Exit codes 219..224 (local code + 218).
+//
+// A null pointer constant assigns to a function pointer.
+//
+// 6.5.16.1p1 lets a null pointer constant assign to any pointer, and
+// 6.3.2.3p3 makes `(void *)0` one -- which is exactly how glibc spells
+// `NULL`. The check for it was read only in the "target is a pointer, value
+// is not" branch, which a null constant that has already decayed to `void *`
+// never reaches: it was judged by the pointer-to-pointer rules instead, and
+// those diagnose a `void *` meeting a function pointer. So every `fp = NULL`
+// warned, and any `-Werror` build using function pointers broke.
+//
+// The no-diagnostic half of this case is the in-process unit test of the
+// same name in `cc/test_asm/c99_types.rs`.
+#include <stddef.h>
+
+typedef void (*handler)(int);
+static handler h1 = NULL;
+static handler h2 = (void *)0;
+static handler h3 = 0;
+
+static void hit(int x) { (void)x; }
+
+static int t_c99_null_constant_assigns_to_a_function_pointer(void) {
+    handler h = NULL;
+    if (h != NULL) return 1;
+    h = (void *)0;
+    if (h) return 2;
+    h = hit;
+    if (!h) return 3;
+    h = 0;
+    if (h) return 4;
+    if (h1 || h2 || h3) return 5;
+
+    /* A void* still round-trips through an object pointer. */
+    int i = 7;
+    void *v = &i;
+    int *p = v;
+    if (*p != 7) return 6;
+    return 0;
+}
+
+// ==== Section 10: t_c99_block_scope_typedef_of_an_incomplete_type (was #[test] c99_block_scope_typedef_of_an_incomplete_type) ====
+// Exit codes 225..225 (local code + 224).
+//
+// A `typedef` of an incomplete type is legal at block scope.
+//
+// 6.7p7 asks for a complete type where an *object* is declared. A typedef
+// declares no object, and the file-scope path has always said so; the
+// block-scope path did not, so `typedef struct Incomplete T;` inside a
+// function was rejected.
+struct Incomplete;
+union AlsoIncomplete;
+
+static int t_c99_block_scope_typedef_of_an_incomplete_type(void) {
+    typedef struct Incomplete T;
+    typedef union AlsoIncomplete U;
+    T *p = 0;
+    U *q = 0;
+
+    /* Completing it later in the block is a different declaration, and the
+       typedef still names the incomplete one -- but a pointer to it is fine. */
+    if (p || q) return 1;
+    return 0;
+}
+
+// ==== Section 11: t_c99_qualified_tentative_definition_is_completed_by_its_tag (was #[test] c99_qualified_tentative_definition_is_completed_by_its_tag) ====
+// Exit codes 226..229 (local code + 225).
+//
+// A qualified tentative definition is completed by completing its tag.
+//
+// 6.9.2p3 lets a file-scope tentative definition be completed later. A
+// qualified spelling -- `volatile struct S` -- is interned as a fresh type
+// holding a clone of the tag's composite data as it stood at the time, and
+// completing the tag mutates only the tag's own entry. Judging the recorded
+// id therefore read a frozen "incomplete" that nothing could ever update.
+// Renamed for the merge: S -> s10_S, U -> s10_U
+struct s10_S;
+volatile struct s10_S vs;
+const struct s10_S cs;
+struct s10_S plain;
+struct s10_S { int a; };
+
+union s10_U;
+volatile union s10_U vu;
+union s10_U { int b; };
+
+static int t_c99_qualified_tentative_definition_is_completed_by_its_tag(void) {
+    if (vs.a != 0) return 1;
+    if (cs.a != 0) return 2;
+    if (plain.a != 0) return 3;
+    if (vu.b != 0) return 4;
+    return 0;
+}
+
+// ==== Section 12: t_c99_mode_attribute_binds_to_its_own_declarator (was #[test] c99_mode_attribute_binds_to_its_own_declarator) ====
+// Exit codes 230..233 (local code + 229).
+//
+// `__attribute__((mode(M)))` belongs to the declarator it is written on.
+//
+// Only the eight *declarator* sites consumed the pending mode. A struct
+// member's declarator was not one of them, so a mode on a member did two
+// wrong things at once: it did not size the member, and it stayed pending
+// until the next declarator that did consume one -- the enclosing
+// declaration's. `struct Big { int arr[100]; int x
+// __attribute__((mode(QI))); } b;` gave `sizeof b == 1` against gcc's 404,
+// because the QI mode was applied to `b` rather than to `x`.
+//
+// Parameters had the same gap, without the leak: a mode on a parameter was
+// silently ignored.
+// Renamed for the merge: Big -> s11_Big, Wide -> s11_Wide, b -> s11_b
+/* The regression: a member's mode must not reach the enclosing object. */
+struct s11_Big { int arr[100]; int x __attribute__((mode(QI))); } s11_b;
+_Static_assert(sizeof s11_b == 404, "a member's mode is not the object's");
+_Static_assert(sizeof s11_b.x == 1, "and it does size the member");
+
+/* Both spellings, before and after the declarator. */
+struct After  { int a __attribute__((mode(QI))); };
+struct Before { int __attribute__((mode(QI))) a; };
+_Static_assert(sizeof(struct After) == 1, "mode after the declarator");
+_Static_assert(sizeof(struct Before) == 1, "mode before the declarator");
+
+/* It must not reach the *next* member either. */
+struct Two { int a __attribute__((mode(QI))); int s11_b; };
+_Static_assert(sizeof(struct Two) == 8, "a mode stops at its own member");
+
+/* Widening as well as narrowing. */
+struct s11_Wide { int a __attribute__((mode(DI))); };
+_Static_assert(sizeof(struct s11_Wide) == 8, "mode(DI) widens a member");
+
+/* Signedness is the declared type's, not the mode's. */
+struct Signs {
+    unsigned u __attribute__((mode(QI)));
+    int s __attribute__((mode(QI)));
+};
+
+int param_sized(int x __attribute__((mode(QI)))) { return sizeof x; }
+
+static int t_c99_mode_attribute_binds_to_its_own_declarator(void) {
+    struct Signs sg;
+    sg.u = 200; sg.s = -1;
+    if (sg.u != 200) return 1;
+    if (sg.s != -1) return 2;
+
+    if (param_sized(0) != 1) return 3;
+
+    s11_b.x = 1;
+    if (sizeof s11_b != 404) return 4;
+    return 0;
+}
+
+// ==== Section 13: t_c99_vector_size_has_a_vector_s_storage (was #[test] c99_vector_size_has_a_vector_s_storage) ====
+// Exit codes 234..236 (local code + 233).
+//
+// `__attribute__((vector_size(N)))` gives a type a vector's storage.
+//
+// It used to be rejected outright, on the reasoning that ignoring it would
+// silently leave the type scalar and that no C system header uses it. The
+// first half is right; the second is not. glibc's `<link.h>` declares
+// `La_x86_64_xmm`, `La_x86_64_ymm` and `La_x86_64_zmm` with it, so the
+// rejection made that header -- and anything including it -- uncompilable.
+//
+// c17 gives such a type the size and alignment a vector has, modelled as an
+// array of its elements, which is exactly the layout GCC produces. What it
+// deliberately does not give is element-wise arithmetic: that needs a real
+// vector type in the IR and in both backends. An array does not accept `+`,
+// so the gap surfaces as a diagnostic where the arithmetic is written rather
+// than as a computation that silently runs on one element -- which is the
+// failure the outright rejection was guarding against.
+typedef float V4 __attribute__((vector_size(16)));
+typedef float V8 __attribute__((vector_size(32)));
+typedef double D8 __attribute__((vector_size(64)));
+typedef short S8 __attribute__((vector_size(16)));
+
+/* A vector aligns to its width rounded to a power of two, capped at 16 --
+   GCC's default on both targets. So a 32-byte vector aligns to 16, not 32. */
+_Static_assert(sizeof(V4) == 16 && _Alignof(V4) == 16, "V4");
+_Static_assert(sizeof(V8) == 32 && _Alignof(V8) == 16, "V8 caps at 16");
+_Static_assert(sizeof(D8) == 64 && _Alignof(D8) == 16, "D8 caps at 16");
+_Static_assert(sizeof(S8) == 16 && _Alignof(S8) == 16, "S8");
+
+/* Below the cap the alignment follows the width. */
+typedef float V2 __attribute__((vector_size(8)));
+typedef float V1 __attribute__((vector_size(4)));
+_Static_assert(sizeof(V2) == 8 && _Alignof(V2) == 8, "V2");
+_Static_assert(sizeof(V1) == 4 && _Alignof(V1) == 4, "V1");
+
+/* ...unless the source says otherwise, which is what <link.h> writes. */
+typedef float A8 __attribute__((vector_size(32), aligned(16)));
+_Static_assert(sizeof(A8) == 32, "A8 size");
+_Static_assert(_Alignof(A8) == 16, "an explicit alignment wins over the width");
+
+/* The <link.h> shape: vectors as union and struct members, never operated on. */
+typedef union { V8 ymm[2]; D8 zmm[1]; V4 xmm[4]; } Vec __attribute__((aligned(16)));
+_Static_assert(sizeof(Vec) == 64, "union of vectors");
+_Static_assert(_Alignof(Vec) == 16, "union alignment");
+
+struct Regs { unsigned long a; Vec v[8]; unsigned long b; };
+_Static_assert(_Alignof(struct Regs) == 16, "struct alignment");
+_Static_assert(sizeof(struct Regs) == 544, "struct layout matches gcc");
+
+static int t_c99_vector_size_has_a_vector_s_storage(void) {
+    Vec v;
+    /* Element access through the array view still works. */
+    v.xmm[0][0] = 1.5f;
+    v.xmm[3][3] = 2.5f;
+    if (v.xmm[0][0] != 1.5f) return 1;
+    if (v.xmm[3][3] != 2.5f) return 2;
+    if (sizeof v.ymm != 64) return 3;
+    return 0;
+}
+
+/* Dispatcher: section k's failure code c is returned as base_k + c. */
+int main(void) {
+    int r;
+    if ((r = t_c99_types_mega()) != 0) return 0 + r;
+    if ((r = t_c99_signed_bitfields_sign_extend_at_every_declared_width()) != 0) return 86 + r;
+    if ((r = t_c99_bitfields_allocate_at_the_next_free_bit()) != 0) return 106 + r;
+    if ((r = t_c99_enum_bitfields_and_enum_signedness()) != 0) return 135 + r;
+    if ((r = t_c99_packed_bitfields_pack_to_the_bit()) != 0) return 149 + r;
+    if ((r = t_c99_mode_attribute_selects_the_type()) != 0) return 173 + r;
+    if ((r = t_c99_mode_attribute_applies_only_to_its_own_declarator()) != 0) return 194 + r;
+    if ((r = t_c99_wide_bitfields_read_only_their_own_bits()) != 0) return 207 + r;
+    if ((r = t_c99_null_constant_assigns_to_a_function_pointer()) != 0) return 218 + r;
+    if ((r = t_c99_block_scope_typedef_of_an_incomplete_type()) != 0) return 224 + r;
+    if ((r = t_c99_qualified_tentative_definition_is_completed_by_its_tag()) != 0) return 225 + r;
+    if ((r = t_c99_mode_attribute_binds_to_its_own_declarator()) != 0) return 229 + r;
+    if ((r = t_c99_vector_size_has_a_vector_s_storage()) != 0) return 233 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("bitfield_allocation", src, &[]), 0);
+    assert_eq!(compile_and_run("c99_types_mega", code, &[]), 0);
+}
+
+/// Bit-field and `packed` member cases run at the matrix levels and at -O1.
+///
+/// Consolidates these single-program tests, one C section each; every
+/// original doc comment is the comment above its section:
+/// - `c99_bool_bitfields_hold_zero_or_one` (exit codes 1..45)
+/// - `c99_packed_member_drops_only_its_own_alignment` (exit codes 46..51)
+#[test]
+fn c99_bitfield_opt_mega() {
+    let code = r#"
+// ==== Section 1: t_c99_bool_bitfields_hold_zero_or_one (was #[test] c99_bool_bitfields_hold_zero_or_one) ====
+// Exit codes 1..45 (local code + 0).
+//
+// A `_Bool` bitfield holds 0 or 1, and reads back as 0 or 1.
+//
+// C17 6.2.5p6 lists `_Bool` among the standard *unsigned* integer types, and
+// 6.3.1.2 makes every conversion into it yield exactly 0 or 1. Two separate
+// defects broke that, in opposite directions, so a test of only one value
+// would have missed one of them:
+//
+// ```text
+//   struct S { _Bool f:1; };
+//   struct S a = {1};   read back -1   -- the load sign-extended
+//   struct S b = {2};   read back  0   -- the initializer truncated 2 to
+//                                        one bit without normalizing first
+//   a.f == 1            was false
+// ```
+//
+// The load was extended because `_Bool` carries no `unsigned` modifier and the
+// signedness predicate read that bit; for a one-bit field the extension is
+// `shl 31; sar 31`, which turns 1 into -1. The initializer converted to the
+// field's unsigned *storage* type instead of to `_Bool`, so it never reached
+// the normalization every other conversion into `_Bool` gets.
+struct S { _Bool f : 1; };
+struct M { _Bool a : 1; unsigned b : 1; int c : 3; _Bool d : 1; };
+
+__attribute__((noinline)) static int as_int(_Bool v) { return (int)v; }
+
+static int t_c99_bool_bitfields_hold_zero_or_one(void) {
+    /* Assignment: any non-zero stores as 1 (returns 1-9). */
+    struct S s = {0};
+    s.f = 1;    if ((int)s.f != 1) return 1;
+    s.f = 2;    if ((int)s.f != 1) return 2;
+    s.f = -1;   if ((int)s.f != 1) return 3;
+    s.f = 0;    if ((int)s.f != 0) return 4;
+    s.f = 3;    if ((int)s.f != 1) return 5;
+
+    /* Brace initializers -- the second, independent defect (returns 10-19). */
+    { struct S v = {0};  if ((int)v.f != 0) return 10; }
+    { struct S v = {1};  if ((int)v.f != 1) return 11; }
+    { struct S v = {2};  if ((int)v.f != 1) return 12; }
+    { struct S v = {3};  if ((int)v.f != 1) return 13; }
+    { struct S v = {-1}; if ((int)v.f != 1) return 14; }
+    { struct S v = {.f = 2}; if ((int)v.f != 1) return 15; }
+
+    /* The value must be usable as a value, not merely print as one (20-29). */
+    s.f = 1;
+    if (s.f != 1) return 20;
+    if (!(s.f == 1)) return 21;
+    if (s.f + 0 != 1) return 22;
+    if (s.f * 2 != 2) return 23;
+    if (s.f < 0) return 24;
+    if (!s.f) return 25;
+    if (as_int(s.f) != 1) return 26;
+
+    /* Compound assignment, increment, and struct copy all read the same
+       load, so each would have shown -1 too (returns 30-39). */
+    s.f = 0; s.f |= 1;      if ((int)s.f != 1) return 30;
+    s.f = 0; s.f++;         if ((int)s.f != 1) return 31;
+    s.f = 1; s.f ^= 0;      if ((int)s.f != 1) return 32;
+    { struct S c = s;       if ((int)c.f != 1) return 33; }
+
+    /* Neighbours keep their own signedness -- the control that stops this
+       passing by never extending anything (returns 40-49). */
+    struct M m = {0};
+    m.a = 1; m.b = 1; m.c = -4; m.d = 1;
+    if ((int)m.a != 1) return 40;
+    if ((int)m.b != 1) return 41;
+    if (m.c != -4) return 42;      /* a signed 3-bit field still extends */
+    if ((int)m.d != 1) return 43;
+    m.c = 3;
+    if (m.c != 3) return 44;
+
+    /* Two _Bool fields in one unit add up, rather than cancelling at -1. */
+    m.a = 1; m.d = 1;
+    if (m.a + m.d != 2) return 45;
+
+    return 0;
+}
+
+// ==== Section 2: t_c99_packed_member_drops_only_its_own_alignment (was #[test] c99_packed_member_drops_only_its_own_alignment) ====
+// Exit codes 46..51 (local code + 45).
+//
+// `packed` on one member drops that member's alignment to 1, so it is laid
+// out at the next byte and no longer raises the struct's alignment; the
+// members around it keep theirs. c17 accepted the attribute there and laid
+// the member out as if it were absent: `struct { char a; int b
+// __attribute__((packed)); }` was 8 bytes, where gcc makes it 5. An
+// `aligned` written alongside still raises the member back. Every size and
+// offset here is gcc's.
+#include <stddef.h>
+struct A { char a; int b __attribute__((packed)); };
+struct B { char a; int b __attribute__((packed)); char c; };
+struct C { char a; long b __attribute__((packed)); int c; };
+struct D { char a; struct { char x; int y; } s __attribute__((packed)); };
+struct E { char a; int b __attribute__((packed, aligned(2))); };
+static int t_c99_packed_member_drops_only_its_own_alignment(void) {
+    struct B b = { 1, 0x12345678, 3 };
+    if (sizeof(struct A) != 5 || offsetof(struct A, b) != 1 || _Alignof(struct A) != 1) return 1;
+    if (sizeof(struct B) != 6 || offsetof(struct B, c) != 5) return 2;
+    if (sizeof(struct C) != 16 || offsetof(struct C, b) != 1 || offsetof(struct C, c) != 12) return 3;
+    if (sizeof(struct D) != 9 || offsetof(struct D, s) != 1) return 4;
+    if (sizeof(struct E) != 6 || offsetof(struct E, b) != 2) return 5;
+    if (b.a != 1 || b.b != 0x12345678 || b.c != 3) return 6;
+    return 0;
+}
+
+/* Dispatcher: section k's failure code c is returned as base_k + c. */
+int main(void) {
+    int r;
+    if ((r = t_c99_bool_bitfields_hold_zero_or_one()) != 0) return 0 + r;
+    if ((r = t_c99_packed_member_drops_only_its_own_alignment()) != 0) return 45 + r;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c99_bitfield_opt_mega", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("c99_bitfield_opt_mega_opt", code),
+        0
+    );
 }
 
 // ============================================================================
-// __float128 / _Float128 — IEEE binary128
+// __float128 / _Float128 — IEEE binary128; C17 6.7.7 VM typedefs
 // ============================================================================
 
-/// `__float128` is a first-class arithmetic type on every target.
+/// `__float128` / `_Float128` (IEEE binary128), exact constant folding, and
+/// C17 6.7.7 block-scope typedefs of variably modified types.
 ///
-/// It is IEEE binary128 everywhere, unlike `long double`, which is x87's
-/// 80-bit format on x86-64, binary128 on aarch64 Linux and plain `double` on
-/// Apple's arm64. Neither target has hardware binary128, so every operation
-/// becomes a libgcc `__*tf*` call; what this asserts is that the *results*
-/// are right, whichever way the value got there.
-///
-/// Every expectation was checked against gcc on the same source.
+/// Consolidates these single-program tests, one C section each; every
+/// original doc comment is the comment above its section:
+/// - `c99_float128_is_a_first_class_type` (exit codes 1..28)
+/// - `c99_constant_folding_is_exact_in_the_expressions_own_format` (exit codes 29..108)
+/// - `c99_float128_outranks_long_double` (exit codes 109..114)
+/// - `c99_float128_edge_cases` (exit codes 115..123)
+/// - `c17_vm_typedef_evaluates_its_extent_at_the_typedef` (exit codes 124..126)
+/// - `c17_vm_typedef_evaluates_its_extent_exactly_once` (exit codes 127..129)
+/// - `c17_vm_typedef_re_evaluates_when_reached_again` (exit codes 130..130)
+/// - `c17_vm_typedef_composes_with_pointers_and_dimensions` (exit codes 131..134)
 #[test]
-fn c99_float128_is_a_first_class_type() {
-    let src = r#"
+fn c99_float128_and_vm_typedef_mega() {
+    let code = r#"
+// ==== Section 1: t_c99_float128_is_a_first_class_type (was #[test] c99_float128_is_a_first_class_type) ====
+// Exit codes 1..28 (local code + 0).
+//
+// `__float128` is a first-class arithmetic type on every target.
+//
+// It is IEEE binary128 everywhere, unlike `long double`, which is x87's
+// 80-bit format on x86-64, binary128 on aarch64 Linux and plain `double` on
+// Apple's arm64. Neither target has hardware binary128, so every operation
+// becomes a libgcc `__*tf*` call; what this asserts is that the *results*
+// are right, whichever way the value got there.
+//
+// Every expectation was checked against gcc on the same source.
 #include <float.h>
 #include <string.h>
 #ifdef __FLT128_MANT_DIG__
@@ -533,8 +1223,7 @@ static int bits_are(__float128 v, unsigned long long hi, unsigned long long lo)
     return a == lo && b == hi;
 }
 
-int main(void)
-{
+static int t_c99_float128_is_a_first_class_type(void) {
     if (sizeof(__float128) != 16) return 1;
     if (_Alignof(__float128) != 16) return 2;
     if (__FLT128_MANT_DIG__ != 113) return 3;
@@ -595,26 +1284,25 @@ int main(void)
 }
 #else
 /* The type does not exist on this target; see `TypeTable::has_float128`. */
-int main(void) { return 0; }
+static int t_c99_float128_is_a_first_class_type(void) { return 0; }
 #endif
-"#;
-    assert_eq!(compile_and_run("float128_first_class", src, &[]), 0);
-}
 
-/// A constant expression is folded in its own format, exactly.
-///
-/// Folding used to narrow both operands to `f64` first, which cost a `long
-/// double` eleven significand bits and a `__float128` sixty: `1.0q/3.0q`
-/// emitted `3ffd5555555555555000...` where gcc emits `...5555555555555555`,
-/// and `1.0q + 1e-30q` collapsed to exactly `1.0`. The sharp edge was that
-/// the *same initializer written for a local* is computed at run time and was
-/// right, so the static and automatic forms of one expression disagreed --
-/// which is what this checks, alongside the bits themselves.
-///
-/// Every expected pattern was taken from gcc compiling the same expression.
-#[test]
-fn c99_constant_folding_is_exact_in_the_expressions_own_format() {
-    let src = r#"
+// ==== Section 2: t_c99_constant_folding_is_exact_in_the_expressions_own_format (was #[test] c99_constant_folding_is_exact_in_the_expressions_own_format) ====
+// Exit codes 29..108 (local code + 28).
+//
+// A constant expression is folded in its own format, exactly.
+//
+// Folding used to narrow both operands to `f64` first, which cost a `long
+// double` eleven significand bits and a `__float128` sixty: `1.0q/3.0q`
+// emitted `3ffd5555555555555000...` where gcc emits `...5555555555555555`,
+// and `1.0q + 1e-30q` collapsed to exactly `1.0`. The sharp edge was that
+// the *same initializer written for a local* is computed at run time and was
+// right, so the static and automatic forms of one expression disagreed --
+// which is what this checks, alongside the bits themselves.
+//
+// Every expected pattern was taken from gcc compiling the same expression.
+// `#line 2` keeps this section's __LINE__ values those of the original program.
+#line 2
 #include <float.h>
 #include <string.h>
 
@@ -645,8 +1333,7 @@ static int fail;
 #define CHECK_Q(expr, hi_want, lo_want) do { } while (0)
 #endif
 
-int main(void)
-{
+static int t_c99_constant_folding_is_exact_in_the_expressions_own_format(void) {
     /* The headline case: a repeating quotient keeps all 113 bits. */
     CHECK_Q(1.0q/3.0q,   0x3ffd555555555555ULL, 0x5555555555555555ULL);
     CHECK_Q(2.0q/7.0q,   0x3ffd249249249249ULL, 0x2492492492492492ULL);
@@ -682,20 +1369,18 @@ int main(void)
 
     return fail;
 }
-"#;
-    assert_eq!(compile_and_run("constant_folding_exact", src, &[]), 0);
-}
+#undef CHECK_LD
+#undef CHECK_Q
 
-/// `__float128` outranks every other real type in the usual arithmetic
-/// conversions -- it has more significand bits than x87 extended and the same
-/// exponent range, so a mixed expression is computed at binary128.
-#[test]
-fn c99_float128_outranks_long_double() {
-    let src = r#"
+// ==== Section 3: t_c99_float128_outranks_long_double (was #[test] c99_float128_outranks_long_double) ====
+// Exit codes 109..114 (local code + 108).
+//
+// `__float128` outranks every other real type in the usual arithmetic
+// conversions -- it has more significand bits than x87 extended and the same
+// exponent range, so a mixed expression is computed at binary128.
 #include <float.h>
 #ifdef __FLT128_MANT_DIG__
-int main(void)
-{
+static int t_c99_float128_outranks_long_double(void) {
     /* 0.1 is inexact in every binary format, and the three formats round it
        differently -- so the result type is observable. */
     __float128 q = 0.1q;
@@ -719,19 +1404,16 @@ int main(void)
     return 0;
 }
 #else
-int main(void) { return 0; }
+static int t_c99_float128_outranks_long_double(void) { return 0; }
 #endif
-"#;
-    assert_eq!(compile_and_run("float128_rank", src, &[]), 0);
-}
 
-/// The cases a code review found after the first `__float128` pass, each of
-/// which the original tests missed by staying on the easy path.
-///
-/// Checked against gcc on the same source.
-#[test]
-fn c99_float128_edge_cases() {
-    let src = r#"
+// ==== Section 4: t_c99_float128_edge_cases (was #[test] c99_float128_edge_cases) ====
+// Exit codes 115..123 (local code + 114).
+//
+// The cases a code review found after the first `__float128` pass, each of
+// which the original tests missed by staying on the easy path.
+//
+// Checked against gcc on the same source.
 #include <float.h>
 #include <string.h>
 #ifdef __FLT128_MANT_DIG__
@@ -752,8 +1434,7 @@ __attribute__((noinline)) static __float128 ten(__float128 a, __float128 b,
 __attribute__((noinline)) static __float128 widen(long double x) { return (__float128)x; }
 __attribute__((noinline)) static long double narrow(__float128 x) { return (long double)x; }
 
-int main(void)
-{
+static int t_c99_float128_edge_cases(void) {
     if (ten(1.0q, 2.0q, 3.0q, 4.0q, 5.0q, 6.0q, 7.0q, 8.0q, 9.0q, 10.0q) != 20.0q)
         return 1;
 
@@ -787,405 +1468,116 @@ int main(void)
     return 0;
 }
 #else
-int main(void) { return 0; }
+static int t_c99_float128_edge_cases(void) { return 0; }
 #endif
-"#;
-    assert_eq!(compile_and_run("float128_edge_cases", src, &[]), 0);
+
+// ============================================================================
+// C17 6.7.7 — typedef of a variably modified type
+//
+// "If a typedef name specifies a variably modified type then it shall have
+// block scope. The array size expressions are evaluated each time the
+// declaration of the typedef name is reached in the order of execution."
+//
+// c17 rejected these outright: "typedef of a variable-length array type is not
+// supported". Two hazards justified the rejection rather than a miscompile --
+// the `vla_sizes` side channel made a typedef'd VM type indistinguishable from
+// an incomplete `int a[]`, and `linearize_local_decl` dispatched on STATIC and
+// `vla_sizes` without ever testing TYPEDEF, so a block-scope one was lowered
+// as a runtime allocation of the array itself.
+// ============================================================================
+
+// ==== Section 5: t_c17_vm_typedef_evaluates_its_extent_at_the_typedef (was #[test] c17_vm_typedef_evaluates_its_extent_at_the_typedef) ====
+// Exit codes 124..126 (local code + 123).
+//
+// The size is fixed when the typedef is *declared*, not when it is used, so
+// changing `n` afterwards must not change the type. Every expected value here
+// was taken from `gcc -std=c17`.
+int n = 4;
+static int t_c17_vm_typedef_evaluates_its_extent_at_the_typedef(void) {
+    typedef int T[n];
+    n = 100;                    /* after the typedef */
+    T a;
+    if (sizeof(T) != 4 * sizeof(int)) return 1;
+    if (sizeof(a) != 4 * sizeof(int)) return 2;
+    a[0] = 1; a[3] = 2;
+    if (a[0] + a[3] != 3) return 3;
+    return 0;
 }
 
-/// An `enum` may be a bit-field's type, and a non-negative enumeration is
-/// unsigned (#C104, #C105).
-///
-/// `validate_bitfield` matched a hand-written list of `TypeKind`s that omitted
-/// `Enum`, so `struct S { enum E e : 2; };` -- which real headers use heavily --
-/// was rejected outright with "bitfield must have integer type". 6.7.2.1p5
-/// allows "some other implementation-defined type" and gcc's set is every
-/// integer type; `is_integer` already is that set.
-///
-/// Accepting it exposed the second half. A bit-field's signedness follows its
-/// declared type's, and `enum_underlying_type` preferred `int` for any list
-/// fitting in `int` -- so a two-bit field of `enum { A, B, C, D }` holding `D`
-/// read back **-1** where gcc gives 3. gcc's rule, which 6.7.2.2p4 leaves it
-/// free to choose, is unsigned whenever no enumerator is negative; that is
-/// observable well beyond bit-fields, since `(enum E)-1 > 0` is true there and
-/// was false here.
-#[test]
-fn c99_enum_bitfields_and_enum_signedness() {
-    let code = r#"
-enum Small { S0, S1, S2, S3 };
-enum Neg   { N_A = -2, N_B = 1 };
-enum Big   { B_HUGE = 0x100000000LL };
-enum Wide  { W_TOP = 0x80000000u };
+// ==== Section 6: t_c17_vm_typedef_evaluates_its_extent_exactly_once (was #[test] c17_vm_typedef_evaluates_its_extent_exactly_once) ====
+// Exit codes 127..129 (local code + 126).
+//
+// "evaluated each time the declaration ... is reached", which means *once*
+// per execution of the typedef, however many objects it then declares.
+static int calls = 0;
+static int side(void) { calls++; return 4; }
 
-struct A { enum Small e : 2; };
-struct B { enum Neg   e : 3; };
-struct C { enum Small e : 2; unsigned u : 3; };
-struct D { enum Small e : 2; enum Neg n : 3; };
+static int t_c17_vm_typedef_evaluates_its_extent_exactly_once(void) {
+    typedef int T[side()];
+    T a, b;
+    if (calls != 1) return 1;               /* one evaluation, two objects */
+    if (sizeof(a) != sizeof(b)) return 2;
+    if (sizeof(a) != 4 * sizeof(int)) return 3;
+    return 0;
+}
 
+// ==== Section 7: t_c17_vm_typedef_re_evaluates_when_reached_again (was #[test] c17_vm_typedef_re_evaluates_when_reached_again) ====
+// Exit codes 130..130 (local code + 129).
+//
+// Reaching the declaration again re-evaluates it: each turn of the loop gets
+// the extent in force at that turn.
+static int t_c17_vm_typedef_re_evaluates_when_reached_again(void) {
+    unsigned long total = 0;
+    for (int i = 1; i <= 3; i++) {
+        typedef int T[i];
+        T a;
+        a[0] = i;
+        total += sizeof(T) / sizeof(int);
+    }
+    return total == 6 ? 0 : 1;      /* 1 + 2 + 3 */
+}
+
+// ==== Section 8: t_c17_vm_typedef_composes_with_pointers_and_dimensions (was #[test] c17_vm_typedef_composes_with_pointers_and_dimensions) ====
+// Exit codes 131..134 (local code + 130).
+//
+// A pointer to a variably modified array, and a two-dimensional one: the
+// extents belong to the pointee, so the object itself is an ordinary pointer.
+static int t_c17_vm_typedef_composes_with_pointers_and_dimensions(void) {
+    int n = 3, m = 4;
+    typedef int Row[m];
+    typedef int Grid[n][m];
+
+    Grid g;
+    if (sizeof(g) != (unsigned long)n * m * sizeof(int)) return 1;
+    if (sizeof(g[0]) != (unsigned long)m * sizeof(int)) return 2;
+
+    Row *p = g;
+    p[1][2] = 7;
+    if (g[1][2] != 7) return 3;
+
+    typedef int (*PRow)[m];
+    if (sizeof(PRow) != sizeof(int *)) return 4;
+    return 0;
+}
+
+/* Dispatcher: section k's failure code c is returned as base_k + c. */
 int main(void) {
-    /* An enumeration with no negative member is unsigned, as in gcc. */
-    if (!((enum Small)-1 > 0)) return 1;
-    if (!((enum Wide)-1 > 0))  return 2;
-    if (!((enum Big)-1 > 0))   return 3;
-    /* One with a negative member is signed. */
-    if ((enum Neg)-1 > 0)      return 4;
-
-    /* ...and the sizes are unchanged by the signedness choice. */
-    if (sizeof(enum Small) != 4) return 5;
-    if (sizeof(enum Neg)   != 4) return 6;
-    if (sizeof(enum Big)   != 8) return 7;
-
-    /* A bit-field of an unsigned enumeration does not sign-extend. */
-    struct A a; a.e = S3;
-    if ((int)a.e != 3) return 8;
-    a.e = S0; if ((int)a.e != 0) return 9;
-
-    /* A bit-field of a signed one does. */
-    struct B b; b.e = N_A;
-    if ((int)b.e != -2) return 10;
-    b.e = N_B; if ((int)b.e != 1) return 11;
-
-    /* Neighbours are undisturbed either way. */
-    struct C c; c.e = S2; c.u = 5;
-    if ((int)c.e != 2 || c.u != 5) return 12;
-    if (sizeof(struct C) != 4) return 13;
-
-    struct D d; d.e = S1; d.n = N_A;
-    if ((int)d.e != 1 || (int)d.n != -2) return 14;
-
+    int r;
+    if ((r = t_c99_float128_is_a_first_class_type()) != 0) return 0 + r;
+    if ((r = t_c99_constant_folding_is_exact_in_the_expressions_own_format()) != 0) return 28 + r;
+    if ((r = t_c99_float128_outranks_long_double()) != 0) return 108 + r;
+    if ((r = t_c99_float128_edge_cases()) != 0) return 114 + r;
+    if ((r = t_c17_vm_typedef_evaluates_its_extent_at_the_typedef()) != 0) return 123 + r;
+    if ((r = t_c17_vm_typedef_evaluates_its_extent_exactly_once()) != 0) return 126 + r;
+    if ((r = t_c17_vm_typedef_re_evaluates_when_reached_again()) != 0) return 129 + r;
+    if ((r = t_c17_vm_typedef_composes_with_pointers_and_dimensions()) != 0) return 130 + r;
     return 0;
 }
 "#;
     assert_eq!(
-        compile_and_run("enum_bitfields_and_signedness", code, &[]),
+        compile_and_run("c99_float128_and_vm_typedef_mega", code, &[]),
         0
     );
-}
-
-/// `__attribute__((packed))` packs a bit-field to the bit (#C110).
-///
-/// c17 refused to: the straddle test in `compute_struct_layout` ran whatever
-/// the pack cap, because the access path addressed one power-of-two unit and
-/// could not span an arbitrary byte range. `struct __attribute__((packed)) {
-/// unsigned a:20, b:20; }` was 8 bytes where gcc gives 5 -- a silent ABI
-/// mismatch with any gcc-compiled object.
-///
-/// Under a cap the unit rule is switched off entirely, not narrowed to the cap:
-/// `#pragma pack(2)` lets a 16-bit field starting at bit 1 straddle both the
-/// 2- and the 4-byte boundary, which is the measurement that rules out the
-/// narrowing reading. A span that is not 1, 2, 4 or 8 bytes is then assembled
-/// byte by byte, as gcc does on both targets -- necessary, not merely
-/// equivalent, since a packed struct can be smaller than any window covering
-/// the field: `{ unsigned c:1; unsigned long long a:64; }` is nine bytes and
-/// the field needs all nine.
-#[test]
-fn c99_packed_bitfields_pack_to_the_bit() {
-    let code = r#"
-struct __attribute__((packed)) A { unsigned a:20, b:20; };
-struct __attribute__((packed)) B { unsigned a:3, b:30, c:3; };
-struct __attribute__((packed)) C { char pre; unsigned a:20; char post; };
-struct __attribute__((packed)) D { unsigned c:1; unsigned long long a:64; };
-struct __attribute__((packed)) E { unsigned a:1; unsigned b:32; };
-struct __attribute__((packed)) F { unsigned long long a:60; unsigned b:20; };
-struct __attribute__((packed)) G { signed a:20; signed b:20; };
-union  __attribute__((packed)) K { unsigned a:20; char c; };
-struct I { unsigned a:20, b:20; };   /* unpacked control */
-
-static struct A init_a = { 0xABCDE, 0x12345 };
-static struct C init_c = { 0x11, 0xFEDCB, 0x22 };
-static struct D init_d = { 1, 0x0123456789ABCDEFULL };
-
-int main(void) {
-    /* Sizes, all of them gcc's. */
-    if (sizeof(struct A) != 5)  return 1;
-    if (sizeof(struct B) != 5)  return 2;
-    if (sizeof(struct C) != 5)  return 3;
-    if (sizeof(struct D) != 9)  return 4;
-    if (sizeof(struct E) != 5)  return 5;
-    if (sizeof(struct F) != 10) return 6;
-    if (sizeof(union  K) != 3)  return 7;
-    /* The unpacked layout is untouched. */
-    if (sizeof(struct I) != 8)  return 8;
-
-    /* Values round-trip through a span that is not a storage unit. */
-    struct A a; a.a = 0xABCDE; a.b = 0x12345;
-    if (a.a != 0xABCDEu || a.b != 0x12345u) return 9;
-
-    struct B b; b.a = 5; b.b = 0x2AAAAAAA; b.c = 3;
-    if (b.a != 5u || b.b != 0x2AAAAAAAu || b.c != 3u) return 10;
-
-    /* Ordinary members either side must survive every write: a store is a
-       read-modify-write over the bytes the field shares with them. */
-    struct C c; c.pre = 0x11; c.post = 0x22; c.a = 0xFEDCB;
-    if (c.pre != 0x11 || c.post != 0x22 || c.a != 0xFEDCBu) return 11;
-    c.a = 0;       if (c.pre != 0x11 || c.post != 0x22) return 12;
-    c.a = 0xFFFFF; if (c.pre != 0x11 || c.post != 0x22 || c.a != 0xFFFFFu) return 13;
-
-    /* Nine bytes, the widest span there is. */
-    struct D d; d.c = 0; d.a = 0x0123456789ABCDEFULL;
-    if (d.a != 0x0123456789ABCDEFULL) return 14;
-    d.c = 1; if (d.a != 0x0123456789ABCDEFULL || d.c != 1u) return 15;
-    d.a = 0xFFFFFFFFFFFFFFFFULL;
-    if (d.a != 0xFFFFFFFFFFFFFFFFULL || d.c != 1u) return 16;
-
-    struct E e; e.a = 1; e.b = 0xDEADBEEF;
-    if (e.a != 1u || e.b != 0xDEADBEEFu) return 17;
-
-    struct F f; f.a = 0x0FEDCBA987654321ULL; f.b = 0xFFFFF;
-    if (f.a != 0x0FEDCBA987654321ULL || f.b != 0xFFFFFu) return 18;
-
-    /* A signed packed field sign-extends from its own width. */
-    struct G g; g.a = -1; g.b = -2;
-    if (g.a != -1 || g.b != -2) return 19;
-    g.a = 0x7FFFF; if (g.a != 0x7FFFF || g.b != -2) return 20;
-
-    /* Static initializers go through the byte merge, not the access path. */
-    if (init_a.a != 0xABCDEu || init_a.b != 0x12345u) return 21;
-    if (init_c.pre != 0x11 || init_c.a != 0xFEDCBu || init_c.post != 0x22) return 22;
-    if (init_d.c != 1u || init_d.a != 0x0123456789ABCDEFULL) return 23;
-
-    /* The unpacked control still round-trips. */
-    struct I i; i.a = 0xABCDE; i.b = 0x12345;
-    if (i.a != 0xABCDEu || i.b != 0x12345u) return 24;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("packed_bitfields", code, &[]), 0);
-}
-
-/// `__attribute__((mode(M)))` selects the type of a machine mode (#C85).
-///
-/// It was unimplemented and warned, which read as cosmetic and was not:
-/// glibc declares `register_t` with `__mode__(__word__)`, so c17 sized it 4
-/// bytes where gcc sizes it 8 -- a wrong type, silently, in a header any
-/// program can include.
-///
-/// The signedness comes from the *declared* type, not the mode, and `XF` and
-/// `TF` are both sixteen bytes but not interchangeable -- one is the x87
-/// extended format and the other IEEE binary128 -- so the arithmetic check at
-/// the end distinguishes them rather than trusting the size.
-#[test]
-fn c99_mode_attribute_selects_the_type() {
-    let code = r#"
-typedef int qi  __attribute__((__mode__(__QI__)));
-typedef int hi  __attribute__((__mode__(__HI__)));
-typedef int si  __attribute__((__mode__(__SI__)));
-typedef int di  __attribute__((__mode__(__DI__)));
-typedef int ti  __attribute__((__mode__(__TI__)));
-typedef int wd  __attribute__((__mode__(__word__)));
-typedef int pt  __attribute__((__mode__(__pointer__)));
-typedef unsigned uqi __attribute__((__mode__(__QI__)));
-typedef unsigned udi __attribute__((__mode__(__DI__)));
-typedef float hf __attribute__((__mode__(__HF__)));
-typedef float sf __attribute__((__mode__(__SF__)));
-typedef float df __attribute__((__mode__(__DF__)));
-typedef _Complex float hc __attribute__((__mode__(HC)));
-typedef _Complex float sc __attribute__((__mode__(SC)));
-typedef _Complex float dc __attribute__((__mode__(DC)));
-/* The binary128 modes exist only where the type does; c17 refuses them on a
-   target with no `__FLT128_*` family rather than handing back a type whose
-   arithmetic cannot link. */
-#ifdef __FLT128_MANT_DIG__
-typedef float tf __attribute__((__mode__(__TF__)));
-typedef _Complex float tc __attribute__((__mode__(TC)));
-#endif
-
-int main(void) {
-    if (sizeof(qi) != 1)  return 1;
-    if (sizeof(hi) != 2)  return 2;
-    if (sizeof(si) != 4)  return 3;
-    if (sizeof(di) != 8)  return 4;
-    if (sizeof(ti) != 16) return 5;
-    if (sizeof(wd) != sizeof(void *)) return 6;
-    if (sizeof(pt) != sizeof(void *)) return 7;
-
-    /* Signedness follows the declared type, not the mode. */
-    if (!((qi)-1 < 0))  return 8;
-    if ((uqi)-1 < 0)    return 9;
-    if (!((di)-1 < 0))  return 10;
-    if ((udi)-1 < 0)    return 11;
-
-    if (sizeof(hf) != 2) return 12;
-    if (sizeof(sf) != 4) return 13;
-    if (sizeof(df) != 8) return 14;
-
-    /* A mode is a type, not merely a width: binary128 divides to more
-       precision than double, which a size check alone would not show.
-       Guarded because c17 offers `_Float128` only where the runtime can
-       support it -- there are no `__FLT128_*` predefines on Apple targets,
-       and `mode(TF)` is refused there rather than handing back a type whose
-       every operation would fail to link. Same guard as
-       `c99_float128_is_a_first_class_type`. */
-#ifdef __FLT128_MANT_DIG__
-    tf third = (tf)1 / 3;
-    if ((int)(third * 3 * 1000000) != 1000000) return 15;
-#endif
-
-    /* Complex modes name the format of each half. glibc's <bits/floatn.h>
-       declares `__cfloat128` with `mode(TC)`, which was 285 of the warnings a
-       CPython build used to produce. */
-    if (sizeof(hc) != 2 * sizeof(hf)) return 17;
-    if (sizeof(sc) != 2 * sizeof(sf)) return 18;
-    if (sizeof(dc) != 2 * sizeof(df)) return 19;
-#ifdef __FLT128_MANT_DIG__
-    if (sizeof(tf) != 16) return 20;
-    if (sizeof(tc) != 2 * sizeof(tf)) return 21;
-#endif
-
-    /* And the narrow integer modes really do wrap at their own width. */
-    qi small = 127;
-    small = (qi)(small + 1);
-    if (small != -128) return 16;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("mode_attribute", code, &[]), 0);
-}
-
-/// A `mode` applies to the declarator it was written on, and to nothing else
-/// (#C117).
-///
-/// `apply_pending_mode` was called only at the three *typedef* sites, but
-/// `pending_mode` is set for any declarator and -- unlike `pending_alignas`,
-/// which is cleared at four declaration boundaries -- was never cleared. So a
-/// mode on a non-typedef was silently dropped **and** survived to be applied to
-/// whatever was declared next:
-///
-/// ```c
-/// int a __attribute__((__mode__(__QI__)));   /* was 4 bytes, gcc gives 1 */
-/// typedef int T;                              /* became 1 byte  */
-/// ```
-///
-/// Both halves are checked here: the mode reaching its own declarator, and the
-/// declaration after it being untouched.
-#[test]
-fn c99_mode_attribute_applies_only_to_its_own_declarator() {
-    let code = r#"
-int a __attribute__((__mode__(__QI__)));
-int after_a;                                   /* must stay 4 */
-
-int b, c __attribute__((__mode__(__HI__)));    /* only c is moded */
-int after_c;
-
-static int d __attribute__((__mode__(__DI__)));
-typedef int AfterD;                            /* must stay 4 */
-
-extern int e __attribute__((__mode__(__QI__)));
-struct S { int m; } s;                         /* member must stay 4 */
-
-unsigned int u __attribute__((__mode__(__QI__)));
-int after_u;
-
-typedef int T __attribute__((__mode__(__HI__)));
-typedef int AfterT;                            /* must stay 4 */
-
-int main(void) {
-    if (sizeof a != 1) return 1;
-    if (sizeof after_a != 4) return 2;
-
-    if (sizeof b != 4) return 3;
-    if (sizeof c != 2) return 4;
-    if (sizeof after_c != 4) return 5;
-
-    if (sizeof d != 8) return 6;
-    if (sizeof(AfterD) != 4) return 7;
-
-    if (sizeof s.m != 4) return 8;
-
-    if (sizeof u != 1) return 9;
-    /* Still unsigned, and narrow: -1 wraps to 255 rather than sign-extending.
-       Tested by the stored value, not by `u - 1 < 0`, which the integer
-       promotions make an `int` comparison whatever `u` is. */
-    u = (unsigned)-1;
-    if (u != 255) return 10;
-    if (sizeof after_u != 4) return 11;
-
-    if (sizeof(T) != 2) return 12;
-    if (sizeof(AfterT) != 4) return 13;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("mode_only_its_declarator", code, &[]), 0);
-}
-
-/// A bit-field must read only its own bits, and keep all of them through a
-/// brace initializer (#C119, #C120).
-///
-/// Two defects that meet on the wide bit-field. **The load** walked every byte
-/// of the access span with no "does this byte hold any of the field's bits?"
-/// test -- the skip its *store* sibling has always had -- so a field in a
-/// window wider than itself read the object's **padding**. Every `__int128`
-/// bit-field is such a field: its window is sixteen bytes. The stray bytes were
-/// also shifted by more than the 64-bit carrier's width, which x86-64 masks
-/// (folding padding into the result) and aarch64's assembler rejects outright,
-/// so the same source would not even build there.
-///
-/// **The brace initializer** then converted the value twice: to the member's
-/// type, correctly, and again to a type derived from the *span*, where
-/// `bitfield_storage_type` answers `unsigned int` for anything but 1, 2, 4 or 8
-/// bytes. A 64-bit field in a sixteen-byte window, or in a packed nine-byte
-/// span, kept 32 bits of its initializer. Assignment was unaffected, so
-/// `p.a = ~0ULL` was right and `= {~0ULL}` was not.
-///
-/// The padding is deliberately dirtied; with it zero the load bug is invisible.
-#[test]
-fn c99_wide_bitfields_read_only_their_own_bits() {
-    let code = r#"
-struct A { unsigned __int128 a:64; };
-struct B { unsigned __int128 a:64, b:64; };
-struct C { unsigned __int128 a:32; };
-struct D { unsigned __int128 a:1; };
-struct __attribute__((packed)) P { unsigned c:1; unsigned long long a:64; };
-struct Q { unsigned __int128 a:64; };
-
-int main(void) {
-    /* Reading: the window is wider than the field, so the bytes beyond it must
-       not contribute. */
-    struct A x; __builtin_memset(&x, 0xAA, sizeof x);
-    x.a = 0x1122334455667788ULL;
-    if (x.a != 0x1122334455667788ULL) return 1;
-
-    struct B y; __builtin_memset(&y, 0xAA, sizeof y);
-    y.a = 1; y.b = 2;
-    if (y.a != 1 || y.b != 2) return 2;
-
-    struct C z; __builtin_memset(&z, 0xAA, sizeof z);
-    z.a = 0xDEADBEEFu;
-    if (z.a != 0xDEADBEEFu) return 3;
-
-    struct D w; __builtin_memset(&w, 0xAA, sizeof w);
-    w.a = 1;
-    if (w.a != 1) return 4;
-    w.a = 0;
-    if (w.a != 0) return 5;
-
-    /* Initializing: the value must not be narrowed to a span-derived type. */
-    struct P p = { 0, 0xFFFFFFFFFFFFFFFFULL };
-    if (p.a != 0xFFFFFFFFFFFFFFFFULL) return 6;
-    struct Q q = { 0xFFFFFFFFFFFFFFFFULL };
-    if (q.a != 0xFFFFFFFFFFFFFFFFULL) return 7;
-
-    /* Assignment always worked and must continue to. */
-    p.a = 0x0123456789ABCDEFULL;
-    if (p.a != 0x0123456789ABCDEFULL) return 8;
-
-    /* The narrow and packed spans the same code serves. */
-    struct E { unsigned a:20, b:20; } e = { 0xABCDE, 0x12345 };
-    if (e.a != 0xABCDEu || e.b != 0x12345u) return 9;
-    struct F { char pre; unsigned a:20; char post; } f = { 1, 0xFEDCB, 2 };
-    if (f.pre != 1 || f.a != 0xFEDCBu || f.post != 2) return 10;
-
-    /* `_Bool` still normalises through its own type, not the storage unit. */
-    struct G { _Bool b:1; } g = { 2 };
-    if (g.b != 1) return 11;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("wide_bitfield_own_bits", code, &[]), 0);
 }
 
 /// `__attribute__((transparent_union))` (#C51): a caller may pass any member
@@ -1248,356 +1640,8 @@ int main(void) {
 }
 
 // ============================================================================
-// C17 6.7.7 — typedef of a variably modified type
-//
-// "If a typedef name specifies a variably modified type then it shall have
-// block scope. The array size expressions are evaluated each time the
-// declaration of the typedef name is reached in the order of execution."
-//
-// c17 rejected these outright: "typedef of a variable-length array type is not
-// supported". Two hazards justified the rejection rather than a miscompile --
-// the `vla_sizes` side channel made a typedef'd VM type indistinguishable from
-// an incomplete `int a[]`, and `linearize_local_decl` dispatched on STATIC and
-// `vla_sizes` without ever testing TYPEDEF, so a block-scope one was lowered
-// as a runtime allocation of the array itself.
-// ============================================================================
-
-/// The size is fixed when the typedef is *declared*, not when it is used, so
-/// changing `n` afterwards must not change the type. Every expected value here
-/// was taken from `gcc -std=c17`.
-#[test]
-fn c17_vm_typedef_evaluates_its_extent_at_the_typedef() {
-    let code = r#"
-int n = 4;
-int main(void) {
-    typedef int T[n];
-    n = 100;                    /* after the typedef */
-    T a;
-    if (sizeof(T) != 4 * sizeof(int)) return 1;
-    if (sizeof(a) != 4 * sizeof(int)) return 2;
-    a[0] = 1; a[3] = 2;
-    if (a[0] + a[3] != 3) return 3;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("c17_vm_typedef_extent", code, &[]), 0);
-}
-
-/// "evaluated each time the declaration ... is reached", which means *once*
-/// per execution of the typedef, however many objects it then declares.
-#[test]
-fn c17_vm_typedef_evaluates_its_extent_exactly_once() {
-    let code = r#"
-static int calls = 0;
-static int side(void) { calls++; return 4; }
-
-int main(void) {
-    typedef int T[side()];
-    T a, b;
-    if (calls != 1) return 1;               /* one evaluation, two objects */
-    if (sizeof(a) != sizeof(b)) return 2;
-    if (sizeof(a) != 4 * sizeof(int)) return 3;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("c17_vm_typedef_once", code, &[]), 0);
-}
-
-/// Reaching the declaration again re-evaluates it: each turn of the loop gets
-/// the extent in force at that turn.
-#[test]
-fn c17_vm_typedef_re_evaluates_when_reached_again() {
-    let code = r#"
-int main(void) {
-    unsigned long total = 0;
-    for (int i = 1; i <= 3; i++) {
-        typedef int T[i];
-        T a;
-        a[0] = i;
-        total += sizeof(T) / sizeof(int);
-    }
-    return total == 6 ? 0 : 1;      /* 1 + 2 + 3 */
-}
-"#;
-    assert_eq!(compile_and_run("c17_vm_typedef_reeval", code, &[]), 0);
-}
-
-/// A pointer to a variably modified array, and a two-dimensional one: the
-/// extents belong to the pointee, so the object itself is an ordinary pointer.
-#[test]
-fn c17_vm_typedef_composes_with_pointers_and_dimensions() {
-    let code = r#"
-int main(void) {
-    int n = 3, m = 4;
-    typedef int Row[m];
-    typedef int Grid[n][m];
-
-    Grid g;
-    if (sizeof(g) != (unsigned long)n * m * sizeof(int)) return 1;
-    if (sizeof(g[0]) != (unsigned long)m * sizeof(int)) return 2;
-
-    Row *p = g;
-    p[1][2] = 7;
-    if (g[1][2] != 7) return 3;
-
-    typedef int (*PRow)[m];
-    if (sizeof(PRow) != sizeof(int *)) return 4;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("c17_vm_typedef_compose", code, &[]), 0);
-}
-
-/// 6.7.7p3's other half: such a typedef "shall have block scope". At file
-/// scope there is nothing to evaluate the extent, and c17 must say so.
-#[test]
-fn c17_vm_typedef_is_rejected_at_file_scope() {
-    let code = r#"
-int n = 4;
-typedef int T[n];
-int main(void) { return 0; }
-"#;
-    assert_eq!(
-        compile_and_run("c17_vm_typedef_file_scope", code, &[]),
-        -1,
-        "a file-scope variably modified typedef must be rejected"
-    );
-}
-
-// ============================================================================
 // Declarations that must be accepted
 // ============================================================================
-
-/// A null pointer constant assigns to a function pointer.
-///
-/// 6.5.16.1p1 lets a null pointer constant assign to any pointer, and
-/// 6.3.2.3p3 makes `(void *)0` one -- which is exactly how glibc spells
-/// `NULL`. The check for it was read only in the "target is a pointer, value
-/// is not" branch, which a null constant that has already decayed to `void *`
-/// never reaches: it was judged by the pointer-to-pointer rules instead, and
-/// those diagnose a `void *` meeting a function pointer. So every `fp = NULL`
-/// warned, and any `-Werror` build using function pointers broke.
-#[test]
-fn c99_null_constant_assigns_to_a_function_pointer() {
-    let code = r#"
-#include <stddef.h>
-
-typedef void (*handler)(int);
-static handler h1 = NULL;
-static handler h2 = (void *)0;
-static handler h3 = 0;
-
-static void hit(int x) { (void)x; }
-
-int main(void)
-{
-    handler h = NULL;
-    if (h != NULL) return 1;
-    h = (void *)0;
-    if (h) return 2;
-    h = hit;
-    if (!h) return 3;
-    h = 0;
-    if (h) return 4;
-    if (h1 || h2 || h3) return 5;
-
-    /* A void* still round-trips through an object pointer. */
-    int i = 7;
-    void *v = &i;
-    int *p = v;
-    if (*p != 7) return 6;
-    return 0;
-}
-"#;
-    // The warning is the defect, so the compile must be clean, not merely
-    // successful.
-    crate::common::compile_expect_no_diagnostic("null_fnptr", code, "forbids");
-    assert_eq!(compile_and_run("null_fnptr_run", code, &[]), 0);
-}
-
-/// A `typedef` of an incomplete type is legal at block scope.
-///
-/// 6.7p7 asks for a complete type where an *object* is declared. A typedef
-/// declares no object, and the file-scope path has always said so; the
-/// block-scope path did not, so `typedef struct Incomplete T;` inside a
-/// function was rejected.
-#[test]
-fn c99_block_scope_typedef_of_an_incomplete_type() {
-    let code = r#"
-struct Incomplete;
-union AlsoIncomplete;
-
-int main(void)
-{
-    typedef struct Incomplete T;
-    typedef union AlsoIncomplete U;
-    T *p = 0;
-    U *q = 0;
-
-    /* Completing it later in the block is a different declaration, and the
-       typedef still names the incomplete one -- but a pointer to it is fine. */
-    if (p || q) return 1;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("block_typedef_incomplete", code, &[]), 0);
-}
-
-/// A qualified tentative definition is completed by completing its tag.
-///
-/// 6.9.2p3 lets a file-scope tentative definition be completed later. A
-/// qualified spelling -- `volatile struct S` -- is interned as a fresh type
-/// holding a clone of the tag's composite data as it stood at the time, and
-/// completing the tag mutates only the tag's own entry. Judging the recorded
-/// id therefore read a frozen "incomplete" that nothing could ever update.
-#[test]
-fn c99_qualified_tentative_definition_is_completed_by_its_tag() {
-    let code = r#"
-struct S;
-volatile struct S vs;
-const struct S cs;
-struct S plain;
-struct S { int a; };
-
-union U;
-volatile union U vu;
-union U { int b; };
-
-int main(void)
-{
-    if (vs.a != 0) return 1;
-    if (cs.a != 0) return 2;
-    if (plain.a != 0) return 3;
-    if (vu.b != 0) return 4;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("qualified_tentative_def", code, &[]), 0);
-}
-
-/// `__attribute__((mode(M)))` belongs to the declarator it is written on.
-///
-/// Only the eight *declarator* sites consumed the pending mode. A struct
-/// member's declarator was not one of them, so a mode on a member did two
-/// wrong things at once: it did not size the member, and it stayed pending
-/// until the next declarator that did consume one -- the enclosing
-/// declaration's. `struct Big { int arr[100]; int x
-/// __attribute__((mode(QI))); } b;` gave `sizeof b == 1` against gcc's 404,
-/// because the QI mode was applied to `b` rather than to `x`.
-///
-/// Parameters had the same gap, without the leak: a mode on a parameter was
-/// silently ignored.
-#[test]
-fn c99_mode_attribute_binds_to_its_own_declarator() {
-    let code = r#"
-/* The regression: a member's mode must not reach the enclosing object. */
-struct Big { int arr[100]; int x __attribute__((mode(QI))); } b;
-_Static_assert(sizeof b == 404, "a member's mode is not the object's");
-_Static_assert(sizeof b.x == 1, "and it does size the member");
-
-/* Both spellings, before and after the declarator. */
-struct After  { int a __attribute__((mode(QI))); };
-struct Before { int __attribute__((mode(QI))) a; };
-_Static_assert(sizeof(struct After) == 1, "mode after the declarator");
-_Static_assert(sizeof(struct Before) == 1, "mode before the declarator");
-
-/* It must not reach the *next* member either. */
-struct Two { int a __attribute__((mode(QI))); int b; };
-_Static_assert(sizeof(struct Two) == 8, "a mode stops at its own member");
-
-/* Widening as well as narrowing. */
-struct Wide { int a __attribute__((mode(DI))); };
-_Static_assert(sizeof(struct Wide) == 8, "mode(DI) widens a member");
-
-/* Signedness is the declared type's, not the mode's. */
-struct Signs {
-    unsigned u __attribute__((mode(QI)));
-    int s __attribute__((mode(QI)));
-};
-
-int param_sized(int x __attribute__((mode(QI)))) { return sizeof x; }
-
-int main(void)
-{
-    struct Signs sg;
-    sg.u = 200; sg.s = -1;
-    if (sg.u != 200) return 1;
-    if (sg.s != -1) return 2;
-
-    if (param_sized(0) != 1) return 3;
-
-    b.x = 1;
-    if (sizeof b != 404) return 4;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("mode_binds_to_declarator", code, &[]), 0);
-}
-
-/// `__attribute__((vector_size(N)))` gives a type a vector's storage.
-///
-/// It used to be rejected outright, on the reasoning that ignoring it would
-/// silently leave the type scalar and that no C system header uses it. The
-/// first half is right; the second is not. glibc's `<link.h>` declares
-/// `La_x86_64_xmm`, `La_x86_64_ymm` and `La_x86_64_zmm` with it, so the
-/// rejection made that header -- and anything including it -- uncompilable.
-///
-/// c17 gives such a type the size and alignment a vector has, modelled as an
-/// array of its elements, which is exactly the layout GCC produces. What it
-/// deliberately does not give is element-wise arithmetic: that needs a real
-/// vector type in the IR and in both backends. An array does not accept `+`,
-/// so the gap surfaces as a diagnostic where the arithmetic is written rather
-/// than as a computation that silently runs on one element -- which is the
-/// failure the outright rejection was guarding against.
-#[test]
-fn c99_vector_size_has_a_vector_s_storage() {
-    let code = r#"
-typedef float V4 __attribute__((vector_size(16)));
-typedef float V8 __attribute__((vector_size(32)));
-typedef double D8 __attribute__((vector_size(64)));
-typedef short S8 __attribute__((vector_size(16)));
-
-/* A vector aligns to its width rounded to a power of two, capped at 16 --
-   GCC's default on both targets. So a 32-byte vector aligns to 16, not 32. */
-_Static_assert(sizeof(V4) == 16 && _Alignof(V4) == 16, "V4");
-_Static_assert(sizeof(V8) == 32 && _Alignof(V8) == 16, "V8 caps at 16");
-_Static_assert(sizeof(D8) == 64 && _Alignof(D8) == 16, "D8 caps at 16");
-_Static_assert(sizeof(S8) == 16 && _Alignof(S8) == 16, "S8");
-
-/* Below the cap the alignment follows the width. */
-typedef float V2 __attribute__((vector_size(8)));
-typedef float V1 __attribute__((vector_size(4)));
-_Static_assert(sizeof(V2) == 8 && _Alignof(V2) == 8, "V2");
-_Static_assert(sizeof(V1) == 4 && _Alignof(V1) == 4, "V1");
-
-/* ...unless the source says otherwise, which is what <link.h> writes. */
-typedef float A8 __attribute__((vector_size(32), aligned(16)));
-_Static_assert(sizeof(A8) == 32, "A8 size");
-_Static_assert(_Alignof(A8) == 16, "an explicit alignment wins over the width");
-
-/* The <link.h> shape: vectors as union and struct members, never operated on. */
-typedef union { V8 ymm[2]; D8 zmm[1]; V4 xmm[4]; } Vec __attribute__((aligned(16)));
-_Static_assert(sizeof(Vec) == 64, "union of vectors");
-_Static_assert(_Alignof(Vec) == 16, "union alignment");
-
-struct Regs { unsigned long a; Vec v[8]; unsigned long b; };
-_Static_assert(_Alignof(struct Regs) == 16, "struct alignment");
-_Static_assert(sizeof(struct Regs) == 544, "struct layout matches gcc");
-
-int main(void)
-{
-    Vec v;
-    /* Element access through the array view still works. */
-    v.xmm[0][0] = 1.5f;
-    v.xmm[3][3] = 2.5f;
-    if (v.xmm[0][0] != 1.5f) return 1;
-    if (v.xmm[3][3] != 2.5f) return 2;
-    if (sizeof v.ymm != 64) return 3;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("vector_size_storage", code, &[]), 0);
-}
 
 /// The header that made the rejection a build blocker.
 ///
@@ -1629,30 +1673,42 @@ int main(void)
     let _ = code;
 }
 
-/// C17 6.5.16.1p2: the value of an assignment expression is the value *stored
-/// in* the object. For a bit-field that is the truncated, sign-extended field
-/// -- not the value that was written.
+/// Bit-field arithmetic and VLA storage cases run at the matrix levels and at -O2.
 ///
-/// The store path always narrowed correctly, so `x.f` read back right; it was
-/// the value handed to the surrounding expression that was wrong, which only
-/// shows when the assignment is used rather than performed for its effect.
-/// Grepping the whole test tree for `if ((s.f = ...) ...)` found nothing, so
-/// nothing exercised it. gcc.c-torture's `921016-1` does, in one line:
-/// `if((l.m=j)==j)abort();` with `signed int m:11` and `j` 1081.
-///
-/// `++x.f` is the same question, since `++E` is `E += 1`. The postfix forms
-/// are not: they yield the value loaded before the update, which the load
-/// path already narrowed.
+/// Consolidates these single-program tests, one C section each; every
+/// original doc comment is the comment above its section:
+/// - `c99_bitfield_assignment_expression_value` (exit codes 1..26)
+/// - `c99_bitfield_integer_promotion` (exit codes 27..39)
+/// - `c99_unary_operators_promote_bitfields` (exit codes 40..54)
+/// - `c99_wide_bitfield_arithmetic_at_declared_width` (exit codes 55..78)
+/// - `c99_vla_storage_is_released_on_scope_exit` (exit codes 79..84)
 #[test]
-fn c99_bitfield_assignment_expression_value() {
+fn c99_bitfield_and_vla_o2_mega() {
     let code = r#"
+// ==== Section 1: t_c99_bitfield_assignment_expression_value (was #[test] c99_bitfield_assignment_expression_value) ====
+// Exit codes 1..26 (local code + 0).
+//
+// C17 6.5.16.1p2: the value of an assignment expression is the value *stored
+// in* the object. For a bit-field that is the truncated, sign-extended field
+// -- not the value that was written.
+//
+// The store path always narrowed correctly, so `x.f` read back right; it was
+// the value handed to the surrounding expression that was wrong, which only
+// shows when the assignment is used rather than performed for its effect.
+// Grepping the whole test tree for `if ((s.f = ...) ...)` found nothing, so
+// nothing exercised it. gcc.c-torture's `921016-1` does, in one line:
+// `if((l.m=j)==j)abort();` with `signed int m:11` and `j` 1081.
+//
+// `++x.f` is the same question, since `++E` is `E += 1`. The postfix forms
+// are not: they yield the value loaded before the update, which the load
+// path already narrowed.
 struct s3  { signed int f : 3; };
 struct u3  { unsigned int f : 3; };
 struct s11 { signed int m : 11; };
 struct wide { unsigned long long b : 40; };
 struct mixed { signed int a : 5; unsigned int b : 5; int pad; };
 
-int main(void) {
+static int t_c99_bitfield_assignment_expression_value(void) {
     /* Plain assignment: 9 does not fit in 3 signed bits. */
     { struct s3 x; if ((x.f = 9) != 1) return 1; if (x.f != 1) return 2; }
     { struct s3 x; if ((x.f = 7) != -1) return 3; if (x.f != -1) return 4; }
@@ -1689,35 +1745,28 @@ int main(void) {
       if (m.b != 0 || m.pad != 77) return 26; }
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_bitfield_assign_value", code, &[]), 0);
-    assert_eq!(
-        compile_and_run("c99_bitfield_assign_value_o2", code, &["-O2".to_string()]),
-        0
-    );
-}
 
-/// C17 6.3.1.1p2: a bit-field takes the integer promotions like any narrow
-/// integer -- to `int` when `int` can represent all its values, otherwise to
-/// `unsigned int`.
-///
-/// What makes this its own question is that the width is a property of the
-/// *member*, not of the type: an `unsigned int f : 7` has type
-/// `unsigned int`, so asking `integer_promote` about the type alone answers
-/// "no change" and `b.f - 2` comes out a huge unsigned value where C says -1.
-///
-/// The conversion is made explicit in the tree rather than only in the
-/// expression's result type, because a comparison takes its signedness from
-/// its operands and not from its own `int` result: left implicit,
-/// `b.u7 > -1` still compared unsigned and answered false.
-#[test]
-fn c99_bitfield_integer_promotion() {
-    let code = r#"
+// ==== Section 2: t_c99_bitfield_integer_promotion (was #[test] c99_bitfield_integer_promotion) ====
+// Exit codes 27..39 (local code + 26).
+//
+// C17 6.3.1.1p2: a bit-field takes the integer promotions like any narrow
+// integer -- to `int` when `int` can represent all its values, otherwise to
+// `unsigned int`.
+//
+// What makes this its own question is that the width is a property of the
+// *member*, not of the type: an `unsigned int f : 7` has type
+// `unsigned int`, so asking `integer_promote` about the type alone answers
+// "no change" and `b.f - 2` comes out a huge unsigned value where C says -1.
+//
+// The conversion is made explicit in the tree rather than only in the
+// expression's result type, because a comparison takes its signedness from
+// its operands and not from its own `int` result: left implicit,
+// `b.u7 > -1` still compared unsigned and answered false.
 struct b { signed int s7 : 7; unsigned int u7 : 7; unsigned int u31 : 31;
            unsigned int u32 : 32; signed int s32 : 32; };
 struct w { unsigned long long b40 : 40; signed long long s40 : 40; };
 
-int main(void) {
+static int t_c99_bitfield_integer_promotion(void) {
     struct b v; v.s7 = 1; v.u7 = 1; v.u31 = 1; v.u32 = 1; v.s32 = 1;
 
     /* A field narrower than int promotes to int, whatever its own sign. */
@@ -1746,29 +1795,22 @@ int main(void) {
     { struct w w1; w1.s40 = -1; if (w1.s40 >= 0) return 13; }
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_bitfield_promotion", code, &[]), 0);
-    assert_eq!(
-        compile_and_run("c99_bitfield_promotion_o2", code, &["-O2".to_string()]),
-        0
-    );
-}
 
-/// Unary `-` and `~` take the integer promotions too (C17 6.5.3.3p3, p4), and
-/// that includes the bit-field rule.
-///
-/// Both operators open-coded the promotion as a `TypeKind` test for
-/// `_Bool`/`char`/`short`. That is right as far as it goes and cannot see a
-/// bit-field at all, because the width is a property of the member rather than
-/// of the type — so `-v.u7 < 0` was false where C and gcc say true. A gap in
-/// the commit that added bit-field promotion for the *binary* operators: the
-/// rule went in one place and the unary operators kept their own copy.
-///
-/// Both now route through the same helper, which is the point: two copies of a
-/// promotion rule is how this happened.
-#[test]
-fn c99_unary_operators_promote_bitfields() {
-    let code = r#"
+// ==== Section 3: t_c99_unary_operators_promote_bitfields (was #[test] c99_unary_operators_promote_bitfields) ====
+// Exit codes 40..54 (local code + 39).
+//
+// Unary `-` and `~` take the integer promotions too (C17 6.5.3.3p3, p4), and
+// that includes the bit-field rule.
+//
+// Both operators open-coded the promotion as a `TypeKind` test for
+// `_Bool`/`char`/`short`. That is right as far as it goes and cannot see a
+// bit-field at all, because the width is a property of the member rather than
+// of the type — so `-v.u7 < 0` was false where C and gcc say true. A gap in
+// the commit that added bit-field promotion for the *binary* operators: the
+// rule went in one place and the unary operators kept their own copy.
+//
+// Both now route through the same helper, which is the point: two copies of a
+// promotion rule is how this happened.
 struct B {
     unsigned u7  : 7;
     signed   s7  : 7;
@@ -1777,7 +1819,7 @@ struct B {
     unsigned long long u40 : 40;  /* wider than int: no promotion */
 };
 
-int main(void) {
+static int t_c99_unary_operators_promote_bitfields(void) {
     struct B v;
     v.u7 = 1; v.s7 = 1; v.u31 = 1; v.u32 = 1; v.u40 = 1;
 
@@ -1812,45 +1854,31 @@ int main(void) {
     { unsigned short h = 1; if (!(~h < 0)) return 15; }
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("c99_unary_bitfield_promotion", code, &[]),
-        0
-    );
-    assert_eq!(
-        compile_and_run(
-            "c99_unary_bitfield_promotion_o2",
-            code,
-            &["-O2".to_string()]
-        ),
-        0
-    );
-}
 
-/// Arithmetic on a bit-field **wider than `int`** is carried out at the
-/// field's declared width.
-///
-/// C17 6.7.2.1p10: a bit-field "is interpreted as having a signed or unsigned
-/// integer type consisting of the specified number of bits". 6.2.5p9 then
-/// reduces an unsigned result modulo 2^width. So with
-/// `unsigned long long b : 40` holding 0x100, `x.b << 32` is **zero** — every
-/// set bit shifts out of the 40-bit type. c17 computed it in 64 bits.
-///
-/// Distinct from the promotion rule: a field *narrower* than `int` promotes to
-/// `int`, which the type can express. A wider one does not promote at all, and
-/// its width is a property of the member rather than of the type — so the
-/// width rides beside the type on the expression instead of in it. That is
-/// deliberate: `sizeof` must stay 8, which gcc agrees with, so this is a
-/// precision and not a size, and a type that answered 40 to `size_bits` would
-/// be wrong everywhere the ABI, DWARF and the backends look at it.
-///
-/// Which operators carry the width, and from where, was read off gcc:
-/// arithmetic and bitwise take the **wider** operand's width, so `u40 * u33`
-/// and `u33 * u40` agree; a shift takes the left operand's alone, per 6.5.7p3;
-/// a comparison yields `int` and carries nothing.
-#[test]
-fn c99_wide_bitfield_arithmetic_at_declared_width() {
-    let code = r#"
+// ==== Section 4: t_c99_wide_bitfield_arithmetic_at_declared_width (was #[test] c99_wide_bitfield_arithmetic_at_declared_width) ====
+// Exit codes 55..78 (local code + 54).
+//
+// Arithmetic on a bit-field **wider than `int`** is carried out at the
+// field's declared width.
+//
+// C17 6.7.2.1p10: a bit-field "is interpreted as having a signed or unsigned
+// integer type consisting of the specified number of bits". 6.2.5p9 then
+// reduces an unsigned result modulo 2^width. So with
+// `unsigned long long b : 40` holding 0x100, `x.b << 32` is **zero** — every
+// set bit shifts out of the 40-bit type. c17 computed it in 64 bits.
+//
+// Distinct from the promotion rule: a field *narrower* than `int` promotes to
+// `int`, which the type can express. A wider one does not promote at all, and
+// its width is a property of the member rather than of the type — so the
+// width rides beside the type on the expression instead of in it. That is
+// deliberate: `sizeof` must stay 8, which gcc agrees with, so this is a
+// precision and not a size, and a type that answered 40 to `size_bits` would
+// be wrong everywhere the ABI, DWARF and the backends look at it.
+//
+// Which operators carry the width, and from where, was read off gcc:
+// arithmetic and bitwise take the **wider** operand's width, so `u40 * u33`
+// and `u33 * u40` agree; a shift takes the left operand's alone, per 6.5.7p3;
+// a comparison yields `int` and carries nothing.
 struct s {
     unsigned long long u33 : 33;
     unsigned long long u40 : 40;
@@ -1858,7 +1886,7 @@ struct s {
     signed   long long s40 : 40;
 };
 
-int main(void) {
+static int t_c99_wide_bitfield_arithmetic_at_declared_width(void) {
     struct s a = {0x100000, 0x100000, 0x100000, 0};
     struct s b = {0x100000000ULL, 0x100000000ULL, 0x100000000ULL, 0};
     struct s c;
@@ -1919,32 +1947,25 @@ int main(void) {
       if (v.f != 0xFFFFFFFFFFFFFFFFULL) return 24; }
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_wide_bitfield_width", code, &[]), 0);
-    assert_eq!(
-        compile_and_run("c99_wide_bitfield_width_o2", code, &["-O2".to_string()]),
-        0
-    );
-}
 
-/// A variable-length array's storage is released when control leaves the
-/// scope of its declaration (C17 6.2.4p7).
-///
-/// c17 never released any of it, so every cycle through a VLA declaration
-/// grew the stack until the program died: a VLA in a loop body, a backward
-/// `goto` to a label ahead of the declaration, a `continue` past it, and a
-/// VLA in a `switch` arm all ran out of stack within a few thousand
-/// iterations. The torture tests are `20040811-1` and `pr43220`, which use
-/// the `goto` spelling, but the loop shapes are the common ones.
-///
-/// The counts here are large on purpose: the defect is unbounded growth, so
-/// a handful of iterations proves nothing.
-#[test]
-fn c99_vla_storage_is_released_on_scope_exit() {
-    let code = r#"
+// ==== Section 5: t_c99_vla_storage_is_released_on_scope_exit (was #[test] c99_vla_storage_is_released_on_scope_exit) ====
+// Exit codes 79..84 (local code + 78).
+//
+// A variable-length array's storage is released when control leaves the
+// scope of its declaration (C17 6.2.4p7).
+//
+// c17 never released any of it, so every cycle through a VLA declaration
+// grew the stack until the program died: a VLA in a loop body, a backward
+// `goto` to a label ahead of the declaration, a `continue` past it, and a
+// VLA in a `switch` arm all ran out of stack within a few thousand
+// iterations. The torture tests are `20040811-1` and `pr43220`, which use
+// the `goto` spelling, but the loop shapes are the common ones.
+//
+// The counts here are large on purpose: the defect is unbounded growth, so
+// a handful of iterations proves nothing.
 void *volatile p;
 
-int main(void) {
+static int t_c99_vla_storage_is_released_on_scope_exit(void) {
     /* A VLA in a loop body, at each loop spelling. */
     for (int i = 0; i < 200000; i++) { int x[i % 500 + 1]; x[0] = i; p = x; }
     { int j = 0; while (j++ < 200000) { int y[j % 500 + 1]; y[0] = j; p = y; } }
@@ -2098,54 +2119,51 @@ int main(void) {
     }
     return 0;
 }
+
+/* Dispatcher: section k's failure code c is returned as base_k + c. */
+int main(void) {
+    int r;
+    if ((r = t_c99_bitfield_assignment_expression_value()) != 0) return 0 + r;
+    if ((r = t_c99_bitfield_integer_promotion()) != 0) return 26 + r;
+    if ((r = t_c99_unary_operators_promote_bitfields()) != 0) return 39 + r;
+    if ((r = t_c99_wide_bitfield_arithmetic_at_declared_width()) != 0) return 54 + r;
+    if ((r = t_c99_vla_storage_is_released_on_scope_exit()) != 0) return 78 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("c99_vla_scope_release", code, &[]), 0);
     assert_eq!(
-        compile_and_run("c99_vla_scope_release_o2", code, &["-O2".to_string()]),
+        compile_and_run("c99_bitfield_and_vla_o2_mega", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run(
+            "c99_bitfield_and_vla_o2_mega_o2",
+            code,
+            &["-O2".to_string()]
+        ),
         0
     );
 }
 
-/// `packed` on one member drops that member's alignment to 1, so it is laid
-/// out at the next byte and no longer raises the struct's alignment; the
-/// members around it keep theirs. c17 accepted the attribute there and laid
-/// the member out as if it were absent: `struct { char a; int b
-/// __attribute__((packed)); }` was 8 bytes, where gcc makes it 5. An
-/// `aligned` written alongside still raises the member back. Every size and
-/// offset here is gcc's.
+/// `packed` members and enums, run everywhere (host matrix, -O0, -O2, aarch64).
+///
+/// Consolidates these single-program tests, one C section each; every
+/// original doc comment is the comment above its section:
+/// - `c99_packed_member_against_pack_and_aligned` (exit codes 1..14)
+/// - `c99_packed_enum_is_its_smallest_integer_type` (exit codes 15..24)
+/// - `c99_packed_enum_placements_and_uses` (exit codes 25..39)
 #[test]
-fn c99_packed_member_drops_only_its_own_alignment() {
+fn c99_packed_everywhere_mega() {
     let code = r#"
-#include <stddef.h>
-struct A { char a; int b __attribute__((packed)); };
-struct B { char a; int b __attribute__((packed)); char c; };
-struct C { char a; long b __attribute__((packed)); int c; };
-struct D { char a; struct { char x; int y; } s __attribute__((packed)); };
-struct E { char a; int b __attribute__((packed, aligned(2))); };
-int main(void) {
-    struct B b = { 1, 0x12345678, 3 };
-    if (sizeof(struct A) != 5 || offsetof(struct A, b) != 1 || _Alignof(struct A) != 1) return 1;
-    if (sizeof(struct B) != 6 || offsetof(struct B, c) != 5) return 2;
-    if (sizeof(struct C) != 16 || offsetof(struct C, b) != 1 || offsetof(struct C, c) != 12) return 3;
-    if (sizeof(struct D) != 9 || offsetof(struct D, s) != 1) return 4;
-    if (sizeof(struct E) != 6 || offsetof(struct E, b) != 2) return 5;
-    if (b.a != 1 || b.b != 0x12345678 || b.c != 3) return 6;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("packed_member", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("packed_member_opt", code), 0);
-}
-
-/// `packed` on a member against the rest of the alignment rules, on both
-/// targets: a packed bit-field takes the next free bit and adds no alignment,
-/// `#pragma pack(n)` caps a member's written `aligned` as well as its type's,
-/// a struct-level `packed` leaves a member's own `aligned` in force, and a
-/// union is as aligned as its least-packed member. Every size, offset and
-/// byte image here is gcc's, the same on x86-64 and aarch64.
-#[test]
-fn c99_packed_member_against_pack_and_aligned() {
-    let code = r#"
+// ==== Section 1: t_c99_packed_member_against_pack_and_aligned (was #[test] c99_packed_member_against_pack_and_aligned) ====
+// Exit codes 1..14 (local code + 0).
+//
+// `packed` on a member against the rest of the alignment rules, on both
+// targets: a packed bit-field takes the next free bit and adds no alignment,
+// `#pragma pack(n)` caps a member's written `aligned` as well as its type's,
+// a struct-level `packed` leaves a member's own `aligned` in force, and a
+// union is as aligned as its least-packed member. Every size, offset and
+// byte image here is gcc's, the same on x86-64 and aarch64.
 #include <stddef.h>
 #include <string.h>
 struct I { char a; int b:12 __attribute__((packed)); char c; };
@@ -2168,7 +2186,7 @@ struct T { char a; ai8 b __attribute__((packed)); };
 static int image(const void *p, size_t n, const char *want) {
     return memcmp(p, want, n) != 0;
 }
-int main(void) {
+static int t_c99_packed_member_against_pack_and_aligned(void) {
     struct I i; struct W w; struct X x;
     if (sizeof(struct I) != 4 || _Alignof(struct I) != 1 || offsetof(struct I, c) != 3) return 1;
     memset(&i, 0, sizeof i); i.b = -1;
@@ -2189,28 +2207,23 @@ int main(void) {
     if (sizeof(struct T) != 5 || offsetof(struct T, b) != 1) return 14;
     return 0;
 }
-"#;
-    compile_and_run_everywhere("packed_member_rules", code);
-}
 
-/// `packed` on an enum makes it the smallest integer type that holds its
-/// values, as gcc's `-fshort-enums` does for every enum: one byte for
-/// `{A0, A1}`, signed when an enumerator is negative, two for a value of 300.
-/// c17 rejected the attribute between `enum` and the tag as a parse error and
-/// ignored it after the list, leaving a four-byte enum where gcc lays out
-/// one. Every size here is gcc's, on both targets.
-#[test]
-fn c99_packed_enum_is_its_smallest_integer_type() {
-    crate::common::compile_and_run_everywhere(
-        "packed_enum",
-        r#"
+// ==== Section 2: t_c99_packed_enum_is_its_smallest_integer_type (was #[test] c99_packed_enum_is_its_smallest_integer_type) ====
+// Exit codes 15..24 (local code + 14).
+//
+// `packed` on an enum makes it the smallest integer type that holds its
+// values, as gcc's `-fshort-enums` does for every enum: one byte for
+// `{A0, A1}`, signed when an enumerator is negative, two for a value of 300.
+// c17 rejected the attribute between `enum` and the tag as a parse error and
+// ignored it after the list, leaving a four-byte enum where gcc lays out
+// one. Every size here is gcc's, on both targets.
 enum __attribute__((packed)) A { A0, A1 };          /* 1 byte, unsigned char */
 enum B { B0 = -1, B1 } __attribute__((packed));     /* 1 byte, signed char */
 enum __attribute__((__packed__)) C { C0 = 300 };    /* 2 bytes */
 enum __attribute__((packed)) D { D0 = 70000 };      /* 4 bytes */
 typedef enum __attribute__((packed)) { T0, T1 } T;  /* anonymous, typedef'd */
 struct S { char c; enum A a; enum C k; };           /* packed enums keep their natural alignment */
-int main(void) {
+static int t_c99_packed_enum_is_its_smallest_integer_type(void) {
     if (sizeof(enum A) != 1 || _Alignof(enum A) != 1) return 1;
     if (sizeof(enum B) != 1) return 2;
     if (sizeof(enum C) != 2 || _Alignof(enum C) != 2) return 3;
@@ -2225,326 +2238,60 @@ int main(void) {
     if (!__builtin_types_compatible_p(enum B, signed char)) return 10;
     return 0;
 }
-"#,
-    );
-}
 
-/// `packed` on an enum in every position gcc reads it, and what a packed
-/// enum does once declared: gcc ignores it on a forward declaration and
-/// ignores `aligned` on an enum altogether; bit-fields keep the enum's
-/// signedness; a value promotes to `int` and the constants stay `int`; a
-/// member wider than `int` widens the enum to 8 bytes.
-#[test]
-fn c99_packed_enum_placements_and_uses() {
-    crate::common::compile_and_run_everywhere(
-        "packed_enum_uses",
-        r#"
-enum __attribute__((packed)) A { A0, A1, A2 = 200 };      /* between enum and tag */
-enum N { N0 = -100, N1 = 100 } __attribute__((packed));    /* after the brace */
-typedef enum { T0, T1 } __attribute__((packed)) T;         /* typedef, after the brace */
+// ==== Section 3: t_c99_packed_enum_placements_and_uses (was #[test] c99_packed_enum_placements_and_uses) ====
+// Exit codes 25..39 (local code + 24).
+//
+// `packed` on an enum in every position gcc reads it, and what a packed
+// enum does once declared: gcc ignores it on a forward declaration and
+// ignores `aligned` on an enum altogether; bit-fields keep the enum's
+// signedness; a value promotes to `int` and the constants stay `int`; a
+// member wider than `int` widens the enum to 8 bytes.
+// Renamed for the merge: A -> s2_A, A0 -> s2_A0, A1 -> s2_A1, N -> s2_N, T -> s2_T, T0 -> s2_T0, T1 -> s2_T1, W -> s2_W
+enum __attribute__((packed)) s2_A { s2_A0, s2_A1, A2 = 200 };      /* between enum and tag */
+enum s2_N { N0 = -100, N1 = 100 } __attribute__((packed));    /* after the brace */
+typedef enum { s2_T0, s2_T1 } __attribute__((packed)) s2_T;         /* typedef, after the brace */
 enum __attribute__((packed)) { X0 = 300 } x;               /* anonymous */
-enum __attribute__((packed)) W { W0 = 0x100000000 };       /* needs 8 bytes */
+enum __attribute__((packed)) s2_W { W0 = 0x100000000 };       /* needs 8 bytes */
 enum F;
 enum __attribute__((packed)) F { F0 };                     /* defined packed after a forward declaration */
 enum __attribute__((packed)) G;
 enum G { G0 };                                             /* packed only on the forward declaration */
 enum __attribute__((aligned(8))) AL { AL0 };               /* aligned on an enum is ignored */
 enum AL2 { AL20 } __attribute__((aligned(16))) al2;
-struct BF { enum A a : 8; enum N n : 3; enum N m : 8; char c; };
-__attribute__((noinline)) enum A pick(enum N n, enum A a) { return n < 0 ? a : A0; }
-int main(void) {
-    if (sizeof(enum A) != 1 || _Alignof(enum A) != 1) return 1;
-    if (sizeof(enum N) != 1 || sizeof(T) != 1) return 2;
+struct BF { enum s2_A a : 8; enum s2_N n : 3; enum s2_N m : 8; char c; };
+__attribute__((noinline)) enum s2_A pick(enum s2_N n, enum s2_A a) { return n < 0 ? a : s2_A0; }
+static int t_c99_packed_enum_placements_and_uses(void) {
+    if (sizeof(enum s2_A) != 1 || _Alignof(enum s2_A) != 1) return 1;
+    if (sizeof(enum s2_N) != 1 || sizeof(s2_T) != 1) return 2;
     if (sizeof x != 2 || _Alignof(x) != 2) return 3;
-    if (sizeof(enum W) != 8 || sizeof(W0) != 8) return 4;
+    if (sizeof(enum s2_W) != 8 || sizeof(W0) != 8) return 4;
     if (sizeof(enum F) != 1 || sizeof(enum G) != 4) return 5;
     if (_Alignof(enum AL) != 4 || _Alignof(al2) != 4) return 6;
     if (sizeof(struct BF) != 4) return 7;
     struct BF b = { A2, -3, N0, 7 };
     if (b.a != 200 || b.n != -3 || b.m != -100 || b.c != 7) return 8;
     /* a packed enum value promotes to int; its constants are int */
-    enum N n = N0;
-    if (sizeof(n * 2) != 4 || n * 2 != -200 || sizeof(A0) != 4) return 9;
+    enum s2_N n = N0;
+    if (sizeof(n * 2) != 4 || n * 2 != -200 || sizeof(s2_A0) != 4) return 9;
     if (_Generic(n + 0, int: 0, default: 1)) return 10;
-    if (!((enum A)-1 > 0) || (enum N)200 != -56) return 11;
-    if (pick(N0, A2) != A2 || pick(N1, A2) != A0) return 12;
-    enum A arr[4] = { A1, A2, A0, A1 };
+    if (!((enum s2_A)-1 > 0) || (enum s2_N)200 != -56) return 11;
+    if (pick(N0, A2) != A2 || pick(N1, A2) != s2_A0) return 12;
+    enum s2_A arr[4] = { s2_A1, A2, s2_A0, s2_A1 };
     if (sizeof arr != 4 || arr[1] + arr[3] != 201) return 13;
-    if (!__builtin_types_compatible_p(T, unsigned char)) return 14;
-    if (!__builtin_types_compatible_p(enum N, signed char)) return 15;
+    if (!__builtin_types_compatible_p(s2_T, unsigned char)) return 14;
+    if (!__builtin_types_compatible_p(enum s2_N, signed char)) return 15;
     return 0;
 }
-"#,
-    );
-}
 
-/// What gcc rejects around a packed enum: an attribute between the tag and
-/// `{`, an empty enumerator list (C17 6.7.2.2p1 does not make it optional),
-/// and a bit-field wider than the enum's one byte.
-#[test]
-fn c99_packed_enum_rejections() {
-    for (name, code, expected) in [
-        (
-            "packed_enum_after_tag",
-            "enum B __attribute__((packed)) { B0 };",
-            "expected identifier",
-        ),
-        ("empty_enum", "enum E { };", "empty enum is invalid"),
-        (
-            "empty_packed_enum",
-            "enum __attribute__((packed)) E { };",
-            "empty enum is invalid",
-        ),
-        (
-            "packed_enum_bitfield_too_wide",
-            "enum __attribute__((packed)) A { A0 }; struct S { enum A a : 9; };",
-            "bitfield width 9 exceeds type size 8",
-        ),
-    ] {
-        crate::common::compile_expect_error(name, &format!("{code}\n"), expected);
-    }
+/* Dispatcher: section k's failure code c is returned as base_k + c. */
+int main(void) {
+    int r;
+    if ((r = t_c99_packed_member_against_pack_and_aligned()) != 0) return 0 + r;
+    if ((r = t_c99_packed_enum_is_its_smallest_integer_type()) != 0) return 14 + r;
+    if ((r = t_c99_packed_enum_placements_and_uses()) != 0) return 24 + r;
+    return 0;
 }
-
-/// An array's element type must be a complete object type (C17 6.7.6.2p1),
-/// wherever the array type is written: a declaration, a pointer to the
-/// array, a parameter that adjusts to a pointer, a member, a typedef, or a
-/// type name in `sizeof`, `_Alignof`, a cast, a compound literal or `va_arg`
-/// -- and when the tag is completed later in the unit. gcc rejects each with
-/// "array type has incomplete element type"; an array of `void` or of
-/// functions is "declaration of 'x' as array of voids" ("of type name" when
-/// abstract). c17 accepted them all.
-#[test]
-fn c99_array_of_incomplete_element_type_is_rejected() {
-    for (name, code, expected) in [
-        (
-            "arr_incomplete_sizeof",
-            "struct I; int n = sizeof(struct I[2]);",
-            "array type has incomplete element type",
-        ),
-        (
-            "arr_incomplete_cast",
-            "struct I; void *p = (struct I(*)[2])0;",
-            "array type has incomplete element type",
-        ),
-        (
-            "arr_incomplete_alignof",
-            "struct I; int f(void) { return _Alignof(struct I[3]); }",
-            "array type has incomplete element type",
-        ),
-        (
-            "arr_incomplete_ptr_decl",
-            "struct I; struct I (*q)[2];",
-            "array type has incomplete element type",
-        ),
-        (
-            "arr_incomplete_extern",
-            "struct I; extern struct I a[2];",
-            "array type has incomplete element type",
-        ),
-        ("arr_of_void", "int n = sizeof(void[2]);", "array of voids"),
-        (
-            "arr_incomplete_va_arg",
-            "#include <stdarg.h>\nstruct I;\n\
-             void f(int n, ...) { va_list ap; va_start(ap, n); va_arg(ap, struct I[2]); }",
-            "array type has incomplete element type 'struct I'",
-        ),
-        (
-            "arr_incomplete_completed_later",
-            "struct I; struct I (*q)[2]; struct I { int x; };",
-            "array type has incomplete element type 'struct I'",
-        ),
-        (
-            "arr_incomplete_tentative_completed_later",
-            "struct I; struct I a[2]; struct I { int x; };",
-            "array type has incomplete element type 'struct I'",
-        ),
-        (
-            "arr_incomplete_unsized",
-            "struct I; extern struct I a[];",
-            "array type has incomplete element type 'struct I'",
-        ),
-        (
-            "arr_incomplete_param",
-            "struct I; void f(struct I a[2]);",
-            "array type has incomplete element type 'struct I'",
-        ),
-        (
-            "arr_incomplete_param_unsized",
-            "struct I; void f(struct I a[]);",
-            "array type has incomplete element type 'struct I'",
-        ),
-        (
-            "arr_incomplete_param_abstract",
-            "struct I; void f(struct I (*)[2]);",
-            "array type has incomplete element type 'struct I'",
-        ),
-        (
-            "arr_incomplete_param_definition",
-            "struct I; void f(struct I a[2]) {}",
-            "array type has incomplete element type 'struct I'",
-        ),
-        (
-            "arr_incomplete_typedef_name",
-            "struct I; typedef struct I T; T a[2];",
-            "array type has incomplete element type",
-        ),
-        (
-            "arr_incomplete_typedef_of_array",
-            "struct I; typedef struct I T[2];",
-            "array type has incomplete element type 'struct I'",
-        ),
-        (
-            "arr_incomplete_union",
-            "union U; extern union U a[2];",
-            "array type has incomplete element type 'union U'",
-        ),
-        (
-            "arr_incomplete_enum",
-            "enum E; extern enum E a[2];",
-            "array type has incomplete element type 'enum E'",
-        ),
-        (
-            "arr_incomplete_member",
-            "struct I; struct S { struct I m[2]; };",
-            "array type has incomplete element type 'struct I'",
-        ),
-        (
-            "arr_incomplete_self_member",
-            "struct S { struct S a[2]; };",
-            "array type has incomplete element type 'struct S'",
-        ),
-        (
-            "arr_incomplete_block_pointer",
-            "struct I; void f(void) { struct I (*p)[2]; }",
-            "array type has incomplete element type 'struct I'",
-        ),
-        (
-            "arr_incomplete_vla_pointer",
-            "struct I; void f(int n) { struct I (*p)[n]; }",
-            "array type has incomplete element type 'struct I'",
-        ),
-        (
-            "arr_incomplete_compound_literal",
-            "struct I; void *g(void) { return (struct I[2]){0}; }",
-            "array type has incomplete element type 'struct I'",
-        ),
-        (
-            "arr_of_unsized_array",
-            "extern int a[3][];",
-            "array type has incomplete element type 'int[]'",
-        ),
-        (
-            "arr_of_unsized_array_grouped",
-            "extern int (a[2])[];",
-            "array type has incomplete element type 'int[]'",
-        ),
-        (
-            "arr_of_unsized_array_param",
-            "void f(int a[3][]);",
-            "array type has incomplete element type 'int[]'",
-        ),
-        (
-            "arr_of_void_declaration",
-            "extern void x[2];",
-            "declaration of 'x' as array of voids",
-        ),
-        (
-            "arr_of_void_grouped",
-            "void (a[2]);",
-            "declaration of 'a' as array of voids",
-        ),
-        (
-            "arr_of_void_member",
-            "struct S { void m[2]; };",
-            "declaration of 'm' as array of voids",
-        ),
-        (
-            "arr_of_void_param",
-            "void f(void a[]);",
-            "declaration of 'a' as array of voids",
-        ),
-        (
-            "arr_of_void_type_name",
-            "int n = sizeof(void[2]);",
-            "declaration of type name as array of voids",
-        ),
-        (
-            "arr_of_functions",
-            "int a[2](void);",
-            "declaration of 'a' as array of functions",
-        ),
-        (
-            "arr_of_functions_grouped",
-            "int (a[2])(void);",
-            "declaration of 'a' as array of functions",
-        ),
-        (
-            "arr_of_functions_param",
-            "void f(int a[](void));",
-            "declaration of 'a' as array of functions",
-        ),
-        (
-            "arr_of_functions_type_name",
-            "int n = sizeof(int[2](void));",
-            "declaration of type name as array of functions",
-        ),
-    ] {
-        crate::common::compile_expect_error(name, &format!("{code}\n"), expected);
-    }
-}
-
-/// The accept side of C17 6.7.6.2p1, each checked against gcc: an element
-/// type completed before the array is formed, a pointer element, a variable
-/// length or `[*]` extent (complete, though known only at run time), an
-/// incomplete *outer* extent, a grouped declarator over its outer suffix, and
-/// a qualified spelling of a tag completed after its first mention.
-#[test]
-fn c99_array_of_complete_element_type_is_accepted() {
-    for (name, code) in [
-        (
-            "arr_ok_completed",
-            "struct I { int x; }; extern struct I a[2];",
-        ),
-        (
-            "arr_ok_completed_after_pointer",
-            "struct I; struct I *p; struct I { int x; }; struct I (*q)[2];",
-        ),
-        (
-            "arr_ok_qualified_completed",
-            "struct I; struct I { int x; }; const struct I a[2]; \
-             int n = sizeof(const struct I[2]);",
-        ),
-        (
-            "arr_ok_enum",
-            "enum E { A }; enum E e[2]; const enum E f[2];",
-        ),
-        ("arr_ok_self_pointer", "struct S { struct S *n; } a[2];"),
-        ("arr_ok_pointer_to_incomplete", "struct I; struct I *a[2];"),
-        (
-            "arr_ok_outer_unsized",
-            "extern int a[][3]; void f(int b[][3]);",
-        ),
-        (
-            "arr_ok_grouped",
-            "int (a[3]); int (b[2])[3]; void (*c[2])(void); int ((*d)[2]);\n\
-             void (*(e[2]))(void); int (*(*g)(void))[3];",
-        ),
-        (
-            "arr_ok_vla",
-            "void f(int n, int m) { int a[n][m]; int (*p)[n]; typedef int V[n]; \
-             V x[2]; int (*q)[n][m]; (void)a; (void)p; (void)x; (void)q; }",
-        ),
-        ("arr_ok_star", "void f(int n, int a[*][*]);"),
-        (
-            "arr_ok_va_arg",
-            "#include <stdarg.h>\nvoid f(int n, ...) { va_list ap; va_start(ap, n); \
-             int (*p)[2] = va_arg(ap, int(*)[2]); (void)p; va_end(ap); }",
-        ),
-        (
-            "arr_ok_flexible_member",
-            "struct F { int n; int a[]; }; struct F *p;",
-        ),
-    ] {
-        crate::common::compile_expect_ok(name, &format!("{code}\n"));
-    }
+"#;
+    compile_and_run_everywhere("c99_packed_everywhere_mega", code);
 }

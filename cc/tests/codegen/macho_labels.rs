@@ -15,7 +15,7 @@
 // expression") as soon as an epilogue's CFI follows a block label.
 //
 
-use super::asm_probe::{asm_for_with, AARCH64_DARWIN, AARCH64_LINUX, X86_64_LINUX};
+use super::asm_probe::{asm_for_with, AARCH64_DARWIN};
 use std::process::{Command, Output};
 
 const X86_64_DARWIN: &str = "x86_64-apple-darwin";
@@ -25,124 +25,11 @@ const X86_64_DARWIN: &str = "x86_64-apple-darwin";
 /// a function whose name needs quoting, a switch, string literals and a
 /// compound literal referenced from data, wide strings, TLS, a constant pool,
 /// `asm goto`, a frame too large for one immediate, a VLA, constructors and
-/// destructors.
-const PROGRAM: &str = r#"
-int g(int);
-static const char *names[] = { "zero", "one", "two" };
-const char *greeting = "hello";
-int *file_cl = (int[]){ 4, 5, 6 };
-const int *wide = (const int *)L"wide";
-_Thread_local int tls_counter;
-double scale(double x) { return x * 1.25 + 0.5; }
-int epilogue(int x) { if (x) return g(x) + 1; return 3; }
-int many_returns(int x) {
-    for (int i = 0; i < x; i++) {
-        if (g(i) == 7) return i;
-        if (g(i) < 0) return -i;
-    }
-    return x > 3 ? 1 : 2;
-}
-int dispatch(int op) {
-    static void *table[] = { &&add, &&sub, &&done };
-    int acc = 0;
-    goto *table[op % 3];
-add: acc += 2; goto done;
-sub: acc -= 2;
-done: return acc;
-}
-int müller(int x) {
-    void *targets[] = { &&lab0, &&lab1 };
-    goto *targets[x & 1];
-lab0: return 1;
-lab1: return 2;
-}
-int sw(int v) {
-    switch (v) {
-    case 0: return g(10); case 1: return g(11); case 2: return g(12);
-    case 3: return g(13); case 4: return g(14); case 5: return g(15);
-    case 6: return g(16); case 7: return g(17); default: return -1;
-    }
-}
-int jumped(int x) {
-#if defined(__aarch64__)
-    __asm__ goto ("cbz %w0, %l[out]" : : "r"(x) : : out);
-#else
-    __asm__ goto ("testl %0, %0; jz %l[out]" : : "r"(x) : : out);
-#endif
-    return 1;
-out:
-    return 0;
-}
-int big_frame(int i) {
-    volatile char buf[70000];
-    buf[i] = (char)i;
-    return buf[69999 - i] + g(i);
-}
-int vla(int n) {
-    int a[n];
-    for (int i = 0; i < n; i++) a[i] = g(i);
-    return n ? a[n - 1] : 0;
-}
-int bump(void) { return ++tls_counter; }
-const char *name_of(int i) { return names[i % 3]; }
-__attribute__((constructor)) static void init(void) { tls_counter = 1; }
-__attribute__((destructor)) static void fini(void) { tls_counter = 0; }
-long double ld(long double x) { return x * 3.0L; }
-"#;
+/// destructors. The private-label spellings are checked in process by
+/// `cc/test_asm/codegen_macho_labels.rs`; this file assembles it.
+const PROGRAM: &str = include_str!("macho_labels.c");
 
 const OPTION_SETS: [&[&str]; 4] = [&["-O0"], &["-O2"], &["-O0", "-g"], &["-O2", "-g"]];
-
-/// Lines of `asm` that define or reference a name spelled `.L…`.
-fn dot_l_mentions(asm: &str) -> Vec<&str> {
-    asm.lines()
-        .filter(|line| {
-            line.match_indices(".L").any(|(at, _)| {
-                at == 0
-                    || !matches!(line.as_bytes()[at - 1],
-                        b'_' | b'.' | b'$' | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z')
-            })
-        })
-        .collect()
-}
-
-/// No `.L` name reaches Mach-O output: each one is spelled `L…`, which is
-/// what that assembler treats as private. ELF output keeps `.L`.
-#[test]
-fn codegen_macho_private_labels_use_the_l_prefix() {
-    for triple in [AARCH64_DARWIN, X86_64_DARWIN] {
-        for opts in OPTION_SETS {
-            let asm = asm_for_with("macho_labels_text", triple, PROGRAM, opts);
-            let leaked = dot_l_mentions(&asm);
-            assert!(
-                leaked.is_empty(),
-                "{triple} {opts:?}: `.L` names are ordinary symbols on Mach-O:\n{}",
-                leaked.join("\n")
-            );
-            for label in ["\nLepilogue_", "\nLC0:", "\nLdispatch_"] {
-                assert!(
-                    asm.contains(label),
-                    "{triple} {opts:?}: expected a private label `{}`:\n{asm}",
-                    label.trim()
-                );
-            }
-        }
-    }
-    for triple in [X86_64_LINUX, AARCH64_LINUX] {
-        let asm = asm_for_with("elf_labels_text", triple, PROGRAM, &["-O2", "-g"]);
-        for label in [
-            "\n.Lepilogue_",
-            "\n.LC0:",
-            "\n.Ldispatch_",
-            "\n.Ldebug_line0:",
-        ] {
-            assert!(
-                asm.contains(label),
-                "{triple}: expected an ELF private label `{}`:\n{asm}",
-                label.trim()
-            );
-        }
-    }
-}
 
 /// Assemble `input` as Mach-O for `arch` (`arm64` or `x86_64`): with
 /// `llvm-mc` wherever it is installed, else with the system assembler on a

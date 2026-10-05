@@ -10,18 +10,25 @@
 // VRP shapes, constant conditions and the branches they decide.
 //
 
-use crate::codegen::asm_probe::{asm_for_with, body_of, X86_64_LINUX};
-use crate::common::{
-    asm_for_at, compile_and_run, compile_and_run_aarch64, compile_and_run_optimized,
-};
+use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_optimized};
 
 // ============================================================================
 // Mega-test: Optimization correctness
 // ============================================================================
 
+/// Optimizer regressions, one program run at -O1
+/// (`compile_and_run_optimized`).
+///
+/// Consolidates these tests, one section each (each original `main` is
+/// a `noinline` section function; the program exits with the section's
+/// base plus the original code):
+/// - `codegen_optimization_mega`: 1..=81
+/// - `codegen_phisource_optimized`: 82..=85
 #[test]
-fn codegen_optimization_mega() {
+fn codegen_optimization_all_mega() {
     let code = r#"
+/* ---- codegen_optimization_mega: exits 1..81
+ */
 int counter = 0;
 
 int side_effect(int x) {
@@ -31,7 +38,8 @@ int side_effect(int x) {
 
 int global_var = 0;
 
-int main(void) {
+static __attribute__((noinline)) int t_optimization_mega(void)
+{
     // ========== BASIC ARITHMETIC (returns 1-9) ==========
     {
         int a = 2 + 3;
@@ -132,18 +140,70 @@ int main(void) {
 
     return 0;
 }
+
+/* ---- codegen_phisource_optimized: exits 82..85
+ */
+static __attribute__((noinline)) int t_phisource_optimized(void)
+{
+    // Test PhiSource survives optimization passes (DCE, instcombine, inlining)
+    int x = 10;
+
+    // Ternary at -O2
+    int a = (x > 5) ? x + 1 : x - 1;
+    if (a != 11) return 1;
+
+    // Logical ops at -O2
+    int b = (x > 0 && x < 100);
+    if (b != 1) return 2;
+
+    int c = (x < 0 || x > 5);
+    if (c != 1) return 3;
+
+    // Loop at -O2
+    int sum = 0;
+    for (int i = 1; i <= 10; i++) {
+        sum += i;
+    }
+    if (sum != 55) return 4;
+
+    return 0;
+}
+
+int main(void)
+{
+    int r;
+    if ((r = t_optimization_mega()) != 0) return r;
+    if ((r = t_phisource_optimized()) != 0) return 81 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run_optimized("opt_mega", code), 0);
+    assert_eq!(compile_and_run_optimized("optimization_all_mega", code), 0);
 }
 
 // ============================================================================
 // PhiSource integration tests
 // ============================================================================
 
+/// Phi sources, switches and `sizeof` forms, one program run at the
+/// compile matrix levels.
+///
+/// Consolidates these tests, one section each (each original `main` is
+/// a `noinline` section function; the program exits with the section's
+/// base plus the original code):
+/// - `codegen_phisource_ternary`: 1..=4
+/// - `codegen_phisource_logical_and_or`: 5..=16
+/// - `codegen_phisource_loop_phi`: 17..=20
+/// - `codegen_switch_64bit`: 21..=25
+/// - `codegen_ternary_div_by_zero`: 26..=30
+/// - `codegen_sizeof_through_typeof`: 31..=42
+/// - `codegen_sizeof_of_array_objects`: 43..=51
 #[test]
-fn codegen_phisource_ternary() {
+fn codegen_optimizer_mega() {
     let code = r#"
-int main(void) {
+/* ---- codegen_phisource_ternary: exits 1..4
+ */
+static __attribute__((noinline)) int t_phisource_ternary(void)
+{
     // Ternary produces phi with PhiSource in each branch
     int x = 10;
     int y = 20;
@@ -163,17 +223,14 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("phisource_ternary", code, &[]), 0);
-}
 
-#[test]
-fn codegen_phisource_logical_and_or() {
-    let code = r#"
+/* ---- codegen_phisource_logical_and_or: exits 5..16
+ */
 int side = 0;
 int inc(void) { side++; return side; }
 
-int main(void) {
+static __attribute__((noinline)) int t_phisource_logical_and_or(void)
+{
     // Logical AND produces phi via short-circuit
     int a = (1 && 1);
     if (a != 1) return 1;
@@ -220,14 +277,11 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("phisource_logical", code, &[]), 0);
-}
 
-#[test]
-fn codegen_phisource_loop_phi() {
-    let code = r#"
-int main(void) {
+/* ---- codegen_phisource_loop_phi: exits 17..20
+ */
+static __attribute__((noinline)) int t_phisource_loop_phi(void)
+{
     // Simple loop with induction variable (SSA phi)
     int sum = 0;
     for (int i = 0; i < 10; i++) {
@@ -270,45 +324,10 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("phisource_loop", code, &[]), 0);
-}
 
-#[test]
-fn codegen_phisource_optimized() {
-    let code = r#"
-int main(void) {
-    // Test PhiSource survives optimization passes (DCE, instcombine, inlining)
-    int x = 10;
-
-    // Ternary at -O2
-    int a = (x > 5) ? x + 1 : x - 1;
-    if (a != 11) return 1;
-
-    // Logical ops at -O2
-    int b = (x > 0 && x < 100);
-    if (b != 1) return 2;
-
-    int c = (x < 0 || x > 5);
-    if (c != 1) return 3;
-
-    // Loop at -O2
-    int sum = 0;
-    for (int i = 1; i <= 10; i++) {
-        sum += i;
-    }
-    if (sum != 55) return 4;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run_optimized("phisource_optimized", code), 0);
-}
-
-/// Test: switch on long value compares all 64 bits
-#[test]
-fn codegen_switch_64bit() {
-    let code = r#"
+/* ---- codegen_switch_64bit: exits 21..25
+ * Test: switch on long value compares all 64 bits
+ */
 int classify(long val) {
     switch (val) {
         case 0L: return 0;
@@ -319,7 +338,8 @@ int classify(long val) {
     }
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_switch_64bit(void)
+{
     if (classify(0L) != 0) return 1;
     if (classify(1L) != 1) return 2;
     if (classify(0x100000000L) != 2) return 3;
@@ -328,8 +348,138 @@ int main(void) {
 
     return 0;
 }
+
+/* ---- codegen_ternary_div_by_zero: exits 26..30
+ * Regression test: ternary operator with division evaluated both branches
+ * unconditionally using cmov, causing SIGFPE when the divisor was zero.
+ * `b == 0 ? 0 : (a / b) + 1` crashed because `a / b` was computed even
+ * when `b == 0`.
+ */
+long safe_div(long a, long b) {
+    return b == 0 ? 0 : (a / b) + 1;
+}
+
+int safe_mod(int a, int b) {
+    return b == 0 ? -1 : a % b;
+}
+
+static __attribute__((noinline)) int t_ternary_div_by_zero(void)
+{
+    /* Division by zero should return 0, not crash */
+    if (safe_div(10, 0) != 0) return 1;
+    if (safe_div(10, 2) != 6) return 2;
+    if (safe_div(100, 3) != 34) return 3;
+
+    /* Modulo by zero should return -1, not crash */
+    if (safe_mod(10, 0) != -1) return 4;
+    if (safe_mod(10, 3) != 1) return 5;
+
+    return 0;
+}
+
+/* ---- codegen_sizeof_through_typeof: exits 31..42
+ * `sizeof` through `typeof` answers the real size (#C89).
+ *
+ * A `typeof` yielded a bare `TypeId`, and `int[]`, `int[n]` and `int[m]` all
+ * intern to one type -- so a VLA's extent did not survive it and
+ * `sizeof(typeof(a))` answered **0** where gcc answers the size. The two
+ * operand forms need different mechanisms and both are exercised here:
+ * `typeof(type-name)` carries the extent expressions out of the
+ * specifier-qualifier list the way #C52 carries a type-name's own, while
+ * `typeof(expr)` is rewritten to `sizeof(expr)`, whose answer lives in the
+ * declaration of the object and which the linearizer already recorded.
+ *
+ * Both dimension orders are checked. Concatenating declarator and specifier
+ * extents the wrong way round makes `int[3][n]` and `int[n][3]` the same size
+ * -- right for one shape and wrong for another, the failure the 2026-08-17
+ * series existed to remove.
+ */
+static __attribute__((noinline)) int t_sizeof_through_typeof(void)
+{
+    int n = 4;
+    int a[n];
+    int b[3][n];
+    int fixed[4];
+
+    /* typeof of an expression: the answer is the declaration's. */
+    if (sizeof(typeof(a)) != 16) return 1;
+    if (sizeof(typeof(b)) != 48) return 2;
+    if (sizeof(typeof(fixed)) != 16) return 3;
+    if (sizeof(typeof(n)) != sizeof(int)) return 4;
+
+    /* typeof of a type-name: the extents ride out of the specifier list. */
+    if (sizeof(typeof(int[n])) != 16) return 5;
+    if (sizeof(typeof(int[n][2])) != 32) return 6;
+    if (sizeof(typeof(int[3][n])) != 48) return 7;
+    if (sizeof(typeof(int[n])[3]) != 48) return 8;
+    if (sizeof(typeof(int)) != 4) return 9;
+    if (sizeof(typeof(int[n]) *) != sizeof(void *)) return 10;
+
+    /* A different extent gives a different answer, so nothing is being
+       folded to a constant behind our back. */
+    int m = 7;
+    int c[m];
+    if (sizeof(typeof(c)) != 28) return 11;
+    if (sizeof(typeof(int[m])) != 28) return 12;
+
+    return 0;
+}
+
+/* ---- codegen_sizeof_of_array_objects: exits 43..51
+ * The sizes that #C112's check must not disturb, and the one it repaired.
+ *
+ * The two declarator paths disagreed about how an absent extent is spelled --
+ * `parse_declarator` recorded `None`, the file-scope loop collapsed it to
+ * `Some(0)` -- which made `int a[];` indistinguishable from the GNU
+ * zero-length `int a[0];`. Both are exercised here, along with the composite
+ * type 6.2.7p4 forms when a later declaration completes an earlier one.
+ */
+int inferred[] = {1, 2, 3};
+int zero_length[0];
+char from_string[] = "hi";
+int two_d[2][3];
+extern int completed[];
+int completed[4];
+
+static __attribute__((noinline)) int t_sizeof_of_array_objects(void)
+{
+    if (sizeof inferred != 3 * sizeof(int)) return 1;
+    if (sizeof zero_length != 0) return 2;
+    if (sizeof from_string != 3) return 3;
+    if (sizeof two_d != 6 * sizeof(int)) return 4;
+    if (sizeof completed != 4 * sizeof(int)) return 5;
+
+    int n = 5;
+    int vla[n];
+    if (sizeof vla != 5 * sizeof(int)) return 6;
+    int vla2[n][3];
+    if (sizeof vla2 != 15 * sizeof(int)) return 7;
+
+    /* A different extent gives a different answer, so nothing is folding to a
+       constant behind the test's back. */
+    n = 7;
+    int vla3[n];
+    if (sizeof vla3 != 7 * sizeof(int)) return 8;
+
+    int fixed[4];
+    if (sizeof fixed != 4 * sizeof(int)) return 9;
+    return 0;
+}
+
+int main(void)
+{
+    int r;
+    if ((r = t_phisource_ternary()) != 0) return r;
+    if ((r = t_phisource_logical_and_or()) != 0) return 4 + r;
+    if ((r = t_phisource_loop_phi()) != 0) return 16 + r;
+    if ((r = t_switch_64bit()) != 0) return 20 + r;
+    if ((r = t_ternary_div_by_zero()) != 0) return 25 + r;
+    if ((r = t_sizeof_through_typeof()) != 0) return 30 + r;
+    if ((r = t_sizeof_of_array_objects()) != 0) return 42 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("switch_64bit", code, &[]), 0);
+    assert_eq!(compile_and_run("optimizer_mega", code, &[]), 0);
 }
 
 // ============================================================================
@@ -376,44 +526,28 @@ int main(void) {
     assert_eq!(compile_and_run("codegen_large_switch_stack", &code, &[]), 0);
 }
 
-/// Regression test: ternary operator with division evaluated both branches
-/// unconditionally using cmov, causing SIGFPE when the divisor was zero.
-/// `b == 0 ? 0 : (a / b) + 1` crashed because `a / b` was computed even
-/// when `b == 0`.
-#[test]
-fn codegen_ternary_div_by_zero() {
-    let code = r#"
-long safe_div(long a, long b) {
-    return b == 0 ? 0 : (a / b) + 1;
-}
-
-int safe_mod(int a, int b) {
-    return b == 0 ? -1 : a % b;
-}
-
-int main(void) {
-    /* Division by zero should return 0, not crash */
-    if (safe_div(10, 0) != 0) return 1;
-    if (safe_div(10, 2) != 6) return 2;
-    if (safe_div(100, 3) != 34) return 3;
-
-    /* Modulo by zero should return -1, not crash */
-    if (safe_mod(10, 0) != -1) return 4;
-    if (safe_mod(10, 3) != 1) return 5;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("codegen_ternary_div_by_zero", code, &[]), 0);
-}
-
 // ============================================================================
 // Test: switch-case block-scoped struct stack slot reuse
 // ============================================================================
 
+/// Folds and wide arithmetic the optimizer must keep exact, one program
+/// run at the compile matrix levels and at -O1
+/// (`compile_and_run_optimized`).
+///
+/// Consolidates these tests, one section each (each original `main` is
+/// a `noinline` section function; the program exits with the section's
+/// base plus the original code):
+/// - `codegen_switch_case_slot_reuse`: 1..=4
+/// - `codegen_checked_arith_128bit`: 5..=106
+/// - `codegen_trunc_to_32_discards_the_upper_half`: 107..=117
+/// - `codegen_vm_typedef_extents_index_the_variable_levels`: 118..=126
+/// - `codegen_checked_sub_sees_a_negative_difference`: 127..=142
+/// - `codegen_constant_shift_folds_at_the_operand_width`: 143..=162
 #[test]
-fn codegen_switch_case_slot_reuse() {
+fn codegen_optimizer_folds_mega() {
     let code = r#"
+/* ---- codegen_switch_case_slot_reuse: exits 1..4
+ */
 struct big { long a; long b; long c; long d; };
 
 int test_switch(int sel) {
@@ -443,69 +577,22 @@ int test_switch(int sel) {
     return result;
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_switch_case_slot_reuse(void)
+{
     if (test_switch(0) != 10) return 1;
     if (test_switch(1) != 100) return 2;
     if (test_switch(2) != 1000) return 3;
     if (test_switch(3) != 26) return 4;
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("codegen_switch_case_slot_reuse", code, &[]),
-        0
-    );
-    // Also verify correctness at -O2
-    assert_eq!(
-        compile_and_run_optimized("codegen_switch_case_slot_reuse_opt", code),
-        0
-    );
-}
 
-/// C17 6.7.9p14 lets an array of character type be exactly as long as the
-/// string literal initializing it, dropping the terminating null:
-/// `char b[2] = "hi"` holds two characters and no terminator.
-///
-/// The store loop wrote the null unconditionally, one byte past the object.
-/// A runtime check cannot see that -- the byte lands in stack padding -- so
-/// this counts the stores instead. Both spellings share one routine, so both
-/// are pinned; the six-byte case shows the terminator and the zero fill are
-/// still written when there is room for them.
-#[test]
-fn codegen_exactly_sized_string_initializer_stays_in_bounds() {
-    let src = r#"
-void sink(char *);
-void exact(void)  { char b[2] = "hi";   sink(b); }
-void braced(void) { char b[2] = {"hi"}; sink(b); }
-void roomy(void)  { char b[6] = "hi";   sink(b); }
-"#;
-    let asm = crate::codegen::asm_probe::asm_for(
-        "exact_string_init",
-        crate::codegen::asm_probe::X86_64_LINUX,
-        src,
-    );
-    for func in ["exact", "braced"] {
-        assert_eq!(
-            crate::codegen::asm_probe::count_in_body(&asm, func, "movb"),
-            2,
-            "{func}: char b[2] = \"hi\" must store exactly two bytes, not three\n{asm}"
-        );
-    }
-    // Six bytes of room: two characters, then the null and the zero fill.
-    assert!(
-        crate::codegen::asm_probe::count_in_body(&asm, "roomy", "movb") > 2,
-        "roomy: a longer array must still get its terminator\n{asm}"
-    );
-}
-
-/// `__builtin_*_overflow` with a 128-bit destination. The ordinary lowering
-/// computes in a type twice the destination's width and asks whether narrowing
-/// lost anything; nothing is wider than 128 bits, so at that width it compared
-/// a value to itself and always answered "no overflow". Every expectation here
-/// was taken from `gcc -std=c17` on the same source.
-#[test]
-fn codegen_checked_arith_128bit() {
-    let code = r#"
+/* ---- codegen_checked_arith_128bit: exits 5..106
+ * `__builtin_*_overflow` with a 128-bit destination. The ordinary lowering
+ * computes in a type twice the destination's width and asks whether narrowing
+ * lost anything; nothing is wider than 128 bits, so at that width it compared
+ * a value to itself and always answered "no overflow". Every expectation here
+ * was taken from `gcc -std=c17` on the same source.
+ */
 typedef __int128 i;
 typedef unsigned __int128 u;
 #define MAXI (((i)1 << 126) - 1 + ((i)1 << 126))
@@ -515,7 +602,8 @@ typedef unsigned __int128 u;
 static int n = 0;
 #define T(e, want) do { n++; if ((e) != (want)) return n; } while (0)
 
-int main(void) {
+static __attribute__((noinline)) int t_checked_arith_128bit(void)
+{
     i r;
     u ur;
 
@@ -571,31 +659,25 @@ int main(void) {
     }
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("codegen_checked_arith_128bit", code, &[]),
-        0
-    );
-    assert_eq!(
-        compile_and_run_optimized("codegen_checked_arith_128bit_opt", code),
-        0
-    );
-}
+#undef MAXI
+#undef MINI
+#undef MAXU
+#undef T
 
-/// Truncating a 128-bit value to 32 bits left the whole low half in the
-/// register. "Already the right width" was true only of the *store* that
-/// usually follows a truncation; anything that read the pseudo directly saw
-/// the bits that were supposed to have been dropped.
-///
-/// `__builtin_add_overflow` is exactly that shape -- compute wide, narrow to
-/// the destination, widen back, compare -- so it compared its result against
-/// an untruncated copy of itself and could never report an overflow on
-/// aarch64. Both aarch64 CI targets failed on it; x86-64 emits the same
-/// self-move and was always right.
-#[test]
-fn codegen_trunc_to_32_discards_the_upper_half() {
-    let code = r#"
-int main(void) {
+/* ---- codegen_trunc_to_32_discards_the_upper_half: exits 107..117
+ * Truncating a 128-bit value to 32 bits left the whole low half in the
+ * register. "Already the right width" was true only of the *store* that
+ * usually follows a truncation; anything that read the pseudo directly saw
+ * the bits that were supposed to have been dropped.
+ *
+ * `__builtin_add_overflow` is exactly that shape -- compute wide, narrow to
+ * the destination, widen back, compare -- so it compared its result against
+ * an untruncated copy of itself and could never report an overflow on
+ * aarch64. Both aarch64 CI targets failed on it; x86-64 emits the same
+ * self-move and was always right.
+ */
+static __attribute__((noinline)) int t_trunc_to_32_discards_the_upper_half(void)
+{
     unsigned ur;
     unsigned x = 4294967295u, y = 1u;
 
@@ -631,129 +713,23 @@ int main(void) {
     }
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("codegen_trunc_to_32_discards_the_upper_half", code, &[]),
-        0
-    );
-    assert_eq!(
-        compile_and_run_optimized("codegen_trunc_to_32_discards_the_upper_half_opt", code),
-        0
-    );
-}
 
-/// `sizeof` through `typeof` answers the real size (#C89).
-///
-/// A `typeof` yielded a bare `TypeId`, and `int[]`, `int[n]` and `int[m]` all
-/// intern to one type -- so a VLA's extent did not survive it and
-/// `sizeof(typeof(a))` answered **0** where gcc answers the size. The two
-/// operand forms need different mechanisms and both are exercised here:
-/// `typeof(type-name)` carries the extent expressions out of the
-/// specifier-qualifier list the way #C52 carries a type-name's own, while
-/// `typeof(expr)` is rewritten to `sizeof(expr)`, whose answer lives in the
-/// declaration of the object and which the linearizer already recorded.
-///
-/// Both dimension orders are checked. Concatenating declarator and specifier
-/// extents the wrong way round makes `int[3][n]` and `int[n][3]` the same size
-/// -- right for one shape and wrong for another, the failure the 2026-08-17
-/// series existed to remove.
-#[test]
-fn codegen_sizeof_through_typeof() {
-    let code = r#"
-int main(void) {
-    int n = 4;
-    int a[n];
-    int b[3][n];
-    int fixed[4];
-
-    /* typeof of an expression: the answer is the declaration's. */
-    if (sizeof(typeof(a)) != 16) return 1;
-    if (sizeof(typeof(b)) != 48) return 2;
-    if (sizeof(typeof(fixed)) != 16) return 3;
-    if (sizeof(typeof(n)) != sizeof(int)) return 4;
-
-    /* typeof of a type-name: the extents ride out of the specifier list. */
-    if (sizeof(typeof(int[n])) != 16) return 5;
-    if (sizeof(typeof(int[n][2])) != 32) return 6;
-    if (sizeof(typeof(int[3][n])) != 48) return 7;
-    if (sizeof(typeof(int[n])[3]) != 48) return 8;
-    if (sizeof(typeof(int)) != 4) return 9;
-    if (sizeof(typeof(int[n]) *) != sizeof(void *)) return 10;
-
-    /* A different extent gives a different answer, so nothing is being
-       folded to a constant behind our back. */
-    int m = 7;
-    int c[m];
-    if (sizeof(typeof(c)) != 28) return 11;
-    if (sizeof(typeof(int[m])) != 28) return 12;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("sizeof_through_typeof", code, &[]), 0);
-}
-
-/// The sizes that #C112's check must not disturb, and the one it repaired.
-///
-/// The two declarator paths disagreed about how an absent extent is spelled --
-/// `parse_declarator` recorded `None`, the file-scope loop collapsed it to
-/// `Some(0)` -- which made `int a[];` indistinguishable from the GNU
-/// zero-length `int a[0];`. Both are exercised here, along with the composite
-/// type 6.2.7p4 forms when a later declaration completes an earlier one.
-#[test]
-fn codegen_sizeof_of_array_objects() {
-    let code = r#"
-int inferred[] = {1, 2, 3};
-int zero_length[0];
-char from_string[] = "hi";
-int two_d[2][3];
-extern int completed[];
-int completed[4];
-
-int main(void) {
-    if (sizeof inferred != 3 * sizeof(int)) return 1;
-    if (sizeof zero_length != 0) return 2;
-    if (sizeof from_string != 3) return 3;
-    if (sizeof two_d != 6 * sizeof(int)) return 4;
-    if (sizeof completed != 4 * sizeof(int)) return 5;
-
-    int n = 5;
-    int vla[n];
-    if (sizeof vla != 5 * sizeof(int)) return 6;
-    int vla2[n][3];
-    if (sizeof vla2 != 15 * sizeof(int)) return 7;
-
-    /* A different extent gives a different answer, so nothing is folding to a
-       constant behind the test's back. */
-    n = 7;
-    int vla3[n];
-    if (sizeof vla3 != 7 * sizeof(int)) return 8;
-
-    int fixed[4];
-    if (sizeof fixed != 4 * sizeof(int)) return 9;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("sizeof_of_array_objects", code, &[]), 0);
-}
-
-/// A variably modified typedef's extents are indexed by *variable* extent.
-///
-/// The parser mints one `VmTypedefExtent(sym, k)` per size expression -- one
-/// per variable level, since a constant level has no expression to evaluate --
-/// but the linearizer recorded one entry per *array level*, constants
-/// included. The two agreed only while every level was variable. Add one
-/// constant extent and the index slid:
-///
-///   typedef int T[2][n]; T a;   read the constant 2 where `n` belonged, so
-///                               `sizeof a` was 16 against gcc's 80 and every
-///                               write past `a[0][3]` landed outside `a`.
-#[test]
-fn codegen_vm_typedef_extents_index_the_variable_levels() {
-    let code = r#"
+/* ---- codegen_vm_typedef_extents_index_the_variable_levels: exits 118..126
+ * A variably modified typedef's extents are indexed by *variable* extent.
+ *
+ * The parser mints one `VmTypedefExtent(sym, k)` per size expression -- one
+ * per variable level, since a constant level has no expression to evaluate --
+ * but the linearizer recorded one entry per *array level*, constants
+ * included. The two agreed only while every level was variable. Add one
+ * constant extent and the index slid:
+ *
+ *   typedef int T[2][n]; T a;   read the constant 2 where `n` belonged, so
+ *                               `sizeof a` was 16 against gcc's 80 and every
+ *                               write past `a[0][3]` landed outside `a`.
+ */
 #include <string.h>
 
-int main(void)
+static __attribute__((noinline)) int t_vm_typedef_extents_index_the_variable_levels(void)
 {
     int n = 10, m = 5;
 
@@ -805,26 +781,18 @@ int main(void)
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("vm_typedef_extent_index", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("vm_typedef_extent_index_opt", code),
-        0
-    );
-}
 
-/// A checked subtraction computes signed, because a difference can be
-/// negative even when every operand is unsigned.
-///
-/// Negative is exactly the unrepresentable case for an unsigned destination,
-/// and computing in an unsigned 128-bit type wraps it instead. Then nothing
-/// downstream could see it: `exact < 0` is never true in unsigned arithmetic,
-/// and the narrow fast path returned a hard "no overflow" whenever the wide
-/// type equalled the destination.
-#[test]
-fn codegen_checked_sub_sees_a_negative_difference() {
-    let code = r#"
-int main(void)
+/* ---- codegen_checked_sub_sees_a_negative_difference: exits 127..142
+ * A checked subtraction computes signed, because a difference can be
+ * negative even when every operand is unsigned.
+ *
+ * Negative is exactly the unrepresentable case for an unsigned destination,
+ * and computing in an unsigned 128-bit type wraps it instead. Then nothing
+ * downstream could see it: `exact < 0` is never true in unsigned arithmetic,
+ * and the narrow fast path returned a hard "no overflow" whenever the wide
+ * type equalled the destination.
+ */
+static __attribute__((noinline)) int t_checked_sub_sees_a_negative_difference(void)
 {
     unsigned __int128 u;
     unsigned long long ull;
@@ -861,36 +829,29 @@ int main(void)
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("checked_sub_negative", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("checked_sub_negative_opt", code),
-        0
-    );
-}
 
-/// A constant right shift must fold at the operand's width, with the
-/// signedness the opcode implies.
-///
-/// `Function::const_val` hands back an `i128` holding whatever bit pattern the
-/// constant was built from, and for a narrower operand that can be wider than
-/// the operand: `(int)0xFFFFFFFFu` is stored as 4294967295, not -1. Every
-/// consumer that only *emits* the value truncates and never noticed. Folding
-/// arithmetic on it does notice — `Asr` shifted in zeros and answered
-/// 2147483647 where the operand is -1 and the answer is -1.
-///
-/// So this was a silent wrong answer in ordinary C, at `-O` and above only,
-/// for any arithmetic shift of a constant whose value came through a cast from
-/// an unsigned literal. `-1 >> 1` was always right, which is why nothing
-/// caught it: the literal is already negative there, so the stored i128 agrees
-/// with the operand.
-///
-/// Found while lowering `__builtin_clrsb`, which folds a sign bit down and so
-/// feeds the folder exactly this shape.
-#[test]
-fn codegen_constant_shift_folds_at_the_operand_width() {
-    let code = r#"
-int main(void) {
+/* ---- codegen_constant_shift_folds_at_the_operand_width: exits 143..162
+ * A constant right shift must fold at the operand's width, with the
+ * signedness the opcode implies.
+ *
+ * `Function::const_val` hands back an `i128` holding whatever bit pattern the
+ * constant was built from, and for a narrower operand that can be wider than
+ * the operand: `(int)0xFFFFFFFFu` is stored as 4294967295, not -1. Every
+ * consumer that only *emits* the value truncates and never noticed. Folding
+ * arithmetic on it does notice — `Asr` shifted in zeros and answered
+ * 2147483647 where the operand is -1 and the answer is -1.
+ *
+ * So this was a silent wrong answer in ordinary C, at `-O` and above only,
+ * for any arithmetic shift of a constant whose value came through a cast from
+ * an unsigned literal. `-1 >> 1` was always right, which is why nothing
+ * caught it: the literal is already negative there, so the stored i128 agrees
+ * with the operand.
+ *
+ * Found while lowering `__builtin_clrsb`, which folds a sign bit down and so
+ * feeds the folder exactly this shape.
+ */
+static __attribute__((noinline)) int t_constant_shift_folds_at_the_operand_width(void)
+{
     /* Arithmetic: the operand is negative at its own width. */
     if (((int)0x80000000) >> 31 != -1) return 1;
     if (((int)0x80000000) >> 1 != -1073741824) return 2;
@@ -920,11 +881,24 @@ int main(void) {
     if ((5 << 3) != 40) return 20;
     return 0;
 }
+
+int main(void)
+{
+    int r;
+    if ((r = t_switch_case_slot_reuse()) != 0) return r;
+    if ((r = t_checked_arith_128bit()) != 0) return 4 + r;
+    if ((r = t_trunc_to_32_discards_the_upper_half()) != 0) return 106 + r;
+    if ((r = t_vm_typedef_extents_index_the_variable_levels()) != 0) return 117 + r;
+    if ((r = t_checked_sub_sees_a_negative_difference()) != 0) return 126 + r;
+    if ((r = t_constant_shift_folds_at_the_operand_width()) != 0) return 142 + r;
+    return 0;
+}
 "#;
-    // -O0 evaluates these at run time and was always right; the whole point is
-    // that -O2, which folds them, now agrees.
-    assert_eq!(compile_and_run("codegen_shift_fold", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("codegen_shift_fold_o2", code), 0);
+    assert_eq!(compile_and_run("optimizer_folds_mega", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("optimizer_folds_mega_opt", code),
+        0
+    );
 }
 
 /// Sparse conditional constant propagation: constants follow the *reachable*
@@ -1759,30 +1733,6 @@ fn codegen_aarch64_big_frame_runs() {
     }
 }
 
-/// A prologue's size does not depend on its frame's. It once zeroed the
-/// whole locals area, unrolled -- a megabyte of locals was 125,000 lines of
-/// assembly -- and stores nothing into the frame at all now: C gives an
-/// uninitialized object no value, and every value is read back at the width
-/// it was stored at.
-#[test]
-fn codegen_aarch64_prologue_does_not_grow_with_the_frame() {
-    let target = ["--target", "aarch64-unknown-linux-gnu"];
-    let big = asm_for_at(
-        "a64_big_prologue",
-        "long f(void) { volatile char a[1000000]; a[0] = 1; return a[0]; }\n",
-        &target,
-    );
-    assert!(
-        big.lines().count() < 200,
-        "a 1 MB frame's prologue should not grow with the frame: {} lines",
-        big.lines().count()
-    );
-    assert!(
-        !big.contains("xzr, xzr"),
-        "nothing zeroes the frame:\n{big}"
-    );
-}
-
 /// Members more than 2 GiB into a struct, read and written through a pointer.
 ///
 /// Both backends narrowed a load's or store's IR offset with `as i32`, so
@@ -1886,14 +1836,11 @@ fn codegen_member_past_two_gigabytes_through_a_pointer() {
 /// now stores the constant directly, and a narrow copy of a constant that
 /// does survive is materialized already extended. The program half pins the
 /// values a narrowing conversion produces, on both targets.
+///
+/// The assembly half is `codegen_a_narrow_constant_is_extended_at_compile_time`
+/// in `cc/test_asm/codegen_optimizer.rs`.
 #[test]
 fn codegen_a_narrow_constant_is_extended_at_compile_time() {
-    let src = "void use(char *);\nvoid zeroed(void) { char buf[16] = {0}; use(buf); }\n";
-    let asm = asm_for_with("narrow_const", X86_64_LINUX, src, &["-O2"]);
-    let body = body_of(&asm, "zeroed");
-    assert!(!body.contains("sarl $24"), "{body}");
-    assert!(!body.contains("shll $24"), "{body}");
-
     let run = r#"
 __attribute__((noinline)) int sc(int x) { signed char c = x; return c; }
 __attribute__((noinline)) int uc(int x) { unsigned char c = x; return c; }

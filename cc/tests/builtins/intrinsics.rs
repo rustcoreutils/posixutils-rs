@@ -11,20 +11,41 @@
 // Consolidates: types_compatible, constant_p, unreachable, expect tests
 //
 
-use crate::common::{
-    asm_for_at, asm_symbol, compile_and_run, compile_and_run_aarch64, compile_expect_no_diagnostic,
-};
+use crate::common::{compile_and_run, compile_and_run_aarch64};
 
 // ============================================================================
 // Mega-test: Intrinsic builtins
 // ============================================================================
 
+/// The intrinsic builtins, and every other run-only program of this file built
+/// with no options that defines nothing a builtin would see, as one program. Each
+/// section keeps its original test name and doc comment; see the exit-code table
+/// at the top of the program.
+///
+/// Consolidates: builtins_intrinsics_mega, builtins_checked_arithmetic,
+/// builtins_libc_aliases_without_headers,
+/// builtins_checked_arith_128bit_mixed_signedness,
+/// builtins_enum_constant_has_type_int, builtins_classify_type and
+/// builtins_checked_arith_overflow_p.
 #[test]
 fn builtins_intrinsics_mega() {
     let code = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1- 86  builtins_intrinsics_mega
+ *    88-106  builtins_checked_arithmetic
+ *   108-147  builtins_libc_aliases_without_headers
+ *   149-173  builtins_checked_arith_128bit_mixed_signedness
+ *   175-190  builtins_enum_constant_has_type_int
+ *   192-213  builtins_classify_type
+ *   215-233  builtins_checked_arith_overflow_p
+ */
+
+/* ---- builtins_intrinsics_mega (exit codes 1-86) ----
+ */
 volatile int opaque = 7;
 
-int main(void) {
+static int t_builtins_intrinsics_mega(void) {
     // Values the optimizer cannot know, for the `constant_p` section below.
     int volatile_read = opaque;
     int argc_like = opaque + 1;
@@ -226,26 +247,24 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("builtins_intrinsics_mega", code, &[]), 0);
-}
 
-/// `__builtin_{add,sub,mul}_overflow` and the typed spellings glibc's headers
-/// use. They compute exactly, store the wrapped result through the pointer,
-/// and answer whether wrapping lost anything.
-///
-/// Lowered by computing in 128 bits — which holds every exact sum, difference
-/// and product of two operands of 64 bits or fewer — then narrowing and
-/// widening back: a round trip that changes the value overflowed. That needs
-/// no new opcode on either target, where reading the hardware's flags would.
-///
-/// Every expectation here came from gcc on this source.
-#[test]
-fn builtins_checked_arithmetic() {
-    let code = r#"
+
+/* ---- builtins_checked_arithmetic (exit codes 88-106) ----
+ *
+ *  `__builtin_{add,sub,mul}_overflow` and the typed spellings glibc's headers
+ *  use. They compute exactly, store the wrapped result through the pointer,
+ *  and answer whether wrapping lost anything.
+ *
+ *  Lowered by computing in 128 bits — which holds every exact sum, difference
+ *  and product of two operands of 64 bits or fewer — then narrowing and
+ *  widening back: a round trip that changes the value overflowed. That needs
+ *  no new opcode on either target, where reading the hardware's flags would.
+ *
+ *  Every expectation here came from gcc on this source.
+ */
 #include <limits.h>
 
-int main(void) {
+static int t_builtins_checked_arithmetic(void) {
     int r; long lr; unsigned ur; unsigned long ulr; long long llr;
 
     if (__builtin_add_overflow(1, 2, &r) || r != 3) return 1;
@@ -282,98 +301,24 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("builtins_checked_arithmetic", code, &[]), 0);
-}
-
-/// Builtins that were absent, and are now present.
-///
-/// `__has_builtin` answered 0 for all of these, so guarded code was already
-/// correct -- the risk was the unguarded uses in system headers, and
-/// `__builtin_choose_expr` in particular, which glibc uses to pick between
-/// expressions that are only valid for one argument type.
-///
-/// Most are the library function under a reserved name, so they lower to an
-/// ordinary call rather than an expression node apiece. That also settles the
-/// question a textual expansion would raise: the argument is evaluated once.
-#[test]
-fn builtins_library_and_bit_builtins_are_available() {
-    let code = r#"#include <string.h>
-#include <math.h>
-int main(void) {
-    /* Compile-time selection: the unselected arm is not type-checked. */
-    if (__builtin_choose_expr(1, 2, "not an int") != 2) return 1;
-    if (__builtin_choose_expr(0, "not an int", 3) != 3) return 2;
-    if (sizeof(__builtin_choose_expr(1, (char)0, (long)0)) != 1) return 3;
-    if (sizeof(__builtin_choose_expr(0, (char)0, (long)0)) != 8) return 4;
-
-    /* String builtins. */
-    if (__builtin_strlen("abcd") != 4) return 5;
-    if (__builtin_strlen("") != 0) return 6;
-    if (__builtin_strcmp("abc", "abc") != 0) return 7;
-    if (__builtin_strcmp("abc", "abd") >= 0) return 8;
-    if (__builtin_strcmp("abd", "abc") <= 0) return 9;
-
-    /* Integer absolute value. */
-    if (__builtin_abs(-5) != 5 || __builtin_abs(5) != 5) return 10;
-    if (__builtin_labs(-5L) != 5L) return 11;
-    if (__builtin_llabs(-5LL) != 5LL) return 12;
-    { int n = -7; if (__builtin_abs(n) != 7) return 13; }
-
-    /* Find first set: one-based, zero for zero. */
-    if (__builtin_ffs(0) != 0) return 14;
-    if (__builtin_ffs(1) != 1) return 15;
-    if (__builtin_ffs(8) != 4) return 16;
-    if (__builtin_ffs(0x80000000) != 32) return 17;
-    if (__builtin_ffsl(0L) != 0) return 18;
-    if (__builtin_ffsl(1L << 40) != 41) return 19;
-
-    /* Parity: low bit of the population count. */
-    if (__builtin_parity(0) != 0) return 20;
-    if (__builtin_parity(7) != 1) return 21;
-    if (__builtin_parity(3) != 0) return 22;
-    if (__builtin_parity(0xFFFFFFFFu) != 0) return 23;
-
-    /* Floating point. */
-    if (__builtin_sqrt(16.0) != 4.0) return 24;
-    if (__builtin_sqrt(0.0) != 0.0) return 25;
-    if (__builtin_copysign(3.0, -1.0) != -3.0) return 26;
-    if (__builtin_copysign(-3.0, 1.0) != 3.0) return 27;
-    if (!signbit(__builtin_copysign(0.0, -1.0))) return 28;
 
 
-
-    /* All of them answer __has_builtin honestly. */
-#define CK(n) do { if (!__has_builtin(n)) return 40; } while (0)
-    CK(__builtin_choose_expr); CK(__builtin_strlen); CK(__builtin_strcmp);
-    CK(__builtin_abs); CK(__builtin_labs); CK(__builtin_llabs);
-    CK(__builtin_ffs); CK(__builtin_ffsl); CK(__builtin_parity);
-    CK(__builtin_trap);
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("builtins_library_and_bit", code, &["-lm".to_string()]),
-        0
-    );
-}
-
-/// The libc-alias builtins, used with **no header included at all**.
-///
-/// That is the case they exist for: gcc knows them intrinsically, and the
-/// gcc.c-torture suite leans on it heavily -- `__builtin_abort` alone appears
-/// in 438 of its tests, none of which include `<stdlib.h>`.
-///
-/// Without a header there is no declaration to consult, so c17 synthesizes
-/// one, and the synthesized *return* type is load-bearing: answering `int`
-/// for a function that returns a pointer truncates the address to 32 bits.
-/// Every pointer-returning entry below is therefore compared against the
-/// address it should have given back, which a truncated return cannot match.
-/// Checking `__has_builtin` alone would not catch any of this.
-#[test]
-fn builtins_libc_aliases_without_headers() {
-    let code = r#"
-int main(void) {
+/* ---- builtins_libc_aliases_without_headers (exit codes 108-147) ----
+ *
+ *  The libc-alias builtins, used with **no header included at all**.
+ *
+ *  That is the case they exist for: gcc knows them intrinsically, and the
+ *  gcc.c-torture suite leans on it heavily -- `__builtin_abort` alone appears
+ *  in 438 of its tests, none of which include `<stdlib.h>`.
+ *
+ *  Without a header there is no declaration to consult, so c17 synthesizes
+ *  one, and the synthesized *return* type is load-bearing: answering `int`
+ *  for a function that returns a pointer truncates the address to 32 bits.
+ *  Every pointer-returning entry below is therefore compared against the
+ *  address it should have given back, which a truncated return cannot match.
+ *  Checking `__has_builtin` alone would not catch any of this.
+ */
+static int t_builtins_libc_aliases_without_headers(void) {
     char buf[64];
     char dst[64];
 
@@ -464,31 +409,27 @@ int main(void) {
     CK(__builtin_isinf_sign); CK(__builtin_complex);
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("builtins_libc_aliases_no_headers", code, &[]),
-        0
-    );
-}
+#undef CK
 
-/// `__builtin_*_overflow` asks whether the *mathematical* result fits, and a
-/// 128-bit destination is no exception (#C62).
-///
-/// The ordinary lowering computes in a type twice the destination's width and
-/// asks whether narrowing lost anything; nothing here is wider than 128 bits,
-/// so at that width it compared a value to itself. The fallback examined the
-/// result directly, on operands already converted to the destination -- which
-/// is not value-preserving for a negative operand with an unsigned
-/// destination, so `__builtin_add_overflow(-1, 5u, &u128)` reported overflow
-/// where the answer is 4.
-///
-/// When both operands are narrower than 128 bits the exact computation still
-/// fits (a sum needs 65 bits, a product 128), so only the *check* changes:
-/// from "did narrowing lose anything" to "is the exact value representable".
-#[test]
-fn builtins_checked_arith_128bit_mixed_signedness() {
-    let code = r#"
-int main(void) {
+
+/* ---- builtins_checked_arith_128bit_mixed_signedness (exit codes 149-173) ----
+ *
+ *  `__builtin_*_overflow` asks whether the *mathematical* result fits, and a
+ *  128-bit destination is no exception (#C62).
+ *
+ *  The ordinary lowering computes in a type twice the destination's width and
+ *  asks whether narrowing lost anything; nothing here is wider than 128 bits,
+ *  so at that width it compared a value to itself. The fallback examined the
+ *  result directly, on operands already converted to the destination -- which
+ *  is not value-preserving for a negative operand with an unsigned
+ *  destination, so `__builtin_add_overflow(-1, 5u, &u128)` reported overflow
+ *  where the answer is 4.
+ *
+ *  When both operands are narrower than 128 bits the exact computation still
+ *  fits (a sum needs 65 bits, a product 128), so only the *check* changes:
+ *  from "did narrowing lose anything" to "is the exact value representable".
+ */
+static int t_builtins_checked_arith_128bit_mixed_signedness(void) {
     unsigned __int128 u;
     __int128 s;
 
@@ -538,38 +479,36 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("checked_arith_128_mixed", code, &[]), 0);
-}
 
-/// An enumeration constant has type `int` (C17 6.4.4.3p2), not the type of the
-/// enumeration it belongs to.
-///
-/// c17 reported the enumeration's type for every constant, which is right only
-/// where it has to be: when a member does not fit in `int` the whole
-/// enumeration widens, and calling the constant `int` would lose the value.
-/// Below that it is simply wrong, and observable --
-/// `__builtin_types_compatible_p (typeof (hot), int)` answered 0 where gcc and
-/// the standard say 1.
-///
-/// Every expectation here was taken from gcc on this source.
-#[test]
-fn builtins_enum_constant_has_type_int() {
-    let code = r#"
-int i;
-double d;
+
+/* ---- builtins_enum_constant_has_type_int (exit codes 175-190) ----
+ *
+ *  An enumeration constant has type `int` (C17 6.4.4.3p2), not the type of the
+ *  enumeration it belongs to.
+ *
+ *  c17 reported the enumeration's type for every constant, which is right only
+ *  where it has to be: when a member does not fit in `int` the whole
+ *  enumeration widens, and calling the constant `int` would lose the value.
+ *  Below that it is simply wrong, and observable --
+ *  `__builtin_types_compatible_p (typeof (hot), int)` answered 0 where gcc and
+ *  the standard say 1.
+ *
+ *  Every expectation here was taken from gcc on this source.
+ */
+int en_i;
+double en_d;
 typedef enum { hot, dog, poo, bear } dingos;
 typedef enum { janette, laura, amanda } cranberry;
 typedef float same1;
 typedef float same2;
 
 /* It must still be a constant expression: this is a file-scope array bound. */
-float rootbeer[__builtin_types_compatible_p (int, typeof(i))];
+float rootbeer[__builtin_types_compatible_p (int, typeof(en_i))];
 
 /* A member past INT_MAX widens the enumeration, and the constant with it. */
 enum big { small = 1, huge = 5000000000LL };
 
-int main(void) {
+static int t_builtins_enum_constant_has_type_int(void) {
     /* Compatible. */
     if (!__builtin_types_compatible_p(int, const int)) return 1;
     if (!__builtin_types_compatible_p(typeof(hot), int)) return 2;
@@ -581,7 +520,7 @@ int main(void) {
     if (__builtin_types_compatible_p(char *, int)) return 6;
     if (__builtin_types_compatible_p(char *, const char *)) return 7;
     if (__builtin_types_compatible_p(long double, double)) return 8;
-    if (__builtin_types_compatible_p(typeof(i), typeof(d))) return 9;
+    if (__builtin_types_compatible_p(typeof(en_i), typeof(en_d))) return 9;
     if (__builtin_types_compatible_p(typeof(dingos), typeof(cranberry))) return 10;
     if (__builtin_types_compatible_p(char, int)) return 11;
     if (__builtin_types_compatible_p(char *, char **)) return 12;
@@ -595,38 +534,36 @@ int main(void) {
     if (sizeof(rootbeer) != sizeof(float)) return 16;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("builtins_enum_constant_int", code, &[]), 0);
-}
 
-/// `__builtin_classify_type(expr)` — a compile-time code for the argument's
-/// type family.
-///
-/// Listed in `cc/BUILTIN.md` as not implemented, which was observable
-/// wherever a header branched on it. Like `sizeof`, the argument is not
-/// evaluated; unlike `sizeof`, gcc takes an expression rather than a type
-/// name.
-///
-/// The codes were read off gcc rather than taken from its documentation,
-/// because the usual conversions run first and that is where the surprises
-/// are: a `char`, an enumeration constant and a `_Bool` all answer 1, and an
-/// array, a function and a string literal all answer 5, because each decays
-/// to a pointer before the classification sees it. All fifteen families below
-/// were diffed against gcc line by line.
-#[test]
-fn builtins_classify_type() {
-    let code = r#"
-struct S { int a; };
-union U { int a; };
-enum E { e1 };
-void fn(void);
-int arr[4];
 
-int main(void) {
+/* ---- builtins_classify_type (exit codes 192-213) ----
+ *
+ *  `__builtin_classify_type(expr)` — a compile-time code for the argument's
+ *  type family.
+ *
+ *  Listed in `cc/BUILTIN.md` as not implemented, which was observable
+ *  wherever a header branched on it. Like `sizeof`, the argument is not
+ *  evaluated; unlike `sizeof`, gcc takes an expression rather than a type
+ *  name.
+ *
+ *  The codes were read off gcc rather than taken from its documentation,
+ *  because the usual conversions run first and that is where the surprises
+ *  are: a `char`, an enumeration constant and a `_Bool` all answer 1, and an
+ *  array, a function and a string literal all answer 5, because each decays
+ *  to a pointer before the classification sees it. All fifteen families below
+ *  were diffed against gcc line by line.
+ */
+struct ct_S { int a; };
+union ct_U { int a; };
+enum ct_E { ct_e1 };
+void ct_fn(void);
+int ct_arr[4];
+
+static int t_builtins_classify_type(void) {
     /* Integer family: everything that converts to an integer answers 1. */
     if (__builtin_classify_type(1) != 1) return 1;
     if (__builtin_classify_type('c') != 1) return 2;
-    if (__builtin_classify_type(e1) != 1) return 3;
+    if (__builtin_classify_type(ct_e1) != 1) return 3;
     if (__builtin_classify_type(1L) != 1) return 4;
     if (__builtin_classify_type(1ULL) != 1) return 5;
     { char c = 0; if (__builtin_classify_type(c) != 1) return 6; }
@@ -643,13 +580,13 @@ int main(void) {
     { _Complex float w = 0; if (__builtin_classify_type(w) != 9) return 13; }
 
     /* Aggregates keep their own codes. */
-    { struct S v; if (__builtin_classify_type(v) != 12) return 14; }
-    { union U v; if (__builtin_classify_type(v) != 13) return 15; }
+    { struct ct_S v; if (__builtin_classify_type(v) != 12) return 14; }
+    { union ct_U v; if (__builtin_classify_type(v) != 13) return 15; }
 
     /* Anything that decays answers as the pointer it decays to. */
     if (__builtin_classify_type((void *)0) != 5) return 16;
-    if (__builtin_classify_type(arr) != 5) return 17;
-    if (__builtin_classify_type(&fn) != 5) return 18;
+    if (__builtin_classify_type(ct_arr) != 5) return 17;
+    if (__builtin_classify_type(&ct_fn) != 5) return 18;
     if (__builtin_classify_type("x") != 5) return 19;
 
     /* A constant expression, usable where one is required. */
@@ -659,23 +596,21 @@ int main(void) {
     { int i = 0; if (__builtin_classify_type(i++) != 1) return 21; if (i != 0) return 22; }
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("builtins_classify_type", code, &[]), 0);
-}
 
-/// `__builtin_{add,sub,mul}_overflow_p` — the same question as the storing
-/// forms, answered without storing.
-///
-/// The destination type is named by a *value* rather than a pointer to one,
-/// and that value is never evaluated: gcc reads its type and nothing else.
-/// So a side effect in the third argument must not happen, which is the one
-/// thing an implementation built on the storing form would get wrong.
-#[test]
-fn builtins_checked_arith_overflow_p() {
-    let code = r#"
+
+/* ---- builtins_checked_arith_overflow_p (exit codes 215-233) ----
+ *
+ *  `__builtin_{add,sub,mul}_overflow_p` — the same question as the storing
+ *  forms, answered without storing.
+ *
+ *  The destination type is named by a *value* rather than a pointer to one,
+ *  and that value is never evaluated: gcc reads its type and nothing else.
+ *  So a side effect in the third argument must not happen, which is the one
+ *  thing an implementation built on the storing form would get wrong.
+ */
 #include <limits.h>
 
-int main(void) {
+static int t_builtins_checked_arith_overflow_p(void) {
     /* The flag matches the storing form's, with nothing written. */
     if (!__builtin_add_overflow_p(INT_MAX, 1, (int)0)) return 1;
     if (__builtin_add_overflow_p(1, 1, (int)0)) return 2;
@@ -708,8 +643,100 @@ int main(void) {
     if (!__has_builtin(__builtin_mul_overflow_p)) return 19;
     return 0;
 }
+
+int main(void)
+{
+    int r;
+    if ((r = t_builtins_intrinsics_mega()) != 0)
+        return 0 + r;
+    if ((r = t_builtins_checked_arithmetic()) != 0)
+        return 87 + r;
+    if ((r = t_builtins_libc_aliases_without_headers()) != 0)
+        return 107 + r;
+    if ((r = t_builtins_checked_arith_128bit_mixed_signedness()) != 0)
+        return 148 + r;
+    if ((r = t_builtins_enum_constant_has_type_int()) != 0)
+        return 174 + r;
+    if ((r = t_builtins_classify_type()) != 0)
+        return 191 + r;
+    if ((r = t_builtins_checked_arith_overflow_p()) != 0)
+        return 214 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("builtins_overflow_p", code, &[]), 0);
+    assert_eq!(compile_and_run("builtins_intrinsics_mega", code, &[]), 0);
+}
+
+/// Builtins that were absent, and are now present.
+///
+/// `__has_builtin` answered 0 for all of these, so guarded code was already
+/// correct -- the risk was the unguarded uses in system headers, and
+/// `__builtin_choose_expr` in particular, which glibc uses to pick between
+/// expressions that are only valid for one argument type.
+///
+/// Most are the library function under a reserved name, so they lower to an
+/// ordinary call rather than an expression node apiece. That also settles the
+/// question a textual expansion would raise: the argument is evaluated once.
+#[test]
+fn builtins_library_and_bit_builtins_are_available() {
+    let code = r#"#include <string.h>
+#include <math.h>
+int main(void) {
+    /* Compile-time selection: the unselected arm is not type-checked. */
+    if (__builtin_choose_expr(1, 2, "not an int") != 2) return 1;
+    if (__builtin_choose_expr(0, "not an int", 3) != 3) return 2;
+    if (sizeof(__builtin_choose_expr(1, (char)0, (long)0)) != 1) return 3;
+    if (sizeof(__builtin_choose_expr(0, (char)0, (long)0)) != 8) return 4;
+
+    /* String builtins. */
+    if (__builtin_strlen("abcd") != 4) return 5;
+    if (__builtin_strlen("") != 0) return 6;
+    if (__builtin_strcmp("abc", "abc") != 0) return 7;
+    if (__builtin_strcmp("abc", "abd") >= 0) return 8;
+    if (__builtin_strcmp("abd", "abc") <= 0) return 9;
+
+    /* Integer absolute value. */
+    if (__builtin_abs(-5) != 5 || __builtin_abs(5) != 5) return 10;
+    if (__builtin_labs(-5L) != 5L) return 11;
+    if (__builtin_llabs(-5LL) != 5LL) return 12;
+    { int n = -7; if (__builtin_abs(n) != 7) return 13; }
+
+    /* Find first set: one-based, zero for zero. */
+    if (__builtin_ffs(0) != 0) return 14;
+    if (__builtin_ffs(1) != 1) return 15;
+    if (__builtin_ffs(8) != 4) return 16;
+    if (__builtin_ffs(0x80000000) != 32) return 17;
+    if (__builtin_ffsl(0L) != 0) return 18;
+    if (__builtin_ffsl(1L << 40) != 41) return 19;
+
+    /* Parity: low bit of the population count. */
+    if (__builtin_parity(0) != 0) return 20;
+    if (__builtin_parity(7) != 1) return 21;
+    if (__builtin_parity(3) != 0) return 22;
+    if (__builtin_parity(0xFFFFFFFFu) != 0) return 23;
+
+    /* Floating point. */
+    if (__builtin_sqrt(16.0) != 4.0) return 24;
+    if (__builtin_sqrt(0.0) != 0.0) return 25;
+    if (__builtin_copysign(3.0, -1.0) != -3.0) return 26;
+    if (__builtin_copysign(-3.0, 1.0) != 3.0) return 27;
+    if (!signbit(__builtin_copysign(0.0, -1.0))) return 28;
+
+
+
+    /* All of them answer __has_builtin honestly. */
+#define CK(n) do { if (!__has_builtin(n)) return 40; } while (0)
+    CK(__builtin_choose_expr); CK(__builtin_strlen); CK(__builtin_strcmp);
+    CK(__builtin_abs); CK(__builtin_labs); CK(__builtin_llabs);
+    CK(__builtin_ffs); CK(__builtin_ffsl); CK(__builtin_parity);
+    CK(__builtin_trap);
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("builtins_library_and_bit", code, &["-lm".to_string()]),
+        0
+    );
 }
 
 /// The libc aliases the `execute/builtins/` sub-suite needs, which running
@@ -865,16 +892,6 @@ int main(void)
 // Integer magnitude: abs, labs, llabs, imaxabs
 // ============================================================================
 
-/// Does `asm` call `name`? Matches `call abs@PLT`, `call _abs` and `bl abs`.
-fn calls(asm: &str, name: &str) -> bool {
-    let sym = asm_symbol(name);
-    asm.lines().any(|l| {
-        let mut words = l.split_whitespace();
-        matches!(words.next(), Some("call" | "bl" | "jmp" | "b"))
-            && words.next().map(|t| t.trim_end_matches("@PLT")) == Some(sym.as_str())
-    })
-}
-
 // Self-contained, since the aarch64 run has no target headers to include.
 const INT_ABS_PROGRAM: &str = r#"typedef __INTMAX_TYPE__ intmax_t;
 int abs(int);
@@ -931,35 +948,7 @@ fn builtins_int_abs_is_expanded_inline() {
         assert_eq!(rc, 0);
     }
 
-    let src = "#include <stdlib.h>\n\
-               #include <inttypes.h>\n\
-               long f(int a, long b, long long c, intmax_t d) {\n\
-                   return abs(a) + labs(b) + llabs(c) + imaxabs(d)\n\
-                        + __builtin_abs(a) + __builtin_labs(b);\n\
-               }\n";
-    for opt in ["-O0", "-O2"] {
-        let asm = asm_for_at("int_abs_asm", src, &[opt]);
-        for name in ["abs", "labs", "llabs", "imaxabs"] {
-            assert!(!calls(&asm, name), "{opt}: {name} was called:\n{asm}");
-        }
-    }
-
-    // `-fno-builtin-abs` turns off the bare spelling it names and nothing
-    // else; `-fno-builtin` turns off every bare spelling. The reserved
-    // spelling is never displaced.
-    let asm = asm_for_at("int_abs_nb_abs", src, &["-fno-builtin-abs"]);
-    assert!(
-        calls(&asm, "abs"),
-        "-fno-builtin-abs kept abs inline:\n{asm}"
-    );
-    assert!(
-        !calls(&asm, "labs"),
-        "-fno-builtin-abs displaced labs:\n{asm}"
-    );
-    let asm = asm_for_at("int_abs_nb", src, &["-fno-builtin"]);
-    for name in ["abs", "labs", "llabs", "imaxabs"] {
-        assert!(calls(&asm, name), "-fno-builtin kept {name} inline:\n{asm}");
-    }
+    // The assembly half is a unit test in cc/test_asm/builtins_intrinsics.rs.
 }
 
 /// A translation unit's own definition of a reserved library name does not
@@ -1001,24 +990,8 @@ long floor(long v) { return 200 + v; }
 "#;
     assert_eq!(compile_and_run("incompatible_bare_builtin", code, &[]), 0);
 
-    let src =
-        "int abs(int);\nlong labs(long);\nlong f(int a, long b) { return abs(a) + labs(b); }\n";
-    let asm = asm_for_at("compatible_bare_builtin", src, &[]);
-    assert!(!calls(&asm, "abs") && !calls(&asm, "labs"), "{asm}");
-}
-
-/// A `__builtin_` library alias the translation unit never declared is
-/// declared by c17 from what it knows of the entry point, with parameter
-/// types that are placeholders. A later call finds that declaration in
-/// scope, and must not be checked against it: `strlen` does not take an
-/// `unsigned long`.
-#[test]
-fn builtins_undeclared_library_alias_is_not_checked_against_placeholders() {
-    let code = "int f(void) {\n\
-                    return (int)__builtin_strlen(\"a\") + (int)__builtin_strlen(\"bc\")\n\
-                        + __builtin_strcmp(\"a\", \"b\") + __builtin_strcmp(\"c\", \"d\");\n\
-                }\n";
-    compile_expect_no_diagnostic("undeclared_library_alias", code, "argument");
+    // The compatible-redeclaration half is a unit test in
+    // cc/test_asm/builtins_intrinsics.rs.
 }
 
 /// `__builtin_assume_aligned(p, align[, misalign])` evaluates every argument,
@@ -1043,84 +1016,5 @@ int main(void) {
     return 0;
 }
 "#,
-    );
-}
-
-/// What gcc rejects in a call to `__builtin_assume_aligned`, in its words
-/// where c17's call checks share them: too many arguments, a misalignment
-/// that is not an integer, and a first argument no conversion makes a
-/// pointer.
-#[test]
-fn builtins_assume_aligned_rejects_bad_arguments() {
-    for (name, call, expected) in [
-        (
-            "assume_aligned_too_many",
-            "__builtin_assume_aligned(p, 16, 0, 1)",
-            "too many arguments to function '__builtin_assume_aligned'",
-        ),
-        (
-            "assume_aligned_too_few",
-            "__builtin_assume_aligned(p)",
-            "too few arguments to function '__builtin_assume_aligned'",
-        ),
-        (
-            "assume_aligned_float_misalign",
-            "__builtin_assume_aligned(p, 16, 1.5)",
-            "non-integer argument 3 in call to function '__builtin_assume_aligned'",
-        ),
-        (
-            "assume_aligned_ptr_misalign",
-            "__builtin_assume_aligned(p, 16, p)",
-            "non-integer argument 3 in call to function '__builtin_assume_aligned'",
-        ),
-        (
-            "assume_aligned_struct",
-            "__builtin_assume_aligned(s, 16)",
-            "incompatible type for argument 1 of '__builtin_assume_aligned'",
-        ),
-    ] {
-        let code = format!(
-            "struct S {{ int a; }} s; char *p;\n\
-             void *f(void) {{ return {call}; }}\n"
-        );
-        crate::common::compile_expect_error(name, &code, expected);
-    }
-}
-
-/// gcc warns, as for any call through `const void *`: an integer made a
-/// pointer, a pointer made a `size_t`, and a `volatile` the parameter drops.
-/// An alignment that is a variable, or not a power of two, is accepted
-/// without a word, and a `const` pointee is not one dropped.
-#[test]
-fn builtins_assume_aligned_warns_as_a_call_does() {
-    for (name, call, expected) in [
-        (
-            "assume_aligned_int_ptr",
-            "__builtin_assume_aligned(n, 16)",
-            "makes pointer from integer without a cast",
-        ),
-        (
-            "assume_aligned_ptr_align",
-            "__builtin_assume_aligned(c, c)",
-            "makes integer from pointer without a cast",
-        ),
-        (
-            "assume_aligned_volatile",
-            "__builtin_assume_aligned(v, 16)",
-            "discards a qualifier from the pointer target type",
-        ),
-    ] {
-        let code = format!(
-            "int n; char *c; volatile int *v;\n\
-             void *f(void) {{ return {call}; }}\n"
-        );
-        crate::common::compile_expect_warning(name, &code, expected);
-    }
-    crate::common::compile_expect_no_diagnostic(
-        "assume_aligned_accepted",
-        "const char *p; int n;\n\
-         char *f(void) { return __builtin_assume_aligned(p, n, n); }\n\
-         char *g(void) { return __builtin_assume_aligned(p, 3); }\n",
-        "warning",
     );
 }

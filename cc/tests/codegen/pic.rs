@@ -23,6 +23,8 @@ use crate::common::compile_and_run;
 // Mega-test: PIC code generation
 // ============================================================================
 
+/// Also covers `codegen_pic_flags`'s -fPIC (uppercase) case, whose program
+/// was an empty `main`: this one is built with exactly `-fPIC`.
 #[test]
 fn codegen_pic_mega() {
     let code = r#"
@@ -160,6 +162,9 @@ int main(void) {
 }
 
 /// Test both -fPIC (uppercase) and -fpic (lowercase) flags
+///
+/// The -fPIC half (`pic_uppercase`, an empty `main`) is `codegen_pic_mega`,
+/// which builds and runs with exactly that flag.
 #[test]
 fn codegen_pic_flags() {
     let code = r#"
@@ -167,10 +172,6 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(
-        compile_and_run("pic_uppercase", code, &["-fPIC".to_string()]),
-        0
-    );
     assert_eq!(
         compile_and_run("pic_lowercase", code, &["-fpic".to_string()]),
         0

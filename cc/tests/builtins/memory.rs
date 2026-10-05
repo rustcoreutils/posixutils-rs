@@ -17,9 +17,29 @@ use crate::common::compile_and_run;
 // Mega-test: Memory builtins (alloca, offsetof)
 // ============================================================================
 
+/// The memory builtins, and every other program of this file built at the matrix
+/// levels with no options, as one program; each section keeps its original test
+/// name and doc comment, and the exit-code table is at the top.
+///
+/// Consolidates: builtins_memory_mega, builtins_object_size_of_known_objects,
+/// builtins_fortified_chk_entry_points, and the no-option runs of
+/// builtins_bare_alloca and builtins_fno_builtin_disables_bare_spellings_only
+/// (both programs of the latter).
 #[test]
 fn builtins_memory_mega() {
     let code = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1- 58  builtins_memory_mega
+ *    61- 76  builtins_object_size_of_known_objects
+ *    81- 88  builtins_fortified_chk_entry_points
+ *    91- 96  builtins_bare_alloca
+ *   101-103  builtins_fno_builtin_disables_bare_spellings_only
+ *   111-111  builtins_fno_builtin_disables_bare_spellings_only
+ */
+
+/* ---- builtins_memory_mega (exit codes 1-58) ----
+ */
 #include <stddef.h>
 
 struct TestStruct {
@@ -57,7 +77,7 @@ int test_alloca_size(int n) {
     return sum;
 }
 
-int main(void) {
+static int t_builtins_memory_mega(void) {
     // ========== ALLOCA SECTION (returns 1-39) ==========
     {
         // Basic allocation
@@ -148,86 +168,82 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("builtins_memory_mega", code, &[]), 0);
-}
 
-/// `__builtin_object_size` reports the real size of a statically known object.
-///
-/// Every expectation was taken from gcc on the same source. Before this was
-/// implemented the builtin answered `(size_t)-1` -- "unknown" -- for all of
-/// them, which is what `_FORTIFY_SOURCE` reads as "nothing to check".
-///
-/// The type argument matters twice over: bit 0 selects the closest surrounding
-/// subobject over the whole object (`s.a` is 10 bytes of its own but 36 bytes
-/// to the end of `s`), and bit 1 asks for a minimum instead of a maximum,
-/// which only changes the answer when the object is *not* known -- 0 rather
-/// than `(size_t)-1`.
-#[test]
-fn builtins_object_size_of_known_objects() {
-    let code = r#"
-struct S { char a[10]; int b; char c[20]; };   /* sizeof == 36 */
-static char g_arr[64];
-static struct S g_s;
-static char *opaque(char *p) { return p; }
 
-int main(void)
+/* ---- builtins_object_size_of_known_objects (exit codes 61-76) ----
+ *
+ *  `__builtin_object_size` reports the real size of a statically known object.
+ *
+ *  Every expectation was taken from gcc on the same source. Before this was
+ *  implemented the builtin answered `(size_t)-1` -- "unknown" -- for all of
+ *  them, which is what `_FORTIFY_SOURCE` reads as "nothing to check".
+ *
+ *  The type argument matters twice over: bit 0 selects the closest surrounding
+ *  subobject over the whole object (`s.a` is 10 bytes of its own but 36 bytes
+ *  to the end of `s`), and bit 1 asks for a minimum instead of a maximum,
+ *  which only changes the answer when the object is *not* known -- 0 rather
+ *  than `(size_t)-1`.
+ */
+struct os_S { char a[10]; int b; char c[20]; };   /* sizeof == 36 */
+static char os_g_arr[64];
+static struct os_S os_g_s;
+static char *os_opaque(char *p) { return p; }
+
+static int t_builtins_object_size_of_known_objects(void)
 {
     char local[32];
-    struct S ls;
+    struct os_S ls;
 
     /* type 0: to the end of the whole object */
-    if (__builtin_object_size(g_arr, 0) != 64) return 1;
-    if (__builtin_object_size(g_arr + 8, 0) != 56) return 2;
+    if (__builtin_object_size(os_g_arr, 0) != 64) return 1;
+    if (__builtin_object_size(os_g_arr + 8, 0) != 56) return 2;
     if (__builtin_object_size(local, 0) != 32) return 3;
-    if (__builtin_object_size(g_s.a, 0) != 36) return 4;
-    if (__builtin_object_size(g_s.c, 0) != 20) return 5;
+    if (__builtin_object_size(os_g_s.a, 0) != 36) return 4;
+    if (__builtin_object_size(os_g_s.c, 0) != 20) return 5;
     if (__builtin_object_size(&ls.a[2], 0) != 34) return 6;
-    if (__builtin_object_size(&g_s, 0) != 36) return 7;
+    if (__builtin_object_size(&os_g_s, 0) != 36) return 7;
 
     /* type 1: to the end of the closest surrounding subobject */
-    if (__builtin_object_size(g_s.a, 1) != 10) return 8;
-    if (__builtin_object_size(g_arr, 1) != 64) return 9;
+    if (__builtin_object_size(os_g_s.a, 1) != 10) return 8;
+    if (__builtin_object_size(os_g_arr, 1) != 64) return 9;
 
     /* a known object has the same minimum and maximum size */
-    if (__builtin_object_size(g_arr, 2) != 64) return 10;
-    if (__builtin_object_size(g_s.a, 3) != 10) return 11;
+    if (__builtin_object_size(os_g_arr, 2) != 64) return 10;
+    if (__builtin_object_size(os_g_s.a, 3) != 10) return 11;
 
     /* unknown: -1 for a maximum, 0 for a minimum */
-    if (__builtin_object_size(opaque(local), 0) != (unsigned long)-1) return 12;
-    if (__builtin_object_size(opaque(local), 1) != (unsigned long)-1) return 13;
-    if (__builtin_object_size(opaque(local), 2) != 0) return 14;
-    if (__builtin_object_size(opaque(local), 3) != 0) return 15;
+    if (__builtin_object_size(os_opaque(local), 0) != (unsigned long)-1) return 12;
+    if (__builtin_object_size(os_opaque(local), 1) != (unsigned long)-1) return 13;
+    if (__builtin_object_size(os_opaque(local), 2) != 0) return 14;
+    if (__builtin_object_size(os_opaque(local), 3) != 0) return 15;
 
     /* a string literal is its bytes plus the terminator */
     if (__builtin_object_size("hello", 0) != 6) return 16;
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("builtins_object_size", code, &[]), 0);
-}
 
-/// The fortified `__builtin___*_chk` builtins work without a declaration.
-///
-/// glibc never declares `__memcpy_chk` and friends -- `bits/string_fortified.h`
-/// calls `__builtin___memcpy_chk` and relies on the compiler knowing the
-/// entry point intrinsically. c17 rewrote the name and then demanded a
-/// declaration that does not exist, so every one of them was an error.
-///
-/// The return type is the part that has to be right rather than merely
-/// present: most of these return a pointer, and declaring one `int` would
-/// truncate the returned address to 32 bits. The assertions below compare the
-/// returned pointer against the expected address for exactly that reason.
-///
-/// Checked against gcc on the same source, which returns 0.
-#[test]
-fn builtins_fortified_chk_entry_points() {
-    let code = r#"
+
+/* ---- builtins_fortified_chk_entry_points (exit codes 81-88) ----
+ *
+ *  The fortified `__builtin___*_chk` builtins work without a declaration.
+ *
+ *  glibc never declares `__memcpy_chk` and friends -- `bits/string_fortified.h`
+ *  calls `__builtin___memcpy_chk` and relies on the compiler knowing the
+ *  entry point intrinsically. c17 rewrote the name and then demanded a
+ *  declaration that does not exist, so every one of them was an error.
+ *
+ *  The return type is the part that has to be right rather than merely
+ *  present: most of these return a pointer, and declaring one `int` would
+ *  truncate the returned address to 32 bits. The assertions below compare the
+ *  returned pointer against the expected address for exactly that reason.
+ *
+ *  Checked against gcc on the same source, which returns 0.
+ */
 #include <string.h>
 #include <stdio.h>
 
-int main(void)
+static int t_builtins_fortified_chk_entry_points(void)
 {
     char buf[32];
 
@@ -249,8 +265,111 @@ int main(void)
 
     return 0;
 }
+
+
+/* ---- builtins_bare_alloca (exit codes 91-96) ----
+ *
+ *  gcc predefines bare `alloca` as well as `__builtin_alloca`, and real code
+ *  calls it without including `<alloca.h>`.
+ *
+ *  It is not reserved the way a `__builtin_*` spelling is, so unlike those it
+ *  must yield to a user declaration that is not a function -- the same rule
+ *  `setjmp`, `longjmp` and `offsetof` already follow in `builtin_is_shadowed`.
+ *  A declaration from `<alloca.h>` *is* a function and must not displace it,
+ *  which is why the predicate asks what kind of declaration it found rather
+ *  than merely whether one exists.
+ */
+int ba_use_alloca(int n) {
+    int *p = (int *)alloca(n * sizeof(int));
+    for (int i = 0; i < n; i++) p[i] = i * 2;
+    int s = 0;
+    for (int i = 0; i < n; i++) s += p[i];
+    return s;
+}
+
+/* A local object named `alloca` is an ordinary variable. */
+int ba_shadowed_by_a_variable(void) {
+    int alloca = 7;
+    return alloca;
+}
+
+static int t_builtins_bare_alloca(void) {
+    if (ba_use_alloca(5) != 0 + 2 + 4 + 6 + 8) return 1;
+    if (ba_use_alloca(1) != 0) return 2;
+    if (ba_shadowed_by_a_variable() != 7) return 3;
+
+    /* The reserved spelling keeps working alongside the bare one, and both
+       give storage that survives to the end of the enclosing function. */
+    char *q = (char *)__builtin_alloca(16);
+    q[0] = 'a';
+    q[15] = 'z';
+    if (q[0] != 'a' || q[15] != 'z') return 4;
+
+    char *r = (char *)alloca(16);
+    r[0] = 'b';
+    if (r[0] != 'b' || q[0] != 'a') return 5;
+    if (r == q) return 6;
+    return 0;
+}
+
+
+/* ---- builtins_fno_builtin_disables_bare_spellings_only (exit codes 101-103) ----
+ *
+ *  `-fno-builtin` and `-fno-builtin-NAME`.
+ *
+ *  gcc's rule, which this follows exactly: the flag disables builtins **whose
+ *  name does not begin with `__builtin_`**. The reserved spellings keep
+ *  working and `__has_builtin` keeps answering 1 for them — verified against
+ *  gcc, which compiles `__builtin_strcpy` under `-fno-builtin` and fails to
+ *  link a bare `alloca`.
+ *
+ *  So the flag lands on exactly the bare names c17 answers to: `alloca`,
+ *  `offsetof`, `setjmp`, `longjmp`. Those are also the only names a user
+ *  declaration may displace, which is the same boundary for the same reason —
+ *  they are not reserved to the implementation.
+ *
+ *  Both driver fields were parsed into variables nothing read, so the flag was
+ *  accepted and did nothing, which is indistinguishable from it working.
+ */
+static int t_builtins_nb_reserved(void) {
+    char b[8];
+    __builtin_strcpy(b, "hi");
+    if (!__has_builtin(__builtin_strcpy)) return 1;
+    if (b[0] != 'h' || b[1] != 'i') return 2;
+    char *p = (char *)__builtin_alloca(16);
+    p[0] = 'z';
+    if (p[0] != 'z') return 3;
+    return 0;
+}
+
+
+/* ---- builtins_fno_builtin_disables_bare_spellings_only (exit codes 111-111) ----
+ */
+static int t_builtins_nb_bare_on(void) {
+    char *p = (char *)alloca(16);
+    p[0] = 'q';
+    return p[0] != 'q';
+}
+
+int main(void)
+{
+    int r;
+    if ((r = t_builtins_memory_mega()) != 0)
+        return 0 + r;
+    if ((r = t_builtins_object_size_of_known_objects()) != 0)
+        return 60 + r;
+    if ((r = t_builtins_fortified_chk_entry_points()) != 0)
+        return 80 + r;
+    if ((r = t_builtins_bare_alloca()) != 0)
+        return 90 + r;
+    if ((r = t_builtins_nb_reserved()) != 0)
+        return 100 + r;
+    if ((r = t_builtins_nb_bare_on()) != 0)
+        return 110 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("builtins_chk", code, &[]), 0);
+    assert_eq!(compile_and_run("builtins_memory_mega", code, &[]), 0);
 }
 
 /// gcc predefines bare `alloca` as well as `__builtin_alloca`, and real code
@@ -298,7 +417,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("builtins_bare_alloca", code, &[]), 0);
+    // The no-option run is a section of builtins_memory_mega.
     assert_eq!(
         compile_and_run("builtins_bare_alloca_o2", code, &["-O2".to_string()]),
         0
@@ -335,7 +454,7 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("builtins_nb_reserved", reserved, &[]), 0);
+    // Its no-option run is a section of builtins_memory_mega.
     assert_eq!(
         compile_and_run(
             "builtins_nb_reserved_off",
@@ -345,15 +464,8 @@ int main(void) {
         0
     );
 
-    // The bare spelling still works when the flag is absent.
-    let bare = r#"
-int main(void) {
-    char *p = (char *)alloca(16);
-    p[0] = 'q';
-    return p[0] != 'q';
-}
-"#;
-    assert_eq!(compile_and_run("builtins_nb_bare_on", bare, &[]), 0);
+    // The bare spelling still works when the flag is absent: that program
+    // is a section of builtins_memory_mega.
 }
 
 /// The other half: under the flag, a bare spelling is an ordinary call, so it

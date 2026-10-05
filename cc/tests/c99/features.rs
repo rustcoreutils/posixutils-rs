@@ -359,10 +359,25 @@ int main(void) {
     assert_eq!(compile_and_run("c99_features_mega", code, &[]), 0);
 }
 
+/// One program, one section per original test; each section carries the
+/// original doc comment and its exit-code range in its header. Consolidates:
+/// `scope_shadowing_deep`, `hex_float_long_significand`,
+/// `param_shadows_typedef`, `extreme_float_literals`,
+/// `compound_literal_postfix`, `array_from_compound_literal`,
+/// `nested_case_labels`, `label_at_block_end`, `static_address_constants`,
+/// `deep_nesting`.
 #[test]
-fn c99_scope_shadowing_deep() {
+fn c99_features_misc_mega() {
     let code = r#"
-int main(void) {
+#include <float.h>
+
+// ==========================================================================
+// scope_shadowing_deep  (exit codes 1-21: 0 + its own code)
+//
+// (was #[test] c99_scope_shadowing_deep)
+//
+// ==========================================================================
+static int t_scope_shadowing_deep(void) {
     int x = 1;
     {
         int x = 2;
@@ -408,26 +423,24 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("scope_shadowing_deep", code, &[]), 0);
-}
 
-/// C99 6.4.4.2 hex floats name a binary value directly, so a long significand
-/// must survive the parse intact.
-///
-/// The significand was accumulated in a `u64` and divided by
-/// `1u64 << (4 * digits)`. Sixteen fraction digits make that a shift of 64,
-/// which wraps to a shift of 0 in a release build, so
-/// `0x1.0000000000000002p+0` evaluated to **3.0** -- wrong by a factor of
-/// three, with no diagnostic, in a feature the conformance matrix listed as
-/// passing. Values are checked against arithmetic that cannot use the same
-/// parser, so a repeat of the bug cannot satisfy both sides.
-#[test]
-fn c99_hex_float_long_significand() {
-    let code = r#"
-#include <float.h>
-
-int main(void) {
+// ==========================================================================
+// hex_float_long_significand  (exit codes 22-31: 21 + its own code)
+//
+// (was #[test] c99_hex_float_long_significand)
+//
+// C99 6.4.4.2 hex floats name a binary value directly, so a long significand
+// must survive the parse intact.
+//
+// The significand was accumulated in a `u64` and divided by
+// `1u64 << (4 * digits)`. Sixteen fraction digits make that a shift of 64,
+// which wraps to a shift of 0 in a release build, so
+// `0x1.0000000000000002p+0` evaluated to **3.0** -- wrong by a factor of
+// three, with no diagnostic, in a feature the conformance matrix listed as
+// passing. Values are checked against arithmetic that cannot use the same
+// parser, so a repeat of the bug cannot satisfy both sides.
+// ==========================================================================
+static int t_hex_float_long_significand(void) {
     /* Just above 1.0: the case that used to yield 3.0. */
     double a = 0x1.0000000000000002p+0;
     if (a < 1.0 || a > 1.0000000001) return 1;
@@ -456,29 +469,370 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("c99_hex_float_long_significand", code, &[]),
-        0
-    );
+
+// ==========================================================================
+// param_shadows_typedef  (exit codes 32-37: 31 + its own code)
+//
+// (was #[test] c99_parameter_shadows_a_file_scope_typedef)
+//
+// A parameter must shadow a file-scope typedef of the same name
+// (C17 6.2.1p4), so `(name)` inside the function is a parenthesized
+// expression and not a type name.
+//
+// The parameter symbol has to be registered as the *innermost* binding.
+// Registering it as the outermost instead left the typedef winning, and
+// `((PyObject*)((string)))` in CPython then failed to parse -- the compiler
+// read `(string)` as a type name and wanted a cast operand after it.
+// ==========================================================================
+typedef int *pst_string;
+typedef long pst_counter;
+
+static int pst_deref(int *pst_string) {
+    /* `string` is the parameter here, so this is a cast of an expression. */
+    return *((int *)((pst_string)));
 }
 
-/// A variably-modified array *parameter* indexed with a row stride of zero,
-/// so every row aliased row 0 on reads and on writes alike, at 2D and 3D.
-///
-/// `cc/parse/parser.rs` dropped a parameter declarator's dimension
-/// expressions -- alone among the declarator paths -- and the one place that
-/// computed a run-time stride only handled the outermost dimension of a bare
-/// identifier. Locals were affected too: a 3D VLA's inner stride and
-/// `sizeof` of any sub-array were both 0.
-///
-/// Every expectation here was taken from gcc on the same source.
+static long pst_total(long pst_counter, long n) {
+    long s = 0;
+    for (long i = 0; i < n; i++)
+        s += (pst_counter);
+    return s;
+}
+
+/* The typedef is visible again once the parameter is out of scope. */
+static pst_string pst_pick(pst_string a, pst_string b, int which) {
+    return which ? a : b;
+}
+
+static int t_param_shadows_typedef(void) {
+    int v = 42;
+    if (pst_deref(&v) != 42) return 1;
+    if (pst_total(3, 4) != 12) return 2;
+
+    int x = 7, y = 9;
+    pst_string p = &x, q = &y;
+    if (*pst_pick(p, q, 1) != 7) return 3;
+    if (*pst_pick(p, q, 0) != 9) return 4;
+
+    /* At file scope the typedef still names a type. */
+    pst_string r = &x;
+    if (*r != 7) return 5;
+    pst_counter c = 5;
+    if (c != 5) return 6;
+
+    return 0;
+}
+
+// ==========================================================================
+// extreme_float_literals  (exit codes 38-47: 37 + its own code)
+//
+// (was #[test] c99_extreme_float_literals)
+//
+// A zero significand is zero at any exponent, and a subnormal literal is
+// rounded to nearest rather than truncated.
+//
+// The decimal converter short-circuits an exponent far outside every target
+// format, on the reasoning that the value can only be an infinity or a zero.
+// That reasoning holds only for a non-zero significand: `0e6000` came out as
+// an infinity. Separately, the subnormal encoding path shifted the
+// significand down and dropped what fell off, which is directed rounding
+// toward zero where every other path rounds to nearest.
+// ==========================================================================
+double efl_zero_big = 0e6000;
+double efl_zero_small = 0.0e-9999;
+long double efl_zero_ld = 0.000e5001;
+
+static int t_extreme_float_literals(void)
+{
+    if (efl_zero_big != 0.0) return 1;
+    if (efl_zero_small != 0.0) return 2;
+    if (efl_zero_ld != 0.0L) return 3;
+    if (0e6000 != 0.0) return 4;
+
+    /* A non-zero significand still saturates as before. */
+    if (1e6000 <= DBL_MAX) return 5;
+    if (1e-6000 != 0.0) return 6;
+
+    /* The smallest subnormal double, and one that must round up to it
+       rather than truncate to zero. */
+    if (4.9406564584124654e-324 == 0.0) return 7;
+    if (3e-324 == 0.0) return 8;
+
+#if LDBL_MIN_EXP < DBL_MIN_EXP
+    /* Subnormal long doubles survive at all, and stay ordered. Only where
+       long double has range of its own: on a target whose long double *is*
+       double -- Apple's arm64 among them -- these underflow to zero, which
+       is the right answer there and not what this is testing. */
+    long double a = 3.6451995318824746025e-4951L;
+    long double b = 7.2903990637649492050e-4951L;
+    if (a == 0.0L) return 9;
+    if (!(a < b)) return 10;
+#endif
+
+    return 0;
+}
+
+// ==========================================================================
+// compound_literal_postfix  (exit codes 48-50: 47 + its own code)
+//
+// (was #[test] c99_compound_literal_is_a_postfix_expression)
+// Under the heading: A compound literal is a postfix expression (C99 6.5.2.5)
+//
+// `sizeof (struct s){1, 2}` is `sizeof` of a *literal*, not of the type.
+//
+// `parse_sizeof` and `parse_alignof` each consumed the `(`, committed to the
+// type name, and never looked for the `{` -- so the braces were left for
+// whatever was parsing the enclosing construct, and the error named that
+// instead. Recognition now lives in one place that every production reaches.
+// ==========================================================================
+struct clp_s { int a; int b; };
+char clp_x[((sizeof (struct clp_s){ 1, 2 }) == sizeof (struct clp_s)) ? 1 : -1];
+char clp_y[(_Alignof (struct clp_s){ 1, 2 }) == _Alignof (struct clp_s) ? 1 : -1];
+char clp_z[sizeof (int[3]){ 1, 2, 3 } == 3 * sizeof (int) ? 1 : -1];
+
+static int t_compound_literal_postfix(void) {
+    /* The postfix suffixes apply to the literal, as to any postfix
+       expression. */
+    if ((int[3]){ 7, 8, 9 }[1] != 8) return 1;
+    if (sizeof (int[3]){ 1, 2, 3 }[0] != sizeof(int)) return 2;
+    if ((struct clp_s){ 4, 5 }.b != 5) return 3;
+    (void)clp_x; (void)clp_y; (void)clp_z;
+    return 0;
+}
+
+// ==========================================================================
+// array_from_compound_literal  (exit codes 51-52: 50 + its own code)
+//
+// (was #[test] c99_array_initialized_from_a_compound_literal)
+//
+// An array may be initialized from a compound literal of its own type. The
+// lowering already handled it; only the initializer check stood in the way,
+// having been written when a string literal was the one non-braced
+// initializer an array could take.
+// ==========================================================================
+static const unsigned short afc_array[] = (const unsigned short []){ 0x0D2B, 0x0D2C };
+
+static int t_array_from_compound_literal(void) {
+    if (afc_array[0] != 0x0D2B || afc_array[1] != 0x0D2C) return 1;
+    if (sizeof afc_array != 2 * sizeof(unsigned short)) return 2;
+    return 0;
+}
+
+// ==========================================================================
+// nested_case_labels  (exit codes 53-62: 52 + its own code)
+//
+// (was #[test] c99_case_labels_inside_a_nested_statement)
+// Under the heading: A labeled statement is one statement (C17 6.8.1)
+//
+// `case` and `default` carry the statement they label.
+//
+// Held as flat sibling markers they worked inside a compound statement and
+// nowhere else: in `switch (c) case 1: if (d) case 2: case 3: f();` the `if`
+// took the bare `case 2:` as its whole then-branch, and `case 3: f();` fell
+// out of the switch entirely -- reported as "case label not within a switch
+// statement".
+// ==========================================================================
+int ncl_duff(int c, int d) {
+    int t = 0;
+    switch (c)
+        case 1:
+            if (d)
+                case 2:
+                case 3:
+                    t = 10;
+    return t;
+}
+
+/* Duff's device: labels inside a loop inside the switch. */
+int ncl_copy(int *dst, const int *src, int n) {
+    int moved = 0;
+    int count = (n + 3) / 4;
+    switch (n % 4) {
+    case 0: do { *dst++ = *src++; moved++;
+    case 3:      *dst++ = *src++; moved++;
+    case 2:      *dst++ = *src++; moved++;
+    case 1:      *dst++ = *src++; moved++;
+            } while (--count > 0);
+    }
+    return moved;
+}
+
+static int t_nested_case_labels(void) {
+    if (ncl_duff(1, 1) != 10) return 1;
+    if (ncl_duff(1, 0) != 0) return 2;
+    if (ncl_duff(2, 0) != 10) return 3;
+    if (ncl_duff(3, 0) != 10) return 4;
+    if (ncl_duff(9, 0) != 0) return 5;
+
+    {
+        int src[7] = { 1, 2, 3, 4, 5, 6, 7 }, dst[8] = { 0 };
+        if (ncl_copy(dst, src, 7) != 7) return 6;
+        if (dst[0] != 1 || dst[6] != 7) return 7;
+    }
+
+    /* Ordinary fall-through must be unchanged. */
+    {
+        int t = 0, c = 1;
+        switch (c) { case 1: t = 1; case 2: t += 2; break; default: t = 99; }
+        if (t != 3) return 8;
+    }
+    /* A declaration after a label still belongs to the enclosing block. */
+    {
+        int c = 1;
+        switch (c) { case 1: ; int v = 5; if (v != 5) return 9; v++; if (v != 6) return 10; }
+    }
+    return 0;
+}
+
+// ==========================================================================
+// label_at_block_end  (exit codes 63-65: 62 + its own code)
+//
+// (was #[test] c99_label_at_the_end_of_a_block)
+//
+// A label at the end of a compound statement. C17 requires a statement after
+// it; gcc and clang accept it without, and C23 made it legal, so c17 accepts
+// it with a warning rather than failing on the `}`.
+// ==========================================================================
+int lbe_g;
+int lbe_f(int n) { if (n) goto done; lbe_g = 1; done: }
+int lbe_h(int n) { switch (n) { case 1: lbe_g = 2; break; default: } return lbe_g; }
+
+static int t_label_at_block_end(void) {
+    lbe_f(0);
+    if (lbe_g != 1) return 1;
+    lbe_f(1);
+    if (lbe_g != 1) return 2;
+    if (lbe_h(1) != 2) return 3;
+    return 0;
+}
+
+// ==========================================================================
+// static_address_constants  (exit codes 66-71: 65 + its own code)
+//
+// (was #[test] c99_address_constants_in_static_initializers)
+// Under the heading: Address constants in a static initializer (C17 6.6p9)
+//
+// A relocation with an addend is a constant expression even where the type
+// system sees plain integer arithmetic.
+//
+// The initializer folder asked which operand had a *pointer type* rather than
+// which named a symbol, so `(unsigned long)&_text - 0x10000000L - 1` -- how a
+// kernel or a linker script's C half is written -- was "not a constant
+// expression". Two smaller holes went with it: identical string literals were
+// two objects, so their difference was a difference between different
+// symbols; and a `void *` difference was discarded for having no element
+// size, although C counts it in bytes.
+// ==========================================================================
+int sac_literal_diff = (&"Foobar"[1] - &"Foobar"[0]);
+struct sac_s { char p[2]; };
+static struct sac_s sac_v;
+const int sac_o0 = (int)((void *)&sac_v.p[0] - (void *)&sac_v) + 0U;
+const int sac_o1 = (int)((void *)&sac_v.p[1] - (void *)&sac_v) + 1U;
+int sac_x[60];
+char *sac_y = ((char *)&(sac_x[2 * 8 + 2]) - 8);
+static unsigned long sac_addend = (unsigned long)&sac_x - 0x1000L - 1;
+
+static int t_static_address_constants(void) {
+    if (sac_literal_diff != 1) return 1;
+    if (sac_o0 != 0) return 2;
+    if (sac_o1 != 2) return 3;
+    if (sac_y != (char *)&sac_x[18] - 8) return 4;
+    if (sac_addend != (unsigned long)&sac_x - 0x1001L) return 5;
+    /* Two spellings of one literal are one object. */
+    if ("Foobar" != "Foobar") return 6;
+    return 0;
+}
+
+// ==========================================================================
+// deep_nesting  (exit codes 72-72: 71 + its own code)
+//
+// (was #[test] c99_deeply_nested_constructs_compile)
+// Under the heading: Translation limits
+// The deeply nested `dn_deep` and the 600 case labels of `dn_labels` are
+// generated by `deep_nesting_src()` and spliced in at DEEP_NESTING.
+//
+// The front end descends recursively through the source, so a deeply nested
+// expression or a long run of `case` labels costs stack. Running out of it
+// was a Rust panic about a stack overflow rather than anything a user could
+// act on; the compile now runs on a thread whose stack is ours to choose.
+//
+// C17 5.2.4.1 asks for 63 levels of each. These go well past that, because
+// generated source does.
+// ==========================================================================
+/* DEEP_NESTING */
+static int t_deep_nesting(void) { return dn_deep() == 1 && dn_labels(3) == 1 ? 0 : 1; }
+
+int main(void) {
+    int r;
+    if ((r = t_scope_shadowing_deep()) != 0) return 0 + r;
+    if ((r = t_hex_float_long_significand()) != 0) return 21 + r;
+    if ((r = t_param_shadows_typedef()) != 0) return 31 + r;
+    if ((r = t_extreme_float_literals()) != 0) return 37 + r;
+    if ((r = t_compound_literal_postfix()) != 0) return 47 + r;
+    if ((r = t_array_from_compound_literal()) != 0) return 50 + r;
+    if ((r = t_nested_case_labels()) != 0) return 52 + r;
+    if ((r = t_label_at_block_end()) != 0) return 62 + r;
+    if ((r = t_static_address_constants()) != 0) return 65 + r;
+    if ((r = t_deep_nesting()) != 0) return 71 + r;
+    return 0;
+}
+"#
+    .replace("/* DEEP_NESTING */", &deep_nesting_src());
+    assert_eq!(compile_and_run("c99_features_misc_mega", &code, &[]), 0);
+}
+
+/// The `deep_nesting` section's functions (was `c99_deeply_nested_constructs_compile`):
+/// a 400-deep parenthesized expression in `dn_deep` and 600 `case` labels in
+/// `dn_labels`. C17 5.2.4.1 asks for 63 levels of each; these go well past
+/// that, because generated source does.
+fn deep_nesting_src() -> String {
+    let mut code = String::from("int dn_deep(void) { return ");
+    let depth = 400;
+    for _ in 0..depth {
+        code.push('(');
+    }
+    code.push('1');
+    for _ in 0..depth {
+        code.push(')');
+    }
+    code.push_str("; }\n");
+
+    code.push_str("int dn_labels(int c) { int t = 0; switch (c) {\n");
+    for i in 0..600 {
+        code.push_str(&format!("case {i}:\n"));
+    }
+    code.push_str("t = 1; break; default: t = 2; }\nreturn t; }\n");
+    code
+}
+
+/// One program, one section per original test; each section carries the
+/// original doc comment and its exit-code range in its header. Consolidates:
+/// `vm_array_params`, `ptr_to_vm_array`, `address_of_vla`, `deref_vm_pointer`,
+/// `vm_pointer_arith`, `switch_body_block_scope`, `stmt_expr_scope`,
+/// `vla_scope_release`.
 #[test]
-fn c99_variably_modified_array_parameters() {
+fn c99_features_vla_mega() {
     let code = r#"
 #include <stddef.h>
+#include <stdlib.h>
 
-static int sum2(int n, int m, int a[n][m]) {
+// ==========================================================================
+// vm_array_params  (exit codes 1-28: 0 + its own code)
+//
+// (was #[test] c99_variably_modified_array_parameters)
+//
+// A variably-modified array *parameter* indexed with a row stride of zero,
+// so every row aliased row 0 on reads and on writes alike, at 2D and 3D.
+//
+// `cc/parse/parser.rs` dropped a parameter declarator's dimension
+// expressions -- alone among the declarator paths -- and the one place that
+// computed a run-time stride only handled the outermost dimension of a bare
+// identifier. Locals were affected too: a 3D VLA's inner stride and
+// `sizeof` of any sub-array were both 0.
+//
+// Every expectation here was taken from gcc on the same source.
+// ==========================================================================
+static int vap_sum2(int n, int m, int a[n][m]) {
     int s = 0;
     for (int i = 0; i < n; i++)
         for (int j = 0; j < m; j++)
@@ -487,7 +841,7 @@ static int sum2(int n, int m, int a[n][m]) {
 }
 
 /* The pointer-to-array spelling of the same parameter. */
-static int sum2p(int m, int (*a)[m], int n) {
+static int vap_sum2p(int m, int (*a)[m], int n) {
     int s = 0;
     for (int i = 0; i < n; i++)
         for (int j = 0; j < m; j++)
@@ -497,25 +851,25 @@ static int sum2p(int m, int (*a)[m], int n) {
 
 /* Neither dimension is named in the body: the extents must still be
    evaluated on entry, which is what a throwaway parameter scope broke. */
-static long row_stride(int n, int m, int a[n][m]) {
+static long vap_row_stride(int n, int m, int a[n][m]) {
     (void)n;
     return (long)(&a[1][0] - &a[0][0]);
 }
 
-static size_t row_size(int n, int m, int a[n][m]) {
+static size_t vap_row_size(int n, int m, int a[n][m]) {
     (void)n;
     (void)m;
     return sizeof(a[0]);
 }
 
-static void write2(int n, int m, int a[n][m]) {
+static void vap_write2(int n, int m, int a[n][m]) {
     (void)n;
     a[1][1] = 99;
     a[0][2] += 100;
     a[1][2]++;
 }
 
-static int sum3(int n, int m, int k, int a[n][m][k]) {
+static int vap_sum3(int n, int m, int k, int a[n][m][k]) {
     int s = 0;
     for (int i = 0; i < n; i++)
         for (int j = 0; j < m; j++)
@@ -525,7 +879,7 @@ static int sum3(int n, int m, int k, int a[n][m][k]) {
 }
 
 /* A dimension that is an expression over earlier parameters. */
-static int sum_expr(int n, int m, int a[n][m + 1]) {
+static int vap_sum_expr(int n, int m, int a[n][m + 1]) {
     int s = 0;
     for (int i = 0; i < n; i++)
         for (int j = 0; j < m + 1; j++)
@@ -534,7 +888,7 @@ static int sum_expr(int n, int m, int a[n][m + 1]) {
 }
 
 /* A constant inner extent mixed with a variable one. */
-static int sum_mixed(int n, int a[n][3]) {
+static int vap_sum_mixed(int n, int a[n][3]) {
     int s = 0;
     for (int i = 0; i < n; i++)
         for (int j = 0; j < 3; j++)
@@ -542,29 +896,29 @@ static int sum_mixed(int n, int a[n][3]) {
     return s;
 }
 
-int main(void) {
+static int t_vm_array_params(void) {
     int a[2][3] = { { 1, 2, 3 }, { 4, 5, 6 } };
 
     /* ===== parameters (returns 1-19) ===== */
-    if (sum2(2, 3, a) != 21) return 1;
-    if (sum2p(3, a, 2) != 21) return 2;
-    if (row_stride(2, 3, a) != 3) return 3;
-    if (row_size(2, 3, a) != 3 * sizeof(int)) return 4;
-    if (sum_expr(2, 2, a) != 21) return 5;
-    if (sum_mixed(2, a) != 21) return 6;
+    if (vap_sum2(2, 3, a) != 21) return 1;
+    if (vap_sum2p(3, a, 2) != 21) return 2;
+    if (vap_row_stride(2, 3, a) != 3) return 3;
+    if (vap_row_size(2, 3, a) != 3 * sizeof(int)) return 4;
+    if (vap_sum_expr(2, 2, a) != 21) return 5;
+    if (vap_sum_mixed(2, a) != 21) return 6;
 
     int b[3][4];
     for (int i = 0; i < 3; i++)
         for (int j = 0; j < 4; j++)
             b[i][j] = i * 4 + j;
-    write2(3, 4, b);
+    vap_write2(3, 4, b);
     if (b[1][1] != 99) return 7;
     if (b[0][1] != 1) return 8;      /* the row that used to be clobbered */
     if (b[0][2] != 102) return 9;
     if (b[1][2] != 7) return 10;
 
     int c[2][2][2] = { { { 1, 2 }, { 3, 4 } }, { { 5, 6 }, { 7, 8 } } };
-    if (sum3(2, 2, 2, c) != 36) return 11;
+    if (vap_sum3(2, 2, 2, c) != 36) return 11;
 
     /* A genuine VLA argument, not just a fixed array passed to a
        variably-modified parameter. */
@@ -573,7 +927,7 @@ int main(void) {
     for (int i = 0; i < n; i++)
         for (int j = 0; j < m; j++)
             v[i][j] = i * 10 + j;
-    if (sum2(n, m, v) != 63) return 12;
+    if (vap_sum2(n, m, v) != 63) return 12;
 
     /* ===== locals (returns 20-39) ===== */
     int k = 4;
@@ -611,87 +965,26 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("c99_variably_modified_array_parameters", code, &[]),
-        0
-    );
-}
 
-/// A parameter must shadow a file-scope typedef of the same name
-/// (C17 6.2.1p4), so `(name)` inside the function is a parenthesized
-/// expression and not a type name.
-///
-/// The parameter symbol has to be registered as the *innermost* binding.
-/// Registering it as the outermost instead left the typedef winning, and
-/// `((PyObject*)((string)))` in CPython then failed to parse -- the compiler
-/// read `(string)` as a type name and wanted a cast operand after it.
-#[test]
-fn c99_parameter_shadows_a_file_scope_typedef() {
-    let code = r#"
-typedef int *string;
-typedef long counter;
-
-static int deref(int *string) {
-    /* `string` is the parameter here, so this is a cast of an expression. */
-    return *((int *)((string)));
-}
-
-static long total(long counter, long n) {
-    long s = 0;
-    for (long i = 0; i < n; i++)
-        s += (counter);
-    return s;
-}
-
-/* The typedef is visible again once the parameter is out of scope. */
-static string pick(string a, string b, int which) {
-    return which ? a : b;
-}
-
-int main(void) {
-    int v = 42;
-    if (deref(&v) != 42) return 1;
-    if (total(3, 4) != 12) return 2;
-
-    int x = 7, y = 9;
-    string p = &x, q = &y;
-    if (*pick(p, q, 1) != 7) return 3;
-    if (*pick(p, q, 0) != 9) return 4;
-
-    /* At file scope the typedef still names a type. */
-    string r = &x;
-    if (*r != 7) return 5;
-    counter c = 5;
-    if (c != 5) return 6;
-
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("c99_parameter_shadows_a_file_scope_typedef", code, &[]),
-        0
-    );
-}
-
-/// A pointer to a variably-modified array is a pointer, not a VLA.
-///
-/// `int (*p)[n]` records run-time extents like a VLA declarator does, and the
-/// declaration path keyed on that alone: it rejected the initializer in
-/// `int (*p)[n] = a;` as "variable length arrays cannot have initializers",
-/// and then walked an array type that was not there and panicked with
-/// "VLA must have at least one dimension".
-///
-/// What the extents are actually for here is the row stride: one index step
-/// off `p` has to advance by `n` elements, the same arithmetic a variably
-/// modified *parameter* -- which is exactly this pointer type after
-/// adjustment -- already needed.
-#[test]
-fn c99_pointer_to_variably_modified_array() {
-    let code = r#"
-#include <stdlib.h>
-
-static int fill(int n)
+// ==========================================================================
+// ptr_to_vm_array  (exit codes 29-33: 28 + its own code)
+//
+// (was #[test] c99_pointer_to_variably_modified_array)
+//
+// A pointer to a variably-modified array is a pointer, not a VLA.
+//
+// `int (*p)[n]` records run-time extents like a VLA declarator does, and the
+// declaration path keyed on that alone: it rejected the initializer in
+// `int (*p)[n] = a;` as "variable length arrays cannot have initializers",
+// and then walked an array type that was not there and panicked with
+// "VLA must have at least one dimension".
+//
+// What the extents are actually for here is the row stride: one index step
+// off `p` has to advance by `n` elements, the same arithmetic a variably
+// modified *parameter* -- which is exactly this pointer type after
+// adjustment -- already needed.
+// ==========================================================================
+static int pvm_fill(int n)
 {
     int a[3][n];
     /* Declared separately from its initialization, and with one. */
@@ -714,11 +1007,11 @@ static int fill(int n)
     return total;
 }
 
-int main(void)
+static int t_ptr_to_vm_array(void)
 {
     /* n = 5: rows 0,10..14 and 20..24 -> 0+1+2+3+4 + 50+10 + 100+10 */
-    if (fill(5) != 180) return 1;
-    if (fill(1) != 30) return 2;
+    if (pvm_fill(5) != 180) return 1;
+    if (pvm_fill(1) != 30) return 2;
 
     /* A constant extent on the pointee still behaves. */
     int n = 4;
@@ -737,73 +1030,19 @@ int main(void)
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("c99_pointer_to_variably_modified_array", code, &[]),
-        0
-    );
-}
 
-/// A zero significand is zero at any exponent, and a subnormal literal is
-/// rounded to nearest rather than truncated.
-///
-/// The decimal converter short-circuits an exponent far outside every target
-/// format, on the reasoning that the value can only be an infinity or a zero.
-/// That reasoning holds only for a non-zero significand: `0e6000` came out as
-/// an infinity. Separately, the subnormal encoding path shifted the
-/// significand down and dropped what fell off, which is directed rounding
-/// toward zero where every other path rounds to nearest.
-#[test]
-fn c99_extreme_float_literals() {
-    let code = r#"
-#include <float.h>
-
-double zero_big = 0e6000;
-double zero_small = 0.0e-9999;
-long double zero_ld = 0.000e5001;
-
-int main(void)
-{
-    if (zero_big != 0.0) return 1;
-    if (zero_small != 0.0) return 2;
-    if (zero_ld != 0.0L) return 3;
-    if (0e6000 != 0.0) return 4;
-
-    /* A non-zero significand still saturates as before. */
-    if (1e6000 <= DBL_MAX) return 5;
-    if (1e-6000 != 0.0) return 6;
-
-    /* The smallest subnormal double, and one that must round up to it
-       rather than truncate to zero. */
-    if (4.9406564584124654e-324 == 0.0) return 7;
-    if (3e-324 == 0.0) return 8;
-
-#if LDBL_MIN_EXP < DBL_MIN_EXP
-    /* Subnormal long doubles survive at all, and stay ordered. Only where
-       long double has range of its own: on a target whose long double *is*
-       double -- Apple's arm64 among them -- these underflow to zero, which
-       is the right answer there and not what this is testing. */
-    long double a = 3.6451995318824746025e-4951L;
-    long double b = 7.2903990637649492050e-4951L;
-    if (a == 0.0L) return 9;
-    if (!(a < b)) return 10;
-#endif
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("c99_extreme_float_literals", code, &[]), 0);
-}
-
-/// A VLA's local slot holds a *pointer* to the storage, not the storage, so
-/// `&a` has to yield the pointer's value -- the same address the array decays
-/// to (C99 6.5.3.2p3, and 6.3.2.1p3 for the decay). c17 took the slot's
-/// address instead, so `&a` differed from `a` for every VLA and
-/// `int (*p)[n] = &a` pointed at the pointer.
-#[test]
-fn c99_address_of_a_vla_is_the_array_address() {
-    let code = r#"
-int main(void) {
+// ==========================================================================
+// address_of_vla  (exit codes 34-46: 33 + its own code)
+//
+// (was #[test] c99_address_of_a_vla_is_the_array_address)
+//
+// A VLA's local slot holds a *pointer* to the storage, not the storage, so
+// `&a` has to yield the pointer's value -- the same address the array decays
+// to (C99 6.5.3.2p3, and 6.3.2.1p3 for the decay). c17 took the slot's
+// address instead, so `&a` differed from `a` for every VLA and
+// `int (*p)[n] = &a` pointed at the pointer.
+// ==========================================================================
+static int t_address_of_vla(void) {
     int n = 4, m = 5;
 
     /* One dimension. */
@@ -850,26 +1089,22 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("c99_address_of_a_vla", code, &[]),
-        0,
-        "&vla must be the array's address"
-    );
-}
 
-/// Dereferencing a pointer to a variably-modified array has to keep the
-/// array's run-time extents: `(*p)[i]` steps a whole row, and `sizeof(*p)` is
-/// the run-time size (C99 6.5.3.4p2 -- "if the type is variable length, the
-/// size is computed at execution time").
-///
-/// The extents were carried only on the way *in*: `p[0][i][j]` indexed
-/// correctly while `(*p)[i][j]` -- the same address, spelled with a deref --
-/// used a stride of zero, and every `sizeof(*p)` answered 0.
-#[test]
-fn c99_deref_of_a_pointer_to_a_vm_array() {
-    let code = r#"
-int main(void) {
+// ==========================================================================
+// deref_vm_pointer  (exit codes 47-62: 46 + its own code)
+//
+// (was #[test] c99_deref_of_a_pointer_to_a_vm_array)
+//
+// Dereferencing a pointer to a variably-modified array has to keep the
+// array's run-time extents: `(*p)[i]` steps a whole row, and `sizeof(*p)` is
+// the run-time size (C99 6.5.3.4p2 -- "if the type is variable length, the
+// size is computed at execution time").
+//
+// The extents were carried only on the way *in*: `p[0][i][j]` indexed
+// correctly while `(*p)[i][j]` -- the same address, spelled with a deref --
+// used a stride of zero, and every `sizeof(*p)` answered 0.
+// ==========================================================================
+static int t_deref_vm_pointer(void) {
     int n = 4, m = 5;
     unsigned long isz = sizeof(int);
 
@@ -915,25 +1150,21 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("c99_deref_vm_pointer", code, &[]),
-        0,
-        "deref of a pointer to a variably-modified array"
-    );
-}
 
-/// Every way of stepping a pointer to a variably-modified array has to use
-/// the run-time stride, not just the two that were fixed first.
-///
-/// `++p` and `p + 1` took it; `p++`, `p += 1` and `p - q` did not. So the
-/// pointer silently did not move for two of the five spellings, and a
-/// difference whose left operand was not a bare identifier divided by a
-/// compile-time size of zero and trapped.
-#[test]
-fn c99_vm_pointer_arithmetic_every_spelling() {
-    let code = r#"
-int main(void) {
+// ==========================================================================
+// vm_pointer_arith  (exit codes 63-78: 62 + its own code)
+//
+// (was #[test] c99_vm_pointer_arithmetic_every_spelling)
+//
+// Every way of stepping a pointer to a variably-modified array has to use
+// the run-time stride, not just the two that were fixed first.
+//
+// `++p` and `p + 1` took it; `p++`, `p += 1` and `p - q` did not. So the
+// pointer silently did not move for two of the five spellings, and a
+// difference whose left operand was not a bare identifier divided by a
+// compile-time size of zero and trapped.
+// ==========================================================================
+static int t_vm_pointer_arith(void) {
     int n = 3, m = 5;
     long row = (long)m * (long)sizeof(int);
     int a[n][m];
@@ -971,448 +1202,17 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("c99_vm_pointer_arith", code, &[]),
-        0,
-        "pointer arithmetic on a variably-modified pointee"
-    );
-}
 
-// ============================================================================
-// A compound literal is a postfix expression (C99 6.5.2.5)
-// ============================================================================
-
-/// `sizeof (struct s){1, 2}` is `sizeof` of a *literal*, not of the type.
-///
-/// `parse_sizeof` and `parse_alignof` each consumed the `(`, committed to the
-/// type name, and never looked for the `{` -- so the braces were left for
-/// whatever was parsing the enclosing construct, and the error named that
-/// instead. Recognition now lives in one place that every production reaches.
-#[test]
-fn c99_compound_literal_is_a_postfix_expression() {
-    let code = r#"
-struct s { int a; int b; };
-char x[((sizeof (struct s){ 1, 2 }) == sizeof (struct s)) ? 1 : -1];
-char y[(_Alignof (struct s){ 1, 2 }) == _Alignof (struct s) ? 1 : -1];
-char z[sizeof (int[3]){ 1, 2, 3 } == 3 * sizeof (int) ? 1 : -1];
-
-int main(void) {
-    /* The postfix suffixes apply to the literal, as to any postfix
-       expression. */
-    if ((int[3]){ 7, 8, 9 }[1] != 8) return 1;
-    if (sizeof (int[3]){ 1, 2, 3 }[0] != sizeof(int)) return 2;
-    if ((struct s){ 4, 5 }.b != 5) return 3;
-    (void)x; (void)y; (void)z;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("compound_literal_postfix", code, &[]), 0);
-}
-
-/// An array may be initialized from a compound literal of its own type. The
-/// lowering already handled it; only the initializer check stood in the way,
-/// having been written when a string literal was the one non-braced
-/// initializer an array could take.
-#[test]
-fn c99_array_initialized_from_a_compound_literal() {
-    let code = r#"
-static const unsigned short array[] = (const unsigned short []){ 0x0D2B, 0x0D2C };
-
-int main(void) {
-    if (array[0] != 0x0D2B || array[1] != 0x0D2C) return 1;
-    if (sizeof array != 2 * sizeof(unsigned short)) return 2;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("array_from_compound_literal", code, &[]), 0);
-}
-
-// ============================================================================
-// A labeled statement is one statement (C17 6.8.1)
-// ============================================================================
-
-/// `case` and `default` carry the statement they label.
-///
-/// Held as flat sibling markers they worked inside a compound statement and
-/// nowhere else: in `switch (c) case 1: if (d) case 2: case 3: f();` the `if`
-/// took the bare `case 2:` as its whole then-branch, and `case 3: f();` fell
-/// out of the switch entirely -- reported as "case label not within a switch
-/// statement".
-#[test]
-fn c99_case_labels_inside_a_nested_statement() {
-    let code = r#"
-int duff(int c, int d) {
-    int t = 0;
-    switch (c)
-        case 1:
-            if (d)
-                case 2:
-                case 3:
-                    t = 10;
-    return t;
-}
-
-/* Duff's device: labels inside a loop inside the switch. */
-int copy(int *dst, const int *src, int n) {
-    int moved = 0;
-    int count = (n + 3) / 4;
-    switch (n % 4) {
-    case 0: do { *dst++ = *src++; moved++;
-    case 3:      *dst++ = *src++; moved++;
-    case 2:      *dst++ = *src++; moved++;
-    case 1:      *dst++ = *src++; moved++;
-            } while (--count > 0);
-    }
-    return moved;
-}
-
-int main(void) {
-    if (duff(1, 1) != 10) return 1;
-    if (duff(1, 0) != 0) return 2;
-    if (duff(2, 0) != 10) return 3;
-    if (duff(3, 0) != 10) return 4;
-    if (duff(9, 0) != 0) return 5;
-
-    {
-        int src[7] = { 1, 2, 3, 4, 5, 6, 7 }, dst[8] = { 0 };
-        if (copy(dst, src, 7) != 7) return 6;
-        if (dst[0] != 1 || dst[6] != 7) return 7;
-    }
-
-    /* Ordinary fall-through must be unchanged. */
-    {
-        int t = 0, c = 1;
-        switch (c) { case 1: t = 1; case 2: t += 2; break; default: t = 99; }
-        if (t != 3) return 8;
-    }
-    /* A declaration after a label still belongs to the enclosing block. */
-    {
-        int c = 1;
-        switch (c) { case 1: ; int v = 5; if (v != 5) return 9; v++; if (v != 6) return 10; }
-    }
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("nested_case_labels", code, &[]), 0);
-}
-
-/// Every `case` and `default` label belongs to the innermost enclosing
-/// `switch`, wherever it sits in that switch's body: inside a `do` loop
-/// (Duff's device), in either arm of an `if`, in a `for` body, and after a
-/// nested switch in the same block -- whose own equal labels shadow the outer
-/// ones. `default` stands first, in the middle and last.
-#[test]
-fn c99_labels_belong_to_the_innermost_switch() {
-    let code = r#"
-/* Duff's device: case labels inside a do-while inside the switch. */
-static int duff_sum(const int *a, int count) {
-    int s = 0, n = (count + 3) / 4;
-    if (count == 0) return 0;
-    switch (count % 4) {
-    case 0: do { s += *a++;
-    case 3:      s += *a++;
-    case 2:      s += *a++;
-    case 1:      s += *a++;
-            } while (--n > 0);
-    }
-    return s;
-}
-
-/* Nested switches: the inner switch's labels shadow the outer's equal ones,
-   and an outer label after the inner switch, in the same block, is the
-   outer's again. `default` stands first, in the middle and last. */
-static int nested(int x, int y) {
-    int r = 0;
-    switch (x) {
-    default: r += 1000;
-    case 1:
-        r += 1;
-        {
-            switch (y) {
-            case 1: r += 10; break;
-            default: r += 30;
-            case 2: r += 20; break;
-            }
-    case 2:
-            r += 2;
-        }
-        break;
-    case 3:
-        switch (y) { case 3: r += 300; break; case 1: r += 100; default: r += 400; }
-        break;
-    }
-    return r;
-}
-
-/* Case labels in both arms of an if-else, and in a `for`, inside the switch. */
-static int in_if(int x, int c) {
-    int r = 0, i = 0;
-    switch (x) {
-    case 0:
-        if (c) {
-    case 1:
-            r += 1;
-        } else {
-    case 2:
-            r += 2;
-        }
-        r += 10;
-        break;
-    case 3:
-        for (; i < 2; i++) {
-            r += 100;
-    default:
-            r += 1000;
-        }
-    }
-    return r;
-}
-
-int main(void) {
-    int a[9] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
-    for (int k = 0; k <= 9; k++) {
-        int want = k * (k + 1) / 2;
-        if (duff_sum(a, k) != want) return 1 + k;
-    }
-    if (nested(1, 1) != 13) return 20;
-    if (nested(1, 2) != 23) return 21;
-    if (nested(1, 7) != 53) return 22;
-    if (nested(2, 1) != 2) return 23;
-    if (nested(3, 3) != 300) return 24;
-    if (nested(3, 1) != 500) return 25;
-    if (nested(3, 9) != 400) return 26;
-    if (nested(9, 1) != 1013) return 27;
-    if (in_if(0, 1) != 11) return 30;
-    if (in_if(0, 0) != 12) return 31;
-    if (in_if(1, 0) != 11) return 32;
-    if (in_if(2, 1) != 12) return 33;
-    if (in_if(3, 0) != 2200) return 34;
-    if (in_if(9, 0) != 2100) return 35;
-    return 0;
-}
-"#;
-    compile_and_run_everywhere("labels_innermost_switch", code);
-}
-
-/// A label at the end of a compound statement. C17 requires a statement after
-/// it; gcc and clang accept it without, and C23 made it legal, so c17 accepts
-/// it with a warning rather than failing on the `}`.
-#[test]
-fn c99_label_at_the_end_of_a_block() {
-    let code = r#"
-int g;
-int f(int n) { if (n) goto done; g = 1; done: }
-int h(int n) { switch (n) { case 1: g = 2; break; default: } return g; }
-
-int main(void) {
-    f(0);
-    if (g != 1) return 1;
-    f(1);
-    if (g != 1) return 2;
-    if (h(1) != 2) return 3;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("label_at_block_end", code, &[]), 0);
-}
-
-// ============================================================================
-// Address constants in a static initializer (C17 6.6p9)
-// ============================================================================
-
-/// A relocation with an addend is a constant expression even where the type
-/// system sees plain integer arithmetic.
-///
-/// The initializer folder asked which operand had a *pointer type* rather than
-/// which named a symbol, so `(unsigned long)&_text - 0x10000000L - 1` -- how a
-/// kernel or a linker script's C half is written -- was "not a constant
-/// expression". Two smaller holes went with it: identical string literals were
-/// two objects, so their difference was a difference between different
-/// symbols; and a `void *` difference was discarded for having no element
-/// size, although C counts it in bytes.
-#[test]
-fn c99_address_constants_in_static_initializers() {
-    let code = r#"
-int literal_diff = (&"Foobar"[1] - &"Foobar"[0]);
-struct s { char p[2]; };
-static struct s v;
-const int o0 = (int)((void *)&v.p[0] - (void *)&v) + 0U;
-const int o1 = (int)((void *)&v.p[1] - (void *)&v) + 1U;
-int x[60];
-char *y = ((char *)&(x[2 * 8 + 2]) - 8);
-static unsigned long addend = (unsigned long)&x - 0x1000L - 1;
-
-int main(void) {
-    if (literal_diff != 1) return 1;
-    if (o0 != 0) return 2;
-    if (o1 != 2) return 3;
-    if (y != (char *)&x[18] - 8) return 4;
-    if (addend != (unsigned long)&x - 0x1001L) return 5;
-    /* Two spellings of one literal are one object. */
-    if ("Foobar" != "Foobar") return 6;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("static_address_constants", code, &[]), 0);
-}
-
-// ============================================================================
-// Translation limits
-// ============================================================================
-
-/// The front end descends recursively through the source, so a deeply nested
-/// expression or a long run of `case` labels costs stack. Running out of it
-/// was a Rust panic about a stack overflow rather than anything a user could
-/// act on; the compile now runs on a thread whose stack is ours to choose.
-///
-/// C17 5.2.4.1 asks for 63 levels of each. These go well past that, because
-/// generated source does.
-#[test]
-fn c99_deeply_nested_constructs_compile() {
-    let mut code = String::from("int deep(void) { return ");
-    let depth = 400;
-    for _ in 0..depth {
-        code.push('(');
-    }
-    code.push('1');
-    for _ in 0..depth {
-        code.push(')');
-    }
-    code.push_str("; }\n");
-
-    code.push_str("int labels(int c) { int t = 0; switch (c) {\n");
-    for i in 0..600 {
-        code.push_str(&format!("case {i}:\n"));
-    }
-    code.push_str("t = 1; break; default: t = 2; }\nreturn t; }\n");
-
-    code.push_str("int main(void) { return deep() == 1 && labels(3) == 1 ? 0 : 1; }\n");
-    assert_eq!(compile_and_run("deep_nesting", &code, &[]), 0);
-}
-
-/// Every way out of a scope that declares a VLA puts the stack pointer back.
-///
-/// Observed without waiting for an exhaustion that a frame pointer hides:
-/// the same declaration reached on the same path allocates at the same
-/// address every time round *if and only if* the previous iteration released
-/// it. A scope that never releases marches the address up the stack, and the
-/// first mismatch is one iteration later.
-///
-/// The declaration scope and the VLA scope used to be opened by hand at
-/// separate call sites, and three of the sites that opened the first never
-/// opened the second: a `for` init clause, the copy of the `for` lowering
-/// inside the switch-body walk, and a statement expression. A computed
-/// `goto` left no scope at all.
-#[test]
-fn c99_a_vla_scope_is_released_on_every_exit() {
-    let code = r#"
-/* A VLA in a `for` init clause: allocated once per execution of the inner
-   `for` statement, released when that statement ends. */
-static int for_init(int n) {
-    void *first = 0;
-    for (int k = 0; k < 8; k++)
-        for (int a[n]; ; ) {
-            a[0] = k;
-            if (!first) first = (void *)a;
-            else if (first != (void *)a) return 1;
-            break;                      /* leaves by `break` */
-        }
-    return 0;
-}
-
-/* The same shape, inside a switch arm. */
-static int for_init_in_switch(int n, int x) {
-    void *first = 0;
-    switch (x) {
-    case 1:
-        for (int k = 0; k < 8; k++)
-            for (int a[n]; ; ) {
-                a[0] = k;
-                if (!first) first = (void *)a;
-                else if (first != (void *)a) return 2;
-                break;
-            }
-        return 0;
-    }
-    return 3;
-}
-
-/* A statement expression is a block, so it is a scope. */
-static int stmt_expr(int n) {
-    void *first = 0;
-    int bad = 0;
-    for (int k = 0; k < 8; k++)
-        (void)({
-            int a[n];
-            a[0] = k;
-            if (!first) first = (void *)a;
-            else if (first != (void *)a) bad = 4;
-            0;
-        });
-    return bad;
-}
-
-/* Leaving by a forward `goto`, which also has to leave the label bookkeeping
-   straight for every label after it. */
-static int goto_out(int n) {
-    void *first = 0;
-    for (int k = 0; k < 8; k++) {
-        for (int a[n]; ; ) {
-            a[0] = k;
-            if (!first) first = (void *)a;
-            else if (first != (void *)a) return 5;
-            goto next;
-        }
-    next:
-        ;
-    }
-    return 0;
-}
-
-/* And by a computed `goto`, which leaves a scope exactly as a plain one
-   does. The jump is the loop, so every iteration goes through it. */
-static int computed_goto(int n) {
-    void *first = 0;
-    int k = 0;
-    void *back = &&top;
-top:
-    {
-        int a[n];
-        a[0] = k;
-        if (!first) first = (void *)a;
-        else if (first != (void *)a) return 6;
-        k++;
-        if (k < 8) goto *back;
-    }
-    return 0;
-}
-
-int main(void) {
-    int n = 7;
-    int rc;
-    if ((rc = for_init(n)) != 0) return rc;
-    if ((rc = for_init_in_switch(n, 1)) != 0) return rc;
-    if ((rc = stmt_expr(n)) != 0) return rc;
-    if ((rc = goto_out(n)) != 0) return rc;
-    if ((rc = computed_goto(n)) != 0) return rc;
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("c99_vla_scope_release", code, &[]),
-        0,
-        "a VLA scope must release its storage on every exit"
-    );
-}
-
-/// A block inside a `switch` body is a declaration scope there too: its
-/// ordinary declarations do not outlive it, and a VLA declared in it is
-/// released when it ends.
-#[test]
-fn c99_a_switch_body_block_is_a_declaration_scope() {
-    let code = r#"
-int main(void) {
+// ==========================================================================
+// switch_body_block_scope  (exit codes 79-81: 78 + its own code)
+//
+// (was #[test] c99_a_switch_body_block_is_a_declaration_scope)
+//
+// A block inside a `switch` body is a declaration scope there too: its
+// ordinary declarations do not outlive it, and a VLA declared in it is
+// released when it ends.
+// ==========================================================================
+static int t_switch_body_block_scope(void) {
     int v = 1;
     int x = 2;
     switch (x) {
@@ -1437,19 +1237,19 @@ int main(void) {
         }
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_switch_body_block_scope", code, &[]), 0);
-}
 
-/// A declaration in a statement expression does not outlive it.
-///
-/// The statement expression had no declaration scope at all, so its locals
-/// were inserted into the enclosing one and stayed there -- an inner `x`
-/// went on shadowing the outer one after the `})`.
-#[test]
-fn c99_a_statement_expression_is_a_declaration_scope() {
-    let code = r#"
-int main(void) {
+// ==========================================================================
+// stmt_expr_scope  (exit codes 82-85: 81 + its own code)
+//
+// (was #[test] c99_a_statement_expression_is_a_declaration_scope)
+//
+// A declaration in a statement expression does not outlive it.
+//
+// The statement expression had no declaration scope at all, so its locals
+// were inserted into the enclosing one and stayed there -- an inner `x`
+// went on shadowing the outer one after the `})`.
+// ==========================================================================
+static int t_stmt_expr_scope(void) {
     int x = 1;
     int y = ({ int x = 41; x + 1; });
     if (y != 42) return 1;
@@ -1462,203 +1262,294 @@ int main(void) {
     }
     return 0;
 }
+
+// ==========================================================================
+// vla_scope_release  (exit codes 86-91: 85 + its own code)
+//
+// (was #[test] c99_a_vla_scope_is_released_on_every_exit)
+// Placed last on purpose: gcc itself does not release a VLA left by a
+// computed goto, so under gcc this section (alone or here) fails with
+// its own code 6; every other section is validated against gcc first.
+//
+// Every way out of a scope that declares a VLA puts the stack pointer back.
+//
+// Observed without waiting for an exhaustion that a frame pointer hides:
+// the same declaration reached on the same path allocates at the same
+// address every time round *if and only if* the previous iteration released
+// it. A scope that never releases marches the address up the stack, and the
+// first mismatch is one iteration later.
+//
+// The declaration scope and the VLA scope used to be opened by hand at
+// separate call sites, and three of the sites that opened the first never
+// opened the second: a `for` init clause, the copy of the `for` lowering
+// inside the switch-body walk, and a statement expression. A computed
+// `goto` left no scope at all.
+// ==========================================================================
+/* A VLA in a `for` init clause: allocated once per execution of the inner
+   `for` statement, released when that statement ends. */
+static int vsr_for_init(int n) {
+    void *first = 0;
+    for (int k = 0; k < 8; k++)
+        for (int a[n]; ; ) {
+            a[0] = k;
+            if (!first) first = (void *)a;
+            else if (first != (void *)a) return 1;
+            break;                      /* leaves by `break` */
+        }
+    return 0;
+}
+
+/* The same shape, inside a switch arm. */
+static int vsr_for_init_in_switch(int n, int x) {
+    void *first = 0;
+    switch (x) {
+    case 1:
+        for (int k = 0; k < 8; k++)
+            for (int a[n]; ; ) {
+                a[0] = k;
+                if (!first) first = (void *)a;
+                else if (first != (void *)a) return 2;
+                break;
+            }
+        return 0;
+    }
+    return 3;
+}
+
+/* A statement expression is a block, so it is a scope. */
+static int vsr_stmt_expr(int n) {
+    void *first = 0;
+    int bad = 0;
+    for (int k = 0; k < 8; k++)
+        (void)({
+            int a[n];
+            a[0] = k;
+            if (!first) first = (void *)a;
+            else if (first != (void *)a) bad = 4;
+            0;
+        });
+    return bad;
+}
+
+/* Leaving by a forward `goto`, which also has to leave the label bookkeeping
+   straight for every label after it. */
+static int vsr_goto_out(int n) {
+    void *first = 0;
+    for (int k = 0; k < 8; k++) {
+        for (int a[n]; ; ) {
+            a[0] = k;
+            if (!first) first = (void *)a;
+            else if (first != (void *)a) return 5;
+            goto next;
+        }
+    next:
+        ;
+    }
+    return 0;
+}
+
+/* And by a computed `goto`, which leaves a scope exactly as a plain one
+   does. The jump is the loop, so every iteration goes through it. */
+static int vsr_computed_goto(int n) {
+    void *first = 0;
+    int k = 0;
+    void *back = &&top;
+top:
+    {
+        int a[n];
+        a[0] = k;
+        if (!first) first = (void *)a;
+        else if (first != (void *)a) return 6;
+        k++;
+        if (k < 8) goto *back;
+    }
+    return 0;
+}
+
+static int t_vla_scope_release(void) {
+    int n = 7;
+    int rc;
+    if ((rc = vsr_for_init(n)) != 0) return rc;
+    if ((rc = vsr_for_init_in_switch(n, 1)) != 0) return rc;
+    if ((rc = vsr_stmt_expr(n)) != 0) return rc;
+    if ((rc = vsr_goto_out(n)) != 0) return rc;
+    if ((rc = vsr_computed_goto(n)) != 0) return rc;
+    return 0;
+}
+
+int main(void) {
+    int r;
+    if ((r = t_vm_array_params()) != 0) return 0 + r;
+    if ((r = t_ptr_to_vm_array()) != 0) return 28 + r;
+    if ((r = t_address_of_vla()) != 0) return 33 + r;
+    if ((r = t_deref_vm_pointer()) != 0) return 46 + r;
+    if ((r = t_vm_pointer_arith()) != 0) return 62 + r;
+    if ((r = t_switch_body_block_scope()) != 0) return 78 + r;
+    if ((r = t_stmt_expr_scope()) != 0) return 81 + r;
+    if ((r = t_vla_scope_release()) != 0) return 85 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("c99_stmt_expr_scope", code, &[]), 0);
+    assert_eq!(compile_and_run("c99_features_vla_mega", code, &[]), 0);
 }
 
-/// A flexible array member may be initialized at the top level of a static
-/// object, as a GNU extension gcc accepts, but not inside an element of an
-/// array of such structures: each element would be a different size, which
-/// no array can hold. gcc rejects that with "initialization of flexible array
-/// member in a nested context", once per element; c17 accepted it and laid
-/// the elements out as if the member were empty.
+/// One program, one section per original test; each section carries the
+/// original doc comment and its exit-code range in its header. Consolidates:
+/// `labels_innermost_switch`, `fam_top_level_init`, `fam_elided_values`.
 #[test]
-fn c99_flexible_array_member_initializer_in_an_array_is_rejected() {
-    crate::common::compile_expect_error(
-        "fam_nested_init",
-        "struct V { int n; const char s[]; };\n\
-         static const struct V arr[] = { { 1, \"x\" }, { 2, \"yy\" } };\n",
-        "initialization of flexible array member in a nested context",
-    );
-    crate::common::compile_expect_error(
-        "fam_nested_init_braced",
-        "struct E { int a; };\n\
-         struct W { int n; struct E e[]; };\n\
-         static struct W arr[] = { { 1, 4 }, { 2, 5 } };\n",
-        "initialization of flexible array member in a nested context",
-    );
-    // The top-level form stays accepted, and its bytes are laid out.
-    crate::common::compile_and_run_everywhere(
-        "fam_top_level_init",
-        r#"
+fn c99_features_everywhere_mega() {
+    let code = r#"
 #include <string.h>
-struct V { int n; const char s[]; };
-static const struct V top = { 3, "abc" };          /* GNU extension: accepted */
-struct W { int n; int a[]; };
-static struct W w = { 2, { 7, 8 } };
-int main(void) {
-    if (top.n != 3 || strcmp(top.s, "abc") != 0) return 1;
-    if (w.a[0] != 7 || w.a[1] != 8) return 2;
+
+// ==========================================================================
+// labels_innermost_switch  (exit codes 1-35: 0 + its own code)
+//
+// (was #[test] c99_labels_belong_to_the_innermost_switch)
+//
+// Every `case` and `default` label belongs to the innermost enclosing
+// `switch`, wherever it sits in that switch's body: inside a `do` loop
+// (Duff's device), in either arm of an `if`, in a `for` body, and after a
+// nested switch in the same block -- whose own equal labels shadow the outer
+// ones. `default` stands first, in the middle and last.
+// ==========================================================================
+/* Duff's device: case labels inside a do-while inside the switch. */
+static int lis_duff_sum(const int *a, int count) {
+    int s = 0, n = (count + 3) / 4;
+    if (count == 0) return 0;
+    switch (count % 4) {
+    case 0: do { s += *a++;
+    case 3:      s += *a++;
+    case 2:      s += *a++;
+    case 1:      s += *a++;
+            } while (--n > 0);
+    }
+    return s;
+}
+
+/* Nested switches: the inner switch's labels shadow the outer's equal ones,
+   and an outer label after the inner switch, in the same block, is the
+   outer's again. `default` stands first, in the middle and last. */
+static int lis_nested(int x, int y) {
+    int r = 0;
+    switch (x) {
+    default: r += 1000;
+    case 1:
+        r += 1;
+        {
+            switch (y) {
+            case 1: r += 10; break;
+            default: r += 30;
+            case 2: r += 20; break;
+            }
+    case 2:
+            r += 2;
+        }
+        break;
+    case 3:
+        switch (y) { case 3: r += 300; break; case 1: r += 100; default: r += 400; }
+        break;
+    }
+    return r;
+}
+
+/* Case labels in both arms of an if-else, and in a `for`, inside the switch. */
+static int lis_in_if(int x, int c) {
+    int r = 0, i = 0;
+    switch (x) {
+    case 0:
+        if (c) {
+    case 1:
+            r += 1;
+        } else {
+    case 2:
+            r += 2;
+        }
+        r += 10;
+        break;
+    case 3:
+        for (; i < 2; i++) {
+            r += 100;
+    default:
+            r += 1000;
+        }
+    }
+    return r;
+}
+
+static int t_labels_innermost_switch(void) {
+    int a[9] = {1, 2, 3, 4, 5, 6, 7, 8, 9};
+    for (int k = 0; k <= 9; k++) {
+        int want = k * (k + 1) / 2;
+        if (lis_duff_sum(a, k) != want) return 1 + k;
+    }
+    if (lis_nested(1, 1) != 13) return 20;
+    if (lis_nested(1, 2) != 23) return 21;
+    if (lis_nested(1, 7) != 53) return 22;
+    if (lis_nested(2, 1) != 2) return 23;
+    if (lis_nested(3, 3) != 300) return 24;
+    if (lis_nested(3, 1) != 500) return 25;
+    if (lis_nested(3, 9) != 400) return 26;
+    if (lis_nested(9, 1) != 1013) return 27;
+    if (lis_in_if(0, 1) != 11) return 30;
+    if (lis_in_if(0, 0) != 12) return 31;
+    if (lis_in_if(1, 0) != 11) return 32;
+    if (lis_in_if(2, 1) != 12) return 33;
+    if (lis_in_if(3, 0) != 2200) return 34;
+    if (lis_in_if(9, 0) != 2100) return 35;
     return 0;
 }
-"#,
-    );
-}
 
-/// Where gcc lets a flexible array member be initialized (a GNU extension),
-/// case by case as gcc 13 decides it: a list of elements only at the static
-/// object's own top level, a string literal anywhere but in an array element,
-/// `{}` anywhere static, and nothing at all in an automatic object.
-#[test]
-fn c99_flexible_array_member_initializer_placement_matches_gcc() {
-    const NESTED: &str = "initialization of flexible array member in a nested context";
-    const NON_STATIC: &str = "non-static initialization of a flexible array member";
-    let v = "struct V { int n; const char s[]; };\n\
-             struct W { int n; int a[]; };\n\
-             struct O { int k; struct V v; };\n\
-             struct P { int k; struct W w; };\n";
-    let rejected: &[(&str, &str, &str)] = &[
-        (
-            "fam_empty_string_in_element",
-            "static struct V a[] = { { 1, \"\" } };",
-            NESTED,
-        ),
-        (
-            "fam_designated_in_element",
-            "static struct V a[] = { { .s = \"x\" } };",
-            NESTED,
-        ),
-        (
-            "fam_subscript_in_element",
-            "static struct V a[] = { [0].s[0] = 'a' };",
-            NESTED,
-        ),
-        (
-            "fam_string_in_member_in_element",
-            "static struct O a[] = { { 1, { 2, \"z\" } } };",
-            NESTED,
-        ),
-        (
-            "fam_braced_chars_in_member",
-            "static struct O o = { 1, { 2, { 'a' } } };",
-            NESTED,
-        ),
-        (
-            "fam_braced_ints_in_member",
-            "static struct P p = { 1, { 2, { 3 } } };",
-            NESTED,
-        ),
-        (
-            "fam_elided_ints_in_member",
-            "static struct P p = { 1, 2, 3 };",
-            NESTED,
-        ),
-        (
-            "fam_elided_ints_in_element",
-            "static struct W a[] = { 1, 2, 3, 4 };",
-            NESTED,
-        ),
-        (
-            "fam_automatic",
-            "void f(void) { struct V a = { 1, \"x\" }; (void)a; }",
-            NON_STATIC,
-        ),
-        (
-            "fam_automatic_empty",
-            "void f(void) { struct V a = { 1, {} }; (void)a; }",
-            NON_STATIC,
-        ),
-        (
-            "fam_automatic_in_element",
-            "void f(void) { struct V a[] = { { 1, \"x\" } }; (void)a; }",
-            NON_STATIC,
-        ),
-        (
-            "fam_block_compound_literal",
-            "void f(void) { const struct V *p = &(struct V){ 1, \"x\" }; (void)p; }",
-            NON_STATIC,
-        ),
-    ];
-    for (name, body, expected) in rejected {
-        crate::common::compile_expect_error(name, &format!("{v}{body}\n"), expected);
-    }
-    let accepted: &[(&str, &str)] = &[
-        (
-            "fam_absent_in_element",
-            "static struct V a[] = { { 1 }, { 2 } };",
-        ),
-        (
-            "fam_empty_braces_in_element",
-            "static struct V a[] = { { 1, {} } };",
-        ),
-        (
-            "fam_string_in_member",
-            "static struct O o = { 1, { 2, \"z\" } };",
-        ),
-        (
-            "fam_braced_string_in_member",
-            "static struct O o = { 1, { 2, { \"z\" } } };",
-        ),
-        (
-            "fam_empty_in_member",
-            "static struct P p = { 1, { 2, {} } };",
-        ),
-        (
-            "fam_static_local",
-            "void f(void) { static struct V a = { 1, \"x\" }; (void)a; }",
-        ),
-        (
-            "fam_automatic_absent",
-            "void f(void) { struct V a = { 1 }; (void)a; }",
-        ),
-        (
-            "fam_file_compound_literal",
-            "const struct V *p = &(struct V){ 1, \"x\" };",
-        ),
-    ];
-    for (name, body) in accepted {
-        crate::common::compile_expect_ok(name, &format!("{v}{body}\n"));
-    }
-}
-
-/// One diagnostic per element, and nothing else: the rejected member's bytes
-/// are skipped rather than laid out, so no further error follows.
-#[test]
-fn c99_flexible_array_member_nested_initializer_reports_each_element_once() {
-    let stderr = crate::common::compile_rejected(
-        "fam_nested_once",
-        "struct V { int n; const char s[]; };\n\
-         static const struct V arr[] = {\n\
-           { 1, \"x\" },\n\
-           { 2, \"yy\" },\n\
-           { 3, \"zzz\" }\n\
-         };\n",
-    );
-    let lines: Vec<&str> = stderr.lines().filter(|l| l.contains("error")).collect();
-    assert_eq!(lines.len(), 3, "stderr:\n{stderr}");
-    for (line, at) in lines.iter().zip([":3:", ":4:", ":5:"]) {
-        assert!(line.contains(at), "{line} should be reported at line {at}");
-    }
-}
-
-/// A brace-elided initializer for a flexible array member takes every value
-/// left in the list, as gcc lays it out; the member used to get only the
-/// first, and the rest were dropped as excess.
-#[test]
-fn c99_flexible_array_member_takes_every_elided_value() {
-    crate::common::compile_and_run_everywhere(
-        "fam_elided_values",
-        r#"
-struct W { int n; int a[]; };
-static struct W w = { 1, 2, 3 };
-struct W2 { int n; struct { int x, y; } a[]; };
-static struct W2 w2 = { 1, 2, 3, 4, 5 };
-int main(void) {
-    if (w.n != 1 || w.a[0] != 2 || w.a[1] != 3) return 1;
-    if (w2.n != 1 || w2.a[0].x != 2 || w2.a[0].y != 3) return 2;
-    if (w2.a[1].x != 4 || w2.a[1].y != 5) return 3;
+// ==========================================================================
+// fam_top_level_init  (exit codes 36-37: 35 + its own code)
+//
+// (was #[test] c99_flexible_array_member_initializer_in_an_array_is_rejected)
+// The accepted top-level form from that test; its two rejected forms
+// are compile-only and live in cc/test_asm/c99_features.rs.
+//
+// A flexible array member may be initialized at the top level of a static
+// object, as a GNU extension gcc accepts, but not inside an element of an
+// array of such structures: each element would be a different size, which
+// no array can hold. gcc rejects that with "initialization of flexible array
+// member in a nested context", once per element; c17 accepted it and laid
+// the elements out as if the member were empty.
+// ==========================================================================
+struct fti_V { int n; const char s[]; };
+static const struct fti_V fti_top = { 3, "abc" };          /* GNU extension: accepted */
+struct fti_W { int n; int a[]; };
+static struct fti_W fti_w = { 2, { 7, 8 } };
+static int t_fam_top_level_init(void) {
+    if (fti_top.n != 3 || strcmp(fti_top.s, "abc") != 0) return 1;
+    if (fti_w.a[0] != 7 || fti_w.a[1] != 8) return 2;
     return 0;
 }
-"#,
-    );
+
+// ==========================================================================
+// fam_elided_values  (exit codes 38-40: 37 + its own code)
+//
+// (was #[test] c99_flexible_array_member_takes_every_elided_value)
+//
+// A brace-elided initializer for a flexible array member takes every value
+// left in the list, as gcc lays it out; the member used to get only the
+// first, and the rest were dropped as excess.
+// ==========================================================================
+struct fev_W { int n; int a[]; };
+static struct fev_W fev_w = { 1, 2, 3 };
+struct fev_W2 { int n; struct { int x, y; } a[]; };
+static struct fev_W2 fev_w2 = { 1, 2, 3, 4, 5 };
+static int t_fam_elided_values(void) {
+    if (fev_w.n != 1 || fev_w.a[0] != 2 || fev_w.a[1] != 3) return 1;
+    if (fev_w2.n != 1 || fev_w2.a[0].x != 2 || fev_w2.a[0].y != 3) return 2;
+    if (fev_w2.a[1].x != 4 || fev_w2.a[1].y != 5) return 3;
+    return 0;
+}
+
+int main(void) {
+    int r;
+    if ((r = t_labels_innermost_switch()) != 0) return 0 + r;
+    if ((r = t_fam_top_level_init()) != 0) return 35 + r;
+    if ((r = t_fam_elided_values()) != 0) return 37 + r;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("c99_features_everywhere_mega", code);
 }

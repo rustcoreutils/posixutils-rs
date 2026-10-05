@@ -17,15 +17,34 @@
 
 use crate::common::compile_and_run;
 
+/// `<tgmath.h>` dispatch on integer arguments and the type of `I`, in one
+/// unit under `<tgmath.h>` (which includes `<complex.h>`).
+///
+/// Consolidates: `tgmath_integer_arguments_count_as_double`, `complex_i_is_float_complex`.
+/// The original tests' documentation follows, one block per section.
+//
+// ---- tgmath_integer_arguments_count_as_double (exit codes 1..50) ----
+// (no doc comment)
+//
+// ---- complex_i_is_float_complex (exit codes 51..54) ----
+// (no doc comment)
 #[test]
-fn tgmath_integer_arguments_count_as_double() {
-    let src = r#"
+fn tgmath_dispatch_and_complex_i_mega() {
+    let code = r#"
+/* tgmath: compile_and_run -lm
+   Exit codes: section k's own failure code plus its base.
+     1.. 50  tgmath_integer_arguments_count_as_double
+    51.. 54  complex_i_is_float_complex
+*/
 #include <tgmath.h>
+#include <complex.h>
+
+/* ==== tgmath_integer_arguments_count_as_double (codes 1..50) ==== */
 #define T(x) _Generic((x), float: 2, double: 3, long double: 4, \
     float _Complex: 5, double _Complex: 6, long double _Complex: 7, default: 99)
 int i = 16777217; float fl = 2.0f; long double ld = 2.0L;
 float _Complex fc = 1.0f;
-int main(void) {
+static int t_tgmath_integer_arguments_count_as_double(void) {
     int got[] = {
         T(pow(i, fl)), T(pow(fl, i)), T(atan2(i, fl)), T(fmax(fl, i)),
         T(fma(i, fl, fl)), T(nextafter(fl, i)), T(pow(i, fc)), T(pow(fl, fl)),
@@ -39,19 +58,11 @@ int main(void) {
     if (fmax(fl, 16777217) != 16777217.0) return 50;
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("tgmath_int_args", src, &["-lm".to_string()]),
-        0
-    );
-}
+#undef T
 
-#[test]
-fn complex_i_is_float_complex() {
-    let src = r#"
-#include <complex.h>
+/* ==== complex_i_is_float_complex (codes 51..54) ==== */
 #define T(x) _Generic((x), float _Complex: 5, double _Complex: 6, default: 99)
-int main(void) {
+static int t_complex_i_is_float_complex(void) {
     if (sizeof(I) != sizeof(float _Complex)) return 1;
     if (T(I) != 5 || T(1.0f * I) != 5 || T(1 * I) != 5 || T(_Complex_I) != 5) return 2;
     if (T(1.0 * I) != 6) return 3;
@@ -59,9 +70,17 @@ int main(void) {
     if (crealf(z) != 1.0f || cimagf(z) != 2.0f) return 4;
     return 0;
 }
+
+int main(void)
+{
+    int rc;
+    if ((rc = t_tgmath_integer_arguments_count_as_double()) != 0) return 0 + rc;
+    if ((rc = t_complex_i_is_float_complex()) != 0) return 50 + rc;
+    return 0;
+}
 "#;
     assert_eq!(
-        compile_and_run("complex_i_float", src, &["-lm".to_string()]),
+        compile_and_run("tgmath_dispatch_and_complex_i", code, &["-lm".to_string()]),
         0
     );
 }

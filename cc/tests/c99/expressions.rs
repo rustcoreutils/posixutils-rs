@@ -239,93 +239,94 @@ int main(void) {
     assert_eq!(compile_and_run("c99_expressions_mega", code, &[]), 0);
 }
 
-/// A struct rvalue used as a designator gets a real address.
-///
-/// `linearize_lvalue` fell through to evaluating the expression for anything
-/// that is not a designator, and for a struct-returning call that yields the
-/// *result local* -- the value, not its address. A consumer that loads or
-/// stores folds the member offset in and reads the right bytes, which is why
-/// `mk().scalar_member` always worked. A consumer that does arithmetic --
-/// indexing an array member, taking an address -- dereferenced the value's own
-/// bits and crashed, for every element type.
-///
-/// C17 6.5.2.3p5 gives the temporary lifetime to the end of the full
-/// expression; the materialized local is function-scope, so that holds.
+/// One program, one section per original test; each section carries the
+/// original doc comment and its exit-code range in its header. Consolidates:
+/// `struct_rvalue_designators`, `integer_promotions`,
+/// `const_fold_common_type`, `elvis`, `cond_arm_conversion`, `cond_uac`,
+/// `fn_designator`, `cond_rank`, `uac_rank_width`.
 #[test]
-fn c99_struct_rvalue_designators() {
+fn c99_expressions_conversions_mega() {
     let code = r#"
-struct A { int v[2]; };
-struct D { double v[2]; };
-struct I { int x; };
-struct B { long pad; struct I inner; };
-struct S { int a; long b; };
+// ==========================================================================
+// struct_rvalue_designators  (exit codes 1-9: 0 + its own code)
+//
+// (was #[test] c99_struct_rvalue_designators)
+//
+// A struct rvalue used as a designator gets a real address.
+//
+// `linearize_lvalue` fell through to evaluating the expression for anything
+// that is not a designator, and for a struct-returning call that yields the
+// *result local* -- the value, not its address. A consumer that loads or
+// stores folds the member offset in and reads the right bytes, which is why
+// `mk().scalar_member` always worked. A consumer that does arithmetic --
+// indexing an array member, taking an address -- dereferenced the value's own
+// bits and crashed, for every element type.
+//
+// C17 6.5.2.3p5 gives the temporary lifetime to the end of the full
+// expression; the materialized local is function-scope, so that holds.
+// ==========================================================================
+struct srd_A { int v[2]; };
+struct srd_D { double v[2]; };
+struct srd_I { int x; };
+struct srd_B { long pad; struct srd_I inner; };
+struct srd_S { int a; long b; };
 
-__attribute__((noinline)) static struct A mka(void) { struct A a = {{7, 9}}; return a; }
-__attribute__((noinline)) static struct D mkd(void) { struct D d = {{1.5, 2.5}}; return d; }
-__attribute__((noinline)) static struct B mkb(void) { struct B b = {1, {42}}; return b; }
-__attribute__((noinline)) static struct S mks(void) { struct S s = {3, 4}; return s; }
-__attribute__((noinline)) static int  take(const int *p) { return p[1]; }
-__attribute__((noinline)) static long sum(struct S s) { return s.a + s.b; }
+__attribute__((noinline)) static struct srd_A srd_mka(void) { struct srd_A a = {{7, 9}}; return a; }
+__attribute__((noinline)) static struct srd_D srd_mkd(void) { struct srd_D d = {{1.5, 2.5}}; return d; }
+__attribute__((noinline)) static struct srd_B srd_mkb(void) { struct srd_B b = {1, {42}}; return b; }
+__attribute__((noinline)) static struct srd_S srd_mks(void) { struct srd_S s = {3, 4}; return s; }
+__attribute__((noinline)) static int  srd_take(const int *p) { return p[1]; }
+__attribute__((noinline)) static long srd_sum(struct srd_S s) { return s.a + s.b; }
 
-int main(void)
+static int t_struct_rvalue_designators(void)
 {
     /* Indexing an array member: the case that crashed. */
-    if (mka().v[0] != 7) return 1;
-    if (mka().v[1] != 9) return 2;
-    if (mkd().v[1] != 2.5) return 3;
+    if (srd_mka().v[0] != 7) return 1;
+    if (srd_mka().v[1] != 9) return 2;
+    if (srd_mkd().v[1] != 2.5) return 3;
 
     /* Taking an address, and letting the member decay to a pointer. */
-    if (*&mka().v[1] != 9) return 4;
-    if (take(mka().v) != 9) return 5;
+    if (*&srd_mka().v[1] != 9) return 4;
+    if (srd_take(srd_mka().v) != 9) return 5;
 
     /* A member at a non-zero offset: offset zero worked by accident. */
-    if (mkb().inner.x != 42) return 6;
+    if (srd_mkb().inner.x != 42) return 6;
 
     /* Scalar members and whole-struct arguments, which already worked. */
-    if (mks().a != 3 || mks().b != 4) return 7;
-    if (sum(mks()) != 7) return 8;
+    if (srd_mks().a != 3 || srd_mks().b != 4) return 7;
+    if (srd_sum(srd_mks()) != 7) return 8;
 
     /* Assigned through a local first -- the control. */
-    struct A a = mka();
+    struct srd_A a = srd_mka();
     if (a.v[0] != 7 || a.v[1] != 9) return 9;
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("c99_struct_rvalue_designators", code, &[]),
-        0
-    );
-    assert_eq!(
-        compile_and_run_optimized("c99_struct_rvalue_designators_opt", code),
-        0
-    );
-}
 
-// ============================================================================
-// The integer promotions run before the usual arithmetic conversions
-// ============================================================================
-
-/// C17 6.3.1.8p1 performs the integer promotions on both operands *before*
-/// comparing their ranks, so every sub-`int` operand pair yields `int` and the
-/// arithmetic that follows is signed. Skipping them let two `unsigned char`s
-/// reach the "either operand is unsigned" fallback and divide unsigned:
-///
-/// ```text
-///   unsigned char a = 1, b = 2;
-///   (a - b) / 2     gave 2147483647, where gcc gives 0
-///   (a - b) >> 1    gave 2147483647, where gcc gives -1
-///   (a - b) < 0     gave 0,          where gcc gives 1
-/// ```
-///
-/// `_Bool` and plain `char` answered correctly only because the signedness
-/// predicate wrongly called them signed, so the two defects cancelled; they are
-/// covered here because fixing that predicate uncancels them. Each row must
-/// equal the `int` answer, whatever the operand type.
-#[test]
-fn c99_integer_promotions_precede_the_usual_arithmetic_conversions() {
-    let code = r#"
-int main(void)
+// ==========================================================================
+// integer_promotions  (exit codes 10-71: 9 + its own code)
+//
+// (was #[test] c99_integer_promotions_precede_the_usual_arithmetic_conversions)
+// Under the heading: The integer promotions run before the usual arithmetic conversions
+//
+// C17 6.3.1.8p1 performs the integer promotions on both operands *before*
+// comparing their ranks, so every sub-`int` operand pair yields `int` and the
+// arithmetic that follows is signed. Skipping them let two `unsigned char`s
+// reach the "either operand is unsigned" fallback and divide unsigned:
+//
+// ```text
+//   unsigned char a = 1, b = 2;
+//   (a - b) / 2     gave 2147483647, where gcc gives 0
+//   (a - b) >> 1    gave 2147483647, where gcc gives -1
+//   (a - b) < 0     gave 0,          where gcc gives 1
+// ```
+//
+// `_Bool` and plain `char` answered correctly only because the signedness
+// predicate wrongly called them signed, so the two defects cancelled; they are
+// covered here because fixing that predicate uncancels them. Each row must
+// equal the `int` answer, whatever the operand type.
+// ==========================================================================
+static int t_integer_promotions(void)
 {
     /* ===== unsigned char: the operand type that was visibly wrong (1-9) ===== */
     {
@@ -397,100 +398,28 @@ int main(void)
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_integer_promotions", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("c99_integer_promotions_opt", code),
-        0
-    );
-}
 
-/// Constant folding of floating comparisons and unsigned comparisons (#C114).
-///
-/// Two wrong answers from one place: the parser's constant folder, which
-/// evaluates array sizes, enumerators, `case` labels and `_Static_assert`.
-///
-/// It truncated a floating literal to `i128` before folding, so `1.5 > 1.0`
-/// became `1 > 1` and was **false** -- `enum E { X = 1.5 > 1.0 }` was 0 and
-/// `int a[1.5 > 1.0 ? 4 : 8]` took the wrong branch. And it compared signed
-/// whatever the operand types, so `(unsigned)-1 > 0` was **false** too.
-/// Neither is exotic; both silently produce a different program.
-///
-/// The runtime rows are the control: the same expressions were always right
-/// when they reached code generation, which is what made the folder's
-/// disagreement invisible.
-#[test]
-fn c99_constant_folding_of_float_and_unsigned_comparisons() {
-    let code = r#"
-/* Floating comparisons, in every context the parser folds. */
-enum FloatCmp { GT = 1.5 > 1.0, LT = 1.0 < 1.5, EQ = 2.0 == 2.0,
-                NE = 2.0 != 3.0, GE = 1.0 >= 1.0, LE = 2.0 <= 1.0,
-                MIXED = 1 < 1.5, LD = 1.5L > 1.0L, DIVCMP = 1.0/4.0 < 0.5 };
-int chosen[1.5 > 1.0 ? 4 : 8];
-
-/* A cast from floating arithmetic truncates the floating value, so the
-   arithmetic under it has to be done in floating point. */
-enum FloatCast { SUM = (int)(1.5 + 1.5), DIV = (int)(7.0/2.0),
-                 NEG = (int)(-3.7), LIT = (int)3.9 };
-int scaled[(int)(2.5 * 2)];
-
-/* Unsigned comparisons; C promotes to the common type before comparing. */
-enum UnsignedCmp { UMAX = (unsigned)-1 > 0, ULMAX = 0xFFFFFFFFFFFFFFFFULL > 1,
-                   UEQ = 1u == 1, SNEG = -1 > 0, SLE = -1 <= 0 };
-int usized[((unsigned)-1 > 0) ? 4 : 8];
-
-_Static_assert(1.5 > 1.0, "floating comparison folds");
-_Static_assert(1.5 + 1.5 == 3.0, "floating arithmetic folds");
-_Static_assert((unsigned)-1 > 0, "unsigned comparison folds");
-
-int main(void) {
-    if (GT != 1 || LT != 1 || EQ != 1 || NE != 1) return 1;
-    if (GE != 1 || LE != 0) return 2;
-    if (MIXED != 1 || LD != 1 || DIVCMP != 1) return 3;
-    if (sizeof chosen / sizeof chosen[0] != 4) return 4;
-
-    if (SUM != 3 || DIV != 3 || NEG != -3 || LIT != 3) return 5;
-    if (sizeof scaled / sizeof scaled[0] != 5) return 6;
-
-    if (UMAX != 1 || ULMAX != 1 || UEQ != 1) return 7;
-    if (SNEG != 0 || SLE != 1) return 8;
-    if (sizeof usized / sizeof usized[0] != 4) return 9;
-
-    /* The control: at run time these were always right, which is why the
-       folder disagreeing with them went unnoticed. */
-    double a = 1.5, b = 1.0;
-    unsigned u = (unsigned)-1;
-    if (!(a > b)) return 10;
-    if (!(u > 0)) return 11;
-    if ((int)(a + a) != 3) return 12;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("const_fold_float_unsigned", code, &[]), 0);
-}
-
-// ============================================================================
-// The folder converts to the common type before operating (6.3.1.8)
-// ============================================================================
-
-/// A folded comparison, division and remainder take their signedness from the
-/// *common type*, not from "either operand is unsigned" and not from the left
-/// operand.
-///
-/// Both shortcuts get the integer promotions wrong. `(unsigned char)200 > -1`
-/// is a signed comparison because both operands promote to `int` (6.3.1.1p2),
-/// and `-1L < 1u` is signed on LP64 because `long` represents every
-/// `unsigned int`; asking whether *either* operand was unsigned made both
-/// false. `-1 / 2u` is unsigned because the common type is `unsigned int`;
-/// asking the left operand alone made it signed and folded 0 where the answer
-/// is 2147483647.
-///
-/// Every one of these is a constant expression, so a wrong fold is a wrong
-/// program, not a wrong diagnostic.
-#[test]
-fn c99_const_fold_uses_the_common_type() {
-    let code = r#"
+// ==========================================================================
+// const_fold_common_type  (exit codes 72-81: 71 + its own code)
+//
+// (was #[test] c99_const_fold_uses_the_common_type)
+// Under the heading: The folder converts to the common type before operating (6.3.1.8)
+//
+// A folded comparison, division and remainder take their signedness from the
+// *common type*, not from "either operand is unsigned" and not from the left
+// operand.
+//
+// Both shortcuts get the integer promotions wrong. `(unsigned char)200 > -1`
+// is a signed comparison because both operands promote to `int` (6.3.1.1p2),
+// and `-1L < 1u` is signed on LP64 because `long` represents every
+// `unsigned int`; asking whether *either* operand was unsigned made both
+// false. `-1 / 2u` is unsigned because the common type is `unsigned int`;
+// asking the left operand alone made it signed and folded 0 where the answer
+// is 2147483647.
+//
+// Every one of these is a constant expression, so a wrong fold is a wrong
+// program, not a wrong diagnostic.
+// ==========================================================================
 /* Promotions make these signed, and true. */
 _Static_assert(-1L < 1u, "long vs unsigned int is signed on LP64");
 _Static_assert((unsigned char)200 > -1, "unsigned char promotes to int");
@@ -506,25 +435,25 @@ _Static_assert(-1 > 1u, "int vs unsigned int is unsigned");
 _Static_assert(!(-1 > 4294967295u), "the left operand converts, not widens");
 _Static_assert(-1 == 4294967295u, "and converts to exactly that");
 
-int main(void)
+static int t_const_fold_common_type(void)
 {
-    enum { UDIV = -1 / 2u };        /* common type unsigned: 2147483647 */
-    enum { UMOD = -1 % 2u };        /* common type unsigned: 1 */
-    enum { SDIV = (unsigned char)200 / -1 };  /* both promote to int: -200 */
-    enum { SMOD = (unsigned char)200 % -1 };  /* -> 0 */
-    enum { LDIV = -1L / 2u };       /* common type long, signed: 0 */
+    enum { fct_UDIV = -1 / 2u };        /* common type unsigned: 2147483647 */
+    enum { fct_UMOD = -1 % 2u };        /* common type unsigned: 1 */
+    enum { fct_SDIV = (unsigned char)200 / -1 };  /* both promote to int: -200 */
+    enum { fct_SMOD = (unsigned char)200 % -1 };  /* -> 0 */
+    enum { fct_LDIV = -1L / 2u };       /* common type long, signed: 0 */
 
-    if (UDIV != 2147483647) return 1;
-    if (UMOD != 1) return 2;
-    if (SDIV != -200) return 3;
-    if (SMOD != 0) return 4;
-    if (LDIV != 0) return 5;
+    if (fct_UDIV != 2147483647) return 1;
+    if (fct_UMOD != 1) return 2;
+    if (fct_SDIV != -200) return 3;
+    if (fct_SMOD != 0) return 4;
+    if (fct_LDIV != 0) return 5;
 
     /* A shift follows the LEFT operand alone (6.5.7p3): the operands are
        promoted separately and the result is the left operand's type. Making
        the shift use the common type would break this. */
-    enum { SHR = -8 >> 1u };        /* arithmetic: -4, not a huge unsigned */
-    if (SHR != -4) return 6;
+    enum { fct_SHR = -8 >> 1u };        /* arithmetic: -4, not a huge unsigned */
+    if (fct_SHR != -4) return 6;
     if (sizeof(1 << 1L) != sizeof(int)) return 7;
 
     /* The control: at run time these were always right. */
@@ -536,124 +465,45 @@ int main(void)
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("const_fold_common_type", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("const_fold_common_type_opt", code),
-        0
-    );
-}
 
-/// `sizeof` a variably-length array is not an integer constant expression.
-///
-/// `SizeofType` grew a runtime guard; `SizeofExpr` did not, so `sizeof a` for
-/// `int a[n]` folded to 0 -- `size_bits` reports 0 for an array with no extent
-/// -- and `case sizeof a:` was accepted with the wrong value, matching
-/// `switch (0)`. A `TypeId` for `int[n]` is indistinguishable from `int[]`, so
-/// the question has to be asked of the array levels.
-#[test]
-fn c99_sizeof_a_vla_is_not_a_constant_expression() {
-    // `case sizeof a:` must be rejected, not silently folded to 0.
-    let rejected = r#"
-int g(int n)
-{
-    int a[n];
-    switch (n) {
-    case sizeof a: return 1;
-    default: return 0;
-    }
-}
-int main(void) { return g(0); }
-"#;
-    crate::common::compile_expect_error("sizeof_vla_case_label", rejected, "constant");
+// ==========================================================================
+// elvis  (exit codes 82-123: 81 + its own code)
+//
+// (was #[test] c99_omitted_middle_operand_conditional)
+//
+// GNU `a ?: b` — a conditional with the middle operand omitted.
+//
+// The condition supplies both the test and the true-value, and it must be
+// evaluated **exactly once**: rewriting to `a ? a : b` in the parser would
+// call `f` twice in `f() ?: 0`. That is why this has its own AST node rather
+// than being desugared, and why the counter checks below are the real test —
+// every value assertion here would also pass under a duplicating rewrite.
+//
+// Found in sparse (14 files) and used in 1373 files of the Linux kernel.
+// ==========================================================================
+static int elv_cond_calls = 0;
+static int elv_rhs_calls = 0;
 
-    // `sizeof` a *fixed* array is still a constant expression.
-    let accepted = r#"
-int main(void)
-{
-    int a[4];
-    switch (sizeof a) {
-    case sizeof a: return 0;
-    default: return 1;
-    }
-}
-"#;
-    assert_eq!(compile_and_run("sizeof_fixed_array_case", accepted, &[]), 0);
-}
+static int elv_zero(void)    { elv_cond_calls++; return 0; }
+static int elv_seven(void)   { elv_cond_calls++; return 7; }
+static int elv_rhs(void)     { elv_rhs_calls++;  return 42; }
 
-/// A floating comparison in a constant expression reaches the integer folder
-/// for its integer-valued operands.
-///
-/// The parser's floating fold had arms only for literals, casts, negation and
-/// the four arithmetic operators, so `_Static_assert(sizeof(int) < 4.5, "")`
-/// was rejected as "not a constant expression" although both operands are
-/// constant. And `CharLit` -- an `i64` whose signedness the lexer has already
-/// resolved -- was read through `u32`, so `'\x80'` folded to 4294967168.0
-/// instead of -128.0 where `char` is signed.
-#[test]
-fn c99_float_comparison_folds_integer_operands() {
-    let code = r#"
-_Static_assert(sizeof(int) < 4.5, "sizeof reaches the float comparison");
-_Static_assert(sizeof(int) > 3.5, "and compares as a number, not a truncation");
-_Static_assert(_Alignof(int) < 4.5, "_Alignof too");
-_Static_assert((1 ? 2 : 3) < 2.5, "a conditional too");
-
-/* Plain `char` is signed on x86-64 and unsigned on aarch64, so the sign of
-   '\x80' is the platform's business. What must hold either way is that the
-   float fold and the integer fold agree about it -- and that is exactly what
-   reading the literal through `u32` broke: it made '\x80' 4294967168.0 where
-   the integer fold has -128. */
-_Static_assert(('\x80' < 0.0) == ('\x80' < 0), "the two folds agree on sign");
-_Static_assert(('\x80' == 0.0) == ('\x80' == 0), "and on equality");
-_Static_assert(('\x7f' < 0.0) == ('\x7f' < 0), "and on a positive literal");
-
-int main(void)
-{
-    /* And both agree with the run-time answer. */
-    char c = '\x80';
-    if (('\x80' < 0.0) != (c < 0)) return 1;
-    if (('\x80' < 0) != (c < 0)) return 2;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("float_cmp_integer_operands", code, &[]), 0);
-}
-
-/// GNU `a ?: b` — a conditional with the middle operand omitted.
-///
-/// The condition supplies both the test and the true-value, and it must be
-/// evaluated **exactly once**: rewriting to `a ? a : b` in the parser would
-/// call `f` twice in `f() ?: 0`. That is why this has its own AST node rather
-/// than being desugared, and why the counter checks below are the real test —
-/// every value assertion here would also pass under a duplicating rewrite.
-///
-/// Found in sparse (14 files) and used in 1373 files of the Linux kernel.
-#[test]
-fn c99_omitted_middle_operand_conditional() {
-    let code = r#"
-static int cond_calls = 0;
-static int rhs_calls = 0;
-
-static int zero(void)    { cond_calls++; return 0; }
-static int seven(void)   { cond_calls++; return 7; }
-static int rhs(void)     { rhs_calls++;  return 42; }
-
-int main(void) {
+static int t_elvis(void) {
     /* Value selection. */
     int a = 0, b = 5;
     if ((b ?: 9) != 5) return 1;
     if ((a ?: 9) != 9) return 2;
 
     /* The condition is evaluated once, whichever way it goes. */
-    cond_calls = 0; rhs_calls = 0;
-    if ((seven() ?: rhs()) != 7) return 3;
-    if (cond_calls != 1) return 4;
-    if (rhs_calls != 0) return 5;   /* right side untouched when true */
+    elv_cond_calls = 0; elv_rhs_calls = 0;
+    if ((elv_seven() ?: elv_rhs()) != 7) return 3;
+    if (elv_cond_calls != 1) return 4;
+    if (elv_rhs_calls != 0) return 5;   /* right side untouched when true */
 
-    cond_calls = 0; rhs_calls = 0;
-    if ((zero() ?: rhs()) != 42) return 6;
-    if (cond_calls != 1) return 7;
-    if (rhs_calls != 1) return 8;   /* ...and evaluated once when false */
+    elv_cond_calls = 0; elv_rhs_calls = 0;
+    if ((elv_zero() ?: elv_rhs()) != 42) return 6;
+    if (elv_cond_calls != 1) return 7;
+    if (elv_rhs_calls != 1) return 8;   /* ...and evaluated once when false */
 
     /* Pointers: the common type is the pointer, not int. */
     int x = 11;
@@ -666,9 +516,9 @@ int main(void) {
     if ((c ?: (1 ? 2 : 3)) != 2) return 11;
 
     /* A constant condition folds; the untaken side is never evaluated. */
-    rhs_calls = 0;
-    if ((5 ?: rhs()) != 5) return 12;
-    if (rhs_calls != 0) return 13;
+    elv_rhs_calls = 0;
+    if ((5 ?: elv_rhs()) != 5) return 12;
+    if (elv_rhs_calls != 0) return 13;
     if ((0 ?: 9) != 9) return 14;
 
     /* Narrower condition widens to the common type. */
@@ -683,271 +533,441 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_elvis", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("c99_elvis_o2", code), 0);
-}
 
-/// C17 6.5.15p5: the conditional expression has the arms' common type, so an
-/// arm whose own type differs is converted.
-///
-/// The conversion used to be attempted only for a *narrower integer* arm, so a
-/// `float` arm feeding a `double` result was left alone and a 32-bit pattern
-/// reached a 64-bit select: `pick() ? f() : d0()` evaluated to 0.0. Both the
-/// ternary and the GNU elvis form were affected, at every one of the seven
-/// places the test was written out.
-#[test]
-fn c99_conditional_arms_are_converted_to_the_common_type() {
-    let code = r#"
-float ff(void) { return 2.5f; }
-double dd(void) { return 7.5; }
-int pick(void) { return 1; }
-int zero(void) { return 0; }
-float g_f = 1.25f;
+// ==========================================================================
+// cond_arm_conversion  (exit codes 124-130: 123 + its own code)
+//
+// (was #[test] c99_conditional_arms_are_converted_to_the_common_type)
+//
+// C17 6.5.15p5: the conditional expression has the arms' common type, so an
+// arm whose own type differs is converted.
+//
+// The conversion used to be attempted only for a *narrower integer* arm, so a
+// `float` arm feeding a `double` result was left alone and a 32-bit pattern
+// reached a 64-bit select: `pick() ? f() : d0()` evaluated to 0.0. Both the
+// ternary and the GNU elvis form were affected, at every one of the seven
+// places the test was written out.
+// ==========================================================================
+float cac_ff(void) { return 2.5f; }
+double cac_dd(void) { return 7.5; }
+int cac_pick(void) { return 1; }
+int cac_zero(void) { return 0; }
+float cac_g_f = 1.25f;
 
-int main(void) {
+static int t_cond_arm_conversion(void) {
     // Impure arms: the value is produced in a branch and merged.
-    if ((pick() ? ff() : dd()) != 2.5) return 1;
-    if ((zero() ? ff() : dd()) != 7.5) return 2;
+    if ((cac_pick() ? cac_ff() : cac_dd()) != 2.5) return 1;
+    if ((cac_zero() ? cac_ff() : cac_dd()) != 7.5) return 2;
 
     // Pure arms: the value is produced with a select.
     double one = 1.0;
-    if ((pick() ? g_f : one) != 1.25) return 3;
+    if ((cac_pick() ? cac_g_f : one) != 1.25) return 3;
 
     // The elvis form: the condition is also the true value.
-    if ((ff() ?: dd()) != 2.5) return 4;
+    if ((cac_ff() ?: cac_dd()) != 2.5) return 4;
     float zf = 0.0f;
-    if ((zf ?: dd()) != 7.5) return 5;
+    if ((zf ?: cac_dd()) != 7.5) return 5;
 
     // A narrowing arm is converted too -- `double` arm, `float` result.
-    float narrowed = pick() ? dd() : ff();
+    float narrowed = cac_pick() ? cac_dd() : cac_ff();
     if (narrowed != 7.5f) return 6;
 
     // The integer widening the old test did handle must still work.
     char c = 3;
     long wide = 1;
-    if ((pick() ? c : wide) != 3) return 7;
+    if ((cac_pick() ? c : wide) != 3) return 7;
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("cond_arm_conversion", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("cond_arm_conversion_opt", code),
-        0
-    );
-}
 
-/// C17 6.3.1.8: the arms of a conditional expression go through the usual
-/// arithmetic conversions, so at equal rank an unsigned operand wins.
-///
-/// Every 32-bit pair was collapsed to `int` instead, which made
-/// `(long)(u ?: -1)` with `unsigned u = 0` give -1 where C gives 4294967295;
-/// at 64 bits the type was whichever arm happened to be written first.
-///
-/// Each case picks the arm whose *own* type is not the common one, since that
-/// is the only arm a conversion has anything to do to.
-#[test]
-fn c99_conditional_usual_arithmetic_conversions() {
-    let code = r#"
-int t(void) { return 1; }
-int f(void) { return 0; }
-int main(void) {
+// ==========================================================================
+// cond_uac  (exit codes 131-139: 130 + its own code)
+//
+// (was #[test] c99_conditional_usual_arithmetic_conversions)
+//
+// C17 6.3.1.8: the arms of a conditional expression go through the usual
+// arithmetic conversions, so at equal rank an unsigned operand wins.
+//
+// Every 32-bit pair was collapsed to `int` instead, which made
+// `(long)(u ?: -1)` with `unsigned u = 0` give -1 where C gives 4294967295;
+// at 64 bits the type was whichever arm happened to be written first.
+//
+// Each case picks the arm whose *own* type is not the common one, since that
+// is the only arm a conversion has anything to do to.
+// ==========================================================================
+int cua_t(void) { return 1; }
+int cua_f(void) { return 0; }
+static int t_cond_uac(void) {
     unsigned u = 0;
     long sl = -1;
     unsigned long ul = 1;
 
     // Equal rank, one unsigned: the unsigned type wins, so the -1 arm is
     // converted to UINT_MAX before the result widens to long.
-    if ((long)(f() ? u : -1) != 4294967295L) return 1;
-    if ((long)(f() ? -1 : u) != 0L) return 2;
+    if ((long)(cua_f() ? u : -1) != 4294967295L) return 1;
+    if ((long)(cua_f() ? -1 : u) != 0L) return 2;
     if ((long)(u ?: -1) != 4294967295L) return 3;
 
     // Equal rank at 64 bits: still the unsigned one, whichever arm it is.
-    if ((f() ? ul : sl) != 18446744073709551615UL) return 4;
-    if ((f() ? sl : ul) != 1UL) return 5;
+    if ((cua_f() ? ul : sl) != 18446744073709551615UL) return 4;
+    if ((cua_f() ? sl : ul) != 1UL) return 5;
 
     // Unequal rank: the wider type, which being signed represents every value
     // of the narrower unsigned one.
-    if ((t() ? sl : u) != -1L) return 6;
+    if ((cua_t() ? sl : u) != -1L) return 6;
 
     // A type narrower than `int` promotes to `int`, so its own signedness does
     // not survive to decide anything.
     unsigned char uc = 200;
-    if ((long)(t() ? (signed char)-1 : 1) != -1L) return 7;
-    if ((long)(f() ? uc : -1) != -1L) return 8;
-    if ((long)(f() ? (unsigned short)1 : -1) != -1L) return 9;
+    if ((long)(cua_t() ? (signed char)-1 : 1) != -1L) return 7;
+    if ((long)(cua_f() ? uc : -1) != -1L) return 8;
+    if ((long)(cua_f() ? (unsigned short)1 : -1) != -1L) return 9;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("cond_uac", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("cond_uac_opt", code), 0);
-}
 
-/// A function declared as a trailing declarator, or inside a block, is still a
-/// function: it decays, it can be addressed, and it can be called. Only the
-/// *lvalue* half was wrong, so these are the uses the fix must not break.
-#[test]
-fn c99_non_defining_function_declarations_still_work() {
-    let code = r#"
-int f(int x), g(int x);
-int f(int x) { return x + 1; }
-int g(int x) { return x * 2; }
-typedef int fn_t(int);
+// ==========================================================================
+// fn_designator  (exit codes 140-144: 139 + its own code)
+//
+// (was #[test] c99_non_defining_function_declarations_still_work)
+//
+// A function declared as a trailing declarator, or inside a block, is still a
+// function: it decays, it can be addressed, and it can be called. Only the
+// *lvalue* half was wrong, so these are the uses the fix must not break.
+// ==========================================================================
+int fnd_f(int x), fnd_g(int x);
+int fnd_f(int x) { return x + 1; }
+int fnd_g(int x) { return x * 2; }
+typedef int fnd_fn_t(int);
 
-int use(void) {
-    int k(int);            /* a block-scope declaration of an outer function */
-    int (*p)(int) = g;     /* decays to a pointer */
-    int (*q)(int) = &f;    /* and can be addressed explicitly */
-    fn_t *r = f;           /* through a function typedef */
-    if (k(1) != 4) return 1;
+int fnd_use(void) {
+    int fnd_k(int);            /* a block-scope declaration of an outer function */
+    int (*p)(int) = fnd_g;     /* decays to a pointer */
+    int (*q)(int) = &fnd_f;    /* and can be addressed explicitly */
+    fnd_fn_t *r = fnd_f;           /* through a function typedef */
+    if (fnd_k(1) != 4) return 1;
     if (p(3) != 6) return 2;
     if (q(3) != 4) return 3;
     if (r(3) != 4) return 4;
-    if (sizeof(&f) != sizeof(void *)) return 5;
+    if (sizeof(&fnd_f) != sizeof(void *)) return 5;
     return 0;
 }
 
-int k(int x) { return x + 3; }
-int main(void) { return use(); }
-"#;
-    assert_eq!(compile_and_run("fn_designator", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("fn_designator_opt", code), 0);
-}
+int fnd_k(int x) { return x + 3; }
+static int t_fn_designator(void) { return fnd_use(); }
 
-/// The conditional's common type is decided by conversion *rank*, not by bit
-/// width (C17 6.3.1.8). On LP64 `long` and `long long` are both 64 bits, and
-/// the copy of the rules that used to live in `ternary_common_type` compared
-/// widths -- so it returned whichever arm was written first, and `c ? l : ll`
-/// and `c ? ll : l` disagreed about their own type.
-///
-/// Checked with `_Generic`, which asks the type directly; the two types share
-/// a representation, so no arithmetic result can tell them apart.
-#[test]
-fn c99_conditional_common_type_follows_rank() {
-    let code = r#"
-#define TY(e) _Generic((e), \
+// ==========================================================================
+// cond_rank  (exit codes 145-156: 144 + its own code)
+//
+// (was #[test] c99_conditional_common_type_follows_rank)
+//
+// The conditional's common type is decided by conversion *rank*, not by bit
+// width (C17 6.3.1.8). On LP64 `long` and `long long` are both 64 bits, and
+// the copy of the rules that used to live in `ternary_common_type` compared
+// widths -- so it returned whichever arm was written first, and `c ? l : ll`
+// and `c ? ll : l` disagreed about their own type.
+//
+// Checked with `_Generic`, which asks the type directly; the two types share
+// a representation, so no arithmetic result can tell them apart.
+// ==========================================================================
+#define crk_TY(e) _Generic((e), \
     int: 1, unsigned int: 2, \
     long: 3, unsigned long: 4, \
     long long: 5, unsigned long long: 6, \
     float: 7, double: 8, long double: 9, \
     default: 0)
-int c(void) { return 1; }
-int main(void) {
+int crk_c(void) { return 1; }
+static int t_cond_rank(void) {
     long l = 1; long long ll = 1;
     unsigned long ul = 1; unsigned long long ull = 1;
     unsigned u = 1; int i = 1;
 
     /* Equal width, unequal rank: long long wins, written either way round. */
-    if (TY(c() ? l : ll) != 5) return 1;
-    if (TY(c() ? ll : l) != 5) return 2;
-    if (TY(c() ? ul : ull) != 6) return 3;
-    if (TY(c() ? ull : ul) != 6) return 4;
+    if (crk_TY(crk_c() ? l : ll) != 5) return 1;
+    if (crk_TY(crk_c() ? ll : l) != 5) return 2;
+    if (crk_TY(crk_c() ? ul : ull) != 6) return 3;
+    if (crk_TY(crk_c() ? ull : ul) != 6) return 4;
 
     /* Mixed signedness at unequal rank: the unsigned counterpart of the
        higher-ranked type, since neither can represent all of the other. */
-    if (TY(c() ? ul : ll) != 6) return 5;
-    if (TY(c() ? ll : ul) != 6) return 6;
+    if (crk_TY(crk_c() ? ul : ll) != 6) return 5;
+    if (crk_TY(crk_c() ? ll : ul) != 6) return 6;
 
     /* The equal-rank case, which is where the unsigned operand wins. */
-    if (TY(c() ? u : i) != 2) return 7;
-    if (TY(c() ? l : ul) != 4) return 8;
+    if (crk_TY(crk_c() ? u : i) != 2) return 7;
+    if (crk_TY(crk_c() ? l : ul) != 4) return 8;
 
     /* Unequal rank, same signedness: the higher rank. */
-    if (TY(c() ? i : ll) != 5) return 9;
-    if (TY(c() ? u : ull) != 6) return 10;
+    if (crk_TY(crk_c() ? i : ll) != 5) return 9;
+    if (crk_TY(crk_c() ? u : ull) != 6) return 10;
 
     /* Reals rank the same way, and `_Float16` is a type of its own rather
        than being flattened to `float`. */
     float f = 1; double d = 1;
-    if (TY(c() ? f : d) != 8) return 11;
-    if (TY(c() ? d : f) != 8) return 12;
+    if (crk_TY(crk_c() ? f : d) != 8) return 11;
+    if (crk_TY(crk_c() ? d : f) != 8) return 12;
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("cond_rank", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("cond_rank_opt", code), 0);
-}
 
-/// The usual arithmetic conversions now have one implementation, on the type
-/// table, and the binary operators and the conditional both reach it. They
-/// used to have two, which had drifted: the table compared `size_bits` where
-/// the parser ranked by kind, so they disagreed about `long` against
-/// `long long`.
-///
-/// C17 6.3.1.8 needs rank *and* width, which are different questions -- `long`
-/// and `long long` rank apart at the same width. Each of the standard's three
-/// mixed-signedness steps gets a case here.
-#[test]
-fn c99_usual_arithmetic_conversions_rank_and_width() {
-    let code = r#"
-#define TY(e) _Generic((e), \
+// ==========================================================================
+// uac_rank_width  (exit codes 157-173: 156 + its own code)
+//
+// (was #[test] c99_usual_arithmetic_conversions_rank_and_width)
+//
+// The usual arithmetic conversions now have one implementation, on the type
+// table, and the binary operators and the conditional both reach it. They
+// used to have two, which had drifted: the table compared `size_bits` where
+// the parser ranked by kind, so they disagreed about `long` against
+// `long long`.
+//
+// C17 6.3.1.8 needs rank *and* width, which are different questions -- `long`
+// and `long long` rank apart at the same width. Each of the standard's three
+// mixed-signedness steps gets a case here.
+// ==========================================================================
+#define urw_TY(e) _Generic((e), \
     int: 1, unsigned int: 2, long: 3, unsigned long: 4, \
     long long: 5, unsigned long long: 6, default: 0)
-int c(void) { return 1; }
-int main(void) {
+int urw_c(void) { return 1; }
+static int t_uac_rank_width(void) {
     int i = 1; unsigned u = 1;
     long l = 1; unsigned long ul = 1;
     long long ll = 1; unsigned long long ull = 1;
     unsigned char uc = 1; short sh = 1;
 
     /* Same signedness: the higher rank wins, at equal width too. */
-    if (TY(l + ll) != 5) return 1;
-    if (TY(ll + l) != 5) return 2;
-    if (TY(ul + ull) != 6) return 3;
-    if (TY(i + ll) != 5) return 4;
+    if (urw_TY(l + ll) != 5) return 1;
+    if (urw_TY(ll + l) != 5) return 2;
+    if (urw_TY(ul + ull) != 6) return 3;
+    if (urw_TY(i + ll) != 5) return 4;
 
     /* Mixed, unsigned ranks at least as high: the unsigned type. */
-    if (TY(l + ul) != 4) return 5;
-    if (TY(i + u) != 2) return 6;
+    if (urw_TY(l + ul) != 4) return 5;
+    if (urw_TY(i + u) != 2) return 6;
 
     /* Mixed, signed ranks higher AND is wider, so it holds every value of the
        unsigned one and keeps its sign. This is the case a rank-only rule gets
        wrong -- `-1L / 2u` really is negative, so it truncates to 0. */
-    if (TY(l + u) != 3) return 7;
-    if (TY(u + l) != 3) return 8;
+    if (urw_TY(l + u) != 3) return 7;
+    if (urw_TY(u + l) != 3) return 8;
     if (-1L / 2u != 0) return 9;
 
     /* Mixed, signed ranks higher but has no room to spare: neither represents
        the other, so the unsigned counterpart of the signed type. */
-    if (TY(ul + ll) != 6) return 10;
-    if (TY(ll + ul) != 6) return 11;
+    if (urw_TY(ul + ll) != 6) return 10;
+    if (urw_TY(ll + ul) != 6) return 11;
 
     /* Both narrower than int: promotion strips the signedness first. */
-    if (TY(uc + sh) != 1) return 12;
+    if (urw_TY(uc + sh) != 1) return 12;
     if ((unsigned char)200 / -1 != -200) return 13;
 
     /* And the conditional gives the same answers, since it is the same code. */
-    if (TY(c() ? l : ll) != 5) return 14;
-    if (TY(c() ? ul : ll) != 6) return 15;
-    if (TY(c() ? l : u) != 3) return 16;
-    if (TY(c() ? uc : sh) != 1) return 17;
+    if (urw_TY(urw_c() ? l : ll) != 5) return 14;
+    if (urw_TY(urw_c() ? ul : ll) != 6) return 15;
+    if (urw_TY(urw_c() ? l : u) != 3) return 16;
+    if (urw_TY(urw_c() ? uc : sh) != 1) return 17;
+    return 0;
+}
+
+int main(void) {
+    int r;
+    if ((r = t_struct_rvalue_designators()) != 0) return 0 + r;
+    if ((r = t_integer_promotions()) != 0) return 9 + r;
+    if ((r = t_const_fold_common_type()) != 0) return 71 + r;
+    if ((r = t_elvis()) != 0) return 81 + r;
+    if ((r = t_cond_arm_conversion()) != 0) return 123 + r;
+    if ((r = t_cond_uac()) != 0) return 130 + r;
+    if ((r = t_fn_designator()) != 0) return 139 + r;
+    if ((r = t_cond_rank()) != 0) return 144 + r;
+    if ((r = t_uac_rank_width()) != 0) return 156 + r;
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("uac_rank_width", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("uac_rank_width_opt", code), 0);
+    assert_eq!(
+        compile_and_run("c99_expressions_conversions_mega", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("c99_expressions_conversions_mega_opt", code),
+        0
+    );
 }
 
-/// `E1 op= E2` evaluates `E1` **exactly once** (C17 6.5.16.2p3), and so do
-/// `++E` and `E++` (6.5.3.1p2, 6.5.2.4p2).
-///
-/// `emit_assign` computed the old value with `linearize_expr(target)` and then
-/// re-derived the target's address in its store arm, so every subexpression of
-/// the target ran twice: `b[i++] += 5` incremented `i` twice *and* updated the
-/// wrong element, `*p++ += 1` advanced `p` by two, and `a[f()] |= 1` called
-/// `f` twice. Ordinary C, wrong at every optimization level -- the torture
-/// tests `920428-1`, `990222-1` and `20060929-1` are the shapes that caught
-/// it, but nothing about it is obscure.
+/// One program, one section per original test; each section carries the
+/// original doc comment and its exit-code range in its header. Consolidates:
+/// `const_fold_float_unsigned`, `sizeof_fixed_array_case`,
+/// `float_cmp_integer_operands`.
 #[test]
-fn c99_compound_assignment_evaluates_its_target_once() {
+fn c99_expressions_constant_folding_mega() {
     let code = r#"
-int calls;
-int idx(void) { calls++; return 0; }
-int g[4];
+// ==========================================================================
+// const_fold_float_unsigned  (exit codes 1-12: 0 + its own code)
+//
+// (was #[test] c99_constant_folding_of_float_and_unsigned_comparisons)
+//
+// Constant folding of floating comparisons and unsigned comparisons (#C114).
+//
+// Two wrong answers from one place: the parser's constant folder, which
+// evaluates array sizes, enumerators, `case` labels and `_Static_assert`.
+//
+// It truncated a floating literal to `i128` before folding, so `1.5 > 1.0`
+// became `1 > 1` and was **false** -- `enum E { X = 1.5 > 1.0 }` was 0 and
+// `int a[1.5 > 1.0 ? 4 : 8]` took the wrong branch. And it compared signed
+// whatever the operand types, so `(unsigned)-1 > 0` was **false** too.
+// Neither is exotic; both silently produce a different program.
+//
+// The runtime rows are the control: the same expressions were always right
+// when they reached code generation, which is what made the folder's
+// disagreement invisible.
+// ==========================================================================
+/* Floating comparisons, in every context the parser folds. */
+enum ffu_FloatCmp { ffu_GT = 1.5 > 1.0, ffu_LT = 1.0 < 1.5, ffu_EQ = 2.0 == 2.0,
+                ffu_NE = 2.0 != 3.0, ffu_GE = 1.0 >= 1.0, ffu_LE = 2.0 <= 1.0,
+                ffu_MIXED = 1 < 1.5, ffu_LD = 1.5L > 1.0L, ffu_DIVCMP = 1.0/4.0 < 0.5 };
+int ffu_chosen[1.5 > 1.0 ? 4 : 8];
+
+/* A cast from floating arithmetic truncates the floating value, so the
+   arithmetic under it has to be done in floating point. */
+enum ffu_FloatCast { ffu_SUM = (int)(1.5 + 1.5), ffu_DIV = (int)(7.0/2.0),
+                 ffu_NEG = (int)(-3.7), ffu_LIT = (int)3.9 };
+int ffu_scaled[(int)(2.5 * 2)];
+
+/* Unsigned comparisons; C promotes to the common type before comparing. */
+enum ffu_UnsignedCmp { ffu_UMAX = (unsigned)-1 > 0, ffu_ULMAX = 0xFFFFFFFFFFFFFFFFULL > 1,
+                   ffu_UEQ = 1u == 1, ffu_SNEG = -1 > 0, ffu_SLE = -1 <= 0 };
+int ffu_usized[((unsigned)-1 > 0) ? 4 : 8];
+
+_Static_assert(1.5 > 1.0, "floating comparison folds");
+_Static_assert(1.5 + 1.5 == 3.0, "floating arithmetic folds");
+_Static_assert((unsigned)-1 > 0, "unsigned comparison folds");
+
+static int t_const_fold_float_unsigned(void) {
+    if (ffu_GT != 1 || ffu_LT != 1 || ffu_EQ != 1 || ffu_NE != 1) return 1;
+    if (ffu_GE != 1 || ffu_LE != 0) return 2;
+    if (ffu_MIXED != 1 || ffu_LD != 1 || ffu_DIVCMP != 1) return 3;
+    if (sizeof ffu_chosen / sizeof ffu_chosen[0] != 4) return 4;
+
+    if (ffu_SUM != 3 || ffu_DIV != 3 || ffu_NEG != -3 || ffu_LIT != 3) return 5;
+    if (sizeof ffu_scaled / sizeof ffu_scaled[0] != 5) return 6;
+
+    if (ffu_UMAX != 1 || ffu_ULMAX != 1 || ffu_UEQ != 1) return 7;
+    if (ffu_SNEG != 0 || ffu_SLE != 1) return 8;
+    if (sizeof ffu_usized / sizeof ffu_usized[0] != 4) return 9;
+
+    /* The control: at run time these were always right, which is why the
+       folder disagreeing with them went unnoticed. */
+    double a = 1.5, b = 1.0;
+    unsigned u = (unsigned)-1;
+    if (!(a > b)) return 10;
+    if (!(u > 0)) return 11;
+    if ((int)(a + a) != 3) return 12;
+
+    return 0;
+}
+
+// ==========================================================================
+// sizeof_fixed_array_case  (exit codes 13-13: 12 + its own code)
+//
+// (was #[test] c99_sizeof_a_vla_is_not_a_constant_expression)
+// The accepted half of that test; the rejected `case sizeof a:` form
+// is compile-only and lives in cc/test_asm/c99_expressions.rs.
+//
+// `sizeof` a variably-length array is not an integer constant expression.
+//
+// `SizeofType` grew a runtime guard; `SizeofExpr` did not, so `sizeof a` for
+// `int a[n]` folded to 0 -- `size_bits` reports 0 for an array with no extent
+// -- and `case sizeof a:` was accepted with the wrong value, matching
+// `switch (0)`. A `TypeId` for `int[n]` is indistinguishable from `int[]`, so
+// the question has to be asked of the array levels.
+// ==========================================================================
+static int t_sizeof_fixed_array_case(void)
+{
+    int a[4];
+    switch (sizeof a) {
+    case sizeof a: return 0;
+    default: return 1;
+    }
+}
+
+// ==========================================================================
+// float_cmp_integer_operands  (exit codes 14-15: 13 + its own code)
+//
+// (was #[test] c99_float_comparison_folds_integer_operands)
+//
+// A floating comparison in a constant expression reaches the integer folder
+// for its integer-valued operands.
+//
+// The parser's floating fold had arms only for literals, casts, negation and
+// the four arithmetic operators, so `_Static_assert(sizeof(int) < 4.5, "")`
+// was rejected as "not a constant expression" although both operands are
+// constant. And `CharLit` -- an `i64` whose signedness the lexer has already
+// resolved -- was read through `u32`, so `'\x80'` folded to 4294967168.0
+// instead of -128.0 where `char` is signed.
+// ==========================================================================
+_Static_assert(sizeof(int) < 4.5, "sizeof reaches the float comparison");
+_Static_assert(sizeof(int) > 3.5, "and compares as a number, not a truncation");
+_Static_assert(_Alignof(int) < 4.5, "_Alignof too");
+_Static_assert((1 ? 2 : 3) < 2.5, "a conditional too");
+
+/* Plain `char` is signed on x86-64 and unsigned on aarch64, so the sign of
+   '\x80' is the platform's business. What must hold either way is that the
+   float fold and the integer fold agree about it -- and that is exactly what
+   reading the literal through `u32` broke: it made '\x80' 4294967168.0 where
+   the integer fold has -128. */
+_Static_assert(('\x80' < 0.0) == ('\x80' < 0), "the two folds agree on sign");
+_Static_assert(('\x80' == 0.0) == ('\x80' == 0), "and on equality");
+_Static_assert(('\x7f' < 0.0) == ('\x7f' < 0), "and on a positive literal");
+
+static int t_float_cmp_integer_operands(void)
+{
+    /* And both agree with the run-time answer. */
+    char c = '\x80';
+    if (('\x80' < 0.0) != (c < 0)) return 1;
+    if (('\x80' < 0) != (c < 0)) return 2;
+    return 0;
+}
 
 int main(void) {
+    int r;
+    if ((r = t_const_fold_float_unsigned()) != 0) return 0 + r;
+    if ((r = t_sizeof_fixed_array_case()) != 0) return 12 + r;
+    if ((r = t_float_cmp_integer_operands()) != 0) return 13 + r;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("c99_expressions_constant_folding_mega", code, &[]),
+        0
+    );
+}
+
+/// One program, one section per original test; each section carries the
+/// original doc comment and its exit-code range in its header. Consolidates:
+/// `compound_assign_once`, `compound_assign_type`, `discarded_side_effects`,
+/// `switch_promotion`, `reversed_subscript`, `switch_wide`.
+#[test]
+fn c99_expressions_side_effects_mega() {
+    let code = r#"
+// ==========================================================================
+// compound_assign_once  (exit codes 1-19: 0 + its own code)
+//
+// (was #[test] c99_compound_assignment_evaluates_its_target_once)
+//
+// `E1 op= E2` evaluates `E1` **exactly once** (C17 6.5.16.2p3), and so do
+// `++E` and `E++` (6.5.3.1p2, 6.5.2.4p2).
+//
+// `emit_assign` computed the old value with `linearize_expr(target)` and then
+// re-derived the target's address in its store arm, so every subexpression of
+// the target ran twice: `b[i++] += 5` incremented `i` twice *and* updated the
+// wrong element, `*p++ += 1` advanced `p` by two, and `a[f()] |= 1` called
+// `f` twice. Ordinary C, wrong at every optimization level -- the torture
+// tests `920428-1`, `990222-1` and `20060929-1` are the shapes that caught
+// it, but nothing about it is obscure.
+// ==========================================================================
+int cao_calls;
+int cao_idx(void) { cao_calls++; return 0; }
+int cao_g[4];
+
+static int t_compound_assign_once(void) {
     /* An index with a side effect. */
     {
         int b[4] = {10, 20, 30, 40};
@@ -974,10 +994,10 @@ int main(void) {
         if (line[0] != '2' || line[1] != '0' || line[2] != '0') return 7;
     }
     /* A call in the index, which is observable even when the value is not. */
-    calls = 0;
-    g[idx()] |= 1;
-    if (calls != 1) return 8;
-    if (g[0] != 1) return 9;
+    cao_calls = 0;
+    cao_g[cao_idx()] |= 1;
+    if (cao_calls != 1) return 8;
+    if (cao_g[0] != 1) return 9;
 
     /* `++` and `--` have the same rule. */
     {
@@ -992,13 +1012,13 @@ int main(void) {
         ++c[j++];
         if (j != 1 || c[0] != 2 || c[1] != 2) return 11;
     }
-    calls = 0;
-    g[idx()]++;
-    if (calls != 1) return 12;
+    cao_calls = 0;
+    cao_g[cao_idx()]++;
+    if (cao_calls != 1) return 12;
 
     /* A struct member reached through a side-effecting base. */
     {
-        struct S { int v; } arr[3] = {{1}, {2}, {3}};
+        struct cao_S { int v; } arr[3] = {{1}, {2}, {3}};
         int k = 1;
         arr[k++].v += 10;
         if (k != 2) return 13;
@@ -1007,8 +1027,8 @@ int main(void) {
     }
     /* And through a post-incremented pointer with `->`. */
     {
-        struct S { int v; } arr[3] = {{1}, {2}, {3}};
-        struct S *sp = arr;
+        struct cao_S { int v; } arr[3] = {{1}, {2}, {3}};
+        struct cao_S *sp = arr;
         sp++->v += 100;
         if (sp - arr != 1) return 16;
         if (arr[0].v != 101) return 17;
@@ -1023,32 +1043,28 @@ int main(void) {
     }
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_compound_assign_once", code, &[]), 0);
-    assert_eq!(
-        compile_and_run("c99_compound_assign_once_o2", code, &["-O2".to_string()]),
-        0
-    );
-}
 
-/// `E1 op= E2` is `E1 = E1 op E2` (C17 6.5.16.2p3), so the operation runs at
-/// the operands' **common type** after the integer promotions, and only the
-/// result converts back to `E1`'s type.
-///
-/// It was computed at `E1`'s type instead, with `E2` converted down first, so
-/// a narrow unsigned target turned a negative right operand into a huge
-/// positive one and divided unsigned: `unsigned char x = 50; short y = -5;
-/// x /= y;` gave 0 where 50 / -5 is -10 and `(unsigned char)-10` is 246.
-#[test]
-fn c99_compound_assignment_computes_at_the_common_type() {
-    let code = r#"
-volatile short vy = -5;
+// ==========================================================================
+// compound_assign_type  (exit codes 20-29: 19 + its own code)
+//
+// (was #[test] c99_compound_assignment_computes_at_the_common_type)
+//
+// `E1 op= E2` is `E1 = E1 op E2` (C17 6.5.16.2p3), so the operation runs at
+// the operands' **common type** after the integer promotions, and only the
+// result converts back to `E1`'s type.
+//
+// It was computed at `E1`'s type instead, with `E2` converted down first, so
+// a narrow unsigned target turned a negative right operand into a huge
+// positive one and divided unsigned: `unsigned char x = 50; short y = -5;
+// x /= y;` gave 0 where 50 / -5 is -10 and `(unsigned char)-10` is 246.
+// ==========================================================================
+volatile short cat_vy = -5;
 
-int main(void) {
+static int t_compound_assign_type(void) {
     /* The `20030128-1` shape, with and without the volatile. */
     {
         unsigned char x = 50;
-        x /= vy;
+        x /= cat_vy;
         if (x != (unsigned char)-10) return 1;
     }
     {
@@ -1108,91 +1124,87 @@ int main(void) {
     }
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_compound_assign_type", code, &[]), 0);
-    assert_eq!(
-        compile_and_run("c99_compound_assign_type_o2", code, &["-O2".to_string()]),
-        0
-    );
-}
 
-/// A side effect keeps happening even where its value is thrown away.
-///
-/// Three places dropped one. A parameter's array size is discarded by the
-/// array-to-pointer adjustment (C17 6.7.6.3p7) but is still evaluated on
-/// entry (6.9.1p10), and c17 threw the expression away with the size.
-/// `__builtin_expect`'s second argument is a hint c17 does not use, and it
-/// was parsed and discarded rather than evaluated. And an `asm` read-write
-/// operand took its lvalue twice -- once for the load before the asm, once
-/// for the store after -- so `asm("" : "+r"(*bar()))` called `bar` twice.
-///
-/// The torture tests are `970217-1`, `pr77767`, `pr85156` and `990130-1`.
-#[test]
-fn c99_discarded_operands_still_have_their_side_effects() {
-    let code = r#"
-int calls;
-int dummy;
-int *bar(void) { ++calls; return &dummy; }
+// ==========================================================================
+// discarded_side_effects  (exit codes 30-43: 29 + its own code)
+//
+// (was #[test] c99_discarded_operands_still_have_their_side_effects)
+//
+// A side effect keeps happening even where its value is thrown away.
+//
+// Three places dropped one. A parameter's array size is discarded by the
+// array-to-pointer adjustment (C17 6.7.6.3p7) but is still evaluated on
+// entry (6.9.1p10), and c17 threw the expression away with the size.
+// `__builtin_expect`'s second argument is a hint c17 does not use, and it
+// was parsed and discarded rather than evaluated. And an `asm` read-write
+// operand took its lvalue twice -- once for the load before the asm, once
+// for the store after -- so `asm("" : "+r"(*bar()))` called `bar` twice.
+//
+// The torture tests are `970217-1`, `pr77767`, `pr85156` and `990130-1`.
+// ==========================================================================
+int dse_calls;
+int dse_dummy;
+int *dse_bar(void) { ++dse_calls; return &dse_dummy; }
 
 /* The size of an adjusted array parameter. */
-int sub(int i, int array[i++]) { return i; }
-int two(int a, int b[a++], int c, int d[c++]) { return a * 10 + c; }
+int dse_sub(int i, int array[i++]) { return i; }
+int dse_two(int a, int b[a++], int c, int d[c++]) { return a * 10 + c; }
 /* Several dimensions: only the outermost is adjusted away, and the inner
    ones are still needed for the row stride. */
-int rows(int n, int m, int a[n++][m]) { return n; }
+int dse_rows(int n, int m, int a[n++][m]) { return n; }
 
 /* __builtin_expect's second argument. */
-int x, y;
-int expect_side(int z) {
-    if (__builtin_expect(x ? y != 0 : 0, z++)) return 7;
+int dse_x, dse_y;
+int dse_expect_side(int z) {
+    if (__builtin_expect(dse_x ? dse_y != 0 : 0, z++)) return 7;
     return z;
 }
 /* A constant hint, which is what likely/unlikely expand to, still works. */
-int expect_const(int v) { return __builtin_expect(v != 0, 1) ? 10 : 20; }
+int dse_expect_const(int v) { return __builtin_expect(v != 0, 1) ? 10 : 20; }
 
 /* An asm read-write operand. */
-static void asm_rw(void) { __asm__("" : "+r"(*bar())); }
+static void dse_asm_rw(void) { __asm__("" : "+r"(*dse_bar())); }
 /* And a plain output operand, which is written once. */
-static void asm_out(void) { __asm__("" : "=r"(*bar())); }
+static void dse_asm_out(void) { __asm__("" : "=r"(*dse_bar())); }
 
-int main(void) {
+static int t_discarded_side_effects(void) {
     int arr[10];
-    if (sub(10, arr) != 11) return 1;
-    if (two(1, arr, 1, arr) != 22) return 2;
+    if (dse_sub(10, arr) != 11) return 1;
+    if (dse_two(1, arr, 1, arr) != 22) return 2;
 
     int grid[4][4];
-    if (rows(3, 4, grid) != 4) return 3;
+    if (dse_rows(3, 4, grid) != 4) return 3;
 
-    x = 1;
-    if (expect_side(10) != 11) return 4;
-    if (expect_const(1) != 10) return 5;
-    if (expect_const(0) != 20) return 6;
+    dse_x = 1;
+    if (dse_expect_side(10) != 11) return 4;
+    if (dse_expect_const(1) != 10) return 5;
+    if (dse_expect_const(0) != 20) return 6;
 
-    calls = 0;
-    asm_rw();
-    if (calls != 1) return 7;
+    dse_calls = 0;
+    dse_asm_rw();
+    if (dse_calls != 1) return 7;
 
-    calls = 0;
-    asm_out();
-    if (calls != 1) return 8;
+    dse_calls = 0;
+    dse_asm_out();
+    if (dse_calls != 1) return 8;
 
     /* Mixed operand kinds, in both orders: the resolved places are indexed
        by operand position, and a memory operand takes an early exit from
        that loop -- so a missing push would silently shift every later one. */
     {
         int mcalls = 0, rcalls = 0;
-        calls = 0;
-        __asm__("" : "=m"(*bar()), "+r"(dummy));
-        mcalls = calls;
-        calls = 0;
-        __asm__("" : "+r"(dummy), "=m"(*bar()));
-        rcalls = calls;
+        dse_calls = 0;
+        __asm__("" : "=m"(*dse_bar()), "+r"(dse_dummy));
+        mcalls = dse_calls;
+        dse_calls = 0;
+        __asm__("" : "+r"(dse_dummy), "=m"(*dse_bar()));
+        rcalls = dse_calls;
         if (mcalls != 1 || rcalls != 1) return 11;
 
         int a = 1, b = 2;
-        calls = 0;
-        __asm__("" : "+r"(a), "=m"(*bar()), "+r"(b));
-        if (calls != 1 || a != 1 || b != 2) return 12;
+        dse_calls = 0;
+        __asm__("" : "+r"(a), "=m"(*dse_bar()), "+r"(b));
+        if (dse_calls != 1 || a != 1 || b != 2) return 12;
     }
     /* A read-write operand whose lvalue has a side effect in its index. */
     {
@@ -1204,7 +1216,7 @@ int main(void) {
     /* A bit-field read-write operand: no address of its own, so it takes
        the placement path rather than an address. */
     {
-        struct bits { unsigned f : 5; unsigned g : 5; } s = {3, 4};
+        struct dse_bits { unsigned f : 5; unsigned g : 5; } s = {3, 4};
         __asm__("" : "+r"(s.f));
         if (s.f != 3 || s.g != 4) return 14;
     }
@@ -1217,26 +1229,22 @@ int main(void) {
     if (w != 3 || hint != 1) return 10;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_discarded_side_effects", code, &[]), 0);
-    assert_eq!(
-        compile_and_run("c99_discarded_side_effects_o2", code, &["-O2".to_string()]),
-        0
-    );
-}
 
-/// The integer promotions run on a `switch`'s controlling expression, and
-/// each case constant converts to the **promoted** type (C17 6.8.4.2p5).
-///
-/// c17 compared at the operand's own narrow width instead, so a label
-/// collided with a value it does not equal: `switch ((signed char) -1)`
-/// matched `case 255:`, because both are 0xFF in eight bits, where the
-/// promoted comparison is -1 against 255. The torture test is `20011223-1`,
-/// but any `switch` on a sub-`int` type could take the wrong arm.
-#[test]
-fn c99_switch_promotes_its_controlling_expression() {
-    let code = r#"
-int main(void) {
+// ==========================================================================
+// switch_promotion  (exit codes 44-60: 43 + its own code)
+//
+// (was #[test] c99_switch_promotes_its_controlling_expression)
+//
+// The integer promotions run on a `switch`'s controlling expression, and
+// each case constant converts to the **promoted** type (C17 6.8.4.2p5).
+//
+// c17 compared at the operand's own narrow width instead, so a label
+// collided with a value it does not equal: `switch ((signed char) -1)`
+// matched `case 255:`, because both are 0xFF in eight bits, where the
+// promoted comparison is -1 against 255. The torture test is `20011223-1`,
+// but any `switch` on a sub-`int` type could take the wrong arm.
+// ==========================================================================
+static int t_switch_promotion(void) {
     /* The reported shape: a negative `signed char` against a label that is
        the same bit pattern only at eight bits. */
     {
@@ -1280,7 +1288,7 @@ int main(void) {
     {
         _Bool b = 1;
         switch (b) { case 1: break; default: return 13; }
-        enum E { E0, E1 = 7 } e = E1;
+        enum swp_E { swp_E0, swp_E1 = 7 } e = swp_E1;
         switch (e) { case 7: break; default: return 14; }
     }
     /* A GNU case range is converted the same way. */
@@ -1295,78 +1303,176 @@ int main(void) {
     }
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_switch_promotion", code, &[]), 0);
-    assert_eq!(
-        compile_and_run("c99_switch_promotion_o2", code, &["-O2".to_string()]),
-        0
-    );
-}
 
-/// `E1[E2]` is `(*((E1)+(E2)))` (C17 6.5.2.1p2), so the operands are
-/// interchangeable: `N[p]` is `p[N]`.
-///
-/// The linearizer already swapped them, but the *type* of the expression came
-/// from the left operand alone -- so `N[p]` was typed `int`. It read four
-/// bytes at a four-byte stride from a `char` object, and a store through it
-/// landed somewhere else entirely. Only the constant-index-on-array spelling,
-/// `1[arr]`, happened to work.
-#[test]
-fn c99_reversed_subscript_takes_its_type_from_the_pointer() {
-    let code = r#"
-int N = 2;
-char buf[8] = {10, 11, 12, 13, 14, 15, 16, 17};
-int iarr[4] = {100, 200, 300, 400};
-long larr[3] = {1000, 2000, 3000};
-void *vp = buf;
-struct S { int a; int b; };
-struct S sarr[3] = {{1, 2}, {3, 4}, {5, 6}};
+// ==========================================================================
+// reversed_subscript  (exit codes 61-77: 60 + its own code)
+//
+// (was #[test] c99_reversed_subscript_takes_its_type_from_the_pointer)
+//
+// `E1[E2]` is `(*((E1)+(E2)))` (C17 6.5.2.1p2), so the operands are
+// interchangeable: `N[p]` is `p[N]`.
+//
+// The linearizer already swapped them, but the *type* of the expression came
+// from the left operand alone -- so `N[p]` was typed `int`. It read four
+// bytes at a four-byte stride from a `char` object, and a store through it
+// landed somewhere else entirely. Only the constant-index-on-array spelling,
+// `1[arr]`, happened to work.
+// ==========================================================================
+int rsu_N = 2;
+char rsu_buf[8] = {10, 11, 12, 13, 14, 15, 16, 17};
+int rsu_iarr[4] = {100, 200, 300, 400};
+long rsu_larr[3] = {1000, 2000, 3000};
+void *rsu_vp = rsu_buf;
+struct rsu_S { int a; int b; };
+struct rsu_S rsu_sarr[3] = {{1, 2}, {3, 4}, {5, 6}};
 
-int main(void) {
-    char *p = buf;
+static int t_reversed_subscript(void) {
+    char *p = rsu_buf;
     /* Reads, through a pointer and through an array. */
-    if (N[p] != 12 || p[N] != 12) return 1;
-    if (N[buf] != 12 || buf[N] != 12) return 2;
+    if (rsu_N[p] != 12 || p[rsu_N] != 12) return 1;
+    if (rsu_N[rsu_buf] != 12 || rsu_buf[rsu_N] != 12) return 2;
     /* Through a cast, which is what `pr22061-1` uses. */
-    if (N[(char *)vp] != 12) return 3;
+    if (rsu_N[(char *)rsu_vp] != 12) return 3;
     /* A constant index, and a variable one. */
     if (2[p] != 12) return 4;
     { int i = 3; if (i[p] != 13) return 5; }
     /* Element types wider than the index type must not be confused for it. */
-    if (1[iarr] != 200 || iarr[1] != 200) return 6;
-    if (2[larr] != 3000) return 7;
-    if (1[sarr].b != 4) return 8;
+    if (1[rsu_iarr] != 200 || rsu_iarr[1] != 200) return 6;
+    if (2[rsu_larr] != 3000) return 7;
+    if (1[rsu_sarr].b != 4) return 8;
 
     /* Writes go where the pointer says. */
-    N[p] = 99;
-    if (buf[2] != 99 || buf[3] != 13) return 9;
-    N[(char *)vp] = 77;
-    if (buf[2] != 77) return 10;
-    1[iarr] = 555;
-    if (iarr[1] != 555 || iarr[2] != 300) return 11;
+    rsu_N[p] = 99;
+    if (rsu_buf[2] != 99 || rsu_buf[3] != 13) return 9;
+    rsu_N[(char *)rsu_vp] = 77;
+    if (rsu_buf[2] != 77) return 10;
+    1[rsu_iarr] = 555;
+    if (rsu_iarr[1] != 555 || rsu_iarr[2] != 300) return 11;
 
     /* A compound assignment and an increment through the reversed form --
        both are read-modify-writes, so both have to agree about the type. */
     3[p] = 20;
     3[p] += 5;
-    if (buf[3] != 25) return 12;
+    if (rsu_buf[3] != 25) return 12;
     3[p]++;
-    if (buf[3] != 26) return 13;
+    if (rsu_buf[3] != 26) return 13;
 
     /* Taking the address, and sizeof, agree with the ordinary spelling. */
     if (&2[p] != &p[2]) return 14;
-    if (sizeof(1[iarr]) != sizeof(int)) return 15;
-    if (sizeof(N[p]) != sizeof(char)) return 16;
+    if (sizeof(1[rsu_iarr]) != sizeof(int)) return 15;
+    if (sizeof(rsu_N[p]) != sizeof(char)) return 16;
 
     /* Two dimensions, reversed at the outer level. */
     { static int g[2][3] = {{1,2,3},{4,5,6}};
       if (1[g][2] != 6) return 17; }
     return 0;
 }
+
+// ==========================================================================
+// switch_wide  (exit codes 78-95: 77 + its own code)
+//
+// (was #[test] c99_switch_wider_than_a_register_compares_all_of_it)
+//
+// A `switch` on a controlling expression wider than a general register
+// compares all of it.
+//
+// The `Switch` instruction carries its case labels as `i64` and both
+// backends compare the value in one register, so a `__int128` controlling
+// expression had its high half ignored -- `switch ((__int128)1 << 64)`
+// matched `case 0:`. A case label outside the 64-bit range was truncated to
+// fit, and could then match a value it does not equal.
+//
+// A wide switch is lowered to explicit comparisons, which go through the
+// ordinary 128-bit compare path. The torture test is `pr122943`.
+// ==========================================================================
+__attribute__((noipa)) int swd_small(__int128 v) {
+    switch (v) {
+    case 0: return 1;
+    case 1: return 2;
+    case 2: return 3;
+    default: return 0;
+    }
+}
+__attribute__((noipa)) int swd_wide(__int128 v) {
+    switch (v) {
+    case 0: return 1;
+    case -1: return 2;
+    case (__int128)1 << 70: return 3;
+    case -((__int128)1 << 70): return 4;
+    default: return 0;
+    }
+}
+__attribute__((noipa)) int swd_ranges(__int128 v) {
+    switch (v) {
+    case 10 ... 20: return 1;
+    case ((__int128)1 << 80) ... (((__int128)1 << 80) + 5): return 2;
+    default: return 0;
+    }
+}
+__attribute__((noipa)) int swd_uns(unsigned __int128 v) {
+    switch (v) {
+    case 0: return 1;
+    case ~(unsigned __int128)0: return 2;
+    default: return 0;
+    }
+}
+
+static int t_switch_wide(void) {
+    /* The reported shape: the high half must not be discarded. */
+    if (swd_small(0) != 1 || swd_small(1) != 2 || swd_small(2) != 3) return 1;
+    if (swd_small(3) != 0 || swd_small(-1) != 0) return 2;
+    if (swd_small((__int128)1 << 64) != 0) return 3;
+    if (swd_small(((__int128)1 << 64) + 1) != 0) return 4;
+
+    /* Case labels that do not fit in 64 bits must keep their value. */
+    if (swd_wide(0) != 1 || swd_wide(-1) != 2) return 5;
+    if (swd_wide((__int128)1 << 70) != 3) return 6;
+    if (swd_wide(-((__int128)1 << 70)) != 4) return 7;
+    if (swd_wide(5) != 0 || swd_wide((__int128)1 << 64) != 0) return 8;
+
+    /* GNU ranges, at both widths. */
+    if (swd_ranges(10) != 1 || swd_ranges(20) != 1 || swd_ranges(15) != 1) return 9;
+    if (swd_ranges(9) != 0 || swd_ranges(21) != 0) return 10;
+    if (swd_ranges((__int128)1 << 80) != 2) return 11;
+    if (swd_ranges(((__int128)1 << 80) + 5) != 2) return 12;
+    if (swd_ranges(((__int128)1 << 80) + 6) != 0) return 13;
+
+    /* Unsigned, where the largest label is negative read as signed. */
+    if (swd_uns(0) != 1) return 14;
+    if (swd_uns(~(unsigned __int128)0) != 2) return 15;
+    if (swd_uns(7) != 0) return 16;
+
+    /* A `long long` switch is still the narrow path and still right. */
+    {
+        long long v = 2;
+        switch (v) { case 2: break; default: return 17; }
+        v = 4294967296LL;
+        switch (v) { case 0: return 18; default: break; }
+    }
+    return 0;
+}
+
+int main(void) {
+    int r;
+    if ((r = t_compound_assign_once()) != 0) return 0 + r;
+    if ((r = t_compound_assign_type()) != 0) return 19 + r;
+    if ((r = t_discarded_side_effects()) != 0) return 29 + r;
+    if ((r = t_switch_promotion()) != 0) return 43 + r;
+    if ((r = t_reversed_subscript()) != 0) return 60 + r;
+    if ((r = t_switch_wide()) != 0) return 77 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("c99_reversed_subscript", code, &[]), 0);
     assert_eq!(
-        compile_and_run("c99_reversed_subscript_o2", code, &["-O2".to_string()]),
+        compile_and_run("c99_expressions_side_effects_mega", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run(
+            "c99_expressions_side_effects_mega_o2",
+            code,
+            &["-O2".to_string()]
+        ),
         0
     );
 }
@@ -1422,94 +1528,6 @@ int main(void) {
             code,
             &["-fpermissive".to_string(), "-O2".to_string()]
         ),
-        0
-    );
-}
-
-/// A `switch` on a controlling expression wider than a general register
-/// compares all of it.
-///
-/// The `Switch` instruction carries its case labels as `i64` and both
-/// backends compare the value in one register, so a `__int128` controlling
-/// expression had its high half ignored -- `switch ((__int128)1 << 64)`
-/// matched `case 0:`. A case label outside the 64-bit range was truncated to
-/// fit, and could then match a value it does not equal.
-///
-/// A wide switch is lowered to explicit comparisons, which go through the
-/// ordinary 128-bit compare path. The torture test is `pr122943`.
-#[test]
-fn c99_switch_wider_than_a_register_compares_all_of_it() {
-    let code = r#"
-__attribute__((noipa)) int small(__int128 v) {
-    switch (v) {
-    case 0: return 1;
-    case 1: return 2;
-    case 2: return 3;
-    default: return 0;
-    }
-}
-__attribute__((noipa)) int wide(__int128 v) {
-    switch (v) {
-    case 0: return 1;
-    case -1: return 2;
-    case (__int128)1 << 70: return 3;
-    case -((__int128)1 << 70): return 4;
-    default: return 0;
-    }
-}
-__attribute__((noipa)) int ranges(__int128 v) {
-    switch (v) {
-    case 10 ... 20: return 1;
-    case ((__int128)1 << 80) ... (((__int128)1 << 80) + 5): return 2;
-    default: return 0;
-    }
-}
-__attribute__((noipa)) int uns(unsigned __int128 v) {
-    switch (v) {
-    case 0: return 1;
-    case ~(unsigned __int128)0: return 2;
-    default: return 0;
-    }
-}
-
-int main(void) {
-    /* The reported shape: the high half must not be discarded. */
-    if (small(0) != 1 || small(1) != 2 || small(2) != 3) return 1;
-    if (small(3) != 0 || small(-1) != 0) return 2;
-    if (small((__int128)1 << 64) != 0) return 3;
-    if (small(((__int128)1 << 64) + 1) != 0) return 4;
-
-    /* Case labels that do not fit in 64 bits must keep their value. */
-    if (wide(0) != 1 || wide(-1) != 2) return 5;
-    if (wide((__int128)1 << 70) != 3) return 6;
-    if (wide(-((__int128)1 << 70)) != 4) return 7;
-    if (wide(5) != 0 || wide((__int128)1 << 64) != 0) return 8;
-
-    /* GNU ranges, at both widths. */
-    if (ranges(10) != 1 || ranges(20) != 1 || ranges(15) != 1) return 9;
-    if (ranges(9) != 0 || ranges(21) != 0) return 10;
-    if (ranges((__int128)1 << 80) != 2) return 11;
-    if (ranges(((__int128)1 << 80) + 5) != 2) return 12;
-    if (ranges(((__int128)1 << 80) + 6) != 0) return 13;
-
-    /* Unsigned, where the largest label is negative read as signed. */
-    if (uns(0) != 1) return 14;
-    if (uns(~(unsigned __int128)0) != 2) return 15;
-    if (uns(7) != 0) return 16;
-
-    /* A `long long` switch is still the narrow path and still right. */
-    {
-        long long v = 2;
-        switch (v) { case 2: break; default: return 17; }
-        v = 4294967296LL;
-        switch (v) { case 0: return 18; default: break; }
-    }
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("c99_switch_wide", code, &[]), 0);
-    assert_eq!(
-        compile_and_run("c99_switch_wide_o2", code, &["-O2".to_string()]),
         0
     );
 }

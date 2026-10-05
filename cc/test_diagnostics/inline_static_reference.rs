@@ -14,7 +14,7 @@
 // static is an object of the function's own, and referring to it is fine.
 //
 
-use crate::common::{compile_expect_error, compile_expect_no_diagnostic};
+use crate::test_compile::{compile_expect_error, compile_expect_no_diagnostic};
 
 const MESSAGE: &str = "cannot reference file-scope static";
 

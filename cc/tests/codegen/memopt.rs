@@ -15,10 +15,7 @@
 // if the pass forwards one byte it should not have.
 //
 
-use crate::codegen::asm_probe::{
-    asm_for_with, assert_body_contains, assert_body_lacks, body_of, count_in_body, AARCH64_LINUX,
-    X86_64_LINUX,
-};
+use crate::codegen::asm_probe::{AARCH64_LINUX, X86_64_LINUX};
 use crate::common::{
     compile_and_run, compile_and_run_aarch64, compile_and_run_optimized, compile_and_run_two_units,
     run_c17,
@@ -32,14 +29,41 @@ fn at_o2_no_inline(name: &str, code: &str) -> i32 {
     compile_and_run(name, code, &["-O2".to_string(), "-fno-inline".to_string()])
 }
 
-/// A callee cannot write a local whose address never left the function --
-/// the rule that lets a store be forwarded across a call to an entirely
-/// unknown function, with no purity attribute anywhere.
+/// Store-to-load forwarding across calls, diamonds, volatiles,
+/// bit-fields, narrow stores, struct returns and `asm` outputs, one
+/// program run at -O2 and at -O2 -fno-inline.
+///
+/// Every analysis here is per function, with callee effects summarized
+/// from the callee's own body: each original `main` is a `noinline`
+/// section function and every helper name is kept distinct, so each
+/// function is analyzed exactly as it was alone.
+///
+/// Consolidates these tests, one section each (each original `main` is
+/// a `noinline` section function; the program exits with the section's
+/// base plus the original code):
+/// - `memopt_a_call_cannot_write_a_local_it_was_never_given`: 1..=1
+/// - `memopt_a_call_given_the_address_does_write_it`: 2..=2
+/// - `memopt_a_call_may_write_a_global`: 3..=3
+/// - `memopt_a_clobber_on_one_arm_of_a_diamond`: 4..=4
+/// - `memopt_a_volatile_object_is_read_every_time`: 5..=5
+/// - `memopt_a_bitfield_read_is_the_width_its_type_names`: 6..=8
+/// - `memopt_a_bitfield_rmw_leaves_its_neighbours_alone`: 9..=10
+/// - `memopt_distinct_objects_and_offsets`: 11..=11
+/// - `memopt_a_narrow_store_does_not_supply_a_wide_read`: 12..=13
+/// - `memopt_a_struct_return_writes_its_receiving_local`: 14..=16
+/// - `memopt_an_asm_output_is_not_its_tied_input`: 17..=17
+/// - `memopt_a_two_register_return_may_need_a_swap`: 18..=20
 #[test]
-fn memopt_a_call_cannot_write_a_local_it_was_never_given() {
+fn memopt_forwarding_mega() {
     let code = r#"
+/* ---- memopt_a_call_cannot_write_a_local_it_was_never_given: exits 1..1
+ * A callee cannot write a local whose address never left the function --
+ * the rule that lets a store be forwarded across a call to an entirely
+ * unknown function, with no purity attribute anywhere.
+ */
 extern int opaque(int);
-int main(void) {
+static __attribute__((noinline)) int t_memopt_a_call_cannot_write_a_local_it_was_never_given(void)
+{
     int a[4];
     a[0] = 11;
     a[1] = 22;
@@ -48,18 +72,14 @@ int main(void) {
     return 0;
 }
 int opaque(int x) { return x; }
-"#;
-    assert_eq!(at_o2("memopt_call_vs_local", code), 0);
-    assert_eq!(at_o2_no_inline("memopt_call_vs_local_ni", code), 0);
-}
 
-/// The same shape once the address *has* left: the callee writes through it,
-/// and the value read afterwards is the callee's.
-#[test]
-fn memopt_a_call_given_the_address_does_write_it() {
-    let code = r#"
+/* ---- memopt_a_call_given_the_address_does_write_it: exits 2..2
+ * The same shape once the address *has* left: the callee writes through it,
+ * and the value read afterwards is the callee's.
+ */
 extern void fill(int *);
-int main(void) {
+static __attribute__((noinline)) int t_memopt_a_call_given_the_address_does_write_it(void)
+{
     int a[4];
     a[0] = 11;
     fill(a);
@@ -67,77 +87,45 @@ int main(void) {
     return 0;
 }
 void fill(int *p) { p[0] = 99; }
-"#;
-    assert_eq!(at_o2("memopt_escaped_local", code), 0);
-    assert_eq!(at_o2_no_inline("memopt_escaped_local_ni", code), 0);
-}
 
-/// A global is reachable by any externally-linked callee, whatever this
-/// function does with it.
-#[test]
-fn memopt_a_call_may_write_a_global() {
-    let code = r#"
+/* ---- memopt_a_call_may_write_a_global: exits 3..3
+ * A global is reachable by any externally-linked callee, whatever this
+ * function does with it.
+ */
 int g = 1;
 extern void bump(void);
-int main(void) {
+static __attribute__((noinline)) int t_memopt_a_call_may_write_a_global(void)
+{
     g = 5;
     bump();
     if (g != 6) return 1;
     return 0;
 }
 void bump(void) { g++; }
-"#;
-    assert_eq!(at_o2("memopt_global_vs_call", code), 0);
-    assert_eq!(at_o2_no_inline("memopt_global_vs_call_ni", code), 0);
-}
 
-/// The back-edge clobber: the store dominates the load, and the write that
-/// invalidates it sits *after* the load, on the latch.
-#[test]
-fn memopt_a_clobber_on_the_back_edge_is_not_dominated_away() {
-    let code = r#"
-int main(void) {
-    int a[1];
-    int sum = 0;
-    a[0] = 1;
-    for (int i = 0; i < 5; i++) {
-        sum += a[0];
-        a[0] = a[0] + 1;
-    }
-    /* 1 + 2 + 3 + 4 + 5 */
-    return sum == 15 ? 0 : 1;
-}
-"#;
-    assert_eq!(at_o2("memopt_back_edge", code), 0);
-}
-
-/// The dominator chain is not every path: one arm of a diamond writes the
-/// bytes the pre-`if` store put there.
-#[test]
-fn memopt_a_clobber_on_one_arm_of_a_diamond() {
-    let code = r#"
+/* ---- memopt_a_clobber_on_one_arm_of_a_diamond: exits 4..4
+ * The dominator chain is not every path: one arm of a diamond writes the
+ * bytes the pre-`if` store put there.
+ */
 extern int pick(void);
-int main(void) {
+static __attribute__((noinline)) int t_memopt_a_clobber_on_one_arm_of_a_diamond(void)
+{
     int a[1];
     a[0] = 1;
     if (pick()) a[0] = 2;
     return a[0] == 2 ? 0 : 1;
 }
 int pick(void) { return 1; }
-"#;
-    assert_eq!(at_o2("memopt_diamond_arm", code), 0);
-    assert_eq!(at_o2_no_inline("memopt_diamond_arm_ni", code), 0);
-}
 
-/// A `volatile` object is read as many times as the program says, and the
-/// property is on the object rather than on the instruction -- which is why
-/// both ends of an access have to be checked.
-#[test]
-fn memopt_a_volatile_object_is_read_every_time() {
-    let code = r#"
+/* ---- memopt_a_volatile_object_is_read_every_time: exits 5..5
+ * A `volatile` object is read as many times as the program says, and the
+ * property is on the object rather than on the instruction -- which is why
+ * both ends of an access have to be checked.
+ */
 static volatile int counter;
 static volatile int local_seen;
-int main(void) {
+static __attribute__((noinline)) int t_memopt_a_volatile_object_is_read_every_time(void)
+{
     volatile int v = 1;
     counter = 1;
     int a = counter;
@@ -148,38 +136,16 @@ int main(void) {
     v = 4;
     return (a == 1 && b == 2 && local_seen == 3 && v == 4) ? 0 : 1;
 }
-"#;
-    assert_eq!(at_o2("memopt_volatile", code), 0);
-    assert_eq!(at_o2_no_inline("memopt_volatile_ni", code), 0);
-}
 
-/// An `asm` with a memory clobber can name a frame slot without naming an
-/// operand, so nothing may be carried across it.
-#[test]
-fn memopt_inline_asm_may_write_anything() {
-    let code = r#"
-int main(void) {
-    int a[2];
-    int *p = a;
-    a[0] = 1;
-#if defined(__x86_64__) || defined(__aarch64__)
-    __asm__ volatile("" : : "r"(p) : "memory");
-#endif
-    return a[0] == 1 ? 0 : 1;
-}
-"#;
-    assert_eq!(at_o2("memopt_asm_clobber", code), 0);
-}
-
-/// A bit-field is a partial write of its storage unit, and the value handed
-/// back is only as wide as the unit it came out of. `k = -1` in an eight-bit
-/// field is `255`, not `0xFFFF`.
-#[test]
-fn memopt_a_bitfield_read_is_the_width_its_type_names() {
-    let code = r#"
+/* ---- memopt_a_bitfield_read_is_the_width_its_type_names: exits 6..8
+ * A bit-field is a partial write of its storage unit, and the value handed
+ * back is only as wide as the unit it came out of. `k = -1` in an eight-bit
+ * field is `255`, not `0xFFFF`.
+ */
 struct __attribute__((packed)) S { unsigned short i:6, j:2, k:8; unsigned long long l; };
 struct S s;
-int main(void) {
+static __attribute__((noinline)) int t_memopt_a_bitfield_read_is_the_width_its_type_names(void)
+{
     s.k = -1;
     unsigned int mask = s.k;
     if (mask != 255u) return 1;
@@ -189,72 +155,228 @@ int main(void) {
     if ((unsigned int)s.j != 3u) return 3;
     return 0;
 }
-"#;
-    assert_eq!(at_o2("memopt_bitfield_width", code), 0);
-    assert_eq!(at_o2_no_inline("memopt_bitfield_width_ni", code), 0);
-}
 
-/// A read-modify-write of one bit-field must not disturb its neighbours in
-/// the same storage unit, and the pass must not mistake the unit-wide store
-/// for the field it wants.
-#[test]
-fn memopt_a_bitfield_rmw_leaves_its_neighbours_alone() {
-    let code = r#"
-struct __attribute__((packed)) S { unsigned short i:6, j:2, k:8; unsigned long long l; };
-struct S s;
+/* ---- memopt_a_bitfield_rmw_leaves_its_neighbours_alone: exits 9..10
+ * A read-modify-write of one bit-field must not disturb its neighbours in
+ * the same storage unit, and the pass must not mistake the unit-wide store
+ * for the field it wants.
+ */
+struct __attribute__((packed)) mo7_S { unsigned short i:6, j:2, k:8; unsigned long long l; };
+struct mo7_S mo7_s;
 extern unsigned int add(unsigned int);
-int main(void) {
-    s.i = 5; s.j = 2; s.k = 7; s.l = 0x1122334455667788ULL;
-    s.k += add(3);
-    if (s.i != 5 || s.j != 2 || s.k != 10) return 1;
-    if (s.l != 0x1122334455667788ULL) return 2;
+static __attribute__((noinline)) int t_memopt_a_bitfield_rmw_leaves_its_neighbours_alone(void)
+{
+    mo7_s.i = 5; mo7_s.j = 2; mo7_s.k = 7; mo7_s.l = 0x1122334455667788ULL;
+    mo7_s.k += add(3);
+    if (mo7_s.i != 5 || mo7_s.j != 2 || mo7_s.k != 10) return 1;
+    if (mo7_s.l != 0x1122334455667788ULL) return 2;
     return 0;
 }
 unsigned int add(unsigned int x) { return x; }
-"#;
-    assert_eq!(at_o2("memopt_bitfield_rmw", code), 0);
-    assert_eq!(at_o2_no_inline("memopt_bitfield_rmw_ni", code), 0);
-}
 
-/// Two locals are two objects, and a write to one must not be taken for a
-/// write to the other -- nor a write at one offset for a write at another.
-#[test]
-fn memopt_distinct_objects_and_offsets() {
-    let code = r#"
-extern int opaque(int);
-int main(void) {
+/* ---- memopt_distinct_objects_and_offsets: exits 11..11
+ * Two locals are two objects, and a write to one must not be taken for a
+ * write to the other -- nor a write at one offset for a write at another.
+ */
+extern int mo8_opaque(int);
+static __attribute__((noinline)) int t_memopt_distinct_objects_and_offsets(void)
+{
     int a[4], b[4];
     a[0] = 1; a[1] = 2;
     b[0] = 3; b[1] = 4;
-    opaque(0);
+    mo8_opaque(0);
     b[0] = 30;
     if (a[0] != 1 || a[1] != 2 || b[0] != 30 || b[1] != 4) return 1;
     return 0;
 }
-int opaque(int x) { return x; }
-"#;
-    assert_eq!(at_o2("memopt_two_objects", code), 0);
-    assert_eq!(at_o2_no_inline("memopt_two_objects_ni", code), 0);
-}
+int mo8_opaque(int x) { return x; }
 
-/// A narrow store followed by a wide read of the same bytes: the value the
-/// store wrote is only the low bits of what the register held.
-#[test]
-fn memopt_a_narrow_store_does_not_supply_a_wide_read() {
-    let code = r#"
-extern int opaque(int);
-int main(void) {
+/* ---- memopt_a_narrow_store_does_not_supply_a_wide_read: exits 12..13
+ * A narrow store followed by a wide read of the same bytes: the value the
+ * store wrote is only the low bits of what the register held.
+ */
+extern int mo9_opaque(int);
+static __attribute__((noinline)) int t_memopt_a_narrow_store_does_not_supply_a_wide_read(void)
+{
     union { unsigned int u; unsigned char b[4]; } v;
     v.u = 0;
-    v.b[0] = (unsigned char)opaque(0x1234);
+    v.b[0] = (unsigned char)mo9_opaque(0x1234);
     if (v.b[0] != 0x34) return 1;
     if (v.u != 0x34u) return 2;
     return 0;
 }
-int opaque(int x) { return x; }
+int mo9_opaque(int x) { return x; }
+
+/* ---- memopt_a_struct_return_writes_its_receiving_local: exits 14..16
+ * A struct-returning call writes its receiving local with no `Store`
+ * anywhere: the `Sym` it targets *is* the storage.
+ */
+typedef struct { unsigned long lo, hi; } P;
+static P make(unsigned long a, unsigned long b) { P r; r.lo = a; r.hi = b; return r; }
+static __attribute__((noinline)) int t_memopt_a_struct_return_writes_its_receiving_local(void)
+{
+    P p = make(1, 2);
+    if (p.lo != 1 || p.hi != 2) return 1;
+    p = make(3, 4);
+    if (p.lo != 3 || p.hi != 4) return 2;
+    /* The halves arrive swapped relative to where they are wanted. */
+    P q = make(p.hi, p.lo);
+    if (q.lo != 4 || q.hi != 3) return 3;
+    return 0;
+}
+
+/* ---- memopt_an_asm_output_is_not_its_tied_input: exits 17..17
+ * An inline-asm output is a second definition of its pseudo. A tied operand
+ * writes that pseudo with a `Copy` *before* the asm, and following it past
+ * the asm's own write answers with the input where the question was about
+ * the result.
+ */
+static __attribute__((noinline)) int t_memopt_an_asm_output_is_not_its_tied_input(void)
+{
+    int x = 5;
+    int r;
+#if defined(__x86_64__)
+    __asm__("shll %1, %0" : "=r"(r) : "I"(3), "0"(x));
+#elif defined(__aarch64__)
+    __asm__("lsl %w0, %w0, #3" : "=r"(r) : "0"(x));
+#else
+    r = x << 3;
+#endif
+    return r == 40 ? 0 : 1;
+}
+
+/* ---- memopt_a_two_register_return_may_need_a_swap: exits 18..20
+ * Both halves of a two-register struct return are live at once, and a
+ * return can want them the other way round: the first's source sits in the
+ * second's destination *and* the second's in the first's. No order of two
+ * moves preserves both, so the values have to be exchanged.
+ *
+ * This is unreachable while both halves are loaded out of memory on their
+ * way to the return, which is why it stayed hidden until forwarding could
+ * leave them in registers -- so it needs `-O2` and a callee that is not
+ * inlined away.
+ */
+typedef struct { unsigned long low, high; } u128_t;
+static u128_t mo12_make(unsigned long lo, unsigned long hi) {
+    u128_t r;
+    r.low = lo;
+    r.high = hi;
+    return r;
+}
+static u128_t mo12_add(u128_t a, u128_t b) {
+    u128_t r;
+    r.low = a.low + b.low;
+    r.high = a.high + b.high + (r.low < a.low ? 1UL : 0UL);
+    return r;
+}
+static __attribute__((noinline)) int t_memopt_a_two_register_return_may_need_a_swap(void)
+{
+    u128_t a = mo12_make(100, 0);
+    if (a.low != 100 || a.high != 0) return 1;
+    u128_t c = mo12_add(a, mo12_make(200, 0));
+    if (c.low != 300 || c.high != 0) return 2;
+    u128_t d = mo12_add(mo12_make(0xFFFFFFFFFFFFFFFFUL, 0), mo12_make(1, 0));
+    if (d.low != 0 || d.high != 1) return 3;
+    return 0;
+}
+
+int main(void)
+{
+    int r;
+    if ((r = t_memopt_a_call_cannot_write_a_local_it_was_never_given()) != 0) return r;
+    if ((r = t_memopt_a_call_given_the_address_does_write_it()) != 0) return 1 + r;
+    if ((r = t_memopt_a_call_may_write_a_global()) != 0) return 2 + r;
+    if ((r = t_memopt_a_clobber_on_one_arm_of_a_diamond()) != 0) return 3 + r;
+    if ((r = t_memopt_a_volatile_object_is_read_every_time()) != 0) return 4 + r;
+    if ((r = t_memopt_a_bitfield_read_is_the_width_its_type_names()) != 0) return 5 + r;
+    if ((r = t_memopt_a_bitfield_rmw_leaves_its_neighbours_alone()) != 0) return 8 + r;
+    if ((r = t_memopt_distinct_objects_and_offsets()) != 0) return 10 + r;
+    if ((r = t_memopt_a_narrow_store_does_not_supply_a_wide_read()) != 0) return 11 + r;
+    if ((r = t_memopt_a_struct_return_writes_its_receiving_local()) != 0) return 13 + r;
+    if ((r = t_memopt_an_asm_output_is_not_its_tied_input()) != 0) return 16 + r;
+    if ((r = t_memopt_a_two_register_return_may_need_a_swap()) != 0) return 17 + r;
+    return 0;
+}
 "#;
-    assert_eq!(at_o2("memopt_narrow_store", code), 0);
-    assert_eq!(at_o2_no_inline("memopt_narrow_store_ni", code), 0);
+    assert_eq!(at_o2("memopt_forwarding_mega", code), 0);
+    assert_eq!(at_o2_no_inline("memopt_forwarding_mega_ni", code), 0);
+}
+
+/// Clobbers the dominator tree does not show -- a back edge, an `asm`, a
+/// computed `goto` -- one program run at -O2.
+///
+/// Each original `main` is a `noinline` section function, analyzed as it
+/// was alone.
+///
+/// Consolidates these tests, one section each (each original `main` is
+/// a `noinline` section function; the program exits with the section's
+/// base plus the original code):
+/// - `memopt_a_clobber_on_the_back_edge_is_not_dominated_away`: 1..=1
+/// - `memopt_inline_asm_may_write_anything`: 2..=2
+/// - `memopt_a_computed_goto_is_an_edge_the_cfg_does_not_have`: 3..=3
+#[test]
+fn memopt_cfg_edges_mega() {
+    let code = r#"
+/* ---- memopt_a_clobber_on_the_back_edge_is_not_dominated_away: exits 1..1
+ * The back-edge clobber: the store dominates the load, and the write that
+ * invalidates it sits *after* the load, on the latch.
+ */
+static __attribute__((noinline)) int t_memopt_a_clobber_on_the_back_edge_is_not_dominated_away(void)
+{
+    int a[1];
+    int sum = 0;
+    a[0] = 1;
+    for (int i = 0; i < 5; i++) {
+        sum += a[0];
+        a[0] = a[0] + 1;
+    }
+    /* 1 + 2 + 3 + 4 + 5 */
+    return sum == 15 ? 0 : 1;
+}
+
+/* ---- memopt_inline_asm_may_write_anything: exits 2..2
+ * An `asm` with a memory clobber can name a frame slot without naming an
+ * operand, so nothing may be carried across it.
+ */
+static __attribute__((noinline)) int t_memopt_inline_asm_may_write_anything(void)
+{
+    int a[2];
+    int *p = a;
+    a[0] = 1;
+#if defined(__x86_64__) || defined(__aarch64__)
+    __asm__ volatile("" : : "r"(p) : "memory");
+#endif
+    return a[0] == 1 ? 0 : 1;
+}
+
+/* ---- memopt_a_computed_goto_is_an_edge_the_cfg_does_not_have: exits 3..3
+ * A computed `goto` reaches a block by a route with no CFG edge.
+ */
+extern int opaque(int);
+static __attribute__((noinline)) int t_memopt_a_computed_goto_is_an_edge_the_cfg_does_not_have(void)
+{
+    int a[1];
+    void *t = &&again;
+    int n = 0;
+    a[0] = 0;
+again:
+    a[0] = a[0] + 1;
+    n++;
+    if (n < 3) goto *t;
+    return a[0] == 3 ? 0 : 1;
+}
+int opaque(int x) { return x; }
+
+int main(void)
+{
+    int r;
+    if ((r = t_memopt_a_clobber_on_the_back_edge_is_not_dominated_away()) != 0) return r;
+    if ((r = t_memopt_inline_asm_may_write_anything()) != 0) return 1 + r;
+    if ((r = t_memopt_a_computed_goto_is_an_edge_the_cfg_does_not_have()) != 0) return 2 + r;
+    return 0;
+}
+"#;
+    assert_eq!(at_o2("memopt_cfg_edges_mega", code), 0);
 }
 
 /// `setjmp` resumes at a point the CFG does not model, so every ordering
@@ -278,112 +400,6 @@ void jump(void) { longjmp(jb, 1); }
 "#;
     assert_eq!(at_o2("memopt_setjmp", code), 0);
     assert_eq!(at_o2_no_inline("memopt_setjmp_ni", code), 0);
-}
-
-/// A computed `goto` reaches a block by a route with no CFG edge.
-#[test]
-fn memopt_a_computed_goto_is_an_edge_the_cfg_does_not_have() {
-    let code = r#"
-extern int opaque(int);
-int main(void) {
-    int a[1];
-    void *t = &&again;
-    int n = 0;
-    a[0] = 0;
-again:
-    a[0] = a[0] + 1;
-    n++;
-    if (n < 3) goto *t;
-    return a[0] == 3 ? 0 : 1;
-}
-int opaque(int x) { return x; }
-"#;
-    assert_eq!(at_o2("memopt_computed_goto", code), 0);
-}
-
-/// A struct-returning call writes its receiving local with no `Store`
-/// anywhere: the `Sym` it targets *is* the storage.
-#[test]
-fn memopt_a_struct_return_writes_its_receiving_local() {
-    let code = r#"
-typedef struct { unsigned long lo, hi; } P;
-static P make(unsigned long a, unsigned long b) { P r; r.lo = a; r.hi = b; return r; }
-int main(void) {
-    P p = make(1, 2);
-    if (p.lo != 1 || p.hi != 2) return 1;
-    p = make(3, 4);
-    if (p.lo != 3 || p.hi != 4) return 2;
-    /* The halves arrive swapped relative to where they are wanted. */
-    P q = make(p.hi, p.lo);
-    if (q.lo != 4 || q.hi != 3) return 3;
-    return 0;
-}
-"#;
-    assert_eq!(at_o2("memopt_struct_return", code), 0);
-    assert_eq!(at_o2_no_inline("memopt_struct_return_ni", code), 0);
-}
-
-/// An inline-asm output is a second definition of its pseudo. A tied operand
-/// writes that pseudo with a `Copy` *before* the asm, and following it past
-/// the asm's own write answers with the input where the question was about
-/// the result.
-#[test]
-fn memopt_an_asm_output_is_not_its_tied_input() {
-    let code = r#"
-int main(void) {
-    int x = 5;
-    int r;
-#if defined(__x86_64__)
-    __asm__("shll %1, %0" : "=r"(r) : "I"(3), "0"(x));
-#elif defined(__aarch64__)
-    __asm__("lsl %w0, %w0, #3" : "=r"(r) : "0"(x));
-#else
-    r = x << 3;
-#endif
-    return r == 40 ? 0 : 1;
-}
-"#;
-    assert_eq!(at_o2("memopt_asm_tied_output", code), 0);
-    assert_eq!(at_o2_no_inline("memopt_asm_tied_output_ni", code), 0);
-}
-
-/// Both halves of a two-register struct return are live at once, and a
-/// return can want them the other way round: the first's source sits in the
-/// second's destination *and* the second's in the first's. No order of two
-/// moves preserves both, so the values have to be exchanged.
-///
-/// This is unreachable while both halves are loaded out of memory on their
-/// way to the return, which is why it stayed hidden until forwarding could
-/// leave them in registers -- so it needs `-O2` and a callee that is not
-/// inlined away.
-#[test]
-fn memopt_a_two_register_return_may_need_a_swap() {
-    let code = r#"
-typedef struct { unsigned long low, high; } u128_t;
-static u128_t make(unsigned long lo, unsigned long hi) {
-    u128_t r;
-    r.low = lo;
-    r.high = hi;
-    return r;
-}
-static u128_t add(u128_t a, u128_t b) {
-    u128_t r;
-    r.low = a.low + b.low;
-    r.high = a.high + b.high + (r.low < a.low ? 1UL : 0UL);
-    return r;
-}
-int main(void) {
-    u128_t a = make(100, 0);
-    if (a.low != 100 || a.high != 0) return 1;
-    u128_t c = add(a, make(200, 0));
-    if (c.low != 300 || c.high != 0) return 2;
-    u128_t d = add(make(0xFFFFFFFFFFFFFFFFUL, 0), make(1, 0));
-    if (d.low != 0 || d.high != 1) return 3;
-    return 0;
-}
-"#;
-    assert_eq!(at_o2_no_inline("memopt_two_reg_return_swap", code), 0);
-    assert_eq!(at_o2("memopt_two_reg_return_swap_inl", code), 0);
 }
 
 /// `__attribute__((pure))` and `((const))` are promises about memory, and
@@ -913,110 +929,6 @@ int main(void) {
     }
 }
 
-/// An aggregate with a `volatile` member is re-read for each copy of it.
-///
-/// C17 6.7.3p7: an object with volatile-qualified type may change in ways
-/// the implementation cannot see, so every access to it happens as written.
-/// A qualifier on a *member* makes that member's storage volatile, but the
-/// struct holding it is not itself volatile-qualified -- and the struct's own
-/// modifiers, plus the access type, were all `forwardable` asked. Once the
-/// copy is expanded into loads and stores those accesses are plain integers,
-/// so `t = s; u = s;` loaded `s` once and fed both copies from it.
-///
-/// The unqualified struct beside it is the control: forwarding *is* right
-/// there, and clang does it -- 4 loads of the volatile object against 2 of
-/// the plain one. The assertion is relative for that reason, rather than
-/// pinning an instruction count that codegen may fairly change.
-#[test]
-fn codegen_volatile_member_is_reread_for_each_aggregate_copy() {
-    let src = r#"
-struct V { volatile int v; int pad[7]; };
-struct P { int v; int pad[7]; };
-struct V vs, vt, vu;
-struct P ps, pt, pu;
-void fv(void) { vt = vs; vu = vs; }
-void fp(void) { pt = ps; pu = ps; }
-"#;
-    for triple in [X86_64_LINUX, AARCH64_LINUX] {
-        let asm = asm_for_with("vol_member_copy", triple, src, &["-O2"]);
-        // A load is an instruction whose *source* operand is memory.
-        let loads = |func: &str| -> usize {
-            body_of(&asm, func)
-                .lines()
-                .map(str::trim)
-                .filter(|l| {
-                    if triple == X86_64_LINUX {
-                        l.starts_with("mov")
-                            && l.split_once(char::is_whitespace).is_some_and(|(_, ops)| {
-                                ops.split(',').next().is_some_and(|src| src.contains('('))
-                            })
-                    } else {
-                        l.starts_with("ldr ") || l.starts_with("ldp ")
-                    }
-                })
-                .count()
-        };
-        let (volatile, plain) = (loads("fv"), loads("fp"));
-        assert!(
-            volatile > plain,
-            "{triple}: the volatile member must be re-read for the second \
-             copy -- volatile {volatile} loads, plain {plain}:\n{}",
-            body_of(&asm, "fv")
-        );
-    }
-}
-
-/// A store into an aggregate with a `volatile` member is not deleted by a
-/// later store that covers it.
-///
-/// The mirror of the load case: `dse::deletable` asked the same three
-/// questions `loadfwd::forwardable` did -- the access type, which an expanded
-/// aggregate copy makes a plain integer, and the object's own modifiers, which
-/// a `struct` holding a volatile member does not carry -- so `s = x; s = y;`
-/// let the first copy's stores go, dropping a write to the volatile member
-/// that C17 6.7.3p7 says must happen.
-///
-/// The unqualified struct beside it is the control: deleting the dead store
-/// *is* right there, so the fix cannot pass by giving up on every aggregate.
-#[test]
-fn codegen_volatile_member_keeps_a_store_a_later_one_covers() {
-    let src = r#"
-struct V { volatile int v; int pad[7]; };
-struct P { int v; int pad[7]; };
-struct V vs, vx, vy;
-struct P ps, px, py;
-void fv(void) { vs = vx; vs = vy; }
-void fp(void) { ps = px; ps = py; }
-"#;
-    for triple in [X86_64_LINUX, AARCH64_LINUX] {
-        let asm = asm_for_with("vol_member_dse", triple, src, &["-O2"]);
-        let stores = |func: &str| -> usize {
-            body_of(&asm, func)
-                .lines()
-                .map(str::trim)
-                .filter(|l| {
-                    if triple == X86_64_LINUX {
-                        // `movq %rdx, 8(%rax)` -- a memory *destination*.
-                        l.starts_with("mov")
-                            && l.split_once(char::is_whitespace).is_some_and(|(_, ops)| {
-                                ops.rsplit(',').next().is_some_and(|d| d.contains('('))
-                            })
-                    } else {
-                        l.starts_with("str ") || l.starts_with("stp ")
-                    }
-                })
-                .count()
-        };
-        let (volatile, plain) = (stores("fv"), stores("fp"));
-        assert!(
-            volatile > plain,
-            "{triple}: the store to a volatile member survives a later copy \
-             (volatile {volatile} stores, plain {plain}):\n{}",
-            body_of(&asm, "fv")
-        );
-    }
-}
-
 /// A composite argument is read at its own size, not rounded up to a
 /// register.
 ///
@@ -1180,277 +1092,6 @@ int main(void) {{
     }
 }
 
-/// The widest load in `body` that reads through a pointer, in bytes, or 0.
-///
-/// Frame-relative accesses are skipped: a spill or a stack temporary is the
-/// compiler's own storage, and its width says nothing about the object.
-fn widest_object_load(body: &str, aarch64: bool) -> (u32, String) {
-    let mut widest = 0;
-    let mut at = String::new();
-    for line in body.lines() {
-        let text = line.trim();
-        let (mnemonic, operands) = match text.split_once(char::is_whitespace) {
-            Some(pair) => pair,
-            None => continue,
-        };
-        let width = if aarch64 {
-            if operands.contains("[sp") || operands.contains("[x29") {
-                continue;
-            }
-            match mnemonic {
-                "ldrb" | "ldrsb" => 1,
-                "ldrh" | "ldrsh" => 2,
-                "ldr" | "ldrsw" if operands.starts_with('w') => 4,
-                "ldr" if operands.starts_with('x') => 8,
-                "ldp" if operands.starts_with('x') => 16,
-                "ldp" if operands.starts_with('w') => 8,
-                _ => continue,
-            }
-        } else {
-            // The source is the first operand; it must be a memory reference
-            // through something other than the frame.
-            let src = operands.split(',').next().unwrap_or("").trim();
-            if !src.contains("(%r") || src.contains("%rbp)") || src.contains("%rsp)") {
-                continue;
-            }
-            match mnemonic {
-                "movb" | "movzbl" | "movsbl" | "movzbq" | "movsbq" => 1,
-                "movw" | "movzwl" | "movswl" | "movzwq" | "movswq" => 2,
-                "movl" | "movslq" => 4,
-                "movq" => 8,
-                _ => continue,
-            }
-        };
-        if width > widest {
-            widest = width;
-            at = text.to_string();
-        }
-    }
-    (widest, at)
-}
-
-/// No composite is read wider than it is, on either target.
-///
-/// The runtime tests above execute, so they only ever cover the host --
-/// x86-64 here. This one compiles for both triples and reads the widths out
-/// of the assembly, which is what covers the aarch64 lowering on a machine
-/// that cannot run it. A ragged size is read as two overlapping halves, so
-/// the widest access is the half, never the object rounded up.
-#[test]
-fn codegen_no_composite_is_read_wider_than_itself() {
-    // (bytes in the struct, the widest load its value may be read with)
-    let cases: &[(usize, u32)] = &[
-        (1, 1),
-        (2, 2),
-        // The ragged sizes: 3 is two halves of 2, and 5, 6 and 7 are two of 4.
-        (3, 2),
-        (5, 4),
-        (6, 4),
-        (7, 4),
-        // The controls, each already one natural access.
-        (4, 4),
-        (8, 8),
-    ];
-    for &(bytes, want) in cases {
-        let src = format!(
-            "struct S {{ char a[{bytes}]; }};\n\
-             int g(struct S s);\n\
-             int f(struct S *p) {{ return g(*p); }}\n"
-        );
-        for (triple, is_a64) in [(X86_64_LINUX, false), (AARCH64_LINUX, true)] {
-            let asm = asm_for_with(&format!("widest_{bytes}"), triple, &src, &["-O1"]);
-            let body = body_of(&asm, "f");
-            let (got, line) = widest_object_load(body, is_a64);
-            assert_eq!(
-                got, want,
-                "{triple}: a {bytes}-byte struct is read with a {got}-byte \
-                 access (`{line}`), not {want} -- anything wider reaches past \
-                 the object:\n{body}"
-            );
-        }
-    }
-}
-
-/// Reading a `volatile` object is an observable side effect, so the access
-/// survives every optimization level -- including a read whose value is
-/// discarded, which no data-flow fact keeps alive (C17 5.1.2.3).
-///
-/// The property is on the access, not on the result, so a discarded read has
-/// nothing an exit status can see. The check is on the emitted instruction,
-/// against both targets, because the rule is architecture-independent.
-#[test]
-fn memopt_a_discarded_volatile_read_is_still_performed() {
-    // The object names are deliberately unmistakable. A single letter is not a
-    // sound needle here: every x86-64 body contains `pushq`/`popq` and every
-    // aarch64 body contains `stp`/`sp`, and `.cfi_startproc` is inside the
-    // range `body_of` returns -- so searching for "p" passes against a body
-    // that was emptied, which is exactly the defect. (No empty body on either
-    // target contains a "g", which is why the other cases were sound.)
-    let cases = [
-        (
-            "assign",
-            "volatile int volobj;\nvoid probe(void) { int a = volobj; (void)a; }\n",
-            "volobj",
-        ),
-        (
-            "discard",
-            "volatile int volobj;\nvoid probe(void) { volobj; }\n",
-            "volobj",
-        ),
-        (
-            "via_ptr",
-            "volatile int *volptr;\nvoid probe(void) { *volptr; }\n",
-            "volptr",
-        ),
-        (
-            "cast_void",
-            "volatile int volobj;\nvoid probe(void) { (void)volobj; }\n",
-            "volobj",
-        ),
-    ];
-
-    for (tag, src, object) in cases {
-        for level in ["-O0", "-O1", "-O2", "-Os"] {
-            for triple in [X86_64_LINUX, AARCH64_LINUX] {
-                let asm = asm_for_with(&format!("vol_{tag}"), triple, src, &[level]);
-                assert_body_contains(
-                    &asm,
-                    "probe",
-                    object,
-                    &format!(
-                        "a volatile read is observable: `{tag}` at {level} on {triple} \
-                         must still access `{object}`"
-                    ),
-                );
-
-                // Naming the pointer is not the same as dereferencing it, and
-                // the qualifier here is on the pointee, so the load through it
-                // is the access under test.
-                if tag == "via_ptr" {
-                    let indirect = if triple == X86_64_LINUX { "(%r" } else { "[x" };
-                    assert_body_contains(
-                        &asm,
-                        "probe",
-                        indirect,
-                        &format!(
-                            "the volatile pointee is read, not just the pointer: \
-                             {level} on {triple}"
-                        ),
-                    );
-                }
-            }
-        }
-    }
-}
-
-/// The counterpart that keeps the fix above honest: an *ordinary* discarded
-/// read is still dead code, and DCE still deletes it.
-///
-/// Without this, marking every load a root would pass the volatile test.
-#[test]
-fn memopt_a_discarded_plain_read_is_still_removed() {
-    // Object names chosen to occur in no mnemonic, register or label the
-    // body can otherwise contain -- `popq` alone contains both `p` and `pq`,
-    // and the body a negative assertion searches includes the function's own
-    // label and prologue.
-    let cases = [
-        (
-            "assign",
-            "int objx;\nvoid probe(void) { int a = objx; (void)a; }\n",
-            "objx",
-        ),
-        ("discard", "int objx;\nvoid probe(void) { objx; }\n", "objx"),
-        (
-            "via_ptr",
-            "int *ptrx;\nvoid probe(void) { *ptrx; }\n",
-            "ptrx",
-        ),
-    ];
-
-    for (tag, src, object) in cases {
-        for triple in [X86_64_LINUX, AARCH64_LINUX] {
-            let asm = asm_for_with(&format!("plain_{tag}"), triple, src, &["-O2"]);
-            assert_body_lacks(
-                &asm,
-                "probe",
-                object,
-                &format!(
-                    "reading a non-volatile object has no effect: `{tag}` on {triple} \
-                     must not access `{object}`"
-                ),
-            );
-        }
-    }
-}
-
-/// Each read of a `volatile` object is its own observable event, so two of
-/// them are two accesses -- neither load-forwarding nor DCE may fold the pair
-/// into one.
-#[test]
-fn memopt_two_volatile_reads_are_both_performed() {
-    // A named object only: two reads through one `volatile int *p` show up as
-    // a *single* reference to `p` -- reading the pointer itself is not
-    // volatile and is rightly done once -- so the count says nothing there.
-    // The through-pointer case is pinned at the IR level instead, by
-    // `test_volatile_accesses_carry_the_marker` and the `dce` unit tests.
-    //
-    // The name occurs in no mnemonic, register or label the body can
-    // otherwise contain: `popq` alone contains both `p` and `pq`.
-    let cases = [(
-        "named",
-        "volatile int objx;\nint sink(int, int);\n\
-         int probe(void) { int a = objx; int b = objx; return sink(a, b); }\n",
-        "objx",
-    )];
-
-    for (tag, src, object) in cases {
-        for level in ["-O1", "-O2", "-Os"] {
-            for triple in [X86_64_LINUX, AARCH64_LINUX] {
-                let asm = asm_for_with(&format!("vol_two_reads_{tag}"), triple, src, &[level]);
-                let n = count_in_body(&asm, "probe", object);
-                assert!(
-                    n >= 2,
-                    "both volatile reads are observable: `{tag}` at {level} on {triple} \
-                     kept {n} reference(s) to `{object}`:\n{}",
-                    body_of(&asm, "probe")
-                );
-            }
-        }
-    }
-}
-
-/// An `_Atomic` read is observable for the same reason, and reaches DCE by a
-/// different route: `AtomicLoad` is a side-effecting opcode outright, so this
-/// cross-checks that the two spellings of "this read must happen" agree.
-#[test]
-fn memopt_a_discarded_atomic_read_is_still_performed() {
-    let cases = [
-        ("discard", "_Atomic int g;\nvoid probe(void) { g; }\n", "g"),
-        (
-            "assign",
-            "_Atomic int g;\nvoid probe(void) { int a = g; (void)a; }\n",
-            "g",
-        ),
-    ];
-
-    for (tag, src, object) in cases {
-        for level in ["-O0", "-O2"] {
-            for triple in [X86_64_LINUX, AARCH64_LINUX] {
-                let asm = asm_for_with(&format!("atomic_{tag}"), triple, src, &[level]);
-                assert_body_contains(
-                    &asm,
-                    "probe",
-                    object,
-                    &format!(
-                        "an atomic read is observable: `{tag}` at {level} on {triple} \
-                         must still access `{object}`"
-                    ),
-                );
-            }
-        }
-    }
-}
-
 /// A `volatile` read inside a loop happens once per iteration: the value is
 /// not a loop invariant, whatever the compiler can see written to the object.
 ///
@@ -1477,243 +1118,6 @@ int main(void) {
     assert_eq!(at_o2("memopt_volatile_in_loop", code), 0);
     if let Some(rc) = compile_and_run_aarch64("memopt_volatile_in_loop_a64", code, "-O2") {
         assert_eq!(rc, 0, "aarch64 at -O2");
-    }
-}
-
-/// A `volatile` store is observable for the same reason, and DSE must not drop
-/// the earlier of two writes to one.
-///
-/// The companion to the read case above: a test that only checked loads would
-/// pass against an `has_side_effects` that named `Store` and not `Load`.
-#[test]
-fn memopt_two_volatile_stores_are_both_performed() {
-    let src = "volatile int g;\nvoid probe(void) { g = 1; g = 2; }\n";
-    for level in ["-O1", "-O2", "-Os"] {
-        for triple in [X86_64_LINUX, AARCH64_LINUX] {
-            let asm = asm_for_with("vol_two_stores", triple, src, &[level]);
-            let n = count_in_body(&asm, "probe", "g");
-            assert!(
-                n >= 2,
-                "both volatile stores are observable: {level} on {triple} kept {n} \
-                 reference(s) to `g`:\n{}",
-                body_of(&asm, "probe")
-            );
-        }
-    }
-}
-
-/// A member of a `volatile` object is itself volatile, so reading it is an
-/// observable event that survives every optimization level.
-///
-/// C17 6.5.2.3p3/p4: the result of `s.m` has the *so-qualified* version of the
-/// member's type — it inherits the qualifiers of the object. c17 took the
-/// member's declared type unchanged, so a member of a `volatile` struct read as
-/// an ordinary `int` and DCE deleted it from `-O1` up. The reverse direction
-/// (`struct T { volatile int a; }`) always worked, because there the member's
-/// own type carries the qualifier; that case is the control below.
-#[test]
-fn memopt_a_member_of_a_volatile_object_is_volatile() {
-    // Distinctive names: a single letter matches `pushq`/`stp`/`.cfi_startproc`
-    // inside the body range and would pass against an emptied function.
-    let src = "\
-struct S { int a; int b; };
-volatile struct S vqobj;
-volatile struct S *vqptr;
-void probe_direct(void) { vqobj.a; }
-void probe_arrow(void) { vqptr->a; }
-void probe_assign(void) { int t = vqobj.a; (void)t; }
-void probe_second(void) { vqobj.b; }
-";
-    for level in ["-O0", "-O1", "-O2", "-Os"] {
-        for triple in [X86_64_LINUX, AARCH64_LINUX] {
-            let asm = asm_for_with("vol_member", triple, src, &[level]);
-            for (func, object) in [
-                ("probe_direct", "vqobj"),
-                ("probe_arrow", "vqptr"),
-                ("probe_assign", "vqobj"),
-                ("probe_second", "vqobj"),
-            ] {
-                assert_body_contains(
-                    &asm,
-                    func,
-                    object,
-                    &format!(
-                        "a member of a volatile object is volatile (C17 6.5.2.3p3): \
-                         {func} at {level} on {triple} must still access `{object}`"
-                    ),
-                );
-            }
-        }
-    }
-}
-
-/// A copy out of a `volatile` aggregate reads it, even when nothing uses the
-/// copy (C17 5.1.2.3p6).
-///
-/// A struct too wide for one register is copied in integer chunks, and the
-/// chunks carried no volatile marker, so `struct S t = vstructobj;` with `t`
-/// unused lost every read from `-O1` up on both targets. The copy is of a
-/// named global so that the object's name in the body is the access itself.
-#[test]
-fn memopt_a_copy_out_of_a_volatile_aggregate_is_performed() {
-    let src = "\
-struct S { int a, b, c; };
-volatile struct S vstructobj;
-struct { volatile struct { int a; }; int b; } vanonobj;
-void probe_copy(void) { struct S t = vstructobj; (void)t; }
-void probe_anon(void) { vanonobj.a; }
-";
-    for level in ["-O0", "-O1", "-O2"] {
-        for triple in [X86_64_LINUX, AARCH64_LINUX] {
-            let asm = asm_for_with("vol_copy", triple, src, &[level]);
-            for (func, object) in [("probe_copy", "vstructobj"), ("probe_anon", "vanonobj")] {
-                assert_body_contains(
-                    &asm,
-                    func,
-                    object,
-                    &format!("{func} at {level} on {triple} must still read `{object}`"),
-                );
-            }
-        }
-    }
-}
-
-/// The control for the test above: an ordinary aggregate's member read is still
-/// deleted, so that test cannot pass by marking every member access volatile.
-#[test]
-fn memopt_a_member_of_a_plain_object_is_still_removed() {
-    let src = "\
-struct S { int a; };
-struct S pqobj;
-void probe(void) { pqobj.a; }
-";
-    for triple in [X86_64_LINUX, AARCH64_LINUX] {
-        let asm = asm_for_with("plain_member", triple, src, &["-O2"]);
-        assert_body_lacks(
-            &asm,
-            "probe",
-            "pqobj",
-            "reading an ordinary member has no effect and is dead code",
-        );
-    }
-}
-
-/// A `volatile` member is not speculatable, so a conditional must not read the
-/// arm it did not take.
-///
-/// C17 6.5.15p4 evaluates only one of the second and third operands, and
-/// 5.1.2.3 makes each volatile read an observable event. `is_pure_expr`'s
-/// `Member` arm asked only whether the *base* was pure, so the read was
-/// hoisted and both members were loaded unconditionally into a branchless
-/// select — at `-O0` too.
-#[test]
-fn memopt_a_volatile_member_is_not_speculated_by_a_conditional() {
-    let src = "\
-struct S { volatile unsigned status; unsigned other; };
-struct S sqobj;
-unsigned probe(int c) { return c ? sqobj.status : sqobj.other; }
-";
-    for level in ["-O0", "-O2"] {
-        for triple in [X86_64_LINUX, AARCH64_LINUX] {
-            let asm = asm_for_with("vol_member_select", triple, src, &[level]);
-            let select = if triple == X86_64_LINUX {
-                "cmov"
-            } else {
-                "csel"
-            };
-            assert_body_lacks(
-                &asm,
-                "probe",
-                select,
-                &format!(
-                    "a volatile member read cannot be speculated, so the arms may not \
-                     collapse into a conditional move: {level} on {triple}"
-                ),
-            );
-        }
-    }
-}
-
-/// The control for the test above: with no volatile member, the branchless
-/// select is still allowed, so that test is asserting the qualifier and not
-/// merely that c17 stopped emitting conditional moves.
-#[test]
-fn memopt_a_plain_member_may_still_be_speculated() {
-    let src = "\
-struct S { unsigned one; unsigned other; };
-struct S pqsel;
-unsigned probe(int c) { return c ? pqsel.one : pqsel.other; }
-";
-    for triple in [X86_64_LINUX, AARCH64_LINUX] {
-        let asm = asm_for_with("plain_member_select", triple, src, &["-O2"]);
-        let select = if triple == X86_64_LINUX {
-            "cmov"
-        } else {
-            "csel"
-        };
-        assert_body_contains(
-            &asm,
-            "probe",
-            select,
-            "two ordinary member reads are pure and may still collapse to a select",
-        );
-    }
-}
-
-/// A `volatile` bit-field read is observable, even though the access is of the
-/// carrier and the carrier can never carry the qualifier.
-///
-/// The bit-field emitters build their load and store at
-/// `bitfield_storage_type`, which is the unqualified storage unit, so nothing
-/// derived the marker from the access type. `mark_volatile_access` anticipates
-/// exactly this ("a bit-field reads a storage unit whose type is the carrier")
-/// and preserves a marker the site sets itself — neither emitter set one, and
-/// the read was deleted outright from `-O1` up. Both spellings are covered: the
-/// field declared `volatile`, and an ordinary field of a `volatile` object.
-#[test]
-fn memopt_a_volatile_bitfield_read_is_performed() {
-    let src = "\
-struct B { volatile unsigned f : 3; unsigned g : 5; };
-struct B bfqobj;
-volatile struct B vbfqobj;
-void probe_field(void) { bfqobj.f; }
-void probe_object(void) { vbfqobj.g; }
-";
-    for level in ["-O0", "-O1", "-O2", "-Os"] {
-        for triple in [X86_64_LINUX, AARCH64_LINUX] {
-            let asm = asm_for_with("vol_bitfield", triple, src, &[level]);
-            for (func, object) in [("probe_field", "bfqobj"), ("probe_object", "vbfqobj")] {
-                assert_body_contains(
-                    &asm,
-                    func,
-                    object,
-                    &format!(
-                        "a volatile bit-field read is observable: {func} at {level} \
-                         on {triple} must still access `{object}`"
-                    ),
-                );
-            }
-        }
-    }
-}
-
-/// The control: an ordinary bit-field read is still dead code, so the test
-/// above cannot pass by marking every bit-field access volatile.
-#[test]
-fn memopt_a_plain_bitfield_read_is_still_removed() {
-    let src = "\
-struct B { unsigned f : 3; };
-struct B pbfqobj;
-void probe(void) { pbfqobj.f; }
-";
-    for triple in [X86_64_LINUX, AARCH64_LINUX] {
-        let asm = asm_for_with("plain_bitfield", triple, src, &["-O2"]);
-        assert_body_lacks(
-            &asm,
-            "probe",
-            "pbfqobj",
-            "reading an ordinary bit-field has no effect and is dead code",
-        );
     }
 }
 

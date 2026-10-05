@@ -324,5 +324,17 @@ int main(void)
     C64(177, _mm_shuffle_pi16(S, _MM_SHUFFLE(0, 1, 2, 3)), 0xcdef89ab45670123ull);
     C64(178, _m_pshufw(S, 0xe4), 0x0123456789abcdefull);
     C64(179, via_maskmove(S, R), 0x5a23455a5aabcd5aull);
+
+    /* Not recorded from gcc: was the separate simd_xmmintrin_brings_sse2
+       test. gcc's <xmmintrin.h> brings the SSE2 header with it, and mesa's
+       half_float.h relies on that: it includes only <xmmintrin.h> and writes
+       __m128i, beside a "v" asm operand of type __m128. This file includes
+       only <xmmintrin.h>, so the check keeps that property. */
+    {
+        __m128 in = {2.0f, 3.0f, 4.0f, 5.0f};
+        __m128i out;
+        __asm__ volatile("cvttps2dq %1, %0" : "=v"(out) : "v"(in));
+        CT(180, _mm_cvtsi128_si32(out) == 2 && ((int *)&out)[3] == 5);
+    }
     return 0;
 }

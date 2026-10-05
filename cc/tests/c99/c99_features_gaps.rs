@@ -12,9 +12,18 @@
 // sizeof excluding FAM, compound literal file-scope, inline with static vars,
 // long long limits, VLA edge cases, overwriting designated initializers
 //
+// Also consolidates `func_name_is_a_const_char_array` (formerly
+// `func_name.rs`), the section returning 90-99:
+//
+// `__func__` (C17 6.4.2.2): implicitly `static const char __func__[] =
+// "function-name";`. c17 typed it `char *`, so `sizeof __func__` was the size
+// of a pointer, `_Generic` picked `char *`, and writing through it was
+// accepted; with an asm label it held the label rather than the name.
+//
 
 use crate::common::compile_and_run;
 
+/// Consolidates `c99_features_gaps_mega` and `func_name_is_a_const_char_array`.
 #[test]
 fn c99_features_gaps_mega() {
     let code = r#"
@@ -41,6 +50,22 @@ struct FlexMsg {
 
 // === File-scope compound literal (static storage) ===
 static int *file_scope_arr = (int[]){100, 200, 300};
+
+// === func_name_is_a_const_char_array: __func__ is a const char array ===
+int f(void) __asm__("c17_func_name_label");
+int f(void) { return sizeof(__func__); }
+const char *h(void) { return __func__; }
+int myfn(void) {
+    _Static_assert(sizeof(__func__) == 5, "__func__");
+    _Static_assert(sizeof(__FUNCTION__) == 5, "__FUNCTION__");
+    _Static_assert(sizeof(__PRETTY_FUNCTION__) == 5, "__PRETTY_FUNCTION__");
+    _Static_assert(_Generic(__func__, const char *: 1, default: 0), "decays to const char *");
+    _Static_assert(_Generic(&__func__, const char (*)[5]: 1, default: 0), "address of the array");
+    static const char *sp = __func__;
+    const char (*pa)[5] = &__func__;
+    if (sp != __func__ || strcmp(*pa, "myfn") != 0) return 1;
+    return 0;
+}
 
 int main(void) {
     // ========== __func__ IDENTIFIER (returns 1-9) ==========
@@ -199,6 +224,14 @@ int main(void) {
         // Long double suffix on hex float
         long double ld1 = 0x1.0p3L;  // 1.0 * 2^3 = 8.0
         if (ld1 < 7.9L || ld1 > 8.1L) return 85;
+    }
+
+    // ========== __func__ IS A const char ARRAY (returns 90-99) ==========
+    {
+        if (f() != 2) return 90;                  /* "f", not the asm label */
+        if (strcmp(h(), "h") != 0) return 91;
+        if (myfn() != 0) return 92;
+        if (strcmp(__func__, "main") != 0) return 93;
     }
 
     return 0;

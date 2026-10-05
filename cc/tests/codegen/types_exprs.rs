@@ -11,8 +11,7 @@
 //
 
 use crate::common::{
-    compile_and_run, compile_and_run_everywhere, compile_and_run_optimized, compile_expect_error,
-    create_c_file,
+    compile_and_run, compile_and_run_everywhere, compile_and_run_optimized, create_c_file,
 };
 use plib::testing::run_test_base;
 
@@ -104,15 +103,27 @@ int main() {
     );
 }
 
-// ============================================================================
-// Test: Large struct member copy from global variable
-// ============================================================================
-// Regression test for bug where accessing a large struct member (size > 64 bits)
-// from a global variable would generate an extra dereference, treating the
-// struct address as a pointer to dereference rather than the struct itself.
+/// Aggregate copies, atomics, compound literals and short-circuit
+/// conditions under the optimizer, one program run at -O1
+/// (`compile_and_run_optimized`).
+///
+/// Consolidates these tests, one section each (each original `main` is
+/// a `noinline` section function; the program exits with the section's
+/// base plus the original code):
+/// - `codegen_large_struct_member_copy`: 1..=9
+/// - `codegen_atomic_cas_register_clobbering`: 10..=20
+/// - `codegen_large_struct_array_copy`: 21..=26
+/// - `codegen_compound_literal_zero_init`: 27..=33
+/// - `codegen_conditional_short_circuit`: 34..=35
 #[test]
-fn codegen_large_struct_member_copy() {
+fn codegen_types_exprs_optimized_mega() {
     let code = r#"
+/* ---- codegen_large_struct_member_copy: exits 1..9
+ * Test: Large struct member copy from global variable
+ * Regression test for bug where accessing a large struct member (size > 64 bits)
+ * from a global variable would generate an extra dereference, treating the
+ * struct address as a pointer to dereference rather than the struct itself.
+ */
 typedef struct {
     void *ctx;
     void *malloc_fn;
@@ -145,7 +156,8 @@ void get_allocator(Allocator *result) {
     *result = _MyMem_Raw;
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_large_struct_member_copy(void)
+{
     // Initialize the source struct
     _MyMem_Raw.ctx = (void*)0x1234;
     _MyMem_Raw.malloc_fn = (void*)0x5678;
@@ -177,23 +189,14 @@ int main(void) {
 
     return 0;
 }
-"#;
+#undef _MyMem_Raw
 
-    let exit_code = compile_and_run_optimized("struct_member_copy", code);
-    assert_eq!(
-        exit_code, 0,
-        "Large struct member copy test failed with exit code {}",
-        exit_code
-    );
-}
-
-// Test for atomic compare-and-swap register clobbering bug.
-// The bug: when regalloc assigns CAS operands to registers R9/R10/R11/RAX,
-// loading one operand can clobber another before it's used.
-// This test uses inline functions to trigger the problematic register allocation.
-#[test]
-fn codegen_atomic_cas_register_clobbering() {
-    let code = r#"
+/* ---- codegen_atomic_cas_register_clobbering: exits 10..20
+ * Test for atomic compare-and-swap register clobbering bug.
+ * The bug: when regalloc assigns CAS operands to registers R9/R10/R11/RAX,
+ * loading one operand can clobber another before it's used.
+ * This test uses inline functions to trigger the problematic register allocation.
+ */
 #include <stdint.h>
 #include <stdatomic.h>
 
@@ -220,7 +223,8 @@ static inline int unlock_mutex(RawMutex *m) {
     return atomic_cas_uintptr(&m->v, &locked, UNLOCKED);
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_atomic_cas_register_clobbering(void)
+{
     RawMutex m = {0};
 
     // Test 1: Lock should succeed (v: 0 -> 1)
@@ -246,23 +250,15 @@ int main(void) {
 
     return 0;
 }
-"#;
+#undef UNLOCKED
+#undef LOCKED
 
-    let exit_code = compile_and_run_optimized("atomic_cas_clobber", code);
-    assert_eq!(
-        exit_code, 0,
-        "Atomic CAS register clobbering test failed with exit code {}",
-        exit_code
-    );
-}
-
-// Regression test for bug where copying a large struct (> 64 bits) from an
-// array element would incorrectly dereference the first field as a pointer
-// instead of doing a proper block copy.
-// Bug: `struct pair item = array[0];` would crash when struct has 2+ pointers.
-#[test]
-fn codegen_large_struct_array_copy() {
-    let code = r#"
+/* ---- codegen_large_struct_array_copy: exits 21..26
+ * Regression test for bug where copying a large struct (> 64 bits) from an
+ * array element would incorrectly dereference the first field as a pointer
+ * instead of doing a proper block copy.
+ * Bug: `struct pair item = array[0];` would crash when struct has 2+ pointers.
+ */
 #include <stdio.h>
 
 struct pair {
@@ -275,7 +271,8 @@ static struct pair pairs[] = {
     {(void*)0xCAFEBABE, "Second"},
 };
 
-int main(void) {
+static __attribute__((noinline)) int t_large_struct_array_copy(void)
+{
     // Test: copy struct from array to local variable
     // This was crashing because the code tried to dereference
     // the first field (0xDEADBEEF) as a pointer to copy from
@@ -312,36 +309,24 @@ int main(void) {
     printf("OK\n");
     return 0;
 }
-"#;
 
-    let exit_code = compile_and_run_optimized("struct_array_copy", code);
-    assert_eq!(
-        exit_code, 0,
-        "Large struct array copy test failed with exit code {}",
-        exit_code
-    );
-}
-
-// ============================================================================
-// Compound literal zero-initialization test
-// ============================================================================
-// C99 6.7.8p21: Fields not explicitly initialized in a compound literal
-// must be zero-initialized. Bug: *p = (struct S){.a = val} left .b and .c
-// as garbage instead of zero.
-#[test]
-fn codegen_compound_literal_zero_init() {
-    let code = r#"
-typedef long int64_t;
+/* ---- codegen_compound_literal_zero_init: exits 27..33
+ * Compound literal zero-initialization test
+ * C99 6.7.8p21: Fields not explicitly initialized in a compound literal
+ * must be zero-initialized. Bug: *p = (struct S){.a = val} left .b and .c
+ * as garbage instead of zero.
+ */
+typedef long to4_int64_t;
 void *malloc(unsigned long);
 void free(void *);
 int printf(const char *, ...);
-#define NULL ((void*)0)
+#define to4_NULL ((void*)0)
 
 typedef int (*func_ptr)(void);
 
 struct cached_m_dict {
     void *copied;
-    int64_t extra;
+    to4_int64_t extra;
 };
 
 typedef struct cached_m_dict *cached_m_dict_t;
@@ -355,13 +340,14 @@ typedef enum {
 struct extensions_cache_value {
     void *def;                      // offset 0: 8 bytes
     func_ptr m_init;                // offset 8: 8 bytes
-    int64_t m_index;                // offset 16: 8 bytes
+    to4_int64_t m_index;                // offset 16: 8 bytes
     cached_m_dict_t m_dict;         // offset 24: 8 bytes (pointer)
     struct cached_m_dict _m_dict;   // offset 32: 16 bytes (embedded struct)
     origin_t origin;                // offset 48: 4 bytes
 };
 
-int main(void) {
+static __attribute__((noinline)) int t_compound_literal_zero_init(void)
+{
     struct extensions_cache_value *v = malloc(sizeof(*v));
     
     // Fill with known non-zero pattern to detect failure to zero-init
@@ -378,7 +364,7 @@ int main(void) {
     // .m_dict, ._m_dict.copied, ._m_dict.extra should become 0
     *v = (struct extensions_cache_value){
         .def = (void*)0x1234,
-        .m_init = NULL,
+        .m_init = to4_NULL,
         .m_index = 1,
         .origin = ORIGIN_CORE,
     };
@@ -388,7 +374,7 @@ int main(void) {
         printf("FAIL: v->def = %p, expected 0x1234\n", v->def);
         return 1;
     }
-    if (v->m_init != NULL) {
+    if (v->m_init != to4_NULL) {
         printf("FAIL: v->m_init = %p, expected NULL\n", (void*)v->m_init);
         return 2;
     }
@@ -402,12 +388,12 @@ int main(void) {
     }
     
     // Check implicitly zero-initialized fields (the bug was here!)
-    if (v->m_dict != NULL) {
+    if (v->m_dict != to4_NULL) {
         printf("FAIL: v->m_dict = %p, expected NULL (should be zero-init)\n", 
                (void*)v->m_dict);
         return 5;
     }
-    if (v->_m_dict.copied != NULL) {
+    if (v->_m_dict.copied != to4_NULL) {
         printf("FAIL: v->_m_dict.copied = %p, expected NULL (should be zero-init)\n", 
                v->_m_dict.copied);
         return 6;
@@ -422,24 +408,14 @@ int main(void) {
     printf("OK\n");
     return 0;
 }
-"#;
+#undef to4_NULL
 
-    let exit_code = compile_and_run_optimized("compound_literal_zero", code);
-    assert_eq!(
-        exit_code, 0,
-        "Compound literal zero-init test failed with exit code {}",
-        exit_code
-    );
-}
-
-// ============================================================================
-// Ternary conditional expressions with pointer dereference must use short-circuit
-// evaluation. Bug: `value = ptr == NULL ? 0 : ptr->x` would evaluate `ptr->x`
-// unconditionally, causing a crash when `ptr` is NULL because the compiler
-// incorrectly used a select instruction (cmov) instead of proper branching.
-#[test]
-fn codegen_conditional_short_circuit() {
-    let code = r#"
+/* ---- codegen_conditional_short_circuit: exits 34..35
+ * Ternary conditional expressions with pointer dereference must use short-circuit
+ * evaluation. Bug: `value = ptr == NULL ? 0 : ptr->x` would evaluate `ptr->x`
+ * unconditionally, causing a crash when `ptr` is NULL because the compiler
+ * incorrectly used a select instruction (cmov) instead of proper branching.
+ */
 #include <stdio.h>
 #include <stddef.h>
 
@@ -454,7 +430,8 @@ int get_value(struct foo *entry) {
     return entry == NULL ? 0 : entry->x;
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_conditional_short_circuit(void)
+{
     struct foo f = { .x = 42 };
     
     // Test 1: non-NULL pointer should return the value
@@ -475,13 +452,21 @@ int main(void) {
     printf("OK\n");
     return 0;
 }
-"#;
 
-    let exit_code = compile_and_run_optimized("conditional_short_circuit", code);
+int main(void)
+{
+    int r;
+    if ((r = t_large_struct_member_copy()) != 0) return r;
+    if ((r = t_atomic_cas_register_clobbering()) != 0) return 9 + r;
+    if ((r = t_large_struct_array_copy()) != 0) return 20 + r;
+    if ((r = t_compound_literal_zero_init()) != 0) return 26 + r;
+    if ((r = t_conditional_short_circuit()) != 0) return 33 + r;
+    return 0;
+}
+"#;
     assert_eq!(
-        exit_code, 0,
-        "Conditional short-circuit test failed with exit code {} (likely crashed on NULL dereference)",
-        exit_code
+        compile_and_run_optimized("types_exprs_optimized_mega", code),
+        0
     );
 }
 
@@ -489,10 +474,27 @@ int main(void) {
 // 32/64-bit type width audit tests
 // ============================================================================
 
-/// Test: enum is treated as integer for pointer arithmetic and is_integer checks
+/// Integer types, promotions, sizing and expression forms, one program
+/// run at the compile matrix levels.
+///
+/// Consolidates these tests, one section each (each original `main` is
+/// a `noinline` section function; the program exits with the section's
+/// base plus the original code):
+/// - `codegen_enum_is_integer`: 1..=5
+/// - `codegen_unary_neg_promotion`: 6..=9
+/// - `codegen_bitfield_64bit_storage`: 10..=13
+/// - `codegen_type_based_sizing_64bit`: 14..=65
+/// - `codegen_vla_sizeof_mul_type`: 66..=96
+/// - `codegen_string_literal_high_bytes`: 97..=129
+/// - `codegen_ternary_common_type`: 130..=133
+/// - `codegen_preinc_deref_postinc`: 134..=137
+/// - `codegen_abi_dispatch_medium_struct`: 138..=144
 #[test]
-fn codegen_enum_is_integer() {
+fn codegen_types_exprs_mega() {
     let code = r#"
+/* ---- codegen_enum_is_integer: exits 1..5
+ * Test: enum is treated as integer for pointer arithmetic and is_integer checks
+ */
 enum Color { RED, GREEN, BLUE };
 
 int arr[] = {10, 20, 30};
@@ -501,7 +503,8 @@ int get_via_enum_ptr(int *p, enum Color c) {
     return *(p + c);
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_enum_is_integer(void)
+{
     // Section 1: enum used in pointer arithmetic
     if (get_via_enum_ptr(arr, RED) != 10) return 1;
     if (get_via_enum_ptr(arr, GREEN) != 20) return 2;
@@ -519,15 +522,12 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("enum_is_integer", code, &[]), 0);
-}
 
-/// Test: unary minus applies integer promotion (char/short -> int)
-#[test]
-fn codegen_unary_neg_promotion() {
-    let code = r#"
-int main(void) {
+/* ---- codegen_unary_neg_promotion: exits 6..9
+ * Test: unary minus applies integer promotion (char/short -> int)
+ */
+static __attribute__((noinline)) int t_unary_neg_promotion(void)
+{
     // Section 1: negating a char should produce int-width result
     char c = 100;
     int neg_c = -c;
@@ -551,20 +551,17 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("unary_neg_promotion", code, &[]), 0);
-}
 
-/// Test: signed bitfield in 64-bit storage unit
-#[test]
-fn codegen_bitfield_64bit_storage() {
-    let code = r#"
+/* ---- codegen_bitfield_64bit_storage: exits 10..13
+ * Test: signed bitfield in 64-bit storage unit
+ */
 struct Wide {
     long a : 40;
     long b : 20;
 };
 
-int main(void) {
+static __attribute__((noinline)) int t_bitfield_64bit_storage(void)
+{
     struct Wide w;
 
     // Section 1: store and read 40-bit signed field
@@ -584,22 +581,13 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("bitfield_64bit_storage", code, &[]), 0);
-}
 
-// ============================================================================
-// Type-based size derivation: verify 64-bit width through binop, unary, mul,
-// div, compare, and select when insn.typ carries the authoritative width.
-// Values above 2^32 prove no 32-bit truncation occurs.
-// ============================================================================
-
-#[test]
-fn codegen_type_based_sizing_64bit() {
-    let code = r#"
+/* ---- codegen_type_based_sizing_64bit: exits 14..65
+ */
 long identity(long x) { return x; }
 
-int main(void) {
+static __attribute__((noinline)) int t_type_based_sizing_64bit(void)
+{
     long base = 0x100000000L;  /* 4 GiB — above 32-bit range */
 
     /* ===== binop: add, sub, and, or, xor, shift (returns 1-9) ===== */
@@ -679,19 +667,11 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("type_based_sizing_64bit", code, &[]), 0);
-}
 
-// ============================================================================
-// VLA sizeof with multi-dimensional arrays — exercises VLA Mul instructions
-// that now carry .with_type(ulong_id) for correct 64-bit multiplication.
-// ============================================================================
-
-#[test]
-fn codegen_vla_sizeof_mul_type() {
-    let code = r#"
-int main(void) {
+/* ---- codegen_vla_sizeof_mul_type: exits 66..96
+ */
+static __attribute__((noinline)) int t_vla_sizeof_mul_type(void)
+{
     /* ===== 1D VLA sizeof with different element types (returns 1-4) ===== */
     int n = 10;
 
@@ -736,17 +716,9 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("vla_sizeof_mul_type", code, &[]), 0);
-}
 
-// ============================================================================
-// Regression: string literal bytes >= 0x80 must not be UTF-8 encoded
-// ============================================================================
-
-#[test]
-fn codegen_string_literal_high_bytes() {
-    let code = r#"
+/* ---- codegen_string_literal_high_bytes: exits 97..129
+ */
 #include <stdio.h>
 
 struct test {
@@ -761,7 +733,8 @@ static struct test t = {
     .y = 99,
 };
 
-int main(void) {
+static __attribute__((noinline)) int t_string_literal_high_bytes(void)
+{
     /* Verify struct fields are correct (not shifted by UTF-8 expansion) */
     if (t.x != 42) return 1;
     if (t.y != 99) return 2;
@@ -795,17 +768,9 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("string_literal_high_bytes", code, &[]), 0);
-}
 
-// ============================================================================
-// Regression: ternary result type must be common type of both branches
-// ============================================================================
-
-#[test]
-fn codegen_ternary_common_type() {
-    let code = r#"
+/* ---- codegen_ternary_common_type: exits 130..133
+ */
 struct rec {
     unsigned char flags;
     unsigned char decimal;
@@ -821,7 +786,8 @@ int get_decimal(struct rec *r) {
     return (r->flags & 0x02) ? r->decimal : -1;
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_ternary_common_type(void)
+{
     /* Digit case: should return 5 */
     if (get_decimal(&table[0]) != 5) return 1;
     /* Non-digit case: should return -1, not 255 */
@@ -837,19 +803,16 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("ternary_common_type", code, &[]), 0);
-}
 
-/// Regression test: ++*s++ re-evaluated s++ when storing back, causing the
-/// increment to write to the wrong address. The PreInc handler must compute
-/// the deref address once before evaluating the operand value.
-#[test]
-fn codegen_preinc_deref_postinc() {
-    let code = r#"
+/* ---- codegen_preinc_deref_postinc: exits 134..137
+ * Regression test: ++*s++ re-evaluated s++ when storing back, causing the
+ * increment to write to the wrong address. The PreInc handler must compute
+ * the deref address once before evaluating the operand value.
+ */
 #include <string.h>
 
-int main(void) {
+static __attribute__((noinline)) int t_preinc_deref_postinc(void)
+{
     /* ++*s++: increment char at *s, then advance s */
     char buf[4] = "abc";
     char *s = buf;
@@ -880,20 +843,9 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("preinc_deref_postinc", code, &[]), 0);
-}
 
-// ============================================================================
-// Test: ABI dispatch for medium struct params (Phase 0 correctness fix)
-// ============================================================================
-
-#[test]
-fn codegen_abi_dispatch_medium_struct() {
-    // Verifies that medium structs (9-16 bytes) are correctly classified via
-    // the ABI dispatcher (get_abi_for_conv) rather than a hardcoded SysV AMD64 ABI.
-    // Tests both two-register integer structs and mixed int/SSE structs.
-    let code = r#"
+/* ---- codegen_abi_dispatch_medium_struct: exits 138..144
+ */
 struct TwoLongs {
     long a;
     long b;
@@ -926,7 +878,8 @@ struct IntDouble make_id(int i, double d) {
     return s;
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_abi_dispatch_medium_struct(void)
+{
     // Test passing a two-GP-register struct as parameter
     struct TwoLongs s = { 15, 25 };
     long r = sum_two_longs(s);
@@ -953,30 +906,76 @@ int main(void) {
 
     return 0;
 }
+
+int main(void)
+{
+    int r;
+    if ((r = t_enum_is_integer()) != 0) return r;
+    if ((r = t_unary_neg_promotion()) != 0) return 5 + r;
+    if ((r = t_bitfield_64bit_storage()) != 0) return 9 + r;
+    if ((r = t_type_based_sizing_64bit()) != 0) return 13 + r;
+    if ((r = t_vla_sizeof_mul_type()) != 0) return 65 + r;
+    if ((r = t_string_literal_high_bytes()) != 0) return 96 + r;
+    if ((r = t_ternary_common_type()) != 0) return 129 + r;
+    if ((r = t_preinc_deref_postinc()) != 0) return 133 + r;
+    if ((r = t_abi_dispatch_medium_struct()) != 0) return 137 + r;
+    return 0;
+}
 "#;
-    assert_eq!(
-        compile_and_run("codegen_abi_dispatch_medium_struct", code, &[]),
-        0
-    );
+    assert_eq!(compile_and_run("types_exprs_mega", code, &[]), 0);
 }
 
-/// AArch64 gives each instruction family its own immediate encoding, and c17
-/// tested one 0..=4095 range for all of them. `add`/`sub` do take a 12-bit
-/// unsigned value, but the logical operations take a *bitmask* immediate that
-/// cannot represent 0 at all, and a shift takes an amount below the operand
-/// width — so `x & 0` emitted `and w1, w1, #0`, `x | 1000` emitted
-/// `orr w1, w1, #1000`, and `x << 32` emitted `lsl w1, w1, #32`, each of which
-/// the assembler refuses. The build failed; nothing was miscompiled.
+// ============================================================================
+// Type-based size derivation: verify 64-bit width through binop, unary, mul,
+// div, compare, and select when insn.typ carries the authoritative width.
+// Values above 2^32 prove no 32-bit truncation occurs.
+// ============================================================================
+
+// ============================================================================
+// VLA sizeof with multi-dimensional arrays — exercises VLA Mul instructions
+// that now carry .with_type(ulong_id) for correct 64-bit multiplication.
+// ============================================================================
+
+// ============================================================================
+// Regression: string literal bytes >= 0x80 must not be UTF-8 encoded
+// ============================================================================
+
+// ============================================================================
+// Regression: ternary result type must be common type of both branches
+// ============================================================================
+
+// ============================================================================
+// Test: ABI dispatch for medium struct params (Phase 0 correctness fix)
+// ============================================================================
+
+/// Logical/shift immediates and signed bit-fields, one program run at
+/// the compile matrix levels and at -O1 (`compile_and_run_optimized`).
 ///
-/// Pre-existing, and invisible to this suite because `compile_and_run` targets
-/// the host. Found by the aarch64 sweep after it was taught that a program
-/// c17 cannot build, where gcc can, is a defect rather than something to skip.
+/// Consolidates these tests, one section each (each original `main` is
+/// a `noinline` section function; the program exits with the section's
+/// base plus the original code):
+/// - `codegen_logical_and_shift_immediates_are_encodable`: 1..=14
+/// - `codegen_signed_bitfield_extends_to_its_declared_type`: 15..=27
 #[test]
-fn codegen_logical_and_shift_immediates_are_encodable() {
+fn codegen_immediates_and_bitfields_mega() {
     let code = r#"
+/* ---- codegen_logical_and_shift_immediates_are_encodable: exits 1..14
+ * AArch64 gives each instruction family its own immediate encoding, and c17
+ * tested one 0..=4095 range for all of them. `add`/`sub` do take a 12-bit
+ * unsigned value, but the logical operations take a *bitmask* immediate that
+ * cannot represent 0 at all, and a shift takes an amount below the operand
+ * width — so `x & 0` emitted `and w1, w1, #0`, `x | 1000` emitted
+ * `orr w1, w1, #1000`, and `x << 32` emitted `lsl w1, w1, #32`, each of which
+ * the assembler refuses. The build failed; nothing was miscompiled.
+ *
+ * Pre-existing, and invisible to this suite because `compile_and_run` targets
+ * the host. Found by the aarch64 sweep after it was taught that a program
+ * c17 cannot build, where gcc can, is a defect rather than something to skip.
+ */
 unsigned u32and(unsigned x, unsigned m) { return x & m; }
 
-int main(void) {
+static __attribute__((noinline)) int t_logical_and_shift_immediates_are_encodable(void)
+{
     unsigned x = 0xFFFFu;
 
     /* Zero has no bitmask encoding on aarch64. */
@@ -1009,24 +1008,16 @@ int main(void) {
     if (u32and(x, 0u) != 0u) return 14;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("logical_imm_encodable", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("logical_imm_encodable_opt", code),
-        0
-    );
-}
 
-/// A signed bit-field sign-extends to its declared type's width.
-///
-/// The extension was measured against the *access unit* the field is carried
-/// in. For a packed `long long a:4` that unit is one byte, so the value was
-/// extended only as far as the unit reached and -1 came back 4294967295 with
-/// `a < 0` false. Where the field exactly filled its unit the guard was false
-/// outright and no extension was emitted at all.
-#[test]
-fn codegen_signed_bitfield_extends_to_its_declared_type() {
-    let code = r#"
+/* ---- codegen_signed_bitfield_extends_to_its_declared_type: exits 15..27
+ * A signed bit-field sign-extends to its declared type's width.
+ *
+ * The extension was measured against the *access unit* the field is carried
+ * in. For a packed `long long a:4` that unit is one byte, so the value was
+ * extended only as far as the unit reached and -1 came back 4294967295 with
+ * `a < 0` false. Where the field exactly filled its unit the guard was false
+ * outright and no extension was emitted at all.
+ */
 #pragma pack(1)
 struct Packed {
     long long a : 4;
@@ -1043,7 +1034,7 @@ struct Plain {
     __int128 e : 27;
 };
 
-int main(void)
+static __attribute__((noinline)) int t_signed_bitfield_extends_to_its_declared_type(void)
 {
     struct Packed p;
     p.a = -1; p.b = -1; p.c = -1;
@@ -1075,10 +1066,21 @@ int main(void)
 
     return 0;
 }
+
+int main(void)
+{
+    int r;
+    if ((r = t_logical_and_shift_immediates_are_encodable()) != 0) return r;
+    if ((r = t_signed_bitfield_extends_to_its_declared_type()) != 0) return 14 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("signed_bitfield_extend", code, &[]), 0);
     assert_eq!(
-        compile_and_run_optimized("signed_bitfield_extend_opt", code),
+        compile_and_run("immediates_and_bitfields_mega", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("immediates_and_bitfields_mega_opt", code),
         0
     );
 }
@@ -1160,16 +1162,33 @@ int main(void)
     }
 }
 
-/// `typeof` of an expression whose type is variably modified names that type
-/// with the extents its object was declared with. The type alone is `int[]`
-/// -- every VLA type interns to one `TypeId` -- so `typeof(v) w;` gave `w` an
-/// incomplete type and no storage, and was then rejected as "array size
-/// missing". The extents are the object's, fixed when it was declared; the
-/// operand is evaluated (once per declarator, as gcc does) only when it is
-/// variably modified, and so is `sizeof`'s (C17 6.5.3.4p2), which c17 skipped.
+/// Variably modified types, `typeof`, decays and static initializers, one
+/// program run on the host at the matrix levels, -O0 and -O2, and on
+/// aarch64 at -O0 and -O2.
+///
+/// Consolidates these tests, one section each (each original `main` is
+/// a `noinline` section function; the program exits with the section's
+/// base plus the original code):
+/// - `codegen_typeof_of_variably_modified_object`: 1..=71
+/// - `codegen_sizeof_parenthesized_operand_takes_postfix_operators`: 72..=76
+/// - `codegen_typeof_vla_declaration_keeps_its_extent`: 77..=96
+/// - `codegen_typedef_name_after_type_specifier_is_declared`: 97..=99
+/// - `codegen_vla_extent_inside_a_grouped_declarator`: 100..=101
+/// - `codegen_function_and_array_convert_from_their_address`: 102..=130
+/// - `codegen_decaying_operand_converts_to_bool_from_its_address`: 131..=147
+/// - `codegen_const_subobject_folds_in_a_static_initializer`: 148..=149
 #[test]
-fn codegen_typeof_of_variably_modified_object() {
-    let src = r#"
+fn codegen_types_exprs_everywhere_mega() {
+    let code = r#"
+/* ---- codegen_typeof_of_variably_modified_object: exits 1..71
+ * `typeof` of an expression whose type is variably modified names that type
+ * with the extents its object was declared with. The type alone is `int[]`
+ * -- every VLA type interns to one `TypeId` -- so `typeof(v) w;` gave `w` an
+ * incomplete type and no storage, and was then rejected as "array size
+ * missing". The extents are the object's, fixed when it was declared; the
+ * operand is evaluated (once per declarator, as gcc does) only when it is
+ * variably modified, and so is `sizeof`'s (C17 6.5.3.4p2), which c17 skipped.
+ */
 static int g(int n, int (*a)[n], typeof(a) b, typeof(*a) *c)
 {
     if ((char *)(b + 1) - (char *)b != n * (long)sizeof(int)) return 1;
@@ -1261,36 +1280,309 @@ static int h(int n)
     return 0;
 }
 
-int main(void)
+static __attribute__((noinline)) int t_typeof_of_variably_modified_object(void)
 {
     int r = h(3);
     if (r == 0) r = h(7);
     return r ? r : f(5);
 }
-"#;
-    compile_and_run_everywhere("typeof_vm_object", src);
-}
 
-/// `sizeof ( expression )` is `sizeof` of a unary expression, and the
-/// parenthesized expression is only its primary: `sizeof (a)[0]` measures
-/// `a[0]`. c17 stopped at the `)` and rejected the `[`.
-#[test]
-fn codegen_sizeof_parenthesized_operand_takes_postfix_operators() {
-    let src = r#"
+/* ---- codegen_sizeof_parenthesized_operand_takes_postfix_operators: exits 72..76
+ * `sizeof ( expression )` is `sizeof` of a unary expression, and the
+ * parenthesized expression is only its primary: `sizeof (a)[0]` measures
+ * `a[0]`. c17 stopped at the `)` and rejected the `[`.
+ */
 struct S { int x[3]; } s;
 int a[10];
-int *f(void) { return a; }
-int main(void)
+int *te2_f(void) { return a; }
+static __attribute__((noinline)) int t_sizeof_parenthesized_operand_takes_postfix_operators(void)
 {
     if (sizeof (a)[0] != sizeof(int)) return 1;
     if (sizeof (s).x != 3 * sizeof(int)) return 2;
     if (_Alignof (a)[0] != _Alignof(int)) return 3;
-    if (sizeof (f)() != sizeof(int *)) return 4;
+    if (sizeof (te2_f)() != sizeof(int *)) return 4;
     if (sizeof (a) != 10 * sizeof(int)) return 5;
     return 0;
 }
+
+/* ---- codegen_typeof_vla_declaration_keeps_its_extent: exits 77..96
+ * `typeof(int[n])` in a declaration names a variable length array whose
+ * extent is `n`, as it does in `sizeof`. The declaration specifiers parsed
+ * the operand with the type-name parser that drops variably modified
+ * extents, so `typeof(int[n]) a;` declared an `int[]` and `sizeof a` was
+ * rejected as incomplete. The extent is evaluated once, at the specifier.
+ */
+static int calls;
+static int next(int n) { calls++; return n; }
+
+static int probe(int n)
+{
+    typeof(int[n]) a;
+    __typeof__(char[n][3]) b;
+    typeof(int[next(n)]) c;
+    if (sizeof a != n * sizeof(int))
+        return 1;
+    if (sizeof b != (unsigned long)n * 3)
+        return 2;
+    if (sizeof c != n * sizeof(int))
+        return 3;
+    for (int i = 0; i < n; i++)
+        a[i] = i * 7;
+    for (int i = 0; i < n; i++)
+        if (a[i] != i * 7)
+            return 4;
+    return 0;
+}
+
+static __attribute__((noinline)) int t_typeof_vla_declaration_keeps_its_extent(void)
+{
+    int r = probe(5);
+    if (r)
+        return r;
+    r = probe(11);
+    if (r)
+        return 10 + r;
+    if (calls != 2)
+        return 20;
+    return 0;
+}
+
+/* ---- codegen_typedef_name_after_type_specifier_is_declared: exits 97..99
+ * A typedef name is a type specifier only when no other type specifier has
+ * been given (C17 6.7.2p2), so `unsigned T = ..` declares a variable named
+ * `T`. `unsigned` sets no base type of its own, and the typedef-name test
+ * asked only for one, so `T` was taken as the type and the declaration
+ * failed for want of a declarator.
+ */
+typedef char T;
+
+int te4_f(void)
+{
+    /* `T` here is the name being declared, an unsigned int hiding the
+       typedef -- not a second type specifier. */
+    unsigned T = 3000000000u;
+    if (T != 3000000000u)
+        return 1;
+    if (sizeof T != sizeof(unsigned int))
+        return 2;
+    return 0;
+}
+
+int te4_g(void)
+{
+    const T c = 'x';   /* a qualifier is not a type specifier */
+    return sizeof c == 1 && c == 'x' ? 0 : 3;
+}
+
+static __attribute__((noinline)) int t_typedef_name_after_type_specifier_is_declared(void)
+{
+    int r = te4_f();
+    if (r)
+        return r;
+    return te4_g();
+}
+
+/* ---- codegen_vla_extent_inside_a_grouped_declarator: exits 100..101
+ * `int (*p[n]);` is an array of `n` pointers: the extent sits in the grouped
+ * inner declarator, and `parse_declarator` dropped every inner extent, so the
+ * array came out incomplete and `sizeof p` was refused.
+ */
+static int grouped(int n)
+{
+    int v = 5;
+    int (*p[n]);
+    if (sizeof p != (unsigned long)n * sizeof(int *))
+        return 1;
+    for (int i = 0; i < n; i++)
+        p[i] = &v;
+    return *p[n - 1] == 5 ? 0 : 2;
+}
+
+static __attribute__((noinline)) int t_vla_extent_inside_a_grouped_declarator(void)
+{
+    return grouped(3);
+}
+
+/* ---- codegen_function_and_array_convert_from_their_address: exits 102..130
+ * A function designator or an array converts from the pointer it decays to
+ * (C17 6.3.2.1p3-4), so every bit of the address survives a cast to an
+ * integer, a conversion to `_Bool` sees all of it, and as a static
+ * initializer the cast is a relocation (6.6p9).
+ *
+ * Typed as the function itself, the conversion read a value with no width:
+ * on x86-64 `(long)h` kept the low 32 bits of the address, `(_Bool)h` was an
+ * internal compiler error, and `long l = (long)h;` at file scope was rejected
+ * as "the value of a variable". `full` is the address read back through a
+ * `volatile` pointer, which no conversion touches.
+ */
+#include <stdint.h>
+#include <stdarg.h>
+
+__attribute__((aligned(256))) static long te6_h(void) { return 7; }
+static long te6_g(void) { return 9; }
+static int arr[4] __attribute__((aligned(256))) = {1, 2, 3, 4};
+
+static long via_mem(long (*volatile *pp)(void)) { return (long)*pp; }
+static long arr_via_mem(int *volatile *pp) { return (long)*pp; }
+
+static long take_long(long x) { return x; }
+static long take_var(int n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    long v = (long)va_arg(ap, long (*)(void));
+    va_end(ap);
+    return v;
+}
+static long take_old();
+static _Bool ret_bool_h(void) { return te6_h; }
+static _Bool ret_bool_arr(void) { return arr; }
+static _Bool take_bool(_Bool b) { return b; }
+
+static long file_scope_h = (long)te6_h;
+static uintptr_t file_scope_u = (uintptr_t)te6_h;
+static long file_scope_arr = (long)arr;
+static uintptr_t file_scope_str = (uintptr_t)"str";
+static _Bool file_scope_bool = (_Bool)te6_h;
+
+static __attribute__((noinline)) int t_function_and_array_convert_from_their_address(void)
+{
+    long (*volatile fp)(void) = te6_h;
+    int *volatile ap = arr;
+    long full = via_mem(&fp);
+    long afull = arr_via_mem(&ap);
+
+    if ((long)te6_h != full) return 1;
+    if ((unsigned long)te6_h != (unsigned long)full) return 2;
+    if ((uintptr_t)te6_h != (uintptr_t)full) return 3;
+    if ((int)te6_h != (int)full) return 4;
+    if ((_Bool)te6_h != 1) return 5;
+    if ((void *)te6_h != (void *)full) return 6;
+    if ((char *)te6_h != (char *)full) return 7;
+    if ((long)arr != afull) return 8;
+    if ((uintptr_t)arr != (uintptr_t)afull) return 9;
+    if (((long)te6_h >> 32) != (full >> 32)) return 10;
+    if (take_long((long)te6_h) != full) return 11;
+    if (take_var(1, te6_h) != full) return 12;
+    if (take_old(te6_h) != full) return 13;
+    if (file_scope_h != full) return 14;
+    if (file_scope_u != (uintptr_t)full) return 15;
+    if (file_scope_arr != afull) return 16;
+    if (file_scope_str == 0 || !file_scope_bool) return 17;
+    void *p = (void *)full;
+    if (!(te6_h == (long (*)(void))p) || !((void *)te6_h == p)) return 18;
+    volatile int c = 1;
+    if ((long)(c ? te6_h : te6_g) != full) return 19;
+    c = 0;
+    if ((long)(c ? te6_h : te6_g) == full) return 20;
+    if ((long)&*te6_h != full || (long)*te6_h != full) return 21;
+    if ((short)te6_h != (short)full || (unsigned char)arr != (unsigned char)afull) return 22;
+    if ((long long)te6_h != (long long)full) return 23;
+    _Bool b = te6_h;
+    if (!b) return 24;
+    b = arr;
+    if (!b || !(_Bool)arr) return 25;
+    if (!ret_bool_h() || !ret_bool_arr()) return 26;
+    if (!take_bool(te6_h) || !take_bool(arr)) return 27;
+    if (sizeof(&te6_h) != sizeof(void *) || sizeof arr != 4 * sizeof(int)) return 28;
+    if (te6_h() + te6_g() != 16) return 29;
+    return 0;
+}
+static long take_old(x) long (*x)(void); { return (long)x; }
+
+/* ---- codegen_decaying_operand_converts_to_bool_from_its_address: exits 131..147
+ * A function designator or an array passed to a `_Bool` parameter, or
+ * converted to `_Bool` at any other site, is converted from the address it
+ * decays to: true, since no function or object is at the null address.
+ *
+ * The argument path decayed the operand and then passed the pointer with no
+ * conversion to the parameter's type, so at -O0 the callee read the
+ * address's low byte -- zero for anything aligned to 256, which is why the
+ * `_Bool` checks above are aligned that way. A static `_Bool` initialized
+ * with an array or a function stored the same low byte.
+ */
+__attribute__((aligned(256))) static long te7_h(void) { return 7; }
+static int te7_arr[4] __attribute__((aligned(256))) = {1, 2, 3, 4};
+static int grid[2][64] __attribute__((aligned(256)));
+struct holder { int a[64]; } __attribute__((aligned(256))) hold;
+__attribute__((noinline)) static _Bool te7_take_bool(_Bool b) { return b; }
+__attribute__((noinline)) static int take_two(int n, _Bool b) { return n + b; }
+static _Bool ret_h(void) { return te7_h; }
+static _Bool ret_arr(void) { return te7_arr; }
+struct flags { _Bool f; };
+_Bool te7_file_scope_arr = (_Bool)te7_arr;
+
+static __attribute__((noinline)) int t_decaying_operand_converts_to_bool_from_its_address(void)
+{
+    if (!te7_take_bool(te7_h)) return 1;
+    if (!te7_take_bool(te7_arr)) return 2;
+    if (!te7_take_bool("str")) return 3;
+    if (!te7_take_bool(grid[1])) return 4;
+    if (!te7_take_bool(hold.a)) return 5;
+    if (!te7_take_bool((int[]){0})) return 6;
+    if (take_two(1, te7_h) != 2 || take_two(2, te7_arr) != 3) return 7;
+    if (!ret_h() || !ret_arr()) return 8;
+    _Bool b = te7_h;
+    if (!b) return 9;
+    b = 0;
+    b = te7_arr;
+    if (!b) return 10;
+    _Bool bs[3] = { te7_h, te7_arr, "x" };
+    if (!bs[0] || !bs[1] || !bs[2]) return 11;
+    struct flags s = { te7_arr };
+    if (!s.f) return 12;
+    _Bool cl = (_Bool){ te7_h };
+    if (!cl) return 13;
+    _Atomic _Bool ab = 0;
+    ab = te7_arr;
+    if (!ab) return 14;
+    struct flags ss = { .f = grid[0] };
+    if (!ss.f) return 15;
+    _Bool (*fp)(_Bool) = te7_take_bool;
+    if (!fp(te7_arr) || !fp(te7_h)) return 16;
+    if (!te7_file_scope_arr) return 17;
+    return 0;
+}
+
+/* ---- codegen_const_subobject_folds_in_a_static_initializer: exits 148..149
+ * An element or member of a `const` object whose initializer folded is
+ * folded in a static initializer, as the object named whole is -- gcc does
+ * both. The subscript or member access was taken as an address, so
+ * `int w = a[0];` was initialized with eight bytes of relocation to `a`.
+ */
+struct P { int x; double d; short v[3]; };
+const int te8_a[3] = {1, 2, 3};
+const struct P p = { 4, 2.5, { 7, 8 } };
+const struct P ps[2] = { { 1, 0.5, {0} }, { 9, 1.25, { 5, 6, 7 } } };
+const double da[2] = { 1.5, 3.5 };
+int w0 = te8_a[0], w2 = te8_a[2] + 1;
+long wx = p.x;
+double wd = p.d * 2;
+int wv = p.v[1];
+int ww = ps[1].v[2] + ps[1].x;
+double wf = da[1];
+float wq = ps[1].d;
+static __attribute__((noinline)) int t_const_subobject_folds_in_a_static_initializer(void)
+{
+    if (w0 != 1 || w2 != 4 || wx != 4 || wd != 5.0) return 1;
+    if (wv != 8 || ww != 16 || wf != 3.5 || wq != 1.25f) return 2;
+    return 0;
+}
+
+int main(void)
+{
+    int r;
+    if ((r = t_typeof_of_variably_modified_object()) != 0) return r;
+    if ((r = t_sizeof_parenthesized_operand_takes_postfix_operators()) != 0) return 71 + r;
+    if ((r = t_typeof_vla_declaration_keeps_its_extent()) != 0) return 76 + r;
+    if ((r = t_typedef_name_after_type_specifier_is_declared()) != 0) return 96 + r;
+    if ((r = t_vla_extent_inside_a_grouped_declarator()) != 0) return 99 + r;
+    if ((r = t_function_and_array_convert_from_their_address()) != 0) return 101 + r;
+    if ((r = t_decaying_operand_converts_to_bool_from_its_address()) != 0) return 130 + r;
+    if ((r = t_const_subobject_folds_in_a_static_initializer()) != 0) return 147 + r;
+    return 0;
+}
 "#;
-    compile_and_run_everywhere("sizeof_paren_postfix", src);
+    compile_and_run_everywhere("types_exprs_everywhere_mega", code);
 }
 
 /// Objects up to `PTRDIFF_MAX`: sizes, member offsets and pointer scaling.
@@ -1411,262 +1703,6 @@ int main(void)
     compile_and_run_everywhere("objects_up_to_ptrdiff_max", src);
 }
 
-/// `typeof(int[n])` in a declaration names a variable length array whose
-/// extent is `n`, as it does in `sizeof`. The declaration specifiers parsed
-/// the operand with the type-name parser that drops variably modified
-/// extents, so `typeof(int[n]) a;` declared an `int[]` and `sizeof a` was
-/// rejected as incomplete. The extent is evaluated once, at the specifier.
-#[test]
-fn codegen_typeof_vla_declaration_keeps_its_extent() {
-    let src = r#"
-static int calls;
-static int next(int n) { calls++; return n; }
-
-static int probe(int n)
-{
-    typeof(int[n]) a;
-    __typeof__(char[n][3]) b;
-    typeof(int[next(n)]) c;
-    if (sizeof a != n * sizeof(int))
-        return 1;
-    if (sizeof b != (unsigned long)n * 3)
-        return 2;
-    if (sizeof c != n * sizeof(int))
-        return 3;
-    for (int i = 0; i < n; i++)
-        a[i] = i * 7;
-    for (int i = 0; i < n; i++)
-        if (a[i] != i * 7)
-            return 4;
-    return 0;
-}
-
-int main(void)
-{
-    int r = probe(5);
-    if (r)
-        return r;
-    r = probe(11);
-    if (r)
-        return 10 + r;
-    if (calls != 2)
-        return 20;
-    return 0;
-}
-"#;
-    compile_and_run_everywhere("typeof_vla_declaration_keeps_its_extent", src);
-}
-
-/// A typedef name is a type specifier only when no other type specifier has
-/// been given (C17 6.7.2p2), so `unsigned T = ..` declares a variable named
-/// `T`. `unsigned` sets no base type of its own, and the typedef-name test
-/// asked only for one, so `T` was taken as the type and the declaration
-/// failed for want of a declarator.
-#[test]
-fn codegen_typedef_name_after_type_specifier_is_declared() {
-    let src = r#"
-typedef char T;
-
-int f(void)
-{
-    /* `T` here is the name being declared, an unsigned int hiding the
-       typedef -- not a second type specifier. */
-    unsigned T = 3000000000u;
-    if (T != 3000000000u)
-        return 1;
-    if (sizeof T != sizeof(unsigned int))
-        return 2;
-    return 0;
-}
-
-int g(void)
-{
-    const T c = 'x';   /* a qualifier is not a type specifier */
-    return sizeof c == 1 && c == 'x' ? 0 : 3;
-}
-
-int main(void)
-{
-    int r = f();
-    if (r)
-        return r;
-    return g();
-}
-"#;
-    compile_and_run_everywhere("typedef_name_after_type_specifier_is_declared", src);
-}
-
-/// `int (*p[n]);` is an array of `n` pointers: the extent sits in the grouped
-/// inner declarator, and `parse_declarator` dropped every inner extent, so the
-/// array came out incomplete and `sizeof p` was refused.
-#[test]
-fn codegen_vla_extent_inside_a_grouped_declarator() {
-    let src = r#"
-static int grouped(int n)
-{
-    int v = 5;
-    int (*p[n]);
-    if (sizeof p != (unsigned long)n * sizeof(int *))
-        return 1;
-    for (int i = 0; i < n; i++)
-        p[i] = &v;
-    return *p[n - 1] == 5 ? 0 : 2;
-}
-
-int main(void)
-{
-    return grouped(3);
-}
-"#;
-    compile_and_run_everywhere("vla_extent_in_grouped_declarator", src);
-}
-
-/// A function designator or an array converts from the pointer it decays to
-/// (C17 6.3.2.1p3-4), so every bit of the address survives a cast to an
-/// integer, a conversion to `_Bool` sees all of it, and as a static
-/// initializer the cast is a relocation (6.6p9).
-///
-/// Typed as the function itself, the conversion read a value with no width:
-/// on x86-64 `(long)h` kept the low 32 bits of the address, `(_Bool)h` was an
-/// internal compiler error, and `long l = (long)h;` at file scope was rejected
-/// as "the value of a variable". `full` is the address read back through a
-/// `volatile` pointer, which no conversion touches.
-#[test]
-fn codegen_function_and_array_convert_from_their_address() {
-    let src = r#"
-#include <stdint.h>
-#include <stdarg.h>
-
-__attribute__((aligned(256))) static long h(void) { return 7; }
-static long g(void) { return 9; }
-static int arr[4] __attribute__((aligned(256))) = {1, 2, 3, 4};
-
-static long via_mem(long (*volatile *pp)(void)) { return (long)*pp; }
-static long arr_via_mem(int *volatile *pp) { return (long)*pp; }
-
-static long take_long(long x) { return x; }
-static long take_var(int n, ...) {
-    va_list ap;
-    va_start(ap, n);
-    long v = (long)va_arg(ap, long (*)(void));
-    va_end(ap);
-    return v;
-}
-static long take_old();
-static _Bool ret_bool_h(void) { return h; }
-static _Bool ret_bool_arr(void) { return arr; }
-static _Bool take_bool(_Bool b) { return b; }
-
-static long file_scope_h = (long)h;
-static uintptr_t file_scope_u = (uintptr_t)h;
-static long file_scope_arr = (long)arr;
-static uintptr_t file_scope_str = (uintptr_t)"str";
-static _Bool file_scope_bool = (_Bool)h;
-
-int main(void) {
-    long (*volatile fp)(void) = h;
-    int *volatile ap = arr;
-    long full = via_mem(&fp);
-    long afull = arr_via_mem(&ap);
-
-    if ((long)h != full) return 1;
-    if ((unsigned long)h != (unsigned long)full) return 2;
-    if ((uintptr_t)h != (uintptr_t)full) return 3;
-    if ((int)h != (int)full) return 4;
-    if ((_Bool)h != 1) return 5;
-    if ((void *)h != (void *)full) return 6;
-    if ((char *)h != (char *)full) return 7;
-    if ((long)arr != afull) return 8;
-    if ((uintptr_t)arr != (uintptr_t)afull) return 9;
-    if (((long)h >> 32) != (full >> 32)) return 10;
-    if (take_long((long)h) != full) return 11;
-    if (take_var(1, h) != full) return 12;
-    if (take_old(h) != full) return 13;
-    if (file_scope_h != full) return 14;
-    if (file_scope_u != (uintptr_t)full) return 15;
-    if (file_scope_arr != afull) return 16;
-    if (file_scope_str == 0 || !file_scope_bool) return 17;
-    void *p = (void *)full;
-    if (!(h == (long (*)(void))p) || !((void *)h == p)) return 18;
-    volatile int c = 1;
-    if ((long)(c ? h : g) != full) return 19;
-    c = 0;
-    if ((long)(c ? h : g) == full) return 20;
-    if ((long)&*h != full || (long)*h != full) return 21;
-    if ((short)h != (short)full || (unsigned char)arr != (unsigned char)afull) return 22;
-    if ((long long)h != (long long)full) return 23;
-    _Bool b = h;
-    if (!b) return 24;
-    b = arr;
-    if (!b || !(_Bool)arr) return 25;
-    if (!ret_bool_h() || !ret_bool_arr()) return 26;
-    if (!take_bool(h) || !take_bool(arr)) return 27;
-    if (sizeof(&h) != sizeof(void *) || sizeof arr != 4 * sizeof(int)) return 28;
-    if (h() + g() != 16) return 29;
-    return 0;
-}
-static long take_old(x) long (*x)(void); { return (long)x; }
-"#;
-    compile_and_run_everywhere("fn_array_convert_from_address", src);
-}
-
-/// A function designator or an array passed to a `_Bool` parameter, or
-/// converted to `_Bool` at any other site, is converted from the address it
-/// decays to: true, since no function or object is at the null address.
-///
-/// The argument path decayed the operand and then passed the pointer with no
-/// conversion to the parameter's type, so at -O0 the callee read the
-/// address's low byte -- zero for anything aligned to 256, which is why the
-/// `_Bool` checks above are aligned that way. A static `_Bool` initialized
-/// with an array or a function stored the same low byte.
-#[test]
-fn codegen_decaying_operand_converts_to_bool_from_its_address() {
-    let src = r#"
-__attribute__((aligned(256))) static long h(void) { return 7; }
-static int arr[4] __attribute__((aligned(256))) = {1, 2, 3, 4};
-static int grid[2][64] __attribute__((aligned(256)));
-struct holder { int a[64]; } __attribute__((aligned(256))) hold;
-__attribute__((noinline)) static _Bool take_bool(_Bool b) { return b; }
-__attribute__((noinline)) static int take_two(int n, _Bool b) { return n + b; }
-static _Bool ret_h(void) { return h; }
-static _Bool ret_arr(void) { return arr; }
-struct flags { _Bool f; };
-_Bool file_scope_arr = (_Bool)arr;
-
-int main(void) {
-    if (!take_bool(h)) return 1;
-    if (!take_bool(arr)) return 2;
-    if (!take_bool("str")) return 3;
-    if (!take_bool(grid[1])) return 4;
-    if (!take_bool(hold.a)) return 5;
-    if (!take_bool((int[]){0})) return 6;
-    if (take_two(1, h) != 2 || take_two(2, arr) != 3) return 7;
-    if (!ret_h() || !ret_arr()) return 8;
-    _Bool b = h;
-    if (!b) return 9;
-    b = 0;
-    b = arr;
-    if (!b) return 10;
-    _Bool bs[3] = { h, arr, "x" };
-    if (!bs[0] || !bs[1] || !bs[2]) return 11;
-    struct flags s = { arr };
-    if (!s.f) return 12;
-    _Bool cl = (_Bool){ h };
-    if (!cl) return 13;
-    _Atomic _Bool ab = 0;
-    ab = arr;
-    if (!ab) return 14;
-    struct flags ss = { .f = grid[0] };
-    if (!ss.f) return 15;
-    _Bool (*fp)(_Bool) = take_bool;
-    if (!fp(arr) || !fp(h)) return 16;
-    if (!file_scope_arr) return 17;
-    return 0;
-}
-"#;
-    compile_and_run_everywhere("decaying_operand_to_bool", src);
-}
-
 /// GNU C rejects a static `_Bool` initialized with a bare array or function,
 /// as not computable at load time; c17 folds it as the cast form folds,
 /// since an address constant is never null.
@@ -1684,78 +1720,4 @@ int main(void) {
 }
 "#;
     compile_and_run_everywhere("static_bool_from_address", src);
-}
-
-/// An element or member of a `const` object whose initializer folded is
-/// folded in a static initializer, as the object named whole is -- gcc does
-/// both. The subscript or member access was taken as an address, so
-/// `int w = a[0];` was initialized with eight bytes of relocation to `a`.
-#[test]
-fn codegen_const_subobject_folds_in_a_static_initializer() {
-    let src = r#"
-struct P { int x; double d; short v[3]; };
-const int a[3] = {1, 2, 3};
-const struct P p = { 4, 2.5, { 7, 8 } };
-const struct P ps[2] = { { 1, 0.5, {0} }, { 9, 1.25, { 5, 6, 7 } } };
-const double da[2] = { 1.5, 3.5 };
-int w0 = a[0], w2 = a[2] + 1;
-long wx = p.x;
-double wd = p.d * 2;
-int wv = p.v[1];
-int ww = ps[1].v[2] + ps[1].x;
-double wf = da[1];
-float wq = ps[1].d;
-int main(void) {
-    if (w0 != 1 || w2 != 4 || wx != 4 || wd != 5.0) return 1;
-    if (wv != 8 || ww != 16 || wf != 3.5 || wq != 1.25f) return 2;
-    return 0;
-}
-"#;
-    compile_and_run_everywhere("const_subobject_static_init", src);
-}
-
-/// An address does not fit an integer object narrower than a pointer, so it
-/// is no initializer for one -- gcc's "not computable at load time". The
-/// relocation was emitted as eight bytes over the one- or four-byte object.
-#[test]
-fn codegen_address_into_a_narrow_integer_is_not_a_static_initializer() {
-    let what = "cannot initialize an object with static storage duration";
-    for (name, src) in [
-        (
-            "narrow_addr_char",
-            "static int arr[4];\nchar k = (long)arr;\n",
-        ),
-        (
-            "narrow_addr_int",
-            "static int arr[4];\nint j = (long)arr + 1;\n",
-        ),
-        ("narrow_addr_fn", "long h(void);\nshort s = (long)&h;\n"),
-    ] {
-        compile_expect_error(name, src, what);
-    }
-}
-
-/// The x86-64 shape of the defect above, where a non-PIE link would put the
-/// function below 4 GiB and hide it: the address loaded from the GOT is the
-/// value, with no 32-bit move between.
-#[test]
-fn codegen_function_cast_to_integer_keeps_the_whole_address() {
-    use crate::codegen::asm_probe::{asm_for_with, body_of, X86_64_LINUX};
-    let src = "long h(void);\nlong a(void) { return (long)h; }\n";
-    let asm = asm_for_with("fn_cast_width", X86_64_LINUX, src, &["-O0"]);
-    let body = body_of(&asm, "a");
-    assert!(!body.contains("movl"), "{body}");
-}
-
-/// The name of an object that does not decay is its *value*, which is not a
-/// constant expression (C17 6.6p9). Deciding by the type being initialized
-/// rather than the name's own type made `int *q = p;` initialize `q` with
-/// the address of `p`.
-#[test]
-fn codegen_pointer_object_value_is_not_a_static_initializer() {
-    compile_expect_error(
-        "ptr_value_static_init",
-        "int x;\nint *p = &x;\nint *q = p;\n",
-        "is not a constant expression",
-    );
 }

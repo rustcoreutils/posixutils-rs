@@ -10,16 +10,13 @@
 //
 
 use crate::common::{
-    aarch64_cross_available, asm_for_at, compile_and_run, compile_expect_error,
-    compile_expect_warning, compile_expect_warning_with, interop_aarch64, interop_host,
-    AARCH64_TARGET_ARGS,
+    aarch64_cross_available, asm_for_at, compile_and_run, interop_aarch64, interop_host,
 };
 
 const CALLEE: &str = r#"
-#define MS __attribute__((ms_abi))
+/* `MS` and `struct S24` are TYPES's, which precedes this unit. */
 struct S8 { int x, y; };
 struct S12 { int a, b, c; };
-struct S24 { long p, q, r; };
 MS long add6(long a, long b, long c, long d, long e, long f) {
     return a + 2 * b + 3 * c + 4 * d + 5 * e + 6 * f;
 }
@@ -49,10 +46,9 @@ MS double pressure(long n, double x) {
 "#;
 
 const CALLER: &str = r#"
-#define MS __attribute__((ms_abi))
+/* `MS` and `struct S24` are TYPES's, which precedes this unit. */
 struct S8 { int x, y; };
 struct S12 { int a, b, c; };
-struct S24 { long p, q, r; };
 MS long add6(long, long, long, long, long, long);
 MS double mixf(int, double, int, double, float, double);
 MS long by_value(struct S8, struct S12, char, short);
@@ -69,7 +65,7 @@ static double ref_pressure(long n, double x) {
     }
     return (double)(a + b + c + d + e + f + g + h) + p + q + r + s + t + u + v + w;
 }
-int main(void) {
+static int run_basic(void) {
     struct S8 s8 = { 1, 2 };
     struct S12 s12 = { 3, 4, 5 };
     if (add6(1, 2, 3, 4, 5, 6) != 91) return 1;
@@ -104,25 +100,6 @@ int main(void) {
     return 0;
 }
 "#;
-
-/// An `ms_abi` function is called with the Microsoft x64 convention: the
-/// first four arguments by *position* in rcx/rdx/r8/r9 or xmm0-xmm3, the
-/// caller's 32-byte shadow space, an aggregate of 1, 2, 4 or 8 bytes in a
-/// register and any other by reference, a larger return through a hidden
-/// pointer in rcx, and rsi, rdi and xmm6-xmm15 preserved across the call.
-///
-/// c17 accepted the attribute and used System V for all of it, so every
-/// pairing with gcc read its arguments from the wrong registers. Each side is
-/// a separate translation unit, built by c17 and by gcc in every pairing; the
-/// `pressure` calls hold enough values live that gcc keeps its own in the
-/// registers Win64 makes callee-saved.
-#[test]
-fn codegen_ms_abi_interoperates_with_gcc() {
-    if !cfg!(target_arch = "x86_64") {
-        return;
-    }
-    interop_host("ms_abi", CALLEE, CALLER);
-}
 
 /// The declarations every interop pair below shares.
 const TYPES: &str = r#"
@@ -225,7 +202,7 @@ MS _Bool t_bool(_Bool, unsigned char, short);
 MS long t_add6(long, long, long, long, long, long);
 MS long t_call6(MS long (*)(long, long, long, long, long, long), long);
 MS long t_aligned(long, double);
-int main(void) {
+static int run_types(void) {
     struct S3 s3 = { 1, 2, 3 };
     if (t_s3(s3, 4) != 4321) return 1;
     if (t_s3_mod(s3) != 101 || s3.a != 1) return 2;
@@ -265,28 +242,6 @@ int main(void) {
     return 0;
 }
 "#;
-
-/// Every class the Microsoft convention distinguishes, against gcc in each
-/// direction: aggregates of 1, 2, 4 and 8 bytes in a register whatever their
-/// members, every other size by reference to a copy the callee may write --
-/// in a register position and past the fourth, where the position holds a
-/// pointer -- the hidden return pointer ahead of four more arguments, and
-/// the wide scalars: `long double`, `__int128` (returned whole in XMM0),
-/// complex values, `_Float16` (in the integer position, as gcc has it) and
-/// `__float128`. `long double` and `_Float16` are not cross-checked on Apple,
-/// whose compiler lowers them differently, and `__float128` is absent there;
-/// see the note in `TYPES_CALLEE`.
-#[test]
-fn codegen_ms_abi_types_interoperate_with_gcc() {
-    if !cfg!(target_arch = "x86_64") {
-        return;
-    }
-    interop_host(
-        "ms_abi_types",
-        &format!("{TYPES}{TYPES_CALLEE}"),
-        &format!("{TYPES}{TYPES_CALLER}"),
-    );
-}
 
 const VARIADIC_CALLEE: &str = r#"
 MS int t_vsum(int n, ...) {
@@ -340,7 +295,7 @@ MS int t_vsum(int, ...);
 MS double t_vmix(int, ...);
 MS double t_vnamed(double, int, ...);
 MS long t_vfwd(int, ...);
-int main(void) {
+static int run_variadic(void) {
     if (t_vsum(6, 1, 2, 3, 4, 5, 6) != 21) return 1;
     struct S8f q = { 0.5f, 0.25f };
     if (t_vmix(5, 1.0, 2.0, 3.0, 4.0, 5.0, q) != 1 + 4 + 9 + 16 + 25 + 0.75 + 1.0) return 2;
@@ -349,24 +304,6 @@ int main(void) {
     return 0;
 }
 "#;
-
-/// A variadic `ms_abi` function, defined with `__builtin_ms_va_list` and
-/// called with floating-point arguments, which travel in both register files
-/// for the first four positions -- the callee reads every position from
-/// memory, the integer registers spilled to its shadow area. gcc reads a
-/// by-reference type out of the position itself when it walks the list, so
-/// only by-value types are asked for here.
-#[test]
-fn codegen_ms_abi_variadic_interoperates_with_gcc() {
-    if !cfg!(target_arch = "x86_64") {
-        return;
-    }
-    interop_host(
-        "ms_abi_variadic",
-        &format!("{TYPES}{VARIADIC_CALLEE}"),
-        &format!("{TYPES}{VARIADIC_CALLER}"),
-    );
-}
 
 const PRESERVE_CALLEE: &str = r#"
 #define MS __attribute__((ms_abi))
@@ -443,7 +380,7 @@ static double expect(long n, double d) {
     double p = d * 2, q = d + 3, r = d - 1, s = d * d, t = d + 0.5;
     return (double)(a + b + c + e + f + (n + 1)) + p + q + r + s + t;
 }
-int main(void) {
+static int run_preserve(void) {
     /* Enough values live across each call that the caller keeps some in
        the registers Win64 makes callee-saved. */
     double f0 = 1, f1 = 2, f2 = 3, f3 = 4, f4 = 5, f5 = 6, f6 = 7, f7 = 8;
@@ -466,17 +403,78 @@ int main(void) {
 }
 "#;
 
+/// The caller unit's `main`: each consolidated test's checks, run in turn,
+/// with a distinct range of exit codes for each.
+const MS_MAIN: &str = r#"
+int main(void) {
+    int r;
+    if ((r = run_basic()) != 0) return 10 + r;
+    if ((r = run_types()) != 0) return 20 + r;
+    if ((r = run_variadic()) != 0) return 40 + r;
+    if ((r = run_preserve()) != 0) return 50 + r;
+    return 0;
+}
+"#;
+
+/// Every `ms_abi` interop pairing against gcc, in one callee unit and one
+/// caller unit -- `interop_host` builds each side with c17 and with the host
+/// compiler, in every pairing. Consolidates four tests, whose documentation
+/// follows; the caller's exit codes are 11..=18 for the first, 21..=37 for
+/// the second, 41..=44 for the third and 51..=53 for the fourth.
+///
+/// `codegen_ms_abi_interoperates_with_gcc`:
+///
+/// An `ms_abi` function is called with the Microsoft x64 convention: the
+/// first four arguments by *position* in rcx/rdx/r8/r9 or xmm0-xmm3, the
+/// caller's 32-byte shadow space, an aggregate of 1, 2, 4 or 8 bytes in a
+/// register and any other by reference, a larger return through a hidden
+/// pointer in rcx, and rsi, rdi and xmm6-xmm15 preserved across the call.
+///
+/// c17 accepted the attribute and used System V for all of it, so every
+/// pairing with gcc read its arguments from the wrong registers. Each side is
+/// a separate translation unit, built by c17 and by gcc in every pairing; the
+/// `pressure` calls hold enough values live that gcc keeps its own in the
+/// registers Win64 makes callee-saved.
+///
+/// `codegen_ms_abi_types_interoperate_with_gcc`:
+///
+/// Every class the Microsoft convention distinguishes, against gcc in each
+/// direction: aggregates of 1, 2, 4 and 8 bytes in a register whatever their
+/// members, every other size by reference to a copy the callee may write --
+/// in a register position and past the fourth, where the position holds a
+/// pointer -- the hidden return pointer ahead of four more arguments, and
+/// the wide scalars: `long double`, `__int128` (returned whole in XMM0),
+/// complex values, `_Float16` (in the integer position, as gcc has it) and
+/// `__float128`. `long double` and `_Float16` are not cross-checked on Apple,
+/// whose compiler lowers them differently, and `__float128` is absent there;
+/// see the note in `TYPES_CALLEE`.
+///
+/// `codegen_ms_abi_variadic_interoperates_with_gcc`:
+///
+/// A variadic `ms_abi` function, defined with `__builtin_ms_va_list` and
+/// called with floating-point arguments, which travel in both register files
+/// for the first four positions -- the callee reads every position from
+/// memory, the integer registers spilled to its shadow area. gcc reads a
+/// by-reference type out of the position itself when it walks the list, so
+/// only by-value types are asked for here.
+///
+/// `codegen_ms_abi_preserves_registers_across_sysv_calls`:
+///
 /// An `ms_abi` function calling System V code: the callee may destroy RSI,
 /// RDI and XMM6-XMM15, which the `ms_abi` function's own caller expects
 /// back, so it saves and restores them -- whole XMM registers. The System V
 /// function clobbers all of them, and the caller keeps values live across
 /// the `ms_abi` call; with c17 on either side, and gcc on the other.
 #[test]
-fn codegen_ms_abi_preserves_registers_across_sysv_calls() {
+fn codegen_ms_abi_interoperates_with_gcc() {
     if !cfg!(target_arch = "x86_64") {
         return;
     }
-    interop_host("ms_abi_preserve", PRESERVE_CALLEE, PRESERVE_CALLER);
+    interop_host(
+        "ms_abi",
+        &format!("{TYPES}{CALLEE}{TYPES_CALLEE}{VARIADIC_CALLEE}{PRESERVE_CALLEE}"),
+        &format!("{TYPES}{CALLER}{TYPES_CALLER}{VARIADIC_CALLER}{PRESERVE_CALLER}{MS_MAIN}"),
+    );
 }
 
 /// Both conventions in one translation unit, so the inliner meets them: an
@@ -490,7 +488,8 @@ fn codegen_ms_abi_inlines_across_conventions() {
     if !cfg!(target_arch = "x86_64") {
         return;
     }
-    let src = format!("{TYPES}{TYPES_CALLEE}{}", TYPES_CALLER);
+    let src =
+        format!("{TYPES}{TYPES_CALLEE}{TYPES_CALLER}int main(void) {{ return run_types(); }}\n");
     for opt in ["-O0", "-O1", "-O2", "-O3"] {
         assert_eq!(
             compile_and_run(
@@ -502,7 +501,9 @@ fn codegen_ms_abi_inlines_across_conventions() {
             "{opt}"
         );
     }
-    let src = format!("{TYPES}{VARIADIC_CALLEE}{VARIADIC_CALLER}");
+    let src = format!(
+        "{TYPES}{VARIADIC_CALLEE}{VARIADIC_CALLER}int main(void) {{ return run_variadic(); }}\n"
+    );
     assert_eq!(
         compile_and_run(
             "ms_abi_inline_va",
@@ -510,51 +511,6 @@ fn codegen_ms_abi_inlines_across_conventions() {
             &["-DC17_ALONE".to_string(), "-O2".to_string()]
         ),
         0
-    );
-}
-
-/// The convention is part of the function type: a pointer to an `ms_abi`
-/// function and one to an ordinary function are incompatible, as gcc warns,
-/// and a redeclaration that changes the convention conflicts.
-#[test]
-fn codegen_ms_abi_function_types_are_distinct() {
-    if !cfg!(target_arch = "x86_64") {
-        return;
-    }
-    compile_expect_warning(
-        "ms_abi_ptr",
-        "long s(long);\n\
-         typedef __attribute__((ms_abi)) long (*msfp)(long);\n\
-         msfp p = s;\n",
-        "incompatible pointer type",
-    );
-    compile_expect_warning(
-        "ms_abi_ptr_rev",
-        "__attribute__((ms_abi)) long m(long);\n\
-         long (*p)(long) = m;\n",
-        "incompatible pointer type",
-    );
-    compile_expect_error(
-        "ms_abi_redecl",
-        "__attribute__((ms_abi)) long m(long);\n\
-         long m(long x) { return x; }\n",
-        "conflicting types",
-    );
-    compile_expect_error(
-        "ms_abi_both",
-        "__attribute__((ms_abi, sysv_abi)) long m(long);\n",
-        "'ms_abi' and 'sysv_abi' attributes are not compatible",
-    );
-    compile_expect_warning(
-        "ms_abi_object",
-        "__attribute__((ms_abi)) int x;\n",
-        "'ms_abi' attribute only applies to function types",
-    );
-    compile_expect_error(
-        "ms_abi_va_start",
-        "__attribute__((ms_abi)) int f(int n, ...) {\n\
-         __builtin_va_list ap; __builtin_va_start(ap, n); return 0; }\n",
-        "'va_start' used in Win64 ABI function",
     );
 }
 
@@ -601,18 +557,9 @@ int main(void) {
 /// against gcc in every pairing.
 #[test]
 fn codegen_ms_abi_is_ignored_on_aarch64() {
-    let src = "__attribute__((ms_abi)) long f(long a);\n\
-               __attribute__((sysv_abi)) long g(long a);\n";
-    let mut args: Vec<String> = AARCH64_TARGET_ARGS.iter().map(|s| s.to_string()).collect();
-    let stderr = compile_expect_warning_with("ms_abi_a64", src, &args);
-    assert!(
-        stderr.contains("'ms_abi' attribute directive ignored")
-            && stderr.contains("'sysv_abi' attribute directive ignored"),
-        "{stderr}"
-    );
-    args.push("-Wno-attributes".to_string());
-    let quiet = compile_expect_warning_with("ms_abi_a64_quiet", src, &args);
-    assert!(!quiet.contains("ms_abi"), "{quiet}");
+    // The warning, and `-Wno-attributes` silencing it, compile in process:
+    // `codegen_ms_abi_is_ignored_on_aarch64_with_a_warning` in
+    // `cc/test_asm/codegen_ms_abi.rs`.
     if !aarch64_cross_available() {
         eprintln!("skipping the aarch64 run: no cross toolchain");
         return;

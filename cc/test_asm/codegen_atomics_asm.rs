@@ -15,7 +15,8 @@
 //
 
 use super::asm_probe::{
-    asm_for, assert_body_contains, assert_body_lacks, count_in_body, AARCH64_LINUX, X86_64_LINUX,
+    asm_for, assert_body_contains, assert_body_lacks, body_of, count_in_body, AARCH64_LINUX,
+    X86_64_LINUX,
 };
 
 /// Source exercising each operand width through the RMW path.
@@ -135,13 +136,13 @@ int f(void) { return __c11_atomic_fetch_or(&g, 8, __ATOMIC_SEQ_CST); }
         count_in_body(&asm, "f", "ldaxr"),
         1,
         "expected exactly one load-exclusive in:\n{}",
-        super::asm_probe::body_of(&asm, "f")
+        body_of(&asm, "f")
     );
     assert_eq!(
         count_in_body(&asm, "f", "stlxr"),
         1,
         "expected exactly one store-exclusive in:\n{}",
-        super::asm_probe::body_of(&asm, "f")
+        body_of(&asm, "f")
     );
 }
 
@@ -254,7 +255,7 @@ int sum(void) { return x + y; }
 "#;
 
     let asm = asm_for("atomic_distinct_arm", AARCH64_LINUX, src);
-    let body = super::asm_probe::body_of(&asm, "sum");
+    let body = body_of(&asm, "sum");
     // Both loads are still ldar into the fixed register...
     assert_eq!(
         body.matches("ldar").count(),
@@ -270,7 +271,7 @@ int sum(void) { return x + y; }
     );
 
     let asm = asm_for("atomic_distinct_x86", X86_64_LINUX, src);
-    let body = super::asm_probe::body_of(&asm, "sum");
+    let body = body_of(&asm, "sum");
     assert!(
         !body.contains("addl %eax, %eax") && !body.contains("add %eax, %eax"),
         "the two atomic results aliased in RAX:\n{body}"
@@ -297,7 +298,7 @@ void set_param(float v) { f = v; }
     // 1.5 as an IEEE double is 0x3FF8000000000000; the high half is 0x3FF8,
     // 16376 << 48, which is the only non-zero halfword, so a single
     // `movz ..., lsl #48` (or a `movk` after one) materializes it.
-    let body = super::asm_probe::body_of(&asm, "set_const");
+    let body = body_of(&asm, "set_const");
     assert!(
         (body.contains("movz") || body.contains("movk")) && body.contains("16376"),
         "the constant's bit pattern must be materialized, not replaced by zero:\n{body}"
@@ -332,7 +333,7 @@ _Atomic int a;
 void mul(int n) { volatile char buf[n]; buf[0] = 0; a *= 3; }
 "#;
     let asm = asm_for("cas_temp_arm", AARCH64_LINUX, src);
-    let body = super::asm_probe::body_of(&asm, "mul");
+    let body = body_of(&asm, "mul");
 
     // The VLA moves SP, which is what makes a mismatch observable.
     assert!(
@@ -363,7 +364,7 @@ _Atomic double ad;
 double get(void) { return ad; }
 "#;
     let asm = asm_for("atomic_double_load_arm", AARCH64_LINUX, src);
-    let body = super::asm_probe::body_of(&asm, "get");
+    let body = body_of(&asm, "get");
     assert!(
         body.contains("ldar x9"),
         "expected an acquire load:\n{body}"

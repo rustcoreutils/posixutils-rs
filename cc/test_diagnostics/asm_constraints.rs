@@ -20,7 +20,7 @@
 // any host.
 //
 
-use crate::common::{compile_rejected_with, create_c_file, run_c17};
+use crate::test_compile::{compile, compile_rejected_with};
 
 pub(super) const X86: [&str; 2] = ["--target", "x86_64-unknown-linux-gnu"];
 pub(super) const A64: [&str; 2] = ["--target", "aarch64-unknown-linux-gnu"];
@@ -36,7 +36,8 @@ pub(super) fn expect_rejected(
     wanted: &str,
     line: u32,
 ) {
-    let stderr = compile_rejected_with(&format!("{name}{opt}"), src, &[target[0], target[1], opt]);
+    let target_flag = target_flag(target);
+    let stderr = compile_rejected_with(&format!("{name}{opt}"), src, &[&target_flag, opt]);
     assert!(
         stderr.contains(wanted),
         "{name} {} {opt}: expected {wanted:?}, got:\n{stderr}",
@@ -52,21 +53,18 @@ pub(super) fn expect_rejected(
 /// Compile `src` for `target` at `opt`, require it to be accepted, and return
 /// the assembly.
 pub(super) fn expect_accepted(name: &str, src: &str, target: [&str; 2], opt: &str) -> String {
-    let c = create_c_file(&format!("{name}{opt}"), src);
-    let path = c.path().to_string_lossy().to_string();
-    let out = plib::tmp::Builder::new()
-        .prefix(&format!("c17_asmc_{name}_"))
-        .suffix(".s")
-        .tempfile()
-        .expect("temp file");
-    let out_path = out.path().to_string_lossy().to_string();
-    let run = run_c17(&[target[0], target[1], opt, "-S", "-o", &out_path, &path]);
+    let run = compile(&format!("{name}{opt}"), src, &[&target_flag(target), opt]);
     assert!(
         run.success,
         "{name} {} {opt} should compile:\n{}",
         target[1], run.stderr
     );
-    std::fs::read_to_string(&out_path).expect("read assembly")
+    run.asm.expect("assembly of a successful compile")
+}
+
+/// `target` as the one `--target=TRIPLE` option the in-process compile takes.
+fn target_flag(target: [&str; 2]) -> String {
+    format!("{}={}", target[0], target[1])
 }
 
 pub(super) const IMPOSSIBLE: &str = "impossible constraint in 'asm'";
@@ -87,7 +85,7 @@ fn asm_immediate_operand_that_is_a_variable() {
         expect_rejected("asm_n_var_a64", &n, A64, opt, IMPOSSIBLE, 3);
     }
     // The message says what the operand must be.
-    let stderr = compile_rejected_with("asm_n_var_msg", &n, &X86);
+    let stderr = compile_rejected_with("asm_n_var_msg", &n, &[&target_flag(X86)]);
     assert!(
         stderr.contains("operand 0 must be an integer constant for \"n\""),
         "{stderr}"

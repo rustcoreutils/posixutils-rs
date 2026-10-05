@@ -17,9 +17,28 @@ use crate::common::compile_and_run;
 // Mega-test: C89 functions (pointers, calls, recursion)
 // ============================================================================
 
+/// C89 functions, with every other matrix-level single-program test of this
+/// file, as one program; each section keeps its original test name and doc
+/// comment, and the exit-code table is at the top.
+///
+/// Consolidates: c89_functions_mega, c89_functions_return_type_conversion,
+/// c89_functions_int_arg_sign_extension, c89_functions_deref_funcptr_noop,
+/// c89_functions_ternary_int_promotion and c89_functions_64bit_conditional.
 #[test]
 fn c89_functions_mega() {
     let code = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1- 63  c89_functions_mega
+ *    71- 80  c89_functions_return_type_conversion
+ *    91- 96  c89_functions_int_arg_sign_extension
+ *   101-103  c89_functions_deref_funcptr_noop
+ *   111-112  c89_functions_ternary_int_promotion
+ *   121-122  c89_functions_64bit_conditional
+ */
+
+/* ---- c89_functions_mega (exit codes 1-63) ----
+ */
 // Basic functions
 int add(int a, int b) { return a + b; }
 int sub(int a, int b) { return a - b; }
@@ -85,7 +104,7 @@ int calc(struct Calculator *c) {
     return c->op(c->a, c->b);
 }
 
-int main(void) {
+static int t_c89_functions_mega(void) {
     // ========== BASIC FUNCTION CALLS (returns 1-19) ==========
     {
         // Direct calls
@@ -211,15 +230,13 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c89_functions_mega", code, &[]), 0);
-}
 
-/// Test that return statements properly convert expression types to function return type
-/// This tests a bug where `return -1` in a `long long` function returned 0xFFFFFFFF instead of -1
-#[test]
-fn c89_functions_return_type_conversion() {
-    let code = r#"
+
+/* ---- c89_functions_return_type_conversion (exit codes 71-80) ----
+ *
+ *  Test that return statements properly convert expression types to function return type
+ *  This tests a bug where `return -1` in a `long long` function returned 0xFFFFFFFF instead of -1
+ */
 typedef long long Py_ssize_t;
 #define DKIX_EMPTY (-1)
 
@@ -263,7 +280,7 @@ static unsigned long long return_uint(void) {
     return (unsigned int)0xFFFFFFFF;  // Should stay 0xFFFFFFFF
 }
 
-int main(void) {
+static int t_c89_functions_return_type_conversion(void) {
     // Test direct -1 return
     Py_ssize_t r1 = return_minus_one();
     if (r1 != -1) return 1;
@@ -290,25 +307,21 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("c89_functions_return_type_conversion", code, &[]),
-        0
-    );
-}
+#undef DKIX_EMPTY
 
-/// Bug P: literal int -1 passed to long parameter must be sign-extended to 64 bits.
-/// Without the fix, -1 (int 0xFFFFFFFF) arrives as 0x00000000FFFFFFFF (positive)
-/// instead of 0xFFFFFFFFFFFFFFFF (-1L).
-#[test]
-fn c89_functions_int_arg_sign_extension() {
-    let code = r#"
+
+/* ---- c89_functions_int_arg_sign_extension (exit codes 91-96) ----
+ *
+ *  Bug P: literal int -1 passed to long parameter must be sign-extended to 64 bits.
+ *  Without the fix, -1 (int 0xFFFFFFFF) arrives as 0x00000000FFFFFFFF (positive)
+ *  instead of 0xFFFFFFFFFFFFFFFF (-1L).
+ */
 long check_long(long x) { return (x == -1L) ? 0 : 1; }
 long check_two(long a, long b) { return (a == -1L && b == 42L) ? 0 : 1; }
 typedef long ssize_t_like;
 ssize_t_like identity(ssize_t_like x) { return x; }
 
-int main() {
+static int t_c89_functions_int_arg_sign_extension(void) {
     /* literal int -1 to long parameter */
     if (check_long(-1)) return 1;
     /* explicit cast (should always work) */
@@ -324,25 +337,20 @@ int main() {
     if (identity(-2) != -2L) return 6;
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("c89_functions_int_arg_sign_extension", code, &[]),
-        0
-    );
-}
 
-/// Bug Q: dereferencing a function pointer is a no-op in C (C99 6.5.3.2).
-/// *func_ptr == func_ptr. Without the fix, c17 emitted a load instruction
-/// that read the first byte of the function's code as a value.
-#[test]
-fn c89_functions_deref_funcptr_noop() {
-    let code = r#"
+
+/* ---- c89_functions_deref_funcptr_noop (exit codes 101-103) ----
+ *
+ *  Bug Q: dereferencing a function pointer is a no-op in C (C99 6.5.3.2).
+ *  *func_ptr == func_ptr. Without the fix, c17 emitted a load instruction
+ *  that read the first byte of the function's code as a value.
+ */
 int add_one(int x) { return x + 1; }
 typedef int (*func_t)(int);
 
 struct TypeObj { func_t fp; };
 
-int main() {
+static int t_c89_functions_deref_funcptr_noop(void) {
     /* basic deref of function pointer */
     func_t f = *add_one;
     if (f(10) != 11) return 1;
@@ -358,54 +366,44 @@ int main() {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("c89_functions_deref_funcptr_noop", code, &[]),
-        0
-    );
-}
 
-/// Bug R (partial): ternary expression must promote narrower operand to result type.
-/// `long_val ? long_count : -1` where -1 is int (32-bit) must be sign-extended
-/// to Py_ssize_t (64-bit) before cmov/phi. Without fix, -1 becomes 0x00000000FFFFFFFF.
-#[test]
-fn c89_functions_ternary_int_promotion() {
-    let code = r#"
-typedef long Py_ssize_t;
-typedef unsigned char Py_UCS1;
 
-static Py_ssize_t default_find(const Py_UCS1 *s, Py_ssize_t n,
-    const Py_UCS1 *p, Py_ssize_t m, int mode) {
-    Py_ssize_t count = 0;
+/* ---- c89_functions_ternary_int_promotion (exit codes 111-112) ----
+ *
+ *  Bug R (partial): ternary expression must promote narrower operand to result type.
+ *  `long_val ? long_count : -1` where -1 is int (32-bit) must be sign-extended
+ *  to Py_ssize_t (64-bit) before cmov/phi. Without fix, -1 becomes 0x00000000FFFFFFFF.
+ */
+typedef long tp_Py_ssize_t;
+typedef unsigned char tp_Py_UCS1;
+
+static tp_Py_ssize_t default_find(const tp_Py_UCS1 *s, tp_Py_ssize_t n,
+    const tp_Py_UCS1 *p, tp_Py_ssize_t m, int mode) {
+    tp_Py_ssize_t count = 0;
     /* ... search logic would go here, but we simulate not-found ... */
     (void)s; (void)n; (void)p; (void)m;
     return mode == 2 ? count : -1;
 }
 
-int main() {
-    Py_ssize_t r = default_find((const Py_UCS1*)"ab", 2, (const Py_UCS1*)"xy", 2, 1);
+static int t_c89_functions_ternary_int_promotion(void) {
+    tp_Py_ssize_t r = default_find((const tp_Py_UCS1*)"ab", 2, (const tp_Py_UCS1*)"xy", 2, 1);
     if (r != -1L) return 1;
     /* Also test the count path */
-    r = default_find((const Py_UCS1*)"ab", 2, (const Py_UCS1*)"xy", 2, 2);
+    r = default_find((const tp_Py_UCS1*)"ab", 2, (const tp_Py_UCS1*)"xy", 2, 2);
     if (r != 0) return 2;
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("c89_functions_ternary_int_promotion", code, &[]),
-        0
-    );
-}
 
-/// Bug R (continued): conditional branch on 64-bit AND result must use testq, not testl.
-/// When `if (value & MASK)` where both are 64-bit (size_t), and the non-zero
-/// bits are only in the upper 32 bits, testl (32-bit test) would see zero
-/// and not take the branch.
-#[test]
-fn c89_functions_64bit_conditional() {
-    let code = r#"
+
+/* ---- c89_functions_64bit_conditional (exit codes 121-122) ----
+ *
+ *  Bug R (continued): conditional branch on 64-bit AND result must use testq, not testl.
+ *  When `if (value & MASK)` where both are 64-bit (size_t), and the non-zero
+ *  bits are only in the upper 32 bits, testl (32-bit test) would see zero
+ *  and not take the branch.
+ */
 typedef unsigned long size_t;
-int main() {
+static int t_c89_functions_64bit_conditional(void) {
     /* Simulate: 8-byte chunk with 0xc2 in the high byte */
     size_t value = 0xc261616161616161UL;
     size_t mask  = 0x8080808080808080UL;
@@ -415,11 +413,26 @@ int main() {
     if (!(value & mask)) return 2;
     return 0;
 }
+
+int main(void)
+{
+    int r;
+    if ((r = t_c89_functions_mega()) != 0)
+        return 0 + r;
+    if ((r = t_c89_functions_return_type_conversion()) != 0)
+        return 70 + r;
+    if ((r = t_c89_functions_int_arg_sign_extension()) != 0)
+        return 90 + r;
+    if ((r = t_c89_functions_deref_funcptr_noop()) != 0)
+        return 100 + r;
+    if ((r = t_c89_functions_ternary_int_promotion()) != 0)
+        return 110 + r;
+    if ((r = t_c89_functions_64bit_conditional()) != 0)
+        return 120 + r;
+    return 0;
+}
 "#;
-    assert_eq!(
-        compile_and_run("c89_functions_64bit_conditional", code, &[]),
-        0
-    );
+    assert_eq!(compile_and_run("c89_functions_mega", code, &[]), 0);
 }
 
 // ============================================================================
@@ -496,31 +509,4 @@ fn c89_functions_identifier_list_parameters_interoperate_with_gcc_aarch64() {
         return;
     }
     crate::common::interop_aarch64("knr", KNR_CALLEE, KNR_CALLER);
-}
-
-/// Dropping a qualifier on the way to or from `void *` is diagnosed as it is
-/// between compatible pointees (C17 6.5.16.1p1), in a call, an
-/// initialization and the other direction alike; gcc warns on each.
-#[test]
-fn c89_functions_void_pointer_conversion_keeps_qualifiers() {
-    for (name, code) in [
-        (
-            "voidptr_init_const",
-            "const int *p; void f(void) { void *q = p; (void)q; }\n",
-        ),
-        (
-            "voidptr_arg_volatile",
-            "void h(const void *); volatile int *p; void f(void) { h(p); }\n",
-        ),
-        (
-            "voidptr_from_const_void",
-            "const void *p; void f(void) { int *q = p; (void)q; }\n",
-        ),
-    ] {
-        crate::common::compile_expect_warning(
-            name,
-            code,
-            "discards a qualifier from the pointer target type",
-        );
-    }
 }

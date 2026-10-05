@@ -17,9 +17,24 @@ use crate::common::compile_and_run;
 // Mega-test: C11 core features
 // ============================================================================
 
+/// C11 core features, predefined macros and anonymous members, as one program;
+/// see the exit-code table at the top. (c11_noreturn_mega stays separate: it
+/// calls exit().)
+///
+/// Consolidates: c11_core_mega, c11_predefined_macros_mega and
+/// c11_anonymous_members_inside_a_union.
 #[test]
 fn c11_core_mega() {
     let code = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1- 76  c11_core_mega
+ *    81-138  c11_predefined_macros_mega
+ *   141-144  c11_anonymous_members_inside_a_union
+ */
+
+/* ---- c11_core_mega (exit codes 1-76) ----
+ */
 // File-scope static assertions
 _Static_assert(1, "always true");
 _Static_assert(sizeof(int) >= 4, "int at least 4 bytes");
@@ -53,7 +68,7 @@ void *get_return_addr(void) {
     return __builtin_return_address(0);
 }
 
-int main(void) {
+static int t_c11_core_mega(void) {
     // ========== _ALIGNOF SECTION (returns 1-19) ==========
     {
         // Basic type alignments
@@ -221,6 +236,114 @@ int main(void) {
 
     return 0;
 }
+
+
+/* ---- c11_predefined_macros_mega (exit codes 81-138) ----
+ */
+#include <stdatomic.h>
+
+static int t_c11_predefined_macros_mega(void) {
+    // ========== __STDC_VERSION__ (returns 1-9) ==========
+
+    // c17 compiles C17, so it reports C17. It used to report 201112L
+    // regardless, which is what made the `c17` name a lie (audit #P1/#X2).
+    // `-std=` cannot change this -- there is one language mode; see
+    // `c17_version_macro_is_c17_whatever_std_says`.
+    #if __STDC_VERSION__ != 201710L
+    return 1;
+    #endif
+
+    // C11 features are still available under the C17 default -- C17 is a
+    // defect-report revision of C11 and removes nothing.
+    #if __STDC_VERSION__ < 201112L
+    return 2;
+    #endif
+
+    // ========== __STDC_NO_THREADS__ (returns 10-19) ==========
+
+    // Not asserted here: whether this is defined depends on whether the host
+    // ships <threads.h>, and macOS SDKs do not. That the macro agrees with the
+    // host either way is what matters, and
+    // `c11_no_threads_macro_agrees_with_the_host` checks it.
+
+    // ========== Atomics ARE supported (returns 20-29) ==========
+
+    // __STDC_NO_ATOMICS__ must NOT be defined
+    #ifdef __STDC_NO_ATOMICS__
+    return 20;
+    #endif
+
+    // ========== Complex IS supported (returns 30-39) ==========
+
+    #ifdef __STDC_NO_COMPLEX__
+    return 30;
+    #endif
+
+    // ========== VLAs ARE supported (returns 40-49) ==========
+
+    #ifdef __STDC_NO_VLA__
+    return 40;
+    #endif
+
+    // ========== Lock-free macros (returns 50-59) ==========
+
+    // All lock-free macros must be defined and >= 0
+    if (ATOMIC_BOOL_LOCK_FREE < 0) return 50;
+    if (ATOMIC_CHAR_LOCK_FREE < 0) return 51;
+    if (ATOMIC_SHORT_LOCK_FREE < 0) return 52;
+    if (ATOMIC_INT_LOCK_FREE < 0) return 53;
+    if (ATOMIC_LONG_LOCK_FREE < 0) return 54;
+    if (ATOMIC_LLONG_LOCK_FREE < 0) return 55;
+    if (ATOMIC_POINTER_LOCK_FREE < 0) return 56;
+
+    // On most platforms, int and pointer are always lock-free
+    if (ATOMIC_INT_LOCK_FREE < 1) return 57;
+    if (ATOMIC_POINTER_LOCK_FREE < 1) return 58;
+
+    return 0;
+}
+
+
+/* ---- c11_anonymous_members_inside_a_union (exit codes 141-144) ----
+ *
+ *  #X10: the c11 checklist marked anonymous struct/union members *inside a
+ *  union* unimplemented, but the parser has always used one shared
+ *  member-parsing path whose anonymous branch is gated only on
+ *  `is_struct_or_union && is_special(b';')` — no `is_union` restriction. So
+ *  they already worked; what was missing was a test to tick the boxes against.
+ */
+        union U {
+            struct { int a; int b; };   /* anonymous struct in a union */
+            union  { long c; };         /* anonymous union in a union  */
+            char raw[16];
+        };
+        static int t_c11_anonymous_members_inside_a_union(void) {
+            union U u;
+            u.a = 1;
+            u.b = 2;
+            if (u.a != 1) return 1;
+            /* The anonymous union overlays the same storage. */
+            u.c = 0;
+            if (u.a != 0) return 2;
+            /* Members are promoted into the enclosing union's scope. */
+            u.raw[0] = 7;
+            if (u.raw[0] != 7) return 3;
+            if (sizeof(union U) < sizeof(long)) return 4;
+            return 0;
+        }
+    
+
+int main(void)
+{
+    int r;
+    if ((r = t_c11_core_mega()) != 0)
+        return 0 + r;
+    if ((r = t_c11_predefined_macros_mega()) != 0)
+        return 80 + r;
+    if ((r = t_c11_anonymous_members_inside_a_union()) != 0)
+        return 140 + r;
+    return 0;
+}
 "#;
     assert_eq!(compile_and_run("c11_core_mega", code, &[]), 0);
 }
@@ -283,108 +406,4 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("c11_noreturn_mega", code, &[]), 0);
-}
-
-// ============================================================================
-// Test: Predefined C11 macros
-// ============================================================================
-
-#[test]
-fn c11_predefined_macros_mega() {
-    let code = r#"
-#include <stdatomic.h>
-
-int main(void) {
-    // ========== __STDC_VERSION__ (returns 1-9) ==========
-
-    // c17 compiles C17, so it reports C17. It used to report 201112L
-    // regardless, which is what made the `c17` name a lie (audit #P1/#X2).
-    // `-std=` cannot change this -- there is one language mode; see
-    // `c17_version_macro_is_c17_whatever_std_says`.
-    #if __STDC_VERSION__ != 201710L
-    return 1;
-    #endif
-
-    // C11 features are still available under the C17 default -- C17 is a
-    // defect-report revision of C11 and removes nothing.
-    #if __STDC_VERSION__ < 201112L
-    return 2;
-    #endif
-
-    // ========== __STDC_NO_THREADS__ (returns 10-19) ==========
-
-    // Not asserted here: whether this is defined depends on whether the host
-    // ships <threads.h>, and macOS SDKs do not. That the macro agrees with the
-    // host either way is what matters, and
-    // `c11_no_threads_macro_agrees_with_the_host` checks it.
-
-    // ========== Atomics ARE supported (returns 20-29) ==========
-
-    // __STDC_NO_ATOMICS__ must NOT be defined
-    #ifdef __STDC_NO_ATOMICS__
-    return 20;
-    #endif
-
-    // ========== Complex IS supported (returns 30-39) ==========
-
-    #ifdef __STDC_NO_COMPLEX__
-    return 30;
-    #endif
-
-    // ========== VLAs ARE supported (returns 40-49) ==========
-
-    #ifdef __STDC_NO_VLA__
-    return 40;
-    #endif
-
-    // ========== Lock-free macros (returns 50-59) ==========
-
-    // All lock-free macros must be defined and >= 0
-    if (ATOMIC_BOOL_LOCK_FREE < 0) return 50;
-    if (ATOMIC_CHAR_LOCK_FREE < 0) return 51;
-    if (ATOMIC_SHORT_LOCK_FREE < 0) return 52;
-    if (ATOMIC_INT_LOCK_FREE < 0) return 53;
-    if (ATOMIC_LONG_LOCK_FREE < 0) return 54;
-    if (ATOMIC_LLONG_LOCK_FREE < 0) return 55;
-    if (ATOMIC_POINTER_LOCK_FREE < 0) return 56;
-
-    // On most platforms, int and pointer are always lock-free
-    if (ATOMIC_INT_LOCK_FREE < 1) return 57;
-    if (ATOMIC_POINTER_LOCK_FREE < 1) return 58;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("c11_predefined_macros_mega", code, &[]), 0);
-}
-
-/// #X10: the c11 checklist marked anonymous struct/union members *inside a
-/// union* unimplemented, but the parser has always used one shared
-/// member-parsing path whose anonymous branch is gated only on
-/// `is_struct_or_union && is_special(b';')` — no `is_union` restriction. So
-/// they already worked; what was missing was a test to tick the boxes against.
-#[test]
-fn c11_anonymous_members_inside_a_union() {
-    let src = r#"
-        union U {
-            struct { int a; int b; };   /* anonymous struct in a union */
-            union  { long c; };         /* anonymous union in a union  */
-            char raw[16];
-        };
-        int main(void) {
-            union U u;
-            u.a = 1;
-            u.b = 2;
-            if (u.a != 1) return 1;
-            /* The anonymous union overlays the same storage. */
-            u.c = 0;
-            if (u.a != 0) return 2;
-            /* Members are promoted into the enclosing union's scope. */
-            u.raw[0] = 7;
-            if (u.raw[0] != 7) return 3;
-            if (sizeof(union U) < sizeof(long)) return 4;
-            return 0;
-        }
-    "#;
-    assert_eq!(compile_and_run("c11_anon_members_in_union", src, &[]), 0);
 }

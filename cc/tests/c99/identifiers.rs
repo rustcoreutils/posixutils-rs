@@ -11,6 +11,11 @@
 
 use crate::common::{compile_and_run, run_c17};
 
+/// Consolidates `c99_extended_identifiers_raw_and_ucn_agree` and the
+/// run-time half of `c99_extended_identifier_in_block_labels_is_quoted`
+/// (its assembly-text half is in `cc/test_asm/c99_identifiers.rs`).
+///
+/// `c99_extended_identifiers_raw_and_ucn_agree`:
 /// C17 6.4.2.1 spells an extended character in an identifier as a universal
 /// character name, and Annex D says which characters those may be. Writing the
 /// character directly is what C23 settled on and what gcc and clang have long
@@ -18,9 +23,28 @@ use crate::common::{compile_and_run, run_c17};
 ///
 /// The two spellings name the same identifier, so a declaration written one
 /// way and a use written the other have to agree.
+///
+/// `c99_extended_identifier_in_block_labels_is_quoted`:
+/// A block label carries its function's name, so an extended character in the
+/// identifier reaches the assembler inside a `.L` label too.
+///
+/// Only the *definition* went out raw. `&&label` builds the same spelling as a
+/// local symbol, which is quoted downstream, so one label was spelled two ways
+/// in one file: `.Lmüller_1:` where it was defined, `".Lmüller_1"(%rip)` where
+/// it was referenced. GNU as resolves both to the same symbol, which is why
+/// this ran; Mach-O's assembler rejects the raw bytes.
+///
+/// It has to assemble, link and run, on whichever target the host is.
 #[test]
-fn c99_extended_identifiers_raw_and_ucn_agree() {
+fn c99_extended_identifiers_mega() {
     let code = r#"
+/*
+ * Exit codes:
+ *   1..11  c99_extended_identifiers_raw_and_ucn_agree
+ *   21     c99_extended_identifier_in_block_labels_is_quoted
+ */
+
+/* ===== c99_extended_identifiers_raw_and_ucn_agree ===== */
 /* Declared raw, used through the UCN spelling and back. */
 static int café = 7;
 static int été = 11;
@@ -30,7 +54,7 @@ static int 中文(int x) { return x + 1; }
 
 struct Σ { int α; int β; };
 
-int main(void) {
+static int t_raw_and_ucn_agree(void) {
     if (été != 11) return 1;
     if (été != 11) return 2;
     if (café != 7) return 3;
@@ -58,6 +82,24 @@ int main(void) {
     int e = 20;
     if (e == été) return 11;
 
+    return 0;
+}
+
+/* ===== c99_extended_identifier_in_block_labels_is_quoted ===== */
+int müller(int x) {
+    void *targets[] = { &&lab0, &&lab1 };
+    goto *targets[x & 1];
+lab0: return 1;
+lab1: return 2;
+}
+static int t_block_labels(void) {
+    return (müller(0) == 1 && müller(1) == 2) ? 0 : 21;
+}
+
+int main(void) {
+    int rc;
+    if ((rc = t_raw_and_ucn_agree()) != 0) return rc;
+    if ((rc = t_block_labels()) != 0) return rc;
     return 0;
 }
 "#;
@@ -109,58 +151,4 @@ fn c99_extended_identifier_across_a_line_splice() {
         Some(0),
         "the spliced identifiers did not join"
     );
-}
-
-/// A block label carries its function's name, so an extended character in the
-/// identifier reaches the assembler inside a `.L` label too.
-///
-/// Only the *definition* went out raw. `&&label` builds the same spelling as a
-/// local symbol, which is quoted downstream, so one label was spelled two ways
-/// in one file: `.Lmüller_1:` where it was defined, `".Lmüller_1"(%rip)` where
-/// it was referenced. GNU as resolves both to the same symbol, which is why
-/// this ran; Mach-O's assembler rejects the raw bytes.
-#[test]
-fn c99_extended_identifier_in_block_labels_is_quoted() {
-    let code = r#"
-int müller(int x) {
-    void *targets[] = { &&lab0, &&lab1 };
-    goto *targets[x & 1];
-lab0: return 1;
-lab1: return 2;
-}
-int main(void) { return (müller(0) == 1 && müller(1) == 2) ? 0 : 1; }
-"#;
-    // It has to assemble, link and run, on whichever target the host is.
-    assert_eq!(compile_and_run("label_quoting", code, &[]), 0);
-
-    // And every mention of the label has to be spelled the same way. Checked
-    // on the text because that is where the two spellings diverged.
-    let dir = plib::tmp::tempdir().unwrap();
-    let src = dir.path().join("lbl.c");
-    std::fs::write(&src, code).unwrap();
-    let asm = dir.path().join("lbl.s");
-    let r = run_c17(&["-S", src.to_str().unwrap(), "-o", asm.to_str().unwrap()]);
-    assert!(r.success, "-S failed: {}", r.stderr);
-    let text = std::fs::read_to_string(&asm).unwrap();
-
-    let mentions: Vec<&str> = text
-        .lines()
-        .filter(|l| l.contains("müller_"))
-        .map(|l| l.trim())
-        .collect();
-    assert!(
-        !mentions.is_empty(),
-        "expected the function's labels in:\n{}",
-        text
-    );
-    for line in &mentions {
-        assert!(
-            !line.contains("Lmüller_")
-                || line.contains("\".Lmüller_")
-                || line.contains("\"Lmüller_"),
-            "an unquoted label reached the assembler: {:?}\nin:\n{}",
-            line,
-            text
-        );
-    }
 }

@@ -16,7 +16,7 @@
 // program failed at link time with an undefined reference to the forwarder.
 //
 
-use crate::common::{compile_rejected_with, create_c_file, run_c17};
+use crate::test_compile::{compile, compile_rejected_with};
 
 const OPTS: [&str; 2] = ["-O0", "-O2"];
 
@@ -37,9 +37,7 @@ fn expect_invalid_use(name: &str, src: &str, opt: &str, builtin: &str, line: u32
 
 /// Require `src` to compile at `opt` with no invalid-use diagnostic.
 fn expect_accepted(name: &str, src: &str, opt: &str) {
-    let c = create_c_file(&format!("{name}{opt}"), src);
-    let path = c.path().to_string_lossy().to_string();
-    let run = run_c17(&[opt, "-S", "-o", "/dev/null", &path]);
+    let run = compile(&format!("{name}{opt}"), src, &[opt]);
     assert!(run.success, "{name} {opt} should compile:\n{}", run.stderr);
     assert!(
         !run.stderr.contains("invalid use"),

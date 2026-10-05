@@ -13,7 +13,7 @@
 // `__builtin_dynamic_object_size`, and x86's CPU detection.
 //
 
-use crate::common::{compile_and_run, compile_expect_error};
+use crate::common::compile_and_run;
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 use crate::common::{compile_with_host_cc, create_c_file};
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
@@ -78,22 +78,7 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("builtins_position", src, &[]), 0);
-
-    compile_expect_error(
-        "builtins_probability_range",
-        "int f(int x) { return __builtin_expect_with_probability(x, 1, 2.0); }\n",
-        "probability must be a constant floating-point expression between 0 and 1",
-    );
-}
-
-/// `#line` moves diagnostics, as gcc's does, not only `__LINE__`.
-#[test]
-fn builtins_line_directive_moves_diagnostics() {
-    compile_expect_error(
-        "line_moves_diagnostics",
-        "int a;\n#line 77 \"renamed.c\"\nint b = undeclared_x;\n",
-        "renamed.c:77:",
-    );
+    // The diagnostic half is a unit test in cc/test_asm/builtins_gnu_batch.rs.
 }
 
 /// x86-64 CPU detection reads libgcc's `__cpu_model` as gcc's code does.
@@ -113,11 +98,7 @@ int main(void) {
 }
 "#;
     assert_eq!(compile_and_run("builtins_cpu", src, &[]), 0);
-    compile_expect_error(
-        "builtins_cpu_bad_name",
-        "int f(void) { return __builtin_cpu_supports(\"nosuch\"); }\n",
-        "parameter to builtin not valid: nosuch",
-    );
+    // The diagnostic half is a unit test in cc/test_asm/builtins_gnu_batch.rs.
 }
 
 /// The CPU names c17 once lacked (and one name per `__cpu_model` field and

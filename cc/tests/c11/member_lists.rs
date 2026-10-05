@@ -12,48 +12,51 @@
 // evaluated.
 //
 
-use crate::common::{compile_and_run, compile_expect_error, compile_expect_ok};
+use crate::common::compile_and_run;
 
-/// C17 6.7.2.1p13: an anonymous union's members are members of the
-/// containing struct, so they are the named members a flexible array member
-/// needs before it (<linux/bpf.h>). An unnamed bit-field is padding and does
-/// not count.
+/// The accepted programs of this file as one program; each section keeps its
+/// original test name and doc comment. The rejected halves are unit tests in
+/// cc/test_asm/c11_member_lists.rs.
+///
+/// Consolidates: fam_after_an_anonymous_member, member_list_shapes_from_uapi_headers
+/// and logical_operators_short_circuit_in_constant_expressions.
 #[test]
-fn fam_after_an_anonymous_member() {
-    let src = r#"
+fn member_lists_mega() {
+    let code = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1-  2  fam_after_an_anonymous_member
+ *    11- 14  member_list_shapes_from_uapi_headers
+ *    21- 22  logical_operators_short_circuit_in_constant_expressions
+ */
+
+/* ---- fam_after_an_anonymous_member (exit codes 1-2) ----
+ *
+ *  C17 6.7.2.1p13: an anonymous union's members are members of the
+ *  containing struct, so they are the named members a flexible array member
+ *  needs before it (<linux/bpf.h>). An unnamed bit-field is padding and does
+ *  not count.
+ */
 #include <stddef.h>
 struct s { union { int a; long b; }; char d[]; };
 struct t { struct { int x, y; }; int tail[]; };
-int main(void) {
+static int t_fam_after_an_anonymous_member(void) {
     if (offsetof(struct s, d) != sizeof(long)) return 1;
     if (offsetof(struct t, tail) != 2 * sizeof(int)) return 2;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("fam_anon", src, &[]), 0);
 
-    compile_expect_error(
-        "fam_only_padding",
-        "struct s { int :3; char d[]; };\n",
-        "flexible array member in a struct with no named members",
-    );
-    compile_expect_error(
-        "fam_alone",
-        "struct s { char d[]; };\n",
-        "flexible array member in a struct with no named members",
-    );
-}
 
-/// An unnamed bit-field may begin a declarator list, as in <linux/ioam6.h>'s
-/// `__u8 :1, :1, x:1;`, and a member list may hold a stray `;`
-/// (<linux/nfc.h>), which gcc accepts.
-#[test]
-fn member_list_shapes_from_uapi_headers() {
-    let src = r#"
+/* ---- member_list_shapes_from_uapi_headers (exit codes 11-13) ----
+ *
+ *  An unnamed bit-field may begin a declarator list, as in <linux/ioam6.h>'s
+ *  `__u8 :1, :1, x:1;`, and a member list may hold a stray `;`
+ *  (<linux/nfc.h>), which gcc accepts.
+ */
 struct flags { unsigned char :1, :1, x:1, :2, y:1; };
 struct semi { int a;; int b; };
 struct lead { ; int c; };
-int main(void) {
+static int t_member_list_shapes_from_uapi_headers(void) {
     struct flags f = { 0 };
     f.x = 1; f.y = 1;
     if (sizeof(struct flags) != 1) return 1;
@@ -63,76 +66,38 @@ int main(void) {
     struct lead l = { 3 };
     return s.a + s.b + l.c - 6;
 }
-"#;
-    assert_eq!(compile_and_run("uapi_member_lists", src, &[]), 0);
 
-    compile_expect_error(
-        "unnamed_bitfield_too_wide",
-        "struct s { unsigned char :1, :9; };\n",
-        "width",
-    );
-}
 
-/// Translation phase 6 makes one literal of adjacent ones, so a
-/// `_Static_assert` message may be written as several (`BUILD_BUG_ON_ZERO`
-/// pastes `#e " is true"`), with any encoding prefix.
-#[test]
-fn static_assert_message_is_a_concatenated_literal() {
-    compile_expect_ok(
-        "sa_concat_ok",
-        "_Static_assert(1, \"a\" \"b\");\n\
-         _Static_assert(1, L\"a\" L\"b\");\n\
-         struct S { int x; _Static_assert(sizeof(int) >= 2, \"int\" \" too small\"); };\n\
-         void f(void) { _Static_assert(1, \"in\" \" a block\"); }\n",
-    );
-    compile_expect_error(
-        "sa_concat_fail",
-        "_Static_assert(0, \"first \" \"second\");\n",
-        "static assertion failed: first second",
-    );
-}
-
-/// The right operand of `&&` and `||` is not evaluated when the left decides
-/// (C17 6.5.13p4, 6.5.14p4), and an operand that is not evaluated may be
-/// anything (6.6p3), as for the arm `?:` does not take.
-#[test]
-fn logical_operators_short_circuit_in_constant_expressions() {
-    let src = r#"
-extern int x;
-int a = 1 || 1/0;
-int b[(0 && 1/0) + 1];
-int c = 0 && x;
+/* ---- logical_operators_short_circuit_in_constant_expressions (exit codes 21-22) ----
+ *
+ *  The right operand of `&&` and `||` is not evaluated when the left decides
+ *  (C17 6.5.13p4, 6.5.14p4), and an operand that is not evaluated may be
+ *  anything (6.6p3), as for the arm `?:` does not take.
+ */
+extern int sc_x;
+int sc_a = 1 || 1/0;
+int sc_b[(0 && 1/0) + 1];
+int sc_c = 0 && sc_x;
 _Static_assert(1 || 1/0, "short circuit");
 _Static_assert(!(0 && 1/0), "short circuit");
-enum { E = 0 || 7 };
-int main(void) {
-    switch (a) { case (1 || 1/0): break; default: return 1; }
-    return (sizeof b == sizeof(int) && c == 0 && E == 1) ? 0 : 2;
+enum { SC_E = 0 || 7 };
+static int t_logical_operators_short_circuit_in_constant_expressions(void) {
+    switch (sc_a) { case (1 || 1/0): break; default: return 1; }
+    return (sizeof sc_b == sizeof(int) && sc_c == 0 && SC_E == 1) ? 0 : 2;
 }
-int x;
+int sc_x;
+
+int main(void)
+{
+    int r;
+    if ((r = t_fam_after_an_anonymous_member()) != 0)
+        return 0 + r;
+    if ((r = t_member_list_shapes_from_uapi_headers()) != 0)
+        return r > 0 && r < 4 ? 10 + r : 14;
+    if ((r = t_logical_operators_short_circuit_in_constant_expressions()) != 0)
+        return 20 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("const_short_circuit", src, &[]), 0);
-
-    compile_expect_error(
-        "const_short_circuit_taken",
-        "int a = 0 || 1/0;\n",
-        "not a constant expression",
-    );
-}
-
-/// glibc headers that include only <stdint.h> and expect it to bring in
-/// <sys/cdefs.h>, as glibc's own does: the bundled one hands a hosted glibc
-/// build to the C library's.
-#[cfg(target_os = "linux")]
-#[test]
-fn glibc_headers_that_lean_on_stdint() {
-    compile_expect_ok(
-        "glibc_stdint_users",
-        "#include <sys/eventfd.h>\n#include <sys/inotify.h>\n\
-         #include <sys/signalfd.h>\n#include <sys/fanotify.h>\n\
-         #include <stdint.h>\n#include <inttypes.h>\n\
-         _Static_assert(INT64_MAX == 0x7fffffffffffffff, \"int64\");\n\
-         _Static_assert(sizeof(intptr_t) == sizeof(void *), \"intptr\");\n\
-         int64_t v = INT64_C(5);\nint main(void) { return 0; }\n",
-    );
+    assert_eq!(compile_and_run("member_lists_mega", code, &[]), 0);
 }

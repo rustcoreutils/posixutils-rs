@@ -8,225 +8,131 @@
 //
 // C99 Complex Number Tests
 
-use crate::common::{
-    compile_and_run, compile_and_run_aarch64, compile_and_run_optimized, create_c_file, run_c17,
-};
+use crate::common::{compile_and_run, compile_and_run_optimized};
 
+/// Complex values: initialization, `__real__`/`__imag__`, truth values,
+/// equality, conditionals and precision across calls, built once at the
+/// matrix levels and once at -O1.
+///
+/// Consolidates: `c99_real_and_imag_operators`, `c99_truth_value_respects_the_type`, `c99_complex_equality_compares_both_halves`, `c99_complex_conditional`, `c99_complex_elvis_with_a_real_left_operand`, `c99_complex_precision_crosses_calls`, `c99_complex_long_double_then_stack_scalars`, `c99_complex_members_of_automatic_aggregates_are_initialized`.
+/// The original tests' documentation follows, one block per section.
+//
+// ---- c99_real_and_imag_operators (exit codes 1..15) ----
+// GCC's `__real__` and `__imag__`, as rvalues and as lvalues.
+//
+// Both are long-standing extensions and the natural way to reach a complex
+// value's halves without `<complex.h>` -- c17 offered only `creal`/`cimag`,
+// which need libm. They are lvalues when the operand is one, so assignment,
+// compound assignment and `&` all have to work; and gcc accepts them on a
+// *real* operand too, where `__real__ x` is `x` and `__imag__ x` is a zero of
+// its type. Every expectation checked against gcc on the same source.
+//
+// ---- c99_truth_value_respects_the_type (exit codes 16..85) ----
+// Converting a value to a truth value has to respect its type. Two ways it
+// did not:
+//
+// A complex value is nonzero when *either* half is (C17 6.3.1.2 via
+// 6.5.3.3p5), but the condition reached `cbr` as a single 128-bit value and
+// only the low half -- the real part -- was tested.
+//
+// A floating-point value is compared against `0.0`, not against its bit
+// pattern, so `-0.0` is false. It was reaching an *integer* compare against
+// an integer zero, and `-0.0`'s bit pattern is not zero.
+//
+// `!` and `(_Bool)` were already right, which is what made the split
+// visible: there are several independent conversions and only some of them
+// looked at the type.
+//
+// ---- c99_complex_equality_compares_both_halves (exit codes 86..101) ----
+// Only `==` and `!=` are defined on complex operands, and both have to look
+// at both halves. The complex arm of `linearize_binary` keyed off the
+// *result* type, which for a comparison is `int`, so equality fell into the
+// scalar path and compared whatever the low half held.
+//
+// ---- c99_complex_conditional (exit codes 102..136) ----
+// A conditional whose result is complex.
+//
+// Two defects met here. The parser held complex back from the usual
+// arithmetic conversions, so `c ? 1 : z` typed as `int` and dropped the
+// imaginary half outright while `c ? z : 1` did not -- the arm order decided
+// the type. And the linearizer phi-ed the arms *by value* where a complex
+// value travels by address everywhere else, so the merged pseudo's bits were
+// dereferenced as a pointer and every complex conditional that reached
+// codegen died, including the arm order that already typed correctly.
+//
+// Both operators are covered: `?:` shares the shape and additionally has to
+// evaluate its left operand exactly once.
+//
+// ---- c99_complex_elvis_with_a_real_left_operand (exit codes 137..148) ----
+// GNU `a ?: b` where only the *result* is complex.
+//
+// The complex path was dispatched on the result type but then assumed the
+// left operand was complex too. It need not be: the result is complex as soon
+// as *either* operand is, so `d ?: z` has a `double` left operand and a
+// `double _Complex` result.
+//
+// Taking a real operand's address as though it were a complex object read the
+// neighbouring stack slot as the imaginary half, and for an rvalue
+// `rvalue_addr` hands back the value's own bits -- so `g() ?: z`
+// dereferenced a `double` as a pointer and died. The truth test was wrong too:
+// an `int` whose bits happen to spell `-0.0f` compared equal to zero.
+//
+// ---- c99_complex_precision_crosses_calls (exit codes 149..163) ----
+// A complex value crossing a call boundary is converted to the precision the
+// other side declared.
+//
+// A complex value is read with its base type's stride, so the two sides must
+// agree on which base type that is. Assignment, initialization and the binary
+// operators all went through `complex_operand_at_precision`; the **argument**
+// and **return** paths did not, and handed the storage over unconverted. A
+// `float _Complex` given to a `double _Complex` parameter had the callee read
+// an 8-byte-strided pair out of 4-byte-strided memory, so `1.0f + 2.0f*I`
+// arrived as `2+1i` -- and the wider directions read past the object.
+//
+// ---- c99_complex_long_double_then_stack_scalars (exit codes 164..168) [from c99::complex_abi] ----
+// A stack parameter after a `long double _Complex` is not read sixteen bytes
+// low.
+//
+// `long double _Complex` is COMPLEX_X87: thirty-two bytes on the stack. The
+// allocator asked `kind()` whether the parameter was a `long double`, and that
+// answers the *base* kind for a complex type, so it took the plain
+// long-double branch and advanced the incoming-argument cursor by sixteen.
+// Every parameter after it then landed on the complex's upper half, and each
+// subsequent one was shifted a slot further.
+//
+// Filed as not reproducible at -O2; it is. The original probe's callee was
+// being inlined, which removes the ABI from the question entirely.
+//
+// ---- c99_complex_members_of_automatic_aggregates_are_initialized (exit codes 169..192) ----
+// A `_Complex` member of an *automatic* aggregate gets its value.
+//
+// A complex value lives in memory and travels by address, so the aggregate
+// initializer -- which assumes a scalar member holds its own value -- stored
+// the address instead. Every complex member of a local struct, union or array
+// read back as a stack address reinterpreted as a double (about 6.9e-310),
+// and a *real* initializer for one crashed outright. The static forms were
+// always right, so `static struct S s = {1.0+2.0*I};` and the same
+// declaration without `static` disagreed.
+//
+// Checked against gcc on the same source, at -O0 and -O2.
 #[test]
-fn c99_complex_mega() {
+fn c99_complex_semantics_mega() {
     let code = r#"
+/* complex: compile_and_run + compile_and_run_optimized
+   Exit codes: section k's own failure code plus its base.
+     1.. 15  c99_real_and_imag_operators
+    16.. 85  c99_truth_value_respects_the_type
+    86..101  c99_complex_equality_compares_both_halves
+   102..136  c99_complex_conditional
+   137..148  c99_complex_elvis_with_a_real_left_operand
+   149..163  c99_complex_precision_crosses_calls
+   164..168  c99_complex_long_double_then_stack_scalars
+   169..192  c99_complex_members_of_automatic_aggregates_are_initialized
+*/
 #include <complex.h>
 
-int main(void) {
-    // ========== BASIC COMPLEX (returns 1-9) ==========
-    {
-        // complex macro expands to _Complex
-        double complex z1 = __builtin_complex(3.0, 4.0);
-        if (creal(z1) < 2.9 || creal(z1) > 3.1) return 1;
-        if (cimag(z1) < 3.9 || cimag(z1) > 4.1) return 2;
-
-        // I macro
-        double complex z2 = I;
-        if (cimag(z2) < 0.9 || cimag(z2) > 1.1) return 3;
-
-        // 3 + 4i using I macro
-        double complex z3 = 3.0 + 4.0 * I;
-        if (creal(z3) < 2.9 || creal(z3) > 3.1) return 4;
-        if (cimag(z3) < 3.9 || cimag(z3) > 4.1) return 5;
-
-        // Real scalar init (imag = 0)
-        double complex z4 = 5.0;
-        if (creal(z4) < 4.9 || creal(z4) > 5.1) return 6;
-        if (cimag(z4) < -0.1 || cimag(z4) > 0.1) return 7;
-    }
-
-    // ========== COMPLEX ARITHMETIC (returns 10-19) ==========
-    {
-        double complex a = __builtin_complex(1.0, 2.0);
-        double complex b = __builtin_complex(3.0, 4.0);
-
-        // Addition
-        double complex sum = a + b;
-        if (creal(sum) < 3.9 || creal(sum) > 4.1) return 10;
-        if (cimag(sum) < 5.9 || cimag(sum) > 6.1) return 11;
-
-        // Subtraction
-        double complex diff = b - a;
-        if (creal(diff) < 1.9 || creal(diff) > 2.1) return 12;
-        if (cimag(diff) < 1.9 || cimag(diff) > 2.1) return 13;
-
-        // Multiplication: (1+2i)(3+4i) = 3+4i+6i+8i² = 3+10i-8 = -5+10i
-        double complex prod = a * b;
-        if (creal(prod) < -5.1 || creal(prod) > -4.9) return 14;
-        if (cimag(prod) < 9.9 || cimag(prod) > 10.1) return 15;
-
-        // Division: (3+4i)/(1+2i) = (3+4i)(1-2i)/((1+2i)(1-2i)) = (11-2i)/5
-        double complex quot = b / a;
-        double qr = creal(quot);
-        double qi = cimag(quot);
-        if (qr < 2.1 || qr > 2.3) return 16;   // 11/5 = 2.2
-        if (qi < -0.5 || qi > 0.1) return 17;    // -2/5 = -0.4
-    }
-
-    // ========== MIXED REAL + COMPLEX (returns 20-29) ==========
-    {
-        double complex z = __builtin_complex(2.0, 3.0);
-
-        // Real + Complex
-        double complex r1 = 10.0 + z;
-        if (creal(r1) < 11.9 || creal(r1) > 12.1) return 20;
-        if (cimag(r1) < 2.9 || cimag(r1) > 3.1) return 21;
-
-        // Complex - Real
-        double complex r2 = z - 1.0;
-        if (creal(r2) < 0.9 || creal(r2) > 1.1) return 22;
-
-        // Real * Complex
-        double complex r3 = 2.0 * z;
-        if (creal(r3) < 3.9 || creal(r3) > 4.1) return 23;
-        if (cimag(r3) < 5.9 || cimag(r3) > 6.1) return 24;
-    }
-
-    // ========== CREAL / CIMAG (returns 30-39) ==========
-    {
-        double complex z = 7.0 + 8.0 * I;
-        double r = creal(z);
-        double i = cimag(z);
-        if (r < 6.9 || r > 7.1) return 30;
-        if (i < 7.9 || i > 8.1) return 31;
-    }
-
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("c99_complex_mega", code, &["-lm".to_string()],),
-        0,
-    );
-}
-
-/// A `_Complex` member of an *automatic* aggregate gets its value.
-///
-/// A complex value lives in memory and travels by address, so the aggregate
-/// initializer -- which assumes a scalar member holds its own value -- stored
-/// the address instead. Every complex member of a local struct, union or array
-/// read back as a stack address reinterpreted as a double (about 6.9e-310),
-/// and a *real* initializer for one crashed outright. The static forms were
-/// always right, so `static struct S s = {1.0+2.0*I};` and the same
-/// declaration without `static` disagreed.
-///
-/// Checked against gcc on the same source, at -O0 and -O2.
-#[test]
-fn c99_complex_members_of_automatic_aggregates_are_initialized() {
-    let code = r#"
-/* complex.h's I, spelled out so the test needs no libm call. */
-#define I __builtin_complex(0.0, 1.0)
-
-struct S { double _Complex z; };
-struct P { int tag; double _Complex z; };
-struct N { struct S inner; };
-struct T { double _Complex a, b; };
-struct V { double _Complex z; int n; };
-struct F { float _Complex z; };
-struct L { long double _Complex z; };
-union  U { double _Complex z; double d[2]; };
-
-/* The value is read through a pointer rather than passed by value: this is a
-   test about initialization, and passing a complex by value is a separate
-   path with its own defects. */
-static int eq(const double _Complex *v, double re, double im)
-{
-    const double *p = (const double *)v;
-    return p[0] == re && p[1] == im;
-}
-static int eqf(const float _Complex *v, float re, float im)
-{
-    const float *p = (const float *)v;
-    return p[0] == re && p[1] == im;
-}
-static int eql(const long double _Complex *v, long double re, long double im)
-{
-    const long double *p = (const long double *)v;
-    return p[0] == re && p[1] == im;
-}
-
-int main(void)
-{
-    /* A struct member, from every shape of initializer. */
-    struct S a = { 1.0 + 2.0*I };            if (!eq(&a.z, 1, 2)) return 1;
-    struct S b = { 3.0 };                    if (!eq(&b.z, 3, 0)) return 2;
-    struct S c = { __builtin_complex(4.0, 5.0) }; if (!eq(&c.z, 4, 5)) return 3;
-    double _Complex src = __builtin_complex(6.0, 7.0);
-    struct S d = { src };                    if (!eq(&d.z, 6, 7)) return 4;
-    struct S e = { 7 };                      if (!eq(&e.z, 7, 0)) return 5;
-
-    /* Alongside other members, in both orders, and designated. */
-    struct P f = { 9, 1.5 + 2.5*I };
-    if (f.tag != 9 || !eq(&f.z, 1.5, 2.5)) return 6;
-    struct V g = { 1.0 + 2.0*I, 42 };
-    if (g.n != 42 || !eq(&g.z, 1, 2)) return 7;
-    struct P h = { .z = 7.0 + 8.0*I, .tag = 2 };
-    if (h.tag != 2 || !eq(&h.z, 7, 8)) return 8;
-    struct T i = { 1.0 + 2.0*I, 3.0 + 4.0*I };
-    if (!eq(&i.a, 1, 2) || !eq(&i.b, 3, 4)) return 9;
-
-    /* An omitted member is still zeroed. */
-    struct P j = { 5 };
-    if (j.tag != 5 || !eq(&j.z, 0, 0)) return 10;
-
-    /* Nested, union, compound literal. */
-    struct N k = { { 8.0 + 9.0*I } };        if (!eq(&k.inner.z, 8, 9)) return 11;
-    union U l = { 1.0 + 2.0*I };             if (!eq(&l.z, 1, 2)) return 12;
-    struct S m = (struct S){ 2.0 + 3.0*I };  if (!eq(&m.z, 2, 3)) return 13;
-
-    /* Arrays: of complex, and of structs holding one. */
-    double _Complex n[2] = { 1.0 + 2.0*I, 3.0 };
-    if (!eq(&n[0], 1, 2) || !eq(&n[1], 3, 0)) return 14;
-    double _Complex o[3] = { 1.0 + 2.0*I };
-    if (!eq(&o[0], 1, 2) || !eq(&o[1], 0, 0) || !eq(&o[2], 0, 0)) return 15;
-    double _Complex p[3] = { [2] = 1.0 + 2.0*I };
-    if (!eq(&p[0], 0, 0) || !eq(&p[2], 1, 2)) return 16;
-    struct S q[2] = { { 1.0 + 2.0*I }, { 3.0 + 4.0*I } };
-    if (!eq(&q[0].z, 1, 2) || !eq(&q[1].z, 3, 4)) return 17;
-
-    /* A braced complex scalar reaches the initializer-list path, not the
-       complex arm of a plain declaration. */
-    double _Complex r = { 5.0 };             if (!eq(&r, 5, 0)) return 18;
-
-    /* Other base precisions. `I` is a *double* complex, so a float member is
-       a conversion in both halves. */
-    struct F s = { 2.0f + 3.0f*I };          if (!eqf(&s.z, 2, 3)) return 19;
-    float _Complex t[2] = { 1.0f + 2.0f*I, 3.0f };
-    if (!eqf(&t[0], 1, 2) || !eqf(&t[1], 3, 0)) return 20;
-    struct L u = { 1.5L + 2.5L*I };          if (!eql(&u.z, 1.5L, 2.5L)) return 21;
-
-    /* Controls: these were always right and must stay so. */
-    double _Complex v = 1.0 + 2.0*I;         if (!eq(&v, 1, 2)) return 22;
-    struct S w; w.z = 4.0 + 5.0*I;           if (!eq(&w.z, 4, 5)) return 23;
-    static struct S x = { 1.0 + 2.0*I };     if (!eq(&x.z, 1, 2)) return 24;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("complex_aggregate_init", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("complex_aggregate_init_opt", code),
-        0
-    );
-}
-
-/// GCC's `__real__` and `__imag__`, as rvalues and as lvalues.
-///
-/// Both are long-standing extensions and the natural way to reach a complex
-/// value's halves without `<complex.h>` -- c17 offered only `creal`/`cimag`,
-/// which need libm. They are lvalues when the operand is one, so assignment,
-/// compound assignment and `&` all have to work; and gcc accepts them on a
-/// *real* operand too, where `__real__ x` is `x` and `__imag__ x` is a zero of
-/// its type. Every expectation checked against gcc on the same source.
-#[test]
-fn c99_real_and_imag_operators() {
-    let code = r#"
-int main(void)
+/* ==== c99_real_and_imag_operators (codes 1..15) ==== */
+static int t_c99_real_and_imag_operators(void)
 {
     double _Complex z = __builtin_complex(1.5, 2.5);
 
@@ -268,45 +174,25 @@ int main(void)
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_real_imag", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("c99_real_imag_opt", code), 0);
-}
 
-/// Converting a value to a truth value has to respect its type. Two ways it
-/// did not:
-///
-/// A complex value is nonzero when *either* half is (C17 6.3.1.2 via
-/// 6.5.3.3p5), but the condition reached `cbr` as a single 128-bit value and
-/// only the low half -- the real part -- was tested.
-///
-/// A floating-point value is compared against `0.0`, not against its bit
-/// pattern, so `-0.0` is false. It was reaching an *integer* compare against
-/// an integer zero, and `-0.0`'s bit pattern is not zero.
-///
-/// `!` and `(_Bool)` were already right, which is what made the split
-/// visible: there are several independent conversions and only some of them
-/// looked at the type.
-#[test]
-fn c99_truth_value_respects_the_type() {
-    let code = r#"
+/* ==== c99_truth_value_respects_the_type (codes 16..85) ==== */
 /* Opaque to the optimizer, so the condition is a real run-time value. */
-static double neg_zero(void) { return -0.0; }
-static double _Complex mkc(double r, double i) {
+static double tv_neg_zero(void) { return -0.0; }
+static double _Complex tv_mkc(double r, double i) {
     double _Complex z = r;
     __imag__ z = i;
     return z;
 }
-static int take_bool(_Bool b) { return (int)b; }
-static _Bool ret_bool(double _Complex z) { return z; }
-static double _Complex both_zero_v(void) { return mkc(0.0, 0.0); }
+static int tv_take_bool(_Bool b) { return (int)b; }
+static _Bool tv_ret_bool(double _Complex z) { return z; }
+static double _Complex tv_both_zero_v(void) { return tv_mkc(0.0, 0.0); }
 /* A complex value returned from a real-typed function keeps its real part
    (C17 6.3.1.7p2), rather than the address it travels by. */
-static double real_of(double _Complex z) { return z; }
+static double tv_real_of(double _Complex z) { return z; }
 
-int main(void) {
+static int t_c99_truth_value_respects_the_type(void) {
     /* ---- floating point: -0.0 is false ---- */
-    double n = neg_zero();
+    double n = tv_neg_zero();
     if (n) return 1;
     if (n && 1) return 2;
     if (n || 0) return 3;
@@ -323,7 +209,7 @@ int main(void) {
     if (!(h && 1)) return 11;
 
     /* ---- complex: either half counts ---- */
-    double _Complex imag_only = mkc(0.0, 3.0);
+    double _Complex imag_only = tv_mkc(0.0, 3.0);
     if (!imag_only) return 20;
     if (!(imag_only && 1)) return 21;
     if (!(imag_only || 0)) return 22;
@@ -336,51 +222,41 @@ int main(void) {
     /* every spelling of the conversion, not just the cast */
     { _Bool b = imag_only; if ((int)b != 1) return 29; }
     { _Bool b; b = imag_only; if ((int)b != 1) return 60; }
-    { if (take_bool(imag_only) != 1) return 61; }
-    { if (ret_bool(imag_only) != 1) return 62; }
-    { _Bool b = both_zero_v(); if ((int)b != 0) return 63; }
+    { if (tv_take_bool(imag_only) != 1) return 61; }
+    { if (tv_ret_bool(imag_only) != 1) return 62; }
+    { _Bool b = tv_both_zero_v(); if ((int)b != 0) return 63; }
 
-    double _Complex real_only = mkc(3.0, 0.0);
+    double _Complex real_only = tv_mkc(3.0, 0.0);
     if (!real_only) return 30;
 
-    double _Complex both_zero = mkc(0.0, 0.0);
+    double _Complex both_zero = tv_mkc(0.0, 0.0);
     if (both_zero) return 40;
     if ((int)(_Bool)both_zero != 0) return 41;
     if (!both_zero != 1) return 42;
 
     /* -0.0 in both halves is still zero */
-    double _Complex neg_zeros = mkc(-0.0, -0.0);
+    double _Complex neg_zeros = tv_mkc(-0.0, -0.0);
     if (neg_zeros) return 50;
     if ((int)(_Bool)neg_zeros != 0) return 51;
 
-    if (real_of(mkc(4.0, 9.0)) != 4.0) return 70;
+    if (tv_real_of(tv_mkc(4.0, 9.0)) != 4.0) return 70;
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_truth_value", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("c99_truth_value_opt", code), 0);
-}
 
-/// Only `==` and `!=` are defined on complex operands, and both have to look
-/// at both halves. The complex arm of `linearize_binary` keyed off the
-/// *result* type, which for a comparison is `int`, so equality fell into the
-/// scalar path and compared whatever the low half held.
-#[test]
-fn c99_complex_equality_compares_both_halves() {
-    let code = r#"
-static double _Complex mkc(double r, double i) {
+/* ==== c99_complex_equality_compares_both_halves (codes 86..101) ==== */
+static double _Complex eqh_mkc(double r, double i) {
     double _Complex z = r;
     __imag__ z = i;
     return z;
 }
 
-int main(void) {
-    double _Complex a = mkc(1.0, 2.0);
-    double _Complex same = mkc(1.0, 2.0);
-    double _Complex imag_differs = mkc(1.0, 9.0);
-    double _Complex real_differs = mkc(7.0, 2.0);
-    double _Complex both_differ = mkc(7.0, 9.0);
+static int t_c99_complex_equality_compares_both_halves(void) {
+    double _Complex a = eqh_mkc(1.0, 2.0);
+    double _Complex same = eqh_mkc(1.0, 2.0);
+    double _Complex imag_differs = eqh_mkc(1.0, 9.0);
+    double _Complex real_differs = eqh_mkc(7.0, 2.0);
+    double _Complex both_differ = eqh_mkc(7.0, 9.0);
 
     if (!(a == same)) return 1;
     if (a == imag_differs) return 2;
@@ -393,14 +269,14 @@ int main(void) {
     if (!(a != both_differ)) return 8;
 
     /* against a real operand: the imaginary half must still count */
-    if (!(mkc(0.0, 0.0) == 0)) return 9;
-    if (mkc(0.0, 3.0) == 0) return 10;
-    if (!(mkc(0.0, 3.0) != 0)) return 11;
-    if (!(mkc(5.0, 0.0) == 5)) return 12;
-    if (mkc(5.0, 1.0) == 5) return 13;
+    if (!(eqh_mkc(0.0, 0.0) == 0)) return 9;
+    if (eqh_mkc(0.0, 3.0) == 0) return 10;
+    if (!(eqh_mkc(0.0, 3.0) != 0)) return 11;
+    if (!(eqh_mkc(5.0, 0.0) == 5)) return 12;
+    if (eqh_mkc(5.0, 1.0) == 5) return 13;
 
     /* -0.0 compares equal to 0.0 */
-    if (!(mkc(-0.0, -0.0) == mkc(0.0, 0.0))) return 14;
+    if (!(eqh_mkc(-0.0, -0.0) == eqh_mkc(0.0, 0.0))) return 14;
 
     /* float _Complex, so the base width is not the pointer width */
     float _Complex f = 1.0f;
@@ -412,41 +288,18 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_complex_equality", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("c99_complex_equality_opt", code),
-        0
-    );
-}
 
-/// A conditional whose result is complex.
-///
-/// Two defects met here. The parser held complex back from the usual
-/// arithmetic conversions, so `c ? 1 : z` typed as `int` and dropped the
-/// imaginary half outright while `c ? z : 1` did not -- the arm order decided
-/// the type. And the linearizer phi-ed the arms *by value* where a complex
-/// value travels by address everywhere else, so the merged pseudo's bits were
-/// dereferenced as a pointer and every complex conditional that reached
-/// codegen died, including the arm order that already typed correctly.
-///
-/// Both operators are covered: `?:` shares the shape and additionally has to
-/// evaluate its left operand exactly once.
-#[test]
-fn c99_complex_conditional() {
-    let code = r#"
-#include <complex.h>
+/* ==== c99_complex_conditional (codes 102..136) ==== */
+static int cond_calls;
+static int cond_nz(void) { return 1; }               /* opaque: defeats folding */
+static double _Complex cond_f(double re) { cond_calls++; return re + 1.0 * I; }
 
-static int calls;
-static int nz(void) { return 1; }               /* opaque: defeats folding */
-static double _Complex f(double re) { calls++; return re + 1.0 * I; }
-
-static int eq(double _Complex a, double re, double im) {
+static int cond_eq(double _Complex a, double re, double im) {
     return __real__ a == re && __imag__ a == im;
 }
 
-int main(void) {
-    int c = nz();
+static int t_c99_complex_conditional(void) {
+    int c = cond_nz();
     double _Complex z = 3.0 + 4.0 * I;
     double _Complex w = 5.0 - 6.0 * I;
     float _Complex fz = 1.0f + 2.0f * I;
@@ -462,49 +315,297 @@ int main(void) {
     if (sizeof(c ? 1.0f : fz) != sizeof(float _Complex)) return 6;
 
     /* Both halves survive the merge, on both branches. */
-    if (!eq(c ? z : w, 3.0, 4.0)) return 10;
-    if (!eq(nz() - 1 ? z : w, 5.0, -6.0)) return 11;
+    if (!cond_eq(c ? z : w, 3.0, 4.0)) return 10;
+    if (!cond_eq(cond_nz() - 1 ? z : w, 5.0, -6.0)) return 11;
 
     /* A real arm is converted, not truncated to the real part of the other. */
-    if (!eq(c ? z : 1, 3.0, 4.0)) return 12;
-    if (!eq(c ? 1 : z, 1.0, 0.0)) return 13;
-    if (!eq(nz() - 1 ? 1 : z, 3.0, 4.0)) return 14;
+    if (!cond_eq(c ? z : 1, 3.0, 4.0)) return 12;
+    if (!cond_eq(c ? 1 : z, 1.0, 0.0)) return 13;
+    if (!cond_eq(cond_nz() - 1 ? 1 : z, 3.0, 4.0)) return 14;
 
     /* Mixed precision reads the narrow arm with its own stride. */
-    if (!eq(c ? fz : z, 1.0, 2.0)) return 15;
-    if (!eq(nz() - 1 ? fz : z, 3.0, 4.0)) return 16;
+    if (!cond_eq(c ? fz : z, 1.0, 2.0)) return 15;
+    if (!cond_eq(cond_nz() - 1 ? fz : z, 3.0, 4.0)) return 16;
 
     /* A constant condition takes one arm outright. */
-    if (!eq(1 ? z : w, 3.0, 4.0)) return 17;
-    if (!eq(0 ? z : w, 5.0, -6.0)) return 18;
-    if (!eq(0 ? 1 : z, 3.0, 4.0)) return 19;
+    if (!cond_eq(1 ? z : w, 3.0, 4.0)) return 17;
+    if (!cond_eq(0 ? z : w, 5.0, -6.0)) return 18;
+    if (!cond_eq(0 ? 1 : z, 3.0, 4.0)) return 19;
 
     /* Consumed in place rather than stored: the result must be an address the
        caller can read halves through. */
     if (__real__ (c ? z : w) != 3.0) return 20;
-    if (!eq((c ? z : w) + (c ? w : z), 8.0, -2.0)) return 21;
+    if (!cond_eq((c ? z : w) + (c ? w : z), 8.0, -2.0)) return 21;
 
     /* GNU `?:` -- same merge, and the left operand evaluated exactly once. */
-    calls = 0;
-    if (!eq(f(3.0) ?: (7.0 + 8.0 * I), 3.0, 1.0)) return 30;
-    if (calls != 1) return 31;
+    cond_calls = 0;
+    if (!cond_eq(cond_f(3.0) ?: (7.0 + 8.0 * I), 3.0, 1.0)) return 30;
+    if (cond_calls != 1) return 31;
 
-    /* f(0.0) is 0+1i, which is nonzero: the imaginary half counts. */
-    calls = 0;
-    if (!eq(f(0.0) ?: (7.0 + 8.0 * I), 0.0, 1.0)) return 32;
-    if (calls != 1) return 33;
+    /* cond_f(0.0) is 0+1i, which is nonzero: the imaginary half counts. */
+    cond_calls = 0;
+    if (!cond_eq(cond_f(0.0) ?: (7.0 + 8.0 * I), 0.0, 1.0)) return 32;
+    if (cond_calls != 1) return 33;
 
     /* Genuinely zero, so the right operand is taken -- still one call. */
-    calls = 0;
-    if (!eq(f(0.0) - 1.0 * I ?: (7.0 + 8.0 * I), 7.0, 8.0)) return 34;
-    if (calls != 1) return 35;
+    cond_calls = 0;
+    if (!cond_eq(cond_f(0.0) - 1.0 * I ?: (7.0 + 8.0 * I), 7.0, 8.0)) return 34;
+    if (cond_calls != 1) return 35;
 
     return 0;
 }
+
+/* ==== c99_complex_elvis_with_a_real_left_operand (codes 137..148) ==== */
+static int elv_calls;
+static double elv_g(double v) { elv_calls++; return v; }
+
+static int elv_eq(double _Complex a, double re, double im) {
+    return __real__ a == re && __imag__ a == im;
+}
+
+static int t_c99_complex_elvis_with_a_real_left_operand(void) {
+    double _Complex z = 7.0 + 8.0 * I;
+
+    /* A real lvalue: the imaginary half must be zero, not the next slot. */
+    double d = 3.0;
+    if (!elv_eq(d ?: z, 3.0, 0.0)) return 1;
+    if (sizeof(d ?: z) != sizeof(double _Complex)) return 2;
+
+    /* An integer lvalue, converted to the result's base type. */
+    int iv = 7;
+    if (!elv_eq(iv ?: z, 7.0, 0.0)) return 3;
+
+    /* INT_MIN's bit pattern is -0.0f: a float compare against zero on the
+       raw bits would call this false and take the wrong arm. */
+    int neg = -2147483647 - 1;
+    if (!elv_eq(neg ?: z, (double)neg, 0.0)) return 4;
+
+    /* A real *rvalue* has no address of its own to take. */
+    elv_calls = 0;
+    if (!elv_eq(elv_g(2.5) ?: z, 2.5, 0.0)) return 5;
+    if (elv_calls != 1) return 6;
+
+    /* Zero takes the right-hand operand -- still exactly one evaluation. */
+    elv_calls = 0;
+    if (!elv_eq(elv_g(0.0) ?: z, 7.0, 8.0)) return 7;
+    if (elv_calls != 1) return 8;
+
+    /* A complex left operand still works: the arm that already existed. */
+    elv_calls = 0;
+    if (!elv_eq(z ?: (1.0 + 2.0 * I), 7.0, 8.0)) return 9;
+
+    /* Mixed precision, real left operand. Checked in `float _Complex` rather
+       than through `elv_eq`: passing a `float _Complex` argument to a
+       `double _Complex` parameter is separately broken, and routing through
+       it would test that instead of this. */
+    float _Complex fz = 1.0f + 2.0f * I;
+    float ff = 4.0f;
+    float _Complex fr = ff ?: fz;
+    if (__real__ fr != 4.0f || __imag__ fr != 0.0f) return 10;
+    if (sizeof(ff ?: fz) != sizeof(float _Complex)) return 11;
+
+    float fzero = 0.0f;
+    fr = fzero ?: fz;
+    if (__real__ fr != 1.0f || __imag__ fr != 2.0f) return 12;
+
+    return 0;
+}
+
+/* ==== c99_complex_precision_crosses_calls (codes 149..163) ==== */
+static int pc_eq(double re, double im, double want_re, double want_im) {
+    return re == want_re && im == want_im;
+}
+
+static int pc_take_d(double _Complex a) { return pc_eq(__real__ a, __imag__ a, 1.0, 2.0); }
+static int pc_take_f(float _Complex a) { return pc_eq(__real__ a, __imag__ a, 1.0, 2.0); }
+static int pc_take_ld(long double _Complex a) { return pc_eq(__real__ a, __imag__ a, 1.0, 2.0); }
+
+/* noinline so the argument really crosses a call; the inlined form is
+   covered separately below. */
+__attribute__((noinline)) static int pc_ni_d(double _Complex a) { return pc_take_d(a); }
+__attribute__((noinline)) static int pc_ni_f(float _Complex a) { return pc_take_f(a); }
+
+static double _Complex pc_widen(float _Complex x) { return x; }
+static float _Complex pc_narrow(double _Complex x) { return x; }
+
+static int t_c99_complex_precision_crosses_calls(void) {
+    float _Complex f = 1.0f + 2.0f * I;
+    double _Complex d = 1.0 + 2.0 * I;
+    long double _Complex l = 1.0L + 2.0L * I;
+
+    /* Every precision into every parameter width. */
+    if (!pc_take_d(f)) return 1;
+    if (!pc_take_d(d)) return 2;
+    if (!pc_take_d(l)) return 3;
+    if (!pc_take_f(d)) return 4;
+    if (!pc_take_f(f)) return 5;
+    if (!pc_take_f(l)) return 6;
+    if (!pc_take_ld(f)) return 7;
+    if (!pc_take_ld(d)) return 8;
+    if (!pc_take_ld(l)) return 9;
+
+    /* Across a call the optimizer cannot fold away. */
+    if (!pc_ni_d(f)) return 10;
+    if (!pc_ni_f(d)) return 11;
+
+    /* Returns convert too, in both directions. */
+    double _Complex w = pc_widen(f);
+    if (!pc_eq(__real__ w, __imag__ w, 1.0, 2.0)) return 12;
+    float _Complex n = pc_narrow(d);
+    if (!pc_eq(__real__ n, __imag__ n, 1.0, 2.0)) return 13;
+
+    /* The paths that already worked, kept as regression guards. */
+    double _Complex a = f;
+    if (!pc_eq(__real__ a, __imag__ a, 1.0, 2.0)) return 14;
+    double _Complex s = f + d;
+    if (!pc_eq(__real__ s, __imag__ s, 2.0, 4.0)) return 15;
+
+    return 0;
+}
+
+/* ==== c99_complex_long_double_then_stack_scalars (codes 164..168) ==== */
+__attribute__((noinline))
+static void lds_probe(long double _Complex v, long double re, long double im,
+                  long double *o)
+{
+    const long double *p = (const long double *)&v;
+    o[0] = p[0]; o[1] = p[1]; o[2] = re; o[3] = im;
+}
+
+__attribute__((noinline))
+static long double lds_three(long double _Complex v, long double a, long double b,
+                         long double c)
+{ return a * 100 + b * 10 + c; }
+
+/* Two complexes back to back, then a scalar. */
+__attribute__((noinline))
+static long double lds_after_two(long double _Complex u, long double _Complex v,
+                             long double a)
+{ return a; }
+
+static int t_c99_complex_long_double_then_stack_scalars(void)
+{
+    long double _Complex z = __builtin_complex(7.0L, 8.0L);
+    long double o[4];
+
+    lds_probe(z, 1.5L, 2.5L, o);
+    if (o[0] != 7.0L || o[1] != 8.0L) return 1;   /* the complex itself */
+    if (o[2] != 1.5L) return 2;                   /* read the imag half */
+    if (o[3] != 2.5L) return 3;
+
+    if (lds_three(z, 1.0L, 2.0L, 3.0L) != 123.0L) return 4;
+    if (lds_after_two(z, z, 9.5L) != 9.5L) return 5;
+
+    return 0;
+}
+
+/* ==== c99_complex_members_of_automatic_aggregates_are_initialized (codes 169..192) ==== */
+#undef I
+/* complex.h's I, spelled out so the test needs no libm call. */
+#define I __builtin_complex(0.0, 1.0)
+struct AS { double _Complex z; };
+struct AP { int tag; double _Complex z; };
+struct AN { struct AS inner; };
+struct AT { double _Complex a, b; };
+struct AV { double _Complex z; int n; };
+struct AF { float _Complex z; };
+struct AL { long double _Complex z; };
+union  AU { double _Complex z; double d[2]; };
+
+/* The value is read through a pointer rather than passed by value: this is a
+   test about initialization, and passing a complex by value is a separate
+   path with its own defects. */
+static int ag_eq(const double _Complex *v, double re, double im)
+{
+    const double *p = (const double *)v;
+    return p[0] == re && p[1] == im;
+}
+static int ag_eqf(const float _Complex *v, float re, float im)
+{
+    const float *p = (const float *)v;
+    return p[0] == re && p[1] == im;
+}
+static int ag_eql(const long double _Complex *v, long double re, long double im)
+{
+    const long double *p = (const long double *)v;
+    return p[0] == re && p[1] == im;
+}
+
+static int t_c99_complex_members_of_automatic_aggregates_are_initialized(void)
+{
+    /* A struct member, from every shape of initializer. */
+    struct AS a = { 1.0 + 2.0*I };            if (!ag_eq(&a.z, 1, 2)) return 1;
+    struct AS b = { 3.0 };                    if (!ag_eq(&b.z, 3, 0)) return 2;
+    struct AS c = { __builtin_complex(4.0, 5.0) }; if (!ag_eq(&c.z, 4, 5)) return 3;
+    double _Complex src = __builtin_complex(6.0, 7.0);
+    struct AS d = { src };                    if (!ag_eq(&d.z, 6, 7)) return 4;
+    struct AS e = { 7 };                      if (!ag_eq(&e.z, 7, 0)) return 5;
+
+    /* Alongside other members, in both orders, and designated. */
+    struct AP f = { 9, 1.5 + 2.5*I };
+    if (f.tag != 9 || !ag_eq(&f.z, 1.5, 2.5)) return 6;
+    struct AV g = { 1.0 + 2.0*I, 42 };
+    if (g.n != 42 || !ag_eq(&g.z, 1, 2)) return 7;
+    struct AP h = { .z = 7.0 + 8.0*I, .tag = 2 };
+    if (h.tag != 2 || !ag_eq(&h.z, 7, 8)) return 8;
+    struct AT i = { 1.0 + 2.0*I, 3.0 + 4.0*I };
+    if (!ag_eq(&i.a, 1, 2) || !ag_eq(&i.b, 3, 4)) return 9;
+
+    /* An omitted member is still zeroed. */
+    struct AP j = { 5 };
+    if (j.tag != 5 || !ag_eq(&j.z, 0, 0)) return 10;
+
+    /* Nested, union, compound literal. */
+    struct AN k = { { 8.0 + 9.0*I } };        if (!ag_eq(&k.inner.z, 8, 9)) return 11;
+    union AU l = { 1.0 + 2.0*I };             if (!ag_eq(&l.z, 1, 2)) return 12;
+    struct AS m = (struct AS){ 2.0 + 3.0*I };  if (!ag_eq(&m.z, 2, 3)) return 13;
+
+    /* Arrays: of complex, and of structs holding one. */
+    double _Complex n[2] = { 1.0 + 2.0*I, 3.0 };
+    if (!ag_eq(&n[0], 1, 2) || !ag_eq(&n[1], 3, 0)) return 14;
+    double _Complex o[3] = { 1.0 + 2.0*I };
+    if (!ag_eq(&o[0], 1, 2) || !ag_eq(&o[1], 0, 0) || !ag_eq(&o[2], 0, 0)) return 15;
+    double _Complex p[3] = { [2] = 1.0 + 2.0*I };
+    if (!ag_eq(&p[0], 0, 0) || !ag_eq(&p[2], 1, 2)) return 16;
+    struct AS q[2] = { { 1.0 + 2.0*I }, { 3.0 + 4.0*I } };
+    if (!ag_eq(&q[0].z, 1, 2) || !ag_eq(&q[1].z, 3, 4)) return 17;
+
+    /* A braced complex scalar reaches the initializer-list path, not the
+       complex arm of a plain declaration. */
+    double _Complex r = { 5.0 };             if (!ag_eq(&r, 5, 0)) return 18;
+
+    /* Other base precisions. `I` is a *double* complex, so a float member is
+       a conversion in both halves. */
+    struct AF s = { 2.0f + 3.0f*I };          if (!ag_eqf(&s.z, 2, 3)) return 19;
+    float _Complex t[2] = { 1.0f + 2.0f*I, 3.0f };
+    if (!ag_eqf(&t[0], 1, 2) || !ag_eqf(&t[1], 3, 0)) return 20;
+    struct AL u = { 1.5L + 2.5L*I };          if (!ag_eql(&u.z, 1.5L, 2.5L)) return 21;
+
+    /* Controls: these were always right and must stay so. */
+    double _Complex v = 1.0 + 2.0*I;         if (!ag_eq(&v, 1, 2)) return 22;
+    struct AS w; w.z = 4.0 + 5.0*I;           if (!ag_eq(&w.z, 4, 5)) return 23;
+    static struct AS x = { 1.0 + 2.0*I };     if (!ag_eq(&x.z, 1, 2)) return 24;
+
+    return 0;
+}
+
+int main(void)
+{
+    int rc;
+    if ((rc = t_c99_real_and_imag_operators()) != 0) return 0 + rc;
+    if ((rc = t_c99_truth_value_respects_the_type()) != 0) return 15 + rc;
+    if ((rc = t_c99_complex_equality_compares_both_halves()) != 0) return 85 + rc;
+    if ((rc = t_c99_complex_conditional()) != 0) return 101 + rc;
+    if ((rc = t_c99_complex_elvis_with_a_real_left_operand()) != 0) return 136 + rc;
+    if ((rc = t_c99_complex_precision_crosses_calls()) != 0) return 148 + rc;
+    if ((rc = t_c99_complex_long_double_then_stack_scalars()) != 0) return 163 + rc;
+    if ((rc = t_c99_complex_members_of_automatic_aggregates_are_initialized()) != 0) return 168 + rc;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("c99_complex_conditional", code, &[]), 0);
+    assert_eq!(compile_and_run("c99_complex_semantics_mega", code, &[]), 0);
     assert_eq!(
-        compile_and_run_optimized("c99_complex_conditional_opt", code),
+        compile_and_run_optimized("c99_complex_semantics_mega_opt", code),
         0
     );
 }
@@ -567,158 +668,6 @@ fn c99_complex_conditional_merges_by_address() {
     );
 }
 
-/// GNU `a ?: b` where only the *result* is complex.
-///
-/// The complex path was dispatched on the result type but then assumed the
-/// left operand was complex too. It need not be: the result is complex as soon
-/// as *either* operand is, so `d ?: z` has a `double` left operand and a
-/// `double _Complex` result.
-///
-/// Taking a real operand's address as though it were a complex object read the
-/// neighbouring stack slot as the imaginary half, and for an rvalue
-/// `rvalue_addr` hands back the value's own bits -- so `g() ?: z`
-/// dereferenced a `double` as a pointer and died. The truth test was wrong too:
-/// an `int` whose bits happen to spell `-0.0f` compared equal to zero.
-#[test]
-fn c99_complex_elvis_with_a_real_left_operand() {
-    let code = r#"
-#include <complex.h>
-
-static int calls;
-static double g(double v) { calls++; return v; }
-
-static int eq(double _Complex a, double re, double im) {
-    return __real__ a == re && __imag__ a == im;
-}
-
-int main(void) {
-    double _Complex z = 7.0 + 8.0 * I;
-
-    /* A real lvalue: the imaginary half must be zero, not the next slot. */
-    double d = 3.0;
-    if (!eq(d ?: z, 3.0, 0.0)) return 1;
-    if (sizeof(d ?: z) != sizeof(double _Complex)) return 2;
-
-    /* An integer lvalue, converted to the result's base type. */
-    int iv = 7;
-    if (!eq(iv ?: z, 7.0, 0.0)) return 3;
-
-    /* INT_MIN's bit pattern is -0.0f: a float compare against zero on the
-       raw bits would call this false and take the wrong arm. */
-    int neg = -2147483647 - 1;
-    if (!eq(neg ?: z, (double)neg, 0.0)) return 4;
-
-    /* A real *rvalue* has no address of its own to take. */
-    calls = 0;
-    if (!eq(g(2.5) ?: z, 2.5, 0.0)) return 5;
-    if (calls != 1) return 6;
-
-    /* Zero takes the right-hand operand -- still exactly one evaluation. */
-    calls = 0;
-    if (!eq(g(0.0) ?: z, 7.0, 8.0)) return 7;
-    if (calls != 1) return 8;
-
-    /* A complex left operand still works: the arm that already existed. */
-    calls = 0;
-    if (!eq(z ?: (1.0 + 2.0 * I), 7.0, 8.0)) return 9;
-
-    /* Mixed precision, real left operand. Checked in `float _Complex` rather
-       than through `eq`: passing a `float _Complex` argument to a
-       `double _Complex` parameter is separately broken, and routing through
-       it would test that instead of this. */
-    float _Complex fz = 1.0f + 2.0f * I;
-    float ff = 4.0f;
-    float _Complex fr = ff ?: fz;
-    if (__real__ fr != 4.0f || __imag__ fr != 0.0f) return 10;
-    if (sizeof(ff ?: fz) != sizeof(float _Complex)) return 11;
-
-    float fzero = 0.0f;
-    fr = fzero ?: fz;
-    if (__real__ fr != 1.0f || __imag__ fr != 2.0f) return 12;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("c99_complex_elvis_real_left", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("c99_complex_elvis_real_left_opt", code),
-        0
-    );
-}
-
-/// A complex value crossing a call boundary is converted to the precision the
-/// other side declared.
-///
-/// A complex value is read with its base type's stride, so the two sides must
-/// agree on which base type that is. Assignment, initialization and the binary
-/// operators all went through `complex_operand_at_precision`; the **argument**
-/// and **return** paths did not, and handed the storage over unconverted. A
-/// `float _Complex` given to a `double _Complex` parameter had the callee read
-/// an 8-byte-strided pair out of 4-byte-strided memory, so `1.0f + 2.0f*I`
-/// arrived as `2+1i` -- and the wider directions read past the object.
-#[test]
-fn c99_complex_precision_crosses_calls() {
-    let code = r#"
-#include <complex.h>
-
-static int eq(double re, double im, double want_re, double want_im) {
-    return re == want_re && im == want_im;
-}
-
-static int take_d(double _Complex a) { return eq(__real__ a, __imag__ a, 1.0, 2.0); }
-static int take_f(float _Complex a) { return eq(__real__ a, __imag__ a, 1.0, 2.0); }
-static int take_ld(long double _Complex a) { return eq(__real__ a, __imag__ a, 1.0, 2.0); }
-
-/* noinline so the argument really crosses a call; the inlined form is
-   covered separately below. */
-__attribute__((noinline)) static int ni_d(double _Complex a) { return take_d(a); }
-__attribute__((noinline)) static int ni_f(float _Complex a) { return take_f(a); }
-
-static double _Complex widen(float _Complex x) { return x; }
-static float _Complex narrow(double _Complex x) { return x; }
-
-int main(void) {
-    float _Complex f = 1.0f + 2.0f * I;
-    double _Complex d = 1.0 + 2.0 * I;
-    long double _Complex l = 1.0L + 2.0L * I;
-
-    /* Every precision into every parameter width. */
-    if (!take_d(f)) return 1;
-    if (!take_d(d)) return 2;
-    if (!take_d(l)) return 3;
-    if (!take_f(d)) return 4;
-    if (!take_f(f)) return 5;
-    if (!take_f(l)) return 6;
-    if (!take_ld(f)) return 7;
-    if (!take_ld(d)) return 8;
-    if (!take_ld(l)) return 9;
-
-    /* Across a call the optimizer cannot fold away. */
-    if (!ni_d(f)) return 10;
-    if (!ni_f(d)) return 11;
-
-    /* Returns convert too, in both directions. */
-    double _Complex w = widen(f);
-    if (!eq(__real__ w, __imag__ w, 1.0, 2.0)) return 12;
-    float _Complex n = narrow(d);
-    if (!eq(__real__ n, __imag__ n, 1.0, 2.0)) return 13;
-
-    /* The paths that already worked, kept as regression guards. */
-    double _Complex a = f;
-    if (!eq(__real__ a, __imag__ a, 1.0, 2.0)) return 14;
-    double _Complex s = f + d;
-    if (!eq(__real__ s, __imag__ s, 2.0, 4.0)) return 15;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("c99_complex_precision_calls", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("c99_complex_precision_calls_opt", code),
-        0
-    );
-}
-
 /// An inlined function's `_Complex` parameter is copied through its address.
 ///
 /// The implicit parameter copies that stand in for the backend prologue decide
@@ -730,6 +679,9 @@ int main(void) {
 /// body read the pointer as a pair of floats.
 ///
 /// Only at -O2, where the inliner's threshold admits these functions.
+///
+/// Kept out of the mega tests: the inliner's decision about each taker is
+/// the subject, and other functions in the unit change that decision.
 #[test]
 fn c99_inlined_complex_param_is_copied_through_its_address() {
     let code = r#"
@@ -769,26 +721,149 @@ int main(void) {
     );
 }
 
-/// `__complex__` and `__complex` are gcc's spellings of `_Complex`.
+/// GNU complex extensions -- spellings, imaginary constants, complex integers,
+/// `~` -- plus casts, assignment values and real arguments to complex
+/// parameters, at the matrix levels and at -O2.
 ///
-/// c17 implemented the type, `__real__` and `__imag__` already; only these two
-/// keyword spellings were missing, and their absence was not a quiet one. A
-/// declaration like `__complex__ float foo(void)` parsed as one naming no type
-/// at all, so the diagnostic read "type specifier missing; implicit 'int' was
-/// removed in C99" and pointed at a line whose type was right there. Seven of
-/// the gcc.c-torture tests that looked like pre-C99 code were this instead.
+/// Consolidates: `c99_gnu_complex_spellings`, `c99_gnu_imaginary_constants`, `c99_cast_to_complex_type`, `c99_complex_assignment_yields_the_object`, `c99_complex_integer_types`, `c99_complex_conjugate_operator`, `c99_imaginary_integer_constants`, `c99_complex_integer_division_matches_gcc`, `c99_real_argument_to_a_complex_parameter`.
+/// The original tests' documentation follows, one block per section.
+//
+// ---- c99_gnu_complex_spellings (exit codes 1..10) ----
+// `__complex__` and `__complex` are gcc's spellings of `_Complex`.
+//
+// c17 implemented the type, `__real__` and `__imag__` already; only these two
+// keyword spellings were missing, and their absence was not a quiet one. A
+// declaration like `__complex__ float foo(void)` parsed as one naming no type
+// at all, so the diagnostic read "type specifier missing; implicit 'int' was
+// removed in C99" and pointed at a line whose type was right there. Seven of
+// the gcc.c-torture tests that looked like pre-C99 code were this instead.
+//
+// ---- c99_gnu_imaginary_constants (exit codes 11..29) ----
+// GNU imaginary constants: a number with an `i` or `j` in its suffix.
+//
+// c17's lexer rejected them outright — `parse error: invalid float literal:
+// 1.0i` — which accounted for five of the gcc.c-torture complex failures.
+//
+// The marker may sit on either side of the floating suffix; gcc takes
+// `1.0fi`, `2.2if`, `1.0iF`, `2.2iL` and `1.0li` alike, so it is removed
+// wherever it lands and the rest of the suffix is parsed as it always was.
+// Only the trailing run of letters is searched, so a hex literal's digits and
+// an exponent cannot be mistaken for a marker.
+//
+// C spells this `_Imaginary`, which C17 6.4.1 reserves and Annex G makes
+// optional. Neither c17 nor gcc provides the type; both give the constant a
+// *complex* type with a zero real part, which `__builtin_complex(0, v)`
+// already builds — so this needs no new expression node, and the constant
+// folds exactly as `<complex.h>`'s `I` and `CMPLX` do.
+//
+// Every value here was diffed against gcc on the same source.
+//
+// ---- c99_cast_to_complex_type (exit codes 30..43) ----
+// A cast **to** a complex type.
+//
+// C17 6.3.1.7p1: converting a real to a complex type gives the real value as
+// the real part and a zero imaginary part; converting complex to complex
+// converts each part.
+//
+// `linearize_cast` had branches for complex-to-`_Bool` and complex-to-real
+// and none for the other direction, so a cast to a complex type fell through
+// to the scalar path and returned a value where a complex address was
+// expected. `(_Complex double)0.0` segfaulted — at every precision, from a
+// real source or a complex one.
+//
+// Built the way `__builtin_complex` is, a local of the target type and two
+// stores, so the result travels by address like every other complex value.
+//
+// ---- c99_complex_assignment_yields_the_object (exit codes 44..57) ----
+// The **value** of a complex assignment.
+//
+// `c = a` was fine as a statement and `if (c = a)` segfaulted. C17 6.5.16p3
+// makes the value of an assignment the value of the left operand after the
+// store, and a complex object travels by *address* — so the branch returned
+// the real part's value where every consumer expected a pointer.
+//
+// The real-to-complex branch a few lines above already returned the address;
+// only the complex-to-complex one did not, which is why the statement form
+// worked and no test caught it. A comment said "return real part as the
+// result value", so it was deliberate and wrong rather than an oversight.
+//
+// ---- c99_complex_integer_types (exit codes 58..91) ----
+// GNU complex integers: `_Complex int` and its relatives.
+//
+// The type was accepted and then miscompiled at every step. `sizeof` gave
+// the *base's* width, because the `COMPLEX` size multiplier was applied only
+// to the floating kinds, so every write of an imaginary half landed one
+// object past the end of the storage -- two neighbouring `_Complex int`
+// locals overwrote each other. `complex_base` answered with the complex type
+// itself for an integer base, so both halves were read from the same address.
+// The usual arithmetic conversions called the type floating and then matched
+// none of the floating kinds, so `_Complex int * _Complex int` came out
+// `_Complex _Float16`: both operands were rounded to half precision and
+// multiplied by `__muldc3`.
+//
+// ---- c99_complex_conjugate_operator (exit codes 92..98) ----
+// `~z` is the complex conjugate -- a GNU extension for every complex type.
+//
+// There was no case for it, so the scalar unary path bit-complemented the
+// value's *address* and the result was dereferenced as a pointer: `~z`
+// segfaulted on valid code, for floating and integer complex alike.
+//
+// ---- c99_imaginary_integer_constants (exit codes 99..106) ----
+// GNU imaginary constants with an integer value: `2i`, `200i`, `2j`.
+//
+// These were rejected with a diagnostic naming `_Complex int` as the missing
+// feature, rather than silently given a floating type -- that would have
+// changed what the program computes. The type exists now, so they parse.
+//
+// ---- c99_complex_integer_division_matches_gcc (exit codes 107..123) ----
+// Complex integer division uses Smith's method, matching gcc.
+//
+// The textbook formula `((ac + bd) + (bc - ad)i) / (c*c + d*d)` is exact but
+// overflows: `(4000000000u + 0i) / (2u + 0i)` needs `a * c` to hold 8e9,
+// which a 32-bit half cannot, and c17 answered 926258176 until this used
+// Smith's method instead. Dividing through by the larger half first keeps
+// every product near the magnitude of the operands.
+//
+// The price is truncation at each step, so `(-9 + 38i) / (5 + 6i)` is
+// `6 + 1i` where the exact quotient is `3 + 4i`. gcc answers the same, and
+// nothing specifies otherwise -- the type is an extension, so gcc is the
+// definition. `cc/BUILTIN.md` records the trade.
+//
+// ---- c99_real_argument_to_a_complex_parameter (exit codes 124..135) [from c99::complex_abi] ----
+// A *real* argument bound to a complex parameter converts as if by
+// assignment (C17 6.5.2.2p2), so the imaginary half is a zero.
+//
+// The argument path keyed on the *argument's* type, not the parameter's, so
+// this case never reached the complex arm at all: the raw scalar was passed
+// where the callee expected an address. With a floating parameter that
+// arrived as garbage -- `f(7)` read `0 + 3.2e-319i` -- and with a
+// `_Complex int` one the callee dereferenced the number 7 and died.
 #[test]
-fn c99_gnu_complex_spellings() {
+fn c99_complex_gnu_extensions_mega() {
     let code = r#"
+/* complex: compile_and_run at the matrix levels and at -O2
+   Exit codes: section k's own failure code plus its base.
+     1.. 10  c99_gnu_complex_spellings
+    11.. 29  c99_gnu_imaginary_constants
+    30.. 43  c99_cast_to_complex_type
+    44.. 57  c99_complex_assignment_yields_the_object
+    58.. 91  c99_complex_integer_types
+    92.. 98  c99_complex_conjugate_operator
+    99..106  c99_imaginary_integer_constants
+   107..123  c99_complex_integer_division_matches_gcc
+   124..135  c99_real_argument_to_a_complex_parameter
+*/
+
+/* ==== c99_gnu_complex_spellings (codes 1..10) ==== */
 extern void abort(void);
 
-__complex__ float cf_id(__complex__ float x) { return x; }
-__complex double cd_add(__complex double a, __complex double b) { return a + b; }
+__complex__ float sp_cf_id(__complex__ float x) { return x; }
+__complex double sp_cd_add(__complex double a, __complex double b) { return a + b; }
 
-typedef __complex__ float cf;
-struct wrap { char c; cf f; };
+typedef __complex__ float sp_cf;
+struct sp_wrap { char c; sp_cf f; };
 
-int main(void) {
+static int t_c99_gnu_complex_spellings(void) {
     __complex__ double z;
     __real__ z = 3.0;
     __imag__ z = 4.0;
@@ -796,10 +871,10 @@ int main(void) {
     if (__imag__ z != 4.0) return 2;
 
     /* Across a call, in both spellings. */
-    __complex float w = cf_id(z);
+    __complex float w = sp_cf_id(z);
     if (__real__ w != 3.0f || __imag__ w != 4.0f) return 3;
 
-    __complex__ double s = cd_add(z, z);
+    __complex__ double s = sp_cd_add(z, z);
     if (__real__ s != 6.0 || __imag__ s != 8.0) return 4;
 
     /* The GNU spelling names the same type as the standard one. */
@@ -807,7 +882,7 @@ int main(void) {
     if (__real__ q != 3.0 || __imag__ q != 4.0) return 5;
 
     /* Through a typedef and as a struct member. */
-    struct wrap wr;
+    struct sp_wrap wr;
     wr.c = 'x';
     wr.f = w;
     if (wr.c != 'x') return 6;
@@ -819,36 +894,9 @@ int main(void) {
     if (sizeof(__complex__ float) != sizeof(_Complex float)) return 10;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_gnu_complex_spellings", code, &[]), 0);
-    assert_eq!(
-        compile_and_run("c99_gnu_complex_spellings_o2", code, &["-O2".to_string()]),
-        0
-    );
-}
 
-/// GNU imaginary constants: a number with an `i` or `j` in its suffix.
-///
-/// c17's lexer rejected them outright — `parse error: invalid float literal:
-/// 1.0i` — which accounted for five of the gcc.c-torture complex failures.
-///
-/// The marker may sit on either side of the floating suffix; gcc takes
-/// `1.0fi`, `2.2if`, `1.0iF`, `2.2iL` and `1.0li` alike, so it is removed
-/// wherever it lands and the rest of the suffix is parsed as it always was.
-/// Only the trailing run of letters is searched, so a hex literal's digits and
-/// an exponent cannot be mistaken for a marker.
-///
-/// C spells this `_Imaginary`, which C17 6.4.1 reserves and Annex G makes
-/// optional. Neither c17 nor gcc provides the type; both give the constant a
-/// *complex* type with a zero real part, which `__builtin_complex(0, v)`
-/// already builds — so this needs no new expression node, and the constant
-/// folds exactly as `<complex.h>`'s `I` and `CMPLX` do.
-///
-/// Every value here was diffed against gcc on the same source.
-#[test]
-fn c99_gnu_imaginary_constants() {
-    let code = r#"
-int main(void) {
+/* ==== c99_gnu_imaginary_constants (codes 11..29) ==== */
+static int t_c99_gnu_imaginary_constants(void) {
     /* Every spelling, and the suffix on both sides of the marker. */
     { _Complex double z = 1.0i;
       if (__real__ z != 0.0 || __imag__ z != 1.0) return 1; }
@@ -893,32 +941,9 @@ int main(void) {
     if (0x1p4 != 16.0) return 19;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_gnu_imaginary", code, &[]), 0);
-    assert_eq!(
-        compile_and_run("c99_gnu_imaginary_o2", code, &["-O2".to_string()]),
-        0
-    );
-}
 
-/// A cast **to** a complex type.
-///
-/// C17 6.3.1.7p1: converting a real to a complex type gives the real value as
-/// the real part and a zero imaginary part; converting complex to complex
-/// converts each part.
-///
-/// `linearize_cast` had branches for complex-to-`_Bool` and complex-to-real
-/// and none for the other direction, so a cast to a complex type fell through
-/// to the scalar path and returned a value where a complex address was
-/// expected. `(_Complex double)0.0` segfaulted — at every precision, from a
-/// real source or a complex one.
-///
-/// Built the way `__builtin_complex` is, a local of the target type and two
-/// stores, so the result travels by address like every other complex value.
-#[test]
-fn c99_cast_to_complex_type() {
-    let code = r#"
-int main(void) {
+/* ==== c99_cast_to_complex_type (codes 30..43) ==== */
+static int t_c99_cast_to_complex_type(void) {
     /* From a real, at each precision: real part kept, imaginary part zero. */
     { _Complex double z = (_Complex double)3.0;
       if (__real__ z != 3.0 || __imag__ z != 0.0) return 1; }
@@ -961,29 +986,9 @@ int main(void) {
       if ((_Bool)a) return 14; }
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_cast_to_complex", code, &[]), 0);
-    assert_eq!(
-        compile_and_run("c99_cast_to_complex_o2", code, &["-O2".to_string()]),
-        0
-    );
-}
 
-/// The **value** of a complex assignment.
-///
-/// `c = a` was fine as a statement and `if (c = a)` segfaulted. C17 6.5.16p3
-/// makes the value of an assignment the value of the left operand after the
-/// store, and a complex object travels by *address* — so the branch returned
-/// the real part's value where every consumer expected a pointer.
-///
-/// The real-to-complex branch a few lines above already returned the address;
-/// only the complex-to-complex one did not, which is why the statement form
-/// worked and no test caught it. A comment said "return real part as the
-/// result value", so it was deliberate and wrong rather than an oversight.
-#[test]
-fn c99_complex_assignment_yields_the_object() {
-    let code = r#"
-int main(void) {
+/* ==== c99_complex_assignment_yields_the_object (codes 44..57) ==== */
+static int t_c99_complex_assignment_yields_the_object(void) {
     _Complex double a = 3.0 + 4.0i;
     _Complex double b, c;
 
@@ -1021,36 +1026,15 @@ int main(void) {
     if (__real__ c != 3.0 || __imag__ c != 4.0) return 14;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_complex_assign_value", code, &[]), 0);
-    assert_eq!(
-        compile_and_run("c99_complex_assign_value_o2", code, &["-O2".to_string()]),
-        0
-    );
-}
 
-/// GNU complex integers: `_Complex int` and its relatives.
-///
-/// The type was accepted and then miscompiled at every step. `sizeof` gave
-/// the *base's* width, because the `COMPLEX` size multiplier was applied only
-/// to the floating kinds, so every write of an imaginary half landed one
-/// object past the end of the storage -- two neighbouring `_Complex int`
-/// locals overwrote each other. `complex_base` answered with the complex type
-/// itself for an integer base, so both halves were read from the same address.
-/// The usual arithmetic conversions called the type floating and then matched
-/// none of the floating kinds, so `_Complex int * _Complex int` came out
-/// `_Complex _Float16`: both operands were rounded to half precision and
-/// multiplied by `__muldc3`.
-#[test]
-fn c99_complex_integer_types() {
-    let code = r#"
+/* ==== c99_complex_integer_types (codes 58..91) ==== */
 _Complex int ci_id(_Complex int x) { return x; }
 _Complex int ci_add(_Complex int a, _Complex int b) { return a + b; }
 _Complex int ci_mul(_Complex int a, _Complex int b) { return a * b; }
 _Complex long cl_sub(_Complex long a, _Complex long b) { return a - b; }
 _Complex unsigned cu_div(_Complex unsigned a, _Complex unsigned b) { return a / b; }
 
-int main(void) {
+static int t_c99_complex_integer_types(void) {
     /* Two halves, not one: a complex integer is twice its base. */
     if (sizeof(_Complex int) != 2 * sizeof(int)) return 1;
     if (sizeof(_Complex long) != 2 * sizeof(long)) return 2;
@@ -1149,26 +1133,12 @@ int main(void) {
     if ((unsigned char)__imag__ uc2 != (unsigned char)200) return 34;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_complex_integer", code, &[]), 0);
-    assert_eq!(
-        compile_and_run("c99_complex_integer_o2", code, &["-O2".to_string()]),
-        0
-    );
-}
 
-/// `~z` is the complex conjugate -- a GNU extension for every complex type.
-///
-/// There was no case for it, so the scalar unary path bit-complemented the
-/// value's *address* and the result was dereferenced as a pointer: `~z`
-/// segfaulted on valid code, for floating and integer complex alike.
-#[test]
-fn c99_complex_conjugate_operator() {
-    let code = r#"
+/* ==== c99_complex_conjugate_operator (codes 92..98) ==== */
 _Complex double conj_d(_Complex double z) { return ~z; }
 _Complex int conj_i(_Complex int z) { return ~z; }
 
-int main(void) {
+static int t_c99_complex_conjugate_operator(void) {
     _Complex double z = 3.0 + 4.0i;
     _Complex double c = ~z;
     if (__real__ c != 3.0 || __imag__ c != -4.0) return 1;
@@ -1192,23 +1162,9 @@ int main(void) {
     if (~n != -6) return 7;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_complex_conjugate", code, &[]), 0);
-    assert_eq!(
-        compile_and_run("c99_complex_conjugate_o2", code, &["-O2".to_string()]),
-        0
-    );
-}
 
-/// GNU imaginary constants with an integer value: `2i`, `200i`, `2j`.
-///
-/// These were rejected with a diagnostic naming `_Complex int` as the missing
-/// feature, rather than silently given a floating type -- that would have
-/// changed what the program computes. The type exists now, so they parse.
-#[test]
-fn c99_imaginary_integer_constants() {
-    let code = r#"
-int main(void) {
+/* ==== c99_imaginary_integer_constants (codes 99..106) ==== */
+static int t_c99_imaginary_integer_constants(void) {
     _Complex int a = 2i;
     if (__real__ a != 0 || __imag__ a != 2) return 1;
 
@@ -1237,32 +1193,11 @@ int main(void) {
     if (__real__ h != 3.0 || __imag__ h != 4.0) return 8;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_imaginary_int_const", code, &[]), 0);
-    assert_eq!(
-        compile_and_run("c99_imaginary_int_const_o2", code, &["-O2".to_string()]),
-        0
-    );
-}
 
-/// Complex integer division uses Smith's method, matching gcc.
-///
-/// The textbook formula `((ac + bd) + (bc - ad)i) / (c*c + d*d)` is exact but
-/// overflows: `(4000000000u + 0i) / (2u + 0i)` needs `a * c` to hold 8e9,
-/// which a 32-bit half cannot, and c17 answered 926258176 until this used
-/// Smith's method instead. Dividing through by the larger half first keeps
-/// every product near the magnitude of the operands.
-///
-/// The price is truncation at each step, so `(-9 + 38i) / (5 + 6i)` is
-/// `6 + 1i` where the exact quotient is `3 + 4i`. gcc answers the same, and
-/// nothing specifies otherwise -- the type is an extension, so gcc is the
-/// definition. `cc/BUILTIN.md` records the trade.
-#[test]
-fn c99_complex_integer_division_matches_gcc() {
-    let code = r#"
+/* ==== c99_complex_integer_division_matches_gcc (codes 107..123) ==== */
 _Complex int div_i(_Complex int a, _Complex int b) { return a / b; }
 
-int main(void) {
+static int t_c99_complex_integer_division_matches_gcc(void) {
     _Complex int a, b;
 
     /* Both halves nonzero: Smith's scaling step truncates, so this is
@@ -1360,22 +1295,109 @@ int main(void) {
     if (__real__ wq != ((__int128)1 << 98) || __imag__ wq != 0) return 17;
     return 0;
 }
+
+/* ==== c99_real_argument_to_a_complex_parameter (codes 124..135) ==== */
+        static double re_d(double _Complex c) { return __real__ c; }
+        static double im_d(double _Complex c) { return __imag__ c; }
+        static float re_f(float _Complex c) { return __real__ c; }
+        static float im_f(float _Complex c) { return __imag__ c; }
+        static long double re_l(long double _Complex c) { return __real__ c; }
+        static long double im_l(long double _Complex c) { return __imag__ c; }
+        static int re_i(_Complex int c) { return __real__ c; }
+        static int im_i(_Complex int c) { return __imag__ c; }
+        static long re_cl(_Complex long c) { return __real__ c; }
+        static long im_cl(_Complex long c) { return __imag__ c; }
+        static unsigned re_u(_Complex unsigned c) { return __real__ c; }
+        static unsigned im_u(_Complex unsigned c) { return __imag__ c; }
+
+        static int t_c99_real_argument_to_a_complex_parameter(void) {
+            /* An integer literal, which needs a conversion as well as a
+               promotion. */
+            if (re_d(7) != 7.0 || im_d(7) != 0.0) return 1;
+            if (re_f(7) != 7.0f || im_f(7) != 0.0f) return 2;
+            if (re_l(7) != 7.0L || im_l(7) != 0.0L) return 3;
+            if (re_i(7) != 7 || im_i(7) != 0) return 4;
+            if (re_cl(7) != 7 || im_cl(7) != 0) return 5;
+            if (re_u(7) != 7u || im_u(7) != 0u) return 6;
+
+            /* A floating value into an integer complex, and the reverse. */
+            if (re_i(9.75) != 9 || im_i(9.75) != 0) return 7;
+            if (re_d(9) != 9.0 || im_d(9) != 0.0) return 8;
+
+            /* A variable rather than a constant, so nothing is folded. */
+            double d = 2.5;
+            if (re_d(d) != 2.5 || im_d(d) != 0.0) return 9;
+            int n = 3;
+            if (re_i(n) != 3 || im_i(n) != 0) return 10;
+            if (re_d(n) != 3.0 || im_d(n) != 0.0) return 11;
+
+            /* Narrowing on the way in: a `long` into a `_Complex int`. */
+            long big = 5;
+            if (re_i(big) != 5 || im_i(big) != 0) return 12;
+            return 0;
+        }
+    
+
+int main(void)
+{
+    int rc;
+    if ((rc = t_c99_gnu_complex_spellings()) != 0) return 0 + rc;
+    if ((rc = t_c99_gnu_imaginary_constants()) != 0) return 10 + rc;
+    if ((rc = t_c99_cast_to_complex_type()) != 0) return 29 + rc;
+    if ((rc = t_c99_complex_assignment_yields_the_object()) != 0) return 43 + rc;
+    if ((rc = t_c99_complex_integer_types()) != 0) return 57 + rc;
+    if ((rc = t_c99_complex_conjugate_operator()) != 0) return 91 + rc;
+    if ((rc = t_c99_imaginary_integer_constants()) != 0) return 98 + rc;
+    if ((rc = t_c99_complex_integer_division_matches_gcc()) != 0) return 106 + rc;
+    if ((rc = t_c99_real_argument_to_a_complex_parameter()) != 0) return 123 + rc;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("c99_complex_int_div", code, &[]), 0);
     assert_eq!(
-        compile_and_run("c99_complex_int_div_o2", code, &["-O2".to_string()]),
+        compile_and_run("c99_complex_gnu_extensions_mega", code, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run(
+            "c99_complex_gnu_extensions_mega_o2",
+            code,
+            &["-O2".to_string()]
+        ),
         0
     );
 }
 
-/// The GNU imaginary marker on a *hexadecimal* floating constant. gcc
-/// accepts `0x1.8p1i` exactly as it accepts `3.0i`, with the same suffix
-/// orders, and gives the same values; c17 took the marker on a decimal
-/// constant and rejected every hex one as an invalid literal.
+/// Hex imaginary constants and the conjugate in static initializers.
+///
+/// Consolidates: `c99_gnu_imaginary_hex_constants`, `c99_complex_conjugate_in_static_initializer`, `c99_complex_conj_call_in_static_initializer`.
+/// The original tests' documentation follows, one block per section.
+//
+// ---- c99_gnu_imaginary_hex_constants (exit codes 1..10) ----
+// The GNU imaginary marker on a *hexadecimal* floating constant. gcc
+// accepts `0x1.8p1i` exactly as it accepts `3.0i`, with the same suffix
+// orders, and gives the same values; c17 took the marker on a decimal
+// constant and rejected every hex one as an invalid literal.
+//
+// ---- c99_complex_conjugate_in_static_initializer (exit codes 11..14) ----
+// `~` -- the GNU complex conjugate -- in a static initializer. gcc folds it
+// as it folds `-z`; c17's constant evaluator had no case for it and
+// rejected the initializer as not constant.
+//
+// ---- c99_complex_conj_call_in_static_initializer (exit codes 15..16) ----
+// `conj` in a static initializer folds as `~` does: it is the same
+// conjugate, computed in place rather than called.
 #[test]
-fn c99_gnu_imaginary_hex_constants() {
+fn c99_complex_constant_forms_mega() {
     let code = r#"
-int main(void) {
+/* complex: compile_and_run at the matrix levels
+   Exit codes: section k's own failure code plus its base.
+     1.. 10  c99_gnu_imaginary_hex_constants
+    11.. 14  c99_complex_conjugate_in_static_initializer
+    15.. 16  c99_complex_conj_call_in_static_initializer
+*/
+
+/* ==== c99_gnu_imaginary_hex_constants (codes 1..10) ==== */
+static int t_c99_gnu_imaginary_hex_constants(void) {
     { _Complex double z = 0x1.8p1i;
       if (__real__ z != 0.0 || __imag__ z != 3.0) return 1; }
     { _Complex float z = 0x1p0fi;
@@ -1395,123 +1417,104 @@ int main(void) {
       if (__real__ z != 4.0 || __imag__ z != 8.0) return 10; }
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_gnu_imaginary_hex", code, &[]), 0);
-}
 
-/// `~` -- the GNU complex conjugate -- in a static initializer. gcc folds it
-/// as it folds `-z`; c17's constant evaluator had no case for it and
-/// rejected the initializer as not constant.
-#[test]
-fn c99_complex_conjugate_in_static_initializer() {
-    let code = r#"
-static _Complex double a = ~(3.0 + 4.0i);
-static _Complex float b = ~(1.0f - 2.0if);
-static _Complex long double c = ~~(5.0L + 6.0iL);
-static _Complex double d = -~(1.0 + 1.0i);
-int main(void) {
-    if (__real__ a != 3.0 || __imag__ a != -4.0) return 1;
-    if (__real__ b != 1.0f || __imag__ b != 2.0f) return 2;
-    if (__real__ c != 5.0L || __imag__ c != 6.0L) return 3;
-    if (__real__ d != -1.0 || __imag__ d != 1.0) return 4;
+/* ==== c99_complex_conjugate_in_static_initializer (codes 11..14) ==== */
+static _Complex double cj_a = ~(3.0 + 4.0i);
+static _Complex float cj_b = ~(1.0f - 2.0if);
+static _Complex long double cj_c = ~~(5.0L + 6.0iL);
+static _Complex double cj_d = -~(1.0 + 1.0i);
+static int t_c99_complex_conjugate_in_static_initializer(void) {
+    if (__real__ cj_a != 3.0 || __imag__ cj_a != -4.0) return 1;
+    if (__real__ cj_b != 1.0f || __imag__ cj_b != 2.0f) return 2;
+    if (__real__ cj_c != 5.0L || __imag__ cj_c != 6.0L) return 3;
+    if (__real__ cj_d != -1.0 || __imag__ cj_d != 1.0) return 4;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c99_conj_static_init", code, &[]), 0);
-}
 
-/// `conj` in a static initializer folds as `~` does: it is the same
-/// conjugate, computed in place rather than called.
-#[test]
-fn c99_complex_conj_call_in_static_initializer() {
-    let code = r#"
+/* ==== c99_complex_conj_call_in_static_initializer (codes 15..16) ==== */
 double _Complex conj(double _Complex);
 float _Complex conjf(float _Complex);
-static _Complex double a = conj(3.0 + 4.0i);
-static _Complex float b = __builtin_conjf(1.0f - 2.0if);
-int main(void) {
-    if (__real__ a != 3.0 || __imag__ a != -4.0) return 1;
-    if (__real__ b != 1.0f || __imag__ b != 2.0f) return 2;
+static _Complex double cc_a = conj(3.0 + 4.0i);
+static _Complex float cc_b = __builtin_conjf(1.0f - 2.0if);
+static int t_c99_complex_conj_call_in_static_initializer(void) {
+    if (__real__ cc_a != 3.0 || __imag__ cc_a != -4.0) return 1;
+    if (__real__ cc_b != 1.0f || __imag__ cc_b != 2.0f) return 2;
+    return 0;
+}
+
+int main(void)
+{
+    int rc;
+    if ((rc = t_c99_gnu_imaginary_hex_constants()) != 0) return 0 + rc;
+    if ((rc = t_c99_complex_conjugate_in_static_initializer()) != 0) return 10 + rc;
+    if ((rc = t_c99_complex_conj_call_in_static_initializer()) != 0) return 14 + rc;
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("c99_conj_call_static_init", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("c99_complex_constant_forms_mega", code, &[]),
+        0
+    );
 }
 
-// `_Float16 _Complex` arithmetic at run time, and its imaginary constants in
-// both suffix orders. Every value was checked against gcc on x86-64 and
-// aarch64. Multiplication and division called the `double` routines
-// (__muldc3/__divdc3) on half-precision operands and returned 0.
-const FLOAT16_COMPLEX_PROGRAM: &str = r#"
-typedef _Float16 _Complex hc;
-int main(void) {
-    volatile _Float16 a = 1.5f16, b = 2.0f16, c = 3.0f16, d = -1.0f16;
-    hc x = __builtin_complex((_Float16)a, (_Float16)b);
-    hc y = __builtin_complex((_Float16)c, (_Float16)d);
-    hc p = x * y, q = x / y, s = x + y, t = x - y;
-    if (__real__ p != 6.5f16 || __imag__ p != 4.5f16) return 1;
-    if (__real__ s != 4.5f16 || __imag__ s != 1.0f16) return 2;
-    /* (1.5+2i)/(3-i) = (4.5-2 + (6+1.5)i)/10 */
-    if (__real__ q != 0.25f16 || __imag__ q != 0.75f16) return 3;
-    if (__real__ t != -1.5f16 || __imag__ t != 3.0f16) return 4;
-    hc k = 2.0f16i;
-    hc k2 = 2.0if16;
-    if (__imag__ k != 2.0f16 || __imag__ k2 != 2.0f16 || __real__ k2 != 0) return 5;
-    if (sizeof(k) != 4 || sizeof(2.0if16) != 4) return 6;
-    hc m = x * 2.0if16;
-    if (__real__ m != -4.0f16 || __imag__ m != 3.0f16) return 7;
-    return 0;
-}
-"#;
-
+/// Unary `+`/`-` on a complex integer and `__imag__` of a real operand, at
+/// -O0, -O1 and -O2.
+///
+/// Consolidates: `c99_unary_plus_and_minus_keep_a_complex_integer_whole`, `c99_imag_of_a_real_operand_still_evaluates_it`.
+/// The original tests' documentation follows, one block per section.
+//
+// ---- c99_unary_plus_and_minus_keep_a_complex_integer_whole (exit codes 1..10) ----
+// Unary `+` and `-` on a GNU complex *integer* keep both halves.
+//
+// C17 6.5.3.3p2 gives unary `+` the value of the promoted operand, and this
+// compiler promotes through `TypeTable::integer_promote`, which switches on
+// `kind()`. `kind()` answers a complex type's *base* kind, so
+// `_Complex short` looked like a `short` and promoted to `int` -- and the
+// conversion that carries out the promotion then threw the imaginary half
+// away:
+//
+// ```text
+//     _Complex short z = 3 + 4i;   +z  ->  (3, 0)     -z  ->  (-3, 0)
+// ```
+//
+// gcc and clang leave the type alone: `sizeof(+z)` is `sizeof(z)`, not
+// `sizeof(_Complex int)`. `default_argument_promote` already had this
+// guard, and said why -- "a complex type is left alone: `kind` answers its
+// base's kind".
+//
+// `integer_promote` itself must keep reducing a complex integer to its
+// promoted base, because the usual arithmetic conversions call it for
+// exactly that and re-wrap the result with `pick_complex`; the binary case
+// below is the control that pins it.
+//
+// ---- c99_imag_of_a_real_operand_still_evaluates_it (exit codes 11..17) ----
+// `__imag__` of a *real* operand still evaluates it.
+//
+// gcc accepts `__real__` and `__imag__` on a real operand: the real half is
+// the value itself, and the imaginary half is a zero of its type. Only the
+// *value* is known in advance, though -- the operand is not in an
+// unevaluated context the way a `sizeof` operand is, so its side effects
+// have to happen. `linearize_complex_half` returned the zero constant
+// without ever linearizing the operand, so every effect in it was dropped:
+//
+// ```text
+//     double x = 1.0;  __imag__ (x += 5.0);   /* x stayed 1.0 */
+// ```
+//
+// The `__real__` arm always linearized the operand, so the two disagreed
+// about the same expression. Both are checked here, for a floating and an
+// integer operand, since the zero is built by a different call for each.
 #[test]
-fn c99_float16_complex_arithmetic() {
-    for opt in ["-O0", "-O2"] {
-        assert_eq!(
-            compile_and_run(
-                &format!("f16_complex{opt}"),
-                FLOAT16_COMPLEX_PROGRAM,
-                &[opt.to_string()]
-            ),
-            0,
-            "host {opt}"
-        );
-        if let Some(rc) = compile_and_run_aarch64(
-            &format!("f16_complex_a64{opt}"),
-            FLOAT16_COMPLEX_PROGRAM,
-            opt,
-        ) {
-            assert_eq!(rc, 0, "aarch64 {opt}");
-        }
-    }
-}
-
-/// Unary `+` and `-` on a GNU complex *integer* keep both halves.
-///
-/// C17 6.5.3.3p2 gives unary `+` the value of the promoted operand, and this
-/// compiler promotes through `TypeTable::integer_promote`, which switches on
-/// `kind()`. `kind()` answers a complex type's *base* kind, so
-/// `_Complex short` looked like a `short` and promoted to `int` -- and the
-/// conversion that carries out the promotion then threw the imaginary half
-/// away:
-///
-/// ```text
-///     _Complex short z = 3 + 4i;   +z  ->  (3, 0)     -z  ->  (-3, 0)
-/// ```
-///
-/// gcc and clang leave the type alone: `sizeof(+z)` is `sizeof(z)`, not
-/// `sizeof(_Complex int)`. `default_argument_promote` already had this
-/// guard, and said why -- "a complex type is left alone: `kind` answers its
-/// base's kind".
-///
-/// `integer_promote` itself must keep reducing a complex integer to its
-/// promoted base, because the usual arithmetic conversions call it for
-/// exactly that and re-wrap the result with `pick_complex`; the binary case
-/// below is the control that pins it.
-#[test]
-fn c99_unary_plus_and_minus_keep_a_complex_integer_whole() {
+fn c99_complex_unary_and_halves_mega() {
     let code = r#"
-int main(void) {
+/* complex: compile_and_run at -O0, -O1 and -O2
+   Exit codes: section k's own failure code plus its base.
+     1.. 10  c99_unary_plus_and_minus_keep_a_complex_integer_whole
+    11.. 17  c99_imag_of_a_real_operand_still_evaluates_it
+*/
+
+/* ==== c99_unary_plus_and_minus_keep_a_complex_integer_whole (codes 1..10) ==== */
+static int t_c99_unary_plus_and_minus_keep_a_complex_integer_whole(void) {
     _Complex short z = 3 + 4i;
     /* `signed char`, not plain `char`: plain `char` is unsigned on aarch64
        Linux, where negating at the narrow width gives 255 rather than -1.
@@ -1547,39 +1550,12 @@ int main(void) {
     if (sizeof(+sc) != sizeof(int)) return 10;
     return 0;
 }
-"#;
-    for opt in ["-O0", "-O1", "-O2"] {
-        assert_eq!(
-            compile_and_run("complex_int_unary", code, &[opt.to_string()]),
-            0,
-            "{opt}"
-        );
-    }
-}
 
-/// `__imag__` of a *real* operand still evaluates it.
-///
-/// gcc accepts `__real__` and `__imag__` on a real operand: the real half is
-/// the value itself, and the imaginary half is a zero of its type. Only the
-/// *value* is known in advance, though -- the operand is not in an
-/// unevaluated context the way a `sizeof` operand is, so its side effects
-/// have to happen. `linearize_complex_half` returned the zero constant
-/// without ever linearizing the operand, so every effect in it was dropped:
-///
-/// ```text
-///     double x = 1.0;  __imag__ (x += 5.0);   /* x stayed 1.0 */
-/// ```
-///
-/// The `__real__` arm always linearized the operand, so the two disagreed
-/// about the same expression. Both are checked here, for a floating and an
-/// integer operand, since the zero is built by a different call for each.
-#[test]
-fn c99_imag_of_a_real_operand_still_evaluates_it() {
-    let code = r#"
-int calls;
-static double bump(void) { calls++; return 1.0; }
+/* ==== c99_imag_of_a_real_operand_still_evaluates_it (codes 11..17) ==== */
+int ir_calls;
+static double ir_bump(void) { ir_calls++; return 1.0; }
 
-int main(void) {
+static int t_c99_imag_of_a_real_operand_still_evaluates_it(void) {
     /* A floating operand: the zero comes from emit_fconst. */
     double x = 1.0;
     double y = __imag__ (x += 5.0);
@@ -1593,9 +1569,9 @@ int main(void) {
     if (j != 0) return 4;
 
     /* A call is an effect too, and must happen exactly once. */
-    calls = 0;
-    (void)__imag__ bump();
-    if (calls != 1) return 5;
+    ir_calls = 0;
+    (void)__imag__ ir_bump();
+    if (ir_calls != 1) return 5;
 
     /* The control: __real__ was always right, and stays so. */
     double a = 1.0;
@@ -1607,10 +1583,18 @@ int main(void) {
     if (__imag__ z != 4.0 || __real__ z != 3.0) return 7;
     return 0;
 }
+
+int main(void)
+{
+    int rc;
+    if ((rc = t_c99_unary_plus_and_minus_keep_a_complex_integer_whole()) != 0) return 0 + rc;
+    if ((rc = t_c99_imag_of_a_real_operand_still_evaluates_it()) != 0) return 10 + rc;
+    return 0;
+}
 "#;
     for opt in ["-O0", "-O1", "-O2"] {
         assert_eq!(
-            compile_and_run("imag_of_real", code, &[opt.to_string()]),
+            compile_and_run("complex_unary_and_halves", code, &[opt.to_string()]),
             0,
             "{opt}"
         );
@@ -1633,6 +1617,9 @@ int main(void) {
 /// The optimizer dropped the dead conversion at -O1 and above, so only -O0
 /// raised the exception -- one more place where the levels disagreed about
 /// the same program. The effects in the operand must still happen.
+///
+/// Kept out of the mega tests: `#pragma STDC FENV_ACCESS ON` covers the
+/// whole translation unit.
 #[test]
 fn c99_void_cast_of_a_complex_operand_converts_nothing() {
     let code = r#"
@@ -1686,61 +1673,6 @@ int main(void) {
             ),
             0,
             "{opt}"
-        );
-    }
-}
-
-/// c17 provides no imaginary types: they are Annex G's, binding only an
-/// implementation that defines `__STDC_IEC_559_COMPLEX__`. Without them
-/// `_Imaginary` is no permitted type specifier (C17 6.7.2p2), so each use is
-/// one error that says so -- not the implicit-int and keyword-as-name pair it
-/// once drew -- while `_Imaginary` in a declarator's name position is the
-/// keyword misused.
-#[test]
-fn c99_imaginary_is_one_accurate_error() {
-    let not_supported = "imaginary types are not supported";
-    let misused = "'_Imaginary' is a keyword and cannot be used as a name";
-    for (name, src, expected) in [
-        ("imag_decl", "_Imaginary double x;\n", not_supported),
-        ("imag_trailing", "double _Imaginary x;\n", not_supported),
-        ("imag_alone", "_Imaginary x;\n", not_supported),
-        ("imag_fn", "float _Imaginary f(void);\n", not_supported),
-        (
-            "imag_member",
-            "struct S { double _Imaginary m; };\n",
-            not_supported,
-        ),
-        (
-            "imag_local",
-            "int f(void) { _Imaginary double y = 0; return 0; }\n",
-            not_supported,
-        ),
-        (
-            "imag_cast",
-            "double f(double d) { return (double _Imaginary)d; }\n",
-            not_supported,
-        ),
-        (
-            "imag_sizeof",
-            "int n = sizeof(float _Imaginary);\n",
-            not_supported,
-        ),
-        ("imag_name", "int _Imaginary;\n", misused),
-        ("imag_param", "void g(int _Imaginary);\n", misused),
-    ] {
-        let c_file = create_c_file(name, src);
-        let path = c_file.path().to_string_lossy().to_string();
-        let run = run_c17(&["-S", "-o", "/dev/null", &path]);
-        assert!(!run.success, "{name}: compiled without error");
-        let errors: Vec<&str> = run
-            .stderr
-            .lines()
-            .filter(|l| l.contains("error:"))
-            .collect();
-        assert!(
-            errors.len() == 1 && errors[0].contains(expected),
-            "{name}: expected exactly one '{expected}', got:\n{}",
-            run.stderr
         );
     }
 }

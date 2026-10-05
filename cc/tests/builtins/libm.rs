@@ -14,10 +14,7 @@
 // runs the same source as the host.
 //
 
-use super::math::calls_any;
-use crate::common::{
-    asm_for_at, compile_and_run, compile_and_run_aarch64_with, compile_expect_error,
-};
+use crate::common::{compile_and_run, compile_and_run_aarch64_with};
 
 /// Run `code` at -O0 and -O2 on the host and on aarch64, with `opts` and,
 /// when `libm` is set, `-lm`.
@@ -42,36 +39,37 @@ fn run_everywhere(name: &str, code: &str, opts: &[&str], libm: bool) {
     }
 }
 
-/// `asm` for the host and for aarch64 Linux, with `opts`.
-fn asm_both(name: &str, src: &str, opts: &[&str]) -> [(&'static str, String); 2] {
-    let mut a64 = opts.to_vec();
-    a64.extend_from_slice(&["--target", "aarch64-unknown-linux-gnu"]);
-    [
-        ("host", asm_for_at(name, src, opts)),
-        ("aarch64", asm_for_at(&format!("{name}_a64"), src, &a64)),
-    ]
-}
-
-/// Whether `asm` contains the instruction `mnemonic` (with its operands).
-fn has_insn(asm: &str, mnemonic: &str) -> bool {
-    asm.lines()
-        .any(|l| l.split_whitespace().next() == Some(mnemonic))
-}
-
-// ============================================================================
-// sqrt, sqrtf, sqrtl
-// ============================================================================
-
-/// The run-time root, bit for bit, and `errno`: set to `EDOM` for an
-/// argument below zero -- `-0` and a NaN are not -- and left alone
-/// otherwise. A call whose value is discarded still sets it, and one in the
-/// arm of a conditional that is not taken does not.
+/// The run-time values of every libm program here that links with -lm, as one
+/// program, at -O0 and -O2 on the host and on aarch64. Each section keeps its
+/// original test name and doc comment; see the exit-code table at the top.
 ///
-/// That is glibc's `errno`. Apple's libm reports a domain error by the
-/// exception alone (its `math_errhandling` is `MATH_ERREXCEPT`), so there the
-/// same calls must leave `errno` at zero: c17 still calls the library for a
-/// negative argument, and nothing on that path may write it.
-const SQRT_PROGRAM: &str = r#"
+/// Consolidates: libm_sqrt_values_and_errno, libm_rounding_values_in_every_direction,
+/// the run half of libm_constant_call_is_a_constant_at_every_level, and
+/// libm_min_max_fma_values. The assembly halves are unit tests in
+/// cc/test_asm/builtins_libm.rs.
+#[test]
+fn libm_values_mega() {
+    let code = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1- 38  SQRT_PROGRAM
+ *    41-161  ROUND_CHECKS
+ *   171-172  CONSTANT_LIBM_CALLS_PROGRAM
+ *   181-207  MIN_MAX_FMA_PROGRAM
+ */
+
+/* ---- SQRT_PROGRAM (exit codes 1-38) ----
+ *
+ *  The run-time root, bit for bit, and `errno`: set to `EDOM` for an
+ *  argument below zero -- `-0` and a NaN are not -- and left alone
+ *  otherwise. A call whose value is discarded still sets it, and one in the
+ *  arm of a conditional that is not taken does not.
+ *
+ *  That is glibc's `errno`. Apple's libm reports a domain error by the
+ *  exception alone (its `math_errhandling` is `MATH_ERREXCEPT`), so there the
+ *  same calls must leave `errno` at zero: c17 still calls the library for a
+ *  negative argument, and nothing on that path may write it.
+ */
 typedef unsigned long long u64; typedef unsigned int u32;
 double sqrt(double); float sqrtf(float); long double sqrtl(long double);
 #ifdef __APPLE__
@@ -83,13 +81,13 @@ extern int *__errno_location(void);
 #define ERRNO (*__errno_location())
 #define DOMAIN_ERRNO 33 /* EDOM */
 #endif
-static u64 dbits(double d) { u64 u; __builtin_memcpy(&u, &d, 8); return u; }
-static double dfrom(u64 u) { double d; __builtin_memcpy(&d, &u, 8); return d; }
-static u32 fbits(float f) { u32 u; __builtin_memcpy(&u, &f, 4); return u; }
-static float ffrom(u32 u) { float f; __builtin_memcpy(&f, &u, 4); return f; }
+static u64 sq_dbits(double d) { u64 u; __builtin_memcpy(&u, &d, 8); return u; }
+static double sq_dfrom(u64 u) { double d; __builtin_memcpy(&d, &u, 8); return d; }
+static u32 sq_fbits(float f) { u32 u; __builtin_memcpy(&u, &f, 4); return u; }
+static float sq_ffrom(u32 u) { float f; __builtin_memcpy(&f, &u, 4); return f; }
 /* +-0, 1, 2, 0.25, the smallest and largest subnormal, the largest finite
    value, +inf, a quiet NaN of each sign with a payload, 10, 1 + ulp, 2^63. */
-static const u64 dcase[][2] = {
+static const u64 sq_dcase[][2] = {
     {0x0000000000000000ULL, 0x0000000000000000ULL},
     {0x8000000000000000ULL, 0x8000000000000000ULL},
     {0x3ff0000000000000ULL, 0x3ff0000000000000ULL},
@@ -105,7 +103,7 @@ static const u64 dcase[][2] = {
     {0x3ff0000000000001ULL, 0x3ff0000000000000ULL},
     {0x43e0000000000000ULL, 0x41e6a09e667f3bcdULL},
 };
-static const u32 fcase[][2] = {
+static const u32 sq_fcase[][2] = {
     {0x00000000U, 0x00000000U}, {0x80000000U, 0x80000000U},
     {0x3f800000U, 0x3f800000U}, {0x40000000U, 0x3fb504f3U},
     {0x3e800000U, 0x3f000000U}, {0x00000001U, 0x1a3504f3U},
@@ -115,19 +113,19 @@ static const u32 fcase[][2] = {
     {0x3f800001U, 0x3f800000U},
 };
 /* -1, -inf and the smallest negative subnormal: domain errors. */
-static const u64 dneg[] = {0xbff0000000000000ULL, 0xfff0000000000000ULL, 0x8000000000000001ULL};
-static const u32 fneg[] = {0xbf800000U, 0xff800000U, 0x80000001U};
+static const u64 sq_dneg[] = {0xbff0000000000000ULL, 0xfff0000000000000ULL, 0x8000000000000001ULL};
+static const u32 sq_fneg[] = {0xbf800000U, 0xff800000U, 0x80000001U};
 #define N(a) (int)(sizeof(a) / sizeof((a)[0]))
-static int check_double(void) {
-    for (int i = 0; i < N(dcase); i++) {
-        volatile double x = dfrom(dcase[i][0]);
+static int sq_check_double(void) {
+    for (int i = 0; i < N(sq_dcase); i++) {
+        volatile double x = sq_dfrom(sq_dcase[i][0]);
         ERRNO = 0;
-        if (dbits(sqrt(x)) != dcase[i][1]) return 1;
-        if (dbits(__builtin_sqrt(x)) != dcase[i][1]) return 2;
+        if (sq_dbits(sqrt(x)) != sq_dcase[i][1]) return 1;
+        if (sq_dbits(__builtin_sqrt(x)) != sq_dcase[i][1]) return 2;
         if (ERRNO != 0) return 3;
     }
-    for (int i = 0; i < N(dneg); i++) {
-        volatile double x = dfrom(dneg[i]);
+    for (int i = 0; i < N(sq_dneg); i++) {
+        volatile double x = sq_dfrom(sq_dneg[i]);
         ERRNO = 0;
         if (!__builtin_isnan(sqrt(x)) || ERRNO != DOMAIN_ERRNO) return 4;
         ERRNO = 0;
@@ -143,19 +141,19 @@ static int check_double(void) {
     /* A `float` argument is converted, not narrowed: the root of 2.0f as a
        double. */
     volatile float two = 2.0f;
-    if (dbits(sqrt(two)) != 0x3ff6a09e667f3bcdULL) return 8;
+    if (sq_dbits(sqrt(two)) != 0x3ff6a09e667f3bcdULL) return 8;
     return 0;
 }
-static int check_float(void) {
-    for (int i = 0; i < N(fcase); i++) {
-        volatile float x = ffrom(fcase[i][0]);
+static int sq_check_float(void) {
+    for (int i = 0; i < N(sq_fcase); i++) {
+        volatile float x = sq_ffrom(sq_fcase[i][0]);
         ERRNO = 0;
-        if (fbits(sqrtf(x)) != fcase[i][1]) return 11;
-        if (fbits(__builtin_sqrtf(x)) != fcase[i][1]) return 12;
+        if (sq_fbits(sqrtf(x)) != sq_fcase[i][1]) return 11;
+        if (sq_fbits(__builtin_sqrtf(x)) != sq_fcase[i][1]) return 12;
         if (ERRNO != 0) return 13;
     }
-    for (int i = 0; i < N(fneg); i++) {
-        volatile float x = ffrom(fneg[i]);
+    for (int i = 0; i < N(sq_fneg); i++) {
+        volatile float x = sq_ffrom(sq_fneg[i]);
         ERRNO = 0;
         if (!__builtin_isnan(sqrtf(x)) || ERRNO != DOMAIN_ERRNO) return 14;
         ERRNO = 0;
@@ -163,7 +161,7 @@ static int check_float(void) {
     }
     return 0;
 }
-static int check_long_double(void) {
+static int sq_check_long_double(void) {
     volatile long double four = 4.0L, quarter = 0.25L, two = 2.0L, mz = -0.0L;
     volatile long double inf = __builtin_infl(), m1 = -1.0L, nan = __builtin_nanl("");
     ERRNO = 0;
@@ -182,31 +180,490 @@ static int check_long_double(void) {
 }
 /* Constant arguments, which the optimizer folds: the same answers, and a
    domain error is still reported. */
-static int check_constants(void) {
+static int sq_check_constants(void) {
     ERRNO = 0;
-    if (dbits(sqrt(2.0)) != 0x3ff6a09e667f3bcdULL) return 31;
-    if (dbits(sqrt(-0.0)) != 0x8000000000000000ULL) return 32;
-    if (dbits(sqrt(__builtin_nan("0x1234"))) != 0x7ff8000000001234ULL) return 33;
-    if (fbits(sqrtf(2.0f)) != 0x3fb504f3U) return 34;
+    if (sq_dbits(sqrt(2.0)) != 0x3ff6a09e667f3bcdULL) return 31;
+    if (sq_dbits(sqrt(-0.0)) != 0x8000000000000000ULL) return 32;
+    if (sq_dbits(sqrt(__builtin_nan("0x1234"))) != 0x7ff8000000001234ULL) return 33;
+    if (sq_fbits(sqrtf(2.0f)) != 0x3fb504f3U) return 34;
     if (sqrtl(2.0L) != 1.4142135623730950488016887242096980785697L) return 35;
     if (sqrt(__builtin_inf()) != __builtin_inf()) return 36;
     if (ERRNO != 0) return 37;
     if (!__builtin_isnan(sqrt(-4.0)) || ERRNO != DOMAIN_ERRNO) return 38;
     return 0;
 }
-int main(void) {
+static int t_libm_sqrt_values_and_errno(void) {
     int rc;
-    if ((rc = check_double())) return rc;
-    if ((rc = check_float())) return rc;
-    if ((rc = check_long_double())) return rc;
-    return check_constants();
+    if ((rc = sq_check_double())) return rc;
+    if ((rc = sq_check_float())) return rc;
+    if ((rc = sq_check_long_double())) return rc;
+    return sq_check_constants();
+}
+#undef DOMAIN_ERRNO
+#undef ERRNO
+#undef N
+
+
+/* ---- ROUND_CHECKS (exit codes 41-161) ----
+ *
+ *  The rounding direction, set in the SSE or FP control register directly
+ *  so that the program needs no `<fenv.h>` and no libm: 0 to nearest, 1
+ *  downward, 2 upward, 3 toward zero.
+ *  Each input with its floor, ceil, trunc and round, and its rint -- which
+ *  nearbyint equals -- in each rounding direction: +-0, 0.5, 0.25, 0.75,
+ *  1.5, 2.5, 2.75, 2^52 - 0.5, 2^52, 2^52 + 1, 2^53, 2^51 + 0.5, 1e300, the
+ *  smallest subnormal, the largest finite value, inf, a quiet NaN with a
+ *  payload and 100, each of both signs; then the same for `float`, around
+ *  2^23. Every value is glibc's, identical on x86-64 and aarch64.
+ *  Every function of every row, bare and `__builtin_`, in all four rounding
+ *  directions, at run time; then the constants the optimizer folds. The
+ *  code says which: 1 + function + 6 * direction for `double`, 40 + the
+ *  same for `float`.
+ */
+static void rd_set_rounding(int m) {
+#if defined(__x86_64__)
+    unsigned csr;
+    __asm__ volatile("stmxcsr %0" : "=m"(csr));
+    csr = (csr & ~0x6000u) | ((unsigned)m << 13);
+    __asm__ volatile("ldmxcsr %0" : : "m"(csr));
+#elif defined(__aarch64__)
+    static const unsigned long rmode[4] = {0, 2, 1, 3};
+    unsigned long fpcr;
+    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+    fpcr = (fpcr & ~(3UL << 22)) | rmode[m] << 22;
+    __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
+#endif
+}
+
+typedef unsigned long long u64; typedef unsigned int u32;
+struct rd_drow { u64 in, fl, ce, tr, ro, ri[4]; };
+static const struct rd_drow rd_dcase[] = {
+    {0x0000000000000000, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000, {0x0000000000000000, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000}},
+    {0x3fe0000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000, 0x3ff0000000000000, {0x0000000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000}},
+    {0x3fd0000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000, 0x0000000000000000, {0x0000000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000}},
+    {0x3fe8000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000, 0x3ff0000000000000, {0x3ff0000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000}},
+    {0x3ff8000000000000, 0x3ff0000000000000, 0x4000000000000000, 0x3ff0000000000000, 0x4000000000000000, {0x4000000000000000, 0x3ff0000000000000, 0x4000000000000000, 0x3ff0000000000000}},
+    {0x4004000000000000, 0x4000000000000000, 0x4008000000000000, 0x4000000000000000, 0x4008000000000000, {0x4000000000000000, 0x4000000000000000, 0x4008000000000000, 0x4000000000000000}},
+    {0x4006000000000000, 0x4000000000000000, 0x4008000000000000, 0x4000000000000000, 0x4008000000000000, {0x4008000000000000, 0x4000000000000000, 0x4008000000000000, 0x4000000000000000}},
+    {0x432fffffffffffff, 0x432ffffffffffffe, 0x4330000000000000, 0x432ffffffffffffe, 0x4330000000000000, {0x4330000000000000, 0x432ffffffffffffe, 0x4330000000000000, 0x432ffffffffffffe}},
+    {0x4330000000000000, 0x4330000000000000, 0x4330000000000000, 0x4330000000000000, 0x4330000000000000, {0x4330000000000000, 0x4330000000000000, 0x4330000000000000, 0x4330000000000000}},
+    {0x4330000000000001, 0x4330000000000001, 0x4330000000000001, 0x4330000000000001, 0x4330000000000001, {0x4330000000000001, 0x4330000000000001, 0x4330000000000001, 0x4330000000000001}},
+    {0x4340000000000000, 0x4340000000000000, 0x4340000000000000, 0x4340000000000000, 0x4340000000000000, {0x4340000000000000, 0x4340000000000000, 0x4340000000000000, 0x4340000000000000}},
+    {0x4320000000000001, 0x4320000000000000, 0x4320000000000002, 0x4320000000000000, 0x4320000000000002, {0x4320000000000000, 0x4320000000000000, 0x4320000000000002, 0x4320000000000000}},
+    {0x7e37e43c8800759c, 0x7e37e43c8800759c, 0x7e37e43c8800759c, 0x7e37e43c8800759c, 0x7e37e43c8800759c, {0x7e37e43c8800759c, 0x7e37e43c8800759c, 0x7e37e43c8800759c, 0x7e37e43c8800759c}},
+    {0x0000000000000001, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000, 0x0000000000000000, {0x0000000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000}},
+    {0x7fefffffffffffff, 0x7fefffffffffffff, 0x7fefffffffffffff, 0x7fefffffffffffff, 0x7fefffffffffffff, {0x7fefffffffffffff, 0x7fefffffffffffff, 0x7fefffffffffffff, 0x7fefffffffffffff}},
+    {0x7ff0000000000000, 0x7ff0000000000000, 0x7ff0000000000000, 0x7ff0000000000000, 0x7ff0000000000000, {0x7ff0000000000000, 0x7ff0000000000000, 0x7ff0000000000000, 0x7ff0000000000000}},
+    {0x7ff8000000001234, 0x7ff8000000001234, 0x7ff8000000001234, 0x7ff8000000001234, 0x7ff8000000001234, {0x7ff8000000001234, 0x7ff8000000001234, 0x7ff8000000001234, 0x7ff8000000001234}},
+    {0x4059000000000000, 0x4059000000000000, 0x4059000000000000, 0x4059000000000000, 0x4059000000000000, {0x4059000000000000, 0x4059000000000000, 0x4059000000000000, 0x4059000000000000}},
+    {0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, {0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000}},
+    {0xbfe0000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000, 0xbff0000000000000, {0x8000000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000}},
+    {0xbfd0000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, {0x8000000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000}},
+    {0xbfe8000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000, 0xbff0000000000000, {0xbff0000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000}},
+    {0xbff8000000000000, 0xc000000000000000, 0xbff0000000000000, 0xbff0000000000000, 0xc000000000000000, {0xc000000000000000, 0xc000000000000000, 0xbff0000000000000, 0xbff0000000000000}},
+    {0xc004000000000000, 0xc008000000000000, 0xc000000000000000, 0xc000000000000000, 0xc008000000000000, {0xc000000000000000, 0xc008000000000000, 0xc000000000000000, 0xc000000000000000}},
+    {0xc006000000000000, 0xc008000000000000, 0xc000000000000000, 0xc000000000000000, 0xc008000000000000, {0xc008000000000000, 0xc008000000000000, 0xc000000000000000, 0xc000000000000000}},
+    {0xc32fffffffffffff, 0xc330000000000000, 0xc32ffffffffffffe, 0xc32ffffffffffffe, 0xc330000000000000, {0xc330000000000000, 0xc330000000000000, 0xc32ffffffffffffe, 0xc32ffffffffffffe}},
+    {0xc330000000000000, 0xc330000000000000, 0xc330000000000000, 0xc330000000000000, 0xc330000000000000, {0xc330000000000000, 0xc330000000000000, 0xc330000000000000, 0xc330000000000000}},
+    {0xc330000000000001, 0xc330000000000001, 0xc330000000000001, 0xc330000000000001, 0xc330000000000001, {0xc330000000000001, 0xc330000000000001, 0xc330000000000001, 0xc330000000000001}},
+    {0xc340000000000000, 0xc340000000000000, 0xc340000000000000, 0xc340000000000000, 0xc340000000000000, {0xc340000000000000, 0xc340000000000000, 0xc340000000000000, 0xc340000000000000}},
+    {0xc320000000000001, 0xc320000000000002, 0xc320000000000000, 0xc320000000000000, 0xc320000000000002, {0xc320000000000000, 0xc320000000000002, 0xc320000000000000, 0xc320000000000000}},
+    {0xfe37e43c8800759c, 0xfe37e43c8800759c, 0xfe37e43c8800759c, 0xfe37e43c8800759c, 0xfe37e43c8800759c, {0xfe37e43c8800759c, 0xfe37e43c8800759c, 0xfe37e43c8800759c, 0xfe37e43c8800759c}},
+    {0x8000000000000001, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, {0x8000000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000}},
+    {0xffefffffffffffff, 0xffefffffffffffff, 0xffefffffffffffff, 0xffefffffffffffff, 0xffefffffffffffff, {0xffefffffffffffff, 0xffefffffffffffff, 0xffefffffffffffff, 0xffefffffffffffff}},
+    {0xfff0000000000000, 0xfff0000000000000, 0xfff0000000000000, 0xfff0000000000000, 0xfff0000000000000, {0xfff0000000000000, 0xfff0000000000000, 0xfff0000000000000, 0xfff0000000000000}},
+    {0xfff8000000001234, 0xfff8000000001234, 0xfff8000000001234, 0xfff8000000001234, 0xfff8000000001234, {0xfff8000000001234, 0xfff8000000001234, 0xfff8000000001234, 0xfff8000000001234}},
+    {0xc059000000000000, 0xc059000000000000, 0xc059000000000000, 0xc059000000000000, 0xc059000000000000, {0xc059000000000000, 0xc059000000000000, 0xc059000000000000, 0xc059000000000000}},
+};
+struct rd_frow { u32 in, fl, ce, tr, ro, ri[4]; };
+static const struct rd_frow rd_fcase[] = {
+    {0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, {0x00000000, 0x00000000, 0x00000000, 0x00000000}},
+    {0x3f000000, 0x00000000, 0x3f800000, 0x00000000, 0x3f800000, {0x00000000, 0x00000000, 0x3f800000, 0x00000000}},
+    {0x3e800000, 0x00000000, 0x3f800000, 0x00000000, 0x00000000, {0x00000000, 0x00000000, 0x3f800000, 0x00000000}},
+    {0x3f400000, 0x00000000, 0x3f800000, 0x00000000, 0x3f800000, {0x3f800000, 0x00000000, 0x3f800000, 0x00000000}},
+    {0x3fc00000, 0x3f800000, 0x40000000, 0x3f800000, 0x40000000, {0x40000000, 0x3f800000, 0x40000000, 0x3f800000}},
+    {0x40200000, 0x40000000, 0x40400000, 0x40000000, 0x40400000, {0x40000000, 0x40000000, 0x40400000, 0x40000000}},
+    {0x40300000, 0x40000000, 0x40400000, 0x40000000, 0x40400000, {0x40400000, 0x40000000, 0x40400000, 0x40000000}},
+    {0x4affffff, 0x4afffffe, 0x4b000000, 0x4afffffe, 0x4b000000, {0x4b000000, 0x4afffffe, 0x4b000000, 0x4afffffe}},
+    {0x4b000000, 0x4b000000, 0x4b000000, 0x4b000000, 0x4b000000, {0x4b000000, 0x4b000000, 0x4b000000, 0x4b000000}},
+    {0x4b000001, 0x4b000001, 0x4b000001, 0x4b000001, 0x4b000001, {0x4b000001, 0x4b000001, 0x4b000001, 0x4b000001}},
+    {0x4b800000, 0x4b800000, 0x4b800000, 0x4b800000, 0x4b800000, {0x4b800000, 0x4b800000, 0x4b800000, 0x4b800000}},
+    {0x4a800001, 0x4a800000, 0x4a800002, 0x4a800000, 0x4a800002, {0x4a800000, 0x4a800000, 0x4a800002, 0x4a800000}},
+    {0x7e967699, 0x7e967699, 0x7e967699, 0x7e967699, 0x7e967699, {0x7e967699, 0x7e967699, 0x7e967699, 0x7e967699}},
+    {0x00000001, 0x00000000, 0x3f800000, 0x00000000, 0x00000000, {0x00000000, 0x00000000, 0x3f800000, 0x00000000}},
+    {0x7f7fffff, 0x7f7fffff, 0x7f7fffff, 0x7f7fffff, 0x7f7fffff, {0x7f7fffff, 0x7f7fffff, 0x7f7fffff, 0x7f7fffff}},
+    {0x7f800000, 0x7f800000, 0x7f800000, 0x7f800000, 0x7f800000, {0x7f800000, 0x7f800000, 0x7f800000, 0x7f800000}},
+    {0x7fc01234, 0x7fc01234, 0x7fc01234, 0x7fc01234, 0x7fc01234, {0x7fc01234, 0x7fc01234, 0x7fc01234, 0x7fc01234}},
+    {0x42c80000, 0x42c80000, 0x42c80000, 0x42c80000, 0x42c80000, {0x42c80000, 0x42c80000, 0x42c80000, 0x42c80000}},
+    {0x80000000, 0x80000000, 0x80000000, 0x80000000, 0x80000000, {0x80000000, 0x80000000, 0x80000000, 0x80000000}},
+    {0xbf000000, 0xbf800000, 0x80000000, 0x80000000, 0xbf800000, {0x80000000, 0xbf800000, 0x80000000, 0x80000000}},
+    {0xbe800000, 0xbf800000, 0x80000000, 0x80000000, 0x80000000, {0x80000000, 0xbf800000, 0x80000000, 0x80000000}},
+    {0xbf400000, 0xbf800000, 0x80000000, 0x80000000, 0xbf800000, {0xbf800000, 0xbf800000, 0x80000000, 0x80000000}},
+    {0xbfc00000, 0xc0000000, 0xbf800000, 0xbf800000, 0xc0000000, {0xc0000000, 0xc0000000, 0xbf800000, 0xbf800000}},
+    {0xc0200000, 0xc0400000, 0xc0000000, 0xc0000000, 0xc0400000, {0xc0000000, 0xc0400000, 0xc0000000, 0xc0000000}},
+    {0xc0300000, 0xc0400000, 0xc0000000, 0xc0000000, 0xc0400000, {0xc0400000, 0xc0400000, 0xc0000000, 0xc0000000}},
+    {0xcaffffff, 0xcb000000, 0xcafffffe, 0xcafffffe, 0xcb000000, {0xcb000000, 0xcb000000, 0xcafffffe, 0xcafffffe}},
+    {0xcb000000, 0xcb000000, 0xcb000000, 0xcb000000, 0xcb000000, {0xcb000000, 0xcb000000, 0xcb000000, 0xcb000000}},
+    {0xcb000001, 0xcb000001, 0xcb000001, 0xcb000001, 0xcb000001, {0xcb000001, 0xcb000001, 0xcb000001, 0xcb000001}},
+    {0xcb800000, 0xcb800000, 0xcb800000, 0xcb800000, 0xcb800000, {0xcb800000, 0xcb800000, 0xcb800000, 0xcb800000}},
+    {0xca800001, 0xca800002, 0xca800000, 0xca800000, 0xca800002, {0xca800000, 0xca800002, 0xca800000, 0xca800000}},
+    {0xfe967699, 0xfe967699, 0xfe967699, 0xfe967699, 0xfe967699, {0xfe967699, 0xfe967699, 0xfe967699, 0xfe967699}},
+    {0x80000001, 0xbf800000, 0x80000000, 0x80000000, 0x80000000, {0x80000000, 0xbf800000, 0x80000000, 0x80000000}},
+    {0xff7fffff, 0xff7fffff, 0xff7fffff, 0xff7fffff, 0xff7fffff, {0xff7fffff, 0xff7fffff, 0xff7fffff, 0xff7fffff}},
+    {0xff800000, 0xff800000, 0xff800000, 0xff800000, 0xff800000, {0xff800000, 0xff800000, 0xff800000, 0xff800000}},
+    {0xffc01234, 0xffc01234, 0xffc01234, 0xffc01234, 0xffc01234, {0xffc01234, 0xffc01234, 0xffc01234, 0xffc01234}},
+    {0xc2c80000, 0xc2c80000, 0xc2c80000, 0xc2c80000, 0xc2c80000, {0xc2c80000, 0xc2c80000, 0xc2c80000, 0xc2c80000}},
+};
+#define N(a) (int)(sizeof(a) / sizeof((a)[0]))
+static u64 rd_dbits(double d) { u64 u; __builtin_memcpy(&u, &d, 8); return u; }
+static double rd_dfrom(u64 u) { double d; __builtin_memcpy(&d, &u, 8); return d; }
+static u32 rd_fbits(float f) { u32 u; __builtin_memcpy(&u, &f, 4); return u; }
+static float rd_ffrom(u32 u) { float f; __builtin_memcpy(&f, &u, 4); return f; }
+
+double floor(double); double ceil(double); double trunc(double);
+double round(double); double rint(double); double nearbyint(double);
+float floorf(float); float ceilf(float); float truncf(float);
+float roundf(float); float rintf(float); float nearbyintf(float);
+__attribute__((noinline)) static int rd_check_double(int m) {
+    for (int i = 0; i < N(rd_dcase); i++) {
+        const struct rd_drow *r = &rd_dcase[i];
+        volatile double x = rd_dfrom(r->in);
+        u64 want[6] = {r->fl, r->ce, r->tr, r->ro, r->ri[m], r->ri[m]};
+        u64 bare[6] = {rd_dbits(floor(x)), rd_dbits(ceil(x)), rd_dbits(trunc(x)),
+                       rd_dbits(round(x)), rd_dbits(rint(x)), rd_dbits(nearbyint(x))};
+        u64 blt[6] = {rd_dbits(__builtin_floor(x)), rd_dbits(__builtin_ceil(x)),
+                      rd_dbits(__builtin_trunc(x)), rd_dbits(__builtin_round(x)),
+                      rd_dbits(__builtin_rint(x)), rd_dbits(__builtin_nearbyint(x))};
+        for (int f = 0; f < 6; f++)
+            if (bare[f] != want[f] || blt[f] != want[f]) return 1 + f + 6 * m;
+    }
+    return 0;
+}
+__attribute__((noinline)) static int rd_check_float(int m) {
+    for (int i = 0; i < N(rd_fcase); i++) {
+        const struct rd_frow *r = &rd_fcase[i];
+        volatile float x = rd_ffrom(r->in);
+        u32 want[6] = {r->fl, r->ce, r->tr, r->ro, r->ri[m], r->ri[m]};
+        u32 bare[6] = {rd_fbits(floorf(x)), rd_fbits(ceilf(x)), rd_fbits(truncf(x)),
+                       rd_fbits(roundf(x)), rd_fbits(rintf(x)), rd_fbits(nearbyintf(x))};
+        u32 blt[6] = {rd_fbits(__builtin_floorf(x)), rd_fbits(__builtin_ceilf(x)),
+                      rd_fbits(__builtin_truncf(x)), rd_fbits(__builtin_roundf(x)),
+                      rd_fbits(__builtin_rintf(x)), rd_fbits(__builtin_nearbyintf(x))};
+        /* A float argument to the double function is narrowed, exactly. */
+        double wide[6] = {floor(x), ceil(x), trunc(x), round(x), rint(x), nearbyint(x)};
+        for (int f = 0; f < 6; f++) {
+            if (bare[f] != want[f] || blt[f] != want[f]) return 40 + f + 6 * m;
+            if (rd_fbits((float)wide[f]) != want[f]) return 70 + f + 6 * m;
+        }
+    }
+    return 0;
+}
+/* rint and nearbyint of a constant that is not an integer depend on the
+   direction, so they are not folded; everything else is. */
+__attribute__((noinline)) static int rd_check_constants(int m) {
+    static const u64 rint_2_5[4] = {0x4000000000000000, 0x4000000000000000,
+                                    0x4008000000000000, 0x4000000000000000};
+    static const u64 nearbyint_m2_5[4] = {0xc000000000000000, 0xc008000000000000,
+                                          0xc000000000000000, 0xc000000000000000};
+    if (rd_dbits(rint(2.5)) != rint_2_5[m]) return 101;
+    if (rd_dbits(nearbyint(-2.5)) != nearbyint_m2_5[m]) return 102;
+    if (rd_dbits(floor(-0.5)) != 0xbff0000000000000) return 103;
+    if (rd_dbits(ceil(-0.5)) != 0x8000000000000000) return 104;
+    if (rd_dbits(trunc(-2.75)) != 0xc000000000000000) return 105;
+    if (rd_dbits(round(2.5)) != 0x4008000000000000) return 106;
+    if (rd_dbits(round(-0.25)) != 0x8000000000000000) return 107;
+    if (rd_dbits(rint(-3.0)) != 0xc008000000000000) return 108;
+    if (rd_fbits(floorf(2.5f)) != 0x40000000) return 109;
+    if (rd_fbits(__builtin_roundf(-2.5f)) != 0xc0400000) return 110;
+    if (rd_dbits(floor(__builtin_nan("0x1234"))) != 0x7ff8000000001234) return 111;
+    if (rd_dbits(ceil(-__builtin_inf())) != 0xfff0000000000000) return 112;
+    return 0;
+}
+static int t_libm_rounding_values_in_every_direction(void) {
+    int rc;
+    for (int m = 0; m < 4; m++) {
+        rd_set_rounding(m);
+        if ((rc = rd_check_double(m)) || (rc = rd_check_float(m)) || (rc = rd_check_constants(m))) {
+            rd_set_rounding(0);
+            return rc;
+        }
+    }
+    rd_set_rounding(0);
+    /* The result of the double function is a double, narrowed or not. */
+    volatile float f = 1.5f;
+    if (sizeof(floor(f)) != sizeof(double)) return 120;
+    if (_Generic(ceil(f), double: 0, default: 1)) return 121;
+    return 0;
+}
+#undef N
+
+
+/* ---- CONSTANT_LIBM_CALLS_PROGRAM (exit codes 171-172) ----
+ *
+ *  A call whose answer is a constant is that constant at every level, as
+ *  under gcc: at `-O0`, where a bare libm spelling is otherwise a call, it
+ *  still initializes a static object, and a rounding of a constant calls
+ *  nothing. (A root keeps its call for `errno` until the optimizer folds it.)
+ *  One whose answer is not a constant -- a root's domain error, a `rint` of
+ *  a value that is not an integer -- stays a call, and cannot.
+ */
+double floor(double), sqrt(double), fmin(double, double), fma(double, double, double);
+float floorf(float);
+static double lc_a = floor(2.5);
+static double lc_b = sqrt(4.0);
+static double lc_c = fmin(1.0, 2.0);
+static double lc_d = fma(1.0, 2.0, 3.0);
+static float lc_e = floorf(2.5f);
+static double lc_f = floor(2.5f);
+static int t_libm_constant_call_is_a_constant_at_every_level(void) {
+    if (lc_a != 2.0 || lc_b != 2.0 || lc_c != 1.0 || lc_d != 5.0 || lc_e != 2.0f || lc_f != 2.0) return 1;
+    if (floor(-2.5) != -3.0 || sqrt(9.0) != 3.0) return 2;
+    return 0;
+}
+
+
+/* ---- MIN_MAX_FMA_PROGRAM (exit codes 181-207) ----
+ *
+ *  Run-time values bit for bit against glibc's, which agree on x86-64 and
+ *  aarch64 except where C leaves the answer open: the signed zeros of
+ *  `fmin` and `fmax` (glibc's x86-64 functions answer the first operand;
+ *  aarch64's `fminnm` and `fmaxnm`, and gcc's fold, the -0 and +0), checked
+ *  on aarch64 only, and which NaN two NaNs give, checked for being one. The
+ *  `fma` cases are the ones a separate multiply and add get wrong: the
+ *  product's low half cancelling against the addend, a tie decided by the
+ *  bits below it, an overflow, and a subnormal result.
+ */
+typedef unsigned long long u64; typedef unsigned int u32;
+double fmin(double, double); double fmax(double, double); double fma(double, double, double);
+float fminf(float, float); float fmaxf(float, float); float fmaf(float, float, float);
+static u64 mm_dbits(double d) { u64 u; __builtin_memcpy(&u, &d, 8); return u; }
+static double mm_dfrom(u64 u) { double d; __builtin_memcpy(&d, &u, 8); return d; }
+static u32 mm_fbits(float f) { u32 u; __builtin_memcpy(&u, &f, 4); return u; }
+static float mm_ffrom(u32 u) { float f; __builtin_memcpy(&f, &u, 4); return f; }
+#define N(a) (int)(sizeof(a) / sizeof((a)[0]))
+static const u64 mm_dfma[][4] = {
+    {0x3ff0000000000001, 0x3fefffffffffffff, 0xbff0000000000000, 0x3c9ffffffffffffe},
+    {0x3fb999999999999a, 0x4024000000000000, 0xbff0000000000000, 0x3c90000000000000},
+    {0x4000000000000000, 0x4008000000000000, 0x4010000000000000, 0x4024000000000000},
+    {0x8000000000000000, 0x3ff0000000000000, 0x0000000000000000, 0x0000000000000000},
+    {0x8000000000000000, 0x3ff0000000000000, 0x8000000000000000, 0x8000000000000000},
+    {0x7fe0000000000000, 0x4000000000000000, 0xffe0000000000000, 0x7fe0000000000000},
+    {0x0010000000000000, 0x3fe0000000000000, 0x0000000000000001, 0x0008000000000001},
+    {0x3ff5555555555555, 0x4008000000000000, 0xc010000000000000, 0xbcb0000000000000},
+    {0x4340000000000001, 0x3ff0000000000001, 0xc340000000000002, 0x3cc0000000000000},
+    {0x3ff0000000000000, 0x3ff0000000000000, 0x3ca0000000000000, 0x3ff0000000000000},
+    {0x3ff0000000000000, 0x3ff0000000000001, 0x3ca0000000000000, 0x3ff0000000000002},
+    {0x7fefffffffffffff, 0x4000000000000000, 0x0000000000000000, 0x7ff0000000000000},
+};
+static const u32 mm_ffma[][4] = {
+    {0x3f800001, 0x3f7fffff, 0xbf800000, 0x337ffffe},
+    {0x3dcccccd, 0x41200000, 0xbf800000, 0x32800000},
+    {0x40000000, 0x40400000, 0x40800000, 0x41200000},
+    {0x80000000, 0x3f800000, 0x00000000, 0x00000000},
+    {0x7f000000, 0x40000000, 0xff000000, 0x7f000000},
+    {0x00800000, 0x3f000000, 0x00000001, 0x00400001},
+    {0x3faaaaab, 0x40400000, 0xc0800000, 0x34000000},
+    {0x7f7fffff, 0x40000000, 0x00000000, 0x7f800000},
+};
+/* x, y, fmin, fmax: ordered pairs both ways, -inf, a quiet NaN on each
+   side, two negatives, inf against the smallest subnormal, a tie. */
+static const u64 mm_dmm[][4] = {
+    {0x3ff0000000000000, 0x4000000000000000, 0x3ff0000000000000, 0x4000000000000000},
+    {0x4000000000000000, 0x3ff0000000000000, 0x3ff0000000000000, 0x4000000000000000},
+    {0xfff0000000000000, 0x4008000000000000, 0xfff0000000000000, 0x4008000000000000},
+    {0x7ff8000000001234, 0x4008000000000000, 0x4008000000000000, 0x4008000000000000},
+    {0x4008000000000000, 0x7ff8000000001234, 0x4008000000000000, 0x4008000000000000},
+    {0xc000000000000000, 0xbff0000000000000, 0xc000000000000000, 0xbff0000000000000},
+    {0x7ff0000000000000, 0x0000000000000001, 0x0000000000000001, 0x7ff0000000000000},
+    {0x3ff0000000000000, 0x3ff0000000000000, 0x3ff0000000000000, 0x3ff0000000000000},
+};
+static const u32 mm_fmm[][4] = {
+    {0x3f800000, 0x40000000, 0x3f800000, 0x40000000},
+    {0x40000000, 0x3f800000, 0x3f800000, 0x40000000},
+    {0xff800000, 0x40400000, 0xff800000, 0x40400000},
+    {0x7fc01234, 0x40400000, 0x40400000, 0x40400000},
+    {0x40400000, 0x7fc01234, 0x40400000, 0x40400000},
+    {0xc0000000, 0xbf800000, 0xc0000000, 0xbf800000},
+};
+static int mm_check_fma(void) {
+    for (int i = 0; i < N(mm_dfma); i++) {
+        volatile double x = mm_dfrom(mm_dfma[i][0]), y = mm_dfrom(mm_dfma[i][1]), z = mm_dfrom(mm_dfma[i][2]);
+        if (mm_dbits(fma(x, y, z)) != mm_dfma[i][3]) return 1;
+        if (mm_dbits(__builtin_fma(x, y, z)) != mm_dfma[i][3]) return 2;
+    }
+    for (int i = 0; i < N(mm_ffma); i++) {
+        volatile float x = mm_ffrom(mm_ffma[i][0]), y = mm_ffrom(mm_ffma[i][1]), z = mm_ffrom(mm_ffma[i][2]);
+        if (mm_fbits(fmaf(x, y, z)) != mm_ffma[i][3]) return 3;
+        if (mm_fbits(__builtin_fmaf(x, y, z)) != mm_ffma[i][3]) return 4;
+    }
+    volatile double nan = __builtin_nan(""), one = 1.0;
+    if (!__builtin_isnan(fma(nan, one, one)) || !__builtin_isnan(fma(one, one, nan))) return 5;
+    return 0;
+}
+static int mm_check_min_max(void) {
+    for (int i = 0; i < N(mm_dmm); i++) {
+        volatile double x = mm_dfrom(mm_dmm[i][0]), y = mm_dfrom(mm_dmm[i][1]);
+        if (mm_dbits(fmin(x, y)) != mm_dmm[i][2] || mm_dbits(__builtin_fmin(x, y)) != mm_dmm[i][2]) return 11;
+        if (mm_dbits(fmax(x, y)) != mm_dmm[i][3] || mm_dbits(__builtin_fmax(x, y)) != mm_dmm[i][3]) return 12;
+    }
+    for (int i = 0; i < N(mm_fmm); i++) {
+        volatile float x = mm_ffrom(mm_fmm[i][0]), y = mm_ffrom(mm_fmm[i][1]);
+        if (mm_fbits(fminf(x, y)) != mm_fmm[i][2] || mm_fbits(__builtin_fminf(x, y)) != mm_fmm[i][2]) return 13;
+        if (mm_fbits(fmaxf(x, y)) != mm_fmm[i][3] || mm_fbits(__builtin_fmaxf(x, y)) != mm_fmm[i][3]) return 14;
+    }
+    volatile double n1 = __builtin_nan("1"), n2 = __builtin_nan("2");
+    if (!__builtin_isnan(fmin(n1, n2)) || !__builtin_isnan(fmax(n1, n2))) return 15;
+/* fminnm's zeros. At -O0 the bare call is the C library's, which C leaves
+   free here: glibc's aarch64 function is fminnm, Apple's is not known to be. */
+#if defined(__aarch64__) && (defined(__OPTIMIZE__) || !defined(__APPLE__))
+    volatile double pz = 0.0, nz = -0.0;
+    if (mm_dbits(fmin(pz, nz)) != 0x8000000000000000 || mm_dbits(fmin(nz, pz)) != 0x8000000000000000) return 16;
+    if (mm_dbits(fmax(pz, nz)) != 0 || mm_dbits(fmax(nz, pz)) != 0) return 17;
+#endif
+    return 0;
+}
+/* Constants, which fold: the same answers, and gcc's for the zeros. */
+static int mm_check_constants(void) {
+    if (mm_dbits(fma(0x1.0000000000001p0, 0x1.fffffffffffffp-1, -1.0)) != 0x3c9ffffffffffffe) return 21;
+    if (mm_dbits(fma(0.1, 10.0, -1.0)) != 0x3c90000000000000) return 22;
+    if (mm_fbits(fmaf(0x1.000002p0f, 0x1.fffffep-1f, -1.0f)) != 0x337ffffe) return 23;
+#if defined(__OPTIMIZE__) || defined(__aarch64__)
+    /* Folded, or fminnm: at -O0 on x86-64 the call is glibc's, which
+       answers the first operand. */
+    if (mm_dbits(fmin(0.0, -0.0)) != 0x8000000000000000 || mm_dbits(fmin(-0.0, 0.0)) != 0x8000000000000000) return 24;
+    if (mm_dbits(fmax(0.0, -0.0)) != 0 || mm_dbits(fmax(-0.0, 0.0)) != 0) return 25;
+#endif
+    if (fmin(__builtin_nan(""), 3.0) != 3.0 || fmaxf(2.0f, __builtin_nanf("")) != 2.0f) return 26;
+    if (fmin(-__builtin_inf(), 1.0) != -__builtin_inf()) return 27;
+    return 0;
+}
+static int t_libm_min_max_fma_values(void) {
+    int rc;
+    if ((rc = mm_check_fma()) || (rc = mm_check_min_max())) return rc;
+    return mm_check_constants();
+}
+#undef N
+
+int main(void)
+{
+    int r;
+    if ((r = t_libm_sqrt_values_and_errno()) != 0)
+        return 0 + r;
+    if ((r = t_libm_rounding_values_in_every_direction()) != 0)
+        return 40 + r;
+    if ((r = t_libm_constant_call_is_a_constant_at_every_level()) != 0)
+        return 170 + r;
+    if ((r = t_libm_min_max_fma_values()) != 0)
+        return 180 + r;
+    return 0;
 }
 "#;
-
-#[test]
-fn libm_sqrt_values_and_errno() {
-    run_everywhere("sqrt_errno", SQRT_PROGRAM, &[], true);
+    run_everywhere("libm_values", code, &[], true);
 }
+
+/// Constant libm calls in static initializers, linked without -lm: what they
+/// fold to is all the program reads.
+///
+/// Consolidates the static-initializer programs of libm_sqrt_of_constants,
+/// libm_rounding_of_constants and libm_min_max_fma_of_constants, whose assembly
+/// and diagnostic halves are unit tests in cc/test_asm/builtins_libm.rs.
+#[test]
+fn libm_constants_mega() {
+    let code = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1-  4  libm_sqrt_of_constants
+ *    11- 12  libm_rounding_of_constants
+ *    21- 24  libm_min_max_fma_of_constants
+ */
+
+/* ---- libm_sqrt_of_constants (exit codes 1-4) ----
+ *
+ *  A constant root folds, in code and in a static initializer, to what the
+ *  instruction computes; a domain error does not, in either.
+ */
+typedef unsigned long long u64;
+double sqrt(double); float sqrtf(float); long double sqrtl(long double);
+static double sq_a = sqrt(2.0);
+static float sq_b = sqrtf(2.0f);
+static long double sq_c = __builtin_sqrtl(2.0L);
+static double sq_d = sqrt(-0.0);
+static int t_libm_sqrt_of_constants(void) {
+    u64 u; __builtin_memcpy(&u, &sq_a, 8);
+    if (u != 0x3ff6a09e667f3bcdULL) return 1;
+    if (sq_b != 1.41421353816986083984375f) return 2;
+    if (sq_c != 1.4142135623730950488016887242096980785697L) return 3;
+    if (sq_d != 0.0 || !__builtin_signbit(sq_d)) return 4;
+    return 0;
+}
+
+
+/* ---- libm_rounding_of_constants (exit codes 11-12) ----
+ *
+ *  Constants fold, in code and in static initializers, except a `rint` or
+ *  `nearbyint` of a value that is not already an integer: its answer is the
+ *  current rounding direction's, and gcc leaves it too.
+ */
+double floor(double); double ceil(double); double trunc(double);
+double round(double); double rint(double); float roundf(float);
+static double rd_a = floor(-2.5);
+static double rd_b = ceil(-0.5);
+static double rd_c = trunc(2.75);
+static double rd_d = round(-2.5);
+static float rd_e = roundf(0.5f);
+static double rd_f = rint(-7.0);
+static int t_libm_rounding_of_constants(void) {
+    if (rd_a != -3.0 || rd_b != 0.0 || !__builtin_signbit(rd_b)) return 1;
+    if (rd_c != 2.0 || rd_d != -3.0 || rd_e != 1.0f || rd_f != -7.0) return 2;
+    return 0;
+}
+
+
+/* ---- libm_min_max_fma_of_constants (exit codes 21-24) ----
+ *
+ *  Constants fold on both targets -- on x86-64 too, where the function is
+ *  otherwise a call -- exactly: `fma` rounds once, and the zeros of `fmin`
+ *  and `fmax` fold to gcc's -0 and +0. In a static initializer gcc refuses a
+ *  NaN argument, and so does this.
+ */
+typedef unsigned long long u64;
+double fmin(double, double); double fmax(double, double);
+double fma(double, double, double); float fmaf(float, float, float);
+static double mm_a = fmin(0.0, -0.0);
+static double mm_b = fmax(-0.0, 0.0);
+static double mm_c = fma(0x1.0000000000001p0, 0x1.fffffffffffffp-1, -1.0);
+static float mm_d = fmaf(2.0f, 3.0f, 4.0f);
+static double mm_e = fmin(-2.0, 1.0);
+static int t_libm_min_max_fma_of_constants(void) {
+    u64 u;
+    __builtin_memcpy(&u, &mm_a, 8);
+    if (u != 0x8000000000000000ULL) return 1;
+    __builtin_memcpy(&u, &mm_b, 8);
+    if (u != 0) return 2;
+    __builtin_memcpy(&u, &mm_c, 8);
+    if (u != 0x3c9ffffffffffffeULL) return 3;
+    if (mm_d != 10.0f || mm_e != -2.0) return 4;
+    return 0;
+}
+
+int main(void)
+{
+    int r;
+    if ((r = t_libm_sqrt_of_constants()) != 0)
+        return 0 + r;
+    if ((r = t_libm_rounding_of_constants()) != 0)
+        return 10 + r;
+    if ((r = t_libm_min_max_fma_of_constants()) != 0)
+        return 20 + r;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("libm_constants_mega", code, &[]), 0);
+}
+
+// ============================================================================
+// sqrt, sqrtf, sqrtl
+// ============================================================================
 
 /// Under `-fno-math-errno` nothing is called at `-O2`, so the program links
 /// without `-lm`, as gcc's does. A negative argument gives the instruction's
@@ -254,33 +711,6 @@ const SQRT_SRC: &str = "double sqrt(double); float sqrtf(float);\n\
                         double bd(double x) { return __builtin_sqrt(x); }\n\
                         float bf(float x) { return __builtin_sqrtf(x); }\n";
 
-/// At `-O2` each root is the instruction, with a call to the library only
-/// for an argument below zero, so that `errno` is set; `-fno-math-errno`
-/// drops the call. As in gcc.
-#[test]
-fn libm_sqrt_is_the_instruction() {
-    for (target, asm) in asm_both("sqrt_o2", SQRT_SRC, &["-O2"]) {
-        let (d, s) = if target == "host" && cfg!(target_arch = "x86_64") {
-            ("sqrtsd", "sqrtss")
-        } else {
-            ("fsqrt", "fsqrt")
-        };
-        assert!(has_insn(&asm, d) && has_insn(&asm, s), "{target}:\n{asm}");
-        assert!(
-            calls_any(&asm, &["sqrt", "sqrtf"]),
-            "{target}: no errno path:\n{asm}"
-        );
-    }
-    for (target, asm) in asm_both("sqrt_no_errno", SQRT_SRC, &["-O2", "-fno-math-errno"]) {
-        assert!(!calls_any(&asm, &["sqrt", "sqrtf"]), "{target}:\n{asm}");
-    }
-    // The last of the pair wins.
-    let opts = ["-O2", "-fno-math-errno", "-fmath-errno"];
-    for (target, asm) in asm_both("sqrt_errno_again", SQRT_SRC, &opts) {
-        assert!(calls_any(&asm, &["sqrt", "sqrtf"]), "{target}:\n{asm}");
-    }
-}
-
 /// `-fmath-errno` and `-fno-math-errno` are options c17 acts on, so neither
 /// is reported as ignored.
 #[test]
@@ -294,314 +724,9 @@ fn libm_math_errno_flags_are_recognized() {
     }
 }
 
-/// At `-O0` gcc calls the library for a bare `sqrt`, and for
-/// `__builtin_sqrt` too while `errno` is to be set, since only the optimizer
-/// can split the call; under `-fno-math-errno` the builtin spelling is the
-/// instruction.
-#[test]
-fn libm_sqrt_at_o0_follows_gcc() {
-    for (target, asm) in asm_both("sqrt_o0", SQRT_SRC, &["-O0"]) {
-        assert!(
-            !has_insn(&asm, "sqrtsd") && !has_insn(&asm, "fsqrt"),
-            "{target}:\n{asm}"
-        );
-        assert!(calls_any(&asm, &["sqrt"]), "{target}:\n{asm}");
-    }
-    let builtin_only = "double bd(double x) { return __builtin_sqrt(x); }\n\
-                        float bf(float x) { return __builtin_sqrtf(x); }\n";
-    for (target, asm) in asm_both("sqrt_o0_ne", builtin_only, &["-O0", "-fno-math-errno"]) {
-        assert!(!calls_any(&asm, &["sqrt", "sqrtf"]), "{target}:\n{asm}");
-    }
-    let bare_only = "double sqrt(double);\ndouble d(double x) { return sqrt(x); }\n";
-    for (target, asm) in asm_both("sqrt_o0_ne_bare", bare_only, &["-O0", "-fno-math-errno"]) {
-        assert!(calls_any(&asm, &["sqrt"]), "{target}:\n{asm}");
-    }
-}
-
-/// `sqrtl`: the x87 `fsqrt` on x86-64, guarded like the others; binary128 on
-/// aarch64 has no instruction, so it is only the call -- with no comparison
-/// in front of it, which would be a libgcc call of its own.
-#[test]
-fn libm_sqrtl_by_target() {
-    let src = "long double sqrtl(long double);\n\
-               long double l(long double x) { return sqrtl(x); }\n";
-    let [(_, host), (_, a64)] = asm_both("sqrtl", src, &["-O2"]);
-    if cfg!(target_arch = "x86_64") {
-        assert!(has_insn(&host, "fsqrt"), "{host}");
-    }
-    assert!(calls_any(&a64, &["sqrtl"]), "{a64}");
-    assert!(!calls_any(&a64, &["__lttf2"]), "{a64}");
-}
-
-/// `-fno-builtin-sqrt` keeps the call to `sqrt`, and only that one.
-#[test]
-fn libm_sqrt_fno_builtin_keeps_the_call() {
-    let opts = ["-O2", "-fno-builtin-sqrt"];
-    let src = "double sqrt(double);\ndouble d(double x) { return sqrt(x); }\n";
-    for (target, asm) in asm_both("sqrt_nb", src, &opts) {
-        assert!(
-            calls_any(&asm, &["sqrt"]) && !has_insn(&asm, "sqrtsd") && !has_insn(&asm, "fsqrt"),
-            "{target}: -fno-builtin-sqrt computed sqrt in place:\n{asm}"
-        );
-    }
-    let src = "float sqrtf(float);\nfloat f(float x) { return sqrtf(x); }\n";
-    for (target, asm) in asm_both("sqrtf_nb", src, &opts) {
-        assert!(
-            has_insn(&asm, "sqrtss") || has_insn(&asm, "fsqrt"),
-            "{target}: -fno-builtin-sqrt displaced sqrtf:\n{asm}"
-        );
-    }
-}
-
-/// A constant root folds, in code and in a static initializer, to what the
-/// instruction computes; a domain error does not, in either.
-#[test]
-fn libm_sqrt_of_constants() {
-    let src = "double sqrt(double);\n\
-               double f(void) { return sqrt(2.0) + __builtin_sqrtf(16.0f); }\n";
-    for (target, asm) in asm_both("sqrt_fold", src, &["-O2"]) {
-        assert!(
-            !calls_any(&asm, &["sqrt", "sqrtf"]) && !has_insn(&asm, "sqrtsd"),
-            "{target}: not folded:\n{asm}"
-        );
-        assert!(!has_insn(&asm, "fsqrt"), "{target}: not folded:\n{asm}");
-    }
-    let src = "double sqrt(double);\ndouble f(void) { return sqrt(-2.0); }\n";
-    for (target, asm) in asm_both("sqrt_fold_neg", src, &["-O2"]) {
-        assert!(calls_any(&asm, &["sqrt"]), "{target}: errno lost:\n{asm}");
-    }
-
-    let code = r#"
-typedef unsigned long long u64;
-double sqrt(double); float sqrtf(float); long double sqrtl(long double);
-static double a = sqrt(2.0);
-static float b = sqrtf(2.0f);
-static long double c = __builtin_sqrtl(2.0L);
-static double d = sqrt(-0.0);
-int main(void) {
-    u64 u; __builtin_memcpy(&u, &a, 8);
-    if (u != 0x3ff6a09e667f3bcdULL) return 1;
-    if (b != 1.41421353816986083984375f) return 2;
-    if (c != 1.4142135623730950488016887242096980785697L) return 3;
-    if (d != 0.0 || !__builtin_signbit(d)) return 4;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("sqrt_static", code, &[]), 0);
-    compile_expect_error(
-        "sqrt_static_domain",
-        "double sqrt(double);\nstatic double z = sqrt(-1.0);\ndouble *p = &z;\n",
-        "cannot initialize an object with static storage duration",
-    );
-}
-
 // ============================================================================
 // floor, ceil, trunc, round, rint, nearbyint and their f forms
 // ============================================================================
-
-/// The rounding direction, set in the SSE or FP control register directly
-/// so that the program needs no `<fenv.h>` and no libm: 0 to nearest, 1
-/// downward, 2 upward, 3 toward zero.
-const SET_ROUNDING: &str = r#"
-static void set_rounding(int m) {
-#if defined(__x86_64__)
-    unsigned csr;
-    __asm__ volatile("stmxcsr %0" : "=m"(csr));
-    csr = (csr & ~0x6000u) | ((unsigned)m << 13);
-    __asm__ volatile("ldmxcsr %0" : : "m"(csr));
-#elif defined(__aarch64__)
-    static const unsigned long rmode[4] = {0, 2, 1, 3};
-    unsigned long fpcr;
-    __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
-    fpcr = (fpcr & ~(3UL << 22)) | rmode[m] << 22;
-    __asm__ volatile("msr fpcr, %0" : : "r"(fpcr));
-#endif
-}
-"#;
-
-/// Each input with its floor, ceil, trunc and round, and its rint -- which
-/// nearbyint equals -- in each rounding direction: +-0, 0.5, 0.25, 0.75,
-/// 1.5, 2.5, 2.75, 2^52 - 0.5, 2^52, 2^52 + 1, 2^53, 2^51 + 0.5, 1e300, the
-/// smallest subnormal, the largest finite value, inf, a quiet NaN with a
-/// payload and 100, each of both signs; then the same for `float`, around
-/// 2^23. Every value is glibc's, identical on x86-64 and aarch64.
-const ROUND_TABLES: &str = r#"
-typedef unsigned long long u64; typedef unsigned int u32;
-struct drow { u64 in, fl, ce, tr, ro, ri[4]; };
-static const struct drow dcase[] = {
-    {0x0000000000000000, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000, {0x0000000000000000, 0x0000000000000000, 0x0000000000000000, 0x0000000000000000}},
-    {0x3fe0000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000, 0x3ff0000000000000, {0x0000000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000}},
-    {0x3fd0000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000, 0x0000000000000000, {0x0000000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000}},
-    {0x3fe8000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000, 0x3ff0000000000000, {0x3ff0000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000}},
-    {0x3ff8000000000000, 0x3ff0000000000000, 0x4000000000000000, 0x3ff0000000000000, 0x4000000000000000, {0x4000000000000000, 0x3ff0000000000000, 0x4000000000000000, 0x3ff0000000000000}},
-    {0x4004000000000000, 0x4000000000000000, 0x4008000000000000, 0x4000000000000000, 0x4008000000000000, {0x4000000000000000, 0x4000000000000000, 0x4008000000000000, 0x4000000000000000}},
-    {0x4006000000000000, 0x4000000000000000, 0x4008000000000000, 0x4000000000000000, 0x4008000000000000, {0x4008000000000000, 0x4000000000000000, 0x4008000000000000, 0x4000000000000000}},
-    {0x432fffffffffffff, 0x432ffffffffffffe, 0x4330000000000000, 0x432ffffffffffffe, 0x4330000000000000, {0x4330000000000000, 0x432ffffffffffffe, 0x4330000000000000, 0x432ffffffffffffe}},
-    {0x4330000000000000, 0x4330000000000000, 0x4330000000000000, 0x4330000000000000, 0x4330000000000000, {0x4330000000000000, 0x4330000000000000, 0x4330000000000000, 0x4330000000000000}},
-    {0x4330000000000001, 0x4330000000000001, 0x4330000000000001, 0x4330000000000001, 0x4330000000000001, {0x4330000000000001, 0x4330000000000001, 0x4330000000000001, 0x4330000000000001}},
-    {0x4340000000000000, 0x4340000000000000, 0x4340000000000000, 0x4340000000000000, 0x4340000000000000, {0x4340000000000000, 0x4340000000000000, 0x4340000000000000, 0x4340000000000000}},
-    {0x4320000000000001, 0x4320000000000000, 0x4320000000000002, 0x4320000000000000, 0x4320000000000002, {0x4320000000000000, 0x4320000000000000, 0x4320000000000002, 0x4320000000000000}},
-    {0x7e37e43c8800759c, 0x7e37e43c8800759c, 0x7e37e43c8800759c, 0x7e37e43c8800759c, 0x7e37e43c8800759c, {0x7e37e43c8800759c, 0x7e37e43c8800759c, 0x7e37e43c8800759c, 0x7e37e43c8800759c}},
-    {0x0000000000000001, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000, 0x0000000000000000, {0x0000000000000000, 0x0000000000000000, 0x3ff0000000000000, 0x0000000000000000}},
-    {0x7fefffffffffffff, 0x7fefffffffffffff, 0x7fefffffffffffff, 0x7fefffffffffffff, 0x7fefffffffffffff, {0x7fefffffffffffff, 0x7fefffffffffffff, 0x7fefffffffffffff, 0x7fefffffffffffff}},
-    {0x7ff0000000000000, 0x7ff0000000000000, 0x7ff0000000000000, 0x7ff0000000000000, 0x7ff0000000000000, {0x7ff0000000000000, 0x7ff0000000000000, 0x7ff0000000000000, 0x7ff0000000000000}},
-    {0x7ff8000000001234, 0x7ff8000000001234, 0x7ff8000000001234, 0x7ff8000000001234, 0x7ff8000000001234, {0x7ff8000000001234, 0x7ff8000000001234, 0x7ff8000000001234, 0x7ff8000000001234}},
-    {0x4059000000000000, 0x4059000000000000, 0x4059000000000000, 0x4059000000000000, 0x4059000000000000, {0x4059000000000000, 0x4059000000000000, 0x4059000000000000, 0x4059000000000000}},
-    {0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, {0x8000000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000}},
-    {0xbfe0000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000, 0xbff0000000000000, {0x8000000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000}},
-    {0xbfd0000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, {0x8000000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000}},
-    {0xbfe8000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000, 0xbff0000000000000, {0xbff0000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000}},
-    {0xbff8000000000000, 0xc000000000000000, 0xbff0000000000000, 0xbff0000000000000, 0xc000000000000000, {0xc000000000000000, 0xc000000000000000, 0xbff0000000000000, 0xbff0000000000000}},
-    {0xc004000000000000, 0xc008000000000000, 0xc000000000000000, 0xc000000000000000, 0xc008000000000000, {0xc000000000000000, 0xc008000000000000, 0xc000000000000000, 0xc000000000000000}},
-    {0xc006000000000000, 0xc008000000000000, 0xc000000000000000, 0xc000000000000000, 0xc008000000000000, {0xc008000000000000, 0xc008000000000000, 0xc000000000000000, 0xc000000000000000}},
-    {0xc32fffffffffffff, 0xc330000000000000, 0xc32ffffffffffffe, 0xc32ffffffffffffe, 0xc330000000000000, {0xc330000000000000, 0xc330000000000000, 0xc32ffffffffffffe, 0xc32ffffffffffffe}},
-    {0xc330000000000000, 0xc330000000000000, 0xc330000000000000, 0xc330000000000000, 0xc330000000000000, {0xc330000000000000, 0xc330000000000000, 0xc330000000000000, 0xc330000000000000}},
-    {0xc330000000000001, 0xc330000000000001, 0xc330000000000001, 0xc330000000000001, 0xc330000000000001, {0xc330000000000001, 0xc330000000000001, 0xc330000000000001, 0xc330000000000001}},
-    {0xc340000000000000, 0xc340000000000000, 0xc340000000000000, 0xc340000000000000, 0xc340000000000000, {0xc340000000000000, 0xc340000000000000, 0xc340000000000000, 0xc340000000000000}},
-    {0xc320000000000001, 0xc320000000000002, 0xc320000000000000, 0xc320000000000000, 0xc320000000000002, {0xc320000000000000, 0xc320000000000002, 0xc320000000000000, 0xc320000000000000}},
-    {0xfe37e43c8800759c, 0xfe37e43c8800759c, 0xfe37e43c8800759c, 0xfe37e43c8800759c, 0xfe37e43c8800759c, {0xfe37e43c8800759c, 0xfe37e43c8800759c, 0xfe37e43c8800759c, 0xfe37e43c8800759c}},
-    {0x8000000000000001, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000, 0x8000000000000000, {0x8000000000000000, 0xbff0000000000000, 0x8000000000000000, 0x8000000000000000}},
-    {0xffefffffffffffff, 0xffefffffffffffff, 0xffefffffffffffff, 0xffefffffffffffff, 0xffefffffffffffff, {0xffefffffffffffff, 0xffefffffffffffff, 0xffefffffffffffff, 0xffefffffffffffff}},
-    {0xfff0000000000000, 0xfff0000000000000, 0xfff0000000000000, 0xfff0000000000000, 0xfff0000000000000, {0xfff0000000000000, 0xfff0000000000000, 0xfff0000000000000, 0xfff0000000000000}},
-    {0xfff8000000001234, 0xfff8000000001234, 0xfff8000000001234, 0xfff8000000001234, 0xfff8000000001234, {0xfff8000000001234, 0xfff8000000001234, 0xfff8000000001234, 0xfff8000000001234}},
-    {0xc059000000000000, 0xc059000000000000, 0xc059000000000000, 0xc059000000000000, 0xc059000000000000, {0xc059000000000000, 0xc059000000000000, 0xc059000000000000, 0xc059000000000000}},
-};
-struct frow { u32 in, fl, ce, tr, ro, ri[4]; };
-static const struct frow fcase[] = {
-    {0x00000000, 0x00000000, 0x00000000, 0x00000000, 0x00000000, {0x00000000, 0x00000000, 0x00000000, 0x00000000}},
-    {0x3f000000, 0x00000000, 0x3f800000, 0x00000000, 0x3f800000, {0x00000000, 0x00000000, 0x3f800000, 0x00000000}},
-    {0x3e800000, 0x00000000, 0x3f800000, 0x00000000, 0x00000000, {0x00000000, 0x00000000, 0x3f800000, 0x00000000}},
-    {0x3f400000, 0x00000000, 0x3f800000, 0x00000000, 0x3f800000, {0x3f800000, 0x00000000, 0x3f800000, 0x00000000}},
-    {0x3fc00000, 0x3f800000, 0x40000000, 0x3f800000, 0x40000000, {0x40000000, 0x3f800000, 0x40000000, 0x3f800000}},
-    {0x40200000, 0x40000000, 0x40400000, 0x40000000, 0x40400000, {0x40000000, 0x40000000, 0x40400000, 0x40000000}},
-    {0x40300000, 0x40000000, 0x40400000, 0x40000000, 0x40400000, {0x40400000, 0x40000000, 0x40400000, 0x40000000}},
-    {0x4affffff, 0x4afffffe, 0x4b000000, 0x4afffffe, 0x4b000000, {0x4b000000, 0x4afffffe, 0x4b000000, 0x4afffffe}},
-    {0x4b000000, 0x4b000000, 0x4b000000, 0x4b000000, 0x4b000000, {0x4b000000, 0x4b000000, 0x4b000000, 0x4b000000}},
-    {0x4b000001, 0x4b000001, 0x4b000001, 0x4b000001, 0x4b000001, {0x4b000001, 0x4b000001, 0x4b000001, 0x4b000001}},
-    {0x4b800000, 0x4b800000, 0x4b800000, 0x4b800000, 0x4b800000, {0x4b800000, 0x4b800000, 0x4b800000, 0x4b800000}},
-    {0x4a800001, 0x4a800000, 0x4a800002, 0x4a800000, 0x4a800002, {0x4a800000, 0x4a800000, 0x4a800002, 0x4a800000}},
-    {0x7e967699, 0x7e967699, 0x7e967699, 0x7e967699, 0x7e967699, {0x7e967699, 0x7e967699, 0x7e967699, 0x7e967699}},
-    {0x00000001, 0x00000000, 0x3f800000, 0x00000000, 0x00000000, {0x00000000, 0x00000000, 0x3f800000, 0x00000000}},
-    {0x7f7fffff, 0x7f7fffff, 0x7f7fffff, 0x7f7fffff, 0x7f7fffff, {0x7f7fffff, 0x7f7fffff, 0x7f7fffff, 0x7f7fffff}},
-    {0x7f800000, 0x7f800000, 0x7f800000, 0x7f800000, 0x7f800000, {0x7f800000, 0x7f800000, 0x7f800000, 0x7f800000}},
-    {0x7fc01234, 0x7fc01234, 0x7fc01234, 0x7fc01234, 0x7fc01234, {0x7fc01234, 0x7fc01234, 0x7fc01234, 0x7fc01234}},
-    {0x42c80000, 0x42c80000, 0x42c80000, 0x42c80000, 0x42c80000, {0x42c80000, 0x42c80000, 0x42c80000, 0x42c80000}},
-    {0x80000000, 0x80000000, 0x80000000, 0x80000000, 0x80000000, {0x80000000, 0x80000000, 0x80000000, 0x80000000}},
-    {0xbf000000, 0xbf800000, 0x80000000, 0x80000000, 0xbf800000, {0x80000000, 0xbf800000, 0x80000000, 0x80000000}},
-    {0xbe800000, 0xbf800000, 0x80000000, 0x80000000, 0x80000000, {0x80000000, 0xbf800000, 0x80000000, 0x80000000}},
-    {0xbf400000, 0xbf800000, 0x80000000, 0x80000000, 0xbf800000, {0xbf800000, 0xbf800000, 0x80000000, 0x80000000}},
-    {0xbfc00000, 0xc0000000, 0xbf800000, 0xbf800000, 0xc0000000, {0xc0000000, 0xc0000000, 0xbf800000, 0xbf800000}},
-    {0xc0200000, 0xc0400000, 0xc0000000, 0xc0000000, 0xc0400000, {0xc0000000, 0xc0400000, 0xc0000000, 0xc0000000}},
-    {0xc0300000, 0xc0400000, 0xc0000000, 0xc0000000, 0xc0400000, {0xc0400000, 0xc0400000, 0xc0000000, 0xc0000000}},
-    {0xcaffffff, 0xcb000000, 0xcafffffe, 0xcafffffe, 0xcb000000, {0xcb000000, 0xcb000000, 0xcafffffe, 0xcafffffe}},
-    {0xcb000000, 0xcb000000, 0xcb000000, 0xcb000000, 0xcb000000, {0xcb000000, 0xcb000000, 0xcb000000, 0xcb000000}},
-    {0xcb000001, 0xcb000001, 0xcb000001, 0xcb000001, 0xcb000001, {0xcb000001, 0xcb000001, 0xcb000001, 0xcb000001}},
-    {0xcb800000, 0xcb800000, 0xcb800000, 0xcb800000, 0xcb800000, {0xcb800000, 0xcb800000, 0xcb800000, 0xcb800000}},
-    {0xca800001, 0xca800002, 0xca800000, 0xca800000, 0xca800002, {0xca800000, 0xca800002, 0xca800000, 0xca800000}},
-    {0xfe967699, 0xfe967699, 0xfe967699, 0xfe967699, 0xfe967699, {0xfe967699, 0xfe967699, 0xfe967699, 0xfe967699}},
-    {0x80000001, 0xbf800000, 0x80000000, 0x80000000, 0x80000000, {0x80000000, 0xbf800000, 0x80000000, 0x80000000}},
-    {0xff7fffff, 0xff7fffff, 0xff7fffff, 0xff7fffff, 0xff7fffff, {0xff7fffff, 0xff7fffff, 0xff7fffff, 0xff7fffff}},
-    {0xff800000, 0xff800000, 0xff800000, 0xff800000, 0xff800000, {0xff800000, 0xff800000, 0xff800000, 0xff800000}},
-    {0xffc01234, 0xffc01234, 0xffc01234, 0xffc01234, 0xffc01234, {0xffc01234, 0xffc01234, 0xffc01234, 0xffc01234}},
-    {0xc2c80000, 0xc2c80000, 0xc2c80000, 0xc2c80000, 0xc2c80000, {0xc2c80000, 0xc2c80000, 0xc2c80000, 0xc2c80000}},
-};
-#define N(a) (int)(sizeof(a) / sizeof((a)[0]))
-static u64 dbits(double d) { u64 u; __builtin_memcpy(&u, &d, 8); return u; }
-static double dfrom(u64 u) { double d; __builtin_memcpy(&d, &u, 8); return d; }
-static u32 fbits(float f) { u32 u; __builtin_memcpy(&u, &f, 4); return u; }
-static float ffrom(u32 u) { float f; __builtin_memcpy(&f, &u, 4); return f; }
-"#;
-
-/// Every function of every row, bare and `__builtin_`, in all four rounding
-/// directions, at run time; then the constants the optimizer folds. The
-/// code says which: 1 + function + 6 * direction for `double`, 40 + the
-/// same for `float`.
-const ROUND_CHECKS: &str = r#"
-double floor(double); double ceil(double); double trunc(double);
-double round(double); double rint(double); double nearbyint(double);
-float floorf(float); float ceilf(float); float truncf(float);
-float roundf(float); float rintf(float); float nearbyintf(float);
-__attribute__((noinline)) static int check_double(int m) {
-    for (int i = 0; i < N(dcase); i++) {
-        const struct drow *r = &dcase[i];
-        volatile double x = dfrom(r->in);
-        u64 want[6] = {r->fl, r->ce, r->tr, r->ro, r->ri[m], r->ri[m]};
-        u64 bare[6] = {dbits(floor(x)), dbits(ceil(x)), dbits(trunc(x)),
-                       dbits(round(x)), dbits(rint(x)), dbits(nearbyint(x))};
-        u64 blt[6] = {dbits(__builtin_floor(x)), dbits(__builtin_ceil(x)),
-                      dbits(__builtin_trunc(x)), dbits(__builtin_round(x)),
-                      dbits(__builtin_rint(x)), dbits(__builtin_nearbyint(x))};
-        for (int f = 0; f < 6; f++)
-            if (bare[f] != want[f] || blt[f] != want[f]) return 1 + f + 6 * m;
-    }
-    return 0;
-}
-__attribute__((noinline)) static int check_float(int m) {
-    for (int i = 0; i < N(fcase); i++) {
-        const struct frow *r = &fcase[i];
-        volatile float x = ffrom(r->in);
-        u32 want[6] = {r->fl, r->ce, r->tr, r->ro, r->ri[m], r->ri[m]};
-        u32 bare[6] = {fbits(floorf(x)), fbits(ceilf(x)), fbits(truncf(x)),
-                       fbits(roundf(x)), fbits(rintf(x)), fbits(nearbyintf(x))};
-        u32 blt[6] = {fbits(__builtin_floorf(x)), fbits(__builtin_ceilf(x)),
-                      fbits(__builtin_truncf(x)), fbits(__builtin_roundf(x)),
-                      fbits(__builtin_rintf(x)), fbits(__builtin_nearbyintf(x))};
-        /* A float argument to the double function is narrowed, exactly. */
-        double wide[6] = {floor(x), ceil(x), trunc(x), round(x), rint(x), nearbyint(x)};
-        for (int f = 0; f < 6; f++) {
-            if (bare[f] != want[f] || blt[f] != want[f]) return 40 + f + 6 * m;
-            if (fbits((float)wide[f]) != want[f]) return 70 + f + 6 * m;
-        }
-    }
-    return 0;
-}
-/* rint and nearbyint of a constant that is not an integer depend on the
-   direction, so they are not folded; everything else is. */
-__attribute__((noinline)) static int check_constants(int m) {
-    static const u64 rint_2_5[4] = {0x4000000000000000, 0x4000000000000000,
-                                    0x4008000000000000, 0x4000000000000000};
-    static const u64 nearbyint_m2_5[4] = {0xc000000000000000, 0xc008000000000000,
-                                          0xc000000000000000, 0xc000000000000000};
-    if (dbits(rint(2.5)) != rint_2_5[m]) return 101;
-    if (dbits(nearbyint(-2.5)) != nearbyint_m2_5[m]) return 102;
-    if (dbits(floor(-0.5)) != 0xbff0000000000000) return 103;
-    if (dbits(ceil(-0.5)) != 0x8000000000000000) return 104;
-    if (dbits(trunc(-2.75)) != 0xc000000000000000) return 105;
-    if (dbits(round(2.5)) != 0x4008000000000000) return 106;
-    if (dbits(round(-0.25)) != 0x8000000000000000) return 107;
-    if (dbits(rint(-3.0)) != 0xc008000000000000) return 108;
-    if (fbits(floorf(2.5f)) != 0x40000000) return 109;
-    if (fbits(__builtin_roundf(-2.5f)) != 0xc0400000) return 110;
-    if (dbits(floor(__builtin_nan("0x1234"))) != 0x7ff8000000001234) return 111;
-    if (dbits(ceil(-__builtin_inf())) != 0xfff0000000000000) return 112;
-    return 0;
-}
-int main(void) {
-    int rc;
-    for (int m = 0; m < 4; m++) {
-        set_rounding(m);
-        if ((rc = check_double(m)) || (rc = check_float(m)) || (rc = check_constants(m))) {
-            set_rounding(0);
-            return rc;
-        }
-    }
-    set_rounding(0);
-    /* The result of the double function is a double, narrowed or not. */
-    volatile float f = 1.5f;
-    if (sizeof(floor(f)) != sizeof(double)) return 120;
-    if (_Generic(ceil(f), double: 0, default: 1)) return 121;
-    return 0;
-}
-"#;
-
-fn round_program() -> String {
-    format!("{SET_ROUNDING}{ROUND_TABLES}{ROUND_CHECKS}")
-}
-
-#[test]
-fn libm_rounding_values_in_every_direction() {
-    run_everywhere("round_modes", &round_program(), &[], true);
-}
 
 /// What each target computes in place needs no libm, as under gcc: all six
 /// on aarch64; on x86-64 all but `round` and `nearbyint`, which SSE2 has no
@@ -642,161 +767,6 @@ int main(void) { return check(); }
 #[test]
 fn libm_rounding_in_place_needs_no_libm() {
     run_everywhere("round_no_libm", ROUND_NO_LIBM_PROGRAM, &[], false);
-}
-
-const ROUND_NAMES: [&str; 12] = [
-    "floor",
-    "ceil",
-    "trunc",
-    "round",
-    "rint",
-    "nearbyint",
-    "floorf",
-    "ceilf",
-    "truncf",
-    "roundf",
-    "rintf",
-    "nearbyintf",
-];
-
-/// A function computing each of the twelve, spelled `prefix` + name.
-fn round_source(prefix: &str) -> String {
-    let mut src = String::from(
-        "double floor(double); double ceil(double); double trunc(double);\n\
-         double round(double); double rint(double); double nearbyint(double);\n\
-         float floorf(float); float ceilf(float); float truncf(float);\n\
-         float roundf(float); float rintf(float); float nearbyintf(float);\n",
-    );
-    for name in ROUND_NAMES {
-        let t = if name.ends_with('f') {
-            "float"
-        } else {
-            "double"
-        };
-        src.push_str(&format!(
-            "{t} t_{name}({t} x) {{ return {prefix}{name}(x); }}\n"
-        ));
-    }
-    src
-}
-
-/// The instructions: `frintm`, `frintp`, `frintz`, `frinta`, `frintx` and
-/// `frinti` on aarch64; on x86-64 gcc's SSE2 sequences through `cvttsd2si`
-/// for `floor`, `ceil` and `trunc` and the 2^52 addition for `rint`, and
-/// calls to `round` and `nearbyint`, which gcc keeps too.
-#[test]
-fn libm_rounding_is_computed_in_place() {
-    for prefix in ["", "__builtin_"] {
-        let [(_, host), (_, a64)] = asm_both("round_o2", &round_source(prefix), &["-O2"]);
-        for insn in ["frintm", "frintp", "frintz", "frinta", "frintx", "frinti"] {
-            assert!(has_insn(&a64, insn), "{prefix}: no {insn}:\n{a64}");
-        }
-        assert!(
-            !calls_any(&a64, &ROUND_NAMES),
-            "{prefix}: a call remains:\n{a64}"
-        );
-        if cfg!(target_arch = "x86_64") {
-            assert!(
-                has_insn(&host, "cvttsd2si") || has_insn(&host, "cvttsd2siq"),
-                "{host}"
-            );
-            assert!(
-                has_insn(&host, "cvttss2si") || has_insn(&host, "cvttss2sil"),
-                "{host}"
-            );
-            let called = [
-                "floor", "ceil", "trunc", "rint", "floorf", "ceilf", "truncf", "rintf",
-            ];
-            assert!(
-                !calls_any(&host, &called),
-                "{prefix}: a call remains:\n{host}"
-            );
-            for kept in ["round", "nearbyint", "roundf", "nearbyintf"] {
-                assert!(
-                    calls_any(&host, &[kept]),
-                    "{prefix}: {kept} not called:\n{host}"
-                );
-            }
-        }
-    }
-}
-
-/// At `-O0` the bare spellings are calls, and the `__builtin_` ones are
-/// computed in place where the target can, as in gcc.
-#[test]
-fn libm_rounding_at_o0_follows_gcc() {
-    for (target, asm) in asm_both("round_o0", &round_source(""), &["-O0"]) {
-        for name in ROUND_NAMES {
-            assert!(
-                calls_any(&asm, &[name]),
-                "{target}: {name} not called:\n{asm}"
-            );
-        }
-    }
-    let [(_, host), (_, a64)] = asm_both("round_o0_b", &round_source("__builtin_"), &["-O0"]);
-    assert!(!calls_any(&a64, &ROUND_NAMES), "a call remains:\n{a64}");
-    if cfg!(target_arch = "x86_64") {
-        assert!(
-            !calls_any(&host, &["floor", "ceil", "trunc", "rint"]),
-            "{host}"
-        );
-    }
-}
-
-/// `-fno-builtin-floor` keeps the call to `floor`, and only that one.
-#[test]
-fn libm_rounding_fno_builtin_keeps_the_call() {
-    let opts = ["-O2", "-fno-builtin-floor"];
-    let src = "double floor(double);\ndouble d(double x) { return floor(x); }\n";
-    for (target, asm) in asm_both("floor_nb", src, &opts) {
-        assert!(calls_any(&asm, &["floor"]), "{target}:\n{asm}");
-    }
-    let src = "double ceil(double);\ndouble d(double x) { return ceil(x); }\n";
-    for (target, asm) in asm_both("ceil_nb", src, &opts) {
-        assert!(!calls_any(&asm, &["ceil"]), "{target}:\n{asm}");
-    }
-}
-
-/// Constants fold, in code and in static initializers, except a `rint` or
-/// `nearbyint` of a value that is not already an integer: its answer is the
-/// current rounding direction's, and gcc leaves it too.
-#[test]
-fn libm_rounding_of_constants() {
-    let src = "double floor(double); double ceil(double); double round(double);\n\
-               double f(void) { return floor(-0.5) + ceil(2.5) + round(0.5)\n\
-               + __builtin_trunc(-1.5) + __builtin_rint(3.0) + __builtin_nearbyintf(-4.0f); }\n";
-    for (target, asm) in asm_both("round_fold", src, &["-O2"]) {
-        assert!(!calls_any(&asm, &ROUND_NAMES), "{target}:\n{asm}");
-        assert!(
-            !asm.contains("frint") && !asm.contains("cvtt"),
-            "{target}:\n{asm}"
-        );
-    }
-    let src = "double rint(double);\ndouble f(void) { return rint(2.5); }\n";
-    let [(_, _), (_, a64)] = asm_both("rint_nofold", src, &["-O2"]);
-    assert!(has_insn(&a64, "frintx"), "rint(2.5) folded:\n{a64}");
-
-    let code = r#"
-double floor(double); double ceil(double); double trunc(double);
-double round(double); double rint(double); float roundf(float);
-static double a = floor(-2.5);
-static double b = ceil(-0.5);
-static double c = trunc(2.75);
-static double d = round(-2.5);
-static float e = roundf(0.5f);
-static double f = rint(-7.0);
-int main(void) {
-    if (a != -3.0 || b != 0.0 || !__builtin_signbit(b)) return 1;
-    if (c != 2.0 || d != -3.0 || e != 1.0f || f != -7.0) return 2;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("round_static", code, &[]), 0);
-    compile_expect_error(
-        "rint_static_inexact",
-        "double rint(double);\nstatic double z = rint(2.5);\ndouble *p = &z;\n",
-        "cannot initialize an object with static storage duration",
-    );
 }
 
 /// A translation unit's own definition of `sqrt` or a rounding is the
@@ -886,50 +856,6 @@ int main(void) {
 }
 "#;
 
-/// A call whose answer is a constant is that constant at every level, as
-/// under gcc: at `-O0`, where a bare libm spelling is otherwise a call, it
-/// still initializes a static object, and a rounding of a constant calls
-/// nothing. (A root keeps its call for `errno` until the optimizer folds it.)
-/// One whose answer is not a constant -- a root's domain error, a `rint` of
-/// a value that is not an integer -- stays a call, and cannot.
-const CONSTANT_LIBM_CALLS_PROGRAM: &str = r#"
-double floor(double), sqrt(double), fmin(double, double), fma(double, double, double);
-float floorf(float);
-static double a = floor(2.5);
-static double b = sqrt(4.0);
-static double c = fmin(1.0, 2.0);
-static double d = fma(1.0, 2.0, 3.0);
-static float e = floorf(2.5f);
-static double f = floor(2.5f);
-int main(void) {
-    if (a != 2.0 || b != 2.0 || c != 1.0 || d != 5.0 || e != 2.0f || f != 2.0) return 1;
-    if (floor(-2.5) != -3.0 || sqrt(9.0) != 3.0) return 2;
-    return 0;
-}
-"#;
-
-#[test]
-fn libm_constant_call_is_a_constant_at_every_level() {
-    run_everywhere("libm_const_calls", CONSTANT_LIBM_CALLS_PROGRAM, &[], true);
-    let src = "double floor(double);\ndouble g(void) { return floor(2.5); }\n";
-    for target in [None, Some("aarch64-unknown-linux-gnu")] {
-        let mut args = vec!["-O0"];
-        if let Some(t) = target {
-            args.extend(["--target", t]);
-        }
-        let asm = asm_for_at("libm_const_o0", src, &args);
-        assert!(
-            !calls_any(&asm, &["floor"]),
-            "{target:?}: a call remains:\n{asm}"
-        );
-    }
-    compile_expect_error(
-        "sqrt_static_domain_error",
-        "double sqrt(double);\nstatic double z = sqrt(-1.0);\ndouble *p = &z;\n",
-        "cannot initialize an object with static storage duration",
-    );
-}
-
 #[test]
 fn libm_weak_definition_does_not_displace_a_float_argument() {
     run_everywhere(
@@ -943,131 +869,6 @@ fn libm_weak_definition_does_not_displace_a_float_argument() {
 // ============================================================================
 // fmin, fmax, fma and their f forms
 // ============================================================================
-
-/// Run-time values bit for bit against glibc's, which agree on x86-64 and
-/// aarch64 except where C leaves the answer open: the signed zeros of
-/// `fmin` and `fmax` (glibc's x86-64 functions answer the first operand;
-/// aarch64's `fminnm` and `fmaxnm`, and gcc's fold, the -0 and +0), checked
-/// on aarch64 only, and which NaN two NaNs give, checked for being one. The
-/// `fma` cases are the ones a separate multiply and add get wrong: the
-/// product's low half cancelling against the addend, a tie decided by the
-/// bits below it, an overflow, and a subnormal result.
-const MIN_MAX_FMA_PROGRAM: &str = r#"
-typedef unsigned long long u64; typedef unsigned int u32;
-double fmin(double, double); double fmax(double, double); double fma(double, double, double);
-float fminf(float, float); float fmaxf(float, float); float fmaf(float, float, float);
-static u64 dbits(double d) { u64 u; __builtin_memcpy(&u, &d, 8); return u; }
-static double dfrom(u64 u) { double d; __builtin_memcpy(&d, &u, 8); return d; }
-static u32 fbits(float f) { u32 u; __builtin_memcpy(&u, &f, 4); return u; }
-static float ffrom(u32 u) { float f; __builtin_memcpy(&f, &u, 4); return f; }
-#define N(a) (int)(sizeof(a) / sizeof((a)[0]))
-static const u64 dfma[][4] = {
-    {0x3ff0000000000001, 0x3fefffffffffffff, 0xbff0000000000000, 0x3c9ffffffffffffe},
-    {0x3fb999999999999a, 0x4024000000000000, 0xbff0000000000000, 0x3c90000000000000},
-    {0x4000000000000000, 0x4008000000000000, 0x4010000000000000, 0x4024000000000000},
-    {0x8000000000000000, 0x3ff0000000000000, 0x0000000000000000, 0x0000000000000000},
-    {0x8000000000000000, 0x3ff0000000000000, 0x8000000000000000, 0x8000000000000000},
-    {0x7fe0000000000000, 0x4000000000000000, 0xffe0000000000000, 0x7fe0000000000000},
-    {0x0010000000000000, 0x3fe0000000000000, 0x0000000000000001, 0x0008000000000001},
-    {0x3ff5555555555555, 0x4008000000000000, 0xc010000000000000, 0xbcb0000000000000},
-    {0x4340000000000001, 0x3ff0000000000001, 0xc340000000000002, 0x3cc0000000000000},
-    {0x3ff0000000000000, 0x3ff0000000000000, 0x3ca0000000000000, 0x3ff0000000000000},
-    {0x3ff0000000000000, 0x3ff0000000000001, 0x3ca0000000000000, 0x3ff0000000000002},
-    {0x7fefffffffffffff, 0x4000000000000000, 0x0000000000000000, 0x7ff0000000000000},
-};
-static const u32 ffma[][4] = {
-    {0x3f800001, 0x3f7fffff, 0xbf800000, 0x337ffffe},
-    {0x3dcccccd, 0x41200000, 0xbf800000, 0x32800000},
-    {0x40000000, 0x40400000, 0x40800000, 0x41200000},
-    {0x80000000, 0x3f800000, 0x00000000, 0x00000000},
-    {0x7f000000, 0x40000000, 0xff000000, 0x7f000000},
-    {0x00800000, 0x3f000000, 0x00000001, 0x00400001},
-    {0x3faaaaab, 0x40400000, 0xc0800000, 0x34000000},
-    {0x7f7fffff, 0x40000000, 0x00000000, 0x7f800000},
-};
-/* x, y, fmin, fmax: ordered pairs both ways, -inf, a quiet NaN on each
-   side, two negatives, inf against the smallest subnormal, a tie. */
-static const u64 dmm[][4] = {
-    {0x3ff0000000000000, 0x4000000000000000, 0x3ff0000000000000, 0x4000000000000000},
-    {0x4000000000000000, 0x3ff0000000000000, 0x3ff0000000000000, 0x4000000000000000},
-    {0xfff0000000000000, 0x4008000000000000, 0xfff0000000000000, 0x4008000000000000},
-    {0x7ff8000000001234, 0x4008000000000000, 0x4008000000000000, 0x4008000000000000},
-    {0x4008000000000000, 0x7ff8000000001234, 0x4008000000000000, 0x4008000000000000},
-    {0xc000000000000000, 0xbff0000000000000, 0xc000000000000000, 0xbff0000000000000},
-    {0x7ff0000000000000, 0x0000000000000001, 0x0000000000000001, 0x7ff0000000000000},
-    {0x3ff0000000000000, 0x3ff0000000000000, 0x3ff0000000000000, 0x3ff0000000000000},
-};
-static const u32 fmm[][4] = {
-    {0x3f800000, 0x40000000, 0x3f800000, 0x40000000},
-    {0x40000000, 0x3f800000, 0x3f800000, 0x40000000},
-    {0xff800000, 0x40400000, 0xff800000, 0x40400000},
-    {0x7fc01234, 0x40400000, 0x40400000, 0x40400000},
-    {0x40400000, 0x7fc01234, 0x40400000, 0x40400000},
-    {0xc0000000, 0xbf800000, 0xc0000000, 0xbf800000},
-};
-static int check_fma(void) {
-    for (int i = 0; i < N(dfma); i++) {
-        volatile double x = dfrom(dfma[i][0]), y = dfrom(dfma[i][1]), z = dfrom(dfma[i][2]);
-        if (dbits(fma(x, y, z)) != dfma[i][3]) return 1;
-        if (dbits(__builtin_fma(x, y, z)) != dfma[i][3]) return 2;
-    }
-    for (int i = 0; i < N(ffma); i++) {
-        volatile float x = ffrom(ffma[i][0]), y = ffrom(ffma[i][1]), z = ffrom(ffma[i][2]);
-        if (fbits(fmaf(x, y, z)) != ffma[i][3]) return 3;
-        if (fbits(__builtin_fmaf(x, y, z)) != ffma[i][3]) return 4;
-    }
-    volatile double nan = __builtin_nan(""), one = 1.0;
-    if (!__builtin_isnan(fma(nan, one, one)) || !__builtin_isnan(fma(one, one, nan))) return 5;
-    return 0;
-}
-static int check_min_max(void) {
-    for (int i = 0; i < N(dmm); i++) {
-        volatile double x = dfrom(dmm[i][0]), y = dfrom(dmm[i][1]);
-        if (dbits(fmin(x, y)) != dmm[i][2] || dbits(__builtin_fmin(x, y)) != dmm[i][2]) return 11;
-        if (dbits(fmax(x, y)) != dmm[i][3] || dbits(__builtin_fmax(x, y)) != dmm[i][3]) return 12;
-    }
-    for (int i = 0; i < N(fmm); i++) {
-        volatile float x = ffrom(fmm[i][0]), y = ffrom(fmm[i][1]);
-        if (fbits(fminf(x, y)) != fmm[i][2] || fbits(__builtin_fminf(x, y)) != fmm[i][2]) return 13;
-        if (fbits(fmaxf(x, y)) != fmm[i][3] || fbits(__builtin_fmaxf(x, y)) != fmm[i][3]) return 14;
-    }
-    volatile double n1 = __builtin_nan("1"), n2 = __builtin_nan("2");
-    if (!__builtin_isnan(fmin(n1, n2)) || !__builtin_isnan(fmax(n1, n2))) return 15;
-/* fminnm's zeros. At -O0 the bare call is the C library's, which C leaves
-   free here: glibc's aarch64 function is fminnm, Apple's is not known to be. */
-#if defined(__aarch64__) && (defined(__OPTIMIZE__) || !defined(__APPLE__))
-    volatile double pz = 0.0, nz = -0.0;
-    if (dbits(fmin(pz, nz)) != 0x8000000000000000 || dbits(fmin(nz, pz)) != 0x8000000000000000) return 16;
-    if (dbits(fmax(pz, nz)) != 0 || dbits(fmax(nz, pz)) != 0) return 17;
-#endif
-    return 0;
-}
-/* Constants, which fold: the same answers, and gcc's for the zeros. */
-static int check_constants(void) {
-    if (dbits(fma(0x1.0000000000001p0, 0x1.fffffffffffffp-1, -1.0)) != 0x3c9ffffffffffffe) return 21;
-    if (dbits(fma(0.1, 10.0, -1.0)) != 0x3c90000000000000) return 22;
-    if (fbits(fmaf(0x1.000002p0f, 0x1.fffffep-1f, -1.0f)) != 0x337ffffe) return 23;
-#if defined(__OPTIMIZE__) || defined(__aarch64__)
-    /* Folded, or fminnm: at -O0 on x86-64 the call is glibc's, which
-       answers the first operand. */
-    if (dbits(fmin(0.0, -0.0)) != 0x8000000000000000 || dbits(fmin(-0.0, 0.0)) != 0x8000000000000000) return 24;
-    if (dbits(fmax(0.0, -0.0)) != 0 || dbits(fmax(-0.0, 0.0)) != 0) return 25;
-#endif
-    if (fmin(__builtin_nan(""), 3.0) != 3.0 || fmaxf(2.0f, __builtin_nanf("")) != 2.0f) return 26;
-    if (fmin(-__builtin_inf(), 1.0) != -__builtin_inf()) return 27;
-    return 0;
-}
-int main(void) {
-    int rc;
-    if ((rc = check_fma()) || (rc = check_min_max())) return rc;
-    return check_constants();
-}
-"#;
-
-#[test]
-fn libm_min_max_fma_values() {
-    run_everywhere("min_max_fma", MIN_MAX_FMA_PROGRAM, &[], true);
-}
 
 /// On aarch64 all six are instructions, so the program needs no libm once
 /// optimizing -- and at `-O0` only through the `__builtin_` spellings.
@@ -1097,139 +898,6 @@ int main(void) {
             assert_eq!(rc, 0, "aarch64 {opt}");
         }
     }
-}
-
-const MIN_MAX_FMA_NAMES: [&str; 6] = ["fmin", "fmax", "fma", "fminf", "fmaxf", "fmaf"];
-
-/// A function computing each of the six, spelled `prefix` + name.
-fn min_max_fma_source(prefix: &str) -> String {
-    let mut src = String::from(
-        "double fmin(double, double); double fmax(double, double);\n\
-         double fma(double, double, double); float fminf(float, float);\n\
-         float fmaxf(float, float); float fmaf(float, float, float);\n",
-    );
-    for name in MIN_MAX_FMA_NAMES {
-        let t = if name.ends_with('f') {
-            "float"
-        } else {
-            "double"
-        };
-        let (params, args) = if name == "fma" || name == "fmaf" {
-            (format!("{t} x, {t} y, {t} z"), "x, y, z")
-        } else {
-            (format!("{t} x, {t} y"), "x, y")
-        };
-        src.push_str(&format!(
-            "{t} t_{name}({params}) {{ return {prefix}{name}({args}); }}\n"
-        ));
-    }
-    src
-}
-
-/// `fminnm`, `fmaxnm` and `fmadd` on aarch64, as gcc emits them; calls on
-/// x86-64, whose baseline has no FMA and whose `minsd` is not `fmin`, as in
-/// gcc. At `-O0` the bare spellings are calls everywhere.
-#[test]
-fn libm_min_max_fma_instructions() {
-    for prefix in ["", "__builtin_"] {
-        let [(_, host), (_, a64)] = asm_both("mmf_o2", &min_max_fma_source(prefix), &["-O2"]);
-        for insn in ["fminnm", "fmaxnm", "fmadd"] {
-            assert!(has_insn(&a64, insn), "{prefix}: no {insn}:\n{a64}");
-        }
-        assert!(!calls_any(&a64, &MIN_MAX_FMA_NAMES), "{prefix}:\n{a64}");
-        if cfg!(target_arch = "x86_64") {
-            for name in MIN_MAX_FMA_NAMES {
-                assert!(
-                    calls_any(&host, &[name]),
-                    "{prefix}: {name} not called:\n{host}"
-                );
-            }
-        }
-    }
-    for (target, asm) in asm_both("mmf_o0", &min_max_fma_source(""), &["-O0"]) {
-        for name in MIN_MAX_FMA_NAMES {
-            assert!(
-                calls_any(&asm, &[name]),
-                "{target}: {name} not called:\n{asm}"
-            );
-        }
-    }
-    let [_, (_, a64)] = asm_both("mmf_o0_b", &min_max_fma_source("__builtin_"), &["-O0"]);
-    assert!(!calls_any(&a64, &MIN_MAX_FMA_NAMES), "{a64}");
-}
-
-/// `-fno-builtin-fma` keeps the call to `fma`, and only that one.
-#[test]
-fn libm_fma_fno_builtin_keeps_the_call() {
-    let src = "double fma(double, double, double); double fmin(double, double);\n\
-               double f(double x, double y) { return fma(x, y, x) + fmin(x, y); }\n";
-    let asm = asm_for_at(
-        "fma_nb",
-        src,
-        &[
-            "-O2",
-            "-fno-builtin-fma",
-            "--target",
-            "aarch64-unknown-linux-gnu",
-        ],
-    );
-    assert!(
-        calls_any(&asm, &["fma"]) && !has_insn(&asm, "fmadd"),
-        "{asm}"
-    );
-    assert!(
-        has_insn(&asm, "fminnm") && !calls_any(&asm, &["fmin"]),
-        "{asm}"
-    );
-}
-
-/// Constants fold on both targets -- on x86-64 too, where the function is
-/// otherwise a call -- exactly: `fma` rounds once, and the zeros of `fmin`
-/// and `fmax` fold to gcc's -0 and +0. In a static initializer gcc refuses a
-/// NaN argument, and so does this.
-#[test]
-fn libm_min_max_fma_of_constants() {
-    let src = "double fmin(double, double); double fmax(double, double);\n\
-               double fma(double, double, double);\n\
-               double f(void) { return fmin(1.0, 2.0) + fmax(-1.0, __builtin_nan(\"\"))\n\
-               + fma(0x1.0000000000001p0, 0x1.fffffffffffffp-1, -1.0)\n\
-               + __builtin_fmaf(2.0f, 3.0f, 4.0f); }\n";
-    for (target, asm) in asm_both("mmf_fold", src, &["-O2"]) {
-        assert!(!calls_any(&asm, &MIN_MAX_FMA_NAMES), "{target}:\n{asm}");
-        assert!(
-            !asm.contains("fminnm") && !asm.contains("fmadd"),
-            "{target}:\n{asm}"
-        );
-    }
-
-    let code = r#"
-typedef unsigned long long u64;
-double fmin(double, double); double fmax(double, double);
-double fma(double, double, double); float fmaf(float, float, float);
-static double a = fmin(0.0, -0.0);
-static double b = fmax(-0.0, 0.0);
-static double c = fma(0x1.0000000000001p0, 0x1.fffffffffffffp-1, -1.0);
-static float d = fmaf(2.0f, 3.0f, 4.0f);
-static double e = fmin(-2.0, 1.0);
-int main(void) {
-    u64 u;
-    __builtin_memcpy(&u, &a, 8);
-    if (u != 0x8000000000000000ULL) return 1;
-    __builtin_memcpy(&u, &b, 8);
-    if (u != 0) return 2;
-    __builtin_memcpy(&u, &c, 8);
-    if (u != 0x3c9ffffffffffffeULL) return 3;
-    if (d != 10.0f || e != -2.0) return 4;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("mmf_static", code, &[]), 0);
-    compile_expect_error(
-        "fmin_static_nan",
-        "double fmin(double, double);\nstatic double z = fmin(__builtin_nan(\"\"), 3.0);\n\
-         double *p = &z;\n",
-        "cannot initialize an object with static storage duration",
-    );
 }
 
 /// A libm call of constants is that constant at every level, so the levels

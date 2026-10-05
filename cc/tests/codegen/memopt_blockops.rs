@@ -17,7 +17,6 @@
 // answer changes if the analyses believe one thing too many.
 //
 
-use crate::codegen::asm_probe::{asm_for_with, assert_body_lacks, AARCH64_LINUX, X86_64_LINUX};
 use crate::common::compile_and_run;
 
 fn at_o2(name: &str, code: &str) -> i32 {
@@ -26,78 +25,6 @@ fn at_o2(name: &str, code: &str) -> i32 {
 
 fn at_o2_no_inline(name: &str, code: &str) -> i32 {
     compile_and_run(name, code, &["-O2".to_string(), "-fno-inline".to_string()])
-}
-
-/// Assert that `main` of `src`, compiled at -O2 without inlining for both
-/// targets, no longer calls `link_error`.
-fn assert_link_error_folded(name: &str, src: &str, why: &str) {
-    for triple in [X86_64_LINUX, AARCH64_LINUX] {
-        let asm = asm_for_with(name, triple, src, &["-O2", "-fno-inline"]);
-        assert_body_lacks(&asm, "main", "link_error", why);
-    }
-}
-
-/// A `static` function whose only write is a `memset` of its own buffer
-/// writes nothing its caller can observe, so a global the caller stored
-/// survives the call to it -- exactly as it would if the buffer were filled
-/// by stores.
-#[test]
-fn memopt_blockops_a_memset_of_a_private_buffer_is_no_write() {
-    let src = r#"
-extern void *memset(void *, int, unsigned long);
-extern void *memcpy(void *, const void *, unsigned long);
-extern void *memmove(void *, const void *, unsigned long);
-extern void abort(void);
-extern void link_error(void);
-int g;
-
-static int fill(int n) {
-    char buf[256];
-    memset(buf, n, sizeof buf);
-    return buf[n & 255];
-}
-
-int main(void) {
-    g = 5;
-    int r = fill(3);
-    if (g != 5) link_error();
-    return r - 3;
-}
-"#;
-    assert_link_error_folded(
-        "blockops_private_memset",
-        src,
-        "fill writes only its own buffer, so g is still 5",
-    );
-}
-
-/// A local whose address went only to a `memcpy` has not escaped, so a call
-/// that was never given it cannot change it.
-#[test]
-fn memopt_blockops_a_memcpy_source_has_not_escaped() {
-    let src = r#"
-extern void *memset(void *, int, unsigned long);
-extern void *memcpy(void *, const void *, unsigned long);
-extern void *memmove(void *, const void *, unsigned long);
-extern void abort(void);
-extern void link_error(void);
-extern void opaque(char *);
-
-int main(void) {
-    char buf[200];
-    char out[200];
-    buf[0] = 7;
-    memcpy(out, buf, sizeof out);
-    opaque(out);
-    if (buf[0] != 7) link_error();
-    return 0;
-}
-"#;
-    assert_link_error_folded(
-        "blockops_memcpy_source",
-        src,
-        "opaque was given out, never buf",
-    );
 }
 
 /// The two folds above, run: the programs they compile must still be right.

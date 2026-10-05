@@ -20,83 +20,35 @@
 // behavioral tests alongside them cover the cases where promotion would
 // change the answer, which is to say the cases where it would be a bug.
 
-use crate::codegen::asm_probe::{
-    asm_for_with, body_of, count_in_body, frame_size, AARCH64_LINUX, X86_64_LINUX,
-};
+use crate::codegen::asm_probe::{asm_for_with, frame_size, X86_64_LINUX};
 use crate::common::{compile_and_run, compile_and_run_aarch64};
 
-/// Ten address-free int locals in straight-line code.
+/// The cases where promoting a local out of memory would change the
+/// answer, one program run at the compile matrix levels.
 ///
-/// Each unpromoted local costs 8 bytes of frame (slots are `size.max(8)` and
-/// never reused), so before promotion this reserved 112 bytes.
+/// Consolidates these tests, one section each (each original `main` is
+/// a `noinline` section function; the program exits with the section's
+/// base plus the original code):
+/// - `codegen_complex_local_is_not_forwarded_by_half`: 1..=3
+/// - `codegen_folded_constant_is_not_reused_beyond_its_width`: 4..=4
+/// - `codegen_loop_body_local_reads_previous_iteration`: 5..=6
+/// - `codegen_shadowed_global_is_not_confused_with_parameter`: 7..=7
+/// - `codegen_hidden_pointer_locals_survive_promotion`: 8..=9
+/// - `codegen_wide_single_block_locals_promote_correctly`: 10..=11
+/// - `codegen_uninitialized_local_still_compiles`: never fails by exit code
 #[test]
-fn codegen_straight_line_locals_leave_memory() {
-    let src = r#"
-int straight(int x) {
-    int a = x + 1;  int b = a * 2;  int c = b - 3;
-    int d = c + 4;  int e = d * 5;  int f = e - 6;
-    int g = f + 7;  int h = g * 8;  int i = h - 9;
-    int j = i + 10;
-    return j;
-}
-"#;
-    let asm = asm_for_with("straight_line_locals", X86_64_LINUX, src, &["-O2"]);
-    let frame = frame_size(&asm, "straight").unwrap_or(0);
-    assert!(
-        frame <= 16,
-        "ten straight-line int locals must not each keep a stack slot, \
-         got a {frame}-byte frame:\n{asm}"
-    );
-}
-
-/// A function with no locals at all still framed its incoming parameter,
-/// because the parameter's own spill slot was itself a single-block local.
-#[test]
-fn codegen_parameter_only_function_needs_no_frame() {
-    let src = "int nolocal(int x) { return x + 1; }\n";
-    let asm = asm_for_with("parameter_only", X86_64_LINUX, src, &["-O2"]);
-    let frame = frame_size(&asm, "nolocal").unwrap_or(0);
-    assert!(
-        frame == 0,
-        "a function whose only value is its parameter needs no frame, \
-         got {frame} bytes:\n{asm}"
-    );
-}
-
-/// Constant folding has to survive the hop from one statement to the next.
-///
-/// Promotion alone is not enough: it turns the `Load` into a `Copy`, and
-/// `instcombine` reads constants off the pseudo's kind, which a `Copy`
-/// target does not have. Both halves are needed for this to reach `21`.
-#[test]
-fn codegen_constants_fold_across_statements() {
-    let src = "int trivial(void) { int a = 2 + 3; int b = a * 4; return b + 1; }\n";
-    let asm = asm_for_with("fold_across_statements", X86_64_LINUX, src, &["-O2"]);
-    assert_eq!(
-        count_in_body(&asm, "trivial", "imul"),
-        0,
-        "a chain of integer constants must fold, not multiply at run time:\n{asm}"
-    );
-    assert!(
-        asm.contains("$21"),
-        "2+3 then *4 then +1 is 21, and it should appear as an immediate:\n{asm}"
-    );
-}
-
-/// `_Complex` is a scalar by `is_scalar`, but its halves are stored
-/// separately at offsets 0 and 8 and read back by a single 128-bit load at
-/// offset 0. Promoting it on the strength of "scalar, address not taken"
-/// forwards the *last* store -- the imaginary half -- into that load, and
-/// `if (z)` becomes permanently false.
-///
-/// This is the shape that makes the width guard in `analyze_variable` load
-/// bearing rather than defensive.
-#[test]
-fn codegen_complex_local_is_not_forwarded_by_half() {
-    // `if (z)` on a complex value currently tests only the real part, so the
-    // nonzero-imaginary case is not asserted here -- that is a separate,
-    // pre-existing defect and folding it into this test would hide it.
-    let src = r#"
+fn codegen_promotion_mega() {
+    let code = r#"
+/* ---- codegen_complex_local_is_not_forwarded_by_half: exits 1..3
+ * `_Complex` is a scalar by `is_scalar`, but its halves are stored
+ * separately at offsets 0 and 8 and read back by a single 128-bit load at
+ * offset 0. Promoting it on the strength of "scalar, address not taken"
+ * forwards the *last* store -- the imaginary half -- into that load, and
+ * `if (z)` becomes permanently false.
+ *
+ * This is the shape that makes the width guard in `analyze_variable` load
+ * bearing rather than defensive.
+ */
 int nonzero_real(void) { double _Complex z = 3.0; if (z) return 1; return 0; }
 int zero_both(void)    { double _Complex z = 0.0; if (z) return 1; return 0; }
 int sum_halves(void) {
@@ -104,37 +56,31 @@ int sum_halves(void) {
     /* Reads both halves back out of the same slot the two stores wrote. */
     return (int)(__real__ z) * 10 + (int)(__imag__ z);
 }
-int main(void) {
+static __attribute__((noinline)) int t_complex_local_is_not_forwarded_by_half(void)
+{
     if (nonzero_real() != 1) return 1;
     if (zero_both()   != 0) return 2;
     if (sum_halves()  != 30) return 3;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("complex_local_halves", src, &[]), 0);
-}
 
-/// Folding through a `Copy` chain must not widen the existing looseness
-/// about constants not being truncated to their operand width.
-///
-/// `0x40000000 * 4` overflows `int`. The product is held as a full-width
-/// `i128`, so a chained fold of `y / 2` would answer `INT_MIN` where the
-/// truncated operand gives `0`. gcc gives 0.
-#[test]
-fn codegen_folded_constant_is_not_reused_beyond_its_width() {
-    let src = r#"
+/* ---- codegen_folded_constant_is_not_reused_beyond_its_width: exits 4..4
+ * Folding through a `Copy` chain must not widen the existing looseness
+ * about constants not being truncated to their operand width.
+ *
+ * `0x40000000 * 4` overflows `int`. The product is held as a full-width
+ * `i128`, so a chained fold of `y / 2` would answer `INT_MIN` where the
+ * truncated operand gives `0`. gcc gives 0.
+ */
 int width(void) { int y = 0x40000000 * 4; int z = y / 2; return z; }
-int main(void) { return width() == 0 ? 0 : 1; }
-"#;
-    assert_eq!(compile_and_run("fold_width_guard", src, &[]), 0);
-}
+static __attribute__((noinline)) int t_folded_constant_is_not_reused_beyond_its_width(void)
+{ return width() == 0 ? 0 : 1; }
 
-/// A local declared inside a loop body has all its uses in one block, but
-/// reading it before writing it reads the previous iteration -- so it needs
-/// a phi at the loop header, not a linear forward.
-#[test]
-fn codegen_loop_body_local_reads_previous_iteration() {
-    let src = r#"
+/* ---- codegen_loop_body_local_reads_previous_iteration: exits 5..6
+ * A local declared inside a loop body has all its uses in one block, but
+ * reading it before writing it reads the previous iteration -- so it needs
+ * a phi at the loop header, not a linear forward.
+ */
 int carry(int n) {
     int acc = 0;
     int seed = 7;
@@ -150,29 +96,26 @@ int straight_body(int n) {
     for (int i = 0; i < n; i++) { int t = i * 2; acc += t; }
     return acc;
 }
-int main(void) {
+static __attribute__((noinline)) int t_loop_body_local_reads_previous_iteration(void)
+{
     /* t = i + 7, read on the next iteration: 7 + 8 + 9 = 24 for n = 4 */
     if (carry(4) != 24) return 1;
     if (straight_body(5) != 20) return 2;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("loop_body_local", src, &[]), 0);
-}
 
-/// A parameter lives in `func.locals` under its bare name; a global reached
-/// through a block-scoped `extern` gets a fresh pseudo carrying the *same*
-/// name. Renaming keyed on the name alone would kill the global's store and
-/// hand its value to the parameter, so the parameter would read 2.
-///
-/// Only the parameter's value is asserted. The global's own value is wrong
-/// today for an unrelated reason -- `arch/*/regalloc.rs` resolves a `Sym` by
-/// looking its *name* up in `func.locals`, so the global's pseudo finds the
-/// parameter's slot -- and asserting it here would turn a pre-existing defect
-/// into a failure of this change.
-#[test]
-fn codegen_shadowed_global_is_not_confused_with_parameter() {
-    let src = r#"
+/* ---- codegen_shadowed_global_is_not_confused_with_parameter: exits 7..7
+ * A parameter lives in `func.locals` under its bare name; a global reached
+ * through a block-scoped `extern` gets a fresh pseudo carrying the *same*
+ * name. Renaming keyed on the name alone would kill the global's store and
+ * hand its value to the parameter, so the parameter would read 2.
+ *
+ * Only the parameter's value is asserted. The global's own value is wrong
+ * today for an unrelated reason -- `arch/* /regalloc.rs` resolves a `Sym` by
+ * looking its *name* up in `func.locals`, so the global's pseudo finds the
+ * parameter's slot -- and asserting it here would turn a pre-existing defect
+ * into a failure of this change.
+ */
 int v = 5;
 int sink;
 int f(int v) {
@@ -181,18 +124,15 @@ int f(int v) {
     sink = v;                  /* must be the parameter: 1 */
     return sink;
 }
-int main(void) { return f(99) == 1 ? 0 : 1; }
-"#;
-    assert_eq!(compile_and_run("shadowed_global", src, &[]), 0);
-}
+static __attribute__((noinline)) int t_shadowed_global_is_not_confused_with_parameter(void)
+{ return f(99) == 1 ? 0 : 1; }
 
-/// Hidden compiler-generated locals that are pointer-typed, and therefore
-/// scalar, and therefore newly promotable: the VLA base pointer and a
-/// `va_list` parameter. Neither goes through `SymAddr`, so neither was
-/// covered before.
-#[test]
-fn codegen_hidden_pointer_locals_survive_promotion() {
-    let src = r#"
+/* ---- codegen_hidden_pointer_locals_survive_promotion: exits 8..9
+ * Hidden compiler-generated locals that are pointer-typed, and therefore
+ * scalar, and therefore newly promotable: the VLA base pointer and a
+ * `va_list` parameter. Neither goes through `SymAddr`, so neither was
+ * covered before.
+ */
 #include <stdarg.h>
 int vla_sum(int n) {
     int a[n];
@@ -212,45 +152,53 @@ static int trampoline(int count, ...) {
     va_end(ap);
     return s;
 }
-int main(void) {
+static __attribute__((noinline)) int t_hidden_pointer_locals_survive_promotion(void)
+{
     if (vla_sum(5) != 30) return 1;          /* 0+3+6+9+12 */
     if (trampoline(4, 1, 2, 3, 4) != 10) return 2;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("hidden_pointer_locals", src, &[]), 0);
-}
 
-/// Values wider than a general register, single-block. `long double` is
-/// stored and loaded as one 128-bit unit, so it is promotable; `__int128`
-/// likewise. Both cross the 8-byte boundary where aggregate handling
-/// historically confuses a value with its address.
-#[test]
-fn codegen_wide_single_block_locals_promote_correctly() {
-    let src = r#"
+/* ---- codegen_wide_single_block_locals_promote_correctly: exits 10..11
+ * Values wider than a general register, single-block. `long double` is
+ * stored and loaded as one 128-bit unit, so it is promotable; `__int128`
+ * likewise. Both cross the 8-byte boundary where aggregate handling
+ * historically confuses a value with its address.
+ */
 long double ld(long double x) { long double t = x + 1.0L; return t * 2.0L; }
 __int128 i128(__int128 x) { __int128 t = x + 1; return t * 2; }
-int main(void) {
+static __attribute__((noinline)) int t_wide_single_block_locals_promote_correctly(void)
+{
     if (ld(10.0L) != 22.0L) return 1;
     __int128 r = i128((__int128)10);
     if (r != (__int128)22) return 2;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("wide_single_block", src, &[]), 0);
-}
 
-/// Reading an uninitialized local is undefined, but it must not crash the
-/// compiler: the load has no reaching definition and becomes a `Copy` of an
-/// undef pseudo, which has to survive to codegen.
-#[test]
-fn codegen_uninitialized_local_still_compiles() {
-    let src = r#"
+/* ---- codegen_uninitialized_local_still_compiles: never fails by exit code
+ * Reading an uninitialized local is undefined, but it must not crash the
+ * compiler: the load has no reaching definition and becomes a `Copy` of an
+ * undef pseudo, which has to survive to codegen.
+ */
 int uninit(int c) { int t; int a = t; if (c) t = 1; else t = 2; return a + t; }
 int single_block_uninit(void) { int t; return t; }
-int main(void) { return 0; }
+static __attribute__((noinline)) int t_uninitialized_local_still_compiles(void)
+{ return 0; }
+
+int main(void)
+{
+    int r;
+    if ((r = t_complex_local_is_not_forwarded_by_half()) != 0) return r;
+    if ((r = t_folded_constant_is_not_reused_beyond_its_width()) != 0) return 3 + r;
+    if ((r = t_loop_body_local_reads_previous_iteration()) != 0) return 4 + r;
+    if ((r = t_shadowed_global_is_not_confused_with_parameter()) != 0) return 6 + r;
+    if ((r = t_hidden_pointer_locals_survive_promotion()) != 0) return 7 + r;
+    if ((r = t_wide_single_block_locals_promote_correctly()) != 0) return 9 + r;
+    if ((r = t_uninitialized_local_still_compiles()) != 0) return 11 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("uninitialized_local", src, &[]), 0);
+    assert_eq!(compile_and_run("promotion_mega", code, &[]), 0);
 }
 
 /// A frame holds only what the function uses.
@@ -272,29 +220,8 @@ int sum(const int *p, int n) { int s = 0; for (int i = 0; i < n; i++) s += p[i];
 long double widen(int x) { return x; }
 float root(float x) { __asm__(\"fsqrt\" : \"+t\"(x)); return x; }
 ";
-    let asm = asm_for_with("frame_uses", X86_64_LINUX, src, &["-O2"]);
-    for f in ["plus1", "folded", "sum"] {
-        let body = body_of(&asm, f);
-        assert!(
-            frame_size(&asm, f).is_none() && !body.contains("subq"),
-            "{f} needs no frame:\n{body}"
-        );
-    }
-    for f in ["widen", "root"] {
-        let frame = frame_size(&asm, f).unwrap_or(0);
-        assert!(
-            frame >= 16,
-            "{f} stages a value through the x87 scratch:\n{asm}"
-        );
-    }
-    let a64 = asm_for_with(
-        "frame_uses_a64",
-        AARCH64_LINUX,
-        "int folded(void) { int a[4] = {1, 2, 3, 4}; return a[2]; }\n",
-        &["-O2"],
-    );
-    assert!(frame_size(&a64, "folded").is_none(), "aarch64:\n{a64}");
-
+    // The frame sizes of these functions are asserted by the test of the
+    // same name in `cc/test_asm/codegen_promotion.rs`; this runs them.
     let run = format!(
         "{src}int main(void) {{ int a[3] = {{1, 2, 3}}; \
          return plus1(1) == 2 && folded() == 3 && sum(a, 3) == 6 \

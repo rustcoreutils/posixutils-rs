@@ -7,18 +7,25 @@
 // SPDX-License-Identifier: MIT
 //
 // Aggregates in the calling convention: structs, unions and HFAs
-// passed and returned, in registers and in memory.
+// passed and returned, in registers and in memory. The assembly checks
+// compile in process, in `cc/test_asm/codegen_aggregate_abi.rs`.
 //
 
-use crate::codegen::asm_probe::{asm_for_with, body_of, AARCH64_LINUX, X86_64_LINUX};
 use crate::common::{
     compile_and_run, compile_and_run_aarch64, compile_and_run_everywhere, compile_and_run_optimized,
 };
 
-/// Test: function returning pointer/long with no explicit return gets 64-bit zero
-#[test]
-fn codegen_default_return_64bit() {
-    let code = r#"
+/// One section per consolidated test, each under that test's own
+/// documentation. Exit codes:
+/// `codegen_default_return_64bit` 11..=14.
+/// `codegen_call_return_pointer` 21..=23.
+/// `codegen_ret_64bit` 31..=33.
+/// `codegen_two_reg_int_struct_return` 41..=46.
+/// `codegen_small_struct_return` 51..=57.
+const SCALAR_AND_SMALL_AGGREGATE_RETURNS: &str = r#"
+/* ====================================================================== */
+/* codegen_default_return_64bit: exit codes 11..14 */
+// Test: function returning pointer/long with no explicit return gets 64-bit zero
 // Function returning pointer without explicit return
 void *get_null(int flag) {
     if (flag) {
@@ -35,7 +42,7 @@ long get_long_default(int flag) {
     // implicit return should be 64-bit zero
 }
 
-int main(void) {
+static int t_codegen_default_return_64bit(void) {
     // Section 1: pointer default return
     void *p = get_null(0);
     if (p != (void*)0) return 1;
@@ -52,14 +59,10 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("default_return_64bit", code, &[]), 0);
-}
 
-/// Test: function returning pointer via call — return value is full 64 bits
-#[test]
-fn codegen_call_return_pointer() {
-    let code = r#"
+/* ====================================================================== */
+/* codegen_call_return_pointer: exit codes 21..23 */
+// Test: function returning pointer via call — return value is full 64 bits
 void *identity(void *p) {
     return p;
 }
@@ -68,7 +71,7 @@ long return_long(long v) {
     return v;
 }
 
-int main(void) {
+static int t_codegen_call_return_pointer(void) {
     // Section 1: pointer return value preserved through call
     long stack_var = 12345;
     void *p = &stack_var;
@@ -83,14 +86,10 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("call_return_pointer", code, &[]), 0);
-}
 
-/// Test: emit_ret with 64-bit integer return value
-#[test]
-fn codegen_ret_64bit() {
-    let code = r#"
+/* ====================================================================== */
+/* codegen_ret_64bit: exit codes 31..33 */
+// Test: emit_ret with 64-bit integer return value
 long return_big(void) {
     return 0x123456789ABCDEF0L;
 }
@@ -103,7 +102,7 @@ unsigned long return_unsigned(void) {
     return 0xFFFFFFFFFFFFFFFFUL;
 }
 
-int main(void) {
+static int t_codegen_ret_64bit(void) {
     // Section 1: long return
     long v = return_big();
     if (v != 0x123456789ABCDEF0L) return 1;
@@ -119,15 +118,11 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("ret_64bit", code, &[]), 0);
-}
 
-/// Regression: two-register integer struct return clobbered rax when
-/// second source was allocated there (parallel-move problem).
-#[test]
-fn codegen_two_reg_int_struct_return() {
-    let code = r#"
+/* ====================================================================== */
+/* codegen_two_reg_int_struct_return: exit codes 41..46 */
+// Regression: two-register integer struct return clobbered rax when
+// second source was allocated there (parallel-move problem).
 #include <stdint.h>
 
 typedef struct { uint64_t low; uint64_t high; } u128_t;
@@ -147,7 +142,7 @@ static u128_t add_u128(u128_t a, u128_t b) {
     return r;
 }
 
-int main(void) {
+static int t_codegen_two_reg_int_struct_return(void) {
     u128_t a = make_u128(100, 0);
     if (a.low != 100 || a.high != 0) return 1;
 
@@ -176,20 +171,13 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("codegen_two_reg_int_struct_return", code, &[]),
-        0
-    );
-}
 
-/// Regression test: small struct (<=64 bits) returned by value from a function
-/// was stored as a raw register value. When assigned to a struct variable,
-/// emit_assign's block_copy dereferenced it as a pointer → SIGSEGV.
-/// Fixed by allocating local storage for small struct returns.
-#[test]
-fn codegen_small_struct_return() {
-    let code = r#"
+/* ====================================================================== */
+/* codegen_small_struct_return: exit codes 51..57 */
+// Regression test: small struct (<=64 bits) returned by value from a function
+// was stored as a raw register value. When assigned to a struct variable,
+// emit_assign's block_copy dereferenced it as a pointer → SIGSEGV.
+// Fixed by allocating local storage for small struct returns.
 typedef struct { int a; int b; } Pair;
 
 __attribute__((noinline))
@@ -205,7 +193,7 @@ int sum_pair(Pair p) {
     return p.a + p.b;
 }
 
-int main(void) {
+static int t_codegen_small_struct_return(void) {
     /* Basic: return small struct and access fields */
     Pair p = make_pair(10, 20);
     if (p.a != 10) return 1;
@@ -238,8 +226,33 @@ int main(void) {
 
     return 0;
 }
+
+int main(void)
+{
+    int r;
+    if ((r = t_codegen_default_return_64bit()) != 0) return 10 + r;
+    if ((r = t_codegen_call_return_pointer()) != 0) return 20 + r;
+    if ((r = t_codegen_ret_64bit()) != 0) return 30 + r;
+    if ((r = t_codegen_two_reg_int_struct_return()) != 0) return 40 + r;
+    if ((r = t_codegen_small_struct_return()) != 0) return 50 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("codegen_small_struct_return", code, &[]), 0);
+
+/// 64-bit scalar returns and register-sized aggregate returns, at the matrix
+/// levels. Consolidates `codegen_default_return_64bit`,
+/// `codegen_call_return_pointer`, `codegen_ret_64bit`,
+/// `codegen_two_reg_int_struct_return` and `codegen_small_struct_return`.
+#[test]
+fn codegen_scalar_and_small_aggregate_returns() {
+    assert_eq!(
+        compile_and_run(
+            "scalar_small_agg_returns",
+            SCALAR_AND_SMALL_AGGREGATE_RETURNS,
+            &[]
+        ),
+        0
+    );
 }
 
 // Regression: do not fold a conditional branch whose target block does
@@ -285,25 +298,29 @@ int main(void) {
     );
 }
 
-/// A register-returned aggregate must be stored through the frame's own base
-/// register, not through `%rbp`.
-///
-/// When a local's alignment exceeds the stack's, the prologue realigns `%rsp`
-/// and keeps the frame's base in a second register; `stack_mem` then addresses
-/// every local relative to that. Six sites in the call path spelled
-/// `-(slot + callee_saved_offset)(%rbp)` by hand instead, so under such a
-/// frame the return value was written to an address nothing reads back --
-/// `movq %rax, -112(%rbp)` followed by `movq 32(%rbx), %rax`. Four of the six
-/// were return paths, which is why `struct S { long long a, b; } r = make();`
-/// came back as zeros beside an `_Alignas(32)` local, in ordinary C with no
-/// varargs involved.
-///
-/// Whether it is *visible* depends on what happens to occupy the address that
-/// is written, so the levels are swept rather than trusted: the two-register
-/// integer shape came back wrong at `-O1` and right at `-O0` and `-O2`.
-#[test]
-fn codegen_aggregate_return_into_an_over_aligned_frame() {
-    let code = r#"
+/// One section per consolidated test, each under that test's own
+/// documentation. Exit codes:
+/// `codegen_aggregate_return_into_an_over_aligned_frame` 11..=19.
+/// `codegen_discarded_two_register_struct_return` 21..=30.
+const REGISTER_AGGREGATE_RETURNS: &str = r#"
+/* ====================================================================== */
+/* codegen_aggregate_return_into_an_over_aligned_frame: exit codes 11..19 */
+// A register-returned aggregate must be stored through the frame's own base
+// register, not through `%rbp`.
+//
+// When a local's alignment exceeds the stack's, the prologue realigns `%rsp`
+// and keeps the frame's base in a second register; `stack_mem` then addresses
+// every local relative to that. Six sites in the call path spelled
+// `-(slot + callee_saved_offset)(%rbp)` by hand instead, so under such a
+// frame the return value was written to an address nothing reads back --
+// `movq %rax, -112(%rbp)` followed by `movq 32(%rbx), %rax`. Four of the six
+// were return paths, which is why `struct S { long long a, b; } r = make();`
+// came back as zeros beside an `_Alignas(32)` local, in ordinary C with no
+// varargs involved.
+//
+// Whether it is *visible* depends on what happens to occupy the address that
+// is written, so the levels are swept rather than trusted: the two-register
+// integer shape came back wrong at `-O1` and right at `-O0` and `-O2`.
 struct TwoInt  { long long a, b; };            /* RAX + RDX   */
 struct TwoSse  { double a, b; };               /* XMM0 + XMM1 */
 struct Mixed   { double a; long long b; };     /* XMM0 + RAX  */
@@ -320,7 +337,7 @@ __attribute__((noinline)) struct OneSse m_os(void){ struct OneSse s={8.5f,9.5f};
 __attribute__((noinline)) double _Complex m_cd(void){ return __builtin_complex(10.5, 11.5); }
 __attribute__((noinline)) float  _Complex m_cf(void){ return __builtin_complex(12.5f, 13.5f); }
 
-int main(void)
+static int t_codegen_aggregate_return_into_an_over_aligned_frame(void)
 {
     _Alignas(32) char pad[64];          /* forces the over-aligned frame */
 
@@ -347,66 +364,122 @@ int main(void)
     if (pad[0] != 1 || pad[63] != 2)                  return 9;
     return 0;
 }
+
+/* ====================================================================== */
+/* codegen_discarded_two_register_struct_return: exit codes 21..30 */
+// A struct returned in registers and then **discarded**.
+//
+// `mem2reg` decides a local is dead by scanning `insn.src`. But a call
+// returning a two-register struct writes its result into a `__2reg_N` local
+// and names that local's `Sym` as the instruction's *target*, not as a
+// source. When the result is used, a following `symaddr` puts the Sym in a
+// `src` and it survives; when it is discarded — `one();` on a line by itself
+// — nothing ever reads it, so the pass concluded the local was dead and
+// dropped both the slot and the pseudo.
+//
+// The backend then had a target with no storage behind it. `handle_two_reg_return`
+// emits `mov %rax, (%reg)` for a `Loc::Reg` destination, so it stored through
+// whatever that register happened to hold.
+//
+// **This was wrong at -O0 too.** It only faulted once the inliner had run,
+// because `should_inline` admits a function this size only at -O2, but the
+// bad IR was there at every level and -O0 passed on luck about the register's
+// contents: a slightly different reduction segfaults at -O0 as well.
+//
+// The boundaries are the ABI's: 8 bytes returns in one register and is fine,
+// 9-16 returns in two and was not, and 17+ uses a hidden pointer argument —
+// which lands in `src` and so survived. Both register files are covered,
+// since the FP path stores XMM0/XMM1 the same way.
+struct I8  { int a, b; };
+struct I12 { int a, b, c; };
+struct I16 { int a, b, c, d; };
+struct I20 { int a, b, c, d, e; };
+struct F12 { float a, b, c; };
+struct D16 { double a, b; };
+
+static int calls;
+
+static struct I8  i8(void)  { struct I8  s = {1,2};       calls++; return s; }
+static struct I12 i12(void) { struct I12 s = {1,2,3};     calls++; return s; }
+static struct I16 i16(void) { struct I16 s = {1,2,3,4};   calls++; return s; }
+static struct I20 i20(void) { struct I20 s = {1,2,3,4,5}; calls++; return s; }
+static struct F12 f12(void) { struct F12 s = {1,2,3};     calls++; return s; }
+static struct D16 d16(void) { struct D16 s = {1,2};       calls++; return s; }
+
+static int t_codegen_discarded_two_register_struct_return(void) {
+    /* Discarded: the result is never read, which is the case that broke. */
+    i8(); i12(); i16(); i20(); f12(); d16();
+    if (calls != 6) return 1;
+
+    /* Used: this path always worked and must keep working, since the fix
+       changes which pseudos survive. */
+    { struct I12 v = i12(); if (v.a != 1 || v.b != 2 || v.c != 3) return 2; }
+    { struct I16 v = i16(); if (v.a != 1 || v.d != 4) return 3; }
+    { struct D16 v = d16(); if (v.a != 1.0 || v.b != 2.0) return 4; }
+    { struct F12 v = f12(); if (v.a != 1.0f || v.c != 3.0f) return 5; }
+    { struct I20 v = i20(); if (v.a != 1 || v.e != 5) return 6; }
+    { struct I8  v = i8();  if (v.a != 1 || v.b != 2) return 7; }
+    if (calls != 12) return 8;
+
+    /* Discarded again, in a loop, so the slot is reused rather than merely
+       allocated once. */
+    for (int k = 0; k < 3; k++) { i12(); d16(); }
+    if (calls != 18) return 9;
+
+    /* Discarded inside an expression whose value is also discarded. */
+    (void)i16();
+    if (calls != 19) return 10;
+    return 0;
+}
+
+int main(void)
+{
+    int r;
+    if ((r = t_codegen_aggregate_return_into_an_over_aligned_frame()) != 0) return 10 + r;
+    if ((r = t_codegen_discarded_two_register_struct_return()) != 0) return 20 + r;
+    return 0;
+}
 "#;
+
+/// Register-returned aggregates landing in an over-aligned frame, and
+/// discarded, swept over -O0, -O1, -O2 and -Os. Consolidates
+/// `codegen_aggregate_return_into_an_over_aligned_frame` (whose assembly
+/// half is in `cc/test_asm/codegen_aggregate_abi.rs`) and
+/// `codegen_discarded_two_register_struct_return`.
+#[test]
+fn codegen_register_aggregate_returns_at_every_level() {
     for opt in ["-O0", "-O1", "-O2", "-Os"] {
         assert_eq!(
             compile_and_run(
-                &format!("codegen_agg_ret_over_aligned{opt}"),
-                code,
+                &format!("codegen_reg_agg_returns{}", opt.replace('-', "_")),
+                REGISTER_AGGREGATE_RETURNS,
                 &[opt.to_string()]
             ),
             0,
             "at {opt}"
         );
     }
-
-    // The behavioural check above only fails when the address written happens
-    // to matter, so pin the property itself: in a function whose frame is
-    // realigned, no aggregate-return store may name `%rbp`.
-    let probe = r#"
-struct TwoInt { long long a, b; };
-struct TwoInt make(void);
-void use(char *);
-long realigned(void)
-{
-    _Alignas(32) char pad[64];   /* escapes, so it keeps its slot */
-    struct TwoInt r = make();
-    use(pad);
-    return r.a + r.b + pad[0];
-}
-"#;
-    let asm = asm_for_with("agg_ret_base_reg", X86_64_LINUX, probe, &["-O1"]);
-    let body = body_of(&asm, "realigned");
-    assert!(
-        body.contains("andq $-32, %rsp"),
-        "the frame is realigned:\n{body}"
-    );
-    for reg in ["%rax", "%rdx"] {
-        for line in body.lines() {
-            let line = line.trim();
-            if line.starts_with(&format!("movq {reg}, ")) && line.contains("(%rbp)") {
-                panic!(
-                    "the aggregate-return store must go through the realigned \
-                     frame base, not %rbp: `{line}`\n{body}"
-                );
-            }
-        }
-    }
 }
 
-/// AAPCS64 §5.4.2 gives a homogeneous floating-point aggregate one V register
-/// per element, for one to four elements. Both sides of the aarch64 call
-/// recognised only the two-element case: a three- or four-element HFA went out
-/// whole in a general register while the callee read it from V0-V3, and it
-/// consumed an integer slot, so the *next* integer argument was shifted along
-/// as well. An aggregate small enough to sit in one register was passed as a
-/// single value rather than split across the element registers.
-///
-/// Every shape below is checked against gcc's own layout, so the test is an
-/// ABI conformance check as much as a regression test.
-#[test]
-fn codegen_hfa_param_element_counts() {
-    let code = r#"
+/// One section per consolidated test, each under that test's own
+/// documentation. Exit codes:
+/// `codegen_hfa_param_element_counts` 21..=30.
+/// `codegen_hfa_return_element_counts` 41..=50.
+/// `codegen_composite_in_two_registers` 61..=68.
+/// `codegen_over_aligned_struct_passed_by_value` 81..=95.
+const AGGREGATE_ARGUMENTS_AND_RETURNS: &str = r#"
+/* ====================================================================== */
+/* codegen_hfa_param_element_counts: exit codes 21..30 */
+// AAPCS64 §5.4.2 gives a homogeneous floating-point aggregate one V register
+// per element, for one to four elements. Both sides of the aarch64 call
+// recognised only the two-element case: a three- or four-element HFA went out
+// whole in a general register while the callee read it from V0-V3, and it
+// consumed an integer slot, so the *next* integer argument was shifted along
+// as well. An aggregate small enough to sit in one register was passed as a
+// single value rather than split across the element registers.
+//
+// Every shape below is checked against gcc's own layout, so the test is an
+// ABI conformance check as much as a regression test.
 typedef struct { float a; }              F1;
 typedef struct { float a, b; }           F2;
 typedef struct { float a, b, c; }        F3;
@@ -438,7 +511,7 @@ double overflow(F4 p, F4 q, D2 r, int n, double s) {
          + r.a * 1e8 + r.b * 1e9 + n + s;
 }
 
-int main(void) {
+static int t_codegen_hfa_param_element_counts(void) {
     F1 f1 = {1};       if (u_f1(f1) != 1)    return 1;
     F2 f2 = {1, 2};    if (u_f2(f2) != 12)   return 2;
     F3 f3 = {1, 2, 3}; if (u_f3(f3) != 123)  return 3;
@@ -455,83 +528,67 @@ int main(void) {
     if (overflow(f4, q, r, 11, 0.5) != 10912345689.5) return 10;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("codegen_hfa_param_counts", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("codegen_hfa_param_counts_opt", code),
-        0
-    );
-}
 
-/// An HFA is returned in one V register per element, up to four, and its size
-/// does not enter into it -- `struct { double a, b, c, d; }` is thirty-two
-/// bytes and still comes back in V0-V3.
-///
-/// Three things had to agree before that worked on aarch64. The linearizer
-/// claimed every aggregate over sixteen bytes for the hidden-pointer return,
-/// on the stated grounds that nothing implemented a three-register HFA return.
-/// The return emitter handled one element and two, so three or four fell
-/// through and sent back the address of the callee's own frame slot -- which
-/// the caller then dereferenced after the frame was gone. And an aggregate
-/// returned in registers is written into a local by the caller, but that local
-/// was only allocated at sixteen bytes or fewer, so a twenty-four-byte result
-/// had nowhere to land and its first use read through a zero.
-#[test]
-fn codegen_hfa_return_element_counts() {
-    let code = r#"
-typedef struct { float a; }              F1;
-typedef struct { float a, b; }           F2;
-typedef struct { float a, b, c; }        F3;
-typedef struct { float a, b, c, d; }     F4;
-typedef struct { double a; }             D1;
-typedef struct { double a, b; }          D2;
-typedef struct { double a, b, c; }       D3;
-typedef struct { double a, b, c, d; }    D4;
+/* ====================================================================== */
+/* codegen_hfa_return_element_counts: exit codes 41..50 */
+// An HFA is returned in one V register per element, up to four, and its size
+// does not enter into it -- `struct { double a, b, c, d; }` is thirty-two
+// bytes and still comes back in V0-V3.
+//
+// Three things had to agree before that worked on aarch64. The linearizer
+// claimed every aggregate over sixteen bytes for the hidden-pointer return,
+// on the stated grounds that nothing implemented a three-register HFA return.
+// The return emitter handled one element and two, so three or four fell
+// through and sent back the address of the callee's own frame slot -- which
+// the caller then dereferenced after the frame was gone. And an aggregate
+// returned in registers is written into a local by the caller, but that local
+// was only allocated at sixteen bytes or fewer, so a twenty-four-byte result
+// had nowhere to land and its first use read through a zero.
+typedef struct { float a; }              RF1;
+typedef struct { float a, b; }           RF2;
+typedef struct { float a, b, c; }        RF3;
+typedef struct { float a, b, c, d; }     RF4;
+typedef struct { double a; }             RD1;
+typedef struct { double a, b; }          RD2;
+typedef struct { double a, b, c; }       RD3;
+typedef struct { double a, b, c, d; }    RD4;
 
-F1 m_f1(float x) { F1 r = {x};                   return r; }
-F2 m_f2(float x) { F2 r = {x, x+1};              return r; }
-F3 m_f3(float x) { F3 r = {x, x+1, x+2};         return r; }
-F4 m_f4(float x) { F4 r = {x, x+1, x+2, x+3};    return r; }
-D1 m_d1(double x){ D1 r = {x};                   return r; }
-D2 m_d2(double x){ D2 r = {x, x+1};              return r; }
-D3 m_d3(double x){ D3 r = {x, x+1, x+2};         return r; }
-D4 m_d4(double x){ D4 r = {x, x+1, x+2, x+3};    return r; }
+RF1 m_f1(float x) { RF1 r = {x};                   return r; }
+RF2 m_f2(float x) { RF2 r = {x, x+1};              return r; }
+RF3 m_f3(float x) { RF3 r = {x, x+1, x+2};         return r; }
+RF4 m_f4(float x) { RF4 r = {x, x+1, x+2, x+3};    return r; }
+RD1 m_d1(double x){ RD1 r = {x};                   return r; }
+RD2 m_d2(double x){ RD2 r = {x, x+1};              return r; }
+RD3 m_d3(double x){ RD3 r = {x, x+1, x+2};         return r; }
+RD4 m_d4(double x){ RD4 r = {x, x+1, x+2, x+3};    return r; }
 
-int main(void) {
-    { F1 v = m_f1(1); if (v.a != 1) return 1; }
-    { F2 v = m_f2(1); if (v.a*10 + v.b != 12) return 2; }
-    { F3 v = m_f3(1); if (v.a*100 + v.b*10 + v.c != 123) return 3; }
-    { F4 v = m_f4(1); if (v.a*1000 + v.b*100 + v.c*10 + v.d != 1234) return 4; }
-    { D1 v = m_d1(1); if (v.a != 1) return 5; }
-    { D2 v = m_d2(1); if (v.a*10 + v.b != 12) return 6; }
-    { D3 v = m_d3(1); if (v.a*100 + v.b*10 + v.c != 123) return 7; }
-    { D4 v = m_d4(1); if (v.a*1000 + v.b*100 + v.c*10 + v.d != 1234) return 8; }
+static int t_codegen_hfa_return_element_counts(void) {
+    { RF1 v = m_f1(1); if (v.a != 1) return 1; }
+    { RF2 v = m_f2(1); if (v.a*10 + v.b != 12) return 2; }
+    { RF3 v = m_f3(1); if (v.a*100 + v.b*10 + v.c != 123) return 3; }
+    { RF4 v = m_f4(1); if (v.a*1000 + v.b*100 + v.c*10 + v.d != 1234) return 4; }
+    { RD1 v = m_d1(1); if (v.a != 1) return 5; }
+    { RD2 v = m_d2(1); if (v.a*10 + v.b != 12) return 6; }
+    { RD3 v = m_d3(1); if (v.a*100 + v.b*10 + v.c != 123) return 7; }
+    { RD4 v = m_d4(1); if (v.a*1000 + v.b*100 + v.c*10 + v.d != 1234) return 8; }
 
     /* returned aggregate consumed in place, not through a named local */
     if (m_d3(2).b != 3) return 9;
     if (m_f4(2).d != 5) return 10;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("codegen_hfa_return_counts", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("codegen_hfa_return_counts_opt", code),
-        0
-    );
-}
 
-/// AAPCS64 §5.4.2 C.10 and SysV AMD64 §3.2.3 both put a composite of at most
-/// sixteen bytes in two consecutive general registers. aarch64 handed over its
-/// *address* instead, on both sides of the call, so c17 agreed with itself and
-/// nothing in the suite noticed -- while every call across a c17/gcc boundary
-/// was wrong. With a gcc caller it segfaulted: the callee read the first eight
-/// bytes of the aggregate as if they were a pointer and dereferenced them.
-///
-/// Structs of four and eight bytes were already right; the broken range is
-/// exactly the two-eightbyte one.
-#[test]
-fn codegen_composite_in_two_registers() {
-    let code = r#"
+/* ====================================================================== */
+/* codegen_composite_in_two_registers: exit codes 61..68 */
+// AAPCS64 §5.4.2 C.10 and SysV AMD64 §3.2.3 both put a composite of at most
+// sixteen bytes in two consecutive general registers. aarch64 handed over its
+// *address* instead, on both sides of the call, so c17 agreed with itself and
+// nothing in the suite noticed -- while every call across a c17/gcc boundary
+// was wrong. With a gcc caller it segfaulted: the callee read the first eight
+// bytes of the aggregate as if they were a pointer and dereferenced them.
+//
+// Structs of four and eight bytes were already right; the broken range is
+// exactly the two-eightbyte one.
 typedef struct { int a; }              S4;
 typedef struct { long a; }             S8;
 typedef struct { int a, b, c; }        S12;
@@ -556,7 +613,7 @@ __attribute__((noinline)) long many(S16 a, S16 b, S16 c, S16 d, S16 e) {
     return a.a + b.a * 10 + c.a * 100 + d.a * 1000 + e.a * 10000 + e.b * 100000;
 }
 
-int main(void) {
+static int t_codegen_composite_in_two_registers(void) {
     S4 s4 = {1};
     S8 s8 = {2};
     S12 s12 = {1, 2, 3};
@@ -576,33 +633,25 @@ int main(void) {
     if (many(a, b, c, d, e) != 654321) return 8;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("codegen_composite_two_regs", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("codegen_composite_two_regs_opt", code),
-        0
-    );
-}
 
-/// A struct whose alignment exceeds the argument area's own, passed by value.
-///
-/// `IncomingOff::take` rounded the *frame displacement* up to the argument's
-/// alignment, but that displacement already carries the saved `%rbp` and the
-/// return address. So an argument wanting 32-byte alignment and arriving first
-/// went to `32(%rbp)` while the caller -- which measures from its outgoing
-/// area's own base, correctly -- had written it at `16(%rbp)`. The callee read
-/// the struct's second half and ran off its end.
-///
-/// Invisible below 32-byte alignment: 16 is already a multiple of 8 and of 16,
-/// so only an argument wanting more than the area's own alignment can tell the
-/// two bases apart. The ordinary-alignment cases are here so the fix cannot
-/// regress them.
-///
-/// Six integer arguments come first in every signature: without them the
-/// struct is passed in registers and the stack layout is never exercised.
-#[test]
-fn codegen_over_aligned_struct_passed_by_value() {
-    let code = r#"
+/* ====================================================================== */
+/* codegen_over_aligned_struct_passed_by_value: exit codes 81..95 */
+// A struct whose alignment exceeds the argument area's own, passed by value.
+//
+// `IncomingOff::take` rounded the *frame displacement* up to the argument's
+// alignment, but that displacement already carries the saved `%rbp` and the
+// return address. So an argument wanting 32-byte alignment and arriving first
+// went to `32(%rbp)` while the caller -- which measures from its outgoing
+// area's own base, correctly -- had written it at `16(%rbp)`. The callee read
+// the struct's second half and ran off its end.
+//
+// Invisible below 32-byte alignment: 16 is already a multiple of 8 and of 16,
+// so only an argument wanting more than the area's own alignment can tell the
+// two bases apart. The ordinary-alignment cases are here so the fix cannot
+// regress them.
+//
+// Six integer arguments come first in every signature: without them the
+// struct is passed in registers and the stack layout is never exercised.
 int printf(const char *, ...);
 
 struct A32 { _Alignas(32) double v[4]; };   /* 32 bytes, 32-aligned */
@@ -682,7 +731,7 @@ static int take_after_fps_plain(double a, double b, double c, double d,
     return 0;
 }
 
-int main(void) {
+static int t_codegen_over_aligned_struct_passed_by_value(void) {
     struct A32 x, y;
     struct A64 big;
     struct P8 plain;
@@ -702,10 +751,31 @@ int main(void) {
     if ((r = take_after_fps_plain(1,2,3,4,5,6,7,8, plain))){ printf("take_after_fps_plain %d\n", r); return r; }
     return 0;
 }
+
+int main(void)
+{
+    int r;
+    if ((r = t_codegen_hfa_param_element_counts()) != 0) return 20 + r;
+    if ((r = t_codegen_hfa_return_element_counts()) != 0) return 40 + r;
+    if ((r = t_codegen_composite_in_two_registers()) != 0) return 60 + r;
+    if ((r = t_codegen_over_aligned_struct_passed_by_value()) != 0) return 80 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("over_aligned_struct_arg", code, &[]), 0);
+
+/// HFAs of every element count as arguments and returns, composites in two
+/// registers, and over-aligned structs by value, at the matrix levels and
+/// at -O1. Consolidates `codegen_hfa_param_element_counts`,
+/// `codegen_hfa_return_element_counts`, `codegen_composite_in_two_registers`
+/// and `codegen_over_aligned_struct_passed_by_value`.
+#[test]
+fn codegen_aggregate_arguments_and_returns() {
     assert_eq!(
-        compile_and_run_optimized("over_aligned_struct_arg_opt", code),
+        compile_and_run("aggregate_args_rets", AGGREGATE_ARGUMENTS_AND_RETURNS, &[]),
+        0
+    );
+    assert_eq!(
+        compile_and_run_optimized("aggregate_args_rets_opt", AGGREGATE_ARGUMENTS_AND_RETURNS),
         0
     );
 }
@@ -800,87 +870,6 @@ int main(void) {
     );
 }
 
-/// A struct returned in registers and then **discarded**.
-///
-/// `mem2reg` decides a local is dead by scanning `insn.src`. But a call
-/// returning a two-register struct writes its result into a `__2reg_N` local
-/// and names that local's `Sym` as the instruction's *target*, not as a
-/// source. When the result is used, a following `symaddr` puts the Sym in a
-/// `src` and it survives; when it is discarded — `one();` on a line by itself
-/// — nothing ever reads it, so the pass concluded the local was dead and
-/// dropped both the slot and the pseudo.
-///
-/// The backend then had a target with no storage behind it. `handle_two_reg_return`
-/// emits `mov %rax, (%reg)` for a `Loc::Reg` destination, so it stored through
-/// whatever that register happened to hold.
-///
-/// **This was wrong at -O0 too.** It only faulted once the inliner had run,
-/// because `should_inline` admits a function this size only at -O2, but the
-/// bad IR was there at every level and -O0 passed on luck about the register's
-/// contents: a slightly different reduction segfaults at -O0 as well.
-///
-/// The boundaries are the ABI's: 8 bytes returns in one register and is fine,
-/// 9-16 returns in two and was not, and 17+ uses a hidden pointer argument —
-/// which lands in `src` and so survived. Both register files are covered,
-/// since the FP path stores XMM0/XMM1 the same way.
-#[test]
-fn codegen_discarded_two_register_struct_return() {
-    let code = r#"
-struct I8  { int a, b; };
-struct I12 { int a, b, c; };
-struct I16 { int a, b, c, d; };
-struct I20 { int a, b, c, d, e; };
-struct F12 { float a, b, c; };
-struct D16 { double a, b; };
-
-static int calls;
-
-static struct I8  i8(void)  { struct I8  s = {1,2};       calls++; return s; }
-static struct I12 i12(void) { struct I12 s = {1,2,3};     calls++; return s; }
-static struct I16 i16(void) { struct I16 s = {1,2,3,4};   calls++; return s; }
-static struct I20 i20(void) { struct I20 s = {1,2,3,4,5}; calls++; return s; }
-static struct F12 f12(void) { struct F12 s = {1,2,3};     calls++; return s; }
-static struct D16 d16(void) { struct D16 s = {1,2};       calls++; return s; }
-
-int main(void) {
-    /* Discarded: the result is never read, which is the case that broke. */
-    i8(); i12(); i16(); i20(); f12(); d16();
-    if (calls != 6) return 1;
-
-    /* Used: this path always worked and must keep working, since the fix
-       changes which pseudos survive. */
-    { struct I12 v = i12(); if (v.a != 1 || v.b != 2 || v.c != 3) return 2; }
-    { struct I16 v = i16(); if (v.a != 1 || v.d != 4) return 3; }
-    { struct D16 v = d16(); if (v.a != 1.0 || v.b != 2.0) return 4; }
-    { struct F12 v = f12(); if (v.a != 1.0f || v.c != 3.0f) return 5; }
-    { struct I20 v = i20(); if (v.a != 1 || v.e != 5) return 6; }
-    { struct I8  v = i8();  if (v.a != 1 || v.b != 2) return 7; }
-    if (calls != 12) return 8;
-
-    /* Discarded again, in a loop, so the slot is reused rather than merely
-       allocated once. */
-    for (int k = 0; k < 3; k++) { i12(); d16(); }
-    if (calls != 18) return 9;
-
-    /* Discarded inside an expression whose value is also discarded. */
-    (void)i16();
-    if (calls != 19) return 10;
-    return 0;
-}
-"#;
-    for opt in ["-O0", "-O1", "-O2", "-Os"] {
-        assert_eq!(
-            compile_and_run(
-                &format!("codegen_discarded_2reg{}", opt.replace('-', "_")),
-                code,
-                &[opt.to_string()]
-            ),
-            0,
-            "discarded two-register struct return failed at {opt}"
-        );
-    }
-}
-
 /// The address of an element of a string literal is a static address, at any
 /// depth and in an aggregate initializer as well as a scalar one.
 ///
@@ -920,125 +909,6 @@ int main(void)
             compile_and_run("c17_addr_of_string_elem", code, &[opt.to_string()]),
             0,
             "at {opt}"
-        );
-    }
-}
-
-// ============================================================================
-// Regression: pointer scaling by a type past the old 512 MB bound
-// ============================================================================
-
-/// Indexing scales by the element's **byte size**, at every size the compiler
-/// accepts.
-///
-/// `size_bits` answers a *value* width in a `u32` and saturates for an
-/// aggregate past `u32::MAX` bits. While the object-size bound was that same
-/// number the saturation was unreachable -- the parser refused any type that
-/// could reach it. Raising the bound made it reachable, and every site still
-/// deriving a byte count as `size_bits / 8` began answering 536870911 for any
-/// larger type: `&a[1][0] - &a[0][0]` on a `char[3][600000000]`, the stride of
-/// an array of a 600 MB struct, and `p + 1` on a pointer to one. `sizeof` was
-/// right throughout, so the sizes agreed with gcc while the addresses did not.
-///
-/// Asserted on the assembly rather than by running: the scale factor is what
-/// was wrong, and no test should ask its machine for gigabytes to see it. The
-/// objects are `extern` for the same reason -- nothing is defined, allocated
-/// or dereferenced.
-#[test]
-fn codegen_pointer_scaling_past_the_old_object_bound() {
-    const SRC: &str = r#"
-extern char rows[3][600000000L];
-struct Big { char x[600000000L]; };
-extern struct Big bigs[2];
-
-char *row(int i) { return rows[i]; }
-struct Big *elem(int i) { return &bigs[i]; }
-long stride(struct Big *p, int i) { return (char *)&p[i] - (char *)p; }
-"#;
-
-    // One target is enough, and x86-64 is the one that materialises the scale
-    // as a literal: the element size is computed in `ir/linearize.rs`, before
-    // any backend runs, so the defect was target-independent. aarch64 builds
-    // the same constant with `movz`/`movk`, which would make this assertion
-    // about instruction encoding rather than about the size.
-    let asm = asm_for_with("pointer_scale", X86_64_LINUX, SRC, &["-O2"]);
-    for func in ["row", "elem", "stride"] {
-        let body = body_of(&asm, func);
-        assert!(
-            body.contains("600000000"),
-            "{func} does not scale by the element size:\n{body}"
-        );
-        assert!(
-            !body.contains("536870911"),
-            "{func} scales by the saturated size_bits:\n{body}"
-        );
-    }
-}
-
-/// An aggregate is copied by its **byte size**, at every size the compiler
-/// accepts.
-///
-/// The companion to `codegen_pointer_scaling_past_the_old_object_bound`, and
-/// the same root cause: `size_bits` saturates at `u32::MAX` bits, and raising
-/// the object-size bound made the saturation reachable. The sites that survived
-/// that commit's audit were the ones that launder the bit count through a local
-/// variable -- two of them spell it `let target_size_bytes = target_size / 8;`,
-/// which no grep for `size_bits(..) / 8` can find -- through a `u32` field
-/// (`struct_return_size`), or through `ArgClass::Indirect`'s payload.
-///
-/// Every shape below copied 536870911 bytes of a 600000000-byte object, on both
-/// targets, at every optimization level. `a = b` is the one that matters most:
-/// it is the plainest aggregate copy in the language.
-///
-/// Asserted on x86-64 alone, and the source is shaped to stay cheap. Both are
-/// load-bearing, not stylistic -- each one avoids a different pre-existing
-/// backend blowup that this test walked straight into and that took both Linux
-/// CI runners down with SIGTERM:
-///
-/// - **x86-64 only.** Nothing to do with coverage: the length is computed in
-///   `ir/` before any backend runs, so one target proves it, and x86-64 is the
-///   one that materialises the constant as a literal rather than as
-///   `movz`/`movk`. An `AARCH64_LINUX` assertion once cost **12.5 seconds and
-///   16 GB** resident, because `initialize`'s 600 MB local went through an
-///   unrolled zeroing of the frame. Nothing zeroes the frame now; nobody has
-///   re-measured the rest of the aarch64 path at this size, so keep the list
-///   as it is.
-/// - **`by_value_param` does not pass its argument on.** The prologue copy is
-///   the site under test. Sending a 600 MB aggregate used to cost 16 seconds
-///   and 21.9 GB of compiler memory, one load/store pair per eightbyte; the
-///   outgoing copy is a `rep movsq` now, but it is not what this test is about.
-///
-/// Everything here is `extern`; nothing is defined or run.
-#[test]
-fn codegen_aggregate_copy_length_past_the_old_object_bound() {
-    const SRC: &str = r#"
-struct Big { char x[600000000L]; };
-extern struct Big src, dst;
-void sink(struct Big *);
-
-void assign(void) { dst = src; }
-void initialize(void) { struct Big loc = src; sink(&loc); }
-void by_value_param(struct Big p) { sink(&p); }
-struct Big returns_it(void) { return src; }
-unsigned long extent(void) { return __builtin_object_size(src.x, 0); }
-"#;
-
-    let asm = asm_for_with("aggregate_copy_length", X86_64_LINUX, SRC, &["-O2"]);
-    for func in [
-        "assign",
-        "initialize",
-        "by_value_param",
-        "returns_it",
-        "extent",
-    ] {
-        let body = body_of(&asm, func);
-        assert!(
-            body.contains("600000000"),
-            "{func} does not use the aggregate's byte size:\n{body}"
-        );
-        assert!(
-            !body.contains("536870911"),
-            "{func} uses the saturated size_bits:\n{body}"
         );
     }
 }
@@ -1111,19 +981,23 @@ fn codegen_aggregate_through_conditional_and_other_rvalues() {
     }
 }
 
-/// The qualifiers written around `typeof(..)` or `_Atomic(..)` in a type-name
-/// are part of the type it names. The type-name specifier loop returned as
-/// soon as it had parsed the operand, so a leading `const` was dropped --
-/// `_Generic` picked `default` for `const typeof(int) *` against a
-/// `const int *` -- and a trailing one was left for the caller, which then
-/// failed to parse it.
-#[test]
-fn codegen_type_name_keeps_qualifiers_around_typeof() {
-    let src = r#"
+/// One section per consolidated test, each under that test's own
+/// documentation. Exit codes:
+/// `codegen_type_name_keeps_qualifiers_around_typeof` 11..=16.
+/// `codegen_specifiers_may_follow_a_complete_type_specifier` 21..=24.
+const TYPE_NAMES_AND_SPECIFIER_ORDER: &str = r#"
+/* ====================================================================== */
+/* codegen_type_name_keeps_qualifiers_around_typeof: exit codes 11..16 */
+// The qualifiers written around `typeof(..)` or `_Atomic(..)` in a type-name
+// are part of the type it names. The type-name specifier loop returned as
+// soon as it had parsed the operand, so a leading `const` was dropped --
+// `_Generic` picked `default` for `const typeof(int) *` against a
+// `const int *` -- and a trailing one was left for the caller, which then
+// failed to parse it.
 const int *p;
 volatile long *q;
 
-int main(void)
+static int t_codegen_type_name_keeps_qualifiers_around_typeof(void)
 {
     /* The qualifier before typeof is part of the association's type. */
     if (_Generic(p, const typeof(int) *: 1, default: 2) != 1)
@@ -1142,19 +1016,15 @@ int main(void)
         return 6;
     return 0;
 }
-"#;
-    compile_and_run_everywhere("type_name_keeps_qualifiers_around_typeof", src);
-}
 
-/// C17 6.7p1 lets declaration specifiers appear in any order, so a qualifier
-/// or storage class may follow `typeof(..)`, `_Atomic(..)` or an enum
-/// specifier as it may follow `int`. Those arms returned as soon as their
-/// type was parsed (the enum arm consumed qualifiers only), and the next
-/// specifier was read as the declarator's name. The block-scope `static`
-/// enum must keep its value across calls.
-#[test]
-fn codegen_specifiers_may_follow_a_complete_type_specifier() {
-    let src = r#"
+/* ====================================================================== */
+/* codegen_specifiers_may_follow_a_complete_type_specifier: exit codes 21..24 */
+// C17 6.7p1 lets declaration specifiers appear in any order, so a qualifier
+// or storage class may follow `typeof(..)`, `_Atomic(..)` or an enum
+// specifier as it may follow `int`. Those arms returned as soon as their
+// type was parsed (the enum arm consumed qualifiers only), and the next
+// specifier was read as the declarator's name. The block-scope `static`
+// enum must keep its value across calls.
 typeof(int) const x = 1;
 _Atomic(int) const y = 2;
 enum E { A = 3, B } static e = B;
@@ -1166,7 +1036,7 @@ static int counter(void)
     return ++n;
 }
 
-int main(void)
+static int t_codegen_specifiers_may_follow_a_complete_type_specifier(void)
 {
     if (x != 1 || y != 2 || e != B || s.v != 5)
         return 1;
@@ -1181,117 +1051,52 @@ int main(void)
         return 4;
     return 0;
 }
+
+int main(void)
+{
+    int r;
+    if ((r = t_codegen_type_name_keeps_qualifiers_around_typeof()) != 0) return 10 + r;
+    if ((r = t_codegen_specifiers_may_follow_a_complete_type_specifier()) != 0) return 20 + r;
+    return 0;
+}
 "#;
-    compile_and_run_everywhere("specifiers_may_follow_a_complete_type_specifier", src);
+
+/// Qualifiers around `typeof(..)` and specifiers after a complete type
+/// specifier, everywhere. Consolidates
+/// `codegen_type_name_keeps_qualifiers_around_typeof` and
+/// `codegen_specifiers_may_follow_a_complete_type_specifier`.
+#[test]
+fn codegen_type_names_and_specifier_order() {
+    compile_and_run_everywhere(
+        "type_names_and_specifier_order",
+        TYPE_NAMES_AND_SPECIFIER_ORDER,
+    );
 }
 
-/// `noreturn` belongs to the function *type*, since that is what a call site
-/// reads. Only the first plain file-scope declarator put it there, so a
-/// grouped, later or block-scope declarator produced a function the caller
-/// believed could return -- visible at -O2 as the code after the call
-/// surviving.
-#[test]
-fn codegen_noreturn_reaches_the_type_from_every_declarator() {
-    let shapes = [
-        ("first", "void f(void) __attribute__((noreturn));\n", ""),
-        ("grouped", "void (f)(void) __attribute__((noreturn));\n", ""),
-        ("later", "int x, f(void) __attribute__((noreturn));\n", ""),
-        ("block", "", "void f(void) __attribute__((noreturn));"),
-        ("block_keyword", "", "_Noreturn void f(void);"),
-        // Written among the specifiers, the attribute belongs to every
-        // declarator of the list, as gcc has it.
-        (
-            "specifier",
-            "__attribute__((noreturn)) void e(void), f(void);\n",
-            "",
-        ),
-        // And a prototype's attribute carries to a later redeclaration.
-        (
-            "redeclared",
-            "void f(void) __attribute__((noreturn));\nvoid f(void);\n",
-            "",
-        ),
-    ];
-    for (name, file_decl, block_decl) in shapes {
-        let src = format!("{file_decl}int g(void) {{ {block_decl} f(); return 12345; }}\n");
-        for triple in [X86_64_LINUX, AARCH64_LINUX] {
-            let asm = asm_for_with(&format!("noreturn_{name}"), triple, &src, &["-O2"]);
-            assert!(
-                !body_of(&asm, "g").contains("12345"),
-                "{name} on {triple}: the code after a noreturn call must be dead:\n{asm}"
-            );
-        }
-    }
-    // The controls: without the attribute the return survives, so the probe
-    // above can fail -- and an attribute on a *parameter* is the parameter's,
-    // not the function's.
-    for (name, decl, call) in [
-        ("noreturn_control", "void f(void);", "f()"),
-        (
-            "noreturn_param",
-            "void f(void (*cb)(void) __attribute__((noreturn)));",
-            "f(0)",
-        ),
-    ] {
-        let src = format!("{decl}\nint g(void) {{ {call}; return 12345; }}\n");
-        let asm = asm_for_with(name, X86_64_LINUX, &src, &["-O2"]);
-        assert!(body_of(&asm, "g").contains("12345"), "{name}:\n{asm}");
-    }
-}
-
-/// The bound itself, not just the answer: above the threshold the zero-fill is
-/// a `memset` call, below it is still stores.
-///
-/// The behavioural test above passes either way — a million unrolled stores
-/// produce a correctly zeroed object, just not in a time anyone will wait for.
-/// This is the test that the *bound* exists, and the negative half keeps it
-/// from being satisfied by calling `memset` for every size, which would cost
-/// more than the stores it replaced for a small object.
-#[test]
-fn codegen_a_large_aggregate_zero_is_a_memset_call() {
-    use crate::codegen::asm_probe::{asm_for_with, AARCH64_LINUX, X86_64_LINUX};
-
-    let src = |n: usize| {
-        format!("void sink(char *);\nvoid probe(void) {{ char buf[{n}] = {{0}}; sink(buf); }}\n")
-    };
-
-    for triple in [X86_64_LINUX, AARCH64_LINUX] {
-        // Comfortably over `INLINE_LIMIT_BYTES` (128).
-        let big = asm_for_with("aggzero_big", triple, &src(4096), &["-O2"]);
-        assert!(
-            big.contains("memset"),
-            "a 4096-byte zero-fill belongs in a memset call, not 512 stores, on {triple}:\n{big}"
-        );
-
-        // And the unrolled form is still used where it is cheaper than a call.
-        let small = asm_for_with("aggzero_small", triple, &src(16), &["-O2"]);
-        assert!(
-            !small.contains("memset"),
-            "a 16-byte zero-fill is cheaper unrolled than called, on {triple}:\n{small}"
-        );
-    }
-}
-
-/// Storing one field of an eight-byte aggregate leaves the other alone.
-///
-/// The x86-64 store lowering widens a 32-bit store at offset 0 of a local to
-/// 64 bits, to clear stale upper bits when a narrow value goes into a wider
-/// slot. Its own comment records the exception that needs: "struct/union
-/// fields at offset 0 must use exact size to avoid clobbering the adjacent
-/// field at offset 4". The exception asked whether the object was *larger than*
-/// 64 bits, which an eight-byte aggregate is not -- so exactly the case the
-/// comment describes was the one that fell through.
-///
-/// Only at `-O0`: with the optimizer on, the field is promoted out of memory
-/// before the store lowering sees it.
-#[test]
-fn codegen_a_field_store_does_not_widen_over_its_neighbour() {
-    let code = r#"
+/// One section per consolidated test, each under that test's own
+/// documentation. Exit codes:
+/// `codegen_a_field_store_does_not_widen_over_its_neighbour` 11..=17.
+/// `codegen_a_narrow_store_into_a_wide_slot_clears_it` 21..=24.
+const NARROW_STORES_INTO_EIGHT_BYTE_SLOTS: &str = r#"
+/* ====================================================================== */
+/* codegen_a_field_store_does_not_widen_over_its_neighbour: exit codes 11..17 */
+// Storing one field of an eight-byte aggregate leaves the other alone.
+//
+// The x86-64 store lowering widens a 32-bit store at offset 0 of a local to
+// 64 bits, to clear stale upper bits when a narrow value goes into a wider
+// slot. Its own comment records the exception that needs: "struct/union
+// fields at offset 0 must use exact size to avoid clobbering the adjacent
+// field at offset 4". The exception asked whether the object was *larger than*
+// 64 bits, which an eight-byte aggregate is not -- so exactly the case the
+// comment describes was the one that fell through.
+//
+// Only at `-O0`: with the optimizer on, the field is promoted out of memory
+// before the store lowering sees it.
 struct P { int x, y; };
 struct S { struct P t; };
 union U { struct P p; double d; };
 
-int main(void)
+static int t_codegen_a_field_store_does_not_widen_over_its_neighbour(void)
 {
     /* The reported shape: a designated override inside an eight-byte struct. */
     struct S a = { .t = {1, 2}, .t.x = 3 };
@@ -1328,34 +1133,19 @@ int main(void)
 
     return 0;
 }
-"#;
-    // `-O0` explicitly: the default matrix compiles at `-O`, where the field is
-    // promoted out of memory before the store lowering ever sees it, so the
-    // defect is invisible there.
-    assert_eq!(
-        compile_and_run("field_store_no_widen", code, &["-O0".to_string()]),
-        0
-    );
-    assert_eq!(compile_and_run("field_store_no_widen_matrix", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("field_store_no_widen_opt", code),
-        0
-    );
-}
 
-/// The control: a narrow value stored into a wider scalar slot still leaves no
-/// stale upper bits.
-///
-/// This is what the widening is for, and it is why the fix has to ask whether
-/// the object is an aggregate rather than simply stop widening. Each case
-/// writes a wide value into the slot first, so a store that failed to clear the
-/// upper half would read it back.
-#[test]
-fn codegen_a_narrow_store_into_a_wide_slot_clears_it() {
-    let code = r#"
+/* ====================================================================== */
+/* codegen_a_narrow_store_into_a_wide_slot_clears_it: exit codes 21..24 */
+// The control: a narrow value stored into a wider scalar slot still leaves no
+// stale upper bits.
+//
+// This is what the widening is for, and it is why the fix has to ask whether
+// the object is an aggregate rather than simply stop widening. Each case
+// writes a wide value into the slot first, so a store that failed to clear the
+// upper half would read it back.
 int wide(void) { return -1; }
 
-int main(void)
+static int t_codegen_a_narrow_store_into_a_wide_slot_clears_it(void)
 {
     /* Put a known wide pattern in the slot, then overwrite it narrowly. */
     long l = 0x7fffffff7fffffffL;
@@ -1380,17 +1170,30 @@ int main(void)
 
     return 0;
 }
+
+int main(void)
+{
+    int r;
+    if ((r = t_codegen_a_field_store_does_not_widen_over_its_neighbour()) != 0) return 10 + r;
+    if ((r = t_codegen_a_narrow_store_into_a_wide_slot_clears_it()) != 0) return 20 + r;
+    return 0;
+}
 "#;
+
+/// A field store into an eight-byte aggregate, and a narrow store into a
+/// wide scalar slot, at -O0, the matrix levels and -O1. Consolidates
+/// `codegen_a_field_store_does_not_widen_over_its_neighbour` and
+/// `codegen_a_narrow_store_into_a_wide_slot_clears_it`.
+#[test]
+fn codegen_narrow_stores_into_eight_byte_slots() {
+    // `-O0` explicitly: the default matrix compiles at `-O`, where the field is
+    // promoted out of memory before the store lowering ever sees it, so the
+    // defect is invisible there.
+    let src = NARROW_STORES_INTO_EIGHT_BYTE_SLOTS;
     assert_eq!(
-        compile_and_run("narrow_store_clears_slot", code, &["-O0".to_string()]),
+        compile_and_run("narrow_stores", src, &["-O0".to_string()]),
         0
     );
-    assert_eq!(
-        compile_and_run("narrow_store_clears_slot_matrix", code, &[]),
-        0
-    );
-    assert_eq!(
-        compile_and_run_optimized("narrow_store_clears_slot_opt", code),
-        0
-    );
+    assert_eq!(compile_and_run("narrow_stores_matrix", src, &[]), 0);
+    assert_eq!(compile_and_run_optimized("narrow_stores_opt", src), 0);
 }

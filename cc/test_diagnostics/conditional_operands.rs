@@ -14,9 +14,8 @@
 // rejects every other pair; the wording and severities here are gcc's.
 //
 
-use crate::common::{
-    compile_expect_error, compile_expect_no_diagnostic, compile_expect_warning, create_c_file,
-    run_c17,
+use crate::test_compile::{
+    compile, compile_expect_error, compile_expect_no_diagnostic, compile_expect_warning,
 };
 
 const DECLS: &str = "struct S { int a; } s, u; struct T { int a; } t; union U { int a; } w;\n\
@@ -138,9 +137,7 @@ fn conditional_mismatch_does_not_cascade() {
         ),
     ];
     for (name, body, expected) in cases {
-        let c = create_c_file(name, &format!("{DECLS}int f(void) {{ {body} }}\n"));
-        let path = c.path().to_string_lossy().to_string();
-        let run = run_c17(&["-S", "-o", "/dev/null", &path]);
+        let run = compile(name, &format!("{DECLS}int f(void) {{ {body} }}\n"), &[]);
         assert!(!run.success, "{name} should be rejected");
         assert_eq!(
             run.stderr.matches("error").count(),
@@ -165,9 +162,11 @@ fn conditional_function_pointer_and_void_pointer() {
         &src,
         "ISO C forbids conditional expr between 'void *' and function pointer",
     );
-    let c = create_c_file("cond_fnptr_void_silenced", &src);
-    let path = c.path().to_string_lossy().to_string();
-    let run = run_c17(&["-S", "-o", "/dev/null", "-Wno-function-pointer-conv", &path]);
+    let run = compile(
+        "cond_fnptr_void_silenced",
+        &src,
+        &["-Wno-function-pointer-conv"],
+    );
     assert!(run.success, "should compile: {}", run.stderr);
     assert!(
         !run.stderr.contains("ISO C forbids"),

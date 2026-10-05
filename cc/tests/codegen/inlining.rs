@@ -10,7 +10,6 @@
 // recursion guards around it.
 //
 
-use crate::codegen::asm_probe::{asm_for_with, AARCH64_LINUX, X86_64_LINUX};
 use crate::common::{
     compile_and_run, compile_and_run_aarch64, compile_and_run_everywhere,
     compile_and_run_optimized, compile_and_run_two_units,
@@ -20,9 +19,37 @@ use crate::common::{
 // Test: Inlined two-register struct returns
 // ============================================================================
 
+/// Inlined bodies: returns, phis, loops, nested and noreturn callees, and
+/// aggregate parameters and returns, one program run at -O1
+/// (`compile_and_run_optimized`).
+///
+/// The inliner decides per call site from the callee (its size, and its
+/// call count, which is by name) and the caller's own size, so each
+/// original `main` keeps its decisions as a `noinline` section function
+/// with every helper name kept distinct.
+///
+/// Consolidates these tests, one section each (each original `main` is
+/// a `noinline` section function; the program exits with the section's
+/// base plus the original code):
+/// - `codegen_inline_two_reg_struct_return`: 1..=6
+/// - `codegen_inline_multi_ret_phi_join`: 7..=13
+/// - `codegen_inline_m0_a_void_return`: 14..=14
+/// - `codegen_inline_m0_b_single_ret`: 15..=17
+/// - `codegen_inline_m0_c_ret_in_loop`: 18..=21
+/// - `codegen_inline_m0_d_internal_phi`: 22..=25
+/// - `codegen_inline_m0_e_multiple_calls`: 26..=29
+/// - `codegen_inline_m0_f_pointer_return`: 30..=35
+/// - `codegen_inline_m0_g_long_return`: 36..=38
+/// - `codegen_inline_m0_h_nested`: 39..=42
+/// - `codegen_inline_m0_j_consecutive_rets_in_block`: 43..=46
+/// - `codegen_inline_m0_i_mixed_noreturn`: 47..=49
+/// - `codegen_inline_two_sse_struct_param`: 50..=53
+/// - `codegen_inline_large_struct_param`: 54..=55
 #[test]
-fn codegen_inline_two_reg_struct_return() {
+fn codegen_inlining_mega() {
     let code = r#"
+/* ---- codegen_inline_two_reg_struct_return: exits 1..6
+ */
 #include <stdio.h>
 
 /* 16-byte struct: returned via RAX+RDX on x86-64 SysV ABI */
@@ -46,7 +73,8 @@ static struct S16b make_s16b(int x, void *y) {
     return r;
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_inline_two_reg_struct_return(void)
+{
     /* Test 1: two longs */
     struct S16 s = make_s16(0x2222, 0x3333);
     if (s.a != 0x2222) {
@@ -84,47 +112,35 @@ int main(void) {
     printf("OK\n");
     return 0;
 }
-"#;
 
-    let exit_code = compile_and_run_optimized("inline_two_reg_struct_return", code);
-    assert_eq!(
-        exit_code, 0,
-        "Inline two-reg struct return test failed with exit code {}",
-        exit_code
-    );
-}
-
-// ============================================================================
-// Test: Inliner emits a φ-join (not multiple Copies) for multi-`ret` callees
-// ============================================================================
-//
-// Regression for the SSA single-def invariant the inliner is required to
-// preserve. A callee like
-//
-//     static inline int choose(int c, int a, int b) {
-//         if (c) return a;
-//         return b;
-//     }
-//
-// has two `ret` paths. The historical lowering converted each `ret` to a
-// `Copy %ret_target = %x` in the cloned predecessor block — and because the
-// inliner uses one shared `%ret_target`, this produced *multiple definitions*
-// of the same SSA pseudo. That is not valid SSA, and any downstream pass
-// that merges pseudos (copyprop, CSE, GVN, SCCP) would mis-route the
-// continuation's reads to whichever Copy it visited first, silently dropping
-// the other return path.
-//
-// After M0, the inliner emits a `PhiSource` in each predecessor and a single
-// `Phi %ret_target = phi (pred1, ps1), (pred2, ps2)` at the head of the
-// continuation block. SSA single-def is restored.
-//
-// The test compiles at -O so the small callees are inlined and exercises
-// every routing path: c true with both arms, c false with both arms,
-// nested calls, calls used in expressions, and calls whose results are
-// stored to globals.
-#[test]
-fn codegen_inline_multi_ret_phi_join() {
-    let code = r#"
+/* ---- codegen_inline_multi_ret_phi_join: exits 7..13
+ * Test: Inliner emits a φ-join (not multiple Copies) for multi-`ret` callees
+ *
+ * Regression for the SSA single-def invariant the inliner is required to
+ * preserve. A callee like
+ *
+ *     static inline int choose(int c, int a, int b) {
+ *         if (c) return a;
+ *         return b;
+ *     }
+ *
+ * has two `ret` paths. The historical lowering converted each `ret` to a
+ * `Copy %ret_target = %x` in the cloned predecessor block — and because the
+ * inliner uses one shared `%ret_target`, this produced *multiple definitions*
+ * of the same SSA pseudo. That is not valid SSA, and any downstream pass
+ * that merges pseudos (copyprop, CSE, GVN, SCCP) would mis-route the
+ * continuation's reads to whichever Copy it visited first, silently dropping
+ * the other return path.
+ *
+ * After M0, the inliner emits a `PhiSource` in each predecessor and a single
+ * `Phi %ret_target = phi (pred1, ps1), (pred2, ps2)` at the head of the
+ * continuation block. SSA single-def is restored.
+ *
+ * The test compiles at -O so the small callees are inlined and exercises
+ * every routing path: c true with both arms, c false with both arms,
+ * nested calls, calls used in expressions, and calls whose results are
+ * stored to globals.
+ */
 static inline int choose(int c, int a, int b) {
     if (c) return a;
     return b;
@@ -137,7 +153,8 @@ static inline int max2(int x, int y) {
 
 int g_sum;
 
-int main(void) {
+static __attribute__((noinline)) int t_inline_multi_ret_phi_join(void)
+{
     /* basic two-arm: cond true and false */
     if (choose(1, 7, 9) != 7) return 1;
     if (choose(0, 7, 9) != 9) return 2;
@@ -169,71 +186,45 @@ int main(void) {
 
     return 0;
 }
-"#;
-    let exit_code = compile_and_run_optimized("inline_multi_ret_phi_join", code);
-    assert_eq!(
-        exit_code, 0,
-        "M0 multi-ret φ-join test failed with exit code {}",
-        exit_code
-    );
-}
 
-// ============================================================================
-// M0 edge-case coverage (A–I)
-//
-// Each test isolates one shape of inlined `ret` lowering that M0 must handle.
-// They were written *after* M0 broke CPython at -O2 (asyncio hot paths) to
-// localize the regression to a fast, debuggable scope.
-// ============================================================================
-
-/// (A) Inlined void-returning function. The M0 path skips Phi materialization
-/// when the call has no result target.
-#[test]
-fn codegen_inline_m0_a_void_return() {
-    let code = r#"
+/* ---- codegen_inline_m0_a_void_return: exits 14..14
+ * (A) Inlined void-returning function. The M0 path skips Phi materialization
+ * when the call has no result target.
+ */
 static int g_counter;
 
 static inline void bump(int delta) {
     g_counter += delta;
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_inline_m0_a_void_return(void)
+{
     g_counter = 0;
     bump(3);
     bump(7);
     if (g_counter != 10) return 1;
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run_optimized("inline_m0_a_void_return", code),
-        0
-    );
-}
 
-/// (B) Inlined function with a SINGLE `ret`. 1-arm Phi.
-#[test]
-fn codegen_inline_m0_b_single_ret() {
-    let code = r#"
+/* ---- codegen_inline_m0_b_single_ret: exits 15..17
+ * (B) Inlined function with a SINGLE `ret`. 1-arm Phi.
+ */
 static inline int identity(int x) {
     return x;
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_inline_m0_b_single_ret(void)
+{
     if (identity(0) != 0) return 1;
     if (identity(42) != 42) return 2;
     if (identity(-7) != -7) return 3;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run_optimized("inline_m0_b_single_ret", code), 0);
-}
 
-/// (C) `ret` inside a loop in the callee. PhiSource lands inside the loop;
-/// the Phi sits in the post-inline continuation outside the loop.
-#[test]
-fn codegen_inline_m0_c_ret_in_loop() {
-    let code = r#"
+/* ---- codegen_inline_m0_c_ret_in_loop: exits 18..21
+ * (C) `ret` inside a loop in the callee. PhiSource lands inside the loop;
+ * the Phi sits in the post-inline continuation outside the loop.
+ */
 static inline int find(int needle, int *haystack, int n) {
     for (int i = 0; i < n; i++) {
         if (haystack[i] == needle) return i;
@@ -241,7 +232,8 @@ static inline int find(int needle, int *haystack, int n) {
     return -1;
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_inline_m0_c_ret_in_loop(void)
+{
     int arr[16] = {10, 20, 30, 40, 50, 60, 70, 80,
                    90, 100, 110, 120, 130, 140, 150, 160};
     if (find(10, arr, 16) != 0) return 1;
@@ -250,75 +242,56 @@ int main(void) {
     if (find(80, arr, 16) != 7) return 4;
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run_optimized("inline_m0_c_ret_in_loop", code),
-        0
-    );
-}
 
-/// (D) Inlined function whose result comes from a callee-internal Phi
-/// (ternary). Two Phi nodes in series — callee's inner Phi feeds M0's
-/// outer continuation Phi.
-#[test]
-fn codegen_inline_m0_d_internal_phi() {
-    let code = r#"
+/* ---- codegen_inline_m0_d_internal_phi: exits 22..25
+ * (D) Inlined function whose result comes from a callee-internal Phi
+ * (ternary). Two Phi nodes in series — callee's inner Phi feeds M0's
+ * outer continuation Phi.
+ */
 static inline int picker(int c, int a, int b) {
     return c ? a : b;
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_inline_m0_d_internal_phi(void)
+{
     if (picker(1, 10, 20) != 10) return 1;
     if (picker(0, 10, 20) != 20) return 2;
     if (picker(picker(1, 1, 0), 100, 200) != 100) return 3;
     if (picker(picker(0, 1, 0), 100, 200) != 200) return 4;
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run_optimized("inline_m0_d_internal_phi", code),
-        0
-    );
-}
 
-/// (E) Multiple inlined calls in the same caller. Each call materializes
-/// its own Phi; pseudo and block IDs must stay disjoint.
-#[test]
-fn codegen_inline_m0_e_multiple_calls() {
-    let code = r#"
+/* ---- codegen_inline_m0_e_multiple_calls: exits 26..29
+ * (E) Multiple inlined calls in the same caller. Each call materializes
+ * its own Phi; pseudo and block IDs must stay disjoint.
+ */
 static inline int absx(int x) {
     if (x < 0) return -x;
     return x;
 }
 
-static inline int max2(int a, int b) {
+static inline int io7_max2(int a, int b) {
     if (a > b) return a;
     return b;
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_inline_m0_e_multiple_calls(void)
+{
     int t = absx(-5);
     int u = absx(3);
-    int v = max2(t, u);
-    int w = max2(absx(-9), -2);
+    int v = io7_max2(t, u);
+    int w = io7_max2(absx(-9), -2);
     if (t != 5) return 1;
     if (u != 3) return 2;
     if (v != 5) return 3;
     if (w != 9) return 4;
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run_optimized("inline_m0_e_multiple_calls", code),
-        0
-    );
-}
 
-/// (F) Inlined function returning a pointer (size 64). Phi must propagate
-/// the correct size from `Ret`.
-#[test]
-fn codegen_inline_m0_f_pointer_return() {
-    let code = r#"
+/* ---- codegen_inline_m0_f_pointer_return: exits 30..35
+ * (F) Inlined function returning a pointer (size 64). Phi must propagate
+ * the correct size from `Ret`.
+ */
 static char buf_a[] = "alpha";
 static char buf_b[] = "beta";
 
@@ -333,7 +306,8 @@ static int strlen3(const char *s) {
     return n;
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_inline_m0_f_pointer_return(void)
+{
     char *p1 = choose_buf(1);
     char *p2 = choose_buf(0);
     if (strlen3(p1) != 5) return 1;
@@ -344,23 +318,17 @@ int main(void) {
     if (choose_buf(0)[1] != 'e') return 6;
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run_optimized("inline_m0_f_pointer_return", code),
-        0
-    );
-}
 
-/// (G) Inlined function returning a long (size 64, int bank).
-#[test]
-fn codegen_inline_m0_g_long_return() {
-    let code = r#"
+/* ---- codegen_inline_m0_g_long_return: exits 36..38
+ * (G) Inlined function returning a long (size 64, int bank).
+ */
 static inline long bigchoice(int c, long a, long b) {
     if (c) return a;
     return b;
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_inline_m0_g_long_return(void)
+{
     long x = bigchoice(1, 0x1122334455667788L, 0x99AABBCCDDEEFF00L);
     long y = bigchoice(0, 0x1122334455667788L, 0x99AABBCCDDEEFF00L);
     if (x != 0x1122334455667788L) return 1;
@@ -369,18 +337,11 @@ int main(void) {
     if (sum != 20L) return 3;
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run_optimized("inline_m0_g_long_return", code),
-        0
-    );
-}
 
-/// (H) Nested inlining: outer→middle→innermost. Each level emits its own
-/// Phi using fresh IDs from next_inline_id.
-#[test]
-fn codegen_inline_m0_h_nested() {
-    let code = r#"
+/* ---- codegen_inline_m0_h_nested: exits 39..42
+ * (H) Nested inlining: outer→middle→innermost. Each level emits its own
+ * Phi using fresh IDs from next_inline_id.
+ */
 static inline int innermost(int c, int a, int b) {
     if (c) return a;
     return b;
@@ -398,27 +359,24 @@ static inline int outer(int c, int x) {
     return m;
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_inline_m0_h_nested(void)
+{
     if (outer(1, 5) != 12) return 1;   /* 5  -> innermost=5 -> middle=6 -> outer=12 */
     if (outer(0, 5) != -6) return 2;   /* 5  -> innermost=-5 -> middle=-6 -> outer=-6 */
     if (outer(1, 0) != 2) return 3;    /* 0  -> innermost=0 -> middle=1 -> outer=2 */
     if (outer(0, 0) != 2) return 4;    /* 0  -> innermost=0 -> middle=1 -> outer=2 */
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run_optimized("inline_m0_h_nested", code), 0);
-}
 
-/// (J) Two `ret`s in the SAME callee block (e.g., a real return followed by
-/// an `#ifdef`-fenced fallback `return 0;`). The pre-M0 inliner generated a
-/// single block with two `Br` terminators, and `lower.rs` placed
-/// phi-elimination copies before the *last* `Br` — unreached at runtime —
-/// leaving the M0 Phi reading an undefined register. This was the actual
-/// CPython asyncio fork-multiprocessing crash. The fix in
-/// `clone_callee_blocks` truncates cloning at the first `Ret`.
-#[test]
-fn codegen_inline_m0_j_consecutive_rets_in_block() {
-    let code = r#"
+/* ---- codegen_inline_m0_j_consecutive_rets_in_block: exits 43..46
+ * (J) Two `ret`s in the SAME callee block (e.g., a real return followed by
+ * an `#ifdef`-fenced fallback `return 0;`). The pre-M0 inliner generated a
+ * single block with two `Br` terminators, and `lower.rs` placed
+ * phi-elimination copies before the *last* `Br` — unreached at runtime —
+ * leaving the M0 Phi reading an undefined register. This was the actual
+ * CPython asyncio fork-multiprocessing crash. The fix in
+ * `clone_callee_blocks` truncates cloning at the first `Ret`.
+ */
 #define HAS_FAST_PATH 1
 
 static int g_x;
@@ -433,7 +391,8 @@ static inline int is_x_one(void) {
     return 0;  /* unreachable when HAS_FAST_PATH defined */
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_inline_m0_j_consecutive_rets_in_block(void)
+{
     g_x = 1;
     if (is_x_one() != 1) return 1;
 
@@ -449,18 +408,12 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run_optimized("inline_m0_j_consecutive_rets_in_block", code),
-        0
-    );
-}
+#undef HAS_FAST_PATH
 
-/// (I) Mixed Noreturn/abort paths with normal returns. Only the returning
-/// paths contribute to M0's Phi; the noreturn path's Unreachable does not.
-#[test]
-fn codegen_inline_m0_i_mixed_noreturn() {
-    let code = r#"
+/* ---- codegen_inline_m0_i_mixed_noreturn: exits 47..49
+ * (I) Mixed Noreturn/abort paths with normal returns. Only the returning
+ * paths contribute to M0's Phi; the noreturn path's Unreachable does not.
+ */
 #include <stdlib.h>
 
 static inline int validated(int x) {
@@ -471,18 +424,124 @@ static inline int validated(int x) {
     return x * 2;
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_inline_m0_i_mixed_noreturn(void)
+{
     if (validated(0) != 100) return 1;
     if (validated(5) != 10) return 2;
     if (validated(7) != 14) return 3;
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run_optimized("inline_m0_i_mixed_noreturn", code),
-        0
-    );
+
+/* ---- codegen_inline_two_sse_struct_param: exits 50..53
+ * Regression: inlining a function with two-SSE struct parameters (e.g.
+ * `{double, double}`) failed because the inliner did not generate the
+ * struct copy that the backend prologue normally performs.  The local
+ * for the parameter was left uninitialised (zero-filled), so the
+ * inlined body read all-zeros.
+ */
+typedef struct { double real; double imag; } Complex;
+
+Complex make_complex(double r, double i) {
+    Complex c;
+    c.real = r;
+    c.imag = i;
+    return c;
 }
+
+Complex add_complex(Complex a, Complex b) {
+    Complex c;
+    c.real = a.real + b.real;
+    c.imag = a.imag + b.imag;
+    return c;
+}
+
+Complex sub_complex(Complex a, Complex b) {
+    Complex c;
+    c.real = a.real - b.real;
+    c.imag = a.imag - b.imag;
+    return c;
+}
+
+static __attribute__((noinline)) int t_inline_two_sse_struct_param(void)
+{
+    Complex z1 = make_complex(3.0, 4.0);
+    if (z1.real != 3.0 || z1.imag != 4.0) return 1;
+
+    Complex z2 = make_complex(1.0, 2.0);
+    Complex z3 = add_complex(z1, z2);
+    if (z3.real != 4.0 || z3.imag != 6.0) return 2;
+
+    Complex z4 = sub_complex(z1, z2);
+    if (z4.real != 2.0 || z4.imag != 2.0) return 3;
+
+    /* Chained: add(sub(z1, z2), z2) == z1 */
+    Complex z5 = add_complex(sub_complex(z1, z2), z2);
+    if (z5.real != 3.0 || z5.imag != 4.0) return 4;
+
+    return 0;
+}
+
+/* ---- codegen_inline_large_struct_param: exits 54..55
+ * Bug AL: Inlining a function with a MEMORY-class struct parameter (>32 bytes,
+ * passed on stack) caused symaddr of the Arg pseudo to produce a pointer-to-pointer
+ * instead of the struct address. The fix converts symaddr-on-Arg to copy during
+ * inlining, since call_args already provides the struct address.
+ */
+typedef struct {
+    long a[16]; // 128 bytes, MEMORY class on x86-64
+} BigStruct;
+
+int convert(void *obj, BigStruct *out) {
+    out->a[0] = 42;
+    out->a[1] = 99;
+    return 1;
+}
+
+long use_big(int how, BigStruct s) {
+    return s.a[0] + s.a[1] + how;
+}
+
+static __attribute__((noinline)) int t_inline_large_struct_param(void)
+{
+    BigStruct local;
+    int ok = convert((void*)0x1234, &local);
+    if (!ok) return 1;
+    long result = use_big(10, local);
+    // 42 + 99 + 10 = 151
+    if (result != 151) return 2;
+    return 0;
+}
+
+int main(void)
+{
+    int r;
+    if ((r = t_inline_two_reg_struct_return()) != 0) return r;
+    if ((r = t_inline_multi_ret_phi_join()) != 0) return 6 + r;
+    if ((r = t_inline_m0_a_void_return()) != 0) return 13 + r;
+    if ((r = t_inline_m0_b_single_ret()) != 0) return 14 + r;
+    if ((r = t_inline_m0_c_ret_in_loop()) != 0) return 17 + r;
+    if ((r = t_inline_m0_d_internal_phi()) != 0) return 21 + r;
+    if ((r = t_inline_m0_e_multiple_calls()) != 0) return 25 + r;
+    if ((r = t_inline_m0_f_pointer_return()) != 0) return 29 + r;
+    if ((r = t_inline_m0_g_long_return()) != 0) return 35 + r;
+    if ((r = t_inline_m0_h_nested()) != 0) return 38 + r;
+    if ((r = t_inline_m0_j_consecutive_rets_in_block()) != 0) return 42 + r;
+    if ((r = t_inline_m0_i_mixed_noreturn()) != 0) return 46 + r;
+    if ((r = t_inline_two_sse_struct_param()) != 0) return 49 + r;
+    if ((r = t_inline_large_struct_param()) != 0) return 53 + r;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run_optimized("inlining_mega", code), 0);
+}
+
+// ============================================================================
+// M0 edge-case coverage (A–I)
+//
+// Each test isolates one shape of inlined `ret` lowering that M0 must handle.
+// They were written *after* M0 broke CPython at -O2 (asyncio hot paths) to
+// localize the regression to a fast, debuggable scope.
+// ============================================================================
 
 /// Regression test: inline asm with "+r" constraint on 64-bit value used 32-bit register.
 /// The xchg instruction in CPython's atomic store macro would truncate pointers.
@@ -564,12 +623,22 @@ int main(void) {
     assert_eq!(compile_and_run("inline_asm_64bit_constraint", code, &[]), 0);
 }
 
-/// Regression test: 2D char array initializers (e.g., char names[7][4] = {"Sun", ...})
-/// stored pointers to string constants instead of inline char data. The initializer
-/// treated each string as a `char*` (SymAddr) instead of `char[4]` (String).
+/// Array initializers and C99 inline definitions, one program run at the
+/// compile matrix levels.
+///
+/// Consolidates these tests, one section each (each original `main` is
+/// a `noinline` section function; the program exits with the section's
+/// base plus the original code):
+/// - `codegen_2d_char_array_init`: 1..=9
+/// - `codegen_inline_definition_constraint_only_binds_inline_definitions`: 10..=13
 #[test]
-fn codegen_2d_char_array_init() {
+fn codegen_inline_definitions_mega() {
     let code = r#"
+/* ---- codegen_2d_char_array_init: exits 1..9
+ * Regression test: 2D char array initializers (e.g., char names[7][4] = {"Sun", ...})
+ * stored pointers to string constants instead of inline char data. The initializer
+ * treated each string as a `char*` (SymAddr) instead of `char[4]` (String).
+ */
 #include <string.h>
 
 static const char wday[7][4] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
@@ -578,7 +647,8 @@ static const char mon[12][4] = {
     "Jul","Aug","Sep","Oct","Nov","Dec"
 };
 
-int main(void) {
+static __attribute__((noinline)) int t_2d_char_array_init(void)
+{
     if (strcmp(wday[0], "Sun") != 0) return 1;
     if (strcmp(wday[3], "Wed") != 0) return 2;
     if (strcmp(wday[6], "Sat") != 0) return 3;
@@ -594,100 +664,52 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("codegen_2d_char_array_init", code, &[]), 0);
+
+/* ---- codegen_inline_definition_constraint_only_binds_inline_definitions: exits 10..13
+ * C99 6.7.4p3 constrains an inline *definition*, not every non-static inline
+ * function.
+ *
+ * The rule exists so that the several inline definitions of a function cannot
+ * differ from each other or from the external one: an inline definition must
+ * not name an identifier with internal linkage, nor define a modifiable
+ * object with static storage duration. A definition that *is* the external
+ * definition -- because some declaration of it says `extern`, which is the
+ * standard idiom for providing one -- is an ordinary function, and gcc
+ * accepts what this used to reject outright.
+ */
+#include <stdio.h>
+
+static const int table[4] = {1, 2, 3, 4};
+static int counter;
+
+/* An `extern` declaration makes this the external definition. */
+inline int get(int i) { return table[i]; }
+extern int get(int);
+
+/* `extern inline` says the same thing up front. */
+extern inline int bump(void) { return ++counter; }
+
+/* A static inline may always reach a file-scope static. */
+static inline int twice(int i) { return table[i] * 2; }
+
+static __attribute__((noinline)) int t_inline_definition_constraint_only_binds_inline_definitions(void)
+{
+    if (get(2) != 3) return 1;
+    if (bump() != 1) return 2;
+    if (bump() != 2) return 3;
+    if (twice(3) != 8) return 4;
+    return 0;
 }
 
-/// Regression: inlining a function with two-SSE struct parameters (e.g.
-/// `{double, double}`) failed because the inliner did not generate the
-/// struct copy that the backend prologue normally performs.  The local
-/// for the parameter was left uninitialised (zero-filled), so the
-/// inlined body read all-zeros.
-#[test]
-fn codegen_inline_two_sse_struct_param() {
-    let code = r#"
-typedef struct { double real; double imag; } Complex;
-
-Complex make_complex(double r, double i) {
-    Complex c;
-    c.real = r;
-    c.imag = i;
-    return c;
-}
-
-Complex add_complex(Complex a, Complex b) {
-    Complex c;
-    c.real = a.real + b.real;
-    c.imag = a.imag + b.imag;
-    return c;
-}
-
-Complex sub_complex(Complex a, Complex b) {
-    Complex c;
-    c.real = a.real - b.real;
-    c.imag = a.imag - b.imag;
-    return c;
-}
-
-int main(void) {
-    Complex z1 = make_complex(3.0, 4.0);
-    if (z1.real != 3.0 || z1.imag != 4.0) return 1;
-
-    Complex z2 = make_complex(1.0, 2.0);
-    Complex z3 = add_complex(z1, z2);
-    if (z3.real != 4.0 || z3.imag != 6.0) return 2;
-
-    Complex z4 = sub_complex(z1, z2);
-    if (z4.real != 2.0 || z4.imag != 2.0) return 3;
-
-    /* Chained: add(sub(z1, z2), z2) == z1 */
-    Complex z5 = add_complex(sub_complex(z1, z2), z2);
-    if (z5.real != 3.0 || z5.imag != 4.0) return 4;
-
+int main(void)
+{
+    int r;
+    if ((r = t_2d_char_array_init()) != 0) return r;
+    if ((r = t_inline_definition_constraint_only_binds_inline_definitions()) != 0) return 9 + r;
     return 0;
 }
 "#;
-    assert_eq!(
-        compile_and_run_optimized("codegen_inline_two_sse_struct_param", code),
-        0
-    );
-}
-
-/// Bug AL: Inlining a function with a MEMORY-class struct parameter (>32 bytes,
-/// passed on stack) caused symaddr of the Arg pseudo to produce a pointer-to-pointer
-/// instead of the struct address. The fix converts symaddr-on-Arg to copy during
-/// inlining, since call_args already provides the struct address.
-#[test]
-fn codegen_inline_large_struct_param() {
-    let code = r#"
-typedef struct {
-    long a[16]; // 128 bytes, MEMORY class on x86-64
-} BigStruct;
-
-int convert(void *obj, BigStruct *out) {
-    out->a[0] = 42;
-    out->a[1] = 99;
-    return 1;
-}
-
-long use_big(int how, BigStruct s) {
-    return s.a[0] + s.a[1] + how;
-}
-
-int main() {
-    BigStruct local;
-    int ok = convert((void*)0x1234, &local);
-    if (!ok) return 1;
-    long result = use_big(10, local);
-    // 42 + 99 + 10 = 151
-    if (result != 151) return 2;
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run_optimized("codegen_inline_large_struct_param", code),
-        0
-    );
+    assert_eq!(compile_and_run("inline_definitions_mega", code, &[]), 0);
 }
 
 #[test]
@@ -723,169 +745,6 @@ int main(void) {
         compile_and_run("gp_live_across_inline_asm_clobber", code, &[]),
         0,
         "GP value corrupted across inline asm that declared the host register in its clobber list"
-    );
-}
-
-/// `__attribute__((noinline))` is a directive, not a hint.
-///
-/// It was recognized and then ignored, so a small function marked `noinline`
-/// was inlined anyway at `-O2` and the call disappeared. People reach for it
-/// to keep a frame on the stack, to keep a symbol callable, or to work around
-/// a miscompile -- none of which survive the size heuristic overruling them.
-#[test]
-fn codegen_noinline_is_honoured() {
-    let src = r#"
-static __attribute__((noinline)) int small(int x) { return x * 2; }
-/* the same function without the attribute, to show the size alone
-   would have had it inlined */
-static int small_ok(int x) { return x * 3; }
-
-int caller(int x) { return small(x) + small_ok(x); }
-"#;
-    for triple in [X86_64_LINUX, AARCH64_LINUX] {
-        let asm = asm_for_with("noinline", triple, src, &["-O2"]);
-        assert!(
-            asm.contains("small:"),
-            "{triple}: noinline function was not emitted:\n{asm}"
-        );
-        let calls = asm
-            .lines()
-            .filter(|l| {
-                let l = l.trim();
-                (l.starts_with("call") || l.starts_with("bl ")) && l.contains("small")
-            })
-            .count();
-        assert!(
-            calls >= 1,
-            "{triple}: noinline function was inlined away (no call survived):\n{asm}"
-        );
-        assert!(
-            !asm.contains("small_ok:") || calls >= 1,
-            "{triple}: unexpected shape:\n{asm}"
-        );
-    }
-}
-
-/// The attribute is honoured in either spelling and wherever it sits -- before
-/// or after the declaration specifiers, on the definition, or on nothing but
-/// an earlier prototype, which is how gcc treats it.
-#[test]
-fn codegen_noinline_spellings_and_placement() {
-    for src in [
-        "static __attribute__((noinline)) int f(int x) { return x + 1; }\nint g(int x){return f(x);}",
-        "__attribute__((noinline)) static int f(int x) { return x + 1; }\nint g(int x){return f(x);}",
-        "static int f(int x) __attribute__((noinline)) { return x + 1; }\nint g(int x){return f(x);}",
-        "static __attribute__((__noinline__)) int f(int x) { return x + 1; }\nint g(int x){return f(x);}",
-        "static int f(int x) __attribute__((noinline));\nstatic int f(int x) { return x + 1; }\nint g(int x){return f(x);}",
-    ] {
-        let asm = asm_for_with("noinline_spelling", X86_64_LINUX, src, &["-O2"]);
-        assert!(
-            asm.lines().any(|l| l.trim().starts_with("call") && l.contains('f')),
-            "no call survived for:\n{src}\n{asm}"
-        );
-    }
-}
-
-/// `always_inline` overrides the size heuristics, and applies at `-O0`.
-///
-/// Both halves are needed to match gcc. A body far over the inline threshold
-/// is still spliced in at `-O2`, and the attribute takes effect at `-O0`,
-/// where the inliner is otherwise switched off entirely -- code that reaches
-/// for the attribute (inline-asm wrappers, intrinsics headers) is relying on
-/// the body actually being there.
-#[test]
-fn codegen_always_inline_overrides_heuristics_and_o0() {
-    // Well past any size threshold: a plain `inline` hint would be refused.
-    let big: String = (1..120)
-        .map(|i| {
-            format!(
-                "    s += x*{i}; s ^= s << ({i}%7); s -= x/({}); s += x%({});\n",
-                i + 1,
-                i + 2
-            )
-        })
-        .collect();
-    let src = format!(
-        "static __attribute__((always_inline)) inline int huge(int x)\n\
-         {{\n    int s = 0;\n{big}    return s;\n}}\n\
-         int caller(int x) {{ return huge(x); }}\n"
-    );
-
-    for opt in ["-O0", "-O2"] {
-        let asm = asm_for_with("always_inline_big", X86_64_LINUX, &src, &[opt]);
-        assert!(
-            !asm.lines().any(|l| l.trim().starts_with("call huge")),
-            "{opt}: always_inline function was left as a call:\n{asm}"
-        );
-    }
-}
-
-/// The attribute is honoured in either spelling and from a prototype, and
-/// `noinline` beats it when both are present -- which is what gcc does, with a
-/// `-Wattributes` warning.
-#[test]
-fn codegen_always_inline_spellings_and_conflict() {
-    let inlined = [
-        "static __attribute__((always_inline)) inline int f(int x) { return x+1; }",
-        "static __attribute__((__always_inline__)) inline int f(int x) { return x+1; }",
-        "static inline int f(int x) __attribute__((always_inline));\n\
-         static inline int f(int x) { return x+1; }",
-    ];
-    for decl in inlined {
-        let src = format!("{decl}\nint g(int x){{return f(x);}}\n");
-        let asm = asm_for_with("always_inline_spelling", X86_64_LINUX, &src, &["-O0"]);
-        assert!(
-            !asm.lines().any(|l| l.trim().starts_with("call f")),
-            "call survived at -O0 for:\n{decl}\n{asm}"
-        );
-    }
-
-    // noinline wins: the call must survive even at -O2.
-    let src = "static __attribute__((noinline)) __attribute__((always_inline)) inline\n\
-               int f(int x) { return x+1; }\nint g(int x){return f(x);}\n";
-    let asm = asm_for_with("always_inline_conflict", X86_64_LINUX, src, &["-O2"]);
-    assert!(
-        asm.lines().any(|l| l.trim().starts_with("call f")),
-        "noinline must outrank always_inline:\n{asm}"
-    );
-}
-
-/// `always_inline` overrides the *desirability* heuristics, not the
-/// stack-safety guards.
-///
-/// The distinction is c17-specific and load-bearing. gcc can honour the
-/// attribute unconditionally because its frames are compact; c17 has no
-/// register promotion, so every inlined copy adds roughly eight bytes of
-/// stack, which is why `should_inline` caps growth into a recursive caller at
-/// `RECURSIVE_CALLER_MAX_STACK`. Inlining past that cap does not produce wrong
-/// code -- it exhausts the stack at a recursion depth the program's own guard
-/// thought was safe.
-///
-/// Found by the CPython gate: `test_isinstance` segfaulted in
-/// `test_infinitely_many_bases`, which recurses until it expects a
-/// `RecursionError`, once `always_inline` was allowed to bypass this check.
-/// CPython documents the same hazard in `Include/pyport.h`, noting that
-/// forcing inlining takes its per-call stack from 6 KB to 15 KB.
-#[test]
-fn codegen_always_inline_yields_to_the_recursive_stack_guard() {
-    // Big enough that caller_size * 8 clears RECURSIVE_CALLER_MAX_STACK --
-    // after simplification, so no statement may undo the ones before it: a
-    // shift by `i % 7` alone is `s ^= s` every seventh line.
-    let body: String = (1..200)
-        .map(|i| format!("    s += x*{i}; s ^= s << ({i}%7+1); s -= x/({});\n", i + 1))
-        .collect();
-    let src = format!(
-        "static __attribute__((always_inline)) inline int helper(int x)\n\
-         {{\n    int s = 0;\n{body}    return s;\n}}\n\
-         int rec(int n) {{ if (n <= 0) return 0; return helper(n) + rec(n-1); }}\n"
-    );
-
-    let asm = asm_for_with("always_inline_recursive", X86_64_LINUX, &src, &["-O2"]);
-    assert!(
-        asm.lines().any(|l| l.trim().starts_with("call helper")),
-        "always_inline must not inline into a recursive caller past the \
-         stack cap; the frame growth overflows the stack at a depth the \
-         program's own recursion guard considers safe:\n{asm}"
     );
 }
 
@@ -936,55 +795,6 @@ fn codegen_inline_header_with_one_extern_declaration() {
     );
 }
 
-/// The four inline spellings differ in whether they emit an external symbol.
-///
-/// Measured against gcc. Note C99 and GNU semantics are *opposite* for
-/// `extern inline`, which is exactly what `__gnu_inline__` selects:
-///
-/// | spelling                          | external definition? |
-/// |-----------------------------------|----------------------|
-/// | `static inline`                   | no (internal)        |
-/// | plain `inline`, no `extern` decl   | no                   |
-/// | `extern inline` (C99)             | yes                  |
-/// | `extern inline` + `__gnu_inline__` | no                   |
-#[test]
-fn codegen_inline_spellings_emit_the_right_symbols() {
-    let src = r#"
-static inline int si(int x) { return x + 1; }
-
-inline int pi(int x) { return x + 2; }
-
-extern int ei(int x);
-inline int ei(int x) { return x + 3; }
-
-extern __inline __attribute__((__gnu_inline__)) int gi(int x) { return x + 4; }
-
-/* Reference each one so nothing is dropped merely for being unused. */
-int use_all(int x) { return si(x) + pi(x) + ei(x) + gi(x); }
-"#;
-
-    for triple in [X86_64_LINUX, AARCH64_LINUX] {
-        let asm = asm_for_with("inline_spellings", triple, src, &["-O"]);
-
-        assert!(
-            asm.contains("ei:"),
-            "{triple}: C99 `extern inline` provides the external definition:\n{asm}"
-        );
-        assert!(
-            !asm.contains(".globl pi"),
-            "{triple}: a plain `inline` definition provides no external definition:\n{asm}"
-        );
-        assert!(
-            !asm.contains(".globl gi"),
-            "{triple}: `__gnu_inline__` provides no external definition:\n{asm}"
-        );
-        assert!(
-            !asm.contains(".globl si"),
-            "{triple}: `static inline` has internal linkage:\n{asm}"
-        );
-    }
-}
-
 /// An inline definition still has to *work* when it cannot be inlined.
 ///
 /// Taking a function's address forces an out-of-line body. For a plain
@@ -1007,68 +817,6 @@ int main(void) { return via_ptr(14) == 42 ? 0 : 1; }
         compile_and_run_two_units("inline_ptr", unit_a, unit_b, &[]),
         0
     );
-}
-
-/// An `extern` thread-local is in another object, so its offset is never known
-/// at link time -- Initial Exec regardless of build mode.
-#[test]
-fn codegen_extern_thread_local_always_uses_initial_exec() {
-    let src = r#"
-extern _Thread_local int ev;
-int read_ev(int x) { return x + ev; }
-"#;
-    let asm = asm_for_with("tls_extern", X86_64_LINUX, src, &["-O"]);
-    assert!(
-        asm.contains("@GOTTPOFF"),
-        "x86_64: extern TLS needs Initial Exec even in an executable:\n{asm}"
-    );
-    // aarch64 spells the same relocations `:gottprel:`/`:gottprel_lo12:`;
-    // x86-64's `gottpoff` there is rejected by the assembler.
-    let asm = asm_for_with("tls_extern", AARCH64_LINUX, src, &["-O"]);
-    assert!(
-        asm.contains(":gottprel:") && asm.contains(":gottprel_lo12:") && !asm.contains("gottpoff"),
-        "aarch64: extern TLS needs Initial Exec even in an executable:\n{asm}"
-    );
-}
-
-/// C99 6.7.4p3 constrains an inline *definition*, not every non-static inline
-/// function.
-///
-/// The rule exists so that the several inline definitions of a function cannot
-/// differ from each other or from the external one: an inline definition must
-/// not name an identifier with internal linkage, nor define a modifiable
-/// object with static storage duration. A definition that *is* the external
-/// definition -- because some declaration of it says `extern`, which is the
-/// standard idiom for providing one -- is an ordinary function, and gcc
-/// accepts what this used to reject outright.
-#[test]
-fn codegen_inline_definition_constraint_only_binds_inline_definitions() {
-    let src = r#"
-#include <stdio.h>
-
-static const int table[4] = {1, 2, 3, 4};
-static int counter;
-
-/* An `extern` declaration makes this the external definition. */
-inline int get(int i) { return table[i]; }
-extern int get(int);
-
-/* `extern inline` says the same thing up front. */
-extern inline int bump(void) { return ++counter; }
-
-/* A static inline may always reach a file-scope static. */
-static inline int twice(int i) { return table[i] * 2; }
-
-int main(void)
-{
-    if (get(2) != 3) return 1;
-    if (bump() != 1) return 2;
-    if (bump() != 2) return 3;
-    if (twice(3) != 8) return 4;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("inline_extern_definition", src, &[]), 0);
 }
 
 /// An `.init_array` entry must name a symbol that was emitted.
@@ -1200,23 +948,39 @@ int main(void)
     }
 }
 
-/// An aggregate that fits in one register travels *as* its value: the argument
-/// pseudo holds the data, not a pointer to it. The inliner's implicit
-/// parameter copies — which stand in for the backend prologue when a callee is
-/// inlined — always loaded *through* the argument, so a `struct { float a, b; }`
-/// became a wild pointer spelled by two floats and the inlined body segfaulted
-/// on its first read.
+/// Inlined aggregate parameters, switches, `alloca` and zeroing, one
+/// program run at the compile matrix levels and at -O1
+/// (`compile_and_run_optimized`).
 ///
-/// This is #C38, and it took a sharper case than the one recorded against it:
-/// the shape in the audit had a *double* HFA on the stack, which is 16 bytes
-/// and does travel by address, so it worked. It needs a float one.
+/// Each original `main` is a `noinline` section function with its helper
+/// names kept distinct, so each call site is inlined as it was alone.
 ///
-/// aarch64 at `-O2` only — `-O0` and `noinline` were both fine, which is what
-/// made it look like an ABI bug rather than an inlining one. Values checked
-/// against `aarch64-linux-gnu-gcc`.
+/// Consolidates these tests, one section each (each original `main` is
+/// a `noinline` section function; the program exits with the section's
+/// base plus the original code):
+/// - `codegen_inlined_register_sized_aggregate_param`: 1..=6
+/// - `codegen_wide_switch_survives_inlining`: 7..=12
+/// - `codegen_over_aligned_locals_survive_alloca`: 13..=17
+/// - `codegen_aggregate_zero_across_the_inline_threshold`: 18..=24
 #[test]
-fn codegen_inlined_register_sized_aggregate_param() {
+fn codegen_inlined_bodies_mega() {
     let code = r#"
+/* ---- codegen_inlined_register_sized_aggregate_param: exits 1..6
+ * An aggregate that fits in one register travels *as* its value: the argument
+ * pseudo holds the data, not a pointer to it. The inliner's implicit
+ * parameter copies — which stand in for the backend prologue when a callee is
+ * inlined — always loaded *through* the argument, so a `struct { float a, b; }`
+ * became a wild pointer spelled by two floats and the inlined body segfaulted
+ * on its first read.
+ *
+ * This is #C38, and it took a sharper case than the one recorded against it:
+ * the shape in the audit had a *double* HFA on the stack, which is 16 bytes
+ * and does travel by address, so it worked. It needs a float one.
+ *
+ * aarch64 at `-O2` only — `-O0` and `noinline` were both fine, which is what
+ * made it look like an ABI bug rather than an inlining one. Values checked
+ * against `aarch64-linux-gnu-gcc`.
+ */
 #include <stdio.h>
 
 typedef struct { float a, b; } F2;
@@ -1240,7 +1004,8 @@ static double f1(F4 p, F4 q, D2 r) { return p.a + p.d + q.a + q.d + r.a + r.b; }
 static double f2(F4 p, F4 q, F3 r) { return p.a + q.a + r.a + r.c; }
 static double f4(F4 p, F4 q, D2 r, S24 s) { return p.a + q.a + r.a + (double)s.z; }
 
-int main(void) {
+static __attribute__((noinline)) int t_inlined_register_sized_aggregate_param(void)
+{
     F4 p = {1,2,3,4}, q = {5,6,7,8};
     F3 t3 = {1,2,3};
     D2 r = {9,10};
@@ -1259,31 +1024,20 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("codegen_inlined_register_sized_aggregate_param", code, &[]),
-        0
-    );
-    assert_eq!(
-        compile_and_run_optimized("codegen_inlined_register_sized_aggregate_param_opt", code),
-        0
-    );
-}
 
-/// A wide switch keeps its width through inlining.
-///
-/// The inliner builds a fresh `Switch` instruction rather than cloning one, so
-/// everything it needs has to be carried over by hand — and the operation
-/// width was not. Once inlined, a 64-bit switch was compared in 32 bits, so
-/// `case 4294967296ul:` matched 0.
-///
-/// Pre-existing, and invisible for a long time because an equality compare on
-/// the low half agrees with the full compare unless the constants collide
-/// there. A `case lo ... hi` range made it plain: its subtraction exposes the
-/// top half every time.
-#[test]
-fn codegen_wide_switch_survives_inlining() {
-    let code = r#"
+/* ---- codegen_wide_switch_survives_inlining: exits 7..12
+ * A wide switch keeps its width through inlining.
+ *
+ * The inliner builds a fresh `Switch` instruction rather than cloning one, so
+ * everything it needs has to be carried over by hand — and the operation
+ * width was not. Once inlined, a 64-bit switch was compared in 32 bits, so
+ * `case 4294967296ul:` matched 0.
+ *
+ * Pre-existing, and invisible for a long time because an equality compare on
+ * the low half agrees with the full compare unless the constants collide
+ * there. A `case lo ... hi` range made it plain: its subtraction exposes the
+ * top half every time.
+ */
 static int hit(unsigned long x)
 {
     switch (x) { case 4294967296ul: return 1; default: return 0; }
@@ -1302,7 +1056,7 @@ static int wide_label(long x)
     switch (x) { case -4294967296L: return 1; default: return 0; }
 }
 
-int main(void)
+static __attribute__((noinline)) int t_wide_switch_survives_inlining(void)
 {
     /* The low 32 bits of 2^32 are zero, so a 32-bit compare says these match. */
     if (!hit(4294967296ul)) return 1;
@@ -1315,81 +1069,22 @@ int main(void)
     if (wide_label(0)) return 6;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("wide_switch_inline", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("wide_switch_inline_opt", code), 0);
-}
 
-/// Inlining a body that `alloca`s must not extend the allocation's lifetime.
-///
-/// A real call releases the memory when it returns. Splicing the body in would
-/// instead hold it until the *caller* returns, so a loop around the call takes
-/// another bite of the stack every iteration -- half a million of them
-/// overflows it. The splice brackets the body with a stack-pointer save and
-/// restore, which is the lifetime the call had.
-///
-/// `alloca` used to disqualify the callee outright, which hid this; the
-/// refusal was silent, and gcc inlines these.
-#[test]
-fn codegen_inlined_alloca_is_released_per_call() {
-    let code = r#"
-__attribute__((always_inline)) static inline long use(int n) {
-    char *p = __builtin_alloca(n);
-    for (int i = 0; i < n; i++) p[i] = (char)(i & 7);
-    return p[n - 1];
-}
-
-/* Two inlined allocas in one expression, so the brackets have to nest
-   correctly rather than merely balance overall. */
-static long deep(int n) { return use(n) + use(n * 2); }
-
-/* Leaves before the end of the body on half its calls. Both exits have to
-   release the stack, or the loop below overflows. */
-__attribute__((always_inline)) static inline int early(int i) {
-    char *p = __builtin_alloca(512);
-    p[0] = (char)(i & 1);
-    if (p[0]) return 1;
-    p[511] = 0;
-    return 0;
-}
-
-int main(void) {
-    long t = 0;
-    for (int i = 0; i < 500000; i++) t += use(256);
-    if (t != 500000L * 7) return 1;
-    if (deep(8) != 7 + 7) return 2;
-
-    /* An early return out of the inlined body still reaches the restore,
-       since every path leaves through the continuation block. */
-    for (int i = 0; i < 500000; i++) {
-        if (early(i) != (i & 1)) return 3;
-    }
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("inlined_alloca_lifetime", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("inlined_alloca_lifetime_opt", code),
-        0
-    );
-}
-
-/// An over-aligned local keeps its address when `%rsp` moves under it.
-///
-/// A local wanting more than 16-byte alignment cannot be reached from `%rbp`,
-/// which the ABI only guarantees to 16, so the prologue rounds a base up and
-/// addresses every local from that. x86-64 used `%rsp` itself as that base --
-/// correct at the instant the prologue's `andq` runs, and wrong from the first
-/// thing that moves it. `alloca` moves it, and the locals shifted out from
-/// under their own addresses: the store of one local landed on top of another.
-///
-/// Both ways in are covered. The caller need not contain an `alloca` of its
-/// own -- the inliner splices callees that do into callers that do not -- and
-/// the direct form was broken at every optimization level, not just where
-/// inlining runs.
-#[test]
-fn codegen_over_aligned_locals_survive_alloca() {
-    let code = r#"
+/* ---- codegen_over_aligned_locals_survive_alloca: exits 13..17
+ * An over-aligned local keeps its address when `%rsp` moves under it.
+ *
+ * A local wanting more than 16-byte alignment cannot be reached from `%rbp`,
+ * which the ABI only guarantees to 16, so the prologue rounds a base up and
+ * addresses every local from that. x86-64 used `%rsp` itself as that base --
+ * correct at the instant the prologue's `andq` runs, and wrong from the first
+ * thing that moves it. `alloca` moves it, and the locals shifted out from
+ * under their own addresses: the store of one local landed on top of another.
+ *
+ * Both ways in are covered. The caller need not contain an `alloca` of its
+ * own -- the inliner splices callees that do into callers that do not -- and
+ * the direct form was broken at every optimization level, not just where
+ * inlining runs.
+ */
 int printf(const char *, ...);
 
 static int use(int n) {
@@ -1454,7 +1149,8 @@ static int vla_form(int n) {
     return 0;
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_over_aligned_locals_survive_alloca(void)
+{
     if (inlined_form() != 0) return 1;
     if (direct_form(16) != 0) return 2;
     if (direct_form(64) != 0) return 3;
@@ -1462,10 +1158,132 @@ int main(void) {
     if (vla_form(9) != 0) return 5;
     return 0;
 }
+
+/* ---- codegen_aggregate_zero_across_the_inline_threshold: exits 18..24
+ * Zero-initializing an aggregate, across the size at which unrolling stops.
+ *
+ * The companion to `codegen_struct_copy_across_the_inline_threshold`, for the
+ * other half of the same family. `emit_aggregate_zero` hand-rolled the same
+ * 8/4/2/1 descent that `memexpand::block_chunks` already produces, but with
+ * **no upper bound** — so `char buf[N] = {0}` emitted one store per chunk for
+ * any N. Measured before the fix: 8 KB cost 2081 instructions in the function
+ * body and 1 MB did not finish compiling in 25 minutes, while its sibling
+ * `emit_block_copy_at_offset` had capped at `INLINE_LIMIT_BYTES` all along.
+ *
+ * The declaration is inside a loop on purpose. On entry the backend zeroes the
+ * whole frame, which masks a missing zero-fill the first time through; only
+ * re-execution shows it.
+ *
+ * Sizes straddle 128 and none is a multiple of 8, so a rounded-up or
+ * short-by-a-tail fill shows as a wrong byte rather than passing by luck.
+ */
+void sink(char *p);
+
+#define MKZ(N)                                                            \
+    static int zero##N(void) {                                            \
+        for (int pass = 0; pass < 2; pass++) {                            \
+            unsigned char lo = 0xA5;                                      \
+            char buf[N] = {0};                                            \
+            unsigned char hi = 0x5A;                                      \
+            for (int i = 0; i < N; i++)                                   \
+                if (buf[i] != 0) return 1;                                \
+            if (lo != 0xA5 || hi != 0x5A) return 2;                       \
+            for (int i = 0; i < N; i++) buf[i] = (char)(i + 1);           \
+            sink(buf);                                                    \
+        }                                                                 \
+        return 0;                                                         \
+    }
+
+MKZ(7)
+MKZ(12)
+MKZ(13)
+MKZ(127)
+MKZ(129)
+MKZ(200)
+MKZ(1000)
+
+void sink(char *p) { (void)p; }
+
+static __attribute__((noinline)) int t_aggregate_zero_across_the_inline_threshold(void)
+{
+    if (zero7()) return 1;
+    if (zero12()) return 2;
+    if (zero13()) return 3;
+    if (zero127()) return 4;
+    if (zero129()) return 5;
+    if (zero200()) return 6;
+    if (zero1000()) return 7;
+    return 0;
+}
+#undef MKZ
+
+int main(void)
+{
+    int r;
+    if ((r = t_inlined_register_sized_aggregate_param()) != 0) return r;
+    if ((r = t_wide_switch_survives_inlining()) != 0) return 6 + r;
+    if ((r = t_over_aligned_locals_survive_alloca()) != 0) return 12 + r;
+    if ((r = t_aggregate_zero_across_the_inline_threshold()) != 0) return 17 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("over_aligned_alloca", code, &[]), 0);
+    assert_eq!(compile_and_run("inlined_bodies_mega", code, &[]), 0);
     assert_eq!(
-        compile_and_run_optimized("over_aligned_alloca_opt", code),
+        compile_and_run_optimized("inlined_bodies_mega_opt", code),
+        0
+    );
+}
+
+/// Inlining a body that `alloca`s must not extend the allocation's lifetime.
+///
+/// A real call releases the memory when it returns. Splicing the body in would
+/// instead hold it until the *caller* returns, so a loop around the call takes
+/// another bite of the stack every iteration -- half a million of them
+/// overflows it. The splice brackets the body with a stack-pointer save and
+/// restore, which is the lifetime the call had.
+///
+/// `alloca` used to disqualify the callee outright, which hid this; the
+/// refusal was silent, and gcc inlines these.
+#[test]
+fn codegen_inlined_alloca_is_released_per_call() {
+    let code = r#"
+__attribute__((always_inline)) static inline long use(int n) {
+    char *p = __builtin_alloca(n);
+    for (int i = 0; i < n; i++) p[i] = (char)(i & 7);
+    return p[n - 1];
+}
+
+/* Two inlined allocas in one expression, so the brackets have to nest
+   correctly rather than merely balance overall. */
+static long deep(int n) { return use(n) + use(n * 2); }
+
+/* Leaves before the end of the body on half its calls. Both exits have to
+   release the stack, or the loop below overflows. */
+__attribute__((always_inline)) static inline int early(int i) {
+    char *p = __builtin_alloca(512);
+    p[0] = (char)(i & 1);
+    if (p[0]) return 1;
+    p[511] = 0;
+    return 0;
+}
+
+int main(void) {
+    long t = 0;
+    for (int i = 0; i < 500000; i++) t += use(256);
+    if (t != 500000L * 7) return 1;
+    if (deep(8) != 7 + 7) return 2;
+
+    /* An early return out of the inlined body still reaches the restore,
+       since every path leaves through the continuation block. */
+    for (int i = 0; i < 500000; i++) {
+        if (early(i) != (i & 1)) return 3;
+    }
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("inlined_alloca_lifetime", code, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("inlined_alloca_lifetime_opt", code),
         0
     );
 }
@@ -1749,47 +1567,6 @@ int main(void) {
     }
 }
 
-/// A `weak` definition may be replaced at link time, so its body is not
-/// authoritative and must never be spliced into a caller.
-///
-/// The inliner consulted nothing about weakness, so a small weak function was
-/// inlined on the same terms as a strong one and the interposing definition
-/// simply never ran. Asserted on assembly because a single translation unit
-/// cannot exhibit interposition: the property is that the *call* survives.
-#[test]
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn codegen_weak_definition_is_not_inlined() {
-    let asm = crate::common::asm_for_at(
-        "c17_weak_noinline_",
-        r#"
-__attribute__((weak)) int impl(void) { return 1; }
-/* Static, so interposition cannot apply and it may still be inlined. */
-__attribute__((weak)) static int local_impl(void) { return 2; }
-int call_weak(void) { return impl(); }
-int call_weak_static(void) { return local_impl(); }
-"#,
-        &["-O2"],
-    );
-    let weak_caller = asm.split("\ncall_weak:").nth(1).unwrap_or_default();
-    assert!(
-        weak_caller.contains("call\timpl") || weak_caller.contains("call impl"),
-        "an interposable definition must still be called:\n{weak_caller}"
-    );
-    // The `static` one has internal linkage, so nothing can replace it and the
-    // attribute does not bar inlining.
-    let static_caller = asm
-        .split("\ncall_weak_static:")
-        .nth(1)
-        .unwrap_or_default()
-        .split("\n\t.size")
-        .next()
-        .unwrap_or_default();
-    assert!(
-        !static_caller.contains("local_impl"),
-        "a weak *static* cannot be interposed, so it may be inlined:\n{static_caller}"
-    );
-}
-
 /// `__typeof__` names a type, never a storage class. The declaration-specifier
 /// parser carried the operand's `static`/`extern`/`_Thread_local` into the
 /// new declaration, so `__typeof__(g) c = 0;` inside a function silently made
@@ -2067,71 +1844,6 @@ int main(void)
 }
 "#;
     compile_and_run_everywhere("inlined_label_address", src);
-}
-
-/// Zero-initializing an aggregate, across the size at which unrolling stops.
-///
-/// The companion to `codegen_struct_copy_across_the_inline_threshold`, for the
-/// other half of the same family. `emit_aggregate_zero` hand-rolled the same
-/// 8/4/2/1 descent that `memexpand::block_chunks` already produces, but with
-/// **no upper bound** — so `char buf[N] = {0}` emitted one store per chunk for
-/// any N. Measured before the fix: 8 KB cost 2081 instructions in the function
-/// body and 1 MB did not finish compiling in 25 minutes, while its sibling
-/// `emit_block_copy_at_offset` had capped at `INLINE_LIMIT_BYTES` all along.
-///
-/// The declaration is inside a loop on purpose. On entry the backend zeroes the
-/// whole frame, which masks a missing zero-fill the first time through; only
-/// re-execution shows it.
-///
-/// Sizes straddle 128 and none is a multiple of 8, so a rounded-up or
-/// short-by-a-tail fill shows as a wrong byte rather than passing by luck.
-#[test]
-fn codegen_aggregate_zero_across_the_inline_threshold() {
-    let code = r#"
-void sink(char *p);
-
-#define MKZ(N)                                                            \
-    static int zero##N(void) {                                            \
-        for (int pass = 0; pass < 2; pass++) {                            \
-            unsigned char lo = 0xA5;                                      \
-            char buf[N] = {0};                                            \
-            unsigned char hi = 0x5A;                                      \
-            for (int i = 0; i < N; i++)                                   \
-                if (buf[i] != 0) return 1;                                \
-            if (lo != 0xA5 || hi != 0x5A) return 2;                       \
-            for (int i = 0; i < N; i++) buf[i] = (char)(i + 1);           \
-            sink(buf);                                                    \
-        }                                                                 \
-        return 0;                                                         \
-    }
-
-MKZ(7)
-MKZ(12)
-MKZ(13)
-MKZ(127)
-MKZ(129)
-MKZ(200)
-MKZ(1000)
-
-void sink(char *p) { (void)p; }
-
-int main(void)
-{
-    if (zero7()) return 1;
-    if (zero12()) return 2;
-    if (zero13()) return 3;
-    if (zero127()) return 4;
-    if (zero129()) return 5;
-    if (zero200()) return 6;
-    if (zero1000()) return 7;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("aggregate_zero_threshold", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("aggregate_zero_threshold_opt", code),
-        0
-    );
 }
 
 /// The inliner moves an implicit parameter copy in whole eight-byte chunks,

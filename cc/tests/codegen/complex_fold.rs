@@ -14,111 +14,7 @@
 // wherever an operand or the result is an infinity or a NaN.
 //
 
-use crate::codegen::asm_probe::{asm_for_with, AARCH64_DARWIN, AARCH64_LINUX, X86_64_LINUX};
 use crate::common::{aarch64_cross_available, compile_and_run, compile_and_run_aarch64};
-
-/// A constant product and quotient in every floating format, at `TY`.
-const CONSTANT: &str = "
-    TY _Complex mul(void) {
-        TY _Complex a = __builtin_complex((TY)1.0, (TY)2.0);
-        TY _Complex b = __builtin_complex((TY)3.0, (TY)-1.0);
-        return a * b;
-    }
-    TY _Complex quo(void) {
-        TY _Complex a = __builtin_complex((TY)1.0, (TY)1.0);
-        TY _Complex b = __builtin_complex((TY)3.0, (TY)7.0);
-        return a / b;
-    }
-    TY _Complex both(void) {
-        TY _Complex a = __builtin_complex((TY)0.1, (TY)0.2), b = __builtin_complex((TY)3.0, (TY)0.5);
-        a *= b;
-        return a / b;
-    }
-";
-
-/// The formats each target computes complex `*` and `/` in, and the routine
-/// each calls at run time.
-const FORMATS: [(&str, &str, &str); 10] = [
-    (X86_64_LINUX, "float", "sc3"),
-    (X86_64_LINUX, "double", "dc3"),
-    (X86_64_LINUX, "long double", "xc3"),
-    (X86_64_LINUX, "_Float16", "sc3"),
-    (X86_64_LINUX, "_Float128", "tc3"),
-    (AARCH64_LINUX, "float", "sc3"),
-    (AARCH64_LINUX, "double", "dc3"),
-    (AARCH64_LINUX, "long double", "tc3"),
-    (AARCH64_LINUX, "_Float16", "sc3"),
-    (AARCH64_LINUX, "_Float128", "tc3"),
-];
-
-/// With the optimizer, no routine is called for constant operands; the
-/// `_Float16` ones widen to `float` for `__mulsc3`, and on x86-64 their
-/// conversions are calls too, which must not stand in the way.
-#[test]
-fn constant_complex_mul_and_div_leave_no_call() {
-    for (triple, ty, routine) in FORMATS {
-        let src = CONSTANT.replace("TY", ty);
-        for opt in ["-O1", "-O2"] {
-            let asm = asm_for_with("cfold", triple, &src, &[opt]);
-            for callee in ["__mul", "__div", "__extendhf", "__trunc"] {
-                assert!(
-                    !asm.contains(callee),
-                    "{triple} {ty} {opt}: {callee} should have folded away:\n{asm}"
-                );
-            }
-        }
-        let asm = asm_for_with("cfold_o0", triple, &src, &["-O0"]);
-        for op in ["__mul", "__div"] {
-            assert!(
-                asm.contains(&format!("{op}{routine}")),
-                "{triple} {ty} -O0: {op}{routine} is the program's own call:\n{asm}"
-            );
-        }
-    }
-}
-
-/// An infinite or NaN operand, a zero divisor and a product that overflows
-/// are left to the routine, which raises what they raise.
-#[test]
-fn what_the_routine_must_compute_stays_a_call() {
-    let src = "
-        double _Complex by_inf(void) {
-            double _Complex a = __builtin_complex(__builtin_inf(), 1.0);
-            return a * __builtin_complex(1.0, 1.0);
-        }
-        double _Complex by_nan(void) {
-            double _Complex a = __builtin_complex(__builtin_nan(\"\"), 1.0);
-            return a / __builtin_complex(1.0, 1.0);
-        }
-        double _Complex by_zero(void) {
-            double _Complex a = __builtin_complex(1.0, 1.0);
-            return a / __builtin_complex(0.0, 0.0);
-        }
-        double _Complex overflows(void) {
-            double _Complex a = __builtin_complex(1e300, 1e300);
-            return a * a;
-        }
-    ";
-    for triple in [X86_64_LINUX, AARCH64_LINUX] {
-        let asm = asm_for_with("cfold_special", triple, src, &["-O2"]);
-        for callee in ["__muldc3", "__divdc3"] {
-            assert!(
-                asm.matches(callee).count() >= 2,
-                "{triple}: {callee} must stay for each special operand:\n{asm}"
-            );
-        }
-    }
-    // Darwin's routines are compiler-rt's, which c17 models beside
-    // libgcc's, so a constant folds there as it does anywhere else.
-    let src = CONSTANT.replace("TY", "double");
-    let asm = asm_for_with("cfold_darwin", AARCH64_DARWIN, &src, &["-O2"]);
-    for callee in ["___muldc3", "___divdc3"] {
-        assert!(
-            !asm.contains(callee),
-            "Darwin folds a constant rather than calling {callee}:\n{asm}"
-        );
-    }
-}
 
 /// Every product and quotient folded from constants, against the same
 /// operations on `volatile` operands and against libgcc's routine called
@@ -196,34 +92,101 @@ const FLOAT: &str = "CASE(1e30, 1e30, 1e30, 1e30) CASE(1e-30, 2e-30, 3e-30, 4e-3
     CASE(3e38, 3e38, 3e38, 3e38) CASE(1e-40, 1e-40, 1e-40, 1e-40)";
 const HALF: &str = "CASE(60000, 60000, 60000, 60000) CASE(0.00001, 0.00002, 0.00003, 0.00004)";
 
-/// `EXACT` for `ty`, whose routine takes `rty` halves (`float` for
-/// `_Float16`) and is `__mulRc3`/`__divRc3`.
-fn exact(ty: &str, rty: &str, r: &str, bytes: u32, extra: &str) -> String {
-    let defs = format!(
-        "#define TY {ty}\n#define RTY {rty}\n#define MULFN __mul{r}c3\n\
-         #define DIVFN __div{r}c3\n#define BYTES {bytes}\n#define EXTRA {extra}\n"
-    );
-    defs + EXACT
+/// One format for `EXACT`: the type, the type its routine takes halves of
+/// (`float` for `_Float16`), the routine's letter in `__mulRc3`/`__divRc3`,
+/// the bytes of a half that are its value, and the extra cases.
+type Format = (&'static str, &'static str, &'static str, u32, &'static str);
+
+/// The names `EXACT` and `F16_EXACT` define at file scope. Each section of
+/// the program `exact_all` builds renames them with a `#define`, so one
+/// program holds every format.
+const EXACT_NAMES: [&str; 5] = ["ty", "cty", "n", "same", "check"];
+
+/// The macros `EXACT` and its parameters define, undone after each section.
+const EXACT_MACROS: [&str; 10] = [
+    "TY", "RTY", "MULFN", "DIVFN", "BYTES", "EXTRA", "C", "CASE", "INF", "NAN",
+];
+
+/// How far apart the sections' exit codes are: `EXACT` returns the number of
+/// its first disagreeing case, at most 28.
+const SECTION_CODES: i32 = 30;
+
+/// One section of [`exact_all`]: `body`, whose `int main(void)` becomes
+/// section `k`'s function, with its file-scope names renamed.
+fn exact_section(k: usize, defs: &str, body: &str) -> String {
+    let mut s = String::new();
+    for name in EXACT_NAMES {
+        s.push_str(&format!("#define {name} {name}_{k}\n"));
+    }
+    s.push_str(defs);
+    s.push_str(&body.replacen(
+        "int main(void)",
+        &format!("__attribute__((noinline)) static int exact_{k}(void)"),
+        1,
+    ));
+    for name in EXACT_NAMES.iter().chain(EXACT_MACROS.iter()) {
+        s.push_str(&format!("#undef {name}\n"));
+    }
+    s
+}
+
+/// `EXACT` for every format in `formats`, followed by `tail` (a program with
+/// the same shape, or nothing), as one program. Section `k` exits with
+/// `k * SECTION_CODES` plus the number of its first case that disagrees.
+fn exact_all(formats: &[Format], tail: Option<&str>) -> String {
+    let mut src = String::from("#include <string.h>\n");
+    let mut sections = 0;
+    for (k, (ty, rty, r, bytes, extra)) in formats.iter().enumerate() {
+        let defs = format!(
+            "#define TY {ty}\n#define RTY {rty}\n#define MULFN __mul{r}c3\n\
+             #define DIVFN __div{r}c3\n#define BYTES {bytes}\n#define EXTRA {extra}\n"
+        );
+        src.push_str(&exact_section(k, &defs, EXACT));
+        sections += 1;
+    }
+    if let Some(tail) = tail {
+        src.push_str(&exact_section(sections, "", tail));
+        sections += 1;
+    }
+    src.push_str("int main(void)\n{\n    int r;\n");
+    for k in 0..sections {
+        src.push_str(&format!(
+            "    if ((r = exact_{k}())) return {} + r;\n",
+            k as i32 * SECTION_CODES
+        ));
+    }
+    src.push_str("    return 0;\n}\n");
+    src
+}
+
+/// Which section, and which case in it, an exit code from [`exact_all`] is.
+fn exact_failure(code: i32, formats: &[Format]) -> String {
+    let k = (code / SECTION_CODES) as usize;
+    let what = formats.get(k).map_or("_Float16 arithmetic", |f| f.0);
+    format!("{what}: case {} disagrees", code % SECTION_CODES)
 }
 
 /// On the host, where libgcc is the runtime: x86-64 Linux.
+///
+/// Also `float16_folds_exactly_on_x86_64`: `_Float16` folded from constants
+/// and computed from `volatile` operands on the host, bit for bit -- the
+/// last section of the same program.
 #[test]
 fn complex_folds_exactly_on_x86_64() {
     if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
         return;
     }
-    for (ty, rty, r, bytes, extra) in [
+    let formats: [Format; 5] = [
         ("float", "float", "s", 4, FLOAT),
         ("double", "double", "d", 8, WIDE),
         ("long double", "long double", "x", 10, WIDE),
         ("_Float16", "float", "s", 2, HALF),
         ("_Float128", "_Float128", "t", 16, WIDE),
-    ] {
-        let src = exact(ty, rty, r, bytes, extra);
-        for opt in ["-O0", "-O2"] {
-            let code = compile_and_run("cfold_exact", &src, &[opt.to_string()]);
-            assert_eq!(code, 0, "{ty} {opt}: case {code} disagrees");
-        }
+    ];
+    let src = exact_all(&formats, Some(F16_EXACT));
+    for opt in ["-O0", "-O2"] {
+        let code = compile_and_run("cfold_exact", &src, &[opt.to_string()]);
+        assert_eq!(code, 0, "{opt}: {}", exact_failure(code, &formats));
     }
 }
 
@@ -234,60 +197,35 @@ fn complex_folds_exactly_on_aarch64() {
         eprintln!("skipping: no aarch64 cross toolchain");
         return;
     }
-    for (ty, rty, r, bytes, extra) in [
+    let formats: [Format; 5] = [
         ("float", "float", "s", 4, FLOAT),
         ("double", "double", "d", 8, WIDE),
         ("long double", "long double", "t", 16, WIDE),
         ("_Float16", "float", "s", 2, HALF),
         ("_Float128", "_Float128", "t", 16, WIDE),
-    ] {
-        let src = exact(ty, rty, r, bytes, extra);
+    ];
+    // Two programs: `long double` and `_Float128` are distinct types that
+    // share the binary128 routines here, so one unit cannot declare
+    // `__multc3` for both.
+    for part in [&formats[..4], &formats[4..]] {
+        let src = exact_all(part, None);
         for opt in ["-O0", "-O2"] {
             let code = compile_and_run_aarch64("cfold_exact_a64", &src, opt);
-            assert_eq!(code, Some(0), "{ty} {opt}: case {code:?} disagrees");
-        }
-    }
-}
-
-/// x86-64 has no half-precision instructions, and its `_Float16`
-/// arithmetic, comparisons and conversions are libgcc calls -- made after the
-/// optimizer, which folds the constant ones first. Without the optimizer
-/// they are still the calls.
-#[test]
-fn float16_constants_fold_before_the_libcalls_on_x86_64() {
-    let src = "
-        extern void link_error(void);
-        _Float16 h(void) { return (_Float16)1.5 * (_Float16)3.0 - (_Float16)0.25; }
-        void f(void) {
-            if ((_Float16)1.0 + (_Float16)2.0 != (_Float16)3.0) link_error();
-            if ((float)((_Float16)1.0 / (_Float16)3.0) != 0x1.554p-2f) link_error();
-            if ((int)(_Float16)7.75 != 7) link_error();
-            if (!((_Float16)-1.0 < (_Float16)0.0)) link_error();
-        }
-    ";
-    for opt in ["-O1", "-O2"] {
-        let asm = asm_for_with("f16_fold", X86_64_LINUX, src, &[opt]);
-        for callee in ["link_error", "__extendhf", "__trunc"] {
-            assert!(
-                !asm.contains(callee),
-                "{opt}: {callee} should have folded away:\n{asm}"
+            assert_eq!(
+                code,
+                Some(0),
+                "{opt}: {}",
+                code.map_or_else(|| "no exit code".to_string(), |c| exact_failure(c, part))
             );
         }
-    }
-    let asm = asm_for_with("f16_o0", X86_64_LINUX, src, &["-O0"]);
-    for callee in ["__extendhfsf2", "__truncsfhf2"] {
-        assert!(asm.contains(callee), "-O0 calls {callee}:\n{asm}");
     }
 }
 
 /// `_Float16` folded from constants and computed from `volatile` operands
-/// on the host, bit for bit.
-#[test]
-fn float16_folds_exactly_on_x86_64() {
-    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        return;
-    }
-    let src = r#"
+/// on the host, bit for bit. Run as the last section of
+/// `complex_folds_exactly_on_x86_64`'s program; returns the number of the
+/// first check that disagrees.
+const F16_EXACT: &str = r#"
         #include <string.h>
         static int n;
         static int same(_Float16 c, _Float16 r) { n++; return memcmp(&c, &r, 2) == 0; }
@@ -308,11 +246,6 @@ fn float16_folds_exactly_on_x86_64() {
             return 0;
         }
     "#;
-    for opt in ["-O0", "-O2"] {
-        let code = compile_and_run("f16_exact", src, &[opt.to_string()]);
-        assert_eq!(code, 0, "{opt}: check {code} disagrees");
-    }
-}
 
 /// A folded product or quotient equals the one the target's own routine
 /// computes, on the host, for operands the folder folds.

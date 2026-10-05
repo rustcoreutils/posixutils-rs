@@ -879,28 +879,216 @@ fn preprocessor_dash_d_object_forms_still_work() {
 // #P16 — GNU named variadic macros
 // ============================================================================
 
-/// `#define LOG(fmt, args...)` binds *all* trailing arguments to `args`. It
-/// used to be parsed as an ordinary positional parameter, so it captured only
-/// the first — and pushed the `__VA_ARGS__` start index one too far.
+/// The conformance programs that are compiled and run rather than checked with
+/// -E, as one program; each section keeps its original test name and doc comment,
+/// and the exit-code table is at the top. A crash in
+/// preprocessor_named_variadic_binds_all_trailing_arguments means a named variadic
+/// macro failed to forward every trailing argument.
+///
+/// Consolidates: preprocessor_named_variadic_binds_all_trailing_arguments,
+/// preprocessor_va_args_form_still_works,
+/// preprocessor_if_character_constants_match_the_compiler,
+/// preprocessor_push_and_pop_macro and
+/// preprocessor_push_macro_name_with_non_ascii_bytes.
 #[test]
-fn preprocessor_named_variadic_binds_all_trailing_arguments() {
-    let src = "#include <stdio.h>\n\
-               #define LOG(fmt, args...) printf(fmt, args)\n\
-               int main(void){ LOG(\"%d %d %d\\n\", 1, 2, 3); return 0; }\n";
-    assert_eq!(
-        crate::common::compile_and_run("named_variadic", src, &[]),
-        0,
-        "a named variadic macro must forward every trailing argument"
-    );
+fn preprocessor_conformance_run_mega() {
+    let code = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1-  1  preprocessor_named_variadic_binds_all_trailing_arguments
+ *    11- 11  preprocessor_va_args_form_still_works
+ *    21- 25  preprocessor_if_character_constants_match_the_compiler
+ *    31- 36  preprocessor_push_and_pop_macro
+ *    41- 43  preprocessor_push_macro_name_with_non_ascii_bytes
+ */
+
+/* ---- preprocessor_named_variadic_binds_all_trailing_arguments (exit codes 1-1) ----
+ *
+ *  `#define LOG(fmt, args...)` binds *all* trailing arguments to `args`. It
+ *  used to be parsed as an ordinary positional parameter, so it captured only
+ *  the first — and pushed the `__VA_ARGS__` start index one too far.
+ */
+#include <stdio.h>
+#define LOG(fmt, args...) printf(fmt, args)
+static int t_preprocessor_named_variadic_binds_all_trailing_arguments(void){ LOG("%d %d %d\n", 1, 2, 3); return 0; }
+#undef LOG
+
+
+/* ---- preprocessor_va_args_form_still_works (exit codes 11-11) ----
+ *
+ *  The C99 `__VA_ARGS__` spelling must be unaffected.
+ */
+#include <stdio.h>
+#define LOG2(fmt, ...) printf(fmt, __VA_ARGS__)
+static int t_preprocessor_va_args_form_still_works(void){ LOG2("%d %d %d\n", 4, 5, 6); return 0; }
+#undef LOG2
+
+
+/* ---- preprocessor_if_character_constants_match_the_compiler (exit codes 21-25) ----
+ *
+ *  `#if 'c'` and the compiled `'c'` must agree. They did not: the evaluator
+ *  packed the source spelling, so `'\n'` was 23662 and `'\0'` was true.
+ */
+#if '\n' != 10
+#error newline
+#endif
+#if '\0' != 0
+#error nul
+#endif
+#if '\x41' != 65
+#error hex
+#endif
+#if '\101' != 65
+#error octal
+#endif
+#if L'\n' != 10
+#error wide
+#endif
+static int t_preprocessor_if_character_constants_match_the_compiler(void) {
+    // The same expressions, compiled. A disagreement here is the bug.
+    if ('\n' != 10) return 1;
+    if ('\0' != 0) return 2;
+    if ('\x41' != 65) return 3;
+    if ('\101' != 65) return 4;
+    if (L'\n' != 10) return 5;
+    return 0;
 }
 
-/// The C99 `__VA_ARGS__` spelling must be unaffected.
-#[test]
-fn preprocessor_va_args_form_still_works() {
-    let src = "#include <stdio.h>\n\
-               #define LOG2(fmt, ...) printf(fmt, __VA_ARGS__)\n\
-               int main(void){ LOG2(\"%d %d %d\\n\", 4, 5, 6); return 0; }\n";
-    assert_eq!(crate::common::compile_and_run("va_args_form", src, &[]), 0);
+
+/* ---- preprocessor_push_and_pop_macro (exit codes 31-36) ----
+ *
+ *  `#pragma push_macro` / `pop_macro`: MSVC's, adopted by gcc and clang, and
+ *  used by real headers to borrow a name and give it back.
+ *
+ *  The cases that make it more than a one-liner are all here: the pragmas
+ *  nest, so each pop restores the most recent push; a name that was *not*
+ *  defined must come back undefined, which glibc's headers depend on; an
+ *  unmatched pop leaves the current definition alone rather than removing it;
+ *  and a function-like macro survives the round trip with its parameters.
+ *
+ *  Every expectation came from gcc on this source.
+ */
+extern void abort(void);
+#define A 2
+#pragma push_macro("A")
+#undef A
+#define A 1
+#pragma pop_macro("A")
+
+/* Nested pushes restore in reverse order. */
+#define B 1
+#pragma push_macro("B")
+#undef B
+#define B 2
+#pragma push_macro("B")
+#undef B
+#define B 3
+
+/* A name that was never defined: pop must restore its absence. */
+#pragma push_macro("C")
+#define C 9
+#pragma pop_macro("C")
+#ifdef C
+#error "C should not be defined after pop"
+#endif
+
+/* An unmatched pop leaves the current definition alone. */
+#define D 7
+#pragma pop_macro("D")
+
+/* A function-like macro survives the round trip. */
+#define F(x) ((x) * 3)
+#pragma push_macro("F")
+#undef F
+#define F(x) ((x) * 5)
+#pragma pop_macro("F")
+
+static int t_preprocessor_push_and_pop_macro(void) {
+    if (A != 2) return 1;
+    if (B != 3) return 2;
+#pragma pop_macro("B")
+    if (B != 2) return 3;
+#pragma pop_macro("B")
+    if (B != 1) return 4;
+    if (D != 7) return 5;
+    if (F(2) != 6) return 6;
+    return 0;
+}
+#undef A
+#undef B
+#undef C
+#undef D
+#undef F
+
+
+/* ---- preprocessor_push_macro_name_with_non_ascii_bytes (exit codes 41-43) ----
+ *
+ *  A `#pragma push_macro` name is a string-literal *payload*, and a payload is
+ *  one `char` per source byte — not Rust text.
+ *
+ *  `literal_payload` is the encoder that produces that form. Applying it to a
+ *  payload that is already in it encodes an encoded payload, doubling every
+ *  byte of 0x80 or more; the name is then looked up in the macro table, which
+ *  is keyed by the identifier as the lexer interned it, so the lookup missed.
+ *  `#pragma push_macro("café")` saved nothing and the matching pop restored
+ *  nothing. `payload_text` is the decoder and the right call.
+ *
+ *  The seventh bug of this shape in this crate, and the reason the accessors
+ *  carry the names they do.
+ *
+ *  gcc gets this wrong too — it does not restore `café` either — so this is a
+ *  case where c17 is the more correct of the two, and the test says so rather
+ *  than pinning c17 to gcc's answer.
+ */
+#define café 2
+#define naïve 5
+#pragma push_macro("café")
+#pragma push_macro("naïve")
+#undef café
+#undef naïve
+#define café 1
+#define naïve 9
+#pragma pop_macro("naïve")
+#pragma pop_macro("café")
+
+/* An ASCII name alongside them, so a fix that broke the common case would
+   show here rather than in a later commit. */
+#define PLAIN 3
+#pragma push_macro("PLAIN")
+#undef PLAIN
+#define PLAIN 4
+#pragma pop_macro("PLAIN")
+
+static int t_preprocessor_push_macro_name_with_non_ascii_bytes(void) {
+    if (café != 2) return 1;
+    if (naïve != 5) return 2;
+    if (PLAIN != 3) return 3;
+    return 0;
+}
+#undef PLAIN
+#undef café
+#undef naïve
+
+int main(void)
+{
+    int r;
+    if ((r = t_preprocessor_named_variadic_binds_all_trailing_arguments()) != 0)
+        return 0 + r;
+    if ((r = t_preprocessor_va_args_form_still_works()) != 0)
+        return 10 + r;
+    if ((r = t_preprocessor_if_character_constants_match_the_compiler()) != 0)
+        return 20 + r;
+    if ((r = t_preprocessor_push_and_pop_macro()) != 0)
+        return 30 + r;
+    if ((r = t_preprocessor_push_macro_name_with_non_ascii_bytes()) != 0)
+        return 40 + r;
+    return 0;
+}
+"#;
+    assert_eq!(
+        compile_and_run("preprocessor_conformance_run", code, &[]),
+        0
+    );
 }
 
 /// Sanity check for the two shadowing tests above: a header that really is
@@ -1346,42 +1534,6 @@ fn preprocessor_short_circuit_suppresses_if_diagnostics() {
         !r.stderr.contains("missing ')'"),
         "the skipped operand must not be diagnosed:\n{}",
         r.stderr
-    );
-}
-
-/// `#if 'c'` and the compiled `'c'` must agree. They did not: the evaluator
-/// packed the source spelling, so `'\n'` was 23662 and `'\0'` was true.
-#[test]
-fn preprocessor_if_character_constants_match_the_compiler() {
-    let src = r#"
-#if '\n' != 10
-#error newline
-#endif
-#if '\0' != 0
-#error nul
-#endif
-#if '\x41' != 65
-#error hex
-#endif
-#if '\101' != 65
-#error octal
-#endif
-#if L'\n' != 10
-#error wide
-#endif
-int main(void) {
-    // The same expressions, compiled. A disagreement here is the bug.
-    if ('\n' != 10) return 1;
-    if ('\0' != 0) return 2;
-    if ('\x41' != 65) return 3;
-    if ('\101' != 65) return 4;
-    if (L'\n' != 10) return 5;
-    return 0;
-}
-"#;
-    assert_eq!(
-        crate::common::compile_and_run("if_char_agrees", src, &[]),
-        0
     );
 }
 
@@ -2042,119 +2194,5 @@ fn preprocessor_u8_prefix_survives_a_paste() {
         r.stdout.contains("u8\"y\""),
         "the prefix was dropped:\n{}",
         r.stdout
-    );
-}
-
-/// `#pragma push_macro` / `pop_macro`: MSVC's, adopted by gcc and clang, and
-/// used by real headers to borrow a name and give it back.
-///
-/// The cases that make it more than a one-liner are all here: the pragmas
-/// nest, so each pop restores the most recent push; a name that was *not*
-/// defined must come back undefined, which glibc's headers depend on; an
-/// unmatched pop leaves the current definition alone rather than removing it;
-/// and a function-like macro survives the round trip with its parameters.
-///
-/// Every expectation came from gcc on this source.
-#[test]
-fn preprocessor_push_and_pop_macro() {
-    let code = r#"
-extern void abort(void);
-#define A 2
-#pragma push_macro("A")
-#undef A
-#define A 1
-#pragma pop_macro("A")
-
-/* Nested pushes restore in reverse order. */
-#define B 1
-#pragma push_macro("B")
-#undef B
-#define B 2
-#pragma push_macro("B")
-#undef B
-#define B 3
-
-/* A name that was never defined: pop must restore its absence. */
-#pragma push_macro("C")
-#define C 9
-#pragma pop_macro("C")
-#ifdef C
-#error "C should not be defined after pop"
-#endif
-
-/* An unmatched pop leaves the current definition alone. */
-#define D 7
-#pragma pop_macro("D")
-
-/* A function-like macro survives the round trip. */
-#define F(x) ((x) * 3)
-#pragma push_macro("F")
-#undef F
-#define F(x) ((x) * 5)
-#pragma pop_macro("F")
-
-int main(void) {
-    if (A != 2) return 1;
-    if (B != 3) return 2;
-#pragma pop_macro("B")
-    if (B != 2) return 3;
-#pragma pop_macro("B")
-    if (B != 1) return 4;
-    if (D != 7) return 5;
-    if (F(2) != 6) return 6;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("preprocessor_push_pop_macro", code, &[]), 0);
-}
-
-/// A `#pragma push_macro` name is a string-literal *payload*, and a payload is
-/// one `char` per source byte — not Rust text.
-///
-/// `literal_payload` is the encoder that produces that form. Applying it to a
-/// payload that is already in it encodes an encoded payload, doubling every
-/// byte of 0x80 or more; the name is then looked up in the macro table, which
-/// is keyed by the identifier as the lexer interned it, so the lookup missed.
-/// `#pragma push_macro("café")` saved nothing and the matching pop restored
-/// nothing. `payload_text` is the decoder and the right call.
-///
-/// The seventh bug of this shape in this crate, and the reason the accessors
-/// carry the names they do.
-///
-/// gcc gets this wrong too — it does not restore `café` either — so this is a
-/// case where c17 is the more correct of the two, and the test says so rather
-/// than pinning c17 to gcc's answer.
-#[test]
-fn preprocessor_push_macro_name_with_non_ascii_bytes() {
-    let code = r#"
-#define café 2
-#define naïve 5
-#pragma push_macro("café")
-#pragma push_macro("naïve")
-#undef café
-#undef naïve
-#define café 1
-#define naïve 9
-#pragma pop_macro("naïve")
-#pragma pop_macro("café")
-
-/* An ASCII name alongside them, so a fix that broke the common case would
-   show here rather than in a later commit. */
-#define PLAIN 3
-#pragma push_macro("PLAIN")
-#undef PLAIN
-#define PLAIN 4
-#pragma pop_macro("PLAIN")
-
-int main(void) {
-    if (café != 2) return 1;
-    if (naïve != 5) return 2;
-    if (PLAIN != 3) return 3;
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("preprocessor_push_macro_non_ascii", code, &[]),
-        0
     );
 }

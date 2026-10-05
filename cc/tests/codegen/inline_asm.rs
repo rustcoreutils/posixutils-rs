@@ -12,33 +12,736 @@
 //
 // Tests are architecture-conditional since inline assembly is platform-specific.
 //
+// Programs that build with the same helper, the same options and the same
+// `#[cfg]` share one translation unit: each original program is a
+// `t_<original test name>` function, and its failure codes are offset so
+// every one stays distinct (the table is at the top of each program).
+// Cases that only inspect assembly are in `cc/test_asm/codegen_inline_asm.rs`.
+//
 
 use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_optimized};
 
 // ============================================================================
-// Architecture-Independent Inline Assembly Test
+// Architecture-independent programs, run at the matrix levels and at -O1
 // ============================================================================
+//
+// C6b -- Memory-Barrier Pattern Lock-In Tests
+//
+// These tests lock in the heavily-used `asm volatile("..." ::: "memory")`
+// idioms — spin-loop pause/yield, full fence (mfence / dmb ish), and the
+// double-checked-init pattern — against future memory-reordering passes.
+//
+// Today no IR pass reorders memory ops across an instruction satisfying
+// `Instruction::is_memory_barrier()` (see contract docs in `cc/ir/dce.rs`
+// and `cc/ir/instcombine.rs`). When future passes do start reordering
+// (GVN, LICM, load-store forwarding, machine scheduler), they MUST
+// consult the predicate before crossing. If they regress, these tests
+// fail loudly with the wrong return code instead of silently breaking a
+// real spinlock under -O2.
+//
+// Each pattern runs at both default and -O1 to catch the optimizer-only
+// regression case.
+//
+// codegen_inline_asm_memory_barrier_pointer_aliased_reload:
+// Plain pointer-aliased store/reload across an empty `asm volatile("" :::
+// "memory")` compiler barrier. A reordering pass that ignored the
+// barrier could forward the first store's value into the post-barrier
+// load, missing the intervening store. Today c17 doesn't reorder; this
+// test locks it in.
+//
+// codegen_inline_asm_memory_barrier_spin_wait_pattern:
+// Spin-wait loop polling a non-volatile location through a pointer.
+// The `asm volatile("pause"/"yield" ::: "memory")` inside the loop body
+// must force a reload of `*p` every iteration — otherwise a hoisting
+// pass would lift `*p` out of the loop and the loop would never
+// terminate. The loop body also writes the flag, so a single-threaded
+// run reaches termination iff the reload happens.
+//
+// codegen_inline_asm_memory_barrier_full_fence:
+// Full memory fence (`mfence` on x86_64, `dmb ish` on aarch64). The
+// surrounding stores and loads must straddle the fence — a pass that
+// reordered the post-fence load before the fence (or dropped the
+// pre-fence store) would observe the wrong value.
+//
+// codegen_inline_asm_memory_barrier_double_checked_init:
+// Double-checked-init pattern. The release barrier in `slow_init()`
+// must order the `value = 42` store before the `initialized = 1` store.
+// The acquire barrier in `get_value()` must force a reload of `value`
+// after seeing `initialized == 1`. A reordering pass that ignored
+// either barrier could observe `value == 0` despite `initialized == 1`.
+// Single-threaded execution still exercises the compiler-level
+// reordering semantics — what we're locking in is "the compiler does
+// not reorder/eliminate loads or stores across the barriers."
+//
+// codegen_inline_asm_memory_barrier_sync_synchronize_pattern:
+// `__sync_synchronize`-equivalent: a single global barrier between two
+// unrelated memory accesses. A reordering pass that moved the second
+// load before the barrier could silently miscompile any code that
+// relies on this idiom for cross-thread visibility. Single-threaded
+// here, so we only assert the compiler-level ordering.
+//
+// C9 -- Multi-Alternative Constraint Tests
+//
+// `"rm"`, `"ri"`, `"rmi"`, and `"g"` (= `"rmi"`) let the compiler choose
+// register vs memory vs immediate based on what fits cheapest given the
+// operand's location. A constraint that lists any non-register class does
+// not force-load a spilled value into a temp register, and one that lists
+// any non-memory class does not force a memory operand.
+//
+// These tests are arch-independent — the patterns work on both x86_64
+// and aarch64 because the assembly inside the asm template uses
+// arch-specific mnemonics in dedicated branches.
+//
+// codegen_inline_asm_multi_alt_rm_register_path:
+// `"+rm"` with a value that lives in a register. The asm template must
+// substitute the register form; the value must be incremented in place.
+//
+// codegen_inline_asm_multi_alt_m_memory_path:
+// `"+m"` on an addr-taken value — value lives in memory by construction.
+//
+// codegen_inline_asm_multi_alt_g_runtime_value:
+// `"g"` (= `"rmi"`) — most permissive. Tested with both a runtime
+// value (compiler should use register form) and a const value
+// (compiler may substitute immediate; today it falls through to
+// register, which is also correct — C9c later optimizes this).
+//
+// codegen_inline_asm_multi_alt_output_rm_to_memory:
+// `"=rm"` output to an addr-taken local — codegen must place the
+// result into memory (no force-load to a temp register).
+//
+// codegen_inline_asm_multi_alt_mixed_operands:
+// Multiple multi-alt operands in one asm, mixed input/output.
+//
+// C9c -- Immediate-Bearing Constraint Lock-In Tests
+//
+// `"ri"` / `"g"` / x86_64's `I`/`J`/.../`O` accept a const-propagated
+// operand by substituting it as a literal in the asm template instead
+// of materializing it through a register. The substitution is implicit
+// in `emit_inline_asm`'s `Loc::Imm(v)` arm — when an operand's
+// allocator location is `Loc::Imm`, the codegen renders it as `$value`
+// (x86_64) regardless of which class letter accepted it. These tests
+// pin the behavior so a future codegen change that, e.g., forced a
+// register load for `"r"` operands with `Loc::Imm` would break loudly
+// instead of silently regressing asm quality.
+//
+// The tests inspect the resulting assembly only via the runtime
+// observation that the test exits 0 — the deeper "is the literal
+// substituted, not register-loaded?" assertion is left informal,
+// since the runtime semantics are what matters for correctness.
+//
+// codegen_inline_asm_imm_const_via_ri: `"ri"(const)` — register or
+// immediate. Const operand should substitute as `$N` literal.
+//
+// codegen_inline_asm_imm_const_via_g: `"g"(const)` — any operand. Const
+// should substitute as `$N`.
+//
+// codegen_inline_asm_imm_runtime_via_ri_uses_register: `"ri"(runtime_value)`
+// — operand isn't const, so the codegen must NOT substitute as a literal.
+// The operand must go through a register (since `"ri"` allows register or
+// immediate, and memory is not allowed). Negative case complementing the
+// const-substitution test above.
+//
+// Memory-constrained output operands ("=m")
+//
+// codegen_asm_memory_output_survives_optimization:
+// Regression test: a memory *output* operand reads its pseudo -- the pseudo
+// holds the address the assembly writes through -- but DCE's use-collector
+// looked only at `asm_data.inputs`. At `-O` and above it therefore deleted the
+// instruction that materialized the address, and the emitted store went
+// through whatever the register happened to hold.
+//
+// Found via the CPython acceptance build: `_Py_get_387controlword`
+// (`Python/pymath.c`) is exactly this shape, and c17 compiled its
+// `fnstcw %0` to `fnstcw (%rax)` with RAX left at 0 from an earlier zero-fill
+// -- a null-pointer write that segfaulted the bootstrap interpreter.
+//
+// The `-O0` path was always correct, so this must run optimized to mean
+// anything.
+//
+// codegen_asm_memory_output_address_survives_register_allocation:
+// The `"=m"` fix has to reach the *register allocator*, not just DCE.
+//
+// DCE learning that a memory output reads its pseudo stopped the address
+// computation being deleted, but the allocator's own use-collectors --
+// live-interval bounds, liveness propagation, the interference graph's def
+// set and live set, and next-use distance -- all still classified such an
+// output as a pure def. So the address register stayed free for the
+// allocator to hand to another operand of the same asm, and the store went
+// through an input's value as a pointer.
+//
+// Enough inputs are needed to make the allocator actually reuse the register;
+// a one-operand asm never exhibits it, which is why the first version of this
+// test passed on x86_64 while the bug was still live.
+//
+// A floating constant as an inline-asm operand
+//
+// `loc_to_asm_string` used to `panic!("Float immediate not supported in inline
+// asm operand")` on both targets. The linearizer does no type filtering on a
+// non-memory asm input, so a floating constant stays an FVal pseudo, and
+// regalloc maps every FVal to `Loc::FImm` -- an FP *constant* is never given a
+// register. `__asm__ ("" :: "r"(1.0))` therefore aborted the compiler at -O0.
+//
+// There was no float-operand test here at all, which is why it survived.
+//
+// codegen_inline_asm_float_constant_in_general_register:
+// A general-register constraint gets the constant's bit pattern, which is
+// what gcc materializes. 1.5 is 0x3FF8000000000000.
+//
+// codegen_inline_asm_fp_value_in_general_register:
+// An FP *value* — not a constant — under a general-register constraint.
+//
+// On aarch64 nothing moved it out of the vector register it was computed in,
+// and the operand rendered as the vector register's name, so `mov %0, %1`
+// assembled as `mov x0, d0` and the assembler read `d0` as an undefined
+// symbol. Pre-existing and independent of any floating constant: it is
+// reachable from any FP variable passed as `"r"`. x86-64 was never affected,
+// spilling the value to a stack slot the register path then loads from.
+//
+// It is also why `-0.0` needed its own case above — that arrives as `fneg` of
+// zero, a computed value in a vector register, rather than as an immediate.
+const PORTABLE_MATRIX_AND_O1: &str = r#"
+/* Exit codes: section k fails with 10*k + its original code.
+ *  1 memory_barrier_pointer_aliased_reload   10..19
+ *  2 memory_barrier_spin_wait_pattern        20..29
+ *  3 memory_barrier_full_fence               30..39
+ *  4 memory_barrier_double_checked_init      40..49
+ *  5 memory_barrier_sync_synchronize_pattern 50..59
+ *  6 multi_alt_rm_register_path              60..69
+ *  7 multi_alt_m_memory_path                 70..79
+ *  8 multi_alt_g_runtime_value               80..89
+ *  9 multi_alt_output_rm_to_memory           90..99
+ * 10 multi_alt_mixed_operands               100..109
+ * 11 imm_const_via_ri                       110..119
+ * 12 imm_const_via_g                        120..129
+ * 13 imm_runtime_via_ri_uses_register       130..139
+ * 14 asm_memory_output_survives_optimization            140..149
+ * 15 asm_memory_output_address_survives_register_allocation 150..159
+ * 16 float_constant_in_general_register     160..169
+ * 17 fp_value_in_general_register           170..179
+ */
+#include <string.h>
 
-#[test]
-fn codegen_inline_asm_nop() {
-    let code = r#"
+/* 1. Plain pointer-aliased store/reload across an empty
+   `asm volatile("" ::: "memory")` compiler barrier. A reordering pass that
+   ignored the barrier could forward the first store's value into the
+   post-barrier load, missing the intervening store. */
+static int t_memory_barrier_pointer_aliased_reload(void) {
+    int sentinel = 0;
+    int *p = &sentinel;
+    *p = 42;
+    __asm__ volatile("" ::: "memory");
+    *p = 99;
+    __asm__ volatile("" ::: "memory");
+    int read_back = *p;
+    return (read_back == 99) ? 0 : 1;
+}
+
+/* 2. Spin-wait loop polling a non-volatile location through a pointer. The
+   `asm volatile("pause"/"yield" ::: "memory")` inside the loop body must
+   force a reload of `*p` every iteration -- otherwise a hoisting pass would
+   lift `*p` out of the loop and the loop would never terminate. The loop
+   body also writes the flag, so a single-threaded run reaches termination
+   iff the reload happens. */
+static int t_memory_barrier_spin_wait_pattern(void) {
+    int flag = 1;
+    int *p = &flag;
+    int iters = 0;
+    while (*p) {
+#if defined(__x86_64__)
+        __asm__ volatile("pause" ::: "memory");
+#elif defined(__aarch64__)
+        __asm__ volatile("yield" ::: "memory");
+#else
+        __asm__ volatile("" ::: "memory");
+#endif
+        *p = 0;
+        iters++;
+        if (iters > 10) return 2;
+    }
+    return (iters == 1) ? 0 : 1;
+}
+
+/* 3. Full memory fence (`mfence` on x86_64, `dmb ish` on aarch64). The
+   surrounding stores and loads must straddle the fence -- a pass that
+   reordered the post-fence load before the fence (or dropped the pre-fence
+   store) would observe the wrong value. */
+static int t_memory_barrier_full_fence(void) {
+    int x = 5;
+    int *p = &x;
+    *p = 10;
+#if defined(__x86_64__)
+    __asm__ volatile("mfence" ::: "memory");
+#elif defined(__aarch64__)
+    __asm__ volatile("dmb ish" ::: "memory");
+#else
+    __asm__ volatile("" ::: "memory");
+#endif
+    *p = 20;
+    return (*p == 20) ? 0 : 1;
+}
+
+/* 4. Double-checked-init pattern. The release barrier in `slow_init()` must
+   order the `value = 42` store before the `initialized = 1` store. The
+   acquire barrier in `get_value()` must force a reload of `value` after
+   seeing `initialized == 1`. A reordering pass that ignored either barrier
+   could observe `value == 0` despite `initialized == 1`. Single-threaded
+   execution still exercises the compiler-level reordering semantics. */
+static int dci_initialized = 0;
+static int dci_value = 0;
+
+static void dci_slow_init(void) {
+    dci_value = 42;
+    __asm__ volatile("" ::: "memory");
+    dci_initialized = 1;
+}
+
+static int dci_get_value(void) {
+    if (!dci_initialized) {
+        dci_slow_init();
+    }
+    __asm__ volatile("" ::: "memory");
+    return dci_value;
+}
+
+static int t_memory_barrier_double_checked_init(void) {
+    if (dci_get_value() != 42) return 1;
+    if (dci_get_value() != 42) return 2;
+    return 0;
+}
+
+/* 5. `__sync_synchronize`-equivalent: a single global barrier between two
+   unrelated memory accesses. A reordering pass that moved the second load
+   before the barrier could silently miscompile any code that relies on this
+   idiom for cross-thread visibility. */
+static int sync_a = 0;
+static int sync_b = 0;
+
+static int t_memory_barrier_sync_synchronize_pattern(void) {
+    sync_a = 1;
+#if defined(__x86_64__)
+    __asm__ volatile("mfence" ::: "memory");
+#elif defined(__aarch64__)
+    __asm__ volatile("dmb ish" ::: "memory");
+#else
+    __asm__ volatile("" ::: "memory");
+#endif
+    sync_b = 2;
+    if (sync_a != 1) return 1;
+    if (sync_b != 2) return 2;
+    return 0;
+}
+
+/* 6. `"+rm"` with a value that lives in a register. The asm template must
+   substitute the register form; the value must be incremented in place. */
+static int t_multi_alt_rm_register_path(void) {
+    int x = 41;
+#if defined(__x86_64__)
+    __asm__("addl $1, %0" : "+rm"(x));
+#elif defined(__aarch64__)
+    __asm__("add %w0, %w0, #1" : "+rm"(x));
+#endif
+    return (x == 42) ? 0 : 1;
+}
+
+/* 7. `"+m"` on an addr-taken value -- value lives in memory by
+   construction. */
+static int t_multi_alt_m_memory_path(void) {
+    int x = 99;
+    int *p = &x;  // address taken -> x stays in memory (mem2reg can't promote)
+#if defined(__x86_64__)
+    __asm__("addl $1, %0" : "+m"(*p));
+#elif defined(__aarch64__)
+    __asm__("ldr w8, %0\n\tadd w8, w8, #1\n\tstr w8, %0" : "+m"(*p));
+#endif
+    return (*p == 100) ? 0 : 1;
+}
+
+/* 8. `"g"` (= `"rmi"`) -- most permissive, with a runtime value. */
+static int t_multi_alt_g_runtime_value(void) {
+    int x = 7;
+    int r;
+#if defined(__x86_64__)
+    __asm__("movl %1, %0\n\taddl $35, %0" : "=r"(r) : "g"(x));
+#elif defined(__aarch64__)
+    __asm__("add %w0, %w1, #35" : "=r"(r) : "g"(x));
+#endif
+    return (r == 42) ? 0 : 1;
+}
+
+/* 9. `"=rm"` output to an addr-taken local -- codegen must place the result
+   into memory (no force-load to a temp register). */
+static int t_multi_alt_output_rm_to_memory(void) {
+    int dst = 0;
+    int *p = &dst;
+#if defined(__x86_64__)
+    __asm__("movl $123, %0" : "=rm"(*p));
+#elif defined(__aarch64__)
+    __asm__("mov %w0, #123" : "=rm"(*p));
+#endif
+    return (*p == 123) ? 0 : 1;
+}
+
+/* 10. Multiple multi-alt operands in one asm, mixed input/output. */
+static int t_multi_alt_mixed_operands(void) {
+    int a = 10, b = 20;
+    int sum;
+#if defined(__x86_64__)
+    __asm__("movl %1, %0\n\taddl %2, %0"
+            : "=r"(sum)
+            : "rm"(a), "rm"(b));
+#elif defined(__aarch64__)
+    __asm__("add %w0, %w1, %w2"
+            : "=r"(sum)
+            : "rm"(a), "rm"(b));
+#endif
+    return (sum == 30) ? 0 : 1;
+}
+
+/* 11. `"ri"(const)` -- register or immediate. Const operand should
+   substitute as `$N` literal. */
+static int t_imm_const_via_ri(void) {
+    int r;
+#if defined(__x86_64__)
+    __asm__("movl %1, %0" : "=r"(r) : "ri"(42));
+#elif defined(__aarch64__)
+    __asm__("mov %w0, %w1" : "=r"(r) : "ri"(42));
+#endif
+    return (r == 42) ? 0 : 1;
+}
+
+/* 12. `"g"(const)` -- any operand. Const should substitute as `$N`. */
+static int t_imm_const_via_g(void) {
+    int r;
+#if defined(__x86_64__)
+    __asm__("movl %1, %0" : "=r"(r) : "g"(99));
+#elif defined(__aarch64__)
+    __asm__("mov %w0, %w1" : "=r"(r) : "g"(99));
+#endif
+    return (r == 99) ? 0 : 1;
+}
+
+/* 13. `"ri"(runtime_value)` -- operand isn't const, so the codegen must NOT
+   substitute as a literal. The operand must go through a register (since
+   `"ri"` allows register or immediate, and memory is not allowed). Negative
+   case complementing the const-substitution test above. */
+static int t_imm_runtime_via_ri_uses_register(void) {
+    int x;
+#if defined(__x86_64__)
+    __asm__("movl $77, %0" : "=r"(x));
+    int r;
+    __asm__("movl %1, %0" : "=r"(r) : "ri"(x));
+#elif defined(__aarch64__)
+    __asm__("mov %w0, #77" : "=r"(x));
+    int r;
+    __asm__("mov %w0, %w1" : "=r"(r) : "ri"(x));
+#endif
+    return (r == 77) ? 0 : 1;
+}
+
+/* 14. A memory *output* operand reads its pseudo -- the pseudo holds the
+   address the assembly writes through -- but DCE's use-collector looked only
+   at `asm_data.inputs`, so at `-O` and above it deleted the instruction that
+   materialized the address (CPython's `_Py_get_387controlword`). */
+/* Store through a "=m" output, then read the object back. If the address
+   computation is dropped, this either faults or writes somewhere else. */
+static int store_via_m(void) {
+    int out = 0;
+#if defined(__x86_64__)
+    __asm__ __volatile__ ("movl $1234, %0" : "=m" (out));
+#elif defined(__aarch64__)
+    {
+        int tmp = 1234;
+        __asm__ __volatile__ ("str %w1, %0" : "=m" (out) : "r" (tmp));
+    }
+#else
+    out = 1234;
+#endif
+    return out;
+}
+
+/* Same, but with the object surrounded by other locals so a stray write
+   would land on a neighbour rather than faulting. */
+static int store_via_m_neighbours(int *before, int *after) {
+    int lo = 11;
+    int out = 0;
+    int hi = 22;
+#if defined(__x86_64__)
+    __asm__ __volatile__ ("movl $77, %0" : "=m" (out));
+#elif defined(__aarch64__)
+    {
+        int tmp = 77;
+        __asm__ __volatile__ ("str %w1, %0" : "=m" (out) : "r" (tmp));
+    }
+#else
+    out = 77;
+#endif
+    *before = lo;
+    *after = hi;
+    return out;
+}
+
+static int t_asm_memory_output_survives_optimization(void) {
+    if (store_via_m() != 1234) return 1;
+
+    int before = 0, after = 0;
+    if (store_via_m_neighbours(&before, &after) != 77) return 2;
+    if (before != 11) return 3;
+    if (after != 22) return 4;
+
+    return 0;
+}
+
+/* 15. The `"=m"` fix has to reach the *register allocator*, not just DCE: an
+   output's address register must not be handed to another operand of the
+   same asm. Enough inputs are needed to make the allocator actually reuse
+   the register. */
+struct Out { unsigned v0, v1, v2, v3, v4, v5; };
+
+/* Six register inputs alongside a memory output. The output's address must
+   not be assigned a register that one of the inputs also gets. */
+static unsigned write_through_m(unsigned a, unsigned b, unsigned c,
+                                unsigned d, unsigned e, unsigned f) {
+    unsigned out = 0;
+#if defined(__x86_64__)
+    __asm__ __volatile__ ("movl %1, %0"
+                          : "=m"(out)
+                          : "r"(a), "r"(b), "r"(c), "r"(d), "r"(e), "r"(f));
+#elif defined(__aarch64__)
+    __asm__ __volatile__ ("str %w1, %0"
+                          : "=m"(out)
+                          : "r"(a), "r"(b), "r"(c), "r"(d), "r"(e), "r"(f));
+#else
+    out = a;
+    (void)b; (void)c; (void)d; (void)e; (void)f;
+#endif
+    return out;
+}
+
+static int t_asm_memory_output_address_survives_register_allocation(void) {
+    /* The first input is what the asm stores, so the result must be it and
+       not some other operand's value or a wild read. */
+    if (write_through_m(11u, 22u, 33u, 44u, 55u, 66u) != 11u) return 1;
+    if (write_through_m(99u, 1u, 2u, 3u, 4u, 5u) != 99u) return 2;
+
+    /* Neighbouring locals must be untouched: a store through the wrong
+       pointer usually lands somewhere else on the frame. */
+    volatile unsigned before = 0xAAAAAAAAu;
+    unsigned got = write_through_m(7u, 0u, 0u, 0u, 0u, 0u);
+    volatile unsigned after = 0xBBBBBBBBu;
+    if (got != 7u) return 3;
+    if (before != 0xAAAAAAAAu) return 4;
+    if (after != 0xBBBBBBBBu) return 5;
+
+    return 0;
+}
+
+/* 16. A general-register constraint gets the constant's bit pattern, which
+   is what gcc materializes. 1.5 is 0x3FF8000000000000. */
+static int t_float_constant_in_general_register(void) {
+    unsigned long bits = 0;
+#if defined(__x86_64__)
+    __asm__ ("movq %1, %0" : "=r"(bits) : "r"(1.5));
+#elif defined(__aarch64__)
+    __asm__ ("mov %0, %1" : "=r"(bits) : "r"(1.5));
+#endif
+    return bits == 0x3FF8000000000000UL ? 0 : 1;
+}
+
+/* 17. An FP *value* -- not a constant -- under a general-register
+   constraint. On aarch64 nothing moved it out of the vector register it was
+   computed in, and the operand rendered as the vector register's name, so
+   `mov %0, %1` assembled as `mov x0, d0`. x86-64 was never affected. */
+double fpv_src = 2.5;
+static int t_fp_value_in_general_register(void) {
+    unsigned long bits = 0;
+    double d = fpv_src * 2.0;                 /* computed, so it lives in an FP reg */
+#if defined(__x86_64__)
+    __asm__ ("movq %1, %0" : "=r"(bits) : "r"(d));
+#elif defined(__aarch64__)
+    __asm__ ("mov %0, %1" : "=r"(bits) : "r"(d));
+#endif
+    return bits == 0x4014000000000000UL ? 0 : 1;   /* 5.0 */
+}
+
 int main(void) {
-    __asm__ volatile("nop");
+    int r;
+    if ((r = t_memory_barrier_pointer_aliased_reload()) != 0) return 10 + r;
+    if ((r = t_memory_barrier_spin_wait_pattern()) != 0) return 20 + r;
+    if ((r = t_memory_barrier_full_fence()) != 0) return 30 + r;
+    if ((r = t_memory_barrier_double_checked_init()) != 0) return 40 + r;
+    if ((r = t_memory_barrier_sync_synchronize_pattern()) != 0) return 50 + r;
+    if ((r = t_multi_alt_rm_register_path()) != 0) return 60 + r;
+    if ((r = t_multi_alt_m_memory_path()) != 0) return 70 + r;
+    if ((r = t_multi_alt_g_runtime_value()) != 0) return 80 + r;
+    if ((r = t_multi_alt_output_rm_to_memory()) != 0) return 90 + r;
+    if ((r = t_multi_alt_mixed_operands()) != 0) return 100 + r;
+    if ((r = t_imm_const_via_ri()) != 0) return 110 + r;
+    if ((r = t_imm_const_via_g()) != 0) return 120 + r;
+    if ((r = t_imm_runtime_via_ri_uses_register()) != 0) return 130 + r;
+    if ((r = t_asm_memory_output_survives_optimization()) != 0) return 140 + r;
+    if ((r = t_asm_memory_output_address_survives_register_allocation()) != 0) return 150 + r;
+    if ((r = t_float_constant_in_general_register()) != 0) return 160 + r;
+    if ((r = t_fp_value_in_general_register()) != 0) return 170 + r;
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("asm_nop", code, &[]), 0);
+
+/// Consolidates codegen_inline_asm_memory_barrier_pointer_aliased_reload,
+/// _spin_wait_pattern, _full_fence, _double_checked_init,
+/// _sync_synchronize_pattern, codegen_inline_asm_multi_alt_rm_register_path,
+/// _m_memory_path, _g_runtime_value, _output_rm_to_memory, _mixed_operands,
+/// codegen_inline_asm_imm_const_via_ri, _imm_const_via_g,
+/// _imm_runtime_via_ri_uses_register,
+/// codegen_asm_memory_output_survives_optimization,
+/// codegen_asm_memory_output_address_survives_register_allocation,
+/// codegen_inline_asm_float_constant_in_general_register and
+/// codegen_inline_asm_fp_value_in_general_register.
+#[test]
+fn codegen_inline_asm_portable_mega() {
+    assert_eq!(
+        compile_and_run("asm_portable_mega", PORTABLE_MATRIX_AND_O1, &[]),
+        0,
+        "see the exit-code table at the top of the program"
+    );
+    assert_eq!(
+        compile_and_run_optimized("asm_portable_mega_opt", PORTABLE_MATRIX_AND_O1),
+        0,
+        "the same at -O1: memory clobbers and \"=m\" address computations \
+         must survive the optimizer"
+    );
+}
+
+// codegen_inline_asm_float_constant_zero_and_negative:
+// The zero constant has its own materialization path (`xorps`), so it is
+// worth its own case -- and a negative zero must not come back as positive.
+//
+// codegen_inline_asm_float_constant_uses_its_own_width:
+// A `float` constant is narrowed to its own width, not handed over as the
+// `double` bit pattern: 1.5f is 0x3FC00000, not 0x3FF8000000000000.
+const PORTABLE_MATRIX: &str = r#"
+/* Exit codes: section k fails with 10*k + its original code.
+ *  1 inline_asm_nop                          10..19
+ *  2 float_constant_zero_and_negative        20..29
+ *  3 float_constant_uses_its_own_width       30..39
+ */
+
+/* 1. The simplest statement there is. */
+static int t_inline_asm_nop(void) {
+    __asm__ volatile("nop");
+    return 0;
+}
+
+/* 2. The zero constant has its own materialization path (`xorps`), so it is
+   worth its own case -- and a negative zero must not come back as
+   positive. */
+static int t_float_constant_zero_and_negative(void) {
+    unsigned long z = 1, nz = 0;
+#if defined(__x86_64__)
+    __asm__ ("movq %1, %0" : "=r"(z) : "r"(0.0));
+    __asm__ ("movq %1, %0" : "=r"(nz) : "r"(-0.0));
+#elif defined(__aarch64__)
+    __asm__ ("mov %0, %1" : "=r"(z) : "r"(0.0));
+    __asm__ ("mov %0, %1" : "=r"(nz) : "r"(-0.0));
+#endif
+    if (z != 0UL) return 1;
+    if (nz != 0x8000000000000000UL) return 2;
+    return 0;
+}
+
+/* 3. A `float` constant is narrowed to its own width, not handed over as the
+   `double` bit pattern: 1.5f is 0x3FC00000, not 0x3FF8000000000000. */
+static int t_float_constant_uses_its_own_width(void) {
+    unsigned int bits = 0;
+#if defined(__x86_64__)
+    __asm__ ("movl %1, %0" : "=r"(bits) : "r"(1.5f));
+#elif defined(__aarch64__)
+    __asm__ ("mov %w0, %w1" : "=r"(bits) : "r"(1.5f));
+#endif
+    return bits == 0x3FC00000U ? 0 : 1;
+}
+
+int main(void) {
+    int r;
+    if ((r = t_inline_asm_nop()) != 0) return 10 + r;
+    if ((r = t_float_constant_zero_and_negative()) != 0) return 20 + r;
+    if ((r = t_float_constant_uses_its_own_width()) != 0) return 30 + r;
+    return 0;
+}
+"#;
+
+/// Consolidates codegen_inline_asm_nop,
+/// codegen_inline_asm_float_constant_zero_and_negative and
+/// codegen_inline_asm_float_constant_uses_its_own_width.
+#[test]
+fn codegen_inline_asm_portable_matrix_mega() {
+    assert_eq!(
+        compile_and_run("asm_portable_matrix_mega", PORTABLE_MATRIX, &[]),
+        0
+    );
 }
 
 // ============================================================================
-// x86-64 Inline Assembly Mega-Test
+// x86-64 programs
 // ============================================================================
-
+//
+// codegen_inline_asm_x86_64_asm_goto_pseudo_survives_edge:
+// The asm-goto CFG plumbing is wired by `linearize_stmt.rs`:
+// when an `__asm__ goto(...)` is emitted, the linearizer
+// explicitly `link_bb`s the current block to every goto-label
+// target plus a fresh fall-through. So liveness propagates
+// correctly from the goto-target back through the asm block,
+// and a pseudo live only at the goto target survives the asm
+// edge with its allocator assignment intact.
+//
+// This test guards against future regression in that plumbing:
+// `val` is computed before the asm, conditionally goto'd-over
+// (so it's still live at the `match_label:` target), then read.
+// If the CFG edge didn't exist, chordal coloring would treat
+// `val` as dying before the asm and could reuse its register
+// for an intermediate inside the asm block, corrupting the
+// value the `match_label:` branch reads.
+//
+// codegen_inline_asm_x86_64_fixed_register_precolor:
+// Regression test for C3's Fixed-operand pre-coloring path.
+//
+// The chordal allocator now pre-colors the operand pseudo of
+// `"=a"(...)` / `"a"(...)` / etc. directly to the constraint-
+// required register. The first commit of C3 had a `get_location`
+// hole: pre-coloring populated only the chordal `pre_colored`
+// map, not `self.locations`. The subsequent Store/Load of the
+// operand then fell through to `Loc::Imm(0)` and silently
+// wrote/read zero.
+//
+// This test exercises every Fixed letter currently in scope
+// (a, b, c, d, S, D) in both `=` and bare positions so a future
+// regression in `collect_asm_fixed_precolors_x86_64` or the
+// `self.locations.insert` in `color_gp_bank` is caught.
+//
+// C10 -- Per-arch Class Letter Tests
+//
+// Tests for the rare GCC constraint letters that aren't built-in
+// classes: x86_64's `q` (byte-register-class), `R`/`l` (register
+// synonyms), `I`/`J`/`K`/`L`/`M`/`N`/`O` (constant-range immediates);
+// aarch64's `I`/`J`/`K`/`L`/`M`/`N` (immediate ranges).
+//
+// codegen_inline_asm_imm_const_via_i_letter: x86_64 `"I"(const)` —
+// constant in [0, 31]. Used for shift counts.
+//
+// codegen_inline_asm_x86_64_class_letter_r_synonym: `R` constraint — legacy
+// 8-register set. Same as `r` on x86_64.
 #[cfg(target_arch = "x86_64")]
-#[test]
-fn codegen_inline_asm_x86_64_mega() {
-    let code = r#"
-int main(void) {
+const X86_64_MATRIX: &str = r#"
+/* Exit codes: section 1 keeps its own codes (1..75); section k >= 2 fails
+ * with 100 + 10*(k-2) + its original code.
+ *  1 inline_asm_x86_64_mega                     1..99
+ *  2 x86_64_asm_goto_pseudo_survives_edge     100..109
+ *  3 x86_64_fixed_register_precolor           110..119
+ *  4 imm_const_via_i_letter                   120..129
+ *  5 x86_64_class_letter_r_synonym            130..139
+ */
+
+/* 1. The x86-64 inline assembly mega-test. */
+static int t_inline_asm_x86_64_mega(void) {
     // ========== BASIC ASM (returns 1-19) ==========
     {
         // Output register
@@ -196,101 +899,27 @@ end_goto:
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("asm_x86_64_mega", code, &[]), 0);
-}
 
-/// A phi at an `asm goto` label receives the value its jump carried.
-///
-/// The label is reached from the `asm` block (by the jump) and from the
-/// fallthrough, so it merges two values of `r`. Phi elimination put the copy
-/// for the jump's edge at the end of the `asm` block, after the `asm` -- which
-/// the jump leaves before reaching -- so the label read whatever `r` held
-/// before, at every level. The edge now gets a block of its own for the copy.
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn codegen_asm_goto_label_receives_the_value_its_jump_carries() {
-    let code = r#"
-int __attribute__((noinline)) f(int x) {
-    int r = x + 1;
-    if (x > 5) r = 7;
-    __asm__ goto("jmp %l0" :::: taken);
-    r = 2;
-taken:
-    return r;
-}
-int main(void) {
-    if (f(10) != 7) return 1;
-    if (f(1) != 2) return 2;
-    return 0;
-}
-"#;
-    for level in ["-O0", "-O2"] {
-        assert_eq!(
-            compile_and_run(&format!("asm_goto_phi{level}"), code, &[level.to_string()]),
-            0,
-            "{level}"
-        );
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn codegen_inline_asm_x86_64_asm_goto_pseudo_survives_edge() {
-    // The asm-goto CFG plumbing is wired by `linearize_stmt.rs`:
-    // when an `__asm__ goto(...)` is emitted, the linearizer
-    // explicitly `link_bb`s the current block to every goto-label
-    // target plus a fresh fall-through. So liveness propagates
-    // correctly from the goto-target back through the asm block,
-    // and a pseudo live only at the goto target survives the asm
-    // edge with its allocator assignment intact.
-    //
-    // This test guards against future regression in that plumbing:
-    // `val` is computed before the asm, conditionally goto'd-over
-    // (so it's still live at the `match_label:` target), then read.
-    // If the CFG edge didn't exist, chordal coloring would treat
-    // `val` as dying before the asm and could reuse its register
-    // for an intermediate inside the asm block, corrupting the
-    // value the `match_label:` branch reads.
-    let code = r#"
-int main(void) {
+/* 2. `val` is computed before the asm, conditionally goto'd-over (so it is
+   still live at the `match_label:` target), then read. If the asm-goto CFG
+   edge didn't exist, chordal coloring would treat `val` as dying before the
+   asm and could reuse its register inside the asm block. */
+static int t_x86_64_asm_goto_pseudo_survives_edge(void) {
     int val = 0xDEADBEEF;
     int x = 5;
     __asm__ goto("cmpl $5, %0\n\t"
                  "je %l[match_label]"
                  : : "r"(x) : "cc" : match_label);
-    return 1;  // x != 5 — shouldn't happen
+    return 1;  // x != 5 -- shouldn't happen
 match_label:
     if (val != 0xDEADBEEF) return 2;
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("asm_x86_64_goto_pseudo_survives_edge", code, &[]),
-        0,
-        "pseudo live at asm-goto target must survive the edge"
-    );
-}
 
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn codegen_inline_asm_x86_64_fixed_register_precolor() {
-    // Regression test for C3's Fixed-operand pre-coloring path.
-    //
-    // The chordal allocator now pre-colors the operand pseudo of
-    // `"=a"(...)` / `"a"(...)` / etc. directly to the constraint-
-    // required register. The first commit of C3 had a `get_location`
-    // hole: pre-coloring populated only the chordal `pre_colored`
-    // map, not `self.locations`. The subsequent Store/Load of the
-    // operand then fell through to `Loc::Imm(0)` and silently
-    // wrote/read zero.
-    //
-    // This test exercises every Fixed letter currently in scope
-    // (a, b, c, d, S, D) in both `=` and bare positions so a future
-    // regression in `collect_asm_fixed_precolors_x86_64` or the
-    // `self.locations.insert` in `color_gp_bank` is caught.
-    let code = r#"
-int main(void) {
+/* 3. Every Fixed letter (a, b, c, d, S, D) in both `=` and bare positions:
+   pre-coloring must populate `self.locations` as well as `pre_colored`, or
+   the operand's Store/Load reads and writes zero. */
+static int t_x86_64_fixed_register_precolor(void) {
     {
         int r;
         __asm__("movl $42, %%eax" : "=a"(r));
@@ -325,46 +954,149 @@ int main(void) {
     }
     return 0;
 }
+
+/* 4. x86_64 `"I"(const)` -- constant in [0, 31]. Used for shift counts. */
+static int t_imm_const_via_i_letter(void) {
+    int x = 5;
+    int r;
+    __asm__("shll %1, %0" : "=r"(r) : "I"(3), "0"(x));
+    return (r == 40) ? 0 : 1;
+}
+
+/* 5. `R` constraint -- legacy 8-register set. Same as `r` on x86_64. */
+static int t_x86_64_class_letter_r_synonym(void) {
+    int x = 100;
+    int r;
+    __asm__("movl %1, %0" : "=R"(r) : "R"(x));
+    return (r == 100) ? 0 : 1;
+}
+
+int main(void) {
+    int r;
+    if ((r = t_inline_asm_x86_64_mega()) != 0) return r;
+    if ((r = t_x86_64_asm_goto_pseudo_survives_edge()) != 0) return 100 + r;
+    if ((r = t_x86_64_fixed_register_precolor()) != 0) return 110 + r;
+    if ((r = t_imm_const_via_i_letter()) != 0) return 120 + r;
+    if ((r = t_x86_64_class_letter_r_synonym()) != 0) return 130 + r;
+    return 0;
+}
 "#;
+
+/// Consolidates codegen_inline_asm_x86_64_mega,
+/// codegen_inline_asm_x86_64_asm_goto_pseudo_survives_edge,
+/// codegen_inline_asm_x86_64_fixed_register_precolor,
+/// codegen_inline_asm_imm_const_via_i_letter and
+/// codegen_inline_asm_x86_64_class_letter_r_synonym.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_inline_asm_x86_64_mega() {
     assert_eq!(
-        compile_and_run("asm_x86_64_fixed_register_precolor", code, &[]),
+        compile_and_run("asm_x86_64_mega", X86_64_MATRIX, &[]),
         0,
-        "fixed-register asm operand must read/write the chordal-assigned register"
+        "pseudo live at asm-goto target must survive the edge, and a \
+         fixed-register asm operand must read/write the chordal-assigned register"
     );
 }
 
+// codegen_inline_asm_x86_64_fixed_precolor_collides_with_abi_pin:
+// Exercises the C3 Fixed-precolor + ABI-pin collision path
+// surfaced by Copilot review.
+//
+// The chordal allocator pre-colors two pseudo sources: (a) ABI-
+// pinned params via `allocate_arguments` (first int arg → RDI),
+// and (b) inline-asm `Fixed(R)` operands. When the same pseudo
+// shows up in both, `pre_colored.entry(pid).or_insert(reg)`
+// correctly keeps the prior ABI register, but the previous code
+// then unconditionally overwrote `self.locations[pid]` with the
+// asm-requested register. Allocator and codegen would disagree —
+// chordal coloring would use RDI, codegen would read RAX.
+//
+// Fix: commit whatever `pre_colored` actually holds to
+// `self.locations`, never the asm-requested register when an
+// earlier pin already won.
+//
+// Today's linearizer stores incoming ABI-args to local stack
+// slots at function entry, so the asm operand is loaded back
+// through a fresh pseudo that's NOT ABI-pinned — meaning the
+// bug doesn't trigger end-to-end on current c17. This test
+// therefore can't fail under the broken code today, but it
+// anchors the linearizer-side assumption: if a future change
+// makes the arg pseudo and the asm operand pseudo identical
+// (e.g. an arg-promotion pass under -O2 that bypasses the
+// entry Store/Load shuffle), the corrected codegen path here
+// continues to work. Without the regalloc.rs fix, that future
+// change would silently miscompile inline asm with no compile-
+// time signal.
+//
+// codegen_inline_asm_x86_64_class_letter_q: `q` constraint — byte-class
+// register. Used by kernel/glibc for byte stores via `movb`. c17 maps `q` to
+// `Any` since every modern x86_64 GP register has a low-byte alias.
+//
+// codegen_inline_asm_x86_64_class_letter_i_immediate: `I` constraint —
+// integer constant in [0, 31]. Used for shift counts. c17 maps `I` to `Imm`;
+// the assembler enforces the range.
+//
+// codegen_inline_asm_float_constant_as_immediate:
+// An immediate-class constraint substitutes the same bit pattern literally,
+// with no register spent on it.
+//
+// codegen_inline_asm_float_constant_in_sse_register:
+// An SSE-class constraint takes the reserved scratch register, loaded with
+// the constant. The clobber is declared because the operand *is* the scratch.
+//
+// SSE register constraints on an inline-asm *output* (#C139)
+//
+// `constraint_requires_register` and `constraint_requires_memory` know no FP
+// class letter, so `"=x"` matched neither and the output fell through to the
+// general-register arm: the template was handed `%rax` and `movsd %xmm0, %rax`
+// was refused by the assembler. The input side had been given
+// `constraint_requires_sse`; the output side had not.
+//
+// x86-64 only. aarch64's output loop falls through to `loc_to_asm_string`,
+// which renders a vector register as `dN` correctly.
+//
+// codegen_inline_asm_sse_output_constraint:
+// The plain case: a value out of the asm through an SSE register.
+//
+// codegen_inline_asm_sse_read_write_constraint:
+// A read-write `"+x"` operand. Its slot carries text rather than a register,
+// so the tied-input path that loads an output's initial value found nothing
+// and `addsd %xmm15, %xmm15` ran on whatever happened to be in the scratch.
+//
+// codegen_inline_asm_sse_output_and_inputs_share_the_scratch_budget:
+// An output and inputs together, which needs both scratch registers and so
+// pins that the two loops share one budget rather than each claiming Xmm15.
+//
+// codegen_inline_asm_x87_constraint:
+// An x87 register constraint reaches the x87 stack, not an XMM register.
+//
+// On x86 `f`, `t` and `u` are the **x87 stack** classes -- `t` is st(0), `u`
+// is st(1), `f` is any of them -- and they were counted as SSE. So a long
+// double operand was routed through an XMM scratch and the assembler was
+// handed `movt -48(%rbp), %xmm15`, which is not an instruction. musl's
+//
+//   long double sqrtl(long double x) { __asm__("fsqrt" : "+t"(x)); return x; }
+//
+// failed to build. c17 keeps a long double in memory and reaches it with
+// `fldt`/`fstpt`, so an x87 operand is pushed onto the FP stack before the
+// template and popped back after it.
 #[cfg(target_arch = "x86_64")]
-#[test]
-fn codegen_inline_asm_x86_64_fixed_precolor_collides_with_abi_pin() {
-    // Exercises the C3 Fixed-precolor + ABI-pin collision path
-    // surfaced by Copilot review.
-    //
-    // The chordal allocator pre-colors two pseudo sources: (a) ABI-
-    // pinned params via `allocate_arguments` (first int arg → RDI),
-    // and (b) inline-asm `Fixed(R)` operands. When the same pseudo
-    // shows up in both, `pre_colored.entry(pid).or_insert(reg)`
-    // correctly keeps the prior ABI register, but the previous code
-    // then unconditionally overwrote `self.locations[pid]` with the
-    // asm-requested register. Allocator and codegen would disagree —
-    // chordal coloring would use RDI, codegen would read RAX.
-    //
-    // Fix: commit whatever `pre_colored` actually holds to
-    // `self.locations`, never the asm-requested register when an
-    // earlier pin already won.
-    //
-    // Today's linearizer stores incoming ABI-args to local stack
-    // slots at function entry, so the asm operand is loaded back
-    // through a fresh pseudo that's NOT ABI-pinned — meaning the
-    // bug doesn't trigger end-to-end on current c17. This test
-    // therefore can't fail under the broken code today, but it
-    // anchors the linearizer-side assumption: if a future change
-    // makes the arg pseudo and the asm operand pseudo identical
-    // (e.g. an arg-promotion pass under -O2 that bypasses the
-    // entry Store/Load shuffle), the corrected codegen path here
-    // continues to work. Without the regalloc.rs fix, that future
-    // change would silently miscompile inline asm with no compile-
-    // time signal.
-    let code = r#"
+const X86_64_MATRIX_AND_O1: &str = r#"
+/* Exit codes: section k fails with 10*k + its original code.
+ *  1 x86_64_fixed_precolor_collides_with_abi_pin    10..19
+ *  2 x86_64_class_letter_q                          20..29
+ *  3 x86_64_class_letter_i_immediate                30..39
+ *  4 float_constant_as_immediate                    40..49
+ *  5 float_constant_in_sse_register                 50..59
+ *  6 sse_output_constraint                          60..69
+ *  7 sse_read_write_constraint                      70..79
+ *  8 sse_output_and_inputs_share_the_scratch_budget 80..89
+ *  9 x87_constraint                                 90..99
+ */
+
+/* 1. The C3 Fixed-precolor + ABI-pin collision path: when one pseudo is both
+   ABI-pinned and an asm Fixed operand, `self.locations` must hold what
+   `pre_colored` actually holds, never the asm-requested register. */
 __attribute__((noinline))
 static int incr_arg1_via_rsi(int arg) {
     // arg pinned by ABI to RDI (1st int arg); asm forces RSI ("+S").
@@ -388,34 +1120,814 @@ static int incr_arg2_via_rax(int a, int arg) {
     return arg;
 }
 
-int main(void) {
+static int t_x86_64_fixed_precolor_collides_with_abi_pin(void) {
     if (incr_arg1_via_rsi(37) != 42) return 1;
     if (incr_arg4_via_rdx(0, 0, 0, 33) != 40) return 2;
     if (incr_arg2_via_rax(0, 31) != 40) return 3;
     return 0;
 }
+
+/* 2. `q` constraint -- byte-class register. c17 maps `q` to `Any` since
+   every modern x86_64 GP register has a low-byte alias. */
+static int t_x86_64_class_letter_q(void) {
+    unsigned char dst = 0;
+    unsigned char src = 0x42;
+    __asm__("movb %1, %0" : "=qm"(dst) : "q"(src));
+    return (dst == 0x42) ? 0 : 1;
+}
+
+/* 3. `I` constraint -- integer constant in [0, 31]. c17 maps `I` to `Imm`;
+   the assembler enforces the range. */
+static int t_x86_64_class_letter_i_immediate(void) {
+    int x = 0x42;
+    int shifted;
+    // Shift left by a compile-time constant 4 -- fits in `I` range.
+    __asm__("shll $4, %0" : "+r"(shifted) : "0"(x));
+    return (shifted == 0x420) ? 0 : 1;
+}
+
+/* 4. An immediate-class constraint substitutes the same bit pattern
+   literally, with no register spent on it. */
+static int t_float_constant_as_immediate(void) {
+    unsigned long bits = 0;
+    __asm__ ("movq %1, %0" : "=r"(bits) : "i"(3.5));
+    return bits == 0x400C000000000000UL ? 0 : 1;
+}
+
+/* 5. An SSE-class constraint takes the reserved scratch register, loaded
+   with the constant. The clobber is declared because the operand *is* the
+   scratch. */
+static int t_float_constant_in_sse_register(void) {
+    double x = 0;
+    __asm__ ("movsd %%xmm15, %0" : "=m"(x) : "x"(2.25) : "xmm15");
+    return x == 2.25 ? 0 : 1;
+}
+
+/* 6. The plain case: a value out of the asm through an SSE register. */
+double sseo_src = 2.25;
+static int t_sse_output_constraint(void) {
+    double back = 0;
+    __asm__ ("movsd %1, %0" : "=x"(back) : "x"(sseo_src));
+    return back == 2.25 ? 0 : 1;
+}
+
+/* 7. A read-write `"+x"` operand: the tied-input path that loads an
+   output's initial value must find it. */
+double sserw_d = 1.5;
+float  sserw_f = 1.25f;
+static int t_sse_read_write_constraint(void) {
+    __asm__ ("addsd %0, %0" : "+x"(sserw_d));
+    if (sserw_d != 3.0) return 1;
+    __asm__ ("addss %0, %0" : "+x"(sserw_f));
+    if (sserw_f != 2.5f) return 2;
+    return 0;
+}
+
+/* 8. An output and inputs together, which needs both scratch registers and
+   so pins that the two loops share one budget rather than each claiming
+   Xmm15. */
+double sseb_a = 1.5, sseb_b = 2.25;
+static int t_sse_output_and_inputs_share_the_scratch_budget(void) {
+    double r = 0;
+    __asm__ ("movsd %1, %0; addsd %2, %0" : "=&x"(r) : "x"(sseb_a), "x"(sseb_b));
+    if (r != 3.75) return 1;
+
+    /* An SSE constant alongside an SSE output: one scratch each. */
+    double c = 0;
+    __asm__ ("movsd %1, %0" : "=x"(c) : "x"(0.5));
+    if (c != 0.5) return 2;
+    return 0;
+}
+
+/* 9. An x87 register constraint reaches the x87 stack, not an XMM
+   register. */
+static long double my_sqrtl(long double x) { __asm__("fsqrt" : "+t"(x)); return x; }
+static long double my_absl(long double x)  { __asm__("fabs"  : "+t"(x)); return x; }
+
+/* An x87 *input* -- the template consumes it and leaves nothing to store. */
+static int x87_to_int(long double x) { int r; __asm__("fistpl %0" : "=m"(r) : "t"(x)); return r; }
+
+/* Two x87 operands: `t` is st(0) and `u` is st(1), so `u` must be pushed
+   first for `t` to end up on top. Getting this backwards computes b/a. */
+static long double x87_mul(long double a, long double b) {
+    __asm__("fmulp" : "+t"(a) : "u"(b));
+    return a;
+}
+static long double x87_sub(long double a, long double b) {
+    __asm__("fsubrp" : "+t"(a) : "u"(b));
+    return a;
+}
+
+static int t_x87_constraint(void) {
+    if (my_sqrtl(4.0L) != 2.0L) return 1;
+    if (my_sqrtl(16.0L) != 4.0L) return 2;
+    if (my_absl(-3.5L) != 3.5L) return 3;
+    if (my_absl(3.5L) != 3.5L) return 4;
+
+    if (x87_to_int(7.0L) != 7) return 5;
+    if (x87_to_int(-3.0L) != -3) return 6;
+
+    if (x87_mul(2.0L, 3.0L) != 6.0L) return 7;
+    /* `fsubrp` computes st(1) - st(0), i.e. b - a. Asymmetric, so having the
+       two operands the wrong way round flips the sign rather than passing by
+       coincidence -- which is the whole point, since `u` must be pushed
+       before `t` for `t` to land on top. */
+    if (x87_sub(10.0L, 4.0L) != -6.0L) return 8;
+    if (x87_sub(4.0L, 10.0L) != 6.0L) return 9;
+    return 0;
+}
+
+int main(void) {
+    int r;
+    if ((r = t_x86_64_fixed_precolor_collides_with_abi_pin()) != 0) return 10 + r;
+    if ((r = t_x86_64_class_letter_q()) != 0) return 20 + r;
+    if ((r = t_x86_64_class_letter_i_immediate()) != 0) return 30 + r;
+    if ((r = t_float_constant_as_immediate()) != 0) return 40 + r;
+    if ((r = t_float_constant_in_sse_register()) != 0) return 50 + r;
+    if ((r = t_sse_output_constraint()) != 0) return 60 + r;
+    if ((r = t_sse_read_write_constraint()) != 0) return 70 + r;
+    if ((r = t_sse_output_and_inputs_share_the_scratch_budget()) != 0) return 80 + r;
+    if ((r = t_x87_constraint()) != 0) return 90 + r;
+    return 0;
+}
 "#;
+
+/// Consolidates codegen_inline_asm_x86_64_fixed_precolor_collides_with_abi_pin,
+/// codegen_inline_asm_x86_64_class_letter_q,
+/// codegen_inline_asm_x86_64_class_letter_i_immediate,
+/// codegen_inline_asm_float_constant_as_immediate,
+/// codegen_inline_asm_float_constant_in_sse_register,
+/// codegen_inline_asm_sse_output_constraint,
+/// codegen_inline_asm_sse_read_write_constraint,
+/// codegen_inline_asm_sse_output_and_inputs_share_the_scratch_budget and
+/// codegen_inline_asm_x87_constraint.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_inline_asm_x86_64_optimized_mega() {
     assert_eq!(
-        compile_and_run("asm_x86_64_fixed_precolor_abi_collide", code, &[]),
+        compile_and_run("asm_x86_64_opt_mega", X86_64_MATRIX_AND_O1, &[]),
         0,
-        "asm Fixed precolor must not split self.locations from pre_colored when the pseudo is already ABI-pinned"
+        "asm Fixed precolor must not split self.locations from pre_colored when \
+         the pseudo is already ABI-pinned"
     );
     assert_eq!(
-        compile_and_run_optimized("asm_x86_64_fixed_precolor_abi_collide_opt", code),
+        compile_and_run_optimized("asm_x86_64_opt_mega_opt", X86_64_MATRIX_AND_O1),
         0,
         "ABI-vs-asm-Fixed split-view fix must hold under -O1"
     );
 }
 
-// ============================================================================
-// AArch64 Inline Assembly Mega-Test
-// ============================================================================
-
-#[cfg(target_arch = "aarch64")]
+/// A phi at an `asm goto` label receives the value its jump carried.
+///
+/// The label is reached from the `asm` block (by the jump) and from the
+/// fallthrough, so it merges two values of `r`. Phi elimination put the copy
+/// for the jump's edge at the end of the `asm` block, after the `asm` -- which
+/// the jump leaves before reaching -- so the label read whatever `r` held
+/// before, at every level. The edge now gets a block of its own for the copy.
+///
+/// Kept apart: it runs at -O0 and -O2, a level set no other program here
+/// shares.
+#[cfg(target_arch = "x86_64")]
 #[test]
-fn codegen_inline_asm_aarch64_mega() {
+fn codegen_asm_goto_label_receives_the_value_its_jump_carries() {
     let code = r#"
+int __attribute__((noinline)) f(int x) {
+    int r = x + 1;
+    if (x > 5) r = 7;
+    __asm__ goto("jmp %l0" :::: taken);
+    r = 2;
+taken:
+    return r;
+}
 int main(void) {
+    if (f(10) != 7) return 1;
+    if (f(1) != 2) return 2;
+    return 0;
+}
+"#;
+    for level in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run(&format!("asm_goto_phi{level}"), code, &[level.to_string()]),
+            0,
+            "{level}"
+        );
+    }
+}
+
+// The `I` constraint test above surfaced this:
+//
+// `+r`(out) paired with a tied matching input (`"0"(in)`) must not double-
+// define the output's pseudo.  The linearizer used to emit BOTH a Load (the
+// `+r` read-half) AND a Copy (from the tied input) targeting the same
+// pseudo — fine at -O0 (no validator) but rejected by the optimizer-stage
+// I1 invariant ("single definition per pseudo") at -O2.  This test pins
+// the behavior down for several lvalue shapes so a regression in the
+// linearizer's tied-input handling is caught no matter which constraint
+// letter happens to surface it.
+#[cfg(target_arch = "x86_64")]
+const TIED_INPUTS: &str = r#"
+/* Exit codes: section k fails with 10*k + its original code.
+ *  1 tied_int_local   10..19
+ *  2 tied_int_global  20..29
+ *  3 tied_int_param   30..39
+ */
+
+/* 1. Local int. */
+static int t_tied_int_local(void) {
+    int src = 0x42;
+    int dst;
+    __asm__("shll $4, %0" : "+r"(dst) : "0"(src));
+    return (dst == 0x420) ? 0 : 1;
+}
+
+/* 2. Global int (different lvalue path -- Load from .data, not from
+   frame). */
+int g = 7;
+static int t_tied_int_global(void) {
+    int out;
+    __asm__("addl $3, %0" : "+r"(out) : "0"(g));
+    return (out == 10) ? 0 : 1;
+}
+
+/* 3. Parameter source (the `param_info.is_some()` linearizer branch -- also
+   historically emitted the wrong Copy when a tied input was present). */
+int helper(int src) {
+    int dst;
+    __asm__("addl $1, %0" : "+r"(dst) : "0"(src));
+    return dst;
+}
+static int t_tied_int_param(void) { return (helper(41) == 42) ? 0 : 1; }
+
+int main(void) {
+    int r;
+    if ((r = t_tied_int_local()) != 0) return 10 + r;
+    if ((r = t_tied_int_global()) != 0) return 20 + r;
+    if ((r = t_tied_int_param()) != 0) return 30 + r;
+    return 0;
+}
+"#;
+
+/// The three lvalue shapes (local, global, parameter) the test used to build
+/// as three programs, now one.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_inline_asm_tied_input_no_double_def() {
+    assert_eq!(compile_and_run_optimized("asm_tied_int", TIED_INPUTS), 0);
+}
+
+/// An x87 asm output whose home is a register, not a stack slot.
+///
+/// A `"=t"` output was accepted only when the allocator had put its pseudo on
+/// the stack, and a bare output pseudo is defined by nothing but the asm, so
+/// it never was: `double r; __asm__("fldpi" : "=t"(r));` was refused at every
+/// level, and gcc.c-torture's `compile/pr34966` -- the same output tied to an
+/// argument arriving in `%xmm0` -- at -O1 and above. A float or double result
+/// now goes through the x87 scratch into its register, and a long double one
+/// gets the stack slot it needs.
+///
+/// The tied input (`"0"(x)`) was never pushed at all, so the template ran on
+/// whatever the FP stack held; and `t` is the top of the stack whatever order
+/// the operands are written in.
+///
+/// Kept apart: it runs at -O0, -O1 and -O2, a level set no other program
+/// here shares.
+#[test]
+#[cfg(target_arch = "x86_64")]
+fn codegen_inline_asm_x87_output_in_register() {
+    let code = r#"
+static double pi(void) { double r; __asm__("fldpi" : "=t"(r)); return r; }
+static float one(void) { float r; __asm__("fld1" : "=t"(r)); return r; }
+static long double pil(void) { long double r; __asm__("fldpi" : "=t"(r)); return r; }
+
+/* pr34966: the output tied to an input that arrives in an XMM register. */
+static double ident(double x) { double r; __asm__ __volatile__("" : "=t"(r) : "0"(x)); return r; }
+static double my_sqrt(double x) { double r; __asm__("fsqrt" : "=t"(r) : "0"(x)); return r; }
+static float my_sqrtf(float x) { __asm__("fsqrt" : "+t"(x)); return x; }
+
+/* `t` and `u` together: fyl2x leaves st(1) * log2(st(0)) and pops. */
+static double ylog2x(double x, double y)
+{
+    double r;
+    __asm__("fyl2x" : "=t"(r) : "0"(x), "u"(y) : "st(1)");
+    return r;
+}
+
+/* The operands the other way round: `t` is still the top of the stack. */
+static double ylog2x_rev(double x, double y)
+{
+    double r;
+    __asm__("fyl2x" : "=t"(r) : "u"(y), "0"(x) : "st(1)");
+    return r;
+}
+
+/* An x87 input the template consumes, arriving in an XMM register. This was
+   refused as "not addressable" rather than staged. */
+static int to_int(double x) { int r; __asm__("fistpl %0" : "=m"(r) : "t"(x)); return r; }
+
+double g;
+volatile double v16 = 16.0;
+
+int main(void)
+{
+    if (pi() != 3.14159265358979323846) return 1;
+    if (one() != 1.0f) return 2;
+    if (pil() != 3.14159265358979323846264338327950288L) return 3;
+    if (ident(2.5) != 2.5) return 4;
+    if (my_sqrt(v16) != 4.0) return 5;
+    if (my_sqrt(16.0) != 4.0) return 6;
+    if (my_sqrtf(9.0f) != 3.0f) return 7;
+    if (ylog2x(8.0, 2.0) != 6.0) return 8;
+    if (ylog2x_rev(8.0, 2.0) != 6.0) return 11;
+    if (ylog2x_rev(2.0, 8.0) != 8.0) return 12;
+    if (to_int(7.0) != 7 || to_int(v16) != 16) return 13;
+    __asm__("fld1" : "=t"(g));
+    if (g != 1.0) return 9;
+    double t = ident(v16);
+    if (t + 1.0 != 17.0) return 10;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O1", "-O2"] {
+        let args = vec![opt.to_string()];
+        assert_eq!(
+            compile_and_run("asm_x87_output_in_register", code, &args),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+// ============================================================================
+// x86-64 register- and memory-operand pressure, at the matrix levels and -O2
+// ============================================================================
+//
+// codegen_inline_asm_early_clobber_x86_64:
+// Early-clobber outputs (`"=&r"`, `"+&r"`) on x86-64.
+//
+// An early-clobber output is written before the template has read all of its
+// inputs, so it may not share a register with any input -- including one
+// whose value dies at the asm, which is exactly the sharing the allocator
+// offers a plain output. The `&` was parsed and then dropped: `early` got
+// its output and `b` in one register and returned 1 + 10 + 1. The address of
+// a `"+m"` operand is an input too.
+//
+// Also here: an explicit tied input `"0"(a)` is operand `%1`, so the next
+// input is `%2`. Only the implicit input a `"+"` output creates goes
+// unnumbered, but every tied input was skipped, so `%2` named nothing and
+// the output failed to assemble. And six early-clobber outputs with six
+// inputs, which needs twelve distinct registers.
+//
+// codegen_inline_asm_numbering_x86_64:
+// Operand and label numbering, gcc's way, on x86-64.
+//
+// gcc numbers operands as outputs, then the inputs the source wrote, then the
+// hidden input each `"+"` output implies; `asm goto` labels come after all
+// of them, so with one `"+r"` output and one input the first label is
+// `%l3`. c17 counted labels from zero and read one digit, so `%l3` named
+// nothing and `%l10` named `%l1`. The outputs of an `asm goto` are valid on
+// every path out of it; c17 wrote them back only on the fall-through.
+//
+// codegen_inline_asm_register_operands_x86_64:
+// A register-class operand gets a register, whatever its value or wherever
+// the allocator put it.
+//
+// A constant under `"r"` was substituted as an immediate on both targets
+// (`leaq 8($100)`, `add x0, #100, #100`). And an operand the allocator
+// spilled was either rendered as its stack slot on aarch64 (`add x0, x0,
+// [x29, #240]`) or, on x86-64, handed a temp from R8/R9/RSI/RDI -- which the
+// allocator also uses, so it landed on another operand and read it twice.
+// Asm register operands are now colored before other values, and what still
+// spills goes in a scratch that holds nothing.
+//
+// codegen_inline_asm_mixed_memory_operands (x86-64 half):
+// Every kind of object a memory operand can name: a struct member, a
+// constant array element, a global, a static, a parameter, a plain local,
+// and one reached through a pointer.
+//
+// codegen_inline_asm_operands_avoid_clobbered_registers (x86-64 half):
+// No operand -- register input, output, or a memory operand's address --
+// may live in a register the statement clobbers: the template writes it
+// before reading them. Both backends exempted every operand from the
+// statement's clobbers, so `a` could be given `%rax` and the template's
+// first instruction destroyed it.
+//
+// codegen_inline_asm_pointer_memory_operands_under_pressure_x86_64:
+// Twelve operands reached through pointers, whose addresses are run-time
+// values: each needs a base register, and with `%rax` clobbered there are
+// fewer allocatable registers than addresses. Those addresses are register
+// demands of the statement, colored first; the one left over is loaded into
+// R10. gcc builds this at -O2 and reports impossible constraints at -O0.
+//
+// codegen_inline_asm_local_memory_operands_x86_64:
+// One asm statement over 16 locals with 25 operands: `"+m"` chars and
+// longs, `"=m"` and `"m"`, in the gcc torture shape.
+//
+// A memory operand naming an object at a constant offset needs no register:
+// it is addressed where it lives, `-N(%rbp)`, as gcc does. c17 routed it
+// through an address pseudo instead, and with more operands than registers
+// that address was spilled -- and x86-64 then substituted the *spill slot*
+// as the operand, so the template read and wrote the saved pointer rather
+// than the object. gcc returns 0; c17 returned 15.
+
+/// The definitions of [`codegen_inline_asm_x86_64_pressure_mega`]'s local
+/// memory-operand section: `NI`, `sink`, `touch` and `many_memory_operands`,
+/// generated. `cc/test_asm/codegen_inline_asm.rs` has the same generator for
+/// the test that reads this function's assembly.
+#[cfg(target_arch = "x86_64")]
+fn many_local_memory_operands_x86_64() -> String {
+    let plan = ["ch", "rw", "wo", "in"].repeat(4);
+    let (mut decls, mut outs, mut ins, mut checks) = (vec![], vec![], vec![], vec![]);
+    outs.push(r#"[sum] "=m"(sum)"#.to_string());
+    let mut body = String::from(r"movq $0, %[sum]\n\t");
+    let mut sum = 0;
+    for (i, kind) in plan.iter().enumerate() {
+        match *kind {
+            "ch" => {
+                decls.push(format!("    char m{i} = {i};"));
+                outs.push(format!(r#"[m{i}] "+m"(m{i})"#));
+                body.push_str(&format!(
+                    r"movb %[m{i}], %%al\n\taddb $1, %%al\n\tmovb %%al, %[m{i}]\n\t"
+                ));
+                checks.push(format!("    if (m{i} != {i} + 1) return {};", i + 1));
+            }
+            "rw" => {
+                decls.push(format!("    long m{i} = {i} * 1000;"));
+                outs.push(format!(r#"[m{i}] "+m"(m{i})"#));
+                body.push_str(&format!(
+                    r"movq %[m{i}], %%rax\n\taddq $1, %%rax\n\tmovq %%rax, %[m{i}]\n\t"
+                ));
+                checks.push(format!("    if (m{i} != {i} * 1000 + 1) return {};", i + 1));
+            }
+            "wo" => {
+                decls.push(format!("    long m{i} = {i} * 1000;"));
+                outs.push(format!(r#"[m{i}] "=m"(m{i})"#));
+                body.push_str(&format!(r"movq ${}, %[m{i}]\n\t", i + 7));
+                checks.push(format!("    if (m{i} != {}) return {};", i + 7, i + 1));
+            }
+            _ => {
+                decls.push(format!("    long m{i} = {i} * 1000;"));
+                ins.push(format!(r#"[m{i}] "m"(m{i})"#));
+                body.push_str(&format!(r"movq %[m{i}], %%rax\n\taddq %%rax, %[sum]\n\t"));
+                sum += i * 1000;
+            }
+        }
+    }
+    format!(
+        r#"#define NI __attribute__((noinline))
+volatile long sink;
+NI void touch(void *p) {{ sink += *(volatile char *)p; }}
+
+NI int many_memory_operands(void)
+{{
+    volatile char lo[4000];
+{decls}
+    long sum;
+    touch((void *)lo);
+    __asm__ volatile(
+        "{body}"
+        : {outs}
+        : {ins}
+        : "rax", "memory");
+{checks}
+    if (sum != {sum}) return 100;
+    return 0;
+}}
+"#,
+        decls = decls.join("\n"),
+        outs = outs.join(", "),
+        ins = ins.join(", "),
+        checks = checks.join("\n"),
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+const X86_64_PRESSURE: &str = r#"
+/* Appended to `many_local_memory_operands_x86_64()`, which defines `NI`,
+ * `sink`, `touch` and `many_memory_operands`.
+ *
+ * Exit codes: section k fails with its base + its original code.
+ *  1 early_clobber_x86_64                 10..19
+ *  2 numbering_x86_64                     20..29
+ *  3 register_operands_x86_64             30..39
+ *  4 mixed_memory_operands (x86-64 half)  40..49
+ *  5 operands_avoid_clobbered_registers (x86-64 half) 50..59
+ *  6 pointer_memory_operands_under_pressure_x86_64    60..79
+ *  7 local_memory_operands_x86_64        100..116, 200
+ */
+
+/* ---- 1. early_clobber_x86_64 ---- */
+/* Each "=&r" output is written before any input is read, so no output may
+   share a register with an input, even one whose value dies at the asm. */
+NI long ec_early(long a, long b)
+{
+    long t;
+    __asm__("movq $1, %0\n\taddq %1, %0\n\taddq %2, %0" : "=&r"(t) : "r"(a), "r"(b));
+    return t;
+}
+NI long ec_early2(long a, long b)
+{
+    long t, u;
+    __asm__("movq $1, %0\n\tmovq $2, %1\n\taddq %2, %0\n\taddq %3, %1"
+            : "=&r"(t), "=&r"(u) : "r"(a), "r"(b));
+    return t * 1000 + u;
+}
+/* The address of a "+m" operand is an input too. */
+NI long ec_early_mem(long *p)
+{
+    long t;
+    __asm__("movq $5, %0\n\taddq %1, %0\n\tmovq %0, %1" : "=&r"(t), "+m"(*p));
+    return t;
+}
+/* "+&r": read-write, and still apart from the other input. */
+NI long ec_plus_early(long t, long b)
+{
+    __asm__("addq %1, %0\n\taddq %1, %0" : "+&r"(t) : "r"(b));
+    return t;
+}
+/* No "&": the output may take a dying input's register, and must still be
+   right when it does. */
+NI long ec_plain(long a)
+{
+    long t;
+    __asm__("leaq 1(%1), %0" : "=r"(t) : "r"(a));
+    return t;
+}
+/* An explicit tied input "0" is operand %1; the next input is %2. */
+NI long ec_tied(long a, long b)
+{
+    long t;
+    __asm__("addq %2, %0" : "=r"(t) : "0"(a), "r"(b));
+    return t;
+}
+NI long ec_tied3(long a, long b, long c)
+{
+    long t;
+    __asm__("addq %2, %0\n\taddq %3, %0" : "=r"(t) : "0"(a), "r"(b), "r"(c));
+    return t;
+}
+/* 6 early-clobber outputs and 6 inputs: 12 distinct registers. */
+NI long ec_pressure(long a0, long a1, long a2, long a3, long a4, long a5)
+{
+    long o0, o1, o2, o3, o4, o5;
+    __asm__("movq $1, %0\n\tmovq $2, %1\n\tmovq $3, %2\n\tmovq $4, %3\n\tmovq $5, %4\n\tmovq $6, %5\n\taddq %6, %0\n\taddq %7, %1\n\taddq %8, %2\n\taddq %9, %3\n\taddq %10, %4\n\taddq %11, %5" : "=&r"(o0), "=&r"(o1), "=&r"(o2), "=&r"(o3), "=&r"(o4), "=&r"(o5) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5));
+    return o0 * 1 + o1 * 10 + o2 * 100 + o3 * 1000 + o4 * 10000 + o5 * 100000;
+}
+static int t_early_clobber_x86_64(void)
+{
+    long v = 100;
+    if (ec_early(10, 20) != 31) return 1;
+    if (ec_early2(10, 20) != 11 * 1000 + 22) return 2;
+    if (ec_early_mem(&v) != 105 || v != 105) return 3;
+    if (ec_plus_early(1, 10) != 21) return 4;
+    if (ec_plain(41) != 42) return 5;
+    if (ec_tied(10, 20) != 30 || ec_tied(20, 10) != 30) return 6;
+    if (ec_tied3(1, 2, 3) != 6) return 7;
+    if (ec_pressure(1, 1, 1, 1, 1, 1) != 765432) return 8;
+    return 0;
+}
+
+/* ---- 2. numbering_x86_64 ---- */
+/* gcc numbers operands as outputs, the inputs written, then the hidden input
+   of each "+" output; asm goto labels come after all of them. */
+NI long plus_then_input(long t, long b)
+{
+    __asm__("addq %1, %0" : "+r"(t) : "r"(b));
+    return t;
+}
+NI long two_plus(long t, long u, long b)
+{
+    __asm__("addq %2, %0\n\taddq %2, %1" : "+r"(t), "+r"(u) : "r"(b));
+    return t * 100 + u;
+}
+/* One output, one input, one hidden input: the label is %l3. */
+NI int goto_after_hidden(long t, long b)
+{
+    __asm__ goto("addq %1, %0\n\tjmp %l3" : "+r"(t) : "r"(b) : : out);
+    return 0;
+out:
+    return (int)t;
+}
+/* Ten inputs: the label is %l10, two digits. */
+NI int goto_two_digits(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7, long a8, long a9)
+{
+    __asm__ goto("jmp %l10" : : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6), "r"(a7), "r"(a8), "r"(a9) : : out);
+    return 0;
+out:
+    return 1;
+}
+/* The output is valid on every path out of an asm goto, not only the
+   fall-through. */
+NI long goto_output(long x)
+{
+    long r;
+    __asm__ goto("leaq 1(%1), %0\n\tcmpq $10, %1\n\tjg %l[big]\n\tjmp %l[small]" : "=r"(r) : "r"(x) : "cc" : big, small);
+    return -1;
+big:
+    return r * 10;
+small:
+    return r;
+}
+static int t_numbering_x86_64(void)
+{
+    if (plus_then_input(1, 10) != 11) return 1;
+    if (two_plus(1, 2, 10) != 1112) return 2;
+    if (goto_after_hidden(1, 10) != 11) return 3;
+    if (goto_two_digits(0,1,2,3,4,5,6,7,8,9) != 1) return 4;
+    if (goto_output(20) != 210 || goto_output(3) != 4) return 5;
+    return 0;
+}
+
+/* ---- 3. register_operands_x86_64 ---- */
+/* A register-class input whose value is a constant still goes in a register:
+   the template may use it where no immediate is allowed. */
+NI long ro_k(void) { long t; __asm__("leaq 8(%1), %0" : "=r"(t) : "r"(100L)); return t; }
+
+volatile long ro_vseed = 1;
+/* 12 register inputs in one statement while other values stay live across
+   it: an operand without a register of its own must not be put in one that
+   holds something else. */
+NI long ro_wide(long *a)
+{
+    long k0 = ro_vseed * 100;
+    long k1 = ro_vseed * 101;
+    long k2 = ro_vseed * 102;
+    long k3 = ro_vseed * 103;
+    long k4 = ro_vseed * 104;
+    long k5 = ro_vseed * 105;
+    long r;
+    __asm__("movq $0, %0\n\taddq %1, %0\n\taddq %2, %0\n\taddq %3, %0\n\taddq %4, %0\n\taddq %5, %0\n\taddq %6, %0\n\taddq %7, %0\n\taddq %8, %0\n\taddq %9, %0\n\taddq %10, %0\n\taddq %11, %0\n\taddq %12, %0" : "=&r"(r) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(a[4]), "r"(a[5]), "r"(a[6]), "r"(a[7]), "r"(a[8]), "r"(a[9]), "r"(a[10]), "r"(a[11]));
+    return r + k0 + k1 + k2 + k3 + k4 + k5;
+}
+static int t_register_operands_x86_64(void)
+{
+    if (ro_k() != 108) return 2;
+    long a[12];
+    for (int i = 0; i < 12; i++) a[i] = i + 1;
+    return ro_wide(a) == 693 ? 0 : 1;
+}
+
+/* ---- 4. mixed_memory_operands, x86-64 half ---- */
+struct P { long a; int b[4]; };
+long mm_g = 5;
+static long mm_sg = 6;
+NI long mm_mix(long param, long *ptr)
+{
+    struct P s = { 1, { 2, 3, 4, 5 } };
+    long arr[6] = { 10, 11, 12, 13, 14, 15 };
+    long local = 7;
+    __asm__ volatile(
+        "addq $1, %0\n\taddl $1, %1\n\taddq $1, %2\n\taddq $1, %3\n\t"
+        "addq $1, %4\n\taddq $1, %5\n\taddq $1, %6\n\taddq $1, %7"
+        : "+m"(s.a), "+m"(s.b[2]), "+m"(arr[4]), "+m"(mm_g), "+m"(mm_sg), "+m"(param),
+          "+m"(*ptr), "+m"(local));
+    return s.a + s.b[2] + arr[4] + mm_g + mm_sg + param + *ptr + local
+         + s.b[1] + s.b[3] + arr[3] + arr[5];
+}
+static int t_mixed_memory_operands(void)
+{
+    long x = 100;
+    if (mm_mix(20, &x) != 2 + 5 + 15 + 6 + 7 + 21 + 101 + 8 + 3 + 5 + 13 + 15) return 1;
+    if (x != 101 || mm_g != 6 || mm_sg != 7) return 2;
+    return 0;
+}
+
+/* ---- 5. operands_avoid_clobbered_registers, x86-64 half ---- */
+/* The template writes %rax before reading its operands, and says so: no
+   operand may live in a clobbered register. */
+NI long reg_in(long a, long b)
+{
+    long t;
+    __asm__("movq $1000, %%rax\n\tmovq %1, %0\n\taddq %2, %0" : "=r"(t) : "r"(a), "r"(b) : "rax");
+    return t;
+}
+NI long mem_in(long *p, long *q)
+{
+    long t;
+    __asm__("movq $0, %%rax\n\tmovq %1, %0\n\taddq %2, %0" : "=r"(t) : "m"(*p), "m"(*q) : "rax");
+    return t;
+}
+NI long out_clob(long a)
+{
+    long t;
+    __asm__("movq %1, %0\n\tmovq $0, %%rax" : "=r"(t) : "r"(a) : "rax");
+    return t;
+}
+static int t_operands_avoid_clobbered_registers(void)
+{
+    long x = 3, y = 4;
+    if (reg_in(10, 20) != 30) return 1;
+    if (mem_in(&x, &y) != 7) return 2;
+    if (out_clob(5) != 5) return 3;
+    return 0;
+}
+
+/* ---- 6. pointer_memory_operands_under_pressure_x86_64 ---- */
+NI void *opaque(void *p) { return p; }
+NI int pointers(void)
+{
+    long m0 = 0 * 10;
+    long m1 = 1 * 10;
+    long m2 = 2 * 10;
+    long m3 = 3 * 10;
+    long m4 = 4 * 10;
+    long m5 = 5 * 10;
+    long m6 = 6 * 10;
+    long m7 = 7 * 10;
+    long m8 = 8 * 10;
+    long m9 = 9 * 10;
+    long m10 = 10 * 10;
+    long m11 = 11 * 10;
+    long *p0 = opaque(&m0);
+    long *p1 = opaque(&m1);
+    long *p2 = opaque(&m2);
+    long *p3 = opaque(&m3);
+    long *p4 = opaque(&m4);
+    long *p5 = opaque(&m5);
+    long *p6 = opaque(&m6);
+    long *p7 = opaque(&m7);
+    long *p8 = opaque(&m8);
+    long *p9 = opaque(&m9);
+    long *p10 = opaque(&m10);
+    long *p11 = opaque(&m11);
+    __asm__ volatile("addq $1, %0\n\taddq $1, %1\n\taddq $1, %2\n\taddq $1, %3\n\taddq $1, %4\n\taddq $1, %5\n\taddq $1, %6\n\taddq $1, %7\n\taddq $1, %8\n\taddq $1, %9\n\taddq $1, %10\n\taddq $1, %11\n\t" : "+m"(*p0), "+m"(*p1), "+m"(*p2), "+m"(*p3), "+m"(*p4), "+m"(*p5), "+m"(*p6), "+m"(*p7), "+m"(*p8), "+m"(*p9), "+m"(*p10), "+m"(*p11) : : "rax", "memory");
+    if (m0 != 0 * 10 + 1) return 1;
+    if (m1 != 1 * 10 + 1) return 2;
+    if (m2 != 2 * 10 + 1) return 3;
+    if (m3 != 3 * 10 + 1) return 4;
+    if (m4 != 4 * 10 + 1) return 5;
+    if (m5 != 5 * 10 + 1) return 6;
+    if (m6 != 6 * 10 + 1) return 7;
+    if (m7 != 7 * 10 + 1) return 8;
+    if (m8 != 8 * 10 + 1) return 9;
+    if (m9 != 9 * 10 + 1) return 10;
+    if (m10 != 10 * 10 + 1) return 11;
+    if (m11 != 11 * 10 + 1) return 12;
+    return 0;
+}
+
+int main(void)
+{
+    int r;
+    if ((r = t_early_clobber_x86_64()) != 0) return 10 + r;
+    if ((r = t_numbering_x86_64()) != 0) return 20 + r;
+    if ((r = t_register_operands_x86_64()) != 0) return 30 + r;
+    if ((r = t_mixed_memory_operands()) != 0) return 40 + r;
+    if ((r = t_operands_avoid_clobbered_registers()) != 0) return 50 + r;
+    if ((r = pointers()) != 0) return 60 + r;
+    if ((r = many_memory_operands()) != 0) return 100 + r;
+    return 0;
+}
+"#;
+
+/// Consolidates codegen_inline_asm_early_clobber_x86_64,
+/// codegen_inline_asm_numbering_x86_64,
+/// codegen_inline_asm_register_operands_x86_64,
+/// codegen_inline_asm_local_memory_operands_x86_64,
+/// codegen_inline_asm_pointer_memory_operands_under_pressure_x86_64 and the
+/// x86-64 halves of codegen_inline_asm_mixed_memory_operands and
+/// codegen_inline_asm_operands_avoid_clobbered_registers. The templates are
+/// x86-64 assembly, run on the host: an x86-64 host only.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn codegen_inline_asm_x86_64_pressure_mega() {
+    let src = format!("{}{X86_64_PRESSURE}", many_local_memory_operands_x86_64());
+    assert_eq!(compile_and_run("asm_x86_pressure", &src, &[]), 0);
+    let o2 = vec!["-O2".to_string()];
+    assert_eq!(compile_and_run("asm_x86_pressure_o2", &src, &o2), 0);
+}
+
+// ============================================================================
+// AArch64 programs
+// ============================================================================
+//
+// codegen_inline_asm_aarch64_class_letter_k_immediate: `K` on aarch64 —
+// 32-bit logical immediate. c17 maps to Imm.
+//
+// codegen_inline_asm_width_modifier_applies_to_a_materialized_constant:
+// The template chooses the width it wants, so a materialized constant has to
+// be handed over as a *register* rather than a pre-rendered name: `%w1`
+// against a hard-coded `x9` assembled as `mov w0, x9`.
+//
+// codegen_inline_asm_two_general_operands_are_distinct:
+// Two general-register operands get two different registers.
+//
+// Both scratch-taking arms took `Reg::scratch_regs().0` -- X9 -- with no
+// tracking of whether it was already spent, so `"r"(a), "r"(b)` with two FP
+// values emitted `fmov x9, d0; fmov x9, d1; add x0, x9, x9`: operand 1
+// destroyed, the result twice operand 2, and no diagnostic. X10 and X11 were
+// reserved and idle the whole time.
+#[cfg(target_arch = "aarch64")]
+const AARCH64_MATRIX: &str = r#"
+/* Exit codes: section 1 keeps its own codes (1..75); section k >= 2 fails
+ * with 100 + 10*(k-2) + its original code.
+ *  1 inline_asm_aarch64_mega                              1..99
+ *  2 aarch64_class_letter_k_immediate                   100..109
+ *  3 width_modifier_applies_to_a_materialized_constant  110..119
+ *  4 two_general_operands_are_distinct                  120..129
+ */
+
+/* 1. The AArch64 inline assembly mega-test. */
+static int t_inline_asm_aarch64_mega(void) {
     // ========== BASIC ASM (returns 1-19) ==========
     {
         // Output register
@@ -542,959 +2054,19 @@ end_goto:
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("asm_aarch64_mega", code, &[]), 0);
-}
 
-// ============================================================================
-// C6b — Memory-Barrier Pattern Lock-In Tests
-// ============================================================================
-//
-// These tests lock in the heavily-used `asm volatile("..." ::: "memory")`
-// idioms — spin-loop pause/yield, full fence (mfence / dmb ish), and the
-// double-checked-init pattern — against future memory-reordering passes.
-//
-// Today no IR pass reorders memory ops across an instruction satisfying
-// `Instruction::is_memory_barrier()` (see contract docs in `cc/ir/dce.rs`
-// and `cc/ir/instcombine.rs`). When future passes do start reordering
-// (GVN, LICM, load-store forwarding, machine scheduler), they MUST
-// consult the predicate before crossing. If they regress, these tests
-// fail loudly with the wrong return code instead of silently breaking a
-// real spinlock under -O2.
-//
-// Each pattern runs at both default and -O1 to catch the optimizer-only
-// regression case.
-
-/// Plain pointer-aliased store/reload across an empty `asm volatile("" :::
-/// "memory")` compiler barrier. A reordering pass that ignored the
-/// barrier could forward the first store's value into the post-barrier
-/// load, missing the intervening store. Today c17 doesn't reorder; this
-/// test locks it in.
-#[test]
-fn codegen_inline_asm_memory_barrier_pointer_aliased_reload() {
-    let code = r#"
-int main(void) {
-    int sentinel = 0;
-    int *p = &sentinel;
-    *p = 42;
-    __asm__ volatile("" ::: "memory");
-    *p = 99;
-    __asm__ volatile("" ::: "memory");
-    int read_back = *p;
-    return (read_back == 99) ? 0 : 1;
-}
-"#;
-    assert_eq!(
-        compile_and_run("asm_memory_barrier_reload", code, &[]),
-        0,
-        "memory clobber must prevent store-forwarding the stale 42 across the barrier"
-    );
-    assert_eq!(
-        compile_and_run_optimized("asm_memory_barrier_reload_opt", code),
-        0,
-        "memory clobber semantics must hold at -O1 too"
-    );
-}
-
-/// Spin-wait loop polling a non-volatile location through a pointer.
-/// The `asm volatile("pause"/"yield" ::: "memory")` inside the loop body
-/// must force a reload of `*p` every iteration — otherwise a hoisting
-/// pass would lift `*p` out of the loop and the loop would never
-/// terminate. The loop body also writes the flag, so a single-threaded
-/// run reaches termination iff the reload happens.
-#[test]
-fn codegen_inline_asm_memory_barrier_spin_wait_pattern() {
-    let code = r#"
-int main(void) {
-    int flag = 1;
-    int *p = &flag;
-    int iters = 0;
-    while (*p) {
-#if defined(__x86_64__)
-        __asm__ volatile("pause" ::: "memory");
-#elif defined(__aarch64__)
-        __asm__ volatile("yield" ::: "memory");
-#else
-        __asm__ volatile("" ::: "memory");
-#endif
-        *p = 0;
-        iters++;
-        if (iters > 10) return 2;
-    }
-    return (iters == 1) ? 0 : 1;
-}
-"#;
-    assert_eq!(
-        compile_and_run("asm_memory_barrier_spin_wait", code, &[]),
-        0,
-        "pause/yield + memory clobber must force flag reload each iteration"
-    );
-    assert_eq!(
-        compile_and_run_optimized("asm_memory_barrier_spin_wait_opt", code),
-        0,
-        "loop body memory clobber must defeat -O1 hoisting of *p"
-    );
-}
-
-/// Full memory fence (`mfence` on x86_64, `dmb ish` on aarch64). The
-/// surrounding stores and loads must straddle the fence — a pass that
-/// reordered the post-fence load before the fence (or dropped the
-/// pre-fence store) would observe the wrong value.
-#[test]
-fn codegen_inline_asm_memory_barrier_full_fence() {
-    let code = r#"
-int main(void) {
-    int x = 5;
-    int *p = &x;
-    *p = 10;
-#if defined(__x86_64__)
-    __asm__ volatile("mfence" ::: "memory");
-#elif defined(__aarch64__)
-    __asm__ volatile("dmb ish" ::: "memory");
-#else
-    __asm__ volatile("" ::: "memory");
-#endif
-    *p = 20;
-    return (*p == 20) ? 0 : 1;
-}
-"#;
-    assert_eq!(
-        compile_and_run("asm_memory_barrier_full_fence", code, &[]),
-        0,
-        "stores around a full fence must not be reordered or dropped"
-    );
-    assert_eq!(
-        compile_and_run_optimized("asm_memory_barrier_full_fence_opt", code),
-        0,
-        "full fence semantics must hold at -O1 too"
-    );
-}
-
-/// Double-checked-init pattern. The release barrier in `slow_init()`
-/// must order the `value = 42` store before the `initialized = 1` store.
-/// The acquire barrier in `get_value()` must force a reload of `value`
-/// after seeing `initialized == 1`. A reordering pass that ignored
-/// either barrier could observe `value == 0` despite `initialized == 1`.
-/// Single-threaded execution still exercises the compiler-level
-/// reordering semantics — what we're locking in is "the compiler does
-/// not reorder/eliminate loads or stores across the barriers."
-#[test]
-fn codegen_inline_asm_memory_barrier_double_checked_init() {
-    let code = r#"
-static int initialized = 0;
-static int value = 0;
-
-static void slow_init(void) {
-    value = 42;
-    __asm__ volatile("" ::: "memory");
-    initialized = 1;
-}
-
-static int get_value(void) {
-    if (!initialized) {
-        slow_init();
-    }
-    __asm__ volatile("" ::: "memory");
-    return value;
-}
-
-int main(void) {
-    if (get_value() != 42) return 1;
-    if (get_value() != 42) return 2;
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("asm_memory_barrier_dci", code, &[]),
-        0,
-        "double-checked init: barriers must preserve store ordering and force value reload"
-    );
-    assert_eq!(
-        compile_and_run_optimized("asm_memory_barrier_dci_opt", code),
-        0,
-        "double-checked init must hold at -O1 too"
-    );
-}
-
-// ============================================================================
-// C9 — Multi-Alternative Constraint Tests
-// ============================================================================
-//
-// `"rm"`, `"ri"`, `"rmi"`, and `"g"` (= `"rmi"`) let the compiler choose
-// register vs memory vs immediate based on what fits cheapest given the
-// operand's location. A constraint that lists any non-register class does
-// not force-load a spilled value into a temp register, and one that lists
-// any non-memory class does not force a memory operand.
-//
-// These tests are arch-independent — the patterns work on both x86_64
-// and aarch64 because the assembly inside the asm template uses
-// arch-specific mnemonics in dedicated branches.
-
-/// `"+rm"` with a value that lives in a register. The asm template must
-/// substitute the register form; the value must be incremented in place.
-#[test]
-fn codegen_inline_asm_multi_alt_rm_register_path() {
-    let code = r#"
-int main(void) {
-    int x = 41;
-#if defined(__x86_64__)
-    __asm__("addl $1, %0" : "+rm"(x));
-#elif defined(__aarch64__)
-    __asm__("add %w0, %w0, #1" : "+rm"(x));
-#endif
-    return (x == 42) ? 0 : 1;
-}
-"#;
-    assert_eq!(
-        compile_and_run("asm_multi_alt_rm_register", code, &[]),
-        0,
-        "+rm with register-resident value must use register syntax"
-    );
-    assert_eq!(
-        compile_and_run_optimized("asm_multi_alt_rm_register_opt", code),
-        0
-    );
-}
-
-/// `"+m"` on an addr-taken value — value lives in memory by construction.
-#[test]
-fn codegen_inline_asm_multi_alt_m_memory_path() {
-    let code = r#"
-int main(void) {
-    int x = 99;
-    int *p = &x;  // address taken → x stays in memory (mem2reg can't promote)
-#if defined(__x86_64__)
-    __asm__("addl $1, %0" : "+m"(*p));
-#elif defined(__aarch64__)
-    __asm__("ldr w8, %0\n\tadd w8, w8, #1\n\tstr w8, %0" : "+m"(*p));
-#endif
-    return (*p == 100) ? 0 : 1;
-}
-"#;
-    assert_eq!(
-        compile_and_run("asm_multi_alt_m_memory", code, &[]),
-        0,
-        "+m on addr-taken operand must use memory syntax"
-    );
-    assert_eq!(
-        compile_and_run_optimized("asm_multi_alt_m_memory_opt", code),
-        0
-    );
-}
-
-/// `"g"` (= `"rmi"`) — most permissive. Tested with both a runtime
-/// value (compiler should use register form) and a const value
-/// (compiler may substitute immediate; today it falls through to
-/// register, which is also correct — C9c later optimizes this).
-#[test]
-fn codegen_inline_asm_multi_alt_g_runtime_value() {
-    let code = r#"
-int main(void) {
-    int x = 7;
-    int r;
-#if defined(__x86_64__)
-    __asm__("movl %1, %0\n\taddl $35, %0" : "=r"(r) : "g"(x));
-#elif defined(__aarch64__)
-    __asm__("add %w0, %w1, #35" : "=r"(r) : "g"(x));
-#endif
-    return (r == 42) ? 0 : 1;
-}
-"#;
-    assert_eq!(
-        compile_and_run("asm_multi_alt_g_runtime", code, &[]),
-        0,
-        "g constraint must work with a runtime int operand"
-    );
-    assert_eq!(
-        compile_and_run_optimized("asm_multi_alt_g_runtime_opt", code),
-        0
-    );
-}
-
-/// `"=rm"` output to an addr-taken local — codegen must place the
-/// result into memory (no force-load to a temp register).
-#[test]
-fn codegen_inline_asm_multi_alt_output_rm_to_memory() {
-    let code = r#"
-int main(void) {
-    int dst = 0;
-    int *p = &dst;
-#if defined(__x86_64__)
-    __asm__("movl $123, %0" : "=rm"(*p));
-#elif defined(__aarch64__)
-    __asm__("mov %w0, #123" : "=rm"(*p));
-#endif
-    return (*p == 123) ? 0 : 1;
-}
-"#;
-    assert_eq!(
-        compile_and_run("asm_multi_alt_output_rm", code, &[]),
-        0,
-        "=rm output to addr-taken location must succeed"
-    );
-    assert_eq!(
-        compile_and_run_optimized("asm_multi_alt_output_rm_opt", code),
-        0
-    );
-}
-
-/// Multiple multi-alt operands in one asm, mixed input/output.
-#[test]
-fn codegen_inline_asm_multi_alt_mixed_operands() {
-    let code = r#"
-int main(void) {
-    int a = 10, b = 20;
-    int sum;
-#if defined(__x86_64__)
-    __asm__("movl %1, %0\n\taddl %2, %0"
-            : "=r"(sum)
-            : "rm"(a), "rm"(b));
-#elif defined(__aarch64__)
-    __asm__("add %w0, %w1, %w2"
-            : "=r"(sum)
-            : "rm"(a), "rm"(b));
-#endif
-    return (sum == 30) ? 0 : 1;
-}
-"#;
-    assert_eq!(
-        compile_and_run("asm_multi_alt_mixed", code, &[]),
-        0,
-        "multiple rm-constrained operands in one asm must compile and run"
-    );
-    assert_eq!(
-        compile_and_run_optimized("asm_multi_alt_mixed_opt", code),
-        0
-    );
-}
-
-// ============================================================================
-// C9c — Immediate-Bearing Constraint Lock-In Tests
-// ============================================================================
-//
-// `"ri"` / `"g"` / x86_64's `I`/`J`/.../`O` accept a const-propagated
-// operand by substituting it as a literal in the asm template instead
-// of materializing it through a register. The substitution is implicit
-// in `emit_inline_asm`'s `Loc::Imm(v)` arm — when an operand's
-// allocator location is `Loc::Imm`, the codegen renders it as `$value`
-// (x86_64) regardless of which class letter accepted it. These tests
-// pin the behavior so a future codegen change that, e.g., forced a
-// register load for `"r"` operands with `Loc::Imm` would break loudly
-// instead of silently regressing asm quality.
-//
-// The tests inspect the resulting assembly only via the runtime
-// observation that the test exits 0 — the deeper "is the literal
-// substituted, not register-loaded?" assertion is left informal,
-// since the runtime semantics are what matters for correctness.
-
-#[test]
-fn codegen_inline_asm_imm_const_via_ri() {
-    // `"ri"(const)` — register or immediate. Const operand should
-    // substitute as `$N` literal.
-    let code = r#"
-int main(void) {
-    int r;
-#if defined(__x86_64__)
-    __asm__("movl %1, %0" : "=r"(r) : "ri"(42));
-#elif defined(__aarch64__)
-    __asm__("mov %w0, %w1" : "=r"(r) : "ri"(42));
-#endif
-    return (r == 42) ? 0 : 1;
-}
-"#;
-    assert_eq!(
-        compile_and_run("asm_imm_const_ri", code, &[]),
-        0,
-        "ri with const operand must substitute as immediate"
-    );
-    assert_eq!(compile_and_run_optimized("asm_imm_const_ri_opt", code), 0);
-}
-
-#[test]
-fn codegen_inline_asm_imm_const_via_g() {
-    // `"g"(const)` — any operand. Const should substitute as `$N`.
-    let code = r#"
-int main(void) {
-    int r;
-#if defined(__x86_64__)
-    __asm__("movl %1, %0" : "=r"(r) : "g"(99));
-#elif defined(__aarch64__)
-    __asm__("mov %w0, %w1" : "=r"(r) : "g"(99));
-#endif
-    return (r == 99) ? 0 : 1;
-}
-"#;
-    assert_eq!(
-        compile_and_run("asm_imm_const_g", code, &[]),
-        0,
-        "g with const operand must substitute as immediate"
-    );
-    assert_eq!(compile_and_run_optimized("asm_imm_const_g_opt", code), 0);
-}
-
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn codegen_inline_asm_imm_const_via_i_letter() {
-    // x86_64 `"I"(const)` — constant in [0, 31]. Used for shift
-    // counts.
-    let code = r#"
-int main(void) {
-    int x = 5;
-    int r;
-    __asm__("shll %1, %0" : "=r"(r) : "I"(3), "0"(x));
-    return (r == 40) ? 0 : 1;
-}
-"#;
-    assert_eq!(
-        compile_and_run("asm_imm_const_I", code, &[]),
-        0,
-        "I constraint with in-range constant substitutes as immediate"
-    );
-}
-
-#[test]
-fn codegen_inline_asm_imm_runtime_via_ri_uses_register() {
-    // `"ri"(runtime_value)` — operand isn't const, so the codegen
-    // must NOT substitute as a literal. The operand must go through
-    // a register (since `"ri"` allows register or immediate, and
-    // memory is not allowed). Negative case complementing the
-    // const-substitution test above.
-    let code = r#"
-int main(void) {
-    int x;
-#if defined(__x86_64__)
-    __asm__("movl $77, %0" : "=r"(x));
-    int r;
-    __asm__("movl %1, %0" : "=r"(r) : "ri"(x));
-#elif defined(__aarch64__)
-    __asm__("mov %w0, #77" : "=r"(x));
-    int r;
-    __asm__("mov %w0, %w1" : "=r"(r) : "ri"(x));
-#endif
-    return (r == 77) ? 0 : 1;
-}
-"#;
-    assert_eq!(
-        compile_and_run("asm_imm_runtime_ri", code, &[]),
-        0,
-        "ri with runtime operand must go through a register"
-    );
-    assert_eq!(compile_and_run_optimized("asm_imm_runtime_ri_opt", code), 0);
-}
-
-// ============================================================================
-// C10 — Per-arch Class Letter Tests
-// ============================================================================
-//
-// Tests for the rare GCC constraint letters that aren't built-in
-// classes: x86_64's `q` (byte-register-class), `R`/`l` (register
-// synonyms), `I`/`J`/`K`/`L`/`M`/`N`/`O` (constant-range immediates);
-// aarch64's `I`/`J`/`K`/`L`/`M`/`N` (immediate ranges).
-
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn codegen_inline_asm_x86_64_class_letter_q() {
-    // `q` constraint — byte-class register. Used by kernel/glibc
-    // for byte stores via `movb`. c17 maps `q` to `Any` since every
-    // modern x86_64 GP register has a low-byte alias.
-    let code = r#"
-int main(void) {
-    unsigned char dst = 0;
-    unsigned char src = 0x42;
-    __asm__("movb %1, %0" : "=qm"(dst) : "q"(src));
-    return (dst == 0x42) ? 0 : 1;
-}
-"#;
-    assert_eq!(
-        compile_and_run("asm_x86_64_class_letter_q", code, &[]),
-        0,
-        "q constraint must accept any GP register for byte operations"
-    );
-    assert_eq!(
-        compile_and_run_optimized("asm_x86_64_class_letter_q_opt", code),
-        0
-    );
-}
-
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn codegen_inline_asm_x86_64_class_letter_i_immediate() {
-    // `I` constraint — integer constant in [0, 31]. Used for shift
-    // counts. c17 maps `I` to `Imm`; the assembler enforces the
-    // range.
-    let code = r#"
-int main(void) {
-    int x = 0x42;
-    int shifted;
-    // Shift left by a compile-time constant 4 — fits in `I` range.
-    __asm__("shll $4, %0" : "+r"(shifted) : "0"(x));
-    return (shifted == 0x420) ? 0 : 1;
-}
-"#;
-    assert_eq!(
-        compile_and_run("asm_x86_64_class_letter_I", code, &[]),
-        0,
-        "I constraint must accept a small compile-time constant"
-    );
-    assert_eq!(
-        compile_and_run_optimized("asm_x86_64_class_letter_I_opt", code),
-        0
-    );
-}
-
-/// `+r`(out) paired with a tied matching input (`"0"(in)`) must not double-
-/// define the output's pseudo.  The linearizer used to emit BOTH a Load (the
-/// `+r` read-half) AND a Copy (from the tied input) targeting the same
-/// pseudo — fine at -O0 (no validator) but rejected by the optimizer-stage
-/// I1 invariant ("single definition per pseudo") at -O2.  This test pins
-/// the behavior down for several lvalue shapes so a regression in the
-/// linearizer's tied-input handling is caught no matter which constraint
-/// letter happens to surface it.
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn codegen_inline_asm_tied_input_no_double_def() {
-    // Local int.
-    assert_eq!(
-        compile_and_run_optimized(
-            "asm_tied_int_local",
-            r#"
-int main(void) {
-    int src = 0x42;
-    int dst;
-    __asm__("shll $4, %0" : "+r"(dst) : "0"(src));
-    return (dst == 0x420) ? 0 : 1;
-}
-"#,
-        ),
-        0
-    );
-
-    // Global int (different lvalue path — Load from .data, not from frame).
-    assert_eq!(
-        compile_and_run_optimized(
-            "asm_tied_int_global",
-            r#"
-int g = 7;
-int main(void) {
-    int out;
-    __asm__("addl $3, %0" : "+r"(out) : "0"(g));
-    return (out == 10) ? 0 : 1;
-}
-"#,
-        ),
-        0
-    );
-
-    // Parameter source (the `param_info.is_some()` linearizer branch — also
-    // historically emitted the wrong Copy when a tied input was present).
-    assert_eq!(
-        compile_and_run_optimized(
-            "asm_tied_int_param",
-            r#"
-int helper(int src) {
-    int dst;
-    __asm__("addl $1, %0" : "+r"(dst) : "0"(src));
-    return dst;
-}
-int main(void) { return (helper(41) == 42) ? 0 : 1; }
-"#,
-        ),
-        0
-    );
-}
-
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn codegen_inline_asm_x86_64_class_letter_r_synonym() {
-    // `R` constraint — legacy 8-register set. Same as `r` on x86_64.
-    let code = r#"
-int main(void) {
-    int x = 100;
-    int r;
-    __asm__("movl %1, %0" : "=R"(r) : "R"(x));
-    return (r == 100) ? 0 : 1;
-}
-"#;
-    assert_eq!(
-        compile_and_run("asm_x86_64_class_letter_R", code, &[]),
-        0,
-        "R constraint synonym for r must work"
-    );
-}
-
-#[cfg(target_arch = "aarch64")]
-#[test]
-fn codegen_inline_asm_aarch64_class_letter_k_immediate() {
-    // `K` on aarch64 — 32-bit logical immediate. c17 maps to Imm.
-    let code = r#"
-int main(void) {
+/* 2. `K` on aarch64 -- 32-bit logical immediate. c17 maps to Imm. */
+static int t_aarch64_class_letter_k_immediate(void) {
     int x = 0xFF;
     int r;
     __asm__("and %w0, %w1, #15" : "=r"(r) : "r"(x));
     return (r == 15) ? 0 : 1;
 }
-"#;
-    assert_eq!(
-        compile_and_run("asm_aarch64_class_letter_K", code, &[]),
-        0,
-        "K constraint must accept logical immediates"
-    );
-}
 
-/// `__sync_synchronize`-equivalent: a single global barrier between two
-/// unrelated memory accesses. A reordering pass that moved the second
-/// load before the barrier could silently miscompile any code that
-/// relies on this idiom for cross-thread visibility. Single-threaded
-/// here, so we only assert the compiler-level ordering.
-#[test]
-fn codegen_inline_asm_memory_barrier_sync_synchronize_pattern() {
-    let code = r#"
-static int a = 0;
-static int b = 0;
-
-int main(void) {
-    a = 1;
-#if defined(__x86_64__)
-    __asm__ volatile("mfence" ::: "memory");
-#elif defined(__aarch64__)
-    __asm__ volatile("dmb ish" ::: "memory");
-#else
-    __asm__ volatile("" ::: "memory");
-#endif
-    b = 2;
-    if (a != 1) return 1;
-    if (b != 2) return 2;
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("asm_memory_barrier_sync_synchronize", code, &[]),
-        0,
-        "stores on either side of a full fence must not be reordered or dropped"
-    );
-    assert_eq!(
-        compile_and_run_optimized("asm_memory_barrier_sync_synchronize_opt", code),
-        0,
-        "sync_synchronize pattern must hold at -O1 too"
-    );
-}
-
-// ============================================================================
-// Memory-constrained output operands ("=m")
-// ============================================================================
-
-/// Regression test: a memory *output* operand reads its pseudo -- the pseudo
-/// holds the address the assembly writes through -- but DCE's use-collector
-/// looked only at `asm_data.inputs`. At `-O` and above it therefore deleted the
-/// instruction that materialized the address, and the emitted store went
-/// through whatever the register happened to hold.
-///
-/// Found via the CPython acceptance build: `_Py_get_387controlword`
-/// (`Python/pymath.c`) is exactly this shape, and c17 compiled its
-/// `fnstcw %0` to `fnstcw (%rax)` with RAX left at 0 from an earlier zero-fill
-/// -- a null-pointer write that segfaulted the bootstrap interpreter.
-///
-/// The `-O0` path was always correct, so this must run optimized to mean
-/// anything.
-#[test]
-fn codegen_asm_memory_output_survives_optimization() {
-    let code = r#"
-/* Store through a "=m" output, then read the object back. If the address
-   computation is dropped, this either faults or writes somewhere else. */
-static int store_via_m(void) {
-    int out = 0;
-#if defined(__x86_64__)
-    __asm__ __volatile__ ("movl $1234, %0" : "=m" (out));
-#elif defined(__aarch64__)
-    {
-        int tmp = 1234;
-        __asm__ __volatile__ ("str %w1, %0" : "=m" (out) : "r" (tmp));
-    }
-#else
-    out = 1234;
-#endif
-    return out;
-}
-
-/* Same, but with the object surrounded by other locals so a stray write
-   would land on a neighbour rather than faulting. */
-static int store_via_m_neighbours(int *before, int *after) {
-    int lo = 11;
-    int out = 0;
-    int hi = 22;
-#if defined(__x86_64__)
-    __asm__ __volatile__ ("movl $77, %0" : "=m" (out));
-#elif defined(__aarch64__)
-    {
-        int tmp = 77;
-        __asm__ __volatile__ ("str %w1, %0" : "=m" (out) : "r" (tmp));
-    }
-#else
-    out = 77;
-#endif
-    *before = lo;
-    *after = hi;
-    return out;
-}
-
-int main(void) {
-    if (store_via_m() != 1234) return 1;
-
-    int before = 0, after = 0;
-    if (store_via_m_neighbours(&before, &after) != 77) return 2;
-    if (before != 11) return 3;
-    if (after != 22) return 4;
-
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("asm_memory_output_operand", code, &[]),
-        0,
-        "a \"=m\" output must write the named object"
-    );
-    assert_eq!(
-        compile_and_run_optimized("asm_memory_output_operand_opt", code),
-        0,
-        "the address computation for a \"=m\" output must survive DCE"
-    );
-}
-
-/// The `"=m"` fix has to reach the *register allocator*, not just DCE.
-///
-/// DCE learning that a memory output reads its pseudo stopped the address
-/// computation being deleted, but the allocator's own use-collectors --
-/// live-interval bounds, liveness propagation, the interference graph's def
-/// set and live set, and next-use distance -- all still classified such an
-/// output as a pure def. So the address register stayed free for the
-/// allocator to hand to another operand of the same asm, and the store went
-/// through an input's value as a pointer.
-///
-/// Enough inputs are needed to make the allocator actually reuse the register;
-/// a one-operand asm never exhibits it, which is why the first version of this
-/// test passed on x86_64 while the bug was still live.
-#[test]
-fn codegen_asm_memory_output_address_survives_register_allocation() {
-    let code = r#"
-#include <string.h>
-
-struct Out { unsigned v0, v1, v2, v3, v4, v5; };
-
-/* Six register inputs alongside a memory output. The output's address must
-   not be assigned a register that one of the inputs also gets. */
-static unsigned write_through_m(unsigned a, unsigned b, unsigned c,
-                                unsigned d, unsigned e, unsigned f) {
-    unsigned out = 0;
-#if defined(__x86_64__)
-    __asm__ __volatile__ ("movl %1, %0"
-                          : "=m"(out)
-                          : "r"(a), "r"(b), "r"(c), "r"(d), "r"(e), "r"(f));
-#elif defined(__aarch64__)
-    __asm__ __volatile__ ("str %w1, %0"
-                          : "=m"(out)
-                          : "r"(a), "r"(b), "r"(c), "r"(d), "r"(e), "r"(f));
-#else
-    out = a;
-    (void)b; (void)c; (void)d; (void)e; (void)f;
-#endif
-    return out;
-}
-
-int main(void) {
-    /* The first input is what the asm stores, so the result must be it and
-       not some other operand's value or a wild read. */
-    if (write_through_m(11u, 22u, 33u, 44u, 55u, 66u) != 11u) return 1;
-    if (write_through_m(99u, 1u, 2u, 3u, 4u, 5u) != 99u) return 2;
-
-    /* Neighbouring locals must be untouched: a store through the wrong
-       pointer usually lands somewhere else on the frame. */
-    volatile unsigned before = 0xAAAAAAAAu;
-    unsigned got = write_through_m(7u, 0u, 0u, 0u, 0u, 0u);
-    volatile unsigned after = 0xBBBBBBBBu;
-    if (got != 7u) return 3;
-    if (before != 0xAAAAAAAAu) return 4;
-    if (after != 0xBBBBBBBBu) return 5;
-
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("asm_memory_output_regalloc", code, &[]),
-        0,
-        "a \"=m\" output's address must not be reallocated to another operand"
-    );
-    assert_eq!(
-        compile_and_run_optimized("asm_memory_output_regalloc_opt", code),
-        0,
-        "the same, once the allocator is under real pressure"
-    );
-}
-
-// ============================================================================
-// A floating constant as an inline-asm operand
-//
-// `loc_to_asm_string` used to `panic!("Float immediate not supported in inline
-// asm operand")` on both targets. The linearizer does no type filtering on a
-// non-memory asm input, so a floating constant stays an FVal pseudo, and
-// regalloc maps every FVal to `Loc::FImm` -- an FP *constant* is never given a
-// register. `__asm__ ("" :: "r"(1.0))` therefore aborted the compiler at -O0.
-//
-// There was no float-operand test here at all, which is why it survived.
-// ============================================================================
-
-/// A general-register constraint gets the constant's bit pattern, which is
-/// what gcc materializes. 1.5 is 0x3FF8000000000000.
-#[test]
-fn codegen_inline_asm_float_constant_in_general_register() {
-    #[cfg(target_arch = "x86_64")]
-    let code = r#"
-int main(void) {
-    unsigned long bits = 0;
-    __asm__ ("movq %1, %0" : "=r"(bits) : "r"(1.5));
-    return bits == 0x3FF8000000000000UL ? 0 : 1;
-}
-"#;
-    #[cfg(target_arch = "aarch64")]
-    let code = r#"
-int main(void) {
-    unsigned long bits = 0;
-    __asm__ ("mov %0, %1" : "=r"(bits) : "r"(1.5));
-    return bits == 0x3FF8000000000000UL ? 0 : 1;
-}
-"#;
-    assert_eq!(compile_and_run("asm_fp_const_gp", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("asm_fp_const_gp_opt", code), 0);
-}
-
-/// An immediate-class constraint substitutes the same bit pattern literally,
-/// with no register spent on it.
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn codegen_inline_asm_float_constant_as_immediate() {
-    let code = r#"
-int main(void) {
-    unsigned long bits = 0;
-    __asm__ ("movq %1, %0" : "=r"(bits) : "i"(3.5));
-    return bits == 0x400C000000000000UL ? 0 : 1;
-}
-"#;
-    assert_eq!(compile_and_run("asm_fp_const_imm", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("asm_fp_const_imm_opt", code), 0);
-}
-
-/// An SSE-class constraint takes the reserved scratch register, loaded with
-/// the constant. The clobber is declared because the operand *is* the scratch.
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn codegen_inline_asm_float_constant_in_sse_register() {
-    let code = r#"
-int main(void) {
-    double x = 0;
-    __asm__ ("movsd %%xmm15, %0" : "=m"(x) : "x"(2.25) : "xmm15");
-    return x == 2.25 ? 0 : 1;
-}
-"#;
-    assert_eq!(compile_and_run("asm_fp_const_sse", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("asm_fp_const_sse_opt", code), 0);
-}
-
-/// The zero constant has its own materialization path (`xorps`), so it is
-/// worth its own case -- and a negative zero must not come back as positive.
-#[test]
-fn codegen_inline_asm_float_constant_zero_and_negative() {
-    #[cfg(target_arch = "x86_64")]
-    let code = r#"
-int main(void) {
-    unsigned long z = 1, nz = 0;
-    __asm__ ("movq %1, %0" : "=r"(z) : "r"(0.0));
-    __asm__ ("movq %1, %0" : "=r"(nz) : "r"(-0.0));
-    if (z != 0UL) return 1;
-    if (nz != 0x8000000000000000UL) return 2;
-    return 0;
-}
-"#;
-    #[cfg(target_arch = "aarch64")]
-    let code = r#"
-int main(void) {
-    unsigned long z = 1, nz = 0;
-    __asm__ ("mov %0, %1" : "=r"(z) : "r"(0.0));
-    __asm__ ("mov %0, %1" : "=r"(nz) : "r"(-0.0));
-    if (z != 0UL) return 1;
-    if (nz != 0x8000000000000000UL) return 2;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("asm_fp_const_zero", code, &[]), 0);
-}
-
-/// A `float` constant is narrowed to its own width, not handed over as the
-/// `double` bit pattern: 1.5f is 0x3FC00000, not 0x3FF8000000000000.
-#[test]
-fn codegen_inline_asm_float_constant_uses_its_own_width() {
-    #[cfg(target_arch = "x86_64")]
-    let code = r#"
-int main(void) {
-    unsigned int bits = 0;
-    __asm__ ("movl %1, %0" : "=r"(bits) : "r"(1.5f));
-    return bits == 0x3FC00000U ? 0 : 1;
-}
-"#;
-    #[cfg(target_arch = "aarch64")]
-    let code = r#"
-int main(void) {
-    unsigned int bits = 0;
-    __asm__ ("mov %w0, %w1" : "=r"(bits) : "r"(1.5f));
-    return bits == 0x3FC00000U ? 0 : 1;
-}
-"#;
-    assert_eq!(compile_and_run("asm_fp_const_float_width", code, &[]), 0);
-}
-
-/// An FP *value* — not a constant — under a general-register constraint.
-///
-/// On aarch64 nothing moved it out of the vector register it was computed in,
-/// and the operand rendered as the vector register's name, so `mov %0, %1`
-/// assembled as `mov x0, d0` and the assembler read `d0` as an undefined
-/// symbol. Pre-existing and independent of any floating constant: it is
-/// reachable from any FP variable passed as `"r"`. x86-64 was never affected,
-/// spilling the value to a stack slot the register path then loads from.
-///
-/// It is also why `-0.0` needed its own case above — that arrives as `fneg` of
-/// zero, a computed value in a vector register, rather than as an immediate.
-#[test]
-fn codegen_inline_asm_fp_value_in_general_register() {
-    #[cfg(target_arch = "x86_64")]
-    let code = r#"
-double src = 2.5;
-int main(void) {
-    unsigned long bits = 0;
-    double d = src * 2.0;                 /* computed, so it lives in an FP reg */
-    __asm__ ("movq %1, %0" : "=r"(bits) : "r"(d));
-    return bits == 0x4014000000000000UL ? 0 : 1;   /* 5.0 */
-}
-"#;
-    #[cfg(target_arch = "aarch64")]
-    let code = r#"
-double src = 2.5;
-int main(void) {
-    unsigned long bits = 0;
-    double d = src * 2.0;
-    __asm__ ("mov %0, %1" : "=r"(bits) : "r"(d));
-    return bits == 0x4014000000000000UL ? 0 : 1;   /* 5.0 */
-}
-"#;
-    assert_eq!(compile_and_run("asm_fp_value_gp", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("asm_fp_value_gp_opt", code), 0);
-}
-
-/// The template chooses the width it wants, so a materialized constant has to
-/// be handed over as a *register* rather than a pre-rendered name: `%w1`
-/// against a hard-coded `x9` assembled as `mov w0, x9`.
-#[cfg(target_arch = "aarch64")]
-#[test]
-fn codegen_inline_asm_width_modifier_applies_to_a_materialized_constant() {
-    let code = r#"
-int main(void) {
+/* 3. The template chooses the width it wants, so a materialized constant
+   has to be handed over as a *register* rather than a pre-rendered name:
+   `%w1` against a hard-coded `x9` assembled as `mov w0, x9`. */
+static int t_width_modifier_applies_to_a_materialized_constant(void) {
     unsigned int lo = 0;
     unsigned long full = 0;
     __asm__ ("mov %w0, %w1" : "=r"(lo) : "r"(1.5f));
@@ -1503,216 +2075,47 @@ int main(void) {
     if (full != 0x3FF8000000000000UL) return 2;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("asm_width_modifier_const", code, &[]), 0);
-}
 
-// ============================================================================
-// SSE register constraints on an inline-asm *output* (#C139)
-//
-// `constraint_requires_register` and `constraint_requires_memory` know no FP
-// class letter, so `"=x"` matched neither and the output fell through to the
-// general-register arm: the template was handed `%rax` and `movsd %xmm0, %rax`
-// was refused by the assembler. The input side had been given
-// `constraint_requires_sse`; the output side had not.
-//
-// x86-64 only. aarch64's output loop falls through to `loc_to_asm_string`,
-// which renders a vector register as `dN` correctly.
-// ============================================================================
+/* 4. Two general-register operands get two different registers: `"r"(a),
+   "r"(b)` with two FP values must not both land in X9. */
+static long bits(double d) { union { double d; long l; } u; u.d = d; return u.l; }
 
-/// The plain case: a value out of the asm through an SSE register.
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn codegen_inline_asm_sse_output_constraint() {
-    let code = r#"
-double src = 2.25;
-int main(void) {
-    double back = 0;
-    __asm__ ("movsd %1, %0" : "=x"(back) : "x"(src));
-    return back == 2.25 ? 0 : 1;
-}
-"#;
-    assert_eq!(compile_and_run("asm_sse_output", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("asm_sse_output_opt", code), 0);
-}
-
-/// A read-write `"+x"` operand. Its slot carries text rather than a register,
-/// so the tied-input path that loads an output's initial value found nothing
-/// and `addsd %xmm15, %xmm15` ran on whatever happened to be in the scratch.
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn codegen_inline_asm_sse_read_write_constraint() {
-    let code = r#"
-double d = 1.5;
-float  f = 1.25f;
-int main(void) {
-    __asm__ ("addsd %0, %0" : "+x"(d));
-    if (d != 3.0) return 1;
-    __asm__ ("addss %0, %0" : "+x"(f));
-    if (f != 2.5f) return 2;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("asm_sse_readwrite", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("asm_sse_readwrite_opt", code), 0);
-}
-
-/// An output and inputs together, which needs both scratch registers and so
-/// pins that the two loops share one budget rather than each claiming Xmm15.
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn codegen_inline_asm_sse_output_and_inputs_share_the_scratch_budget() {
-    let code = r#"
-double a = 1.5, b = 2.25;
-int main(void) {
-    double r = 0;
-    __asm__ ("movsd %1, %0; addsd %2, %0" : "=&x"(r) : "x"(a), "x"(b));
-    if (r != 3.75) return 1;
-
-    /* An SSE constant alongside an SSE output: one scratch each. */
-    double c = 0;
-    __asm__ ("movsd %1, %0" : "=x"(c) : "x"(0.5));
-    if (c != 0.5) return 2;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("asm_sse_budget", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("asm_sse_budget_opt", code), 0);
-}
-
-/// An x87 register constraint reaches the x87 stack, not an XMM register.
-///
-/// On x86 `f`, `t` and `u` are the **x87 stack** classes -- `t` is st(0), `u`
-/// is st(1), `f` is any of them -- and they were counted as SSE. So a long
-/// double operand was routed through an XMM scratch and the assembler was
-/// handed `movt -48(%rbp), %xmm15`, which is not an instruction. musl's
-///
-///   long double sqrtl(long double x) { __asm__("fsqrt" : "+t"(x)); return x; }
-///
-/// failed to build. c17 keeps a long double in memory and reaches it with
-/// `fldt`/`fstpt`, so an x87 operand is pushed onto the FP stack before the
-/// template and popped back after it.
-#[test]
-#[cfg(target_arch = "x86_64")]
-fn codegen_inline_asm_x87_constraint() {
-    let code = r#"
-static long double my_sqrtl(long double x) { __asm__("fsqrt" : "+t"(x)); return x; }
-static long double my_absl(long double x)  { __asm__("fabs"  : "+t"(x)); return x; }
-
-/* An x87 *input* -- the template consumes it and leaves nothing to store. */
-static int to_int(long double x) { int r; __asm__("fistpl %0" : "=m"(r) : "t"(x)); return r; }
-
-/* Two x87 operands: `t` is st(0) and `u` is st(1), so `u` must be pushed
-   first for `t` to end up on top. Getting this backwards computes b/a. */
-static long double mul(long double a, long double b) {
-    __asm__("fmulp" : "+t"(a) : "u"(b));
-    return a;
-}
-static long double sub(long double a, long double b) {
-    __asm__("fsubrp" : "+t"(a) : "u"(b));
-    return a;
-}
-
-int main(void) {
-    if (my_sqrtl(4.0L) != 2.0L) return 1;
-    if (my_sqrtl(16.0L) != 4.0L) return 2;
-    if (my_absl(-3.5L) != 3.5L) return 3;
-    if (my_absl(3.5L) != 3.5L) return 4;
-
-    if (to_int(7.0L) != 7) return 5;
-    if (to_int(-3.0L) != -3) return 6;
-
-    if (mul(2.0L, 3.0L) != 6.0L) return 7;
-    /* `fsubrp` computes st(1) - st(0), i.e. b - a. Asymmetric, so having the
-       two operands the wrong way round flips the sign rather than passing by
-       coincidence -- which is the whole point, since `u` must be pushed
-       before `t` for `t` to land on top. */
-    if (sub(10.0L, 4.0L) != -6.0L) return 8;
-    if (sub(4.0L, 10.0L) != 6.0L) return 9;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("asm_x87_constraint", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("asm_x87_constraint_opt", code), 0);
-}
-
-/// An x87 asm output whose home is a register, not a stack slot.
-///
-/// A `"=t"` output was accepted only when the allocator had put its pseudo on
-/// the stack, and a bare output pseudo is defined by nothing but the asm, so
-/// it never was: `double r; __asm__("fldpi" : "=t"(r));` was refused at every
-/// level, and gcc.c-torture's `compile/pr34966` -- the same output tied to an
-/// argument arriving in `%xmm0` -- at -O1 and above. A float or double result
-/// now goes through the x87 scratch into its register, and a long double one
-/// gets the stack slot it needs.
-///
-/// The tied input (`"0"(x)`) was never pushed at all, so the template ran on
-/// whatever the FP stack held; and `t` is the top of the stack whatever order
-/// the operands are written in.
-#[test]
-#[cfg(target_arch = "x86_64")]
-fn codegen_inline_asm_x87_output_in_register() {
-    let code = r#"
-static double pi(void) { double r; __asm__("fldpi" : "=t"(r)); return r; }
-static float one(void) { float r; __asm__("fld1" : "=t"(r)); return r; }
-static long double pil(void) { long double r; __asm__("fldpi" : "=t"(r)); return r; }
-
-/* pr34966: the output tied to an input that arrives in an XMM register. */
-static double ident(double x) { double r; __asm__ __volatile__("" : "=t"(r) : "0"(x)); return r; }
-static double my_sqrt(double x) { double r; __asm__("fsqrt" : "=t"(r) : "0"(x)); return r; }
-static float my_sqrtf(float x) { __asm__("fsqrt" : "+t"(x)); return x; }
-
-/* `t` and `u` together: fyl2x leaves st(1) * log2(st(0)) and pops. */
-static double ylog2x(double x, double y)
-{
-    double r;
-    __asm__("fyl2x" : "=t"(r) : "0"(x), "u"(y) : "st(1)");
+static long add_bits(double a, double b) {
+    long r;
+    __asm__("add %0, %1, %2" : "=r"(r) : "r"(a), "r"(b));
     return r;
 }
 
-/* The operands the other way round: `t` is still the top of the stack. */
-static double ylog2x_rev(double x, double y)
-{
-    double r;
-    __asm__("fyl2x" : "=t"(r) : "u"(y), "0"(x) : "st(1)");
-    return r;
+static int t_two_general_operands_are_distinct(void) {
+    double x = 2.0, y = 3.0;
+    if (add_bits(x, y) != bits(x) + bits(y)) return 1;
+    /* Distinct values, so sharing a register cannot pass by coincidence. */
+    if (add_bits(1.0, 8.0) != bits(1.0) + bits(8.0)) return 2;
+    return 0;
 }
 
-/* An x87 input the template consumes, arriving in an XMM register. This was
-   refused as "not addressable" rather than staged. */
-static int to_int(double x) { int r; __asm__("fistpl %0" : "=m"(r) : "t"(x)); return r; }
-
-double g;
-volatile double v16 = 16.0;
-
-int main(void)
-{
-    if (pi() != 3.14159265358979323846) return 1;
-    if (one() != 1.0f) return 2;
-    if (pil() != 3.14159265358979323846264338327950288L) return 3;
-    if (ident(2.5) != 2.5) return 4;
-    if (my_sqrt(v16) != 4.0) return 5;
-    if (my_sqrt(16.0) != 4.0) return 6;
-    if (my_sqrtf(9.0f) != 3.0f) return 7;
-    if (ylog2x(8.0, 2.0) != 6.0) return 8;
-    if (ylog2x_rev(8.0, 2.0) != 6.0) return 11;
-    if (ylog2x_rev(2.0, 8.0) != 8.0) return 12;
-    if (to_int(7.0) != 7 || to_int(v16) != 16) return 13;
-    __asm__("fld1" : "=t"(g));
-    if (g != 1.0) return 9;
-    double t = ident(v16);
-    if (t + 1.0 != 17.0) return 10;
+int main(void) {
+    int r;
+    if ((r = t_inline_asm_aarch64_mega()) != 0) return r;
+    if ((r = t_aarch64_class_letter_k_immediate()) != 0) return 100 + r;
+    if ((r = t_width_modifier_applies_to_a_materialized_constant()) != 0) return 110 + r;
+    if ((r = t_two_general_operands_are_distinct()) != 0) return 120 + r;
     return 0;
 }
 "#;
-    for opt in ["-O0", "-O1", "-O2"] {
-        let args = vec![opt.to_string()];
-        assert_eq!(
-            compile_and_run("asm_x87_output_in_register", code, &args),
-            0,
-            "at {opt}"
-        );
-    }
+
+/// Consolidates codegen_inline_asm_aarch64_mega,
+/// codegen_inline_asm_aarch64_class_letter_k_immediate,
+/// codegen_inline_asm_width_modifier_applies_to_a_materialized_constant and
+/// codegen_inline_asm_two_general_operands_are_distinct.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn codegen_inline_asm_aarch64_mega() {
+    assert_eq!(
+        compile_and_run("asm_aarch64_mega", AARCH64_MATRIX, &[]),
+        0,
+        "K constraint must accept logical immediates"
+    );
 }
 
 /// A vector-class operand gets a vector register, on both sides of the asm.
@@ -1757,263 +2160,43 @@ int main(void) {
     );
 }
 
-/// Two general-register operands get two different registers.
-///
-/// Both scratch-taking arms took `Reg::scratch_regs().0` -- X9 -- with no
-/// tracking of whether it was already spent, so `"r"(a), "r"(b)` with two FP
-/// values emitted `fmov x9, d0; fmov x9, d1; add x0, x9, x9`: operand 1
-/// destroyed, the result twice operand 2, and no diagnostic. X10 and X11 were
-/// reserved and idle the whole time.
-#[test]
-#[cfg(target_arch = "aarch64")]
-fn codegen_inline_asm_two_general_operands_are_distinct() {
-    let code = r#"
-static long bits(double d) { union { double d; long l; } u; u.d = d; return u.l; }
-
-static long add_bits(double a, double b) {
-    long r;
-    __asm__("add %0, %1, %2" : "=r"(r) : "r"(a), "r"(b));
-    return r;
-}
-
-int main(void) {
-    double x = 2.0, y = 3.0;
-    if (add_bits(x, y) != bits(x) + bits(y)) return 1;
-    /* Distinct values, so sharing a register cannot pass by coincidence. */
-    if (add_bits(1.0, 8.0) != bits(1.0) + bits(8.0)) return 2;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("asm_two_gp_operands", code, &[]), 0);
-}
-
-/// An `asm goto` label reference is spelled the way its definition is.
-///
-/// A function whose identifier holds an extended character needs its local
-/// labels quoted, and `Label::name()` quotes them. The aarch64 operand builder
-/// hand-rolled `format!(".L{}_{}", ...)` instead, so the branch the template
-/// expanded to named `.Lf\u{e9}_1` while the block that defines it was emitted
-/// as `".Lf\u{e9}_1"` -- two spellings of one label, which the assembler reads
-/// as an undefined symbol.
-///
-/// Asserted as agreement rather than as a literal: the test does not care
-/// whether the label is quoted, only that both sites agree.
-#[test]
-fn codegen_asm_goto_label_matches_its_definition() {
-    use crate::codegen::asm_probe::{asm_for, AARCH64_LINUX, X86_64_LINUX};
-
-    let code = "
-int f\u{e9}(int x) {
-    __asm__ goto (\"b %l[done]\" : : : : done);
-    return 0;
-done:
-    return 1;
-}
-";
-
-    for triple in [AARCH64_LINUX, X86_64_LINUX] {
-        let asm = asm_for("asm_goto_label_quoting", triple, code);
-
-        // Every local label this function defines, exactly as written.
-        let defined: Vec<&str> = asm
-            .lines()
-            .map(str::trim)
-            .filter_map(|l| l.strip_suffix(':'))
-            .filter(|l| l.contains(".L") && l.contains("f\u{e9}"))
-            .collect();
-        assert!(
-            !defined.is_empty(),
-            "{triple}: no local labels defined:\n{asm}"
-        );
-
-        // Every branch target naming one of this function's local labels.
-        for line in asm.lines().map(str::trim) {
-            let Some(rest) = line
-                .strip_prefix("b ")
-                .or_else(|| line.strip_prefix("jmp "))
-            else {
-                continue;
-            };
-            let target = rest.trim();
-            if !target.contains("f\u{e9}") {
-                continue;
-            }
-            assert!(
-                defined.contains(&target),
-                "{triple}: branch to {target} but the definitions are {defined:?}:\n{asm}"
-            );
-        }
-    }
-}
-
-/// An `asm goto` label survives being inlined.
-///
-/// The label names a *block*, and it is the callee's block. The inliner
-/// remaps `bb_true`/`bb_false` and the pseudos inside the asm operands, but
-/// not `asm_data.goto_labels` -- so after inlining the label named whichever
-/// caller block happened to share the id. For a small callee that is the block
-/// holding the asm itself, and the branch became `b .Lmain_1` from inside
-/// `.Lmain_1`: the program jumped to its own address and hung.
-///
-/// This must be *run*, not read: the assembly was well-formed and the label
-/// was spelled correctly, which is all a text probe checks. Only executing it
-/// shows the branch going to the wrong place.
-#[test]
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn codegen_inlined_asm_goto_branches_to_the_right_block() {
-    #[cfg(target_arch = "x86_64")]
-    let jump = "jmp %l[done]";
-    #[cfg(target_arch = "aarch64")]
-    let jump = "b %l[done]";
-
-    let code = format!(
-        r#"
-/* Small enough that the inliner takes it, which is the whole point. */
-static int taken(void) {{
-    __asm__ goto ("{jump}" : : : : done);
-    return 0;
-done:
-    return 1;
-}}
-
-/* The fallthrough arm: the asm does not branch, so the label is not used. */
-static int not_taken(void) {{
-    __asm__ goto ("" : : : : done);
-    return 0;
-done:
-    return 1;
-}}
-
-int main(void) {{
-    if (taken() != 1) return 1;
-    if (not_taken() != 0) return 2;
-    /* Twice, so a second inlining of the same callee is remapped too. */
-    if (taken() != 1) return 3;
-    if (taken() + not_taken() != 1) return 4;
-    return 0;
-}}
-"#
-    );
-    assert_eq!(compile_and_run("inlined_asm_goto", &code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("inlined_asm_goto_opt", &code), 0);
-}
-
-/// Early-clobber outputs (`"=&r"`, `"+&r"`) on x86-64.
-///
-/// An early-clobber output is written before the template has read all of its
-/// inputs, so it may not share a register with any input -- including one
-/// whose value dies at the asm, which is exactly the sharing the allocator
-/// offers a plain output. The `&` was parsed and then dropped: `early` got
-/// its output and `b` in one register and returned 1 + 10 + 1. The address of
-/// a `"+m"` operand is an input too.
-///
-/// Also here: an explicit tied input `"0"(a)` is operand `%1`, so the next
-/// input is `%2`. Only the implicit input a `"+"` output creates goes
-/// unnumbered, but every tied input was skipped, so `%2` named nothing and
-/// the output failed to assemble. And six early-clobber outputs with six
-/// inputs, which needs twelve distinct registers.
-const EARLY_CLOBBER_X86_64: &str = r#"
+// codegen_inline_asm_early_clobber_aarch64:
+// The aarch64 counterpart, under qemu. Ten early-clobber outputs and ten
+// inputs take twenty distinct registers.
+//
+// codegen_inline_asm_numbering_aarch64:
+// The aarch64 counterpart. aarch64 numbered the hidden input of a `"+r"` in
+// place, so `%1` in `"add %0, %0, %1" : "+r"(t) : "r"(b)` named `t` again.
+//
+// codegen_inline_asm_register_operands_aarch64:
+// The aarch64 counterpart: twenty-six register inputs and an early-clobber
+// output, more operands than the allocator has registers.
+//
+// The aarch64 halves of codegen_inline_asm_mixed_memory_operands,
+// codegen_inline_asm_operands_avoid_clobbered_registers and
+// codegen_inline_asm_operand_address_used_elsewhere (documented with their
+// x86-64 / host halves).
+const AARCH64_QEMU: &str = r#"
+/* Exit codes: section k fails with 10*k + its original code.
+ *  1 early_clobber_aarch64                                  10..19
+ *  2 numbering_aarch64                                      20..29
+ *  3 register_operands_aarch64                              30..39
+ *  4 mixed_memory_operands (aarch64 half)                   40..49
+ *  5 operands_avoid_clobbered_registers (aarch64 half)      50..59
+ *  6 operand_address_used_elsewhere (aarch64 half)          60..69
+ */
 #define NI __attribute__((noinline))
+
+/* ---- 1. early_clobber_aarch64 ---- */
 /* Each "=&r" output is written before any input is read, so no output may
    share a register with an input, even one whose value dies at the asm. */
-NI long early(long a, long b)
-{
-    long t;
-    __asm__("movq $1, %0\n\taddq %1, %0\n\taddq %2, %0" : "=&r"(t) : "r"(a), "r"(b));
-    return t;
-}
-NI long early2(long a, long b)
-{
-    long t, u;
-    __asm__("movq $1, %0\n\tmovq $2, %1\n\taddq %2, %0\n\taddq %3, %1"
-            : "=&r"(t), "=&r"(u) : "r"(a), "r"(b));
-    return t * 1000 + u;
-}
-/* The address of a "+m" operand is an input too. */
-NI long early_mem(long *p)
-{
-    long t;
-    __asm__("movq $5, %0\n\taddq %1, %0\n\tmovq %0, %1" : "=&r"(t), "+m"(*p));
-    return t;
-}
-/* "+&r": read-write, and still apart from the other input. */
-NI long plus_early(long t, long b)
-{
-    __asm__("addq %1, %0\n\taddq %1, %0" : "+&r"(t) : "r"(b));
-    return t;
-}
-/* No "&": the output may take a dying input's register, and must still be
-   right when it does. */
-NI long plain(long a)
-{
-    long t;
-    __asm__("leaq 1(%1), %0" : "=r"(t) : "r"(a));
-    return t;
-}
-/* An explicit tied input "0" is operand %1; the next input is %2. */
-NI long tied(long a, long b)
-{
-    long t;
-    __asm__("addq %2, %0" : "=r"(t) : "0"(a), "r"(b));
-    return t;
-}
-NI long tied3(long a, long b, long c)
-{
-    long t;
-    __asm__("addq %2, %0\n\taddq %3, %0" : "=r"(t) : "0"(a), "r"(b), "r"(c));
-    return t;
-}
-/* 6 early-clobber outputs and 6 inputs: 12 distinct registers. */
-NI long pressure(long a0, long a1, long a2, long a3, long a4, long a5)
-{
-    long o0, o1, o2, o3, o4, o5;
-    __asm__("movq $1, %0\n\tmovq $2, %1\n\tmovq $3, %2\n\tmovq $4, %3\n\tmovq $5, %4\n\tmovq $6, %5\n\taddq %6, %0\n\taddq %7, %1\n\taddq %8, %2\n\taddq %9, %3\n\taddq %10, %4\n\taddq %11, %5" : "=&r"(o0), "=&r"(o1), "=&r"(o2), "=&r"(o3), "=&r"(o4), "=&r"(o5) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5));
-    return o0 * 1 + o1 * 10 + o2 * 100 + o3 * 1000 + o4 * 10000 + o5 * 100000;
-}
-int main(void)
-{
-    long v = 100;
-    if (early(10, 20) != 31) return 1;
-    if (early2(10, 20) != 11 * 1000 + 22) return 2;
-    if (early_mem(&v) != 105 || v != 105) return 3;
-    if (plus_early(1, 10) != 21) return 4;
-    if (plain(41) != 42) return 5;
-    if (tied(10, 20) != 30 || tied(20, 10) != 30) return 6;
-    if (tied3(1, 2, 3) != 6) return 7;
-    if (pressure(1, 1, 1, 1, 1, 1) != 765432) return 8;
-    return 0;
-}
-"#;
-
-#[test]
-fn codegen_inline_asm_early_clobber_x86_64() {
-    if !cfg!(target_arch = "x86_64") {
-        return;
-    }
-    assert_eq!(
-        compile_and_run("asm_early_x86", EARLY_CLOBBER_X86_64, &[]),
-        0
-    );
-    let o2 = vec!["-O2".to_string()];
-    assert_eq!(
-        compile_and_run("asm_early_x86_o2", EARLY_CLOBBER_X86_64, &o2),
-        0
-    );
-}
-
-/// The aarch64 counterpart, under qemu. Ten early-clobber outputs and ten
-/// inputs take twenty distinct registers.
-const EARLY_CLOBBER_AARCH64: &str = r#"
-#define NI __attribute__((noinline))
-/* Each "=&r" output is written before any input is read, so no output may
-   share a register with an input, even one whose value dies at the asm. */
-NI long early(long a, long b)
+NI long ec_early(long a, long b)
 {
     long t;
     __asm__("mov %0, #1\n\tadd %0, %0, %1\n\tadd %0, %0, %2" : "=&r"(t) : "r"(a), "r"(b));
     return t;
 }
-NI long early2(long a, long b)
+NI long ec_early2(long a, long b)
 {
     long t, u;
     __asm__("mov %0, #1\n\tmov %1, #2\n\tadd %0, %0, %2\n\tadd %1, %1, %3"
@@ -2021,137 +2204,53 @@ NI long early2(long a, long b)
     return t * 1000 + u;
 }
 /* The address of a "+m" operand is an input too. */
-NI long early_mem(long *p)
+NI long ec_early_mem(long *p)
 {
     long t;
     __asm__("mov %0, #5\n\tldr x9, %1\n\tadd %0, %0, x9\n\tstr %0, %1" : "=&r"(t), "+m"(*p) : : "x9");
     return t;
 }
 /* "+&r": read-write, and still apart from the other input. */
-NI long plus_early(long t, long b)
+NI long ec_plus_early(long t, long b)
 {
     __asm__("add %0, %0, %1\n\tadd %0, %0, %1" : "+&r"(t) : "r"(b));
     return t;
 }
 /* No "&": the output may take a dying input's register, and must still be
    right when it does. */
-NI long plain(long a)
+NI long ec_plain(long a)
 {
     long t;
     __asm__("add %0, %1, #1" : "=r"(t) : "r"(a));
     return t;
 }
-NI long tied(long a, long b)
+NI long ec_tied(long a, long b)
 {
     long t;
     __asm__("add %0, %0, %2" : "=r"(t) : "0"(a), "r"(b));
     return t;
 }
 /* 10 early-clobber outputs and 10 inputs: 20 distinct registers. */
-NI long pressure(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7, long a8, long a9)
+NI long ec_pressure(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7, long a8, long a9)
 {
     long o0, o1, o2, o3, o4, o5, o6, o7, o8, o9;
     __asm__("mov %0, #1\n\tmov %1, #2\n\tmov %2, #3\n\tmov %3, #4\n\tmov %4, #5\n\tmov %5, #6\n\tmov %6, #7\n\tmov %7, #8\n\tmov %8, #9\n\tmov %9, #10\n\tadd %0, %0, %10\n\tadd %1, %1, %11\n\tadd %2, %2, %12\n\tadd %3, %3, %13\n\tadd %4, %4, %14\n\tadd %5, %5, %15\n\tadd %6, %6, %16\n\tadd %7, %7, %17\n\tadd %8, %8, %18\n\tadd %9, %9, %19" : "=&r"(o0), "=&r"(o1), "=&r"(o2), "=&r"(o3), "=&r"(o4), "=&r"(o5), "=&r"(o6), "=&r"(o7), "=&r"(o8), "=&r"(o9) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6), "r"(a7), "r"(a8), "r"(a9));
     return o0 * 1 + o1 * 2 + o2 * 3 + o3 * 4 + o4 * 5 + o5 * 6 + o6 * 7 + o7 * 8 + o8 * 9 + o9 * 10;
 }
-int main(void)
+static int t_early_clobber_aarch64(void)
 {
     long v = 100;
-    if (early(10, 20) != 31) return 1;
-    if (early2(10, 20) != 11 * 1000 + 22) return 2;
-    if (early_mem(&v) != 105 || v != 105) return 3;
-    if (plus_early(1, 10) != 21) return 4;
-    if (plain(41) != 42) return 5;
-    if (tied(10, 20) != 30 || tied(20, 10) != 30) return 6;
-    if (pressure(100, 200, 300, 400, 500, 600, 700, 800, 900, 1000) != 38885) return 8;
+    if (ec_early(10, 20) != 31) return 1;
+    if (ec_early2(10, 20) != 11 * 1000 + 22) return 2;
+    if (ec_early_mem(&v) != 105 || v != 105) return 3;
+    if (ec_plus_early(1, 10) != 21) return 4;
+    if (ec_plain(41) != 42) return 5;
+    if (ec_tied(10, 20) != 30 || ec_tied(20, 10) != 30) return 6;
+    if (ec_pressure(100, 200, 300, 400, 500, 600, 700, 800, 900, 1000) != 38885) return 8;
     return 0;
 }
-"#;
 
-#[test]
-fn codegen_inline_asm_early_clobber_aarch64() {
-    for opt in ["-O0", "-O2"] {
-        if let Some(code) = compile_and_run_aarch64("asm_early_a64", EARLY_CLOBBER_AARCH64, opt) {
-            assert_eq!(code, 0, "at {opt}");
-        }
-    }
-}
-
-/// Operand and label numbering, gcc's way, on x86-64.
-///
-/// gcc numbers operands as outputs, then the inputs the source wrote, then the
-/// hidden input each `"+"` output implies; `asm goto` labels come after all
-/// of them, so with one `"+r"` output and one input the first label is
-/// `%l3`. c17 counted labels from zero and read one digit, so `%l3` named
-/// nothing and `%l10` named `%l1`. The outputs of an `asm goto` are valid on
-/// every path out of it; c17 wrote them back only on the fall-through.
-const NUMBERING_X86_64: &str = r#"
-#define NI __attribute__((noinline))
-/* gcc numbers operands as outputs, the inputs written, then the hidden input
-   of each "+" output; asm goto labels come after all of them. */
-NI long plus_then_input(long t, long b)
-{
-    __asm__("addq %1, %0" : "+r"(t) : "r"(b));
-    return t;
-}
-NI long two_plus(long t, long u, long b)
-{
-    __asm__("addq %2, %0\n\taddq %2, %1" : "+r"(t), "+r"(u) : "r"(b));
-    return t * 100 + u;
-}
-/* One output, one input, one hidden input: the label is %l3. */
-NI int goto_after_hidden(long t, long b)
-{
-    __asm__ goto("addq %1, %0\n\tjmp %l3" : "+r"(t) : "r"(b) : : out);
-    return 0;
-out:
-    return (int)t;
-}
-/* Ten inputs: the label is %l10, two digits. */
-NI int goto_two_digits(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7, long a8, long a9)
-{
-    __asm__ goto("jmp %l10" : : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a5), "r"(a6), "r"(a7), "r"(a8), "r"(a9) : : out);
-    return 0;
-out:
-    return 1;
-}
-/* The output is valid on every path out of an asm goto, not only the
-   fall-through. */
-NI long goto_output(long x)
-{
-    long r;
-    __asm__ goto("leaq 1(%1), %0\n\tcmpq $10, %1\n\tjg %l[big]\n\tjmp %l[small]" : "=r"(r) : "r"(x) : "cc" : big, small);
-    return -1;
-big:
-    return r * 10;
-small:
-    return r;
-}
-int main(void)
-{
-    if (plus_then_input(1, 10) != 11) return 1;
-    if (two_plus(1, 2, 10) != 1112) return 2;
-    if (goto_after_hidden(1, 10) != 11) return 3;
-    if (goto_two_digits(0,1,2,3,4,5,6,7,8,9) != 1) return 4;
-    if (goto_output(20) != 210 || goto_output(3) != 4) return 5;
-    return 0;
-}
-"#;
-
-#[test]
-fn codegen_inline_asm_numbering_x86_64() {
-    if !cfg!(target_arch = "x86_64") {
-        return;
-    }
-    assert_eq!(compile_and_run("asm_num_x86", NUMBERING_X86_64, &[]), 0);
-    let o2 = vec!["-O2".to_string()];
-    assert_eq!(compile_and_run("asm_num_x86_o2", NUMBERING_X86_64, &o2), 0);
-}
-
-/// The aarch64 counterpart. aarch64 numbered the hidden input of a `"+r"` in
-/// place, so `%1` in `"add %0, %0, %1" : "+r"(t) : "r"(b)` named `t` again.
-const NUMBERING_AARCH64: &str = r#"
-#define NI __attribute__((noinline))
+/* ---- 2. numbering_aarch64 ---- */
 /* gcc numbers operands as outputs, the inputs written, then the hidden input
    of each "+" output; asm goto labels come after all of them. */
 NI long plus_then_input(long t, long b)
@@ -2192,7 +2291,7 @@ big:
 small:
     return r;
 }
-int main(void)
+static int t_numbering_aarch64(void)
 {
     if (plus_then_input(1, 10) != 11) return 1;
     if (two_plus(1, 2, 10) != 1112) return 2;
@@ -2201,257 +2300,31 @@ int main(void)
     if (goto_output(20) != 210 || goto_output(3) != 4) return 5;
     return 0;
 }
-"#;
 
-#[test]
-fn codegen_inline_asm_numbering_aarch64() {
-    for opt in ["-O0", "-O2"] {
-        if let Some(code) = compile_and_run_aarch64("asm_num_a64", NUMBERING_AARCH64, opt) {
-            assert_eq!(code, 0, "at {opt}");
-        }
-    }
-}
-
-/// A register-class operand gets a register, whatever its value or wherever
-/// the allocator put it.
-///
-/// A constant under `"r"` was substituted as an immediate on both targets
-/// (`leaq 8($100)`, `add x0, #100, #100`). And an operand the allocator
-/// spilled was either rendered as its stack slot on aarch64 (`add x0, x0,
-/// [x29, #240]`) or, on x86-64, handed a temp from R8/R9/RSI/RDI -- which the
-/// allocator also uses, so it landed on another operand and read it twice.
-/// Asm register operands are now colored before other values, and what still
-/// spills goes in a scratch that holds nothing.
-const REGISTER_OPERANDS_X86_64: &str = r#"
-#define NI __attribute__((noinline))
+/* ---- 3. register_operands_aarch64 ---- */
 /* A register-class input whose value is a constant still goes in a register:
    the template may use it where no immediate is allowed. */
-NI long k(void) { long t; __asm__("leaq 8(%1), %0" : "=r"(t) : "r"(100L)); return t; }
+NI long ro_k(void) { long t; __asm__("add %0, %1, %1" : "=r"(t) : "r"(100L)); return t; }
 
-volatile long vseed = 1;
-/* 12 register inputs in one statement while other values stay live across
-   it: an operand without a register of its own must not be put in one that
-   holds something else. */
-NI long wide(long *a)
-{
-    long k0 = vseed * 100;
-    long k1 = vseed * 101;
-    long k2 = vseed * 102;
-    long k3 = vseed * 103;
-    long k4 = vseed * 104;
-    long k5 = vseed * 105;
-    long r;
-    __asm__("movq $0, %0\n\taddq %1, %0\n\taddq %2, %0\n\taddq %3, %0\n\taddq %4, %0\n\taddq %5, %0\n\taddq %6, %0\n\taddq %7, %0\n\taddq %8, %0\n\taddq %9, %0\n\taddq %10, %0\n\taddq %11, %0\n\taddq %12, %0" : "=&r"(r) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(a[4]), "r"(a[5]), "r"(a[6]), "r"(a[7]), "r"(a[8]), "r"(a[9]), "r"(a[10]), "r"(a[11]));
-    return r + k0 + k1 + k2 + k3 + k4 + k5;
-}
-int main(void)
-{
-    if (k() != 108) return 2;
-    long a[12];
-    for (int i = 0; i < 12; i++) a[i] = i + 1;
-    return wide(a) == 693 ? 0 : 1;
-}
-"#;
-
-#[test]
-fn codegen_inline_asm_register_operands_x86_64() {
-    if !cfg!(target_arch = "x86_64") {
-        return;
-    }
-    assert_eq!(
-        compile_and_run("asm_regops_x86", REGISTER_OPERANDS_X86_64, &[]),
-        0
-    );
-    let o2 = vec!["-O2".to_string()];
-    assert_eq!(
-        compile_and_run("asm_regops_x86_o2", REGISTER_OPERANDS_X86_64, &o2),
-        0
-    );
-}
-
-/// The aarch64 counterpart: twenty-six register inputs and an early-clobber
-/// output, more operands than the allocator has registers.
-const REGISTER_OPERANDS_AARCH64: &str = r#"
-#define NI __attribute__((noinline))
-/* A register-class input whose value is a constant still goes in a register:
-   the template may use it where no immediate is allowed. */
-NI long k(void) { long t; __asm__("add %0, %1, %1" : "=r"(t) : "r"(100L)); return t; }
-
-NI long wide(long *a)
+NI long ro_wide(long *a)
 {
     long r;
     __asm__("mov %0, #0\n\tadd %0, %0, %1\n\tadd %0, %0, %2\n\tadd %0, %0, %3\n\tadd %0, %0, %4\n\tadd %0, %0, %5\n\tadd %0, %0, %6\n\tadd %0, %0, %7\n\tadd %0, %0, %8\n\tadd %0, %0, %9\n\tadd %0, %0, %10\n\tadd %0, %0, %11\n\tadd %0, %0, %12\n\tadd %0, %0, %13\n\tadd %0, %0, %14\n\tadd %0, %0, %15\n\tadd %0, %0, %16\n\tadd %0, %0, %17\n\tadd %0, %0, %18\n\tadd %0, %0, %19\n\tadd %0, %0, %20\n\tadd %0, %0, %21\n\tadd %0, %0, %22\n\tadd %0, %0, %23\n\tadd %0, %0, %24\n\tadd %0, %0, %25\n\tadd %0, %0, %26" : "=&r"(r) : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(a[4]), "r"(a[5]), "r"(a[6]), "r"(a[7]), "r"(a[8]), "r"(a[9]), "r"(a[10]), "r"(a[11]), "r"(a[12]), "r"(a[13]), "r"(a[14]), "r"(a[15]), "r"(a[16]), "r"(a[17]), "r"(a[18]), "r"(a[19]), "r"(a[20]), "r"(a[21]), "r"(a[22]), "r"(a[23]), "r"(a[24]), "r"(a[25]));
     return r;
 }
-int main(void)
+static int t_register_operands_aarch64(void)
 {
-    if (k() != 200) return 2;
+    if (ro_k() != 200) return 2;
     long a[26];
     for (int i = 0; i < 26; i++) a[i] = i + 1;
-    return wide(a) == 351 ? 0 : 1;
-}
-"#;
-
-#[test]
-fn codegen_inline_asm_register_operands_aarch64() {
-    for opt in ["-O0", "-O2"] {
-        if let Some(code) =
-            compile_and_run_aarch64("asm_regops_a64", REGISTER_OPERANDS_AARCH64, opt)
-        {
-            assert_eq!(code, 0, "at {opt}");
-        }
-    }
+    return ro_wide(a) == 351 ? 0 : 1;
 }
 
-// ============================================================================
-// Memory operands addressed in place, and clobbered registers
-// ============================================================================
-
-/// One asm statement over 16 locals with 25 operands: `"+m"` chars and
-/// longs, `"=m"` and `"m"`, in the gcc torture shape.
-///
-/// A memory operand naming an object at a constant offset needs no register:
-/// it is addressed where it lives, `-N(%rbp)`, as gcc does. c17 routed it
-/// through an address pseudo instead, and with more operands than registers
-/// that address was spilled -- and x86-64 then substituted the *spill slot*
-/// as the operand, so the template read and wrote the saved pointer rather
-/// than the object. gcc returns 0; c17 returned 15.
-fn many_local_memory_operands_x86_64() -> String {
-    let plan = ["ch", "rw", "wo", "in"].repeat(4);
-    let (mut decls, mut outs, mut ins, mut checks) = (vec![], vec![], vec![], vec![]);
-    outs.push(r#"[sum] "=m"(sum)"#.to_string());
-    let mut body = String::from(r"movq $0, %[sum]\n\t");
-    let mut sum = 0;
-    for (i, kind) in plan.iter().enumerate() {
-        match *kind {
-            "ch" => {
-                decls.push(format!("    char m{i} = {i};"));
-                outs.push(format!(r#"[m{i}] "+m"(m{i})"#));
-                body.push_str(&format!(
-                    r"movb %[m{i}], %%al\n\taddb $1, %%al\n\tmovb %%al, %[m{i}]\n\t"
-                ));
-                checks.push(format!("    if (m{i} != {i} + 1) return {};", i + 1));
-            }
-            "rw" => {
-                decls.push(format!("    long m{i} = {i} * 1000;"));
-                outs.push(format!(r#"[m{i}] "+m"(m{i})"#));
-                body.push_str(&format!(
-                    r"movq %[m{i}], %%rax\n\taddq $1, %%rax\n\tmovq %%rax, %[m{i}]\n\t"
-                ));
-                checks.push(format!("    if (m{i} != {i} * 1000 + 1) return {};", i + 1));
-            }
-            "wo" => {
-                decls.push(format!("    long m{i} = {i} * 1000;"));
-                outs.push(format!(r#"[m{i}] "=m"(m{i})"#));
-                body.push_str(&format!(r"movq ${}, %[m{i}]\n\t", i + 7));
-                checks.push(format!("    if (m{i} != {}) return {};", i + 7, i + 1));
-            }
-            _ => {
-                decls.push(format!("    long m{i} = {i} * 1000;"));
-                ins.push(format!(r#"[m{i}] "m"(m{i})"#));
-                body.push_str(&format!(r"movq %[m{i}], %%rax\n\taddq %%rax, %[sum]\n\t"));
-                sum += i * 1000;
-            }
-        }
-    }
-    format!(
-        r#"#define NI __attribute__((noinline))
-volatile long sink;
-NI void touch(void *p) {{ sink += *(volatile char *)p; }}
-
-NI int many_memory_operands(void)
-{{
-    volatile char lo[4000];
-{decls}
-    long sum;
-    touch((void *)lo);
-    __asm__ volatile(
-        "{body}"
-        : {outs}
-        : {ins}
-        : "rax", "memory");
-{checks}
-    if (sum != {sum}) return 100;
-    return 0;
-}}
-
-int main(void) {{ return many_memory_operands(); }}
-"#,
-        decls = decls.join("\n"),
-        outs = outs.join(", "),
-        ins = ins.join(", "),
-        checks = checks.join("\n"),
-    )
-}
-
-/// The template is x86-64 assembly, run on the host: an x86-64 host only.
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn codegen_inline_asm_local_memory_operands_x86_64() {
-    let src = many_local_memory_operands_x86_64();
-    assert_eq!(compile_and_run("asm_mem_locals", &src, &[]), 0);
-    let opts = vec!["-O2".to_string()];
-    assert_eq!(compile_and_run("asm_mem_locals_o2", &src, &opts), 0);
-}
-
-/// Every operand is a frame slot in the template, and no register is loaded
-/// with an address for it.
-#[test]
-fn codegen_inline_asm_local_memory_operands_are_frame_slots_x86_64() {
-    let asm = crate::common::asm_for_at(
-        "asm_mem_locals_shape",
-        &many_local_memory_operands_x86_64(),
-        &["--target", "x86_64-unknown-linux-gnu", "-O2"],
-    );
-    let start = asm.find("many_memory_operands:").expect("the function");
-    let body = &asm[start
-        ..asm[start..]
-            .find(".cfi_endproc")
-            .map_or(asm.len(), |e| start + e)];
-    assert!(body.contains("movb %al, -"), "{body}");
-    assert!(body.contains("(%rbp), %al\n    addb $1, %al"), "{body}");
-    assert!(
-        !body.contains("(%r10)") && !body.contains("(%r11)"),
-        "{body}"
-    );
-}
-
-/// Every kind of object a memory operand can name: a struct member, a
-/// constant array element, a global, a static, a parameter, a plain local,
-/// and one reached through a pointer.
-const MIXED_MEMORY_OPERANDS_X86_64: &str = r#"
-#define NI __attribute__((noinline))
+/* ---- 4. mixed_memory_operands, aarch64 half ---- */
 struct P { long a; int b[4]; };
-long g = 5;
-static long sg = 6;
-NI long mix(long param, long *ptr)
-{
-    struct P s = { 1, { 2, 3, 4, 5 } };
-    long arr[6] = { 10, 11, 12, 13, 14, 15 };
-    long local = 7;
-    __asm__ volatile(
-        "addq $1, %0\n\taddl $1, %1\n\taddq $1, %2\n\taddq $1, %3\n\t"
-        "addq $1, %4\n\taddq $1, %5\n\taddq $1, %6\n\taddq $1, %7"
-        : "+m"(s.a), "+m"(s.b[2]), "+m"(arr[4]), "+m"(g), "+m"(sg), "+m"(param),
-          "+m"(*ptr), "+m"(local));
-    return s.a + s.b[2] + arr[4] + g + sg + param + *ptr + local
-         + s.b[1] + s.b[3] + arr[3] + arr[5];
-}
-int main(void)
-{
-    long x = 100;
-    if (mix(20, &x) != 2 + 5 + 15 + 6 + 7 + 21 + 101 + 8 + 3 + 5 + 13 + 15) return 1;
-    if (x != 101 || g != 6 || sg != 7) return 2;
-    return 0;
-}
-"#;
-
-const MIXED_MEMORY_OPERANDS_AARCH64: &str = r#"
-#define NI __attribute__((noinline))
-struct P { long a; int b[4]; };
-long g = 5;
-static long sg = 6;
-NI long mix(long param, long *ptr)
+long mm_g = 5;
+static long mm_sg = 6;
+NI long mm_mix(long param, long *ptr)
 {
     struct P s = { 1, { 2, 3, 4, 5 } };
     long arr[6] = { 10, 11, 12, 13, 14, 15 };
@@ -2465,154 +2338,21 @@ NI long mix(long param, long *ptr)
         "ldr x9, %5\n\tadd x9, x9, #1\n\tstr x9, %5\n\t"
         "ldr x9, %6\n\tadd x9, x9, #1\n\tstr x9, %6\n\t"
         "ldr x9, %7\n\tadd x9, x9, #1\n\tstr x9, %7"
-        : "+m"(s.a), "+m"(s.b[2]), "+m"(arr[4]), "+m"(g), "+m"(sg), "+m"(param),
+        : "+m"(s.a), "+m"(s.b[2]), "+m"(arr[4]), "+m"(mm_g), "+m"(mm_sg), "+m"(param),
           "+m"(*ptr), "+m"(local)
         : : "x9");
-    return s.a + s.b[2] + arr[4] + g + sg + param + *ptr + local
+    return s.a + s.b[2] + arr[4] + mm_g + mm_sg + param + *ptr + local
          + s.b[1] + s.b[3] + arr[3] + arr[5];
 }
-int main(void)
+static int t_mixed_memory_operands(void)
 {
     long x = 100;
-    if (mix(20, &x) != 2 + 5 + 15 + 6 + 7 + 21 + 101 + 8 + 3 + 5 + 13 + 15) return 1;
-    if (x != 101 || g != 6 || sg != 7) return 2;
+    if (mm_mix(20, &x) != 2 + 5 + 15 + 6 + 7 + 21 + 101 + 8 + 3 + 5 + 13 + 15) return 1;
+    if (x != 101 || mm_g != 6 || mm_sg != 7) return 2;
     return 0;
 }
-"#;
 
-#[test]
-fn codegen_inline_asm_mixed_memory_operands() {
-    // The x86-64 half is x86-64 assembly run on the host; the aarch64 half
-    // runs under qemu on any host that has the cross toolchain.
-    if cfg!(target_arch = "x86_64") {
-        let opts = vec!["-O2".to_string()];
-        assert_eq!(
-            compile_and_run("asm_mem_mix", MIXED_MEMORY_OPERANDS_X86_64, &[]),
-            0
-        );
-        assert_eq!(
-            compile_and_run("asm_mem_mix_o2", MIXED_MEMORY_OPERANDS_X86_64, &opts),
-            0
-        );
-    } else {
-        eprintln!("SKIP asm_mem_mix x86-64 half: not an x86-64 host");
-    }
-    for opt in ["-O0", "-O2"] {
-        if let Some(code) =
-            compile_and_run_aarch64("asm_mem_mix_a64", MIXED_MEMORY_OPERANDS_AARCH64, opt)
-        {
-            assert_eq!(code, 0, "aarch64 at {opt}");
-        }
-    }
-}
-
-/// Twelve operands reached through pointers, whose addresses are run-time
-/// values: each needs a base register, and with `%rax` clobbered there are
-/// fewer allocatable registers than addresses. Those addresses are register
-/// demands of the statement, colored first; the one left over is loaded into
-/// R10. gcc builds this at -O2 and reports impossible constraints at -O0.
-#[cfg(target_arch = "x86_64")]
-const POINTER_MEMORY_OPERANDS_X86_64: &str = r#"
-#define NI __attribute__((noinline))
-NI void *opaque(void *p) { return p; }
-NI int pointers(void)
-{
-    long m0 = 0 * 10;
-    long m1 = 1 * 10;
-    long m2 = 2 * 10;
-    long m3 = 3 * 10;
-    long m4 = 4 * 10;
-    long m5 = 5 * 10;
-    long m6 = 6 * 10;
-    long m7 = 7 * 10;
-    long m8 = 8 * 10;
-    long m9 = 9 * 10;
-    long m10 = 10 * 10;
-    long m11 = 11 * 10;
-    long *p0 = opaque(&m0);
-    long *p1 = opaque(&m1);
-    long *p2 = opaque(&m2);
-    long *p3 = opaque(&m3);
-    long *p4 = opaque(&m4);
-    long *p5 = opaque(&m5);
-    long *p6 = opaque(&m6);
-    long *p7 = opaque(&m7);
-    long *p8 = opaque(&m8);
-    long *p9 = opaque(&m9);
-    long *p10 = opaque(&m10);
-    long *p11 = opaque(&m11);
-    __asm__ volatile("addq $1, %0\n\taddq $1, %1\n\taddq $1, %2\n\taddq $1, %3\n\taddq $1, %4\n\taddq $1, %5\n\taddq $1, %6\n\taddq $1, %7\n\taddq $1, %8\n\taddq $1, %9\n\taddq $1, %10\n\taddq $1, %11\n\t" : "+m"(*p0), "+m"(*p1), "+m"(*p2), "+m"(*p3), "+m"(*p4), "+m"(*p5), "+m"(*p6), "+m"(*p7), "+m"(*p8), "+m"(*p9), "+m"(*p10), "+m"(*p11) : : "rax", "memory");
-    if (m0 != 0 * 10 + 1) return 1;
-    if (m1 != 1 * 10 + 1) return 2;
-    if (m2 != 2 * 10 + 1) return 3;
-    if (m3 != 3 * 10 + 1) return 4;
-    if (m4 != 4 * 10 + 1) return 5;
-    if (m5 != 5 * 10 + 1) return 6;
-    if (m6 != 6 * 10 + 1) return 7;
-    if (m7 != 7 * 10 + 1) return 8;
-    if (m8 != 8 * 10 + 1) return 9;
-    if (m9 != 9 * 10 + 1) return 10;
-    if (m10 != 10 * 10 + 1) return 11;
-    if (m11 != 11 * 10 + 1) return 12;
-    return 0;
-}
-int main(void) { return pointers(); }
-"#;
-
-/// The template is x86-64 assembly, run on the host: an x86-64 host only.
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn codegen_inline_asm_pointer_memory_operands_under_pressure_x86_64() {
-    let opts = vec!["-O2".to_string()];
-    assert_eq!(
-        compile_and_run("asm_mem_ptrs", POINTER_MEMORY_OPERANDS_X86_64, &[]),
-        0
-    );
-    assert_eq!(
-        compile_and_run("asm_mem_ptrs_o2", POINTER_MEMORY_OPERANDS_X86_64, &opts),
-        0
-    );
-}
-
-/// No operand -- register input, output, or a memory operand's address --
-/// may live in a register the statement clobbers: the template writes it
-/// before reading them. Both backends exempted every operand from the
-/// statement's clobbers, so `a` could be given `%rax` and the template's
-/// first instruction destroyed it.
-const CLOBBERED_REGISTERS_X86_64: &str = r#"
-#define NI __attribute__((noinline))
-/* The template writes %rax before reading its operands, and says so: no
-   operand may live in a clobbered register. */
-NI long reg_in(long a, long b)
-{
-    long t;
-    __asm__("movq $1000, %%rax\n\tmovq %1, %0\n\taddq %2, %0" : "=r"(t) : "r"(a), "r"(b) : "rax");
-    return t;
-}
-NI long mem_in(long *p, long *q)
-{
-    long t;
-    __asm__("movq $0, %%rax\n\tmovq %1, %0\n\taddq %2, %0" : "=r"(t) : "m"(*p), "m"(*q) : "rax");
-    return t;
-}
-NI long out_clob(long a)
-{
-    long t;
-    __asm__("movq %1, %0\n\tmovq $0, %%rax" : "=r"(t) : "r"(a) : "rax");
-    return t;
-}
-int main(void)
-{
-    long x = 3, y = 4;
-    if (reg_in(10, 20) != 30) return 1;
-    if (mem_in(&x, &y) != 7) return 2;
-    if (out_clob(5) != 5) return 3;
-    return 0;
-}
-"#;
-
-const CLOBBERED_REGISTERS_AARCH64: &str = r#"
-#define NI __attribute__((noinline))
+/* ---- 5. operands_avoid_clobbered_registers, aarch64 half ---- */
 /* The template writes x0 before reading its operands, and says so: no
    operand may live in a clobbered register. */
 NI long reg_in(long a, long b)
@@ -2633,7 +2373,7 @@ NI long out_clob(long a)
     __asm__("mov %0, %1\n\tmov x0, #0" : "=r"(t) : "r"(a) : "x0");
     return t;
 }
-int main(void)
+static int t_operands_avoid_clobbered_registers(void)
 {
     long x = 3, y = 4;
     if (reg_in(10, 20) != 30) return 1;
@@ -2641,32 +2381,207 @@ int main(void)
     if (out_clob(5) != 5) return 3;
     return 0;
 }
+
+/* ---- 6. operand_address_used_elsewhere, aarch64 half ---- */
+int garr[4];
+int *gq;
+struct S { int x; int y[3]; } gs;
+static int t_operand_address_used_elsewhere(void)
+{
+    int larr[4];
+    int *q, *r, *s;
+    __asm__ volatile("" : "=m"(*(gq = &garr[2])));
+    if (gq != &garr[2]) return 1;
+    __asm__ volatile("" : "=m"(*(q = &larr[1])));
+    if (q != &larr[1]) return 2;
+    __asm__ volatile("" : "=m"(*(r = &gs.y[1])));
+    if (r != &gs.y[1]) return 3;
+    s = &larr[3];
+    __asm__ volatile("" : "+m"(*s));
+    *s = 7;
+    if (larr[3] != 7) return 4;
+    return 0;
+}
+
+int main(void)
+{
+    int r;
+    if ((r = t_early_clobber_aarch64()) != 0) return 10 + r;
+    if ((r = t_numbering_aarch64()) != 0) return 20 + r;
+    if ((r = t_register_operands_aarch64()) != 0) return 30 + r;
+    if ((r = t_mixed_memory_operands()) != 0) return 40 + r;
+    if ((r = t_operands_avoid_clobbered_registers()) != 0) return 50 + r;
+    if ((r = t_operand_address_used_elsewhere()) != 0) return 60 + r;
+    return 0;
+}
 "#;
 
+/// Consolidates codegen_inline_asm_early_clobber_aarch64,
+/// codegen_inline_asm_numbering_aarch64,
+/// codegen_inline_asm_register_operands_aarch64 and the aarch64 halves of
+/// codegen_inline_asm_mixed_memory_operands,
+/// codegen_inline_asm_operands_avoid_clobbered_registers and
+/// codegen_inline_asm_operand_address_used_elsewhere: run under qemu on any
+/// host that has the cross toolchain.
 #[test]
-fn codegen_inline_asm_operands_avoid_clobbered_registers() {
-    // The x86-64 half is x86-64 assembly run on the host; the aarch64 half
-    // runs under qemu on any host that has the cross toolchain.
-    if cfg!(target_arch = "x86_64") {
-        let opts = vec!["-O2".to_string()];
-        assert_eq!(
-            compile_and_run("asm_clobbered", CLOBBERED_REGISTERS_X86_64, &[]),
-            0
-        );
-        assert_eq!(
-            compile_and_run("asm_clobbered_o2", CLOBBERED_REGISTERS_X86_64, &opts),
-            0
-        );
-    } else {
-        eprintln!("SKIP asm_clobbered x86-64 half: not an x86-64 host");
-    }
+fn codegen_inline_asm_aarch64_qemu_mega() {
     for opt in ["-O0", "-O2"] {
-        if let Some(code) =
-            compile_and_run_aarch64("asm_clobbered_a64", CLOBBERED_REGISTERS_AARCH64, opt)
-        {
+        if let Some(code) = compile_and_run_aarch64("asm_a64_qemu_mega", AARCH64_QEMU, opt) {
             assert_eq!(code, 0, "aarch64 at {opt}");
         }
     }
+}
+
+// ============================================================================
+// Programs for both 64-bit targets
+// ============================================================================
+
+/// An `asm goto` label survives being inlined.
+///
+/// The label names a *block*, and it is the callee's block. The inliner
+/// remaps `bb_true`/`bb_false` and the pseudos inside the asm operands, but
+/// not `asm_data.goto_labels` -- so after inlining the label named whichever
+/// caller block happened to share the id. For a small callee that is the block
+/// holding the asm itself, and the branch became `b .Lmain_1` from inside
+/// `.Lmain_1`: the program jumped to its own address and hung.
+///
+/// This must be *run*, not read: the assembly was well-formed and the label
+/// was spelled correctly, which is all a text probe checks. Only executing it
+/// shows the branch going to the wrong place.
+///
+/// Kept apart: it is about an inlining decision, which another function in
+/// the translation unit could change.
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn codegen_inlined_asm_goto_branches_to_the_right_block() {
+    #[cfg(target_arch = "x86_64")]
+    let jump = "jmp %l[done]";
+    #[cfg(target_arch = "aarch64")]
+    let jump = "b %l[done]";
+
+    let code = format!(
+        r#"
+/* Small enough that the inliner takes it, which is the whole point. */
+static int taken(void) {{
+    __asm__ goto ("{jump}" : : : : done);
+    return 0;
+done:
+    return 1;
+}}
+
+/* The fallthrough arm: the asm does not branch, so the label is not used. */
+static int not_taken(void) {{
+    __asm__ goto ("" : : : : done);
+    return 0;
+done:
+    return 1;
+}}
+
+int main(void) {{
+    if (taken() != 1) return 1;
+    if (not_taken() != 0) return 2;
+    /* Twice, so a second inlining of the same callee is remapped too. */
+    if (taken() != 1) return 3;
+    if (taken() + not_taken() != 1) return 4;
+    return 0;
+}}
+"#
+    );
+    assert_eq!(compile_and_run("inlined_asm_goto", &code, &[]), 0);
+    assert_eq!(compile_and_run_optimized("inlined_asm_goto_opt", &code), 0);
+}
+
+// codegen_asm_goto_releases_a_vla_scope_on_its_label_edge:
+// An `asm goto` releases the VLA scopes its label edge leaves.
+//
+// It has two exits and needs a release on each. The enclosing scope's
+// release sits on the fall-through, and the label edge branches straight
+// past it -- so a loop whose back edge runs through the jump allocated
+// every time round and freed nothing. Each edge now has a block of its own
+// and the release goes there.
+//
+// Observed by address rather than by exhaustion: the same declaration
+// reached on the same path allocates at the same address every iteration if
+// and only if the previous one was released.
+//
+// codegen_asm_array_operand_is_a_pointer:
+// An array or a function in a register operand has decayed to a pointer
+// (C17 6.3.2.1p3-4), so the operand is the pointer's width. c17 sized it
+// as the array, and named the register for an odd width as its 32-bit half:
+// `0(%eax)` addressed the low four gigabytes, where no stack is.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const BOTH_TARGETS: &str = r#"
+/* Exit codes: section k fails with 10*k + its original code.
+ *  1 asm_goto_releases_a_vla_scope_on_its_label_edge  10..19
+ *  2 asm_array_operand_is_a_pointer                   20..29
+ */
+#if defined(__x86_64__)
+#define VLA_JUMP "jmp %l[again]"
+#define AO_STORE "movq $7, 0(%0)"
+#define AO_CLOBBERS "memory"
+#elif defined(__aarch64__)
+#define VLA_JUMP "b %l[again]"
+#define AO_STORE "mov x9, #7\n\tstr x9, [%0]"
+#define AO_CLOBBERS "x9", "memory"
+#endif
+
+/* 1. An `asm goto` releases the VLA scopes its label edge leaves: the same
+   declaration reached on the same path allocates at the same address every
+   iteration if and only if the previous one was released. */
+static int loop_through_asm_goto(int n) {
+    void *first = 0;
+    int k = 0;
+top:
+    {
+        int a[n];
+        a[0] = k;
+        if (!first) first = (void *)a;
+        else if (first != (void *)a) return 1;
+        k++;
+        __asm__ goto (VLA_JUMP : : : : again);
+        return 2;                 /* the asm always branches */
+    }
+again:
+    if (k < 8) goto top;
+    return 0;
+}
+
+static int t_asm_goto_releases_a_vla_scope_on_its_label_edge(void) {
+    return loop_through_asm_goto(7);
+}
+
+/* 2. An array or a function in a register operand has decayed to a pointer
+   (C17 6.3.2.1p3-4), so the operand is the pointer's width. */
+static long kept[2];
+static int seven(void) { return 7; }
+static int t_asm_array_operand_is_a_pointer(void) {
+    long local[2] = { 0, 0 };
+    void *fp;
+    __asm__ volatile(AO_STORE : : "r"(local) : AO_CLOBBERS);
+    __asm__ volatile(AO_STORE : : "r"(kept) : AO_CLOBBERS);
+    __asm__ volatile("" : "=r"(fp) : "0"(seven));
+    if (local[0] != 7 || kept[0] != 7) return 1;
+    return fp == (void *)seven ? 0 : 2;
+}
+
+int main(void) {
+    int r;
+    if ((r = t_asm_goto_releases_a_vla_scope_on_its_label_edge()) != 0) return 10 + r;
+    if ((r = t_asm_array_operand_is_a_pointer()) != 0) return 20 + r;
+    return 0;
+}
+"#;
+
+/// Consolidates codegen_asm_goto_releases_a_vla_scope_on_its_label_edge and
+/// codegen_asm_array_operand_is_a_pointer.
+#[test]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn codegen_inline_asm_both_targets_mega() {
+    assert_eq!(compile_and_run("asm_both_targets", BOTH_TARGETS, &[]), 0);
+    assert_eq!(
+        compile_and_run_optimized("asm_both_targets_opt", BOTH_TARGETS),
+        0
+    );
 }
 
 /// A memory operand's address arithmetic can have readers besides the asm:
@@ -2675,6 +2590,8 @@ fn codegen_inline_asm_operands_avoid_clobbered_registers() {
 /// directly, so the store wrote an undefined register and `q != &arr[2]`
 /// afterwards -- for a global, a local and a struct member alike. It is left
 /// for DCE now, which knows its readers.
+///
+/// The aarch64 half is a section of [`codegen_inline_asm_aarch64_qemu_mega`].
 const ASM_OPERAND_ADDRESS_SHARED: &str = r#"
 int garr[4];
 int *gq;
@@ -2708,94 +2625,4 @@ fn codegen_inline_asm_operand_address_used_elsewhere() {
         compile_and_run("asm_addr_shared_o2", ASM_OPERAND_ADDRESS_SHARED, &opts),
         0
     );
-    for opt in ["-O0", "-O2"] {
-        if let Some(code) =
-            compile_and_run_aarch64("asm_addr_shared_a64", ASM_OPERAND_ADDRESS_SHARED, opt)
-        {
-            assert_eq!(code, 0, "aarch64 at {opt}");
-        }
-    }
-}
-
-/// An `asm goto` releases the VLA scopes its label edge leaves.
-///
-/// It has two exits and needs a release on each. The enclosing scope's
-/// release sits on the fall-through, and the label edge branches straight
-/// past it -- so a loop whose back edge runs through the jump allocated
-/// every time round and freed nothing. Each edge now has a block of its own
-/// and the release goes there.
-///
-/// Observed by address rather than by exhaustion: the same declaration
-/// reached on the same path allocates at the same address every iteration if
-/// and only if the previous one was released.
-#[test]
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn codegen_asm_goto_releases_a_vla_scope_on_its_label_edge() {
-    #[cfg(target_arch = "x86_64")]
-    let jump = "jmp %l[again]";
-    #[cfg(target_arch = "aarch64")]
-    let jump = "b %l[again]";
-
-    let code = format!(
-        r#"
-static int loop_through_asm_goto(int n) {{
-    void *first = 0;
-    int k = 0;
-top:
-    {{
-        int a[n];
-        a[0] = k;
-        if (!first) first = (void *)a;
-        else if (first != (void *)a) return 1;
-        k++;
-        __asm__ goto ("{jump}" : : : : again);
-        return 2;                 /* the asm always branches */
-    }}
-again:
-    if (k < 8) goto top;
-    return 0;
-}}
-
-int main(void) {{
-    return loop_through_asm_goto(7);
-}}
-"#
-    );
-    assert_eq!(compile_and_run("asm_goto_vla_scope", &code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("asm_goto_vla_scope_opt", &code),
-        0
-    );
-}
-
-/// An array or a function in a register operand has decayed to a pointer
-/// (C17 6.3.2.1p3-4), so the operand is the pointer's width. c17 sized it
-/// as the array, and named the register for an odd width as its 32-bit half:
-/// `0(%eax)` addressed the low four gigabytes, where no stack is.
-#[test]
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn codegen_asm_array_operand_is_a_pointer() {
-    #[cfg(target_arch = "x86_64")]
-    let store = "movq $7, 0(%0)";
-    #[cfg(target_arch = "aarch64")]
-    let store = "mov x9, #7\\n\\tstr x9, [%0]";
-    let code = format!(
-        r#"
-static long kept[2];
-static int seven(void) {{ return 7; }}
-int main(void) {{
-    long local[2] = {{ 0, 0 }};
-    void *fp;
-    __asm__ volatile("{store}" : : "r"(local) : "x9", "memory");
-    __asm__ volatile("{store}" : : "r"(kept) : "x9", "memory");
-    __asm__ volatile("" : "=r"(fp) : "0"(seven));
-    if (local[0] != 7 || kept[0] != 7) return 1;
-    return fp == (void *)seven ? 0 : 2;
-}}
-"#
-    );
-    #[cfg(target_arch = "x86_64")]
-    let code = code.replace("\"x9\", ", "");
-    assert_eq!(compile_and_run("asm_array_operand", &code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("asm_array_operand_opt", &code), 0);
 }

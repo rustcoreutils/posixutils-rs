@@ -181,8 +181,11 @@ fn standard_library_exists(name: &str, lib_paths: &[String]) -> bool {
 /// search path is -- are this driver's to answer, so they are put to it rather
 /// than guessed at.
 pub fn host_driver() -> Command {
-    Command::new("cc")
+    Command::new(HOST_DRIVER)
 }
+
+/// The program name of the host C driver; see [`host_driver`].
+pub const HOST_DRIVER: &str = "cc";
 
 /// Recover the ordered link line from a normalized argument vector.
 ///

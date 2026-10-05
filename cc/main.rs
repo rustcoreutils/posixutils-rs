@@ -18,7 +18,7 @@ use posixutils_cc::linkargs;
 use posixutils_cc::opt;
 use posixutils_cc::parse;
 use posixutils_cc::pipeline;
-use posixutils_cc::prefix_map::{MapOption, PrefixMaps};
+use posixutils_cc::prefix_map::{MapOption, PrefixMap, PrefixMaps};
 use posixutils_cc::respfile;
 use posixutils_cc::strings;
 use posixutils_cc::symbol;
@@ -1292,11 +1292,15 @@ fn process_file(
         ObjectName::Temp(p) => (p.clone(), true),
     };
 
-    let mut as_cmd = Command::new("as");
-    if args.debug > 0 {
-        as_cmd.arg("-g");
-    }
-    let status = as_cmd.args(["-o", &obj_file, &temp_asm]).status()?;
+    let status = AssemblerCommand::new(
+        target.os,
+        args.debug > 0,
+        &prefix_maps.debug,
+        &temp_asm,
+        &obj_file,
+    )
+    .command()
+    .status()?;
 
     let _ = std::fs::remove_file(&temp_asm);
 
@@ -2437,12 +2441,15 @@ fn assemble_operand(
         path.to_string()
     };
 
-    let mut as_cmd = Command::new("as");
-    if args.debug > 0 {
-        as_cmd.arg("-g");
-    }
-    as_cmd.args(["-o", &obj_file, &asm_to_assemble]);
-    let status = as_cmd.status()?;
+    let status = AssemblerCommand::new(
+        target.os,
+        args.debug > 0,
+        &args.prefix_maps().debug,
+        &asm_to_assemble,
+        &obj_file,
+    )
+    .command()
+    .status()?;
 
     if needs_cpp {
         let _ = std::fs::remove_file(&asm_to_assemble);
@@ -2456,6 +2463,50 @@ fn assemble_operand(
         Ok(None)
     } else {
         Ok(Some(obj_file))
+    }
+}
+
+/// How to assemble one `.s` file: the program and its arguments.
+///
+/// Normally this is the system `as`. On Darwin with a debug prefix map in
+/// effect it is the host driver instead: Apple's assembler is clang's
+/// integrated assembler, which records its own working directory in the DWARF
+/// line table unless it is told the mapping, and only the driver forwards
+/// `-fdebug-prefix-map` to it. GNU `as` records no such directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssemblerCommand {
+    program: &'static str,
+    args: Vec<String>,
+}
+
+impl AssemblerCommand {
+    fn new(os: Os, debug: bool, debug_map: &PrefixMap, input: &str, output: &str) -> Self {
+        let mut args = Vec::new();
+        let program = if os == Os::MacOS && !debug_map.is_empty() {
+            args.extend(["-c", "-x", "assembler", input, "-o", output].map(String::from));
+            if debug {
+                args.push("-g".to_string());
+            }
+            args.extend(
+                debug_map
+                    .entries()
+                    .map(|(old, new)| format!("-fdebug-prefix-map={old}={new}")),
+            );
+            linkargs::HOST_DRIVER
+        } else {
+            if debug {
+                args.push("-g".to_string());
+            }
+            args.extend(["-o", output, input].map(String::from));
+            "as"
+        };
+        AssemblerCommand { program, args }
+    }
+
+    fn command(&self) -> Command {
+        let mut cmd = Command::new(self.program);
+        cmd.args(&self.args);
+        cmd
     }
 }
 
@@ -3101,6 +3152,75 @@ mod tests {
         assert_eq!(maps.macros.apply("/a=b/t.c"), "/M/t.c");
         assert_eq!(maps.debug.apply("/a=b/t.c"), "/a=b/t.c");
         assert_eq!(args.files, ["foo.c"]);
+    }
+
+    fn assembler(os: Os, debug: bool, map: &[(&str, &str)]) -> (&'static str, Vec<String>) {
+        let mut debug_map = PrefixMap::default();
+        for (old, new) in map {
+            debug_map.push(old, new);
+        }
+        let cmd = AssemblerCommand::new(os, debug, &debug_map, "t.s", "t.o");
+        (cmd.program, cmd.args)
+    }
+
+    #[test]
+    fn test_darwin_prefix_map_assembles_with_the_driver() {
+        // Apple's integrated assembler records its own cwd in the line table
+        // unless the driver forwards the map to it, in command-line order.
+        let (program, args) = assembler(Os::MacOS, true, &[("/b", "."), ("/b/x", "/X")]);
+        assert_eq!(program, "cc");
+        assert_eq!(
+            args,
+            [
+                "-c",
+                "-x",
+                "assembler",
+                "t.s",
+                "-o",
+                "t.o",
+                "-g",
+                "-fdebug-prefix-map=/b=.",
+                "-fdebug-prefix-map=/b/x=/X",
+            ]
+        );
+        let (program, args) = assembler(Os::MacOS, false, &[("/b", ".")]);
+        assert_eq!(program, "cc");
+        assert_eq!(
+            args,
+            [
+                "-c",
+                "-x",
+                "assembler",
+                "t.s",
+                "-o",
+                "t.o",
+                "-fdebug-prefix-map=/b=."
+            ]
+        );
+    }
+
+    #[test]
+    fn test_assembler_is_plain_as_otherwise() {
+        // Darwin without a map, and GNU as with one, are unchanged.
+        for (os, map) in [
+            (Os::MacOS, &[][..]),
+            (Os::Linux, &[("/b", ".")][..]),
+            (Os::FreeBSD, &[("/b", ".")][..]),
+        ] {
+            assert_eq!(
+                assembler(os, true, map),
+                (
+                    "as",
+                    vec!["-g".into(), "-o".into(), "t.o".into(), "t.s".into()]
+                ),
+                "{os:?}"
+            );
+            assert_eq!(
+                assembler(os, false, map),
+                ("as", vec!["-o".into(), "t.o".into(), "t.s".into()]),
+                "{os:?}"
+            );
+        }
     }
 
     #[test]

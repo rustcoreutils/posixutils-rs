@@ -28,6 +28,16 @@ impl PrefixMap {
         self.entries.push((old.to_string(), new.to_string()));
     }
 
+    /// The `(old, new)` rewrites, in command-line order.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries.iter().map(|(o, n)| (o.as_str(), n.as_str()))
+    }
+
+    /// Whether no rewrite was given.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// `path` with its prefix rewritten.
     ///
     /// gcc's rule: the *last* option whose `OLD` is a prefix of the path

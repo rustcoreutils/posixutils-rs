@@ -1716,8 +1716,9 @@ fn test_target_clones_become_versions_and_a_resolver() {
 
 /// A `target_clones` function's attributes divide among its symbols as gcc
 /// divides them: `constructor` and `destructor`, priority and all, register
-/// the default version; `section` and `used` reach every version and `used`
-/// the resolver; `visibility` stays with the name; `weak` goes nowhere.
+/// the default version; `section` reaches every version but the default one,
+/// `used` every version and the resolver; `visibility` and `weak` go nowhere,
+/// so a `hidden` function's name is exported, as gcc 13 exports it.
 #[test]
 fn test_target_clones_divide_attributes_as_gcc() {
     let src = "__attribute__((target_clones(\"sse4.2\", \"default\"), constructor(101), \
@@ -1739,13 +1740,14 @@ fn test_target_clones_divide_attributes_as_gcc() {
     for version in [default, other] {
         assert!(version.symbol_attrs.used, "{}", version.name);
         assert!(!version.symbol_attrs.weak, "{}", version.name);
-        assert_eq!(version.symbol_attrs.section.as_deref(), Some(".text.hot"));
         assert_eq!(version.symbol_attrs.visibility, None, "{}", version.name);
     }
+    assert_eq!(default.symbol_attrs.section, None);
+    assert_eq!(other.symbol_attrs.section.as_deref(), Some(".text.hot"));
     let resolver = func("init.resolver");
     assert!(resolver.symbol_attrs.used);
     assert_eq!((resolver.constructor, resolver.destructor), (None, None));
     let alias = module.aliases.iter().find(|a| a.name == "init").unwrap();
-    assert_eq!(alias.visibility.as_deref(), Some("hidden"));
+    assert_eq!(alias.visibility, None);
     assert!(!alias.weak);
 }

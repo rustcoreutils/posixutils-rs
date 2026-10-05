@@ -52,9 +52,9 @@ pub(crate) struct VersionAttrs {
 /// |----------------------------|------------------------------------------|
 /// | `constructor`/`destructor` | `name.default`, with any priority: gcc   |
 /// |                            | registers the default version, not `name`|
-/// | `section`                  | every version                            |
+/// | `section`                  | every version but `name.default`         |
 /// | `used`                     | every version and the resolver           |
-/// | `visibility`               | `name`                                   |
+/// | `visibility`               | nothing: `name` is exported, as in gcc   |
 /// | `weak`                     | nothing: `name` stays global, as in gcc  |
 /// | `alias`/`ifunc`            | nothing: `name` is the resolver's ifunc  |
 ///
@@ -62,9 +62,10 @@ pub(crate) struct VersionAttrs {
 /// `always_inline`, `pure`/`const`, `noreturn` -- every compilation of the
 /// body reads off the definition itself, so every version has it.
 ///
-/// Two departures from gcc 13, which drops these on the floor: `section`
-/// also reaches `name.default` (gcc puts only the other versions there), and
-/// `visibility` reaches `name` (gcc exports a `hidden` function).
+/// `section` and `visibility` follow gcc 13 as measured, odd as both look:
+/// the default version stays in `.text`, and a `hidden` function's indirect
+/// symbol is exported anyway. Matching it keeps a library's exported symbols
+/// the same as a gcc build's.
 struct Division {
     default: VersionAttrs,
     others: VersionAttrs,
@@ -81,7 +82,10 @@ impl Division {
         };
         Division {
             default: VersionAttrs {
-                symbol: version.clone(),
+                symbol: SymbolAttrs {
+                    section: None,
+                    ..version.clone()
+                },
                 constructor: attrs.constructor,
                 destructor: attrs.destructor,
             },
@@ -90,10 +94,7 @@ impl Division {
                 ..Default::default()
             },
             resolver_used: attrs.symbol.used,
-            name: SymbolAttrs {
-                visibility: attrs.symbol.visibility.clone(),
-                ..Default::default()
-            },
+            name: SymbolAttrs::default(),
         }
     }
 }

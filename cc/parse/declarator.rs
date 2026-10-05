@@ -707,7 +707,7 @@ impl Parser<'_> {
 
             // Parse parameter type
             let param_pos = self.current_pos();
-            let param_specs = self.parse_declaration_specifiers(SpecContext::Declaration)?;
+            let param_specs = self.parse_declaration_specifiers(SpecContext::Parameter)?;
             let param_type = param_specs.ty;
             // C11 6.7.5p2: not on a parameter.
             self.reject_alignas_in("a parameter");

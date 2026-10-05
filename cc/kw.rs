@@ -1193,6 +1193,9 @@ define_keywords! {
     (_, "__target__",                SUPPORTED_ATTR),
     (_, "target_clones",             SUPPORTED_ATTR),
     (_, "__target_clones__",         SUPPORTED_ATTR),
+    // `__auto_type`: a declaration whose type is its initializer's. A type
+    // specifier, and reserved like every `__` spelling. Appended, as above.
+    (GNU_AUTO_TYPE,     "__auto_type",       TYPE_SPEC | TYPE_KEYWORD | RESERVED_NAME),
 }
 
 // Tag query API
@@ -1345,6 +1348,7 @@ mod tests {
             "typeof",
             "__typeof__",
             "__typeof",
+            "__auto_type",
             "_Atomic",
         ] {
             let table = StringTable::new();
@@ -1407,6 +1411,7 @@ mod tests {
             "typeof",
             "__typeof__",
             "__typeof",
+            "__auto_type",
         ] {
             let table = StringTable::new();
             let sid = id(&table, s);
@@ -1465,6 +1470,7 @@ mod tests {
             "typeof",
             "__typeof__",
             "__typeof",
+            "__auto_type",
             "_Thread_local",
             "__thread",
             "_Static_assert",

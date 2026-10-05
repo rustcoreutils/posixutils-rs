@@ -395,3 +395,43 @@ fn misc_cleanup_goto_into_scope_is_accepted() {
     );
     compile_expect_no_diagnostic("cleanup_goto_into", &src, "jump");
 }
+
+/// `__auto_type` needs exactly one plain, initialized declarator and no
+/// other type specifier, in gcc's words.
+#[test]
+fn diagnostics_auto_type_misuse() {
+    for (name, src, want) in [
+        (
+            "auto_type_file_scope_no_init",
+            "__auto_type x;\n",
+            "'__auto_type' requires an initialized data declaration",
+        ),
+        (
+            "auto_type_no_init",
+            "void f(void) { __auto_type a; }\n",
+            "'__auto_type' requires an initialized data declaration",
+        ),
+        (
+            "auto_type_two_declarators",
+            "void f(void) { __auto_type a = 1, b = 2.0; }\n",
+            "'__auto_type' may only be used with a single declarator",
+        ),
+        (
+            "auto_type_with_int",
+            "void f(void) { __auto_type int a = 1; }\n",
+            "two or more data types in declaration specifiers",
+        ),
+        (
+            "auto_type_pointer_declarator",
+            "void f(void) { __auto_type a = 1; __auto_type *p = &a; }\n",
+            "'__auto_type' requires a plain identifier as declarator",
+        ),
+        (
+            "auto_type_array_declarator",
+            "void f(void) { __auto_type a[] = {1}; }\n",
+            "'__auto_type' requires a plain identifier as declarator",
+        ),
+    ] {
+        crate::test_compile::compile_expect_error(name, src, want);
+    }
+}

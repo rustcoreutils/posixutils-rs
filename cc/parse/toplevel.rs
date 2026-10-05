@@ -494,7 +494,7 @@ impl Parser<'_> {
             declared = true;
             let knr_pos = self.current_pos();
             let knr_type = self
-                .parse_declaration_specifiers(SpecContext::Declaration)?
+                .parse_declaration_specifiers(SpecContext::Parameter)?
                 .ty;
             let knr_base_id = self.intern_type_with_tag(&knr_type);
             loop {

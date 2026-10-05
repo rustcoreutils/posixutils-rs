@@ -2814,6 +2814,20 @@ pub struct FunctionAttrs {
 }
 
 impl FunctionAttrs {
+    /// Whether a definition with these attributes is a GNU inline-only body:
+    /// `extern inline` under GNU inline semantics, selected by the attribute
+    /// or by `-fgnu89-inline`. It emits nothing and is there to be inlined.
+    ///
+    /// Only the definition's own specifiers count, as in gcc: an `extern`
+    /// on another declaration of the name does not make a plain `inline`
+    /// definition inline-only, and an `extern inline` declaration does not
+    /// make the definition after it one either. `storage` is the
+    /// definition's storage-class specifiers and `inline`.
+    pub fn gnu_inline_only(&self, storage: TypeModifiers) -> bool {
+        (self.gnu_inline || crate::builtins::gnu89_inline())
+            && storage.contains(TypeModifiers::EXTERN | TypeModifiers::INLINE)
+    }
+
     /// Fold `other` in, letting a present attribute win.
     ///
     /// Attributes reach a function definition from more than one place --

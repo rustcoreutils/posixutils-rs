@@ -38,7 +38,7 @@ pub(crate) struct LinkedName {
     defined: bool,
     /// Whether that definition was a GNU inline-only one (`extern inline`
     /// under `gnu_inline` semantics), which emits nothing and so may be
-    /// followed by the real one.
+    /// followed by the real one -- the one further definition allowed.
     inline_only: bool,
 }
 
@@ -178,8 +178,10 @@ impl Parser<'_> {
         }
 
         // 6.9p3, p5: one definition. A GNU inline-only body defines nothing
-        // here, so it may precede or follow the real one.
-        let redefined = d.defines && prior.defined && !(prior.inline_only || d.inline_only);
+        // here, so the real one may follow it -- and only that: gcc rejects
+        // an inline-only body after the real one, and a second inline-only
+        // body after the first.
+        let redefined = d.defines && prior.defined && !(prior.inline_only && !d.inline_only);
         if redefined {
             diag::error_args(d.pos, "redefinition of '{0}'", &[&spelled]);
         }

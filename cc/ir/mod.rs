@@ -3859,13 +3859,16 @@ pub struct Module {
     pub library_symbols: HashMap<&'static str, String>,
     /// Where each global is in `globals`, by name: see `Module::global_mut`.
     global_idx: AppendIndex,
+    /// Where each function is in `functions`, by name: see
+    /// `Module::add_function`.
+    function_idx: AppendIndex,
     /// Where each literal is in `strings`, by contents: see
     /// `Module::add_string`.
     string_idx: AppendIndex,
 }
 
 /// The position of each item in one of `Module`'s lists, by a key the item
-/// carries: a global's name, a literal's contents.
+/// carries: a global's or a function's name, a literal's contents.
 ///
 /// Those lists are only ever appended to, by this module and by the passes
 /// that push to them directly, so the index catches up with whatever was
@@ -3938,9 +3941,21 @@ pub(crate) fn string_label(index: usize) -> String {
 }
 
 impl Module {
-    /// Add a function
+    /// Add a function definition, keeping one function per name.
+    ///
+    /// A GNU inline-only body (`emit == false`) may be followed by the
+    /// translation unit's real definition of the same name -- the parser
+    /// allows that order and no other -- and the real one replaces it: it is
+    /// the function, for calls, for the inliner and for `&f`, as in gcc. Two
+    /// entries under one name would leave every lookup by name to pick one.
     pub fn add_function(&mut self, func: Function) {
-        self.functions.push(func);
+        let found = self
+            .function_idx
+            .find(&self.functions, |f| f.name.as_str(), &func.name);
+        match found {
+            Some(i) if !self.functions[i].emit => self.functions[i] = func,
+            _ => self.functions.push(func),
+        }
     }
 
     /// Add a global variable

@@ -1585,6 +1585,41 @@ fn test_alias_declarations_become_symbol_aliases() {
     }
 }
 
+/// A gnu_inline `extern inline` body followed by the real definition of the
+/// same name leaves one function under that name in the module: the real
+/// one, emitted. Two entries let the inliner take the first by name -- the
+/// inline-only body -- while the emitted symbol was the second.
+///
+/// A plain `inline` gnu_inline definition after an `extern` declaration is
+/// the real one too: only the definition's own `extern` makes it
+/// inline-only.
+#[test]
+fn test_real_definition_replaces_gnu_inline_body() {
+    let src = "int one(void);\nint zero(void);\n\
+               extern inline __attribute__((gnu_inline)) int f(void) { return one(); }\n\
+               int f(void) { return zero(); }\n\
+               extern int h(void);\n\
+               inline __attribute__((gnu_inline)) int h(void) { return zero(); }\n";
+    for arch in [crate::target::Arch::X86_64, crate::target::Arch::Aarch64] {
+        let target = Target::new(arch, crate::target::Os::Linux);
+        let module = linearize_source(src, &target);
+        for name in ["f", "h"] {
+            let found: Vec<&Function> =
+                module.functions.iter().filter(|f| f.name == name).collect();
+            assert_eq!(found.len(), 1, "{arch}: one `{name}` in the module");
+            let func = found[0];
+            assert!(func.emit, "{arch}: `{name}` is the emitted definition");
+            let callees: Vec<&str> = func
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insns)
+                .filter_map(|i| i.local_callee())
+                .collect();
+            assert_eq!(callees, ["zero"], "{arch}: `{name}` is the real body");
+        }
+    }
+}
+
 /// x86-64 Linux, whose x87 `long double` holds `0x1p62L + 1.0L` exactly --
 /// a test about that names the target rather than taking the host's, since
 /// on an arm64 Mac `long double` is `double`.

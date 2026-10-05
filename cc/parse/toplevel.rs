@@ -343,13 +343,9 @@ impl Parser<'_> {
             ParamStyle::IdentifierList => Redeclared::IdentifierListDefinition,
         };
         self.check_redeclaration(name, typ, pos, form);
-        // A GNU inline-only body -- `extern inline` under `gnu_inline`
-        // semantics -- emits nothing, so a real definition may join it.
-        let gnu_inline = attrs.gnu_inline || crate::builtins::gnu89_inline();
-        let inline_only = gnu_inline
-            && specs
-                .storage_class
-                .contains(TypeModifiers::EXTERN | TypeModifiers::INLINE);
+        // A GNU inline-only body emits nothing, so a real definition may
+        // follow it.
+        let inline_only = attrs.gnu_inline_only(specs.storage_class);
         let linkage = self.declare_linkage(Declared {
             name,
             typ,

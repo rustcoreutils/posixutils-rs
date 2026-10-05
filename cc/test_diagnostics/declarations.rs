@@ -351,6 +351,30 @@ fn declarations_that_stay_legal() {
     );
 }
 
+/// The other order is a redefinition in gcc: once the real body is in,
+/// an inline-only body of the same name is a second definition.
+#[test]
+fn real_definition_then_gnu_inline_body_is_a_redefinition() {
+    compile_expect_error(
+        "decl_real_then_gnu_inline",
+        "int g(void) { return 0; }\n\
+         extern inline __attribute__((gnu_inline)) int g(void) { return 2; }\n",
+        "redefinition of 'g'",
+    );
+}
+
+/// Only the real definition may follow an inline-only body: a second
+/// inline-only body is a redefinition in gcc too.
+#[test]
+fn two_gnu_inline_bodies_are_a_redefinition() {
+    compile_expect_error(
+        "decl_two_gnu_inline",
+        "extern inline __attribute__((gnu_inline)) int g(void) { return 1; }\n\
+         extern inline __attribute__((gnu_inline)) int g(void) { return 1; }\n",
+        "redefinition of 'g'",
+    );
+}
+
 /// `static` and qualifiers in `[ ]` qualify the parameter's own array type,
 /// however its name is parenthesized; through a pointer they do not.
 #[test]

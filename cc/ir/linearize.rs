@@ -1930,7 +1930,9 @@ impl<'a> Linearizer<'a> {
         // GNU inline, selected by `__gnu_inline__`, is the exact opposite on
         // the `extern` question: there `extern inline` is the one that
         // provides no external definition. glibc's `__fortify_function` relies
-        // on it.
+        // on it. Unlike C99's, that question is asked of the definition's own
+        // specifiers alone, as the parser asks it to allow the real
+        // definition after the inline-only one (`gnu_inline_only`).
         //
         // `static inline` is neither -- it has internal linkage and is emitted
         // like any other static function.
@@ -1939,13 +1941,14 @@ impl<'a> Linearizer<'a> {
         // `-fgnu89-inline` makes the GNU rule the default for every inline
         // function, which is what the attribute selects one at a time.
         let gnu_inline = func.attrs.gnu_inline || crate::builtins::gnu89_inline();
-        let is_inline_definition = is_inline
-            && !is_static
-            && if gnu_inline {
-                has_extern_decl
-            } else {
-                !has_extern_decl && all_decls_inline
-            };
+        let is_inline_definition = if gnu_inline {
+            let mut storage = TypeModifiers::empty();
+            storage.set(TypeModifiers::EXTERN, is_extern);
+            storage.set(TypeModifiers::INLINE, is_inline);
+            func.attrs.gnu_inline_only(storage)
+        } else {
+            is_inline && !is_static && !has_extern_decl && all_decls_inline
+        };
 
         // C99 6.7.4p3 constrains an inline *definition*, not every non-static
         // inline function: what it forbids -- naming an identifier with

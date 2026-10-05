@@ -316,7 +316,7 @@ impl Linearizer<'_> {
             (ShuffleFrom::Both, indices.to_vec())
         };
         let idx = ShuffleIndices::new(&indices);
-        crate::arch::simd::native_shuffle(self.target, &idx, result_typ, self.types)
+        crate::arch::simd::native_shuffle(self.target, self.isa, &idx, result_typ, self.types)
             .then_some((idx, from))
     }
 
@@ -668,7 +668,7 @@ impl Linearizer<'_> {
     /// Whether the target computes `op` on vectors of type `vec` with a
     /// packed instruction.
     fn simd_native(&self, op: SimdOp, vec: TypeId) -> bool {
-        crate::arch::simd::native(self.target, op, vec, self.types)
+        crate::arch::simd::native(self.target, self.isa, op, vec, self.types)
     }
 
     /// `op` on the vectors at `operands`, of type `vec`, as one packed

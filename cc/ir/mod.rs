@@ -46,6 +46,7 @@ pub mod range;
 pub mod sccp;
 pub mod ssa;
 pub(crate) mod strdata;
+mod target_clones;
 pub mod tls;
 pub mod validate;
 pub mod vrp;
@@ -3011,6 +3012,11 @@ pub struct Function {
     /// `__attribute__((noinline))`: the inliner must leave this function
     /// alone, whatever its size says.
     pub is_noinline: bool,
+    /// The x86-64 extensions this function is compiled for: the translation
+    /// unit's, or what its `target(...)` attribute or `target_clones`
+    /// version asks. What the linearizer and the backend both read; set
+    /// once, by `Linearizer::linearize_function`. The baseline elsewhere.
+    pub isa: crate::target::X86Isa,
     /// `__attribute__((pure))` / `((const))`, as written.
     ///
     /// The programmer's promise, kept separate from anything `ir/effects.rs`
@@ -3092,6 +3098,7 @@ impl Default for Function {
             is_noreturn: false,
             conv: CallingConv::C,
             is_noinline: false,
+            isa: Default::default(),
             declared_effect: crate::parse::ast::MemEffect::Unknown,
             is_always_inline: false,
             constructor: None,

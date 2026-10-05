@@ -54,4 +54,5 @@ mod permissive;
 mod ranges_designators_labels;
 mod return_conversion;
 mod specifiers;
+mod target_attr;
 mod va_arg_pack;

@@ -9978,3 +9978,42 @@ fn test_cleanup_attribute_reaches_its_declarator() {
     .collect();
     assert_eq!(got, want);
 }
+
+/// `target("...")` and `target_clones(...)` reach the definition's
+/// attributes, accumulated over its declarations as gcc accumulates them:
+/// one written on a prototype applies to the definition after it.
+#[test]
+fn test_target_attributes_reach_the_definition() {
+    use crate::target::{Arch, Os};
+    use crate::target_attr::{parse_target, parse_target_clones};
+    let x86 = Target::new(Arch::X86_64, Os::Linux);
+    let (tu, _types, strings, _symbols) = parse_tu_for(
+        "__attribute__((__target__(\"sse4.1,popcnt\"))) int e(int);\n\
+         int e(int x) { return x; }\n\
+         __attribute__((target_clones(\"sse4.2\", \"default\"))) int s(int x) { return x; }\n\
+         int p(int x) { return x; }\n",
+        &x86,
+    )
+    .unwrap();
+    let def = |name: &str| {
+        tu.items
+            .iter()
+            .find_map(|item| match item {
+                ExternalDecl::FunctionDef(f) if strings.get(f.name) == name => Some(f),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(
+        def("e").attrs.target,
+        Some(parse_target("sse4.1,popcnt", Arch::X86_64).0)
+    );
+    assert!(def("e").attrs.clones.is_none());
+    let items = ["sse4.2".to_string(), "default".to_string()];
+    assert_eq!(
+        def("s").attrs.clones,
+        parse_target_clones(&items, Arch::X86_64).0
+    );
+    assert!(def("s").attrs.clones.is_some());
+    assert!(def("p").attrs.target.is_none() && def("p").attrs.clones.is_none());
+}

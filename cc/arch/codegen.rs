@@ -125,6 +125,9 @@ pub struct CodeGenBase<I: LirInst> {
     pub lir_buffer: Vec<I>,
     /// Current function name (for label generation)
     pub current_fn: String,
+    /// The x86-64 ISA of the function being emitted (`ir::Function::isa`),
+    /// which picks the instructions a vector operation becomes.
+    pub isa: crate::target::X86Isa,
     /// Whether to emit unwind tables (the CFI procedures and their frame rules)
     pub emit_unwind_tables: bool,
     /// A source position for the function being emitted, for a backend
@@ -168,6 +171,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     /// Create a new CodeGenBase for the given target
     pub fn new(target: Target) -> Self {
         Self {
+            isa: target.x86_isa,
             target,
             output: String::new(),
             lir_buffer: Vec::with_capacity(DEFAULT_LIR_BUFFER_CAPACITY),

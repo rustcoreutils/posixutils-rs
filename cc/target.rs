@@ -120,7 +120,7 @@ pub struct X86Isa {
 /// A set of the x86-64 extensions [`X86Isa`] models, as gcc's option
 /// handling sees them: one bit each.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct IsaSet(u8);
+pub(crate) struct IsaSet(u8);
 
 impl IsaSet {
     const SSE3: Self = Self(1);
@@ -139,7 +139,7 @@ impl IsaSet {
         Self(!(bottom.0 - 1) & 15)
     }
 
-    const fn with(self, other: Self) -> Self {
+    pub(crate) const fn with(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
 
@@ -154,7 +154,7 @@ impl IsaSet {
     /// What `-march=cpu` enables, of these: gcc 13's `-dM -E` for each
     /// 64-bit name in its roster. A name not listed here -- `x86-64`,
     /// `k8`, `opteron`, `athlon64`, `athlon-fx` -- is the SSE2 baseline.
-    fn of_arch(cpu: &str) -> Self {
+    pub(crate) fn of_arch(cpu: &str) -> Self {
         let sse42 = Self::and_below(Self::SSE42).with(Self::POPCNT);
         match cpu {
             "native" => Self::host(),
@@ -205,14 +205,14 @@ impl IsaSet {
 
 /// What one ISA `-m` option does: turn on an extension and those it needs,
 /// or turn off one and those that need it.
-#[derive(Clone, Copy)]
-enum IsaEdit {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum IsaEdit {
     Enable(IsaSet),
     Disable(IsaSet),
 }
 
 /// The edit an ISA `-m` option makes, or `None` for any other flag.
-fn isa_edit(flag: &str) -> Option<IsaEdit> {
+pub(crate) fn isa_edit(flag: &str) -> Option<IsaEdit> {
     use IsaEdit::{Disable, Enable};
     Some(match flag {
         "-msse3" => Enable(IsaSet::and_below(IsaSet::SSE3)),
@@ -290,6 +290,62 @@ impl X86Isa {
         Self::from_set(set)
     }
 
+    /// This ISA as the set of extensions it holds.
+    fn to_set(self) -> IsaSet {
+        let simd = match self.simd {
+            X86Simd::Sse2 => IsaSet::default(),
+            X86Simd::Sse3 => IsaSet::SSE3,
+            X86Simd::Ssse3 => IsaSet::and_below(IsaSet::SSSE3),
+            X86Simd::Sse41 => IsaSet::and_below(IsaSet::SSE41),
+            X86Simd::Sse42 => IsaSet::and_below(IsaSet::SSE42),
+        };
+        if self.popcnt {
+            simd.with(IsaSet::POPCNT)
+        } else {
+            simd
+        }
+    }
+
+    /// The ISA a function with `__attribute__((target(...)))` is compiled
+    /// for, when the translation unit's is `self`: an `arch=` adds what
+    /// that CPU has, and the feature edits apply on top in order, as the
+    /// `-m` options do. Enabling SSE4.2 brings POPCNT unless the request
+    /// named POPCNT, as `-msse4.2` does.
+    pub fn with_request(self, request: &IsaRequest) -> Self {
+        let mut set = self.to_set();
+        if let Some(arch) = request.arch {
+            set = set.with(arch);
+        }
+        let mut named = IsaSet::default();
+        let mut enabled = IsaSet::default();
+        for edit in &request.edits {
+            match *edit {
+                IsaEdit::Enable(exts) => {
+                    set = set.with(exts);
+                    enabled = enabled.with(exts);
+                    named = named.with(exts);
+                }
+                IsaEdit::Disable(exts) => {
+                    set = set.without(exts);
+                    named = named.with(exts);
+                }
+            }
+        }
+        let raised_sse42 =
+            enabled.has(IsaSet::SSE42) || request.arch.is_some_and(|a| a.has(IsaSet::SSE42));
+        if raised_sse42 && set.has(IsaSet::SSE42) && !named.has(IsaSet::POPCNT) {
+            set = set.with(IsaSet::POPCNT);
+        }
+        Self::from_set(set)
+    }
+
+    /// Whether code compiled for `other` may run as part of code compiled
+    /// for `self`: every extension `other` uses, `self` has. gcc's rule for
+    /// inlining one `target` function into another.
+    pub fn includes(self, other: Self) -> bool {
+        self.simd >= other.simd && (self.popcnt || !other.popcnt)
+    }
+
     /// The level `set` reaches: SSE3 .. SSE4.2, each needing the one before.
     fn from_set(set: IsaSet) -> Self {
         let simd = [
@@ -324,6 +380,28 @@ impl X86Isa {
             m.push("__POPCNT__");
         }
         m
+    }
+}
+
+/// What `__attribute__((target("...")))` asks of one function's x86-64
+/// ISA, relative to the translation unit's: the extensions an `arch=` CPU
+/// has, and the feature edits (`sse4.1`, `no-sse4.2`, `popcnt`) in order.
+/// Read from the attribute by `crate::target_attr`; applied by
+/// [`X86Isa::with_request`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IsaRequest {
+    pub(crate) arch: Option<IsaSet>,
+    pub(crate) edits: Vec<IsaEdit>,
+}
+
+impl IsaRequest {
+    /// `other` asked after this: its CPU's extensions join any this names,
+    /// and its edits follow these.
+    pub fn extend(&mut self, other: IsaRequest) {
+        if let Some(set) = other.arch {
+            self.arch = Some(self.arch.map_or(set, |a| a.with(set)));
+        }
+        self.edits.extend(other.edits);
     }
 }
 

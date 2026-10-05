@@ -1187,6 +1187,12 @@ define_keywords! {
     // `ifunc("resolver")`: a GNU indirect function. Appended, as above.
     (_, "ifunc",                     SUPPORTED_ATTR),
     (_, "__ifunc__",                 SUPPORTED_ATTR),
+    // `target("...")` and `target_clones(...)`: one function compiled for
+    // another ISA, or for several with a resolver. Appended, as above.
+    (_, "target",                    SUPPORTED_ATTR),
+    (_, "__target__",                SUPPORTED_ATTR),
+    (_, "target_clones",             SUPPORTED_ATTR),
+    (_, "__target_clones__",         SUPPORTED_ATTR),
 }
 
 // Tag query API
@@ -1568,6 +1574,10 @@ mod tests {
             "__cleanup__",
             "ifunc",
             "__ifunc__",
+            "target",
+            "__target__",
+            "target_clones",
+            "__target_clones__",
         ] {
             let table = StringTable::new();
             let sid = id(&table, s);

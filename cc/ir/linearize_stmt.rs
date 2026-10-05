@@ -721,6 +721,21 @@ impl<'a> super::linearize::Linearizer<'a> {
         &mut self,
         declarator: &crate::parse::ast::InitDeclarator,
     ) {
+        // A later `target_clones` version shares the object the first one
+        // defined: one static, whichever version runs.
+        let shared = self
+            .clone_statics
+            .as_ref()
+            .and_then(|statics| statics.get(&declarator.symbol))
+            .cloned();
+        if let Some(global) = shared {
+            self.insert_local(
+                declarator.symbol,
+                LocalVarInfo::new(LocalBinding::Static { global }, declarator.typ),
+            );
+            self.record_pointee_extents(declarator.symbol, declarator.typ, &declarator.vla_sizes);
+            return;
+        }
         let name_str = self.symbol_name(declarator.symbol);
 
         // C99 6.7.4p3: A non-static inline function cannot define a non-const
@@ -756,6 +771,9 @@ impl<'a> super::linearize::Linearizer<'a> {
             self.static_local_counter
         );
         self.static_local_counter += 1;
+        if let Some(statics) = &mut self.clone_statics {
+            statics.insert(declarator.symbol, global_name.clone());
+        }
 
         // The name is bound in this scope like any local, so an inner
         // declaration shadows it and leaving the scope ends it.

@@ -1667,3 +1667,49 @@ fn test_real_definition_replaces_gnu_inline_body() {
 pub(super) fn x86_64_linux() -> Target {
     Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux)
 }
+
+/// A `target_clones` function becomes its versions -- local, each compiled
+/// for its ISA, sharing one copy of each static local -- a resolver, and an
+/// indirect function of its own name bound to the resolver. A `target`
+/// function is compiled for its ISA, and its neighbours for the unit's.
+#[test]
+fn test_target_clones_become_versions_and_a_resolver() {
+    use crate::parse::ast::AliasForm;
+    use crate::target::{X86Isa, X86Simd};
+    let src = "__attribute__((target_clones(\"sse4.2\", \"default\")))\n\
+               int sum(int x) { static int calls; calls++; return x + calls; }\n\
+               __attribute__((target(\"ssse3\"))) int t(int x) { return x; }\n\
+               int plain(int x) { return sum(x); }\n";
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    let module = linearize_source(src, &target);
+    let func = |name: &str| {
+        module
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("no {name}"))
+    };
+    let sse42 = X86Isa {
+        simd: X86Simd::Sse42,
+        popcnt: true,
+    };
+    assert!(func("sum.default").is_static);
+    assert_eq!(func("sum.default").isa, X86Isa::default());
+    assert!(func("sum.sse4_2").is_static);
+    assert_eq!(func("sum.sse4_2").isa, sse42);
+    assert!(!func("sum.resolver").is_static);
+    assert!(func("sum.resolver").symbol_attrs.weak);
+    assert_eq!(func("t").isa.simd, X86Simd::Ssse3);
+    assert_eq!(func("plain").isa, X86Isa::default());
+    assert!(module.functions.iter().all(|f| f.name != "sum"));
+    let alias = module.aliases.iter().find(|a| a.name == "sum").unwrap();
+    assert_eq!(alias.target, "sum.resolver");
+    assert_eq!(alias.form, AliasForm::Ifunc);
+    assert!(module.extern_symbols.contains("sum"));
+    let statics: Vec<_> = module
+        .globals
+        .iter()
+        .filter(|g| g.name.contains("calls"))
+        .collect();
+    assert_eq!(statics.len(), 1, "one static shared by both versions");
+}

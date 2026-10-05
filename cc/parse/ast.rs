@@ -2830,6 +2830,13 @@ pub struct FunctionAttrs {
     /// `__attribute__((noreturn))`. What a call site reads is the function
     /// *type*'s `noreturn`, which the declarator is given from this.
     pub noreturn: bool,
+    /// `__attribute__((target("...")))`: the ISA this function alone is
+    /// compiled for, relative to the translation unit's.
+    pub target: Option<crate::target::IsaRequest>,
+    /// `__attribute__((target_clones(...)))`: the versions besides
+    /// `default` this function is compiled as, dispatched by a resolver.
+    /// `None` when there is nothing to dispatch.
+    pub clones: Option<crate::target_attr::TargetClones>,
 }
 
 impl FunctionAttrs {
@@ -2872,6 +2879,13 @@ impl FunctionAttrs {
         // wins, as it does for an object.
         self.align = self.align.max(other.align);
         self.noreturn |= other.noreturn;
+        // A later declaration's ISA request replaces an earlier one's.
+        if other.target.is_some() {
+            self.target = other.target.clone();
+        }
+        if other.clones.is_some() {
+            self.clones = other.clones.clone();
+        }
     }
 }
 

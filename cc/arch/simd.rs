@@ -14,7 +14,7 @@
 
 use crate::float::FpFormat;
 use crate::ir::{ShuffleIndices, SimdOp};
-use crate::target::{Arch, Target, X86Simd};
+use crate::target::{Arch, Target, X86Isa, X86Simd};
 use crate::types::{TypeId, TypeTable};
 
 /// Whether `target` computes `op` on vectors of type `vec` with packed
@@ -26,7 +26,10 @@ use crate::types::{TypeId, TypeTable};
 ///
 /// A shuffle's answer depends on its indices: it is asked with
 /// [`native_shuffle`], and this answers `false` for one.
-pub fn native(target: &Target, op: SimdOp, vec: TypeId, types: &TypeTable) -> bool {
+///
+/// `isa` is the x86-64 ISA of the function the vector operation is in
+/// (`ir::Function::isa`); other targets ignore it.
+pub fn native(target: &Target, isa: X86Isa, op: SimdOp, vec: TypeId, types: &TypeTable) -> bool {
     let Some(Whole {
         bytes,
         lane_bytes,
@@ -39,7 +42,7 @@ pub fn native(target: &Target, op: SimdOp, vec: TypeId, types: &TypeTable) -> bo
         return false;
     }
     match target.arch {
-        Arch::X86_64 => x86_64(op, bytes, lane_bytes, float, target.x86_isa.simd),
+        Arch::X86_64 => x86_64(op, bytes, lane_bytes, float, isa.simd),
         Arch::Aarch64 => aarch64(op, lane_bytes),
     }
 }
@@ -49,6 +52,7 @@ pub fn native(target: &Target, op: SimdOp, vec: TypeId, types: &TypeTable) -> bo
 /// [`x86_64_shuffle`] finds on SSE2.
 pub fn native_shuffle(
     target: &Target,
+    isa: X86Isa,
     idx: &ShuffleIndices,
     vec: TypeId,
     types: &TypeTable,
@@ -63,7 +67,7 @@ pub fn native_shuffle(
         Arch::X86_64 => {
             bytes == 16
                 && (x86_64_shuffle(idx, lane_bytes).is_some()
-                    || (target.x86_isa.simd >= X86Simd::Ssse3
+                    || (isa.simd >= X86Simd::Ssse3
                         && x86_64_byte_shuffle(idx, lane_bytes).is_some()))
         }
         Arch::Aarch64 => true,
@@ -267,7 +271,7 @@ mod tests {
         let v2df = types.vector_of(types.double_id, 2, None);
         let v2hi = types.vector_of(types.short_id, 2, None);
         let v1ti = types.vector_of(types.int128_id, 1, None);
-        let n = |op, v| native(&target, op, v, &types);
+        let n = |op, v| native(&target, target.x86_isa, op, v, &types);
         for v in [v4si, v2si, v16qi] {
             for op in [
                 SimdOp::Add,
@@ -296,9 +300,9 @@ mod tests {
             (SimdOp::FAdd, v2sf),
             (SimdOp::Neg, v2si),
         ] {
-            assert!(native(&a64, op, v, &types), "{op:?}");
+            assert!(native(&a64, a64.x86_isa, op, v, &types), "{op:?}");
         }
-        assert!(!native(&a64, SimdOp::Add, v2hi, &types));
+        assert!(!native(&a64, a64.x86_isa, SimdOp::Add, v2hi, &types));
     }
 
     #[test]
@@ -311,7 +315,7 @@ mod tests {
         let v4si = types.vector_of(types.int_id, 4, None);
         let v2di = types.vector_of(types.long_id, 2, None);
         let v4sf = types.vector_of(types.float_id, 4, None);
-        let n = |t: &Target, op, v| native(t, op, v, &types);
+        let n = |t: &Target, op, v| native(t, t.x86_isa, op, v, &types);
         // A splat of either lane kind.
         for v in [v16qi, v4si, v2di, v4sf] {
             assert!(n(&x86, SimdOp::Splat, v) && n(&a64, SimdOp::Splat, v));
@@ -357,24 +361,24 @@ mod tests {
         ]);
         // The baseline: dword multiply and unsigned orders up to dwords,
         // at both widths; not of qwords.
-        assert!(native(&x86, SimdOp::Mul, v4si, &types));
+        assert!(native(&x86, x86.x86_isa, SimdOp::Mul, v4si, &types));
         for v in [v16qu, v8hu, v4su, v4hu, v2su] {
             for op in [SimdOp::CmpGtU, SimdOp::CmpGeU] {
-                assert!(native(&x86, op, v, &types), "{op:?}");
+                assert!(native(&x86, x86.x86_isa, op, v, &types), "{op:?}");
             }
         }
-        assert!(!native(&x86, SimdOp::CmpGtU, v2du, &types));
-        assert!(!native_shuffle(&x86, &words, v8hu, &types));
+        assert!(!native(&x86, x86.x86_isa, SimdOp::CmpGtU, v2du, &types));
+        assert!(!native_shuffle(&x86, x86.x86_isa, &words, v8hu, &types));
         x86.x86_isa.simd = X86Simd::Ssse3;
-        assert!(native_shuffle(&x86, &words, v8hu, &types));
+        assert!(native_shuffle(&x86, x86.x86_isa, &words, v8hu, &types));
         x86.x86_isa.simd = X86Simd::Sse41;
-        assert!(native(&x86, SimdOp::Mul, v4si, &types));
-        assert!(native(&x86, SimdOp::CmpEq, v2di, &types));
-        assert!(!native(&x86, SimdOp::CmpGt, v2di, &types));
-        assert!(native(&x86, SimdOp::CmpGtU, v8hu, &types));
-        assert!(!native(&x86, SimdOp::CmpGtU, v2di, &types));
+        assert!(native(&x86, x86.x86_isa, SimdOp::Mul, v4si, &types));
+        assert!(native(&x86, x86.x86_isa, SimdOp::CmpEq, v2di, &types));
+        assert!(!native(&x86, x86.x86_isa, SimdOp::CmpGt, v2di, &types));
+        assert!(native(&x86, x86.x86_isa, SimdOp::CmpGtU, v8hu, &types));
+        assert!(!native(&x86, x86.x86_isa, SimdOp::CmpGtU, v2di, &types));
         x86.x86_isa.simd = X86Simd::Sse42;
-        assert!(native(&x86, SimdOp::CmpGe, v2di, &types));
+        assert!(native(&x86, x86.x86_isa, SimdOp::CmpGe, v2di, &types));
         // The control of a word reversal, its unspecified lane zero.
         let (src, ctl) = x86_64_byte_shuffle(&words, 2).unwrap();
         assert_eq!(src, 0);
@@ -391,7 +395,7 @@ mod tests {
         let v2di = types.vector_of(types.long_id, 2, None);
         let v4sf = types.vector_of(types.float_id, 4, None);
         let v2sf = types.vector_of(types.float_id, 2, None);
-        let n = |t: &Target, op, v| native(t, op, v, &types);
+        let n = |t: &Target, op, v| native(t, t.x86_isa, op, v, &types);
         for v in [v16qi, v4si] {
             assert!(n(&x86, SimdOp::CmpEq, v) && n(&x86, SimdOp::CmpGe, v));
         }
@@ -458,9 +462,9 @@ mod tests {
         let v8hi = types.vector_of(types.short_id, 8, None);
         let rev = ShuffleIndices::new(&[Some(3), Some(2), Some(1), Some(0)]);
         let words = ShuffleIndices::new(&[Some(0); 8]);
-        assert!(native_shuffle(&x86, &rev, v4si, &types));
-        assert!(!native_shuffle(&x86, &words, v8hi, &types));
-        assert!(native_shuffle(&a64, &words, v8hi, &types));
-        assert!(!native(&a64, SimdOp::Shuffle, v4si, &types));
+        assert!(native_shuffle(&x86, x86.x86_isa, &rev, v4si, &types));
+        assert!(!native_shuffle(&x86, x86.x86_isa, &words, v8hi, &types));
+        assert!(native_shuffle(&a64, a64.x86_isa, &words, v8hi, &types));
+        assert!(!native(&a64, a64.x86_isa, SimdOp::Shuffle, v4si, &types));
     }
 }

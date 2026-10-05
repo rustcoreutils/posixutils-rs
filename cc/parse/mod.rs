@@ -30,6 +30,7 @@ mod linkage;
 mod operand_rule;
 pub mod parser;
 mod statement;
+mod target_attr;
 mod toplevel;
 mod typename;
 mod vector_builtin;
@@ -53,6 +54,7 @@ mod test_specifiers;
 mod test_vectors;
 
 // Re-export parser used by main.rs
+pub(crate) use cpu_builtin::cpu_feature_location;
 pub use library_builtin::LibraryCallPolicy;
 pub use parser::Parser;
 

@@ -327,9 +327,15 @@ impl AttributeList {
         self.init_priority("destructor")
     }
 
-    /// Collect the attributes that affect how a function is emitted.
-    pub fn function_attrs(&self) -> crate::parse::ast::FunctionAttrs {
+    /// Collect the attributes that affect how a function is emitted, for
+    /// `target`.
+    pub fn function_attrs(
+        &self,
+        target: &crate::target::Target,
+    ) -> crate::parse::ast::FunctionAttrs {
         crate::parse::ast::FunctionAttrs {
+            target: self.target_request(target),
+            clones: self.target_clones(target),
             symbol: self.symbol_attrs(),
             noinline: self.has_noinline(),
             always_inline: self.has_always_inline(),
@@ -676,6 +682,17 @@ impl Parser<'_> {
             AttrArgs::Integers(role) => self.check_integer_args(&name, role, &args, pos).ok()?,
             AttrArgs::Cleanup => self.check_cleanup_function(&args, pos).ok()?,
             _ => {}
+        }
+        let target_attr = match name.trim_matches('_') {
+            "target" => Some(false),
+            "target_clones" => Some(true),
+            _ => None,
+        };
+        if let (true, Some(clones)) = (recognised, target_attr) {
+            let target = self.types.target();
+            if !super::target_attr::check_target_args(clones, &args, pos, &target) {
+                return None;
+            }
         }
 
         // A mode or a vector width replaces the declared type, so each is
@@ -1122,7 +1139,7 @@ impl Parser<'_> {
                 self.pending_packed |= attrs.has_packed();
                 self.merge_symbol_attrs(&attrs);
                 self.merge_calling_conv(&attrs, pos);
-                let fn_attrs = attrs.function_attrs();
+                let fn_attrs = attrs.function_attrs(&self.types.target());
                 self.pending_fn_attrs.merge(&fn_attrs);
             } else if self.is_asm_keyword() {
                 self.parse_asm_label();

@@ -842,6 +842,21 @@ pub struct Linearizer<'a> {
     /// is emitted even where its answer is known. `-fno-trapping-math` turns
     /// it off.
     pub(crate) trapping_math: bool,
+    /// The x86-64 ISA of the function being linearized: what decides which
+    /// vector operations are one packed instruction. See
+    /// [`Linearizer::function_isa`].
+    pub(crate) isa: crate::target::X86Isa,
+    /// While the versions of a `target_clones` function are linearized: the
+    /// global each of its static locals became in the first version, which
+    /// every later one shares, as gcc's clones share them.
+    pub(crate) clone_statics: Option<HashMap<SymbolId, String>>,
+}
+
+/// One compilation of a function definition other than its own: a
+/// `target_clones` version, under its own name and ISA.
+pub(crate) struct FnVersion {
+    pub(crate) name: String,
+    pub(crate) isa: crate::target::X86Isa,
 }
 
 impl<'a> Linearizer<'a> {
@@ -899,6 +914,8 @@ impl<'a> Linearizer<'a> {
             declared_aliases: Vec::new(),
             defined_functions: std::collections::HashSet::new(),
             trapping_math: true,
+            isa: target.x86_isa,
+            clone_statics: None,
         }
     }
 
@@ -1128,9 +1145,10 @@ impl<'a> Linearizer<'a> {
             .collect();
         for item in &tu.items {
             match item {
-                ExternalDecl::FunctionDef(func) => {
-                    self.linearize_function(func);
-                }
+                ExternalDecl::FunctionDef(func) => match &func.attrs.clones {
+                    Some(clones) => self.linearize_target_clones(func, clones),
+                    None => self.linearize_function(func),
+                },
                 ExternalDecl::Declaration(decl) => {
                     self.linearize_global_decl(decl);
                 }
@@ -1818,7 +1836,7 @@ impl<'a> Linearizer<'a> {
     /// block scope has already dropped every mark -- but it is entered the
     /// same way as any other scope so that no site can enter one without the
     /// other.
-    fn reset_for_function(&mut self, func: &FunctionDef) -> Scope {
+    fn reset_for_function(&mut self, func: &FunctionDef, name: &str) -> Scope {
         // Reset per-function state
         self.next_pseudo = 0;
         self.next_bb = 0;
@@ -1831,7 +1849,7 @@ impl<'a> Linearizer<'a> {
         self.struct_return_ptr = None;
         self.reg_aggregate_return_type = None;
         self.vector_return = None;
-        self.current_func_name = self.emitted_name(func.name);
+        self.current_func_name = name.to_string();
         self.current_func_ident = func.name;
         self.addr_taken_labels.clear();
         self.label_refs.clear();
@@ -1890,7 +1908,24 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// The x86-64 ISA a function is compiled for, given what its
+    /// `target(...)` attribute asks: the translation unit's, edited by the
+    /// request. The one rule for every function and version.
+    pub(crate) fn function_isa(
+        &self,
+        request: Option<&crate::target::IsaRequest>,
+    ) -> crate::target::X86Isa {
+        let unit = self.target.x86_isa;
+        request.map_or(unit, |r| unit.with_request(r))
+    }
+
     pub(crate) fn linearize_function(&mut self, func: &FunctionDef) {
+        self.linearize_function_as(func, None)
+    }
+
+    /// Linearize `func` as itself, or as `version`: a local function of the
+    /// version's name, compiled for its ISA.
+    pub(crate) fn linearize_function_as(&mut self, func: &FunctionDef, version: Option<FnVersion>) {
         // Set current position for debug info (function definition location)
         self.current_pos = Some(func.pos);
 
@@ -1900,13 +1935,16 @@ impl<'a> Linearizer<'a> {
         // expression to the same rule.
         let labels = self.check_jumps_into_protected_scopes(&func.body);
 
-        let func_scope = self.reset_for_function(func);
+        let name = version
+            .as_ref()
+            .map_or_else(|| self.emitted_name(func.name), |v| v.name.clone());
+        let func_scope = self.reset_for_function(func, &name);
         self.written_labels = labels.written;
         self.label_cleanups = labels.cleanups;
 
         // Create function - use storage class from FunctionDef
         let modifiers = self.types.modifiers(func.return_type);
-        let is_static = func.is_static;
+        let is_static = func.is_static || version.is_some();
         let is_inline = func.is_inline;
         let is_extern = modifiers.contains(TypeModifiers::EXTERN);
         let is_noreturn = modifiers.contains(TypeModifiers::NORETURN);
@@ -1914,8 +1952,12 @@ impl<'a> Linearizer<'a> {
         // The definition is compiled under its own type's convention.
         self.current_calling_conv = func.calling_conv;
 
-        let mut ir_func = Function::new(self.emitted_name(func.name), func.return_type);
+        let mut ir_func = Function::new(name, func.return_type);
         ir_func.conv = func.calling_conv;
+        ir_func.isa = version
+            .as_ref()
+            .map_or_else(|| self.function_isa(func.attrs.target.as_ref()), |v| v.isa);
+        self.isa = ir_func.isa;
 
         // Whether this is an *inline definition*, which provides no external
         // definition and so must not be emitted.
@@ -1964,6 +2006,15 @@ impl<'a> Linearizer<'a> {
         ir_func.is_noreturn = is_noreturn;
         ir_func.is_inline = is_inline;
         ir_func.symbol_attrs = func.attrs.symbol.clone();
+        if version.is_some() {
+            // A version is a local copy of the body: the symbol's linkage
+            // attributes belong to the function's name, which the resolver
+            // binds. Only where the code goes carries over.
+            ir_func.symbol_attrs = crate::parse::ast::SymbolAttrs {
+                section: func.attrs.symbol.section.clone(),
+                ..Default::default()
+            };
+        }
         // `alias` or `ifunc` on a definition -- written on it, or on an
         // earlier prototype -- asks for two things one symbol cannot be.
         // Recorded like any other alias, so `resolve_aliases` reports it once.
@@ -1978,8 +2029,10 @@ impl<'a> Linearizer<'a> {
         ir_func.is_noinline = func.attrs.noinline;
         ir_func.declared_effect = func.attrs.effect;
         ir_func.is_always_inline = func.attrs.always_inline;
-        ir_func.constructor = func.attrs.constructor;
-        ir_func.destructor = func.attrs.destructor;
+        if version.is_none() {
+            ir_func.constructor = func.attrs.constructor;
+            ir_func.destructor = func.attrs.destructor;
+        }
 
         let ret_kind = self.types.kind(func.return_type);
         // A vector is returned as its carrier, which is what the function

@@ -316,8 +316,9 @@ impl Parser<'_> {
         pos: Position,
         typ: TypeId,
         params: Option<Vec<RawParam>>,
-        attrs: FunctionAttrs,
+        mut attrs: FunctionAttrs,
     ) -> ParseResult<FunctionDef> {
+        super::target_attr::resolve_target_conflict(&mut attrs, pos);
         let mut params = params.unwrap_or_default();
         let typ = self.parse_old_style_parameters(typ, &mut params)?;
         self.check_parameters_complete(&params, pos);

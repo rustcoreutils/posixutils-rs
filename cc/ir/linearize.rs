@@ -2484,10 +2484,23 @@ impl<'a> Linearizer<'a> {
         }
         match self.types.fp_format(to) {
             Some(fmt) if self.types.is_integer(from) => self
-                .eval_const_expr(expr)
-                .is_none_or(|v| !fmt.holds_integer_value(v)),
+                .const_magnitude(expr, from)
+                .is_none_or(|m| !fmt.holds_integer_magnitude(m)),
             _ => true,
         }
+    }
+
+    /// The magnitude of the integer constant `expr`, of type `typ`, or `None`
+    /// if it is not a constant. A constant is evaluated in an `i128`, which
+    /// holds an `unsigned __int128` at or above 2^127 as negative: its bits
+    /// are the magnitude, where a signed value's is its absolute value.
+    fn const_magnitude(&self, expr: &Expr, typ: TypeId) -> Option<u128> {
+        let value = self.eval_const_expr(expr)?;
+        Some(if self.types.is_unsigned(typ) {
+            value as u128
+        } else {
+            value.unsigned_abs()
+        })
     }
 
     /// Whether computing `left op right`, the binary expression `expr`, can

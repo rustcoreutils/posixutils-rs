@@ -148,3 +148,63 @@ fn codegen_an_untaken_arms_conversion_or_square_root_raises_nothing() {
         }
     }
 }
+
+/// An `unsigned __int128` constant arm. Whether converting a constant is
+/// exact is decided from its value, and one at or above 2^127 does not fit
+/// the `i128` a constant is evaluated in: `(unsigned __int128)-1` read as -1
+/// looked exact, so the arm became a select and converted 2^128 - 1 -- inexact,
+/// and an overflow for `float` -- whatever the condition.
+const UNTAKEN_U128_CONSTANTS: &str = r#"
+#include <fenv.h>
+
+/* An unsigned __int128 constant at or above 2^127 converts to float and
+   double inexactly (and overflows float), so an untaken arm holding one must
+   not be converted. */
+__attribute__((noinline)) static float to_f(int c) { return c ? (unsigned __int128)-1 : 0.0f; }
+__attribute__((noinline)) static double to_d(int c) { return c ? (unsigned __int128)-1 : 0.0; }
+__attribute__((noinline)) static double to_d_top(int c)
+{
+    return c ? ((unsigned __int128)1 << 127) + 1 : 0.0;
+}
+
+static volatile double sink;
+
+int main(void)
+{
+    feclearexcept(FE_ALL_EXCEPT);
+    sink = to_f(0);
+    if (fetestexcept(FE_INEXACT | FE_OVERFLOW)) return 1;
+    sink = to_d(0);
+    if (fetestexcept(FE_INEXACT)) return 2;
+    sink = to_d_top(0);
+    if (fetestexcept(FE_INEXACT)) return 3;
+    /* The taken arm's value: 2^128 - 1 rounds to 2^128. */
+    sink = to_d(1);
+    if (sink != 0x1p128) return 4;
+    if (to_f(1) != __builtin_inff()) return 5;
+    return 0;
+}
+"#;
+
+#[test]
+fn codegen_an_untaken_unsigned_int128_constant_arm_raises_nothing() {
+    for level in ["-O0", "-O1", "-O2"] {
+        assert_eq!(
+            compile_and_run(
+                "fp_untaken_u128",
+                UNTAKEN_U128_CONSTANTS,
+                &[level.to_string(), "-lm".to_string()]
+            ),
+            0,
+            "{level}"
+        );
+        if let Some(rc) = compile_and_run_aarch64_with(
+            "fp_untaken_u128_a64",
+            UNTAKEN_U128_CONSTANTS,
+            &[level],
+            &["-lm"],
+        ) {
+            assert_eq!(rc, 0, "aarch64 {level}");
+        }
+    }
+}

@@ -998,11 +998,12 @@ impl FpFormat {
         magnitude <= self.precision()
     }
 
-    /// Whether the integer `value` is a value of `self`, so converting it is
-    /// exact and raises nothing: its significant bits fit the significand
-    /// and it is below the format's overflow threshold, 2^(emax+1).
-    pub fn holds_integer_value(self, value: i128) -> bool {
-        let magnitude = value.unsigned_abs();
+    /// Whether an integer of magnitude `magnitude` is a value of `self`, so
+    /// converting it is exact and raises nothing: its significant bits fit
+    /// the significand and it is below the format's overflow threshold,
+    /// 2^(emax+1). The format is symmetric, so the sign does not matter; the
+    /// caller reads the magnitude with the signedness of the integer's type.
+    pub fn holds_integer_magnitude(self, magnitude: u128) -> bool {
         if magnitude == 0 {
             return true;
         }
@@ -2286,21 +2287,33 @@ mod tests {
         assert!(Binary32.holds_integer(16, false));
         assert!(Binary32.holds_integer(25, true));
         assert!(!Binary32.holds_integer(25, false));
-        for (fmt, value, holds) in [
+        for (fmt, magnitude, holds) in [
             (Binary32, 0, true),
-            (Binary32, -16_777_216, true),
+            (Binary32, 16_777_216, true),
             (Binary32, 16_777_217, false),
             (Binary32, 1 << 100, true),
-            (Binary32, i128::MIN, true),
-            (Binary16, i128::MIN, false),
+            (Binary32, i128::MIN.unsigned_abs(), true),
+            (Binary16, i128::MIN.unsigned_abs(), false),
             (Binary16, 65504, true),
             (Binary16, 65536, false),
             (Binary16, 2049, false),
-            (Binary64, i64::MAX as i128, false),
-            (X87Extended, i64::MAX as i128, true),
-            (Binary128, i128::MIN, true),
+            (Binary64, i64::MAX as u128, false),
+            (X87Extended, i64::MAX as u128, true),
+            (Binary128, i128::MIN.unsigned_abs(), true),
+            // `unsigned __int128` magnitudes at and above 2^127.
+            (Binary32, 1 << 127, true),
+            (Binary64, (1 << 127) + 1, false),
+            (Binary64, u128::MAX, false),
+            (Binary32, u128::MAX, false),
+            (Binary128, u128::MAX, false),
+            (Binary64, u128::MAX << 75, true),
+            (Binary32, u128::MAX << 104, true),
         ] {
-            assert_eq!(fmt.holds_integer_value(value), holds, "{fmt:?} {value}");
+            assert_eq!(
+                fmt.holds_integer_magnitude(magnitude),
+                holds,
+                "{fmt:?} {magnitude}"
+            );
         }
     }
     use ComplexDivision::Libgcc;

@@ -2000,3 +2000,43 @@ fn test_a_conditional_arm_that_can_raise_keeps_its_branch() {
         }
     }
 }
+
+/// An `__int128` constant arm converts exactly when its value is one of the
+/// format's, read with the signedness of its type: an `unsigned __int128`
+/// at or above 2^127 is held negative in the `i128` a constant evaluates
+/// to, and `(unsigned __int128)-1` read as -1 looked exact.
+#[test]
+fn test_an_int128_constant_arm_converts_by_its_types_signedness() {
+    let raising = [
+        "float f(int c) { return c ? (unsigned __int128)-1 : 0.0f; }",
+        "double f(int c) { return c ? (unsigned __int128)-1 : 0.0; }",
+        "double f(int c) { return c ? ((unsigned __int128)1 << 127) + 1 : 0.0; }",
+        "double f(int c) { return c ? -(((__int128)1 << 126) + 1) : 0.0; }",
+    ];
+    let exact = [
+        "float f(int c) { return c ? (unsigned __int128)5 : 0.0f; }",
+        "double f(int c) { return c ? (unsigned __int128)1 << 127 : 0.0; }",
+        "float f(int c) { return c ? (__int128)-1 : 0.0f; }",
+        // INT128_MIN, -2^127, is a power of two.
+        "double f(int c) { return c ? -((__int128)1 << 126) - ((__int128)1 << 126) : 0.0; }",
+    ];
+    let policy = || crate::parse::LibraryCallPolicy {
+        optimizing: true,
+        math_errno: false,
+    };
+    for target in [
+        Target::new(Arch::X86_64, Os::Linux),
+        Target::new(Arch::Aarch64, Os::Linux),
+    ] {
+        let branches = |src: &str| {
+            let (module, _) = linearize_source_trapping(src, &target, policy(), true);
+            insns_of(&module, "f").iter().any(|i| i.op == Opcode::Cbr)
+        };
+        for src in raising {
+            assert!(branches(src), "{:?}: keeps its branch: {src}", target.arch);
+        }
+        for src in exact {
+            assert!(!branches(src), "{:?}: a select: {src}", target.arch);
+        }
+    }
+}

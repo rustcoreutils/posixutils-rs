@@ -1489,6 +1489,7 @@ impl Parser<'_> {
         declarators.push(InitDeclarator {
             symbol_attrs: Default::default(),
             fn_effect: MemEffect::Unknown,
+            cleanup: None,
             symbol: id,
             typ,
             storage_class: TypeModifiers::TYPEDEF,

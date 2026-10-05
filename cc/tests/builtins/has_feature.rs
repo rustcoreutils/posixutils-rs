@@ -209,6 +209,10 @@ int main(void) {
 #if !__has_attribute(__always_inline__)
         return 88;
 #endif
+
+#if !__has_attribute(cleanup) || !__has_attribute(__cleanup__)
+        return 89;
+#endif
     }
 
     return 0;

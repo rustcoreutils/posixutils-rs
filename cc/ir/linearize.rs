@@ -546,6 +546,9 @@ pub(crate) struct Scope {
     /// The `vla_marks` depth on entry; every mark above it belongs to this
     /// scope and is released when it ends.
     pub(crate) vla_entry: usize,
+    /// The `cleanups` depth on entry; every cleanup above it belongs to a
+    /// variable this scope declares, and runs when it ends.
+    pub(crate) cleanup_entry: usize,
 }
 
 /// A captured stack pointer and the loop/switch nesting it was captured at.
@@ -763,6 +766,14 @@ pub struct Linearizer<'a> {
     /// loop body, including a VLA declared before the switch, and asking the
     /// break depth there found no mark to undo.
     pub(crate) vla_marks: Vec<VlaMark>,
+    /// The `cleanup(fn)` calls of the variables in scope, outermost first.
+    /// See [`super::linearize_cleanup`].
+    pub(crate) cleanups: Vec<super::linearize_cleanup::PendingCleanup>,
+    /// For each label, the variables with a cleanup in whose scope it lies,
+    /// outermost first: a `goto` runs the cleanup of every variable in scope
+    /// at the jump and not at its label. Taken from the jump-scope walk,
+    /// because a forward `goto` is lowered before its label.
+    pub(crate) label_cleanups: std::collections::HashMap<StringId, Vec<SymbolId>>,
     /// Whether this function declares anything variably modified, and so
     /// needs the bookkeeping above.
     pub(crate) func_has_vla: bool,
@@ -869,6 +880,8 @@ impl<'a> Linearizer<'a> {
             label_vla_depth: std::collections::HashMap::new(),
             pending_goto_vla: Vec::new(),
             vla_marks: Vec::new(),
+            cleanups: Vec::new(),
+            label_cleanups: std::collections::HashMap::new(),
             volatile_init_object: None,
             static_init_nesting: StaticInitNesting::default(),
             func_has_vla: false,
@@ -913,17 +926,21 @@ impl<'a> Linearizer<'a> {
         self.local_scope_stack.push(Vec::new());
         Scope {
             vla_entry: self.vla_marks.len(),
+            cleanup_entry: self.cleanups.len(),
         }
     }
 
-    /// Leave the scope `scope` opened: release the VLAs declared in it and
-    /// restore every local it shadowed.
+    /// Leave the scope `scope` opened: run the cleanups of the variables
+    /// declared in it, release its VLAs and restore every local it shadowed.
     ///
-    /// The stack restore comes first, while the block the scope ends in is
-    /// still the current one, and is emitted only on the falling-out path --
-    /// a `break`, `continue`, `goto` or `return` that left already did its
-    /// own unwinding and terminated the block.
+    /// The cleanups come first, while every variable they name is still in
+    /// scope and still has its storage; then the stack restore, while the
+    /// block the scope ends in is still the current one. Both are emitted
+    /// only on the falling-out path -- a `break`, `continue`, `goto` or
+    /// `return` that left already did its own unwinding and terminated the
+    /// block.
     pub(crate) fn pop_scope(&mut self, scope: Scope) {
+        self.close_cleanup_scope(&scope);
         self.close_vla_scope(&scope);
         self.end_lifetimes();
         if let Some(entries) = self.local_scope_stack.pop() {
@@ -1822,6 +1839,7 @@ impl<'a> Linearizer<'a> {
         self.label_vla_depth.clear();
         self.pending_goto_vla.clear();
         self.vla_marks.clear();
+        self.cleanups.clear();
         self.func_has_vla = Self::declares_vla(&func.body);
         self.indirect_dispatch = None;
         // Remove from extern_symbols since we're defining this function
@@ -1880,10 +1898,11 @@ impl<'a> Linearizer<'a> {
         // variably modified identifier without executing its declaration
         // leaves the object's size never computed. gcc holds a statement
         // expression to the same rule.
-        let written_labels = self.check_jumps_into_protected_scopes(&func.body);
+        let labels = self.check_jumps_into_protected_scopes(&func.body);
 
         let func_scope = self.reset_for_function(func);
-        self.written_labels = written_labels;
+        self.written_labels = labels.written;
+        self.label_cleanups = labels.cleanups;
 
         // Create function - use storage class from FunctionDef
         let modifiers = self.types.modifiers(func.return_type);
@@ -2312,7 +2331,7 @@ impl<'a> Linearizer<'a> {
             let val = self.linearize_converted(e, ret_type);
             let size = self.types.size_bits(ret_type);
             self.emit(Instruction::store(val, sret_ptr, 0, ret_type, size));
-            self.emit(Instruction::ret_typed(
+            self.emit_return(Instruction::ret_typed(
                 Some(sret_ptr),
                 self.types.void_ptr_id,
                 64,
@@ -2336,7 +2355,9 @@ impl<'a> Linearizer<'a> {
         };
         self.emit_block_copy(sret_ptr, src_addr, struct_bytes as i64, vol);
 
-        self.emit(Instruction::ret_typed(
+        // The value is in the caller's buffer before any cleanup runs, so a
+        // cleanup that scrubs the variable returned does not reach it.
+        self.emit_return(Instruction::ret_typed(
             Some(sret_ptr),
             self.types.void_ptr_id,
             64,
@@ -2408,9 +2429,12 @@ impl<'a> Linearizer<'a> {
         // lives, because the inliner has to ask the same question of the
         // `Ret` this emits.
         if super::aggregate_ret_is_address(&ret_class, struct_size) {
+            // The `Ret` reads the value through the address when the function
+            // returns, which is after the cleanups have run.
+            let src_addr = self.outlive_cleanups(src_addr, ret_type, 0);
             let mut ret_insn = Instruction::ret_typed(Some(src_addr), ret_type, struct_size);
             ret_insn.extra_mut().abi_info = Some(Box::new(CallAbiInfo::new(vec![], ret_class)));
-            self.emit(ret_insn);
+            self.emit_return(ret_insn);
             return;
         }
 
@@ -2447,7 +2471,7 @@ impl<'a> Linearizer<'a> {
         let mut ret_insn = Instruction::ret_typed(Some(low_temp), ret_type, struct_size);
         ret_insn.src.push(high_temp);
         ret_insn.extra_mut().abi_info = Some(Box::new(CallAbiInfo::new(vec![], ret_class)));
-        self.emit(ret_insn);
+        self.emit_return(ret_insn);
     }
 
     // Expression linearization
@@ -6847,6 +6871,8 @@ impl<'a> Linearizer<'a> {
                 // The result is the value of the final expression, computed
                 // before the scope ends: it may read the VLA being released.
                 let value = self.linearize_expr(result);
+                let value =
+                    self.outlive_cleanups(value, self.expr_type(result), scope.cleanup_entry);
                 self.switch_stack = enclosing_switches;
                 self.pop_scope(scope);
                 value
@@ -6925,6 +6951,9 @@ mod test_linearize_call;
 #[cfg(test)]
 #[path = "test_linearize_cfg.rs"]
 mod test_linearize_cfg;
+#[cfg(test)]
+#[path = "test_linearize_cleanup.rs"]
+mod test_linearize_cleanup;
 #[cfg(test)]
 #[path = "test_linearize_expr.rs"]
 mod test_linearize_expr;

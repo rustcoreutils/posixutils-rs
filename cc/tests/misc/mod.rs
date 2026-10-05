@@ -12,6 +12,7 @@
 //
 
 mod cast_to_union;
+mod cleanup_attr;
 mod float_n;
 mod no_current_block;
 mod setjmp;

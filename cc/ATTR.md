@@ -85,6 +85,7 @@ The arguments of an unrecognised attribute are skipped without being parsed.
 | `used` | Functions, variables | Kept even when nothing refers to it. Load-bearing for functions, since an unreferenced static function is pruned at `-O1` and above. Variables are not pruned, so it changes nothing there |
 | `visibility` | Functions, variables | ELF `.hidden` / `.protected` / `.internal`; "default" is the *absence* of a directive, not a `.default` pseudo-op. Mach-O has only `.private_extern`, used for "hidden" and "internal". A zero-initialized variable leaves the `.comm` fast path rather than lose it |
 | `alias("target")` | Functions, variables | The declaration becomes a second symbol for `target`, which this translation unit must define: `.set name, target`, with the alias's own binding -- `.globl`, `.weak` with `weak`, nothing when `static` -- and its own visibility. The target may itself be an alias, and a static function reached only through its alias is kept. An error, as in gcc, when the target is undefined here or only an inline definition, when one of the two is a function and the other a variable, and when the alias is also defined normally. Mach-O has no symbol aliases and the attribute is an error there, as in clang. The optimizer treats a store through either name as a store to the one object |
+| `cleanup(fn)` | Automatic variables | `fn(&var)` runs whenever `var` leaves its scope, as in gcc: innermost scope first and in reverse declaration order; on falling out of a block, a `for` loop's declaration or a statement expression, after the statement expression's value is computed; on `return`, after the value returned is computed, side effects included; on `break` and `continue`, each time round; and on a `goto` out of the scope, forward or backward. A computed `goto`, an `asm goto`'s jump, `longjmp` and `exit` run none, as in gcc. A returned or statement-expression value the IR keeps in memory -- a complex number, a vector, an aggregate wider than a register -- is copied out before the cleanups run. The parser builds the call and checks it as any call (`Parser::cleanup_call`), so an argument the prototype cannot take draws the usual warning or error; the linearizer keeps the calls of the variables in scope on a stack, and one question, how much of it is still in scope where an exit lands, decides what every exit runs (`ir/linearize_cleanup.rs`); a `goto` learns its label's cleanup scopes from the jump-scope walk, which runs before lowering. A jump into the scope is accepted, as in gcc. An argument that is not a bare name is an error ("cleanup argument not an identifier"), as is a name that is not a function ("cleanup argument not a function") and anything but one argument. On a `static`, file-scope, `typedef`, function, member or parameter declaration it warns "'cleanup' attribute ignored"; on a block-scope `extern` it is ignored in silence, as gcc does |
 | `section("name")` | Functions, variables | Places the symbol in the named section, ahead of every other rule -- including the zero-initialized fast path, since `.comm` would let the linker choose. ELF flags follow the contents: `"ax"` for code, `"aw"` for mutable data, `"a"` for read-only data |
 
 ### `noreturn` spellings
@@ -143,8 +144,8 @@ whatever it would have left pending for a declarator is discarded.
 
 ## Not Recognised
 
-Any other name -- including `cleanup` -- warns "'name' attribute directive
-ignored", suppressible with `-Wno-attributes`, and its arguments are skipped.
+Any other name warns "'name' attribute directive ignored", suppressible with
+`-Wno-attributes`, and its arguments are skipped.
 
 ## `__has_attribute`
 
@@ -155,8 +156,6 @@ another target (`ms_abi`, `sysv_abi`). The parser's "directive ignored"
 warning and both evaluators ask that one function -- `eval_has_attribute` in
 `token/preprocess.rs` (`#if`) and the `BuiltinMacro::HasAttribute` arm in
 `token/preprocess_macro.rs` -- so there is no second list to keep in step.
-
-`cleanup` answers 0.
 
 ```c
 #if __has_attribute(noreturn)

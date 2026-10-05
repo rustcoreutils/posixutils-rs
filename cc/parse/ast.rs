@@ -2595,6 +2595,12 @@ pub struct SymbolAttrs {
     /// translation unit defines. Becomes an `ir::SymbolAlias`, never a
     /// definition or an extern reference of its own.
     pub alias: Option<String>,
+    /// `cleanup(fn)`: the function to call with the variable's address when
+    /// it leaves scope. Only ever read off a pending declarator: the parser
+    /// turns it into [`InitDeclarator::cleanup`] for an automatic variable
+    /// and drops it with a warning from anything else, so no symbol is ever
+    /// emitted carrying it.
+    pub cleanup: Option<SymbolId>,
 }
 
 impl SymbolAttrs {
@@ -2617,6 +2623,9 @@ impl SymbolAttrs {
         }
         if other.alias.is_some() {
             self.alias = other.alias.clone();
+        }
+        if other.cleanup.is_some() {
+            self.cleanup = other.cleanup;
         }
     }
 }
@@ -2649,6 +2658,10 @@ pub struct InitDeclarator {
     /// __attribute__((__pure__));` is the only thing that says `strlen`
     /// writes nothing.
     pub fn_effect: MemEffect,
+    /// `__attribute__((cleanup(fn)))` on an automatic variable: the call
+    /// `fn(&var)`, already checked as any call is, which the linearizer
+    /// emits on every path out of the variable's scope.
+    pub cleanup: Option<Expr>,
     /// Source position of the declarator itself.
     ///
     /// Recorded independently of `init` so that a declaration with no
@@ -2666,6 +2679,7 @@ impl Declaration {
             declarators: vec![InitDeclarator {
                 symbol_attrs: Default::default(),
                 fn_effect: Default::default(),
+                cleanup: None,
                 pos: Position::default(),
                 symbol,
                 typ,

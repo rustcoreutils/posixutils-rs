@@ -250,3 +250,148 @@ fn misc_attribute_declaration_is_empty() {
         "empty declaration",
     );
 }
+
+// ============================================================================
+// tests/misc/cleanup_attr.rs:
+// `__attribute__((cleanup(fn)))`, diagnosed in gcc's words.
+// ============================================================================
+
+const CLEANUP_FNS: &str = "void c(int *p);\nvoid cl(long *p);\nvoid two(int *a, int b);\n\
+                           void ni(int a);\nvoid vp(void *p);\nint notfn;\nvoid (*fp)(int *);\n";
+
+/// Only an automatic variable has a scope to leave. Anything else ignores
+/// the attribute with gcc's warning -- except a block-scope `extern`, which
+/// gcc ignores in silence.
+#[test]
+fn misc_cleanup_ignored_without_automatic_storage() {
+    for (name, decl) in [
+        ("cleanup_file_scope", "int g __attribute__((cleanup(c)));\n"),
+        (
+            "cleanup_static",
+            "void f(void) { static int s __attribute__((cleanup(c))); }\n",
+        ),
+        (
+            "cleanup_typedef",
+            "void f(void) { typedef int T __attribute__((cleanup(c))); }\n",
+        ),
+        (
+            "cleanup_block_function",
+            "void f(void) { void g(void) __attribute__((cleanup(c))); }\n",
+        ),
+        (
+            "cleanup_member",
+            "struct T { int m __attribute__((cleanup(c))); };\n",
+        ),
+        (
+            "cleanup_parameter",
+            "void p(int x __attribute__((cleanup(c)))) { (void)x; }\n",
+        ),
+    ] {
+        let src = format!("{CLEANUP_FNS}{decl}");
+        compile_expect_warning(name, &src, "'cleanup' attribute ignored");
+        let quiet = compile_expect_warning_with(name, &src, &["-Wno-attributes".to_string()]);
+        assert!(!quiet.contains("cleanup"), "{name}: {quiet}");
+    }
+    let quiet = format!(
+        "{CLEANUP_FNS}void f(void) {{ extern int k __attribute__((cleanup(c))); \
+         int a __attribute__((cleanup(c))) = 0; int b __attribute__((__cleanup__(vp))); }}\n"
+    );
+    compile_expect_no_diagnostic("cleanup_quiet", &quiet, "cleanup");
+}
+
+/// The argument names a function: anything else is an error.
+#[test]
+fn misc_cleanup_argument_errors() {
+    for (name, attr, msg) in [
+        (
+            "cleanup_variable",
+            "cleanup(notfn)",
+            "cleanup argument not a function",
+        ),
+        (
+            "cleanup_function_pointer",
+            "cleanup(fp)",
+            "cleanup argument not a function",
+        ),
+        (
+            "cleanup_undeclared",
+            "cleanup(undeclared_fn)",
+            "cleanup argument not a function",
+        ),
+        (
+            "cleanup_integer",
+            "cleanup(1)",
+            "cleanup argument not an identifier",
+        ),
+        (
+            "cleanup_string",
+            "cleanup(\"c\")",
+            "cleanup argument not an identifier",
+        ),
+        (
+            "cleanup_bare",
+            "cleanup",
+            "wrong number of arguments specified for 'cleanup' attribute",
+        ),
+        (
+            "cleanup_empty",
+            "cleanup()",
+            "wrong number of arguments specified for 'cleanup' attribute",
+        ),
+        (
+            "cleanup_two",
+            "__cleanup__(c, c)",
+            "wrong number of arguments specified for 'cleanup' attribute",
+        ),
+    ] {
+        let src = format!("{CLEANUP_FNS}void f(void) {{ int a __attribute__(({attr})); }}\n");
+        compile_expect_error(name, &src, msg);
+    }
+}
+
+/// `fn(&var)` is checked as the call it is: its argument by the usual
+/// conversion rules, its count against the prototype, and `&` against a
+/// `register` variable.
+#[test]
+fn misc_cleanup_call_is_checked_as_a_call() {
+    let src = |decl: &str| format!("{CLEANUP_FNS}void f(void) {{ {decl} }}\n");
+    compile_expect_warning(
+        "cleanup_incompatible_pointer",
+        &src("int a __attribute__((cleanup(cl)));"),
+        "passing argument 1 of 'cl'",
+    );
+    compile_expect_warning(
+        "cleanup_int_conversion",
+        &src("int a __attribute__((cleanup(ni)));"),
+        "makes integer from pointer without a cast",
+    );
+    compile_expect_error(
+        "cleanup_too_few",
+        &src("int a __attribute__((cleanup(two)));"),
+        "too few arguments to function 'two'",
+    );
+    compile_expect_error(
+        "cleanup_register",
+        &src("register int r __attribute__((cleanup(c)));"),
+        "address of register variable 'r' requested",
+    );
+    compile_expect_no_diagnostic(
+        "cleanup_void_pointer",
+        &src("long a __attribute__((cleanup(vp)));"),
+        "argument",
+    );
+}
+
+/// A `goto` into the scope of a variable with a cleanup is legal, as in gcc
+/// -- unlike one into the scope of a VLA.
+#[test]
+fn misc_cleanup_goto_into_scope_is_accepted() {
+    let src = format!(
+        "{CLEANUP_FNS}void f(int x) {{\n\
+           if (x) goto in;\n\
+           {{ int a __attribute__((cleanup(c))) = 1; in: x++; }}\n\
+           switch (x) {{ int b __attribute__((cleanup(c))); case 1: b = 2; break; }}\n\
+         }}\n"
+    );
+    compile_expect_no_diagnostic("cleanup_goto_into", &src, "jump");
+}

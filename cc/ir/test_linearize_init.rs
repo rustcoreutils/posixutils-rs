@@ -109,6 +109,7 @@ fn test_string_literal_char_array_init() {
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
                     fn_effect: Default::default(),
+                    cleanup: None,
                     symbol_attrs: Default::default(),
                     pos: Position::default(),
                     symbol: arr_sym,
@@ -165,6 +166,7 @@ fn test_string_literal_char_pointer_init() {
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
                     fn_effect: Default::default(),
+                    cleanup: None,
                     symbol_attrs: Default::default(),
                     pos: Position::default(),
                     symbol: p_sym,
@@ -430,6 +432,7 @@ fn test_static_local_address_in_initializer() {
     let x_decl = Declaration {
         declarators: vec![InitDeclarator {
             fn_effect: Default::default(),
+            cleanup: None,
             symbol_attrs: Default::default(),
             pos: Position::default(),
             symbol: x_sym,
@@ -453,6 +456,7 @@ fn test_static_local_address_in_initializer() {
     let p_decl = Declaration {
         declarators: vec![InitDeclarator {
             fn_effect: Default::default(),
+            cleanup: None,
             symbol_attrs: Default::default(),
             pos: Position::default(),
             symbol: p_sym,
@@ -616,6 +620,7 @@ fn test_mixed_designated_positional_struct_init() {
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
                     fn_effect: Default::default(),
+                    cleanup: None,
                     symbol_attrs: Default::default(),
                     pos: Position::default(),
                     symbol: s_sym,
@@ -715,6 +720,7 @@ fn test_mixed_designated_positional_array_init() {
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
                     fn_effect: Default::default(),
+                    cleanup: None,
                     symbol_attrs: Default::default(),
                     pos: Position::default(),
                     symbol: arr_sym,
@@ -875,6 +881,7 @@ fn test_designator_chain_nested_struct_init() {
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
                     fn_effect: Default::default(),
+                    cleanup: None,
                     symbol_attrs: Default::default(),
                     pos: Position::default(),
                     symbol: outer_sym,
@@ -958,6 +965,7 @@ fn test_designator_chain_array_member_init() {
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
                     fn_effect: Default::default(),
+                    cleanup: None,
                     symbol_attrs: Default::default(),
                     pos: Position::default(),
                     symbol: s_sym,
@@ -1025,6 +1033,7 @@ fn test_repeated_designator_last_wins_array() {
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
                     fn_effect: Default::default(),
+                    cleanup: None,
                     symbol_attrs: Default::default(),
                     pos: Position::default(),
                     symbol: arr_sym,
@@ -1133,6 +1142,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
                     fn_effect: Default::default(),
+                    cleanup: None,
                     symbol_attrs: Default::default(),
                     pos: Position::default(),
                     symbol: s_sym,
@@ -1225,6 +1235,7 @@ fn test_union_first_named_member_positional_init() {
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
                     fn_effect: Default::default(),
+                    cleanup: None,
                     symbol_attrs: Default::default(),
                     pos: Position::default(),
                     symbol: u_sym,
@@ -1361,6 +1372,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
     let decl = Declaration {
         declarators: vec![InitDeclarator {
             fn_effect: Default::default(),
+            cleanup: None,
             symbol_attrs: Default::default(),
             pos: Position::default(),
             symbol: s_sym,
@@ -1512,6 +1524,7 @@ fn test_bitfield_designated_init_local_var() {
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
                     fn_effect: Default::default(),
+                    cleanup: None,
                     symbol_attrs: Default::default(),
                     pos: Position::default(),
                     symbol: s_sym,
@@ -1820,6 +1833,7 @@ fn test_complex_struct_member_init_stores_both_halves() {
         body: Stmt::Block(vec![BlockItem::Declaration(Declaration {
             declarators: vec![InitDeclarator {
                 fn_effect: Default::default(),
+                cleanup: None,
                 symbol_attrs: Default::default(),
                 pos: Position::default(),
                 symbol: s_sym,

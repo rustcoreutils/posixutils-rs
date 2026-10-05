@@ -10,7 +10,9 @@
 // declarators to the symbols they bind, at file scope and block scope alike
 //
 
-use super::ast::{Declaration, Expr, ExternalDecl, FunctionAttrs, InitDeclarator};
+use super::ast::{
+    Declaration, Expr, ExprKind, ExternalDecl, FunctionAttrs, InitDeclarator, UnaryOp,
+};
 use super::attribute::SpecifierAttrs;
 use super::declaration::{Redeclared, SpecContext};
 use super::linkage::Declared;
@@ -74,6 +76,14 @@ enum Bound {
     /// A block-scope redeclaration the symbol table refused, which binds
     /// nothing new.
     Nothing,
+}
+
+/// A `cleanup(func)` written on the declarator of `var`, whose type is `typ`.
+struct Cleanup {
+    func: SymbolId,
+    var: SymbolId,
+    typ: TypeId,
+    pos: Position,
 }
 
 /// No automatic storage duration, so no stack slot to size.
@@ -435,9 +445,20 @@ impl Parser<'_> {
         // declarator does not inherit it; a function takes the effect every
         // declaration of its name has promised.
         let pending_effect = self.take_pending_fn_effect();
+        let mut symbol_attrs = std::mem::take(&mut self.pending_symbol_attrs);
+        let cleanup = symbol_attrs.cleanup.take().and_then(|func| {
+            let var = Cleanup {
+                func,
+                var: symbol,
+                typ,
+                pos,
+            };
+            self.declarator_cleanup(var, specs.storage_class, scope, is_fn)
+        });
         Ok(Bound::Decl(InitDeclarator {
-            symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
+            symbol_attrs,
             fn_effect: fn_attrs.map_or(pending_effect, |a| a.effect),
+            cleanup,
             symbol,
             typ,
             storage_class: specs.storage_class,
@@ -447,6 +468,58 @@ impl Parser<'_> {
             explicit_align: if is_fn { None } else { align },
             pos,
         }))
+    }
+
+    /// The call `__attribute__((cleanup(fn)))` asks for on the declarator
+    /// `var` describes, with storage class `storage` at `scope`.
+    ///
+    /// Only a variable with automatic storage has a scope to leave. gcc
+    /// ignores the attribute with a warning on a typedef, a function, a
+    /// `static` and anything at file scope -- and in silence on a
+    /// block-scope `extern`, which this matches.
+    ///
+    /// The call is built here, where it is checked as any call is: an
+    /// argument the function's prototype cannot take draws the usual
+    /// diagnostic, and taking the address of a `register` variable is the
+    /// usual error.
+    fn declarator_cleanup(
+        &mut self,
+        var: Cleanup,
+        storage: TypeModifiers,
+        scope: DeclScope,
+        is_fn: bool,
+    ) -> Option<Expr> {
+        let automatic = matches!(scope, DeclScope::Block { .. })
+            && !is_fn
+            && !storage.intersects(NO_AUTO_DURATION);
+        if automatic {
+            return Some(self.cleanup_call(var));
+        }
+        let block_extern = matches!(scope, DeclScope::Block { .. })
+            && !is_fn
+            && storage.contains(TypeModifiers::EXTERN);
+        if !block_extern {
+            Self::warn_cleanup_ignored(var.pos);
+        }
+        None
+    }
+
+    /// `func(&var)`, checked as the call it is.
+    fn cleanup_call(&mut self, c: Cleanup) -> Expr {
+        let func_typ = self.symbols.get(c.func).typ;
+        let callee = Self::typed_expr(ExprKind::Ident(c.func), func_typ, c.pos);
+        let operand = Self::typed_expr(ExprKind::Ident(c.var), c.typ, c.pos);
+        self.check_addressable(&operand, c.pos);
+        let ptr = self.types.pointer_to(c.typ);
+        let arg = Self::typed_expr(
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                operand: Box::new(operand),
+            },
+            ptr,
+            c.pos,
+        );
+        self.checked_call(callee, vec![arg], c.pos, c.pos)
     }
 
     /// The storage-class and function specifiers a declarator of this kind,

@@ -9872,3 +9872,77 @@ fn test_conditional_mismatched_arms_are_errors() {
         assert!(crate::diag::error_count() > before, "{src}: accepted");
     }
 }
+
+/// `cleanup(fn)` belongs to the declarator it is written on, or to every
+/// declarator when written among the specifiers, as gcc reads it; a trailing
+/// one replaces the specifiers'. Each becomes the checked call `fn(&var)`,
+/// and a `static` gets none.
+#[test]
+fn test_cleanup_attribute_reaches_its_declarator() {
+    let src = "void c(int *p); void d(int *p);\n\
+               void f(void) {\n\
+                 int a, b __attribute__((cleanup(c))), e;\n\
+                 __attribute__((cleanup(d))) int g, h __attribute__((__cleanup__(c)));\n\
+                 int __attribute__((cleanup(c))) i = 1, j = 2;\n\
+                 static int s __attribute__((cleanup(c)));\n\
+                 int k __attribute__((cleanup(d))) = sizeof(long), l;\n\
+               }\n";
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    let (tu, _types, strings, symbols) = parse_tu_for(src, &target).unwrap();
+    let name = |sym| strings.get(symbols.get(sym).name).to_string();
+    let body = tu
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ExternalDecl::FunctionDef(f) => Some(&f.body),
+            _ => None,
+        })
+        .unwrap();
+    let Stmt::Block(items) = body else {
+        panic!("a function body is a block");
+    };
+    let mut got = Vec::new();
+    for item in items {
+        let BlockItem::Declaration(decl) = item else {
+            continue;
+        };
+        for d in &decl.declarators {
+            let cleanup = d.cleanup.as_ref().map(|call| {
+                let ExprKind::Call { func, args, .. } = &call.kind else {
+                    panic!("a cleanup is a call");
+                };
+                let ExprKind::Ident(callee) = func.kind else {
+                    panic!("a cleanup calls its function by name");
+                };
+                // The one argument is the variable's own address.
+                let [arg] = &args[..] else {
+                    panic!("a cleanup takes one argument");
+                };
+                assert!(
+                    matches!(&arg.kind, ExprKind::Unary { op: UnaryOp::AddrOf, operand }
+                        if matches!(operand.kind, ExprKind::Ident(v) if v == d.symbol)),
+                    "the argument of {}'s cleanup is &{0}",
+                    name(d.symbol)
+                );
+                name(callee)
+            });
+            got.push((name(d.symbol), cleanup));
+        }
+    }
+    let want: Vec<(String, Option<String>)> = [
+        ("a", None),
+        ("b", Some("c")),
+        ("e", None),
+        ("g", Some("d")),
+        ("h", Some("c")),
+        ("i", Some("c")),
+        ("j", Some("c")),
+        ("s", None),
+        ("k", Some("d")),
+        ("l", None),
+    ]
+    .into_iter()
+    .map(|(n, c)| (n.to_string(), c.map(str::to_string)))
+    .collect();
+    assert_eq!(got, want);
+}

@@ -10,6 +10,7 @@
 
 use super::asm_operand::AddrWalk;
 use super::linearize::*;
+use super::linearize_cleanup::ScopeExit;
 use super::linearize_emit::Controlling;
 use super::{
     AsmConstraint, AsmData, BasicBlockId, GlobalStorage, Initializer, Instruction, Opcode, PseudoId,
@@ -186,7 +187,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                         let conv = self.current_calling_conv;
                         let val = self.vector_return_value(addr, vec, func_ret_type, conv);
                         let size = self.types.size_bits(func_ret_type);
-                        self.emit(Instruction::ret_typed(Some(val), func_ret_type, size));
+                        self.emit_return(Instruction::ret_typed(Some(val), func_ret_type, size));
                     } else if let Some(sret_ptr) = self.struct_return_ptr {
                         self.emit_sret_return(e, sret_ptr, func_ret_type);
                     } else if let Some(ret_type) = self.reg_aggregate_return_type {
@@ -198,30 +199,31 @@ impl<'a> super::linearize::Linearizer<'a> {
                         } else {
                             self.linearize_converted(e, func_ret_type)
                         };
+                        let converted_val = self.outlive_cleanups(converted_val, func_ret_type, 0);
                         // Function types decay to pointers when returned
                         let typ_size = if self.types.kind(func_ret_type) == TypeKind::Function {
                             self.target.pointer_width
                         } else {
                             self.types.size_bits(func_ret_type)
                         };
-                        self.emit(Instruction::ret_typed(
+                        self.emit_return(Instruction::ret_typed(
                             Some(converted_val),
                             func_ret_type,
                             typ_size,
                         ));
                     }
                 } else {
-                    self.emit(Instruction::ret(None));
+                    self.emit_return(Instruction::ret(None));
                 }
                 self.start_unreachable_block();
             }
 
             Stmt::Break(_) => {
                 if let Some(&target) = self.break_targets.last() {
-                    if let Some(current) = self.current_bb {
+                    if self.current_bb.is_some() {
+                        self.leave_scopes(ScopeExit::Break);
                         self.unwind_vla_marks(JumpKind::Break);
-                        self.emit(Instruction::br(target));
-                        self.link_bb(current, target);
+                        self.link_to_merge_if_needed(target);
                         self.start_unreachable_block();
                     }
                 }
@@ -229,10 +231,10 @@ impl<'a> super::linearize::Linearizer<'a> {
 
             Stmt::Continue(_) => {
                 if let Some(&target) = self.continue_targets.last() {
-                    if let Some(current) = self.current_bb {
+                    if self.current_bb.is_some() {
+                        self.leave_scopes(ScopeExit::Continue);
                         self.unwind_vla_marks(JumpKind::Continue);
-                        self.emit(Instruction::br(target));
-                        self.link_bb(current, target);
+                        self.link_to_merge_if_needed(target);
                         self.start_unreachable_block();
                     }
                 }
@@ -282,10 +284,10 @@ impl<'a> super::linearize::Linearizer<'a> {
             Stmt::Goto { name: label, pos } => {
                 let label_str = self.str(*label).to_string();
                 let target = self.refer_to_label(&label_str, *pos);
-                if let Some(current) = self.current_bb {
+                if self.current_bb.is_some() {
+                    self.leave_scopes(ScopeExit::Goto(*label));
                     self.release_vla_scopes_for_goto(target);
-                    self.emit(Instruction::br(target));
-                    self.link_bb(current, target);
+                    self.link_to_merge_if_needed(target);
                 }
 
                 // Set current_bb to None - any subsequent code until a label is dead
@@ -443,6 +445,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     );
                 }
                 self.linearize_vla_decl(declarator);
+                self.register_cleanup(declarator);
                 continue;
             }
 
@@ -542,6 +545,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     }
                 }
             }
+            self.register_cleanup(declarator);
         }
     }
 
@@ -1777,11 +1781,9 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// does not -- the position says where to look and the name says what the
     /// problem is.
     ///
-    /// Answers the name of every label the body writes, evaluated or not.
-    pub(crate) fn check_jumps_into_protected_scopes(
-        &self,
-        body: &Stmt,
-    ) -> std::collections::HashSet<String> {
+    /// Answers the name of every label the body writes, evaluated or not,
+    /// and which cleanup scopes each label lies in.
+    pub(crate) fn check_jumps_into_protected_scopes(&self, body: &Stmt) -> LabelScopes {
         let w = JumpScopeWalk::of(body);
 
         // 6.8.1p3: a label name is unique within the function it appears in.
@@ -1822,10 +1824,16 @@ impl<'a> super::linearize::Linearizer<'a> {
             error(*pos, &gettextrs::gettext(message));
         }
 
-        w.labels
+        let cleanups = first_label
+            .iter()
+            .map(|(&name, &i)| (name, w.cleanup_vars(&w.labels[i].1)))
+            .collect();
+        let written = w
+            .labels
             .iter()
             .map(|(name, _, _)| self.strings.get(*name).to_string())
-            .collect()
+            .collect();
+        LabelScopes { written, cleanups }
     }
 
     /// Report a jump into `scope`, by a `switch` reaching a label inside it
@@ -1842,6 +1850,9 @@ impl<'a> super::linearize::Linearizer<'a> {
                     ),
                 );
             }
+            // Entering one is legal: gcc accepts it in silence, and the
+            // cleanup then runs on whatever the variable holds.
+            JumpScope::Cleanup(_) => {}
             JumpScope::StmtExpr => {
                 let message = if by_switch {
                     "switch jumps into statement expression"
@@ -3399,6 +3410,26 @@ enum JumpScope {
     /// one is allowed, and so is a computed `goto`, which gcc documents as
     /// undefined rather than diagnosing.
     StmtExpr,
+    /// The scope of a variable with `__attribute__((cleanup))`, from the end
+    /// of its declarator to the end of its block. A jump may enter it; one
+    /// that leaves it runs the cleanup.
+    Cleanup(crate::symbol::SymbolId),
+}
+
+impl JumpScope {
+    /// Whether a jump from outside may not enter this scope.
+    fn forbids_entry(&self) -> bool {
+        !matches!(self, JumpScope::Cleanup(_))
+    }
+}
+
+/// What the jump-scope walk tells the lowering about a function's labels.
+pub(crate) struct LabelScopes {
+    /// The name of every label the body writes, evaluated or not.
+    pub(crate) written: std::collections::HashSet<String>,
+    /// For each label, the variables with a cleanup in whose scope it lies,
+    /// outermost first.
+    pub(crate) cleanups: std::collections::HashMap<StringId, Vec<crate::symbol::SymbolId>>,
 }
 
 /// A `goto`, or one label of an `asm goto`, as the walk found it.
@@ -3494,7 +3525,10 @@ impl JumpScopeWalk {
     /// outermost of each kind: one jump earns at most one diagnostic of each.
     fn entered(&self, from: &[usize], to: &[usize]) -> Vec<usize> {
         let mut out: Vec<usize> = Vec::new();
-        for &id in to.iter().filter(|id| !from.contains(id)) {
+        let entered = to
+            .iter()
+            .filter(|id| !from.contains(id) && self.scopes[**id].forbids_entry());
+        for &id in entered {
             let same_kind = |other: &usize| {
                 std::mem::discriminant(&self.scopes[*other])
                     == std::mem::discriminant(&self.scopes[id])
@@ -3667,7 +3701,11 @@ impl JumpScopeWalk {
         // since they all say the same thing.
         if let Some(outer) = switch_scopes {
             let mut stmt_expr_seen = false;
-            for &id in self.open.iter().filter(|id| !outer.contains(id)) {
+            let entered = self
+                .open
+                .iter()
+                .filter(|id| !outer.contains(id) && self.scopes[**id].forbids_entry());
+            for &id in entered {
                 if matches!(self.scopes[id], JumpScope::StmtExpr) {
                     if stmt_expr_seen {
                         continue;
@@ -3714,7 +3752,22 @@ impl JumpScopeWalk {
             if let Some(init) = &d.init {
                 self.walk_expr(init, switch_scopes);
             }
+            // A cleanup is in force once its variable is initialized.
+            if d.cleanup.is_some() {
+                self.open.push(self.scopes.len());
+                self.scopes.push(JumpScope::Cleanup(d.symbol));
+            }
         }
+    }
+
+    /// The variables with a cleanup among the scopes `open`, outermost first.
+    fn cleanup_vars(&self, open: &[usize]) -> Vec<crate::symbol::SymbolId> {
+        open.iter()
+            .filter_map(|&id| match self.scopes[id] {
+                JumpScope::Cleanup(var) => Some(var),
+                _ => None,
+            })
+            .collect()
     }
 }
 

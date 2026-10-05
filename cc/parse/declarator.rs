@@ -738,6 +738,7 @@ impl Parser<'_> {
 
             // Skip any __attribute__ after parameter declarator
             self.skip_extensions();
+            self.drop_pending_cleanup(param_pos);
 
             // A parameter's type attributes are the parameter's, and are
             // applied before the array-to-pointer adjustment below so a mode

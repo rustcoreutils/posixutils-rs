@@ -1180,6 +1180,10 @@ define_keywords! {
     (REAL_KW_SHORT,     "__real",            RESERVED_NAME),
     (IMAG_KW,           "__imag__",          RESERVED_NAME),
     (IMAG_KW_SHORT,     "__imag",            RESERVED_NAME),
+    // `cleanup(fn)`: runs `fn(&var)` when an automatic variable leaves its
+    // scope. Appended, as above.
+    (_, "cleanup",                   SUPPORTED_ATTR),
+    (_, "__cleanup__",               SUPPORTED_ATTR),
 }
 
 // Tag query API
@@ -1557,6 +1561,8 @@ mod tests {
             "__mode__",
             "vector_size",
             "__vector_size__",
+            "cleanup",
+            "__cleanup__",
         ] {
             let table = StringTable::new();
             let sid = id(&table, s);

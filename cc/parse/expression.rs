@@ -1698,46 +1698,63 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let args = self.parse_argument_list()?;
                 self.expect_special(b')')?;
-                self.check_callable(&expr, call_pos);
-                let func_type = self.resolved_function_type(&expr);
-                let callee = self.callee_name(&expr);
-                self.check_call(func_type, callee, &args, call_pos);
-
-                // The return type, from the function type the call calls --
-                // through a pointer for a call through one -- or `int` when
-                // there is none. A call's value has the unqualified version
-                // of it (C17 6.7.6.3p4 makes that the function's return type).
-                let return_type = func_type
-                    .and_then(|f| self.types.base_type(f))
-                    .unwrap_or(self.types.int_id);
-                let return_type = self.types.unqualified(return_type);
-                // 6.5.2.2p1: a call returns `void` or a complete object type;
-                // a prototype may name an incomplete one, but a call has a
-                // value of it to make.
-                if self.types.kind(return_type) != TypeKind::Void
-                    && self.type_name_is_incomplete(return_type, 0)
-                {
-                    let named = self.types.format_type(return_type, Some(self.idents));
-                    diag::error_args(call_pos, "invalid use of undefined type '{0}'", &[&named]);
-                }
-
-                let known = self.known_callee(&expr);
-                expr = self.fold_zero_length_compare(Self::typed_expr(
-                    ExprKind::Call {
-                        func: Box::new(expr),
-                        args,
-                        binding: crate::parse::ast::CalleeBinding::Declared,
-                        known,
-                    },
-                    return_type,
-                    base_pos,
-                ));
+                expr = self.checked_call(expr, args, call_pos, base_pos);
             } else {
                 break;
             }
         }
 
         Ok(expr)
+    }
+
+    /// The call `callee(args)`, checked as C17 6.5.2.2 asks: the callee is
+    /// callable, the arguments agree with its prototype, and the value it
+    /// returns is complete. `call_pos` is where diagnostics about the call
+    /// point; `pos` is the expression's own position.
+    ///
+    /// Every call the source spells goes through here, and so does the call
+    /// `__attribute__((cleanup(fn)))` stands for.
+    pub(super) fn checked_call(
+        &mut self,
+        callee: Expr,
+        args: Vec<Expr>,
+        call_pos: Position,
+        pos: Position,
+    ) -> Expr {
+        self.check_callable(&callee, call_pos);
+        let func_type = self.resolved_function_type(&callee);
+        let callee_name = self.callee_name(&callee);
+        self.check_call(func_type, callee_name, &args, call_pos);
+
+        // The return type, from the function type the call calls --
+        // through a pointer for a call through one -- or `int` when
+        // there is none. A call's value has the unqualified version
+        // of it (C17 6.7.6.3p4 makes that the function's return type).
+        let return_type = func_type
+            .and_then(|f| self.types.base_type(f))
+            .unwrap_or(self.types.int_id);
+        let return_type = self.types.unqualified(return_type);
+        // 6.5.2.2p1: a call returns `void` or a complete object type;
+        // a prototype may name an incomplete one, but a call has a
+        // value of it to make.
+        if self.types.kind(return_type) != TypeKind::Void
+            && self.type_name_is_incomplete(return_type, 0)
+        {
+            let named = self.types.format_type(return_type, Some(self.idents));
+            diag::error_args(call_pos, "invalid use of undefined type '{0}'", &[&named]);
+        }
+
+        let known = self.known_callee(&callee);
+        self.fold_zero_length_compare(Self::typed_expr(
+            ExprKind::Call {
+                func: Box::new(callee),
+                args,
+                binding: crate::parse::ast::CalleeBinding::Declared,
+                known,
+            },
+            return_type,
+            pos,
+        ))
     }
 
     /// The type of `__func__`: `const char[N]` for the enclosing function's

@@ -30,6 +30,7 @@ pub mod instcombine;
 pub mod libcall_fold;
 pub mod linearize;
 mod linearize_atomic;
+mod linearize_cleanup;
 mod linearize_emit;
 mod linearize_init;
 mod linearize_stmt;

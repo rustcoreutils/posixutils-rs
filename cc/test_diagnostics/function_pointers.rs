@@ -698,8 +698,12 @@ __attribute__((used)) static int used_var;
 #if !__has_attribute(weak) || !__has_attribute(transparent_union)
 #error "__has_attribute must admit the attributes the compiler accepts"
 #endif
+#if !__has_attribute(cleanup) || !__has_attribute(__cleanup__)
+#error "__has_attribute must admit cleanup, which the compiler implements"
+#endif
 
-int main(void) { return 0; }
+static void release(int *p) { (void)p; }
+int main(void) { int held __attribute__((cleanup(release))) = 0; return held; }
 "#;
     compile_expect_ok("recognised_attributes", src);
 }

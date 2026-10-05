@@ -37,6 +37,7 @@ fn linearize_static_local_stmt(build: impl FnOnce(&TestContext, Expr) -> Expr) -
     let decl = Declaration {
         declarators: vec![InitDeclarator {
             fn_effect: Default::default(),
+            cleanup: None,
             symbol_attrs: Default::default(),
             pos: Position::default(),
             symbol: counter_sym,
@@ -328,6 +329,7 @@ fn test_large_struct_copy_from_array() {
             BlockItem::Declaration(Declaration {
                 declarators: vec![InitDeclarator {
                     fn_effect: Default::default(),
+                    cleanup: None,
                     symbol_attrs: Default::default(),
                     pos: Position::default(),
                     symbol: item_sym,
@@ -403,6 +405,7 @@ fn test_block_scope_extern_declares_no_local() {
         BlockItem::Declaration(Declaration {
             declarators: vec![crate::parse::ast::InitDeclarator {
                 fn_effect: Default::default(),
+                cleanup: None,
                 symbol_attrs: Default::default(),
                 pos: Position::default(),
                 symbol: g_sym,

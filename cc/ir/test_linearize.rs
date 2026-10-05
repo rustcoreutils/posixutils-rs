@@ -329,6 +329,7 @@ fn test_linearize_for() {
             init: Some(ForInit::Declaration(Declaration {
                 declarators: vec![crate::parse::ast::InitDeclarator {
                     fn_effect: Default::default(),
+                    cleanup: None,
                     symbol_attrs: Default::default(),
                     pos: Position::default(),
                     symbol: i_sym,
@@ -612,6 +613,7 @@ fn test_local_var_emits_load_store() {
             BlockItem::Declaration(Declaration {
                 declarators: vec![crate::parse::ast::InitDeclarator {
                     fn_effect: Default::default(),
+                    cleanup: None,
                     symbol_attrs: Default::default(),
                     pos: Position::default(),
                     symbol: x_sym,
@@ -679,6 +681,7 @@ fn test_ssa_converts_local_to_phi() {
             BlockItem::Declaration(Declaration {
                 declarators: vec![crate::parse::ast::InitDeclarator {
                     fn_effect: Default::default(),
+                    cleanup: None,
                     symbol_attrs: Default::default(),
                     pos: Position::default(),
                     symbol: x_sym,
@@ -750,6 +753,7 @@ fn test_ssa_loop_variable() {
             BlockItem::Declaration(Declaration {
                 declarators: vec![crate::parse::ast::InitDeclarator {
                     fn_effect: Default::default(),
+                    cleanup: None,
                     symbol_attrs: Default::default(),
                     pos: Position::default(),
                     symbol: i_sym,
@@ -1339,6 +1343,7 @@ fn test_incomplete_struct_type_resolution() {
         body: Stmt::Block(vec![BlockItem::Declaration(Declaration {
             declarators: vec![InitDeclarator {
                 fn_effect: Default::default(),
+                cleanup: None,
                 symbol_attrs: Default::default(),
                 pos: Position::default(),
                 symbol: f_sym,

@@ -2269,6 +2269,22 @@ enum Lang {
     Unknown,
 }
 
+/// Whether a linker-input operand never reaches the linker in this run, so
+/// that the driver itself must check it exists.
+///
+/// gcc errors "linker input file not found" for a missing linker input when
+/// nothing is linked (`-c`, `-S`, `-E`); a build naming a file it never made
+/// must fail, not succeed with a warning. When linking, the linker reports a
+/// missing object itself. An unrecognized suffix never reaches c17's link
+/// line, so it is checked whether or not this run links.
+fn bypasses_linker(kind: OperandKind, link_phase: bool) -> bool {
+    match kind {
+        OperandKind::Unknown => true,
+        OperandKind::Object => !link_phase,
+        OperandKind::Source | OperandKind::Asm => false,
+    }
+}
+
 impl Operand {
     fn classify(path: String, args: &Args) -> Self {
         let kind = match args.lang_of(&path) {
@@ -2735,7 +2751,27 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     // remaining operands, skip the link, exit non-zero.
     let mut failed = false;
 
+    let link_phase = !args.compile_only
+        && !args.asm_only
+        && !args.preprocess_only
+        && !args.dump_tokens
+        && !args.dump_ast
+        && args.dump_ir.is_none();
+
     for (idx, op) in operands.iter().enumerate() {
+        if bypasses_linker(op.kind, link_phase) {
+            if let Err(e) = std::fs::metadata(&op.path) {
+                eprintln!(
+                    "c17: {}: {}: {}: {}",
+                    gettext("error"),
+                    op.path,
+                    gettext("linker input file not found"),
+                    plib::diag::io_error_text(&e)
+                );
+                failed = true;
+                continue;
+            }
+        }
         match op.kind {
             OperandKind::Unknown => {}
             OperandKind::Object => operand_objects[idx] = Some(op.path.clone()),
@@ -2789,13 +2825,6 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let link_line = build_link_line(&scanned, &args, &operand_objects);
 
-    let link_phase = !args.compile_only
-        && !args.asm_only
-        && !args.preprocess_only
-        && !args.dump_tokens
-        && !args.dump_ast
-        && args.dump_ir.is_none();
-
     let has_object = link_line.iter().any(|i| matches!(i, LinkItem::Object(_)));
 
     if !failed && link_phase && has_object {
@@ -2826,6 +2855,19 @@ mod tests {
         assert_eq!(StripBy::for_os(Os::Linux), StripBy::LinkerFlag);
         assert_eq!(StripBy::for_os(Os::FreeBSD), StripBy::LinkerFlag);
         assert_eq!(StripBy::for_os(Os::MacOS), StripBy::StripTool);
+    }
+
+    /// Only a linker input the linker will not see is checked by the driver:
+    /// an object only when nothing is linked, an unknown suffix always.
+    #[test]
+    fn test_bypasses_linker() {
+        for link_phase in [false, true] {
+            assert!(bypasses_linker(OperandKind::Unknown, link_phase));
+            assert!(!bypasses_linker(OperandKind::Source, link_phase));
+            assert!(!bypasses_linker(OperandKind::Asm, link_phase));
+        }
+        assert!(bypasses_linker(OperandKind::Object, false));
+        assert!(!bypasses_linker(OperandKind::Object, true));
     }
 
     // Tests for is_object_file()

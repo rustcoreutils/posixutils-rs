@@ -13,7 +13,7 @@
 //
 
 use crate::common::{preprocess_text, run_c17};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// A scratch directory holding `name` with `content`.
 fn scratch(name: &str, content: &str) -> (plib::tmp::TempDir, PathBuf) {
@@ -702,12 +702,14 @@ fn gcc_flags_response_files_are_expanded() {
     assert!(r.success, "{}", r.stderr);
     assert!(r.stdout.starts_with("x y B"), "{}", r.stdout);
 
-    // A file that cannot be read stays a literal operand, reported as one.
+    // A file that cannot be read stays a literal operand, reported as one:
+    // a linker input that does not exist, which is an error as in gcc.
     let missing = format!("@{}", dir.path().join("missing.rsp").display());
     let r = run_c17(&["-E", &missing, src.to_str().unwrap()]);
+    assert!(!r.success, "{}", r.stderr);
     assert!(
         r.stderr
-            .contains(&format!("unrecognized file type: {missing}")),
+            .contains(&format!("{missing}: linker input file not found")),
         "{}",
         r.stderr
     );
@@ -740,4 +742,63 @@ fn gcc_flags_response_file_drives_a_link() {
     assert!(r.success, "{}", r.stderr);
     let status = std::process::Command::new(&exe).status().expect("run");
     assert_eq!(status.code(), Some(7));
+}
+
+/// An input c17 does not compile is a linker input, and one that does not
+/// exist is an error even when nothing is linked, as in gcc ("linker input
+/// file not found"): a build that names a file it never made must fail,
+/// not succeed with a warning. One that exists is only unused.
+#[test]
+fn gcc_flags_missing_linker_input_is_an_error_without_linking() {
+    let (dir, src) = scratch("t.c", MAIN);
+    let missing = dir.path().join("nofile.zz");
+    let present = dir.path().join("present.zz");
+    std::fs::write(&present, "").expect("write");
+    let obj = dir.path().join("t.o");
+    let (src, obj) = (src.to_str().unwrap(), obj.to_str().unwrap());
+    for mode in [&["-c", "-o", obj][..], &["-E"]] {
+        let mut args = mode.to_vec();
+        args.extend([missing.to_str().unwrap(), src]);
+        let run = run_c17(&args);
+        assert!(!run.success, "{mode:?}: {}", run.stderr);
+        assert!(
+            run.stderr.contains("linker input file not found"),
+            "{mode:?}: {}",
+            run.stderr
+        );
+        let mut args = mode.to_vec();
+        args.extend([present.to_str().unwrap(), src]);
+        let run = run_c17(&args);
+        assert!(run.success, "{mode:?} existing: {}", run.stderr);
+    }
+}
+
+/// A missing object or archive is the same error when nothing is linked,
+/// under every mode that stops short of the link; the source operands are
+/// still compiled, as in gcc.
+#[test]
+fn gcc_flags_missing_object_is_an_error_without_linking() {
+    let (dir, src) = scratch("t.c", MAIN);
+    let out = dir.path().join("t.out");
+    let (src, out) = (src.to_str().unwrap(), out.to_str().unwrap());
+    for name in ["gone.o", "libgone.a"] {
+        let missing = dir.path().join(name);
+        let missing = missing.to_str().unwrap();
+        for mode in ["-c", "-S", "-E"] {
+            let run = run_c17(&[mode, "-o", out, missing, src]);
+            assert!(!run.success, "{mode} {name}: {}", run.stderr);
+            assert!(
+                run.stderr.contains(&format!(
+                    "error: {missing}: linker input file not found: No such file or directory"
+                )),
+                "{mode} {name}: {}",
+                run.stderr
+            );
+            assert!(
+                Path::new(out).exists(),
+                "{mode} {name}: source not compiled"
+            );
+            std::fs::remove_file(out).expect("remove");
+        }
+    }
 }

@@ -10,7 +10,6 @@
 // hidden symbols, constructors and destructors.
 //
 
-use crate::codegen::asm_probe::{asm_for_with, body_of, host_asm, AARCH64_LINUX, X86_64_LINUX};
 use crate::common::{compile_and_run, compile_and_run_everywhere, compile_and_run_two_units};
 // Only the x86-64 tests below assemble and run a file of their own.
 #[cfg(target_arch = "x86_64")]
@@ -458,50 +457,6 @@ int main(void)
     assert_eq!(compile_and_run("asm_label_rename", src, &[]), 0);
 }
 
-/// The label reaches the assembly, on both ABIs, for calls and definitions.
-///
-/// The runtime test above only proves the two names resolve to one another;
-/// this proves the *declared* name never appears as a symbol at all.
-#[test]
-fn codegen_asm_label_reaches_the_assembly() {
-    let src = r#"
-extern int myfn(int) __asm__("realfn");
-int defrenamed(int x) __asm__("real_def");
-int defrenamed(int x) { return x + 1; }
-extern int my_var __asm__("real_var");
-
-int call(int x) { return myfn(x) + my_var; }
-"#;
-
-    for triple in [X86_64_LINUX, AARCH64_LINUX] {
-        let asm = asm_for_with("asm_label", triple, src, &["-O"]);
-        assert!(
-            asm.contains("realfn"),
-            "{triple}: call should target the asm label:\n{asm}"
-        );
-        assert!(
-            !asm.contains("myfn"),
-            "{triple}: the declared name must not be emitted:\n{asm}"
-        );
-        assert!(
-            asm.contains("real_def"),
-            "{triple}: a definition's asm label should name its own label:\n{asm}"
-        );
-        assert!(
-            !asm.contains("defrenamed"),
-            "{triple}: the declared name must not be emitted:\n{asm}"
-        );
-        assert!(
-            asm.contains("real_var"),
-            "{triple}: a global's asm label should be the emitted symbol:\n{asm}"
-        );
-        assert!(
-            !asm.contains("my_var"),
-            "{triple}: the declared name must not be emitted:\n{asm}"
-        );
-    }
-}
-
 /// An asm label on a block-scope declaration with linkage renames it too, and
 /// a block-scope redeclaration keeps the label an earlier declaration gave the
 /// name. The block binder never settled either: the first emitted a reference
@@ -545,70 +500,6 @@ int main(void)
         compile_and_run_two_units("asm_label_block_scope_2tu", unit_a, unit_b, &[]),
         0
     );
-}
-
-/// An asm label belongs to the declarator it was written on, and to nothing
-/// else.
-///
-/// The label is collected wherever a type specifier can appear, but only a
-/// file-scope declarator claims one. A label written anywhere else -- on a
-/// block-scope declaration, on a struct definition, in a `for` initializer --
-/// stayed pending and was claimed by whatever was declared next, so an
-/// unrelated global was emitted under someone else's assembler name. The
-/// symptom at link time is an undefined reference to a name that is plainly
-/// defined in the source.
-#[test]
-fn codegen_asm_label_does_not_leak_to_the_next_declaration() {
-    let src = r#"
-extern int keep_me;
-
-/* GCC's local register variable: a register constraint, not a rename. */
-void with_register(void) { register long r __asm__("rdi"); (void)r; }
-int after_register = 1;
-
-void with_local(void) { int x __asm__("bogus_local"); (void)x; }
-int after_local = 2;
-
-void with_static_local(void) { static int x __asm__("bogus_static"); (void)x; }
-int after_static_local = 3;
-
-struct Tagged { int a; } __asm__("bogus_struct");
-int after_struct = 4;
-
-void with_for_init(void) { for (int i __asm__("bogus_for") = 0; i < 1; i++) ; }
-int after_for_init = 5;
-
-int keep_me = 6;
-"#;
-
-    for triple in [X86_64_LINUX, AARCH64_LINUX] {
-        let asm = asm_for_with("asm_label_leak", triple, src, &["-O"]);
-        for name in [
-            "after_register",
-            "after_local",
-            "after_static_local",
-            "after_struct",
-            "after_for_init",
-            "keep_me",
-        ] {
-            assert!(
-                asm.contains(name),
-                "{triple}: {name} should be emitted under its own name:\n{asm}"
-            );
-        }
-        for stolen in [
-            "rdi:",
-            "bogus_local",
-            "bogus_static",
-            "bogus_struct",
-            "bogus_for",
-        ] {
-            assert!(
-                !asm.contains(stolen),
-                "{triple}: a stray asm label was claimed by a later symbol ({stolen}):\n{asm}"
-            );
-        }
-    }
 }
 
 /// `weak`, `visibility`, `section` and `used` were parsed and thrown away
@@ -725,42 +616,6 @@ int main(void) { return weak_fn() + hidden_fn() + placed_fn() + default_fn() + p
 /// The attribute cases are grouped because they share a shape: an attribute
 /// that reaches the *parser* but not the object file, or reaches an object it
 /// was never written on.
-/// A function designator tested for truth is tested as the pointer it decays
-/// to, at the full width of an address (C17 6.3.2.1p4).
-///
-/// Typed as the function itself, the test had no width -- a function's is 0
-/// -- which both back ends raised to 32 bits: `if (weak_fn)` compared the low
-/// half of the address, so a function placed at a multiple of 4 GiB read as
-/// absent. `cmpl`/`cmp w` against 0 is the defect; the whole register is the
-/// fix.
-#[test]
-fn codegen_a_function_designator_is_tested_at_address_width() {
-    // And comparing two of them, which is the same question at a second site.
-    let src = "extern int wkfn(void) __attribute__((weak));\n\
-               extern int other(void) __attribute__((weak));\n\
-               int probe(void) { if (wkfn) return 1; return 0; }\n\
-               int same(void) { return wkfn == other; }\n";
-    let asm = asm_for_with("fn_truth", X86_64_LINUX, src, &["-O0"]);
-    let body = body_of(&asm, "probe");
-    assert!(body.contains("cmpq $0"), "{body}");
-    assert!(!body.contains("cmpl $0"), "{body}");
-    let body = body_of(&asm, "same");
-    assert!(body.contains("cmpq"), "{body}");
-    assert!(!body.contains("cmpl"), "{body}");
-    // The address is compared at sixty-four bits. What that comparison
-    // yields is an `int`, and a branch on it rightly tests thirty-two.
-    let asm = asm_for_with("fn_truth_a64", AARCH64_LINUX, src, &["-O0"]);
-    for f in ["probe", "same"] {
-        let body = body_of(&asm, f);
-        let lines: Vec<&str> = body.lines().map(str::trim).collect();
-        let address_test = lines
-            .iter()
-            .position(|l| l.starts_with("cmp "))
-            .unwrap_or_else(|| panic!("no comparison in {f}:\n{body}"));
-        assert!(lines[address_test].starts_with("cmp x"), "{body}");
-    }
-}
-
 #[test]
 fn codegen_symbol_attributes_do_not_leak_or_vanish() {
     // A function definition consumed its attributes through the function-attribute
@@ -800,6 +655,7 @@ int main(void) { return plain2 + weak_fn() - 6; }
     // `weak` on a declaration with no definition. Every spelling and position,
     // since only the trailing-attribute-on-a-function-declarator one was
     // broken.
+    #[cfg(target_os = "linux")]
     let declared = r#"
 extern int missing_a(void) __attribute__((weak));
 __attribute__((weak)) extern int missing_b(void);
@@ -814,17 +670,8 @@ int main(void) {
 }
 "#;
 
-    // What c17 emits is c17's business, and is checked on every target: ELF
-    // spells both sides `.weak`, Mach-O has `.weak_reference` for this one and
-    // rejects `.weak` as an unknown directive.
-    let asm = host_asm("c17_weak_decl_", declared);
-    for sym in ["missing_a", "missing_b", "missing_c", "missing_var"] {
-        assert!(
-            asm.contains(&format!(".weak {sym}"))
-                || asm.contains(&format!(".weak_reference _{sym}")),
-            "no weak directive for {sym}:\n{asm}"
-        );
-    }
+    // What c17 emits for `declared` is checked in process, on every target:
+    // `test_asm::codegen_asm_attributes::codegen_symbol_attributes_weak_declaration_directives`.
 
     // Whether an unresolved weak symbol *links* is the platform linker's
     // policy rather than the compiler's, so the running half is checked where
@@ -833,120 +680,6 @@ int main(void) {
     assert_eq!(
         compile_and_run("codegen_symbol_attrs_weak_declaration", declared, &[]),
         0
-    );
-}
-
-/// A zero-initialized definition took the `.comm`/`.bss` fast path, which
-/// returns before the `.weak` and visibility directives are emitted. A common
-/// symbol carries neither, so both were silently lost -- a hidden variable
-/// escaping as default visibility is an ABI change, not a cosmetic one.
-#[test]
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn codegen_zero_init_keeps_weak_and_visibility() {
-    let asm = host_asm(
-        "c17_zeroinit_attrs_",
-        r#"
-__attribute__((visibility("hidden"))) int hidden_zero;
-__attribute__((weak)) int weak_zero;
-__attribute__((visibility("hidden"))) int hidden_init = 7;
-int plain_zero;
-int main(void) { return hidden_zero + weak_zero + hidden_init - 7 + plain_zero; }
-"#,
-    );
-    assert!(
-        asm.contains(".hidden hidden_zero"),
-        "zero-initialized hidden variable lost its visibility:\n{asm}"
-    );
-    assert!(
-        asm.contains(".weak weak_zero"),
-        "zero-initialized weak variable lost its weakness:\n{asm}"
-    );
-    assert!(
-        asm.contains(".hidden hidden_init"),
-        "initialized hidden variable lost its visibility:\n{asm}"
-    );
-    // The unattributed one still gets the fast path it was always entitled
-    // to -- but as a *definition*. A common symbol merges with another
-    // translation unit's definition of the same object, which C17 6.9p5 does
-    // not allow and gcc reports.
-    assert_eq!(
-        crate::codegen::asm_probe::section_of(&asm, "plain_zero"),
-        Some(".bss"),
-        "an unattributed zero-initialized global still belongs in .bss:\n{asm}"
-    );
-    assert!(
-        !asm.contains(".comm plain_zero"),
-        "it must not be a common symbol:\n{asm}"
-    );
-}
-
-/// An attribute belongs to the declarator it follows, and a declaration may
-/// hold several. At file scope the continuation loop went straight from
-/// `parse_declarator` to symbol binding with no attribute parse at all, so
-/// `int a, b __attribute__((section(".s")));` was not a misplaced attribute
-/// but a syntax error. The same declaration inside a function was accepted,
-/// because the block-scope loop parses attributes after every declarator.
-///
-/// The distinction the test pins is per-declarator: `weak`, `section`,
-/// `visibility` and `used` name one symbol, so an attribute written on `b`
-/// must not reach `a`.
-#[test]
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn codegen_attribute_binds_to_its_own_file_scope_declarator() {
-    let asm = host_asm(
-        "attr_later_declarator",
-        r#"
-int plain_a = 1, sect_b __attribute__((section(".mysec"))) = 2;
-int plain_c = 3, weak_d __attribute__((weak)) = 4;
-int plain_e = 5, hidden_f __attribute__((visibility("hidden"))) = 6;
-int plain_g = 7, aligned_h __attribute__((aligned(64))) = 8;
-"#,
-    );
-
-    // The attributed symbol got its attribute...
-    assert!(
-        asm.contains(".mysec"),
-        "sect_b should land in .mysec:\n{asm}"
-    );
-    assert!(
-        asm.contains(".weak weak_d") || asm.contains(".weak\tweak_d"),
-        "weak_d should be weak:\n{asm}"
-    );
-    assert!(
-        asm.contains(".hidden hidden_f") || asm.contains(".hidden\thidden_f"),
-        "hidden_f should be hidden:\n{asm}"
-    );
-
-    // ...and its neighbours in the same declaration did not.
-    for leaked in ["plain_a", "plain_c", "plain_e", "plain_g"] {
-        assert!(
-            !asm.contains(&format!(".weak {leaked}")),
-            "{leaked} must not be weak:\n{asm}"
-        );
-        assert!(
-            !asm.contains(&format!(".hidden {leaked}")),
-            "{leaked} must not be hidden:\n{asm}"
-        );
-    }
-
-    // A section directive names exactly one symbol: the one that asked.
-    let mysec_line = asm
-        .lines()
-        .position(|l| l.contains(".mysec"))
-        .expect("a .mysec directive");
-    let after: String = asm
-        .lines()
-        .skip(mysec_line)
-        .take(6)
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        after.contains("sect_b"),
-        ".mysec should be followed by sect_b:\n{after}"
-    );
-    assert!(
-        !after.contains("plain_a"),
-        "plain_a must not share sect_b's section:\n{after}"
     );
 }
 
@@ -1115,26 +848,6 @@ int main(void) {
     assert_eq!(
         crate::common::compile_and_run_optimized("frame_base_vs_asm_a64_opt", code),
         0
-    );
-}
-
-/// A name that appears only inside an assembly template still refers to the
-/// function: it reaches the assembler with no IR reference for the prune to
-/// find.
-#[test]
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn codegen_asm_template_reference_keeps_a_static_alive() {
-    let asm = crate::common::asm_for_at(
-        "c17_asm_names_static_",
-        r#"
-static int helper(void) { return 7; }
-int main(void) { __asm__ volatile ("call helper" ::: "memory"); return 0; }
-"#,
-        &["-O2"],
-    );
-    assert!(
-        asm.contains("\nhelper:"),
-        "a static named only in an asm template must survive:\n{asm}"
     );
 }
 
@@ -1316,57 +1029,6 @@ int main(void)
             0,
             "alias across units at {opt:?}"
         );
-    }
-}
-
-/// The directives an alias is made of, as gcc writes them on ELF: `.set` for
-/// the value, `.globl` or `.weak` for its binding and nothing for a static
-/// one, visibility on the alias itself, and no `.type`/`.size`, which the
-/// assembler copies from the target.
-#[test]
-fn codegen_alias_attribute_asm() {
-    let src = r#"
-int f(void) { return 1; }
-int g(void) __attribute__((alias("f")));
-int w(void) __attribute__((weak, alias("f")));
-int h(void) __attribute__((alias("f"), visibility("hidden")));
-static int s = 5;
-static int u __attribute__((alias("s")));
-int *use(void) { return &u; }
-"#;
-    for triple in [X86_64_LINUX, AARCH64_LINUX] {
-        let asm = asm_for_with("alias_asm", triple, src, &[]);
-        let lines: Vec<&str> = asm.lines().map(str::trim).collect();
-        for want in [
-            ".globl g",
-            ".set g, f",
-            ".weak w",
-            ".set w, f",
-            ".globl h",
-            ".hidden h",
-            ".set h, f",
-            ".set u, s",
-        ] {
-            assert!(lines.contains(&want), "{triple}: missing {want:?}:\n{asm}");
-        }
-        // A directive naming the symbol, however its operands continue.
-        let names = |directive: &str, sym: &str| {
-            lines.iter().any(|l| {
-                let mut words = l.split([' ', '\t', ',']).filter(|w| !w.is_empty());
-                words.next() == Some(directive) && words.next() == Some(sym)
-            })
-        };
-        for (directive, sym) in [
-            (".globl", "u"),
-            (".globl", "w"),
-            (".type", "g"),
-            (".size", "g"),
-        ] {
-            assert!(
-                !names(directive, sym),
-                "{triple}: unexpected {directive} {sym}:\n{asm}"
-            );
-        }
     }
 }
 

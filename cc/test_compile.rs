@@ -46,6 +46,11 @@ struct Options {
     optimization: Optimization,
     debug: bool,
     pic: bool,
+    pie: bool,
+    no_pie: bool,
+    shared: bool,
+    no_unwind_tables: bool,
+    verbose_asm: bool,
     math_errno: bool,
     trapping_math: bool,
     defines: Vec<String>,
@@ -55,6 +60,7 @@ struct Options {
     /// `-finline` / `-fno-inline`, last one winning, applied to whatever
     /// level the `-O` options leave, as the driver does.
     inlining: Option<bool>,
+    mflags: Vec<String>,
 }
 
 /// Apply `flags` the way the driver does: the switches that live in
@@ -77,6 +83,11 @@ fn apply_flags(flags: &[&str]) -> Options {
             "-g" => o.debug = true,
             "-O" => o.optimization = Optimization::from_flag("1").unwrap(),
             "-fPIC" | "-fpic" => o.pic = true,
+            "-fPIE" | "-fpie" => o.pie = true,
+            "-fno-pie" => o.no_pie = true,
+            "-shared" | "--shared" | "-G" => o.shared = true,
+            "--fno-unwind-tables" => o.no_unwind_tables = true,
+            "-fverbose-asm" => o.verbose_asm = true,
             "-fno-math-errno" => o.math_errno = false,
             "-fno-trapping-math" => o.trapping_math = false,
             "-fno-inline" => o.inlining = Some(false),
@@ -96,6 +107,8 @@ fn apply_flags(flags: &[&str]) -> Options {
                     o.include_paths.push(i.to_string());
                 } else if let Some(t) = flag.strip_prefix("--target=") {
                     o.target = Some(t.to_string());
+                } else if flag.starts_with("-m") && flag.len() > 2 {
+                    o.mflags.push(flag.to_string());
                 } else {
                     panic!("test_compile: unsupported option {flag}");
                 }
@@ -118,14 +131,19 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
 
     let source_name = format!("{name}.c");
     let o = apply_flags(flags);
-    let target = match &o.target {
+    let mut target = match &o.target {
         Some(triple) => Target::from_triple(triple).expect("unsupported target"),
         None => Target::host(),
     };
-    // As the driver: PIE is the Linux default, and implies PIC.
-    let pie = target.os == target::Os::Linux;
+    // As the driver: the `-m` ISA options select x86-64's instructions.
+    if target.arch == target::Arch::X86_64 {
+        target.x86_isa = target::X86Isa::from_flags(&o.mflags);
+    }
+    // As the driver's `position_independence`: PIE is the Linux default
+    // unless a shared object or `-fno-pie` asks otherwise, and implies PIC.
+    let pie = !(o.shared || o.no_pie) && (o.pie || target.os == target::Os::Linux);
     let position = target::PositionIndependence {
-        pic: o.pic || pie,
+        pic: o.pic || o.shared || pie,
         pie,
     };
 
@@ -151,7 +169,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
             collect_dependencies: false,
             optimization: o.optimization,
             position,
-            isa: target::X86Isa::from_flags(&[]),
+            isa: target::X86Isa::from_flags(&o.mflags),
         },
     );
 
@@ -161,10 +179,10 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         debug: o.debug,
         trapping_math: o.trapping_math,
         default_visibility: None,
-        shared_mode: o.pic,
+        shared_mode: o.shared || o.pic,
         pic: position.pic,
-        unwind_tables: true,
-        verbose_asm: false,
+        unwind_tables: !o.no_unwind_tables,
+        verbose_asm: o.verbose_asm,
         source_name: &source_name,
     };
     let result = pipeline::compile_tokens(preprocessed, &strings, &target, &opts, &mut Quiet);

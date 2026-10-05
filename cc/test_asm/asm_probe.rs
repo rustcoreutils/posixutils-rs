@@ -6,19 +6,24 @@
 // file in the root directory of this project.
 // SPDX-License-Identifier: MIT
 //
-// The integration suite's `tests/codegen/asm_probe.rs` helpers, compiling in
-// process through `test_compile` instead of spawning `c17 -S`. The names and
-// signatures are the same, so a case moves between the two unchanged.
+// The in-process twin of `tests/codegen/asm_probe.rs`: the same helpers, by
+// the same names and signatures, compiling through `test_compile` instead of
+// spawning `c17 -S`, so an assembly-inspecting case moves here unchanged.
+//
+// Everything takes an explicit target triple, so an x86_64 host asserts
+// aarch64 codegen and vice versa.
 //
 
-use crate::test_compile;
+use crate::test_compile::{self, compile};
 
 pub const X86_64_LINUX: &str = "x86_64-unknown-linux-gnu";
 pub const AARCH64_LINUX: &str = "aarch64-unknown-linux-gnu";
 pub const AARCH64_DARWIN: &str = "aarch64-apple-darwin";
 
-/// Emit assembly for `src` at `triple` and return it, at `-O` as the
-/// integration helper does.
+/// Emit assembly for `src` at `triple` and return it.
+///
+/// Compiles at `-O` because several of the defects these tests cover exist
+/// only once the optimizer runs.
 #[track_caller]
 pub fn asm_for(name: &str, triple: &str, src: &str) -> String {
     asm_for_with(name, triple, src, &["-O"])
@@ -30,12 +35,16 @@ pub fn asm_for_with(name: &str, triple: &str, src: &str, extra: &[&str]) -> Stri
     let target = format!("--target={triple}");
     let mut flags = vec![target.as_str()];
     flags.extend_from_slice(extra);
-    test_compile::asm_for(name, src, &flags)
+    let c = compile(name, src, &flags);
+    match c.asm {
+        Some(asm) => asm,
+        None => panic!("c17 --target {triple} failed for {name}:\n{}", c.stderr),
+    }
 }
 
-/// The integration suite's `common::asm_for_at`: the host's assembly at
-/// `-O0` unless `extra` says otherwise. A `--target TRIPLE` pair is accepted
-/// in the driver's spelling.
+/// The host's assembly for `src` with `extra` options; `-O0` unless they
+/// name a level, as `c17 -S` would. A `--target TRIPLE` pair is accepted as
+/// the integration helper spells it.
 #[track_caller]
 pub fn asm_for_at(prefix: &str, src: &str, extra: &[&str]) -> String {
     let mut flags: Vec<String> = Vec::new();
@@ -50,6 +59,13 @@ pub fn asm_for_at(prefix: &str, src: &str, extra: &[&str]) -> String {
     }
     let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
     test_compile::asm_for(prefix, src, &flags)
+}
+
+/// The host's assembly for `src` at `-O0`, for tests that need to see the
+/// directives rather than the program's answer.
+#[track_caller]
+pub fn host_asm(prefix: &str, src: &str) -> String {
+    asm_for_at(prefix, src, &[])
 }
 
 /// The body of function `name`, from its label to `.cfi_endproc`.
@@ -69,6 +85,7 @@ pub fn body_of<'a>(asm: &'a str, name: &str) -> &'a str {
 }
 
 /// Assert that function `func` contains `needle`.
+#[track_caller]
 pub fn assert_body_contains(asm: &str, func: &str, needle: &str, why: &str) {
     let body = body_of(asm, func);
     assert!(
@@ -78,6 +95,10 @@ pub fn assert_body_contains(asm: &str, func: &str, needle: &str, why: &str) {
 }
 
 /// Assert that function `func` does *not* contain `needle`.
+///
+/// Negative assertions keep the positive ones honest: a test that only checks
+/// for `lock` cannot tell whether the compiler emits it everywhere.
+#[track_caller]
 pub fn assert_body_lacks(asm: &str, func: &str, needle: &str, why: &str) {
     let body = body_of(asm, func);
     assert!(
@@ -89,6 +110,33 @@ pub fn assert_body_lacks(asm: &str, func: &str, needle: &str, why: &str) {
 /// How many times `needle` appears in function `func`.
 pub fn count_in_body(asm: &str, func: &str, needle: &str) -> usize {
     body_of(asm, func).matches(needle).count()
+}
+
+/// The section directive in force where `name:` is defined. Only the ELF
+/// section tests use it, and they run on an x86-64 Linux host.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub fn section_of<'a>(asm: &'a str, name: &str) -> Option<&'a str> {
+    let label = format!("{name}:");
+    let mut current = None;
+    for line in asm.lines() {
+        let t = line.trim();
+        if t == ".bss" || t == ".data" || t == ".text" || t.starts_with(".section ") {
+            current = Some(t);
+        } else if t == label {
+            return current;
+        }
+    }
+    None
+}
+
+/// `name` as the assembler spells it on this host. Only for a test that
+/// compiles for the *host*.
+pub fn asm_symbol(name: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("_{name}")
+    } else {
+        name.to_string()
+    }
 }
 
 /// Bytes of stack frame function `func` reserves in its prologue: the x86-64

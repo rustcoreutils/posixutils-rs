@@ -15,7 +15,6 @@
 // gcc on x86-64 and aarch64.
 //
 
-use crate::codegen::asm_probe::{asm_for, X86_64_LINUX};
 use crate::common::compile_and_run_everywhere;
 
 /// A vector type of the matrix: its name, lane type, lane count, and the
@@ -125,40 +124,74 @@ fn check(
     ));
 }
 
-/// The program checking `shapes` with `ops`, each a (vector expression,
-/// lane expression, result type) for a shape -- the result type `V` the
-/// shape's own and `M` its mask's.
-fn program(shapes: &[Shape], ops: &[(&str, &str, &str, &str)]) -> String {
-    let mut out = String::from(PRELUDE);
-    let mut ids = Vec::new();
+/// A program under construction: its text, the description of each check
+/// function `t<id>` so far, and the vector types already declared.
+struct Program {
+    out: String,
+    checks: Vec<String>,
+    declared: Vec<String>,
+}
+
+impl Program {
+    fn new() -> Self {
+        Program {
+            out: String::from(PRELUDE),
+            checks: Vec::new(),
+            declared: Vec::new(),
+        }
+    }
+
+    /// Declare vector type `vec` of `lane`s in `bytes`, once.
+    fn typedef(&mut self, lane: &str, vec: &str, bytes: usize) {
+        if !self.declared.iter().any(|d| d == vec) {
+            self.out.push_str(&format!(
+                "typedef {lane} {vec} __attribute__((vector_size({bytes})));\n"
+            ));
+            self.declared.push(vec.to_string());
+        }
+    }
+
+    /// `main`, running every check and naming the first that fails.
+    fn finish(mut self) -> String {
+        self.out.push_str("int main(void) {\n    int r;\n");
+        for (id, what) in self.checks.iter().enumerate() {
+            let what = what.replace('"', "'");
+            self.out.push_str(&format!(
+                "    if ((r = t{id}())) {{ __builtin_printf(\"%s: %d\\n\", \"{what}\", r); return 1; }}\n"
+            ));
+        }
+        self.out.push_str("    return 0;\n}\n");
+        self.out
+    }
+}
+
+/// The checks of `shapes` with `ops`, each a (vector expression, lane
+/// expression, result type) for a shape -- the result type `V` the shape's
+/// own and `M` its mask's.
+fn matrix(p: &mut Program, shapes: &[Shape], ops: &[(&str, &str, &str, &str)]) {
     for s in shapes {
         let bytes = s.count * lane_bytes(s.lane);
-        out.push_str(&format!(
-            "typedef {} {} __attribute__((vector_size({bytes})));\n",
-            s.lane, s.vec
-        ));
+        p.typedef(s.lane, s.vec, bytes);
         let mask = format!("{}_mask", s.vec);
-        out.push_str(&format!(
-            "typedef {} {mask} __attribute__((vector_size({bytes})));\n",
-            s.mask
-        ));
+        p.typedef(s.mask, &mask, bytes);
         for &(expr, want, result, fix) in ops {
             let rtype = if result == "M" { mask.as_str() } else { s.vec };
             let want = want.replace('T', s.lane).replace('M', s.mask);
-            let id = ids.len();
-            check(&mut out, id, s, (expr, &want, rtype), fix);
-            ids.push(format!("{} {expr}", s.vec));
+            let id = p.checks.len();
+            check(&mut p.out, id, s, (expr, &want, rtype), fix);
+            p.checks.push(format!("{} {expr}", s.vec));
         }
     }
-    out.push_str("int main(void) {\n    int r;\n");
-    for (id, what) in ids.iter().enumerate() {
-        let what = what.replace('"', "'");
-        out.push_str(&format!(
-            "    if ((r = t{id}())) {{ __builtin_printf(\"%s: %d\\n\", \"{what}\", r); return 1; }}\n"
-        ));
-    }
-    out.push_str("    return 0;\n}\n");
-    out
+}
+
+/// One program holding every lane check in this file: the integer and
+/// floating operator matrices, and every shuffle and conversion.
+fn native_program() -> String {
+    let mut p = Program::new();
+    matrix(&mut p, INT_SHAPES, INT_OPS);
+    matrix(&mut p, FLOAT_SHAPES, FLOAT_OPS);
+    shuffles_and_conversions(&mut p);
+    p.finish()
 }
 
 fn lane_bytes(lane: &str) -> usize {
@@ -219,183 +252,15 @@ const FLOAT_OPS: &[(&str, &str, &str, &str)] = &[
     ("a >= b", "(M)(a[i] >= b[i] ? -1 : 0)", "M", ""),
 ];
 
+/// Every lane check -- integer and floating operators, shuffles and
+/// conversions -- in one program, run everywhere.
+///
+/// Consolidates: vector_native_integer_lanes_match_scalars,
+/// vector_native_floating_lanes_match_scalars,
+/// vector_native_shuffles_and_conversions_match_scalars.
 #[test]
-fn vector_native_integer_lanes_match_scalars() {
-    compile_and_run_everywhere("vec_native_int", &program(INT_SHAPES, INT_OPS));
-}
-
-#[test]
-fn vector_native_floating_lanes_match_scalars() {
-    compile_and_run_everywhere("vec_native_float", &program(FLOAT_SHAPES, FLOAT_OPS));
-}
-
-/// On x86-64 the operations SSE2 has are one packed instruction each, with
-/// no lane loop left: the integer ones at every lane width, and the
-/// floating ones on sixteen-byte vectors.
-#[test]
-fn vector_native_x86_64_uses_packed_instructions() {
-    let src = r#"
-typedef signed char v16qi __attribute__((vector_size(16)));
-typedef short v8hi __attribute__((vector_size(16)));
-typedef int v4si __attribute__((vector_size(16)));
-typedef long long v2di __attribute__((vector_size(16)));
-typedef int v2si __attribute__((vector_size(8)));
-typedef float v4sf __attribute__((vector_size(16)));
-typedef double v2df __attribute__((vector_size(16)));
-void addb(v16qi *d, v16qi *a, v16qi *b) { *d = *a + *b; }
-void subw(v8hi *d, v8hi *a, v8hi *b) { *d = *a - *b; }
-void addd(v4si *d, v4si *a, v4si *b) { *d = *a + *b; }
-void subq(v2di *d, v2di *a, v2di *b) { *d = *a - *b; }
-void add8(v2si *d, v2si *a, v2si *b) { *d = *a + *b; }
-void bits(v4si *d, v4si *a, v4si *b) { *d = (*a & *b) | (*a ^ ~*b); }
-void negd(v4si *d, v4si *a) { *d = -*a; }
-void fops(v4sf *d, v4sf *a, v4sf *b) { *d = -((*a + *b) * (*a - *b) / *b); }
-void dops(v2df *d, v2df *a, v2df *b) { *d = -((*a + *b) * (*a - *b) / *b); }
-"#;
-    let asm = asm_for("vec_native_x86", X86_64_LINUX, src);
-    for (f, want) in [
-        ("addb", &["paddb"][..]),
-        ("subw", &["psubw"]),
-        ("addd", &["paddd"]),
-        ("subq", &["psubq"]),
-        ("add8", &["paddd"]),
-        ("bits", &["pand", "por", "pxor", "pcmpeqd"]),
-        ("negd", &["psubd"]),
-        ("fops", &["addps", "subps", "mulps", "divps", "xorps"]),
-        ("dops", &["addpd", "subpd", "mulpd", "divpd", "xorpd"]),
-    ] {
-        let body = crate::codegen::asm_probe::body_of(&asm, f);
-        for m in want {
-            assert!(body.contains(m), "{f}: no {m}:\n{body}");
-        }
-        // No lane is computed one at a time.
-        let lane_ops = [
-            "addl", "subl", "addb", "addw", "subb", "subw", "negl", "addss", "addsd",
-        ];
-        for line in body.lines() {
-            let first = line.split_whitespace().next().unwrap_or("");
-            assert!(
-                !lane_ops.contains(&first),
-                "{f}: lane loop ({line}):\n{body}"
-            );
-        }
-    }
-}
-
-/// On aarch64 every listed operation is one NEON instruction, at both
-/// widths -- the D-register forms for eight bytes, and the scalar `d` form
-/// for a single 64-bit lane -- with the standard syntax both Linux and
-/// Apple's assembler take.
-#[test]
-fn vector_native_aarch64_uses_neon_instructions() {
-    let src = r#"
-typedef signed char v16qi __attribute__((vector_size(16)));
-typedef short v4hi __attribute__((vector_size(8)));
-typedef int v4si __attribute__((vector_size(16)));
-typedef long long v1di __attribute__((vector_size(8)));
-typedef float v2sf __attribute__((vector_size(8)));
-typedef double v2df __attribute__((vector_size(16)));
-void addb(v16qi *d, v16qi *a, v16qi *b) { *d = *a + *b; }
-void subh(v4hi *d, v4hi *a, v4hi *b) { *d = *a - *b; }
-void bits(v4si *d, v4si *a, v4si *b) { *d = (*a & *b) | (*a ^ ~*b); }
-void neg1(v1di *d, v1di *a) { *d = -*a; }
-void fops(v2sf *d, v2sf *a, v2sf *b) { *d = -((*a + *b) * (*a - *b) / *b); }
-void dops(v2df *d, v2df *a, v2df *b) { *d = *a * *b; }
-"#;
-    for triple in [
-        crate::codegen::asm_probe::AARCH64_LINUX,
-        crate::codegen::asm_probe::AARCH64_DARWIN,
-    ] {
-        let asm = asm_for("vec_native_a64", triple, src);
-        for (f, want) in [
-            ("addb", &["add v", ".16b"][..]),
-            ("subh", &["sub v", ".4h"]),
-            ("bits", &["and v", "orr v", "eor v", "not v"]),
-            ("neg1", &["neg d"]),
-            (
-                "fops",
-                &["fadd v", "fsub v", "fmul v", "fdiv v", "fneg v", ".2s"],
-            ),
-            ("dops", &["fmul v", ".2d"]),
-        ] {
-            let body = crate::codegen::asm_probe::body_of(&asm, f);
-            for m in want {
-                assert!(body.contains(m), "{triple} {f}: no {m}:\n{body}");
-            }
-        }
-    }
-}
-
-/// Scalar operands, shifts and multiplies: SSE2 spreads a scalar with a
-/// shuffle, shifts every lane by one count (an immediate, or a count in an
-/// XMM register) and multiplies words; NEON spreads with `dup`, shifts by
-/// per-lane counts (right as a left shift by negated counts) and multiplies
-/// up to 32-bit lanes.
-#[test]
-fn vector_native_splat_shift_and_multiply() {
-    let src = r#"
-typedef short v8hi __attribute__((vector_size(16)));
-typedef int v4si __attribute__((vector_size(16)));
-typedef unsigned v4su __attribute__((vector_size(16)));
-typedef float v4sf __attribute__((vector_size(16)));
-void mulw(v8hi *d, v8hi *a, v8hi *b) { *d = *a * *b; }
-void shifts(v4si *d, v4si *a, int s) { *d = (*a << s) + (*a >> 3); }
-void lsr(v4su *d, v4su *a, unsigned s) { *d = *a >> s; }
-void splat(v4sf *d, v4sf *a, float s) { *d = *a * s; }
-void splati(v4si *d, v4si *a, int s) { *d = *a + s; }
-"#;
-    let x86 = asm_for("vec_native_x86_ext", X86_64_LINUX, src);
-    let a64 = asm_for(
-        "vec_native_a64_ext",
-        crate::codegen::asm_probe::AARCH64_LINUX,
-        src,
-    );
-    for (asm, f, want) in [
-        (&x86, "mulw", &["pmullw"][..]),
-        (&x86, "shifts", &["pslld", "psrad $3", "paddd"]),
-        (&x86, "lsr", &["psrld"]),
-        (&x86, "splat", &["shufps $0", "mulps"]),
-        (&x86, "splati", &["pshufd $0", "paddd"]),
-        (&a64, "mulw", &["mul v", ".8h"]),
-        (&a64, "shifts", &["dup v", "ushl v", "neg v", "sshl v"]),
-        (&a64, "lsr", &["neg v", "ushl v"]),
-        (&a64, "splat", &["dup v", ".s[0]", "fmul v"]),
-        (&a64, "splati", &["dup v", "add v"]),
-    ] {
-        let body = crate::codegen::asm_probe::body_of(asm, f);
-        for m in want {
-            assert!(body.contains(m), "{f}: no {m}:\n{body}");
-        }
-    }
-}
-
-/// Comparisons give their masks with packed compares: SSE2's `pcmpeq` and
-/// signed `pcmpgt` (with an inverse for `!=` and `>=`) and `cmpps` with C's
-/// predicates; NEON's `cmeq`/`cmgt`/`cmge`/`cmhi` and floating forms.
-#[test]
-fn vector_native_comparisons() {
-    let src = r#"
-typedef int v4si __attribute__((vector_size(16)));
-typedef unsigned v4su __attribute__((vector_size(16)));
-typedef float v4sf __attribute__((vector_size(16)));
-void ints(v4si *d, v4si *a, v4si *b) { *d = (*a < *b) | (*a >= *b) | (*a != *b); }
-void uns(v4si *d, v4su *a, v4su *b) { *d = *a > *b; }
-void flts(v4si *d, v4sf *a, v4sf *b) { *d = (*a > *b) | (*a != *b) | (*a <= *b); }
-"#;
-    let x86 = asm_for("vec_cmp_x86", X86_64_LINUX, src);
-    let a64 = asm_for("vec_cmp_a64", crate::codegen::asm_probe::AARCH64_LINUX, src);
-    for (asm, f, want) in [
-        (&x86, "ints", &["pcmpgtd", "pcmpeqd", "pxor"][..]),
-        (&x86, "flts", &["cmpltps", "cmpneqps", "cmpleps"]),
-        (&a64, "ints", &["cmgt v", "cmge v", "cmeq v", "not v"]),
-        (&a64, "uns", &["cmhi v"]),
-        (&a64, "flts", &["fcmgt v", "fcmeq v", "fcmge v"]),
-    ] {
-        let body = crate::codegen::asm_probe::body_of(asm, f);
-        for m in want {
-            assert!(body.contains(m), "{f}: no {m}:\n{body}");
-        }
-    }
+fn vector_native_lanes_match_scalars() {
+    compile_and_run_everywhere("vec_native", &native_program());
 }
 
 /// `__builtin_shufflevector` patterns over `n` lanes: each result lane an
@@ -424,11 +289,10 @@ fn shuffle_patterns(n: usize) -> Vec<Vec<i32>> {
     pats
 }
 
-/// The program checking every shuffle pattern on every shape, and every
+/// The checks of every shuffle pattern on every shape, and every
 /// same-width conversion between integer and floating lanes, against
 /// scalar lanes.
-fn shuffle_convert_program() -> String {
-    let mut out = String::from(PRELUDE);
+fn shuffles_and_conversions(p: &mut Program) {
     let shapes: &[(&str, &str, usize, bool)] = &[
         ("v4si", "int", 4, false),
         ("v4sf", "float", 4, true),
@@ -441,22 +305,19 @@ fn shuffle_convert_program() -> String {
         ("v4hi", "short", 4, false),
         ("v2sf", "float", 2, true),
     ];
-    let mut checks = Vec::new();
     for &(vec, lane, n, float) in shapes {
         let bytes = n * lane_bytes(lane);
-        out.push_str(&format!(
-            "typedef {lane} {vec} __attribute__((vector_size({bytes})));\n"
-        ));
+        p.typedef(lane, vec, bytes);
         let (src, nv) = if float {
             ("fval", "NF")
         } else {
             ("ival", "NI")
         };
         for pat in shuffle_patterns(n) {
-            let id = checks.len();
+            let id = p.checks.len();
             let list: Vec<String> = pat.iter().map(|i| i.to_string()).collect();
             let idx: Vec<String> = pat.iter().map(|i| i.to_string()).collect();
-            out.push_str(&format!(
+            p.out.push_str(&format!(
                 "static int t{id}(void) {{\n\
                  \x20   static const int idx[] = {{{}}};\n\
                  \x20   for (int k = 0; k < {nv}; k++) {{\n\
@@ -477,7 +338,7 @@ fn shuffle_convert_program() -> String {
                 idx.join(", "),
                 list.join(", ")
             ));
-            checks.push(format!("shuffle {vec} {}", list.join(" ")));
+            p.checks.push(format!("shuffle {vec} {}", list.join(" ")));
         }
     }
     // Conversions: values each conversion defines -- in range, and not
@@ -494,24 +355,17 @@ fn shuffle_convert_program() -> String {
         ("v2si", "int", "v2sf", "float", 2, "ival"),
         ("v2sf", "float", "v2si", "int", 2, "sval"),
     ];
-    out.push_str(
+    p.out.push_str(
         "static volatile double sval[] = {0.0, -0.0, 1.5, -2.5, 1e6, -7.75, 123456.7, -2e9, 0.99};\n\
          static volatile double uval[] = {0.0, 1.5, 1e6, 7.75, 123456.7, 3.9e9, 0.99, 2.5};\n",
     );
-    let mut declared: Vec<&str> = shapes.iter().map(|s| s.0).collect();
     for &(from, from_lane, to, to_lane, n, vals) in conversions {
         for (v, lane) in [(from, from_lane), (to, to_lane)] {
-            if !declared.contains(&v) {
-                let bytes = n * lane_bytes(lane);
-                out.push_str(&format!(
-                    "typedef {lane} {v} __attribute__((vector_size({bytes})));\n"
-                ));
-                declared.push(v);
-            }
+            p.typedef(lane, v, n * lane_bytes(lane));
         }
-        let id = checks.len();
+        let id = p.checks.len();
         let count = format!("(int)(sizeof {vals} / sizeof {vals}[0])");
-        out.push_str(&format!(
+        p.out.push_str(&format!(
             "static int t{id}(void) {{\n\
              \x20   for (int k = 0; k < {count}; k++) {{\n\
              \x20       {from} a;\n\
@@ -525,59 +379,7 @@ fn shuffle_convert_program() -> String {
              \x20   return 0;\n\
              }}\n"
         ));
-        checks.push(format!("convert {from} to {to}"));
-    }
-    out.push_str("int main(void) {\n    int r;\n");
-    for (id, what) in checks.iter().enumerate() {
-        out.push_str(&format!(
-            "    if ((r = t{id}())) {{ __builtin_printf(\"%s: %d\\n\", \"{what}\", r); return 1; }}\n"
-        ));
-    }
-    out.push_str("    return 0;\n}\n");
-    out
-}
-
-#[test]
-fn vector_native_shuffles_and_conversions_match_scalars() {
-    compile_and_run_everywhere("vec_native_shuffle", &shuffle_convert_program());
-}
-
-/// Constant shuffles and conversions: SSE2's pshufd, shufps and shufpd and
-/// cvtdq2ps/cvttps2dq; NEON's `tbl` -- one table register or a pair -- and
-/// scvtf/ucvtf/fcvtzs/fcvtzu.
-#[test]
-fn vector_native_shuffle_and_convert_instructions() {
-    let src = r#"
-typedef int v4si __attribute__((vector_size(16)));
-typedef unsigned v4su __attribute__((vector_size(16)));
-typedef float v4sf __attribute__((vector_size(16)));
-typedef double v2df __attribute__((vector_size(16)));
-void rev(v4si *d, v4si *a) { *d = __builtin_shufflevector(*a, *a, 3, 2, 1, 0); }
-void mix(v4sf *d, v4sf *a, v4sf *b) { *d = __builtin_shufflevector(*a, *b, 1, 0, 6, 7); }
-void pd(v2df *d, v2df *a, v2df *b) { *d = __builtin_shufflevector(*a, *b, 3, 0); }
-void cvt(v4si *d, v4sf *a) { *d = __builtin_convertvector(*a, v4si); }
-void ucvt(v4sf *d, v4su *a) { *d = __builtin_convertvector(*a, v4sf); }
-"#;
-    let x86 = asm_for("vec_shuf_x86", X86_64_LINUX, src);
-    let a64 = asm_for(
-        "vec_shuf_a64",
-        crate::codegen::asm_probe::AARCH64_LINUX,
-        src,
-    );
-    for (asm, f, want) in [
-        (&x86, "rev", &["pshufd $27"][..]),
-        (&x86, "mix", &["shufps $225"]),
-        (&x86, "pd", &["shufpd $1"]),
-        (&x86, "cvt", &["cvttps2dq"]),
-        (&a64, "rev", &["tbl v", "{v17.16b}"]),
-        (&a64, "mix", &["tbl v", "{v17.16b, v18.16b}"]),
-        (&a64, "cvt", &["fcvtzs v", ".4s"]),
-        (&a64, "ucvt", &["ucvtf v", ".4s"]),
-    ] {
-        let body = crate::codegen::asm_probe::body_of(asm, f);
-        for m in want {
-            assert!(body.contains(m), "{f}: no {m}:\n{body}");
-        }
+        p.checks.push(format!("convert {from} to {to}"));
     }
 }
 
@@ -591,66 +393,18 @@ fn vector_native_matrices_at_sse4() {
         eprintln!("vector_native_matrices_at_sse4: the host has no SSE4.2 to run it");
         return;
     }
+    // One program: the integer matrix and the shuffles and conversions
+    // this ran as two, with the floating matrix besides.
+    let src = native_program();
+    let name = "vec_native_sse4";
     for flag in ["-mssse3", "-msse4.2"] {
-        for (name, src) in [
-            ("vec_native_int_sse4", program(INT_SHAPES, INT_OPS)),
-            ("vec_native_shuffle_sse4", shuffle_convert_program()),
-        ] {
-            for opt in ["-O0", "-O2"] {
-                let args = [flag.to_string(), opt.to_string()];
-                assert_eq!(
-                    crate::common::compile_and_run(name, &src, &args),
-                    0,
-                    "{name} {flag} {opt}"
-                );
-            }
+        for opt in ["-O0", "-O2"] {
+            let args = [flag.to_string(), opt.to_string()];
+            assert_eq!(
+                crate::common::compile_and_run(name, &src, &args),
+                0,
+                "{name} {flag} {opt}"
+            );
         }
     }
-}
-
-/// What each `-m` level adds to the packed instructions x86-64 uses.
-#[test]
-fn vector_native_x86_64_isa_levels() {
-    let src = r#"
-typedef int v4si __attribute__((vector_size(16)));
-typedef long long v2di __attribute__((vector_size(16)));
-typedef unsigned v4su __attribute__((vector_size(16)));
-typedef unsigned char v16qu __attribute__((vector_size(16)));
-typedef short v8hi __attribute__((vector_size(16)));
-void mul(v4si *d, v4si *a, v4si *b) { *d = *a * *b; }
-void eqq(v2di *d, v2di *a, v2di *b) { *d = *a == *b; }
-void gtq(v2di *d, v2di *a, v2di *b) { *d = *a > *b; }
-void geu(v4si *d, v4su *a, v4su *b) { *d = *a >= *b; }
-void gtub(v16qu *d, v16qu *a, v16qu *b) { *d = *a > *b; }
-void rev(v8hi *d, v8hi *a) { *d = __builtin_shufflevector(*a, *a, 7, 6, 5, 4, 3, 2, 1, 0); }
-"#;
-    let at = |flags: &[&str]| {
-        let mut args = vec!["-O"];
-        args.extend(flags);
-        crate::codegen::asm_probe::asm_for_with("vec_isa", X86_64_LINUX, src, &args)
-    };
-    let has = |asm: &str, f: &str, m: &str| crate::codegen::asm_probe::body_of(asm, f).contains(m);
-    let base = at(&[]);
-    assert!(
-        has(&base, "gtub", "pminub"),
-        "SSE2 has the unsigned byte order"
-    );
-    for (f, m) in [
-        ("mul", "pmulld"),
-        ("eqq", "pcmpeqq"),
-        ("gtq", "pcmpgtq"),
-        ("geu", "pminud"),
-        ("rev", "pshufb"),
-    ] {
-        assert!(!has(&base, f, m), "{f}: {m} without the flag");
-    }
-    let ssse3 = at(&["-mssse3"]);
-    assert!(has(&ssse3, "rev", "pshufb") && !has(&ssse3, "mul", "pmulld"));
-    let sse41 = at(&["-msse4.1"]);
-    for (f, m) in [("mul", "pmulld"), ("eqq", "pcmpeqq"), ("geu", "pminud")] {
-        assert!(has(&sse41, f, m), "{f}: no {m} at SSE4.1");
-    }
-    assert!(!has(&sse41, "gtq", "pcmpgtq"));
-    let sse42 = at(&["-msse4.2"]);
-    assert!(has(&sse42, "gtq", "pcmpgtq"));
 }

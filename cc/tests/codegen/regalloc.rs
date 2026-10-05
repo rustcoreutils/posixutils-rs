@@ -8,19 +8,75 @@
 //
 // Register Allocation Mega-Test
 //
-// Consolidates: loop_regalloc, shift_regalloc, many_args tests
+// Consolidates: loop_regalloc, shift_regalloc, many_args tests, and (into
+// codegen_regalloc_mega) the stack-slot and Sym-coloring tests listed there
 //
 
-use crate::codegen::asm_probe::{asm_for_with, body_of, AARCH64_LINUX};
 use crate::common::{compile_and_run, compile_and_run_aarch64};
 
 // ============================================================================
 // Mega-test: Register allocation
 // ============================================================================
 
+/// One program, one build, for every host-only register-allocation program
+/// compiled with no extra options. Each original program is a `noinline`
+/// section, so its functions are allocated as they were on their own; the
+/// exit code names the section (ranges in the program's opening comment).
+///
+/// Consolidates: codegen_regalloc_mega, regalloc_stack_slot_reuse,
+/// regalloc_no_reuse_overlapping, regalloc_slot_multi_owner_history,
+/// regalloc_sym_stack_coloring, regalloc_sym_no_reuse_addr_taken,
+/// regalloc_switch_in_loop, regalloc_write_only_locals,
+/// regalloc_cross_block_liveness, regalloc_nested_loops,
+/// regalloc_sym_array_no_reuse.
+///
+/// Stack slot reuse tests: regalloc_stack_slot_reuse,
+/// regalloc_no_reuse_overlapping, regalloc_slot_multi_owner_history.
+///
+/// regalloc_slot_multi_owner_history: Regression test for the multi-owner
+/// slot-reuse bug. Pseudo A owns slot S during [t0, t1]; A frees S. Pseudo B
+/// reuses S during [t2, t3] where t2 > t1. Pseudo C with lifetime that spans
+/// [t0.something, t3.something] then tries to reuse S
+/// checked-against-B-only (current owner) — sees no overlap and is granted
+/// S, but C's lifetime actually overlaps A's old window so C silently
+/// overwrites the slot in A's tail window.
+///
+/// The bug was the bottom of the CPython `double_round` miscompile
+/// (assertAlmostEqual segfault — interval-overlap check only validated
+/// against the most-recent owner, not the full ownership history).
+///
+/// C-level reproducer is fiddly to engineer reliably without depending on
+/// allocator internals; the test below relies on running a function with
+/// enough register pressure that chordal coloring triggers spill commits in
+/// an order that exercises the multi-owner case. The function does floating-
+/// point arithmetic interleaved with calls so the FP allocator path is
+/// exercised. CPython's full test suite is the broader regression coverage.
+/// Its failure (exit 91-93) means: stack slot reuse must check candidate's
+/// interval against ALL past owners, not just the current one.
+///
+/// Sym (named local) stack coloring tests: regalloc_sym_stack_coloring,
+/// regalloc_sym_no_reuse_addr_taken, regalloc_switch_in_loop,
+/// regalloc_write_only_locals, regalloc_cross_block_liveness,
+/// regalloc_nested_loops, regalloc_sym_array_no_reuse.
 #[test]
 fn codegen_regalloc_mega() {
     let code = r#"
+#include <stdio.h>
+/* Exit codes: each section's own failure code plus its base:
+ *   1-52     codegen_regalloc_mega
+ *   61-73    regalloc_stack_slot_reuse
+ *   81-83    regalloc_no_reuse_overlapping
+ *   91-93    regalloc_slot_multi_owner_history
+ *   101-118  regalloc_sym_stack_coloring
+ *   121-125  regalloc_sym_no_reuse_addr_taken
+ *   131      regalloc_switch_in_loop
+ *   141-142  regalloc_write_only_locals
+ *   151-152  regalloc_cross_block_liveness
+ *   161-162  regalloc_nested_loops
+ *   171-174  regalloc_sym_array_no_reuse
+ */
+
+/* ===== codegen_regalloc_mega (exit 1-52) ===== */
 // Lookup tables for high register pressure test
 int lookup1[256];
 int lookup2[256];
@@ -90,7 +146,7 @@ double many_doubles(double a, double b, double c, double d,
     return a + b + c + d + e + f + g + h + i + j;
 }
 
-int main(void) {
+static __attribute__((noinline)) int t_codegen_regalloc_mega(void) {
     // ========== LOOP REGALLOC (returns 1-49) ==========
 
     // Basic loop-carried value
@@ -235,6 +291,297 @@ int main(void) {
 
     return 0;
 }
+
+/* ===== regalloc_stack_slot_reuse (exit 61-73) ===== */
+int switch_reuse(int x) {
+    switch (x) {
+    case 0: { int a=10,b=20,c=30,d=40; return a+b+c+d; }
+    case 1: { int e=1,f=2,g=3,h=4; return e*f*g*h; }
+    case 2: { int p=100,q=200; return p-q; }
+    case 3: { int a=5,b=6,c=7,d=8; return a*b+c*d; }
+    case 4: { int x1=11,x2=22,x3=33,x4=44; return x1+x2+x3+x4; }
+    case 5: { int a=3,b=4; return a*b*a*b; }
+    case 6: { int m=1,n=2,o=3,p=4; return (m+n)*(o+p); }
+    case 7: { int a=50,b=25,c=10; return a-b+c; }
+    case 8: { int a=7,b=8,c=9,d=10; return a+b+c+d; }
+    case 9: { int a=2,b=3,c=4,d=5; return a*b+c*d; }
+    case 10: { int a=100,b=50,c=25,d=12; return a-b-c-d; }
+    case 11: { int a=6,b=7; return a*b; }
+    default: return -1;
+    }
+}
+
+static __attribute__((noinline)) int t_regalloc_stack_slot_reuse(void) {
+    if (switch_reuse(0) != 100) return 1;
+    if (switch_reuse(1) != 24) return 2;
+    if (switch_reuse(2) != -100) return 3;
+    if (switch_reuse(3) != 86) return 4;
+    if (switch_reuse(4) != 110) return 5;
+    if (switch_reuse(5) != 144) return 6;
+    if (switch_reuse(6) != 21) return 7;
+    if (switch_reuse(7) != 35) return 8;
+    if (switch_reuse(8) != 34) return 9;
+    if (switch_reuse(9) != 26) return 10;
+    if (switch_reuse(10) != 13) return 11;
+    if (switch_reuse(11) != 42) return 12;
+    if (switch_reuse(99) != -1) return 13;
+    return 0;
+}
+
+/* ===== regalloc_no_reuse_overlapping (exit 81-83) ===== */
+int overlapping(int x) {
+    int a = x + 1;
+    int b = x + 2;
+    int c = a + b;
+    return c;
+}
+
+static __attribute__((noinline)) int t_regalloc_no_reuse_overlapping(void) {
+    if (overlapping(10) != 23) return 1;
+    if (overlapping(0) != 3) return 2;
+    if (overlapping(-5) != -7) return 3;
+    return 0;
+}
+
+/* ===== regalloc_slot_multi_owner_history (exit 91-93) ===== */
+
+__attribute__((noinline))
+double helper(double a, double b, double c) {
+    return a * b + c;
+}
+
+__attribute__((noinline))
+int compute(double x, double y, int n) {
+    double a = x + 1.0;
+    double b = y + 1.0;
+    double c = helper(a, b, x);
+    double d = helper(b, a, y);
+    double e = c + d;
+    if (n > 0) {
+        e = e + helper(a, c, d);
+    }
+    if (e != e) return 99;
+    return (e > 0.0) ? 1 : 0;
+}
+
+static __attribute__((noinline)) int t_regalloc_slot_multi_owner_history(void) {
+    if (compute(1.0, 2.0, 1) != 1) return 1;
+    if (compute(-1.0, -2.0, 1) != 0) return 2;
+    if (compute(0.5, 0.25, 0) != 1) return 3;
+    return 0;
+}
+
+/* ===== regalloc_sym_stack_coloring (exit 101-118) ===== */
+int switch_locals(int x) {
+    switch (x) {
+    case 0:  { int a=1,b=2,c=3,d=4; return a+b+c+d; }
+    case 1:  { int a=10,b=20,c=30,d=40; return a+b+c+d; }
+    case 2:  { int a=5,b=6,c=7,d=8; return a*b+c*d; }
+    case 3:  { int a=100,b=50,c=25,d=12; return a-b-c-d; }
+    case 4:  { int a=3,b=4,c=5,d=6; return (a+b)*(c+d); }
+    case 5:  { int a=7,b=8,c=9,d=10; return a*d+b*c; }
+    case 6:  { int a=2,b=3,c=4,d=5; return a*b*c*d; }
+    case 7:  { int a=50,b=25,c=10,d=5; return a/d+b/d+c/d; }
+    case 8:  { int a=11,b=22,c=33,d=44; return a+b+c+d; }
+    case 9:  { int a=1,b=1,c=1,d=1; return a+b+c+d; }
+    case 10: { int a=99,b=1,c=0,d=0; return a+b+c+d; }
+    case 11: { int a=6,b=7,c=8,d=9; return a*b-c*d; }
+    case 12: { int a=15,b=3,c=20,d=4; return a/b+c/d; }
+    case 13: { int a=1,b=2,c=3,d=4; return d*d+c*c+b*b+a*a; }
+    case 14: { int a=10,b=20,c=30,d=40; return d-c-b-a; }
+    case 15: { double a=1.5,b=2.5; return (int)(a+b); }
+    case 16: { long long a=1000000000LL,b=2000000000LL; return (int)((a+b)/100000000LL); }
+    default: return -1;
+    }
+}
+
+static __attribute__((noinline)) int t_regalloc_sym_stack_coloring(void) {
+    if (switch_locals(0) != 10) return 1;
+    if (switch_locals(1) != 100) return 2;
+    if (switch_locals(2) != 86) return 3;
+    if (switch_locals(3) != 13) return 4;
+    if (switch_locals(4) != 77) return 5;
+    if (switch_locals(5) != 142) return 6;
+    if (switch_locals(6) != 120) return 7;
+    if (switch_locals(7) != 17) return 8;
+    if (switch_locals(8) != 110) return 9;
+    if (switch_locals(9) != 4) return 10;
+    if (switch_locals(10) != 100) return 11;
+    if (switch_locals(11) != -30) return 12;
+    if (switch_locals(12) != 10) return 13;
+    if (switch_locals(13) != 30) return 14;
+    if (switch_locals(14) != -20) return 15;
+    if (switch_locals(15) != 4) return 16;
+    if (switch_locals(16) != 30) return 17;
+    if (switch_locals(99) != -1) return 18;
+    return 0;
+}
+
+/* ===== regalloc_sym_no_reuse_addr_taken (exit 121-125) ===== */
+int test_addr_taken(int val) {
+    int x = val;
+    int *p = &x;
+    *p += 10;
+    return x;
+}
+
+int test_addr_taken_across_call(int val) {
+    int x = val;
+    int *p = &x;
+    // Call a function to ensure p's target survives
+    int y = test_addr_taken(*p);
+    return x + y;
+}
+
+static __attribute__((noinline)) int t_regalloc_sym_no_reuse_addr_taken(void) {
+    if (test_addr_taken(5) != 15) return 1;
+    if (test_addr_taken(0) != 10) return 2;
+    if (test_addr_taken(-10) != 0) return 3;
+    if (test_addr_taken_across_call(5) != 20) return 4;
+    if (test_addr_taken_across_call(0) != 10) return 5;
+    return 0;
+}
+
+/* ===== regalloc_switch_in_loop (exit 131) ===== */
+int sil_side_effect(int x) { return x + 1; }
+
+static __attribute__((noinline)) int t_regalloc_switch_in_loop(void) {
+    int total = 0;
+    for (int iter = 0; iter < 3; iter++) {
+        switch (iter) {
+        case 0: {
+            int a = 10, b = 20, c = 30;
+            int tmp = sil_side_effect(a) + b + c;
+            total += tmp;
+            break;
+        }
+        case 1: {
+            int x = 5, y = 15, z = 25;
+            int tmp = sil_side_effect(x) * y + z;
+            total += tmp;
+            break;
+        }
+        case 2: {
+            int p = 100, q = 50;
+            int tmp = sil_side_effect(p) - q;
+            total += tmp;
+            break;
+        }
+        }
+    }
+    // case 0: 11+20+30=61, case 1: 6*15+25=115, case 2: 101-50=51
+    // total: 61+115+51=227
+    if (total != 227) return 1;
+    return 0;
+}
+
+/* ===== regalloc_write_only_locals (exit 141-142) ===== */
+int wol_side_effect(int x) { return x + 1; }
+
+static __attribute__((noinline)) int t_regalloc_write_only_locals(void) {
+    int a = 42;
+    int b = 10;
+    int c = wol_side_effect(b);
+    if (c != 11) return 1;
+
+    int d = 99;
+    int e = 20;
+    int f = wol_side_effect(e);
+    if (f != 21) return 2;
+
+    return 0;
+}
+
+/* ===== regalloc_cross_block_liveness (exit 151-152) ===== */
+static __attribute__((noinline)) int t_regalloc_cross_block_liveness(void) {
+    int x = 42;
+    int result;
+    if (x > 0) {
+        result = x + 10;
+    } else {
+        result = x - 10;
+    }
+    if (result != 52) return 1;
+
+    int a = 5, b = 10;
+    int sum;
+    if (a < b) {
+        int temp = a;
+        a = b;
+        b = temp;
+        sum = a + b;
+    } else {
+        sum = a - b;
+    }
+    if (sum != 15) return 2;
+
+    return 0;
+}
+
+/* ===== regalloc_nested_loops (exit 161-162) ===== */
+static __attribute__((noinline)) int t_regalloc_nested_loops(void) {
+    int outer_sum = 0;
+    for (int i = 0; i < 4; i++) {
+        int inner_sum = 0;
+        for (int j = 0; j < 3; j++) {
+            inner_sum += i + j;
+        }
+        outer_sum += inner_sum;
+    }
+    // i=0: 0+1+2=3, i=1: 1+2+3=6, i=2: 2+3+4=9, i=3: 3+4+5=12
+    // total: 3+6+9+12=30
+    if (outer_sum != 30) return 1;
+
+    // Nested with loop-carried at both levels
+    int total = 1;
+    for (int i = 0; i < 3; i++) {
+        int factor = 1;
+        for (int j = 0; j <= i; j++) {
+            factor *= 2;
+        }
+        total *= factor;
+    }
+    // i=0: factor=2, total=2
+    // i=1: factor=4, total=8
+    // i=2: factor=8, total=64
+    if (total != 64) return 2;
+
+    return 0;
+}
+
+/* ===== regalloc_sym_array_no_reuse (exit 171-174) ===== */
+int test_local_array(int n) {
+    int arr[4];
+    arr[0] = n;
+    arr[1] = n * 2;
+    arr[2] = n * 3;
+    arr[3] = n * 4;
+    return arr[0] + arr[1] + arr[2] + arr[3];
+}
+
+static __attribute__((noinline)) int t_regalloc_sym_array_no_reuse(void) {
+    if (test_local_array(1) != 10) return 1;
+    if (test_local_array(5) != 50) return 2;
+    if (test_local_array(0) != 0) return 3;
+    if (test_local_array(-3) != -30) return 4;
+    return 0;
+}
+
+int main(void) {
+    int r;
+    if ((r = t_codegen_regalloc_mega()) != 0) return r;
+    if ((r = t_regalloc_stack_slot_reuse()) != 0) return 60 + r;
+    if ((r = t_regalloc_no_reuse_overlapping()) != 0) return 80 + r;
+    if ((r = t_regalloc_slot_multi_owner_history()) != 0) return 90 + r;
+    if ((r = t_regalloc_sym_stack_coloring()) != 0) return 100 + r;
+    if ((r = t_regalloc_sym_no_reuse_addr_taken()) != 0) return 120 + r;
+    if ((r = t_regalloc_switch_in_loop()) != 0) return 130 + r;
+    if ((r = t_regalloc_write_only_locals()) != 0) return 140 + r;
+    if ((r = t_regalloc_cross_block_liveness()) != 0) return 150 + r;
+    if ((r = t_regalloc_nested_loops()) != 0) return 160 + r;
+    if ((r = t_regalloc_sym_array_no_reuse()) != 0) return 170 + r;
+    return 0;
+}
 "#;
     assert_eq!(compile_and_run("codegen_regalloc_mega", code, &[]), 0);
 }
@@ -334,375 +681,10 @@ int main(void) {
     assert_eq!(compile_and_run("codegen_shift_x86_64", code, &[]), 0);
 }
 
-// ============================================================================
-// Stack slot reuse tests
-// ============================================================================
-
-#[test]
-fn regalloc_stack_slot_reuse() {
-    let code = r#"
-int switch_reuse(int x) {
-    switch (x) {
-    case 0: { int a=10,b=20,c=30,d=40; return a+b+c+d; }
-    case 1: { int e=1,f=2,g=3,h=4; return e*f*g*h; }
-    case 2: { int p=100,q=200; return p-q; }
-    case 3: { int a=5,b=6,c=7,d=8; return a*b+c*d; }
-    case 4: { int x1=11,x2=22,x3=33,x4=44; return x1+x2+x3+x4; }
-    case 5: { int a=3,b=4; return a*b*a*b; }
-    case 6: { int m=1,n=2,o=3,p=4; return (m+n)*(o+p); }
-    case 7: { int a=50,b=25,c=10; return a-b+c; }
-    case 8: { int a=7,b=8,c=9,d=10; return a+b+c+d; }
-    case 9: { int a=2,b=3,c=4,d=5; return a*b+c*d; }
-    case 10: { int a=100,b=50,c=25,d=12; return a-b-c-d; }
-    case 11: { int a=6,b=7; return a*b; }
-    default: return -1;
-    }
-}
-
-int main(void) {
-    if (switch_reuse(0) != 100) return 1;
-    if (switch_reuse(1) != 24) return 2;
-    if (switch_reuse(2) != -100) return 3;
-    if (switch_reuse(3) != 86) return 4;
-    if (switch_reuse(4) != 110) return 5;
-    if (switch_reuse(5) != 144) return 6;
-    if (switch_reuse(6) != 21) return 7;
-    if (switch_reuse(7) != 35) return 8;
-    if (switch_reuse(8) != 34) return 9;
-    if (switch_reuse(9) != 26) return 10;
-    if (switch_reuse(10) != 13) return 11;
-    if (switch_reuse(11) != 42) return 12;
-    if (switch_reuse(99) != -1) return 13;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("regalloc_stack_slot_reuse", code, &[]), 0);
-}
-
-#[test]
-fn regalloc_no_reuse_overlapping() {
-    let code = r#"
-int overlapping(int x) {
-    int a = x + 1;
-    int b = x + 2;
-    int c = a + b;
-    return c;
-}
-
-int main(void) {
-    if (overlapping(10) != 23) return 1;
-    if (overlapping(0) != 3) return 2;
-    if (overlapping(-5) != -7) return 3;
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("regalloc_no_reuse_overlapping", code, &[]),
-        0
-    );
-}
-
-#[test]
-fn regalloc_slot_multi_owner_history() {
-    // Regression test for the multi-owner slot-reuse bug. Pseudo A
-    // owns slot S during [t0, t1]; A frees S. Pseudo B reuses S
-    // during [t2, t3] where t2 > t1. Pseudo C with lifetime that
-    // spans [t0.something, t3.something] then tries to reuse S
-    // checked-against-B-only (current owner) — sees no overlap and
-    // is granted S, but C's lifetime actually overlaps A's old
-    // window so C silently overwrites the slot in A's tail window.
-    //
-    // The bug was the bottom of the CPython `double_round`
-    // miscompile (assertAlmostEqual segfault — interval-overlap
-    // check only validated against the most-recent owner, not the
-    // full ownership history).
-    //
-    // C-level reproducer is fiddly to engineer reliably without
-    // depending on allocator internals; the test below relies on
-    // running a function with enough register pressure that
-    // chordal coloring triggers spill commits in an order that
-    // exercises the multi-owner case. The function does floating-
-    // point arithmetic interleaved with calls so the FP allocator
-    // path is exercised. CPython's full test suite is the broader
-    // regression coverage.
-    let code = r#"
-#include <stdio.h>
-
-__attribute__((noinline))
-double helper(double a, double b, double c) {
-    return a * b + c;
-}
-
-__attribute__((noinline))
-int compute(double x, double y, int n) {
-    double a = x + 1.0;
-    double b = y + 1.0;
-    double c = helper(a, b, x);
-    double d = helper(b, a, y);
-    double e = c + d;
-    if (n > 0) {
-        e = e + helper(a, c, d);
-    }
-    if (e != e) return 99;
-    return (e > 0.0) ? 1 : 0;
-}
-
-int main(void) {
-    if (compute(1.0, 2.0, 1) != 1) return 1;
-    if (compute(-1.0, -2.0, 1) != 0) return 2;
-    if (compute(0.5, 0.25, 0) != 1) return 3;
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("regalloc_slot_multi_owner_history", code, &[]),
-        0,
-        "stack slot reuse must check candidate's interval against ALL past owners, not just the current one"
-    );
-}
-
-// ============================================================================
-// Sym (named local) stack coloring tests
-// ============================================================================
-
-#[test]
-fn regalloc_sym_stack_coloring() {
-    let code = r#"
-int switch_locals(int x) {
-    switch (x) {
-    case 0:  { int a=1,b=2,c=3,d=4; return a+b+c+d; }
-    case 1:  { int a=10,b=20,c=30,d=40; return a+b+c+d; }
-    case 2:  { int a=5,b=6,c=7,d=8; return a*b+c*d; }
-    case 3:  { int a=100,b=50,c=25,d=12; return a-b-c-d; }
-    case 4:  { int a=3,b=4,c=5,d=6; return (a+b)*(c+d); }
-    case 5:  { int a=7,b=8,c=9,d=10; return a*d+b*c; }
-    case 6:  { int a=2,b=3,c=4,d=5; return a*b*c*d; }
-    case 7:  { int a=50,b=25,c=10,d=5; return a/d+b/d+c/d; }
-    case 8:  { int a=11,b=22,c=33,d=44; return a+b+c+d; }
-    case 9:  { int a=1,b=1,c=1,d=1; return a+b+c+d; }
-    case 10: { int a=99,b=1,c=0,d=0; return a+b+c+d; }
-    case 11: { int a=6,b=7,c=8,d=9; return a*b-c*d; }
-    case 12: { int a=15,b=3,c=20,d=4; return a/b+c/d; }
-    case 13: { int a=1,b=2,c=3,d=4; return d*d+c*c+b*b+a*a; }
-    case 14: { int a=10,b=20,c=30,d=40; return d-c-b-a; }
-    case 15: { double a=1.5,b=2.5; return (int)(a+b); }
-    case 16: { long long a=1000000000LL,b=2000000000LL; return (int)((a+b)/100000000LL); }
-    default: return -1;
-    }
-}
-
-int main(void) {
-    if (switch_locals(0) != 10) return 1;
-    if (switch_locals(1) != 100) return 2;
-    if (switch_locals(2) != 86) return 3;
-    if (switch_locals(3) != 13) return 4;
-    if (switch_locals(4) != 77) return 5;
-    if (switch_locals(5) != 142) return 6;
-    if (switch_locals(6) != 120) return 7;
-    if (switch_locals(7) != 17) return 8;
-    if (switch_locals(8) != 110) return 9;
-    if (switch_locals(9) != 4) return 10;
-    if (switch_locals(10) != 100) return 11;
-    if (switch_locals(11) != -30) return 12;
-    if (switch_locals(12) != 10) return 13;
-    if (switch_locals(13) != 30) return 14;
-    if (switch_locals(14) != -20) return 15;
-    if (switch_locals(15) != 4) return 16;
-    if (switch_locals(16) != 30) return 17;
-    if (switch_locals(99) != -1) return 18;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("regalloc_sym_stack_coloring", code, &[]), 0);
-}
-
-#[test]
-fn regalloc_sym_no_reuse_addr_taken() {
-    let code = r#"
-int test_addr_taken(int val) {
-    int x = val;
-    int *p = &x;
-    *p += 10;
-    return x;
-}
-
-int test_addr_taken_across_call(int val) {
-    int x = val;
-    int *p = &x;
-    // Call a function to ensure p's target survives
-    int y = test_addr_taken(*p);
-    return x + y;
-}
-
-int main(void) {
-    if (test_addr_taken(5) != 15) return 1;
-    if (test_addr_taken(0) != 10) return 2;
-    if (test_addr_taken(-10) != 0) return 3;
-    if (test_addr_taken_across_call(5) != 20) return 4;
-    if (test_addr_taken_across_call(0) != 10) return 5;
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("regalloc_sym_no_reuse_addr_taken", code, &[]),
-        0
-    );
-}
-
-#[test]
-fn regalloc_switch_in_loop() {
-    let code = r#"
-int side_effect(int x) { return x + 1; }
-
-int main(void) {
-    int total = 0;
-    for (int iter = 0; iter < 3; iter++) {
-        switch (iter) {
-        case 0: {
-            int a = 10, b = 20, c = 30;
-            int tmp = side_effect(a) + b + c;
-            total += tmp;
-            break;
-        }
-        case 1: {
-            int x = 5, y = 15, z = 25;
-            int tmp = side_effect(x) * y + z;
-            total += tmp;
-            break;
-        }
-        case 2: {
-            int p = 100, q = 50;
-            int tmp = side_effect(p) - q;
-            total += tmp;
-            break;
-        }
-        }
-    }
-    // case 0: 11+20+30=61, case 1: 6*15+25=115, case 2: 101-50=51
-    // total: 61+115+51=227
-    if (total != 227) return 1;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("regalloc_switch_in_loop", code, &[]), 0);
-}
-
-#[test]
-fn regalloc_write_only_locals() {
-    let code = r#"
-int side_effect(int x) { return x + 1; }
-
-int main(void) {
-    int a = 42;
-    int b = 10;
-    int c = side_effect(b);
-    if (c != 11) return 1;
-
-    int d = 99;
-    int e = 20;
-    int f = side_effect(e);
-    if (f != 21) return 2;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("regalloc_write_only_locals", code, &[]), 0);
-}
-
-#[test]
-fn regalloc_cross_block_liveness() {
-    let code = r#"
-int main(void) {
-    int x = 42;
-    int result;
-    if (x > 0) {
-        result = x + 10;
-    } else {
-        result = x - 10;
-    }
-    if (result != 52) return 1;
-
-    int a = 5, b = 10;
-    int sum;
-    if (a < b) {
-        int temp = a;
-        a = b;
-        b = temp;
-        sum = a + b;
-    } else {
-        sum = a - b;
-    }
-    if (sum != 15) return 2;
-
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("regalloc_cross_block_liveness", code, &[]),
-        0
-    );
-}
-
-#[test]
-fn regalloc_nested_loops() {
-    let code = r#"
-int main(void) {
-    int outer_sum = 0;
-    for (int i = 0; i < 4; i++) {
-        int inner_sum = 0;
-        for (int j = 0; j < 3; j++) {
-            inner_sum += i + j;
-        }
-        outer_sum += inner_sum;
-    }
-    // i=0: 0+1+2=3, i=1: 1+2+3=6, i=2: 2+3+4=9, i=3: 3+4+5=12
-    // total: 3+6+9+12=30
-    if (outer_sum != 30) return 1;
-
-    // Nested with loop-carried at both levels
-    int total = 1;
-    for (int i = 0; i < 3; i++) {
-        int factor = 1;
-        for (int j = 0; j <= i; j++) {
-            factor *= 2;
-        }
-        total *= factor;
-    }
-    // i=0: factor=2, total=2
-    // i=1: factor=4, total=8
-    // i=2: factor=8, total=64
-    if (total != 64) return 2;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("regalloc_nested_loops", code, &[]), 0);
-}
-
-#[test]
-fn regalloc_sym_array_no_reuse() {
-    let code = r#"
-int test_local_array(int n) {
-    int arr[4];
-    arr[0] = n;
-    arr[1] = n * 2;
-    arr[2] = n * 3;
-    arr[3] = n * 4;
-    return arr[0] + arr[1] + arr[2] + arr[3];
-}
-
-int main(void) {
-    if (test_local_array(1) != 10) return 1;
-    if (test_local_array(5) != 50) return 2;
-    if (test_local_array(0) != 0) return 3;
-    if (test_local_array(-3) != -30) return 4;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("regalloc_sym_array_no_reuse", code, &[]), 0);
-}
-
-/// A value is read back at the width it was stored at.
+/// A value is read back at the width it was stored at -- run on aarch64.
+///
+/// The assembly half of this test is the in-process
+/// `test_asm::codegen_regalloc` case of the same name.
 ///
 /// A comparison's result is an `int`, and spilled to the frame it is stored
 /// as one -- `str w16, [x29, #136]` -- but `Cbr` and `Select` read their
@@ -728,26 +710,6 @@ __attribute__((noinline)) int many_fcmp(double a, double b) {
     return r;
 }
 "#;
-    for opt in ["-O1", "-O2"] {
-        let asm = asm_for_with("spilled_cond", AARCH64_LINUX, src, &[opt]);
-        let body = body_of(&asm, "many_fcmp");
-        let mut stored_w: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for line in body.lines().map(str::trim) {
-            let Some((op, rest)) = line.split_once(' ') else {
-                continue;
-            };
-            let Some((reg, addr)) = rest.split_once(", ") else {
-                continue;
-            };
-            if op == "str" && reg.starts_with('w') {
-                stored_w.insert(addr);
-            }
-            assert!(
-                !(op == "ldr" && reg.starts_with('x') && stored_w.contains(addr)),
-                "at {opt}, `{line}` reads 64 bits of a slot stored as 32:\n{body}"
-            );
-        }
-    }
     let run =
         format!("{src}int main(void) {{ return many_fcmp(2.0, 1.0) != (2|8|32|128|512|2048); }}\n");
     if let Some(rc) = compile_and_run_aarch64("spilled_cond", &run, "-O2") {

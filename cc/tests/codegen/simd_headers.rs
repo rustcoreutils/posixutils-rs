@@ -29,6 +29,11 @@ fn run_x86(name: &str, src: &str) {
     }
 }
 
+/// Also consolidates `simd_xmmintrin_brings_sse2` (check 180 of the
+/// fixture): gcc's `<xmmintrin.h>` brings the SSE2 header with it, and mesa's
+/// `half_float.h` relies on that: it includes only `<xmmintrin.h>` and
+/// writes `__m128i`, beside a `"v"` asm operand of type `__m128`. The
+/// fixture includes only `<xmmintrin.h>`, so that property holds.
 #[cfg(target_arch = "x86_64")]
 #[test]
 fn simd_mmintrin_xmmintrin() {
@@ -101,22 +106,4 @@ fn simd_arm_neon() {
             assert_eq!(code, 0, "simd_neon on aarch64 at {opt}");
         }
     }
-}
-
-/// gcc's `<xmmintrin.h>` brings the SSE2 header with it, and mesa's
-/// `half_float.h` relies on that: it includes only `<xmmintrin.h>` and
-/// writes `__m128i`, beside a `"v"` asm operand of type `__m128`.
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn simd_xmmintrin_brings_sse2() {
-    let src = r#"
-#include <xmmintrin.h>
-int main(void) {
-    __m128 in = {2.0f, 3.0f, 4.0f, 5.0f};
-    __m128i out;
-    __asm__ volatile("cvttps2dq %1, %0" : "=v"(out) : "v"(in));
-    return (_mm_cvtsi128_si32(out) == 2 && ((int *)&out)[3] == 5) ? 0 : 1;
-}
-"#;
-    run_x86("simd_xmm_sse2", src);
 }

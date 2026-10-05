@@ -1594,6 +1594,8 @@ int main(void)
 }
 "#;
     assert_eq!(compile_and_run("floating_abi_mega", code, &[]), 0);
+    // Optimized as well: the long-double aggregate return section's inliner
+    // sees an address-carrying `Ret` only there.
     assert_eq!(compile_and_run_optimized("floating_abi_mega_opt", code), 0);
 }
 

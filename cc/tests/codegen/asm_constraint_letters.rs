@@ -37,14 +37,29 @@ fn run_aarch64_levels(name: &str, src: &str) {
     }
 }
 
-/// x86-64 `Q` is a register class -- `a`, `b`, `c` or `d`, the registers
-/// with an addressable high byte -- not memory. Taken for memory, the
-/// operand was handed over as an address and `%h1` named no register.
+/// x86-64 constraint letters, one program (exit codes listed in its header):
+///
+/// - `codegen_asm_x86_64_q_is_a_high_byte_register`: x86-64 `Q` is a register
+///   class -- `a`, `b`, `c` or `d`, the registers with an addressable high
+///   byte -- not memory. Taken for memory, the operand was handed over as an
+///   address and `%h1` named no register.
+/// - `codegen_asm_x86_64_early_clobber_pinned_output_claims_its_register`: An
+///   early-clobber output pinned to one register (`"=&d"`) claims that
+///   register at the asm. The allocator read `=&d` as an unknown letter `&`
+///   and dropped the operand, so it never learned %rdx was written there and
+///   left a live argument in it.
 #[cfg(target_arch = "x86_64")]
 #[test]
-fn codegen_asm_x86_64_q_is_a_high_byte_register() {
+fn codegen_asm_x86_64_register_letters() {
     let src = r#"
-int main(void) {
+/* Sections (exit codes):
+ *   1..3   t_q_high_byte            (codegen_asm_x86_64_q_is_a_high_byte_register)
+ *   11..12 t_early_clobber_pinned   (codegen_asm_x86_64_early_clobber_pinned_output_claims_its_register)
+ */
+
+/* x86-64 `Q` is a register class -- `a`, `b`, `c` or `d`, the registers
+   with an addressable high byte -- not memory. */
+static int t_q_high_byte(void) {
     unsigned long x = 0x1234, y;
     unsigned char r;
     __asm__("movb %h1, %0" : "=r"(r) : "Q"(x));
@@ -59,18 +74,9 @@ int main(void) {
         return 3;
     return 0;
 }
-"#;
-    run_host_levels("asm_x86_q_high_byte", src);
-}
 
-/// An early-clobber output pinned to one register (`"=&d"`) claims that
-/// register at the asm. The allocator read `=&d` as an unknown letter `&`
-/// and dropped the operand, so it never learned %rdx was written there and
-/// left a live argument in it.
-#[cfg(target_arch = "x86_64")]
-#[test]
-fn codegen_asm_x86_64_early_clobber_pinned_output_claims_its_register() {
-    let src = r#"
+/* An early-clobber output pinned to one register (`"=&d"`) claims that
+   register at the asm. */
 __attribute__((noinline)) long f(long a, long b, long c, long d, long e, long g) {
     long r;
     __asm__("movq $77, %0" : "=&d"(r) : "r"(a));
@@ -81,15 +87,24 @@ __attribute__((noinline)) long h(long a, long b, long c, long d, long e, long g)
     __asm__("movq $77, %0" : "=&c"(r) : "r"(a));
     return a + b + c + d + e + g + r;
 }
-int main(void) {
+static int t_early_clobber_pinned(void) {
     if (f(1, 2, 3, 4, 5, 6) != 98)
-        return 1;
+        return 11;
     if (h(1, 2, 3, 4, 5, 6) != 98)
-        return 2;
+        return 12;
+    return 0;
+}
+
+int main(void) {
+    int rc;
+    if ((rc = t_q_high_byte()) != 0)
+        return rc;
+    if ((rc = t_early_clobber_pinned()) != 0)
+        return rc;
     return 0;
 }
 "#;
-    run_host_levels("asm_x86_early_clobber_pinned", src);
+    run_host_levels("asm_x86_register_letters", src);
 }
 
 /// A matching constraint names an operand number, which may have two digits.
@@ -115,19 +130,32 @@ int main(void) {
     compile_and_run_everywhere("asm_matching_two_digits", src);
 }
 
-/// aarch64 `w` is a register class, so `"+wm"` may be a register. The IR
-/// read it as memory-only -- `w` was not one of its letters -- and passed the
-/// address, while the backend chose the vector register: the template
-/// doubled the pointer's bits and `*p` never changed. gcc -O0 also chooses
-/// the register for this operand.
+/// aarch64 constraint letters, one program (exit codes listed in its header):
+///
+/// - `codegen_asm_aarch64_w_or_memory_is_a_register_operand`: aarch64 `w` is
+///   a register class, so `"+wm"` may be a register. The IR read it as
+///   memory-only -- `w` was not one of its letters -- and passed the address,
+///   while the backend chose the vector register: the template doubled the
+///   pointer's bits and `*p` never changed. gcc -O0 also chooses the register
+///   for this operand.
+/// - `codegen_asm_aarch64_q_is_addressed_by_a_bare_base_register`: aarch64 `Q`
+///   is memory addressed by a base register alone: `ldxr` and the other
+///   exclusives encode no offset. A local or an array element addressed in
+///   place as `[x29, #N]` did not assemble. (Its global is `qg` here.)
 #[test]
-fn codegen_asm_aarch64_w_or_memory_is_a_register_operand() {
+fn codegen_asm_aarch64_register_and_memory_letters() {
     let src = r#"
+/* Sections (exit codes):
+ *   1..2   t_w_or_memory  (codegen_asm_aarch64_w_or_memory_is_a_register_operand)
+ *   11..13 t_q_bare_base  (codegen_asm_aarch64_q_is_addressed_by_a_bare_base_register)
+ */
+
+/* aarch64 `w` is a register class, so `"+wm"` may be a register. */
 __attribute__((noinline)) double twice(double *p) {
     __asm__("fadd %d0, %d0, %d0" : "+wm"(*p));
     return *p;
 }
-int main(void) {
+static int t_w_or_memory(void) {
     double v = 1.25;
     if (twice(&v) != 2.5)
         return 1;
@@ -135,33 +163,34 @@ int main(void) {
         return 2;
     return 0;
 }
-"#;
-    run_aarch64_levels("asm_a64_wm_register", src);
-}
 
-/// aarch64 `Q` is memory addressed by a base register alone: `ldxr` and the
-/// other exclusives encode no offset. A local or an array element addressed
-/// in place as `[x29, #N]` did not assemble.
-#[test]
-fn codegen_asm_aarch64_q_is_addressed_by_a_bare_base_register() {
-    let src = r#"
-long g = 9;
-int main(void) {
+/* aarch64 `Q` is memory addressed by a base register alone. */
+long qg = 9;
+static int t_q_bare_base(void) {
     long x = 41, r, z;
     long y[4] = {1, 2, 3, 77};
     __asm__ volatile("ldxr %0, %1\n\tclrex" : "=r"(r) : "Q"(x));
     if (r != 41)
-        return 1;
+        return 11;
     __asm__ volatile("ldxr %0, %1\n\tclrex" : "=r"(z) : "Q"(y[3]));
     if (z != 77)
-        return 2;
-    __asm__ volatile("ldxr %0, %1\n\tclrex" : "=r"(r) : "Q"(g));
+        return 12;
+    __asm__ volatile("ldxr %0, %1\n\tclrex" : "=r"(r) : "Q"(qg));
     if (r != 9)
-        return 3;
+        return 13;
+    return 0;
+}
+
+int main(void) {
+    int rc;
+    if ((rc = t_w_or_memory()) != 0)
+        return rc;
+    if ((rc = t_q_bare_base()) != 0)
+        return rc;
     return 0;
 }
 "#;
-    run_aarch64_levels("asm_a64_q_base_only", src);
+    run_aarch64_levels("asm_a64_register_and_memory_letters", src);
 }
 
 /// An immediate-only operand is written into the template as the constant

@@ -1500,7 +1500,10 @@ fn test_ifconv_collapses_nested_and_sequential_diamonds() {
             .iter_mut()
             .find(|f| f.name == name)
             .expect("function");
-        assert!(crate::ir::ifconv::run(func));
+        assert!(crate::ir::ifconv::run(
+            func,
+            &TypeTable::new(&Target::host())
+        ));
         let mut errors = Vec::new();
         crate::ir::validate::check_pseudo_index(func, &mut errors);
         assert!(errors.is_empty(), "{errors:?}");

@@ -27,7 +27,7 @@
 //
 
 use super::constfold::{at_width, unambiguous_at, CmpDomain, Outcomes};
-use super::{Function, Opcode, PseudoId, PseudoKind};
+use super::{Function, Instruction, Opcode, PseudoId, PseudoKind};
 use crate::float::FloatVal;
 use std::collections::HashMap;
 
@@ -305,36 +305,75 @@ pub(crate) struct CmpFacts {
 
 impl CmpFacts {
     pub(crate) fn new(func: &Function, consts: &ConstMap) -> Self {
-        let mut facts = HashMap::new();
-        let mut combinators = HashMap::new();
+        let mut cmps = Self {
+            facts: HashMap::new(),
+            combinators: HashMap::new(),
+        };
         for bb in &func.blocks {
             for insn in &bb.insns {
-                let Some(target) = insn.target else {
-                    continue;
-                };
-                if let Some(c) = Combinator::of(insn.op, &insn.src) {
-                    combinators.insert(target, c);
-                }
-                let Some((mask, domain)) = Outcomes::of_op(insn.op) else {
-                    continue;
-                };
-                if insn.src.len() != 2 {
-                    continue;
-                }
-                let width = insn.operand_width();
-                facts.insert(
-                    target,
-                    CmpFact {
-                        mask,
-                        lhs: consts.root(insn.src[0], width),
-                        rhs: consts.root(insn.src[1], width),
-                        domain,
-                        width,
-                    },
-                );
+                cmps.record(consts, insn);
             }
         }
-        Self { facts, combinators }
+        cmps
+    }
+
+    /// Learn what `insn` says, if it is a comparison or a combinator: for a
+    /// pass that creates one after the facts were built, as `ifconv` does
+    /// with each `Select` it makes.
+    pub(crate) fn record(&mut self, consts: &ConstMap, insn: &Instruction) {
+        let Some(target) = insn.target else {
+            return;
+        };
+        if let Some(c) = Combinator::of(insn.op, &insn.src) {
+            self.combinators.insert(target, c);
+        }
+        let Some((mask, domain)) = Outcomes::of_op(insn.op) else {
+            return;
+        };
+        if insn.src.len() != 2 {
+            return;
+        }
+        let width = insn.operand_width();
+        self.facts.insert(
+            target,
+            CmpFact {
+                mask,
+                lhs: consts.root(insn.src[0], width),
+                rhs: consts.root(insn.src[1], width),
+                domain,
+                width,
+            },
+        );
+    }
+
+    /// Whether the 0-or-1 value `cond` being `holds` proves the float
+    /// operands `lhs` and `rhs`, read at `width`, ordered: neither a NaN.
+    ///
+    /// `!isunordered(x, y)` proves it, and so does `x < y` holding, or any
+    /// combination of comparisons of the pair that excludes *unordered*.
+    /// `x < y` *failing* does not, nor does anything about another pair.
+    pub(crate) fn proves_ordered(
+        &self,
+        consts: &ConstMap,
+        cond: PseudoId,
+        holds: bool,
+        (lhs, rhs): (PseudoId, PseudoId),
+        width: u32,
+    ) -> bool {
+        let Some(relation) = self.relation(consts, cond, 1) else {
+            return false;
+        };
+        let Relation::Holds(fact) = (if holds { relation } else { not(relation) }) else {
+            return false;
+        };
+        let pair = CmpFact {
+            mask: Outcomes::NONE,
+            lhs: consts.root(lhs, width),
+            rhs: consts.root(rhs, width),
+            domain: CmpDomain::Float,
+            width,
+        };
+        aligned_mask(pair, fact).is_some_and(|m| !m.contains(Outcomes::UN))
     }
 
     pub(crate) fn get(&self, id: PseudoId) -> Option<CmpFact> {

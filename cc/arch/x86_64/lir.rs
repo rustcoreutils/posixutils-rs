@@ -17,6 +17,7 @@ use super::regalloc::{Reg, XmmReg};
 use crate::arch::lir::{
     CallTarget, CondCode, Directive, EmitAsm, FpSize, Label, OperandSize, Symbol,
 };
+use crate::ir::NanCompare;
 use crate::target::{Os, Target};
 use std::fmt::Write;
 
@@ -742,8 +743,11 @@ pub enum X86Inst {
         dst: XmmReg,
     },
 
-    /// UCOMISS/UCOMISD - Unordered compare scalar floating-point
-    UComiFp {
+    /// COMISS/COMISD or UCOMISS/UCOMISD - Compare scalar floating-point,
+    /// raising invalid for a quiet NaN or not, as `nan` says. The flags are
+    /// the same either way.
+    ComiFp {
+        nan: NanCompare,
         size: FpSize,
         src: XmmOperand,
         dst: XmmReg,
@@ -795,8 +799,9 @@ pub enum X86Inst {
     /// FSQRT - Replace ST(0) by its square root
     X87Sqrt,
 
-    /// FCOMIP - Compare ST(0) with ST(1), set EFLAGS, pop ST(0)
-    X87CmpPop,
+    /// FCOMIP or FUCOMIP - Compare ST(0) with ST(1), set EFLAGS, pop ST(0),
+    /// raising invalid for a quiet NaN or not, as `nan` says.
+    X87CmpPop { nan: NanCompare },
 
     /// FSTP %st(0) - Pop and discard top of x87 stack
     X87Pop,
@@ -1185,8 +1190,17 @@ impl EmitAsm for X86Inst {
                 );
             }
 
-            X86Inst::UComiFp { size, src, dst } => {
-                Self::emit_fp_alu("ucomi", size, src, dst, target, out)
+            X86Inst::ComiFp {
+                nan,
+                size,
+                src,
+                dst,
+            } => {
+                let op = match nan {
+                    NanCompare::Quiet => "ucomi",
+                    NanCompare::Signaling => "comi",
+                };
+                Self::emit_fp_alu(op, size, src, dst, target, out)
             }
             X86Inst::CvtIntToFp {
                 int_size,
@@ -1241,11 +1255,12 @@ impl EmitAsm for X86Inst {
                 let _ = writeln!(out, "    fsqrt");
             }
 
-            X86Inst::X87CmpPop => {
-                // `fucomip`, not `fcomip`: the quiet form does not raise
-                // invalid-operation on a QNaN, which is what C's relational
-                // operators require of everything but the signalling macros.
-                let _ = writeln!(out, "    fucomip %st(1), %st");
+            X86Inst::X87CmpPop { nan } => {
+                let op = match nan {
+                    NanCompare::Quiet => "fucomip",
+                    NanCompare::Signaling => "fcomip",
+                };
+                let _ = writeln!(out, "    {op} %st(1), %st");
             }
 
             X86Inst::X87Pop => {

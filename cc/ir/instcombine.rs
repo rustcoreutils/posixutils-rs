@@ -652,10 +652,9 @@ fn simplify_convert(insn: &Instruction, consts: &ConstMap) -> Option<Simplificat
 /// NaN), a value compared with itself (`x < x` is 0; `x == x` is not 1), and
 /// gcc's `fabs(x) < 0.0`.
 ///
-/// Folding a NaN comparison drops the `FE_INVALID` an ordered comparison
-/// with a NaN is specified to raise, as gcc does. Neither backend raises it
-/// in the first place: both emit the quiet compare (`ucomis*`, `fucomip`,
-/// aarch64 `fcmp`), which signals only for a signaling NaN.
+/// Folding a signaling comparison (C's `<`) that a NaN may reach drops the
+/// `FE_INVALID` it raises at run time, as gcc's folds do; DECISIONS.md
+/// records why. A quiet one raises nothing to drop.
 fn simplify_fcmp(
     insn: &Instruction,
     consts: &ConstMap,

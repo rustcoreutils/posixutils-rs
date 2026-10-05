@@ -199,14 +199,19 @@ instruction turns them into that call (`arch::mapping::call_library_fallbacks`).
 
 The result is `typ`/`size`; the operands' type and width are
 `src_typ`/`src_size`, read through `operand_type`/`operand_width`.
-`Opcode::is_int_comparison` and `is_float_comparison` classify them.
+`Opcode::is_int_comparison` and `is_float_comparison` classify them, and
+`Opcode::float_cmp` takes a float one apart into its predicate and its
+`NanCompare`. A pass may replace a signaling comparison by its quiet twin
+only where the operands are known ordered (`ifconv`); nothing replaces a
+quiet one by a signaling one.
 
 | Opcode | Description |
 |--------|-------------|
 | `seteq`, `setne` | `==`, `!=` |
 | `setlt`, `setle`, `setgt`, `setge` | Signed `<`, `<=`, `>`, `>=` |
 | `setb`, `setbe`, `seta`, `setae` | Unsigned `<`, `<=`, `>`, `>=` ("below", "above") |
-| `fcmp_oeq`, `fcmp_olt`, `fcmp_ole`, `fcmp_ogt`, `fcmp_oge` | Ordered `==`, `<`, `<=`, `>`, `>=`: false when either operand is a NaN |
+| `fcmp_oeq`, `fcmp_olt`, `fcmp_ole`, `fcmp_ogt`, `fcmp_oge` | Ordered `==`, `<`, `<=`, `>`, `>=`: false when either operand is a NaN, and quiet -- raise nothing for a quiet NaN (`==`, the `isless` family, the compiler's own tests) |
+| `fcmps_olt`, `fcmps_ole`, `fcmps_ogt`, `fcmps_oge` | The same predicates, *signaling*: raise invalid for any NaN. C's `<`, `<=`, `>`, `>=` (C17 F.9.3) and nothing else |
 | `fcmp_one` | C's `!=`, which despite the name is **unordered**: true when either operand is a NaN (`constfold::Outcomes::of_op`) |
 
 ### Type Conversions

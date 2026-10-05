@@ -141,6 +141,97 @@ pub(crate) type Site = (usize, usize);
 
 // Opcodes
 
+/// What a floating comparison does when an operand is a quiet NaN.
+///
+/// Every comparison raises invalid for a *signaling* NaN; Annex F leaves
+/// those unspecified anyway (C17 F.2.1). The difference is the quiet NaN,
+/// the one every invalid operation produces: IEEE 754 (5.11) has the
+/// relational predicates signal for it and equality not, and C17 F.9.3 binds
+/// `<`, `<=`, `>` and `>=` to the signaling ones, `==` and `!=` and the
+/// <math.h> comparison macros (7.12.14) to the quiet ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NanCompare {
+    /// Raises nothing: `ucomis*` and `fucomip` on x86-64, `fcmp` on
+    /// aarch64, `__eqtf2`/`__netf2`/`__unordtf2` in software.
+    Quiet,
+    /// Raises invalid: `comis*` and `fcomip` on x86-64, `fcmpe` on aarch64,
+    /// `__lttf2`/`__letf2`/`__gttf2`/`__getf2` in software.
+    Signaling,
+}
+
+/// A floating comparison taken apart ([`Opcode::float_cmp`]): the
+/// predicate, and for a relational one what a quiet NaN does.
+///
+/// Equality carries no [`NanCompare`] because it has only one in C17: the
+/// quiet one. `Ne` is C's `!=`, true for an unordered pair; every other
+/// predicate is false for one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FloatCmp {
+    Eq,
+    Ne,
+    Lt(NanCompare),
+    Le(NanCompare),
+    Gt(NanCompare),
+    Ge(NanCompare),
+}
+
+impl FloatCmp {
+    /// What a quiet NaN operand does to this comparison.
+    pub fn nan(self) -> NanCompare {
+        match self {
+            FloatCmp::Eq | FloatCmp::Ne => NanCompare::Quiet,
+            FloatCmp::Lt(n) | FloatCmp::Le(n) | FloatCmp::Gt(n) | FloatCmp::Ge(n) => n,
+        }
+    }
+
+    /// The same relational predicate, raising invalid for a quiet NaN, or
+    /// `None` for equality, which C17 has no signaling form of.
+    pub fn signaling(self) -> Option<FloatCmp> {
+        use NanCompare::Signaling;
+        match self {
+            FloatCmp::Eq | FloatCmp::Ne => None,
+            FloatCmp::Lt(_) => Some(FloatCmp::Lt(Signaling)),
+            FloatCmp::Le(_) => Some(FloatCmp::Le(Signaling)),
+            FloatCmp::Gt(_) => Some(FloatCmp::Gt(Signaling)),
+            FloatCmp::Ge(_) => Some(FloatCmp::Ge(Signaling)),
+        }
+    }
+
+    /// The same predicate, raising nothing for a quiet NaN.
+    ///
+    /// The two give the same answer for every operand pair, and the same
+    /// exceptions for every *ordered* one; only an unordered pair tells them
+    /// apart. So the quiet form may stand in for the signaling one exactly
+    /// where the operands are known to be ordered.
+    pub fn quiet(self) -> FloatCmp {
+        match self {
+            FloatCmp::Eq | FloatCmp::Ne => self,
+            FloatCmp::Lt(_) => FloatCmp::Lt(NanCompare::Quiet),
+            FloatCmp::Le(_) => FloatCmp::Le(NanCompare::Quiet),
+            FloatCmp::Gt(_) => FloatCmp::Gt(NanCompare::Quiet),
+            FloatCmp::Ge(_) => FloatCmp::Ge(NanCompare::Quiet),
+        }
+    }
+}
+
+impl From<FloatCmp> for Opcode {
+    fn from(cmp: FloatCmp) -> Opcode {
+        use NanCompare::*;
+        match cmp {
+            FloatCmp::Eq => Opcode::FCmpOEq,
+            FloatCmp::Ne => Opcode::FCmpONe,
+            FloatCmp::Lt(Quiet) => Opcode::FCmpOLt,
+            FloatCmp::Le(Quiet) => Opcode::FCmpOLe,
+            FloatCmp::Gt(Quiet) => Opcode::FCmpOGt,
+            FloatCmp::Ge(Quiet) => Opcode::FCmpOGe,
+            FloatCmp::Lt(Signaling) => Opcode::FCmpsOLt,
+            FloatCmp::Le(Signaling) => Opcode::FCmpsOLe,
+            FloatCmp::Gt(Signaling) => Opcode::FCmpsOGt,
+            FloatCmp::Ge(Signaling) => Opcode::FCmpsOGe,
+        }
+    }
+}
+
 /// IR opcodes for the intermediate representation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Opcode {
@@ -194,13 +285,25 @@ pub enum Opcode {
     SetA,  // > (unsigned, "above")
     SetAe, // >= (unsigned)
 
-    // Floating-point comparisons (ordered)
+    // Floating-point comparisons. See [`FloatCmp`], which is how every
+    // consumer should take one apart: the predicate, and for a relational
+    // one whether a quiet NaN operand raises invalid.
+    //
+    // Quiet: raise nothing for a quiet NaN. `==`, `!=`, the <math.h>
+    // comparison macros, and every comparison the compiler makes up for
+    // itself (`isfinite`, `fpclassify`, the `sqrt` domain check).
     FCmpOEq,
     FCmpONe,
     FCmpOLt,
     FCmpOLe,
     FCmpOGt,
     FCmpOGe,
+    // Signaling: raise invalid when either operand is a NaN. C's `<`, `<=`,
+    // `>` and `>=` (C17 F.9.3, IEEE 754 5.11), and nothing else.
+    FCmpsOLt,
+    FCmpsOLe,
+    FCmpsOGt,
+    FCmpsOGe,
 
     // Unary ops
     Not,  // Bitwise NOT
@@ -651,17 +754,30 @@ impl Opcode {
         )
     }
 
-    /// A floating comparison: `fcmp_oeq` .. `fcmp_oge`, a 0-or-1 result.
+    /// A floating comparison, quiet or signaling, with a 0-or-1 result.
     pub fn is_float_comparison(self) -> bool {
-        matches!(
-            self,
-            Opcode::FCmpOEq
-                | Opcode::FCmpONe
-                | Opcode::FCmpOLt
-                | Opcode::FCmpOLe
-                | Opcode::FCmpOGt
-                | Opcode::FCmpOGe
-        )
+        self.float_cmp().is_some()
+    }
+
+    /// The floating comparison this opcode is, taken apart: its predicate
+    /// and, for a relational one, what a quiet NaN operand does. `None` for
+    /// every other opcode.
+    pub fn float_cmp(self) -> Option<FloatCmp> {
+        use FloatCmp::*;
+        use NanCompare::*;
+        Some(match self {
+            Opcode::FCmpOEq => Eq,
+            Opcode::FCmpONe => Ne,
+            Opcode::FCmpOLt => Lt(Quiet),
+            Opcode::FCmpOLe => Le(Quiet),
+            Opcode::FCmpOGt => Gt(Quiet),
+            Opcode::FCmpOGe => Ge(Quiet),
+            Opcode::FCmpsOLt => Lt(Signaling),
+            Opcode::FCmpsOLe => Le(Signaling),
+            Opcode::FCmpsOGt => Gt(Signaling),
+            Opcode::FCmpsOGe => Ge(Signaling),
+            _ => return None,
+        })
     }
 
     /// Any comparison, integer or floating.
@@ -860,6 +976,10 @@ impl Opcode {
             Opcode::FCmpOLe => "fcmp_ole",
             Opcode::FCmpOGt => "fcmp_ogt",
             Opcode::FCmpOGe => "fcmp_oge",
+            Opcode::FCmpsOLt => "fcmps_olt",
+            Opcode::FCmpsOLe => "fcmps_ole",
+            Opcode::FCmpsOGt => "fcmps_ogt",
+            Opcode::FCmpsOGe => "fcmps_oge",
             Opcode::Not => "not",
             Opcode::Neg => "neg",
             Opcode::FNeg => "fneg",
@@ -1063,7 +1183,8 @@ macro_rules! every_opcode {
 every_opcode! {
     Entry, Ret, Br, Cbr, Switch, IndirectBr, Add, Sub, Mul, DivU, DivS, ModU, ModS, Shl, Lsr, Asr,
     FAdd, FSub, FMul, FDiv, And, Or, Xor, SetEq, SetNe, SetLt, SetLe, SetGt, SetGe, SetB, SetBe,
-    SetA, SetAe, FCmpOEq, FCmpONe, FCmpOLt, FCmpOLe, FCmpOGt, FCmpOGe, Not, Neg, FNeg, Fabs,
+    SetA, SetAe, FCmpOEq, FCmpONe, FCmpOLt, FCmpOLe, FCmpOGt, FCmpOGe, FCmpsOLt, FCmpsOLe, FCmpsOGt,
+    FCmpsOGe, Not, Neg, FNeg, Fabs,
     CopySign, Sqrt, FMin, FMax, Fma, Trunc, Zext, Sext, FCvtU, FCvtS, UCvtF, SCvtF, FCvtF, Load,
     Store, Phi, PhiSource, Copy, SymAddr, TlsAddr, Call, Select, SetVal, Nop, VaStart, VaArg,
     VaEnd, VaCopy, VaArgPackLen, ConstantP, Bswap16, Bswap32, Bswap64, Ctz32, Ctz64, Clz32, Clz64,
@@ -3946,6 +4067,36 @@ mod tests {
             assert!(op.is_listed());
             assert!(!Opcode::ALL[..i].contains(op), "{op:?} is listed twice");
         }
+    }
+
+    /// Every float comparison opcode is exactly one `FloatCmp`, and back:
+    /// a consumer that takes one apart can trust it names every opcode. The
+    /// four signaling ones are the relationals, each the twin of a quiet one
+    /// with the same predicate; equality is quiet only.
+    #[test]
+    fn float_cmp_names_every_float_comparison_once() {
+        let mut signaling = 0;
+        for &op in Opcode::ALL {
+            let Some(cmp) = op.float_cmp() else {
+                assert!(!op.is_float_comparison(), "{op:?}");
+                continue;
+            };
+            assert_eq!(Opcode::from(cmp), op, "{cmp:?}");
+            assert_eq!(cmp.quiet().nan(), NanCompare::Quiet, "{cmp:?}");
+            assert_eq!(cmp.quiet().quiet(), cmp.quiet(), "{cmp:?}");
+            match cmp.signaling() {
+                Some(s) => {
+                    assert_eq!(s.nan(), NanCompare::Signaling, "{cmp:?}");
+                    assert_eq!(s.quiet(), cmp.quiet(), "{cmp:?}");
+                }
+                None => assert!(matches!(cmp, FloatCmp::Eq | FloatCmp::Ne)),
+            }
+            if cmp.nan() == NanCompare::Signaling {
+                signaling += 1;
+                assert_ne!(Opcode::from(cmp.quiet()), op);
+            }
+        }
+        assert_eq!(signaling, 4);
     }
 
     /// I5 -- a memory access is a DCE root, except a `Load`. Over the whole

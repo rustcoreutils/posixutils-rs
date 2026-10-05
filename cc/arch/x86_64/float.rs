@@ -14,7 +14,7 @@ use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, XmmOperand};
 use super::regalloc::{Loc, Reg, XmmReg};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize};
 use crate::float::{FloatVal, IntegralRounding};
-use crate::ir::{Instruction, Opcode, PseudoId};
+use crate::ir::{FloatCmp, Instruction, NanCompare, Opcode, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
 /// What `emit_fp_sign_bit_op` does to the sign bit.
@@ -658,7 +658,8 @@ impl X86_64CodeGen {
             IntegralRounding::Ceil => (x, int),
             _ => return,
         };
-        self.push_lir(X86Inst::UComiFp {
+        self.push_lir(X86Inst::ComiFp {
+            nan: NanCompare::Quiet,
             size: fp_size,
             src: XmmOperand::Reg(below),
             dst: above,
@@ -893,6 +894,12 @@ impl X86_64CodeGen {
             Some(t) => t,
             None => return,
         };
+        let Some(cmp) = insn.op.float_cmp() else {
+            return;
+        };
+        // `comis*` for C's relational operators, `ucomis*` for the rest: the
+        // flags are the same, only a quiet NaN's invalid differs.
+        let nan = cmp.nan();
         // The operands' format; the result is an `int`.
         let (operand, width) = (insn.operand_type(), insn.operand_width());
         let fp_size = FpSize::from_type_or_bits(operand, width, types, &self.base.target);
@@ -906,18 +913,20 @@ impl X86_64CodeGen {
         // Load first operand to XMM15
         self.emit_fp_move(src1, XmmReg::Xmm15, move_size);
 
-        // Compare with second operand using ucomiss/ucomisd
+        // Compare with second operand using (u)comiss/(u)comisd
         let src2_loc = self.get_location(src2);
         match src2_loc {
             Loc::Xmm(x) => {
-                self.push_lir(X86Inst::UComiFp {
+                self.push_lir(X86Inst::ComiFp {
+                    nan,
                     size: fp_size,
                     src: XmmOperand::Reg(x),
                     dst: XmmReg::Xmm15,
                 });
             }
             Loc::Stack(offset) => {
-                self.push_lir(X86Inst::UComiFp {
+                self.push_lir(X86Inst::ComiFp {
+                    nan,
                     size: fp_size,
                     src: XmmOperand::Mem(self.stack_mem(offset)),
                     dst: XmmReg::Xmm15,
@@ -929,7 +938,8 @@ impl X86_64CodeGen {
                 } else {
                     self.emit_fp_imm_to_xmm(v, XmmReg::Xmm14, move_size.bits());
                 }
-                self.push_lir(X86Inst::UComiFp {
+                self.push_lir(X86Inst::ComiFp {
+                    nan,
                     size: fp_size,
                     src: XmmOperand::Reg(XmmReg::Xmm14),
                     dst: XmmReg::Xmm15,
@@ -937,7 +947,8 @@ impl X86_64CodeGen {
             }
             _ => {
                 self.emit_fp_move(src2, XmmReg::Xmm14, move_size);
-                self.push_lir(X86Inst::UComiFp {
+                self.push_lir(X86Inst::ComiFp {
+                    nan,
                     size: fp_size,
                     src: XmmOperand::Reg(XmmReg::Xmm14),
                     dst: XmmReg::Xmm15,
@@ -966,14 +977,13 @@ impl X86_64CodeGen {
         } else {
             Reg::R11
         };
-        match insn.op {
-            Opcode::FCmpOEq | Opcode::FCmpOLt | Opcode::FCmpOLe => {
+        match cmp {
+            FloatCmp::Eq | FloatCmp::Lt(_) | FloatCmp::Le(_) => {
                 // result = setcc(dst) AND setnp(scratch)
-                let cc = match insn.op {
-                    Opcode::FCmpOEq => CondCode::Eq,
-                    Opcode::FCmpOLt => CondCode::Ult,
-                    Opcode::FCmpOLe => CondCode::Ule,
-                    _ => unreachable!(),
+                let cc = match cmp {
+                    FloatCmp::Lt(_) => CondCode::Ult,
+                    FloatCmp::Le(_) => CondCode::Ule,
+                    _ => CondCode::Eq,
                 };
                 self.push_lir(X86Inst::SetCC { cc, dst: dst_reg });
                 self.push_lir(X86Inst::SetCC {
@@ -986,7 +996,7 @@ impl X86_64CodeGen {
                     dst: dst_reg,
                 });
             }
-            Opcode::FCmpONe => {
+            FloatCmp::Ne => {
                 // result = setne(dst) OR setp(scratch)
                 self.push_lir(X86Inst::SetCC {
                     cc: CondCode::Ne,
@@ -1002,19 +1012,18 @@ impl X86_64CodeGen {
                     dst: dst_reg,
                 });
             }
-            Opcode::FCmpOGt => {
+            FloatCmp::Gt(_) => {
                 self.push_lir(X86Inst::SetCC {
                     cc: CondCode::Ugt,
                     dst: dst_reg,
                 });
             }
-            Opcode::FCmpOGe => {
+            FloatCmp::Ge(_) => {
                 self.push_lir(X86Inst::SetCC {
                     cc: CondCode::Uge,
                     dst: dst_reg,
                 });
             }
-            _ => return,
         }
 
         self.push_lir(X86Inst::Movzx {
@@ -1281,7 +1290,8 @@ impl X86_64CodeGen {
             fp_size.bits(),
         );
 
-        self.push_lir(X86Inst::UComiFp {
+        self.push_lir(X86Inst::ComiFp {
+            nan: NanCompare::Quiet,
             size: fp_size,
             src: XmmOperand::Reg(XmmReg::Xmm14),
             dst: XmmReg::Xmm15,

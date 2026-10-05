@@ -10,7 +10,9 @@
 
 use super::linearize::{BlockVolatility, LocalBinding, ObjectPlace, Storage};
 use super::memexpand::{self, BlockOp};
-use super::{BasicBlockId, CallAbiInfo, Instruction, Opcode, Pseudo, PseudoId};
+use super::{
+    BasicBlockId, CallAbiInfo, FloatCmp, Instruction, NanCompare, Opcode, Pseudo, PseudoId,
+};
 use crate::abi::get_abi_for_conv;
 use crate::constexpr::ConstScope;
 use crate::diag::{error, Position};
@@ -193,35 +195,45 @@ struct ComplexHalfOps {
 }
 
 /// The floating comparison C's relational or equality operator `op` is.
+///
+/// The relational operators are IEEE 754's *signaling* predicates under
+/// Annex F (C17 F.9.3): `NaN < 1.0` is false and raises invalid. Equality is
+/// quiet. The one place a C operator becomes a float comparison, so the one
+/// place that decides which.
 pub(crate) fn float_comparison(op: BinaryOp) -> Option<Opcode> {
-    Some(match op {
-        BinaryOp::Lt => Opcode::FCmpOLt,
-        BinaryOp::Gt => Opcode::FCmpOGt,
-        BinaryOp::Le => Opcode::FCmpOLe,
-        BinaryOp::Ge => Opcode::FCmpOGe,
-        BinaryOp::Eq => Opcode::FCmpOEq,
-        BinaryOp::Ne => Opcode::FCmpONe,
+    use NanCompare::Signaling;
+    Some(Opcode::from(match op {
+        BinaryOp::Lt => FloatCmp::Lt(Signaling),
+        BinaryOp::Gt => FloatCmp::Gt(Signaling),
+        BinaryOp::Le => FloatCmp::Le(Signaling),
+        BinaryOp::Ge => FloatCmp::Ge(Signaling),
+        BinaryOp::Eq => FloatCmp::Eq,
+        BinaryOp::Ne => FloatCmp::Ne,
         _ => return None,
-    })
+    }))
 }
 
 /// The one floating comparison a member of the `isgreater` family is, or
 /// `None` for the two that take more than one (`islessgreater`,
 /// `isunordered`).
+///
+/// Quiet, every one: raising nothing for a NaN is what the family is for
+/// (C17 7.12.14).
 pub(crate) fn fp_compare_opcode(cmp: FpCompare) -> Option<Opcode> {
-    Some(match cmp {
-        FpCompare::Greater => Opcode::FCmpOGt,
-        FpCompare::GreaterEqual => Opcode::FCmpOGe,
-        FpCompare::Less => Opcode::FCmpOLt,
-        FpCompare::LessEqual => Opcode::FCmpOLe,
+    use NanCompare::Quiet;
+    Some(Opcode::from(match cmp {
+        FpCompare::Greater => FloatCmp::Gt(Quiet),
+        FpCompare::GreaterEqual => FloatCmp::Ge(Quiet),
+        FpCompare::Less => FloatCmp::Lt(Quiet),
+        FpCompare::LessEqual => FloatCmp::Le(Quiet),
         // C23 7.12.17.1 has `iseqsig` raise `FE_INVALID` for an unordered
-        // pair, quiet NaN included -- the reverse of its siblings. The quiet
-        // compare emitted for it does not raise it for a quiet NaN. The
-        // *answer* is exact; only the exception flag differs -- the same gap
-        // c17's `<` and `>` have, which use this compare too.
-        FpCompare::Equal => Opcode::FCmpOEq,
+        // pair, quiet NaN included -- the reverse of its siblings. The IR
+        // has no signaling equality, so the quiet compare emitted for it does
+        // not raise it for a quiet NaN. The *answer* is exact; only the
+        // exception flag differs.
+        FpCompare::Equal => FloatCmp::Eq,
         FpCompare::LessGreater | FpCompare::Unordered => return None,
-    })
+    }))
 }
 
 /// A controlling expression, evaluated for a branch.
@@ -2083,6 +2095,10 @@ impl<'a> super::linearize::Linearizer<'a> {
 
     /// `op` comparing `lhs` and `rhs`, of type `typ` at `size` bits, into a
     /// fresh `int` pseudo. See [`Self::compare_insn`].
+    ///
+    /// A quiet relational of a format that has none of its own -- binary128,
+    /// see `has_quiet_relational` -- is built as gcc builds it: the
+    /// signaling comparison, run only once the operands are known ordered.
     pub(crate) fn emit_compare(
         &mut self,
         op: Opcode,
@@ -2090,6 +2106,23 @@ impl<'a> super::linearize::Linearizer<'a> {
         rhs: PseudoId,
         typ: TypeId,
     ) -> PseudoId {
+        let guarded = op
+            .float_cmp()
+            .filter(|c| c.nan() == NanCompare::Quiet)
+            .and_then(FloatCmp::signaling)
+            .filter(|_| !crate::arch::mapping::has_quiet_relational(self.types, typ));
+        if let Some(signaling) = guarded {
+            let int = self.types.int_id;
+            let size = self.types.size_bits(int);
+            let unordered = self.emit_unordered(lhs, rhs, typ);
+            return self.emit_diamond(
+                unordered,
+                int,
+                size,
+                |lin| lin.emit_const(0, int),
+                |lin| lin.emit_compare(signaling.into(), lhs, rhs, typ),
+            );
+        }
         let dst = self.alloc_pseudo();
         self.emit(self.compare_insn(op, dst, (lhs, rhs), typ));
         dst

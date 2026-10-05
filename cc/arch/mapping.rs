@@ -15,7 +15,9 @@
 
 use crate::abi::{get_abi_for_conv, ArgClass, CallingConv};
 use crate::float::{ComplexRoutineFormat, FpFormat};
-use crate::ir::{CallAbiInfo, Function, Instruction, Module, Opcode, PseudoId};
+use crate::ir::{
+    CallAbiInfo, FloatCmp, Function, Instruction, Module, NanCompare, Opcode, PseudoId,
+};
 use crate::rtlib::{Float16Abi, RtlibNames};
 use crate::target::{Arch, Target};
 use crate::types::{TypeId, TypeKind, TypeTable};
@@ -170,6 +172,20 @@ pub(crate) fn float_suffix(kind: TypeKind, target: &Target) -> &'static str {
 /// extended and is not this.
 fn is_binary128(types: &TypeTable, typ: TypeId) -> bool {
     types.fp_format(typ) == Some(FpFormat::Binary128)
+}
+
+/// Whether a *quiet* relational comparison of two `typ` values is one
+/// operation: an instruction, or a single library call.
+///
+/// Not for binary128, which is software on every target: libgcc's ordering
+/// helpers (`__lttf2`, `__letf2`, `__gttf2`, `__getf2`) all raise invalid for
+/// a quiet NaN, and its quiet ones (`__eqtf2`, `__netf2`, `__unordtf2`)
+/// answer nothing but equality. A quiet `<` there is an unordered test
+/// guarding the signaling call, as gcc builds it (gcc's test is one
+/// `__unordtf2`, c17's two quiet self-comparisons) -- control flow, which
+/// the linearizer emits (`emit_compare`) and `ifconv` must not undo.
+pub(crate) fn has_quiet_relational(types: &TypeTable, typ: TypeId) -> bool {
+    !is_binary128(types, typ)
 }
 
 /// Get the integer suffix for a long double↔int conversion.
@@ -1866,14 +1882,21 @@ fn map_binary128(insn: &Instruction, ctx: &mut MappingCtx<'_>) -> Option<MappedI
             if !is_binary128(ctx.types, operand_typ) {
                 return None;
             }
-            let (name, cmp_op) = match insn.op {
-                Opcode::FCmpOLt => ("__lttf2", Opcode::SetLt),
-                Opcode::FCmpOLe => ("__letf2", Opcode::SetLe),
-                Opcode::FCmpOGt => ("__gttf2", Opcode::SetGt),
-                Opcode::FCmpOGe => ("__getf2", Opcode::SetGe),
-                Opcode::FCmpOEq => ("__eqtf2", Opcode::SetEq),
-                Opcode::FCmpONe => ("__netf2", Opcode::SetNe),
-                _ => unreachable!(),
+            // libgcc's ordering helpers signal and its equality helpers do
+            // not, which is exactly C's split. A quiet relational has no
+            // helper; see `has_quiet_relational`.
+            let cmp = insn.op.float_cmp()?;
+            assert!(
+                cmp.nan() == NanCompare::Signaling || cmp.signaling().is_none(),
+                "a quiet binary128 {cmp:?} reached mapping: the linearizer guards it"
+            );
+            let (name, cmp_op) = match cmp {
+                FloatCmp::Lt(_) => ("__lttf2", Opcode::SetLt),
+                FloatCmp::Le(_) => ("__letf2", Opcode::SetLe),
+                FloatCmp::Gt(_) => ("__gttf2", Opcode::SetGt),
+                FloatCmp::Ge(_) => ("__getf2", Opcode::SetGe),
+                FloatCmp::Eq => ("__eqtf2", Opcode::SetEq),
+                FloatCmp::Ne => ("__netf2", Opcode::SetNe),
             };
 
             let result_pseudo = insn.target.expect("cmp must have target");

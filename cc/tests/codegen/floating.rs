@@ -964,9 +964,9 @@ static __attribute__((noinline)) int t_long_double_literals_keep_their_precision
  * and `<` / `<=` were true in both operand orders. Only `>` and `>=` were
  * right, because their codes are already false when CF is set.
  *
- * The compare also used `fcomip`, which raises invalid-operation on a quiet
- * NaN; C's relational operators other than the signalling ones want the
- * quiet `fucomip`.
+ * `fcomip` and `fucomip` set the same flags: the relational operators use
+ * `fcomip`, which raises invalid for a quiet NaN as C17 F.9.3 asks, and
+ * `==` and `!=` the quiet `fucomip` (tests/codegen/fp_compare_traps.rs).
  *
  * Every expectation is gcc's output on the same source.
  */

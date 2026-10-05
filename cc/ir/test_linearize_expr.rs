@@ -499,20 +499,15 @@ fn test_float_comparison() {
     let module = ctx.linearize(&tu);
     let ir = format!("{}", module.display(&ctx.types));
 
-    // Float comparison should produce fcmp instruction
+    // `<` is the signaling comparison (C17 F.9.3), and only that.
     assert!(
-        has_op(
-            &module,
-            &[
-                Opcode::FCmpOEq,
-                Opcode::FCmpONe,
-                Opcode::FCmpOLt,
-                Opcode::FCmpOLe,
-                Opcode::FCmpOGt,
-                Opcode::FCmpOGe
-            ]
-        ),
-        "Float comparison should produce fcmp instruction: {}",
+        has_op(&module, &[Opcode::FCmpsOLt]),
+        "Float `<` should produce fcmps_olt: {}",
+        ir
+    );
+    assert!(
+        !has_op(&module, &[Opcode::FCmpOLt]),
+        "Float `<` must not be the quiet compare: {}",
         ir
     );
 }

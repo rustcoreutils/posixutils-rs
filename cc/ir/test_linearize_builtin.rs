@@ -626,3 +626,109 @@ fn test_va_arg_of_complex_writes_a_local() {
         );
     }
 }
+
+// Floating comparisons: signaling or quiet
+
+/// The float comparisons `f` computes, in order.
+fn float_cmps(module: &Module, name: &str) -> Vec<Opcode> {
+    insns_of(module, name)
+        .iter()
+        .map(|i| i.op)
+        .filter(|op| op.is_float_comparison())
+        .collect()
+}
+
+/// C17 F.9.3: `<`, `<=`, `>` and `>=` are IEEE 754's signaling predicates,
+/// and raise invalid for a quiet NaN; `==`, `!=` and the 7.12.14 macros are
+/// the quiet ones. So is every comparison the compiler makes up for itself:
+/// `isfinite` and `fpclassify` raise nothing for a NaN either, and neither
+/// does the boolean test of a float.
+#[test]
+fn test_relational_operators_signal_and_everything_else_is_quiet() {
+    use Opcode::*;
+    let cases: &[(&str, &[Opcode])] = &[
+        ("a < b", &[FCmpsOLt]),
+        ("a <= b", &[FCmpsOLe]),
+        ("a > b", &[FCmpsOGt]),
+        ("a >= b", &[FCmpsOGe]),
+        ("!(a < b)", &[FCmpsOLt]),
+        ("a < 1", &[FCmpsOLt]),
+        ("a == b", &[FCmpOEq]),
+        ("a != b", &[FCmpONe]),
+        ("!a", &[FCmpOEq]),
+        ("__builtin_isless(a, b)", &[FCmpOLt]),
+        ("__builtin_islessequal(a, b)", &[FCmpOLe]),
+        ("__builtin_isgreater(a, b)", &[FCmpOGt]),
+        ("__builtin_isgreaterequal(a, b)", &[FCmpOGe]),
+        ("__builtin_islessgreater(a, b)", &[FCmpOLt, FCmpOGt]),
+        ("__builtin_isunordered(a, b)", &[FCmpONe, FCmpONe]),
+        ("__builtin_isfinite(a)", &[FCmpOLt, FCmpOGt]),
+    ];
+    for t in ["float", "double", "long double"] {
+        for (expr, want) in cases {
+            let src = format!("int f({t} a, {t} b) {{ return {expr}; }}");
+            let module = linearize_source(&src, &Target::host());
+            assert_eq!(float_cmps(&module, "f"), *want, "{t}: {expr}");
+        }
+    }
+    let src = "int f(double a) { return __builtin_fpclassify(0, 1, 2, 3, 4, a); }";
+    let module = linearize_source(src, &Target::host());
+    let cmps = float_cmps(&module, "f");
+    assert!(!cmps.is_empty());
+    assert!(
+        cmps.iter()
+            .all(|op| op.float_cmp().unwrap().nan() == NanCompare::Quiet),
+        "{cmps:?}"
+    );
+}
+
+/// binary128 has no quiet relational of its own -- libgcc's ordering helpers
+/// all signal -- so `isless` on aarch64's `long double` is the signaling
+/// comparison behind an unordered test, as gcc builds it. `<` needs no
+/// guard: it is meant to signal.
+#[test]
+fn test_quiet_binary128_relational_is_guarded_by_an_unordered_test() {
+    let target = Target::new(Arch::Aarch64, Os::Linux);
+    for t in ["long double", "__float128"] {
+        let src = format!(
+            "int q({t} a, {t} b) {{ return __builtin_isless(a, b); }}\n\
+             int s({t} a, {t} b) {{ return a < b; }}\n"
+        );
+        let module = linearize_source(&src, &target);
+        let q = insns_of(&module, "q");
+        let ops: Vec<Opcode> = q.iter().map(|i| i.op).collect();
+        assert_eq!(
+            float_cmps(&module, "q"),
+            [Opcode::FCmpONe, Opcode::FCmpONe, Opcode::FCmpsOLt],
+            "{t}"
+        );
+        assert!(ops.contains(&Opcode::Cbr), "{t}: {ops:?}");
+        assert_eq!(float_cmps(&module, "s"), [Opcode::FCmpsOLt], "{t}");
+        assert!(
+            !insns_of(&module, "s").iter().any(|i| i.op == Opcode::Cbr),
+            "{t}"
+        );
+    }
+    // The hardware formats keep the one quiet compare.
+    let module = linearize_source(
+        "int q(double a, double b) { return __builtin_isless(a, b); }",
+        &target,
+    );
+    assert_eq!(float_cmps(&module, "q"), [Opcode::FCmpOLt]);
+}
+
+/// A conditional expression evaluates one arm (C17 6.5.15p4), so an arm is
+/// computed unconditionally only when evaluating it cannot be observed. A
+/// float relational can: it raises invalid for a NaN, which
+/// `isnan(a) ? 0 : a < b` exists to avoid. Equality cannot.
+#[test]
+fn test_a_relational_arm_is_not_evaluated_unconditionally() {
+    let src = "int r(int c, double a, double b) { return c ? a < b : 0; }\n\
+               int e(int c, double a, double b) { return c ? a == b : 0; }\n\
+               int i(int c, int a, int b) { return c ? a < b : 0; }\n";
+    let module = linearize_source(src, &Target::host());
+    let branches = |name| insns_of(&module, name).iter().any(|i| i.op == Opcode::Cbr);
+    assert!(branches("r"), "a signaling compare stays behind its branch");
+    assert!(!branches("e"), "a quiet compare is speculated");
+    assert!(!branches("i"), "an integer compare is speculated");
+}

@@ -103,11 +103,15 @@ infinite operand, a division by zero, a result or narrowing that overflows
 and folding the operation would take the flag with it. An inexact or
 underflowing result is folded, as gcc folds it without `-frounding-math`.
 
-Comparisons of two constants are the exception, as in gcc: one against a NaN
-folds -- every ordered predicate to 0, `!=` to 1 -- although an ordered
-comparison with a NaN raises `FE_INVALID`. At run time both backends emit
-quiet compares, which do not raise it for a quiet NaN either, so the fold
-agrees with what the unfolded code does.
+Comparisons are the exception, as in gcc: from `-O1` one whose answer no
+operand value can change folds -- against a NaN every ordered predicate to 0
+and `!=` to 1, `x > +Inf` to 0, `(x < y) && (x > y)` to 0 -- although a
+relational operator with a NaN operand raises `FE_INVALID` at run time
+(C17 F.9.3: they are the signaling compares, `comis*`/`fcomip`/`fcmpe`), and
+the fold takes the flag with it. gcc.c-torture's `ieee/fp-cmp-6` and friends
+require the fold. What the optimizer never does is the other half: run a
+relational on a path the program would not have, or turn one into a quiet
+compare where its operands may be unordered.
 
 ## Known Divergences
 

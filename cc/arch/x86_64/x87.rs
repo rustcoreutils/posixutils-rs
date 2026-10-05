@@ -27,7 +27,7 @@ use super::lir::{GpOperand, MemAddr, ShiftCount, X86Inst, X87BinOp, X87IntWidth,
 use super::regalloc::{Loc, Reg, X87ControlWords, XmmReg};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize};
 use crate::float::FpFormat;
-use crate::ir::{Instruction, Opcode, PseudoId};
+use crate::ir::{FloatCmp, Instruction, NanCompare, Opcode, PseudoId};
 use crate::types::{TypeKind, TypeTable};
 
 /// 2^63 as the bit pattern of a `double`.
@@ -524,7 +524,10 @@ impl X86_64CodeGen {
     ///   fstp    %st(0)       ; discard remaining value
     ///   setcc   %al          ; set result based on condition
     ///
-    /// `fucomip` reports an unordered result -- either operand a NaN -- by
+    /// `fcomip` for C's relational operators and `fucomip` for the rest:
+    /// the flags are the same, and only a quiet NaN's invalid differs.
+    ///
+    /// Both report an unordered result -- either operand a NaN -- by
     /// setting CF, ZF *and* PF together. Those are exactly the flags the
     /// unsigned condition codes read as "below" and "equal", so a naive
     /// mapping makes every NaN comparison answer as though the operands were
@@ -546,11 +549,14 @@ impl X86_64CodeGen {
             Some(t) => t,
             None => return,
         };
+        let Some(cmp) = insn.op.float_cmp() else {
+            return;
+        };
 
         // `<` and `<=` are evaluated as the mirrored `>` / `>=` so that the
         // unordered case falls out false; that means loading the operands the
         // other way round.
-        let swap = matches!(insn.op, Opcode::FCmpOLt | Opcode::FCmpOLe);
+        let swap = matches!(cmp, FloatCmp::Lt(_) | FloatCmp::Le(_));
         let (first, second) = if swap { (src2, src1) } else { (src1, src2) };
 
         // Load in reverse order so the comparison reads first op second.
@@ -561,19 +567,18 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::X87Load { addr: first_addr });
 
         // Compare ST(0) with ST(1), set EFLAGS, pop ST(0)
-        self.push_lir(X86Inst::X87CmpPop);
+        self.push_lir(X86Inst::X87CmpPop { nan: cmp.nan() });
 
         // Discard remaining ST(0)
         self.push_lir(X86Inst::X87Pop);
 
-        let cc = match insn.op {
-            Opcode::FCmpOEq => CondCode::Eq,
-            Opcode::FCmpONe => CondCode::Ne,
-            Opcode::FCmpOLt => CondCode::Ugt, // mirrored: b > a
-            Opcode::FCmpOLe => CondCode::Uge, // mirrored: b >= a
-            Opcode::FCmpOGt => CondCode::Ugt, // CF=0 and ZF=0
-            Opcode::FCmpOGe => CondCode::Uge, // CF=0
-            _ => return,
+        let cc = match cmp {
+            FloatCmp::Eq => CondCode::Eq,
+            FloatCmp::Ne => CondCode::Ne,
+            FloatCmp::Lt(_) => CondCode::Ugt, // mirrored: b > a
+            FloatCmp::Le(_) => CondCode::Uge, // mirrored: b >= a
+            FloatCmp::Gt(_) => CondCode::Ugt, // CF=0 and ZF=0
+            FloatCmp::Ge(_) => CondCode::Uge, // CF=0
         };
 
         let dst_loc = self.get_location(target);
@@ -588,8 +593,8 @@ impl X86_64CodeGen {
         // Equality has to consult the parity flag as well, because ZF alone
         // cannot tell "equal" from "unordered": both set it. R11 is the
         // reserved scratch (see the note on emit_fp_move).
-        match insn.op {
-            Opcode::FCmpOEq => {
+        match cmp {
+            FloatCmp::Eq => {
                 // equal  =  ZF=1 and not unordered
                 self.push_lir(X86Inst::SetCC {
                     cc: CondCode::Np,
@@ -601,7 +606,7 @@ impl X86_64CodeGen {
                     dst: dst_reg,
                 });
             }
-            Opcode::FCmpONe => {
+            FloatCmp::Ne => {
                 // not equal  =  ZF=0 or unordered
                 self.push_lir(X86Inst::SetCC {
                     cc: CondCode::P,
@@ -1150,7 +1155,9 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::X87LoadDouble {
             addr: const_addr.clone(),
         });
-        self.push_lir(X86Inst::X87CmpPop);
+        self.push_lir(X86Inst::X87CmpPop {
+            nan: NanCompare::Quiet,
+        });
         self.push_lir(X86Inst::Jcc {
             cc: CondCode::Ule,
             target: big_label.clone(),

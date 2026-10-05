@@ -216,7 +216,7 @@ mod tests {
         let mapper = Aarch64Mapper;
 
         let mut insn = Instruction::compare(
-            Opcode::FCmpOLt,
+            Opcode::FCmpsOLt,
             PseudoId(2),
             (PseudoId(0), PseudoId(1)),
             (types.int_id, 128),
@@ -256,6 +256,63 @@ mod tests {
             "__eqtf2",
             Opcode::SetEq,
         );
+    }
+
+    /// libgcc's ordering helpers are the *signaling* comparisons, and its
+    /// equality helpers the quiet ones, which is C's split exactly. A quiet
+    /// relational has no helper, and the linearizer never emits one for
+    /// binary128 (`has_quiet_relational`): reaching here is a bug, loudly.
+    #[test]
+    fn test_aarch64_longdouble_cmp_names_the_signaling_helpers() {
+        let target = Target::new(Arch::Aarch64, Os::Linux);
+        let types = TypeTable::new(&target);
+        let mapper = Aarch64Mapper;
+        for (op, name, int_op) in [
+            (Opcode::FCmpsOLt, "__lttf2", Opcode::SetLt),
+            (Opcode::FCmpsOLe, "__letf2", Opcode::SetLe),
+            (Opcode::FCmpsOGt, "__gttf2", Opcode::SetGt),
+            (Opcode::FCmpsOGe, "__getf2", Opcode::SetGe),
+            (Opcode::FCmpOEq, "__eqtf2", Opcode::SetEq),
+            (Opcode::FCmpONe, "__netf2", Opcode::SetNe),
+        ] {
+            let mut insn = Instruction::compare(
+                op,
+                PseudoId(2),
+                (PseudoId(0), PseudoId(1)),
+                (types.int_id, 128),
+                (types.int_id, 32),
+            );
+            insn.src_typ = Some(types.longdouble_id);
+            let mut func = make_minimal_func(&types);
+            let mut ctx = MappingCtx {
+                func: &mut func,
+                types: &types,
+                target: &target,
+            };
+            assert_cmp_libcall(&library_call(&insn, &mut ctx, &mapper), name, int_op);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "quiet binary128")]
+    fn test_aarch64_quiet_longdouble_relational_never_reaches_mapping() {
+        let target = Target::new(Arch::Aarch64, Os::Linux);
+        let types = TypeTable::new(&target);
+        let mut insn = Instruction::compare(
+            Opcode::FCmpOLt,
+            PseudoId(2),
+            (PseudoId(0), PseudoId(1)),
+            (types.int_id, 128),
+            (types.int_id, 32),
+        );
+        insn.src_typ = Some(types.longdouble_id);
+        let mut func = make_minimal_func(&types);
+        let mut ctx = MappingCtx {
+            func: &mut func,
+            types: &types,
+            target: &target,
+        };
+        library_call(&insn, &mut ctx, &Aarch64Mapper);
     }
 
     #[test]

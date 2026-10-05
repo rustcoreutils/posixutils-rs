@@ -20,7 +20,7 @@ use crate::arch::lir::{is_private_name, CondCode, Directive, FpSize, Label, Oper
 use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{FrameBase, Loc, Reg, X87ControlWords, X87Scratch, XmmReg};
 use crate::arch::x86_64::x87::{is_x87_float_to_int, is_x87_fp_cvt, is_x87_int_to_float};
-use crate::ir::{Instruction, Module, Opcode, PseudoId, PseudoKind};
+use crate::ir::{Instruction, Module, NanCompare, Opcode, PseudoId, PseudoKind};
 use crate::target::{Os, Target};
 use crate::types::TypeTable;
 use std::collections::{HashMap, HashSet};
@@ -671,7 +671,8 @@ impl X86_64CodeGen {
                     FpSize::Double
                 };
                 self.push_lir(X86Inst::XorpsSelf { reg: XmmReg::Xmm15 });
-                self.push_lir(X86Inst::UComiFp {
+                self.push_lir(X86Inst::ComiFp {
+                    nan: NanCompare::Quiet,
                     size: fp_size,
                     src: XmmOperand::Reg(*x),
                     dst: XmmReg::Xmm15,

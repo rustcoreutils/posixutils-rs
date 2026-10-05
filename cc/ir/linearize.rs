@@ -14,7 +14,7 @@ use super::memexpand::BlockOp;
 use super::ssa::ssa_convert;
 use super::{
     BasicBlock, BasicBlockId, CallAbiInfo, FenceScope, Function, Initializer, Instruction,
-    MemoryOrder, Module, Opcode, Pseudo, PseudoId, PseudoKind,
+    MemoryOrder, Module, NanCompare, Opcode, Pseudo, PseudoId, PseudoKind,
 };
 use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::diag::{get_all_stream_names, Position};
@@ -2461,6 +2461,19 @@ impl<'a> Linearizer<'a> {
         )
     }
 
+    /// Whether `left op right` is a floating comparison that raises invalid
+    /// for a NaN operand: the one [`super::linearize_emit::float_comparison`]
+    /// makes of it, when the operands are compared as floats.
+    fn is_signaling_comparison(&self, op: BinaryOp, left: &Expr, right: &Expr) -> bool {
+        let floating = [left, right]
+            .iter()
+            .any(|e| e.typ.is_some_and(|t| self.types.is_float(t)));
+        floating
+            && super::linearize_emit::float_comparison(op)
+                .and_then(Opcode::float_cmp)
+                .is_some_and(|c| c.nan() == NanCompare::Signaling)
+    }
+
     /// Check if an expression is "pure" (side-effect-free).
     /// Pure expressions can be speculatively evaluated, enabling cmov/csel codegen.
     ///
@@ -2514,11 +2527,15 @@ impl<'a> Linearizer<'a> {
 
             // Binary ops are pure if both operands are pure AND the
             // operator can't trap. Division and modulo cause SIGFPE
-            // on division by zero, so they're never pure.
+            // on division by zero, so they're never pure. A floating
+            // relational raises invalid for a NaN operand (C17 F.9.3), so
+            // evaluating it on a path that would not have can set a flag the
+            // program reads: `isnan(x) ? 0 : x < y`.
             ExprKind::Binary {
                 op, left, right, ..
             } => {
                 !matches!(op, BinaryOp::Div | BinaryOp::Mod)
+                    && !self.is_signaling_comparison(*op, left, right)
                     && self.is_pure_expr(left)
                     && self.is_pure_expr(right)
             }
@@ -3411,11 +3428,10 @@ impl<'a> Linearizer<'a> {
 
     /// The C99 7.12.14 relations, each yielding 0 or 1.
     ///
-    /// Every one of them is a comparison c17 already emits. The family exists
-    /// in C because the ordinary relational operators are specified to raise
-    /// `FE_INVALID` on an unordered pair and these are not -- and c17 emits
-    /// the quiet compare (`ucomis*`, `fucomip`) for both, so the two agree
-    /// here and there is nothing further to arrange.
+    /// The family exists in C because the ordinary relational operators
+    /// raise `FE_INVALID` on an unordered pair and these do not: each is the
+    /// *quiet* comparison (`fp_compare_opcode`), where `<` is the signaling
+    /// one (`float_comparison`).
     ///
     /// Both operands are linearized before any comparison is emitted, so
     /// `isgreater(f(), g())` calls each function exactly once.
@@ -3435,15 +3451,18 @@ impl<'a> Linearizer<'a> {
                 let above = self.emit_compare(Opcode::FCmpOGt, a, b, typ);
                 self.emit_bool_combine(Opcode::Or, below, above)
             }
-            // `isnan(a) || isnan(b)`, spelled as the self-comparison
-            // `linearize_fp_test` uses for `isnan`.
-            FpCompare::Unordered => {
-                let a_nan = self.emit_compare(Opcode::FCmpONe, a, a, typ);
-                let b_nan = self.emit_compare(Opcode::FCmpONe, b, b, typ);
-                self.emit_bool_combine(Opcode::Or, a_nan, b_nan)
-            }
+            FpCompare::Unordered => self.emit_unordered(a, b, typ),
             _ => unreachable!("{cmp:?} is one comparison"),
         }
+    }
+
+    /// Whether `a` and `b` are unordered: `isnan(a) || isnan(b)`, spelled as
+    /// the self-comparison `linearize_fp_test` uses for `isnan`, which is
+    /// quiet.
+    pub(crate) fn emit_unordered(&mut self, a: PseudoId, b: PseudoId, typ: TypeId) -> PseudoId {
+        let a_nan = self.emit_compare(Opcode::FCmpONe, a, a, typ);
+        let b_nan = self.emit_compare(Opcode::FCmpONe, b, b, typ);
+        self.emit_bool_combine(Opcode::Or, a_nan, b_nan)
     }
 
     /// `x > -inf && x < +inf`, which is false for a NaN because both

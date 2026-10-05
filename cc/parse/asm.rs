@@ -208,7 +208,9 @@ impl Parser<'_> {
         self.expect_special(b')')?;
         self.expect_special(b';')?;
 
-        // Note: is_volatile is parsed but not yet used (Phase 2 feature)
+        // Every asm is already treated as volatile: `Opcode::Asm` is a memory
+        // access, so DCE never deletes one and no pass reorders it past
+        // another memory operation. The qualifier has nothing left to add.
         let _ = is_volatile;
 
         Ok(Stmt::Asm {

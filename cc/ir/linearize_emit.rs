@@ -157,7 +157,7 @@ pub(crate) fn compound_assign_opcode(types: &TypeTable, op: AssignOp, typ: TypeI
                 Opcode::DivS
             }
         }
-        // Modulo not supported for floats.
+        // `%=` takes integer operands only (C17 6.5.5p2).
         AssignOp::ModAssign => {
             if is_unsigned {
                 Opcode::ModU
@@ -265,8 +265,8 @@ pub(crate) fn binary_opcode(types: &TypeTable, op: BinaryOp, operand_typ: TypeId
                 }
             }
             BinaryOp::Mod => {
-                // Modulo is not supported for floats in hardware - use fmod() library call
-                // For now, use integer modulo (semantic analysis should catch float % float)
+                // `%` takes integer operands only (C17 6.5.5p2); the parser
+                // rejects a floating one, so this is never reached with one.
                 if is_unsigned {
                     Opcode::ModU
                 } else {

@@ -697,23 +697,10 @@ impl Aarch64CodeGen {
             self.emit_vec_store_to_loc(*vreg, loc, *size, insn.pos);
         }
 
-        // Handle clobbers - for now just emit comments for documentation
-        // Our simple codegen doesn't do sophisticated register allocation across asm
-        for clobber in &asm_data.clobbers {
-            match clobber.as_str() {
-                "memory" => {
-                    // Memory clobber - acts as compiler memory barrier
-                    // Our codegen doesn't reorder loads/stores, so this is mostly informational
-                }
-                "cc" => {
-                    // Condition codes clobbered - informational for our simple codegen
-                }
-                _ => {
-                    // Register clobber - could save/restore if needed
-                    // For now, trust that the register allocator has handled this
-                }
-            }
-        }
+        // Clobbers emit nothing here. A register clobber is a constraint the
+        // allocator honours (`regalloc::get_constraint_info_aarch64`), and a
+        // `"memory"` clobber makes the asm a barrier in the IR
+        // (`Instruction::is_memory_barrier`).
     }
 
     /// The text of a memory-class operand whose address is not already in a

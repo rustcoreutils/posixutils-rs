@@ -907,7 +907,11 @@ fn emit_preprocessed(
     // has to say what it does instead.
     let markers = !args.no_line_markers;
     if markers {
-        writeln!(out.preprocessed, "# 1 \"{}\"", display_path)?;
+        writeln!(
+            out.preprocessed,
+            "# 1 \"{}\"",
+            token::lexer::escape_c_string(display_path)
+        )?;
     }
     let mut emitted_marker_for: Vec<u16> = vec![stream_id];
     let mut current_stream: Option<u16> = Some(stream_id);
@@ -991,7 +995,7 @@ fn emit_preprocessed(
                         out.preprocessed,
                         "# {} \"{}\" {}",
                         line,
-                        name,
+                        token::lexer::escape_c_string(&name),
                         if returning { 2 } else { 1 }
                     )?;
                 }
@@ -1019,7 +1023,12 @@ fn emit_preprocessed(
                             writeln!(out.preprocessed)?;
                         }
                     } else {
-                        writeln!(out.preprocessed, "# {} \"{}\"", line, name)?;
+                        writeln!(
+                            out.preprocessed,
+                            "# {} \"{}\"",
+                            line,
+                            token::lexer::escape_c_string(&name)
+                        )?;
                     }
                     current_line = line;
                 }

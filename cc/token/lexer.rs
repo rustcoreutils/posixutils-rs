@@ -1703,6 +1703,36 @@ fn literal_parts(token: &Token) -> Option<(&'static str, u8, &str)> {
     Some((prefix, delim, payload.as_str()))
 }
 
+/// Spell `text` as the body of a C string literal: `"` and `\` get a
+/// backslash (C17 6.10.3.2p2) and a newline becomes `\n`. Every other
+/// character stands as itself, so it serves a payload and Rust text alike.
+///
+/// What `#` does to a literal, and how a file name is written into
+/// `__FILE__` or an `-E` linemarker; [`decode_string_spelling`] is its
+/// inverse.
+pub fn escape_c_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The text a narrow string literal's payload denotes, escapes interpreted:
+/// the file name a `#line` directive or a linemarker names.
+pub fn decode_string_spelling(payload: &str) -> String {
+    payload_text(&super::literal::literal_bytes(
+        &super::literal::parse_string_literal(payload),
+    ))
+}
+
 /// Encode Rust text as a literal payload: one `char` per UTF-8 byte.
 ///
 /// A literal's payload holds the literal's *source bytes*, one per `char`

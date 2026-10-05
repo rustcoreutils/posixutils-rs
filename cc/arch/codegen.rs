@@ -71,29 +71,41 @@ pub fn is_variadic_function(func: &Function) -> bool {
     false
 }
 
-/// Escape a string for assembly output (.ascii/.asciz directives)
-/// Non-printable and non-ASCII characters are escaped as octal byte sequences.
+/// Escape a literal payload for assembly output (.ascii/.asciz directives).
+///
+/// A payload holds one `char` per byte (see `literal_payload`); a `char`
+/// beyond a byte is written as its UTF-8.
 pub fn escape_string(s: &str) -> String {
-    let mut result = String::new();
+    let mut bytes = Vec::with_capacity(s.len());
     for c in s.chars() {
-        match c {
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            '\\' => result.push_str("\\\\"),
-            '"' => result.push_str("\\\""),
-            c if c.is_ascii_graphic() || c == ' ' => result.push(c),
-            c => {
-                // String literals represent raw byte values (0-255).
-                // Emit as single octal byte, not UTF-8 encoded.
-                if (c as u32) <= 255 {
-                    result.push_str(&format!("\\{:03o}", c as u8));
-                } else {
-                    for byte in c.to_string().as_bytes() {
-                        result.push_str(&format!("\\{:03o}", byte));
-                    }
-                }
-            }
+        match u8::try_from(c) {
+            Ok(b) => bytes.push(b),
+            Err(_) => bytes.extend_from_slice(c.to_string().as_bytes()),
+        }
+    }
+    escape_bytes(&bytes)
+}
+
+/// Escape a file name for an assembler string operand: `.file`, and the
+/// DWARF unit name and directory. A path is Rust text, so its bytes are its
+/// UTF-8.
+pub fn escape_path(path: &str) -> String {
+    escape_bytes(path.as_bytes())
+}
+
+/// The one escaping rule for every string written into assembly: `"` and
+/// `\` escaped, control and non-ASCII bytes as octal.
+fn escape_bytes(bytes: &[u8]) -> String {
+    let mut result = String::with_capacity(bytes.len());
+    for &b in bytes {
+        match b {
+            b'\n' => result.push_str("\\n"),
+            b'\r' => result.push_str("\\r"),
+            b'\t' => result.push_str("\\t"),
+            b'\\' => result.push_str("\\\\"),
+            b'"' => result.push_str("\\\""),
+            b if b.is_ascii_graphic() || b == b' ' => result.push(char::from(b)),
+            b => result.push_str(&format!("\\{:03o}", b)),
         }
     }
     result

@@ -19,9 +19,9 @@ use std::time::SystemTime;
 
 use super::cursor::{Provenance, TokenCursor};
 use super::lexer::{
-    literal_payload, payload_bytes, payload_text, show_token, tokens_to_source_bytes, write_token,
-    IdentTable, LexerMode, Position, Punctuator, SpecialToken, Spelling, Token, TokenType,
-    TokenValue, Tokenizer,
+    decode_string_spelling, escape_c_string, literal_payload, payload_bytes, payload_text,
+    show_token, tokens_to_source_bytes, write_token, IdentTable, LexerMode, Position, Punctuator,
+    SpecialToken, Spelling, Token, TokenType, TokenValue, Tokenizer,
 };
 use super::literal;
 use crate::arch;
@@ -1547,10 +1547,11 @@ impl<'a> Preprocessor<'a> {
     }
 
     /// The string-literal payload a file-name macro expands to: `name`
-    /// through `-fmacro-prefix-map`. Both `__FILE__` and `__BASE_FILE__`
-    /// come here, so the two cannot be mapped differently.
+    /// through `-fmacro-prefix-map`, spelled with its `"` and `\` escaped.
+    /// Both `__FILE__` and `__BASE_FILE__` come here, so the two cannot be
+    /// mapped differently.
     fn file_macro_payload(&self, name: &str) -> String {
-        literal_payload(&self.macro_prefix_map.apply(name))
+        escape_c_string(&literal_payload(&self.macro_prefix_map.apply(name)))
     }
 
     /// Establish that the physical line after the current directive is line

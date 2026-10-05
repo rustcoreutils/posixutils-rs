@@ -1004,7 +1004,8 @@ pub enum Directive {
     // ========================================================================
     // Debug Information
     // ========================================================================
-    /// .file index "path" - declare source file for debug info
+    /// .file index "path" - declare source file for debug info. `path` is
+    /// the file's name as text; emission escapes it.
     File { index: u32, path: String },
 
     /// .loc file line column - source location for debug info
@@ -1532,7 +1533,12 @@ impl EmitAsm for Directive {
 
             // Debug info
             Directive::File { index, path } => {
-                let _ = writeln!(out, "    .file {} \"{}\"", index, path);
+                let _ = writeln!(
+                    out,
+                    "    .file {} \"{}\"",
+                    index,
+                    super::codegen::escape_path(path)
+                );
             }
             Directive::Loc { file, line, col } => {
                 let _ = writeln!(out, "    .loc {} {} {}", file, line, col);
@@ -1813,6 +1819,21 @@ mod tests {
         let mut out = String::new();
         dir.emit(&target, &mut out);
         assert_eq!(out, "    .loc 1 42 5\n");
+    }
+
+    /// A `.file` path is escaped as any assembler string is: an unescaped
+    /// `"` ended the operand early. Non-ASCII bytes go out as their UTF-8.
+    #[test]
+    fn test_directive_file_escapes_the_path() {
+        for (arch, os) in [
+            (Arch::X86_64, Os::Linux),
+            (Arch::Aarch64, Os::Linux),
+            (Arch::Aarch64, Os::MacOS),
+        ] {
+            let mut out = String::new();
+            Directive::file(3, "q\"d\\e/caf\u{e9}.c").emit(&Target::new(arch, os), &mut out);
+            assert_eq!(out, "    .file 3 \"q\\\"d\\\\e/caf\\303\\251.c\"\n");
+        }
     }
 
     #[test]

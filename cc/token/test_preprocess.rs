@@ -1748,6 +1748,35 @@ fn test_line_directive_sets_file() {
     );
 }
 
+/// A `#line` or linemarker name is a string literal, so its escapes are
+/// interpreted; `__FILE__` spells the name back with `"` and `\` escaped,
+/// as `__BASE_FILE__` does the main file's.
+#[test]
+fn test_file_macros_escape_quote_and_backslash() {
+    let input = "__BASE_FILE__\n#line 7 \"a\\\\b\\\"c\\x41\"\n__FILE__\n# 9 \"x\\\\y\"\n__FILE__\n";
+    let mut idents = IdentTable::new();
+    let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
+    let (out, _) = preprocess_collecting(
+        tokens,
+        &Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux),
+        &mut idents,
+        "q\"d\\e/f.c",
+        &PreprocessConfig::default(),
+    );
+    let spelled: Vec<String> = out
+        .iter()
+        .filter_map(|t| match &t.value {
+            TokenValue::String(s) => Some(payload_text(s)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        spelled,
+        ["q\\\"d\\\\e/f.c", "a\\\\b\\\"cA", "x\\\\y"],
+        "file-name macros must spell their names escaped"
+    );
+}
+
 #[test]
 fn test_line_directive_skipped_in_false_branch() {
     // #line inside #if 0 should have no effect

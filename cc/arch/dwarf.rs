@@ -9,7 +9,7 @@
 // DWARF debug information generation for c17 C17 compiler
 //
 
-use super::codegen::CodeGenBase;
+use super::codegen::{escape_path, CodeGenBase};
 use super::lir::{Directive, EmitAsm, LirInst, Symbol};
 use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::HashMap;
@@ -639,10 +639,10 @@ pub fn generate_debug_info<I: LirInst + EmitAsm>(
     base.push_directive(Directive::Long(DW_LANG_C99 as i64));
 
     // DW_AT_name (source filename)
-    base.push_directive(Directive::Asciz(source_name.to_string()));
+    base.push_directive(Directive::Asciz(escape_path(source_name)));
 
     // DW_AT_comp_dir (compilation directory)
-    base.push_directive(Directive::Asciz(comp_dir.to_string()));
+    base.push_directive(Directive::Asciz(escape_path(comp_dir)));
 
     // DW_AT_stmt_list: this unit's own line program.
     //

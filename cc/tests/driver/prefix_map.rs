@@ -279,3 +279,33 @@ fn prefix_map_file_makes_builds_reproducible() {
     assert!(o1 == o2, "objects differ between build directories");
     assert!(!s1.contains(d1.to_str().unwrap()));
 }
+
+/// A source path holding a quote or a backslash is written into the
+/// assembly (`.file`, and DWARF names with `-g`) and into `__FILE__`; each
+/// must be escaped. An unescaped `"` ended the `.file` string early and the
+/// assembler rejected the line.
+#[test]
+fn prefix_map_source_path_with_quote_and_backslash() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_pathquote_")
+        .tempdir()
+        .expect("tempdir");
+    let sub = dir.path().join("q\"d\\e");
+    std::fs::create_dir(&sub).expect("mkdir");
+    let src = sub.join("f.c");
+    std::fs::write(
+        &src,
+        "#include <string.h>\n\
+         int main(void) { return !(strchr(__FILE__, '\"') && strchr(__FILE__, '\\\\')); }\n",
+    )
+    .expect("write");
+    let exe = dir.path().join("a.out");
+    for flags in [&[][..], &["-g"]] {
+        let mut args: Vec<&str> = flags.to_vec();
+        args.extend(["-o", exe.to_str().unwrap(), src.to_str().unwrap()]);
+        let run = crate::common::run_c17(&args);
+        assert!(run.success, "{flags:?}: {}", run.stderr);
+        let status = std::process::Command::new(&exe).status().expect("run");
+        assert_eq!(status.code(), Some(0), "{flags:?}");
+    }
+}

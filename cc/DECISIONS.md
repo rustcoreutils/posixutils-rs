@@ -113,6 +113,17 @@ require the fold. What the optimizer never does is the other half: run a
 relational on a path the program would not have, or turn one into a quiet
 compare where its operands may be unordered.
 
+Nor does anything else that can raise run on a path the program would not
+have: `c ? a * b : 0` keeps its branch rather than becoming a select, as do
+an arm's narrowing, float-to-integer or inexact integer-to-float conversion
+and its `sqrt` (`ir::FpRaise`, asked through
+`Instruction::may_raise_fp_exception` by `ifconv` and by the linearizer's
+`is_pure_expr`). Folding a constant drops an inexact flag; speculating an
+operation would *add* flags nothing caused, which no flag setting allows. The
+exact operations -- negation, `fabs`, `copysign`, widening, quiet equality --
+still become selects. `-fno-trapping-math` lets the linearizer speculate the
+rest, as gcc does.
+
 ## Known Divergences
 
 Behaviours where c17 deliberately differs from gcc on the same source.

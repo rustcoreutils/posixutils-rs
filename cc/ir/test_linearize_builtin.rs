@@ -15,6 +15,7 @@ use super::test_linearize::{
     test_pos, TestContext,
 };
 use super::*;
+use crate::ir::NanCompare;
 use crate::parse::ast::{
     BlockItem, Declaration, ExprKind, ExternalDecl, FunctionDef, InitDeclarator, ParamStyle,
     Parameter, Stmt,

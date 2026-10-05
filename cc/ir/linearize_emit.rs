@@ -213,6 +213,117 @@ pub(crate) fn float_comparison(op: BinaryOp) -> Option<Opcode> {
     }))
 }
 
+/// The opcode C's binary operator `op` is when its operands have been
+/// converted to `operand_typ`: the one place that decides, for
+/// [`super::linearize::Linearizer::emit_binary`] which emits it and for
+/// `is_pure_expr` which asks whether it may run where the program would not.
+///
+/// Not for `&&` and `||`, which are control flow rather than an opcode.
+pub(crate) fn binary_opcode(types: &TypeTable, op: BinaryOp, operand_typ: TypeId) -> Opcode {
+    let is_float = types.is_float(operand_typ);
+    // A pointer is not an integer type, so `is_unsigned` says false for
+    // one -- but C17 6.5.8 compares pointers by address, and an address is
+    // unsigned. Taking the signed answer emitted `setl` where gcc emits
+    // `setb`, which differs for any pair straddling the sign bit. The
+    // arithmetic opcodes below are unreachable for a pointer operand, so
+    // one predicate serves both.
+    let is_unsigned =
+        types.is_unsigned(operand_typ) || types.kind(operand_typ) == TypeKind::Pointer;
+
+    if let Some(fcmp) = float_comparison(op).filter(|_| is_float) {
+        fcmp
+    } else {
+        match op {
+            BinaryOp::Add => {
+                if is_float {
+                    Opcode::FAdd
+                } else {
+                    Opcode::Add
+                }
+            }
+            BinaryOp::Sub => {
+                if is_float {
+                    Opcode::FSub
+                } else {
+                    Opcode::Sub
+                }
+            }
+            BinaryOp::Mul => {
+                if is_float {
+                    Opcode::FMul
+                } else {
+                    Opcode::Mul
+                }
+            }
+            BinaryOp::Div => {
+                if is_float {
+                    Opcode::FDiv
+                } else if is_unsigned {
+                    Opcode::DivU
+                } else {
+                    Opcode::DivS
+                }
+            }
+            BinaryOp::Mod => {
+                // Modulo is not supported for floats in hardware - use fmod() library call
+                // For now, use integer modulo (semantic analysis should catch float % float)
+                if is_unsigned {
+                    Opcode::ModU
+                } else {
+                    Opcode::ModS
+                }
+            }
+            BinaryOp::Lt => {
+                if is_unsigned {
+                    Opcode::SetB
+                } else {
+                    Opcode::SetLt
+                }
+            }
+            BinaryOp::Gt => {
+                if is_unsigned {
+                    Opcode::SetA
+                } else {
+                    Opcode::SetGt
+                }
+            }
+            BinaryOp::Le => {
+                if is_unsigned {
+                    Opcode::SetBe
+                } else {
+                    Opcode::SetLe
+                }
+            }
+            BinaryOp::Ge => {
+                if is_unsigned {
+                    Opcode::SetAe
+                } else {
+                    Opcode::SetGe
+                }
+            }
+            BinaryOp::Eq => Opcode::SetEq,
+            BinaryOp::Ne => Opcode::SetNe,
+            // LogAnd and LogOr are handled earlier in linearize_expr via
+            // emit_logical_and/emit_logical_or for proper short-circuit evaluation
+            BinaryOp::LogAnd | BinaryOp::LogOr => {
+                unreachable!("LogAnd/LogOr should be handled in ExprKind::Binary")
+            }
+            BinaryOp::BitAnd => Opcode::And,
+            BinaryOp::BitOr => Opcode::Or,
+            BinaryOp::BitXor => Opcode::Xor,
+            BinaryOp::Shl => Opcode::Shl,
+            BinaryOp::Shr => {
+                // Logical shift for unsigned, arithmetic for signed
+                if is_unsigned {
+                    Opcode::Lsr
+                } else {
+                    Opcode::Asr
+                }
+            }
+        }
+    }
+}
+
 /// The one floating comparison a member of the `isgreater` family is, or
 /// `None` for the two that take more than one (`islessgreater`,
 /// `isunordered`).
@@ -1141,110 +1252,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         result_typ: TypeId,
         operand_typ: TypeId,
     ) -> PseudoId {
-        let is_float = self.types.is_float(operand_typ);
-        // A pointer is not an integer type, so `is_unsigned` says false for
-        // one -- but C17 6.5.8 compares pointers by address, and an address is
-        // unsigned. Taking the signed answer emitted `setl` where gcc emits
-        // `setb`, which differs for any pair straddling the sign bit. The
-        // arithmetic opcodes below are unreachable for a pointer operand, so
-        // one predicate serves both.
-        let is_unsigned = self.types.is_unsigned(operand_typ)
-            || self.types.kind(operand_typ) == TypeKind::Pointer;
-
         let result = self.alloc_pseudo();
-
-        let opcode = if let Some(fcmp) = float_comparison(op).filter(|_| is_float) {
-            fcmp
-        } else {
-            match op {
-                BinaryOp::Add => {
-                    if is_float {
-                        Opcode::FAdd
-                    } else {
-                        Opcode::Add
-                    }
-                }
-                BinaryOp::Sub => {
-                    if is_float {
-                        Opcode::FSub
-                    } else {
-                        Opcode::Sub
-                    }
-                }
-                BinaryOp::Mul => {
-                    if is_float {
-                        Opcode::FMul
-                    } else {
-                        Opcode::Mul
-                    }
-                }
-                BinaryOp::Div => {
-                    if is_float {
-                        Opcode::FDiv
-                    } else if is_unsigned {
-                        Opcode::DivU
-                    } else {
-                        Opcode::DivS
-                    }
-                }
-                BinaryOp::Mod => {
-                    // Modulo is not supported for floats in hardware - use fmod() library call
-                    // For now, use integer modulo (semantic analysis should catch float % float)
-                    if is_unsigned {
-                        Opcode::ModU
-                    } else {
-                        Opcode::ModS
-                    }
-                }
-                BinaryOp::Lt => {
-                    if is_unsigned {
-                        Opcode::SetB
-                    } else {
-                        Opcode::SetLt
-                    }
-                }
-                BinaryOp::Gt => {
-                    if is_unsigned {
-                        Opcode::SetA
-                    } else {
-                        Opcode::SetGt
-                    }
-                }
-                BinaryOp::Le => {
-                    if is_unsigned {
-                        Opcode::SetBe
-                    } else {
-                        Opcode::SetLe
-                    }
-                }
-                BinaryOp::Ge => {
-                    if is_unsigned {
-                        Opcode::SetAe
-                    } else {
-                        Opcode::SetGe
-                    }
-                }
-                BinaryOp::Eq => Opcode::SetEq,
-                BinaryOp::Ne => Opcode::SetNe,
-                // LogAnd and LogOr are handled earlier in linearize_expr via
-                // emit_logical_and/emit_logical_or for proper short-circuit evaluation
-                BinaryOp::LogAnd | BinaryOp::LogOr => {
-                    unreachable!("LogAnd/LogOr should be handled in ExprKind::Binary")
-                }
-                BinaryOp::BitAnd => Opcode::And,
-                BinaryOp::BitOr => Opcode::Or,
-                BinaryOp::BitXor => Opcode::Xor,
-                BinaryOp::Shl => Opcode::Shl,
-                BinaryOp::Shr => {
-                    // Logical shift for unsigned, arithmetic for signed
-                    if is_unsigned {
-                        Opcode::Lsr
-                    } else {
-                        Opcode::Asr
-                    }
-                }
-            }
-        };
+        let opcode = binary_opcode(self.types, op, operand_typ);
 
         let insn = if opcode.is_comparison() {
             self.compare_insn(opcode, result, (left, right), operand_typ)

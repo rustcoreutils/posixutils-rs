@@ -13,8 +13,8 @@ use super::mem2reg::mem2reg;
 use super::memexpand::BlockOp;
 use super::ssa::ssa_convert;
 use super::{
-    BasicBlock, BasicBlockId, CallAbiInfo, FenceScope, Function, Initializer, Instruction,
-    MemoryOrder, Module, NanCompare, Opcode, Pseudo, PseudoId, PseudoKind,
+    conversion_raises_fp, BasicBlock, BasicBlockId, CallAbiInfo, FenceScope, FpRaise, Function,
+    Initializer, Instruction, MemoryOrder, Module, Opcode, Pseudo, PseudoId, PseudoKind,
 };
 use crate::abi::{get_abi_for_conv, CallingConv};
 use crate::diag::{get_all_stream_names, Position};
@@ -2461,21 +2461,101 @@ impl<'a> Linearizer<'a> {
         )
     }
 
-    /// Whether `left op right` is a floating comparison that raises invalid
-    /// for a NaN operand: the one [`super::linearize_emit::float_comparison`]
-    /// makes of it, when the operands are compared as floats.
-    fn is_signaling_comparison(&self, op: BinaryOp, left: &Expr, right: &Expr) -> bool {
-        let floating = [left, right]
-            .iter()
-            .any(|e| e.typ.is_some_and(|t| self.types.is_float(t)));
-        floating
-            && super::linearize_emit::float_comparison(op)
-                .and_then(Opcode::float_cmp)
-                .is_some_and(|c| c.nan() == NanCompare::Signaling)
+    /// Whether running `op` where the program would not have can be seen:
+    /// it may raise a floating-point exception ([`FpRaise`]) and the program
+    /// may look at the flags (`-ftrapping-math`, the default).
+    fn opcode_raises_fp(&self, op: Opcode) -> bool {
+        self.trapping_math && op.fp_raise() != FpRaise::Never
     }
 
-    /// Check if an expression is "pure" (side-effect-free).
-    /// Pure expressions can be speculatively evaluated, enabling cmov/csel codegen.
+    /// [`Self::opcode_raises_fp`], for converting a value of type `from` to
+    /// type `to` ([`conversion_raises_fp`]).
+    fn conversion_raises_fp(&self, from: TypeId, to: TypeId) -> bool {
+        self.trapping_math && conversion_raises_fp(self.types, from, to)
+    }
+
+    /// [`Self::conversion_raises_fp`], for converting the value of `expr`, of
+    /// type `from`, to type `to`: an integer constant converts exactly where
+    /// its value is one of the destination's, so `c ? x : 0` with a `float x`
+    /// converts its `0` without a trace.
+    fn converting_raises_fp(&self, expr: &Expr, from: TypeId, to: TypeId) -> bool {
+        if !self.conversion_raises_fp(from, to) {
+            return false;
+        }
+        match self.types.fp_format(to) {
+            Some(fmt) if self.types.is_integer(from) => self
+                .eval_const_expr(expr)
+                .is_none_or(|v| !fmt.holds_integer_value(v)),
+            _ => true,
+        }
+    }
+
+    /// Whether computing `left op right`, the binary expression `expr`, can
+    /// raise a floating-point exception ([`FpRaise`]) besides what its
+    /// operands raise: converting each operand to the type the operation is
+    /// performed at, and the operation itself -- the opcode
+    /// [`super::linearize_emit::binary_opcode`] makes of it. Complex and
+    /// vector operands are asked about their halves and lanes.
+    ///
+    /// `&&` and `||` compare each operand with zero, quietly, and raise
+    /// nothing of their own.
+    fn binary_raises_fp(&self, expr: &Expr, op: BinaryOp, left: &Expr, right: &Expr) -> bool {
+        if matches!(op, BinaryOp::LogAnd | BinaryOp::LogOr) {
+            return false;
+        }
+        let (left_typ, right_typ) = (self.expr_type(left), self.expr_type(right));
+        // The type `linearize_binary` converts both operands to.
+        let operand_typ = if op.is_comparison() {
+            self.types.common_type(left_typ, right_typ)
+        } else {
+            self.expr_type(expr)
+        };
+        // What one lane or half is computed at.
+        let scalar = |t: TypeId| match self.types.vector_lanes(t) {
+            Some((lane, _)) => lane,
+            None => self.types.complex_base(t),
+        };
+        let operand = scalar(operand_typ);
+        let converts = |e: &Expr, t: TypeId| self.converting_raises_fp(e, scalar(t), operand);
+        converts(left, left_typ)
+            || converts(right, right_typ)
+            || self.opcode_raises_fp(super::linearize_emit::binary_opcode(
+                self.types, op, operand,
+            ))
+    }
+
+    /// Whether the computation a library call stands for can raise a
+    /// floating-point exception: the answer of the opcode it is computed by
+    /// (`compute_library_call`).
+    fn library_call_raises_fp(&self, func: InlineLibraryFn) -> bool {
+        let op = match func {
+            InlineLibraryFn::Sqrt(_) => Opcode::Sqrt,
+            InlineLibraryFn::RoundToIntegral(how) => Opcode::RoundToIntegral(how),
+            InlineLibraryFn::FMin => Opcode::FMin,
+            InlineLibraryFn::FMax => Opcode::FMax,
+            InlineLibraryFn::Fma => Opcode::Fma,
+            InlineLibraryFn::Fabs => Opcode::Fabs,
+            InlineLibraryFn::CopySign => Opcode::CopySign,
+            InlineLibraryFn::Conjugate => Opcode::FNeg,
+            InlineLibraryFn::IntAbs
+            | InlineLibraryFn::ComplexReal
+            | InlineLibraryFn::ComplexImag
+            | InlineLibraryFn::Memory(_) => return false,
+        };
+        self.opcode_raises_fp(op)
+    }
+
+    /// Whether a conditional's arm `arm` may be evaluated whichever way the
+    /// condition goes, converted to the conditional's type `result_typ`:
+    /// it is pure, and converting it raises no floating-point exception --
+    /// `c ? n : 0.0f` with a large `int n` is inexact where `c` is false.
+    pub(crate) fn is_speculatable_arm(&self, arm: &Expr, result_typ: TypeId) -> bool {
+        self.is_pure_expr(arm) && !self.converting_raises_fp(arm, self.expr_type(arm), result_typ)
+    }
+
+    /// Check if an expression is "pure": safe to evaluate where the program
+    /// would not have. Pure expressions can be speculatively evaluated,
+    /// enabling cmov/csel codegen.
     ///
     /// An expression is pure if it contains NO:
     /// - Function calls
@@ -2483,6 +2563,10 @@ impl<'a> Linearizer<'a> {
     /// - Pre/post increment/decrement (++, --)
     /// - Assignments (=, +=, -=, etc.)
     /// - Statement expressions (GNU extension with potential side effects)
+    /// - Operation that can raise a floating-point exception ([`FpRaise`]):
+    ///   c17 defines `__STDC_IEC_559__`, so the flags are something the
+    ///   program observes, and `c ? a * b : 0` evaluated as a select reports
+    ///   an overflow where `c` is false.
     pub(crate) fn is_pure_expr(&self, expr: &Expr) -> bool {
         match &expr.kind {
             // Writes through its third argument.
@@ -2527,15 +2611,15 @@ impl<'a> Linearizer<'a> {
 
             // Binary ops are pure if both operands are pure AND the
             // operator can't trap. Division and modulo cause SIGFPE
-            // on division by zero, so they're never pure. A floating
-            // relational raises invalid for a NaN operand (C17 F.9.3), so
-            // evaluating it on a path that would not have can set a flag the
-            // program reads: `isnan(x) ? 0 : x < y`.
+            // on division by zero, so they're never pure. Floating
+            // arithmetic can raise overflow, inexact or invalid, and a
+            // floating relational raises invalid for a NaN operand (C17
+            // F.9.3): `isnan(x) ? 0 : x < y`.
             ExprKind::Binary {
                 op, left, right, ..
             } => {
                 !matches!(op, BinaryOp::Div | BinaryOp::Mod)
-                    && !self.is_signaling_comparison(*op, left, right)
+                    && !self.binary_raises_fp(expr, *op, left, right)
                     && self.is_pure_expr(left)
                     && self.is_pure_expr(right)
             }
@@ -2551,21 +2635,25 @@ impl<'a> Linearizer<'a> {
             // Post-increment/decrement have side effects
             ExprKind::PostInc(_) | ExprKind::PostDec(_) => false,
 
-            // Ternary is pure if all parts are pure
+            // Ternary is pure if all parts are pure, each arm converted to
+            // the conditional's type.
             ExprKind::Conditional {
                 cond,
                 then_expr,
                 else_expr,
             } => {
+                let typ = self.expr_type(expr);
                 self.is_pure_expr(cond)
-                    && self.is_pure_expr(then_expr)
-                    && self.is_pure_expr(else_expr)
+                    && self.is_speculatable_arm(then_expr, typ)
+                    && self.is_speculatable_arm(else_expr, typ)
             }
 
             // `a ?: b` evaluates `a` once and `b` only when `a` is false, so
-            // it is pure exactly when both are.
+            // it is pure exactly when both are. `a` converted is the value
+            // the program takes where it is nonzero, and converting a zero
+            // is exact.
             ExprKind::CondElvis { cond, else_expr } => {
-                self.is_pure_expr(cond) && self.is_pure_expr(else_expr)
+                self.is_pure_expr(cond) && self.is_speculatable_arm(else_expr, self.expr_type(expr))
             }
 
             // Function calls are never pure (may have side effects)
@@ -2595,8 +2683,17 @@ impl<'a> Linearizer<'a> {
             // so we must not eagerly evaluate it in conditional expressions.
             ExprKind::Index { .. } => false,
 
-            // Casts are pure if the operand is pure
-            ExprKind::Cast { expr, .. } => self.is_pure_expr(expr),
+            // Casts are pure if the operand is pure and the conversion
+            // raises nothing: `(float)d` can overflow, `(int)d` is invalid
+            // for a NaN.
+            ExprKind::Cast { expr: inner, .. } => {
+                self.is_pure_expr(inner)
+                    && !self.converting_raises_fp(
+                        inner,
+                        self.expr_type(inner),
+                        self.expr_type(expr),
+                    )
+            }
 
             // Assignments have side effects
             ExprKind::Assign { .. } => false,
@@ -2662,6 +2759,7 @@ impl<'a> Linearizer<'a> {
                 func, args, name, ..
             } => {
                 !func.has_side_effects()
+                    && !self.library_call_raises_fp(*func)
                     && !func.is_displaced(*name, &self.defined_functions)
                     && args.iter().all(|a| self.is_pure_expr(a))
             }
@@ -5117,7 +5215,10 @@ impl<'a> Linearizer<'a> {
             (result_typ, self.types.size_bits(result_typ))
         };
 
-        if self.is_pure_expr(then_expr) && self.is_pure_expr(else_expr) && size <= 64 {
+        if self.is_speculatable_arm(then_expr, result_typ)
+            && self.is_speculatable_arm(else_expr, result_typ)
+            && size <= 64
+        {
             // Pure: use Select instruction (enables cmov/csel)
             let cond_bool = self.linearize_condition(cond);
             let then_val = self.linearize_expr(then_expr);
@@ -5258,7 +5359,9 @@ impl<'a> Linearizer<'a> {
         let cond_val = self.linearize_expr(cond);
         let cond_bool = self.emit_compare_zero(cond_val, cond_typ);
 
-        if self.is_pure_expr(else_expr) && size <= 64 {
+        // The left operand converted is the value taken where it is nonzero,
+        // and converting a zero is exact, so only the right one is asked.
+        if self.is_speculatable_arm(else_expr, result_typ) && size <= 64 {
             // No branch here, so both arms are converted in place.
             let then_val = self.convert_conditional_arm(cond_val, cond_typ, result_typ);
             let mut else_val = self.linearize_expr(else_expr);

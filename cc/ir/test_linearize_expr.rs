@@ -11,7 +11,8 @@
 //
 
 use super::test_linearize::{
-    has_op, linearize_no_ssa, linearize_source, linearize_source_with_types, test_pos, TestContext,
+    has_op, insns_of, linearize_no_ssa, linearize_source, linearize_source_trapping,
+    linearize_source_with_types, test_pos, TestContext,
 };
 use super::*;
 use crate::parse::ast::{
@@ -1918,5 +1919,85 @@ fn test_vector_mixed_signedness_compares_unsigned() {
             div.contains(&Opcode::DivS) && !div.contains(&Opcode::DivU),
             "{arch:?}"
         );
+    }
+}
+
+/// A conditional expression evaluates one arm (C17 6.5.15p4), and under
+/// Annex F a floating operation that runs raises flags the program can
+/// read. So an arm whose arithmetic or conversion can raise -- overflow,
+/// inexact, invalid -- keeps its branch, and one whose every operation is
+/// exact still becomes a select: negation, `fabs`, `copysign`, widening,
+/// an `int` to `double`, quiet equality, and integer arithmetic.
+#[test]
+fn test_a_conditional_arm_that_can_raise_keeps_its_branch() {
+    let raising = [
+        "double f(int c, double a, double b) { return c ? a * b : 0; }",
+        "double f(int c, double a, double b) { return c ? a + b : 0; }",
+        "double f(int c, double a, double b) { return c ? 0 : a - b; }",
+        "float f(int c, float a, float b) { return c ? a * b : 0; }",
+        "float f(int c, double a) { return c ? (float)a : 0; }",
+        "int f(int c, double a) { return c ? (int)a : 0; }",
+        "float f(int c, int n) { return c ? n : 0.5f; }",
+        "double f(int c, long n) { return c ? n : 0.5; }",
+        "float f(int c, float a) { return c ? a : 16777217; }",
+        "double f(int c, int d, double a, double b) { return c ? (d ? a * b : 1.0) : 0; }",
+        "double f(double c, double a, double b) { return c ?: a * b; }",
+        "double f(int c, double a) { return c ? __builtin_sqrt(a) : 0; }",
+        "double f(int c, double a, double b) { return c ? __builtin_fmin(a, b) : 0; }",
+        "int f(int c, double a, double b) { return c ? a < b : 0; }",
+        // Never a select, being wider than a register; listed so the rule
+        // is pinned for them too.
+        "long double f(int c, long double a, long double b) { return c ? a * b : 0; }",
+        "double _Complex f(int c, double _Complex a) { return c ? a * a : 0; }",
+    ];
+    let exact = [
+        "double f(int c, double a) { return c ? -a : 0; }",
+        "double f(int c, double a) { return c ? __builtin_fabs(a) : 0; }",
+        "double f(int c, double a, double b) { return c ? __builtin_copysign(a, b) : 0; }",
+        "double f(int c, float a) { return c ? (double)a : 0; }",
+        "double f(int c, short n) { return c ? (float)n : 0; }",
+        "double f(int c, int n) { return c ? n : 0.5; }",
+        "int f(int c, double a, double b) { return c ? a == b : 0; }",
+        "_Bool f(int c, double a) { return c ? (_Bool)a : 0; }",
+        "int f(int c, int a, int b) { return c ? a * b + 1 : 0; }",
+        "long f(int c, int a) { return c ? (long)a : 0; }",
+        "double f(int c, double a, double b) { return c ?: a; }",
+        // An integer constant converts exactly when the format holds it.
+        "float f(int c, float a) { return c ? -a : 0; }",
+        "float f(int c, float a) { return c ? a : 16777216; }",
+        "int f(int c, float a) { return c ? a == 1 : 0; }",
+    ];
+    // In place, as `-fno-math-errno` computes `sqrt`.
+    let policy = || crate::parse::LibraryCallPolicy {
+        optimizing: true,
+        math_errno: false,
+    };
+    for target in [
+        Target::new(Arch::X86_64, Os::Linux),
+        Target::new(Arch::Aarch64, Os::Linux),
+    ] {
+        let branches = |src: &str, trapping: bool| {
+            let (module, _) = linearize_source_trapping(src, &target, policy(), trapping);
+            insns_of(&module, "f").iter().any(|i| i.op == Opcode::Cbr)
+        };
+        for src in raising {
+            assert!(
+                branches(src, true),
+                "{:?}: keeps its branch: {src}",
+                target.arch
+            );
+        }
+        for src in exact {
+            assert!(!branches(src, true), "{:?}: a select: {src}", target.arch);
+        }
+        // `-fno-trapping-math` says nothing reads the flags, so an arm that
+        // can only raise one is as speculatable as an exact one.
+        for src in &raising[..raising.len() - 2] {
+            assert!(
+                !branches(src, false),
+                "{:?}: -fno-trapping-math: {src}",
+                target.arch
+            );
+        }
     }
 }

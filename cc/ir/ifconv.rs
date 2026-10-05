@@ -50,12 +50,16 @@ use std::collections::{HashSet, VecDeque};
 /// divisor -- and so are the shifts, whose behaviour past the operand width is
 /// undefined. Neither is needed for the shape this pass exists for.
 ///
-/// A *quiet* float comparison is listed: it raises nothing for a quiet NaN,
-/// so evaluating one on a path that would not have cannot set a flag the
-/// program could observe. (Annex F leaves signaling NaNs unspecified.) A
-/// signaling one -- C's `<` -- raises invalid for a NaN and is not; see
-/// [`Speculation::relaxes`] for when it may go anyway.
-fn is_speculatable(insn: &Instruction) -> bool {
+/// A float comparison is listed where it raises nothing
+/// ([`Instruction::may_raise_fp_exception`], the one rule every pass that
+/// speculates asks): a *quiet* one raises nothing for a quiet NaN, so
+/// evaluating one on a path that would not have cannot set a flag the
+/// program could observe. A signaling one -- C's `<` -- raises invalid for a
+/// NaN and is not; see [`Speculation::relaxes`] for when it may go anyway.
+/// Float arithmetic and conversions are not listed at all: most can raise
+/// (an overflow, an inexact result, invalid), and the exact ones are not
+/// needed for the shape this pass exists for.
+fn is_speculatable(insn: &Instruction, types: &TypeTable) -> bool {
     matches!(
         insn.op,
         Opcode::Nop
@@ -74,10 +78,7 @@ fn is_speculatable(insn: &Instruction) -> bool {
             | Opcode::Sext
             | Opcode::Select
     ) || insn.op.is_int_comparison()
-        || insn
-            .op
-            .float_cmp()
-            .is_some_and(|c| c.nan() == NanCompare::Quiet)
+        || (insn.op.is_float_comparison() && !insn.may_raise_fp_exception(types))
 }
 
 /// What is known while diamonds are collapsed: enough to tell when a
@@ -218,7 +219,9 @@ fn recognize(func: &Function, pred: BasicBlockId, known: &Speculation) -> Option
         // A `PhiSource` is bookkeeping rather than a computation and is
         // rewritten by `collapse`, so it is allowed through here.
         let body_ok = a.insns[..a.insns.len() - 1].iter().all(|i| {
-            i.op == Opcode::PhiSource || is_speculatable(i) || known.relaxes(i, cond, arm_on_true)
+            i.op == Opcode::PhiSource
+                || is_speculatable(i, known.types)
+                || known.relaxes(i, cond, arm_on_true)
         });
         if !body_ok {
             continue;
@@ -506,6 +509,32 @@ mod tests {
         );
         let mut func = diamond(fdiv);
         assert!(!run(&mut func), "a float division must not be speculated");
+        // Nor anything else that rounds: a product can overflow, a
+        // narrowing conversion too, and `(int)x` is invalid for a NaN.
+        for op in [Opcode::FAdd, Opcode::FSub, Opcode::FMul] {
+            let arm = Instruction::binop(
+                op,
+                PseudoId(2),
+                PseudoId(0),
+                PseudoId(1),
+                types.double_id,
+                64,
+            );
+            let mut func = diamond(arm);
+            assert!(!run(&mut func), "{op:?} must not be speculated");
+        }
+        for (op, from, to) in [
+            (Opcode::FCvtF, types.double_id, types.float_id),
+            (Opcode::FCvtS, types.double_id, types.int_id),
+            (Opcode::SCvtF, types.long_id, types.double_id),
+        ] {
+            let mut arm = Instruction::unop(op, PseudoId(2), PseudoId(0), to, types.size_bits(to));
+            arm.src_typ = Some(from);
+            arm.src_size = 64;
+            assert!(arm.may_raise_fp_exception(&types), "{op:?}");
+            let mut func = diamond(arm);
+            assert!(!run(&mut func), "{op:?} must not be speculated");
+        }
     }
 
     /// `f(a, b)` from `src` after one run of the pass: how many branches it

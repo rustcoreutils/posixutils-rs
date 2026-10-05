@@ -232,6 +232,71 @@ impl From<FloatCmp> for Opcode {
     }
 }
 
+/// Whether an operation can raise a floating-point exception: set a flag
+/// `fetestexcept` reads (C17 7.6.2) -- invalid, divide-by-zero, overflow,
+/// underflow or inexact.
+///
+/// c17 defines `__STDC_IEC_559__`, so those flags are part of what a program
+/// observes, and an operation that may raise one must run only where the
+/// program runs it: `c ? a * b : 0` evaluated as a select reports an
+/// overflow nothing caused. Asked through
+/// [`Instruction::may_raise_fp_exception`], by every place that would run an
+/// operation on a path that would not have -- `ifconv`, and the linearizer
+/// deciding whether a `?:` arm may become a select.
+///
+/// A *signaling* NaN operand raises invalid in nearly everything; Annex F
+/// leaves signaling NaNs unspecified (C17 F.2.1), so `Never` means "for any
+/// other operand".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FpRaise {
+    /// Raises nothing: every integer and memory operation, and the
+    /// floating ones that are exact for every operand and only move or
+    /// test bits -- negation, `fabs`, `copysign`, `signbit` (IEEE 754 5.5.1,
+    /// C17 F.10.8) -- and the quiet comparisons.
+    Never,
+    /// May raise: arithmetic, which rounds and can overflow or underflow;
+    /// division, which can divide by zero; square root of a negative; a
+    /// signaling comparison of a NaN (C17 F.9.3); `fmin`/`fmax`, which x86-64
+    /// computes with `minsd`/`maxsd`, raising invalid for a quiet NaN; the
+    /// round-to-integral family, of which `rint` raises inexact; a call or an
+    /// `asm`, which may do anything.
+    May,
+    /// A conversion: raises exactly when the destination does not hold every
+    /// value of the source. See [`conversion_raises_fp`].
+    Conversion,
+}
+
+/// Whether converting a value of type `from` to type `to` can raise a
+/// floating-point exception ([`FpRaise`]).
+///
+/// * Floating to floating: not when `to` holds every value of `from`
+///   (C17 6.3.1.5p1) -- `float` to `double` is exact, and a quiet NaN
+///   stays one. Narrowing can overflow, underflow and be inexact.
+/// * Floating to integer: always. A NaN, an infinity or a value out of range
+///   raises invalid (C17 F.4), and a fraction may raise inexact.
+/// * Integer to floating: not when the format's significand holds every
+///   value of the integer type -- `int` to `double` -- and otherwise a large
+///   one is inexact (C17 6.3.1.4p2, F.4): `long` to `double`, `int` to
+///   `float`.
+/// * Anything to `_Bool`: no. A value becomes 0 or 1 by comparing it with
+///   zero, quietly (C17 6.3.1.2).
+///
+/// A complex type converts as its halves do (C17 6.3.1.6-7). Neither type
+/// floating -- integers, pointers, a GNU vector, which converts by
+/// reinterpreting its bits -- raises nothing, and nor does a cast to `void`.
+pub fn conversion_raises_fp(types: &TypeTable, from: TypeId, to: TypeId) -> bool {
+    if types.kind(to) == crate::types::TypeKind::Bool {
+        return false;
+    }
+    let (from, to) = (types.complex_base(from), types.complex_base(to));
+    match (types.fp_format(from), types.fp_format(to)) {
+        (Some(f), Some(t)) => !t.holds(f),
+        (Some(_), None) => types.is_integer(to),
+        (None, Some(t)) => !t.holds_integer(types.size_bits(from), !types.is_unsigned(from)),
+        (None, None) => false,
+    }
+}
+
 /// IR opcodes for the intermediate representation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Opcode {
@@ -589,6 +654,23 @@ impl ShuffleIndices {
 }
 
 impl SimdOp {
+    /// Whether this lane-wise operation can raise a floating-point
+    /// exception, lane by lane as [`Opcode::fp_raise`] answers the scalar
+    /// one. The ordered lane comparisons are the signaling ones both targets
+    /// emit (`cmpltps`, `fcmgt`); a lane conversion is `int` to `float` or
+    /// back, which is inexact or invalid for some lane values.
+    pub fn fp_raise(self) -> FpRaise {
+        use SimdOp::*;
+        match self {
+            FAdd | FSub | FMul | FDiv | FCmpGt | FCmpGe | CvtSF | CvtUF | CvtFS | CvtFU => {
+                FpRaise::May
+            }
+            Add | Sub | And | Or | Xor | Not | Neg | FNeg | Splat | Mul | Shl | Lsr | Asr
+            | ShlScalar | LsrScalar | AsrScalar | CmpEq | CmpNe | CmpGt | CmpGe | CmpGtU
+            | CmpGeU | FCmpEq | FCmpNe | Shuffle => FpRaise::Never,
+        }
+    }
+
     /// Every operation, for tests over the whole set.
     pub const ALL: [SimdOp; 35] = [
         SimdOp::Add,
@@ -778,6 +860,36 @@ impl Opcode {
             Opcode::FCmpsOGe => Ge(Signaling),
             _ => return None,
         })
+    }
+
+    /// Whether this operation can raise a floating-point exception; see
+    /// [`FpRaise`]. Exhaustive, so a new opcode is classified when it is
+    /// added rather than defaulted.
+    pub fn fp_raise(self) -> FpRaise {
+        use Opcode::*;
+        match self {
+            FAdd | FSub | FMul | FDiv | Sqrt | RoundToIntegral(_) | FMin | FMax | Fma | Call
+            | Asm => FpRaise::May,
+            FCvtU | FCvtS | UCvtF | SCvtF | FCvtF => FpRaise::Conversion,
+            FCmpOEq | FCmpONe | FCmpOLt | FCmpOLe | FCmpOGt | FCmpOGe | FCmpsOLt | FCmpsOLe
+            | FCmpsOGt | FCmpsOGe => match self.float_cmp().map(FloatCmp::nan) {
+                Some(NanCompare::Signaling) => FpRaise::May,
+                _ => FpRaise::Never,
+            },
+            Simd(op) => op.fp_raise(),
+            FNeg | Fabs | CopySign | Signbit => FpRaise::Never,
+            Entry | Ret | Br | Cbr | Switch | IndirectBr | Add | Sub | Mul | DivU | DivS | ModU
+            | ModS | Shl | Lsr | Asr | And | Or | Xor | SetEq | SetNe | SetLt | SetLe | SetGt
+            | SetGe | SetB | SetBe | SetA | SetAe | Not | Neg | Trunc | Zext | Sext | Load
+            | Store | Phi | PhiSource | Copy | SymAddr | TlsAddr | Select | SetVal | Nop
+            | VaStart | VaArg | VaEnd | VaCopy | VaArgPackLen | ConstantP | Bswap16 | Bswap32
+            | Bswap64 | Ctz32 | Ctz64 | Clz32 | Clz64 | Popcount32 | Popcount64 | Alloca
+            | StackSave | StackRestore | Memset | Memcpy | Memmove | Unreachable | FrameAddress
+            | ReturnAddress | Setjmp | Longjmp | AtomicLoad | AtomicStore | AtomicSwap
+            | AtomicCas | AtomicFetchAdd | AtomicFetchSub | AtomicFetchAnd | AtomicFetchOr
+            | AtomicFetchXor | Fence | Lo64 | Hi64 | Pair64 | AddC | AdcC | SubC | SbcC
+            | UMulHi | LifetimeEnd => FpRaise::Never,
+        }
     }
 
     /// Any comparison, integer or floating.
@@ -2198,6 +2310,21 @@ impl Instruction {
             self.src_typ
         } else {
             self.typ
+        }
+    }
+
+    /// Whether running this instruction can raise a floating-point
+    /// exception ([`FpRaise`]): its opcode's answer, with a conversion's
+    /// decided by the two types it converts between. A conversion that does
+    /// not record its source type is assumed to raise.
+    pub fn may_raise_fp_exception(&self, types: &TypeTable) -> bool {
+        match self.op.fp_raise() {
+            FpRaise::Never => false,
+            FpRaise::May => true,
+            FpRaise::Conversion => match (self.src_typ, self.typ) {
+                (Some(from), Some(to)) => conversion_raises_fp(types, from, to),
+                _ => true,
+            },
         }
     }
 
@@ -4097,6 +4224,120 @@ mod tests {
             }
         }
         assert_eq!(signaling, 4);
+    }
+
+    /// What may raise a floating-point exception, by opcode: arithmetic and
+    /// signaling comparisons may, the exact bit operations and quiet
+    /// comparisons do not, and every non-floating opcode but a call or an
+    /// `asm` raises nothing.
+    #[test]
+    fn fp_raise_separates_exact_float_operations_from_rounding_ones() {
+        use Opcode::*;
+        for op in [
+            FAdd, FSub, FMul, FDiv, Sqrt, Fma, FMin, FMax, FCmpsOLt, FCmpsOGe, Call, Asm,
+        ] {
+            assert_eq!(op.fp_raise(), FpRaise::May, "{op:?}");
+        }
+        for op in [
+            FNeg, Fabs, CopySign, Signbit, FCmpOEq, FCmpONe, FCmpOLt, FCmpOGe, Add, Mul, DivS,
+            Load, Select, Trunc, Sext,
+        ] {
+            assert_eq!(op.fp_raise(), FpRaise::Never, "{op:?}");
+        }
+        for op in [FCvtF, FCvtS, FCvtU, SCvtF, UCvtF] {
+            assert_eq!(op.fp_raise(), FpRaise::Conversion, "{op:?}");
+        }
+        for &op in Opcode::ALL {
+            if let Some(cmp) = op.float_cmp() {
+                let signals = cmp.nan() == NanCompare::Signaling;
+                assert_eq!(op.fp_raise() == FpRaise::May, signals, "{op:?}");
+            }
+        }
+        assert_eq!(Simd(SimdOp::FMul).fp_raise(), FpRaise::May);
+        assert_eq!(Simd(SimdOp::FNeg).fp_raise(), FpRaise::Never);
+        assert_eq!(Simd(SimdOp::Add).fp_raise(), FpRaise::Never);
+    }
+
+    /// A conversion raises exactly where the destination does not hold
+    /// every source value: widening and small integers are exact,
+    /// narrowing, floating to integer and wide integers are not, and
+    /// `_Bool` compares quietly.
+    #[test]
+    fn conversion_raises_fp_where_the_destination_loses_values() {
+        let x86 = TypeTable::new(&Target::new(Arch::X86_64, crate::target::Os::Linux));
+        let a64 = TypeTable::new(&Target::new(Arch::Aarch64, crate::target::Os::Linux));
+        let mac = TypeTable::new(&Target::new(Arch::Aarch64, crate::target::Os::MacOS));
+        for t in [&x86, &a64, &mac] {
+            let cases = [
+                (t.float_id, t.double_id, false),
+                (t.double_id, t.longdouble_id, false),
+                (t.float16_id, t.float_id, false),
+                (t.double_id, t.float_id, true),
+                (t.float_id, t.float16_id, true),
+                (t.double_id, t.int_id, true),
+                (t.float_id, t.ulong_id, true),
+                (t.double_id, t.bool_id, false),
+                (t.bool_id, t.float_id, false),
+                (t.short_id, t.float_id, false),
+                (t.int_id, t.double_id, false),
+                (t.uint_id, t.double_id, false),
+                (t.int_id, t.float_id, true),
+                (t.long_id, t.double_id, true),
+                (t.int_id, t.long_id, false),
+                (t.double_id, t.void_id, false),
+                (
+                    t.make_complex(t.float_id),
+                    t.make_complex(t.double_id),
+                    false,
+                ),
+                (
+                    t.make_complex(t.double_id),
+                    t.make_complex(t.float_id),
+                    true,
+                ),
+                (t.double_id, t.make_complex(t.float_id), true),
+                (t.make_complex(t.double_id), t.double_id, false),
+            ];
+            for (from, to, raises) in cases {
+                assert_eq!(
+                    conversion_raises_fp(t, from, to),
+                    raises,
+                    "{:?} -> {:?}",
+                    t.get(from).kind,
+                    t.get(to).kind
+                );
+            }
+        }
+        // `long double` decides by its format: x87 holds every `long`,
+        // binary64 (Apple arm64) does not, and nothing holds a `double`
+        // narrowed back from one.
+        assert!(!conversion_raises_fp(&x86, x86.ulong_id, x86.longdouble_id));
+        assert!(!conversion_raises_fp(&a64, a64.long_id, a64.longdouble_id));
+        assert!(conversion_raises_fp(&mac, mac.long_id, mac.longdouble_id));
+        assert!(!conversion_raises_fp(
+            &mac,
+            mac.longdouble_id,
+            mac.double_id
+        ));
+        assert!(conversion_raises_fp(&x86, x86.longdouble_id, x86.double_id));
+        assert!(conversion_raises_fp(&a64, a64.int128_id, a64.float128_id));
+
+        // The instruction asks the same question of the types it records.
+        let mut narrow =
+            Instruction::unop(Opcode::FCvtF, PseudoId(1), PseudoId(0), x86.float_id, 32);
+        narrow.src_typ = Some(x86.double_id);
+        narrow.src_size = 64;
+        assert!(narrow.may_raise_fp_exception(&x86));
+        let mut widen =
+            Instruction::unop(Opcode::FCvtF, PseudoId(1), PseudoId(0), x86.double_id, 64);
+        widen.src_typ = Some(x86.float_id);
+        widen.src_size = 32;
+        assert!(!widen.may_raise_fp_exception(&x86));
+        widen.src_typ = None;
+        assert!(
+            widen.may_raise_fp_exception(&x86),
+            "no source type: assume it raises"
+        );
     }
 
     /// I5 -- a memory access is a DCE root, except a `Load`. Over the whole

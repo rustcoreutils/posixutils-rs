@@ -205,6 +205,12 @@ The result is `typ`/`size`; the operands' type and width are
 only where the operands are known ordered (`ifconv`); nothing replaces a
 quiet one by a signaling one.
 
+Whether an operation can raise a floating-point exception is
+`Opcode::fp_raise` (`FpRaise`): never, may, or -- for a conversion -- as the
+two types say (`conversion_raises_fp`). `Instruction::may_raise_fp_exception`
+puts them together, and nothing that may raise is moved onto a path that
+would not have run it.
+
 | Opcode | Description |
 |--------|-------------|
 | `seteq`, `setne` | `==`, `!=` |

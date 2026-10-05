@@ -20,9 +20,43 @@ use std::io::Write;
 // Mega-test: Preprocessor macros
 // ============================================================================
 
+/// Macro expansion, #if, blue painting, __has_builtin, C99 edge cases, digraphs
+/// and stringification, as one program; each section keeps its original test
+/// name and doc comment, and the exit-code table is at the top. Every macro a
+/// section defines is #undef'd after it, so each section starts from the same
+/// macro state it had alone. (preprocessor_pragma_stdc_mega stays separate: its
+/// #pragma STDC lines apply to the whole translation unit.)
+///
+/// The last section is preprocessor_stringify_keeps_multi_character_punctuators:
+/// 6.10.3.2p2 asks for "the spelling of the preprocessing token", and a
+/// punctuator of more than one character has one. `SpecialToken` codes at or
+/// above 256 fell through the stringifier's catch-all, so every multi-character
+/// operator vanished: `#x` turned `a >> b` into `"a  b"`, and an assertion or
+/// logging macro printed something that was not the expression it was given.
+/// Each expected string below is gcc's. Recorded at #C128.
+///
+/// Consolidates: preprocessor_macros_mega, preprocessor_if_directives_mega,
+/// preprocessor_blue_painting_mega, preprocessor_has_builtin_mega,
+/// preprocessor_c99_edge_cases_mega, preprocessor_digraphs_mega,
+/// preprocessor_stringify_escaping_mega and
+/// preprocessor_stringify_keeps_multi_character_punctuators.
 #[test]
 fn preprocessor_macros_mega() {
     let code = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1- 39  preprocessor_macros_mega
+ *    41- 52  preprocessor_if_directives_mega
+ *    61- 61  preprocessor_blue_painting_mega
+ *    71-103  preprocessor_has_builtin_mega
+ *   111-116  preprocessor_c99_edge_cases_mega
+ *   121-127  preprocessor_digraphs_mega
+ *   131-150  preprocessor_stringify_escaping_mega
+ *   161-184  preprocessor_stringify_keeps_multi_character_punctuators
+ */
+
+/* ---- preprocessor_macros_mega (exit codes 1-39) ----
+ */
 #define STR(x) #x
 #define WRAP(y) STR(y)
 #define ID(x) x
@@ -39,7 +73,7 @@ fn preprocessor_macros_mega() {
 #define STR1 "hello"
 #define STR2 "world"
 
-int main(void) {
+static int t_preprocessor_macros_mega(void) {
     // ========== NESTED MACRO EXPANSION (returns 1-9) ==========
     {
         // Nested macro at line start
@@ -117,17 +151,25 @@ CALL(ADD, 10, 20);
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("preproc_macros_mega", code, &[]), 0);
-}
+#undef ADD
+#undef CALL
+#undef ID
+#undef ID1
+#undef ID2
+#undef ID3
+#undef MAKE_VAR
+#undef PASTE
+#undef STR
+#undef STR1
+#undef STR2
+#undef VALUE
+#undef WRAP
+#undef WRAP_ID
+#undef XSTR
 
-// ============================================================================
-// Mega-test: #if/#elif macro expansion
-// ============================================================================
 
-#[test]
-fn preprocessor_if_directives_mega() {
-    let code = r#"
+/* ---- preprocessor_if_directives_mega (exit codes 41-52) ----
+ */
 #define VALUE 42
 #define ZERO 0
 #define ONE 1
@@ -221,7 +263,7 @@ int test12_passed = 1;
 int test12_passed = 0;
 #endif
 
-int main(void) {
+static int t_preprocessor_if_directives_mega(void) {
     if (!test1_passed) return 1;
     if (!test2_passed) return 2;
     if (!test3_passed) return 3;
@@ -236,17 +278,16 @@ int main(void) {
     if (!test12_passed) return 12;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("preproc_if_mega", code, &[]), 0);
-}
+#undef ADD
+#undef ONE
+#undef OPTION
+#undef TEST_GUARD
+#undef VALUE
+#undef ZERO
 
-// ============================================================================
-// Mega-test: Blue-painting / Recursive Macro Prevention
-// ============================================================================
 
-#[test]
-fn preprocessor_blue_painting_mega() {
-    let code = r#"
+/* ---- preprocessor_blue_painting_mega (exit codes 61-61) ----
+ */
 // Self-reference macro
 #define EXPAND_SELF SELF + 1
 int SELF = 10;
@@ -259,7 +300,7 @@ int SELF = 10;
 #define F(x) ((x) + F(x))
 int val = 10;
 
-int main(void) {
+static int t_preprocessor_blue_painting_mega(void) {
     // ========== SELF REFERENCE (returns 1-9) ==========
     {
         // EXPAND_SELF expands to "SELF + 1", inner SELF is variable
@@ -281,18 +322,15 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("preproc_blue_mega", code, &[]), 0);
-}
+#undef A
+#undef B
+#undef EXPAND_SELF
+#undef F
 
-// ============================================================================
-// Mega-test: __has_builtin comprehensive
-// ============================================================================
 
-#[test]
-fn preprocessor_has_builtin_mega() {
-    let code = r#"
-int main(void) {
+/* ---- preprocessor_has_builtin_mega (exit codes 71-103) ----
+ */
+static int t_preprocessor_has_builtin_mega(void) {
     int result = 0;
 
     // ========== VARIADIC BUILTINS ==========
@@ -418,53 +456,10 @@ int main(void) {
     // (4 va + 3 bswap + 3 bit + 4 mem + 4 compile + 3 fp-const + 3 fp-math + 6 atomic + 2 fortified)
     return (result == 32) ? 0 : result;
 }
-"#;
-    assert_eq!(compile_and_run("preproc_has_builtin", code, &[]), 0);
-}
 
-// ============================================================================
-// Test: #error directive exit code
-// ============================================================================
 
-#[test]
-fn preprocessor_error_directive_exit_code() {
-    // Test that #error directive causes non-zero exit code in preprocess-only mode
-    let code = r#"
-#ifdef __ANDROID__
-android_api = __ANDROID_API__
-#else
-#error not Android
-#endif
-"#;
-
-    // Create temp file
-    let mut file = plib::tmp::Builder::new()
-        .prefix("c17_test_error_")
-        .suffix(".c")
-        .tempfile()
-        .expect("failed to create temp file");
-    file.write_all(code.as_bytes())
-        .expect("failed to write test file");
-    let path = file.path().to_path_buf();
-
-    // Run c17 -E (preprocess only)
-    let args = vec!["-E".to_string(), path.to_str().unwrap().to_string()];
-    let output = run_test_base("c17", &args, &[]);
-
-    // Should fail with non-zero exit code
-    assert!(
-        !output.status.success(),
-        "#error directive should cause non-zero exit code"
-    );
-}
-
-// ============================================================================
-// Mega-test: C99 preprocessor edge cases
-// ============================================================================
-
-#[test]
-fn preprocessor_c99_edge_cases_mega() {
-    let code = r#"
+/* ---- preprocessor_c99_edge_cases_mega (exit codes 111-116) ----
+ */
 // Section 5: #include via macro expansion (must be at file scope)
 #define HEADER "stdbool.h"
 #include HEADER
@@ -481,7 +476,7 @@ int defined_ok = 1;
 int defined_ok = 0;
 #endif
 
-int main(void) {
+static int t_preprocessor_c99_edge_cases_mega(void) {
     // Section 1: Stringification of empty variadic args
     {
 #define S(...) #__VA_ARGS__
@@ -536,18 +531,17 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("preproc_c99_edge_mega", code, &[]), 0);
-}
+#undef HAS
+#undef HEADER
+#undef OPT
+#undef P
+#undef S
+#undef TESTMACRO
 
-// ============================================================================
-// Test: C99 digraphs compile and run correctly
-// ============================================================================
 
-#[test]
-fn preprocessor_digraphs_mega() {
-    let code = r#"
-int main(void) {
+/* ---- preprocessor_digraphs_mega (exit codes 121-127) ----
+ */
+static int t_preprocessor_digraphs_mega(void) {
     // Section 1: <: and :> as [ and ]
     {
         int arr<:3:> = <% 10, 20, 30 %>;
@@ -574,48 +568,15 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("preproc_digraphs_mega", code, &[]), 0);
-}
 
-// ============================================================================
-// Mega-test: #pragma STDC directives
-// ============================================================================
 
-#[test]
-fn preprocessor_pragma_stdc_mega() {
-    let code = r#"
-#pragma STDC FP_CONTRACT ON
-#pragma STDC FENV_ACCESS OFF
-#pragma STDC CX_LIMITED_RANGE DEFAULT
-
-int main(void) {
-    // All STDC pragmas should be silently recognized
-    int x = 42;
-    if (x != 42) return 1;
-
-    // _Pragma with STDC equivalent
-    _Pragma("STDC FP_CONTRACT OFF")
-    if (x != 42) return 2;
-
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("preproc_pragma_stdc_mega", code, &[]), 0);
-}
-
-// ============================================================================
-// Mega-test: Stringification escaping (C99 6.10.3.2p2)
-// ============================================================================
-
-#[test]
-fn preprocessor_stringify_escaping_mega() {
-    let code = r#"
+/* ---- preprocessor_stringify_escaping_mega (exit codes 131-150) ----
+ */
 #include <string.h>
 
 #define S(x) #x
 
-int main(void) {
+static int t_preprocessor_stringify_escaping_mega(void) {
     // Section 1: Stringifying a string literal adds escaped quotes
     {
         const char *s = S("hello");
@@ -645,58 +606,126 @@ int main(void) {
 
     return 0;
 }
+#undef S
+
+
+/* ---- preprocessor_stringify_keeps_multi_character_punctuators (exit codes 161-184) ----
+ */
+#include <string.h>
+#define S(x) #x
+static int t_preprocessor_stringify_keeps_multi_character_punctuators(void) {
+if (strcmp(S(a += b), "a += b")) return 1;
+if (strcmp(S(a ++), "a ++")) return 2;
+if (strcmp(S(a -= b), "a -= b")) return 3;
+if (strcmp(S(a --), "a --")) return 4;
+if (strcmp(S(p -> m), "p -> m")) return 5;
+if (strcmp(S(a *= b), "a *= b")) return 6;
+if (strcmp(S(a /= b), "a /= b")) return 7;
+if (strcmp(S(a %= b), "a %= b")) return 8;
+if (strcmp(S(a <= b), "a <= b")) return 9;
+if (strcmp(S(a >= b), "a >= b")) return 10;
+if (strcmp(S(a == b), "a == b")) return 11;
+if (strcmp(S(a != b), "a != b")) return 12;
+if (strcmp(S(a && b), "a && b")) return 13;
+if (strcmp(S(a &= b), "a &= b")) return 14;
+if (strcmp(S(a || b), "a || b")) return 15;
+if (strcmp(S(a |= b), "a |= b")) return 16;
+if (strcmp(S(a ^= b), "a ^= b")) return 17;
+if (strcmp(S(a << b), "a << b")) return 18;
+if (strcmp(S(a >> b), "a >> b")) return 19;
+if (strcmp(S(a <<= b), "a <<= b")) return 20;
+if (strcmp(S(a >>= b), "a >>= b")) return 21;
+if (strcmp(S(f(...)), "f(...)")) return 22;
+/* single-character punctuators were never the problem */
+if (strcmp(S(x[i] ? y : z), "x[i] ? y : z")) return 23;
+if (strcmp(S(a > b), "a > b")) return 24;
+return 0;
+}
+#undef S
+
+int main(void)
+{
+    int r;
+    if ((r = t_preprocessor_macros_mega()) != 0)
+        return 0 + r;
+    if ((r = t_preprocessor_if_directives_mega()) != 0)
+        return 40 + r;
+    if ((r = t_preprocessor_blue_painting_mega()) != 0)
+        return 60 + r;
+    if ((r = t_preprocessor_has_builtin_mega()) != 0)
+        return r > 0 && r < 33 ? 70 + r : 103;
+    if ((r = t_preprocessor_c99_edge_cases_mega()) != 0)
+        return 110 + r;
+    if ((r = t_preprocessor_digraphs_mega()) != 0)
+        return 120 + r;
+    if ((r = t_preprocessor_stringify_escaping_mega()) != 0)
+        return 130 + r;
+    if ((r = t_preprocessor_stringify_keeps_multi_character_punctuators()) != 0)
+        return 160 + r;
+    return 0;
+}
 "#;
-    assert_eq!(
-        compile_and_run("preproc_stringify_escape_mega", code, &[]),
-        0
+    assert_eq!(compile_and_run("preprocessor_macros_mega", code, &[]), 0);
+}
+
+// ============================================================================
+// Test: #error directive exit code
+// ============================================================================
+
+#[test]
+fn preprocessor_error_directive_exit_code() {
+    // Test that #error directive causes non-zero exit code in preprocess-only mode
+    let code = r#"
+#ifdef __ANDROID__
+android_api = __ANDROID_API__
+#else
+#error not Android
+#endif
+"#;
+
+    // Create temp file
+    let mut file = plib::tmp::Builder::new()
+        .prefix("c17_test_error_")
+        .suffix(".c")
+        .tempfile()
+        .expect("failed to create temp file");
+    file.write_all(code.as_bytes())
+        .expect("failed to write test file");
+    let path = file.path().to_path_buf();
+
+    // Run c17 -E (preprocess only)
+    let args = vec!["-E".to_string(), path.to_str().unwrap().to_string()];
+    let output = run_test_base("c17", &args, &[]);
+
+    // Should fail with non-zero exit code
+    assert!(
+        !output.status.success(),
+        "#error directive should cause non-zero exit code"
     );
 }
 
-/// 6.10.3.2p2 asks for "the spelling of the preprocessing token", and a
-/// punctuator of more than one character has one.
-///
-/// `SpecialToken` codes at or above 256 fell through the stringifier's
-/// catch-all, so every multi-character operator vanished: `#x` turned
-/// `a >> b` into `"a  b"`, and an assertion or logging macro printed something
-/// that was not the expression it was given. Each expected string below is
-/// gcc's. Recorded at #C128.
+// ============================================================================
+// Mega-test: #pragma STDC directives
+// ============================================================================
+
 #[test]
-fn preprocessor_stringify_keeps_multi_character_punctuators() {
-    assert_eq!(
-        compile_and_run(
-            "stringify_multi_character_punctuators",
-            "#include <string.h>\n\
-             #define S(x) #x\n\
-             int main(void) {\n\
-             if (strcmp(S(a += b), \"a += b\")) return 1;\n\
-             if (strcmp(S(a ++), \"a ++\")) return 2;\n\
-             if (strcmp(S(a -= b), \"a -= b\")) return 3;\n\
-             if (strcmp(S(a --), \"a --\")) return 4;\n\
-             if (strcmp(S(p -> m), \"p -> m\")) return 5;\n\
-             if (strcmp(S(a *= b), \"a *= b\")) return 6;\n\
-             if (strcmp(S(a /= b), \"a /= b\")) return 7;\n\
-             if (strcmp(S(a %= b), \"a %= b\")) return 8;\n\
-             if (strcmp(S(a <= b), \"a <= b\")) return 9;\n\
-             if (strcmp(S(a >= b), \"a >= b\")) return 10;\n\
-             if (strcmp(S(a == b), \"a == b\")) return 11;\n\
-             if (strcmp(S(a != b), \"a != b\")) return 12;\n\
-             if (strcmp(S(a && b), \"a && b\")) return 13;\n\
-             if (strcmp(S(a &= b), \"a &= b\")) return 14;\n\
-             if (strcmp(S(a || b), \"a || b\")) return 15;\n\
-             if (strcmp(S(a |= b), \"a |= b\")) return 16;\n\
-             if (strcmp(S(a ^= b), \"a ^= b\")) return 17;\n\
-             if (strcmp(S(a << b), \"a << b\")) return 18;\n\
-             if (strcmp(S(a >> b), \"a >> b\")) return 19;\n\
-             if (strcmp(S(a <<= b), \"a <<= b\")) return 20;\n\
-             if (strcmp(S(a >>= b), \"a >>= b\")) return 21;\n\
-             if (strcmp(S(f(...)), \"f(...)\")) return 22;\n\
-             /* single-character punctuators were never the problem */\n\
-             if (strcmp(S(x[i] ? y : z), \"x[i] ? y : z\")) return 23;\n\
-             if (strcmp(S(a > b), \"a > b\")) return 24;\n\
-             return 0;\n\
-             }\n",
-            &[],
-        ),
-        0
-    );
+fn preprocessor_pragma_stdc_mega() {
+    let code = r#"
+#pragma STDC FP_CONTRACT ON
+#pragma STDC FENV_ACCESS OFF
+#pragma STDC CX_LIMITED_RANGE DEFAULT
+
+int main(void) {
+    // All STDC pragmas should be silently recognized
+    int x = 42;
+    if (x != 42) return 1;
+
+    // _Pragma with STDC equivalent
+    _Pragma("STDC FP_CONTRACT OFF")
+    if (x != 42) return 2;
+
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("preproc_pragma_stdc_mega", code, &[]), 0);
 }

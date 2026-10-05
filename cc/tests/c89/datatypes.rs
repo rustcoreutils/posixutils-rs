@@ -23,10 +23,22 @@ use crate::common::compile_and_run;
 // Mega-test: ALL C89 integral types (char, short, int, long)
 // ============================================================================
 
+/// C89 integral and floating types, as one program; see the exit-code table at
+/// the top.
+///
+/// Consolidates: c89_integral_types_mega and c89_floating_types_mega.
 #[test]
-fn c89_integral_types_mega() {
+fn c89_arithmetic_types_mega() {
     let code = r#"
-int main(void) {
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1-102  c89_integral_types_mega
+ *   111-175  c89_floating_types_mega
+ */
+
+/* ---- c89_integral_types_mega (exit codes 1-102) ----
+ */
+static int t_c89_integral_types_mega(void) {
     // ========== CHAR SECTION (returns 1-29) ==========
     {
         // Basic char operations
@@ -205,18 +217,11 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c89_integral_mega", code, &[]), 0);
-}
 
-// ============================================================================
-// Mega-test: ALL C89 floating-point types (float, double, long double)
-// ============================================================================
 
-#[test]
-fn c89_floating_types_mega() {
-    let code = r#"
-int main(void) {
+/* ---- c89_floating_types_mega (exit codes 111-175) ----
+ */
+static int t_c89_floating_types_mega(void) {
     // ========== FLOAT SECTION (returns 1-29) ==========
     {
         float a = 3.14f, b = 2.0f;
@@ -333,17 +338,39 @@ int main(void) {
 
     return 0;
 }
+
+int main(void)
+{
+    int r;
+    if ((r = t_c89_integral_types_mega()) != 0)
+        return 0 + r;
+    if ((r = t_c89_floating_types_mega()) != 0)
+        return 110 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("c89_floating_mega", code, &[]), 0);
+    assert_eq!(compile_and_run("c89_arithmetic_types_mega", code, &[]), 0);
 }
 
 // ============================================================================
 // Mega-test: ALL C89 aggregate types (array, struct, union)
 // ============================================================================
 
+/// C89 aggregate types, pointers and typedefs, as one program; see the exit-code
+/// table at the top.
+///
+/// Consolidates: c89_aggregate_types_mega and c89_pointer_typedef_mega.
 #[test]
-fn c89_aggregate_types_mega() {
+fn c89_derived_types_mega() {
     let code = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1- 76  c89_aggregate_types_mega
+ *    81-141  c89_pointer_typedef_mega
+ */
+
+/* ---- c89_aggregate_types_mega (exit codes 1-76) ----
+ */
 struct Point { int x; int y; };
 struct Rect { struct Point tl; struct Point br; };
 union Data { int i; float f; char c; };
@@ -359,7 +386,7 @@ int sum_array(int arr[], int size) {
     return total;
 }
 
-int main(void) {
+static int t_c89_aggregate_types_mega(void) {
     // ========== ARRAY SECTION (returns 1-39) ==========
     {
         // Basic int array
@@ -502,17 +529,10 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c89_aggregate_mega", code, &[]), 0);
-}
 
-// ============================================================================
-// Mega-test: Pointer and typedef types
-// ============================================================================
 
-#[test]
-fn c89_pointer_typedef_mega() {
-    let code = r#"
+/* ---- c89_pointer_typedef_mega (exit codes 81-141) ----
+ */
 typedef int INT;
 typedef int* INTPTR;
 typedef struct { int x; int y; } Point;
@@ -520,7 +540,7 @@ typedef int IntArray[5];
 
 int double_val(int x) { return x * 2; }
 
-int main(void) {
+static int t_c89_pointer_typedef_mega(void) {
     // ========== POINTER SECTION (returns 1-39) ==========
     {
         // Basic pointer
@@ -630,6 +650,16 @@ int main(void) {
 
     return 0;
 }
+
+int main(void)
+{
+    int r;
+    if ((r = t_c89_aggregate_types_mega()) != 0)
+        return 0 + r;
+    if ((r = t_c89_pointer_typedef_mega()) != 0)
+        return 80 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("c89_ptr_typedef_mega", code, &[]), 0);
+    assert_eq!(compile_and_run("c89_derived_types_mega", code, &[]), 0);
 }

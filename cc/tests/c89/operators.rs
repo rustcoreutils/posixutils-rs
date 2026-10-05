@@ -17,9 +17,23 @@ use crate::common::{compile_and_run, compile_and_run_everywhere};
 // Mega-test: C89 operators (bitfield, mixed_cmp, ops_struct, short_circuit)
 // ============================================================================
 
+/// C89 operators, comprehensively, and unary plus promotion, as one program; see
+/// the exit-code table at the top.
+///
+/// Consolidates: c89_operators_mega, c89_operators_comprehensive_mega and
+/// c89_unary_plus_promotes.
 #[test]
 fn c89_operators_mega() {
     let code = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1- 97  c89_operators_mega
+ *   101-183  c89_operators_comprehensive_mega
+ *   191-201  c89_unary_plus_promotes
+ */
+
+/* ---- c89_operators_mega (exit codes 1-97) ----
+ */
 // Struct for ops_struct tests
 struct Ops {
     int a;
@@ -35,7 +49,7 @@ struct Ops make_ops(int a, int b) {
 int side_effect_count;
 int has_side_effect(int val) { side_effect_count++; return val; }
 
-int main(void) {
+static int t_c89_operators_mega(void) {
     // ========== BITFIELD SECTION (returns 1-29) ==========
     {
         struct Bits {
@@ -273,22 +287,14 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c89_operators_mega", code, &[]), 0);
-}
 
-// ============================================================================
-// Mega-test: Operator coverage gaps — compound assignments, bitwise NOT,
-// comma operator, precedence (15 levels), associativity
-// ============================================================================
 
-#[test]
-fn c89_operators_comprehensive_mega() {
-    let code = r#"
+/* ---- c89_operators_comprehensive_mega (exit codes 101-183) ----
+ */
 int side_effect_var;
 int side_effect_fn(int v) { side_effect_var = v; return v; }
 
-int main(void) {
+static int t_c89_operators_comprehensive_mega(void) {
     // ========== COMPOUND ASSIGNMENT OPS (returns 1-19) ==========
     {
         int a;
@@ -581,24 +587,19 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("c89_operators_comprehensive_mega", code, &[]),
-        0,
-    );
-}
 
-/// Unary `+` promotes its operand and yields the promoted type (C17
-/// 6.5.3.3p2), in every context an expression reaches: `sizeof`, `_Generic`,
-/// arithmetic, and the constant expressions of an initializer, a case label
-/// and an array bound.
-#[test]
-fn c89_unary_plus_promotes() {
-    let code = r#"
+
+/* ---- c89_unary_plus_promotes (exit codes 191-201) ----
+ *
+ *  Unary `+` promotes its operand and yields the promoted type (C17
+ *  6.5.3.3p2), in every context an expression reaches: `sizeof`, `_Generic`,
+ *  arithmetic, and the constant expressions of an initializer, a case label
+ *  and an array bound.
+ */
 static int s = +(signed char)-3;
 enum { E = +(unsigned char)200 };
 
-int main(void) {
+static int t_c89_unary_plus_promotes(void) {
     signed char c = -1;
     unsigned char u = 255;
     short h = -2;
@@ -622,9 +623,26 @@ int main(void) {
     if (!(+u - 256 < 0)) return 11;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("unary_plus_promotes", code, &[]), 0);
+
+int main(void)
+{
+    int r;
+    if ((r = t_c89_operators_mega()) != 0)
+        return 0 + r;
+    if ((r = t_c89_operators_comprehensive_mega()) != 0)
+        return 100 + r;
+    if ((r = t_c89_unary_plus_promotes()) != 0)
+        return 190 + r;
+    return 0;
 }
+"#;
+    assert_eq!(compile_and_run("c89_operators_mega", code, &[]), 0);
+}
+
+// ============================================================================
+// Mega-test: Operator coverage gaps — compound assignments, bitwise NOT,
+// comma operator, precedence (15 levels), associativity
+// ============================================================================
 
 /// Arithmetic on a pointer to a function, which gcc accepts silently as a GNU
 /// extension: it steps by 1, as `void *` arithmetic does, and `sizeof` a

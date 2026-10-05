@@ -112,14 +112,32 @@ fn builtins_gnu_atomics_aarch64() {
     }
 }
 
-/// Every integer width, because the memory operand has to be exactly as wide
-/// as the object: widening it made an 8- or 16-bit read-modify-write touch its
-/// neighbours, which is a bug this family would otherwise re-introduce.
+/// The GNU atomic builtins at every width, evaluating their operand once, and
+/// mixed with C11 atomics, as one program; each section keeps its original test
+/// name and doc comment.
+///
+/// Consolidates: builtins_gnu_atomics_at_every_width,
+/// builtins_gnu_atomics_evaluate_the_operand_once and
+/// builtins_gnu_atomics_agree_with_c11_atomics. The assembly cases are unit
+/// tests in cc/test_asm/builtins_gnu_atomics.rs.
 #[test]
-fn builtins_gnu_atomics_at_every_width() {
+fn builtins_gnu_atomics_mega() {
     let code = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1-  8  builtins_gnu_atomics_at_every_width
+ *    11- 13  builtins_gnu_atomics_evaluate_the_operand_once
+ *    21- 25  builtins_gnu_atomics_agree_with_c11_atomics
+ */
+
+/* ---- builtins_gnu_atomics_at_every_width (exit codes 1-8) ----
+ *
+ *  Every integer width, because the memory operand has to be exactly as wide
+ *  as the object: widening it made an 8- or 16-bit read-modify-write touch its
+ *  neighbours, which is a bug this family would otherwise re-introduce.
+ */
 struct pack { unsigned char before; unsigned char v; unsigned char after; };
-int main(void) {
+static int t_builtins_gnu_atomics_at_every_width(void) {
     { struct pack p = { 0xAA, 1, 0xBB };
       if (__sync_fetch_and_add(&p.v, 1) != 1 || p.v != 2) return 1;
       if (p.before != 0xAA || p.after != 0xBB) return 2; }
@@ -138,40 +156,36 @@ int main(void) {
       (void)p; }
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("gnu_atomics_widths", code, &[]), 0);
-}
 
-/// The operand is evaluated exactly once, although `*_and_fetch` and `nand`
-/// each read it twice in the lowering. Re-applying the operation works on the
-/// value already in hand, not on a second evaluation of the expression.
-#[test]
-fn builtins_gnu_atomics_evaluate_the_operand_once() {
-    let code = r#"
-int calls;
-int one(void) { calls++; return 1; }
 
-int main(void) {
+/* ---- builtins_gnu_atomics_evaluate_the_operand_once (exit codes 11-13) ----
+ *
+ *  The operand is evaluated exactly once, although `*_and_fetch` and `nand`
+ *  each read it twice in the lowering. Re-applying the operation works on the
+ *  value already in hand, not on a second evaluation of the expression.
+ */
+int eo_calls;
+int eo_one(void) { eo_calls++; return 1; }
+
+static int t_builtins_gnu_atomics_evaluate_the_operand_once(void) {
     int v = 0;
-    if (__sync_add_and_fetch(&v, one()) != 1 || calls != 1) return 1;
-    calls = 0;
-    if (__sync_nand_and_fetch(&v, one()) != (int)~1 || calls != 1) return 2;
-    calls = 0;
+    if (__sync_add_and_fetch(&v, eo_one()) != 1 || eo_calls != 1) return 1;
+    eo_calls = 0;
+    if (__sync_nand_and_fetch(&v, eo_one()) != (int)~1 || eo_calls != 1) return 2;
+    eo_calls = 0;
     v = 5;
-    if (__sync_fetch_and_add(&v, one()) != 5 || calls != 1 || v != 6) return 3;
+    if (__sync_fetch_and_add(&v, eo_one()) != 5 || eo_calls != 1 || v != 6) return 3;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("gnu_atomics_once", code, &[]), 0);
-}
 
-/// `_Atomic` objects, the C11 builtins and the GNU ones all reach the same
-/// memory. They lower through one path, so a program may mix them.
-#[test]
-fn builtins_gnu_atomics_agree_with_c11_atomics() {
-    let code = r#"
+
+/* ---- builtins_gnu_atomics_agree_with_c11_atomics (exit codes 21-25) ----
+ *
+ *  `_Atomic` objects, the C11 builtins and the GNU ones all reach the same
+ *  memory. They lower through one path, so a program may mix them.
+ */
 #include <stdatomic.h>
-int main(void) {
+static int t_builtins_gnu_atomics_agree_with_c11_atomics(void) {
     _Atomic int v = 0;
     atomic_store(&v, 5);
     if (__atomic_load_n(&v, __ATOMIC_SEQ_CST) != 5) return 1;
@@ -182,79 +196,20 @@ int main(void) {
     if (atomic_load(&v) != 11) return 5;
     return 0;
 }
+
+int main(void)
+{
+    int r;
+    if ((r = t_builtins_gnu_atomics_at_every_width()) != 0)
+        return 0 + r;
+    if ((r = t_builtins_gnu_atomics_evaluate_the_operand_once()) != 0)
+        return 10 + r;
+    if ((r = t_builtins_gnu_atomics_agree_with_c11_atomics()) != 0)
+        return 20 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("gnu_atomics_c11", code, &[]), 0);
-}
-
-/// `int f(int *p) { return __atomic_load_n(p, ORDER); }` for one `ORDER`,
-/// compiled at -O2 for `target`, with its instruction lines only.
-fn atomic_asm(target: &[&str], body: &str) -> String {
-    let mut args = vec!["-O2"];
-    args.extend_from_slice(target);
-    crate::common::asm_for_at("atomic_order", body, &args)
-        .lines()
-        .filter(|l| !l.trim_start().starts_with('.'))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// An `__atomic_*` operation is only as ordered as it is asked to be. On
-/// aarch64, c17 emitted the acquire and release forms -- `ldar`, `stlr`,
-/// `ldaxr`/`stlxr` -- whatever the order, so a relaxed counter paid for two
-/// barriers per update. gcc emits `ldr`, `str` and `ldxr`/`stxr` for relaxed,
-/// and the acquire or release half alone where only that is asked for.
-#[test]
-fn builtins_aarch64_atomics_honour_their_memory_order() {
-    let a64 = &crate::common::AARCH64_TARGET_ARGS[..];
-    for (body, present, absent) in [
-        (
-            "int f(int *p) { return __atomic_load_n(p, __ATOMIC_RELAXED); }",
-            "ldr",
-            &["ldar"][..],
-        ),
-        (
-            "int f(int *p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }",
-            "ldar",
-            &[][..],
-        ),
-        (
-            "void f(int *p, int v) { __atomic_store_n(p, v, __ATOMIC_RELAXED); }",
-            "str",
-            &["stlr"][..],
-        ),
-        (
-            "void f(int *p, int v) { __atomic_store_n(p, v, __ATOMIC_RELEASE); }",
-            "stlr",
-            &[][..],
-        ),
-        (
-            "int f(int *p, int v) { return __atomic_exchange_n(p, v, __ATOMIC_RELAXED); }",
-            "ldxr",
-            &["ldaxr", "stlxr"][..],
-        ),
-        (
-            "int f(int *p, int v) { return __atomic_fetch_add(p, v, __ATOMIC_RELAXED); }",
-            "ldxr",
-            &["ldaxr", "stlxr"][..],
-        ),
-        (
-            "int f(int *p, int v) { return __atomic_fetch_add(p, v, __ATOMIC_ACQUIRE); }",
-            "ldaxr",
-            &["stlxr"][..],
-        ),
-        (
-            "int f(int *p, int v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }",
-            "stlxr",
-            &[][..],
-        ),
-    ] {
-        let asm = atomic_asm(a64, body);
-        let has = |m: &str| asm.lines().any(|l| l.split_whitespace().next() == Some(m));
-        assert!(has(present), "{body}: expected `{present}`:\n{asm}");
-        for m in absent {
-            assert!(!has(m), "{body}: `{m}` is stronger than asked:\n{asm}");
-        }
-    }
+    assert_eq!(compile_and_run("builtins_gnu_atomics_mega", code, &[]), 0);
 }
 
 /// Every operation at every order it admits, with checked results, at -O0
@@ -353,165 +308,4 @@ int main(void) {
 }
 "#;
     crate::common::compile_and_run_everywhere("atomics_every_order", code);
-}
-
-/// A compare-exchange runs one instruction sequence for both outcomes, so
-/// its two orders combine into one, as gcc combines them: a failure order
-/// stronger than the success order makes it seq-cst, and a release that
-/// acquires on failure is acq-rel. The orders are gcc's choices, read off
-/// `aarch64-linux-gnu-gcc -O2 -mno-outline-atomics`.
-#[test]
-fn builtins_aarch64_compare_exchange_combines_its_orders() {
-    let a64 = &crate::common::AARCH64_TARGET_ARGS[..];
-    for (success, failure, load, store) in [
-        ("RELAXED", "RELAXED", "ldxr", "stxr"),
-        ("CONSUME", "RELAXED", "ldaxr", "stxr"),
-        ("ACQUIRE", "ACQUIRE", "ldaxr", "stxr"),
-        ("RELEASE", "RELAXED", "ldxr", "stlxr"),
-        ("RELEASE", "ACQUIRE", "ldaxr", "stlxr"),
-        ("RELAXED", "ACQUIRE", "ldaxr", "stlxr"),
-        ("ACQUIRE", "SEQ_CST", "ldaxr", "stlxr"),
-        ("ACQ_REL", "RELAXED", "ldaxr", "stlxr"),
-        ("SEQ_CST", "RELAXED", "ldaxr", "stlxr"),
-    ] {
-        let body = format!(
-            "int f(int *p, int *e, int d) {{ return __atomic_compare_exchange_n(\
-             p, e, d, 0, __ATOMIC_{success}, __ATOMIC_{failure}); }}"
-        );
-        let asm = atomic_asm(a64, &body);
-        let ops: Vec<_> = asm
-            .lines()
-            .filter_map(|l| l.split_whitespace().next())
-            .filter(|m| m.contains("xr"))
-            .collect();
-        assert_eq!(ops, [load, store], "{success}/{failure}:\n{asm}");
-    }
-}
-
-/// A fence emits what gcc emits for its order. On aarch64 a release fence is
-/// a full `dmb ish`: it must keep earlier *loads* before later stores too,
-/// which the `dmb ishst` c17 emitted (stores only) does not. On x86-64 only
-/// seq-cst costs an instruction; c17 emitted `lfence`/`sfence`, which order
-/// nothing an acquire or release fence needs.
-#[test]
-fn builtins_thread_fences_follow_their_order() {
-    let host: &[&str] = &[];
-    let a64 = &crate::common::AARCH64_TARGET_ARGS[..];
-    let fence = |target: &[&str], order: &str| {
-        let body = format!("void f(void) {{ __atomic_thread_fence(__ATOMIC_{order}); }}");
-        atomic_asm(target, &body)
-            .lines()
-            .map(str::trim)
-            .filter(|l| l.contains("fence") || l.starts_with("dmb"))
-            .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
-            .collect::<Vec<_>>()
-    };
-    for (order, barrier) in [
-        ("RELAXED", None),
-        ("CONSUME", Some("dmb ishld")),
-        ("ACQUIRE", Some("dmb ishld")),
-        ("RELEASE", Some("dmb ish")),
-        ("ACQ_REL", Some("dmb ish")),
-        ("SEQ_CST", Some("dmb ish")),
-    ] {
-        assert_eq!(
-            fence(a64, order),
-            Vec::from_iter(barrier),
-            "aarch64 {order}"
-        );
-    }
-    if cfg!(target_arch = "x86_64") {
-        for order in ["RELAXED", "CONSUME", "ACQUIRE", "RELEASE", "ACQ_REL"] {
-            assert!(fence(host, order).is_empty(), "x86-64 {order}");
-        }
-        assert_eq!(fence(host, "SEQ_CST"), ["mfence"]);
-    }
-}
-
-/// An order the operation cannot have -- a release load, an acquire store --
-/// is answered with seq-cst and gcc's `-Winvalid-memory-model` warning, as
-/// gcc answers it; so are a failure order that is a release or stronger than
-/// the success order.
-#[test]
-fn builtins_atomics_answer_an_invalid_order_with_seq_cst() {
-    let a64 = &crate::common::AARCH64_TARGET_ARGS[..];
-    let load = atomic_asm(
-        a64,
-        "int f(int *p) { return __atomic_load_n(p, __ATOMIC_RELEASE); }",
-    );
-    assert!(load.contains("ldar"), "{load}");
-    let store = atomic_asm(
-        a64,
-        "void f(int *p) { __atomic_store_n(p, 1, __ATOMIC_ACQUIRE); }",
-    );
-    assert!(store.contains("stlr"), "{store}");
-    if cfg!(target_arch = "x86_64") {
-        let host: &[&str] = &[];
-        let store = atomic_asm(
-            host,
-            "void f(char *p) { __atomic_clear(p, __ATOMIC_ACQ_REL); }",
-        );
-        assert!(store.contains("xchg"), "{store}");
-    }
-
-    for (body, warning) in [
-        (
-            "int f(int *p) { return __atomic_load_n(p, __ATOMIC_RELEASE); }",
-            "invalid memory model 'memory_order_release' for an atomic load",
-        ),
-        (
-            "void f(int *p) { __atomic_store_n(p, 1, __ATOMIC_CONSUME); }",
-            "invalid memory model 'memory_order_consume' for an atomic store",
-        ),
-        (
-            "int f(int *p) { return __atomic_load_n(p, 9); }",
-            "invalid memory model 9 for an atomic load",
-        ),
-        (
-            "int f(int *p, int *e) { return __atomic_compare_exchange_n(p, e, 1, 0, \
-             __ATOMIC_SEQ_CST, __ATOMIC_RELEASE); }",
-            "invalid failure memory model 'memory_order_release'",
-        ),
-        (
-            "int f(int *p, int *e) { return __atomic_compare_exchange_n(p, e, 1, 0, \
-             __ATOMIC_RELAXED, __ATOMIC_ACQUIRE); }",
-            "failure memory model 'memory_order_acquire' cannot be stronger than \
-             success memory model 'memory_order_relaxed'",
-        ),
-    ] {
-        crate::common::compile_expect_warning("atomic_invalid_order", body, warning);
-    }
-    crate::common::compile_expect_no_diagnostic(
-        "atomic_valid_order",
-        "int f(int *p, int *e, int o) { return __atomic_load_n(p, o) \
-         + __atomic_compare_exchange_n(p, e, 1, 0, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE); }",
-        "memory model",
-    );
-}
-
-/// `__atomic_signal_fence` orders only against a signal handler on the same
-/// thread, which needs the compiler not to move memory accesses across it and
-/// no instruction at all; gcc emits nothing. c17 emitted a full hardware
-/// fence (`mfence`, `dmb ish`). The thread fence keeps its instruction.
-#[test]
-fn builtins_signal_fence_emits_no_instruction() {
-    let host: &[&str] = &[];
-    for target in [host, &crate::common::AARCH64_TARGET_ARGS[..]] {
-        let sig = atomic_asm(
-            target,
-            "void f(void) { __atomic_signal_fence(__ATOMIC_SEQ_CST); }",
-        );
-        assert!(
-            !sig.contains("mfence") && !sig.contains("dmb"),
-            "signal fence emitted a hardware fence:\n{sig}"
-        );
-        let thr = atomic_asm(
-            target,
-            "void f(void) { __atomic_thread_fence(__ATOMIC_SEQ_CST); }",
-        );
-        assert!(
-            thr.contains("mfence") || thr.contains("dmb"),
-            "thread fence lost its instruction:\n{thr}"
-        );
-    }
 }

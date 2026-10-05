@@ -159,3 +159,40 @@ pub fn frame_size(asm: &str, func: &str) -> Option<i64> {
     }
     None
 }
+
+/// The symbol prefix `asm` uses, read off a symbol it is known to define.
+///
+/// Mach-O spells every C identifier with a leading underscore. Reading the
+/// prefix off the output is right both for a test that names a `--target`
+/// and for one compiled for the host.
+pub fn asm_prefix(asm: &str, defined: &str) -> &'static str {
+    let mangled = format!("_{defined}:");
+    if asm.lines().any(|l| l.trim_start() == mangled) {
+        "_"
+    } else {
+        ""
+    }
+}
+
+/// Whether `asm` calls a function whose name ends in one of `names`.
+pub fn calls_any(asm: &str, names: &[&str]) -> bool {
+    asm.lines().any(|l| {
+        let mut w = l.split_whitespace();
+        matches!(w.next(), Some("call" | "bl" | "jmp" | "b"))
+            && w.next().is_some_and(|t| {
+                let t = t.trim_end_matches("@PLT");
+                names.iter().any(|n| t.ends_with(n))
+            })
+    })
+}
+
+/// Whether the assembly mentions the function `name` at all -- a call, a
+/// tail jump or an address taken.
+pub fn mentions(asm: &str, name: &str) -> bool {
+    asm.lines()
+        .filter(|l| !l.trim_start().starts_with(".file"))
+        .any(|l| {
+            l.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .any(|w| w == name || w.strip_prefix('_') == Some(name))
+        })
+}

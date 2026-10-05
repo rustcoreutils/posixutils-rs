@@ -17,9 +17,25 @@ use crate::common::compile_and_run;
 // Mega-test: C89 storage classes (auto, static, register, extern)
 // ============================================================================
 
+/// C89 storage classes and block-scope names, as one program; each section keeps
+/// its original test name and doc comment, and the exit-code table is at the top.
+///
+/// Consolidates: c89_storage_mega, c89_block_scope_extern_refers_to_the_global,
+/// c89_block_scope_function_declaration_is_not_an_object and
+/// c89_static_local_is_scoped_like_any_name.
 #[test]
 fn c89_storage_mega() {
     let code = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1- 92  c89_storage_mega
+ *   101-112  c89_block_scope_extern_refers_to_the_global
+ *   121-125  c89_block_scope_function_declaration_is_not_an_object
+ *   131-133  c89_static_local_is_scoped_like_any_name
+ */
+
+/* ---- c89_storage_mega (exit codes 1-92) ----
+ */
 // Extern declaration
 extern int external_var;
 int external_var = 42;
@@ -73,7 +89,7 @@ int sum_with_register(int n) {
     return sum;
 }
 
-int main(void) {
+static int t_c89_storage_mega(void) {
     // ========== AUTO (DEFAULT) STORAGE (returns 1-19) ==========
     {
         // auto is the default for local variables
@@ -208,18 +224,16 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c89_storage_mega", code, &[]), 0);
-}
 
-/// A declaration inside a function body with `extern` declares no object: it
-/// refers to one with external linkage (C17 6.2.2p4). c17 used to fall through
-/// to the ordinary automatic-storage path and give it a stack slot, so reads
-/// returned whatever the frame held and writes never reached the real object.
-/// No shadowing is required to see it.
-#[test]
-fn c89_block_scope_extern_refers_to_the_global() {
-    let code = r#"
+
+/* ---- c89_block_scope_extern_refers_to_the_global (exit codes 101-112) ----
+ *
+ *  A declaration inside a function body with `extern` declares no object: it
+ *  refers to one with external linkage (C17 6.2.2p4). c17 used to fall through
+ *  to the ordinary automatic-storage path and give it a stack slot, so reads
+ *  returned whatever the frame held and writes never reached the real object.
+ *  No shadowing is required to see it.
+ */
 int g = 5;
 long long wide = 1234567890123LL;
 double dg = 2.5;
@@ -258,7 +272,7 @@ int shadowed_addr_taken(int g) {
     return *keep;             /* the parameter */
 }
 
-int main(void) {
+static int t_c89_block_scope_extern_refers_to_the_global(void) {
     if (read_in_function_body() != 5) return 1;
     if (read_in_nested_block()  != 5) return 2;
     if (read_without_extern()   != 5) return 3;
@@ -282,17 +296,15 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c89_block_scope_extern", code, &[]), 0);
-}
 
-/// A function declared inside a function body has external linkage whether or
-/// not `extern` is spelled, so it must not get a stack slot either. Calling it
-/// worked regardless -- calls resolve by name -- but using it as a value took
-/// the address of the slot.
-#[test]
-fn c89_block_scope_function_declaration_is_not_an_object() {
-    let code = r#"
+
+/* ---- c89_block_scope_function_declaration_is_not_an_object (exit codes 121-125) ----
+ *
+ *  A function declared inside a function body has external linkage whether or
+ *  not `extern` is spelled, so it must not get a stack slot either. Calling it
+ *  worked regardless -- calls resolve by name -- but using it as a value took
+ *  the address of the slot.
+ */
 int target(void) { return 77; }
 
 int call_after_extern_decl(void) { extern int target(void); return target(); }
@@ -315,7 +327,7 @@ int pointer_identity(void) {
     return a == b && a == target;
 }
 
-int main(void) {
+static int t_c89_block_scope_function_declaration_is_not_an_object(void) {
     if (call_after_extern_decl() != 77) return 1;
     if (call_after_plain_decl()  != 77) return 2;
     if (via_pointer()            != 77) return 3;
@@ -323,20 +335,18 @@ int main(void) {
     if (!pointer_identity())          return 5;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c89_block_scope_fn_decl", code, &[]), 0);
-}
 
-/// A block-scope `static` is a name like any other: an inner one shadows only
-/// inside its block, and it never stands in for a file-scope name it does not
-/// hide. Each used to be found by spelling alone, function name plus
-/// identifier, so the last same-named static declared in a function answered
-/// for every later use of that name in it.
-#[test]
-fn c89_static_local_is_scoped_like_any_name() {
-    let code = r#"
-int g = 100;
-const int c = 5;
+
+/* ---- c89_static_local_is_scoped_like_any_name (exit codes 131-133) ----
+ *
+ *  A block-scope `static` is a name like any other: an inner one shadows only
+ *  inside its block, and it never stands in for a file-scope name it does not
+ *  hide. Each used to be found by spelling alone, function name plus
+ *  identifier, so the last same-named static declared in a function answered
+ *  for every later use of that name in it.
+ */
+int sl_g = 100;
+const int sl_c = 5;
 
 int outer_after_inner(void) {
     static int x = 1;
@@ -346,23 +356,37 @@ int outer_after_inner(void) {
 }
 
 int file_scope_address(void) {
-    { static int g = 5; (void)g; }
-    static int *p = &g;
+    { static int sl_g = 5; (void)sl_g; }
+    static int *p = &sl_g;
     return *p;
 }
 
 int file_scope_const(void) {
-    { static const int c = 9; (void)c; }
-    static int w = c;
+    { static const int sl_c = 9; (void)sl_c; }
+    static int w = sl_c;
     return w;
 }
 
-int main(void) {
+static int t_c89_static_local_is_scoped_like_any_name(void) {
     if (outer_after_inner() != 11) return 1;
     if (file_scope_address() != 100) return 2;
     if (file_scope_const() != 5) return 3;
     return 0;
 }
+
+int main(void)
+{
+    int r;
+    if ((r = t_c89_storage_mega()) != 0)
+        return 0 + r;
+    if ((r = t_c89_block_scope_extern_refers_to_the_global()) != 0)
+        return 100 + r;
+    if ((r = t_c89_block_scope_function_declaration_is_not_an_object()) != 0)
+        return 120 + r;
+    if ((r = t_c89_static_local_is_scoped_like_any_name()) != 0)
+        return 130 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("c89_static_local_scoped", code, &[]), 0);
+    assert_eq!(compile_and_run("c89_storage_mega", code, &[]), 0);
 }

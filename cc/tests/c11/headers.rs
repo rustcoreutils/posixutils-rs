@@ -11,13 +11,31 @@
 
 use crate::common::{compile_and_run, preprocess_text, run_c17};
 
-/// #H1: `<stdint.h>` is in the *freestanding* header set (C17 4p6), so the
-/// implementation must supply it rather than lean on the host's.
+/// The bundled <stdint.h> and <stdatomic.h> surfaces and the long double round
+/// trip, as one program; each section keeps its original test name and doc
+/// comment, and the exit-code table is at the top.
+///
+/// Consolidates: c17_bundled_stdint_provides_the_mandated_surface,
+/// c17_bundled_stdint_agrees_with_system_headers,
+/// c11_stdatomic_provides_the_mandated_typedefs and c17_long_double_round_trip.
 #[test]
-fn c17_bundled_stdint_provides_the_mandated_surface() {
-    let src = r#"
+fn c17_headers_mega() {
+    let code = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1- 10  c17_bundled_stdint_provides_the_mandated_surface
+ *    21- 21  c17_bundled_stdint_agrees_with_system_headers
+ *    31- 32  c11_stdatomic_provides_the_mandated_typedefs
+ *    41- 44  c17_long_double_round_trip
+ */
+
+/* ---- c17_bundled_stdint_provides_the_mandated_surface (exit codes 1-10) ----
+ *
+ *  #H1: `<stdint.h>` is in the *freestanding* header set (C17 4p6), so the
+ *  implementation must supply it rather than lean on the host's.
+ */
         #include <stdint.h>
-        int main(void) {
+        static int t_c17_bundled_stdint_provides_the_mandated_surface(void) {
             if (sizeof(int8_t) != 1 || sizeof(int16_t) != 2) return 1;
             if (sizeof(int32_t) != 4 || sizeof(int64_t) != 8) return 2;
             if (sizeof(uint8_t) != 1 || sizeof(uint64_t) != 8) return 3;
@@ -34,39 +52,37 @@ fn c17_bundled_stdint_provides_the_mandated_surface() {
             if (INT64_C(-9223372036854775807) >= 0) return 10;
             return 0;
         }
-    "#;
-    assert_eq!(compile_and_run("c17_bundled_stdint", src, &[]), 0);
-}
+    
 
-/// The bundled copy must agree with the host's about what `int64_t` is, or
-/// any translation unit including both fails. On LP64 that means `long`, not
-/// `long long` — they are distinct types even at the same width.
-#[test]
-fn c17_bundled_stdint_agrees_with_system_headers() {
-    let src = r#"
+
+/* ---- c17_bundled_stdint_agrees_with_system_headers (exit codes 21-21) ----
+ *
+ *  The bundled copy must agree with the host's about what `int64_t` is, or
+ *  any translation unit including both fails. On LP64 that means `long`, not
+ *  `long long` — they are distinct types even at the same width.
+ */
         #include <stdio.h>
         #include <inttypes.h>
         #include <stdint.h>
         #include <stdlib.h>
         #include <string.h>
-        int main(void) {
+        static int t_c17_bundled_stdint_agrees_with_system_headers(void) {
             int64_t v = INT64_C(-1);
             uint64_t u = UINT64_C(1);
             char buf[64];
             snprintf(buf, sizeof buf, "%" PRId64 " %" PRIu64, v, u);
             return strcmp(buf, "-1 1") == 0 ? 0 : 1;
         }
-    "#;
-    assert_eq!(compile_and_run("c17_stdint_agrees", src, &[]), 0);
-}
+    
 
-/// #X6: C11 7.17.6.1 mandates far more atomic aliases than the fixed-width
-/// ones, and 7.17.5.1 mandates `atomic_is_lock_free`.
-#[test]
-fn c11_stdatomic_provides_the_mandated_typedefs() {
-    let src = r#"
+
+/* ---- c11_stdatomic_provides_the_mandated_typedefs (exit codes 31-31) ----
+ *
+ *  #X6: C11 7.17.6.1 mandates far more atomic aliases than the fixed-width
+ *  ones, and 7.17.5.1 mandates `atomic_is_lock_free`.
+ */
         #include <stdatomic.h>
-        int main(void) {
+        static int t_c11_stdatomic_provides_the_mandated_typedefs(void) {
             atomic_size_t sz; atomic_ptrdiff_t pd; atomic_intptr_t ip; atomic_uintptr_t up;
             atomic_intmax_t im; atomic_uintmax_t um; atomic_wchar_t wc;
             atomic_char16_t c16; atomic_char32_t c32;
@@ -81,19 +97,83 @@ fn c11_stdatomic_provides_the_mandated_typedefs() {
             if (!atomic_is_lock_free(&ai)) return 1;
             return (int)(atomic_load(&sz) + atomic_load(&l64)) - 2;
         }
-    "#;
-    assert_eq!(compile_and_run("c11_stdatomic_typedefs", src, &[]), 0);
+    
+
+
+/* ---- c17_long_double_round_trip (exit codes 41-44) ----
+ *
+ *  #H4: a `long double` round trip. The audit flagged aarch64's float.rs as
+ *  mapping `LongDouble` to a 64-bit slot while the rest of the port is
+ *  consistent with 128 bits, but could not verify it — that audit and this
+ *  development both ran on x86_64. This test runs everywhere; aarch64 CI is
+ *  what adjudicates the claim.
+ */
+        #include <float.h>
+        static long double store;
+        static long double round_trip(long double v) { store = v; return store; }
+        static int t_c17_long_double_round_trip(void) {
+            /* A value that needs more than 53 bits of mantissa: if the slot
+               collapsed to double, this comes back changed. */
+            long double v = 1.0L + LDBL_EPSILON;
+            if (round_trip(v) != v) return 1;
+            if (v == 1.0L) return 2;   /* would mean epsilon was lost */
+
+            /* And one that exceeds double's exponent range on targets where
+               long double is wider. */
+            long double big = LDBL_MAX / 2.0L;
+            if (round_trip(big) != big) return 3;
+
+            /* Through an array, so the load/store path is exercised too. */
+            long double a[3];
+            a[0] = v; a[1] = big; a[2] = -v;
+            if (a[0] != v || a[1] != big || a[2] != -v) return 4;
+            return 0;
+        }
+    
+
+int main(void)
+{
+    int r;
+    if ((r = t_c17_bundled_stdint_provides_the_mandated_surface()) != 0)
+        return 0 + r;
+    if ((r = t_c17_bundled_stdint_agrees_with_system_headers()) != 0)
+        return 20 + r;
+    if ((r = t_c11_stdatomic_provides_the_mandated_typedefs()) != 0)
+        return r > 0 && r < 2 ? 30 + r : 32;
+    if ((r = t_c17_long_double_round_trip()) != 0)
+        return 40 + r;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("c17_headers_mega", code, &[]), 0);
 }
 
-/// #X7: `CMPLX` exists precisely so an infinite or NaN imaginary part can be
-/// constructed exactly — `x + y*I` propagates the special value into the real
-/// part too.
+/// <complex.h> with <math.h>: CMPLX, the infinity rules and unary minus, as one
+/// program linked with -lm; each section keeps its original test name and doc
+/// comment. (<tgmath.h> is in c17_tgmath_mega: its macros would rename the math
+/// calls of these sections.)
+///
+/// Consolidates: c11_cmplx_constructs_exactly, c17_complex_infinity_rules_match_gcc
+/// and c11_complex_unary_minus_and_real_cast.
 #[test]
-fn c11_cmplx_constructs_exactly() {
-    let src = r#"
+fn c11_complex_headers_mega() {
+    let code = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1-  3  c11_cmplx_constructs_exactly
+ *    11- 20  c17_complex_infinity_rules_match_gcc
+ *    31- 48  c11_complex_unary_minus_and_real_cast
+ */
+
+/* ---- c11_cmplx_constructs_exactly (exit codes 1-3) ----
+ *
+ *  #X7: `CMPLX` exists precisely so an infinite or NaN imaginary part can be
+ *  constructed exactly — `x + y*I` propagates the special value into the real
+ *  part too.
+ */
         #include <complex.h>
         #include <math.h>
-        int main(void) {
+        static int t_c11_cmplx_constructs_exactly(void) {
             double complex c = CMPLX(1.0, INFINITY);
             if (creal(c) != 1.0) return 1;
             if (!isinf(cimag(c))) return 2;
@@ -102,9 +182,146 @@ fn c11_cmplx_constructs_exactly() {
             if (!isnan(creal(n))) return 3;
             return 0;
         }
-    "#;
+    
+
+
+/* ---- c17_complex_infinity_rules_match_gcc (exit codes 11-20) ----
+ *
+ *  The complex arithmetic behind the `__STDC_IEC_559_COMPLEX__` decision.
+ *
+ *  Two things are pinned. The parts of Annex G that c17 *does* get right, so a
+ *  regression in complex lowering is caught here rather than in whatever
+ *  numeric code notices first -- these all agree with gcc, verified
+ *  differentially at float, double and long double. And the one rule it gets
+ *  wrong, G.5.1p4, which is the whole reason the macro stays undefined.
+ *
+ *  If the G.5.1 case ever starts passing, this test fails, and that is the
+ *  signal to define the macro rather than let the decision go stale.
+ */
+#include <complex.h>
+#include <math.h>
+
+static int t_c17_complex_infinity_rules_match_gcc(void) {
+    double _Complex inf_c = CMPLX(INFINITY, 0.0);
+    double _Complex nan_c = CMPLX(NAN, NAN);
+
+    /* G.5.1: infinity over a finite value stays infinite. */
+    double _Complex d = inf_c / CMPLX(2.0, 0.0);
+    if (!isinf(creal(d))) return 1;
+
+    /* ...and a finite value over an infinity is a zero. */
+    double _Complex z = CMPLX(2.0, 0.0) / inf_c;
+    if (creal(z) != 0.0 || cimag(z) != 0.0) return 2;
+
+    /* G.6p2: cproj folds every infinity onto one point on the real axis,
+       whichever part is infinite. */
+    if (!isinf(creal(cproj(CMPLX(INFINITY, 2.0))))) return 3;
+    if (!isinf(creal(cproj(CMPLX(1.0, INFINITY))))) return 4;
+    if (creal(cproj(CMPLX(-INFINITY, -0.0))) <= 0.0) return 5;
+
+    /* G.6.3.1: clog's branch cut runs along the negative real axis, and the
+       sign of a zero imaginary part decides which side we are on. */
+    if (cimag(clog(CMPLX(-1.0, 0.0))) <= 0.0) return 6;
+    if (cimag(clog(CMPLX(-1.0, -0.0))) >= 0.0) return 7;
+
+    /* The same rules hold at the other two precisions -- these were the
+       precisions that used to be miscompiled outright (#C1/#C2). */
+    float _Complex fz = CMPLXF(2.0f, 0.0f) / CMPLXF(INFINITY, 0.0f);
+    if (crealf(fz) != 0.0f) return 8;
+    long double _Complex lz = CMPLXL(2.0L, 0.0L) / CMPLXL(INFINITY, 0.0L);
+    if (creall(lz) != 0.0L) return 9;
+
+    /* G.5.1p4 is NOT met: an infinite operand should give an infinite result
+       even against a NaN. It gives NaN, exactly as gcc does -- which is why
+       __STDC_IEC_559_COMPLEX__ stays undefined. Asserted in the failing
+       direction on purpose: this is the gate on that decision.  */
+    double _Complex m = inf_c * nan_c;
+    if (isinf(creal(m)) || isinf(cimag(m))) return 10;
+
+    return 0;
+}
+
+
+/* ---- c11_complex_unary_minus_and_real_cast (exit codes 31-48) ----
+ *
+ *  Unary minus on a complex value, and a cast from complex to a real type.
+ *
+ *  A complex value travels by address, and neither path knew it. `-z` handed
+ *  the *address* to the integer negate, so the result was a small negative
+ *  integer that the next operation dereferenced -- `creal(-z)` segfaulted on
+ *  valid code. A cast to `double` reinterpreted the address as the value.
+ */
+        #include <complex.h>
+        #include <math.h>
+
+        static int near(double a, double b) { return fabs(a - b) < 1e-9; }
+
+        static int t_c11_complex_unary_minus_and_real_cast(void) {
+            double complex z = 3.0 + 4.0 * I;
+
+            double complex n = -z;
+            if (!near(creal(n), -3.0)) return 1;
+            if (!near(cimag(n), -4.0)) return 2;
+
+            /* Negation inside a larger expression, and applied twice. */
+            if (!near(creal(-(-z)), 3.0)) return 3;
+            if (!near(cimag(z + -z), 0.0)) return 4;
+            if (!near(creal(-z * 2.0), -6.0)) return 5;
+
+            /* Every precision, since the part stride differs in each. */
+            float complex fz = 1.5f + 2.5f * I;
+            if (!near(crealf(-fz), -1.5)) return 6;
+            if (!near(cimagf(-fz), -2.5)) return 7;
+
+            long double complex lz = 1.25L + 2.5L * I;
+            if (!near((double)creall(-lz), -1.25)) return 8;
+            if (!near((double)cimagl(-lz), -2.5)) return 9;
+
+            /* A cast to a real type keeps the real part and drops the
+               imaginary one (C17 6.3.1.7p2). */
+            double d = (double) z;
+            if (!near(d, 3.0)) return 10;
+            if ((int) z != 3) return 11;
+            float f = (float) z;
+            if (!near((double) f, 3.0)) return 12;
+
+            /* Compound assignment is `z = z op v`, and both sides travel by
+               address. `z += 1.0` used to compute on the address itself. */
+            double complex c = 3.0 + 4.0 * I;
+            c += 1.0;
+            if (!near(creal(c), 4.0) || !near(cimag(c), 4.0)) return 13;
+            c *= 2.0;
+            if (!near(creal(c), 8.0) || !near(cimag(c), 8.0)) return 14;
+            c -= 8.0 * I;
+            if (!near(creal(c), 8.0) || !near(cimag(c), 0.0)) return 15;
+            c /= 4.0;
+            if (!near(creal(c), 2.0) || !near(cimag(c), 0.0)) return 16;
+
+            /* ...including with a complex right-hand side. */
+            double complex q = 1.0 + 1.0 * I;
+            q *= 1.0 + 1.0 * I;
+            if (!near(creal(q), 0.0) || !near(cimag(q), 2.0)) return 17;
+            q += 3.0 - 2.0 * I;
+            if (!near(creal(q), 3.0) || !near(cimag(q), 0.0)) return 18;
+
+            return 0;
+        }
+    
+
+int main(void)
+{
+    int r;
+    if ((r = t_c11_cmplx_constructs_exactly()) != 0)
+        return 0 + r;
+    if ((r = t_c17_complex_infinity_rules_match_gcc()) != 0)
+        return 10 + r;
+    if ((r = t_c11_complex_unary_minus_and_real_cast()) != 0)
+        return 30 + r;
+    return 0;
+}
+"#;
     assert_eq!(
-        compile_and_run("c11_cmplx_exact", src, &["-lm".to_string()]),
+        compile_and_run("c11_complex_headers_mega", code, &["-lm".to_string()]),
         0
     );
 }
@@ -166,68 +383,6 @@ fn c17_does_not_claim_annex_g_complex() {
     );
 }
 
-/// The complex arithmetic behind the `__STDC_IEC_559_COMPLEX__` decision.
-///
-/// Two things are pinned. The parts of Annex G that c17 *does* get right, so a
-/// regression in complex lowering is caught here rather than in whatever
-/// numeric code notices first -- these all agree with gcc, verified
-/// differentially at float, double and long double. And the one rule it gets
-/// wrong, G.5.1p4, which is the whole reason the macro stays undefined.
-///
-/// If the G.5.1 case ever starts passing, this test fails, and that is the
-/// signal to define the macro rather than let the decision go stale.
-#[test]
-fn c17_complex_infinity_rules_match_gcc() {
-    let src = r#"
-#include <complex.h>
-#include <math.h>
-
-int main(void) {
-    double _Complex inf_c = CMPLX(INFINITY, 0.0);
-    double _Complex nan_c = CMPLX(NAN, NAN);
-
-    /* G.5.1: infinity over a finite value stays infinite. */
-    double _Complex d = inf_c / CMPLX(2.0, 0.0);
-    if (!isinf(creal(d))) return 1;
-
-    /* ...and a finite value over an infinity is a zero. */
-    double _Complex z = CMPLX(2.0, 0.0) / inf_c;
-    if (creal(z) != 0.0 || cimag(z) != 0.0) return 2;
-
-    /* G.6p2: cproj folds every infinity onto one point on the real axis,
-       whichever part is infinite. */
-    if (!isinf(creal(cproj(CMPLX(INFINITY, 2.0))))) return 3;
-    if (!isinf(creal(cproj(CMPLX(1.0, INFINITY))))) return 4;
-    if (creal(cproj(CMPLX(-INFINITY, -0.0))) <= 0.0) return 5;
-
-    /* G.6.3.1: clog's branch cut runs along the negative real axis, and the
-       sign of a zero imaginary part decides which side we are on. */
-    if (cimag(clog(CMPLX(-1.0, 0.0))) <= 0.0) return 6;
-    if (cimag(clog(CMPLX(-1.0, -0.0))) >= 0.0) return 7;
-
-    /* The same rules hold at the other two precisions -- these were the
-       precisions that used to be miscompiled outright (#C1/#C2). */
-    float _Complex fz = CMPLXF(2.0f, 0.0f) / CMPLXF(INFINITY, 0.0f);
-    if (crealf(fz) != 0.0f) return 8;
-    long double _Complex lz = CMPLXL(2.0L, 0.0L) / CMPLXL(INFINITY, 0.0L);
-    if (creall(lz) != 0.0L) return 9;
-
-    /* G.5.1p4 is NOT met: an infinite operand should give an infinite result
-       even against a NaN. It gives NaN, exactly as gcc does -- which is why
-       __STDC_IEC_559_COMPLEX__ stays undefined. Asserted in the failing
-       direction on purpose: this is the gate on that decision.  */
-    double _Complex m = inf_c * nan_c;
-    if (isinf(creal(m)) || isinf(cimag(m))) return 10;
-
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("c17_complex_infinity_rules", src, &["-lm".to_string()]),
-        0
-    );
-}
-
 /// #H12: accepting a flag that does nothing is misleading. There is no
 /// freestanding environment to enter, so say so.
 #[test]
@@ -252,39 +407,6 @@ fn c17_ffreestanding_is_diagnosed() {
         "expected a diagnostic naming the flag:\n{}",
         r.stderr
     );
-}
-
-/// #H4: a `long double` round trip. The audit flagged aarch64's float.rs as
-/// mapping `LongDouble` to a 64-bit slot while the rest of the port is
-/// consistent with 128 bits, but could not verify it — that audit and this
-/// development both ran on x86_64. This test runs everywhere; aarch64 CI is
-/// what adjudicates the claim.
-#[test]
-fn c17_long_double_round_trip() {
-    let src = r#"
-        #include <float.h>
-        static long double store;
-        static long double round_trip(long double v) { store = v; return store; }
-        int main(void) {
-            /* A value that needs more than 53 bits of mantissa: if the slot
-               collapsed to double, this comes back changed. */
-            long double v = 1.0L + LDBL_EPSILON;
-            if (round_trip(v) != v) return 1;
-            if (v == 1.0L) return 2;   /* would mean epsilon was lost */
-
-            /* And one that exceeds double's exponent range on targets where
-               long double is wider. */
-            long double big = LDBL_MAX / 2.0L;
-            if (round_trip(big) != big) return 3;
-
-            /* Through an array, so the load/store path is exercised too. */
-            long double a[3];
-            a[0] = v; a[1] = big; a[2] = -v;
-            if (a[0] != v || a[1] != big || a[2] != -v) return 4;
-            return 0;
-        }
-    "#;
-    assert_eq!(compile_and_run("c17_long_double_round_trip", src, &[]), 0);
 }
 
 /// #X8: `__STDC_NO_THREADS__` is a claim about the host, so the only thing
@@ -335,21 +457,34 @@ fn c11_no_threads_macro_agrees_with_the_host() {
 // <tgmath.h> — C11 7.25 type-generic math
 // ============================================================================
 
-/// The bundled `<tgmath.h>` dispatches over float / double / long double and
-/// their complex counterparts.
+/// <tgmath.h> on real and complex arguments, as one program; each section keeps
+/// its original test name and doc comment.
 ///
-/// It is bundled rather than delegated because no glibc `<tgmath.h>` is usable
-/// here: each one needs compiler internals c17 lacks (`__builtin_tgmath` for
-/// GCC >= 8, `__builtin_classify_type` and `__real__` for the older path), and
-/// every version `#error`s out before reaching them unless `__HAVE_FLOAT128`
-/// agrees with `__HAVE_FLOAT64X` -- which is decided solely by the `__GNUC__`
-/// version c17 advertises.
+/// Consolidates: c17_tgmath_dispatches_by_type and c17_tgmath_handles_complex.
 #[test]
-fn c17_tgmath_dispatches_by_type() {
-    let src = r#"
+fn c17_tgmath_mega() {
+    let code = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1- 41  c17_tgmath_dispatches_by_type
+ *    51- 58  c17_tgmath_handles_complex
+ */
+
+/* ---- c17_tgmath_dispatches_by_type (exit codes 1-41) ----
+ *
+ *  The bundled `<tgmath.h>` dispatches over float / double / long double and
+ *  their complex counterparts.
+ *
+ *  It is bundled rather than delegated because no glibc `<tgmath.h>` is usable
+ *  here: each one needs compiler internals c17 lacks (`__builtin_tgmath` for
+ *  GCC >= 8, `__builtin_classify_type` and `__real__` for the older path), and
+ *  every version `#error`s out before reaching them unless `__HAVE_FLOAT128`
+ *  agrees with `__HAVE_FLOAT64X` -- which is decided solely by the `__GNUC__`
+ *  version c17 advertises.
+ */
         #include <tgmath.h>
 
-        int main(void) {
+        static int t_c17_tgmath_dispatches_by_type(void) {
             float f = 4.0f;
             double d = 4.0;
             long double l = 4.0L;
@@ -397,19 +532,14 @@ fn c17_tgmath_dispatches_by_type() {
 
             return 0;
         }
-    "#;
-    assert_eq!(
-        compile_and_run("c17_tgmath_real", src, &["-lm".to_string()]),
-        0
-    );
-}
+    
 
-#[test]
-fn c17_tgmath_handles_complex() {
-    let src = r#"
+
+/* ---- c17_tgmath_handles_complex (exit codes 51-58) ----
+ */
         #include <tgmath.h>
 
-        int main(void) {
+        static int t_c17_tgmath_handles_complex(void) {
             double _Complex z = 1.0 + 0.0 * I;
             float _Complex zf = 1.0f + 0.0f * I;
 
@@ -434,80 +564,20 @@ fn c17_tgmath_handles_complex() {
 
             return 0;
         }
-    "#;
-    assert_eq!(
-        compile_and_run("c17_tgmath_complex", src, &["-lm".to_string()]),
-        0
-    );
+    
+
+int main(void)
+{
+    int r;
+    if ((r = t_c17_tgmath_dispatches_by_type()) != 0)
+        return 0 + r;
+    if ((r = t_c17_tgmath_handles_complex()) != 0)
+        return 50 + r;
+    return 0;
 }
-
-/// Unary minus on a complex value, and a cast from complex to a real type.
-///
-/// A complex value travels by address, and neither path knew it. `-z` handed
-/// the *address* to the integer negate, so the result was a small negative
-/// integer that the next operation dereferenced -- `creal(-z)` segfaulted on
-/// valid code. A cast to `double` reinterpreted the address as the value.
-#[test]
-fn c11_complex_unary_minus_and_real_cast() {
-    let src = r#"
-        #include <complex.h>
-        #include <math.h>
-
-        static int near(double a, double b) { return fabs(a - b) < 1e-9; }
-
-        int main(void) {
-            double complex z = 3.0 + 4.0 * I;
-
-            double complex n = -z;
-            if (!near(creal(n), -3.0)) return 1;
-            if (!near(cimag(n), -4.0)) return 2;
-
-            /* Negation inside a larger expression, and applied twice. */
-            if (!near(creal(-(-z)), 3.0)) return 3;
-            if (!near(cimag(z + -z), 0.0)) return 4;
-            if (!near(creal(-z * 2.0), -6.0)) return 5;
-
-            /* Every precision, since the part stride differs in each. */
-            float complex fz = 1.5f + 2.5f * I;
-            if (!near(crealf(-fz), -1.5)) return 6;
-            if (!near(cimagf(-fz), -2.5)) return 7;
-
-            long double complex lz = 1.25L + 2.5L * I;
-            if (!near((double)creall(-lz), -1.25)) return 8;
-            if (!near((double)cimagl(-lz), -2.5)) return 9;
-
-            /* A cast to a real type keeps the real part and drops the
-               imaginary one (C17 6.3.1.7p2). */
-            double d = (double) z;
-            if (!near(d, 3.0)) return 10;
-            if ((int) z != 3) return 11;
-            float f = (float) z;
-            if (!near((double) f, 3.0)) return 12;
-
-            /* Compound assignment is `z = z op v`, and both sides travel by
-               address. `z += 1.0` used to compute on the address itself. */
-            double complex c = 3.0 + 4.0 * I;
-            c += 1.0;
-            if (!near(creal(c), 4.0) || !near(cimag(c), 4.0)) return 13;
-            c *= 2.0;
-            if (!near(creal(c), 8.0) || !near(cimag(c), 8.0)) return 14;
-            c -= 8.0 * I;
-            if (!near(creal(c), 8.0) || !near(cimag(c), 0.0)) return 15;
-            c /= 4.0;
-            if (!near(creal(c), 2.0) || !near(cimag(c), 0.0)) return 16;
-
-            /* ...including with a complex right-hand side. */
-            double complex q = 1.0 + 1.0 * I;
-            q *= 1.0 + 1.0 * I;
-            if (!near(creal(q), 0.0) || !near(cimag(q), 2.0)) return 17;
-            q += 3.0 - 2.0 * I;
-            if (!near(creal(q), 3.0) || !near(cimag(q), 0.0)) return 18;
-
-            return 0;
-        }
-    "#;
+"#;
     assert_eq!(
-        compile_and_run("c11_complex_unary_minus", src, &["-lm".to_string()]),
+        compile_and_run("c17_tgmath_mega", code, &["-lm".to_string()]),
         0
     );
 }

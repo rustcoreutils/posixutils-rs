@@ -18,7 +18,7 @@
 // same predefined macros, and a typo is still an error.
 //
 
-use crate::common::{compile_expect_ok, preprocess_text, run_c17};
+use crate::common::{preprocess_text, run_c17};
 
 /// The `-std=` spellings that name C17 itself. Exhaustive.
 const C17_SPELLINGS: &[&str] = &[
@@ -252,12 +252,9 @@ fn c17_rejects_an_unknown_std() {
 #[test]
 fn c17_accepts_every_documented_std_spelling() {
     // The negative test above cannot pass vacuously: these must all work.
+    // The compile half (compile_expect_ok of each spelling's name) is a unit
+    // test in cc/test_asm/preprocessor_std_dialect.rs.
     for spec in accepted() {
-        compile_expect_ok(
-            &format!("std_ok_{}", spec.replace(':', "_")),
-            "int main(void) { return 0; }\n",
-        );
-
         let run = run_c17(&[&format!("-std={spec}"), "--print-targets"]);
         assert!(
             run.success,

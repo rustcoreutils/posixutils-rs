@@ -88,6 +88,7 @@ fn apply_flags(flags: &[&str]) -> Options {
             "-shared" | "--shared" | "-G" => o.shared = true,
             "--fno-unwind-tables" => o.no_unwind_tables = true,
             "-fverbose-asm" => o.verbose_asm = true,
+            "-fmath-errno" => o.math_errno = true,
             "-fno-math-errno" => o.math_errno = false,
             "-fno-trapping-math" => o.trapping_math = false,
             "-fno-inline" => o.inlining = Some(false),

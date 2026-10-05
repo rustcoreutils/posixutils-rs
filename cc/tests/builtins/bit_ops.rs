@@ -12,17 +12,31 @@
 //
 
 use crate::common::{
-    asm_for_at, compile_and_run, compile_and_run_aarch64, compile_and_run_optimized,
+    compile_and_run, compile_and_run_aarch64, compile_and_run_everywhere, compile_and_run_optimized,
 };
 
 // ============================================================================
 // Mega-test: Bit operation builtins
 // ============================================================================
 
+/// The bit builtins, with every other program of this file built at the matrix
+/// levels with no options, as one program; see the exit-code table at the top.
+///
+/// Consolidates: builtins_bit_ops_mega, the matrix-level run of
+/// builtins_clrsb_counts_redundant_sign_bits, and builtins_ffsll_matches_its_siblings.
 #[test]
 fn builtins_bit_ops_mega() {
     let code = r#"
-int main(void) {
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1- 98  builtins_bit_ops_mega
+ *   101-119  builtins_clrsb_counts_redundant_sign_bits
+ *   121-128  builtins_ffsll_matches_its_siblings
+ */
+
+/* ---- builtins_bit_ops_mega (exit codes 1-98) ----
+ */
+static int t_builtins_bit_ops_mega(void) {
     // ========== CLZ (count leading zeros) (returns 1-29) ==========
     {
         unsigned int val;
@@ -228,6 +242,90 @@ int main(void) {
 
     return 0;
 }
+
+
+/* ---- builtins_clrsb_counts_redundant_sign_bits (exit codes 101-119) ----
+ *
+ *  `__builtin_clrsb` and friends: the count of redundant sign bits.
+ *
+ *  Absent entirely until now, which is what stopped sparse's `builtin.c`
+ *  compiling. Unlike the `clz` family these are defined for *every* input --
+ *  0 and -1 both answer one less than the width -- so the lowering cannot use
+ *  `clz` naively: `clz(0)` is undefined, and c17 and gcc happen to answer
+ *  differently there, so relying on it would be relying on two undefined
+ *  behaviours agreeing. The fold shifts up and sets a low bit instead, which
+ *  both removes the zero case and absorbs the `- 1`.
+ *
+ *  Every bit position is checked, both signs, at each width.
+ */
+static int side_effect_count = 0;
+static int bump(void) { side_effect_count++; return 255; }
+
+static int t_builtins_clrsb_counts_redundant_sign_bits(void) {
+    /* Documented anchors, taken from gcc. */
+    if (__builtin_clrsb(0) != 31) return 1;
+    if (__builtin_clrsb(-1) != 31) return 2;
+    if (__builtin_clrsb(1) != 30) return 3;
+    if (__builtin_clrsb(-2) != 30) return 4;
+    if (__builtin_clrsb(2) != 29) return 5;
+    if (__builtin_clrsb(255) != 23) return 6;
+    if (__builtin_clrsb(-256) != 23) return 7;
+    if (__builtin_clrsb(0x7fffffff) != 0) return 8;
+    if (__builtin_clrsb((int)0x80000000) != 0) return 9;
+
+    if (__builtin_clrsbll(0LL) != 63) return 10;
+    if (__builtin_clrsbll(-1LL) != 63) return 11;
+    if (__builtin_clrsbll(1LL) != 62) return 12;
+    if (__builtin_clrsbl(0L) != 63) return 13;
+
+    /* Every bit position, both signs, at each width. */
+    for (int i = 0; i < 31; i++) {
+        int v = 1 << i;
+        if (__builtin_clrsb(v) != 30 - i) return 14;
+        if (__builtin_clrsb(-v) != 31 - i) return 15;   /* clrsb(-1) is 31 */
+    }
+    for (int i = 0; i < 63; i++) {
+        long long v = 1LL << i;
+        if (__builtin_clrsbll(v) != 62 - i) return 16;
+        if (__builtin_clrsbll(-v) != 63 - i) return 17;
+    }
+
+    /* The operand is evaluated exactly once. The fold reads its value twice,
+       so a lowering that re-evaluated the *expression* would call bump twice. */
+    if (__builtin_clrsb(bump()) != 23) return 18;
+    if (side_effect_count != 1) return 19;
+    return 0;
+}
+
+
+/* ---- builtins_ffsll_matches_its_siblings (exit codes 121-128) ----
+ *
+ *  `__builtin_ffsll` completes a family that had its first two members only.
+ */
+static int t_builtins_ffsll_matches_its_siblings(void) {
+    if (__builtin_ffs(0) != 0) return 1;
+    if (__builtin_ffs(8) != 4) return 2;
+    if (__builtin_ffsl(8L) != 4) return 3;
+    if (__builtin_ffsll(8LL) != 4) return 4;
+    if (__builtin_ffsll(0LL) != 0) return 5;
+    if (__builtin_ffsll(1LL) != 1) return 6;
+    /* A bit only a 64-bit form can reach. */
+    if (__builtin_ffsll(1LL << 40) != 41) return 7;
+    if (__builtin_ffsll((long long)0x8000000000000000LL) != 64) return 8;
+    return 0;
+}
+
+int main(void)
+{
+    int r;
+    if ((r = t_builtins_bit_ops_mega()) != 0)
+        return 0 + r;
+    if ((r = t_builtins_clrsb_counts_redundant_sign_bits()) != 0)
+        return 100 + r;
+    if ((r = t_builtins_ffsll_matches_its_siblings()) != 0)
+        return 120 + r;
+    return 0;
+}
 "#;
     assert_eq!(compile_and_run("builtins_bit_ops_mega", code, &[]), 0);
 }
@@ -285,28 +383,8 @@ int main(void) {
     return 0;
 }
 "#;
-    assert_eq!(compile_and_run("builtins_clrsb", code, &[]), 0);
+    // The matrix-level run is a section of builtins_bit_ops_mega.
     assert_eq!(compile_and_run_optimized("builtins_clrsb_o2", code), 0);
-}
-
-/// `__builtin_ffsll` completes a family that had its first two members only.
-#[test]
-fn builtins_ffsll_matches_its_siblings() {
-    let code = r#"
-int main(void) {
-    if (__builtin_ffs(0) != 0) return 1;
-    if (__builtin_ffs(8) != 4) return 2;
-    if (__builtin_ffsl(8L) != 4) return 3;
-    if (__builtin_ffsll(8LL) != 4) return 4;
-    if (__builtin_ffsll(0LL) != 0) return 5;
-    if (__builtin_ffsll(1LL) != 1) return 6;
-    /* A bit only a 64-bit form can reach. */
-    if (__builtin_ffsll(1LL << 40) != 41) return 7;
-    if (__builtin_ffsll((long long)0x8000000000000000LL) != 64) return 8;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("builtins_ffsll", code, &[]), 0);
 }
 
 // ============================================================================
@@ -336,7 +414,8 @@ int main(void) {
 /// processors -- and c17 targets the baseline, as gcc does without
 /// `-mpopcnt`. It was emitted unconditionally, so a popcount or parity
 /// raised SIGILL on a processor without it. gcc calls libgcc's
-/// `__popcountdi2`; c17 counts inline instead.
+/// `__popcountdi2`; c17 counts inline instead. (The assembly half is a unit
+/// test in cc/test_asm/builtins_bit_ops.rs.)
 #[test]
 fn builtins_popcount_uses_baseline_instructions() {
     for opt in ["-O0", "-O2"] {
@@ -354,31 +433,37 @@ fn builtins_popcount_uses_baseline_instructions() {
         {
             assert_eq!(rc, 0, "aarch64 {opt}");
         }
-        let asm = asm_for_at(
-            "popcount_asm",
-            "int a(unsigned x) { return __builtin_popcount(x); }\n\
-             int b(unsigned long x) { return __builtin_popcountl(x); }\n\
-             int c(unsigned x) { return __builtin_parity(x); }\n\
-             int d(unsigned long long x) { return __builtin_parityll(x); }\n",
-            &["--target", "x86_64-unknown-linux-gnu", opt],
-        );
-        assert!(!asm.contains("popcnt"), "{opt}: popcnt emitted:\n{asm}");
     }
 }
 
-/// The bit builtins have prototypes -- `int __builtin_ctz(unsigned int)` and
-/// so on -- so an argument converts to the parameter type as in any call
-/// through a prototype (C17 6.5.2.2p7). c17 took the argument's bits as they
-/// were: `__builtin_ctz(8.0)` counted the zeros of the double's
-/// representation, 0 on x86-64 and 2 on aarch64, where gcc answers 3.
+/// The bit builtins as calls through a prototype and as constant expressions, on
+/// every level and target; each section keeps its original test name and doc
+/// comment.
+///
+/// Consolidates: builtins_bit_ops_convert_their_argument,
+/// builtins_bit_ops_of_constants_are_constant_expressions and
+/// builtins_ctz_clz_of_constant_zero_fold_to_the_width.
 #[test]
-fn builtins_bit_ops_convert_their_argument() {
-    crate::common::compile_and_run_everywhere(
-        "bit_ops_convert",
-        r#"
+fn builtins_bit_ops_everywhere_mega() {
+    let code = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1-  9  builtins_bit_ops_convert_their_argument
+ *    11- 61  builtins_bit_ops_of_constants_are_constant_expressions
+ *    71- 73  builtins_ctz_clz_of_constant_zero_fold_to_the_width
+ */
+
+/* ---- builtins_bit_ops_convert_their_argument (exit codes 1-9) ----
+ *
+ *  The bit builtins have prototypes -- `int __builtin_ctz(unsigned int)` and
+ *  so on -- so an argument converts to the parameter type as in any call
+ *  through a prototype (C17 6.5.2.2p7). c17 took the argument's bits as they
+ *  were: `__builtin_ctz(8.0)` counted the zeros of the double's
+ *  representation, 0 on x86-64 and 2 on aarch64, where gcc answers 3.
+ */
 /* Bit builtins convert their argument to the parameter type, as a call
    through a prototype would. */
-int main(void) {
+static int t_builtins_bit_ops_convert_their_argument(void) {
     volatile double d = 8.0, e = 7.9;
     volatile float f = 12.0f;
     volatile long double ld = 2147483648.0L;
@@ -393,58 +478,62 @@ int main(void) {
     if (__builtin_clrsb(f) != 27) return 9;
     return 0;
 }
-"#,
-    );
-}
 
-/// A bit builtin of a constant is an integer constant expression in gcc, so
-/// it may initialize a static object and label a `case`. c17 folded only
-/// `popcount` and `parity`, and none of them in a static initializer.
-#[test]
-fn builtins_bit_ops_of_constants_are_constant_expressions() {
-    crate::common::compile_and_run_everywhere(
-        "bit_ops_constant",
-        r#"
+
+/* ---- builtins_bit_ops_of_constants_are_constant_expressions (exit codes 11-61) ----
+ *
+ *  A bit builtin of a constant is an integer constant expression in gcc, so
+ *  it may initialize a static object and label a `case`. c17 folded only
+ *  `popcount` and `parity`, and none of them in a static initializer.
+ */
 /* Every bit builtin of a constant is an integer constant expression in gcc,
    so it works in a static initializer and a case label. */
-static const int t[] = {
+static const int bc_t[] = {
     __builtin_ctz(8), __builtin_clz(1), __builtin_ctzll(1ULL << 40),
     __builtin_clzl(1), __builtin_popcount(7), __builtin_parity(7),
     __builtin_clrsb(0), __builtin_ffs(8), __builtin_bswap16(0x1234),
 };
-static const unsigned b32 = __builtin_bswap32(0x12345678u);
-static const unsigned long long b64 = __builtin_bswap64(0x0102030405060708ULL);
-int main(void) {
+static const unsigned bc_b32 = __builtin_bswap32(0x12345678u);
+static const unsigned long long bc_b64 = __builtin_bswap64(0x0102030405060708ULL);
+static int t_builtins_bit_ops_of_constants_are_constant_expressions(void) {
     switch (8) { case __builtin_ctz(256): break; case __builtin_popcount(127): return 50; default: return 51; }
-    if (t[0] != 3 || t[1] != 31 || t[2] != 40 || t[3] != 63 || t[4] != 3 || t[5] != 1
-        || t[6] != 31 || t[7] != 4 || t[8] != 0x3412) return 1;
-    if (b32 != 0x78563412u || b64 != 0x0807060504030201ULL) return 2;
+    if (bc_t[0] != 3 || bc_t[1] != 31 || bc_t[2] != 40 || bc_t[3] != 63 || bc_t[4] != 3 || bc_t[5] != 1
+        || bc_t[6] != 31 || bc_t[7] != 4 || bc_t[8] != 0x3412) return 1;
+    if (bc_b32 != 0x78563412u || bc_b64 != 0x0807060504030201ULL) return 2;
     return 0;
-}
-"#,
-    );
 }
 
-/// `ctz` and `clz` of 0 are undefined at run time, but of a constant 0 gcc
-/// still folds them, to the operand width, on both targets: a static
-/// initializer, an enumerator, an array bound and `_Static_assert` accept
-/// them. The other bit builtins are constants in those places too.
-#[test]
-fn builtins_ctz_clz_of_constant_zero_fold_to_the_width() {
-    crate::common::compile_and_run_everywhere(
-        "bit_ops_constant_zero",
-        r#"
-static int z[] = { __builtin_ctz(0), __builtin_clz(0), __builtin_ctzll(0), __builtin_clzl(0) };
-enum { E = __builtin_ctz(0), F = __builtin_ffs(0), G = __builtin_clrsb(-1) };
-static char bound[__builtin_bswap16(0x0100) + __builtin_ctz(-1)];
+
+/* ---- builtins_ctz_clz_of_constant_zero_fold_to_the_width (exit codes 71-73) ----
+ *
+ *  `ctz` and `clz` of 0 are undefined at run time, but of a constant 0 gcc
+ *  still folds them, to the operand width, on both targets: a static
+ *  initializer, an enumerator, an array bound and `_Static_assert` accept
+ *  them. The other bit builtins are constants in those places too.
+ */
+static int bz_z[] = { __builtin_ctz(0), __builtin_clz(0), __builtin_ctzll(0), __builtin_clzl(0) };
+enum { BZ_E = __builtin_ctz(0), BZ_F = __builtin_ffs(0), BZ_G = __builtin_clrsb(-1) };
+static char bz_bound[__builtin_bswap16(0x0100) + __builtin_ctz(-1)];
 _Static_assert(__builtin_clzll(0) == 64 && __builtin_popcountll(-1) == 64, "folded");
 _Static_assert(__builtin_bswap32(0x12345678u) == 0x78563412u, "folded");
-int main(void) {
-    if (z[0] != 32 || z[1] != 32 || z[2] != 64 || z[3] != 64) return 1;
-    if (E != 32 || F != 0 || G != 31) return 2;
-    if (sizeof bound != 1) return 3;
+static int t_builtins_ctz_clz_of_constant_zero_fold_to_the_width(void) {
+    if (bz_z[0] != 32 || bz_z[1] != 32 || bz_z[2] != 64 || bz_z[3] != 64) return 1;
+    if (BZ_E != 32 || BZ_F != 0 || BZ_G != 31) return 2;
+    if (sizeof bz_bound != 1) return 3;
     return 0;
 }
-"#,
-    );
+
+int main(void)
+{
+    int r;
+    if ((r = t_builtins_bit_ops_convert_their_argument()) != 0)
+        return 0 + r;
+    if ((r = t_builtins_bit_ops_of_constants_are_constant_expressions()) != 0)
+        return 10 + r;
+    if ((r = t_builtins_ctz_clz_of_constant_zero_fold_to_the_width()) != 0)
+        return 70 + r;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("builtins_bit_ops_everywhere_mega", code);
 }

@@ -822,93 +822,6 @@ pub fn compile_expect_ok(name: &str, content: &str) {
     );
 }
 
-/// Compile `content` and require it to be **accepted with a diagnostic**.
-///
-/// C17 5.1.1.3 asks only for a diagnostic message, not a failure, so a
-/// constraint gcc warns about is a warning here too. Neither
-/// `compile_expect_error` nor `compile_expect_ok` can express that: the first
-/// demands a non-zero exit, the second says nothing about stderr.
-pub fn compile_expect_warning(name: &str, content: &str, expected: &str) {
-    compile_expect_warning_named(name, content, expected, &[]);
-}
-
-fn compile_expect_warning_named(
-    name: &str,
-    content: &str,
-    expected: &str,
-    extra: &[String],
-) -> String {
-    let c_file = create_c_file(name, content);
-    let asm = plib::tmp::Builder::new()
-        .prefix(&format!("c17_warn_{}_", name))
-        .suffix(".s")
-        .tempfile()
-        .expect("failed to create temp file");
-
-    let mut args = extra.to_vec();
-    args.extend([
-        "-S".to_string(),
-        "-o".to_string(),
-        asm.path().to_string_lossy().to_string(),
-        c_file.path().to_string_lossy().to_string(),
-    ]);
-    let output = run_test_base("c17", &args, &[]);
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert!(
-        output.status.success(),
-        "'{}' should have compiled with a warning, but was rejected.\nSource:\n{}\nstderr:\n{}",
-        name,
-        content,
-        stderr
-    );
-    assert!(
-        stderr.contains(expected),
-        "'{}' compiled, but no diagnostic mentioned {:?}.\nstderr:\n{}",
-        name,
-        expected,
-        stderr
-    );
-    stderr
-}
-
-/// Compile `content` and require it to be accepted **without** a diagnostic
-/// mentioning `forbidden`.
-///
-/// The inverse of `compile_expect_warning`, and the only way to pin a
-/// *spurious* diagnostic: `compile_expect_ok` checks the exit status, which a
-/// warning does not change, so a wrongly-warned program passes it.
-pub fn compile_expect_no_diagnostic(name: &str, content: &str, forbidden: &str) {
-    let c_file = create_c_file(name, content);
-    let asm = plib::tmp::Builder::new()
-        .prefix(&format!("c17_nodiag_{}_", name))
-        .suffix(".s")
-        .tempfile()
-        .expect("failed to create temp file");
-
-    let args = vec![
-        "-S".to_string(),
-        "-o".to_string(),
-        asm.path().to_string_lossy().to_string(),
-        c_file.path().to_string_lossy().to_string(),
-    ];
-    let output = run_test_base("c17", &args, &[]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "'{}' should have compiled cleanly, but was rejected.\nSource:\n{}\nstderr:\n{}",
-        name,
-        content,
-        stderr
-    );
-    assert!(
-        !stderr.contains(forbidden),
-        "'{}' compiled, but emitted a diagnostic mentioning {:?}.\nstderr:\n{}",
-        name,
-        forbidden,
-        stderr
-    );
-}
-
 /// Preprocess `content` with `-E` and return the run.
 ///
 /// Every other preprocessor test asserts on the exit code of a compiled
@@ -991,23 +904,5 @@ pub fn asm_prefix(asm: &str, defined: &str) -> &'static str {
         "_"
     } else {
         ""
-    }
-}
-
-/// `name` as the assembler spells it on this host.
-///
-/// Mach-O prefixes every C identifier with an underscore, so a test that
-/// looks for a label or a call by its C name finds nothing on macOS -- and
-/// usually finds nothing in the *negative* direction either, so it passes
-/// vacuously and reports a failure only on the platform it was never run on.
-///
-/// Only for a test that compiles for the *host*. One that names its target
-/// should spell the prefix from the target, and is better off naming both
-/// formats so the Mach-O shape is exercised on every run.
-pub fn asm_symbol(name: &str) -> String {
-    if cfg!(target_os = "macos") {
-        format!("_{name}")
-    } else {
-        name.to_string()
     }
 }

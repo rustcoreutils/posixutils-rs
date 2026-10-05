@@ -16,6 +16,20 @@
 //
 
 mod asm_probe;
+mod builtins_bit_ops;
+mod builtins_call_semantics;
+mod builtins_copy_fold;
+mod builtins_gnu_atomics;
+mod builtins_gnu_batch;
+mod builtins_intrinsics;
+mod builtins_libm;
+mod builtins_math;
+mod builtins_mem_expand;
+mod builtins_mem_moves;
+mod builtins_stdio_fold;
+mod builtins_string_fold;
+mod builtins_va_arg_pack;
+mod c11_member_lists;
 mod c99_complex;
 mod c99_expressions;
 mod c99_features;
@@ -55,3 +69,5 @@ mod codegen_unwind;
 mod codegen_varargs;
 mod codegen_vector_abi;
 mod codegen_vector_native;
+mod misc_statement_attributes;
+mod preprocessor_std_dialect;

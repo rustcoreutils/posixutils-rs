@@ -8,21 +8,43 @@
 //
 // Math Builtins Mega-Test
 //
-// Consolidates: nan, nans, flt_rounds tests
+// Consolidates: nan, nans, flt_rounds tests, and every run-only program of
+// this file that shares a link line. Assembly and compile-only cases are
+// unit tests in cc/test_asm/builtins_math.rs.
 //
 
-use crate::common::{
-    asm_for_at, asm_symbol, compile_and_run, compile_and_run_aarch64, compile_expect_error,
-};
+use crate::common::{compile_and_run, compile_and_run_aarch64};
 
 // ============================================================================
 // Mega-test: Math builtins
 // ============================================================================
 
+/// The math builtins, and every other program of this file that links with -lm and
+/// includes no header, as one program. Each section keeps its original test name
+/// and doc comment; see the exit-code table at the top of the program.
+///
+/// Consolidates: builtins_math_mega (nan, nans, flt_rounds),
+/// builtins_library_math_builtins_take_doubles, builtins_fp_relations,
+/// builtins_libm_and_memory_aliases, builtins_libm_entry_points, the function-pointer
+/// half of builtins_bare_complex_accessors, and the run half of
+/// builtins_nan_of_a_string_that_does_not_fold.
 #[test]
 fn builtins_math_mega() {
     let code = r#"
-int main(void) {
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1- 91  builtins_math_mega
+ *   101-109  builtins_library_math_builtins_take_doubles
+ *   111-140  FP_RELATIONS
+ *   151-170  builtins_libm_and_memory_aliases
+ *   181-199  builtins_libm_entry_points
+ *   201-201  builtins_bare_complex_accessors
+ *   211-213  builtins_nan_of_a_string_that_does_not_fold
+ */
+
+/* ---- builtins_math_mega (exit codes 1-91) ----
+ */
+static int t_builtins_math_mega(void) {
     // ========== __BUILTIN_NAN (returns 1-9) ==========
     {
         // Quiet NaN for double
@@ -146,6 +168,256 @@ int main(void) {
 
     return 0;
 }
+
+
+/* ---- builtins_library_math_builtins_take_doubles (exit codes 101-109) ----
+ *
+ *  A library builtin taking `double` must be declared taking `double`.
+ *
+ *  When the header that would declare `sqrt` or `copysign` has not been
+ *  included, these builtins synthesize a declaration. Every synthesized
+ *  parameter was an `unsigned long` — right for the `_chk` family, whose
+ *  arguments are pointers, sizes and flags, and wrong for a `double`, which
+ *  the ABI passes in an SSE register instead. The argument went to the wrong
+ *  register file entirely, so `__builtin_sqrt(4.0)` read whatever was in xmm0
+ *  and answered 0.0, and `__builtin_copysign(1.0, -1.0)` answered 1.0 because
+ *  the sign argument never arrived.
+ *
+ *  Silent: the call links and runs. The library functions of the same name
+ *  were always correct, which is what narrowed it to this path.
+ *
+ *  No `<math.h>` here on purpose — including it declares them properly and
+ *  the synthesized path is never taken.
+ */
+static int t_builtins_library_math_builtins_take_doubles(void) {
+    if (__builtin_sqrt(4.0) != 2.0) return 1;
+    if (__builtin_sqrt(9.0) != 3.0) return 2;
+    if (__builtin_sqrt(0.0) != 0.0) return 3;
+
+    if (__builtin_copysign(1.0, -1.0) != -1.0) return 4;
+    if (__builtin_copysign(-1.0, 1.0) != 1.0) return 5;
+    if (__builtin_copysign(-5.0, 2.0) != 5.0) return 6;
+    /* The magnitude has to survive too: this answered 0.0, not -3.0. */
+    if (__builtin_copysign(3.0, -0.0) != -3.0) return 7;
+
+    /* A non-constant argument takes the same path. */
+    volatile double v = 16.0;
+    if (__builtin_sqrt(v) != 4.0) return 8;
+    volatile double sign = -2.0;
+    if (__builtin_copysign(7.0, sign) != -7.0) return 9;
+    return 0;
+}
+
+
+/* ---- FP_RELATIONS (exit codes 111-140) ----
+ *
+ *  glibc's `<math.h>` *defines* `isgreater`, `isless`, `isunordered` and their
+ *  siblings as these builtins, so a translation unit that includes the header
+ *  and uses one did not compile at all before they existed.
+ *
+ *  Every relation is checked against an ordered pair in both directions and
+ *  against a NaN on each side, because the NaN answer is the whole reason C99
+ *  has this family: the ordinary relational operators may raise `FE_INVALID`
+ *  on an unordered pair and these may not. `islessgreater` is the one that
+ *  cannot be spelled as `!=` -- `!=` is *true* for an unordered pair and this
+ *  must be false for one.
+ */
+extern void abort(void);
+#define CHECK(n, e) do { if (!(e)) return n; } while (0)
+
+static int t_builtins_fp_relations(void) {
+    volatile double one = 1.0, two = 2.0, nan = 0.0, zero = 0.0;
+    nan = nan / zero;                    /* a NaN the optimizer cannot fold */
+
+    CHECK(1, __builtin_isgreater(two, one) == 1);
+    CHECK(2, __builtin_isgreater(one, two) == 0);
+    CHECK(3, __builtin_isgreater(one, one) == 0);
+    CHECK(4, __builtin_isgreaterequal(one, one) == 1);
+    CHECK(5, __builtin_isgreaterequal(one, two) == 0);
+    CHECK(6, __builtin_isless(one, two) == 1);
+    CHECK(7, __builtin_isless(two, one) == 0);
+    CHECK(8, __builtin_islessequal(one, one) == 1);
+    CHECK(9, __builtin_islessequal(two, one) == 0);
+    CHECK(10, __builtin_islessgreater(one, two) == 1);
+    CHECK(11, __builtin_islessgreater(one, one) == 0);
+    CHECK(12, __builtin_isunordered(one, two) == 0);
+
+    /* Every relation is false for an unordered pair, on either side... */
+    CHECK(13, __builtin_isgreater(nan, one) == 0);
+    CHECK(14, __builtin_isgreater(one, nan) == 0);
+    CHECK(15, __builtin_isgreaterequal(nan, one) == 0);
+    CHECK(16, __builtin_isless(nan, one) == 0);
+    CHECK(17, __builtin_islessequal(nan, one) == 0);
+    CHECK(18, __builtin_islessgreater(nan, one) == 0);
+    CHECK(19, __builtin_islessgreater(nan, nan) == 0);
+    /* ...and `isunordered` is the one that is true for it. */
+    CHECK(20, __builtin_isunordered(nan, one) == 1);
+    CHECK(21, __builtin_isunordered(one, nan) == 1);
+    CHECK(22, __builtin_isunordered(nan, nan) == 1);
+
+    /* Infinities are ordered, so the relations answer normally. */
+    {
+        volatile double inf = __builtin_inf();
+        CHECK(23, __builtin_isgreater(inf, one) == 1);
+        CHECK(24, __builtin_isless(-inf, one) == 1);
+        CHECK(25, __builtin_isunordered(inf, one) == 0);
+    }
+
+    /* float and long double reach the same lowering through a conversion. */
+    {
+        volatile float f1 = 1.0f, f2 = 2.0f;
+        volatile long double l1 = 1.0L, l2 = 2.0L;
+        CHECK(26, __builtin_isless(f1, f2) == 1);
+        CHECK(27, __builtin_isgreater(l2, l1) == 1);
+        CHECK(28, __builtin_isunordered(f1, f2) == 0);
+    }
+
+    /* The usual arithmetic conversions run first, as they do for `<`. */
+    CHECK(29, __builtin_isless(1, 2.0) == 1);
+    CHECK(30, __builtin_isgreater(3.0f, 2) == 1);
+    return 0;
+}
+#undef CHECK
+
+
+/* ---- builtins_libm_and_memory_aliases (exit codes 151-170) ----
+ *
+ *  The suffixed spellings of the libm aliases, and the memory ones gcc has
+ *  under a `__builtin_` name. `bits/floatn.h` reaches for
+ *  `__builtin_copysignf`, so its absence broke any file including `<math.h>`
+ *  on a target with `_Float128` support advertised.
+ */
+static int t_builtins_libm_and_memory_aliases(void) {
+    if (__builtin_copysign(2.0, -1.0) != -2.0) return 1;
+    if (__builtin_copysignf(2.0f, -1.0f) != -2.0f) return 2;
+    if (__builtin_copysignl(2.0L, -1.0L) != -2.0L) return 3;
+    if (__builtin_sqrtf(16.0f) != 4.0f) return 4;
+    if (__builtin_sqrtl(16.0L) != 4.0L) return 5;
+    if (__builtin_fmax(3.0, 4.0) != 4.0) return 6;
+    if (__builtin_fmaxf(3.0f, 4.0f) != 4.0f) return 7;
+    if (__builtin_fmaxl(3.0L, 4.0L) != 4.0L) return 8;
+    if (__builtin_fmin(3.0, 4.0) != 3.0) return 9;
+    if (__builtin_fminf(3.0f, 4.0f) != 3.0f) return 10;
+    if (__builtin_fminl(3.0L, 4.0L) != 3.0L) return 11;
+    if (__builtin_pow(2.0, 10.0) != 1024.0) return 12;
+    if (__builtin_powf(2.0f, 10.0f) != 1024.0f) return 13;
+    if (__builtin_fma(2.0, 3.0, 4.0) != 10.0) return 14;
+
+    {
+        char d[8] = "abcdefg";
+        __builtin_bzero(d, 8);
+        if (d[0] != 0 || d[7] != 0) return 15;
+    }
+    if (__builtin_bcmp("ab", "ab", 2) != 0) return 16;
+    if (__builtin_bcmp("ab", "ac", 2) == 0) return 17;
+    {
+        char dst[8];
+        if (__builtin_stpncpy(dst, "ab", 3) != dst + 2) return 18;
+        if (dst[0] != 'a' || dst[1] != 'b' || dst[2] != 0) return 19;
+    }
+    if (__builtin_strdup("hi") == 0) return 20;
+    return 0;
+}
+
+
+/* ---- builtins_libm_entry_points (exit codes 181-199) ----
+ *
+ *  The libm entry points under their `__builtin_` spellings, at each of the
+ *  three real widths.
+ *
+ *  `__builtin_ceilf` and `__builtin_modf` are ordinary functions any program
+ *  may name; c17 recognised the bare `ceil`/`floor` family and not these.
+ *  Signatures come from one table, because a `float` entry point that is
+ *  declared as taking a `double` does not fail to link -- it sends the
+ *  argument at the wrong width and answers with whatever was in the register.
+ */
+static int t_builtins_libm_entry_points(void) {
+    if (__builtin_ceilf(1.2f) != 2.0f) return 1;
+    if (__builtin_ceil(1.2) != 2.0) return 2;
+    if (__builtin_ceill(1.2L) != 2.0L) return 3;
+    if (__builtin_floor(1.8) != 1.0) return 4;
+    if (__builtin_floorf(1.8f) != 1.0f) return 5;
+    if (__builtin_trunc(-1.8) != -1.0) return 6;
+    if (__builtin_fmod(7.0, 4.0) != 3.0) return 7;
+    if (__builtin_atan2(0.0, 1.0) != 0.0) return 8;
+    if (__builtin_hypot(3.0, 4.0) != 5.0) return 9;
+    if (__builtin_exp(0.0) != 1.0) return 10;
+    if (__builtin_log(1.0) != 0.0) return 11;
+
+    /* These three do not take a list of one type: the second parameter is a
+       pointer or an `int`, and declaring them uniformly sends it to the wrong
+       register file. */
+    {
+        double ip;
+        if (__builtin_modf(3.25, &ip) != 0.25 || ip != 3.0) return 12;
+    }
+    {
+        int e;
+        if (__builtin_frexp(8.0, &e) != 0.5 || e != 4) return 13;
+    }
+    if (__builtin_ldexp(0.5, 4) != 8.0) return 14;
+
+    /* The POSIX case-insensitive comparisons. */
+    if (__builtin_strncasecmp("AbC", "abc", 3) != 0) return 15;
+    if (__builtin_strcasecmp("AbC", "abd") == 0) return 16;
+    if (__builtin_strndup("abcd", 2) == 0) return 17;
+    if (__builtin_memcmp_eq("ab", "ab", 2) != 0) return 18;
+    if (__builtin_memcmp_eq("ab", "ac", 2) == 0) return 19;
+    return 0;
+}
+
+
+/* ---- builtins_bare_complex_accessors (exit codes 201-201) ----
+ *
+ *  `creal`, `cimag` and `conj` are computed in place under their bare names,
+ *  as the `__builtin_` spellings always were; `-fno-builtin-NAME` keeps the
+ *  library call.
+ */
+/* Named without a call, the identifier is the library function. Host only
+   (this mega links -lm on the host): the aarch64 helper links no libm. */
+double creal(double _Complex);
+static int t_complex_accessor_fnptr(void) {
+    double (*fp)(double _Complex) = creal;
+    return fp(1.5 + 2.5i) == 1.5 ? 0 : 1;
+}
+
+
+/* ---- builtins_nan_of_a_string_that_does_not_fold (exit codes 211-213) ----
+ *
+ *  A string gcc does not fold is not folded here either. `__builtin_nan` of
+ *  one is a call to the library's `nan`, which reads the string at run time;
+ *  `__builtin_nans` has no library function, so it is an error -- gcc's is a
+ *  link failure against `__builtin_nans`.
+ */
+double nan(const char *);
+float nanf(const char *);
+static int t_builtins_nan_of_a_string_that_does_not_fold(void) {
+    const char *volatile s = "0x77";
+    if (!__builtin_isnan(__builtin_nan(s))) return 1;
+    if (!__builtin_isnan(__builtin_nan("abc"))) return 2;
+    if (!__builtin_isnan(__builtin_nanf("08"))) return 3;
+    return 0;
+}
+
+int main(void)
+{
+    int r;
+    if ((r = t_builtins_math_mega()) != 0)
+        return 0 + r;
+    if ((r = t_builtins_library_math_builtins_take_doubles()) != 0)
+        return 100 + r;
+    if ((r = t_builtins_fp_relations()) != 0)
+        return 110 + r;
+    if ((r = t_builtins_libm_and_memory_aliases()) != 0)
+        return 150 + r;
+    if ((r = t_builtins_libm_entry_points()) != 0)
+        return 180 + r;
+    if ((r = t_complex_accessor_fnptr()) != 0)
+        return 200 + r;
+    if ((r = t_builtins_nan_of_a_string_that_does_not_fold()) != 0)
+        return 210 + r;
+    return 0;
+}
 "#;
     assert_eq!(
         compile_and_run("builtins_math_mega", code, &["-lm".to_string()]),
@@ -153,19 +425,44 @@ int main(void) {
     );
 }
 
-/// The floating classification builtins agree with gcc at every width.
+/// Every program of this file that links without -lm and needs nothing else of its
+/// own, as one program. Each section keeps its original test name and doc comment.
 ///
-/// `__builtin_isnan` and friends are lowered as comparisons rather than bit
-/// tests, which keeps them exact for `long double` and needs no backend work.
-///
-/// Checked against gcc on the same source at -O0 and -O2.
+/// Consolidates: builtins_float_classification_matches_gcc,
+/// builtins_isnan_answers_one_at_every_width,
+/// builtins_complex_parts_and_suffixed_fp_tests,
+/// builtins_fp_relations_evaluate_each_operand_once,
+/// builtins_return_address_and_cache, and the run halves of
+/// builtins_math_h_signbit_and_copysign and
+/// builtins_sign_ops_in_constant_expressions (their assembly and diagnostic halves
+/// are unit tests in cc/test_asm/builtins_math.rs).
 #[test]
-fn builtins_float_classification_matches_gcc() {
+fn builtins_math_host_mega() {
     let code = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1- 39  builtins_float_classification_matches_gcc
+ *    41- 52  builtins_isnan_answers_one_at_every_width
+ *    61- 78  builtins_complex_parts_and_suffixed_fp_tests
+ *    81- 86  builtins_fp_relations_evaluate_each_operand_once
+ *    91- 93  builtins_return_address_and_cache
+ *   101-103  builtins_math_h_signbit_and_copysign
+ *   111-113  builtins_sign_ops_in_constant_expressions
+ */
+
+/* ---- builtins_float_classification_matches_gcc (exit codes 1-39) ----
+ *
+ *  The floating classification builtins agree with gcc at every width.
+ *
+ *  `__builtin_isnan` and friends are lowered as comparisons rather than bit
+ *  tests, which keeps them exact for `long double` and needs no backend work.
+ *
+ *  Checked against gcc on the same source at -O0 and -O2.
+ */
 #include <float.h>
 
-static volatile double dz = 0.0;
-static volatile float  fz = 0.0f;
+static volatile double fc_dz = 0.0;
+static volatile float  fc_fz = 0.0f;
 
 /* nan, inf, finite, normal -- packed into one integer per case */
 #define BITS(x) ( (__builtin_isnan(x)    ? 8 : 0) \
@@ -173,10 +470,10 @@ static volatile float  fz = 0.0f;
                 | (__builtin_isfinite(x) ? 2 : 0) \
                 | (__builtin_isnormal(x) ? 1 : 0) )
 
-int main(void)
+static int t_builtins_float_classification_matches_gcc(void)
 {
-    double dn = dz / dz, di = 1.0 / dz, ds = 2.2250738585072014e-308 / 4.0;
-    float  fn = fz / fz, fi = 1.0f / fz, fs = 1.17549435e-38f / 4.0f;
+    double dn = fc_dz / fc_dz, di = 1.0 / fc_dz, ds = 2.2250738585072014e-308 / 4.0;
+    float  fn = fc_fz / fc_fz, fi = 1.0f / fc_fz, fs = 1.17549435e-38f / 4.0f;
     long double ln = (long double)dn, li = (long double)di;
     /* Spelled from <float.h> rather than as a fixed exponent: the smallest
        normal is 2^-16382 for x87 and binary128 but 2^-1022 where long double
@@ -227,30 +524,29 @@ int main(void)
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("builtins_fp_classify", code, &[]), 0);
-}
+#undef BITS
 
-/// `isnan(x)` answers 1, not 65535.
-///
-/// glibc's `<math.h>` only uses `__builtin_isnan` once the compiler claims
-/// GCC 4.4; below that it takes a `sizeof` ternary that calls `__isnanl`,
-/// which returns raw class bits. Both conform — C99 7.12.3.4 asks only for "a
-/// nonzero value" — but `isnan(x) == 1` is what real code writes, and it is
-/// what gcc gives. Reaching that path also required `__float128`, since
-/// `bits/floatn.h` turns on `__HAVE_FLOAT128` one threshold *below* it.
-///
-/// This is audit finding #C7.
-#[test]
-fn builtins_isnan_answers_one_at_every_width() {
-    let code = r#"
+
+/* ---- builtins_isnan_answers_one_at_every_width (exit codes 41-52) ----
+ *
+ *  `isnan(x)` answers 1, not 65535.
+ *
+ *  glibc's `<math.h>` only uses `__builtin_isnan` once the compiler claims
+ *  GCC 4.4; below that it takes a `sizeof` ternary that calls `__isnanl`,
+ *  which returns raw class bits. Both conform — C99 7.12.3.4 asks only for "a
+ *  nonzero value" — but `isnan(x) == 1` is what real code writes, and it is
+ *  what gcc gives. Reaching that path also required `__float128`, since
+ *  `bits/floatn.h` turns on `__HAVE_FLOAT128` one threshold *below* it.
+ *
+ *  This is audit finding #C7.
+ */
 #include <math.h>
 
-static volatile double dz = 0.0;
+static volatile double in_dz = 0.0;
 
-int main(void)
+static int t_builtins_isnan_answers_one_at_every_width(void)
 {
-    double dn = dz / dz;
+    double dn = in_dz / in_dz;
     float fn = (float)dn;
     long double ln = (long double)dn;
 
@@ -266,7 +562,7 @@ int main(void)
 
     /* `__builtin_isinf_sign`, which glibc's `isinf` uses once __float128 is
        on: the sign of the infinity, or zero. */
-    double inf = 1.0 / dz;
+    double inf = 1.0 / in_dz;
     if (__builtin_isinf_sign(inf) != 1) return 7;
     if (__builtin_isinf_sign(-inf) != -1) return 8;
     if (__builtin_isinf_sign(1.0) != 0) return 9;
@@ -278,8 +574,176 @@ int main(void)
 
     return 0;
 }
+
+
+/* ---- builtins_complex_parts_and_suffixed_fp_tests (exit codes 61-78) ----
+ *
+ *  `creal`, `cimag` and `conj`, and the suffixed spellings of `isnan` and
+ *  `isinf`.
+ *
+ *  `creal`/`cimag` lower to the `__real__` and `__imag__` c17 already has, and
+ *  `conj` to `__builtin_complex(__real__ z, -__imag__ z)` -- every piece
+ *  existed, so none of the three needs a libm call or `-lm`. The `isnan`/
+ *  `isinf` suffixes carry no information the node needs: `FpTest` dispatches
+ *  on the operand's own type.
+ *
+ *  gcc has **no** `__builtin_isfinitef` or `__builtin_isnormall`, despite
+ *  having the unsuffixed pair -- they compile and then fail to link, which is
+ *  how the first version of this got it wrong. Claiming a builtin gcc does not
+ *  have would make `__has_builtin` a worse answer than none, so the test pins
+ *  their absence alongside the others' presence.
+ */
+static int t_builtins_complex_parts_and_suffixed_fp_tests(void) {
+    _Complex double z = __builtin_complex(3.0, 4.0);
+    _Complex float  w = __builtin_complex(1.0f, 2.0f);
+    _Complex long double q = __builtin_complex(5.0L, 6.0L);
+
+    /* creal/cimag name the halves __real__ and __imag__ already reach. */
+    if (__builtin_creal(z) != 3.0 || __builtin_cimag(z) != 4.0) return 1;
+    if (__builtin_crealf(w) != 1.0f || __builtin_cimagf(w) != 2.0f) return 2;
+    if (__builtin_creall(q) != 5.0L || __builtin_cimagl(q) != 6.0L) return 3;
+
+    /* conj flips the sign of the imaginary half, at every precision. */
+    { _Complex double c = __builtin_conj(z);
+      if (__builtin_creal(c) != 3.0 || __builtin_cimag(c) != -4.0) return 4; }
+    { _Complex float c = __builtin_conjf(w);
+      if (__builtin_crealf(c) != 1.0f || __builtin_cimagf(c) != -2.0f) return 5; }
+    { _Complex long double c = __builtin_conjl(q);
+      if (__builtin_creall(c) != 5.0L || __builtin_cimagl(c) != -6.0L) return 6; }
+
+    /* An involution: conj of conj is the original. */
+    { _Complex double c = __builtin_conj(__builtin_conj(z));
+      if (__builtin_creal(c) != 3.0 || __builtin_cimag(c) != 4.0) return 7; }
+
+    /* A zero imaginary part conjugates to negative zero, which is the whole
+       reason conj is not "subtract the imaginary part from zero". */
+    { _Complex double c = __builtin_conj(__builtin_complex(1.0, 0.0));
+      if (!__builtin_signbit(__builtin_cimag(c))) return 8; }
+
+    /* The suffixed isnan/isinf spellings ask the same question as the
+       unsuffixed one, of the operand's own type. */
+    if (!__builtin_isinff(1.0f / 0.0f)) return 9;
+    if (!__builtin_isinfl(1.0L / 0.0L)) return 10;
+    if (!__builtin_isnanf(0.0f / 0.0f)) return 11;
+    if (!__builtin_isnanl(0.0L / 0.0L)) return 12;
+    if (__builtin_isinff(1.0f) || __builtin_isnanf(1.0f)) return 13;
+
+    /* gcc has no suffixed isfinite or isnormal, so neither do we, and
+       __has_builtin must say so rather than over-promise. */
+    if (__has_builtin(__builtin_isfinitef)) return 14;
+    if (__has_builtin(__builtin_isnormall)) return 15;
+    if (!__has_builtin(__builtin_isinff)) return 16;
+    if (!__has_builtin(__builtin_conjf)) return 17;
+    if (!__has_builtin(__builtin_creal)) return 18;
+    return 0;
+}
+
+
+/* ---- builtins_fp_relations_evaluate_each_operand_once (exit codes 81-86) ----
+ *
+ *  Each operand is evaluated exactly once. The relation is desugared in the
+ *  linearizer rather than written out as `a < b` in the parser precisely so
+ *  that `isunordered(f(), g())` does not call either function twice.
+ */
+int fo_lhs, fo_rhs;
+double fo_f(void) { fo_lhs++; return 1.0; }
+double fo_g(void) { fo_rhs++; return 2.0; }
+
+static int t_builtins_fp_relations_evaluate_each_operand_once(void) {
+    if (__builtin_isless(fo_f(), fo_g()) != 1) return 1;
+    if (fo_lhs != 1 || fo_rhs != 1) return 2;
+    /* `isunordered` and `islessgreater` each read both operands twice in the
+       lowering, which is where a duplicated *expression* would show up. */
+    fo_lhs = fo_rhs = 0;
+    if (__builtin_isunordered(fo_f(), fo_g()) != 0) return 3;
+    if (fo_lhs != 1 || fo_rhs != 1) return 4;
+    fo_lhs = fo_rhs = 0;
+    if (__builtin_islessgreater(fo_f(), fo_g()) != 1) return 5;
+    if (fo_lhs != 1 || fo_rhs != 1) return 6;
+    return 0;
+}
+
+
+/* ---- builtins_return_address_and_cache (exit codes 91-93) ----
+ *
+ *  `__builtin_extract_return_addr` is the identity on both targets c17 has,
+ *  and `__builtin___clear_cache` has to reach libgcc on AArch64, where the
+ *  caches are not coherent and a JIT is wrong without it.
+ */
+int ra_calls;
+void *ra_bump(void) { ra_calls++; return (void *)0x1234; }
+
+static int t_builtins_return_address_and_cache(void) {
+    char code[16];
+    __builtin___clear_cache(code, code + 16);
+    if (__builtin_extract_return_addr(ra_bump()) != (void *)0x1234) return 1;
+    if (ra_calls != 1) return 2;
+    if (__builtin_extract_return_addr(__builtin_return_address(0)) == 0) return 3;
+    return 0;
+}
+
+
+/* ---- builtins_math_h_signbit_and_copysign (exit codes 101-103) ----
+ *
+ *  glibc's `signbit` macro and the `copysign` family `<math.h>` declares
+ *  are the builtins, so a program using them needs no -lm either.
+ */
+#include <math.h>
+static int t_builtins_math_h_signbit_and_copysign(void) {
+    volatile double x = -2.0, z = 0.0;
+    volatile float f = 1.0f;
+    volatile long double l = -0.0L;
+    if (!signbit(x) || signbit(z) || signbit(f) || !signbit(l)) return 1;
+    if (copysign(3.0, x) != -3.0 || copysignf(f, -1.0f) != -1.0f) return 2;
+    if (copysignl(5.0L, l) != -5.0L || !signbit(copysign(z, -1.0))) return 3;
+    return 0;
+}
+
+
+/* ---- builtins_sign_ops_in_constant_expressions (exit codes 111-113) ----
+ *
+ *  As in gcc: `signbit` of a constant is an integer constant expression, and
+ *  `copysign`, `fabs` and `abs` of constants fold in a static initializer --
+ *  but, being calls, are not integer constant expressions, so an array bound
+ *  of one at file scope is rejected.
+ */
+double copysign(double, double); double fabs(double); int abs(int);
+static double sc_a = copysign(2.0, -0.0);
+static float sc_b = __builtin_copysignf(-1.5f, 1.0f);
+static double sc_c = fabs(-3.0);
+static int sc_d = abs(-4);
+static int sc_e = __builtin_signbit(-1.0) + __builtin_signbitl(-0.0L);
+enum { SC_E = __builtin_signbit(-2.0f) };
+_Static_assert(__builtin_signbit(-1.0), "signbit is sc_a constant");
+static int sc_arr[__builtin_signbit(-1.0) + 1];
+static int t_builtins_sign_ops_in_constant_expressions(void) {
+    if (sc_a != -2.0 || sc_b != 1.5f || sc_c != 3.0 || sc_d != 4 || sc_e != 2) return 1;
+    if (SC_E != 1 || sizeof sc_arr != 2 * sizeof(int)) return 2;
+    switch (sc_d) { case __builtin_signbit(-1.0) + 3: return 0; }
+    return 3;
+}
+
+int main(void)
+{
+    int r;
+    if ((r = t_builtins_float_classification_matches_gcc()) != 0)
+        return 0 + r;
+    if ((r = t_builtins_isnan_answers_one_at_every_width()) != 0)
+        return 40 + r;
+    if ((r = t_builtins_complex_parts_and_suffixed_fp_tests()) != 0)
+        return 60 + r;
+    if ((r = t_builtins_fp_relations_evaluate_each_operand_once()) != 0)
+        return 80 + r;
+    if ((r = t_builtins_return_address_and_cache()) != 0)
+        return 90 + r;
+    if ((r = t_builtins_math_h_signbit_and_copysign()) != 0)
+        return 100 + r;
+    if ((r = t_builtins_sign_ops_in_constant_expressions()) != 0)
+        return 110 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("builtins_isnan_is_one", code, &[]), 0);
+    assert_eq!(compile_and_run("builtins_math_host_mega", code, &[]), 0);
 }
 
 /// `__builtin_fabsl` and `__builtin_signbitl` operate on a `long double`, not
@@ -329,115 +793,6 @@ int main(void) {
     if let Some(rc) = compile_and_run_aarch64("long_double_magnitude_a64", code, "-O2") {
         assert_eq!(rc, 0);
     }
-}
-
-/// A library builtin taking `double` must be declared taking `double`.
-///
-/// When the header that would declare `sqrt` or `copysign` has not been
-/// included, these builtins synthesize a declaration. Every synthesized
-/// parameter was an `unsigned long` — right for the `_chk` family, whose
-/// arguments are pointers, sizes and flags, and wrong for a `double`, which
-/// the ABI passes in an SSE register instead. The argument went to the wrong
-/// register file entirely, so `__builtin_sqrt(4.0)` read whatever was in xmm0
-/// and answered 0.0, and `__builtin_copysign(1.0, -1.0)` answered 1.0 because
-/// the sign argument never arrived.
-///
-/// Silent: the call links and runs. The library functions of the same name
-/// were always correct, which is what narrowed it to this path.
-///
-/// No `<math.h>` here on purpose — including it declares them properly and
-/// the synthesized path is never taken.
-#[test]
-fn builtins_library_math_builtins_take_doubles() {
-    let code = r#"
-int main(void) {
-    if (__builtin_sqrt(4.0) != 2.0) return 1;
-    if (__builtin_sqrt(9.0) != 3.0) return 2;
-    if (__builtin_sqrt(0.0) != 0.0) return 3;
-
-    if (__builtin_copysign(1.0, -1.0) != -1.0) return 4;
-    if (__builtin_copysign(-1.0, 1.0) != 1.0) return 5;
-    if (__builtin_copysign(-5.0, 2.0) != 5.0) return 6;
-    /* The magnitude has to survive too: this answered 0.0, not -3.0. */
-    if (__builtin_copysign(3.0, -0.0) != -3.0) return 7;
-
-    /* A non-constant argument takes the same path. */
-    volatile double v = 16.0;
-    if (__builtin_sqrt(v) != 4.0) return 8;
-    volatile double sign = -2.0;
-    if (__builtin_copysign(7.0, sign) != -7.0) return 9;
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("builtins_lib_math", code, &["-lm".to_string()]),
-        0
-    );
-}
-
-/// `creal`, `cimag` and `conj`, and the suffixed spellings of `isnan` and
-/// `isinf`.
-///
-/// `creal`/`cimag` lower to the `__real__` and `__imag__` c17 already has, and
-/// `conj` to `__builtin_complex(__real__ z, -__imag__ z)` -- every piece
-/// existed, so none of the three needs a libm call or `-lm`. The `isnan`/
-/// `isinf` suffixes carry no information the node needs: `FpTest` dispatches
-/// on the operand's own type.
-///
-/// gcc has **no** `__builtin_isfinitef` or `__builtin_isnormall`, despite
-/// having the unsuffixed pair -- they compile and then fail to link, which is
-/// how the first version of this got it wrong. Claiming a builtin gcc does not
-/// have would make `__has_builtin` a worse answer than none, so the test pins
-/// their absence alongside the others' presence.
-#[test]
-fn builtins_complex_parts_and_suffixed_fp_tests() {
-    let code = r#"
-int main(void) {
-    _Complex double z = __builtin_complex(3.0, 4.0);
-    _Complex float  w = __builtin_complex(1.0f, 2.0f);
-    _Complex long double q = __builtin_complex(5.0L, 6.0L);
-
-    /* creal/cimag name the halves __real__ and __imag__ already reach. */
-    if (__builtin_creal(z) != 3.0 || __builtin_cimag(z) != 4.0) return 1;
-    if (__builtin_crealf(w) != 1.0f || __builtin_cimagf(w) != 2.0f) return 2;
-    if (__builtin_creall(q) != 5.0L || __builtin_cimagl(q) != 6.0L) return 3;
-
-    /* conj flips the sign of the imaginary half, at every precision. */
-    { _Complex double c = __builtin_conj(z);
-      if (__builtin_creal(c) != 3.0 || __builtin_cimag(c) != -4.0) return 4; }
-    { _Complex float c = __builtin_conjf(w);
-      if (__builtin_crealf(c) != 1.0f || __builtin_cimagf(c) != -2.0f) return 5; }
-    { _Complex long double c = __builtin_conjl(q);
-      if (__builtin_creall(c) != 5.0L || __builtin_cimagl(c) != -6.0L) return 6; }
-
-    /* An involution: conj of conj is the original. */
-    { _Complex double c = __builtin_conj(__builtin_conj(z));
-      if (__builtin_creal(c) != 3.0 || __builtin_cimag(c) != 4.0) return 7; }
-
-    /* A zero imaginary part conjugates to negative zero, which is the whole
-       reason conj is not "subtract the imaginary part from zero". */
-    { _Complex double c = __builtin_conj(__builtin_complex(1.0, 0.0));
-      if (!__builtin_signbit(__builtin_cimag(c))) return 8; }
-
-    /* The suffixed isnan/isinf spellings ask the same question as the
-       unsuffixed one, of the operand's own type. */
-    if (!__builtin_isinff(1.0f / 0.0f)) return 9;
-    if (!__builtin_isinfl(1.0L / 0.0L)) return 10;
-    if (!__builtin_isnanf(0.0f / 0.0f)) return 11;
-    if (!__builtin_isnanl(0.0L / 0.0L)) return 12;
-    if (__builtin_isinff(1.0f) || __builtin_isnanf(1.0f)) return 13;
-
-    /* gcc has no suffixed isfinite or isnormal, so neither do we, and
-       __has_builtin must say so rather than over-promise. */
-    if (__has_builtin(__builtin_isfinitef)) return 14;
-    if (__has_builtin(__builtin_isnormall)) return 15;
-    if (!__has_builtin(__builtin_isinff)) return 16;
-    if (!__has_builtin(__builtin_conjf)) return 17;
-    if (!__has_builtin(__builtin_creal)) return 18;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("builtins_complex_parts", code, &[]), 0);
 }
 
 // ============================================================================
@@ -535,8 +890,8 @@ int main(void)
 /// narrowing `sin` would be a wrong answer rather than a faster one.
 ///
 /// c17 narrows where it computes the answer itself, as gcc does once
-/// optimizing; [`builtins_math_narrowing_computes_in_place`] pins that down
-/// on the assembly.
+/// optimizing; `builtins_math_narrowing_computes_in_place` (a unit test in
+/// cc/test_asm/builtins_math.rs) pins that down on the assembly.
 #[test]
 fn builtins_exactly_rounding_math_narrows_to_its_float_form() {
     let code = r#"
@@ -612,178 +967,9 @@ int main(void)
     }
 }
 
-/// A narrowed call is computed in place, at `float` -- `cvttss2si` on
-/// x86-64, `frintm` of an `s` register on aarch64 -- and nothing is called.
-/// At `-O0` the bare `floor` is not computed but called, as under gcc, and
-/// the call is the one the program wrote: to `floor`, never `floorf`, so
-/// that a definition of `floor` anywhere in the unit is what it reaches.
-#[test]
-fn builtins_math_narrowing_computes_in_place() {
-    let src = "double floor(double);\nfloat q(float a) { return floor(a); }\n";
-    // The host's own format, plus both Darwin triples so the Mach-O spelling
-    // is exercised wherever this runs. The prefix is read off each output
-    // rather than assumed -- Mach-O calls `_floorf`, and "floorf" is a
-    // substring of that, so a check spelled for ELF keeps passing there
-    // while its negative half matches nothing at all. The last element is
-    // the instruction that computes a `float` floor in place.
-    let host_insn = if cfg!(target_arch = "aarch64") {
-        "frintm s"
-    } else {
-        "cvttss2si"
-    };
-    let targets: [(&[&str], &str); 3] = [
-        (&[], host_insn),
-        (&["--target=aarch64-apple-darwin"], "frintm s"),
-        (&["--target=x86_64-apple-darwin"], "cvttss2si"),
-    ];
-    for (target, in_place) in targets {
-        for opt in ["-O0", "-O1", "-O2"] {
-            let mut args = vec![opt];
-            args.extend_from_slice(target);
-            let asm = asm_for_at("math_narrow_level", src, &args);
-            // `q` is the function this source defines, so it calibrates.
-            let p = crate::common::asm_prefix(&asm, "q");
-            // Matched exactly, across all four spellings a call takes here:
-            // `call f@PLT` and `bl f` on ELF, `call _f` and `bl _f` on
-            // Mach-O, which has no PLT syntax. Exactness is also what stops
-            // `floor` matching the `floorf` the narrowing produces.
-            let calls = |name: &str| {
-                let want = format!("{p}{name}");
-                asm.lines().any(|line| {
-                    let t = line.trim_start();
-                    t.strip_prefix("call ")
-                        .or_else(|| t.strip_prefix("bl "))
-                        .is_some_and(|dst| {
-                            dst == want
-                                || dst.strip_prefix(&want).is_some_and(|s| s.starts_with('@'))
-                        })
-                })
-            };
-            assert!(
-                !calls("floorf"),
-                "{target:?} at {opt}: the float form must not be called:\n{asm}"
-            );
-            if opt == "-O0" {
-                assert!(
-                    calls("floor"),
-                    "{target:?} at {opt}: the call should be to {p}floor:\n{asm}"
-                );
-            } else {
-                assert!(
-                    !calls("floor") && asm.contains(in_place),
-                    "{target:?} at {opt}: not computed in place at float:\n{asm}"
-                );
-            }
-        }
-    }
-}
-
 // ============================================================================
 // C99 7.12.14 — the unordered-safe relations
 // ============================================================================
-
-/// glibc's `<math.h>` *defines* `isgreater`, `isless`, `isunordered` and their
-/// siblings as these builtins, so a translation unit that includes the header
-/// and uses one did not compile at all before they existed.
-///
-/// Every relation is checked against an ordered pair in both directions and
-/// against a NaN on each side, because the NaN answer is the whole reason C99
-/// has this family: the ordinary relational operators may raise `FE_INVALID`
-/// on an unordered pair and these may not. `islessgreater` is the one that
-/// cannot be spelled as `!=` -- `!=` is *true* for an unordered pair and this
-/// must be false for one.
-const FP_RELATIONS: &str = r#"
-extern void abort(void);
-#define CHECK(n, e) do { if (!(e)) return n; } while (0)
-
-int main(void) {
-    volatile double one = 1.0, two = 2.0, nan = 0.0, zero = 0.0;
-    nan = nan / zero;                    /* a NaN the optimizer cannot fold */
-
-    CHECK(1, __builtin_isgreater(two, one) == 1);
-    CHECK(2, __builtin_isgreater(one, two) == 0);
-    CHECK(3, __builtin_isgreater(one, one) == 0);
-    CHECK(4, __builtin_isgreaterequal(one, one) == 1);
-    CHECK(5, __builtin_isgreaterequal(one, two) == 0);
-    CHECK(6, __builtin_isless(one, two) == 1);
-    CHECK(7, __builtin_isless(two, one) == 0);
-    CHECK(8, __builtin_islessequal(one, one) == 1);
-    CHECK(9, __builtin_islessequal(two, one) == 0);
-    CHECK(10, __builtin_islessgreater(one, two) == 1);
-    CHECK(11, __builtin_islessgreater(one, one) == 0);
-    CHECK(12, __builtin_isunordered(one, two) == 0);
-
-    /* Every relation is false for an unordered pair, on either side... */
-    CHECK(13, __builtin_isgreater(nan, one) == 0);
-    CHECK(14, __builtin_isgreater(one, nan) == 0);
-    CHECK(15, __builtin_isgreaterequal(nan, one) == 0);
-    CHECK(16, __builtin_isless(nan, one) == 0);
-    CHECK(17, __builtin_islessequal(nan, one) == 0);
-    CHECK(18, __builtin_islessgreater(nan, one) == 0);
-    CHECK(19, __builtin_islessgreater(nan, nan) == 0);
-    /* ...and `isunordered` is the one that is true for it. */
-    CHECK(20, __builtin_isunordered(nan, one) == 1);
-    CHECK(21, __builtin_isunordered(one, nan) == 1);
-    CHECK(22, __builtin_isunordered(nan, nan) == 1);
-
-    /* Infinities are ordered, so the relations answer normally. */
-    {
-        volatile double inf = __builtin_inf();
-        CHECK(23, __builtin_isgreater(inf, one) == 1);
-        CHECK(24, __builtin_isless(-inf, one) == 1);
-        CHECK(25, __builtin_isunordered(inf, one) == 0);
-    }
-
-    /* float and long double reach the same lowering through a conversion. */
-    {
-        volatile float f1 = 1.0f, f2 = 2.0f;
-        volatile long double l1 = 1.0L, l2 = 2.0L;
-        CHECK(26, __builtin_isless(f1, f2) == 1);
-        CHECK(27, __builtin_isgreater(l2, l1) == 1);
-        CHECK(28, __builtin_isunordered(f1, f2) == 0);
-    }
-
-    /* The usual arithmetic conversions run first, as they do for `<`. */
-    CHECK(29, __builtin_isless(1, 2.0) == 1);
-    CHECK(30, __builtin_isgreater(3.0f, 2) == 1);
-    return 0;
-}
-"#;
-
-#[test]
-fn builtins_fp_relations() {
-    assert_eq!(
-        compile_and_run("fp_relations", FP_RELATIONS, &["-lm".into()]),
-        0
-    );
-}
-
-/// Each operand is evaluated exactly once. The relation is desugared in the
-/// linearizer rather than written out as `a < b` in the parser precisely so
-/// that `isunordered(f(), g())` does not call either function twice.
-#[test]
-fn builtins_fp_relations_evaluate_each_operand_once() {
-    let code = r#"
-int lhs, rhs;
-double f(void) { lhs++; return 1.0; }
-double g(void) { rhs++; return 2.0; }
-
-int main(void) {
-    if (__builtin_isless(f(), g()) != 1) return 1;
-    if (lhs != 1 || rhs != 1) return 2;
-    /* `isunordered` and `islessgreater` each read both operands twice in the
-       lowering, which is where a duplicated *expression* would show up. */
-    lhs = rhs = 0;
-    if (__builtin_isunordered(f(), g()) != 0) return 3;
-    if (lhs != 1 || rhs != 1) return 4;
-    lhs = rhs = 0;
-    if (__builtin_islessgreater(f(), g()) != 1) return 5;
-    if (lhs != 1 || rhs != 1) return 6;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("fp_relations_once", code, &[]), 0);
-}
 
 /// `<math.h>`'s own macros, which are what real code writes. This is the
 /// case that failed to compile: the header expands `isgreater(x, y)` straight
@@ -808,124 +994,6 @@ int main(void) {
 "#;
     assert_eq!(
         compile_and_run("math_h_relations", code, &["-lm".into()]),
-        0
-    );
-}
-
-/// The suffixed spellings of the libm aliases, and the memory ones gcc has
-/// under a `__builtin_` name. `bits/floatn.h` reaches for
-/// `__builtin_copysignf`, so its absence broke any file including `<math.h>`
-/// on a target with `_Float128` support advertised.
-#[test]
-fn builtins_libm_and_memory_aliases() {
-    let code = r#"
-int main(void) {
-    if (__builtin_copysign(2.0, -1.0) != -2.0) return 1;
-    if (__builtin_copysignf(2.0f, -1.0f) != -2.0f) return 2;
-    if (__builtin_copysignl(2.0L, -1.0L) != -2.0L) return 3;
-    if (__builtin_sqrtf(16.0f) != 4.0f) return 4;
-    if (__builtin_sqrtl(16.0L) != 4.0L) return 5;
-    if (__builtin_fmax(3.0, 4.0) != 4.0) return 6;
-    if (__builtin_fmaxf(3.0f, 4.0f) != 4.0f) return 7;
-    if (__builtin_fmaxl(3.0L, 4.0L) != 4.0L) return 8;
-    if (__builtin_fmin(3.0, 4.0) != 3.0) return 9;
-    if (__builtin_fminf(3.0f, 4.0f) != 3.0f) return 10;
-    if (__builtin_fminl(3.0L, 4.0L) != 3.0L) return 11;
-    if (__builtin_pow(2.0, 10.0) != 1024.0) return 12;
-    if (__builtin_powf(2.0f, 10.0f) != 1024.0f) return 13;
-    if (__builtin_fma(2.0, 3.0, 4.0) != 10.0) return 14;
-
-    {
-        char d[8] = "abcdefg";
-        __builtin_bzero(d, 8);
-        if (d[0] != 0 || d[7] != 0) return 15;
-    }
-    if (__builtin_bcmp("ab", "ab", 2) != 0) return 16;
-    if (__builtin_bcmp("ab", "ac", 2) == 0) return 17;
-    {
-        char dst[8];
-        if (__builtin_stpncpy(dst, "ab", 3) != dst + 2) return 18;
-        if (dst[0] != 'a' || dst[1] != 'b' || dst[2] != 0) return 19;
-    }
-    if (__builtin_strdup("hi") == 0) return 20;
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("libm_memory_aliases", code, &["-lm".into()]),
-        0
-    );
-}
-
-/// `__builtin_extract_return_addr` is the identity on both targets c17 has,
-/// and `__builtin___clear_cache` has to reach libgcc on AArch64, where the
-/// caches are not coherent and a JIT is wrong without it.
-#[test]
-fn builtins_return_address_and_cache() {
-    let code = r#"
-int calls;
-void *bump(void) { calls++; return (void *)0x1234; }
-
-int main(void) {
-    char code[16];
-    __builtin___clear_cache(code, code + 16);
-    if (__builtin_extract_return_addr(bump()) != (void *)0x1234) return 1;
-    if (calls != 1) return 2;
-    if (__builtin_extract_return_addr(__builtin_return_address(0)) == 0) return 3;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("return_addr_clear_cache", code, &[]), 0);
-}
-
-/// The libm entry points under their `__builtin_` spellings, at each of the
-/// three real widths.
-///
-/// `__builtin_ceilf` and `__builtin_modf` are ordinary functions any program
-/// may name; c17 recognised the bare `ceil`/`floor` family and not these.
-/// Signatures come from one table, because a `float` entry point that is
-/// declared as taking a `double` does not fail to link -- it sends the
-/// argument at the wrong width and answers with whatever was in the register.
-#[test]
-fn builtins_libm_entry_points() {
-    let code = r#"
-int main(void) {
-    if (__builtin_ceilf(1.2f) != 2.0f) return 1;
-    if (__builtin_ceil(1.2) != 2.0) return 2;
-    if (__builtin_ceill(1.2L) != 2.0L) return 3;
-    if (__builtin_floor(1.8) != 1.0) return 4;
-    if (__builtin_floorf(1.8f) != 1.0f) return 5;
-    if (__builtin_trunc(-1.8) != -1.0) return 6;
-    if (__builtin_fmod(7.0, 4.0) != 3.0) return 7;
-    if (__builtin_atan2(0.0, 1.0) != 0.0) return 8;
-    if (__builtin_hypot(3.0, 4.0) != 5.0) return 9;
-    if (__builtin_exp(0.0) != 1.0) return 10;
-    if (__builtin_log(1.0) != 0.0) return 11;
-
-    /* These three do not take a list of one type: the second parameter is a
-       pointer or an `int`, and declaring them uniformly sends it to the wrong
-       register file. */
-    {
-        double ip;
-        if (__builtin_modf(3.25, &ip) != 0.25 || ip != 3.0) return 12;
-    }
-    {
-        int e;
-        if (__builtin_frexp(8.0, &e) != 0.5 || e != 4) return 13;
-    }
-    if (__builtin_ldexp(0.5, 4) != 8.0) return 14;
-
-    /* The POSIX case-insensitive comparisons. */
-    if (__builtin_strncasecmp("AbC", "abc", 3) != 0) return 15;
-    if (__builtin_strcasecmp("AbC", "abd") == 0) return 16;
-    if (__builtin_strndup("abcd", 2) == 0) return 17;
-    if (__builtin_memcmp_eq("ab", "ab", 2) != 0) return 18;
-    if (__builtin_memcmp_eq("ab", "ac", 2) == 0) return 19;
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("libm_entry_points", code, &["-lm".into()]),
         0
     );
 }
@@ -993,47 +1061,8 @@ fn builtins_bare_complex_accessors() {
         assert_eq!(rc, 0);
     }
 
-    // Named without a call, the identifier is the library function. Host
-    // only: the aarch64 helper links no libm.
-    let code = r#"
-double creal(double _Complex);
-int main(void) {
-    double (*fp)(double _Complex) = creal;
-    return fp(1.5 + 2.5i) == 1.5 ? 0 : 1;
-}
-"#;
-    assert_eq!(
-        compile_and_run("complex_accessor_fnptr", code, &["-lm".to_string()]),
-        0
-    );
-
-    let calls = |asm: &str, name: &str| {
-        let sym = asm_symbol(name);
-        asm.lines().any(|l| {
-            let mut words = l.split_whitespace();
-            matches!(words.next(), Some("call" | "bl" | "jmp" | "b"))
-                && words.next().map(|t| t.trim_end_matches("@PLT")) == Some(sym.as_str())
-        })
-    };
-    let src = "double creal(double _Complex);\n\
-               double cimag(double _Complex);\n\
-               double _Complex conj(double _Complex);\n\
-               double f(double _Complex z) { return creal(z) + cimag(conj(z)); }\n";
-    for opt in ["-O0", "-O2"] {
-        let asm = asm_for_at("complex_accessors_asm", src, &[opt]);
-        for name in ["creal", "cimag", "conj"] {
-            assert!(!calls(&asm, name), "{opt}: {name} was called:\n{asm}");
-        }
-    }
-    let asm = asm_for_at("complex_accessors_nb", src, &["-fno-builtin-creal"]);
-    assert!(
-        calls(&asm, "creal"),
-        "-fno-builtin-creal kept creal inline:\n{asm}"
-    );
-    assert!(
-        !calls(&asm, "conj"),
-        "-fno-builtin-creal displaced conj:\n{asm}"
-    );
+    // The function-pointer half runs in builtins_math_mega; the assembly
+    // half is a unit test in cc/test_asm/builtins_math.rs.
 }
 
 // ============================================================================
@@ -1074,22 +1103,7 @@ fn builtins_fabs_needs_no_libm() {
     if let Some(rc) = compile_and_run_aarch64("fabs_no_libm_a64_o2", FABS_PROGRAM, "-O2") {
         assert_eq!(rc, 0);
     }
-    let src = "double f(double x) { return __builtin_fabs(x); }\n\
-               float g(float x) { return __builtin_fabsf(x); }\n";
-    for opt in ["-O0", "-O2"] {
-        let asm = asm_for_at("fabs_inline", src, &[opt]);
-        for name in ["fabs", "fabsf"] {
-            let sym = asm_symbol(name);
-            assert!(
-                !asm.lines().any(|l| {
-                    let mut w = l.split_whitespace();
-                    matches!(w.next(), Some("call" | "bl" | "jmp" | "b"))
-                        && w.next().map(|t| t.trim_end_matches("@PLT")) == Some(sym.as_str())
-                }),
-                "{opt}: {name} was called:\n{asm}"
-            );
-        }
-    }
+    // The assembly half is a unit test in cc/test_asm/builtins_math.rs.
 }
 
 // Linked without -lm on purpose, like the test above: `fabsl` is a sign-bit
@@ -1165,50 +1179,7 @@ fn builtins_fabsl_needs_no_libm() {
     if let Some(rc) = compile_and_run_aarch64("fabsl_no_libm_a64_o2", FABSL_PROGRAM, "-O2") {
         assert_eq!(rc, 0);
     }
-    let called = |asm: &str| {
-        asm.lines().any(|l| {
-            let mut w = l.split_whitespace();
-            matches!(w.next(), Some("call" | "bl" | "jmp" | "b"))
-                && w.next()
-                    .is_some_and(|t| t.trim_end_matches("@PLT").ends_with("fabsl"))
-        })
-    };
-    let src = "long double f(long double x) { return __builtin_fabsl(x); }\n\
-               long double g(long double x) { return fabsl(x); }\n";
-    for opt in ["-O0", "-O2"] {
-        let asm = asm_for_at("fabsl_inline", src, &[opt]);
-        assert!(!called(&asm), "{opt}: fabsl was called:\n{asm}");
-        let asm = asm_for_at(
-            "fabsl_inline_a64",
-            src,
-            &[opt, "--target", "aarch64-unknown-linux-gnu"],
-        );
-        assert!(!called(&asm), "{opt} aarch64: fabsl was called:\n{asm}");
-    }
-}
-
-/// `fabs` of a constant folds at -O1 and above: no sign-clearing instruction
-/// is left. Checked for `long double` only where its negation folds too; a
-/// binary128 `-3.5L` is a libgcc call before the optimizer sees it.
-#[test]
-fn builtins_fabs_of_a_constant_folds() {
-    let mut src = String::from(
-        "double f(void) { return __builtin_fabs(-3.5); }\n\
-         float g(void) { return __builtin_fabsf(-2.0f); }\n",
-    );
-    if cfg!(target_arch = "x86_64") {
-        src.push_str("long double h(void) { return __builtin_fabsl(-3.5L); }\n");
-    }
-    for opt in ["-O1", "-O2"] {
-        let asm = asm_for_at("fabs_const", &src, &[opt]);
-        assert!(
-            !asm.lines().any(|l| matches!(
-                l.split_whitespace().next(),
-                Some("andpd" | "andps" | "fabs")
-            )),
-            "{opt}: fabs of a constant was not folded:\n{asm}"
-        );
-    }
+    // The assembly half is a unit test in cc/test_asm/builtins_math.rs.
 }
 
 // ============================================================================
@@ -1281,34 +1252,6 @@ fn builtins_nan_payloads_survive() {
             assert_eq!(rc, 0, "aarch64 {opt}");
         }
     }
-}
-
-/// A string gcc does not fold is not folded here either. `__builtin_nan` of
-/// one is a call to the library's `nan`, which reads the string at run time;
-/// `__builtin_nans` has no library function, so it is an error -- gcc's is a
-/// link failure against `__builtin_nans`.
-#[test]
-fn builtins_nan_of_a_string_that_does_not_fold() {
-    let code = r#"
-double nan(const char *);
-float nanf(const char *);
-int main(void) {
-    const char *volatile s = "0x77";
-    if (!__builtin_isnan(__builtin_nan(s))) return 1;
-    if (!__builtin_isnan(__builtin_nan("abc"))) return 2;
-    if (!__builtin_isnan(__builtin_nanf("08"))) return 3;
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("nan_library_call", code, &["-lm".to_string()]),
-        0
-    );
-    compile_expect_error(
-        "nans_malformed",
-        "double f(void) { return __builtin_nans(\"zz\"); }\n",
-        "is not a string literal naming a NaN payload",
-    );
 }
 
 // ============================================================================
@@ -1470,166 +1413,6 @@ fn builtins_signbit_and_copysign_need_no_libm() {
         if let Some(rc) = compile_and_run_aarch64(&format!("sign_ops_a64{opt}"), SIGN_PROGRAM, opt)
         {
             assert_eq!(rc, 0, "aarch64 {opt}");
-        }
-    }
-}
-
-/// Whether `asm` calls a function whose name ends in one of `names`.
-pub(super) fn calls_any(asm: &str, names: &[&str]) -> bool {
-    asm.lines().any(|l| {
-        let mut w = l.split_whitespace();
-        matches!(w.next(), Some("call" | "bl" | "jmp" | "b"))
-            && w.next().is_some_and(|t| {
-                let t = t.trim_end_matches("@PLT");
-                names.iter().any(|n| t.ends_with(n))
-            })
-    })
-}
-
-/// Neither `signbit` nor `copysign` is a call, at any width, on either
-/// target: not to the libm function, and not to glibc's `__signbit*`.
-#[test]
-fn builtins_signbit_and_copysign_are_not_calls() {
-    const CALLEES: &[&str] = &[
-        "signbit",
-        "signbitf",
-        "signbitl",
-        "signbitd",
-        "copysign",
-        "copysignf",
-        "copysignl",
-    ];
-    let src = "double copysign(double, double); float copysignf(float, float);\n\
-               long double copysignl(long double, long double);\n\
-               int sf(float x) { return __builtin_signbit(x) + __builtin_signbitf(x); }\n\
-               int sd(double x) { return __builtin_signbit(x); }\n\
-               int sl(long double x) { return __builtin_signbit(x) + __builtin_signbitl(x); }\n\
-               double cd(double x, double y) { return copysign(x, y) + __builtin_copysign(y, x); }\n\
-               float cf(float x, float y) { return copysignf(x, y) + __builtin_copysignf(y, x); }\n\
-               long double cl(long double x, long double y)\n\
-               { return copysignl(x, y) + __builtin_copysignl(y, x); }\n";
-    for opt in ["-O0", "-O2"] {
-        let asm = asm_for_at("sign_ops_inline", src, &[opt]);
-        assert!(!calls_any(&asm, CALLEES), "{opt}: a call remains:\n{asm}");
-        let asm = asm_for_at(
-            "sign_ops_inline_a64",
-            src,
-            &[opt, "--target", "aarch64-unknown-linux-gnu"],
-        );
-        assert!(
-            !calls_any(&asm, CALLEES),
-            "{opt} aarch64: a call remains:\n{asm}"
-        );
-    }
-}
-
-/// glibc's `signbit` macro and the `copysign` family `<math.h>` declares
-/// are the builtins, so a program using them needs no -lm either.
-#[test]
-fn builtins_math_h_signbit_and_copysign() {
-    let code = r#"
-#include <math.h>
-int main(void) {
-    volatile double x = -2.0, z = 0.0;
-    volatile float f = 1.0f;
-    volatile long double l = -0.0L;
-    if (!signbit(x) || signbit(z) || signbit(f) || !signbit(l)) return 1;
-    if (copysign(3.0, x) != -3.0 || copysignf(f, -1.0f) != -1.0f) return 2;
-    if (copysignl(5.0L, l) != -5.0L || !signbit(copysign(z, -1.0))) return 3;
-    return 0;
-}
-"#;
-    assert_eq!(compile_and_run("sign_ops_math_h", code, &[]), 0);
-    let asm = asm_for_at("sign_ops_math_h_asm", code, &["-O2"]);
-    assert!(
-        !calls_any(
-            &asm,
-            &[
-                "signbit",
-                "signbitf",
-                "signbitl",
-                "copysign",
-                "copysignf",
-                "copysignl"
-            ]
-        ),
-        "a call remains:\n{asm}"
-    );
-}
-
-/// `-fno-builtin-copysign` keeps the call to `copysign`, and only that one.
-#[test]
-fn builtins_copysign_fno_builtin_keeps_the_call() {
-    let src = "double copysign(double, double); float copysignf(float, float);\n\
-               double f(double x, double y) { return copysign(x, y); }\n\
-               float g(float x, float y) { return copysignf(x, y); }\n";
-    let asm = asm_for_at("copysign_nb", src, &["-fno-builtin-copysign"]);
-    assert!(
-        calls_any(&asm, &["copysign"]),
-        "-fno-builtin-copysign kept copysign inline:\n{asm}"
-    );
-    assert!(
-        !calls_any(&asm, &["copysignf"]),
-        "-fno-builtin-copysign displaced copysignf:\n{asm}"
-    );
-}
-
-/// As in gcc: `signbit` of a constant is an integer constant expression, and
-/// `copysign`, `fabs` and `abs` of constants fold in a static initializer --
-/// but, being calls, are not integer constant expressions, so an array bound
-/// of one at file scope is rejected.
-#[test]
-fn builtins_sign_ops_in_constant_expressions() {
-    let code = r#"
-double copysign(double, double); double fabs(double); int abs(int);
-static double a = copysign(2.0, -0.0);
-static float b = __builtin_copysignf(-1.5f, 1.0f);
-static double c = fabs(-3.0);
-static int d = abs(-4);
-static int e = __builtin_signbit(-1.0) + __builtin_signbitl(-0.0L);
-enum { E = __builtin_signbit(-2.0f) };
-_Static_assert(__builtin_signbit(-1.0), "signbit is a constant");
-static int arr[__builtin_signbit(-1.0) + 1];
-int main(void) {
-    if (a != -2.0 || b != 1.5f || c != 3.0 || d != 4 || e != 2) return 1;
-    if (E != 1 || sizeof arr != 2 * sizeof(int)) return 2;
-    switch (d) { case __builtin_signbit(-1.0) + 3: return 0; }
-    return 3;
-}
-"#;
-    assert_eq!(compile_and_run("sign_ops_constexpr", code, &[]), 0);
-    compile_expect_error(
-        "abs_not_ice",
-        "int abs(int);\nint a[abs(-2)];\n",
-        "variable length arrays cannot have file scope",
-    );
-}
-
-/// `copysign` and `signbit` of constants fold at -O1 and above: nothing is
-/// left to compute them.
-#[test]
-fn builtins_sign_ops_of_constants_fold() {
-    let src = "double f(void) { return __builtin_copysign(3.5, -0.0); }\n\
-               float g(void) { return __builtin_copysignf(2.0f, -1.0f); }\n\
-               int h(void) { return __builtin_signbit(-2.0) + __builtin_signbit(-1.0f); }\n";
-    for opt in ["-O1", "-O2"] {
-        for target in [None, Some("aarch64-unknown-linux-gnu")] {
-            let mut args = vec![opt];
-            if let Some(t) = target {
-                args.extend(["--target", t]);
-            }
-            let asm = asm_for_at("sign_ops_const", src, &args);
-            assert!(
-                !calls_any(&asm, &["signbit", "signbitf", "copysign", "copysignf"]),
-                "{opt} {target:?}: a call remains:\n{asm}"
-            );
-            assert!(
-                !asm.lines().any(|l| matches!(
-                    l.split_whitespace().next(),
-                    Some("shrq" | "shrl" | "shlq" | "shll" | "orq" | "orl" | "lsr" | "lsl" | "orr")
-                )),
-                "{opt} {target:?}: a sign operation on a constant was not folded:\n{asm}"
-            );
         }
     }
 }

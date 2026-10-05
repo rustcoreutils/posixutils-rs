@@ -17,10 +17,25 @@ use crate::common::{compile_and_run, compile_and_run_optimized};
 // Mega-test: C89 control flow (loops, conditionals, jumps)
 // ============================================================================
 
+/// C89 control flow, statement edge cases, Duff's device and switch bodies, as
+/// one program; see the exit-code table at the top.
+///
+/// Consolidates: c89_control_flow_mega, c89_statements_edge_cases_mega,
+/// c89_duffs_device and c89_switch_with_a_non_compound_body_still_tests_the_value.
 #[test]
 fn c89_control_flow_mega() {
     let code = r#"
-int main(void) {
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1-108  c89_control_flow_mega
+ *   111-165  c89_statements_edge_cases_mega
+ *   171-175  c89_duffs_device
+ *   181-206  c89_switch_with_a_non_compound_body_still_tests_the_value
+ */
+
+/* ---- c89_control_flow_mega (exit codes 1-108) ----
+ */
+static int t_c89_control_flow_mega(void) {
     // ========== IF/ELSE SECTION (returns 1-19) ==========
     {
         int x = 10;
@@ -373,18 +388,9 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c89_control_flow_mega", code, &[]), 0);
-}
 
-// ============================================================================
-// Mega-test: Statement edge cases (null stmt, empty blocks, dangling else,
-// omitted for clauses, void return, expression statements)
-// ============================================================================
-
-#[test]
-fn c89_statements_edge_cases_mega() {
-    let code = r#"
+/* ---- c89_statements_edge_cases_mega (exit codes 111-165) ----
+ */
 // Helper: void return
 void set_value(int *p, int v) {
     *p = v;
@@ -396,7 +402,7 @@ void set_if(int *p, int v, int cond) {
     *p = v;
 }
 
-int main(void) {
+static int t_c89_statements_edge_cases_mega(void) {
     // ========== NULL STATEMENT (returns 1-9) ==========
     {
         ;                          // standalone null statement
@@ -538,20 +544,9 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(
-        compile_and_run("c89_statements_edge_cases_mega", code, &[]),
-        0
-    );
-}
 
-// ============================================================================
-// Test: Duff's device (switch interleaved with do-while)
-// ============================================================================
-
-#[test]
-fn c89_duffs_device() {
-    let code = r#"
+/* ---- c89_duffs_device (exit codes 171-175) ----
+ */
 #include <string.h>
 
 // Classic Duff's device: unrolled memory copy
@@ -570,7 +565,7 @@ void duff_copy(char *to, const char *from, int count) {
     }
 }
 
-int main(void) {
+static int t_c89_duffs_device(void) {
     // Test 1: copy "hello world" (11 chars)
     {
         const char *src = "hello world";
@@ -623,25 +618,22 @@ int main(void) {
 
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("c89_duffs_device", code, &[]), 0);
-}
 
-/// A `switch` whose body is not a compound statement dropped the test (#C99).
-///
-/// `case E : statement` is one labeled statement in the grammar, but the AST
-/// models the label as a sibling marker that carries no statement. Inside a
-/// block that is sound -- marker and statement stay adjacent items of one list.
-/// A non-compound body has room for exactly one statement, so the marker took
-/// the whole body and the labeled statement escaped to become the *next*
-/// statement of the enclosing block, reached unconditionally: `f(2)` on
-/// `switch (x) case 1: return 2;` returned **2**, where gcc returns 0.
-///
-/// Both label kinds are covered, and the block form is kept alongside as a
-/// control, since it was always correct and must stay so.
-#[test]
-fn c89_switch_with_a_non_compound_body_still_tests_the_value() {
-    let code = r#"
+/* ---- c89_switch_with_a_non_compound_body_still_tests_the_value (exit codes 181-206) ----
+ *
+ *  A `switch` whose body is not a compound statement dropped the test (#C99).
+ *
+ *  `case E : statement` is one labeled statement in the grammar, but the AST
+ *  models the label as a sibling marker that carries no statement. Inside a
+ *  block that is sound -- marker and statement stay adjacent items of one list.
+ *  A non-compound body has room for exactly one statement, so the marker took
+ *  the whole body and the labeled statement escaped to become the *next*
+ *  statement of the enclosing block, reached unconditionally: `f(2)` on
+ *  `switch (x) case 1: return 2;` returned **2**, where gcc returns 0.
+ *
+ *  Both label kinds are covered, and the block form is kept alongside as a
+ *  control, since it was always correct and must stay so.
+ */
 static int one_case(int x)      { switch (x) case 1: return 2; return 0; }
 static int one_default(int x)   { switch (x) default: return 7; return 0; }
 static int two_labels(int x)    { switch (x) case 1: case 2: return 5; return 0; }
@@ -678,7 +670,7 @@ static int prefix_decl(int x) { int r = 0; switch (x) { int y = 7; case 1: r = 1
 static int do_body(int x)   { int n = 0; switch (x) do { case 1: n++; } while (n < 2); return n; }
 static int for_body(int x)  { int n = 0; switch (x) for (; n < 2;) { case 1: n++; } return n; }
 
-int main(void) {
+static int t_c89_switch_with_a_non_compound_body_still_tests_the_value(void) {
     if (one_case(1) != 2)  return 1;
     if (one_case(2) != 0)  return 2;   /* the regression */
     if (one_case(0) != 0)  return 3;
@@ -715,24 +707,66 @@ int main(void) {
 
     return 0;
 }
+
+int main(void)
+{
+    int r;
+    if ((r = t_c89_control_flow_mega()) != 0)
+        return 0 + r;
+    if ((r = t_c89_statements_edge_cases_mega()) != 0)
+        return 110 + r;
+    if ((r = t_c89_duffs_device()) != 0)
+        return 170 + r;
+    if ((r = t_c89_switch_with_a_non_compound_body_still_tests_the_value()) != 0)
+        return 180 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("switch_non_compound_body", code, &[]), 0);
+    assert_eq!(compile_and_run("c89_control_flow_mega", code, &[]), 0);
 }
 
-/// GNU case ranges: `case lo ... hi:`.
+// ============================================================================
+// Case ranges, computed goto and other control-flow edges
+// ============================================================================
+
+/// Case ranges, computed goto, label addresses, a `for` post-expression that
+/// splits its block, and case-label conversion, at the matrix levels and at -O1;
+/// each section keeps its original test name and doc comment, and the exit-code
+/// table is at the top.
 ///
-/// Measured as the most-used extension c17 rejected — 612 files in the Linux
-/// tree, 18 in mesa, 4 in CPython. GCC requires whitespace around the `...`
-/// (`case 1...9:` lexes as one pp-number and is rejected there too), so only
-/// the spaced form is accepted.
-///
-/// A range is *not* expanded into individual labels: `case 0 ... 1000000:` is
-/// legal, and every label costs a basic block and a comparison. It lowers to
-/// `(x - lo) <=unsigned (hi - lo)`, one subtraction and one compare whatever
-/// the width.
+/// Consolidates (both runs of each): c89_case_ranges, c89_computed_goto,
+/// c89_computed_goto_value_survives_the_edge, c89_case_range_unsigned_bounds,
+/// c89_label_address_without_a_computed_goto,
+/// c89_for_post_expression_that_splits_the_block_keeps_the_back_edge and
+/// c89_a_case_label_is_converted_to_the_controlling_type.
 #[test]
-fn c89_case_ranges() {
+fn c89_control_flow_extensions_mega() {
     let code = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1- 40  c89_case_ranges
+ *    51- 80  c89_computed_goto
+ *    91- 94  c89_computed_goto_value_survives_the_edge
+ *   101-103  c89_case_range_unsigned_bounds
+ *   111-111  c89_label_address_without_a_computed_goto
+ *   121-125  c89_for_post_expression_that_splits_the_block_keeps_the_back_edge
+ *   131-136  c89_a_case_label_is_converted_to_the_controlling_type
+ */
+
+/* ---- c89_case_ranges (exit codes 1-40) ----
+ *
+ *  GNU case ranges: `case lo ... hi:`.
+ *
+ *  Measured as the most-used extension c17 rejected — 612 files in the Linux
+ *  tree, 18 in mesa, 4 in CPython. GCC requires whitespace around the `...`
+ *  (`case 1...9:` lexes as one pp-number and is rejected there too), so only
+ *  the spaced form is accepted.
+ *
+ *  A range is *not* expanded into individual labels: `case 0 ... 1000000:` is
+ *  legal, and every label costs a basic block and a comparison. It lowers to
+ *  `(x - lo) <=unsigned (hi - lo)`, one subtraction and one compare whatever
+ *  the width.
+ */
 static int basic(int x) { switch (x) { case 1 ... 9: return 0; default: return 1; } }
 
 static int edges(int x) { switch (x) { case 3 ... 7: return 1; default: return 0; } }
@@ -770,7 +804,7 @@ static int wide(long x) {
 /* An empty range never matches; GCC warns and compiles. */
 static int empty(int x) { switch (x) { case 9 ... 1: return 0; default: return 1; } }
 
-int main(void)
+static int t_c89_case_ranges(void)
 {
     if (basic(5)) return 1;
     if (basic(0) != 1 || basic(10) != 1) return 2;
@@ -797,23 +831,19 @@ int main(void)
     switch (3) { case 3 ... 3: break; default: return 14; }
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("case_ranges", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("case_ranges_opt", code), 0);
-}
 
-/// GNU computed goto: the label address `&&label` and the indirect `goto *p`.
-///
-/// The reason the extension exists is interpreter dispatch, so that shape is
-/// the centrepiece here. `&&label` needs no opcode of its own — every basic
-/// block already emits an assembly label, and both backends already lower a
-/// leading-`.` symbol to a pc-relative address — but the branch does: the
-/// reachable blocks are not derivable from the instruction, so the CFG edges
-/// to every address-taken label are recorded on the block, exactly as `asm
-/// goto` does. Without them DCE deletes the targets.
-#[test]
-fn c89_computed_goto() {
-    let code = r#"
+/* ---- c89_computed_goto (exit codes 51-80) ----
+ *
+ *  GNU computed goto: the label address `&&label` and the indirect `goto *p`.
+ *
+ *  The reason the extension exists is interpreter dispatch, so that shape is
+ *  the centrepiece here. `&&label` needs no opcode of its own — every basic
+ *  block already emits an assembly label, and both backends already lower a
+ *  leading-`.` symbol to a pc-relative address — but the branch does: the
+ *  reachable blocks are not derivable from the instruction, so the CFG edges
+ *  to every address-taken label are recorded on the block, exactly as `asm
+ *  goto` does. Without them DCE deletes the targets.
+ */
 /* A bytecode interpreter's dispatch loop: the shape the extension is for.
    The table is `static`, so the label addresses go through the data-image
    path rather than through runtime stores. */
@@ -864,7 +894,7 @@ static int in_struct(void)
 L:  return 0;
 }
 
-int main(void)
+static int t_c89_computed_goto(void)
 {
     int prog[] = { 0, 1, 0, 2 };   /* acc = ((1+2)*3)+2 = 11 */
     if (run(prog, 4) != 11) return 1;
@@ -878,21 +908,17 @@ int main(void)
     if (in_struct()) return 6;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("computed_goto", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("computed_goto_opt", code), 0);
-}
 
-/// A value live across an indirect branch must survive it.
-///
-/// The companion to `codegen_inline_asm_x86_64_asm_goto_pseudo_survives_edge`,
-/// and the same hazard: liveness is computed from the block's recorded
-/// successors, so if the edges to the address-taken labels were missing, a
-/// pseudo live only along one of them would look dead and its register could
-/// be reused before the branch.
-#[test]
-fn c89_computed_goto_value_survives_the_edge() {
-    let code = r#"
+/* ---- c89_computed_goto_value_survives_the_edge (exit codes 91-94) ----
+ *
+ *  A value live across an indirect branch must survive it.
+ *
+ *  The companion to `codegen_inline_asm_x86_64_asm_goto_pseudo_survives_edge`,
+ *  and the same hazard: liveness is computed from the block's recorded
+ *  successors, so if the edges to the address-taken labels were missing, a
+ *  pseudo live only along one of them would look dead and its register could
+ *  be reused before the branch.
+ */
 static int dispatch(int which, int a, int b)
 {
     void *t[] = { &&X, &&Y };
@@ -905,7 +931,7 @@ X:  return sum;
 Y:  return prod;
 }
 
-int main(void)
+static int t_c89_computed_goto_value_survives_the_edge(void)
 {
     if (dispatch(0, 3, 4) != 7) return 1;
     if (dispatch(1, 3, 4) != 12) return 2;
@@ -914,22 +940,15 @@ int main(void)
     if (dispatch(1, 100, 200) != 20000) return 4;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("computed_goto_liveness", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("computed_goto_liveness_opt", code),
-        0
-    );
-}
 
-/// An unsigned switch range whose bound exceeds `i64::MAX`.
-///
-/// Case endpoints are carried as `i64`, so `ULONG_MAX` read as -1 and the
-/// range looked empty: it warned "empty range specified" and never matched.
-/// The ordering has to follow the switch type's own signedness.
-#[test]
-fn c89_case_range_unsigned_bounds() {
-    let code = r#"
+/* ---- c89_case_range_unsigned_bounds (exit codes 101-103) ----
+ *
+ *  An unsigned switch range whose bound exceeds `i64::MAX`.
+ *
+ *  Case endpoints are carried as `i64`, so `ULONG_MAX` read as -1 and the
+ *  range looked empty: it warned "empty range specified" and never matched.
+ *  The ordering has to follow the switch type's own signedness.
+ */
 static int whole(unsigned long x)
 {
     switch (x) { case 0ul ... 18446744073709551615ul: return 1; default: return 0; }
@@ -943,29 +962,22 @@ static int upper(unsigned long x)
     }
 }
 
-int main(void)
+static int t_c89_case_range_unsigned_bounds(void)
 {
     if (!whole(0) || !whole(1) || !whole(18446744073709551615ul)) return 1;
     if (!upper(9223372036854775808ul) || !upper(18446744073709551615ul)) return 2;
     if (upper(0) || upper(9223372036854775807ul)) return 3;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("case_range_unsigned", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("case_range_unsigned_opt", code),
-        0
-    );
-}
 
-/// A label whose address is taken but never branched on must still be emitted.
-///
-/// The blocks were linked to the dispatch block, and a function with no
-/// computed goto has none — so DCE deleted the block and the link failed on an
-/// undefined `.L` symbol. Storing a label address for later use is legal.
-#[test]
-fn c89_label_address_without_a_computed_goto() {
-    let code = r#"
+/* ---- c89_label_address_without_a_computed_goto (exit codes 111-111) ----
+ *
+ *  A label whose address is taken but never branched on must still be emitted.
+ *
+ *  The blocks were linked to the dispatch block, and a function with no
+ *  computed goto has none — so DCE deleted the block and the link failed on an
+ *  undefined `.L` symbol. Storing a label address for later use is legal.
+ */
 void *slot;
 
 static void take(int x)
@@ -976,33 +988,29 @@ static void take(int x)
 L:  slot = 0;
 }
 
-int main(void)
+static int t_c89_label_address_without_a_computed_goto(void)
 {
     take(1);
     return slot != 0 ? 0 : 1;
 }
-"#;
-    assert_eq!(compile_and_run("label_addr_no_goto", code, &[]), 0);
-    assert_eq!(compile_and_run_optimized("label_addr_no_goto_opt", code), 0);
-}
 
-/// A `for` post-expression that splits the block keeps the loop's back edge.
-///
-/// `&&`, `||` and `?:` leave the current block on their merge, not on the block
-/// the post-expression started in, so the branch back to the condition landed
-/// in one block while the CFG edge was recorded from another. Every other loop
-/// lowering reads `self.current_bb` back before linking; the two `for` arms did
-/// not.
-///
-/// The exhaustive statement of this is the CFG-consistency check in
-/// `ir::test_linearize`; asserting it there rather than here is deliberate,
-/// because with the defect present the compiled program does not merely return
-/// the wrong answer, it never terminates -- a runtime test would hang the suite
-/// instead of failing it. What is left here is the end-to-end answer, which is
-/// safe to run only once the shape is known to be acyclic.
-#[test]
-fn c89_for_post_expression_that_splits_the_block_keeps_the_back_edge() {
-    let code = r#"
+/* ---- c89_for_post_expression_that_splits_the_block_keeps_the_back_edge (exit codes 121-125) ----
+ *
+ *  A `for` post-expression that splits the block keeps the loop's back edge.
+ *
+ *  `&&`, `||` and `?:` leave the current block on their merge, not on the block
+ *  the post-expression started in, so the branch back to the condition landed
+ *  in one block while the CFG edge was recorded from another. Every other loop
+ *  lowering reads `self.current_bb` back before linking; the two `for` arms did
+ *  not.
+ *
+ *  The exhaustive statement of this is the CFG-consistency check in
+ *  `ir::test_linearize`; asserting it there rather than here is deliberate,
+ *  because with the defect present the compiled program does not merely return
+ *  the wrong answer, it never terminates -- a runtime test would hang the suite
+ *  instead of failing it. What is left here is the end-to-end answer, which is
+ *  safe to run only once the shape is known to be acyclic.
+ */
 int and_in_post(int n)
 {
     int s = 0;
@@ -1043,7 +1051,7 @@ int and_in_post_in_switch(int n)
     }
 }
 
-int main(void)
+static int t_c89_for_post_expression_that_splits_the_block_keeps_the_back_edge(void)
 {
     if (and_in_post(5) != 10) return 1;
     if (or_in_post(5) != 10) return 2;
@@ -1053,28 +1061,21 @@ int main(void)
     if (and_in_post(0) != 0) return 5;
     return 0;
 }
-"#;
-    assert_eq!(compile_and_run("for_post_splits_block", code, &[]), 0);
-    assert_eq!(
-        compile_and_run_optimized("for_post_splits_block_opt", code),
-        0
-    );
-}
 
-/// A `case` label is converted to the promoted type of the controlling
-/// expression, and matching happens after that conversion.
-///
-/// C17 6.8.4.2p5: the constant expression of each `case` is converted to the
-/// promoted type of the controlling expression. c17 evaluated labels at full
-/// width and never converted them, so a label outside the controlling type
-/// matched or missed depending on which lowering saw it -- a runtime selector
-/// kept the label in the `switch` instruction, while the constant-selector fast
-/// path compared at 128 bits with a signed test that ignored the switch's
-/// signedness. The same switch answered differently depending on whether its
-/// selector was a constant.
-#[test]
-fn c89_a_case_label_is_converted_to_the_controlling_type() {
-    let code = r#"
+/* ---- c89_a_case_label_is_converted_to_the_controlling_type (exit codes 131-136) ----
+ *
+ *  A `case` label is converted to the promoted type of the controlling
+ *  expression, and matching happens after that conversion.
+ *
+ *  C17 6.8.4.2p5: the constant expression of each `case` is converted to the
+ *  promoted type of the controlling expression. c17 evaluated labels at full
+ *  width and never converted them, so a label outside the controlling type
+ *  matched or missed depending on which lowering saw it -- a runtime selector
+ *  kept the label in the `switch` instruction, while the constant-selector fast
+ *  path compared at 128 bits with a signed test that ignored the switch's
+ *  signedness. The same switch answered differently depending on whether its
+ *  selector was a constant.
+ */
 /* 4294967296 is 2^32: zero when converted to int. */
 int runtime_sel(int x) { switch (x) { case 4294967296LL: return 1; default: return 2; } }
 int const_sel(void)    { switch (0) { case 4294967296LL: return 1; default: return 2; } }
@@ -1089,7 +1090,7 @@ int plain(int x) { switch (x) { case -1: return 1; case 7: return 3; default: re
 /* Short controlling expression: promoted to int, so the label is too. */
 int shorty(short x) { switch (x) { case 65536 + 5: return 1; case 5: return 3; default: return 2; } }
 
-int main(void)
+static int t_c89_a_case_label_is_converted_to_the_controlling_type(void)
 {
     /* Both lowerings must agree, and both must match. */
     if (runtime_sel(0) != 1) return 1;
@@ -1105,10 +1106,30 @@ int main(void)
 
     return 0;
 }
+
+int main(void)
+{
+    int r;
+    if ((r = t_c89_case_ranges()) != 0)
+        return 0 + r;
+    if ((r = t_c89_computed_goto()) != 0)
+        return 50 + r;
+    if ((r = t_c89_computed_goto_value_survives_the_edge()) != 0)
+        return 90 + r;
+    if ((r = t_c89_case_range_unsigned_bounds()) != 0)
+        return 100 + r;
+    if ((r = t_c89_label_address_without_a_computed_goto()) != 0)
+        return 110 + r;
+    if ((r = t_c89_for_post_expression_that_splits_the_block_keeps_the_back_edge()) != 0)
+        return 120 + r;
+    if ((r = t_c89_a_case_label_is_converted_to_the_controlling_type()) != 0)
+        return 130 + r;
+    return 0;
+}
 "#;
-    assert_eq!(compile_and_run("case_label_conversion", code, &[]), 0);
+    assert_eq!(compile_and_run("c89_control_flow_extensions", code, &[]), 0);
     assert_eq!(
-        compile_and_run_optimized("case_label_conversion_opt", code),
+        compile_and_run_optimized("c89_control_flow_extensions_opt", code),
         0
     );
 }

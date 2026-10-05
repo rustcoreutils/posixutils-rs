@@ -13,9 +13,23 @@
 
 use crate::common::{compile_and_run, compile_and_run_aarch64, compile_and_run_optimized};
 
+/// C11 alignment, with the other matrix-only alignment programs of this file, as
+/// one program; see the exit-code table at the top.
+///
+/// Consolidates: c11_alignment_mega, c11_alignment_typedef_and_object_alignof and
+/// c11_alignment_typedef_at_block_scope.
 #[test]
 fn c11_alignment_mega() {
     let code = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1-192  c11_alignment_mega
+ *   201-210  c11_alignment_typedef_and_object_alignof
+ *   221-225  c11_alignment_typedef_at_block_scope
+ */
+
+/* ---- c11_alignment_mega (exit codes 1-192) ----
+ */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -310,7 +324,7 @@ int test_typedef_as_struct_member(void) {
 // main
 // ============================================================================
 
-int main(void) {
+static int t_c11_alignment_mega(void) {
     int r;
     if ((r = test_global_alignment()) != 0) return r;
     if ((r = test_local_alignment_16()) != 0) return r;
@@ -331,6 +345,89 @@ int main(void) {
     if ((r = test_trailing_struct_aligned()) != 0) return r;
     if ((r = test_combined_alignas_and_attr()) != 0) return r;
     if ((r = test_typedef_as_struct_member()) != 0) return r;
+    return 0;
+}
+
+
+/* ---- c11_alignment_typedef_and_object_alignof (exit codes 201-210) ----
+ *
+ *  A typedef's declared alignment must reach both the typedef'd type and any
+ *  object of it, whichever position the alignment specifier is written in, and
+ *  `_Alignof` on an object must answer the object's declared alignment rather
+ *  than its type's.
+ *
+ *  Every check here diverged from gcc before the fix:
+ *
+ *    * a *trailing* `__attribute__((aligned(N)))` on a typedef was dropped --
+ *      the typedef binding read `pending_alignas`, which never holds an
+ *      attribute written after the declarator;
+ *    * a *pointer-grouped* typedef (`typedef int *(T)[4]`) dropped even a
+ *      leading one, because that grouped-declarator path skipped the merge;
+ *    * `_Alignof(obj)` reported the alignment of `obj`'s type, ignoring the
+ *      `_Alignas` or `aligned` on the object itself.
+ */
+/* Trailing attribute on a typedef. */
+typedef int T_trail[4] __attribute__((aligned(64)));
+/* Leading attribute on a pointer-grouped typedef. */
+__attribute__((aligned(64))) typedef int *(T_ptrgrp)[4];
+/* Leading attribute, ungrouped. */
+__attribute__((aligned(64))) typedef int T_lead[4];
+/* Leading attribute, plain-grouped. */
+__attribute__((aligned(64))) typedef int (T_grp)[4];
+
+T_trail o_trail;
+T_ptrgrp o_ptrgrp;
+T_lead o_lead;
+T_grp o_grp;
+
+/* Objects carrying their own alignment, in both spellings. */
+_Alignas(64) int v_as[4];
+int v_attr[4] __attribute__((aligned(64)));
+
+static int t_c11_alignment_typedef_and_object_alignof(void) {
+    if (_Alignof(T_trail) != 64) return 1;
+    if (_Alignof(T_ptrgrp) != 64) return 2;
+    if (_Alignof(T_lead) != 64) return 3;
+    if (_Alignof(T_grp) != 64) return 4;
+    if ((unsigned long)(void *)o_trail % 64) return 5;
+    if ((unsigned long)(void *)o_ptrgrp % 64) return 6;
+    if ((unsigned long)(void *)o_lead % 64) return 7;
+    if ((unsigned long)(void *)o_grp % 64) return 8;
+    if (_Alignof(v_as) != 64) return 9;
+    if (_Alignof(v_attr) != 64) return 10;
+    return 0;
+}
+
+
+/* ---- c11_alignment_typedef_at_block_scope (exit codes 221-225) ----
+ *
+ *  The same alignments must survive a block scope. The block-scope binder was
+ *  a third copy of the same rule and it had drifted the same way.
+ */
+static int t_c11_alignment_typedef_at_block_scope(void) {
+    typedef int L_trail[4] __attribute__((aligned(64)));
+    __attribute__((aligned(64))) typedef int L_lead[4];
+    static L_trail lo_trail;
+    static L_lead lo_lead;
+    _Alignas(64) static int lv[4];
+
+    if (_Alignof(L_trail) != 64) return 1;
+    if (_Alignof(L_lead) != 64) return 2;
+    if ((unsigned long)(void *)lo_trail % 64) return 3;
+    if ((unsigned long)(void *)lo_lead % 64) return 4;
+    if (_Alignof(lv) != 64) return 5;
+    return 0;
+}
+
+int main(void)
+{
+    int r;
+    if ((r = t_c11_alignment_mega()) != 0)
+        return 0 + r;
+    if ((r = t_c11_alignment_typedef_and_object_alignof()) != 0)
+        return 200 + r;
+    if ((r = t_c11_alignment_typedef_at_block_scope()) != 0)
+        return 220 + r;
     return 0;
 }
 "#;
@@ -432,96 +529,31 @@ int main(void) {
     assert_eq!(compile_and_run("c11_alignment_aarch64_over", code, &[]), 0);
 }
 
-/// A typedef's declared alignment must reach both the typedef'd type and any
-/// object of it, whichever position the alignment specifier is written in, and
-/// `_Alignof` on an object must answer the object's declared alignment rather
-/// than its type's.
-///
-/// Every check here diverged from gcc before the fix:
-///
-///   * a *trailing* `__attribute__((aligned(N)))` on a typedef was dropped --
-///     the typedef binding read `pending_alignas`, which never holds an
-///     attribute written after the declarator;
-///   * a *pointer-grouped* typedef (`typedef int *(T)[4]`) dropped even a
-///     leading one, because that grouped-declarator path skipped the merge;
-///   * `_Alignof(obj)` reported the alignment of `obj`'s type, ignoring the
-///     `_Alignas` or `aligned` on the object itself.
-#[test]
-fn c11_alignment_typedef_and_object_alignof() {
-    let code = r#"
-/* Trailing attribute on a typedef. */
-typedef int T_trail[4] __attribute__((aligned(64)));
-/* Leading attribute on a pointer-grouped typedef. */
-__attribute__((aligned(64))) typedef int *(T_ptrgrp)[4];
-/* Leading attribute, ungrouped. */
-__attribute__((aligned(64))) typedef int T_lead[4];
-/* Leading attribute, plain-grouped. */
-__attribute__((aligned(64))) typedef int (T_grp)[4];
-
-T_trail o_trail;
-T_ptrgrp o_ptrgrp;
-T_lead o_lead;
-T_grp o_grp;
-
-/* Objects carrying their own alignment, in both spellings. */
-_Alignas(64) int v_as[4];
-int v_attr[4] __attribute__((aligned(64)));
-
-int main(void) {
-    if (_Alignof(T_trail) != 64) return 1;
-    if (_Alignof(T_ptrgrp) != 64) return 2;
-    if (_Alignof(T_lead) != 64) return 3;
-    if (_Alignof(T_grp) != 64) return 4;
-    if ((unsigned long)(void *)o_trail % 64) return 5;
-    if ((unsigned long)(void *)o_ptrgrp % 64) return 6;
-    if ((unsigned long)(void *)o_lead % 64) return 7;
-    if ((unsigned long)(void *)o_grp % 64) return 8;
-    if (_Alignof(v_as) != 64) return 9;
-    if (_Alignof(v_attr) != 64) return 10;
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("c11_alignment_typedef_and_object_alignof", code, &[]),
-        0
-    );
-}
-
-/// The same alignments must survive a block scope. The block-scope binder was
-/// a third copy of the same rule and it had drifted the same way.
-#[test]
-fn c11_alignment_typedef_at_block_scope() {
-    let code = r#"
-int main(void) {
-    typedef int L_trail[4] __attribute__((aligned(64)));
-    __attribute__((aligned(64))) typedef int L_lead[4];
-    static L_trail lo_trail;
-    static L_lead lo_lead;
-    _Alignas(64) static int lv[4];
-
-    if (_Alignof(L_trail) != 64) return 1;
-    if (_Alignof(L_lead) != 64) return 2;
-    if ((unsigned long)(void *)lo_trail % 64) return 3;
-    if ((unsigned long)(void *)lo_lead % 64) return 4;
-    if (_Alignof(lv) != 64) return 5;
-    return 0;
-}
-"#;
-    assert_eq!(
-        compile_and_run("c11_alignment_typedef_at_block_scope", code, &[]),
-        0
-    );
-}
-
 /// `__attribute__((aligned(N)))` on a function aligns its code, and
-/// `__alignof__` of the function answers N.
-///
-/// The attribute can reach a function by every route a declaration has: on a
-/// prototype after the declarator (the gcc torture test `execute/align-3`,
-/// whose definition then says nothing), before the declaration specifiers, and
-/// on the definition itself. The largest wins when there are several. c17
-/// answered 1 and emitted no alignment directive at all.
+/// `__alignof__` of the function answers N -- and `aligned` on a function
+/// declared after the first declarator of a list, or at block scope. Both
+/// programs (formerly `FUNCTION_ALIGNMENT` and
+/// `FUNCTION_ALIGNMENT_LATER_DECLARATOR`, the latter run by
+/// `c11_alignment_of_a_function_in_a_declarator_list`) are sections of this
+/// one, with their original doc comments; see the exit-code table at the top.
 const FUNCTION_ALIGNMENT: &str = r#"
+/*
+ * Exit codes: each section's own failure codes, offset by its base.
+ *     1- 14  FUNCTION_ALIGNMENT
+ *    21- 26  FUNCTION_ALIGNMENT_LATER_DECLARATOR
+ */
+
+/* ---- FUNCTION_ALIGNMENT (exit codes 1-14) ----
+ *
+ *  `__attribute__((aligned(N)))` on a function aligns its code, and
+ *  `__alignof__` of the function answers N.
+ *
+ *  The attribute can reach a function by every route a declaration has: on a
+ *  prototype after the declarator (the gcc torture test `execute/align-3`,
+ *  whose definition then says nothing), before the declaration specifiers, and
+ *  on the definition itself. The largest wins when there are several. c17
+ *  answered 1 and emitted no alignment directive at all.
+ */
 #include <stdint.h>
 
 void on_prototype(void) __attribute__((aligned(256)));
@@ -535,7 +567,7 @@ void on_definition(void) {}
 
 static __attribute__((aligned(1024))) int internal(int x) { return x + 1; }
 
-int main(void)
+static int t_function_alignment(void)
 {
     if (__alignof__(on_prototype) != 256) return 1;
     if (__alignof__(before_specifiers) != 64) return 2;
@@ -552,6 +584,47 @@ int main(void)
     on_definition();
     return internal(-1);
 }
+
+
+/* ---- FUNCTION_ALIGNMENT_LATER_DECLARATOR (exit codes 21-26) ----
+ *
+ *  `aligned` on a function declared after the first declarator of a list, or
+ *  at block scope, is recorded like any other. Only the first declarator and a
+ *  grouped one folded a function's attributes in, so `void f(void), g(void)
+ *  __attribute__((aligned(32)));` left `g` unaligned with `__alignof__` 1.
+ *  The attribute written after a declarator belongs to it alone, which `f`
+ *  and `h` check by staying unaligned.
+ */
+void f(void), g(void) __attribute__((aligned(32)));
+void f(void) {}
+void g(void) {}
+static void h(void), k(void) __attribute__((aligned(64)));
+static void h(void) {}
+static void k(void) {}
+static int t_function_alignment_later_declarator(void)
+{
+    void m(void) __attribute__((aligned(16))), n(void) __attribute__((aligned(128)));
+    if (__alignof__(g) != 32) return 1;
+    if ((unsigned long)g % 32) return 2;
+    if (__alignof__(k) != 64) return 3;
+    if ((unsigned long)k % 64) return 4;
+    if (__alignof__(n) != 128) return 5;
+    if ((unsigned long)n % 128) return 6;
+    f(); h();
+    return 0;
+}
+void m(void) {}
+void n(void) {}
+
+int main(void)
+{
+    int r;
+    if ((r = t_function_alignment()) != 0)
+        return 0 + r;
+    if ((r = t_function_alignment_later_declarator()) != 0)
+        return 20 + r;
+    return 0;
+}
 "#;
 
 #[test]
@@ -566,48 +639,6 @@ fn c11_alignment_of_a_function_aarch64() {
     for opt in ["-O0", "-O2"] {
         if let Some(code) = compile_and_run_aarch64("fn_align_a64", FUNCTION_ALIGNMENT, opt) {
             assert_eq!(code, 0, "at {opt}");
-        }
-    }
-}
-
-/// `aligned` on a function declared after the first declarator of a list, or
-/// at block scope, is recorded like any other. Only the first declarator and a
-/// grouped one folded a function's attributes in, so `void f(void), g(void)
-/// __attribute__((aligned(32)));` left `g` unaligned with `__alignof__` 1.
-/// The attribute written after a declarator belongs to it alone, which `f`
-/// and `h` check by staying unaligned.
-const FUNCTION_ALIGNMENT_LATER_DECLARATOR: &str = r#"
-void f(void), g(void) __attribute__((aligned(32)));
-void f(void) {}
-void g(void) {}
-static void h(void), k(void) __attribute__((aligned(64)));
-static void h(void) {}
-static void k(void) {}
-int main(void)
-{
-    void m(void) __attribute__((aligned(16))), n(void) __attribute__((aligned(128)));
-    if (__alignof__(g) != 32) return 1;
-    if ((unsigned long)g % 32) return 2;
-    if (__alignof__(k) != 64) return 3;
-    if ((unsigned long)k % 64) return 4;
-    if (__alignof__(n) != 128) return 5;
-    if ((unsigned long)n % 128) return 6;
-    f(); h();
-    return 0;
-}
-void m(void) {}
-void n(void) {}
-"#;
-
-#[test]
-fn c11_alignment_of_a_function_in_a_declarator_list() {
-    let src = FUNCTION_ALIGNMENT_LATER_DECLARATOR;
-    assert_eq!(compile_and_run("fn_align_list", src, &[]), 0);
-    let opts = vec!["-O2".to_string()];
-    assert_eq!(compile_and_run("fn_align_list_o2", src, &opts), 0);
-    for opt in ["-O0", "-O2"] {
-        if let Some(code) = compile_and_run_aarch64("fn_align_list_a64", src, opt) {
-            assert_eq!(code, 0, "aarch64 at {opt}");
         }
     }
 }

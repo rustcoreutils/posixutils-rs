@@ -316,7 +316,7 @@ static __attribute__((noinline)) int t_large_struct_array_copy(void)
  * must be zero-initialized. Bug: *p = (struct S){.a = val} left .b and .c
  * as garbage instead of zero.
  */
-typedef long int64_t;
+typedef long to4_int64_t;
 void *malloc(unsigned long);
 void free(void *);
 int printf(const char *, ...);
@@ -326,7 +326,7 @@ typedef int (*func_ptr)(void);
 
 struct cached_m_dict {
     void *copied;
-    int64_t extra;
+    to4_int64_t extra;
 };
 
 typedef struct cached_m_dict *cached_m_dict_t;
@@ -340,7 +340,7 @@ typedef enum {
 struct extensions_cache_value {
     void *def;                      // offset 0: 8 bytes
     func_ptr m_init;                // offset 8: 8 bytes
-    int64_t m_index;                // offset 16: 8 bytes
+    to4_int64_t m_index;                // offset 16: 8 bytes
     cached_m_dict_t m_dict;         // offset 24: 8 bytes (pointer)
     struct cached_m_dict _m_dict;   // offset 32: 16 bytes (embedded struct)
     origin_t origin;                // offset 48: 4 bytes

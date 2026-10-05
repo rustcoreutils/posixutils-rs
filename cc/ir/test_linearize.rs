@@ -1555,6 +1555,7 @@ fn test_alias_declarations_become_symbol_aliases() {
         crate::ir::SymbolAlias {
             name: name.to_string(),
             target: target.to_string(),
+            form: crate::parse::ast::AliasForm::Alias,
             is_static,
             weak,
             visibility: vis.map(str::to_string),
@@ -1577,6 +1578,46 @@ fn test_alias_declarations_become_symbol_aliases() {
         assert!(
             !module.globals.iter().any(|g| g.name == name),
             "{name} has no storage"
+        );
+        assert!(
+            !module.functions.iter().any(|f| f.name == name),
+            "{name} has no body"
+        );
+    }
+}
+
+/// An `ifunc` declaration becomes a `SymbolAlias` of the `Ifunc` form naming
+/// its resolver -- not a definition, and not the resolver: a call to it is a
+/// call to an external symbol, reached through the GOT, which is where the
+/// binding the resolver chose is stored. An ordinary redeclaration does not
+/// make it a second record.
+#[test]
+fn test_ifunc_declarations_become_indirect_functions() {
+    use crate::parse::ast::AliasForm;
+    let src = "static int impl(int x) { return x; }\n\
+               static void *res(void) { return (void *)impl; }\n\
+               int f(int) __attribute__((ifunc(\"res\")));\n\
+               int f(int);\n\
+               static int g(int) __attribute__((ifunc(\"res\"), visibility(\"hidden\")));\n\
+               int use(void) { return f(1) + g(2); }\n";
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    let module = linearize_source(src, &target);
+    let ifunc = |name: &str, is_static: bool, vis: Option<&str>| crate::ir::SymbolAlias {
+        name: name.to_string(),
+        target: "res".to_string(),
+        form: AliasForm::Ifunc,
+        is_static,
+        weak: false,
+        visibility: vis.map(str::to_string),
+    };
+    assert_eq!(
+        module.aliases,
+        [ifunc("f", false, None), ifunc("g", true, Some("hidden"))]
+    );
+    for name in ["f", "g"] {
+        assert!(
+            module.extern_symbols.contains(name),
+            "{name} is reached via the GOT"
         );
         assert!(
             !module.functions.iter().any(|f| f.name == name),

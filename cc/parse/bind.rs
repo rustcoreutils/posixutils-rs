@@ -446,6 +446,9 @@ impl Parser<'_> {
         // declaration of its name has promised.
         let pending_effect = self.take_pending_fn_effect();
         let mut symbol_attrs = std::mem::take(&mut self.pending_symbol_attrs);
+        if !is_fn {
+            Self::drop_ifunc(&mut symbol_attrs, pos);
+        }
         let cleanup = symbol_attrs.cleanup.take().and_then(|func| {
             let var = Cleanup {
                 func,

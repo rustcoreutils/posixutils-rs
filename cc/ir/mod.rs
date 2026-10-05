@@ -3751,7 +3751,11 @@ pub struct SymbolAlias {
     /// The alias, as the assembler spells it.
     pub name: String,
     /// The symbol it names: a definition in this unit, or another alias.
+    /// For an `ifunc`, the resolver.
     pub target: String,
+    /// A second name for `target`, or a GNU indirect function `target`
+    /// resolves.
+    pub form: crate::parse::ast::AliasForm,
     /// Declared `static`: a local symbol, no `.globl`.
     pub is_static: bool,
     /// `weak`: `.weak` rather than `.globl`.
@@ -4176,6 +4180,7 @@ mod tests {
             aliases: vec![SymbolAlias {
                 name: "a".into(),
                 target: "plain".into(),
+                form: crate::parse::ast::AliasForm::Alias,
                 is_static: false,
                 weak: false,
                 visibility: None,

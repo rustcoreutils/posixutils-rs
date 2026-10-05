@@ -758,6 +758,8 @@ pub enum SymbolType {
     Object,
     /// @tls_object (ELF TLS symbol)
     TlsObject,
+    /// @gnu_indirect_function (`__attribute__((ifunc))`)
+    GnuIndirectFunction,
 }
 
 impl SymbolType {
@@ -766,6 +768,7 @@ impl SymbolType {
             SymbolType::Function => "@function",
             SymbolType::Object => "@object",
             SymbolType::TlsObject => "@tls_object",
+            SymbolType::GnuIndirectFunction => "@gnu_indirect_function",
         }
     }
 }
@@ -895,9 +898,10 @@ pub enum Directive {
     Global(Symbol),
 
     /// `.set sym, value` -- define `sym` as another name for `value`'s
-    /// address, from `__attribute__((alias))`. The assembler gives `sym` the
-    /// section, type and size of `value`; its binding is whatever `.globl`,
-    /// `.weak` or neither says.
+    /// address, from `__attribute__((alias))`; or, after a `.type` of
+    /// `@gnu_indirect_function`, as the indirect function `value` resolves.
+    /// The assembler gives `sym` the section, type and size of `value`; its
+    /// binding is whatever `.globl`, `.weak` or neither says.
     SymbolAlias { sym: Symbol, value: Symbol },
 
     /// .type symbol, @function/@object (ELF only)

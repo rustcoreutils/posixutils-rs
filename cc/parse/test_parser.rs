@@ -8363,17 +8363,23 @@ fn test_attributes_follow_their_declarator_in_a_list() {
     assert_eq!(weak, [("wa".to_string(), true), ("wb".to_string(), true)]);
 }
 
-/// `alias("target")` is a symbol attribute like `weak`: it reaches the
-/// declarator it is written on and no other, in either spelling.
+/// `alias("target")` and `ifunc("resolver")` are symbol attributes like
+/// `weak`: each reaches the declarator it is written on and no other, in
+/// either spelling, and says which of the two it is. `ifunc` on a variable
+/// is dropped.
 #[test]
 fn test_alias_attribute_reaches_its_declarator() {
+    use crate::parse::ast::AliasForm;
     let (tu, _types, strings, symbols) = parse_tu(
         "int a;\n\
          extern int b __attribute__((alias(\"a\"))), c;\n\
-         int f(void) __attribute__((__alias__(\"g\")));\n",
+         int f(void) __attribute__((__alias__(\"g\")));\n\
+         int h(void) __attribute__((ifunc(\"r\"))), i(void);\n\
+         int j(void) __attribute__((__ifunc__(\"r\")));\n\
+         int v __attribute__((ifunc(\"r\")));\n",
     )
     .unwrap();
-    let got: Vec<(String, Option<String>)> = tu
+    let got: Vec<(String, Option<(String, AliasForm)>)> = tu
         .items
         .iter()
         .filter_map(|item| match item {
@@ -8383,14 +8389,24 @@ fn test_alias_attribute_reaches_its_declarator() {
         .flatten()
         .map(|d| {
             let name = strings.get(symbols.get(d.symbol).name).to_string();
-            (name, d.symbol_attrs.alias.clone())
+            let attr = d.symbol_attrs.alias.clone();
+            (name, attr.map(|a| (a.target, a.form)))
         })
         .collect();
-    let want: Vec<(String, Option<String>)> =
-        [("a", None), ("b", Some("a")), ("c", None), ("f", Some("g"))]
-            .into_iter()
-            .map(|(n, t)| (n.to_string(), t.map(str::to_string)))
-            .collect();
+    let want: Vec<(String, Option<(String, AliasForm)>)> = [
+        ("a", None),
+        ("b", Some(("a", AliasForm::Alias))),
+        ("c", None),
+        ("f", Some(("g", AliasForm::Alias))),
+        ("h", Some(("r", AliasForm::Ifunc))),
+        ("i", None),
+        ("j", Some(("r", AliasForm::Ifunc))),
+        // Only a function can be indirect: gcc warns and drops it.
+        ("v", None),
+    ]
+    .into_iter()
+    .map(|(n, t)| (n.to_string(), t.map(|(t, f)| (t.to_string(), f))))
+    .collect();
     assert_eq!(got, want);
 }
 

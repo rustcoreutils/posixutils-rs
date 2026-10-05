@@ -2590,17 +2590,36 @@ pub struct SymbolAttrs {
     /// `visibility("...")`: ELF visibility, verbatim -- "default", "hidden",
     /// "protected" or "internal".
     pub visibility: Option<String>,
-    /// `alias("target")`: this declaration is not a reference to storage
-    /// defined elsewhere but a second name for `target`, which this
+    /// `alias("target")` or `ifunc("resolver")`: this declaration is not a
+    /// reference to storage defined elsewhere but a name for a symbol this
     /// translation unit defines. Becomes an `ir::SymbolAlias`, never a
     /// definition or an extern reference of its own.
-    pub alias: Option<String>,
+    pub alias: Option<AliasAttr>,
     /// `cleanup(fn)`: the function to call with the variable's address when
     /// it leaves scope. Only ever read off a pending declarator: the parser
     /// turns it into [`InitDeclarator::cleanup`] for an automatic variable
     /// and drops it with a warning from anything else, so no symbol is ever
     /// emitted carrying it.
     pub cleanup: Option<SymbolId>,
+}
+
+/// How a name declared with `alias` or `ifunc` is bound to the symbol its
+/// attribute names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasForm {
+    /// `alias("target")`: the same address as `target`.
+    Alias,
+    /// `ifunc("resolver")`: a GNU indirect function, bound at load time to
+    /// whatever `resolver` returns. ELF only.
+    Ifunc,
+}
+
+/// An `alias("target")` or `ifunc("resolver")` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasAttr {
+    /// The symbol the attribute names, as written.
+    pub target: String,
+    pub form: AliasForm,
 }
 
 impl SymbolAttrs {

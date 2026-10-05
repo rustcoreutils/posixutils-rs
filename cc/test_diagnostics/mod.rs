@@ -43,6 +43,7 @@ mod empty_declarations;
 mod expressions;
 mod function_compatibility;
 mod function_pointers;
+mod ifunc;
 mod incomplete_types;
 mod inline_static_reference;
 mod jumps_and_characters;

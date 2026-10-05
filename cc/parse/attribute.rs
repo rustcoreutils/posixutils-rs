@@ -343,9 +343,10 @@ impl AttributeList {
         }
     }
 
-    /// The `weak`, `used`, `section(...)`, `visibility(...)` and `alias(...)`
-    /// requests in this list.
+    /// The `weak`, `used`, `section(...)`, `visibility(...)`, `alias(...)` and
+    /// `ifunc(...)` requests in this list.
     pub fn symbol_attrs(&self) -> crate::parse::ast::SymbolAttrs {
+        use crate::parse::ast::{AliasAttr, AliasForm};
         let mut out = crate::parse::ast::SymbolAttrs::default();
         for attr in &self.attrs {
             let text = |a: &Attribute| match a.args.first() {
@@ -353,12 +354,14 @@ impl AttributeList {
                 Some(AttributeArg::Ident(s)) => Some(s.clone()),
                 _ => None,
             };
+            let alias = |a: &Attribute, form| text(a).map(|target| AliasAttr { target, form });
             match attr.name.trim_matches('_') {
                 "weak" => out.weak = true,
                 "used" => out.used = true,
                 "section" => out.section = text(attr),
                 "visibility" => out.visibility = text(attr),
-                "alias" => out.alias = text(attr),
+                "alias" => out.alias = alias(attr, AliasForm::Alias),
+                "ifunc" => out.alias = alias(attr, AliasForm::Ifunc),
                 _ => {}
             }
         }
@@ -806,6 +809,20 @@ impl Parser<'_> {
     pub(super) fn drop_pending_cleanup(&mut self, pos: Position) {
         if self.pending_symbol_attrs.cleanup.take().is_some() {
             Self::warn_cleanup_ignored(pos);
+        }
+    }
+
+    /// `ifunc("resolver")` on anything but a function is dropped with gcc's
+    /// warning: only a function can be indirect, and the object is declared
+    /// as written.
+    pub(super) fn drop_ifunc(attrs: &mut crate::parse::ast::SymbolAttrs, pos: Position) {
+        let form = attrs.alias.as_ref().map(|a| a.form);
+        if form != Some(crate::parse::ast::AliasForm::Ifunc) {
+            return;
+        }
+        attrs.alias = None;
+        if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
+            diag::warning_args(pos, "'{0}' attribute ignored", &["ifunc"]);
         }
     }
 

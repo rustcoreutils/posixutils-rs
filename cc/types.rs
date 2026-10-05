@@ -1745,6 +1745,12 @@ impl TypeTable {
         self.format_declarator(id, String::new(), idents)
     }
 
+    /// Format a pointer to `id` for display, whether or not the table holds
+    /// that pointer type: `int (*)(int)` for a function `int (int)`.
+    pub fn format_pointer_to(&self, id: TypeId) -> String {
+        self.format_declarator(id, String::from("*"), None)
+    }
+
     /// Spell `id` in declarator form, wrapping `decl` -- the declarator built
     /// so far, read outward from where the name would stand.
     ///
@@ -4919,6 +4925,11 @@ mod tests {
         // Pointers chain without spaces between the stars.
         let ptr_ptr = t.intern(Type::pointer(int_ptr));
         assert_eq!(t.format_type(ptr_ptr, None), "int **");
+
+        // A pointer the table never interned spells as if it had.
+        let f_int = t.intern(Type::function(t.int_id, vec![t.int_id], false, false));
+        assert_eq!(t.format_pointer_to(f_int), "int (*)(int)");
+        assert_eq!(t.format_pointer_to(arr8), "int (*)[8]");
 
         // A function, and a pointer to one.
         let f_void = t.intern(Type::function(t.int_id, vec![], false, false));

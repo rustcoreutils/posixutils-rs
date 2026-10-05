@@ -1964,12 +1964,15 @@ impl<'a> Linearizer<'a> {
         ir_func.is_noreturn = is_noreturn;
         ir_func.is_inline = is_inline;
         ir_func.symbol_attrs = func.attrs.symbol.clone();
-        // `alias` on a definition -- written on it, or on an earlier
-        // prototype -- asks for two things one symbol cannot be. Recorded
-        // like any other alias, so `resolve_aliases` reports it once.
+        // `alias` or `ifunc` on a definition -- written on it, or on an
+        // earlier prototype -- asks for two things one symbol cannot be.
+        // Recorded like any other alias, so `resolve_aliases` reports it once.
         if ir_func.symbol_attrs.alias.take().is_some() {
-            let kind = super::linearize_init::AliasKind::Function;
-            self.declare_alias(&ir_func.name, &func.attrs.symbol, is_static, kind, func.pos);
+            let typ = self
+                .symbols
+                .lookup(func.name, crate::symbol::Namespace::Ordinary)
+                .map_or(func.return_type, |s| s.typ);
+            self.declare_alias(&ir_func.name, &func.attrs.symbol, is_static, typ, func.pos);
         }
         ir_func.align = func.attrs.align;
         ir_func.is_noinline = func.attrs.noinline;

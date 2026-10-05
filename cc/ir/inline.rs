@@ -2244,6 +2244,7 @@ mod tests {
         module.aliases.push(crate::ir::SymbolAlias {
             name: "api".to_string(),
             target: "impl".to_string(),
+            form: crate::parse::ast::AliasForm::Alias,
             is_static: false,
             weak: false,
             visibility: None,

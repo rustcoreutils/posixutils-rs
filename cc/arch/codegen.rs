@@ -360,9 +360,11 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         }
     }
 
-    /// `__attribute__((alias))` symbols, as gcc writes them on ELF: the
-    /// binding, the visibility, then `.set`. No `.type` or `.size` -- the
-    /// assembler copies both from the target.
+    /// `__attribute__((alias))` and `__attribute__((ifunc))` symbols, as gcc
+    /// writes them on ELF: the binding, the visibility, then `.set`. An alias
+    /// has no `.type` or `.size` -- the assembler copies both from the
+    /// target -- and an indirect function is typed `@gnu_indirect_function`,
+    /// which is what makes `.set` name its resolver rather than itself.
     pub fn emit_symbol_aliases(&mut self, module: &Module) {
         for alias in &module.aliases {
             let sym = Symbol::global(&alias.name);
@@ -376,6 +378,12 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             }
             if let Some(how) = &alias.visibility {
                 self.push_directive(Directive::Visibility(sym.clone(), how.clone()));
+            }
+            if alias.form == crate::parse::ast::AliasForm::Ifunc {
+                self.push_directive(Directive::Type {
+                    sym: sym.clone(),
+                    kind: crate::arch::lir::SymbolType::GnuIndirectFunction,
+                });
             }
             self.push_directive(Directive::SymbolAlias {
                 sym,

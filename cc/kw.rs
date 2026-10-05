@@ -1184,6 +1184,9 @@ define_keywords! {
     // scope. Appended, as above.
     (_, "cleanup",                   SUPPORTED_ATTR),
     (_, "__cleanup__",               SUPPORTED_ATTR),
+    // `ifunc("resolver")`: a GNU indirect function. Appended, as above.
+    (_, "ifunc",                     SUPPORTED_ATTR),
+    (_, "__ifunc__",                 SUPPORTED_ATTR),
 }
 
 // Tag query API
@@ -1563,6 +1566,8 @@ mod tests {
             "__vector_size__",
             "cleanup",
             "__cleanup__",
+            "ifunc",
+            "__ifunc__",
         ] {
             let table = StringTable::new();
             let sid = id(&table, s);

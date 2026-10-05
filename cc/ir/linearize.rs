@@ -2916,6 +2916,37 @@ impl<'a> Linearizer<'a> {
         addr
     }
 
+    /// Whether a value of `typ` is carried as the address of its storage: a
+    /// complex number, a vector, or an aggregate that does not travel by
+    /// value ([`Self::aggregate_travels_by_value`]).
+    fn value_is_storage(&self, typ: TypeId) -> bool {
+        self.types.is_complex(typ)
+            || self.types.is_vector(typ)
+            || matches!(self.types.kind(typ), TypeKind::Struct | TypeKind::Union)
+                && !self.aggregate_travels_by_value(typ)
+    }
+
+    /// `value`, a value of type `typ`, in storage of its own: when
+    /// [`Self::value_is_storage`], a copy in a frame temporary that lives as
+    /// long as the function, and otherwise `value` itself.
+    ///
+    /// For a value that has to outlive whatever storage it was read from --
+    /// an object whose lifetime ends, or that a cleanup is about to change --
+    /// before anything has used it.
+    pub(crate) fn detach_value(&mut self, value: PseudoId, typ: TypeId) -> PseudoId {
+        if !self.value_is_storage(typ) {
+            return value;
+        }
+        let copy = self.frame_temp_addr("__value_copy", typ);
+        let bytes = self.types.size_bytes(typ) as i64;
+        let vol = BlockVolatility {
+            dst: false,
+            src: self.types.contains_volatile(typ),
+        };
+        self.emit_block_copy(copy, value, bytes, vol);
+        copy
+    }
+
     /// Whether a struct or union of this type travels in the IR as its value
     /// rather than its address: it does when it fits in one register, the
     /// threshold [`Self::read_object`] applies. A complex value always
@@ -2934,7 +2965,15 @@ impl<'a> Linearizer<'a> {
     /// decays (C17 6.3.2.1p3, 7.16p3), a function designator converts to a
     /// pointer (6.3.2.1p4), and an aggregate that does not travel by value
     /// ([`Self::aggregate_travels_by_value`]) is used where it lies.
+    ///
+    /// So is a complex object, at every size: every consumer of a complex
+    /// value reads its halves through an address. Reading one as a single
+    /// wide load handed `({ v; })` and `(0, v)` the number's bits where its
+    /// address was wanted, and they were dereferenced.
     pub(crate) fn object_reads_as_address(&self, typ: TypeId) -> bool {
+        if self.types.is_complex(typ) {
+            return true;
+        }
         match self.types.kind(typ) {
             TypeKind::Array | TypeKind::Function => true,
             TypeKind::VaList => !self.types.va_list_is_pointer(),
@@ -6870,9 +6909,13 @@ impl<'a> Linearizer<'a> {
                 }
                 // The result is the value of the final expression, computed
                 // before the scope ends: it may read the VLA being released.
+                // A value carried as an address is copied out of the block
+                // first. It may name an object declared here, whose slot is
+                // free for reuse once the block ends -- `f(({ struct S x =
+                // ...; x; }), ({ struct S y = ...; y; }))` passed `y` twice
+                // -- or one a cleanup run below changes.
                 let value = self.linearize_expr(result);
-                let value =
-                    self.outlive_cleanups(value, self.expr_type(result), scope.cleanup_entry);
+                let value = self.detach_value(value, self.expr_type(result));
                 self.switch_stack = enclosing_switches;
                 self.pop_scope(scope);
                 value

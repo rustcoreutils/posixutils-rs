@@ -34,12 +34,12 @@
 //! of that stack is still in scope where the exit lands? -- and runs the rest
 //! through [`Linearizer::run_cleanups_above`].
 
-use super::linearize::{BlockVolatility, Linearizer, Scope};
+use super::linearize::{Linearizer, Scope};
 use super::{Instruction, PseudoId};
 use crate::parse::ast::{Expr, InitDeclarator};
 use crate::strings::StringId;
 use crate::symbol::SymbolId;
-use crate::types::{TypeId, TypeKind};
+use crate::types::TypeId;
 
 /// The cleanup of one variable in scope.
 pub(crate) struct PendingCleanup {
@@ -93,34 +93,19 @@ impl Linearizer<'_> {
 
     /// `value`, a value of type `typ`, made safe from the cleanups above the
     /// first `kept`: a value the IR hands around as the address of its
-    /// storage -- a complex number, a vector, an aggregate wider than a
-    /// register -- is copied out first when one of those could change it,
-    /// as gcc copies a returned variable before its own cleanup runs.
+    /// storage is copied out first when one of those could change it
+    /// ([`Linearizer::detach_value`]), as gcc copies a returned variable
+    /// before its own cleanup runs.
     pub(crate) fn outlive_cleanups(
         &mut self,
         value: PseudoId,
         typ: TypeId,
         kept: usize,
     ) -> PseudoId {
-        if self.cleanups.len() <= kept || !self.value_is_storage(typ) {
+        if self.cleanups.len() <= kept {
             return value;
         }
-        let copy = self.frame_temp_addr("__cleanup_copy", typ);
-        let bytes = self.types.size_bytes(typ) as i64;
-        let vol = BlockVolatility {
-            dst: false,
-            src: self.types.contains_volatile(typ),
-        };
-        self.emit_block_copy(copy, value, bytes, vol);
-        copy
-    }
-
-    /// Whether a value of `typ` is carried as the address of its storage.
-    fn value_is_storage(&self, typ: TypeId) -> bool {
-        self.types.is_complex(typ)
-            || self.types.is_vector(typ)
-            || matches!(self.types.kind(typ), TypeKind::Struct | TypeKind::Union)
-                && !self.aggregate_travels_by_value(typ)
+        self.detach_value(value, typ)
     }
 
     /// Run the cleanup of every variable `exit` leaves the scope of.

@@ -1018,9 +1018,10 @@ fn test_read_object_decides_address_or_value() {
                int i; double d; int *p; int arr[3]; int fn(void);\n\
                __builtin_va_list ap;\n\
                struct E e; struct Z z; struct S4 s4; struct S16 s16;\n\
-               union U8 u8; union U0 u0;\n";
+               union U8 u8; union U0 u0;\n\
+               float _Complex fc; double _Complex dc; _Complex int ci;\n";
     let names = [
-        "i", "d", "p", "arr", "fn", "ap", "e", "z", "s4", "s16", "u8", "u0",
+        "i", "d", "p", "arr", "fn", "ap", "e", "z", "s4", "s16", "u8", "u0", "fc", "dc", "ci",
     ];
     let expect = [
         (false, false), // i
@@ -1035,10 +1036,24 @@ fn test_read_object_decides_address_or_value() {
         (true, false),  // s16
         (false, true),  // u8
         (true, false),  // u0: zero-sized
+        (true, false),  // fc: complex, though it fits in a register
+        (true, false),  // dc
+        (true, false),  // ci
     ];
-    let got = read_object_decisions(src, &Target::new(Arch::X86_64, Os::Linux), &names);
-    for ((name, want), have) in names.iter().zip(expect).zip(got) {
-        assert_eq!(have, want, "{name}: (reads as address, travels by value)");
+    for target in [
+        Target::new(Arch::X86_64, Os::Linux),
+        Target::new(Arch::Aarch64, Os::Linux),
+    ] {
+        let got = read_object_decisions(src, &target, &names);
+        for ((name, want), have) in names.iter().zip(expect).zip(got) {
+            // Only `ap` differs: AAPCS64's va_list is a struct.
+            let want = if *name == "ap" && target.arch == Arch::Aarch64 {
+                have
+            } else {
+                want
+            };
+            assert_eq!(have, want, "{name}: (reads as address, travels by value)");
+        }
     }
 
     // Where `va_list` is itself a pointer it is read like one.
@@ -1048,6 +1063,62 @@ fn test_read_object_decides_address_or_value() {
         &["ap"],
     );
     assert_eq!(got, [(false, false)], "a pointer va_list is loaded");
+}
+
+/// A statement expression's value is out of the block before the block's
+/// objects die: when it is carried as an address -- a struct wider than a
+/// register, a complex number, a vector -- nothing after `x`'s
+/// `lifetime.end` reads `x`, whose slot the next object may share. An
+/// eight-byte struct travels as its value and needs no copy.
+#[test]
+fn test_stmt_expr_value_is_read_before_its_block_ends() {
+    let src = "struct S24 { long a, b, c; }; struct S8 { int a, b; };\n\
+               typedef int v4 __attribute__((vector_size(16)));\n\
+               struct S24 g(void) { return ({ struct S24 x = {1, 2, 3}; x; }); }\n\
+               double _Complex h(void) { return ({ double _Complex x = 1.0; x; }); }\n\
+               float _Complex k(void) { return ({ float _Complex x = 1.0f; x; }); }\n\
+               v4 v(void) { return ({ v4 x = {1, 2, 3, 4}; x; }); }\n\
+               struct S8 s(void) { return ({ struct S8 x = {1, 2}; x; }); }\n";
+    for target in [
+        Target::new(Arch::X86_64, Os::Linux),
+        Target::new(Arch::Aarch64, Os::Linux),
+    ] {
+        let module = linearize_source(src, &target);
+        for name in ["g", "h", "k", "v", "s"] {
+            let func = module
+                .functions
+                .iter()
+                .find(|f| f.name == name)
+                .expect(name);
+            let x = func
+                .locals
+                .iter()
+                .find(|(n, _)| n.starts_with("x."))
+                .map(|(_, l)| l.sym)
+                .expect("x");
+            let insns: Vec<&Instruction> =
+                func.blocks.iter().flat_map(|bb| bb.insns.iter()).collect();
+            let mut names_x = vec![x];
+            for insn in &insns {
+                if insn.op == Opcode::SymAddr && insn.src.first() == Some(&x) {
+                    names_x.extend(insn.target);
+                }
+            }
+            let end = insns
+                .iter()
+                .position(|i| i.op == Opcode::LifetimeEnd && i.extra().lifetime_of == Some(x))
+                .unwrap_or_else(|| panic!("{name}: x's lifetime ends in the block"));
+            for insn in &insns[end + 1..] {
+                assert!(
+                    !insn.src.iter().any(|p| names_x.contains(p)),
+                    "{name} on {:?}: {insn:?} reads x after its lifetime ended",
+                    target.arch
+                );
+            }
+            let copied = func.locals.keys().any(|n| n.starts_with("__value_copy"));
+            assert_eq!(copied, name != "s", "{name}: copied out of the block");
+        }
+    }
 }
 
 /// No access to a zero-sized object moves any bits: every load and store in

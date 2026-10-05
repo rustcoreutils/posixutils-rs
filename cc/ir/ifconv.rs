@@ -33,7 +33,10 @@
 // any other, which is what `Instruction::is_memory_barrier()` requires.
 //
 
-use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
+use super::facts::{CmpFacts, ConstMap};
+use super::{BasicBlockId, Function, Instruction, NanCompare, Opcode, PseudoId};
+use crate::arch::mapping::has_quiet_relational;
+use crate::types::TypeTable;
 use std::collections::{HashSet, VecDeque};
 
 /// Whether `insn` may be executed on a path that would not have run it.
@@ -47,14 +50,16 @@ use std::collections::{HashSet, VecDeque};
 /// divisor -- and so are the shifts, whose behaviour past the operand width is
 /// undefined. Neither is needed for the shape this pass exists for.
 ///
-/// A float comparison is listed because every one that reaches this pass is
-/// emitted as a *quiet* compare -- `ucomis*` and `fucomip` on x86-64, `fcmp`
-/// on aarch64 -- which raises nothing for a quiet NaN, so evaluating one on a
-/// path that would not have cannot set a flag the program could observe.
-/// (Annex F leaves signaling NaNs unspecified.) The comparisons that are
-/// library calls, binary128 `long double` on aarch64, have already been
-/// rewritten into `Call`s by the time this runs.
-fn is_speculatable(insn: &Instruction) -> bool {
+/// A float comparison is listed where it raises nothing
+/// ([`Instruction::may_raise_fp_exception`], the one rule every pass that
+/// speculates asks): a *quiet* one raises nothing for a quiet NaN, so
+/// evaluating one on a path that would not have cannot set a flag the
+/// program could observe. A signaling one -- C's `<` -- raises invalid for a
+/// NaN and is not; see [`Speculation::relaxes`] for when it may go anyway.
+/// Float arithmetic and conversions are not listed at all: most can raise
+/// (an overflow, an inexact result, invalid), and the exact ones are not
+/// needed for the shape this pass exists for.
+fn is_speculatable(insn: &Instruction, types: &TypeTable) -> bool {
     matches!(
         insn.op,
         Opcode::Nop
@@ -72,7 +77,52 @@ fn is_speculatable(insn: &Instruction) -> bool {
             | Opcode::Zext
             | Opcode::Sext
             | Opcode::Select
-    ) || insn.op.is_comparison()
+    ) || insn.op.is_int_comparison()
+        || (insn.op.is_float_comparison() && !insn.may_raise_fp_exception(types))
+}
+
+/// What is known while diamonds are collapsed: enough to tell when a
+/// signaling comparison may be speculated as its quiet twin.
+struct Speculation<'a> {
+    types: &'a TypeTable,
+    consts: ConstMap,
+    cmps: CmpFacts,
+}
+
+impl Speculation<'_> {
+    /// Whether `insn`, a signaling float comparison in an arm reached when
+    /// `cond` is `arm_on_true`, may run unconditionally as its quiet twin.
+    ///
+    /// The two give the same answer always, and raise the same exceptions
+    /// for ordered operands; they differ only on an unordered pair. So when
+    /// reaching the arm proves the pair ordered -- `isunordered(x, y) ||
+    /// x < y`, `(x < y) && (x > y)` -- the quiet one stands in for the
+    /// signaling one where the arm ran, and raises nothing where it did not.
+    /// Speculating the signaling one would raise invalid for
+    /// `isunordered(x, y) || x < y` with a NaN, which never evaluates
+    /// `x < y`. `isnan(x) || x < y` proves nothing about `y`, and keeps its
+    /// branch.
+    ///
+    /// Not for a format with no quiet relational of its own (binary128),
+    /// whose guarded form `emit_compare` built on purpose.
+    fn relaxes(&self, insn: &Instruction, cond: PseudoId, arm_on_true: bool) -> bool {
+        let (Some(cmp), Some(operand), [lhs, rhs]) = (
+            insn.op.float_cmp(),
+            insn.operand_type(),
+            insn.src.as_slice(),
+        ) else {
+            return false;
+        };
+        cmp.nan() == NanCompare::Signaling
+            && has_quiet_relational(self.types, operand)
+            && self.cmps.proves_ordered(
+                &self.consts,
+                cond,
+                arm_on_true,
+                (*lhs, *rhs),
+                insn.operand_width(),
+            )
+    }
 }
 
 /// One recognized diamond.
@@ -99,7 +149,14 @@ struct Diamond {
 /// function after every collapse, and removing each arm as it went, made a
 /// function of n `if` statements n^2. The dead arms are removed once, at the
 /// end.
-pub fn run(func: &mut Function) -> bool {
+pub fn run(func: &mut Function, types: &TypeTable) -> bool {
+    let consts = ConstMap::new(func);
+    let cmps = CmpFacts::new(func, &consts);
+    let mut known = Speculation {
+        types,
+        consts,
+        cmps,
+    };
     let mut queue: VecDeque<BasicBlockId> = func.blocks.iter().map(|b| b.id).collect();
     let mut queued: HashSet<BasicBlockId> = queue.iter().copied().collect();
     let mut dead: HashSet<BasicBlockId> = HashSet::new();
@@ -108,10 +165,10 @@ pub fn run(func: &mut Function) -> bool {
         if dead.contains(&b) {
             continue;
         }
-        let Some(d) = recognize(func, b) else {
+        let Some(d) = recognize(func, b, &known) else {
             continue;
         };
-        collapse(func, &d);
+        collapse(func, &d, &mut known);
         dead.insert(d.arm);
         let outer: Vec<BasicBlockId> = func
             .get_block(d.pred)
@@ -132,7 +189,7 @@ pub fn run(func: &mut Function) -> bool {
 }
 
 /// Whether `pred` ends a diamond this pass can collapse.
-fn recognize(func: &Function, pred: BasicBlockId) -> Option<Diamond> {
+fn recognize(func: &Function, pred: BasicBlockId, known: &Speculation) -> Option<Diamond> {
     let p = func.get_block(pred)?;
     let term = p.insns.last()?;
     if term.op != Opcode::Cbr {
@@ -161,9 +218,11 @@ fn recognize(func: &Function, pred: BasicBlockId) -> Option<Diamond> {
         // Everything but the terminator has to be safe to run unconditionally.
         // A `PhiSource` is bookkeeping rather than a computation and is
         // rewritten by `collapse`, so it is allowed through here.
-        let body_ok = a.insns[..a.insns.len() - 1]
-            .iter()
-            .all(|i| i.op == Opcode::PhiSource || is_speculatable(i));
+        let body_ok = a.insns[..a.insns.len() - 1].iter().all(|i| {
+            i.op == Opcode::PhiSource
+                || is_speculatable(i, known.types)
+                || known.relaxes(i, cond, arm_on_true)
+        });
         if !body_ok {
             continue;
         }
@@ -233,19 +292,27 @@ fn merge_selects(
     Some(selects)
 }
 
-fn collapse(func: &mut Function, d: &Diamond) {
+fn collapse(func: &mut Function, d: &Diamond, known: &mut Speculation) {
     let merge_idx = func.block_index(d.merge).expect("merge exists");
 
     // Move the arm's computation into the predecessor, ahead of its branch.
     // `PhiSource` does not come with it: the phi it fed is about to stop
     // existing.
     let arm_idx = func.block_index(d.arm).expect("arm exists");
+    // A signaling comparison goes as its quiet twin: `recognize` admitted
+    // it only where `Speculation::relaxes` says they are interchangeable.
     let body: Vec<Instruction> = {
         let insns = &func.blocks[arm_idx].insns;
         insns[..insns.len() - 1]
             .iter()
             .filter(|i| i.op != Opcode::PhiSource && i.op != Opcode::Nop)
-            .cloned()
+            .map(|i| {
+                let mut i = i.clone();
+                if let Some(cmp) = i.op.float_cmp() {
+                    i.op = cmp.quiet().into();
+                }
+                i
+            })
             .collect()
     };
     let pred_idx = func.block_index(d.pred).expect("pred exists");
@@ -280,6 +347,8 @@ fn collapse(func: &mut Function, d: &Diamond) {
             typ.expect("a phi carries its type"),
             size,
         );
+        // An outer diamond may branch on it: `a || b || c`.
+        known.cmps.record(&known.consts, insn);
     }
 
     // CFG: the arm is gone, and the merge is reached only from the
@@ -294,6 +363,11 @@ mod tests {
     use crate::ir::{BasicBlock, Pseudo, PseudoId};
     use crate::target::Target;
     use crate::types::TypeTable;
+
+    /// The pass, for the host's types.
+    fn run(func: &mut Function) -> bool {
+        super::run(func, &TypeTable::new(&Target::host()))
+    }
 
     /// `cond ? <arm> : 0` as the front end builds it: a two-block diamond
     /// whose arm computes one instruction and feeds a phi at the merge.
@@ -381,12 +455,12 @@ mod tests {
         );
     }
 
-    /// `(x < y) && (x > y)` over floats: the comparison is a quiet compare,
-    /// so it is speculated like an integer one, and the two relationals land
-    /// side by side where `instcombine` can compare them. Float arithmetic is
-    /// not: a division can raise divide-by-zero.
+    /// A quiet float comparison raises nothing for a quiet NaN, so it is
+    /// speculated like an integer one. A signaling one -- C's `<` -- is not,
+    /// behind a condition that says nothing about its operands. Float
+    /// arithmetic is not either: a division can raise divide-by-zero.
     #[test]
-    fn ifconv_speculates_a_float_comparison_but_not_float_arithmetic() {
+    fn ifconv_speculates_a_quiet_float_comparison_but_not_float_arithmetic() {
         let types = TypeTable::new(&Target::host());
         for op in [
             Opcode::FCmpOEq,
@@ -408,6 +482,23 @@ mod tests {
             let merge = func.get_block(BasicBlockId(2)).expect("merge survives");
             assert_eq!(merge.insns[0].op, Opcode::Select, "{op:?}");
         }
+        for op in [
+            Opcode::FCmpsOLt,
+            Opcode::FCmpsOLe,
+            Opcode::FCmpsOGt,
+            Opcode::FCmpsOGe,
+        ] {
+            let mut arm = Instruction::test_binary(
+                op,
+                PseudoId(2),
+                (PseudoId(0), PseudoId(1)),
+                types.double_id,
+                64,
+            );
+            arm.src_typ = Some(types.double_id);
+            let mut func = diamond(arm);
+            assert!(!run(&mut func), "{op:?} must not be speculated");
+        }
         let fdiv = Instruction::binop(
             Opcode::FDiv,
             PseudoId(2),
@@ -418,6 +509,108 @@ mod tests {
         );
         let mut func = diamond(fdiv);
         assert!(!run(&mut func), "a float division must not be speculated");
+        // Nor anything else that rounds: a product can overflow, a
+        // narrowing conversion too, and `(int)x` is invalid for a NaN.
+        for op in [Opcode::FAdd, Opcode::FSub, Opcode::FMul] {
+            let arm = Instruction::binop(
+                op,
+                PseudoId(2),
+                PseudoId(0),
+                PseudoId(1),
+                types.double_id,
+                64,
+            );
+            let mut func = diamond(arm);
+            assert!(!run(&mut func), "{op:?} must not be speculated");
+        }
+        for (op, from, to) in [
+            (Opcode::FCvtF, types.double_id, types.float_id),
+            (Opcode::FCvtS, types.double_id, types.int_id),
+            (Opcode::SCvtF, types.long_id, types.double_id),
+        ] {
+            let mut arm = Instruction::unop(op, PseudoId(2), PseudoId(0), to, types.size_bits(to));
+            arm.src_typ = Some(from);
+            arm.src_size = 64;
+            assert!(arm.may_raise_fp_exception(&types), "{op:?}");
+            let mut func = diamond(arm);
+            assert!(!run(&mut func), "{op:?} must not be speculated");
+        }
+    }
+
+    /// `f(a, b)` from `src` after one run of the pass: how many branches it
+    /// still has, and the float comparisons it computes.
+    fn after_ifconv(src: &str, target: &Target) -> (usize, Vec<Opcode>) {
+        let (mut module, types) =
+            crate::ir::linearize::test_linearize::linearize_source_with_types(src, target);
+        let func = module
+            .functions
+            .iter_mut()
+            .find(|f| f.name == "f")
+            .expect("f");
+        super::run(func, &types);
+        let ops: Vec<Opcode> = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.insns.iter())
+            .map(|i| i.op)
+            .collect();
+        let branches = ops.iter().filter(|op| **op == Opcode::Cbr).count();
+        (
+            branches,
+            ops.into_iter()
+                .filter(|op| op.is_float_comparison())
+                .collect(),
+        )
+    }
+
+    /// A signaling comparison is speculated only as its quiet twin, and only
+    /// where reaching the arm proves its operands ordered: there the two
+    /// raise the same, and off the arm the quiet one raises nothing. With a
+    /// NaN `a`, `isnan(a) || a < b` never evaluates `a < b`, and must not
+    /// raise invalid; `(a < b) && (a > b)` evaluates `a > b` only once
+    /// `a < b` has held, which no NaN does.
+    #[test]
+    fn ifconv_speculates_a_signaling_comparison_only_where_its_operands_are_ordered() {
+        use Opcode::*;
+        let host = Target::host();
+        let fold = |cond: &str| {
+            let src = format!("int f(double a, double b, double c, int k) {{ return {cond}; }}");
+            after_ifconv(&src, &host)
+        };
+        for (cond, want) in [
+            ("(a < b) && (a > b)", vec![FCmpsOLt, FCmpOGt]),
+            ("(a < b) && (b < a)", vec![FCmpsOLt, FCmpOLt]),
+            (
+                "__builtin_isunordered(a, b) || a >= b",
+                vec![FCmpONe, FCmpONe, FCmpOGe],
+            ),
+            (
+                "!__builtin_isunordered(b, a) && a <= b",
+                vec![FCmpONe, FCmpONe, FCmpOLe],
+            ),
+        ] {
+            assert_eq!(fold(cond), (0, want), "{cond}");
+        }
+        for (cond, want) in [
+            // The arm runs when `a < b` failed, which a NaN does.
+            ("(a < b) || (a > b)", vec![FCmpsOLt, FCmpsOGt]),
+            // Only `a` is known not to be a NaN.
+            ("__builtin_isnan(a) || a < b", vec![FCmpONe, FCmpsOLt]),
+            ("k && a < b", vec![FCmpsOLt]),
+            // Another pair.
+            ("(a < c) && (a > b)", vec![FCmpsOLt, FCmpsOGt]),
+        ] {
+            assert_eq!(fold(cond), (1, want), "{cond}");
+        }
+        // binary128 keeps the signaling call behind its branch: it has no
+        // quiet relational to relax to.
+        let a64 = Target::new(crate::target::Arch::Aarch64, crate::target::Os::Linux);
+        let src = "int f(long double a, long double b) \
+                   { return __builtin_isunordered(a, b) || a >= b; }";
+        assert_eq!(
+            after_ifconv(src, &a64),
+            (1, vec![FCmpONe, FCmpONe, FCmpsOGe])
+        );
     }
 
     /// The guarantee C makes: the right operand of `&&` does not run when the

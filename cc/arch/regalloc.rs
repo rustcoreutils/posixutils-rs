@@ -1061,7 +1061,7 @@ pub fn live_out_anywhere(live_out: &[HashSet<PseudoId>]) -> HashSet<PseudoId> {
 /// 3. It's the target of an FP conversion (FCvtF, UCvtF, SCvtF)
 /// 4. It has a float type (excluding FP comparisons which produce integer results)
 ///
-/// Note: FP comparisons (FCmpOxx) produce integer results (0 or 1), so their
+/// Note: FP comparisons (`Opcode::is_float_comparison`) produce integer results (0 or 1), so their
 /// targets should NOT be in FP registers.
 /// Every argument pseudo with the declared type of the parameter it carries.
 ///

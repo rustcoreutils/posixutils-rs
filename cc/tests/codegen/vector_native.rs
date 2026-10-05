@@ -58,6 +58,7 @@ const INT_SHAPES: &[Shape] = &[
     int("v2du", "unsigned long long", 2, "long long"),
     int("v8qi", "signed char", 8, "signed char"),
     int("v4hi", "short", 4, "short"),
+    int("v4hu", "unsigned short", 4, "short"),
     int("v2si", "int", 2, "int"),
     int("v2su", "unsigned", 2, "int"),
     int("v1di", "long long", 1, "long long"),
@@ -191,6 +192,7 @@ fn native_program() -> String {
     matrix(&mut p, INT_SHAPES, INT_OPS);
     matrix(&mut p, FLOAT_SHAPES, FLOAT_OPS);
     shuffles_and_conversions(&mut p);
+    pressure(&mut p);
     p.finish()
 }
 
@@ -233,6 +235,8 @@ const INT_OPS: &[(&str, &str, &str, &str)] = &[
     ("a != b", "(M)(a[i] != b[i] ? -1 : 0)", "M", ""),
     ("a < b", "(M)(a[i] < b[i] ? -1 : 0)", "M", ""),
     ("a >= b", "(M)(a[i] >= b[i] ? -1 : 0)", "M", ""),
+    ("a > b", "(M)(a[i] > b[i] ? -1 : 0)", "M", ""),
+    ("a <= b", "(M)(a[i] <= b[i] ? -1 : 0)", "M", ""),
     ("a > s", "(M)(a[i] > s ? -1 : 0)", "M", ""),
 ];
 
@@ -381,6 +385,73 @@ fn shuffles_and_conversions(p: &mut Program) {
         ));
         p.checks.push(format!("convert {from} to {to}"));
     }
+}
+
+/// Fourteen vectors live across 32-bit multiplies and unsigned orders of
+/// words and dwords: every XMM register the allocator hands out holds one,
+/// so a temporary that SSE2's multi-instruction forms of those write
+/// without the allocator knowing destroys a value the sum then reads.
+const PRESSURE: &str = r#"
+static v4si pressure_src[16];
+static unsigned pressure_word_order(const v4si *x, const v4si *y, int i, int le) {
+    unsigned short hx[8], hy[8], m[8];
+    memcpy(hx, x, 16);
+    memcpy(hy, y, 16);
+    for (int w = 0; w < 8; w++)
+        m[w] = (le ? hx[w] <= hy[w] : hx[w] < hy[w]) ? 0xffff : 0;
+    unsigned out[4];
+    memcpy(out, m, 16);
+    return out[i];
+}
+static int tID(void) {
+    for (int j = 0; j < 16; j++)
+        for (int i = 0; i < 4; i++)
+            pressure_src[j][i] = (int)ival[(j * 5 + i * 3 + j / 4) % NI];
+    for (int k = 0; k < 16; k++) {
+        volatile v4si *s = pressure_src;
+#define S(j) ((v4su)s[(k + (j)) % 16])
+        /* Right-nested, so each left term is held while the rest -- the
+           multiplies and orders innermost -- is computed. */
+        v4su sum = S(0) + ((S(1) << 1) + ((S(2) << 2) + ((S(3) << 3)
+            + ((S(4) << 4) + ((S(5) << 5) + ((S(6) << 6) + ((S(7) << 7)
+            + ((S(8) << 8) + ((S(9) << 9) + ((S(10) << 10) + ((S(11) << 11)
+            + ((S(12) << 12) + ((S(13) << 13)
+            + (S(0) * S(1) + (((v4su)(S(2) > S(3)) << 1)
+            + (((v4su)((v8hu)S(4) <= (v8hu)S(5)) << 2)
+            + (((v4su)(S(6) >= S(7)) << 3)
+            + (((v4su)((v8hu)S(8) < (v8hu)S(9)) << 4)
+            + ((S(10) * S(11)) << 5)))))))))))))))))));
+#undef S
+        for (int i = 0; i < 4; i++) {
+#define A(j) (unsigned)pressure_src[(k + (j)) % 16][i]
+#define V(j) &pressure_src[(k + (j)) % 16]
+            unsigned want = A(0) * A(1) + ((A(2) > A(3) ? ~0u : 0) << 1)
+                + (pressure_word_order(V(4), V(5), i, 1) << 2)
+                + ((A(6) >= A(7) ? ~0u : 0) << 3)
+                + (pressure_word_order(V(8), V(9), i, 0) << 4)
+                + ((A(10) * A(11)) << 5);
+            unsigned mix = 0;
+            for (int j = 0; j < 14; j++)
+                mix += A(j) << j;
+            want += mix;
+#undef A
+#undef V
+            if ((unsigned)sum[i] != want) return k * 64 + i + 1;
+        }
+    }
+    return 0;
+}
+"#;
+
+/// The [`PRESSURE`] check.
+fn pressure(p: &mut Program) {
+    p.typedef("int", "v4si", 16);
+    p.typedef("unsigned", "v4su", 16);
+    p.typedef("unsigned short", "v8hu", 16);
+    let id = p.checks.len();
+    p.out.push_str(&PRESSURE.replace("tID", &format!("t{id}")));
+    p.checks
+        .push("vectors live across multiplies and unsigned orders".into());
 }
 
 /// The lane matrices again with the `-m` flags that widen what x86-64 has

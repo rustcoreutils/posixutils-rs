@@ -152,13 +152,19 @@ fn test_native_splat_shift_and_multiply() {
     assert!(simds(right, &x86).is_empty(), "SSE2 has no per-lane counts");
     assert_eq!(simds(right, &a64), [SimdOp::Lsr]);
     let mul = "void f(v4si *d, v4si *a, v4si *b) { *d = *a * *b; }";
-    assert!(simds(mul, &x86).is_empty(), "SSE2 multiplies words only");
-    assert_eq!(simds(mul, &a64), [SimdOp::Mul]);
+    for t in [&x86, &a64] {
+        assert_eq!(simds(mul, t), [SimdOp::Mul]);
+    }
+    let mulq = "typedef long long v2di __attribute__((vector_size(16)));\n\
+                void f(v2di *d, v2di *a, v2di *b) { *d = *a * *b; }";
+    assert!(simds(mulq, &x86).is_empty(), "SSE2 multiplies no qwords");
+    assert!(simds(mulq, &a64).is_empty(), "NEON multiplies no qwords");
 }
 
 /// A comparison of vectors is one packed compare giving the mask: `<` and
 /// `<=` are `>` and `>=` of the operands swapped, and the lane type of a
-/// mixed-signedness compare is unsigned. SSE2 has no unsigned order.
+/// mixed-signedness compare is unsigned. SSE2 orders unsigned dwords too,
+/// though not qwords.
 #[test]
 fn test_native_comparisons() {
     use crate::ir::SimdOp;
@@ -203,7 +209,7 @@ fn test_native_comparisons() {
         (
             "typedef unsigned v4su __attribute__((vector_size(16)));\n\
              void f(v4si *d, v4si *a, v4su *b) { *d = *a > *b; }",
-            None,
+            Some(SimdOp::CmpGtU),
             SimdOp::CmpGtU,
         ),
     ] {

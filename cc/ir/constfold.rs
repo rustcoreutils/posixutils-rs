@@ -28,7 +28,7 @@ use crate::float::{FloatVal, FpFormat};
 
 use std::cmp::Ordering;
 
-use super::{Instruction, Opcode};
+use super::{FloatCmp, Instruction, Opcode};
 
 /// Does `v` mean the same thing at `size` bits whether it is read as signed
 /// or as unsigned?
@@ -144,7 +144,8 @@ impl Outcomes {
     /// The exception is `FCmpONe`, which despite its name is C's `!=` -- true
     /// when either operand is a NaN -- and is emitted that way by both
     /// backends: `setne` OR'd with `setp` on x86-64, `cset ne` (which is
-    /// taken on unordered) on aarch64.
+    /// taken on unordered) on aarch64. A signaling comparison and its quiet
+    /// twin are true for the same outcomes.
     pub(crate) fn of_op(op: Opcode) -> Option<(Outcomes, CmpDomain)> {
         const LT: Outcomes = Outcomes::LT;
         const EQ: Outcomes = Outcomes::EQ;
@@ -163,13 +164,19 @@ impl Outcomes {
             Opcode::SetBe => (LT | EQ, unsigned),
             Opcode::SetA => (GT, unsigned),
             Opcode::SetAe => (GT | EQ, unsigned),
-            Opcode::FCmpOEq => (EQ, float),
-            Opcode::FCmpONe => (LT | GT | Outcomes::UN, float),
-            Opcode::FCmpOLt => (LT, float),
-            Opcode::FCmpOLe => (LT | EQ, float),
-            Opcode::FCmpOGt => (GT, float),
-            Opcode::FCmpOGe => (GT | EQ, float),
-            _ => return None,
+            _ => {
+                // A signaling relational is true for the same outcomes as
+                // its quiet twin: what it raises is not part of its answer.
+                let mask = match op.float_cmp()? {
+                    FloatCmp::Eq => EQ,
+                    FloatCmp::Ne => LT | GT | Outcomes::UN,
+                    FloatCmp::Lt(_) => LT,
+                    FloatCmp::Le(_) => LT | EQ,
+                    FloatCmp::Gt(_) => GT,
+                    FloatCmp::Ge(_) => GT | EQ,
+                };
+                (mask, float)
+            }
         })
     }
 
@@ -836,9 +843,23 @@ mod tests {
             (Opcode::FCmpOLe, Opcode::FCmpOGe),
             (Opcode::FCmpOEq, Opcode::FCmpOEq),
             (Opcode::FCmpONe, Opcode::FCmpONe),
+            (Opcode::FCmpsOLt, Opcode::FCmpsOGt),
+            (Opcode::FCmpsOLe, Opcode::FCmpsOGe),
         ] {
             let (m, d) = Outcomes::of_op(op).unwrap();
             assert_eq!(Some((m.mirror(), d)), Outcomes::of_op(swapped), "{op:?}");
+        }
+    }
+
+    /// A signaling comparison is true for exactly the outcomes its quiet
+    /// twin is: what it raises is not part of its answer.
+    #[test]
+    fn a_signaling_comparison_has_its_quiet_twins_outcomes() {
+        for &op in Opcode::ALL {
+            if let Some(cmp) = op.float_cmp() {
+                let quiet = Opcode::from(cmp.quiet());
+                assert_eq!(Outcomes::of_op(op), Outcomes::of_op(quiet), "{op:?}");
+            }
         }
     }
 

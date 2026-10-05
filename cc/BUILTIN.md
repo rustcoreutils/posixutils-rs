@@ -349,10 +349,13 @@ arithmetic conversions; each is evaluated once, because the relation is an
 `ExprKind::FpCompare` desugared in the linearizer. glibc's `<math.h>` defines
 `isgreater` and the rest as these builtins.
 
-c17 emits the quiet compare (`ucomis*`, `fucomip`, `fcmp`) for these and for
-the ordinary relational operators alike, so the operators do not raise
-`FE_INVALID` for a quiet NaN either, and `iseqsig` does not raise it for an
-unordered pair as C23 7.12.17.1 requires. The results are exact.
+These are the quiet compares (`ucomis*`, `fucomip`, `fcmp`), which raise
+nothing for a quiet NaN; the ordinary relational operators are the signaling
+ones (`comis*`, `fcomip`, `fcmpe`), which raise `FE_INVALID` (C17 F.9.3). On
+binary128, where libgcc's ordering helpers all signal, a quiet relation is the
+signaling helper behind an unordered test, as gcc builds it. `iseqsig` is the
+quiet equality, so it does not raise `FE_INVALID` for an unordered pair as
+C23 7.12.17.1 requires. The results are exact.
 
 ## Stack Introspection and Non-Local Jumps
 

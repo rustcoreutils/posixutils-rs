@@ -1265,9 +1265,9 @@ impl<'a> Parser<'a> {
         let size_t = self.types.ulong_id;
 
         if self.is_special(b'(') {
-            // Could be sizeof(type) or sizeof(expr)
-            // For now, try to detect if it's a type
-            // This is a simplified check - full implementation needs type lookahead
+            // `sizeof (type-name)`, or a unary expression that begins with a
+            // parenthesized primary: a type name is tried first, and an
+            // expression parsed if it is not one.
             self.advance(); // consume '('
 
             // `sizeof(typeof(E))` is `sizeof(E)`. `sizeof` does not

@@ -977,6 +977,41 @@ impl FpFormat {
         }
     }
 
+    /// Whether every value of `other` is a value of `self`, so converting
+    /// one to `self` is exact and raises nothing (C17 6.3.1.5p1).
+    ///
+    /// The formats nest -- binary16, binary32, binary64, x87 extended,
+    /// binary128 -- each at least as precise as the one before it, with at
+    /// least its exponent range, and so at least its subnormals.
+    pub fn holds(self, other: FpFormat) -> bool {
+        self.precision() >= other.precision()
+            && self.emax() >= other.emax()
+            && self.emin() <= other.emin()
+    }
+
+    /// Whether every value of an integer type `bits` wide is a value of
+    /// `self`, so converting one is exact and raises nothing (C17 6.3.1.4p2):
+    /// its magnitude needs no more significand bits than the format has. A
+    /// signed type's most negative value is a power of two, which needs one.
+    pub fn holds_integer(self, bits: u32, signed: bool) -> bool {
+        let magnitude = if signed { bits.saturating_sub(1) } else { bits };
+        magnitude <= self.precision()
+    }
+
+    /// Whether an integer of magnitude `magnitude` is a value of `self`, so
+    /// converting it is exact and raises nothing: its significant bits fit
+    /// the significand and it is below the format's overflow threshold,
+    /// 2^(emax+1). The format is symmetric, so the sign does not matter; the
+    /// caller reads the magnitude with the signedness of the integer's type.
+    pub fn holds_integer_magnitude(self, magnitude: u128) -> bool {
+        if magnitude == 0 {
+            return true;
+        }
+        let bits = u128::BITS - magnitude.leading_zeros();
+        let significant = bits - magnitude.trailing_zeros();
+        significant <= self.precision() && bits as i32 <= self.emax() + 1
+    }
+
     /// Width of the stored significand field: the fraction, plus the integer
     /// bit in the one format that stores it explicitly.
     fn stored_significand_bits(self) -> u32 {
@@ -2230,6 +2265,57 @@ impl FloatVal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The formats nest, each holding every value of the narrower ones; an
+    /// integer type converts exactly when the significand holds its widest
+    /// magnitude, and an integer value when it holds its significant bits
+    /// below the overflow threshold.
+    #[test]
+    fn fp_format_holds_what_converts_exactly() {
+        use FpFormat::*;
+        let nest = [Binary16, Binary32, Binary64, X87Extended, Binary128];
+        for (i, a) in nest.iter().enumerate() {
+            for (j, b) in nest.iter().enumerate() {
+                assert_eq!(a.holds(*b), i >= j, "{a:?} holds {b:?}");
+            }
+        }
+        assert!(Binary64.holds_integer(32, true));
+        assert!(Binary64.holds_integer(32, false));
+        assert!(!Binary64.holds_integer(64, true));
+        assert!(X87Extended.holds_integer(64, false));
+        assert!(!Binary32.holds_integer(32, true));
+        assert!(Binary32.holds_integer(16, false));
+        assert!(Binary32.holds_integer(25, true));
+        assert!(!Binary32.holds_integer(25, false));
+        for (fmt, magnitude, holds) in [
+            (Binary32, 0, true),
+            (Binary32, 16_777_216, true),
+            (Binary32, 16_777_217, false),
+            (Binary32, 1 << 100, true),
+            (Binary32, i128::MIN.unsigned_abs(), true),
+            (Binary16, i128::MIN.unsigned_abs(), false),
+            (Binary16, 65504, true),
+            (Binary16, 65536, false),
+            (Binary16, 2049, false),
+            (Binary64, i64::MAX as u128, false),
+            (X87Extended, i64::MAX as u128, true),
+            (Binary128, i128::MIN.unsigned_abs(), true),
+            // `unsigned __int128` magnitudes at and above 2^127.
+            (Binary32, 1 << 127, true),
+            (Binary64, (1 << 127) + 1, false),
+            (Binary64, u128::MAX, false),
+            (Binary32, u128::MAX, false),
+            (Binary128, u128::MAX, false),
+            (Binary64, u128::MAX << 75, true),
+            (Binary32, u128::MAX << 104, true),
+        ] {
+            assert_eq!(
+                fmt.holds_integer_magnitude(magnitude),
+                holds,
+                "{fmt:?} {magnitude}"
+            );
+        }
+    }
     use ComplexDivision::Libgcc;
 
     /// libgcc's `__div?c3` with separate steps, which most of these tests

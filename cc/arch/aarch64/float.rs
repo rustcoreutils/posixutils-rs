@@ -14,7 +14,7 @@ use super::lir::{Aarch64Inst, GpOperand, MemAddr};
 use super::regalloc::{Loc, Reg, VReg};
 use crate::arch::lir::{CondCode, FpSize, OperandSize, Symbol};
 use crate::float::IntegralRounding;
-use crate::ir::{Instruction, Opcode, PseudoId};
+use crate::ir::{FloatCmp, Instruction, Opcode, PseudoId};
 use crate::types::{TypeId, TypeKind, TypeTable};
 
 impl Aarch64CodeGen {
@@ -682,13 +682,18 @@ impl Aarch64CodeGen {
             Some(t) => t,
             None => return,
         };
+        let Some(cmp) = insn.op.float_cmp() else {
+            return;
+        };
 
         // Load operands to FP registers
         self.emit_fp_move(src1, VReg::V17, operand, size, types);
         self.emit_fp_move(src2, VReg::V18, operand, size, types);
 
-        // Perform comparison
+        // `fcmpe` for C's relational operators, `fcmp` for the rest: NZCV
+        // is the same, only a quiet NaN's invalid differs.
         self.push_lir(Aarch64Inst::Fcmp {
+            nan: cmp.nan(),
             size: fp_size,
             src1: VReg::V17,
             src2: VReg::V18,
@@ -710,14 +715,13 @@ impl Aarch64CodeGen {
         //   OGe: use 'ge' (N=V) — NaN has N≠V → false ✓
         //   OEq: use 'eq' (Z=1) — NaN has Z=0 → false ✓
         //   ONe: use 'ne' (Z=0) — NaN has Z=0 → true ✓ (correct for unordered not-equal)
-        let cond = match insn.op {
-            Opcode::FCmpOEq => CondCode::Eq,
-            Opcode::FCmpONe => CondCode::Ne,
-            Opcode::FCmpOLt => CondCode::Ult, // 'lo' = C clear, NaN-safe
-            Opcode::FCmpOLe => CondCode::Ule, // 'ls' = C=0 OR Z=1, NaN-safe
-            Opcode::FCmpOGt => CondCode::Sgt, // 'gt' = Z=0 AND N=V, NaN-safe
-            Opcode::FCmpOGe => CondCode::Sge, // 'ge' = N=V, NaN-safe
-            _ => return,
+        let cond = match cmp {
+            FloatCmp::Eq => CondCode::Eq,
+            FloatCmp::Ne => CondCode::Ne,
+            FloatCmp::Lt(_) => CondCode::Ult, // 'lo' = C clear, NaN-safe
+            FloatCmp::Le(_) => CondCode::Ule, // 'ls' = C=0 OR Z=1, NaN-safe
+            FloatCmp::Gt(_) => CondCode::Sgt, // 'gt' = Z=0 AND N=V, NaN-safe
+            FloatCmp::Ge(_) => CondCode::Sge, // 'ge' = N=V, NaN-safe
         };
 
         self.push_lir(Aarch64Inst::Cset { cond, dst: dst_reg });

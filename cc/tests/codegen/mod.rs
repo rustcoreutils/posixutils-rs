@@ -28,6 +28,8 @@ mod cross_abi_types;
 mod cross_abi_varargs;
 mod determinism;
 mod floating;
+mod fp_compare_traps;
+mod fp_untaken_arms;
 mod inline_asm;
 mod inlining;
 mod int128;

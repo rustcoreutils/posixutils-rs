@@ -193,7 +193,7 @@ const PASSES: [Pass; 12] = [
     // `ifconv` collapses a short-circuit diamond into a `Select` in one
     // block, which is what makes the two relationals inside it comparable
     // at all.
-    ("ifconv", |f, _| ifconv::run(f)),
+    ("ifconv", |f, c| ifconv::run(f, c.types)),
     // `sccp` proves branches dead, which `instcombine` cannot, and leaves
     // behind `Copy` from a constant -- exactly the shape `instcombine`'s
     // `ConstMap` follows.

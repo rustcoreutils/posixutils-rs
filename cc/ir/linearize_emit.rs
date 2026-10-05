@@ -10,7 +10,9 @@
 
 use super::linearize::{BlockVolatility, LocalBinding, ObjectPlace, Storage};
 use super::memexpand::{self, BlockOp};
-use super::{BasicBlockId, CallAbiInfo, Instruction, Opcode, Pseudo, PseudoId};
+use super::{
+    BasicBlockId, CallAbiInfo, FloatCmp, Instruction, NanCompare, Opcode, Pseudo, PseudoId,
+};
 use crate::abi::get_abi_for_conv;
 use crate::constexpr::ConstScope;
 use crate::diag::{error, Position};
@@ -155,7 +157,7 @@ pub(crate) fn compound_assign_opcode(types: &TypeTable, op: AssignOp, typ: TypeI
                 Opcode::DivS
             }
         }
-        // Modulo not supported for floats.
+        // `%=` takes integer operands only (C17 6.5.5p2).
         AssignOp::ModAssign => {
             if is_unsigned {
                 Opcode::ModU
@@ -193,35 +195,156 @@ struct ComplexHalfOps {
 }
 
 /// The floating comparison C's relational or equality operator `op` is.
+///
+/// The relational operators are IEEE 754's *signaling* predicates under
+/// Annex F (C17 F.9.3): `NaN < 1.0` is false and raises invalid. Equality is
+/// quiet. The one place a C operator becomes a float comparison, so the one
+/// place that decides which.
 pub(crate) fn float_comparison(op: BinaryOp) -> Option<Opcode> {
-    Some(match op {
-        BinaryOp::Lt => Opcode::FCmpOLt,
-        BinaryOp::Gt => Opcode::FCmpOGt,
-        BinaryOp::Le => Opcode::FCmpOLe,
-        BinaryOp::Ge => Opcode::FCmpOGe,
-        BinaryOp::Eq => Opcode::FCmpOEq,
-        BinaryOp::Ne => Opcode::FCmpONe,
+    use NanCompare::Signaling;
+    Some(Opcode::from(match op {
+        BinaryOp::Lt => FloatCmp::Lt(Signaling),
+        BinaryOp::Gt => FloatCmp::Gt(Signaling),
+        BinaryOp::Le => FloatCmp::Le(Signaling),
+        BinaryOp::Ge => FloatCmp::Ge(Signaling),
+        BinaryOp::Eq => FloatCmp::Eq,
+        BinaryOp::Ne => FloatCmp::Ne,
         _ => return None,
-    })
+    }))
+}
+
+/// The opcode C's binary operator `op` is when its operands have been
+/// converted to `operand_typ`: the one place that decides, for
+/// [`super::linearize::Linearizer::emit_binary`] which emits it and for
+/// `is_pure_expr` which asks whether it may run where the program would not.
+///
+/// Not for `&&` and `||`, which are control flow rather than an opcode.
+pub(crate) fn binary_opcode(types: &TypeTable, op: BinaryOp, operand_typ: TypeId) -> Opcode {
+    let is_float = types.is_float(operand_typ);
+    // A pointer is not an integer type, so `is_unsigned` says false for
+    // one -- but C17 6.5.8 compares pointers by address, and an address is
+    // unsigned. Taking the signed answer emitted `setl` where gcc emits
+    // `setb`, which differs for any pair straddling the sign bit. The
+    // arithmetic opcodes below are unreachable for a pointer operand, so
+    // one predicate serves both.
+    let is_unsigned =
+        types.is_unsigned(operand_typ) || types.kind(operand_typ) == TypeKind::Pointer;
+
+    if let Some(fcmp) = float_comparison(op).filter(|_| is_float) {
+        fcmp
+    } else {
+        match op {
+            BinaryOp::Add => {
+                if is_float {
+                    Opcode::FAdd
+                } else {
+                    Opcode::Add
+                }
+            }
+            BinaryOp::Sub => {
+                if is_float {
+                    Opcode::FSub
+                } else {
+                    Opcode::Sub
+                }
+            }
+            BinaryOp::Mul => {
+                if is_float {
+                    Opcode::FMul
+                } else {
+                    Opcode::Mul
+                }
+            }
+            BinaryOp::Div => {
+                if is_float {
+                    Opcode::FDiv
+                } else if is_unsigned {
+                    Opcode::DivU
+                } else {
+                    Opcode::DivS
+                }
+            }
+            BinaryOp::Mod => {
+                // `%` takes integer operands only (C17 6.5.5p2); the parser
+                // rejects a floating one, so this is never reached with one.
+                if is_unsigned {
+                    Opcode::ModU
+                } else {
+                    Opcode::ModS
+                }
+            }
+            BinaryOp::Lt => {
+                if is_unsigned {
+                    Opcode::SetB
+                } else {
+                    Opcode::SetLt
+                }
+            }
+            BinaryOp::Gt => {
+                if is_unsigned {
+                    Opcode::SetA
+                } else {
+                    Opcode::SetGt
+                }
+            }
+            BinaryOp::Le => {
+                if is_unsigned {
+                    Opcode::SetBe
+                } else {
+                    Opcode::SetLe
+                }
+            }
+            BinaryOp::Ge => {
+                if is_unsigned {
+                    Opcode::SetAe
+                } else {
+                    Opcode::SetGe
+                }
+            }
+            BinaryOp::Eq => Opcode::SetEq,
+            BinaryOp::Ne => Opcode::SetNe,
+            // LogAnd and LogOr are handled earlier in linearize_expr via
+            // emit_logical_and/emit_logical_or for proper short-circuit evaluation
+            BinaryOp::LogAnd | BinaryOp::LogOr => {
+                unreachable!("LogAnd/LogOr should be handled in ExprKind::Binary")
+            }
+            BinaryOp::BitAnd => Opcode::And,
+            BinaryOp::BitOr => Opcode::Or,
+            BinaryOp::BitXor => Opcode::Xor,
+            BinaryOp::Shl => Opcode::Shl,
+            BinaryOp::Shr => {
+                // Logical shift for unsigned, arithmetic for signed
+                if is_unsigned {
+                    Opcode::Lsr
+                } else {
+                    Opcode::Asr
+                }
+            }
+        }
+    }
 }
 
 /// The one floating comparison a member of the `isgreater` family is, or
 /// `None` for the two that take more than one (`islessgreater`,
 /// `isunordered`).
+///
+/// Quiet, every one: raising nothing for a NaN is what the family is for
+/// (C17 7.12.14).
 pub(crate) fn fp_compare_opcode(cmp: FpCompare) -> Option<Opcode> {
-    Some(match cmp {
-        FpCompare::Greater => Opcode::FCmpOGt,
-        FpCompare::GreaterEqual => Opcode::FCmpOGe,
-        FpCompare::Less => Opcode::FCmpOLt,
-        FpCompare::LessEqual => Opcode::FCmpOLe,
+    use NanCompare::Quiet;
+    Some(Opcode::from(match cmp {
+        FpCompare::Greater => FloatCmp::Gt(Quiet),
+        FpCompare::GreaterEqual => FloatCmp::Ge(Quiet),
+        FpCompare::Less => FloatCmp::Lt(Quiet),
+        FpCompare::LessEqual => FloatCmp::Le(Quiet),
         // C23 7.12.17.1 has `iseqsig` raise `FE_INVALID` for an unordered
-        // pair, quiet NaN included -- the reverse of its siblings. The quiet
-        // compare emitted for it does not raise it for a quiet NaN. The
-        // *answer* is exact; only the exception flag differs -- the same gap
-        // c17's `<` and `>` have, which use this compare too.
-        FpCompare::Equal => Opcode::FCmpOEq,
+        // pair, quiet NaN included -- the reverse of its siblings. The IR
+        // has no signaling equality, so the quiet compare emitted for it does
+        // not raise it for a quiet NaN. The *answer* is exact; only the
+        // exception flag differs.
+        FpCompare::Equal => FloatCmp::Eq,
         FpCompare::LessGreater | FpCompare::Unordered => return None,
-    })
+    }))
 }
 
 /// A controlling expression, evaluated for a branch.
@@ -1129,110 +1252,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         result_typ: TypeId,
         operand_typ: TypeId,
     ) -> PseudoId {
-        let is_float = self.types.is_float(operand_typ);
-        // A pointer is not an integer type, so `is_unsigned` says false for
-        // one -- but C17 6.5.8 compares pointers by address, and an address is
-        // unsigned. Taking the signed answer emitted `setl` where gcc emits
-        // `setb`, which differs for any pair straddling the sign bit. The
-        // arithmetic opcodes below are unreachable for a pointer operand, so
-        // one predicate serves both.
-        let is_unsigned = self.types.is_unsigned(operand_typ)
-            || self.types.kind(operand_typ) == TypeKind::Pointer;
-
         let result = self.alloc_pseudo();
-
-        let opcode = if let Some(fcmp) = float_comparison(op).filter(|_| is_float) {
-            fcmp
-        } else {
-            match op {
-                BinaryOp::Add => {
-                    if is_float {
-                        Opcode::FAdd
-                    } else {
-                        Opcode::Add
-                    }
-                }
-                BinaryOp::Sub => {
-                    if is_float {
-                        Opcode::FSub
-                    } else {
-                        Opcode::Sub
-                    }
-                }
-                BinaryOp::Mul => {
-                    if is_float {
-                        Opcode::FMul
-                    } else {
-                        Opcode::Mul
-                    }
-                }
-                BinaryOp::Div => {
-                    if is_float {
-                        Opcode::FDiv
-                    } else if is_unsigned {
-                        Opcode::DivU
-                    } else {
-                        Opcode::DivS
-                    }
-                }
-                BinaryOp::Mod => {
-                    // Modulo is not supported for floats in hardware - use fmod() library call
-                    // For now, use integer modulo (semantic analysis should catch float % float)
-                    if is_unsigned {
-                        Opcode::ModU
-                    } else {
-                        Opcode::ModS
-                    }
-                }
-                BinaryOp::Lt => {
-                    if is_unsigned {
-                        Opcode::SetB
-                    } else {
-                        Opcode::SetLt
-                    }
-                }
-                BinaryOp::Gt => {
-                    if is_unsigned {
-                        Opcode::SetA
-                    } else {
-                        Opcode::SetGt
-                    }
-                }
-                BinaryOp::Le => {
-                    if is_unsigned {
-                        Opcode::SetBe
-                    } else {
-                        Opcode::SetLe
-                    }
-                }
-                BinaryOp::Ge => {
-                    if is_unsigned {
-                        Opcode::SetAe
-                    } else {
-                        Opcode::SetGe
-                    }
-                }
-                BinaryOp::Eq => Opcode::SetEq,
-                BinaryOp::Ne => Opcode::SetNe,
-                // LogAnd and LogOr are handled earlier in linearize_expr via
-                // emit_logical_and/emit_logical_or for proper short-circuit evaluation
-                BinaryOp::LogAnd | BinaryOp::LogOr => {
-                    unreachable!("LogAnd/LogOr should be handled in ExprKind::Binary")
-                }
-                BinaryOp::BitAnd => Opcode::And,
-                BinaryOp::BitOr => Opcode::Or,
-                BinaryOp::BitXor => Opcode::Xor,
-                BinaryOp::Shl => Opcode::Shl,
-                BinaryOp::Shr => {
-                    // Logical shift for unsigned, arithmetic for signed
-                    if is_unsigned {
-                        Opcode::Lsr
-                    } else {
-                        Opcode::Asr
-                    }
-                }
-            }
-        };
+        let opcode = binary_opcode(self.types, op, operand_typ);
 
         let insn = if opcode.is_comparison() {
             self.compare_insn(opcode, result, (left, right), operand_typ)
@@ -2083,6 +2104,10 @@ impl<'a> super::linearize::Linearizer<'a> {
 
     /// `op` comparing `lhs` and `rhs`, of type `typ` at `size` bits, into a
     /// fresh `int` pseudo. See [`Self::compare_insn`].
+    ///
+    /// A quiet relational of a format that has none of its own -- binary128,
+    /// see `has_quiet_relational` -- is built as gcc builds it: the
+    /// signaling comparison, run only once the operands are known ordered.
     pub(crate) fn emit_compare(
         &mut self,
         op: Opcode,
@@ -2090,6 +2115,23 @@ impl<'a> super::linearize::Linearizer<'a> {
         rhs: PseudoId,
         typ: TypeId,
     ) -> PseudoId {
+        let guarded = op
+            .float_cmp()
+            .filter(|c| c.nan() == NanCompare::Quiet)
+            .and_then(FloatCmp::signaling)
+            .filter(|_| !crate::arch::mapping::has_quiet_relational(self.types, typ));
+        if let Some(signaling) = guarded {
+            let int = self.types.int_id;
+            let size = self.types.size_bits(int);
+            let unordered = self.emit_unordered(lhs, rhs, typ);
+            return self.emit_diamond(
+                unordered,
+                int,
+                size,
+                |lin| lin.emit_const(0, int),
+                |lin| lin.emit_compare(signaling.into(), lhs, rhs, typ),
+            );
+        }
         let dst = self.alloc_pseudo();
         self.emit(self.compare_insn(op, dst, (lhs, rhs), typ));
         dst

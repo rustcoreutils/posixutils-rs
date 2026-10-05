@@ -11,7 +11,8 @@
 //
 
 use super::test_linearize::{
-    has_op, linearize_no_ssa, linearize_source, linearize_source_with_types, test_pos, TestContext,
+    has_op, insns_of, linearize_no_ssa, linearize_source, linearize_source_trapping,
+    linearize_source_with_types, test_pos, TestContext,
 };
 use super::*;
 use crate::parse::ast::{
@@ -499,20 +500,15 @@ fn test_float_comparison() {
     let module = ctx.linearize(&tu);
     let ir = format!("{}", module.display(&ctx.types));
 
-    // Float comparison should produce fcmp instruction
+    // `<` is the signaling comparison (C17 F.9.3), and only that.
     assert!(
-        has_op(
-            &module,
-            &[
-                Opcode::FCmpOEq,
-                Opcode::FCmpONe,
-                Opcode::FCmpOLt,
-                Opcode::FCmpOLe,
-                Opcode::FCmpOGt,
-                Opcode::FCmpOGe
-            ]
-        ),
-        "Float comparison should produce fcmp instruction: {}",
+        has_op(&module, &[Opcode::FCmpsOLt]),
+        "Float `<` should produce fcmps_olt: {}",
+        ir
+    );
+    assert!(
+        !has_op(&module, &[Opcode::FCmpOLt]),
+        "Float `<` must not be the quiet compare: {}",
         ir
     );
 }
@@ -1879,8 +1875,9 @@ fn test_complex_conversions_are_never_scalar() {
 
 /// Two vectors of integer lanes differing in signedness compare unsigned,
 /// whichever side is unsigned, as gcc does; arithmetic keeps the left
-/// operand's lane type. Asked of both targets, whatever the host: SSE2
-/// compares such words lane by lane, NEON with one unsigned `cmhi`.
+/// operand's lane type. Asked of both targets, whatever the host: each
+/// compares such words with one unsigned order -- SSE2's flipped-sign
+/// `pcmpgtw`, NEON's `cmhi`.
 #[test]
 fn test_vector_mixed_signedness_compares_unsigned() {
     use crate::ir::SimdOp;
@@ -1912,16 +1909,134 @@ fn test_vector_mixed_signedness_compares_unsigned() {
                 !ops.iter().any(|o| signed_ops.contains(o)),
                 "{arch:?} {name}: signed"
             );
-            let want = match arch {
-                Arch::X86_64 => unsigned,
-                Arch::Aarch64 => Opcode::Simd(SimdOp::CmpGtU),
-            };
+            let want = Opcode::Simd(SimdOp::CmpGtU);
             assert!(ops.contains(&want), "{arch:?} {name}: no {want:?}: {ops:?}");
+            assert!(!ops.contains(&unsigned), "{arch:?} {name}: lane by lane");
         }
         let div = ops("div");
         assert!(
             div.contains(&Opcode::DivS) && !div.contains(&Opcode::DivU),
             "{arch:?}"
         );
+    }
+}
+
+/// A conditional expression evaluates one arm (C17 6.5.15p4), and under
+/// Annex F a floating operation that runs raises flags the program can
+/// read. So an arm whose arithmetic or conversion can raise -- overflow,
+/// inexact, invalid -- keeps its branch, and one whose every operation is
+/// exact still becomes a select: negation, `fabs`, `copysign`, widening,
+/// an `int` to `double`, quiet equality, and integer arithmetic.
+#[test]
+fn test_a_conditional_arm_that_can_raise_keeps_its_branch() {
+    let raising = [
+        "double f(int c, double a, double b) { return c ? a * b : 0; }",
+        "double f(int c, double a, double b) { return c ? a + b : 0; }",
+        "double f(int c, double a, double b) { return c ? 0 : a - b; }",
+        "float f(int c, float a, float b) { return c ? a * b : 0; }",
+        "float f(int c, double a) { return c ? (float)a : 0; }",
+        "int f(int c, double a) { return c ? (int)a : 0; }",
+        "float f(int c, int n) { return c ? n : 0.5f; }",
+        "double f(int c, long n) { return c ? n : 0.5; }",
+        "float f(int c, float a) { return c ? a : 16777217; }",
+        "double f(int c, int d, double a, double b) { return c ? (d ? a * b : 1.0) : 0; }",
+        "double f(double c, double a, double b) { return c ?: a * b; }",
+        "double f(int c, double a) { return c ? __builtin_sqrt(a) : 0; }",
+        "double f(int c, double a, double b) { return c ? __builtin_fmin(a, b) : 0; }",
+        "int f(int c, double a, double b) { return c ? a < b : 0; }",
+        // Never a select, being wider than a register; listed so the rule
+        // is pinned for them too.
+        "long double f(int c, long double a, long double b) { return c ? a * b : 0; }",
+        "double _Complex f(int c, double _Complex a) { return c ? a * a : 0; }",
+    ];
+    let exact = [
+        "double f(int c, double a) { return c ? -a : 0; }",
+        "double f(int c, double a) { return c ? __builtin_fabs(a) : 0; }",
+        "double f(int c, double a, double b) { return c ? __builtin_copysign(a, b) : 0; }",
+        "double f(int c, float a) { return c ? (double)a : 0; }",
+        "double f(int c, short n) { return c ? (float)n : 0; }",
+        "double f(int c, int n) { return c ? n : 0.5; }",
+        "int f(int c, double a, double b) { return c ? a == b : 0; }",
+        "_Bool f(int c, double a) { return c ? (_Bool)a : 0; }",
+        "int f(int c, int a, int b) { return c ? a * b + 1 : 0; }",
+        "long f(int c, int a) { return c ? (long)a : 0; }",
+        "double f(int c, double a, double b) { return c ?: a; }",
+        // An integer constant converts exactly when the format holds it.
+        "float f(int c, float a) { return c ? -a : 0; }",
+        "float f(int c, float a) { return c ? a : 16777216; }",
+        "int f(int c, float a) { return c ? a == 1 : 0; }",
+    ];
+    // In place, as `-fno-math-errno` computes `sqrt`.
+    let policy = || crate::parse::LibraryCallPolicy {
+        optimizing: true,
+        math_errno: false,
+    };
+    for target in [
+        Target::new(Arch::X86_64, Os::Linux),
+        Target::new(Arch::Aarch64, Os::Linux),
+    ] {
+        let branches = |src: &str, trapping: bool| {
+            let (module, _) = linearize_source_trapping(src, &target, policy(), trapping);
+            insns_of(&module, "f").iter().any(|i| i.op == Opcode::Cbr)
+        };
+        for src in raising {
+            assert!(
+                branches(src, true),
+                "{:?}: keeps its branch: {src}",
+                target.arch
+            );
+        }
+        for src in exact {
+            assert!(!branches(src, true), "{:?}: a select: {src}", target.arch);
+        }
+        // `-fno-trapping-math` says nothing reads the flags, so an arm that
+        // can only raise one is as speculatable as an exact one.
+        for src in &raising[..raising.len() - 2] {
+            assert!(
+                !branches(src, false),
+                "{:?}: -fno-trapping-math: {src}",
+                target.arch
+            );
+        }
+    }
+}
+
+/// An `__int128` constant arm converts exactly when its value is one of the
+/// format's, read with the signedness of its type: an `unsigned __int128`
+/// at or above 2^127 is held negative in the `i128` a constant evaluates
+/// to, and `(unsigned __int128)-1` read as -1 looked exact.
+#[test]
+fn test_an_int128_constant_arm_converts_by_its_types_signedness() {
+    let raising = [
+        "float f(int c) { return c ? (unsigned __int128)-1 : 0.0f; }",
+        "double f(int c) { return c ? (unsigned __int128)-1 : 0.0; }",
+        "double f(int c) { return c ? ((unsigned __int128)1 << 127) + 1 : 0.0; }",
+        "double f(int c) { return c ? -(((__int128)1 << 126) + 1) : 0.0; }",
+    ];
+    let exact = [
+        "float f(int c) { return c ? (unsigned __int128)5 : 0.0f; }",
+        "double f(int c) { return c ? (unsigned __int128)1 << 127 : 0.0; }",
+        "float f(int c) { return c ? (__int128)-1 : 0.0f; }",
+        // INT128_MIN, -2^127, is a power of two.
+        "double f(int c) { return c ? -((__int128)1 << 126) - ((__int128)1 << 126) : 0.0; }",
+    ];
+    let policy = || crate::parse::LibraryCallPolicy {
+        optimizing: true,
+        math_errno: false,
+    };
+    for target in [
+        Target::new(Arch::X86_64, Os::Linux),
+        Target::new(Arch::Aarch64, Os::Linux),
+    ] {
+        let branches = |src: &str| {
+            let (module, _) = linearize_source_trapping(src, &target, policy(), true);
+            insns_of(&module, "f").iter().any(|i| i.op == Opcode::Cbr)
+        };
+        for src in raising {
+            assert!(branches(src), "{:?}: keeps its branch: {src}", target.arch);
+        }
+        for src in exact {
+            assert!(!branches(src), "{:?}: a select: {src}", target.arch);
+        }
     }
 }

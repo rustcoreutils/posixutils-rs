@@ -18,6 +18,7 @@ use crate::arch::lir::{
     CallTarget, CondCode, Directive, EmitAsm, FpSize, Label, OperandSize, Symbol,
 };
 use crate::float::IntegralRounding;
+use crate::ir::NanCompare;
 use crate::target::{Os, Target};
 use std::fmt::Write;
 
@@ -838,8 +839,10 @@ pub enum Aarch64Inst {
         dst: VReg,
     },
 
-    /// FCMP - FP compare
+    /// FCMPE or FCMP - FP compare, raising invalid for a quiet NaN or not,
+    /// as `nan` says. NZCV is the same either way.
     Fcmp {
+        nan: NanCompare,
         size: FpSize,
         src1: VReg,
         src2: VReg,
@@ -1584,10 +1587,19 @@ impl EmitAsm for Aarch64Inst {
                 );
             }
 
-            Aarch64Inst::Fcmp { size, src1, src2 } => {
+            Aarch64Inst::Fcmp {
+                nan,
+                size,
+                src1,
+                src2,
+            } => {
+                let op = match nan {
+                    NanCompare::Quiet => "fcmp",
+                    NanCompare::Signaling => "fcmpe",
+                };
                 let _ = writeln!(
                     out,
-                    "    fcmp {}, {}",
+                    "    {op} {}, {}",
                     src1.name_for_size(size_bits(*size)),
                     src2.name_for_size(size_bits(*size))
                 );

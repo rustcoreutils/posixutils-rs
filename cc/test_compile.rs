@@ -81,7 +81,18 @@ fn apply_flags(flags: &[&str]) -> Options {
     };
     let mut no_groups = std::collections::HashSet::new();
     let mut no_builtin_funcs = std::collections::HashSet::new();
+    let mut pedantic = diag::Pedantic::OFF;
     for &flag in flags {
+        // As the driver: `-pedantic` and `-pedantic-errors` are `-W` options
+        // by the time the switch is folded.
+        let w_name = match flag {
+            "-pedantic" | "-pedantic-errors" => Some(&flag[1..]),
+            _ => flag.strip_prefix("-W"),
+        };
+        if let Some(next) = w_name.and_then(|name| pedantic.after(name)) {
+            pedantic = next;
+            continue;
+        }
         match flag {
             "-w" => diag::suppress_warnings(),
             "-fpermissive" => diag::set_permissive(),
@@ -135,6 +146,7 @@ fn apply_flags(flags: &[&str]) -> Options {
         o.optimization.set_inlining(enabled);
     }
     diag::suppress_warning_groups(no_groups);
+    diag::set_pedantic(pedantic);
     crate::builtins::set_no_builtin_funcs(no_builtin_funcs);
     o
 }

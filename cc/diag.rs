@@ -307,6 +307,9 @@ thread_local! {
     /// `-fpermissive`; see [`set_permissive`].
     static PERMISSIVE: Cell<bool> = const { Cell::new(false) };
 
+    /// `-pedantic` and its relatives; see [`Pedantic`].
+    static PEDANTIC: Cell<Pedantic> = const { Cell::new(Pedantic::OFF) };
+
     /// Where diagnostics go when not to stderr; see [`capture_diagnostics`].
     static CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
 }
@@ -391,6 +394,87 @@ pub fn permissive_error(pos: Position, msg: &str) {
     } else {
         error(pos, msg);
     }
+}
+
+/// The `-pedantic` switch: whether the diagnostics gcc gives only under
+/// `-Wpedantic` are given, and whether as errors.
+///
+/// These are the constraint violations gcc accepts in silence as GNU
+/// extensions -- a function pointer against `void *`, `int f(...)` -- so they
+/// are off by default here too. Every one goes through [`pedwarn`], which
+/// asks this and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pedantic {
+    /// `-pedantic` or `-Wpedantic`, and not a later `-Wno-pedantic`.
+    enabled: bool,
+    /// `-pedantic-errors`. gcc keeps it through a later `-Wno-pedantic`,
+    /// which silences the diagnostics outright, and a later `-Wpedantic`
+    /// brings them back as errors.
+    errors: bool,
+}
+
+impl Pedantic {
+    /// gcc's default: no pedantic diagnostics at all.
+    pub const OFF: Pedantic = Pedantic {
+        enabled: false,
+        errors: false,
+    };
+
+    /// Fold one `-W<name>` warning option into the switch, in command-line
+    /// order, as gcc does: the last of `-Wpedantic` and `-Wno-pedantic` wins.
+    /// The driver passes `-pedantic` as the name `pedantic` and
+    /// `-pedantic-errors` as `pedantic-errors`. Answers `None` for any other
+    /// name.
+    pub fn after(self, name: &str) -> Option<Pedantic> {
+        match name {
+            "pedantic" => Some(Pedantic {
+                enabled: true,
+                ..self
+            }),
+            "pedantic-errors" => Some(Pedantic {
+                enabled: true,
+                errors: true,
+            }),
+            "no-pedantic" => Some(Pedantic {
+                enabled: false,
+                ..self
+            }),
+            _ => None,
+        }
+    }
+
+    /// The switch after every `-W<name>` in `names`, in order.
+    pub fn from_warning_options<'a>(names: impl IntoIterator<Item = &'a str>) -> Pedantic {
+        names
+            .into_iter()
+            .fold(Pedantic::OFF, |p, name| p.after(name).unwrap_or(p))
+    }
+}
+
+/// Set the `-pedantic` switch for the rest of this thread's compilation.
+pub fn set_pedantic(p: Pedantic) {
+    PEDANTIC.set(p);
+}
+
+/// Report a constraint violation gcc diagnoses only under `-pedantic`: nothing
+/// by default, a warning under `-pedantic` or `-Wpedantic`, an error under
+/// `-pedantic-errors`.
+pub fn pedwarn(pos: Position, msg: &str) {
+    let p = PEDANTIC.get();
+    if !p.enabled {
+        return;
+    }
+    let level = if p.errors {
+        DiagLevel::Error
+    } else {
+        DiagLevel::Warning
+    };
+    do_diag(level, pos, msg);
+}
+
+/// [`pedwarn`] with a translatable template; see [`warning_args`].
+pub fn pedwarn_args(pos: Position, template: &str, args: &[&str]) {
+    pedwarn(pos, &gettext_args(template, args));
 }
 
 pub fn has_error() -> u32 {

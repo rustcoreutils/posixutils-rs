@@ -150,27 +150,39 @@ fn conditional_mismatch_does_not_cascade() {
 }
 
 /// A function pointer beside `void *` is outside 6.5.15p3, whose `void *`
-/// carve-out is for object pointers. gcc objects only under `-pedantic`;
-/// c17 warns in the group it uses for the same conversion by assignment, so
-/// one flag silences both. `(void *)0` is a null pointer constant and draws
-/// nothing.
+/// carve-out is for object pointers. gcc accepts it in silence and objects
+/// only under `-pedantic`, as for the same conversion by assignment, and
+/// `-Wno-pedantic` after it silences it again. `(void *)0` is a null pointer
+/// constant and draws nothing even then.
 #[test]
 fn conditional_function_pointer_and_void_pointer() {
     let src = source("c ? fp : vp");
-    compile_expect_warning(
-        "cond_fnptr_void",
-        &src,
-        "ISO C forbids conditional expr between 'void *' and function pointer",
-    );
+    let want = "ISO C forbids conditional expr between 'void *' and function pointer";
+    compile_expect_no_diagnostic("cond_fnptr_void", &src, "ISO C forbids");
+    for flags in [&["-pedantic"][..], &["-Wpedantic"]] {
+        let run = compile("cond_fnptr_void_pedantic", &src, flags);
+        assert!(run.success, "should compile: {}", run.stderr);
+        assert!(run.stderr.contains(want), "{flags:?}:\n{}", run.stderr);
+    }
     let run = compile(
         "cond_fnptr_void_silenced",
         &src,
-        &["-Wno-function-pointer-conv"],
+        &["-pedantic", "-Wno-pedantic"],
     );
     assert!(run.success, "should compile: {}", run.stderr);
     assert!(
         !run.stderr.contains("ISO C forbids"),
-        "-Wno-function-pointer-conv should silence it, got:\n{}",
+        "-Wno-pedantic should silence it, got:\n{}",
         run.stderr
+    );
+    let null = compile(
+        "cond_fnptr_null",
+        &source("c ? fp : (void *)0"),
+        &["-pedantic"],
+    );
+    assert!(
+        null.success && !null.stderr.contains("ISO C forbids"),
+        "{}",
+        null.stderr
     );
 }

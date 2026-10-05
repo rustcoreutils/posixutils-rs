@@ -313,9 +313,6 @@ struct Args {
     #[arg(short = 'w', help = gettext("Suppress all warnings"))]
     no_warnings: bool,
 
-    #[arg(long = "pedantic", hide = true, help = gettext("Pedantic mode (compatibility)"))]
-    pedantic: bool,
-
     /// C standard dialect, from `-std=` (rewritten by `preprocess_args_from`).
     ///
     /// Hidden because the user-facing spelling is `-std=`, which clap cannot
@@ -1741,7 +1738,11 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             }
             i += 1;
         } else if arg == "-pedantic" || arg == "-pedantic-errors" {
-            result.push("--pedantic".to_string());
+            // -pedantic → -W pedantic, -pedantic-errors → -W pedantic-errors:
+            // among the `-W` options, so `diag::Pedantic` folds them in
+            // command-line order with `-Wpedantic` and `-Wno-pedantic`.
+            result.push("-W".to_string());
+            result.push(arg[1..].to_string());
             i += 1;
         } else if arg == "-x" || (arg.starts_with("-x") && arg.len() > 2) {
             let (name, used) = match arg.strip_prefix("-x").filter(|n| !n.is_empty()) {
@@ -2620,8 +2621,11 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
         builtins::set_no_builtin_funcs(args.fno_builtin_funcs.iter().cloned().collect());
     }
     // `-Wno-<name>` reaches the places that emit warnings, which are nowhere
-    // near here. Only `-Wno-` entries mean anything today; `-W<name>` turning
-    // a group *on* has no group that is off by default to turn on.
+    // near here. The one group that is off by default is `-Wpedantic`, which
+    // has a switch of its own because `-pedantic-errors` makes it fatal.
+    diag::set_pedantic(diag::Pedantic::from_warning_options(
+        args.warnings.iter().map(String::as_str),
+    ));
     diag::suppress_warning_groups(
         args.warnings
             .iter()
@@ -3259,7 +3263,13 @@ mod tests {
         assert!(result
             .windows(2)
             .any(|w| w[0] == "--c17-std" && w[1] == "c90"));
-        assert_eq!(result.iter().filter(|a| *a == "--pedantic").count(), 2);
+        assert!(result
+            .windows(2)
+            .any(|w| w[0] == "-W" && w[1] == "pedantic-errors"));
+        assert!(result
+            .windows(2)
+            .any(|w| w[0] == "-W" && w[1] == "pedantic"));
+        assert!(!result.iter().any(|a| a.starts_with("-pedantic")));
     }
 
     #[test]

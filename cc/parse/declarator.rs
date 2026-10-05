@@ -691,10 +691,11 @@ impl Parser<'_> {
         loop {
             // Check for ellipsis
             if self.is_special_token(SpecialToken::Ellipsis) {
-                // ISO C requires at least one named parameter before '...'
-                // GCC/Clang emit a warning with -Wstrict-prototypes
+                // C17 6.7.6p1's grammar has a parameter before `, ...`, but
+                // gcc accepts `int f(...)` as an extension (C23 adopted it)
+                // and objects only under `-pedantic`.
                 if params.is_empty() {
-                    diag::warning(
+                    diag::pedwarn(
                         self.current_pos(),
                         &gettext("ISO C requires a named argument before '...'"),
                     );

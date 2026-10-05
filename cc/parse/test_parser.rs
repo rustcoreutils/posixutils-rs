@@ -9610,6 +9610,7 @@ struct OperandTypes {
     union: crate::types::TypeId,
     complex_int: crate::types::TypeId,
     long_ptr: crate::types::TypeId,
+    fn_ptr: crate::types::TypeId,
 }
 
 fn operand_types() -> OperandTypes {
@@ -9619,12 +9620,15 @@ fn operand_types() -> OperandTypes {
     let union = types.intern(Type::union_type(CompositeType::incomplete(None)));
     let complex_int = types.make_complex(types.int_id);
     let long_ptr = types.intern(Type::pointer(types.long_id));
+    let function = types.intern(Type::function(types.int_id, vec![], false, false));
+    let fn_ptr = types.intern(Type::pointer(function));
     OperandTypes {
         types,
         structure,
         union,
         complex_int,
         long_ptr,
+        fn_ptr,
     }
 }
 
@@ -9715,7 +9719,11 @@ fn binary_operand_verdicts() {
         v(ty.int_ptr_id),
         v(t.structure),
     );
-    let (lptr, vptr) = (v(t.long_ptr), v(ty.void_ptr_id));
+    let (lptr, vptr, fptr) = (v(t.long_ptr), v(ty.void_ptr_id), v(t.fn_ptr));
+    let vnull = Operand {
+        typ: ty.void_ptr_id,
+        null_constant: true,
+    };
     use BinaryOp::*;
     let table = [
         // Aggregates satisfy no operator.
@@ -9759,6 +9767,14 @@ fn binary_operand_verdicts() {
         (Eq, ptr, zero, Valid),
         (Gt, ptr, zero, Valid),
         (Eq, ptr, dbl, Invalid),
+        // `void *` against a function pointer: gcc's -pedantic extension
+        // for equality, unless the `void *` is a null pointer constant, and
+        // distinct types for ordering.
+        (Eq, vptr, fptr, FunctionPointerVoid),
+        (Ne, fptr, vptr, FunctionPointerVoid),
+        (Eq, fptr, vnull, Valid),
+        (Lt, vptr, fptr, DistinctPointers),
+        (Eq, ptr, fptr, DistinctPointers),
         // Logical operators take any scalar.
         (LogOr, ptr, cplx, Valid),
         (LogAnd, s, int, Invalid),

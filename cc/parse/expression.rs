@@ -416,13 +416,9 @@ impl<'a> Parser<'a> {
         );
         let target = if t_void || e_void {
             // The `void *` carve-out is for pointers to objects. gcc objects
-            // to a function pointer only under `-pedantic`; c17 warns in the
-            // group that assignment uses for the same conversion.
-            let function = |k| k == TypeKind::Function;
-            if (function(self.types.kind(tp)) || function(self.types.kind(ep)))
-                && diag::warning_group_enabled(crate::types::FUNCTION_POINTER_CONV)
-            {
-                diag::warning(
+            // to a function pointer only under `-pedantic`.
+            if self.types.pointees_pair_function_with_void(tp, ep) {
+                diag::pedwarn(
                     pos,
                     &gettext(
                         "ISO C forbids conditional expr between 'void *' and function pointer",
@@ -1151,6 +1147,42 @@ impl<'a> Parser<'a> {
             );
         } else if target_kind == TypeKind::Pointer && self.types.is_float(from) {
             diag::error(pos, &gettext("cannot convert to a pointer type"));
+        } else if target_kind == TypeKind::Pointer && from_kind == TypeKind::Pointer {
+            self.check_function_object_pointer_cast(target, from, expr, pos);
+        }
+    }
+
+    /// C17 6.3.2.3 converts a function pointer only to another function
+    /// pointer; a cast between one and an object pointer -- `void *`
+    /// included, which is why `(fp)dlsym(h, "x")` is outside the standard --
+    /// is a conversion it does not define. gcc accepts both directions as an
+    /// extension and objects only under `-pedantic`, except to a null pointer
+    /// constant, which converts to any pointer.
+    fn check_function_object_pointer_cast(
+        &self,
+        target: TypeId,
+        from: TypeId,
+        expr: &Expr,
+        pos: Position,
+    ) {
+        let (Some(to), Some(of)) = (self.types.base_type(target), self.types.base_type(from))
+        else {
+            return;
+        };
+        let (to_fn, of_fn) = (
+            self.types.kind(to) == TypeKind::Function,
+            self.types.kind(of) == TypeKind::Function,
+        );
+        if of_fn && !to_fn {
+            diag::pedwarn(
+                pos,
+                &gettext("ISO C forbids conversion of function pointer to object pointer type"),
+            );
+        } else if to_fn && !of_fn && !self.is_null_pointer_constant(expr) {
+            diag::pedwarn(
+                pos,
+                &gettext("ISO C forbids conversion of object pointer to function pointer type"),
+            );
         }
     }
 

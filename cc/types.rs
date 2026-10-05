@@ -999,14 +999,6 @@ pub enum AssignFault {
     FunctionPointerVoid,
 }
 
-/// The `-Wno-<name>` group the function-pointer/`void *` warnings belong to.
-///
-/// Named rather than fatal because gcc accepts the conversion in silence and
-/// only `-pedantic` objects; diagnosing it at all is stricter than the
-/// compiler c17 matches by policy, so it has to be silenceable by anyone who
-/// calls `dlsym` in a loop.
-pub const FUNCTION_POINTER_CONV: &str = "function-pointer-conv";
-
 impl AssignFault {
     /// Whether this fault is fatal. Only a missing conversion is.
     pub fn is_error(self) -> bool {
@@ -2390,6 +2382,20 @@ impl TypeTable {
         }
     }
 
+    /// Whether two pointees, qualifiers aside, are `void` and a function
+    /// type, in either order: the pairing outside the `void *` carve-out of
+    /// 6.5.16.1p1, 6.5.9p2 and 6.5.15p3, which reach only object pointers.
+    ///
+    /// gcc accepts it in assignment, comparison and the conditional operator
+    /// alike as an extension, objecting only under `-pedantic`, and POSIX
+    /// needs it (`fp f = dlsym(h, "x");`), so every context asks this one
+    /// question and reports through `diag::pedwarn`.
+    pub fn pointees_pair_function_with_void(&self, a: TypeId, b: TypeId) -> bool {
+        let (a, b) = (self.kind(a), self.kind(b));
+        (a == TypeKind::Void && b == TypeKind::Function)
+            || (a == TypeKind::Function && b == TypeKind::Void)
+    }
+
     /// Check a value against the type it is being assigned to (C17
     /// 6.5.16.1p1). `None` means the assignment is allowed.
     ///
@@ -2450,20 +2456,16 @@ impl TypeTable {
             //
             // "Object" is the whole of it: the carve-out does not reach a
             // function pointer, which is why `FP fp = dlsym(h, "x");` is a
-            // constraint violation. It stays a warning because POSIX requires
-            // that exact line to work (XSH `dlsym`) and gcc accepts it in
-            // silence, objecting only under `-pedantic`.
+            // constraint violation. It is only a pedantic warning because POSIX
+            // requires that exact line to work (XSH `dlsym`) and gcc accepts
+            // it in silence, objecting only under `-pedantic`.
+            if self.pointees_pair_function_with_void(t_pointee, v_pointee) {
+                return Some(AssignFault::FunctionPointerVoid);
+            }
             let (t_void, v_void) = (
                 self.kind(t_pointee) == TypeKind::Void,
                 self.kind(v_pointee) == TypeKind::Void,
             );
-            let (t_fn, v_fn) = (
-                self.kind(t_pointee) == TypeKind::Function,
-                self.kind(v_pointee) == TypeKind::Function,
-            );
-            if (t_void && v_fn) || (v_void && t_fn) {
-                return Some(AssignFault::FunctionPointerVoid);
-            }
             if !(t_void || v_void) && !self.types_compatible(t_pointee, v_pointee) {
                 return Some(AssignFault::PointerMismatch);
             }

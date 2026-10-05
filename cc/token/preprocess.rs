@@ -28,6 +28,7 @@ use crate::arch;
 use crate::builtin_headers;
 use crate::diag;
 use crate::os;
+use crate::prefix_map::PrefixMap;
 use crate::target::{IntType, Target, STDC_VERSION};
 use gettextrs::gettext;
 
@@ -517,6 +518,10 @@ pub struct Preprocessor<'a> {
     /// Base file name (for __BASE_FILE__ - the main input file)
     base_file: String,
 
+    /// `-fmacro-prefix-map`: rewrites what `__FILE__` and `__BASE_FILE__`
+    /// expand to.
+    macro_prefix_map: PrefixMap,
+
     /// Current file directory (for relative includes)
     current_dir: String,
 
@@ -962,6 +967,7 @@ impl<'a> Preprocessor<'a> {
             quote_include_paths: Vec::with_capacity(DEFAULT_INCLUDE_PATH_CAPACITY),
             current_file: filename.to_string(),
             base_file: filename.to_string(),
+            macro_prefix_map: PrefixMap::default(),
             current_dir,
             counter: 0,
             include_depth: 0,
@@ -1538,6 +1544,13 @@ impl<'a> Preprocessor<'a> {
             .get(&self.physical_stream)
             .and_then(|lm| lm.name.as_deref())
             .unwrap_or(&self.current_file)
+    }
+
+    /// The string-literal payload a file-name macro expands to: `name`
+    /// through `-fmacro-prefix-map`. Both `__FILE__` and `__BASE_FILE__`
+    /// come here, so the two cannot be mapped differently.
+    fn file_macro_payload(&self, name: &str) -> String {
+        literal_payload(&self.macro_prefix_map.apply(name))
     }
 
     /// Establish that the physical line after the current directive is line
@@ -2623,6 +2636,8 @@ pub struct PreprocessConfig<'a> {
     pub position: crate::target::PositionIndependence,
     /// The x86-64 extensions the code may assume; see [`define_isa_macros`].
     pub isa: crate::target::X86Isa,
+    /// `-fmacro-prefix-map` (and the macro half of `-ffile-prefix-map`).
+    pub macro_prefix_map: PrefixMap,
     /// What optimization was asked for.
     ///
     /// The same value the optimizer is given, so `__OPTIMIZE__`,
@@ -2737,6 +2752,7 @@ pub fn preprocess_collecting(
     pp.trigraphs = config.trigraphs;
     pp.preprocessed = config.preprocessed;
     pp.collect_dependencies = config.collect_dependencies;
+    pp.macro_prefix_map = config.macro_prefix_map.clone();
 
     define_optimization_macros(&mut pp, config.optimization);
     define_pic_macros(&mut pp, target, config.position);
@@ -2815,6 +2831,9 @@ pub struct AsmPreprocessConfig<'a> {
     pub position: crate::target::PositionIndependence,
     /// See [`PreprocessConfig::isa`].
     pub isa: crate::target::X86Isa,
+    /// See [`PreprocessConfig::macro_prefix_map`]: `__FILE__` in a `.S` file
+    /// is mapped as in C.
+    pub macro_prefix_map: PrefixMap,
 }
 
 /// A `.S` operand that could not be preprocessed.
@@ -2875,6 +2894,7 @@ pub fn preprocess_asm_file(
 
     // Use assembly lexer mode for included files as well
     pp.lexer_mode = LexerMode::Assembly;
+    pp.macro_prefix_map = config.macro_prefix_map.clone();
 
     // Undefine C-specific macros that don't apply to assembly
     pp.undef_macro("__STDC__");

@@ -1635,14 +1635,11 @@ impl<'a> Preprocessor<'a> {
                 *pos,
                 TokenValue::Number(pos.line.to_string()),
             )]),
-            BuiltinMacro::File => {
-                let effective_file = self.presumed_file_name().to_string();
-                Some(vec![Token::with_value(
-                    TokenType::String,
-                    *pos,
-                    TokenValue::String(literal_payload(&effective_file)),
-                )])
-            }
+            BuiltinMacro::File => Some(vec![Token::with_value(
+                TokenType::String,
+                *pos,
+                TokenValue::String(self.file_macro_payload(self.presumed_file_name())),
+            )]),
             BuiltinMacro::Date => Some(vec![Token::with_value(
                 TokenType::String,
                 *pos,
@@ -1670,7 +1667,7 @@ impl<'a> Preprocessor<'a> {
             BuiltinMacro::BaseFile => Some(vec![Token::with_value(
                 TokenType::String,
                 *pos,
-                TokenValue::String(self.base_file.clone()),
+                TokenValue::String(self.file_macro_payload(&self.base_file)),
             )]),
             BuiltinMacro::HasAttribute
             | BuiltinMacro::HasBuiltin

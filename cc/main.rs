@@ -18,6 +18,7 @@ use posixutils_cc::linkargs;
 use posixutils_cc::opt;
 use posixutils_cc::parse;
 use posixutils_cc::pipeline;
+use posixutils_cc::prefix_map::{MapOption, PrefixMaps};
 use posixutils_cc::respfile;
 use posixutils_cc::strings;
 use posixutils_cc::symbol;
@@ -291,6 +292,19 @@ struct Args {
         overrides_with = "plain_char"
     )]
     plain_char: Option<target::CharSignedness>,
+
+    /// `-fdebug-prefix-map=`, `-fmacro-prefix-map=` and `-ffile-prefix-map=`,
+    /// each carried in its gcc spelling by `preprocess_args_from` so the three
+    /// stay in one list in command-line order, which decides which map wins.
+    #[arg(
+        long = "c17-prefix-map",
+        hide = true,
+        action = clap::ArgAction::Append,
+        value_name = "option",
+        allow_hyphen_values = true,
+        value_parser = parse_prefix_map
+    )]
+    prefix_maps: Vec<MapOption>,
 
     #[arg(short = 'W', action = clap::ArgAction::Append, value_name = "warning",
           num_args = 0..=1, default_missing_value = "extra", help = gettext("Warning flags (e.g., -Wall, -Wextra, -Wno-unused)"))]
@@ -701,6 +715,7 @@ fn preprocess_asm_operand(
         include_paths: &args.include_paths,
         search: system_search(args),
         no_std_inc: args.no_std_inc,
+        macro_prefix_map: args.prefix_maps().macros,
     };
     let preprocessed = preprocess_asm_file(&content, target, path, &config).map_err(|e| {
         diag::reset_counts();
@@ -1141,6 +1156,8 @@ fn process_file(
         return Ok(Compiled::Nothing);
     }
 
+    let prefix_maps = args.prefix_maps();
+
     // Preprocess (may add new identifiers from included files)
     let (preprocessed, outcome) = preprocess_collecting(
         tokens,
@@ -1162,6 +1179,7 @@ fn process_file(
             optimization: args.optimization(),
             position: position_independence(args, target),
             isa: target::X86Isa::from_flags(&args.mflags),
+            macro_prefix_map: prefix_maps.macros,
         },
     );
 
@@ -1209,6 +1227,7 @@ fn process_file(
         unwind_tables: !args.no_unwind_tables,
         verbose_asm: args.verbose_asm,
         source_name: path,
+        debug_prefix_map: &prefix_maps.debug,
     };
     let compiled = pipeline::compile_tokens(
         preprocessed,
@@ -1489,6 +1508,11 @@ impl Args {
         }
         opt
     }
+
+    /// The maps the `-f*-prefix-map=` options build, in command-line order.
+    fn prefix_maps(&self) -> PrefixMaps {
+        PrefixMaps::from_options(&self.prefix_maps)
+    }
 }
 
 /// The value of the internal `--c17-plain-char` option.
@@ -1498,6 +1522,12 @@ fn parse_plain_char(s: &str) -> Result<target::CharSignedness, String> {
         "unsigned" => Ok(target::CharSignedness::Unsigned),
         _ => Err(format!("invalid plain char signedness '{s}'")),
     }
+}
+
+/// The value of the internal `--c17-prefix-map` option: a prefix-map
+/// option in its gcc spelling, already validated by `preprocess_args_from`.
+fn parse_prefix_map(s: &str) -> Result<MapOption, String> {
+    MapOption::parse(s).unwrap_or_else(|| Err(format!("not a prefix map: '{s}'")))
 }
 
 /// The plain-`char` signedness a GCC `-f` flag selects, as the value of
@@ -1819,6 +1849,15 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             i += 1;
         } else if let Some(signedness) = plain_char_flag(arg) {
             result.push(format!("--c17-plain-char={signedness}"));
+            i += 1;
+        } else if let Some(map) = MapOption::parse(arg) {
+            // Diagnosed here, in gcc's words, rather than by clap, whose
+            // message would name the internal spelling.
+            if let Err(msg) = map {
+                eprintln!("c17: {}: {}", gettext("error"), msg);
+                std::process::exit(1);
+            }
+            result.push(format!("--c17-prefix-map={arg}"));
             i += 1;
         } else if arg == "-fverbose-asm" {
             result.push("--fverbose-asm".to_string());
@@ -2374,6 +2413,7 @@ fn assemble_operand(
             include_paths: &args.include_paths,
             search: system_search(args),
             no_std_inc: args.no_std_inc,
+            macro_prefix_map: args.prefix_maps().macros,
         };
         // Catches #error, a missing include, and friends.
         let preprocessed =
@@ -3030,6 +3070,24 @@ mod tests {
             parse(&["-fsigned-char", "-fno-signed-char", "foo.c"]),
             Some(Unsigned)
         );
+    }
+
+    #[test]
+    fn test_prefix_maps_keep_command_line_order() {
+        // The three spellings share one list, so a later `-fdebug-prefix-map`
+        // overrides an earlier `-ffile-prefix-map` for debug info only.
+        let args = Args::parse_from(run_preprocess(&[
+            "-ffile-prefix-map=/b=.",
+            "foo.c",
+            "-fdebug-prefix-map=/b=/D",
+            "-fmacro-prefix-map=/a=b=/M",
+        ]));
+        let maps = args.prefix_maps();
+        assert_eq!(maps.debug.apply("/b/t.c"), "/D/t.c");
+        assert_eq!(maps.macros.apply("/b/t.c"), "./t.c");
+        assert_eq!(maps.macros.apply("/a=b/t.c"), "/M/t.c");
+        assert_eq!(maps.debug.apply("/a=b/t.c"), "/a=b/t.c");
+        assert_eq!(args.files, ["foo.c"]);
     }
 
     #[test]

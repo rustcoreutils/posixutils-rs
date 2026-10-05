@@ -17,6 +17,7 @@
 use crate::diag;
 use crate::opt::Optimization;
 use crate::pipeline::{self, CodegenOptions, Quiet};
+use crate::prefix_map::{MapOption, PrefixMaps};
 use crate::strings::StringTable;
 use crate::target::{self, Target};
 use crate::token::preprocess::SystemSearch;
@@ -64,6 +65,9 @@ struct Options {
     /// one winning, overriding the target's plain `char`.
     plain_char: Option<target::CharSignedness>,
     mflags: Vec<String>,
+    /// `-fdebug-prefix-map=`, `-fmacro-prefix-map=`, `-ffile-prefix-map=`,
+    /// in order.
+    prefix_maps: Vec<MapOption>,
 }
 
 /// Apply `flags` the way the driver does: the switches that live in
@@ -105,6 +109,8 @@ fn apply_flags(flags: &[&str]) -> Options {
             _ => {
                 if let Some(level) = flag.strip_prefix("-O") {
                     o.optimization = Optimization::from_flag(level).unwrap();
+                } else if let Some(map) = MapOption::parse(flag) {
+                    o.prefix_maps.push(map.unwrap());
                 } else if let Some(name) = flag.strip_prefix("-Wno-") {
                     no_groups.insert(name.to_string());
                 } else if let Some(name) = flag.strip_prefix("-fno-builtin-") {
@@ -160,6 +166,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         pie,
     };
 
+    let prefix_maps = PrefixMaps::from_options(&o.prefix_maps);
     let mut strings = StringTable::new();
     let (tokens, _) =
         pipeline::source_tokens(src.as_bytes(), &source_name, false, false, &mut strings);
@@ -183,6 +190,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
             optimization: o.optimization,
             position,
             isa: target::X86Isa::from_flags(&o.mflags),
+            macro_prefix_map: prefix_maps.macros,
         },
     );
 
@@ -197,6 +205,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         unwind_tables: !o.no_unwind_tables,
         verbose_asm: o.verbose_asm,
         source_name: &source_name,
+        debug_prefix_map: &prefix_maps.debug,
     };
     let result = pipeline::compile_tokens(preprocessed, &strings, &target, &opts, &mut Quiet);
 

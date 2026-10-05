@@ -19,11 +19,13 @@ use crate::diag;
 use crate::ir;
 use crate::opt;
 use crate::parse::{self, ast::TranslationUnit, Parser};
+use crate::prefix_map::PrefixMap;
 use crate::strings::StringTable;
 use crate::symbol::SymbolTable;
 use crate::target::{self, Target};
 use crate::token::{self, lexer::Token, replace_trigraphs, strip_bom, Tokenizer};
 use crate::types::TypeTable;
+use std::borrow::Cow;
 use std::io;
 
 /// Translation phases 1 and 2 and tokenization of one source file, and the
@@ -79,6 +81,9 @@ pub struct CodegenOptions<'a> {
     pub verbose_asm: bool,
     /// The name DWARF records for the primary source file.
     pub source_name: &'a str,
+    /// `-fdebug-prefix-map`: rewrites every path the debug information and
+    /// the `.file` directives record.
+    pub debug_prefix_map: &'a PrefixMap,
 }
 
 /// The pipeline's points of interest to the driver: its dumps, `--stats`, and
@@ -192,11 +197,20 @@ pub fn compile_tokens(
 
     observer.linearized(&module, strings, &types, &symbols);
 
-    // Set DWARF metadata
-    module.source_name = Some(opts.source_name.to_string());
+    // Set DWARF metadata. Every path it records goes through the debug
+    // prefix map, as gcc's does: the compilation directory, the primary
+    // source's name, and each `.file`. A placeholder for a synthetic stream
+    // is not a path and stays empty.
+    let map = opts.debug_prefix_map;
+    module.source_name = Some(map.apply(opts.source_name).into_owned());
     module.comp_dir = std::env::current_dir()
         .ok()
-        .map(|p| p.to_string_lossy().to_string());
+        .map(|p| map.apply(&p.to_string_lossy()).into_owned());
+    for file in module.source_files.iter_mut().filter(|f| !f.is_empty()) {
+        if let Cow::Owned(mapped) = map.apply(file) {
+            *file = mapped;
+        }
+    }
 
     observer.stage("post-linearize", &module, &types, None);
     ir::validate::verify(&module, ir::validate::Stage::Ssa, "linearization");

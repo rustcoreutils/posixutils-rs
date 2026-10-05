@@ -932,6 +932,42 @@ fn test_base_file_macro() {
     assert!(tokens.iter().any(|t| t.typ == TokenType::String));
 }
 
+/// `-fmacro-prefix-map` rewrites `__FILE__`, `__BASE_FILE__`, and a name a
+/// `#line` gave, by the last matching map; the payload is the mapped name's
+/// bytes, one `char` each, for both macros.
+#[test]
+fn test_file_macros_follow_the_macro_prefix_map() {
+    let mut map = crate::prefix_map::PrefixMap::default();
+    map.push("/src", "/OLD");
+    map.push("/src/d\u{e9}", "/N\u{e9}");
+    let config = PreprocessConfig {
+        macro_prefix_map: map,
+        ..Default::default()
+    };
+    let input = "__FILE__ __BASE_FILE__\n#line 9 \"/src/x.c\"\n__FILE__ \"/src/y.c\"\n";
+    let mut idents = IdentTable::new();
+    let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
+    let (out, _) = preprocess_collecting(
+        tokens,
+        &Target::host(),
+        &mut idents,
+        "/src/d\u{e9}/t.c",
+        &config,
+    );
+    let payloads: Vec<String> = out
+        .iter()
+        .filter_map(|t| match &t.value {
+            TokenValue::String(s) => Some(payload_text(s)),
+            _ => None,
+        })
+        .collect();
+    // An ordinary string literal is not a file name and is left alone.
+    assert_eq!(
+        payloads,
+        ["/N\u{e9}/t.c", "/N\u{e9}/t.c", "/OLD/x.c", "/src/y.c"]
+    );
+}
+
 // Tests for ternary operator in #if expressions
 
 #[test]

@@ -165,7 +165,7 @@ fn standard_library_exists(name: &str, lib_paths: &[String]) -> bool {
     // behind with no `.so` of either, so probing only `.so` would drop a
     // `-l rt` that links perfectly well.
     files.iter().any(|f| {
-        Command::new("cc")
+        host_driver()
             .arg(format!("-print-file-name={}", f))
             .output()
             .ok()
@@ -173,6 +173,15 @@ fn standard_library_exists(name: &str, lib_paths: &[String]) -> bool {
             .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
             .is_some_and(|found| found != *f && Path::new(&found).exists())
     })
+}
+
+/// The host C driver, which c17 links with.
+///
+/// Questions about the link step -- where a library is, what the default
+/// search path is -- are this driver's to answer, so they are put to it rather
+/// than guessed at.
+pub fn host_driver() -> Command {
+    Command::new("cc")
 }
 
 /// Recover the ordered link line from a normalized argument vector.

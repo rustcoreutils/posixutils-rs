@@ -427,3 +427,317 @@ fn gcc_flags_x86_march_last_wins_and_mno_applies() {
         assert!(got.contains(want), "{flags:?}: {got}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Static links
+// ---------------------------------------------------------------------------
+
+/// What an ELF executable's headers say about how it was linked.
+#[cfg(target_os = "linux")]
+struct ElfLinkage {
+    /// `e_type`: 2 for a fixed-address executable, 3 for a PIE or shared object.
+    e_type: u16,
+    /// Whether a `PT_INTERP` program header names a dynamic loader.
+    has_interp: bool,
+}
+
+/// Read `e_type` and look for `PT_INTERP` in a native-endian ELF64 file.
+#[cfg(target_os = "linux")]
+fn elf_linkage(path: &std::path::Path) -> ElfLinkage {
+    const PT_INTERP: u32 = 3;
+    let b = std::fs::read(path).expect("read executable");
+    assert_eq!(&b[..4], b"\x7fELF", "not an ELF file");
+    let u16_at = |o: usize| u16::from_ne_bytes(b[o..o + 2].try_into().unwrap());
+    let u32_at = |o: usize| u32::from_ne_bytes(b[o..o + 4].try_into().unwrap());
+    let u64_at = |o: usize| u64::from_ne_bytes(b[o..o + 8].try_into().unwrap());
+    let phoff = u64_at(32) as usize;
+    let phentsize = u16_at(54) as usize;
+    let phnum = u16_at(56) as usize;
+    let has_interp = (0..phnum).any(|i| u32_at(phoff + i * phentsize) == PT_INTERP);
+    ElfLinkage {
+        e_type: u16_at(16),
+        has_interp,
+    }
+}
+
+/// `-static` links a program with no dynamic loader that runs, whatever PIE
+/// request came before it -- gcc's answer to `-pie -static` is a static,
+/// fixed-address executable -- and `-static-pie` links a static PIE.
+#[cfg(target_os = "linux")]
+#[test]
+fn gcc_flags_static_links_without_an_interpreter() {
+    let (dir, path) = scratch("st.c", "int main(void) { return 7; }\n");
+    let exe = dir.path().join("st");
+    for (flags, e_type) in [
+        (&["-static"][..], 2u16),
+        (&["-pie", "-static"], 2),
+        (&["-static", "-pie"], 2),
+        (&["-static-pie"], 3),
+    ] {
+        let _ = std::fs::remove_file(&exe);
+        let mut args = flags.to_vec();
+        args.extend(["-o", exe.to_str().unwrap(), path.to_str().unwrap()]);
+        let r = run_c17(&args);
+        assert!(r.success, "{flags:?}: {}", r.stderr);
+        let elf = elf_linkage(&exe);
+        assert!(!elf.has_interp, "{flags:?}: has a PT_INTERP");
+        assert_eq!(elf.e_type, e_type, "{flags:?}: e_type");
+        let status = std::process::Command::new(&exe).status().expect("run");
+        assert_eq!(status.code(), Some(7), "{flags:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Leaf frame pointers
+// ---------------------------------------------------------------------------
+
+/// `-m[no-]omit-leaf-frame-pointer` is accepted on both architectures
+/// (Ubuntu 24.04's default CFLAGS pass `-mno-omit-leaf-frame-pointer`), and
+/// what the first asks for is already so: a leaf function at -O2 still sets
+/// up its frame pointer.
+#[test]
+fn gcc_flags_leaf_frame_pointer_flags_are_accepted() {
+    let src = "int leaf(int x) { return x + 1; }\n";
+    for (target, frame_setup) in [
+        ("--target=x86_64-unknown-linux-gnu", "movq %rsp, %rbp"),
+        ("--target=aarch64-unknown-linux-gnu", "mov x29, sp"),
+    ] {
+        for flag in ["-mno-omit-leaf-frame-pointer", "-momit-leaf-frame-pointer"] {
+            let asm = crate::common::asm_for_at("c17_leaf_fp_", src, &[target, "-O2", flag]);
+            assert!(asm.contains(frame_setup), "{target} {flag}:\n{asm}");
+        }
+    }
+    // And on the host, all the way to an object.
+    let r = compile_with("leaf.c", src, &["-mno-omit-leaf-frame-pointer"]);
+    assert!(r.success, "{}", r.stderr);
+}
+
+// ---------------------------------------------------------------------------
+// gcc driver queries
+// ---------------------------------------------------------------------------
+
+/// The host's triple in gcc's spelling.
+fn host_gcc_triple() -> &'static str {
+    if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        "x86_64-linux-gnu"
+    } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        "aarch64-linux-gnu"
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        "arm64-apple-darwin"
+    } else if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
+        "x86_64-apple-darwin"
+    } else if cfg!(all(target_os = "freebsd", target_arch = "x86_64")) {
+        "x86_64-unknown-freebsd"
+    } else {
+        "aarch64-unknown-freebsd"
+    }
+}
+
+#[test]
+fn gcc_flags_dumpmachine_names_the_target() {
+    let r = run_c17(&["-dumpmachine"]);
+    assert!(r.success, "{}", r.stderr);
+    assert_eq!(r.stdout, format!("{}\n", host_gcc_triple()));
+
+    for (target, want) in [
+        ("--target=aarch64-unknown-linux-gnu", "aarch64-linux-gnu\n"),
+        ("--target=x86_64-unknown-linux-gnu", "x86_64-linux-gnu\n"),
+        ("--target=aarch64-apple-darwin", "arm64-apple-darwin\n"),
+        ("--target=x86_64-apple-darwin", "x86_64-apple-darwin\n"),
+        (
+            "--target=x86_64-unknown-freebsd",
+            "x86_64-unknown-freebsd\n",
+        ),
+    ] {
+        // Before and after the query, and in both spellings of `--target`.
+        let r = run_c17(&[target, "-dumpmachine"]);
+        assert!(r.success, "{target}: {}", r.stderr);
+        assert_eq!(r.stdout, want, "{target}");
+        let r = run_c17(&["-dumpmachine", target]);
+        assert_eq!(r.stdout, want, "{target}");
+        let (flag, value) = target.split_once('=').unwrap();
+        let r = run_c17(&["-dumpmachine", flag, value]);
+        assert_eq!(r.stdout, want, "{target}");
+    }
+
+    let r = run_c17(&["--target=sparc-sun-solaris", "-dumpmachine"]);
+    assert!(!r.success);
+    assert!(r.stderr.contains("unsupported target"), "{}", r.stderr);
+}
+
+/// `-dumpversion` and `-dumpfullversion` agree with `__GNUC__`,
+/// `__GNUC_MINOR__` and `__GNUC_PATCHLEVEL__`: configure scripts compare the
+/// two, and a version from one that the macros contradict picks code paths
+/// for a compiler that is not there.
+#[test]
+fn gcc_flags_dumpversion_agrees_with_the_gnuc_macros() {
+    let macros = preprocess_text(
+        "gnuc_ver",
+        "__GNUC__.__GNUC_MINOR__.__GNUC_PATCHLEVEL__\n",
+        &["-P"],
+    );
+    assert!(macros.success, "{}", macros.stderr);
+    let full = macros.stdout.split_whitespace().collect::<String>();
+    let major = full.split('.').next().unwrap().to_string();
+
+    let r = run_c17(&["-dumpversion"]);
+    assert!(r.success, "{}", r.stderr);
+    assert_eq!(r.stdout, format!("{major}\n"));
+
+    let r = run_c17(&["-dumpfullversion"]);
+    assert!(r.success, "{}", r.stderr);
+    assert_eq!(r.stdout, format!("{full}\n"));
+}
+
+/// gcc spells it with one dash; c17 already knew the two-dash form.
+#[test]
+fn gcc_flags_print_multiarch_single_dash() {
+    let two = run_c17(&["--print-multiarch"]);
+    let one = run_c17(&["-print-multiarch"]);
+    assert!(one.success, "{}", one.stderr);
+    assert_eq!(one.stdout, two.stdout);
+    if cfg!(target_os = "linux") {
+        assert_eq!(one.stdout, format!("{}\n", host_gcc_triple()));
+    }
+}
+
+/// The queries about the link step are the host driver's to answer, since it
+/// is the host driver that links: c17 prints exactly what `cc` prints.
+#[test]
+fn gcc_flags_link_queries_are_forwarded_to_the_host_driver() {
+    for (query, host) in [
+        ("-print-file-name=", "-print-file-name="),
+        ("--print-file-name=", "-print-file-name="),
+        ("-print-file-name=libc.a", "-print-file-name=libc.a"),
+        (
+            "-print-file-name=no-such-c17-file",
+            "-print-file-name=no-such-c17-file",
+        ),
+        ("-print-search-dirs", "-print-search-dirs"),
+        ("-print-libgcc-file-name", "-print-libgcc-file-name"),
+        ("--print-search-dirs", "-print-search-dirs"),
+        ("-print-multi-os-directory", "-print-multi-os-directory"),
+    ] {
+        let want = std::process::Command::new("cc")
+            .arg(host)
+            .output()
+            .expect("run host cc");
+        let r = run_c17(&[query]);
+        assert_eq!(r.success, want.status.success(), "{query}: {}", r.stderr);
+        assert_eq!(r.stdout, String::from_utf8_lossy(&want.stdout), "{query}");
+    }
+}
+
+/// Bare `-v` is gcc's version banner on stderr, which libtool and autoconf
+/// run and log; with operands it is still c17's verbose compile.
+#[test]
+fn gcc_flags_bare_v_prints_a_version_banner() {
+    let r = run_c17(&["-v"]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(r.stdout.is_empty(), "{}", r.stdout);
+    assert!(
+        r.stderr
+            .contains(&format!("c17 version {}", env!("CARGO_PKG_VERSION"))),
+        "{}",
+        r.stderr
+    );
+    assert!(
+        r.stderr
+            .contains(&format!("Target: {}\n", host_gcc_triple())),
+        "{}",
+        r.stderr
+    );
+    let full = run_c17(&["-dumpfullversion"]).stdout;
+    assert!(
+        r.stderr.contains(&format!("gcc version {} ", full.trim())),
+        "{}",
+        r.stderr
+    );
+
+    let r = run_c17(&["--target=aarch64-unknown-linux-gnu", "-v"]);
+    assert!(
+        r.stderr.contains("Target: aarch64-linux-gnu\n"),
+        "{}",
+        r.stderr
+    );
+
+    // With an operand, `-v` keeps its verbose meaning and compiles.
+    let r = compile_with("v.c", MAIN, &["-v"]);
+    assert!(r.success, "{}", r.stderr);
+}
+
+// ---------------------------------------------------------------------------
+// Response files
+// ---------------------------------------------------------------------------
+
+/// `@file` reads arguments from `file` with gcc's quoting rules, expands
+/// nested `@file`s, and leaves an unreadable one as a literal argument.
+#[test]
+fn gcc_flags_response_files_are_expanded() {
+    let (dir, src) = scratch("rsp.c", "A B C D\n");
+    let inner = dir.path().join("inner.rsp");
+    std::fs::write(&inner, "-DC=3\n").unwrap();
+    let outer = dir.path().join("outer.rsp");
+    std::fs::write(
+        &outer,
+        format!(
+            "-DA=1 '-DB=two  words'\n  \"-DD=a\\\"q\\\"\"\t@{}\n",
+            inner.display()
+        ),
+    )
+    .unwrap();
+    let outer_arg = format!("@{}", outer.display());
+    let r = run_c17(&["-E", "-P", &outer_arg, src.to_str().unwrap()]);
+    assert!(r.success, "{}", r.stderr);
+    assert_eq!(
+        r.stdout.split_whitespace().collect::<Vec<_>>(),
+        ["1", "two", "words", "3", "a\"q\""],
+        "{}",
+        r.stdout
+    );
+
+    // Backslash escapes outside quotes: an escaped space joins words.
+    std::fs::write(&outer, "-DA=x\\ y\n").unwrap();
+    let r = run_c17(&["-E", "-P", &outer_arg, src.to_str().unwrap()]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(r.stdout.starts_with("x y B"), "{}", r.stdout);
+
+    // A file that cannot be read stays a literal operand, reported as one.
+    let missing = format!("@{}", dir.path().join("missing.rsp").display());
+    let r = run_c17(&["-E", &missing, src.to_str().unwrap()]);
+    assert!(
+        r.stderr
+            .contains(&format!("unrecognized file type: {missing}")),
+        "{}",
+        r.stderr
+    );
+
+    // A response file that includes itself is refused, not followed forever.
+    let cycle = dir.path().join("cycle.rsp");
+    std::fs::write(&cycle, format!("-DA=1 @{}\n", cycle.display())).unwrap();
+    let cycle_arg = format!("@{}", cycle.display());
+    let r = run_c17(&["-E", &cycle_arg, src.to_str().unwrap()]);
+    assert!(!r.success);
+    assert!(r.stderr.contains("response file"), "{}", r.stderr);
+}
+
+/// The link line is read from the expanded arguments too: the operands and
+/// the `-l` order in a response file reach the link step.
+#[test]
+fn gcc_flags_response_file_drives_a_link() {
+    let (dir, src) = scratch(
+        "rsplink.c",
+        "#include <math.h>\nint main(void) { return (int)sqrt(49.0); }\n",
+    );
+    let exe = dir.path().join("rsplink");
+    let rsp = dir.path().join("link.rsp");
+    std::fs::write(
+        &rsp,
+        format!("-o '{}' '{}' -lm\n", exe.display(), src.display()),
+    )
+    .unwrap();
+    let r = run_c17(&[&format!("@{}", rsp.display())]);
+    assert!(r.success, "{}", r.stderr);
+    let status = std::process::Command::new(&exe).status().expect("run");
+    assert_eq!(status.code(), Some(7));
+}

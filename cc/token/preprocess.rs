@@ -648,6 +648,15 @@ struct LineMarker {
 /// on and only needs to reproduce.
 const PRAGMA_TEXT_PREFIX: &str = "text:";
 
+/// The gcc release c17 claims to be, as `[major, minor, patchlevel]`.
+///
+/// One value for every place the claim is made: `__GNUC__`,
+/// `__GNUC_MINOR__`, `__GNUC_PATCHLEVEL__` and `__VERSION__` here, and the
+/// driver's `-dumpversion`, `-dumpfullversion` and `-v` banner. A configure
+/// script that compares the two must find them agreeing. Why it is 7.5.0 is
+/// set out where the macros are defined.
+pub const GNUC_VERSION: [&str; 3] = ["7", "5", "0"];
+
 /// The directive a marker token stands for, when it is one c17 only carries.
 ///
 /// `#pragma pack` is the one pragma that changes what the compiler does, so it
@@ -1065,17 +1074,16 @@ impl<'a> Preprocessor<'a> {
         //        by name
         //   8.0  <tgmath.h> needs `__builtin_tgmath`, and <sys/cdefs.h>
         //        the `nonstring` attribute. That is the ceiling.
-        self.define_macro(Macro::predefined("__GNUC__", Some("7")));
-        self.define_macro(Macro::predefined("__GNUC_MINOR__", Some("5")));
-        self.define_macro(Macro::predefined("__GNUC_PATCHLEVEL__", Some("0")));
-        self.define_macro(Macro::predefined(
-            "__VERSION__",
-            Some(concat!(
-                "\"c17 ",
-                env!("CARGO_PKG_VERSION"),
-                " (gcc compatible 7.5.0)\""
-            )),
-        ));
+        let [major, minor, patchlevel] = GNUC_VERSION;
+        self.define_macro(Macro::predefined("__GNUC__", Some(major)));
+        self.define_macro(Macro::predefined("__GNUC_MINOR__", Some(minor)));
+        self.define_macro(Macro::predefined("__GNUC_PATCHLEVEL__", Some(patchlevel)));
+        let version = format!(
+            "\"c17 {} (gcc compatible {})\"",
+            env!("CARGO_PKG_VERSION"),
+            GNUC_VERSION.join(".")
+        );
+        self.define_macro(Macro::predefined("__VERSION__", Some(&version)));
         self.define_macro(Macro::predefined("__GNUC_STDC_INLINE__", Some("1")));
 
         // GCC type keyword compatibility

@@ -183,6 +183,22 @@ fn test_predefined_arch() {
     assert!(pp.is_defined("__x86_64__") || pp.is_defined("__aarch64__"));
 }
 
+/// The version macros spell `GNUC_VERSION`, which the driver's
+/// `-dumpversion` and `-dumpfullversion` print.
+#[test]
+fn test_predefined_gnuc_version_is_gnuc_version() {
+    let (tokens, idents) =
+        preprocess_str("__GNUC__ __GNUC_MINOR__ __GNUC_PATCHLEVEL__ __VERSION__");
+    let strs = get_token_strings(&tokens, &idents);
+    assert_eq!(strs[..3], GNUC_VERSION);
+    let version = format!(
+        "\"c17 {} (gcc compatible {})\"",
+        env!("CARGO_PKG_VERSION"),
+        GNUC_VERSION.join(".")
+    );
+    assert_eq!(strs[3], version);
+}
+
 #[test]
 fn test_line_macro() {
     let (tokens, _idents) = preprocess_str("__LINE__");

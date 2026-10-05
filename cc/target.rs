@@ -880,11 +880,52 @@ impl Target {
 
         Some(Self::new(arch, os))
     }
+
+    /// The triple gcc's `-dumpmachine` prints for this target.
+    ///
+    /// Debian's spelling on Linux, which is also the multiarch directory
+    /// name; Apple's `arm64` on macOS, where the system compiler is clang. No
+    /// OS release is appended: c17 does not target one release over another.
+    /// Each round-trips through [`Target::from_triple`].
+    pub fn gcc_triple(&self) -> &'static str {
+        match (self.arch, self.os) {
+            (Arch::X86_64, Os::Linux) => "x86_64-linux-gnu",
+            (Arch::Aarch64, Os::Linux) => "aarch64-linux-gnu",
+            (Arch::X86_64, Os::MacOS) => "x86_64-apple-darwin",
+            (Arch::Aarch64, Os::MacOS) => "arm64-apple-darwin",
+            (Arch::X86_64, Os::FreeBSD) => "x86_64-unknown-freebsd",
+            (Arch::Aarch64, Os::FreeBSD) => "aarch64-unknown-freebsd",
+        }
+    }
+
+    /// The multiarch tuple `-print-multiarch` prints: Debian's library
+    /// directory name, which only Linux has.
+    pub fn multiarch(&self) -> Option<&'static str> {
+        (self.os == Os::Linux).then(|| self.gcc_triple())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every gcc triple names its own target again, and multiarch is the
+    /// triple on Linux and nothing elsewhere.
+    #[test]
+    fn test_gcc_triple_round_trips() {
+        for arch in [Arch::X86_64, Arch::Aarch64] {
+            for os in [Os::Linux, Os::MacOS, Os::FreeBSD] {
+                let t = Target::new(arch, os);
+                let back = Target::from_triple(t.gcc_triple()).expect("parses");
+                assert_eq!((back.arch, back.os), (arch, os), "{}", t.gcc_triple());
+                assert_eq!(t.multiarch().is_some(), os == Os::Linux);
+            }
+        }
+        assert_eq!(
+            Target::new(Arch::Aarch64, Os::Linux).multiarch(),
+            Some("aarch64-linux-gnu")
+        );
+    }
 
     /// Each level implies the ones below it, enabling options accumulate, and
     /// gcc's -msse4.2 brings POPCNT with it.

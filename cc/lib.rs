@@ -29,6 +29,7 @@ pub mod os;
 pub mod parse;
 pub mod pipeline;
 pub mod ppargs;
+pub mod respfile;
 pub mod rtlib;
 pub mod strings;
 pub mod symbol;

@@ -18,6 +18,7 @@ use posixutils_cc::linkargs;
 use posixutils_cc::opt;
 use posixutils_cc::parse;
 use posixutils_cc::pipeline;
+use posixutils_cc::respfile;
 use posixutils_cc::strings;
 use posixutils_cc::symbol;
 use posixutils_cc::target;
@@ -77,7 +78,8 @@ impl RuntimeLib {
     about = gettext("c17 - compile standard C programs")
 )]
 struct Args {
-    #[arg(required_unless_present = "print_targets", help = gettext("Input files"))]
+    /// Not required with `-v` alone, which prints gcc's version banner.
+    #[arg(required_unless_present_any = ["print_targets", "verbose"], help = gettext("Input files"))]
     files: Vec<String>,
 
     /// Print registered targets
@@ -1321,6 +1323,26 @@ impl StripBy {
     }
 }
 
+/// The host driver option that leads the link line and says what kind of
+/// file it makes.
+///
+/// A static link is never `-pie`: gcc's answer to `-pie -static` is a
+/// fixed-address static executable, and c17 compiles position-independent
+/// code by default, which is what makes `-pie` the default here. Only
+/// `-static-pie` asks for both.
+fn link_mode_flag(args: &Args, target: &Target) -> &'static str {
+    let has = |flag: &str| args.linker_flags.iter().any(|f| f == flag);
+    if producing_shared(args) {
+        "-shared"
+    } else if has("-static-pie") {
+        "-static-pie"
+    } else if has("-static") || !pie_enabled(args, target) {
+        "-no-pie"
+    } else {
+        "-pie"
+    }
+}
+
 /// Link `link_line` into `exe_file`, preserving the order given.
 fn link_objects(
     link_line: &[LinkItem],
@@ -1328,14 +1350,8 @@ fn link_objects(
     args: &Args,
     target: &Target,
 ) -> io::Result<()> {
-    let mut link_cmd = Command::new("cc");
-    if producing_shared(args) {
-        link_cmd.arg("-shared");
-    } else if pie_enabled(args, target) {
-        link_cmd.arg("-pie");
-    } else {
-        link_cmd.arg("-no-pie");
-    }
+    let mut link_cmd = linkargs::host_driver();
+    link_cmd.arg(link_mode_flag(args, target));
     link_cmd.args(["-o", exe_file]);
 
     // -B selects which form of a library `-l` prefers. GNU ld spells this
@@ -1500,8 +1516,17 @@ fn is_valid_opt_level(s: &str) -> bool {
 }
 
 /// Preprocess this process's command-line arguments for gcc compatibility.
+///
+/// `@file` response files are expanded first, so the rewriting below, clap and
+/// `linkargs::scan` all read the same, complete argument vector.
 fn preprocess_args() -> Vec<String> {
-    preprocess_args_from(std::env::args().collect())
+    match respfile::expand(std::env::args().collect()) {
+        Ok(argv) => preprocess_args_from(argv),
+        Err(e) => {
+            eprintln!("c17: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Preprocess command-line arguments for gcc compatibility.
@@ -1935,15 +1960,17 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             // -rdynamic -> pass to linker
             result.push("--c17-linker-flag=-rdynamic".to_string());
             i += 1;
-        } else if arg == "--print-multiarch" {
-            // GCC compatibility: print multiarch tuple and exit
-            let target = Target::host();
-            match (target.arch, target.os) {
-                (target::Arch::X86_64, Os::Linux) => println!("x86_64-linux-gnu"),
-                (target::Arch::Aarch64, Os::Linux) => println!("aarch64-linux-gnu"),
-                _ => {} // Empty output for unsupported platforms
+        } else if arg == "-static" || arg == "-static-pie" {
+            // For the link step, which reads them to choose its leading
+            // option: see `link_mode_flag`. clap would read `-static` as the
+            // short cluster `-s -t -a ...`. A static PIE is still a PIE.
+            if arg == "-static-pie" {
+                result.push("--c17-fpie".to_string());
             }
-            std::process::exit(0);
+            result.push(format!("--c17-linker-flag={arg}"));
+            i += 1;
+        } else if let Some(status) = answer_driver_query(arg, &raw_args) {
+            std::process::exit(status);
         } else if let Some(prog) = arg.strip_prefix("-print-prog-name=") {
             // GCC compatibility: print program path and exit
             // Just echo back the program name (like gcc does when it doesn't have a special path)
@@ -1982,6 +2009,94 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     result
 }
 
+/// Answer one of gcc's driver queries, returning the exit status, or `None`
+/// when `arg` is not one.
+///
+/// Build systems run these alone and use the answer verbatim -- in a `-D`
+/// macro, a library search path, a cross-compile check -- so each prints
+/// exactly the answer and nothing else. The target ones honour `--target`
+/// wherever it stands on the line; the link ones go to the host driver, which
+/// does the linking. `-dumpversion` is the major version alone, as since gcc
+/// 7. (`-v` with no operands is in `compile_main`, since only clap knows
+/// what an operand is.)
+fn answer_driver_query(arg: &str, raw_args: &[String]) -> Option<i32> {
+    // gcc takes every `-print-` query with two dashes as well.
+    let query = arg
+        .strip_prefix('-')
+        .filter(|q| q.starts_with("-print-"))
+        .unwrap_or(arg);
+    match query {
+        "-dumpmachine" => println!("{}", query_target(raw_args).gcc_triple()),
+        "-print-multiarch" => {
+            if let Some(tuple) = query_target(raw_args).multiarch() {
+                println!("{tuple}");
+            }
+        }
+        "-dumpversion" => println!("{}", token::preprocess::GNUC_VERSION[0]),
+        "-dumpfullversion" => println!("{}", token::preprocess::GNUC_VERSION.join(".")),
+        "-print-search-dirs" | "-print-libgcc-file-name" | "-print-multi-os-directory" => {
+            return Some(forward_to_host_driver(query));
+        }
+        _ if query.starts_with("-print-file-name=") => {
+            return Some(forward_to_host_driver(query));
+        }
+        _ => return None,
+    }
+    Some(0)
+}
+
+/// The target named by `--target` in either spelling, last one winning, or
+/// the host. An unknown triple ends the run, as it would a compile.
+fn query_target(raw_args: &[String]) -> Target {
+    let mut triple = None;
+    let mut it = raw_args.iter().skip(1);
+    while let Some(arg) = it.next() {
+        if let Some(t) = arg.strip_prefix("--target=") {
+            triple = Some(t);
+        } else if arg == "--target" {
+            triple = it.next().map(String::as_str);
+        }
+    }
+    let Some(triple) = triple else {
+        return Target::host();
+    };
+    Target::from_triple(triple).unwrap_or_else(|| {
+        eprintln!("c17: {}: {}", gettext("unsupported target"), triple);
+        std::process::exit(1);
+    })
+}
+
+/// Put `query` to the host driver and pass on its answer and exit status.
+fn forward_to_host_driver(query: &str) -> i32 {
+    match linkargs::host_driver().arg(query).output() {
+        Ok(out) => {
+            let _ = io::stdout().write_all(&out.stdout);
+            let _ = io::stderr().write_all(&out.stderr);
+            out.status.code().unwrap_or(1)
+        }
+        Err(e) => {
+            eprintln!("c17: cc: {e}");
+            1
+        }
+    }
+}
+
+/// gcc's `-v` banner, printed when `-v` is given with nothing to compile.
+///
+/// libtool and autoconf run `$CC -v` and log what it says, and probes that
+/// want to know which compiler this is look for the line `gcc version`, so
+/// that line carries the version `__GNUC__` claims, with c17 in the place
+/// gcc puts its package version. `Target:` and `Thread model:` are spelled
+/// as gcc spells them.
+fn version_banner(target: &Target) -> String {
+    format!(
+        "c17 version {pkg}\nTarget: {triple}\nThread model: posix\ngcc version {gnuc} (c17 {pkg})\n",
+        pkg = env!("CARGO_PKG_VERSION"),
+        triple = target.gcc_triple(),
+        gnuc = token::preprocess::GNUC_VERSION.join("."),
+    )
+}
+
 /// Refuse the `-m` flags that ask for code c17 does not generate.
 ///
 /// What stays is what changes nothing: the target's own word size, and
@@ -2014,6 +2129,15 @@ fn check_machine_flags(flags: &[String], target: &Target) {
                     matches!(flag, "-mabi=lp64" | "-mlittle-endian" | "-mcmodel=small")
                 }
             }
+            // Both are no-ops. Every function's prologue sets up the frame
+            // pointer, leaf or not -- `emit_prologue` in `arch/*/frame.rs`
+            // pushes %rbp, or stores x29 and x30, unconditionally -- so the
+            // `-mno-` form asks for what is already so, and the other only
+            // permits an omission c17 never makes.
+            || matches!(
+                flag,
+                "-mno-omit-leaf-frame-pointer" | "-momit-leaf-frame-pointer"
+            )
     };
     let refused: Vec<&String> = flags.iter().filter(|f| !accepted(f)).collect();
     if refused.is_empty() {
@@ -2485,6 +2609,11 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Target::host()
     };
+
+    if args.verbose && args.files.is_empty() {
+        eprint!("{}", version_banner(&target));
+        return Ok(());
+    }
 
     check_machine_flags(&args.mflags, &target);
     if target.arch == target::Arch::X86_64 {
@@ -3061,6 +3190,37 @@ mod tests {
         let result = run_preprocess(&["-no-pie", "foo.c"]);
         assert!(result.contains(&"--c17-fno-pie".to_string()));
         assert!(result.contains(&"--c17-linker-flag=-no-pie".to_string()));
+    }
+
+    #[test]
+    fn test_preprocess_static_is_a_linker_flag() {
+        // Not the short cluster `-s -t -a -t -i -c`.
+        let result = run_preprocess(&["-static", "foo.c"]);
+        assert!(result.contains(&"--c17-linker-flag=-static".to_string()));
+        assert!(!result.contains(&"-static".to_string()));
+        assert!(!result.contains(&"--c17-fpie".to_string()));
+
+        let result = run_preprocess(&["-static-pie", "foo.c"]);
+        assert!(result.contains(&"--c17-linker-flag=-static-pie".to_string()));
+        assert!(result.contains(&"--c17-fpie".to_string()));
+    }
+
+    /// A static link leads with `-no-pie` whatever PIE request came with it;
+    /// only `-static-pie` makes a static PIE.
+    #[test]
+    fn test_link_mode_flag() {
+        let linux = Target::new(target::Arch::X86_64, Os::Linux);
+        let mode = |argv: &[&str]| {
+            let args = Args::parse_from(run_preprocess(argv));
+            link_mode_flag(&args, &linux)
+        };
+        assert_eq!(mode(&["foo.c"]), "-pie");
+        assert_eq!(mode(&["-no-pie", "foo.c"]), "-no-pie");
+        assert_eq!(mode(&["-static", "foo.c"]), "-no-pie");
+        assert_eq!(mode(&["-pie", "-static", "foo.c"]), "-no-pie");
+        assert_eq!(mode(&["-static", "-fPIE", "foo.c"]), "-no-pie");
+        assert_eq!(mode(&["-static-pie", "foo.c"]), "-static-pie");
+        assert_eq!(mode(&["-shared", "-static", "foo.c"]), "-shared");
     }
 
     // Tests for linker passthrough flags

@@ -36,8 +36,7 @@
 
 use super::linearize::{Linearizer, Scope};
 use super::{Instruction, PseudoId};
-use crate::parse::ast::{Expr, InitDeclarator};
-use crate::strings::StringId;
+use crate::parse::ast::{Expr, InitDeclarator, LabelId};
 use crate::symbol::SymbolId;
 use crate::types::TypeId;
 
@@ -63,9 +62,8 @@ pub(crate) enum ScopeExit {
     Break,
     /// `continue`: the innermost loop's body.
     Continue,
-    /// `goto` the label of this name: every scope it is in and its label is
-    /// not.
-    Goto(StringId),
+    /// `goto` this label: every scope the jump is in and its label is not.
+    Goto(LabelId),
 }
 
 impl Linearizer<'_> {

@@ -857,10 +857,10 @@ pub enum ExprKind {
 
     /// GNU label address: `&&label`, of type `void *`.
     ///
-    /// The label need not be declared yet -- taking its address before the
-    /// labelled statement is the usual shape -- so this holds the name and is
-    /// resolved when the function is linearized.
-    LabelAddr(StringId),
+    /// The label need not be defined yet -- taking its address before the
+    /// labelled statement is the usual shape -- so this holds the label's
+    /// identity and the block is found when the function is linearized.
+    LabelAddr(LabelId),
 
     /// Initializer list: {1, 2, 3} or {.x = 1, [0] = 2}
     InitList {
@@ -2092,11 +2092,49 @@ pub struct AsmOperand {
     pub expr: Expr,
 }
 
+/// Which declaration of a label name a label or a jump means.
+///
+/// A label is the function's unless a GNU `__label__` declaration at the
+/// head of an enclosing block or statement expression names it, which makes
+/// it local to that block and shadows any outer label of the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LabelScope {
+    /// An ordinary label, whose scope is the whole function (C17 6.2.1p3).
+    Function,
+    /// A label declared by `__label__`. Each declaration gets its own
+    /// number, unique within the translation unit, so two expansions of one
+    /// macro declare two different labels.
+    Local(u32),
+}
+
+/// A label's identity: its spelling and the declaration it resolves to.
+///
+/// Resolved by the parser, which alone sees which `__label__` declarations
+/// are in force; every later consumer keys labels by this rather than by
+/// the spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LabelId {
+    /// The label as written.
+    pub name: StringId,
+    /// Which declaration of `name` it is.
+    pub scope: LabelScope,
+}
+
+impl LabelId {
+    /// An ordinary function-scope label.
+    pub fn function(name: StringId) -> Self {
+        LabelId {
+            name,
+            scope: LabelScope::Function,
+        }
+    }
+}
+
 /// One label of a [`Stmt::Labeled`] (C17 6.8.1).
 #[derive(Debug, Clone)]
 pub enum Label {
     /// `name:`, the target of a `goto`.
-    Named { name: StringId, pos: Position },
+    Named { label: LabelId, pos: Position },
 
     /// Case label: `case expr:`, or the GNU range `case lo ... hi:`.
     ///
@@ -2161,7 +2199,7 @@ pub enum Stmt {
     Continue(Position),
 
     /// Goto statement: goto label;
-    Goto { name: StringId, pos: Position },
+    Goto { label: LabelId, pos: Position },
 
     /// GNU computed goto: `goto *expr;`. The operand is a label address
     /// produced by [`ExprKind::LabelAddr`], though C says only that it is a
@@ -2205,7 +2243,7 @@ pub enum Stmt {
         /// Clobber list: registers and special values ("memory", "cc")
         clobbers: Vec<String>,
         /// Goto labels for asm goto (4th colon): labels the asm can jump to
-        goto_labels: Vec<StringId>,
+        goto_labels: Vec<LabelId>,
     },
 }
 

@@ -1196,6 +1196,9 @@ define_keywords! {
     // `__auto_type`: a declaration whose type is its initializer's. A type
     // specifier, and reserved like every `__` spelling. Appended, as above.
     (GNU_AUTO_TYPE,     "__auto_type",       TYPE_SPEC | TYPE_KEYWORD | RESERVED_NAME),
+    // `__label__`: declares labels local to a block, at its head. A
+    // statement keyword, so it is never itself a label. Appended, as above.
+    (GNU_LABEL,         "__label__",         STMT_KW | RESERVED_NAME),
 }
 
 // Tag query API

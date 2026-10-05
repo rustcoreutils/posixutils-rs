@@ -435,3 +435,54 @@ fn diagnostics_auto_type_misuse() {
         crate::test_compile::compile_expect_error(name, src, want);
     }
 }
+
+/// A local label is out of scope outside its block, may be declared only
+/// at the head of one, and is still defined once, in gcc's words.
+#[test]
+fn diagnostics_local_label_scope_and_placement() {
+    for (name, src, want) in [
+        (
+            "local_label_out_of_scope",
+            "void f(void) { { __label__ x; x: ; } goto x; }\n",
+            "label 'x' used but not defined",
+        ),
+        (
+            "local_label_after_a_declaration",
+            "void f(void) { int a; __label__ x; x: ; }\n",
+            "expected expression before '__label__'",
+        ),
+        (
+            "local_label_at_file_scope",
+            "__label__ x;\n",
+            "expected identifier or '(' before '__label__'",
+        ),
+        (
+            "local_label_defined_twice",
+            "void f(void) { __label__ x; x: ; x: ; }\n",
+            "duplicate label 'x'",
+        ),
+    ] {
+        crate::test_compile::compile_expect_error(name, src, want);
+    }
+}
+
+/// A jump to a local label is held to the rules for any label: it may not
+/// enter a variably modified scope or a statement expression.
+#[test]
+fn diagnostics_local_label_protected_scopes() {
+    for (name, src, want) in [
+        (
+            "local_label_into_vla_scope",
+            "void g(int *);\n\
+             void f(int n) { { __label__ in; goto in; { int v[n]; in: g(v); } } }\n",
+            "jump into the scope of 'v', which has a variably modified type",
+        ),
+        (
+            "local_label_into_stmt_expr",
+            "void f(void) { { __label__ in; goto in; (void)({ in: 0; }); } }\n",
+            "jump into statement expression",
+        ),
+    ] {
+        crate::test_compile::compile_expect_error(name, src, want);
+    }
+}

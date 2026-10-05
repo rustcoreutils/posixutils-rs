@@ -9,7 +9,7 @@
 // GCC asm labels on declarations and extended asm statements
 //
 
-use super::ast::{AsmOperand, Stmt};
+use super::ast::{AsmOperand, LabelId, Stmt};
 use super::parser::{ParseError, ParseResult, Parser};
 use crate::strings::StringId;
 use crate::symbol::Namespace;
@@ -331,7 +331,7 @@ impl Parser<'_> {
     }
 
     /// Parse asm goto label list: label1, label2, ...
-    fn parse_asm_goto_labels(&mut self) -> ParseResult<Vec<StringId>> {
+    fn parse_asm_goto_labels(&mut self) -> ParseResult<Vec<LabelId>> {
         let mut labels = Vec::new();
 
         // Allow empty label list
@@ -348,7 +348,7 @@ impl Parser<'_> {
             }
             let token = self.consume();
             if let TokenValue::Ident(label_id) = token.value {
-                labels.push(label_id);
+                labels.push(self.resolve_label(label_id));
             }
 
             if self.is_special(b',') {

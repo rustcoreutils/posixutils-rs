@@ -297,6 +297,14 @@ impl Parser<'_> {
     }
 
     pub(crate) fn parse_external_decl(&mut self) -> ParseResult<ExternalDecl> {
+        // `__label__` declares labels local to a block; at file scope gcc
+        // reads it as a misplaced keyword where a declarator should begin.
+        if self.current_ident() == Some(crate::kw::GNU_LABEL) {
+            return Err(ParseError::new(
+                gettext("expected identifier or '(' before '__label__'"),
+                self.current_pos(),
+            ));
+        }
         if self.at_attribute_declaration() {
             return self.parse_file_attribute_declaration();
         }

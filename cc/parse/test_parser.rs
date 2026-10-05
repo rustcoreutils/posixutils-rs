@@ -14,8 +14,8 @@
 use crate::float::IntegralRounding;
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, CalleeBinding, Declaration, Designator, Expr, ExprKind,
-    ExternalDecl, ForInit, FpTest, FunctionDef, InlineLibraryFn, Label, LibFn, MathErrno, MemoryFn,
-    Stmt, TranslationUnit, UnaryOp,
+    ExternalDecl, ForInit, FpTest, FunctionDef, InlineLibraryFn, Label, LabelScope, LibFn,
+    MathErrno, MemoryFn, Stmt, TranslationUnit, UnaryOp,
 };
 use crate::parse::parser::{ParseResult, Parser};
 use crate::strings::{StringId, StringTable};
@@ -1781,7 +1781,10 @@ fn test_continue_stmt() {
 fn test_goto_stmt() {
     let (stmt, strings) = parse_stmt("goto label;").unwrap();
     match stmt {
-        Stmt::Goto { name, .. } => check_name(&strings, name, "label"),
+        Stmt::Goto { label, .. } => {
+            check_name(&strings, label.name, "label");
+            assert_eq!(label.scope, LabelScope::Function);
+        }
         _ => panic!("Expected Goto"),
     }
 }
@@ -1814,10 +1817,10 @@ fn test_labeled_stmt() {
     let (stmt, strings) = parse_stmt("label: x = 1;").unwrap();
     match stmt {
         Stmt::Labeled { labels, stmt } => {
-            let [Label::Named { name, .. }] = labels.as_slice() else {
+            let [Label::Named { label, .. }] = labels.as_slice() else {
                 panic!("expected one goto label: {labels:?}");
             };
-            check_name(&strings, *name, "label");
+            check_name(&strings, label.name, "label");
             assert!(matches!(*stmt, Stmt::Expr(_)));
         }
         _ => panic!("Expected Label"),
@@ -1833,13 +1836,13 @@ fn test_consecutive_labels_are_one_list() {
     let Stmt::Labeled { labels, stmt } = stmt else {
         panic!("expected a labeled statement: {stmt:?}");
     };
-    let [Label::Case(_, None), Label::Named { name: a, .. }, Label::Default(_), Label::Case(_, Some(_)), Label::Named { name: b, .. }] =
+    let [Label::Case(_, None), Label::Named { label: a, .. }, Label::Default(_), Label::Case(_, Some(_)), Label::Named { label: b, .. }] =
         labels.as_slice()
     else {
         panic!("labels out of order: {labels:?}");
     };
-    check_name(&strings, *a, "a");
-    check_name(&strings, *b, "b");
+    check_name(&strings, a.name, "a");
+    check_name(&strings, b.name, "b");
     assert!(matches!(*stmt, Stmt::Expr(_)), "{stmt:?}");
 }
 

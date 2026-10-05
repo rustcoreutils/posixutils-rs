@@ -778,8 +778,9 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let name = self.expect_identifier()?;
+            let label = self.resolve_label(name);
             return Ok(Self::typed_expr(
-                ExprKind::LabelAddr(name),
+                ExprKind::LabelAddr(label),
                 self.types.void_ptr_id,
                 op_pos,
             ));
@@ -2518,6 +2519,16 @@ impl<'a> Parser<'a> {
                 let token_pos = token.pos;
                 if let TokenValue::Ident(id) = &token.value {
                     let name_id = *id;
+
+                    // `__label__` declares local labels at the head of a
+                    // block and nowhere else; anywhere a statement or an
+                    // expression is wanted, gcc takes it as neither.
+                    if name_id == crate::kw::GNU_LABEL {
+                        return Err(ParseError::new(
+                            gettext("expected expression before '__label__'"),
+                            token_pos,
+                        ));
+                    }
 
                     // Try builtin dispatch first, unless a declaration in scope
                     // has claimed the name (see `builtin_is_shadowed`).

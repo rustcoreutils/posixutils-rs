@@ -24,8 +24,8 @@ use crate::ir::linearize_emit::CompoundAssign;
 use crate::ir::linearize_stmt::SwitchCtx;
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef,
-    GnuAtomicOp, InitElement, InlineLibraryFn, MemoryFn, NarrowedLibraryCall, OffsetOfPath,
-    ParamStyle, TranslationUnit, UnaryOp,
+    GnuAtomicOp, InitElement, InlineLibraryFn, LabelId, MemoryFn, NarrowedLibraryCall,
+    OffsetOfPath, ParamStyle, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
@@ -673,8 +673,9 @@ pub struct Linearizer<'a> {
     /// declaration -- a typedef inside a loop -- overwrites the entry, which
     /// is exactly what "each time it is reached" asks for.
     pub(crate) vm_typedef_dims: HashMap<SymbolId, Vec<VmDim>>,
-    /// Label -> basic block mapping
-    pub(crate) label_map: HashMap<String, BasicBlockId>,
+    /// Each label's basic block, keyed by the label's resolved identity: two
+    /// local labels of one spelling are two labels.
+    pub(crate) label_map: HashMap<LabelId, BasicBlockId>,
     /// Break target stack (for loops)
     pub(crate) break_targets: Vec<BasicBlockId>,
     /// Continue target stack (for loops)
@@ -715,14 +716,14 @@ pub struct Linearizer<'a> {
     /// `asm goto` -- with where each was written. Checked against
     /// `defined_labels` once the body is walked, because a forward reference
     /// is legal and only the end of the function settles it.
-    pub(crate) label_refs: Vec<(String, crate::diag::Position)>,
+    pub(crate) label_refs: Vec<(LabelId, crate::diag::Position)>,
 
     /// Labels this function actually defines.
-    pub(crate) defined_labels: std::collections::HashSet<String>,
+    pub(crate) defined_labels: std::collections::HashSet<LabelId>,
     /// Every label written in this function's body, including one inside an
     /// operand that is never evaluated -- `sizeof(({ L: x; }))` -- and so
     /// never defined by lowering.
-    pub(crate) written_labels: std::collections::HashSet<String>,
+    pub(crate) written_labels: std::collections::HashSet<LabelId>,
     /// How many VLA marks were in force at each label already linearized, for
     /// a function that declares a variable-length array.
     ///
@@ -773,7 +774,7 @@ pub struct Linearizer<'a> {
     /// outermost first: a `goto` runs the cleanup of every variable in scope
     /// at the jump and not at its label. Taken from the jump-scope walk,
     /// because a forward `goto` is lowered before its label.
-    pub(crate) label_cleanups: std::collections::HashMap<StringId, Vec<SymbolId>>,
+    pub(crate) label_cleanups: std::collections::HashMap<LabelId, Vec<SymbolId>>,
     /// Whether this function declares anything variably modified, and so
     /// needs the bookkeeping above.
     pub(crate) func_has_vla: bool,
@@ -6542,8 +6543,8 @@ impl<'a> Linearizer<'a> {
     }
 
     /// GNU `&&label`: the address of a label, for a computed goto.
-    fn linearize_label_addr(&mut self, name: &StringId, expr: &Expr) -> PseudoId {
-        let Some(sym) = self.take_label_address(*name, expr.pos) else {
+    fn linearize_label_addr(&mut self, label: LabelId, expr: &Expr) -> PseudoId {
+        let Some(sym) = self.take_label_address(label, expr.pos) else {
             return self.emit_const(0, self.types.void_ptr_id);
         };
         let sym_pseudo = self.sym_pseudo(sym);
@@ -6704,7 +6705,7 @@ impl<'a> Linearizer<'a> {
             // exactly this spelling -- `Label::name()` -- and both backends
             // already lower a leading-`.` global to a pc-relative address, so
             // this needs no opcode of its own.
-            ExprKind::LabelAddr(name) => self.linearize_label_addr(name, expr),
+            ExprKind::LabelAddr(label) => self.linearize_label_addr(*label, expr),
 
             // One extent of a variably modified `typedef`, evaluated when the
             // typedef's declaration was reached and stored in a hidden local

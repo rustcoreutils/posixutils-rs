@@ -45,6 +45,8 @@ mod test_float_n;
 #[cfg(test)]
 mod test_incomplete;
 #[cfg(test)]
+mod test_local_labels;
+#[cfg(test)]
 mod test_member_list;
 #[cfg(test)]
 mod test_parser;

@@ -21,9 +21,8 @@ use crate::diag::{error, Position};
 use crate::float::FloatVal;
 use crate::parse::ast::{
     AsmOperand, BinaryOp, BlockItem, Declaration, Expr, ExprKind, ForInit, InitElement, Label,
-    Stmt, UnaryOp,
+    LabelId, Stmt, UnaryOp,
 };
-use crate::strings::StringId;
 use crate::symbol::SymbolId;
 use crate::token::lexer::payload_bytes;
 use crate::types::TypeTable;
@@ -281,9 +280,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.current_bb = None;
             }
 
-            Stmt::Goto { name: label, pos } => {
-                let label_str = self.str(*label).to_string();
-                let target = self.refer_to_label(&label_str, *pos);
+            Stmt::Goto { label, pos } => {
+                let target = self.refer_to_label(*label, *pos);
                 if self.current_bb.is_some() {
                     self.leave_scopes(ScopeExit::Goto(*label));
                     self.release_vla_scopes_for_goto(target);
@@ -300,7 +298,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     match label {
                         Label::Case(expr, high) => self.enter_case_label(expr, high.as_ref()),
                         Label::Default(_) => self.enter_default_label(),
-                        Label::Named { name, .. } => self.place_label(*name),
+                        Label::Named { label, .. } => self.place_label(*label),
                     }
                 }
                 // Then the statement the labels prefix, which is where their
@@ -1730,14 +1728,15 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// or hung. Checked once the body is walked, because a forward reference
     /// is legal.
     pub(crate) fn check_label_references(&mut self) {
-        for (name, pos) in std::mem::take(&mut self.label_refs) {
-            if self.defined_labels.contains(&name) {
+        for (label, pos) in std::mem::take(&mut self.label_refs) {
+            if self.defined_labels.contains(&label) {
                 continue;
             }
-            if self.written_labels.contains(&name) {
-                self.place_unevaluated_label(&name);
+            if self.written_labels.contains(&label) {
+                self.place_unevaluated_label(label);
                 continue;
             }
+            let name = self.str(label.name).to_string();
             crate::diag::error_args(pos, "label '{0}' used but not defined", &[&name]);
         }
     }
@@ -1750,12 +1749,12 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// `goto` to it has already been reported as a jump into a statement
     /// expression, which is gcc's one error, and gcc accepts `&&L`, whose
     /// address has to name some block.
-    fn place_unevaluated_label(&mut self, name: &str) {
+    fn place_unevaluated_label(&mut self, label: LabelId) {
         let resume = self.current_bb;
-        let label_bb = self.get_or_create_label(name);
+        let label_bb = self.get_or_create_label(label);
         self.switch_bb(label_bb);
         self.emit(Instruction::new(Opcode::Unreachable).with_type(self.types.void_id));
-        self.defined_labels.insert(name.to_string());
+        self.defined_labels.insert(label);
         self.current_bb = resume;
     }
 
@@ -1809,8 +1808,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         // `L: i++; if (i<2) goto L; L: return i;` looped forever.
         let (first_label, duplicates) = w.resolve_labels();
         for i in duplicates {
-            let (name, _, pos) = &w.labels[i];
-            let spelled = self.strings.get(*name).to_string();
+            let (label, _, pos) = &w.labels[i];
+            let spelled = self.strings.get(label.name).to_string();
             crate::diag::error_args(*pos, "duplicate label '{0}'", &[&spelled]);
         }
 
@@ -1844,13 +1843,9 @@ impl<'a> super::linearize::Linearizer<'a> {
 
         let cleanups = first_label
             .iter()
-            .map(|(&name, &i)| (name, w.cleanup_vars(&w.labels[i].1)))
+            .map(|(&label, &i)| (label, w.cleanup_vars(&w.labels[i].1)))
             .collect();
-        let written = w
-            .labels
-            .iter()
-            .map(|(name, _, _)| self.strings.get(*name).to_string())
-            .collect();
+        let written = w.labels.iter().map(|(label, _, _)| *label).collect();
         LabelScopes { written, cleanups }
     }
 
@@ -2709,7 +2704,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         outputs: &[AsmOperand],
         inputs: &[AsmOperand],
         clobbers: &[String],
-        goto_labels: &[StringId],
+        goto_labels: &[LabelId],
     ) {
         let mut ir_outputs = Vec::new();
         let mut ir_inputs = Vec::new();
@@ -2936,10 +2931,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         let pos = self.current_pos.unwrap_or_default();
         let ir_goto_labels: Vec<(BasicBlockId, String)> = goto_labels
             .iter()
-            .map(|label_id| {
-                let label_name = self.str(*label_id).to_string();
-                let bb = self.refer_to_label(&label_name, pos);
-                (bb, label_name)
+            .map(|&label| {
+                let bb = self.refer_to_label(label, pos);
+                // The template names the label as written: `%l[name]`.
+                (bb, self.str(label.name).to_string())
             })
             .collect();
 
@@ -3332,15 +3327,14 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// Define label `name` here: fall into its block and continue there.
+    /// Define `label` here: fall into its block and continue there.
     ///
     /// Every named label is placed through this, which is what records it as
     /// defined -- `&&lbl` naming a label between the case labels of a
     /// `switch` included.
-    fn place_label(&mut self, name: StringId) {
-        let name_str = self.str(name).to_string();
-        self.defined_labels.insert(name_str.clone());
-        let label_bb = self.get_or_create_label(&name_str);
+    fn place_label(&mut self, label: LabelId) {
+        self.defined_labels.insert(label);
+        let label_bb = self.get_or_create_label(label);
 
         // If current block is not terminated, branch to label
         if !self.is_terminated() {
@@ -3369,12 +3363,12 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// The block for label `name`, named by a `goto`, `&&label` or `asm goto`
-    /// at `pos`. Recorded so `check_label_references` can insist the label
+    /// The block for `label`, named by a `goto`, `&&label` or `asm goto` at
+    /// `pos`. Recorded so `check_label_references` can insist the label
     /// exists.
-    fn refer_to_label(&mut self, name: &str, pos: Position) -> BasicBlockId {
-        self.label_refs.push((name.to_string(), pos));
-        self.get_or_create_label(name)
+    fn refer_to_label(&mut self, label: LabelId, pos: Position) -> BasicBlockId {
+        self.label_refs.push((label, pos));
+        self.get_or_create_label(label)
     }
 
     /// The assembler symbol for `&&name` at `pos`, or `None` outside a
@@ -3382,8 +3376,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     ///
     /// The label becomes a branch target for every computed `goto` in the
     /// function, and the CFG has to say so or DCE deletes the block.
-    pub(crate) fn take_label_address(&mut self, name: StringId, pos: Position) -> Option<String> {
-        let label = self.str(name).to_string();
+    pub(crate) fn take_label_address(&mut self, label: LabelId, pos: Position) -> Option<String> {
         // Outside a function there is no block to name, and
         // `get_or_create_label` would unwrap a `None` current function -- an
         // ICE on `void *g = &&L;` at file scope.
@@ -3391,11 +3384,11 @@ impl<'a> super::linearize::Linearizer<'a> {
             crate::diag::error_args(
                 pos,
                 "label '{0}' referenced outside of any function",
-                &[&label],
+                &[self.str(label.name)],
             );
             return None;
         }
-        let bb = self.refer_to_label(&label, pos);
+        let bb = self.refer_to_label(label, pos);
         self.addr_taken_labels.push(bb);
         if let Some(func) = &mut self.current_func {
             func.takes_label_addr = true;
@@ -3403,15 +3396,17 @@ impl<'a> super::linearize::Linearizer<'a> {
         Some(bb.label_symbol(&self.current_func_name))
     }
 
-    pub(crate) fn get_or_create_label(&mut self, name: &str) -> BasicBlockId {
-        if let Some(&bb) = self.label_map.get(name) {
+    pub(crate) fn get_or_create_label(&mut self, label: LabelId) -> BasicBlockId {
+        if let Some(&bb) = self.label_map.get(&label) {
             bb
         } else {
             let bb = self.alloc_bb();
-            self.label_map.insert(name.to_string(), bb);
-            // Set label name on the block
+            self.label_map.insert(label, bb);
+            // The block shows the label as written. Two local labels of one
+            // spelling show alike, but they are two blocks.
+            let name = self.str(label.name).to_string();
             let block = self.get_or_create_bb(bb);
-            block.label = Some(name.to_string());
+            block.label = Some(name);
             bb
         }
     }
@@ -3443,16 +3438,16 @@ impl JumpScope {
 
 /// What the jump-scope walk tells the lowering about a function's labels.
 pub(crate) struct LabelScopes {
-    /// The name of every label the body writes, evaluated or not.
-    pub(crate) written: std::collections::HashSet<String>,
+    /// Every label the body writes, evaluated or not.
+    pub(crate) written: std::collections::HashSet<LabelId>,
     /// For each label, the variables with a cleanup in whose scope it lies,
     /// outermost first.
-    pub(crate) cleanups: std::collections::HashMap<StringId, Vec<crate::symbol::SymbolId>>,
+    pub(crate) cleanups: std::collections::HashMap<LabelId, Vec<crate::symbol::SymbolId>>,
 }
 
 /// A `goto`, or one label of an `asm goto`, as the walk found it.
 struct JumpRecord {
-    label: StringId,
+    label: LabelId,
     /// The scopes enclosing the jump.
     from: Vec<usize>,
     /// Where the jump was written. An `asm goto` records none for its
@@ -3474,8 +3469,8 @@ struct JumpScopeWalk {
     open: Vec<usize>,
     /// Every scope seen, indexed by scope id.
     scopes: Vec<JumpScope>,
-    /// Label name, the scopes enclosing it, and where it was written.
-    labels: Vec<(StringId, Vec<usize>, Position)>,
+    /// Each label, the scopes enclosing it, and where it was written.
+    labels: Vec<(LabelId, Vec<usize>, Position)>,
     /// Each `goto` and `asm goto` label.
     gotos: Vec<JumpRecord>,
     /// Scope ids a `case`/`default` was found inside but its `switch` was not,
@@ -3508,18 +3503,19 @@ impl JumpScopeWalk {
         w
     }
 
-    /// The first label of each name, as an index into `labels`, which is the
-    /// one a `goto` reaches; and in order, every later label of a name already
-    /// seen. One lookup per label: comparing each label with the labels before
-    /// it, and each `goto` with every label, was quadratic in the labels.
-    fn resolve_labels(&self) -> (std::collections::HashMap<StringId, usize>, Vec<usize>) {
+    /// The first definition of each label, as an index into `labels`, which
+    /// is the one a `goto` reaches; and in order, every later definition of a
+    /// label already seen. One lookup per label: comparing each label with the
+    /// labels before it, and each `goto` with every label, was quadratic in
+    /// the labels.
+    fn resolve_labels(&self) -> (std::collections::HashMap<LabelId, usize>, Vec<usize>) {
         let mut first = std::collections::HashMap::with_capacity(self.labels.len());
         let mut duplicates = Vec::new();
-        for (i, (name, _, _)) in self.labels.iter().enumerate() {
-            if first.contains_key(name) {
+        for (i, (label, _, _)) in self.labels.iter().enumerate() {
+            if first.contains_key(label) {
                 duplicates.push(i);
             } else {
-                first.insert(*name, i);
+                first.insert(*label, i);
             }
         }
         (first, duplicates)
@@ -3581,8 +3577,8 @@ impl JumpScopeWalk {
             Stmt::Labeled { labels, stmt } => {
                 for label in labels {
                     match label {
-                        Label::Named { name, pos } => {
-                            self.labels.push((*name, self.open.clone(), *pos));
+                        Label::Named { label, pos } => {
+                            self.labels.push((*label, self.open.clone(), *pos));
                         }
                         Label::Case(low, high) => {
                             self.walk_case(low.pos, "case", switch_scopes);
@@ -3596,8 +3592,8 @@ impl JumpScopeWalk {
                 }
                 self.walk(stmt, switch_scopes);
             }
-            Stmt::Goto { name, pos } => self.gotos.push(JumpRecord {
-                label: *name,
+            Stmt::Goto { label, pos } => self.gotos.push(JumpRecord {
+                label: *label,
                 from: self.open.clone(),
                 pos: Some(*pos),
             }),
@@ -3686,9 +3682,9 @@ impl JumpScopeWalk {
                 }
                 // An `asm goto` may branch to each label it names, and gcc
                 // holds each to the rule a `goto` is held to.
-                for name in goto_labels {
+                for label in goto_labels {
                     self.gotos.push(JumpRecord {
-                        label: *name,
+                        label: *label,
                         from: self.open.clone(),
                         pos: None,
                     });

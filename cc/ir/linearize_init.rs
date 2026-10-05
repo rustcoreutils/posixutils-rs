@@ -366,7 +366,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Every initializer that reaches here has static storage duration,
             // so the function can no longer be copied: see
             // `Function::saves_label_in_static`.
-            ExprKind::LabelAddr(name) => match self.take_label_address(*name, expr.pos) {
+            ExprKind::LabelAddr(label) => match self.take_label_address(*label, expr.pos) {
                 Some(sym) => {
                     if let Some(func) = &mut self.current_func {
                         func.saves_label_in_static = true;

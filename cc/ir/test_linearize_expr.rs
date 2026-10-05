@@ -1875,8 +1875,9 @@ fn test_complex_conversions_are_never_scalar() {
 
 /// Two vectors of integer lanes differing in signedness compare unsigned,
 /// whichever side is unsigned, as gcc does; arithmetic keeps the left
-/// operand's lane type. Asked of both targets, whatever the host: SSE2
-/// compares such words lane by lane, NEON with one unsigned `cmhi`.
+/// operand's lane type. Asked of both targets, whatever the host: each
+/// compares such words with one unsigned order -- SSE2's flipped-sign
+/// `pcmpgtw`, NEON's `cmhi`.
 #[test]
 fn test_vector_mixed_signedness_compares_unsigned() {
     use crate::ir::SimdOp;
@@ -1908,11 +1909,9 @@ fn test_vector_mixed_signedness_compares_unsigned() {
                 !ops.iter().any(|o| signed_ops.contains(o)),
                 "{arch:?} {name}: signed"
             );
-            let want = match arch {
-                Arch::X86_64 => unsigned,
-                Arch::Aarch64 => Opcode::Simd(SimdOp::CmpGtU),
-            };
+            let want = Opcode::Simd(SimdOp::CmpGtU);
             assert!(ops.contains(&want), "{arch:?} {name}: no {want:?}: {ops:?}");
+            assert!(!ops.contains(&unsigned), "{arch:?} {name}: lane by lane");
         }
         let div = ops("div");
         assert!(

@@ -213,6 +213,101 @@ void ucvt(v4sf *d, v4su *a) { *d = __builtin_convertvector(*a, v4sf); }
     }
 }
 
+/// What SSE2 builds from several instructions where SSE4.1 has one: a
+/// 32-bit lane multiply from two `pmuludq` (even lanes, then odd ones moved
+/// down) gathered with `pshufd`/`punpckldq`, and an unsigned order of
+/// words or dwords as the signed `pcmpgt` of operands whose sign bits are
+/// flipped. Both register widths: an eight-byte vector rides in the low
+/// half of an XMM register. No lane is computed one at a time.
+#[test]
+fn vector_native_x86_64_sse2_sequences() {
+    let src = r#"
+typedef int v4si __attribute__((vector_size(16)));
+typedef int v2si __attribute__((vector_size(8)));
+typedef unsigned v4su __attribute__((vector_size(16)));
+typedef unsigned v2su __attribute__((vector_size(8)));
+typedef short v8hi __attribute__((vector_size(16)));
+typedef short v4hi __attribute__((vector_size(8)));
+typedef unsigned short v8hu __attribute__((vector_size(16)));
+typedef unsigned short v4hu __attribute__((vector_size(8)));
+void mul(v4si *d, v4si *a, v4si *b) { *d = *a * *b; }
+void mulu(v4su *d, v4su *a, v4su *b) { *d = *a * *b; }
+void mul8(v2si *d, v2si *a, v2si *b) { *d = *a * *b; }
+void gtd(v4si *d, v4su *a, v4su *b) { *d = *a > *b; }
+void ged(v4si *d, v4su *a, v4su *b) { *d = *a >= *b; }
+void ltd(v4si *d, v4su *a, v4su *b) { *d = *a < *b; }
+void led(v4si *d, v4su *a, v4su *b) { *d = *a <= *b; }
+void gtw(v8hi *d, v8hu *a, v8hu *b) { *d = *a > *b; }
+void gew(v8hi *d, v8hu *a, v8hu *b) { *d = *a >= *b; }
+void ltw(v8hi *d, v8hu *a, v8hu *b) { *d = *a < *b; }
+void lew(v8hi *d, v8hu *a, v8hu *b) { *d = *a <= *b; }
+void gtd8(v2si *d, v2su *a, v2su *b) { *d = *a > *b; }
+void led8(v2si *d, v2su *a, v2su *b) { *d = *a <= *b; }
+void gtw8(v4hi *d, v4hu *a, v4hu *b) { *d = *a > *b; }
+void lew8(v4hi *d, v4hu *a, v4hu *b) { *d = *a <= *b; }
+"#;
+    // Scalar arithmetic, compares and the flag reads a lane loop needs.
+    let scalar = [
+        "imul", "cmpl", "cmpw", "seta", "setb", "setae", "setbe", "sbb", "cmov",
+    ];
+    for opt in ["-O0", "-O2"] {
+        let asm = super::asm_probe::asm_for_with("vec_sse2_seq", X86_64_LINUX, src, &[opt]);
+        for (f, want) in [
+            ("mul", &["pmuludq", "punpckldq"][..]),
+            ("mulu", &["pmuludq", "punpckldq"]),
+            ("mul8", &["pmuludq", "punpckldq"]),
+            ("gtd", &["pcmpgtd", "pxor"]),
+            ("ged", &["pcmpgtd", "pxor"]),
+            ("ltd", &["pcmpgtd", "pxor"]),
+            ("led", &["pcmpgtd", "pxor"]),
+            ("gtw", &["pcmpgtw", "pxor"]),
+            ("gew", &["pcmpgtw", "pxor"]),
+            ("ltw", &["pcmpgtw", "pxor"]),
+            ("lew", &["pcmpgtw", "pxor"]),
+            ("gtd8", &["pcmpgtd"]),
+            ("led8", &["pcmpgtd"]),
+            ("gtw8", &["pcmpgtw"]),
+            ("lew8", &["pcmpgtw"]),
+        ] {
+            let body = super::asm_probe::body_of(&asm, f);
+            for m in want {
+                assert!(body.contains(m), "{opt} {f}: no {m}:\n{body}");
+            }
+            for line in body.lines() {
+                let first = line.split_whitespace().next().unwrap_or("");
+                assert!(
+                    !scalar.iter().any(|s| first.starts_with(s)),
+                    "{opt} {f}: lane loop ({line}):\n{body}"
+                );
+            }
+            // The SSE4.1 forms need the flag.
+            for m in ["pmulld", "pminu"] {
+                assert!(!body.contains(m), "{opt} {f}: {m} without -msse4.1");
+            }
+        }
+    }
+}
+
+/// The SSE2 sequences need a third XMM temporary beyond the two scratch
+/// registers, which the allocator keeps free of every value live across
+/// them. Under an `ms_abi` function, where that register is callee-saved,
+/// the prologue saves it.
+#[test]
+fn vector_native_x86_64_sse2_third_scratch_is_saved_under_ms_abi() {
+    let src = r#"
+typedef int v4si __attribute__((vector_size(16)));
+__attribute__((ms_abi)) void mul(v4si *d, v4si *a, v4si *b) { *d = *a * *b; }
+"#;
+    let asm = asm_for("vec_sse2_ms_abi", X86_64_LINUX, src);
+    let body = super::asm_probe::body_of(&asm, "mul");
+    assert!(body.contains("pmuludq"), "no pmuludq:\n{body}");
+    assert!(
+        body.lines()
+            .any(|l| l.contains("%xmm13") && l.contains("(%r")),
+        "xmm13 not saved:\n{body}"
+    );
+}
+
 /// What each `-m` level adds to the packed instructions x86-64 uses.
 #[test]
 fn vector_native_x86_64_isa_levels() {
@@ -240,6 +335,8 @@ void rev(v8hi *d, v8hi *a) { *d = __builtin_shufflevector(*a, *a, 7, 6, 5, 4, 3,
         has(&base, "gtub", "pminub"),
         "SSE2 has the unsigned byte order"
     );
+    // SSE2 builds what SSE4.1 has as one instruction.
+    assert!(has(&base, "mul", "pmuludq") && has(&base, "geu", "pcmpgtd"));
     for (f, m) in [
         ("mul", "pmulld"),
         ("eqq", "pcmpeqq"),
@@ -255,6 +352,7 @@ void rev(v8hi *d, v8hi *a) { *d = __builtin_shufflevector(*a, *a, 7, 6, 5, 4, 3,
     for (f, m) in [("mul", "pmulld"), ("eqq", "pcmpeqq"), ("geu", "pminud")] {
         assert!(has(&sse41, f, m), "{f}: no {m} at SSE4.1");
     }
+    assert!(!has(&sse41, "mul", "pmuludq") && !has(&sse41, "geu", "pcmpgtd"));
     assert!(!has(&sse41, "gtq", "pcmpgtq"));
     let sse42 = at(&["-msse4.2"]);
     assert!(has(&sse42, "gtq", "pcmpgtq"));

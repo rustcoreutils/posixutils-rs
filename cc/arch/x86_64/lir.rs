@@ -304,6 +304,9 @@ pub enum PackedOp {
     FXor(FloatLane),
     /// PMULLW: the low half of each product. SSE2 has only the word form.
     MulLow(IntLane),
+    /// PMULUDQ: each qword the unsigned 64-bit product of the two
+    /// operands' low dwords in it -- the even dword lanes.
+    MulEvenDwords,
     /// PUNPCKLBW/WD/DQ/QDQ: interleave the low halves' lanes.
     UnpackLow(IntLane),
     /// UNPCKLPD (and PS): interleave the low halves' floating lanes.
@@ -396,6 +399,7 @@ impl PackedOp {
             PackedOp::FDiv(l) => format!("div{}", l.suffix()),
             PackedOp::FXor(l) => format!("xor{}", l.suffix()),
             PackedOp::MulLow(l) => format!("pmull{}", l.suffix()),
+            PackedOp::MulEvenDwords => "pmuludq".into(),
             PackedOp::UnpackLow(l) => format!(
                 "punpckl{}",
                 match l {

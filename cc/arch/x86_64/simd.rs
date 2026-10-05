@@ -14,6 +14,12 @@
 // slots that are not 16-byte aligned, where a legacy-SSE memory operand
 // faults, so they are loaded with `movups` (the `Quad` move) first.
 //
+// What SSE4.1 does in one instruction SSE2 does in several: a dword
+// multiply, and an unsigned order of words or dwords. Those sequences need
+// three registers beside their operands' -- the target's and two
+// temporaries -- which for a target in memory is one more than the two
+// reserved scratch registers: the spare, [`SPARE_XMM`].
+//
 
 use super::codegen::X86_64CodeGen;
 use super::lir::{
@@ -22,19 +28,39 @@ use super::lir::{
 use super::regalloc::{Loc, Reg, XmmReg};
 use crate::arch::lir::{FpSize, OperandSize};
 use crate::arch::simd::X86Shuffle;
-use crate::ir::{Instruction, PseudoId, SimdOp};
+use crate::ir::{Instruction, Opcode, PseudoId, SimdOp};
+use crate::target::X86Simd;
 use crate::types::TypeTable;
 
+/// The third temporary of the SSE2 sequences, beside the two reserved
+/// scratch registers. It is allocatable: the allocator keeps it free of
+/// every value live where [`writes_spare_xmm`] says an instruction may
+/// write it, operands included.
+pub(super) const SPARE_XMM: XmmReg = XmmReg::Xmm13;
+
+/// Whether `op` may write [`SPARE_XMM`]: a multiply or an unsigned order,
+/// whatever its lanes and `-m` flags, so the answer errs toward keeping the
+/// register free.
+pub(super) fn writes_spare_xmm(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::Simd(SimdOp::Mul | SimdOp::CmpGtU | SimdOp::CmpGeU)
+    )
+}
+
 /// A two-operand operation as SSE computes it: `first` moved into the
-/// target, `op` applied with `second`, then -- for an unsigned order --
-/// compared for equality with `second` again, and inverted when the
-/// instruction answers the opposite question.
+/// target, `op` applied with `second`, then -- for an unsigned order by
+/// minimum -- compared for equality with `second` again, and inverted when
+/// the instruction answers the opposite question. With `flip_signs` both
+/// operands have each lane's sign bit flipped first, which makes a signed
+/// order of them the unsigned order of the originals.
 struct PackedForm {
     first: PseudoId,
     second: PseudoId,
     op: PackedOp,
     then_equal: bool,
     invert: bool,
+    flip_signs: bool,
 }
 
 impl X86_64CodeGen {
@@ -61,11 +87,15 @@ impl X86_64CodeGen {
             Loc::Xmm(x) => x,
             _ => XmmReg::Xmm15,
         };
-        let scratch = if dst == XmmReg::Xmm15 {
-            XmmReg::Xmm14
+        // Two temporaries besides the target's register: the scratch
+        // registers, or XMM14 and the spare when XMM15 stands in for a
+        // target in memory.
+        let (scratch, spare) = if dst == XmmReg::Xmm15 {
+            (XmmReg::Xmm14, SPARE_XMM)
         } else {
-            XmmReg::Xmm15
+            (XmmReg::Xmm15, XmmReg::Xmm14)
         };
+        let sse41 = self.base.target.x86_isa.simd >= X86Simd::Sse41;
         let packed = |op, src, dst| X86Inst::Packed { op, src, dst };
         match op {
             SimdOp::Not => {
@@ -82,19 +112,14 @@ impl X86_64CodeGen {
                 self.push_lir(packed(PackedOp::Sub(lane), scratch, dst));
             }
             SimdOp::FNeg => {
-                // Flip each sign bit: all ones shifted up to the lane's top.
                 self.emit_fp_move(insn.src[0], dst, size);
-                self.push_lir(packed(PackedOp::CmpEq(IntLane::D), scratch, scratch));
-                let lane = IntLane::of_bytes(lane_bytes);
-                let count = (lane_bytes * 8 - 1) as u8;
-                self.push_lir(X86Inst::PackedShiftImm {
-                    shift: PackedShift::Left,
-                    lane,
-                    count,
-                    dst: scratch,
-                });
+                self.emit_sign_bits(lane_bytes, scratch);
                 let flane = FloatLane::of_bytes(lane_bytes);
                 self.push_lir(packed(PackedOp::FXor(flane), scratch, dst));
+            }
+            SimdOp::Mul if lane_bytes == 4 && !sse41 => {
+                let temps = (scratch, spare);
+                self.emit_mul_dwords(insn, dst, temps, size);
             }
             SimdOp::Splat => self.emit_splat(insn.src[0], dst, lane_bytes, types.is_float(lane)),
             SimdOp::Shuffle => {
@@ -178,32 +203,130 @@ impl X86_64CodeGen {
             }
             _ => {
                 let (a, b) = (insn.src[0], insn.src[1]);
-                let form = Self::packed_form(op, a, b, lane_bytes);
-                // The second operand in a register other than the target's,
-                // secured before the first is moved into the target.
-                let second_reg = match self.get_location(form.second) {
-                    Loc::Xmm(x) if x != dst => x,
-                    _ => {
-                        self.emit_fp_move(form.second, scratch, size);
-                        scratch
-                    }
-                };
-                self.emit_fp_move(form.first, dst, size);
-                self.push_lir(packed(form.op, second_reg, dst));
-                if form.then_equal {
-                    let lane = IntLane::of_bytes(lane_bytes);
-                    self.push_lir(packed(PackedOp::CmpEq(lane), second_reg, dst));
-                }
-                if form.invert {
-                    // The scratch register is free again: all ones, xored in.
-                    self.push_lir(packed(PackedOp::CmpEq(IntLane::D), scratch, scratch));
-                    self.push_lir(packed(PackedOp::Xor, scratch, dst));
-                }
+                // pminub is SSE2's; pminuw and pminud are SSE4.1's.
+                let min_u = lane_bytes == 1 || sse41;
+                let form = Self::packed_form(op, a, b, lane_bytes, min_u);
+                self.emit_packed_form(&form, lane_bytes, dst, (scratch, spare), size);
             }
         }
         if !matches!(dst_loc, Loc::Xmm(x) if x == dst) {
             self.emit_fp_move_from_xmm(dst, &dst_loc, size);
         }
+    }
+
+    /// The two-operand `form` on lanes of `lane_bytes`, into `dst`, with
+    /// the temporaries `scratch` and `spare`.
+    fn emit_packed_form(
+        &mut self,
+        form: &PackedForm,
+        lane_bytes: usize,
+        dst: XmmReg,
+        (scratch, spare): (XmmReg, XmmReg),
+        size: FpSize,
+    ) {
+        let packed = |op, src, dst| X86Inst::Packed { op, src, dst };
+        let second_reg = if form.flip_signs {
+            // Both operands with their sign bits flipped: the second in the
+            // scratch register, secured before the first is moved into the
+            // target, then the first in place.
+            self.emit_sign_bits(lane_bytes, spare);
+            self.emit_fp_move(form.second, scratch, size);
+            self.push_lir(packed(PackedOp::Xor, spare, scratch));
+            self.emit_fp_move(form.first, dst, size);
+            self.push_lir(packed(PackedOp::Xor, spare, dst));
+            scratch
+        } else {
+            // The second operand in a register other than the target's,
+            // secured before the first is moved into the target.
+            let second_reg = match self.get_location(form.second) {
+                Loc::Xmm(x) if x != dst => x,
+                _ => {
+                    self.emit_fp_move(form.second, scratch, size);
+                    scratch
+                }
+            };
+            self.emit_fp_move(form.first, dst, size);
+            second_reg
+        };
+        self.push_lir(packed(form.op, second_reg, dst));
+        if form.then_equal {
+            let lane = IntLane::of_bytes(lane_bytes);
+            self.push_lir(packed(PackedOp::CmpEq(lane), second_reg, dst));
+        }
+        if form.invert {
+            // The scratch register is free again: all ones, xored in.
+            self.push_lir(packed(PackedOp::CmpEq(IntLane::D), scratch, scratch));
+            self.push_lir(packed(PackedOp::Xor, scratch, dst));
+        }
+    }
+
+    /// Each lane of `reg` only its sign bit, for a lane of `lane_bytes`: all
+    /// ones shifted up to the lane's top.
+    fn emit_sign_bits(&mut self, lane_bytes: usize, reg: XmmReg) {
+        self.push_lir(X86Inst::Packed {
+            op: PackedOp::CmpEq(IntLane::D),
+            src: reg,
+            dst: reg,
+        });
+        self.push_lir(X86Inst::PackedShiftImm {
+            shift: PackedShift::Left,
+            lane: IntLane::of_bytes(lane_bytes),
+            count: (lane_bytes * 8 - 1) as u8,
+            dst: reg,
+        });
+    }
+
+    /// A 32-bit lane multiply without SSE4.1's `pmulld`: `pmuludq` of the
+    /// even lanes, and of the odd lanes moved down into even places
+    /// (`pshufd $0xf5`), each product's low dword then gathered and the two
+    /// halves interleaved. An eight-byte vector's two lanes are already the
+    /// low dwords of the first qword of each product, so it needs no
+    /// gathering. Into `dst`, with the temporaries `scratch` and `spare`.
+    fn emit_mul_dwords(
+        &mut self,
+        insn: &Instruction,
+        dst: XmmReg,
+        (scratch, spare): (XmmReg, XmmReg),
+        size: FpSize,
+    ) {
+        const ODD_DOWN: u8 = 0xf5; // dwords 1, 1, 3, 3
+        const EVEN_LOW: u8 = 0x08; // dwords 0, 2 to the bottom
+        let shuffle = |imm, src, dst| X86Inst::PackedShuffle {
+            op: PackedShuffleOp::Pshufd,
+            imm,
+            src,
+            dst,
+        };
+        let mul = |src, dst| X86Inst::Packed {
+            op: PackedOp::MulEvenDwords,
+            src,
+            dst,
+        };
+        let (a, b) = (insn.src[0], insn.src[1]);
+        // `b` in a register other than the target's, secured before `a` is
+        // moved into the target; the scratch register's copy may be
+        // rearranged in place.
+        let b_reg = match self.get_location(b) {
+            Loc::Xmm(x) if x != dst => x,
+            _ => {
+                self.emit_fp_move(b, scratch, size);
+                scratch
+            }
+        };
+        self.emit_fp_move(a, dst, size);
+        self.push_lir(shuffle(ODD_DOWN, dst, spare));
+        self.push_lir(mul(b_reg, dst));
+        self.push_lir(shuffle(ODD_DOWN, b_reg, scratch));
+        self.push_lir(mul(scratch, spare));
+        if size == FpSize::Quad {
+            self.push_lir(shuffle(EVEN_LOW, dst, dst));
+            self.push_lir(shuffle(EVEN_LOW, spare, spare));
+        }
+        self.push_lir(X86Inst::Packed {
+            op: PackedOp::UnpackLow(IntLane::D),
+            src: spare,
+            dst,
+        });
     }
 
     /// A constant shuffle in its SSE2 `form`, into `dst`.
@@ -314,11 +437,19 @@ impl X86_64CodeGen {
     /// How SSE computes the two-operand `op` of `a` and `b` on lanes of
     /// `lane_bytes` ([`PackedForm`]). The integer compares are equality and
     /// signed greater-than only, so `!=` is the inverse of `==`, and
-    /// `a >= b` the inverse of `b > a`; an unsigned `a >= b` is
-    /// `min(a, b) == b`, which reads `b` twice and `a` once, and `a > b` the
-    /// inverse of `b >= a`. The floating compares have every predicate C
-    /// needs but greater-than, which is less-than of the operands swapped.
-    fn packed_form(op: SimdOp, a: PseudoId, b: PseudoId, lane_bytes: usize) -> PackedForm {
+    /// `a >= b` the inverse of `b > a`. An unsigned order is, with an
+    /// unsigned minimum (`min_u`), `a >= b` as `min(a, b) == b`, which reads
+    /// `b` twice and `a` once, and `a > b` the inverse of `b >= a`; without
+    /// one, the signed order of the operands with their sign bits flipped.
+    /// The floating compares have every predicate C needs but greater-than,
+    /// which is less-than of the operands swapped.
+    fn packed_form(
+        op: SimdOp,
+        a: PseudoId,
+        b: PseudoId,
+        lane_bytes: usize,
+        min_u: bool,
+    ) -> PackedForm {
         let int = || IntLane::of_bytes(lane_bytes);
         let float = || FloatLane::of_bytes(lane_bytes);
         let form = |first, second, op| PackedForm {
@@ -327,6 +458,7 @@ impl X86_64CodeGen {
             op,
             then_equal: false,
             invert: false,
+            flip_signs: false,
         };
         let inverse = |f: PackedForm| PackedForm { invert: true, ..f };
         let min_equal = |first, second| PackedForm {
@@ -338,8 +470,19 @@ impl X86_64CodeGen {
             SimdOp::CmpNe => inverse(form(a, b, PackedOp::CmpEq(int()))),
             SimdOp::CmpGt => form(a, b, PackedOp::CmpGt(int())),
             SimdOp::CmpGe => inverse(form(b, a, PackedOp::CmpGt(int()))),
-            SimdOp::CmpGeU => min_equal(a, b),
-            SimdOp::CmpGtU => inverse(min_equal(b, a)),
+            SimdOp::CmpGeU if min_u => min_equal(a, b),
+            SimdOp::CmpGtU if min_u => inverse(min_equal(b, a)),
+            SimdOp::CmpGeU | SimdOp::CmpGtU => {
+                let signed = if op == SimdOp::CmpGeU {
+                    SimdOp::CmpGe
+                } else {
+                    SimdOp::CmpGt
+                };
+                PackedForm {
+                    flip_signs: true,
+                    ..Self::packed_form(signed, a, b, lane_bytes, min_u)
+                }
+            }
             SimdOp::FCmpEq => form(a, b, PackedOp::FCmp(FloatCompare::Eq, float())),
             SimdOp::FCmpNe => form(a, b, PackedOp::FCmp(FloatCompare::Neq, float())),
             SimdOp::FCmpGt => form(b, a, PackedOp::FCmp(FloatCompare::Lt, float())),

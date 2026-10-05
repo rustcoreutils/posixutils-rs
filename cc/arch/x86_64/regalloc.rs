@@ -42,6 +42,7 @@
 // taken to clobber the System V set, which covers both conventions.
 // ============================================================================
 
+use super::simd::{writes_spare_xmm, SPARE_XMM};
 use super::x87::{is_x87_float_to_int, uses_x87_scratch};
 use crate::arch::asm_constraints::{AsmOperandClass, AsmRegClass, PinnedGp};
 use crate::arch::lir::FpSize;
@@ -681,7 +682,9 @@ impl XmmReg {
     /// All allocatable XMM registers
     /// All XMM registers (XMM0-XMM15) are caller-saved on x86-64 SysV ABI.
     /// Values in XMM registers are NOT preserved across function calls.
-    /// XMM14 and XMM15 are reserved as scratch registers for codegen operations
+    /// XMM14 and XMM15 are reserved as scratch registers for codegen operations.
+    /// XMM13 is allocatable, but kept free where a SIMD sequence needs a third
+    /// temporary (`simd::SPARE_XMM`).
     pub fn allocatable() -> &'static [XmmReg] {
         &[
             XmmReg::Xmm0,
@@ -969,6 +972,23 @@ fn exempt_from_clobber(cp: &ConstraintPoint<Reg>, interval: &LiveInterval) -> bo
     cp.operand_survives(interval.pseudo, interval.start, interval.end)
 }
 
+/// Keeps [`SPARE_XMM`] free wherever an instruction may write it: no
+/// candidate live there -- an operand included, since the sequence writes
+/// it while its operands are still wanted -- may take it.
+fn spare_xmm_forbidden(
+    func: &Function,
+    intervals: &[LiveInterval],
+    xmm_candidates: &std::collections::BTreeSet<PseudoId>,
+) -> BTreeMap<PseudoId, std::collections::BTreeSet<XmmReg>> {
+    let positions = find_call_positions(func, writes_spare_xmm);
+    intervals
+        .iter()
+        .filter(|i| xmm_candidates.contains(&i.pseudo))
+        .filter(|i| interval_crosses_call(i, &positions))
+        .map(|i| (i.pseudo, std::collections::BTreeSet::from([SPARE_XMM])))
+        .collect()
+}
+
 /// The frame slot `x87.rs` stages a value through on its way into or out of
 /// the FPU -- `fild` and `fld` have no register form, so an immediate or a
 /// general register goes through memory.
@@ -1202,12 +1222,15 @@ impl RegAlloc {
     ///
     /// That is all ten once it calls anything -- the callee may be System V,
     /// which preserves none of them, and a `memcpy` is a call too -- or runs
-    /// inline asm. Otherwise it is the ones the allocator handed out, and the
-    /// two scratch registers, which the back end writes without asking it.
+    /// inline asm. Otherwise it is the ones the allocator handed out, the
+    /// two scratch registers, which the back end writes without asking it,
+    /// and [`SPARE_XMM`] where an instruction may write it.
     fn win64_xmm_to_save(&self, func: &Function) -> Vec<XmmReg> {
-        let calls = func.blocks.iter().flat_map(|b| &b.insns).any(|insn| {
+        let insns = || func.blocks.iter().flat_map(|b| &b.insns);
+        let calls = insns().any(|insn| {
             is_call_like_x86_64(insn.op) || matches!(insn.op, Opcode::Asm | Opcode::TlsAddr)
         });
+        let spare = insns().any(|insn| writes_spare_xmm(insn.op));
         let allocated: HashSet<XmmReg> = self
             .locations
             .values()
@@ -1220,7 +1243,10 @@ impl RegAlloc {
             .iter()
             .copied()
             .filter(|x| {
-                calls || matches!(x, XmmReg::Xmm14 | XmmReg::Xmm15) || allocated.contains(x)
+                calls
+                    || matches!(x, XmmReg::Xmm14 | XmmReg::Xmm15)
+                    || (spare && *x == SPARE_XMM)
+                    || allocated.contains(x)
             })
             .collect()
     }
@@ -2530,7 +2556,7 @@ impl RegAlloc {
         // paths (e.g. _Py_dg_strtod's correction loop) in non-obvious
         // ways.
         let graph = build_interference_graph(&all_vertices, func, &self.live_out, false);
-        let forbidden: BTreeMap<PseudoId, std::collections::BTreeSet<XmmReg>> = BTreeMap::new();
+        let forbidden = spare_xmm_forbidden(func, intervals, xmm_candidates);
         let order = mcs_ordering(&graph);
         let result = greedy_color(
             &graph,

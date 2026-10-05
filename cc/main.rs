@@ -277,6 +277,19 @@ struct Args {
     )]
     inline_arg: Option<bool>,
 
+    /// `-fsigned-char` / `-funsigned-char` and their `-fno-` inverses,
+    /// rewritten by `preprocess_args_from` so the four spellings share one
+    /// option and the last occurrence wins, as in GCC. Overrides the
+    /// target's default for plain `char`.
+    #[arg(
+        long = "c17-plain-char",
+        hide = true,
+        value_name = "signedness",
+        value_parser = parse_plain_char,
+        overrides_with = "plain_char"
+    )]
+    plain_char: Option<target::CharSignedness>,
+
     #[arg(short = 'W', action = clap::ArgAction::Append, value_name = "warning",
           num_args = 0..=1, default_missing_value = "extra", help = gettext("Warning flags (e.g., -Wall, -Wextra, -Wno-unused)"))]
     warnings: Vec<String>,
@@ -1462,6 +1475,26 @@ impl Args {
     }
 }
 
+/// The value of the internal `--c17-plain-char` option.
+fn parse_plain_char(s: &str) -> Result<target::CharSignedness, String> {
+    match s {
+        "signed" => Ok(target::CharSignedness::Signed),
+        "unsigned" => Ok(target::CharSignedness::Unsigned),
+        _ => Err(format!("invalid plain char signedness '{s}'")),
+    }
+}
+
+/// The plain-`char` signedness a GCC `-f` flag selects, as the value of
+/// `--c17-plain-char`: `-fno-signed-char` means unsigned and
+/// `-fno-unsigned-char` means signed.
+fn plain_char_flag(arg: &str) -> Option<&'static str> {
+    match arg {
+        "-fsigned-char" | "-fno-unsigned-char" => Some("signed"),
+        "-funsigned-char" | "-fno-signed-char" => Some("unsigned"),
+        _ => None,
+    }
+}
+
 fn is_valid_opt_level(s: &str) -> bool {
     matches!(s, "0" | "1" | "2" | "3" | "s" | "z" | "fast" | "g")
 }
@@ -1758,6 +1791,9 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             // inlined, and does not define `__NO_INLINE__` -- so it falls
             // through to the catch-all below, accepted and ignored.
             result.push(format!("--c17-inline={}", arg == "-finline"));
+            i += 1;
+        } else if let Some(signedness) = plain_char_flag(arg) {
+            result.push(format!("--c17-plain-char={signedness}"));
             i += 1;
         } else if arg == "-fverbose-asm" {
             result.push("--fverbose-asm".to_string());
@@ -2454,6 +2490,11 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     if target.arch == target::Arch::X86_64 {
         target.x86_isa = target::X86Isa::from_flags(&args.mflags);
     }
+    // Before anything reads it: the type system, the predefined macros and
+    // the preprocessor's character constants all take it from the target.
+    if let Some(signedness) = args.plain_char {
+        target.plain_char = signedness;
+    }
 
     // Parse runtime library selection
     let _rtlib = match args.rtlib.as_deref() {
@@ -2776,6 +2817,48 @@ mod tests {
         );
         // A typo is still an error, not a silently ignored value.
         assert_eq!(parse(&["-std=c42", "foo.c"]).std_request(), Err("c42"));
+    }
+
+    #[test]
+    fn test_preprocess_plain_char_spellings() {
+        for (flag, want) in [
+            ("-funsigned-char", "unsigned"),
+            ("-fno-signed-char", "unsigned"),
+            ("-fsigned-char", "signed"),
+            ("-fno-unsigned-char", "signed"),
+        ] {
+            let result = run_preprocess(&[flag, "foo.c"]);
+            assert!(
+                result.contains(&format!("--c17-plain-char={want}")),
+                "{flag}: {result:?}"
+            );
+            assert!(!result.contains(&flag.to_string()), "{flag}");
+        }
+    }
+
+    #[test]
+    fn test_plain_char_last_flag_wins() {
+        use target::CharSignedness::{Signed, Unsigned};
+        let parse = |argv: &[&str]| Args::parse_from(run_preprocess(argv)).plain_char;
+        assert_eq!(parse(&["foo.c"]), None);
+        assert_eq!(parse(&["-funsigned-char", "foo.c"]), Some(Unsigned));
+        assert_eq!(parse(&["-fno-unsigned-char", "foo.c"]), Some(Signed));
+        assert_eq!(
+            parse(&["-fsigned-char", "-funsigned-char", "foo.c"]),
+            Some(Unsigned)
+        );
+        assert_eq!(
+            parse(&["-funsigned-char", "-fsigned-char", "foo.c"]),
+            Some(Signed)
+        );
+        assert_eq!(
+            parse(&["-funsigned-char", "foo.c", "-fno-unsigned-char"]),
+            Some(Signed)
+        );
+        assert_eq!(
+            parse(&["-fsigned-char", "-fno-signed-char", "foo.c"]),
+            Some(Unsigned)
+        );
     }
 
     #[test]

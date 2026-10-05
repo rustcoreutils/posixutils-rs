@@ -14,6 +14,7 @@
 // assembly shapes are pinned in `cross_abi.rs`; these tests run the code.
 //
 
+use crate::common::compile_and_run_aarch64_with;
 #[cfg(target_os = "linux")]
 use crate::common::{aarch64_cross_available, interop_aarch64};
 use crate::common::{compile_and_run, compile_and_run_aarch64, interop_host};
@@ -192,4 +193,86 @@ fn plain_char_interoperates_with_gcc_aarch64() {
     }
     let (callee, caller) = interop_sources(false);
     interop_aarch64("plain_char_a64", &callee, &caller);
+}
+
+/// `-funsigned-char` and `-fsigned-char` (and their `-fno-` inverses) choose
+/// plain `char`'s signedness whatever the target's default, the last one
+/// winning: the type, `__CHAR_UNSIGNED__`, `<limits.h>` and the
+/// preprocessor's character constants all follow. They were ignored with a
+/// warning, so a package passing `-funsigned-char` on x86-64 got signed
+/// `char`.
+const CHAR_SIGN_FLAG: &str = r#"
+#include <limits.h>
+
+/* Built with -DWANT_UNSIGNED=1 under -funsigned-char, =0 under
+   -fsigned-char: plain char, its limits, the predefined macro and the
+   preprocessor's character constants must all agree with the flag. */
+#if WANT_UNSIGNED
+#ifndef __CHAR_UNSIGNED__
+#error "-funsigned-char must define __CHAR_UNSIGNED__"
+#endif
+#if CHAR_MIN != 0 || CHAR_MAX != UCHAR_MAX
+#error "limits.h must describe an unsigned char"
+#endif
+#if '\xff' < 0
+#error "a preprocessor character constant must be unsigned"
+#endif
+#else
+#ifdef __CHAR_UNSIGNED__
+#error "-fsigned-char must not define __CHAR_UNSIGNED__"
+#endif
+#if CHAR_MIN != SCHAR_MIN || CHAR_MAX != SCHAR_MAX
+#error "limits.h must describe a signed char"
+#endif
+#if '\xff' >= 0
+#error "a preprocessor character constant must be signed"
+#endif
+#endif
+
+static volatile int big = 200;
+
+int main(void)
+{
+    char c = (char)big;
+    int widened = c;
+    int expect = WANT_UNSIGNED ? 200 : 200 - 256;
+    if (widened != expect) return 1;
+    if (((char)-1 < 0) == WANT_UNSIGNED) return 2;
+    if (('\xff' < 0) == WANT_UNSIGNED) return 3;
+    /* char is still a distinct type from both explicit forms. */
+    if (_Generic(c, char: 0, signed char: 1, unsigned char: 2) != 0) return 4;
+    return 0;
+}
+"#;
+
+#[test]
+fn plain_char_signedness_follows_the_flag() {
+    let cases: [(&[&str], bool); 5] = [
+        (&["-funsigned-char"], true),
+        (&["-fsigned-char"], false),
+        (&["-fno-signed-char"], true),
+        (&["-fno-unsigned-char"], false),
+        (&["-fsigned-char", "-funsigned-char"], true),
+    ];
+    for (flags, unsigned) in cases {
+        let want = format!("-DWANT_UNSIGNED={}", u8::from(unsigned));
+        for level in ["-O0", "-O2"] {
+            let mut opts: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
+            opts.push(want.clone());
+            opts.push(level.to_string());
+            assert_eq!(
+                compile_and_run("char_sign_flag", CHAR_SIGN_FLAG, &opts),
+                0,
+                "{flags:?} {level}"
+            );
+            let mut a64: Vec<&str> = flags.to_vec();
+            a64.push(&want);
+            a64.push(level);
+            if let Some(rc) =
+                compile_and_run_aarch64_with("char_sign_flag_a64", CHAR_SIGN_FLAG, &a64, &[])
+            {
+                assert_eq!(rc, 0, "aarch64 {flags:?} {level}");
+            }
+        }
+    }
 }

@@ -60,6 +60,9 @@ struct Options {
     /// `-finline` / `-fno-inline`, last one winning, applied to whatever
     /// level the `-O` options leave, as the driver does.
     inlining: Option<bool>,
+    /// `-fsigned-char` / `-funsigned-char` (and the `-fno-` inverses), last
+    /// one winning, overriding the target's plain `char`.
+    plain_char: Option<target::CharSignedness>,
     mflags: Vec<String>,
 }
 
@@ -93,6 +96,12 @@ fn apply_flags(flags: &[&str]) -> Options {
             "-fno-trapping-math" => o.trapping_math = false,
             "-fno-inline" => o.inlining = Some(false),
             "-finline" => o.inlining = Some(true),
+            "-fsigned-char" | "-fno-unsigned-char" => {
+                o.plain_char = Some(target::CharSignedness::Signed)
+            }
+            "-funsigned-char" | "-fno-signed-char" => {
+                o.plain_char = Some(target::CharSignedness::Unsigned)
+            }
             _ => {
                 if let Some(level) = flag.strip_prefix("-O") {
                     o.optimization = Optimization::from_flag(level).unwrap();
@@ -139,6 +148,9 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
     // As the driver: the `-m` ISA options select x86-64's instructions.
     if target.arch == target::Arch::X86_64 {
         target.x86_isa = target::X86Isa::from_flags(&o.mflags);
+    }
+    if let Some(signedness) = o.plain_char {
+        target.plain_char = signedness;
     }
     // As the driver's `position_independence`: PIE is the Linux default
     // unless a shared object or `-fno-pie` asks otherwise, and implies PIC.

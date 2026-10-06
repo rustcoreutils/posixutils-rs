@@ -568,6 +568,8 @@ define_keywords! {
     (BUILTIN_TYPES_COMPATIBLE_P, "__builtin_types_compatible_p", BUILTIN),
     (BUILTIN_CLASSIFY_TYPE, "__builtin_classify_type", BUILTIN),
     (BUILTIN_UNREACHABLE, "__builtin_unreachable", BUILTIN),
+    (BUILTIN_SETJMP,    "__builtin_setjmp",   BUILTIN),
+    (BUILTIN_LONGJMP,   "__builtin_longjmp",  BUILTIN),
     (BUILTIN_OFFSETOF,  "__builtin_offsetof", BUILTIN),
     (OFFSETOF,          "offsetof",           BUILTIN),
     (BUILTIN_INF,       "__builtin_inf",      BUILTIN),

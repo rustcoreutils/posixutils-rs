@@ -1197,6 +1197,8 @@ pub enum ExprKind {
     Setjmp {
         /// The jmp_buf to save the context to
         env: Box<Expr>,
+        /// The library's `setjmp`, or gcc's `__builtin_setjmp`.
+        kind: JmpKind,
     },
 
     /// longjmp(env, val)
@@ -1208,6 +1210,9 @@ pub enum ExprKind {
         env: Box<Expr>,
         /// The value to return from setjmp (1 if 0 is passed)
         val: Box<Expr>,
+        /// The library's `longjmp`, or gcc's `__builtin_longjmp`, whose
+        /// `val` is always the constant 1.
+        kind: JmpKind,
     },
 
     // =========================================================================
@@ -2078,6 +2083,24 @@ pub enum CalleeBinding {
     Library,
 }
 
+/// Which non-local jump a `setjmp`/`longjmp` pair is.
+///
+/// The two never mix: a buffer one fills only the other's partner reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JmpKind {
+    /// The C library's `setjmp`/`longjmp` (and `_setjmp`/`_longjmp`): a call,
+    /// which saves the callee-saved registers and whatever else the library
+    /// keeps in a `jmp_buf`.
+    #[default]
+    Library,
+    /// gcc's `__builtin_setjmp`/`__builtin_longjmp`: inline code over a
+    /// five-word buffer holding the frame pointer, the resume address and
+    /// the stack pointer. Nothing else is saved, so the function containing
+    /// the setjmp assumes every register is lost when control resumes there,
+    /// and saves every callee-saved register in its prologue.
+    Builtin,
+}
+
 // Inline Assembly Support (GCC Extended Asm)
 
 /// An operand in an inline assembly statement
@@ -2421,7 +2444,7 @@ impl Expr {
             | K::Popcountll { arg: a }
             | K::Alloca { size: a }
             | K::FpTest { arg: a, .. }
-            | K::Setjmp { env: a }
+            | K::Setjmp { env: a, .. }
             | K::C11AtomicThreadFence { order: a }
             | K::C11AtomicSignalFence { order: a } => vec![a],
             K::Binary {
@@ -2440,7 +2463,7 @@ impl Expr {
             | K::VaCopy { dest: a, src: b }
             | K::FpCompare { lhs: a, rhs: b, .. }
             | K::BuiltinComplex { real: a, imag: b }
-            | K::Longjmp { env: a, val: b }
+            | K::Longjmp { env: a, val: b, .. }
             | K::C11AtomicInit { ptr: a, val: b }
             | K::C11AtomicLoad { ptr: a, order: b } => vec![a, b],
             K::Conditional {

@@ -552,12 +552,18 @@ impl Label {
     /// for. Both go through [`Symbol::format_for_target`], which also
     /// gives the name `target`'s private prefix.
     pub fn name(&self, target: &Target) -> String {
+        self.symbol().format_for_target(target)
+    }
+
+    /// The label as a symbol, for an instruction that takes its address --
+    /// a `__builtin_setjmp` storing where to resume.
+    pub fn symbol(&self) -> Symbol {
         let name = if self.internal {
             internal_label(&self.func_name, self.block_id)
         } else {
             crate::ir::BasicBlockId(self.block_id).label_symbol(&self.func_name)
         };
-        Symbol::local(name).format_for_target(target)
+        Symbol::local(name)
     }
 }
 

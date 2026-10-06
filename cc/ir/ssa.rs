@@ -640,7 +640,14 @@ pub fn ssa_convert(func: &mut Function, types: &TypeTable) {
 
 /// [`ssa_convert`], handing back the phi each variable got in each block.
 fn convert(func: &mut Function, types: &TypeTable) -> Phis {
-    if func.blocks.is_empty() {
+    // A `__builtin_longjmp` comes back to a `__builtin_setjmp` from any call
+    // after it, an edge the CFG does not have, and gcc's contract is that
+    // the receiver sees what the function stored before that call -- not
+    // only `volatile` objects: gcc models the edges, so `a = 1; bar();`
+    // with `bar` jumping back reads 1. Promoted to SSA, a local would read
+    // its value at the setjmp instead. In memory, every call is a barrier
+    // that the store precedes and the receiver's load follows.
+    if func.blocks.is_empty() || func.receives_nonlocal_goto() {
         return Phis::new();
     }
 
@@ -1225,6 +1232,23 @@ mod tests {
         // The copy must carry the stored value, not an undef.
         let copy = entry.insns.iter().find(|i| i.op == Opcode::Copy).unwrap();
         assert_eq!(copy.src, vec![PseudoId(1)]);
+    }
+
+    /// The same local is left in memory in a function that receives a
+    /// non-local goto: the `__builtin_longjmp` edges into it are not in the
+    /// CFG, so only memory carries a store made before the jumping call to
+    /// the receiver.
+    #[test]
+    fn test_local_stays_in_memory_under_builtin_setjmp() {
+        let types = TypeTable::new(&Target::host());
+        let mut func = make_straight_line_cfg(&types);
+        let mut setjmp = Instruction::new(Opcode::Setjmp);
+        setjmp.extra_mut().jmp_kind = crate::parse::ast::JmpKind::Builtin;
+        func.blocks[0].insns.insert(1, setjmp);
+        ssa_convert(&mut func, &types);
+        let ops: Vec<Opcode> = func.blocks[0].insns.iter().map(|i| i.op).collect();
+        assert!(ops.contains(&Opcode::Store), "store was promoted: {ops:?}");
+        assert!(ops.contains(&Opcode::Load), "load was promoted: {ops:?}");
     }
 
     #[test]

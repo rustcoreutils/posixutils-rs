@@ -128,3 +128,196 @@ int main(void) {
 "#;
     assert_eq!(compile_and_run("misc_setjmp_mega", code, &[]), 0);
 }
+
+/// gcc's `__builtin_setjmp` / `__builtin_longjmp`: a five-word buffer, the
+/// second return is always 1, the jump comes from another function, and
+/// `volatile` locals of the setjmp's frame survive it.
+#[test]
+fn misc_builtin_setjmp_and_longjmp() {
+    crate::common::compile_and_run_everywhere(
+        "builtin_setjmp",
+        r#"
+/* gcc's lightweight non-local goto: `__builtin_setjmp(buf)` with a
+   five-word buffer returns 0, and 1 when `__builtin_longjmp(buf, 1)` --
+   called from another function, never the setjmp's own -- jumps back to
+   it. No signal mask is saved. The gcc.c-torture `*-chk` tests reach it
+   through chk.h to recover from a deliberate overflow abort. */
+static void *buf[5];
+static void *outer[5];
+static int depth;
+
+__attribute__((noinline, noreturn)) static void jump(void **b) { __builtin_longjmp(b, 1); }
+
+__attribute__((noinline)) static void deep(int n)
+{
+    if (n == 0)
+        jump(buf);
+    depth++;
+    deep(n - 1);
+}
+
+__attribute__((noinline)) static int try_deep(void)
+{
+    volatile int phase = 0;
+    if (__builtin_setjmp(buf)) {
+        /* Locals the setjmp's frame owns survive, if volatile. */
+        return phase == 1 ? depth : -1;
+    }
+    phase = 1;
+    deep(5);
+    return -2;
+}
+
+/* Two buffers: an inner jump does not disturb the outer one. */
+__attribute__((noinline)) static int nested(void)
+{
+    volatile int steps = 0;
+    if (__builtin_setjmp(outer)) {
+        return steps;
+    }
+    steps += 1;
+    if (__builtin_setjmp(buf) == 0) {
+        steps += 10;
+        jump(buf);
+    }
+    steps += 100;
+    jump(outer);
+    return -1;
+}
+
+/* Used in a condition with other code around it, and called repeatedly. */
+__attribute__((noinline)) static int count_jumps(int times)
+{
+    volatile int n = 0;
+    for (int i = 0; i < times; i++) {
+        if (__builtin_setjmp(buf) == 0)
+            jump(buf);
+        else
+            n++;
+    }
+    return n;
+}
+
+int main(void)
+{
+    if (try_deep() != 5) return 1;
+    if (nested() != 111) return 2;
+    if (count_jumps(7) != 7) return 3;
+    return 0;
+}
+"#,
+    );
+}
+
+/// What `__builtin_setjmp` leaves to the compiler: values computed before it
+/// and read after it -- never modified, so not `volatile` -- must survive a
+/// jump that comes through frames which used every callee-saved register;
+/// the frame's over-aligned base register must be re-established; and the
+/// caller's own callee-saved registers must come back intact, though the
+/// jump skipped the epilogues that restore them.
+#[test]
+fn misc_builtin_setjmp_keeps_values_and_registers() {
+    crate::common::compile_and_run_everywhere(
+        "builtin_setjmp_values",
+        r#"
+static void *buf[5];
+
+__attribute__((noinline, noreturn)) static void jump(void) { __builtin_longjmp(buf, 1); }
+
+/* Uses many callee-saved registers, then jumps past its epilogue. */
+__attribute__((noinline)) static long churn(long a, long b, long c, long d, int n)
+{
+    long w = a * 3, x = b * 5, y = c * 7, z = d * 11, v = a ^ d, u = b ^ c;
+    for (int i = 0; i < n; i++) {
+        w += x; x += y; y += z; z += v; v += u; u += w;
+        if (i == n - 1)
+            jump();
+    }
+    return w + x + y + z + u + v;
+}
+
+__attribute__((noinline)) static long keep(long a, long b, double f, int n)
+{
+    long p = a * 7 + 1, q = b * 13 + 2, r = a ^ b, s = a + b, t = a - b, k = a * b;
+    double g = f * 2.5, h = f + 1.0;
+    if (__builtin_setjmp(buf))
+        return p + q + r + s + t + k + (long)(g + h);
+    churn(p, q, r, s, n);
+    return -1;
+}
+
+__attribute__((noinline)) static int aligned(int n)
+{
+    _Alignas(64) volatile int arr[16];
+    volatile int marker = 0;
+    for (int i = 0; i < 16; i++)
+        arr[i] = i * n;
+    if (__builtin_setjmp(buf)) {
+        if (((unsigned long)&arr[0]) % 64)
+            return -5;
+        int sum = 0;
+        for (int i = 0; i < 16; i++)
+            sum += arr[i];
+        return sum + marker;
+    }
+    marker = 1000;
+    churn(1, 2, 3, 4, n);
+    return -1;
+}
+
+__attribute__((noinline)) static long outer(long seed)
+{
+    long a = seed * 3, b = seed * 5, c = seed * 7, d = seed * 11, e = seed * 13, f = seed * 17;
+    long r = keep(seed, seed + 1, 1.5, 4);
+    return r + a + b + c + d + e + f;
+}
+
+int main(void)
+{
+    long p = 5 * 7 + 1, q = 6 * 13 + 2, r = 5 ^ 6, s = 5 + 6, t = 5 - 6, k = 5 * 6;
+    long want = p + q + r + s + t + k + (long)(1.5 * 2.5 + 1.5 + 1.0);
+    if (keep(5, 6, 1.5, 3) != want)
+        return 1;
+    if (aligned(2) != 2 * 120 + 1000)
+        return 2;
+    if (outer(5) != want + 5 * (3 + 5 + 7 + 11 + 13 + 17))
+        return 3;
+    return 0;
+}
+"#,
+    );
+}
+
+/// gcc models a `__builtin_longjmp` as an edge from every call after the
+/// setjmp to its receiver, so a plain local stored before the call that
+/// jumps is read back at the receiver with that store's value -- `volatile`
+/// is not needed. (gcc.c-torture execute/pr60003.)
+#[test]
+fn misc_builtin_setjmp_sees_stores_before_the_jumping_call() {
+    crate::common::compile_and_run_everywhere(
+        "builtin_setjmp_stores",
+        r#"
+static void *buf[5];
+
+__attribute__((noinline)) static void baz(void) { __builtin_longjmp(buf, 1); }
+static void bar(void) { baz(); }
+
+__attribute__((noinline)) static int foo(int x)
+{
+    int a = 0;
+    if (__builtin_setjmp(buf) == 0) {
+        while (1) {
+            a = 1;
+            bar();
+        }
+    }
+    return a == 0 ? 0 : x;
+}
+
+int main(void)
+{
+    return foo(3) == 3 ? 0 : 1;
+}
+"#,
+    );
+}

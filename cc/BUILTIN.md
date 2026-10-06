@@ -367,10 +367,36 @@ C23 7.12.17.1 requires. The results are exact.
 | `__builtin___clear_cache(begin, end)` | A call to libgcc's `__clear_cache`: a no-op on x86-64, required on AArch64 for code written as data |
 | `setjmp(env)`, `_setjmp(env)` | Bare names parsed as builtins: `Opcode::Setjmp`, calling the library function under the name its declaration gives it. `setjmp()` with no argument is an ordinary unprototyped call |
 | `longjmp(env, val)`, `_longjmp(env, val)` | `Opcode::Longjmp`, a terminator |
+| `__builtin_setjmp(buf)` | `int (void *)`. `Opcode::Setjmp` with `JmpKind::Builtin`: inline code, no library call. Returns 0, and 1 when resumed |
+| `__builtin_longjmp(buf, 1)` | `void (void *, int)`. `Opcode::Longjmp` with `JmpKind::Builtin`, a terminator. A value other than the constant 1 is an error, as in gcc |
 
 `setjmp` and `longjmp` are displaced only by a declaration that is not a
 function, or by `-fno-builtin`; `<setjmp.h>`'s function declarations keep
 them.
+
+`__builtin_setjmp` stores gcc's layout in the first three of its five words:
+the frame pointer, the address of a resume label inside the instruction's own
+code, and the stack pointer. `__builtin_longjmp` loads all three, then sets
+the frame and stack pointers and jumps to the label (`jmp *` / `br`). The
+code is the same on every target, Mach-O included. No signal mask and no
+other register is saved, so the function containing the setjmp:
+
+- keeps no value in a register across it: the setjmp is a constraint point
+  that clobbers every allocatable register (`builtin_setjmp_constraint`), and
+  a call-like opcode, so floating values go to the stack too;
+- saves every callee-saved register in its prologue, since the jump skips the
+  epilogues of the frames it unwinds;
+- re-establishes an over-aligned frame's base register at the resume label;
+- is never inlined (`Function::receives_nonlocal_goto`), as gcc never copies
+  it.
+
+The resume label belongs to the instruction, not to a block, so the
+optimizer sees a plain side-effecting instruction with an unknown result and
+nothing can delete the resume path. As with every `setjmp`, a value live
+across it has its interval stretched to the end of the function
+(`extend_across_returns_twice`), since the jump comes from a path the CFG
+does not connect back to it. gcc's rule that the `__builtin_longjmp` must
+not be in the same function as its setjmp is not diagnosed, by gcc either.
 
 ## Control Flow and Hints
 
@@ -605,7 +631,6 @@ Their absence is silent and changes which branch a guarded header takes.
 
 | Builtin | Consequence |
 |---------|-------------|
-| `__builtin_setjmp`, `__builtin_longjmp` | Use `setjmp`/`longjmp`, which are builtins (above) |
 | `__builtin_strnlen`, `__builtin_vprintf`, `__builtin_vfprintf` | `strnlen`, `vprintf`, `vfprintf` are known by their bare names only |
 | `__builtin_clear_padding` | Would have to walk a type to find its padding |
 | `__builtin_issignaling` | `<math.h>` defines `issignaling` itself, so nothing fails to build |

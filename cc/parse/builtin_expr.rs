@@ -11,7 +11,8 @@
 //
 
 use super::ast::{
-    BinaryOp, CalleeBinding, Expr, ExprKind, FpCompare, GnuAtomicOp, LibFn, OffsetOfPath, UnaryOp,
+    BinaryOp, CalleeBinding, Expr, ExprKind, FpCompare, GnuAtomicOp, JmpKind, LibFn, OffsetOfPath,
+    UnaryOp,
 };
 use super::builtin_args::ConstantArgument;
 use super::library_builtin::LibraryBuiltin;
@@ -878,7 +879,10 @@ impl Parser<'_> {
                 let env = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
                 Ok(Self::typed_expr(
-                    ExprKind::Setjmp { env: Box::new(env) },
+                    ExprKind::Setjmp {
+                        env: Box::new(env),
+                        kind: JmpKind::Library,
+                    },
                     self.types.int_id,
                     token_pos,
                 ))
@@ -895,6 +899,51 @@ impl Parser<'_> {
                     ExprKind::Longjmp {
                         env: Box::new(env),
                         val: Box::new(val),
+                        kind: JmpKind::Library,
+                    },
+                    self.types.void_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_SETJMP => Some((|| {
+                // gcc's `int __builtin_setjmp(void *)`: 0 directly, 1 when
+                // `__builtin_longjmp` resumes it.
+                use super::library_builtin::ProtoType::{Int, VoidPtr};
+                let args = self.parse_prototyped_builtin(name_id, Int, &[VoidPtr], false)?;
+                let Some(env) = args.and_then(|args| args.into_iter().next()) else {
+                    return Ok(self.diagnosed_call(self.types.int_id, token_pos));
+                };
+                Ok(Self::typed_expr(
+                    ExprKind::Setjmp {
+                        env: Box::new(env),
+                        kind: JmpKind::Builtin,
+                    },
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_LONGJMP => Some((|| {
+                // gcc's `void __builtin_longjmp(void *, int)`. The value is
+                // not passed anywhere: the setjmp it resumes always returns
+                // 1, and gcc rejects any other.
+                use super::library_builtin::ProtoType::{Int, Void, VoidPtr};
+                let args = self.parse_prototyped_builtin(name_id, Void, &[VoidPtr, Int], false)?;
+                let Some([env, val]) = args.and_then(|args| <[Expr; 2]>::try_from(args).ok())
+                else {
+                    return Ok(self.diagnosed_call(self.types.void_id, token_pos));
+                };
+                if self.constant_argument(&val, 1..=1) != ConstantArgument::InRange(1) {
+                    diag::error(
+                        token_pos,
+                        &gettext("'__builtin_longjmp' second argument must be 1"),
+                    );
+                    return Ok(self.diagnosed_call(self.types.void_id, token_pos));
+                }
+                Ok(Self::typed_expr(
+                    ExprKind::Longjmp {
+                        env: Box::new(env),
+                        val: Box::new(val),
+                        kind: JmpKind::Builtin,
                     },
                     self.types.void_id,
                     token_pos,

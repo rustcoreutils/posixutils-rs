@@ -134,28 +134,7 @@ impl Aarch64CodeGen {
         // Emit prologue (save fp/lr, callee-saved regs, allocate stack)
         self.emit_prologue(total_frame, &callee_saved, &callee_saved_fp);
 
-        // Compute aligned base register (x19) for over-aligned locals
-        if let FrameBase::Aligned {
-            reg: base,
-            align: max_align,
-        } = self.frame_base
-        {
-            let base_offset = 16 + self.callee_saved_size;
-            // base = (FP + base_offset + max_align - 1) & ~(max_align - 1)
-            self.push_lir(Aarch64Inst::Add {
-                size: OperandSize::B64,
-                dst: base,
-                src1: Reg::X29,
-                src2: GpOperand::Imm((base_offset + max_align - 1) as i64),
-            });
-            // AND with bitmask: aarch64 AND (immediate) encodes bitmasks
-            self.push_lir(Aarch64Inst::And {
-                size: OperandSize::B64,
-                dst: base,
-                src1: base,
-                src2: GpOperand::Imm(-(max_align as i64)),
-            });
-        }
+        self.emit_frame_base_latch();
 
         // For variadic functions on Linux/FreeBSD, save argument registers
         if is_variadic && !is_darwin {
@@ -210,6 +189,35 @@ impl Aarch64CodeGen {
         // Only now is every branch and label of the function in place.
         let base = &mut self.base;
         super::relax::relax_branches(&mut base.lir_buffer[first_inst..], &base.target);
+    }
+
+    /// Compute an over-aligned frame's base register (x19) from x29.
+    ///
+    /// Once in the prologue, and again wherever a `__builtin_longjmp`
+    /// resumes, which restores x29 and sp and nothing else.
+    pub(super) fn emit_frame_base_latch(&mut self) {
+        let FrameBase::Aligned {
+            reg: base,
+            align: max_align,
+        } = self.frame_base
+        else {
+            return;
+        };
+        let base_offset = 16 + self.callee_saved_size;
+        // base = (FP + base_offset + max_align - 1) & ~(max_align - 1)
+        self.push_lir(Aarch64Inst::Add {
+            size: OperandSize::B64,
+            dst: base,
+            src1: Reg::X29,
+            src2: GpOperand::Imm((base_offset + max_align - 1) as i64),
+        });
+        // AND with bitmask: aarch64 AND (immediate) encodes bitmasks
+        self.push_lir(Aarch64Inst::And {
+            size: OperandSize::B64,
+            dst: base,
+            src1: base,
+            src2: GpOperand::Imm(-(max_align as i64)),
+        });
     }
 
     /// Record what `-g` has to say about this function.

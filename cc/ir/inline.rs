@@ -169,6 +169,11 @@ pub struct InlineCandidate {
     /// `Function::saves_label_in_static`. That table names the blocks of the
     /// out-of-line body, so no copy of the body can use it.
     pub saves_label_in_static: bool,
+    /// Whether the function contains a `__builtin_setjmp` -- see
+    /// `Function::receives_nonlocal_goto`. gcc never copies one ("can never
+    /// be copied because it receives a non-local goto"), and neither does
+    /// c17: the resume point belongs to the function's own frame.
+    pub receives_nonlocal_goto: bool,
     /// Number of times this function is called in the module
     pub call_count: usize,
     /// Whether the function returns a complex value (should not inline)
@@ -207,6 +212,7 @@ impl InlineCandidate {
             || self.is_recursive
             || self.has_computed_goto
             || self.saves_label_in_static
+            || self.receives_nonlocal_goto
             || self.ret_is_address
             || self.is_noinline
     }
@@ -256,6 +262,7 @@ pub fn analyze_all_functions(module: &Module) -> HashMap<String, InlineCandidate
 fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> InlineCandidate {
     let mut candidate = InlineCandidate {
         saves_label_in_static: func.saves_label_in_static,
+        receives_nonlocal_goto: func.receives_nonlocal_goto(),
         is_noinline: func.is_noinline,
         is_always_inline: func.is_always_inline,
         is_interposable: func.symbol_attrs.weak && !func.is_static,
@@ -1884,6 +1891,7 @@ mod tests {
             consumes_va_list: false,
             has_computed_goto: false,
             saves_label_in_static: false,
+            receives_nonlocal_goto: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -1917,6 +1925,7 @@ mod tests {
             consumes_va_list: true,
             has_computed_goto: false,
             saves_label_in_static: false,
+            receives_nonlocal_goto: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -1968,6 +1977,7 @@ mod tests {
             consumes_va_list: true,
             has_computed_goto: false,
             saves_label_in_static: false,
+            receives_nonlocal_goto: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -1995,6 +2005,7 @@ mod tests {
             consumes_va_list: false,
             has_computed_goto: false,
             saves_label_in_static: false,
+            receives_nonlocal_goto: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -2022,6 +2033,7 @@ mod tests {
             consumes_va_list: false,
             has_computed_goto: false,
             saves_label_in_static: false,
+            receives_nonlocal_goto: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -2049,6 +2061,7 @@ mod tests {
             consumes_va_list: false,
             has_computed_goto: false,
             saves_label_in_static: false,
+            receives_nonlocal_goto: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -3022,6 +3035,39 @@ mod tests {
         let mut table = label_address_callee(&types);
         table.saves_label_in_static = true;
         assert!(analyze_function(&table, &HashMap::new()).cannot_be_inlined());
+    }
+
+    /// A function containing `__builtin_setjmp` receives a non-local goto,
+    /// which gcc never copies ("can never be copied because it receives a
+    /// non-local goto"): it stays a call even where it is small, static and
+    /// called once -- and `always_inline` cannot override it.
+    #[test]
+    fn test_builtin_setjmp_receiver_is_not_inlined() {
+        let src = r#"
+void *buf[5];
+extern void g(void);
+static int recv(void) { if (__builtin_setjmp(buf)) return 1; g(); return 0; }
+int caller(void) { return recv(); }
+"#;
+        let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+        let mut module = crate::ir::linearize::test_linearize::linearize_source(src, &target);
+        let candidates = analyze_all_functions(&module);
+        assert!(candidates["recv"].receives_nonlocal_goto);
+        assert!(candidates["recv"].cannot_be_inlined());
+        run(&mut module, opt_at(2));
+        assert_eq!(calls_left(&module, "caller", "recv"), 1, "recv was inlined");
+
+        let mut forced = candidates["recv"].clone();
+        forced.is_always_inline = true;
+        assert!(!should_inline(
+            &forced,
+            opt_at(2),
+            CallerSize {
+                now: 10,
+                original: 10
+            },
+            false
+        ));
     }
 
     #[test]

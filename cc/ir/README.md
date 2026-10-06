@@ -365,7 +365,7 @@ Operands are `(dst, src-or-byte, n)`. The back ends emit the libc call; one whos
 |--------|-------------|
 | `alloca` | Dynamic stack allocation |
 | `stacksave`, `stackrestore` | Capture and restore the stack pointer. The inliner brackets a callee that `alloca`s with them, so its allocation is released where the call would have returned instead of accumulating in the caller (a loop would otherwise grow the stack every iteration) |
-| `setjmp` | Save context; returns 0, or the value a `longjmp` passed (`longjmp` is a terminator, above) |
+| `setjmp` | Save context; returns 0, or the value a `longjmp` passed (`longjmp` is a terminator, above). `JmpKind::Builtin` is gcc's `__builtin_setjmp`, generated inline: no register survives it, and it always resumes with 1 |
 | `frame_address` | `__builtin_frame_address(level)`; the level is `frame_level()` |
 | `return_address` | `__builtin_return_address(level)` |
 

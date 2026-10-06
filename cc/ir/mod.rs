@@ -1827,6 +1827,9 @@ pub struct InsnExtra {
     pub lifetime_of: Option<PseudoId>,
     /// For `Simd(Shuffle)`: the lanes it picks.
     pub shuffle: Option<ShuffleIndices>,
+    /// For `Setjmp` and `Longjmp`: the library's, or gcc's builtin pair.
+    /// Read it through [`Instruction::jmp_kind`].
+    pub jmp_kind: crate::parse::ast::JmpKind,
 }
 
 /// What an instruction with no extra fields answers: every one empty.
@@ -1847,6 +1850,7 @@ static NO_EXTRA: InsnExtra = InsnExtra {
     fence_scope: FenceScope::Thread,
     lifetime_of: None,
     shuffle: None,
+    jmp_kind: crate::parse::ast::JmpKind::Library,
 };
 
 impl Default for Instruction {
@@ -2010,6 +2014,21 @@ impl Instruction {
             Some(name) => name,
             None => panic!("{:?} was built without its library callee", self.op),
         }
+    }
+
+    /// Which `setjmp`/`longjmp` a `Setjmp` or `Longjmp` is: the library's,
+    /// a call naming [`Self::library_callee`], or gcc's builtin pair, which
+    /// names none and is generated inline.
+    pub fn jmp_kind(&self) -> crate::parse::ast::JmpKind {
+        self.extra().jmp_kind
+    }
+
+    /// Is this gcc's `__builtin_setjmp`? Control resumes just after it with
+    /// no register intact but the frame and stack pointers, so the register
+    /// allocator keeps nothing in a register across it, and the function
+    /// saves every callee-saved register.
+    pub fn is_builtin_setjmp(&self) -> bool {
+        self.op == Opcode::Setjmp && self.jmp_kind() == crate::parse::ast::JmpKind::Builtin
     }
 
     /// Set bit size
@@ -3232,6 +3251,18 @@ impl Function {
     /// Get a local variable
     pub fn get_local(&self, name: &str) -> Option<&LocalVar> {
         self.locals.get(name)
+    }
+
+    /// Does this function contain a `__builtin_setjmp`, the receiver of a
+    /// non-local goto? gcc never copies such a function, and its prologue
+    /// saves every callee-saved register: a `__builtin_longjmp` skips the
+    /// epilogues of the frames it unwinds, so whatever they changed is still
+    /// changed when control resumes here.
+    pub fn receives_nonlocal_goto(&self) -> bool {
+        self.blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .any(Instruction::is_builtin_setjmp)
     }
 
     /// The local variable that `sym` *is*, if it is one.

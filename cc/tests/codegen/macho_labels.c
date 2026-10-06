@@ -59,3 +59,7 @@ const char *name_of(int i) { return names[i % 3]; }
 __attribute__((constructor)) static void init(void) { tls_counter = 1; }
 __attribute__((destructor)) static void fini(void) { tls_counter = 0; }
 long double ld(long double x) { return x * 3.0L; }
+/* gcc's builtin setjmp stores the address of a label of its own. */
+static void *resume_buf[5];
+void nonlocal_jump(void) { __builtin_longjmp(resume_buf, 1); }
+int nonlocal_target(void) { return __builtin_setjmp(resume_buf) ? g(1) : g(0); }

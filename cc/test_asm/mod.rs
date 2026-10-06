@@ -26,6 +26,7 @@ mod builtins_libm;
 mod builtins_math;
 mod builtins_mem_expand;
 mod builtins_mem_moves;
+mod builtins_setjmp;
 mod builtins_stdio_fold;
 mod builtins_string_fold;
 mod builtins_va_arg_pack;

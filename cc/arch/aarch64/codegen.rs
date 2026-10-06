@@ -26,6 +26,7 @@ use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::float::FloatVal;
 use crate::ir::{Instruction, Module, Opcode, PseudoId, PseudoKind};
+use crate::parse::ast::JmpKind;
 use crate::target::{Os, Target};
 use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
@@ -854,13 +855,15 @@ impl Aarch64CodeGen {
             }
 
             // setjmp/longjmp support
-            Opcode::Setjmp => {
-                self.emit_setjmp(insn);
-            }
+            Opcode::Setjmp => match insn.jmp_kind() {
+                JmpKind::Library => self.emit_setjmp(insn),
+                JmpKind::Builtin => self.emit_builtin_setjmp(insn),
+            },
 
-            Opcode::Longjmp => {
-                self.emit_longjmp(insn);
-            }
+            Opcode::Longjmp => match insn.jmp_kind() {
+                JmpKind::Library => self.emit_longjmp(insn),
+                JmpKind::Builtin => self.emit_builtin_longjmp(insn),
+            },
 
             // Inline Assembly
             Opcode::Asm => {

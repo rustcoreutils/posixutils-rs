@@ -24,7 +24,7 @@ use crate::ir::linearize_emit::CompoundAssign;
 use crate::ir::linearize_stmt::SwitchCtx;
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef,
-    GnuAtomicOp, InitElement, InlineLibraryFn, LabelId, MemoryFn, NarrowedLibraryCall,
+    GnuAtomicOp, InitElement, InlineLibraryFn, JmpKind, LabelId, MemoryFn, NarrowedLibraryCall,
     OffsetOfPath, ParamStyle, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
@@ -5964,31 +5964,44 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
-            ExprKind::Setjmp { env } => {
+            ExprKind::Setjmp { env, kind } => {
                 // setjmp(env) - saves execution context, returns int
                 let env_val = self.linearize_expr(env);
                 let result = self.alloc_pseudo();
 
-                let insn = Instruction::new(Opcode::Setjmp)
-                    .with_func(self.library_function_name("setjmp"))
+                let mut insn = Instruction::new(Opcode::Setjmp)
                     .with_target(result)
                     .with_src(env_val)
                     .with_type_and_size(self.types.int_id, 32);
+                match kind {
+                    JmpKind::Library => insn = insn.with_func(self.library_function_name("setjmp")),
+                    JmpKind::Builtin => insn.extra_mut().jmp_kind = JmpKind::Builtin,
+                }
                 self.emit(insn);
                 result
             }
 
-            ExprKind::Longjmp { env, val } => {
+            ExprKind::Longjmp { env, val, kind } => {
                 // longjmp(env, val) - restores execution context (never returns)
                 let env_val = self.linearize_expr(env);
-                let val_val = self.linearize_expr(val);
                 let result = self.alloc_pseudo();
 
-                let mut insn = Instruction::new(Opcode::Longjmp)
-                    .with_func(self.library_function_name("longjmp"));
+                let mut insn = Instruction::new(Opcode::Longjmp);
                 insn.target = Some(result);
-                insn.src = vec![env_val, val_val];
                 insn.typ = Some(self.types.void_id);
+                match kind {
+                    JmpKind::Library => {
+                        let val_val = self.linearize_expr(val);
+                        insn = insn.with_func(self.library_function_name("longjmp"));
+                        insn.src = vec![env_val, val_val];
+                    }
+                    // The value is the constant 1, which the parser checked,
+                    // and the setjmp's receiver supplies it itself.
+                    JmpKind::Builtin => {
+                        insn.extra_mut().jmp_kind = JmpKind::Builtin;
+                        insn.src = vec![env_val];
+                    }
+                }
                 self.emit_no_return(insn);
                 result
             }

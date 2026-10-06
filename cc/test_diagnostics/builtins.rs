@@ -770,3 +770,44 @@ fn builtins_va_arg_pack_outside_a_forwarding_function_is_rejected() {
         "va_arg_pack",
     );
 }
+
+/// gcc's `__builtin_longjmp` takes only the constant 1, and both builtins
+/// are prototyped, so a wrong count is reported as for any call -- each in
+/// gcc's words. `0 + 1` is the constant 1 and is accepted.
+#[test]
+fn builtins_setjmp_longjmp_arguments_are_checked() {
+    for (name, src, expected) in [
+        (
+            "longjmp_two",
+            "void *b[5]; void f(void){ __builtin_longjmp(b, 2); }",
+            "'__builtin_longjmp' second argument must be 1",
+        ),
+        (
+            "longjmp_variable",
+            "void *b[5]; void f(int v){ __builtin_longjmp(b, v); }",
+            "'__builtin_longjmp' second argument must be 1",
+        ),
+        (
+            "longjmp_one_arg",
+            "void *b[5]; void f(void){ __builtin_longjmp(b); }",
+            "too few arguments to function '__builtin_longjmp'",
+        ),
+        (
+            "setjmp_no_arg",
+            "int f(void){ return __builtin_setjmp(); }",
+            "too few arguments to function '__builtin_setjmp'",
+        ),
+        (
+            "setjmp_two_args",
+            "void *b[5]; int f(void){ return __builtin_setjmp(b, b); }",
+            "too many arguments to function '__builtin_setjmp'",
+        ),
+    ] {
+        compile_expect_error(name, src, expected);
+    }
+    compile_expect_no_diagnostic(
+        "longjmp_constant_expression",
+        "void *b[5]; void f(void){ __builtin_longjmp(b, 0 + 1); }",
+        "second argument",
+    );
+}

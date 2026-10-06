@@ -711,6 +711,41 @@ mod tests {
         module
     }
 
+    /// The resume point of a `__builtin_setjmp` is inside the instruction,
+    /// so the optimizer sees an ordinary instruction whose result it cannot
+    /// know: at -O2 the setjmp survives as the builtin, and so do both arms
+    /// of the branch on its result -- the one only a `__builtin_longjmp`
+    /// reaches included.
+    #[test]
+    fn builtin_setjmp_and_its_resume_arm_survive_optimization() {
+        let src = r#"
+void *buf[5];
+extern void g(void);
+int f(void) { if (__builtin_setjmp(buf)) return 7; g(); return 0; }
+"#;
+        for target in [
+            Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux),
+            Target::new(crate::target::Arch::Aarch64, crate::target::Os::Linux),
+        ] {
+            let (mut module, types) =
+                crate::ir::linearize::test_linearize::linearize_source_with_types(src, &target);
+            let opt = Optimization::from_flag("2").expect("valid level");
+            optimize_module(&mut module, &types, opt, &target);
+            let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+            assert!(f.receives_nonlocal_goto(), "the builtin setjmp was removed");
+            let insns: Vec<&Instruction> = f.blocks.iter().flat_map(|b| &b.insns).collect();
+            assert!(
+                insns.iter().any(|i| i.local_callee() == Some("g")),
+                "the direct arm was removed"
+            );
+            let sevens = f
+                .pseudos
+                .iter()
+                .any(|p| matches!(p.kind, crate::ir::PseudoKind::Val(7)));
+            assert!(sevens, "the resume arm's `return 7` was removed");
+        }
+    }
+
     /// A taken address is found where it is taken, a call is not an address,
     /// and an address in an initializer falls back to the builtin's position.
     #[test]

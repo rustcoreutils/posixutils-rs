@@ -1573,6 +1573,114 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::Ud2);
     }
 
+    /// gcc's `__builtin_setjmp(buf)`: inline, with no library call.
+    ///
+    /// The five-word buffer gets gcc's layout -- the frame pointer, the
+    /// resume address, the stack pointer -- and the result is 0 straight
+    /// through and 1 at the resume point:
+    ///
+    /// ```text
+    ///     movq %rbp, 0(buf); leaq resume(%rip), t; movq t, 8(buf)
+    ///     movq %rsp, 16(buf); movl $0, r; jmp done
+    /// resume:                     # %rbp and %rsp are back, nothing else is
+    ///     movl $1, r
+    /// done:
+    /// ```
+    ///
+    /// Nothing else survives the jump. The allocator keeps no value in a
+    /// register across this instruction (`get_constraint_info`) and the
+    /// prologue saves every callee-saved register, so the only state to
+    /// re-establish is an over-aligned frame's base register.
+    pub(super) fn emit_builtin_setjmp(&mut self, insn: &Instruction) {
+        let (Some(&env), Some(target)) = (insn.src.first(), insn.target) else {
+            return;
+        };
+        let id = self.unique_label_counter;
+        self.unique_label_counter += 1;
+        let resume = Label::internal("sjlj_resume", id);
+        let done = Label::internal("sjlj_done", id);
+        let word = |offset| {
+            GpOperand::Mem(MemAddr::BaseOffset {
+                base: Reg::R10,
+                offset,
+            })
+        };
+
+        self.emit_move(env, Reg::R10, 64);
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rbp),
+            dst: word(0),
+        });
+        self.push_lir(X86Inst::Lea {
+            addr: MemAddr::RipRelative(resume.symbol()),
+            dst: Reg::R11,
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::R11),
+            dst: word(8),
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rsp),
+            dst: word(16),
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B32,
+            src: GpOperand::Imm(0),
+            dst: GpOperand::Reg(Reg::R11),
+        });
+        self.push_lir(X86Inst::Jmp {
+            target: done.clone(),
+        });
+
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(resume)));
+        self.emit_frame_base_latch_from_rbp();
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B32,
+            src: GpOperand::Imm(1),
+            dst: GpOperand::Reg(Reg::R11),
+        });
+
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(done)));
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::R11, &dst_loc, u32::BITS);
+    }
+
+    /// gcc's `__builtin_longjmp(buf, 1)`: put back the frame and stack
+    /// pointers the matching `__builtin_setjmp` saved, and jump to its resume
+    /// address. The buffer's address is read into a scratch register first,
+    /// since it may well be addressed from the `%rbp` being replaced.
+    pub(super) fn emit_builtin_longjmp(&mut self, insn: &Instruction) {
+        let Some(&env) = insn.src.first() else {
+            return;
+        };
+        let word = |offset| {
+            GpOperand::Mem(MemAddr::BaseOffset {
+                base: Reg::R11,
+                offset,
+            })
+        };
+        self.emit_move(env, Reg::R11, 64);
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: word(8),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: word(0),
+            dst: GpOperand::Reg(Reg::Rbp),
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: word(16),
+            dst: GpOperand::Reg(Reg::Rsp),
+        });
+        self.push_lir(X86Inst::JmpIndirect { reg: Reg::R10 });
+    }
+
     /// Emit __builtin_alloca - dynamic stack allocation
     pub(super) fn emit_alloca(&mut self, insn: &Instruction) {
         let size = match insn.src.first() {

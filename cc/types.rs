@@ -167,7 +167,13 @@ impl StructMember {
     /// (6.7.9p9). An anonymous structure or union *is* reached: it is the
     /// member its own members live in (6.7.2.1p13).
     pub fn is_initializable(&self) -> bool {
-        self.name != StringId::EMPTY || self.bit_width.is_none()
+        !self.is_unnamed_bitfield()
+    }
+
+    /// An unnamed bit-field, zero-width or not: padding that lays out the
+    /// members around it (C17 6.7.2.1p12).
+    pub fn is_unnamed_bitfield(&self) -> bool {
+        self.name == StringId::EMPTY && self.bit_width.is_some()
     }
 }
 
@@ -3645,9 +3651,11 @@ impl TypeTable {
     ///
     /// The System V ABI allocates every member from a running *bit* offset
     /// measured from the start of the struct. A bitfield takes the next free
-    /// bits; its declared type contributes the struct's alignment and the size
-    /// of the window the field may not straddle, but never an allocation of
-    /// its own. So two bitfields of different declared types share a unit
+    /// bits; its declared type contributes the size of the window the field
+    /// may not straddle and the struct's alignment, but never an allocation of
+    /// its own. An unnamed bit-field contributes the alignment, and reserves
+    /// the window, only where [`Self::unnamed_bitfields_align_aggregate`]
+    /// says so. So two bitfields of different declared types share a unit
     /// freely, and a bitfield reuses the padding left by the plain member
     /// before it.
     /// `pack_cap` is the `#pragma pack(n)` in force, if any. A struct-level
@@ -3706,11 +3714,13 @@ impl TypeTable {
                 // struct 8 bytes with alignment 4 -- and unlike an ordinary
                 // member's, that contribution survives packing, so it is kept
                 // out of `max_align` and applied afterwards. Both are gcc's
-                // answers on the respective target.
-                if self.target_arch == Arch::Aarch64 {
-                    zero_width_align = zero_width_align.max(self.alignment(member.typ));
+                // answers on the respective target; Apple arm64 gives the
+                // x86-64 one (see `unnamed_bitfields_align_aggregate`).
+                let align = self.zero_width_alignment(member);
+                if self.unnamed_bitfields_align_aggregate() {
+                    zero_width_align = zero_width_align.max(align);
                 }
-                bit_offset = bit_offset.next_multiple_of(unit_bits);
+                bit_offset = bit_offset.next_multiple_of(unit_bits.max(align as u128 * 8));
                 member.offset = bytes_of(bit_offset);
                 member.bit_offset = None;
                 member.access_bytes = None;
@@ -3718,12 +3728,26 @@ impl TypeTable {
             }
 
             let align = self.member_alignment(member, pack_cap);
-            max_align = max_align.max(align);
+            // An unnamed field, on an ABI where its type does not shape the
+            // aggregate, is placed by the same rules as any bit-field but is
+            // padding as far as the aggregate is concerned: it neither aligns
+            // it nor reserves a window -- nothing ever accesses the field --
+            // so the size need only cover the bytes its bits touch. gcc makes
+            // `struct { char a; long :3; char b; }` 3 bytes on x86-64.
+            let shapes_aggregate =
+                !member.is_unnamed_bitfield() || self.unnamed_bitfields_align_aggregate();
+            if shapes_aggregate {
+                max_align = max_align.max(align);
+            }
             // An alignment written on the field places it, as it places any
             // member: `int b:3 __attribute__((aligned(8)))` starts at the
-            // next 8-byte boundary, packed or not. Without one, the rules below
+            // next 8-byte boundary, packed or not. So does one its type
+            // carries from a typedef's `aligned`, unless packing drops it:
+            // gcc puts `ai8 b:3` at 8 too. Without either, the rules below
             // place it.
-            if member.align.written.is_some() {
+            if member.align.written.is_some()
+                || self.alignment(member.typ) > self.natural_alignment(member.typ)
+            {
                 bit_offset = bit_offset.next_multiple_of(align as u128 * 8);
             }
 
@@ -3738,10 +3762,7 @@ impl TypeTable {
                 // free bit, and its access span is exactly the bytes its own
                 // bits touch: never wider than the object, so `window_end`
                 // takes no contribution here.
-                let within = bit_offset % 8;
-                member.offset = bytes_of(bit_offset);
-                member.bit_offset = Some(within as u32);
-                member.access_bytes = Some((within + bit_width).div_ceil(8) as u32);
+                Self::place_in_own_bytes(member, bit_offset, bit_width);
             } else {
                 // Advance only when the field would otherwise straddle a unit
                 // boundary, then read and write it through the
@@ -3754,11 +3775,15 @@ impl TypeTable {
                 if bit_offset % unit_bits + bit_width > unit_bits {
                     bit_offset = bit_offset.next_multiple_of(unit_bits);
                 }
-                let offset_bits = bit_offset / unit_bits * unit_bits;
-                member.offset = bytes_of(offset_bits);
-                member.bit_offset = Some((bit_offset - offset_bits) as u32);
-                member.access_bytes = Some(unit_bytes as u32);
-                window_end = window_end.max(offset_bits + unit_bits);
+                if shapes_aggregate {
+                    let offset_bits = bit_offset / unit_bits * unit_bits;
+                    member.offset = bytes_of(offset_bits);
+                    member.bit_offset = Some((bit_offset - offset_bits) as u32);
+                    member.access_bytes = Some(unit_bytes as u32);
+                    window_end = window_end.max(offset_bits + unit_bits);
+                } else {
+                    Self::place_in_own_bytes(member, bit_offset, bit_width);
+                }
             }
 
             bit_offset += bit_width;
@@ -3792,6 +3817,43 @@ impl TypeTable {
         };
         let raised = member.align.written.map_or(base, |w| base.max(w as usize));
         pack_cap.map_or(raised, |cap| raised.min(cap as usize))
+    }
+
+    /// Record a bit-field at `bit_offset` as spanning exactly the bytes its
+    /// own bits touch: the first of them is its offset, and its bit offset
+    /// within that byte is below 8.
+    fn place_in_own_bytes(member: &mut StructMember, bit_offset: u128, bit_width: u128) {
+        let within = bit_offset % 8;
+        member.offset = usize::try_from(bit_offset / 8).unwrap_or(usize::MAX);
+        member.bit_offset = Some(within as u32);
+        member.access_bytes = Some((within + bit_width).div_ceil(8) as u32);
+    }
+
+    /// The boundary a zero-width bit-field forces the next member to, in
+    /// bytes, beyond its storage unit: its type's alignment, raised by any
+    /// alignment written on it. Packing lowers neither -- gcc leaves
+    /// `int :0 __attribute__((aligned(8)))` at an 8-byte boundary under
+    /// `#pragma pack(1)` -- and it is also what the field contributes to its
+    /// aggregate's alignment where [`Self::unnamed_bitfields_align_aggregate`].
+    fn zero_width_alignment(&self, member: &StructMember) -> usize {
+        let written = member.align.written.map_or(1, |w| w as usize);
+        self.alignment(member.typ).max(written)
+    }
+
+    /// Whether an unnamed bit-field's declared type shapes its aggregate:
+    /// raises the struct's or union's alignment to its own -- zero-width or
+    /// not, and through packing for a zero-width one -- and reserves the
+    /// `sizeof(T)` window a named field would be accessed through.
+    ///
+    /// The x86-64 psABI says it does not ("unnamed bit-fields' types do not
+    /// affect the alignment of a structure or union"), on Linux and Darwin
+    /// alike. AAPCS64 says it does, and gcc follows it on aarch64 Linux.
+    /// Apple arm64 does not: clang's `DarwinAArch64TargetInfo` turns
+    /// `UseZeroLengthBitfieldAlignment` off, and with it off
+    /// `ItaniumRecordLayoutBuilder::LayoutBitField` drops an anonymous
+    /// bit-field's alignment from the record -- the x86-64 answer.
+    pub fn unnamed_bitfields_align_aggregate(&self) -> bool {
+        self.target_arch == Arch::Aarch64 && self.target_os != Os::MacOS
     }
 
     /// Whether a bit-field is laid out packed -- at the next free bit, through
@@ -3834,6 +3896,13 @@ impl TypeTable {
             // and no storage unit, rather than left as it was found: this
             // computes a layout, so every field of it is an output, and
             // `compute_struct_layout` clears the same two for the same reason.
+            // An unnamed bit-field, where the ABI ignores its type, is
+            // padding: as in a struct it spans only the bytes its bits touch
+            // and adds no alignment, so gcc makes `union { int :20; char c; }`
+            // three bytes on x86-64.
+            let shapes_aggregate =
+                !member.is_unnamed_bitfield() || self.unnamed_bitfields_align_aggregate();
+            let own_bytes = !shapes_aggregate || Self::packs_bitfield(member, pack_cap);
             if let Some(w) = member.bit_width.filter(|w| *w > 0) {
                 member.bit_offset = Some(0);
                 // Packed, the span is the bytes the field's own bits touch, as
@@ -3841,7 +3910,7 @@ impl TypeTable {
                 // bytes under gcc, not 4. Unpacked the two spellings coincide
                 // on both targets, and gating on the cap keeps that output
                 // bit-identical.
-                member.access_bytes = Some(if Self::packs_bitfield(member, pack_cap) {
+                member.access_bytes = Some(if own_bytes {
                     w.div_ceil(8)
                 } else {
                     self.size_bytes(member.typ) as u32
@@ -3860,8 +3929,8 @@ impl TypeTable {
                 // Except on AAPCS64, where it still demands its type's
                 // alignment -- and, as in a struct, packing does not suppress
                 // that. The union's size follows from the rounding.
-                if self.target_arch == Arch::Aarch64 {
-                    zero_width_align = zero_width_align.max(self.alignment(member.typ));
+                if self.unnamed_bitfields_align_aggregate() {
+                    zero_width_align = zero_width_align.max(self.zero_width_alignment(member));
                 }
                 continue;
             }
@@ -3870,13 +3939,13 @@ impl TypeTable {
             // is what makes `packed union { unsigned a:20; char c; }` three
             // bytes rather than four.
             let member_size = match member.bit_width {
-                Some(w) if w > 0 && Self::packs_bitfield(member, pack_cap) => {
-                    w.div_ceil(8) as usize
-                }
+                Some(w) if own_bytes => w.div_ceil(8) as usize,
                 _ => self.size_bytes(member.typ),
             };
             max_size = max_size.max(member_size);
-            max_align = max_align.max(self.member_alignment(member, pack_cap));
+            if shapes_aggregate {
+                max_align = max_align.max(self.member_alignment(member, pack_cap));
+            }
         }
 
         let max_align = max_align.max(zero_width_align);
@@ -4755,23 +4824,239 @@ mod tests {
             }
         }
 
-        let x86 = Target::new(Arch::X86_64, Os::Linux);
         let arm = Target::new(Arch::Aarch64, Os::Linux);
-
-        // Struct: the boundary applies everywhere, the alignment does not.
-        assert_eq!(layout(&x86, None, false), (5, 1));
+        // Apple arm64 takes the x86-64 answer: clang turns AAPCS64's
+        // zero-length bit-field alignment off for it.
+        for x86 in [
+            Target::new(Arch::X86_64, Os::Linux),
+            Target::new(Arch::X86_64, Os::MacOS),
+            Target::new(Arch::Aarch64, Os::MacOS),
+        ] {
+            // Struct: the boundary applies everywhere, the alignment does not.
+            assert_eq!(layout(&x86, None, false), (5, 1));
+            // Packing caps an ordinary member's alignment but not this one.
+            assert_eq!(layout(&x86, Some(1), false), (5, 1));
+            // Union: a zero-width bitfield occupies no storage, so it cannot
+            // widen the union.
+            assert_eq!(layout(&x86, None, true), (1, 1));
+            assert_eq!(layout(&x86, Some(1), true), (1, 1));
+        }
         assert_eq!(layout(&arm, None, false), (8, 4));
-
-        // Packing caps an ordinary member's alignment but not this one.
-        assert_eq!(layout(&x86, Some(1), false), (5, 1));
         assert_eq!(layout(&arm, Some(1), false), (8, 4));
-
-        // Union: a zero-width bitfield occupies no storage, so it cannot
-        // widen the union.
-        assert_eq!(layout(&x86, None, true), (1, 1));
         assert_eq!(layout(&arm, None, true), (4, 4));
-        assert_eq!(layout(&x86, Some(1), true), (1, 1));
         assert_eq!(layout(&arm, Some(1), true), (4, 4));
+    }
+
+    /// An unnamed bit-field of non-zero width is placed as any bit-field is
+    /// on every target; whether its declared type also aligns the aggregate,
+    /// and widens it to the `sizeof(T)` window, is the ABI's call. The x86-64
+    /// psABI (Linux and Darwin) and Apple arm64 say no; AAPCS64 says yes.
+    /// Each row is gcc's on x86-64 and aarch64 Linux, measured, and clang's
+    /// record-layout rule for Apple arm64.
+    #[test]
+    fn test_unnamed_bitfield_alignment_is_abi_specific() {
+        #[derive(Clone, Copy)]
+        enum T {
+            Char,
+            Short,
+            Int,
+            Long,
+            LongLong,
+            Int128,
+        }
+        // (type, width, named); a width of None is an ordinary member.
+        type Shape = &'static [(T, Option<u32>, bool)];
+        fn layout(target: &Target, shape: Shape, union_: bool, pack: Option<u32>) -> Vec<usize> {
+            let types = TypeTable::new(target);
+            let mut idents = crate::strings::StringTable::new();
+            let name = idents.intern("m");
+            let mut members: Vec<_> = shape
+                .iter()
+                .map(|&(t, bit_width, named)| StructMember {
+                    name: if named { name } else { StringId::EMPTY },
+                    typ: match t {
+                        T::Char => types.char_id,
+                        T::Short => types.short_id,
+                        T::Int => types.int_id,
+                        T::Long => types.long_id,
+                        T::LongLong => types.longlong_id,
+                        T::Int128 => types.uint128_id,
+                    },
+                    offset: 0,
+                    bit_offset: None,
+                    bit_width,
+                    access_bytes: None,
+                    align: MemberAlign::NATURAL,
+                })
+                .collect();
+            let (size, align) = if union_ {
+                types.compute_union_layout(&mut members, pack)
+            } else {
+                types.compute_struct_layout(&mut members, pack)
+            };
+            // The span invariant: no member is accessed past the aggregate.
+            for m in &members {
+                if let Some(access) = m.access_bytes {
+                    assert!(m.offset + access as usize <= size, "{target:?}");
+                }
+            }
+            // Size, alignment, then the offset of every named member.
+            let named = members.iter().filter(|m| m.name != StringId::EMPTY);
+            [size, align]
+                .into_iter()
+                .chain(named.map(|m| m.offset))
+                .collect()
+        }
+        use T::*;
+        const C: (T, Option<u32>, bool) = (Char, None, true);
+        const SH: (T, Option<u32>, bool) = (Short, None, true);
+        // (shape, union, pack, x86-64 and Apple arm64, aarch64 Linux)
+        type Row = (Shape, bool, Option<u32>, &'static [usize], &'static [usize]);
+        #[rustfmt::skip]
+        let rows: &[Row] = &[
+            // { char a; int :5; char b; }
+            (&[C, (Int, Some(5), false), C], false, None, &[3, 1, 0, 2], &[4, 4, 0, 2]),
+            // { char a; long :3; char b; }
+            (&[C, (Long, Some(3), false), C], false, None, &[3, 1, 0, 2], &[8, 8, 0, 2]),
+            // { int :20; char c; }
+            (&[(Int, Some(20), false), C], false, None, &[4, 1, 3], &[4, 4, 3]),
+            // { char a; int :5; int :7; char b; }
+            (&[C, (Int, Some(5), false), (Int, Some(7), false), C], false, None,
+             &[4, 1, 0, 3], &[4, 4, 0, 3]),
+            // { short a; int :31; char b; }
+            (&[SH, (Int, Some(31), false), C], false, None, &[10, 2, 0, 8], &[12, 4, 0, 8]),
+            // { unsigned __int128 :96; } -- never accessed, so no carrier
+            (&[(Int128, Some(96), false)], false, None, &[12, 1], &[16, 16]),
+            // { char a; long long :40; char b; }
+            (&[C, (LongLong, Some(40), false), C], false, None, &[7, 1, 0, 6], &[8, 8, 0, 6]),
+            // { char a; long :33; } -- trailing: the size covers its bits
+            (&[C, (Long, Some(33), false)], false, None, &[6, 1, 0], &[8, 8, 0]),
+            // { char a; long :3; int b; } -- a named member still aligns
+            (&[C, (Long, Some(3), false), (Int, None, true)], false, None,
+             &[8, 4, 0, 4], &[8, 8, 0, 4]),
+            // { char a; int b:5; char c; } -- named: the same everywhere
+            (&[C, (Int, Some(5), true), C], false, None, &[4, 4, 0, 0, 2], &[4, 4, 0, 0, 2]),
+            // #pragma pack(2) { char a; int :5; char b; }
+            (&[C, (Int, Some(5), false), C], false, Some(2), &[3, 1, 0, 2], &[4, 2, 0, 2]),
+            // union { int :20; char c; }
+            (&[(Int, Some(20), false), C], true, None, &[3, 1, 0], &[4, 4, 0]),
+            // union { char c; long :33; }
+            (&[C, (Long, Some(33), false)], true, None, &[5, 1, 0], &[8, 8, 0]),
+            // union { short s; long :17; }
+            (&[SH, (Long, Some(17), false)], true, None, &[4, 2, 0], &[8, 8, 0]),
+        ];
+        let aapcs64 = Target::new(Arch::Aarch64, Os::Linux);
+        for (i, &(shape, union_, pack, psabi, aapcs)) in rows.iter().enumerate() {
+            for target in [
+                Target::new(Arch::X86_64, Os::Linux),
+                Target::new(Arch::X86_64, Os::MacOS),
+                Target::new(Arch::Aarch64, Os::MacOS),
+            ] {
+                assert_eq!(
+                    layout(&target, shape, union_, pack),
+                    psabi,
+                    "row {i} {target:?}"
+                );
+            }
+            assert_eq!(
+                layout(&aapcs64, shape, union_, pack),
+                aapcs,
+                "row {i} aarch64 Linux"
+            );
+        }
+    }
+
+    /// An alignment written on a bit-field, or carried by its typedef'd type,
+    /// places the field at that boundary on every target; whether it also
+    /// aligns the aggregate follows the same per-ABI rule as the field's type
+    /// does. A zero-width field's boundary is raised by it too, and packing
+    /// does not lower that. Every row is gcc's on x86-64 and aarch64 Linux.
+    #[test]
+    fn test_bitfield_alignment_attributes_place_the_field() {
+        // { char a; <T> :<w> [aligned(8)]; char b; } -> (size, align, offsetof b)
+        fn layout(
+            target: &Target,
+            ai8: bool,
+            written: Option<u32>,
+            width: u32,
+            named: bool,
+            pack: Option<u32>,
+        ) -> (usize, usize, usize) {
+            let mut types = TypeTable::new(target);
+            let mut idents = crate::strings::StringTable::new();
+            let name = idents.intern("m");
+            let int = types.int_id;
+            let typ = if ai8 {
+                types.intern(Type {
+                    explicit_align: Some(8),
+                    ..types.get(int).clone()
+                })
+            } else {
+                int
+            };
+            let member = |typ, bit_width, written, name| StructMember {
+                name,
+                typ,
+                offset: 0,
+                bit_offset: None,
+                bit_width,
+                access_bytes: None,
+                align: MemberAlign {
+                    written,
+                    packed: false,
+                },
+            };
+            let char_id = types.char_id;
+            let mut members = vec![
+                member(char_id, None, None, name),
+                member(
+                    typ,
+                    Some(width),
+                    written,
+                    if named { name } else { StringId::EMPTY },
+                ),
+                member(char_id, None, None, name),
+            ];
+            let (size, align) = types.compute_struct_layout(&mut members, pack);
+            (size, align, members[2].offset)
+        }
+        let psabi = [
+            Target::new(Arch::X86_64, Os::Linux),
+            Target::new(Arch::X86_64, Os::MacOS),
+            Target::new(Arch::Aarch64, Os::MacOS),
+        ];
+        let aapcs64 = Target::new(Arch::Aarch64, Os::Linux);
+        // (typedef aligned(8), written, width, named, pack, psABI, AAPCS64)
+        type Layout = (usize, usize, usize);
+        type Row = (bool, Option<u32>, u32, bool, Option<u32>, Layout, Layout);
+        let rows: &[Row] = &[
+            // int :5 __attribute__((aligned(8)))
+            (false, Some(8), 5, false, None, (10, 1, 9), (16, 8, 9)),
+            // int :0 __attribute__((aligned(8))), with and without pack(1)
+            (false, Some(8), 0, false, None, (9, 1, 8), (16, 8, 8)),
+            (false, Some(8), 0, false, Some(1), (9, 1, 8), (16, 8, 8)),
+            // ai8 :5 and ai8 :0
+            (true, None, 5, false, None, (10, 1, 9), (16, 8, 9)),
+            (true, None, 0, false, None, (9, 1, 8), (16, 8, 8)),
+            // ai8 x:5 -- named, so the aggregate is aligned everywhere
+            (true, None, 5, true, None, (16, 8, 9), (16, 8, 9)),
+            // ai8 :5 under pack(1): the cap drops the typedef's alignment
+            (true, None, 5, false, Some(1), (3, 1, 2), (3, 1, 2)),
+        ];
+        for (i, &(ai8, written, width, named, pack, sysv, aapcs)) in rows.iter().enumerate() {
+            for target in &psabi {
+                assert_eq!(
+                    layout(target, ai8, written, width, named, pack),
+                    sysv,
+                    "row {i} {target:?}"
+                );
+            }
+            assert_eq!(
+                layout(&aapcs64, ai8, written, width, named, pack),
+                aapcs,
+                "row {i} aarch64 Linux"
+            );
+        }
     }
 
     /// One rule aligns a member: `packed` (on it, or on its whole aggregate)
@@ -5355,8 +5640,10 @@ mod tests {
     #[test]
     fn test_struct_layout_past_u64_bits() {
         let mut types = TypeTable::new(&Target::host());
+        // Named: an unnamed bit-field is padding, laid out by its own rule.
+        let name = crate::strings::StringTable::new().intern("m");
         let member = |typ, bit_width| StructMember {
-            name: StringId::EMPTY,
+            name,
             typ,
             offset: 0,
             bit_offset: None,

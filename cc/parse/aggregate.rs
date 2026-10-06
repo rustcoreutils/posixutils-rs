@@ -736,15 +736,22 @@ impl Parser<'_> {
                     self.advance(); // consume ':'
                     let width = self.parse_bitfield_width()?;
                     self.validate_bitfield(member_base_type_id, width, false)?;
+                    // Attributes after the width are this field's, as after
+                    // a named one: `int :5 __attribute__((aligned(8)))`
+                    // places it at the next 8-byte boundary under gcc, and
+                    // `packed` packs it.
+                    self.skip_extensions();
+                    let typ = self.apply_pending_type_attrs(member_base_type_id);
+                    let align = specifier_align.merge(self.take_member_align());
 
                     members.push(StructMember {
                         name: StringId::EMPTY,
-                        typ: member_base_type_id,
+                        typ,
                         offset: 0,
                         bit_offset: None,
                         bit_width: Some(width),
                         access_bytes: None,
-                        align: MemberAlign::NATURAL, // padding: nothing written aligns it
+                        align,
                     });
 
                     if self.is_special(b',') {
@@ -939,7 +946,9 @@ impl Parser<'_> {
     fn check_wide_bitfields_have_a_carrier(&self, members: &[StructMember]) {
         for m in members {
             let Some(width) = m.bit_width else { continue };
-            if width <= 64 || m.access_bytes == Some(16) {
+            // An unnamed field is never accessed, so needs no carrier: on an
+            // ABI where it is padding its span is only the bytes it touches.
+            if width <= 64 || m.access_bytes == Some(16) || m.is_unnamed_bitfield() {
                 continue;
             }
             diag::error_args(
@@ -975,7 +984,7 @@ impl Parser<'_> {
         if members
             .iter()
             .take(first)
-            .all(|m| m.name == StringId::EMPTY && m.bit_width.is_some())
+            .all(StructMember::is_unnamed_bitfield)
         {
             diag::error(
                 pos,

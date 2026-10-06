@@ -19,6 +19,7 @@ mod asm_constraint_letters;
 mod asm_operand_modifiers;
 pub mod asm_probe;
 mod binary128;
+mod bitfield_layout;
 mod block_moves;
 mod call_args;
 mod complex_fold;

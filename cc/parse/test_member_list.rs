@@ -37,6 +37,39 @@ fn test_unnamed_bitfields_may_begin_a_declarator_list() {
     );
 }
 
+/// An attribute after an unnamed bit-field's width is that field's, as after
+/// a named one's, and does not leak to the next declarator. It was a parse
+/// error.
+#[test]
+fn test_attributes_follow_an_unnamed_bitfield() {
+    let src = "struct s { char a; int :5 __attribute__((aligned(8))), :3; \
+               int :7 __attribute__((packed)); char b; };";
+    let (_, types, strings, symbols) = parse_tu(src).unwrap();
+    let tag = strings.lookup("s").expect("tag interned");
+    let typ = symbols
+        .lookup(tag, Namespace::Tag)
+        .expect("tag declared")
+        .typ;
+    let composite = types.get(typ).composite.as_ref().expect("a composite");
+    let aligns: Vec<_> = composite
+        .members
+        .iter()
+        .map(|m| (m.align.written, m.align.packed))
+        .collect();
+    assert_eq!(
+        aligns,
+        [
+            (None, false),
+            (Some(8), false),
+            (None, false),
+            (None, true),
+            (None, false)
+        ]
+    );
+    // The written alignment places the field at 8 on every target.
+    assert_eq!(composite.members[1].offset, 8);
+}
+
 #[test]
 fn test_stray_semicolons_in_a_member_list() {
     assert_eq!(

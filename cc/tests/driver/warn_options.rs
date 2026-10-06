@@ -233,8 +233,15 @@ fn linker_options_are_untouched() {
         "{}",
         r.stderr
     );
+    // An option the host's linker takes: GNU ld's `-z now`, Apple ld's
+    // `-dead_strip` (which has no `-z`).
+    let linker_option = if cfg!(target_os = "macos") {
+        "-Wl,-dead_strip"
+    } else {
+        "-Wl,-z,now"
+    };
     let r = run_c17(&[
-        "-Wl,-z,now",
+        linker_option,
         "-o",
         exe.to_str().unwrap(),
         path.to_str().unwrap(),

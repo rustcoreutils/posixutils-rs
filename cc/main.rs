@@ -1431,17 +1431,25 @@ impl StripBy {
 /// fixed-address static executable, and c17 compiles position-independent
 /// code by default, which is what makes `-pie` the default here. Only
 /// `-static-pie` asks for both.
-fn link_mode_flag(args: &Args, target: &Target) -> &'static str {
+///
+/// `None` for an executable on macOS: a Mach-O executable is always
+/// position independent there, and Apple's driver answers `-pie` and
+/// `-no-pie` alike with "argument unused during compilation". A `-static`,
+/// `-static-pie`, `-pie` or `-no-pie` on the command line still reaches it
+/// as written, among the other linker flags.
+fn link_mode_flag(args: &Args, target: &Target) -> Option<&'static str> {
     let has = |flag: &str| args.linker_flags.iter().any(|f| f == flag);
-    if producing_shared(args) {
+    Some(if producing_shared(args) {
         "-shared"
+    } else if target.os == Os::MacOS {
+        return None;
     } else if has("-static-pie") {
         "-static-pie"
     } else if has("-static") || !link_pie(args, target) {
         "-no-pie"
     } else {
         "-pie"
-    }
+    })
 }
 
 /// Whether an executable is linked as a PIE: as the last of `-pie` and
@@ -1469,7 +1477,9 @@ fn link_objects(
     target: &Target,
 ) -> io::Result<()> {
     let mut link_cmd = linkargs::host_driver();
-    link_cmd.arg(link_mode_flag(args, target));
+    if let Some(mode) = link_mode_flag(args, target) {
+        link_cmd.arg(mode);
+    }
     link_cmd.args(["-o", exe_file]);
 
     // -B selects which form of a library `-l` prefers. GNU ld spells this
@@ -3784,19 +3794,44 @@ mod tests {
             let args = Args::parse_from(run_preprocess(argv));
             link_mode_flag(&args, &linux)
         };
-        assert_eq!(mode(&["foo.c"]), "-pie");
-        assert_eq!(mode(&["-no-pie", "foo.c"]), "-no-pie");
-        assert_eq!(mode(&["-no-pie", "-pie", "foo.c"]), "-pie");
-        assert_eq!(mode(&["-pie", "-no-pie", "foo.c"]), "-no-pie");
-        assert_eq!(mode(&["-fno-pic", "foo.c"]), "-no-pie");
-        assert_eq!(mode(&["-fno-pic", "-pie", "foo.c"]), "-pie");
-        assert_eq!(mode(&["-fPIC", "foo.c"]), "-pie");
-        assert_eq!(mode(&["-fPIE", "-no-pie", "foo.c"]), "-no-pie");
-        assert_eq!(mode(&["-static", "foo.c"]), "-no-pie");
-        assert_eq!(mode(&["-pie", "-static", "foo.c"]), "-no-pie");
-        assert_eq!(mode(&["-static", "-fPIE", "foo.c"]), "-no-pie");
-        assert_eq!(mode(&["-static-pie", "foo.c"]), "-static-pie");
-        assert_eq!(mode(&["-shared", "-static", "foo.c"]), "-shared");
+        assert_eq!(mode(&["foo.c"]), Some("-pie"));
+        assert_eq!(mode(&["-no-pie", "foo.c"]), Some("-no-pie"));
+        assert_eq!(mode(&["-no-pie", "-pie", "foo.c"]), Some("-pie"));
+        assert_eq!(mode(&["-pie", "-no-pie", "foo.c"]), Some("-no-pie"));
+        assert_eq!(mode(&["-fno-pic", "foo.c"]), Some("-no-pie"));
+        assert_eq!(mode(&["-fno-pic", "-pie", "foo.c"]), Some("-pie"));
+        assert_eq!(mode(&["-fPIC", "foo.c"]), Some("-pie"));
+        assert_eq!(mode(&["-fPIE", "-no-pie", "foo.c"]), Some("-no-pie"));
+        assert_eq!(mode(&["-static", "foo.c"]), Some("-no-pie"));
+        assert_eq!(mode(&["-pie", "-static", "foo.c"]), Some("-no-pie"));
+        assert_eq!(mode(&["-static", "-fPIE", "foo.c"]), Some("-no-pie"));
+        assert_eq!(mode(&["-static-pie", "foo.c"]), Some("-static-pie"));
+        assert_eq!(mode(&["-shared", "-static", "foo.c"]), Some("-shared"));
+    }
+
+    /// A Mach-O executable on arm64 is always position independent, and
+    /// Apple's driver ignores `-pie`/`-no-pie` with "argument unused during
+    /// compilation": no executable link mode is passed there, whatever was
+    /// asked. A shared library still says so.
+    #[test]
+    fn test_link_mode_flag_macos() {
+        let macos = Target::new(target::Arch::Aarch64, Os::MacOS);
+        let mode = |argv: &[&str]| {
+            let args = Args::parse_from(run_preprocess(argv));
+            link_mode_flag(&args, &macos)
+        };
+        for argv in [
+            &["foo.c"][..],
+            &["-fno-pic", "foo.c"],
+            &["-no-pie", "foo.c"],
+            &["-pie", "foo.c"],
+            &["-fPIC", "foo.c"],
+            &["-static", "foo.c"],
+            &["-static-pie", "foo.c"],
+        ] {
+            assert_eq!(mode(argv), None, "{argv:?}");
+        }
+        assert_eq!(mode(&["-shared", "foo.c"]), Some("-shared"));
     }
 
     // Tests for linker passthrough flags

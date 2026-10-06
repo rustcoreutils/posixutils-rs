@@ -684,3 +684,37 @@ fn test_copy_list_with_nul_byte_is_diagnosed() {
     assert_exit_code(&output, 1, "pax -rw with a NUL in a listed name");
     assert!(temp.path().join("out/good").exists());
 }
+
+/// A write error on the archive is the archive's failure, not each source
+/// file's. With the file-size limit exceeded (EFBIG), pax must stop and say so
+/// once -- not go on reporting "File too large" against every remaining file
+/// as though that file were at fault.
+#[test]
+fn test_archive_write_error_is_fatal_and_reported_once() {
+    let temp = TempDir::new().unwrap();
+    let mut names = Vec::new();
+    for i in 0..20 {
+        let name = format!("f{i:02}");
+        fs::write(temp.path().join(&name), vec![b'x'; 4096]).unwrap();
+        names.push(name);
+    }
+
+    // SIGXFSZ ignored so the over-limit write fails with EFBIG instead of
+    // killing the process; a 1-block limit is exceeded by the first record.
+    let script = format!(
+        "trap '' XFSZ; ulimit -f 1; exec \"$0\" -w -f a.tar {}",
+        names.join(" ")
+    );
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(&script)
+        .arg(env!("CARGO_BIN_EXE_pax"))
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+
+    assert_exit_code(&output, 1, "pax -w past the file-size limit");
+    let stderr = stderr_str(&output);
+    assert_eq!(stderr.lines().count(), 1, "stderr:\n{stderr}");
+    assert!(!stderr.contains("f0"), "blamed a source file:\n{stderr}");
+}

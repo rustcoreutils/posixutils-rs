@@ -23,7 +23,7 @@ mod rawpath;
 mod subst;
 mod userdb;
 
-use archive::{ArchiveFormat, ArchiveWriter};
+use archive::ArchiveFormat;
 use blocked_io::{
     default_record_size, parse_blocksize, BlockedReader, BlockedWriter, ByteCounter,
     DEFAULT_RECORD_SIZE, TAR_BLOCK_SIZE,
@@ -573,10 +573,8 @@ fn run_write_multi_volume(
 
     let mut writer = multivolume::MultiVolumeWriter::new(mv_options)?;
 
-    // Write each file to the multi-volume archive
-    modes::write::write_files_to_archive(&mut writer, files, format, options)?;
-
-    writer.finish()
+    // Write each file to the multi-volume archive, then its trailer
+    modes::write::write_files_to_archive(&mut writer, files, options)
 }
 
 /// Run append mode (-w -a)

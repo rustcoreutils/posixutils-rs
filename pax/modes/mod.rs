@@ -24,14 +24,19 @@ pub use write::create_archive;
 
 /// Whether an error should stop a traversal rather than skip one file.
 ///
-/// A failure to write the archive, or to reach the destination filesystem, is
-/// not about the file being visited and will recur for every one after it --
-/// without this, a full disk or a closed pipe produces one diagnostic per
-/// remaining file. A failure to read a *source* file is per-file, and POSIX
-/// CONSEQUENCES OF ERRORS says to diagnose it and carry on.
+/// A failure to write the archive is not about the file being visited and will
+/// recur for every one after it -- without this, a full disk, a closed pipe or
+/// an exceeded file-size limit produces one diagnostic per remaining file, each
+/// blaming a file that did nothing wrong. Every I/O error the archive writer
+/// raises arrives as `ArchiveWrite` (see `write::ArchiveSink`), whatever its
+/// errno. Copy mode has no archive; there a full or vanished destination
+/// filesystem is the shared failure. A failure to read a *source* file is
+/// per-file, and POSIX CONSEQUENCES OF ERRORS says to diagnose it and carry on.
 pub(crate) fn is_fatal(err: &crate::error::PaxError) -> bool {
+    use crate::error::PaxError;
     match err {
-        crate::error::PaxError::Io(e) => matches!(
+        PaxError::ArchiveWrite(_) => true,
+        PaxError::Io(e) => matches!(
             e.kind(),
             std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::StorageFull
         ),

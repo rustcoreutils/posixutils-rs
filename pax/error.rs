@@ -18,6 +18,10 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 pub enum PaxError {
     /// I/O error
     Io(io::Error),
+    /// Writing the archive itself failed. Unlike an `Io` error on a file being
+    /// archived, this is not about any one member and will recur for every one
+    /// after it, so it ends the run.
+    ArchiveWrite(io::Error),
     /// Invalid archive format
     InvalidFormat(String),
     /// Invalid header field
@@ -41,6 +45,7 @@ impl fmt::Display for PaxError {
         use gettextrs::gettext;
         match self {
             PaxError::Io(e) => write!(f, "{}: {}", gettext("I/O error"), e),
+            PaxError::ArchiveWrite(e) => write!(f, "{}: {}", gettext("error writing archive"), e),
             PaxError::InvalidFormat(msg) => {
                 write!(f, "{}: {}", gettext("Invalid archive format"), msg)
             }
@@ -56,7 +61,7 @@ impl fmt::Display for PaxError {
 impl std::error::Error for PaxError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            PaxError::Io(e) => Some(e),
+            PaxError::Io(e) | PaxError::ArchiveWrite(e) => Some(e),
             _ => None,
         }
     }

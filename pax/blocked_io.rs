@@ -145,6 +145,8 @@ pub struct BlockedWriter<W: Write> {
     buffer: Vec<u8>,
     /// Current position within the buffer
     pos: usize,
+    /// How much of a full record the underlying writer has already accepted
+    sent: usize,
     /// Whether finish() has been called (to avoid double-flush in Drop)
     finished: bool,
     /// Total bytes written to the underlying writer
@@ -164,6 +166,7 @@ impl<W: Write> BlockedWriter<W> {
             record_size,
             buffer: vec![0u8; record_size],
             pos: 0,
+            sent: 0,
             finished: false,
             counter,
         }
@@ -172,6 +175,18 @@ impl<W: Write> BlockedWriter<W> {
     /// Flush the current record to the underlying writer
     ///
     /// This writes exactly record_size bytes, zero-padding if necessary.
+    ///
+    /// Bytes the underlying writer has accepted are never offered to it again.
+    /// A write can be partial -- a pipe, a file at its size limit -- and fail on
+    /// the next call; starting the record over on a retry would put the
+    /// accepted part into the stream twice. So progress is kept in `sent`, and
+    /// once this has been called the record is committed: `pos` stays at the
+    /// end of it until all of it is out.
+    ///
+    /// An interrupted write is retried. Any other error is returned as it is,
+    /// EAGAIN on a non-blocking descriptor included: nothing here knows the
+    /// descriptor to wait on, and the caller treats a failed archive write as
+    /// the end of the run (`PaxError::ArchiveWrite`).
     fn flush_record(&mut self) -> std::io::Result<()> {
         if self.pos == 0 {
             return Ok(());
@@ -179,13 +194,22 @@ impl<W: Write> BlockedWriter<W> {
 
         // Zero-fill the rest of the record
         self.buffer[self.pos..].fill(0);
+        self.pos = self.record_size;
 
-        // Write exactly one record
-        self.writer.write_all(&self.buffer)?;
-        self.counter
-            .fetch_add(self.buffer.len() as u64, Ordering::Relaxed);
+        while self.sent < self.record_size {
+            match self.writer.write(&self.buffer[self.sent..]) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(n) => {
+                    self.sent += n;
+                    self.counter.fetch_add(n as u64, Ordering::Relaxed);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
 
         self.pos = 0;
+        self.sent = 0;
         Ok(())
     }
 
@@ -204,25 +228,24 @@ impl<W: Write> BlockedWriter<W> {
 }
 
 impl<W: Write> Write for BlockedWriter<W> {
+    /// Take up to one record's worth of `buf`.
+    ///
+    /// A full record goes out when the next byte arrives (or on `flush`), not
+    /// when it fills: an error is then returned only from a call that has taken
+    /// none of its `buf`, as `Write` requires, and a retry resumes the record
+    /// where the underlying writer left off.
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut written = 0;
-
-        while written < buf.len() {
-            let space = self.record_size - self.pos;
-            let to_copy = std::cmp::min(space, buf.len() - written);
-
-            self.buffer[self.pos..self.pos + to_copy]
-                .copy_from_slice(&buf[written..written + to_copy]);
-            self.pos += to_copy;
-            written += to_copy;
-
-            // If record is full, flush it
-            if self.pos >= self.record_size {
-                self.flush_record()?;
-            }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.pos == self.record_size {
+            self.flush_record()?;
         }
 
-        Ok(written)
+        let to_copy = std::cmp::min(self.record_size - self.pos, buf.len());
+        self.buffer[self.pos..self.pos + to_copy].copy_from_slice(&buf[..to_copy]);
+        self.pos += to_copy;
+        Ok(to_copy)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -359,6 +382,73 @@ mod tests {
         assert_eq!(&result[..1000], &data[..]);
         // Rest should be zeros
         assert!(result[1000..].iter().all(|&b| b == 0));
+    }
+
+    /// Is interrupted `interrupts` times, then accepts `budget` bytes in
+    /// total, a few at a time, then fails every write with WouldBlock until
+    /// given more budget.
+    struct ChokingWriter {
+        out: Vec<u8>,
+        interrupts: usize,
+        budget: usize,
+    }
+
+    impl ChokingWriter {
+        fn new(interrupts: usize, budget: usize) -> Self {
+            ChokingWriter {
+                out: Vec::new(),
+                interrupts,
+                budget,
+            }
+        }
+    }
+
+    impl Write for ChokingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.interrupts > 0 {
+                self.interrupts -= 1;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            if self.budget == 0 {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let n = buf.len().min(self.budget).min(300);
+            self.out.extend_from_slice(&buf[..n]);
+            self.budget -= n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_blocked_writer_never_resends_accepted_bytes() {
+        let data: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
+        let mut writer = BlockedWriter::new(ChokingWriter::new(0, 700), 1024);
+
+        // The first record is accepted 300 + 300 + 100 bytes, then refused.
+        let err = writer.write_all(&data).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(writer.writer.out, &data[..700]);
+
+        // Once the writer can take more, the stream picks up at byte 700 --
+        // not at the start of the record, which would duplicate 700 bytes --
+        // and the 1024 bytes the failed call did not take are taken now.
+        writer.writer.budget = usize::MAX;
+        writer.write_all(&data[1024..]).unwrap();
+        let out = writer.finish().unwrap().out;
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn test_blocked_writer_retries_interrupted() {
+        let mut writer = BlockedWriter::new(ChokingWriter::new(3, usize::MAX), 512);
+        writer.write_all(&[7u8; 1000]).unwrap();
+        let out = writer.finish().unwrap().out;
+        assert_eq!(&out[..1000], &[7u8; 1000]);
+        assert_eq!(out.len(), 1024);
     }
 
     #[test]

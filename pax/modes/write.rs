@@ -106,21 +106,74 @@ pub fn create_archive<W: Write>(
     options: &WriteOptions,
 ) -> PaxResult<()> {
     match format {
-        ArchiveFormat::Ustar => {
-            let mut archive = UstarWriter::new(writer);
-            write_files(&mut archive, files, options)?;
-            archive.finish()
-        }
-        ArchiveFormat::Cpio => {
-            let mut archive = CpioWriter::with_format(writer, options.cpio_format);
-            write_files(&mut archive, files, options)?;
-            archive.finish()
-        }
-        ArchiveFormat::Pax => {
-            let mut archive = PaxWriter::with_options(writer, options.format_options.clone());
-            write_files(&mut archive, files, options)?;
-            archive.finish()
-        }
+        ArchiveFormat::Ustar => write_archive(&mut UstarWriter::new(writer), files, options),
+        ArchiveFormat::Cpio => write_archive(
+            &mut CpioWriter::with_format(writer, options.cpio_format),
+            files,
+            options,
+        ),
+        ArchiveFormat::Pax => write_archive(
+            &mut PaxWriter::with_options(writer, options.format_options.clone()),
+            files,
+            options,
+        ),
+    }
+}
+
+/// Archive `files` and write the trailer, with every I/O failure of `archive`
+/// itself marked as the archive's (see `ArchiveSink`).
+fn write_archive<A: ArchiveWriter>(
+    archive: &mut A,
+    files: &[PathBuf],
+    options: &WriteOptions,
+) -> PaxResult<()> {
+    let mut sink = ArchiveSink(archive);
+    write_files(&mut sink, files, options)?;
+    sink.finish()
+}
+
+/// An archive writer whose I/O errors are known to be the archive's.
+///
+/// While a file is archived, its own reads and the archive's writes happen side
+/// by side, and both fail with an `io::Error`. Telling them apart by errno does
+/// not work -- EIO, EFBIG or EAGAIN can come from either -- and getting it wrong
+/// either blames every remaining source file for the archive's failure or stops
+/// the run over one unreadable file. A writer's only I/O is its sink, so this
+/// wrapper re-labels each such error `ArchiveWrite`, which ends the run.
+struct ArchiveSink<'a, A: ArchiveWriter>(&'a mut A);
+
+impl<A: ArchiveWriter> ArchiveSink<'_, A> {
+    fn sink<T>(result: PaxResult<T>) -> PaxResult<T> {
+        result.map_err(|e| match e {
+            PaxError::Io(e) => PaxError::ArchiveWrite(e),
+            e => e,
+        })
+    }
+}
+
+impl<A: ArchiveWriter> ArchiveWriter for ArchiveSink<'_, A> {
+    fn write_entry(&mut self, entry: &ArchiveEntry) -> PaxResult<()> {
+        Self::sink(self.0.write_entry(entry))
+    }
+
+    fn write_data(&mut self, data: &[u8]) -> PaxResult<()> {
+        Self::sink(self.0.write_data(data))
+    }
+
+    fn finish_entry(&mut self) -> PaxResult<()> {
+        Self::sink(self.0.finish_entry())
+    }
+
+    fn finish(&mut self) -> PaxResult<()> {
+        Self::sink(self.0.finish())
+    }
+
+    fn supports_hardlinks(&self) -> bool {
+        self.0.supports_hardlinks()
+    }
+
+    fn needs_data_checksum(&self) -> bool {
+        self.0.needs_data_checksum()
     }
 }
 
@@ -598,12 +651,18 @@ fn file_checksum(file: &mut File) -> PaxResult<u32> {
 ///
 /// So the read is truncated if the file grew and zero-padded if it shrank, which
 /// is what GNU tar does ("File shrank by N bytes; padding with zeros"), and the
-/// exit status records that the archive does not match what was on disk. The
-/// bound also has to come from `size` rather than from end-of-file: waiting for a
-/// shrinking file to deliver bytes it no longer has is how CVE-2018-20482 turned
-/// into an infinite loop.
-fn copy_file_data<W: ArchiveWriter>(
-    file: &mut File,
+/// exit status records that the archive does not match what was on disk. A read
+/// error part-way through is the same case: it is the file's failure, reported
+/// against the file, and the member is still padded out to its declared size --
+/// stopping short would leave the next header inside this member's data area,
+/// where no reader would find it or anything after it. The bound also has to
+/// come from `size` rather than from end-of-file: waiting for a shrinking file
+/// to deliver bytes it no longer has is how CVE-2018-20482 turned into an
+/// infinite loop.
+///
+/// Only an error from `archive` is returned; one from `file` is reported here.
+fn copy_file_data<R: Read, W: ArchiveWriter>(
+    file: &mut R,
     archive: &mut W,
     size: u64,
     path: &Path,
@@ -613,34 +672,53 @@ fn copy_file_data<W: ArchiveWriter>(
 
     while remaining > 0 {
         let want = remaining.min(buf.len() as u64) as usize;
-        let n = file.read(&mut buf[..want])?;
-        if n == 0 {
-            break;
-        }
+        let n = match read_retrying(file, &mut buf[..want]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                crate::error::report_error(
+                    path,
+                    format!("{e}; padding {remaining} bytes with zeros"),
+                );
+                return pad_with_zeros(archive, remaining);
+            }
+        };
         archive.write_data(&buf[..n])?;
         remaining -= n as u64;
     }
 
     if remaining > 0 {
-        eprintln!(
-            "pax: {}: File shrank by {} bytes; padding with zeros",
-            path.display(),
-            remaining
+        crate::error::report_error(
+            path,
+            format!("File shrank by {remaining} bytes; padding with zeros"),
         );
-        crate::error::note_error();
-
-        let zeros = [0u8; 8192];
-        while remaining > 0 {
-            let n = remaining.min(zeros.len() as u64) as usize;
-            archive.write_data(&zeros[..n])?;
-            remaining -= n as u64;
-        }
-    } else if file.read(&mut buf[..1])? != 0 {
+        pad_with_zeros(archive, remaining)?;
+    } else if matches!(read_retrying(file, &mut buf[..1]), Ok(n) if n != 0) {
         // Still more to read than the header promised.
         crate::error::report_error(path, "file changed as we read it");
-        crate::error::note_error();
     }
 
+    Ok(())
+}
+
+/// `read`, retried for as long as it is interrupted by a signal.
+fn read_retrying<R: Read>(file: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        match file.read(buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            result => return result,
+        }
+    }
+}
+
+/// Write `count` zero bytes of member data.
+fn pad_with_zeros<W: ArchiveWriter>(archive: &mut W, mut count: u64) -> PaxResult<()> {
+    let zeros = [0u8; 8192];
+    while count > 0 {
+        let n = count.min(zeros.len() as u64) as usize;
+        archive.write_data(&zeros[..n])?;
+        count -= n as u64;
+    }
     Ok(())
 }
 
@@ -706,14 +784,14 @@ fn build_entry(
     Ok(entry)
 }
 
-/// Write files to a pre-existing archive writer (for multi-volume support)
+/// Archive files into a pre-existing archive writer and write its trailer (for
+/// multi-volume support)
 pub fn write_files_to_archive<W: ArchiveWriter>(
     archive: &mut W,
     files: &[PathBuf],
-    _format: ArchiveFormat,
     options: &WriteOptions,
 ) -> PaxResult<()> {
-    write_files(archive, files, options)
+    write_archive(archive, files, options)
 }
 
 /// Read file list from stdin (one path per line)
@@ -806,5 +884,92 @@ fn reset_atime(file: &File, path: &Path, atime_sec: i64, atime_nsec: i64) {
             path.display(),
             std::io::Error::last_os_error()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Collects member data; fails every call with `fail` once that is set.
+    #[derive(Default)]
+    struct DataSink {
+        data: Vec<u8>,
+        fail: Option<std::io::ErrorKind>,
+    }
+
+    impl ArchiveWriter for DataSink {
+        fn write_entry(&mut self, _entry: &ArchiveEntry) -> PaxResult<()> {
+            Ok(())
+        }
+
+        fn write_data(&mut self, data: &[u8]) -> PaxResult<()> {
+            if let Some(kind) = self.fail {
+                return Err(PaxError::Io(kind.into()));
+            }
+            self.data.extend_from_slice(data);
+            Ok(())
+        }
+
+        fn finish_entry(&mut self) -> PaxResult<()> {
+            Ok(())
+        }
+
+        fn finish(&mut self) -> PaxResult<()> {
+            Ok(())
+        }
+    }
+
+    /// Yields `data`, then fails with EIO.
+    struct FailingReader<'a> {
+        data: &'a [u8],
+    }
+
+    impl Read for FailingReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.data.is_empty() {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+            let n = buf.len().min(self.data.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn read_error_pads_member_to_declared_size() {
+        let mut file = FailingReader {
+            data: &[b'x'; 1000],
+        };
+        let mut sink = DataSink::default();
+        copy_file_data(&mut file, &mut sink, 4000, Path::new("f")).unwrap();
+        assert_eq!(sink.data.len(), 4000);
+        assert!(sink.data[..1000].iter().all(|&b| b == b'x'));
+        assert!(sink.data[1000..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn grown_file_is_cut_to_declared_size() {
+        let mut file: &[u8] = &[b'y'; 5000];
+        let mut sink = DataSink::default();
+        copy_file_data(&mut file, &mut sink, 3000, Path::new("f")).unwrap();
+        assert_eq!(sink.data, vec![b'y'; 3000]);
+    }
+
+    #[test]
+    fn archive_errors_are_archive_write_errors() {
+        // Any I/O error from the archive is fatal, whatever its kind; an error
+        // reading a source file (the test above) is not -- the errno does not
+        // decide, the origin does.
+        let mut inner = DataSink {
+            fail: Some(std::io::ErrorKind::Other),
+            ..Default::default()
+        };
+        let mut sink = ArchiveSink(&mut inner);
+        let mut file: &[u8] = b"abc";
+        let err = copy_file_data(&mut file, &mut sink, 3, Path::new("f")).unwrap_err();
+        assert!(matches!(err, PaxError::ArchiveWrite(_)));
+        assert!(crate::modes::is_fatal(&err));
     }
 }

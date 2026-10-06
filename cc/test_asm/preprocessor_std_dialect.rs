@@ -11,17 +11,30 @@
 
 use crate::test_compile::compile_expect_ok;
 
-/// The `-std=` spellings that name C17 itself. Exhaustive.
+/// The `-std=` spellings c17 takes in silence: C17 itself, and C99 and C11,
+/// whose programs C17 compiles as written. Exhaustive.
 const C17_SPELLINGS: &[&str] = &[
+    "c9x",
+    "c99",
+    "c1x",
+    "c11",
     "c17",
     "c18",
+    "gnu9x",
+    "gnu99",
+    "gnu1x",
+    "gnu11",
     "gnu17",
     "gnu18",
+    "iso9899:199x",
+    "iso9899:1999",
+    "iso9899:2011",
     "iso9899:2017",
     "iso9899:2018",
 ];
 
-/// The `-std=` spellings naming an older revision. Exhaustive.
+/// The `-std=` spellings naming C90, whose implicit `int` and implicit
+/// declarations C17 refuses: accepted, with a warning. Exhaustive.
 ///
 /// Together with `C17_SPELLINGS` this is every spelling `classify_std`
 /// accepts, so "every accepted spelling behaves identically" is a claim these
@@ -29,21 +42,10 @@ const C17_SPELLINGS: &[&str] = &[
 const OLDER_SPELLINGS: &[&str] = &[
     "c89",
     "c90",
-    "c9x",
-    "c99",
-    "c1x",
-    "c11",
     "gnu89",
     "gnu90",
-    "gnu9x",
-    "gnu99",
-    "gnu1x",
-    "gnu11",
     "iso9899:1990",
     "iso9899:199409",
-    "iso9899:199x",
-    "iso9899:1999",
-    "iso9899:2011",
 ];
 
 /// Every `-std=` spelling c17 accepts.

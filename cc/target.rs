@@ -27,12 +27,16 @@ pub const STDC_VERSION: &str = "201710L";
 /// mode, and `-std=` exists only because build systems pass it unconditionally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StdRequest {
-    /// A C17 spelling (`c17`, `c18`, `gnu17`, `gnu18`, `iso9899:2017/2018`) —
-    /// what we compile anyway, so it passes without comment.
-    C17,
-    /// An older revision (`c89`, `c99`, `c11`, the `gnu*` and `iso9899:`
-    /// equivalents). Accepted and compiled as C17; the driver says so.
-    Older,
+    /// C17, or C99 or C11 (`c99`, `c11`, `c17`, their `gnu*` and `iso9899:`
+    /// equivalents and draft names): a program in any of them is a C17
+    /// program, so it passes without comment.
+    Compiled,
+    /// C90 (`c89`, `c90`, `gnu89`, `gnu90`, `iso9899:1990`, `iso9899:199409`),
+    /// whose implicit `int` and implicit declarations C17 refuses. Accepted
+    /// and compiled as C17; the driver says so. A revision after C17 is not
+    /// accepted at all: c17 cannot compile it, and a configure probe for it
+    /// must be told no.
+    Ignored,
 }
 
 /// Classify the argument of `-std=`, e.g. `c17`, `gnu11`, `iso9899:1999`.
@@ -47,8 +51,8 @@ pub fn classify_std(spec: &str) -> Option<StdRequest> {
     // compiler defines, and far likelier a typo than a request.
     if let Some(year) = spec.strip_prefix("iso9899:") {
         return match year {
-            "2017" | "2018" => Some(StdRequest::C17),
-            "1990" | "199409" | "199x" | "1999" | "2011" => Some(StdRequest::Older),
+            "199x" | "1999" | "2011" | "2017" | "2018" => Some(StdRequest::Compiled),
+            "1990" | "199409" => Some(StdRequest::Ignored),
             _ => None,
         };
     }
@@ -57,8 +61,8 @@ pub fn classify_std(spec: &str) -> Option<StdRequest> {
         .strip_prefix("gnu")
         .or_else(|| spec.strip_prefix('c'))?;
     match rev {
-        "17" | "18" => Some(StdRequest::C17),
-        "89" | "90" | "9x" | "99" | "1x" | "11" => Some(StdRequest::Older),
+        "9x" | "99" | "1x" | "11" | "17" | "18" => Some(StdRequest::Compiled),
+        "89" | "90" => Some(StdRequest::Ignored),
         _ => None,
     }
 }
@@ -1438,36 +1442,48 @@ mod tests {
     #[test]
     fn test_classify_std_spellings() {
         for spec in [
+            "c9x",
+            "c99",
+            "c1x",
+            "c11",
             "c17",
             "c18",
+            "gnu9x",
+            "gnu99",
+            "gnu1x",
+            "gnu11",
             "gnu17",
             "gnu18",
+            "iso9899:199x",
+            "iso9899:1999",
+            "iso9899:2011",
             "iso9899:2017",
             "iso9899:2018",
         ] {
-            assert_eq!(classify_std(spec), Some(StdRequest::C17), "{spec}");
+            assert_eq!(classify_std(spec), Some(StdRequest::Compiled), "{spec}");
         }
 
         for spec in [
             "c89",
             "c90",
-            "c9x",
-            "c99",
-            "c1x",
-            "c11",
             "gnu89",
             "gnu90",
-            "gnu9x",
-            "gnu99",
-            "gnu1x",
-            "gnu11",
             "iso9899:1990",
             "iso9899:199409",
-            "iso9899:199x",
-            "iso9899:1999",
-            "iso9899:2011",
         ] {
-            assert_eq!(classify_std(spec), Some(StdRequest::Older), "{spec}");
+            assert_eq!(classify_std(spec), Some(StdRequest::Ignored), "{spec}");
+        }
+
+        for spec in [
+            "c2x",
+            "c23",
+            "c2y",
+            "gnu2x",
+            "gnu23",
+            "gnu2y",
+            "iso9899:2024",
+        ] {
+            assert_eq!(classify_std(spec), None, "{spec}");
         }
     }
 

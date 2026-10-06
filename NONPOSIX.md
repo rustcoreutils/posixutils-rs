@@ -146,8 +146,10 @@ Language and preprocessor additions:
  * On Linux, `_GNU_SOURCE`, `_XOPEN_SOURCE=800` and `_XOPEN_SOURCE_EXTENDED`
    are predefined unconditionally.
 
-Deviation: `-std=` is accepted and discarded — `__STDC_VERSION__` is always
-`201112L`, not the `201710L` the utility's name implies.
+Deviation: `-std=` selects nothing — the language is C17 and
+`__STDC_VERSION__` is `201710L` whatever it names.  A C99, C11 or C17
+spelling is taken in silence; C90 (`-ansi` included) draws a warning that
+`-Wno-c17-dialect` silences; a revision after C17 is an error.
 
 ### cflow
 

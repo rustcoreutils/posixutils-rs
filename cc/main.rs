@@ -2851,11 +2851,13 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
             );
             std::process::exit(1);
         }
-        // Say plainly that an older revision was not honoured. c17 compiles
-        // C17 and only C17, so the flag is accepted -- build systems pass it
-        // unconditionally -- but silently ignoring it is what let
-        // __STDC_VERSION__ disagree with the binary's own name once already.
-        Ok(Some(StdRequest::Older)) if diag::warning_group_enabled(STD_DIALECT_WARNING) => {
+        // Say plainly that C90 was not honoured.
+        // c17 compiles C17 and only C17, so the flag is accepted -- build
+        // systems pass it unconditionally -- but silently ignoring it is what
+        // let __STDC_VERSION__ disagree with the binary's own name once
+        // already. A C99 or C11 program is a C17 program, so asking for
+        // either is met.
+        Ok(Some(StdRequest::Ignored)) if diag::warning_group_enabled(STD_DIALECT_WARNING) => {
             let spec = args.c17_std.as_deref().unwrap_or_default();
             driver_warning(&gettext_args(
                 "'-std={0}' ignored; c17 compiles C17 (ISO/IEC 9899:2018) only",
@@ -3262,15 +3264,22 @@ mod tests {
         assert_eq!(parse(&["foo.c"]).std_request(), Ok(None));
         assert_eq!(
             parse(&["-std=c17", "foo.c"]).std_request(),
-            Ok(Some(StdRequest::C17))
+            Ok(Some(StdRequest::Compiled))
         );
-        // Recognized but older: accepted, and reported as not honoured.
+        // A C99 program is a C17 program.
         assert_eq!(
             parse(&["-std=c99", "foo.c"]).std_request(),
-            Ok(Some(StdRequest::Older))
+            Ok(Some(StdRequest::Compiled))
+        );
+        // Recognized but not C17's: accepted, and reported as not honoured.
+        assert_eq!(
+            parse(&["-std=c90", "foo.c"]).std_request(),
+            Ok(Some(StdRequest::Ignored))
         );
         // A typo is still an error, not a silently ignored value.
         assert_eq!(parse(&["-std=c42", "foo.c"]).std_request(), Err("c42"));
+        // So is a revision after C17, which c17 cannot compile.
+        assert_eq!(parse(&["-std=c23", "foo.c"]).std_request(), Err("c23"));
     }
 
     #[test]

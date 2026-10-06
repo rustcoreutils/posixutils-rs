@@ -305,11 +305,9 @@ fn diagnostics_variably_modified_jumps_point_at_the_jump() {
 /// #C90 closed the type-name form and left this one: `extern int a[]; sizeof a`
 /// compiled and answered **0**.
 ///
-/// Neither the type nor the completeness helpers can settle it, because
-/// `int[]`, `int[n]` and `int[m]` all intern to one `TypeId` -- the extent
-/// lives on the declarator. `Symbol::array_is_variably_modified` records
-/// whether one was given, so a VLA's `sizeof` keeps working while an
-/// incomplete array's is refused.
+/// The array type's extent settles it: `int[]` is `ArrayExtent::Unknown` and
+/// incomplete, while `int[n]` is `ArrayExtent::Variable` and complete, so a
+/// VLA's `sizeof` keeps working while an incomplete array's is refused.
 #[test]
 fn diagnostics_sizeof_of_an_incomplete_array_expression_is_rejected() {
     for (name, src) in [

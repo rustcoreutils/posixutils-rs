@@ -112,14 +112,11 @@ pub struct Symbol {
     /// headers, so ignoring it makes those headers fail to link.
     pub asm_label: Option<String>,
 
-    /// Whether this symbol's array type was declared with size *expressions*
-    /// -- that is, whether it is variably modified rather than incomplete.
-    ///
-    /// The type cannot answer it: `int[]`, `int[n]` and `int[m]` all intern to
-    /// one `TypeId`, the key holding an `array_size` that is `None` for all
-    /// three. The distinction lives on the declarator, and `sizeof a` needs it
-    /// -- gcc measures a VLA at run time and rejects an incomplete array
-    /// (6.5.3.4p1), and without this both answered 0.
+    /// Whether this symbol's declaration was given size *expressions*, whose
+    /// values it recorded -- so that an expression rooted in the symbol has
+    /// somewhere to read its variable extents from. The type says which
+    /// levels are variable ([`crate::types::ArrayExtent::Variable`]); it
+    /// cannot hold their values, since `int[n]` and `int[m]` are one type.
     pub array_is_variably_modified: bool,
 
     /// Whether *any* file-scope declaration of this name carried `extern`.
@@ -488,7 +485,7 @@ impl SymbolTable {
     /// Look up a typedef by name, returning its symbol as well as its type.
     ///
     /// A variably modified typedef's array extents cannot live in the
-    /// `TypeId` -- `int[n]`, `int[m]` and `int[]` all intern to one type --
+    /// `TypeId` -- `int[n]` and `int[m]` intern to one type --
     /// so they hang off the *symbol*, and resolving one needs its identity
     /// rather than only its type. See C17 6.7.7p3.
     pub fn lookup_typedef_symbol(&self, name: StringId) -> Option<(SymbolId, TypeId)> {

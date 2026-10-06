@@ -876,8 +876,8 @@ static int t_const_fold_float_unsigned(void) {
 // `SizeofType` grew a runtime guard; `SizeofExpr` did not, so `sizeof a` for
 // `int a[n]` folded to 0 -- `size_bits` reports 0 for an array with no extent
 // -- and `case sizeof a:` was accepted with the wrong value, matching
-// `switch (0)`. A `TypeId` for `int[n]` is indistinguishable from `int[]`, so
-// the question has to be asked of the array levels.
+// `switch (0)`. The question is asked of the array levels: any variable
+// one makes the size a run-time value.
 // ==========================================================================
 static int t_sizeof_fixed_array_case(void)
 {

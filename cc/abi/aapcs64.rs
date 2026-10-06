@@ -369,7 +369,7 @@ impl Aapcs64Abi {
         // For arrays, the element contributes however many members it has.
         if kind == TypeKind::Array {
             let elem_ty = typ.base?;
-            let len = typ.array_size?;
+            let len = typ.extent.known()?;
             let elem_kind = types.kind(elem_ty);
             // A scalar element is one member; an aggregate element is as
             // many as it flattens to. AAPCS64 5.9.5 counts a composite's

@@ -1395,7 +1395,8 @@ int main(void) {
 
 /// One program, one section per original test; each section carries the
 /// original doc comment and its exit-code range in its header. Consolidates:
-/// `labels_innermost_switch`, `fam_top_level_init`, `fam_elided_values`.
+/// `labels_innermost_switch`, `fam_top_level_init`, `fam_elided_values`,
+/// `array_extents`.
 #[test]
 fn c99_features_everywhere_mega() {
     let code = r#"
@@ -1543,11 +1544,45 @@ static int t_fam_elided_values(void) {
     return 0;
 }
 
+// ==========================================================================
+// array_extents  (exit codes 41-50: 40 + its own code)
+//
+// A variable length array and an array of unknown size are different
+// types: `int[n]` is complete and measured at run time, `int[]` is
+// incomplete until a declaration or an initializer sizes it. They once
+// interned to one type, so these must still measure what they did.
+// ==========================================================================
+extern int ae_a[];
+int ae_a[5];
+static int ae_rows(int n, int (*q)[n]) { return (int)(sizeof *q / sizeof (*q)[0]); }
+static int t_array_extents(int n) {
+    int (*p)[n] = 0;
+    __typeof__(*p) row;
+    typedef int T[n];
+    T t;
+    int grid[n][3];
+    int (*g)[3] = grid;
+    int (*v)[n] = (int (*)[n])grid;
+    int init[] = { 1, 2, 3 };
+    if (sizeof *p != n * sizeof(int)) return 1;
+    if (sizeof row != n * sizeof(int)) return 2;
+    if (sizeof t != n * sizeof(int)) return 3;
+    if (sizeof(__typeof__(*p)) != n * sizeof(int)) return 4;
+    if (sizeof grid != n * 3 * sizeof(int) || sizeof grid[0] != 3 * sizeof(int)) return 5;
+    if ((char *)(g + 1) - (char *)g != 3 * sizeof(int)) return 6;
+    if ((char *)(v + 1) - (char *)v != n * sizeof(int)) return 7;
+    if (sizeof ae_a != 5 * sizeof(int) || sizeof init != 3 * sizeof(int)) return 8;
+    if (ae_rows(n, v) != n) return 9;
+    if (sizeof(int[n][n]) != n * n * sizeof(int)) return 10;
+    return 0;
+}
+
 int main(void) {
     int r;
     if ((r = t_labels_innermost_switch()) != 0) return 0 + r;
     if ((r = t_fam_top_level_init()) != 0) return 35 + r;
     if ((r = t_fam_elided_values()) != 0) return 37 + r;
+    if ((r = t_array_extents(7)) != 0) return 40 + r;
     return 0;
 }
 "#;

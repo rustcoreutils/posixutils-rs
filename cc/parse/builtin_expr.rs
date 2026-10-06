@@ -439,7 +439,7 @@ impl Parser<'_> {
                 let type_pos = self.current_pos();
                 let (arg_type, dims) = self.parse_type_name_vm()?;
                 self.expect_special(b')')?;
-                if !self.check_va_arg_type(arg_type, dims.len(), type_pos) {
+                if !self.check_va_arg_type(arg_type, type_pos) {
                     return Ok(self.diagnosed_call(self.types.int_id, token_pos));
                 }
                 let value = Self::typed_expr(
@@ -538,7 +538,7 @@ impl Parser<'_> {
     /// type is an error; one the default argument promotions change can
     /// never match what a caller passed, a warning. `false` once the error is
     /// reported. Types are named unqualified, as gcc names them.
-    fn check_va_arg_type(&mut self, typ: TypeId, extents: usize, pos: Position) -> bool {
+    fn check_va_arg_type(&mut self, typ: TypeId, pos: Position) -> bool {
         let typ = self.types.unqualified(typ);
         let named = self.types.format_type(typ, Some(self.idents));
         if self.types.kind(typ) == TypeKind::Function {
@@ -549,7 +549,7 @@ impl Parser<'_> {
             );
             return false;
         }
-        if self.type_name_is_incomplete(typ, extents) {
+        if self.type_name_is_incomplete(typ) {
             diag::error_args(
                 pos,
                 "second argument to 'va_arg' is of incomplete type '{0}'",

@@ -523,6 +523,35 @@ impl FloatClass {
 
 // Type Representation
 
+/// How many elements an array type has (C17 6.7.6.2p4): a number the
+/// declaration fixed, a number fixed only at run time, or none at all.
+///
+/// The last two were once a single `None`, so `int[n]` and `int[]` interned
+/// to one type and nothing that held only a `TypeId` could say whether
+/// `sizeof` of it was a run-time value or a constraint violation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArrayExtent {
+    /// `int[3]`: an array of known constant size, complete.
+    Known(usize),
+    /// `int[n]` or a prototype's `int[*]`: a variable length array. Complete,
+    /// but its size is an expression the declaration evaluates, so the type
+    /// does not hold it; the declaration's extents are recorded elsewhere.
+    Variable,
+    /// `int[]`: an array of unknown size, incomplete until a later
+    /// declaration or an initializer gives it one.
+    Unknown,
+}
+
+impl ArrayExtent {
+    /// The element count, when the type itself knows it.
+    pub fn known(self) -> Option<usize> {
+        match self {
+            ArrayExtent::Known(n) => Some(n),
+            ArrayExtent::Variable | ArrayExtent::Unknown => None,
+        }
+    }
+}
+
 /// A C type (compositional structure)
 ///
 /// Types are built compositionally using TypeId references:
@@ -542,8 +571,9 @@ pub struct Type {
     /// Base type for pointers, arrays, and function return types (interned TypeId)
     pub base: Option<TypeId>,
 
-    /// Array size (for arrays)
-    pub array_size: Option<usize>,
+    /// The number of elements, for an array; [`ArrayExtent::Unknown`] for
+    /// every other kind, which has none.
+    pub extent: ArrayExtent,
 
     /// Function parameter types (interned TypeIds)
     pub params: Option<Vec<TypeId>>,
@@ -578,7 +608,7 @@ impl Default for Type {
             kind: TypeKind::Int,
             modifiers: TypeModifiers::empty(),
             base: None,
-            array_size: None,
+            extent: ArrayExtent::Unknown,
             params: None,
             variadic: false,
             noreturn: false,
@@ -615,12 +645,18 @@ impl Type {
         }
     }
 
-    /// Create an array type (element type is a TypeId)
+    /// Create an array of a known number of elements (element type is a
+    /// TypeId)
     pub fn array(base: TypeId, size: usize) -> Self {
+        Self::array_of(base, ArrayExtent::Known(size))
+    }
+
+    /// Create an array type of any extent
+    pub fn array_of(base: TypeId, extent: ArrayExtent) -> Self {
         Self {
             kind: TypeKind::Array,
             base: Some(base),
-            array_size: Some(size),
+            extent,
             ..Default::default()
         }
     }
@@ -820,9 +856,10 @@ impl Type {
         // passing an ordinary `int m[2][2]` gave "passing argument 3 as
         // 'int[]*' from 'int[2]*' incompatible pointer type" where gcc is
         // silent even under -Wall.
-        match (self.array_size, other.array_size) {
-            (Some(a), Some(b)) if a != b => return false,
-            _ => {}
+        if let (ArrayExtent::Known(a), ArrayExtent::Known(b)) = (self.extent, other.extent) {
+            if a != b {
+                return false;
+            }
         }
 
         // Compare variadic flag. A function type without a prototype says
@@ -924,10 +961,10 @@ impl fmt::Display for Type {
             }
             TypeKind::Array => {
                 if let Some(base) = self.base {
-                    if let Some(size) = self.array_size {
-                        write!(f, "T{}[{}]", base.0, size)
-                    } else {
-                        write!(f, "T{}[]", base.0)
+                    match self.extent {
+                        ArrayExtent::Known(size) => write!(f, "T{}[{}]", base.0, size),
+                        ArrayExtent::Variable => write!(f, "T{}[*]", base.0),
+                        ArrayExtent::Unknown => write!(f, "T{}[]", base.0),
                     }
                 } else {
                     write!(f, "[]")
@@ -970,7 +1007,7 @@ enum TypeKey {
     /// Pointer to interned type
     Pointer(TypeId, u32), // base_id, modifiers
     /// Array of interned type
-    Array(TypeId, Option<usize>, u32), // base_id, size, modifiers
+    Array(TypeId, ArrayExtent, u32), // base_id, extent, modifiers
     /// Function type
     Function {
         ret: TypeId,
@@ -1474,7 +1511,7 @@ impl TypeTable {
             }
             TypeKind::Array => {
                 let base = typ.base?;
-                Some(TypeKey::Array(base, typ.array_size, typ.modifiers.bits()))
+                Some(TypeKey::Array(base, typ.extent, typ.modifiers.bits()))
             }
             TypeKind::Function => {
                 let ret = typ.base?;
@@ -1608,8 +1645,9 @@ impl TypeTable {
 
     // Type-shape accessors
 
-    pub fn array_size(&self, id: TypeId) -> Option<usize> {
-        self.get(id).array_size
+    /// The extent of an array type; [`ArrayExtent::Unknown`] for any other.
+    pub fn array_extent(&self, id: TypeId) -> ArrayExtent {
+        self.get(id).extent
     }
 
     /// Has this struct or union been defined, as opposed to merely declared?
@@ -1628,7 +1666,14 @@ impl TypeTable {
     /// Whether `member` is a flexible array member: an array with no bound,
     /// which C17 6.7.2.1p18 allows only as the last member of a structure.
     pub fn is_flexible_array_member(&self, member: &StructMember) -> bool {
-        member.bit_width.is_none() && self.unsized_array_levels(member.typ) > 0
+        member.bit_width.is_none() && self.is_incomplete_array(member.typ)
+    }
+
+    /// Whether `id` is an array of unknown size (C17 6.2.5p22) -- `int[]`,
+    /// not `int[n]`, which is complete.
+    pub fn is_incomplete_array(&self, id: TypeId) -> bool {
+        let typ = self.get(id);
+        typ.kind == TypeKind::Array && typ.extent == ArrayExtent::Unknown
     }
 
     /// Whether an object of type `id` ends in storage with no bound: it is an
@@ -1636,7 +1681,7 @@ impl TypeTable {
     /// last.
     pub fn has_unbounded_tail(&self, id: TypeId) -> bool {
         match self.kind(id) {
-            TypeKind::Array => self.get(id).array_size.is_none(),
+            TypeKind::Array => self.get(id).extent == ArrayExtent::Unknown,
             TypeKind::Struct => self
                 .get(id)
                 .composite
@@ -1647,24 +1692,21 @@ impl TypeTable {
         }
     }
 
-    /// How many array levels of `id`, outermost-first, have no extent.
-    ///
-    /// The type table cannot tell a variably-modified array from an incomplete
-    /// one: `int[n]`, `int[m]` and `int[]` all intern to the same `TypeId`,
-    /// because the key holds `array_size`, which is `None` for all three. So
-    /// this counts the levels that *need* a size expression supplied from
-    /// outside, which is exactly what `record_vm_extents` consumes one
-    /// expression for -- and therefore also the count that says whether a
-    /// given list of expressions describes the whole type or only part of it.
+    /// How many array levels of `id`, outermost-first, are variable length:
+    /// the levels whose extent a declaration's size expression supplies, so
+    /// exactly what `record_vm_extents` consumes one expression for -- and
+    /// therefore also the count that says whether a given list of
+    /// expressions describes the whole type or only part of it. An unknown
+    /// `[]` level is not one: it has no expression.
     ///
     /// Stops at the first non-array level, so a pointer to a variably-modified
     /// array counts zero: its size is the pointer's.
-    pub fn unsized_array_levels(&self, id: TypeId) -> usize {
+    pub fn variable_array_levels(&self, id: TypeId) -> usize {
         let mut levels = 0;
         let mut cur = id;
         while self.kind(cur) == TypeKind::Array {
             let typ = self.get(cur);
-            if typ.array_size.is_none() {
+            if typ.extent == ArrayExtent::Variable {
                 levels += 1;
             }
             match typ.base {
@@ -1822,7 +1864,7 @@ impl TypeTable {
                 let elem = typ.base.map(|b| self.format_type(b, idents));
                 name.push_str(&format!(
                     "__vector({}) {}",
-                    typ.array_size.unwrap_or(0),
+                    typ.extent.known().unwrap_or(0),
                     elem.unwrap_or_default()
                 ));
                 if !decl.is_empty() {
@@ -1841,9 +1883,12 @@ impl TypeTable {
                         break Some(cur);
                     }
                     // Outermost extent first, as the declaration writes it.
-                    match t.array_size {
-                        Some(size) => extents.push_str(&format!("[{}]", size)),
-                        None => extents.push_str("[]"),
+                    // gcc names a variable extent by its expression, which
+                    // the type does not hold; `[]` is what it would print
+                    // for none.
+                    match t.extent {
+                        ArrayExtent::Known(size) => extents.push_str(&format!("[{}]", size)),
+                        ArrayExtent::Variable | ArrayExtent::Unknown => extents.push_str("[]"),
                     }
                     match t.base {
                         Some(base) => cur = base,
@@ -2046,7 +2091,7 @@ impl TypeTable {
         let vector = self.intern(Type {
             kind: TypeKind::Array,
             base: Some(elem),
-            array_size: Some(count),
+            extent: ArrayExtent::Known(count),
             modifiers: TypeModifiers::VECTOR,
             explicit_align: Some(align),
             ..Default::default()
@@ -2230,7 +2275,7 @@ impl TypeTable {
             return None;
         }
         let typ = self.get(id);
-        Some((typ.base?, typ.array_size?))
+        Some((typ.base?, typ.extent.known()?))
     }
 
     /// The type of a comparison of two vectors of type `id`: as many lanes,
@@ -3155,7 +3200,8 @@ impl TypeTable {
             // keeps a too-wide type from looking small.
             TypeKind::Array => {
                 let elem_size = typ.base.map(|b| self.size_bits(b)).unwrap_or(0) as u64;
-                let count = typ.array_size.unwrap_or(0) as u64;
+                // A variable or unknown extent has no size the type knows.
+                let count = typ.extent.known().unwrap_or(0) as u64;
                 elem_size.saturating_mul(count).min(u32::MAX as u64) as u32
             }
             TypeKind::Struct | TypeKind::Union => {
@@ -3261,7 +3307,7 @@ impl TypeTable {
             TypeKind::Function => 1,
             TypeKind::Array => {
                 let elem = typ.base.map(|b| self.size_bytes(b)).unwrap_or(0);
-                let count = typ.array_size.unwrap_or(0);
+                let count = typ.extent.known().unwrap_or(0);
                 elem.saturating_mul(count)
             }
             _ => (self.size_bits(id) / 8) as usize,
@@ -3723,10 +3769,19 @@ impl TypeTable {
             composite.base = Some(self.composite_type(x, y));
         }
         match composite.kind {
-            // "Unknown" is spelled both as no size and as zero; see
+            // A known size wins, then a variable one (6.2.7p3). "Unknown" is
+            // spelled both as no size and as zero; see
             // `redeclaration_compatible`.
-            TypeKind::Array if matches!(composite.array_size, None | Some(0)) => {
-                composite.array_size = other.array_size.or(composite.array_size);
+            TypeKind::Array => {
+                composite.extent = match (composite.extent, other.extent) {
+                    (ArrayExtent::Known(0), other @ ArrayExtent::Known(_)) => other,
+                    (known @ ArrayExtent::Known(_), _) => known,
+                    (_, known @ ArrayExtent::Known(_)) => known,
+                    (ArrayExtent::Variable, _) | (_, ArrayExtent::Variable) => {
+                        ArrayExtent::Variable
+                    }
+                    (ArrayExtent::Unknown, ArrayExtent::Unknown) => ArrayExtent::Unknown,
+                };
             }
             TypeKind::Function => match (&composite.params, &other.params) {
                 (None, Some(_)) => {
@@ -4661,7 +4716,7 @@ mod tests {
         let mut types = TypeTable::new(&Target::host());
         let int_arr_id = types.intern(Type::array(types.int_id, 10));
         assert_eq!(types.kind(int_arr_id), TypeKind::Array);
-        assert_eq!(types.array_size(int_arr_id), Some(10));
+        assert_eq!(types.array_extent(int_arr_id), ArrayExtent::Known(10));
 
         let base_id = types.base_type(int_arr_id).unwrap();
         assert_eq!(types.kind(base_id), TypeKind::Int);
@@ -4863,48 +4918,108 @@ mod tests {
         }
     }
 
-    /// `unsized_array_levels` counts the array levels that need a size
+    /// `variable_array_levels` counts the array levels that need a size
     /// expression supplied from outside. It is what says whether a list of
-    /// such expressions describes the whole type or only part of it, so
-    /// `int[][n]` (two unsized levels, one expression) can be told from
-    /// `int[n]` (one and one).
+    /// such expressions describes the whole type or only part of it, and an
+    /// unknown `[]` level is not among them.
     #[test]
-    fn test_unsized_array_levels() {
-        let mut types = TypeTable::new(&Target::host());
+    fn test_variable_array_levels() {
+        let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+        let mut types = TypeTable::new(&target);
         let int_id = types.int_id;
 
         // Not an array at all.
-        assert_eq!(types.unsized_array_levels(int_id), 0);
+        assert_eq!(types.variable_array_levels(int_id), 0);
 
         // Fully sized arrays need nothing.
         let a4 = types.intern(Type::array(int_id, 4));
-        assert_eq!(types.unsized_array_levels(a4), 0);
+        assert_eq!(types.variable_array_levels(a4), 0);
         let a3x4 = types.intern(Type::array(a4, 3));
-        assert_eq!(types.unsized_array_levels(a3x4), 0);
+        assert_eq!(types.variable_array_levels(a3x4), 0);
 
-        // An absent extent counts once, at whichever level it sits. This is
-        // how a variably-modified dimension is represented: the size lives in
-        // a side-channel expression, not in the type.
-        fn unsized_array(types: &mut TypeTable, base: TypeId) -> TypeId {
-            let mut t = Type::array(base, 0);
-            t.array_size = None;
-            types.intern(t)
-        }
-        let an = unsized_array(&mut types, int_id);
-        assert_eq!(types.unsized_array_levels(an), 1);
+        // A variable extent counts once, at whichever level it sits.
+        let an = types.intern(Type::array_of(int_id, ArrayExtent::Variable));
+        assert_eq!(types.variable_array_levels(an), 1);
 
         // `int[3][n]`: outer sized, inner not.
         let a3xn = types.intern(Type::array(an, 3));
-        assert_eq!(types.unsized_array_levels(a3xn), 1);
+        assert_eq!(types.variable_array_levels(a3xn), 1);
 
-        // `int[n][m]`: both absent.
-        let anxm = unsized_array(&mut types, an);
-        assert_eq!(types.unsized_array_levels(anxm), 2);
+        // `int[n][m]`: both variable.
+        let anxm = types.intern(Type::array_of(an, ArrayExtent::Variable));
+        assert_eq!(types.variable_array_levels(anxm), 2);
+
+        // `int[][n]`: the unknown level has no expression.
+        let unknown_xn = types.intern(Type::array_of(an, ArrayExtent::Unknown));
+        assert_eq!(types.variable_array_levels(unknown_xn), 1);
+        let unknown = types.intern(Type::array_of(int_id, ArrayExtent::Unknown));
+        assert_eq!(types.variable_array_levels(unknown), 0);
 
         // A pointer to a variably-modified array stops at the pointer: its
         // size is the pointer's, and nothing about its extent is needed.
         let ptr = types.intern(Type::pointer(an));
-        assert_eq!(types.unsized_array_levels(ptr), 0);
+        assert_eq!(types.variable_array_levels(ptr), 0);
+    }
+
+    /// `int[]` and `int[n]` are two types: the first is incomplete, the
+    /// second a complete variable length array. They intern apart, and
+    /// neither is the same as `int[3]`, though all three are compatible.
+    #[test]
+    fn array_extents_are_distinct_types() {
+        let target = Target::new(crate::target::Arch::Aarch64, crate::target::Os::Linux);
+        let mut types = TypeTable::new(&target);
+        let int_id = types.int_id;
+        let unknown = types.intern(Type::array_of(int_id, ArrayExtent::Unknown));
+        let variable = types.intern(Type::array_of(int_id, ArrayExtent::Variable));
+        let three = types.intern(Type::array(int_id, 3));
+        let four = types.intern(Type::array(int_id, 4));
+
+        assert_ne!(unknown, variable);
+        assert_eq!(types.array_extent(unknown), ArrayExtent::Unknown);
+        assert_eq!(types.array_extent(variable), ArrayExtent::Variable);
+        assert_eq!(types.array_extent(three), ArrayExtent::Known(3));
+        assert_eq!(types.array_extent(int_id), ArrayExtent::Unknown);
+        assert_eq!(ArrayExtent::Known(3).known(), Some(3));
+        assert_eq!(ArrayExtent::Variable.known(), None);
+        assert_eq!(ArrayExtent::Unknown.known(), None);
+
+        // Interning the same extent twice gives the same type.
+        assert_eq!(
+            types.intern(Type::array_of(int_id, ArrayExtent::Variable)),
+            variable
+        );
+
+        // Only the unknown extent is incomplete; a flexible array member is
+        // one, a variable length array is not.
+        assert!(types.is_incomplete_array(unknown));
+        assert!(!types.is_incomplete_array(variable));
+        assert!(!types.is_incomplete_array(three));
+        assert!(!types.is_incomplete_array(int_id));
+        assert!(types.has_unbounded_tail(unknown));
+        assert!(!types.has_unbounded_tail(variable));
+
+        // C17 6.7.6.2p6: only two constant sizes can disagree.
+        assert!(types.types_compatible(unknown, variable));
+        assert!(types.types_compatible(unknown, three));
+        assert!(types.types_compatible(variable, three));
+        assert!(!types.types_compatible(three, four));
+
+        // C17 6.2.7p3: the composite takes a known size, else a variable one.
+        assert_eq!(types.composite_type(unknown, three), three);
+        assert_eq!(types.composite_type(variable, three), three);
+        assert_eq!(types.composite_type(three, variable), three);
+        assert_eq!(types.composite_type(unknown, variable), variable);
+        assert_eq!(types.composite_type(variable, unknown), variable);
+
+        // Neither has a size the type knows.
+        assert_eq!(types.size_bytes(unknown), 0);
+        assert_eq!(types.size_bytes(variable), 0);
+        assert_eq!(types.size_bytes(three), 12);
+
+        // A variable extent is spelled as gcc spells a missing one, since the
+        // type does not hold the expression.
+        assert_eq!(types.format_type(variable, None), "int[]");
+        assert_eq!(types.format_type(unknown, None), "int[]");
     }
 
     /// A zero-width bit-field forces the next member to a boundary on every
@@ -5400,7 +5515,7 @@ mod tests {
         assert_eq!(types.kind(ptr_to_arr_id), TypeKind::Pointer);
         let base_id = types.base_type(ptr_to_arr_id).unwrap();
         assert_eq!(types.kind(base_id), TypeKind::Array);
-        assert_eq!(types.array_size(base_id), Some(10));
+        assert_eq!(types.array_extent(base_id), ArrayExtent::Known(10));
     }
 
     #[test]
@@ -5917,10 +6032,7 @@ mod tests {
     #[test]
     fn composite_type_of_compatible_types() {
         let mut t = TypeTable::new(&Target::host());
-        let unknown = t.intern(Type {
-            array_size: None,
-            ..Type::array(t.int_id, 0)
-        });
+        let unknown = t.intern(Type::array_of(t.int_id, ArrayExtent::Unknown));
         let three = t.intern(Type::array(t.int_id, 3));
         assert_eq!(t.composite_type(unknown, three), three);
         assert_eq!(t.composite_type(three, unknown), three);

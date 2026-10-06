@@ -494,15 +494,14 @@ impl Parser<'_> {
             // An initialized `extern` declaration is a definition (6.9.2p1),
             // so its object needs a size like any other.
             if !is_fn && (!specs.is_extern() || init.is_some()) {
-                self.check_object_complete(scope, name, typ, &vla, pos);
+                self.check_object_complete(scope, name, typ, pos);
             }
             // A tentative definition of an array without its extent, which a
             // later declaration in the unit may still supply (6.9.2p2).
             if scope == DeclScope::File
                 && init.is_none()
                 && !specs.is_extern()
-                && self.types.kind(typ) == TypeKind::Array
-                && self.types.unsized_array_levels(typ) > 0
+                && self.types.is_incomplete_array(typ)
             {
                 if let Some(id) = symbol {
                     self.tentative_arrays.push((id, pos));
@@ -999,7 +998,6 @@ impl Parser<'_> {
         scope: DeclScope,
         name: StringId,
         typ: TypeId,
-        vla: &[Expr],
         pos: Position,
     ) {
         let is_array = self.types.kind(typ) == TypeKind::Array;
@@ -1010,7 +1008,7 @@ impl Parser<'_> {
                 }
             }
             DeclScope::Block { .. } if is_array => {
-                if self.types.get(typ).array_size.is_none() && vla.is_empty() {
+                if self.types.is_incomplete_array(typ) {
                     diag::error_args(pos, "array size missing in '{0}'", &[self.idents.get(name)]);
                 }
             }

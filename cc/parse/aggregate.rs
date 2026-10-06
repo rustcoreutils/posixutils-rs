@@ -913,7 +913,7 @@ impl Parser<'_> {
             TypeKind::Function => "field '{0}' declared as a function",
             // An array's element type was checked by its declarator.
             TypeKind::Array => return true,
-            _ if self.type_name_is_incomplete(typ, 0) => "field '{0}' has incomplete type",
+            _ if self.type_name_is_incomplete(typ) => "field '{0}' has incomplete type",
             _ => return true,
         };
         diag::error_args(self.current_pos(), message, &[&spelled]);

@@ -31,7 +31,7 @@ use crate::parse::ast::{
 use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
 use crate::target::Target;
-use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
+use crate::types::{ArrayExtent, MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::{HashMap, HashSet};
 
 const DEFAULT_LOCALS_CAPACITY: usize = 64;
@@ -3605,30 +3605,33 @@ impl<'a> Linearizer<'a> {
         let mut dims: Vec<VmDim> = Vec::new();
         let mut exprs = vm_exprs.iter();
         let mut elem_type = array_type;
-        // An unsized level with no expression is incomplete -- the `[]` of
-        // `int (*p)[][m]` -- and only the outermost may be (6.7.6.2p1), so
-        // the expressions belong to the innermost unsized levels. Handing
-        // them out from the outside gave `m` to the `[]` and left the row
-        // extent 0.
-        let mut incomplete = self
+        // Should a variable level outnumber the expressions, the ones given
+        // belong to the innermost levels, which are the ones a stride needs.
+        let mut unsupplied = self
             .types
-            .unsized_array_levels(array_type)
+            .variable_array_levels(array_type)
             .saturating_sub(vm_exprs.len());
 
         while self.types.kind(elem_type) == TypeKind::Array {
             let level = elem_type;
             elem_type = self.types.base_type(level).unwrap_or(self.types.int_id);
 
-            if let Some(n) = self.types.get(level).array_size {
-                dims.push(VmDim::Const(n));
-                continue;
-            }
-
-            let next = if incomplete == 0 { exprs.next() } else { None };
-            let Some(size_expr) = next else {
-                // Nothing to evaluate and nothing measurable; the entry
-                // keeps every later level at its own index.
-                incomplete = incomplete.saturating_sub(1);
+            let size_expr = match self.types.array_extent(level) {
+                ArrayExtent::Known(n) => {
+                    dims.push(VmDim::Const(n));
+                    continue;
+                }
+                // The `[]` of `int (*p)[][m]`: nothing to evaluate and
+                // nothing measurable; the entry keeps every later level at
+                // its own index.
+                ArrayExtent::Unknown => None,
+                ArrayExtent::Variable if unsupplied > 0 => {
+                    unsupplied -= 1;
+                    None
+                }
+                ArrayExtent::Variable => exprs.next(),
+            };
+            let Some(size_expr) = size_expr else {
                 dims.push(VmDim::Const(0));
                 continue;
             };
@@ -6855,25 +6858,25 @@ impl<'a> Linearizer<'a> {
     }
 
     /// One extent of an object expression's type, read from the hidden
-    /// locals its object's declaration stored: that of its `level`-th unsized
-    /// array level, which is how [`crate::parse::ast::vm_extent_count`]
-    /// counts them. An incomplete `[]` among them reads as 0.
+    /// locals its object's declaration stored: that of its `level`-th
+    /// variable array level, which is how
+    /// [`crate::parse::ast::vm_extent_count`] counts them.
     fn linearize_vm_object_extent(&mut self, object: &Expr, level: u32) -> PseudoId {
         let typ = self.expr_type(object);
         let array = match self.types.kind(typ) {
             TypeKind::Pointer => self.types.base_type(typ).unwrap_or(typ),
             _ => typ,
         };
-        let mut unsized_at = Vec::new();
+        let mut variable_at = Vec::new();
         let mut cur = array;
         while self.types.kind(cur) == TypeKind::Array {
-            unsized_at.push(self.types.get(cur).array_size.is_none());
+            variable_at.push(self.types.array_extent(cur) == ArrayExtent::Variable);
             cur = self.types.base_type(cur).unwrap_or(self.types.int_id);
         }
-        let position = unsized_at
+        let position = variable_at
             .iter()
             .enumerate()
-            .filter(|(_, is_unsized)| **is_unsized)
+            .filter(|(_, is_variable)| **is_variable)
             .nth(level as usize)
             .map(|(i, _)| i);
         let dim = position.and_then(|i| {

@@ -2103,7 +2103,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         // always has room.
         let capacity = self
             .types
-            .array_size(arr_typ)
+            .array_extent(arr_typ)
+            .known()
             .filter(|&n| n > 0)
             .unwrap_or(units.len() + 1);
 

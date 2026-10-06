@@ -884,7 +884,7 @@ pub enum ExprKind {
     /// is not variably modified, which is the ordinary case.
     ///
     /// They have to ride on the node because they cannot be recovered from the
-    /// `TypeId`: `int[n]`, `int[m]` and `int[]` all intern to one type. Use
+    /// `TypeId`: `int[n]` and `int[m]` intern to one type. Use
     /// [`sizeof_type_is_runtime`] rather than testing the `Vec` directly.
     SizeofType(TypeId, Vec<Expr>),
 
@@ -1585,23 +1585,24 @@ pub struct InitElement {
 ///   `sizeof(T)`;
 /// - a pointer to a variably-modified array. `sizeof(int(*)[n])` is the
 ///   pointer's size, and gcc does not evaluate `n` there either;
-/// - a type whose unsized levels outnumber the expressions supplied, as in
-///   `sizeof(int[][n])`, which is invalid C anyway -- gcc rejects it as an
-///   incomplete type.
+/// - an array of unknown size, as in `sizeof(int[][n])`, which is invalid C
+///   anyway -- gcc rejects it as an incomplete type.
 ///
 /// Five consumers need this same answer, so it is asked in one place: the
 /// linearizer, both constant folders, `is_pure_expr` and `expr_is_runtime`.
 pub fn sizeof_type_is_runtime(types: &TypeTable, typ: TypeId, dims: &[Expr]) -> bool {
     !dims.is_empty()
         && types.kind(typ) == TypeKind::Array
-        && types.unsized_array_levels(typ) == dims.len()
+        && !types.is_incomplete_array(typ)
+        && types.variable_array_levels(typ) == dims.len()
 }
 
 /// How many variable extents the type of `expr` has, counted as a
-/// declarator's size expressions count them: an array's unsized levels, or a
-/// pointer's pointee's. Zero unless `expr` is rooted in an object -- or a
+/// declarator's size expressions count them: an array's variable levels, or
+/// a pointer's pointee's. Zero unless `expr` is rooted in an object -- or a
 /// type-name's value ([`ExprKind::VmTypeName`]) -- declared variably
-/// modified, since the type cannot tell `int[n]` from the incomplete `int[]`.
+/// modified, since the extents' values are recorded with that declaration
+/// and an expression reached any other way has nowhere to read them from.
 ///
 /// `typeof(expr)` names this many extents, and `sizeof` evaluates an operand
 /// of array type that has any.
@@ -1613,7 +1614,7 @@ pub(crate) fn vm_extent_count(types: &TypeTable, symbols: &SymbolTable, expr: &E
         TypeKind::Pointer => types.base_type(typ),
         _ => Some(typ),
     };
-    let levels = array.map_or(0, |a| types.unsized_array_levels(a));
+    let levels = array.map_or(0, |a| types.variable_array_levels(a));
     let declared_vm = expr
         .vm_index_base()
         .is_some_and(|(root, _)| symbols.get(root).array_is_variably_modified);
@@ -1920,7 +1921,7 @@ impl<'a> ObjectWalk<'a> {
     fn positional(&self, typ: TypeId, cursor: usize) -> Option<Subobject> {
         match self.types.kind(typ) {
             TypeKind::Array => {
-                let size = self.types.get(typ).array_size;
+                let size = self.types.array_extent(typ).known();
                 if size.is_some_and(|n| cursor >= n) {
                     return None;
                 }

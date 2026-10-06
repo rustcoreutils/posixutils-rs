@@ -19,7 +19,7 @@ use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId, SymbolKind};
 use crate::token::lexer::Position;
-use crate::types::{FloatClass, Type, TypeId, TypeKind, TypeModifiers, TypeTable};
+use crate::types::{ArrayExtent, FloatClass, Type, TypeId, TypeKind, TypeModifiers, TypeTable};
 use gettextrs::gettext;
 
 /// C17 6.7.2p2: the type specifiers must together name one of a
@@ -283,7 +283,7 @@ pub(crate) struct DeclSpecifiers {
     /// The extents of the variably modified array levels the specifiers
     /// introduced -- through a variably modified typedef name, or through
     /// `typeof(int[n])` or `typeof(v)` -- outermost-first. They cannot ride on the type:
-    /// `int[n]`, `int[m]` and `int[]` all intern to one `TypeId`.
+    /// `int[n]` and `int[m]` intern to one `TypeId`.
     pub(crate) vm_dims: Vec<Expr>,
     /// Where `__auto_type` was written, if it was: the declarator takes the
     /// type of its initializer, and `ty` holds only the qualifiers and
@@ -607,7 +607,7 @@ impl Parser<'_> {
         if self.types.kind(typ) != TypeKind::Array {
             return;
         }
-        let Some(capacity) = self.types.array_size(typ).filter(|&n| n > 0) else {
+        let Some(capacity) = self.types.array_extent(typ).known().filter(|&n| n > 0) else {
             return;
         };
         for element in elements {
@@ -655,7 +655,7 @@ impl Parser<'_> {
         let message = match self.types.kind(typ) {
             // An absent or zero size is an array whose bound came from this
             // very initializer, so it cannot overflow.
-            TypeKind::Array if self.types.array_size(typ).is_some_and(|n| n > 0) => {
+            TypeKind::Array if self.types.array_extent(typ).known().is_some_and(|n| n > 0) => {
                 "excess elements in array initializer"
             }
             TypeKind::Struct
@@ -683,10 +683,12 @@ impl Parser<'_> {
             return typ;
         }
 
-        let array_size = self.types.get(typ).array_size;
-        // Check if array size is incomplete (0 or None)
-        if array_size != Some(0) && array_size.is_some() {
-            return typ;
+        // Only an array of unknown size takes its size from the initializer
+        // -- and a zero-length one, which some declarator paths once used to
+        // spell "unknown". A variable length array cannot be initialized.
+        match self.types.array_extent(typ) {
+            ArrayExtent::Unknown | ArrayExtent::Known(0) => {}
+            ArrayExtent::Known(_) | ArrayExtent::Variable => return typ,
         }
 
         // `{"hi"}` initializes the array with the string, not with one
@@ -707,7 +709,9 @@ impl Parser<'_> {
             // out from its own braces. Without this the declared array stayed
             // incomplete and `sizeof` on it failed, although the initializer
             // said exactly how long it was.
-            ExprKind::CompoundLiteral { typ: lit_typ, .. } => self.types.get(*lit_typ).array_size,
+            ExprKind::CompoundLiteral { typ: lit_typ, .. } => {
+                self.types.array_extent(*lit_typ).known()
+            }
             _ => self.string_initializer_len(init),
         };
 
@@ -743,10 +747,10 @@ impl Parser<'_> {
     pub(super) fn derive_array_type(
         &mut self,
         elem: TypeId,
-        size: Option<usize>,
+        extent: ArrayExtent,
         pos: Position,
     ) -> Result<TypeId, ParseError> {
-        if let Some(count) = size {
+        if let ArrayExtent::Known(count) = extent {
             let total = (count as u128) * (self.types.size_bytes(elem) as u128);
             let max = self.types.max_object_bytes();
             if total > max as u128 {
@@ -759,12 +763,7 @@ impl Parser<'_> {
                 ));
             }
         }
-        Ok(self.types.intern(Type {
-            kind: TypeKind::Array,
-            base: Some(elem),
-            array_size: size,
-            ..Default::default()
-        }))
+        Ok(self.types.intern(Type::array_of(elem, extent)))
     }
 
     /// Refuse an object the backend cannot give a stack slot.
@@ -1207,8 +1206,8 @@ impl<'a> Parser<'a> {
                     // try the type name first, keeping any variably modified
                     // extents it found: `typeof(int[n])` is a complete type
                     // whose size is `n * sizeof(int)`, and dropping them left
-                    // it indistinguishable from `int[]` -- in a declaration as
-                    // much as in `sizeof`.
+                    // it with no size -- in a declaration as much as in
+                    // `sizeof`.
                     let (typ, dims) = match self.try_parse_type_name_vm() {
                         Some(named) => named,
                         None => {
@@ -1794,8 +1793,13 @@ impl Parser<'_> {
         // `int a[0]` (the GNU zero-length array) is accepted against any size.
         // Under-diagnosing that is the safe direction.
         if o.kind == TypeKind::Array && n.kind == TypeKind::Array {
-            let size_unknown = |sz: Option<usize>| matches!(sz, None | Some(0));
-            if size_unknown(o.array_size) || size_unknown(n.array_size) {
+            let size_unknown = |extent| {
+                matches!(
+                    extent,
+                    ArrayExtent::Unknown | ArrayExtent::Variable | ArrayExtent::Known(0)
+                )
+            };
+            if size_unknown(o.extent) || size_unknown(n.extent) {
                 return match (o.base, n.base) {
                     (Some(a), Some(b)) => self.types.types_compatible(a, b),
                     _ => false,

@@ -511,7 +511,7 @@ fn test_designator_chain_continuation_checks_and_sizes() {
         ),
     ] {
         let (types, typ, _) = last_initializer(src);
-        assert_eq!(types.array_size(typ), Some(len), "{src}");
+        assert_eq!(types.array_extent(typ).known(), Some(len), "{src}");
     }
 }
 
@@ -629,7 +629,7 @@ fn test_function_redeclaration_composes_parameters() {
         let (types, f) = file_scope_type(src, "f");
         let params = types.get(f).params.clone().expect("a prototype");
         let pointee = types.base_type(params[0]).expect("a pointer");
-        types.get(pointee).array_size
+        types.get(pointee).extent.known()
     };
     assert_eq!(param("int f(int (*a)[]); int f(int (*a)[5]);"), Some(5));
     assert_eq!(param("int f(int (*a)[5]); int f(int (*a)[]);"), Some(5));
@@ -651,7 +651,7 @@ fn test_function_redeclaration_composes_parameters() {
     let callback_fn = types.base_type(callback).unwrap();
     let array_ptr = types.get(callback_fn).params.as_ref().unwrap()[0];
     let array = types.base_type(array_ptr).unwrap();
-    assert_eq!(types.get(array).array_size, Some(7));
+    assert_eq!(types.get(array).extent.known(), Some(7));
 
     // Prototyped and unprototyped, in either order: the prototype wins.
     for src in ["int f(); int f(int (*)[]);", "int f(int (*)[]); int f();"] {

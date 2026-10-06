@@ -1939,7 +1939,7 @@ fn test_pointer_decl() {
 fn test_array_decl() {
     let (decl, types, _strings, _symbols) = parse_decl("int arr[10];").unwrap();
     assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Array);
-    assert_eq!(types.get(decl.declarators[0].typ).array_size, Some(10));
+    assert_eq!(types.get(decl.declarators[0].typ).extent.known(), Some(10));
 }
 
 #[test]
@@ -4556,7 +4556,7 @@ fn test_incomplete_array_string_literal_size() {
         let typ = decl.declarators[0].typ;
         assert_eq!(types.kind(typ), TypeKind::Array);
         assert_eq!(
-            types.get(typ).array_size,
+            types.get(typ).extent.known(),
             Some(4),
             "Array size should be 4 (3 chars + null terminator)"
         );
@@ -4574,7 +4574,7 @@ fn test_incomplete_array_empty_string() {
         let typ = decl.declarators[0].typ;
         assert_eq!(types.kind(typ), TypeKind::Array);
         assert_eq!(
-            types.get(typ).array_size,
+            types.get(typ).extent.known(),
             Some(1),
             "Array size should be 1 (just null terminator)"
         );
@@ -4591,7 +4591,7 @@ fn test_incomplete_array_designator_size() {
         let typ = decl.declarators[0].typ;
         assert_eq!(types.kind(typ), TypeKind::Array);
         assert_eq!(
-            types.get(typ).array_size,
+            types.get(typ).extent.known(),
             Some(11),
             "Array size should be 11 for {{[10] = 1}}"
         );
@@ -4608,7 +4608,7 @@ fn test_incomplete_array_designator_sequence_size() {
         let typ = decl.declarators[0].typ;
         assert_eq!(types.kind(typ), TypeKind::Array);
         assert_eq!(
-            types.get(typ).array_size,
+            types.get(typ).extent.known(),
             Some(7),
             "Array size should be 7 for {{1,2,[5]=5,6}}"
         );
@@ -4736,7 +4736,7 @@ fn test_wide_string_literal_basic() {
     let elem_type = types.get(typ).base.unwrap();
     assert_eq!(elem_type, types.wchar_id);
     // Array size should be 6 (5 chars + null terminator)
-    assert_eq!(types.array_size(typ), Some(6));
+    assert_eq!(types.array_extent(typ).known(), Some(6));
 }
 
 #[test]
@@ -4761,7 +4761,7 @@ fn test_wide_string_array_size_inference() {
         let typ = decl.declarators[0].typ;
         assert_eq!(types.kind(typ), TypeKind::Array);
         assert_eq!(
-            types.get(typ).array_size,
+            types.get(typ).extent.known(),
             Some(4),
             "Wide string array size should be 4 (3 chars + null terminator)"
         );
@@ -8975,8 +8975,8 @@ fn test_later_declarators_align_and_complete() {
     };
     assert_eq!(types.get(find("B")).explicit_align, Some(16));
     assert_eq!(types.get(find("A")).explicit_align, None);
-    assert_eq!(types.get(find("p")).array_size, Some(4));
-    assert_eq!(types.get(find("q")).array_size, Some(5));
+    assert_eq!(types.get(find("p")).extent.known(), Some(4));
+    assert_eq!(types.get(find("q")).extent.known(), Some(5));
 }
 
 /// `ms_abi` belongs to the function *type*, as gcc has it: a definition, a
@@ -9984,9 +9984,9 @@ fn test_array_suffix_derivation_order() {
 
     let (decl, types, _, _) = parse_decl("int (a[2])[3];").unwrap();
     let typ = decl.declarators[0].typ;
-    assert_eq!(types.get(typ).array_size, Some(2));
+    assert_eq!(types.get(typ).extent.known(), Some(2));
     let elem = types.base_type(typ).unwrap();
-    assert_eq!(types.get(elem).array_size, Some(3));
+    assert_eq!(types.get(elem).extent.known(), Some(3));
     assert_eq!(types.kind(types.base_type(elem).unwrap()), TypeKind::Int);
 }
 

@@ -20,7 +20,7 @@
 //
 
 use super::{is_aggregate, is_float, is_integer, is_pointer, Abi, ArgClass, RegClass};
-use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::types::{ArrayExtent, TypeId, TypeKind, TypeTable};
 
 /// Maximum aggregate size (in bits) that can be passed in registers.
 /// Structs larger than 128 bits (16 bytes) must use sret.
@@ -175,7 +175,7 @@ fn sole_scalar_content(ty: TypeId, types: &TypeTable) -> Option<TypeId> {
         }
         TypeKind::Array => {
             let typ = types.get(ty);
-            if typ.array_size != Some(1) {
+            if typ.extent != ArrayExtent::Known(1) {
                 return None;
             }
             sole_scalar_content(typ.base?, types)?

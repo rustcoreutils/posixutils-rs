@@ -15,7 +15,7 @@
 // prototype and is parsed with `alloca` (`parse_memory_builtin`).
 //
 
-use super::ast::{vm_extent_count, Expr, ExprKind};
+use super::ast::{Expr, ExprKind};
 use super::library_builtin::ProtoType;
 use super::parser::{ParseResult, Parser};
 use crate::diag;
@@ -108,7 +108,6 @@ impl Parser<'_> {
     fn clear_padding_pointee(&mut self, ptr: &Expr, pos: Position) -> Option<TypeId> {
         // An argument whose type is unknown was reported already.
         let typ = ptr.typ?;
-        let is_array = self.types.kind(typ) == TypeKind::Array;
         let decayed = self.decayed_type(typ);
         let pointee = (self.types.kind(decayed) == TypeKind::Pointer)
             .then(|| self.types.base_type(decayed))
@@ -121,10 +120,7 @@ impl Parser<'_> {
             );
             return None;
         };
-        // An array argument's own outermost extent is not the pointee's.
-        let extents =
-            vm_extent_count(self.types, self.symbols, ptr).saturating_sub(is_array.into());
-        if self.type_name_is_incomplete(pointee, extents) {
+        if self.type_name_is_incomplete(pointee) {
             diag::error_args(
                 ptr.pos,
                 "argument 1 in call to function '{0}' points to incomplete type",

@@ -1065,7 +1065,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         // GNU zero-length array -- so nothing in the list can be excess.
         let last_index = self
             .types
-            .array_size(array_typ)
+            .array_extent(array_typ)
+            .known()
             .filter(|&n| n > 0)
             .map(|n| n as i64 - 1);
         let in_bounds = |idx: i64| last_index.is_none_or(|last| (0..=last).contains(&idx));
@@ -1342,7 +1343,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
         let form = match &visit.kind {
             // A designator into the member, `.s[1] = c`, initializes elements.
-            StructFieldVisitKind::Expr(expr) if self.types.unsized_array_levels(visit.typ) > 0 => {
+            StructFieldVisitKind::Expr(expr) if self.types.is_incomplete_array(visit.typ) => {
                 match &expr.kind {
                     ExprKind::InitList { elements } if elements.is_empty() => FamInit::Empty,
                     ExprKind::InitList { elements } => match elements.as_slice() {
@@ -2969,7 +2970,7 @@ mod tests {
     use crate::parse::ast::Expr;
     use crate::symbol::SymbolTable;
     use crate::target::Target;
-    use crate::types::Type;
+    use crate::types::{ArrayExtent, Type};
 
     /// A bit-field's bytes, counted from the least significant bit of each
     /// byte for a little-endian struct and from the most significant for a
@@ -3014,12 +3015,8 @@ mod tests {
         let target = Target::host();
         let mut types = TypeTable::new(&target);
         let elements = build(&types);
-        let array = types.intern(Type {
-            kind: TypeKind::Array,
-            base: Some(types.int_id),
-            array_size: size,
-            ..Default::default()
-        });
+        let extent = size.map_or(ArrayExtent::Unknown, ArrayExtent::Known);
+        let array = types.intern(Type::array_of(types.int_id, extent));
         let symbols = SymbolTable::new();
         let strings = crate::strings::StringTable::new();
         let lin = Linearizer::new(&symbols, &types, &strings, &target);
@@ -3144,12 +3141,7 @@ mod tests {
         let mut types = TypeTable::new(&target);
         let mut strings = crate::strings::StringTable::new();
         let (n, s) = (strings.intern("n"), strings.intern("s"));
-        let chars = types.intern(Type {
-            kind: TypeKind::Array,
-            base: Some(types.char_id),
-            array_size: None,
-            ..Default::default()
-        });
+        let chars = types.intern(Type::array_of(types.char_id, ArrayExtent::Unknown));
         let v = types.intern(Type::struct_type(composite(
             vec![member(n, types.int_id, 0), member(s, chars, 4)],
             4,

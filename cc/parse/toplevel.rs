@@ -25,7 +25,7 @@ use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Linkage, Symbol, SymbolId};
 use crate::token::lexer::{payload_text, Position, TokenType};
-use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
+use crate::types::{ArrayExtent, Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
 use std::collections::HashMap;
 
@@ -74,15 +74,15 @@ impl Parser<'_> {
         }
         for &id in &order {
             let typ = self.symbols.get(id).typ;
-            if self.types.unsized_array_levels(typ) == 0 {
+            if !self.types.is_incomplete_array(typ) {
                 continue;
             }
             let name = self.symbols.get(id).name;
             let spelled = self.idents.get_opt(name).unwrap_or("");
             // A block-scope `extern` may have given the object its extent.
             let completed = match self.linked_type(name) {
-                Some((linked, late)) if self.types.unsized_array_levels(linked) == 0 => {
-                    if late && self.types.get(linked).array_size != Some(1) {
+                Some((linked, late)) if !self.types.is_incomplete_array(linked) => {
+                    if late && self.types.array_extent(linked) != ArrayExtent::Known(1) {
                         diag::error_args(
                             last[&id],
                             "type of array '{0}' completed incompatibly with implicit initialization",
@@ -108,7 +108,7 @@ impl Parser<'_> {
                 continue;
             };
             for d in &mut decl.declarators {
-                if last.contains_key(&d.symbol) && self.types.unsized_array_levels(d.typ) > 0 {
+                if last.contains_key(&d.symbol) && self.types.is_incomplete_array(d.typ) {
                     // The symbol's type is the last declaration's, which
                     // spelled its own storage class; the declarator's is
                     // the object's alone (see `bind_declarator`).
@@ -347,7 +347,7 @@ impl Parser<'_> {
         // C17 6.9.1p3: a definition returns `void` or a complete object
         // type, since its `return` makes one.
         if self.types.kind(return_type) != TypeKind::Void
-            && self.type_name_is_incomplete(return_type, 0)
+            && self.type_name_is_incomplete(return_type)
         {
             diag::error(pos, &gettext("return type is an incomplete type"));
         }
@@ -430,8 +430,7 @@ impl Parser<'_> {
     /// A prototype that is not a definition may name an incomplete type.
     fn check_parameters_complete(&self, params: &[RawParam], pos: Position) {
         for (i, raw) in params.iter().enumerate() {
-            if self.types.kind(raw.typ) == TypeKind::Void
-                || !self.type_name_is_incomplete(raw.typ, 0)
+            if self.types.kind(raw.typ) == TypeKind::Void || !self.type_name_is_incomplete(raw.typ)
             {
                 continue;
             }

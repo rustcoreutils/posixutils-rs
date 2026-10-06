@@ -111,7 +111,7 @@ fn mark_members(
 
 /// Each element of an array in turn; an array without a bound has none.
 fn mark_array(types: &TypeTable, typ: TypeId, at: usize, bits: &mut [u8]) -> Result<(), StringId> {
-    let (Some(count), Some(elem)) = (types.array_size(typ), types.base_type(typ)) else {
+    let (Some(count), Some(elem)) = (types.array_extent(typ).known(), types.base_type(typ)) else {
         return Ok(());
     };
     let size = types.size_bytes(elem);
@@ -199,7 +199,7 @@ impl Linearizer<'_> {
             return;
         }
         let volatile = self.types.contains_volatile(pointee);
-        if self.types.unsized_array_levels(pointee) == 0 {
+        if self.types.variable_array_levels(pointee) == 0 {
             // A flexible array member was reported by the parser.
             if let Ok(bits) = value_bits(self.types, pointee) {
                 self.emit_padding_ops(base, &padding_ops(&bits), volatile);
@@ -348,7 +348,7 @@ impl Linearizer<'_> {
 mod tests {
     use super::*;
     use crate::target::{Arch, Os, Target};
-    use crate::types::{CompositeType, MemberAlign, StructMember, Type};
+    use crate::types::{ArrayExtent, CompositeType, MemberAlign, StructMember, Type};
 
     fn field(typ: TypeId, offset: usize) -> StructMember {
         StructMember {
@@ -508,10 +508,7 @@ mod tests {
         let empty = types.intern(Type::array(s, 0));
         assert!(value_bits(&types, empty).unwrap().is_empty());
 
-        let flex = types.intern(Type {
-            array_size: None,
-            ..Type::array(c, 0)
-        });
+        let flex = types.intern(Type::array_of(c, ArrayExtent::Unknown));
         let mut tail = field(flex, 5);
         tail.name = StringId(7);
         let f = composite(

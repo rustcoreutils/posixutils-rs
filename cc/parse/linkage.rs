@@ -201,9 +201,9 @@ impl Parser<'_> {
         }
 
         // 6.2.7p3: an extent, from any scope, completes the array.
-        let completes = self.types.unsized_array_levels(prior.typ) > 0
+        let completes = self.types.is_incomplete_array(prior.typ)
             && self.types.kind(d.typ) == TypeKind::Array
-            && self.types.unsized_array_levels(d.typ) == 0;
+            && !self.types.is_incomplete_array(d.typ);
         let late = completes && !file && self.has_tentative_array(d.name);
 
         let prior = self.linked_names.get_mut(&d.name).expect("present");

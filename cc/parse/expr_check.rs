@@ -183,7 +183,7 @@ impl Parser<'_> {
             // C17 6.5.2.2p4 assigns the argument to the parameter, which
             // needs an object of the parameter's type; a prototype may name an
             // incomplete one, but a call cannot be made through it.
-            if self.type_name_is_incomplete(param, 0) && self.types.kind(param) != TypeKind::Void {
+            if self.type_name_is_incomplete(param) && self.types.kind(param) != TypeKind::Void {
                 let n = (i + 1).to_string();
                 diag::error_args(arg.pos, "type of formal parameter {0} is incomplete", &[&n]);
                 sound = false;
@@ -436,8 +436,16 @@ impl Parser<'_> {
         let Some(pointee) = self.types.base_type(typ) else {
             return true;
         };
-        // An unsized array pointee is not tested: the type table interns
-        // `int[n]` and `int[]` alike, and stepping over the former is C.
+        // An array of unknown size has no size to step by; a variable length
+        // one does, at run time, and stepping over it is C. gcc words the
+        // former its own way for a subscript and for `+`.
+        if self.types.is_incomplete_array(pointee) {
+            diag::error(
+                pos,
+                &gettext("invalid use of array with unspecified bounds"),
+            );
+            return false;
+        }
         let incomplete = matches!(
             self.types.kind(pointee),
             TypeKind::Struct | TypeKind::Union | TypeKind::Enum
@@ -909,7 +917,7 @@ impl Parser<'_> {
     /// terminating null then has no room, and is dropped -- but may not
     /// overrun it. gcc warns and truncates, and so does c17.
     fn check_string_fits_array(&self, target: TypeId, init: &Expr) {
-        let Some(capacity) = self.types.array_size(target).filter(|&n| n > 0) else {
+        let Some(capacity) = self.types.array_extent(target).known().filter(|&n| n > 0) else {
             return;
         };
         let units = match &init.kind {

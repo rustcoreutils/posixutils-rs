@@ -18,7 +18,7 @@ use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::Symbol;
 use crate::token::lexer::{Position, SpecialToken, TokenType};
-use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
+use crate::types::{ArrayExtent, Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
 
 const DEFAULT_PARAM_CAPACITY: usize = 8;
@@ -40,28 +40,6 @@ impl FuncSignature {
             Type::function(return_type, self.param_types, self.variadic, false)
         } else {
             Type::function_no_prototype(return_type, false)
-        }
-    }
-}
-
-/// What one `[ ]` of an array declarator says about the array's extent.
-#[derive(Clone, Copy)]
-enum Extent {
-    /// An integer constant expression.
-    Constant(usize),
-    /// A variable length array's size expression, or `[*]`: complete, but
-    /// known only at run time.
-    Runtime,
-    /// `[]`: the array type is incomplete (C17 6.7.6.2p4).
-    Absent,
-}
-
-impl Extent {
-    /// The extent the array type records; a run-time one is carried apart.
-    fn size(self) -> Option<usize> {
-        match self {
-            Self::Constant(n) => Some(n),
-            Self::Runtime | Self::Absent => None,
         }
     }
 }
@@ -256,7 +234,7 @@ impl Parser<'_> {
         let plain_inner = inner.as_ref().is_none_or(|i| i.plain_name) && !group_attributed;
 
         // Handle array declarators - collect all dimensions first
-        let mut dimensions: Vec<(Extent, Position)> = Vec::new();
+        let mut dimensions: Vec<(ArrayExtent, Position)> = Vec::new();
         while self.is_special(b'[') {
             let dim_pos = self.current_pos();
             self.advance();
@@ -331,7 +309,6 @@ impl Parser<'_> {
         }
         let site = DeclSite { name, name_pos };
         let over_placeholder = placeholder && result_type_id == base_type_id;
-        let outer_absent = matches!(dimensions.first(), Some((Extent::Absent, _)));
         result_type_id =
             self.derive_suffix_arrays(result_type_id, dimensions, site, over_placeholder)?;
 
@@ -341,7 +318,7 @@ impl Parser<'_> {
             // `int (*p)[3]`, Pointer(Void) and Array(3, int) compose into
             // Pointer(Array(3, int)).
             if self.array_over_placeholder(inner.typ) {
-                self.check_array_element(result_type_id, outer_absent, site);
+                self.check_array_element(result_type_id, site);
             }
             result_type_id = self.substitute_base_type(inner.typ, result_type_id);
         }
@@ -379,7 +356,7 @@ impl Parser<'_> {
         outermost: bool,
         vla: &mut Vec<Expr>,
         vla_pos: &mut Option<Position>,
-    ) -> ParseResult<Extent> {
+    ) -> ParseResult<ArrayExtent> {
         // C17 6.7.6.2p1: the optional type qualifiers and `static` belong to
         // the declaration of a function parameter -- `_Atomic` among them.
         let mut qualified = false;
@@ -400,7 +377,7 @@ impl Parser<'_> {
         }
 
         if self.is_special(b']') {
-            return Ok(Extent::Absent);
+            return Ok(ArrayExtent::Unknown);
         }
         // `[*]`: a variable length array of unspecified size, which only a
         // prototype can declare (C17 6.7.6.2p4). `[*p]` is an expression.
@@ -416,14 +393,14 @@ impl Parser<'_> {
                 // known yet.
                 self.star_in_params.get_or_insert(dim_pos);
             }
-            return Ok(Extent::Runtime);
+            return Ok(ArrayExtent::Variable);
         }
 
         // Parse constant expression for array size (C99 6.7.5.2)
         let size_pos = self.current_pos();
         let expr = self.parse_assignment_expr()?;
         match self.eval_array_bound(&expr) {
-            Some(n) if n >= 0 => Ok(Extent::Constant(n as usize)),
+            Some(n) if n >= 0 => Ok(ArrayExtent::Known(n as usize)),
             // C17 6.7.6.2p1: the size shall be greater than zero. Zero itself
             // is a GNU extension gcc accepts, so only a negative size is
             // refused here.
@@ -445,7 +422,7 @@ impl Parser<'_> {
                 self.check_array_size_type(&expr, size_pos)?;
                 vla.push(expr);
                 vla_pos.get_or_insert(size_pos);
-                Ok(Extent::Runtime)
+                Ok(ArrayExtent::Variable)
             }
         }
     }
@@ -457,18 +434,16 @@ impl Parser<'_> {
     fn derive_suffix_arrays(
         &mut self,
         elem: TypeId,
-        dimensions: Vec<(Extent, Position)>,
+        dimensions: Vec<(ArrayExtent, Position)>,
         site: DeclSite,
         over_placeholder: bool,
     ) -> ParseResult<TypeId> {
         let mut typ = elem;
-        let mut elem_absent = false;
         for (i, (extent, pos)) in dimensions.into_iter().rev().enumerate() {
             if i > 0 || !over_placeholder {
-                self.check_array_element(typ, elem_absent, site);
+                self.check_array_element(typ, site);
             }
-            typ = self.derive_array_type(typ, extent.size(), pos)?;
-            elem_absent = matches!(extent, Extent::Absent);
+            typ = self.derive_array_type(typ, extent, pos)?;
         }
         Ok(typ)
     }
@@ -493,12 +468,13 @@ impl Parser<'_> {
     /// stride, so this holds wherever an array type is formed -- an `extern`
     /// declaration, a typedef, a parameter that adjusts to a pointer, a
     /// pointer to the array, a type-name -- and gcc does not wait for a tag
-    /// completed further down. `elem_absent` says `elem` is an array whose
-    /// own extent was written `[]`. Reported, not fatal: the type is still
-    /// formed, so the declaration binds and nothing cascades. An abstract
-    /// declarator's `site` is its start, where gcc points too.
-    fn check_array_element(&self, elem: TypeId, elem_absent: bool, site: DeclSite) {
-        let Some(defect) = self.array_element_defect(elem, elem_absent) else {
+    /// completed further down. An element that is itself an array of unknown
+    /// size is incomplete; one of variable length is not. Reported, not
+    /// fatal: the type is still formed, so the declaration binds and nothing
+    /// cascades. An abstract declarator's `site` is its start, where gcc
+    /// points too.
+    fn check_array_element(&self, elem: TypeId, site: DeclSite) {
+        let Some(defect) = self.array_element_defect(elem) else {
             return;
         };
         let msg = match defect {
@@ -518,13 +494,12 @@ impl Parser<'_> {
     }
 
     /// What, if anything, keeps `elem` from being an array's element type.
-    fn array_element_defect(&self, elem: TypeId, elem_absent: bool) -> Option<ElementDefect> {
+    fn array_element_defect(&self, elem: TypeId) -> Option<ElementDefect> {
         match self.types.kind(elem) {
             TypeKind::Void => Some(ElementDefect::Of("voids")),
             TypeKind::Function => Some(ElementDefect::Of("functions")),
-            TypeKind::Array => elem_absent.then_some(ElementDefect::Incomplete),
             _ => self
-                .type_name_is_incomplete(elem, 0)
+                .type_name_is_incomplete(elem)
                 .then_some(ElementDefect::Incomplete),
         }
     }
@@ -574,13 +549,13 @@ impl Parser<'_> {
             TypeKind::Array => {
                 let inner_base_id = decl_type.base.unwrap();
                 let decl_modifiers = decl_type.modifiers;
-                let decl_array_size = decl_type.array_size;
+                let decl_extent = decl_type.extent;
                 let new_base_id = self.substitute_base_type(inner_base_id, actual_base_id);
                 let arr_type = Type {
                     kind: TypeKind::Array,
                     modifiers: decl_modifiers,
                     base: Some(new_base_id),
-                    array_size: decl_array_size,
+                    extent: decl_extent,
                     ..Default::default()
                 };
                 self.types.intern(arr_type)
@@ -809,7 +784,7 @@ impl Parser<'_> {
             let elem_typ = self.types.get(typ_id).base;
             let (vm_dims, discarded_dims) = match elem_typ {
                 Some(elem) => {
-                    let want = self.types.unsized_array_levels(elem);
+                    let want = self.types.variable_array_levels(elem);
                     let skip = vla_sizes.len().saturating_sub(want);
                     // The leading entries are the dimensions the
                     // array-to-pointer adjustment removes. They are still

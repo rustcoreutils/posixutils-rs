@@ -273,8 +273,8 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
 
         // sizeof(type), constant for a complete type but *not* for a variable
         // length array, whose size 6.5.3.4p2 computes at run time. The type
-        // table cannot tell `int[n]` from `int[]`, so answering from it alone
-        // gave 0 -- and a 0 that was still an integer constant expression, so
+        // holds no size for `int[n]`, so answering from it alone gave 0 -- and
+        // a 0 that was still an integer constant expression, so
         // `int z[sizeof(int[n])];` silently became a zero-length array.
         ExprKind::SizeofType(type_id, dims) => {
             if crate::parse::ast::sizeof_type_is_runtime(env.types(), *type_id, dims) {
@@ -287,10 +287,10 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
             // `sizeof a` where `a` is a variable-length array is computed at
             // run time (6.5.3.4p2) and is not an integer constant expression.
             //
-            // A `TypeId` for `int[n]` is indistinguishable from one for `int[]`,
-            // so the question has to be asked of the levels, not the size.
+            // Any variable level makes the size a run-time one: `int[3][n]`
+            // as much as `int[n]`.
             let typ = inner.typ?;
-            if env.types().unsized_array_levels(typ) > 0 {
+            if env.types().variable_array_levels(typ) > 0 {
                 return None;
             }
             Some(env.types().size_bytes(typ) as i128)

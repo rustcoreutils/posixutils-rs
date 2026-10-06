@@ -470,12 +470,10 @@ fn diagnostics_permitted_universal_character_names_are_accepted() {
 // #C90 — sizeof of an incomplete type (C17 6.5.3.4p1)
 // ============================================================================
 
-/// `sizeof` shall not be applied to an incomplete type. An array is the
-/// awkward case: the type table cannot tell `int[n]` from `int[]`, since both
-/// simply have no extent. The size expressions decide it -- a level with an
-/// expression is variably modified and so complete, a level without one is
-/// incomplete -- which is what makes `sizeof(int[][n])`, two absent extents
-/// against one expression, the incomplete array of arrays gcc rejects.
+/// `sizeof` shall not be applied to an incomplete type. For an array the
+/// outermost extent decides it: `int[n]` is a variable length array and
+/// complete, `int[]` -- and so `int[][n]`, an array of unknown size whose
+/// elements are variable -- is incomplete, and gcc rejects it.
 #[test]
 fn diagnostics_sizeof_of_an_incomplete_type_is_rejected() {
     for (name, src) in [
@@ -549,11 +547,8 @@ fn diagnostics_sizeof_of_complete_types_is_accepted() {
     );
 }
 
-/// `typeof` yields a bare type, so a VLA's extent does not survive it and the
-/// result is indistinguishable from an incomplete array. `sizeof(typeof(a))`
-/// is legal -- gcc answers with the VLA's size -- so the completeness check
-/// above must not fire on it. It answers 0 rather than 16, which is #C89 and
-/// unfixed; what this pins is that it is not *rejected*, since `typeof`
+/// `sizeof(typeof(a))` of a VLA is legal -- gcc answers with the VLA's size
+/// -- so the completeness check above must not fire on it, and `typeof`
 /// appears in real system headers.
 #[test]
 fn diagnostics_sizeof_of_a_typeof_is_not_rejected() {

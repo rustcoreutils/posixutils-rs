@@ -280,6 +280,12 @@ pub struct CompositeType {
     /// union is passed as its first member would be. Unions only; gcc's
     /// attribute governs calls, so assignment and `return` stay strict.
     pub transparent: bool,
+    /// Whether this struct or union stores its scalars in the reverse of the
+    /// target's byte order (gcc's `scalar_storage_order`). The member types
+    /// say it for the scalars themselves; this says it of the aggregate, which
+    /// a member gcc does not reverse -- a pointer -- still answers to: an
+    /// address constant cannot initialize one statically.
+    pub reverse_order: bool,
     /// Which definition a tagless struct, union or enum came from; `None` for
     /// a tagged or synthesized one.
     ///
@@ -320,6 +326,7 @@ impl CompositeType {
             member_align: 1,
             is_complete: false,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         }
@@ -2153,6 +2160,7 @@ impl TypeTable {
             member_align: align as usize,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         };
@@ -2220,6 +2228,7 @@ impl TypeTable {
             member_align: align as usize,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         };
@@ -4223,6 +4232,7 @@ mod tests {
             member_align: 4,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         };
@@ -4357,6 +4367,7 @@ mod tests {
             member_align: 4,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         };
@@ -4606,6 +4617,7 @@ mod tests {
             member_align: 8,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         };
@@ -4670,6 +4682,7 @@ mod tests {
             member_align: 8,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         };
@@ -5601,6 +5614,7 @@ mod tests {
             member_align: size,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         };

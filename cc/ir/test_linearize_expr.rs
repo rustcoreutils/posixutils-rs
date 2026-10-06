@@ -641,6 +641,7 @@ fn test_struct_deref_returns_address() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        reverse_order: false,
         anon_id: None,
         tag_type: None,
     });

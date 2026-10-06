@@ -201,3 +201,103 @@ fn diagnostics_storage_order_variants_are_incompatible() {
          void f(struct S *s, S2 *s2) { *s = *s2; }\n",
     );
 }
+
+/// gcc.dg/sso-1.c: a static initializer cannot put an address -- of an
+/// object, a function, a string literal, with or without an offset -- into
+/// a struct or union stored in reverse order, though the pointer member
+/// itself is stored natively. gcc says the element is not constant, and
+/// says it of an address converted to an integer member as well. A struct
+/// of the target's order nested inside keeps its own order, and is fine.
+#[test]
+fn diagnostics_storage_order_address_constant_in_a_reversed_aggregate() {
+    const MSG: &str = "initializer element is not constant";
+    const REC: &str = "int i;\nvoid fn(void);\n\
+                       struct __attribute__((scalar_storage_order(\"big-endian\"))) Rec {\n\
+                       int *p;\n\
+                       };\n";
+    let cases = [
+        ("sso_init_object", format!("{REC}struct Rec r = {{ &i }};\n")),
+        (
+            "sso_init_static_block",
+            format!("{REC}void f(void) {{ static struct Rec r = {{ &i }}; (void)r; }}\n"),
+        ),
+        (
+            "sso_init_offset",
+            format!("{REC}struct Rec r = {{ .p = &i + 1 }};\n"),
+        ),
+        (
+            "sso_init_array_of",
+            format!("{REC}struct Rec r[2] = {{ {{ &i }}, {{ 0 }} }};\n"),
+        ),
+        (
+            "sso_init_function",
+            "void g(void);\n\
+             struct __attribute__((scalar_storage_order(\"big-endian\"))) F { void (*fp)(void); };\n\
+             struct F r = { g };\n"
+                .to_string(),
+        ),
+        (
+            "sso_init_string",
+            "struct __attribute__((scalar_storage_order(\"big-endian\"))) S { const char *s; };\n\
+             struct S r = { \"hi\" };\n"
+                .to_string(),
+        ),
+        (
+            "sso_init_pointer_array",
+            "int i;\n\
+             struct __attribute__((scalar_storage_order(\"big-endian\"))) A { int *p[2]; };\n\
+             struct A r = { { &i, 0 } };\n"
+                .to_string(),
+        ),
+        (
+            "sso_init_union",
+            "int i;\n\
+             union __attribute__((scalar_storage_order(\"big-endian\"))) U { int *p; long l; };\n\
+             union U u = { &i };\n"
+                .to_string(),
+        ),
+        (
+            "sso_init_integer",
+            "int i;\n\
+             struct __attribute__((scalar_storage_order(\"big-endian\"))) L { long l; };\n\
+             struct L r = { (long)&i };\n"
+                .to_string(),
+        ),
+        (
+            "sso_init_pragma",
+            "int i;\n#pragma scalar_storage_order big-endian\n\
+             struct P { int *p; };\n#pragma scalar_storage_order default\n\
+             struct P r = { &i };\n"
+                .to_string(),
+        ),
+        (
+            "sso_init_typedef_variant",
+            "int i;\nstruct T { int *p; };\n\
+             typedef struct T __attribute__((scalar_storage_order(\"big-endian\"))) BT;\n\
+             BT r = { &i };\n"
+                .to_string(),
+        ),
+    ];
+    for (name, src) in &cases {
+        expect_error(name, src, MSG);
+    }
+}
+
+/// What gcc still accepts: a null or integer-valued pointer, an automatic
+/// object (initialized by stores, not by the linker), a native-order struct
+/// nested inside a reversed one, a struct of the target's own order, and
+/// the address *of* a reversed struct.
+#[test]
+fn diagnostics_storage_order_reversed_aggregate_initializers_gcc_allows() {
+    expect_clean(
+        "sso_init_allowed",
+        "int i;\n\
+         struct __attribute__((scalar_storage_order(\"big-endian\"))) Rec { int x; int *p; \
+         struct In { int *q; } in; };\n\
+         struct Rec a = { 1, 0, { &i } };\n\
+         struct Rec b = { 2, (int *)16, { 0 } };\n\
+         struct Rec *pa = &a;\n\
+         struct __attribute__((scalar_storage_order(\"little-endian\"))) Le { int *p; } le = { &i };\n\
+         int f(void) { struct Rec c = { 3, &i, { &i } }; return *c.p + *c.in.q; }\n",
+    );
+}

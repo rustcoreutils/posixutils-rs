@@ -3596,6 +3596,19 @@ pub enum Initializer {
 }
 
 impl Initializer {
+    /// Whether the linker writes any of it: an address, or a difference of
+    /// labels, here or in an element of an array.
+    pub fn holds_address(&self) -> bool {
+        match self {
+            Initializer::SymAddr(_)
+            | Initializer::SymAddrOffset(..)
+            | Initializer::LabelDiff { .. } => true,
+            Initializer::Array { elements, .. } => elements.iter().any(|(_, e)| e.holds_address()),
+            Initializer::Struct { fields, .. } => fields.iter().any(|(_, _, f)| f.holds_address()),
+            _ => false,
+        }
+    }
+
     /// A string literal initializing an array of `total_size` bytes, as the
     /// element list it stands for: one `Int` per code unit that fits, each
     /// `elem_size` bytes wide. `None` for anything that is not a string.
@@ -4317,6 +4330,36 @@ mod tests {
     use crate::abi::{ArgClass, RegClass};
     use crate::target::{Arch, Target};
     use crate::types::{Type, TypeTable};
+
+    /// An initializer holds an address when the linker writes any part of
+    /// it, at any depth; a value, a string and nothing do not.
+    #[test]
+    fn initializer_holds_address() {
+        let addr = Initializer::SymAddr("x".into());
+        assert!(addr.holds_address());
+        assert!(Initializer::SymAddrOffset("x".into(), 4).holds_address());
+        assert!(Initializer::LabelDiff {
+            end: "b".into(),
+            start: "a".into(),
+            addend: 0,
+        }
+        .holds_address());
+        let array = |elements| Initializer::Array {
+            elem_size: 8,
+            total_size: 16,
+            elements,
+        };
+        assert!(array(vec![(0, Initializer::Int(0)), (8, addr.clone())]).holds_address());
+        assert!(!array(vec![(0, Initializer::Int(1))]).holds_address());
+        let nested = Initializer::Struct {
+            total_size: 16,
+            fields: vec![(0, 16, array(vec![(8, addr)]))],
+        };
+        assert!(nested.holds_address());
+        assert!(!Initializer::None.holds_address());
+        assert!(!Initializer::Int(7).holds_address());
+        assert!(!Initializer::String("s".into()).holds_address());
+    }
 
     /// `-fvisibility=` reaches every external definition that named none,
     /// and nothing else.

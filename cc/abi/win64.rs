@@ -204,6 +204,7 @@ mod tests {
             member_align: align,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         }))

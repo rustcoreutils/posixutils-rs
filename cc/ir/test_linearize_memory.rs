@@ -305,6 +305,7 @@ fn test_large_struct_copy_from_array() {
             member_align: 8,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         })),

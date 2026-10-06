@@ -242,6 +242,7 @@ impl Parser<'_> {
                 member_align: size,
                 is_complete: true,
                 transparent: false,
+                reverse_order: false,
                 anon_id: tag.is_none().then(|| self.types.fresh_anon_id()),
                 tag_type: None,
             };
@@ -473,7 +474,7 @@ impl Parser<'_> {
             storage_order = attrs.storage_order(specifier_pos).or(storage_order);
 
             self.check_flexible_array_members(&members, is_union);
-            self.apply_storage_order(&mut members, storage_order);
+            let reverse_order = self.apply_storage_order(&mut members, storage_order);
 
             // Compute layout. `__attribute__((packed))` on the struct or union
             // is `packed` on every member, which is how gcc defines it; a
@@ -539,6 +540,7 @@ impl Parser<'_> {
                 member_align,
                 is_complete: true,
                 transparent: is_transparent && is_union,
+                reverse_order,
                 anon_id: tag.is_none().then(|| self.types.fresh_anon_id()),
                 tag_type: None,
             };
@@ -983,20 +985,27 @@ impl Parser<'_> {
     /// [`crate::types::TypeTable::in_reverse_storage`]. The order is a
     /// property of the member types from here on: everything that reads or
     /// writes a member learns it from the type it accesses the member at.
-    fn apply_storage_order(&mut self, members: &mut [StructMember], written: Option<ByteOrder>) {
+    /// Answers whether the order is the reverse of the target's, which the
+    /// aggregate records too.
+    fn apply_storage_order(
+        &mut self,
+        members: &mut [StructMember],
+        written: Option<ByteOrder>,
+    ) -> bool {
         let order = match written {
             Some(order) => order,
             None => match self.current_storage_order() {
                 StorageOrderPragma::Order(order) => order,
-                StorageOrderPragma::Default => return,
+                StorageOrderPragma::Default => return false,
             },
         };
         if order == self.types.target().byte_order() {
-            return;
+            return false;
         }
         for member in members {
             member.typ = self.types.in_reverse_storage(member.typ);
         }
+        true
     }
 
     /// The struct or union `typ` as a reference to it with a
@@ -1014,7 +1023,8 @@ impl Parser<'_> {
         let Some(composite) = variant.composite.as_deref_mut() else {
             return variant;
         };
-        let mut changed = false;
+        let mut changed = composite.reverse_order != reverse;
+        composite.reverse_order = reverse;
         for member in &mut composite.members {
             let typ = if reverse {
                 self.types.in_reverse_storage(member.typ)

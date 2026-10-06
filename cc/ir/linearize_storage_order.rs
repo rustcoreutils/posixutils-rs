@@ -309,17 +309,10 @@ impl<'a> Linearizer<'a> {
                 other => return other,
             }
         } else {
+            // An address is written by the linker, in the target's order;
+            // `ast_init_to_ir` refused it before it got here.
             match init {
                 Initializer::Int(v) => v as u128,
-                Initializer::SymAddr(_)
-                | Initializer::SymAddrOffset(..)
-                | Initializer::LabelDiff { .. } => {
-                    // An address is written by the linker, in the target's
-                    // order; gcc cannot reverse one either.
-                    let pos = self.current_pos.unwrap_or_default();
-                    diag::error(pos, "initializer element is not computable at load time");
-                    return Initializer::None;
-                }
                 other => return other,
             }
         };

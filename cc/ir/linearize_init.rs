@@ -334,8 +334,17 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// than one cannot hold it: gcc rejects `char k = (long)arr;` as not
     /// computable at load time, where emitting the relocation wrote eight
     /// bytes over a one-byte object and its neighbours.
+    ///
+    /// An address cannot be stored in reverse order -- the linker writes it
+    /// in the target's -- so gcc refuses one for a reversed scalar, as
+    /// [`Self::reject_address_in_reversed`] does for the other members of a
+    /// reversed aggregate.
     pub(crate) fn ast_init_to_ir(&mut self, expr: &Expr, typ: TypeId) -> Initializer {
         let init = self.ast_init_in_native_order(expr, typ);
+        if self.types.reverses_storage(typ) && init.holds_address() {
+            error(self.expr_pos(expr), "initializer element is not constant");
+            return Initializer::None;
+        }
         self.in_storage_order(init, typ)
     }
 
@@ -910,6 +919,39 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
             _ => None,
         }
+    }
+
+    /// gcc.dg/sso-1.c: an address constant cannot initialize a member of a
+    /// struct or union stored in reverse order -- gcc refuses it whether the
+    /// member is a pointer (which it stores natively) or an array of them.
+    /// A member that is itself a struct or union, or an array of them, has
+    /// its own order, and its own members answer to it. `init` is the
+    /// member's initializer, which is dropped once refused.
+    fn reject_address_in_reversed(
+        &self,
+        aggregate: TypeId,
+        member: TypeId,
+        init: Initializer,
+        pos: Position,
+    ) -> Initializer {
+        let reversed = self
+            .types
+            .get(aggregate)
+            .composite
+            .as_ref()
+            .is_some_and(|c| c.reverse_order);
+        let mut element = member;
+        while self.types.kind(element) == TypeKind::Array {
+            element = self.types.base_type(element).unwrap_or(self.types.int_id);
+        }
+        if !reversed
+            || matches!(self.types.kind(element), TypeKind::Struct | TypeKind::Union)
+            || !init.holds_address()
+        {
+            return init;
+        }
+        error(pos, "initializer element is not constant");
+        Initializer::None
     }
 
     /// Report an initializer that is not a constant expression we can fold:
@@ -2210,6 +2252,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let outer = self.enter_static_subobject(false);
                     for visit in visits {
                         let held = self.held_union_members(visit.typ, &visit.kind, visit.offset);
+                        let pos = self.visit_pos(&visit);
                         let field_init = match visit.kind {
                             StructFieldVisitKind::BraceElision(sub_elements) => {
                                 self.ast_init_list_to_ir(&sub_elements, visit.typ)
@@ -2223,6 +2266,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                                 self.ast_init_to_ir(&expr, visit.typ)
                             }
                         };
+                        let field_init =
+                            self.reject_address_in_reversed(typ, visit.typ, field_init, pos);
                         raw_fields.push(RawFieldInit {
                             offset: visit.offset,
                             field_size: visit.field_size,

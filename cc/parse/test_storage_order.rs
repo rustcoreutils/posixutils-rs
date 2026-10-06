@@ -162,3 +162,42 @@ fn test_a_typedef_names_a_variant_in_the_written_order() {
     assert!(types.types_compatible(tag, le));
     assert_eq!(types.size_bytes(be), types.size_bytes(tag));
 }
+
+/// The aggregate records its own order, which a struct of pointers alone --
+/// none of whose members the order reaches -- has no other trace of. A
+/// typedef variant in the other order is a type with the other answer.
+#[test]
+fn test_a_reversed_aggregate_records_its_order() {
+    let src = "struct __attribute__((scalar_storage_order(\"big-endian\"))) B { int *p; };\n\
+               union __attribute__((scalar_storage_order(\"big-endian\"))) U { int *p; };\n\
+               struct __attribute__((scalar_storage_order(\"little-endian\"))) L { int *p; };\n\
+               struct N { int *p; };\n\
+               typedef struct N __attribute__((scalar_storage_order(\"big-endian\"))) NB;\n\
+               NB nb;\n";
+    let (_, types, strings, symbols) = parse_tu_for(src, &x86_64_linux()).unwrap();
+    let reversed = |typ| {
+        types
+            .get(typ)
+            .composite
+            .as_ref()
+            .expect("a composite")
+            .reverse_order
+    };
+    let tag = |name: &str| {
+        let id = strings.lookup(name).expect("tag interned");
+        symbols
+            .lookup(id, Namespace::Tag)
+            .expect("tag declared")
+            .typ
+    };
+    assert!(reversed(tag("B")));
+    assert!(reversed(tag("U")));
+    assert!(!reversed(tag("L")));
+    assert!(!reversed(tag("N")));
+    let nb = strings.lookup("nb").expect("interned");
+    let nb = symbols
+        .lookup(nb, Namespace::Ordinary)
+        .expect("declared")
+        .typ;
+    assert!(reversed(nb));
+}

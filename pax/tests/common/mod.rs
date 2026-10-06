@@ -443,7 +443,6 @@ impl Ustar<'_> {
         let size = self.size.unwrap_or(self.body.len() as u64);
         h[124..136].copy_from_slice(format!("{:011o}\0", size).as_bytes());
         h[136..148].copy_from_slice(format!("{:011o}\0", self.mtime).as_bytes());
-        h[148..156].copy_from_slice(b"        "); // spaces while summing
         h[156] = self.typeflag;
         h[157..157 + self.linkname.len()].copy_from_slice(self.linkname);
         h[257..263].copy_from_slice(b"ustar\0");
@@ -453,9 +452,7 @@ impl Ustar<'_> {
         h[265..265 + self.uname.len()].copy_from_slice(self.uname);
         h[297..297 + self.gname.len()].copy_from_slice(self.gname);
         h[345..345 + self.prefix.len()].copy_from_slice(self.prefix);
-
-        let sum: u32 = h.iter().map(|&b| b as u32).sum();
-        h[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
+        reseal_header(&mut h);
         h
     }
 
@@ -476,6 +473,14 @@ impl Ustar<'_> {
         out.extend_from_slice(&ustar_trailer());
         out
     }
+}
+
+/// Recompute the checksum of the header block that `block` begins with, for a
+/// fixture that edits a field after the header was built.
+pub fn reseal_header(block: &mut [u8]) {
+    block[148..156].copy_from_slice(b"        "); // spaces while summing
+    let sum: u32 = block[..BLOCK].iter().map(|&b| b as u32).sum();
+    block[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
 }
 
 /// Run pax on `args` in `dir`, killing it if it has not finished within

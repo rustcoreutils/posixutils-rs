@@ -26,13 +26,14 @@
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
 use crate::error::{PaxError, PaxResult};
 use crate::formats::ustar::{
-    calculate_checksum, entry_type_to_flag, parse_header as parse_ustar_header, parse_numeric,
-    try_split_path, ustar_path_bytes, verify_checksum, write_field, LoneZeroBlock, SizeRule,
-    BLOCK_SIZE, CHKSUM_OFF, DEVMAJOR_OFF, DEVMINOR_OFF, GID_OFF, GNAME_LEN, GNAME_OFF,
-    LINKNAME_LEN, LINKNAME_OFF, MAGIC_OFF, MODE_OFF, MTIME_OFF, NAME_LEN, NAME_OFF, PREFIX_LEN,
-    PREFIX_OFF, SIZE_OFF, TYPEFLAG_OFF, UID_OFF, UNAME_LEN, UNAME_OFF, VERSION_OFF, ZERO_BLOCK,
+    calculate_checksum, entry_type_to_flag, long_name_record, member_data_size,
+    parse_header as parse_ustar_header, parse_numeric, try_split_path, ustar_path_bytes,
+    verify_checksum, write_field, LoneZeroBlock, LongNameGroup, SizeRule, BLOCK_SIZE, CHKSUM_OFF,
+    DEVMAJOR_OFF, DEVMINOR_OFF, GID_OFF, GNAME_LEN, GNAME_OFF, LINKNAME_LEN, LINKNAME_OFF,
+    MAGIC_OFF, MODE_OFF, MTIME_OFF, NAME_LEN, NAME_OFF, PREFIX_LEN, PREFIX_OFF, SIZE_OFF,
+    TYPEFLAG_OFF, UID_OFF, UNAME_LEN, UNAME_OFF, VERSION_OFF, ZERO_BLOCK,
 };
-use crate::formats::{ArchiveStream, MAX_NAME};
+use crate::formats::{ArchiveStream, MAX_EXTENDED_HEADER, MAX_NAME};
 use crate::options::FormatOptions;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
@@ -275,6 +276,21 @@ impl ExtendedHeader {
                 })?;
         }
         Ok(header)
+    }
+
+    /// Refuse a `path` or `linkpath` record longer than a reader accepts --
+    /// this one included, so writing it made an archive pax could not read
+    /// back.
+    fn check_name_limit(&self) -> PaxResult<()> {
+        for name in [&self.path, &self.linkpath].into_iter().flatten() {
+            if name.len() as u64 > MAX_NAME {
+                return Err(PaxError::PathTooLong(format!(
+                    "{} bytes, over the {MAX_NAME} byte limit",
+                    name.len()
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Parse extended header records from data
@@ -659,8 +675,10 @@ impl ExtendedHeader {
         let path_is_binary = needs_record(path_bytes);
         if try_split_path(&ustar_spelling).is_none() || path_is_binary {
             // A non-UTF-8 name has no faithful ustar spelling, so it always
-            // needs the record regardless of length.
-            header.path = Some(path_bytes.to_vec());
+            // needs the record regardless of length. A directory's carries
+            // the trailing slash its header fields would, as bsdtar's does,
+            // so it lists the same whichever of the two names it.
+            header.path = Some(ustar_spelling);
         }
 
         // Link path needs extended header if too long
@@ -697,8 +715,11 @@ impl ExtendedHeader {
             header.hdrcharset = Some(crate::options::BINARY_CHARSET.to_string());
         }
 
-        // Size > 8GB needs extended header
-        if entry.size > 0o77777777777 {
+        // Size > 8GB needs extended header. So does a hard link's data
+        // (`-o linkdata`): a reader takes typeflag 1 to have any only in a
+        // pax archive, which only an extended header makes one.
+        if entry.size > 0o77777777777 || (entry.entry_type == EntryType::Hardlink && entry.size > 0)
+        {
             header.size = Some(entry.size);
         }
 
@@ -784,8 +805,16 @@ fn parse_record_span(data: &[u8], pos: usize) -> PaxResult<RecordSpan> {
         .position(|&b| b == b' ')
         .ok_or_else(|| PaxError::InvalidHeader("invalid extended header format".to_string()))?;
 
-    let len_str = std::str::from_utf8(&data[pos..pos + space_pos]).map_err(|_| bad_len())?;
-    let record_len: usize = len_str.parse().map_err(|_| bad_len())?;
+    // POSIX: "%d", a decimal number -- digits only. `parse` would also take
+    // a leading '+'.
+    let len_field = &data[pos..pos + space_pos];
+    if len_field.is_empty() || !len_field.iter().all(u8::is_ascii_digit) {
+        return Err(bad_len());
+    }
+    let record_len: usize = std::str::from_utf8(len_field)
+        .ok()
+        .and_then(|digits| digits.parse().ok())
+        .ok_or_else(bad_len)?;
 
     // The record must extend past its own length field, its <space>, and the
     // trailing <newline>; otherwise there is no value and the end underflows.
@@ -806,6 +835,13 @@ fn parse_record_span(data: &[u8], pos: usize) -> PaxResult<RecordSpan> {
     if value_end < value_start {
         return Err(bad_len());
     }
+    // The length has to land just past the record's <newline>. Taking
+    // whatever byte is there for it dropped the last byte of the value.
+    if data[value_end] != b'\n' {
+        return Err(PaxError::InvalidHeader(
+            "extended header record does not end in a newline".to_string(),
+        ));
+    }
 
     Ok(RecordSpan {
         value: value_start..value_end,
@@ -824,30 +860,46 @@ fn parse_record_span(data: &[u8], pos: usize) -> PaxResult<RecordSpan> {
 fn parse_pax_time(s: &str) -> PaxResult<PaxTime> {
     let invalid = || PaxError::InvalidHeader(format!("invalid pax time: {}", s));
     let (sec_str, frac_str) = s.split_once('.').unwrap_or((s, ""));
-    let sec: i64 = sec_str.parse().map_err(|_| invalid())?;
+    let mut sec: i64 = sec_str.parse().map_err(|_| invalid())?;
 
     // Take up to 9 fractional digits, zero-padded to nanoseconds.
     let mut frac = String::with_capacity(9);
+    let mut dropped = false;
     for c in frac_str.chars() {
         if !c.is_ascii_digit() {
             return Err(invalid());
         }
         if frac.len() < 9 {
             frac.push(c);
+        } else {
+            dropped |= c != '0';
         }
     }
     while frac.len() < 9 {
         frac.push('0');
     }
-    let nsec: u32 = frac.parse().map_err(|_| invalid())?;
+    let mut nsec: u32 = frac.parse().map_err(|_| invalid())?;
 
-    if sec_str.starts_with('-') && nsec > 0 {
-        return Ok(PaxTime {
-            sec: sec.checked_sub(1).ok_or_else(invalid)?,
-            nsec: NSEC_PER_SEC - nsec,
-        });
+    if !sec_str.starts_with('-') {
+        // Dropping digits rounded down, as `timespec` does.
+        return Ok(PaxTime { sec, nsec });
     }
-    Ok(PaxTime { sec, nsec })
+    // Before the Epoch, dropping digits rounded the magnitude down and so the
+    // time up; one more nanosecond of magnitude rounds it down instead.
+    if dropped {
+        nsec += 1;
+        if nsec == NSEC_PER_SEC {
+            sec = sec.checked_sub(1).ok_or_else(invalid)?;
+            nsec = 0;
+        }
+    }
+    if nsec == 0 {
+        return Ok(PaxTime { sec, nsec });
+    }
+    Ok(PaxTime {
+        sec: sec.checked_sub(1).ok_or_else(invalid)?,
+        nsec: NSEC_PER_SEC - nsec,
+    })
 }
 
 const NSEC_PER_SEC: u32 = 1_000_000_000;
@@ -964,6 +1016,10 @@ pub struct PaxReader<R: Read> {
     /// cloning them into each one made a large `g` header cost its size
     /// times the number of members.
     global_extra: Arc<HashMap<String, String>>,
+    /// The bytes of keyword and value in `global_extra`, held to
+    /// `MAX_EXTENDED_HEADER` as a whole: each `g` header is capped, but they
+    /// accumulate.
+    global_extra_bytes: usize,
     /// `-o keyword:=value`, appended to every member's extended header.
     per_file_options: ExtendedHeader,
     /// `-o` options consulted on read (`delete=` keyword removal).
@@ -991,6 +1047,7 @@ impl<R: Read> PaxReader<R> {
             bytes_read: 0,
             global_header: ExtendedHeader::new(),
             global_extra: Arc::default(),
+            global_extra_bytes: 0,
             per_file_options: ExtendedHeader::new(),
             options: FormatOptions::default(),
             member_offset: 0,
@@ -1039,7 +1096,8 @@ impl<R: Read> PaxReader<R> {
         self.options = options;
         self.global_header = ExtendedHeader::new();
         self.global_extra = Arc::default();
-        self.merge_global(records.global);
+        self.global_extra_bytes = 0;
+        self.merge_global(records.global)?;
         self.per_file_options = records.per_file;
         Ok(self)
     }
@@ -1050,18 +1108,43 @@ impl<R: Read> PaxReader<R> {
     /// Its extension records go straight into the shared map, which no member
     /// still holds by the time the next header is read, so this costs the
     /// size of `later` rather than of everything global so far.
-    fn merge_global(&mut self, mut later: ExtendedHeader) {
+    ///
+    /// Distinct keywords accumulate there, one `g` header after another, so
+    /// the whole is held to the limit a single header is.
+    fn merge_global(&mut self, mut later: ExtendedHeader) -> PaxResult<()> {
         let extra = std::mem::take(&mut later.extra);
         let shared = Arc::make_mut(&mut self.global_extra);
+        let mut bytes = self.global_extra_bytes;
         for keyword in &later.deleted {
-            shared.remove(keyword);
-        }
-        for (keyword, value) in extra {
-            if !self.options.should_delete_keyword(&keyword) {
-                shared.insert(keyword, value);
+            if let Some(value) = shared.remove(keyword) {
+                bytes -= keyword.len() + value.len();
             }
         }
+        for (keyword, value) in extra {
+            if self.options.should_delete_keyword(&keyword) {
+                continue;
+            }
+            let keyword_len = keyword.len();
+            bytes += keyword_len + value.len();
+            if let Some(old) = shared.insert(keyword, value) {
+                // Already counted, with the value just replaced.
+                bytes -= keyword_len + old.len();
+            }
+        }
+        self.global_extra_bytes = bytes;
+        if bytes as u64 > MAX_EXTENDED_HEADER {
+            return Err(PaxError::InvalidHeader(format!(
+                "global extended header records exceed the {MAX_EXTENDED_HEADER} byte limit"
+            )));
+        }
+        // Only a typed keyword's deletion has anything left to act on: an
+        // extension's was carried out on the shared map above, and keeping
+        // it would be one more thing that accumulates.
+        later
+            .deleted
+            .retain(|keyword| STANDARD_KEYWORDS.contains(&keyword.as_str()));
         self.global_header.merge(&later);
+        Ok(())
     }
 
     /// Read a raw header block
@@ -1100,6 +1183,19 @@ impl<R: Read> PaxReader<R> {
         records
     }
 
+    /// The rule for which members carry data. A hard link may only in a pax
+    /// archive, and an archive is one only once it has used an extended
+    /// header: the ustar magic alone is no sign, and in a ustar archive a
+    /// link's size field -- which the pre-POSIX convention filled with the
+    /// linked file's size -- is followed by the next member's header.
+    fn size_rule(&self) -> SizeRule {
+        if self.saw_extended_header {
+            SizeRule::Pax
+        } else {
+            SizeRule::Ustar
+        }
+    }
+
     /// Read extended header data
     fn read_extended_header(&mut self, size: u64) -> PaxResult<ExtendedHeader> {
         let data = crate::formats::read_declared(
@@ -1133,19 +1229,36 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
         // Skip any remaining data from previous entry
         self.skip_data()?;
 
+        // What describes the next member: its `x` header, and the GNU
+        // long-name records ahead of it. Either can come first, and both
+        // describe the member that follows them, not each other.
         let mut extended_header: Option<ExtendedHeader> = None;
+        let mut long_names = LongNameGroup::default();
 
         loop {
-            if extended_header.is_none() {
+            if extended_header.is_none() && long_names.is_empty() {
                 self.member_offset = self.reader.offset();
                 self.pending_globals.clear();
             }
-            let header = match self.read_header_block()? {
-                Some(h) => h,
-                None => return Ok(None),
+            let Some(header) = self.read_header_block()? else {
+                // With no member after them, the records end the archive,
+                // which begins where they do.
+                if !long_names.is_empty() {
+                    long_names.report(None);
+                }
+                return Ok(None);
             };
 
             let typeflag = header[TYPEFLAG_OFF];
+            let describes_pending = extended_header.is_some() || !long_names.is_empty();
+
+            // A GNU long-name record describes the member that follows, whose
+            // own name field is truncated to 100 bytes. There can be more
+            // than one.
+            if let Some(what) = long_name_record(typeflag) {
+                long_names.consume(&mut self.reader, &header, what)?;
+                continue;
+            }
 
             match typeflag {
                 PAX_GHDR => {
@@ -1154,9 +1267,9 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
                     let start = self.reader.offset() - BLOCK_SIZE as u64;
                     let size = parse_numeric(&header[SIZE_OFF..SIZE_OFF + 12])?;
                     let global = self.read_extended_header(size)?;
-                    self.merge_global(global);
+                    self.merge_global(global)?;
                     self.saw_extended_header = true;
-                    if extended_header.is_some() {
+                    if describes_pending {
                         self.pending_globals.push(start..self.reader.offset());
                     }
                 }
@@ -1166,42 +1279,30 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
                     extended_header = Some(self.read_extended_header(size)?);
                     self.saw_extended_header = true;
                 }
-                _ if crate::formats::ustar::long_name_record(typeflag).is_some() => {
-                    // A GNU long-name record describes the member that
-                    // follows, whose own name field is truncated to 100 bytes.
-                    // The records and the member are dropped together, and
-                    // there can be more than one record -- see
-                    // consume_long_name_group.
-                    // With no member after them, the records end the archive,
-                    // which begins where they do.
-                    let Some(size) = crate::formats::ustar::consume_long_name_group(
-                        &mut self.reader,
-                        header,
-                        SizeRule::Pax,
-                        self.lone_zero,
-                    )?
-                    else {
-                        return Ok(None);
-                    };
-                    self.current_size = size;
-                    self.bytes_read = 0;
-                    self.skip_data()?;
-                    // An `x` header ahead of the group described the member
-                    // just dropped, not the one after it.
-                    extended_header = None;
-                }
                 _ => {
-                    // Regular file entry - parse and apply extended headers
-                    let mut entry = parse_ustar_header(&header, SizeRule::Pax)?;
+                    let records = self.member_records(extended_header.as_ref());
+                    let rule = self.size_rule();
+                    if !long_names.superseded(records.path.is_some(), records.linkpath.is_some()) {
+                        // The records and the member are dropped together,
+                        // the member by the size its own records give it.
+                        long_names.report(Some(&header));
+                        self.current_size = member_data_size(&header, rule, records.size)?;
+                        self.bytes_read = 0;
+                        self.skip_data()?;
+                        extended_header = None;
+                        long_names = LongNameGroup::default();
+                        continue;
+                    }
 
-                    self.member_records(extended_header.as_ref())
-                        .apply_to(&mut entry);
+                    // Regular file entry - parse and apply extended headers
+                    let mut entry = parse_ustar_header(&header, rule)?;
+                    records.apply_to(&mut entry);
                     entry.ext_records.share(&self.global_extra);
 
                     // A `size=` record replaces the size field, not the rule
                     // for which types carry data: a directory or FIFO has
                     // none whichever of the two records its size.
-                    entry.size = SizeRule::Pax.data_size(entry.entry_type, entry.size);
+                    entry.size = rule.data_size(entry.entry_type, entry.size);
 
                     self.current_size = entry.size;
                     self.bytes_read = 0;
@@ -1436,6 +1537,7 @@ impl<W: Write> ArchiveWriter for PaxWriter<W> {
         // with no extended records is a valid ustar archive and reads back
         // identically, so there is no need to force an mtime record.
         let ext_header = ExtendedHeader::from_entry(entry, &self.options);
+        ext_header.check_name_limit()?;
 
         // Built before anything is written, so that a member this format
         // cannot hold is refused without leaving its `x` header behind to
@@ -1811,6 +1913,37 @@ mod tests {
             assert_eq!(format_pax_time(time), text, "format {text}");
         }
         assert!(parse_pax_time(&format!("{}.5", i64::MIN)).is_err());
+    }
+
+    /// Digits past the ninth are dropped, which rounds toward zero. For a
+    /// time before the Epoch that is upward, so the time held is the one
+    /// rounded down -- the same direction as for a time after it.
+    #[test]
+    fn test_negative_pax_time_beyond_nanoseconds_rounds_down() {
+        for (text, sec, nsec) in [
+            ("-1.0000000001", -2, 999_999_999),
+            ("-0.9999999999", -1, 0),
+            ("-1.0000000000", -1, 0),
+            ("1.0000000009", 1, 0),
+        ] {
+            assert_eq!(
+                parse_pax_time(text).unwrap(),
+                PaxTime { sec, nsec },
+                "parse {text}"
+            );
+        }
+    }
+
+    /// The reader's limit on a `path` record is the writer's too: a name it
+    /// would refuse to read back is refused when written.
+    #[test]
+    fn test_path_record_beyond_the_name_limit_is_refused_on_write() {
+        let long = "n".repeat(MAX_NAME as usize + 1);
+        let entry = ArchiveEntry::new(PathBuf::from(&long), EntryType::Regular);
+        let mut out = Vec::new();
+        let mut writer = PaxWriter::with_options(&mut out, FormatOptions::default());
+        assert!(writer.write_entry(&entry).is_err());
+        assert!(out.is_empty(), "no header may be left behind");
     }
 
     /// A time the ustar field cannot hold gets an `mtime` record, and the

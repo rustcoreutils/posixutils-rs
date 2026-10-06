@@ -2322,7 +2322,9 @@ fn test_o_keyword_records_rank_around_the_archive_records() {
 }
 
 /// An `x` header ahead of a GNU long-name group describes the member that
-/// group skips; it must not rename the member after it.
+/// group describes; it must not rename the member after it. Its `path`
+/// record names that member in full, so the `L` record is moot and the
+/// member is read under the `x` header's name, as bsdtar reads it.
 #[test]
 fn test_extended_header_does_not_outlive_a_skipped_long_name_group() {
     let mut a = Ustar {
@@ -2346,7 +2348,7 @@ fn test_extended_header_does_not_outlive_a_skipped_long_name_group() {
     a.extend_from_slice(&ustar_trailer());
 
     let output = run_pax_with_stdin_bytes(&[], &a);
-    assert_eq!(stdout_str(&output), "next\n");
+    assert_eq!(stdout_str(&output), "renamed\nnext\n");
 }
 
 /// A value no archive record could carry is refused, not silently ignored.
@@ -2582,4 +2584,34 @@ fn test_interactive_skip_directory_keeps_its_contents() {
     );
     let listing = run_pax_in_dir(&["-f", "out.tar"], temp.path());
     assert_eq!(stdout_str(&listing), "d/f\n");
+}
+
+/// A `-o keyword=value` or `keyword:=value` operand of write mode becomes a
+/// record in the archive. One whose value no reader can accept -- a uid that
+/// is not a number, a time that is not one -- wrote an archive that pax
+/// itself then refused to read. It is refused before anything is written.
+#[test]
+fn test_write_refuses_option_values_no_reader_accepts() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f"), "F\n").unwrap();
+
+    for opt in ["uid=abc", "mtime:=garbage", "size=-1"] {
+        let output = run_pax_in_dir(&["-w", "-x", "pax", "-o", opt, "f"], temp.path());
+        assert_failure(&output, opt);
+        assert!(
+            output.stdout.is_empty(),
+            "-o {opt}: nothing should be written"
+        );
+        assert!(
+            stderr_str(&output).contains(opt),
+            "-o {opt} must be named: {}",
+            stderr_str(&output)
+        );
+    }
+
+    // A valid one is still written, and read back.
+    let output = run_pax_in_dir(&["-w", "-x", "pax", "-o", "uid:=4242", "f"], temp.path());
+    assert_success(&output, "-o uid:=4242");
+    let listing = run_pax_with_stdin_bytes(&["-o", "listopt=%(uid)d %F"], &output.stdout);
+    assert_eq!(stdout_str(&listing), "4242 f\n");
 }

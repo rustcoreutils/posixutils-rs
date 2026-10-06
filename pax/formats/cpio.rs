@@ -401,6 +401,15 @@ impl<W: Write> ArchiveWriter for CpioWriter<W> {
         // The name is stored NUL-terminated and c_namesize counts the NUL.
         let name = crate::rawpath::as_bytes(&entry.path);
         let namesize = name.len() + 1;
+        // The reader's limit is the writer's: a longer name made an archive
+        // pax could not read back.
+        if namesize as u64 > crate::formats::MAX_NAME {
+            return Err(PaxError::PathTooLong(format!(
+                "{} bytes, over the {} byte limit",
+                name.len(),
+                crate::formats::MAX_NAME
+            )));
+        }
 
         let header = match self.format {
             CpioFormat::Odc => build_odc_header(entry, ids, namesize)?,

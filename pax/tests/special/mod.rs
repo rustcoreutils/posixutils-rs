@@ -785,3 +785,39 @@ fn test_terminal_fatal_diagnostic_is_escaped() {
         String::from_utf8_lossy(&tty)
     );
 }
+
+/// A socket member (cpio can hold one) cannot be created: nothing makes a
+/// listening socket out of an archive. Skipping it in silence, with exit
+/// status 0, reported an extraction that left a file out as complete.
+#[test]
+fn test_socket_member_is_diagnosed_on_extract() {
+    let temp = TempDir::new().unwrap();
+    let mut archive = CpioNewc {
+        name: b"sock",
+        mode: 0o140644,
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &CpioNewc {
+            name: b"after",
+            body: b"after\n",
+            ino: 2,
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, temp.path());
+    assert_exit_code(&output, 1, "extract a socket member");
+    assert!(
+        stderr_str(&output).contains("sock"),
+        "the socket must be named: {}",
+        stderr_str(&output)
+    );
+    assert!(!temp.path().join("sock").exists());
+    assert_eq!(
+        fs::read_to_string(temp.path().join("after")).unwrap(),
+        "after\n"
+    );
+}

@@ -378,6 +378,18 @@ fn parse_format_options(args: &Args) -> PaxResult<FormatOptions> {
     Ok(opts)
 }
 
+/// The `-o` options of write and append mode, whose `keyword=value` and
+/// `keyword:=value` operands become records in the archive.
+///
+/// Each value is checked as a reader will parse it, before anything is
+/// written: a uid that is not a number made an archive that pax itself then
+/// refused to read.
+fn parse_write_format_options(args: &Args) -> PaxResult<FormatOptions> {
+    let opts = parse_format_options(args)?;
+    formats::OptionRecords::new(&opts)?;
+    Ok(opts)
+}
+
 /// Parse all -s substitution expressions from arguments
 fn parse_substitutions(args: &Args) -> PaxResult<Vec<Substitution>> {
     use std::os::unix::ffi::OsStrExt;
@@ -529,7 +541,7 @@ fn reject_dash_c(args: &Args, mode: &str) -> PaxResult<()> {
 fn run_write(args: &Args, name_lists: Vec<NameList>, archive_bytes: &ByteCounter) -> PaxResult<()> {
     reject_dash_c(args, "write")?;
     let substitutions = parse_substitutions(args)?;
-    let format_options = parse_format_options(args)?;
+    let format_options = parse_write_format_options(args)?;
 
     let selected = args.format.unwrap_or(Format::Ustar);
     let mut options = WriteOptions {
@@ -665,7 +677,7 @@ fn run_append(
     }
 
     let substitutions = parse_substitutions(args)?;
-    let format_options = parse_format_options(args)?;
+    let format_options = parse_write_format_options(args)?;
 
     let mut options = WriteOptions {
         cli_dereference: args.cli_dereference,
@@ -865,40 +877,13 @@ fn detect_format_from_bytes(buf: &[u8]) -> PaxResult<ArchiveFormat> {
     ))
 }
 
-/// Verify tar checksum
+/// Whether `buf` begins with a tar header whose checksum is right, by the
+/// same test the header parser applies -- so a header detected here is one
+/// the reader then accepts.
 fn is_valid_tar_checksum(buf: &[u8]) -> bool {
-    if buf.len() < 512 {
-        return false;
-    }
-
-    // Parse checksum field at offset 148
-    let chksum_str = std::str::from_utf8(&buf[148..156]).unwrap_or("");
-    let chksum_str = chksum_str.trim_matches(|c| c == ' ' || c == '\0');
-    if chksum_str.is_empty() {
-        return false;
-    }
-
-    // Reject if checksum contains a sign
-    if chksum_str.starts_with('+') || chksum_str.starts_with('-') {
-        return false;
-    }
-
-    let stored = match u32::from_str_radix(chksum_str, 8) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-
-    // Calculate checksum
-    let mut sum: u32 = 0;
-    for (i, &byte) in buf[0..512].iter().enumerate() {
-        if (148..156).contains(&i) {
-            sum += b' ' as u32;
-        } else {
-            sum += byte as u32;
-        }
-    }
-
-    sum == stored
+    buf.get(..512)
+        .and_then(|block| block.try_into().ok())
+        .is_some_and(crate::formats::ustar::verify_checksum)
 }
 
 /// Compile pattern operands into Pattern objects.

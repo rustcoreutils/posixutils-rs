@@ -2057,3 +2057,47 @@ fn test_refused_directory_header_keeps_its_contents() {
     let listing = run_pax_in_dir(&["-f", "a.tar"], temp.path());
     assert_eq!(stdout_str(&listing), "d/f\n");
 }
+
+/// The reader refuses a `path` record, or a cpio name, longer than its name
+/// limit, so the writer must not produce one: pax could not read back its
+/// own archive. A name that long is refused when it is written, and the
+/// rest still are.
+#[test]
+fn test_pax_refuses_a_name_its_reader_would_reject() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f"), "F\n").unwrap();
+    fs::write(temp.path().join("g"), "G\n").unwrap();
+    let long = "n".repeat(70_000);
+    let subst = format!(",^f$,{long},");
+
+    for format in ["pax", "cpio", "sv4cpio"] {
+        let output = run_pax_in_dir(&["-w", "-x", format, "-s", &subst, "f", "g"], temp.path());
+        assert_exit_code(&output, 1, format);
+        let listing = run_pax_with_stdin_bytes(&[], &output.stdout);
+        assert_success(&listing, format);
+        assert_eq!(stdout_str(&listing), "g\n", "{format}");
+    }
+}
+
+/// A directory whose name is 101 to 156 bytes long has a '/' only at its end.
+/// Splitting there left the name field empty -- which old readers take for
+/// the end of the archive -- and the whole name in the prefix.
+#[test]
+fn test_directory_name_is_not_split_at_its_trailing_slash() {
+    let temp = TempDir::new().unwrap();
+    let dir = "a".repeat(120);
+    fs::create_dir(temp.path().join(&dir)).unwrap();
+
+    let output = run_pax_in_dir(&["-w", "-x", "pax", &dir], temp.path());
+    assert_success(&output, "pax -w -x pax of a 120-byte directory name");
+    // An `x` header first, then the directory's own header.
+    let header = &output.stdout[2 * BLOCK..3 * BLOCK];
+    assert_eq!(header[156], b'5');
+    assert_ne!(header[0], 0, "the name field must not be empty");
+    let listing = run_pax_with_stdin_bytes(&[], &output.stdout);
+    assert_eq!(stdout_str(&listing), format!("{dir}/\n"));
+
+    // ustar has nowhere to put such a name.
+    let output = run_pax_in_dir(&["-w", "-x", "ustar", &dir], temp.path());
+    assert_exit_code(&output, 1, "pax -w -x ustar of a 120-byte directory name");
+}

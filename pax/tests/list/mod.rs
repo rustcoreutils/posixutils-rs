@@ -407,10 +407,7 @@ fn test_gnu_base256_size_and_uid_are_read() {
     let uid = 3_000_000u64;
     a[108] = 0x80;
     a[109..116].copy_from_slice(&uid.to_be_bytes()[1..]);
-    // Recompute the checksum over the altered header.
-    a[148..156].copy_from_slice(b"        ");
-    let sum: u32 = a[..512].iter().map(|&b| b as u32).sum();
-    a[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
+    reseal_header(&mut a);
     a.extend_from_slice(
         &Ustar {
             name: b"next",

@@ -68,17 +68,26 @@ pub fn read_declared<R: Read>(
 /// the end would report a shorter archive as complete, every member after the
 /// cut silently lost. That is [`truncated_header`], an error.
 pub fn read_header<R: Read>(reader: &mut R, buf: &mut [u8]) -> PaxResult<bool> {
+    match read_up_to(reader, buf)? {
+        0 => Ok(false),
+        n if n == buf.len() => Ok(true),
+        _ => Err(truncated_header()),
+    }
+}
+
+/// Fill as much of `buf` as the archive holds, returning how much that was:
+/// less than its length only at end of file.
+pub fn read_up_to<R: Read>(reader: &mut R, buf: &mut [u8]) -> PaxResult<usize> {
     let mut filled = 0;
     while filled < buf.len() {
         match reader.read(&mut buf[filled..]) {
-            Ok(0) if filled == 0 => return Ok(false),
-            Ok(0) => return Err(truncated_header()),
+            Ok(0) => break,
             Ok(n) => filled += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(true)
+    Ok(filled)
 }
 
 /// The error for an archive that ends partway through a header.

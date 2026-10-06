@@ -293,19 +293,30 @@ impl SizeRule {
 
 pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResult<ArchiveEntry> {
     let name = path_field(&header[NAME_OFF..NAME_OFF + NAME_LEN]);
-    let prefix = path_field(&header[PREFIX_OFF..PREFIX_OFF + PREFIX_LEN]);
+    // An old GNU header has no prefix field: GNU tar keeps the access and
+    // change times in those bytes, and joining them onto the name turned
+    // `dir/file` into `14524770401/dir/file`.
+    let prefix = if is_old_gnu(header) {
+        b"".as_slice()
+    } else {
+        path_field(&header[PREFIX_OFF..PREFIX_OFF + PREFIX_LEN])
+    };
 
     let path = crate::rawpath::join(prefix, name);
 
-    let mode = parse_numeric(&header[MODE_OFF..MODE_OFF + 8])? as u32;
-    let uid = parse_numeric(&header[UID_OFF..UID_OFF + 8])? as u32;
-    let gid = parse_numeric(&header[GID_OFF..GID_OFF + 8])? as u32;
+    let mode = parse_u32_field(&header[MODE_OFF..MODE_OFF + 8], "mode")?;
+    let uid = parse_u32_field(&header[UID_OFF..UID_OFF + 8], "uid")?;
+    let gid = parse_u32_field(&header[GID_OFF..GID_OFF + 8], "gid")?;
     let declared_size = parse_numeric(&header[SIZE_OFF..SIZE_OFF + 12])?;
     let mtime = parse_signed_numeric(&header[MTIME_OFF..MTIME_OFF + 12])?;
 
     let typeflag = header[TYPEFLAG_OFF];
     let flag = parse_typeflag(typeflag);
-    let entry_type = flag.entry_type();
+    let entry_type = if is_old_style_directory(typeflag, name, declared_size) {
+        EntryType::Directory
+    } else {
+        flag.entry_type()
+    };
     let size = rule.data_size(entry_type, declared_size);
 
     let linkname = path_field(&header[LINKNAME_OFF..LINKNAME_OFF + LINKNAME_LEN]);
@@ -347,8 +358,8 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
     let gname = name_field(&header[GNAME_OFF..GNAME_OFF + GNAME_LEN]);
 
     // Parse device major/minor for block/char devices
-    let devmajor = parse_numeric(&header[DEVMAJOR_OFF..DEVMAJOR_OFF + 8])? as u32;
-    let devminor = parse_numeric(&header[DEVMINOR_OFF..DEVMINOR_OFF + 8])? as u32;
+    let devmajor = parse_u32_field(&header[DEVMAJOR_OFF..DEVMAJOR_OFF + 8], "devmajor")?;
+    let devminor = parse_u32_field(&header[DEVMINOR_OFF..DEVMINOR_OFF + 8], "devminor")?;
 
     Ok(ArchiveEntry {
         path,
@@ -394,6 +405,31 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
     })
 }
 
+/// Whether this is an old GNU header: magic "ustar " and version " \0", as
+/// GNU tar wrote before POSIX ustar, with no prefix field.
+fn is_old_gnu(header: &[u8; BLOCK_SIZE]) -> bool {
+    &header[MAGIC_OFF..VERSION_OFF + VERSION_LEN] == b"ustar  \0"
+}
+
+/// Whether a header is a directory by the convention that predates typeflag
+/// 5: a regular-file header whose name ends in a slash. GNU and BSD tar both
+/// still read it so. Only an empty one: a header that records data is a
+/// regular file whatever it is called, and its data has to be stepped over
+/// as such.
+fn is_old_style_directory(typeflag: u8, name: &[u8], declared_size: u64) -> bool {
+    matches!(typeflag, REGTYPE | AREGTYPE) && name.ends_with(b"/") && declared_size == 0
+}
+
+/// A numeric field that holds a 32-bit value: a mode, an id, a device number.
+///
+/// The base-256 form can hold far more. Truncating it is not a value the
+/// archive gave: a uid of 2^32 became 0 -- root, on a setuid file.
+fn parse_u32_field(bytes: &[u8], what: &str) -> PaxResult<u32> {
+    let value = parse_numeric(bytes)?;
+    u32::try_from(value)
+        .map_err(|_| PaxError::InvalidHeader(format!("{what} field out of range: {value}")))
+}
+
 /// Parse a NUL-terminated or space-padded string field.
 ///
 /// Used for the space-padded fields (uname, gname) and as the basis for the
@@ -436,6 +472,9 @@ pub(crate) fn name_field(bytes: &[u8]) -> &[u8] {
 /// Parse an octal number from bytes
 pub(crate) fn parse_octal(bytes: &[u8]) -> PaxResult<u64> {
     let s = parse_string(bytes);
+    // Historical writers pad on the left with spaces ("%6o "), as format
+    // detection has always accepted.
+    let s = s.trim_start_matches(' ');
     if s.is_empty() {
         return Ok(0);
     }
@@ -443,7 +482,7 @@ pub(crate) fn parse_octal(bytes: &[u8]) -> PaxResult<u64> {
     if s.starts_with('+') || s.starts_with('-') {
         return Err(PaxError::InvalidHeader(format!("invalid octal: {}", s)));
     }
-    u64::from_str_radix(&s, 8).map_err(|_| PaxError::InvalidHeader(format!("invalid octal: {}", s)))
+    u64::from_str_radix(s, 8).map_err(|_| PaxError::InvalidHeader(format!("invalid octal: {}", s)))
 }
 
 /// What a header's typeflag means, and why.
@@ -538,6 +577,21 @@ fn read_block(reader: &mut impl Read) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
     Ok(crate::formats::read_header(reader, &mut block)?.then_some(block))
 }
 
+/// The block after a zero block, or `None` when the archive ends inside it.
+///
+/// An archive cut off inside the second block of its end-of-archive
+/// indicator is complete: the first zero block already ended it, and bsdtar
+/// reads it as such. Only a cut inside something that is not zeros is a
+/// truncated header.
+fn read_block_after_zero(reader: &mut impl Read) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
+    let mut block = [0u8; BLOCK_SIZE];
+    match crate::formats::read_up_to(reader, &mut block)? {
+        BLOCK_SIZE => Ok(Some(block)),
+        _ if is_zero_block(&block) => Ok(None),
+        _ => Err(crate::formats::truncated_header()),
+    }
+}
+
 /// What [`next_header_block`] makes of a single zero block followed by a
 /// header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -575,7 +629,7 @@ pub(crate) fn next_header_block(
         return Ok(Some(block));
     }
 
-    match read_block(reader)? {
+    match read_block_after_zero(reader)? {
         // Two zero blocks, or one followed by end of file: a proper end.
         None => Ok(None),
         Some(next) if is_zero_block(&next) => Ok(None),
@@ -648,9 +702,9 @@ fn parse_base256(bytes: &[u8]) -> PaxResult<Option<i64>> {
 /// a long link target and a long name, so a reader that assumes exactly one
 /// record mistakes the second record's *header* for the member, and then reads
 /// the real member header as an ordinary one -- restoring it under the
-/// truncated name it was trying to avoid. `consume_long_name_group` consumes the
-/// whole run.
-pub(crate) fn consume_long_name_record(
+/// truncated name it was trying to avoid. [`LongNameGroup`] gathers the whole
+/// run.
+fn consume_long_name_record(
     reader: &mut impl Read,
     header: &[u8; BLOCK_SIZE],
     what: &str,
@@ -667,6 +721,83 @@ pub(crate) fn consume_long_name_record(
     Ok(data[..end].to_vec())
 }
 
+/// The GNU long-name records read so far ahead of a member, which describe
+/// that member rather than files of their own.
+///
+/// Implementing the extension is separate work. What this avoids is the
+/// alternative: extracting `././@LongLink` as a file of its own and the member
+/// under a name truncated to 100 bytes -- two wrong files, and the name that
+/// got path-checked is not the name the archive meant. So the member they
+/// describe is skipped, unless something else names it in full (see
+/// [`superseded`](Self::superseded)).
+#[derive(Default)]
+pub(crate) struct LongNameGroup {
+    /// The `L` record's value: the member's name.
+    name: Option<Vec<u8>>,
+    /// Whether there was a `K` record, the member's link target.
+    link: bool,
+    /// What each record was, for the diagnostic.
+    kinds: Vec<&'static str>,
+    /// The last record's own name field, which is all there is to name the
+    /// group by when no `L` record or member follows.
+    record_name: Vec<u8>,
+}
+
+impl LongNameGroup {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.kinds.is_empty()
+    }
+
+    /// Read the record whose header is `header`, of the kind `what`.
+    pub(crate) fn consume(
+        &mut self,
+        reader: &mut impl Read,
+        header: &[u8; BLOCK_SIZE],
+        what: &'static str,
+    ) -> PaxResult<()> {
+        let value = consume_long_name_record(reader, header, what)?;
+        // The `L` record holds the name; `K` holds the link target, which is
+        // not what the member is called.
+        if header[TYPEFLAG_OFF] == b'L' {
+            self.name = Some(value);
+        } else {
+            self.link = true;
+        }
+        self.kinds.push(what);
+        self.record_name = path_field(&header[NAME_OFF..NAME_OFF + NAME_LEN]).to_vec();
+        Ok(())
+    }
+
+    /// Whether the member's pax records name everything these records do --
+    /// a `path` for an `L`, a `linkpath` for a `K` -- so that they are moot:
+    /// a pax record overrides the header it describes, however that header's
+    /// own fields were spelt.
+    pub(crate) fn superseded(&self, path: bool, linkpath: bool) -> bool {
+        (self.name.is_none() || path) && (!self.link || linkpath)
+    }
+
+    /// Name the member that is being skipped, and the extensions that
+    /// describe it. `member` is its header, or `None` when the archive ended
+    /// before one.
+    pub(crate) fn report(&self, member: Option<&[u8; BLOCK_SIZE]>) {
+        // The long name if the archive gave one, otherwise the truncated name
+        // in the member's own header -- which is all there is to go on for a
+        // lone `K`.
+        let name = match (&self.name, member) {
+            (Some(n), _) => n.as_slice(),
+            (None, Some(member)) => path_field(&member[NAME_OFF..NAME_OFF + NAME_LEN]),
+            (None, None) => &self.record_name,
+        };
+        crate::error::report_error(
+            &crate::rawpath::from_bytes(name),
+            format!(
+                "uses {}, which is not supported; skipping the member",
+                self.kinds.join(" and ")
+            ),
+        );
+    }
+}
+
 /// Consume every long-name record preceding a member, and the member's header,
 /// and report the whole group as unsupported.
 ///
@@ -675,32 +806,20 @@ pub(crate) fn consume_long_name_record(
 /// next read is the following member; or `None` when the archive ends after
 /// the records, with no member for them to describe. That is the end of the
 /// archive, and the caller must not read on past the indicator just consumed.
-///
-/// Implementing the extension is separate work. What this avoids is the
-/// alternative: extracting `././@LongLink` as a file of its own and the member
-/// under a name truncated to 100 bytes -- two wrong files, and the name that
-/// got path-checked is not the name the archive meant.
-pub(crate) fn consume_long_name_group(
+fn consume_long_name_group(
     reader: &mut impl Read,
     mut header: [u8; BLOCK_SIZE],
     rule: SizeRule,
     lone_zero: LoneZeroBlock,
 ) -> PaxResult<Option<u64>> {
-    let mut long_name: Option<Vec<u8>> = None;
-    let mut kinds: Vec<&'static str> = Vec::new();
+    let mut group = LongNameGroup::default();
 
     while let Some(what) = long_name_record(header[TYPEFLAG_OFF]) {
-        let value = consume_long_name_record(reader, &header, what)?;
-        // The `L` record holds the name; `K` holds the link target, which is
-        // not what the member is called.
-        if header[TYPEFLAG_OFF] == b'L' {
-            long_name = Some(value);
-        }
-        kinds.push(what);
+        group.consume(reader, &header, what)?;
 
         let Some(next) = next_header_block(reader, lone_zero)? else {
             // The archive ends after the record, with no member to skip.
-            report_long_name_group(&long_name, &header, &kinds);
+            group.report(None);
             return Ok(None);
         };
         if !verify_checksum(&next) {
@@ -710,48 +829,54 @@ pub(crate) fn consume_long_name_group(
     }
 
     // `header` is now the member the records described.
-    report_long_name_group(&long_name, &header, &kinds);
-    member_data_size(&header, rule).map(Some)
-}
-
-/// Name the member that is being skipped, and the extensions that describe it.
-fn report_long_name_group(
-    long_name: &Option<Vec<u8>>,
-    member: &[u8; BLOCK_SIZE],
-    kinds: &[&'static str],
-) {
-    // The long name if the archive gave one, otherwise the truncated name in
-    // the member's own header -- which is all there is to go on for a lone `K`.
-    let name = match long_name {
-        Some(n) => crate::rawpath::from_bytes(n),
-        None => crate::rawpath::from_bytes(path_field(&member[NAME_OFF..NAME_OFF + NAME_LEN])),
-    };
-    crate::error::report_error(
-        &name,
-        format!(
-            "uses {}, which is not supported; skipping the member",
-            kinds.join(" and ")
-        ),
-    );
+    group.report(Some(&header));
+    member_data_size(&header, rule, None).map(Some)
 }
 
 /// The length of the data that follows a member header, by the same rule
 /// `parse_header` applies, without interpreting the rest of the header.
-fn member_data_size(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResult<u64> {
-    let declared = parse_numeric(&header[SIZE_OFF..SIZE_OFF + 12])?;
+/// `size_record` is a pax `size` record for the member, which replaces the
+/// size field.
+pub(crate) fn member_data_size(
+    header: &[u8; BLOCK_SIZE],
+    rule: SizeRule,
+    size_record: Option<u64>,
+) -> PaxResult<u64> {
+    let declared = match size_record {
+        Some(size) => size,
+        None => parse_numeric(&header[SIZE_OFF..SIZE_OFF + 12])?,
+    };
     let entry_type = parse_typeflag(header[TYPEFLAG_OFF]).entry_type();
     Ok(rule.data_size(entry_type, declared))
 }
 
-/// Verify header checksum
+/// Verify header checksum.
+///
+/// POSIX sums the bytes as unsigned, but historical implementations summed
+/// them as signed chars, and the two differ for a header with any byte above
+/// 127. Either is accepted, as GNU and BSD tar accept them.
 pub(crate) fn verify_checksum(header: &[u8; BLOCK_SIZE]) -> bool {
-    let stored = match parse_octal(&header[CHKSUM_OFF..CHKSUM_OFF + 8]) {
-        Ok(v) => v as u32,
-        Err(_) => return false,
+    let Ok(stored) = parse_octal(&header[CHKSUM_OFF..CHKSUM_OFF + 8]) else {
+        return false;
     };
+    stored == u64::from(calculate_checksum(header))
+        || i64::try_from(stored).is_ok_and(|s| s == signed_checksum(header))
+}
 
-    let calculated = calculate_checksum(header);
-    stored == calculated
+/// The checksum as a historical implementation computed it: the header bytes
+/// summed as signed chars, the checksum field as spaces.
+fn signed_checksum(header: &[u8; BLOCK_SIZE]) -> i64 {
+    header
+        .iter()
+        .enumerate()
+        .map(|(i, &byte)| {
+            if (CHKSUM_OFF..CHKSUM_OFF + 8).contains(&i) {
+                i64::from(b' ')
+            } else {
+                i64::from(byte as i8)
+            }
+        })
+        .sum()
 }
 
 /// Calculate header checksum
@@ -876,8 +1001,11 @@ pub(crate) fn split_name_prefix(path: &[u8]) -> Option<(&[u8], &[u8])> {
         return Some((path, b""));
     }
 
-    // Split at the highest '/' that leaves a name of at most NAME_LEN bytes.
-    for i in (1..=PREFIX_LEN.min(path.len().saturating_sub(1))).rev() {
+    // Split at the highest '/' that leaves a name of at most NAME_LEN bytes,
+    // and of at least one byte before any trailing '/': a directory's own
+    // trailing slash is no place to split, and left the name field empty --
+    // which an old reader takes for the end of the archive.
+    for i in (1..=PREFIX_LEN.min(path.len().saturating_sub(2))).rev() {
         if path[i] == b'/' && path.len() - (i + 1) <= NAME_LEN {
             return Some((&path[i + 1..], &path[..i]));
         }

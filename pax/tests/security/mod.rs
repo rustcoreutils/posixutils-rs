@@ -407,12 +407,24 @@ fn test_symlink_size_field_does_not_hide_the_next_member() {
 /// read a bsdtar archive written with linkdata.
 #[test]
 fn test_hardlink_size_field_is_honoured_in_pax_format() {
+    // A `g` header is what makes this a pax archive rather than a ustar one,
+    // where typeflag 1 never has data.
+    let comment = pax_record("comment", b"pax");
     let mut archive = Ustar {
-        name: b"a.txt",
-        body: b"aa\n",
+        name: b"PaxHeaders/g",
+        typeflag: b'g',
+        body: &comment,
         ..Default::default()
     }
     .member();
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"a.txt",
+            body: b"aa\n",
+            ..Default::default()
+        }
+        .member(),
+    );
     archive.extend_from_slice(
         &Ustar {
             name: b"b.txt",

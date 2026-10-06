@@ -384,13 +384,11 @@ fn extract_entry<R: ArchiveReader>(
             archive.skip_data()?;
         }
         EntryType::Socket => {
-            // Sockets cannot be extracted from archives
-            if options.verbose {
-                let mut line =
-                    format!("{}: skipping socket: ", crate::error::program_name()).into_bytes();
-                line.extend_from_slice(crate::rawpath::as_bytes(&member.display));
-                crate::escape::write_stderr_line(&line);
-            }
+            // Nothing makes a socket out of an archive member: bind(2)
+            // creates one only to listen on. libarchive refuses one the same
+            // way; skipping it in silence reported an incomplete extraction
+            // as a complete one.
+            crate::error::report_error(&member.display, "cannot create a socket; skipped");
             archive.skip_data()?;
         }
     }

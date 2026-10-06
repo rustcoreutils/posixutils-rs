@@ -1920,6 +1920,21 @@ impl Instruction {
         }
     }
 
+    /// The builtin by which this instruction names its function's caller's
+    /// variadic arguments: `__builtin_va_arg_pack_len()`, or a call ending in
+    /// `__builtin_va_arg_pack()`. `None` for every other instruction. A
+    /// function with one is a forwarder, which only a call site it is
+    /// inlined into can complete.
+    pub fn va_arg_pack_builtin(&self) -> Option<&'static str> {
+        if self.op == Opcode::VaArgPackLen {
+            Some("__builtin_va_arg_pack_len")
+        } else if self.extra().ends_with_va_arg_pack {
+            Some("__builtin_va_arg_pack")
+        } else {
+            None
+        }
+    }
+
     /// The function in this module a direct call may run, by name.
     ///
     /// `None` for anything but a direct call, and for a call to a library

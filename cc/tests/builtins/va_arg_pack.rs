@@ -231,3 +231,94 @@ int main(void)
         );
     }
 }
+
+/// The forwarding wrapper and the program around it, with `body` -- straight
+/// line code of whatever size a test needs -- in `caller`, which also calls
+/// the wrapper once. `seen` adds up the first argument each forwarded call
+/// delivers.
+fn forwarding_program(caller: &str) -> String {
+    format!(
+        r#"
+#include <stdarg.h>
+static int seen;
+static int target(const char *f, ...) {{
+    va_list ap;
+    va_start(ap, f);
+    seen += va_arg(ap, int);
+    va_end(ap);
+    return 0;
+}}
+
+__attribute__((always_inline)) static inline int wrap(const char *f, ...) {{
+    return target(f, __builtin_va_arg_pack());
+}}
+
+volatile int vals[8] = {{1, 2, 3, 4, 5, 6, 7, 8}};
+{caller}
+"#
+    )
+}
+
+/// `count` statements of straight-line code, each a few instructions.
+fn straight_line(count: usize) -> String {
+    (0..count)
+        .map(|i| format!("    acc += vals[{}] * {i};\n", i % 8))
+        .collect()
+}
+
+/// A recursive caller of any size still inlines a forwarder, which has no
+/// out-of-line form to call instead: c17's stack-depth cap on inlining into a
+/// recursive function does not apply. jansson's `do_dump` calls `snprintf`,
+/// isl's `print_help` calls `printf`, and gcc inlines both.
+#[test]
+fn builtins_va_arg_pack_forwarder_in_large_recursive_caller() {
+    let code = forwarding_program(&format!(
+        r#"
+static long walk(int n) {{
+    long acc = 0;
+{}
+    wrap("%d", n);
+    if (n > 0)
+        acc += walk(n - 1);
+    return acc;
+}}
+
+int main(void) {{
+    walk(3);
+    return seen == 6 ? 0 : 1;
+}}
+"#,
+        straight_line(64)
+    ));
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run("va_pack_recursive_caller", &code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}
+
+/// A caller past c17's own size cap on inlining -- bzip2's `sendMTFValues`,
+/// mpfr's test `main`s -- still inlines a forwarder. gcc has no such cap.
+#[test]
+fn builtins_va_arg_pack_forwarder_in_huge_caller() {
+    let code = forwarding_program(&format!(
+        r#"
+int main(void) {{
+    long acc = 0;
+{}
+    wrap("%d", 5);
+    return seen == 5 && acc != 0 ? 0 : 1;
+}}
+"#,
+        straight_line(1600)
+    ));
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run("va_pack_huge_caller", &code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}

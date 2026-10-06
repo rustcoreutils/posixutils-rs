@@ -292,15 +292,8 @@ struct PackUse {
 /// nothing.
 fn pack_use(func: &Function) -> Option<PackUse> {
     func.blocks.iter().flat_map(|b| &b.insns).find_map(|i| {
-        let builtin = if i.op == Opcode::VaArgPackLen {
-            "__builtin_va_arg_pack_len"
-        } else if i.extra().ends_with_va_arg_pack {
-            "__builtin_va_arg_pack"
-        } else {
-            return None;
-        };
         Some(PackUse {
-            builtin,
+            builtin: i.va_arg_pack_builtin()?,
             pos: i.pos.unwrap_or_default(),
         })
     })

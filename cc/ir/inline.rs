@@ -174,6 +174,11 @@ pub struct InlineCandidate {
     /// be copied because it receives a non-local goto"), and neither does
     /// c17: the resume point belongs to the function's own frame.
     pub receives_nonlocal_goto: bool,
+    /// Whether the function forwards its caller's variadic arguments with
+    /// `__builtin_va_arg_pack()` or `__builtin_va_arg_pack_len()`. Such a
+    /// function has no out-of-line form -- what it forwards exists only at a
+    /// call site -- so every call must be spliced, whatever c17's own caps say.
+    pub forwards_caller_arguments: bool,
     /// Number of times this function is called in the module
     pub call_count: usize,
     /// Whether the function returns a complex value (should not inline)
@@ -277,6 +282,9 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
     // Check for disqualifying patterns
     for bb in &func.blocks {
         for insn in &bb.insns {
+            if insn.va_arg_pack_builtin().is_some() {
+                candidate.forwards_caller_arguments = true;
+            }
             match insn.op {
                 Opcode::VaStart => {
                     candidate.defines_varargs_frame = true;
@@ -334,6 +342,16 @@ fn should_inline(
     // assumption it always inlines, it left an undefined symbol at link.
     if candidate.cannot_be_inlined() {
         return false;
+    }
+
+    // A forwarder has no out-of-line form to call instead, so none of the
+    // caps below -- all c17's own, none gcc's -- may refuse it: a recursive
+    // caller (jansson's `do_dump` calling `snprintf`) or a huge one (bzip2's
+    // `sendMTFValues` calling `fprintf`) left the call standing and the
+    // program rejected. Its body is one call, so the stack the caps guard
+    // barely grows.
+    if candidate.forwards_caller_arguments {
+        return true;
     }
 
     // Consuming a `va_list` is safe to splice, but it is only done on request.
@@ -1906,6 +1924,7 @@ mod tests {
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
+            forwards_caller_arguments: false,
             isa: Default::default(),
         };
 
@@ -1940,6 +1959,7 @@ mod tests {
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
+            forwards_caller_arguments: false,
             isa: Default::default(),
         };
 
@@ -1992,6 +2012,7 @@ mod tests {
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
+            forwards_caller_arguments: false,
             isa: Default::default(),
         };
 
@@ -2020,6 +2041,7 @@ mod tests {
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
+            forwards_caller_arguments: false,
             isa: Default::default(),
         };
 
@@ -2048,6 +2070,7 @@ mod tests {
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
+            forwards_caller_arguments: false,
             isa: Default::default(),
         };
 
@@ -2076,6 +2099,7 @@ mod tests {
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
+            forwards_caller_arguments: false,
             isa: Default::default(),
         };
 
@@ -2096,6 +2120,42 @@ mod tests {
             &candidate_no_hint,
             opt_at(1),
             CallerSize::unchanged(100),
+            false
+        ));
+    }
+
+    /// c17's caps on the caller -- its stack in a recursive function, its
+    /// size in any -- refuse a plain `always_inline` callee, which is then an
+    /// ordinary call. A `__builtin_va_arg_pack` forwarder has no ordinary call
+    /// to fall back on, so they never refuse one; what makes a splice
+    /// impossible still does.
+    #[test]
+    fn test_forwarder_ignores_the_caller_caps() {
+        let forced = InlineCandidate {
+            estimated_size: 4,
+            is_always_inline: true,
+            ..Default::default()
+        };
+        let forwarder = InlineCandidate {
+            forwards_caller_arguments: true,
+            ..forced.clone()
+        };
+        let huge = CallerSize::unchanged(HARD_CALLER_SIZE_CAP + 1);
+        let recursive_large = CallerSize::unchanged(RECURSIVE_CALLER_MAX_STACK);
+        for opt in [opt_at(0), opt_at(2)] {
+            assert!(!should_inline(&forced, opt, huge, false));
+            assert!(!should_inline(&forced, opt, recursive_large, true));
+            assert!(should_inline(&forwarder, opt, huge, false));
+            assert!(should_inline(&forwarder, opt, recursive_large, true));
+        }
+        let noinline = InlineCandidate {
+            is_noinline: true,
+            ..forwarder
+        };
+        assert!(!should_inline(
+            &noinline,
+            opt_at(2),
+            CallerSize::unchanged(10),
             false
         ));
     }

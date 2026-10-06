@@ -16,7 +16,7 @@ use crate::options::{
     format_list_entry, format_mode_symbolic, format_time_traditional, FormatOptions, ListEntryInfo,
 };
 use crate::pattern::{find_matching_pattern_subtree, matches_excluded, Pattern};
-use crate::subst::{apply_substitutions, SubstResult, Substitution};
+use crate::subst::Substitution;
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -102,35 +102,15 @@ fn list_entries<R: ArchiveReader, W: Write>(
             // `-o keyword:=value` forces a value regardless of what the archive
             // carried, and the listing must report what extraction would use.
             crate::modes::read::apply_keyword_overrides(&mut entry, &options.format_options);
-            // Apply substitutions
-            if !options.substitutions.is_empty() {
-                match apply_substitutions(&options.substitutions, &entry.path) {
-                    SubstResult::Unchanged => {
-                        // Keep the original bytes.
-                    }
-                    SubstResult::Changed(new_path) => {
-                        entry.path = crate::rawpath::from_substituted(&new_path);
-                    }
-                    SubstResult::Empty => {
-                        // Skip this entry
-                        archive.skip_data()?;
-                        continue;
-                    }
-                }
-            }
-            // --strip-components reshapes the name the listing reports, so that
-            // `tar -t` shows what `tar -x` would create.
-            if options.strip_components > 0 {
-                match crate::modes::read::strip_leading_components(
-                    &entry.path,
-                    options.strip_components,
-                ) {
-                    Some(stripped) => entry.path = stripped,
-                    None => {
-                        archive.skip_data()?;
-                        continue;
-                    }
-                }
+            // Rename as extraction would, hard link targets included, so the
+            // listing shows the names `-r` would create (`tar -t` what `tar -x`).
+            if !crate::modes::read::rename_member(
+                &mut entry,
+                &options.substitutions,
+                options.strip_components,
+            ) {
+                archive.skip_data()?;
+                continue;
             }
             let linked_to = link_set_target(&mut link_sets, &entry);
             if let Err(e) = print_entry(writer, &entry, linked_to.as_deref(), options) {

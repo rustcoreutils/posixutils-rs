@@ -23,7 +23,7 @@
 
 use crate::error::{PaxError, PaxResult};
 use plib::regex::{Match, Regex, RegexFlags, MAX_CAPTURES};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A compiled substitution expression from -s option
 #[derive(Debug)]
@@ -298,10 +298,30 @@ fn parse_delimited(s: &str, delimiter: char) -> PaxResult<(String, String)> {
     Ok((result, remaining))
 }
 
-/// Apply a list of substitutions to a path
-///
-/// Substitutions are applied in order. The first one that matches
-/// (produces a change) wins, and no further substitutions are tried.
+/// The name a member takes under the `-s` expressions, or `None` when it
+/// becomes the empty string and so is to be ignored. A `p` expression reports
+/// the rewrite on standard error.
+pub fn substitute_name(substitutions: &[Substitution], path: &Path) -> Option<PathBuf> {
+    substituted(substitutions, path, true)
+}
+
+/// The `-s` rewrite of a hard link's target, which is the name of another
+/// member and so has to follow wherever `-s` moved that member. Not reported
+/// under `p`: the rename is the target member's, and was reported for it.
+pub fn substitute_link_target(substitutions: &[Substitution], path: &Path) -> Option<PathBuf> {
+    substituted(substitutions, path, false)
+}
+
+fn substituted(substitutions: &[Substitution], path: &Path, report: bool) -> Option<PathBuf> {
+    match apply_substitutions(substitutions, path, report) {
+        // Keep the original bytes: this is the only case that round-trips a
+        // name that is not UTF-8 exactly.
+        SubstResult::Unchanged => Some(path.to_path_buf()),
+        SubstResult::Changed(new) => Some(crate::rawpath::from_substituted(&new)),
+        SubstResult::Empty => None,
+    }
+}
+
 /// Apply the `-s` expressions to a member name, in order, stopping at the
 /// first that changes it.
 ///
@@ -309,13 +329,13 @@ fn parse_delimited(s: &str, delimiter: char) -> PaxResult<(String, String)> {
 /// report the name as it really is. The matching itself is still done on the
 /// lossy form -- see `crate::rawpath::MatchName` -- which is why the left-hand
 /// side of the report comes from `path` and not from what the regex saw.
-pub fn apply_substitutions(substitutions: &[Substitution], path: &Path) -> SubstResult {
+fn apply_substitutions(substitutions: &[Substitution], path: &Path, report: bool) -> SubstResult {
     let name = crate::rawpath::MatchName::of(path);
     for subst in substitutions {
         match subst.apply(name.as_str()) {
             SubstResult::Unchanged => continue,
             result => {
-                if subst.print {
+                if report && subst.print {
                     let mut line = Vec::new();
                     line.extend_from_slice(crate::rawpath::as_bytes(path));
                     line.extend_from_slice(b" >> ");
@@ -548,7 +568,7 @@ mod tests {
             Substitution::parse("/foo/second/").unwrap(),
         ];
         assert_eq!(
-            apply_substitutions(&subs, Path::new("foo")),
+            apply_substitutions(&subs, Path::new("foo"), false),
             SubstResult::Changed("first".to_string())
         );
     }
@@ -560,7 +580,7 @@ mod tests {
             Substitution::parse("/foo/second/").unwrap(),
         ];
         assert_eq!(
-            apply_substitutions(&subs, Path::new("foo")),
+            apply_substitutions(&subs, Path::new("foo"), false),
             SubstResult::Changed("second".to_string())
         );
     }
@@ -572,7 +592,7 @@ mod tests {
             Substitution::parse("/yyy/second/").unwrap(),
         ];
         assert_eq!(
-            apply_substitutions(&subs, Path::new("foo")),
+            apply_substitutions(&subs, Path::new("foo"), false),
             SubstResult::Unchanged
         );
     }

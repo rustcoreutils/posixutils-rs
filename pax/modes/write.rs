@@ -15,7 +15,7 @@ use crate::formats::{checksum_bytes, CpioFormat, CpioWriter, PaxWriter, UstarWri
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::options::FormatOptions;
 use crate::pattern::{matches_excluded, Pattern};
-use crate::subst::{apply_substitutions, SubstResult, Substitution};
+use crate::subst::{substitute_name, Substitution};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
@@ -272,21 +272,26 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
         }
     }
 
+    /// Whether to walk into a directory, recording its device for `-X` when so.
+    fn descend(&self, metadata: &ftw::Metadata) -> bool {
+        if self.options.no_recurse {
+            return false;
+        }
+        self.dev_stack.borrow_mut().push(metadata.dev());
+        true
+    }
+
     fn archive_entry(
         &self,
         entry: &ftw::Entry<'_>,
         path: &Path,
         metadata: &ftw::Metadata,
     ) -> PaxResult<bool> {
-        // Apply substitutions first (per POSIX: -s applies before -i)
-        let archive_path = if !self.options.substitutions.is_empty() {
-            match apply_substitutions(&self.options.substitutions, path) {
-                SubstResult::Unchanged => path.to_path_buf(),
-                SubstResult::Changed(new_path) => crate::rawpath::from_substituted(&new_path),
-                SubstResult::Empty => return Ok(false), // Skip this file
-            }
-        } else {
-            path.to_path_buf()
+        // Apply substitutions first (per POSIX: -s applies before -i). A name
+        // that becomes empty is ignored -- that name only: a directory's
+        // descendants are still archived, each under its own substitution.
+        let Some(archive_path) = substitute_name(&self.options.substitutions, path) else {
+            return Ok(metadata.is_dir() && self.descend(metadata));
         };
 
         // Handle interactive rename
@@ -333,11 +338,7 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
                 archive.write_entry(&dir_entry)?;
                 archive.finish_entry()?;
             }
-            if self.options.no_recurse {
-                return Ok(false);
-            }
-            self.dev_stack.borrow_mut().push(metadata.dev());
-            return Ok(true);
+            return Ok(self.descend(metadata));
         }
 
         if metadata.is_symlink() {

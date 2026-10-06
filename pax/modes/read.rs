@@ -18,7 +18,7 @@ use crate::modes::anchored::{
     DirTree, MemberPath,
 };
 use crate::pattern::{find_matching_pattern_subtree, matches_excluded, Pattern};
-use crate::subst::{apply_substitutions, SubstResult, Substitution};
+use crate::subst::{substitute_link_target, substitute_name, Substitution};
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
 use std::fs::File;
@@ -156,45 +156,12 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
             // Apply `-o keyword:=value` overrides before substitutions/rename so a
             // forced path/uid/gid/etc. takes effect on the extracted file.
             apply_keyword_overrides(&mut entry, &options.format_options);
-            // Apply substitutions first (per POSIX: -s applies before -i)
-            if !options.substitutions.is_empty() {
-                match apply_substitutions(&options.substitutions, &entry.path) {
-                    SubstResult::Unchanged => {
-                        // Keep the original bytes: this is the only case that
-                        // round-trips a name that is not UTF-8 exactly.
-                    }
-                    SubstResult::Changed(new_path) => {
-                        entry.path = crate::rawpath::from_substituted(&new_path);
-                    }
-                    SubstResult::Empty => {
-                        // Skip this entry
-                        archive.skip_data()?;
-                        continue;
-                    }
-                }
-            }
-
-            // --strip-components reshapes the member name before it is offered
-            // for renaming, so an interactive prompt shows the name that will
-            // actually be created. A member with no components left over names
-            // nothing to extract and is dropped, as GNU tar does.
-            if options.strip_components > 0 {
-                match strip_leading_components(&entry.path, options.strip_components) {
-                    Some(stripped) => entry.path = stripped,
-                    None => {
-                        archive.skip_data()?;
-                        continue;
-                    }
-                }
-                // A hard link's target is another member name, so it has to be
-                // stripped in step. A symlink's target is not: it is resolved in
-                // the extracted tree and must be left alone.
-                if entry.entry_type == EntryType::Hardlink {
-                    if let Some(target) = &entry.link_target {
-                        entry.link_target =
-                            strip_leading_components(target, options.strip_components);
-                    }
-                }
+            // -s, then --strip-components, both before the name is offered for
+            // renaming (POSIX: -s applies before -i), so an interactive prompt
+            // shows the name that will actually be created.
+            if !rename_member(&mut entry, &options.substitutions, options.strip_components) {
+                archive.skip_data()?;
+                continue;
             }
 
             // Handle interactive rename if enabled
@@ -304,6 +271,42 @@ pub(crate) fn apply_keyword_overrides(
             other => entry.set_ext_record(other, value),
         }
     }
+}
+
+/// Rename a member the way -s and --strip-components direct. `false` when its
+/// own name is dropped -- substituted to the empty string, or left with no
+/// components -- and the member is to be ignored, as POSIX says of `-s`.
+///
+/// A hard link's target is another member's name, so it is renamed in step:
+/// leaving it alone linked the renamed member to whatever file sat at the old
+/// name, or to nothing. A symlink's target is its contents, not a member name;
+/// it is resolved in the extracted tree, and `-s` leaves it alone (the `s`
+/// flag). A target that is itself dropped becomes `None`: the member it names
+/// was never extracted, and the link is diagnosed as having nothing to link to.
+pub(crate) fn rename_member(
+    entry: &mut ArchiveEntry,
+    substitutions: &[Substitution],
+    strip_components: usize,
+) -> bool {
+    let strip = |name: PathBuf| {
+        if strip_components == 0 {
+            Some(name)
+        } else {
+            strip_leading_components(&name, strip_components)
+        }
+    };
+    let Some(path) = substitute_name(substitutions, &entry.path).and_then(strip) else {
+        return false;
+    };
+    entry.path = path;
+    if entry.entry_type == EntryType::Hardlink {
+        entry.link_target = entry
+            .link_target
+            .as_deref()
+            .and_then(|target| substitute_link_target(substitutions, target))
+            .and_then(strip);
+    }
+    true
 }
 
 /// Drop the first `n` pathname components from an archive member name.
@@ -1208,6 +1211,44 @@ mod tests {
         };
         let attrs = attrs_of(&bare);
         assert_eq!((attrs.uid, attrs.gid), (7, 8));
+    }
+
+    #[test]
+    fn test_rename_member_renames_hardlink_target_only() {
+        let subs = [Substitution::parse(",^,P/,").unwrap()];
+        let linked = |entry_type| {
+            let mut entry = ArchiveEntry::new(PathBuf::from("b"), entry_type);
+            entry.link_target = Some(PathBuf::from("a"));
+            entry
+        };
+
+        // A hard link's target is a member name and follows the member.
+        let mut hard = linked(EntryType::Hardlink);
+        assert!(rename_member(&mut hard, &subs, 0));
+        assert_eq!(hard.path, PathBuf::from("P/b"));
+        assert_eq!(hard.link_target, Some(PathBuf::from("P/a")));
+
+        // A symlink's target is its contents, and stays as archived.
+        let mut soft = linked(EntryType::Symlink);
+        assert!(rename_member(&mut soft, &subs, 0));
+        assert_eq!(soft.link_target, Some(PathBuf::from("a")));
+
+        // Substitution, then stripping, applies to the target as well.
+        let mut stripped = linked(EntryType::Hardlink);
+        assert!(rename_member(&mut stripped, &subs, 1));
+        assert_eq!(stripped.path, PathBuf::from("b"));
+        assert_eq!(stripped.link_target, Some(PathBuf::from("a")));
+
+        // A target -s ignores leaves the link nothing to link to; the member's
+        // own name is kept so extraction can diagnose it.
+        let drop_a = [Substitution::parse(",^a$,,").unwrap()];
+        let mut orphan = linked(EntryType::Hardlink);
+        assert!(rename_member(&mut orphan, &drop_a, 0));
+        assert_eq!(orphan.link_target, None);
+
+        // A member whose own name is ignored is dropped.
+        let drop_b = [Substitution::parse(",^b$,,").unwrap()];
+        assert!(!rename_member(&mut linked(EntryType::Hardlink), &drop_b, 0));
     }
 
     #[test]

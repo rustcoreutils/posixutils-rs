@@ -21,7 +21,7 @@ use crate::modes::anchored::{
     AttrPolicy, Attrs, DirTree, MemberPath,
 };
 use crate::pattern::{matches_any, Pattern};
-use crate::subst::{apply_substitutions, SubstResult, Substitution};
+use crate::subst::{substitute_name, Substitution};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
@@ -171,7 +171,10 @@ struct CopyWalk<'a> {
     dest_stack: RefCell<Vec<Option<(OwnedFd, Attrs)>>>,
     /// Member names, built by joining as the walk descends rather than derived
     /// from the filesystem path, so selection and substitution see the name an
-    /// archive would record.
+    /// archive would record. These are the names *before* -s and -i: a copy is
+    /// an archive round trip, so each name is substituted once, by itself --
+    /// building a child's name from its parent's substituted one applied the
+    /// substitution again at every level.
     member_stack: RefCell<Vec<PathBuf>>,
     /// `st_dev` of each directory descended into, for `-X`.
     dev_stack: RefCell<Vec<u64>>,
@@ -270,31 +273,6 @@ impl CopyWalk<'_> {
             }
         }
 
-        // -s applies before -i (POSIX: the order of -o, -p and -s is
-        // significant).
-        let member = if self.options.substitutions.is_empty() {
-            member
-        } else {
-            match apply_substitutions(&self.options.substitutions, &member) {
-                SubstResult::Unchanged => member,
-                SubstResult::Changed(new_name) => crate::rawpath::from_substituted(&new_name),
-                SubstResult::Empty => return Ok(false), // a null name means skip
-            }
-        };
-
-        let member = {
-            let mut prompter = self.prompter.borrow_mut();
-            if let Some(ref mut p) = *prompter {
-                match p.prompt(&member)? {
-                    RenameResult::Skip => return Ok(false),
-                    RenameResult::UseOriginal => member,
-                    RenameResult::Rename(new_name) => new_name,
-                }
-            } else {
-                member
-            }
-        };
-
         // A source directory that *is* one of this copy's destinations is one
         // being copied into. Following it walks the copy's own output back
         // into itself until the pathname runs out of room; identity cannot be
@@ -315,11 +293,36 @@ impl CopyWalk<'_> {
             ));
         }
 
+        // -s applies before -i (POSIX: the order of -o, -p and -s is
+        // significant). A name that becomes empty is ignored -- that name
+        // only: a directory's descendants are still copied, each under its
+        // own substitution, as they would be through an archive.
+        let Some(dest) = substitute_name(&self.options.substitutions, &member) else {
+            return if metadata.is_dir() {
+                self.descend(member, None, metadata)
+            } else {
+                Ok(false)
+            };
+        };
+
+        let dest = {
+            let mut prompter = self.prompter.borrow_mut();
+            if let Some(ref mut p) = *prompter {
+                match p.prompt(&dest)? {
+                    RenameResult::Skip => return Ok(false),
+                    RenameResult::UseOriginal => dest,
+                    RenameResult::Rename(new_name) => new_name,
+                }
+            } else {
+                dest
+            }
+        };
+
         if metadata.is_dir() {
-            return self.enter_directory(src, member, metadata);
+            return self.enter_directory(src, member, &dest, metadata);
         }
 
-        let Some(mp) = MemberPath::parse(&member)? else {
+        let Some(mp) = MemberPath::parse(&dest)? else {
             return Ok(false);
         };
 
@@ -388,15 +391,16 @@ impl CopyWalk<'_> {
         &self,
         src: &Path,
         member: PathBuf,
+        dest: &Path,
         metadata: &ftw::Metadata,
     ) -> PaxResult<bool> {
         // `open_dir_at` creates it when missing and otherwise opens what is
         // there with O_DIRECTORY|O_NOFOLLOW, so a symbolic link left in the
         // destination is refused rather than descended through.
-        let dir = if member.as_os_str().is_empty() {
+        let dir = if dest.as_os_str().is_empty() {
             self.tree.root().try_clone_to_owned()?
         } else {
-            let Some(mp) = MemberPath::parse(&member)? else {
+            let Some(mp) = MemberPath::parse(dest)? else {
                 return Ok(false);
             };
             let parent = self.tree.parent_of(&mp, true)?;
@@ -426,12 +430,24 @@ impl CopyWalk<'_> {
 
         // `.` as an operand has no directory of its own to stamp: its children
         // are copied straight into the destination root.
-        let pending = if member.as_os_str().is_empty() {
+        let pending = if dest.as_os_str().is_empty() {
             None
         } else {
             Some((dir, attrs_of(metadata)))
         };
+        self.descend(member, pending, metadata)
+    }
 
+    /// Walk into the source directory `member`, unless -d says not to.
+    /// `pending` is the destination directory to stamp once its contents
+    /// exist, if there is one: not for `.`, nor for a directory whose own name
+    /// -s ignored.
+    fn descend(
+        &self,
+        member: PathBuf,
+        pending: Option<(OwnedFd, Attrs)>,
+        metadata: &ftw::Metadata,
+    ) -> PaxResult<bool> {
         if self.options.no_recurse {
             // No postprocess_dir will fire, so stamp it now.
             if let Some((dir, attrs)) = pending {

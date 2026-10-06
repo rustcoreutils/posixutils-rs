@@ -433,19 +433,22 @@ pub fn permissive_error(pos: Position, msg: &str) {
 }
 
 /// The `-pedantic` switch: whether the diagnostics gcc gives only under
-/// `-Wpedantic` are given, and whether as errors.
+/// `-Wpedantic` are given, and whether gcc's pedwarns are errors.
 ///
-/// These are the constraint violations gcc accepts in silence as GNU
-/// extensions -- a function pointer against `void *`, `int f(...)` -- so they
-/// are off by default here too. Every one goes through [`pedwarn`], which
-/// asks this and nothing else.
+/// gcc has two kinds of pedwarn, and this owns both. Those it gives only
+/// under `-Wpedantic` are the constraint violations it accepts in silence as
+/// GNU extensions -- a function pointer against `void *`, `int f(...)` -- so
+/// they are off by default here too; each goes through [`pedwarn`]. Those it
+/// gives by default are warnings that `-pedantic-errors` makes errors -- a
+/// struct member list with no `;` after its last member; each goes through
+/// [`pedwarn_default`]. Both ask this and nothing else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pedantic {
     /// `-pedantic` or `-Wpedantic`, and not a later `-Wno-pedantic`.
     enabled: bool,
     /// `-pedantic-errors`. gcc keeps it through a later `-Wno-pedantic`,
-    /// which silences the diagnostics outright, and a later `-Wpedantic`
-    /// brings them back as errors.
+    /// which silences the `-Wpedantic` diagnostics outright, and a later
+    /// `-Wpedantic` brings them back as errors.
     errors: bool,
 }
 
@@ -496,21 +499,40 @@ pub fn set_pedantic(p: Pedantic) {
 /// by default, a warning under `-pedantic` or `-Wpedantic`, an error under
 /// `-pedantic-errors`.
 pub fn pedwarn(pos: Position, msg: &str) {
-    let p = PEDANTIC.get();
-    if !p.enabled {
-        return;
+    if PEDANTIC.get().enabled {
+        give_pedwarn(pos, msg);
     }
-    let level = if p.errors {
-        DiagLevel::Error
-    } else {
-        DiagLevel::Warning
-    };
-    do_diag(level, pos, msg);
 }
 
 /// [`pedwarn`] with a translatable template; see [`warning_args`].
 pub fn pedwarn_args(pos: Position, template: &str, args: &[&str]) {
     pedwarn(pos, &gettext_args(template, args));
+}
+
+/// Report a constraint violation gcc diagnoses by default but only warns
+/// about: a warning, and an error under `-pedantic-errors`. `-Wno-pedantic`
+/// does not silence it, as it does not in gcc.
+pub fn pedwarn_default(pos: Position, msg: &str) {
+    give_pedwarn(pos, msg);
+}
+
+/// [`pedwarn_default`] with a translatable template; see [`warning_args`].
+pub fn pedwarn_default_args(pos: Position, template: &str, args: &[&str]) {
+    pedwarn_default(pos, &gettext_args(template, args));
+}
+
+/// A pedwarn that is given: an error under `-pedantic-errors`, a warning
+/// otherwise. As in gcc, `-w` and a system header leave it a warning, which
+/// is then not shown -- `-pedantic-errors` does not reach into libc's
+/// headers, which use the extensions it objects to.
+fn give_pedwarn(pos: Position, msg: &str) {
+    let hidden = warnings_suppressed() || STREAMS.with(|s| s.borrow().is_system(pos.stream));
+    let level = if PEDANTIC.get().errors && !hidden {
+        DiagLevel::Error
+    } else {
+        DiagLevel::Warning
+    };
+    do_diag(level, pos, msg);
 }
 
 pub fn has_error() -> u32 {

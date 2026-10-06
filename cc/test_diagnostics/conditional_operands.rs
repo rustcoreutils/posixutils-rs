@@ -186,3 +186,26 @@ fn conditional_function_pointer_and_void_pointer() {
         null.stderr
     );
 }
+
+/// One `void` arm: C17 6.5.15p3 wants both or neither, but gcc accepts it
+/// silently as an extension and objects only under `-pedantic` ("ISO C
+/// forbids conditional expr with only one void side"), as an error under
+/// `-pedantic-errors`. Used as a statement, the value is discarded anyway.
+#[test]
+fn conditional_with_one_void_arm_is_pedantic_only() {
+    let src = "void f(void);\n\
+               int g(int c, int x) { c ? f() : x; c ? x : f(); c ? f() : (void)x; return 0; }\n";
+    let quiet = crate::test_compile::compile_accepted("void_arm_default", src, &[]);
+    assert!(!quiet.contains("void"), "warned by default:\n{quiet}");
+    for flag in ["-pedantic", "-Wpedantic"] {
+        let loud = crate::test_compile::compile_accepted("void_arm_pedantic", src, &[flag]);
+        assert_eq!(
+            loud.matches("ISO C forbids conditional expr with only one void side")
+                .count(),
+            2,
+            "{flag}:\n{loud}"
+        );
+    }
+    let c = crate::test_compile::compile("void_arm_errors", src, &["-pedantic-errors"]);
+    assert!(!c.success, "{}", c.stderr);
+}

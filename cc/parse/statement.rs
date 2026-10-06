@@ -36,12 +36,12 @@ impl Parser<'_> {
         // end of a block therefore needs the empty one written out. gcc and
         // clang both accept it without, C23 made it legal, and the idiom is
         // common enough in code that jumps to a cleanup label at the end of a
-        // function -- `asm goto`'s own torture test is written that way.
-        // Accepted with a warning rather than invented silently.
+        // function -- `asm goto`'s own torture test is written that way. gcc
+        // says so only under `-pedantic`.
         let stmt = if self.is_special(b'}') {
-            diag::warning(
+            diag::pedwarn(
                 self.current_pos(),
-                &gettext("a label at the end of a compound statement needs a statement in C17"),
+                &gettext("label at end of compound statement"),
             );
             Stmt::Empty
         } else {

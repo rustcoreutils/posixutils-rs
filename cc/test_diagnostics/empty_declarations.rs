@@ -1,4 +1,6 @@
-use crate::test_compile::{compile_expect_error, compile_expect_ok};
+use crate::test_compile::{
+    compile_accepted, compile_expect_error, compile_expect_ok, compile_rejected_with,
+};
 
 // ============================================================================
 // A declaration that declares nothing (C17 6.7p2)
@@ -6,45 +8,122 @@ use crate::test_compile::{compile_expect_error, compile_expect_ok};
 
 /// 6.7p2 wants a declarator, a tag, or enumeration members. These have none.
 ///
-/// All of them were **accepted silently** except the bare-specifier forms,
-/// which drew "type specifier missing" -- blaming the half that was absent
-/// rather than the declarator that was. gcc errors on `register`/`inline` here
-/// and warns on the rest; c17 errors on all of them, which 6.7p2 permits since
-/// it asks only for a diagnostic.
+/// All of them were **accepted silently** at first. gcc refuses a function
+/// specifier here, and `auto` or `register` at file scope; the rest it warns
+/// about, with a pedwarn that `-pedantic-errors` makes an error. c17 gives
+/// each one gcc's verdict and gcc's words.
 #[test]
 fn diagnostics_declaration_that_declares_nothing_is_rejected() {
-    // A storage class or qualifier is named, the way gcc names it.
-    for (name, src, spec) in [
-        ("declnothing_register", "int register;\n", "register"),
-        ("declnothing_inline", "int inline;\n", "inline"),
-        ("declnothing_static", "static;\n", "static"),
-        ("declnothing_extern", "extern;\n", "extern"),
-        ("declnothing_typedef", "int typedef;\n", "typedef"),
-        ("declnothing_const", "const;\n", "const"),
-        ("declnothing_volatile", "volatile;\n", "volatile"),
+    for (name, src, msg) in [
+        (
+            "declnothing_inline",
+            "int inline;\n",
+            "'inline' in empty declaration",
+        ),
+        (
+            "declnothing_bare_inline",
+            "inline;\n",
+            "'inline' in empty declaration",
+        ),
+        (
+            "declnothing_noreturn",
+            "_Noreturn;\n",
+            "'_Noreturn' in empty declaration",
+        ),
+        (
+            "declnothing_register",
+            "int register;\n",
+            "'register' in file-scope empty declaration",
+        ),
+        (
+            "declnothing_auto",
+            "auto;\n",
+            "'auto' in file-scope empty declaration",
+        ),
+        (
+            "declnothing_block_inline",
+            "void f(void){ inline; }\n",
+            "'inline' in empty declaration",
+        ),
     ] {
-        compile_expect_error(name, src, &format!("'{spec}' in empty declaration"));
+        compile_expect_error(name, src, msg);
     }
+}
 
-    // Nothing to name: just a type that declares no object.
-    compile_expect_error("declnothing_int", "int;\n", "declaration declares nothing");
-    compile_expect_error(
-        "declnothing_unsigned",
-        "unsigned;\n",
-        "declaration declares nothing",
-    );
-
-    // Block scope has the same rule and its own parse path.
-    compile_expect_error(
-        "declnothing_block_static",
-        "void f(void){ static; }\n",
-        "'static' in empty declaration",
-    );
-    compile_expect_error(
-        "declnothing_block_register",
-        "void f(void){ int register; }\n",
-        "'register' in empty declaration",
-    );
+/// The empty declarations gcc only warns about: a type named for nothing, or
+/// a storage class, `_Thread_local` or qualifier that applies to nothing.
+/// Warnings by default, errors under `-pedantic-errors`.
+#[test]
+fn diagnostics_declaration_that_declares_nothing_is_gccs_pedwarn() {
+    const USELESS_TYPE: &str = "useless type name in empty declaration";
+    const EMPTY: &str = "empty declaration";
+    for (name, src, first) in [
+        ("declnothing_int", "int;\n", USELESS_TYPE),
+        ("declnothing_unsigned", "unsigned;\n", USELESS_TYPE),
+        ("declnothing_typedef_int", "int typedef;\n", USELESS_TYPE),
+        (
+            "declnothing_block_register",
+            "void f(void){ int register; }\n",
+            USELESS_TYPE,
+        ),
+        (
+            "declnothing_static",
+            "static;\n",
+            "useless storage class specifier in empty declaration",
+        ),
+        (
+            "declnothing_extern",
+            "extern;\n",
+            "useless storage class specifier in empty declaration",
+        ),
+        (
+            "declnothing_block_static",
+            "void f(void){ static; }\n",
+            "useless storage class specifier in empty declaration",
+        ),
+        (
+            "declnothing_block_auto",
+            "void f(void){ auto; }\n",
+            "useless storage class specifier in empty declaration",
+        ),
+        (
+            "declnothing_thread_local",
+            "_Thread_local;\n",
+            "useless '_Thread_local' in empty declaration",
+        ),
+        (
+            "declnothing_const",
+            "const;\n",
+            "useless type qualifier in empty declaration",
+        ),
+        (
+            "declnothing_volatile",
+            "volatile;\n",
+            "useless type qualifier in empty declaration",
+        ),
+        (
+            "declnothing_untagged_struct",
+            "struct { int a; };\n",
+            "unnamed struct/union that defines no instances",
+        ),
+    ] {
+        let warned = compile_accepted(name, src, &[]);
+        assert!(
+            warned.contains("warning:") && warned.contains(first),
+            "{name}: expected a warning {first:?}:\n{warned}"
+        );
+        // With no type named, gcc's pedwarn is a separate "empty
+        // declaration" after the warning naming the useless specifier.
+        let names_a_specifier = first != USELESS_TYPE && !name.contains("struct");
+        assert_eq!(
+            warned
+                .lines()
+                .any(|l| l.ends_with(&format!("warning: {EMPTY}"))),
+            names_a_specifier,
+            "{name}:\n{warned}"
+        );
+        compile_rejected_with(name, src, &["-pedantic-errors"]);
+    }
 }
 
 /// The accept side, which is the half that can silently break real source.

@@ -125,9 +125,8 @@ impl NumericEscape {
 /// forbids, and an octal or hex escape whose value the element type cannot
 /// represent (6.4.4.4p9).
 ///
-/// The second is an error, as a constraint violation is here, and a warning
-/// under `-fpermissive`: gcc only warns, and the literal then holds the
-/// escape's low bits, as gcc's does.
+/// The second is gcc's warning, an error under `-pedantic-errors`, and the
+/// literal then holds the escape's low bits, as gcc's does.
 ///
 /// Every decoder of a literal calls this -- the parser for a constant or a
 /// string, and `#if` for a character constant -- so a literal is checked by
@@ -154,11 +153,41 @@ pub(crate) fn check_elements(elements: &[Escaped], unit_bits: u32, pos: Position
                 );
             }
             Escaped::Numeric(n) if !n.fits(unit_bits) => {
-                crate::diag::permissive_error(pos, n.out_of_range_message())
+                crate::diag::pedwarn_default(pos, n.out_of_range_message())
             }
             _ => {}
         }
     }
+}
+
+/// The value an integer constant's `digits` spell in `radix`, as gcc takes
+/// it: the low 64 bits, and whether any were lost. `None` when a character is
+/// no digit of the radix, which the caller reports as it reports a bad
+/// constant.
+///
+/// A constant wider than every integer type has no type (C17 6.4.4.1p6), but
+/// gcc only warns, "integer constant is too large for its type", and keeps
+/// the low bits -- in `#if` as in the program -- so the caller reports that
+/// through [`report_too_large_integer`] and goes on with the value.
+pub(crate) fn integer_digits_value(digits: &str, radix: u32) -> Option<(u64, bool)> {
+    if digits.is_empty() {
+        return None;
+    }
+    digits.chars().try_fold((0u64, false), |(v, lost), c| {
+        let d = u64::from(c.to_digit(radix)?);
+        let (m, o1) = v.overflowing_mul(u64::from(radix));
+        let (a, o2) = m.overflowing_add(d);
+        Some((a, lost || o1 || o2))
+    })
+}
+
+/// gcc's warning for a constant [`integer_digits_value`] had to truncate, an
+/// error under `-pedantic-errors`.
+pub(crate) fn report_too_large_integer(pos: Position) {
+    crate::diag::pedwarn_default(
+        pos,
+        &gettextrs::gettext("integer constant is too large for its type"),
+    );
 }
 
 /// The width of a plain literal's element, `char`.

@@ -1902,40 +1902,28 @@ impl Parser<'_> {
         }
     }
 
-    /// The specifier a declaration led with, for the diagnostic below.
-    ///
-    /// Ordered so the one a reader would blame comes first: a storage class
-    /// is more surprising in an empty declaration than a bare qualifier.
-    fn leading_specifier_name(modifiers: TypeModifiers) -> Option<&'static str> {
-        const SPELLINGS: &[(TypeModifiers, &str)] = &[
-            (TypeModifiers::TYPEDEF, "typedef"),
-            (TypeModifiers::EXTERN, "extern"),
-            (TypeModifiers::STATIC, "static"),
-            (TypeModifiers::REGISTER, "register"),
-            (TypeModifiers::AUTO, "auto"),
-            (TypeModifiers::THREAD_LOCAL, "_Thread_local"),
-            (TypeModifiers::INLINE, "inline"),
-            (TypeModifiers::CONST, "const"),
-            (TypeModifiers::VOLATILE, "volatile"),
-        ];
-        SPELLINGS
-            .iter()
-            .find(|(m, _)| modifiers.contains(*m))
-            .map(|(_, name)| *name)
-    }
-
-    /// Diagnose a declaration that stops at `;` having declared nothing.
+    /// Diagnose a declaration that stops at `;` having declared nothing, as
+    /// gcc does.
     ///
     /// C17 6.7p2 requires a declaration to declare a declarator, a tag, or the
     /// members of an enumeration. `struct S;` and `enum E { A };` declare a
     /// tag and are the reason this arm exists at all; `int;`, `static;` and
     /// `int register;` declare nothing whatsoever and were accepted silently.
     ///
-    /// Reported rather than warned: the constraint is violated, and a
-    /// declaration that declares nothing is always a typo or a stray token.
-    /// (gcc errors on `register`/`inline` here and warns on the rest; both are
-    /// conforming, since 6.7p2 asks only for a diagnostic.)
-    pub(super) fn check_declares_something(&mut self, pos: Position, base_type: &Type) {
+    /// gcc refuses a function specifier here, and `auto` or `register` at file
+    /// scope, where they could not apply to anything even with a declarator.
+    /// The rest it only warns about -- a pedwarn, so an error under
+    /// `-pedantic-errors`: "useless type name" when a type was named, and
+    /// otherwise "empty declaration" after a plain warning naming the
+    /// specifier that does nothing. `explicit` is whether a type specifier
+    /// was written.
+    pub(super) fn check_declares_something(
+        &mut self,
+        pos: Position,
+        base_type: &Type,
+        explicit: bool,
+        file_scope: bool,
+    ) {
         // A tag -- declared or defined -- is the thing this declaration form
         // exists to express, so it always counts. A structure or union with
         // no tag declares nothing it could be named by again (an enumeration
@@ -1949,7 +1937,7 @@ impl Parser<'_> {
                 .as_ref()
                 .is_some_and(|c| c.tag.is_none());
             if untagged && base_type.kind != TypeKind::Enum {
-                diag::warning(
+                diag::pedwarn_default(
                     pos,
                     &gettext("unnamed struct/union that defines no instances"),
                 );
@@ -1957,10 +1945,51 @@ impl Parser<'_> {
             return;
         }
 
-        match Self::leading_specifier_name(base_type.modifiers) {
-            Some(spec) => diag::error_args(pos, "'{0}' in empty declaration", &[spec]),
-            None => diag::error(pos, &gettext("declaration declares nothing")),
+        let m = base_type.modifiers;
+        if explicit {
+            diag::pedwarn_default(pos, &gettext("useless type name in empty declaration"));
         }
+        let mut refused = false;
+        for (bit, spec) in [
+            (TypeModifiers::INLINE, "inline"),
+            (TypeModifiers::NORETURN, "_Noreturn"),
+        ] {
+            if m.contains(bit) {
+                diag::error_args(pos, "'{0}' in empty declaration", &[spec]);
+                refused = true;
+            }
+        }
+        if file_scope {
+            for (bit, spec) in [
+                (TypeModifiers::AUTO, "auto"),
+                (TypeModifiers::REGISTER, "register"),
+            ] {
+                if m.contains(bit) {
+                    diag::error_args(pos, "'{0}' in file-scope empty declaration", &[spec]);
+                    refused = true;
+                }
+            }
+        }
+        if explicit || refused {
+            return;
+        }
+        let storage = Type::STORAGE_CLASS.difference(TypeModifiers::THREAD_LOCAL);
+        if m.intersects(storage) {
+            diag::warning(
+                pos,
+                &gettext("useless storage class specifier in empty declaration"),
+            );
+        } else if m.contains(TypeModifiers::THREAD_LOCAL) {
+            diag::warning(
+                pos,
+                &gettext("useless '_Thread_local' in empty declaration"),
+            );
+        } else if m.intersects(Type::QUALIFIERS) {
+            diag::warning(pos, &gettext("useless type qualifier in empty declaration"));
+        } else if self.pending_alignas_kw.is_some() {
+            diag::warning(pos, &gettext("useless '_Alignas' in empty declaration"));
+        }
+        diag::pedwarn_default(pos, &gettext("empty declaration"));
     }
 }
 

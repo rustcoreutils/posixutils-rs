@@ -788,8 +788,8 @@ fn diagnostics_equality_accepts_a_complex_operand() {
 /// An octal or hex escape's value must be representable in the literal's
 /// element type: `unsigned char` for a plain literal, and the unsigned type
 /// of `wchar_t`, `char16_t` or `char32_t` for a prefixed one. gcc warns and
-/// truncates; c17 was silent. A constraint gcc only warns about is an error
-/// here, and `-fpermissive` makes it a warning with gcc's truncation.
+/// truncates, an error only under `-pedantic-errors`; c17 was silent, and now
+/// does as gcc does.
 #[test]
 fn diagnostics_escape_out_of_range() {
     for (name, src, msg) in [
@@ -846,17 +846,17 @@ fn diagnostics_escape_out_of_range() {
             "hex escape sequence out of range",
         ),
     ] {
-        let strict = compile(name, src, &[]);
+        let warned = compile(name, src, &[]);
         assert!(
-            !strict.success && strict.stderr.contains("error:") && strict.stderr.contains(msg),
-            "{name}: expected an error mentioning {msg:?}:\n{}",
-            strict.stderr
+            warned.success && warned.stderr.contains(&format!("warning: {msg}")),
+            "{name}: expected a warning {msg:?}:\n{}",
+            warned.stderr
         );
-        let lax = compile(name, src, &["-fpermissive"]);
+        let strict = compile(name, src, &["-pedantic-errors"]);
         assert!(
-            lax.success && lax.stderr.contains("warning:") && lax.stderr.contains(msg),
-            "{name}: -fpermissive should warn {msg:?}:\n{}",
-            lax.stderr
+            !strict.success && strict.stderr.contains(&format!("error: {msg}")),
+            "{name}: -pedantic-errors should refuse it with {msg:?}:\n{}",
+            strict.stderr
         );
     }
 }

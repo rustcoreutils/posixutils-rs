@@ -9890,6 +9890,25 @@ fn test_conditional_pointer_result_types() {
     }
 }
 
+/// One `void` arm makes the conditional `void`, as gcc types it, whichever
+/// arm it is and whatever the other is -- so its value cannot be used, and
+/// the only diagnostic is gcc's `-pedantic` one, which is off here.
+#[test]
+fn test_conditional_with_one_void_arm_is_void() {
+    let decls = "void f(void); int c, x; int *p; struct S { int a; } s;";
+    for expr in ["c ? f() : x", "c ? x : f()", "c ? p : f()", "c ? f() : s"] {
+        let src = format!("{decls} __typeof__({expr}) *r;");
+        let before = crate::diag::error_count();
+        let (tu, types, _, _) = parse_tu(&src).unwrap();
+        assert_eq!(crate::diag::error_count(), before, "{expr}: an error");
+        let Some(ExternalDecl::Declaration(decl)) = tu.items.last() else {
+            panic!("{expr}: expected a declaration");
+        };
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.format_type(typ, None), "void *", "{expr}");
+    }
+}
+
 /// C17 6.5.15p3 admits only these pairs of arms; any other is an error, which
 /// leaves the conditional untyped so no enclosing operator reports it again.
 /// The accepted pairs are proved in `cc/tests/diagnostics`, where a stray

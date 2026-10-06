@@ -120,3 +120,28 @@ fn incomplete_ucn_keeps_its_digits() {
         [Escaped::CodePoint('\u{e9}')]
     ));
 }
+
+/// gcc keeps the low 64 bits of an integer constant too wide for any type,
+/// and says so; a character that is no digit of the radix is no constant.
+#[test]
+fn integer_digits_keep_the_low_64_bits() {
+    assert_eq!(
+        integer_digits_value("18446744073709551615", 10),
+        Some((u64::MAX, false))
+    );
+    assert_eq!(
+        integer_digits_value("18446744073709551616", 10),
+        Some((0, true))
+    );
+    assert_eq!(
+        integer_digits_value("123456789012345678901234567890", 10),
+        Some((0xc373e0ee4e3f0ad2, true))
+    );
+    assert_eq!(
+        integer_digits_value("123456789abcdef0123", 16),
+        Some((0x456789abcdef0123, true))
+    );
+    assert_eq!(integer_digits_value("0777", 8), Some((0o777, false)));
+    assert_eq!(integer_digits_value("09", 8), None);
+    assert_eq!(integer_digits_value("", 10), None);
+}

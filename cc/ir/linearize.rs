@@ -5196,21 +5196,21 @@ impl<'a> Linearizer<'a> {
         self.file_scope_statics.contains(&name).then_some(name)
     }
 
-    /// Report a reference [`Self::inline_static_reference`] refuses.
+    /// Report a reference [`Self::inline_static_reference`] objects to, in
+    /// gcc's words. A violation of C99 6.7.4p3, but gcc only warns -- an error
+    /// under `-pedantic-errors` -- and real source contains it: ffmpeg's
+    /// `dv_guess_qnos` reads a file-scope `static const int` from an inline
+    /// definition.
     pub(crate) fn check_inline_static_reference(&self, symbol_id: SymbolId) {
         let Some(name) = self.inline_static_reference(symbol_id) else {
             return;
         };
         if let Some(pos) = self.current_pos {
-            let msg = format!(
-                "inline definition of '{}' cannot reference file-scope static variable '{}'",
-                self.current_func_name, name
+            crate::diag::pedwarn_default_args(
+                pos,
+                "'{0}' is static but used in inline function '{1}' which is not static",
+                &[name.as_str(), self.current_func_name.as_str()],
             );
-            // gcc does not enforce this one, so real source contains it --
-            // ffmpeg's `dv_guess_qnos` reads a file-scope `static const int`
-            // from an inline definition. It is relaxed by `-fpermissive`,
-            // which is where c17 keeps the constraints gcc lets through.
-            crate::diag::permissive_error(pos, &msg);
         }
     }
 

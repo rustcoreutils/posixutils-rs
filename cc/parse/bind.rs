@@ -46,6 +46,8 @@ pub(super) struct DeclSpecs {
     ty: Type,
     /// The type every declarator derives from, or `__auto_type`.
     base: DeclBase,
+    /// Whether a type specifier was written, rather than `int` defaulted.
+    explicit: bool,
     /// The storage-class specifiers and `inline` ([`Type::STORAGE_CLASS`]),
     /// which the declaration records rather than the type.
     pub(super) storage_class: TypeModifiers,
@@ -175,7 +177,12 @@ impl Parser<'_> {
                 DeclBase::Inferred { pos, .. } => {
                     diag::error(pos, &gettext("'__auto_type' in empty declaration"));
                 }
-                DeclBase::Given(_) => self.check_declares_something(specs.pos, &specs.ty),
+                DeclBase::Given(_) => self.check_declares_something(
+                    specs.pos,
+                    &specs.ty,
+                    specs.explicit,
+                    scope == DeclScope::File,
+                ),
             }
         } else {
             let mut first = true;
@@ -264,6 +271,7 @@ impl Parser<'_> {
             pos,
             storage_class: ty.modifiers & Type::STORAGE_CLASS,
             base,
+            explicit: parsed.explicit,
             attrs: self.specifier_attrs(),
             vm_dims: parsed.vm_dims,
             ty,

@@ -736,8 +736,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
         let name_str = self.symbol_name(declarator.symbol);
 
-        // C99 6.7.4p3: A non-static inline function cannot define a non-const
-        // function-local static variable
+        // C99 6.7.4p3: an inline definition shall not define a modifiable
+        // object with static storage duration. gcc only warns, in its own
+        // words -- an error under `-pedantic-errors`.
         if self.current_func_is_inline_definition {
             let is_const = self
                 .types
@@ -745,12 +746,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                 .contains(TypeModifiers::CONST);
             if !is_const {
                 if let Some(pos) = self.current_pos {
-                    error(
+                    crate::diag::pedwarn_default_args(
                         pos,
-                        &format!(
-                            "inline definition of '{}' cannot define non-const static variable '{}'",
-                            self.current_func_name, name_str
-                        ),
+                        "'{0}' is static but declared in inline function '{1}' which is not static",
+                        &[name_str.as_str(), self.current_func_name.as_str()],
                     );
                 }
             }

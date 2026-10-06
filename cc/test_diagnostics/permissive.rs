@@ -163,13 +163,14 @@ int main(void) { bad(1, 42L); return 0; }
 // What `-fpermissive` relaxes
 // ============================================================================
 
-/// The constraints gcc lets through, and c17 relaxes only when asked.
+/// The constraints GCC 13 only warns about and GCC 14 refuses, which c17
+/// relaxes only when asked.
 ///
 /// Each is a genuine C17 constraint violation, and each appears in source old
-/// enough that gcc chose to warn rather than refuse. `-fpermissive` is where
-/// c17 keeps that leniency: it already covers implicit `int` and implicit
-/// function declarations, and these join them rather than becoming warnings
-/// for everybody.
+/// enough that gcc once chose to warn rather than refuse. `-fpermissive` is
+/// where c17 keeps that leniency: it already covers implicit `int` and
+/// implicit function declarations, and these join them. The constraints gcc
+/// still only warns about are warnings here too (`default_pedwarns.rs`).
 #[test]
 fn diagnostics_permissive_relaxes_the_constraints_gcc_warns_about() {
     const CASES: &[(&str, &str, &str)] = &[
@@ -182,21 +183,6 @@ fn diagnostics_permissive_relaxes_the_constraints_gcc_warns_about() {
             "return_with_value",
             "void h(int v) { return v; }\n",
             "'return' with a value",
-        ),
-        (
-            "struct_member_missing_semicolon",
-            "struct S { int a; int b };\nint main(void){ return 0; }\n",
-            "needs a ';'",
-        ),
-        (
-            "inline_reads_a_file_scope_static",
-            "static const int k = 3;\ninline int f(void) { return k; }\nint main(void){ return f() - 3; }\n",
-            "cannot reference file-scope static",
-        ),
-        (
-            "inline_updates_a_file_scope_static",
-            "static int k;\ninline void f(void) { k += 3; }\nint main(void){ f(); return k - 3; }\n",
-            "cannot reference file-scope static",
         ),
     ];
 

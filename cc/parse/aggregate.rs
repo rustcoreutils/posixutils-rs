@@ -147,14 +147,13 @@ impl Parser<'_> {
                     })?;
                     // C17 6.7.2.2p2 requires an enumerator to be
                     // representable as `int`, so exceeding it is a constraint
-                    // violation and 5.1.1.3 requires it be diagnosed. gcc
-                    // widens the enumerated type rather than rejecting, and
-                    // so does c17 -- but not in silence.
+                    // violation. gcc widens the enumerated type rather than
+                    // rejecting, and says so only under `-pedantic`; so does
+                    // c17.
                     if v < i32::MIN as i128 || v > i32::MAX as i128 {
-                        diag::warning_args(
+                        diag::pedwarn(
                             value_pos,
-                            "enumerator value {0} is outside the range of 'int'",
-                            &[&v.to_string()],
+                            &gettext("ISO C restricts enumerator values to range of 'int'"),
                         );
                     }
                     v
@@ -866,14 +865,14 @@ impl Parser<'_> {
             }
 
             // C17 6.7.2.1 requires the `;`. gcc accepts a member list
-            // whose last declaration lacks one and warns, and
-            // `-fpermissive` is where c17 keeps that kind of leniency --
-            // there is nothing ambiguous about `struct S { int a; int b }`,
-            // the `}` says the list ended.
-            if self.is_special(b'}') && diag::permissive() {
-                diag::warning(
+            // whose last declaration lacks one, with a warning that
+            // `-pedantic-errors` makes an error -- there is nothing
+            // ambiguous about `struct S { int a; int b }`, the `}` says the
+            // list ended.
+            if self.is_special(b'}') {
+                diag::pedwarn_default(
                     self.current_pos(),
-                    &gettext("the last member of a struct or union needs a ';'"),
+                    &gettext("no semicolon at end of struct or union"),
                 );
             } else {
                 self.expect_special(b';')?;

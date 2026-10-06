@@ -306,8 +306,7 @@ impl<'a> Parser<'a> {
         else_expr: &Expr,
         pos: Position,
     ) -> Option<TypeId> {
-        // An arm diagnosed already, or one with no value -- whose mismatch
-        // with a valued arm `check_not_void` has reported.
+        // An arm diagnosed already.
         let (then_typ, else_typ) = (then_expr.typ?, else_expr.typ?);
         // GNU vectors: two of one type, and nothing else.
         if self.types.is_vector(then_typ) || self.types.is_vector(else_typ) {
@@ -516,13 +515,17 @@ impl<'a> Parser<'a> {
             let else_typ = else_expr.typ.unwrap_or(self.types.int_id);
 
             // C17 6.5.15p3: either both arms have type void, or neither does.
-            // A mismatch means one arm has no value for the expression to
-            // take.
+            // gcc accepts one `void` arm as an extension and objects only
+            // under `-pedantic`; the conditional then has type `void`
+            // (`conditional_result_type`), so the other arm's value is
+            // discarded and using the whole as a value is still an error.
             let then_void = self.types.kind(then_typ) == TypeKind::Void;
             let else_void = self.types.kind(else_typ) == TypeKind::Void;
             if then_void != else_void {
-                let culprit = if then_void { &then_expr } else { &else_expr };
-                self.check_not_void(culprit, culprit.pos);
+                diag::pedwarn(
+                    colon_pos,
+                    &gettext("ISO C forbids conditional expr with only one void side"),
+                );
             }
 
             let typ = self.conditional_result_type(&then_expr, &else_expr, colon_pos);
@@ -2940,17 +2943,21 @@ impl<'a> Parser<'a> {
             let is_long = long == IntLong::Long;
 
             // Parse as u64 first to handle large unsigned values, then reinterpret as i64
-            let value_u64: u64 = if is_hex {
+            let (digits, radix) = if is_hex {
                 // Strip 0x or 0X prefix
-                u64::from_str_radix(&body[2..], 16)
+                (&body[2..], 16)
             } else if let Some(bin_part) = body.strip_prefix("0b") {
-                u64::from_str_radix(bin_part, 2)
+                (bin_part, 2)
             } else if body.starts_with('0') && body.len() > 1 {
-                u64::from_str_radix(&body, 8)
+                (&body[..], 8)
             } else {
-                body.parse()
+                (&body[..], 10)
+            };
+            let (value_u64, truncated) = crate::token::literal::integer_digits_value(digits, radix)
+                .ok_or_else(|| ParseError::new(format!("invalid integer literal: {}", s), pos))?;
+            if truncated {
+                crate::token::literal::report_too_large_integer(pos);
             }
-            .map_err(|_| ParseError::new(format!("invalid integer literal: {}", s), pos))?;
 
             // Reinterpret bits as i64 (preserves bit pattern for unsigned values)
             let value = value_u64 as i64;

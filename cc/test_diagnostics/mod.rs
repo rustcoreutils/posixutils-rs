@@ -39,6 +39,7 @@ mod constraint_sweep;
 mod constraints_core;
 mod declarations;
 mod declarators_and_shifts;
+mod default_pedwarns;
 mod empty_declarations;
 mod expressions;
 mod function_compatibility;

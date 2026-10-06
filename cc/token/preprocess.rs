@@ -1530,7 +1530,7 @@ impl<'a> Preprocessor<'a> {
         match self.linemarkers.get(&pos.stream) {
             Some(lm) => Position {
                 stream: lm.target,
-                line: (pos.line as i64 + lm.delta).max(1) as u32,
+                line: (pos.line as i64 + lm.delta).max(0) as u32,
                 ..pos
             },
             None => pos,
@@ -2468,20 +2468,18 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         }
         let suffix_unsigned = suffix.contains('u') || suffix.contains('U');
 
-        match u64::from_str_radix(body, radix) {
-            Ok(v) => {
-                // Too large for intmax_t means the constant's type is
-                // uintmax_t, even without a suffix.
-                let unsigned = suffix_unsigned || v > i64::MAX as u64;
-                PpValue::from_parts(v as i128, unsigned)
-            }
-            // The body is all digits of the radix, so the only way to fail is
-            // to be wider than `uintmax_t`.
-            Err(_) => {
-                self.err_token(pos, "integer constant \"{0}\" is too large", s);
-                PpValue::signed(0)
-            }
+        // The body is all digits of the radix, so the only way to fail is
+        // to be wider than `uintmax_t`, which keeps the low bits. gcc says so
+        // in an unevaluated operand too: it is the constant that is wrong.
+        let (v, truncated) =
+            crate::token::literal::integer_digits_value(body, radix).unwrap_or((0, false));
+        if truncated {
+            crate::token::literal::report_too_large_integer(pos);
         }
+        // Too large for intmax_t means the constant's type is uintmax_t, even
+        // without a suffix.
+        let unsigned = suffix_unsigned || v > i64::MAX as u64;
+        PpValue::from_parts(v as i128, unsigned)
     }
 }
 

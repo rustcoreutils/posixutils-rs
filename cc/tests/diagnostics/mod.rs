@@ -1747,8 +1747,8 @@ fn diagnostics_specifier_qualifier_list_rejects_declaration_only_specifiers() {
 /// An octal or hex escape's value must be representable in the literal's
 /// element type: `unsigned char` for a plain literal, and the unsigned type
 /// of `wchar_t`, `char16_t` or `char32_t` for a prefixed one. gcc warns and
-/// truncates; c17 was silent. A constraint gcc only warns about is an error
-/// here, and `-fpermissive` makes it a warning with gcc's truncation.
+/// truncates, an error only under `-pedantic-errors`; c17 was silent, and now
+/// does as gcc does.
 #[test]
 fn diagnostics_escape_out_of_range() {
     for (name, src, msg) in [
@@ -1805,24 +1805,24 @@ fn diagnostics_escape_out_of_range() {
             "hex escape sequence out of range",
         ),
     ] {
-        let strict = compile_with(name, src, &[]);
+        let warned = compile_with(name, src, &[]);
         assert!(
-            !strict.success && strict.stderr.contains("error:") && strict.stderr.contains(msg),
-            "{name}: expected an error mentioning {msg:?}:\n{}",
-            strict.stderr
+            warned.success && warned.stderr.contains(&format!("warning: {msg}")),
+            "{name}: expected a warning {msg:?}:\n{}",
+            warned.stderr
         );
-        let lax = compile_with(name, src, &["-fpermissive"]);
+        let strict = compile_with(name, src, &["-pedantic-errors"]);
         assert!(
-            lax.success && lax.stderr.contains("warning:") && lax.stderr.contains(msg),
-            "{name}: -fpermissive should warn {msg:?}:\n{}",
-            lax.stderr
+            !strict.success && strict.stderr.contains(&format!("error: {msg}")),
+            "{name}: -pedantic-errors should refuse it with {msg:?}:\n{}",
+            strict.stderr
         );
     }
 }
 
-/// Under `-fpermissive` the program keeps gcc's truncation to the low bits.
+/// The program keeps gcc's truncation to the low bits.
 #[test]
-fn diagnostics_escape_out_of_range_truncates_under_fpermissive() {
+fn diagnostics_escape_out_of_range_truncates_as_gcc_does() {
     let src = r#"
 typedef __CHAR16_TYPE__ char16_t;
 int main(void) {
@@ -1833,8 +1833,44 @@ int main(void) {
     return 0;
 }
 "#;
+    assert_eq!(compile_and_run("esc_truncate", src, &[]), 0);
+}
+
+/// The constructs gcc only warns about compile, warn, and run as gcc's do:
+/// a conditional with one `void` arm discards the other arm's value; a
+/// member list missing its last `;` still has that member; a constant too
+/// large for any type keeps its low 64 bits -- `2^64` is an `int` zero --
+/// in `#if` as in the program; a `#line` number past 32 bits wraps, and
+/// `#line 0` names line 0; a null character is whitespace; and an inline
+/// definition may still read its file-scope static (never called here: it
+/// has no external definition to call).
+#[test]
+fn diagnostics_gcc_warnings_compile_to_gccs_program() {
+    let src = "static int hits;\n\
+               static int counter = 7;\n\
+               inline int next(void) { return counter; }\n\
+               void f(void) { hits += 10; }\n\
+               int g(int c, int x) { c ? f() : x; c ? x++ : f(); return hits + x; }\n\
+               struct S { int a; int b };\n\
+               int main(void) {\n\
+                   unsigned long long a = 123456789012345678901234567890;\n\
+                   struct S s = { 1, 2 };\0\n\
+                   if (g(1, 5) != 16 || g(0, 5) != 25) return 1;\n\
+                   if (a != 0xc373e0ee4e3f0ad2ULL) return 2;\n\
+                   if (sizeof(18446744073709551616) != sizeof(int)) return 3;\n\
+                   if (s.b != 2) return 4;\n\
+               #if 123456789012345678901234567890 != 0xc373e0ee4e3f0ad2\n\
+                   return 5;\n\
+               #endif\n\
+               #line 0\n\
+                   if (__LINE__ != 0) return 6;\n\
+               #line 4294967297\n\
+                   if (__LINE__ != 1) return 7;\n\
+                   return 0;\n\
+               }\n";
+    assert_eq!(compile_and_run("gcc_warnings_run", src, &[]), 0);
     assert_eq!(
-        compile_and_run("esc_truncate", src, &["-fpermissive".to_string()]),
+        compile_and_run("gcc_warnings_run_o2", src, &["-O2".to_string()]),
         0
     );
 }

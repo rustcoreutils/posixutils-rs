@@ -1554,3 +1554,16 @@ fn test_dots_lex_as_c_punctuators() {
         assert_eq!(got, want, "{src:?}");
     }
 }
+
+/// A null character between tokens is whitespace, as gcc treats it: the
+/// tokens either side are untouched and nothing stands in for it.
+#[test]
+fn test_null_character_is_whitespace() {
+    let (tokens, idents) = tokenize_str("int\0\0x\0;");
+    let spelled: Vec<String> = tokens[1..tokens.len() - 1]
+        .iter()
+        .map(|t| show_token(t, &idents))
+        .collect();
+    assert_eq!(spelled, ["int", "x", ";"]);
+    assert!(tokens[2].pos.whitespace);
+}

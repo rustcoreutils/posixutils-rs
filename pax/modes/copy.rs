@@ -567,7 +567,8 @@ fn copy_symlink(
 
     // A symlink's own mode is meaningless and there is no portable way to chmod
     // one, so only owner and times are restored.
-    set_link_attrs_at(dirfd, name, &attrs_of(metadata), &policy_of(options))
+    set_link_attrs_at(dirfd, name, &attrs_of(metadata), &policy_of(options))?;
+    Ok(())
 }
 
 /// Copy a regular file
@@ -742,7 +743,7 @@ fn set_node_attrs_at(
 
     // Owner and times take AT_SYMLINK_NOFOLLOW; the mode check is in
     // set_permissions_at, which refuses a name that is a symbolic link.
-    set_link_attrs_at(dirfd, name, &attrs, &policy)?;
+    let owner_set = set_link_attrs_at(dirfd, name, &attrs, &policy)?;
 
     let Some(st) = stat_at(dirfd, name) else {
         return Err(std::io::Error::last_os_error().into());
@@ -756,7 +757,7 @@ fn set_node_attrs_at(
         libc::fchmodat(
             dirfd.as_raw_fd(),
             name.as_ptr(),
-            policy.mode(&attrs) as libc::mode_t,
+            policy.mode(&attrs, owner_set) as libc::mode_t,
             0,
         )
     };

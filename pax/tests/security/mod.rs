@@ -261,6 +261,9 @@ fn test_extract_does_not_chmod_through_planted_symlink() {
 /// contents are complete. The window itself is a race and is asserted at the
 /// unit level (`AttrPolicy::creation_mode`); what this pins is that closing it
 /// did not cost the preservation `-p e` asks for.
+///
+/// The member belongs to whoever runs the test, so the chown `-p e` performs
+/// succeeds unprivileged: a set-id bit is kept only when the owner is.
 #[test]
 fn test_extract_preserves_setuid_bit_on_the_finished_file() {
     use std::os::unix::fs::PermissionsExt;
@@ -272,6 +275,8 @@ fn test_extract_preserves_setuid_bit_on_the_finished_file() {
     let archive = Ustar {
         name: b"suid",
         mode: 0o4755,
+        uid: unsafe { libc::geteuid() },
+        gid: unsafe { libc::getegid() },
         body: b"contents\n",
         ..Default::default()
     }

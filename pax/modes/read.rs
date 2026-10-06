@@ -14,7 +14,8 @@ use crate::error::{PaxError, PaxResult};
 use crate::formats::{CpioReader, PaxReader, UstarReader};
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
-    create_replacing, link_replacing, set_attrs_fd, stat_at, AttrPolicy, Attrs, DirTree, MemberPath,
+    chown_result, create_replacing, link_replacing, set_attrs_fd, stat_at, AttrPolicy, Attrs,
+    DirTree, MemberPath,
 };
 use crate::pattern::{find_matching_pattern_subtree, matches_excluded, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
@@ -823,8 +824,8 @@ fn extract_device(
         Err(e) => return Err(e),
     }
 
-    set_owner_at(dirfd, name, entry, options)?;
-    set_permissions_at(dirfd, name, entry, options)?;
+    let owner_set = set_owner_at(dirfd, name, entry, options)?;
+    set_permissions_at(dirfd, name, entry, options, owner_set)?;
     set_times_at(dirfd, name, entry, options)
 }
 
@@ -860,8 +861,8 @@ fn extract_fifo(
         Err(e) => return Err(e),
     }
 
-    set_owner_at(dirfd, name, entry, options)?;
-    set_permissions_at(dirfd, name, entry, options)?;
+    let owner_set = set_owner_at(dirfd, name, entry, options)?;
+    set_permissions_at(dirfd, name, entry, options, owner_set)?;
     set_times_at(dirfd, name, entry, options)
 }
 
@@ -1011,6 +1012,7 @@ fn set_permissions_at(
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
+    owner_set: bool,
 ) -> PaxResult<()> {
     let Some(st) = stat_at(dirfd, name) else {
         return Err(std::io::Error::last_os_error().into());
@@ -1024,7 +1026,7 @@ fn set_permissions_at(
         ));
     }
 
-    let mode = policy_of(options).mode(&attrs_of(entry));
+    let mode = policy_of(options).mode(&attrs_of(entry), owner_set);
     let r = unsafe { libc::fchmodat(dirfd.as_raw_fd(), name.as_ptr(), mode as libc::mode_t, 0) };
     if r != 0 {
         return Err(std::io::Error::last_os_error().into());
@@ -1032,19 +1034,20 @@ fn set_permissions_at(
     Ok(())
 }
 
-/// Set file owner (uid/gid) - requires privileges
+/// Set file owner (uid/gid) - requires privileges. Returns whether it was set,
+/// which decides whether `set_permissions_at` may apply set-id bits.
 fn set_owner_at(
     dirfd: BorrowedFd<'_>,
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-) -> PaxResult<()> {
+) -> PaxResult<bool> {
     if !options.preserve_owner {
-        return Ok(());
+        return Ok(false);
     }
 
     let (uid, gid) = owner_ids(entry);
-    let result = unsafe {
+    chown_result(unsafe {
         libc::fchownat(
             dirfd.as_raw_fd(),
             name.as_ptr(),
@@ -1052,20 +1055,7 @@ fn set_owner_at(
             gid,
             libc::AT_SYMLINK_NOFOLLOW,
         )
-    };
-
-    if result != 0 {
-        let err = std::io::Error::last_os_error();
-        // EPERM usually means we're not root - warn but continue
-        if err.raw_os_error() == Some(libc::EPERM) {
-            eprintln!("pax: cannot change owner: Operation not permitted");
-            crate::error::note_error();
-            return Ok(());
-        }
-        return Err(err.into());
-    }
-
-    Ok(())
+    })
 }
 
 /// Set file access and modification times
@@ -1278,7 +1268,7 @@ mod tests {
             umask: 0o022,
             ..Default::default()
         };
-        set_permissions_at(dir.as_fd(), &name, &entry, &opts).unwrap();
+        set_permissions_at(dir.as_fd(), &name, &entry, &opts, false).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o755
@@ -1290,7 +1280,7 @@ mod tests {
             umask: 0o022,
             ..Default::default()
         };
-        set_permissions_at(dir.as_fd(), &name, &entry, &opts).unwrap();
+        set_permissions_at(dir.as_fd(), &name, &entry, &opts, false).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o777

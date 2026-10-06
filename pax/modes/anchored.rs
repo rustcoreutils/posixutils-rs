@@ -403,16 +403,20 @@ pub(crate) struct AttrPolicy {
 }
 
 impl AttrPolicy {
-    /// The permission bits to apply.
+    /// The permission bits to apply, given whether the owner was set.
     ///
-    /// Without `-p o`/`-p e` the set-user-ID and set-group-ID bits are dropped,
-    /// since the file is about to belong to whoever ran pax rather than to the
-    /// user recorded in the source. Without `-p p`/`-p e` the file is created by
-    /// the normal file-creation action, so the mode is modified by the umask
-    /// exactly as `open()` or `mkdir()` would do.
-    pub fn mode(&self, attrs: &Attrs) -> u32 {
+    /// The set-user-ID and set-group-ID bits are kept only when `owner_set`
+    /// says the file now belongs to the user and group recorded in the source.
+    /// POSIX, -p: "if ... the user ID and group ID are not preserved for any
+    /// reason, pax shall not set the S_ISUID and S_ISGID bits". Without
+    /// `-p o`/`-p e` that is never, and a chown refused with EPERM leaves the
+    /// file belonging to whoever ran pax -- a set-id bit there would hand out
+    /// that user's identity, not the archived one. Without `-p p`/`-p e` the
+    /// file is created by the normal file-creation action, so the mode is
+    /// modified by the umask exactly as `open()` or `mkdir()` would do.
+    pub fn mode(&self, attrs: &Attrs, owner_set: bool) -> u32 {
         let mut mode = attrs.mode;
-        if !self.preserve_owner {
+        if !(self.preserve_owner && owner_set) {
             #[allow(clippy::unnecessary_cast)] // u16 on macOS, u32 on Linux
             let setid = !((libc::S_ISUID | libc::S_ISGID) as u32);
             mode &= setid;
@@ -437,7 +441,7 @@ impl AttrPolicy {
     /// the data is complete, so any set-id bit the archive legitimately carries
     /// arrives then, on a file whose contents are already final.
     pub fn creation_mode(&self, attrs: &Attrs) -> u32 {
-        self.mode(attrs) & 0o777
+        self.mode(attrs, false) & 0o777
     }
 
     /// The times to apply, or `None` when neither was asked for.
@@ -487,21 +491,17 @@ pub(crate) fn set_attrs_fd(
     attrs: &Attrs,
     policy: &AttrPolicy,
 ) -> PaxResult<()> {
-    if policy.preserve_owner {
-        let r = unsafe { libc::fchown(fd.as_raw_fd(), attrs.uid, attrs.gid) };
-        if r != 0 {
-            let err = std::io::Error::last_os_error();
-            // EPERM usually means we're not root - warn but continue
-            if err.raw_os_error() == Some(libc::EPERM) {
-                eprintln!("pax: cannot change owner: Operation not permitted");
-                crate::error::note_error();
-            } else {
-                return Err(err.into());
-            }
-        }
-    }
+    // Owner first: a successful chown may clear the set-id bits, and whether it
+    // succeeded decides whether they may be set at all.
+    let owner_set = policy.preserve_owner
+        && chown_result(unsafe { libc::fchown(fd.as_raw_fd(), attrs.uid, attrs.gid) })?;
 
-    let r = unsafe { libc::fchmod(fd.as_raw_fd(), policy.mode(attrs) as libc::mode_t) };
+    let r = unsafe {
+        libc::fchmod(
+            fd.as_raw_fd(),
+            policy.mode(attrs, owner_set) as libc::mode_t,
+        )
+    };
     if r != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
@@ -520,17 +520,37 @@ pub(crate) fn set_attrs_fd(
     Ok(())
 }
 
+/// Whether a `chown` call, given its return value, set the owner.
+///
+/// EPERM -- usually not being root -- is diagnosed and otherwise tolerated: the
+/// file keeps whoever ran pax as its owner, and the caller must then withhold
+/// the set-id bits (see [`AttrPolicy::mode`]). Any other failure is an error.
+pub(crate) fn chown_result(r: libc::c_int) -> PaxResult<bool> {
+    if r == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EPERM) {
+        eprintln!("pax: cannot change owner: Operation not permitted");
+        crate::error::note_error();
+        return Ok(false);
+    }
+    Err(err.into())
+}
+
 /// Apply owner and times to a name that cannot be opened for the purpose -- a
 /// symbolic link, whose own mode bits carry no meaning and which must never be
 /// followed to reach them.
+///
+/// Returns whether the owner was set, for a caller that goes on to apply a mode.
 pub(crate) fn set_link_attrs_at(
     dirfd: BorrowedFd<'_>,
     name: &CStr,
     attrs: &Attrs,
     policy: &AttrPolicy,
-) -> PaxResult<()> {
-    if policy.preserve_owner {
-        let r = unsafe {
+) -> PaxResult<bool> {
+    let owner_set = policy.preserve_owner
+        && chown_result(unsafe {
             libc::fchownat(
                 dirfd.as_raw_fd(),
                 name.as_ptr(),
@@ -538,17 +558,7 @@ pub(crate) fn set_link_attrs_at(
                 attrs.gid,
                 libc::AT_SYMLINK_NOFOLLOW,
             )
-        };
-        if r != 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EPERM) {
-                eprintln!("pax: cannot change owner: Operation not permitted");
-                crate::error::note_error();
-            } else {
-                return Err(err.into());
-            }
-        }
-    }
+        })?;
 
     if let Some(times) = policy.times(attrs) {
         let r = unsafe {
@@ -568,7 +578,7 @@ pub(crate) fn set_link_attrs_at(
         }
     }
 
-    Ok(())
+    Ok(owner_set)
 }
 
 /// `fstatat` with `AT_SYMLINK_NOFOLLOW`, for asking what a name *is* without
@@ -641,7 +651,7 @@ mod tests {
                 for perms in [false, true] {
                     let p = policy(owner, perms);
                     let created = p.creation_mode(&attrs(mode));
-                    let final_mode = p.mode(&attrs(mode));
+                    let final_mode = p.mode(&attrs(mode), true);
                     assert_eq!(
                         created & !final_mode,
                         0,
@@ -660,6 +670,15 @@ mod tests {
         assert_eq!(policy(true, true).creation_mode(&attrs(0o4755)), 0o755);
         // Without -p p the normal file-creation action applies the umask.
         assert_eq!(policy(false, false).creation_mode(&attrs(0o4777)), 0o755);
+    }
+
+    /// Set-id bits survive only when ownership was asked for *and* the chown
+    /// took: a refused chown leaves the file owned by whoever ran pax.
+    #[test]
+    fn test_mode_keeps_set_id_only_when_the_owner_was_set() {
+        assert_eq!(policy(true, true).mode(&attrs(0o6755), true), 0o6755);
+        assert_eq!(policy(true, true).mode(&attrs(0o6755), false), 0o755);
+        assert_eq!(policy(false, true).mode(&attrs(0o6755), true), 0o755);
     }
 
     /// A link onto a name that already is the source must keep the file:

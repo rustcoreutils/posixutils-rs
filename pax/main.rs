@@ -684,6 +684,7 @@ fn run_copy(args: &Args) -> PaxResult<()> {
         one_file_system: args.one_file_system,
         interactive: args.interactive,
         update: args.update,
+        reset_atime: args.reset_atime,
         substitutions,
         umask: current_umask(),
     };
@@ -782,6 +783,14 @@ fn detect_format_from_bytes(buf: &[u8]) -> PaxResult<ArchiveFormat> {
         if magic16_be == 0o070707 {
             return Ok(ArchiveFormat::Cpio);
         }
+    }
+
+    // An all-zero first block is where a tar archive with no members starts:
+    // the end-of-archive indicator, which is all that `pax -w` writes when it
+    // is given nothing to archive. Its own output has to read back -- as an
+    // empty archive, and as one -a can append to.
+    if buf.len() >= 512 && crate::formats::ustar::is_zero_block(&buf[..512]) {
+        return Ok(ArchiveFormat::Ustar);
     }
 
     // Check for old-style tar by validating checksum

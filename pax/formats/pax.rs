@@ -26,12 +26,11 @@
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
 use crate::error::{PaxError, PaxResult};
 use crate::formats::ustar::{
-    calculate_checksum, parse_header as parse_ustar_header, parse_octal, try_split_path,
-    ustar_path_bytes, verify_checksum, write_field, SizeRule, BLKTYPE, BLOCK_SIZE, CHKSUM_OFF,
-    CHRTYPE, DEVMAJOR_OFF, DEVMINOR_OFF, DIRTYPE, FIFOTYPE, GID_OFF, GNAME_LEN, GNAME_OFF,
-    LINKNAME_LEN, LINKNAME_OFF, LNKTYPE, MAGIC_OFF, MODE_OFF, MTIME_OFF, NAME_LEN, NAME_OFF,
-    PREFIX_LEN, PREFIX_OFF, REGTYPE, SIZE_OFF, SYMTYPE, TYPEFLAG_OFF, UID_OFF, UNAME_LEN,
-    UNAME_OFF, VERSION_OFF, ZERO_BLOCK,
+    calculate_checksum, entry_type_to_flag, parse_header as parse_ustar_header, parse_octal,
+    try_split_path, ustar_path_bytes, verify_checksum, write_field, SizeRule, BLOCK_SIZE,
+    CHKSUM_OFF, DEVMAJOR_OFF, DEVMINOR_OFF, GID_OFF, GNAME_LEN, GNAME_OFF, LINKNAME_LEN,
+    LINKNAME_OFF, MAGIC_OFF, MODE_OFF, MTIME_OFF, NAME_LEN, NAME_OFF, PREFIX_LEN, PREFIX_OFF,
+    SIZE_OFF, TYPEFLAG_OFF, UID_OFF, UNAME_LEN, UNAME_OFF, VERSION_OFF, ZERO_BLOCK,
 };
 use crate::formats::ArchiveStream;
 use crate::options::FormatOptions;
@@ -536,17 +535,17 @@ impl ExtendedHeader {
             entry.gname = Some(gname.clone());
         }
         if let Some(mtime) = self.mtime {
-            entry.mtime = mtime.sec as u64;
+            entry.mtime = mtime.sec;
             entry.mtime_nsec = mtime.nsec;
         }
         if let Some(atime) = self.atime {
-            entry.atime = Some(atime.sec as u64);
+            entry.atime = Some(atime.sec);
             entry.atime_nsec = atime.nsec;
         }
         // Carried onto the entry so `-o listopt=%(ctime)T` can report it. The
         // extractor never applies it to the filesystem.
         if let Some(ctime) = self.ctime {
-            entry.ctime = Some(ctime.sec as u64);
+            entry.ctime = Some(ctime.sec);
             entry.ctime_nsec = ctime.nsec;
         }
         // The records nothing above holds: `charset`, `comment`, `hdrcharset`
@@ -664,10 +663,13 @@ impl ExtendedHeader {
             header.gid = Some(entry.gid);
         }
 
-        // Include mtime: always if include_times, or if subsecond precision needed
-        if include_times || entry.mtime_nsec > 0 {
+        // POSIX: an mtime record "for each file ... if the file's
+        // modification time cannot be represented exactly in the ustar header
+        // logical record" -- a fraction of a second, or a time outside the
+        // octal field's range, before 1970 included. Also under `-o times`.
+        if include_times || entry.mtime_nsec > 0 || !(0..=USTAR_TIME_MAX).contains(&entry.mtime) {
             header.mtime = Some(PaxTime {
-                sec: entry.mtime as i64,
+                sec: entry.mtime,
                 nsec: entry.mtime_nsec,
             });
         }
@@ -676,8 +678,8 @@ impl ExtendedHeader {
         // extended-record set, so an ordinary file produces no `x` header.
         if include_times {
             let (sec, nsec) = match entry.atime {
-                Some(atime) => (atime as i64, entry.atime_nsec),
-                None => (entry.mtime as i64, entry.mtime_nsec),
+                Some(atime) => (atime, entry.atime_nsec),
+                None => (entry.mtime, entry.mtime_nsec),
             };
             header.atime = Some(PaxTime { sec, nsec });
 
@@ -686,7 +688,7 @@ impl ExtendedHeader {
             // and an archive without it cannot answer `%(ctime)T`.
             if let Some(ctime) = entry.ctime {
                 header.ctime = Some(PaxTime {
-                    sec: ctime as i64,
+                    sec: ctime,
                     nsec: entry.ctime_nsec,
                 });
             }
@@ -764,7 +766,14 @@ fn parse_record_span(data: &[u8], pos: usize) -> PaxResult<RecordSpan> {
     })
 }
 
-/// Parse pax time format (decimal seconds with optional fractional part)
+/// Parse a pax time: decimal seconds since the Epoch with an optional
+/// fraction, and an optional leading '-' for a time before it.
+///
+/// The value is the signed decimal number, so "-1.5" is a second and a half
+/// before the Epoch. `PaxTime` holds it the way `timespec` does, as whole
+/// seconds rounded down plus a non-negative fraction: -2 s + 0.5 s. Taking
+/// the fraction as an addition to the truncated "-1" made it -0.5, and "-0.5"
+/// itself came out as +0.5, since "-0" parses as zero.
 fn parse_pax_time(s: &str) -> PaxResult<PaxTime> {
     let invalid = || PaxError::InvalidHeader(format!("invalid pax time: {}", s));
     let (sec_str, frac_str) = s.split_once('.').unwrap_or((s, ""));
@@ -784,17 +793,33 @@ fn parse_pax_time(s: &str) -> PaxResult<PaxTime> {
         frac.push('0');
     }
     let nsec: u32 = frac.parse().map_err(|_| invalid())?;
+
+    if sec_str.starts_with('-') && nsec > 0 {
+        return Ok(PaxTime {
+            sec: sec.checked_sub(1).ok_or_else(invalid)?,
+            nsec: NSEC_PER_SEC - nsec,
+        });
+    }
     Ok(PaxTime { sec, nsec })
 }
 
-/// Format time for pax extended header, preserving exact nanoseconds.
+const NSEC_PER_SEC: u32 = 1_000_000_000;
+
+/// Format time for pax extended header, preserving exact nanoseconds: the
+/// signed decimal value, so a time before the Epoch has a leading '-' on the
+/// whole number (see `parse_pax_time`).
 fn format_pax_time(time: PaxTime) -> String {
     if time.nsec == 0 {
-        format!("{}", time.sec)
-    } else {
-        let frac = format!("{:09}", time.nsec);
-        format!("{}.{}", time.sec, frac.trim_end_matches('0'))
+        return format!("{}", time.sec);
     }
+    let (sign, whole, nsec) = if time.sec < 0 {
+        // -2 s + 0.5 s is -1.5: one second fewer, and the fraction's complement.
+        ("-", (time.sec + 1).unsigned_abs(), NSEC_PER_SEC - time.nsec)
+    } else {
+        ("", time.sec as u64, time.nsec)
+    };
+    let frac = format!("{:09}", nsec);
+    format!("{sign}{whole}.{}", frac.trim_end_matches('0'))
 }
 
 /// Write a pax extended header record whose value is raw bytes.
@@ -1109,7 +1134,7 @@ pub struct PaxWriter<W: Write> {
     sequence: u64,          // For generating unique names for extended header files
     options: FormatOptions, // Format-specific options
     global_header_written: bool, // Track if global header has been written
-    /// Skip data writes for symlinks/hardlinks (they have no data in pax/ustar format)
+    /// Skip data writes for a symlink, which has no data blocks
     skip_data: bool,
 }
 
@@ -1170,16 +1195,15 @@ impl<W: Write> PaxWriter<W> {
         // Create a header for the global extended header block
         let mut header = [0u8; BLOCK_SIZE];
 
-        // Generate name for global header using template
+        // Named by the globexthdr.name template. Its default is under
+        // $TMPDIR, which can be too long for the header; the same name without
+        // the directory is used then.
         self.sequence += 1;
         let glob_name = self.options.expand_globexthdr_name(self.sequence);
-        // Truncate to fit in NAME_LEN if too long
-        let glob_name = if glob_name.len() > NAME_LEN {
-            format!("GlobalHead.{}", self.sequence)
-        } else {
-            glob_name
-        };
-        write_field(&mut header[NAME_OFF..], glob_name.as_bytes(), NAME_LEN);
+        let file_name = std::path::Path::new(&glob_name).file_name();
+        write_header_name(&mut header, glob_name.as_bytes(), || {
+            file_name.unwrap_or_default().as_bytes().to_vec()
+        });
 
         // Mode, uid, gid (use reasonable defaults)
         write_octal(&mut header[MODE_OFF..], 0o644, 8);
@@ -1237,16 +1261,17 @@ impl<W: Write> PaxWriter<W> {
         // Create a header for the extended header block
         let mut header = [0u8; BLOCK_SIZE];
 
-        // Generate a unique name for the extended header using template
+        // Named by the exthdr.name template, from the member's pathname. A
+        // name too long for the header is formed by the same template from
+        // the file's name alone, as though it were at the top level.
         self.sequence += 1;
         let ext_name = self.options.expand_exthdr_name(&entry.path, self.sequence);
-        // Truncate to fit in NAME_LEN if too long, or use fallback
-        let ext_name = if ext_name.len() > NAME_LEN {
-            format!("PaxHeader/{}", self.sequence)
-        } else {
-            ext_name
-        };
-        write_field(&mut header[NAME_OFF..], ext_name.as_bytes(), NAME_LEN);
+        write_header_name(&mut header, ext_name.as_bytes(), || {
+            let file_name = entry.path.file_name().unwrap_or(entry.path.as_os_str());
+            self.options
+                .expand_exthdr_name(std::path::Path::new(file_name), self.sequence)
+                .into_bytes()
+        });
 
         // Mode, uid, gid (use reasonable defaults)
         write_octal(&mut header[MODE_OFF..], 0o644, 8);
@@ -1257,7 +1282,7 @@ impl<W: Write> PaxWriter<W> {
         write_octal(&mut header[SIZE_OFF..], data.len() as u64, 12);
 
         // Mtime (use entry's mtime)
-        write_octal(&mut header[MTIME_OFF..], entry.mtime, 12);
+        write_octal(&mut header[MTIME_OFF..], ustar_time(entry.mtime), 12);
 
         // Typeflag 'x' for per-file extended header
         header[TYPEFLAG_OFF] = PAX_XHDR;
@@ -1297,20 +1322,26 @@ impl<W: Write> ArchiveWriter for PaxWriter<W> {
         // identically, so there is no need to force an mtime record.
         let ext_header = ExtendedHeader::from_entry(entry, &self.options);
 
-        self.write_extended_header(&ext_header, entry)?;
-
-        // Write the regular ustar header
+        // Built before anything is written, so that a member this format
+        // cannot hold is refused without leaving its `x` header behind to
+        // describe whatever member comes next.
         let header = build_ustar_header(entry)?;
+        self.write_extended_header(&ext_header, entry)?;
         self.writer.write_all(&header)?;
         self.bytes_written = 0;
         self.current_size = entry.size;
-        // Per POSIX, symlinks and hardlinks have no data blocks in pax/ustar format
-        self.skip_data = matches!(entry.entry_type, EntryType::Symlink | EntryType::Hardlink);
+        // A symlink has no data blocks. A hard link has them exactly when the
+        // caller gave it a size, which is `-o linkdata`.
+        self.skip_data = entry.entry_type == EntryType::Symlink;
         Ok(())
     }
 
+    fn hardlinks_may_carry_data(&self) -> bool {
+        true
+    }
+
     fn write_data(&mut self, data: &[u8]) -> PaxResult<()> {
-        // Symlinks/hardlinks have no data blocks in pax/ustar format
+        // Symlinks have no data blocks
         if self.skip_data {
             return Ok(());
         }
@@ -1362,16 +1393,19 @@ fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
         std::cmp::min(entry.gid as u64, 0o7777777),
         8,
     );
-    // Per POSIX, symlinks and hardlinks must have size=0 (no data blocks)
+    // A symlink records size 0 (no data blocks). A hard link records the
+    // size of the data it carries: none, unless `-o linkdata` -- pax, unlike
+    // ustar, "may" include data blocks for typeflag 1.
     let header_size = match entry.entry_type {
-        EntryType::Symlink | EntryType::Hardlink => 0,
+        EntryType::Symlink => 0,
         _ => std::cmp::min(entry.size, 0o77777777777),
     };
     write_octal(&mut header[SIZE_OFF..], header_size, 12);
-    write_octal(&mut header[MTIME_OFF..], entry.mtime, 12);
+    // Outside the field's range the `mtime` record holds the real value.
+    write_octal(&mut header[MTIME_OFF..], ustar_time(entry.mtime), 12);
 
     // Typeflag
-    header[TYPEFLAG_OFF] = entry_type_to_flag(&entry.entry_type);
+    header[TYPEFLAG_OFF] = entry_type_to_flag(entry.entry_type)?;
 
     // Linkname
     if let Some(ref target) = entry.link_target {
@@ -1430,6 +1464,31 @@ fn split_path(entry: &ArchiveEntry) -> PaxResult<(Vec<u8>, Vec<u8>)> {
     ))
 }
 
+/// Put an extended header's name in the name and prefix fields, split as a
+/// member's pathname would be.
+///
+/// When it does not fit, `shorter` supplies the name to use instead, and that
+/// is cut to the name field if it does not fit either. Nothing reads these
+/// names back -- a reader that knows the format consumes the header, and one
+/// that does not extracts it as a file -- so what matters is only that the
+/// fallback keeps the template's shape, and with it a relative name for a
+/// relative member.
+fn write_header_name(
+    header: &mut [u8; BLOCK_SIZE],
+    name: &[u8],
+    shorter: impl FnOnce() -> Vec<u8>,
+) {
+    let (name, prefix) = try_split_path(name).unwrap_or_else(|| {
+        let short = shorter();
+        try_split_path(&short).unwrap_or_else(|| {
+            let end = floor_char_boundary(&short, NAME_LEN);
+            (short[..end].to_vec(), Vec::new())
+        })
+    });
+    write_field(&mut header[NAME_OFF..], &name, NAME_LEN);
+    write_field(&mut header[PREFIX_OFF..], &prefix, PREFIX_LEN);
+}
+
 /// Largest index `<= max` that does not cut a UTF-8 character of `bytes` in
 /// half.
 ///
@@ -1452,26 +1511,25 @@ fn floor_char_boundary(bytes: &[u8], max: usize) -> usize {
     end
 }
 
-/// Convert EntryType to typeflag
-fn entry_type_to_flag(entry_type: &EntryType) -> u8 {
-    match entry_type {
-        EntryType::Regular => REGTYPE,
-        EntryType::Directory => DIRTYPE,
-        EntryType::Symlink => SYMTYPE,
-        EntryType::Hardlink => LNKTYPE,
-        EntryType::CharDevice => CHRTYPE,
-        EntryType::BlockDevice => BLKTYPE,
-        EntryType::Fifo => FIFOTYPE,
-        EntryType::Socket => REGTYPE, // Sockets not supported in tar, fall back to regular
-    }
-}
-
 /// Write an octal number to a field
 fn write_octal(buf: &mut [u8], val: u64, width: usize) {
     let s = format!("{:0width$o} ", val, width = width - 2);
     let bytes = s.as_bytes();
     let len = std::cmp::min(bytes.len(), width);
     buf[..len].copy_from_slice(&bytes[..len]);
+}
+
+/// The largest time the ustar header's 12-byte octal `mtime` field holds.
+const USTAR_TIME_MAX: i64 = 0o77777777777;
+
+/// A time as the ustar `mtime` field can hold it: clamped into its range.
+///
+/// Only a fallback for a reader that ignores extended headers -- a time
+/// outside the range also gets an `mtime` record. Writing the value as it was
+/// did not fail but wrapped: the two's-complement bits of a time before 1970
+/// truncated to eleven octal digits read back as a date in the 2500s.
+fn ustar_time(time: i64) -> u64 {
+    time.clamp(0, USTAR_TIME_MAX) as u64
 }
 
 /// Round up to next block boundary
@@ -1622,6 +1680,49 @@ mod tests {
         );
     }
 
+    /// A time before the Epoch is the signed decimal value: "-1.5" is a
+    /// second and a half before it, held as -2 s + 0.5 s.
+    #[test]
+    fn test_negative_pax_times_roundtrip() {
+        for (text, sec, nsec) in [
+            ("-86400", -86400, 0),
+            ("-1.5", -2, 500_000_000),
+            ("-0.5", -1, 500_000_000),
+            ("-0.000000001", -1, 999_999_999),
+            ("-10.25", -11, 750_000_000),
+        ] {
+            let time = PaxTime { sec, nsec };
+            assert_eq!(parse_pax_time(text).unwrap(), time, "parse {text}");
+            assert_eq!(format_pax_time(time), text, "format {text}");
+        }
+        assert!(parse_pax_time(&format!("{}.5", i64::MIN)).is_err());
+    }
+
+    /// A time the ustar field cannot hold gets an `mtime` record, and the
+    /// field itself is clamped rather than wrapped.
+    #[test]
+    fn test_out_of_range_mtime_gets_a_record() {
+        let opts = FormatOptions::default();
+        for mtime in [-86400, USTAR_TIME_MAX + 1] {
+            let mut entry = ArchiveEntry::new(PathBuf::from("f"), EntryType::Regular);
+            entry.mtime = mtime;
+            let header = ExtendedHeader::from_entry(&entry, &opts);
+            assert_eq!(
+                header.mtime,
+                Some(PaxTime {
+                    sec: mtime,
+                    nsec: 0
+                })
+            );
+        }
+        assert_eq!(ustar_time(-86400), 0);
+        assert_eq!(ustar_time(i64::MAX), USTAR_TIME_MAX as u64);
+
+        let mut entry = ArchiveEntry::new(PathBuf::from("f"), EntryType::Regular);
+        entry.mtime = 1_000_000_000;
+        assert_eq!(ExtendedHeader::from_entry(&entry, &opts).mtime, None);
+    }
+
     #[test]
     fn test_format_pax_time() {
         assert_eq!(
@@ -1688,6 +1789,26 @@ mod tests {
         writer.finish_entry().unwrap();
         writer.finish().unwrap();
         out
+    }
+
+    /// An extended header whose templated name is too long for the header is
+    /// named by the same template from the file's name alone -- still
+    /// relative, never an unrelated fixed name.
+    #[test]
+    fn test_long_extended_header_name_keeps_the_template() {
+        let mut out = Vec::new();
+        let mut writer = PaxWriter::with_options(&mut out, FormatOptions::default());
+        let path = format!("{}/{}", "x".repeat(200), "y".repeat(90));
+        let entry = ArchiveEntry::new(PathBuf::from(path), EntryType::Regular);
+        writer.write_entry(&entry).unwrap();
+        assert_eq!(out[TYPEFLAG_OFF], PAX_XHDR);
+        let name = crate::formats::ustar::path_field(&out[NAME_OFF..NAME_OFF + NAME_LEN]);
+        let prefix = crate::formats::ustar::path_field(&out[PREFIX_OFF..PREFIX_OFF + PREFIX_LEN]);
+        assert_eq!(name, "y".repeat(90).as_bytes());
+        assert_eq!(
+            prefix,
+            format!("./PaxHeaders.{}", std::process::id()).as_bytes()
+        );
     }
 
     fn end_of(archive: &[u8]) -> (u64, bool) {

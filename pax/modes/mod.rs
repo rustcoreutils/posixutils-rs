@@ -43,3 +43,31 @@ pub(crate) fn is_fatal(err: &crate::error::PaxError) -> bool {
         _ => false,
     }
 }
+
+/// `-X`: whether the walk may go below a directory on device `dev`, given the
+/// device of the operand it was reached from (`None` at the operand itself).
+///
+/// POSIX: "when a directory with a different device ID is encountered, pax
+/// shall process (archive or copy) the directory itself but shall not process
+/// any files below the directory." So this decides descent only; the mount
+/// point is still archived or copied, which is why it is not a filter on
+/// entries.
+pub(crate) fn may_descend(one_file_system: bool, operand_dev: Option<u64>, dev: u64) -> bool {
+    !one_file_system || operand_dev.is_none_or(|operand| operand == dev)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::may_descend;
+
+    #[test]
+    fn one_file_system_stops_below_a_mount_point_only() {
+        // The operand itself, and anything at all without -X.
+        assert!(may_descend(true, None, 7));
+        assert!(may_descend(false, Some(1), 7));
+        // A directory on the operand's device is descended.
+        assert!(may_descend(true, Some(1), 1));
+        // A mount point is not.
+        assert!(!may_descend(true, Some(1), 7));
+    }
+}

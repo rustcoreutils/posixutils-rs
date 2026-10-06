@@ -551,3 +551,63 @@ pub fn stdout_str(output: &Output) -> String {
 pub fn stderr_str(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
+
+/// A small file system mounted at a directory, for the tests that need a
+/// mount point (`-X`) or a second device (`-l` across devices). Unmounted when
+/// dropped.
+///
+/// Only macOS can do this unprivileged (`hdiutil`); elsewhere `mount` returns
+/// `None` and the caller skips.
+pub struct ScratchMount {
+    mount_point: std::path::PathBuf,
+}
+
+impl ScratchMount {
+    /// Mount a fresh 1 MB file system at `mount_point`, which must be an
+    /// empty directory. `scratch` holds the disk image.
+    pub fn mount(scratch: &Path, mount_point: &Path) -> Option<ScratchMount> {
+        if !cfg!(target_os = "macos") {
+            return None;
+        }
+        let image = scratch.join("scratch.dmg");
+        let hdiutil = |args: &[&std::ffi::OsStr]| {
+            Command::new("hdiutil")
+                .args(args)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        let created = hdiutil(&[
+            "create".as_ref(),
+            "-size".as_ref(),
+            "1m".as_ref(),
+            "-fs".as_ref(),
+            "HFS+".as_ref(),
+            "-volname".as_ref(),
+            "paxtest".as_ref(),
+            image.as_os_str(),
+        ]);
+        let attached = created
+            && hdiutil(&[
+                "attach".as_ref(),
+                "-nobrowse".as_ref(),
+                "-mountpoint".as_ref(),
+                mount_point.as_os_str(),
+                image.as_os_str(),
+            ]);
+        attached.then(|| ScratchMount {
+            mount_point: mount_point.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for ScratchMount {
+    fn drop(&mut self) {
+        let _ = Command::new("hdiutil")
+            .args([
+                "detach".as_ref(),
+                "-force".as_ref(),
+                self.mount_point.as_os_str(),
+            ])
+            .output();
+    }
+}

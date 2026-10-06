@@ -348,7 +348,8 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
         uid,
         gid,
         size,
-        mtime,
+        // At most twelve octal digits: always a valid time_t.
+        mtime: mtime as i64,
         entry_type,
         link_target,
         uname: if uname.is_empty() {
@@ -714,10 +715,10 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
         _ => entry.size,
     };
     write_octal(&mut header[SIZE_OFF..], header_size, 12)?;
-    write_octal(&mut header[MTIME_OFF..], entry.mtime, 12)?;
+    write_octal(&mut header[MTIME_OFF..], entry.unsigned_mtime()?, 12)?;
 
     // Typeflag
-    header[TYPEFLAG_OFF] = entry_type_to_flag(&entry.entry_type);
+    header[TYPEFLAG_OFF] = entry_type_to_flag(entry.entry_type)?;
 
     // Linkname
     if let Some(ref target) = entry.link_target {
@@ -803,9 +804,14 @@ pub(crate) fn split_name_prefix(path: &[u8]) -> Option<(&[u8], &[u8])> {
     None
 }
 
-/// Convert EntryType to typeflag
-fn entry_type_to_flag(entry_type: &EntryType) -> u8 {
-    match entry_type {
+/// The typeflag of a member of this type, for every writer of a tar header.
+///
+/// A socket has none. Writing it as a regular file, as this used to, put an
+/// empty file in the archive where there had been a socket; write mode
+/// diagnoses one before it gets here (`ArchiveWriter::supports_sockets`), and
+/// this refuses one that does.
+pub(crate) fn entry_type_to_flag(entry_type: EntryType) -> PaxResult<u8> {
+    Ok(match entry_type {
         EntryType::Regular => REGTYPE,
         EntryType::Directory => DIRTYPE,
         EntryType::Symlink => SYMTYPE,
@@ -813,8 +819,12 @@ fn entry_type_to_flag(entry_type: &EntryType) -> u8 {
         EntryType::CharDevice => CHRTYPE,
         EntryType::BlockDevice => BLKTYPE,
         EntryType::Fifo => FIFOTYPE,
-        EntryType::Socket => REGTYPE, // Sockets typically not stored; fallback to regular
-    }
+        EntryType::Socket => {
+            return Err(PaxError::InvalidFormat(
+                "a socket cannot be stored in a tar archive".to_string(),
+            ))
+        }
+    })
 }
 
 /// Write a string to a field, NUL-terminated if space permits

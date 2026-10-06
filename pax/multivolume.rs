@@ -36,7 +36,7 @@
 //! - Compression is not supported with multi-volume
 //! - Volume scripts are executed synchronously
 
-use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
+use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter};
 use crate::blocked_io::{BlockedReader, BlockedWriter};
 use crate::error::{PaxError, PaxResult};
 use crate::formats::ustar::parse_octal;
@@ -686,19 +686,10 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     write_octal(&mut header[124..], entry.size, 12);
 
     // Mtime
-    write_octal(&mut header[136..], entry.mtime, 12);
+    write_octal(&mut header[136..], entry.unsigned_mtime()?, 12);
 
     // Typeflag
-    let typeflag = match entry.entry_type {
-        EntryType::Regular => b'0',
-        EntryType::Directory => b'5',
-        EntryType::Symlink => b'2',
-        EntryType::Hardlink => b'1',
-        EntryType::CharDevice => b'3',
-        EntryType::BlockDevice => b'4',
-        EntryType::Fifo => b'6',
-        EntryType::Socket => b'0',
-    };
+    let typeflag = crate::formats::ustar::entry_type_to_flag(entry.entry_type)?;
     header[156] = typeflag;
 
     // Link name for symlinks/hardlinks. The linkname field has no prefix

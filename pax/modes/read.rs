@@ -902,7 +902,7 @@ fn is_archive_newer_at(entry: &ArchiveEntry, dirfd: BorrowedFd<'_>, name: &CStr)
     if r != 0 {
         return true; // nothing there: extract it
     }
-    entry.mtime as i64 > st.st_mtime
+    entry.mtime > st.st_mtime
 }
 
 /// The ids to give an extracted file.
@@ -945,9 +945,9 @@ fn attrs_of(entry: &ArchiveEntry) -> Attrs {
         mode: entry.mode,
         uid,
         gid,
-        mtime: entry.mtime as i64,
+        mtime: entry.mtime,
         mtime_nsec: entry.mtime_nsec as i64,
-        atime: entry.atime.map(|a| a as i64),
+        atime: entry.atime,
         atime_nsec: entry.atime_nsec as i64,
     }
 }

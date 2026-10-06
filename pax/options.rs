@@ -466,15 +466,9 @@ fn expand_template(template: &str, ctx: &TemplateContext) -> String {
 
 /// Expand template for per-file extended header names
 fn expand_header_template(template: &str, path: &std::path::Path, sequence: u64) -> String {
-    // Use empty string as fallback (matching original behavior with unwrap_or_default)
-    let dirname_owned = path
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let filename_owned = path
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let path = crate::rawpath::as_bytes(path);
+    let dirname_owned = String::from_utf8_lossy(dirname(path)).into_owned();
+    let filename_owned = String::from_utf8_lossy(basename(path)).into_owned();
 
     let ctx = TemplateContext {
         dirname: Some(dirname_owned.as_str()),
@@ -484,6 +478,41 @@ fn expand_header_template(template: &str, path: &std::path::Path, sequence: u64)
     };
 
     expand_template(template, &ctx)
+}
+
+/// What dirname(1) gives for `path`, which is what POSIX defines `%d` as.
+///
+/// In particular "." for a name with no directory part. `Path::parent` gives
+/// "" there instead, which turned the default "%d/PaxHeaders.%p/%f" into an
+/// absolute name for every top-level member -- one a reader that ignores
+/// extended headers would extract at the root of the file system.
+fn dirname(path: &[u8]) -> &[u8] {
+    let trimmed = trim_trailing_slashes(path);
+    match trimmed.iter().rposition(|&b| b == b'/') {
+        None if trimmed.is_empty() && !path.is_empty() => b"/",
+        None => b".",
+        Some(i) => match trim_trailing_slashes(&trimmed[..i]) {
+            b"" => b"/",
+            dir => dir,
+        },
+    }
+}
+
+/// What basename(1) gives for `path`, which is what POSIX defines `%f` as.
+fn basename(path: &[u8]) -> &[u8] {
+    let trimmed = trim_trailing_slashes(path);
+    match trimmed.iter().rposition(|&b| b == b'/') {
+        Some(i) => &trimmed[i + 1..],
+        None if trimmed.is_empty() && !path.is_empty() => b"/",
+        None => trimmed,
+    }
+}
+
+/// `path` without trailing slashes -- unless it is nothing but slashes, which
+/// dirname and basename both treat as "/".
+fn trim_trailing_slashes(path: &[u8]) -> &[u8] {
+    let end = path.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1);
+    &path[..end]
 }
 
 /// Expand template for global extended header names
@@ -844,7 +873,7 @@ enum KeywordValue {
 
 /// The seconds value of a time-valued keyword, if this entry carries one.
 /// The outer `Option` distinguishes "not a time keyword" from "no record".
-fn time_keyword(info: &ListEntryInfo, keyword: &str) -> Option<Option<u64>> {
+fn time_keyword(info: &ListEntryInfo, keyword: &str) -> Option<Option<i64>> {
     match keyword {
         "mtime" => Some(Some(info.entry.mtime)),
         "atime" => Some(info.entry.atime),
@@ -1068,7 +1097,7 @@ fn cpio_keyword(info: &ListEntryInfo, keyword: &str) -> Option<Field> {
         ),
         "uid" => fmt_decimal(info.entry.uid as u64),
         "gid" => fmt_decimal(info.entry.gid as u64),
-        "mtime" => fmt_decimal(info.entry.mtime),
+        "mtime" => Field::Value(info.entry.mtime.to_string().into_bytes()),
         "rdev" if is_device(info) => fmt_octal(crate::formats::cpio::pack_rdev(
             info.entry.devmajor,
             info.entry.devminor,
@@ -1301,7 +1330,7 @@ pub(crate) fn format_mode_symbolic(mode: u32, entry_type: EntryType) -> String {
 }
 
 /// Format time in traditional ls -l style
-pub(crate) fn format_time_traditional(mtime: u64) -> String {
+pub(crate) fn format_time_traditional(mtime: i64) -> String {
     // POSIX `ls -l`-style time, formatted via libc strftime (localtime_r), so TZ
     // and LC_TIME take effect: date+time when recent, date+year otherwise.
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1310,12 +1339,12 @@ pub(crate) fn format_time_traditional(mtime: u64) -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let age = now_secs - mtime as i64;
+    let age = now_secs - mtime;
     let six_months: i64 = 180 * 24 * 60 * 60;
     let recent = (0..six_months).contains(&age);
 
     let fmt = if recent { "%b %e %H:%M" } else { "%b %e  %Y" };
-    plib::locale::strftime(fmt, mtime as i64).unwrap_or_else(|_| mtime.to_string())
+    plib::locale::strftime(fmt, mtime).unwrap_or_else(|_| mtime.to_string())
 }
 
 /// The default subformat of the listopt `T` conversion (POSIX pax EXTENDED
@@ -1325,8 +1354,8 @@ const DEFAULT_TIME_SUBFORMAT: &str = "%b %e %H:%M %Y";
 
 /// Render `secs` through `subformat`, TZ- and LC_TIME-aware via strftime,
 /// falling back to the raw seconds if the subformat cannot be rendered.
-fn strftime_or_secs(secs: u64, subformat: &str) -> String {
-    plib::locale::strftime(subformat, secs as i64).unwrap_or_else(|_| secs.to_string())
+fn strftime_or_secs(secs: i64, subformat: &str) -> String {
+    plib::locale::strftime(subformat, secs).unwrap_or_else(|_| secs.to_string())
 }
 
 #[cfg(test)]
@@ -1378,6 +1407,30 @@ mod tests {
     fn test_parse_escaped_comma() {
         let opts = FormatOptions::parse(r"listopt=a\,b").unwrap();
         assert_eq!(opts.list_format, Some("a,b".to_string()));
+    }
+
+    #[test]
+    fn test_exthdr_name_dirname_and_basename() {
+        for (path, dir, base) in [
+            ("top", ".", "top"),
+            ("a/b", "a", "b"),
+            ("a/b/c", "a/b", "c"),
+            ("d/", ".", "d"),
+            ("a//b//", "a", "b"),
+            ("/top", "/", "top"),
+            ("/", "/", "/"),
+        ] {
+            assert_eq!(dirname(path.as_bytes()), dir.as_bytes(), "dirname {path}");
+            assert_eq!(
+                basename(path.as_bytes()),
+                base.as_bytes(),
+                "basename {path}"
+            );
+        }
+        assert_eq!(
+            expand_header_template("%d/PaxHeaders.%p/%f", std::path::Path::new("top"), 1),
+            format!("./PaxHeaders.{}/top", std::process::id())
+        );
     }
 
     #[test]

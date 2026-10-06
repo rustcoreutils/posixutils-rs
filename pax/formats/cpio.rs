@@ -380,6 +380,10 @@ impl<W: Write> ArchiveWriter for CpioWriter<W> {
         self.format == CpioFormat::NewcCrc
     }
 
+    fn supports_sockets(&self) -> bool {
+        true
+    }
+
     fn write_entry(&mut self, entry: &ArchiveEntry) -> PaxResult<()> {
         let ids = self.archive_ids(entry);
 
@@ -506,7 +510,8 @@ fn parse_odc_header<R: Read>(header: &[u8], reader: &mut R) -> PaxResult<Archive
         uid,
         gid,
         size,
-        mtime,
+        // At most 11 octal or 8 hex digits: always a valid time_t.
+        mtime: mtime as i64,
         entry_type,
         link_target,
         dev,
@@ -607,7 +612,8 @@ fn parse_newc_header<R: Read>(header: &[u8], reader: &mut R) -> PaxResult<(Archi
             uid,
             gid,
             size,
-            mtime,
+            // At most 11 octal or 8 hex digits: always a valid time_t.
+            mtime: mtime as i64,
             entry_type,
             link_target,
             dev,
@@ -725,7 +731,8 @@ fn parse_bin_header<R: Read>(
             uid,
             gid,
             size,
-            mtime,
+            // At most 11 octal or 8 hex digits: always a valid time_t.
+            mtime: mtime as i64,
             entry_type,
             link_target,
             dev,
@@ -870,7 +877,7 @@ fn build_odc_header(
     write_octal_field(&mut header, packed_rdev(entry), 6)?;
 
     // c_mtime
-    write_octal_field(&mut header, entry.mtime, 11)?;
+    write_octal_field(&mut header, entry.unsigned_mtime()?, 11)?;
 
     // c_namesize (including NUL)
     write_octal_field(&mut header, namesize as u64, 6)?;
@@ -906,7 +913,7 @@ fn build_newc_header(
     write_hex_field_masked(&mut header, entry.uid as u64);
     write_hex_field_masked(&mut header, entry.gid as u64);
     write_hex_field(&mut header, nlink, "c_nlink")?;
-    write_hex_field(&mut header, entry.mtime, "c_mtime")?;
+    write_hex_field(&mut header, entry.unsigned_mtime()?, "c_mtime")?;
     write_hex_field(&mut header, entry.size, "c_filesize")?;
 
     // c_devmajor / c_devminor describe the filesystem the member came from;
@@ -960,14 +967,15 @@ fn build_bin_header(
     push_u16(nlink & 0xffff);
     push_u16(packed_rdev(entry));
 
-    if entry.mtime > u32::MAX as u64 {
+    let mtime = entry.unsigned_mtime()?;
+    if mtime > u32::MAX as u64 {
         return Err(PaxError::InvalidHeader(format!(
             "modification time {} does not fit the binary cpio format",
-            entry.mtime
+            mtime
         )));
     }
-    push_u16(entry.mtime >> 16);
-    push_u16(entry.mtime & 0xffff);
+    push_u16(mtime >> 16);
+    push_u16(mtime & 0xffff);
 
     if namesize > u16::MAX as usize {
         return Err(PaxError::InvalidHeader(format!(

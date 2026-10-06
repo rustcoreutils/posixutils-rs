@@ -798,3 +798,70 @@ fn test_copy_hardlink_visited_twice() {
     assert_eq!(fs::read_to_string(out.join("tree/f")).unwrap(), "DATA\n");
     assert_eq!(fs::read_to_string(out.join("tree/g")).unwrap(), "DATA\n");
 }
+
+/// -l with -L: POSIX, "the hard link created in the destination file hierarchy
+/// shall be to the file referenced by the symbolic link" -- not to the link.
+#[test]
+fn test_copy_link_with_dereference_links_the_target() {
+    let temp = TempDir::new().unwrap();
+    let out = temp.path().join("out");
+    fs::create_dir(&out).unwrap();
+    fs::write(temp.path().join("t"), "T\n").unwrap();
+    std::os::unix::fs::symlink("t", temp.path().join("s")).unwrap();
+
+    for follow in ["-L", "-H"] {
+        let output = run_pax_in_dir(&["-rwl", follow, "s", "out"], temp.path());
+        assert_success(&output, &format!("pax -rwl {follow}"));
+        let copied = fs::symlink_metadata(out.join("s")).unwrap();
+        assert!(copied.file_type().is_file(), "{follow}: not a regular file");
+        let target = fs::metadata(temp.path().join("t")).unwrap();
+        assert_eq!(
+            copied.ino(),
+            target.ino(),
+            "{follow}: not linked to the target"
+        );
+        fs::remove_file(out.join("s")).unwrap();
+    }
+}
+
+/// -l across devices cannot link; POSIX says the file is then copied, and
+/// that expected fallback is neither diagnosed nor a failure.
+#[test]
+fn test_copy_link_across_devices_copies_quietly() {
+    let temp = TempDir::new().unwrap();
+    let mnt = temp.path().join("mnt");
+    let out = temp.path().join("out");
+    fs::create_dir(&mnt).unwrap();
+    fs::create_dir(&out).unwrap();
+    let Some(_mount) = ScratchMount::mount(temp.path(), &mnt) else {
+        return; // no unprivileged way to get a second device here
+    };
+    fs::write(mnt.join("f"), "F\n").unwrap();
+
+    let output = run_pax_in_dir(&["-rwl", "f", out.to_str().unwrap()], &mnt);
+    assert_success(&output, "pax -rwl across devices");
+    assert_eq!(stderr_str(&output), "");
+    assert_eq!(fs::read_to_string(out.join("f")).unwrap(), "F\n");
+}
+
+/// -X: a directory on another device is itself copied; only what is below
+/// it is not.
+#[test]
+fn test_copy_one_file_system_keeps_the_mount_point() {
+    let temp = TempDir::new().unwrap();
+    let tree = temp.path().join("tree");
+    let out = temp.path().join("out");
+    fs::create_dir_all(tree.join("mnt")).unwrap();
+    fs::create_dir(&out).unwrap();
+    fs::write(tree.join("f"), "F\n").unwrap();
+    let Some(_mount) = ScratchMount::mount(temp.path(), &tree.join("mnt")) else {
+        return;
+    };
+    fs::write(tree.join("mnt/inside"), "I\n").unwrap();
+
+    let output = run_pax_in_dir(&["-rwX", "tree", "out"], temp.path());
+    assert_success(&output, "pax -rwX");
+    assert!(out.join("tree/f").is_file());
+    assert!(out.join("tree/mnt").is_dir(), "mount point not copied");
+    assert!(!out.join("tree/mnt/inside").exists(), "descended below it");
+}

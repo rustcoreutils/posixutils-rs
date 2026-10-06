@@ -284,15 +284,30 @@ pub(crate) fn link_replacing(
     name: &CStr,
     no_clobber: bool,
 ) -> PaxResult<bool> {
+    link_replacing_with(from_dir, from_name, false, dirfd, name, no_clobber)
+}
+
+/// `link_replacing`, linking the file a symbolic link `from_name` refers to
+/// when `follow` is set -- copy mode's `-l` under `-H`/`-L`, where POSIX says
+/// "the hard link created ... shall be to the file referenced by the symbolic
+/// link". Without it, `from_name` itself is linked, whatever it is.
+pub(crate) fn link_replacing_with(
+    from_dir: libc::c_int,
+    from_name: &CStr,
+    follow: bool,
+    dirfd: BorrowedFd<'_>,
+    name: &CStr,
+    no_clobber: bool,
+) -> PaxResult<bool> {
+    let flags = if follow { libc::AT_SYMLINK_FOLLOW } else { 0 };
     let link = || {
-        // flags 0: link `from_name` itself, never anything it points at.
         let r = unsafe {
             libc::linkat(
                 from_dir,
                 from_name.as_ptr(),
                 dirfd.as_raw_fd(),
                 name.as_ptr(),
-                0,
+                flags,
             )
         };
         if r != 0 {
@@ -377,6 +392,75 @@ pub(crate) fn open_source_file(
     }
 
     Ok(file)
+}
+
+/// `-t`: put back the access time that reading a file disturbed.
+///
+/// Through the descriptor the data came from rather than by name: resolving
+/// the name again could stamp a different file -- a symbolic link's target, or
+/// whatever replaced the name meanwhile. `UTIME_OMIT` leaves the modification
+/// time as it is instead of reading it back to write it again.
+///
+/// POSIX makes -t conditional on the user having "the permissions required by
+/// futimens()", so a file the user may not stamp (EPERM) is left alone without
+/// comment. Any other failure is a warning: the file itself was read.
+pub(crate) fn restore_atime(fd: BorrowedFd<'_>, path: &Path, metadata: &ftw::Metadata) {
+    use std::os::unix::fs::MetadataExt;
+
+    let times = [
+        libc::timespec {
+            tv_sec: metadata.atime() as libc::time_t,
+            tv_nsec: metadata.atime_nsec() as libc::c_long,
+        },
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+    ];
+    if unsafe { libc::futimens(fd.as_raw_fd(), times.as_ptr()) } == 0 {
+        return;
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::EPERM) {
+        eprintln!(
+            "pax: warning: cannot reset atime on {}: {}",
+            path.display(),
+            err
+        );
+    }
+}
+
+/// `-t` for a directory, once the walk has finished reading it.
+///
+/// The walk's own descriptor for it is gone by then, so it is opened again
+/// from the directory it was found in -- opening a directory does not touch
+/// its access time, only reading it does -- and stamped only if it is still
+/// the directory the walk saw.
+pub(crate) fn restore_dir_atime(entry: &ftw::Entry<'_>) {
+    use std::os::unix::fs::MetadataExt;
+
+    let Some(metadata) = entry.metadata() else {
+        return;
+    };
+    // -H/-L: the walk followed a symbolic link to get here.
+    let followed = entry.is_symlink() == Some(true) && !metadata.is_symlink();
+    let mut flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    if !followed {
+        flags |= libc::O_NOFOLLOW;
+    }
+    let fd = unsafe { libc::openat(entry.dir_fd(), entry.file_name().as_ptr(), flags) };
+    if fd < 0 {
+        return;
+    }
+    let dir = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // Casts needed: `dev_t` is i32 on macOS and u64 on Linux.
+    #[allow(clippy::unnecessary_cast)]
+    let same = unsafe { libc::fstat(dir.as_raw_fd(), &mut st) } == 0
+        && (st.st_dev as u64, st.st_ino as u64) == (metadata.dev(), metadata.ino());
+    if same {
+        restore_atime(dir.as_fd(), entry.path().as_inner(), metadata);
+    }
 }
 
 /// The attributes a copied or extracted file takes from its source, whether that

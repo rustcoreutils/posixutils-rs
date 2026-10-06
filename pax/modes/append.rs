@@ -57,6 +57,11 @@ pub fn append_to_archive(
     let format = match &scan {
         None => ArchiveFormat::Cpio,
         Some(scan) if scan.has_extended_header => ArchiveFormat::Pax,
+        // A tar archive with no members has no format of its own to keep, so
+        // either tar format may be appended to it.
+        Some(scan) if scan.end == 0 && requested_format == Some(ArchiveFormat::Pax) => {
+            ArchiveFormat::Pax
+        }
         Some(_) => ArchiveFormat::Ustar,
     };
 
@@ -115,7 +120,7 @@ struct TarScan {
     has_extended_header: bool,
     /// The latest modification time recorded for each member name, when -u
     /// asked for them.
-    mtimes: Option<HashMap<PathBuf, u64>>,
+    mtimes: Option<HashMap<PathBuf, i64>>,
 }
 
 /// Walk a tar-family archive member by member with the reader `pax -r` uses.
@@ -129,7 +134,7 @@ struct TarScan {
 fn scan_tar_archive(file: &mut File, want_mtimes: bool) -> PaxResult<TarScan> {
     file.seek(SeekFrom::Start(0))?;
     let mut archive = PaxReader::seekable(&mut *file);
-    let mut mtimes: Option<HashMap<PathBuf, u64>> = want_mtimes.then(HashMap::new);
+    let mut mtimes: Option<HashMap<PathBuf, i64>> = want_mtimes.then(HashMap::new);
 
     // A name can appear more than once -- that is what appending does -- and
     // the most recent copy is the one an extraction would produce, so it is

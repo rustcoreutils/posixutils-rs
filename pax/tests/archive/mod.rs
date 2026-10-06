@@ -15,6 +15,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -1427,4 +1428,195 @@ fn test_write_issues_whole_records() {
     }
     assert!(!sizes.is_empty());
     assert!(sizes.iter().all(|&n| n == 10240), "write sizes: {sizes:?}");
+}
+
+/// `-o linkdata`: a pax-format hard link "may include" the file's data, and
+/// this option asks for it -- every hard-link member then carries the bytes.
+#[test]
+fn test_linkdata_writes_hardlink_data() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("a"), "DATA\n").unwrap();
+    fs::hard_link(temp.path().join("a"), temp.path().join("b")).unwrap();
+
+    let output = run_pax_in_dir(
+        &["-w", "-x", "pax", "-o", "linkdata", "a", "b"],
+        temp.path(),
+    );
+    assert_success(&output, "pax -w -o linkdata");
+    let listing =
+        run_pax_with_stdin_bytes(&["-o", "listopt=%(typeflag)s %(size)d %F"], &output.stdout);
+    assert_eq!(stdout_str(&listing), "0 5 a\n1 5 b\n");
+}
+
+/// ustar has no socket type. POSIX: a file that cannot be archived in the
+/// format is diagnosed. It must not turn into an empty regular file.
+#[test]
+fn test_socket_is_diagnosed_not_archived_as_regular() {
+    let temp = TempDir::new().unwrap();
+    let _sock = std::os::unix::net::UnixListener::bind(temp.path().join("s")).unwrap();
+    fs::write(temp.path().join("f"), "F\n").unwrap();
+
+    for format in ["ustar", "pax"] {
+        let output = run_pax_in_dir(&["-w", "-x", format, "s", "f"], temp.path());
+        assert_exit_code(&output, 1, format);
+        let listing = run_pax_with_stdin_bytes(&[], &output.stdout);
+        assert_eq!(stdout_str(&listing), "f\n", "{format}");
+    }
+}
+
+/// A hard link is recorded only once its first name was actually archived.
+/// If a cannot be read, b must not become "b == a" pointing at nothing.
+#[test]
+fn test_hardlink_to_unarchived_file_is_not_a_link() {
+    if unsafe { libc::geteuid() } == 0 {
+        return; // root reads mode 000 files
+    }
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("a"), "DATA\n").unwrap();
+    fs::hard_link(temp.path().join("a"), temp.path().join("b")).unwrap();
+    fs::set_permissions(temp.path().join("a"), fs::Permissions::from_mode(0o000)).unwrap();
+
+    let output = run_pax_in_dir(&["-w", "-x", "ustar", "a", "b"], temp.path());
+    fs::set_permissions(temp.path().join("a"), fs::Permissions::from_mode(0o644)).unwrap();
+    assert_exit_code(&output, 1, "pax -w of an unreadable linked file");
+    let listing = run_pax_with_stdin_bytes(&["-v"], &output.stdout);
+    assert!(
+        !stdout_str(&listing).contains("=="),
+        "{}",
+        stdout_str(&listing)
+    );
+}
+
+/// A directory name of 100-155 bytes is split into prefix and name like any
+/// other; the name field must not come out empty.
+#[test]
+fn test_ustar_long_directory_name_roundtrips() {
+    let temp = TempDir::new().unwrap();
+    let dir = format!("{}/{}", "p".repeat(60), "d".repeat(60));
+    fs::create_dir_all(temp.path().join(&dir)).unwrap();
+
+    let output = run_pax_in_dir(&["-w", "-d", "-x", "ustar", &dir], temp.path());
+    assert_success(&output, "pax -w");
+    let listing = run_pax_with_stdin_bytes(&[], &output.stdout);
+    assert_eq!(stdout_str(&listing), format!("{dir}/\n"));
+}
+
+/// A time before 1970 cannot go in a ustar octal field. In pax format it is
+/// written as an mtime record; it must not wrap to a date centuries away.
+#[test]
+fn test_pre_epoch_mtime_roundtrips_in_pax() {
+    let temp = TempDir::new().unwrap();
+    let f = temp.path().join("old");
+    fs::write(&f, "O\n").unwrap();
+    filetime::set_file_mtime(&f, filetime::FileTime::from_unix_time(-86400, 0)).unwrap();
+
+    let output = run_pax_in_dir(&["-w", "-x", "pax", "old"], temp.path());
+    assert_success(&output, "pax -w");
+    let listing = run_pax_with_stdin_bytes(&["-o", "listopt=%(mtime)d"], &output.stdout);
+    assert_eq!(stdout_str(&listing), "-86400\n");
+}
+
+/// The default name of an extended header is built from "%d/PaxHeaders.%p/%f",
+/// where %d is what dirname(1) gives: "." for a top-level member, so the
+/// name is relative -- never an absolute path a naive reader would write to.
+#[test]
+fn test_default_exthdr_name_is_relative() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("top"), "T\n").unwrap();
+
+    let output = run_pax_in_dir(&["-w", "-x", "pax", "-o", "uname:=zz", "top"], temp.path());
+    assert_success(&output, "pax -w");
+    // The first header block is the extended header's.
+    let name = String::from_utf8_lossy(&output.stdout[..100]);
+    let name = name.trim_end_matches('\0');
+    assert!(name.starts_with("./PaxHeaders"), "{name}");
+}
+
+/// pax writes an empty archive (two zero blocks) when given nothing to
+/// archive; it must be able to read that archive back and append to it.
+#[test]
+fn test_empty_archive_reads_and_appends() {
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("e.tar");
+    fs::write(temp.path().join("f"), "F\n").unwrap();
+
+    let output = run_pax_in_dir_with_stdin(&["-w", "-f", "e.tar"], temp.path(), "");
+    assert_success(&output, "pax -w of nothing");
+    let output = run_pax_in_dir(&["-f", archive.to_str().unwrap()], temp.path());
+    assert_success(&output, "list of an empty archive");
+    assert_eq!(stdout_str(&output), "");
+
+    let output = run_pax_in_dir(&["-w", "-a", "-f", "e.tar", "f"], temp.path());
+    assert_success(&output, "append to an empty archive");
+    let output = run_pax_in_dir(&["-f", archive.to_str().unwrap()], temp.path());
+    assert_eq!(stdout_str(&output), "f\n");
+}
+
+/// pax-format header fields are meant for the portable character set; a name
+/// outside it goes in a UTF-8 `path` record so that every reader recovers it.
+#[test]
+fn test_pax_non_ascii_name_gets_path_record() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("café"), "C\n").unwrap();
+
+    let output = run_pax_in_dir(&["-w", "-x", "pax", "café"], temp.path());
+    assert_success(&output, "pax -w");
+    let listing = run_pax_with_stdin_bytes(&["-o", "listopt=%(typeflag)s"], &output.stdout);
+    assert_success(&listing, "list");
+    // An `x` header precedes the member, carrying the name.
+    assert_eq!(output.stdout[156], b'x');
+}
+
+/// -t restores the access time of each file read -- in copy mode too, and for
+/// directories as well as regular files.
+#[test]
+fn test_t_restores_atime_in_copy_and_for_directories() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir_all(src.join("d")).unwrap();
+    fs::write(src.join("d/f"), "F\n").unwrap();
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    for p in [src.join("d/f"), src.join("d")] {
+        filetime::set_file_atime(&p, old).unwrap();
+    }
+    fs::create_dir(temp.path().join("out")).unwrap();
+
+    let output = run_pax_in_dir(&["-rw", "-t", "d", "../out"], &src);
+    assert_success(&output, "pax -rw -t");
+    for p in [src.join("d/f"), src.join("d")] {
+        let atime = fs::metadata(&p).unwrap().atime();
+        assert_eq!(atime, 1_000_000_000, "{}", p.display());
+    }
+
+    for p in [src.join("d/f"), src.join("d")] {
+        filetime::set_file_atime(&p, old).unwrap();
+    }
+    let output = run_pax_in_dir(&["-w", "-t", "-f", "../a.tar", "d"], &src);
+    assert_success(&output, "pax -w -t");
+    for p in [src.join("d/f"), src.join("d")] {
+        let atime = fs::metadata(&p).unwrap().atime();
+        assert_eq!(atime, 1_000_000_000, "{}", p.display());
+    }
+}
+
+/// -X: "when a directory with a different device ID is encountered, pax shall
+/// process (archive or copy) the directory itself but shall not process any
+/// files below the directory."
+#[test]
+fn test_one_file_system_archives_the_mount_point() {
+    let temp = TempDir::new().unwrap();
+    let tree = temp.path().join("tree");
+    fs::create_dir_all(tree.join("mnt")).unwrap();
+    fs::write(tree.join("f"), "F\n").unwrap();
+    let Some(_mount) = ScratchMount::mount(temp.path(), &tree.join("mnt")) else {
+        return; // no unprivileged way to mount here; the rule is unit-tested
+    };
+    fs::write(tree.join("mnt/inside"), "I\n").unwrap();
+
+    let output = run_pax_in_dir(&["-wX", "tree"], temp.path());
+    assert_success(&output, "pax -wX");
+    let listing = run_pax_with_stdin_bytes(&[], &output.stdout);
+    let mut names: Vec<_> = stdout_str(&listing).lines().map(String::from).collect();
+    names.sort();
+    assert_eq!(names, ["tree/", "tree/f", "tree/mnt/"]);
 }

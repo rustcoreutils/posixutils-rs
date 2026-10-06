@@ -20,6 +20,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
+use std::os::fd::AsFd;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -55,7 +56,7 @@ pub struct WriteOptions {
     /// The key is the *member* name -- what the file is stored as, after `-s`
     /// and any rename -- because that is what a later extraction resolves, and
     /// it is not the pathname the file was named by on the command line.
-    pub update_times: Option<HashMap<PathBuf, u64>>,
+    pub update_times: Option<HashMap<PathBuf, i64>>,
 }
 
 impl WriteOptions {
@@ -82,10 +83,10 @@ impl WriteOptions {
 
 /// A file's modification time in whole seconds, the resolution every header
 /// format records.
-fn file_mtime_secs(metadata: &ftw::Metadata) -> u64 {
+fn file_mtime_secs(metadata: &ftw::Metadata) -> i64 {
     #[cfg(unix)]
     {
-        metadata.mtime().max(0) as u64
+        metadata.mtime()
     }
     #[cfg(not(unix))]
     {
@@ -93,7 +94,7 @@ fn file_mtime_secs(metadata: &ftw::Metadata) -> u64 {
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
+            .map(|d| d.as_secs() as i64)
             .unwrap_or(0)
     }
 }
@@ -175,6 +176,14 @@ impl<A: ArchiveWriter> ArchiveWriter for ArchiveSink<'_, A> {
     fn needs_data_checksum(&self) -> bool {
         self.0.needs_data_checksum()
     }
+
+    fn hardlinks_may_carry_data(&self) -> bool {
+        self.0.hardlinks_may_carry_data()
+    }
+
+    fn supports_sockets(&self) -> bool {
+        self.0.supports_sockets()
+    }
 }
 
 /// Write files to any archive writer.
@@ -212,10 +221,7 @@ fn write_files<W: ArchiveWriter>(
         let _ = ftw::traverse_directory(
             path,
             |entry| walk.visit(entry),
-            |_, _| {
-                walk.dev_stack.borrow_mut().pop();
-                Ok(())
-            },
+            |entry, exit| walk.leave_directory(&entry, exit),
             |entry, err| crate::error::report_error(entry.path().as_inner(), err.inner()),
             ftw::TraverseDirectoryOpts {
                 follow_symlinks_on_args: options.cli_dereference,
@@ -249,9 +255,9 @@ struct WriteWalk<'a, W: ArchiveWriter> {
     archive: RefCell<&'a mut W>,
     link_tracker: RefCell<HardLinkTracker>,
     prompter: RefCell<Option<InteractivePrompter>>,
-    /// `st_dev` of each directory descended into, for `-X`. Per parent rather
-    /// than per operand: `-X` stops pax crossing *a* mount point, not just the
-    /// one the operand sits on.
+    /// `st_dev` of each directory descended into. The first is the operand's,
+    /// which is what `-X` compares against; an empty stack means the walk is
+    /// at an operand.
     dev_stack: RefCell<Vec<u64>>,
     /// Set by a failure that must stop the walk rather than skip a file.
     fatal: RefCell<Option<PaxError>>,
@@ -300,16 +306,6 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
             return Ok(false);
         }
 
-        // -X: a directory on a different filesystem from its parent is not
-        // descended and not archived.
-        if self.options.one_file_system {
-            if let Some(&parent_dev) = self.dev_stack.borrow().last() {
-                if metadata.dev() != parent_dev {
-                    return Ok(false);
-                }
-            }
-        }
-
         match self.archive_entry(&entry, path, metadata) {
             Ok(descend) => Ok(descend),
             Err(e) if crate::modes::is_fatal(&e) => {
@@ -325,9 +321,25 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
         }
     }
 
+    /// Undo what `descend` did, once the walk is done with a directory, and
+    /// for -t put back the access time reading it disturbed.
+    fn leave_directory(&self, entry: &ftw::Entry<'_>, exit: ftw::DirExit) -> Result<(), ()> {
+        self.dev_stack.borrow_mut().pop();
+        if self.options.reset_atime && exit == ftw::DirExit::Descended {
+            crate::modes::anchored::restore_dir_atime(entry);
+        }
+        Ok(())
+    }
+
     /// Whether to walk into a directory, recording its device for `-X` when so.
+    ///
+    /// `-X` is decided here and nowhere else: a directory on another device
+    /// is archived like any other and only its contents are left out.
     fn descend(&self, metadata: &ftw::Metadata) -> bool {
-        if self.options.no_recurse {
+        let operand_dev = self.dev_stack.borrow().first().copied();
+        if self.options.no_recurse
+            || !crate::modes::may_descend(self.options.one_file_system, operand_dev, metadata.dev())
+        {
             return false;
         }
         self.dev_stack.borrow_mut().push(metadata.dev());
@@ -471,6 +483,17 @@ fn write_special<W: ArchiveWriter>(
     } else if file_type.is_fifo() {
         EntryType::Fifo
     } else if file_type.is_socket() {
+        // POSIX: "Attempts to archive a socket shall produce a diagnostic
+        // message when ustar interchange format is used". The pax format has
+        // no socket type either; recording one as an empty regular file
+        // would extract something the file never was.
+        if !archive.supports_sockets() {
+            crate::error::report_error(
+                path,
+                gettextrs::gettext("socket not archived: the format has no socket type"),
+            );
+            return Ok(());
+        }
         EntryType::Socket
     } else {
         crate::error::report_error(path, gettextrs::gettext("unsupported file type"));
@@ -508,14 +531,6 @@ fn write_file<W: ArchiveWriter>(
 ) -> PaxResult<()> {
     let src_path = entry_ref.path();
     let src_path = src_path.as_inner();
-    // Save access time if we need to reset it after reading
-    #[cfg(unix)]
-    let original_atime = if options.reset_atime {
-        Some((metadata.atime(), metadata.atime_nsec()))
-    } else {
-        None
-    };
-
     let mut entry = build_entry(archive_path, metadata, EntryType::Regular)?;
     // But use src_path for hard link tracking (dev/ino)
     entry.dev = {
@@ -550,7 +565,7 @@ fn write_file<W: ArchiveWriter>(
     };
 
     // Check for hard link
-    if let Some(original_path) = link_tracker.check(&entry) {
+    if let Some(original_path) = link_tracker.lookup(entry.dev, entry.ino, entry.nlink) {
         // The same file met again under the very name it was first archived
         // as (`pax -w f f`, or `find tree | pax -w` reaching it from both the
         // list and the walk). "f == f" extracts by unlinking f and then failing
@@ -570,11 +585,12 @@ fn write_file<W: ArchiveWriter>(
             entry.link_target = Some(original_path);
         }
 
-        // Per POSIX: -o linkdata means write file contents for each hard link.
         // By default a hard link has size=0 and no data -- but only where the
         // format records the linkage, otherwise the contents are the only copy
-        // of the data this member will ever have.
-        if linkable && !options.format_options.link_data {
+        // of the data this member will ever have. `-o linkdata` asks for the
+        // contents with every link, which only the pax format can carry.
+        let with_data = options.format_options.link_data && archive.hardlinks_may_carry_data();
+        if linkable && !with_data {
             entry.size = 0;
             archive.write_entry(&entry)?;
             archive.finish_entry()?;
@@ -615,11 +631,11 @@ fn write_file<W: ArchiveWriter>(
     // Held open past the copy so -t can stamp the descriptor below.
 
     archive.finish_entry()?;
+    // Only now is there a member for a later name of this file to link to.
+    link_tracker.record(entry.dev, entry.ino, entry.nlink, &entry.path);
 
-    // Reset access time if requested
-    #[cfg(unix)]
-    if let Some((atime_sec, atime_nsec)) = original_atime {
-        reset_atime(&file, src_path, atime_sec, atime_nsec);
+    if options.reset_atime {
+        crate::modes::anchored::restore_atime(file.as_fd(), src_path, metadata);
     }
 
     Ok(())
@@ -735,13 +751,13 @@ fn build_entry(
         entry.mode = metadata.mode() & 0o7777;
         entry.uid = metadata.uid();
         entry.gid = metadata.gid();
-        entry.mtime = metadata.mtime() as u64;
+        entry.mtime = metadata.mtime();
         // Capture sub-second times so the pax interchange format can record a
         // fractional `mtime`/`atime` (other formats ignore the nsec fields).
         entry.mtime_nsec = metadata.mtime_nsec() as u32;
-        entry.atime = Some(metadata.atime() as u64);
+        entry.atime = Some(metadata.atime());
         entry.atime_nsec = metadata.atime_nsec() as u32;
-        entry.ctime = Some(metadata.ctime() as u64);
+        entry.ctime = Some(metadata.ctime());
         entry.ctime_nsec = metadata.ctime_nsec() as u32;
         entry.dev = metadata.dev();
         entry.ino = metadata.ino();
@@ -766,7 +782,7 @@ fn build_entry(
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
+            .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
     }
 
@@ -851,40 +867,6 @@ fn path_from_bytes(bytes: &[u8]) -> PathBuf {
 #[cfg(not(unix))]
 fn path_from_bytes(bytes: &[u8]) -> PathBuf {
     PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
-}
-
-/// Restore the access time `-t` recorded, on the file that was actually read.
-///
-/// Stamping goes through the descriptor the data came from rather than by name.
-/// Resolving the name a second time was wrong both ways round: without
-/// `AT_SYMLINK_NOFOLLOW` a name replaced by a symbolic link in between would
-/// redirect the timestamp onto the link's target, and with it, `-L`/`-H` stamped
-/// the link rather than the file whose access time the read had actually
-/// disturbed. A descriptor has neither problem, and `UTIME_OMIT` leaves the
-/// modification time alone instead of reading it back to write it again.
-#[cfg(unix)]
-fn reset_atime(file: &File, path: &Path, atime_sec: i64, atime_nsec: i64) {
-    use std::os::fd::AsRawFd;
-
-    let times = [
-        libc::timespec {
-            tv_sec: atime_sec as libc::time_t,
-            tv_nsec: atime_nsec as libc::c_long,
-        },
-        libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_OMIT,
-        },
-    ];
-
-    let result = unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) };
-    if result != 0 {
-        eprintln!(
-            "pax: warning: cannot reset atime on {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        );
-    }
 }
 
 #[cfg(test)]

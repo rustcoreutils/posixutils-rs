@@ -17,8 +17,9 @@ use crate::archive::HardLinkTracker;
 use crate::error::{PaxError, PaxResult};
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
-    create_replacing, link_replacing, open_dir_at, set_attrs_fd, set_link_attrs_at, stat_at,
-    AttrPolicy, Attrs, DirTree, MemberPath,
+    create_replacing, link_replacing, link_replacing_with, open_dir_at, restore_atime,
+    restore_dir_atime, set_attrs_fd, set_link_attrs_at, stat_at, AttrPolicy, Attrs, DirTree,
+    MemberPath,
 };
 use crate::pattern::{matches_any, Pattern};
 use crate::subst::{substitute_name, Substitution};
@@ -66,6 +67,8 @@ pub struct CopyOptions {
     pub interactive: bool,
     /// Update mode - only copy if source is newer than destination
     pub update: bool,
+    /// Put back the access time of each source file and directory read (-t)
+    pub reset_atime: bool,
     /// Path substitutions (-s option)
     pub substitutions: Vec<Substitution>,
     /// Process file-creation mask, applied to the mode of copied files when the
@@ -126,7 +129,7 @@ pub fn copy_files(files: &[PathBuf], dest_dir: &Path, options: &CopyOptions) -> 
         let _ = ftw::traverse_directory(
             path,
             |entry| walk.visit(entry),
-            |_, _| walk.leave_directory(),
+            |entry, exit| walk.leave_directory(&entry, exit),
             |entry, err| crate::error::report_error(entry.path().as_inner(), err.inner()),
             ftw::TraverseDirectoryOpts {
                 follow_symlinks_on_args: options.cli_dereference,
@@ -176,7 +179,8 @@ struct CopyWalk<'a> {
     /// building a child's name from its parent's substituted one applied the
     /// substitution again at every level.
     member_stack: RefCell<Vec<PathBuf>>,
-    /// `st_dev` of each directory descended into, for `-X`.
+    /// `st_dev` of each directory descended into; the first is the operand's,
+    /// which `-X` compares against.
     dev_stack: RefCell<Vec<u64>>,
     fatal: RefCell<Option<PaxError>>,
 }
@@ -222,7 +226,13 @@ impl CopyWalk<'_> {
     /// directory failed, the destination directory still exists and still
     /// wants its mode. The old code returned early on that path and left it
     /// with the creation mode.
-    fn leave_directory(&self) -> Result<(), ()> {
+    ///
+    /// The source directory has been read by now, so this is also where -t
+    /// puts back its access time.
+    fn leave_directory(&self, entry: &ftw::Entry<'_>, exit: ftw::DirExit) -> Result<(), ()> {
+        if self.options.reset_atime && exit == ftw::DirExit::Descended {
+            restore_dir_atime(entry);
+        }
         // Taken before the pop: a failure here has to name the directory it
         // was about, and this is the only place that still knows.
         let member = self.member_stack.borrow().last().cloned();
@@ -262,14 +272,6 @@ impl CopyWalk<'_> {
             let matches = matches_any(&self.options.patterns, name.as_str());
             if self.options.exclude == matches {
                 return Ok(false);
-            }
-        }
-
-        if self.options.one_file_system {
-            if let Some(&parent_dev) = self.dev_stack.borrow().last() {
-                if metadata.dev() != parent_dev {
-                    return Ok(false);
-                }
             }
         }
 
@@ -438,7 +440,8 @@ impl CopyWalk<'_> {
         self.descend(member, pending, metadata)
     }
 
-    /// Walk into the source directory `member`, unless -d says not to.
+    /// Walk into the source directory `member`, unless -d says not to or it
+    /// is a mount point -X stops at.
     /// `pending` is the destination directory to stamp once its contents
     /// exist, if there is one: not for `.`, nor for a directory whose own name
     /// -s ignored.
@@ -448,7 +451,11 @@ impl CopyWalk<'_> {
         pending: Option<(OwnedFd, Attrs)>,
         metadata: &ftw::Metadata,
     ) -> PaxResult<bool> {
-        if self.options.no_recurse {
+        // -X copies a directory on another device but nothing below it.
+        let operand_dev = self.dev_stack.borrow().first().copied();
+        if self.options.no_recurse
+            || !crate::modes::may_descend(self.options.one_file_system, operand_dev, metadata.dev())
+        {
             // No postprocess_dir will fire, so stamp it now.
             if let Some((dir, attrs)) = pending {
                 set_attrs_fd(dir.as_fd(), &attrs, &policy_of(self.options))?;
@@ -606,24 +613,31 @@ fn copy_file(
     if options.link {
         // From the descriptor of the directory the walk found it in, not by
         // re-resolving the whole source path. Never by unlinking the source:
-        // `pax -rwl tree .` names every file as its own destination.
-        let linked = link_replacing(
+        // `pax -rwl tree .` names every file as its own destination. Under
+        // -H/-L the walk followed a symbolic link here, and the link made is
+        // to the file it refers to, as POSIX requires of -l.
+        let followed = entry.is_symlink() == Some(true) && !metadata.is_symlink();
+        let linked = link_replacing_with(
             entry.dir_fd(),
             entry.file_name(),
+            followed,
             dirfd,
             name,
             options.no_clobber,
         );
         match linked {
-            Ok(false) => return Ok(()),
+            // The name is resolved again by linkat, so what it linked is
+            // checked to be the file the walk saw; if the name changed in
+            // between, the copy below replaces the link with that file.
+            Ok(false) if is_file_at(dirfd, name, metadata) => return Ok(()),
             Ok(true) => {
                 crate::error::report_error(src, "Unable to link file to itself");
                 return Ok(());
             }
-            Err(e) => {
-                // Hard link failed (maybe cross-device), fall back to copy
-                crate::error::report_error(src, format!("hard link failed, copying: {e}"));
-            }
+            // POSIX: links are made "whenever possible". One that cannot be
+            // made -- across devices, most often -- means the file is copied
+            // instead, which is the expected outcome and not an error.
+            Ok(false) | Err(_) => {}
         }
     }
 
@@ -634,12 +648,8 @@ fn copy_file(
     // raw name instead let a `-s` rename to an absolute path be handed to
     // `linkat`, which resolves an absolute path from the root of the filesystem
     // and ignores the anchor descriptor entirely.
-    if let Some(link_target) = link_tracker.check_ids(
-        metadata.dev(),
-        metadata.ino(),
-        metadata.nlink() as u32,
-        member,
-    ) {
+    let (dev, ino, nlink) = (metadata.dev(), metadata.ino(), metadata.nlink() as u32);
+    if let Some(link_target) = link_tracker.lookup(dev, ino, nlink) {
         let Some(target) = MemberPath::parse(&link_target)? else {
             return do_copy_file(entry, dirfd, name, metadata, options);
         };
@@ -658,7 +668,18 @@ fn copy_file(
         return Ok(());
     }
 
-    do_copy_file(entry, dirfd, name, metadata, options)
+    do_copy_file(entry, dirfd, name, metadata, options)?;
+    // Only a copy that exists can be linked to by the file's later names.
+    link_tracker.record(dev, ino, nlink, member);
+    Ok(())
+}
+
+/// Whether `name` in `dirfd` is the file `metadata` describes.
+fn is_file_at(dirfd: BorrowedFd<'_>, name: &CStr, metadata: &ftw::Metadata) -> bool {
+    // Casts needed: `dev_t` is i32 on macOS and u64 on Linux.
+    #[allow(clippy::unnecessary_cast)]
+    stat_at(dirfd, name)
+        .is_some_and(|st| (st.st_dev as u64, st.st_ino as u64) == (metadata.dev(), metadata.ino()))
 }
 
 /// Actually copy file contents
@@ -716,6 +737,9 @@ fn do_copy_file(
             break;
         }
         dest_file.write_all(&buf[..n])?;
+    }
+    if options.reset_atime {
+        restore_atime(src_file.as_fd(), entry.path().as_inner(), metadata);
     }
 
     set_attrs_fd(dest_file.as_fd(), &attrs_of(metadata), &policy_of(options))

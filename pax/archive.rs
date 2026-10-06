@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::error::PaxResult;
+use crate::error::{PaxError, PaxResult};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -85,18 +85,19 @@ pub struct ArchiveEntry {
     pub gid: u32,
     /// File size in bytes
     pub size: u64,
-    /// Modification time (seconds since epoch)
-    pub mtime: u64,
+    /// Modification time (seconds since epoch). Signed, like `time_t`: a
+    /// file can predate 1970, and a pax `mtime` record can say so.
+    pub mtime: i64,
     /// Modification time nanoseconds (for pax format)
     pub mtime_nsec: u32,
     /// Access time (seconds since epoch, for pax format)
-    pub atime: Option<u64>,
+    pub atime: Option<i64>,
     /// Access time nanoseconds (for pax format)
     pub atime_nsec: u32,
     /// Inode change time (seconds since epoch). Not a POSIX pax keyword -- see
     /// `ExtendedHeader::ctime` -- but carried so archives that do record one can
     /// be listed, and so `-o times` can write one.
-    pub ctime: Option<u64>,
+    pub ctime: Option<i64>,
     /// Change time nanoseconds (for pax format)
     pub ctime_nsec: u32,
     /// Type of entry
@@ -175,6 +176,24 @@ impl ArchiveEntry {
             ext_records: Vec::new(),
             source_header: None,
         }
+    }
+
+    /// The modification time as the unsigned seconds a ustar or cpio header
+    /// field holds.
+    ///
+    /// POSIX: "Portable file timestamps cannot be negative. If pax encounters
+    /// a file with a negative timestamp in copy or write mode, it can reject
+    /// the file". Those formats have no way to say "before 1970", and storing
+    /// the two's-complement bits instead dated such a file centuries ahead,
+    /// silently, so the member is refused with a diagnostic. (The pax format
+    /// writes an `mtime` record instead.)
+    pub fn unsigned_mtime(&self) -> PaxResult<u64> {
+        u64::try_from(self.mtime).map_err(|_| {
+            PaxError::InvalidHeader(format!(
+                "modification time {} is before 1970, which this format cannot record",
+                self.mtime
+            ))
+        })
     }
 
     /// The value of an extended-header record this member carried.
@@ -260,6 +279,25 @@ pub trait ArchiveWriter {
         true
     }
 
+    /// Whether a hard-link member may also carry the file's data, which is
+    /// what `-o linkdata` asks for.
+    ///
+    /// Only the pax format allows it ("data blocks for files of typeflag 1
+    /// ... may be included"); a ustar typeflag 1 header records no data, so
+    /// there the option has nothing to act on.
+    fn hardlinks_may_carry_data(&self) -> bool {
+        false
+    }
+
+    /// Whether this format has a file type for a socket.
+    ///
+    /// cpio does (`C_ISSOCK`). The tar formats do not, and POSIX requires an
+    /// attempt to archive one in ustar to be diagnosed; a writer that returns
+    /// `false` is never handed one.
+    fn supports_sockets(&self) -> bool {
+        false
+    }
+
     /// Whether `write_entry` needs `ArchiveEntry::data_checksum` filled in.
     ///
     /// True only for the cpio "crc" format, whose c_check field sits in the
@@ -285,30 +323,27 @@ impl HardLinkTracker {
         }
     }
 
-    /// Check if we've seen this file before (by dev/ino)
-    /// Returns the original path if this is a hard link
-    pub fn check(&mut self, entry: &ArchiveEntry) -> Option<PathBuf> {
-        self.check_ids(entry.dev, entry.ino, entry.nlink, &entry.path)
-    }
-
-    /// The same, for a caller that holds the ids directly rather than an entry.
-    ///
-    /// `record` is what a later link to the same file will be pointed at: the
-    /// archive member path when writing, the destination path when copying.
-    /// That difference is the only reason copy mode used to carry its own copy
-    /// of this type -- one which re-stat'd every file the caller had already
-    /// stat'd.
-    pub fn check_ids(&mut self, dev: u64, ino: u64, nlink: u32, record: &Path) -> Option<PathBuf> {
+    /// The name a multiply-linked file was first stored under, if one of its
+    /// names already has been.
+    pub fn lookup(&self, dev: u64, ino: u64, nlink: u32) -> Option<PathBuf> {
         if nlink <= 1 {
             return None;
         }
+        self.seen.get(&(dev, ino)).cloned()
+    }
 
-        let key = (dev, ino);
-        if let Some(original) = self.seen.get(&key) {
-            Some(original.clone())
-        } else {
-            self.seen.insert(key, record.to_path_buf());
-            None
+    /// Note that a file's first name has been stored, as `stored`: the archive
+    /// member path when writing, the destination path when copying.
+    ///
+    /// Separate from `lookup` because it must only happen once that name
+    /// really is in the archive or the destination. Recording a file before
+    /// its data was read made every later name of an unreadable file a link
+    /// to a member that was never written.
+    pub fn record(&mut self, dev: u64, ino: u64, nlink: u32, stored: &Path) {
+        if nlink > 1 {
+            self.seen
+                .entry((dev, ino))
+                .or_insert_with(|| stored.to_path_buf());
         }
     }
 }

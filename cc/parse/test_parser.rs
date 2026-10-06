@@ -6440,12 +6440,22 @@ pub(super) fn with_statement_expr<R>(
     stmt: &str,
     f: impl FnOnce(&mut Parser, &Expr) -> R,
 ) -> R {
+    with_statement_expr_for(&Target::host(), decls, stmt, f)
+}
+
+/// [`with_statement_expr`] for `target`.
+pub(super) fn with_statement_expr_for<R>(
+    target: &Target,
+    decls: &str,
+    stmt: &str,
+    f: impl FnOnce(&mut Parser, &Expr) -> R,
+) -> R {
     let src = format!("{decls}\nvoid t(void) {{ {stmt}; }}");
     let mut strings = StringTable::new();
     let mut tokenizer = Tokenizer::new(src.as_bytes(), 0, &mut strings);
     let tokens = tokenizer.tokenize();
     let mut symbols = SymbolTable::new();
-    let mut types = TypeTable::new(&Target::host());
+    let mut types = TypeTable::new(target);
     let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
     let tu = parser.parse_translation_unit().unwrap();
     let Stmt::Expr(expr) = first_statement(&tu) else {
@@ -8254,6 +8264,106 @@ fn test_signbit_is_type_generic() {
                 arg,
             } => assert_eq!(arg.typ, Some(typ), "#{i}: the operand's type"),
             other => panic!("#{i}: expected a sign-bit test, got {other:?}"),
+        }
+    }
+}
+
+/// `__builtin_issignaling` tests its operand at the operand's own type, on
+/// every target and for every floating type: unlike `signbit`, it can take
+/// no conversion on the way, since converting a signalling NaN to another
+/// format quiets it.
+#[test]
+fn test_issignaling_tests_its_operand_unconverted() {
+    use crate::target::{Arch, Os};
+    let types = [
+        "float",
+        "double",
+        "long double",
+        "_Float16",
+        "_Float32",
+        "_Float64",
+        "_Float128",
+        "_Float32x",
+        "_Float64x",
+    ];
+    for arch in [Arch::X86_64, Arch::Aarch64] {
+        let target = Target::new(arch, Os::Linux);
+        for t in types {
+            with_statement_expr_for(
+                &target,
+                &format!("{t} v;"),
+                "__builtin_issignaling(v)",
+                |p, e| {
+                    assert_eq!(e.typ, Some(p.types.int_id), "{arch:?} {t}");
+                    let ExprKind::FpTest {
+                        test: FpTest::IsSignaling,
+                        arg,
+                    } = &e.kind
+                    else {
+                        panic!(
+                            "{arch:?} {t}: expected an issignaling test, got {:?}",
+                            e.kind
+                        );
+                    };
+                    assert!(
+                        matches!(arg.kind, ExprKind::Ident(_)),
+                        "{arch:?} {t}: the operand is converted: {:?}",
+                        arg.kind
+                    );
+                    assert_eq!(p.eval_const_expr(e), None, "{arch:?} {t}: a variable");
+                },
+            );
+        }
+    }
+}
+
+/// `__builtin_issignaling` of a constant is an integer constant expression,
+/// as in gcc 13, and the constant is quieted wherever the program would
+/// quiet it: a conversion to another format and arithmetic quiet it, a
+/// negation and a conversion to the same format do not.
+#[test]
+fn test_issignaling_of_a_constant_is_a_constant_expression() {
+    use crate::target::{Arch, Os};
+    let cases = [
+        ("__builtin_nans(\"\")", 1),
+        ("__builtin_nansf(\"0x123\")", 1),
+        ("__builtin_nansl(\"\")", 1),
+        ("__builtin_nansf16(\"\")", 1),
+        ("__builtin_nansf128(\"\")", 1),
+        ("__builtin_nansf32x(\"\")", 1),
+        ("__builtin_nansf64x(\"\")", 1),
+        ("-__builtin_nans(\"\")", 1),
+        ("(double)__builtin_nansf32x(\"\")", 1),
+        ("__builtin_nan(\"\")", 0),
+        ("__builtin_nanl(\"0x234\")", 0),
+        ("__builtin_inf()", 0),
+        ("-__builtin_inff()", 0),
+        ("0.0L", 0),
+        ("1.5", 0),
+        ("(float)__builtin_nans(\"\")", 0),
+        ("(long double)__builtin_nans(\"\")", 0),
+        ("__builtin_nans(\"\") * 1.0", 0),
+        ("__builtin_nansf(\"\") + 0.0f", 0),
+    ];
+    for target in [
+        Target::new(Arch::X86_64, Os::Linux),
+        Target::new(Arch::Aarch64, Os::Linux),
+        Target::new(Arch::Aarch64, Os::MacOS),
+    ] {
+        for (arg, want) in cases {
+            // Apple has no binary128, so neither of the types that are one.
+            let wide = arg.contains("f128") || arg.contains("f64x");
+            if wide && target.os == Os::MacOS {
+                continue;
+            }
+            // Apple's `long double` is `double`, so that conversion is none.
+            let same_format = target.os == Os::MacOS && arg.starts_with("(long double)");
+            let want = if same_format { 1 } else { want };
+            let call = format!("__builtin_issignaling({arg})");
+            with_statement_expr_for(&target, "", &call, |p, e| {
+                let at = (target.arch, target.os);
+                assert_eq!(p.eval_const_expr(e), Some(want), "{at:?}: {call}");
+            });
         }
     }
 }

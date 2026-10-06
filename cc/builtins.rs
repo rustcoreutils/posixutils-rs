@@ -382,6 +382,7 @@ pub const SUPPORTED_BUILTINS: &[&str] = &[
     "__builtin_isunordered",
     "__builtin_iseqsig",
     "__builtin_fpclassify",
+    "__builtin_issignaling",
     "__builtin_signbit",
     "__builtin_signbitf",
     "__builtin_signbitl",

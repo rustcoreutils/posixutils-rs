@@ -205,6 +205,15 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
             arg,
         } => Some(i128::from(eval_float(env, scope, arg)?.sign_bit())),
 
+        // `issignaling` of a floating constant, which gcc folds the same way:
+        // `enum { E = __builtin_issignaling(__builtin_nans("")) };` is 1. The
+        // constant walk quiets a NaN wherever the program would -- a
+        // conversion, arithmetic -- so `(float)__builtin_nans("")` is 0.
+        ExprKind::FpTest {
+            test: FpTest::IsSignaling,
+            arg,
+        } => Some(i128::from(eval_float(env, scope, arg)?.is_signalling_nan())),
+
         // `abs` of a constant, in a static initializer only: a call is not an
         // integer constant expression, and gcc rejects `int a[abs(-2)];` at
         // file scope while folding `static int b = abs(-2);`. The argument

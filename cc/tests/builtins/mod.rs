@@ -25,6 +25,7 @@ mod gnu_atomics;
 mod gnu_batch;
 mod has_feature;
 mod intrinsics;
+mod issignaling;
 mod libm;
 mod math;
 mod mem_expand;

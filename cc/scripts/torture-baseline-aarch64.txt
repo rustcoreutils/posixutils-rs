@@ -7311,6 +7311,8 @@ aarch64/ieee/acc1@-O0
 aarch64/ieee/acc1@-O2
 aarch64/ieee/acc2@-O0
 aarch64/ieee/acc2@-O2
+aarch64/ieee/builtin-issignaling-1@-O0
+aarch64/ieee/builtin-issignaling-1@-O2
 aarch64/ieee/builtin-nan-1@-O0
 aarch64/ieee/builtin-nan-1@-O2
 aarch64/ieee/cdivchkd@-O0
@@ -7331,6 +7333,18 @@ aarch64/ieee/copysign1@-O0
 aarch64/ieee/copysign1@-O2
 aarch64/ieee/copysign2@-O0
 aarch64/ieee/copysign2@-O2
+aarch64/ieee/float128-builtin-issignaling-1@-O0
+aarch64/ieee/float128-builtin-issignaling-1@-O2
+aarch64/ieee/float16-builtin-issignaling-1@-O0
+aarch64/ieee/float16-builtin-issignaling-1@-O2
+aarch64/ieee/float32-builtin-issignaling-1@-O0
+aarch64/ieee/float32-builtin-issignaling-1@-O2
+aarch64/ieee/float32x-builtin-issignaling-1@-O0
+aarch64/ieee/float32x-builtin-issignaling-1@-O2
+aarch64/ieee/float64-builtin-issignaling-1@-O0
+aarch64/ieee/float64-builtin-issignaling-1@-O2
+aarch64/ieee/float64x-builtin-issignaling-1@-O0
+aarch64/ieee/float64x-builtin-issignaling-1@-O2
 aarch64/ieee/fp-cmp-1@-O0
 aarch64/ieee/fp-cmp-1@-O2
 aarch64/ieee/fp-cmp-2@-O0

@@ -633,6 +633,7 @@ define_keywords! {
     (BUILTIN_ISFINITE,  "__builtin_isfinite", BUILTIN),
     (BUILTIN_ISNORMAL,  "__builtin_isnormal", BUILTIN),
     (BUILTIN_FPCLASSIFY,"__builtin_fpclassify", BUILTIN),
+    (BUILTIN_ISSIGNALING, "__builtin_issignaling", BUILTIN),
     // gcc's atomic builtins. These are not `__builtin_`-prefixed, and they
     // are reserved spellings all the same: `__sync_` and `__atomic_` both
     // start with two underscores, so no conforming program defines one.

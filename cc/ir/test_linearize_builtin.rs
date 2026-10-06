@@ -15,6 +15,7 @@ use super::test_linearize::{
     test_pos, TestContext,
 };
 use super::*;
+use crate::float::FpFormat;
 use crate::ir::NanCompare;
 use crate::parse::ast::{
     BlockItem, Declaration, ExprKind, ExternalDecl, FunctionDef, InitDeclarator, ParamStyle,
@@ -754,4 +755,217 @@ fn test_a_relational_arm_is_not_evaluated_unconditionally() {
     assert!(branches("r"), "a signaling compare stays behind its branch");
     assert!(!branches("e"), "a quiet compare is speculated");
     assert!(!branches("i"), "an integer compare is speculated");
+}
+
+// `__builtin_issignaling`: a test of the representation
+
+/// Run `f`, the linearized `int f(T x) { return __builtin_issignaling(x); }`,
+/// with `x` holding the bytes `image`: what `f`'s integer loads from the
+/// temporary that `x` is stored to read back. Everything else it computes is
+/// straight-line integer arithmetic, evaluated by the optimizer's own
+/// folding.
+fn run_issignaling(module: &Module, image: [u8; 16]) -> i128 {
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let mut vals: std::collections::HashMap<PseudoId, i128> = Default::default();
+    let mut temp = None;
+    for insn in f.blocks.iter().flat_map(|bb| bb.insns.iter()) {
+        let value = |vals: &std::collections::HashMap<PseudoId, i128>, id: PseudoId| {
+            vals.get(&id)
+                .copied()
+                .or_else(|| match f.get_pseudo(id)?.kind {
+                    PseudoKind::Val(v) => Some(v),
+                    _ => None,
+                })
+        };
+        match insn.op {
+            Opcode::SymAddr => {
+                let sym = f.get_pseudo(insn.src[0]).map(|p| &p.kind);
+                if matches!(sym, Some(PseudoKind::Sym(n)) if n.starts_with("__snan")) {
+                    temp = insn.target;
+                }
+            }
+            Opcode::Load if Some(insn.src[0]) == temp => {
+                let at = insn.offset as usize;
+                let bytes = insn.size as usize / 8;
+                let mut word = [0u8; 16];
+                word[..bytes].copy_from_slice(&image[at..at + bytes]);
+                vals.insert(insn.target.unwrap(), u128::from_le_bytes(word) as i128);
+            }
+            Opcode::Ret => return value(&vals, insn.src[0]).expect("a computed result"),
+            op if crate::ir::constfold::is_int_foldable(op) || op == Opcode::Copy => {
+                let ops: Vec<i128> = insn.src.iter().filter_map(|&s| value(&vals, s)).collect();
+                if ops.len() != insn.src.len() {
+                    continue; // the floating operand, on its way to the store
+                }
+                let v = if op == Opcode::Copy {
+                    ops[0]
+                } else {
+                    crate::ir::constfold::eval_int(insn, &ops).expect("folds")
+                };
+                vals.insert(insn.target.unwrap(), v);
+            }
+            _ => {}
+        }
+    }
+    panic!("f returned nothing")
+}
+
+/// The interesting values of `fmt`, each with whether it is a signalling
+/// NaN, as images of the format's bits.
+fn issignaling_cases(fmt: FpFormat) -> Vec<(String, u128, bool)> {
+    use crate::float::{FloatVal, NanKind};
+    let mut values = vec![
+        (
+            "sNaN",
+            FloatVal::nan_with_payload(fmt, 0, NanKind::Signalling),
+            true,
+        ),
+        (
+            "sNaN 0x123",
+            FloatVal::nan_with_payload(fmt, 0x123, NanKind::Signalling),
+            true,
+        ),
+        (
+            "sNaN 1",
+            FloatVal::nan_with_payload(fmt, 1, NanKind::Signalling),
+            true,
+        ),
+        (
+            "qNaN",
+            FloatVal::nan_with_payload(fmt, 0, NanKind::Quiet),
+            false,
+        ),
+        (
+            "qNaN 0x234",
+            FloatVal::nan_with_payload(fmt, 0x234, NanKind::Quiet),
+            false,
+        ),
+        ("inf", FloatVal::infinity(false), false),
+        ("zero", FloatVal::ZERO, false),
+        ("1.5", FloatVal::from_f64(1.5), false),
+        (
+            "min subnormal",
+            FloatVal::from_parts(false, 1, -16000),
+            false,
+        ),
+    ];
+    // Every sign: issignaling ignores it.
+    let negated: Vec<_> = values
+        .iter()
+        .map(|&(n, v, s)| (n, v.negated(), s))
+        .collect();
+    values.extend(negated);
+    let mut cases: Vec<(String, u128, bool)> = values
+        .into_iter()
+        .map(|(n, v, s)| (format!("{n} (sign {})", v.sign_bit()), v.to_bits(fmt), s))
+        .collect();
+    let top = |bits: u32| 1u128 << (bits - 1);
+    match fmt {
+        // The x87 encodings no IEEE format has, as gcc and glibc count them:
+        // a nonzero exponent with the integer bit clear signals.
+        FpFormat::X87Extended => {
+            let x87 = |sign_exp: u128, sig: u128| (sign_exp << 64) | sig;
+            for (name, bits, s) in [
+                ("pseudo-infinity", x87(0x7fff, 0), true),
+                ("pseudo-NaN", x87(0x7fff, 42), true),
+                (
+                    "pseudo-NaN, quiet bit",
+                    x87(0xffff, 0x4000_0000_0000_0042),
+                    true,
+                ),
+                ("unnormal", x87(0x42, 0), true),
+                ("unnormal 42", x87(0x8042, 42), true),
+                ("pseudo-denormal", x87(0, 0x8000_0000_0000_0000), false),
+                ("denormal", x87(0x8000, 42), false),
+                ("indefinite", x87(0xffff, 0xc000_0000_0000_0000), false),
+                ("normal", x87(0x42, 0x8000_0000_0000_0042), false),
+            ] {
+                cases.push((name.to_string(), bits, s));
+            }
+        }
+        // A payload in the low word alone: the half the test folds into the
+        // high one.
+        FpFormat::Binary128 => {
+            let exp = 0x7fffu128 << 112;
+            cases.push(("sNaN, low word".to_string(), exp | 1, true));
+            cases.push(("sNaN, bit 63".to_string(), exp | top(64), true));
+            cases.push(("qNaN, low word".to_string(), exp | top(112) | 1, false));
+        }
+        _ => {}
+    }
+    cases
+}
+
+/// `__builtin_issignaling` reads every format's representation correctly, on
+/// each target: signalling NaNs of either sign and every payload position
+/// are 1; quiet NaNs, infinities, zeros, numbers are 0; and on x87 the
+/// encodings the hardware no longer accepts are 1, as in gcc. No floating
+/// comparison or conversion is made, since either would quiet or raise.
+#[test]
+fn test_issignaling_tests_the_representation() {
+    let x86 = Target::new(Arch::X86_64, Os::Linux);
+    let a64 = Target::new(Arch::Aarch64, Os::Linux);
+    let apple = Target::new(Arch::Aarch64, Os::MacOS);
+    let cases = [
+        (&x86, "float", FpFormat::Binary32),
+        (&x86, "double", FpFormat::Binary64),
+        (&x86, "long double", FpFormat::X87Extended),
+        (&x86, "_Float16", FpFormat::Binary16),
+        (&x86, "_Float128", FpFormat::Binary128),
+        (&x86, "_Float64x", FpFormat::X87Extended),
+        (&a64, "float", FpFormat::Binary32),
+        (&a64, "double", FpFormat::Binary64),
+        (&a64, "long double", FpFormat::Binary128),
+        (&a64, "_Float16", FpFormat::Binary16),
+        (&a64, "_Float32x", FpFormat::Binary64),
+        (&apple, "long double", FpFormat::Binary64),
+    ];
+    for (target, t, fmt) in cases {
+        let src = format!("int f({t} x) {{ return __builtin_issignaling(x); }}");
+        let module = linearize_source(&src, target);
+        let insns = insns_of(&module, "f");
+        assert!(
+            !insns.iter().any(|i| i.op.is_float_comparison()
+                || matches!(i.op, Opcode::FCvtF | Opcode::Call)),
+            "{:?} {t}: a floating operation",
+            target.arch
+        );
+        for (name, bits, want) in issignaling_cases(fmt) {
+            let got = run_issignaling(&module, bits.to_le_bytes());
+            assert_eq!(
+                got,
+                i128::from(want),
+                "{:?} {t}: {name} {bits:#x}",
+                target.arch
+            );
+        }
+    }
+}
+
+/// A constant operand folds in the linearizer, at every level: no store, no
+/// load, just the answer -- with the constant quieted wherever the program
+/// would have quieted it.
+#[test]
+fn test_issignaling_of_a_constant_folds() {
+    let target = Target::new(Arch::X86_64, Os::Linux);
+    for (arg, want) in [
+        ("__builtin_nans(\"\")", 1),
+        ("-__builtin_nansl(\"\")", 1),
+        ("__builtin_nansf128(\"\")", 1),
+        ("__builtin_nan(\"\")", 0),
+        ("(float)__builtin_nans(\"\")", 0),
+        ("__builtin_nans(\"\") + 1.0", 0),
+        ("2.5f", 0),
+    ] {
+        let src = format!("int f(void) {{ return __builtin_issignaling({arg}); }}");
+        let module = linearize_source(&src, &target);
+        let insns = insns_of(&module, "f");
+        assert!(
+            !insns
+                .iter()
+                .any(|i| matches!(i.op, Opcode::Store | Opcode::Load)),
+            "{arg}: not folded"
+        );
+        assert_eq!(run_issignaling(&module, [0; 16]), want, "{arg}");
+    }
 }

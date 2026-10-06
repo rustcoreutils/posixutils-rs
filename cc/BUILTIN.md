@@ -75,7 +75,8 @@ Checked by gcc's own rules, in its words, with the shared helpers of
 `is_integral`, `parse_generic_builtin_args`):
 
 - the type-generic classification builtins (`isnan`, `isinf`, `isfinite`,
-  `isnormal`, `isinf_sign`, `signbit`, and `fpclassify`'s last argument)
+  `isnormal`, `isinf_sign`, `signbit`, `issignaling`, and `fpclassify`'s
+  last argument)
   require a real floating argument; the unordered relations require one of
   their two (`parse_fp_compare`);
 - `__builtin_fpclassify` takes six arguments, and its five class codes,
@@ -324,12 +325,26 @@ error.
 | `__builtin_isinf_sign(x)` | +1 for +inf, -1 for -inf, 0 otherwise |
 | `__builtin_isfinite(x)`, `__builtin_isnormal(x)` | As C's macros. No suffixed spellings, as in gcc |
 | `__builtin_fpclassify(nan, inf, normal, subnormal, zero, x)` | Whichever of the five codes describes `x`. The codes convert to `int` and must be integer constants |
+| `__builtin_issignaling(x)` | 1 for a signalling NaN of either sign, else 0. Any real floating type, tested at its own width and never converted, since a conversion quiets. On x86-64's `long double`, as in gcc and glibc, also 1 for every encoding with a nonzero exponent and the integer bit clear (pseudo-infinity, pseudo-NaN, unnormal). Of a constant it is an integer constant expression |
 | `__builtin_flt_rounds()` | The integer constant 1, whatever the current rounding mode (clang reads the mode; gcc has no such builtin) |
 
 The classification builtins are `ExprKind::FpTest` / `FpClassify`, lowered by
 `linearize_fp_test` / `linearize_fp_classify` into comparisons and bit tests;
-`signbit` is `Opcode::Signbit`. Only `signbit` folds as a constant
-expression.
+`signbit` is `Opcode::Signbit`. `issignaling` cannot compare at all -- any
+floating operation on a signalling NaN, a quiet comparison included, quiets
+it or raises -- so its operand is stored to a temporary at its own type and
+read back as integers (`emit_is_signaling`). Only `signbit` and
+`issignaling` fold as constant expressions.
+
+`-fsignaling-nans` defines gcc's `__SUPPORT_SNAN__` and changes nothing else:
+no fold c17 makes assumes a NaN is quiet, which is what the flag asks of
+gcc. An operation that consumes a signalling NaN constant is not folded
+(`constfold`) and raises *invalid* at run time; `x * 1.0`, `x - 0.0` and
+`fmin(x, x)` stay operations that quiet `x`. One difference remains: under
+the flag gcc stops taking a conversion of, or arithmetic on, a signalling NaN
+constant as an integer constant expression, so `enum { E =
+__builtin_issignaling((float)__builtin_nans("")) };` is an error there; c17
+folds it to 0 with or without the flag, as gcc does without it.
 
 ### The unordered-safe relations (C99 7.12.14)
 
@@ -633,7 +648,6 @@ Their absence is silent and changes which branch a guarded header takes.
 |---------|-------------|
 | `__builtin_strnlen`, `__builtin_vprintf`, `__builtin_vfprintf` | `strnlen`, `vprintf`, `vfprintf` are known by their bare names only |
 | `__builtin_clear_padding` | Would have to walk a type to find its padding |
-| `__builtin_issignaling` | `<math.h>` defines `issignaling` itself, so nothing fails to build |
 | `__builtin_stack_save`, `__builtin_stack_restore` | c17 frees a VLA at the end of its block without them. The IR has `StackSave`/`StackRestore` for inlining, but no builtin reaches them |
 | `__builtin_cexpi`, `__builtin_cpow` | Complex libm entry points gcc synthesizes; no header declares them |
 | `__builtin_bswap128` | No 128-bit byte swap |

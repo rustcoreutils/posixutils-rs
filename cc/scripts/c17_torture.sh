@@ -623,6 +623,8 @@ execute/pr51447        all      nested functions (non-local goto to a __label__)
 execute/pr71494        all      nested functions
 execute/pr80692        all      post-C17 feature
 execute/pr82210        all      VLA as a struct member
+ieee/bfloat16-builtin-issignaling-1  all  __bf16
+ieee/float128x-builtin-issignaling-1 all  _Float128x: no target has it, gcc included
 '
 
 # `dg-do compile` tests whose asm template is deliberately not an instruction

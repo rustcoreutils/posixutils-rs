@@ -468,6 +468,10 @@ pub enum FpTest {
     /// sign is set, which no comparison can tell, so this one is a bit test.
     /// Answers 0 or 1.
     SignBit,
+    /// Is it a signalling NaN, of either sign? `__builtin_issignaling`
+    /// (gcc 13): a bit test too, since any floating operation on a
+    /// signalling NaN -- a comparison included -- quiets it or raises.
+    IsSignaling,
 }
 
 /// Which read-modify-write a [`ExprKind::GnuAtomicRmw`] performs.

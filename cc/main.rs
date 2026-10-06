@@ -1660,6 +1660,8 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     let mut lang_overrides = Vec::new();
     // `-g` and its levels, last one wins: `-g3 -g0` is no debug information.
     let mut debug: Option<bool> = None;
+    // `-fsignaling-nans`, last one wins.
+    let mut signaling_nans = false;
 
     while i < raw_args.len() {
         let arg = &raw_args[i];
@@ -1879,6 +1881,15 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
         } else if arg == "-fpermissive" {
             result.push("--fpermissive".to_string());
             i += 1;
+        } else if arg == "-fsignaling-nans" || arg == "-fno-signaling-nans" {
+            // Nothing c17 folds assumes a NaN is quiet, so the optimizer is
+            // already what gcc's is under `-fsignaling-nans`: an identity
+            // like `x * 1.0 -> x`, which would hand back a signalling `x`
+            // where the multiplication quiets it, is not one it makes. What
+            // the flag still changes is gcc's `__SUPPORT_SNAN__`, which
+            // glibc's <math.h> and <fenv.h> read.
+            signaling_nans = arg == "-fsignaling-nans";
+            i += 1;
         } else if arg == "-fgnu89-inline"
             || arg == "-fno-gnu89-inline"
             || arg == "-fmath-errno"
@@ -2053,6 +2064,10 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     let mut trailer = lang_overrides;
     if debug == Some(true) {
         trailer.push("-g".to_string());
+    }
+    if signaling_nans {
+        trailer.push("-D".to_string());
+        trailer.push("__SUPPORT_SNAN__".to_string());
     }
     let at = result
         .iter()
@@ -3491,6 +3506,34 @@ mod tests {
         // Should also define _REENTRANT
         assert!(result.contains(&"-D".to_string()));
         assert!(result.contains(&"_REENTRANT".to_string()));
+    }
+
+    /// `-fsignaling-nans` defines gcc's `__SUPPORT_SNAN__`, the last of it
+    /// and `-fno-signaling-nans` wins, and neither is passed on.
+    #[test]
+    fn test_preprocess_signaling_nans() {
+        let defines = |args: &[&str]| {
+            let result = run_preprocess(args);
+            assert!(!result.iter().any(|a| a.contains("signaling-nans")));
+            result.contains(&"__SUPPORT_SNAN__".to_string())
+        };
+        assert!(defines(&["-fsignaling-nans", "foo.c"]));
+        assert!(!defines(&["foo.c"]));
+        assert!(!defines(&[
+            "-fsignaling-nans",
+            "-fno-signaling-nans",
+            "foo.c"
+        ]));
+        assert!(defines(&[
+            "-fno-signaling-nans",
+            "-fsignaling-nans",
+            "foo.c"
+        ]));
+        // Ahead of `--`, after which everything is an operand.
+        let result = run_preprocess(&["-fsignaling-nans", "--", "foo.c"]);
+        let snan = result.iter().position(|a| a == "__SUPPORT_SNAN__");
+        let dashes = result.iter().position(|a| a == "--");
+        assert!(snan < dashes, "{result:?}");
     }
 
     #[test]

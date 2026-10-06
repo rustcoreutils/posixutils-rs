@@ -17,8 +17,9 @@ use super::{
     Initializer, Instruction, MemoryOrder, Module, Opcode, Pseudo, PseudoId, PseudoKind,
 };
 use crate::abi::{get_abi_for_conv, CallingConv};
+use crate::constexpr::ConstScope;
 use crate::diag::{get_all_stream_names, Position};
-use crate::float::FloatVal;
+use crate::float::{FloatVal, FpFormat};
 use crate::ir::linearize_atomic::{AtomicLvalue, OrderedAccess};
 use crate::ir::linearize_emit::CompoundAssign;
 use crate::ir::linearize_stmt::SwitchCtx;
@@ -3634,6 +3635,13 @@ impl<'a> Linearizer<'a> {
     /// expression, so `isnan(f())` would call `f` twice.
     fn linearize_fp_test(&mut self, test: FpTest, arg: &Expr) -> PseudoId {
         let typ = self.expr_type(arg);
+        if test == FpTest::IsSignaling {
+            // A constant answers at every level, as gcc's front end does.
+            if let Some(v) = crate::constexpr::eval_float(self, ConstScope::Standard, arg) {
+                let int = self.types.int_id;
+                return self.emit_const(i128::from(v.is_signalling_nan()), int);
+            }
+        }
         let val = self.linearize_expr(arg);
 
         match test {
@@ -3661,7 +3669,136 @@ impl<'a> Linearizer<'a> {
                 self.emit_bool_combine(Opcode::And, finite, magnitude)
             }
             FpTest::SignBit => self.emit_signbit(val, typ),
+            FpTest::IsSignaling => self.emit_is_signaling(val, typ),
         }
+    }
+
+    /// `__builtin_issignaling(x)` of `x`, a value of the real floating type
+    /// `typ`: 1 for a signalling NaN of either sign, 0 otherwise.
+    ///
+    /// A test of the representation, as gcc's is. No floating operation can
+    /// ask: every one of them, a quiet comparison included, delivers a
+    /// signalling NaN quieted or raises *invalid* on it. So `x` is stored to
+    /// a temporary at its own type -- a plain move on every target, which
+    /// keeps the bits -- and read back as integers. Every target is
+    /// little-endian, so the low word is at offset 0.
+    fn emit_is_signaling(&mut self, x: PseudoId, typ: TypeId) -> PseudoId {
+        debug_assert!(self.target.little_endian());
+        let fmt = self
+            .types
+            .fp_format(typ)
+            .expect("issignaling takes a real floating operand");
+        let image = self.frame_temp_addr("__snan", typ);
+        let bits = self.types.size_bits(typ);
+        self.emit(Instruction::store(x, image, 0, typ, bits));
+        let u64t = self.types.ulonglong_id;
+        match fmt {
+            FpFormat::X87Extended => self.x87_is_signaling(image),
+            FpFormat::Binary128 => {
+                // The high word with the low word's "any bit set" folded into
+                // its lowest payload bit, which leaves the test to one word.
+                let lo = self.load_word(image, 0, u64t);
+                let hi = self.load_word(image, 8, u64t);
+                let zero = self.emit_const(0, u64t);
+                let lo_set = self.emit_compare(Opcode::SetNe, lo, zero, u64t);
+                let lo_set = self.emit_convert(lo_set, self.types.int_id, u64t);
+                let hi = self.emit_int_binop(Opcode::Or, hi, lo_set, u64t, 64);
+                self.ieee_word_is_signaling(hi, u64t, 64, 112 - 64)
+            }
+            _ => {
+                let word_typ = match bits {
+                    16 => self.types.ushort_id,
+                    32 => self.types.uint_id,
+                    _ => u64t,
+                };
+                let word = self.load_word(image, 0, word_typ);
+                let (word, word_typ) = match bits {
+                    16 => {
+                        let uint = self.types.uint_id;
+                        (self.emit_convert(word, word_typ, uint), uint)
+                    }
+                    _ => (word, word_typ),
+                };
+                let fraction = fmt.precision() - 1;
+                self.ieee_word_is_signaling(word, word_typ, bits, fraction)
+            }
+        }
+    }
+
+    /// One integer of type `typ` read from `addr + offset`.
+    fn load_word(&mut self, addr: PseudoId, offset: i64, typ: TypeId) -> PseudoId {
+        let value = self.alloc_reg_pseudo();
+        let size = self.types.size_bits(typ);
+        self.emit(Instruction::load(value, addr, offset, typ, size));
+        value
+    }
+
+    /// Whether `word`, the top `width` bits of an IEEE interchange format
+    /// whose `fraction` lowest bits are the trailing significand, is a
+    /// signalling NaN. `word` is zero above `width` and is held in `typ`.
+    ///
+    /// gcc's test: with the sign cleared and the quiet bit flipped, a
+    /// signalling NaN -- exponent all ones, quiet bit clear, payload nonzero
+    /// -- is exactly what lies above the exponent-all-ones-and-quiet-bit
+    /// pattern. A quiet NaN falls below it once its quiet bit is flipped
+    /// away, and an infinity lands on it.
+    fn ieee_word_is_signaling(
+        &mut self,
+        word: PseudoId,
+        typ: TypeId,
+        width: u32,
+        fraction: u32,
+    ) -> PseudoId {
+        let size = self.types.size_bits(typ);
+        let magnitude_mask = (1i128 << (width - 1)) - 1;
+        let quiet = 1i128 << (fraction - 1);
+        let exponent = magnitude_mask & !((1i128 << fraction) - 1);
+        let mask = self.emit_const(magnitude_mask, typ);
+        let magnitude = self.emit_int_binop(Opcode::And, word, mask, typ, size);
+        let quiet_bit = self.emit_const(quiet, typ);
+        let flipped = self.emit_int_binop(Opcode::Xor, magnitude, quiet_bit, typ, size);
+        let threshold = self.emit_const(exponent | quiet, typ);
+        self.emit_compare(Opcode::SetA, flipped, threshold, typ)
+    }
+
+    /// [`Self::emit_is_signaling`] for the x87 80-bit format, whose integer
+    /// bit is explicit (bit 63 of the 64-bit significand at offset 0; the
+    /// quiet bit is 62) and whose sign and exponent are the 16 bits at
+    /// offset 8.
+    ///
+    /// Signalling, as gcc and glibc count it: a NaN with the integer bit set,
+    /// the quiet bit clear and the rest of the significand nonzero -- and
+    /// every encoding with a nonzero exponent and the integer bit clear
+    /// (pseudo-NaN, pseudo-infinity, unnormal), which the x87 no longer
+    /// accepts as an operand and raises *invalid* on, as it does for a
+    /// signalling NaN.
+    fn x87_is_signaling(&mut self, image: PseudoId) -> PseudoId {
+        const INTEGER_BIT: i128 = 1 << 63;
+        const QUIET_BIT: i128 = 1 << 62;
+        let u64t = self.types.ulonglong_id;
+        let uint = self.types.uint_id;
+        let sig = self.load_word(image, 0, u64t);
+        let sign_exp = self.load_word(image, 8, self.types.ushort_id);
+        let sign_exp = self.emit_convert(sign_exp, self.types.ushort_id, uint);
+        let exp_mask = self.emit_const(0x7fff, uint);
+        let exp = self.emit_int_binop(Opcode::And, sign_exp, exp_mask, uint, 32);
+
+        // A NaN with the integer bit set: flipping the quiet bit puts a
+        // signalling one above integer-and-quiet bits alone.
+        let all_ones = self.emit_compare(Opcode::SetEq, exp, exp_mask, uint);
+        let quiet = self.emit_const(QUIET_BIT, u64t);
+        let flipped = self.emit_int_binop(Opcode::Xor, sig, quiet, u64t, 64);
+        let threshold = self.emit_const(INTEGER_BIT | QUIET_BIT, u64t);
+        let payload = self.emit_compare(Opcode::SetA, flipped, threshold, u64t);
+        let nan = self.emit_bool_combine(Opcode::And, all_ones, payload);
+
+        // A nonzero exponent without the integer bit.
+        let zero = self.emit_const(0, uint);
+        let exp_set = self.emit_compare(Opcode::SetNe, exp, zero, uint);
+        let integer = self.emit_const(INTEGER_BIT, u64t);
+        let no_integer = self.emit_compare(Opcode::SetB, sig, integer, u64t);
+        let unnormal = self.emit_bool_combine(Opcode::And, exp_set, no_integer);
+        self.emit_bool_combine(Opcode::Or, nan, unnormal)
     }
 
     /// The C99 7.12.14 relations, each yielding 0 or 1.

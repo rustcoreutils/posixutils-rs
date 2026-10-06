@@ -48,6 +48,7 @@ const FP_TESTS: &[(StringId, FpTest, Option<ProtoType>)] = {
         (kw::BUILTIN_SIGNBIT,     SignBit,   None),
         (kw::BUILTIN_SIGNBITF,    SignBit,   Some(Float)),
         (kw::BUILTIN_SIGNBITL,    SignBit,   Some(LongDouble)),
+        (kw::BUILTIN_ISSIGNALING, IsSignaling, None),
     ]
 };
 

@@ -57,6 +57,16 @@ pub struct WriteOptions {
     /// and any rename -- because that is what a later extraction resolves, and
     /// it is not the pathname the file was named by on the command line.
     pub update_times: Option<HashMap<PathBuf, i64>>,
+    /// `(st_dev, st_ino)` of the archive being written, when it is a regular
+    /// file. A name list read as the walk goes can name it once it exists --
+    /// `find . | pax -w -f out.tar` -- and it is left out rather than copied
+    /// into itself.
+    pub archive_id: Option<(u64, u64)>,
+}
+
+/// `(st_dev, st_ino)`, which identifies a file however it is named.
+pub fn file_id(metadata: &std::fs::Metadata) -> (u64, u64) {
+    (metadata.dev(), metadata.ino())
 }
 
 impl WriteOptions {
@@ -297,6 +307,14 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
             // stat, which it does not do inside the handler.
             return Ok(false);
         };
+
+        if self.options.archive_id == Some((metadata.dev(), metadata.ino())) {
+            crate::error::report_warning(
+                path,
+                gettextrs::gettext("file is the archive; not dumped"),
+            );
+            return Ok(false);
+        }
 
         // -L, and -H on an operand, ask for the *target*, not the link. ftw
         // falls back to the link's own metadata when the target cannot be

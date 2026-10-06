@@ -192,10 +192,41 @@ impl<'a> From<&'a String> for Subject<'a> {
 /// carries a pathname, so one rule with no exceptions is the only one that
 /// cannot be got wrong later.
 pub fn report_error<'a>(context: impl Into<Subject<'a>>, err: impl fmt::Display) {
+    if QUIET.load(Ordering::Relaxed) {
+        return;
+    }
+    write_diagnostic(context.into(), err);
+    note_error();
+}
+
+/// Write a diagnostic in the same form as [`report_error`], for something
+/// worth saying that is not a failure: the exit status is left alone.
+pub fn report_warning<'a>(context: impl Into<Subject<'a>>, err: impl fmt::Display) {
+    write_diagnostic(context.into(), err);
+}
+
+/// Set while [`quietly`] runs.
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+/// Run `f` with [`report_error`] silenced, neither writing nor failing the run.
+///
+/// For reading an archive only to learn something about it -- where append
+/// mode is to write -- with the reader `pax -r` uses. What that reader says
+/// about a member it could not extract is about extraction, and append
+/// extracts nothing. pax is single-threaded, so the flag is not shared with
+/// work that wants its diagnostics.
+pub fn quietly<T>(f: impl FnOnce() -> T) -> T {
+    QUIET.store(true, Ordering::Relaxed);
+    let result = f();
+    QUIET.store(false, Ordering::Relaxed);
+    result
+}
+
+fn write_diagnostic(context: Subject<'_>, err: impl fmt::Display) {
     let mut line = Vec::new();
     line.extend_from_slice(program_name().as_bytes());
     line.extend_from_slice(b": ");
-    match context.into() {
+    match context {
         Subject::Path(p) => line.extend_from_slice(crate::rawpath::as_bytes(p)),
         Subject::Text(t) => line.extend_from_slice(t.as_bytes()),
         Subject::Owned(t) => line.extend_from_slice(t.as_bytes()),
@@ -204,5 +235,4 @@ pub fn report_error<'a>(context: impl Into<Subject<'a>>, err: impl fmt::Display)
     let _ = write!(line, "{}", err);
 
     crate::escape::write_stderr_line(&line);
-    note_error();
 }

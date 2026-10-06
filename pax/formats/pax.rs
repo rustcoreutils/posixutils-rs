@@ -27,16 +27,17 @@ use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
 use crate::error::{PaxError, PaxResult};
 use crate::formats::ustar::{
     calculate_checksum, entry_type_to_flag, parse_header as parse_ustar_header, parse_numeric,
-    try_split_path, ustar_path_bytes, verify_checksum, write_field, SizeRule, BLOCK_SIZE,
-    CHKSUM_OFF, DEVMAJOR_OFF, DEVMINOR_OFF, GID_OFF, GNAME_LEN, GNAME_OFF, LINKNAME_LEN,
-    LINKNAME_OFF, MAGIC_OFF, MODE_OFF, MTIME_OFF, NAME_LEN, NAME_OFF, PREFIX_LEN, PREFIX_OFF,
-    SIZE_OFF, TYPEFLAG_OFF, UID_OFF, UNAME_LEN, UNAME_OFF, VERSION_OFF, ZERO_BLOCK,
+    try_split_path, ustar_path_bytes, verify_checksum, write_field, LoneZeroBlock, SizeRule,
+    BLOCK_SIZE, CHKSUM_OFF, DEVMAJOR_OFF, DEVMINOR_OFF, GID_OFF, GNAME_LEN, GNAME_OFF,
+    LINKNAME_LEN, LINKNAME_OFF, MAGIC_OFF, MODE_OFF, MTIME_OFF, NAME_LEN, NAME_OFF, PREFIX_LEN,
+    PREFIX_OFF, SIZE_OFF, TYPEFLAG_OFF, UID_OFF, UNAME_LEN, UNAME_OFF, VERSION_OFF, ZERO_BLOCK,
 };
 use crate::formats::{ArchiveStream, MAX_NAME};
 use crate::options::FormatOptions;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{Read, Seek, Write};
+use std::ops::Range;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -971,8 +972,14 @@ pub struct PaxReader<R: Read> {
     /// describes it. Once `read_entry` has returned `None` this is where the
     /// end-of-archive indicator begins.
     member_offset: u64,
+    /// The `g` headers read since `member_offset` while an `x` header was
+    /// pending, as byte ranges of the archive. See
+    /// [`trailing_global_headers`](Self::trailing_global_headers).
+    pending_globals: Vec<Range<u64>>,
     /// Whether any `x` or `g` header has been read.
     saw_extended_header: bool,
+    /// What a single zero block between members means.
+    lone_zero: LoneZeroBlock,
 }
 
 impl<R: Read> PaxReader<R> {
@@ -987,8 +994,17 @@ impl<R: Read> PaxReader<R> {
             per_file_options: ExtendedHeader::new(),
             options: FormatOptions::default(),
             member_offset: 0,
+            pending_globals: Vec::new(),
             saw_extended_header: false,
+            lone_zero: LoneZeroBlock::Stop,
         }
+    }
+
+    /// Read on past a single zero block, as append mode must, rather than
+    /// taking it for the end of the archive. See [`LoneZeroBlock`].
+    pub fn stepping_over_lone_zero_blocks(mut self) -> Self {
+        self.lone_zero = LoneZeroBlock::StepOver;
+        self
     }
 
     /// The offset at which the end-of-archive indicator begins, once
@@ -999,6 +1015,16 @@ impl<R: Read> PaxReader<R> {
     /// not: it applies to every member that follows, appended ones included.
     pub fn end_of_archive(&self) -> u64 {
         self.member_offset
+    }
+
+    /// The `g` headers that lie past [`end_of_archive`](Self::end_of_archive),
+    /// once `read_entry` has returned `None`, as byte ranges of the archive.
+    ///
+    /// They come after a dangling `x` header, which is why the end of the
+    /// archive is before them. They still apply to whatever is appended, so
+    /// append writes them again at the new end, without the `x`.
+    pub fn trailing_global_headers(&self) -> &[Range<u64>] {
+        &self.pending_globals
     }
 
     /// Whether the archive has used any pax extended header so far.
@@ -1040,7 +1066,9 @@ impl<R: Read> PaxReader<R> {
 
     /// Read a raw header block
     fn read_header_block(&mut self) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
-        let Some(header) = crate::formats::ustar::next_header_block(&mut self.reader)? else {
+        let Some(header) =
+            crate::formats::ustar::next_header_block(&mut self.reader, self.lone_zero)?
+        else {
             return Ok(None);
         };
 
@@ -1110,6 +1138,7 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
         loop {
             if extended_header.is_none() {
                 self.member_offset = self.reader.offset();
+                self.pending_globals.clear();
             }
             let header = match self.read_header_block()? {
                 Some(h) => h,
@@ -1122,10 +1151,14 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
                 PAX_GHDR => {
                     // Global extended header - affects all subsequent files,
                     // for the keywords it names; the rest stay in force.
+                    let start = self.reader.offset() - BLOCK_SIZE as u64;
                     let size = parse_numeric(&header[SIZE_OFF..SIZE_OFF + 12])?;
                     let global = self.read_extended_header(size)?;
                     self.merge_global(global);
                     self.saw_extended_header = true;
+                    if extended_header.is_some() {
+                        self.pending_globals.push(start..self.reader.offset());
+                    }
                 }
                 PAX_XHDR => {
                     // Per-file extended header
@@ -1139,11 +1172,18 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
                     // The records and the member are dropped together, and
                     // there can be more than one record -- see
                     // consume_long_name_group.
-                    self.current_size = crate::formats::ustar::consume_long_name_group(
+                    // With no member after them, the records end the archive,
+                    // which begins where they do.
+                    let Some(size) = crate::formats::ustar::consume_long_name_group(
                         &mut self.reader,
                         header,
                         SizeRule::Pax,
-                    )?;
+                        self.lone_zero,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    self.current_size = size;
                     self.bytes_read = 0;
                     self.skip_data()?;
                     // An `x` header ahead of the group described the member

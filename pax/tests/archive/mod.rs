@@ -1900,3 +1900,69 @@ fn test_find_style_list_keeps_hard_links() {
     let g = fs::metadata(dst.join("tree/g")).unwrap();
     assert_eq!(f.ino(), g.ino(), "tree/f and tree/g should be one inode");
 }
+
+/// A name list that cannot be read at all fails before the archive is
+/// created. Its first read used to be diagnosed as the end of the list after
+/// `-f` had already truncated the existing archive.
+#[test]
+fn test_write_unreadable_name_list_keeps_existing_archive() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f1"), "1\n").unwrap();
+    let archive = temp.path().join("keep.tar");
+    assert_success(
+        &run_pax_in_dir(&["-w", "-f", "keep.tar", "f1"], temp.path()),
+        "create",
+    );
+    let before = fs::read(&archive).unwrap();
+    fs::create_dir(temp.path().join("somedir")).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["-w", "-f", "keep.tar"])
+        .current_dir(temp.path())
+        .stdin(File::open(temp.path().join("somedir")).unwrap())
+        .output()
+        .unwrap();
+    assert_failure(&out, "pax -w with a directory for a name list");
+    assert_eq!(fs::read(&archive).unwrap(), before, "archive was truncated");
+}
+
+/// A streamed name list can name the archive being written -- `find . |
+/// pax -w -f out.tar` lists out.tar once pax has created it. Archiving it
+/// copies the archive into itself; like GNU tar, pax leaves it out.
+#[test]
+fn test_write_does_not_archive_the_archive_itself() {
+    use std::process::Stdio;
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f1"), "1\n").unwrap();
+    fs::create_dir(temp.path().join("zzz")).unwrap();
+    let archive = temp.path().join("zzz/out.tar");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["-wd", "-f", "zzz/out.tar"])
+        .current_dir(temp.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"f1\n").unwrap();
+    stdin.flush().unwrap();
+    // The archive exists once the first name has been read.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !archive.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    stdin.write_all(b"zzz/out.tar\n").unwrap();
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    assert_success(&out, "pax -w naming its own archive");
+    assert!(
+        stderr_str(&out).contains("zzz/out.tar"),
+        "the skip is not reported: {}",
+        stderr_str(&out)
+    );
+
+    let listing = stdout_str(&run_pax_in_dir(&["-f", "zzz/out.tar"], temp.path()));
+    assert_eq!(listing, "f1\n");
+}

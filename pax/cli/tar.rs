@@ -398,7 +398,11 @@ fn finish(mut st: State) -> PaxResult<Args> {
     }
 
     // tar always writes an interchange format; only the flavor is selectable.
-    st.args.format = Some(st.format.unwrap_or(Format::Ustar));
+    // Appending keeps the flavor the archive already has unless one is named.
+    st.args.format = match mode {
+        Mode::Append | Mode::Update => st.format,
+        _ => Some(st.format.unwrap_or(Format::Ustar)),
+    };
 
     if !st.privs.is_empty() {
         st.args.privs = vec![st.privs.clone()];

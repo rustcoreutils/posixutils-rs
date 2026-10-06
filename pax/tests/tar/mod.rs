@@ -633,3 +633,95 @@ fn test_front_end_name_lists_stream() {
         "cpio -o -0: no record written while the list was open"
     );
 }
+
+/// The names in a `-T` list select members on extraction and listing just as
+/// operands do. They used to be read only when creating, so `tar -x -T list`
+/// extracted -- and overwrote -- every member.
+#[test]
+fn test_tar_files_from_selects_members_on_extract_and_list() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+    assert_success(
+        &run_tar(&["-cf", "../t.tar", "a.txt", "sub"], &src),
+        "tar -c",
+    );
+    let dst = temp.path().join("dst");
+    fs::create_dir_all(dst.join("sub")).unwrap();
+    fs::write(dst.join("sub/b.txt"), "LOCAL\n").unwrap();
+    fs::write(dst.join("list"), "a.txt\n").unwrap();
+
+    let out = run_tar(&["-tf", "../t.tar", "-T", "list"], &dst);
+    assert_success(&out, "tar -t -T");
+    assert_eq!(stdout_str(&out), "a.txt\n");
+
+    let out = run_tar(&["-xf", "../t.tar", "-T", "list"], &dst);
+    assert_success(&out, "tar -x -T");
+    assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "alpha\n");
+    assert_eq!(
+        fs::read_to_string(dst.join("sub/b.txt")).unwrap(),
+        "LOCAL\n",
+        "a member not in the list was extracted"
+    );
+    assert!(!dst.join("sub/c.o").exists());
+}
+
+/// A name list that cannot be read is diagnosed before the archive is
+/// created: `File::create` truncated an existing archive first, so the
+/// failed command destroyed it.
+#[test]
+fn test_tar_unreadable_files_from_keeps_existing_archive() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+    assert_success(&run_tar(&["-cf", "../keep.tar", "a.txt"], &src), "tar -c");
+    let before = fs::read(temp.path().join("keep.tar")).unwrap();
+    fs::create_dir(temp.path().join("somedir")).unwrap();
+
+    let out = run_tar(&["-cf", "keep.tar", "-T", "somedir"], temp.path());
+    assert_failure(&out, "tar -c -T directory");
+    assert_eq!(fs::read(temp.path().join("keep.tar")).unwrap(), before);
+}
+
+/// `tar -r` appends in whatever tar format the archive is already in. It used
+/// to ask for ustar explicitly, which append refuses for a pax archive.
+#[test]
+fn test_tar_append_to_pax_archive() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+    let long = "p".repeat(120);
+    fs::write(src.join(&long), "P\n").unwrap();
+    assert_success(
+        &run_tar(&["--format=pax", "-cf", "../p.tar", &long], &src),
+        "tar -c pax",
+    );
+    let out = run_tar(&["-rf", "../p.tar", "a.txt"], &src);
+    assert_success(&out, "tar -r on a pax archive");
+    assert_eq!(
+        members(temp.path(), "p.tar"),
+        vec!["a.txt".to_string(), long]
+    );
+}
+
+/// Giving `-T` means members are selected by the list, so an empty list
+/// selects none of them, as with GNU tar and bsdtar; it used to select all.
+#[test]
+fn test_tar_empty_files_from_selects_nothing_on_extract_and_list() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+    assert_success(&run_tar(&["-cf", "../t.tar", "a.txt"], &src), "tar -c");
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+    fs::write(dst.join("empty.list"), "").unwrap();
+
+    let out = run_tar(&["-tf", "../t.tar", "-T", "empty.list"], &dst);
+    assert_success(&out, "tar -t -T empty");
+    assert_eq!(stdout_str(&out), "");
+
+    let out = run_tar(&["-xf", "../t.tar", "-T", "empty.list"], &dst);
+    assert_success(&out, "tar -x -T empty");
+    assert!(!dst.join("a.txt").exists(), "a member was extracted");
+
+    // Operands still select alongside the empty list.
+    let out = run_tar(&["-tf", "../t.tar", "-T", "empty.list", "a.txt"], &dst);
+    assert_success(&out, "tar -t -T empty a.txt");
+    assert_eq!(stdout_str(&out), "a.txt\n");
+}

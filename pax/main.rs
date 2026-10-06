@@ -283,6 +283,19 @@ fn run(mut args: Args) -> PaxResult<()> {
 
     let mode = determine_mode(&args);
     let name_lists = std::mem::take(&mut args.name_lists);
+    let name_lists = if matches!(mode, PaxMode::List | PaxMode::Read) {
+        // Given a list, selection is by the list: an empty one, with no
+        // operands either, selects no member -- not, as no patterns at all
+        // would, every one.
+        let selecting = !name_lists.is_empty();
+        names_as_patterns(name_lists, &mut args.files_and_patterns)?;
+        if selecting && args.files_and_patterns.is_empty() {
+            return Ok(());
+        }
+        Vec::new()
+    } else {
+        name_lists
+    };
 
     // Counts the archive bytes read or written, for the block total cpio
     // reports when it is done.
@@ -511,7 +524,7 @@ fn run_write(args: &Args, name_lists: Vec<NameList>, archive_bytes: &ByteCounter
     let format_options = parse_format_options(args)?;
 
     let selected = args.format.unwrap_or(Format::Ustar);
-    let options = WriteOptions {
+    let mut options = WriteOptions {
         cli_dereference: args.cli_dereference,
         dereference: args.dereference,
         no_recurse: args.dir_no_follow,
@@ -525,15 +538,11 @@ fn run_write(args: &Args, name_lists: Vec<NameList>, archive_bytes: &ByteCounter
         exclude_patterns: compile_patterns(&args.exclude_patterns),
         // -u selects among existing members, which write mode has none of.
         update_times: None,
+        archive_id: None,
     };
 
     let format = ArchiveFormat::from(selected);
-
-    // The first name is read before the archive is created, so a list that
-    // cannot be read at all fails before an existing archive is truncated.
-    // The rest is read as the walk goes.
-    let mut files = source_names(name_lists, &args.files_and_patterns).peekable();
-    files.peek();
+    let mut files = source_names(name_lists, &args.files_and_patterns)?;
 
     // Check for multi-volume mode
     if args.multi_volume {
@@ -548,7 +557,11 @@ fn run_write(args: &Args, name_lists: Vec<NameList>, archive_bytes: &ByteCounter
         Some(ref path) => File::create(path)?,
         None => stdio_file(io::stdout())?,
     };
-    let regular_file = raw.metadata()?.is_file();
+    let metadata = raw.metadata()?;
+    let regular_file = metadata.is_file();
+    if regular_file {
+        options.archive_id = Some(modes::write::file_id(&metadata));
+    }
     // -b is the size of every write to the archive file, and with -z the
     // archive file holds the compressed stream: that is what gets blocked.
     let blocked = BlockedWriter::with_counter(raw, record_size, ByteCounter::clone(archive_bytes));
@@ -623,6 +636,14 @@ fn run_append(
     name_lists: Vec<NameList>,
     archive_bytes: &ByteCounter,
 ) -> PaxResult<()> {
+    // Appending finds the end of one file and writes there; there is no
+    // reading a volume set to its last volume to carry on from.
+    if args.multi_volume {
+        return Err(PaxError::InvalidFormat(
+            "-M is not supported with -a".to_string(),
+        ));
+    }
+
     // Append mode requires an archive file (not stdin/stdout)
     let archive_path = args
         .archive
@@ -652,15 +673,17 @@ fn run_append(
         exclude_patterns: compile_patterns(&args.exclude_patterns),
         // Filled in by append_to_archive once it knows the archive's format.
         update_times: None,
+        archive_id: None,
     };
 
     let requested_format = args.format.map(ArchiveFormat::from);
     // Appended members are blocked like any other write; append used to bypass
     // the blocked writer entirely and so ignored -b.
     let record_size = write_record_size(args, DEFAULT_RECORD_SIZE)?;
+    let mut files = source_names(name_lists, &args.files_and_patterns)?;
     modes::append_to_archive(
         archive_path,
-        &mut source_names(name_lists, &args.files_and_patterns),
+        &mut files,
         &mut options,
         requested_format,
         record_size,
@@ -707,7 +730,7 @@ fn run_copy(args: &Args, name_lists: Vec<NameList>) -> PaxResult<()> {
         umask: current_umask(),
     };
 
-    modes::copy_files(&mut source_names(name_lists, sources), &dest_dir, &options)
+    modes::copy_files(&mut source_names(name_lists, sources)?, &dest_dir, &options)
 }
 
 /// Open the archive for reading, detecting its format.
@@ -889,16 +912,54 @@ fn compile_patterns(patterns: &[OsString]) -> Vec<Pattern> {
 /// A list is read as the walk asks for each name. One that cannot be read is
 /// diagnosed and ends there; what was archived before it stays archived, and
 /// the archive is still finished properly.
-fn source_names(lists: Vec<NameList>, operands: &[OsString]) -> impl Iterator<Item = PathBuf> + '_ {
+///
+/// The first name is read here, though, before the caller creates or opens
+/// the archive: a list that cannot be read at all is an error before an
+/// existing archive has been truncated, not a diagnostic after.
+fn source_names(
+    lists: Vec<NameList>,
+    operands: &[OsString],
+) -> PaxResult<impl Iterator<Item = PathBuf> + '_> {
     let lists = if lists.is_empty() && operands.is_empty() {
         vec![NameList::stdin(b'\n')]
     } else {
         lists
     };
-    lists
-        .into_iter()
-        .flat_map(|list| list.names().map_while(report_list_error))
-        .chain(operands.iter().map(PathBuf::from))
+    let mut names = lists.into_iter().flat_map(NameList::names).peekable();
+    if let Some(Err(_)) = names.peek() {
+        if let Some(Err(e)) = names.next() {
+            return Err(list_error(e));
+        }
+    }
+    Ok(names
+        .map_while(report_list_error)
+        .chain(operands.iter().map(PathBuf::from)))
+}
+
+/// tar's `-T` in list and read mode: each name selects members as a pattern
+/// operand does, ahead of the operands themselves. The lists are read in
+/// full, since selection starts with the first member.
+fn names_as_patterns(lists: Vec<NameList>, operands: &mut Vec<OsString>) -> PaxResult<()> {
+    let mut patterns = Vec::new();
+    for list in lists {
+        for name in list.names() {
+            patterns.push(name.map_err(list_error)?.into_os_string());
+        }
+    }
+    patterns.append(operands);
+    *operands = patterns;
+    Ok(())
+}
+
+/// A failure to read a name list, saying that is what failed.
+fn list_error(e: PaxError) -> PaxError {
+    match e {
+        PaxError::Io(e) => PaxError::Io(io::Error::new(
+            e.kind(),
+            format!("{}: {}", gettext("pathname list"), e),
+        )),
+        e => e,
+    }
 }
 
 /// A name from a list, or `None` -- ending the list -- after diagnosing a
@@ -1183,7 +1244,9 @@ mod tests {
         let name = OsString::from_vec(b"caf\xe9".to_vec());
         let args = Args::try_parse_from([OsString::from("pax"), "-w".into(), name.clone()])
             .expect("a non-UTF-8 operand is a pathname, not a usage error");
-        let files: Vec<PathBuf> = source_names(Vec::new(), &args.files_and_patterns).collect();
+        let files: Vec<PathBuf> = source_names(Vec::new(), &args.files_and_patterns)
+            .unwrap()
+            .collect();
         assert_eq!(files[0].as_os_str().as_bytes(), b"caf\xe9");
 
         // As a pattern it selects the member of that name.

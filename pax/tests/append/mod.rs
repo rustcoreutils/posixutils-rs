@@ -712,3 +712,261 @@ fn test_append_directory_with_nonzero_size_field() {
 
     assert_eq!(append_and_list(&a), ["d/", "d/after", "newfile"]);
 }
+
+/// A member of `name` holding `body`, as a hand-built archive would carry it.
+fn plain(name: &[u8], body: &[u8]) -> Vec<u8> {
+    Ustar {
+        name,
+        body,
+        ..Default::default()
+    }
+    .member()
+}
+
+/// A file whose first block happens to be zeros is not thereby an empty tar
+/// archive: a disk image, say, with its data further in. Append used to take
+/// it for one, write its member at the start and cut the file off after it.
+#[test]
+fn test_append_refuses_a_non_archive_that_starts_with_zeros() {
+    let temp = TempDir::new().unwrap();
+    let image = temp.path().join("disk.img");
+    let mut contents = vec![0u8; 32 * 1024];
+    contents.extend_from_slice(&b"DATA".repeat(1000));
+    fs::write(&image, &contents).unwrap();
+    fs::write(temp.path().join("f"), "F\n").unwrap();
+
+    let out = run_pax_in_dir(
+        &["-w", "-a", "-f", image.to_str().unwrap(), "f"],
+        temp.path(),
+    );
+    assert_failure(&out, "append to a zero-led non-archive");
+    assert_eq!(fs::read(&image).unwrap(), contents, "the file was modified");
+
+    // A file of nothing but zeros is an empty archive, and stays appendable.
+    let empty = temp.path().join("empty.tar");
+    fs::write(&empty, vec![0u8; 10240]).unwrap();
+    let out = run_pax_in_dir(
+        &["-w", "-a", "-f", empty.to_str().unwrap(), "f"],
+        temp.path(),
+    );
+    assert_success(&out, "append to an all-zero archive");
+    let listing = stdout_str(&run_pax(&["-f", empty.to_str().unwrap()]));
+    assert_eq!(listing, "f\n");
+}
+
+/// One zero block is not the end-of-archive indicator, which is two. Append
+/// used to write over it, then cut the archive off after the new member,
+/// destroying every member that followed it.
+#[test]
+fn test_append_keeps_members_after_a_lone_zero_block() {
+    let mut a = plain(b"a", b"A\n");
+    a.extend_from_slice(&[0u8; BLOCK]);
+    a.extend_from_slice(&plain(b"b", b"B\n"));
+    a.extend_from_slice(&ustar_trailer());
+
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("lone.tar");
+    fs::write(&archive, &a).unwrap();
+    fs::write(temp.path().join("c"), "C\n").unwrap();
+
+    let out = run_pax_in_dir(
+        &["-w", "-a", "-f", archive.to_str().unwrap(), "c"],
+        temp.path(),
+    );
+    assert_success(&out, "append after a lone zero block");
+    assert_eq!(stderr_str(&out), "");
+
+    // The original bytes are all still there, b included.
+    let after = fs::read(&archive).unwrap();
+    assert_eq!(&after[..a.len() - 2 * BLOCK], &a[..a.len() - 2 * BLOCK]);
+    let c_at = a.len() - 2 * BLOCK;
+    assert_eq!(&after[c_at..c_at + 1], b"c", "c is appended after b");
+}
+
+/// The append scan reads the archive only to find its end. The diagnostics
+/// reading mode gives about members it cannot extract -- a GNU long-name
+/// record, an unknown type -- are not about anything append does, and used to
+/// make a successful append exit 1.
+#[test]
+fn test_append_to_gnu_long_name_archive_is_silent() {
+    let long = vec![b'L'; 150];
+    let mut name_data = long.clone();
+    name_data.push(0);
+    let mut a = Ustar {
+        name: b"././@LongLink",
+        typeflag: b'L',
+        body: &name_data,
+        ..Default::default()
+    }
+    .member();
+    a.extend_from_slice(&plain(&long[..100], b"long\n"));
+    a.extend_from_slice(
+        &Ustar {
+            name: b"odd",
+            typeflag: b'Q',
+            ..Default::default()
+        }
+        .member(),
+    );
+    a.extend_from_slice(&ustar_trailer());
+
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("gnu.tar");
+    fs::write(&archive, &a).unwrap();
+    fs::write(temp.path().join("newfile"), "NEW\n").unwrap();
+
+    let out = run_pax_in_dir(
+        &["-w", "-a", "-f", archive.to_str().unwrap(), "newfile"],
+        temp.path(),
+    );
+    assert_success(&out, "append to a GNU long-name archive");
+    assert_eq!(stderr_str(&out), "");
+    let listing = stdout_str(&run_pax(&["-f", archive.to_str().unwrap()]));
+    assert!(listing.ends_with("newfile\n"), "listing: {listing}");
+}
+
+/// A pax archive whose members needed no extended header is byte for byte a
+/// ustar archive, so `-a -x pax` on one has to be accepted: pax members are
+/// valid in a ustar archive and the other way about.
+#[test]
+fn test_append_pax_members_to_a_ustar_archive() {
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("u.tar");
+    fs::write(
+        &archive,
+        Ustar {
+            name: b"a",
+            body: b"A\n",
+            ..Default::default()
+        }
+        .archive(),
+    )
+    .unwrap();
+    let long = "n".repeat(120);
+    fs::write(temp.path().join(&long), "N\n").unwrap();
+
+    let out = run_pax_in_dir(
+        &[
+            "-w",
+            "-a",
+            "-x",
+            "pax",
+            "-f",
+            archive.to_str().unwrap(),
+            &long,
+        ],
+        temp.path(),
+    );
+    assert_success(&out, "append -x pax to a ustar archive");
+    let listing = stdout_str(&run_pax(&["-f", archive.to_str().unwrap()]));
+    assert_eq!(listing, format!("a\n{long}\n"));
+
+    // ...and ustar members to what is now a pax archive.
+    fs::write(temp.path().join("u"), "U\n").unwrap();
+    let out = run_pax_in_dir(
+        &[
+            "-w",
+            "-a",
+            "-x",
+            "ustar",
+            "-f",
+            archive.to_str().unwrap(),
+            "u",
+        ],
+        temp.path(),
+    );
+    assert_success(&out, "append -x ustar to a pax archive");
+    let listing = stdout_str(&run_pax(&["-f", archive.to_str().unwrap()]));
+    assert_eq!(listing, format!("a\n{long}\nu\n"));
+}
+
+/// A GNU long-name record with no member after it describes nothing, and the
+/// end of the archive is where it begins. Append used to put its members after
+/// the end-of-archive indicator that follows the record, where no reader ever
+/// sees them.
+#[test]
+fn test_append_over_a_dangling_long_name_record() {
+    let mut a = plain(b"a", b"A\n");
+    a.extend_from_slice(
+        &Ustar {
+            name: b"././@LongLink",
+            typeflag: b'L',
+            body: b"some/long/name\0",
+            ..Default::default()
+        }
+        .member(),
+    );
+    a.extend_from_slice(&ustar_trailer());
+
+    assert_eq!(append_and_list(&a), ["a", "newfile"]);
+}
+
+/// A `g` header at the end of an archive applies to whatever is appended, so
+/// append keeps it. It used to be overwritten whenever a dangling `x` header
+/// came before it -- the `x`, which describes no member, is the part to drop.
+#[test]
+fn test_append_keeps_a_trailing_global_header_after_a_dangling_x() {
+    let mut a = plain(b"a", b"A\n");
+    a.extend_from_slice(
+        &Ustar {
+            name: b"PaxHeaders/x",
+            typeflag: b'x',
+            body: &pax_record("path", b"WRONG"),
+            ..Default::default()
+        }
+        .member(),
+    );
+    a.extend_from_slice(
+        &Ustar {
+            name: b"GlobalHead",
+            typeflag: b'g',
+            body: &pax_record("uname", b"globaluser"),
+            ..Default::default()
+        }
+        .member(),
+    );
+    a.extend_from_slice(&ustar_trailer());
+
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("g.tar");
+    fs::write(&archive, &a).unwrap();
+    fs::write(temp.path().join("newfile"), "NEW\n").unwrap();
+    let out = run_pax_in_dir(
+        &["-w", "-a", "-f", archive.to_str().unwrap(), "newfile"],
+        temp.path(),
+    );
+    assert_success(&out, "append after x and g");
+
+    let out = run_pax(&["-v", "-f", archive.to_str().unwrap()]);
+    assert_success(&out, "list");
+    let listing = stdout_str(&out);
+    let line = listing
+        .lines()
+        .find(|l| l.ends_with(" newfile"))
+        .unwrap_or_else(|| panic!("newfile not listed under its own name: {listing}"));
+    assert!(line.contains("globaluser"), "g header lost: {line}");
+}
+
+/// Append has no multi-volume support, and ignoring -M wrote the members to
+/// the one file as though it had not been given.
+#[test]
+fn test_append_refuses_multi_volume() {
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("a.tar");
+    let original = Ustar {
+        name: b"a",
+        body: b"A\n",
+        ..Default::default()
+    }
+    .archive();
+    fs::write(&archive, &original).unwrap();
+    fs::write(temp.path().join("c"), "C\n").unwrap();
+
+    let out = run_pax_in_dir(
+        &["-w", "-a", "-M", "-f", archive.to_str().unwrap(), "c"],
+        temp.path(),
+    );
+    assert_failure(&out, "append with -M");
+    assert!(stderr_str(&out).contains("-M"), "{}", stderr_str(&out));
+    assert_eq!(fs::read(&archive).unwrap(), original);
+}

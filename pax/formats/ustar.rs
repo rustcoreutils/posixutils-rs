@@ -103,7 +103,7 @@ impl<R: Read> ArchiveReader for UstarReader<R> {
         self.skip_data()?;
 
         loop {
-            let Some(header) = next_header_block(&mut self.reader)? else {
+            let Some(header) = next_header_block(&mut self.reader, LoneZeroBlock::Stop)? else {
                 return Ok(None);
             };
 
@@ -116,8 +116,16 @@ impl<R: Read> ArchiveReader for UstarReader<R> {
             // own name field is truncated. The records and the member are
             // dropped together -- there can be more than one record.
             if long_name_record(header[TYPEFLAG_OFF]).is_some() {
-                self.current_size =
-                    consume_long_name_group(&mut self.reader, header, SizeRule::Ustar)?;
+                let Some(size) = consume_long_name_group(
+                    &mut self.reader,
+                    header,
+                    SizeRule::Ustar,
+                    LoneZeroBlock::Stop,
+                )?
+                else {
+                    return Ok(None);
+                };
+                self.current_size = size;
                 self.bytes_read = 0;
                 self.skip_data()?;
                 continue;
@@ -530,6 +538,18 @@ fn read_block(reader: &mut impl Read) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
     Ok(crate::formats::read_header(reader, &mut block)?.then_some(block))
 }
 
+/// What [`next_header_block`] makes of a single zero block followed by a
+/// header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoneZeroBlock {
+    /// End the archive there, and say so: reading and listing.
+    Stop,
+    /// Read on from the header after it, silently. Append mode writes where
+    /// the archive ends, and stopping at a lone zero block put that in front
+    /// of members it then destroyed.
+    StepOver,
+}
+
 /// The next header block, or `None` at the end of the archive.
 ///
 /// The end-of-archive indicator is *two* 512-byte blocks of zeros (POSIX). A
@@ -544,7 +564,10 @@ fn read_block(reader: &mut impl Read) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
 /// place in the file. Counting correctly means threading a byte position
 /// through every read and skip in both readers, which is more machinery than
 /// a diagnostic detail is worth.
-pub(crate) fn next_header_block(reader: &mut impl Read) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
+pub(crate) fn next_header_block(
+    reader: &mut impl Read,
+    lone_zero: LoneZeroBlock,
+) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
     let Some(block) = read_block(reader)? else {
         return Ok(None);
     };
@@ -556,6 +579,7 @@ pub(crate) fn next_header_block(reader: &mut impl Read) -> PaxResult<Option<[u8;
         // Two zero blocks, or one followed by end of file: a proper end.
         None => Ok(None),
         Some(next) if is_zero_block(&next) => Ok(None),
+        Some(next) if lone_zero == LoneZeroBlock::StepOver => Ok(Some(next)),
         Some(_) => {
             crate::error::report_error(
                 "archive",
@@ -648,7 +672,9 @@ pub(crate) fn consume_long_name_record(
 ///
 /// `header` is the first record's header. Returns the length of the member's
 /// data, which the caller steps over -- by seeking, where it can -- so that its
-/// next read is the following member.
+/// next read is the following member; or `None` when the archive ends after
+/// the records, with no member for them to describe. That is the end of the
+/// archive, and the caller must not read on past the indicator just consumed.
 ///
 /// Implementing the extension is separate work. What this avoids is the
 /// alternative: extracting `././@LongLink` as a file of its own and the member
@@ -658,7 +684,8 @@ pub(crate) fn consume_long_name_group(
     reader: &mut impl Read,
     mut header: [u8; BLOCK_SIZE],
     rule: SizeRule,
-) -> PaxResult<u64> {
+    lone_zero: LoneZeroBlock,
+) -> PaxResult<Option<u64>> {
     let mut long_name: Option<Vec<u8>> = None;
     let mut kinds: Vec<&'static str> = Vec::new();
 
@@ -671,10 +698,10 @@ pub(crate) fn consume_long_name_group(
         }
         kinds.push(what);
 
-        let Some(next) = next_header_block(reader)? else {
+        let Some(next) = next_header_block(reader, lone_zero)? else {
             // The archive ends after the record, with no member to skip.
             report_long_name_group(&long_name, &header, &kinds);
-            return Ok(0);
+            return Ok(None);
         };
         if !verify_checksum(&next) {
             return Err(PaxError::InvalidHeader("checksum mismatch".to_string()));
@@ -684,7 +711,7 @@ pub(crate) fn consume_long_name_group(
 
     // `header` is now the member the records described.
     report_long_name_group(&long_name, &header, &kinds);
-    member_data_size(&header, rule)
+    member_data_size(&header, rule).map(Some)
 }
 
 /// Name the member that is being skipped, and the extensions that describe it.

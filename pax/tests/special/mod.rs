@@ -651,3 +651,36 @@ fn test_listopt_literal_tab_survives() {
         "the tab is part of the format, not part of a name"
     );
 }
+
+/// A NUL inside a pathname read from standard input -- the common slip
+/// `find -print0 | pax -w` -- can name no file. pax must diagnose that name and
+/// go on with the rest, not panic after the archive was already created.
+#[test]
+fn test_write_list_with_nul_byte_is_diagnosed() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("good"), "G\n").unwrap();
+    let archive = temp.path().join("a.tar");
+
+    let output = run_pax_with_stdin_bytes_in_dir(
+        &["-w", "-f", archive.to_str().unwrap()],
+        b"a\0b\ngood\n",
+        temp.path(),
+    );
+    assert_exit_code(&output, 1, "pax -w with a NUL in a listed name");
+
+    let output = run_pax_in_dir(&["-f", archive.to_str().unwrap()], temp.path());
+    assert_success(&output, "list");
+    assert_eq!(stdout_str(&output), "good\n");
+}
+
+/// The same name list in copy mode.
+#[test]
+fn test_copy_list_with_nul_byte_is_diagnosed() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("good"), "G\n").unwrap();
+    fs::create_dir(temp.path().join("out")).unwrap();
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-rw", "out"], b"a\0b\ngood\n", temp.path());
+    assert_exit_code(&output, 1, "pax -rw with a NUL in a listed name");
+    assert!(temp.path().join("out/good").exists());
+}

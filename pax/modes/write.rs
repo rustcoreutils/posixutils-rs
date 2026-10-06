@@ -725,6 +725,12 @@ pub fn read_file_list<R: Read>(reader: R) -> PaxResult<Vec<PathBuf>> {
 /// `sep` is `b'\n'` for the usual `find | pax` pipeline and `b'\0'` for the
 /// `find -print0` pipeline that tar's `--null` and cpio's `-0` select, which is
 /// the only way a pathname containing a newline survives the trip.
+///
+/// A name holding a NUL byte -- `find -print0` piped to a list read by lines --
+/// can name no file, since the system interfaces end a pathname at the first
+/// NUL. It is diagnosed here and left out, so the exit status records it and
+/// the rest of the list is still processed, rather than handed on to a walk
+/// that would otherwise act on the prefix before the NUL instead.
 pub fn read_file_list_sep<R: Read>(reader: R, sep: u8) -> PaxResult<Vec<PathBuf>> {
     use std::io::BufRead;
 
@@ -742,7 +748,12 @@ pub fn read_file_list_sep<R: Read>(reader: R, sep: u8) -> PaxResult<Vec<PathBuf>
         }
         // Keep the name verbatim so pathnames with leading or trailing spaces
         // survive; skip only a wholly empty entry (e.g. a trailing separator).
-        if !buf.is_empty() {
+        if buf.contains(&0) {
+            crate::error::report_error(
+                &path_from_bytes(&buf),
+                gettextrs::gettext("pathname contains a NUL byte"),
+            );
+        } else if !buf.is_empty() {
             files.push(path_from_bytes(&buf));
         }
     }

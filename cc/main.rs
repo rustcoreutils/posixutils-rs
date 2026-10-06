@@ -1075,7 +1075,7 @@ fn emit_preprocessed(
                         out.preprocessed,
                         "# {} \"{}\" {}",
                         line,
-                        token::lexer::escape_c_string(&name),
+                        token::lexer::escape_c_string(token::preprocess::marker_file_name(&name)),
                         if returning { 2 } else { 1 }
                     )?;
                 }
@@ -1107,7 +1107,9 @@ fn emit_preprocessed(
                             out.preprocessed,
                             "# {} \"{}\"",
                             line,
-                            token::lexer::escape_c_string(&name)
+                            token::lexer::escape_c_string(token::preprocess::marker_file_name(
+                                &name
+                            ))
                         )?;
                     }
                     current_line = line;

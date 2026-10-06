@@ -1297,7 +1297,7 @@ impl<'a> Preprocessor<'a> {
         }
 
         // Save current state
-        let saved_file = std::mem::replace(&mut self.current_file, format!("<builtin:{}>", name));
+        let saved_file = std::mem::replace(&mut self.current_file, bundled_header_stream(name));
         let saved_dir = std::mem::replace(&mut self.current_dir, ".".to_string());
         let saved_cond_stack = std::mem::take(&mut self.cond_stack);
         // A bundled header's `#include_next` continues into the system

@@ -674,6 +674,26 @@ const PRAGMA_TEXT_PREFIX: &str = "text:";
 /// set out where the macros are defined.
 pub const GNUC_VERSION: [&str; 3] = ["7", "5", "0"];
 
+/// The stream name of a bundled header, which diagnostics show.
+pub(crate) fn bundled_header_stream(name: &str) -> String {
+    format!("<builtin:{name}>")
+}
+
+/// The file a `-E` line marker names for a stream.
+///
+/// A bundled header is compiled into c17 and has no path, so its marker
+/// names `<built-in>`, gcc's pseudo-file for text the compiler supplies.
+/// Tools read the markers as a list of files and know gcc's pseudo-names:
+/// perl's `makedepend` drops `<built-in>` and made `<builtin:stdarg.h>` a
+/// make prerequisite, which make then rejected as a target pattern.
+pub fn marker_file_name(stream_name: &str) -> &str {
+    if stream_name.starts_with("<builtin:") {
+        "<built-in>"
+    } else {
+        stream_name
+    }
+}
+
 /// The directive a marker token stands for, when it is one c17 only carries.
 ///
 /// `#pragma pack` and `#pragma scalar_storage_order` are the pragmas that

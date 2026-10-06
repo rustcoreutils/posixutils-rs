@@ -58,6 +58,42 @@ fn preprocessor_argument_keeps_its_parameters_space() {
     );
 }
 
+/// Every file a line marker names is a file, or one of the pseudo-names gcc
+/// writes for text that has none. Tools read the markers as a dependency
+/// list: perl's `makedepend` turns each into a make prerequisite, drops
+/// `<built-in>` and `<command-line>`, and choked on `<builtin:stdarg.h>`
+/// ("target pattern contains no '%'") -- c17's bundled headers are not on
+/// disk.
+#[test]
+fn preprocessor_markers_name_files_or_gcc_pseudo_files() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_pp_marker_names_")
+        .tempdir()
+        .unwrap();
+    let src = dir.path().join("m.c");
+    std::fs::write(
+        &src,
+        "#include <stdarg.h>\n#include <stddef.h>\n#include <stdio.h>\nint x;\n",
+    )
+    .unwrap();
+    let r = run_c17(&["-E", &src.to_string_lossy()]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    let mut pseudo = 0;
+    for line in r.stdout.lines().filter(|l| l.starts_with("# ")) {
+        let name = line.split('"').nth(1).expect("marker without a name");
+        if name.starts_with('<') {
+            assert_eq!(name, "<built-in>", "marker {line:?}");
+            pseudo += 1;
+        } else {
+            assert!(
+                std::path::Path::new(name).exists(),
+                "marker {line:?} names no file"
+            );
+        }
+    }
+    assert!(pseudo > 0, "no bundled header was marked:\n{}", r.stdout);
+}
+
 /// Tokens from different places can meet with nothing between them: a macro
 /// boundary, an argument, an empty expansion. Written side by side they must
 /// still read back as the tokens they are, or `-M` (with `M` defined as `-`)

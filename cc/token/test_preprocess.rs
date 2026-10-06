@@ -2526,3 +2526,17 @@ fn test_argument_takes_its_parameters_leading_space() {
         assert_eq!(spacing, want, "{src:?}");
     }
 }
+
+/// A bundled header keeps its name for diagnostics, but a line marker names
+/// it as gcc names compiler-supplied text; real files pass through.
+#[test]
+fn test_bundled_header_marker_is_built_in() {
+    let stream = bundled_header_stream("stdarg.h");
+    assert_eq!(stream, "<builtin:stdarg.h>");
+    assert_eq!(marker_file_name(&stream), "<built-in>");
+    assert_eq!(
+        marker_file_name("/usr/include/stdio.h"),
+        "/usr/include/stdio.h"
+    );
+    assert_eq!(marker_file_name("<stdin>"), "<stdin>");
+}

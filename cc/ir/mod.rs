@@ -33,6 +33,7 @@ mod linearize_atomic;
 mod linearize_cleanup;
 mod linearize_emit;
 mod linearize_init;
+mod linearize_label_diff;
 mod linearize_stmt;
 mod linearize_vector;
 pub mod loadfwd;
@@ -3565,6 +3566,14 @@ pub enum Initializer {
     SymAddr(String),
     /// Address of a symbol plus offset (for pointer initializers like `int *p = &s.field;`)
     SymAddrOffset(String, i64),
+    /// GNU `&&end - &&start + addend`: the distance in bytes between two
+    /// labels of one function, which the assembler writes as a symbol
+    /// difference at the object's width. Both are block-label symbols.
+    LabelDiff {
+        end: String,
+        start: String,
+        addend: i64,
+    },
 }
 
 impl Initializer {
@@ -3598,6 +3607,35 @@ impl Initializer {
         })
     }
 
+    /// Call `f` with every symbol this initializer names: the target of an
+    /// address and both labels of a label difference.
+    pub fn for_each_symbol(&self, f: &mut impl FnMut(&str)) {
+        match self {
+            Initializer::SymAddr(name) | Initializer::SymAddrOffset(name, _) => f(name),
+            Initializer::LabelDiff { end, start, .. } => {
+                f(end);
+                f(start);
+            }
+            Initializer::Array { elements, .. } => {
+                for (_, init) in elements {
+                    init.for_each_symbol(f);
+                }
+            }
+            Initializer::Struct { fields, .. } => {
+                for (_, _, init) in fields {
+                    init.for_each_symbol(f);
+                }
+            }
+            Initializer::None
+            | Initializer::Int(_)
+            | Initializer::Float(_)
+            | Initializer::Float128(_)
+            | Initializer::String(_)
+            | Initializer::Utf16String(_)
+            | Initializer::Utf32String(_) => {}
+        }
+    }
+
     /// Recursively determine whether this initializer evaluates to all zero bytes.
     ///
     /// Used to route static / extern globals whose initial contents are entirely
@@ -3621,7 +3659,11 @@ impl Initializer {
                 fields.iter().all(|(_, _, init)| init.is_all_zero())
             }
             // Address-of expressions are never zero — they take an address.
-            Initializer::SymAddr(_) | Initializer::SymAddrOffset(_, _) => false,
+            // A label difference is not known until the function is
+            // assembled, so it needs data of its own either way.
+            Initializer::SymAddr(_)
+            | Initializer::SymAddrOffset(_, _)
+            | Initializer::LabelDiff { .. } => false,
         }
     }
 
@@ -3639,7 +3681,10 @@ impl Initializer {
             Initializer::Struct { fields, .. } => {
                 fields.iter().any(|(_, _, init)| init.has_reloc())
             }
-            Initializer::Float128(_)
+            // Two labels of one section: the assembler resolves their
+            // distance, and nothing is left for the loader to fix up.
+            Initializer::LabelDiff { .. }
+            | Initializer::Float128(_)
             | Initializer::None
             | Initializer::Int(_)
             | Initializer::Float(_)
@@ -3684,6 +3729,13 @@ impl fmt::Display for Initializer {
                 write!(f, " }}")
             }
             Initializer::SymAddr(name) => write!(f, "&{}", name),
+            Initializer::LabelDiff { end, start, addend } => {
+                write!(f, "&&{}-&&{}", end, start)?;
+                if *addend != 0 {
+                    write!(f, "{:+}", addend)?;
+                }
+                Ok(())
+            }
             Initializer::SymAddrOffset(name, offset) => {
                 if *offset >= 0 {
                     write!(f, "&{}+{}", name, offset)

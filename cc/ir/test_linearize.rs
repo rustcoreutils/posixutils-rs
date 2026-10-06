@@ -1904,3 +1904,65 @@ fn test_global_type_is_the_object_type_alone() {
         );
     }
 }
+
+/// GNU `&&a - &&b` in a static initializer is a label difference at the
+/// object's width, with any constant around it folded into one addend, in
+/// bytes: a `void *` difference counts bytes, and an integer added to a
+/// `void *` or `char *` does too. A label cancelled against itself is the
+/// constant gcc folds it to, and a function whose labels a static names is
+/// marked so the inliner never copies it.
+#[test]
+fn test_label_difference_initializers() {
+    let src = "int f(int i) {\n\
+               static const int t[] = {&&a - &&a, &&b - &&a, &&b - &&a + 3};\n\
+               static const short s = -(&&a - &&b) - 2;\n\
+               static const long w = (&&b + 4) - &&a;\n\
+               static const char c = (char *)&&a - (char *)&&b;\n\
+               static const long l = (long)&&b - (long)&&a;\n\
+               goto *(&&a + t[i] + s + w + c + l);\n\
+               a: return 1;\n\
+               b: return 2;\n\
+               }\n";
+    for arch in [crate::target::Arch::X86_64, crate::target::Arch::Aarch64] {
+        let target = Target::new(arch, crate::target::Os::Linux);
+        let module = linearize_source(src, &target);
+        let init = |name: &str| {
+            &module
+                .globals
+                .iter()
+                .find(|g| g.name == name)
+                .unwrap_or_else(|| panic!("{arch}: no `{name}`"))
+                .init
+        };
+        let diff = |init: &Initializer| match init {
+            Initializer::LabelDiff { end, start, addend } => (end.clone(), start.clone(), *addend),
+            other => panic!("{arch}: not a label difference: {other:?}"),
+        };
+        let Initializer::Array {
+            elem_size,
+            elements,
+            ..
+        } = init("f.t.0")
+        else {
+            panic!("{arch}: `t` is an array");
+        };
+        assert_eq!(*elem_size, 4);
+        assert!(
+            matches!(elements[0].1, Initializer::Int(0)),
+            "{arch}: &&a - &&a"
+        );
+        let (b, a, k) = diff(&elements[1].1);
+        assert!(
+            a.starts_with(".Lf_") && b.starts_with(".Lf_") && a != b,
+            "{arch}"
+        );
+        assert_eq!(k, 0);
+        assert_eq!(diff(&elements[2].1), (b.clone(), a.clone(), 3));
+        assert_eq!(diff(init("f.s.1")), (b.clone(), a.clone(), -2));
+        assert_eq!(diff(init("f.w.2")), (b.clone(), a.clone(), 4));
+        assert_eq!(diff(init("f.c.3")), (a.clone(), b.clone(), 0));
+        assert_eq!(diff(init("f.l.4")), (b, a, 0));
+        let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+        assert!(f.saves_label_in_static, "{arch}: `f` saves its labels");
+    }
+}

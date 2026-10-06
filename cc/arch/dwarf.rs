@@ -10,7 +10,7 @@
 //
 
 use super::codegen::{escape_path, CodeGenBase};
-use super::lir::{Directive, EmitAsm, LirInst, Symbol};
+use super::lir::{Directive, EmitAsm, LirInst, OperandSize, Symbol};
 use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::HashMap;
 
@@ -402,9 +402,11 @@ fn base_encoding(id: TypeId, types: &TypeTable) -> u64 {
 
 /// A CU-relative reference to another DIE (`DW_FORM_ref4`).
 fn type_ref<I: LirInst + EmitAsm>(base: &mut CodeGenBase<I>, label: &str) {
-    base.push_directive(Directive::LongDifference {
+    base.push_directive(Directive::SymDifference {
+        size: OperandSize::B32,
         end: Symbol::local(label),
         start: Symbol::local(".Ldebug_info0"),
+        addend: 0,
     });
 }
 
@@ -614,9 +616,11 @@ pub fn generate_debug_info<I: LirInst + EmitAsm>(
     // Unit length (will be computed by assembler/linker)
     // Use label arithmetic: .Ldebug_info_end - .Ldebug_info_start
     base.push_directive(Directive::local_label(".Ldebug_info0"));
-    base.push_directive(Directive::LongDifference {
+    base.push_directive(Directive::SymDifference {
+        size: OperandSize::B32,
         end: Symbol::local(".Ldebug_info_end"),
         start: Symbol::local(".Ldebug_info_start"),
+        addend: 0,
     });
     base.push_directive(Directive::local_label(".Ldebug_info_start"));
 

@@ -568,7 +568,7 @@ after that, because merging would undo the splitting the copies depend on. See
 
 | File | Purpose |
 |------|---------|
-| `linearize.rs` (+ `_init.rs`, `_stmt.rs`, `_emit.rs`, `_atomic.rs`) | AST to IR, with every local in memory. `linearize.rs` holds functions and expressions, `_init.rs` initializers and globals, `_stmt.rs` statements, `_emit.rs` shared emitters (constants, block copies, bit-fields, assignments), and `_atomic.rs` ordinary operators on `_Atomic` objects as atomic RMW loops. Marks each block-scope local's `lifetime.end` |
+| `linearize.rs` (+ `_init.rs`, `_label_diff.rs`, `_stmt.rs`, `_emit.rs`, `_atomic.rs`) | AST to IR, with every local in memory. `linearize.rs` holds functions and expressions, `_init.rs` initializers and globals, `_label_diff.rs` GNU `&&a - &&b` static initializers, `_stmt.rs` statements, `_emit.rs` shared emitters (constants, block copies, bit-fields, assignments), and `_atomic.rs` ordinary operators on `_Atomic` objects as atomic RMW loops. Marks each block-scope local's `lifetime.end` |
 | `ssa.rs` | Promotes each eligible local out of memory into SSA values. A local is eligible when it is scalar, not volatile or atomic, never has its address taken, and is only accessed whole. φs go at iterated dominance frontiers, followed by renaming over the dominator tree. Runs once, during linearization |
 | `mem2reg.rs` | Despite the name, it promotes nothing: it deletes the locals no instruction names any more, with their lifetime markers, so they get no stack slot. Runs after `ssa` and again after the optimizer |
 | `mach_o_dtors.rs` | Mach-O does not run a `destructor` listed in `__mod_term_func` for an executable, so each one is registered with `atexit` from a synthesized constructor |

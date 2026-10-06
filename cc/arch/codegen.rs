@@ -9,7 +9,7 @@
 // Architecture-independent code generation interface
 //
 
-use crate::arch::lir::{is_private_name, Directive, EmitAsm, LirInst, Symbol};
+use crate::arch::lir::{is_private_name, Directive, EmitAsm, LirInst, OperandSize, Symbol};
 use crate::arch::DEFAULT_LIR_BUFFER_CAPACITY;
 use crate::float::{FloatVal, FpFormat};
 use crate::ir::{Function, Initializer, Instruction, Module, Opcode, Pseudo, PseudoId};
@@ -770,6 +770,19 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             Initializer::SymAddrOffset(name, offset) => {
                 let sym = Symbol::named(name.clone());
                 self.push_directive(Directive::QuadSymOffset(sym, *offset));
+            }
+            Initializer::LabelDiff { end, start, addend } => {
+                // The linearizer accepts only the widths with a directive.
+                debug_assert!(
+                    matches!(size, 1 | 2 | 4 | 8),
+                    "label difference of {size} bytes"
+                );
+                self.push_directive(Directive::SymDifference {
+                    size: OperandSize::from_bits(size as u32 * 8),
+                    end: Symbol::named(end.clone()),
+                    start: Symbol::named(start.clone()),
+                    addend: *addend,
+                });
             }
         }
     }

@@ -54,6 +54,7 @@ mod codegen_floating;
 mod codegen_fp_compare;
 mod codegen_inline_asm;
 mod codegen_inlining;
+mod codegen_label_diff;
 mod codegen_macho_labels;
 mod codegen_memopt;
 mod codegen_memopt_blockops;

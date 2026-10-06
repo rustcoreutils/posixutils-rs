@@ -34,6 +34,7 @@ mod ifunc;
 mod inline_asm;
 mod inlining;
 mod int128;
+mod label_diff;
 mod macho_labels;
 mod memopt;
 mod memopt_blockops;

@@ -101,7 +101,8 @@ Supported:
   `b`/`h`/`s`/`d`/`q` width modifiers on AArch64
 - GNU extensions real code depends on: case ranges (`case 1 ... 9:`),
   designated-initializer ranges (`[0 ... 3] = v`), computed goto (`&&label`
-  and `goto *p`), the omitted middle operand (`a ?: b`, with `a` evaluated
+  and `goto *p`, with `&&a - &&b` as a constant for jump tables of offsets),
+  the omitted middle operand (`a ?: b`, with `a` evaluated
   once), statement expressions, `typeof`, `__attribute__` including `mode` and
   `vector_size`, `__builtin_*` (see [BUILTIN.md](BUILTIN.md)), and case-range-style
   `...` spacing matching gcc's (`case 1...9:` is one pp-number and is rejected

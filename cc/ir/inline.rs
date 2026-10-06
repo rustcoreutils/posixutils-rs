@@ -1631,39 +1631,17 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
     any_changed
 }
 
-/// Collect all function address references from an initializer (recursive)
+/// Collect every function an initializer takes the address of.
 pub(crate) fn collect_func_refs_from_initializer(
     init: &super::Initializer,
     func_names: &HashSet<String>,
     address_taken: &mut HashSet<String>,
 ) {
-    use super::Initializer;
-    match init {
-        Initializer::SymAddr(name) | Initializer::SymAddrOffset(name, _) => {
-            // Check if this symbol is a function name
-            if func_names.contains(name) {
-                address_taken.insert(name.clone());
-            }
+    init.for_each_symbol(&mut |name| {
+        if func_names.contains(name) {
+            address_taken.insert(name.to_string());
         }
-        Initializer::Float128(_) => {}
-        Initializer::Array { elements, .. } => {
-            for (_, elem_init) in elements {
-                collect_func_refs_from_initializer(elem_init, func_names, address_taken);
-            }
-        }
-        Initializer::Struct { fields, .. } => {
-            for (_, _, field_init) in fields {
-                collect_func_refs_from_initializer(field_init, func_names, address_taken);
-            }
-        }
-        // Other initializer types don't contain function references
-        Initializer::None
-        | Initializer::Int(_)
-        | Initializer::Float(_)
-        | Initializer::String(_)
-        | Initializer::Utf16String(_)
-        | Initializer::Utf32String(_) => {}
-    }
+    });
 }
 
 /// Remove functions that are static and have no callers -- with
@@ -1676,8 +1654,9 @@ fn remove_dead_functions(module: &mut Module, only_inline: bool) {
     loop {
         let referenced = collect_referenced_functions(module);
         let before = module.functions.len();
+        let mut dead_labels = HashSet::new();
         module.functions.retain(|f| {
-            f.name == "main"
+            let keep = f.name == "main"
                 || !f.is_static
                 || (only_inline && !f.is_inline)
                 // `__attribute__((used))` means exactly "keep this even
@@ -1688,11 +1667,41 @@ fn remove_dead_functions(module: &mut Module, only_inline: bool) {
                 // reference is the `.init_array` / `.fini_array` entry the
                 // backend emits, which is created after this pass runs.
                 || f.constructor.is_some()
-                || f.destructor.is_some()
+                || f.destructor.is_some();
+            if !keep && f.saves_label_in_static {
+                dead_labels.extend(f.blocks.iter().map(|bb| bb.id.label_symbol(&f.name)));
+            }
+            keep
         });
+        remove_tables_of_dead_labels(module, dead_labels);
         if module.functions.len() == before {
             return;
         }
+    }
+}
+
+/// Remove the static objects that name a label of a function just removed.
+///
+/// `static void *t[] = {&&a}` and `static const int d[] = {&&a - &&b}` name
+/// blocks that no longer exist, and the assembler rejects a reference to a
+/// label nothing defines. Such an object is a static local of the removed
+/// function -- `&&` names nothing at file scope, and a function that saves a
+/// label in a static is never inlined -- so nothing else can refer to it but
+/// another static local of the same function, which goes with it. gcc drops
+/// them too.
+fn remove_tables_of_dead_labels(module: &mut Module, mut dead: HashSet<String>) {
+    while !dead.is_empty() {
+        let mut removed = HashSet::new();
+        module.globals.retain(|g| {
+            let mut names_dead = false;
+            g.init
+                .for_each_symbol(&mut |sym| names_dead |= dead.contains(sym));
+            if names_dead {
+                removed.insert(g.name.clone());
+            }
+            !names_dead
+        });
+        dead = removed;
     }
 }
 
@@ -2263,6 +2272,43 @@ mod tests {
 
         assert!(module.functions.iter().any(|f| f.name == "kept"));
         assert!(!module.functions.iter().any(|f| f.name == "dropped"));
+    }
+
+    /// A static table naming the labels of a function that is removed goes
+    /// with it, and so does a static that names the table: what is left
+    /// would reference labels nothing defines, which the assembler rejects.
+    /// A table of a surviving function, and an unrelated global, stay.
+    #[test]
+    fn test_label_tables_of_a_dead_function_go_with_it() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::default();
+        let mut dead = static_fn(&types, "dead", None);
+        dead.saves_label_in_static = true;
+        let mut live = static_fn(&types, "live", None);
+        live.saves_label_in_static = true;
+        let mut main = static_fn(&types, "main", Some("live"));
+        main.is_static = false;
+        let label = |f: &str| BasicBlockId(0).label_symbol(f);
+        let diff = |f: &str| Initializer::LabelDiff {
+            end: label(f),
+            start: label(f),
+            addend: 4,
+        };
+        module.functions.extend([dead, live, main]);
+        for (name, init) in [
+            ("dead.d.0", diff("dead")),
+            ("dead.t.1", Initializer::SymAddr(label("dead"))),
+            ("dead.p.2", Initializer::SymAddr("dead.d.0".to_string())),
+            ("live.d.0", diff("live")),
+            ("other", Initializer::Int(1)),
+        ] {
+            module.add_global(name, types.int_id, init);
+        }
+
+        remove_dead_functions(&mut module, false);
+
+        let names: Vec<&str> = module.globals.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["live.d.0", "other"]);
     }
 
     /// `__attribute__((alias))` names its target in a `.set` the backend

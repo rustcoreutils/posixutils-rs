@@ -53,6 +53,17 @@ impl OperandSize {
         }
     }
 
+    /// The data directive that emits a value of this size: `.byte`,
+    /// `.short`, `.long` or `.quad`. Every target c17 has reads these.
+    pub fn data_directive(&self) -> &'static str {
+        match self {
+            OperandSize::B8 => ".byte",
+            OperandSize::B16 => ".short",
+            OperandSize::B32 => ".long",
+            OperandSize::B64 => ".quad",
+        }
+    }
+
     /// x86-64 AT&T syntax suffix (b, w, l, q)
     pub fn x86_suffix(&self) -> &'static str {
         match self {
@@ -972,9 +983,15 @@ pub enum Directive {
     /// linker has to relocate it as the units are combined.
     LongSym(Symbol),
 
-    /// .long end - start - emit the 32-bit distance between two labels, a
-    /// DWARF unit's length or a CU-relative DIE reference
-    LongDifference { end: Symbol, start: Symbol },
+    /// `.long end - start + addend`, at `size`: the distance between two
+    /// labels, which the assembler resolves -- a DWARF unit's length, a
+    /// CU-relative DIE reference, or a GNU `&&a - &&b` table entry.
+    SymDifference {
+        size: OperandSize,
+        end: Symbol,
+        start: Symbol,
+        addend: i64,
+    },
 
     /// .quad symbol+offset - emit 64-bit symbol address with offset (for member pointers)
     QuadSymOffset(Symbol, i64),
@@ -1491,13 +1508,29 @@ impl EmitAsm for Directive {
             Directive::LongSym(sym) => {
                 let _ = writeln!(out, "    .long {}", sym.format_for_target(target));
             }
-            Directive::LongDifference { end, start } => {
-                let _ = writeln!(
+            Directive::SymDifference {
+                size,
+                end,
+                start,
+                addend,
+            } => {
+                let _ = write!(
                     out,
-                    "    .long {} - {}",
+                    "    {} {} - {}",
+                    size.data_directive(),
                     end.format_for_target(target),
                     start.format_for_target(target)
                 );
+                match addend.cmp(&0) {
+                    std::cmp::Ordering::Greater => {
+                        let _ = write!(out, " + {}", addend);
+                    }
+                    std::cmp::Ordering::Less => {
+                        let _ = write!(out, " - {}", addend.unsigned_abs());
+                    }
+                    std::cmp::Ordering::Equal => {}
+                }
+                let _ = writeln!(out);
             }
             Directive::QuadSymOffset(sym, offset) => {
                 if *offset >= 0 {

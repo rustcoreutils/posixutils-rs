@@ -348,6 +348,13 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
         }
 
+        // GNU `&&a - &&b`: before the arithmetic fold below, which would give
+        // up on the label addresses and diagnose them, or read one as a
+        // non-null address for a `_Bool`.
+        if let Some(init) = self.label_difference_init(expr, typ) {
+            return init;
+        }
+
         // An arithmetic object is initialized with the *object's* encoding,
         // whatever the constant's own type is (C17 6.7.9p11: the initializer
         // is converted as in assignment). `int c = 1.0 + 2.0;` stores 3, not
@@ -962,7 +969,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// `linearize_global_decl` has no statement to set `current_pos` from, so
     /// at file scope it stays `None` and a diagnostic reads `file:0`. The
     /// expression carries its own position; prefer it.
-    fn expr_pos(&self, expr: &Expr) -> Position {
+    pub(crate) fn expr_pos(&self, expr: &Expr) -> Position {
         if expr.pos != Position::default() {
             expr.pos
         } else {

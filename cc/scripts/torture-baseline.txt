@@ -1862,6 +1862,8 @@ compile/labels-1@-O0
 compile/labels-1@-O2
 compile/labels-2@-O0
 compile/labels-2@-O2
+compile/labels-3@-O0
+compile/labels-3@-O2
 compile/layout@-O0
 compile/layout@-O2
 compile/lbug@-O0
@@ -6762,6 +6764,8 @@ execute/pr70222-2@-O0
 execute/pr70222-2@-O2
 execute/pr70429@-O0
 execute/pr70429@-O2
+execute/pr70460@-O0
+execute/pr70460@-O2
 execute/pr70566@-O0
 execute/pr70566@-O2
 execute/pr70586@-O0

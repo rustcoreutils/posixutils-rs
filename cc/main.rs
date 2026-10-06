@@ -2162,8 +2162,13 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             // short cluster `-s -t -a ...`.
             result.push(format!("--c17-linker-flag={arg}"));
             i += 1;
-        } else if let Some(status) = answer_driver_query(&raw_args[i..], &raw_args) {
+        } else if let Some(status) = answer_driver_query(arg, &raw_args) {
             std::process::exit(status);
+        } else if let Some(prog) = arg.strip_prefix("-print-prog-name=") {
+            // GCC compatibility: print program path and exit
+            // Just echo back the program name (like gcc does when it doesn't have a special path)
+            println!("{}", prog);
+            std::process::exit(0);
         } else {
             // An operand, or an option's value -- the two cannot be told apart
             // here, and recording a language for a value is harmless, since
@@ -2240,21 +2245,7 @@ fn two_dash_prefix_map(arg: &str) -> Option<String> {
 /// does the linking. `-dumpversion` is the major version alone, as since gcc
 /// 7. (`-v` with no operands is in `compile_main`, since only clap knows
 /// what an operand is.)
-fn answer_driver_query(rest: &[String], raw_args: &[String]) -> Option<i32> {
-    let arg = rest[0].as_str();
-    // The two-dash spellings of the queries that take a value may also take
-    // it as the next argument, as binutils' configure gives it.
-    let joined;
-    let arg = if matches!(arg, "--print-prog-name" | "--print-file-name") {
-        let Some(value) = rest.get(1) else {
-            eprintln!("c17: {} '{arg}'", gettext("error: missing argument to"));
-            return Some(1);
-        };
-        joined = format!("{arg}={value}");
-        joined.as_str()
-    } else {
-        arg
-    };
+fn answer_driver_query(arg: &str, raw_args: &[String]) -> Option<i32> {
     // gcc takes every `-print-` query with two dashes as well.
     let query = arg
         .strip_prefix('-')
@@ -2274,12 +2265,6 @@ fn answer_driver_query(rest: &[String], raw_args: &[String]) -> Option<i32> {
         }
         _ if query.starts_with("-print-file-name=") => {
             return Some(forward_to_host_driver(query));
-        }
-        // c17 runs no programs of its own that a build could ask after, so
-        // every name is answered as gcc answers one it has no path for: with
-        // the name itself, meaning whatever the search path finds.
-        _ if query.starts_with("-print-prog-name=") => {
-            println!("{}", &query["-print-prog-name=".len()..]);
         }
         _ => return None,
     }

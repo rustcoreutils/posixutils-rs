@@ -420,6 +420,95 @@ impl AttributeList {
     }
 }
 
+/// What gcc's `mode` attribute makes of a machine mode name, on the target
+/// at hand: the class decides which declared types it may replace.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MachineModeClass {
+    /// An integer mode, this many bits wide.
+    Int(u32),
+    /// A real binary or decimal floating mode.
+    Float,
+    /// A complex mode, of floating or integer halves.
+    Complex,
+    /// A vector mode, which gcc still accepts with a deprecation warning.
+    Vector,
+    /// A mode the target has but no type can have: a condition-code, block,
+    /// one-bit, fixed-point or over-wide integer mode.
+    Unemulated,
+    /// No mode of this target.
+    Unknown,
+}
+
+impl MachineModeClass {
+    /// The class of the mode gcc 13 spells `name` (its `__` already
+    /// stripped) on `arch`. The names are the target's machine modes;
+    /// `byte`, `word`, `pointer` and the libgcc names are gcc's aliases for
+    /// the integer modes the target picks.
+    fn of(name: &str, arch: crate::target::Arch) -> MachineModeClass {
+        let x86 = arch == crate::target::Arch::X86_64;
+        match name {
+            "QI" | "byte" => MachineModeClass::Int(8),
+            "HI" => MachineModeClass::Int(16),
+            "SI" => MachineModeClass::Int(32),
+            "DI" | "word" | "pointer" | "unwind_word" | "libgcc_cmp_return"
+            | "libgcc_shift_count" => MachineModeClass::Int(64),
+            "TI" => MachineModeClass::Int(128),
+            "HF" | "BF" | "SF" | "DF" | "TF" | "SD" | "DD" | "TD" => MachineModeClass::Float,
+            "XF" if x86 => MachineModeClass::Float,
+            "HC" | "BC" | "SC" | "DC" | "TC" | "CQI" | "CHI" | "CSI" | "CDI" | "CTI" => {
+                MachineModeClass::Complex
+            }
+            "XC" if x86 => MachineModeClass::Complex,
+            "OI" | "XI" | "COI" | "BI" | "BLK" | "CC" | "CCFP" => MachineModeClass::Unemulated,
+            _ if is_fixed_point_mode(name) => MachineModeClass::Unemulated,
+            // The condition-code modes each target defines: `CCZ` and its
+            // kind on x86-64, `CC_NZ` and its kind on aarch64.
+            _ if name.len() > 2 && name.starts_with("CC") => {
+                let rest = &name[2..];
+                let x86_cc = rest.bytes().all(|b| b.is_ascii_uppercase());
+                let a64_cc = rest
+                    .strip_prefix('_')
+                    .is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_uppercase()))
+                    || rest == "FPE";
+                if (x86 && x86_cc) || (!x86 && a64_cc) {
+                    MachineModeClass::Unemulated
+                } else {
+                    MachineModeClass::Unknown
+                }
+            }
+            _ if is_vector_mode(name) => MachineModeClass::Vector,
+            _ => MachineModeClass::Unknown,
+        }
+    }
+}
+
+/// A fixed-point mode: `QQ`..`TQ` fractional, `HA`..`TA` accumulator, either
+/// with a `U` for unsigned.
+fn is_fixed_point_mode(name: &str) -> bool {
+    let name = name.strip_prefix('U').unwrap_or(name);
+    matches!(
+        name,
+        "QQ" | "HQ" | "SQ" | "DQ" | "TQ" | "HA" | "SA" | "DA" | "TA"
+    )
+}
+
+/// A vector mode: a power-of-two lane count, then a scalar integer or
+/// floating mode -- `V4SI`, `V2DF`.
+fn is_vector_mode(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('V') else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let (count, lane) = rest.split_at(digits);
+    count
+        .parse::<u32>()
+        .is_ok_and(|n| n >= 2 && n.is_power_of_two())
+        && matches!(
+            lane,
+            "QI" | "HI" | "SI" | "DI" | "TI" | "HF" | "BF" | "SF" | "DF"
+        )
+}
+
 impl fmt::Display for AttributeList {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.attrs.is_empty() {
@@ -737,9 +826,18 @@ impl Parser<'_> {
         // scalar would compute on one element. Only a recognised spelling is
         // applied: one warned about as ignored is not.
         match (recognised, name.trim_matches('_'), args.first()) {
-            (true, "mode", Some(AttributeArg::Ident(m))) => {
-                self.pending_mode = Some((m.trim_matches('_').to_string(), pos));
-            }
+            (true, "mode", _) => match args.as_slice() {
+                [AttributeArg::Ident(m)] => self.pending_mode = Some((m.clone(), pos)),
+                [_] => diag::group_warning(
+                    ATTRIBUTE_WARNING,
+                    pos,
+                    &gettext("'mode' attribute ignored"),
+                ),
+                _ => diag::error(
+                    pos,
+                    &gettext("wrong number of arguments specified for 'mode' attribute"),
+                ),
+            },
             (true, "vector_size", Some(AttributeArg::Int(n))) => {
                 self.pending_vector_size = Some((u64::try_from(*n).unwrap_or(u64::MAX), pos));
             }
@@ -1068,13 +1166,36 @@ impl Parser<'_> {
     /// `__mode__(__word__)`, which is why leaving this unimplemented sized it
     /// 4 bytes against gcc's 8.
     ///
-    /// An unrecognised mode -- `V4SF` and the other vector modes, which need
-    /// vector types -- keeps the warning, because ignoring it would silently
-    /// change what the program computes.
+    /// gcc refuses a mode of another class than the declared type -- a
+    /// floating mode on an integer type, an integer mode on a floating one,
+    /// any mode on `_Bool` or an aggregate -- a pointer mode other than the
+    /// pointer width, a non-integer mode on an enumeration, a mode it cannot
+    /// emulate and a name that is no mode at all; so does c17, in gcc's
+    /// words, and the declared type stays.
+    ///
+    /// A mode gcc accepts that c17 does not implement -- `V4SF` and the other
+    /// vector modes, which need vector types -- keeps the warning, because
+    /// ignoring it would silently change what the program computes.
     pub(super) fn apply_pending_mode(&mut self, typ: TypeId) -> TypeId {
-        let Some((mode, pos)) = self.pending_mode.take() else {
+        let Some((written, pos)) = self.pending_mode.take() else {
             return typ;
         };
+        // gcc strips a `__` on both sides, and only both: `_SI_` and `__SI`
+        // name no mode.
+        let mode = written
+            .strip_prefix("__")
+            .and_then(|m| m.strip_suffix("__"))
+            .filter(|m| !m.is_empty())
+            .unwrap_or(&written)
+            .to_string();
+        let class = MachineModeClass::of(&mode, self.types.target().arch);
+        if !self.mode_fits_type(class, &mode, &written, typ, pos) {
+            return typ;
+        }
+        // A pointer at the pointer width is the type it already is.
+        if self.types.kind(typ) == TypeKind::Pointer {
+            return typ;
+        }
         let unsigned = self.types.is_unsigned(typ);
         let t = &self.types;
         let mapped = match mode.as_str() {
@@ -1140,6 +1261,48 @@ impl Parser<'_> {
                 typ
             }
         }
+    }
+
+    /// Whether the machine mode `mode` (spelled `written`) of class `class`
+    /// may replace the declared type `typ`, reporting at `pos`, in gcc's
+    /// words and gcc's order, the reason it may not.
+    fn mode_fits_type(
+        &self,
+        class: MachineModeClass,
+        mode: &str,
+        written: &str,
+        typ: TypeId,
+        pos: Position,
+    ) -> bool {
+        let t = &self.types;
+        let refusal = match (class, t.kind(typ)) {
+            (MachineModeClass::Unknown, _) => {
+                diag::error_args(pos, "unknown machine mode '{0}'", &[written]);
+                return false;
+            }
+            (MachineModeClass::Unemulated, _) => "unable to emulate '{0}'",
+            // Left to the warning that it is not implemented.
+            (MachineModeClass::Vector, _) => return true,
+            (MachineModeClass::Int(bits), TypeKind::Pointer)
+                if bits == t.target().pointer_width =>
+            {
+                return true
+            }
+            (_, TypeKind::Pointer) => "invalid pointer mode '{0}'",
+            (MachineModeClass::Int(_), TypeKind::Enum) => return true,
+            (_, TypeKind::Enum) => "cannot use mode '{0}' for enumerated types",
+            (MachineModeClass::Int(_), TypeKind::Bool) => {
+                "mode '{0}' applied to inappropriate type"
+            }
+            (MachineModeClass::Int(_), _) if t.is_integer(typ) && !t.is_complex(typ) => {
+                return true
+            }
+            (MachineModeClass::Float, _) if t.is_float(typ) => return true,
+            (MachineModeClass::Complex, _) if t.is_complex(typ) => return true,
+            _ => "mode '{0}' applied to inappropriate type",
+        };
+        diag::error_args(pos, refusal, &[mode]);
+        false
     }
 
     /// Apply alignment from __attribute__((aligned(N))) to pending_alignas.

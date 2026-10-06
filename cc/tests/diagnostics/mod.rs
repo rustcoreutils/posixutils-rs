@@ -24,6 +24,7 @@ mod declarations;
 mod expressions;
 mod function_compatibility;
 mod integer_overflow;
+mod mode_attribute;
 mod narrow_initializers;
 
 use crate::common::{

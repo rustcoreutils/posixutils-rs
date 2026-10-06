@@ -53,6 +53,7 @@ mod jumps_and_characters;
 mod keywords_and_suffixes;
 mod lexical_errors;
 mod misc;
+mod mode_attribute;
 mod objects_and_constants;
 mod permissive;
 mod ranges_designators_labels;

@@ -865,3 +865,52 @@ fn test_copy_one_file_system_keeps_the_mount_point() {
     assert!(out.join("tree/mnt").is_dir(), "mount point not copied");
     assert!(!out.join("tree/mnt/inside").exists(), "descended below it");
 }
+
+/// Copy mode's -k leaves an existing destination directory as it is, the way
+/// it leaves an existing file: its contents are still copied, but its mode is
+/// not replaced by the source's.
+#[test]
+fn test_copy_keep_existing_directory_attributes() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir_all(src.join("d")).unwrap();
+    fs::write(src.join("d/f"), "F\n").unwrap();
+    fs::set_permissions(src.join("d"), fs::Permissions::from_mode(0o755)).unwrap();
+    let dst = temp.path().join("dst");
+    fs::create_dir_all(dst.join("d")).unwrap();
+    fs::set_permissions(dst.join("d"), fs::Permissions::from_mode(0o700)).unwrap();
+
+    let out = run_pax_in_dir(&["-rw", "-k", "-pp", "d", dst.to_str().unwrap()], &src);
+    assert_success(&out, "pax -rw -k");
+    assert_eq!(fs::read_to_string(dst.join("d/f")).unwrap(), "F\n");
+    let mode = fs::metadata(dst.join("d")).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o700, "-k replaced an existing directory's mode");
+}
+
+/// -u likewise: a destination directory newer than its source keeps its own
+/// attributes, while its contents are still each considered.
+#[test]
+fn test_copy_update_keeps_newer_directory_attributes() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir_all(src.join("d")).unwrap();
+    fs::write(src.join("d/f"), "F\n").unwrap();
+    fs::set_permissions(src.join("d"), fs::Permissions::from_mode(0o755)).unwrap();
+    // Make the source directory old, so the destination one is newer.
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    File::open(src.join("d"))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let dst = temp.path().join("dst");
+    fs::create_dir_all(dst.join("d")).unwrap();
+    fs::set_permissions(dst.join("d"), fs::Permissions::from_mode(0o700)).unwrap();
+
+    let out = run_pax_in_dir(&["-rw", "-u", "-pp", "d", dst.to_str().unwrap()], &src);
+    assert_success(&out, "pax -rw -u");
+    assert_eq!(fs::read_to_string(dst.join("d/f")).unwrap(), "F\n");
+    let mode = fs::metadata(dst.join("d")).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o700, "-u replaced a newer directory's mode");
+}

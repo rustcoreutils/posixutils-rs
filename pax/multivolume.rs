@@ -39,7 +39,9 @@
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter};
 use crate::blocked_io::{BlockedReader, BlockedWriter};
 use crate::error::{PaxError, PaxResult};
-use crate::formats::ustar::{parse_numeric, parse_octal};
+use crate::formats::ustar::{
+    build_header, is_zero_block, parse_numeric, stores_data, verify_checksum,
+};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -88,6 +90,8 @@ pub struct MultiVolumeWriter {
     record_size: usize,
     /// Current output file
     writer: Option<BlockedWriter<File>>,
+    /// The member being written stores no data (a link): drop what is offered.
+    skip_data: bool,
 }
 
 impl MultiVolumeWriter {
@@ -102,6 +106,7 @@ impl MultiVolumeWriter {
             options,
             record_size,
             writer: None,
+            skip_data: false,
         };
 
         // Open first volume
@@ -175,33 +180,7 @@ impl MultiVolumeWriter {
                 return Err(PaxError::Io(io::Error::other("volume script failed")));
             }
         } else {
-            // Prompt user via /dev/tty
-            #[cfg(unix)]
-            {
-                use std::io::BufRead;
-
-                let tty_read = std::fs::File::open("/dev/tty")?;
-                let mut tty_write = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
-
-                let next_path = self.volume_path(self.current_volume);
-                write!(
-                    tty_write,
-                    "\nPrepare volume #{} for '{}' and press ENTER: ",
-                    self.current_volume,
-                    next_path.display()
-                )?;
-                tty_write.flush()?;
-
-                let mut reader = std::io::BufReader::new(tty_read);
-                let mut line = String::new();
-                reader.read_line(&mut line)?;
-            }
-            #[cfg(not(unix))]
-            {
-                eprintln!("Prepare volume #{} and press ENTER", self.current_volume);
-                let mut line = String::new();
-                io::stdin().read_line(&mut line)?;
-            }
+            prompt_volume_change(self.current_volume, &self.volume_path(self.current_volume))?;
         }
         Ok(())
     }
@@ -220,13 +199,43 @@ impl MultiVolumeWriter {
     }
 }
 
+/// Ask on `/dev/tty` for the next volume to be made ready, and wait for the
+/// response. End of file there ends the run, as it does for `-i`.
+fn prompt_volume_change(volume: u32, path: &std::path::Path) -> PaxResult<()> {
+    use std::io::BufRead;
+
+    let tty_read = File::open("/dev/tty")?;
+    let mut tty_write = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
+
+    let mut msg = format!("\nPrepare volume #{} for '", volume).into_bytes();
+    crate::escape::push_escaped(
+        &mut msg,
+        crate::rawpath::as_bytes(path),
+        crate::escape::Style::TTY,
+    );
+    msg.extend_from_slice(b"' and press ENTER: ");
+    tty_write.write_all(&msg)?;
+    tty_write.flush()?;
+
+    let mut line = Vec::new();
+    if std::io::BufReader::new(tty_read).read_until(b'\n', &mut line)? == 0 {
+        return Err(PaxError::TtyEof);
+    }
+    Ok(())
+}
+
 impl ArchiveWriter for MultiVolumeWriter {
     fn write_entry(&mut self, entry: &ArchiveEntry) -> PaxResult<()> {
         // A member is never divided between volumes, so it has to fit in one
         // whole. Refuse it up front: the alternative is streaming the payload
         // past the tape length and producing a volume that silently exceeds the
         // limit the user asked for.
-        let needed = BLOCK_SIZE as u64 + entry.size.div_ceil(BLOCK_SIZE as u64) * BLOCK_SIZE as u64;
+        let data = if stores_data(entry.entry_type) {
+            entry.size
+        } else {
+            0
+        };
+        let needed = BLOCK_SIZE as u64 + data.div_ceil(BLOCK_SIZE as u64) * BLOCK_SIZE as u64;
         if self.volume_bytes(needed) > self.volume_size {
             return Err(PaxError::InvalidFormat(format!(
                 "{}: {} bytes does not fit in a {}-byte volume",
@@ -241,8 +250,8 @@ impl ArchiveWriter for MultiVolumeWriter {
             self.open_next_volume()?;
         }
 
-        // Build and write header using ustar format
         let header = build_header(entry)?;
+        self.skip_data = !stores_data(entry.entry_type);
 
         let writer = self
             .writer
@@ -255,6 +264,10 @@ impl ArchiveWriter for MultiVolumeWriter {
     }
 
     fn write_data(&mut self, data: &[u8]) -> PaxResult<()> {
+        // A link's target is in its header; nothing follows it.
+        if self.skip_data {
+            return Ok(());
+        }
         let writer = self
             .writer
             .as_mut()
@@ -368,7 +381,10 @@ impl MultiVolumeReader {
                         return Err(PaxError::Io(io::Error::other("volume script failed")));
                     }
                 } else {
-                    self.prompt_for_volume()?;
+                    prompt_volume_change(
+                        self.current_volume,
+                        &self.volume_path(self.current_volume),
+                    )?;
                 }
             }
             if !path.exists() {
@@ -386,37 +402,6 @@ impl MultiVolumeReader {
 
         self.reader = Some(BlockedReader::new(File::open(&path)?));
         Ok(true)
-    }
-
-    /// Prompt user for next volume
-    fn prompt_for_volume(&self) -> PaxResult<()> {
-        #[cfg(unix)]
-        {
-            use std::io::BufRead;
-
-            let tty_read = std::fs::File::open("/dev/tty")?;
-            let mut tty_write = std::fs::OpenOptions::new().write(true).open("/dev/tty")?;
-
-            let next_path = self.volume_path(self.current_volume);
-            write!(
-                tty_write,
-                "\nPrepare volume #{} for '{}' and press ENTER: ",
-                self.current_volume,
-                next_path.display()
-            )?;
-            tty_write.flush()?;
-
-            let mut reader = std::io::BufReader::new(tty_read);
-            let mut line = String::new();
-            reader.read_line(&mut line)?;
-        }
-        #[cfg(not(unix))]
-        {
-            eprintln!("Prepare volume #{} and press ENTER", self.current_volume);
-            let mut line = String::new();
-            io::stdin().read_line(&mut line)?;
-        }
-        Ok(())
     }
 
     /// Check if a header is a continuation header
@@ -439,21 +424,6 @@ impl MultiVolumeReader {
             return 0;
         }
         parse_numeric(&header[369..381]).unwrap_or(0)
-    }
-
-    /// Check if a block is all zeros (end of archive marker)
-    fn is_zero_block(block: &[u8]) -> bool {
-        block.iter().all(|&b| b == 0)
-    }
-
-    /// Verify header checksum
-    fn verify_checksum(header: &[u8; BLOCK_SIZE]) -> bool {
-        let stored = match parse_octal(&header[148..156]) {
-            Ok(v) => v as u32,
-            Err(_) => return false,
-        };
-        let calculated = calculate_checksum(header);
-        stored == calculated
     }
 
     /// Read exactly n bytes from current reader
@@ -504,7 +474,7 @@ impl ArchiveReader for MultiVolumeReader {
             }
 
             // Check for end of archive (two zero blocks)
-            if Self::is_zero_block(&header) {
+            if is_zero_block(&header) {
                 // Check if there's another volume
                 if self.open_next_volume()? {
                     continue;
@@ -513,7 +483,7 @@ impl ArchiveReader for MultiVolumeReader {
             }
 
             // Verify checksum
-            if !Self::verify_checksum(&header) {
+            if !verify_checksum(&header) {
                 return Err(PaxError::InvalidHeader("checksum mismatch".to_string()));
             }
 
@@ -644,93 +614,6 @@ impl std::io::Read for MultiVolumeReader {
     }
 }
 
-// Helper functions
-
-fn write_octal(buf: &mut [u8], val: u64, width: usize) {
-    let s = format!("{:0width$o} ", val, width = width - 2);
-    let bytes = s.as_bytes();
-    let len = std::cmp::min(bytes.len(), width);
-    buf[..len].copy_from_slice(&bytes[..len]);
-}
-
-fn calculate_checksum(header: &[u8; BLOCK_SIZE]) -> u32 {
-    let mut sum: u32 = 0;
-    for (i, &byte) in header.iter().enumerate() {
-        if (148..156).contains(&i) {
-            sum += b' ' as u32;
-        } else {
-            sum += byte as u32;
-        }
-    }
-    sum
-}
-
-fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
-    let mut header = [0u8; BLOCK_SIZE];
-
-    // Write the pathname across the name and prefix fields. Truncating to the
-    // 100-byte name field silently corrupted any longer path -- and this file's
-    // own parse_header reads the prefix back, so the format was asymmetric with
-    // itself. split_path errors rather than truncating when even the pair
-    // cannot hold the path.
-    let (name, prefix) = crate::formats::ustar::split_path(entry)?;
-    header[0..name.len()].copy_from_slice(&name);
-    header[345..345 + prefix.len()].copy_from_slice(&prefix);
-
-    // Mode, uid, gid
-    write_octal(&mut header[100..], entry.mode as u64, 8);
-    write_octal(&mut header[108..], entry.uid as u64, 8);
-    write_octal(&mut header[116..], entry.gid as u64, 8);
-
-    // Size
-    write_octal(&mut header[124..], entry.size, 12);
-
-    // Mtime
-    write_octal(&mut header[136..], entry.unsigned_mtime()?, 12);
-
-    // Typeflag
-    let typeflag = crate::formats::ustar::entry_type_to_flag(entry.entry_type)?;
-    header[156] = typeflag;
-
-    // Link name for symlinks/hardlinks. The linkname field has no prefix
-    // companion, so an over-long target is an error rather than a silent
-    // truncation that would extract to the wrong file.
-    if let Some(ref target) = entry.link_target {
-        let target_str = target.to_string_lossy();
-        let target_bytes = target_str.as_bytes();
-        if target_bytes.len() > 100 {
-            return Err(PaxError::PathTooLong(target_str.into_owned()));
-        }
-        header[157..157 + target_bytes.len()].copy_from_slice(target_bytes);
-    }
-
-    // Magic and version
-    header[257..263].copy_from_slice(b"ustar\0");
-    header[263..265].copy_from_slice(b"00");
-
-    // uname and gname
-    if let Some(ref bytes) = entry.uname {
-        let len = std::cmp::min(bytes.len(), 32);
-        header[265..265 + len].copy_from_slice(&bytes[..len]);
-    }
-    if let Some(ref bytes) = entry.gname {
-        let len = std::cmp::min(bytes.len(), 32);
-        header[297..297 + len].copy_from_slice(&bytes[..len]);
-    }
-
-    // Device major/minor
-    if entry.is_device() {
-        write_octal(&mut header[329..], entry.devmajor as u64, 8);
-        write_octal(&mut header[337..], entry.devminor as u64, 8);
-    }
-
-    // Calculate and write checksum
-    let checksum = calculate_checksum(&header);
-    write_octal(&mut header[148..], checksum as u64, 8);
-
-    Ok(header)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -748,6 +631,7 @@ mod tests {
             options,
             record_size: 512,
             writer: None,
+            skip_data: false,
         };
 
         assert_eq!(writer.volume_path(1), PathBuf::from("/tmp/test.tar"));
@@ -764,25 +648,11 @@ mod tests {
             options: MultiVolumeOptions::default(),
             record_size: 10240,
             writer: None,
+            skip_data: false,
         };
         assert_eq!(writer.volume_bytes(0), 10240);
         assert_eq!(writer.volume_bytes(9216), 10240);
         // No room left for the end-of-archive marker in the first record.
         assert_eq!(writer.volume_bytes(9728), 20480);
-    }
-
-    #[test]
-    fn test_write_octal() {
-        let mut buf = [0u8; 8];
-        write_octal(&mut buf, 0o644, 8);
-        assert_eq!(&buf[..6], b"000644");
-    }
-
-    #[test]
-    fn test_checksum() {
-        let mut header = [0u8; BLOCK_SIZE];
-        header[0..4].copy_from_slice(b"test");
-        let checksum = calculate_checksum(&header);
-        assert!(checksum > 0);
     }
 }

@@ -690,3 +690,28 @@ fn test_dangling_symlink_below_an_operand_is_kept_under_cli_dereference() {
         "the link itself should be archived: {listing}"
     );
 }
+
+/// Extraction must work below a directory the user may search and write but
+/// not read (mode 0300): reaching a component needs search permission only,
+/// so opening each one for reading fails where mkdir/open would succeed.
+#[test]
+fn test_extract_below_search_only_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    fs::create_dir(temp.path().join("s")).unwrap();
+    fs::set_permissions(temp.path().join("s"), fs::Permissions::from_mode(0o300)).unwrap();
+    let archive = Ustar {
+        name: b"s/f",
+        body: b"F\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let out = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, temp.path());
+    fs::set_permissions(temp.path().join("s"), fs::Permissions::from_mode(0o755)).unwrap();
+    assert_success(&out, "pax -r below a search-only directory");
+    assert_eq!(fs::read_to_string(temp.path().join("s/f")).unwrap(), "F\n");
+}

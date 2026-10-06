@@ -10,13 +10,12 @@
 //! Integration tests for the `cpio` compatibility front-end.
 
 use crate::common::{
-    assert_failure, assert_success, have_tool, run_cpio, run_front_end, stderr_str, stdout_str,
+    assert_failure, assert_success, run_cpio, run_front_end, run_system_ok, stderr_str, stdout_str,
+    system_tool,
 };
 use plib::tmp::TempDir;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 /// The pathname list a real `find .` would produce for the tree below, in the
 /// order cpio expects it on standard input.
@@ -393,10 +392,9 @@ fn test_cpio_help_and_version_exit_zero() {
 
 #[test]
 fn test_cpio_cross_tool_system_reads_our_newc_and_crc() {
-    if !have_tool("cpio") {
-        eprintln!("skipping cross-tool test: no system cpio");
+    let Some(cpio) = system_tool("cpio") else {
         return;
-    }
+    };
 
     // newc and crc are the formats this crate learned to write; the checksummed
     // one in particular is only proven correct by a reader that verifies it.
@@ -407,28 +405,7 @@ fn test_cpio_cross_tool_system_reads_our_newc_and_crc() {
         fs::create_dir(&dest).unwrap();
         let archive = copy_out(&src, Some(format));
 
-        let mut child = match Command::new("cpio")
-            .args(["-idm"])
-            .current_dir(&dest)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(_) => {
-                eprintln!("skipping cross-tool test: system cpio would not run");
-                return;
-            }
-        };
-        child.stdin.take().unwrap().write_all(&archive).unwrap();
-        let out = child.wait_with_output().unwrap();
-        assert!(
-            out.status.success(),
-            "system cpio rejected our -H {} archive: {}",
-            format,
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let out = run_system_ok(&cpio, &["-idm"], &dest, Some(&archive));
         assert!(
             !String::from_utf8_lossy(&out.stderr).contains("checksum"),
             "system cpio reported a checksum problem in -H {}: {}",
@@ -441,29 +418,80 @@ fn test_cpio_cross_tool_system_reads_our_newc_and_crc() {
 
 #[test]
 fn test_cpio_cross_tool_we_read_system_newc() {
-    if !have_tool("cpio") {
-        eprintln!("skipping cross-tool test: no system cpio");
+    let Some(cpio) = system_tool("cpio") else {
         return;
-    }
+    };
 
     let temp = TempDir::new().unwrap();
     let src = setup(temp.path());
     let dest = temp.path().join("dest");
     fs::create_dir(&dest).unwrap();
 
-    let made = Command::new("sh")
-        .args(["-c", "find . | cpio -o -H newc"])
-        .current_dir(&src)
-        .output();
-    let Ok(made) = made else {
-        eprintln!("skipping cross-tool test: system cpio would not run");
-        return;
-    };
-    if !made.status.success() {
-        eprintln!("skipping cross-tool test: system cpio failed to create");
-        return;
-    }
+    let made = run_system_ok(
+        &cpio,
+        &["-o", "-H", "newc"],
+        &src,
+        Some(NAME_LIST.as_bytes()),
+    );
 
     assert_success(&run_cpio(&["-idm"], &dest, &made.stdout), "cpio -idm");
     assert_tree_extracted(&dest);
+}
+
+/// `cpio -t` alone lists the archive on standard input: -t implies -i.
+#[test]
+fn test_cpio_t_alone_lists() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+    let archive = copy_out(&src, Some("newc"));
+    let out = run_cpio(&["-t"], temp.path(), &archive);
+    assert_success(&out, "cpio -t");
+    assert!(stdout_str(&out).contains("a.txt"), "{}", stdout_str(&out));
+}
+
+/// `find -depth` lists a directory after its contents, which is what lets
+/// cpio restore a restrictive directory mode: the mode must arrive last and
+/// stay, not be replaced by the 0755 created to hold the contents.
+#[test]
+fn test_cpio_depth_order_restores_directory_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir_all(src.join("d")).unwrap();
+    fs::write(src.join("d/f"), "F\n").unwrap();
+    fs::set_permissions(src.join("d"), fs::Permissions::from_mode(0o700)).unwrap();
+
+    let out = run_cpio(&["-o", "-H", "newc"], &src, b"d/f\nd\n");
+    assert_success(&out, "cpio -o");
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+    let res = run_cpio(&["-idm"], &dst, &out.stdout);
+    assert_success(&res, "cpio -idm");
+    let mode = fs::metadata(dst.join("d")).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o700);
+}
+
+/// Pass mode copies a read-only directory's contents before applying its
+/// mode; applying it first makes the directory unwritable and every file in
+/// it fails with EACCES.
+#[test]
+fn test_cpio_pass_read_only_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir_all(src.join("ro")).unwrap();
+    fs::write(src.join("ro/f"), "F\n").unwrap();
+    fs::set_permissions(src.join("ro"), fs::Permissions::from_mode(0o555)).unwrap();
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+
+    let out = run_cpio(&["-pd", dst.to_str().unwrap()], &src, b"ro\nro/f\n");
+    fs::set_permissions(src.join("ro"), fs::Permissions::from_mode(0o755)).unwrap();
+    let copied = fs::read_to_string(dst.join("ro/f"));
+    let _ = fs::set_permissions(dst.join("ro"), fs::Permissions::from_mode(0o755));
+    assert_success(&out, "cpio -pd of a read-only directory");
+    assert_eq!(copied.unwrap(), "F\n");
 }

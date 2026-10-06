@@ -216,17 +216,15 @@ fn test_read_special_files_from_system_tar() {
     }
 
     // Create archive with system tar
-    let output = Command::new("tar")
-        .args(["-cf"])
-        .arg(&archive)
-        .arg(".")
-        .current_dir(&src_dir)
-        .output();
-
-    if output.is_err() || !output.as_ref().unwrap().status.success() {
-        eprintln!("Skipping test: system tar not available");
+    let Some(tar) = system_tool("tar") else {
         return;
-    }
+    };
+    run_system_ok(
+        &tar,
+        &["-cf", archive.to_str().unwrap(), "."],
+        &src_dir,
+        None,
+    );
 
     // List with our pax
     let output = run_pax(&["-v", "-f", archive.to_str().unwrap()]);
@@ -717,4 +715,73 @@ fn test_archive_write_error_is_fatal_and_reported_once() {
     let stderr = stderr_str(&output);
     assert_eq!(stderr.lines().count(), 1, "stderr:\n{stderr}");
     assert!(!stderr.contains("f0"), "blamed a source file:\n{stderr}");
+}
+
+/// On a terminal, nothing taken from an archive reaches it raw: not the name,
+/// not a symbolic link's target, and not the owner and group names in the
+/// `-v` columns, which were rendered without escaping.
+#[test]
+fn test_terminal_listing_escapes_every_archive_field() {
+    let temp = TempDir::new().unwrap();
+    let mut archive = crate::common::Ustar {
+        name: b"n\x1b[31m",
+        body: b"x\n",
+        uname: b"u\x1b[32m",
+        gname: b"g\x1b[33m",
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &crate::common::Ustar {
+            name: b"l",
+            typeflag: b'2',
+            linkname: b"t\x1b[34m",
+            ..Default::default()
+        }
+        .archive(),
+    );
+    fs::write(temp.path().join("a.tar"), &archive).unwrap();
+
+    let tty = run_pax_on_terminal(
+        &["-v", "-f", "a.tar"],
+        temp.path(),
+        std::time::Duration::from_secs(20),
+    )
+    .expect("pax -v did not finish");
+    assert!(
+        !tty.contains(&0x1b),
+        "an escape sequence reached the terminal: {:?}",
+        String::from_utf8_lossy(&tty)
+    );
+    assert!(
+        tty.windows(2).any(|w| w == b"t?"),
+        "{:?}",
+        String::from_utf8_lossy(&tty)
+    );
+}
+
+/// A diagnostic that ends the run is escaped like every per-file one: the
+/// final message was printed as it was, archive bytes and all.
+#[test]
+fn test_terminal_fatal_diagnostic_is_escaped() {
+    let temp = TempDir::new().unwrap();
+    let archive = archive_with_ext_records(&pax_record("size", b"1\x1b[31m"));
+    fs::write(temp.path().join("a.tar"), &archive).unwrap();
+
+    let tty = run_pax_on_terminal(
+        &["-f", "a.tar"],
+        temp.path(),
+        std::time::Duration::from_secs(20),
+    )
+    .expect("pax did not finish");
+    assert!(
+        tty.windows(2).any(|w| w == b"1?"),
+        "the diagnostic should quote the value: {:?}",
+        String::from_utf8_lossy(&tty)
+    );
+    assert!(
+        !tty.contains(&0x1b),
+        "an escape sequence reached the terminal: {:?}",
+        String::from_utf8_lossy(&tty)
+    );
 }

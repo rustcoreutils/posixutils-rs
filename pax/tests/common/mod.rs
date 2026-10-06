@@ -139,8 +139,15 @@ pub fn front_end(name: &str) -> std::path::PathBuf {
 
 /// Run `tar` or `cpio` in `dir`, feeding `stdin_data` if given.
 pub fn run_front_end(name: &str, args: &[&str], dir: &Path, stdin_data: Option<&[u8]>) -> Output {
+    run_program(&front_end(name), args, dir, stdin_data)
+}
+
+/// Run `program` in `dir` with its standard input fed from `stdin_data` (or
+/// empty), collecting its output.
+pub fn run_program(program: &Path, args: &[&str], dir: &Path, stdin_data: Option<&[u8]>) -> Output {
     use std::process::Stdio;
-    let mut child = Command::new(front_end(name))
+    let name = program.display();
+    let mut child = Command::new(program)
         .args(args)
         .current_dir(dir)
         .stdin(Stdio::piped())
@@ -183,13 +190,40 @@ pub fn run_cpio(args: &[&str], dir: &Path, stdin_data: &[u8]) -> Output {
     run_front_end("cpio", args, dir, Some(stdin_data))
 }
 
-/// Whether a system tool of this name can be run, for the cross-tool checks.
-pub fn have_tool(name: &str) -> bool {
-    Command::new(name)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// The system's own `name` -- the first executable of that name on `$PATH` --
+/// for the cross-tool checks, or `None` when there is none.
+///
+/// Absence is the only reason a cross-tool test may skip. Once the tool
+/// exists, anything it does wrong is the test's failure: a check that also
+/// skipped when the tool failed passed whatever pax wrote. Found by looking,
+/// not by running `name --version`, which BSD pax and some cpio do not
+/// accept.
+pub fn system_tool(name: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let found = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(name))
+            .find(|p| {
+                fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            })
+    });
+    if found.is_none() {
+        eprintln!("skipping cross-tool check: no system {}", name);
+    }
+    found
+}
+
+/// Run the system `tool` and require it to succeed.
+pub fn run_system_ok(tool: &Path, args: &[&str], dir: &Path, stdin_data: Option<&[u8]>) -> Output {
+    let out = run_program(tool, args, dir, stdin_data);
+    assert!(
+        out.status.success(),
+        "system {} {:?} failed: {}",
+        tool.display(),
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
 }
 
 /// Create a test directory with standard test files
@@ -419,6 +453,161 @@ pub fn run_pax_with_deadline(args: &[&str], dir: &Path, limit: Duration) -> Opti
         std::thread::sleep(Duration::from_millis(20));
     }
     Some(child.wait_with_output().unwrap())
+}
+
+/// Run pax in `dir` with a fresh pseudo-terminal as its controlling terminal,
+/// so that `/dev/tty` is that terminal and `-i` prompts on it. `typed` is
+/// queued as terminal input before pax starts. Returns pax's output and
+/// everything it wrote to the terminal, or `None` if it had to be killed
+/// after `limit` -- a pax that keeps prompting would otherwise hang the test.
+pub fn run_pax_on_tty(
+    args: &[&str],
+    dir: &Path,
+    typed: &[u8],
+    limit: Duration,
+) -> Option<(Output, Vec<u8>)> {
+    PtyPax::spawn(args, dir, typed, PtyStdio::StdinOnly).finish(limit)
+}
+
+/// `run_pax_on_tty` with standard output and standard error on the terminal
+/// as well, the way an interactive user runs pax; their output is then part of
+/// the terminal's.
+pub fn run_pax_on_terminal(args: &[&str], dir: &Path, limit: Duration) -> Option<Vec<u8>> {
+    PtyPax::spawn(args, dir, b"", PtyStdio::All)
+        .finish(limit)
+        .map(|(_, tty)| tty)
+}
+
+/// Which of pax's standard streams are the terminal.
+pub enum PtyStdio {
+    /// Standard input only; output and errors are piped.
+    StdinOnly,
+    /// All three.
+    All,
+    /// Output and errors; standard input is a pipe the test writes to.
+    OutputOnly,
+}
+
+/// A pax running with a pseudo-terminal as its controlling terminal.
+pub struct PtyPax {
+    pub child: std::process::Child,
+    master: File,
+    /// Everything pax has written to the terminal so far.
+    pub seen: Vec<u8>,
+}
+
+impl PtyPax {
+    pub fn spawn(args: &[&str], dir: &Path, typed: &[u8], stdio: PtyStdio) -> PtyPax {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+
+        let (mut master, mut slave) = (-1, -1);
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                // `*mut` on macOS, `*const` on Linux; a null `*mut` suits both.
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+        // Not inherited by the children other tests spawn meanwhile: a stray
+        // copy of the slave would keep the terminal open after pax exits.
+        for fd in [master, slave] {
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+        let mut master = unsafe { File::from_raw_fd(master) };
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        master.write_all(typed).unwrap();
+        // Drained as pax runs, never with a blocking read: on macOS a read of
+        // the master does not return once the slave is closed, it just waits.
+        unsafe {
+            let flags = libc::fcntl(master.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        // At least one of pax's own descriptors is the slave: macOS stops
+        // `/dev/tty` opening once no descriptor for the terminal is left open.
+        let tty = || Stdio::from(slave.try_clone().unwrap());
+        let (stdin, out, err) = match stdio {
+            PtyStdio::StdinOnly => (tty(), Stdio::piped(), Stdio::piped()),
+            PtyStdio::All => (tty(), tty(), tty()),
+            PtyStdio::OutputOnly => (Stdio::piped(), tty(), tty()),
+        };
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_pax"));
+        cmd.args(args)
+            .current_dir(dir)
+            .stdin(stdin)
+            .stdout(out)
+            .stderr(err);
+        let slave_fd = slave.as_raw_fd();
+        unsafe {
+            cmd.pre_exec(move || {
+                // A new session with the slave as its controlling terminal.
+                if libc::setsid() < 0 || libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().unwrap();
+        // The parent's copies of the slave go here, so that pax holds the
+        // only ones.
+        drop(cmd);
+        drop(slave);
+        PtyPax {
+            child,
+            master,
+            seen: Vec::new(),
+        }
+    }
+
+    /// Collect whatever pax has written to the terminal since the last call.
+    pub fn drain(&mut self) {
+        use std::io::Read;
+        let mut buf = [0u8; 1024];
+        while let Ok(n) = self.master.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            self.seen.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    /// Wait up to `limit` for `needle` to appear on the terminal.
+    pub fn wait_for(&mut self, needle: &[u8], limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        loop {
+            self.drain();
+            if self.seen.windows(needle.len()).any(|w| w == needle) {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Wait for pax to exit, killing it after `limit`; `None` if it had to be.
+    pub fn finish(mut self, limit: Duration) -> Option<(Output, Vec<u8>)> {
+        let deadline = Instant::now() + limit;
+        while self.child.try_wait().unwrap().is_none() {
+            self.drain();
+            if Instant::now() > deadline {
+                self.child.kill().unwrap();
+                self.child.wait().unwrap();
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.drain();
+        let output = self.child.wait_with_output().unwrap();
+        Some((output, self.seen))
+    }
 }
 
 /// The end-of-archive indicator: two 512-byte blocks of zeros (POSIX).

@@ -21,11 +21,14 @@
 //! always created fresh rather than written through.
 
 use crate::error::{PaxError, PaxResult};
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ffi::{CStr, CString, OsString};
 use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// A member pathname reduced to the directory components that must be walked
 /// and the final component to create.
@@ -108,34 +111,57 @@ impl MemberPath {
     }
 }
 
+/// Open flags for a directory that is only ever walked through or used as the
+/// `dirfd` of an `*at` call.
+///
+/// Reaching a name below a directory takes search permission only, so opening
+/// each component for reading refused a path through a directory the user may
+/// search and write but not list (mode 0300) where `mkdir` or `open` by name
+/// would have succeeded. `O_PATH` (Linux) and `O_SEARCH` (macOS, the BSDs) open
+/// it for exactly that. Elsewhere `O_RDONLY` is the only option there is.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const SEARCH_ONLY: libc::c_int = libc::O_PATH;
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd"))]
+const SEARCH_ONLY: libc::c_int = libc::O_SEARCH;
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd"
+)))]
+const SEARCH_ONLY: libc::c_int = libc::O_RDONLY;
+
+/// Flags for walking one directory component: search only, and never through
+/// a symbolic link or anything that is not a directory.
+const WALK_FLAGS: libc::c_int =
+    SEARCH_ONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+
 /// Extraction anchored at an open descriptor for the working directory.
 ///
 /// Member paths are walked one component at a time with
-/// `O_RDONLY|O_DIRECTORY|O_NOFOLLOW`, so a symlink planted anywhere along the
-/// path fails the descent rather than redirecting the write outside the
-/// extraction directory. The previous code resolved whole paths through the
-/// ordinary filesystem namespace, where `create_dir_all` on `sub/file` was
-/// happy to follow `sub -> /elsewhere`.
+/// `O_DIRECTORY|O_NOFOLLOW`, so a symlink planted anywhere along the path fails
+/// the descent rather than redirecting the write outside the extraction
+/// directory. The previous code resolved whole paths through the ordinary
+/// filesystem namespace, where `create_dir_all` on `sub/file` was happy to
+/// follow `sub -> /elsewhere`.
 pub(crate) struct DirTree {
     root: OwnedFd,
+    /// The parent most recently walked to, by its components. Consecutive
+    /// members of one directory -- nearly every member of a typical archive --
+    /// then share one walk instead of each reopening the whole chain. Any
+    /// member that could replace one of those components names a shorter
+    /// chain, and so replaces this entry before it can be reused.
+    last_parent: RefCell<Option<(Vec<CString>, Rc<OwnedFd>)>>,
+    /// `(st_dev, st_ino)` of the directories this run created only to hold a
+    /// member below them. Such a directory is not a pre-existing file: a member
+    /// that names it later (`find -depth` order) still gives it its attributes.
+    implicit: RefCell<HashSet<(u64, u64)>>,
 }
 
 impl DirTree {
     pub(crate) fn open_cwd() -> PaxResult<Self> {
-        let dot = CString::new(".").expect("no NUL in \".\"");
-        let fd = unsafe {
-            libc::openat(
-                libc::AT_FDCWD,
-                dot.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(DirTree {
-            root: unsafe { OwnedFd::from_raw_fd(fd) },
-        })
+        Self::open_path(Path::new("."))
     }
 
     /// Anchor at a directory named by the caller, for copy mode's destination.
@@ -146,7 +172,7 @@ impl DirTree {
             libc::openat(
                 libc::AT_FDCWD,
                 c.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                SEARCH_ONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
             )
         };
         if fd < 0 {
@@ -154,6 +180,8 @@ impl DirTree {
         }
         Ok(DirTree {
             root: unsafe { OwnedFd::from_raw_fd(fd) },
+            last_parent: RefCell::new(None),
+            implicit: RefCell::new(HashSet::new()),
         })
     }
 
@@ -168,13 +196,105 @@ impl DirTree {
         &self,
         member: &MemberPath,
         create_missing: bool,
-    ) -> PaxResult<OwnedFd> {
-        let mut cur = self.root.try_clone()?;
-        for comp in &member.dirs {
-            cur = open_dir_at(cur.as_fd(), comp, create_missing)?;
+    ) -> PaxResult<Rc<OwnedFd>> {
+        if let Some((dirs, fd)) = &*self.last_parent.borrow() {
+            if *dirs == member.dirs {
+                return Ok(Rc::clone(fd));
+            }
         }
-        Ok(cur)
+
+        let mut cur: Option<OwnedFd> = None;
+        for comp in &member.dirs {
+            let at = cur.as_ref().map_or(self.root.as_fd(), |fd| fd.as_fd());
+            let (next, created) = open_or_create_dir_at(at, comp, create_missing)?;
+            if created {
+                if let Some(st) = stat_at(next.as_fd(), c".") {
+                    self.implicit.borrow_mut().insert(file_id(&st));
+                }
+            }
+            cur = Some(next);
+        }
+        let fd = Rc::new(match cur {
+            Some(fd) => fd,
+            None => self.root.try_clone()?,
+        });
+        *self.last_parent.borrow_mut() = Some((member.dirs.clone(), Rc::clone(&fd)));
+        Ok(fd)
     }
+
+    /// Whether `st` is a directory this run created only to hold members
+    /// below it, rather than one that was there before.
+    pub(crate) fn is_implicit(&self, st: &libc::stat) -> bool {
+        self.implicit.borrow().contains(&file_id(st))
+    }
+}
+
+/// `(st_dev, st_ino)` of a stat result.
+fn file_id(st: &libc::stat) -> (u64, u64) {
+    // Casts needed: `dev_t` is i32 on macOS and u64 on Linux.
+    #[allow(clippy::unnecessary_cast)]
+    (st.st_dev as u64, st.st_ino as u64)
+}
+
+/// Directories whose archived attributes wait until everything below them
+/// exists.
+///
+/// An archived mode denying write or search would stop the directory's own
+/// contents being created, and every child created afterwards changes its
+/// mtime, so both are applied once at the end, deepest first. Only the name and
+/// the attributes are kept: the directory is reopened when its turn comes.
+#[derive(Default)]
+pub(crate) struct PendingDirs(Vec<PendingDir>);
+
+struct PendingDir {
+    path: PathBuf,
+    depth: usize,
+    attrs: Attrs,
+}
+
+impl PendingDirs {
+    pub(crate) fn push(&mut self, member: &MemberPath, attrs: Attrs) {
+        self.0.push(PendingDir {
+            path: member.display.clone(),
+            depth: member.depth(),
+            attrs,
+        });
+    }
+
+    /// Apply every pending directory's attributes, deepest first.
+    ///
+    /// Siblings are grouped so they share one walk to their parent; the sort
+    /// is stable, so of two entries for one name the later still wins.
+    pub(crate) fn apply(&mut self, tree: &DirTree, policy: &AttrPolicy) {
+        self.0
+            .sort_by(|a, b| b.depth.cmp(&a.depth).then_with(|| a.path.cmp(&b.path)));
+        for dir in self.0.drain(..) {
+            if let Err(e) = apply_dir_attrs(tree, &dir, policy) {
+                crate::error::report_error(&dir.path, e);
+            }
+        }
+    }
+}
+
+/// Reopen one pending directory and apply its attributes through that
+/// descriptor.
+///
+/// The name need not still be the directory that was created for it -- a
+/// later member can have replaced it with a symbolic link, and applying the
+/// mode by name would then chmod whatever the link points at. `O_NOFOLLOW`
+/// refuses the link, and `O_DIRECTORY` anything else that took its place.
+fn apply_dir_attrs(tree: &DirTree, dir: &PendingDir, policy: &AttrPolicy) -> PaxResult<()> {
+    let Some(member) = MemberPath::parse(&dir.path)? else {
+        return Ok(());
+    };
+    let parent = tree.parent_of(&member, false)?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), member.leaf.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    set_attrs_fd(fd.as_fd(), &dir.attrs, policy)
 }
 
 /// Open one directory component below `dirfd` without following a symlink.
@@ -183,11 +303,18 @@ pub(crate) fn open_dir_at(
     name: &CString,
     create_missing: bool,
 ) -> PaxResult<OwnedFd> {
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    open_or_create_dir_at(dirfd, name, create_missing).map(|(fd, _)| fd)
+}
 
-    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), flags) };
+/// `open_dir_at`, also saying whether the directory had to be created.
+fn open_or_create_dir_at(
+    dirfd: BorrowedFd<'_>,
+    name: &CString,
+    create_missing: bool,
+) -> PaxResult<(OwnedFd, bool)> {
+    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), WALK_FLAGS) };
     if fd >= 0 {
-        return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+        return Ok((unsafe { OwnedFd::from_raw_fd(fd) }, false));
     }
 
     let err = std::io::Error::last_os_error();
@@ -198,18 +325,19 @@ pub(crate) fn open_dir_at(
     // Intermediate directories are created with the normal file-creation
     // action, per POSIX read/copy mode: mode 0777 modified by the umask.
     let r = unsafe { libc::mkdirat(dirfd.as_raw_fd(), name.as_ptr(), 0o777) };
-    if r != 0 {
+    let created = r == 0;
+    if !created {
         let e = std::io::Error::last_os_error();
         if e.raw_os_error() != Some(libc::EEXIST) {
             return Err(e.into());
         }
     }
 
-    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), flags) };
+    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), WALK_FLAGS) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    Ok((unsafe { OwnedFd::from_raw_fd(fd) }, created))
 }
 
 /// Remove whatever currently occupies `name`, so an exclusive create can win.
@@ -422,11 +550,10 @@ pub(crate) fn restore_atime(fd: BorrowedFd<'_>, path: &Path, metadata: &ftw::Met
     }
     let err = std::io::Error::last_os_error();
     if err.raw_os_error() != Some(libc::EPERM) {
-        eprintln!(
-            "pax: warning: cannot reset atime on {}: {}",
-            path.display(),
-            err
-        );
+        let mut line = b"pax: warning: cannot reset atime on ".to_vec();
+        line.extend_from_slice(crate::rawpath::as_bytes(path));
+        line.extend_from_slice(format!(": {}", err).as_bytes());
+        crate::escape::write_stderr_line(&line);
     }
 }
 

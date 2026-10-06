@@ -99,10 +99,7 @@ impl InteractivePrompter {
 
         // EOF means we should exit immediately
         if n == 0 {
-            return Err(PaxError::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "EOF on interactive input",
-            )));
+            return Err(PaxError::TtyEof);
         }
 
         let response = line.trim();

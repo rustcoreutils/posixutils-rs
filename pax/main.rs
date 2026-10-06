@@ -182,6 +182,11 @@ struct Args {
     #[arg(help = gettext("Pathnames, patterns and file operands to be processed"))]
     files_and_patterns: Vec<OsString>,
 
+    /// The names to archive were given explicitly (tar `-T`), so an empty
+    /// list means archive nothing rather than read names from stdin.
+    #[arg(skip)]
+    names_given: bool,
+
     /// tar `-C`: change to this directory before operating. Applied after the
     /// `-f` pathname has been resolved, since that one is relative to the
     /// directory the command was invoked from.
@@ -256,7 +261,9 @@ fn main() -> ExitCode {
         }
         Err(PaxError::EarlyExit) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("{}: {}", program.name(), e);
+            // Escaped like every other diagnostic: the message can quote a
+            // name or a header value straight out of the archive.
+            crate::escape::write_stderr_line(format!("{}: {}", program.name(), e).as_bytes());
             ExitCode::FAILURE
         }
     }
@@ -381,13 +388,26 @@ fn run_list(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
     }
 
     let mut archive = open_archive_for_read(args, archive_bytes, &options.format_options)?;
-    // StdoutLock is a LineWriter, so an unbuffered listing costs one write(2)
-    // per member (two under -o listopt). Buffer it.
-    let mut stdout = io::BufWriter::new(io::stdout().lock());
+    let mut stdout = listing_stdout();
 
     modes::list_archive(&mut archive, &mut stdout, &options)?;
-    stdout.flush()?;
-    Ok(())
+    stdout.flush().map_err(modes::list::listing_error)
+}
+
+/// Standard output for a listing.
+///
+/// StdoutLock is a LineWriter, so an unbuffered listing costs one write(2)
+/// per member (two under -o listopt), and to a pipe or a file it is buffered.
+/// On a terminal it is not: someone is watching, and each member should
+/// appear as it is read -- the LineWriter's line at a time.
+fn listing_stdout() -> io::BufWriter<io::StdoutLock<'static>> {
+    use std::io::IsTerminal;
+    let capacity = if io::stdout().is_terminal() {
+        0
+    } else {
+        8 * 1024
+    };
+    io::BufWriter::with_capacity(capacity, io::stdout().lock())
 }
 
 /// Run list mode with multi-volume support
@@ -866,7 +886,7 @@ fn compile_patterns(patterns: &[OsString]) -> Vec<Pattern> {
 
 /// Get files to archive (from args or stdin)
 fn get_files_to_archive(args: &Args) -> PaxResult<Vec<PathBuf>> {
-    if args.files_and_patterns.is_empty() {
+    if args.files_and_patterns.is_empty() && !args.names_given {
         // Read from stdin
         modes::write::read_file_list(io::stdin())
     } else {

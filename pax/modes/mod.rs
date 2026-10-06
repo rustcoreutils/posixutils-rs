@@ -33,10 +33,11 @@ pub use write::create_archive;
 /// errno. Copy mode has no archive; there a full or vanished destination
 /// filesystem is the shared failure. A failure to read a *source* file is
 /// per-file, and POSIX CONSEQUENCES OF ERRORS says to diagnose it and carry on.
+/// End of file on `/dev/tty` under -i ends the run by definition.
 pub(crate) fn is_fatal(err: &crate::error::PaxError) -> bool {
     use crate::error::PaxError;
     match err {
-        PaxError::ArchiveWrite(_) => true,
+        PaxError::ArchiveWrite(_) | PaxError::TtyEof => true,
         PaxError::Io(e) => matches!(
             e.kind(),
             std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::StorageFull

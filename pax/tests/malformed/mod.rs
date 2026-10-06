@@ -656,3 +656,37 @@ fn test_cpio_truncated_inside_header_is_an_error() {
     assert_exit_code(&output, 1, "list of a cpio archive cut inside a header");
     assert_eq!(stdout_str(&output), "one\n");
 }
+
+/// A fatal error part-way through still leaves the directories already
+/// extracted with their archived attributes: the deferred pass is what gives
+/// a directory its mode and times, and skipping it on the error path left
+/// them with the creation mode and the time of extraction.
+#[test]
+fn test_fatal_read_error_still_applies_directory_attributes() {
+    let temp = plib::tmp::TempDir::new().unwrap();
+    let mut archive = Ustar {
+        name: b"d/",
+        typeflag: b'5',
+        mode: 0o750,
+        mtime: 1_000_000_000,
+        ..Default::default()
+    }
+    .member();
+    // A member whose header promises far more data than follows: reading it
+    // runs out of archive, which ends the extraction.
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"d/f",
+            body: b"x",
+            size: Some(100_000),
+            ..Default::default()
+        }
+        .member(),
+    );
+
+    let out = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, temp.path());
+    assert!(!out.status.success(), "a truncated archive must fail");
+    let meta = std::fs::metadata(temp.path().join("d")).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(meta.mtime(), 1_000_000_000, "{}", stderr_str(&out));
+}

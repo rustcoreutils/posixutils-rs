@@ -166,23 +166,26 @@ impl FormatOptions {
     ///
     /// Later options take precedence over earlier ones.
     pub fn parse_into(&mut self, input: &str) -> PaxResult<()> {
-        let input = input.trim();
-        if input.is_empty() {
-            return Ok(());
-        }
-
-        // Per POSIX, `listopt` is the final <comma>-separated keyword: its value
-        // runs to the end of the `-o` string, so commas inside the format are
-        // literal. Split it off before the comma tokenizer can break it apart.
-        if let Some(marker) = find_listopt_marker(input) {
-            let before = input[..marker].trim_end().trim_end_matches(',');
-            self.parse_comma_list(before)?;
-            let raw = &input[marker + "listopt=".len()..];
-            self.list_format = Some(unescape_backslashes(raw));
-            return Ok(());
-        }
-
-        self.parse_comma_list(input)
+        // Per POSIX, `listopt` is the final <comma>-separated keyword: "all
+        // characters in the remainder of the option-argument shall be
+        // considered part of the format string" -- commas and trailing blanks
+        // included. Split it off before the comma tokenizer can break it
+        // apart; the input is not trimmed for the same reason.
+        let Some(marker) = find_listopt_marker(input) else {
+            return self.parse_comma_list(input);
+        };
+        // Only the one comma that separates the tail goes: an escaped comma
+        // ending the keyword before it is part of that keyword's value.
+        let before = input[..marker].trim_end();
+        self.parse_comma_list(before.strip_suffix(',').unwrap_or(before))?;
+        let format = decode_printf_escapes(&input[marker + "listopt=".len()..]);
+        // "When multiple -o listopt=format options are specified, the format
+        // strings shall be considered a single, concatenated string, evaluated
+        // in command-line order."
+        self.list_format
+            .get_or_insert_with(String::new)
+            .push_str(&format);
+        Ok(())
     }
 
     /// Parse a sequence of comma-separated options (backslash escapes a comma).
@@ -669,19 +672,32 @@ fn find_listopt_marker(input: &str) -> Option<usize> {
     None
 }
 
-/// Remove backslash escapes (`\X` → `X`) from a listopt format value.
-fn unescape_backslashes(s: &str) -> String {
+/// Decode the backslash escapes of a listopt format, which POSIX makes a
+/// `printf` format: `\\`, `\a`, `\b`, `\f`, `\n`, `\r`, `\t` and `\v` are the
+/// characters XBD File Format Notation gives them. Before any other character
+/// the backslash is dropped, so `\,` is a comma, as it is elsewhere in `-o`.
+fn decode_printf_escapes(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut escaped = false;
-    for c in s.chars() {
-        if escaped {
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
             out.push(c);
-            escaped = false;
-        } else if c == '\\' {
-            escaped = true;
-        } else {
-            out.push(c);
+            continue;
         }
+        let Some(next) = chars.next() else {
+            out.push(c);
+            break;
+        };
+        out.push(match next {
+            'a' => '\x07',
+            'b' => '\x08',
+            'f' => '\x0c',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'v' => '\x0b',
+            other => other,
+        });
     }
     out
 }
@@ -1596,6 +1612,41 @@ mod tests {
         assert_eq!(fmt("%(uname)s:%(gname)s", &info), "alice:users");
         // An unknown keyword is echoed verbatim.
         assert_eq!(fmt("%(bogus)s", &info), "%(bogus)s");
+    }
+
+    /// POSIX: "all characters in the remainder of the option-argument shall
+    /// be considered part of the format string" -- trailing blanks included.
+    #[test]
+    fn test_listopt_value_is_the_whole_remainder() {
+        let opts = FormatOptions::parse("listopt=[%F] ").unwrap();
+        assert_eq!(opts.list_format.as_deref(), Some("[%F] "));
+    }
+
+    /// The format is a printf format, whose backslash escapes are decoded.
+    #[test]
+    fn test_listopt_decodes_printf_escapes() {
+        let opts = FormatOptions::parse(r"listopt=%F\t%s\\").unwrap();
+        assert_eq!(opts.list_format.as_deref(), Some("%F\t%s\\"));
+    }
+
+    /// POSIX: "When multiple -o listopt=format options are specified, the
+    /// format strings shall be considered a single, concatenated string,
+    /// evaluated in command-line order."
+    #[test]
+    fn test_listopt_options_concatenate() {
+        let mut opts = FormatOptions::new();
+        opts.parse_into("listopt=%F").unwrap();
+        opts.parse_into("listopt=:%s").unwrap();
+        assert_eq!(opts.list_format.as_deref(), Some("%F:%s"));
+    }
+
+    /// Splitting off the listopt tail removes the one comma that separates
+    /// it, not an escaped comma that ends the value before it.
+    #[test]
+    fn test_escaped_comma_before_listopt_is_kept() {
+        let opts = FormatOptions::parse(r"x=a\,,listopt=%F").unwrap();
+        assert_eq!(opts.global.get("x").map(String::as_str), Some("a,"));
+        assert_eq!(opts.list_format.as_deref(), Some("%F"));
     }
 
     #[test]

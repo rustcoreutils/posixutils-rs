@@ -2492,3 +2492,59 @@ fn test_n_stops_once_every_pattern_is_matched() {
     let output = run_pax_with_stdin_bytes(&["a"], &a);
     assert!(!output.status.success());
 }
+
+/// POSIX -i: "If EOF is encountered when reading a response ... pax shall
+/// immediately exit with a non-zero exit status." Three ^D are typed, one per
+/// operand: a pax that treats EOF as a per-file error prompts for every one.
+fn assert_tty_eof_exits(args: &[&str], dir: &std::path::Path) {
+    let Some((out, tty)) = run_pax_on_tty(
+        args,
+        dir,
+        b"\x04\x04\x04",
+        std::time::Duration::from_secs(20),
+    ) else {
+        panic!("pax {:?} did not exit on EOF from /dev/tty", args);
+    };
+    assert!(!out.status.success(), "EOF on /dev/tty must fail");
+    let prompts = tty.windows(4).filter(|w| w == b" => ").count();
+    assert_eq!(
+        prompts,
+        1,
+        "pax {:?} kept prompting after EOF: {:?} / {}",
+        args,
+        String::from_utf8_lossy(&tty),
+        stderr_str(&out)
+    );
+}
+
+fn three_files(dir: &std::path::Path) {
+    for name in ["a", "b", "c"] {
+        fs::write(dir.join(name), name).unwrap();
+    }
+}
+
+#[test]
+fn test_interactive_eof_exits_write_mode() {
+    let temp = TempDir::new().unwrap();
+    three_files(temp.path());
+    assert_tty_eof_exits(&["-w", "-i", "-f", "out.tar", "a", "b", "c"], temp.path());
+}
+
+#[test]
+fn test_interactive_eof_exits_read_mode() {
+    let temp = TempDir::new().unwrap();
+    three_files(temp.path());
+    let out = run_pax_in_dir(&["-w", "-f", "in.tar", "a", "b", "c"], temp.path());
+    assert_success(&out, "pax -w");
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+    assert_tty_eof_exits(&["-r", "-i", "-f", "../in.tar"], &dst);
+}
+
+#[test]
+fn test_interactive_eof_exits_copy_mode() {
+    let temp = TempDir::new().unwrap();
+    three_files(temp.path());
+    fs::create_dir(temp.path().join("dst")).unwrap();
+    assert_tty_eof_exits(&["-rw", "-i", "a", "b", "c", "dst"], temp.path());
+}

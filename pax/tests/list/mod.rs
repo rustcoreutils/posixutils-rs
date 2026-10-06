@@ -449,3 +449,68 @@ fn test_subst_non_ascii_name_in_c_locale() {
         stderr_str(&output)
     );
 }
+
+/// An archive of `n` empty members named `member-0000`, `member-0001`, ...
+fn many_members(n: usize) -> Vec<u8> {
+    let mut archive = Vec::new();
+    for i in 0..n {
+        let name = format!("member-{i:04}");
+        archive.extend_from_slice(
+            &Ustar {
+                name: name.as_bytes(),
+                ..Default::default()
+            }
+            .member(),
+        );
+    }
+    archive.extend_from_slice(&ustar_trailer());
+    archive
+}
+
+/// A listing on a terminal shows each member as it is read, not once the
+/// whole archive is: here the archive arrives on a pipe, and its end is held
+/// back until the first name has appeared.
+#[test]
+fn test_terminal_listing_is_not_held_back() {
+    let temp = TempDir::new().unwrap();
+    let archive = many_members(4);
+    let (first, rest) = archive.split_at(2 * 512);
+
+    let mut pax = PtyPax::spawn(&[], temp.path(), b"", PtyStdio::OutputOnly);
+    let mut stdin = pax.child.stdin.take().unwrap();
+    stdin.write_all(first).unwrap();
+    let shown = pax.wait_for(b"member-0001", std::time::Duration::from_secs(5));
+    let _ = stdin.write_all(rest);
+    drop(stdin);
+    let finished = pax.finish(std::time::Duration::from_secs(20));
+    assert!(
+        shown,
+        "the first names were held back until the archive ended"
+    );
+    assert!(finished.is_some_and(|(out, _)| out.status.success()));
+}
+
+/// A listing standard output cannot hold is one error, diagnosed once, and
+/// ends the run with a failure status -- not a diagnostic per remaining member
+/// blaming each one in turn. The file-size limit stands in for a full disk;
+/// a closed pipe needs no test, since SIGPIPE ends pax as it ends `cat`.
+#[test]
+fn test_listing_write_error_fails_once() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("a.tar"), many_members(3000)).unwrap();
+
+    // SIGXFSZ ignored so the over-limit write fails with EFBIG instead of
+    // killing the process; a 1-block limit is exceeded early in the listing.
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg("trap '' XFSZ; ulimit -f 1; exec \"$0\" -f a.tar > out")
+        .arg(env!("CARGO_BIN_EXE_pax"))
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+
+    assert_exit_code(&output, 1, "pax listing past the file-size limit");
+    let stderr = stderr_str(&output);
+    assert_eq!(stderr.lines().count(), 1, "stderr:\n{stderr}");
+    assert!(!stderr.contains("member-"), "blamed a member:\n{stderr}");
+}

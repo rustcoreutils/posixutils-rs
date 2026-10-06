@@ -221,23 +221,15 @@ fn test_cross_tool_tar_read() {
     writeln!(f, "Hello from tar").unwrap();
 
     // Create archive using system tar
-    let output = Command::new("tar")
-        .args(["-cf"])
-        .arg(&archive)
-        .arg(".")
-        .current_dir(&src_dir)
-        .output();
-
-    // Skip test if tar is not available
-    if output.is_err() {
-        eprintln!("Skipping cross-tool test: tar not available");
+    let Some(tar) = system_tool("tar") else {
         return;
-    }
-    let output = output.unwrap();
-    if !output.status.success() {
-        eprintln!("Skipping cross-tool test: tar failed");
-        return;
-    }
+    };
+    run_system_ok(
+        &tar,
+        &["-cf", archive.to_str().unwrap(), "."],
+        &src_dir,
+        None,
+    );
 
     // Extract with our pax
     fs::create_dir(&dst_dir).unwrap();
@@ -270,27 +262,11 @@ fn test_cross_tool_tar_write() {
     assert_success(&output, "pax write");
 
     // Extract with system tar
+    let Some(tar) = system_tool("tar") else {
+        return;
+    };
     fs::create_dir(&dst_dir).unwrap();
-    let output = Command::new("tar")
-        .args(["-xf"])
-        .arg(&archive)
-        .current_dir(&dst_dir)
-        .output();
-
-    // Skip test if tar is not available
-    if output.is_err() {
-        eprintln!("Skipping cross-tool test: tar not available");
-        return;
-    }
-    let output = output.unwrap();
-    if !output.status.success() {
-        eprintln!(
-            "tar extract failed: {:?}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        // This is okay if tar isn't available or compatible
-        return;
-    }
+    run_system_ok(&tar, &["-xf", archive.to_str().unwrap()], &dst_dir, None);
 
     // Verify content
     let content = fs::read_to_string(dst_dir.join("hello.txt")).unwrap();
@@ -529,31 +505,16 @@ fn test_pax_cross_tool_read() {
         .write_all(b"test content")
         .unwrap();
 
-    // Try to create archive with system tar using posix format
-    let output = Command::new("tar")
-        .args(["--format=posix", "-cf"])
-        .arg(&archive)
-        .arg(".")
-        .current_dir(&src_dir)
-        .output();
-
-    if output.is_err() {
-        eprintln!("Skipping: tar not available");
+    // Create the archive with system tar in pax format. GNU tar and bsdtar
+    // both spell it --format=posix; a tar that knows neither still has to
+    // write some archive this pax reads.
+    let Some(tar) = system_tool("tar") else {
         return;
-    }
-    let output = output.unwrap();
-    if !output.status.success() {
-        // Try without --format flag (macOS tar)
-        let output = Command::new("tar")
-            .args(["-cf"])
-            .arg(&archive)
-            .arg(".")
-            .current_dir(&src_dir)
-            .output();
-        if output.is_err() || !output.unwrap().status.success() {
-            eprintln!("Skipping: could not create tar archive");
-            return;
-        }
+    };
+    let path = archive.to_str().unwrap();
+    let made = run_program(&tar, &["--format=posix", "-cf", path, "."], &src_dir, None);
+    if !made.status.success() {
+        run_system_ok(&tar, &["-cf", path, "."], &src_dir, None);
     }
 
     // Extract with our pax
@@ -585,23 +546,12 @@ fn test_pax_cross_tool_write() {
     );
     assert_success(&output, "pax write");
 
-    // Extract with system tar
+    // Extract with system tar: every tar in use today reads pax archives.
+    let Some(tar) = system_tool("tar") else {
+        return;
+    };
     fs::create_dir(&dst_dir).unwrap();
-    let output = Command::new("tar")
-        .args(["-xf"])
-        .arg(&archive)
-        .current_dir(&dst_dir)
-        .output();
-
-    if output.is_err() {
-        eprintln!("Skipping: tar not available");
-        return;
-    }
-    let output = output.unwrap();
-    if !output.status.success() {
-        eprintln!("System tar could not read pax archive (this may be expected)");
-        return;
-    }
+    run_system_ok(&tar, &["-xf", archive.to_str().unwrap()], &dst_dir, None);
 
     let content = fs::read_to_string(dst_dir.join("test.txt")).unwrap();
     assert!(content.contains("pax content"));
@@ -620,22 +570,11 @@ fn test_cross_tool_cpio_read() {
     let mut f = File::create(src_dir.join("hello.txt")).unwrap();
     writeln!(f, "Hello from cpio").unwrap();
 
-    // Create archive using system cpio (via find | cpio -o)
-    let output = Command::new("sh")
-        .args(["-c", "find . | cpio -o"])
-        .current_dir(&src_dir)
-        .stdout(std::process::Stdio::piped())
-        .output();
-
-    if output.is_err() {
-        eprintln!("Skipping cross-tool test: cpio not available");
+    // Create archive using system cpio, from the names `find .` would give
+    let Some(cpio) = system_tool("cpio") else {
         return;
-    }
-    let output = output.unwrap();
-    if !output.status.success() {
-        eprintln!("Skipping cross-tool test: cpio failed");
-        return;
-    }
+    };
+    let output = run_system_ok(&cpio, &["-o"], &src_dir, Some(b".\n./hello.txt\n"));
 
     // Write the cpio archive
     fs::write(&archive, &output.stdout).unwrap();
@@ -671,24 +610,16 @@ fn test_cross_tool_cpio_write() {
     assert_success(&output, "pax write cpio");
 
     // Extract with system cpio
+    let Some(cpio) = system_tool("cpio") else {
+        return;
+    };
     fs::create_dir(&dst_dir).unwrap();
-    let output = Command::new("sh")
-        .args(["-c", &format!("cpio -id < {}", archive.to_str().unwrap())])
-        .current_dir(&dst_dir)
-        .output();
-
-    if output.is_err() {
-        eprintln!("Skipping cross-tool test: cpio not available");
-        return;
-    }
-    let output = output.unwrap();
-    if !output.status.success() {
-        eprintln!(
-            "cpio extract failed: {:?}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
+    run_system_ok(
+        &cpio,
+        &["-id"],
+        &dst_dir,
+        Some(&fs::read(&archive).unwrap()),
+    );
 
     // Verify content
     let content = fs::read_to_string(dst_dir.join("hello.txt")).unwrap();
@@ -812,13 +743,10 @@ fn test_symlink_tar_no_damaged_warning() {
     assert_success(&output, "pax write");
 
     // List with system tar and check for "Damaged" warning
-    let output = Command::new("tar").args(["-tvf"]).arg(&archive).output();
-
-    if output.is_err() {
-        eprintln!("Skipping: tar not available");
+    let Some(tar) = system_tool("tar") else {
         return;
-    }
-    let output = output.unwrap();
+    };
+    let output = run_system_ok(&tar, &["-tvf", archive.to_str().unwrap()], &src_dir, None);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     // The key assertion: no "Damaged" warning
@@ -830,13 +758,7 @@ fn test_symlink_tar_no_damaged_warning() {
 
     // Verify it can extract correctly
     fs::create_dir(&dst_dir).unwrap();
-    let output = Command::new("tar")
-        .args(["-xf"])
-        .arg(&archive)
-        .current_dir(&dst_dir)
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "tar extraction failed");
+    run_system_ok(&tar, &["-xf", archive.to_str().unwrap()], &dst_dir, None);
 
     // Verify symlink was extracted correctly
     let link_path = dst_dir.join("link.txt");
@@ -1669,4 +1591,67 @@ fn test_list_seeks_over_member_data() {
     .expect("pax read through the member data instead of seeking over it");
     assert_success(&output, "pax -f big.tar");
     assert_eq!(stdout_str(&output), "big\nafter\n");
+}
+
+/// The system's pax reads what ours writes, in the formats every pax shares.
+#[test]
+fn test_cross_tool_system_pax_reads_ours() {
+    let Some(pax) = system_tool("pax") else {
+        return;
+    };
+    for format in ["ustar", "cpio"] {
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("sub/f.txt"), "from ours\n").unwrap();
+        std::os::unix::fs::symlink("sub/f.txt", src.join("l")).unwrap();
+
+        let out = run_pax_in_dir(&["-w", "-x", format, "-f", "../a", "sub", "l"], &src);
+        assert_success(&out, &format!("pax -w -x {format}"));
+        let dst = temp.path().join("dst");
+        fs::create_dir(&dst).unwrap();
+        run_system_ok(&pax, &["-r", "-f", "../a"], &dst, None);
+        assert_eq!(
+            fs::read_to_string(dst.join("sub/f.txt")).unwrap(),
+            "from ours\n"
+        );
+        assert_eq!(
+            fs::read_link(dst.join("l")).unwrap(),
+            Path::new("sub/f.txt")
+        );
+    }
+}
+
+/// And ours reads what the system's pax writes.
+#[test]
+fn test_cross_tool_we_read_system_pax() {
+    let Some(pax) = system_tool("pax") else {
+        return;
+    };
+    for format in ["ustar", "cpio"] {
+        let temp = TempDir::new().unwrap();
+        let src = temp.path().join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("sub/f.txt"), "from system\n").unwrap();
+        std::os::unix::fs::symlink("sub/f.txt", src.join("l")).unwrap();
+
+        run_system_ok(
+            &pax,
+            &["-w", "-x", format, "-f", "../a", "sub", "l"],
+            &src,
+            None,
+        );
+        let dst = temp.path().join("dst");
+        fs::create_dir(&dst).unwrap();
+        let out = run_pax_in_dir(&["-r", "-f", "../a"], &dst);
+        assert_success(&out, &format!("pax -r of system pax -x {format}"));
+        assert_eq!(
+            fs::read_to_string(dst.join("sub/f.txt")).unwrap(),
+            "from system\n"
+        );
+        assert_eq!(
+            fs::read_link(dst.join("l")).unwrap(),
+            Path::new("sub/f.txt")
+        );
+    }
 }

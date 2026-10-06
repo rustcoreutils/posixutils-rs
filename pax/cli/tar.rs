@@ -208,10 +208,12 @@ fn apply_value(c: char, value: &OsStr, st: &mut State) -> PaxResult<()> {
     match c {
         'f' => set_archive(st, value),
         'C' => set_chdir(st, value)?,
-        'T' => st
-            .args
-            .files_and_patterns
-            .extend(read_name_list(value, st.null)?),
+        'T' => {
+            st.args.names_given = true;
+            st.args
+                .files_and_patterns
+                .extend(read_name_list(value, st.null)?)
+        }
         'X' => st
             .args
             .exclude_patterns

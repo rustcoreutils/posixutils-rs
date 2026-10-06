@@ -15,7 +15,7 @@ use crate::formats::OptionRecords;
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
     chown_result, create_replacing, link_replacing, set_attrs_fd, stat_at, AttrPolicy, Attrs,
-    DirTree, MemberPath,
+    DirTree, MemberPath, PendingDirs,
 };
 use crate::modes::select::Selector;
 use crate::pattern::Pattern;
@@ -26,6 +26,7 @@ use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// Options for read/extract mode
 pub struct ReadOptions {
@@ -98,15 +99,27 @@ impl Default for ReadOptions {
 
 /// Extract the members of an archive
 pub fn extract_archive<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> PaxResult<()> {
-    let mut link_sets: LinkSets<CreatedSet> = LinkSets::default();
     // Extraction is anchored at an open descriptor for the working directory,
     // and every member path is resolved relative to it without following a
     // symlink.
     let tree = DirTree::open_cwd()?;
     // Directories take their archived attributes only once the whole archive
-    // has been extracted; see apply_pending_dirs.
-    let mut pending_dirs: Vec<(MemberPath, ArchiveEntry)> = Vec::new();
+    // has been extracted -- and still do when a fatal error stops it early,
+    // for the directories that were created by then.
+    let mut pending_dirs = PendingDirs::default();
+    let result = extract_members(archive, options, &tree, &mut pending_dirs);
+    pending_dirs.apply(&tree, &policy_of(options));
+    result
+}
 
+/// The member loop of `extract_archive`.
+fn extract_members<R: ArchiveReader>(
+    archive: &mut R,
+    options: &ReadOptions,
+    tree: &DirTree,
+    pending_dirs: &mut PendingDirs,
+) -> PaxResult<()> {
+    let mut link_sets: LinkSets<CreatedSet> = LinkSets::default();
     let mut selector = Selector::new(
         &options.patterns,
         options.exclude,
@@ -127,18 +140,13 @@ pub fn extract_archive<R: ArchiveReader>(archive: &mut R, options: &ReadOptions)
         if let Some(ref records) = option_records {
             records.apply(&mut entry);
         }
-        if select_member(&mut selector, &mut entry, options, &mut prompter, &tree)? {
+        if select_member(&mut selector, &mut entry, options, &mut prompter, tree)? {
             // Per POSIX CONSEQUENCES OF ERRORS: diagnose a per-file failure and
             // set a non-zero exit, but continue with the next member. Skip any
             // unconsumed data of the failed entry to realign the reader.
-            if let Err(e) = extract_entry(
-                archive,
-                &entry,
-                options,
-                &mut link_sets,
-                &tree,
-                &mut pending_dirs,
-            ) {
+            if let Err(e) =
+                extract_entry(archive, &entry, options, &mut link_sets, tree, pending_dirs)
+            {
                 crate::error::report_error(&entry.path, e);
             }
         }
@@ -148,7 +156,6 @@ pub fn extract_archive<R: ArchiveReader>(archive: &mut R, options: &ReadOptions)
         }
     }
 
-    apply_pending_dirs(&tree, &mut pending_dirs, options);
     selector.report_unmatched();
     Ok(())
 }
@@ -284,7 +291,7 @@ fn extract_entry<R: ArchiveReader>(
     options: &ReadOptions,
     link_sets: &mut LinkSets<CreatedSet>,
     tree: &DirTree,
-    pending_dirs: &mut Vec<(MemberPath, ArchiveEntry)>,
+    pending_dirs: &mut PendingDirs,
 ) -> PaxResult<()> {
     // -O turns extraction into a dump: nothing is created on disk, so none of
     // the pathname resolution below applies.
@@ -327,9 +334,9 @@ fn extract_entry<R: ArchiveReader>(
 
     match entry.entry_type {
         EntryType::Directory => {
-            if extract_directory(pfd, name, entry, options)? {
+            if extract_directory(tree, pfd, name, entry, options)? {
                 // Its attributes are applied once the subtree exists.
-                pending_dirs.push((member, entry.clone()));
+                pending_dirs.push(&member, attrs_of(entry, options));
             }
             archive.skip_data()?;
         }
@@ -356,11 +363,10 @@ fn extract_entry<R: ArchiveReader>(
         EntryType::Socket => {
             // Sockets cannot be extracted from archives
             if options.verbose {
-                eprintln!(
-                    "{}: skipping socket: {}",
-                    crate::error::program_name(),
-                    member.display.display()
-                );
+                let mut line =
+                    format!("{}: skipping socket: ", crate::error::program_name()).into_bytes();
+                line.extend_from_slice(crate::rawpath::as_bytes(&member.display));
+                crate::escape::write_stderr_line(&line);
             }
             archive.skip_data()?;
         }
@@ -410,6 +416,7 @@ fn copy_member_to_stdout<R: ArchiveReader>(
 
 /// Extract a directory. Returns whether its attributes should be applied later.
 fn extract_directory(
+    tree: &DirTree,
     dirfd: BorrowedFd<'_>,
     name: &CStr,
     entry: &ArchiveEntry,
@@ -433,12 +440,19 @@ fn extract_directory(
         Err(e) if !exists(&e) => return Err(e.into()),
         Err(_) => {}
     }
-    // With -k whatever is there is left entirely alone. Otherwise extracting
-    // onto an existing directory is not an error (POSIX), and it is kept.
+    // A directory this run created only to hold earlier members is not a
+    // pre-existing file: the member naming it (`find -depth` order) brings
+    // its attributes. With -k anything else there is left entirely alone.
+    // Otherwise extracting onto an existing directory is not an error
+    // (POSIX), and it is kept.
+    let existing_dir = stat_at(dirfd, name).filter(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR);
+    if existing_dir.is_some_and(|st| tree.is_implicit(&st)) {
+        return Ok(true);
+    }
     if options.no_clobber {
         return Ok(false);
     }
-    if is_directory_at(dirfd, name) {
+    if existing_dir.is_some() {
         return Ok(true);
     }
 
@@ -646,7 +660,7 @@ fn join_link_set<R: ArchiveReader>(
 }
 
 /// The directory and leaf of an extracted name, if it still names `file`.
-fn holding_name(tree: &DirTree, path: &Path, file: (u64, u64)) -> Option<(OwnedFd, CString)> {
+fn holding_name(tree: &DirTree, path: &Path, file: (u64, u64)) -> Option<(Rc<OwnedFd>, CString)> {
     let member = MemberPath::parse(path).ok()??;
     let dir = tree.parent_of(&member, false).ok()?;
     (id_at(dir.as_fd(), &member.leaf) == Some(file)).then_some((dir, member.leaf))
@@ -822,7 +836,9 @@ fn is_archive_newer(tree: &DirTree, entry: &ArchiveEntry) -> bool {
     let Ok(parent) = tree.parent_of(&member, false) else {
         return true; // no such directory, so nothing there: extract it
     };
-    stat_at(parent.as_fd(), &member.leaf).is_none_or(|st| entry.mtime > st.st_mtime)
+    // A directory created here only to hold earlier members is not one.
+    stat_at(parent.as_fd(), &member.leaf)
+        .is_none_or(|st| tree.is_implicit(&st) || entry.mtime > st.st_mtime)
 }
 
 /// The ids to give an extracted file.
@@ -979,55 +995,6 @@ fn set_times_at(
     }
 
     Ok(())
-}
-
-/// Apply the archived attributes of every extracted directory, deepest first.
-///
-/// Directories cannot take their attributes at creation time: an archived mode
-/// denying write or search stops its own contents being written, and the mtime
-/// is invalidated by every child created afterwards. Both are applied here,
-/// once the whole archive has been extracted.
-fn apply_pending_dirs(
-    tree: &DirTree,
-    pending: &mut [(MemberPath, ArchiveEntry)],
-    options: &ReadOptions,
-) {
-    // Deepest first, so a parent is stamped only after its children are done.
-    pending.sort_by_key(|(member, _)| std::cmp::Reverse(member.depth()));
-
-    for (member, entry) in pending.iter() {
-        let parent = match tree.parent_of(member, false) {
-            Ok(p) => p,
-            Err(e) => {
-                crate::error::report_error(&member.display, e);
-                continue;
-            }
-        };
-        let pfd = parent.as_fd();
-        let name = member.leaf.as_c_str();
-
-        // Reopen the directory itself and work through that descriptor. This
-        // pass runs after the whole archive has been extracted, so the name
-        // need not still be the directory that was created for this member --
-        // a later member can have replaced it with a symbolic link, and
-        // applying the archived mode by name would then chmod whatever the
-        // link points at. `O_NOFOLLOW` refuses the link, and `O_DIRECTORY`
-        // refuses anything else that took its place.
-        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        let fd = unsafe { libc::openat(pfd.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            crate::error::report_error(
-                &member.display,
-                PaxError::from(std::io::Error::last_os_error()),
-            );
-            continue;
-        }
-        let dir = unsafe { OwnedFd::from_raw_fd(fd) };
-
-        if let Err(e) = set_attrs_fd(dir.as_fd(), &attrs_of(entry, options), &policy_of(options)) {
-            crate::error::report_error(&member.display, e);
-        }
-    }
 }
 
 #[cfg(all(test, unix))]

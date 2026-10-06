@@ -267,7 +267,8 @@ fn apply_long(long: &[u8], st: &mut State, cur: &mut ArgCursor) -> PaxResult<()>
 
 /// Turn the accumulated state into the internal options pax runs on.
 fn finish(mut st: State) -> PaxResult<Args> {
-    let Some(mode) = st.mode else {
+    // -t alone lists the archive on standard input: it implies -i.
+    let Some(mode) = st.mode.or(st.list.then_some(Mode::CopyIn)) else {
         return Err(usage(PROG, "one of -o, -i or -p is required"));
     };
 
@@ -358,7 +359,7 @@ Operation:
   -o, --create               write an archive built from the names on stdin
   -i, --extract              read an archive and extract the members
   -p, --pass-through         copy the named files into a directory
-  -t, --list                 with -i, list the archive instead of extracting
+  -t, --list                 list the archive instead of extracting (implies -i)
 
 Options:
   -F, --file=ARCHIVE         use ARCHIVE instead of standard input or output

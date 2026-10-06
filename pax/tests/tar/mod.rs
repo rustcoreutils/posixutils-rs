@@ -9,11 +9,12 @@
 
 //! Integration tests for the `tar` compatibility front-end.
 
-use crate::common::{assert_failure, assert_success, have_tool, run_tar, stderr_str, stdout_str};
+use crate::common::{
+    assert_failure, assert_success, run_system_ok, run_tar, stderr_str, stdout_str, system_tool,
+};
 use plib::tmp::TempDir;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Build the tree every test archives: a file, a subdirectory with two files
 /// (one of which the exclusion tests target), and a symlink.
@@ -557,25 +558,12 @@ fn test_tar_help_and_version_exit_zero() {
 fn test_tar_cross_tool_system_tar_reads_ours() {
     let temp = TempDir::new().unwrap();
     let src = setup(temp.path());
-    if !have_tool("tar") {
-        eprintln!("skipping cross-tool test: no system tar");
-        return;
-    }
-
-    assert_success(&run_tar(&["-cf", "../out.tar", "."], &src), "tar -cf");
-    let out = Command::new("tar")
-        .args(["-tf", "out.tar"])
-        .current_dir(temp.path())
-        .output();
-    let Ok(out) = out else {
-        eprintln!("skipping cross-tool test: system tar would not run");
+    let Some(tar) = system_tool("tar") else {
         return;
     };
-    assert!(
-        out.status.success(),
-        "system tar could not read our archive: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+
+    assert_success(&run_tar(&["-cf", "../out.tar", "."], &src), "tar -cf");
+    let out = run_system_ok(&tar, &["-tf", "out.tar"], temp.path(), None);
     assert!(String::from_utf8_lossy(&out.stdout).contains("a.txt"));
 }
 
@@ -585,24 +573,32 @@ fn test_tar_cross_tool_we_read_system_tar() {
     let src = setup(temp.path());
     let dest = temp.path().join("dest");
     fs::create_dir(&dest).unwrap();
-    if !have_tool("tar") {
-        eprintln!("skipping cross-tool test: no system tar");
-        return;
-    }
-
-    let made = Command::new("tar")
-        .args(["-cf", "../sys.tar", "."])
-        .current_dir(&src)
-        .output();
-    let Ok(made) = made else {
-        eprintln!("skipping cross-tool test: system tar would not run");
+    let Some(tar) = system_tool("tar") else {
         return;
     };
-    if !made.status.success() {
-        eprintln!("skipping cross-tool test: system tar failed to create");
-        return;
-    }
+
+    run_system_ok(&tar, &["-cf", "../sys.tar", "."], &src, None);
 
     assert_success(&run_tar(&["-xf", "../sys.tar"], &dest), "tar -xf sys.tar");
     assert_eq!(fs::read_to_string(dest.join("a.txt")).unwrap(), "alpha\n");
+}
+
+/// An empty -T list names no files: tar must archive nothing, not fall back to
+/// reading names from standard input.
+#[test]
+fn test_tar_empty_name_list_archives_nothing() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f"), "F\n").unwrap();
+    fs::write(temp.path().join("empty.list"), "").unwrap();
+
+    let out = crate::common::run_front_end(
+        "tar",
+        &["-cf", "x.tar", "-T", "empty.list"],
+        temp.path(),
+        Some(b"f\n"),
+    );
+    assert_success(&out, "tar -T empty.list");
+    let out = run_tar(&["-tf", "x.tar"], temp.path());
+    assert_success(&out, "tar -t");
+    assert_eq!(stdout_str(&out), "");
 }

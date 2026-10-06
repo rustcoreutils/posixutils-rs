@@ -8,7 +8,7 @@
 //
 
 //! Compression integration tests for pax
-use crate::common::{run_pax, run_pax_in_dir, stdout_str};
+use crate::common::{run_pax, run_pax_in_dir, run_system_ok, stdout_str, system_tool};
 
 use plib::tmp::TempDir;
 use std::fs::{self, File};
@@ -281,22 +281,15 @@ fn test_gzip_system_gunzip_compat() {
         .unwrap();
     assert_success(&output, "pax write gzip");
 
-    // Try to list with system tar (if available)
-    let output = Command::new("tar").args(["-tzf"]).arg(&archive).output();
-
-    if let Ok(output) = output {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("compat.txt"),
-                "System tar should read pax gzip archive"
-            );
-        } else {
-            eprintln!("System tar -tzf failed, skipping compatibility check");
-        }
-    } else {
-        eprintln!("System tar not available, skipping compatibility check");
-    }
+    // List with system tar
+    let Some(tar) = system_tool("tar") else {
+        return;
+    };
+    let output = run_system_ok(&tar, &["-tzf", archive.to_str().unwrap()], &src_dir, None);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("compat.txt"),
+        "System tar should read pax gzip archive"
+    );
 }
 
 #[test]
@@ -314,18 +307,16 @@ fn test_gzip_read_system_tar_output() {
         .write_all(b"Created by system tar")
         .unwrap();
 
-    // Create gzip archive with system tar (if available)
-    let output = Command::new("tar")
-        .args(["-czf"])
-        .arg(&archive)
-        .arg(".")
-        .current_dir(&src_dir)
-        .output();
-
-    if output.is_err() || !output.as_ref().unwrap().status.success() {
-        eprintln!("System tar not available or failed, skipping test");
+    // Create gzip archive with system tar
+    let Some(tar) = system_tool("tar") else {
         return;
-    }
+    };
+    run_system_ok(
+        &tar,
+        &["-czf", archive.to_str().unwrap(), "."],
+        &src_dir,
+        None,
+    );
 
     // List with pax (should auto-detect gzip)
     let output = Command::new(pax_binary())

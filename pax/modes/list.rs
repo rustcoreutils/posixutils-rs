@@ -10,7 +10,7 @@
 //! List mode implementation - list archive contents
 
 use crate::archive::{ArchiveEntry, ArchiveReader, EntryType, LinkSets};
-use crate::error::PaxResult;
+use crate::error::{PaxError, PaxResult};
 use crate::modes::select::Selector;
 use crate::options::{
     format_list_entry, format_mode_symbolic, format_time_traditional, FormatOptions, ListEntryInfo,
@@ -77,9 +77,10 @@ pub fn list_archive<R: ArchiveReader, W: Write>(
                 options.strip_components,
             ) {
                 let linked_to = link_set_target(&mut link_sets, &entry);
-                if let Err(e) = print_entry(writer, &entry, linked_to.as_deref(), options) {
-                    crate::error::report_error(&entry.path, e);
-                }
+                // A failure to write the listing is not about this member and
+                // recurs for every one after it, so it ends the run.
+                print_entry(writer, &entry, linked_to.as_deref(), options)
+                    .map_err(listing_error)?;
             }
         }
         archive.skip_data()?;
@@ -90,6 +91,14 @@ pub fn list_archive<R: ArchiveReader, W: Write>(
 
     selector.report_unmatched();
     Ok(())
+}
+
+/// A failure to write the listing, which ends the run.
+pub(crate) fn listing_error(e: std::io::Error) -> PaxError {
+    PaxError::Io(std::io::Error::new(
+        e.kind(),
+        format!("writing the listing: {e}"),
+    ))
 }
 
 /// The name a later name of a cpio link set is linked to on extraction: the
@@ -112,7 +121,7 @@ fn print_entry<W: Write>(
     entry: &ArchiveEntry,
     linked_to: Option<&Path>,
     options: &ListOptions,
-) -> PaxResult<()> {
+) -> std::io::Result<()> {
     // Check for custom list format (listopt)
     if let Some(ref format) = options.format_options.list_format {
         let info = ListEntryInfo {
@@ -142,7 +151,7 @@ fn print_verbose<W: Write>(
     writer: &mut W,
     entry: &ArchiveEntry,
     linked_to: Option<&Path>,
-) -> PaxResult<()> {
+) -> std::io::Result<()> {
     let mode_str = format_mode_symbolic(entry.mode, entry.entry_type);
     let nlink = entry.nlink;
     let owner = format_owner(entry);
@@ -170,7 +179,9 @@ fn print_verbose<W: Write>(
 /// A name is bytes, and this column is padded to a width, so it is rendered as
 /// display text rather than written through. A name that is not UTF-8 -- which
 /// `hdrcharset=BINARY` permits -- would otherwise mis-align every following
-/// column. `-o listopt=%(uname)s` is the lossless way to read one.
+/// column. `-o listopt=%(uname)s` is the lossless way to read one. It comes
+/// from the archive like the pathname, so it is escaped like one; escaping
+/// keeps one unit per unit, so the column width is unchanged.
 fn format_owner(entry: &ArchiveEntry) -> String {
     display_name(entry.uname.as_deref(), entry.uid)
 }
@@ -182,7 +193,11 @@ fn format_group(entry: &ArchiveEntry) -> String {
 
 fn display_name(name: Option<&[u8]>, id: u32) -> String {
     match name {
-        Some(name) => String::from_utf8_lossy(name).into_owned(),
+        Some(name) => {
+            let mut shown = Vec::with_capacity(name.len());
+            crate::escape::push_escaped(&mut shown, name, crate::escape::stdout_style());
+            String::from_utf8_lossy(&shown).into_owned()
+        }
         None => id.to_string(),
     }
 }
@@ -196,7 +211,7 @@ fn write_link_suffix<W: Write>(
     writer: &mut W,
     entry: &ArchiveEntry,
     linked_to: Option<&Path>,
-) -> PaxResult<()> {
+) -> std::io::Result<()> {
     let (marker, target) = match (&entry.entry_type, &entry.link_target, linked_to) {
         (EntryType::Symlink, Some(target), _) => (b" -> ".as_slice(), target.as_path()),
         (EntryType::Hardlink, Some(target), _) => (b" == ".as_slice(), target.as_path()),

@@ -185,8 +185,7 @@ impl<W: Write> ArchiveWriter for UstarWriter<W> {
         self.writer.write_all(&header)?;
         self.bytes_written = 0;
         self.current_size = entry.size;
-        // Per POSIX, symlinks and hardlinks have no data blocks in ustar format
-        self.skip_data = matches!(entry.entry_type, EntryType::Symlink | EntryType::Hardlink);
+        self.skip_data = !stores_data(entry.entry_type);
         Ok(())
     }
 
@@ -745,8 +744,16 @@ pub(crate) fn calculate_checksum(header: &[u8; BLOCK_SIZE]) -> u32 {
 // Header building functions
 // ============================================================================
 
+/// Whether a member of this type is followed by data blocks. Per POSIX,
+/// symlinks and hardlinks have none in ustar format, whatever size the entry
+/// carries -- write mode sets a symlink's to its target length for cpio, where
+/// the target *is* the data.
+pub(crate) fn stores_data(entry_type: EntryType) -> bool {
+    !matches!(entry_type, EntryType::Symlink | EntryType::Hardlink)
+}
+
 /// Build a header block from an ArchiveEntry
-fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
+pub(crate) fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     let mut header = [0u8; BLOCK_SIZE];
 
     // Split path into name and prefix if needed
@@ -757,10 +764,10 @@ fn build_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
     write_octal(&mut header[MODE_OFF..], entry.mode as u64, 8)?;
     write_octal(&mut header[UID_OFF..], entry.uid as u64, 8)?;
     write_octal(&mut header[GID_OFF..], entry.gid as u64, 8)?;
-    // Per POSIX, symlinks and hardlinks must have size=0 (no data blocks)
-    let header_size = match entry.entry_type {
-        EntryType::Symlink | EntryType::Hardlink => 0,
-        _ => entry.size,
+    let header_size = if stores_data(entry.entry_type) {
+        entry.size
+    } else {
+        0
     };
     write_octal(&mut header[SIZE_OFF..], header_size, 12)?;
     write_octal(&mut header[MTIME_OFF..], entry.unsigned_mtime()?, 12)?;

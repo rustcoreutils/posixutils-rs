@@ -32,6 +32,10 @@ pub enum PaxError {
     PatternError(String),
     /// Malformed command line: the message is already a complete diagnostic
     Usage(String),
+    /// End of file on `/dev/tty` while `-i` was waiting for a response.
+    /// POSIX: pax "shall immediately exit with a non-zero exit status", so it
+    /// ends the run wherever it arises.
+    TtyEof,
     /// Nothing left to do and nothing went wrong -- `--help` and `--version`
     /// have already written their output and want a success exit.
     EarlyExit,
@@ -53,6 +57,7 @@ impl fmt::Display for PaxError {
             PaxError::PathTooLong(path) => write!(f, "{}: {}", gettext("Path too long"), path),
             PaxError::PatternError(msg) => write!(f, "{}: {}", gettext("Pattern error"), msg),
             PaxError::Usage(msg) => write!(f, "{}", msg),
+            PaxError::TtyEof => write!(f, "{}", gettext("EOF on /dev/tty")),
             PaxError::EarlyExit => Ok(()),
         }
     }

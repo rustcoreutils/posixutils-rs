@@ -727,3 +727,46 @@ fn test_multi_volume_long_path_not_truncated() {
         "deep content\n"
     );
 }
+
+/// A symbolic link in a multi-volume archive carries no data: its header must
+/// say so and nothing may follow it. The writer stored the target's length as
+/// the size and the target itself as a data block, which no reader -- ours
+/// included -- reads back as the next member's header.
+#[test]
+fn test_multi_volume_symlink_round_trip() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("f"), "hi\n").unwrap();
+    std::os::unix::fs::symlink("f", src.join("l")).unwrap();
+    fs::write(src.join("g"), "after\n").unwrap();
+    let archive = temp.path().join("vol.tar");
+    let archive = archive.to_str().unwrap();
+
+    let out = run_pax_in_dir(
+        &[
+            "-w",
+            "-M",
+            "--tape-length",
+            "1000000",
+            "-f",
+            archive,
+            "f",
+            "l",
+            "g",
+        ],
+        &src,
+    );
+    assert_success(&out, "pax -w -M");
+
+    for reader in [&["-r", "-M", "-f", archive][..], &["-r", "-f", archive][..]] {
+        let dst = TempDir::new().unwrap();
+        let out = run_pax_in_dir(reader, dst.path());
+        assert_success(&out, &format!("pax {:?}", reader));
+        assert_eq!(
+            fs::read_link(dst.path().join("l")).unwrap(),
+            std::path::Path::new("f")
+        );
+        assert_eq!(fs::read_to_string(dst.path().join("g")).unwrap(), "after\n");
+    }
+}

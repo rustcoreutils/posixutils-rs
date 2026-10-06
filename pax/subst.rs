@@ -22,7 +22,7 @@
 //! This implementation uses plib::regex for POSIX BRE support.
 
 use crate::error::{PaxError, PaxResult};
-use plib::regex::{Match, Regex, RegexFlags, MAX_CAPTURES};
+use plib::regex::{Match, Regex, RegexFlags};
 use std::path::{Path, PathBuf};
 
 /// A compiled substitution expression from -s option
@@ -30,13 +30,35 @@ use std::path::{Path, PathBuf};
 pub struct Substitution {
     /// Compiled POSIX regex
     regex: Regex,
-    /// Replacement template string (with & and \n references)
-    replacement: String,
+    /// The replacement, already split into literal text and references
+    replacement: Vec<ReplPart>,
     /// Replace all occurrences (g flag)
     global: bool,
     /// Print successful substitutions to stderr (p flag)
     print: bool,
 }
+
+/// One piece of a parsed replacement string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReplPart {
+    /// Text copied as it is
+    Literal(Vec<u8>),
+    /// The text matched by subexpression `n`; 0 is the whole match (`&`)
+    Group(usize),
+}
+
+/// One character of a delimited part of the expression, and whether a
+/// backslash escaped it. What an escape means differs between the pattern and
+/// the replacement, so it is decided only once the part is known.
+#[derive(Clone, Copy)]
+enum Piece {
+    Plain(char),
+    Escaped(char),
+}
+
+/// Characters a BRE gives a meaning of their own, and which therefore keep
+/// their backslash when an escaped delimiter is one of them.
+const BRE_SPECIAL: &str = ".[\\*^$";
 
 /// Result of applying substitutions to a path
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,11 +105,10 @@ impl Substitution {
 
         let rest: String = chars.collect();
 
-        // Parse the old pattern (up to next unescaped delimiter)
-        let (old_pattern, after_old) = parse_delimited(&rest, delimiter)?;
-
-        // Parse the new pattern (up to next unescaped delimiter)
-        let (new_pattern, after_new) = parse_delimited(&after_old, delimiter)?;
+        // Each part runs to the next unescaped delimiter.
+        let (old_pieces, after_old) = parse_delimited(&rest, delimiter)?;
+        let (new_pieces, after_new) = parse_delimited(after_old, delimiter)?;
+        let old_pattern = bre_from(&old_pieces, delimiter);
 
         // Parse flags (remainder)
         let flags = after_new;
@@ -127,7 +148,7 @@ impl Substitution {
 
         Ok(Substitution {
             regex,
-            replacement: new_pattern,
+            replacement: replacement_from(&new_pieces, delimiter),
             global,
             print,
         })
@@ -209,87 +230,94 @@ fn next_scan_pos(
     Some(resume + plib::locale::mb_char_slices(&rest[..rest.len().min(16)])[0].len())
 }
 
-/// Build the replacement string from template and match groups
-fn build_replacement(template: &str, input: &[u8], matches: &[Match]) -> Vec<u8> {
-    // Pre-allocate with a reasonable estimate (template length + some extra for expansions)
-    let mut result = Vec::with_capacity(template.len() + 32);
-    // Byte by byte: every special character is ASCII, and no byte of a
-    // multibyte UTF-8 character is.
-    let mut bytes = template.bytes().peekable();
-
-    while let Some(c) = bytes.next() {
-        if c == b'&' {
-            // & is replaced by entire match
-            if !matches.is_empty() && matches[0].end > matches[0].start {
-                result.extend_from_slice(&input[matches[0].start..matches[0].end]);
-            }
-        } else if c == b'\\' {
-            match bytes.peek() {
-                Some(&next @ b'1'..=b'9') => {
-                    // \1 through \9 - backreference
-                    let idx = (next - b'0') as usize;
-                    if idx < matches.len()
-                        && idx < MAX_CAPTURES
-                        && matches[idx].end > matches[idx].start
-                    {
-                        result.extend_from_slice(&input[matches[idx].start..matches[idx].end]);
-                    }
-                    bytes.next();
+/// Build the replacement text for one match.
+fn build_replacement(parts: &[ReplPart], input: &[u8], matches: &[Match]) -> Vec<u8> {
+    let mut result = Vec::new();
+    for part in parts {
+        match part {
+            ReplPart::Literal(text) => result.extend_from_slice(text),
+            ReplPart::Group(idx) => {
+                if let Some(m) = matches.get(*idx).filter(|m| m.end > m.start) {
+                    result.extend_from_slice(&input[m.start..m.end]);
                 }
-                // \\ -> literal backslash, \& -> literal &
-                Some(&next @ (b'\\' | b'&')) => {
-                    result.push(next);
-                    bytes.next();
-                }
-                // Keep other backslash sequences as-is
-                _ => result.push(c),
             }
-        } else {
-            result.push(c);
         }
     }
-
     result
 }
 
-/// Parse a delimited string, handling escaped delimiters
+/// Split off one delimited part of the expression: everything up to the next
+/// delimiter not preceded by a backslash, and what follows that delimiter.
 ///
-/// Returns (parsed_string, remaining_after_delimiter)
-fn parse_delimited(s: &str, delimiter: char) -> PaxResult<(String, String)> {
-    let mut result = String::new();
-    let mut chars = s.chars().peekable();
-    let mut found_delimiter = false;
-
-    while let Some(c) = chars.next() {
+/// A backslash always takes the character after it with it, so `\\` is one
+/// escaped backslash and cannot escape a delimiter that follows it.
+fn parse_delimited(s: &str, delimiter: char) -> PaxResult<(Vec<Piece>, &str)> {
+    let mut pieces = Vec::new();
+    let mut chars = s.char_indices();
+    while let Some((i, c)) = chars.next() {
         if c == '\\' {
-            // Check if next char is the delimiter (escaped)
-            if let Some(&next) = chars.peek() {
-                if next == delimiter {
-                    // Escaped delimiter - include literal delimiter
-                    result.push(delimiter);
-                    chars.next();
-                    continue;
-                }
+            if let Some((_, next)) = chars.next() {
+                pieces.push(Piece::Escaped(next));
+                continue;
             }
-            // Not an escaped delimiter - keep the backslash
-            result.push(c);
         } else if c == delimiter {
-            found_delimiter = true;
-            break;
-        } else {
-            result.push(c);
+            return Ok((pieces, &s[i + c.len_utf8()..]));
+        }
+        pieces.push(Piece::Plain(c));
+    }
+    Err(PaxError::PatternError(format!(
+        "missing delimiter '{}' in substitution",
+        delimiter
+    )))
+}
+
+/// The BRE for the `old` part. An escaped delimiter is "that literal
+/// character", as in ed and sed, so where the BRE would give it a meaning of
+/// its own it keeps a backslash; every other escape is the BRE's.
+fn bre_from(pieces: &[Piece], delimiter: char) -> String {
+    let mut bre = String::new();
+    for piece in pieces {
+        match *piece {
+            Piece::Plain(c) => bre.push(c),
+            Piece::Escaped(c) if c == delimiter && !BRE_SPECIAL.contains(c) => bre.push(c),
+            Piece::Escaped(c) => {
+                bre.push('\\');
+                bre.push(c);
+            }
         }
     }
+    bre
+}
 
-    if !found_delimiter {
-        return Err(PaxError::PatternError(format!(
-            "missing delimiter '{}' in substitution",
-            delimiter
-        )));
+/// The parsed `new` part, with ed's meanings: `&` and `\0` are the whole
+/// match, `\1`-`\9` a subexpression, and an escaped delimiter, `\\` or `\&`
+/// the character itself. ed leaves a backslash before any other character
+/// unspecified; it is dropped, as BSD pax and sed do.
+fn replacement_from(pieces: &[Piece], delimiter: char) -> Vec<ReplPart> {
+    let mut parts = Vec::new();
+    let mut literal = Vec::new();
+    for piece in pieces {
+        let group = match *piece {
+            Piece::Plain('&') => Some(0),
+            Piece::Escaped(c) if c != delimiter => c.to_digit(10).map(|d| d as usize),
+            _ => None,
+        };
+        match (group, *piece) {
+            (Some(n), _) => {
+                if !literal.is_empty() {
+                    parts.push(ReplPart::Literal(std::mem::take(&mut literal)));
+                }
+                parts.push(ReplPart::Group(n));
+            }
+            (None, Piece::Plain(c) | Piece::Escaped(c)) => {
+                literal.extend_from_slice(c.encode_utf8(&mut [0u8; 4]).as_bytes())
+            }
+        }
     }
-
-    let remaining: String = chars.collect();
-    Ok((result, remaining))
+    if !literal.is_empty() {
+        parts.push(ReplPart::Literal(literal));
+    }
+    parts
 }
 
 /// The name a member takes under the `-s` expressions, or `None` when it
@@ -609,5 +637,47 @@ mod tests {
             s.apply("foo".as_bytes()),
             SubstResult::Changed("&".as_bytes().to_vec())
         );
+    }
+
+    fn changed(expr: &str, name: &str) -> SubstResult {
+        Substitution::parse(expr).unwrap().apply(name.as_bytes())
+    }
+
+    fn to(name: &str) -> SubstResult {
+        SubstResult::Changed(name.as_bytes().to_vec())
+    }
+
+    /// `\\` is one escaped backslash, so the delimiter after it is not
+    /// escaped: `/a\\/X/` replaces `a\`. The pair was taken apart and the
+    /// second backslash escaped the delimiter, so the expression was refused.
+    #[test]
+    fn test_escaped_backslash_before_delimiter() {
+        assert_eq!(changed(r"/a\\/X/", r"a\"), to("X"));
+    }
+
+    /// An escaped delimiter is "that literal character" (as in ed and sed),
+    /// even where the character is special in a BRE: `.a\.b.X.` matches a
+    /// dot, not any character.
+    #[test]
+    fn test_escaped_delimiter_is_literal_in_the_pattern() {
+        assert_eq!(changed(r".a\.b.X.", "a.b"), to("X"));
+        assert_eq!(changed(r".a\.b.X.", "axb"), SubstResult::Unchanged);
+    }
+
+    /// The same in the replacement: with `&` as the delimiter, `\&` is a
+    /// literal ampersand, not the matched text.
+    #[test]
+    fn test_escaped_delimiter_is_literal_in_the_replacement() {
+        assert_eq!(changed(r"&a&\&&", "ab"), to("&b"));
+        // A digit delimiter escaped is the digit, not a back-reference.
+        assert_eq!(changed(r"1a\(b\)1\11", "ab"), to("1"));
+    }
+
+    /// Before any other character a backslash in the replacement is dropped,
+    /// as ed, sed and BSD pax do, and `\0` is the whole match like `&`.
+    #[test]
+    fn test_replacement_backslash_before_ordinary_character() {
+        assert_eq!(changed(r"/a/\x/", "ab"), to("xb"));
+        assert_eq!(changed(r"/a/<\0>/", "ab"), to("<a>b"));
     }
 }

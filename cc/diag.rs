@@ -14,6 +14,8 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::io::{self, Write};
 
+use crate::warn_options::{self, Verdict};
+
 // Source Position
 
 /// Source position tracking for tokens and diagnostics.
@@ -314,8 +316,15 @@ thread_local! {
     static WERROR: RefCell<Werror> = RefCell::new(Werror::default());
 
     /// Warnings made errors by [`WERROR`] in this translation unit, for
-    /// [`report_promoted_warnings`].
+    /// [`finish_unit`].
     static PROMOTED: Cell<u32> = const { Cell::new(0) };
+
+    /// The `-Wno-<name>` options naming no warning c17 knows, in
+    /// command-line order, for [`finish_unit`]'s notes.
+    static UNKNOWN_NEGATIONS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+
+    /// Diagnostics shown in this translation unit, for [`finish_unit`].
+    static SHOWN: Cell<u32> = const { Cell::new(0) };
 
     /// Where diagnostics go when not to stderr; see [`capture_diagnostics`].
     static CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
@@ -388,6 +397,13 @@ fn suppressed_groups<'a>(
 /// left on, [`Pedantic`] and [`Werror`]. The driver passes `-pedantic` as the
 /// name `pedantic` and `-pedantic-errors` as `pedantic-errors`.
 pub fn set_warning_options(names: &[&str]) {
+    UNKNOWN_NEGATIONS.replace(
+        names
+            .iter()
+            .filter(|name| warn_options::classify(name) == Verdict::UnknownNegation)
+            .map(|name| name.to_string())
+            .collect(),
+    );
     SUPPRESSED_GROUPS.replace(suppressed_groups(names.iter().copied()));
     PEDANTIC.set(Pedantic::from_warning_options(names.iter().copied()));
     WERROR.replace(Werror::from_warning_options(names.iter().copied()));
@@ -600,12 +616,24 @@ pub fn werror_all() -> bool {
     WERROR.with_borrow(|w| w.all)
 }
 
-/// gcc's closing line for a translation unit in which a warning was made an
-/// error, if one was: "all" under `-Werror`, "some" when only named groups
-/// were. Given once, and the next unit starts again -- which is why this,
-/// and not [`reset_counts`], clears the tally: a unit's failure path may
-/// reset the counts before its error is reported.
-pub fn report_promoted_warnings() {
+/// Close a translation unit's diagnostics as gcc does. If any were shown,
+/// each `-Wno-<name>` that named no known warning gets a note, last first,
+/// saying it may have been meant to silence one. Then, if a warning was
+/// made an error, the closing line: "all" under `-Werror`, "some" when only
+/// named groups were. Given once, and the next unit starts again -- which
+/// is why this, and not [`reset_counts`], clears the tallies: a unit's
+/// failure path may reset the counts before its error is reported.
+pub fn finish_unit() {
+    if SHOWN.replace(0) > 0 {
+        UNKNOWN_NEGATIONS.with_borrow(|names| {
+            for name in names.iter().rev() {
+                emit_line(format!(
+                    "c17: {}",
+                    warn_options::unknown_negation_note(name)
+                ));
+            }
+        });
+    }
     if PROMOTED.replace(0) == 0 {
         return;
     }
@@ -800,6 +828,8 @@ fn do_diag(level: DiagLevel, pos: Position, msg: &str) {
             }
         }
     }
+
+    SHOWN.set(SHOWN.get() + 1);
 
     // Format the message
     let (filename, line, col) = STREAMS.with(|s| s.borrow().effective_position(pos));

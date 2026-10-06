@@ -22,6 +22,7 @@ use crate::strings::StringTable;
 use crate::target::{self, Target};
 use crate::token::preprocess::SystemSearch;
 use crate::token::{preprocess_collecting, PreprocessConfig};
+use crate::warn_options::{self, Verdict};
 
 /// The stack a compile runs on, as the driver's own compiler thread: the
 /// front end recurses per nesting level, and the test harness's default
@@ -85,11 +86,17 @@ fn apply_flags(flags: &[&str]) -> Options {
     // `-pedantic` and `-pedantic-errors` are among them.
     let mut warning_options = Vec::new();
     for &flag in flags {
-        let w_name = match flag {
-            "-pedantic" | "-pedantic-errors" => Some(&flag[1..]),
-            _ => flag.strip_prefix("-W"),
-        };
-        if let Some(name) = w_name {
+        if let "-pedantic" | "-pedantic-errors" = flag {
+            warning_options.push(&flag[1..]);
+            continue;
+        }
+        if let Some(name) = flag.strip_prefix("-W") {
+            // The driver refuses a name gcc would; so does this.
+            if let Verdict::DriverError(_) | Verdict::CompilerError(_) =
+                warn_options::classify(name)
+            {
+                panic!("test_compile: unsupported option {flag}");
+            }
             warning_options.push(name);
             continue;
         }
@@ -221,7 +228,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
     };
     let result = pipeline::compile_tokens(preprocessed, &strings, &target, &opts, &mut Quiet);
 
-    diag::report_promoted_warnings();
+    diag::finish_unit();
     let mut diags = diag::take_captured_diagnostics();
     let asm = match result {
         Ok(asm) => asm,

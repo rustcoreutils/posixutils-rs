@@ -16,6 +16,7 @@
 mod gcc_flags;
 mod linker_input;
 mod prefix_map;
+mod warn_options;
 mod werror;
 
 use crate::common::{create_c_file, run_c17};

@@ -25,6 +25,7 @@ use posixutils_cc::symbol;
 use posixutils_cc::target;
 use posixutils_cc::token;
 use posixutils_cc::types;
+use posixutils_cc::warn_options::{self, Verdict};
 
 use clap::Parser;
 use gettextrs::{gettext, gettext_args};
@@ -1734,6 +1735,10 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     // The options accepted and ignored with a warning, which waits for the
     // parse: `-w` and `-Werror` decide what it is, wherever they stand.
     let mut ignored = Vec::new();
+    // The `-W<name>` options refused as gcc refuses them: by its driver,
+    // and -- only if the driver let everything through -- by its compiler.
+    let mut warning_errors = Vec::new();
+    let mut werror_errors = Vec::new();
 
     while i < raw_args.len() {
         let arg = &raw_args[i];
@@ -1766,7 +1771,13 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             }
             i += 1;
         } else if arg.starts_with("-W") && arg.len() > 2 && !arg.starts_with("-Wl,") {
-            // -Wall → -W all, -Wextra → -W extra, etc.
+            // -Wall → -W all, -Wextra → -W extra, etc. -- once the name is
+            // known to be one gcc would take.
+            match warn_options::classify(&arg[2..]) {
+                Verdict::DriverError(lines) => warning_errors.extend(lines),
+                Verdict::CompilerError(line) => werror_errors.push(line),
+                Verdict::Known(_) | Verdict::PassThrough | Verdict::UnknownNegation => {}
+            }
             result.push("-W".to_string());
             result.push(arg[2..].to_string());
             i += 1;
@@ -2132,6 +2143,20 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             result.push(arg.clone());
             i += 1;
         }
+    }
+
+    // A configure probe passes a `-W` option to learn whether the compiler
+    // takes it, so one c17 does not know fails the run as gcc's would.
+    let refused = if warning_errors.is_empty() {
+        werror_errors
+    } else {
+        warning_errors
+    };
+    if !refused.is_empty() {
+        for line in refused {
+            eprintln!("c17: {line}");
+        }
+        std::process::exit(1);
     }
 
     // Options gathered over the whole scan, placed ahead of any `--`, after
@@ -3024,7 +3049,7 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
             // the text, as gcc does.
             OperandKind::Asm if args.preprocess_only => {
                 let result = preprocess_asm_operand(&op.path, &args, &target, &mut pp_out);
-                diag::report_promoted_warnings();
+                diag::finish_unit();
                 match result {
                     Ok(()) => {}
                     Err(e) => {
@@ -3035,7 +3060,7 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
             }
             OperandKind::Asm => {
                 let result = assemble_operand(&op.path, &args, &target, scratch.path(), idx);
-                diag::report_promoted_warnings();
+                diag::finish_unit();
                 match result {
                     Ok(Some(obj)) => operand_objects[idx] = Some(obj),
                     Ok(None) => {}
@@ -3055,7 +3080,7 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
                     process_file(&op.path, &args, &target, &mut outputs, scratch.path(), idx);
                 // gcc's "warnings being treated as errors" closes the unit's
                 // own diagnostics, ahead of the driver's verdict on it.
-                diag::report_promoted_warnings();
+                diag::finish_unit();
                 match result {
                     Ok(Compiled::Nothing) => {}
                     Ok(Compiled::Object { path, temporary }) => {

@@ -1724,8 +1724,20 @@ impl<'a> Linearizer<'a> {
         // A convention that passes such a value by reference instead --
         // AAPCS64, Win64 -- hands over a pointer to the caller's copy,
         // which the pointer path below copies out of.
-        let arrived_by_value = !abi.indirect_param_is_reference()
-            && crate::arch::lir::memory_class_bytes(self.types, typ).is_some();
+        //
+        // AAPCS64's own by-value stack argument, gcc's floating vector of
+        // four bytes or fewer, arrives the same way: the caller copied its
+        // bytes into the argument area from the address the call names.
+        // Reading it as a value instead broke inlining, which puts that
+        // address in the `Arg`'s place: only this address-of turns into a
+        // copy of it there.
+        let stacked = matches!(
+            abi.classify_param(typ, self.types),
+            crate::abi::ArgClass::Stacked { .. }
+        );
+        let arrived_by_value = stacked
+            || !abi.indirect_param_is_reference()
+                && crate::arch::lir::memory_class_bytes(self.types, typ).is_some();
         if arrived_by_value {
             // Passed by value on the stack. `arg_pseudo` is an IncomingArg
             // naming the struct data; take its address, then copy each

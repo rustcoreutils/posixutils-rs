@@ -128,8 +128,9 @@ fn test_vector_masks_and_specifier_attributes() {
 
 /// A vector parameter is passed by value: it is no array, and C17
 /// 6.7.6.3p7's adjustment to a pointer does not reach it. A one-lane `float`
-/// vector on aarch64 is the one shape c17 cannot pass; x86-64 passes it in
-/// memory.
+/// vector passes on every target -- in memory on x86-64, on the stack on
+/// aarch64 -- and only a vector whose size is no register width, three
+/// `short` lanes, is the shape c17 cannot pass.
 #[test]
 fn test_vector_parameters_are_not_adjusted() {
     let src = format!(
@@ -139,11 +140,14 @@ fn test_vector_parameters_are_not_adjusted() {
     );
     parse_tu_for(&src, &x86_linux()).unwrap();
     let small = "typedef float v1sf __attribute__((vector_size(4))); v1sf h(v1sf a);";
-    parse_tu_for(small, &x86_linux()).unwrap();
-    let before = crate::diag::error_count();
-    let aarch64 = Target::new(Arch::Aarch64, Os::Linux);
-    let rejected = parse_tu_for(small, &aarch64).is_err() || crate::diag::error_count() > before;
-    assert!(rejected, "a vector of one float on aarch64");
+    let odd = "typedef short v3hi __attribute__((vector_size(6))); v3hi h(v3hi a);";
+    for target in [x86_linux(), Target::new(Arch::Aarch64, Os::Linux)] {
+        let before = crate::diag::error_count();
+        assert!(parse_tu_for(small, &target).is_ok());
+        assert_eq!(crate::diag::error_count(), before, "v1sf on {target:?}");
+        let rejected = parse_tu_for(odd, &target).is_err() || crate::diag::error_count() > before;
+        assert!(rejected, "a vector of three shorts on {target:?}");
+    }
 }
 
 #[test]

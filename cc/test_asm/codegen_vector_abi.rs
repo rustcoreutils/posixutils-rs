@@ -11,26 +11,84 @@
 // is `tests/codegen/vector_abi.rs`.
 //
 
-use super::asm_probe::{asm_for, body_of, AARCH64_DARWIN, AARCH64_LINUX};
-use crate::test_compile::compile;
+use super::asm_probe::{asm_for, body_of, AARCH64_DARWIN, AARCH64_LINUX, X86_64_LINUX};
 
-/// gcc's aarch64 passes a one-float vector on the stack along with the
-/// arguments after it, and returns it in a general register -- like no type
-/// c17 has. c17 refuses it there, and passes it in memory on System V as gcc
-/// does.
+/// A floating vector of four bytes or fewer on aarch64, by each platform
+/// compiler's rule, read off `aarch64-linux-gnu-gcc -O2 -S` and, for Darwin,
+/// clang's coercion of such a vector to `i32` lowered by
+/// `llc -mtriple=arm64-apple-macos`:
+///
+/// - gcc lays it on the stack and sends the general-register arguments after
+///   it there too (`after` reads `i` from the stack, `call` stores the `7`
+///   above the vector), leaves the V registers alone (`fp_after` reads `f`
+///   in S0), and returns it in W0.
+/// - clang passes it in a general register and returns it in V0: S0, or H0
+///   for the two-byte `v1hf`.
 #[test]
-fn vector_abi_small_float_vector_is_refused_on_aarch64() {
-    let src = "typedef float v1sf __attribute__((vector_size(4)));\nv1sf f(v1sf a) { return a; }\n";
-    let a64 = compile("vec_abi_v1sf", src, &["--target=aarch64-unknown-linux-gnu"]);
-    assert!(!a64.success, "aarch64 accepted it");
-    assert!(
-        a64.stderr
-            .contains("c17 does not pass or return this vector type on this target"),
-        "{}",
-        a64.stderr
-    );
-    let x86 = compile("vec_abi_v1sf", src, &["--target=x86_64-unknown-linux-gnu"]);
-    assert!(x86.success, "{}", x86.stderr);
+fn vector_abi_small_float_vectors_on_aarch64() {
+    let src = r#"
+typedef float v1sf __attribute__((vector_size(4)));
+typedef _Float16 v1hf __attribute__((vector_size(2)));
+long after(v1sf a, long i) { return i; }
+float fp_after(v1sf a, float f) { return f; }
+v1sf r1(float x) { v1sf r = {x}; return r; }
+v1hf r1h(_Float16 x) { v1hf r = {x}; return r; }
+long ext(v1sf, long);
+long call(float x) { v1sf a = {x}; return ext(a, 7); }
+"#;
+    for triple in [AARCH64_LINUX, AARCH64_DARWIN] {
+        let asm = asm_for("vec_small_float", triple, src);
+        let linux = triple == AARCH64_LINUX;
+        let after = body_of(&asm, "after");
+        assert_eq!(names(after, &["x1"]), !linux, "{triple} after:\n{after}");
+        assert_eq!(
+            after.contains("ldr x0, [x29"),
+            linux,
+            "{triple} after:\n{after}"
+        );
+        let fp_after = body_of(&asm, "fp_after");
+        assert!(!fp_after.contains("ldr"), "{triple} fp_after:\n{fp_after}");
+        for f in ["r1", "r1h"] {
+            let body = body_of(&asm, f);
+            assert_eq!(names(body, &["w0", "x0"]), linux, "{triple} {f}:\n{body}");
+        }
+        let call = body_of(&asm, "call");
+        let before_call = call.split_once("bl ").map_or(call, |(head, _)| head);
+        assert_eq!(
+            names(before_call, &["x1", "w1"]),
+            !linux,
+            "{triple} call:\n{call}"
+        );
+        assert_eq!(
+            before_call.contains("[sp, #8]"),
+            linux,
+            "{triple} call:\n{call}"
+        );
+    }
+}
+
+/// gcc's System V passes and returns `v2hf` in XMM0, as the SSE class of its
+/// one eightbyte, and the general registers stay free for what follows.
+#[test]
+fn vector_abi_v2hf_travels_in_xmm0_on_x86_64() {
+    let src = r#"
+typedef _Float16 v2hf __attribute__((vector_size(4)));
+v2hf swap(v2hf a, int k) { v2hf r = {a[1], a[0]}; return r; }
+v2hf ext(v2hf, int);
+int call(v2hf a) { return ext(a, 3)[1] > 0; }
+"#;
+    let asm = asm_for("vec_v2hf", X86_64_LINUX, src);
+    let swap = body_of(&asm, "swap");
+    assert!(names(swap, &["xmm0"]), "swap:\n{swap}");
+    let call = body_of(&asm, "call");
+    let before_call = call.split_once("call ").map_or(call, |(head, _)| head);
+    assert!(before_call.contains("$3, %edi"), "call:\n{call}");
+}
+
+/// Whether `asm` names any of the registers `regs`.
+fn names(asm: &str, regs: &[&str]) -> bool {
+    asm.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|t| regs.contains(&t))
 }
 
 /// clang -- Darwin's compiler -- returns an integer vector of four bytes or

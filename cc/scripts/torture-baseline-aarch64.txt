@@ -7393,6 +7393,8 @@ aarch64/ieee/fp-cmp-8@-O0
 aarch64/ieee/fp-cmp-8@-O2
 aarch64/ieee/fp-cmp-9@-O0
 aarch64/ieee/fp-cmp-9@-O2
+aarch64/ieee/fp-cmp-cond-1@-O0
+aarch64/ieee/fp-cmp-cond-1@-O2
 aarch64/ieee/hugeval@-O0
 aarch64/ieee/hugeval@-O2
 aarch64/ieee/inf-1@-O0

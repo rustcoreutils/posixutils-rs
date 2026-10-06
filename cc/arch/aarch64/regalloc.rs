@@ -931,6 +931,12 @@ pub fn param_layout(
                 }
             }
             ArgClass::Ignore => ParamPlace::Absent,
+            // gcc's floating vector of four bytes or fewer: on the stack
+            // whatever is left, and NGRN becomes 8 behind it.
+            ArgClass::Stacked { .. } => {
+                ngrn = REGS;
+                stack(&mut next, false)
+            }
             // Integer, pointer and everything else -- including a composite
             // over sixteen bytes, which travels as a pointer to a copy (stage
             // C.4) -- takes one X register or one eight-byte slot.

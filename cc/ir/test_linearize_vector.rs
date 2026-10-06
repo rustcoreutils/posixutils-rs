@@ -261,3 +261,34 @@ fn test_native_shuffles_and_conversions() {
     assert_eq!(count(unsigned, &x86), 0);
     assert!(ops_of(unsigned, "f", &a64).contains(&Opcode::Simd(SimdOp::CvtUF)));
 }
+
+/// gcc's AAPCS64 lays a floating vector of four bytes or fewer on the stack,
+/// so its parameter arrives as bytes in the incoming argument area, not as a
+/// value: the callee takes the `Arg`'s address and copies out of it, as a
+/// System V MEMORY-class argument is read. The caller hands the vector's
+/// address, so an inlined body -- which substitutes that address for the
+/// `Arg` -- reads the vector through it instead of storing the address as
+/// its bits.
+#[test]
+fn test_stacked_small_float_vector_param_arrives_by_value() {
+    use crate::ir::PseudoKind;
+    use crate::target::{Arch, Os};
+    let src = "typedef float v1sf __attribute__((vector_size(4)));\n\
+               float f(v1sf a, long i) { return a[0] + i; }\n";
+    let (module, types) = super::test_linearize::linearize_source_with_types(
+        src,
+        &Target::new(Arch::Aarch64, Os::Linux),
+    );
+    let func = module.functions.iter().find(|f| f.name == "f").unwrap();
+    assert!(types.is_vector_stack_carrier(func.params[0].1));
+    let arg_addressed = insns_of(&module, "f").into_iter().any(|i| {
+        i.op == Opcode::SymAddr
+            && i.src.first().is_some_and(|&s| {
+                matches!(
+                    func.get_pseudo(s).map(|p| &p.kind),
+                    Some(PseudoKind::Arg(0))
+                )
+            })
+    });
+    assert!(arg_addressed, "the vector parameter is not read in place");
+}

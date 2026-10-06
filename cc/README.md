@@ -132,8 +132,6 @@ Not yet implemented:
   stops at SSE4.2, and `-march=x86-64-v3` claims no more than v2. The SSE
   through SSE4.2 headers and a core `<arm_neon.h>` are bundled, written in C
   over `vector_size` values
-- a `vector_size` value of floating lanes four bytes wide or less at a call
-  boundary, which gcc passes like no type c17 has
 
 Will not implement:
 - `__auto_type`; nested functions and `__label__`. Clang refuses nested

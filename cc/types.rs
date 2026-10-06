@@ -1130,6 +1130,11 @@ pub struct TypeTable {
     /// what System V passes such a vector as. See
     /// [`Self::vector_wrapper_carrier`].
     vector_wrapper_carriers: std::collections::HashMap<(TypeId, u32), TypeId>,
+    /// For each (size, alignment) of a floating vector of four bytes or
+    /// fewer, a struct of that size and alignment holding nothing but
+    /// bytes: what gcc's AAPCS64 passes such a vector as. See
+    /// [`Self::vector_stack_carrier`].
+    vector_stack_carriers: std::collections::HashMap<(usize, u32), TypeId>,
     /// For each integer vector of several lanes and four bytes or fewer, the
     /// vector of as many lanes widened to fill eight bytes: what clang
     /// returns it as on Darwin, by lane count. See [`Self::vector_widened`].
@@ -1211,6 +1216,7 @@ impl TypeTable {
             complex_of: std::collections::HashMap::new(),
             vector_memory_carriers: std::collections::HashMap::new(),
             vector_wrapper_carriers: std::collections::HashMap::new(),
+            vector_stack_carriers: std::collections::HashMap::new(),
             vector_widened: std::collections::HashMap::new(),
             complex_float_id: TypeId::INVALID,
             complex_double_id: TypeId::INVALID,
@@ -2048,6 +2054,9 @@ impl TypeTable {
         if count == 1 && self.is_float(elem) {
             self.intern_vector_wrapper_carrier(vector, elem, align);
         }
+        if bytes <= 4 && self.is_float(elem) {
+            self.intern_vector_stack_carrier(bytes, align);
+        }
         if count > 1
             && bytes <= 4
             && self.is_integer(elem)
@@ -2130,9 +2139,23 @@ impl TypeTable {
 
     /// Make the memory carrier for vectors of `bytes` and `align`, once.
     fn intern_vector_memory_carrier(&mut self, bytes: usize, align: u32) {
-        if self.vector_memory_carriers.contains_key(&(bytes, align)) {
-            return;
+        if !self.vector_memory_carriers.contains_key(&(bytes, align)) {
+            let id = self.intern_byte_struct(bytes, align);
+            self.vector_memory_carriers.insert((bytes, align), id);
         }
+    }
+
+    /// Make the stack carrier for floating vectors of `bytes` and `align`,
+    /// once.
+    fn intern_vector_stack_carrier(&mut self, bytes: usize, align: u32) {
+        if !self.vector_stack_carriers.contains_key(&(bytes, align)) {
+            let id = self.intern_byte_struct(bytes, align);
+            self.vector_stack_carriers.insert((bytes, align), id);
+        }
+    }
+
+    /// A fresh struct of `bytes` and `align` holding nothing but bytes.
+    fn intern_byte_struct(&mut self, bytes: usize, align: u32) -> TypeId {
         let array = self.intern(Type::array(self.uchar_id, bytes));
         let member = StructMember {
             name: StringId::EMPTY,
@@ -2155,12 +2178,38 @@ impl TypeTable {
             anon_id: None,
             tag_type: None,
         };
-        let id = self.intern(Type {
+        self.intern(Type {
             kind: TypeKind::Struct,
             composite: Some(Box::new(composite)),
             ..Default::default()
-        });
-        self.vector_memory_carriers.insert((bytes, align), id);
+        })
+    }
+
+    /// The struct a floating vector of type `vec`, four bytes or fewer, is
+    /// passed as under gcc's AAPCS64: on the stack whatever registers are
+    /// left, with every later general-register argument after it
+    /// ([`crate::abi::ArgClass::Stacked`]) -- like no C type, so the
+    /// carrier is a type of its own, recognised by identity
+    /// ([`Self::is_vector_stack_carrier`]). A struct the program declares
+    /// holding such a vector is an ordinary composite.
+    pub fn vector_stack_carrier(&self, vec: TypeId) -> Option<TypeId> {
+        let align = self.get(vec).explicit_align?;
+        self.vector_stack_carriers
+            .get(&(self.size_bytes(vec), align))
+            .copied()
+    }
+
+    /// Whether `id` is a carrier of [`Self::vector_stack_carrier`].
+    pub fn is_vector_stack_carrier(&self, id: TypeId) -> bool {
+        self.vector_stack_carriers.values().any(|&c| c == id)
+    }
+
+    /// Whether `vec` is a floating vector of four bytes or fewer: the one
+    /// shape no machine register width describes, so each convention has a
+    /// rule of its own for it.
+    pub fn is_small_float_vector(&self, vec: TypeId) -> bool {
+        self.vector_lanes(vec)
+            .is_some_and(|(lane, _)| self.is_float(lane) && self.size_bytes(vec) <= 4)
     }
 
     /// The struct a vector of type `vec`, over sixteen bytes, is passed and

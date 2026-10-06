@@ -266,6 +266,9 @@ impl X86_64CodeGen {
                     temp_int_idx += gp_needed;
                     temp_fp_idx += fp_needed;
                 }
+                ArgClass::Stacked { .. } => {
+                    unreachable!("AAPCS64's class: no x86-64 convention answers it");
+                }
                 ArgClass::Indirect { size_bytes, .. } => {
                     // Large struct parameters (> 16 bytes): passed by value on the stack
                     // per SysV AMD64 ABI MEMORY class. Always a stack arg — never in
@@ -1102,6 +1105,9 @@ impl X86_64CodeGen {
             }
             ArgClass::Indirect { .. } => {
                 // sret: return value already written to memory, nothing to do
+            }
+            ArgClass::Stacked { .. } => {
+                unreachable!("AAPCS64's argument-only class, never a return");
             }
             ArgClass::Hfa { count, base } => {
                 // HFA returns (primarily AArch64, but handle for completeness)

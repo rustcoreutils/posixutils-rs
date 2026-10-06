@@ -515,23 +515,55 @@ impl Abi for Aapcs64Abi {
         true
     }
 
+    /// gcc's convention ([`super::native_vector_carrier`]), and for a
+    /// floating vector of four bytes or fewer -- `v1sf`, `v2hf`, `v1hf` --
+    /// the compiler's own:
+    ///
+    /// - gcc gives one neither register class: it lays it on the stack in an
+    ///   eight-byte slot and sends every later general-register argument
+    ///   there too, leaving the V registers alone. Its carrier is a type of
+    ///   its own, classed [`ArgClass::Stacked`].
+    /// - clang on Darwin coerces one to `i32` -- a general register, or four
+    ///   bytes of the stack once those run out -- whatever its size, so the
+    ///   two-byte `v1hf` travels as an `unsigned int` too.
     fn vector_carrier(&self, vec: TypeId, types: &TypeTable) -> Option<TypeId> {
-        super::native_vector_carrier(vec, types)
+        if !types.is_small_float_vector(vec) {
+            return super::native_vector_carrier(vec, types);
+        }
+        if self.darwin {
+            Some(types.uint_id)
+        } else {
+            types.vector_stack_carrier(vec)
+        }
     }
 
-    /// clang on Darwin passes an integer vector of four bytes or fewer in a
-    /// general register, as gcc does, but returns it in V0: a single lane in
-    /// its low bits -- as a `float` carrying those bits travels -- and
-    /// several widened to fill D0 ([`Self::vector_return_widened`]).
+    /// A vector of four bytes or fewer is returned other than it is passed.
+    ///
+    /// gcc returns a floating one in a general register, as the unsigned
+    /// integer of its size is -- W0, zero-extended at two bytes.
+    ///
+    /// clang on Darwin returns any one in V0: a single lane in its low bits
+    /// -- as a `float` carrying those bits travels, or a `_Float16` for the
+    /// two-byte `v1hf`, which LLVM returns in H0 -- and integer lanes, when
+    /// there are several, widened to fill D0
+    /// ([`Self::vector_return_widened`]). Floating lanes are not widened:
+    /// LLVM legalizes `<2 x half>` by adding lanes, so `v2hf` is the low
+    /// four bytes of D0, as a `float` carrying them is.
     fn vector_return_carrier(&self, vec: TypeId, types: &TypeTable) -> Option<TypeId> {
         if let Some(widened) = self.vector_return_widened(vec, types) {
             return self.vector_carrier(widened, types);
         }
-        let small_integer = types
-            .vector_lanes(vec)
-            .is_some_and(|(lane, _)| types.is_integer(lane) && types.size_bytes(vec) <= 4);
-        if self.darwin && small_integer {
-            return Some(types.float_id);
+        let bytes = types.size_bytes(vec);
+        let small = types.vector_lanes(vec).is_some() && bytes <= 4;
+        if self.darwin && small {
+            return Some(if types.is_small_float_vector(vec) && bytes == 2 {
+                types.float16_id
+            } else {
+                types.float_id
+            });
+        }
+        if types.is_small_float_vector(vec) {
+            return types.unsigned_of_size(bytes);
         }
         self.vector_carrier(vec, types)
     }
@@ -548,6 +580,11 @@ impl Abi for Aapcs64Abi {
             return match self.vector_carrier(ty, types) {
                 Some(carrier) => self.classify_param(carrier, types),
                 None => super::uncarried_vector_class(ty, types),
+            };
+        }
+        if types.is_vector_stack_carrier(ty) {
+            return ArgClass::Stacked {
+                size_bytes: types.size_bytes(ty),
             };
         }
         let kind = types.kind(ty);

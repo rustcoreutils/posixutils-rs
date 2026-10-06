@@ -373,9 +373,9 @@ impl Parser<'_> {
 
     /// Refuse a `vector_size` value as a function's argument, parameter or
     /// return value when the target's convention has no type that travels as
-    /// gcc passes it (`Abi::vector_carrier`): a one-lane `float` vector on
-    /// aarch64, which gcc passes on the stack with the arguments after it and
-    /// returns in a general register. Every other vector goes as its carrier.
+    /// gcc passes it (`Abi::vector_carrier`): one whose size is no register
+    /// width, such as three `short` lanes. Every other vector goes as its
+    /// carrier.
     pub(super) fn check_not_vector_value(&self, typ: Option<TypeId>, pos: Position) -> bool {
         let Some(t) = typ.filter(|&t| self.types.is_vector(t)) else {
             return false;

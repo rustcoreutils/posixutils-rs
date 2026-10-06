@@ -75,8 +75,8 @@ struct sv4 gs4(struct sv4 x);
 struct sv5 gs5(struct sv5 x);
 /* One lane of `double`, `long long` or `float`: gcc passes these in memory on
    System V, and a struct holding one small enough to fit a register is
-   memory class there too. The aarch64 one-float vector is a gcc quirk c17
-   does not reproduce, so it is x86-64 only. */
+   memory class there too. The one-float vector is x86-64 only here; every
+   target's rule for it is `SMALL_DECLS`'s. */
 typedef double v1df __attribute__((vector_size(8)));
 typedef long long v1di __attribute__((vector_size(8)));
 struct s1df { v1df a; int i; };
@@ -287,6 +287,243 @@ fn vector_abi_interop_aarch64() {
         &format!("{DECLS}{CALLEE}"),
         &format!("{DECLS}{CALLER}int main(void) {{ return run_vectors(); }}\n"),
     );
+}
+
+/// Floating vectors of four bytes or fewer -- `v1sf`, `v2hf`, `v1hf` -- which
+/// no machine register width describes, so each compiler has its own rule:
+///
+/// - gcc on aarch64 lays each one on the stack, in an eight-byte slot, and
+///   sends every later general-register argument there too (NGRN becomes
+///   8) while the V registers stay available; it returns one in W0.
+/// - clang on Darwin passes one in a general register and returns it in V0.
+/// - gcc on System V passes a one-lane one in memory and `v2hf` in XMM0.
+///
+/// Clang on x86-64 differs from gcc, so Apple x86-64 sits this out
+/// (`GCC_VECTORS`); on Apple arm64 the other half is clang, which is the
+/// point.
+const SMALL_DECLS: &str = r#"
+#if !defined(__APPLE__) || defined(C17_ALONE) || defined(__aarch64__)
+#define SMALL_FLOAT_VECTORS 1
+#endif
+#ifdef SMALL_FLOAT_VECTORS
+typedef float v1sf __attribute__((vector_size(4)));
+typedef _Float16 v2hf __attribute__((vector_size(4)));
+typedef _Float16 v1hf __attribute__((vector_size(2)));
+v1sf sf_ret(float x);
+v2hf hf2_ret(_Float16 x, _Float16 y);
+v1hf hf1_ret(_Float16 x);
+float sf_arg(v1sf a);
+float hf2_arg(v2hf a);
+float hf1_arg(v1hf a);
+double sf_mix(int i, v1sf a, float f, long l, v1sf b, double d, int j);
+double hf_mix(v2hf a, int i, v1hf b, float f, long l);
+double sf_full(long a, long b, long c, long d, long e, long f, long g, long h,
+               v1sf v, long k, float z);
+double sf_many(v1sf a0, v1sf a1, v1sf a2, v1sf a3, v1sf a4, v1sf a5,
+               v1sf a6, v1sf a7, v1sf a8, v1sf a9, int k, float z);
+double hf_many(v2hf a0, v1hf a1, v2hf a2, v1hf a3, v2hf a4, v1hf a5,
+               v2hf a6, v1hf a7, v2hf a8, v1hf a9, double d, long l);
+v1sf sf_chain(v1sf a, int k, v1sf b);
+v2hf hf2_chain(v2hf a, int k);
+v1hf hf1_chain(int k, v1hf a);
+/* A struct holding one is an ordinary composite on aarch64, and classed by
+   the vector's own SSE eightbyte on System V. */
+struct sa { v1sf a; float f; };
+struct sb { v2hf a; int i; };
+struct sc { v1hf a, b; };
+struct sa gsa(struct sa x, int k);
+struct sb gsb(struct sb x);
+struct sc gsc(struct sc x);
+#endif
+"#;
+
+const SMALL_CALLEE: &str = r#"
+#ifdef SMALL_FLOAT_VECTORS
+v1sf sf_ret(float x) { v1sf r = {x * 2}; return r; }
+v2hf hf2_ret(_Float16 x, _Float16 y) { v2hf r = {x + 1, y * 2}; return r; }
+v1hf hf1_ret(_Float16 x) { v1hf r = {x - 1}; return r; }
+float sf_arg(v1sf a) { return a[0] + 1; }
+float hf2_arg(v2hf a) { return (float)a[0] * 10 + (float)a[1]; }
+float hf1_arg(v1hf a) { return (float)a[0] * 3; }
+double sf_mix(int i, v1sf a, float f, long l, v1sf b, double d, int j)
+{ return i + a[0] * 10 + f * 100 + l * 1000 + b[0] * 10000 + d * 100000 + j * 1000000.0; }
+double hf_mix(v2hf a, int i, v1hf b, float f, long l)
+{ return (double)a[0] + a[1] * 10 + i * 100 + b[0] * 1000 + f * 10000 + l * 100000.0; }
+double sf_full(long a, long b, long c, long d, long e, long f, long g, long h,
+               v1sf v, long k, float z)
+{ return a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7 + h * 8 + v[0] * 100 + k * 1000 + z * 10000.0; }
+double sf_many(v1sf a0, v1sf a1, v1sf a2, v1sf a3, v1sf a4, v1sf a5,
+               v1sf a6, v1sf a7, v1sf a8, v1sf a9, int k, float z)
+{
+    return a0[0] + a1[0] * 2 + a2[0] * 3 + a3[0] * 4 + a4[0] * 5 + a5[0] * 6
+         + a6[0] * 7 + a7[0] * 8 + a8[0] * 9 + a9[0] * 10 + k * 1000 + z * 10000.0;
+}
+double hf_many(v2hf a0, v1hf a1, v2hf a2, v1hf a3, v2hf a4, v1hf a5,
+               v2hf a6, v1hf a7, v2hf a8, v1hf a9, double d, long l)
+{
+    return a0[0] + a0[1] * 2 + a1[0] * 3 + a2[1] * 4 + a3[0] * 5 + a4[0] * 6
+         + a5[0] * 7 + a6[1] * 8 + a7[0] * 9 + a8[0] * 10 + a8[1] * 11
+         + a9[0] * 12 + d * 1000 + l * 10000.0;
+}
+v1sf sf_chain(v1sf a, int k, v1sf b) { return a * b + (float)k; }
+v2hf hf2_chain(v2hf a, int k) { v2hf r = {a[1] + k, a[0] - k}; return r; }
+v1hf hf1_chain(int k, v1hf a) { v1hf r = {a[0] * (_Float16)k}; return r; }
+struct sa gsa(struct sa x, int k) { x.a += x.f; x.f = k; return x; }
+struct sb gsb(struct sb x) { x.a[0] += 1; x.i++; return x; }
+struct sc gsc(struct sc x) { struct sc r = {x.b, x.a}; return r; }
+#endif
+"#;
+
+const SMALL_CALLER: &str = r#"
+#ifdef SMALL_FLOAT_VECTORS
+/* Inlined at -O2: the inlined body reads the vector from the address the
+   call passes, as the out-of-line callee reads its stacked bytes. */
+static v1sf local_sf(v1sf a, long n, v1sf b) { return a * 2 + b + (float)n; }
+static v2hf local_hf(int k, v2hf a) { v2hf r = {a[1] + k, a[0]}; return r; }
+#endif
+static int run_small(void) {
+#ifdef SMALL_FLOAT_VECTORS
+    v1sf s1 = {1.5f}, s2 = {2.0f}, s3 = {3.0f};
+    v2hf h2 = {2, 3};
+    v1hf h1 = {4};
+    if (sf_ret(1.25f)[0] != 2.5f) return 1;
+    v2hf r2 = hf2_ret(2, 3);
+    if (r2[0] != 3 || r2[1] != 6) return 2;
+    if (hf1_ret(5)[0] != 4) return 3;
+    if (sf_arg(s1) != 2.5f) return 4;
+    if (hf2_arg(h2) != 23) return 5;
+    if (hf1_arg(h1) != 12) return 6;
+    if (sf_mix(1, s2, 3.0f, 4, s3, 5.0, 6) != 6534321.0) return 7;
+    if (hf_mix(h2, 4, h1, 5.0f, 6) != 654432.0) return 8;
+    if (sf_full(1, 1, 1, 1, 1, 1, 1, 1, s2, 3, 4.0f) != 43236.0) return 9;
+    v1sf o = {1.0f};
+    if (sf_many(o, o, o, o, o, o, o, o, s2, s3, 5, 6.0f) != 65084.0) return 10;
+    if (hf_many(h2, h1, h2, h1, h2, h1, h2, h1, h2, h1, 7.0, 8) != 87253.0) return 11;
+    v1sf c = sf_chain(s2, 7, s3);
+    if (c[0] != 13.0f) return 12;
+    v2hf c2 = hf2_chain(h2, 1);
+    if (c2[0] != 4 || c2[1] != 1) return 13;
+    if (hf1_chain(3, h1)[0] != 12) return 14;
+    struct sa ta = gsa((struct sa){{1.5f}, 2.0f}, 7);
+    if (ta.a[0] != 3.5f || ta.f != 7) return 15;
+    struct sb tb = gsb((struct sb){{2, 3}, 4});
+    if (tb.a[0] != 3 || tb.a[1] != 3 || tb.i != 5) return 16;
+    struct sc tc = gsc((struct sc){{1}, {2}});
+    if (tc.a[0] != 2 || tc.b[0] != 1) return 17;
+    if (local_sf(s1, 3, s2)[0] != 8.0f) return 18;
+    v2hf lh = local_hf(5, h2);
+    if (lh[0] != 8 || lh[1] != 2) return 19;
+#endif
+    return 0;
+}
+"#;
+
+/// The floating vectors of four bytes or fewer (`SMALL_DECLS`) against the
+/// host compiler in every pairing.
+#[test]
+fn vector_abi_small_float_interop_host() {
+    let caller = format!("{SMALL_DECLS}{SMALL_CALLER}int main(void) {{ return run_small(); }}\n");
+    interop_host(
+        "vec_small_float",
+        &format!("{SMALL_DECLS}{SMALL_CALLEE}"),
+        &caller,
+    );
+}
+
+/// The floating vectors of four bytes or fewer against aarch64 gcc in every
+/// pairing, under qemu. Exit codes 1..=19 name the check in `SMALL_CALLER`.
+#[test]
+fn vector_abi_small_float_interop_aarch64() {
+    if !aarch64_cross_available() {
+        return;
+    }
+    interop_aarch64(
+        "vec_small_float",
+        &format!("{SMALL_DECLS}{SMALL_CALLEE}"),
+        &format!("{SMALL_DECLS}{SMALL_CALLER}int main(void) {{ return run_small(); }}\n"),
+    );
+}
+
+/// A floating vector of four bytes or fewer through `...` on aarch64 Linux.
+///
+/// gcc contradicts itself here: its caller lays the vector on the stack and
+/// moves NGRN to 8, as for a named one, while its `va_arg` reads the vector
+/// out of the general-register save area. c17's `va_arg` follows gcc's
+/// caller, so a gcc caller and c17 on both sides agree, and the one pairing
+/// left out -- a c17 caller of a gcc `va_arg` -- fails between two gcc units
+/// as well.
+#[test]
+fn vector_abi_small_float_variadic_aarch64() {
+    if !aarch64_cross_available() {
+        return;
+    }
+    const VA_CALLEE: &str = r#"
+#include <stdarg.h>
+typedef float v1sf __attribute__((vector_size(4)));
+typedef _Float16 v2hf __attribute__((vector_size(4)));
+typedef _Float16 v1hf __attribute__((vector_size(2)));
+double va_small(int n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    double s = 0;
+    for (int i = 0; i < n; i++) {
+        v1sf a = va_arg(ap, v1sf);
+        long l = va_arg(ap, long);
+        v2hf b = va_arg(ap, v2hf);
+        double d = va_arg(ap, double);
+        v1hf c = va_arg(ap, v1hf);
+        int k = va_arg(ap, int);
+        s = s * 10 + a[0] + l * 2 + b[0] * 3 + b[1] * 4 + d * 5 + c[0] * 6 + k * 7;
+    }
+    va_end(ap);
+    return s;
+}
+"#;
+    const VA_CALLER: &str = r#"
+typedef float v1sf __attribute__((vector_size(4)));
+typedef _Float16 v2hf __attribute__((vector_size(4)));
+typedef _Float16 v1hf __attribute__((vector_size(2)));
+double va_small(int n, ...);
+int main(void) {
+    v1sf a = {1.0f};
+    v2hf b = {2, 3};
+    v1hf c = {4};
+    /* 1 + 2 + 6 + 12 + 5 + 24 + 7 = 57; then 570 + 57 */
+    if (va_small(1, a, 1L, b, 1.0, c, 1) != 57.0) return 1;
+    if (va_small(2, a, 1L, b, 1.0, c, 1, a, 1L, b, 1.0, c, 1) != 627.0) return 2;
+    return 0;
+}
+"#;
+    let dir = plib::tmp::Builder::new()
+        .prefix("vec_small_va_")
+        .tempdir()
+        .unwrap();
+    let callee_c = crate::common::create_c_file("vec_small_va_callee", VA_CALLEE);
+    let caller_c = crate::common::create_c_file("vec_small_va_caller", VA_CALLER);
+    let callee_src = callee_c.path().to_string_lossy().into_owned();
+    let caller_src = caller_c.path().to_string_lossy().into_owned();
+    for opt in ["-O0", "-O2"] {
+        let asm = |src: &str, n: &str| {
+            let s = dir.path().join(format!("{n}{opt}.s"));
+            let mut args = crate::common::AARCH64_TARGET_ARGS.to_vec();
+            args.extend_from_slice(&[opt, "-w", "-S", "-o", s.to_str().unwrap(), src]);
+            let run = crate::common::run_c17(&args);
+            assert!(run.success, "c17 failed on {n}:\n{}", run.stderr);
+            s.to_string_lossy().into_owned()
+        };
+        let callee_s = asm(&callee_src, "callee");
+        let caller_s = asm(&caller_src, "caller");
+        assert_eq!(
+            crate::common::cross_link_and_run("vec_small_va_cc", &[&caller_s, &callee_s]),
+            0,
+            "c17 both, {opt}"
+        );
+        assert_eq!(
+            crate::common::cross_link_and_run("vec_small_va_gc", &[&caller_src, &callee_s]),
+            0,
+            "gcc caller, c17 callee, {opt}"
+        );
+    }
 }
 
 /// Win64 passes a sixteen-byte vector by reference and returns it in XMM0,

@@ -65,6 +65,10 @@ enum VaAggKind {
     /// to memory and pass a *pointer* to the copy, so one general slot holds
     /// the address and the object is read through it.
     Indirect { bytes: i32 },
+    /// gcc's floating vector of four bytes or fewer
+    /// ([`crate::abi::ArgClass::Stacked`]): always on the stack, and every
+    /// later general-register argument with it.
+    Stacked { bytes: i32 },
 }
 
 impl VaAggKind {
@@ -88,6 +92,7 @@ impl VaAggKind {
         match abi.classify_param(typ, types) {
             crate::abi::ArgClass::Hfa { base, count } => VaAggKind::Hfa(HfaElem::of(base), count),
             crate::abi::ArgClass::Indirect { .. } => VaAggKind::Indirect { bytes },
+            crate::abi::ArgClass::Stacked { .. } => VaAggKind::Stacked { bytes },
             _ => VaAggKind::Gp {
                 qwords: ((bytes + 7) / 8) as u8,
                 bytes,
@@ -319,7 +324,7 @@ impl Aarch64CodeGen {
                 self.emit_va_arg_bytes(dst_loc, scratch0, 0, bytes, bytes <= 8);
                 ((bytes + 7) & !7) as i64
             }
-            VaAggKind::Gp { bytes, .. } => {
+            VaAggKind::Gp { bytes, .. } | VaAggKind::Stacked { bytes } => {
                 self.emit_va_arg_bytes(dst_loc, scratch0, 0, bytes, bytes <= 8);
                 ((bytes + 7) & !7) as i64
             }
@@ -407,7 +412,9 @@ impl Aarch64CodeGen {
             VaAggKind::Hfa(elem, count) => {
                 Self::va_slot_bytes((count as u32) * (elem.bytes as u32) * 8)
             }
-            VaAggKind::Gp { bytes, .. } => Self::va_slot_bytes(bytes as u32 * 8),
+            VaAggKind::Gp { bytes, .. } | VaAggKind::Stacked { bytes } => {
+                Self::va_slot_bytes(bytes as u32 * 8)
+            }
             // Only the pointer is on the stack, not the object.
             VaAggKind::Indirect { .. } => 8,
             VaAggKind::Scalar => Self::va_slot_bytes(type_bits),
@@ -419,6 +426,11 @@ impl Aarch64CodeGen {
             VaAggKind::Hfa(_, count) => 16 * count as i64,
             VaAggKind::Gp { qwords, .. } => 8 * qwords as i64,
             VaAggKind::Indirect { .. } => 8,
+            // More than the whole save area: `offs + reg_step` is positive
+            // whatever `offs` was, so the argument comes off the stack, and
+            // the committed offset pins every later general argument there
+            // too -- NGRN becoming 8, as the caller had it.
+            VaAggKind::Stacked { .. } => i64::from(VA_GR_SAVE_BYTES) + 8,
             VaAggKind::Scalar if is_fp => 16,
             VaAggKind::Scalar => stack_step,
         };
@@ -585,7 +597,7 @@ impl Aarch64CodeGen {
         });
 
         match agg {
-            VaAggKind::Gp { bytes, .. } => {
+            VaAggKind::Gp { bytes, .. } | VaAggKind::Stacked { bytes } => {
                 // Contiguous in both sources: consecutive eightbyte slots in
                 // the save area, and the object itself on the stack.
                 self.emit_va_arg_bytes(dst_loc, scratch0, 0, bytes, type_bits <= 64);

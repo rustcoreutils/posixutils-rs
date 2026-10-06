@@ -827,6 +827,13 @@ impl Aarch64CodeGen {
                 None
             };
 
+            // On the stack whatever registers are left, taking the general
+            // registers with it; the body reads its pseudo where it lies.
+            if self.stacked_arg_bytes(*typ, types).is_some() {
+                int_arg_idx = arg_regs.len();
+                continue;
+            }
+
             // The pseudo for this argument; each early exit leaves the block.
             // With sret, params have arg_idx = i + 1, but still use arg_regs[i].
             'arg: {

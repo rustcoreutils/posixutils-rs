@@ -303,7 +303,7 @@ impl SysVAmd64Abi {
             if types.vector_wrapper_carrier(ty).is_some() {
                 return RegClass::Memory;
             }
-            return match super::native_vector_carrier(ty, types) {
+            return match self.vector_carrier(ty, types) {
                 Some(carrier) => self.classify_eightbyte(carrier, _offset_bits, _size_bits, types),
                 None => RegClass::Memory,
             };
@@ -466,10 +466,15 @@ impl Abi for SysVAmd64Abi {
     /// gcc's System V convention, but for one-lane floating vectors --
     /// `float` or `double` -- which it passes in memory and returns through a
     /// hidden pointer: those travel as a struct holding the vector, which is
-    /// classed MEMORY just as gcc classes them.
+    /// classed MEMORY just as gcc classes them. A floating vector of four
+    /// bytes and several lanes -- `v2hf` -- is SSE class, the low four bytes
+    /// of XMM0 both ways, as a `float` carrying them is.
     fn vector_carrier(&self, vec: TypeId, types: &TypeTable) -> Option<TypeId> {
         if let Some(wrapper) = types.vector_wrapper_carrier(vec) {
             return Some(wrapper);
+        }
+        if types.is_small_float_vector(vec) {
+            return (types.size_bytes(vec) == 4).then_some(types.float_id);
         }
         super::native_vector_carrier(vec, types)
     }

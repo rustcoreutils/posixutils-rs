@@ -14,8 +14,8 @@ use crate::error::{PaxError, PaxResult};
 use crate::formats::OptionRecords;
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
-    create_replacing, link_replacing, set_attrs_fd, set_owner, stat_at, unlink_at, AttrPolicy,
-    Attrs, DirTree, MemberPath, PendingDirs,
+    create_replacing, link_replacing, make_dir_at, set_attrs_fd, set_owner, stat_at, unlink_at,
+    AttrPolicy, Attrs, DirTree, MemberPath, PendingDirs,
 };
 use crate::modes::select::Selector;
 use crate::pattern::Pattern;
@@ -440,56 +440,7 @@ fn extract_directory(
     entry: &ArchiveEntry,
     options: &ReadOptions,
 ) -> PaxResult<bool> {
-    // Force owner search/write permission so the directory can be populated;
-    // the archived mode is applied once the subtree exists. An archived 0555
-    // used to be set immediately and then rejected every child with EACCES.
-    let mode = (entry.mode as libc::mode_t) | 0o700;
-    let mkdir = || {
-        if unsafe { libc::mkdirat(dirfd.as_raw_fd(), name.as_ptr(), mode) } == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
-    };
-    let exists = |e: &std::io::Error| e.raw_os_error() == Some(libc::EEXIST);
-
-    match mkdir() {
-        Ok(()) => return Ok(true),
-        Err(e) if !exists(&e) => return Err(e.into()),
-        Err(_) => {}
-    }
-    // A directory this run created only to hold earlier members is not a
-    // pre-existing file: the member naming it (`find -depth` order) brings
-    // its attributes. With -k anything else there is left entirely alone.
-    // Otherwise extracting onto an existing directory is not an error
-    // (POSIX), and it is kept.
-    let existing_dir = stat_at(dirfd, name).filter(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR);
-    if existing_dir.is_some_and(|st| tree.claim_implicit(&st)) {
-        return Ok(true);
-    }
-    if options.no_clobber {
-        return Ok(false);
-    }
-    if existing_dir.is_some() {
-        return Ok(true);
-    }
-
-    // A non-directory is in the way, and is replaced the way a file member
-    // replaces a file. unlinkat with no flags removes the name itself -- never
-    // what a symlink points at -- and refuses a directory, so one that
-    // appeared meanwhile survives and is used.
-    let unlinked = unsafe { libc::unlinkat(dirfd.as_raw_fd(), name.as_ptr(), 0) } == 0;
-    let unlink_err = (!unlinked).then(std::io::Error::last_os_error);
-    match mkdir() {
-        Ok(()) => Ok(true),
-        Err(e) if exists(&e) && is_directory_at(dirfd, name) => Ok(true),
-        Err(e) => Err(unlink_err.unwrap_or(e).into()),
-    }
-}
-
-/// Whether `name` below `dirfd` is a directory, not following a symlink.
-fn is_directory_at(dirfd: BorrowedFd<'_>, name: &CStr) -> bool {
-    stat_at(dirfd, name).is_some_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
+    make_dir_at(tree, dirfd, name, entry.mode, options.no_clobber)
 }
 
 /// Extract a symlink
@@ -942,7 +893,7 @@ fn is_archive_newer(tree: &DirTree, entry: &ArchiveEntry) -> bool {
     };
     // A directory created here only to hold earlier members is not one.
     stat_at(parent.as_fd(), &member.leaf)
-        .is_none_or(|st| tree.is_implicit(&st) || entry.mtime > st.st_mtime)
+        .is_none_or(|st| tree.is_implicit(&st) || entry.mtime > tree.mtime_before_run(&st))
 }
 
 /// The ids to give an extracted file.

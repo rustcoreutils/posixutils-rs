@@ -22,7 +22,7 @@
 
 use crate::error::{PaxError, PaxResult};
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -181,6 +181,11 @@ pub(crate) struct DirTree {
     /// member below them. Such a directory is not a pre-existing file: a member
     /// that names it later (`find -depth` order) still gives it its attributes.
     implicit: RefCell<HashSet<(u64, u64)>>,
+    /// The mtime each pre-existing directory had when this run first walked
+    /// into it, before any member created below it changed that. -u compares
+    /// against this: a `find -depth` list names a directory after its
+    /// contents, by which time its own mtime is this run's doing.
+    pre_run_mtimes: RefCell<HashMap<(u64, u64), i64>>,
 }
 
 impl DirTree {
@@ -208,6 +213,7 @@ impl DirTree {
             max_levels: cached_levels_budget(),
             last_parent: RefCell::new(None),
             implicit: RefCell::new(HashSet::new()),
+            pre_run_mtimes: RefCell::new(HashMap::new()),
         })
     }
 
@@ -253,9 +259,14 @@ impl DirTree {
         for comp in member.dirs().skip(shared) {
             let at = cur.as_ref().map_or(self.root.as_fd(), |fd| fd.as_fd());
             let (next, created) = open_or_create_dir_at(at, comp, create_missing)?;
-            if created {
-                if let Some(st) = stat_at(next.as_fd(), c".") {
+            if let Some(st) = fstat(next.as_fd()) {
+                if created {
                     self.implicit.borrow_mut().insert(file_id(&st));
+                } else {
+                    self.pre_run_mtimes
+                        .borrow_mut()
+                        .entry(file_id(&st))
+                        .or_insert(st.st_mtime);
                 }
             }
             let next = Rc::new(next);
@@ -283,6 +294,18 @@ impl DirTree {
     /// its attributes.
     pub(crate) fn claim_implicit(&self, st: &libc::stat) -> bool {
         self.implicit.borrow_mut().remove(&file_id(st))
+    }
+
+    /// The mtime `st` had before this run put anything below it, for -u.
+    pub(crate) fn mtime_before_run(&self, st: &libc::stat) -> i64 {
+        // Cast needed: `time_t` is i64 on both platforms, but not by name.
+        #[allow(clippy::unnecessary_cast)]
+        let now = st.st_mtime as i64;
+        self.pre_run_mtimes
+            .borrow()
+            .get(&file_id(st))
+            .copied()
+            .unwrap_or(now)
     }
 }
 
@@ -518,6 +541,74 @@ fn open_or_create_dir_at(
         return Err(std::io::Error::last_os_error().into());
     }
     Ok((unsafe { OwnedFd::from_raw_fd(fd) }, created))
+}
+
+/// Create the directory a member names, replacing a non-directory in the
+/// way the way a file member replaces a file. `true` when the member's
+/// attributes are to be applied to it once its contents exist; `false` when
+/// -k (`no_clobber`) leaves what is there alone.
+///
+/// It is created with `mode` (the umask applies) plus owner read, write and
+/// search: enough to populate it, and never more than the final mode lets
+/// anyone else do. A directory made 0777 first and given its own mode only at
+/// the end was open to everyone in between -- for good, if pax never got
+/// there.
+pub(crate) fn make_dir_at(
+    tree: &DirTree,
+    dirfd: BorrowedFd<'_>,
+    name: &CStr,
+    mode: u32,
+    no_clobber: bool,
+) -> PaxResult<bool> {
+    // An archived 0555 used to be set immediately and then rejected every
+    // child with EACCES.
+    let mode = ((mode & 0o7777) | 0o700) as libc::mode_t;
+    let mkdir = || {
+        if unsafe { libc::mkdirat(dirfd.as_raw_fd(), name.as_ptr(), mode) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    };
+    let exists = |e: &std::io::Error| e.raw_os_error() == Some(libc::EEXIST);
+
+    match mkdir() {
+        Ok(()) => return Ok(true),
+        Err(e) if !exists(&e) => return Err(e.into()),
+        Err(_) => {}
+    }
+    // A directory this run created only to hold earlier members is not a
+    // pre-existing file: the member naming it (`find -depth` order) brings
+    // its attributes. With -k anything else there is left entirely alone.
+    // Otherwise extracting onto an existing directory is not an error
+    // (POSIX), and it is kept.
+    let existing_dir = stat_at(dirfd, name).filter(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR);
+    if existing_dir.is_some_and(|st| tree.claim_implicit(&st)) {
+        return Ok(true);
+    }
+    if no_clobber {
+        return Ok(false);
+    }
+    if existing_dir.is_some() {
+        return Ok(true);
+    }
+
+    // A non-directory is in the way, and is replaced the way a file member
+    // replaces a file. unlinkat with no flags removes the name itself -- never
+    // what a symlink points at -- and refuses a directory, so one that
+    // appeared meanwhile survives and is used.
+    let unlinked = unsafe { libc::unlinkat(dirfd.as_raw_fd(), name.as_ptr(), 0) } == 0;
+    let unlink_err = (!unlinked).then(std::io::Error::last_os_error);
+    match mkdir() {
+        Ok(()) => Ok(true),
+        Err(e) if exists(&e) && is_directory_at(dirfd, name) => Ok(true),
+        Err(e) => Err(unlink_err.unwrap_or(e).into()),
+    }
+}
+
+/// Whether `name` below `dirfd` is a directory, not following a symlink.
+fn is_directory_at(dirfd: BorrowedFd<'_>, name: &CStr) -> bool {
+    stat_at(dirfd, name).is_some_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR)
 }
 
 /// Remove whatever currently occupies `name`, so an exclusive create can win.

@@ -943,3 +943,167 @@ fn test_copy_update_keeps_newer_directory_attributes() {
     let mode = fs::metadata(dst.join("d")).unwrap().permissions().mode() & 0o7777;
     assert_eq!(mode, 0o700, "-u replaced a newer directory's mode");
 }
+
+/// A source directory that only its owner may enter must not be copied to one
+/// anyone may enter, not even while the copy runs: until the run ends its
+/// copy, and the 0644 files in it, were open to everyone -- for good, if the
+/// run never finished.
+#[test]
+fn test_copy_private_directory_is_not_exposed_during_the_copy() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let dst = temp.path().join("dst");
+    fs::create_dir_all(src.join("home/alice")).unwrap();
+    fs::create_dir(&dst).unwrap();
+    fs::write(src.join("home/alice/f"), "secret\n").unwrap();
+    fs::set_permissions(src.join("home/alice"), fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["-rw", dst.to_str().unwrap()])
+        .current_dir(&src)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"home/alice\n").unwrap();
+    stdin.flush().unwrap();
+
+    // The name list is still open: pax has copied the subtree but cannot
+    // have finished the run.
+    let copied = dst.join("home/alice/f");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !copied.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let mode = fs::metadata(dst.join("home/alice"))
+        .map(|m| m.permissions().mode() & 0o777)
+        .ok();
+    drop(stdin);
+    child.wait().unwrap();
+
+    assert!(copied.exists(), "the subtree was never copied");
+    assert_eq!(
+        mode.map(|m| m & 0o077),
+        Some(0),
+        "a 0700 directory's copy was open to others during the run: {mode:?}"
+    );
+    let mode = fs::metadata(dst.join("home/alice"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700);
+}
+
+/// A `find -depth` list names a directory after its contents. A directory
+/// already at the destination has been written to by then -- by this run --
+/// so -u must compare the source with what the destination was *before* the
+/// run, or the source directory's mode and time are never applied. cpio -p
+/// implies -u, which made `find . -depth | cpio -pdm` leave them behind.
+#[test]
+fn test_copy_update_depth_first_uses_pre_run_directory_time() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir_all(src.join("a")).unwrap();
+    fs::write(src.join("a/f"), "F\n").unwrap();
+    fs::set_permissions(src.join("a"), fs::Permissions::from_mode(0o700)).unwrap();
+    let src_time = filetime::FileTime::from_unix_time(1_577_836_800, 0); // 2020
+    filetime::set_file_mtime(src.join("a"), src_time).unwrap();
+
+    let list = b"./a/f\n./a\n.\n";
+    let runs: [(&str, &[&str]); 2] = [
+        ("cpio", &["-pdm", "../dst"]),
+        ("pax", &["-rw", "-d", "-u", "-pe", "../dst"]),
+    ];
+    for (tool, args) in runs {
+        let dst = temp.path().join("dst");
+        let _ = fs::remove_dir_all(&dst);
+        fs::create_dir_all(dst.join("a")).unwrap();
+        fs::set_permissions(dst.join("a"), fs::Permissions::from_mode(0o755)).unwrap();
+        let dst_time = filetime::FileTime::from_unix_time(1_546_300_800, 0); // 2019
+        filetime::set_file_mtime(dst.join("a"), dst_time).unwrap();
+
+        let out = if tool == "cpio" {
+            run_cpio(args, &src, list)
+        } else {
+            run_program(
+                std::path::Path::new(env!("CARGO_BIN_EXE_pax")),
+                args,
+                &src,
+                Some(list),
+            )
+        };
+        assert_success(&out, tool);
+        assert_eq!(fs::read_to_string(dst.join("a/f")).unwrap(), "F\n");
+        let meta = fs::metadata(dst.join("a")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700, "{tool}: mode");
+        assert_eq!(meta.mtime(), 1_577_836_800, "{tool}: mtime");
+    }
+}
+
+/// -s renaming a directory to `.` puts its contents straight into the
+/// destination, as extracting the same members from an archive does. The
+/// whole subtree used to be dropped, silently.
+#[test]
+fn test_copy_subst_directory_to_dot_copies_its_contents() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("src/sub")).unwrap();
+    fs::write(temp.path().join("src/sub/f"), "F\n").unwrap();
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+
+    let out = run_pax_in_dir(&["-rw", "-s", ",^src,.,", "src", "dst"], temp.path());
+    assert_success(&out, "pax -rw -s to .");
+    assert_eq!(fs::read_to_string(dst.join("sub/f")).unwrap(), "F\n");
+}
+
+/// `pax -rw tree .` names every file as its own destination. Copying one
+/// onto itself must neither rewrite it nor split its hard links: BSD pax says
+/// "file would overwrite itself" and leaves it alone.
+#[test]
+fn test_copy_onto_itself_leaves_the_source_alone() {
+    let temp = TempDir::new().unwrap();
+    let tree = temp.path().join("tree");
+    fs::create_dir(&tree).unwrap();
+    fs::write(tree.join("f"), "DATA\n").unwrap();
+    fs::hard_link(tree.join("f"), tree.join("g")).unwrap();
+    let ino = fs::metadata(tree.join("f")).unwrap().ino();
+
+    for operands in [&["tree", "."][..], &["tree/f", "."][..]] {
+        let mut args = vec!["-rw"];
+        args.extend_from_slice(operands);
+        let out = run_pax_in_dir(&args, temp.path());
+        assert!(
+            stderr_str(&out).contains("itself"),
+            "{operands:?}: copying a file onto itself is not diagnosed: {}",
+            stderr_str(&out)
+        );
+        for name in ["f", "g"] {
+            let meta = fs::metadata(tree.join(name)).unwrap();
+            assert_eq!(meta.ino(), ino, "{operands:?}: {name} was replaced");
+            assert_eq!(meta.nlink(), 2, "{operands:?}: {name}'s link was split");
+        }
+        assert_eq!(fs::read_to_string(tree.join("f")).unwrap(), "DATA\n");
+    }
+}
+
+/// A directory replaces a non-directory already at its destination name, as
+/// it does when extracted from an archive.
+#[test]
+fn test_copy_directory_replaces_existing_file() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("src/d")).unwrap();
+    fs::write(temp.path().join("src/d/f"), "F\n").unwrap();
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+    fs::write(dst.join("d"), "old\n").unwrap();
+
+    let out = run_pax_in_dir(&["-rw", "d", "../dst"], &temp.path().join("src"));
+    assert_success(&out, "pax -rw over a file");
+    assert_eq!(fs::read_to_string(dst.join("d/f")).unwrap(), "F\n");
+}

@@ -2035,3 +2035,25 @@ fn test_extract_to_stdout_write_error_fails_once() {
         "one diagnostic, not one per member: {err}"
     );
 }
+
+/// A directory whose header the format refuses -- here a time before 1970,
+/// which ustar cannot record -- is diagnosed, and its contents are still
+/// archived. The whole subtree used to go with it.
+#[test]
+fn test_refused_directory_header_keeps_its_contents() {
+    let temp = TempDir::new().unwrap();
+    let d = temp.path().join("d");
+    fs::create_dir(&d).unwrap();
+    fs::write(d.join("f"), "F\n").unwrap();
+    filetime::set_file_mtime(&d, filetime::FileTime::from_unix_time(-86400, 0)).unwrap();
+
+    let output = run_pax_in_dir(&["-w", "-x", "ustar", "-f", "a.tar", "d"], temp.path());
+    assert_exit_code(&output, 1, "pax -w of a pre-1970 directory");
+    assert!(
+        stderr_str(&output).contains("1970"),
+        "{}",
+        stderr_str(&output)
+    );
+    let listing = run_pax_in_dir(&["-f", "a.tar"], temp.path());
+    assert_eq!(stdout_str(&listing), "d/f\n");
+}

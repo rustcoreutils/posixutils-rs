@@ -390,7 +390,9 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
             let mut prompter = self.prompter.borrow_mut();
             if let Some(ref mut p) = *prompter {
                 match p.prompt(&archive_path)? {
-                    RenameResult::Skip => return Ok(false),
+                    // POSIX: "the file ... shall be skipped" -- that name
+                    // alone, as with an empty -s replacement.
+                    RenameResult::Skip => return Ok(metadata.is_dir() && self.descend(metadata)),
                     RenameResult::UseOriginal => archive_path,
                     RenameResult::Rename(new_path) => new_path,
                 }
@@ -425,9 +427,12 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
 
         if metadata.is_dir() {
             if !up_to_date {
-                let dir_entry = build_entry(&archive_path, metadata, EntryType::Directory)?;
-                archive.write_entry(&dir_entry)?;
-                archive.finish_entry()?;
+                // A header the format refuses (a time before 1970 in ustar,
+                // say) loses this entry, not everything below it.
+                match write_dir_entry(archive, &archive_path, metadata) {
+                    Err(e) if !crate::modes::is_fatal(&e) => crate::error::report_error(path, e),
+                    r => r?,
+                }
             }
             return Ok(self.descend(metadata));
         }
@@ -460,6 +465,17 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
 
         Ok(false)
     }
+}
+
+/// Write a directory's header.
+fn write_dir_entry<W: ArchiveWriter>(
+    archive: &mut W,
+    archive_path: &Path,
+    metadata: &ftw::Metadata,
+) -> PaxResult<()> {
+    let dir_entry = build_entry(archive_path, metadata, EntryType::Directory)?;
+    archive.write_entry(&dir_entry)?;
+    archive.finish_entry()
 }
 
 /// Write a symlink

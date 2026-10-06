@@ -2548,3 +2548,38 @@ fn test_interactive_eof_exits_copy_mode() {
     fs::create_dir(temp.path().join("dst")).unwrap();
     assert_tty_eof_exits(&["-rw", "-i", "a", "b", "c", "dst"], temp.path());
 }
+
+/// -i: a blank answer skips "the file" -- for a directory, that one name, as
+/// an empty -s replacement does. Its contents are still offered, one prompt
+/// each, rather than dropped with it unasked.
+#[test]
+fn test_interactive_skip_directory_keeps_its_contents() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir(temp.path().join("d")).unwrap();
+    fs::write(temp.path().join("d/f"), "F\n").unwrap();
+    fs::create_dir(temp.path().join("dst")).unwrap();
+
+    let runs: [&[&str]; 2] = [
+        &["-rw", "-i", "d", "dst"],
+        &["-w", "-i", "-f", "out.tar", "d"],
+    ];
+    for args in runs {
+        let Some((out, tty)) = run_pax_on_tty(
+            args,
+            temp.path(),
+            b"\n.\n",
+            std::time::Duration::from_secs(20),
+        ) else {
+            panic!("pax {args:?} did not finish");
+        };
+        assert_success(&out, &format!("pax {args:?}"));
+        let prompts = tty.windows(4).filter(|w| w == b" => ").count();
+        assert_eq!(prompts, 2, "{args:?}: {:?}", String::from_utf8_lossy(&tty));
+    }
+    assert_eq!(
+        fs::read_to_string(temp.path().join("dst/d/f")).unwrap(),
+        "F\n"
+    );
+    let listing = run_pax_in_dir(&["-f", "out.tar"], temp.path());
+    assert_eq!(stdout_str(&listing), "d/f\n");
+}

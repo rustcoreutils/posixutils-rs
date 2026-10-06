@@ -166,7 +166,7 @@ fn seek_over<R: Read + Seek>(reader: &mut R, count: u64) -> std::io::Result<()> 
 }
 
 pub use cpio::{checksum_bytes, CpioFormat, CpioReader, CpioWriter};
-pub use pax::{PaxReader, PaxWriter};
+pub use pax::{OptionRecords, PaxReader, PaxWriter};
 pub use ustar::{UstarReader, UstarWriter};
 
 #[cfg(test)]

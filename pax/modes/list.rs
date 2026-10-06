@@ -65,7 +65,8 @@ pub fn list_archive<R: Read, W: Write>(
             // Same as read mode: without the options the reader ignores
             // `-o delete=`, so a keyword suppressed on extract was still shown
             // in the listing.
-            let mut archive = PaxReader::new(reader).with_options(options.format_options.clone());
+            let mut archive =
+                PaxReader::new(reader).with_options(options.format_options.clone())?;
             list_entries(&mut archive, writer, options)
         }
     }
@@ -88,20 +89,22 @@ fn list_entries<R: ArchiveReader, W: Write>(
 ) -> PaxResult<()> {
     // Track which patterns have been matched (for -n first_match option)
     let mut matched_patterns: HashSet<usize> = HashSet::new();
+    let option_records =
+        crate::modes::read::caller_option_records(archive, &options.format_options)?;
     // The first listed name of each cpio link set, for the later ones to show
     // as `== first`, the way extraction links them.
     let mut link_sets: LinkSets<PathBuf> = LinkSets::default();
 
     while let Some(mut entry) = archive.read_entry()? {
+        if let Some(ref records) = option_records {
+            records.apply(&mut entry);
+        }
         if let Some(should_output) = should_list(&entry, options, &mut matched_patterns) {
             if !should_output {
                 // Entry matched a pattern that's already been matched (first_match mode)
                 archive.skip_data()?;
                 continue;
             }
-            // `-o keyword:=value` forces a value regardless of what the archive
-            // carried, and the listing must report what extraction would use.
-            crate::modes::read::apply_keyword_overrides(&mut entry, &options.format_options);
             // Rename as extraction would, hard link targets included, so the
             // listing shows the names `-r` would create (`tar -t` what `tar -x`).
             if !crate::modes::read::rename_member(

@@ -225,6 +225,14 @@ pub trait ArchiveReader {
 
     /// Skip the data for the current entry
     fn skip_data(&mut self) -> PaxResult<()>;
+
+    /// Whether the reader applies the `-o keyword=value` and
+    /// `-o keyword:=value` records itself. The pax reader has to, because they
+    /// rank among the archive's own extended headers; any other reader leaves
+    /// them to the caller (see `OptionRecords::apply`).
+    fn applies_option_records(&self) -> bool {
+        false
+    }
 }
 
 /// Trait for writing archives

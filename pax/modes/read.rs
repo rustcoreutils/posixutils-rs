@@ -11,7 +11,7 @@
 
 use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveReader, EntryType, LinkSets};
 use crate::error::{PaxError, PaxResult};
-use crate::formats::{CpioReader, PaxReader, UstarReader};
+use crate::formats::{CpioReader, OptionRecords, PaxReader, UstarReader};
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
     chown_result, create_replacing, link_replacing, set_attrs_fd, stat_at, AttrPolicy, Attrs,
@@ -56,7 +56,8 @@ pub struct ReadOptions {
     /// Process file-creation mask, applied to the mode of extracted files when
     /// the mode is not explicitly preserved (no `-p p`/`-p e`).
     pub umask: u32,
-    /// `-o` extended-header options (delete=/keyword:=value) applied on extract.
+    /// `-o` extended-header options (delete=, keyword=value, keyword:=value)
+    /// applied on extract.
     pub format_options: crate::options::FormatOptions,
     /// `-d`: a directory pattern matches only the directory itself, not its
     /// subtree.
@@ -111,7 +112,8 @@ pub fn extract_archive<R: Read>(
             extract_entries(&mut archive, options)
         }
         ArchiveFormat::Pax => {
-            let mut archive = PaxReader::new(reader).with_options(options.format_options.clone());
+            let mut archive =
+                PaxReader::new(reader).with_options(options.format_options.clone())?;
             extract_entries(&mut archive, options)
         }
     }
@@ -138,6 +140,7 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
 
     // Track which patterns have been matched (for -n first_match option)
     let mut matched_patterns: HashSet<usize> = HashSet::new();
+    let option_records = caller_option_records(archive, &options.format_options)?;
 
     // Create interactive prompter if needed
     let mut prompter = if options.interactive {
@@ -147,15 +150,15 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
     };
 
     while let Some(mut entry) = archive.read_entry()? {
+        if let Some(ref records) = option_records {
+            records.apply(&mut entry);
+        }
         if let Some(should_output) = should_extract(&entry, options, &mut matched_patterns) {
             if !should_output {
                 // Entry matched a pattern that's already been matched (first_match mode)
                 archive.skip_data()?;
                 continue;
             }
-            // Apply `-o keyword:=value` overrides before substitutions/rename so a
-            // forced path/uid/gid/etc. takes effect on the extracted file.
-            apply_keyword_overrides(&mut entry, &options.format_options);
             // -s, then --strip-components, both before the name is offered for
             // renaming (POSIX: -s applies before -i), so an interactive prompt
             // shows the name that will actually be created.
@@ -213,64 +216,20 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
     Ok(())
 }
 
-/// Apply `-o keyword:=value` per-file overrides to an entry on extract.
+/// The `-o keyword=value` and `-o keyword:=value` records the caller has to
+/// apply to each member itself: `None` when the reader applies them, as the
+/// pax reader does among the archive's own extended headers.
 ///
-/// The `:=` form forces the value regardless of what the archive carried, so it
-/// is applied after the reader has merged any extended-header records. The
-/// standard keywords that map onto an entry field are applied to it; every
-/// other keyword is recorded as an extended-header value, which has no
-/// extraction effect but is what `-o listopt=%(keyword)` reports. `delete=` is
-/// handled in the pax reader (so the ustar value remains), not here.
-pub(crate) fn apply_keyword_overrides(
-    entry: &mut ArchiveEntry,
+/// They are applied before anything looks at the member, the way an extended
+/// header record would be, so a `path:=` name is the one patterns match.
+pub(crate) fn caller_option_records<R: ArchiveReader>(
+    archive: &R,
     opts: &crate::options::FormatOptions,
-) {
-    for (keyword, value) in opts.per_file_options() {
-        match keyword.as_str() {
-            "uid" => {
-                if let Ok(v) = value.parse() {
-                    entry.uid = v;
-                }
-            }
-            "gid" => {
-                if let Ok(v) = value.parse() {
-                    entry.gid = v;
-                }
-            }
-            "uname" => entry.uname = Some(value.clone().into_bytes()),
-            "gname" => entry.gname = Some(value.clone().into_bytes()),
-            "path" => entry.path = PathBuf::from(value),
-            "linkpath" => entry.link_target = Some(PathBuf::from(value)),
-            "size" => {
-                if let Ok(v) = value.parse() {
-                    entry.size = v;
-                }
-            }
-            "mtime" => {
-                if let Ok(t) = value.parse::<f64>() {
-                    entry.mtime = t as u64;
-                    entry.mtime_nsec = (t.fract() * 1_000_000_000.0) as u32;
-                }
-            }
-            "atime" => {
-                if let Ok(t) = value.parse::<f64>() {
-                    entry.atime = Some(t as u64);
-                    entry.atime_nsec = (t.fract() * 1_000_000_000.0) as u32;
-                }
-            }
-            "ctime" => {
-                if let Ok(t) = value.parse::<f64>() {
-                    entry.ctime = Some(t as u64);
-                    entry.ctime_nsec = (t.fract() * 1_000_000_000.0) as u32;
-                }
-            }
-            // Every remaining keyword is an extended-header record with no
-            // extraction effect -- `charset`, `comment`, `hdrcharset`, an
-            // implementation extension. It still has to reach the entry, or
-            // `-o charset:=x` would force a value the listing then denied.
-            other => entry.set_ext_record(other, value),
-        }
+) -> PaxResult<Option<OptionRecords>> {
+    if archive.applies_option_records() {
+        return Ok(None);
     }
+    OptionRecords::new(opts).map(Some)
 }
 
 /// Rename a member the way -s and --strip-components direct. `false` when its

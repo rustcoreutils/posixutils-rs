@@ -2168,3 +2168,199 @@ fn test_option_listopt_posix_rule7_keywords_all_resolve() {
     assert_success(&out, "listopt=%(bogus)s");
     assert_eq!(stdout_str(&out).trim_end(), "%(bogus)s");
 }
+
+/// A `g` header with `records` as its data, as a member to concatenate.
+fn global_header(records: &[u8]) -> Vec<u8> {
+    Ustar {
+        name: b"GlobalHead",
+        typeflag: b'g',
+        body: records,
+        ..Default::default()
+    }
+    .member()
+}
+
+/// A plain member named `name`.
+fn plain_member(name: &[u8]) -> Vec<u8> {
+    Ustar {
+        name,
+        uname: b"hdruser",
+        body: b"X\n",
+        ..Default::default()
+    }
+    .member()
+}
+
+/// A global header sets only the keywords it names: a later `g` adding a
+/// comment must leave the earlier one's uname and mtime in force.
+#[test]
+fn test_global_headers_accumulate() {
+    let mut a = global_header(
+        &[
+            pax_record("uname", b"globaluser"),
+            pax_record("mtime", b"1000000000"),
+        ]
+        .concat(),
+    );
+    a.extend_from_slice(&plain_member(b"one.txt"));
+    a.extend_from_slice(&global_header(&pax_record("comment", b"hi")));
+    a.extend_from_slice(&plain_member(b"two.txt"));
+    a.extend_from_slice(&ustar_trailer());
+
+    let output = run_pax_with_stdin_bytes(&["-o", "listopt=%(uname)s %(mtime)d %F"], &a);
+    assert_success(&output, "list");
+    assert_eq!(
+        stdout_str(&output),
+        "globaluser 1000000000 one.txt\nglobaluser 1000000000 two.txt\n"
+    );
+}
+
+/// A record with an empty value deletes the keyword: "the
+/// corresponding ... field shall be ... as if the record were not
+/// present". The header's own field applies again -- it is not a parse error.
+#[test]
+fn test_empty_extended_record_value_deletes_the_keyword() {
+    for keyword in ["mtime", "atime", "uid", "gid", "size", "uname"] {
+        let mut a = Ustar {
+            name: b"PaxHeaders/f",
+            typeflag: b'x',
+            body: &pax_record(keyword, b""),
+            ..Default::default()
+        }
+        .member();
+        a.extend_from_slice(&plain_member(b"f"));
+        a.extend_from_slice(&plain_member(b"after"));
+        a.extend_from_slice(&ustar_trailer());
+
+        let output = run_pax_with_stdin_bytes(&[], &a);
+        assert_success(&output, keyword);
+        assert_eq!(stdout_str(&output), "f\nafter\n", "{keyword}");
+    }
+}
+
+/// pax writes `mtime=` for `-o mtime:=`; it has to be able to read it back.
+#[test]
+fn test_reads_its_own_deleted_mtime() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f"), "F\n").unwrap();
+    let archive = temp.path().join("e.pax");
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "pax",
+            "-o",
+            "mtime:=",
+            "-f",
+            archive.to_str().unwrap(),
+            "f",
+        ],
+        temp.path(),
+    );
+    assert_success(&output, "write");
+
+    let output = run_pax_in_dir(&["-v", "-f", archive.to_str().unwrap()], temp.path());
+    assert_success(&output, "list -v");
+}
+
+/// In read and list mode, `-o keyword=value` acts as a global extended header
+/// record, and `keyword:=value` as a per-file one; both override the archive.
+#[test]
+fn test_o_keyword_value_applies_on_list() {
+    let mut a = plain_member(b"f");
+    a.extend_from_slice(&ustar_trailer());
+
+    for opt in ["uname=forced", "uname:=forced"] {
+        let output = run_pax_with_stdin_bytes(&["-o", opt, "-o", "listopt=%(uname)s"], &a);
+        assert_success(&output, opt);
+        assert_eq!(stdout_str(&output), "forced\n", "{opt}");
+    }
+}
+
+/// A `g` record with an empty value deletes the global value: later members
+/// fall back to their own header field.
+#[test]
+fn test_deleted_global_value_stops_applying() {
+    let mut a = global_header(&pax_record("mtime", b"1000000000"));
+    a.extend_from_slice(&plain_member(b"one.txt"));
+    a.extend_from_slice(&global_header(&pax_record("mtime", b"")));
+    a.extend_from_slice(&plain_member(b"two.txt"));
+    a.extend_from_slice(&ustar_trailer());
+
+    let output = run_pax_with_stdin_bytes(&["-o", "listopt=%(mtime)d %F"], &a);
+    assert_success(&output, "list");
+    assert_eq!(stdout_str(&output), "1000000000 one.txt\n0 two.txt\n");
+}
+
+/// `-o keyword=value` ranks as a global record at the start of the archive,
+/// so a member's own `x` record outranks it; `keyword:=value` is appended to
+/// every extended header, so it outranks the `x` record.
+#[test]
+fn test_o_keyword_records_rank_around_the_archive_records() {
+    let mut a = Ustar {
+        name: b"PaxHeaders/f",
+        typeflag: b'x',
+        body: &pax_record("uname", b"xuser"),
+        ..Default::default()
+    }
+    .member();
+    a.extend_from_slice(&plain_member(b"f"));
+    a.extend_from_slice(&plain_member(b"g"));
+    a.extend_from_slice(&ustar_trailer());
+
+    for (opt, expected) in [
+        ("uname=opt", "xuser f\nopt g\n"),
+        ("uname:=opt", "opt f\nopt g\n"),
+        // A `:=` deletion drops the x record and the header field alike.
+        ("uname:=", " f\n g\n"),
+    ] {
+        let output = run_pax_with_stdin_bytes(&["-o", opt, "-o", "listopt=%(uname)s %F"], &a);
+        assert_success(&output, opt);
+        assert_eq!(stdout_str(&output), expected, "{opt}");
+    }
+}
+
+/// An `x` header ahead of a GNU long-name group describes the member that
+/// group skips; it must not rename the member after it.
+#[test]
+fn test_extended_header_does_not_outlive_a_skipped_long_name_group() {
+    let mut a = Ustar {
+        name: b"PaxHeaders/skipped",
+        typeflag: b'x',
+        body: &pax_record("path", b"renamed"),
+        ..Default::default()
+    }
+    .member();
+    a.extend_from_slice(
+        &Ustar {
+            name: b"././@LongLink",
+            typeflag: b'L',
+            body: b"long/name\0",
+            ..Default::default()
+        }
+        .member(),
+    );
+    a.extend_from_slice(&plain_member(b"long/na"));
+    a.extend_from_slice(&plain_member(b"next"));
+    a.extend_from_slice(&ustar_trailer());
+
+    let output = run_pax_with_stdin_bytes(&[], &a);
+    assert_eq!(stdout_str(&output), "next\n");
+}
+
+/// A value no archive record could carry is refused, not silently ignored.
+#[test]
+fn test_o_keyword_with_invalid_value_is_refused_on_list() {
+    let mut a = plain_member(b"f");
+    a.extend_from_slice(&ustar_trailer());
+
+    for opt in ["mtime=abc", "uid:=-1"] {
+        let output = run_pax_with_stdin_bytes(&["-o", opt], &a);
+        assert_failure(&output, opt);
+        assert!(
+            stderr_str(&output).contains(opt),
+            "{opt}: {}",
+            stderr_str(&output)
+        );
+    }
+}

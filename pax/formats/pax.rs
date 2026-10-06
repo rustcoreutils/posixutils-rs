@@ -35,7 +35,7 @@ use crate::formats::ustar::{
 };
 use crate::formats::ArchiveStream;
 use crate::options::FormatOptions;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{Read, Seek, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -105,6 +105,14 @@ pub struct ExtendedHeader {
     pub hdrcharset: Option<String>,
     /// Additional custom keywords
     pub extra: HashMap<String, String>,
+    /// Keywords a zero-length record (`keyword=`) deleted.
+    ///
+    /// POSIX: such a record "shall delete any header block field, previously
+    /// entered extended header value, or global extended header value of the
+    /// same name". The field above is cleared too; this remembers the deletion
+    /// so that it reaches the global values and header block underneath when
+    /// the headers are merged and applied.
+    pub deleted: HashSet<String>,
 }
 
 /// The extended-header keywords `ExtendedHeader` holds in a typed field, as
@@ -112,8 +120,8 @@ pub struct ExtendedHeader {
 ///
 /// One list: `serialize` needs it twice and `set_keyword` has an arm per name,
 /// and the three had been written out separately, so adding a keyword to one
-/// and not the others was a silent mistake. `test_standard_keywords_are_typed`
-/// pins them together.
+/// and not the others was a silent mistake. `holds`, `clear` and `merge` also
+/// name every field; `test_standard_keywords_are_typed` pins them together.
 const STANDARD_KEYWORDS: &[&str] = &[
     "hdrcharset",
     "atime",
@@ -153,6 +161,92 @@ impl ExtendedHeader {
         }
     }
 
+    /// Drop this header's value for `keyword`, typed or not.
+    fn clear(&mut self, keyword: &str) {
+        match keyword {
+            "hdrcharset" => self.hdrcharset = None,
+            "atime" => self.atime = None,
+            "mtime" => self.mtime = None,
+            "ctime" => self.ctime = None,
+            "path" => self.path = None,
+            "linkpath" => self.linkpath = None,
+            "size" => self.size = None,
+            "uid" => self.uid = None,
+            "gid" => self.gid = None,
+            "uname" => self.uname = None,
+            "gname" => self.gname = None,
+            _ => {
+                self.extra.remove(keyword);
+            }
+        }
+    }
+
+    /// Record a zero-length `keyword=` record: the value is gone, and so is
+    /// any value it would have overridden. See `deleted`.
+    fn delete(&mut self, keyword: &str) {
+        self.clear(keyword);
+        self.deleted.insert(keyword.to_string());
+    }
+
+    /// Layer `later` over this header, keyword by keyword: what `later` sets
+    /// replaces this header's value, what it deletes is deleted here, and
+    /// everything it does not name is left alone.
+    ///
+    /// This is both how a `g` header joins the global values already in force
+    /// ("the last one given ... shall take precedence", and only for the
+    /// keywords it gives) and how an `x` header overrides them.
+    fn merge(&mut self, later: &ExtendedHeader) {
+        for keyword in &later.deleted {
+            self.delete(keyword);
+        }
+        macro_rules! take {
+            ($($field:ident),*) => {$(
+                if later.$field.is_some() {
+                    self.$field.clone_from(&later.$field);
+                    self.deleted.remove(stringify!($field));
+                }
+            )*};
+        }
+        take!(hdrcharset, atime, mtime, ctime, path, linkpath, size, uid, gid, uname, gname);
+        for (keyword, value) in &later.extra {
+            self.extra.insert(keyword.clone(), value.clone());
+            self.deleted.remove(keyword);
+        }
+    }
+
+    /// Forget every value, and every deletion, whose keyword `keep` rejects,
+    /// as though the archive had never carried the record.
+    fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+        for &keyword in STANDARD_KEYWORDS {
+            if !keep(keyword) {
+                self.clear(keyword);
+            }
+        }
+        self.extra.retain(|keyword, _| keep(keyword));
+        self.deleted.retain(|keyword| keep(keyword));
+    }
+
+    /// The records a set of `-o` operands stands for, in a stable order so
+    /// that a bad value is always the same one reported. `assign` is the
+    /// operator they were given with (`=` or `:=`), for the diagnostic.
+    fn from_options(options: &HashMap<String, String>, assign: &str) -> PaxResult<Self> {
+        let mut sorted: Vec<_> = options.iter().collect();
+        sorted.sort();
+        let mut header = ExtendedHeader::new();
+        for (keyword, value) in sorted {
+            header
+                .apply_record(format!("{keyword}={value}").as_bytes())
+                .map_err(|e| {
+                    let reason = match e {
+                        PaxError::InvalidHeader(reason) => reason,
+                        other => other.to_string(),
+                    };
+                    PaxError::InvalidFormat(format!("-o {keyword}{assign}{value}: {reason}"))
+                })?;
+        }
+        Ok(header)
+    }
+
     /// Parse extended header records from data
     pub fn parse(data: &[u8]) -> PaxResult<Self> {
         let mut header = ExtendedHeader::new();
@@ -187,6 +281,14 @@ impl ExtendedHeader {
         // Value: try UTF-8 first, but SCHILY.xattr.* and some others can be binary
         // For binary-capable keywords, skip if not valid UTF-8
         let value_bytes = &record[eq_pos + 1..];
+        // A zero-length value is a deletion, not a value: an empty time or id
+        // is not something to parse, and a pax writer emits one on purpose
+        // (`-o mtime:=`).
+        if value_bytes.is_empty() {
+            self.delete(keyword);
+            return Ok(());
+        }
+        self.deleted.remove(keyword);
         // A pathname keyword keeps its bytes whatever they are; under
         // hdrcharset=BINARY they are deliberately not UTF-8.
         match keyword {
@@ -401,79 +503,67 @@ impl ExtendedHeader {
         data
     }
 
-    /// Apply extended-header overrides on extract, skipping any keyword removed
-    /// by the caller's `-o delete=` patterns so the underlying ustar header
-    /// value remains in force (POSIX Keyword Precedence).
-    pub fn apply_to_filtered(&self, entry: &mut ArchiveEntry, opts: &FormatOptions) {
-        let keep = |kw: &str| !opts.should_delete_keyword(kw);
-        if keep("path") {
-            if let Some(ref path) = self.path {
-                entry.path = PathBuf::from(OsString::from_vec(path.clone()));
-            }
+    /// Apply these records over the header block fields already in `entry`.
+    ///
+    /// A keyword with no value here leaves the header block field in force.
+    /// That includes a deleted one, with two exceptions: `uname` and `gname`,
+    /// whose header block fields can be deleted too -- the owner is then named
+    /// by its numeric id, which is what an archive without the name means.
+    /// The other fields have no "absent": deleting `size` would desync the
+    /// archive, `path` would leave the member nameless, and a time or an id
+    /// of zero would be an invented value rather than a missing one, so their
+    /// header block value stands.
+    fn apply_to(&self, entry: &mut ArchiveEntry) {
+        if let Some(ref path) = self.path {
+            entry.path = PathBuf::from(OsString::from_vec(path.clone()));
         }
-        if keep("linkpath") {
-            if let Some(ref linkpath) = self.linkpath {
-                entry.link_target = Some(PathBuf::from(OsString::from_vec(linkpath.clone())));
-            }
+        if let Some(ref linkpath) = self.linkpath {
+            entry.link_target = Some(PathBuf::from(OsString::from_vec(linkpath.clone())));
         }
-        if keep("size") {
-            if let Some(size) = self.size {
-                entry.size = size;
-            }
+        if let Some(size) = self.size {
+            entry.size = size;
         }
-        if keep("uid") {
-            if let Some(uid) = self.uid {
-                entry.uid = uid;
-            }
+        if let Some(uid) = self.uid {
+            entry.uid = uid;
         }
-        if keep("gid") {
-            if let Some(gid) = self.gid {
-                entry.gid = gid;
-            }
+        if let Some(gid) = self.gid {
+            entry.gid = gid;
         }
-        if keep("uname") {
-            if let Some(ref uname) = self.uname {
-                entry.uname = Some(uname.clone());
-            }
+        if let Some(ref uname) = self.uname {
+            entry.uname = Some(uname.clone());
         }
-        if keep("gname") {
-            if let Some(ref gname) = self.gname {
-                entry.gname = Some(gname.clone());
-            }
+        if let Some(ref gname) = self.gname {
+            entry.gname = Some(gname.clone());
         }
-        if keep("mtime") {
-            if let Some(mtime) = self.mtime {
-                entry.mtime = mtime.sec as u64;
-                entry.mtime_nsec = mtime.nsec;
-            }
+        if let Some(mtime) = self.mtime {
+            entry.mtime = mtime.sec as u64;
+            entry.mtime_nsec = mtime.nsec;
         }
-        if keep("atime") {
-            if let Some(atime) = self.atime {
-                entry.atime = Some(atime.sec as u64);
-                entry.atime_nsec = atime.nsec;
-            }
+        if let Some(atime) = self.atime {
+            entry.atime = Some(atime.sec as u64);
+            entry.atime_nsec = atime.nsec;
         }
         // Carried onto the entry so `-o listopt=%(ctime)T` can report it. The
         // extractor never applies it to the filesystem.
-        if keep("ctime") {
-            if let Some(ctime) = self.ctime {
-                entry.ctime = Some(ctime.sec as u64);
-                entry.ctime_nsec = ctime.nsec;
-            }
+        if let Some(ctime) = self.ctime {
+            entry.ctime = Some(ctime.sec as u64);
+            entry.ctime_nsec = ctime.nsec;
         }
         // The records nothing above holds: `charset`, `comment`, `hdrcharset`
         // and any implementation extension. None affects extraction; POSIX
         // listopt rule 7 admits every one of them as a `%(keyword)`, and
         // without this the listing had no way to report what the archive said.
-        if keep("hdrcharset") {
-            if let Some(ref hdrcharset) = self.hdrcharset {
-                entry.set_ext_record("hdrcharset", hdrcharset);
-            }
+        if let Some(ref hdrcharset) = self.hdrcharset {
+            entry.set_ext_record("hdrcharset", hdrcharset);
         }
         for (keyword, value) in &self.extra {
-            if keep(keyword) {
-                entry.set_ext_record(keyword, value);
-            }
+            entry.set_ext_record(keyword, value);
+        }
+        if self.deleted.contains("uname") {
+            entry.uname = None;
+        }
+        if self.deleted.contains("gname") {
+            entry.gname = None;
         }
     }
 
@@ -754,13 +844,51 @@ fn write_pax_record(data: &mut Vec<u8>, keyword: &str, value: &str) {
     data.extend_from_slice(content.as_bytes());
 }
 
+/// The `-o keyword=value` and `-o keyword:=value` operands of read and list
+/// mode, as the extended-header records POSIX says they act as.
+///
+/// `keyword=value` acts "as if they had been at the beginning of the archive
+/// as typeflag g global extended header records", and `keyword:=value` "as if
+/// they were included as records at the end of each extended header", so the
+/// first is overridden by the archive's own records and the second overrides
+/// them.
+#[derive(Debug, Clone, Default)]
+pub struct OptionRecords {
+    global: ExtendedHeader,
+    per_file: ExtendedHeader,
+}
+
+impl OptionRecords {
+    /// Parse the operands' values as the records they stand for, so that a
+    /// value no archive record could carry is refused up front.
+    pub fn new(options: &FormatOptions) -> PaxResult<Self> {
+        Ok(OptionRecords {
+            global: ExtendedHeader::from_options(options.global_options(), "=")?,
+            per_file: ExtendedHeader::from_options(options.per_file_options(), ":=")?,
+        })
+    }
+
+    /// Apply the records to a member of a format with no extended headers
+    /// (cpio, pre-POSIX tar), where the global records and then the per-file
+    /// ones simply override the header fields.
+    pub fn apply(&self, entry: &mut ArchiveEntry) {
+        let mut records = self.global.clone();
+        records.merge(&self.per_file);
+        records.apply_to(entry);
+    }
+}
+
 /// pax archive reader
 pub struct PaxReader<R: Read> {
     reader: ArchiveStream<R>,
     current_size: u64,
     bytes_read: u64,
+    /// The global values in force: `-o keyword=value` first, then every `g`
+    /// header read so far, each layered over the last.
     global_header: ExtendedHeader,
-    /// `-o` options consulted on read (currently `delete=` keyword removal).
+    /// `-o keyword:=value`, appended to every member's extended header.
+    per_file_options: ExtendedHeader,
+    /// `-o` options consulted on read (`delete=` keyword removal).
     options: FormatOptions,
     /// Where the member being read begins, counting any extended header that
     /// describes it. Once `read_entry` has returned `None` this is where the
@@ -782,6 +910,7 @@ impl<R: Read> PaxReader<R> {
             current_size: 0,
             bytes_read: 0,
             global_header: ExtendedHeader::new(),
+            per_file_options: ExtendedHeader::new(),
             options: FormatOptions::default(),
             member_offset: 0,
             saw_extended_header: false,
@@ -803,10 +932,14 @@ impl<R: Read> PaxReader<R> {
         self.saw_extended_header
     }
 
-    /// Attach `-o` format options (e.g. `delete=`) consulted while extracting.
-    pub fn with_options(mut self, options: FormatOptions) -> Self {
+    /// Attach the `-o` format options of read and list mode: `delete=`, and
+    /// the keyword records described at [`OptionRecords`].
+    pub fn with_options(mut self, options: FormatOptions) -> PaxResult<Self> {
+        let records = OptionRecords::new(&options)?;
+        self.global_header = records.global;
+        self.per_file_options = records.per_file;
         self.options = options;
-        self
+        Ok(self)
     }
 
     /// Read a raw header block
@@ -821,6 +954,23 @@ impl<R: Read> PaxReader<R> {
         }
 
         Ok(Some(header))
+    }
+
+    /// The records that describe the next member, in POSIX's order of
+    /// precedence: the global values, then its own `x` header, then the
+    /// `-o keyword:=value` records appended to the end of it.
+    ///
+    /// `-o delete=` removes the archive's records, so a removed keyword falls
+    /// back to the header block value; the operator's own `:=` records are
+    /// applied whatever it matches.
+    fn member_records(&self, extended_header: Option<&ExtendedHeader>) -> ExtendedHeader {
+        let mut records = self.global_header.clone();
+        if let Some(ext) = extended_header {
+            records.merge(ext);
+        }
+        records.retain(|keyword| !self.options.should_delete_keyword(keyword));
+        records.merge(&self.per_file_options);
+        records
     }
 
     /// Read extended header data
@@ -871,9 +1021,11 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
 
             match typeflag {
                 PAX_GHDR => {
-                    // Global extended header - affects all subsequent files
+                    // Global extended header - affects all subsequent files,
+                    // for the keywords it names; the rest stay in force.
                     let size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
-                    self.global_header = self.read_extended_header(size)?;
+                    let global = self.read_extended_header(size)?;
+                    self.global_header.merge(&global);
                     self.saw_extended_header = true;
                 }
                 PAX_XHDR => {
@@ -895,20 +1047,16 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
                     )?;
                     self.bytes_read = 0;
                     self.skip_data()?;
+                    // An `x` header ahead of the group described the member
+                    // just dropped, not the one after it.
+                    extended_header = None;
                 }
                 _ => {
                     // Regular file entry - parse and apply extended headers
                     let mut entry = parse_ustar_header(&header, SizeRule::Pax)?;
 
-                    // Apply global header first, honoring `-o delete=` so removed
-                    // keywords fall back to the ustar header value.
-                    self.global_header
-                        .apply_to_filtered(&mut entry, &self.options);
-
-                    // Apply per-file extended header (overrides global)
-                    if let Some(ref ext) = extended_header {
-                        ext.apply_to_filtered(&mut entry, &self.options);
-                    }
+                    self.member_records(extended_header.as_ref())
+                        .apply_to(&mut entry);
 
                     // A `size=` record replaces the size field, not the rule
                     // for which types carry data: a directory or FIFO has
@@ -946,6 +1094,10 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
 
         self.bytes_read = total_bytes;
         Ok(())
+    }
+
+    fn applies_option_records(&self) -> bool {
+        true
     }
 }
 
@@ -1410,6 +1562,18 @@ mod tests {
             assert!(
                 header.holds(keyword),
                 "{keyword} is in STANDARD_KEYWORDS but `holds` does not see it"
+            );
+
+            let mut merged = ExtendedHeader::new();
+            merged.merge(&header);
+            assert!(
+                merged.holds(keyword),
+                "{keyword} is in STANDARD_KEYWORDS but `merge` does not carry it"
+            );
+            merged.clear(keyword);
+            assert!(
+                !merged.holds(keyword),
+                "{keyword} is in STANDARD_KEYWORDS but `clear` does not drop it"
             );
         }
 

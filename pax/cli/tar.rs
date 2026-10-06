@@ -12,9 +12,14 @@
 //! Scope is the set of options that appear in real scripts, not everything GNU
 //! tar accepts. Anything outside it is rejected by name rather than ignored.
 
-use super::{parse_number, read_name_list, unknown, unsupported, usage, ArgCursor};
+use super::{
+    cluster_letters, parse_number, parse_options, read_name_list, split_long, unknown, unsupported,
+    usage, ArgCursor,
+};
 use crate::error::{PaxError, PaxResult};
 use crate::{Args, Format};
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 const PROG: &str = "tar";
@@ -86,7 +91,7 @@ impl State {
 }
 
 /// Parse a tar command line into pax's internal options.
-pub fn parse(argv: Vec<String>) -> PaxResult<Args> {
+pub fn parse(argv: Vec<OsString>) -> PaxResult<Args> {
     let mut st = State::new();
 
     // tar's oldest calling convention puts the option letters in the first
@@ -94,8 +99,9 @@ pub fn parse(argv: Vec<String>) -> PaxResult<Args> {
     // are then taken, in order, from the arguments that follow.
     let old_style = argv
         .get(1)
+        .and_then(|first| first.to_str())
         .filter(|first| !first.is_empty() && first.chars().all(|c| OPTION_LETTERS.contains(c)))
-        .cloned();
+        .map(str::to_string);
 
     let start = if old_style.is_some() { 2 } else { 1 };
     let mut cur = ArgCursor::new(PROG, argv, start);
@@ -106,21 +112,7 @@ pub fn parse(argv: Vec<String>) -> PaxResult<Args> {
         }
     }
 
-    let mut operands: Vec<String> = Vec::new();
-    while let Some(arg) = cur.next() {
-        if arg == "--" {
-            operands.extend(cur.rest());
-            break;
-        } else if let Some(long) = arg.strip_prefix("--") {
-            apply_long(long, &mut st, &mut cur)?;
-        } else if arg.len() > 1 && arg.starts_with('-') {
-            apply_cluster(&arg[1..], &mut st, &mut cur)?;
-        } else {
-            // A bare "-" is a pathname operand, not an option.
-            operands.push(arg);
-        }
-    }
-
+    let operands = parse_options(&mut cur, &mut st, apply_long, apply_cluster)?;
     st.args.files_and_patterns.extend(operands);
     finish(st)
 }
@@ -128,7 +120,7 @@ pub fn parse(argv: Vec<String>) -> PaxResult<Args> {
 /// Apply one short option. `glued` is the rest of its cluster, if any.
 fn apply_short(
     c: char,
-    glued: Option<String>,
+    glued: Option<OsString>,
     st: &mut State,
     cur: &mut ArgCursor,
 ) -> PaxResult<()> {
@@ -212,7 +204,7 @@ fn apply_short(
 }
 
 /// Apply a short option that took an argument.
-fn apply_value(c: char, value: &str, st: &mut State) -> PaxResult<()> {
+fn apply_value(c: char, value: &OsStr, st: &mut State) -> PaxResult<()> {
     match c {
         'f' => set_archive(st, value),
         'C' => set_chdir(st, value)?,
@@ -231,11 +223,11 @@ fn apply_value(c: char, value: &str, st: &mut State) -> PaxResult<()> {
 }
 
 /// Apply a cluster of short options from a single `-xyz` argument.
-fn apply_cluster(cluster: &str, st: &mut State, cur: &mut ArgCursor) -> PaxResult<()> {
-    for (i, c) in cluster.char_indices() {
+fn apply_cluster(cluster: &[u8], st: &mut State, cur: &mut ArgCursor) -> PaxResult<()> {
+    for (c, rest) in cluster_letters(cluster) {
         if takes_arg(c) {
             // Whatever follows the letter in this argument is its value.
-            let glued = cluster[i + c.len_utf8()..].to_string();
+            let glued = OsStr::from_bytes(rest).to_owned();
             return apply_short(c, Some(glued), st, cur);
         }
         apply_short(c, None, st, cur)?;
@@ -244,11 +236,9 @@ fn apply_cluster(cluster: &str, st: &mut State, cur: &mut ArgCursor) -> PaxResul
 }
 
 /// Apply one long option, with the leading `--` already stripped.
-fn apply_long(long: &str, st: &mut State, cur: &mut ArgCursor) -> PaxResult<()> {
-    let (name, inline) = match long.split_once('=') {
-        Some((n, v)) => (n, Some(v.to_string())),
-        None => (long, None),
-    };
+fn apply_long(long: &[u8], st: &mut State, cur: &mut ArgCursor) -> PaxResult<()> {
+    let (name, inline) = split_long(long);
+    let name = name.as_str();
 
     // Long options that map straight onto a short one keep a single
     // implementation by delegating.
@@ -296,7 +286,9 @@ fn apply_long(long: &str, st: &mut State, cur: &mut ArgCursor) -> PaxResult<()> 
         }
         "format" => {
             let value = cur.value("--format", inline)?;
-            st.format = Some(match value.as_str() {
+            // No format name is anything but ASCII, so a lossy rendering only
+            // ever matters to the diagnostic.
+            st.format = Some(match value.to_string_lossy().as_ref() {
                 // v7 and the GNU formats are close enough to ustar that the
                 // ustar writer is the honest choice; anything a member needs
                 // beyond it is an error rather than a silent GNU extension.
@@ -325,7 +317,7 @@ fn apply_long(long: &str, st: &mut State, cur: &mut ArgCursor) -> PaxResult<()> 
     Ok(())
 }
 
-fn set_archive(st: &mut State, value: &str) {
+fn set_archive(st: &mut State, value: &OsStr) {
     // "-" is tar's spelling of standard input or output, which is what pax does
     // when no archive is named at all.
     st.args.archive = if value == "-" {
@@ -335,7 +327,7 @@ fn set_archive(st: &mut State, value: &str) {
     };
 }
 
-fn set_chdir(st: &mut State, value: &str) -> PaxResult<()> {
+fn set_chdir(st: &mut State, value: &OsStr) -> PaxResult<()> {
     if st.args.chdir.is_some() {
         // GNU applies each -C at the point it appears among the operands. That
         // is not implemented, and quietly honoring only one of several would
@@ -346,7 +338,7 @@ fn set_chdir(st: &mut State, value: &str) -> PaxResult<()> {
     Ok(())
 }
 
-fn set_blocking_factor(st: &mut State, value: &str) -> PaxResult<()> {
+fn set_blocking_factor(st: &mut State, value: &OsStr) -> PaxResult<()> {
     // tar counts 512-byte blocks where pax counts bytes.
     let factor = parse_number(PROG, "-b", value)?;
     let bytes = factor.checked_mul(512).filter(|b| *b <= u32::MAX as u64);
@@ -357,7 +349,10 @@ fn set_blocking_factor(st: &mut State, value: &str) -> PaxResult<()> {
         }
         None => Err(usage(
             PROG,
-            format!("blocking factor '{}' is out of range", value),
+            format!(
+                "blocking factor '{}' is out of range",
+                value.to_string_lossy()
+            ),
         )),
     }
 }
@@ -409,7 +404,7 @@ fn finish(mut st: State) -> PaxResult<Args> {
     st.args.format = Some(st.format.unwrap_or(Format::Ustar));
 
     if !st.privs.is_empty() {
-        st.args.privs = Some(st.privs.clone());
+        st.args.privs = vec![st.privs.clone()];
     }
 
     Ok(st.args)
@@ -466,9 +461,14 @@ mod tests {
 
     /// Parse a tar command line given without the leading program name.
     fn tar(args: &[&str]) -> PaxResult<Args> {
-        let mut argv = vec!["tar".to_string()];
-        argv.extend(args.iter().map(|s| s.to_string()));
+        let mut argv = vec![OsString::from("tar")];
+        argv.extend(args.iter().map(OsString::from));
         parse(argv)
+    }
+
+    /// Operands as the `OsString`s the parser hands on.
+    fn names(names: &[&str]) -> Vec<OsString> {
+        names.iter().map(OsString::from).collect()
     }
 
     #[test]
@@ -479,7 +479,7 @@ mod tests {
         assert!(args.write_mode);
         assert!(args.verbose);
         assert_eq!(args.archive.as_deref(), Some(Path::new("out.tar")));
-        assert_eq!(args.files_and_patterns, vec!["dir".to_string()]);
+        assert_eq!(args.files_and_patterns, names(&["dir"]));
     }
 
     #[test]
@@ -507,7 +507,7 @@ mod tests {
         // "readme" contains letters this parser does not know, so it cannot be
         // an old-style bundle and must be treated as a pathname.
         let args = tar(&["-cf", "out.tar", "readme"]).unwrap();
-        assert_eq!(args.files_and_patterns, vec!["readme".to_string()]);
+        assert_eq!(args.files_and_patterns, names(&["readme"]));
         assert!(tar(&["readme"]).is_err(), "no operation was selected");
     }
 
@@ -540,20 +540,14 @@ mod tests {
 
     #[test]
     fn test_preservation_flags_become_pax_privileges() {
-        assert_eq!(tar(&["-xpf", "a.tar"]).unwrap().privs.as_deref(), Some("p"));
-        assert_eq!(tar(&["-xmf", "a.tar"]).unwrap().privs.as_deref(), Some("m"));
-        assert_eq!(
-            tar(&["-xf", "a.tar", "--same-owner"])
-                .unwrap()
-                .privs
-                .as_deref(),
-            Some("o")
-        );
+        assert_eq!(tar(&["-xpf", "a.tar"]).unwrap().privs, ["p"]);
+        assert_eq!(tar(&["-xmf", "a.tar"]).unwrap().privs, ["m"]);
+        assert_eq!(tar(&["-xf", "a.tar", "--same-owner"]).unwrap().privs, ["o"]);
         // The pax defaults already match tar's, so nothing is asked for.
-        assert_eq!(tar(&["-xf", "a.tar"]).unwrap().privs, None);
+        assert!(tar(&["-xf", "a.tar"]).unwrap().privs.is_empty());
         assert_eq!(
             tar(&["-xf", "a.tar", "--no-same-owner"]).unwrap().privs,
-            None
+            Vec::<String>::new()
         );
     }
 
@@ -616,10 +610,51 @@ mod tests {
     #[test]
     fn test_double_dash_ends_option_parsing() {
         let args = tar(&["-cf", "a.tar", "--", "-x", "--exclude"]).unwrap();
-        assert_eq!(
-            args.files_and_patterns,
-            vec!["-x".to_string(), "--exclude".to_string()]
-        );
+        assert_eq!(args.files_and_patterns, names(&["-x", "--exclude"]));
+    }
+
+    /// Pathnames are bytes: a non-UTF-8 operand, -f value (separate, glued or
+    /// after `=`) and -T list entry all reach pax unchanged.
+    #[test]
+    fn test_pathnames_keep_their_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = |b: &[u8]| OsString::from_vec(b.to_vec());
+        let parse_raw = |args: &[&[u8]]| {
+            let mut argv = vec![OsString::from("tar")];
+            argv.extend(args.iter().map(|a| raw(a)));
+            parse(argv).unwrap()
+        };
+
+        let args = parse_raw(&[b"-cf", b"a\xff.tar", b"caf\xe9"]);
+        assert_eq!(args.files_and_patterns, [raw(b"caf\xe9")]);
+        assert_eq!(args.archive.unwrap().as_os_str().as_bytes(), b"a\xff.tar");
+
+        for argv in [
+            &[&b"-cfa\xff.tar"[..], b"x"][..],
+            &[b"-c", b"--file=a\xff.tar", b"x"],
+            &[b"cf", b"a\xff.tar", b"x"],
+        ] {
+            let archive = parse_raw(argv).archive.unwrap();
+            assert_eq!(archive.as_os_str().as_bytes(), b"a\xff.tar", "{argv:?}");
+        }
+
+        // A list naming caf\351 must not become 'caf' + U+FFFD.
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let list = dir.path().join("list");
+        std::fs::write(&list, b"caf\xe9\nplain\n").unwrap();
+        let args = parse_raw(&[b"-cf", b"a.tar", b"-T", list.as_os_str().as_bytes()]);
+        assert_eq!(args.files_and_patterns, [raw(b"caf\xe9"), raw(b"plain")]);
+    }
+
+    #[test]
+    fn test_non_utf8_option_letter_is_unknown_not_a_panic() {
+        use std::os::unix::ffi::OsStringExt;
+        let argv = vec![
+            OsString::from("tar"),
+            OsString::from_vec(b"-c\xff".to_vec()),
+        ];
+        let err = parse(argv).unwrap_err().to_string();
+        assert!(err.contains("unrecognized option"), "{err}");
     }
 
     #[test]

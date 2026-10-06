@@ -41,6 +41,7 @@ use modes::write::WriteOptions;
 use multivolume::{MultiVolumeOptions, MultiVolumeReader};
 use options::FormatOptions;
 use pattern::Pattern;
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -102,7 +103,7 @@ struct Args {
     #[arg(short = 'a', long, help = gettext("Append files to the end of an existing archive"))]
     append: bool,
 
-    #[arg(short, long, help = gettext("Block the output at a positive decimal integer number of bytes per write"))]
+    #[arg(short, long, allow_hyphen_values = true, help = gettext("Block the output at a positive decimal integer number of bytes per write"))]
     blocksize: Option<u32>,
 
     #[arg(short = 'c', long, help = gettext("Match all file or archive members except those specified by the pattern or file operands"))]
@@ -111,10 +112,12 @@ struct Args {
     #[arg(short, long, help = gettext("Cause files of type directory to match only the file or archive member itself"))]
     dir_no_follow: bool,
 
-    #[arg(short = 'f', long, help = gettext("Specify the pathname of the input or output archive"))]
+    #[arg(short = 'f', long, allow_hyphen_values = true, help = gettext("Specify the pathname of the input or output archive"))]
     archive: Option<PathBuf>,
 
-    #[arg(short = 'H', help = gettext("Follow symlinks on the command line, rather than archiving the symlink itself"))]
+    // -H and -L are mutually exclusive, and POSIX makes the last one given
+    // win rather than calling the pair an error.
+    #[arg(short = 'H', overrides_with = "dereference", help = gettext("Follow symlinks on the command line, rather than archiving the symlink itself"))]
     cli_dereference: bool,
 
     #[arg(short = 'i', long, help = gettext("Interactively rename files or archive members"))]
@@ -126,7 +129,7 @@ struct Args {
     #[arg(short, long, help = gettext("In copy mode, hard links shall be made between the source and destination"))]
     link: bool,
 
-    #[arg(short = 'L', long, help = gettext("Follow symlinks"))]
+    #[arg(short = 'L', long, overrides_with = "cli_dereference", help = gettext("Follow symlinks"))]
     dereference: bool,
 
     #[arg(short = 'n', long, help = gettext("Select only the first archive member that matches each pattern operand"))]
@@ -135,10 +138,12 @@ struct Args {
     #[arg(short = 'z', long = "gzip", help = gettext("Compress/decompress archive using gzip"))]
     gzip: bool,
 
-    #[arg(short = 'o', long = "options", action = clap::ArgAction::Append, help = gettext("Format-specific options"))]
+    #[arg(short = 'o', long = "options", action = clap::ArgAction::Append, allow_hyphen_values = true, help = gettext("Format-specific options"))]
     format_options: Vec<String>,
 
-    #[arg(short = 's', action = clap::ArgAction::Append, help = gettext("Modify file/archive member names using substitution expression"))]
+    // An option-argument is taken verbatim (XBD 12.2, guideline 7), so an
+    // expression delimited by '-' (`-s -a-b-`) is a value, not an option.
+    #[arg(short = 's', action = clap::ArgAction::Append, allow_hyphen_values = true, help = gettext("Modify file/archive member names using substitution expression"))]
     substitutions: Vec<String>,
 
     #[arg(short = 't', long, help = gettext("Reset access times of files after reading them"))]
@@ -147,8 +152,9 @@ struct Args {
     #[arg(short = 'u', long, help = gettext("Ignore files older than existing files/archive members with same name"))]
     update: bool,
 
-    #[arg(short, long, help = gettext("Specify one or more file characteristic options (privileges)"))]
-    privs: Option<String>,
+    // The synopsis is `[-p string]...`: the strings combine in order.
+    #[arg(short, long, action = clap::ArgAction::Append, allow_hyphen_values = true, help = gettext("Specify one or more file characteristic options (privileges)"))]
+    privs: Vec<String>,
 
     #[arg(short, long, help = gettext("In list mode, produce a verbose table of contents"))]
     verbose: bool,
@@ -156,7 +162,7 @@ struct Args {
     // Left as an Option (rather than a defaulted value) so append mode can tell
     // an explicit `-x` from the ustar default and reject a format that conflicts
     // with the existing archive.
-    #[arg(short = 'x', long, value_enum, help = gettext("Specify the output archive format"))]
+    #[arg(short = 'x', long, value_enum, allow_hyphen_values = true, help = gettext("Specify the output archive format"))]
     format: Option<Format>,
 
     #[arg(short = 'X', long, help = gettext("Do not cross filesystem boundaries"))]
@@ -171,8 +177,9 @@ struct Args {
     #[arg(long, help = gettext("Run this script at end of each volume (for -M mode)"))]
     new_volume_script: Option<String>,
 
+    // Pathnames are byte strings, so operands are not required to be UTF-8.
     #[arg(help = gettext("Pathnames, patterns and file operands to be processed"))]
-    files_and_patterns: Vec<String>,
+    files_and_patterns: Vec<OsString>,
 
     /// tar `-C`: change to this directory before operating. Applied after the
     /// `-f` pathname has been resolved, since that one is relative to the
@@ -182,7 +189,7 @@ struct Args {
 
     /// tar `--exclude` / `-X`: names never archived, listed or extracted
     #[arg(skip)]
-    exclude_patterns: Vec<String>,
+    exclude_patterns: Vec<OsString>,
 
     /// tar `--strip-components`: leading pathname components to drop
     #[arg(skip)]
@@ -229,8 +236,8 @@ fn main() -> ExitCode {
     error::set_program_name(program.name());
     let args = match program {
         ProgramMode::Pax => Ok(Args::parse()),
-        ProgramMode::Tar => cli::tar::parse(std::env::args().collect()),
-        ProgramMode::Cpio => cli::cpio::parse(std::env::args().collect()),
+        ProgramMode::Tar => cli::tar::parse(std::env::args_os().collect()),
+        ProgramMode::Cpio => cli::cpio::parse(std::env::args_os().collect()),
     };
 
     let result = args.and_then(run);
@@ -819,9 +826,16 @@ fn is_valid_tar_checksum(buf: &[u8]) -> bool {
     sum == stored
 }
 
-/// Compile pattern strings into Pattern objects
-fn compile_patterns(patterns: &[String]) -> PaxResult<Vec<Pattern>> {
-    patterns.iter().map(|s| Pattern::new(s)).collect()
+/// Compile pattern operands into Pattern objects.
+///
+/// Patterns match against [`rawpath::MatchName`], the lossy text form of a
+/// member name, so an operand that is not UTF-8 is converted the same way:
+/// `caf\351` then still selects the member stored as `caf\351`.
+fn compile_patterns(patterns: &[OsString]) -> PaxResult<Vec<Pattern>> {
+    patterns
+        .iter()
+        .map(|s| Pattern::new(&s.to_string_lossy()))
+        .collect()
 }
 
 /// Get files to archive (from args or stdin)
@@ -834,10 +848,12 @@ fn get_files_to_archive(args: &Args) -> PaxResult<Vec<PathBuf>> {
     }
 }
 
-/// Parse -p privilege string and return preservation flags
-/// Per POSIX: when conflicting characters appear, the last one wins.
+/// Parse the -p privilege strings and return preservation flags.
+/// Per POSIX: the strings of repeated -p options combine, and when
+/// characters conflict -- within one string or across several -- the one
+/// given last wins.
 /// Defaults: preserve atime, mtime, perms; do NOT preserve owner
-fn parse_privs(privs: &Option<String>) -> (bool, bool, bool, bool) {
+fn parse_privs(privs: &[String]) -> (bool, bool, bool, bool) {
     // Defaults per POSIX:
     // - atime: preserved (so 'a' disables it)
     // - mtime: preserved (so 'm' disables it)
@@ -849,23 +865,21 @@ fn parse_privs(privs: &Option<String>) -> (bool, bool, bool, bool) {
     let mut preserve_perms = false;
     let mut preserve_owner = false;
 
-    if let Some(s) = privs {
-        // Process each character in order, last one wins for conflicts
-        for c in s.chars() {
-            match c {
-                'a' => preserve_atime = false,
-                'm' => preserve_mtime = false,
-                'o' => preserve_owner = true,
-                'p' => preserve_perms = true,
-                'e' => {
-                    // 'e' means preserve everything
-                    preserve_atime = true;
-                    preserve_mtime = true;
-                    preserve_perms = true;
-                    preserve_owner = true;
-                }
-                _ => {} // Ignore unknown characters per POSIX
+    // Process each character in order, last one wins for conflicts
+    for c in privs.iter().flat_map(|s| s.chars()) {
+        match c {
+            'a' => preserve_atime = false,
+            'm' => preserve_mtime = false,
+            'o' => preserve_owner = true,
+            'p' => preserve_perms = true,
+            'e' => {
+                // 'e' means preserve everything
+                preserve_atime = true;
+                preserve_mtime = true;
+                preserve_perms = true;
+                preserve_owner = true;
             }
+            _ => {} // Ignore unknown characters per POSIX
         }
     }
 
@@ -896,22 +910,22 @@ fn current_umask() -> u32 {
 }
 
 /// Check if permissions should be preserved
-fn should_preserve_perms(privs: &Option<String>) -> bool {
+fn should_preserve_perms(privs: &[String]) -> bool {
     parse_privs(privs).2
 }
 
 /// Check if modification time should be preserved
-fn should_preserve_mtime(privs: &Option<String>) -> bool {
+fn should_preserve_mtime(privs: &[String]) -> bool {
     parse_privs(privs).1
 }
 
 /// Check if access time should be preserved
-fn should_preserve_atime(privs: &Option<String>) -> bool {
+fn should_preserve_atime(privs: &[String]) -> bool {
     parse_privs(privs).0
 }
 
 /// Check if owner should be preserved
-fn should_preserve_owner(privs: &Option<String>) -> bool {
+fn should_preserve_owner(privs: &[String]) -> bool {
     parse_privs(privs).3
 }
 
@@ -1035,40 +1049,87 @@ mod tests {
         assert!(matches!(determine_mode(&args), PaxMode::List));
     }
 
+    /// The privilege strings of one `-p` per element.
+    fn p(strings: &[&str]) -> Vec<String> {
+        strings.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn test_preserve_flags() {
         // Default (no -p): preserve atime, mtime; do NOT preserve perms (the mode
         // is set as part of normal file creation, i.e. archived mode & ~umask) or
         // owner.
-        assert!(should_preserve_atime(&None));
-        assert!(should_preserve_mtime(&None));
-        assert!(!should_preserve_perms(&None));
-        assert!(!should_preserve_owner(&None));
+        assert!(should_preserve_atime(&[]));
+        assert!(should_preserve_mtime(&[]));
+        assert!(!should_preserve_perms(&[]));
+        assert!(!should_preserve_owner(&[]));
 
         // Individual flags
-        assert!(!should_preserve_atime(&Some("a".to_string())));
-        assert!(!should_preserve_mtime(&Some("m".to_string())));
-        assert!(should_preserve_perms(&Some("p".to_string())));
-        assert!(should_preserve_owner(&Some("o".to_string())));
+        assert!(!should_preserve_atime(&p(&["a"])));
+        assert!(!should_preserve_mtime(&p(&["m"])));
+        assert!(should_preserve_perms(&p(&["p"])));
+        assert!(should_preserve_owner(&p(&["o"])));
 
         // 'e' preserves everything
-        assert!(should_preserve_atime(&Some("e".to_string())));
-        assert!(should_preserve_mtime(&Some("e".to_string())));
-        assert!(should_preserve_perms(&Some("e".to_string())));
-        assert!(should_preserve_owner(&Some("e".to_string())));
+        assert!(should_preserve_atime(&p(&["e"])));
+        assert!(should_preserve_mtime(&p(&["e"])));
+        assert!(should_preserve_perms(&p(&["e"])));
+        assert!(should_preserve_owner(&p(&["e"])));
 
         // Combined flags
-        assert!(!should_preserve_atime(&Some("am".to_string())));
-        assert!(!should_preserve_mtime(&Some("am".to_string())));
-        assert!(!should_preserve_perms(&Some("am".to_string()))); // no p/e → not preserved
+        assert!(!should_preserve_atime(&p(&["am"])));
+        assert!(!should_preserve_mtime(&p(&["am"])));
+        assert!(!should_preserve_perms(&p(&["am"]))); // no p/e → not preserved
 
         // Precedence: last wins
         // 'e' enables everything, then 'a' disables atime
-        assert!(!should_preserve_atime(&Some("ea".to_string())));
-        assert!(should_preserve_mtime(&Some("ea".to_string())));
-        assert!(should_preserve_owner(&Some("ea".to_string())));
+        assert!(!should_preserve_atime(&p(&["ea"])));
+        assert!(should_preserve_mtime(&p(&["ea"])));
+        assert!(should_preserve_owner(&p(&["ea"])));
 
         // 'm' disables mtime, then 'e' enables everything
-        assert!(should_preserve_mtime(&Some("me".to_string())));
+        assert!(should_preserve_mtime(&p(&["me"])));
+
+        // Repeated -p strings combine in order, so the same holds across them.
+        assert!(!should_preserve_atime(&p(&["e", "a"])));
+        assert!(should_preserve_mtime(&p(&["m", "e"])));
+        assert!(!should_preserve_mtime(&p(&["e", "m"])));
+    }
+
+    #[test]
+    fn test_p_may_repeat_and_h_l_last_wins() {
+        let args = Args::parse_from(["pax", "-r", "-p", "e", "-p", "m"]);
+        assert_eq!(args.privs, p(&["e", "m"]));
+
+        let args = Args::parse_from(["pax", "-w", "-H", "-L"]);
+        assert!(args.dereference && !args.cli_dereference);
+        let args = Args::parse_from(["pax", "-w", "-L", "-H"]);
+        assert!(args.cli_dereference && !args.dereference);
+    }
+
+    #[test]
+    fn test_option_arguments_may_begin_with_a_dash() {
+        let args = Args::parse_from(["pax", "-w", "-s", "-a-b-", "-v", "f"]);
+        assert_eq!(args.substitutions, vec!["-a-b-".to_string()]);
+        assert!(args.verbose, "-v after the -s argument is still an option");
+        let args = Args::parse_from(["pax", "-r", "-f", "-v"]);
+        assert_eq!(args.archive.as_deref(), Some(std::path::Path::new("-v")));
+        assert!(!args.verbose);
+    }
+
+    #[test]
+    fn test_operands_keep_their_bytes() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let name = OsString::from_vec(b"caf\xe9".to_vec());
+        let args = Args::try_parse_from([OsString::from("pax"), "-w".into(), name.clone()])
+            .expect("a non-UTF-8 operand is a pathname, not a usage error");
+        let files = get_files_to_archive(&args).unwrap();
+        assert_eq!(files[0].as_os_str().as_bytes(), b"caf\xe9");
+
+        // As a pattern it selects the member of that name.
+        let pat = &compile_patterns(&[name]).unwrap().remove(0);
+        let member = rawpath::from_bytes(b"caf\xe9");
+        assert!(pat.matches(rawpath::MatchName::of(&member).as_str()));
+        assert!(!pat.matches("caf"));
     }
 }

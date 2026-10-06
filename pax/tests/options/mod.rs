@@ -14,6 +14,7 @@ use plib::tmp::TempDir;
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
 
 #[test]
 fn test_option_listopt_filename() {
@@ -2362,5 +2363,81 @@ fn test_o_keyword_with_invalid_value_is_refused_on_list() {
             "{opt}: {}",
             stderr_str(&output)
         );
+    }
+}
+
+/// The synopsis is `[-p string]...`: -p may be repeated, and the strings
+/// combine as if concatenated.
+#[test]
+fn test_p_option_may_repeat() {
+    let temp = TempDir::new().unwrap();
+    let archive = Ustar {
+        name: b"f",
+        body: b"F\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let output =
+        run_pax_with_stdin_bytes_in_dir(&["-r", "-p", "p", "-p", "m"], &archive, temp.path());
+    assert_success(&output, "pax -r -p p -p m");
+    assert!(temp.path().join("f").exists());
+}
+
+/// -H and -L conflict, and POSIX says the last one given wins. With -L last
+/// a symlink met in the walk is followed; with -H last only operands are.
+#[test]
+fn test_h_and_l_last_one_wins() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir(temp.path().join("d")).unwrap();
+    fs::write(temp.path().join("target"), "T\n").unwrap();
+    std::os::unix::fs::symlink("../target", temp.path().join("d/link")).unwrap();
+
+    for (flags, want) in [(["-H", "-L"], "-"), (["-L", "-H"], "l")] {
+        let output = run_pax_in_dir(&["-w", flags[0], flags[1], "-x", "ustar", "d"], temp.path());
+        assert_success(&output, "pax -w");
+        let listing = run_pax_with_stdin_bytes(&["-v"], &output.stdout);
+        let line = stdout_str(&listing)
+            .lines()
+            .find(|l| l.ends_with("d/link") || l.contains("d/link "))
+            .unwrap_or_default()
+            .to_string();
+        assert!(line.starts_with(want), "{flags:?}: {line}");
+    }
+}
+
+/// An -s expression may use any delimiter, `-` included, even though the
+/// operand then looks like an option.
+#[test]
+fn test_s_expression_with_dash_delimiter() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("abc"), "A\n").unwrap();
+
+    let output = run_pax_in_dir(&["-w", "-s", "-abc-xyz-", "abc"], temp.path());
+    assert_success(&output, "pax -w -s -abc-xyz-");
+    let listing = run_pax_with_stdin_bytes(&[], &output.stdout);
+    assert_eq!(stdout_str(&listing), "xyz\n");
+}
+
+/// Pathnames are byte strings. An argument that is not UTF-8 must not panic
+/// the tar front-end or be refused by pax as a usage error.
+#[test]
+fn test_non_utf8_argument_is_a_pathname() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let temp = TempDir::new().unwrap();
+    let name = OsStr::from_bytes(b"caf\xe9");
+
+    for program in ["pax", "tar"] {
+        let mut cmd = Command::new(front_end(program));
+        if program == "pax" {
+            cmd.args(["-w", "-f", "x.tar"]);
+        } else {
+            cmd.args(["-cf", "x.tar"]);
+        }
+        let output = cmd.arg(name).current_dir(temp.path()).output().unwrap();
+        // The file does not exist: a diagnostic and exit 1, not a panic (101)
+        // or a usage error (2).
+        assert_exit_code(&output, 1, program);
     }
 }

@@ -26,9 +26,12 @@ pub mod tar;
 
 use crate::error::{PaxError, PaxResult};
 use crate::modes;
+use crate::rawpath;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
 /// Which historic command line this invocation should be parsed as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,19 +93,20 @@ fn unknown(prog: &str, opt: &str) -> PaxError {
 /// operation starts, and therefore before any `-C` has changed the working
 /// directory, which is what makes the names in the file relative to where the
 /// command was invoked.
-fn read_name_list(path: &str, nul: bool) -> PaxResult<Vec<String>> {
+///
+/// The names are kept as the bytes the list holds: a list naming `caf\351`
+/// must not archive some other file whose name is its lossy rendering.
+fn read_name_list(path: &OsStr, nul: bool) -> PaxResult<Vec<OsString>> {
     let sep = if nul { b'\0' } else { b'\n' };
     let names = if path == "-" {
         modes::write::read_file_list_sep(io::stdin(), sep)?
     } else {
-        let file = File::open(path).map_err(|e| PaxError::Usage(format!("{}: {}", path, e)))?;
+        let file = File::open(path)
+            .map_err(|e| PaxError::Usage(format!("{}: {}", Path::new(path).display(), e)))?;
         modes::write::read_file_list_sep(file, sep)?
     };
 
-    Ok(names
-        .into_iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect())
+    Ok(names.into_iter().map(PathBuf::into_os_string).collect())
 }
 
 /// A cursor over the command line, shared by both front-end parsers.
@@ -110,14 +114,17 @@ fn read_name_list(path: &str, nul: bool) -> PaxResult<Vec<String>> {
 /// The two differ in which options exist and how the first operand is spelled,
 /// but not in how an option-argument is found: it is either glued to the option
 /// letter (`-fx.tar`), joined to the long name with `=`, or the next argument.
+///
+/// Arguments are kept as `OsString`: an operand or option-argument may be a
+/// pathname, and a pathname is a byte string that need not be UTF-8.
 struct ArgCursor {
-    argv: Vec<String>,
+    argv: Vec<OsString>,
     pos: usize,
     prog: &'static str,
 }
 
 impl ArgCursor {
-    fn new(prog: &'static str, argv: Vec<String>, start: usize) -> Self {
+    fn new(prog: &'static str, argv: Vec<OsString>, start: usize) -> Self {
         ArgCursor {
             argv,
             pos: start,
@@ -125,7 +132,7 @@ impl ArgCursor {
         }
     }
 
-    fn next(&mut self) -> Option<String> {
+    fn next(&mut self) -> Option<OsString> {
         let item = self.argv.get(self.pos).cloned();
         if item.is_some() {
             self.pos += 1;
@@ -137,7 +144,7 @@ impl ArgCursor {
     ///
     /// `glued` is whatever followed the option letter in the same argument;
     /// when it is empty the value comes from the next argument.
-    fn value(&mut self, opt: &str, glued: Option<String>) -> PaxResult<String> {
+    fn value(&mut self, opt: &str, glued: Option<OsString>) -> PaxResult<OsString> {
         if let Some(v) = glued {
             if !v.is_empty() {
                 return Ok(v);
@@ -148,14 +155,108 @@ impl ArgCursor {
     }
 
     /// Everything not yet consumed, as operands.
-    fn rest(&mut self) -> Vec<String> {
+    fn rest(&mut self) -> Vec<OsString> {
         self.argv.split_off(self.pos.min(self.argv.len()))
     }
 }
 
 /// Parse a non-negative integer option-argument.
-fn parse_number(prog: &str, opt: &str, value: &str) -> PaxResult<u64> {
+fn parse_number(prog: &str, opt: &str, value: &OsStr) -> PaxResult<u64> {
     value
-        .parse::<u64>()
-        .map_err(|_| usage(prog, format!("invalid number '{}' for '{}'", value, opt)))
+        .to_str()
+        .and_then(|v| v.parse::<u64>().ok())
+        .ok_or_else(|| {
+            usage(
+                prog,
+                format!("invalid number '{}' for '{}'", value.to_string_lossy(), opt),
+            )
+        })
+}
+
+/// A front-end's handler for a long option or a short-option cluster.
+type OptionHandler<S> = fn(&[u8], &mut S, &mut ArgCursor) -> PaxResult<()>;
+
+/// Walk the rest of the command line, handing each long option and each
+/// short-option cluster to the front-end, and return the operands in order.
+fn parse_options<S>(
+    cur: &mut ArgCursor,
+    st: &mut S,
+    long: OptionHandler<S>,
+    cluster: OptionHandler<S>,
+) -> PaxResult<Vec<OsString>> {
+    let mut operands = Vec::new();
+    while let Some(arg) = cur.next() {
+        match classify(&arg) {
+            ArgKind::EndOfOptions => {
+                operands.extend(cur.rest());
+                break;
+            }
+            ArgKind::Long(name) => long(name, st, cur)?,
+            ArgKind::Cluster(letters) => cluster(letters, st, cur)?,
+            ArgKind::Operand => operands.push(arg),
+        }
+    }
+    Ok(operands)
+}
+
+/// One command-line argument, classified the way both front-ends read it.
+enum ArgKind<'a> {
+    /// `--`: everything after it is an operand.
+    EndOfOptions,
+    /// `--name` or `--name=value`, with the dashes stripped.
+    Long(&'a [u8]),
+    /// `-xyz`, with the dash stripped.
+    Cluster(&'a [u8]),
+    /// Anything else, including a bare `-`.
+    Operand,
+}
+
+fn classify(arg: &OsStr) -> ArgKind<'_> {
+    let bytes = arg.as_bytes();
+    if bytes == b"--" {
+        ArgKind::EndOfOptions
+    } else if let Some(long) = bytes.strip_prefix(b"--") {
+        ArgKind::Long(long)
+    } else if bytes.len() > 1 && bytes[0] == b'-' {
+        ArgKind::Cluster(&bytes[1..])
+    } else {
+        ArgKind::Operand
+    }
+}
+
+/// Split a long option into its name and any `=value` glued to it.
+///
+/// The value keeps its bytes. The name is text: every long option is ASCII, so
+/// a name that is not UTF-8 is simply one no front-end knows, and is rendered
+/// lossily only for the diagnostic.
+fn split_long(long: &[u8]) -> (String, Option<OsString>) {
+    let (name, value) = match long.iter().position(|&b| b == b'=') {
+        Some(i) => (
+            &long[..i],
+            Some(OsStr::from_bytes(&long[i + 1..]).to_owned()),
+        ),
+        None => (long, None),
+    };
+    (String::from_utf8_lossy(name).into_owned(), value)
+}
+
+/// The option letters of a `-xyz` cluster, each with the bytes that follow it.
+///
+/// A letter that is not one character of UTF-8 comes back as U+FFFD, which no
+/// front-end recognizes, so it is reported as an unknown option. What follows
+/// a letter is the glued value of an option that takes one.
+fn cluster_letters(cluster: &[u8]) -> impl Iterator<Item = (char, &[u8])> {
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        if i >= cluster.len() {
+            return None;
+        }
+        let len = rawpath::unit_len(&cluster[i..]);
+        let c = std::str::from_utf8(&cluster[i..i + len])
+            .ok()
+            .and_then(|s| s.chars().next())
+            .unwrap_or(char::REPLACEMENT_CHARACTER);
+        i += len;
+        Some((c, &cluster[i..]))
+    })
 }

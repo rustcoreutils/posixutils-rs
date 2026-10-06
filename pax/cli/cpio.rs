@@ -12,9 +12,14 @@
 //! Scope is the set of options that appear in real scripts, not everything GNU
 //! cpio accepts. Anything outside it is rejected by name rather than ignored.
 
-use super::{parse_number, read_name_list, unknown, unsupported, usage, ArgCursor};
+use super::{
+    cluster_letters, parse_number, parse_options, read_name_list, split_long, unknown, unsupported,
+    usage, ArgCursor,
+};
 use crate::error::{PaxError, PaxResult};
 use crate::{Args, Format};
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 const PROG: &str = "cpio";
@@ -50,7 +55,7 @@ struct State {
     /// --quiet: do not report the block count
     quiet: bool,
     format: Option<Format>,
-    operands: Vec<String>,
+    operands: Vec<OsString>,
 }
 
 impl State {
@@ -82,22 +87,11 @@ impl State {
 }
 
 /// Parse a cpio command line into pax's internal options.
-pub fn parse(argv: Vec<String>) -> PaxResult<Args> {
+pub fn parse(argv: Vec<OsString>) -> PaxResult<Args> {
     let mut st = State::new();
     let mut cur = ArgCursor::new(PROG, argv, 1);
 
-    while let Some(arg) = cur.next() {
-        if arg == "--" {
-            st.operands.extend(cur.rest());
-            break;
-        } else if let Some(long) = arg.strip_prefix("--") {
-            apply_long(long, &mut st, &mut cur)?;
-        } else if arg.len() > 1 && arg.starts_with('-') {
-            apply_cluster(&arg[1..], &mut st, &mut cur)?;
-        } else {
-            st.operands.push(arg);
-        }
-    }
+    st.operands = parse_options(&mut cur, &mut st, apply_long, apply_cluster)?;
 
     finish(st)
 }
@@ -105,7 +99,7 @@ pub fn parse(argv: Vec<String>) -> PaxResult<Args> {
 /// Apply one short option. `glued` is the rest of its cluster, if any.
 fn apply_short(
     c: char,
-    glued: Option<String>,
+    glued: Option<OsString>,
     st: &mut State,
     cur: &mut ArgCursor,
 ) -> PaxResult<()> {
@@ -152,7 +146,7 @@ fn apply_short(
 }
 
 /// Apply a short option that took an argument.
-fn apply_value(c: char, value: &str, st: &mut State) -> PaxResult<()> {
+fn apply_value(c: char, value: &OsStr, st: &mut State) -> PaxResult<()> {
     match c {
         // -F names one archive for either direction; -I and -O are the
         // input-only and output-only spellings of the same thing.
@@ -162,7 +156,10 @@ fn apply_value(c: char, value: &str, st: &mut State) -> PaxResult<()> {
             if size == 0 || size > u32::MAX as u64 {
                 return Err(usage(
                     PROG,
-                    format!("I/O block size '{}' is out of range", value),
+                    format!(
+                        "I/O block size '{}' is out of range",
+                        value.to_string_lossy()
+                    ),
                 ));
             }
             st.args.blocksize = Some(size as u32);
@@ -180,8 +177,10 @@ fn apply_value(c: char, value: &str, st: &mut State) -> PaxResult<()> {
 }
 
 /// Map a `-H` name onto the archive format pax will write.
-fn archive_format(name: &str) -> PaxResult<Format> {
-    match name {
+fn archive_format(name: &OsStr) -> PaxResult<Format> {
+    // No format name is anything but ASCII, so a lossy rendering only ever
+    // matters to the diagnostic.
+    match name.to_string_lossy().as_ref() {
         "bin" => Ok(Format::Bcpio),
         "odc" => Ok(Format::Cpio),
         "newc" => Ok(Format::Sv4cpio),
@@ -197,10 +196,11 @@ fn archive_format(name: &str) -> PaxResult<Format> {
 }
 
 /// Apply a cluster of short options from a single `-xyz` argument.
-fn apply_cluster(cluster: &str, st: &mut State, cur: &mut ArgCursor) -> PaxResult<()> {
-    for (i, c) in cluster.char_indices() {
+fn apply_cluster(cluster: &[u8], st: &mut State, cur: &mut ArgCursor) -> PaxResult<()> {
+    for (c, rest) in cluster_letters(cluster) {
         if takes_arg(c) {
-            let glued = cluster[i + c.len_utf8()..].to_string();
+            // Whatever follows the letter in this argument is its value.
+            let glued = OsStr::from_bytes(rest).to_owned();
             return apply_short(c, Some(glued), st, cur);
         }
         apply_short(c, None, st, cur)?;
@@ -209,11 +209,9 @@ fn apply_cluster(cluster: &str, st: &mut State, cur: &mut ArgCursor) -> PaxResul
 }
 
 /// Apply one long option, with the leading `--` already stripped.
-fn apply_long(long: &str, st: &mut State, cur: &mut ArgCursor) -> PaxResult<()> {
-    let (name, inline) = match long.split_once('=') {
-        Some((n, v)) => (n, Some(v.to_string())),
-        None => (long, None),
-    };
+fn apply_long(long: &[u8], st: &mut State, cur: &mut ArgCursor) -> PaxResult<()> {
+    let (name, inline) = split_long(long);
+    let name = name.as_str();
 
     let short = match name {
         "create" => Some('o'),
@@ -292,7 +290,7 @@ fn finish(mut st: State) -> PaxResult<Args> {
     // -0 that list is NUL-separated, which pax cannot read for itself, so it is
     // collected here and handed over as operands instead.
     let names = if st.null && mode != Mode::CopyIn {
-        read_name_list("-", true)?
+        read_name_list(OsStr::new("-"), true)?
     } else {
         Vec::new()
     };
@@ -336,7 +334,7 @@ fn finish(mut st: State) -> PaxResult<Args> {
     // cpio restores modification times only when asked; pax preserves them by
     // default, so the absence of -m is what has to be expressed.
     if !st.preserve_mtime && mode != Mode::CopyOut {
-        st.args.privs = Some("m".to_string());
+        st.args.privs = vec!["m".to_string()];
     }
 
     // Without -u, cpio refuses to replace a file with an older archived copy --
@@ -397,8 +395,8 @@ mod tests {
 
     /// Parse a cpio command line given without the leading program name.
     fn cpio(args: &[&str]) -> PaxResult<Args> {
-        let mut argv = vec!["cpio".to_string()];
-        argv.extend(args.iter().map(|s| s.to_string()));
+        let mut argv = vec![OsString::from("cpio")];
+        argv.extend(args.iter().map(OsString::from));
         parse(argv)
     }
 
@@ -417,7 +415,7 @@ mod tests {
         // -p is copy mode, with the destination as its only operand.
         let pass = cpio(&["-p", "dest"]).unwrap();
         assert!(pass.read_mode && pass.write_mode);
-        assert_eq!(pass.files_and_patterns, vec!["dest".to_string()]);
+        assert_eq!(pass.files_and_patterns, [OsString::from("dest")]);
 
         assert!(
             cpio(&["-o", "-p", "dest"]).is_err(),
@@ -466,16 +464,16 @@ mod tests {
         // cpio restores timestamps only under -m, and refuses to replace a
         // newer file unless -u; pax's defaults are the other way round.
         let plain = cpio(&["-i"]).unwrap();
-        assert_eq!(plain.privs.as_deref(), Some("m"));
+        assert_eq!(plain.privs, ["m"]);
         assert!(plain.update);
 
         let both = cpio(&["-imu"]).unwrap();
-        assert_eq!(both.privs, None);
+        assert_eq!(both.privs, Vec::<String>::new());
         assert!(!both.update);
 
         // Neither applies when writing an archive.
         let out = cpio(&["-o"]).unwrap();
-        assert_eq!(out.privs, None);
+        assert_eq!(out.privs, Vec::<String>::new());
         assert!(!out.update);
     }
 
@@ -522,7 +520,7 @@ mod tests {
         assert!(cpio(&["-i"]).unwrap().files_and_patterns.is_empty());
         assert_eq!(
             cpio(&["-i", "*.txt"]).unwrap().files_and_patterns,
-            vec!["*.txt".to_string()]
+            [OsString::from("*.txt")]
         );
     }
 

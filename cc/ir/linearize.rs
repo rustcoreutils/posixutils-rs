@@ -2881,6 +2881,11 @@ impl<'a> Linearizer<'a> {
             // Alloca allocates memory - not pure
             ExprKind::Alloca { .. } => false,
 
+            // They read or move the stack pointer, or write memory.
+            ExprKind::StackSave | ExprKind::StackRestore { .. } | ExprKind::ClearPadding { .. } => {
+                false
+            }
+
             // Unreachable is pure (no side effects, just UB hint)
             ExprKind::Unreachable => true,
 
@@ -3967,7 +3972,7 @@ impl<'a> Linearizer<'a> {
     /// None unless `expr` is rooted in a local -- or a type-name's value --
     /// whose declaration recorded extents. A pointer's are those of what it
     /// points at, one step further in than the pointer itself.
-    fn vm_type_extents(&self, expr: &Expr) -> Option<(Vec<VmDim>, TypeId)> {
+    pub(crate) fn vm_type_extents(&self, expr: &Expr) -> Option<(Vec<VmDim>, TypeId)> {
         let (symbol_id, depth) = expr.vm_index_base()?;
         let info = self.locals.get(&symbol_id)?;
         let elem = info.vla_elem_type?;
@@ -6060,6 +6065,31 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
+            ExprKind::StackSave => {
+                let result = self.alloc_reg_pseudo();
+                self.emit(
+                    Instruction::new(Opcode::StackSave)
+                        .with_target(result)
+                        .with_type_and_size(self.types.void_ptr_id, self.ptr_bits()),
+                );
+                result
+            }
+
+            ExprKind::StackRestore { ptr } => {
+                let mark = self.linearize_expr(ptr);
+                self.emit(
+                    Instruction::new(Opcode::StackRestore)
+                        .with_src(mark)
+                        .with_type_and_size(self.types.void_ptr_id, self.ptr_bits()),
+                );
+                self.emit_const(0, self.types.int_id)
+            }
+
+            ExprKind::ClearPadding { ptr, pointee } => {
+                self.linearize_clear_padding(ptr, *pointee);
+                self.emit_const(0, self.types.int_id)
+            }
+
             ExprKind::FpTest { test, arg } => self.linearize_fp_test(*test, arg),
             ExprKind::FpCompare { cmp, lhs, rhs } => self.linearize_fp_compare(*cmp, lhs, rhs),
 
@@ -7064,6 +7094,9 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Popcountl { .. }
             | ExprKind::Popcountll { .. }
             | ExprKind::Alloca { .. }
+            | ExprKind::StackSave
+            | ExprKind::StackRestore { .. }
+            | ExprKind::ClearPadding { .. }
             | ExprKind::FpTest { .. }
             | ExprKind::FpCompare { .. }
             | ExprKind::FpClassify { .. }

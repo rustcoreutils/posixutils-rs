@@ -211,6 +211,8 @@ value gcc folds them to on both targets; at run time they stay undefined.
 |---------|-------------|
 | `__builtin_alloca(size)`, `alloca(size)` | `Opcode::Alloca`, freed on return. An inlined callee's `alloca` is bracketed by `StackSave`/`StackRestore` so it is freed when the call would have returned. The bare `alloca` is displaced by a non-function declaration or `-fno-builtin[-alloca]`; `<alloca.h>`'s function declaration does not displace it. Either spelling is checked through gcc's prototype `void *(size_t)` |
 | `memset`, `memcpy`, `memmove`, `mempcpy`, `bcopy` and their `__builtin_` spellings | Computed in place (next section) |
+| `__builtin_stack_save()`, `__builtin_stack_restore(p)` | `void *(void)` and `void (void *)`: `Opcode::StackSave` and `Opcode::StackRestore`, the pair c17 brackets a VLA's scope and an inlined `alloca` with. The restore frees every `alloca` and VLA made since the save; nothing else frees an `alloca` before the function returns. Every local is addressed from the frame pointer and every epilogue resets the stack pointer from it, so moving the stack pointer disturbs neither; a VLA whose scope then ends restores its own mark, which is never below the program's. A save live across a `setjmp` survives the `longjmp` back to it, as any value live there does |
+| `__builtin_clear_padding(p)` | Zeroes every padding bit of `*p` and leaves its members' bits alone (`ir/padding.rs`), as gcc 13 does: the gaps between members and the tail; the bits of a bit-field's bytes no named bit-field uses (an unnamed bit-field is padding); in a union, only the bits that are padding in every member, a bit-field directly in a union covering whole bytes; the 6 unused bytes of x87 `long double`, in each half of a complex one; each element of an array. A byte of padding is a zero store (runs of them a `Memset`, expanded like any other), a byte partly a bit-field's is and-ed with the bits to keep. A pointer to a variable length array clears its innermost fixed-size element in a loop; an array argument points at its first element only. `p` must be a pointer to a complete type that is not `const` and has no flexible array member, with gcc's errors; a pointer to a function is accepted and clears nothing |
 | `__builtin_prefetch(addr[, rw[, locality]])` | Emits nothing. `addr` is evaluated (`__builtin_prefetch((q = p))` assigns `q`). `rw` (0 or 1) and locality (0 to 3) must be integer constants, so there is nothing in them to evaluate; one out of range is a warning, as in gcc. Further arguments are accepted and ignored, as gcc ignores them |
 
 ## Library Functions Computed in Place
@@ -437,6 +439,8 @@ not be in the same function as its setjmp is not diagnosed, by gcc either.
 |---------|-------------|
 | `__builtin_complex(re, im)` | `ExprKind::BuiltinComplex`, of the complex type of `re`'s type. Usable in static initializers and at file scope (`<complex.h>`'s `I` and `CMPLX` macros use it), at every precision. The operands must be of one real floating type, as gcc requires |
 | `__builtin_creal`, `crealf`, `creall`, `cimag`, `cimagf`, `cimagl`, `conj`, `conjf`, `conjl` | Computed in place (above) |
+| `__builtin_cexpi(x)`, `cexpif`, `cexpil` | `cos x + i sin x`: a call to `cexp` (`cexpf`, `cexpl`) of `+0 + xi`, so the answer is exactly `cexp(I * x)`'s. gcc calls `sincos` where it exists, which glibc's `cexp` computes the same way, scaled by `exp(+0)`; `cexp` exists everywhere, macOS included. The argument converts to the real type, as gcc's prototype says |
+| `__builtin_cpow(z, w)`, `cpowf`, `cpowl` | The library's `cpow` (below) |
 
 Complex integer types (`_Complex int` and the rest, a GNU extension) are
 supported as two integers laid end to end; multiply and divide are
@@ -507,6 +511,7 @@ implicit declaration of one of these names takes the row's return type.
 | `__builtin_printf`, `sprintf`, `snprintf`, `fprintf`, `puts`, `putchar`, `fputs`, `fputc`, `fwrite` | |
 | `__builtin_printf_unlocked`, `fprintf_unlocked`, `fputs_unlocked` | glibc defines none of these; a program using one supplies it (gcc.c-torture's `builtins/` tests do) |
 | `__builtin_pow`, `fmod`, `atan2`, `hypot`, `fdim`, `remainder`, `nextafter` and `f`/`l` forms | |
+| `__builtin_cpow`, `cpowf`, `cpowl` | Through the complex prototype, so a real argument converts to it (`__builtin_cpow(x, 75)`) |
 | `__builtin_cbrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `exp`, `exp2`, `expm1`, `log`, `log2`, `log10`, `log1p`, `logb`, `ilogb`, `tgamma`, `lgamma`, `erf`, `erfc` and `f`/`l` forms | |
 | `__builtin_modf`, `frexp`, `ldexp` and `f`/`l` forms | The second parameter is a pointer or an `int` |
 | `__builtin_ceill`, `floorl`, `truncl`, `roundl`, `rintl`, `nearbyintl`, `fminl`, `fmaxl`, `fmal` | The `long double` forms of functions computed in place |
@@ -647,9 +652,6 @@ Their absence is silent and changes which branch a guarded header takes.
 | Builtin | Consequence |
 |---------|-------------|
 | `__builtin_strnlen`, `__builtin_vprintf`, `__builtin_vfprintf` | `strnlen`, `vprintf`, `vfprintf` are known by their bare names only |
-| `__builtin_clear_padding` | Would have to walk a type to find its padding |
-| `__builtin_stack_save`, `__builtin_stack_restore` | c17 frees a VLA at the end of its block without them. The IR has `StackSave`/`StackRestore` for inlining, but no builtin reaches them |
-| `__builtin_cexpi`, `__builtin_cpow` | Complex libm entry points gcc synthesizes; no header declares them |
 | `__builtin_bswap128` | No 128-bit byte swap |
 
 ## Adding a Builtin

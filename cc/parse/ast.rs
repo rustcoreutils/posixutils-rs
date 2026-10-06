@@ -1091,6 +1091,27 @@ pub enum ExprKind {
         size: Box<Expr>,
     },
 
+    /// `__builtin_stack_save()`: the stack pointer, as a `void *`, for a
+    /// later [`ExprKind::StackRestore`] to put back.
+    StackSave,
+
+    /// `__builtin_stack_restore(ptr)`: put the stack pointer back to what a
+    /// `__builtin_stack_save` answered, releasing every `alloca` and VLA
+    /// allocated since.
+    StackRestore {
+        /// The saved stack pointer, converted to `void *`
+        ptr: Box<Expr>,
+    },
+
+    /// `__builtin_clear_padding(ptr)`: zero every padding bit of the object
+    /// `ptr` points at, leaving its members' bits alone.
+    ClearPadding {
+        /// The pointer, as written (an array argument is not yet decayed)
+        ptr: Box<Expr>,
+        /// The type of the object it points at
+        pointee: TypeId,
+    },
+
     // =========================================================================
     // Floating-point builtins
     // =========================================================================
@@ -2401,6 +2422,7 @@ impl Expr {
             | K::VaArgPack
             | K::VaArgPackLen
             | K::Unreachable
+            | K::StackSave
             | K::FrameAddress { .. }
             | K::ReturnAddress { .. }
             | K::OffsetOf { .. } => Vec::new(),
@@ -2447,6 +2469,8 @@ impl Expr {
             | K::Popcountl { arg: a }
             | K::Popcountll { arg: a }
             | K::Alloca { size: a }
+            | K::StackRestore { ptr: a }
+            | K::ClearPadding { ptr: a, .. }
             | K::FpTest { arg: a, .. }
             | K::Setjmp { env: a, .. }
             | K::C11AtomicThreadFence { order: a }

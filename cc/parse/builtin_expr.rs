@@ -16,6 +16,7 @@ use super::ast::{
 };
 use super::builtin_args::ConstantArgument;
 use super::library_builtin::LibraryBuiltin;
+use super::lowering_builtin::CEXPI_BUILTINS;
 use super::parser::{ParseError, ParseResult, Parser};
 use crate::diag;
 use crate::float::{FloatVal, NanKind};
@@ -517,13 +518,41 @@ impl Parser<'_> {
         }
     }
 
-    /// `alloca`, bare or reserved.
+    /// `alloca`, bare or reserved, the stack pointer's save and restore,
+    /// and `__builtin_clear_padding`.
     fn parse_memory_builtin(
         &mut self,
         name_id: StringId,
         token_pos: Position,
     ) -> Option<ParseResult<Expr>> {
         match name_id {
+            crate::kw::BUILTIN_STACK_SAVE => Some((|| {
+                // gcc's `void *__builtin_stack_save(void)`.
+                use super::library_builtin::ProtoType::VoidPtr;
+                let void_ptr = self.types.void_ptr_id;
+                if self
+                    .parse_prototyped_builtin(name_id, VoidPtr, &[], false)?
+                    .is_none()
+                {
+                    return Ok(self.diagnosed_call(void_ptr, token_pos));
+                }
+                Ok(Self::typed_expr(ExprKind::StackSave, void_ptr, token_pos))
+            })()),
+            crate::kw::BUILTIN_STACK_RESTORE => Some((|| {
+                // gcc's `void __builtin_stack_restore(void *)`.
+                use super::library_builtin::ProtoType::{Void, VoidPtr};
+                let void = self.types.void_id;
+                let args = self.parse_prototyped_builtin(name_id, Void, &[VoidPtr], false)?;
+                let Some(ptr) = args.and_then(|args| args.into_iter().next()) else {
+                    return Ok(self.diagnosed_call(void, token_pos));
+                };
+                Ok(Self::typed_expr(
+                    ExprKind::StackRestore { ptr: Box::new(ptr) },
+                    void,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_CLEAR_PADDING => Some(self.parse_clear_padding(token_pos)),
             crate::kw::BUILTIN_ALLOCA | crate::kw::ALLOCA => Some((|| {
                 // gcc's prototype is `void *(size_t)`, for either spelling.
                 use super::library_builtin::ProtoType::{SizeT, VoidPtr};
@@ -549,6 +578,10 @@ impl Parser<'_> {
         name_id: StringId,
         token_pos: Position,
     ) -> Option<ParseResult<Expr>> {
+        if let Some(&(_, real, complex, cexp)) = CEXPI_BUILTINS.iter().find(|row| row.0 == name_id)
+        {
+            return Some(self.parse_cexpi(name_id, real, complex, cexp, token_pos));
+        }
         if let Some(&(_, value, suffix)) = FLOAT_CONSTANT_BUILTINS
             .iter()
             .find(|(id, _, _)| *id == name_id)
@@ -2178,6 +2211,9 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_POW
                 | crate::kw::BUILTIN_POWF
                 | crate::kw::BUILTIN_POWL
+                | crate::kw::BUILTIN_CPOW
+                | crate::kw::BUILTIN_CPOWF
+                | crate::kw::BUILTIN_CPOWL
                 | crate::kw::BUILTIN_FMAL
                 | crate::kw::BUILTIN_BCMP
                 | crate::kw::BUILTIN_BZERO

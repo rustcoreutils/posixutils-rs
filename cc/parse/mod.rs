@@ -27,6 +27,7 @@ mod expression;
 mod generic_builtin;
 mod library_builtin;
 mod linkage;
+mod lowering_builtin;
 mod operand_rule;
 pub mod parser;
 mod statement;

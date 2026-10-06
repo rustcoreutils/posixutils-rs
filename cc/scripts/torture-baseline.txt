@@ -793,6 +793,8 @@ compile/20071108-1@-O0
 compile/20071108-1@-O2
 compile/20071114-1@-O0
 compile/20071114-1@-O2
+compile/20071117-1@-O0
+compile/20071117-1@-O2
 compile/20071118-1@-O0
 compile/20071118-1@-O2
 compile/20071128-1@-O0
@@ -2112,6 +2114,8 @@ compile/pr109919-1@-O0
 compile/pr109919-1@-O2
 compile/pr110251@-O0
 compile/pr110251@-O2
+compile/pr110266@-O0
+compile/pr110266@-O2
 compile/pr110271@-O0
 compile/pr110271@-O2
 compile/pr110334@-O0
@@ -3162,6 +3166,8 @@ compile/pr54103-6@-O0
 compile/pr54103-6@-O2
 compile/pr54321@-O0
 compile/pr54321@-O2
+compile/pr54428@-O0
+compile/pr54428@-O2
 compile/pr54552-1@-O0
 compile/pr54552-1@-O2
 compile/pr54559@-O0
@@ -3676,6 +3682,8 @@ compile/pr97578@-O0
 compile/pr97578@-O2
 compile/pr97979@-O0
 compile/pr97979@-O2
+compile/pr98087@-O0
+compile/pr98087@-O2
 compile/pr98096@-O0
 compile/pr98096@-O2
 compile/pr98199@-O0

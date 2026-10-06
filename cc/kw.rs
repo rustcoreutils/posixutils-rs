@@ -1202,6 +1202,23 @@ define_keywords! {
     // `__label__`: declares labels local to a block, at its head. A
     // statement keyword, so it is never itself a label. Appended, as above.
     (GNU_LABEL,         "__label__",         STMT_KW | RESERVED_NAME),
+    // Builtins gcc makes for its own lowering, which code may also call.
+    // Appended, as above. `cexp` and `cpow` are what the complex ones call.
+    (BUILTIN_STACK_SAVE,    "__builtin_stack_save",    BUILTIN),
+    (BUILTIN_STACK_RESTORE, "__builtin_stack_restore", BUILTIN),
+    (BUILTIN_CLEAR_PADDING, "__builtin_clear_padding", BUILTIN),
+    (BUILTIN_CEXPI,     "__builtin_cexpi",   BUILTIN),
+    (BUILTIN_CEXPIF,    "__builtin_cexpif",  BUILTIN),
+    (BUILTIN_CEXPIL,    "__builtin_cexpil",  BUILTIN),
+    (BUILTIN_CPOW,      "__builtin_cpow",    BUILTIN),
+    (BUILTIN_CPOWF,     "__builtin_cpowf",   BUILTIN),
+    (BUILTIN_CPOWL,     "__builtin_cpowl",   BUILTIN),
+    (CEXP,              "cexp",              0),
+    (CEXPF,             "cexpf",             0),
+    (CEXPL,             "cexpl",             0),
+    (CPOW,              "cpow",              0),
+    (CPOWF,             "cpowf",             0),
+    (CPOWL,             "cpowl",             0),
 }
 
 // Tag query API

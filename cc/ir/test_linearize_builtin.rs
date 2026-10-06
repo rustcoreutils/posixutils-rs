@@ -969,3 +969,35 @@ fn test_issignaling_of_a_constant_folds() {
         assert_eq!(run_issignaling(&module, [0; 16]), want, "{arg}");
     }
 }
+
+/// `__builtin_stack_save` is a `StackSave`, and `__builtin_stack_restore`
+/// a `StackRestore` of the value it gave, on both targets.
+#[test]
+fn test_stack_save_and_restore_are_their_opcodes() {
+    let src = "void g(int n) { void *m = __builtin_stack_save();\n\
+               __builtin_stack_restore(m); }\n";
+    for arch in [Arch::X86_64, Arch::Aarch64] {
+        let module = linearize_source(src, &Target::new(arch, Os::Linux));
+        let insns = insns_of(&module, "g");
+        let save = insns
+            .iter()
+            .find(|i| i.op == Opcode::StackSave)
+            .expect("a StackSave");
+        let restore = insns
+            .iter()
+            .find(|i| i.op == Opcode::StackRestore)
+            .expect("a StackRestore");
+        assert_eq!(save.size, 64, "{arch:?}");
+        assert_eq!(restore.src.len(), 1, "{arch:?}");
+        // `m` is promoted: the restore reads the save's own result, through
+        // the copy that was the assignment.
+        let mut mark = restore.src[0];
+        while let Some(copy) = insns
+            .iter()
+            .find(|i| i.op == Opcode::Copy && i.target == Some(mark))
+        {
+            mark = copy.src[0];
+        }
+        assert_eq!(Some(mark), save.target, "{arch:?}");
+    }
+}

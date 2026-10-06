@@ -42,6 +42,7 @@ pub mod mach_o_dtors;
 pub mod mem2reg;
 pub mod memexpand;
 pub mod memloc;
+pub(crate) mod padding;
 pub mod propagate;
 pub mod range;
 pub mod sccp;
@@ -475,7 +476,9 @@ pub enum Opcode {
     /// Capture the stack pointer, so a later [`Opcode::StackRestore`] can put
     /// it back. Defines a pointer-sized pseudo and reads nothing.
     ///
-    /// Exists for inlining. A call to a function that `alloca`s releases that
+    /// A VLA's scope is bracketed by the pair, and the program can write them
+    /// itself as `__builtin_stack_save` / `__builtin_stack_restore`. They also
+    /// exist for inlining. A call to a function that `alloca`s releases that
     /// memory when it returns; splicing the body into the caller would instead
     /// hold it until the *caller* returns, so `for (...) use(n)` with an
     /// `alloca` in `use` would grow the stack every iteration until it

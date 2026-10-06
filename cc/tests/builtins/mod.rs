@@ -21,6 +21,7 @@ mod bit_ops;
 mod call_semantics;
 mod copy_fold;
 mod frame_address;
+mod gcc_lowering;
 mod gnu_atomics;
 mod gnu_batch;
 mod has_feature;

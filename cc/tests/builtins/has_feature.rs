@@ -77,6 +77,23 @@ int main(void) {
         return 14;
 #endif
 
+        // Builtins gcc makes for its own lowering
+#if !__has_builtin(__builtin_stack_save) || !__has_builtin(__builtin_stack_restore)
+        return 16;
+#endif
+
+#if !__has_builtin(__builtin_clear_padding)
+        return 17;
+#endif
+
+#if !__has_builtin(__builtin_cexpi) || !__has_builtin(__builtin_cexpif) || !__has_builtin(__builtin_cexpil)
+        return 18;
+#endif
+
+#if !__has_builtin(__builtin_cpow) || !__has_builtin(__builtin_cpowf) || !__has_builtin(__builtin_cpowl)
+        return 19;
+#endif
+
         // Non-existent builtin should return 0
 #if __has_builtin(__nonexistent_builtin_xyz)
         return 15;

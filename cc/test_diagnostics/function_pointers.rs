@@ -716,12 +716,16 @@ typedef int pt __attribute__((__mode__(__pointer__)));
 typedef float hf __attribute__((__mode__(__HF__)));
 typedef float sf __attribute__((__mode__(__SF__)));
 typedef float df __attribute__((__mode__(__DF__)));
+#ifdef __x86_64__ /* x87 extended: an unknown mode on aarch64, as in gcc */
 typedef float xf __attribute__((__mode__(__XF__)));
+#endif
 typedef float tf __attribute__((__mode__(__TF__)));
 typedef _Complex float hc __attribute__((__mode__(HC)));
 typedef _Complex float sc __attribute__((__mode__(SC)));
 typedef _Complex float dc __attribute__((__mode__(DC)));
+#ifdef __x86_64__
 typedef _Complex float xc __attribute__((__mode__(XC)));
+#endif
 typedef _Complex float tc __attribute__((__mode__(TC)));
 int main(void){ return 0; }
 "#,

@@ -13,6 +13,7 @@
 
 use posixutils_cc::builtins;
 use posixutils_cc::diag;
+use posixutils_cc::f_options::{self, Effect};
 use posixutils_cc::ir;
 use posixutils_cc::linkargs;
 use posixutils_cc::opt;
@@ -444,6 +445,19 @@ struct Args {
     #[arg(long = "c17-ignored", action = clap::ArgAction::Append, value_name = "option",
           allow_hyphen_values = true, hide = true)]
     ignored_options: Vec<String>,
+
+    /// The `-f` options c17 takes without doing what they ask, each warned
+    /// about once `-w` and the `-W` options are known (rewritten by
+    /// `preprocess_args_from`).
+    #[arg(long = "c17-unsupported", action = clap::ArgAction::Append, value_name = "option",
+          allow_hyphen_values = true, hide = true)]
+    unsupported_options: Vec<String>,
+
+    /// `-fstack-clash-protection`, last of it and `-fno-` winning (rewritten
+    /// by `preprocess_args_from`): c17 probes no stack, and warns for each
+    /// function whose stack gcc would probe.
+    #[arg(long = "c17-stack-clash", hide = true)]
+    stack_clash: bool,
 }
 
 /// The `-Wno-` name for the "`-std=` was not honoured" warning.
@@ -1289,6 +1303,7 @@ fn process_file(
         unwind_tables: !args.no_unwind_tables,
         verbose_asm: args.verbose_asm,
         cf_protection: args.cf_protection.unwrap_or_default(),
+        stack_clash: args.stack_clash,
         source_name: path,
         debug_prefix_map: &prefix_maps.debug,
     };
@@ -1707,76 +1722,6 @@ fn preprocess_args() -> Vec<String> {
 ///
 /// Takes the raw argument vector rather than reading the environment so the
 /// unit tests exercise this exact function.
-/// `-f` flags c17 accepts and ignores without comment.
-///
-/// Each names an optimisation or code-generation choice that c17 either does
-/// not make at all, or makes unconditionally, so honouring it and ignoring it
-/// are the same program. Everything outside this list draws a warning, because
-/// a flag that is silently dropped is indistinguishable from one that worked.
-fn is_known_ignorable_f_flag(arg: &str) -> bool {
-    // An exact spelling, or a prefix for the `=`-valued ones.
-    const EXACT: &[&str] = &[
-        // Aliasing and overflow assumptions c17 does not exploit.
-        "-fstrict-aliasing",
-        "-fno-strict-aliasing",
-        "-fstrict-overflow",
-        "-fno-strict-overflow",
-        "-fwrapv",
-        "-fno-wrapv",
-        "-ftrapv",
-        "-fno-trapv",
-        // Inlining and frame choices c17 makes on its own.
-        "-fomit-frame-pointer",
-        "-fno-omit-frame-pointer",
-        "-finline-functions",
-        "-fno-inline-functions",
-        "-fno-inline",
-        "-finline-small-functions",
-        // Tree and loop passes c17 has no equivalent of.
-        "-ftree-vectorize",
-        "-fno-tree-vectorize",
-        "-ftree-loop-distribution",
-        "-fno-tree-loop-distribute-patterns",
-        "-fno-tree-dse",
-        "-fno-tracer",
-        "-fno-ipa-ra",
-        "-funroll-loops",
-        "-fno-unroll-loops",
-        "-fpeel-loops",
-        "-fno-peel-loops",
-        "-ftracer",
-        "-fmodulo-sched",
-        "-foptimize-strlen",
-        "-fno-optimize-strlen",
-        "-fno-vect-cost-model",
-        "-fivopts",
-        "-fno-ivopts",
-        "-fschedule-insns",
-        "-fno-schedule-insns",
-        "-fschedule-insns2",
-        "-fno-schedule-insns2",
-        // Floating point c17 already treats strictly.
-        "-ffloat-store",
-        "-fno-float-store",
-        "-fsigned-zeros",
-        "-fno-signed-zeros",
-        // Linkage and layout.
-        "-fno-common",
-        "-fcommon",
-        "-fno-zero-initialized-in-bss",
-        "-fnon-call-exceptions",
-        "-fno-non-call-exceptions",
-        "-fexceptions",
-        "-fno-exceptions",
-        "-fasynchronous-unwind-tables",
-        "-fno-asynchronous-unwind-tables",
-        "-fno-semantic-interposition",
-        "-fsemantic-interposition",
-    ];
-    const PREFIX: &[&str] = &["-fpack-struct=", "-fstack-protector"];
-    EXACT.contains(&arg) || PREFIX.iter().any(|p| arg.starts_with(p))
-}
-
 fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     let mut result = Vec::with_capacity(raw_args.len());
     let mut i = 0;
@@ -1797,9 +1742,16 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     // The options accepted and ignored with a warning, which waits for the
     // parse: `-w` and `-Werror` decide what it is, wherever they stand.
     let mut ignored = Vec::new();
-    // The `-W<name>` options refused as gcc refuses them: by its driver,
-    // and -- only if the driver let everything through -- by its compiler.
-    let mut warning_errors = Vec::new();
+    // The `-f` options taken without their effect, by what each asks for
+    // (`f_options::family`): a later one of a family replaces an earlier
+    // one, and `-fno-<family>` withdraws it. Warned about after the parse.
+    let mut unsupported: Vec<(String, String)> = Vec::new();
+    // `-fstack-clash-protection`, last one wins.
+    let mut stack_clash = false;
+    // The `-W<name>` and `-f<name>` options refused as gcc refuses them: by
+    // its driver, and -- only if the driver let everything through -- by
+    // its compiler.
+    let mut driver_errors = Vec::new();
     let mut werror_errors = Vec::new();
 
     while i < raw_args.len() {
@@ -1836,7 +1788,7 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             // -Wall → -W all, -Wextra → -W extra, etc. -- once the name is
             // known to be one gcc would take.
             match warn_options::classify(&arg[2..]) {
-                Verdict::DriverError(lines) => warning_errors.extend(lines),
+                Verdict::DriverError(lines) => driver_errors.extend(lines),
                 Verdict::CompilerError(line) => werror_errors.push(line),
                 Verdict::Known(_) | Verdict::PassThrough | Verdict::UnknownNegation => {}
             }
@@ -1942,14 +1894,6 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             result.push("--c17-fno-builtin-func".to_string());
             result.push(func.to_string());
             i += 1;
-        } else if arg == "-fstrict-overflow"
-            || arg == "-fno-strict-overflow"
-            || arg == "-fwrapv"
-            || arg == "-fstrict-aliasing"
-            || arg == "-fno-strict-aliasing"
-        {
-            // GCC optimization flags - silently ignore (c17 doesn't have these optimizations)
-            i += 1;
         } else if arg.starts_with("-m") && arg.len() > 2 {
             // Machine flags are judged once the target is known.
             result.push(format!("--c17-mflag={}", arg));
@@ -1963,19 +1907,6 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
                 std::process::exit(1);
             }
             result.push(format!("--c17-visibility={}", how));
-            i += 1;
-        } else if arg == "-fno-semantic-interposition"
-            || arg.starts_with("-fstack-protector")
-            || arg == "-fno-reorder-blocks-and-partition"
-            || arg == "-fno-plt"
-            || arg == "-fno-common"
-            || arg == "-fexceptions"
-            || arg == "-fno-exceptions"
-        {
-            // GCC flags - silently ignore
-            i += 1;
-        } else if arg.starts_with("-fsanitize") {
-            // Sanitizer flags - silently ignore (c17 doesn't support sanitizers)
             i += 1;
         } else if arg == "-ffreestanding" || arg == "-fhosted" {
             // Not swallowed by the catch-all below: there is no freestanding
@@ -2039,25 +1970,35 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
         {
             result.push(format!("-{arg}"));
             i += 1;
-        } else if arg.starts_with("-f") && !arg.starts_with("-fno-builtin") {
-            // Not a catch-all any more. gcc *errors* on an unrecognised `-f`
-            // flag, and silently discarding one is worse than either answer:
-            // a build system cannot tell a flag that took effect from one that
-            // was thrown away, which is how `-fpermissive` appeared not to
-            // work and how `-fno-builtin` sat inert for as long as it did.
-            //
-            // Erroring outright would break builds that pass flags c17 has no
-            // opinion about, so the middle course is to classify: the flags
-            // below name optimisations and code-generation choices c17 either
-            // does not make or already makes unconditionally, so ignoring them
-            // changes nothing and they stay quiet. Anything else says so.
-            //
-            // The list is drawn from what real builds actually pass -- CPython's
-            // configure and the gcc torture suite's own dg-options -- rather
-            // than from gcc's manual. Add to it when a corpus needs it, not in
-            // anticipation.
-            if !is_known_ignorable_f_flag(arg) {
-                ignored.push(format!("--c17-ignored={arg}"));
+        } else if arg == "-fstack-clash-protection" || arg == "-fno-stack-clash-protection" {
+            stack_clash = arg == "-fstack-clash-protection";
+            i += 1;
+        } else if arg.starts_with("-fuse-ld=")
+            && f_options::classify(&arg[2..]) == f_options::Verdict::Known(Effect::Implemented)
+        {
+            // Which linker the host driver runs, so it goes to the link.
+            result.push(format!("--c17-linker-flag={arg}"));
+            i += 1;
+        } else if let Some(name) = arg.strip_prefix("-f") {
+            // Every other `-f` option, as `f_options` classifies it: taken
+            // in silence when c17's output already is what it asks for, taken
+            // with a warning when its effect is missing, and refused in gcc's
+            // words when gcc would not know it.
+            match f_options::classify(name) {
+                f_options::Verdict::Known(Effect::Accepted(_)) => {}
+                f_options::Verdict::Known(Effect::Unsupported) => {
+                    let family = f_options::family(name);
+                    unsupported.retain(|(f, _)| f != family);
+                    unsupported.push((family.to_string(), arg.clone()));
+                }
+                f_options::Verdict::Known(Effect::Implemented) => {
+                    debug_assert!(false, "{arg} is implemented, so parsed above");
+                }
+                f_options::Verdict::Error(lines) => driver_errors.extend(lines),
+            }
+            // `-fno-<family>` withdraws an earlier request.
+            if let Some(family) = name.strip_prefix("no-") {
+                unsupported.retain(|(f, _)| f != family);
             }
             i += 1;
         } else if arg == "--param" || arg.starts_with("--param=") {
@@ -2191,12 +2132,13 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
         }
     }
 
-    // A configure probe passes a `-W` option to learn whether the compiler
-    // takes it, so one c17 does not know fails the run as gcc's would.
-    let refused = if warning_errors.is_empty() {
+    // A configure probe passes a `-W` or `-f` option to learn whether the
+    // compiler takes it, so one c17 does not know fails the run as gcc's
+    // would.
+    let refused = if driver_errors.is_empty() {
         werror_errors
     } else {
-        warning_errors
+        driver_errors
     };
     if !refused.is_empty() {
         for line in refused {
@@ -2209,6 +2151,14 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     // which everything is an operand.
     let mut trailer = lang_overrides;
     trailer.append(&mut ignored);
+    trailer.extend(
+        unsupported
+            .into_iter()
+            .map(|(_, arg)| format!("--c17-unsupported={arg}")),
+    );
+    if stack_clash {
+        trailer.push("--c17-stack-clash".to_string());
+    }
     if debug == Some(true) {
         trailer.push("-g".to_string());
     }
@@ -2882,6 +2832,12 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
             gettext("unrecognized option, ignored"),
             option
         ));
+    }
+    for option in &args.unsupported_options {
+        refused |= diag::command_line_group_warning(
+            f_options::UNSUPPORTED_WARNING,
+            &gettext_args("'{0}' is not supported; ignored", &[option]),
+        );
     }
 
     // Validate -std= alongside the other argument checks, before any
@@ -3566,46 +3522,110 @@ mod tests {
         assert!(result.contains(&"foo.c".to_string()));
     }
 
+    /// An option whose effect c17 does not provide reaches the driver as a
+    /// request to warn, the last of its family winning and a later `-fno-`
+    /// withdrawing it.
     #[test]
-    fn test_preprocess_fstack_protector_ignored() {
+    fn test_preprocess_unsupported_f_flags_are_kept_for_the_warning() {
         for flag in &[
             "-fstack-protector",
             "-fstack-protector-strong",
             "-fstack-protector-all",
+            "-fsanitize=address",
+            "-fcommon",
         ] {
             let result = run_preprocess(&[flag, "foo.c"]);
             assert!(
-                !result.contains(&flag.to_string()),
-                "flag {} not ignored",
-                flag
+                result.contains(&format!("--c17-unsupported={flag}")),
+                "{flag}: {result:?}"
             );
             assert!(result.contains(&"foo.c".to_string()));
         }
+        let unsupported = |args: &[&str]| -> Vec<String> {
+            run_preprocess(args)
+                .into_iter()
+                .filter(|a| a.starts_with("--c17-unsupported="))
+                .collect()
+        };
+        assert_eq!(
+            unsupported(&["-fstack-protector", "-fstack-protector-strong"]),
+            ["--c17-unsupported=-fstack-protector-strong"]
+        );
+        assert!(unsupported(&["-fstack-protector-all", "-fno-stack-protector"]).is_empty());
+        assert_eq!(
+            unsupported(&["-fno-stack-protector", "-fstack-protector"]),
+            ["--c17-unsupported=-fstack-protector"]
+        );
     }
 
+    /// What c17's output already is is taken in silence, and leaves nothing
+    /// behind.
     #[test]
-    fn test_preprocess_misc_f_flags_ignored() {
+    fn test_preprocess_accepted_f_flags_leave_nothing() {
         for flag in &[
             "-fno-semantic-interposition",
             "-fno-reorder-blocks-and-partition",
             "-fno-plt",
             "-fno-common",
+            "-fdiagnostics-color=always",
+            "-flto=auto",
+            "-ffat-lto-objects",
         ] {
             let result = run_preprocess(&[flag, "foo.c"]);
-            assert!(
-                !result.contains(&flag.to_string()),
-                "flag {} not ignored",
-                flag
-            );
+            assert_eq!(result, ["c17", "foo.c"], "{flag}");
         }
     }
 
+    /// Every option the table says the driver implements is parsed before
+    /// the table is consulted: a debug build asserts it.
     #[test]
-    fn test_preprocess_catchall_f_flags_ignored() {
-        // Unknown -f flags should be silently ignored
-        let result = run_preprocess(&["-funknown-flag", "foo.c"]);
-        assert!(!result.contains(&"-funknown-flag".to_string()));
-        assert!(result.contains(&"foo.c".to_string()));
+    fn test_preprocess_implemented_f_flags_are_parsed() {
+        for flag in &[
+            "-fPIC",
+            "-fno-pie",
+            "-fcf-protection",
+            "-fcf-protection=branch",
+            "-fno-cf-protection",
+            "-ffile-prefix-map=/a=/b",
+            "-fdebug-prefix-map=/a=/b",
+            "-fmacro-prefix-map=/a=/b",
+            "-fgnu89-inline",
+            "-fno-gnu89-inline",
+            "-fhosted",
+            "-finline",
+            "-fno-inline",
+            "-fmath-errno",
+            "-fno-math-errno",
+            "-fno-builtin",
+            "-fno-builtin-memcpy",
+            "-fpermissive",
+            "-fsignaling-nans",
+            "-fno-signaling-nans",
+            "-fsigned-char",
+            "-fno-unsigned-char",
+            "-fstack-clash-protection",
+            "-fno-stack-clash-protection",
+            "-ftls-model=initial-exec",
+            "-ftrapping-math",
+            "-fno-trapping-math",
+            "-fuse-ld=lld",
+            "-fverbose-asm",
+            "-fvisibility=hidden",
+        ] {
+            assert_eq!(
+                posixutils_cc::f_options::classify(&flag[2..]),
+                posixutils_cc::f_options::Verdict::Known(Effect::Implemented),
+                "{flag}"
+            );
+            run_preprocess(&[flag, "foo.c"]);
+        }
+        let result = run_preprocess(&["-fuse-ld=lld", "foo.c"]);
+        assert!(result.contains(&"--c17-linker-flag=-fuse-ld=lld".to_string()));
+        assert!(run_preprocess(&["-fstack-clash-protection"]).contains(&"--c17-stack-clash".into()));
+        assert!(
+            !run_preprocess(&["-fstack-clash-protection", "-fno-stack-clash-protection"])
+                .contains(&"--c17-stack-clash".into())
+        );
     }
 
     #[test]
@@ -3871,8 +3891,9 @@ mod tests {
         // Silently-ignored flags should NOT appear
         assert!(!result.contains(&"-fvisibility=hidden".to_string()));
         assert!(!result.contains(&"-fno-semantic-interposition".to_string()));
-        assert!(!result.contains(&"-fstack-protector-strong".to_string()));
         assert!(!result.contains(&"-fno-plt".to_string()));
+        // The stack protector c17 does not provide is kept for its warning.
+        assert!(result.contains(&"--c17-unsupported=-fstack-protector-strong".to_string()));
         assert!(!result.contains(&"-pipe".to_string()));
         // Linker flags should be passed through
         assert!(result.iter().any(|a| a.starts_with("--c17-linker-flag=")));

@@ -1489,6 +1489,10 @@ impl CodeGenerator for Aarch64CodeGen {
     fn set_cf_protection(&mut self, cf_protection: crate::target::CfProtection) {
         self.base.cf_protection = cf_protection;
     }
+
+    fn set_stack_clash(&mut self, on: bool) {
+        self.base.stack_clash = on;
+    }
 }
 
 #[cfg(test)]

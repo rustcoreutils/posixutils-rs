@@ -82,6 +82,8 @@ pub struct CodegenOptions<'a> {
     pub verbose_asm: bool,
     /// `-fcf-protection`.
     pub cf_protection: crate::target::CfProtection,
+    /// `-fstack-clash-protection`.
+    pub stack_clash: bool,
     /// The name DWARF records for the primary source file.
     pub source_name: &'a str,
     /// `-fdebug-prefix-map`: rewrites every path the debug information and
@@ -279,6 +281,7 @@ pub fn compile_tokens(
         opts.tls,
         opts.verbose_asm,
         opts.cf_protection,
+        opts.stack_clash,
     );
     let asm = codegen.generate(&module, &types);
 

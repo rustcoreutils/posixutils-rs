@@ -56,6 +56,8 @@ const PLAIN: &[(&str, Effect)] = &[
     ("c++-compat", Accepted),
     // c17's own: the "-std= ignored" driver warning.
     ("c17-dialect", Implemented),
+    // c17's own: "'-fX' is not supported"; see `f_options`.
+    ("c17-unsupported-option", Implemented),
     ("c90-c99-compat", Accepted),
     ("c99-c11-compat", Accepted),
     ("cast-align", Accepted),
@@ -473,6 +475,7 @@ mod tests {
         for name in [
             "attributes",
             "c17-dialect",
+            "c17-unsupported-option",
             "invalid-memory-model",
             "overflow",
             "pedantic",

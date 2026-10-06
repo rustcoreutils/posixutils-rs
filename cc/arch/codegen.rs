@@ -150,6 +150,8 @@ pub struct CodeGenBase<I: LirInst> {
     /// `-fcf-protection`, which only x86-64's `__builtin_setjmp` and
     /// `__builtin_longjmp` read.
     pub cf_protection: crate::target::CfProtection,
+    /// `-fstack-clash-protection`; see [`CodeGenBase::check_stack_clash`].
+    pub stack_clash: bool,
     /// Trailing comments to hang off individual LIR instructions, by their
     /// index in `lir_buffer`.
     ///
@@ -187,9 +189,43 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             tls: crate::target::TlsPolicy::default(),
             verbose_asm: false,
             cf_protection: crate::target::CfProtection::default(),
+            stack_clash: false,
             lir_comments: std::collections::HashMap::new(),
             value_widths: ValueWidths::default(),
             fn_dies: Vec::new(),
+        }
+    }
+
+    /// Under `-fstack-clash-protection`, warn that `func` is unprobed if gcc
+    /// would probe it: when its prologue moves the stack pointer by
+    /// `adjustment` bytes, enough to step over the guard page, or when it
+    /// allocates on the stack at run time (`alloca`, a VLA). c17 emits no
+    /// probes. Any other function needs none: its prologue's step is
+    /// smaller than the guard, and the store the prologue makes at the new
+    /// stack pointer (x86-64's return address below it, aarch64's frame
+    /// record at it) touches the guard if anything does. The guard is gcc's
+    /// default: 4 KiB on x86-64; 64 KiB on aarch64, less the 1 KiB a caller
+    /// may leave untouched below its own frame.
+    pub fn check_stack_clash(&self, func: &Function, adjustment: i64) {
+        if !self.stack_clash {
+            return;
+        }
+        let guard = match self.target.arch {
+            crate::target::Arch::X86_64 => 4096,
+            crate::target::Arch::Aarch64 => 64 * 1024 - 1024,
+        };
+        let dynamic = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .any(|i| i.op == Opcode::Alloca);
+        if adjustment >= guard || dynamic {
+            crate::diag::group_warning_args(
+                crate::f_options::UNSUPPORTED_WARNING,
+                self.func_pos,
+                "'-fstack-clash-protection' is not supported; the stack of '{0}' is not probed",
+                &[&self.current_fn],
+            );
         }
     }
 
@@ -1181,6 +1217,9 @@ pub trait CodeGenerator {
 
     /// Set `-fcf-protection`.
     fn set_cf_protection(&mut self, cf_protection: crate::target::CfProtection);
+
+    /// Set `-fstack-clash-protection`.
+    fn set_stack_clash(&mut self, on: bool);
 }
 
 /// The alignment, in bytes, a global definition is emitted at: an explicit
@@ -1465,6 +1504,7 @@ pub fn create_codegen(
     tls: crate::target::TlsPolicy,
     verbose_asm: bool,
     cf_protection: crate::target::CfProtection,
+    stack_clash: bool,
 ) -> Box<dyn CodeGenerator> {
     use crate::target::Arch;
 
@@ -1477,6 +1517,7 @@ pub fn create_codegen(
     codegen.set_tls_policy(tls);
     codegen.set_verbose_asm(verbose_asm);
     codegen.set_cf_protection(cf_protection);
+    codegen.set_stack_clash(stack_clash);
     codegen
 }
 

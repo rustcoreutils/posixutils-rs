@@ -249,3 +249,39 @@ fn pedantic_errors_unchanged_by_werror() {
         lacks(&c.stderr, "treated as errors");
     }
 }
+
+/// One function whose frame steps over the guard page.
+const BIG_FRAME: &str = "void use(char *);\nvoid big(void) { char b[70000]; use(b); }\n";
+const UNPROBED_MSG: &str =
+    "'-fstack-clash-protection' is not supported; the stack of 'big' is not probed";
+
+/// The "not supported" warning is one plain `-Werror` leaves a warning: a
+/// distribution's default flags give it to every compile. Naming its group
+/// makes it an error, and `-w` or `-Wno-` silences it.
+#[test]
+fn unsupported_option_is_beyond_plain_werror() {
+    let flags = ["-fstack-clash-protection", "-Werror"];
+    let plain = compile_accepted("unsupported_plain", BIG_FRAME, &flags);
+    has(&plain, &format!("warning: {UNPROBED_MSG}\n"));
+    lacks(&plain, "-Werror");
+    lacks(&plain, "treated as errors");
+
+    let named = compile_rejected_with(
+        "unsupported_named",
+        BIG_FRAME,
+        &["-fstack-clash-protection", "-Werror=c17-unsupported-option"],
+    );
+    has(
+        &named,
+        &format!("error: {UNPROBED_MSG} [-Werror=c17-unsupported-option]\n"),
+    );
+    has(&named, &format!("{SOME}\n"));
+
+    for quiet in ["-w", "-Wno-c17-unsupported-option"] {
+        let r = compile_accepted("unsupported_quiet", BIG_FRAME, &[flags[0], flags[1], quiet]);
+        lacks(&r, "probed");
+    }
+    // Without the option there is nothing to say.
+    let r = compile_accepted("unsupported_off", BIG_FRAME, &[]);
+    lacks(&r, "probed");
+}

@@ -99,31 +99,32 @@ fn werror_skips_system_headers() {
     assert!(r.stderr.contains("[-Werror]"), "{}", r.stderr);
 }
 
-/// gcc refuses an option it does not know. c17 warns and goes on, which
-/// is no answer to a probe that adds `-Werror` to find out: there it fails,
-/// as gcc does. `-w` hides it, as it hides every warning.
+/// gcc refuses an option it does not know. For a `-g` option c17 warns and
+/// goes on, which is no answer to a probe that adds `-Werror` to find out:
+/// there it fails, as gcc does. `-w` hides it, as it hides every warning.
+/// (An unknown `-f` option is refused outright; see `f_options`.)
 #[test]
 fn werror_fails_an_unrecognized_option() {
     let (dir, path) = scratch("a.c", "int a;\n");
-    let r = compile_in(dir.path(), &path, &["-fc17-no-such-flag"]);
+    let r = compile_in(dir.path(), &path, &["-gc17-no-such-flag"]);
     assert!(r.success, "{}", r.stderr);
     assert_eq!(
         r.stderr,
-        "c17: warning: unrecognized option, ignored: -fc17-no-such-flag\n"
+        "c17: warning: unrecognized option, ignored: -gc17-no-such-flag\n"
     );
 
-    let r = compile_in(dir.path(), &path, &["-w", "-fc17-no-such-flag"]);
+    let r = compile_in(dir.path(), &path, &["-w", "-gc17-no-such-flag"]);
     assert!(r.success && r.stderr.is_empty(), "{}", r.stderr);
 
     std::fs::remove_file(dir.path().join("out.o")).unwrap();
     for flags in [
-        &["-Werror", "-fc17-no-such-flag"][..],
-        &["-fc17-no-such-flag", "-Werror"],
+        &["-Werror", "-gc17-no-such-flag"][..],
+        &["-gc17-no-such-flag", "-Werror"],
     ] {
         let r = compile_in(dir.path(), &path, flags);
         assert!(!r.success, "{flags:?}: {}", r.stderr);
         assert_eq!(
-            r.stderr, "c17: error: unrecognized option, ignored: -fc17-no-such-flag [-Werror]\n",
+            r.stderr, "c17: error: unrecognized option, ignored: -gc17-no-such-flag [-Werror]\n",
             "{flags:?}"
         );
         assert!(!dir.path().join("out.o").exists(), "an object was written");

@@ -1,0 +1,269 @@
+//
+// Copyright (c) 2025-2026 Jeff Garzik
+//
+// This file is part of the posixutils-rs project covered under
+// the MIT License.  For the full license text, please see the LICENSE
+// file in the root directory of this project.
+// SPDX-License-Identifier: MIT
+//
+// `-f<name>` through the driver: a distribution's or a build system's
+// default flags compile, under `-Werror` too; an option whose effect c17
+// does not provide says so; one gcc does not know is refused, as gcc 13
+// refuses it.
+//
+
+use crate::common::run_c17;
+use std::path::{Path, PathBuf};
+
+/// A scratch directory holding `name` with `content`.
+fn scratch(name: &str, content: &str) -> (plib::tmp::TempDir, PathBuf) {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_fopt_")
+        .tempdir()
+        .expect("tempdir");
+    let path = dir.path().join(name);
+    std::fs::write(&path, content).expect("write");
+    (dir, path)
+}
+
+/// Compile `path` to an object in `dir` with `flags` ahead of the operand.
+fn compile_in(dir: &Path, path: &Path, flags: &[&str]) -> crate::common::C17Run {
+    let obj = dir.join("out.o");
+    let mut args: Vec<&str> = flags.to_vec();
+    args.extend(["-c", "-o", obj.to_str().unwrap(), path.to_str().unwrap()]);
+    run_c17(&args)
+}
+
+const CLEAN: &str = "int main(void) { return 0; }\n";
+
+/// The stack protector's warning, which c17 gives once per run.
+const NO_SSP: &str = "c17: warning: '-fstack-protector-strong' is not supported; ignored\n";
+
+/// Debian trixie's `dpkg-buildflags --get CFLAGS`, and Ubuntu 24.04's.
+const DEBIAN: &[&str] = &[
+    "-g",
+    "-O2",
+    "-Werror=implicit-function-declaration",
+    "-ffile-prefix-map=/build/pkg=.",
+    "-fstack-protector-strong",
+    "-fstack-clash-protection",
+    "-Wformat",
+    "-Werror=format-security",
+    "-fcf-protection",
+];
+const UBUNTU: &[&str] = &[
+    "-g",
+    "-O2",
+    "-fno-omit-frame-pointer",
+    "-mno-omit-leaf-frame-pointer",
+    "-ffile-prefix-map=/build/pkg=.",
+    "-flto=auto",
+    "-ffat-lto-objects",
+    "-fstack-protector-strong",
+    "-fstack-clash-protection",
+    "-Wformat",
+    "-Werror=format-security",
+    "-fcf-protection",
+];
+
+/// A distribution's default flags compile under plain `-Werror`, which they
+/// once failed: every `-f` c17 did not know was an "unrecognized option"
+/// that `-Werror` made an error. What is left is the stack protector's
+/// warning, once, which `-Werror` does not reach and `-w` silences. The
+/// stack-clash protection says nothing for a function whose stack needs no
+/// probe.
+#[test]
+fn distribution_flags_compile_under_werror() {
+    let (dir, path) = scratch("t.c", CLEAN);
+    for flags in [DEBIAN, UBUNTU] {
+        // The Ubuntu set's `-mno-omit-leaf-frame-pointer` is x86-64's and
+        // aarch64's alike.
+        let mut args = flags.to_vec();
+        args.push("-Werror");
+        let r = compile_in(dir.path(), &path, &args);
+        assert!(r.success, "{flags:?}: {}", r.stderr);
+        assert_eq!(r.stderr, NO_SSP, "{flags:?}");
+
+        args.push("-w");
+        let r = compile_in(dir.path(), &path, &args);
+        assert!(r.success && r.stderr.is_empty(), "{flags:?}: {}", r.stderr);
+
+        args.pop();
+        args.push("-Wno-c17-unsupported-option");
+        let r = compile_in(dir.path(), &path, &args);
+        assert!(r.success && r.stderr.is_empty(), "{flags:?}: {}", r.stderr);
+    }
+}
+
+/// What meson and cmake pass by default is taken in silence, under
+/// `-Werror` too: diagnostics colour, LTO, position independence.
+#[test]
+fn build_system_defaults_are_silent() {
+    let (dir, path) = scratch("t.c", CLEAN);
+    for flags in [
+        &["-fdiagnostics-color=always"][..],
+        &["-fno-diagnostics-color"],
+        &["-flto=auto", "-fno-fat-lto-objects"],
+        &["-flto", "-fuse-linker-plugin", "-ffat-lto-objects"],
+        &["-fPIC", "-fvisibility=hidden"],
+        &["-fmessage-length=0", "-fdiagnostics-show-option"],
+        &["-fno-diagnostics-show-caret", "-fdiagnostics-format=text"],
+        &[
+            "-fno-strict-aliasing",
+            "-fwrapv",
+            "-fno-semantic-interposition",
+        ],
+    ] {
+        let mut args = flags.to_vec();
+        args.push("-Werror");
+        let r = compile_in(dir.path(), &path, &args);
+        assert!(r.success, "{flags:?}: {}", r.stderr);
+        assert!(r.stderr.is_empty(), "{flags:?}: {}", r.stderr);
+    }
+}
+
+/// An option gcc does not know is refused with gcc's text, `-w` or not, and
+/// nothing is compiled.
+#[test]
+fn unknown_option_is_an_error() {
+    let (dir, path) = scratch("t.c", CLEAN);
+    for flags in [&["-ffoo"][..], &["-w", "-ffoo"], &["-ffoo", "-Wno-error"]] {
+        let r = compile_in(dir.path(), &path, flags);
+        assert!(!r.success, "{flags:?}: {}", r.stderr);
+        assert_eq!(
+            r.stderr, "c17: error: unrecognized command-line option '-ffoo'\n",
+            "{flags:?}"
+        );
+        assert!(!dir.path().join("out.o").exists(), "an object was written");
+    }
+
+    // Every one is reported, in order, with the bad `-W` names.
+    let r = compile_in(dir.path(), &path, &["-ffoo", "-Wbar", "-fbaz=1"]);
+    assert!(!r.success);
+    assert_eq!(
+        r.stderr,
+        "c17: error: unrecognized command-line option '-ffoo'\n\
+         c17: error: unrecognized command-line option '-Wbar'\n\
+         c17: error: unrecognized command-line option '-fbaz=1'\n"
+    );
+
+    // A known option with a value gcc refuses.
+    let r = compile_in(dir.path(), &path, &["-fdiagnostics-color=sometimes"]);
+    assert!(!r.success);
+    assert_eq!(
+        r.stderr,
+        "c17: error: unrecognized argument in option '-fdiagnostics-color=sometimes'\n\
+         c17: note: valid arguments to '-fdiagnostics-color=' are: always auto never\n"
+    );
+}
+
+/// An option whose effect c17 does not provide is taken with a warning,
+/// once however often it is given, and not at all when a later `-fno-`
+/// withdraws it.
+#[test]
+fn unsupported_option_warns() {
+    let (dir, path) = scratch("t.c", CLEAN);
+    let r = compile_in(dir.path(), &path, &["-fsanitize=address"]);
+    assert!(r.success, "{}", r.stderr);
+    assert_eq!(
+        r.stderr,
+        "c17: warning: '-fsanitize=address' is not supported; ignored\n"
+    );
+
+    let r = compile_in(
+        dir.path(),
+        &path,
+        &["-fstack-protector", "-fstack-protector-strong", "-Werror"],
+    );
+    assert!(r.success, "{}", r.stderr);
+    assert_eq!(r.stderr, NO_SSP);
+
+    let r = compile_in(
+        dir.path(),
+        &path,
+        &[
+            "-fstack-protector-strong",
+            "-fno-stack-protector",
+            "-fcommon",
+        ],
+    );
+    assert!(r.success, "{}", r.stderr);
+    assert_eq!(
+        r.stderr,
+        "c17: warning: '-fcommon' is not supported; ignored\n"
+    );
+
+    // `-Werror=` names the group, and then it is an error.
+    let r = compile_in(
+        dir.path(),
+        &path,
+        &["-ftrapv", "-Werror=c17-unsupported-option"],
+    );
+    assert!(!r.success, "{}", r.stderr);
+    assert_eq!(
+        r.stderr,
+        "c17: error: '-ftrapv' is not supported; ignored [-Werror=c17-unsupported-option]\n"
+    );
+}
+
+/// A function whose frame reaches the guard page, or that allocates on the
+/// stack at run time, is one gcc's `-fstack-clash-protection` would probe
+/// and c17 does not: that function, and only that one, gets the warning.
+#[test]
+fn stack_clash_protection_names_unprobed_functions() {
+    let src = "void use(char *);\n\
+               void small(void) { char b[64]; use(b); }\n\
+               void big(void) { char b[70000]; use(b); }\n\
+               void dynamic(int n) { char b[n]; use(b); }\n";
+    let (dir, path) = scratch("s.c", src);
+    let asm = dir.path().join("s.s");
+    for target in [None, Some("--target=aarch64-unknown-linux-gnu")] {
+        let mut args = vec!["-fstack-clash-protection", "-Werror", "-S", "-o"];
+        args.push(asm.to_str().unwrap());
+        args.push(path.to_str().unwrap());
+        args.extend(target);
+        let r = run_c17(&args);
+        assert!(r.success, "{target:?}: {}", r.stderr);
+        let p = path.display();
+        assert_eq!(
+            r.stderr,
+            format!(
+                "{p}:3:1: warning: '-fstack-clash-protection' is not supported; \
+                 the stack of 'big' is not probed\n\
+                 {p}:4:1: warning: '-fstack-clash-protection' is not supported; \
+                 the stack of 'dynamic' is not probed\n"
+            ),
+            "{target:?}"
+        );
+
+        for quiet in ["-w", "-fno-stack-clash-protection"] {
+            let mut args = args.clone();
+            args.push(quiet);
+            let r = run_c17(&args);
+            assert!(r.success && r.stderr.is_empty(), "{quiet}: {}", r.stderr);
+        }
+    }
+}
+
+/// `-fuse-ld=` reaches the link, as gcc's does: a linker that does not
+/// exist fails it. Linux only: the host compiler driver is gcc there.
+#[cfg(target_os = "linux")]
+#[test]
+fn use_ld_reaches_the_link() {
+    let (dir, path) = scratch("t.c", CLEAN);
+    let exe = dir.path().join("t");
+    let run = |ld: &str| run_c17(&[ld, "-o", exe.to_str().unwrap(), path.to_str().unwrap()]);
+    let r = run("-fuse-ld=bfd");
+    assert!(r.success, "{}", r.stderr);
+    assert!(r.stderr.is_empty(), "{}", r.stderr);
+
+    // gcc runs `ld.mold`; where there is none, the link fails.
+    let has_mold = std::process::Command::new("ld.mold")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !has_mold {
+        let r = run("-fuse-ld=mold");
+        assert!(!r.success, "-fuse-ld=mold did not reach the link");
+    }
+}

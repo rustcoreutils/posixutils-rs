@@ -53,6 +53,7 @@ struct Options {
     tls_model: target::TlsModel,
     shared: bool,
     no_unwind_tables: bool,
+    stack_clash: bool,
     verbose_asm: bool,
     cf_protection: target::CfProtection,
     math_errno: bool,
@@ -111,6 +112,7 @@ fn apply_flags(flags: &[&str]) -> Options {
             "-shared" | "--shared" | "-G" => o.shared = true,
             "--fno-unwind-tables" => o.no_unwind_tables = true,
             "-fverbose-asm" => o.verbose_asm = true,
+            "-fstack-clash-protection" => o.stack_clash = true,
             "-fmath-errno" => o.math_errno = true,
             "-fno-math-errno" => o.math_errno = false,
             "-fno-trapping-math" => o.trapping_math = false,
@@ -225,6 +227,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         unwind_tables: !o.no_unwind_tables,
         verbose_asm: o.verbose_asm,
         cf_protection: o.cf_protection,
+        stack_clash: o.stack_clash,
         source_name: &source_name,
         debug_prefix_map: &prefix_maps.debug,
     };

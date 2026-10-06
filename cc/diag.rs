@@ -607,12 +607,36 @@ impl Werror {
         })
     }
 
-    /// Is a warning in `group` (`None`: in none gcc names) an error?
+    /// Is a warning in `group` (`None`: in none gcc names) an error? Plain
+    /// `-Werror` does not reach a group in [`BEYOND_PLAIN_WERROR`].
     fn promotes(&self, group: Option<&str>) -> bool {
-        group
-            .and_then(|g| self.groups.get(g).copied())
-            .unwrap_or(self.all)
+        match group.and_then(|g| self.groups.get(g).copied()) {
+            Some(verdict) => verdict,
+            None => self.all && !group.is_some_and(|g| BEYOND_PLAIN_WERROR.contains(&g)),
+        }
     }
+}
+
+/// The warning groups only `-Werror=<name>` makes errors of. c17's
+/// "'-fX' is not supported" is one: a distribution's default flags give it
+/// on every compile, and a build that adds `-Werror` asks about its own
+/// code, not about the compiler's.
+const BEYOND_PLAIN_WERROR: &[&str] = &[crate::f_options::UNSUPPORTED_WARNING];
+
+/// A warning in the group `name` about the command line, which has no
+/// source position: given as the driver gives its own, unless `-w` or
+/// `-Wno-<name>` silences it, and an error, tagged as gcc tags one, when
+/// `-Werror` reaches the group. Answers whether it was an error.
+pub fn command_line_group_warning(name: &str, msg: &str) -> bool {
+    if warnings_suppressed() || !warning_group_enabled(name) {
+        return false;
+    }
+    if WERROR.with_borrow(|w| w.promotes(Some(name))) {
+        emit_line(format!("c17: {}: {msg} [-Werror={name}]", gettext("error")));
+        return true;
+    }
+    emit_line(format!("c17: {}: {msg}", gettext("warning")));
+    false
 }
 
 /// Is `-Werror` in effect for every warning -- what gcc calls "all warnings

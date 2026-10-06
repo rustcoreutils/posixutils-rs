@@ -20,6 +20,7 @@ pub mod builtin_headers;
 pub mod builtins;
 pub mod constexpr;
 pub mod diag;
+pub mod f_options;
 pub mod float;
 pub mod ir;
 pub mod kw;

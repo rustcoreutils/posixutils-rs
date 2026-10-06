@@ -612,3 +612,47 @@ fn test_device_size_field_carries_no_data() {
         );
     }
 }
+
+/// An archive cut off inside a header block -- an interrupted download -- is
+/// not a clean end of archive. The members before the cut are still listed,
+/// but pax must say the archive is truncated and exit non-zero, as bsdtar and
+/// BSD pax do, rather than silently report a shorter archive.
+#[test]
+fn test_ustar_truncated_inside_header_is_an_error() {
+    let mut a = Ustar {
+        name: b"one",
+        body: b"ONE\n",
+        ..Default::default()
+    }
+    .member();
+    let cut = a.len() + 300;
+    a.extend_from_slice(
+        &Ustar {
+            name: b"two",
+            body: b"TWO\n",
+            ..Default::default()
+        }
+        .archive(),
+    );
+    a.truncate(cut);
+
+    let output = run_pax_with_stdin_bytes(&[], &a);
+    assert_exit_code(&output, 1, "list of an archive cut inside a header");
+    assert_eq!(stdout_str(&output), "one\n");
+}
+
+/// The cpio form: a stray partial header after the last whole member.
+#[test]
+fn test_cpio_truncated_inside_header_is_an_error() {
+    let mut a = CpioNewc {
+        name: b"one",
+        body: b"ONE\n",
+        ..Default::default()
+    }
+    .member();
+    a.push(b'0');
+
+    let output = run_pax_with_stdin_bytes(&[], &a);
+    assert_exit_code(&output, 1, "list of a cpio archive cut inside a header");
+    assert_eq!(stdout_str(&output), "one\n");
+}

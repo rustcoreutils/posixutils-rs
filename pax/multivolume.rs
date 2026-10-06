@@ -37,7 +37,7 @@
 //! - Volume scripts are executed synchronously
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
-use crate::error::{is_eof_error, PaxError, PaxResult};
+use crate::error::{PaxError, PaxResult};
 use crate::formats::ustar::parse_octal;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -458,6 +458,15 @@ impl MultiVolumeReader {
         Ok(())
     }
 
+    /// Read a header block, or `false` at end of file (see `formats::read_header`).
+    fn read_header_from_reader(&mut self, buf: &mut [u8]) -> PaxResult<bool> {
+        let reader = self
+            .reader
+            .as_mut()
+            .ok_or_else(|| PaxError::Io(io::Error::other("no reader")))?;
+        crate::formats::read_header(reader, buf)
+    }
+
     /// Round up to next block boundary
     fn round_up_block(size: u64) -> u64 {
         // See the note in formats/ustar.rs: a declared size near u64::MAX
@@ -474,15 +483,16 @@ impl ArchiveReader for MultiVolumeReader {
 
         loop {
             let mut header = [0u8; BLOCK_SIZE];
-            if let Err(e) = self.read_exact_from_reader(&mut header) {
+            let read = self.read_header_from_reader(&mut header);
+            if !matches!(read, Ok(true)) {
                 // Try opening next volume if this is a split file
                 if self.in_split_file && self.open_next_volume()? {
                     continue;
                 }
-                if is_eof_error(&e) {
-                    return Ok(None);
-                }
-                return Err(e);
+                // Nothing at all is the end of the archive; part of a header
+                // is a truncated one.
+                read?;
+                return Ok(None);
             }
 
             // Check for end of archive (two zero blocks)

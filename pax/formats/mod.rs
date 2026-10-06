@@ -58,6 +58,35 @@ pub fn read_declared<R: Read>(
     Ok(buf)
 }
 
+/// Fill `buf` with a header, or `false` if the archive ended before it began.
+///
+/// End of file at a header boundary is where an archive missing its trailer
+/// ends, and is taken as the end of the archive. End of file after part of a
+/// header is not: it is an archive cut off inside that header, and taking it as
+/// the end would report a shorter archive as complete, every member after the
+/// cut silently lost. That is [`truncated_header`], an error.
+pub fn read_header<R: Read>(reader: &mut R, buf: &mut [u8]) -> PaxResult<bool> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) if filled == 0 => return Ok(false),
+            Ok(0) => return Err(truncated_header()),
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(true)
+}
+
+/// The error for an archive that ends partway through a header.
+///
+/// Deliberately not an `UnexpectedEof` I/O error: callers take that as the
+/// clean end of an archive with no trailer, which this is not.
+pub fn truncated_header() -> PaxError {
+    PaxError::InvalidFormat("unexpected end of archive inside a header".to_string())
+}
+
 /// An archive stream that knows how far into the archive it is, and steps
 /// over member data by seeking when the archive is a seekable file.
 ///

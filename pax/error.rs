@@ -71,17 +71,6 @@ impl From<io::Error> for PaxError {
 /// Result type for pax operations
 pub type PaxResult<T> = Result<T, PaxError>;
 
-/// Check if a PaxError represents end-of-file
-///
-/// This is preferred over string matching on error messages,
-/// which is fragile across different platforms and Rust versions.
-pub fn is_eof_error(error: &PaxError) -> bool {
-    match error {
-        PaxError::Io(e) => e.kind() == io::ErrorKind::UnexpectedEof,
-        _ => false,
-    }
-}
-
 /// Process-wide "an error occurred" flag. Per POSIX CONSEQUENCES OF ERRORS, a
 /// per-file failure (or an unmatched pattern/operand) shall be diagnosed and a
 /// non-zero exit status returned, but processing continues; this flag carries

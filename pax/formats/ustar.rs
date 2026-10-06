@@ -523,14 +523,11 @@ pub(crate) fn parse_typeflag(flag: u8) -> TypeFlag {
     }
 }
 
-/// Read one 512-byte block, or `None` at end of file.
+/// Read one 512-byte block, or `None` at end of file. A partial block is an
+/// archive truncated inside a header, and an error.
 fn read_block(reader: &mut impl Read) -> PaxResult<Option<[u8; BLOCK_SIZE]>> {
     let mut block = [0u8; BLOCK_SIZE];
-    match reader.read_exact(&mut block) {
-        Ok(()) => Ok(Some(block)),
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
-        Err(e) => Err(e.into()),
-    }
+    Ok(crate::formats::read_header(reader, &mut block)?.then_some(block))
 }
 
 /// The next header block, or `None` at the end of the archive.

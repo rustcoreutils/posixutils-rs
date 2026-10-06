@@ -49,7 +49,8 @@
 //! then file data padded to 4-byte boundary.
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType, SourceHeader};
-use crate::error::{is_eof_error, PaxError, PaxResult};
+use crate::error::{PaxError, PaxResult};
+use crate::formats::{read_header, truncated_header};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -176,9 +177,12 @@ impl<R: Read> CpioReader<R> {
         }
     }
 
-    /// Read exactly n bytes
+    /// Read the rest of a header whose magic has already been read: end of
+    /// file here is an archive truncated inside that header.
     fn read_exact(&mut self, buf: &mut [u8]) -> PaxResult<()> {
-        self.reader.read_exact(buf)?;
+        if !read_header(&mut self.reader, buf)? {
+            return Err(truncated_header());
+        }
         Ok(())
     }
 }
@@ -193,12 +197,11 @@ impl<R: Read> ArchiveReader for CpioReader<R> {
         self.skip_data()?;
 
         // Read first 2 bytes to check for binary format
+        // End of file before the first byte is an archive without a trailer;
+        // after it, a truncated one.
         let mut magic2 = [0u8; 2];
-        if let Err(e) = self.read_exact(&mut magic2) {
-            if is_eof_error(&e) {
-                return Ok(None);
-            }
-            return Err(e);
+        if !read_header(&mut self.reader, &mut magic2)? {
+            return Ok(None);
         }
 
         // Check for binary cpio format (2-byte magic)

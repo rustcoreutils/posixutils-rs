@@ -1986,6 +1986,45 @@ fn test_search_pos_order_is_the_search_order() {
     );
 }
 
+/// `-dD`: each `#define` and `#undef` that takes effect travels in the
+/// output as its own text, where it stood, and the definitions in force
+/// before the source come back separately.
+#[test]
+fn test_keep_definitions_carries_the_directives() {
+    let input = "#define A  1\nA\n#undef A\n#if 0\n#define B 2\n#endif\n#define F(x) ( x+1 )\n";
+    let mut idents = IdentTable::new();
+    let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
+    let config = PreprocessConfig {
+        keep_definitions: true,
+        defines: &["CMD=7".to_string()],
+        ..Default::default()
+    };
+    let (out, outcome) =
+        preprocess_collecting(tokens, &Target::host(), &mut idents, "<test>", &config);
+    let carried: Vec<String> = out.iter().filter_map(pragma_text).collect();
+    assert_eq!(carried, ["#define A 1", "#undef A", "#define F(x) ( x+1 )"]);
+    assert!(get_token_strings(&out, &idents).contains(&"1".to_string()));
+    for want in ["#define __STDC__ 1", "#define CMD 7"] {
+        assert!(
+            outcome.initial_definitions.iter().any(|d| d == want),
+            "{want}: {:?}",
+            outcome.initial_definitions
+        );
+    }
+
+    // Without the option, nothing is carried and nothing collected.
+    let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
+    let (out, outcome) = preprocess_collecting(
+        tokens,
+        &Target::host(),
+        &mut idents,
+        "<test>",
+        &PreprocessConfig::default(),
+    );
+    assert!(out.iter().all(|t| pragma_text(t).is_none()));
+    assert!(outcome.initial_definitions.is_empty());
+}
+
 /// `-iquote` directories are searched for the `"..."` form only, after the
 /// including file's own directory and ahead of `-I`; `#include_next` from a
 /// header found there goes on to the rest of the chain.

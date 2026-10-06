@@ -578,6 +578,67 @@ fn preprocessor_include_next_walks_the_dash_i_path() {
     );
 }
 
+/// `-dD` keeps every `#define` and `#undef` in the preprocessed text, where
+/// it stood, after the macros in force before the source. dpkg runs
+/// `echo '#include "dselect-curses.h"' | gcc -E -dD - >curkeys.hpp` and
+/// reads curses' `KEY_*` definitions back out; c17 refused the option as
+/// clap's `unexpected argument '-d'`.
+#[test]
+fn preprocessor_dash_dd_keeps_the_definitions() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_dash_dd_")
+        .tempdir()
+        .unwrap();
+    std::fs::write(
+        dir.path().join("h.h"),
+        "#define CUR_KEY 0401\n#undef CUR_KEY\n#define KEY_DOWN 0402 /* down */\n",
+    )
+    .unwrap();
+    let src = dir.path().join("m.c");
+    std::fs::write(
+        &src,
+        "#include \"h.h\"\n#define A 1\nint a = A;\n#undef A\n\
+         #define F(x)  (x +   1)\nint b = F(2);\n#if 0\n#define SKIPPED 1\n#endif\n",
+    )
+    .unwrap();
+    let r = run_c17(&["-E", "-dD", "-P", "-DCMD=7", &src.to_string_lossy()]);
+    assert!(r.success, "{}", r.stderr);
+    let lines: Vec<&str> = r.stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    let want = [
+        "#define CUR_KEY 0401",
+        "#undef CUR_KEY",
+        "#define KEY_DOWN 0402",
+        "#define A 1",
+        "int a = 1;",
+        "#undef A",
+        "#define F(x) (x + 1)",
+        "int b = (2 + 1);",
+    ];
+    assert!(lines.len() > want.len(), "{}", r.stdout);
+    let (head, tail) = lines.split_at(lines.len() - want.len());
+    assert_eq!(tail, want, "{}", r.stdout);
+    // Ahead of the source: the predefined macros and the command line's.
+    for first in ["#define __STDC_VERSION__ 201710L", "#define CMD 7"] {
+        assert!(head.contains(&first), "{first} missing:\n{}", r.stdout);
+    }
+
+    // Line markers still name the source, after the definitions ahead of it.
+    let r = run_c17(&["-E", "-dD", &src.to_string_lossy()]);
+    assert!(r.success, "{}", r.stderr);
+    let at = r.stdout.find("int a = 1;").expect("text");
+    let before = &r.stdout[..at];
+    let marker = before.rfind("\n# ").expect("a marker before the text");
+    let line: u32 = before[marker + 3..]
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // Count lines from the marker to the text: the text is on source line 3.
+    let gap = before[marker + 1..].matches('\n').count() as u32 - 1;
+    assert_eq!(line + gap, 3, "{}", r.stdout);
+}
+
 /// `-iquote DIR` and `-iquoteDIR` add a directory searched for `"..."`
 /// includes ahead of `-I`, and not for `<...>` ones. guile builds libguile
 /// with `-iquote.` and dpkg with `-iquote .`; c17 refused both as clap's

@@ -553,6 +553,9 @@ pub struct Preprocessor<'a> {
     dependencies: Vec<(PathBuf, bool)>,
     /// Whether to collect the above.
     collect_dependencies: bool,
+    /// `-dD`: carry each `#define` and `#undef` that takes effect into the
+    /// output, as its own text; see [`PreprocessConfig::keep_definitions`].
+    keep_definitions: bool,
 
     /// Files named by a `#pragma once`.
     once_files: HashSet<PathBuf>,
@@ -657,8 +660,9 @@ struct LineMarker {
     name: Option<String>,
 }
 
-/// The payload prefix a marker uses when it carries a pragma c17 does not act
-/// on and only needs to reproduce.
+/// The payload prefix a marker uses when it carries a directive c17 does not
+/// act on and only needs to reproduce: a pragma, or under `-dD` a `#define`
+/// or `#undef` that has already taken effect.
 const PRAGMA_TEXT_PREFIX: &str = "text:";
 
 /// The gcc release c17 claims to be, as `[major, minor, patchlevel]`.
@@ -678,7 +682,8 @@ pub const GNUC_VERSION: [&str; 3] = ["7", "5", "0"];
 /// text: c17 does not act on `#pragma GCC diagnostic` or an OpenMP directive,
 /// but POSIX makes a `.i` a valid operand and c17 compiles one, so dropping
 /// them made preprocessing and compiling in two steps mean something different
-/// from doing it in one.
+/// from doing it in one. Under `-dD` the `#define` and `#undef` lines travel
+/// the same way, to be written where they stood.
 pub fn pragma_text(token: &Token) -> Option<String> {
     match &token.value {
         TokenValue::String(s) => s.strip_prefix(PRAGMA_TEXT_PREFIX).map(str::to_string),
@@ -1078,6 +1083,7 @@ impl<'a> Preprocessor<'a> {
             max_include_depth: 200,
             dependencies: Vec::new(),
             collect_dependencies: false,
+            keep_definitions: false,
             once_files: HashSet::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
             guarded_files: HashMap::with_capacity(DEFAULT_INCLUDE_TRACK_CAPACITY),
             compile_date,
@@ -2782,6 +2788,9 @@ pub struct PreprocessConfig<'a> {
     pub pre_includes: &'a [String],
     /// Collect every macro definition for `-dM` instead of only the tokens.
     pub dump_macros: bool,
+    /// `-dD`: carry each `#define` and `#undef` in the output where it
+    /// stood, and collect the definitions in force before the source.
+    pub keep_definitions: bool,
     /// Collect the headers this translation unit depends on (the `-M` family).
     pub collect_dependencies: bool,
     /// The position independence code generation uses; see
@@ -2873,6 +2882,9 @@ pub struct PreprocessOutcome {
     /// Every macro in force at the end, as `#define` lines, sorted (`-dM`).
     /// Empty unless asked for: rendering them is not free.
     pub macro_definitions: Vec<String>,
+    /// Under `-dD`, the macros in force before the source -- predefined and
+    /// from the command line -- as `#define` lines, sorted. Empty otherwise.
+    pub initial_definitions: Vec<String>,
     /// Every header opened, in the order first opened, with whether it came
     /// from a system directory (the `-M` family). Empty unless asked for.
     pub dependencies: Vec<(PathBuf, bool)>,
@@ -2928,6 +2940,15 @@ pub fn preprocess_collecting(
         pp.undef_macro(undef);
     }
 
+    // `-dD`: what is defined now is what the source starts with; from here
+    // on each directive is carried where it stands, `-include`d ones too.
+    let initial_definitions = if config.keep_definitions {
+        pp.keep_definitions = true;
+        pp.macro_definitions(idents)
+    } else {
+        Vec::new()
+    };
+
     // `-include` runs after `-D`/`-U`, because a header may well test what
     // they defined, and before the source, because that is what "as if it were
     // the first line" means.
@@ -2957,6 +2978,7 @@ pub fn preprocess_collecting(
         } else {
             Vec::new()
         },
+        initial_definitions,
         dependencies: std::mem::take(&mut pp.dependencies),
     };
     (output, outcome)

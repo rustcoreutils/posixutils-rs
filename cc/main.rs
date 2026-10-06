@@ -109,6 +109,10 @@ struct Args {
     #[arg(long = "dM", help = gettext("Dump macro definitions instead of output"))]
     dump_macros: bool,
 
+    /// Keep every `#define` and `#undef` in the preprocessed text (`-dD`).
+    #[arg(long = "dD", help = gettext("Keep macro definitions in the output"))]
+    dump_definitions: bool,
+
     /// Write a make rule naming every header the source depends on, instead of
     /// compiling it (`-M`).
     #[arg(short = 'M', help = gettext("Write a make dependency rule instead of compiling"))]
@@ -970,6 +974,17 @@ fn emit_preprocessed(
     // below checks this; a marker is never merely cosmetic, so each site
     // has to say what it does instead.
     let markers = !args.no_line_markers;
+    // `-dD`: the definitions the source starts with, under gcc's name for
+    // where they came from. The marker naming the source follows, so the
+    // line count is right again for what comes after.
+    if !outcome.initial_definitions.is_empty() {
+        if markers {
+            writeln!(out.preprocessed, "# 1 \"<built-in>\"")?;
+        }
+        for line in &outcome.initial_definitions {
+            writeln!(out.preprocessed, "{}", line.trim_end())?;
+        }
+    }
     if markers {
         writeln!(
             out.preprocessed,
@@ -1249,6 +1264,8 @@ fn process_file(
             preprocessed,
             pre_includes: &args.pre_includes,
             dump_macros: args.dump_macros,
+            // Only `-E` writes the text the directives are carried into.
+            keep_definitions: args.dump_definitions && args.preprocess_only,
             collect_dependencies: args.wants_dependencies(),
             optimization: args.optimization(),
             position: position_independence(args, target),
@@ -2047,9 +2064,9 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             } else {
                 i += 1;
             }
-        } else if arg == "-dM" {
-            // One dash in gcc; clap would read it as the short cluster `-d -M`.
-            result.push("--dM".to_string());
+        } else if arg == "-dM" || arg == "-dD" {
+            // One dash in gcc; clap would read it as a short cluster `-d -M`.
+            result.push(format!("-{arg}"));
             i += 1;
         } else if arg == "-include" {
             // gcc spells it with one dash; clap would read that as the short

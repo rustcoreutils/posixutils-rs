@@ -205,6 +205,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
             preprocessed: false,
             pre_includes: &[],
             dump_macros: false,
+            keep_definitions: false,
             collect_dependencies: false,
             optimization: o.optimization,
             position,

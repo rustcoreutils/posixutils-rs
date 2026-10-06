@@ -1368,6 +1368,15 @@ fn test_linkdata_writes_hardlink_data() {
     let listing =
         run_pax_with_stdin_bytes(&["-o", "listopt=%(typeflag)s %(size)d %F"], &output.stdout);
     assert_eq!(stdout_str(&listing), "0 5 a\n1 5 b\n");
+    // The sizes alone do not show the data is there: a header claiming five
+    // bytes with none behind it reads the trailer as the body. Each member's
+    // body block must begin with the bytes.
+    let bodies = output
+        .stdout
+        .chunks(BLOCK)
+        .filter(|b| b.starts_with(b"DATA\n"))
+        .count();
+    assert_eq!(bodies, 2, "hard link b carries no data block");
 }
 
 /// ustar has no socket type. POSIX: a file that cannot be archived in the
@@ -1479,14 +1488,27 @@ fn test_empty_archive_reads_and_appends() {
 #[test]
 fn test_pax_non_ascii_name_gets_path_record() {
     let temp = TempDir::new().unwrap();
-    fs::write(temp.path().join("café"), "C\n").unwrap();
+    let f = temp.path().join("café");
+    fs::write(&f, "C\n").unwrap();
+    // Whole seconds, so no mtime record makes an `x` header on its own.
+    filetime::set_file_mtime(&f, filetime::FileTime::from_unix_time(1_000_000_000, 0)).unwrap();
 
     let output = run_pax_in_dir(&["-w", "-x", "pax", "café"], temp.path());
     assert_success(&output, "pax -w");
-    let listing = run_pax_with_stdin_bytes(&["-o", "listopt=%(typeflag)s"], &output.stdout);
-    assert_success(&listing, "list");
-    // An `x` header precedes the member, carrying the name.
-    assert_eq!(output.stdout[156], b'x');
+    assert_eq!(
+        output.stdout[156], b'x',
+        "an `x` header precedes the member"
+    );
+    assert_eq!(count_pax_records(&output.stdout, "path"), 1);
+    assert!(
+        output
+            .stdout
+            .windows(" path=café\n".len())
+            .any(|w| w == " path=café\n".as_bytes()),
+        "the record carries the name in UTF-8"
+    );
+    let listing = run_pax_with_stdin_bytes(&[], &output.stdout);
+    assert_eq!(stdout_str(&listing), "café\n");
 }
 
 /// -t restores the access time of each file read -- in copy mode too, and for
@@ -1841,7 +1863,8 @@ fn test_overlong_path_records_are_rejected() {
     let temp = TempDir::new().unwrap();
     let limit = 64 * 1024;
     // Exactly at the limit is a name like any other.
-    let at_limit = format!("{}f", "a/".repeat((limit - 1) / 2));
+    let at_limit = format!("{}ff", "a/".repeat((limit - 2) / 2));
+    assert_eq!(at_limit.len(), limit);
     fs::write(
         temp.path().join("ok.pax"),
         archive_with_ext_records(&pax_record("path", at_limit.as_bytes())),
@@ -1852,7 +1875,8 @@ fn test_overlong_path_records_are_rejected() {
     assert_eq!(stdout_str(&output), format!("{at_limit}\n"));
 
     for keyword in ["path", "linkpath"] {
-        let long = format!("{}f", "a/".repeat(limit / 2));
+        // One byte over.
+        let long = format!("{at_limit}f");
         let name = format!("{keyword}.pax");
         fs::write(
             temp.path().join(&name),

@@ -1969,7 +1969,7 @@ fn test_option_hdrcharset_is_checked_and_still_recorded() {
 }
 
 /// Under `-o hdrcharset=BINARY` the `path` record is what carries a name's
-/// bytes, so POSIX requires one for any non-ASCII name even when the ustar
+/// bytes, and POSIX requires one for any non-ASCII name even when the ustar
 /// fields could hold it: RATIONALE, "an extended header path record is always
 /// required to be generated if the prefix or name fields contain non-ASCII
 /// characters even when hdrcharset=binary is also in effect for that file."
@@ -1982,8 +1982,8 @@ fn test_option_hdrcharset_binary_forces_a_path_record() {
     let temp = TempDir::new().unwrap();
     let src_dir = temp.path().join("source");
     fs::create_dir(&src_dir).unwrap();
-    // Short, and valid UTF-8: the ustar name field could hold it, so nothing
-    // but the operator's request makes a record necessary.
+    // Short, and valid UTF-8: the ustar name field could hold its bytes, but
+    // a ustar header is ISO/IEC 646, so it needs a record all the same.
     fs::write(src_dir.join("élan.txt"), b"x").unwrap();
     fs::write(src_dir.join("plain.txt"), b"y").unwrap();
 
@@ -1997,15 +1997,15 @@ fn test_option_hdrcharset_binary_forces_a_path_record() {
 
     let path_records = |bytes: &[u8]| bytes.windows(5).filter(|w| *w == b"path=").count();
 
-    // Without the option, a short UTF-8 name needs no record.
+    // Without the option, the non-ASCII name gets one in UTF-8 ...
     let plain = write(&temp.path().join("plain.pax"), &[]);
     assert_eq!(
         path_records(&plain),
-        0,
-        "a representable name must not get a path record on its own"
+        1,
+        "a non-ASCII name needs a path record whatever the charset"
     );
 
-    // With it, the non-ASCII name gets one -- and only that one.
+    // ... and with it, too -- and only that one.
     let binary = write(
         &temp.path().join("binary.pax"),
         &["-o", "hdrcharset=BINARY"],
@@ -2372,18 +2372,42 @@ fn test_o_keyword_with_invalid_value_is_refused_on_list() {
 /// combine as if concatenated.
 #[test]
 fn test_p_option_may_repeat() {
-    let temp = TempDir::new().unwrap();
+    use std::os::unix::fs::MetadataExt;
+
     let archive = Ustar {
         name: b"f",
+        mode: 0o666,
         body: b"F\n",
+        mtime: 1_000_000_000,
         ..Default::default()
     }
     .archive();
+    // Under umask 077 a mode of 0666 survives only if `p` took effect.
+    let extract = |privs: &[&str]| {
+        let temp = TempDir::new().unwrap();
+        let pax = env!("CARGO_BIN_EXE_pax");
+        let mut args = vec!["-c", "umask 077; exec \"$0\" \"$@\"", pax, "-r"];
+        args.extend_from_slice(privs);
+        let output = run_program(
+            std::path::Path::new("sh"),
+            &args,
+            temp.path(),
+            Some(&archive),
+        );
+        assert_success(&output, &format!("pax -r {privs:?}"));
+        let md = fs::metadata(temp.path().join("f")).unwrap();
+        (md.mode() & 0o7777, md.mtime())
+    };
 
-    let output =
-        run_pax_with_stdin_bytes_in_dir(&["-r", "-p", "p", "-p", "m"], &archive, temp.path());
-    assert_success(&output, "pax -r -p p -p m");
-    assert!(temp.path().join("f").exists());
+    // Each string alone does only its own part ...
+    assert_eq!(extract(&["-p", "p"]), (0o666, 1_000_000_000));
+    assert_eq!(extract(&["-p", "m"]).0, 0o600);
+    // ... and repeated, both apply.
+    for privs in [["-p", "p", "-p", "m"], ["-p", "m", "-p", "p"]] {
+        let (mode, mtime) = extract(&privs);
+        assert_eq!(mode, 0o666, "{privs:?}: the mode was not preserved");
+        assert_ne!(mtime, 1_000_000_000, "{privs:?}: the mtime was preserved");
+    }
 }
 
 /// -H and -L conflict, and POSIX says the last one given wins. With -L last

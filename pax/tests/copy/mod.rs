@@ -759,10 +759,11 @@ fn test_copy_hard_link_follows_the_sanitized_member_name() {
     );
 }
 
-/// `pax -rwl tree .` names each source file as its own destination. linkat()
-/// reports EEXIST, and the replace-on-EEXIST path must not then unlink the
-/// name -- it is the source. BSD pax says "Unable to link file to itself" and
-/// leaves the tree alone.
+/// `pax -rwl tree/f tree/g tree/s .` names each source file as its own
+/// destination. linkat() reports EEXIST, and the replace-on-EEXIST path must
+/// not then unlink the name -- it is the source. BSD pax says "Unable to link
+/// file to itself" for each and leaves the tree alone. `pax -rwl tree .` is
+/// refused one level up, at the directory.
 #[test]
 fn test_copy_link_onto_itself_keeps_source() {
     let temp = TempDir::new().unwrap();
@@ -771,12 +772,28 @@ fn test_copy_link_onto_itself_keeps_source() {
     fs::write(tree.join("f"), "DATA\n").unwrap();
     fs::hard_link(tree.join("f"), tree.join("g")).unwrap();
     fs::write(tree.join("s"), "x\n").unwrap();
+    let ino = |n: &str| fs::metadata(tree.join(n)).unwrap().ino();
+    let before = [ino("f"), ino("g"), ino("s")];
 
-    run_pax_in_dir(&["-rwl", "tree", "."], temp.path());
+    let files = ["tree/f", "tree/g", "tree/s"];
+    for (operands, diagnostics) in [(&files[..], 3), (&["tree"][..], 1)] {
+        let mut args = vec!["-rwl"];
+        args.extend_from_slice(operands);
+        args.push(".");
+        let output = run_pax_in_dir(&args, temp.path());
+        assert_exit_code(&output, 1, &format!("pax {args:?}"));
+        assert_eq!(
+            stderr_str(&output).lines().count(),
+            diagnostics,
+            "{args:?}: {}",
+            stderr_str(&output)
+        );
 
-    assert_eq!(fs::read_to_string(tree.join("f")).unwrap(), "DATA\n");
-    assert_eq!(fs::read_to_string(tree.join("g")).unwrap(), "DATA\n");
-    assert_eq!(fs::read_to_string(tree.join("s")).unwrap(), "x\n");
+        assert_eq!(fs::read_to_string(tree.join("f")).unwrap(), "DATA\n");
+        assert_eq!(fs::read_to_string(tree.join("g")).unwrap(), "DATA\n");
+        assert_eq!(fs::read_to_string(tree.join("s")).unwrap(), "x\n");
+        assert_eq!([ino("f"), ino("g"), ino("s")], before, "{args:?}");
+    }
 }
 
 /// A multiply-linked file reached twice -- `find tree | pax -rw` visits it as

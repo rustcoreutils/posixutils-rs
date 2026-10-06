@@ -640,30 +640,23 @@ impl ExtendedHeader {
     ///
     /// `options` supplies the two things the operator can change. `-o times`
     /// forces atime and mtime records for every member rather than only where
-    /// one is needed, and `-o hdrcharset=` both widens the rule for which
-    /// names need a record and decides whether this member declares a charset
-    /// of its own.
+    /// one is needed, and `-o hdrcharset=` decides whether this member
+    /// declares a charset of its own.
     pub fn from_entry(entry: &ArchiveEntry, options: &FormatOptions) -> Self {
         let mut header = ExtendedHeader::new();
         let include_times = options.include_times;
 
-        // `-o hdrcharset=BINARY` is the operator saying the names in this
-        // archive are the underlying system's bytes rather than UTF-8, and
-        // under it the `path` record is what carries those bytes. POSIX's
-        // RATIONALE is explicit about the consequence: "an extended header
-        // path record is always required to be generated if the prefix or
-        // name fields contain non-ASCII characters even when
-        // hdrcharset=binary is also in effect for that file." So the trigger
-        // widens from "has no faithful UTF-8 reading" to "is not ASCII": a
-        // UTF-8 name that would fit the ustar fields still needs the record.
+        // Every character of a ustar header is ISO/IEC 646, so a pathname
+        // with any other byte has no faithful ustar spelling and goes in a
+        // `path` (or `linkpath`) record -- as GNU tar and bsdtar write it.
+        // POSIX's RATIONALE: "an extended header path record is always
+        // required to be generated if the prefix or name fields contain
+        // non-ASCII characters even when hdrcharset=binary is also in effect
+        // for that file." Under `-o hdrcharset=BINARY` the record carries the
+        // system's bytes; otherwise UTF-8, which a name that is not valid
+        // UTF-8 cannot be -- that one is declared BINARY below.
         let binary = options.hdrcharset() == Some(crate::options::BINARY_CHARSET);
-        let needs_record = |bytes: &[u8]| {
-            if binary {
-                !bytes.is_ascii()
-            } else {
-                std::str::from_utf8(bytes).is_err()
-            }
-        };
+        let not_utf8 = |bytes: &[u8]| std::str::from_utf8(bytes).is_err();
 
         // Path needs an extended header whenever it cannot be represented
         // exactly by the ustar name/prefix pair. Length alone is not the test:
@@ -673,21 +666,20 @@ impl ExtendedHeader {
         // ustar fallback in split_path() silently truncates the name.
         let path_bytes = crate::rawpath::as_bytes(&entry.path);
         let ustar_spelling = ustar_path_bytes(entry);
-        let path_is_binary = needs_record(path_bytes);
-        if try_split_path(&ustar_spelling).is_none() || path_is_binary {
-            // A non-UTF-8 name has no faithful ustar spelling, so it always
+        if try_split_path(&ustar_spelling).is_none() || !path_bytes.is_ascii() {
+            // A non-ASCII name has no faithful ustar spelling, so it always
             // needs the record regardless of length. A directory's carries
             // the trailing slash its header fields would, as bsdtar's does,
             // so it lists the same whichever of the two names it.
             header.path = Some(ustar_spelling);
         }
 
-        // Link path needs extended header if too long
+        // Link path needs extended header if too long or not ASCII
         let mut link_is_binary = false;
         if let Some(ref link) = entry.link_target {
             let link_bytes = link.as_os_str().as_bytes();
-            link_is_binary = needs_record(link_bytes);
-            if link_bytes.len() > LINKNAME_LEN || link_is_binary {
+            link_is_binary = not_utf8(link_bytes);
+            if link_bytes.len() > LINKNAME_LEN || !link_bytes.is_ascii() {
                 header.linkpath = Some(link_bytes.to_vec());
             }
         }
@@ -709,7 +701,7 @@ impl ExtendedHeader {
         // so any of the four forces the declaration, not just the two
         // pathnames. A user or group name is bytes from the local database and
         // need not be UTF-8 either.
-        let not_utf8 = |bytes: &[u8]| std::str::from_utf8(bytes).is_err();
+        let path_is_binary = not_utf8(path_bytes);
         let name_is_binary = entry.uname.as_deref().is_some_and(not_utf8)
             || entry.gname.as_deref().is_some_and(not_utf8);
         if !binary && (path_is_binary || link_is_binary || name_is_binary) {

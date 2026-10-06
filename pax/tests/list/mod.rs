@@ -309,9 +309,18 @@ fn test_pattern_bracket_classes_and_slash() {
     a.extend_from_slice(&ustar_trailer());
 
     let output = run_pax_with_stdin_bytes(&["a[[:digit:]]"], &a);
+    assert_success(&output, "a character class");
     assert_eq!(stdout_str(&output), "a1\n");
+    // Matching nothing is "pattern not matched": a diagnostic naming it and
+    // exit 1 -- not a pattern error, and not a silent success.
     let output = run_pax_with_stdin_bytes(&["a[!x]b"], &a);
     assert_eq!(stdout_str(&output), "", "a bracket matched '/'");
+    assert_exit_code(&output, 1, "an unmatched bracket pattern");
+    assert!(
+        stderr_str(&output).contains("a[!x]b"),
+        "{}",
+        stderr_str(&output)
+    );
 }
 
 /// An unterminated '[' is an ordinary character, not a fatal error.
@@ -407,6 +416,11 @@ fn test_gnu_base256_size_and_uid_are_read() {
     let uid = 3_000_000u64;
     a[108] = 0x80;
     a[109..116].copy_from_slice(&uid.to_be_bytes()[1..]);
+    // size field (124..136): base-256, value 2 -- the body that follows. Read
+    // as anything else, the next header lands in the wrong block.
+    a[124..136].fill(0);
+    a[124] = 0x80;
+    a[128..136].copy_from_slice(&2u64.to_be_bytes());
     reseal_header(&mut a);
     a.extend_from_slice(
         &Ustar {
@@ -417,9 +431,9 @@ fn test_gnu_base256_size_and_uid_are_read() {
         .archive(),
     );
 
-    let output = run_pax_with_stdin_bytes(&["-o", "listopt=%(uid)d %F"], &a);
+    let output = run_pax_with_stdin_bytes(&["-o", "listopt=%(uid)d %(size)d %F"], &a);
     assert_success(&output, "list");
-    assert_eq!(stdout_str(&output), "3000000 big-uid\n0 next\n");
+    assert_eq!(stdout_str(&output), "3000000 2 big-uid\n0 2 next\n");
 }
 
 /// Under the C locale a non-ASCII member name must not panic -s.

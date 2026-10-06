@@ -437,18 +437,20 @@ impl Ustar<'_> {
     pub fn header(&self) -> [u8; BLOCK] {
         let mut h = [0u8; BLOCK];
         h[..self.name.len()].copy_from_slice(self.name);
-        h[100..108].copy_from_slice(format!("{:07o}\0", self.mode).as_bytes());
-        h[108..116].copy_from_slice(format!("{:07o}\0", self.uid).as_bytes());
-        h[116..124].copy_from_slice(format!("{:07o}\0", self.gid).as_bytes());
-        let size = self.size.unwrap_or(self.body.len() as u64);
-        h[124..136].copy_from_slice(format!("{:011o}\0", size).as_bytes());
-        h[136..148].copy_from_slice(format!("{:011o}\0", self.mtime).as_bytes());
+        numeric_field(&mut h[100..108], self.mode.into());
+        numeric_field(&mut h[108..116], self.uid.into());
+        numeric_field(&mut h[116..124], self.gid.into());
+        numeric_field(
+            &mut h[124..136],
+            self.size.unwrap_or(self.body.len() as u64),
+        );
+        numeric_field(&mut h[136..148], self.mtime);
         h[156] = self.typeflag;
         h[157..157 + self.linkname.len()].copy_from_slice(self.linkname);
         h[257..263].copy_from_slice(b"ustar\0");
         h[263..265].copy_from_slice(b"00");
-        h[329..337].copy_from_slice(format!("{:07o}\0", self.devmajor).as_bytes());
-        h[337..345].copy_from_slice(format!("{:07o}\0", self.devminor).as_bytes());
+        numeric_field(&mut h[329..337], self.devmajor.into());
+        numeric_field(&mut h[337..345], self.devminor.into());
         h[265..265 + self.uname.len()].copy_from_slice(self.uname);
         h[297..297 + self.gname.len()].copy_from_slice(self.gname);
         h[345..345 + self.prefix.len()].copy_from_slice(self.prefix);
@@ -472,6 +474,29 @@ impl Ustar<'_> {
         let mut out = self.member();
         out.extend_from_slice(&ustar_trailer());
         out
+    }
+}
+
+/// Write `value` into a ustar numeric field: NUL-terminated octal when it
+/// fits, else the GNU base-256 form (first byte 0x80, the value big-endian in
+/// the rest). A uid from the test host -- 2097152 and up is ordinary on CI --
+/// does not fit seven octal digits.
+fn numeric_field(field: &mut [u8], value: u64) {
+    let digits = field.len() - 1;
+    let octal = format!("{value:0digits$o}\0");
+    if octal.len() == field.len() {
+        field.copy_from_slice(octal.as_bytes());
+    } else {
+        let be = value.to_be_bytes();
+        let n = digits.min(be.len());
+        assert!(
+            be[..be.len() - n].iter().all(|&b| b == 0),
+            "{value} too big"
+        );
+        field.fill(0);
+        field[0] = 0x80;
+        let start = field.len() - n;
+        field[start..].copy_from_slice(&be[be.len() - n..]);
     }
 }
 

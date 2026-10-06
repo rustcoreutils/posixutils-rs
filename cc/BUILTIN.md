@@ -561,17 +561,27 @@ incompatible declaration keep the bare name's call.
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_object_size(ptr, type)` | Bytes left in the object `ptr` points into, folded **at parse time** (`parse_object_size`) from what the expression shows: an array, a string literal, `&lvalue`, member and constant-index chains, casts and constant pointer arithmetic. Unknown is `(size_t)-1` for types 0/1 and 0 for 2/3. `type` must be an integer constant from 0 to 3 |
+| `__builtin_object_size(ptr, type)` | Bytes left in the object `ptr` points into. Folded at parse time (`parse_object_size`) from what the expression shows: an array, a string literal, `&lvalue`, member and constant-index chains, casts and constant pointer arithmetic. Anything else becomes `Opcode::ObjectSize` at `-O1`+, answered by `ir::objsize` after inlining by walking the pointer back through copies, constant displacements, `?:` and phis to a local, a named object, a string literal or a constant `alloca` -- the largest arm for types 0/1, the smallest for 2/3. Unknown is `(size_t)-1` for types 0/1 and 0 for 2/3, given at `-O0`, for an operand with side effects, and for whatever the walk cannot see once the optimizer has converged. Type 1 through the IR is the whole object's remaining size, and type 3 is 0 (see `DECISIONS.md`). `type` must be an integer constant from 0 to 3 |
 | `__builtin_dynamic_object_size(ptr, type)` | The same builtin: every static answer is a correct one for it, and c17 gives no run-time sizes |
-| `__builtin___memcpy_chk`, `memmove_chk`, `mempcpy_chk`, `memset_chk` | Calls to `__memcpy_chk` etc. |
+| `__builtin___memcpy_chk`, `memmove_chk`, `mempcpy_chk`, `memset_chk` | Calls to `__memcpy_chk` etc., decided at `-O1`+ as below |
 | `__builtin___strcpy_chk`, `stpcpy_chk`, `strncpy_chk`, `stpncpy_chk`, `strcat_chk`, `strncat_chk` | |
-| `__builtin___printf_chk`, `fprintf_chk`, `sprintf_chk`, `snprintf_chk`, `vsprintf_chk`, `vsnprintf_chk` | |
+| `__builtin___sprintf_chk`, `snprintf_chk`, `vsprintf_chk`, `vsnprintf_chk` | |
+| `__builtin___printf_chk`, `fprintf_chk` | Folded with their plain forms (`stdio.rs`) |
 
-With `_FORTIFY_SOURCE` set and `-O`, glibc's fortified wrappers compile and
-emit `__*_chk` calls, but check nothing useful: a wrapper asks
-`__builtin_object_size` of its own parameter, which at parse time is
-unknown. Folding it after inlining is the remaining work; see the
-`_FORTIFY_SOURCE` entry in `DECISIONS.md`.
+With `_FORTIFY_SOURCE` set and `-O`, glibc's fortified wrappers are inlined
+and their `__builtin_object_size` answered for the caller's object. A `_chk`
+call is then the plain function (`libcall_fold/fortify.rs`, one table-driven
+rule, gcc's) where the size is `(size_t)-1`, or where what it writes is known
+to fit: a constant length or the largest of a choice of constants, a known
+string or the longest of several with its terminator, an empty `strcat` or
+one onto a destination string of known length, a
+`sprintf`/`vsprintf` format with no directive or `sprintf`'s `"%s"` of a
+known string. The `printf` forms drop the check under a nonzero flag only for
+a format with no directive but `"%s"`. Otherwise the check stays, and a
+provable overflow aborts at run time; a `__strcpy_chk` of a known string is
+`__memcpy_chk` of its length and terminator. With the result unused,
+`__mempcpy_chk`, `__stpcpy_chk` and `__stpncpy_chk` are first `__memcpy_chk`,
+`__strcpy_chk` and `__strncpy_chk`. At `-O0` every check stays.
 
 ## Atomic Builtins
 

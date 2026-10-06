@@ -19,6 +19,7 @@ mod asm_probe;
 mod builtins_bit_ops;
 mod builtins_call_semantics;
 mod builtins_copy_fold;
+mod builtins_fortify;
 mod builtins_gnu_atomics;
 mod builtins_gnu_batch;
 mod builtins_intrinsics;

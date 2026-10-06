@@ -43,6 +43,7 @@ pub mod mach_o_dtors;
 pub mod mem2reg;
 pub mod memexpand;
 pub mod memloc;
+pub mod objsize;
 pub(crate) mod padding;
 pub mod propagate;
 pub mod range;
@@ -454,6 +455,14 @@ pub enum Opcode {
     /// `ir::lower` to 0 otherwise -- which is every case at `-O0`, where
     /// the optimizer does not run at all.
     ConstantP,
+    /// `__builtin_object_size(src[0], type)`, deferred until inlining and
+    /// propagation have shown what object `src[0]` points into.
+    ///
+    /// Answered by `ir::objsize` -- the moment its object is known, and
+    /// with the unknown object's answer once the optimizer has converged --
+    /// and by `ir::lower` with the unknown object's answer for anything
+    /// left. The parser answers at `-O0`, so no `-O0` function has one.
+    ObjectSize(crate::parse::ast::ObjectSizeType),
 
     // Byte-swapping builtins
     Bswap16, // Byte-swap 16-bit value
@@ -889,13 +898,13 @@ impl Opcode {
             | ModS | Shl | Lsr | Asr | And | Or | Xor | SetEq | SetNe | SetLt | SetLe | SetGt
             | SetGe | SetB | SetBe | SetA | SetAe | Not | Neg | Trunc | Zext | Sext | Load
             | Store | Phi | PhiSource | Copy | SymAddr | TlsAddr | Select | SetVal | Nop
-            | VaStart | VaArg | VaEnd | VaCopy | VaArgPackLen | ConstantP | Bswap16 | Bswap32
-            | Bswap64 | Ctz32 | Ctz64 | Clz32 | Clz64 | Popcount32 | Popcount64 | Alloca
-            | StackSave | StackRestore | Memset | Memcpy | Memmove | Unreachable | FrameAddress
-            | ReturnAddress | Setjmp | Longjmp | AtomicLoad | AtomicStore | AtomicSwap
-            | AtomicCas | AtomicFetchAdd | AtomicFetchSub | AtomicFetchAnd | AtomicFetchOr
-            | AtomicFetchXor | Fence | Lo64 | Hi64 | Pair64 | AddC | AdcC | SubC | SbcC
-            | UMulHi | LifetimeEnd => FpRaise::Never,
+            | VaStart | VaArg | VaEnd | VaCopy | VaArgPackLen | ConstantP | ObjectSize(_)
+            | Bswap16 | Bswap32 | Bswap64 | Ctz32 | Ctz64 | Clz32 | Clz64 | Popcount32
+            | Popcount64 | Alloca | StackSave | StackRestore | Memset | Memcpy | Memmove
+            | Unreachable | FrameAddress | ReturnAddress | Setjmp | Longjmp | AtomicLoad
+            | AtomicStore | AtomicSwap | AtomicCas | AtomicFetchAdd | AtomicFetchSub
+            | AtomicFetchAnd | AtomicFetchOr | AtomicFetchXor | Fence | Lo64 | Hi64 | Pair64
+            | AddC | AdcC | SubC | SbcC | UMulHi | LifetimeEnd => FpRaise::Never,
         }
     }
 
@@ -1142,6 +1151,7 @@ impl Opcode {
             Opcode::VaCopy => "va_copy",
             Opcode::VaArgPackLen => "va_arg_pack_len",
             Opcode::ConstantP => "constant_p",
+            Opcode::ObjectSize(_) => "object_size",
             Opcode::Bswap16 => "bswap16",
             Opcode::Bswap32 => "bswap32",
             Opcode::Bswap64 => "bswap64",
@@ -1241,12 +1251,17 @@ macro_rules! every_opcode {
                 Opcode::Simd(SimdOp::CvtUF),
                 Opcode::Simd(SimdOp::CvtFS),
                 Opcode::Simd(SimdOp::CvtFU),
+                Opcode::ObjectSize(crate::parse::ast::ObjectSizeType::from_bits(0)),
+                Opcode::ObjectSize(crate::parse::ast::ObjectSizeType::from_bits(1)),
+                Opcode::ObjectSize(crate::parse::ast::ObjectSizeType::from_bits(2)),
+                Opcode::ObjectSize(crate::parse::ast::ObjectSizeType::from_bits(3)),
             ];
 
             /// The exhaustiveness guard behind [`Opcode::ALL`]; always true.
             fn is_listed(self) -> bool {
                 match self {
                     $(Opcode::$op)|* => true,
+                    Opcode::ObjectSize(_) => true,
                     Opcode::RoundToIntegral(
                         IntegralRounding::Floor
                         | IntegralRounding::Ceil
@@ -4003,7 +4018,31 @@ impl AppendIndex {
 /// called something else -- `strstr(s, "c")` becomes `strchr(s, 'c')` --
 /// by their C names.
 pub const FOLD_CALLEES: &[&str] = &[
-    "strlen", "strchr", "strcpy", "memcpy", "memset", "puts", "putchar", "fputs", "fputc", "fwrite",
+    "strlen",
+    "strchr",
+    "strcpy",
+    "memcpy",
+    "memset",
+    "puts",
+    "putchar",
+    "fputs",
+    "fputc",
+    "fwrite",
+    // What a `_chk` call is without its check (`libcall_fold::fortify`).
+    "memmove",
+    "stpcpy",
+    "strncpy",
+    "stpncpy",
+    "strcat",
+    "strncat",
+    "sprintf",
+    "snprintf",
+    "vsprintf",
+    "vsnprintf",
+    // ... and a `_chk` call whose result is unused.
+    "__memcpy_chk",
+    "__strcpy_chk",
+    "__strncpy_chk",
 ];
 
 /// [`Module::strings`] and its index, borrowed apart from the rest of the

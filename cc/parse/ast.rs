@@ -133,6 +133,40 @@ pub enum MathErrno {
     Ignored,
 }
 
+/// The second argument of `__builtin_object_size`, an integer constant from
+/// 0 to 3: bit 0 asks about the closest surrounding subobject rather than the
+/// whole object, and bit 1 for the fewest bytes that may remain rather than
+/// the most.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ObjectSizeType {
+    /// Bit 0: the closest surrounding subobject.
+    pub subobject: bool,
+    /// Bit 1: a minimum, where clear a maximum.
+    pub minimum: bool,
+}
+
+impl ObjectSizeType {
+    /// The type from its argument's value, which the parser has checked is
+    /// 0 to 3.
+    pub const fn from_bits(bits: u64) -> ObjectSizeType {
+        ObjectSizeType {
+            subobject: bits & 1 != 0,
+            minimum: bits & 2 != 0,
+        }
+    }
+
+    /// What the builtin answers when nothing is known about the object:
+    /// the answer that lets a `_FORTIFY_SOURCE` check pass rather than fire,
+    /// which is `(size_t)-1` for a maximum and 0 for a minimum.
+    pub fn unknown(self) -> u64 {
+        if self.minimum {
+            0
+        } else {
+            u64::MAX
+        }
+    }
+}
+
 /// A library function whose call stays a call, but whose result the
 /// optimizer may know from its arguments (C17 7.1.4p1): `strlen("abc")` is 3,
 /// `strchr(s, 0)` is `s + strlen(s)`.
@@ -188,6 +222,24 @@ pub enum LibFn {
     /// libgcc's `__div?c3`, which a floating complex `/` calls; as
     /// [`LibFn::MulComplex`].
     DivComplex,
+    /// glibc's checking forms of the functions that write into a buffer,
+    /// which `_FORTIFY_SOURCE` calls through `__builtin___memcpy_chk` and
+    /// its kin with the destination's `__builtin_object_size`
+    /// ([`LibFamily::Fortified`]).
+    MemcpyChk,
+    MempcpyChk,
+    MemmoveChk,
+    MemsetChk,
+    StrcpyChk,
+    StpcpyChk,
+    StrncpyChk,
+    StpncpyChk,
+    StrcatChk,
+    StrncatChk,
+    SprintfChk,
+    SnprintfChk,
+    VsprintfChk,
+    VsnprintfChk,
 }
 
 /// The kinds of [`LibFn`], by what a call to one does: the optimizer folds
@@ -203,6 +255,9 @@ pub enum LibFamily {
     Output,
     /// A libgcc complex `*` or `/` routine.
     ComplexArith,
+    /// A `_chk` function that checks a write against the size of the object
+    /// written to, and is the plain function where the write provably fits.
+    Fortified,
 }
 
 impl LibFn {
@@ -241,6 +296,20 @@ impl LibFn {
             | L::Fputc
             | L::Fwrite => LibFamily::Output,
             L::MulComplex | L::DivComplex => LibFamily::ComplexArith,
+            L::MemcpyChk
+            | L::MempcpyChk
+            | L::MemmoveChk
+            | L::MemsetChk
+            | L::StrcpyChk
+            | L::StpcpyChk
+            | L::StrncpyChk
+            | L::StpncpyChk
+            | L::StrcatChk
+            | L::StrncatChk
+            | L::SprintfChk
+            | L::SnprintfChk
+            | L::VsprintfChk
+            | L::VsnprintfChk => LibFamily::Fortified,
         }
     }
 
@@ -289,6 +358,20 @@ impl LibFn {
             L::Putchar => "putchar",
             L::Fputc => "fputc",
             L::Fwrite => "fwrite",
+            L::MemcpyChk => "__memcpy_chk",
+            L::MempcpyChk => "__mempcpy_chk",
+            L::MemmoveChk => "__memmove_chk",
+            L::MemsetChk => "__memset_chk",
+            L::StrcpyChk => "__strcpy_chk",
+            L::StpcpyChk => "__stpcpy_chk",
+            L::StrncpyChk => "__strncpy_chk",
+            L::StpncpyChk => "__stpncpy_chk",
+            L::StrcatChk => "__strcat_chk",
+            L::StrncatChk => "__strncat_chk",
+            L::SprintfChk => "__sprintf_chk",
+            L::SnprintfChk => "__snprintf_chk",
+            L::VsprintfChk => "__vsprintf_chk",
+            L::VsnprintfChk => "__vsnprintf_chk",
             L::MulComplex | L::DivComplex => return None,
         })
     }
@@ -933,6 +1016,17 @@ pub enum ExprKind {
     /// so this carries only the cases that might yet become constant. It
     /// resolves to 0 if nothing proves otherwise, which is what `-O0` gets.
     ConstantP(Box<Expr>),
+
+    /// `__builtin_object_size(ptr, type)` that the parser could not answer
+    /// from the expression as written: `ptr` is a pointer variable, a
+    /// choice, or anything else whose object only propagation finds. gcc
+    /// answers it after inlining and propagation, at `-O1` and above, so it
+    /// is deferred to `ir::objsize`; at `-O0` the parser answers it
+    /// [`ObjectSizeType::unknown`] at once, as gcc does.
+    ObjectSize {
+        ptr: Box<Expr>,
+        otype: ObjectSizeType,
+    },
 
     /// __builtin_va_copy(dest, src)
     /// Copies a va_list
@@ -2453,6 +2547,7 @@ impl Expr {
             | K::VaArg { ap: a, .. }
             | K::VaEnd { ap: a }
             | K::ConstantP(a)
+            | K::ObjectSize { ptr: a, .. }
             | K::Bswap16 { arg: a }
             | K::Bswap32 { arg: a }
             | K::Bswap64 { arg: a }

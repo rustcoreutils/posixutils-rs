@@ -2748,9 +2748,9 @@ impl<'a> Linearizer<'a> {
             // nothing. `VaArgPack` is not a value at all -- the call it sits
             // in carries it -- but it is no less pure for that.
             ExprKind::VaArgPack | ExprKind::VaArgPackLen => true,
-            // Answers a question *about* its operand without evaluating it:
+            // Answer a question *about* their operand without evaluating it:
             // an impure one is never linearized at all (see below).
-            ExprKind::ConstantP(_) => true,
+            ExprKind::ConstantP(_) | ExprKind::ObjectSize { .. } => true,
             // Literals are always pure
             ExprKind::IntLit(_)
             | ExprKind::Int128Lit(_)
@@ -6972,6 +6972,29 @@ impl<'a> Linearizer<'a> {
                         .with_target(result)
                         .with_src(operand)
                         .with_type_and_size(self.types.int_id, 32),
+                );
+                result
+            }
+            // `__builtin_object_size`, for a pointer whose object the parser
+            // could not see. gcc answers it once inlining and propagation have
+            // shown the object, so it is deferred to `ir::objsize`, which
+            // walks the pointer back to it, and to `ir::lower` for anything
+            // left. As for `ConstantP`, the builtin does not evaluate its
+            // argument: gcc answers one with side effects as an unknown
+            // object at once, and a computation without is dead once the
+            // placeholder is answered.
+            ExprKind::ObjectSize { ptr, otype } => {
+                let size_t = self.types.ulong_id;
+                if !self.is_discardable(ptr) {
+                    return self.emit_const(super::objsize::size_constant(otype.unknown()), size_t);
+                }
+                let operand = self.linearize_expr(ptr);
+                let result = self.alloc_reg_pseudo();
+                self.emit(
+                    Instruction::new(Opcode::ObjectSize(*otype))
+                        .with_target(result)
+                        .with_src(operand)
+                        .with_type_and_size(size_t, self.types.size_bits(size_t)),
                 );
                 result
             }

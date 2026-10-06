@@ -16,35 +16,6 @@ than rediscover the choice.
 
 ## Settled — do not re-open
 
-### `_FORTIFY_SOURCE` compiles but checks nothing
-
-**Deferred indefinitely by maintainer decision** -- a decision, not a backlog
-item, and this is its only record. `_FORTIFY_SOURCE`,
-`__builtin_object_size` and the `_chk` family appear nowhere in POSIX.1-2024
-or C17, so this is not a conformance gap.
-
-What the build needs already works: c17 accepts `-D_FORTIFY_SOURCE=2` (and
-`=3`, whose `__builtin_dynamic_object_size` falls back to
-`__builtin_object_size`), compiles glibc's fortified headers, and links.
-Distro builds pass the flag by default -- Debian's `dpkg-buildflags` does --
-so this part is load-bearing. With `-O`, `__OPTIMIZE__` is predefined, glibc
-compiles its wrappers, and c17 emits the `__*_chk` calls.
-
-What it does not do is *check*. `__builtin_object_size` folds at parse time
-from what the expression shows (an array, a member, `&lvalue`, constant
-pointer arithmetic). Inside a glibc wrapper its argument is the wrapper's own
-parameter, which at parse time is unknown, so it folds to `(size_t)-1` -- the
-encoding for "do not check". The program pays for the wrappers and checks
-nothing, and anyone who sets the flag expecting hardening gets no diagnostic
-saying so.
-
-Doing it properly means folding `__builtin_object_size` after inlining. There
-is no IR representation for an unresolved builtin query -- no opcode, no
-expression node that survives linearization, and no post-inline
-pointer-provenance analysis to build one on. `instcombine` refuses to touch
-`Call` and every memory-touching opcode, and its `Simplification` enum can
-only copy or fold to a constant. That is the cost the deferral weighs.
-
 ### Trigraphs are off by default — decided, not deferred
 
 **Settled. Not a to-do, not an open conformance item, not awaiting a
@@ -168,7 +139,7 @@ themselves. No torture test depends on it.
 |---|---|
 | `mode` with a vector mode | `mode(V4SI)` and the other vector modes warn that they are not implemented and leave the declared type unchanged, so `sizeof` is the element's (4) where gcc's is the vector's (16). Scalar modes (`QI`..`TI`, `SF`, `DF`, ...) bind as in gcc, on a declarator, a struct member or a parameter. gcc itself deprecates vector modes in favour of `vector_size` |
 | `return` with the wrong value-ness | `return expr;` in a `void` function, and a bare `return;` in a non-`void` one, are errors, as they are by default from GCC 14 (`-Wreturn-mismatch`); GCC 13 and earlier warn. Both are C17 6.8.6.4p1 constraint violations. `-fpermissive` downgrades them, as it does implicit `int` |
-| `_FORTIFY_SOURCE` | Compiles the wrappers and emits `__*_chk` calls, but checks nothing; see the settled entry above |
+| `_FORTIFY_SOURCE` | `__builtin_object_size` is answered after inlining (`ir/objsize.rs`) and the `_chk` calls are decided as gcc decides them (`ir/libcall_fold/fortify.rs`), with four differences. The IR does not record subobjects, so type 1 of a pointer whose object only propagation finds is the whole object's remaining size, which never fires where gcc's would not, and type 3 is 0; the parser answers both exactly where the expression names the member. A `malloc` or other `alloc_size` result is an unknown object. A provable overflow is left to abort at run time without gcc's compile-time `-Wstringop-overflow` warning, which c17 does not have. And gcc's strlen pass re-expresses some checks that stay -- `__strncat_chk` with a bound no shorter than its source as `__strcat_chk`, `__strcat_chk` onto a string of known length as `__strcpy_chk` or `__memcpy_chk` at its end -- where c17 keeps the call as written; the check is made either way |
 | Identifier characters U+FD3E, U+FD3F | Rejected here; GCC's binary accepts them. Ornate parentheses, which C17 Annex D excludes between its F900-FD3D and FD40-FDCF ranges -- GCC's own `ucnid.tab` does not list them and Clang's table does not either, so the table is followed rather than the binary |
 | Darwin: an over-aligned variadic aggregate | clang disagrees with itself, so no compiler satisfies this in both directions. Measured on macOS CI: its caller stacks the aggregate at the next eight-byte granule and its `va_arg` rounds the cursor up to the type's own alignment, reading somewhere else. A program built entirely with clang has the same defect. c17 follows `va_arg` -- its caller realigns the outgoing area so the argument really is that aligned -- which means a c17 caller reaches a clang callee and a clang caller does not reach a c17 callee. `codegen_over_aligned_argument_area` therefore does not put this shape through its host-compiler cross-check on Apple; the pure-c17 runs still cover it at every optimization level |
 | Darwin: a vector that is not one of the machine's widths | gcc and clang disagree about these on System V, and c17 follows gcc. A vector wider than sixteen bytes has no register class unless AVX is on, so gcc gives it memory and a hidden return pointer while clang legalizes it into a pair of SSE registers -- on every target it compiles for, Linux included. A one-lane vector (`double`, `long long` or `float` under `vector_size`, and a register-sized struct holding one) is memory to gcc and the bare scalar in its own register to clang. So a clang caller of a c17 callee returning `int __attribute__((vector_size(32)))` reads the wrong place, and `va_arg` disagrees likewise. Neither compiler is wrong -- the psABI classifies no such type -- so `vector_abi_interop_host` leaves these shapes out of its host-compiler cross-check on Apple and runs them with c17 on both sides, which `GCC_VECTORS` in its sources keys off `__APPLE__` and `C17_ALONE` to do |

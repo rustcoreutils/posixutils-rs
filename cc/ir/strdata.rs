@@ -165,6 +165,23 @@ pub(crate) enum Len {
     MinusOffset { len: u64, var: PseudoId },
 }
 
+/// How a walk joins the lengths its arms find.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Joint {
+    /// Every arm must find the same length: the length is known.
+    Same,
+    /// The longest constant length: no arm's string is longer.
+    Longest,
+}
+
+/// Where a walk is: the phis being asked about, the definitions it may still
+/// follow, and how it joins arms.
+struct WalkState {
+    open: HashSet<PseudoId>,
+    budget: usize,
+    joint: Joint,
+}
+
 /// What one arm of a walk found.
 enum Walk {
     Len(Len),
@@ -241,15 +258,34 @@ impl<'a> StrReader<'a> {
     /// The length of the string `p` points at, when every value `p` can
     /// have gives the same one.
     pub(crate) fn string_len(&self, p: PseudoId) -> Option<Len> {
-        let mut budget = MAX_WALK;
-        match self.walk(p, &mut HashSet::new(), &mut budget)? {
+        self.walk_from(p, Joint::Same)
+    }
+
+    /// The length of the longest string `p` can point at, when every value
+    /// `p` can have points at a string of a constant length: gcc's
+    /// `get_maxval_strlen`, which bounds what a `strcpy` writes when the
+    /// source is one of several strings.
+    pub(crate) fn longest_len(&self, p: PseudoId) -> Option<u64> {
+        match self.walk_from(p, Joint::Longest)? {
+            Len::Const(len) => Some(len),
+            Len::MinusOffset { .. } => None,
+        }
+    }
+
+    fn walk_from(&self, p: PseudoId, joint: Joint) -> Option<Len> {
+        let mut state = WalkState {
+            open: HashSet::new(),
+            budget: MAX_WALK,
+            joint,
+        };
+        match self.walk(p, &mut state)? {
             Walk::Len(len) => Some(len),
             Walk::Cycle => None,
         }
     }
 
-    fn walk(&self, p: PseudoId, open: &mut HashSet<PseudoId>, budget: &mut usize) -> Option<Walk> {
-        *budget = budget.checked_sub(1)?;
+    fn walk(&self, p: PseudoId, state: &mut WalkState) -> Option<Walk> {
+        state.budget = state.budget.checked_sub(1)?;
         if let Some(s) = self.string_at(p) {
             return Some(Walk::Len(Len::Const(s.c_str()?.len() as u64)));
         }
@@ -264,15 +300,15 @@ impl<'a> StrReader<'a> {
         }
         let def = self.am.def(self.func, p)?;
         match (def.op, def.src.as_slice()) {
-            (Opcode::Copy | Opcode::PhiSource, &[src]) => self.walk(src, open, budget),
-            (Opcode::Select, &[_, a, b]) => self.join(&[a, b], open, budget),
+            (Opcode::Copy | Opcode::PhiSource, &[src]) => self.walk(src, state),
+            (Opcode::Select, &[_, a, b]) => self.join(&[a, b], state),
             (Opcode::Phi, _) => {
-                if !open.insert(p) {
+                if !state.open.insert(p) {
                     return Some(Walk::Cycle);
                 }
                 let arms: Vec<PseudoId> = def.phi_list.iter().map(|&(_, v)| v).collect();
-                let joined = self.join(&arms, open, budget);
-                open.remove(&p);
+                let joined = self.join(&arms, state);
+                state.open.remove(&p);
                 joined
             }
             (Opcode::Add, &[a, b]) if def.size == self.ptr_bits => {
@@ -311,19 +347,19 @@ impl<'a> StrReader<'a> {
         None
     }
 
-    /// The one length every arm gives, ignoring the arms that only cycle.
-    fn join(
-        &self,
-        arms: &[PseudoId],
-        open: &mut HashSet<PseudoId>,
-        budget: &mut usize,
-    ) -> Option<Walk> {
+    /// The one length every arm gives, or the longest constant one, as
+    /// `state` joins them, ignoring the arms that only cycle.
+    fn join(&self, arms: &[PseudoId], state: &mut WalkState) -> Option<Walk> {
         let mut found: Option<Len> = None;
         for &arm in arms {
-            match self.walk(arm, open, budget)? {
-                Walk::Cycle => {}
-                Walk::Len(len) if found.is_none_or(|f| f == len) => found = Some(len),
-                Walk::Len(_) => return None,
+            match (self.walk(arm, state)?, found, state.joint) {
+                (Walk::Cycle, ..) => {}
+                (Walk::Len(len), None, _) => found = Some(len),
+                (Walk::Len(len), Some(f), Joint::Same) if f == len => {}
+                (Walk::Len(Len::Const(a)), Some(Len::Const(b)), Joint::Longest) => {
+                    found = Some(Len::Const(a.max(b)));
+                }
+                (Walk::Len(_), Some(_), _) => return None,
             }
         }
         Some(found.map_or(Walk::Cycle, Walk::Len))
@@ -661,6 +697,37 @@ mod tests {
         let s = fx.select(r, c);
         fx.phi_into(r, &[a, s]);
         assert_eq!(fx.len(r), None);
+    }
+
+    /// The longest of several strings is the longest any arm brings, a loop
+    /// included; an arm whose string is not known leaves no bound, and
+    /// neither does a pointer an unknown distance into a string.
+    #[test]
+    fn the_longest_of_several_strings() {
+        let mut fx = Fixture::new();
+        let (foo, four) = (fx.literal("foo"), fx.literal("four"));
+        let (a, c) = (fx.addr(&foo), fx.addr(&four));
+        let longest = |fx: &Fixture, p| {
+            let bytes = ConstBytes::build(&fx.module, &fx.types);
+            let f = &fx.module.functions[0];
+            let am = AddrMap::build(f);
+            StrReader::new(&bytes, f, &am, &fx.types).longest_len(p)
+        };
+        assert_eq!(longest(&fx, a), Some(3));
+        let differ = fx.select(a, c);
+        assert_eq!(longest(&fx, differ), Some(4));
+
+        let r = fx.fresh();
+        let s = fx.select(r, c);
+        fx.phi_into(r, &[a, s]);
+        assert_eq!(longest(&fx, r), Some(4));
+
+        let u = fx.unknown();
+        let unknown_arm = fx.select(a, u);
+        assert_eq!(longest(&fx, unknown_arm), None);
+        let i = fx.unknown();
+        let into = fx.op(Opcode::Add, c, i);
+        assert_eq!(longest(&fx, into), None);
     }
 
     /// A local array's string is read a byte at a time from the stores

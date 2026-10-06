@@ -902,8 +902,8 @@ impl Parser<'_> {
 impl crate::constexpr::ConstEnv for Parser<'_> {
     /// Every constant expression the parser folds is one C requires, so it
     /// always answers.
-    fn deferred_constant_p(&self, _scope: ConstScope) -> Option<i128> {
-        Some(0)
+    fn deferred_builtin(&self, settled: i128, _scope: ConstScope) -> Option<i128> {
+        Some(settled)
     }
 
     fn types(&self) -> &TypeTable {

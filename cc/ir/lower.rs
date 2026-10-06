@@ -282,28 +282,31 @@ pub fn lower_module(module: &mut Module) {
 /// Lower a single function.
 ///
 /// Runs:
-/// 1. `__builtin_constant_p` placeholders resolved to 0
+/// 1. `__builtin_constant_p` and `__builtin_object_size` placeholders
+///    answered as nothing more is known
 /// 2. Critical-edge splitting, which phi elimination depends on -- see
 ///    `ir::cfg` for why, and for why nothing may merge blocks after it
 /// 3. Phi elimination
 pub fn lower_function(func: &mut Function) {
-    resolve_constant_p(func);
+    resolve_placeholders(func);
     func.split_critical_edges();
     eliminate_phi_nodes(func);
 }
 
-/// Answer every `ConstantP` this far down the pipeline with 0.
+/// Answer every `ConstantP` and `ObjectSize` this far down the pipeline as
+/// nothing more is known: 0, and the unknown object's size.
 ///
-/// `sccp` resolves the ones it can prove, and answers 0 itself for an
-/// operand it proves *not* constant. What reaches here is everything it
-/// never looked at -- which is every one of them at `-O0`, where
-/// `opt::optimize_module` returns before the per-function passes run.
+/// `sccp` and `objsize` resolve the ones they can prove, and `objsize`
+/// answers the rest itself once the optimizer has converged. What reaches
+/// here is everything they never looked at -- which is every `ConstantP`
+/// at `-O0`, where `opt::optimize_module` returns before the per-function
+/// passes run.
 ///
 /// This runs unconditionally, and it has to: both backends end their opcode
 /// match in a catch-all that emits nothing, so a survivor would leave its
 /// target undefined rather than fail.
-fn resolve_constant_p(func: &mut Function) {
-    let sites: Vec<(usize, usize)> = func
+fn resolve_placeholders(func: &mut Function) {
+    let sites: Vec<(usize, usize, i128)> = func
         .blocks
         .iter()
         .enumerate()
@@ -311,18 +314,24 @@ fn resolve_constant_p(func: &mut Function) {
             bb.insns
                 .iter()
                 .enumerate()
-                .filter(|(_, insn)| insn.op == Opcode::ConstantP)
-                .map(move |(i, _)| (b, i))
+                .filter_map(move |(i, insn)| settled_answer(insn.op).map(|v| (b, i, v)))
         })
         .collect();
-    if sites.is_empty() {
-        return;
-    }
-    let zero = func.create_const_pseudo(0);
-    for (b, i) in sites {
+    for (b, i, v) in sites {
+        let c = func.create_const_pseudo(v);
         let insn = &mut func.blocks[b].insns[i];
         insn.op = Opcode::Copy;
-        insn.src = vec![zero];
+        insn.src = vec![c];
+    }
+}
+
+/// What a placeholder `op` answers when nothing more is known about its
+/// operand; `None` for any other opcode.
+fn settled_answer(op: Opcode) -> Option<i128> {
+    match op {
+        Opcode::ConstantP => Some(0),
+        Opcode::ObjectSize(otype) => Some(super::objsize::size_constant(otype.unknown())),
+        _ => None,
     }
 }
 
@@ -894,6 +903,42 @@ mod tests {
         let insn = &func.blocks[0].insns[1];
         assert_eq!(insn.op, Opcode::Copy);
         assert_eq!(func.const_val(insn.src[0]), Some(0));
+        assert!(validate_function_at(&func, Stage::Lowered).is_ok());
+    }
+
+    /// A leftover `__builtin_object_size` is answered as an unknown object
+    /// is: `(size_t)-1` for a maximum, 0 for a minimum.
+    #[test]
+    fn lowering_answers_a_leftover_object_size_as_unknown() {
+        use crate::parse::ast::ObjectSizeType;
+        let types = TypeTable::new(&Target::host());
+        let ulong = types.ulong_id;
+        let mut func = Function::new("t", ulong);
+        func.add_pseudo(Pseudo::arg(PseudoId(0), 0));
+        func.add_pseudo(Pseudo::reg(PseudoId(1), 1));
+        func.add_pseudo(Pseudo::reg(PseudoId(2), 2));
+        func.next_pseudo = 8;
+        let mut b0 = BasicBlock::new(BasicBlockId(0));
+        b0.add_insn(Instruction::new(Opcode::Entry));
+        for (t, bits) in [(1, 0), (2, 2)] {
+            b0.add_insn(
+                Instruction::new(Opcode::ObjectSize(ObjectSizeType::from_bits(bits)))
+                    .with_target(PseudoId(t))
+                    .with_src(PseudoId(0))
+                    .with_type_and_size(ulong, 64),
+            );
+        }
+        b0.add_insn(Instruction::ret(Some(PseudoId(1))));
+        func.add_block(b0);
+        func.entry = BasicBlockId(0);
+
+        assert!(validate_function_at(&func, Stage::Lowered).is_err());
+        lower_function(&mut func);
+        for (at, want) in [(1, -1), (2, 0)] {
+            let insn = &func.blocks[0].insns[at];
+            assert_eq!(insn.op, Opcode::Copy);
+            assert_eq!(func.const_val(insn.src[0]), Some(want));
+        }
         assert!(validate_function_at(&func, Stage::Lowered).is_ok());
     }
 

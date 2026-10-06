@@ -989,12 +989,15 @@ impl Parser<'_> {
     /// An integer constant expression may cast only arithmetic types to
     /// integer types (C17 6.6p6), so `(int)(char *)0` folds to zero but is no
     /// integer constant expression, and so no null pointer constant. The
-    /// operand of `sizeof`, `_Alignof` and `__builtin_constant_p` is not
-    /// evaluated, and may be anything.
+    /// operand of `sizeof`, `_Alignof`, `__builtin_constant_p` and
+    /// `__builtin_object_size` is not evaluated, and may be anything.
     fn evaluates_a_pointer(&self, expr: &Expr) -> bool {
         if matches!(
             expr.kind,
-            ExprKind::SizeofExpr(_) | ExprKind::AlignofExpr(_) | ExprKind::ConstantP(_)
+            ExprKind::SizeofExpr(_)
+                | ExprKind::AlignofExpr(_)
+                | ExprKind::ConstantP(_)
+                | ExprKind::ObjectSize { .. }
         ) {
             return false;
         }

@@ -3793,8 +3793,8 @@ impl crate::constexpr::ConstEnv for Linearizer<'_> {
     /// A static initializer needs an answer; the linearizer's other folds --
     /// a constant `?:` condition, chiefly -- are optimizations, and one of
     /// those is exactly the shape `__builtin_constant_p` is written in.
-    fn deferred_constant_p(&self, scope: ConstScope) -> Option<i128> {
-        matches!(scope, ConstScope::StaticInitializer).then_some(0)
+    fn deferred_builtin(&self, settled: i128, scope: ConstScope) -> Option<i128> {
+        matches!(scope, ConstScope::StaticInitializer).then_some(settled)
     }
 
     fn types(&self) -> &TypeTable {

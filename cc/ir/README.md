@@ -334,6 +334,7 @@ Use `returns_via_sret()` and `returns_two_regs()` to query return strategy.
 | Opcode | Description |
 |--------|-------------|
 | `constant_p` | `__builtin_constant_p`, held back until propagation has run (made only when optimizing; the parser answers at `-O0`): `sccp` answers 1 when it proves the operand constant, and 0 otherwise once inlining is done -- the round before inlining leaves the 0s, since inlining a constant argument answers 1 -- and `lower` answers 0 for every one left |
+| `object_size` | `__builtin_object_size(src[0], type)`, the type in the opcode, held back until inlining and propagation have shown the object (made only when optimizing; the parser answers at `-O0`): `objsize` answers it once the object is known, and as an unknown object once the optimizer has converged; `lower` answers any left as unknown |
 
 ### Bit Manipulation Builtins
 
@@ -546,9 +547,11 @@ The optimizer, from `-O1` up, runs:
   on every function, so the inliner sizes a callee by the code it will emit;
 - `inline`, then `memexpand`;
 - the passes in `opt::PASSES` to a fixed point: `constglobal`, `memexpand`,
-  `loadfwd`, `vrp`, `ifconv`, `sccp`, `instcombine`, `libcall_fold`,
-  `copyprop`, `dse`, `dce`, `simplify_cfg`. This runs for at most
-  `MAX_ITERATIONS` rounds;
+  `loadfwd`, `vrp`, `ifconv`, `objsize`, `sccp`, `instcombine`,
+  `libcall_fold`, `copyprop`, `dse`, `dce`, `simplify_cfg`. This runs for at
+  most `MAX_ITERATIONS` rounds; if `objsize` then has an `object_size` left
+  whose object is unknown, it answers it as unknown and the passes run to a
+  fixed point again;
 - then `mem2reg`.
 
 The order inside the loop matters, and `PASSES` gives the reason for each
@@ -573,7 +576,7 @@ after that, because merging would undo the splitting the copies depend on. See
 | `mem2reg.rs` | Despite the name, it promotes nothing: it deletes the locals no instruction names any more, with their lifetime markers, so they get no stack slot. Runs after `ssa` and again after the optimizer |
 | `mach_o_dtors.rs` | Mach-O does not run a `destructor` listed in `__mod_term_func` for an executable, so each one is registered with `atexit` from a synthesized constructor |
 | `tls.rs` | Expands `tlsaddr` into its call for the call-based TLS models (ELF TLS descriptors, every Darwin access), so the register allocator sees the clobbers |
-| `lower.rs` | Out of SSA. It answers each remaining `constant_p` with 0, splits critical edges, then eliminates φs into copies, which it sequentializes as a parallel copy |
+| `lower.rs` | Out of SSA. It answers each remaining `constant_p` with 0 and `object_size` as unknown, splits critical edges, then eliminates φs into copies, which it sequentializes as a parallel copy |
 
 ### Optimization passes
 
@@ -587,7 +590,8 @@ after that, because merging would undo the splitting the copies depend on. See
 | `ifconv.rs` | Turns a short-circuit `&&`/`\|\|` diamond into a `sel` when the arm is safe to speculate (no memory access, call or trap). This puts the two comparisons in one block, where `instcombine` can relate them |
 | `sccp.rs` | Sparse conditional constant propagation (Wegman–Zadeck) on the `dataflow` solver. It folds constant branches, removing the dead edge; `dce` then deletes the unreachable blocks |
 | `instcombine.rs` | Per-instruction rewriting of pure operations: constant folding through `constfold`, algebraic identities (`x - x`, `x ^ x`, ...), and pairs of comparisons over the same operands. It never moves or reorders instructions |
-| `libcall_fold/` | Folds calls the parser tagged as known library functions (`Instruction::known`). Results the arguments decide become constants: `strlen("abc")` is 3, and `strcmp(p, "")` is the first byte of `p`. An output call whose result is unused becomes a cheaper one that writes the same bytes: `printf("hi\n")` becomes `puts("hi")`. A `memmove` whose blocks cannot overlap becomes a `memcpy`. A dispatcher, with one module per family of functions |
+| `libcall_fold/` | Folds calls the parser tagged as known library functions (`Instruction::known`). Results the arguments decide become constants: `strlen("abc")` is 3, and `strcmp(p, "")` is the first byte of `p`. An output call whose result is unused becomes a cheaper one that writes the same bytes: `printf("hi\n")` becomes `puts("hi")`. A `memmove` whose blocks cannot overlap becomes a `memcpy`. A `_chk` call whose write is known to fit, or whose object is unknown, becomes the plain function (`fortify.rs`). A dispatcher, with one module per family of functions |
+| `objsize.rs` | Answers `object_size` after inlining: walks the pointer back through copies, constant displacements, `sel` and φs to the objects it may point into, and takes the largest (or, for a minimum, the smallest) remaining size. A pointer stepped round a loop adds nothing where the step cannot raise the answer |
 | `copyprop.rs` | Each use of a no-op `copy` (same width, same register class) reads the copy's source instead; `dce` collects the copies |
 | `dse.rs` | Dead-store elimination, for two cases: a store whose every byte is overwritten before any is read (a forward walk within a block), and a store to a non-escaping local that nothing reads before the function returns (a backward walk over the CFG) |
 | `dce.rs` | Mark-sweep from the roots, which are any opcode with `has_side_effects()` plus any volatile access. It also folds a branch into a block that does nothing but `unreachable`, and removes unreachable blocks |

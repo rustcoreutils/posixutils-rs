@@ -26,6 +26,7 @@ use crate::ir::loadfwd;
 use crate::ir::mem2reg::mem2reg;
 use crate::ir::memexpand;
 use crate::ir::memloc;
+use crate::ir::objsize::{self, ObjectSizes, Settle};
 use crate::ir::sccp;
 use crate::ir::vrp;
 use crate::ir::{Function, Module, Opcode};
@@ -156,6 +157,8 @@ struct PassCtx<'a> {
     known: &'a constglobal::KnownGlobals,
     mi: &'a memloc::ModuleInfo,
     fold: &'a libcall_fold::FoldCtx<'a>,
+    /// The sizes of the module's named objects, for `objsize`.
+    sizes: &'a ObjectSizes,
 }
 
 /// One per-function pass: its name, and a run that answers whether it
@@ -164,7 +167,7 @@ type Pass = (&'static str, fn(&mut Function, &PassCtx) -> bool);
 
 /// The fixed-point loop's passes, in order. The order is load-bearing: each
 /// pass hands the next one a shape it could not have seen for itself.
-const PASSES: [Pass; 12] = [
+const PASSES: [Pass; 13] = [
     // `constglobal` before anything looks at a value: a load of a `const`
     // global becomes its initializer, which every pass below treats as the
     // constant it is.
@@ -193,6 +196,14 @@ const PASSES: [Pass; 12] = [
     // block, which is what makes the two relationals inside it comparable
     // at all.
     ("ifconv", |f, c| ifconv::run(f, c.types)),
+    // `objsize` answers each `__builtin_object_size` whose object the
+    // passes above have uncovered -- a load forwarded, a choice collapsed --
+    // so that `sccp` sees its answer as the constant it is, and
+    // `libcall_fold` sees the size a `_chk` call checks against. One whose
+    // object is still unknown waits for the end: see `optimize_function`.
+    ("objsize", |f, c| {
+        objsize::run(f, c.types, c.sizes, Settle::Known)
+    }),
     // `sccp` proves branches dead, which `instcombine` cannot, and leaves
     // behind `Copy` from a constant -- exactly the shape `instcombine`'s
     // `ConstMap` follows.
@@ -583,6 +594,7 @@ fn optimize_functions(
     // graph and the set of globals are final.
     let known = constglobal::KnownGlobals::collect(module, types);
     let mi = memloc::ModuleInfo::build(module, types);
+    let sizes = ObjectSizes::build(module, types);
     let (functions, strings, callees) = module.split_for_rewrite();
     let literals = libcall_fold::NewLiterals::new(strings);
     let fold = libcall_fold::FoldCtx {
@@ -598,6 +610,7 @@ fn optimize_functions(
         known: &known,
         mi: &mi,
         fold: &fold,
+        sizes: &sizes,
     };
     let mut report = OptReport::default();
     for func in functions {
@@ -613,6 +626,12 @@ fn optimize_functions(
 
 /// Optimize a single function by running `PASSES` until none changes it, or
 /// for `max_iterations` rounds.
+///
+/// A `__builtin_object_size` whose object is still unknown when nothing
+/// changes any more is unknown for good, and is answered so -- `(size_t)-1`
+/// or 0 -- after which the passes run to a fixed point again: the answer is
+/// what lets `libcall_fold` turn a `_chk` call of an unknown size into the
+/// plain call, which may fold in turn.
 fn optimize_function(func: &mut Function, ctx: &PassCtx, max_iterations: usize) -> Convergence {
     let mut c = Convergence {
         function: func.name.clone(),
@@ -620,6 +639,16 @@ fn optimize_function(func: &mut Function, ctx: &PassCtx, max_iterations: usize) 
         changes: [0; PASSES.len()],
         still_changing: Vec::new(),
     };
+    run_passes(func, ctx, max_iterations, &mut c);
+    if objsize::run(func, ctx.types, ctx.sizes, Settle::Everything) {
+        run_passes(func, ctx, max_iterations, &mut c);
+    }
+    c
+}
+
+/// Run `PASSES` over `func` until none changes it, or for `max_iterations`
+/// rounds, recording how it went in `c`.
+fn run_passes(func: &mut Function, ctx: &PassCtx, max_iterations: usize, c: &mut Convergence) {
     for _ in 0..max_iterations {
         c.iterations += 1;
         c.still_changing.clear();
@@ -637,7 +666,6 @@ fn optimize_function(func: &mut Function, ctx: &PassCtx, max_iterations: usize) 
             break;
         }
     }
-    c
 }
 
 #[cfg(test)]

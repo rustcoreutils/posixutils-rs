@@ -1002,6 +1002,84 @@ fn test_stack_save_and_restore_are_their_opcodes() {
     }
 }
 
+// __builtin_object_size
+
+/// What became of `f`'s `__builtin_object_size`, compiled optimizing or not:
+/// `Err(type)` deferred as an `ObjectSize` placeholder of that type, or
+/// `Ok(constants)` answered while parsing, the answer among the constants
+/// `f` uses.
+fn object_size(
+    src: &str,
+    optimizing: bool,
+) -> Result<Vec<i128>, crate::parse::ast::ObjectSizeType> {
+    let policy = crate::parse::LibraryCallPolicy {
+        optimizing,
+        math_errno: true,
+    };
+    let (module, _) = linearize_source_under(src, &Target::new(Arch::X86_64, Os::Linux), policy);
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let insns = insns_of(&module, "f");
+    if let Some(insn) = insns.iter().find(|i| matches!(i.op, Opcode::ObjectSize(_))) {
+        let Opcode::ObjectSize(otype) = insn.op else {
+            unreachable!()
+        };
+        return Err(otype);
+    }
+    Ok(insns
+        .iter()
+        .flat_map(|i| &i.src)
+        .filter_map(|&s| f.const_val(s))
+        .collect())
+}
+
+/// A pointer whose object only propagation finds is deferred when
+/// optimizing, with its type, and answered as an unknown object at `-O0`,
+/// as gcc does: `(size_t)-1` for a maximum, 0 for a minimum.
+#[test]
+fn test_object_size_of_a_pointer_variable_is_deferred_when_optimizing() {
+    use crate::parse::ast::ObjectSizeType;
+    for (otype, unknown) in [(0, -1), (1, -1), (2, 0), (3, 0)] {
+        let src = format!(
+            "char buf[32];\n\
+             unsigned long f(void) {{ char *p = buf + 4; return __builtin_object_size(p, {otype}); }}\n"
+        );
+        assert_eq!(
+            object_size(&src, true),
+            Err(ObjectSizeType::from_bits(otype))
+        );
+        let answered = object_size(&src, false).expect("answered at -O0");
+        assert!(answered.contains(&unknown), "type {otype}: {answered:?}");
+    }
+}
+
+/// What the expression itself names is answered while parsing, at every
+/// level; only the rest waits.
+#[test]
+fn test_object_size_of_a_named_object_is_answered_at_once() {
+    let src = "char buf[32];\n\
+               unsigned long f(void) { return __builtin_object_size(buf + 4, 0); }\n";
+    for optimizing in [false, true] {
+        let answered = object_size(src, optimizing).expect("answered while parsing");
+        assert!(answered.contains(&28), "{answered:?}");
+    }
+}
+
+/// The builtin does not evaluate its argument: one with a side effect, or
+/// a `volatile` read, is an unknown object at once, as in gcc.
+#[test]
+fn test_object_size_of_a_side_effect_is_unknown_at_once() {
+    for body in [
+        "char *p = buf; return __builtin_object_size(p++, 0);",
+        "char *p; return __builtin_object_size(p = buf, 0);",
+        "return __builtin_object_size(g(), 0);",
+        "char *volatile p = buf; return __builtin_object_size(p, 0);",
+    ] {
+        let src = format!("char buf[32];\nchar *g(void);\nunsigned long f(void) {{ {body} }}\n");
+        let answered = object_size(&src, true).expect("answered at once");
+        assert!(answered.contains(&-1), "{body}: {answered:?}");
+    }
+}
+
 // __builtin_constant_p
 
 /// Whether `f`'s `__builtin_constant_p` was deferred to the optimizer as a

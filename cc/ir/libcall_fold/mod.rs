@@ -25,13 +25,16 @@
 // `printf` and its kin, whose result must be unused, and which become calls
 // that print the same bytes; `complex` has libgcc's `__mul?c3` and
 // `__div?c3`, which a floating complex `*` and `/` call, and whose result is
-// written where the call would have written it. `memory` is the one family
+// written where the call would have written it; `fortify` has the `_chk`
+// functions `_FORTIFY_SOURCE` calls, which are the plain functions wherever
+// the write is known to fit. `memory` is the one family
 // that rewrites an IR operation rather than a call: a `Memmove` whose source
 // and destination cannot overlap becomes a `Memcpy`, in place.
 //
 
 mod complex;
 mod copies;
+mod fortify;
 mod memory;
 mod stdio;
 mod strings;
@@ -99,6 +102,9 @@ pub(crate) enum Folded {
     Discard(Option<NewCall>),
     /// A complex result, written where the call returns it.
     Complex(FloatVal, FloatVal),
+    /// The plain function in place of a `_chk` one, the write being known
+    /// to need no check.
+    Unchecked(&'static fortify::Fortified),
 }
 
 /// A call's result, computed at the call's type from its operands.
@@ -142,6 +148,8 @@ pub(crate) enum Callee {
     Known(LibFn),
     /// The function a block memory operation calls.
     Block(BlockOp),
+    /// One the optimizer knows nothing more about, by its C name.
+    Named(&'static str),
 }
 
 impl Callee {
@@ -150,6 +158,7 @@ impl Callee {
         match self {
             Callee::Known(f) => f.c_name().expect("a fold calls only a function C names"),
             Callee::Block(op) => op.c_name(),
+            Callee::Named(name) => name,
         }
     }
 }
@@ -294,6 +303,7 @@ fn fold(known: LibFn, insn: &Instruction, facts: &CallSite) -> Option<Folded> {
         LibFamily::StringWrite => copies::fold(known, insn, facts),
         LibFamily::Output => stdio::fold(known, insn, facts),
         LibFamily::ComplexArith => complex::fold(known, insn, facts),
+        LibFamily::Fortified => fortify::fold(known, insn, facts),
     }
 }
 
@@ -310,6 +320,7 @@ fn calls_made(folded: &Folded) -> Vec<Callee> {
     match folded {
         Folded::Call(call) | Folded::Discard(Some(call)) => vec![Callee::Known(call.func)],
         Folded::Write(write) => write.calls().to_vec(),
+        Folded::Unchecked(row) => vec![row.callee()],
         Folded::Value(_) | Folded::Discard(None) | Folded::Complex(..) => Vec::new(),
     }
 }
@@ -399,6 +410,7 @@ fn materialize(b: &mut Builder, ctx: &FoldCtx, call: &Instruction, folded: Folde
             }
         }
         Folded::Complex(re, im) => complex::materialize(b, call, (re, im)),
+        Folded::Unchecked(row) => fortify::materialize(b, ctx, call, row),
     }
 }
 
@@ -694,9 +706,15 @@ pub(super) mod tests {
         ]
         .map(Callee::Known);
         let block = [BlockOp::Copy, BlockOp::Set].map(Callee::Block);
-        let mut names: Vec<_> = known.iter().chain(&block).map(|c| c.c_name()).collect();
+        let mut names: Vec<_> = known
+            .iter()
+            .chain(&block)
+            .chain(&fortify::callees())
+            .map(|c| c.c_name())
+            .collect();
         let mut listed = crate::ir::FOLD_CALLEES.to_vec();
         names.sort_unstable();
+        names.dedup();
         listed.sort_unstable();
         assert_eq!(names, listed);
     }

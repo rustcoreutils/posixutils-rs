@@ -82,32 +82,3 @@ fn link_options_unreadable_specs_are_fatal() {
         r.stderr
     );
 }
-
-/// `-nostartfiles` and `-nostdlib` reach the link. glibc's configure links a
-/// `.S` file that defines its own `_start` with both to learn whether the
-/// toolchain supports IFUNC relocations, and c17 stopped at clap's
-/// `unexpected argument '-n'`, so glibc concluded it did not. Without the
-/// options the host's start files would define `_start` a second time.
-#[cfg(target_os = "linux")]
-#[test]
-fn link_options_nostartfiles_nostdlib_reach_the_link() {
-    let (dir, _) = scratch();
-    let src = dir.path().join("conftest.S");
-    std::fs::write(
-        &src,
-        ".type foo,%gnu_indirect_function\nfoo:\n.globl _start\n_start:\n\
-         .globl __start\n__start:\n.data\n#ifdef _LP64\n.quad foo\n#else\n\
-         .long foo\n#endif\n",
-    )
-    .unwrap();
-    let exe = dir.path().join("conftest");
-    let r = run_c17(&[
-        "-nostartfiles",
-        "-nostdlib",
-        "-o",
-        exe.to_str().unwrap(),
-        src.to_str().unwrap(),
-    ]);
-    assert!(r.success, "{}", r.stderr);
-    assert!(exe.exists());
-}

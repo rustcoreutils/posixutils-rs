@@ -101,6 +101,24 @@ pub fn run_pax_in_dir(args: &[&str], dir: &Path) -> Output {
         .expect("Failed to run pax")
 }
 
+/// Run pax in `dir` in a session of its own, with no controlling terminal --
+/// as under cron or CI -- so that opening `/dev/tty` fails.
+pub fn run_pax_without_tty(args: &[&str], dir: &Path) -> Output {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pax"));
+    cmd.args(args).current_dir(dir).stdin(Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.output().expect("Failed to run pax")
+}
+
 /// Run pax with stdin input in a specific directory
 pub fn run_pax_in_dir_with_stdin(args: &[&str], dir: &Path, stdin_data: &str) -> Output {
     use std::process::Stdio;

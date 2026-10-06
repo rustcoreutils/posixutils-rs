@@ -702,10 +702,11 @@ fn test_tar_append_to_pax_archive() {
     );
 }
 
-/// Giving `-T` means members are selected by the list, so an empty list
-/// selects none of them, as with GNU tar and bsdtar; it used to select all.
+/// An empty `-T` list adds no names, so with no operands either there are no
+/// patterns at all, and every member is selected -- as bsdtar and GNU tar do.
+/// The archive is still read: a missing one is an error.
 #[test]
-fn test_tar_empty_files_from_selects_nothing_on_extract_and_list() {
+fn test_tar_empty_files_from_selects_every_member_on_extract_and_list() {
     let temp = TempDir::new().unwrap();
     let src = setup(temp.path());
     assert_success(&run_tar(&["-cf", "../t.tar", "a.txt"], &src), "tar -c");
@@ -715,15 +716,43 @@ fn test_tar_empty_files_from_selects_nothing_on_extract_and_list() {
 
     let out = run_tar(&["-tf", "../t.tar", "-T", "empty.list"], &dst);
     assert_success(&out, "tar -t -T empty");
-    assert_eq!(stdout_str(&out), "");
+    assert_eq!(stdout_str(&out), "a.txt\n");
 
     let out = run_tar(&["-xf", "../t.tar", "-T", "empty.list"], &dst);
     assert_success(&out, "tar -x -T empty");
-    assert!(!dst.join("a.txt").exists(), "a member was extracted");
+    assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "alpha\n");
 
     // Operands still select alongside the empty list.
-    let out = run_tar(&["-tf", "../t.tar", "-T", "empty.list", "a.txt"], &dst);
+    fs::write(src.join("z.txt"), "zed\n").unwrap();
+    assert_success(
+        &run_tar(&["-cf", "../t2.tar", "a.txt", "z.txt"], &src),
+        "tar -c",
+    );
+    let out = run_tar(&["-tf", "../t2.tar", "-T", "empty.list", "a.txt"], &dst);
     assert_success(&out, "tar -t -T empty a.txt");
+    assert_eq!(stdout_str(&out), "a.txt\n");
+
+    for mode in ["-tf", "-xf"] {
+        let out = run_tar(&[mode, "../missing.tar", "-T", "empty.list"], &dst);
+        assert_failure(&out, &format!("tar {mode} missing.tar -T empty"));
+    }
+}
+
+/// GNU tar skips a socket with a warning, "socket ignored", and exits 0 --
+/// bsdtar likewise. pax itself diagnoses one as POSIX requires.
+#[test]
+fn test_tar_create_skips_socket_with_a_warning() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+    let _sock = std::os::unix::net::UnixListener::bind(src.join("s")).unwrap();
+    let out = run_tar(&["-cf", "../t.tar", "s", "a.txt"], &src);
+    assert_success(&out, "tar -c with a socket");
+    assert!(
+        stderr_str(&out).contains("s: socket ignored"),
+        "{}",
+        stderr_str(&out)
+    );
+    let out = run_tar(&["-tf", "../t.tar"], &src);
     assert_eq!(stdout_str(&out), "a.txt\n");
 }
 

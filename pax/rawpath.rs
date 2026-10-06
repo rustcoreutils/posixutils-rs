@@ -55,6 +55,23 @@ pub fn trim_trailing_slashes(path: &Path) -> &Path {
     Path::new(std::ffi::OsStr::from_bytes(&bytes[..end]))
 }
 
+/// Whether two pathnames are spellings of one name: they differ only in empty
+/// and `.` components, so `./h/a`, `h//a` and `h/a/` all name `h/a`. A leading
+/// `/` is significant. `..` is not resolved, since where it leads depends on
+/// what the components before it are.
+pub fn same_name(a: &Path, b: &Path) -> bool {
+    fn parts(path: &Path) -> (bool, impl Iterator<Item = &[u8]>) {
+        let bytes = as_bytes(path);
+        let parts = bytes
+            .split(|&b| b == b'/')
+            .filter(|part| !part.is_empty() && *part != b".");
+        (bytes.starts_with(b"/"), parts)
+    }
+    let (a_root, a_parts) = parts(a);
+    let (b_root, b_parts) = parts(b);
+    a_root == b_root && a_parts.eq(b_parts)
+}
+
 /// Join a ustar `prefix` field to its `name` field.
 ///
 /// An empty prefix means the name stands alone; the separator is not part of
@@ -116,6 +133,18 @@ pub fn unit_len(bytes: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_name_ignores_empty_and_dot_components() {
+        let same = |a: &str, b: &str| same_name(Path::new(a), Path::new(b));
+        assert!(same("h/a", "./h/a"));
+        assert!(same("h/a", ".//h/./a/"));
+        assert!(same("/h/a", "//h/a"));
+        assert!(!same("/h/a", "h/a"));
+        assert!(!same("h/a", "h/b"));
+        assert!(!same("h/a", "h/a/b"));
+        assert!(!same("d/../h/a", "h/a"));
+    }
 
     #[test]
     fn test_trim_trailing_slashes_keeps_bytes() {

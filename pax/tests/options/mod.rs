@@ -2841,3 +2841,46 @@ fn test_interactive_reply_may_be_non_utf8() {
     let out = run_pax_in_dir(&["-f", "o.tar"], temp.path());
     assert_eq!(out.stdout, b"n\xff\n");
 }
+
+/// With no terminal for `-i` to prompt on -- cron, CI -- the run fails before
+/// the archive is touched. The archive file was created first, so an existing
+/// one was truncated to nothing and only then did opening /dev/tty fail.
+/// `-M` lost its first volume the same way, and `-a` must not change the
+/// archive either.
+#[test]
+fn test_interactive_without_tty_keeps_existing_archive() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f"), "F\n").unwrap();
+    // A real archive, so that -a gets as far as wanting the terminal.
+    let out = run_pax_in_dir(&["-w", "-f", "keep.tar", "f"], temp.path());
+    assert_success(&out, "pax -w");
+    let before = fs::read(temp.path().join("keep.tar")).unwrap();
+    let runs: [&[&str]; 3] = [
+        &["-w", "-i", "-f", "keep.tar", "f"],
+        &[
+            "-w",
+            "-i",
+            "-M",
+            "--tape-length",
+            "10240",
+            "-f",
+            "keep.tar",
+            "f",
+        ],
+        &["-w", "-a", "-i", "-f", "keep.tar", "f"],
+    ];
+    for args in runs {
+        fs::write(temp.path().join("keep.tar"), &before).unwrap();
+        let out = run_pax_without_tty(args, temp.path());
+        assert_failure(&out, &format!("pax {args:?} with no terminal"));
+        assert!(
+            stderr_str(&out).contains("/dev/tty"),
+            "{args:?}: {}",
+            stderr_str(&out)
+        );
+        assert!(
+            fs::read(temp.path().join("keep.tar")).unwrap() == before,
+            "pax {args:?} changed the archive"
+        );
+    }
+}

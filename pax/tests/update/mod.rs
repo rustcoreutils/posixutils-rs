@@ -410,3 +410,39 @@ fn test_update_append_distinguishes_non_utf8_names() {
     let out = run_pax_in_dir(&["-f", "a.tar"], temp.path());
     assert_eq!(out.stdout, b"n\xff\nn\xfe\n");
 }
+
+/// `-w -a -u` compares against a member's `mtime` record to the nanosecond:
+/// a file modified again within the same second is newer. A member with no
+/// sub-second time -- a ustar header -- holds the file's time truncated, so
+/// against that the file's seconds are compared, and an unchanged file whose
+/// time has a fraction is not appended again.
+#[test]
+fn test_update_append_compares_subsecond_times() {
+    let temp = TempDir::new().unwrap();
+    let at = |nsec| filetime::FileTime::from_unix_time(1_600_000_000, nsec);
+    let f = temp.path().join("f");
+    let count = |archive: &str| {
+        let out = run_pax_in_dir(&["-f", archive], temp.path());
+        assert_success(&out, "pax list");
+        stdout_str(&out).lines().count()
+    };
+
+    for (format, archive) in [("pax", "a.pax"), ("ustar", "a.tar")] {
+        fs::write(&f, "first\n").unwrap();
+        filetime::set_file_mtime(&f, at(300_000_000)).unwrap();
+        let out = run_pax_in_dir(&["-w", "-x", format, "-f", archive, "f"], temp.path());
+        assert_success(&out, "pax -w");
+
+        // Unchanged: nothing to add, in either format.
+        let out = run_pax_in_dir(&["-w", "-a", "-u", "-f", archive, "f"], temp.path());
+        assert_success(&out, "pax -w -a -u, unchanged");
+        assert_eq!(count(archive), 1, "{format}: unchanged file appended");
+    }
+
+    // Changed within the same second: only the pax record can tell.
+    fs::write(&f, "second\n").unwrap();
+    filetime::set_file_mtime(&f, at(700_000_000)).unwrap();
+    let out = run_pax_in_dir(&["-w", "-a", "-u", "-f", "a.pax", "f"], temp.path());
+    assert_success(&out, "pax -w -a -u, changed");
+    assert_eq!(count("a.pax"), 2, "newer file not appended");
+}

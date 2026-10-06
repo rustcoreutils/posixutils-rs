@@ -26,7 +26,7 @@ use crate::blocked_io::BlockedWriter;
 use crate::error::{PaxError, PaxResult};
 use crate::formats::ustar::{is_zero_block, BLOCK_SIZE};
 use crate::formats::PaxReader;
-use crate::modes::write::WriteOptions;
+use crate::modes::write::{MemberTime, WriteOptions};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -84,7 +84,7 @@ pub fn append_to_archive(
     // an operand is usually a directory, and what has to be compared is each
     // member name it expands to, after -s has had its say.
     options.update_times = scan.mtimes;
-    options.archive_id = Some(crate::modes::write::file_id(&file.metadata()?));
+    options.archive_files.add(&file.metadata()?);
 
     // Read before they are written over: the global headers that follow a
     // dangling `x` header go back in at the new end, ahead of the new members.
@@ -133,7 +133,7 @@ struct TarScan {
     trailing_globals: Vec<Range<u64>>,
     /// The latest modification time recorded for each member name, when -u
     /// asked for them.
-    mtimes: Option<HashMap<PathBuf, i64>>,
+    mtimes: Option<HashMap<PathBuf, MemberTime>>,
 }
 
 /// Walk a tar-family archive member by member with the reader `pax -r` uses.
@@ -156,7 +156,7 @@ fn scan_tar_archive(file: &mut File, want_mtimes: bool) -> PaxResult<TarScan> {
 fn walk_tar_archive(file: &mut File, want_mtimes: bool) -> PaxResult<TarScan> {
     file.seek(SeekFrom::Start(0))?;
     let mut archive = PaxReader::seekable(&mut *file).stepping_over_lone_zero_blocks();
-    let mut mtimes: Option<HashMap<PathBuf, i64>> = want_mtimes.then(HashMap::new);
+    let mut mtimes: Option<HashMap<PathBuf, MemberTime>> = want_mtimes.then(HashMap::new);
 
     // A name can appear more than once -- that is what appending does -- and
     // the most recent copy is the one an extraction would produce, so it is
@@ -165,11 +165,13 @@ fn walk_tar_archive(file: &mut File, want_mtimes: bool) -> PaxResult<TarScan> {
         if let Some(mtimes) = mtimes.as_mut() {
             // Keyed by the name's bytes: a lossy rendering made distinct
             // names that are not UTF-8 one name.
+            // To the nanosecond when a pax `mtime` record gives one.
             let key = crate::rawpath::trim_trailing_slashes(&entry.path).to_path_buf();
+            let mtime = (entry.mtime, entry.mtime_nsec);
             mtimes
                 .entry(key)
-                .and_modify(|t| *t = std::cmp::max(*t, entry.mtime))
-                .or_insert(entry.mtime);
+                .and_modify(|t| *t = std::cmp::max(*t, mtime))
+                .or_insert(mtime);
         }
     }
 

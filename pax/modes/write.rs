@@ -17,13 +17,14 @@ use crate::options::FormatOptions;
 use crate::pattern::{matches_excluded, Pattern};
 use crate::subst::{substitute_name, Substitution};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, Read, Seek, Write};
 use std::os::fd::AsFd;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// Options for write/create mode
 #[derive(Default)]
@@ -38,8 +39,12 @@ pub struct WriteOptions {
     pub verbose: bool,
     /// Stay on one filesystem
     pub one_file_system: bool,
-    /// Interactive rename mode
-    pub interactive: bool,
+    /// The terminal `-i` prompts on. Opened by the caller before the archive
+    /// file is created or touched: where there is no terminal, the run fails
+    /// with the archive as it was, rather than after truncating it.
+    pub prompter: Option<InteractivePrompter>,
+    /// tar: skip a socket the format cannot hold with a warning, not an error
+    pub ignore_sockets: bool,
     /// Reset access time after reading files
     pub reset_atime: bool,
     /// Path substitutions (-s option)
@@ -56,18 +61,44 @@ pub struct WriteOptions {
     /// The key is the *member* name -- what the file is stored as, after `-s`
     /// and any rename -- because that is what a later extraction resolves, and
     /// it is not the pathname the file was named by on the command line.
-    pub update_times: Option<HashMap<PathBuf, i64>>,
-    /// `(st_dev, st_ino)` of the archive being written, when it is a regular
-    /// file. A name list read as the walk goes can name it once it exists --
-    /// `find . | pax -w -f out.tar` -- and it is left out rather than copied
-    /// into itself.
-    pub archive_id: Option<(u64, u64)>,
+    pub update_times: Option<HashMap<PathBuf, MemberTime>>,
+    /// The files the archive is being written to, which are left out rather
+    /// than copied into themselves.
+    pub archive_files: ArchiveFiles,
 }
 
 /// `(st_dev, st_ino)`, which identifies a file however it is named.
 pub fn file_id(metadata: &std::fs::Metadata) -> (u64, u64) {
     (metadata.dev(), metadata.ino())
 }
+
+/// The `(st_dev, st_ino)` of each regular file the archive is written to.
+///
+/// A name list read as the walk goes can name the archive once it exists --
+/// `find . | pax -w -f out.tar` -- and so can a walk of the directory holding
+/// it. Under -M that is every volume, each created part way through the walk,
+/// so the volume writer adds each one as it creates it: a set shared with the
+/// writer rather than one id fixed before the walk begins.
+#[derive(Clone, Default)]
+pub struct ArchiveFiles(Rc<RefCell<HashSet<(u64, u64)>>>);
+
+impl ArchiveFiles {
+    /// Record a file the archive is written to. Only a regular file counts:
+    /// a device such as `/dev/null` or a tape is not one the walk could be
+    /// copying into itself.
+    pub fn add(&self, metadata: &std::fs::Metadata) {
+        if metadata.is_file() {
+            self.0.borrow_mut().insert(file_id(metadata));
+        }
+    }
+
+    fn contains(&self, metadata: &ftw::Metadata) -> bool {
+        self.0.borrow().contains(&(metadata.dev(), metadata.ino()))
+    }
+}
+
+/// A member's modification time as `(seconds, nanoseconds)`.
+pub type MemberTime = (i64, u32);
 
 impl WriteOptions {
     /// Whether `-u` should leave this member out because the archive already
@@ -83,26 +114,30 @@ impl WriteOptions {
         let Some(&member_mtime) = times.get(name) else {
             return false;
         };
-        file_mtime_secs(metadata) <= member_mtime
+        not_newer(file_mtime(metadata), member_mtime)
     }
 }
 
-/// A file's modification time in whole seconds, the resolution every header
-/// format records.
-fn file_mtime_secs(metadata: &ftw::Metadata) -> i64 {
-    #[cfg(unix)]
-    {
-        metadata.mtime()
+/// Whether a file last modified at `file` is no newer than a member recording
+/// `member`.
+///
+/// A member with a fraction of a second -- a pax `mtime` record -- is compared
+/// to the nanosecond, so a file changed again within the same second is newer.
+/// One without has its time to the second only: every ustar header, where
+/// what was archived from a file modified at 100.5 says 100. Comparing the
+/// file's 100.5 to that would append an unchanged file on every run, so
+/// against it only the file's seconds count.
+fn not_newer(file: MemberTime, member: MemberTime) -> bool {
+    if member.1 == 0 {
+        file.0 <= member.0
+    } else {
+        file <= member
     }
-    #[cfg(not(unix))]
-    {
-        metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
-    }
+}
+
+/// A file's modification time as `(seconds, nanoseconds)`.
+fn file_mtime(metadata: &ftw::Metadata) -> MemberTime {
+    (metadata.mtime(), metadata.mtime_nsec() as u32)
 }
 
 /// The pathnames write, append and copy mode act on, in order.
@@ -118,7 +153,7 @@ pub fn create_archive<W: Write>(
     writer: W,
     files: &mut FileNames<'_>,
     format: ArchiveFormat,
-    options: &WriteOptions,
+    options: &mut WriteOptions,
 ) -> PaxResult<()> {
     match format {
         ArchiveFormat::Ustar => write_archive(&mut UstarWriter::new(writer), files, options),
@@ -144,7 +179,7 @@ pub fn create_archive<W: Write>(
 fn write_archive<A: ArchiveWriter>(
     archive: &mut A,
     files: &mut FileNames<'_>,
-    options: &WriteOptions,
+    options: &mut WriteOptions,
 ) -> PaxResult<()> {
     let mut sink = ArchiveSink(archive);
     match write_files(&mut sink, files, options) {
@@ -226,13 +261,10 @@ impl<A: ArchiveWriter> ArchiveWriter for ArchiveSink<'_, A> {
 fn write_files<W: ArchiveWriter>(
     archive: &mut W,
     files: &mut FileNames<'_>,
-    options: &WriteOptions,
+    options: &mut WriteOptions,
 ) -> PaxResult<()> {
-    let prompter = if options.interactive {
-        Some(InteractivePrompter::new()?)
-    } else {
-        None
-    };
+    let prompter = options.prompter.take();
+    let options = &*options;
 
     let walk = WriteWalk {
         archive: RefCell::new(archive),
@@ -316,7 +348,7 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
             return Ok(false);
         };
 
-        if self.options.archive_id == Some((metadata.dev(), metadata.ino())) {
+        if self.options.archive_files.contains(metadata) {
             crate::error::report_warning(
                 path,
                 gettextrs::gettext("file is the archive; not dumped"),
@@ -468,7 +500,7 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
             // Block and character devices, FIFOs and sockets are archived from
             // their metadata; none of them is ever opened, so a FIFO with no
             // writer cannot block the walk.
-            write_special(archive, &archive_path, metadata)?;
+            write_special(archive, &archive_path, metadata, self.options)?;
         }
 
         Ok(false)
@@ -522,6 +554,7 @@ fn write_special<W: ArchiveWriter>(
     archive: &mut W,
     path: &Path,
     metadata: &ftw::Metadata,
+    options: &WriteOptions,
 ) -> PaxResult<()> {
     use std::os::unix::fs::FileTypeExt;
 
@@ -538,10 +571,16 @@ fn write_special<W: ArchiveWriter>(
         // no socket type either; recording one as an empty regular file
         // would extract something the file never was.
         if !archive.supports_sockets() {
-            crate::error::report_error(
-                path,
-                gettextrs::gettext("socket not archived: the format has no socket type"),
-            );
+            // tar's front-end follows GNU tar and bsdtar: a warning, and the
+            // run still succeeds.
+            if options.ignore_sockets {
+                crate::error::report_warning(path, gettextrs::gettext("socket ignored"));
+            } else {
+                crate::error::report_error(
+                    path,
+                    gettextrs::gettext("socket not archived: the format has no socket type"),
+                );
+            }
             return Ok(());
         }
         EntryType::Socket
@@ -562,6 +601,7 @@ fn write_special<W: ArchiveWriter>(
     _archive: &mut W,
     path: &Path,
     _metadata: &ftw::Metadata,
+    _options: &WriteOptions,
 ) -> PaxResult<()> {
     eprintln!(
         "pax: {}: special files not supported on this platform",
@@ -620,11 +660,12 @@ fn write_file<W: ArchiveWriter>(
     if let Some(original_path) = original {
         // The same file met again under the very name it was first archived
         // as (`pax -w f f`, or `find tree | pax -w` reaching it from both the
-        // list and the walk). "f == f" extracts by unlinking f and then failing
-        // to link it, and archiving the data again would split f from any
-        // other name linked to it in between. The earlier member already says
-        // everything this one could.
-        if original_path == entry.path {
+        // list and the walk), however spelled: `./h/a` and `h/a` are one name.
+        // "f == f" extracts by unlinking f and then failing to link it, and
+        // archiving the data again would split f from any other name linked
+        // to it in between. The earlier member already says everything this
+        // one could.
+        if crate::rawpath::same_name(&original_path, &entry.path) {
             return Ok(());
         }
 
@@ -859,7 +900,7 @@ fn build_entry(
 pub fn write_files_to_archive<W: ArchiveWriter>(
     archive: &mut W,
     files: &mut FileNames<'_>,
-    options: &WriteOptions,
+    options: &mut WriteOptions,
 ) -> PaxResult<()> {
     write_archive(archive, files, options)
 }

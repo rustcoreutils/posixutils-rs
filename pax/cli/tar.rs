@@ -421,6 +421,9 @@ fn finish(mut st: State) -> PaxResult<Args> {
         st.args.privs = vec![st.privs.clone()];
     }
 
+    // GNU tar and bsdtar skip a socket with a warning and still succeed.
+    st.args.ignore_sockets = true;
+
     Ok(st.args)
 }
 

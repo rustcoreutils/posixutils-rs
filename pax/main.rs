@@ -34,6 +34,7 @@ use compression::{is_gzip, GzipReader, GzipWriter, GZIP_MAGIC};
 use error::{PaxError, PaxResult};
 use formats::{ArchiveStream, CpioFormat};
 use gettextrs::gettext;
+use interactive::InteractivePrompter;
 use modes::copy::CopyOptions;
 use modes::list::ListOptions;
 use modes::read::ReadOptions;
@@ -209,6 +210,11 @@ struct Args {
     #[arg(skip)]
     to_stdout: bool,
 
+    /// tar: a socket, which the format cannot hold, is skipped with a
+    /// warning rather than diagnosed as an error
+    #[arg(skip)]
+    ignore_sockets: bool,
+
     /// cpio: report the archive size as a count of 512-byte blocks on stderr
     #[arg(skip)]
     report_blocks: bool,
@@ -303,14 +309,10 @@ fn run(mut args: Args) -> PaxResult<()> {
     let mode = determine_mode(&args);
     let name_lists = std::mem::take(&mut args.name_lists);
     let name_lists = if matches!(mode, PaxMode::List | PaxMode::Read) {
-        // Given a list, selection is by the list: an empty one, with no
-        // operands either, selects no member -- not, as no patterns at all
-        // would, every one.
-        let selecting = !name_lists.is_empty();
+        // An empty list adds no patterns, so with no operands either every
+        // member is selected, as bsdtar and GNU tar do -- and the archive is
+        // read all the same, so a missing or corrupt one is still an error.
         names_as_patterns(name_lists, &mut args.files_and_patterns)?;
-        if selecting && args.files_and_patterns.is_empty() {
-            return Ok(());
-        }
         Vec::new()
     } else {
         name_lists
@@ -519,6 +521,15 @@ fn reject_dash_c(args: &Args, mode: &str) -> PaxResult<()> {
     Ok(())
 }
 
+/// The terminal `-i` prompts on, when it is given.
+///
+/// Write and append mode open it before the archive file: with no terminal
+/// -- under cron, say -- the run then fails leaving an existing archive as it
+/// was, where creating the archive first had already truncated it.
+fn interactive_prompter(args: &Args) -> PaxResult<Option<InteractivePrompter>> {
+    args.interactive.then(InteractivePrompter::new).transpose()
+}
+
 fn run_write(args: &Args, name_lists: Vec<NameList>, archive_bytes: &ByteCounter) -> PaxResult<()> {
     reject_dash_c(args, "write")?;
     let substitutions = parse_substitutions(args)?;
@@ -531,7 +542,8 @@ fn run_write(args: &Args, name_lists: Vec<NameList>, archive_bytes: &ByteCounter
         no_recurse: args.dir_no_follow,
         verbose: args.verbose,
         one_file_system: args.one_file_system,
-        interactive: args.interactive,
+        prompter: interactive_prompter(args)?,
+        ignore_sockets: args.ignore_sockets,
         reset_atime: args.reset_atime,
         substitutions,
         format_options,
@@ -539,7 +551,7 @@ fn run_write(args: &Args, name_lists: Vec<NameList>, archive_bytes: &ByteCounter
         exclude_patterns: compile_patterns(&args.exclude_patterns),
         // -u selects among existing members, which write mode has none of.
         update_times: None,
-        archive_id: None,
+        archive_files: Default::default(),
     };
 
     let format = ArchiveFormat::from(selected);
@@ -550,7 +562,7 @@ fn run_write(args: &Args, name_lists: Vec<NameList>, archive_bytes: &ByteCounter
     // Check for multi-volume mode
     if args.multi_volume {
         let mv_options = multi_volume_options(args, names_on_stdin)?;
-        return run_write_multi_volume(args, mv_options, &mut files, format, &options);
+        return run_write_multi_volume(args, mv_options, &mut files, format, &mut options);
     }
 
     // Determine record size for blocked I/O. With no explicit -b, the default
@@ -562,9 +574,7 @@ fn run_write(args: &Args, name_lists: Vec<NameList>, archive_bytes: &ByteCounter
         None => stdio_file(io::stdout())?,
     };
     let metadata = raw.metadata()?;
-    if metadata.is_file() {
-        options.archive_id = Some(modes::write::file_id(&metadata));
-    }
+    options.archive_files.add(&metadata);
     // -b is the size of every write to the archive file, and with -z the
     // archive file holds the compressed stream: that is what gets blocked.
     let mut blocked =
@@ -576,9 +586,14 @@ fn run_write(args: &Args, name_lists: Vec<NameList>, archive_bytes: &ByteCounter
         if !is_device(&metadata) {
             blocked = blocked.unpadded_last_record();
         }
-        modes::create_archive(GzipWriter::new(&mut blocked)?, &mut files, format, &options)
+        modes::create_archive(
+            GzipWriter::new(&mut blocked)?,
+            &mut files,
+            format,
+            &mut options,
+        )
     } else {
-        modes::create_archive(&mut blocked, &mut files, format, &options)
+        modes::create_archive(&mut blocked, &mut files, format, &mut options)
     };
     // Closed even after a failure, which takes precedence in the report.
     let closed = blocked.close().map_err(PaxError::ArchiveWrite);
@@ -599,7 +614,7 @@ fn run_write_multi_volume(
     mv_options: MultiVolumeOptions,
     files: &mut FileNames<'_>,
     format: ArchiveFormat,
-    options: &WriteOptions,
+    options: &mut WriteOptions,
 ) -> PaxResult<()> {
     // The multi-volume writer emits ustar headers unconditionally, so any other
     // interchange format has to be refused rather than silently downgraded.
@@ -629,7 +644,12 @@ fn run_write_multi_volume(
             volume_size, record_size
         )));
     }
-    let mut writer = multivolume::MultiVolumeWriter::new(mv_options, record_size)?;
+    // Each volume is added to the files the walk leaves out as it is created.
+    let mut writer = multivolume::MultiVolumeWriter::new(
+        mv_options,
+        record_size,
+        options.archive_files.clone(),
+    )?;
 
     // Write each file to the multi-volume archive, then its trailer
     modes::write::write_files_to_archive(&mut writer, files, options)
@@ -670,7 +690,8 @@ fn run_append(
         no_recurse: args.dir_no_follow,
         verbose: args.verbose,
         one_file_system: args.one_file_system,
-        interactive: args.interactive,
+        prompter: interactive_prompter(args)?,
+        ignore_sockets: args.ignore_sockets,
         reset_atime: args.reset_atime,
         substitutions,
         format_options,
@@ -678,7 +699,7 @@ fn run_append(
         exclude_patterns: compile_patterns(&args.exclude_patterns),
         // Filled in by append_to_archive once it knows the archive's format.
         update_times: None,
-        archive_id: None,
+        archive_files: Default::default(),
     };
 
     let requested_format = args.format.map(ArchiveFormat::from);

@@ -1123,6 +1123,38 @@ fn test_hardlink_operand_repeated_roundtrip() {
     assert_eq!(fs::read_to_string(dst.join("f")).unwrap(), "DATA\n");
 }
 
+/// The same file named twice under different spellings of one name -- `./h/a`
+/// and `h/a` -- is one name, and must not be archived as a link to itself
+/// either: bsdtar extracts "h/a == ./h/a" by unlinking h/a, losing it.
+#[test]
+fn test_hardlink_to_itself_under_another_spelling_is_left_out() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir_all(src.join("h")).unwrap();
+    fs::write(src.join("h/a"), "DATA\n").unwrap();
+    fs::hard_link(src.join("h/a"), src.join("h/b")).unwrap();
+
+    let output = run_pax_in_dir(
+        &["-w", "-f", "../a.tar", "./h/a", "h/a", ".//h/./a", "h/b"],
+        &src,
+    );
+    assert_success(&output, "pax -w ./h/a h/a .//h/./a h/b");
+    let listing = run_pax_in_dir(&["-v", "-f", "a.tar"], temp.path());
+    let listing = stdout_str(&listing);
+    let links: Vec<&str> = listing.lines().filter(|l| l.contains(" == ")).collect();
+    assert_eq!(links.len(), 1, "{listing}");
+    assert!(links[0].ends_with("h/b == ./h/a"), "{listing}");
+
+    let Some(tar) = system_tool("tar") else {
+        return;
+    };
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+    run_system_ok(&tar, &["-xf", "../a.tar"], &dst, None);
+    assert_eq!(fs::read_to_string(dst.join("h/a")).unwrap(), "DATA\n");
+    assert_eq!(fs::read_to_string(dst.join("h/b")).unwrap(), "DATA\n");
+}
+
 /// GNU cpio and bsdcpio write a newc hard-link set with the data on the last
 /// link only; the earlier names carry c_filesize 0. Extraction has to re-create
 /// one inode holding the data, not an empty file beside a full one.

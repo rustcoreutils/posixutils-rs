@@ -40,6 +40,7 @@ use crate::formats::ustar::{
     build_header, is_zero_block, parse_numeric, stores_data, verify_checksum, SIZE_OFF,
     TYPEFLAG_OFF,
 };
+use crate::modes::write::ArchiveFiles;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -174,11 +175,19 @@ pub struct MultiVolumeWriter {
     writer: Option<BlockedWriter<File>>,
     /// The member being written stores no data (a link): drop what is offered.
     skip_data: bool,
+    /// Where each volume is recorded as it is created, so the walk does not
+    /// archive a volume into itself.
+    archive_files: ArchiveFiles,
 }
 
 impl MultiVolumeWriter {
-    /// Create a new multi-volume writer that writes `record_size` bytes at a time
-    pub fn new(options: MultiVolumeOptions, record_size: usize) -> PaxResult<Self> {
+    /// Create a new multi-volume writer that writes `record_size` bytes at a
+    /// time, adding each volume to `archive_files`.
+    pub fn new(
+        options: MultiVolumeOptions,
+        record_size: usize,
+        archive_files: ArchiveFiles,
+    ) -> PaxResult<Self> {
         let volume_size = options.volume_size.unwrap_or(u64::MAX);
 
         let mut writer = MultiVolumeWriter {
@@ -189,6 +198,7 @@ impl MultiVolumeWriter {
             record_size,
             writer: None,
             skip_data: false,
+            archive_files,
         };
         writer.open_volume()?;
         Ok(writer)
@@ -198,7 +208,9 @@ impl MultiVolumeWriter {
     fn open_volume(&mut self) -> PaxResult<()> {
         let path = volume_path(&self.options.archive_path, self.current_volume);
         announce(&self.options, "opening", self.current_volume, &path);
-        self.writer = Some(BlockedWriter::new(File::create(&path)?, self.record_size));
+        let file = File::create(&path)?;
+        self.archive_files.add(&file.metadata()?);
+        self.writer = Some(BlockedWriter::new(file, self.record_size));
         Ok(())
     }
 
@@ -473,6 +485,7 @@ mod tests {
             record_size: 10240,
             writer: None,
             skip_data: false,
+            archive_files: ArchiveFiles::default(),
         };
         assert_eq!(writer.volume_bytes(0), 10240);
         assert_eq!(writer.volume_bytes(9216), 10240);

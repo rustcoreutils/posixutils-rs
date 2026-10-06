@@ -1167,3 +1167,64 @@ fn test_multi_volume_non_utf8_archive_name() {
     assert_success(&out, "pax -M list");
     assert_eq!(stdout_str(&out), names);
 }
+
+/// A volume being written is the archive, and is not archived into itself --
+/// any volume, not only the first, and whether the walk or a name operand
+/// reaches it. The single-volume writer always skipped its archive; -M
+/// never did, and stored a copy of a volume as a member.
+#[test]
+fn test_multi_volume_does_not_archive_its_own_volumes() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("a"), vec![b'a'; 12000]).unwrap();
+    fs::write(temp.path().join("b"), vec![b'b'; 12000]).unwrap();
+    let out = run_pax_in_dir(
+        &[
+            "-w",
+            "-M",
+            "--tape-length",
+            "20480",
+            "--new-volume-script",
+            "true",
+            "-f",
+            "vol.tar",
+            "a",
+            "b",
+            "vol.tar",
+            "vol.tar.2",
+        ],
+        temp.path(),
+    );
+    let err = stderr_str(&out);
+    assert!(temp.path().join("vol.tar.2").exists(), "two volumes: {err}");
+    assert!(
+        err.contains("vol.tar: file is the archive")
+            && err.contains("vol.tar.2: file is the archive"),
+        "{err}"
+    );
+    let out = list_volume_set(temp.path(), "false");
+    assert_eq!(listed(&out), vec!["a", "b"]);
+
+    // The walk of a directory holding the archive finds it too.
+    let dir = temp.path().join("d");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("f"), "F\n").unwrap();
+    let out = run_pax_in_dir(
+        &[
+            "-w",
+            "-M",
+            "--tape-length",
+            "1048576",
+            "-f",
+            "./arch.tar",
+            ".",
+        ],
+        &dir,
+    );
+    assert!(
+        stderr_str(&out).contains("file is the archive"),
+        "{}",
+        stderr_str(&out)
+    );
+    let out = run_pax_in_dir(&["-M", "-f", "arch.tar"], &dir);
+    assert_eq!(listed(&out), vec!["./", "./f"]);
+}

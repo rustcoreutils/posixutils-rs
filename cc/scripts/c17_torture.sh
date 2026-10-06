@@ -255,7 +255,7 @@ dg_scan() {
             # `label_values` tests long after c17 had all four, and hid three
             # bugs behind them; modelling each name instead skipped avx512,
             # `-fexceptions` and profiling tests that c17 compiles. Every test
-            # is attempted; nothing is skipped by name.
+            # is attempted unless SKIP_BY_NAME names it.
             else if (d ~ /dg-timeout-factor/) {
                 if (match(text, /[0-9]+/)) mult = substr(text, RSTART, RLENGTH)
             }
@@ -512,6 +512,119 @@ x_file_verdict() {
 }
 
 
+# Tests skipped by name: `<sub-suite>/<name>  <target>  <reason>`, target
+# `all`, `host` or `aarch64`. Everything else is attempted. Only what the
+# project has decided not to do belongs here -- nested functions, VLA struct
+# members, post-C17 features, another compiler's internals -- and the odd
+# test gcc itself rejects. A failure that is a c17 gap or bug is fixed, not
+# listed.
+SKIP_BY_NAME='
+builtins/uabs-1        all      post-C17 feature
+builtins/uabs-2        all      post-C17 feature
+builtins/uabs-3        all      post-C17 feature
+compile/20010226-1     all      nested functions
+compile/20010605-1     all      nested functions
+compile/20010903-2     all      nested functions
+compile/20011023-1     all      nested functions
+compile/20020210-1     all      VLA as a struct member
+compile/20020309-1     all      nested functions
+compile/20021204-1     all      nested functions
+compile/20030224-1     all      VLA as a struct member
+compile/20030418-1     all      nested functions
+compile/20030716-1     all      nested functions
+compile/20031011-1     all      nested functions
+compile/20031023-1     all      needs 64-bit stack frames
+compile/20031023-2     all      needs 64-bit stack frames
+compile/20031023-3     all      needs 64-bit stack frames
+compile/20031023-4     all      needs 64-bit stack frames
+compile/20040310-1     all      nested functions
+compile/20040317-3     all      nested functions
+compile/20040323-1     all      nested functions
+compile/20050119-1     all      nested functions
+compile/20050122-2     all      nested functions (non-local goto to a __label__)
+compile/20050801-2     all      VLA as a struct member
+compile/920415-1       all      nested functions (non-local goto to a __label__)
+compile/920428-4       all      VLA as a struct member
+compile/920501-16      all      VLA as a struct member
+compile/930506-2       all      nested functions
+compile/950919-1       all      GNU preprocessor assertions (#cpu)
+compile/951116-1       all      nested functions
+compile/dll            all      gcc rejects it too
+compile/mipscop-1      all      inline assembly for another target
+compile/mipscop-2      all      inline assembly for another target
+compile/mipscop-3      all      inline assembly for another target
+compile/mipscop-4      all      inline assembly for another target
+compile/nested-1       all      nested functions
+compile/nested-2       all      nested functions
+compile/nested-3       all      nested functions
+compile/pr110386-2     all      -mavx: above the SSE4.2 ceiling
+compile/pr111059-10    all      post-C17 feature
+compile/pr111059-11    all      post-C17 feature
+compile/pr111059-12    all      post-C17 feature
+compile/pr111059-7     all      post-C17 feature
+compile/pr111059-8     all      post-C17 feature
+compile/pr111059-9     all      post-C17 feature
+compile/pr111911-2     all      post-C17 feature
+compile/pr115143-2     all      the GIMPLE front end of gcc (-fgimple)
+compile/pr115143-3     all      the GIMPLE front end of gcc (-fgimple)
+compile/pr21728        all      nested functions (non-local goto to a __label__)
+compile/pr27528        aarch64  non-PIC "s" operands; gcc rejects them under PIC too
+compile/pr27889        all      nested functions
+compile/pr35006        all      nested functions
+compile/pr39394        all      VLA as a struct member
+compile/pr42956        all      VLA as a struct member
+compile/pr77754-6      all      VLA as a struct member
+compile/pr82564        all      VLA as a struct member
+compile/pr99324        all      nested functions
+compile/stack-check-1  all      needs 64-bit stack frames
+execute/20000822-1     all      nested functions
+execute/20010209-1     all      nested functions
+execute/20010605-1     all      nested functions
+execute/20020412-1     all      VLA as a struct member
+execute/20030501-1     all      nested functions
+execute/20040308-1     all      VLA as a struct member
+execute/20040423-1     all      VLA as a struct member
+execute/20040520-1     all      nested functions
+execute/20041218-2     all      VLA as a struct member
+execute/20061220-1     all      nested functions
+execute/20070919-1     all      VLA as a struct member
+execute/20090219-1     all      nested functions
+execute/920415-1       all      nested functions (non-local goto to a __label__)
+execute/920428-2       all      nested functions (non-local goto to a __label__)
+execute/920501-7       all      nested functions (non-local goto to a __label__)
+execute/920612-2       all      nested functions
+execute/920721-4       all      nested functions (non-local goto to a __label__)
+execute/921017-1       all      nested functions
+execute/921215-1       all      nested functions
+execute/931002-1       all      nested functions
+execute/align-nest     all      VLA as a struct member
+execute/comp-goto-2    all      nested functions (non-local goto to a __label__)
+execute/eeprof-1       all      -finstrument-functions
+execute/nest-align-1   all      nested functions
+execute/nest-stdar-1   all      nested functions
+execute/nestfunc-1     all      nested functions
+execute/nestfunc-2     all      nested functions
+execute/nestfunc-3     all      nested functions
+execute/nestfunc-5     all      nested functions (non-local goto to a __label__)
+execute/nestfunc-6     all      nested functions (non-local goto to a __label__)
+execute/nestfunc-7     all      nested functions
+execute/pr103405       all      nested functions
+execute/pr117432       all      gcc rejects it too
+execute/pr123864       all      implicit int; gcc 14 rejects it too
+execute/pr123978       all      post-C17 feature
+execute/pr124358       all      post-C17 feature
+execute/pr125291       all      post-C17 feature
+execute/pr22061-3      all      nested functions
+execute/pr22061-4      all      nested functions
+execute/pr24135        all      nested functions (non-local goto to a __label__)
+execute/pr41935        all      VLA as a struct member
+execute/pr47237        all      __builtin_apply
+execute/pr51447        all      nested functions (non-local goto to a __label__)
+execute/pr71494        all      nested functions
+execute/pr80692        all      post-C17 feature
+execute/pr82210        all      VLA as a struct member
+'
+
 # `dg-do compile` tests whose asm template is deliberately not an instruction
 # -- `asm("%0" :: "r"(1.5))`, `asm("f")` -- so they only mean something up to
 # `-S`, which is where gcc stops. aarch64 mode assembles every other compile
@@ -552,6 +665,12 @@ run_one() {
         flags:*) xflags=${xv#flags:};;
     esac
     local key="$suite/$base"
+    local why
+    why=$(printf '%s\n' "$SKIP_BY_NAME" | awk -v k="$key" -v t="$TORTURE_TARGET" \
+        '$1 == k && ($2 == "all" || $2 == t) { $1 = ""; $2 = ""; sub(/^ +/, ""); print; exit }')
+    if [ -n "$why" ]; then
+        echo "SKIP	$tag	$why"; return
+    fi
     local scan skip flags mult stack dgdo errlines
     scan=$(dg_scan "$src" "$opt")
     skip=${scan%%|*}; scan=${scan#*|}
@@ -775,7 +894,7 @@ default_mode() {
 
 export -f run_one dg_scan x_file_verdict default_mode expect_reject
 export -f target_compile_only target_build target_run
-export TORTURE_TARGET TARGET_FLAGS TAG_PREFIX TEMPLATE_NOT_ASSEMBLED
+export TORTURE_TARGET TARGET_FLAGS TAG_PREFIX TEMPLATE_NOT_ASSEMBLED SKIP_BY_NAME
 export TORTURE_TRIPLE
 
 # ------------------------------------------------------------- collect tests

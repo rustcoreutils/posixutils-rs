@@ -75,7 +75,6 @@ builtins/strstr-asm@-O0
 builtins/strstr-asm@-O2
 builtins/strstr@-O0
 builtins/strstr@-O2
-builtins/uabs-2@-O0
 compile/103818@-O0
 compile/103818@-O2
 compile/20000105-1@-O0

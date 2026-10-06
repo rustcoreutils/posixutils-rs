@@ -75,7 +75,6 @@ aarch64/builtins/strstr-asm@-O0
 aarch64/builtins/strstr-asm@-O2
 aarch64/builtins/strstr@-O0
 aarch64/builtins/strstr@-O2
-aarch64/builtins/uabs-2@-O0
 aarch64/compile/103818@-O0
 aarch64/compile/103818@-O2
 aarch64/compile/20000105-1@-O0

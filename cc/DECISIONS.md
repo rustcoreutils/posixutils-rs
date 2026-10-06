@@ -221,9 +221,13 @@ does not define it there.
 
 ## Torture tests
 
-The harness (`scripts/c17_torture.sh`) attempts every test; nothing is
-skipped by name. Only the suite's own directives -- a `.x` file, `dg-skip-if`,
-a `dg-do` target selector -- keep a test from running.
+The harness (`scripts/c17_torture.sh`) attempts every test except those in
+its `SKIP_BY_NAME` table, which holds what is out of scope -- nested
+functions, VLA struct members, post-C17 features, gcc's own internals,
+another target's assembly -- and the odd test gcc itself rejects, each with
+its reason. The suite's own directives (a `.x` file, `dg-skip-if`, a `dg-do`
+target selector) skip the rest. A failure that is a c17 gap or bug is fixed,
+not listed.
 
 ### Deliberate divergences from gcc
 

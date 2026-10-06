@@ -1213,15 +1213,19 @@ impl<'a> Parser<'a> {
                     // whose size is `n * sizeof(int)`, and dropping them left
                     // it with no size -- in a declaration as much as in
                     // `sizeof`.
-                    let (typ, dims) = match self.try_parse_type_name_vm() {
-                        Some(named) => named,
-                        None => {
-                            let expr = self.parse_expression()?;
-                            self.exempt_reverse_atomic_operand(&expr);
-                            let dims = self.typeof_object_extents(&expr);
-                            (expr.typ.unwrap_or(self.types.int_id), dims)
-                        }
-                    };
+                    // The operand is not evaluated, unless it is variably
+                    // modified; gcc reports no overflow in it either way.
+                    let (typ, dims) = self.unevaluated_if(true, |p| {
+                        Ok(match p.try_parse_type_name_vm() {
+                            Some(named) => named,
+                            None => {
+                                let expr = p.parse_expression()?;
+                                p.exempt_reverse_atomic_operand(&expr);
+                                let dims = p.typeof_object_extents(&expr);
+                                (expr.typ.unwrap_or(p.types.int_id), dims)
+                            }
+                        })
+                    })?;
                     self.expect_special(b')')?;
                     tally.note_data_type(idents.get(name_id), pos);
 

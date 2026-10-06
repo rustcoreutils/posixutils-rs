@@ -48,11 +48,6 @@ pub(crate) fn is_const_object_type(types: &TypeTable, typ: TypeId) -> bool {
     }
 }
 
-/// gcc's group for a constant that a conversion changes -- a floating one
-/// out of an integer type's range, an integer one its type cannot hold --
-/// and for signed arithmetic that overflows: `-Wno-overflow` silences them.
-pub(crate) const OVERFLOW_WARNING: &str = "overflow";
-
 /// The bytes a bit-field's own bits occupy, as `(byte offset from the field's
 /// own offset, the bits `value` puts there, the mask of the bits the field
 /// owns)`.
@@ -1111,7 +1106,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             msg.push_str(" from ");
             msg.push_str(values);
         }
-        crate::diag::group_warning(OVERFLOW_WARNING, self.expr_pos(expr), &msg);
+        crate::diag::group_warning(constexpr::OVERFLOW_WARNING, self.expr_pos(expr), &msg);
     }
 
     /// [`Self::convert_integer_constant`]'s warning for an implicit

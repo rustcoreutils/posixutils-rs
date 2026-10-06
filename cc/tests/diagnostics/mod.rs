@@ -23,6 +23,7 @@ mod constraint_sweep;
 mod declarations;
 mod expressions;
 mod function_compatibility;
+mod integer_overflow;
 mod narrow_initializers;
 
 use crate::common::{

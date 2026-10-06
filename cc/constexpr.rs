@@ -48,6 +48,9 @@ pub(crate) enum ConstScope {
     /// a comparison of a value saturated low (`(int)-1e300 < 0`), a NaN from
     /// `__builtin_nan`, and on x86-64 alone a negative value converted to
     /// `unsigned` -- and gcc then takes the size as a constant.
+    ///
+    /// Signed arithmetic that overflows ([`eval_noting_overflow`]) is refused
+    /// here for the same reason: `int a[INT_MAX + 2 > 0];` is a VLA to gcc.
     ArrayBound,
     /// Additionally a `const`-qualified object with a visible constant
     /// initializer, which gcc folds in a static initializer and nowhere else.
@@ -139,6 +142,69 @@ pub(crate) fn reduce_to_width(value: i128, bits: u32, unsigned: bool) -> i128 {
     }
 }
 
+/// gcc's warning group for a constant that a conversion changes -- a
+/// floating one out of an integer type's range, an integer one its type
+/// cannot hold -- and for signed arithmetic on constants that overflows:
+/// `-Wno-overflow` silences them all.
+pub(crate) const OVERFLOW_WARNING: &str = "overflow";
+
+thread_local! {
+    /// Whether the walk has evaluated a signed operation whose result its
+    /// type cannot hold, since [`eval_noting_overflow`] last asked.
+    static OVERFLOWED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Record a signed operation that overflowed (C17 6.5p5), and answer whether
+/// the walk may still give a value in `scope`: an array size whose
+/// computation overflows is not an integer constant expression to gcc, which
+/// makes the array variable, while every other context takes the wrapped
+/// value.
+fn note_overflow(scope: ConstScope) -> bool {
+    OVERFLOWED.set(true);
+    scope != ConstScope::ArrayBound
+}
+
+/// [`eval`], and whether any signed operation it evaluated overflowed --
+/// gcc's `TREE_OVERFLOW`, which its `-Woverflow` reports once, at the
+/// operation that overflowed: a value computed from an overflowed operand
+/// carries the mark without being reported again.
+///
+/// Only the operations evaluated count, so the arm a constant condition
+/// discards, and the right operand of a `&&` or `||` the left decides, do
+/// not.
+pub(crate) fn eval_noting_overflow(
+    env: &impl ConstEnv,
+    scope: ConstScope,
+    expr: &Expr,
+) -> Option<(i128, bool)> {
+    let outer = OVERFLOWED.replace(false);
+    let value = eval(env, scope, expr);
+    let overflowed = OVERFLOWED.get();
+    OVERFLOWED.set(outer || overflowed);
+    value.map(|v| (v, overflowed))
+}
+
+/// Whether `left op right`, both already in the signed integer type `typ`,
+/// has a value that type cannot hold. The remainder overflows wherever the
+/// quotient does: gcc reports `INT_MIN % -1` as it reports `INT_MIN / -1`.
+fn signed_op_overflows(
+    types: &TypeTable,
+    typ: TypeId,
+    op: BinaryOp,
+    left: i128,
+    right: i128,
+) -> bool {
+    let exact = match op {
+        BinaryOp::Add => left.checked_add(right),
+        BinaryOp::Sub => left.checked_sub(right),
+        BinaryOp::Mul => left.checked_mul(right),
+        BinaryOp::Div | BinaryOp::Mod if right == 0 => return false,
+        BinaryOp::Div | BinaryOp::Mod => left.checked_div(right),
+        _ => return false,
+    };
+    exact.is_none_or(|v| normalize(types, Some(typ), v) != v)
+}
+
 /// Does either operand of a comparison have floating or complex type?
 ///
 /// Asked of the operands rather than the node, because a comparison's own type
@@ -218,7 +284,20 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
         ExprKind::Unary { op, operand } => {
             let val = eval(env, scope, operand)?;
             match op {
-                UnaryOp::Neg => Some(val.wrapping_neg()),
+                // Negating the minimum of a signed type overflows it.
+                UnaryOp::Neg => {
+                    let types = env.types();
+                    let signed = expr
+                        .typ
+                        .filter(|&t| types.is_integer(t) && !types.is_unsigned(t));
+                    if signed.is_some_and(|t| normalize(types, Some(t), val.wrapping_neg()) == val)
+                        && val != 0
+                        && !note_overflow(scope)
+                    {
+                        return None;
+                    }
+                    Some(val.wrapping_neg())
+                }
                 UnaryOp::BitNot => Some(!val),
                 _ => None,
             }
@@ -494,6 +573,14 @@ fn eval_binary(
     let left_unsigned = left
         .typ
         .is_some_and(|t| env.types().is_integer(t) && env.types().is_unsigned(t));
+
+    // Signed arithmetic whose result the common type cannot hold (6.5p5).
+    // The value is the wrapped one below, as in gcc.
+    if let Some(t) = common.filter(|_| !unsigned) {
+        if signed_op_overflows(env.types(), t, op, lc, rc) && !note_overflow(scope) {
+            return None;
+        }
+    }
 
     match op {
         BinaryOp::Add => Some(l.wrapping_add(r)),

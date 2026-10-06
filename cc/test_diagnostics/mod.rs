@@ -48,6 +48,7 @@ mod function_pointers;
 mod ifunc;
 mod incomplete_types;
 mod inline_static_reference;
+mod integer_overflow;
 mod jumps_and_characters;
 mod keywords_and_suffixes;
 mod lexical_errors;

@@ -351,6 +351,24 @@ pub fn compile_expect_no_diagnostic(name: &str, content: &str, forbidden: &str) 
     );
 }
 
+/// The warnings a translation unit that must compile draws, each as
+/// `line:col: message` -- for a test that has to see every one, where it
+/// points, and that there are no others.
+#[track_caller]
+pub fn compile_warnings(name: &str, src: &str, flags: &[&str]) -> Vec<String> {
+    let c = compile(name, src, flags);
+    assert!(c.success, "'{name}' should have compiled:\n{}", c.stderr);
+    let prefix = format!("{name}.c:");
+    c.stderr
+        .lines()
+        .filter_map(|l| l.strip_prefix(&prefix))
+        .filter_map(|l| {
+            let (at, msg) = l.split_once(": warning: ")?;
+            Some(format!("{at}: {msg}"))
+        })
+        .collect()
+}
+
 /// The assembly of a translation unit that must compile.
 #[track_caller]
 pub fn asm_for(name: &str, src: &str, flags: &[&str]) -> String {

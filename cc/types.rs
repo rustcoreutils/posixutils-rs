@@ -1808,6 +1808,50 @@ impl TypeTable {
         self.format_declarator(id, String::new(), idents)
     }
 
+    /// `id` as gcc's conversion warnings name it: an integer type by gcc's
+    /// full spelling -- `short int`, `long unsigned int`, `__int128 unsigned`
+    /// -- where [`Self::format_type`] gives the spelling a declaration would
+    /// most likely use. Any other type is [`Self::format_type`]'s.
+    pub fn gcc_type_name(&self, id: TypeId, idents: Option<&IdentTable>) -> String {
+        let typ = self.get(id);
+        let unsigned = self.spelled_unsigned(id);
+        let pick = |s: IntType| if unsigned { s.to_unsigned() } else { s };
+        let int = match typ.kind {
+            _ if typ.modifiers.contains(TypeModifiers::COMPLEX) => None,
+            TypeKind::Char if unsigned => Some(IntType::UChar),
+            TypeKind::Char if typ.modifiers.contains(TypeModifiers::SIGNED) => Some(IntType::SChar),
+            TypeKind::Char => return "char".to_string(),
+            TypeKind::Short => Some(pick(IntType::Short)),
+            TypeKind::Int => Some(pick(IntType::Int)),
+            TypeKind::Long => Some(pick(IntType::Long)),
+            TypeKind::LongLong => Some(pick(IntType::LongLong)),
+            TypeKind::Int128 if unsigned => return "__int128 unsigned".to_string(),
+            TypeKind::Int128 => return "__int128".to_string(),
+            _ => None,
+        };
+        match int {
+            Some(t) => t.spelling().to_string(),
+            None => self.format_type(id, idents),
+        }
+    }
+
+    /// The type gcc names a bit-field of `bits` bits by in a diagnostic:
+    /// the narrowest standard integer type that holds it, of the field's
+    /// signedness, and the width -- `signed char:3`, `short unsigned int:10`.
+    pub fn gcc_bitfield_type_name(&self, bits: u32, unsigned: bool) -> String {
+        let target = self.target();
+        let narrowest = [IntType::SChar, IntType::Short, IntType::Int, IntType::Long]
+            .into_iter()
+            .find(|&t| target.int_width(t) >= bits)
+            .unwrap_or(IntType::LongLong);
+        let t = if unsigned {
+            narrowest.to_unsigned()
+        } else {
+            narrowest
+        };
+        format!("{}:{bits}", t.spelling())
+    }
+
     /// Format a pointer to `id` for display, whether or not the table holds
     /// that pointer type: `int (*)(int)` for a function `int (int)`.
     pub fn format_pointer_to(&self, id: TypeId) -> String {

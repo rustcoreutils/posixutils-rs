@@ -37,6 +37,7 @@ mod complex_specifiers;
 mod conditional_operands;
 mod constraint_sweep;
 mod constraints_core;
+mod conversion_overflow;
 mod declarations;
 mod declarators_and_shifts;
 mod default_pedwarns;

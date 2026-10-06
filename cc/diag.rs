@@ -409,6 +409,12 @@ pub fn set_warning_options(names: &[&str]) {
     WERROR.replace(Werror::from_warning_options(names.iter().copied()));
 }
 
+/// Is `-pedantic` (or `-pedantic-errors`) in effect? For a warning gcc gives
+/// in its own group only when pedantic, which [`pedwarn`] cannot express.
+pub fn pedantic() -> bool {
+    PEDANTIC.get().enabled
+}
+
 /// Is the warning group `name` still on? A diagnostic in a group goes
 /// through [`group_warning`], which asks this itself.
 pub fn warning_group_enabled(name: &str) -> bool {

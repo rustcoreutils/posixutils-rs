@@ -48,9 +48,10 @@ pub(crate) fn is_const_object_type(types: &TypeTable, typ: TypeId) -> bool {
     }
 }
 
-/// `-Wno-overflow` silences the warning for a floating constant that
-/// converts to an integer type outside its range, as it does in gcc.
-const OVERFLOW_WARNING: &str = "overflow";
+/// gcc's group for a constant that a conversion changes -- a floating one
+/// out of an integer type's range, an integer one its type cannot hold --
+/// and for signed arithmetic that overflows: `-Wno-overflow` silences them.
+pub(crate) const OVERFLOW_WARNING: &str = "overflow";
 
 /// The bytes a bit-field's own bits occupy, as `(byte offset from the field's
 /// own offset, the bits `value` puts there, the mask of the bits the field
@@ -396,7 +397,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         // integer 3. Deciding that here, from the type, keeps every expression
         // arm below from having to decide it again -- and differently.
         if self.types.is_integer(typ) || self.types.is_float(typ) {
-            if let Some(init) = self.fold_scalar_init(expr, typ) {
+            if let Some(init) = self.fold_scalar_init(expr, typ, None) {
                 return init;
             }
         }
@@ -967,11 +968,17 @@ impl<'a> super::linearize::Linearizer<'a> {
     }
 
     /// Fold a constant expression into an initializer for an *arithmetic*
-    /// object of type `typ`, converting as an assignment would.
+    /// object of type `typ` -- a bit-field of `bit_width` bits, when it
+    /// initializes one -- converting as an assignment would.
     ///
     /// Returns None when the expression is not a constant this compiler can
     /// fold, leaving the caller's own diagnostics to run.
-    fn fold_scalar_init(&mut self, expr: &Expr, typ: TypeId) -> Option<Initializer> {
+    fn fold_scalar_init(
+        &mut self,
+        expr: &Expr,
+        typ: TypeId,
+        bit_width: Option<u32>,
+    ) -> Option<Initializer> {
         if self.types.is_float(typ) {
             let wrap = |val| {
                 if self.types.kind(typ) == TypeKind::Float128 {
@@ -1002,12 +1009,13 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
         }
 
+        // Converted to the object's type, which the emitted data has to
+        // hold: `char z = 300;` is 44, not a `.byte 300` for the assembler
+        // to truncate.
         if let Some(val) = self.eval_const_init_expr(expr) {
-            return Some(Initializer::Int(if is_bool {
-                i128::from(val != 0)
-            } else {
-                val
-            }));
+            return Some(Initializer::Int(
+                self.convert_integer_constant(expr, val, typ, bit_width),
+            ));
         }
         // C17 6.3.1.4: converting a floating constant to an integer type
         // discards the fractional part; a complex one converts its real part.
@@ -1025,17 +1033,105 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// saturated value. An explicit cast says the program means it, and gcc
     /// is silent there.
     pub(crate) fn warn_saturated_conversion(&self, expr: &Expr, typ: TypeId) {
-        let from = expr
-            .typ
-            .map_or_else(String::new, |t| self.types.format_type(t, None));
-        crate::diag::group_warning(
-            OVERFLOW_WARNING,
-            self.expr_pos(expr),
-            &format!(
-                "overflow in conversion from '{from}' to '{}' changes value",
-                self.types.format_type(typ, None)
-            ),
-        );
+        let to = self.types.gcc_type_name(typ, Some(self.strings));
+        self.warn_changed_conversion(expr, "overflow in conversion", &to, None);
+    }
+
+    /// `value`, the value of the integer constant expression `expr`,
+    /// converted to the integer type `to` -- a bit-field of `bit_width` bits,
+    /// when it initializes or is assigned to one -- as an implicit conversion
+    /// converts it: modulo 2^N, which C17 6.3.1.3p3 leaves to the
+    /// implementation and gcc defines. `_Bool` asks whether it is zero
+    /// (6.3.1.2).
+    ///
+    /// The one place the conversion of an integer constant is decided, so
+    /// that what a static initializer emits and what gcc's `-Woverflow` says
+    /// about it cannot disagree. gcc warns when the value fits neither the
+    /// target type nor the other signedness of its width -- `char c = 300;`,
+    /// `unsigned char u = -129;` -- and is silent on `unsigned u = -1;` and
+    /// `signed char c = 200;`, unless `-pedantic` and the conversion narrows,
+    /// where it warns on the second as well.
+    pub(crate) fn convert_integer_constant(
+        &self,
+        expr: &Expr,
+        value: i128,
+        to: TypeId,
+        bit_width: Option<u32>,
+    ) -> i128 {
+        if self.types.kind(to) == TypeKind::Bool {
+            return i128::from(value != 0);
+        }
+        let full = self.types.size_bits(to);
+        let bits = bit_width.map_or(full, |w| w.min(full));
+        let unsigned = self.types.is_unsigned(to);
+        let converted = constexpr::reduce_to_width(value, bits, unsigned);
+        if converted == value {
+            return converted;
+        }
+        let Some(from) = expr.typ.filter(|&t| self.types.is_integer(t)) else {
+            return converted;
+        };
+        let fits_signed = constexpr::reduce_to_width(value, bits, false) == value;
+        let fits_unsigned = constexpr::reduce_to_width(value, bits, true) == value;
+        let prefix = if unsigned {
+            if fits_signed {
+                // A change of sign only, which is `-Wsign-conversion`'s.
+                return converted;
+            }
+            if self.types.is_unsigned(from) {
+                "conversion"
+            } else {
+                "unsigned conversion"
+            }
+        } else if !fits_unsigned || (crate::diag::pedantic() && self.types.size_bits(from) != bits)
+        {
+            "overflow in conversion"
+        } else {
+            return converted;
+        };
+        let to_name = if bits < full {
+            self.types.gcc_bitfield_type_name(bits, unsigned)
+        } else {
+            self.types.gcc_type_name(to, Some(self.strings))
+        };
+        let values = format!("'{value}' to '{converted}'");
+        self.warn_changed_conversion(expr, prefix, &to_name, Some(&values));
+        converted
+    }
+
+    /// gcc's `-Woverflow` warning for a constant `expr` that an implicit
+    /// conversion to the type named `to` changes, worded by `prefix`, and
+    /// naming the value before and after when `values` gives them.
+    fn warn_changed_conversion(&self, expr: &Expr, prefix: &str, to: &str, values: Option<&str>) {
+        let from = expr.typ.map_or_else(String::new, |t| {
+            self.types.gcc_type_name(t, Some(self.strings))
+        });
+        let mut msg = format!("{prefix} from '{from}' to '{to}' changes value");
+        if let Some(values) = values {
+            msg.push_str(" from ");
+            msg.push_str(values);
+        }
+        crate::diag::group_warning(OVERFLOW_WARNING, self.expr_pos(expr), &msg);
+    }
+
+    /// [`Self::convert_integer_constant`]'s warning for an implicit
+    /// conversion in code -- initialization, assignment, `return`, a
+    /// prototyped argument -- of an `expr` that is an integer constant
+    /// expression, where the conversion itself is an instruction.
+    pub(crate) fn warn_converted_integer_constant(
+        &self,
+        expr: &Expr,
+        to: TypeId,
+        bit_width: Option<u32>,
+    ) {
+        let t = self.types;
+        let integer = |typ: TypeId| t.is_integer(typ) && !t.is_complex(typ);
+        if !expr.typ.is_some_and(integer) || !integer(to) {
+            return;
+        }
+        if let Some(value) = constexpr::eval(self, ConstScope::Standard, expr) {
+            self.convert_integer_constant(expr, value, to, bit_width);
+        }
     }
 
     /// The position to report for `expr`.
@@ -2256,10 +2352,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                                 self.ast_init_list_to_ir(&sub_elements, visit.typ)
                             }
                             // A bit-field's value is placed bit by bit
-                            // below, in the struct's order.
-                            StructFieldVisitKind::Expr(expr) if visit.bit_width.is_some() => {
-                                self.ast_init_in_native_order(&expr, visit.typ)
-                            }
+                            // below, in the struct's order, converted to the
+                            // field's own width.
+                            StructFieldVisitKind::Expr(expr) if visit.bit_width.is_some() => self
+                                .fold_scalar_init(&expr, visit.typ, visit.bit_width)
+                                .unwrap_or_else(|| self.ast_init_in_native_order(&expr, visit.typ)),
                             StructFieldVisitKind::Expr(expr) => {
                                 self.ast_init_to_ir(&expr, visit.typ)
                             }

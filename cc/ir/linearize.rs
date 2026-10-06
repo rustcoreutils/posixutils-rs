@@ -4653,8 +4653,10 @@ impl<'a> Linearizer<'a> {
         sig: &CalleeSignature,
     ) -> (PseudoId, TypeId) {
         // A floating constant for an integer parameter folds, as every
-        // other implicit conversion of one does (`linearize_converted`).
+        // other implicit conversion of one does (`linearize_converted`), and
+        // an integer constant the conversion changes draws gcc's warning.
         if let Some(pt) = param {
+            self.warn_converted_integer_constant(a, pt, None);
             if let Some(folded) = self.implicit_float_to_integer_const(a, pt) {
                 return (folded, pt);
             }

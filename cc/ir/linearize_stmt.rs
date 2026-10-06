@@ -1033,7 +1033,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                                     // storage unit's: for `_Bool` that is the
                                     // conversion normalizing to 0/1 (6.3.1.2), so
                                     // `struct { _Bool f:1; } v = {2};` stores 1.
-                                    let member_val = self.linearize_converted(&expr, field_type);
+                                    let member_val = self.linearize_converted_into(
+                                        &expr,
+                                        field_type,
+                                        Some(bf.bit_width),
+                                    );
                                     self.emit_bitfield_store(base_sym, bf, member_val, field_type);
                                 } else {
                                     self.linearize_struct_field_init(

@@ -119,12 +119,20 @@ fn normalize(types: &TypeTable, typ: Option<TypeId>, value: i128) -> i128 {
     if types.kind(t) == TypeKind::Bool {
         return (value != 0) as i128;
     }
-    let bits = types.size_bits(t);
+    reduce_to_width(value, types.size_bits(t), types.is_unsigned(t))
+}
+
+/// `value` converted to the integer type of `bits` bits and the signedness
+/// `unsigned` says: modulo 2^bits, as C17 6.3.1.3p2 converts to an unsigned
+/// type and as gcc defines the conversion p3 leaves to the implementation.
+/// What [`normalize`] does for a type, for a width no type has -- a
+/// bit-field's.
+pub(crate) fn reduce_to_width(value: i128, bits: u32, unsigned: bool) -> i128 {
     if bits == 0 || bits >= 128 {
         return value;
     }
     let shift = 128 - bits;
-    if types.is_unsigned(t) {
+    if unsigned {
         (((value as u128) << shift) >> shift) as i128
     } else {
         (value << shift) >> shift

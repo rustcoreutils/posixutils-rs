@@ -608,6 +608,21 @@ pub const HOST_CC: &str = if cfg!(target_os = "macos") {
     "gcc"
 };
 
+/// Compile `src` with `extra` options to a host object in a scratch
+/// directory and return the run, its warnings included -- and the
+/// assembler's, which `-S` never reaches.
+pub fn compile_object_run(name: &str, src: &str, extra: &[&str]) -> C17Run {
+    let c = create_c_file(name, src);
+    let dir = plib::tmp::Builder::new()
+        .prefix(&format!("c17_object_{name}_"))
+        .tempdir()
+        .expect("tempdir");
+    let o = dir.path().join(format!("{name}.o"));
+    let mut args = extra.to_vec();
+    args.extend_from_slice(&["-c", "-o", o.to_str().unwrap(), c.path().to_str().unwrap()]);
+    run_c17(&args)
+}
+
 /// Compile `src` with c17 to a host object in `dir`, returning its path.
 pub fn c17_object(name: &str, src: &str, opt: &str, dir: &std::path::Path) -> String {
     c17_object_with(name, src, opt, &[], dir)

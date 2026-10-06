@@ -475,3 +475,29 @@ fn test_darwin_returns_small_integer_vectors_in_v0() {
         assert_eq!(types.is_float(call.typ.unwrap()), darwin, "{os:?} call");
     }
 }
+
+/// A call reaches the declaration it names, not whatever this unit defines
+/// under the same assembler name. glibc's fortified `open` calls
+/// `__open_alias`, labelled like the wrapper itself: that call is the
+/// library's, so the wrapper is not recursive; the program's own call to `w`
+/// is the wrapper's.
+#[test]
+fn call_through_a_labelled_alias_reaches_the_library() {
+    use crate::parse::ast::CalleeBinding;
+    let src = "extern int w(int, ...) __asm__(\"lib\");\n\
+               extern int w_alias(int, ...) __asm__(\"lib\");\n\
+               extern __inline __attribute__((always_inline, gnu_inline)) int\n\
+               w(int a, ...) { return w_alias(a, __builtin_va_arg_pack()); }\n\
+               int main(void) { return w(1, 2); }\n";
+    let module = linearize_source(src, &x86());
+    let label = crate::arch::lir::verbatim("lib");
+    let wrapper = func(&module, &label);
+    let in_main = calls(func(&module, "main"));
+    assert_eq!(in_main.len(), 1);
+    assert_eq!(in_main[0].extra().callee_binding, CalleeBinding::Declared);
+    assert_eq!(in_main[0].local_callee(), Some(label.as_str()));
+    let in_wrapper = calls(wrapper);
+    assert_eq!(in_wrapper.len(), 1);
+    assert_eq!(in_wrapper[0].extra().callee_binding, CalleeBinding::Library);
+    assert_eq!(in_wrapper[0].local_callee(), None);
+}

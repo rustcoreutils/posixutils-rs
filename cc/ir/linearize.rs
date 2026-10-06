@@ -4273,6 +4273,7 @@ impl<'a> Linearizer<'a> {
         known: Option<crate::parse::ast::LibFn>,
     ) -> PseudoId {
         let target = self.lower_callee(func_expr);
+        let binding = self.callee_binding(func_expr, binding);
 
         let sig = self.callee_signature(func_expr);
         let conv = sig.conv;
@@ -4411,6 +4412,33 @@ impl<'a> Linearizer<'a> {
             return self.vector_returned(result_sym, typ, expr_typ, conv);
         }
         result_sym
+    }
+
+    /// Which definition a direct call reaches, refining what the parser
+    /// decided.
+    ///
+    /// The IR names a callee by its assembler name, so a second declaration
+    /// labelled with the name of a function this unit defines would otherwise
+    /// call that definition. It does not: glibc's fortified `open` calls
+    /// `__open_alias`, `__REDIRECT`ed to `open` (or `open64`) -- the label of
+    /// the wrapper itself -- and means the library's function. Read as a call
+    /// to the wrapper, it made the wrapper recursive, which kept it from being
+    /// inlined anywhere. gcc binds the call to the declaration it names, so a
+    /// labelled identifier with no definition here is the external function.
+    fn callee_binding(
+        &self,
+        func_expr: &Expr,
+        binding: crate::parse::ast::CalleeBinding,
+    ) -> crate::parse::ast::CalleeBinding {
+        let ExprKind::Ident(symbol_id) = func_expr.kind else {
+            return binding;
+        };
+        let sym = self.symbols.get(symbol_id);
+        if sym.asm_label.is_some() && !self.defined_functions.contains(&sym.name) {
+            crate::parse::ast::CalleeBinding::Library
+        } else {
+            binding
+        }
     }
 
     /// What a call calls: the named function, or the function pointer the

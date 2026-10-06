@@ -185,3 +185,49 @@ int main(void) { return wrap("%d-%d", 42, 7) == 104 ? 0 : 1; }
     assert_eq!(compile_and_run("va_pack_alloca", code, &[]), 0);
     assert_eq!(compile_and_run_optimized("va_pack_alloca_opt", code), 0);
 }
+
+/// A forwarder whose body calls the library through a second declaration
+/// with the same assembler name: glibc's `open` in `bits/fcntl2.h` calls
+/// `__open_alias`, and `error` in `bits/error.h` calls `__error_alias`, each
+/// `__REDIRECT`ed to the very symbol the wrapper itself is labelled with.
+/// The alias is a different function -- the library's -- so the call is not
+/// recursion, and gcc inlines the wrapper.
+#[test]
+fn builtins_va_arg_pack_forwarder_calls_its_own_assembler_name() {
+    let code = r#"
+#define STR2(x) #x
+#define STR(x) STR2(x)
+#define ASMNAME(cname) __asm__(STR(__USER_LABEL_PREFIX__) cname)
+typedef __SIZE_TYPE__ size_t;
+
+extern int fmt(char *, size_t, const char *, ...) ASMNAME("snprintf");
+extern int fmt_alias(char *, size_t, const char *, ...) ASMNAME("snprintf");
+
+extern __inline __attribute__((__always_inline__, __gnu_inline__, __artificial__)) int
+fmt(char *d, size_t n, const char *f, ...)
+{
+    if (__builtin_va_arg_pack_len() > 2)
+        return -1;
+    return fmt_alias(d, n, f, __builtin_va_arg_pack());
+}
+
+int main(void)
+{
+    char b[32];
+    if (fmt(b, sizeof b, "%d-%s", 42, "x") != 4)
+        return 1;
+    if (b[0] != '4' || b[3] != 'x')
+        return 2;
+    if (fmt(b, sizeof b, "%d%d%d", 1, 2, 3) != -1)
+        return 3;
+    return 0;
+}
+"#;
+    for opt in ["-O0", "-O2"] {
+        assert_eq!(
+            compile_and_run("va_pack_own_asm_name", code, &[opt.to_string()]),
+            0,
+            "at {opt}"
+        );
+    }
+}

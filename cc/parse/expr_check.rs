@@ -148,14 +148,8 @@ impl Parser<'_> {
         callee: Option<StringId>,
         args: &[Expr],
     ) -> bool {
-        // A vector argument goes by value under gcc, in vector registers; the
-        // array model would pass its address. Checked for every argument,
-        // prototyped or not.
         let mut sound = true;
         for arg in args {
-            if self.check_not_vector_value(arg.typ, arg.pos) {
-                sound = false;
-            }
             // An argument is a value (C17 6.5.2.2p4), which a void
             // expression is not -- under a prototype or not.
             // `__builtin_va_arg_pack()` stands for the caller's arguments.
@@ -369,28 +363,6 @@ impl Parser<'_> {
             diag::error(pos, &gettext("void value not ignored as it ought to be"));
         }
         is_void
-    }
-
-    /// Refuse a `vector_size` value as a function's argument, parameter or
-    /// return value when the target's convention has no type that travels as
-    /// gcc passes it (`Abi::vector_carrier`): one whose size is no register
-    /// width, such as three `short` lanes. Every other vector goes as its
-    /// carrier.
-    pub(super) fn check_not_vector_value(&self, typ: Option<TypeId>, pos: Position) -> bool {
-        let Some(t) = typ.filter(|&t| self.types.is_vector(t)) else {
-            return false;
-        };
-        let target = self.types.target();
-        let unpassable = crate::abi::get_abi(&target)
-            .vector_carrier(t, self.types)
-            .is_none();
-        if unpassable {
-            diag::error(
-                pos,
-                &gettext("c17 does not pass or return this vector type on this target"),
-            );
-        }
-        unpassable
     }
 
     /// Check the operand of a unary operator against the type its operator

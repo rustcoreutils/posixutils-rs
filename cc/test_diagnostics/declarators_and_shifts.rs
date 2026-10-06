@@ -354,15 +354,80 @@ fn diagnostics_vector_size_is_bounded() {
         "'vector_size' attribute argument value '9223372036854775808' exceeds \
          9223372036854775807",
     );
-    compile_expect_error(
-        "vector_size_negative",
-        "typedef float V __attribute__((vector_size(-16)));\nint main(void){ return 0; }\n",
-        "positive byte count",
-    );
-    compile_expect_error(
-        "vector_size_not_multiple",
-        "typedef double V __attribute__((vector_size(12)));\nint main(void){ return 0; }\n",
-        "not a multiple",
+}
+
+/// A `vector_size` declaration gcc refuses is refused in gcc's words: a
+/// width that is zero, negative or no whole number of lanes, a lane count
+/// that is not a power of two, and a lane that is complex or `_Bool`. The
+/// lane count is what makes every vector a convention has to pass one of
+/// its register or memory widths.
+#[test]
+fn diagnostics_vector_size_shapes_gcc_refuses() {
+    for (name, decl, expected) in [
+        (
+            "zero",
+            "short V __attribute__((vector_size(0)))",
+            "zero vector size",
+        ),
+        (
+            "negative",
+            "float V __attribute__((vector_size(-16)))",
+            "'vector_size' attribute argument value '-16' is negative",
+        ),
+        (
+            "not_multiple",
+            "short V __attribute__((vector_size(5)))",
+            "vector size not an integral multiple of component size",
+        ),
+        (
+            "three_shorts",
+            "short V __attribute__((vector_size(6)))",
+            "number of vector components 3 not a power of two",
+        ),
+        (
+            "three_chars",
+            "char V __attribute__((vector_size(3)))",
+            "number of vector components 3 not a power of two",
+        ),
+        (
+            "three_doubles",
+            "double V __attribute__((vector_size(24)))",
+            "number of vector components 3 not a power of two",
+        ),
+        (
+            "many_ints",
+            "int V __attribute__((vector_size(1536)))",
+            "number of vector components 384 not a power of two",
+        ),
+        (
+            "complex",
+            "_Complex float V __attribute__((vector_size(16)))",
+            "invalid vector type for attribute 'vector_size'",
+        ),
+        (
+            "bool",
+            "_Bool V __attribute__((vector_size(4)))",
+            "invalid vector type for attribute 'vector_size'",
+        ),
+    ] {
+        for form in ["typedef {D};\n", "{D} obj;\n", "struct S { {D}; };\n"] {
+            compile_expect_error(
+                &format!("vector_size_{name}"),
+                &format!(
+                    "{}int main(void){{ return 0; }}\n",
+                    form.replace("{D}", decl)
+                ),
+                expected,
+            );
+        }
+    }
+    compile_expect_ok(
+        "vector_size_powers_of_two",
+        "typedef char V1 __attribute__((vector_size(1)));\n\
+         typedef short V2 __attribute__((vector_size(4)));\n\
+         typedef double V4 __attribute__((vector_size(32)));\n\
+         typedef int V64 __attribute__((vector_size(256)));\n\
+         _Static_assert(sizeof(V1) + sizeof(V2) + sizeof(V4) + sizeof(V64) == 293, \"\");\n",
     );
 }
 

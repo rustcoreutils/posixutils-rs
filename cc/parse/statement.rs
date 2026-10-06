@@ -320,9 +320,7 @@ impl Parser<'_> {
         }
 
         let expr = self.parse_expression()?;
-        if !self.check_not_vector_value(expr.typ, expr.pos) {
-            self.check_return(Some(&expr), pos);
-        }
+        self.check_return(Some(&expr), pos);
         self.expect_special(b';')?;
         Ok(Stmt::Return(Some(expr)))
     }

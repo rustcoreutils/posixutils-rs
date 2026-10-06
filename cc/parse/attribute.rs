@@ -153,10 +153,16 @@ impl IntArgRole {
                 pos,
                 &gettext("'vector_size' attribute argument is not an integer constant"),
             ),
-            (IntArgRole::VectorSize, _) => diag::error(
-                pos,
-                &gettext("'vector_size' requires a positive byte count"),
-            ),
+            (IntArgRole::VectorSize, IntArgFault::Zero) => {
+                diag::error(pos, &gettext("zero vector size"))
+            }
+            (IntArgRole::VectorSize, IntArgFault::OutOfRange(n) | IntArgFault::TooLarge(n)) => {
+                diag::error_args(
+                    pos,
+                    "'vector_size' attribute argument value '{0}' is negative",
+                    &[&n.to_string()],
+                )
+            }
             (IntArgRole::Priority, _) => diag::error_args(
                 pos,
                 "{0} priorities must be integers from 0 to 65535 inclusive",
@@ -661,7 +667,8 @@ impl Parser<'_> {
                 Some(IntArgFault::TooLarge(n))
             }
             (IntArgRole::VectorSize, None) => Some(IntArgFault::Count),
-            (IntArgRole::VectorSize, Some(n)) if n <= 0 => Some(IntArgFault::OutOfRange(n)),
+            (IntArgRole::VectorSize, Some(0)) => Some(IntArgFault::Zero),
+            (IntArgRole::VectorSize, Some(n)) if n < 0 => Some(IntArgFault::OutOfRange(n)),
             (IntArgRole::Priority, Some(n)) if !(0..=i128::from(u16::MAX)).contains(&n) => {
                 Some(IntArgFault::OutOfRange(n))
             }
@@ -998,8 +1005,16 @@ impl Parser<'_> {
             return typ;
         };
         let elem_size = self.types.size_bytes(typ);
-        if elem_size == 0 || !self.types.is_arithmetic(typ) {
-            diag::error(pos, "'vector_size' requires an arithmetic element type");
+        // A lane is a real number: no complex type, and no `_Bool`.
+        let t = &*self.types;
+        let lane = (t.is_integer(typ) || t.is_float(typ))
+            && !t.is_complex(typ)
+            && t.kind(typ) != TypeKind::Bool;
+        if elem_size == 0 || !lane {
+            diag::error(
+                pos,
+                &gettext("invalid vector type for attribute 'vector_size'"),
+            );
             return typ;
         }
         // The same ceiling `derive_array_type` applies, and for the same
@@ -1017,15 +1032,23 @@ impl Parser<'_> {
             return typ;
         }
         if bytes % elem_size as u64 != 0 {
-            let named = self.types.format_type(typ, Some(self.idents));
-            diag::error_args(
+            diag::error(
                 pos,
-                "'vector_size' of {0} is not a multiple of sizeof({1})",
-                &[&bytes.to_string(), &named],
+                &gettext("vector size not an integral multiple of component size"),
             );
             return typ;
         }
+        // gcc refuses any other lane count at the declaration, so every
+        // vector a convention has to pass is one of its widths.
         let count = bytes / elem_size as u64;
+        if !count.is_power_of_two() {
+            diag::error_args(
+                pos,
+                "number of vector components {0} not a power of two",
+                &[&count.to_string()],
+            );
+            return typ;
+        }
         // An `aligned(n)` written alongside has to be applied here rather
         // than left to the later attribute pass, since an explicit alignment
         // may not reduce one already recorded.

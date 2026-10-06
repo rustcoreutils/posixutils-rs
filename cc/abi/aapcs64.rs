@@ -526,12 +526,12 @@ impl Abi for Aapcs64Abi {
     /// - clang on Darwin coerces one to `i32` -- a general register, or four
     ///   bytes of the stack once those run out -- whatever its size, so the
     ///   two-byte `v1hf` travels as an `unsigned int` too.
-    fn vector_carrier(&self, vec: TypeId, types: &TypeTable) -> Option<TypeId> {
+    fn vector_carrier(&self, vec: TypeId, types: &TypeTable) -> TypeId {
         if !types.is_small_float_vector(vec) {
             return super::native_vector_carrier(vec, types);
         }
         if self.darwin {
-            Some(types.uint_id)
+            types.uint_id
         } else {
             types.vector_stack_carrier(vec)
         }
@@ -549,21 +549,21 @@ impl Abi for Aapcs64Abi {
     /// ([`Self::vector_return_widened`]). Floating lanes are not widened:
     /// LLVM legalizes `<2 x half>` by adding lanes, so `v2hf` is the low
     /// four bytes of D0, as a `float` carrying them is.
-    fn vector_return_carrier(&self, vec: TypeId, types: &TypeTable) -> Option<TypeId> {
+    fn vector_return_carrier(&self, vec: TypeId, types: &TypeTable) -> TypeId {
         if let Some(widened) = self.vector_return_widened(vec, types) {
             return self.vector_carrier(widened, types);
         }
         let bytes = types.size_bytes(vec);
         let small = types.vector_lanes(vec).is_some() && bytes <= 4;
         if self.darwin && small {
-            return Some(if types.is_small_float_vector(vec) && bytes == 2 {
+            return if types.is_small_float_vector(vec) && bytes == 2 {
                 types.float16_id
             } else {
                 types.float_id
-            });
+            };
         }
         if types.is_small_float_vector(vec) {
-            return types.unsigned_of_size(bytes);
+            return super::small_vector_bits(bytes, types);
         }
         self.vector_carrier(vec, types)
     }
@@ -577,10 +577,7 @@ impl Abi for Aapcs64Abi {
 
     fn classify_param(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
         if types.is_vector(ty) {
-            return match self.vector_carrier(ty, types) {
-                Some(carrier) => self.classify_param(carrier, types),
-                None => super::uncarried_vector_class(ty, types),
-            };
+            return self.classify_param(self.vector_carrier(ty, types), types);
         }
         if types.is_vector_stack_carrier(ty) {
             return ArgClass::Stacked {
@@ -703,10 +700,7 @@ impl Abi for Aapcs64Abi {
 
     fn classify_return(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
         if types.is_vector(ty) {
-            return match self.vector_return_carrier(ty, types) {
-                Some(carrier) => self.classify_return(carrier, types),
-                None => super::uncarried_vector_class(ty, types),
-            };
+            return self.classify_return(self.vector_return_carrier(ty, types), types);
         }
         let kind = types.kind(ty);
         let size_bits = types.size_bits(ty);

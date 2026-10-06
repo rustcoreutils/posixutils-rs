@@ -129,8 +129,7 @@ fn test_vector_masks_and_specifier_attributes() {
 /// A vector parameter is passed by value: it is no array, and C17
 /// 6.7.6.3p7's adjustment to a pointer does not reach it. A one-lane `float`
 /// vector passes on every target -- in memory on x86-64, on the stack on
-/// aarch64 -- and only a vector whose size is no register width, three
-/// `short` lanes, is the shape c17 cannot pass.
+/// aarch64 -- and so does a vector whose alignment a typedef raises.
 #[test]
 fn test_vector_parameters_are_not_adjusted() {
     let src = format!(
@@ -139,14 +138,47 @@ fn test_vector_parameters_are_not_adjusted() {
          v4si g(v4si a) {{ return a + 1; }}"
     );
     parse_tu_for(&src, &x86_linux()).unwrap();
-    let small = "typedef float v1sf __attribute__((vector_size(4))); v1sf h(v1sf a);";
-    let odd = "typedef short v3hi __attribute__((vector_size(6))); v3hi h(v3hi a);";
     for target in [x86_linux(), Target::new(Arch::Aarch64, Os::Linux)] {
+        for shape in [
+            "typedef float v1sf __attribute__((vector_size(4))); v1sf h(v1sf a);",
+            "typedef int v8si __attribute__((vector_size(32)));\
+             typedef v8si w8si __attribute__((aligned(64))); w8si h(w8si a);",
+        ] {
+            let before = crate::diag::error_count();
+            assert!(parse_tu_for(shape, &target).is_ok());
+            assert_eq!(crate::diag::error_count(), before, "{shape} on {target:?}");
+        }
+    }
+}
+
+/// gcc refuses a vector whose lane count is not a power of two where it is
+/// declared -- a typedef, an object, a member -- so no convention ever
+/// meets one. Each of `1`, `2`, `4` ... `64` lanes is still a vector.
+#[test]
+fn test_vector_lane_count_is_a_power_of_two() {
+    let refused = |decl: &str| {
         let before = crate::diag::error_count();
-        assert!(parse_tu_for(small, &target).is_ok());
-        assert_eq!(crate::diag::error_count(), before, "v1sf on {target:?}");
-        let rejected = parse_tu_for(odd, &target).is_err() || crate::diag::error_count() > before;
-        assert!(rejected, "a vector of three shorts on {target:?}");
+        parse_tu_for(decl, &x86_linux()).is_err() || crate::diag::error_count() > before
+    };
+    for decl in [
+        "typedef short v __attribute__((vector_size(6)));",
+        "char v __attribute__((vector_size(3)));",
+        "struct s { double m __attribute__((vector_size(24))); };",
+        "typedef int v __attribute__((vector_size(1536)));",
+        "typedef short v __attribute__((vector_size(0)));",
+        "typedef short v __attribute__((vector_size(5)));",
+        "typedef _Complex float v __attribute__((vector_size(16)));",
+        "typedef _Bool v __attribute__((vector_size(4)));",
+    ] {
+        assert!(refused(decl), "{decl}");
+    }
+    for lanes in [1, 2, 4, 8, 16, 32, 64] {
+        let decl = format!(
+            "typedef int v __attribute__((vector_size({})));\
+             _Static_assert(sizeof(v) / sizeof(int) == {lanes}, \"lanes\");",
+            lanes * 4
+        );
+        assert!(!refused(&decl), "{lanes} lanes");
     }
 }
 

@@ -2057,10 +2057,20 @@ impl TypeTable {
     }
 
     /// The alignment a vector of `id`'s size has when none is written.
+    ///
+    /// It also keys the vector's carriers, whatever a written `aligned` made
+    /// of the type: gcc passes a vector as its main variant, so a raised or
+    /// lowered alignment moves no argument -- a `typedef v8si w
+    /// __attribute__((aligned(64)))` starts where a `v8si` would, on a
+    /// 32-byte boundary.
     fn natural_vector_align(&self, id: TypeId) -> u32 {
-        self.size_bytes(id)
-            .next_power_of_two()
-            .min(self.vector_align_cap()) as u32
+        self.natural_vector_align_of_size(self.size_bytes(id))
+    }
+
+    /// The alignment a vector of `bytes` has when none is written: its
+    /// width rounded up to a power of two, capped by the target.
+    fn natural_vector_align_of_size(&self, bytes: usize) -> u32 {
+        bytes.next_power_of_two().min(self.vector_align_cap()) as u32
     }
 
     /// The most a vector aligns to when none is written; see
@@ -2089,20 +2099,30 @@ impl TypeTable {
     /// layout. An `aligned(n)` written alongside, `align`, takes precedence,
     /// which is what `<link.h>` does: `__vector_size__(32), __aligned__(16)`.
     pub fn vector_of(&mut self, elem: TypeId, count: usize, align: Option<u32>) -> TypeId {
-        let bytes = self.size_bytes(elem) * count;
-        let natural = bytes.next_power_of_two().min(self.vector_align_cap()) as u32;
-        let align = align.unwrap_or(natural);
-        if bytes > 16 {
-            self.intern_vector_memory_carrier(bytes, align);
-        }
-        let vector = self.intern(Type {
+        let natural = self.natural_vector_align_of_size(self.size_bytes(elem) * count);
+        let vector = |align| Type {
             kind: TypeKind::Array,
             base: Some(elem),
             extent: ArrayExtent::Known(count),
             modifiers: TypeModifiers::VECTOR,
             explicit_align: Some(align),
             ..Default::default()
-        });
+        };
+        let plain = self.intern(vector(natural));
+        self.intern_vector_carriers(plain, elem, count, natural);
+        match align {
+            Some(align) if align != natural => self.intern(vector(align)),
+            _ => plain,
+        }
+    }
+
+    /// Make the carriers of the vector `vector` -- `count` lanes of `elem`,
+    /// at its natural alignment `align` -- once.
+    fn intern_vector_carriers(&mut self, vector: TypeId, elem: TypeId, count: usize, align: u32) {
+        let bytes = self.size_bytes(vector);
+        if bytes > 16 {
+            self.intern_vector_memory_carrier(bytes, align);
+        }
         if count == 1 && self.is_float(elem) {
             self.intern_vector_wrapper_carrier(vector, elem, align);
         }
@@ -2118,7 +2138,6 @@ impl TypeTable {
             let widened = self.vector_of(lane, count, None);
             self.vector_widened.insert(count, widened);
         }
-        vector
     }
 
     /// The vector of `vec`'s lane count whose lanes are widened to fill
@@ -2176,11 +2195,12 @@ impl TypeTable {
     /// one floating lane: System V classes such a vector MEMORY, as it does
     /// a struct holding one, and no scalar C type travels that way.
     pub fn vector_wrapper_carrier(&self, vec: TypeId) -> Option<TypeId> {
-        let (elem, _) = self.vector_lanes(vec)?;
-        let align = self.get(vec).explicit_align?;
-        self.vector_wrapper_carriers
-            .get(&(self.float_lane_key(elem), align))
-            .copied()
+        let (elem, count) = self.vector_lanes(vec)?;
+        if count != 1 || !self.is_float(elem) {
+            return None;
+        }
+        let key = (self.float_lane_key(elem), self.natural_vector_align(vec));
+        Some(self.vector_wrapper_carriers[&key])
     }
 
     /// The floating kind and class of `elem`, as a stable key: one-lane
@@ -2246,11 +2266,8 @@ impl TypeTable {
     /// carrier is a type of its own, recognised by identity
     /// ([`Self::is_vector_stack_carrier`]). A struct the program declares
     /// holding such a vector is an ordinary composite.
-    pub fn vector_stack_carrier(&self, vec: TypeId) -> Option<TypeId> {
-        let align = self.get(vec).explicit_align?;
-        self.vector_stack_carriers
-            .get(&(self.size_bytes(vec), align))
-            .copied()
+    pub fn vector_stack_carrier(&self, vec: TypeId) -> TypeId {
+        self.vector_stack_carriers[&(self.size_bytes(vec), self.natural_vector_align(vec))]
     }
 
     /// Whether `id` is a carrier of [`Self::vector_stack_carrier`].
@@ -2270,11 +2287,8 @@ impl TypeTable {
     /// returned as: gcc's conventions treat such a vector exactly as an
     /// aggregate of its size and alignment -- MEMORY class on System V, by
     /// reference on AAPCS64 and Win64, returned through a hidden pointer.
-    pub fn vector_memory_carrier(&self, vec: TypeId) -> Option<TypeId> {
-        let align = self.get(vec).explicit_align?;
-        self.vector_memory_carriers
-            .get(&(self.size_bytes(vec), align))
-            .copied()
+    pub fn vector_memory_carrier(&self, vec: TypeId) -> TypeId {
+        self.vector_memory_carriers[&(self.size_bytes(vec), self.natural_vector_align(vec))]
     }
 
     /// The element type and the number of elements of a vector type, or

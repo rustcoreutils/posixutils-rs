@@ -44,13 +44,9 @@ enum Lanes {
 
 impl Linearizer<'_> {
     /// The type the convention `conv` passes and returns vectors of type
-    /// `vec` as (`Abi::vector_carrier`). The parser refuses a vector at a
-    /// call boundary that has none, so a missing one is the vector itself,
-    /// which every path below then refuses to take apart.
+    /// `vec` as (`Abi::vector_carrier`).
     pub(crate) fn vector_carrier(&self, vec: TypeId, conv: CallingConv) -> TypeId {
-        get_abi_for_conv(conv, self.target)
-            .vector_carrier(vec, self.types)
-            .unwrap_or(vec)
+        get_abi_for_conv(conv, self.target).vector_carrier(vec, self.types)
     }
 
     /// `typ`, or the carrier of `typ` if it is a vector: what a parameter or
@@ -70,9 +66,7 @@ impl Linearizer<'_> {
         if !self.types.is_vector(typ) {
             return typ;
         }
-        get_abi_for_conv(conv, self.target)
-            .vector_return_carrier(typ, self.types)
-            .unwrap_or(typ)
+        get_abi_for_conv(conv, self.target).vector_return_carrier(typ, self.types)
     }
 
     /// The vector `vec` is widened to, lane by lane, to be returned under

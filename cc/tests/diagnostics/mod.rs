@@ -1227,16 +1227,18 @@ int helper(int x) { return x + 1; }
 // What `-fpermissive` relaxes
 // ============================================================================
 
-/// A `vector_size` value passed to or returned from a function is refused
-/// only where the target's convention has no type that travels as gcc
-/// passes it: a vector of three lanes, which gcc refuses to declare at all.
-/// A one-lane `float` vector goes on both targets -- on the stack on
-/// aarch64, in memory on x86-64, as gcc passes it -- and every other vector
-/// goes as its carrier.
+/// Every vector a declaration admits is passed and returned: gcc refuses a
+/// lane count that is not a power of two where the type is declared, so
+/// each size left is a register width or an aggregate. A one-lane `float`
+/// vector goes on the stack on aarch64 and in memory on x86-64, as gcc
+/// passes it, and a vector whose alignment a typedef raises travels too --
+/// it had no carrier, and was refused.
 #[test]
-fn diagnostics_vector_passing_is_refused_only_without_a_carrier() {
+fn diagnostics_every_declared_vector_is_passed() {
     let prelude = "typedef float V1SF __attribute__((vector_size(4)));\n\
-                   typedef short V3HI __attribute__((vector_size(6)));\n\
+                   typedef int V8SI __attribute__((vector_size(32)));\n\
+                   typedef V8SI W8SI __attribute__((aligned(64)));\n\
+                   typedef V1SF W1SF __attribute__((aligned(16)));\n\
                    typedef int V2SI __attribute__((vector_size(8)));\n\
                    long f(); long l; int c;\n";
     let compile = |name: &str, body: &str, target: &str| {
@@ -1249,30 +1251,23 @@ fn diagnostics_vector_passing_is_refused_only_without_a_carrier() {
         ("parameter", "long t(V v) { return 0; }"),
         ("return", "V t(void) { V v = {1}; return v; }"),
     ] {
-        for target in ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"] {
-            let refused = compile(
-                &format!("vector_value_{name}_v3hi"),
-                &shape.replace('V', "V3HI"),
-                target,
-            );
-            assert!(!refused.success, "{name} of V3HI accepted on {target}");
-            assert!(
-                refused
-                    .stderr
-                    .contains("c17 does not pass or return this vector type on this target"),
-                "{}",
-                refused.stderr
-            );
-            let passed = compile(
-                &format!("vector_value_{name}_v1sf"),
-                &shape.replace('V', "V1SF"),
-                target,
-            );
-            assert!(
-                passed.success,
-                "{name} of V1SF on {target}: {}",
-                passed.stderr
-            );
+        for target in [
+            "aarch64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            "x86_64-unknown-linux-gnu",
+        ] {
+            for vector in ["V1SF", "W1SF", "W8SI"] {
+                let passed = compile(
+                    &format!("vector_value_{name}_{vector}"),
+                    &shape.replace('V', vector),
+                    target,
+                );
+                assert!(
+                    passed.success,
+                    "{name} of {vector} on {target}: {}",
+                    passed.stderr
+                );
+            }
         }
     }
     compile_expect_ok(

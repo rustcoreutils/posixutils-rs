@@ -444,6 +444,119 @@ fn vector_abi_small_float_interop_aarch64() {
     );
 }
 
+/// Vectors whose alignment is written -- raised by a typedef, raised or
+/// lowered beside `vector_size` -- travel as their natural shape does: gcc
+/// passes a vector as its main variant. A `typedef v8si w
+/// __attribute__((aligned(64)))` was refused at every call boundary, and a
+/// 64-byte-aligned `v8si` or a 16-byte-aligned `v1sf` started on its own
+/// boundary on the stack where gcc starts it on the natural one.
+const ALIGNED_DECLS: &str = r#"
+typedef int v8si __attribute__((vector_size(32)));
+typedef v8si w8si __attribute__((aligned(64)));
+typedef int l8si __attribute__((vector_size(32), aligned(16)));
+typedef int a8si __attribute__((vector_size(32), aligned(64)));
+typedef a8si t8si __attribute__((aligned(128)));
+typedef float v1sf __attribute__((vector_size(4)));
+typedef v1sf w1sf __attribute__((aligned(16)));
+typedef float a1sf __attribute__((vector_size(4), aligned(16)));
+typedef int a4si __attribute__((vector_size(16), aligned(64)));
+typedef short v2hi __attribute__((vector_size(4)));
+typedef v2hi w2hi __attribute__((aligned(16)));
+int f8(int a, v8si v, int b, v8si w);
+int w8(int a, w8si v, int b, w8si w);
+int l8(int a, l8si v, int b, l8si w);
+int a8(long x1, long x2, long x3, long x4, long x5, long x6, int a, a8si v, int b, a8si w);
+int t8(int a, t8si v, int b, t8si w);
+float w1(int a, w1sf v, double d, w1sf w, int b);
+float a1(int a, a1sf v, int b, a1sf w);
+int a4(int a, a4si v, int b, a4si w);
+int w2(int a, w2hi v, int b, w2hi w);
+a8si ra8(int k);
+w8si rw8(int k);
+w1sf rw1(float k);
+a4si ra4(int k);
+w2hi rw2(short k);
+"#;
+
+const ALIGNED_CALLEE: &str = r#"
+int f8(int a, v8si v, int b, v8si w) { return a + v[1] + b * 10 + w[2] * 100; }
+int w8(int a, w8si v, int b, w8si w) { return a + v[1] + b * 10 + w[2] * 100; }
+int l8(int a, l8si v, int b, l8si w) { return a + v[1] + b * 10 + w[2] * 100; }
+int a8(long x1, long x2, long x3, long x4, long x5, long x6, int a, a8si v, int b, a8si w) {
+    return a + v[1] + b * 10 + w[2] * 100 + (int)(x1 + x6);
+}
+int t8(int a, t8si v, int b, t8si w) { return a + v[1] + b * 10 + w[2] * 100; }
+float w1(int a, w1sf v, double d, w1sf w, int b) { return a + v[0] + d + w[0] * 10 + b * 100; }
+float a1(int a, a1sf v, int b, a1sf w) { return a + v[0] + b * 10 + w[0] * 100; }
+int a4(int a, a4si v, int b, a4si w) { return a + v[1] + b * 10 + w[2] * 100; }
+int w2(int a, w2hi v, int b, w2hi w) { return a + v[1] + b * 10 + w[0] * 100; }
+a8si ra8(int k) { a8si v = {k, 2, 3, 4, 5, 6, 7, k * 9}; return v; }
+w8si rw8(int k) { w8si v = {k, 2, 3, 4, 5, 6, 7, k * 3}; return v; }
+w1sf rw1(float k) { w1sf v = {k * 3}; return v; }
+a4si ra4(int k) { a4si v = {k, k + 1, k + 2, k * 9}; return v; }
+w2hi rw2(short k) { w2hi v = {k, (short)(k * 3)}; return v; }
+"#;
+
+const ALIGNED_CALLER: &str = r#"
+int main(void) {
+    v8si v = {1, 2, 3, 4}, w = {5, 6, 7, 8};
+    w8si wv = {1, 2, 3, 4}, ww = {5, 6, 7, 8};
+    l8si lv = {1, 2, 3, 4}, lw = {5, 6, 7, 8};
+    a8si av = {1, 2, 3, 4}, aw = {5, 6, 7, 8};
+    t8si tv = {1, 2, 3, 4}, tw = {5, 6, 7, 8};
+    w1sf sv = {1.5f}, sw = {2.5f};
+    a1sf xv = {1.5f}, xw = {2.5f};
+    a4si qv = {1, 2, 3, 4}, qw = {5, 6, 7, 8};
+    w2hi hv = {3, 4}, hw = {5, 6};
+    if (f8(1, v, 2, w) != 723) return 1;
+    if (w8(1, wv, 2, ww) != 723) return 2;
+    if (l8(1, lv, 2, lw) != 723) return 3;
+    if (a8(10, 0, 0, 0, 0, 20, 1, av, 2, aw) != 753) return 4;
+    if (t8(1, tv, 2, tw) != 723) return 5;
+    if (w1(1, sv, 0.5, sw, 3) != 328.0f) return 6;
+    if (a1(1, xv, 2, xw) != 272.5f) return 7;
+    if (a4(1, qv, 2, qw) != 723) return 8;
+    if (w2(1, hv, 2, hw) != 525) return 9;
+    a8si r8 = ra8(3);
+    if (r8[0] != 3 || r8[7] != 27) return 10;
+    w8si s8 = rw8(4);
+    if (s8[0] != 4 || s8[7] != 12) return 11;
+    if (rw1(1.5f)[0] != 4.5f) return 12;
+    a4si r4 = ra4(4);
+    if (r4[1] != 5 || r4[3] != 36) return 13;
+    w2hi r2 = rw2(7);
+    if (r2[0] != 7 || r2[1] != 21) return 14;
+    return 0;
+}
+"#;
+
+/// The written-alignment vectors (`ALIGNED_DECLS`) against the host gcc in
+/// every pairing. Linux only: these are gcc's rules, and clang's for the
+/// wide and one-lane shapes are its own.
+#[cfg(target_os = "linux")]
+#[test]
+fn vector_abi_aligned_interop_host() {
+    interop_host(
+        "vec_aligned",
+        &format!("{ALIGNED_DECLS}{ALIGNED_CALLEE}"),
+        &format!("{ALIGNED_DECLS}{ALIGNED_CALLER}"),
+    );
+}
+
+/// The written-alignment vectors against aarch64 gcc in every pairing,
+/// under qemu. Exit codes 1..=14 name the check in `ALIGNED_CALLER`.
+#[test]
+fn vector_abi_aligned_interop_aarch64() {
+    if !aarch64_cross_available() {
+        return;
+    }
+    interop_aarch64(
+        "vec_aligned",
+        &format!("{ALIGNED_DECLS}{ALIGNED_CALLEE}"),
+        &format!("{ALIGNED_DECLS}{ALIGNED_CALLER}"),
+    );
+}
+
 /// A floating vector of four bytes or fewer through `...` on aarch64 Linux.
 ///
 /// gcc contradicts itself here: its caller lays the vector on the stack and

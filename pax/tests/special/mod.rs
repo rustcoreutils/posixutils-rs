@@ -821,3 +821,74 @@ fn test_socket_member_is_diagnosed_on_extract() {
         "after\n"
     );
 }
+
+/// The root of macOS's sealed, read-only system volume, where creating a name
+/// fails with EROFS (below it, SIP answers EPERM first). `None` where a probe
+/// does not fail that way, so the tests below never write outside their
+/// temporary directory.
+#[cfg(target_os = "macos")]
+fn read_only_dir() -> Option<&'static std::path::Path> {
+    let dir = std::path::Path::new("/");
+    let probe = dir.join("pax-erofs-probe");
+    match fs::create_dir(&probe) {
+        Err(e) if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem => Some(dir),
+        Ok(()) => {
+            let _ = fs::remove_dir(&probe);
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+/// POSIX CONSEQUENCES OF ERRORS: a file that cannot be created is diagnosed,
+/// and processing continues. A read-only destination used to end the run at
+/// the first member, with a message naming none of them.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_read_only_destination_is_diagnosed_per_member_on_extract() {
+    let Some(root) = read_only_dir() else {
+        return;
+    };
+    let mut archive = CpioNewc {
+        name: b"pax-erofs-a",
+        body: b"a\n",
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &CpioNewc {
+            name: b"pax-erofs-b",
+            body: b"b\n",
+            ino: 2,
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, root);
+    assert_exit_code(&output, 1, "extract onto a read-only filesystem");
+    let stderr = stderr_str(&output);
+    assert!(stderr.contains("pax-erofs-a"), "stderr:\n{stderr}");
+    assert!(stderr.contains("pax-erofs-b"), "stderr:\n{stderr}");
+}
+
+/// The same in copy mode: every file is diagnosed, not just the first.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_read_only_destination_is_diagnosed_per_file_on_copy() {
+    let Some(dest) = read_only_dir() else {
+        return;
+    };
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("pax-erofs-a"), "a\n").unwrap();
+    fs::write(temp.path().join("pax-erofs-b"), "b\n").unwrap();
+
+    let output = run_pax_in_dir(
+        &["-rw", "pax-erofs-a", "pax-erofs-b", dest.to_str().unwrap()],
+        temp.path(),
+    );
+    assert_exit_code(&output, 1, "copy onto a read-only filesystem");
+    let stderr = stderr_str(&output);
+    assert!(stderr.contains("pax-erofs-a"), "stderr:\n{stderr}");
+    assert!(stderr.contains("pax-erofs-b"), "stderr:\n{stderr}");
+}

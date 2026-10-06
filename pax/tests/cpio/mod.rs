@@ -746,3 +746,58 @@ fn test_cpio_reads_only_its_own_archive_from_standard_input() {
     // Each reports the size of one archive, which is what writing it reported.
     assert_eq!(stderr_str(&out), format!("{written}{written}"));
 }
+
+/// Under -n the extract loop stopped once every pattern was used, before the
+/// last name of a newc link set -- the one that carries the data -- was read,
+/// so the name extracted was left empty.
+#[test]
+fn test_cpio_first_match_reads_on_to_the_newc_data() {
+    let archive = newc_pair(b"", b"hello world");
+    let temp = TempDir::new().unwrap();
+    let out = run_pax_with_stdin_bytes_in_dir(&["-r", "-n", "a"], &archive, temp.path());
+    assert_success(&out, "pax -r -n a");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("a")).unwrap(),
+        "hello world"
+    );
+    assert!(!temp.path().join("b").exists());
+}
+
+/// A link set whose first name is replaced by an unrelated member of the same
+/// name before its next name arrives: that next name is created empty, and
+/// must not count as having the set's data, or the data on the last name is
+/// skipped and every name is left linked to the empty file.
+#[test]
+fn test_cpio_newc_set_data_arrives_after_its_first_name_is_replaced() {
+    let link = |name, body| CpioNewc {
+        name,
+        body,
+        ino: 5,
+        nlink: 3,
+        ..Default::default()
+    };
+    let mut archive = link(b"a", b"").member();
+    archive.extend_from_slice(
+        &CpioNewc {
+            name: b"a",
+            body: b"OTHER",
+            ino: 9,
+            ..Default::default()
+        }
+        .member(),
+    );
+    archive.extend_from_slice(&link(b"b", b"").member());
+    archive.extend_from_slice(&link(b"c", b"DATA").archive());
+
+    let temp = TempDir::new().unwrap();
+    let out = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, temp.path());
+    assert_success(&out, "pax -r");
+    let read = |name| fs::read_to_string(temp.path().join(name)).unwrap();
+    assert_eq!(read("a"), "OTHER");
+    assert_eq!(read("b"), "DATA");
+    assert_eq!(read("c"), "DATA");
+    assert_eq!(
+        file_id(&temp.path().join("b")),
+        file_id(&temp.path().join("c"))
+    );
+}

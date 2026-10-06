@@ -31,23 +31,20 @@ pub use write::create_archive;
 /// blaming a file that did nothing wrong. Every I/O error the archive writer
 /// raises arrives as `ArchiveWrite` (see `write::ArchiveSink`), whatever its
 /// errno, and every failure to write -O's standard output as `StdoutWrite`.
-/// Read and copy mode write files instead; there a destination filesystem that
-/// is full, over quota or read-only is the shared failure. A failure to read a *source* file is
-/// per-file, and POSIX CONSEQUENCES OF ERRORS says to diagnose it and carry on.
 /// End of file on `/dev/tty` under -i ends the run by definition.
+///
+/// Nothing else does. A file read or copy mode cannot create or write -- even
+/// on a destination that is full, over quota or read-only -- is that member's
+/// failure, as is a failure to read a source file: POSIX CONSEQUENCES OF ERRORS
+/// says to diagnose it, naming the file, and carry on. Space freed or a
+/// smaller member may well succeed, and on another filesystem below the same
+/// tree the next member is unaffected.
 pub(crate) fn is_fatal(err: &crate::error::PaxError) -> bool {
     use crate::error::PaxError;
-    match err {
-        PaxError::ArchiveWrite(_) | PaxError::StdoutWrite(_) | PaxError::TtyEof => true,
-        PaxError::Io(e) => matches!(
-            e.kind(),
-            std::io::ErrorKind::BrokenPipe
-                | std::io::ErrorKind::StorageFull
-                | std::io::ErrorKind::QuotaExceeded
-                | std::io::ErrorKind::ReadOnlyFilesystem
-        ),
-        _ => false,
-    }
+    matches!(
+        err,
+        PaxError::ArchiveWrite(_) | PaxError::StdoutWrite(_) | PaxError::TtyEof
+    )
 }
 
 /// `-X`: whether the walk may go below a directory on device `dev`, given the
@@ -66,16 +63,26 @@ pub(crate) fn may_descend(one_file_system: bool, operand_dev: Option<u64>, dev: 
 mod tests {
     use super::{is_fatal, may_descend};
 
-    /// A destination filesystem that is full, over quota or read-only fails
-    /// every file after the first the same way.
+    /// Only a failure of the archive, of -O's standard output or of the
+    /// terminal ends the run. A file that cannot be created -- even on a
+    /// destination that is full, over quota or read-only -- is that member's
+    /// failure: POSIX CONSEQUENCES OF ERRORS says processing continues.
     #[test]
-    fn full_or_read_only_destination_is_fatal() {
-        for errno in [libc::ENOSPC, libc::EDQUOT, libc::EROFS, libc::EPIPE] {
-            let err = crate::error::PaxError::Io(std::io::Error::from_raw_os_error(errno));
-            assert!(is_fatal(&err), "errno {errno}");
+    fn only_archive_stdout_and_tty_failures_are_fatal() {
+        use crate::error::PaxError;
+        let io = |errno| std::io::Error::from_raw_os_error(errno);
+        for errno in [
+            libc::ENOSPC,
+            libc::EDQUOT,
+            libc::EROFS,
+            libc::EPIPE,
+            libc::EACCES,
+        ] {
+            assert!(!is_fatal(&PaxError::Io(io(errno))), "errno {errno}");
         }
-        let err = crate::error::PaxError::Io(std::io::Error::from_raw_os_error(libc::EACCES));
-        assert!(!is_fatal(&err));
+        assert!(is_fatal(&PaxError::ArchiveWrite(io(libc::EIO))));
+        assert!(is_fatal(&PaxError::StdoutWrite(io(libc::EPIPE))));
+        assert!(is_fatal(&PaxError::TtyEof));
     }
 
     #[test]

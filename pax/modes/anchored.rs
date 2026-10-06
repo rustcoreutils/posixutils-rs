@@ -1121,6 +1121,65 @@ pub(crate) fn set_link_attrs_at(
     Ok(owner_set)
 }
 
+/// Set the mode of a name below `dirfd` that cannot be opened for the purpose
+/// -- a FIFO, whose open blocks, or a device, whose open can act on the device
+/// -- never following a symbolic link: one found there is refused, and one
+/// swapped in after that check is not followed either.
+pub(crate) fn chmod_at(dirfd: BorrowedFd<'_>, name: &CStr, mode: u32) -> PaxResult<()> {
+    match stat_at(dirfd, name) {
+        None => return Err(std::io::Error::last_os_error().into()),
+        Some(st) if st.st_mode & libc::S_IFMT == libc::S_IFLNK => {
+            return Err(PaxError::InvalidHeader(
+                "refusing to set permissions through a symbolic link".to_string(),
+            ))
+        }
+        Some(_) => {}
+    }
+    chmod_nofollow(dirfd, name, mode as libc::mode_t).map_err(Into::into)
+}
+
+/// The race-free half of `chmod_at`: at worst, a symbolic link put at `name`
+/// since it was checked is refused or has its own mode set.
+///
+/// Linux's `fchmodat` refuses `AT_SYMLINK_NOFOLLOW` (until `fchmodat2`), and
+/// `fchmod` refuses an `O_PATH` descriptor. So the name is opened `O_PATH`,
+/// which opens nothing on the device or FIFO itself, without following a
+/// link; the descriptor is checked to be no link, and its `/proc/self/fd`
+/// entry, which resolves to the very file it holds, takes the chmod -- as in
+/// `set_attrs_search_only`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn chmod_nofollow(dirfd: BorrowedFd<'_>, name: &CStr, mode: libc::mode_t) -> std::io::Result<()> {
+    let flags = libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    match fstat(fd.as_fd()) {
+        None => return Err(std::io::Error::last_os_error()),
+        Some(st) if st.st_mode & libc::S_IFMT == libc::S_IFLNK => {
+            return Err(std::io::Error::from_raw_os_error(libc::ELOOP))
+        }
+        Some(_) => {}
+    }
+    let path = CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+        .expect("a formatted number has no NUL");
+    if AttrTarget::Path(&path).chmod(mode) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Elsewhere `fchmodat` takes `AT_SYMLINK_NOFOLLOW`.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn chmod_nofollow(dirfd: BorrowedFd<'_>, name: &CStr, mode: libc::mode_t) -> std::io::Result<()> {
+    let flags = libc::AT_SYMLINK_NOFOLLOW;
+    if unsafe { libc::fchmodat(dirfd.as_raw_fd(), name.as_ptr(), mode, flags) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `fstatat` with `AT_SYMLINK_NOFOLLOW`, for asking what a name *is* without
 /// following it anywhere.
 pub(crate) fn stat_at(dirfd: BorrowedFd<'_>, name: &CStr) -> Option<libc::stat> {
@@ -1157,6 +1216,32 @@ mod tests {
     fn ino_at(path: &Path) -> u64 {
         use std::os::unix::fs::MetadataExt;
         std::fs::symlink_metadata(path).unwrap().ino()
+    }
+
+    /// A symbolic link swapped in for a FIFO or device between the check and
+    /// the chmod must not carry the mode to the file it points at.
+    #[test]
+    fn test_chmod_nofollow_never_reaches_through_a_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = plib::tmp::TempDir::new().unwrap();
+        let target = tmp.path().join("target");
+        std::fs::write(&target, "").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::os::unix::fs::symlink(&target, tmp.path().join("link")).unwrap();
+        let dir = File::open(tmp.path()).unwrap();
+
+        // Refused (Linux) or applied to the link itself (macOS, the BSDs).
+        let _ = chmod_nofollow(dir.as_fd(), c"link", 0o600);
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o644);
+
+        // What it is for: a FIFO, which cannot be opened without blocking.
+        let fifo = tmp.path().join("fifo");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o644) }, 0);
+        chmod_nofollow(dir.as_fd(), c"fifo", 0o604).unwrap();
+        let mode = std::fs::metadata(&fifo).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o604);
     }
 
     #[test]

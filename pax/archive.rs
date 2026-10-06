@@ -482,6 +482,11 @@ impl<T> LinkSets<T> {
         Some(&mut set.value)
     }
 
+    /// What was remembered about every set started so far.
+    pub fn values(&self) -> impl Iterator<Item = &T> {
+        self.sets.values().map(|set| &set.value)
+    }
+
     /// Start a set at `entry`, its first name. Nothing happens for a member
     /// that is not one of several names of a file, or whose set has already
     /// started -- which `find_mut` turned away for its differing data.

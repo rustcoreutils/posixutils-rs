@@ -14,8 +14,8 @@ use crate::error::{PaxError, PaxResult};
 use crate::formats::OptionRecords;
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
-    create_replacing, link_replacing, make_dir_at, set_attrs_fd, set_owner, stat_at, unlink_at,
-    AttrPolicy, Attrs, DirTree, MemberPath, PendingDirs,
+    chmod_at, create_replacing, link_replacing, make_dir_at, set_attrs_fd, set_owner, stat_at,
+    unlink_at, AttrPolicy, Attrs, DirTree, MemberPath, PendingDirs,
 };
 use crate::modes::select::Selector;
 use crate::pattern::Pattern;
@@ -152,8 +152,8 @@ fn extract_members<R: ArchiveReader>(
             // Per POSIX CONSEQUENCES OF ERRORS: diagnose a per-file failure and
             // set a non-zero exit, but continue with the next member. Skip any
             // unconsumed data of the failed entry to realign the reader.
-            // A failure every later member would meet too -- a full disk, -O's
-            // output gone -- ends the run instead.
+            // A failure every later member would meet too -- -O's output
+            // gone, end of file on the terminal -- ends the run instead.
             let r = extract_entry(archive, &entry, options, &mut link_sets, tree, pending_dirs);
             report_unless_fatal(&entry, r)?;
         } else if let Some(set) = link_sets.find_mut(&entry) {
@@ -161,7 +161,9 @@ fn extract_members<R: ArchiveReader>(
             report_unless_fatal(&entry, r)?;
         }
         archive.skip_data()?;
-        if selector.is_done() {
+        // A newc set's data comes with its last name, which -n must still
+        // read even when every pattern has been used by an earlier one.
+        if selector.is_done() && link_sets.values().all(|set| set.has_data) {
             reached_end = false;
             break;
         }
@@ -621,10 +623,12 @@ fn join_link_set<R: ArchiveReader>(
     };
     let mut names = move_names_to(holders, dirfd, name)?;
     names.push(member.display.clone());
+    // Created empty when no earlier name survived to link to: the data is
+    // then still to come, on a later name.
     *set = CreatedSet {
         names,
         file,
-        has_data: true,
+        has_data: entry.size > 0,
     };
     Ok(())
 }
@@ -863,7 +867,11 @@ fn write_file_data<R: ArchiveReader>(
 
     // Through the descriptor the data was just written to, not by name.
     set_attrs_fd(file.as_fd(), &attrs_of(entry, options), &policy_of(options))?;
-    Ok(file_id(&file.metadata()?))
+    let id = file_id(&file.metadata()?);
+    // A filesystem that defers writes -- NFS, a quota checked late -- reports
+    // their failure here, and the member is then not extracted after all.
+    crate::blocked_io::close_file(file)?;
+    Ok(id)
 }
 
 /// Copy file data from archive to file
@@ -971,11 +979,8 @@ fn policy_of(options: &ReadOptions) -> AttrPolicy {
     }
 }
 
-/// Set file permissions on a name below `dirfd`.
-///
-/// `fchmodat` has no portable way to refuse a symbolic link -- Linux rejects
-/// `AT_SYMLINK_NOFOLLOW` outright -- so the type is checked first and a link is
-/// refused. Callers that hold a descriptor for the file should use
+/// Set file permissions on a name below `dirfd`, never through a symbolic
+/// link (`chmod_at`). Callers that hold a descriptor for the file should use
 /// `set_attrs_fd` instead, which cannot be redirected at all.
 fn set_permissions_at(
     dirfd: BorrowedFd<'_>,
@@ -984,24 +989,8 @@ fn set_permissions_at(
     options: &ReadOptions,
     owner_set: bool,
 ) -> PaxResult<()> {
-    let Some(st) = stat_at(dirfd, name) else {
-        return Err(std::io::Error::last_os_error().into());
-    };
-    if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
-        // Whatever this name was when it was created, it is a symbolic link
-        // now. Following it would apply the archived mode to the file it
-        // points at, anywhere on the system.
-        return Err(PaxError::InvalidHeader(
-            "refusing to set permissions through a symbolic link".to_string(),
-        ));
-    }
-
     let mode = policy_of(options).mode(&attrs_of(entry, options), owner_set);
-    let r = unsafe { libc::fchmodat(dirfd.as_raw_fd(), name.as_ptr(), mode as libc::mode_t, 0) };
-    if r != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
+    chmod_at(dirfd, name, mode)
 }
 
 /// Set file owner (uid/gid) - requires privileges. Returns whether it was set,

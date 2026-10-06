@@ -17,9 +17,9 @@ use crate::archive::HardLinkTracker;
 use crate::error::{PaxError, PaxResult};
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
-    create_replacing, file_id, link_replacing, link_replacing_with, make_dir_at, open_dir_at,
-    restore_atime, restore_dir_atime, set_attrs_fd, set_link_attrs_at, stat_at, AttrPolicy, Attrs,
-    DirTree, MemberPath, PendingDirs,
+    chmod_at, create_replacing, file_id, link_replacing, link_replacing_with, make_dir_at,
+    open_dir_at, restore_atime, restore_dir_atime, set_attrs_fd, set_link_attrs_at, stat_at,
+    AttrPolicy, Attrs, DirTree, MemberPath, PendingDirs,
 };
 use crate::modes::write::FileNames;
 use crate::pattern::{matches_any, Pattern};
@@ -757,7 +757,10 @@ fn do_copy_file(
         restore_atime(src_file.as_fd(), entry.path().as_inner(), metadata);
     }
 
-    set_attrs_fd(dest_file.as_fd(), &attrs_of(metadata), &policy_of(options))
+    set_attrs_fd(dest_file.as_fd(), &attrs_of(metadata), &policy_of(options))?;
+    // A filesystem that defers writes reports their failure on close.
+    crate::blocked_io::close_file(dest_file)?;
+    Ok(())
 }
 
 /// The largest buffer `copy_contents` reads through.
@@ -891,30 +894,10 @@ fn set_node_attrs_at(
     let attrs = attrs_of(metadata);
     let policy = policy_of(options);
 
-    // Owner and times take AT_SYMLINK_NOFOLLOW; the mode check is in
-    // set_permissions_at, which refuses a name that is a symbolic link.
+    // Owner and times take AT_SYMLINK_NOFOLLOW, and chmod_at never follows
+    // a symbolic link either.
     let owner_set = set_link_attrs_at(dirfd, name, &attrs, &policy)?;
-
-    let Some(st) = stat_at(dirfd, name) else {
-        return Err(std::io::Error::last_os_error().into());
-    };
-    if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
-        return Err(PaxError::InvalidHeader(
-            "refusing to set permissions through a symbolic link".to_string(),
-        ));
-    }
-    let r = unsafe {
-        libc::fchmodat(
-            dirfd.as_raw_fd(),
-            name.as_ptr(),
-            policy.mode(&attrs, owner_set) as libc::mode_t,
-            0,
-        )
-    };
-    if r != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
+    chmod_at(dirfd, name, policy.mode(&attrs, owner_set))
 }
 
 #[cfg(test)]

@@ -1124,3 +1124,94 @@ fn test_copy_directory_replaces_existing_file() {
     assert_success(&out, "pax -rw over a file");
     assert_eq!(fs::read_to_string(dst.join("d/f")).unwrap(), "F\n");
 }
+
+/// A directory that maps onto itself is not copied, but -s can still send
+/// its contents elsewhere, each under its own name, as a round trip through
+/// an archive does. The whole subtree used to be skipped.
+#[test]
+fn test_copy_directory_onto_itself_still_copies_renamed_children() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("src/sub")).unwrap();
+    fs::write(temp.path().join("src/x"), "X\n").unwrap();
+    fs::write(temp.path().join("src/sub/y"), "Y\n").unwrap();
+
+    let out = run_pax_in_dir(&["-rw", "-s", ",^src/,dst/,", "src", "."], temp.path());
+    assert_success(&out, "pax -rw -s with the directory mapped onto itself");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("dst/x")).unwrap(),
+        "X\n"
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("dst/sub/y")).unwrap(),
+        "Y\n"
+    );
+}
+
+/// Without -s or -i everything below a directory that maps onto itself maps
+/// onto itself too: one diagnostic says so, not one per file.
+#[test]
+fn test_copy_directory_onto_itself_is_diagnosed_once() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("src/sub")).unwrap();
+    fs::write(temp.path().join("src/x"), "X\n").unwrap();
+    fs::write(temp.path().join("src/sub/y"), "Y\n").unwrap();
+
+    let out = run_pax_in_dir(&["-rw", "src", "."], temp.path());
+    assert_failure(&out, "pax -rw src .");
+    let err = stderr_str(&out);
+    assert_eq!(err.matches("itself").count(), 1, "{err}");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("src/x")).unwrap(),
+        "X\n"
+    );
+}
+
+/// Under -H or -L the walk follows a symbolic link operand, but the link
+/// itself is still the source: copying it into its own directory names it as
+/// its own destination. It used to be unlinked and replaced -- by an empty
+/// directory, or under -l by nothing at all.
+#[test]
+fn test_copy_followed_link_onto_itself_keeps_the_link() {
+    let temp = TempDir::new().unwrap();
+    let sub = temp.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("file"), "payload\n").unwrap();
+    fs::write(temp.path().join("f"), "F\n").unwrap();
+    std::os::unix::fs::symlink("sub", temp.path().join("ld")).unwrap();
+    std::os::unix::fs::symlink("f", temp.path().join("lf")).unwrap();
+
+    let runs: [(&str, &[&str]); 8] = [
+        ("pax", &["-rw", "-H", "ld", "."]),
+        ("pax", &["-rw", "-L", "ld", "."]),
+        ("pax", &["-rw", "-H", "lf", "."]),
+        ("pax", &["-rw", "-L", "lf", "."]),
+        ("pax", &["-rw", "-l", "-H", "lf", "."]),
+        ("pax", &["-rw", "-l", "-L", "lf", "."]),
+        ("cpio", &["-pL", "."]),
+        ("cpio", &["-plL", "."]),
+    ];
+    for (tool, args) in runs {
+        let out = if tool == "cpio" {
+            run_cpio(args, temp.path(), b"ld\nlf\n")
+        } else {
+            run_pax_in_dir(args, temp.path())
+        };
+        let ctx = format!("{tool} {args:?}");
+        assert!(
+            stderr_str(&out).contains("itself"),
+            "{ctx}: {}",
+            stderr_str(&out)
+        );
+        for (link, target) in [("ld", "sub"), ("lf", "f")] {
+            let meta = fs::symlink_metadata(temp.path().join(link)).unwrap();
+            assert!(meta.is_symlink(), "{ctx}: {link} was replaced");
+            assert_eq!(
+                fs::read_link(temp.path().join(link)).unwrap(),
+                std::path::Path::new(target),
+                "{ctx}"
+            );
+        }
+        assert_eq!(fs::read_to_string(sub.join("file")).unwrap(), "payload\n");
+        assert_eq!(fs::read_to_string(temp.path().join("f")).unwrap(), "F\n");
+    }
+}

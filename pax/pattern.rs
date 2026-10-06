@@ -483,15 +483,6 @@ pub fn matches_excluded(patterns: &[Pattern], path: &[u8]) -> bool {
     })
 }
 
-/// Check if any pattern matches the given path. No patterns means match all.
-pub fn matches_any(patterns: &[Pattern], path: &[u8]) -> bool {
-    if patterns.is_empty() {
-        return true;
-    }
-    let name = Name::new(path);
-    patterns.iter().any(|p| p.matches_name(&name))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,8 +510,7 @@ mod tests {
         // A directory member arrives with a trailing slash and still matches.
         assert!(matches_excluded(&pats, b"src/build/"));
 
-        // An empty list excludes nothing -- the opposite of matches_any, where
-        // no patterns means "everything".
+        // An empty list excludes nothing.
         assert!(!matches_excluded(&[], b"anything"));
     }
 

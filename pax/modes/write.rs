@@ -696,15 +696,10 @@ fn write_file<W: ArchiveWriter>(
     // and re-checked against the (dev, ino) the walk saw. What this replaced
     // resolved the whole pathname again -- twice over, for the cpio "crc"
     // format, which needs the contents summed before the header goes out.
-    //
-    // Whether the walk dereferenced this entry is directly observable: the
-    // name is a symbolic link but the metadata is not, so -H/-L policy stays
-    // in the traversal options and is not decided a second time here.
-    let followed = entry_ref.is_symlink() == Some(true) && !metadata.is_symlink();
     let mut file = crate::modes::anchored::open_source_file(
         entry_ref.dir_fd(),
         entry_ref.file_name(),
-        followed,
+        crate::modes::followed_link(entry_ref, metadata),
         (metadata.dev(), metadata.ino()),
     )?;
 

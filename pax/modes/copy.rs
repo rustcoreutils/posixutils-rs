@@ -21,8 +21,8 @@ use crate::modes::anchored::{
     open_dir_at, restore_atime, restore_dir_atime, set_attrs_fd, set_link_attrs_at, stat_at,
     AttrPolicy, Attrs, DirTree, MemberPath, PendingDirs,
 };
+use crate::modes::followed_link;
 use crate::modes::write::FileNames;
-use crate::pattern::{matches_any, Pattern};
 use crate::subst::{substitute_name, Substitution};
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -37,10 +37,6 @@ use std::path::{Path, PathBuf};
 /// Options for copy mode
 #[derive(Default)]
 pub struct CopyOptions {
-    /// Patterns to match (empty means match all)
-    pub patterns: Vec<Pattern>,
-    /// Match all except patterns
-    pub exclude: bool,
     /// Don't overwrite existing files
     pub no_clobber: bool,
     /// Verbose output
@@ -193,9 +189,9 @@ struct CopyWalk<'a> {
     /// applied any sooner refuses the rest of its contents.
     pending_dirs: RefCell<PendingDirs>,
     /// Member names, built by joining as the walk descends rather than derived
-    /// from the filesystem path, so selection and substitution see the name an
-    /// archive would record. These are the names *before* -s and -i: a copy is
-    /// an archive round trip, so each name is substituted once, by itself --
+    /// from the filesystem path, so substitution sees the name an archive
+    /// would record. These are the names *before* -s and -i: a copy is an
+    /// archive round trip, so each name is substituted once, by itself --
     /// building a child's name from its parent's substituted one applied the
     /// substitution again at every level.
     member_stack: RefCell<Vec<PathBuf>>,
@@ -266,15 +262,6 @@ impl CopyWalk<'_> {
             return Ok(false);
         }
 
-        // Selection and substitution both act on the member name, so they
-        // reach every file in the subtree rather than only the operands.
-        if !self.options.patterns.is_empty() {
-            let matches = matches_any(&self.options.patterns, crate::rawpath::as_bytes(&member));
-            if self.options.exclude == matches {
-                return Ok(false);
-            }
-        }
-
         // A source directory that *is* one of this copy's destinations is one
         // being copied into. Following it walks the copy's own output back
         // into itself until the pathname runs out of room; identity cannot be
@@ -326,7 +313,7 @@ impl CopyWalk<'_> {
         };
 
         if metadata.is_dir() {
-            return self.enter_directory(src, member, &dest, metadata);
+            return self.enter_directory(entry, member, &dest, metadata);
         }
 
         let Some(mp) = MemberPath::parse(&dest)? else {
@@ -349,7 +336,7 @@ impl CopyWalk<'_> {
         }
         // The destination name already *is* the source (`pax -rw tree .`):
         // replacing it would rewrite the file from itself and split its links.
-        if existing.is_some_and(|st| is_same_file(&st, metadata)) && !self.options.link {
+        if existing.is_some_and(|st| is_source(&st, entry, metadata)) && !self.options.link {
             return overwrites_itself(src);
         }
 
@@ -397,11 +384,13 @@ impl CopyWalk<'_> {
     /// are still copied, each subject to the same test.
     fn enter_directory(
         &self,
-        src: &Path,
+        entry: &ftw::Entry<'_>,
         member: PathBuf,
         dest: &Path,
         metadata: &ftw::Metadata,
     ) -> PaxResult<bool> {
+        let src_path = entry.path();
+        let src = src_path.as_inner();
         // `.` as an operand, or a -s result naming it (or nothing below the
         // destination at all), has no directory of its own to stamp. Its
         // children are still copied, each under its own name, as they would
@@ -412,8 +401,8 @@ impl CopyWalk<'_> {
         };
         let parent = self.tree.parent_of(&mp, true)?;
         let existing = stat_at(parent.as_fd(), &mp.leaf);
-        if existing.is_some_and(|st| is_same_file(&st, metadata)) {
-            return overwrites_itself(src);
+        if existing.is_some_and(|st| is_source(&st, entry, metadata)) {
+            return self.dir_onto_itself(src, member, metadata);
         }
         let keep = existing.is_some_and(|st| self.keeps_existing_dir(metadata, &st));
         // Created no more open than its source, and reopened with
@@ -439,6 +428,25 @@ impl CopyWalk<'_> {
                 .borrow_mut()
                 .push(&mp, &st, attrs_of(metadata));
         }
+        self.descend(member, metadata)
+    }
+
+    /// A directory whose destination is the directory itself (`pax -rw tree
+    /// .`) is neither created nor stamped. Without -s or -i everything below
+    /// it maps onto itself too, and one diagnostic covers the lot. With them
+    /// its contents may be renamed elsewhere, and are each copied under their
+    /// own name, as they would be extracted from an archive; any that still
+    /// map onto themselves are diagnosed one by one.
+    fn dir_onto_itself(
+        &self,
+        src: &Path,
+        member: PathBuf,
+        metadata: &ftw::Metadata,
+    ) -> PaxResult<bool> {
+        if self.options.substitutions.is_empty() && !self.options.interactive {
+            return overwrites_itself(src);
+        }
+        self.print_verbose(src);
         self.descend(member, metadata)
     }
 
@@ -517,9 +525,20 @@ fn member_name(src: &Path) -> PathBuf {
     out
 }
 
-/// Whether the destination `st` is the very file being copied.
-fn is_same_file(st: &libc::stat, metadata: &ftw::Metadata) -> bool {
-    file_id(st) == (metadata.dev(), metadata.ino())
+/// Whether the destination `st` is the very file being copied -- or, when
+/// -H or -L followed a symbolic link to reach it, that link: it is just as
+/// much the source, and replacing it destroys it (`pax -rw -H link .`).
+fn is_source(st: &libc::stat, entry: &ftw::Entry<'_>, metadata: &ftw::Metadata) -> bool {
+    let id = file_id(st);
+    if id == (metadata.dev(), metadata.ino()) {
+        return true;
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFLNK || !followed_link(entry, metadata) {
+        return false;
+    }
+    // SAFETY: the walk keeps the entry's directory open while it is visited.
+    let dir = unsafe { BorrowedFd::borrow_raw(entry.dir_fd()) };
+    stat_at(dir, entry.file_name()).is_some_and(|link| file_id(&link) == id)
 }
 
 /// Diagnose copying a file to its own name, as BSD pax words it, and skip it.
@@ -641,11 +660,10 @@ fn copy_file(
         // `pax -rwl tree .` names every file as its own destination. Under
         // -H/-L the walk followed a symbolic link here, and the link made is
         // to the file it refers to, as POSIX requires of -l.
-        let followed = entry.is_symlink() == Some(true) && !metadata.is_symlink();
         let linked = link_replacing_with(
             entry.dir_fd(),
             entry.file_name(),
-            followed,
+            followed_link(entry, metadata),
             dirfd,
             name,
             options.no_clobber,
@@ -716,11 +734,10 @@ fn do_copy_file(
     // against the (dev, ino) the walk saw, rather than re-resolving the whole
     // source path. Whether the walk dereferenced this entry is observable from
     // the entry itself, so -H/-L stays decided in the traversal options.
-    let followed = entry.is_symlink() == Some(true) && !metadata.is_symlink();
     let mut src_file = crate::modes::anchored::open_source_file(
         entry.dir_fd(),
         entry.file_name(),
-        followed,
+        followed_link(entry, metadata),
         (metadata.dev(), metadata.ino()),
     )?;
 

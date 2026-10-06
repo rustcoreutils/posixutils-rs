@@ -681,7 +681,8 @@ where
 /// is changed and `true` is returned; the caller decides whether that merits a
 /// diagnostic. Identity is (dev, ino) of both names, the source resolved the
 /// way `linkat` resolves it: the name itself, or with `follow` the file a
-/// symbolic link refers to -- which may be the very file at `name`.
+/// symbolic link refers to -- which may be the very file at `name` -- and the
+/// link too, which is just as much the source (`pax -rwl -H link .`).
 pub(crate) fn link_replacing(
     from_dir: libc::c_int,
     from_name: &CStr,
@@ -730,10 +731,17 @@ pub(crate) fn link_replacing_with(
     if no_clobber {
         return Ok(false);
     }
-    let src_flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
-    let src = fstatat(from_dir, from_name, src_flags);
-    if let (Some(src), Some(dst)) = (src, stat_at(dirfd, name)) {
-        if (src.st_dev, src.st_ino) == (dst.st_dev, dst.st_ino) {
+    if let Some(dst) = stat_at(dirfd, name) {
+        let src_flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+        let resolved = fstatat(from_dir, from_name, src_flags);
+        let link = follow
+            .then(|| fstatat(from_dir, from_name, libc::AT_SYMLINK_NOFOLLOW))
+            .flatten();
+        if [resolved, link]
+            .iter()
+            .flatten()
+            .any(|src| file_id(src) == file_id(&dst))
+        {
             return Ok(true);
         }
     }

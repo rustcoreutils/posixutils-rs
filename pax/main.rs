@@ -732,12 +732,9 @@ fn run_copy(args: &Args, name_lists: Vec<NameList>) -> PaxResult<()> {
     let dest_dir = PathBuf::from(dest);
 
     // Copy mode has no pattern operands: every operand is a source pathname.
-    let patterns = compile_patterns(&[]);
     let substitutions = parse_substitutions(args)?;
 
     let options = CopyOptions {
-        patterns,
-        exclude: false,
         no_clobber: args.no_clobber,
         verbose: args.verbose,
         preserve_perms: should_preserve_perms(&args.privs),

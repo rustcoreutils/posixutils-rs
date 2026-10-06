@@ -59,6 +59,13 @@ pub(crate) fn may_descend(one_file_system: bool, operand_dev: Option<u64>, dev: 
     !one_file_system || operand_dev.is_none_or(|operand| operand == dev)
 }
 
+/// Whether the walk reached `entry` by following a symbolic link (-H, -L):
+/// the name is a link but the metadata is not, so the -H/-L policy stays in
+/// the traversal options and is not decided a second time.
+pub(crate) fn followed_link(entry: &ftw::Entry<'_>, metadata: &ftw::Metadata) -> bool {
+    entry.is_symlink() == Some(true) && !metadata.is_symlink()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{is_fatal, may_descend};

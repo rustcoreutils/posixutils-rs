@@ -52,6 +52,7 @@ struct Options {
     shared: bool,
     no_unwind_tables: bool,
     verbose_asm: bool,
+    cf_protection: target::CfProtection,
     math_errno: bool,
     trapping_math: bool,
     defines: Vec<String>,
@@ -132,6 +133,8 @@ fn apply_flags(flags: &[&str]) -> Options {
                     o.undefines.push(u.to_string());
                 } else if let Some(i) = flag.strip_prefix("-I") {
                     o.include_paths.push(i.to_string());
+                } else if let Some(level) = flag.strip_prefix("-fcf-protection=") {
+                    o.cf_protection = target::CfProtection::from_level(level).unwrap();
                 } else if let Some(t) = flag.strip_prefix("--target=") {
                     o.target = Some(t.to_string());
                 } else if flag.starts_with("-m") && flag.len() > 2 {
@@ -216,6 +219,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         pic: position.pic,
         unwind_tables: !o.no_unwind_tables,
         verbose_asm: o.verbose_asm,
+        cf_protection: o.cf_protection,
         source_name: &source_name,
         debug_prefix_map: &prefix_maps.debug,
     };

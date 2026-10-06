@@ -321,3 +321,113 @@ int main(void)
 "#,
     );
 }
+
+/// The setjmp's buffer is read by whichever compiler built the longjmp, so
+/// both must agree on its layout -- and gcc's depends on
+/// `-fcf-protection`. With return protection (`full`, `return`) it is
+/// frame pointer, resume address, shadow-stack pointer, stack pointer, and
+/// the longjmp unwinds the shadow stack; otherwise the shadow-stack word is
+/// not there and the stack pointer is the third word. Each side here is built
+/// with the same flag, in every pairing of c17 and gcc, at -O0 and -O2: a
+/// gcc longjmp reading c17's stack pointer as a shadow-stack pointer runs
+/// `incsspq` and dies of SIGILL, and a c17 longjmp reading gcc's
+/// shadow-stack word as the stack pointer jumps with a null stack.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn misc_builtin_setjmp_interop_under_cf_protection() {
+    let jumper = r#"
+void *buf[5];
+__attribute__((noinline)) void jump(int depth)
+{
+    if (depth > 0)
+        jump(depth - 1);
+    __builtin_longjmp(buf, 1);
+}
+"#;
+    let receiver = r#"
+extern void *buf[5];
+extern void jump(int);
+__attribute__((noinline)) static int recv(int x)
+{
+    volatile int seen = x;
+    if (__builtin_setjmp(buf))
+        return seen + 1;
+    jump(3);
+    return -1;
+}
+int main(void)
+{
+    return recv(41) == 42 ? 0 : 1;
+}
+"#;
+    for flag in ["-fcf-protection=none", "-fcf-protection=full"] {
+        crate::common::interop_host_with("builtin_setjmp_cet", jumper, receiver, &[flag]);
+    }
+}
+
+/// The same pairings under `-fcf-protection=full` with the shadow stack
+/// really on, where the CPU and kernel have it: `main` turns it on itself
+/// (`arch_prctl(ARCH_SHSTK_ENABLE)`), so every return after that is checked
+/// against it, and it never returns from a frame entered before. The
+/// longjmp is 601 frames deep, so it unwinds the shadow stack through
+/// `incsspq`'s 255-entry loop as well as its remainder; a longjmp that left
+/// the shadow stack where it was faults at the receiver's own `ret`.
+/// Without shadow-stack support the program runs with it off, which is the
+/// test above.
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn misc_builtin_setjmp_interop_with_the_shadow_stack_on() {
+    let jumper = r#"
+void *buf[5];
+__attribute__((noinline)) void jump(int depth)
+{
+    if (depth > 0)
+        jump(depth - 1);
+    __builtin_longjmp(buf, 1);
+}
+"#;
+    let receiver = r#"
+extern void *buf[5];
+extern void jump(int);
+static inline __attribute__((always_inline)) long syscall2(long n, long a, long b)
+{
+    long r;
+    __asm__ volatile("syscall" : "=a"(r) : "a"(n), "D"(a), "S"(b) : "rcx", "r11", "memory");
+    return r;
+}
+__attribute__((noinline)) int recv(int x)
+{
+    volatile int seen = x;
+    if (__builtin_setjmp(buf))
+        return seen + 1;
+    jump(600);
+    return -1;
+}
+__attribute__((noinline)) int deeper(int n)
+{
+    if (n > 0)
+        return deeper(n - 1) + 0;
+    return recv(41);
+}
+int main(void)
+{
+    /* arch_prctl(ARCH_SHSTK_ENABLE, ARCH_SHSTK_SHSTK) */
+    long on = syscall2(158, 0x5001, 1) == 0;
+    /* A receiver deep in the stack, and calls and returns after it. */
+    int r = deeper(300);
+    r += deeper(2);
+    if (!on)
+        return r == 84 ? 0 : 1;
+    /* exit_group: main's own return would not match the shadow stack. */
+    syscall2(231, r == 84 ? 0 : 1, 0);
+    for (;;)
+        ;
+}
+"#;
+    crate::common::interop_host_with(
+        "builtin_setjmp_shstk",
+        jumper,
+        receiver,
+        &["-fcf-protection=full"],
+    );
+}

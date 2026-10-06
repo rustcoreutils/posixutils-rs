@@ -1485,6 +1485,10 @@ impl CodeGenerator for Aarch64CodeGen {
     fn set_verbose_asm(&mut self, verbose: bool) {
         self.base.verbose_asm = verbose;
     }
+
+    fn set_cf_protection(&mut self, cf_protection: crate::target::CfProtection) {
+        self.base.cf_protection = cf_protection;
+    }
 }
 
 #[cfg(test)]

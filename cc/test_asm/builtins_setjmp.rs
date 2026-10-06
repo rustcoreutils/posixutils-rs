@@ -11,8 +11,8 @@
 //
 
 use super::asm_probe::{
-    asm_for, assert_body_contains, assert_body_lacks, body_of, AARCH64_DARWIN, AARCH64_LINUX,
-    X86_64_LINUX,
+    asm_for, asm_for_with, assert_body_contains, assert_body_lacks, body_of, count_in_body,
+    AARCH64_DARWIN, AARCH64_LINUX, X86_64_LINUX,
 };
 
 const PROGRAM: &str = r#"
@@ -53,6 +53,81 @@ fn builtin_setjmp_x86_64_buffer_and_jump() {
         assert_body_contains(&asm, "j", needle, why);
     }
     assert_body_lacks(&asm, "j", "longjmp", "no library call");
+    // No `-fcf-protection` is `none`: nothing of CET's.
+    for func in ["f", "j"] {
+        for insn in ["endbr64", "rdsspq", "incsspq"] {
+            assert_body_lacks(&asm, func, insn, "default -fcf-protection=none");
+        }
+    }
+}
+
+/// gcc's buffer under return protection (`-fcf-protection=return` and
+/// `=full`): the shadow-stack pointer is the third word, read by `rdsspq`
+/// into a register zeroed first, and the stack pointer moves to the fourth.
+/// The longjmp unwinds the shadow stack to the saved pointer, in gcc's
+/// 255-entry steps, before restoring the frame and stack pointers.
+#[test]
+fn builtin_setjmp_x86_64_shadow_stack_layout() {
+    for level in ["return", "full"] {
+        let flag = format!("-fcf-protection={level}");
+        let asm = asm_for_with("builtin_setjmp_cet", X86_64_LINUX, PROGRAM, &["-O", &flag]);
+        let why = format!("x86-64 __builtin_setjmp, {flag}");
+        for needle in [
+            "movq %rbp, (%r10)",
+            "movq %r11, 8(%r10)",
+            "movl $0, %r11d\n    rdsspq %r11\n    movq %r11, 16(%r10)\n",
+            "movq %rsp, 24(%r10)",
+        ] {
+            assert_body_contains(&asm, "f", needle, &why);
+        }
+        assert_body_lacks(&asm, "f", "movq %rsp, 16(%r10)", &why);
+        let why = format!("x86-64 __builtin_longjmp, {flag}");
+        for needle in [
+            "movq 8(%r11), %r10",
+            "movl $0, %eax\n    rdsspq %rax\n    subq 16(%r11), %rax\n    je ",
+            "negq %rax\n    shrq $3, %rax\n    cmpq $255, %rax\n    jbe ",
+            "movl $255, %ecx\n    incsspq %rcx\n    subq $255, %rax\n    cmpq $255, %rax\n    ja ",
+            "incsspq %rax\n",
+            "movq (%r11), %rbp",
+            "movq 24(%r11), %rsp",
+            "jmp *%r10",
+        ] {
+            assert_body_contains(&asm, "j", needle, &why);
+        }
+        assert_body_lacks(&asm, "j", "movq 16(%r11), %rsp", &why);
+    }
+}
+
+/// Branch protection (`-fcf-protection=branch` and `=full`) starts the
+/// resume point, which the longjmp reaches by an indirect jump, with
+/// `endbr64`. On its own it leaves gcc's three-word layout alone.
+#[test]
+fn builtin_setjmp_x86_64_resume_point_landing_pad() {
+    for (level, landing_pad) in [
+        ("none", false),
+        ("branch", true),
+        ("return", false),
+        ("full", true),
+    ] {
+        let flag = format!("-fcf-protection={level}");
+        let asm = asm_for_with("builtin_setjmp_ibt", X86_64_LINUX, PROGRAM, &["-O", &flag]);
+        let why = format!("x86-64 __builtin_setjmp, {flag}");
+        let resume = ".L.sjlj_resume.0:\n    endbr64\n";
+        if landing_pad {
+            assert_body_contains(&asm, "f", resume, &why);
+            assert_eq!(count_in_body(&asm, "f", "endbr64"), 1, "{why}");
+        } else {
+            assert_body_lacks(&asm, "f", "endbr64", &why);
+        }
+        if level == "branch" {
+            assert_body_contains(&asm, "f", "movq %rsp, 16(%r10)", &why);
+            assert_body_contains(&asm, "j", "movq 16(%r11), %rsp", &why);
+            assert_body_lacks(&asm, "f", "rdsspq", &why);
+            assert_body_lacks(&asm, "j", "rdsspq", &why);
+        }
+        // Function entries are not landing pads: that is general IBT.
+        assert_body_lacks(&asm, "j", "endbr64", &why);
+    }
 }
 
 /// The same on aarch64, for Linux and Darwin alike: the code is the

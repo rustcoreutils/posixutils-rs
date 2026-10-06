@@ -610,16 +610,23 @@ pub const HOST_CC: &str = if cfg!(target_os = "macos") {
 
 /// Compile `src` with c17 to a host object in `dir`, returning its path.
 pub fn c17_object(name: &str, src: &str, opt: &str, dir: &std::path::Path) -> String {
+    c17_object_with(name, src, opt, &[], dir)
+}
+
+/// [`c17_object`], with `extra` options after `opt`.
+pub fn c17_object_with(
+    name: &str,
+    src: &str,
+    opt: &str,
+    extra: &[&str],
+    dir: &std::path::Path,
+) -> String {
     let c = create_c_file(name, src);
     let o = dir.join(format!("{name}.o"));
-    let run = run_c17(&[
-        opt,
-        "-w",
-        "-c",
-        "-o",
-        o.to_str().unwrap(),
-        c.path().to_str().unwrap(),
-    ]);
+    let mut args = vec![opt, "-w"];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&["-c", "-o", o.to_str().unwrap(), c.path().to_str().unwrap()]);
+    let run = run_c17(&args);
     assert!(run.success, "c17 failed on {name}:\n{}", run.stderr);
     o.to_string_lossy().into_owned()
 }
@@ -640,10 +647,23 @@ pub fn host_link_and_run(
     opt: &str,
     dir: &std::path::Path,
 ) -> i32 {
+    host_link_and_run_with(name, objs, c_srcs, opt, &[], dir)
+}
+
+/// [`host_link_and_run`], with `extra` options given to [`HOST_CC`] after
+/// `opt`.
+pub fn host_link_and_run_with(
+    name: &str,
+    objs: &[&str],
+    c_srcs: &[&str],
+    opt: &str,
+    extra: &[&str],
+    dir: &std::path::Path,
+) -> i32 {
     let exe = dir.join(name);
     let files: Vec<_> = c_srcs.iter().map(|s| create_c_file(name, s)).collect();
     let mut cmd = Command::new(HOST_CC);
-    cmd.arg("-w").arg(opt).arg("-o").arg(&exe);
+    cmd.arg("-w").arg(opt).args(extra).arg("-o").arg(&exe);
     for f in &files {
         cmd.arg(f.path());
     }
@@ -667,27 +687,33 @@ pub fn host_link_and_run(
 /// `callee` and `caller` are separate translation units, so each side reads
 /// what the other wrote only through the calling convention.
 pub fn interop_host(tag: &str, callee: &str, caller: &str) {
+    interop_host_with(tag, callee, caller, &[]);
+}
+
+/// [`interop_host`], with `flags` given to both compilers on every side.
+pub fn interop_host_with(tag: &str, callee: &str, caller: &str, flags: &[&str]) {
     let dir = plib::tmp::Builder::new()
         .prefix(&format!("{tag}_"))
         .tempdir()
         .unwrap();
+    let d = dir.path();
     for opt in ["-O0", "-O2"] {
-        let callee_o = c17_object(&format!("{tag}_callee"), callee, opt, dir.path());
-        let caller_o = c17_object(&format!("{tag}_caller"), caller, opt, dir.path());
+        let callee_o = c17_object_with(&format!("{tag}_callee"), callee, opt, flags, d);
+        let caller_o = c17_object_with(&format!("{tag}_caller"), caller, opt, flags, d);
         assert_eq!(
-            host_link_and_run("cc", &[&caller_o, &callee_o], &[], opt, dir.path()),
+            host_link_and_run_with("cc", &[&caller_o, &callee_o], &[], opt, flags, d),
             0,
-            "c17 both, {opt}"
+            "c17 both, {opt} {flags:?}"
         );
         assert_eq!(
-            host_link_and_run("gc", &[&callee_o], &[caller], opt, dir.path()),
+            host_link_and_run_with("gc", &[&callee_o], &[caller], opt, flags, d),
             0,
-            "{HOST_CC} caller, c17 callee, {opt}"
+            "{HOST_CC} caller, c17 callee, {opt} {flags:?}"
         );
         assert_eq!(
-            host_link_and_run("cg", &[&caller_o], &[callee], opt, dir.path()),
+            host_link_and_run_with("cg", &[&caller_o], &[callee], opt, flags, d),
             0,
-            "c17 caller, {HOST_CC} callee, {opt}"
+            "c17 caller, {HOST_CC} callee, {opt} {flags:?}"
         );
     }
 }

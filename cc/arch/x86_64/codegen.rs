@@ -1745,4 +1745,8 @@ impl CodeGenerator for X86_64CodeGen {
     fn set_verbose_asm(&mut self, verbose: bool) {
         self.base.verbose_asm = verbose;
     }
+
+    fn set_cf_protection(&mut self, cf_protection: crate::target::CfProtection) {
+        self.base.cf_protection = cf_protection;
+    }
 }

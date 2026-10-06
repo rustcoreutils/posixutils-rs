@@ -802,3 +802,32 @@ fn gcc_flags_missing_object_is_an_error_without_linking() {
         }
     }
 }
+
+/// `-fcf-protection` is honoured, not ignored: every level gcc has is
+/// accepted without the "unrecognized option" warning, as is
+/// `-fno-cf-protection`, and a level gcc does not have is an error in its
+/// words.
+#[test]
+fn gcc_flags_cf_protection() {
+    for flag in [
+        "-fcf-protection",
+        "-fcf-protection=full",
+        "-fcf-protection=branch",
+        "-fcf-protection=return",
+        "-fcf-protection=none",
+        "-fcf-protection=check",
+        "-fno-cf-protection",
+    ] {
+        let r = compile_with("cet.c", MAIN, &[flag]);
+        assert!(r.success, "{flag}: {}", r.stderr);
+        assert!(!r.stderr.contains("unrecognized"), "{flag}: {}", r.stderr);
+    }
+    let r = compile_with("cet.c", MAIN, &["-fcf-protection=bogus"]);
+    assert!(!r.success);
+    assert!(
+        r.stderr
+            .contains("unknown Control-Flow Protection Level: bogus"),
+        "{}",
+        r.stderr
+    );
+}

@@ -147,6 +147,9 @@ pub struct CodeGenBase<I: LirInst> {
     pub shared_mode: bool,
     /// `-fverbose-asm`: annotate the generated instructions.
     pub verbose_asm: bool,
+    /// `-fcf-protection`, which only x86-64's `__builtin_setjmp` and
+    /// `__builtin_longjmp` read.
+    pub cf_protection: crate::target::CfProtection,
     /// Trailing comments to hang off individual LIR instructions, by their
     /// index in `lir_buffer`.
     ///
@@ -183,6 +186,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             emit_debug: false,
             shared_mode: false,
             verbose_asm: false,
+            cf_protection: crate::target::CfProtection::default(),
             lir_comments: std::collections::HashMap::new(),
             value_widths: ValueWidths::default(),
             fn_dies: Vec::new(),
@@ -1179,6 +1183,9 @@ pub trait CodeGenerator {
 
     /// Set `-fverbose-asm`: annotate the generated instructions.
     fn set_verbose_asm(&mut self, verbose: bool);
+
+    /// Set `-fcf-protection`.
+    fn set_cf_protection(&mut self, cf_protection: crate::target::CfProtection);
 }
 
 /// The alignment, in bytes, a global definition is emitted at: an explicit
@@ -1452,6 +1459,7 @@ pub fn create_codegen(
     pic_mode: bool,
     shared_mode: bool,
     verbose_asm: bool,
+    cf_protection: crate::target::CfProtection,
 ) -> Box<dyn CodeGenerator> {
     use crate::target::Arch;
 
@@ -1463,6 +1471,7 @@ pub fn create_codegen(
     codegen.set_pic_mode(pic_mode);
     codegen.set_shared_mode(shared_mode);
     codegen.set_verbose_asm(verbose_asm);
+    codegen.set_cf_protection(cf_protection);
     codegen
 }
 

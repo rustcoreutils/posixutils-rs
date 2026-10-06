@@ -1766,6 +1766,8 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
 
     while i < raw_args.len() {
         let arg = &raw_args[i];
+        let f_spelling = two_dash_prefix_map(arg);
+        let arg = f_spelling.as_ref().unwrap_or(arg);
 
         if arg == "-O" {
             // Standalone -O: check if next arg is a valid optimization level
@@ -2194,6 +2196,16 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
         .unwrap_or(result.len());
     result.splice(at..at, trailer);
     result
+}
+
+/// The `-f` spelling of a path prefix map written `--NAME=VALUE`.
+///
+/// gcc's driver takes `--NAME` for `-fNAME`, and gmp passes
+/// `--debug-prefix-map=` that way when it assembles its `.s` files. The prefix
+/// maps are the options real builds spell so, and the only ones taken.
+fn two_dash_prefix_map(arg: &str) -> Option<String> {
+    let f = format!("-f{}", arg.strip_prefix("--")?);
+    MapOption::parse(&f).is_some().then_some(f)
 }
 
 /// Answer one of gcc's driver queries, returning the exit status, or `None`

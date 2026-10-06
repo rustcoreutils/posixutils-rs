@@ -348,7 +348,10 @@ mod tests {
 
     impl Fx {
         fn new() -> Fx {
-            let types = TypeTable::new(&Target::host());
+            let types = TypeTable::new(&Target::new(
+                crate::target::Arch::X86_64,
+                crate::target::Os::Linux,
+            ));
             let mut func = Function::new("f", types.ulong_id);
             func.next_pseudo = 1;
             let mut b = BasicBlock::new(BasicBlockId(0));
@@ -593,11 +596,15 @@ mod tests {
     #[test]
     fn named_sizes_skip_weak_and_unbounded_objects() {
         use crate::ir::{GlobalDef, Initializer};
-        let mut types = TypeTable::new(&Target::host());
+        let mut types = TypeTable::new(&Target::new(
+            crate::target::Arch::X86_64,
+            crate::target::Os::Linux,
+        ));
         let arr = types.intern(Type::array(types.char_id, 8));
-        let mut unbounded = Type::array(types.char_id, 0);
-        unbounded.array_size = None;
-        let open = types.intern(unbounded);
+        let open = types.intern(Type::array_of(
+            types.char_id,
+            crate::types::ArrayExtent::Unknown,
+        ));
         let mut module = Module::default();
         module
             .globals

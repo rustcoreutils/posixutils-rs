@@ -1966,34 +1966,40 @@ fn test_long_long_decl() {
     assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::LongLong);
 }
 
+/// An object of static storage duration is declared with its storage class
+/// in `storage_class` and its type without one, at every level: `extern int
+/// *p` is a `extern` declaration of an `int *`.
 #[test]
-fn test_extern_pointer_modifier_propagation() {
+fn test_extern_pointer_storage_class_is_not_its_type() {
     let (decl, types, _strings, _symbols) = parse_decl("extern int *p;").unwrap();
-    let ptr_typ = decl.declarators[0].typ;
-
-    // Verify it's a pointer type
-    assert_eq!(types.kind(ptr_typ), TypeKind::Pointer);
-
-    // Verify EXTERN modifier is on the pointer type
-    assert!(
-        types.get(ptr_typ).modifiers.contains(TypeModifiers::EXTERN),
-        "EXTERN modifier should propagate to pointer type"
-    );
+    let d = &decl.declarators[0];
+    assert_eq!(types.kind(d.typ), TypeKind::Pointer);
+    assert!(d.storage_class.contains(TypeModifiers::EXTERN));
+    assert!(!types
+        .modifiers(d.typ)
+        .intersects(crate::types::Type::DECL_SPECIFIERS));
+    let pointee = types.base_type(d.typ).expect("pointee");
+    assert!(!types
+        .modifiers(pointee)
+        .intersects(crate::types::Type::DECL_SPECIFIERS));
 }
 
+/// An object of static storage duration is declared with its storage class
+/// in `storage_class` and its type without one, at every level: `static int
+/// *p` is a `static` declaration of an `int *`.
 #[test]
-fn test_static_pointer_modifier_propagation() {
+fn test_static_pointer_storage_class_is_not_its_type() {
     let (decl, types, _strings, _symbols) = parse_decl("static int *p;").unwrap();
-    let ptr_typ = decl.declarators[0].typ;
-
-    // Verify it's a pointer type
-    assert_eq!(types.kind(ptr_typ), TypeKind::Pointer);
-
-    // Verify STATIC modifier is on the pointer type
-    assert!(
-        types.get(ptr_typ).modifiers.contains(TypeModifiers::STATIC),
-        "STATIC modifier should propagate to pointer type"
-    );
+    let d = &decl.declarators[0];
+    assert_eq!(types.kind(d.typ), TypeKind::Pointer);
+    assert!(d.storage_class.contains(TypeModifiers::STATIC));
+    assert!(!types
+        .modifiers(d.typ)
+        .intersects(crate::types::Type::DECL_SPECIFIERS));
+    let pointee = types.base_type(d.typ).expect("pointee");
+    assert!(!types
+        .modifiers(pointee)
+        .intersects(crate::types::Type::DECL_SPECIFIERS));
 }
 
 #[test]

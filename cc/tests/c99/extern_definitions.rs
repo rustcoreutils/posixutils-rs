@@ -69,3 +69,36 @@ int main(void)
 "#,
     );
 }
+
+/// The definition after a declaration that spelled another storage class is
+/// still one object of one type: an array, a pointer, a qualified object,
+/// and an array or pointee the definition completes.
+#[test]
+fn c99_extern_definition_after_another_storage_class() {
+    compile_and_run_everywhere(
+        "extern_definition_storage_class",
+        r#"
+static const int c;
+extern const int c = 4;
+static int a[3];
+extern int a[3] = {1, 2, 3};
+static int e[];
+extern int e[3] = {4, 5, 6};
+int b[3];
+int (*q)[];
+int (*q)[3] = &b;
+static int *ptr;
+extern int *ptr = &a[1];
+int main(void)
+{
+    static int n;
+    if (c != 4) return 1;
+    if (a[2] != 3 || sizeof a != 3 * sizeof(int)) return 2;
+    if (e[2] != 6 || sizeof e != 3 * sizeof(int)) return 3;
+    if (*q != b) return 4;
+    if (*ptr != 2) return 5;
+    return n;
+}
+"#,
+    );
+}

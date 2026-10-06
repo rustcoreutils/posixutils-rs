@@ -529,6 +529,16 @@ impl Parser<'_> {
             };
             self.declarator_cleanup(var, specs.storage_class, scope, is_fn)
         });
+        // An object of static storage duration is defined by its type alone:
+        // the storage class travels apart, in `storage_class`. `static int x;`
+        // and `extern int x = 7;` are one object of one type, and the
+        // definition must not depend on which declaration spelled what
+        // (`Module::define_global`).
+        let static_duration =
+            scope == DeclScope::File || specs.storage_class.contains(TypeModifiers::STATIC);
+        if !is_fn && !is_typedef && static_duration {
+            typ = self.types.without_decl_specifiers(typ);
+        }
         Ok(Bound::Decl(InitDeclarator {
             symbol_attrs,
             fn_effect: fn_attrs.map_or(pending_effect, |a| a.effect),

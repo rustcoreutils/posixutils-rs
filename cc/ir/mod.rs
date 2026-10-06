@@ -4047,8 +4047,16 @@ impl Module {
     /// global of the same name exists with `Initializer::None`, this
     /// definition replaces it, and a tentative definition after an
     /// initialized one is merged into it.
+    ///
+    /// `typ` is the object's type alone: its storage class is in `storage`,
+    /// and the parser gives every declarator of static storage duration its
+    /// type without one, so `static int x; extern int x = 7;` is one `int`.
+    /// The declarations of one object have compatible, identically qualified
+    /// types (C17 6.2.7p2); a later one may complete an earlier one (`int
+    /// (*p)[]; int (*p)[3] = 0;`), so the definition's type is the global's.
     pub(crate) fn define_global(
         &mut self,
+        types: &TypeTable,
         name: impl Into<String>,
         typ: TypeId,
         init: Initializer,
@@ -4061,15 +4069,21 @@ impl Module {
             is_thread_local,
         } = storage;
         let name = name.into();
+        debug_assert!(
+            !types
+                .modifiers(typ)
+                .intersects(crate::types::Type::DECL_SPECIFIERS),
+            "global '{name}' typed with its declaration's specifiers"
+        );
         // Check for existing tentative definition
         if let Some(existing) = self.global_mut(&name) {
             // Replace tentative definition with actual definition
             if matches!(existing.init, Initializer::None) {
-                debug_assert_eq!(
-                    existing.typ, typ,
-                    "tentative definition type mismatch for '{}'",
-                    name
+                debug_assert!(
+                    types.types_compatible_qualified(existing.typ, typ),
+                    "tentative definition type mismatch for '{name}'"
                 );
+                existing.typ = typ;
                 existing.init = init;
                 existing.is_static = is_static;
                 // Const-ness is a property of the declaration that ultimately
@@ -4923,12 +4937,19 @@ mod tests {
         let plain = storage(false, false, false);
 
         // Add a tentative definition (no initializer)
-        module.define_global("x", types.int_id, Initializer::None, None, plain);
+        module.define_global(&types, "x", types.int_id, Initializer::None, None, plain);
         assert_eq!(module.globals.len(), 1);
         assert!(matches!(module.globals[0].init, Initializer::None));
 
         // Add actual definition - should replace the tentative one
-        module.define_global("x", types.int_id, Initializer::Int(42), Some(4), plain);
+        module.define_global(
+            &types,
+            "x",
+            types.int_id,
+            Initializer::Int(42),
+            Some(4),
+            plain,
+        );
         assert_eq!(module.globals.len(), 1); // Still only one global
         assert!(matches!(module.globals[0].init, Initializer::Int(42)));
         assert_eq!(module.globals[0].explicit_align, Some(4));
@@ -4941,11 +4962,11 @@ mod tests {
         let plain = storage(false, false, false);
 
         // Add a real definition (with initializer)
-        module.define_global("x", types.int_id, Initializer::Int(10), None, plain);
+        module.define_global(&types, "x", types.int_id, Initializer::Int(10), None, plain);
         assert_eq!(module.globals.len(), 1);
 
         // Add another definition with same name - should NOT replace (adds new entry)
-        module.define_global("x", types.int_id, Initializer::Int(20), None, plain);
+        module.define_global(&types, "x", types.int_id, Initializer::Int(20), None, plain);
         assert_eq!(module.globals.len(), 2); // Two globals now (linker will error)
     }
 
@@ -4956,13 +4977,20 @@ mod tests {
         let tls = storage(false, false, true);
 
         // Add a TLS tentative definition
-        module.define_global("tls_var", types.int_id, Initializer::None, None, tls);
+        module.define_global(
+            &types,
+            "tls_var",
+            types.int_id,
+            Initializer::None,
+            None,
+            tls,
+        );
         assert_eq!(module.globals.len(), 1);
         assert!(matches!(module.globals[0].init, Initializer::None));
 
         // Add actual TLS definition - should replace
         let init = Initializer::Int(100);
-        module.define_global("tls_var", types.int_id, init, Some(8), tls);
+        module.define_global(&types, "tls_var", types.int_id, init, Some(8), tls);
         assert_eq!(module.globals.len(), 1);
         assert!(matches!(module.globals[0].init, Initializer::Int(100)));
         assert!(module.globals[0].is_thread_local);
@@ -4978,7 +5006,7 @@ mod tests {
         for bits in 0..8u8 {
             let st = storage(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
             let name = format!("g{bits}");
-            module.define_global(&name, types.int_id, Initializer::Int(1), None, st);
+            module.define_global(&types, &name, types.int_id, Initializer::Int(1), None, st);
             all.push((name, st));
         }
         assert_eq!(module.globals.len(), 8);
@@ -4998,6 +5026,7 @@ mod tests {
         let mut module = Module::default();
         let int = types.int_id;
         module.define_global(
+            &types,
             "a",
             int,
             Initializer::None,
@@ -5005,6 +5034,7 @@ mod tests {
             storage(true, true, true),
         );
         module.define_global(
+            &types,
             "a",
             int,
             Initializer::Int(1),
@@ -5019,6 +5049,7 @@ mod tests {
         assert_eq!(a.explicit_align, Some(16));
 
         module.define_global(
+            &types,
             "b",
             int,
             Initializer::None,
@@ -5026,6 +5057,7 @@ mod tests {
             storage(false, false, false),
         );
         module.define_global(
+            &types,
             "b",
             int,
             Initializer::Int(2),

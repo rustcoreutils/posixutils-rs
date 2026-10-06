@@ -109,7 +109,12 @@ impl Parser<'_> {
             };
             for d in &mut decl.declarators {
                 if last.contains_key(&d.symbol) && self.types.unsized_array_levels(d.typ) > 0 {
-                    d.typ = self.symbols.get(d.symbol).typ;
+                    // The symbol's type is the last declaration's, which
+                    // spelled its own storage class; the declarator's is
+                    // the object's alone (see `bind_declarator`).
+                    d.typ = self
+                        .types
+                        .without_decl_specifiers(self.symbols.get(d.symbol).typ);
                 }
             }
         }

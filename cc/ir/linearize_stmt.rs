@@ -810,6 +810,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 .contains(TypeModifiers::THREAD_LOCAL),
         };
         self.module.define_global(
+            self.types,
             &global_name,
             declarator.typ,
             init,

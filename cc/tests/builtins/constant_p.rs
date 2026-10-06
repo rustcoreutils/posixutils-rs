@@ -109,3 +109,50 @@ int main(void)
     return 0;
 }
 "#;
+
+/// glibc's fortified `open` (`bits/fcntl2.h`), over a flag that is a
+/// constant on a loop's first trip and not after: diffutils' `stdopen`
+/// passes `fd == STDIN_FILENO ? O_WRONLY : O_RDONLY`. SCCP saw the operand
+/// as a constant first and answered 1, then 0 once it was not, and the two
+/// answers met to "unknown": the branch to `__open_missing_mode` -- declared
+/// with `__attribute__((error))` and defined nowhere -- was never deleted,
+/// and the program failed to link. gcc links it at every level, as must c17.
+#[test]
+fn builtins_constant_p_over_a_value_constant_only_at_first() {
+    let src = r#"
+extern void missing_mode(void);
+
+int lib(const char *p, int f, ...) { return f + (p[0] == '/'); }
+int lib2(const char *p, int f) { return f + (p[0] == '/'); }
+int fails(int fd) { return fd != 1; }
+
+extern __inline __attribute__((__always_inline__, __gnu_inline__)) int
+wrap(const char *p, int f, ...)
+{
+    if (__builtin_constant_p(f)) {
+        if ((f & 64) && __builtin_va_arg_pack_len() < 1) {
+            missing_mode();
+            return lib2(p, f);
+        }
+        return lib(p, f, __builtin_va_arg_pack());
+    }
+    if (__builtin_va_arg_pack_len() < 1)
+        return lib2(p, f);
+    return lib(p, f, __builtin_va_arg_pack());
+}
+
+int total;
+
+int main(void)
+{
+    for (int fd = 0; fd <= 2; fd++) {
+        if (fails(fd)) {
+            int mode = fd == 0 ? 1 : 0;
+            total += wrap("/dev/null", mode);
+        }
+    }
+    return total == 3 ? 0 : 1;
+}
+"#;
+    compile_and_run_everywhere("builtins_constant_p_first_trip", src);
+}

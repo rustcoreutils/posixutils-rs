@@ -38,6 +38,7 @@ use super::dataflow::{Lattice, Selector, Sparse, SparseAnalysis};
 use super::facts::ConstMap;
 use super::propagate::cbr_taken;
 use super::{BasicBlockId, Function, Instruction, Opcode, PseudoId};
+use std::collections::HashMap;
 
 /// The lattice, of height three.
 ///
@@ -78,6 +79,8 @@ struct Solver {
     /// Whether a `__builtin_constant_p` of a value not proved constant may
     /// be answered 0 yet. See [`run_before_inlining`].
     final_answers: bool,
+    /// Each `__builtin_constant_p`'s target, with the operand it asks about.
+    constant_p: HashMap<PseudoId, PseudoId>,
 }
 
 /// Run SCCP over `func`, returning whether anything changed.
@@ -102,6 +105,13 @@ fn solve(func: &mut Function, final_answers: bool) -> bool {
         core: Sparse::new(func, Val::Const),
         consts: ConstMap::new(func),
         final_answers,
+        constant_p: func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .filter(|i| i.op == Opcode::ConstantP)
+            .filter_map(|i| Some((i.target?, *i.src.first()?)))
+            .collect(),
     }
     .run(func)
 }
@@ -109,6 +119,23 @@ fn solve(func: &mut Function, final_answers: bool) -> bool {
 impl Solver {
     fn get(&self, id: PseudoId) -> Val {
         self.core.get(id)
+    }
+
+    /// `__builtin_constant_p(operand)`, by what is known of `operand` now.
+    ///
+    /// `Top` is not yet an answer -- a value still `Top` at fixpoint is in
+    /// unreachable code, and `ir::lower` answers 0 for whatever is left over.
+    /// A float constant is in no lattice cell (see `dataflow`), so the
+    /// operand is also asked whether it copies one; a float is never
+    /// narrowed by a `Copy`, so any width follows the chain.
+    fn constant_p_answer(&self, operand: PseudoId) -> Val {
+        match self.get(operand) {
+            Val::Const(_) => Val::Const(1),
+            Val::Top => Val::Top,
+            Val::Bottom if self.consts.fget(operand, 0).is_some() => Val::Const(1),
+            Val::Bottom if self.final_answers => Val::Const(0),
+            Val::Bottom => Val::Bottom,
+        }
     }
 
     /// An integer operation `constfold` evaluates, over its operands'
@@ -168,8 +195,19 @@ impl SparseAnalysis for Solver {
         }
     }
 
+    /// A `__builtin_constant_p` is the exception to reading the cell. Its
+    /// answer is not monotone in its operand: an operand optimistically a
+    /// constant -- a loop counter on its first trip -- answers 1, and 0 once
+    /// it settles to unknown, and the cell meets the two to `Bottom`. That
+    /// was sound for the solve, which then took both arms of the branch it
+    /// guards, but it is no answer to rewrite: the operand's settled value
+    /// is. Answered here, the next solve prunes the arm.
     fn constant(&self, _block: BasicBlockId, target: PseudoId) -> Option<i128> {
-        match self.get(target) {
+        let val = match (self.get(target), self.constant_p.get(&target)) {
+            (Val::Bottom, Some(&operand)) => self.constant_p_answer(operand),
+            (val, _) => val,
+        };
+        match val {
             Val::Const(v) => Some(v),
             _ => None,
         }
@@ -218,19 +256,11 @@ impl SparseAnalysis for Solver {
             }
 
             // `__builtin_constant_p`, which asks this pass its own question:
-            // is the operand a constant once propagation has run? `Top` is
-            // not yet an answer -- a value still `Top` at fixpoint is in
-            // unreachable code, and `ir::lower` answers 0 for whatever is
-            // left over. A float constant is in no lattice cell (see
-            // `dataflow`), so the operand is also asked whether it copies
-            // one; a float is never narrowed by a `Copy`, so any width
-            // follows the chain.
-            Opcode::ConstantP => match insn.src.first().map(|s| (*s, self.get(*s))) {
-                Some((_, Val::Const(_))) => Val::Const(1),
-                Some((_, Val::Top)) => Val::Top,
-                Some((s, _)) if self.consts.fget(s, 0).is_some() => Val::Const(1),
-                _ if self.final_answers => Val::Const(0),
-                _ => Val::Bottom,
+            // is the operand a constant once propagation has run?
+            Opcode::ConstantP => match insn.src.first() {
+                Some(&operand) => self.constant_p_answer(operand),
+                None if self.final_answers => Val::Const(0),
+                None => Val::Bottom,
             },
 
             op if is_int_foldable(op) => self.int_op(insn),
@@ -797,6 +827,43 @@ mod tests {
         assert_eq!(constant_p_over_with(arg, run_before_inlining), None);
         let val = Pseudo::val(PseudoId(1), 42);
         assert_eq!(constant_p_over_with(val, run_before_inlining), Some(1));
+    }
+
+    /// An operand that is optimistically a constant at first -- a loop
+    /// counter on its first trip -- and settles to unknown is answered by
+    /// where it settled: 0. The cell met 1 with 0 on the way, which is no
+    /// answer at all, and the branch it guards was never pruned: glibc's
+    /// `__open_missing_mode` call reached the link.
+    #[test]
+    fn constant_p_answers_zero_for_an_operand_constant_only_at_first() {
+        use crate::ir::linearize::test_linearize::linearize_source;
+        let src = "int f(void) {\n\
+                       int r = 0;\n\
+                       for (int i = 0; i < 3; i++)\n\
+                           r += __builtin_constant_p(i) ? 100 : 1;\n\
+                       return r;\n\
+                   }\n";
+        let mut module = linearize_source(src, &Target::host());
+        let f = module.functions.iter_mut().find(|f| f.name == "f").unwrap();
+        let constant_ps = |f: &Function| {
+            f.blocks
+                .iter()
+                .flat_map(|b| &b.insns)
+                .filter(|i| i.op == Opcode::ConstantP)
+                .count()
+        };
+        assert_eq!(constant_ps(f), 1, "linearized unanswered");
+        assert!(run(f));
+        assert_eq!(constant_ps(f), 0, "answered by the solve");
+        // The rewrite leaves the answer for the next solve to prune with.
+        run(f);
+        crate::ir::dce::run(f);
+        let reads_100 = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .any(|i| i.src.iter().any(|&s| f.const_val(s) == Some(100)));
+        assert!(!reads_100, "the arm taken for a constant is gone");
     }
 
     /// A float constant is in no lattice cell, and is no less a constant.

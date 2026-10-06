@@ -764,6 +764,63 @@ fn test_malformed_record_framing_is_rejected() {
     }
 }
 
+/// A numeric record value is decimal digits (a time may be negative), and
+/// Rust's `parse` also takes a leading '+'. bsdtar does not, so `size=+5`
+/// framed the member one way for pax and another for bsdtar -- a member one
+/// tool sees and the other does not.
+#[test]
+fn test_numeric_record_with_a_plus_sign_is_rejected() {
+    for (keyword, value) in [
+        ("size", b"+5".as_slice()),
+        ("uid", b"+1"),
+        ("gid", b"+1"),
+        ("mtime", b"+1"),
+        ("atime", b"+1.5"),
+    ] {
+        let mut archive = ext_header(b'x', &pax_record(keyword, value));
+        archive.extend_from_slice(
+            &Ustar {
+                name: b"f",
+                body: b"hello",
+                ..Default::default()
+            }
+            .archive(),
+        );
+        let output = run_pax_with_stdin_bytes(&[], &archive);
+        assert_exit_code(&output, 1, &format!("list {keyword}=+"));
+        let value = std::str::from_utf8(value).unwrap();
+        assert!(
+            stderr_str(&output).contains(&format!("invalid {keyword}: {value}"))
+                || stderr_str(&output).contains(&format!("invalid pax time: {value}")),
+            "the diagnostic must name {keyword}={value}: {}",
+            stderr_str(&output)
+        );
+    }
+}
+
+/// The same for a newc header's hexadecimal fields: `from_str_radix` takes a
+/// leading '+', GNU and BSD cpio do not.
+#[test]
+fn test_newc_hex_field_with_a_plus_sign_is_rejected() {
+    let mut archive = CpioNewc {
+        name: b"f",
+        body: b"hello",
+        ..Default::default()
+    }
+    .archive();
+    // c_filesize: the seventh eight-digit field after the six-byte magic.
+    let filesize = 6 + 6 * 8;
+    archive[filesize..filesize + 8].copy_from_slice(b"+0000005");
+
+    let output = run_pax_with_stdin_bytes(&["-x", "cpio"], &archive);
+    assert_exit_code(&output, 1, "list a newc header with a signed field");
+    assert!(
+        !stdout_str(&output).contains('f'),
+        "the member must not be listed: {}",
+        stdout_str(&output)
+    );
+}
+
 /// An `x` header whose `size=` record describes a member that a GNU `L`
 /// record also describes: the member is skipped, and it has to be skipped by
 /// the size the `x` header gave it, or its data is read as headers.
@@ -954,6 +1011,97 @@ fn test_regular_typeflag_with_trailing_slash_is_a_directory() {
         std::fs::read_to_string(temp.path().join("olddir/f")).unwrap(),
         "hi"
     );
+}
+
+/// The old-style directory rule is about the member, not its header block: a
+/// `size` record replaces the size field before the rule looks at it. A header
+/// named `x/` with an empty size field but `size=1024` is a 1024-byte file
+/// named by its `path` record, and those bytes are its data. Deciding on the
+/// raw fields made it an empty directory and read the data as further members
+/// -- a member bsdtar extracts as file contents, smuggled in as a file of its
+/// own.
+#[test]
+fn test_size_record_overrides_old_style_directory() {
+    let mut records = pax_record("path", b"file.bin");
+    records.extend_from_slice(&pax_record("size", b"1024"));
+    let mut archive = ext_header(b'x', &records);
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"x/",
+            size: Some(0),
+            ..Default::default()
+        }
+        .header(),
+    );
+    let mut data = Ustar {
+        name: b"smuggled",
+        body: b"payload",
+        ..Default::default()
+    }
+    .member();
+    data.resize(1024, 0);
+    archive.extend_from_slice(&data);
+    archive.extend_from_slice(&ustar_trailer());
+
+    let output = run_pax_with_stdin_bytes(&["-o", "listopt=%(size)d %F"], &archive);
+    assert_success(&output, "list a member sized by its size record");
+    assert_eq!(stdout_str(&output), "1024 file.bin\n");
+}
+
+/// The rule looks at the member's final name too. Python's tarfile and pax
+/// itself put the first 100 bytes of a long name in the name field and the
+/// whole name in a `path` record, and those 100 bytes can end in a slash. An
+/// empty file at such a path was extracted as a directory; bsdtar extracts
+/// the file.
+#[test]
+fn test_path_record_overrides_old_style_directory() {
+    let temp = plib::tmp::TempDir::new().unwrap();
+    let mut archive = archive_with_ext_records(&pax_record("path", b"pkg/__init__.py"));
+    // `archive_with_ext_records` names the member `f`; give it the truncated
+    // spelling instead, which ends in a slash.
+    let member = 2 * BLOCK;
+    archive[member..member + 100].fill(0);
+    archive[member..member + 4].copy_from_slice(b"pkg/");
+    reseal_header(&mut archive[member..]);
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, temp.path());
+    assert_success(&output, "extract a member named by its path record");
+    let extracted = temp.path().join("pkg/__init__.py");
+    assert!(
+        extracted.is_file(),
+        "pkg/__init__.py was not a regular file"
+    );
+
+    // A `path` record that itself ends in a slash is still a directory.
+    let archive = archive_with_ext_records(&pax_record("path", b"olddir/"));
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, temp.path());
+    assert_success(&output, "extract an old-style directory named by a record");
+    assert!(temp.path().join("olddir").is_dir());
+}
+
+/// pax's own writer: an empty file whose name needs a `path` record, and
+/// whose name field is cut where the 100th byte is a slash, must read back
+/// as the file it was.
+#[test]
+fn test_long_name_cut_at_a_slash_round_trips() {
+    let temp = plib::tmp::TempDir::new().unwrap();
+    let dir = "a".repeat(99);
+    let file = format!("{dir}/{}", "b".repeat(200));
+    std::fs::create_dir(temp.path().join(&dir)).unwrap();
+    std::fs::write(temp.path().join(&file), "").unwrap();
+
+    let output = run_pax_in_dir(&["-w", "-x", "pax", &file], temp.path());
+    assert_success(&output, "archive a long name");
+    // The name field is a fallback for a reader without extended headers;
+    // it must not spell a directory for a file.
+    let header = &output.stdout[2 * BLOCK..3 * BLOCK];
+    assert_ne!(header[99], b'/', "name field of a file ends in a slash");
+
+    let out = temp.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let read = run_pax_with_stdin_bytes_in_dir(&["-r"], &output.stdout, &out);
+    assert_success(&read, "extract the long name");
+    assert!(out.join(&file).is_file(), "{file} was not a regular file");
 }
 
 /// An archive cut off inside the second block of its end-of-archive indicator

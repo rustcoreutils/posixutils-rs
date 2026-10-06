@@ -131,7 +131,7 @@ impl<R: Read> ArchiveReader for UstarReader<R> {
                 continue;
             }
 
-            let entry = parse_header(&header, SizeRule::Ustar)?;
+            let entry = parse_header(&header, SizeRule::Ustar, |_| {})?;
             self.current_size = entry.size;
             self.bytes_read = 0;
 
@@ -239,7 +239,6 @@ pub(crate) fn is_zero_block(block: &[u8]) -> bool {
     block.iter().all(|&b| b == 0)
 }
 
-/// Parse a header block into an ArchiveEntry
 /// Which format's rules govern a header's size field.
 ///
 /// POSIX (pax, "No data logical records are stored for types 1, 2, or 5") makes
@@ -295,7 +294,17 @@ impl SizeRule {
     }
 }
 
-pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResult<ArchiveEntry> {
+/// Parse a header block into an ArchiveEntry.
+///
+/// `overrides` applies what the archive says about the member outside its
+/// header block -- a pax archive's extended-header records -- before the
+/// member's type and data length are settled, since both depend on its final
+/// name and size. A plain ustar reader passes a closure that does nothing.
+pub(crate) fn parse_header(
+    header: &[u8; BLOCK_SIZE],
+    rule: SizeRule,
+    overrides: impl FnOnce(&mut ArchiveEntry),
+) -> PaxResult<ArchiveEntry> {
     let name = path_field(&header[NAME_OFF..NAME_OFF + NAME_LEN]);
     // An old GNU header has no prefix field: GNU tar keeps the access and
     // change times in those bytes, and joining them onto the name turned
@@ -316,12 +325,7 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
 
     let typeflag = header[TYPEFLAG_OFF];
     let flag = parse_typeflag(typeflag);
-    let entry_type = if is_old_style_directory(typeflag, name, declared_size) {
-        EntryType::Directory
-    } else {
-        flag.entry_type()
-    };
-    let size = rule.data_size(entry_type, declared_size);
+    let entry_type = flag.entry_type();
 
     let linkname = path_field(&header[LINKNAME_OFF..LINKNAME_OFF + LINKNAME_LEN]);
     let link_target = if linkname.is_empty() {
@@ -365,12 +369,12 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
     let devmajor = parse_u32_field(&header[DEVMAJOR_OFF..DEVMAJOR_OFF + 8], "devmajor")?;
     let devminor = parse_u32_field(&header[DEVMINOR_OFF..DEVMINOR_OFF + 8], "devminor")?;
 
-    Ok(ArchiveEntry {
+    let mut entry = ArchiveEntry {
         path,
         mode,
         uid,
         gid,
-        size,
+        size: declared_size,
         mtime,
         entry_type,
         link_target,
@@ -406,7 +410,29 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
             typeflag,
         }),
         ..Default::default()
-    })
+    };
+    overrides(&mut entry);
+    settle_type_and_size(&mut entry, typeflag, rule);
+    Ok(entry)
+}
+
+/// Decide a member's type and data length from its final name and size.
+///
+/// The old-style directory rule runs here, after any `path` and `size`
+/// records, not on the header block's own fields: the 100-byte name field of
+/// a long name can end in a slash where the name does not, and a `size`
+/// record can give data to a header whose size field is empty. Either way the
+/// member is a file, and deciding on the raw fields made it a directory --
+/// whose data, unread, then parsed as further members.
+fn settle_type_and_size(entry: &mut ArchiveEntry, typeflag: u8, rule: SizeRule) {
+    let name = crate::rawpath::as_bytes(&entry.path);
+    if is_old_style_directory(typeflag, name, entry.size) {
+        entry.entry_type = EntryType::Directory;
+    }
+    // A `size` record replaces the size field, not the rule for which types
+    // carry data: a directory or FIFO has none whichever of the two records
+    // its size.
+    entry.size = rule.data_size(entry.entry_type, entry.size);
 }
 
 /// Whether this is an old GNU header: magic "ustar " and version " \0", as

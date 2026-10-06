@@ -403,24 +403,13 @@ impl ExtendedHeader {
                 self.linkpath = Some(value.as_bytes().to_vec());
             }
             "size" => {
-                self.size =
-                    Some(value.parse().map_err(|_| {
-                        PaxError::InvalidHeader(format!("invalid size: {}", value))
-                    })?);
+                self.size = Some(parse_decimal(keyword, value)?);
             }
             "uid" => {
-                self.uid = Some(
-                    value
-                        .parse()
-                        .map_err(|_| PaxError::InvalidHeader(format!("invalid uid: {}", value)))?,
-                );
+                self.uid = Some(parse_decimal(keyword, value)?);
             }
             "gid" => {
-                self.gid = Some(
-                    value
-                        .parse()
-                        .map_err(|_| PaxError::InvalidHeader(format!("invalid gid: {}", value)))?,
-                );
+                self.gid = Some(parse_decimal(keyword, value)?);
             }
             "uname" => {
                 self.uname = Some(value.as_bytes().to_vec());
@@ -449,15 +438,18 @@ impl ExtendedHeader {
 
         // Write a record unless the keyword is deleted, honoring any per-file
         // `keyword:=value` override. Plain functions rather than closures so the
-        // text and raw-bytes forms can both append to `data`.
+        // text and raw-bytes forms can both append to `data`. A record that
+        // names the member where its header fields cannot (`required`) is
+        // written whatever `-o delete=` matches.
         fn write_if_allowed_bytes(
             data: &mut Vec<u8>,
             options: &FormatOptions,
             per_file: &HashMap<String, Vec<u8>>,
             keyword: &str,
             default_value: &[u8],
+            required: bool,
         ) {
-            if options.should_delete_keyword(keyword) {
+            if !required && options.should_delete_keyword(keyword) {
                 return;
             }
             match per_file.get(keyword) {
@@ -473,7 +465,14 @@ impl ExtendedHeader {
             keyword: &str,
             default_value: &str,
         ) {
-            write_if_allowed_bytes(data, options, per_file, keyword, default_value.as_bytes());
+            write_if_allowed_bytes(
+                data,
+                options,
+                per_file,
+                keyword,
+                default_value.as_bytes(),
+                false,
+            );
         }
 
         macro_rules! rec {
@@ -482,8 +481,8 @@ impl ExtendedHeader {
             };
         }
         macro_rules! rec_bytes {
-            ($kw:expr, $val:expr) => {
-                write_if_allowed_bytes(&mut data, options, per_file, $kw, $val)
+            ($kw:expr, $val:expr, $required:expr) => {
+                write_if_allowed_bytes(&mut data, options, per_file, $kw, $val, $required)
             };
         }
 
@@ -501,13 +500,18 @@ impl ExtendedHeader {
             rec!("ctime", &format_pax_time(ctime));
         }
         if let Some(ref path) = self.path {
-            rec_bytes!("path", path);
+            rec_bytes!("path", path, try_split_path(path).is_none());
         }
         if let Some(ref linkpath) = self.linkpath {
-            rec_bytes!("linkpath", linkpath);
+            rec_bytes!("linkpath", linkpath, linkpath.len() > LINKNAME_LEN);
         }
+        // `size` frames the member: `from_entry` writes it only where a reader
+        // needs it to find the data's end -- a size the field cannot hold, or a
+        // hard link's data, which only an extended header makes a reader look
+        // for. Deleting it, or replacing its value, makes the data read as
+        // headers, so neither `-o delete=` nor `-o size:=` touches it.
         if let Some(size) = self.size {
-            rec!("size", &size.to_string());
+            write_pax_record_bytes(&mut data, "size", size.to_string().as_bytes());
         }
         if let Some(uid) = self.uid {
             rec!("uid", &uid.to_string());
@@ -516,10 +520,10 @@ impl ExtendedHeader {
             rec!("gid", &gid.to_string());
         }
         if let Some(ref uname) = self.uname {
-            rec_bytes!("uname", uname);
+            rec_bytes!("uname", uname, false);
         }
         if let Some(ref gname) = self.gname {
-            rec_bytes!("gname", gname);
+            rec_bytes!("gname", gname, false);
         }
         // Sorted: iterating a HashMap made the record order differ between runs
         // of the same command, so two invocations produced different bytes for
@@ -534,9 +538,9 @@ impl ExtendedHeader {
         // value is absent from this entry: write_if_allowed above already merges
         // an override when the entry carried the field, but a forced value such
         // as `-o gname:=other` / `-o uid:=N` on an entry with no gname/uid must
-        // still produce a record.
+        // still produce a record. Never `size`, for the reason above.
         for &keyword in STANDARD_KEYWORDS {
-            if self.holds(keyword) || options.should_delete_keyword(keyword) {
+            if self.holds(keyword) || options.should_delete_keyword(keyword) || keyword == "size" {
                 continue;
             }
             if let Some(value) = per_file.get(keyword) {
@@ -853,6 +857,9 @@ fn parse_record_span(data: &[u8], pos: usize) -> PaxResult<RecordSpan> {
 fn parse_pax_time(s: &str) -> PaxResult<PaxTime> {
     let invalid = || PaxError::InvalidHeader(format!("invalid pax time: {}", s));
     let (sec_str, frac_str) = s.split_once('.').unwrap_or((s, ""));
+    if !is_decimal(sec_str.strip_prefix('-').unwrap_or(sec_str)) {
+        return Err(invalid());
+    }
     let mut sec: i64 = sec_str.parse().map_err(|_| invalid())?;
 
     // Take up to 9 fractional digits, zero-padded to nanoseconds.
@@ -896,6 +903,23 @@ fn parse_pax_time(s: &str) -> PaxResult<PaxTime> {
 }
 
 const NSEC_PER_SEC: u32 = 1_000_000_000;
+
+/// Whether `s` is a decimal number: one or more digits and nothing else.
+///
+/// Rust's `parse` also takes a leading '+', which bsdtar and GNU tar do not;
+/// a `size=+5` that frames a member for one tool and not the other is how a
+/// member gets seen by one and not the other.
+fn is_decimal(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The value of an unsigned numeric record: `size`, `uid` or `gid`.
+fn parse_decimal<T: std::str::FromStr>(keyword: &str, value: &str) -> PaxResult<T> {
+    is_decimal(value)
+        .then(|| value.parse().ok())
+        .flatten()
+        .ok_or_else(|| PaxError::InvalidHeader(format!("invalid {keyword}: {value}")))
+}
 
 /// Format time for pax extended header, preserving exact nanoseconds: the
 /// signed decimal value, so a time before the Epoch has a leading '-' on the
@@ -1267,14 +1291,9 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
                     }
 
                     // Regular file entry - parse and apply extended headers
-                    let mut entry = parse_ustar_header(&header, rule)?;
-                    records.apply_to(&mut entry);
+                    let mut entry =
+                        parse_ustar_header(&header, rule, |entry| records.apply_to(entry))?;
                     entry.ext_records.share(&self.global_extra);
-
-                    // A `size=` record replaces the size field, not the rule
-                    // for which types carry data: a directory or FIFO has
-                    // none whichever of the two records its size.
-                    entry.size = rule.data_size(entry.entry_type, entry.size);
 
                     self.current_size = entry.size;
                     self.bytes_read = 0;
@@ -1372,8 +1391,9 @@ impl<W: Write> PaxWriter<W> {
             if special_keywords.contains(&key.as_str()) {
                 continue;
             }
-            // Skip if this keyword should be deleted
-            if self.options.should_delete_keyword(key) {
+            // Skip if this keyword should be deleted. A global `size` would
+            // give every member that length, whatever data follows it.
+            if self.options.should_delete_keyword(key) || key == "size" {
                 continue;
             }
             write_pax_record_bytes(&mut data, key, value);
@@ -1644,6 +1664,10 @@ fn build_ustar_header(entry: &ArchiveEntry) -> PaxResult<[u8; BLOCK_SIZE]> {
 /// `ExtendedHeader::from_entry`, so these fields are only a fallback for a
 /// reader that ignores extended headers. Truncate on a UTF-8 character
 /// boundary so a multi-byte character straddling NAME_LEN does not panic.
+///
+/// Nor may the cut leave a slash at the end of a non-directory's name: an
+/// empty regular file named so is a directory by the old-style rule, to a
+/// reader that ignores the `path` record.
 fn split_path(entry: &ArchiveEntry) -> PaxResult<(Vec<u8>, Vec<u8>)> {
     let path = ustar_path_bytes(entry);
 
@@ -1651,10 +1675,13 @@ fn split_path(entry: &ArchiveEntry) -> PaxResult<(Vec<u8>, Vec<u8>)> {
         return Ok(split);
     }
 
-    Ok((
-        path[..floor_char_boundary(&path, NAME_LEN)].to_vec(),
-        Vec::new(),
-    ))
+    let mut name = &path[..floor_char_boundary(&path, NAME_LEN)];
+    if entry.entry_type != EntryType::Directory {
+        while let Some(rest) = name.strip_suffix(b"/") {
+            name = rest;
+        }
+    }
+    Ok((name.to_vec(), Vec::new()))
 }
 
 /// Put an extended header's name in the name and prefix fields, split as a

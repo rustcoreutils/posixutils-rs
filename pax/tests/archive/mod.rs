@@ -1411,6 +1411,62 @@ fn test_linkdata_writes_hardlink_data() {
     assert_eq!(bodies, 2, "hard link b carries no data block");
 }
 
+/// `-o delete=` removes the records pax would otherwise write, but not the
+/// ones that frame a member. A hard link's data is read only from a pax
+/// archive -- one with an extended header -- so dropping `size` with the rest
+/// left the reader stepping over no data, and the bytes of `b` were read as
+/// the next header.
+#[test]
+fn test_delete_keeps_the_records_that_frame_a_member() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("a"), "DATA\n").unwrap();
+    fs::hard_link(temp.path().join("a"), temp.path().join("b")).unwrap();
+    fs::write(temp.path().join("c"), "see\n").unwrap();
+
+    let output = run_pax_in_dir(
+        &[
+            "-w", "-x", "pax", "-o", "linkdata", "-o", "delete=*", "a", "b", "c",
+        ],
+        temp.path(),
+    );
+    assert_success(&output, "pax -w -o linkdata -o delete=*");
+    let listing =
+        run_pax_with_stdin_bytes(&["-o", "listopt=%(typeflag)s %(size)d %F"], &output.stdout);
+    assert_success(&listing, "list the archive");
+    assert_eq!(stdout_str(&listing), "0 5 a\n1 5 b\n0 4 c\n");
+
+    // A name the header fields cannot hold keeps its `path` record too:
+    // without it the member is named by the first 100 bytes.
+    let long = format!("{}/{}", "d".repeat(99), "e".repeat(200));
+    fs::create_dir(temp.path().join("d".repeat(99))).unwrap();
+    fs::write(temp.path().join(&long), "").unwrap();
+    let output = run_pax_in_dir(
+        &["-w", "-x", "pax", "-o", "delete=path", &long],
+        temp.path(),
+    );
+    assert_success(&output, "pax -w -o delete=path");
+    let listing = run_pax_with_stdin_bytes(&[], &output.stdout);
+    assert_eq!(stdout_str(&listing), format!("{long}\n"));
+}
+
+/// The size of a member's data is not the operator's to set when writing:
+/// `-o size:=3` on a five-byte file wrote a record claiming three, and every
+/// member after it was read from the wrong place.
+#[test]
+fn test_size_option_does_not_reframe_written_members() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("a"), "DATA\n").unwrap();
+    fs::write(temp.path().join("c"), "see\n").unwrap();
+
+    for opt in ["size:=3", "size=3"] {
+        let output = run_pax_in_dir(&["-w", "-x", "pax", "-o", opt, "a", "c"], temp.path());
+        assert_success(&output, &format!("pax -w -o {opt}"));
+        let listing = run_pax_with_stdin_bytes(&["-o", "listopt=%(size)d %F"], &output.stdout);
+        assert_success(&listing, "list the archive");
+        assert_eq!(stdout_str(&listing), "5 a\n4 c\n", "-o {opt}");
+    }
+}
+
 /// ustar has no socket type. POSIX: a file that cannot be archived in the
 /// format is diagnosed. It must not turn into an empty regular file.
 #[test]

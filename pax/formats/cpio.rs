@@ -786,6 +786,12 @@ fn parse_octal_field(bytes: &[u8]) -> PaxResult<u64> {
 fn parse_hex_field(bytes: &[u8]) -> PaxResult<u64> {
     let s = std::str::from_utf8(bytes)
         .map_err(|_| PaxError::InvalidHeader("invalid hex field".to_string()))?;
+    // Digits only: `from_str_radix` also takes a leading '+', which GNU and
+    // BSD cpio do not, and a field one reader takes and another refuses frames
+    // the archive differently for each.
+    if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(PaxError::InvalidHeader(format!("invalid hex: {}", s)));
+    }
     u64::from_str_radix(s, 16).map_err(|_| PaxError::InvalidHeader(format!("invalid hex: {}", s)))
 }
 
@@ -894,28 +900,27 @@ fn build_odc_header(
 
     // c_mode (file type + permissions)
     let mode = build_mode(entry);
-    write_octal_field(&mut header, mode as u64, 6)?;
+    write_octal_field(&mut header, mode as u64, 6, "c_mode")?;
 
-    // c_uid (mask on overflow — high uids exceed the ODC 6-digit width)
-    write_octal_field_masked(&mut header, entry.uid as u64, 6);
-
-    // c_gid (mask on overflow — high gids exceed the ODC 6-digit width)
-    write_octal_field_masked(&mut header, entry.gid as u64, 6);
+    // c_uid and c_gid: six digits, 18 bits. A wider id is refused, not
+    // masked onto some other owner.
+    write_octal_field(&mut header, entry.uid as u64, 6, "c_uid")?;
+    write_octal_field(&mut header, entry.gid as u64, 6, "c_gid")?;
 
     // c_nlink
-    write_octal_field(&mut header, nlink, 6)?;
+    write_octal_field(&mut header, nlink, 6, "c_nlink")?;
 
     // c_rdev (device major/minor for block/char devices)
-    write_octal_field(&mut header, packed_rdev(entry)?, 6)?;
+    write_octal_field(&mut header, packed_rdev(entry)?, 6, "c_rdev")?;
 
     // c_mtime
-    write_octal_field(&mut header, entry.unsigned_mtime()?, 11)?;
+    write_octal_field(&mut header, entry.unsigned_mtime()?, 11, "c_mtime")?;
 
     // c_namesize (including NUL)
-    write_octal_field(&mut header, namesize as u64, 6)?;
+    write_octal_field(&mut header, namesize as u64, 6, "c_namesize")?;
 
     // c_filesize
-    write_octal_field(&mut header, entry.size, 11)?;
+    write_octal_field(&mut header, entry.size, 11, "c_filesize")?;
 
     Ok(header)
 }
@@ -924,8 +929,8 @@ fn build_odc_header(
 ///
 /// Every field is eight hex digits. The identity fields (c_ino, c_dev*) are
 /// masked on overflow for the same reason as in ODC -- they only group hard
-/// links -- while the fields the reader frames the stream with are rejected if
-/// they do not fit.
+/// links -- while the fields the reader frames or restores the member with
+/// are rejected if they do not fit.
 fn build_newc_header(
     entry: &ArchiveEntry,
     (ino, nlink): (u64, u64),
@@ -942,8 +947,8 @@ fn build_newc_header(
 
     write_hex_field_masked(&mut header, ino);
     write_hex_field(&mut header, build_mode(entry) as u64, "c_mode")?;
-    write_hex_field_masked(&mut header, entry.uid as u64);
-    write_hex_field_masked(&mut header, entry.gid as u64);
+    write_hex_field(&mut header, entry.uid as u64, "c_uid")?;
+    write_hex_field(&mut header, entry.gid as u64, "c_gid")?;
     write_hex_field(&mut header, nlink, "c_nlink")?;
     write_hex_field(&mut header, entry.unsigned_mtime()?, "c_mtime")?;
     write_hex_field(&mut header, entry.size, "c_filesize")?;
@@ -994,18 +999,14 @@ fn build_bin_header(
     push_u16(entry.dev & 0xffff);
     push_u16(ino & 0xffff);
     push_u16(build_mode(entry) as u64 & 0xffff);
-    push_u16(entry.uid as u64 & 0xffff);
-    push_u16(entry.gid as u64 & 0xffff);
-    push_u16(nlink & 0xffff);
+    // A wider owner or link count is refused, not masked: uid 65536 masked
+    // to 0 archived a setuid file as root's.
+    push_u16(fit_bin(entry.uid as u64, u16::MAX, "c_uid")?);
+    push_u16(fit_bin(entry.gid as u64, u16::MAX, "c_gid")?);
+    push_u16(fit_bin(nlink, u16::MAX, "c_nlink")?);
     push_u16(packed_rdev(entry)?);
 
-    let mtime = entry.unsigned_mtime()?;
-    if mtime > u32::MAX as u64 {
-        return Err(PaxError::InvalidHeader(format!(
-            "modification time {} does not fit the binary cpio format",
-            mtime
-        )));
-    }
+    let mtime = fit_bin(entry.unsigned_mtime()?, u32::MAX, "c_mtime")?;
     push_u16(mtime >> 16);
     push_u16(mtime & 0xffff);
 
@@ -1017,16 +1018,28 @@ fn build_bin_header(
     }
     push_u16(namesize as u64);
 
-    if entry.size > u32::MAX as u64 {
-        return Err(PaxError::InvalidHeader(format!(
-            "file size {} does not fit the binary cpio format",
-            entry.size
-        )));
-    }
-    push_u16(entry.size >> 16);
-    push_u16(entry.size & 0xffff);
+    let size = fit_bin(entry.size, u32::MAX, "c_filesize")?;
+    push_u16(size >> 16);
+    push_u16(size & 0xffff);
 
     Ok(header)
+}
+
+/// A binary header value that must fit its field whole: one or two 16-bit
+/// words, so `max` is `u16::MAX` or `u32::MAX`.
+fn fit_bin(val: u64, max: impl Into<u64>, field: &str) -> PaxResult<u64> {
+    if val > max.into() {
+        return Err(field_overflow(val, field, "binary"));
+    }
+    Ok(val)
+}
+
+/// The diagnostic for a value too large for its header field. The member is
+/// refused rather than written with the value cut down to the field.
+fn field_overflow(val: u64, field: &str, format: &str) -> PaxError {
+    PaxError::InvalidHeader(format!(
+        "value {val} too large for the {field} field of the cpio {format} format"
+    ))
 }
 
 /// Build c_mode from entry
@@ -1051,28 +1064,26 @@ pub(crate) fn cpio_mode(mode: u32, entry_type: EntryType) -> u32 {
     type_bits | (mode & C_PERM_MASK)
 }
 
-/// Write a stream-framing octal field (c_namesize, c_filesize, c_mtime) for the
-/// cpio ODC header.
+/// Write an octal field the reader needs verbatim for the cpio ODC header:
+/// one that frames the stream (c_namesize, c_filesize) or restores the member
+/// (c_mode, c_uid, c_gid, c_mtime ...).
 ///
-/// These fields determine how the reader frames the rest of the stream, so a
-/// value too large for `width` octal digits is rejected with an error rather
-/// than silently keeping only its low-order digits — truncation here would
-/// mis-frame every following header (e.g. c_filesize for a file ≥8 GiB in the
-/// 11-digit field).
-fn write_octal_field(buf: &mut Vec<u8>, val: u64, width: usize) -> PaxResult<()> {
+/// A value too large for `width` octal digits is rejected with an error
+/// rather than silently keeping only its low-order digits — truncation here
+/// would mis-frame every following header (e.g. c_filesize for a file ≥8 GiB
+/// in the 11-digit field), or give the file another owner. `field` names the
+/// header member for the diagnostic.
+fn write_octal_field(buf: &mut Vec<u8>, val: u64, width: usize, field: &str) -> PaxResult<()> {
     let s = format!("{:0width$o}", val, width = width);
     if s.len() > width {
-        return Err(PaxError::InvalidHeader(format!(
-            "value {} too large for {}-digit cpio ODC field",
-            val, width
-        )));
+        return Err(field_overflow(val, field, "odc"));
     }
     buf.extend_from_slice(s.as_bytes());
     Ok(())
 }
 
-/// Write an identity octal field (c_dev, c_ino, c_uid, c_gid) for the cpio ODC
-/// header, keeping only the low-order `width` octal digits on overflow.
+/// Write an identity octal field (c_dev, c_ino) for the cpio ODC header,
+/// keeping only the low-order `width` octal digits on overflow.
 ///
 /// Unlike the framing fields, these carry no stream-length information: c_dev /
 /// c_ino exist only to associate hard links within the archive, and large real
@@ -1097,10 +1108,7 @@ const NEWC_FIELD_WIDTH: usize = 8;
 fn write_hex_field(buf: &mut Vec<u8>, val: u64, field: &str) -> PaxResult<()> {
     let s = format!("{:0width$X}", val, width = NEWC_FIELD_WIDTH);
     if s.len() > NEWC_FIELD_WIDTH {
-        return Err(PaxError::InvalidHeader(format!(
-            "value {} too large for the {} field of the cpio newc format",
-            val, field
-        )));
+        return Err(field_overflow(val, field, "newc"));
     }
     buf.extend_from_slice(s.as_bytes());
     Ok(())
@@ -1108,8 +1116,8 @@ fn write_hex_field(buf: &mut Vec<u8>, val: u64, field: &str) -> PaxResult<()> {
 
 /// Write an eight-digit hex newc identity field, masking on overflow.
 ///
-/// As with the ODC identity fields, c_ino / c_dev* / c_uid / c_gid only need to
-/// be self-consistent within the archive, and real inode numbers routinely
+/// As with the ODC identity fields, c_ino / c_dev* only need to be
+/// self-consistent within the archive, and real inode numbers routinely
 /// exceed 32 bits.
 fn write_hex_field_masked(buf: &mut Vec<u8>, val: u64) {
     let s = format!("{:0width$X}", val & 0xffff_ffff, width = NEWC_FIELD_WIDTH);
@@ -1163,21 +1171,21 @@ mod tests {
     #[test]
     fn test_write_octal_field() {
         let mut buf = Vec::new();
-        write_octal_field(&mut buf, 0o644, 6).unwrap();
+        write_octal_field(&mut buf, 0o644, 6, "c_mode").unwrap();
         assert_eq!(&buf, b"000644");
 
         let mut buf = Vec::new();
-        write_octal_field(&mut buf, 0, 6).unwrap();
+        write_octal_field(&mut buf, 0, 6, "c_mode").unwrap();
         assert_eq!(&buf, b"000000");
 
         // The widest value that fits an 11-digit c_filesize field is 8 GiB - 1.
         let mut buf = Vec::new();
-        write_octal_field(&mut buf, 0o77_777_777_777, 11).unwrap();
+        write_octal_field(&mut buf, 0o77_777_777_777, 11, "c_filesize").unwrap();
         assert_eq!(&buf, b"77777777777");
 
         // One larger overflows and must be rejected, not truncated.
         let mut buf = Vec::new();
-        assert!(write_octal_field(&mut buf, 0o100_000_000_000, 11).is_err());
+        assert!(write_octal_field(&mut buf, 0o100_000_000_000, 11, "c_filesize").is_err());
     }
 
     #[test]
@@ -1390,6 +1398,35 @@ mod tests {
         assert!(build_bin_header(&device(255, 255), (1, 1), 4).is_ok());
         // newc has a field for each, and stores them whole.
         assert!(build_newc_header(&device(300, 300), (1, 1), 4, CpioFormat::Newc).is_ok());
+    }
+
+    /// An odc c_uid holds 18 bits and a binary one 16; a wider owner used to
+    /// be masked, so a setuid file of uid 262144 (odc) or 65536 (binary) was
+    /// archived as root's. It is refused, as a wide device number is. So is
+    /// a link count the binary format cannot hold, which odc already refused.
+    #[test]
+    fn test_wide_owner_ids_are_refused_by_odc_and_binary() {
+        let owned = |uid, gid| ArchiveEntry {
+            path: PathBuf::from("f"),
+            mode: 0o4755,
+            entry_type: EntryType::Regular,
+            uid,
+            gid,
+            ..Default::default()
+        };
+        for (uid, gid) in [(1 << 18, 0), (0, 1 << 18)] {
+            assert!(build_odc_header(&owned(uid, gid), (1, 1), 2).is_err());
+        }
+        assert!(build_odc_header(&owned((1 << 18) - 1, (1 << 18) - 1), (1, 1), 2).is_ok());
+        for (uid, gid) in [(1 << 16, 0), (0, 1 << 16)] {
+            assert!(build_bin_header(&owned(uid, gid), (1, 1), 2).is_err());
+        }
+        assert!(build_bin_header(&owned(0xffff, 0xffff), (1, 1), 2).is_ok());
+        assert!(build_bin_header(&owned(0, 0), (1, 1 << 16), 2).is_err());
+        assert!(build_odc_header(&owned(0, 0), (1, 1 << 18), 2).is_err());
+        // newc's fields are 32 bits, as wide as a uid_t.
+        let wide = owned(u32::MAX, u32::MAX);
+        assert!(build_newc_header(&wide, (1, 1), 2, CpioFormat::Newc).is_ok());
     }
 
     #[test]

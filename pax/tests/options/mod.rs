@@ -2694,3 +2694,126 @@ fn test_interactive_eof_finishes_the_archive() {
         assert_eq!(stderr_str(&out), "");
     }
 }
+
+/// POSIX -o: `keyword[[:]=value]`. The keyword ends at the first `=`; a `:=`
+/// later in the value is part of the value. Searching for `:=` first split
+/// `comment=a:=b` into the per-file keyword `comment=a` with value `b`.
+#[test]
+fn test_option_value_may_contain_colon_equals() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f"), b"x").unwrap();
+    for opt in ["comment=a:=b", "comment:=a:=b"] {
+        let out = run_pax_in_dir(
+            &["-w", "-x", "pax", "-o", opt, "-f", "o.pax", "f"],
+            temp.path(),
+        );
+        assert_success(&out, opt);
+        assert_eq!(
+            listopt(&temp.path().join("o.pax"), "%(comment)s"),
+            "a:=b",
+            "-o {opt}"
+        );
+    }
+}
+
+/// The listopt format follows printf's escapes, `\ddd` octal included (one to
+/// three digits). It was left as a backslash-less `ddd`.
+#[test]
+fn test_option_listopt_octal_escapes() {
+    let archive = Ustar {
+        name: b"f",
+        ..Default::default()
+    }
+    .archive();
+    let out = run_pax_with_stdin_bytes(&["-o", r"listopt=<\101\60\0101\377>%F"], &archive);
+    assert_success(&out, "listopt octal escapes");
+    assert_eq!(out.stdout, b"<A0\x081\xff>f\n");
+}
+
+/// POSIX: "The pax utility shall append a <newline> to the listopt output for
+/// each selected file" -- unconditionally, even when the format ends in one.
+#[test]
+fn test_option_listopt_newline_always_appended() {
+    let archive = [
+        Ustar {
+            name: b"a",
+            ..Default::default()
+        }
+        .member(),
+        Ustar {
+            name: b"b",
+            ..Default::default()
+        }
+        .member(),
+        ustar_trailer().to_vec(),
+    ]
+    .concat();
+    let out = run_pax_with_stdin_bytes(&["-o", "listopt=%F%n"], &archive);
+    assert_success(&out, "listopt ending in %n");
+    assert_eq!(out.stdout, b"a\n\nb\n\n");
+    let out = run_pax_with_stdin_bytes(&["-o", r"listopt=%F\n"], &archive);
+    assert_eq!(out.stdout, b"a\n\nb\n\n");
+}
+
+/// `-o` values are bytes: a `path:=` pathname, or a listopt literal, that is
+/// not UTF-8 was refused by the argument parser before pax saw it.
+#[test]
+fn test_option_values_may_be_non_utf8() {
+    use std::os::unix::ffi::OsStrExt;
+    let archive = Ustar {
+        name: b"f",
+        ..Default::default()
+    }
+    .archive();
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("a.tar"), &archive).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["-f", "a.tar", "-o"])
+        .arg(std::ffi::OsStr::from_bytes(b"path:=n\xff"))
+        .arg("-o")
+        .arg(std::ffi::OsStr::from_bytes(b"listopt=\xfe%F"))
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+    assert_success(&out, "-o with non-UTF-8 values");
+    assert_eq!(out.stdout, b"\xfen\xff\n");
+}
+
+/// POSIX -i: the response is the new name. Only its <newline> ends it, so a
+/// name with leading or trailing blanks can be given; the reply used to be
+/// trimmed.
+#[test]
+fn test_interactive_reply_keeps_blanks() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("a"), b"x").unwrap();
+    let Some((out, _)) = run_pax_on_tty(
+        &["-w", "-i", "-x", "ustar", "-f", "o.tar", "a"],
+        temp.path(),
+        b"  sp ace  \n",
+        std::time::Duration::from_secs(20),
+    ) else {
+        panic!("pax -w -i did not finish");
+    };
+    assert_success(&out, "pax -w -i");
+    let out = run_pax_in_dir(&["-f", "o.tar"], temp.path());
+    assert_eq!(stdout_str(&out), "  sp ace  \n");
+}
+
+/// A reply is a pathname, and a pathname is bytes: one that is not UTF-8
+/// aborted the run with "stream did not contain valid UTF-8".
+#[test]
+fn test_interactive_reply_may_be_non_utf8() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("a"), b"x").unwrap();
+    let Some((out, _)) = run_pax_on_tty(
+        &["-w", "-i", "-x", "ustar", "-f", "o.tar", "a"],
+        temp.path(),
+        b"n\xff\n",
+        std::time::Duration::from_secs(20),
+    ) else {
+        panic!("pax -w -i did not finish");
+    };
+    assert_success(&out, "pax -w -i with a non-UTF-8 reply");
+    let out = run_pax_in_dir(&["-f", "o.tar"], temp.path());
+    assert_eq!(out.stdout, b"n\xff\n");
+}

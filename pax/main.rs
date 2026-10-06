@@ -139,8 +139,9 @@ struct Args {
     #[arg(short = 'z', long = "gzip", help = gettext("Compress/decompress archive using gzip"))]
     gzip: bool,
 
+    // Bytes, like -s: a value can be a pathname or a listopt literal.
     #[arg(short = 'o', long = "options", action = clap::ArgAction::Append, allow_hyphen_values = true, help = gettext("Format-specific options"))]
-    format_options: Vec<String>,
+    format_options: Vec<OsString>,
 
     // An option-argument is taken verbatim (XBD 12.2, guideline 7), so an
     // expression delimited by '-' (`-s -a-b-`) is a value, not an option. It
@@ -270,8 +271,14 @@ fn main() -> ExitCode {
         Err(PaxError::EarlyExit) => ExitCode::SUCCESS,
         Err(e) => {
             // Escaped like every other diagnostic: the message can quote a
-            // name or a header value straight out of the archive.
-            crate::escape::write_stderr_line(format!("{}: {}", program.name(), e).as_bytes());
+            // name or a header value straight out of the archive. The usage
+            // hint is pax's own line, so it is not.
+            let hint = match e {
+                PaxError::Usage(_, Some(prog)) => format!("Try '{} --help'.\n", prog),
+                _ => String::new(),
+            };
+            let line = format!("{}: {}", program.name(), e);
+            crate::escape::write_stderr_line_then(line.as_bytes(), &hint);
             ExitCode::FAILURE
         }
     }
@@ -377,9 +384,10 @@ fn determine_mode(args: &Args) -> PaxMode {
 
 /// Parse all -o format options from arguments
 fn parse_format_options(args: &Args) -> PaxResult<FormatOptions> {
+    use std::os::unix::ffi::OsStrExt;
     let mut opts = FormatOptions::new();
     for opt_str in &args.format_options {
-        opts.parse_into(opt_str)?;
+        opts.parse_into(opt_str.as_bytes())?;
     }
     Ok(opts)
 }

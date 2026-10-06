@@ -16,6 +16,10 @@
 //!
 //! The `:=` form is used for per-file options (pax format),
 //! while `=` is used for global options.
+//!
+//! An option-argument is bytes. Keywords are text, but a value can be a
+//! pathname (`path:=`), a name template or a listopt literal, none of which
+//! need be UTF-8, so values are kept as the bytes given.
 
 use crate::archive::{ArchiveEntry, EntryType, SourceHeader};
 use crate::error::{PaxError, PaxResult};
@@ -101,13 +105,13 @@ fn canonical_hdrcharset(value: &str) -> PaxResult<&'static str> {
 #[derive(Debug, Clone, Default)]
 pub struct FormatOptions {
     /// Global options (keyword=value)
-    global: HashMap<String, String>,
+    global: HashMap<String, Vec<u8>>,
     /// Per-file options (keyword:=value) - for future pax format support
-    per_file: HashMap<String, String>,
+    per_file: HashMap<String, Vec<u8>>,
     /// List format specification (listopt=format)
-    pub list_format: Option<String>,
+    pub list_format: Option<Vec<u8>>,
     /// Delete patterns (delete=pattern) - for future pax format support
-    pub delete_patterns: Vec<String>,
+    pub delete_patterns: Vec<Vec<u8>>,
     /// Pre-compiled delete patterns for efficient matching
     delete_patterns_compiled: Vec<Pattern>,
     /// Times option (include atime/mtime -- and, as an extension, ctime -- in
@@ -117,10 +121,10 @@ pub struct FormatOptions {
     pub link_data: bool,
     /// Extended header name template (exthdr.name)
     /// Default: "%d/PaxHeaders.%p/%f"
-    pub exthdr_name: Option<String>,
+    pub exthdr_name: Option<Vec<u8>>,
     /// Global extended header name template (globexthdr.name)
     /// Default: "$TMPDIR/GlobalHead.%p.%n"
-    pub globexthdr_name: Option<String>,
+    pub globexthdr_name: Option<Vec<u8>>,
 }
 
 /// Known option identifiers for table-driven parsing
@@ -158,14 +162,14 @@ impl FormatOptions {
     #[cfg(test)]
     pub fn parse(input: &str) -> PaxResult<Self> {
         let mut options = FormatOptions::new();
-        options.parse_into(input)?;
+        options.parse_into(input.as_bytes())?;
         Ok(options)
     }
 
     /// Parse options and merge into existing options
     ///
     /// Later options take precedence over earlier ones.
-    pub fn parse_into(&mut self, input: &str) -> PaxResult<()> {
+    pub fn parse_into(&mut self, input: &[u8]) -> PaxResult<()> {
         // Per POSIX, `listopt` is the final <comma>-separated keyword: "all
         // characters in the remainder of the option-argument shall be
         // considered part of the format string" -- commas and trailing blanks
@@ -176,38 +180,38 @@ impl FormatOptions {
         };
         // Only the one comma that separates the tail goes: an escaped comma
         // ending the keyword before it is part of that keyword's value.
-        let before = input[..marker].trim_end();
-        self.parse_comma_list(before.strip_suffix(',').unwrap_or(before))?;
-        let format = decode_printf_escapes(&input[marker + "listopt=".len()..]);
+        let before = input[..marker].trim_ascii_end();
+        self.parse_comma_list(before.strip_suffix(b",").unwrap_or(before))?;
+        let format = decode_printf_escapes(&input[marker + b"listopt=".len()..]);
         // "When multiple -o listopt=format options are specified, the format
         // strings shall be considered a single, concatenated string, evaluated
         // in command-line order."
         self.list_format
-            .get_or_insert_with(String::new)
-            .push_str(&format);
+            .get_or_insert_with(Vec::new)
+            .extend_from_slice(&format);
         Ok(())
     }
 
     /// Parse a sequence of comma-separated options (backslash escapes a comma).
-    fn parse_comma_list(&mut self, input: &str) -> PaxResult<()> {
-        let mut current = String::new();
+    fn parse_comma_list(&mut self, input: &[u8]) -> PaxResult<()> {
+        let mut current = Vec::new();
         let mut escaped = false;
 
-        for c in input.chars() {
+        for &b in input {
             if escaped {
-                current.push(c);
+                current.push(b);
                 escaped = false;
-            } else if c == '\\' {
+            } else if b == b'\\' {
                 escaped = true;
-            } else if c == ',' {
-                self.parse_single_option(current.trim())?;
+            } else if b == b',' {
+                self.parse_single_option(current.trim_ascii())?;
                 current.clear();
             } else {
-                current.push(c);
+                current.push(b);
             }
         }
 
-        let final_opt = current.trim();
+        let final_opt = current.trim_ascii();
         if !final_opt.is_empty() {
             self.parse_single_option(final_opt)?;
         }
@@ -216,26 +220,14 @@ impl FormatOptions {
     }
 
     /// Parse a single option (keyword[[:]=value])
-    fn parse_single_option(&mut self, opt: &str) -> PaxResult<()> {
+    fn parse_single_option(&mut self, opt: &[u8]) -> PaxResult<()> {
         use KnownOption::*;
 
         if opt.is_empty() {
             return Ok(());
         }
 
-        // Check for := (per-file) or = (global)
-        let (keyword, value, is_per_file) = if let Some(pos) = opt.find(":=") {
-            let keyword = opt[..pos].trim();
-            let value = opt[pos + 2..].trim();
-            (keyword, Some(value), true)
-        } else if let Some(pos) = opt.find('=') {
-            let keyword = opt[..pos].trim();
-            let value = opt[pos + 1..].trim();
-            (keyword, Some(value), false)
-        } else {
-            // Boolean keyword with no value
-            (opt.trim(), None, false)
-        };
+        let (keyword, value, is_per_file) = split_option(opt)?;
 
         // Checked here rather than through KNOWN_OPTIONS, because the value
         // still has to reach the `g`/`x` extended header like any other
@@ -244,7 +236,9 @@ impl FormatOptions {
         // field is zero length, it shall delete any ... previously entered
         // extended header value"), so it is left alone.
         let value = match (keyword, value) {
-            ("hdrcharset", Some(v)) if !v.is_empty() => Some(canonical_hdrcharset(v)?),
+            ("hdrcharset", Some(v)) if !v.is_empty() => {
+                Some(canonical_hdrcharset(&String::from_utf8_lossy(v))?.as_bytes())
+            }
             _ => value,
         };
 
@@ -253,18 +247,21 @@ impl FormatOptions {
             match known_opt {
                 Times => self.include_times = true,
                 LinkData => self.link_data = true,
-                ListFormat => self.list_format = value.map(|s| s.to_string()),
-                ExthdrName => self.exthdr_name = value.map(|s| s.to_string()),
-                GlobexthdrName => self.globexthdr_name = value.map(|s| s.to_string()),
+                ListFormat => self.list_format = value.map(<[u8]>::to_vec),
+                ExthdrName => self.exthdr_name = value.map(<[u8]>::to_vec),
+                GlobexthdrName => self.globexthdr_name = value.map(<[u8]>::to_vec),
                 Delete => {
                     if let Some(pattern) = value {
-                        self.delete_patterns.push(pattern.to_string());
+                        self.delete_patterns.push(pattern.to_vec());
                         self.delete_patterns_compiled.push(Pattern::new(pattern));
                     }
                 }
                 Invalid => {
                     if let Some(v) = value {
-                        match INVALID_ACTIONS.iter().find(|(name, _)| *name == v) {
+                        match INVALID_ACTIONS
+                            .iter()
+                            .find(|(name, _)| name.as_bytes() == v)
+                        {
                             Some((_, true)) => {}
                             Some((name, false)) => {
                                 return Err(PaxError::InvalidFormat(format!(
@@ -277,7 +274,7 @@ impl FormatOptions {
                             None => {
                                 return Err(PaxError::InvalidFormat(format!(
                                     "invalid value for 'invalid' option: {}",
-                                    v
+                                    String::from_utf8_lossy(v)
                                 )))
                             }
                         }
@@ -286,13 +283,12 @@ impl FormatOptions {
             }
         } else {
             // Store unknown options for format-specific handling
-            if is_per_file {
-                self.per_file
-                    .insert(keyword.to_string(), value.unwrap_or("").to_string());
+            let map = if is_per_file {
+                &mut self.per_file
             } else {
-                self.global
-                    .insert(keyword.to_string(), value.unwrap_or("").to_string());
-            }
+                &mut self.global
+            };
+            map.insert(keyword.to_string(), value.unwrap_or_default().to_vec());
         }
 
         Ok(())
@@ -300,7 +296,7 @@ impl FormatOptions {
 
     /// Get a per-file option value
     #[cfg(test)]
-    pub fn get_per_file(&self, key: &str) -> Option<&String> {
+    pub fn get_per_file(&self, key: &str) -> Option<&Vec<u8>> {
         self.per_file.get(key)
     }
 
@@ -349,17 +345,17 @@ impl FormatOptions {
         self.per_file
             .get("hdrcharset")
             .or_else(|| self.global.get("hdrcharset"))
-            .map(String::as_str)
+            .and_then(|value| std::str::from_utf8(value).ok())
             .filter(|value| !value.is_empty())
     }
 
     /// Get the global options map for extended header generation
-    pub fn global_options(&self) -> &HashMap<String, String> {
+    pub fn global_options(&self) -> &HashMap<String, Vec<u8>> {
         &self.global
     }
 
     /// Get the per-file options map for extended header generation
-    pub fn per_file_options(&self) -> &HashMap<String, String> {
+    pub fn per_file_options(&self) -> &HashMap<String, Vec<u8>> {
         &self.per_file
     }
 
@@ -372,8 +368,11 @@ impl FormatOptions {
     /// - `%%` - literal percent sign
     ///
     /// Default template: "%d/PaxHeaders.%p/%f"
-    pub fn expand_exthdr_name(&self, path: &std::path::Path, sequence: u64) -> String {
-        let template = self.exthdr_name.as_deref().unwrap_or("%d/PaxHeaders.%p/%f");
+    pub fn expand_exthdr_name(&self, path: &std::path::Path, sequence: u64) -> Vec<u8> {
+        let template = self
+            .exthdr_name
+            .as_deref()
+            .unwrap_or(b"%d/PaxHeaders.%p/%f");
 
         expand_header_template(template, path, sequence)
     }
@@ -387,70 +386,96 @@ impl FormatOptions {
     ///
     /// Default template: "$TMPDIR/GlobalHead.%p.%n", with `$TMPDIR` defaulting
     /// to `/tmp` when unset (per POSIX ENVIRONMENT VARIABLES).
-    pub fn expand_globexthdr_name(&self, sequence: u64) -> String {
-        let tmpdir = std::env::var("TMPDIR").ok();
-        let default_template = default_globexthdr_template(tmpdir.as_deref());
+    pub fn expand_globexthdr_name(&self, sequence: u64) -> Vec<u8> {
+        let tmpdir = std::env::var_os("TMPDIR");
+        let tmpdir = tmpdir
+            .as_deref()
+            .map(std::os::unix::ffi::OsStrExt::as_bytes);
+        let default_template = default_globexthdr_template(tmpdir);
         let template = self.globexthdr_name.as_deref().unwrap_or(&default_template);
 
         expand_global_header_template(template, sequence)
     }
 }
 
+/// Split one `keyword[[:]=value]` option into its keyword, its value and
+/// whether it is the per-file `:=` form.
+///
+/// The keyword ends at the first `=`; a `:` just before it makes the option
+/// per-file. Any `:=` after that is part of the value, so `comment=a:=b` is
+/// the global keyword `comment` with the value `a:=b`.
+fn split_option(opt: &[u8]) -> PaxResult<(&str, Option<&[u8]>, bool)> {
+    let (keyword, value, is_per_file) = match opt.iter().position(|&b| b == b'=') {
+        Some(pos) => {
+            let value = Some(opt[pos + 1..].trim_ascii());
+            match opt[..pos].strip_suffix(b":") {
+                Some(keyword) => (keyword, value, true),
+                None => (&opt[..pos], value, false),
+            }
+        }
+        // Boolean keyword with no value
+        None => (opt, None, false),
+    };
+    let keyword = std::str::from_utf8(keyword.trim_ascii()).map_err(|_| {
+        PaxError::InvalidFormat(format!(
+            "-o keyword '{}' is not valid UTF-8",
+            String::from_utf8_lossy(keyword)
+        ))
+    })?;
+    Ok((keyword, value, is_per_file))
+}
+
 /// Build the default `globexthdr.name` template from `$TMPDIR` (or `/tmp`).
-fn default_globexthdr_template(tmpdir: Option<&str>) -> String {
-    let dir = tmpdir.unwrap_or("/tmp");
-    format!("{}/GlobalHead.%p.%n", dir.trim_end_matches('/'))
+fn default_globexthdr_template(tmpdir: Option<&[u8]>) -> Vec<u8> {
+    let dir = tmpdir.unwrap_or(b"/tmp");
+    let mut template = trim_trailing_slashes(dir).to_vec();
+    template.extend_from_slice(b"/GlobalHead.%p.%n");
+    template
 }
 
 /// Context for template expansion
 struct TemplateContext<'a> {
-    dirname: Option<&'a str>,
-    filename: Option<&'a str>,
+    dirname: Option<&'a [u8]>,
+    filename: Option<&'a [u8]>,
     pid: u32,
     sequence: u64,
 }
 
 /// Type alias for template specifier handler
-type TemplateHandler = fn(&TemplateContext) -> Option<String>;
+type TemplateHandler = fn(&TemplateContext) -> Option<Vec<u8>>;
 
 /// Template specifier handlers
-const TEMPLATE_SPECIFIERS: &[(char, TemplateHandler)] = &[
-    ('d', |ctx| ctx.dirname.map(|s| s.to_string())),
-    ('f', |ctx| ctx.filename.map(|s| s.to_string())),
-    ('p', |ctx| Some(ctx.pid.to_string())),
-    ('n', |ctx| Some(ctx.sequence.to_string())),
-    ('%', |_| Some("%".to_string())),
+const TEMPLATE_SPECIFIERS: &[(u8, TemplateHandler)] = &[
+    (b'd', |ctx| ctx.dirname.map(<[u8]>::to_vec)),
+    (b'f', |ctx| ctx.filename.map(<[u8]>::to_vec)),
+    (b'p', |ctx| Some(ctx.pid.to_string().into_bytes())),
+    (b'n', |ctx| Some(ctx.sequence.to_string().into_bytes())),
+    (b'%', |_| Some(b"%".to_vec())),
 ];
 
-/// Unified template expansion function
-fn expand_template(template: &str, ctx: &TemplateContext) -> String {
-    let mut result = String::new();
-    let mut chars = template.chars().peekable();
+/// Unified template expansion function. A name is bytes, and so is the
+/// template that builds one.
+fn expand_template(template: &[u8], ctx: &TemplateContext) -> Vec<u8> {
+    let mut result = Vec::new();
+    let mut bytes = template.iter().copied();
 
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            match chars.next() {
-                Some(spec) => {
-                    if let Some((_, handler)) =
-                        TEMPLATE_SPECIFIERS.iter().find(|(ch, _)| *ch == spec)
-                    {
-                        if let Some(value) = handler(ctx) {
-                            result.push_str(&value);
-                        } else {
-                            // Specifier not available in this context - pass through
-                            result.push('%');
-                            result.push(spec);
-                        }
-                    } else {
-                        // Unknown specifier - include literally
-                        result.push('%');
-                        result.push(spec);
-                    }
-                }
-                None => result.push('%'),
-            }
-        } else {
-            result.push(c);
+    while let Some(b) = bytes.next() {
+        if b != b'%' {
+            result.push(b);
+            continue;
+        }
+        let Some(spec) = bytes.next() else {
+            result.push(b'%');
+            break;
+        };
+        let value = TEMPLATE_SPECIFIERS
+            .iter()
+            .find(|(ch, _)| *ch == spec)
+            .and_then(|(_, handler)| handler(ctx));
+        match value {
+            Some(value) => result.extend_from_slice(&value),
+            // Unknown, or not available in this context: included literally.
+            None => result.extend_from_slice(&[b'%', spec]),
         }
     }
 
@@ -458,14 +483,11 @@ fn expand_template(template: &str, ctx: &TemplateContext) -> String {
 }
 
 /// Expand template for per-file extended header names
-fn expand_header_template(template: &str, path: &std::path::Path, sequence: u64) -> String {
+fn expand_header_template(template: &[u8], path: &std::path::Path, sequence: u64) -> Vec<u8> {
     let path = crate::rawpath::as_bytes(path);
-    let dirname_owned = String::from_utf8_lossy(dirname(path)).into_owned();
-    let filename_owned = String::from_utf8_lossy(basename(path)).into_owned();
-
     let ctx = TemplateContext {
-        dirname: Some(dirname_owned.as_str()),
-        filename: Some(filename_owned.as_str()),
+        dirname: Some(dirname(path)),
+        filename: Some(basename(path)),
         pid: std::process::id(),
         sequence,
     };
@@ -509,7 +531,7 @@ fn trim_trailing_slashes(path: &[u8]) -> &[u8] {
 }
 
 /// Expand template for global extended header names
-fn expand_global_header_template(template: &str, sequence: u64) -> String {
+fn expand_global_header_template(template: &[u8], sequence: u64) -> Vec<u8> {
     let ctx = TemplateContext {
         dirname: None,
         filename: None,
@@ -650,22 +672,22 @@ const FORMAT_SPECIFIERS: &[(char, FormatHandler)] = &[
 
 /// Locate a `listopt=` keyword sitting at an option boundary (start of string
 /// or just after an unescaped comma), returning the byte offset of `listopt=`.
-fn find_listopt_marker(input: &str) -> Option<usize> {
+fn find_listopt_marker(input: &[u8]) -> Option<usize> {
     let mut boundaries = vec![0usize];
     let mut escaped = false;
-    for (i, c) in input.char_indices() {
+    for (i, &b) in input.iter().enumerate() {
         if escaped {
             escaped = false;
-        } else if c == '\\' {
+        } else if b == b'\\' {
             escaped = true;
-        } else if c == ',' {
+        } else if b == b',' {
             boundaries.push(i + 1);
         }
     }
     for b in boundaries {
         let rest = &input[b..];
-        let start = b + (rest.len() - rest.trim_start().len());
-        if input[start..].starts_with("listopt=") {
+        let start = b + (rest.len() - rest.trim_ascii_start().len());
+        if input[start..].starts_with(b"listopt=") {
             return Some(start);
         }
     }
@@ -674,28 +696,47 @@ fn find_listopt_marker(input: &str) -> Option<usize> {
 
 /// Decode the backslash escapes of a listopt format, which POSIX makes a
 /// `printf` format: `\\`, `\a`, `\b`, `\f`, `\n`, `\r`, `\t` and `\v` are the
-/// characters XBD File Format Notation gives them. Before any other character
-/// the backslash is dropped, so `\,` is a comma, as it is elsewhere in `-o`.
-fn decode_printf_escapes(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
+/// characters XBD File Format Notation gives them, and `\ddd` -- one to three
+/// octal digits -- is the byte with that value, as in `printf`. Before any
+/// other character the backslash is dropped, so `\,` is a comma, as it is
+/// elsewhere in `-o`.
+fn decode_printf_escapes(s: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        let b = s[i];
+        i += 1;
+        if b != b'\\' {
+            out.push(b);
             continue;
         }
-        let Some(next) = chars.next() else {
-            out.push(c);
+        let Some(&next) = s.get(i) else {
+            out.push(b);
             break;
         };
+        let octal = s[i..]
+            .iter()
+            .take(3)
+            .take_while(|d| matches!(d, b'0'..=b'7'))
+            .count();
+        if octal > 0 {
+            // Like printf, a value past 0377 keeps its low eight bits.
+            let value = s[i..i + octal]
+                .iter()
+                .fold(0u32, |v, d| v * 8 + u32::from(d - b'0'));
+            out.push(value as u8);
+            i += octal;
+            continue;
+        }
+        i += 1;
         out.push(match next {
-            'a' => '\x07',
-            'b' => '\x08',
-            'f' => '\x0c',
-            'n' => '\n',
-            'r' => '\r',
-            't' => '\t',
-            'v' => '\x0b',
+            b'a' => 0x07,
+            b'b' => 0x08,
+            b'f' => 0x0c,
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'v' => 0x0b,
             other => other,
         });
     }
@@ -722,26 +763,29 @@ fn decode_printf_escapes(s: &str) -> String {
 /// - `%G` - group gid
 /// - `%n` - newline
 /// - `%%` - literal %
-pub fn format_list_entry(format: &str, info: &ListEntryInfo) -> Vec<u8> {
+pub fn format_list_entry(format: &[u8], info: &ListEntryInfo) -> Vec<u8> {
     let mut result: Vec<u8> = Vec::new();
-    let mut chars = format.chars().peekable();
+    let mut bytes = format.iter().copied().peekable();
 
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            if let Some(spec) = parse_format_specifier(&mut chars) {
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            if let Some(spec) = parse_format_specifier(&mut bytes) {
                 result.extend_from_slice(&format_with_spec(info, spec));
             } else {
                 result.push(b'%');
             }
         } else {
-            // The format string is operator-supplied text; its literal
-            // characters go out as their UTF-8 encoding.
-            result.extend_from_slice(c.encode_utf8(&mut [0u8; 4]).as_bytes());
+            // The format string is operator-supplied; its literal bytes go
+            // out as given.
+            result.push(b);
         }
     }
 
     result
 }
+
+/// The bytes of a listopt format, as `format_list_entry` reads them.
+type FormatBytes<'a> = std::iter::Peekable<std::iter::Copied<std::slice::Iter<'a, u8>>>;
 
 /// Maximum allowed width or precision for listopt format specifiers.
 /// This prevents unbounded memory allocation from malicious format strings.
@@ -754,60 +798,49 @@ struct FormatSpec {
     left_justify: bool,
     width: Option<usize>,
     precision: Option<usize>,
-    spec: char,
+    /// The conversion character. A byte, since a format need not be UTF-8;
+    /// every conversion is ASCII.
+    spec: u8,
     /// POSIX `%(keyword)X` extended-header keyword (with an optional `=subformat`
     /// tail used by the `T` time conversion).
     keyword: Option<String>,
 }
 
-fn parse_format_specifier(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) -> Option<FormatSpec> {
+fn parse_format_specifier(bytes: &mut FormatBytes) -> Option<FormatSpec> {
     let mut spec = FormatSpec::default();
 
-    while let Some('-') = chars.peek().copied() {
+    while bytes.next_if_eq(&b'-').is_some() {
         spec.left_justify = true;
-        chars.next();
     }
 
-    spec.width = parse_number(chars).map(|w| w.min(MAX_FORMAT_FIELD_SIZE));
+    spec.width = parse_number(bytes).map(|w| w.min(MAX_FORMAT_FIELD_SIZE));
 
-    if let Some('.') = chars.peek().copied() {
-        chars.next();
-        spec.precision = parse_number(chars)
+    if bytes.next_if_eq(&b'.').is_some() {
+        spec.precision = parse_number(bytes)
             .map(|p| p.min(MAX_FORMAT_FIELD_SIZE))
             .or(Some(0));
     }
 
-    // POSIX keyword substitution: `%(keyword)s`, `%(mtime=%Y)T`, etc.
-    if let Some('(') = chars.peek().copied() {
-        chars.next();
-        let mut keyword = String::new();
-        for c in chars.by_ref() {
-            if c == ')' {
-                break;
-            }
-            keyword.push(c);
-        }
-        spec.keyword = Some(keyword);
+    // POSIX keyword substitution: `%(keyword)s`, `%(mtime=%Y)T`, etc. A
+    // keyword is text; only a time subformat could be anything else.
+    if bytes.next_if_eq(&b'(').is_some() {
+        let keyword: Vec<u8> = bytes.by_ref().take_while(|&b| b != b')').collect();
+        spec.keyword = Some(String::from_utf8_lossy(&keyword).into_owned());
     }
 
-    spec.spec = chars.next()?;
+    spec.spec = bytes.next()?;
     Some(spec)
 }
 
-fn parse_number(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<usize> {
+fn parse_number(bytes: &mut FormatBytes) -> Option<usize> {
     let mut value: usize = 0;
     let mut seen = false;
 
-    while let Some(c) = chars.peek().copied() {
-        if let Some(digit) = c.to_digit(10) {
-            seen = true;
-            value = value.saturating_mul(10).saturating_add(digit as usize);
-            chars.next();
-        } else {
-            break;
-        }
+    while let Some(b) = bytes.next_if(u8::is_ascii_digit) {
+        seen = true;
+        value = value
+            .saturating_mul(10)
+            .saturating_add(usize::from(b - b'0'));
     }
 
     if seen {
@@ -818,18 +851,17 @@ fn parse_number(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<
 }
 
 fn format_with_spec(info: &ListEntryInfo, spec: FormatSpec) -> Vec<u8> {
+    let conversion = char::from(spec.spec);
     let mut rendered = if let Some(ref keyword) = spec.keyword {
-        match keyword_value(info, keyword, spec.spec) {
+        match keyword_value(info, keyword, conversion) {
             KeywordValue::Value(v) => v,
             KeywordValue::Absent => Vec::new(),
-            KeywordValue::Unknown => format!("%({}){}", keyword, spec.spec).into_bytes(),
+            KeywordValue::Unknown => [format!("%({})", keyword).as_bytes(), &[spec.spec]].concat(),
         }
-    } else if let Some((_, handler)) = FORMAT_SPECIFIERS.iter().find(|(ch, _)| *ch == spec.spec) {
+    } else if let Some((_, handler)) = FORMAT_SPECIFIERS.iter().find(|(ch, _)| *ch == conversion) {
         handler(info)
     } else {
-        let mut literal = String::from("%");
-        literal.push(spec.spec);
-        literal.into_bytes()
+        vec![b'%', spec.spec]
     };
 
     // Width and precision count display units, not bytes: a byte index would
@@ -1384,7 +1416,7 @@ mod tests {
     #[test]
     fn test_parse_key_value() {
         let opts = FormatOptions::parse("listopt=%F %s").unwrap();
-        assert_eq!(opts.list_format, Some("%F %s".to_string()));
+        assert_eq!(opts.list_format.as_deref(), Some(&b"%F %s"[..]));
     }
 
     #[test]
@@ -1392,27 +1424,39 @@ mod tests {
         let opts = FormatOptions::parse("times,linkdata,listopt=%F").unwrap();
         assert!(opts.include_times);
         assert!(opts.link_data);
-        assert_eq!(opts.list_format, Some("%F".to_string()));
+        assert_eq!(opts.list_format.as_deref(), Some(&b"%F"[..]));
     }
 
     #[test]
     fn test_parse_delete_patterns() {
         let opts = FormatOptions::parse("delete=*.tmp,delete=*.bak").unwrap();
         assert_eq!(opts.delete_patterns.len(), 2);
-        assert!(opts.delete_patterns.contains(&"*.tmp".to_string()));
-        assert!(opts.delete_patterns.contains(&"*.bak".to_string()));
+        assert!(opts.delete_patterns.contains(&b"*.tmp".to_vec()));
+        assert!(opts.delete_patterns.contains(&b"*.bak".to_vec()));
+    }
+
+    /// The keyword ends at the first `=`; a later `:=` is value.
+    #[test]
+    fn test_split_option_at_first_equals() {
+        let opts = FormatOptions::parse("comment=a:=b").unwrap();
+        assert_eq!(
+            opts.global.get("comment").map(Vec::as_slice),
+            Some(&b"a:=b"[..])
+        );
+        let opts = FormatOptions::parse("comment:=a=b").unwrap();
+        assert_eq!(opts.get_per_file("comment"), Some(&b"a=b".to_vec()));
     }
 
     #[test]
     fn test_parse_per_file_option() {
         let opts = FormatOptions::parse("gname:=mygroup").unwrap();
-        assert_eq!(opts.get_per_file("gname"), Some(&"mygroup".to_string()));
+        assert_eq!(opts.get_per_file("gname"), Some(&b"mygroup".to_vec()));
     }
 
     #[test]
     fn test_parse_escaped_comma() {
         let opts = FormatOptions::parse(r"listopt=a\,b").unwrap();
-        assert_eq!(opts.list_format, Some("a,b".to_string()));
+        assert_eq!(opts.list_format.as_deref(), Some(&b"a,b"[..]));
     }
 
     #[test]
@@ -1434,8 +1478,8 @@ mod tests {
             );
         }
         assert_eq!(
-            expand_header_template("%d/PaxHeaders.%p/%f", std::path::Path::new("top"), 1),
-            format!("./PaxHeaders.{}/top", std::process::id())
+            expand_header_template(b"%d/PaxHeaders.%p/%f", std::path::Path::new("top"), 1),
+            format!("./PaxHeaders.{}/top", std::process::id()).into_bytes()
         );
     }
 
@@ -1446,14 +1490,14 @@ mod tests {
         // mutating the process-global TMPDIR env (which would race other tests'
         // temp-dir creation).
         assert_eq!(
-            default_globexthdr_template(Some("/custom/tmp")),
-            "/custom/tmp/GlobalHead.%p.%n"
+            default_globexthdr_template(Some(b"/custom/tmp")),
+            b"/custom/tmp/GlobalHead.%p.%n"
         );
         assert_eq!(
-            default_globexthdr_template(Some("/custom/tmp/")),
-            "/custom/tmp/GlobalHead.%p.%n"
+            default_globexthdr_template(Some(b"/custom/tmp/")),
+            b"/custom/tmp/GlobalHead.%p.%n"
         );
-        assert_eq!(default_globexthdr_template(None), "/tmp/GlobalHead.%p.%n");
+        assert_eq!(default_globexthdr_template(None), b"/tmp/GlobalHead.%p.%n");
     }
 
     /// `-o hdrcharset=` named the encoding of the path, linkpath, uname and
@@ -1466,15 +1510,15 @@ mod tests {
         for spelling in ["BINARY", "binary", "Binary"] {
             let opts = FormatOptions::parse(&format!("hdrcharset={spelling}")).unwrap();
             assert_eq!(
-                opts.global_options().get("hdrcharset").map(String::as_str),
-                Some("BINARY"),
+                opts.global_options().get("hdrcharset").map(Vec::as_slice),
+                Some(&b"BINARY"[..]),
                 "{spelling} must record as POSIX's spelling"
             );
         }
         let utf8 = FormatOptions::parse("hdrcharset=iso-ir 10646 2000 utf-8").unwrap();
         assert_eq!(
-            utf8.global_options().get("hdrcharset").map(String::as_str),
-            Some("ISO-IR 10646 2000 UTF-8")
+            utf8.global_options().get("hdrcharset").map(Vec::as_slice),
+            Some(&b"ISO-IR 10646 2000 UTF-8"[..])
         );
 
         // A name pax cannot encode to is refused, and the message names the
@@ -1502,8 +1546,8 @@ mod tests {
     fn test_parse_charset_value_is_carried_unchecked() {
         let opts = FormatOptions::parse("charset=ISO-IR 8859 1 1998").unwrap();
         assert_eq!(
-            opts.global_options().get("charset").map(String::as_str),
-            Some("ISO-IR 8859 1 1998")
+            opts.global_options().get("charset").map(Vec::as_slice),
+            Some(&b"ISO-IR 8859 1 1998"[..])
         );
     }
 
@@ -1515,14 +1559,14 @@ mod tests {
 
         assert!(opts1.include_times);
         assert!(opts1.link_data);
-        assert_eq!(opts1.list_format, Some("%F".to_string()));
+        assert_eq!(opts1.list_format.as_deref(), Some(&b"%F"[..]));
     }
 
     /// `format_list_entry` yields bytes, because a member name is bytes. Every
     /// fixture here is ASCII, so rendering back to a `String` keeps the
     /// assertions readable; the byte-exact cases assert on the Vec directly.
     fn fmt(format: &str, info: &ListEntryInfo) -> String {
-        String::from_utf8(format_list_entry(format, info)).expect("ASCII fixture")
+        String::from_utf8(format_list_entry(format.as_bytes(), info)).expect("ASCII fixture")
     }
 
     /// The formatter's view of a member, with escaping off.
@@ -1619,14 +1663,14 @@ mod tests {
     #[test]
     fn test_listopt_value_is_the_whole_remainder() {
         let opts = FormatOptions::parse("listopt=[%F] ").unwrap();
-        assert_eq!(opts.list_format.as_deref(), Some("[%F] "));
+        assert_eq!(opts.list_format.as_deref(), Some(&b"[%F] "[..]));
     }
 
     /// The format is a printf format, whose backslash escapes are decoded.
     #[test]
     fn test_listopt_decodes_printf_escapes() {
         let opts = FormatOptions::parse(r"listopt=%F\t%s\\").unwrap();
-        assert_eq!(opts.list_format.as_deref(), Some("%F\t%s\\"));
+        assert_eq!(opts.list_format.as_deref(), Some(&b"%F\t%s\\"[..]));
     }
 
     /// POSIX: "When multiple -o listopt=format options are specified, the
@@ -1635,9 +1679,9 @@ mod tests {
     #[test]
     fn test_listopt_options_concatenate() {
         let mut opts = FormatOptions::new();
-        opts.parse_into("listopt=%F").unwrap();
-        opts.parse_into("listopt=:%s").unwrap();
-        assert_eq!(opts.list_format.as_deref(), Some("%F:%s"));
+        opts.parse_into(b"listopt=%F").unwrap();
+        opts.parse_into(b"listopt=:%s").unwrap();
+        assert_eq!(opts.list_format.as_deref(), Some(&b"%F:%s"[..]));
     }
 
     /// Splitting off the listopt tail removes the one comma that separates
@@ -1645,8 +1689,8 @@ mod tests {
     #[test]
     fn test_escaped_comma_before_listopt_is_kept() {
         let opts = FormatOptions::parse(r"x=a\,,listopt=%F").unwrap();
-        assert_eq!(opts.global.get("x").map(String::as_str), Some("a,"));
-        assert_eq!(opts.list_format.as_deref(), Some("%F"));
+        assert_eq!(opts.global.get("x").map(Vec::as_slice), Some(&b"a,"[..]));
+        assert_eq!(opts.list_format.as_deref(), Some(&b"%F"[..]));
     }
 
     #[test]
@@ -1655,8 +1699,8 @@ mod tests {
         let opts = FormatOptions::parse("times,listopt=%(path)s,%(size)d bytes").unwrap();
         assert!(opts.include_times);
         assert_eq!(
-            opts.list_format,
-            Some("%(path)s,%(size)d bytes".to_string())
+            opts.list_format.as_deref(),
+            Some(&b"%(path)s,%(size)d bytes"[..])
         );
     }
 

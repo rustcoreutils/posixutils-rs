@@ -370,3 +370,43 @@ fn test_update_compares_subsecond_times() {
         );
     }
 }
+
+/// `-w -u -a` compares each file against the member of the same name -- the
+/// same bytes. The names were compared lossily, so `n\376` matched an
+/// archived `n\377` (both `n\u{FFFD}`) and, being older, was left out.
+///
+/// Linux-only: macOS cannot hold a filename that is not UTF-8.
+#[cfg(target_os = "linux")]
+#[test]
+fn test_update_append_distinguishes_non_utf8_names() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let temp = TempDir::new().unwrap();
+    let old = OsStr::from_bytes(b"n\xfe");
+    let new = OsStr::from_bytes(b"n\xff");
+    fs::write(temp.path().join(new), b"new").unwrap();
+    fs::write(temp.path().join(old), b"old").unwrap();
+    let old_time = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+    filetime::set_file_mtime(
+        temp.path().join(old),
+        filetime::FileTime::from_system_time(old_time),
+    )
+    .unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["-w", "-x", "ustar", "-f", "a.tar"])
+        .arg(new)
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+    assert_success(&out, "pax -w");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["-w", "-u", "-a", "-f", "a.tar"])
+        .arg(old)
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+    assert_success(&out, "pax -w -u -a");
+    let out = run_pax_in_dir(&["-f", "a.tar"], temp.path());
+    assert_eq!(out.stdout, b"n\xff\nn\xfe\n");
+}

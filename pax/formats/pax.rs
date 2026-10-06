@@ -260,18 +260,19 @@ impl ExtendedHeader {
     /// The records a set of `-o` operands stands for, in a stable order so
     /// that a bad value is always the same one reported. `assign` is the
     /// operator they were given with (`=` or `:=`), for the diagnostic.
-    fn from_options(options: &HashMap<String, String>, assign: &str) -> PaxResult<Self> {
+    fn from_options(options: &HashMap<String, Vec<u8>>, assign: &str) -> PaxResult<Self> {
         let mut sorted: Vec<_> = options.iter().collect();
         sorted.sort();
         let mut header = ExtendedHeader::new();
         for (keyword, value) in sorted {
             header
-                .apply_record(format!("{keyword}={value}").as_bytes())
+                .apply_record(&[keyword.as_bytes(), b"=", value].concat())
                 .map_err(|e| {
                     let reason = match e {
                         PaxError::InvalidHeader(reason) => reason,
                         other => other.to_string(),
                     };
+                    let value = String::from_utf8_lossy(value);
                     PaxError::InvalidFormat(format!("-o {keyword}{assign}{value}: {reason}"))
                 })?;
         }
@@ -452,7 +453,7 @@ impl ExtendedHeader {
         fn write_if_allowed_bytes(
             data: &mut Vec<u8>,
             options: &FormatOptions,
-            per_file: &HashMap<String, String>,
+            per_file: &HashMap<String, Vec<u8>>,
             keyword: &str,
             default_value: &[u8],
         ) {
@@ -460,7 +461,7 @@ impl ExtendedHeader {
                 return;
             }
             match per_file.get(keyword) {
-                Some(v) => write_pax_record_bytes(data, keyword, v.as_bytes()),
+                Some(v) => write_pax_record_bytes(data, keyword, v),
                 None => write_pax_record_bytes(data, keyword, default_value),
             }
         }
@@ -468,7 +469,7 @@ impl ExtendedHeader {
         fn write_if_allowed(
             data: &mut Vec<u8>,
             options: &FormatOptions,
-            per_file: &HashMap<String, String>,
+            per_file: &HashMap<String, Vec<u8>>,
             keyword: &str,
             default_value: &str,
         ) {
@@ -539,7 +540,7 @@ impl ExtendedHeader {
                 continue;
             }
             if let Some(value) = per_file.get(keyword) {
-                write_pax_record(&mut data, keyword, value);
+                write_pax_record_bytes(&mut data, keyword, value);
             }
         }
 
@@ -553,7 +554,7 @@ impl ExtendedHeader {
             }
             // Skip standard keywords that were already handled above
             if !STANDARD_KEYWORDS.contains(&key.as_str()) && !self.extra.contains_key(key) {
-                write_pax_record(&mut data, key, value);
+                write_pax_record_bytes(&mut data, key, value);
             }
         }
 
@@ -945,27 +946,6 @@ fn write_pax_record_bytes(data: &mut Vec<u8>, keyword: &str, value: &[u8]) {
 
     data.extend_from_slice(len.to_string().as_bytes());
     data.extend_from_slice(&content);
-}
-
-/// Write a pax extended header record
-fn write_pax_record(data: &mut Vec<u8>, keyword: &str, value: &str) {
-    // Record format: "%d %s=%s\n"
-    // Length includes itself, so we need to calculate iteratively
-    let content = format!(" {}={}\n", keyword, value);
-
-    // Start with an estimate
-    let mut len = content.len() + 1; // +1 for at least one digit
-    loop {
-        let len_str = len.to_string();
-        let total = len_str.len() + content.len();
-        if total == len {
-            break;
-        }
-        len = total;
-    }
-
-    data.extend_from_slice(len.to_string().as_bytes());
-    data.extend_from_slice(content.as_bytes());
 }
 
 /// The `-o keyword=value` and `-o keyword:=value` operands of read and list
@@ -1404,7 +1384,7 @@ impl<W: Write> PaxWriter<W> {
             if self.options.should_delete_keyword(key) {
                 continue;
             }
-            write_pax_record(&mut data, key, value);
+            write_pax_record_bytes(&mut data, key, value);
         }
 
         // If no actual header data to write, skip
@@ -1420,8 +1400,9 @@ impl<W: Write> PaxWriter<W> {
         // the directory is used then.
         self.sequence += 1;
         let glob_name = self.options.expand_globexthdr_name(self.sequence);
-        let file_name = std::path::Path::new(&glob_name).file_name();
-        write_header_name(&mut header, glob_name.as_bytes(), || {
+        let glob_path = crate::rawpath::from_bytes(&glob_name);
+        let file_name = glob_path.file_name();
+        write_header_name(&mut header, &glob_name, || {
             file_name.unwrap_or_default().as_bytes().to_vec()
         });
 
@@ -1486,11 +1467,10 @@ impl<W: Write> PaxWriter<W> {
         // the file's name alone, as though it were at the top level.
         self.sequence += 1;
         let ext_name = self.options.expand_exthdr_name(&entry.path, self.sequence);
-        write_header_name(&mut header, ext_name.as_bytes(), || {
+        write_header_name(&mut header, &ext_name, || {
             let file_name = entry.path.file_name().unwrap_or(entry.path.as_os_str());
             self.options
                 .expand_exthdr_name(std::path::Path::new(file_name), self.sequence)
-                .into_bytes()
         });
 
         // Mode, uid, gid (use reasonable defaults)
@@ -1867,7 +1847,7 @@ mod tests {
     #[test]
     fn test_write_pax_record() {
         let mut data = Vec::new();
-        write_pax_record(&mut data, "path", "/some/path");
+        write_pax_record_bytes(&mut data, "path", b"/some/path");
         let s = String::from_utf8(data).unwrap();
         // Record format: "len path=/some/path\n"
         // len includes itself + " " + "path=/some/path\n" = 2 + 1 + 16 = 19 chars

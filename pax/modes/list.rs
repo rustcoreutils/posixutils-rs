@@ -129,12 +129,10 @@ fn print_entry<W: Write>(
             entry,
             style: crate::escape::stdout_style(),
         };
-        let output = format_list_entry(format, &info);
-        writer.write_all(&output)?;
-        // Add newline if format doesn't end with one
-        if output.last() != Some(&b'\n') {
-            writer.write_all(b"\n")?;
-        }
+        writer.write_all(&format_list_entry(format, &info))?;
+        // POSIX: "The pax utility shall append a <newline> to the listopt
+        // output for each selected file" -- even one ending in a <newline>.
+        writer.write_all(b"\n")?;
     } else if options.verbose {
         print_verbose(writer, entry, linked_to)?;
     } else {

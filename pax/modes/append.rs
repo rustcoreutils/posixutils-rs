@@ -163,11 +163,9 @@ fn walk_tar_archive(file: &mut File, want_mtimes: bool) -> PaxResult<TarScan> {
     // the one -u has to compare against.
     while let Some(entry) = archive.read_entry()? {
         if let Some(mtimes) = mtimes.as_mut() {
-            // A directory is stored as "dir/" but named "dir" while being
-            // written, so the trailing slash comes off here and the lookup
-            // side spells it the same way.
-            let name = entry.path.to_string_lossy();
-            let key = PathBuf::from(name.trim_end_matches('/'));
+            // Keyed by the name's bytes: a lossy rendering made distinct
+            // names that are not UTF-8 one name.
+            let key = crate::rawpath::trim_trailing_slashes(&entry.path).to_path_buf();
             mtimes
                 .entry(key)
                 .and_modify(|t| *t = std::cmp::max(*t, entry.mtime))

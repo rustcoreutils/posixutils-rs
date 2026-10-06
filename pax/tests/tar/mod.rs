@@ -369,7 +369,8 @@ fn test_tar_rejects_unsupported_and_unknown_options() {
     assert!(stderr_str(&out).contains("unrecognized option"));
 
     let out = run_tar(&["-cf", "../out.tar"], &src);
-    assert_success(&out, "tar -cf with no operands");
+    assert_failure(&out, "tar -cf with no operands");
+    assert!(stderr_str(&out).contains("empty archive"));
     let out = run_tar(&["-f", "../out.tar"], &src);
     assert_failure(&out, "tar with no operation");
     assert!(stderr_str(&out).contains("is required"));
@@ -764,4 +765,64 @@ fn test_tar_exclude_matches_dot_files_and_directory_contents() {
     );
     assert!(dest.join("e").is_dir());
     assert!(!dest.join("e/.h").exists(), "e/.h/q was extracted");
+}
+
+/// `--file=` gives the empty string as the archive name; it must not take
+/// the next argument instead. It took `a.txt`, so `tar -c --file= a.txt`
+/// truncated the file it was asked to archive.
+#[test]
+fn test_tar_empty_long_option_value_is_not_the_next_argument() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+    let out = run_tar(&["-c", "--file=", "a.txt"], &src);
+    assert_failure(&out, "tar -c --file=");
+    assert_eq!(fs::read_to_string(src.join("a.txt")).unwrap(), "alpha\n");
+
+    // cpio's long options share the parser.
+    let out = run_tar(&["-cf", "../a.tar", "a.txt"], &src);
+    assert_success(&out, "tar -cf");
+    let out = crate::common::run_cpio(&["-t", "--file=", "../a.tar"], &src, b"");
+    assert_failure(&out, "cpio -t --file=");
+}
+
+/// `tar -c` with no file operands and no `-T` has nothing to archive. It read
+/// names from standard input, as `pax -w` does; GNU tar refuses.
+#[test]
+fn test_tar_create_without_operands_is_refused() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+    let out = crate::common::run_front_end("tar", &["-cf", "out.tar"], &src, Some(b"a.txt\n"));
+    assert_failure(&out, "tar -cf with no operands");
+    assert!(
+        stderr_str(&out).contains("empty archive"),
+        "{}",
+        stderr_str(&out)
+    );
+    assert!(!src.join("out.tar").exists());
+
+    // Appending nothing leaves the archive as it was, without reading stdin.
+    let out = run_tar(&["-cf", "out.tar", "a.txt"], &src);
+    assert_success(&out, "tar -cf");
+    for mode in ["-rf", "-uf"] {
+        let out =
+            crate::common::run_front_end("tar", &[mode, "out.tar"], &src, Some(b"sub/b.txt\n"));
+        assert_success(&out, &format!("tar {mode} with no operands"));
+        assert_eq!(members(&src, "out.tar"), vec!["a.txt"], "tar {mode}");
+    }
+}
+
+/// A usage error is two lines. On a terminal the message is escaped, but its
+/// own newline has to stay a newline: it came out as `?`.
+#[test]
+fn test_tar_usage_error_newline_on_terminal() {
+    use crate::common::{PtyPax, PtyStdio};
+    let temp = TempDir::new().unwrap();
+    let Some((_, tty)) =
+        PtyPax::spawn_program(&front_end("tar"), &["-q"], temp.path(), b"", PtyStdio::All)
+            .finish(std::time::Duration::from_secs(20))
+    else {
+        panic!("tar -q did not exit");
+    };
+    let tty = String::from_utf8_lossy(&tty);
+    assert!(tty.contains("'-q'\r\nTry 'tar --help'."), "{tty:?}");
 }

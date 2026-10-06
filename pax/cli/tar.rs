@@ -13,13 +13,13 @@
 //! tar accepts. Anything outside it is rejected by name rather than ignored.
 
 use super::{
-    cluster_letters, open_name_list, parse_number, parse_options, read_name_list, split_long,
-    unknown, unsupported, usage, ArgCursor,
+    cluster_letters, glued_value, open_name_list, parse_number, parse_options, read_name_list,
+    split_long, unknown, unsupported, usage, ArgCursor,
 };
 use crate::error::{PaxError, PaxResult};
+use crate::modes::write::NameList;
 use crate::{Args, Format};
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 const PROG: &str = "tar";
@@ -224,8 +224,7 @@ fn apply_cluster(cluster: &[u8], st: &mut State, cur: &mut ArgCursor) -> PaxResu
     for (c, rest) in cluster_letters(cluster) {
         if takes_arg(c) {
             // Whatever follows the letter in this argument is its value.
-            let glued = OsStr::from_bytes(rest).to_owned();
-            return apply_short(c, Some(glued), st, cur);
+            return apply_short(c, glued_value(rest), st, cur);
         }
         apply_short(c, None, st, cur)?;
     }
@@ -360,6 +359,20 @@ fn finish(mut st: State) -> PaxResult<Args> {
         return Err(usage(PROG, "one of -c, -x, -t, -r or -u is required"));
     };
 
+    // pax reads the names to archive from standard input when it is given
+    // none; tar never does. With nothing to create GNU tar refuses, and with
+    // nothing to add an append or update adds nothing.
+    let no_names = st.args.files_and_patterns.is_empty() && st.args.name_lists.is_empty();
+    if no_names {
+        match mode {
+            Mode::Create => {
+                return Err(usage(PROG, "cowardly refusing to create an empty archive"))
+            }
+            Mode::Append | Mode::Update => st.args.name_lists.push(NameList::empty()),
+            Mode::Extract | Mode::List => {}
+        }
+    }
+
     match mode {
         Mode::Create => st.args.write_mode = true,
         Mode::Extract => st.args.read_mode = true,
@@ -458,6 +471,7 @@ no member can be written outside the current directory.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
 
     /// Parse a tar command line given without the leading program name.

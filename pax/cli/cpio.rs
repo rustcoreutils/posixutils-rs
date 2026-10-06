@@ -13,14 +13,13 @@
 //! cpio accepts. Anything outside it is rejected by name rather than ignored.
 
 use super::{
-    cluster_letters, parse_number, parse_options, read_name_list, split_long, unknown, unsupported,
-    usage, ArgCursor,
+    cluster_letters, glued_value, parse_number, parse_options, read_name_list, split_long, unknown,
+    unsupported, usage, ArgCursor,
 };
 use crate::error::{PaxError, PaxResult};
 use crate::modes::write::NameList;
 use crate::{Args, Format};
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 const PROG: &str = "cpio";
@@ -207,8 +206,7 @@ fn apply_cluster(cluster: &[u8], st: &mut State, cur: &mut ArgCursor) -> PaxResu
     for (c, rest) in cluster_letters(cluster) {
         if takes_arg(c) {
             // Whatever follows the letter in this argument is its value.
-            let glued = OsStr::from_bytes(rest).to_owned();
-            return apply_short(c, Some(glued), st, cur);
+            return apply_short(c, glued_value(rest), st, cur);
         }
         apply_short(c, None, st, cur)?;
     }

@@ -29,14 +29,8 @@
 //!
 //! ## Where bytes are still given up
 //!
-//! [`MatchName`] is the lossy form of a name, for the comparisons that still
-//! use one. It implements no `Display`, no `AsRef<Path>` and no
-//! `Into<PathBuf>`, so a lossy name cannot be printed, stored, or written into
-//! a header by accident -- the compiler refuses. The complete list of places
-//! this crate gives up bytes is `MatchName::of` and the `uname`/`gname`
-//! fields, which are text by definition.
+//! Only in the `uname`/`gname` fields, which are text by definition.
 
-use std::borrow::Cow;
 use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -49,6 +43,16 @@ pub fn as_bytes(path: &Path) -> &[u8] {
 /// A pathname from the bytes a header recorded, exactly as recorded.
 pub fn from_bytes(bytes: &[u8]) -> PathBuf {
     PathBuf::from(OsString::from_vec(bytes.to_vec()))
+}
+
+/// `path` with any trailing slashes removed, as bytes.
+///
+/// A directory member is stored as `dir/` but named `dir` while it is being
+/// written; `-u` compares the two, so both sides drop the slash.
+pub fn trim_trailing_slashes(path: &Path) -> &Path {
+    let bytes = as_bytes(path);
+    let end = bytes.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1);
+    Path::new(std::ffi::OsStr::from_bytes(&bytes[..end]))
 }
 
 /// Join a ustar `prefix` field to its `name` field.
@@ -64,25 +68,6 @@ pub fn join(prefix: &[u8], name: &[u8]) -> PathBuf {
     joined.push(b'/');
     joined.extend_from_slice(name);
     from_bytes(&joined)
-}
-
-/// A pathname rendered as `&str`, which cannot show a name that is not UTF-8
-/// as it really is.
-///
-/// Deliberately not printable, not storable and not convertible back to a
-/// `Path`: this is the lossy form, and the type is what keeps it from leaking
-/// into an extracted filename or a header field.
-pub struct MatchName<'a>(Cow<'a, str>);
-
-impl<'a> MatchName<'a> {
-    /// The only sanctioned lossy conversion of a pathname in this crate.
-    pub fn of(path: &'a Path) -> Self {
-        MatchName(path.to_string_lossy())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 /// The byte offsets at which each *display unit* of `bytes` begins.
@@ -133,6 +118,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_trim_trailing_slashes_keeps_bytes() {
+        assert_eq!(
+            as_bytes(trim_trailing_slashes(&from_bytes(b"d\xfe//"))),
+            b"d\xfe"
+        );
+        assert_ne!(
+            trim_trailing_slashes(&from_bytes(b"n\xfe")),
+            trim_trailing_slashes(&from_bytes(b"n\xff"))
+        );
+        assert_eq!(as_bytes(trim_trailing_slashes(Path::new("/"))), b"");
+    }
+
+    #[test]
     fn test_round_trip_keeps_invalid_bytes() {
         let raw = b"na\xffme.txt";
         let path = from_bytes(raw);
@@ -146,9 +144,6 @@ mod tests {
         let a = from_bytes(b"a\xffb");
         let b = from_bytes(b"a\xfeb");
         assert_ne!(a, b);
-        // ...whereas the lossy form of each is the same string, which is
-        // exactly why matching is documented as a limitation.
-        assert_eq!(MatchName::of(&a).as_str(), MatchName::of(&b).as_str());
     }
 
     #[test]

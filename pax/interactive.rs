@@ -94,29 +94,48 @@ impl InteractivePrompter {
         self.tty_write.flush()?;
 
         // Read response
-        let mut line = String::new();
-        let n = self.tty_read.read_line(&mut line)?;
+        let mut line = Vec::new();
+        let n = self.tty_read.read_until(b'\n', &mut line)?;
 
         // EOF means we should exit immediately
         if n == 0 {
             return Err(PaxError::TtyEof);
         }
 
-        let response = line.trim();
+        Ok(parse_response(&line))
+    }
+}
 
-        if response.is_empty() {
-            Ok(RenameResult::Skip)
-        } else if response == "." {
-            Ok(RenameResult::UseOriginal)
-        } else {
-            Ok(RenameResult::Rename(PathBuf::from(response)))
-        }
+/// What a line typed at the prompt asks for.
+///
+/// The line, less its <newline>, is a pathname: bytes, not text, and nothing
+/// else is stripped, so a name with leading or trailing blanks can be given.
+fn parse_response(line: &[u8]) -> RenameResult {
+    let response = line.strip_suffix(b"\n").unwrap_or(line);
+    match response {
+        b"" => RenameResult::Skip,
+        b"." => RenameResult::UseOriginal,
+        name => RenameResult::Rename(crate::rawpath::from_bytes(name)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_response() {
+        assert_eq!(parse_response(b"\n"), RenameResult::Skip);
+        assert_eq!(parse_response(b".\n"), RenameResult::UseOriginal);
+        assert_eq!(
+            parse_response(b" a b \n"),
+            RenameResult::Rename(PathBuf::from(" a b "))
+        );
+        assert_eq!(
+            parse_response(b"n\xff\n"),
+            RenameResult::Rename(crate::rawpath::from_bytes(b"n\xff"))
+        );
+    }
 
     #[test]
     fn test_rename_result() {

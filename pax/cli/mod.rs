@@ -69,20 +69,20 @@ impl ProgramMode {
 ///
 /// The program name is not repeated here: `main` already prefixes every error
 /// it prints with it.
-fn usage(prog: &str, msg: impl std::fmt::Display) -> PaxError {
-    PaxError::Usage(format!("{}\nTry '{} --help'.", msg, prog))
+fn usage(prog: &'static str, msg: impl std::fmt::Display) -> PaxError {
+    PaxError::Usage(msg.to_string(), Some(prog))
 }
 
 /// Report an option this front-end deliberately does not implement.
 ///
 /// Silently ignoring one would let, say, `tar -cjf` write an uncompressed
 /// archive under a `.bz2` name; naming the option makes the gap actionable.
-fn unsupported(prog: &str, opt: &str, why: &str) -> PaxError {
+fn unsupported(prog: &'static str, opt: &str, why: &str) -> PaxError {
     usage(prog, format!("unsupported option '{}' ({})", opt, why))
 }
 
 /// Reject an unrecognized option.
-fn unknown(prog: &str, opt: &str) -> PaxError {
+fn unknown(prog: &'static str, opt: &str) -> PaxError {
     usage(prog, format!("unrecognized option '{}'", opt))
 }
 
@@ -98,7 +98,7 @@ fn open_name_list(path: &OsStr, nul: bool) -> PaxResult<NameList> {
         return Ok(NameList::stdin(sep));
     }
     let file = File::open(path)
-        .map_err(|e| PaxError::Usage(format!("{}: {}", Path::new(path).display(), e)))?;
+        .map_err(|e| PaxError::Usage(format!("{}: {}", Path::new(path).display(), e), None))?;
     Ok(NameList::file(file, sep))
 }
 
@@ -147,13 +147,13 @@ impl ArgCursor {
 
     /// Consume the argument of an option that requires one.
     ///
-    /// `glued` is whatever followed the option letter in the same argument;
-    /// when it is empty the value comes from the next argument.
+    /// `glued` is the value given in the same argument -- after the option
+    /// letter, or after `=` -- and is the value even when empty: `--file=`
+    /// names the empty string, it does not take the next argument. With none
+    /// the value comes from the next argument.
     fn value(&mut self, opt: &str, glued: Option<OsString>) -> PaxResult<OsString> {
         if let Some(v) = glued {
-            if !v.is_empty() {
-                return Ok(v);
-            }
+            return Ok(v);
         }
         self.next()
             .ok_or_else(|| usage(self.prog, format!("option '{}' requires an argument", opt)))
@@ -166,7 +166,7 @@ impl ArgCursor {
 }
 
 /// Parse a non-negative integer option-argument.
-fn parse_number(prog: &str, opt: &str, value: &OsStr) -> PaxResult<u64> {
+fn parse_number(prog: &'static str, opt: &str, value: &OsStr) -> PaxResult<u64> {
     value
         .to_str()
         .and_then(|v| v.parse::<u64>().ok())
@@ -243,6 +243,12 @@ fn split_long(long: &[u8]) -> (String, Option<OsString>) {
         None => (long, None),
     };
     (String::from_utf8_lossy(name).into_owned(), value)
+}
+
+/// The value glued to an option letter in a cluster: the rest of the
+/// argument, or none when the letter ends it (`-f x.tar`).
+fn glued_value(rest: &[u8]) -> Option<OsString> {
+    (!rest.is_empty()).then(|| OsStr::from_bytes(rest).to_owned())
 }
 
 /// The option letters of a `-xyz` cluster, each with the bytes that follow it.

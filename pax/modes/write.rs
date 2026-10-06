@@ -79,11 +79,7 @@ impl WriteOptions {
         let Some(times) = &self.update_times else {
             return false;
         };
-        // Directory members are stored with a trailing slash; archived_mtimes
-        // strips it so both sides of this lookup spell the name the same way.
-        let name = crate::rawpath::MatchName::of(archive_path);
-        let name = name.as_str();
-        let name = Path::new(name.trim_end_matches('/'));
+        let name = crate::rawpath::trim_trailing_slashes(archive_path);
         let Some(&member_mtime) = times.get(name) else {
             return false;
         };
@@ -888,6 +884,7 @@ pub struct NameList {
 enum NameSource {
     Stdin,
     File(File),
+    Empty,
 }
 
 impl NameList {
@@ -907,6 +904,15 @@ impl NameList {
         }
     }
 
+    /// No names at all: what stands in for standard input when a front-end
+    /// is given nothing to archive and must not read it.
+    pub fn empty() -> Self {
+        NameList {
+            source: NameSource::Empty,
+            sep: b'\n',
+        }
+    }
+
     /// Whether the names are read from standard input.
     pub fn is_stdin(&self) -> bool {
         matches!(self.source, NameSource::Stdin)
@@ -917,6 +923,7 @@ impl NameList {
         let reader: Box<dyn BufRead> = match self.source {
             NameSource::Stdin => Box::new(std::io::stdin().lock()),
             NameSource::File(file) => Box::new(std::io::BufReader::new(file)),
+            NameSource::Empty => Box::new(std::io::empty()),
         };
         NameReader {
             reader,

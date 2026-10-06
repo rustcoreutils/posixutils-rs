@@ -63,6 +63,9 @@ pub fn list_archive<R: ArchiveReader, W: Write>(
     // as `== first`, the way extraction links them.
     let mut link_sets: LinkSets<PathBuf> = LinkSets::default();
 
+    // Whether the loop met the end of the archive, rather than stopping
+    // short of it under -n.
+    let mut reached_end = true;
     while let Some(mut entry) = archive.read_entry()? {
         if let Some(ref records) = option_records {
             records.apply(&mut entry);
@@ -85,12 +88,13 @@ pub fn list_archive<R: ArchiveReader, W: Write>(
         }
         archive.skip_data()?;
         if selector.is_done() {
+            reached_end = false;
             break;
         }
     }
 
     selector.report_unmatched();
-    Ok(())
+    archive.finish(reached_end)
 }
 
 /// A failure to write the listing, which ends the run.

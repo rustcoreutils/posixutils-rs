@@ -770,3 +770,400 @@ fn test_multi_volume_symlink_round_trip() {
         assert_eq!(fs::read_to_string(dst.path().join("g")).unwrap(), "after\n");
     }
 }
+
+// ============================================================================
+// Volume sets: how one volume leads to the next
+// ============================================================================
+
+/// Write `count` files of `size` bytes into `dir`, named `f0000`..., and return
+/// their names one per line, in order.
+fn many_files(dir: &std::path::Path, count: usize, size: usize) -> String {
+    let mut names = String::new();
+    for i in 0..count {
+        let name = format!("f{i:04}");
+        fs::write(dir.join(&name), vec![b'a' + (i % 26) as u8; size]).unwrap();
+        names.push_str(&name);
+        names.push('\n');
+    }
+    names
+}
+
+/// `pax -w -M` of `files` in `dir` into `vol.tar` with volumes of `length`
+/// bytes, every volume change accepted by `true`.
+fn write_volume_set(dir: &std::path::Path, length: &str, files: &[&str]) {
+    let mut args = vec![
+        "-w",
+        "-M",
+        "--tape-length",
+        length,
+        "--new-volume-script",
+        "true",
+        "-f",
+        "vol.tar",
+    ];
+    args.extend_from_slice(files);
+    let out = run_pax_in_dir(&args, dir);
+    assert_success(&out, "pax -w -M");
+}
+
+/// `pax -M` listing `vol.tar` in `dir`, with `script` run for a volume that
+/// is not there.
+fn list_volume_set(dir: &std::path::Path, script: &str) -> std::process::Output {
+    run_pax_in_dir(&["-M", "--new-volume-script", script, "-f", "vol.tar"], dir)
+}
+
+/// The names in a listing, in order.
+fn listed(out: &std::process::Output) -> Vec<String> {
+    stdout_str(out).lines().map(str::to_string).collect()
+}
+
+/// The volume script is a child of pax. When the names to archive are pax's
+/// standard input, a script that reads its own standard input -- `read
+/// answer` -- took them from under pax, and those files were silently never
+/// archived. More than one buffer's worth of names, so some are still unread
+/// when the volume changes.
+#[test]
+fn test_multi_volume_script_does_not_consume_the_name_list() {
+    let temp = TempDir::new().unwrap();
+    let names = many_files(temp.path(), 2000, 1);
+    assert!(names.len() > 8192);
+
+    let out = run_pax_in_dir_with_stdin(
+        &[
+            "-w",
+            "-M",
+            "--tape-length",
+            "1048576",
+            "--new-volume-script",
+            "cat > /dev/null",
+            "-f",
+            "vol.tar",
+        ],
+        temp.path(),
+        &names,
+    );
+    assert_success(&out, "pax -w -M from a name list");
+    assert!(temp.path().join("vol.tar.2").exists());
+
+    let out = list_volume_set(temp.path(), "false");
+    assert_success(&out, "pax -M list");
+    assert_eq!(stdout_str(&out), names);
+}
+
+/// A volume that is not the last has no end-of-archive indicator, so the
+/// archive is not over when it ends. A next volume that is not there was
+/// taken for the end of the archive: everything on it and after it was
+/// silently missing, exit status 0. The script is run for it, and if it is
+/// still not there that is an error.
+#[test]
+fn test_multi_volume_missing_volume_is_not_the_end() {
+    let temp = TempDir::new().unwrap();
+    let names = many_files(temp.path(), 15, 3000);
+    let files: Vec<&str> = names.lines().collect();
+    write_volume_set(temp.path(), "20480", &files);
+    assert!(temp.path().join("vol.tar.3").exists());
+    assert!(!temp.path().join("vol.tar.4").exists());
+    fs::rename(temp.path().join("vol.tar.3"), temp.path().join("saved")).unwrap();
+
+    let out = list_volume_set(temp.path(), "true");
+    assert_failure(&out, "a missing volume");
+    assert!(
+        stderr_str(&out).contains("vol.tar.3"),
+        "the diagnostic names the volume: {}",
+        stderr_str(&out)
+    );
+
+    // A script that mounts the volume -- here, puts it in place -- lets the
+    // read carry on.
+    let out = list_volume_set(temp.path(), "cp saved \"$TAR_ARCHIVE\"");
+    assert_success(&out, "pax -M with the volume supplied");
+    assert_eq!(listed(&out), files);
+}
+
+/// The end-of-archive indicator on the last volume ends the archive. A
+/// volume from an earlier, longer run under the same name used to be read on
+/// as the next one.
+#[test]
+fn test_multi_volume_stale_volume_is_not_read() {
+    let temp = TempDir::new().unwrap();
+    let names = many_files(temp.path(), 15, 3000);
+    let files: Vec<&str> = names.lines().collect();
+    write_volume_set(temp.path(), "20480", &files);
+    assert!(temp.path().join("vol.tar.3").exists());
+
+    write_volume_set(temp.path(), "20480", &["f0001"]);
+    let out = list_volume_set(temp.path(), "false");
+    assert_success(&out, "pax -M list");
+    assert_eq!(listed(&out), ["f0001"]);
+    // Not silently: it may be the rest of a set whose every volume ends
+    // with the indicator, as pax used to write them.
+    let stderr = stderr_str(&out);
+    assert!(
+        stderr.contains("vol.tar.2") && stderr.contains("not read"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("vol.tar.3"), "{stderr}");
+
+    // A set that ends where it should says nothing.
+    fs::remove_file(temp.path().join("vol.tar.2")).unwrap();
+    let out = list_volume_set(temp.path(), "false");
+    assert_success(&out, "pax -M list");
+    assert_eq!(stderr_str(&out), "");
+}
+
+/// A tar header for a GNU multi-volume set: `typeflag` with the "ustar  "
+/// magic GNU tar writes, and `offset` in the old GNU `offset` field (369).
+fn gnu_header(name: &[u8], typeflag: u8, size: u64, offset: Option<u64>) -> Vec<u8> {
+    let mut h = Ustar {
+        name,
+        typeflag,
+        size: Some(size),
+        ..Default::default()
+    }
+    .header();
+    h[257..265].copy_from_slice(b"ustar  \0");
+    if let Some(offset) = offset {
+        h[369..381].copy_from_slice(format!("{offset:011o}\0").as_bytes());
+    }
+    reseal_header(&mut h);
+    h.to_vec()
+}
+
+fn member(name: &[u8], body: &[u8]) -> Vec<u8> {
+    Ustar {
+        name,
+        body,
+        ..Default::default()
+    }
+    .member()
+}
+
+/// A volume that ends between members without an end-of-archive indicator
+/// is followed by another, as GNU tar writes them. Its end was taken for the
+/// end of the whole archive.
+#[test]
+fn test_multi_volume_volume_without_trailer_continues() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("vol.tar"), member(b"x1", b"one\n")).unwrap();
+    let mut second = member(b"x2", b"two\n");
+    second.extend_from_slice(&ustar_trailer());
+    fs::write(temp.path().join("vol.tar.2"), second).unwrap();
+
+    let out = list_volume_set(temp.path(), "false");
+    assert_success(&out, "pax -M list");
+    assert_eq!(listed(&out), ["x1", "x2"]);
+}
+
+/// GNU tar splits a member between volumes: the first holds its header and
+/// the start of its data, the next starts -- after a volume label, when one
+/// was asked for -- with an 'M' header and the rest. Neither header is a
+/// member; the data is one member's.
+#[test]
+fn test_multi_volume_reads_gnu_split_member() {
+    let temp = TempDir::new().unwrap();
+    let big: Vec<u8> = (0..2048u32).map(|i| (i * 7) as u8).collect();
+
+    let mut first = gnu_header(b"MyLabel", b'V', 0, None);
+    first.extend(member(b"a", b"AAAA\n"));
+    first.extend(gnu_header(b"big", b'0', 2048, None));
+    first.extend_from_slice(&big[..1024]);
+    fs::write(temp.path().join("vol.tar"), first).unwrap();
+
+    let mut second = gnu_header(b"MyLabel Volume 2", b'V', 0, None);
+    second.extend(gnu_header(b"big", b'M', 1024, Some(1024)));
+    second.extend_from_slice(&big[1024..]);
+    second.extend(member(b"c", b"CCCC\n"));
+    second.extend_from_slice(&ustar_trailer());
+    fs::write(temp.path().join("vol.tar.2"), second).unwrap();
+
+    let out = list_volume_set(temp.path(), "false");
+    assert_success(&out, "pax -M list");
+    assert_eq!(listed(&out), ["a", "big", "c"]);
+
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+    let out = run_pax_in_dir(
+        &[
+            "-r",
+            "-M",
+            "--new-volume-script",
+            "false",
+            "-f",
+            "../vol.tar",
+        ],
+        &dst,
+    );
+    assert_success(&out, "pax -r -M");
+    assert_eq!(fs::read(dst.join("big")).unwrap(), big);
+    assert_eq!(fs::read(dst.join("c")).unwrap(), b"CCCC\n");
+}
+
+/// A continuation header on the first volume continues nothing: the volumes
+/// were given out of order.
+#[test]
+fn test_multi_volume_first_volume_continuation_is_refused() {
+    let temp = TempDir::new().unwrap();
+    let mut vol = gnu_header(b"big", b'M', 512, Some(1024));
+    vol.extend_from_slice(&[7u8; 512]);
+    vol.extend_from_slice(&ustar_trailer());
+    fs::write(temp.path().join("vol.tar"), vol).unwrap();
+
+    let out = list_volume_set(temp.path(), "false");
+    assert_failure(&out, "a set starting with a continuation");
+    assert!(stdout_str(&out).is_empty());
+}
+
+/// The multi-volume reader was a header loop of its own, without what the
+/// reader of a single archive knows: a GNU long-name record is not a member,
+/// and a lone zero block is not the end of the archive. A one-volume set reads
+/// exactly as the archive it is.
+#[test]
+fn test_multi_volume_reads_like_a_single_archive() {
+    let temp = TempDir::new().unwrap();
+    let long = [b"d/".as_slice(), &[b'n'; 120]].concat();
+    let mut record = long.clone();
+    record.push(0);
+    let mut with_long_name = gnu_header(b"././@LongLink", b'L', record.len() as u64, None);
+    pad_to_block(&mut record);
+    with_long_name.extend(record);
+    with_long_name.extend(member(&long[..100], b"LONG\n"));
+    with_long_name.extend(member(b"after", b"after\n"));
+    with_long_name.extend_from_slice(&ustar_trailer());
+
+    let mut lone_zero = member(b"l1", b"one\n");
+    lone_zero.extend_from_slice(&[0u8; 512]);
+    lone_zero.extend(member(b"l2", b"two\n"));
+    lone_zero.extend_from_slice(&ustar_trailer());
+
+    for archive in [with_long_name, lone_zero] {
+        fs::write(temp.path().join("vol.tar"), archive).unwrap();
+        let single = run_pax_in_dir(&["-f", "vol.tar"], temp.path());
+        let multi = list_volume_set(temp.path(), "false");
+        assert!(!stdout_str(&multi).contains("@LongLink"));
+        assert_eq!(stdout_str(&multi), stdout_str(&single));
+        assert_eq!(stderr_str(&multi), stderr_str(&single));
+        assert_eq!(multi.status.code(), single.status.code());
+    }
+}
+
+/// A member whose header is refused is refused before the volume is changed
+/// for it: the change made a new volume that nothing was ever written to.
+#[test]
+fn test_multi_volume_refused_member_does_not_change_volume() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f1"), vec![b'1'; 9000]).unwrap();
+    fs::write(temp.path().join("f2"), vec![b'2'; 9000]).unwrap();
+    // A target too long for the ustar linkname field.
+    std::os::unix::fs::symlink("t".repeat(150), temp.path().join("z")).unwrap();
+
+    let out = run_pax_in_dir(
+        &[
+            "-w",
+            "-M",
+            "--tape-length",
+            "20480",
+            "--new-volume-script",
+            "true",
+            "-f",
+            "vol.tar",
+            "f1",
+            "f2",
+            "z",
+        ],
+        temp.path(),
+    );
+    assert_failure(&out, "a member ustar cannot hold");
+    assert!(stderr_str(&out).contains('z'), "{}", stderr_str(&out));
+    assert!(!temp.path().join("vol.tar.2").exists());
+    let out = list_volume_set(temp.path(), "false");
+    assert_success(&out, "pax -M list");
+    assert_eq!(listed(&out), ["f1", "f2"]);
+}
+
+/// -M writes uncompressed volumes; -z was silently ignored.
+#[test]
+fn test_multi_volume_refuses_gzip() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f"), "x").unwrap();
+    let out = run_pax_in_dir(
+        &[
+            "-w",
+            "-z",
+            "-M",
+            "--tape-length",
+            "100000",
+            "-f",
+            "vol.tar",
+            "f",
+        ],
+        temp.path(),
+    );
+    assert_failure(&out, "-z with -M");
+    assert!(stderr_str(&out).contains("-z"), "{}", stderr_str(&out));
+}
+
+/// The previous volume is closed before the script is run for the next:
+/// the script may be what takes it away, to a tape or another host.
+#[test]
+fn test_multi_volume_previous_volume_closed_before_script() {
+    let Some(_) = system_tool("lsof") else {
+        return;
+    };
+    let temp = TempDir::new().unwrap();
+    let names = many_files(temp.path(), 8, 3000);
+    let files: Vec<&str> = names.lines().collect();
+    let mut args = vec![
+        "-w",
+        "-M",
+        "--tape-length",
+        "20480",
+        "--new-volume-script",
+        "lsof -p $PPID 2>/dev/null | grep -E '/vol\\.tar(\\.[0-9]+)?$' >> held; true",
+        "-f",
+        "vol.tar",
+    ];
+    args.extend_from_slice(&files);
+    let out = run_pax_in_dir(&args, temp.path());
+    assert_success(&out, "pax -w -M");
+    assert!(temp.path().join("vol.tar.2").exists());
+    assert_eq!(
+        fs::read_to_string(temp.path().join("held")).unwrap(),
+        "",
+        "pax held a volume open while the script ran"
+    );
+}
+
+/// Volume names are the archive name's bytes with `.N` after them. They were
+/// made from a lossy UTF-8 rendering of it, so an archive name that is not
+/// UTF-8 put its later volumes under a different name.
+#[test]
+fn test_multi_volume_non_utf8_archive_name() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let temp = TempDir::new().unwrap();
+    let names = many_files(temp.path(), 8, 3000);
+    let name = OsStr::from_bytes(b"vol\xff");
+    // Some file systems (APFS) take only UTF-8 names.
+    if fs::write(temp.path().join(name), "").is_err() {
+        return;
+    }
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["-w", "-M", "--tape-length", "20480"])
+        .args(["--new-volume-script", "true", "-f"])
+        .arg(name)
+        .args(names.lines())
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+    assert_success(&out, "pax -w -M");
+    assert!(temp.path().join(OsStr::from_bytes(b"vol\xff.2")).exists());
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["-M", "--new-volume-script", "false", "-f"])
+        .arg(name)
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+    assert_success(&out, "pax -M list");
+    assert_eq!(stdout_str(&out), names);
+}

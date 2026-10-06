@@ -1340,6 +1340,10 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
     fn applies_option_records(&self) -> bool {
         true
     }
+
+    fn finish(&mut self, reached_end: bool) -> PaxResult<()> {
+        self.reader.finish(reached_end)
+    }
 }
 
 /// pax archive writer

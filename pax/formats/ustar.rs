@@ -164,6 +164,10 @@ impl<R: Read> ArchiveReader for UstarReader<R> {
         self.bytes_read = total_bytes;
         Ok(())
     }
+
+    fn finish(&mut self, reached_end: bool) -> PaxResult<()> {
+        self.reader.finish(reached_end)
+    }
 }
 
 /// ustar archive writer

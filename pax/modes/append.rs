@@ -98,12 +98,17 @@ pub fn append_to_archive(
     // gained -s substitutions, -o invalid= handling, -o linkdata, or the
     // sub-second/atime/ctime fields, and it built the pax writer with
     // PaxWriter::new so every -o option was discarded.
-    {
+    let written = {
         let mut blocked = BlockedWriter::new(&mut file, record_size);
         blocked
             .write_all(&globals)
             .map_err(PaxError::ArchiveWrite)?;
-        crate::modes::write::create_archive(blocked, files, format, options)?;
+        crate::modes::write::create_archive(blocked, files, format, options)
+    };
+    // EOF on /dev/tty under -i ends the run with the archive finished, and
+    // the end of it is still the end of the file.
+    if !matches!(written, Ok(()) | Err(PaxError::TtyEof)) {
+        return written;
     }
 
     // Discard whatever remains of the old archive. The previous end-of-archive
@@ -113,7 +118,9 @@ pub fn append_to_archive(
     let end = file.stream_position()?;
     file.set_len(end)?;
 
-    Ok(())
+    // A failure to close is the last word on whether the archive was written.
+    crate::blocked_io::close_file(file).map_err(PaxError::ArchiveWrite)?;
+    written
 }
 
 /// What walking an existing tar-family archive found.

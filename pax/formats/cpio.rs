@@ -294,6 +294,10 @@ impl<R: Read> ArchiveReader for CpioReader<R> {
         }
         Ok(())
     }
+
+    fn finish(&mut self, reached_end: bool) -> PaxResult<()> {
+        self.reader.finish(reached_end)
+    }
 }
 
 /// cpio archive writer

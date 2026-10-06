@@ -141,6 +141,9 @@ fn extract_members<R: ArchiveReader>(
         None
     };
 
+    // Whether the loop met the end of the archive, rather than stopping
+    // short of it under -n.
+    let mut reached_end = true;
     while let Some(mut entry) = archive.read_entry()? {
         if let Some(ref records) = option_records {
             records.apply(&mut entry);
@@ -159,12 +162,13 @@ fn extract_members<R: ArchiveReader>(
         }
         archive.skip_data()?;
         if selector.is_done() {
+            reached_end = false;
             break;
         }
     }
 
     selector.report_unmatched();
-    Ok(())
+    archive.finish(reached_end)
 }
 
 /// Diagnose a member's failure and carry on, unless it is one that ends the

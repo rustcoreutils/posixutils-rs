@@ -25,8 +25,8 @@ mod userdb;
 
 use archive::{ArchiveFormat, ArchiveReader};
 use blocked_io::{
-    default_record_size, parse_blocksize, BlockedReader, BlockedWriter, ByteCounter,
-    DEFAULT_RECORD_SIZE, TAR_BLOCK_SIZE,
+    default_record_size, parse_blocksize, parse_read_blocksize, BlockedReader, BlockedWriter,
+    ByteCounter, DEFAULT_RECORD_SIZE, TAR_BLOCK_SIZE,
 };
 use clap::{Parser, ValueEnum};
 use cli::ProgramMode;
@@ -38,12 +38,12 @@ use modes::copy::CopyOptions;
 use modes::list::ListOptions;
 use modes::read::ReadOptions;
 use modes::write::{FileNames, NameList, WriteOptions};
-use multivolume::{MultiVolumeOptions, MultiVolumeReader};
+use multivolume::{MultiVolumeOptions, VolumeChain};
 use options::FormatOptions;
 use pattern::Pattern;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -284,6 +284,12 @@ fn run(mut args: Args) -> PaxResult<()> {
             "gzip compression (-z) is incompatible with append mode (-a)".to_string(),
         ));
     }
+    // Volumes are written uncompressed; -z was silently ignored.
+    if args.gzip && args.multi_volume {
+        return Err(PaxError::InvalidFormat(
+            "gzip compression (-z) is incompatible with multi-volume mode (-M)".to_string(),
+        ));
+    }
 
     apply_chdir(&mut args)?;
 
@@ -417,11 +423,6 @@ fn run_list(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
         strip_components: args.strip_components,
     };
 
-    // Check for multi-volume mode
-    if args.multi_volume {
-        return run_list_multi_volume(args, &options);
-    }
-
     let mut archive = open_archive_for_read(args, archive_bytes, &options.format_options)?;
     let mut stdout = listing_stdout();
 
@@ -443,26 +444,6 @@ fn listing_stdout() -> io::BufWriter<io::StdoutLock<'static>> {
         8 * 1024
     };
     io::BufWriter::with_capacity(capacity, io::stdout().lock())
-}
-
-/// Run list mode with multi-volume support
-fn run_list_multi_volume(args: &Args, options: &ListOptions) -> PaxResult<()> {
-    let archive_path = args.archive.as_ref().ok_or_else(|| {
-        PaxError::InvalidFormat("multi-volume mode requires -f archive".to_string())
-    })?;
-
-    let mv_options = MultiVolumeOptions {
-        volume_size: None, // Not needed for reading
-        volume_script: args.new_volume_script.clone(),
-        archive_path: archive_path.clone(),
-        verbose: args.verbose,
-    };
-
-    let mut reader = MultiVolumeReader::new(mv_options)?;
-    let mut stdout = io::stdout().lock();
-
-    // Multi-volume is always ustar format
-    modes::list_archive(&mut reader, &mut stdout, options)
 }
 
 /// Run read/extract mode
@@ -493,32 +474,24 @@ fn run_read(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
         to_stdout: args.to_stdout,
     };
 
-    // Check for multi-volume mode
-    if args.multi_volume {
-        return run_read_multi_volume(args, &options);
-    }
-
     let mut archive = open_archive_for_read(args, archive_bytes, &options.format_options)?;
     modes::extract_archive(&mut archive, &options)
 }
 
-/// Run read/extract mode with multi-volume support
-fn run_read_multi_volume(args: &Args, options: &ReadOptions) -> PaxResult<()> {
+/// The volume options of -M: the volumes are named after `-f`, which is
+/// required. `stdin_in_use` is whether pax reads its names from standard
+/// input, which the volume script then must not.
+fn multi_volume_options(args: &Args, stdin_in_use: bool) -> PaxResult<MultiVolumeOptions> {
     let archive_path = args.archive.as_ref().ok_or_else(|| {
         PaxError::InvalidFormat("multi-volume mode requires -f archive".to_string())
     })?;
-
-    let mv_options = MultiVolumeOptions {
-        volume_size: None, // Not needed for reading
+    Ok(MultiVolumeOptions {
+        volume_size: args.tape_length,
         volume_script: args.new_volume_script.clone(),
         archive_path: archive_path.clone(),
         verbose: args.verbose,
-    };
-
-    let mut reader = MultiVolumeReader::new(mv_options)?;
-
-    // Multi-volume is always ustar format
-    modes::extract_archive(&mut reader, options)
+        stdin_in_use,
+    })
 }
 
 /// Run write/create mode
@@ -562,11 +535,14 @@ fn run_write(args: &Args, name_lists: Vec<NameList>, archive_bytes: &ByteCounter
     };
 
     let format = ArchiveFormat::from(selected);
+    let name_lists = name_lists_or_stdin(name_lists, &args.files_and_patterns);
+    let names_on_stdin = name_lists.iter().any(NameList::is_stdin);
     let mut files = source_names(name_lists, &args.files_and_patterns)?;
 
     // Check for multi-volume mode
     if args.multi_volume {
-        return run_write_multi_volume(args, &mut files, format, &options);
+        let mv_options = multi_volume_options(args, names_on_stdin)?;
+        return run_write_multi_volume(args, mv_options, &mut files, format, &options);
     }
 
     // Determine record size for blocked I/O. With no explicit -b, the default
@@ -578,37 +554,45 @@ fn run_write(args: &Args, name_lists: Vec<NameList>, archive_bytes: &ByteCounter
         None => stdio_file(io::stdout())?,
     };
     let metadata = raw.metadata()?;
-    let regular_file = metadata.is_file();
-    if regular_file {
+    if metadata.is_file() {
         options.archive_id = Some(modes::write::file_id(&metadata));
     }
     // -b is the size of every write to the archive file, and with -z the
     // archive file holds the compressed stream: that is what gets blocked.
-    let blocked = BlockedWriter::with_counter(raw, record_size, ByteCounter::clone(archive_bytes));
-    if args.gzip {
-        let blocked = if regular_file {
-            blocked.unpadded_last_record()
-        } else {
-            blocked
-        };
-        modes::create_archive(GzipWriter::new(blocked)?, &mut files, format, &options)
+    let mut blocked =
+        BlockedWriter::with_counter(raw, record_size, ByteCounter::clone(archive_bytes));
+    let written = if args.gzip {
+        // Only a device needs its last record whole. Anywhere else the
+        // padding is zeros after the gzip trailer, which gzip(1) reports as
+        // trailing garbage -- as bsdtar and GNU tar leave none.
+        if !is_device(&metadata) {
+            blocked = blocked.unpadded_last_record();
+        }
+        modes::create_archive(GzipWriter::new(&mut blocked)?, &mut files, format, &options)
     } else {
-        modes::create_archive(blocked, &mut files, format, &options)
-    }
+        modes::create_archive(&mut blocked, &mut files, format, &options)
+    };
+    // Closed even after a failure, which takes precedence in the report.
+    let closed = blocked.close().map_err(PaxError::ArchiveWrite);
+    written.and(closed)
+}
+
+/// Whether the archive file is a device -- a tape -- rather than a file,
+/// pipe or socket.
+fn is_device(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    let file_type = metadata.file_type();
+    file_type.is_char_device() || file_type.is_block_device()
 }
 
 /// Run write mode with multi-volume support
 fn run_write_multi_volume(
     args: &Args,
+    mv_options: MultiVolumeOptions,
     files: &mut FileNames<'_>,
     format: ArchiveFormat,
     options: &WriteOptions,
 ) -> PaxResult<()> {
-    // Multi-volume requires an archive file (not stdout)
-    let archive_path = args.archive.as_ref().ok_or_else(|| {
-        PaxError::InvalidFormat("multi-volume mode requires -f archive".to_string())
-    })?;
-
     // The multi-volume writer emits ustar headers unconditionally, so any other
     // interchange format has to be refused rather than silently downgraded.
     if format != ArchiveFormat::Ustar {
@@ -620,18 +604,11 @@ fn run_write_multi_volume(
     }
 
     // Tape length is required for multi-volume
-    let volume_size = args.tape_length.ok_or_else(|| {
+    let volume_size = mv_options.volume_size.ok_or_else(|| {
         PaxError::InvalidFormat(
             "multi-volume mode requires --tape-length to specify volume size".to_string(),
         )
     })?;
-
-    let mv_options = MultiVolumeOptions {
-        volume_size: Some(volume_size),
-        volume_script: args.new_volume_script.clone(),
-        archive_path: archive_path.clone(),
-        verbose: args.verbose,
-    };
 
     // A volume holds whole records. Without -b, a tape length shorter than
     // the format's default record makes the record no larger than the volume.
@@ -758,15 +735,27 @@ fn run_copy(args: &Args, name_lists: Vec<NameList>) -> PaxResult<()> {
 /// A regular file -- named by -f, or on standard input -- is read through a
 /// stream that seeks over the member data list and read mode skip, rather than
 /// reading it. A compressed archive, a pipe or a device is read throughout.
+/// Under -M the archive is its volumes, one after the other.
 fn open_archive_for_read(
     args: &Args,
     archive_bytes: &ByteCounter,
     format_options: &FormatOptions,
 ) -> PaxResult<Box<dyn ArchiveReader>> {
-    // -b sets the size of writes only; on input the blocking is whatever the
-    // reads return (see BlockedReader). A bad value is still diagnosed.
-    if let Some(b) = args.blocksize {
-        parse_blocksize(b)?;
+    // -b sets the size of writes; on input the blocking is whatever the reads
+    // return (see BlockedReader), and a -b given says how large a record
+    // they must hold.
+    let record = args
+        .blocksize
+        .map(parse_read_blocksize)
+        .transpose()?
+        .unwrap_or(0);
+
+    if args.multi_volume {
+        let chain = VolumeChain::open(multi_volume_options(args, false)?, record)?;
+        let blocked = BlockedReader::with_counter(chain, ByteCounter::clone(archive_bytes))
+            .with_record_size(record);
+        let stream = |b| ArchiveStream::new(b).with_finisher(warn_of_next_volume);
+        return open_detected(blocked, stream, format_options);
     }
 
     let raw = match args.archive {
@@ -778,23 +767,70 @@ fn open_archive_for_read(
     // Everything that looks at the raw archive, gzip detection included, goes
     // through the one blocked reader: a smaller read of its own would cut the
     // first record short.
-    let mut blocked = BlockedReader::with_counter(raw, ByteCounter::clone(archive_bytes));
+    let mut blocked = BlockedReader::with_counter(raw, ByteCounter::clone(archive_bytes))
+        .with_record_size(record);
     let is_gzip_archive = is_gzip(blocked.peek(GZIP_MAGIC.len())?);
     if is_gzip_archive || args.gzip {
         // For format detection, peek at the decompressed archive.
         let mut reader = PeekReader::new(Box::new(GzipReader::new(blocked)?), 512);
         let format = detect_format_from_bytes(reader.peek()?)?;
-        return formats::open_reader(ArchiveStream::new(reader), format, format_options);
+        let stream = ArchiveStream::new(reader).with_finisher(read_compressed_trailer);
+        return formats::open_reader(stream, format, format_options);
     }
 
+    if seekable {
+        let stream = |b| ArchiveStream::seekable(b).with_finisher(leave_after_archive);
+        open_detected(blocked, stream, format_options)
+    } else {
+        open_detected(blocked, ArchiveStream::new, format_options)
+    }
+}
+
+/// The reader for the archive `blocked` holds, in whatever format its first
+/// block shows, over the stream `stream` makes of it.
+fn open_detected<R: Read + 'static>(
+    mut blocked: BlockedReader<R>,
+    stream: impl FnOnce(BlockedReader<R>) -> ArchiveStream<BlockedReader<R>>,
+    format_options: &FormatOptions,
+) -> PaxResult<Box<dyn ArchiveReader>> {
     let peeked = blocked.peek(512)?;
     let format = detect_format_from_bytes(&peeked[..peeked.len().min(512)])?;
-    let stream = if seekable {
-        ArchiveStream::seekable(blocked)
-    } else {
-        ArchiveStream::new(blocked)
-    };
-    formats::open_reader(stream, format, format_options)
+    formats::open_reader(stream(blocked), format, format_options)
+}
+
+/// The end of a compressed archive is not the end of the compressed stream:
+/// its trailer, with the CRC and length of everything before it, comes after
+/// the end-of-archive indicator. Reading on to it is what checks them.
+fn read_compressed_trailer<R: Read>(reader: &mut R, reached_end: bool) -> io::Result<()> {
+    if reached_end {
+        io::copy(reader, &mut io::sink())?;
+    }
+    Ok(())
+}
+
+/// At the end of a multi-volume archive, a volume after the last one is
+/// reported rather than silently ignored.
+fn warn_of_next_volume(
+    blocked: &mut BlockedReader<VolumeChain>,
+    reached_end: bool,
+) -> io::Result<()> {
+    if reached_end {
+        blocked.get_ref().warn_of_next_volume();
+    }
+    Ok(())
+}
+
+/// Leave a seekable input just past the archive -- its record padding
+/// included, when it was read to the end -- and not wherever reading ahead
+/// got to. Standard input is shared with whatever reads it next.
+fn leave_after_archive<R: Read + Seek>(
+    blocked: &mut BlockedReader<R>,
+    reached_end: bool,
+) -> io::Result<()> {
+    if reached_end {
+        blocked.skip_trailing_zeros()?;
+    }
+    blocked.unread_buffered()
 }
 
 /// The bytes per write to the archive: -b, or `default` without it.
@@ -913,11 +949,7 @@ fn source_names(
     lists: Vec<NameList>,
     operands: &[OsString],
 ) -> PaxResult<impl Iterator<Item = PathBuf> + '_> {
-    let lists = if lists.is_empty() && operands.is_empty() {
-        vec![NameList::stdin(b'\n')]
-    } else {
-        lists
-    };
+    let lists = name_lists_or_stdin(lists, operands);
     let mut names = lists.into_iter().flat_map(NameList::names).peekable();
     if let Some(Err(_)) = names.peek() {
         if let Some(Err(e)) = names.next() {
@@ -927,6 +959,16 @@ fn source_names(
     Ok(names
         .map_while(report_list_error)
         .chain(operands.iter().map(PathBuf::from)))
+}
+
+/// The name lists of write, append and copy mode: those given, or with
+/// neither lists nor operands, standard input, one name per line.
+fn name_lists_or_stdin(lists: Vec<NameList>, operands: &[OsString]) -> Vec<NameList> {
+    if lists.is_empty() && operands.is_empty() {
+        vec![NameList::stdin(b'\n')]
+    } else {
+        lists
+    }
 }
 
 /// tar's `-T` in list and read mode: each name selects members as a pattern

@@ -109,7 +109,12 @@ pub struct ArchiveStream<R> {
     inner: R,
     offset: u64,
     skip: fn(&mut R, u64) -> std::io::Result<()>,
+    finish: Finisher<R>,
 }
+
+/// What [`ArchiveStream::finish`] does with the stream: given whether the
+/// archive was read to its end.
+pub type Finisher<R> = fn(&mut R, bool) -> std::io::Result<()>;
 
 impl<R: Read> ArchiveStream<R> {
     /// A stream that steps over data by reading it -- a pipe, a tape.
@@ -118,7 +123,25 @@ impl<R: Read> ArchiveStream<R> {
             inner,
             offset: 0,
             skip: read_over::<R>,
+            finish: |_, _| Ok(()),
         }
+    }
+
+    /// Have [`finish`](Self::finish) call `finish`.
+    pub fn with_finisher(mut self, finish: Finisher<R>) -> Self {
+        self.finish = finish;
+        self
+    }
+
+    /// Done with the archive, which was read to its end-of-archive indicator
+    /// when `reached_end`, and otherwise left part way (`-n`).
+    ///
+    /// What the input still needs then depends on what it is: a compressed
+    /// stream is checked against its trailer, a file shared with the caller
+    /// is left just past the archive.
+    pub fn finish(&mut self, reached_end: bool) -> PaxResult<()> {
+        (self.finish)(&mut self.inner, reached_end)?;
+        Ok(())
     }
 
     /// Step over `count` bytes of member data.
@@ -141,6 +164,7 @@ impl<R: Read + Seek> ArchiveStream<R> {
             inner,
             offset: 0,
             skip: seek_over::<R>,
+            finish: |_, _| Ok(()),
         }
     }
 }

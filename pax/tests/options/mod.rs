@@ -2615,3 +2615,82 @@ fn test_write_refuses_option_values_no_reader_accepts() {
     let listing = run_pax_with_stdin_bytes(&["-o", "listopt=%(uid)d %F"], &output.stdout);
     assert_eq!(stdout_str(&listing), "4242 f\n");
 }
+
+/// Reading an archive from a standard input that is a file leaves the file
+/// just past the archive (POSIX, "INPUT FILES": a utility that stops before
+/// end-of-file on a seekable input positions it past the last byte it
+/// processed), the record padding after the end-of-archive indicator
+/// included. pax read ahead and left the file wherever its reads had got to.
+#[test]
+fn test_read_leaves_standard_input_after_the_archive() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f"), "x").unwrap();
+    let out = run_pax_in_dir(&["-w", "-f", "a.tar", "f"], temp.path());
+    assert_success(&out, "pax -w");
+    let mut data = fs::read(temp.path().join("a.tar")).unwrap();
+    assert_eq!(data.len(), 10240, "padded to a whole record");
+    data.extend_from_slice(b"TRAILING");
+    fs::write(temp.path().join("in"), &data).unwrap();
+
+    for pax in [&["-v"][..], &["-r", "-k"][..]] {
+        let out = Command::new("sh")
+            .args(["-c", "\"$0\" \"$@\" >/dev/null && cat"])
+            .arg(env!("CARGO_BIN_EXE_pax"))
+            .args(pax)
+            .current_dir(temp.path())
+            .stdin(File::open(temp.path().join("in")).unwrap())
+            .output()
+            .unwrap();
+        assert_success(&out, &format!("pax {pax:?}; cat"));
+        assert_eq!(stdout_str(&out), "TRAILING", "pax {pax:?}");
+    }
+}
+
+/// -b sets the size of each write; on input the blocking is found from the
+/// archive. A -b given anyway is a record size the reads must hold, and it
+/// was refused if it exceeded what pax may *write*.
+#[test]
+fn test_read_accepts_a_record_size_over_the_write_limit() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f"), "x").unwrap();
+    let out = run_pax_in_dir(&["-w", "-f", "a.tar", "f"], temp.path());
+    assert_success(&out, "pax -w");
+    let mut data = fs::read(temp.path().join("a.tar")).unwrap();
+    data.resize(128 * 1024, 0);
+    fs::write(temp.path().join("big.tar"), &data).unwrap();
+
+    let out = run_pax_in_dir(&["-b", "131072", "-f", "big.tar"], temp.path());
+    assert_success(&out, "pax -b 131072 on read");
+    assert_eq!(stdout_str(&out), "f\n");
+
+    // Still a number of bytes that is a multiple of 512.
+    let out = run_pax_in_dir(&["-b", "1000", "-f", "big.tar"], temp.path());
+    assert!(!out.status.success());
+    // And still limited on write.
+    let out = run_pax_in_dir(&["-w", "-b", "131072", "-f", "c.tar", "f"], temp.path());
+    assert!(!out.status.success());
+}
+
+/// EOF on /dev/tty ends a -w -i run, but the archive written so far is
+/// still finished: without its trailer a cpio archive cannot be read at all.
+#[test]
+fn test_interactive_eof_finishes_the_archive() {
+    let temp = TempDir::new().unwrap();
+    three_files(temp.path());
+    for (format, archive) in [("cpio", "out.cpio"), ("ustar", "out.tar")] {
+        let args = ["-w", "-i", "-x", format, "-f", archive, "a", "b", "c"];
+        let Some((out, _)) = run_pax_on_tty(
+            &args,
+            temp.path(),
+            b".\n\x04",
+            std::time::Duration::from_secs(20),
+        ) else {
+            panic!("pax {args:?} did not exit on EOF from /dev/tty");
+        };
+        assert!(!out.status.success(), "EOF on /dev/tty must fail");
+        let out = run_pax_in_dir(&["-f", archive], temp.path());
+        assert_success(&out, &format!("reading {archive}"));
+        assert_eq!(stdout_str(&out), "a\n");
+        assert_eq!(stderr_str(&out), "");
+    }
+}

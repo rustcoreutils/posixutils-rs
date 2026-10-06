@@ -141,14 +141,26 @@ pub fn create_archive<W: Write>(
 
 /// Archive `files` and write the trailer, with every I/O failure of `archive`
 /// itself marked as the archive's (see `ArchiveSink`).
+///
+/// End of file on `/dev/tty` under -i ends the run, but what has been
+/// archived by then is still finished with a trailer: without one a cpio
+/// archive cannot be read at all.
 fn write_archive<A: ArchiveWriter>(
     archive: &mut A,
     files: &mut FileNames<'_>,
     options: &WriteOptions,
 ) -> PaxResult<()> {
     let mut sink = ArchiveSink(archive);
-    write_files(&mut sink, files, options)?;
-    sink.finish()
+    match write_files(&mut sink, files, options) {
+        Err(PaxError::TtyEof) => {
+            sink.finish()?;
+            Err(PaxError::TtyEof)
+        }
+        written => {
+            written?;
+            sink.finish()
+        }
+    }
 }
 
 /// An archive writer whose I/O errors are known to be the archive's.
@@ -893,6 +905,11 @@ impl NameList {
             source: NameSource::File(file),
             sep,
         }
+    }
+
+    /// Whether the names are read from standard input.
+    pub fn is_stdin(&self) -> bool {
+        matches!(self.source, NameSource::Stdin)
     }
 
     /// The names, read one at a time as they are asked for.

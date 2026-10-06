@@ -281,6 +281,12 @@ pub trait ArchiveReader {
     fn applies_option_records(&self) -> bool {
         false
     }
+
+    /// Done reading: the archive was read to its end when `reached_end`,
+    /// and otherwise stopped part way. See `ArchiveStream::finish`.
+    fn finish(&mut self, _reached_end: bool) -> PaxResult<()> {
+        Ok(())
+    }
 }
 
 /// A boxed reader, as `formats::open_reader` returns for a format detected at
@@ -300,6 +306,10 @@ impl<T: ArchiveReader + ?Sized> ArchiveReader for Box<T> {
 
     fn applies_option_records(&self) -> bool {
         (**self).applies_option_records()
+    }
+
+    fn finish(&mut self, reached_end: bool) -> PaxResult<()> {
+        (**self).finish(reached_end)
     }
 }
 

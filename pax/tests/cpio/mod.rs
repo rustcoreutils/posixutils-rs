@@ -710,3 +710,39 @@ fn test_cpio_rename_keeps_newer_file_at_the_new_name() {
     assert_eq!(fs::read_to_string(dest.join("g")).unwrap(), "archived\n");
     assert_eq!(fs::read_to_string(dest.join("f")).unwrap(), "newer\n");
 }
+
+/// Two archives one after the other on a standard input that is a file:
+/// each `cpio -i` reads its own and leaves the file just past it, as POSIX
+/// asks of a utility that stops before the end of a seekable input. Reading
+/// ahead took the second archive with the first, and counted it in the first
+/// one's block total too.
+#[test]
+fn test_cpio_reads_only_its_own_archive_from_standard_input() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+    fs::write(src.join("a.txt"), vec![b'a'; 3000]).unwrap();
+    let out = run_cpio(&["-o"], &src, NAME_LIST.as_bytes());
+    assert_success(&out, "cpio -o");
+    let written = stderr_str(&out);
+    let one = out.stdout;
+    assert!(one.len() > 512);
+
+    let two = temp.path().join("two.cpio");
+    fs::write(&two, [one.as_slice(), &one].concat()).unwrap();
+    let out = std::process::Command::new("sh")
+        .args(["-c", "\"$0\" -it && \"$0\" -it"])
+        .arg(crate::common::front_end("cpio"))
+        .stdin(fs::File::open(&two).unwrap())
+        .output()
+        .unwrap();
+    assert_success(&out, "cpio -it twice");
+    let names = stdout_str(&out);
+    let once = names.lines().count() / 2;
+    assert!(once > 0);
+    assert_eq!(
+        names.lines().take(once).collect::<Vec<_>>(),
+        names.lines().skip(once).collect::<Vec<_>>()
+    );
+    // Each reports the size of one archive, which is what writing it reported.
+    assert_eq!(stderr_str(&out), format!("{written}{written}"));
+}

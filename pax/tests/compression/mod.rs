@@ -495,3 +495,56 @@ fn test_gzip_reads_a_stream_split_across_two_members() {
     );
     assert_eq!(fs::read(dst.join("two.txt")).unwrap(), b"last\n");
 }
+
+/// A gzip archive with one byte of its trailer flipped: `at` counts back from
+/// the end, 8 for the CRC and 4 for ISIZE.
+fn damaged_trailer(dir: &std::path::Path, at: usize) -> std::path::PathBuf {
+    fs::write(dir.join("f"), b"contents\n").unwrap();
+    let gz = dir.join("good.tgz");
+    assert_success(
+        &run_pax_in_dir(&["-wz", "-f", gz.to_str().unwrap(), "f"], dir),
+        "pax -wz",
+    );
+    let mut data = fs::read(&gz).unwrap();
+    let n = data.len();
+    data[n - at] ^= 0xff;
+    let bad = dir.join(format!("bad{at}.tgz"));
+    fs::write(&bad, data).unwrap();
+    bad
+}
+
+/// The gzip trailer records the CRC and length of what it compressed. The
+/// tar reader stops at the end-of-archive indicator, before the trailer, so
+/// neither was ever checked: a corrupted archive read back with status 0.
+#[test]
+fn test_gzip_trailer_is_verified() {
+    let temp = TempDir::new().unwrap();
+    for at in [8, 4] {
+        let bad = damaged_trailer(temp.path(), at);
+        let out = run_pax(&["-f", bad.to_str().unwrap()]);
+        assert_failure(&out, &format!("byte -{at} of the gzip trailer damaged"));
+        let dst = temp.path().join(format!("dst{at}"));
+        fs::create_dir(&dst).unwrap();
+        let out = run_pax_in_dir(&["-r", "-f", bad.to_str().unwrap()], &dst);
+        assert_failure(&out, "extracting it");
+    }
+}
+
+/// `pax -wz` to a pipe ends with the gzip trailer. Blocking padded the last
+/// record with zeros after it, which gzip(1) reports as trailing garbage.
+/// Only a device needs whole records.
+#[test]
+fn test_gzip_to_a_pipe_ends_with_the_trailer() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f"), b"contents\n").unwrap();
+    let out = run_pax_in_dir(&["-wz", "f"], temp.path());
+    assert_success(&out, "pax -wz to a pipe");
+    let gz = &out.stdout;
+    let isize = u32::from_le_bytes(gz[gz.len() - 4..].try_into().unwrap());
+    // Header, a block of data and the end-of-archive indicator.
+    assert_eq!(isize, 4 * 512, "the stream must end with its own trailer");
+
+    let mut plain = Vec::new();
+    std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&gz[..]), &mut plain).unwrap();
+    assert_eq!(plain.len(), 4 * 512);
+}

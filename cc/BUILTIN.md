@@ -495,8 +495,12 @@ incompatible declaration keep the bare name's call.
   `s` is `strcpy(d, s)`.
 - `printf`, `fprintf`, `vprintf`, `vfprintf`, `fputs`, their `_unlocked`
   forms and `__printf_chk`, `__vprintf_chk`, `__fprintf_chk`,
-  `__vfprintf_chk` (`stdio.rs`), result unused: `printf("")` goes,
-  `printf("x")` is `putchar('x')`, `printf("text\n")` and `printf("%s\n", s)`
+  `__vfprintf_chk` (`stdio.rs`), result unused: a write of nothing --
+  `printf("")`, `printf("%s", "")`, `fprintf(fp, "")`,
+  `fprintf(fp, "%s", "")`, `fputs("", fp)`, an empty `v` format -- goes,
+  its arguments still evaluated, as gcc deletes it, although C17 7.21.2p4
+  has even an empty write orient the stream; `printf("x")` is
+  `putchar('x')`, `printf("text\n")` and `printf("%s\n", s)`
   are `puts`, `printf("%c", c)` is `putchar(c)`; `fprintf(fp, "text")` and
   `fprintf(fp, "%s", s)` are `fputs`, `fprintf(fp, "%c", c)` is `fputc`;
   `fputs` of a known string is nothing, `fputc` or `fwrite`. The `v` forms

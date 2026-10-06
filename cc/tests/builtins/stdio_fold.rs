@@ -27,6 +27,7 @@ const PROGRAM: &str = r#"
 
 static int effects;
 static FILE *out(void) { effects++; return stdout; }
+static const char *nothing(void) { effects++; return ""; }
 
 static void v(const char *unused, ...) {
     va_list ap;
@@ -52,6 +53,7 @@ int main(void) {
     printf("%c", 'B');
     printf("%s", "C\n");
     printf("%s", "");
+    printf("%s", nothing());
     printf("%d\n", 42);
     printf("%%\n");
     printf("%s", "100%\n");
@@ -70,7 +72,7 @@ int main(void) {
     v("");
     if (printf("used\n") != 5) return 1;
     if (fputs("", stdout) < 0) return 2;
-    if (effects != 8) return 3;
+    if (effects != 9) return 3;
     if (i != 0 || s3 != s2 + 1) return 4;
     return 0;
 }
@@ -126,33 +128,35 @@ fn builtins_stdio_fold_output_aarch64() {
     }
 }
 
-/// `fputs("", fp)` writes nothing, but it still orients the stream.
+/// A write of nothing whose result is unused is deleted from -O1 up, as gcc
+/// deletes it, and the stream is left unoriented.
 ///
 /// C17 7.21.2p4: a stream has no orientation until an input or output
 /// function is applied to it, and the first one sets it -- whether or not it
-/// transfers any bytes. Folding the call away took the orientation with it,
-/// so `fwide(fp, 0)` answered 0 at -O2 and a byte orientation at -O0:
+/// transfers any bytes. gcc deletes `printf("")`, `fprintf(fp, "")`,
+/// `fprintf(fp, "%s", "")` and `fputs("", fp)` all the same, and c17 does
+/// as gcc does:
 ///
 /// ```text
-///     fputs("", fp);  fwide(fp, 0)   ->   -1 at -O0,  0 at -O2
+///     fputs("", fp);  fwide(fp, 0)   ->   -1 at -O0,  0 at -O1 and -O2
 /// ```
 ///
-/// gcc and clang keep this call for the same reason. They drop
-/// `fprintf(fp, "")` and `fprintf(fp, "%s", "")` and lose the orientation
-/// with them; every empty write is treated alike here, so those are
-/// asserted too.
+/// gcc deletes them at -O0 too; c17 folds no stdio call at -O0.
 #[test]
-fn stdio_fold_empty_fputs_still_orients_the_stream() {
+fn stdio_fold_empty_write_is_deleted_as_in_gcc() {
     let src = r#"
 #include <stdio.h>
+#include <stdlib.h>
 #include <wchar.h>
-int main(void) {
+int main(int argc, char **argv) {
+    /* -1 when the call stayed and oriented the stream, 0 when it went. */
+    int want = atoi(argv[1]);
     FILE *f = fopen("/dev/null", "w");
     if (!f) return 1;
-    /* Nothing is written, but the stream becomes byte-oriented. The result
-       is deliberately unused: that is the shape the fold applies to. */
+    /* The result is deliberately unused: that is the shape the fold
+       applies to. */
     fputs("", f);
-    if (fwide(f, 0) >= 0) return 3;
+    if (fwide(f, 0) != want) return 3;
     fclose(f);
 
     /* The same through a variable the optimizer can see is empty. */
@@ -160,27 +164,33 @@ int main(void) {
     if (!g) return 4;
     const char *empty = "";
     fputs(empty, g);
-    if (fwide(g, 0) >= 0) return 6;
+    if (fwide(g, 0) != want) return 6;
     fclose(g);
 
-    /* Every other empty write orients the stream too. */
     FILE *h = fopen("/dev/null", "w");
     if (!h) return 7;
     fprintf(h, "");
-    if (fwide(h, 0) >= 0) return 8;
+    if (fwide(h, 0) != want) return 8;
     fclose(h);
 
     FILE *i = fopen("/dev/null", "w");
     if (!i) return 9;
     fprintf(i, "%s", "");
-    if (fwide(i, 0) >= 0) return 10;
+    if (fwide(i, 0) != want) return 10;
     fclose(i);
+
+    /* A used result keeps the call, which orients the stream. */
+    FILE *j = fopen("/dev/null", "w");
+    if (!j) return 11;
+    if (fputs("", j) < 0) return 12;
+    if (fwide(j, 0) >= 0) return 13;
+    fclose(j);
     return 0;
 }
 "#;
-    for opt in ["-O0", "-O1", "-O2"] {
+    for (opt, want) in [("-O0", "-1"), ("-O1", "0"), ("-O2", "0")] {
         let dir = plib::tmp::Builder::new()
-            .prefix("c17_fputs_orient_")
+            .prefix("c17_empty_write_")
             .tempdir()
             .expect("tempdir");
         let c = dir.path().join("t.c");
@@ -189,6 +199,7 @@ int main(void) {
         let built = run_c17(&[opt, "-o", exe.to_str().unwrap(), c.to_str().unwrap()]);
         assert!(built.success, "{opt}: {}{}", built.stdout, built.stderr);
         let code = Command::new(&exe)
+            .arg(want)
             .status()
             .expect("run")
             .code()

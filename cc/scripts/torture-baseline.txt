@@ -9,7 +9,9 @@ builtins/abs-3@-O2
 builtins/complex-1@-O0
 builtins/complex-1@-O2
 builtins/fprintf@-O0
+builtins/fprintf@-O2
 builtins/fputs@-O0
+builtins/fputs@-O2
 builtins/memchr@-O0
 builtins/memchr@-O2
 builtins/memcmp@-O0
@@ -31,6 +33,7 @@ builtins/pr22237-1@-O2
 builtins/pr22237@-O0
 builtins/pr22237@-O2
 builtins/printf@-O0
+builtins/printf@-O2
 builtins/sprintf@-O0
 builtins/sprintf@-O2
 builtins/strcat@-O0
@@ -5623,6 +5626,7 @@ execute/fprintf-1@-O2
 execute/fprintf-2@-O0
 execute/fprintf-2@-O2
 execute/fprintf-chk-1@-O0
+execute/fprintf-chk-1@-O2
 execute/frame-address@-O0
 execute/frame-address@-O2
 execute/func-ptr-1@-O0
@@ -7036,6 +7040,7 @@ execute/printf-1@-O2
 execute/printf-2@-O0
 execute/printf-2@-O2
 execute/printf-chk-1@-O0
+execute/printf-chk-1@-O2
 execute/pta-field-1@-O0
 execute/pta-field-1@-O2
 execute/pta-field-2@-O0
@@ -7217,11 +7222,13 @@ execute/va-arg-trap-1@-O2
 execute/vfprintf-1@-O0
 execute/vfprintf-1@-O2
 execute/vfprintf-chk-1@-O0
+execute/vfprintf-chk-1@-O2
 execute/vla-dealloc-1@-O0
 execute/vla-dealloc-1@-O2
 execute/vprintf-1@-O0
 execute/vprintf-1@-O2
 execute/vprintf-chk-1@-O0
+execute/vprintf-chk-1@-O2
 execute/vrp-1@-O0
 execute/vrp-1@-O2
 execute/vrp-2@-O0

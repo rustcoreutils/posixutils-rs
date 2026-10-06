@@ -18,7 +18,10 @@ const PROTOTYPES: &str = "typedef struct F FILE;\n\
     int printf(const char *, ...);\n\
     int fprintf(FILE *, const char *, ...);\n\
     int fputs(const char *, FILE *);\n\
-    int puts(const char *);\n";
+    int puts(const char *);\n\
+    typedef __builtin_va_list va_list;\n\
+    int vprintf(const char *, va_list);\n\
+    int vfprintf(FILE *, const char *, va_list);\n";
 
 /// The functions the assembly calls or jumps to, by name, less any `_`
 /// prefix.
@@ -75,9 +78,17 @@ fn for_each_target_src(src: &str, opts: &[&str], check: impl Fn(&[String], &str)
 #[test]
 fn builtins_stdio_fold_makes_the_calls() {
     let cases: &[(&str, &[&str])] = &[
-        // An empty write orients the stream (C17 7.21.2p4), so the call
-        // stays; see `Print::text`.
-        ("void f(void) { printf(\"\"); }", &["printf"]),
+        // An empty write whose result is unused is deleted, as gcc deletes
+        // it, although C17 7.21.2p4 has it orient the stream.
+        ("void f(void) { printf(\"\"); }", &[]),
+        ("void f(FILE *fp) { fprintf(fp, \"\"); }", &[]),
+        ("void f(void) { printf(\"%s\", \"\"); }", &[]),
+        ("void f(FILE *fp) { fprintf(fp, \"%s\", \"\"); }", &[]),
+        ("void f(va_list ap) { vprintf(\"\", ap); }", &[]),
+        (
+            "void f(FILE *fp, va_list ap) { vfprintf(fp, \"\", ap); }",
+            &[],
+        ),
         ("void f(void) { printf(\"a\"); }", &["putchar"]),
         ("void f(void) { printf(\"hi\\n\"); }", &["puts"]),
         ("void f(const char *s) { printf(\"%s\\n\", s); }", &["puts"]),
@@ -91,9 +102,7 @@ fn builtins_stdio_fold_makes_the_calls() {
             "void f(FILE *fp, int c) { fprintf(fp, \"%c\", c); }",
             &["fputc"],
         ),
-        // Writes nothing, but still orients the stream (C17 7.21.2p4), so
-        // the call stays.
-        ("void f(FILE *fp) { fputs(\"\", fp); }", &["fputs"]),
+        ("void f(FILE *fp) { fputs(\"\", fp); }", &[]),
         ("void f(FILE *fp) { fputs(\"x\", fp); }", &["fputc"]),
         (
             "void f(FILE *fp, int i) { fputs(i ? \"ab\" : \"cd\", fp); }",
@@ -119,6 +128,12 @@ fn builtins_stdio_fold_keeps_the_call_otherwise() {
         ("void f(const char *s) { printf(\"%s\", s); }", "printf"),
         ("void f(long c) { printf(\"%c\", c); }", "printf"),
         ("int f(FILE *fp) { return fputs(\"hi\", fp); }", "fputs"),
+        // An empty write whose result is used stays, as in gcc.
+        ("int f(void) { return printf(\"\"); }", "printf"),
+        ("int f(FILE *fp) { return fprintf(fp, \"\"); }", "fprintf"),
+        ("int f(FILE *fp) { return fputs(\"\", fp); }", "fputs"),
+        // puts("") writes a newline.
+        ("void f(void) { puts(\"\"); }", "puts"),
         ("void f(FILE *fp, const char *s) { fputs(s, fp); }", "fputs"),
     ];
     for (body, name) in cases {

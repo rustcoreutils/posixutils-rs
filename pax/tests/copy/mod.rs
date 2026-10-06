@@ -824,6 +824,35 @@ fn test_copy_link_with_dereference_links_the_target() {
     }
 }
 
+/// -l with -H/-L where the destination name already *is* the file the source
+/// symbolic link refers to. linkat reports EEXIST; the "already the same file"
+/// check has to follow the link the way linkat does, or it sees two different
+/// inodes, unlinks the destination -- the only copy of the data -- and the
+/// retried link then has nothing to link to.
+#[test]
+fn test_copy_link_follow_onto_the_link_target_keeps_it() {
+    for follow in ["-H", "-L"] {
+        let temp = TempDir::new().unwrap();
+        let d = temp.path().join("D");
+        fs::create_dir(&d).unwrap();
+        fs::write(d.join("x"), "DATA\n").unwrap();
+        std::os::unix::fs::symlink("D/x", temp.path().join("x")).unwrap();
+
+        let output = run_pax_in_dir(&["-rwl", follow, "x", "D"], temp.path());
+        assert_eq!(
+            fs::read_to_string(d.join("x")).unwrap_or_default(),
+            "DATA\n",
+            "{follow}: the link target was destroyed: {}",
+            stderr_str(&output)
+        );
+        assert!(
+            stderr_str(&output).contains("to itself"),
+            "{follow}: linking a file onto itself is diagnosed as elsewhere: {}",
+            stderr_str(&output)
+        );
+    }
+}
+
 /// -l across devices cannot link; POSIX says the file is then copied, and
 /// that expected fallback is neither diagnosed nor a failure.
 #[test]

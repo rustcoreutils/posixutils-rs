@@ -30,17 +30,21 @@ pub use write::create_archive;
 /// an exceeded file-size limit produces one diagnostic per remaining file, each
 /// blaming a file that did nothing wrong. Every I/O error the archive writer
 /// raises arrives as `ArchiveWrite` (see `write::ArchiveSink`), whatever its
-/// errno. Copy mode has no archive; there a full or vanished destination
-/// filesystem is the shared failure. A failure to read a *source* file is
+/// errno, and every failure to write -O's standard output as `StdoutWrite`.
+/// Read and copy mode write files instead; there a destination filesystem that
+/// is full, over quota or read-only is the shared failure. A failure to read a *source* file is
 /// per-file, and POSIX CONSEQUENCES OF ERRORS says to diagnose it and carry on.
 /// End of file on `/dev/tty` under -i ends the run by definition.
 pub(crate) fn is_fatal(err: &crate::error::PaxError) -> bool {
     use crate::error::PaxError;
     match err {
-        PaxError::ArchiveWrite(_) | PaxError::TtyEof => true,
+        PaxError::ArchiveWrite(_) | PaxError::StdoutWrite(_) | PaxError::TtyEof => true,
         PaxError::Io(e) => matches!(
             e.kind(),
-            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::StorageFull
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::StorageFull
+                | std::io::ErrorKind::QuotaExceeded
+                | std::io::ErrorKind::ReadOnlyFilesystem
         ),
         _ => false,
     }
@@ -60,7 +64,19 @@ pub(crate) fn may_descend(one_file_system: bool, operand_dev: Option<u64>, dev: 
 
 #[cfg(test)]
 mod tests {
-    use super::may_descend;
+    use super::{is_fatal, may_descend};
+
+    /// A destination filesystem that is full, over quota or read-only fails
+    /// every file after the first the same way.
+    #[test]
+    fn full_or_read_only_destination_is_fatal() {
+        for errno in [libc::ENOSPC, libc::EDQUOT, libc::EROFS, libc::EPIPE] {
+            let err = crate::error::PaxError::Io(std::io::Error::from_raw_os_error(errno));
+            assert!(is_fatal(&err), "errno {errno}");
+        }
+        let err = crate::error::PaxError::Io(std::io::Error::from_raw_os_error(libc::EACCES));
+        assert!(!is_fatal(&err));
+    }
 
     #[test]
     fn one_file_system_stops_below_a_mount_point_only() {

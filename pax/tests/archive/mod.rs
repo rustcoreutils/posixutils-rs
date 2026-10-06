@@ -1966,3 +1966,72 @@ fn test_write_does_not_archive_the_archive_itself() {
     let listing = stdout_str(&run_pax_in_dir(&["-f", "zzz/out.tar"], temp.path()));
     assert_eq!(listing, "f1\n");
 }
+
+/// -t with -L restores the access time of a directory reached through a
+/// symbolic link: the walk read the directory the link refers to, and that is
+/// the one whose access time it disturbed.
+#[test]
+fn test_t_restores_atime_of_directory_reached_through_link() {
+    let temp = TempDir::new().unwrap();
+    let real = temp.path().join("real");
+    fs::create_dir(&real).unwrap();
+    fs::write(real.join("f"), "F\n").unwrap();
+    std::os::unix::fs::symlink("real", temp.path().join("lnk")).unwrap();
+    fs::create_dir(temp.path().join("out")).unwrap();
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+
+    for args in [
+        &["-w", "-L", "-t", "-f", "a.tar", "lnk"][..],
+        &["-rw", "-L", "-t", "lnk", "out"][..],
+    ] {
+        filetime::set_file_atime(&real, old).unwrap();
+        let output = run_pax_in_dir(args, temp.path());
+        assert_success(&output, &format!("pax {args:?}"));
+        assert_eq!(
+            fs::metadata(&real).unwrap().atime(),
+            1_000_000_000,
+            "{args:?}: directory access time not restored"
+        );
+    }
+}
+
+/// Read mode stops at a failure that every later member would hit too. With
+/// -O, standard output that cannot be written fails every member after the
+/// first the same way; one diagnostic says so, rather than one per member
+/// blaming each in turn. The file-size limit stands in for a full disk.
+#[test]
+fn test_extract_to_stdout_write_error_fails_once() {
+    let body = vec![b'x'; 4096];
+    let mut archive = Vec::new();
+    for name in [&b"m1"[..], b"m2", b"m3", b"m4"] {
+        archive.extend_from_slice(
+            &Ustar {
+                name,
+                body: &body,
+                ..Default::default()
+            }
+            .member(),
+        );
+    }
+    archive.extend_from_slice(&ustar_trailer());
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("a.tar"), &archive).unwrap();
+
+    // SIGXFSZ ignored so the over-limit write fails with EFBIG instead of
+    // killing the process.
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg("trap '' XFSZ; ulimit -f 1; exec \"$0\" -xOf a.tar > out")
+        .arg(front_end("tar"))
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+
+    assert_exit_code(&output, 1, "tar -xO past the file-size limit");
+    let err = stderr_str(&output);
+    assert_eq!(
+        err.lines().count(),
+        1,
+        "one diagnostic, not one per member: {err}"
+    );
+}

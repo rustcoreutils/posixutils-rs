@@ -715,3 +715,203 @@ fn test_extract_below_search_only_directory() {
     assert_success(&out, "pax -r below a search-only directory");
     assert_eq!(fs::read_to_string(temp.path().join("s/f")).unwrap(), "F\n");
 }
+
+/// `(uid_t)-1` asks chown to leave the owner alone, so a chown to it
+/// "succeeds" without setting anything. An archive naming that id must not
+/// thereby count as having had its owner restored: the file still belongs to
+/// whoever ran pax, and a set-id bit on it would hand out their identity.
+#[test]
+fn test_extract_owner_minus_one_does_not_keep_set_id() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().unwrap();
+    let mut records = pax_record("uid", b"4294967295");
+    records.extend_from_slice(&pax_record("gid", b"4294967295"));
+    let mut archive = Ustar {
+        name: b"PaxHeaders/f",
+        typeflag: b'x',
+        body: &records,
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"f",
+            mode: 0o6755,
+            body: b"#!/bin/sh\nid\n",
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r", "-p", "e"], &archive, temp.path());
+    let mode = fs::metadata(temp.path().join("f"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o7000,
+        0,
+        "set-id kept on a file whose owner was never set: {}",
+        stderr_str(&output)
+    );
+}
+
+/// The archive's directory attributes are applied to a directory that was
+/// already there, even one the user may search and write but not read (mode
+/// 0300): applying them needs no read permission, so reopening the directory
+/// for reading must not be what decides whether they are applied.
+#[test]
+fn test_extract_attrs_applied_to_search_only_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let d = temp.path().join("d");
+    fs::create_dir(&d).unwrap();
+    fs::set_permissions(&d, fs::Permissions::from_mode(0o300)).unwrap();
+    let archive = Ustar {
+        name: b"d/",
+        typeflag: b'5',
+        mode: 0o750,
+        mtime: 1_000_000_000,
+        ..Default::default()
+    }
+    .archive();
+
+    let out = run_pax_with_stdin_bytes_in_dir(&["-r", "-p", "pm"], &archive, temp.path());
+    let meta = fs::metadata(&d).unwrap();
+    fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_success(&out, "pax -r onto a search-only directory");
+    assert_eq!(meta.permissions().mode() & 0o7777, 0o750);
+}
+
+/// A directory member that a later member replaces with a file has nothing
+/// left to take its attributes. That is the archive's own doing, not an error.
+#[test]
+fn test_extract_superseded_directory_is_not_an_error() {
+    let temp = TempDir::new().unwrap();
+    let mut archive = Ustar {
+        name: b"d/",
+        typeflag: b'5',
+        mode: 0o755,
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"d",
+            body: b"now a file\n",
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let out = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, temp.path());
+    assert_success(&out, "pax -r of a directory superseded by a file");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("d")).unwrap(),
+        "now a file\n"
+    );
+}
+
+/// A hard link whose target walk fails part-way must not leave a descriptor
+/// for a directory a later member removes in the walk cache: the member after
+/// that, below the re-created directory, would be written into the removed
+/// one and lost.
+#[test]
+fn test_extract_after_failed_link_walk_uses_live_directory() {
+    let temp = TempDir::new().unwrap();
+    let dir = |name: &'static [u8]| {
+        Ustar {
+            name,
+            typeflag: b'5',
+            mode: 0o755,
+            ..Default::default()
+        }
+        .member()
+    };
+    let mut archive = dir(b"x/");
+    archive.extend_from_slice(&dir(b"x/y/"));
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"x/h",
+            typeflag: b'1',
+            linkname: b"x/y/missing/t",
+            ..Default::default()
+        }
+        .member(),
+    );
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"x/y",
+            body: b"file\n",
+            ..Default::default()
+        }
+        .member(),
+    );
+    archive.extend_from_slice(&dir(b"x/y/"));
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"x/y/f",
+            body: b"hello\n",
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let out = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, temp.path());
+    assert_eq!(
+        fs::read_to_string(temp.path().join("x/y/f")).unwrap_or_default(),
+        "hello\n",
+        "x/y/f was lost: {}",
+        stderr_str(&out)
+    );
+    let err = stderr_str(&out);
+    assert!(
+        err.contains("x/h") && !err.contains("x/y/f"),
+        "only the dangling hard link is diagnosed: {err}"
+    );
+}
+
+/// -k leaves an existing directory alone. A directory this run created only to
+/// hold an earlier member takes its attributes from the member that names it,
+/// but only once: a second member of that name meets a directory that is, by
+/// then, an existing file.
+#[test]
+fn test_extract_no_clobber_implicit_directory_claimed_once() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().unwrap();
+    let dir = |mode| {
+        Ustar {
+            name: b"a/",
+            typeflag: b'5',
+            mode,
+            ..Default::default()
+        }
+        .member()
+    };
+    let mut archive = Ustar {
+        name: b"a/f",
+        body: b"x\n",
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(&dir(0o700));
+    archive.extend_from_slice(&dir(0o751));
+    archive.extend_from_slice(&ustar_trailer());
+
+    let out = run_pax_with_stdin_bytes_in_dir(&["-r", "-k", "-p", "p"], &archive, temp.path());
+    assert_success(&out, "pax -r -k");
+    let mode = fs::metadata(temp.path().join("a"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o7777,
+        0o700,
+        "-k let a second member override the first"
+    );
+}

@@ -17,7 +17,7 @@ use crate::archive::HardLinkTracker;
 use crate::error::{PaxError, PaxResult};
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
-    create_replacing, link_replacing, link_replacing_with, open_dir_at, restore_atime,
+    create_replacing, file_id, link_replacing, link_replacing_with, open_dir_at, restore_atime,
     restore_dir_atime, set_attrs_fd, set_link_attrs_at, stat_at, AttrPolicy, Attrs, DirTree,
     MemberPath, PendingDirs,
 };
@@ -122,11 +122,7 @@ pub fn copy_files(
         fatal: RefCell::new(None),
     };
     if let Some(st) = stat_at(tree.root(), c".") {
-        // Casts needed: `dev_t` is i32 on macOS and u64 on Linux.
-        #[allow(clippy::unnecessary_cast)]
-        walk.dest_ids
-            .borrow_mut()
-            .insert((st.st_dev as u64, st.st_ino as u64));
+        walk.dest_ids.borrow_mut().insert(file_id(&st));
     }
 
     // Directories take their attributes once everything has been copied --
@@ -425,12 +421,9 @@ impl CopyWalk<'_> {
 
         // Remember what this destination directory *is*, so the walk can
         // recognise it if the source tree leads back here.
-        if let Some(st) = stat_at(dir.as_fd(), c".") {
-            // Casts needed: `dev_t` is i32 on macOS and u64 on Linux.
-            #[allow(clippy::unnecessary_cast)]
-            self.dest_ids
-                .borrow_mut()
-                .insert((st.st_dev as u64, st.st_ino as u64));
+        let dest_st = stat_at(dir.as_fd(), c".");
+        if let Some(st) = &dest_st {
+            self.dest_ids.borrow_mut().insert(file_id(st));
         }
 
         if self.options.verbose {
@@ -444,8 +437,10 @@ impl CopyWalk<'_> {
             let _ = std::io::Write::write_all(&mut std::io::stderr().lock(), &line);
         }
 
-        if let Some(mp) = stamp {
-            self.pending_dirs.borrow_mut().push(&mp, attrs_of(metadata));
+        if let (Some(mp), Some(st)) = (stamp, dest_st) {
+            self.pending_dirs
+                .borrow_mut()
+                .push(&mp, &st, attrs_of(metadata));
         }
         self.descend(member, metadata)
     }
@@ -453,7 +448,7 @@ impl CopyWalk<'_> {
     /// Whether -k or -u leaves the directory already at a destination name
     /// with its own attributes.
     fn keeps_existing_dir(&self, metadata: &ftw::Metadata, st: &libc::stat) -> bool {
-        if self.tree.is_implicit(st) {
+        if self.tree.claim_implicit(st) {
             return false;
         }
         self.options.no_clobber || (self.options.update && !is_source_newer(metadata, Some(st)))
@@ -682,10 +677,7 @@ fn copy_file(
 
 /// Whether `name` in `dirfd` is the file `metadata` describes.
 fn is_file_at(dirfd: BorrowedFd<'_>, name: &CStr, metadata: &ftw::Metadata) -> bool {
-    // Casts needed: `dev_t` is i32 on macOS and u64 on Linux.
-    #[allow(clippy::unnecessary_cast)]
-    stat_at(dirfd, name)
-        .is_some_and(|st| (st.st_dev as u64, st.st_ino as u64) == (metadata.dev(), metadata.ino()))
+    stat_at(dirfd, name).is_some_and(|st| file_id(&st) == (metadata.dev(), metadata.ino()))
 }
 
 /// Actually copy file contents

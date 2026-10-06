@@ -229,6 +229,22 @@ impl DirTree {
             }
         }
 
+        let walked = self.walk_chain(member, create_missing);
+        // A walk that fails part-way has still extended the chain past the
+        // last parent, which the shortcut above would then skip truncating:
+        // a later member naming one of those directories as its leaf could
+        // replace it while the chain kept its descriptor. With no last parent
+        // the next member goes through the chain, and cuts it as it should.
+        *self.last_parent.borrow_mut() = match &walked {
+            Ok(fd) => Some((member.dirs.clone(), Rc::clone(fd))),
+            Err(_) => None,
+        };
+        walked
+    }
+
+    /// The walk `parent_of` does through the chain, reopening only the
+    /// components `member` does not share with it.
+    fn walk_chain(&self, member: &MemberPath, create_missing: bool) -> PaxResult<Rc<OwnedFd>> {
         let mut chain = self.chain.borrow_mut();
         let shared = chain.shared_with(member);
         chain.truncate(shared);
@@ -248,18 +264,25 @@ impl DirTree {
             }
             cur = Some(next);
         }
-        let fd = match cur {
-            Some(fd) => fd,
-            None => Rc::new(self.root.try_clone()?),
-        };
-        *self.last_parent.borrow_mut() = Some((member.dirs.clone(), Rc::clone(&fd)));
-        Ok(fd)
+        match cur {
+            Some(fd) => Ok(fd),
+            None => Ok(Rc::new(self.root.try_clone()?)),
+        }
     }
 
     /// Whether `st` is a directory this run created only to hold members
     /// below it, rather than one that was there before.
     pub(crate) fn is_implicit(&self, st: &libc::stat) -> bool {
         self.implicit.borrow().contains(&file_id(st))
+    }
+
+    /// `is_implicit`, for the member that names the directory and so gives it
+    /// its attributes. That member makes it an ordinary existing directory:
+    /// a later member of the same name meets it the way it would meet any
+    /// other -- left alone under -k -- rather than as one still waiting for
+    /// its attributes.
+    pub(crate) fn claim_implicit(&self, st: &libc::stat) -> bool {
+        self.implicit.borrow_mut().remove(&file_id(st))
     }
 }
 
@@ -320,7 +343,7 @@ fn cached_levels_budget() -> usize {
 }
 
 /// `(st_dev, st_ino)` of a stat result.
-fn file_id(st: &libc::stat) -> (u64, u64) {
+pub(crate) fn file_id(st: &libc::stat) -> (u64, u64) {
     // Casts needed: `dev_t` is i32 on macOS and u64 on Linux.
     #[allow(clippy::unnecessary_cast)]
     (st.st_dev as u64, st.st_ino as u64)
@@ -331,22 +354,28 @@ fn file_id(st: &libc::stat) -> (u64, u64) {
 ///
 /// An archived mode denying write or search would stop the directory's own
 /// contents being created, and every child created afterwards changes its
-/// mtime, so both are applied once at the end, deepest first. Only the name and
-/// the attributes are kept: the directory is reopened when its turn comes.
+/// mtime, so both are applied once at the end, deepest first. Only the name,
+/// the identity and the attributes are kept: the directory is reopened when its
+/// turn comes, and stamped only if the name still refers to it.
 #[derive(Default)]
 pub(crate) struct PendingDirs(Vec<PendingDir>);
 
 struct PendingDir {
     path: PathBuf,
     depth: usize,
+    /// `(st_dev, st_ino)` of the directory the attributes are for.
+    id: (u64, u64),
     attrs: Attrs,
 }
 
 impl PendingDirs {
-    pub(crate) fn push(&mut self, member: &MemberPath, attrs: Attrs) {
+    /// Defer `attrs` for the directory `member` names, `st` being what that
+    /// directory is.
+    pub(crate) fn push(&mut self, member: &MemberPath, st: &libc::stat, attrs: Attrs) {
         self.0.push(PendingDir {
             path: member.display.clone(),
             depth: member.depth(),
+            id: file_id(st),
             attrs,
         });
     }
@@ -370,21 +399,82 @@ impl PendingDirs {
 /// descriptor.
 ///
 /// The name need not still be the directory that was created for it -- a
-/// later member can have replaced it with a symbolic link, and applying the
-/// mode by name would then chmod whatever the link points at. `O_NOFOLLOW`
-/// refuses the link, and `O_DIRECTORY` anything else that took its place.
+/// later member can have replaced it with a file, a symbolic link or another
+/// directory, and applying the mode by name would then chmod whatever the link
+/// points at. `O_NOFOLLOW` refuses the link, `O_DIRECTORY` anything else that
+/// is not a directory, and the identity check a directory that is not this
+/// one. Each means the directory these attributes were for is gone, which is
+/// not an error: whatever replaced it brought its own.
 fn apply_dir_attrs(tree: &DirTree, dir: &PendingDir, policy: &AttrPolicy) -> PaxResult<()> {
     let Some(member) = MemberPath::parse(&dir.path)? else {
         return Ok(());
     };
-    let parent = tree.parent_of(&member, false)?;
+    let opened = tree
+        .parent_of(&member, false)
+        .and_then(|parent| open_dir_for_attrs(parent.as_fd(), &member.leaf));
+    let (fd, search_only) = match opened {
+        Ok(opened) => opened,
+        Err(PaxError::Io(e)) if is_superseded(&e) => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if fstat(fd.as_fd()).is_none_or(|st| file_id(&st) != dir.id) {
+        return Ok(());
+    }
+    if search_only {
+        return set_attrs_search_only(fd.as_fd(), &dir.attrs, policy);
+    }
+    set_attrs_fd(fd.as_fd(), &dir.attrs, policy)
+}
+
+/// Whether failing to reach a pending directory means it was replaced.
+fn is_superseded(e: &std::io::Error) -> bool {
+    matches!(
+        e.raw_os_error(),
+        Some(libc::ENOENT) | Some(libc::ENOTDIR) | Some(libc::ELOOP)
+    )
+}
+
+/// Open a directory to apply attributes through, never following a symbolic
+/// link. `true` alongside it when it could only be opened for search.
+///
+/// None of the attributes needs read permission, and a directory whose mode
+/// denies its owner reading (0300) still takes them -- through a descriptor
+/// opened for search alone, where the platform has one.
+fn open_dir_for_attrs(dirfd: BorrowedFd<'_>, name: &CStr) -> PaxResult<(OwnedFd, bool)> {
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    let fd = unsafe { libc::openat(parent.as_raw_fd(), member.leaf.as_ptr(), flags) };
+    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), flags) };
+    if fd >= 0 {
+        return Ok((unsafe { OwnedFd::from_raw_fd(fd) }, false));
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() != Some(libc::EACCES) || SEARCH_ONLY == libc::O_RDONLY {
+        return Err(err.into());
+    }
+    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), WALK_FLAGS) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    set_attrs_fd(fd.as_fd(), &dir.attrs, policy)
+    Ok((unsafe { OwnedFd::from_raw_fd(fd) }, true))
+}
+
+/// `set_attrs_fd` for a descriptor opened for search only.
+///
+/// Linux's `O_PATH` descriptor is refused by `fchown`, `fchmod` and `futimens`
+/// alike. Its `/proc/self/fd` entry is not: it resolves to the very file the
+/// descriptor holds, whatever has happened to the name since, so the calls
+/// made through it by name cannot be redirected.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_attrs_search_only(fd: BorrowedFd<'_>, attrs: &Attrs, policy: &AttrPolicy) -> PaxResult<()> {
+    let path = CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+        .expect("a formatted number has no NUL");
+    set_attrs(&AttrTarget::Path(&path), attrs, policy)
+}
+
+/// Elsewhere a search-only descriptor (`O_SEARCH`) takes the same calls as any
+/// other.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn set_attrs_search_only(fd: BorrowedFd<'_>, attrs: &Attrs, policy: &AttrPolicy) -> PaxResult<()> {
+    set_attrs_fd(fd, attrs, policy)
 }
 
 /// Open one directory component below `dirfd` without following a symlink.
@@ -493,8 +583,9 @@ where
 /// be the link source itself (`pax -rwl tree .`, or a member linked to its own
 /// name), and unlinking it destroys the only thing there was to link. Nothing
 /// is changed and `true` is returned; the caller decides whether that merits a
-/// diagnostic. Identity is (dev, ino) of both names, neither followed, since
-/// `linkat` with flags 0 links the name itself.
+/// diagnostic. Identity is (dev, ino) of both names, the source resolved the
+/// way `linkat` resolves it: the name itself, or with `follow` the file a
+/// symbolic link refers to -- which may be the very file at `name`.
 pub(crate) fn link_replacing(
     from_dir: libc::c_int,
     from_name: &CStr,
@@ -543,7 +634,9 @@ pub(crate) fn link_replacing_with(
     if no_clobber {
         return Ok(false);
     }
-    if let (Some(src), Some(dst)) = (stat_raw(from_dir, from_name), stat_at(dirfd, name)) {
+    let src_flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
+    let src = fstatat(from_dir, from_name, src_flags);
+    if let (Some(src), Some(dst)) = (src, stat_at(dirfd, name)) {
         if (src.st_dev, src.st_ino) == (dst.st_dev, dst.st_ino) {
             return Ok(true);
         }
@@ -596,7 +689,7 @@ pub(crate) fn open_source_file(
             "source file changed type before it could be read",
         ));
     }
-    if (st.st_dev as u64, st.st_ino) != expected {
+    if file_id(&st) != expected {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "source file was replaced before it could be read",
@@ -653,29 +746,25 @@ pub(crate) fn restore_atime(fd: BorrowedFd<'_>, path: &Path, metadata: &ftw::Met
 /// from the directory it was found in -- opening a directory does not touch
 /// its access time, only reading it does -- and stamped only if it is still
 /// the directory the walk saw.
+///
+/// The name is followed: under -H/-L it may be a symbolic link the walk
+/// followed to reach the directory, and the walk's entry no longer says so
+/// once the directory has been left. Following is safe because the identity
+/// check is what decides: a link that leads anywhere but the directory the
+/// walk read stamps nothing.
 pub(crate) fn restore_dir_atime(entry: &ftw::Entry<'_>) {
     use std::os::unix::fs::MetadataExt;
 
     let Some(metadata) = entry.metadata() else {
         return;
     };
-    // -H/-L: the walk followed a symbolic link to get here.
-    let followed = entry.is_symlink() == Some(true) && !metadata.is_symlink();
-    let mut flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
-    if !followed {
-        flags |= libc::O_NOFOLLOW;
-    }
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
     let fd = unsafe { libc::openat(entry.dir_fd(), entry.file_name().as_ptr(), flags) };
     if fd < 0 {
         return;
     }
     let dir = unsafe { OwnedFd::from_raw_fd(fd) };
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // Casts needed: `dev_t` is i32 on macOS and u64 on Linux.
-    #[allow(clippy::unnecessary_cast)]
-    let same = unsafe { libc::fstat(dir.as_raw_fd(), &mut st) } == 0
-        && (st.st_dev as u64, st.st_ino as u64) == (metadata.dev(), metadata.ino());
-    if same {
+    if fstat(dir.as_fd()).is_some_and(|st| file_id(&st) == (metadata.dev(), metadata.ino())) {
         restore_atime(dir.as_fd(), entry.path().as_inner(), metadata);
     }
 }
@@ -792,24 +881,58 @@ pub(crate) fn set_attrs_fd(
     attrs: &Attrs,
     policy: &AttrPolicy,
 ) -> PaxResult<()> {
+    set_attrs(&AttrTarget::Fd(fd), attrs, policy)
+}
+
+/// What the attribute calls of `set_attrs` act on.
+enum AttrTarget<'a> {
+    Fd(BorrowedFd<'a>),
+    /// A name that cannot be redirected: see `set_attrs_search_only`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    Path(&'a CStr),
+}
+
+impl AttrTarget<'_> {
+    fn chown(&self, uid: libc::uid_t, gid: libc::gid_t) -> libc::c_int {
+        match self {
+            AttrTarget::Fd(fd) => unsafe { libc::fchown(fd.as_raw_fd(), uid, gid) },
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            AttrTarget::Path(p) => unsafe { libc::chown(p.as_ptr(), uid, gid) },
+        }
+    }
+
+    fn chmod(&self, mode: libc::mode_t) -> libc::c_int {
+        match self {
+            AttrTarget::Fd(fd) => unsafe { libc::fchmod(fd.as_raw_fd(), mode) },
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            AttrTarget::Path(p) => unsafe { libc::chmod(p.as_ptr(), mode) },
+        }
+    }
+
+    fn utimens(&self, times: &[libc::timespec; 2]) -> libc::c_int {
+        match self {
+            AttrTarget::Fd(fd) => unsafe { libc::futimens(fd.as_raw_fd(), times.as_ptr()) },
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            AttrTarget::Path(p) => unsafe {
+                libc::utimensat(libc::AT_FDCWD, p.as_ptr(), times.as_ptr(), 0)
+            },
+        }
+    }
+}
+
+/// `set_attrs_fd`, for any `AttrTarget`.
+fn set_attrs(target: &AttrTarget<'_>, attrs: &Attrs, policy: &AttrPolicy) -> PaxResult<()> {
     // Owner first: a successful chown may clear the set-id bits, and whether it
     // succeeded decides whether they may be set at all.
     let owner_set = policy.preserve_owner
-        && chown_result(unsafe { libc::fchown(fd.as_raw_fd(), attrs.uid, attrs.gid) })?;
+        && set_owner(attrs.uid, attrs.gid, |uid, gid| target.chown(uid, gid))?;
 
-    let r = unsafe {
-        libc::fchmod(
-            fd.as_raw_fd(),
-            policy.mode(attrs, owner_set) as libc::mode_t,
-        )
-    };
-    if r != 0 {
+    if target.chmod(policy.mode(attrs, owner_set) as libc::mode_t) != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
 
     if let Some(times) = policy.times(attrs) {
-        let r = unsafe { libc::futimens(fd.as_raw_fd(), times.as_ptr()) };
-        if r != 0 {
+        if target.utimens(&times) != 0 {
             eprintln!(
                 "pax: warning: cannot set times: {}",
                 std::io::Error::last_os_error()
@@ -821,12 +944,32 @@ pub(crate) fn set_attrs_fd(
     Ok(())
 }
 
+/// Set the owner to `uid`/`gid` with `chown`, one of the chown calls, and say
+/// whether it was set.
+///
+/// `(uid_t)-1` and `(gid_t)-1` are not ids: every chown call reads them as
+/// "leave this one alone" and then succeeds having changed nothing. A source
+/// recording one cannot have its owner restored, and is diagnosed as such --
+/// a success here would let the set-id bits through on a file still owned by
+/// whoever ran pax.
+pub(crate) fn set_owner<F>(uid: u32, gid: u32, chown: F) -> PaxResult<bool>
+where
+    F: FnOnce(libc::uid_t, libc::gid_t) -> libc::c_int,
+{
+    if uid == u32::MAX || gid == u32::MAX {
+        eprintln!("pax: cannot change owner: invalid user or group ID");
+        crate::error::note_error();
+        return Ok(false);
+    }
+    chown_result(chown(uid, gid))
+}
+
 /// Whether a `chown` call, given its return value, set the owner.
 ///
 /// EPERM -- usually not being root -- is diagnosed and otherwise tolerated: the
 /// file keeps whoever ran pax as its owner, and the caller must then withhold
 /// the set-id bits (see [`AttrPolicy::mode`]). Any other failure is an error.
-pub(crate) fn chown_result(r: libc::c_int) -> PaxResult<bool> {
+fn chown_result(r: libc::c_int) -> PaxResult<bool> {
     if r == 0 {
         return Ok(true);
     }
@@ -851,12 +994,12 @@ pub(crate) fn set_link_attrs_at(
     policy: &AttrPolicy,
 ) -> PaxResult<bool> {
     let owner_set = policy.preserve_owner
-        && chown_result(unsafe {
+        && set_owner(attrs.uid, attrs.gid, |uid, gid| unsafe {
             libc::fchownat(
                 dirfd.as_raw_fd(),
                 name.as_ptr(),
-                attrs.uid,
-                attrs.gid,
+                uid,
+                gid,
                 libc::AT_SYMLINK_NOFOLLOW,
             )
         })?;
@@ -885,13 +1028,20 @@ pub(crate) fn set_link_attrs_at(
 /// `fstatat` with `AT_SYMLINK_NOFOLLOW`, for asking what a name *is* without
 /// following it anywhere.
 pub(crate) fn stat_at(dirfd: BorrowedFd<'_>, name: &CStr) -> Option<libc::stat> {
-    stat_raw(dirfd.as_raw_fd(), name)
+    fstatat(dirfd.as_raw_fd(), name, libc::AT_SYMLINK_NOFOLLOW)
 }
 
-/// The same, from a raw directory descriptor such as a walk entry's.
-fn stat_raw(dirfd: libc::c_int, name: &CStr) -> Option<libc::stat> {
+/// `fstat` of an open descriptor.
+fn fstat(fd: BorrowedFd<'_>) -> Option<libc::stat> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let r = unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+    let r = unsafe { libc::fstat(fd.as_raw_fd(), &mut st) };
+    (r == 0).then_some(st)
+}
+
+/// `fstatat` from a raw directory descriptor such as a walk entry's.
+fn fstatat(dirfd: libc::c_int, name: &CStr, flags: libc::c_int) -> Option<libc::stat> {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    let r = unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut st, flags) };
     (r == 0).then_some(st)
 }
 

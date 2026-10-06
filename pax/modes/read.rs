@@ -14,7 +14,7 @@ use crate::error::{PaxError, PaxResult};
 use crate::formats::OptionRecords;
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
-    chown_result, create_replacing, link_replacing, set_attrs_fd, stat_at, unlink_at, AttrPolicy,
+    create_replacing, link_replacing, set_attrs_fd, set_owner, stat_at, unlink_at, AttrPolicy,
     Attrs, DirTree, MemberPath, PendingDirs,
 };
 use crate::modes::select::Selector;
@@ -144,15 +144,13 @@ fn extract_members<R: ArchiveReader>(
             // Per POSIX CONSEQUENCES OF ERRORS: diagnose a per-file failure and
             // set a non-zero exit, but continue with the next member. Skip any
             // unconsumed data of the failed entry to realign the reader.
-            if let Err(e) =
-                extract_entry(archive, &entry, options, &mut link_sets, tree, pending_dirs)
-            {
-                crate::error::report_error(&entry.path, e);
-            }
+            // A failure every later member would meet too -- a full disk, -O's
+            // output gone -- ends the run instead.
+            let r = extract_entry(archive, &entry, options, &mut link_sets, tree, pending_dirs);
+            report_unless_fatal(&entry, r)?;
         } else if let Some(set) = link_sets.find_mut(&entry) {
-            if let Err(e) = fill_link_set(archive, tree, &entry, options, set) {
-                crate::error::report_error(&entry.path, e);
-            }
+            let r = fill_link_set(archive, tree, &entry, options, set);
+            report_unless_fatal(&entry, r)?;
         }
         archive.skip_data()?;
         if selector.is_done() {
@@ -162,6 +160,19 @@ fn extract_members<R: ArchiveReader>(
 
     selector.report_unmatched();
     Ok(())
+}
+
+/// Diagnose a member's failure and carry on, unless it is one that ends the
+/// run (`modes::is_fatal`), which is handed back instead.
+fn report_unless_fatal(entry: &ArchiveEntry, result: PaxResult<()>) -> PaxResult<()> {
+    match result {
+        Err(e) if crate::modes::is_fatal(&e) => Err(e),
+        Err(e) => {
+            crate::error::report_error(&entry.path, e);
+            Ok(())
+        }
+        Ok(()) => Ok(()),
+    }
 }
 
 /// Decide whether a member is extracted, renaming it as -s and -i direct.
@@ -339,8 +350,11 @@ fn extract_entry<R: ArchiveReader>(
     match entry.entry_type {
         EntryType::Directory => {
             if extract_directory(tree, pfd, name, entry, options)? {
-                // Its attributes are applied once the subtree exists.
-                pending_dirs.push(&member, attrs_of(entry, options));
+                // Its attributes are applied once the subtree exists, if it
+                // is still this directory then.
+                if let Some(st) = stat_at(pfd, name) {
+                    pending_dirs.push(&member, &st, attrs_of(entry, options));
+                }
             }
             archive.skip_data()?;
         }
@@ -409,9 +423,9 @@ fn copy_member_to_stdout<R: ArchiveReader>(
             if n == 0 {
                 break;
             }
-            stdout.write_all(&buf[..n])?;
+            stdout.write_all(&buf[..n]).map_err(PaxError::StdoutWrite)?;
         }
-        stdout.flush()?;
+        stdout.flush().map_err(PaxError::StdoutWrite)?;
     }
 
     archive.skip_data()?;
@@ -450,7 +464,7 @@ fn extract_directory(
     // Otherwise extracting onto an existing directory is not an error
     // (POSIX), and it is kept.
     let existing_dir = stat_at(dirfd, name).filter(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR);
-    if existing_dir.is_some_and(|st| tree.is_implicit(&st)) {
+    if existing_dir.is_some_and(|st| tree.claim_implicit(&st)) {
         return Ok(true);
     }
     if options.no_clobber {
@@ -719,7 +733,7 @@ fn holding_name(tree: &DirTree, path: &Path, file: (u64, u64)) -> Option<(Rc<Own
 
 /// (st_dev, st_ino) of a name below `dirfd`, not following a symlink.
 fn id_at(dirfd: BorrowedFd<'_>, name: &CStr) -> Option<(u64, u64)> {
-    stat_at(dirfd, name).map(|st| (st.st_dev as u64, st.st_ino))
+    stat_at(dirfd, name).map(|st| crate::modes::anchored::file_id(&st))
 }
 
 /// (st_dev, st_ino) of an open file.
@@ -1042,7 +1056,7 @@ fn set_owner_at(
     }
 
     let (uid, gid) = owner_ids(entry);
-    chown_result(unsafe {
+    set_owner(uid, gid, |uid, gid| unsafe {
         libc::fchownat(
             dirfd.as_raw_fd(),
             name.as_ptr(),

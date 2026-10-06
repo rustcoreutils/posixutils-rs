@@ -87,10 +87,19 @@ fn is_sse_scalar(kind: TypeKind, ty: TypeId, types: &TypeTable) -> bool {
 }
 
 impl Abi for Win64Abi {
-    /// Win64 passes a vector by its size alone: eight bytes or fewer in a
-    /// general register, sixteen by reference and returned in XMM0 -- as a
-    /// plain `__int128` is -- and anything larger as an aggregate.
+    /// Win64 passes a vector by its size: eight bytes or fewer in a general
+    /// register, sixteen by reference and returned in XMM0 -- as a plain
+    /// `__int128` is -- and anything larger as an aggregate.
+    ///
+    /// A one-lane floating vector -- `v1sf`, `v1df`, `v1hf`, `v1tf` -- is
+    /// gcc's exception: passed by reference whatever its size (`addss
+    /// (%rbx)` reads a `v1sf`), as the struct holding it that is its
+    /// carrier, which [`Self::classify_param`] sends by reference. It is
+    /// returned as [`Self::vector_return_carrier`] says.
     fn vector_carrier(&self, vec: TypeId, types: &TypeTable) -> TypeId {
+        if let Some(wrapper) = types.vector_wrapper_carrier(vec) {
+            return wrapper;
+        }
         match types.size_bytes(vec) {
             17.. => types.vector_memory_carrier(vec),
             16 => types.int128_id,
@@ -99,9 +108,28 @@ impl Abi for Win64Abi {
         }
     }
 
+    /// A one-lane floating vector is returned by its size, as an aggregate
+    /// of it would be: in RAX at eight bytes or fewer, and the sixteen-byte
+    /// `v1tf` through the hidden pointer -- not in XMM0, where every other
+    /// sixteen-byte vector comes back. Every other vector is returned as
+    /// it is passed.
+    fn vector_return_carrier(&self, vec: TypeId, types: &TypeTable) -> TypeId {
+        match types.vector_wrapper_carrier(vec) {
+            Some(wrapper) => match types.size_bytes(vec) {
+                8 => types.ulong_id,
+                bytes @ ..=4 => super::small_vector_bits(bytes, types),
+                _ => wrapper,
+            },
+            None => self.vector_carrier(vec, types),
+        }
+    }
+
     fn classify_param(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
         if types.is_vector(ty) {
             return self.classify_param(self.vector_carrier(ty, types), types);
+        }
+        if types.is_vector_wrapper_carrier(ty) {
+            return Self::indirect(ty, types);
         }
         if let Some(first) = types.transparent_union_first_member(ty) {
             return self.classify_param(first, types);

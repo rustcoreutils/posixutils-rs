@@ -904,5 +904,40 @@ mod tests {
                 size_bits: 128
             }
         );
+        // gcc passes a one-lane floating vector by reference whatever its
+        // size, and returns it by its size: RAX up to eight bytes, the
+        // hidden pointer at sixteen.
+        let integer = |bits| ArgClass::Direct {
+            classes: vec![RegClass::Integer],
+            size_bits: bits,
+        };
+        for (lane, bits) in [
+            (types.float16_id, 16),
+            (types.float_id, 32),
+            (types.double_id, 64),
+            (types.float128_id, 128),
+        ] {
+            let v = types.vector_of(lane, 1, None);
+            let bytes = bits as usize / 8;
+            let by_reference = ArgClass::Indirect {
+                align: bytes as u32,
+                size_bytes: bytes,
+            };
+            assert_eq!(abi.classify_param(v, &types), by_reference, "{bits}");
+            let ret = abi.classify_return(v, &types);
+            match types.unsigned_of_size(bytes) {
+                Some(bits_of) => {
+                    assert_eq!(ret, abi.classify_return(bits_of, &types), "{bits}");
+                }
+                None => assert_eq!(ret, by_reference),
+            }
+        }
+        // Several floating lanes, or integer ones, travel by value.
+        let v2hf = types.vector_of(types.float16_id, 2, None);
+        let v1si = types.vector_of(types.int_id, 1, None);
+        for v in [v2hf, v1si] {
+            assert_eq!(abi.classify_param(v, &types), integer(32));
+            assert_eq!(abi.classify_return(v, &types), integer(32));
+        }
     }
 }

@@ -2203,6 +2203,13 @@ impl TypeTable {
         Some(self.vector_wrapper_carriers[&key])
     }
 
+    /// Whether `id` is a carrier of [`Self::vector_wrapper_carrier`]. A
+    /// struct the program declares holding such a vector is an ordinary
+    /// composite.
+    pub fn is_vector_wrapper_carrier(&self, id: TypeId) -> bool {
+        self.vector_wrapper_carriers.values().any(|&c| c == id)
+    }
+
     /// The floating kind and class of `elem`, as a stable key: one-lane
     /// vectors of `float` and of `_Float32` carry differently typed lanes.
     fn float_lane_key(&self, elem: TypeId) -> TypeId {

@@ -2122,6 +2122,12 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             }
             result.push(format!("--c17-linker-flag={arg}"));
             i += 1;
+        } else if arg == "-nostdlib" || arg == "-nostartfiles" {
+            // Link options: leave out the host's libraries and start files,
+            // or the start files alone. clap would read either as a short
+            // cluster `-n -o ...`.
+            result.push(format!("--c17-linker-flag={arg}"));
+            i += 1;
         } else if arg == "-rdynamic" {
             // -rdynamic -> pass to linker
             result.push("--c17-linker-flag=-rdynamic".to_string());

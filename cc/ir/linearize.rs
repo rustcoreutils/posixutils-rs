@@ -3390,6 +3390,14 @@ impl<'a> Linearizer<'a> {
             return self.linearize_expr(inner_expr);
         }
 
+        // A floating constant to an integer type folds, saturated where it
+        // is out of range, as gcc's front end folds it at every level. A cast
+        // says the program means it, so unlike an implicit conversion
+        // (`linearize_converted`) it draws no warning.
+        if let Some(c) = self.fold_float_to_integer(inner_expr, cast_type) {
+            return self.emit_const(c.value(), cast_type);
+        }
+
         // Into or out of a complex type (C17 6.3.1.7), by the rule every
         // converting site shares.
         if self.types.is_complex(src_type) || self.types.is_complex(cast_type) {
@@ -4629,6 +4637,13 @@ impl<'a> Linearizer<'a> {
         param: Option<TypeId>,
         sig: &CalleeSignature,
     ) -> (PseudoId, TypeId) {
+        // A floating constant for an integer parameter folds, as every
+        // other implicit conversion of one does (`linearize_converted`).
+        if let Some(pt) = param {
+            if let Some(folded) = self.implicit_float_to_integer_const(a, pt) {
+                return (folded, pt);
+            }
+        }
         let mut val = self.linearize_expr(a);
 
         // Implicit argument conversion when actual type differs from

@@ -342,7 +342,11 @@ read back as integers (`emit_is_signaling`). Only `signbit` and
 no fold c17 makes assumes a NaN is quiet, which is what the flag asks of
 gcc. An operation that consumes a signalling NaN constant is not folded
 (`constfold`) and raises *invalid* at run time; `x * 1.0`, `x - 0.0` and
-`fmin(x, x)` stay operations that quiet `x`. One difference remains: under
+`fmin(x, x)` stay operations that quiet `x`. A conversion to an integer type
+is the exception: it folds to 0, as gcc folds it with or without the flag,
+and like every float-to-integer fold it drops the *invalid* (DECISIONS.md,
+"Float constant folding stops where an operation raises"). One difference
+remains: under
 the flag gcc stops taking a conversion of, or arithmetic on, a signalling NaN
 constant as an integer constant expression, so `enum { E =
 __builtin_issignaling((float)__builtin_nans("")) };` is an error there; c17

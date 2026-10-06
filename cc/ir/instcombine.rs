@@ -2867,17 +2867,32 @@ mod tests {
         assert_eq!(fold_fcvt(Opcode::FCvtU, 3.5, 32), Some(3));
     }
 
-    /// Out of the destination's range the conversion is undefined, and the
-    /// hardware's answer is the target's business, not this pass's.
+    /// Out of the destination's range the conversion is undefined, and it
+    /// folds as gcc folds it: saturated, and a NaN to 0. The hardware's
+    /// answer differs by target (x86-64 gives the minimum).
     #[test]
-    fn an_out_of_range_conversion_is_left_alone() {
-        assert_eq!(fold_fcvt(Opcode::FCvtS, 3e9, 32), None);
-        assert_eq!(fold_fcvt(Opcode::FCvtS, -3e9, 32), None);
-        assert_eq!(fold_fcvt(Opcode::FCvtU, -1.0, 32), None);
-        assert_eq!(fold_fcvt(Opcode::FCvtS, f64::NAN, 32), None);
-        assert_eq!(fold_fcvt(Opcode::FCvtS, f64::INFINITY, 64), None);
-        // The same value the 32-bit case refused does fit 64 bits.
+    fn an_out_of_range_conversion_saturates() {
+        assert_eq!(fold_fcvt(Opcode::FCvtS, 3e9, 32), Some(i32::MAX.into()));
+        assert_eq!(fold_fcvt(Opcode::FCvtS, -3e9, 32), Some(i32::MIN.into()));
+        assert_eq!(fold_fcvt(Opcode::FCvtU, -1.0, 32), Some(0));
+        assert_eq!(fold_fcvt(Opcode::FCvtS, f64::NAN, 32), Some(0));
+        assert_eq!(
+            fold_fcvt(Opcode::FCvtS, f64::INFINITY, 64),
+            Some(i64::MAX.into())
+        );
+        assert_eq!(fold_fcvt(Opcode::FCvtU, 1e10, 32), Some(u32::MAX.into()));
+        // The same value the 32-bit case saturated does fit 64 bits.
         assert_eq!(fold_fcvt(Opcode::FCvtS, 3e9, 64), Some(3_000_000_000));
+    }
+
+    /// An infinity reaching a float-to-integer conversion through a
+    /// narrowing `FCvtF` folds as well: the narrowing raises nothing for it.
+    #[test]
+    fn an_infinity_narrowed_then_converted_folds() {
+        let types = TypeTable::new(&Target::host());
+        let (d, f) = ((types.double_id, 64), (types.float_id, 32));
+        assert_eq!(fold_fcvtf(f64::NEG_INFINITY, d, f), Some(f64::NEG_INFINITY));
+        assert!(fold_fcvtf(f64::NAN, d, f).is_some_and(f64::is_nan));
     }
 
     /// `Signbit` of a constant folds to 0 or 1 for every operand, a zero and

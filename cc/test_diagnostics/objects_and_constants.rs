@@ -761,3 +761,44 @@ fn diagnostics_floating_literal_is_not_an_integer_constant() {
         compile_expect_error(name, src, message);
     }
 }
+
+/// A floating constant an implicit conversion takes out of an integer
+/// type's range draws gcc's `-Woverflow` warning in code as it does in a
+/// static initializer: `return`, initialization, assignment and a prototyped
+/// argument. An explicit cast is silent, as in gcc, and `-Wno-overflow`
+/// silences the rest.
+#[test]
+fn diagnostics_saturating_implicit_conversion_warns() {
+    for (name, src, to) in [
+        ("sat_return", "int f(void) { return 1e10; }\n", "int"),
+        (
+            "sat_init",
+            "int f(void) { int x = -1e10; return x; }\n",
+            "int",
+        ),
+        (
+            "sat_assign",
+            "unsigned f(void) { unsigned u; u = -5.0; return u; }\n",
+            "unsigned int",
+        ),
+        (
+            "sat_arg",
+            "int g(int);\nint f(void) { return g(1e10); }\n",
+            "int",
+        ),
+    ] {
+        let want = format!("overflow in conversion from 'double' to '{to}' changes value");
+        compile_expect_warning(name, src, &want);
+        let quiet = crate::test_compile::compile_expect_warning_with(
+            name,
+            src,
+            &["-Wno-overflow".to_string()],
+        );
+        assert!(!quiet.contains("overflow"), "{name}: {quiet}");
+    }
+    crate::test_compile::compile_expect_no_diagnostic(
+        "sat_cast",
+        "int f(void) { return (int)1e10 + (unsigned char)-1.0; }\n",
+        "overflow",
+    );
+}

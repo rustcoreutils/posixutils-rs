@@ -9166,16 +9166,48 @@ fn test_constant_expression_floating_folds_are_exact() {
     }
 }
 
-/// A conversion C leaves undefined is not an integer constant expression:
-/// gcc makes `int a[(int)1e300 > 0];` a VLA for the same reason.
+/// A conversion C leaves undefined folds as gcc folds it, saturated and a
+/// NaN to 0, wherever gcc takes the value: an enumerator, `_Static_assert`,
+/// a `case` label, a bit-field width, `_Alignas`, `__builtin_constant_p`.
+/// Each answer is gcc 13's.
 #[test]
-fn test_out_of_range_float_cast_is_not_an_integer_constant() {
+fn test_out_of_range_float_cast_saturates_in_a_constant_expression() {
+    let src = "\
+        enum { E = (int)1e300, F = (short)-1e10, G = (unsigned char)300.0 };\n\
+        _Static_assert(E == 2147483647 && F == -32768 && G == 255, \"enum\");\n\
+        _Static_assert((int)__builtin_nan(\"\") == 0, \"NaN\");\n\
+        _Static_assert((unsigned)-1.0 == 0, \"negative to unsigned\");\n\
+        _Static_assert((int)2147483648.0f == 2147483647, \"one past\");\n\
+        _Static_assert((long long)-__builtin_inf() == -9223372036854775807LL - 1, \"-inf\");\n\
+        _Static_assert((unsigned __int128)1e300 == ~(unsigned __int128)0, \"u128\");\n\
+        _Static_assert(__builtin_constant_p((int)1e10), \"constant\");\n\
+        struct W { unsigned f : (unsigned char)300.0 / 32; };\n\
+        struct A { _Alignas((unsigned char)1e10 / 16 + 1) char c; };\n\
+        _Static_assert(_Alignof(struct A) == 16, \"align\");\n\
+        int f(int x) { switch (x) { case (int)1e10: return 1; case (int)-1e10: return 2; } return 0; }\n";
+    if let Err(e) = parse_tu(src) {
+        panic!("should have parsed: {e}");
+    }
+}
+
+/// An array's size alone refuses the saturated value: gcc makes
+/// `int a[(int)1e300 > 0];` a VLA, so at file scope it is an error, while an
+/// in-range conversion is a constant size. Each is gcc 13's answer on both
+/// targets.
+#[test]
+fn test_out_of_range_float_cast_makes_an_array_variable_length() {
     for src in [
-        "enum { E = (int)1e300 };",
-        "_Static_assert((int)__builtin_nan(\"\") == 0, \"\");",
-        "_Static_assert((unsigned)-1.0 == 0, \"\");",
+        "int a[(int)1e300 > 0];",
+        "int b[(signed char)-1e10 + 200];",
+        "int c[(unsigned)1e10 > 0];",
+        "int d[(short)1e10 > 0];",
     ] {
-        assert!(parse_tu(src).is_err(), "{src} should be rejected");
+        assert!(parse_tu(src).is_err(), "{src} should be a VLA");
+    }
+    for src in ["int a[(int)1e3 > 0];", "int b[(unsigned char)255.5];"] {
+        if let Err(e) = parse_tu(src) {
+            panic!("{src} should have a constant size: {e}");
+        }
     }
 }
 

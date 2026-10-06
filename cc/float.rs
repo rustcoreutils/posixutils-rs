@@ -550,10 +550,12 @@ impl FloatVal {
     /// none: a value beyond the range saturates to the nearer end of it, and
     /// a NaN becomes 0.
     ///
-    /// Only for a context that must have *some* value and cannot leave the
-    /// conversion to run time -- a static initializer. gcc folds the same
-    /// constant to the same answer there, so the two compilers agree on a
-    /// program whose behavior C does not define.
+    /// The one rule every fold of a constant conversion follows -- a static
+    /// initializer, an integer constant expression, a constant converted in
+    /// code, the optimizer's `FCvtS`/`FCvtU` -- because gcc folds the same
+    /// constant to the same answer in each, so the two compilers agree on a
+    /// program whose behavior C does not define. Only a conversion of a value
+    /// unknown until run time is left to the hardware.
     pub fn to_integer_saturating(self, bits: u32, signed: bool) -> i128 {
         if let Some(v) = self.to_integer(bits, signed) {
             return v;
@@ -2620,7 +2622,54 @@ mod tests {
         assert_eq!(FloatVal::infinity(true).to_integer(64, true), None);
     }
 
-    /// gcc's answer for a static initializer C gives none for.
+    /// gcc's answer where C gives none, at every width, for the infinities,
+    /// both NaNs and the values one past each end of the range.
+    #[test]
+    fn to_integer_saturating_at_the_edges_of_each_width() {
+        let v = |x: f64| FloatVal::from_f64(x);
+        let (inf, ninf) = (FloatVal::infinity(false), FloatVal::infinity(true));
+        for bits in [8u32, 16, 32, 64, 128] {
+            let smax = (u128::MAX >> (129 - bits)) as i128;
+            let smin = -smax - 1;
+            let umax = if bits == 128 {
+                -1
+            } else {
+                ((1u128 << bits) - 1) as i128
+            };
+            assert_eq!(inf.to_integer_saturating(bits, true), smax, "{bits}");
+            assert_eq!(ninf.to_integer_saturating(bits, true), smin, "{bits}");
+            assert_eq!(inf.to_integer_saturating(bits, false), umax, "{bits}");
+            assert_eq!(ninf.to_integer_saturating(bits, false), 0, "{bits}");
+            let nan = FloatVal::nan();
+            assert_eq!(nan.to_integer_saturating(bits, true), 0, "{bits}");
+            assert_eq!(
+                nan.negated().to_integer_saturating(bits, false),
+                0,
+                "{bits}"
+            );
+            // 2^(bits-1) is one past the signed maximum; -2^(bits-1) is the
+            // minimum itself, in range.
+            let half = v(2f64.powi(bits as i32 - 1));
+            assert_eq!(half.to_integer_saturating(bits, true), smax, "{bits}");
+            assert_eq!(half.negated().to_integer_saturating(bits, true), smin);
+            let full = v(2f64.powi(bits as i32));
+            assert_eq!(full.to_integer_saturating(bits, false), umax, "{bits}");
+            assert_eq!(v(-1.0).to_integer_saturating(bits, false), 0, "{bits}");
+            // A fraction below zero truncates to zero: in range.
+            assert_eq!(v(-0.5).to_integer_saturating(bits, false), 0, "{bits}");
+        }
+        assert_eq!(v(-129.0).to_integer_saturating(8, true), -128);
+        assert_eq!(
+            v(-2147483649.0).to_integer_saturating(32, true),
+            -(1i128 << 31)
+        );
+        assert_eq!(
+            v(2147483647.9).to_integer_saturating(32, true),
+            (1i128 << 31) - 1
+        );
+    }
+
+    /// gcc's answer for a constant C gives none for.
     #[test]
     fn to_integer_saturating_follows_gcc() {
         let v = |x: f64| FloatVal::from_f64(x);

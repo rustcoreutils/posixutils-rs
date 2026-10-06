@@ -3807,7 +3807,7 @@ impl crate::constexpr::ConstEnv for Linearizer<'_> {
             return symbol.enum_value;
         }
         match scope {
-            ConstScope::Standard => None,
+            ConstScope::Standard | ConstScope::ArrayBound => None,
             ConstScope::StaticInitializer => self.const_object_value(sym),
         }
     }
@@ -3837,7 +3837,7 @@ impl crate::constexpr::ConstEnv for Linearizer<'_> {
         scope: ConstScope,
     ) -> Option<FloatVal> {
         match scope {
-            ConstScope::Standard => None,
+            ConstScope::Standard | ConstScope::ArrayBound => None,
             ConstScope::StaticInitializer => self.const_object_float_value(sym),
         }
     }

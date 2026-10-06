@@ -28,13 +28,27 @@ use crate::symbol::SymbolId;
 use crate::target::Target;
 use crate::types::{TypeId, TypeKind, TypeTable};
 
-/// Which identifiers carry a value in a constant expression.
+/// Which constant expression is asked for: which identifiers carry a value
+/// in it, and whether a conversion C leaves undefined still gives one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ConstScope {
     /// C's own rule: an enumeration constant is the only identifier with a
-    /// value here. Array sizes, `case` labels, `_Static_assert`, enumerators
-    /// and bit-field widths all ask this one, and gcc is equally strict.
+    /// value here. `case` labels, `_Static_assert`, enumerators, bit-field
+    /// widths and `_Alignas` all ask this one, and gcc is equally strict.
     Standard,
+    /// An array's size: [`Self::Standard`], except that a floating value out
+    /// of the integer type it converts to makes the expression no constant,
+    /// and the array a VLA. gcc marks the saturated value it folds as an
+    /// overflow; an enumerator or a `case` label takes it with a warning,
+    /// and the array size alone refuses it -- `int a[(int)1e300 > 0];` is
+    /// "variably modified" at file scope.
+    ///
+    /// Refusing every such conversion is the uniform rule nearest gcc's,
+    /// not gcc's exactly: some of its folds drop the overflow mark again --
+    /// a comparison of a value saturated low (`(int)-1e300 < 0`), a NaN from
+    /// `__builtin_nan`, and on x86-64 alone a negative value converted to
+    /// `unsigned` -- and gcc then takes the size as a constant.
+    ArrayBound,
     /// Additionally a `const`-qualified object with a visible constant
     /// initializer, which gcc folds in a static initializer and nowhere else.
     StaticInitializer,
@@ -45,7 +59,7 @@ pub(crate) trait ConstEnv {
     fn types(&self) -> &TypeTable;
 
     /// The value of an identifier, or `None` when it is not a constant in this
-    /// scope. An enumeration constant answers in both scopes; a `const` object
+    /// scope. An enumeration constant answers in every scope; a `const` object
     /// answers only in [`ConstScope::StaticInitializer`].
     fn ident_value(&self, sym: SymbolId, scope: ConstScope) -> Option<i128>;
 
@@ -296,12 +310,11 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
             {
                 return match (eval_as_integer(env, scope, inner, *cast_type)?, scope) {
                     (IntConversion::InRange(v), _) => Some(v),
-                    // A value C does not define is no integer constant
-                    // expression -- gcc makes `int a[(int)1e300 > 0];` a VLA.
-                    (IntConversion::Saturated(_), ConstScope::Standard) => None,
-                    // A static initializer must have a value, and gcc's is
-                    // the saturated one.
-                    (IntConversion::Saturated(v), ConstScope::StaticInitializer) => Some(v),
+                    // An array size refuses the value C does not define --
+                    // gcc makes `int a[(int)1e300 > 0];` a VLA.
+                    (IntConversion::Saturated(_), ConstScope::ArrayBound) => None,
+                    // Every other context takes gcc's saturated one.
+                    (IntConversion::Saturated(v), _) => Some(v),
                 };
             }
             eval(env, scope, inner)
@@ -691,8 +704,8 @@ pub(crate) fn float_to_integer(types: &TypeTable, val: FloatVal, to: TypeId) -> 
     }
 }
 
-/// [`float_to_integer`] for a context that must have a value, with gcc's
-/// saturated answer where C gives none: see
+/// [`float_to_integer`] with gcc's folded answer where C gives none,
+/// saturated: see
 /// [`FloatVal::to_integer_saturating`].
 fn float_to_integer_saturating(types: &TypeTable, val: FloatVal, to: TypeId) -> i128 {
     match integer_shape(types, to) {
@@ -962,6 +975,15 @@ pub(crate) fn eval_as_float(
 pub(crate) enum IntConversion {
     InRange(i128),
     Saturated(i128),
+}
+
+impl IntConversion {
+    /// The converted value, whichever it is.
+    pub(crate) fn value(self) -> i128 {
+        match self {
+            Self::InRange(v) | Self::Saturated(v) => v,
+        }
+    }
 }
 
 /// The constant `expr` of floating or complex type converted to the integer

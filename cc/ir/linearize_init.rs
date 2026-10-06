@@ -972,21 +972,29 @@ impl<'a> super::linearize::Linearizer<'a> {
             constexpr::IntConversion::InRange(v) => return Some(Initializer::Int(v)),
             constexpr::IntConversion::Saturated(v) => v,
         };
-        // Out of range, where C gives no value and a static object must still
-        // have one: gcc's, with gcc's warning.
-        if crate::diag::warning_group_enabled(OVERFLOW_WARNING) {
-            let from = expr
-                .typ
-                .map_or_else(String::new, |t| self.types.format_type(t, None));
-            crate::diag::warning(
-                self.expr_pos(expr),
-                &format!(
-                    "overflow in conversion from '{from}' to '{}' changes value",
-                    self.types.format_type(typ, None)
-                ),
-            );
-        }
+        // Out of range, where C gives no value: gcc's, with gcc's warning.
+        self.warn_saturated_conversion(expr, typ);
         Some(Initializer::Int(v))
+    }
+
+    /// gcc's warning for a floating constant that an implicit conversion
+    /// takes out of the range of the integer type `typ`, folding it to the
+    /// saturated value. An explicit cast says the program means it, and gcc
+    /// is silent there.
+    pub(crate) fn warn_saturated_conversion(&self, expr: &Expr, typ: TypeId) {
+        if !crate::diag::warning_group_enabled(OVERFLOW_WARNING) {
+            return;
+        }
+        let from = expr
+            .typ
+            .map_or_else(String::new, |t| self.types.format_type(t, None));
+        crate::diag::warning(
+            self.expr_pos(expr),
+            &format!(
+                "overflow in conversion from '{from}' to '{}' changes value",
+                self.types.format_type(typ, None)
+            ),
+        );
     }
 
     /// The position to report for `expr`.

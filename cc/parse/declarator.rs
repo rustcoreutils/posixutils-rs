@@ -422,7 +422,7 @@ impl Parser<'_> {
         // Parse constant expression for array size (C99 6.7.5.2)
         let size_pos = self.current_pos();
         let expr = self.parse_assignment_expr()?;
-        match self.eval_const_expr(&expr) {
+        match self.eval_array_bound(&expr) {
             Some(n) if n >= 0 => Ok(Extent::Constant(n as usize)),
             // C17 6.7.6.2p1: the size shall be greater than zero. Zero itself
             // is a GNU extension gcc accepts, so only a negative size is

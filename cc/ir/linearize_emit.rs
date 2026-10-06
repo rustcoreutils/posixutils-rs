@@ -14,7 +14,7 @@ use super::{
     BasicBlockId, CallAbiInfo, FloatCmp, Instruction, NanCompare, Opcode, Pseudo, PseudoId,
 };
 use crate::abi::get_abi_for_conv;
-use crate::constexpr::ConstScope;
+use crate::constexpr::{ConstScope, IntConversion};
 use crate::diag::{error, Position};
 use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, FpCompare, LibFn, MathErrno, UnaryOp};
@@ -2444,6 +2444,8 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// - to a complex type, the operand at that precision, or a real operand
     ///   as the real half with a zero imaginary half (C17 6.3.1.7p1);
     /// - from a complex type to a real one, [`Self::complex_to_real_at`];
+    /// - a floating constant to an integer type, the constant it folds to
+    ///   ([`Self::implicit_float_to_integer_const`]);
     /// - otherwise the scalar conversion, [`Self::emit_convert`].
     ///
     /// It is handed the *expression* rather than a value because only the
@@ -2455,6 +2457,9 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// the address's bit pattern.
     pub(crate) fn linearize_converted(&mut self, expr: &Expr, to_typ: TypeId) -> PseudoId {
         let from_typ = self.expr_type(expr);
+        if let Some(folded) = self.implicit_float_to_integer_const(expr, to_typ) {
+            return folded;
+        }
         if self.types.is_complex(to_typ) {
             return if self.types.is_complex(from_typ) {
                 self.complex_operand_at_precision(expr, to_typ)
@@ -2468,6 +2473,44 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
         let val = self.linearize_expr(expr);
         self.emit_convert(val, from_typ, to_typ)
+    }
+
+    /// `expr`, a floating or complex constant expression, converted to the
+    /// integer type `to` as gcc's front end converts it at every level, `-O0`
+    /// included: `(int)2147483648.0f` is the constant `INT_MAX`. Out of
+    /// range, where C gives no value (6.3.1.4p1), the answer is gcc's
+    /// saturated one ([`crate::float::FloatVal::to_integer_saturating`]).
+    ///
+    /// `None` when `expr` is not a constant expression, or when `to` is not
+    /// an integer type or is `_Bool`, whose conversion is a comparison and
+    /// defined for every value. A conversion of a value known only at run
+    /// time stays an instruction and gives the target's answer, as in gcc.
+    pub(crate) fn fold_float_to_integer(&self, expr: &Expr, to: TypeId) -> Option<IntConversion> {
+        let from = self.expr_type(expr);
+        if !(self.types.is_float(from) || self.types.is_complex(from))
+            || !self.types.is_integer(to)
+            || self.types.is_complex(to)
+            || self.types.kind(to) == TypeKind::Bool
+        {
+            return None;
+        }
+        crate::constexpr::eval_as_integer(self, ConstScope::Standard, expr, to)
+    }
+
+    /// [`Self::fold_float_to_integer`] for an implicit conversion -- by
+    /// assignment, `return`, initialization or a prototyped argument --
+    /// emitted as the constant it folds to, with gcc's `-Woverflow` warning
+    /// when it saturates.
+    pub(crate) fn implicit_float_to_integer_const(
+        &mut self,
+        expr: &Expr,
+        to: TypeId,
+    ) -> Option<PseudoId> {
+        let c = self.fold_float_to_integer(expr, to)?;
+        if matches!(c, IntConversion::Saturated(_)) {
+            self.warn_saturated_conversion(expr, to);
+        }
+        Some(self.emit_const(c.value(), to))
     }
 
     /// Turn `expr` into the 0/1 truth value a branch or logical operator wants.

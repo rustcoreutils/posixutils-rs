@@ -725,15 +725,24 @@ impl Parser<'_> {
         self.symbols.lookup_typedef(name_id).is_some()
     }
 
-    /// Evaluate an integer constant expression: array bounds, enumerators,
-    /// `case` labels, bit-field widths, `_Static_assert`.
+    /// Evaluate an integer constant expression: enumerators, `case` labels,
+    /// bit-field widths, `_Static_assert`.
     ///
     /// The walk itself lives in [`crate::constexpr`], shared with the
     /// linearizer's static-initializer folding. The parser answers only
-    /// [`ConstScope::Standard`]: it has no emitted globals to read a `const`
-    /// object's value out of, and no context here would accept one anyway.
+    /// [`ConstScope::Standard`] and, for an array's size,
+    /// [`Self::eval_array_bound`]: it has no emitted globals to read a
+    /// `const` object's value out of, and no context here would accept one
+    /// anyway.
     pub(crate) fn eval_const_expr(&self, expr: &Expr) -> Option<i128> {
         crate::constexpr::eval(self, ConstScope::Standard, expr)
+    }
+
+    /// An array's size as an integer constant expression, or `None` for a
+    /// VLA: [`ConstScope::ArrayBound`], which refuses an out-of-range
+    /// floating conversion as gcc does.
+    pub(crate) fn eval_array_bound(&self, expr: &Expr) -> Option<i128> {
+        crate::constexpr::eval(self, ConstScope::ArrayBound, expr)
     }
 
     /// The composite type of this declaration and a visible prior one of the

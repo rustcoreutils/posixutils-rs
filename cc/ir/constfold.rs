@@ -541,28 +541,36 @@ pub(crate) fn eval_funop(op: Opcode, fmt: FpFormat, a: FloatVal) -> Option<Float
 /// A float-to-float conversion of a constant, from one format to another:
 /// [`FloatVal::convert`], which rounds at the source format first.
 ///
-/// Held to the same rule as the arithmetic above otherwise: a non-finite
-/// operand is left alone, and so is a narrowing that overflows to infinity,
-/// because both are where the conversion raises.
+/// Folded wherever the conversion raises nothing but *inexact*: a signalling
+/// NaN raises invalid and a narrowing that overflows to infinity raises
+/// overflow, so both are left to run time. An infinity converts exactly and
+/// a quiet NaN raises nothing, so both fold -- `float x = -INFINITY;` is
+/// then a constant to the float-to-integer fold below, as it is in gcc.
 pub(crate) fn eval_fcvtf(
     op: Opcode,
     src_fmt: FpFormat,
     dst_fmt: FpFormat,
     a: FloatVal,
 ) -> Option<FloatVal> {
-    if op != Opcode::FCvtF || !a.is_finite() {
+    let a = a.round_to_format(src_fmt);
+    if op != Opcode::FCvtF || a.is_signalling_nan() {
         return None;
     }
     let r = a.convert(src_fmt, dst_fmt);
-    r.is_finite().then_some(r)
+    (r.is_finite() || !a.is_finite()).then_some(r)
 }
 
 /// A float-to-integer conversion of a constant, to `dst_size` bits, or the
 /// other integer a float operand gives in the same shape: `Signbit`.
 ///
-/// `None` when the value does not fit, which is exactly where C leaves the
-/// conversion undefined (6.3.1.4): a folded answer there would be this
-/// compiler's invention rather than the target's, and the two differ.
+/// A value that does not fit, where C leaves the conversion undefined
+/// (6.3.1.4), folds as gcc folds it: saturated to the nearer end of the
+/// range, and a NaN to 0 ([`FloatVal::to_integer_saturating`], the rule the
+/// front end's folds share). The run-time instruction would answer
+/// differently by target -- x86-64 gives the minimum, aarch64 saturates --
+/// and raise `FE_INVALID`, which the fold drops as gcc's does; DECISIONS.md
+/// records the choice. A signalling NaN folds to 0 like a quiet one: gcc
+/// folds it even under `-fsignaling-nans`.
 ///
 /// `Signbit` folds for every operand, the infinities and NaN included: it
 /// reads a bit and raises nothing, and rounding to a format never changes a
@@ -574,8 +582,10 @@ pub(crate) fn eval_fcvt(op: Opcode, dst_size: u32, src_fmt: FpFormat, a: FloatVa
         Opcode::Signbit => return Some(i128::from(a.sign_bit())),
         _ => return None,
     };
-    a.round_to_format(src_fmt)
-        .to_integer(dst_size.clamp(1, 128), signed)
+    Some(
+        a.round_to_format(src_fmt)
+            .to_integer_saturating(dst_size.clamp(1, 128), signed),
+    )
 }
 
 /// How many integer operands `op` takes when [`eval_int`] evaluates it, or
@@ -1270,5 +1280,60 @@ mod tests {
         for op in [Opcode::Load, Opcode::UMulHi, Opcode::FAdd, Opcode::Lo64] {
             assert!(!is_int_foldable(op), "{op:?}");
         }
+    }
+
+    /// A float-to-integer conversion out of range folds to gcc's saturated
+    /// answer at every width, rounding at the source format first: the
+    /// `float` nearest 2147483647 is 2^31, one past `INT_MAX`.
+    #[test]
+    fn an_out_of_range_fcvt_saturates_as_gcc_does() {
+        let v = FloatVal::from_f64;
+        let d = FpFormat::Binary64;
+        let (inf, nan) = (FloatVal::infinity(false), FloatVal::nan());
+        let s = |bits, x| eval_fcvt(Opcode::FCvtS, bits, d, x);
+        let u = |bits, x| eval_fcvt(Opcode::FCvtU, bits, d, x);
+        assert_eq!(s(32, v(3e9)), Some(i128::from(i32::MAX)));
+        assert_eq!(s(32, v(-3e9)), Some(i128::from(i32::MIN)));
+        assert_eq!(s(32, nan), Some(0));
+        assert_eq!(s(32, nan.negated()), Some(0));
+        // A signalling NaN too: gcc folds it to 0 even under
+        // `-fsignaling-nans`.
+        let snan = FloatVal::nan_with_payload(d, 1, crate::float::NanKind::Signalling);
+        assert_eq!(s(32, snan), Some(0));
+        assert_eq!(s(64, inf), Some(i128::from(i64::MAX)));
+        assert_eq!(s(64, inf.negated()), Some(i128::from(i64::MIN)));
+        assert_eq!(s(8, v(1e10)), Some(127));
+        assert_eq!(s(16, v(-1e10)), Some(-32768));
+        assert_eq!(s(128, v(1e300)), Some(i128::MAX));
+        assert_eq!(u(32, v(-1.0)), Some(0));
+        assert_eq!(u(32, v(5e9)), Some(i128::from(u32::MAX)));
+        assert_eq!(u(8, v(300.0)), Some(255));
+        assert_eq!(u(128, inf), Some(-1), "u128::MAX as its bit pattern");
+        assert_eq!(u(64, nan), Some(0));
+        // In range it is the exact conversion, as before.
+        assert_eq!(s(32, v(-2.5)), Some(-2));
+        assert_eq!(s(64, v(3e9)), Some(3_000_000_000));
+        let f = FpFormat::Binary32;
+        assert_eq!(
+            eval_fcvt(Opcode::FCvtS, 32, f, v(2147483647.0)),
+            Some(i128::from(i32::MAX))
+        );
+    }
+
+    /// A float-to-float conversion folds wherever it raises nothing but
+    /// inexact: an infinity and a quiet NaN do, a signalling NaN and an
+    /// overflowing narrowing do not.
+    #[test]
+    fn fcvtf_folds_what_raises_nothing() {
+        let (d, f) = (FpFormat::Binary64, FpFormat::Binary32);
+        let conv = |x| eval_fcvtf(Opcode::FCvtF, d, f, x);
+        let inf = FloatVal::infinity(true);
+        assert_eq!(conv(inf), Some(inf));
+        let quiet = conv(FloatVal::nan()).expect("a quiet NaN folds");
+        assert!(quiet.is_nan() && !quiet.is_signalling_nan());
+        let snan = FloatVal::nan_with_payload(d, 1, crate::float::NanKind::Signalling);
+        assert_eq!(conv(snan), None, "raises invalid");
+        assert_eq!(conv(FloatVal::from_f64(1e300)), None, "raises overflow");
+        assert!(conv(FloatVal::from_f64(0.1)).is_some_and(|r| r.is_finite()));
     }
 }

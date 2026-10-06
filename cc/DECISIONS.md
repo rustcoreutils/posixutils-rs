@@ -96,12 +96,34 @@ optimizer decides which comparisons qualify by the same rule
 
 Arithmetic, negation, comparison and conversion fold over float constants, at
 the format the program computes in rather than at the 128 significand bits a
-literal is carried in. Arithmetic and conversion leave to run time every
-operation that would raise invalid, divide-by-zero or overflow: a NaN or
-infinite operand, a division by zero, a result or narrowing that overflows
-(`ir/constfold.rs`). C lets a program read those flags through `<fenv.h>`,
-and folding the operation would take the flag with it. An inexact or
-underflowing result is folded, as gcc folds it without `-frounding-math`.
+literal is carried in. Arithmetic and float-to-float conversion leave to run
+time every operation that would raise invalid, divide-by-zero or overflow: a
+NaN or infinite arithmetic operand, a signalling NaN converted, a division by
+zero, a result or narrowing that overflows (`ir/constfold.rs`). C lets a
+program read those flags through `<fenv.h>`, and folding the operation would
+take the flag with it. An inexact or underflowing result is folded, as gcc
+folds it without `-frounding-math`, and so is a conversion of an infinity or
+a quiet NaN to another float format, which raises nothing.
+
+A conversion to an integer type is the other exception, chosen to match gcc.
+A value outside the type's range -- an infinity, a NaN, a huge or a negative
+value to an unsigned type -- is undefined (C17 6.3.1.4p1) and raises
+`FE_INVALID` at run time, where the instruction's answer differs by target:
+x86-64 gives the minimum, aarch64 saturates. gcc folds a constant one in
+every context, at `-O0` as well, and saturates: the maximum above the range,
+the minimum (0 for unsigned) below it, and 0 for any NaN, signalling or not,
+with or without `-fsignaling-nans`. c17 folds the same constants to the same
+answers, dropping the flag as gcc does, by one rule
+(`FloatVal::to_integer_saturating`): static initializers and integer
+constant expressions (`constexpr.rs`), a constant cast or implicitly
+converted in code (`fold_float_to_integer` in the linearizer, at every
+level), and the optimizer's `FCvtS`/`FCvtU` (`constfold::eval_fcvt`).
+gcc.c-torture's `execute/20031003-1` requires it. Only an array size refuses
+the saturated value, making the array a VLA as gcc does for
+`int a[(int)1e300 > 0];`. A conversion of a value not known until run time
+is the hardware's. One gap remains: a 128-bit conversion becomes a libgcc
+call before the optimizer runs, so a constant that reaches one through a
+variable is converted at run time, where gcc folds it from `-O1`.
 
 Comparisons are the exception, as in gcc: from `-O1` one whose answer no
 operand value can change folds -- against a NaN every ordered predicate to 0

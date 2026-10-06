@@ -458,8 +458,10 @@ static int t_c89_zero_width_bitfield_forces_a_boundary(void) {
        the x86-64 psABI says no, so zw_A is 5 bytes with alignment 1; AAPCS64
        says it contributes its declared type's alignment, making zw_A 8 with
        alignment 4 -- and, unlike an ordinary member's, that survives packing.
-       Every number below is gcc's on the target it is written for. */
-#ifdef __aarch64__
+       Every number below is gcc's on the target it is written for; Apple
+       arm64 follows the x86-64 rule (clang: UseZeroLengthBitfieldAlignment is
+       false for Darwin). */
+#if defined(__aarch64__) && !defined(__APPLE__)
     if (sizeof(struct zw_A) != 8 || _Alignof(struct zw_A) != 4) return 40;
     if (sizeof(struct zw_C) != 8 || _Alignof(struct zw_C) != 4) return 41;
     if (sizeof(struct zw_E) != 4 || _Alignof(struct zw_E) != 4) return 42;

@@ -293,7 +293,9 @@ int main(void)
     if (!RAISES(sink = __builtin_nans("") * 1.0)) return 1;
     if (!RAISES(sink = __builtin_nans("") + 0.0)) return 2;
     if (!RAISES(sinkf = (float)__builtin_nans(""))) return 3;
+#if __LDBL_MANT_DIG__ != 53 /* a real conversion, which quiets and raises */
     if (!RAISES(sinkl = (long double)__builtin_nans(""))) return 4;
+#endif
     if (!RAISES(sink = (double)__builtin_nansf(""))) return 5;
     if (!RAISES(sink = __builtin_sqrt(__builtin_nans("")))) return 6;
     if (!RAISES(sink = __builtin_fmin(__builtin_nans(""), 1.0))) return 7;

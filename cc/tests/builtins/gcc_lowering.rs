@@ -192,12 +192,17 @@ int main(void)
     unsigned char want_ld[32];
     memset(want_ld, 0, sizeof want_ld);
     want_ld[0] = 0xff;
+#if __LDBL_MANT_DIG__ == 53 /* Apple arm64: long double is double */
+    memset(want_ld + 8, 0xff, 8);
+    if (sizeof ld != 16 || !check(&ld, 16, want_ld)) return 5;
+#else
 #if defined(__x86_64__)
     memset(want_ld + 16, 0xff, 10);
 #else
     memset(want_ld + 16, 0xff, 16);
 #endif
     if (sizeof ld != 32 || !check(&ld, 32, want_ld)) return 5;
+#endif
 
     static const unsigned char want_s[8] = { 0xff, 0, 0, 0, 0xff, 0xff, 0xff, 0xff };
     static const unsigned char full[8] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };

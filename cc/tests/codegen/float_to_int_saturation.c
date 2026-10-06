@@ -19,6 +19,12 @@ typedef unsigned __int128 u128;
 #define INF __builtin_inf()
 #define QNAN __builtin_nan("")
 #define NI __attribute__((noinline))
+/* No _Float128 on Apple targets: the widest format there is long double. */
+#ifdef __FLT128_MANT_DIG__
+#define F128 _Float128
+#else
+#define F128 long double
+#endif
 
 /* X(n, target, source, value, gcc's answer). Each value is converted to the
    source type first, then to the target. */
@@ -32,7 +38,7 @@ typedef unsigned __int128 u128;
     X(7, signed char, long double, QNAN, 0) \
     X(8, unsigned char, double, 300.0, UCHAR_MAX) \
     X(9, unsigned char, float, -1.0, 0) \
-    X(10, unsigned char, _Float128, 256.0, UCHAR_MAX) \
+    X(10, unsigned char, F128, 256.0, UCHAR_MAX) \
     X(11, short, double, 32768.0, SHRT_MAX) \
     X(12, short, double, -32769.0, SHRT_MIN) \
     X(13, short, float, -INF, SHRT_MIN) \
@@ -49,7 +55,7 @@ typedef unsigned __int128 u128;
     X(24, int, double, -QNAN, 0) \
     X(25, int, long double, INF, INT_MAX) \
     X(26, int, long double, 1e4000L, INT_MAX) \
-    X(27, int, _Float128, -INF, INT_MIN) \
+    X(27, int, F128, -INF, INT_MIN) \
     X(28, unsigned int, double, -1.0, 0) \
     X(29, unsigned int, double, -0.5, 0) \
     X(30, unsigned int, double, 4294967296.0, UINT_MAX) \
@@ -62,22 +68,22 @@ typedef unsigned __int128 u128;
     X(37, long long, double, 1e300, LLONG_MAX) \
     X(38, long long, double, -0x1p63, LLONG_MIN) \
     X(39, long long, long double, -0x1p63L - 1.0L, LLONG_MIN) \
-    X(40, long long, _Float128, QNAN, 0) \
+    X(40, long long, F128, QNAN, 0) \
     X(41, unsigned long, double, 0x1p64, ULONG_MAX) \
     X(42, unsigned long, float, -1.0, 0) \
     X(43, unsigned long long, double, 1e19, 10000000000000000000ULL) \
     X(44, unsigned long long, long double, 1e300, ULLONG_MAX) \
-    X(45, unsigned long long, _Float128, -INF, 0) \
+    X(45, unsigned long long, F128, -INF, 0) \
     X(46, __int128, double, 1e300, I128_MAX) \
     X(47, __int128, double, -1e300, I128_MIN) \
     X(48, __int128, long double, 0x1p127L, I128_MAX) \
     X(49, __int128, float, INF, I128_MAX) \
     X(50, __int128, double, QNAN, 0) \
-    X(51, __int128, _Float128, -0x1p127L, I128_MIN) \
+    X(51, __int128, F128, -0x1p127L, I128_MIN) \
     X(52, unsigned __int128, long double, 0x1p128L, U128_MAX) \
     X(53, unsigned __int128, double, 1e300, U128_MAX) \
     X(54, unsigned __int128, float, -1.0, 0) \
-    X(55, unsigned __int128, _Float128, INF, U128_MAX) \
+    X(55, unsigned __int128, F128, INF, U128_MAX) \
     X(56, unsigned __int128, double, QNAN, 0)
 
 /* A static initializer, a cast in code, an implicit conversion in code, and

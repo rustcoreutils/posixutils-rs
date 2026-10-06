@@ -2123,11 +2123,6 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             // Just echo back the program name (like gcc does when it doesn't have a special path)
             println!("{}", prog);
             std::process::exit(0);
-        } else if arg == "-v" || arg == "--version" || arg == "-qversion" || arg == "-version" {
-            // Version query - handled by clap, but -v is also our verbose flag
-            // Let it pass through to clap
-            result.push(arg.clone());
-            i += 1;
         } else {
             // An operand, or an option's value -- the two cannot be told apart
             // here, and recording a language for a value is harmless, since
@@ -2254,6 +2249,88 @@ fn forward_to_host_driver(query: &str) -> i32 {
             1
         }
     }
+}
+
+/// Parse the rewritten command line, refusing it as gcc's driver would.
+///
+/// clap's own refusal named no program, followed it with a usage block, and
+/// named only the letter it stopped at: configure's `-qversion` probe logged
+/// `error: unexpected argument '-q' found`. Build logs are read by people
+/// looking for which program said what, so every refusal carries `c17:`, and
+/// the two gcc has words for -- an unknown option, a missing value -- use
+/// them. The status is gcc's 1, not clap's 2.
+fn parse_args(argv: Vec<String>) -> Args {
+    use clap::error::ErrorKind;
+    match Args::try_parse_from(&argv) {
+        Ok(args) => args,
+        Err(e) => match e.kind() {
+            ErrorKind::DisplayHelp
+            | ErrorKind::DisplayVersion
+            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => e.exit(),
+            _ => {
+                eprintln!("c17: {}", parse_error_text(&e, &argv));
+                std::process::exit(1);
+            }
+        },
+    }
+}
+
+/// The text of a parse refusal, without the `c17: ` it is printed after.
+fn parse_error_text(e: &clap::Error, argv: &[String]) -> String {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    let context = |kind| match e.get(kind) {
+        Some(ContextValue::String(s)) => Some(s.as_str()),
+        _ => None,
+    };
+    let invalid_arg = context(ContextKind::InvalidArg).unwrap_or_default();
+    match e.kind() {
+        ErrorKind::UnknownArgument => format!(
+            "{} '{}'",
+            gettext("error: unrecognized command-line option"),
+            unknown_option_culprit(argv, invalid_arg)
+        ),
+        // clap names the option with its value placeholder, `-o <file>`.
+        ErrorKind::InvalidValue if context(ContextKind::InvalidValue) == Some("") => format!(
+            "{} '{}'",
+            gettext("error: missing argument to"),
+            invalid_arg.split(' ').next().unwrap_or_default()
+        ),
+        // The operands are the only required argument.
+        ErrorKind::MissingRequiredArgument => gettext("fatal error: no input files"),
+        // clap's first paragraph is the message; the rest is usage and help.
+        _ => {
+            let text = e.render().to_string();
+            let message = text.split("\n\n").next().unwrap_or_default();
+            message.trim_end().to_string()
+        }
+    }
+}
+
+/// The argument that held the unknown option clap stopped at.
+///
+/// clap reads `-qversion` as the short options `-q -v -e ...` and reports the
+/// first letter it does not know, so `-q`, where gcc names the whole
+/// argument. The argument is the first one that, parsed alone, fails on that
+/// same letter: a value such as `-I/q` that merely contains it parses.
+fn unknown_option_culprit<'a>(argv: &'a [String], reported: &'a str) -> &'a str {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+    if reported.starts_with("--") || reported.len() != 2 {
+        return reported;
+    }
+    let fails_on_reported = |arg: &str| {
+        let Err(e) = Args::try_parse_from([argv[0].as_str(), arg]) else {
+            return false;
+        };
+        e.kind() == ErrorKind::UnknownArgument
+            && matches!(e.get(ContextKind::InvalidArg),
+                Some(ContextValue::String(s)) if s == reported)
+    };
+    argv.iter()
+        .skip(1)
+        .take_while(|a| *a != "--")
+        .filter(|a| a.starts_with('-') && !a.starts_with("--") && a.len() > 1)
+        .find(|a| *a == reported || fails_on_reported(a))
+        .map_or(reported, String::as_str)
 }
 
 /// gcc's `-v` banner, printed when `-v` is given with nothing to compile.
@@ -2805,7 +2882,7 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     // per-flag collection cannot preserve. Done before parsing so a parse
     // failure still exits the usual way.
     let scanned = linkargs::scan(argv.iter().cloned());
-    let args = Args::parse_from(argv);
+    let args = parse_args(argv);
 
     if args.no_warnings {
         diag::suppress_warnings();

@@ -956,3 +956,40 @@ fn gcc_flags_tls_model() {
         r.stderr
     );
 }
+
+/// An option c17 does not know is refused as gcc refuses it, under c17's
+/// name and naming the option as it was written: configure's `-qversion`
+/// probe came back as clap's `error: unexpected argument '-q' found`, with a
+/// usage block and no `c17:` to say which program spoke.
+#[test]
+fn gcc_flags_unknown_option_is_refused_in_gccs_words() {
+    for (args, culprit) in [
+        (&["-qversion"][..], "-qversion"),
+        (&["-version"], "-version"),
+        (&["--no-such-c17-option"], "--no-such-c17-option"),
+        // The culprit is the argument that held the unknown letter, wherever
+        // it stands, not a value that happens to contain it.
+        (&["-I/q", "-c", "-no-gcc", "x.c"], "-no-gcc"),
+    ] {
+        let r = run_c17(args);
+        assert!(!r.success, "{args:?}");
+        assert_eq!(
+            r.stderr,
+            format!("c17: error: unrecognized command-line option '{culprit}'\n"),
+            "{args:?}"
+        );
+    }
+    // A missing value, in gcc's words too.
+    let r = run_c17(&["x.c", "-o"]);
+    assert!(!r.success);
+    assert_eq!(r.stderr, "c17: error: missing argument to '-o'\n");
+    // Nothing to compile.
+    let r = run_c17(&["-c"]);
+    assert!(!r.success);
+    assert_eq!(r.stderr, "c17: fatal error: no input files\n");
+    // Every other refusal from the parser still says who is speaking.
+    let r = run_c17(&["-Obogus", "x.c"]);
+    assert!(!r.success);
+    assert!(r.stderr.starts_with("c17: error: "), "{}", r.stderr);
+    assert!(!r.stderr.contains("Usage:"), "{}", r.stderr);
+}

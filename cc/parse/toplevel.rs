@@ -368,9 +368,15 @@ impl Parser<'_> {
             defines: true,
             gnu_extern_inline: attrs.gnu_inline_only(specs.storage_class),
         });
-        let _ = self
-            .symbols
-            .declare(Symbol::function(name, typ, self.symbols.depth()).with_linkage(linkage));
+        // After the definition the name has the composite type of it and any
+        // earlier declaration (C17 6.2.7p4): `int (*fp(void))[6] { .. }`
+        // keeps the extent an earlier `int (*fp(void))[];` lacked, and an
+        // earlier one supplies what the definition left out. The body itself
+        // is checked against the definition's own type.
+        let symbol_typ = self.composite_with_prior_declaration(name, typ, true);
+        let _ = self.symbols.declare(
+            Symbol::function(name, symbol_typ, self.symbols.depth()).with_linkage(linkage),
+        );
         // A weak definition may be replaced at link time, so gcc leaves the
         // builtin in place of it; so does this.
         if !attrs.symbol.weak {

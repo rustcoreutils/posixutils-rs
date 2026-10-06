@@ -19,7 +19,7 @@ use super::linkage::Declared;
 use super::parser::{DeclaratorContext, ParseError, ParseResult, ParsedDeclarator, Parser};
 use crate::diag;
 use crate::strings::StringId;
-use crate::symbol::{Namespace, Symbol, SymbolId};
+use crate::symbol::{Linkage, Namespace, Symbol, SymbolId};
 use crate::token::lexer::Position;
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
@@ -437,9 +437,12 @@ impl Parser<'_> {
             if !is_fn && (inferred_init.is_some() || self.is_special(b'=')) {
                 self.check_extern_initializer(specs, scope, name, pos);
             }
-            // C17 6.2.7p4: two declarations of one object with linkage
-            // describe it by their composite type.
-            typ = self.composite_with_prior_declaration(name, typ, specs.storage_class);
+            // C17 6.2.7p4: two declarations of one object or function with
+            // linkage describe it by their composite type. Every file-scope
+            // declaration has linkage (6.2.2p3, p5); at block scope only an
+            // `extern` one or a function does (6.2.2p4, p5).
+            let has_linkage = scope == DeclScope::File || is_fn || specs.is_extern();
+            typ = self.composite_with_prior_declaration(name, typ, has_linkage);
             self.check_redeclaration(name, typ, pos, Redeclared::Declaration);
             let linkage = self.declare_linkage(Declared {
                 name,
@@ -798,30 +801,31 @@ impl Parser<'_> {
     /// already bound in this scope.
     ///
     /// C allows any number of file-scope declarations of one object or
-    /// function, so there the existing symbol is reused -- and a declaration
-    /// that knows an array's extent completes an earlier `extern int a[];`
-    /// (6.2.7p4). A block-scope repeat binds nothing.
+    /// function, so there the existing symbol is reused, and takes the
+    /// composite type of both declarations (6.2.7p4): `int (*q)[3];` completes
+    /// an earlier `int (*q)[];` as `int a[3];` does `extern int a[];`. So
+    /// is a block-scope repeat of a declaration with linkage, `extern int
+    /// z[]; extern int z[3];` in one block; any other block-scope repeat
+    /// binds nothing.
     fn declare_in(&mut self, scope: DeclScope, sym: Symbol, name: StringId) -> Option<SymbolId> {
         let typ = sym.typ;
         let is_typedef = sym.is_typedef();
+        let has_linkage = sym.linkage != Linkage::None;
         if let Ok(id) = self.symbols.declare(sym) {
             return Some(id);
-        }
-        if scope != DeclScope::File {
-            return None;
         }
         let existing = self
             .symbols
             .lookup_id(name, Namespace::Ordinary)
             .expect("redeclaration should find existing symbol");
-        if !is_typedef
-            && self
-                .types
-                .unsized_array_levels(self.symbols.get(existing).typ)
-                > 0
-            && self.types.unsized_array_levels(typ) == 0
+        if scope != DeclScope::File
+            && !(has_linkage && self.symbols.get(existing).linkage != Linkage::None)
         {
-            self.symbols.get_mut(existing).typ = typ;
+            return None;
+        }
+        let prior = self.symbols.get(existing).typ;
+        if !is_typedef && self.types.types_compatible(prior, typ) {
+            self.symbols.get_mut(existing).typ = self.types.composite_type(typ, prior);
         }
         Some(existing)
     }

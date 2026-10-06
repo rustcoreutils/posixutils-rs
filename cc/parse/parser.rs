@@ -14,7 +14,7 @@ use super::ast::Expr;
 use crate::constexpr::ConstScope;
 use crate::diag;
 use crate::strings::StringId;
-use crate::symbol::{Namespace, Symbol, SymbolId, SymbolTable};
+use crate::symbol::{Linkage, Namespace, Symbol, SymbolId, SymbolTable};
 use crate::token::lexer::{IdentTable, Position, SpecialToken, Token, TokenType, TokenValue};
 use crate::token::preprocess::PackAction;
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers, TypeTable};
@@ -713,45 +713,41 @@ impl Parser<'_> {
     }
 
     /// The composite type of this declaration and a visible prior one of the
-    /// same object (C17 6.2.7p4).
+    /// same object or function (C17 6.2.7p4).
     ///
-    /// Two declarations of an identifier *with linkage* describe one object,
-    /// so an inner `extern char i[];` under an outer `extern char i[10];` is
-    /// the same complete array -- `sizeof i` is 10, and gcc answers so. c17
-    /// took the inner declaration's own incomplete type and refused the
-    /// `sizeof` outright.
+    /// Two declarations of an identifier *with linkage* describe one entity,
+    /// and after the second the identifier has the composite type of both
+    /// (6.2.7p3): an incomplete array completed at any depth -- `int (*q)[];
+    /// int (*q)[3];` makes `sizeof *q` 12 -- and a prototype supplied to a
+    /// declarator without one. So does an inner `extern char i[];` under an
+    /// outer `extern char i[10];`: `sizeof i` is 10, as gcc answers.
     ///
-    /// Only the array-extent half of the composite is formed here, which is
-    /// the half that changes an answer: a prototype against an unprototyped
-    /// declarator is already handled by `redeclaration_compatible`.
+    /// `has_linkage` says whether this declaration gives the identifier
+    /// linkage; a plain block-scope object is a different object from any
+    /// outer one, and so is a prior declaration without linkage. Incompatible
+    /// types are left alone, for `check_redeclaration` to diagnose the type
+    /// as written.
     pub(super) fn composite_with_prior_declaration(
-        &self,
+        &mut self,
         name: StringId,
         typ: TypeId,
-        modifiers: TypeModifiers,
+        has_linkage: bool,
     ) -> TypeId {
-        // Only a declaration with linkage names an object another declaration
-        // could also name. A plain block-scope object is a different object.
-        if !modifiers.contains(TypeModifiers::EXTERN) {
-            return typ;
-        }
-        if self.types.kind(typ) != TypeKind::Array || self.types.get(typ).array_size.is_some() {
+        if !has_linkage {
             return typ;
         }
         let Some(prior_id) = self.symbols.lookup_id(name, Namespace::Ordinary) else {
             return typ;
         };
-        let prior = self.symbols.get(prior_id).typ;
-        if self.types.kind(prior) != TypeKind::Array || self.types.get(prior).array_size.is_none() {
+        let prior = self.symbols.get(prior_id);
+        if prior.linkage == Linkage::None || prior.is_typedef() {
             return typ;
         }
-        // The element types still have to agree, or these are not two
-        // declarations of one object and the conflict belongs to
-        // `check_redeclaration`.
-        match (self.types.base_type(typ), self.types.base_type(prior)) {
-            (Some(a), Some(b)) if self.types.types_compatible(a, b) => prior,
-            _ => typ,
+        let prior = prior.typ;
+        if !self.types.types_compatible(typ, prior) {
+            return typ;
         }
+        self.types.composite_type(typ, prior)
     }
 
     /// Build the symbol for a declared name, choosing its kind from its type.

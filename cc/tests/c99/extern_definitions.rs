@@ -102,3 +102,37 @@ int main(void)
 "#,
     );
 }
+
+/// A later declaration gives the object the composite type (C17 6.2.7p3-4),
+/// wherever in the type the incomplete array it completes sits: `int (*q)[];
+/// int (*q)[3];` makes `sizeof *q` 12. c17 merged only a top-level array,
+/// so `sizeof *q` was 0.
+#[test]
+fn c99_redeclaration_completes_a_nested_array() {
+    compile_and_run_everywhere(
+        "composite_nested_array",
+        r#"
+/* C17 6.2.7p3-4: a later declaration of the same object gives it the
+   composite type, so a nested incomplete array completed by the second
+   declaration is complete afterwards, wherever it sits in the type. */
+int b[3];
+int (*q)[];
+int (*q)[3] = &b;
+extern int m[][4];
+int m[2][4];
+struct s { int (*p)[]; };
+int f(int (*a)[]);
+int f(int (*a)[5]) { return sizeof *a; }
+extern int (*fp(void))[];
+int (*fp(void))[6] { return 0; }
+int main(void)
+{
+    if (sizeof *q != 3 * sizeof(int)) return 1;
+    if (sizeof m != 8 * sizeof(int)) return 2;
+    if (f(0) != 5 * sizeof(int)) return 3;
+    if (sizeof *fp() != 6 * sizeof(int)) return 4;
+    return 0;
+}
+"#,
+    );
+}

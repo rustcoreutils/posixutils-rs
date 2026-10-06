@@ -169,9 +169,13 @@ pub fn compile_tokens(
         optimizing: opts.optimization.optimizes(),
         math_errno: opts.math_errno,
     });
-    let ast = parser
-        .parse_translation_unit()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("parse error: {}", e)))?;
+    // A syntax error is reported where it is, like every other diagnostic:
+    // its position may be in a header, and only `diag` knows which file a
+    // position belongs to and which includes reached it.
+    let ast = parser.parse_translation_unit().map_err(|e| {
+        diag::error(e.pos, &e.message);
+        failed("compilation failed")
+    })?;
 
     // Check for semantic errors (e.g., undeclared identifiers) reported during parsing
     if diag::has_error() != 0 {

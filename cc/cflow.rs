@@ -776,6 +776,7 @@ fn preprocess_assembler(
         optimization: Default::default(),
         position: Default::default(),
         isa: Default::default(),
+        macro_prefix_map: Default::default(),
     };
     // A #error or a missing include makes the remaining bytes not worth
     // assembling: `as` would bury the real diagnostic under syntax errors.

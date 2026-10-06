@@ -12,7 +12,7 @@
 use super::test_linearize::{linearize_no_ssa, linearize_source, test_pos, TestContext};
 use super::*;
 use crate::parse::ast::{
-    AsmOperand, BlockItem, ExternalDecl, FunctionDef, Label, ParamStyle, Parameter, Stmt,
+    AsmOperand, BlockItem, ExternalDecl, FunctionDef, Label, LabelId, ParamStyle, Parameter, Stmt,
 };
 use crate::target::Target;
 
@@ -42,12 +42,12 @@ fn test_asm_goto_output_written_back_on_the_label_edge() {
             }],
             inputs: vec![],
             clobbers: vec![],
-            goto_labels: vec![out_id],
+            goto_labels: vec![LabelId::function(out_id)],
         })),
         BlockItem::Statement(Box::new(Stmt::Return(Some(Expr::int(0, &ctx.types))))),
         BlockItem::Statement(Box::new(Stmt::Labeled {
             labels: vec![Label::Named {
-                name: out_id,
+                label: LabelId::function(out_id),
                 pos: test_pos(),
             }],
             stmt: Box::new(Stmt::Return(Some(Expr::var_typed(x_sym, int_type)))),

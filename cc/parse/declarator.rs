@@ -691,10 +691,11 @@ impl Parser<'_> {
         loop {
             // Check for ellipsis
             if self.is_special_token(SpecialToken::Ellipsis) {
-                // ISO C requires at least one named parameter before '...'
-                // GCC/Clang emit a warning with -Wstrict-prototypes
+                // C17 6.7.6p1's grammar has a parameter before `, ...`, but
+                // gcc accepts `int f(...)` as an extension (C23 adopted it)
+                // and objects only under `-pedantic`.
                 if params.is_empty() {
-                    diag::warning(
+                    diag::pedwarn(
                         self.current_pos(),
                         &gettext("ISO C requires a named argument before '...'"),
                     );
@@ -706,7 +707,7 @@ impl Parser<'_> {
 
             // Parse parameter type
             let param_pos = self.current_pos();
-            let param_specs = self.parse_declaration_specifiers(SpecContext::Declaration)?;
+            let param_specs = self.parse_declaration_specifiers(SpecContext::Parameter)?;
             let param_type = param_specs.ty;
             // C11 6.7.5p2: not on a parameter.
             self.reject_alignas_in("a parameter");
@@ -738,6 +739,7 @@ impl Parser<'_> {
 
             // Skip any __attribute__ after parameter declarator
             self.skip_extensions();
+            self.drop_pending_cleanup(param_pos);
 
             // A parameter's type attributes are the parameter's, and are
             // applied before the array-to-pointer adjustment below so a mode

@@ -416,13 +416,9 @@ impl<'a> Parser<'a> {
         );
         let target = if t_void || e_void {
             // The `void *` carve-out is for pointers to objects. gcc objects
-            // to a function pointer only under `-pedantic`; c17 warns in the
-            // group that assignment uses for the same conversion.
-            let function = |k| k == TypeKind::Function;
-            if (function(self.types.kind(tp)) || function(self.types.kind(ep)))
-                && diag::warning_group_enabled(crate::types::FUNCTION_POINTER_CONV)
-            {
-                diag::warning(
+            // to a function pointer only under `-pedantic`.
+            if self.types.pointees_pair_function_with_void(tp, ep) {
+                diag::pedwarn(
                     pos,
                     &gettext(
                         "ISO C forbids conditional expr between 'void *' and function pointer",
@@ -782,8 +778,9 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let name = self.expect_identifier()?;
+            let label = self.resolve_label(name);
             return Ok(Self::typed_expr(
-                ExprKind::LabelAddr(name),
+                ExprKind::LabelAddr(label),
                 self.types.void_ptr_id,
                 op_pos,
             ));
@@ -1151,6 +1148,42 @@ impl<'a> Parser<'a> {
             );
         } else if target_kind == TypeKind::Pointer && self.types.is_float(from) {
             diag::error(pos, &gettext("cannot convert to a pointer type"));
+        } else if target_kind == TypeKind::Pointer && from_kind == TypeKind::Pointer {
+            self.check_function_object_pointer_cast(target, from, expr, pos);
+        }
+    }
+
+    /// C17 6.3.2.3 converts a function pointer only to another function
+    /// pointer; a cast between one and an object pointer -- `void *`
+    /// included, which is why `(fp)dlsym(h, "x")` is outside the standard --
+    /// is a conversion it does not define. gcc accepts both directions as an
+    /// extension and objects only under `-pedantic`, except to a null pointer
+    /// constant, which converts to any pointer.
+    fn check_function_object_pointer_cast(
+        &self,
+        target: TypeId,
+        from: TypeId,
+        expr: &Expr,
+        pos: Position,
+    ) {
+        let (Some(to), Some(of)) = (self.types.base_type(target), self.types.base_type(from))
+        else {
+            return;
+        };
+        let (to_fn, of_fn) = (
+            self.types.kind(to) == TypeKind::Function,
+            self.types.kind(of) == TypeKind::Function,
+        );
+        if of_fn && !to_fn {
+            diag::pedwarn(
+                pos,
+                &gettext("ISO C forbids conversion of function pointer to object pointer type"),
+            );
+        } else if to_fn && !of_fn && !self.is_null_pointer_constant(expr) {
+            diag::pedwarn(
+                pos,
+                &gettext("ISO C forbids conversion of object pointer to function pointer type"),
+            );
         }
     }
 
@@ -1698,46 +1731,63 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let args = self.parse_argument_list()?;
                 self.expect_special(b')')?;
-                self.check_callable(&expr, call_pos);
-                let func_type = self.resolved_function_type(&expr);
-                let callee = self.callee_name(&expr);
-                self.check_call(func_type, callee, &args, call_pos);
-
-                // The return type, from the function type the call calls --
-                // through a pointer for a call through one -- or `int` when
-                // there is none. A call's value has the unqualified version
-                // of it (C17 6.7.6.3p4 makes that the function's return type).
-                let return_type = func_type
-                    .and_then(|f| self.types.base_type(f))
-                    .unwrap_or(self.types.int_id);
-                let return_type = self.types.unqualified(return_type);
-                // 6.5.2.2p1: a call returns `void` or a complete object type;
-                // a prototype may name an incomplete one, but a call has a
-                // value of it to make.
-                if self.types.kind(return_type) != TypeKind::Void
-                    && self.type_name_is_incomplete(return_type, 0)
-                {
-                    let named = self.types.format_type(return_type, Some(self.idents));
-                    diag::error_args(call_pos, "invalid use of undefined type '{0}'", &[&named]);
-                }
-
-                let known = self.known_callee(&expr);
-                expr = self.fold_zero_length_compare(Self::typed_expr(
-                    ExprKind::Call {
-                        func: Box::new(expr),
-                        args,
-                        binding: crate::parse::ast::CalleeBinding::Declared,
-                        known,
-                    },
-                    return_type,
-                    base_pos,
-                ));
+                expr = self.checked_call(expr, args, call_pos, base_pos);
             } else {
                 break;
             }
         }
 
         Ok(expr)
+    }
+
+    /// The call `callee(args)`, checked as C17 6.5.2.2 asks: the callee is
+    /// callable, the arguments agree with its prototype, and the value it
+    /// returns is complete. `call_pos` is where diagnostics about the call
+    /// point; `pos` is the expression's own position.
+    ///
+    /// Every call the source spells goes through here, and so does the call
+    /// `__attribute__((cleanup(fn)))` stands for.
+    pub(super) fn checked_call(
+        &mut self,
+        callee: Expr,
+        args: Vec<Expr>,
+        call_pos: Position,
+        pos: Position,
+    ) -> Expr {
+        self.check_callable(&callee, call_pos);
+        let func_type = self.resolved_function_type(&callee);
+        let callee_name = self.callee_name(&callee);
+        self.check_call(func_type, callee_name, &args, call_pos);
+
+        // The return type, from the function type the call calls --
+        // through a pointer for a call through one -- or `int` when
+        // there is none. A call's value has the unqualified version
+        // of it (C17 6.7.6.3p4 makes that the function's return type).
+        let return_type = func_type
+            .and_then(|f| self.types.base_type(f))
+            .unwrap_or(self.types.int_id);
+        let return_type = self.types.unqualified(return_type);
+        // 6.5.2.2p1: a call returns `void` or a complete object type;
+        // a prototype may name an incomplete one, but a call has a
+        // value of it to make.
+        if self.types.kind(return_type) != TypeKind::Void
+            && self.type_name_is_incomplete(return_type, 0)
+        {
+            let named = self.types.format_type(return_type, Some(self.idents));
+            diag::error_args(call_pos, "invalid use of undefined type '{0}'", &[&named]);
+        }
+
+        let known = self.known_callee(&callee);
+        self.fold_zero_length_compare(Self::typed_expr(
+            ExprKind::Call {
+                func: Box::new(callee),
+                args,
+                binding: crate::parse::ast::CalleeBinding::Declared,
+                known,
+            },
+            return_type,
+            pos,
+        ))
     }
 
     /// The type of `__func__`: `const char[N]` for the enclosing function's
@@ -2469,6 +2519,16 @@ impl<'a> Parser<'a> {
                 let token_pos = token.pos;
                 if let TokenValue::Ident(id) = &token.value {
                     let name_id = *id;
+
+                    // `__label__` declares local labels at the head of a
+                    // block and nowhere else; anywhere a statement or an
+                    // expression is wanted, gcc takes it as neither.
+                    if name_id == crate::kw::GNU_LABEL {
+                        return Err(ParseError::new(
+                            gettext("expected expression before '__label__'"),
+                            token_pos,
+                        ));
+                    }
 
                     // Try builtin dispatch first, unless a declaration in scope
                     // has claimed the name (see `builtin_is_shadowed`).

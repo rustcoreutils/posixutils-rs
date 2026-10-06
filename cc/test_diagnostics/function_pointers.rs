@@ -1,5 +1,6 @@
 use crate::test_compile::{
-    compile, compile_expect_error, compile_expect_ok, compile_expect_warning,
+    compile, compile_accepted, compile_expect_error, compile_expect_ok, compile_expect_warning,
+    compile_rejected_with,
 };
 
 // ============================================================================
@@ -8,14 +9,13 @@ use crate::test_compile::{
 
 /// 6.5.16.1p1 offers the `void *` carve-out for a pointer to an **object**
 /// type, so a function pointer on the other side is a constraint violation.
-/// It is a warning rather than a rejection: gcc accepts it in silence and
-/// only `-pedantic` objects, and POSIX requires the line it appears in to
-/// work -- `dlsym` returns `void *` and every caller assigns it to a function
-/// pointer.
+/// gcc accepts it in silence and only `-pedantic` objects, and POSIX requires
+/// the line it appears in to work -- `dlsym` returns `void *` and every
+/// caller assigns it to a function pointer -- so it is a pedantic warning.
 ///
 /// All four contexts, because 6.5.16.1's constraints reach `return` and
 /// argument passing through "as if by assignment" and the three live in
-/// different files.
+/// different files. An argument names its callee when the call spelled one.
 #[test]
 fn diagnostics_function_pointer_and_void_pointer_warn() {
     let cases = [
@@ -37,18 +37,27 @@ fn diagnostics_function_pointer_and_void_pointer_warn() {
         (
             "fnptr_argument",
             "int fn(void);\nvoid take(void *);\nvoid f(void) { take(fn); }\n",
+            "ISO C forbids passing argument 1 of 'take' between function pointer and 'void *'",
+        ),
+        (
+            "fnptr_argument_unnamed",
+            "int fn(void);\nstruct S { void (*take)(void *); };\n\
+             void f(struct S s) { s.take(fn); }\n",
             "ISO C forbids passing argument 1 between function pointer and 'void *'",
         ),
     ];
     for (name, src, expected) in cases {
-        compile_expect_warning(name, src, expected);
+        let stderr = compile_accepted(name, src, &["-pedantic"]);
+        assert!(stderr.contains(expected), "{name}: {stderr}");
     }
 }
 
 /// The warning must not reach an ordinary object pointer, and must not reach
 /// a function designator converting to its own pointer type -- both are
 /// conversions the standard permits outright, and a check written from
-/// "pointer meets pointer" would catch them.
+/// "pointer meets pointer" would catch them. Nor a null pointer constant,
+/// which converts to any pointer. Checked under `-pedantic`, where the
+/// warning is on.
 ///
 /// `compile_expect_ok` asserts only that the program builds, which a
 /// spuriously warning compiler still does; this asserts the silence.
@@ -63,9 +72,11 @@ void f(void) {
     p = v;  v = p;  cp = v;  v = cp;
     b = v;  v = 0;
     FP g = fn;  (void)g;  (void)b;
+    FP n = (void *)0;  (void)n;  n = (FP)(void *)0;  n = (FP)0;
+    b = fn == (void *)0;  b = (void *)0 != fn;  b = n == fn;
 }
 "#;
-    let run = compile("fnptr_no_over_fire", src, &[]);
+    let run = compile("fnptr_no_over_fire", src, &["-pedantic"]);
     assert!(run.success, "should compile: {}", run.stderr);
     assert!(
         !run.stderr.contains("ISO C forbids"),
@@ -74,29 +85,87 @@ void f(void) {
     );
 }
 
-/// Diagnosing this at all is stricter than gcc's default, so it has to be
-/// silenceable by name -- otherwise every `dlsym` caller pays for it.
+/// `-w` silences the pedantic warnings like any other, and `-Wno-pedantic`
+/// after `-pedantic` turns them off again; before it, `-pedantic` wins, the
+/// last of the pair deciding as in gcc.
 #[test]
 fn diagnostics_function_pointer_warning_can_be_silenced() {
     let src = "int fn(void);\nvoid *f(void) { return fn; }\n";
 
-    for silencer in ["-w", "-Wno-function-pointer-conv"] {
-        let run = compile("fnptr_silence", src, &[silencer]);
-        assert!(run.success, "{silencer} should be accepted: {}", run.stderr);
+    for silencer in [&["-pedantic", "-w"][..], &["-pedantic", "-Wno-pedantic"]] {
+        let run = compile("fnptr_silence", src, silencer);
+        assert!(
+            run.success,
+            "{silencer:?} should be accepted: {}",
+            run.stderr
+        );
         assert!(
             !run.stderr.contains("ISO C forbids"),
-            "{silencer} should silence the conversion warning, got:\n{}",
+            "{silencer:?} should silence the conversion warning, got:\n{}",
             run.stderr
         );
     }
 
-    // An unrelated -Wno- must not silence it, or the flag name means nothing.
-    let run = compile("fnptr_silence", src, &["-Wno-unused"]);
-    assert!(
-        run.stderr.contains("ISO C forbids"),
-        "-Wno-unused should leave it alone, got:\n{}",
-        run.stderr
-    );
+    // An unrelated -Wno- must not silence it, nor -Wno-pedantic before
+    // -pedantic.
+    for flags in [
+        &["-pedantic", "-Wno-unused"][..],
+        &["-Wno-pedantic", "-pedantic"],
+    ] {
+        let run = compile("fnptr_silence", src, flags);
+        assert!(
+            run.stderr.contains("ISO C forbids"),
+            "{flags:?} should leave it on, got:\n{}",
+            run.stderr
+        );
+    }
+}
+
+/// `-pedantic-errors` makes the pedantic diagnostics errors, as in gcc --
+/// every context of the `void *`/function pointer pairing and `int f(...)`
+/// alike -- and a later `-Wno-pedantic` silences them altogether.
+#[test]
+fn diagnostics_pedantic_errors_are_fatal() {
+    for (name, src, want) in [
+        (
+            "ped_err_return",
+            "int fn(void);\nvoid *f(void) { return fn; }\n",
+            "error: ISO C forbids return between function pointer and 'void *'",
+        ),
+        (
+            "ped_err_cast",
+            "int fn(void);\nvoid *f(void) { return (void *)fn; }\n",
+            "error: ISO C forbids conversion of function pointer to object pointer type",
+        ),
+        (
+            "ped_err_compare",
+            "int fn(void);\nint f(void *p) { return p != fn; }\n",
+            "error: ISO C forbids comparison of 'void *' with function pointer",
+        ),
+        (
+            "ped_err_ellipsis",
+            "int f(...);\n",
+            "error: ISO C requires a named argument before '...'",
+        ),
+    ] {
+        let stderr = compile_rejected_with(name, src, &["-pedantic-errors"]);
+        assert!(stderr.contains(want), "{name}: {stderr}");
+        let quiet = compile_accepted(name, src, &["-pedantic-errors", "-Wno-pedantic"]);
+        assert!(!quiet.contains("ISO C"), "{name}: {quiet}");
+    }
+}
+
+/// `int f(...)` is outside C17's grammar, which wants a parameter before the
+/// ellipsis, but gcc accepts it as an extension (C23 adopted it) and objects
+/// only under `-pedantic`.
+#[test]
+fn diagnostics_ellipsis_without_named_parameter_is_pedantic_only() {
+    let src = "int f(...);\n";
+    let want = "ISO C requires a named argument before '...'";
+    let quiet = compile_accepted("ellipsis_only_default", src, &[]);
+    assert!(!quiet.contains(want), "warned without -pedantic:\n{quiet}");
+    let loud = compile_accepted("ellipsis_only_pedantic", src, &["-Wpedantic"]);
+    assert!(loud.contains(want), "{loud}");
 }
 
 /// glibc declares the socket calls with a union parameter carrying
@@ -698,8 +767,50 @@ __attribute__((used)) static int used_var;
 #if !__has_attribute(weak) || !__has_attribute(transparent_union)
 #error "__has_attribute must admit the attributes the compiler accepts"
 #endif
+#if !__has_attribute(cleanup) || !__has_attribute(__cleanup__)
+#error "__has_attribute must admit cleanup, which the compiler implements"
+#endif
 
-int main(void) { return 0; }
+static void release(int *p) { (void)p; }
+int main(void) { int held __attribute__((cleanup(release))) = 0; return held; }
 "#;
     compile_expect_ok("recognised_attributes", src);
+}
+
+/// gcc says nothing about `void *` against a function pointer unless asked
+/// with `-pedantic` (or `-Wpedantic`), and then it flags every context: the
+/// four conversions as if by assignment, an explicit cast either way, and a
+/// comparison. `fp f = dlsym(h, "x");` is everyday POSIX code, so a default
+/// warning breaks every `-Werror` build that loads a plugin.
+#[test]
+fn diagnostics_function_pointer_and_void_pointer_are_pedantic_only() {
+    let src = "typedef int (*fp)(void);\n\
+               static int g(void) { return 0; }\n\
+               void *r1(void) { return g; }\n\
+               fp r2(void *p) { return p; }\n\
+               void take(void *);\n\
+               void t(void **out) {\n\
+                   void *v = g; fp f = v; *out = g; take(g);\n\
+                   v = (void *)g; f = (fp)v; (void)f; (void)v;\n\
+               }\n\
+               int cmp(void *p) { return p == g; }\n";
+    let quiet = compile_accepted("fnptr_void_default", src, &[]);
+    assert!(
+        !quiet.contains("ISO C forbids"),
+        "warned without -pedantic:\n{quiet}"
+    );
+    for flag in ["-pedantic", "-Wpedantic"] {
+        let loud = compile_accepted("fnptr_void_pedantic", src, &[flag]);
+        for want in [
+            "ISO C forbids return between function pointer and 'void *'",
+            "ISO C forbids initialization between function pointer and 'void *'",
+            "ISO C forbids assignment between function pointer and 'void *'",
+            "ISO C forbids passing argument 1 of 'take' between function pointer and 'void *'",
+            "ISO C forbids conversion of function pointer to object pointer type",
+            "ISO C forbids conversion of object pointer to function pointer type",
+            "ISO C forbids comparison of 'void *' with function pointer",
+        ] {
+            assert!(loud.contains(want), "{flag}: missing {want:?}:\n{loud}");
+        }
+    }
 }

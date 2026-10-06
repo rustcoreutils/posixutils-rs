@@ -30,6 +30,7 @@ mod determinism;
 mod floating;
 mod fp_compare_traps;
 mod fp_untaken_arms;
+mod ifunc;
 mod inline_asm;
 mod inlining;
 mod int128;

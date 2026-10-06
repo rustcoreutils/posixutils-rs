@@ -36,7 +36,8 @@ use crate::common::{
 /// The warning must not reach an ordinary object pointer, and must not reach
 /// a function designator converting to its own pointer type -- both are
 /// conversions the standard permits outright, and a check written from
-/// "pointer meets pointer" would catch them.
+/// "pointer meets pointer" would catch them. Checked under `-pedantic`,
+/// where the warning is on.
 ///
 /// `compile_expect_ok` asserts only that the program builds, which a
 /// spuriously warning compiler still does; this asserts the silence.
@@ -55,7 +56,7 @@ void f(void) {
 "#;
     let c = create_c_file("fnptr_no_over_fire", src);
     let path = c.path().to_string_lossy().to_string();
-    let run = run_c17(&["-S", "-o", "/dev/null", &path]);
+    let run = run_c17(&["-S", "-o", "/dev/null", "-pedantic", &path]);
     assert!(run.success, "should compile: {}", run.stderr);
     assert!(
         !run.stderr.contains("ISO C forbids"),
@@ -64,31 +65,40 @@ void f(void) {
     );
 }
 
-/// Diagnosing this at all is stricter than gcc's default, so it has to be
-/// silenceable by name -- otherwise every `dlsym` caller pays for it.
+/// The `void *`/function pointer pairing is gcc's `-pedantic` extension:
+/// silent by default, a warning under `-pedantic` or `-Wpedantic`, an error
+/// under `-pedantic-errors`, and off again after `-Wno-pedantic`. The driver
+/// rewrites `-pedantic` into the `-W` options so the last of them decides.
 #[test]
-fn diagnostics_function_pointer_warning_can_be_silenced() {
+fn diagnostics_function_pointer_warning_is_pedantic() {
     let src = "int fn(void);\nvoid *f(void) { return fn; }\n";
-    let c = create_c_file("fnptr_silence", src);
+    let c = create_c_file("fnptr_pedantic", src);
     let path = c.path().to_string_lossy().to_string();
+    let want = "ISO C forbids return between function pointer and 'void *'";
 
-    for silencer in ["-w", "-Wno-function-pointer-conv"] {
-        let run = run_c17(&["-S", "-o", "/dev/null", silencer, &path]);
-        assert!(run.success, "{silencer} should be accepted: {}", run.stderr);
-        assert!(
-            !run.stderr.contains("ISO C forbids"),
-            "{silencer} should silence the conversion warning, got:\n{}",
+    for (flags, success, diagnosed) in [
+        (&[][..], true, false),
+        (&["-pedantic"], true, true),
+        (&["-Wpedantic"], true, true),
+        (&["-pedantic", "-w"], true, false),
+        (&["-pedantic", "-Wno-pedantic"], true, false),
+        (&["-Wno-pedantic", "-pedantic"], true, true),
+        (&["-pedantic", "-Wno-unused"], true, true),
+        (&["-pedantic-errors"], false, true),
+        (&["-pedantic-errors", "-Wno-pedantic"], true, false),
+    ] {
+        let mut argv = vec!["-S", "-o", "/dev/null"];
+        argv.extend_from_slice(flags);
+        argv.push(&path);
+        let run = run_c17(&argv);
+        assert_eq!(run.success, success, "{flags:?}: {}", run.stderr);
+        assert_eq!(
+            run.stderr.contains(want),
+            diagnosed,
+            "{flags:?}: {}",
             run.stderr
         );
     }
-
-    // An unrelated -Wno- must not silence it, or the flag name means nothing.
-    let run = run_c17(&["-S", "-o", "/dev/null", "-Wno-unused", &path]);
-    assert!(
-        run.stderr.contains("ISO C forbids"),
-        "-Wno-unused should leave it alone, got:\n{}",
-        run.stderr
-    );
 }
 
 /// ...and it belongs to the `attributes` group, like every other

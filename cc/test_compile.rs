@@ -17,6 +17,7 @@
 use crate::diag;
 use crate::opt::Optimization;
 use crate::pipeline::{self, CodegenOptions, Quiet};
+use crate::prefix_map::{MapOption, PrefixMaps};
 use crate::strings::StringTable;
 use crate::target::{self, Target};
 use crate::token::preprocess::SystemSearch;
@@ -60,7 +61,13 @@ struct Options {
     /// `-finline` / `-fno-inline`, last one winning, applied to whatever
     /// level the `-O` options leave, as the driver does.
     inlining: Option<bool>,
+    /// `-fsigned-char` / `-funsigned-char` (and the `-fno-` inverses), last
+    /// one winning, overriding the target's plain `char`.
+    plain_char: Option<target::CharSignedness>,
     mflags: Vec<String>,
+    /// `-fdebug-prefix-map=`, `-fmacro-prefix-map=`, `-ffile-prefix-map=`,
+    /// in order.
+    prefix_maps: Vec<MapOption>,
 }
 
 /// Apply `flags` the way the driver does: the switches that live in
@@ -74,7 +81,18 @@ fn apply_flags(flags: &[&str]) -> Options {
     };
     let mut no_groups = std::collections::HashSet::new();
     let mut no_builtin_funcs = std::collections::HashSet::new();
+    let mut pedantic = diag::Pedantic::OFF;
     for &flag in flags {
+        // As the driver: `-pedantic` and `-pedantic-errors` are `-W` options
+        // by the time the switch is folded.
+        let w_name = match flag {
+            "-pedantic" | "-pedantic-errors" => Some(&flag[1..]),
+            _ => flag.strip_prefix("-W"),
+        };
+        if let Some(next) = w_name.and_then(|name| pedantic.after(name)) {
+            pedantic = next;
+            continue;
+        }
         match flag {
             "-w" => diag::suppress_warnings(),
             "-fpermissive" => diag::set_permissive(),
@@ -93,9 +111,17 @@ fn apply_flags(flags: &[&str]) -> Options {
             "-fno-trapping-math" => o.trapping_math = false,
             "-fno-inline" => o.inlining = Some(false),
             "-finline" => o.inlining = Some(true),
+            "-fsigned-char" | "-fno-unsigned-char" => {
+                o.plain_char = Some(target::CharSignedness::Signed)
+            }
+            "-funsigned-char" | "-fno-signed-char" => {
+                o.plain_char = Some(target::CharSignedness::Unsigned)
+            }
             _ => {
                 if let Some(level) = flag.strip_prefix("-O") {
                     o.optimization = Optimization::from_flag(level).unwrap();
+                } else if let Some(map) = MapOption::parse(flag) {
+                    o.prefix_maps.push(map.unwrap());
                 } else if let Some(name) = flag.strip_prefix("-Wno-") {
                     no_groups.insert(name.to_string());
                 } else if let Some(name) = flag.strip_prefix("-fno-builtin-") {
@@ -120,6 +146,7 @@ fn apply_flags(flags: &[&str]) -> Options {
         o.optimization.set_inlining(enabled);
     }
     diag::suppress_warning_groups(no_groups);
+    diag::set_pedantic(pedantic);
     crate::builtins::set_no_builtin_funcs(no_builtin_funcs);
     o
 }
@@ -140,6 +167,9 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
     if target.arch == target::Arch::X86_64 {
         target.x86_isa = target::X86Isa::from_flags(&o.mflags);
     }
+    if let Some(signedness) = o.plain_char {
+        target.plain_char = signedness;
+    }
     // As the driver's `position_independence`: PIE is the Linux default
     // unless a shared object or `-fno-pie` asks otherwise, and implies PIC.
     let pie = !(o.shared || o.no_pie) && (o.pie || target.os == target::Os::Linux);
@@ -148,6 +178,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         pie,
     };
 
+    let prefix_maps = PrefixMaps::from_options(&o.prefix_maps);
     let mut strings = StringTable::new();
     let (tokens, _) =
         pipeline::source_tokens(src.as_bytes(), &source_name, false, false, &mut strings);
@@ -171,6 +202,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
             optimization: o.optimization,
             position,
             isa: target::X86Isa::from_flags(&o.mflags),
+            macro_prefix_map: prefix_maps.macros,
         },
     );
 
@@ -185,6 +217,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         unwind_tables: !o.no_unwind_tables,
         verbose_asm: o.verbose_asm,
         source_name: &source_name,
+        debug_prefix_map: &prefix_maps.debug,
     };
     let result = pipeline::compile_tokens(preprocessed, &strings, &target, &opts, &mut Quiet);
 

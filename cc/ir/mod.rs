@@ -30,6 +30,7 @@ pub mod instcombine;
 pub mod libcall_fold;
 pub mod linearize;
 mod linearize_atomic;
+mod linearize_cleanup;
 mod linearize_emit;
 mod linearize_init;
 mod linearize_stmt;
@@ -45,6 +46,7 @@ pub mod range;
 pub mod sccp;
 pub mod ssa;
 pub(crate) mod strdata;
+mod target_clones;
 pub mod tls;
 pub mod validate;
 pub mod vrp;
@@ -3010,6 +3012,11 @@ pub struct Function {
     /// `__attribute__((noinline))`: the inliner must leave this function
     /// alone, whatever its size says.
     pub is_noinline: bool,
+    /// The x86-64 extensions this function is compiled for: the translation
+    /// unit's, or what its `target(...)` attribute or `target_clones`
+    /// version asks. What the linearizer and the backend both read; set
+    /// once, by `Linearizer::linearize_function`. The baseline elsewhere.
+    pub isa: crate::target::X86Isa,
     /// `__attribute__((pure))` / `((const))`, as written.
     ///
     /// The programmer's promise, kept separate from anything `ir/effects.rs`
@@ -3091,6 +3098,7 @@ impl Default for Function {
             is_noreturn: false,
             conv: CallingConv::C,
             is_noinline: false,
+            isa: Default::default(),
             declared_effect: crate::parse::ast::MemEffect::Unknown,
             is_always_inline: false,
             constructor: None,
@@ -3750,7 +3758,11 @@ pub struct SymbolAlias {
     /// The alias, as the assembler spells it.
     pub name: String,
     /// The symbol it names: a definition in this unit, or another alias.
+    /// For an `ifunc`, the resolver.
     pub target: String,
+    /// A second name for `target`, or a GNU indirect function `target`
+    /// resolves.
+    pub form: crate::parse::ast::AliasForm,
     /// Declared `static`: a local symbol, no `.globl`.
     pub is_static: bool,
     /// `weak`: `.weak` rather than `.globl`.
@@ -3858,13 +3870,16 @@ pub struct Module {
     pub library_symbols: HashMap<&'static str, String>,
     /// Where each global is in `globals`, by name: see `Module::global_mut`.
     global_idx: AppendIndex,
+    /// Where each function is in `functions`, by name: see
+    /// `Module::add_function`.
+    function_idx: AppendIndex,
     /// Where each literal is in `strings`, by contents: see
     /// `Module::add_string`.
     string_idx: AppendIndex,
 }
 
 /// The position of each item in one of `Module`'s lists, by a key the item
-/// carries: a global's name, a literal's contents.
+/// carries: a global's or a function's name, a literal's contents.
 ///
 /// Those lists are only ever appended to, by this module and by the passes
 /// that push to them directly, so the index catches up with whatever was
@@ -3937,9 +3952,21 @@ pub(crate) fn string_label(index: usize) -> String {
 }
 
 impl Module {
-    /// Add a function
+    /// Add a function definition, keeping one function per name.
+    ///
+    /// A GNU inline-only body (`emit == false`) may be followed by the
+    /// translation unit's real definition of the same name -- the parser
+    /// allows that order and no other -- and the real one replaces it: it is
+    /// the function, for calls, for the inliner and for `&f`, as in gcc. Two
+    /// entries under one name would leave every lookup by name to pick one.
     pub fn add_function(&mut self, func: Function) {
-        self.functions.push(func);
+        let found = self
+            .function_idx
+            .find(&self.functions, |f| f.name.as_str(), &func.name);
+        match found {
+            Some(i) if !self.functions[i].emit => self.functions[i] = func,
+            _ => self.functions.push(func),
+        }
     }
 
     /// Add a global variable
@@ -4160,6 +4187,7 @@ mod tests {
             aliases: vec![SymbolAlias {
                 name: "a".into(),
                 target: "plain".into(),
+                form: crate::parse::ast::AliasForm::Alias,
                 is_static: false,
                 weak: false,
                 visibility: None,

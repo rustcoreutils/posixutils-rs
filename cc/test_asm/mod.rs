@@ -63,6 +63,7 @@ mod codegen_regalloc;
 mod codegen_sections;
 mod codegen_stacked_args;
 mod codegen_symbols;
+mod codegen_target_attr;
 mod codegen_tls_models;
 mod codegen_trapping_folds;
 mod codegen_types_exprs;

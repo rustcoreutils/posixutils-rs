@@ -1180,6 +1180,25 @@ define_keywords! {
     (REAL_KW_SHORT,     "__real",            RESERVED_NAME),
     (IMAG_KW,           "__imag__",          RESERVED_NAME),
     (IMAG_KW_SHORT,     "__imag",            RESERVED_NAME),
+    // `cleanup(fn)`: runs `fn(&var)` when an automatic variable leaves its
+    // scope. Appended, as above.
+    (_, "cleanup",                   SUPPORTED_ATTR),
+    (_, "__cleanup__",               SUPPORTED_ATTR),
+    // `ifunc("resolver")`: a GNU indirect function. Appended, as above.
+    (_, "ifunc",                     SUPPORTED_ATTR),
+    (_, "__ifunc__",                 SUPPORTED_ATTR),
+    // `target("...")` and `target_clones(...)`: one function compiled for
+    // another ISA, or for several with a resolver. Appended, as above.
+    (_, "target",                    SUPPORTED_ATTR),
+    (_, "__target__",                SUPPORTED_ATTR),
+    (_, "target_clones",             SUPPORTED_ATTR),
+    (_, "__target_clones__",         SUPPORTED_ATTR),
+    // `__auto_type`: a declaration whose type is its initializer's. A type
+    // specifier, and reserved like every `__` spelling. Appended, as above.
+    (GNU_AUTO_TYPE,     "__auto_type",       TYPE_SPEC | TYPE_KEYWORD | RESERVED_NAME),
+    // `__label__`: declares labels local to a block, at its head. A
+    // statement keyword, so it is never itself a label. Appended, as above.
+    (GNU_LABEL,         "__label__",         STMT_KW | RESERVED_NAME),
 }
 
 // Tag query API
@@ -1332,6 +1351,7 @@ mod tests {
             "typeof",
             "__typeof__",
             "__typeof",
+            "__auto_type",
             "_Atomic",
         ] {
             let table = StringTable::new();
@@ -1394,6 +1414,7 @@ mod tests {
             "typeof",
             "__typeof__",
             "__typeof",
+            "__auto_type",
         ] {
             let table = StringTable::new();
             let sid = id(&table, s);
@@ -1452,6 +1473,7 @@ mod tests {
             "typeof",
             "__typeof__",
             "__typeof",
+            "__auto_type",
             "_Thread_local",
             "__thread",
             "_Static_assert",
@@ -1557,6 +1579,14 @@ mod tests {
             "__mode__",
             "vector_size",
             "__vector_size__",
+            "cleanup",
+            "__cleanup__",
+            "ifunc",
+            "__ifunc__",
+            "target",
+            "__target__",
+            "target_clones",
+            "__target_clones__",
         ] {
             let table = StringTable::new();
             let sid = id(&table, s);

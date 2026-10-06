@@ -16,7 +16,7 @@ use super::test_linearize::{
 };
 use super::*;
 use crate::parse::ast::{
-    AssignOp, BinaryOp, BlockItem, ExprKind, ExternalDecl, FunctionDef, Label, ParamStyle,
+    AssignOp, BinaryOp, BlockItem, ExprKind, ExternalDecl, FunctionDef, Label, LabelId, ParamStyle,
     Parameter, Stmt,
 };
 use crate::strings::StringTable;
@@ -478,7 +478,7 @@ fn test_goto_forward() {
     // Block: { goto end; x = 1; end: x = 2; return x; }
     let body = Stmt::Block(vec![
         BlockItem::Statement(Box::new(Stmt::Goto {
-            name: end_id,
+            label: LabelId::function(end_id),
             pos: test_pos(),
         })),
         BlockItem::Statement(Box::new(Stmt::Expr(Expr::typed_unpositioned(
@@ -491,7 +491,7 @@ fn test_goto_forward() {
         )))),
         BlockItem::Statement(Box::new(Stmt::Labeled {
             labels: vec![Label::Named {
-                name: end_id,
+                label: LabelId::function(end_id),
                 pos: test_pos(),
             }],
             stmt: Box::new(Stmt::Expr(Expr::typed_unpositioned(
@@ -575,7 +575,7 @@ fn test_goto_backward() {
     let if_goto = Stmt::If {
         cond,
         then_stmt: Box::new(Stmt::Goto {
-            name: loop_id,
+            label: LabelId::function(loop_id),
             pos: test_pos(),
         }),
         else_stmt: None,
@@ -584,7 +584,7 @@ fn test_goto_backward() {
     let body = Stmt::Block(vec![
         BlockItem::Statement(Box::new(Stmt::Labeled {
             labels: vec![Label::Named {
-                name: loop_id,
+                label: LabelId::function(loop_id),
                 pos: test_pos(),
             }],
             stmt: Box::new(increment),
@@ -1082,7 +1082,7 @@ fn test_cfg_edges_are_recorded_once_in_both_lists() {
             BlockItem::Statement(Box::new(Stmt::If {
                 cond: Expr::var_typed(x_sym, int_type),
                 then_stmt: Box::new(Stmt::Goto {
-                    name: end_id,
+                    label: LabelId::function(end_id),
                     pos: test_pos(),
                 }),
                 else_stmt: None,
@@ -1091,7 +1091,7 @@ fn test_cfg_edges_are_recorded_once_in_both_lists() {
         .collect();
     items.push(BlockItem::Statement(Box::new(Stmt::Labeled {
         labels: vec![Label::Named {
-            name: end_id,
+            label: LabelId::function(end_id),
             pos: test_pos(),
         }],
         stmt: Box::new(Stmt::Return(Some(Expr::var_typed(x_sym, int_type)))),
@@ -1171,7 +1171,12 @@ fn linearize_source_labels(src: &str) -> (Module, std::collections::HashSet<Stri
     };
     let mut linearizer = Linearizer::new(&symbols, &types, &strings, &target);
     let module = linearizer.linearize(&tu);
-    (module, linearizer.defined_labels.clone())
+    let defined = linearizer
+        .defined_labels
+        .iter()
+        .map(|label| strings.get(label.name).to_string())
+        .collect();
+    (module, defined)
 }
 
 /// A label is defined wherever it sits in a `switch` body -- before a case
@@ -1998,4 +2003,32 @@ fn a_backward_goto_past_a_vla_declaration_releases_it() {
         "the jump back to `lab` puts the stack where the label found it, and \
          the path that falls out of the block releases it too"
     );
+}
+
+/// Two local labels of one spelling (`__label__`) are two labels: each
+/// `goto` reaches the block of the label declared in its own block. Keyed by
+/// spelling, both jumps reached one block and the second definition was a
+/// duplicate.
+#[test]
+fn test_local_labels_of_one_name_are_two_blocks() {
+    let src = "int f(int x) {\n\
+                 { __label__ l; goto l; x += 1; l: x += 2; }\n\
+                 { __label__ l; goto l; x += 4; l: x += 8; }\n\
+                 return x;\n\
+               }\n";
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    let module = linearize_source(src, &target);
+    let func = module.functions.iter().find(|f| f.name == "f").expect("f");
+    let blocks: Vec<_> = func
+        .blocks
+        .iter()
+        .filter(|bb| bb.label.as_deref() == Some("l"))
+        .collect();
+    assert_eq!(blocks.len(), 2, "one block per local label");
+    // Each is reached only by its own block's `goto`: the statement before
+    // each label is dead, so nothing falls in.
+    for bb in &blocks {
+        assert_eq!(bb.parents.len(), 1, "{:?}", bb.parents);
+    }
+    assert_ne!(blocks[0].parents, blocks[1].parents);
 }

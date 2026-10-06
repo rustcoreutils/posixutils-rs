@@ -180,6 +180,7 @@ fn test_valist_local_not_indirect() {
     let lva_decl = Declaration {
         declarators: vec![InitDeclarator {
             fn_effect: Default::default(),
+            cleanup: None,
             symbol_attrs: Default::default(),
             pos: Position::default(),
             symbol: lva_sym,
@@ -255,6 +256,7 @@ fn test_valist_expression_decay() {
     let ptr_decl = Declaration {
         declarators: vec![InitDeclarator {
             fn_effect: Default::default(),
+            cleanup: None,
             symbol_attrs: Default::default(),
             pos: Position::default(),
             symbol: ptr_sym,

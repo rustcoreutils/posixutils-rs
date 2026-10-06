@@ -96,6 +96,10 @@ pub(crate) enum OperandVerdict {
     /// Two pointers compared whose referenced types are not compatible.
     /// gcc warns and compares the addresses.
     DistinctPointers,
+    /// `void *` tested for equality with a function pointer. 6.5.9p2's
+    /// `void *` form is for object pointers, but gcc accepts it as an
+    /// extension and objects only under `-pedantic`.
+    FunctionPointerVoid,
 }
 
 /// Check a binary operator's operands against C17 6.5.5p2 through 6.5.14p2.
@@ -134,10 +138,12 @@ fn pointer_form_verdict(
             OperandVerdict::Invalid
         }),
         _ if op.is_comparison() && lp && rp => {
-            Some(if pointers_comparable(types, op, left, right) {
-                OperandVerdict::Valid
-            } else {
+            Some(if !pointers_comparable(types, op, left, right) {
                 OperandVerdict::DistinctPointers
+            } else if pairs_function_with_void(types, left, right) {
+                OperandVerdict::FunctionPointerVoid
+            } else {
+                OperandVerdict::Valid
             })
         }
         _ if op.is_comparison() && pointer_and_integer => {
@@ -156,6 +162,19 @@ fn pointer_form_verdict(
 fn pointees_compatible(types: &TypeTable, left: Operand, right: Operand) -> bool {
     match (types.base_type(left.typ), types.base_type(right.typ)) {
         (Some(l), Some(r)) => types.types_compatible(l, r),
+        _ => false,
+    }
+}
+
+/// Does one pointer point at `void` and the other at a function? A null
+/// pointer constant is a null pointer whatever its type, so `(void *)0`
+/// pairs with nothing.
+fn pairs_function_with_void(types: &TypeTable, left: Operand, right: Operand) -> bool {
+    if left.null_constant || right.null_constant {
+        return false;
+    }
+    match (types.base_type(left.typ), types.base_type(right.typ)) {
+        (Some(l), Some(r)) => types.pointees_pair_function_with_void(l, r),
         _ => false,
     }
 }

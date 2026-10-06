@@ -14,7 +14,9 @@ use crate::constexpr;
 use crate::constexpr::ConstScope;
 use crate::diag::error;
 use crate::float::FloatVal;
-use crate::parse::ast::{BinaryOp, Declaration, Designator, Expr, ExprKind, InitElement, UnaryOp};
+use crate::parse::ast::{
+    AliasForm, BinaryOp, Declaration, Designator, Expr, ExprKind, InitElement, UnaryOp,
+};
 use crate::strings::StringId;
 use crate::token::lexer::Position;
 use crate::types::{MemberInfo, Type, TypeId, TypeKind, TypeModifiers, TypeTable};
@@ -189,11 +191,6 @@ impl<'a> super::linearize::Linearizer<'a> {
                     );
                     continue;
                 }
-                let kind = if self.types.kind(declarator.typ) == TypeKind::Function {
-                    AliasKind::Function
-                } else {
-                    AliasKind::Object
-                };
                 if storage_class.contains(TypeModifiers::THREAD_LOCAL) {
                     // Accessed as a thread-local, whatever it names.
                     self.module.extern_tls_symbols.insert(name.clone());
@@ -202,7 +199,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                     &name,
                     &declarator.symbol_attrs,
                     storage_class.contains(TypeModifiers::STATIC),
-                    kind,
+                    declarator.typ,
                     declarator.pos,
                 );
                 continue;
@@ -369,7 +366,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Every initializer that reaches here has static storage duration,
             // so the function can no longer be copied: see
             // `Function::saves_label_in_static`.
-            ExprKind::LabelAddr(name) => match self.take_label_address(*name, expr.pos) {
+            ExprKind::LabelAddr(label) => match self.take_label_address(*label, expr.pos) {
                 Some(sym) => {
                     if let Some(func) = &mut self.current_func {
                         func.saves_label_in_static = true;
@@ -2597,13 +2594,19 @@ pub(crate) enum AliasKind {
     Object,
 }
 
-/// An `__attribute__((alias))` declaration, awaiting the end of the unit.
+/// An `__attribute__((alias))` or `__attribute__((ifunc))` declaration,
+/// awaiting the end of the unit.
 #[derive(Debug, Clone)]
 pub(crate) struct DeclaredAlias {
     /// The alias, as emitted.
     name: String,
-    /// The target, as written in the attribute.
+    /// The target -- for an `ifunc`, the resolver -- as written in the
+    /// attribute.
     target: String,
+    form: AliasForm,
+    /// The declared type: what an `ifunc` resolver has to return a pointer
+    /// to, and whether an `alias` names code or data.
+    typ: TypeId,
     kind: AliasKind,
     is_static: bool,
     weak: bool,
@@ -2620,7 +2623,8 @@ enum AliasFault {
 }
 
 impl<'a> super::linearize::Linearizer<'a> {
-    /// Record `name` as `__attribute__((alias))` for the target in `attrs`.
+    /// Record `name`, of type `typ`, as `__attribute__((alias))` or
+    /// `__attribute__((ifunc))` for the symbol named in `attrs`.
     ///
     /// Every declaration of the alias may repeat the attribute; the first is
     /// the one recorded.
@@ -2629,18 +2633,25 @@ impl<'a> super::linearize::Linearizer<'a> {
         name: &str,
         attrs: &crate::parse::ast::SymbolAttrs,
         is_static: bool,
-        kind: AliasKind,
+        typ: TypeId,
         pos: Position,
     ) {
-        let Some(target) = attrs.alias.clone() else {
+        let Some(attr) = attrs.alias.clone() else {
             return;
         };
         if self.declared_aliases.iter().any(|a| a.name == name) {
             return;
         }
+        let kind = if self.types.kind(typ) == TypeKind::Function {
+            AliasKind::Function
+        } else {
+            AliasKind::Object
+        };
         self.declared_aliases.push(DeclaredAlias {
             name: name.to_string(),
-            target,
+            target: attr.target,
+            form: attr.form,
+            typ,
             kind,
             is_static,
             weak: attrs.weak,
@@ -2663,19 +2674,29 @@ impl<'a> super::linearize::Linearizer<'a> {
             self.module.declared_symbol_attrs.remove(&a.name);
             self.module.extern_object_align.remove(&a.name);
         }
-        // Mach-O has no symbol aliases -- clang refuses the attribute on
-        // Darwin for the same reason -- so there is nothing correct to emit.
+        // Mach-O has neither symbol aliases nor indirect functions -- clang
+        // refuses `alias` on Darwin for the same reason -- so there is
+        // nothing correct to emit.
         if self.target.os == crate::target::Os::MacOS {
             for a in &declared {
-                error(
-                    a.pos,
-                    &gettextrs::gettext("aliases are not supported on darwin"),
-                );
+                let msg = match a.form {
+                    AliasForm::Alias => "aliases are not supported on darwin",
+                    AliasForm::Ifunc => "ifunc is not supported on this target",
+                };
+                error(a.pos, &gettextrs::gettext(msg));
             }
             return;
         }
         for a in &declared {
             if let Some(alias) = self.resolve_alias(&declared, a) {
+                // An indirect function is reached the way a symbol from
+                // another module is, as gcc reaches it: through the GOT for
+                // its address, so the dynamic linker's (or the static
+                // startup code's) IRELATIVE binding is what the program
+                // sees. A call already goes through the PLT.
+                if alias.form == AliasForm::Ifunc {
+                    self.module.extern_symbols.insert(alias.name.clone());
+                }
                 self.module.aliases.push(alias);
             }
         }
@@ -2684,6 +2705,12 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// Check one alias, diagnosing it if it cannot be made.
     fn resolve_alias(&self, declared: &[DeclaredAlias], a: &DeclaredAlias) -> Option<SymbolAlias> {
         let shown = crate::arch::lir::undecorated(&a.name);
+        // The dynamic linker binds an indirect function once, in the module
+        // that defines it; there is no weak resolution of one to fall back to.
+        if a.form == AliasForm::Ifunc && a.weak {
+            crate::diag::error_args(a.pos, "weak '{0}' cannot be defined 'ifunc'", &[shown]);
+            return None;
+        }
         // An inline definition emits no symbol, so it and an alias of the
         // same name coexist: the body is there to inline, and the alias is
         // what an out-of-line call reaches (gcc.c-torture `20011119-1`).
@@ -2694,11 +2721,18 @@ impl<'a> super::linearize::Linearizer<'a> {
             .any(|f| f.name == a.name && f.emit)
             || self.module.globals.iter().any(|g| g.name == a.name);
         if defined_here {
-            crate::diag::error_args(
-                a.pos,
-                "'{0}' defined both normally and as 'alias' attribute",
-                &[shown],
-            );
+            match a.form {
+                AliasForm::Alias => crate::diag::error_args(
+                    a.pos,
+                    "'{0}' defined both normally and as 'alias' attribute",
+                    &[shown],
+                ),
+                // gcc counts the `ifunc` declaration as the definition, and
+                // the body as the second one.
+                AliasForm::Ifunc => {
+                    crate::diag::error_args(a.pos, "redefinition of '{0}'", &[shown])
+                }
+            }
             return None;
         }
         let (target, kind) = match self.alias_target(declared, &a.target) {
@@ -2728,13 +2762,63 @@ impl<'a> super::linearize::Linearizer<'a> {
             );
             return None;
         }
+        if a.form == AliasForm::Ifunc {
+            self.check_resolver_type(declared, a);
+        }
         Some(SymbolAlias {
             name: a.name.clone(),
             target,
+            form: a.form,
             is_static: a.is_static,
             weak: a.weak,
             visibility: a.visibility.clone(),
         })
+    }
+
+    /// Check that an `ifunc` resolver returns a pointer to the indirect
+    /// function's type, as gcc does: anything but a pointer is an error,
+    /// and a pointer to anything but that type or `void` a warning.
+    fn check_resolver_type(&self, declared: &[DeclaredAlias], a: &DeclaredAlias) {
+        let undecorated = crate::arch::lir::undecorated;
+        // The resolver as the unit declares it -- the first hop, not the
+        // definition at the end of an alias chain: gcc reads the type off
+        // the name the attribute gives.
+        let ret = match self
+            .module
+            .functions
+            .iter()
+            .find(|f| undecorated(&f.name) == a.target)
+        {
+            Some(f) => Some(f.return_type),
+            None => declared
+                .iter()
+                .find(|d| undecorated(&d.name) == a.target)
+                .and_then(|d| self.types.base_type(d.typ)),
+        };
+        let Some(ret) = ret else {
+            return;
+        };
+        let shown = undecorated(&a.name);
+        let want = self.types.format_pointer_to(a.typ);
+        if self.types.kind(ret) != TypeKind::Pointer {
+            crate::diag::error_args(
+                a.pos,
+                "'ifunc' resolver for '{0}' must return '{1}'",
+                &[shown, &want],
+            );
+            return;
+        }
+        let pointee = self.types.base_type(ret);
+        let fits = pointee.is_none_or(|p| {
+            self.types.kind(p) == TypeKind::Void || self.types.types_compatible(p, a.typ)
+        });
+        if !fits {
+            crate::diag::warning_args(
+                a.pos,
+                "'ifunc' resolver for '{0}' should return '{1}'",
+                &[shown, &want],
+            );
+        }
     }
 
     /// The emitted name `target` refers to, and what kind of symbol it

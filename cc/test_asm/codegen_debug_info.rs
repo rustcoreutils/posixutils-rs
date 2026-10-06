@@ -268,3 +268,61 @@ fn codegen_debug_unshadowed_names_are_plain() {
         );
     }
 }
+
+/// `-fdebug-prefix-map` rewrites every path the debug information records --
+/// the `.file` table, DW_AT_name and DW_AT_comp_dir -- on both targets, and
+/// leaves `__FILE__` alone; `-fmacro-prefix-map` is the reverse.
+#[test]
+fn codegen_debug_prefix_maps_split_by_kind() {
+    let cwd = std::env::current_dir().unwrap();
+    let cwd = cwd.to_str().unwrap();
+    let src = "const char *f = __FILE__;\nint g(void) { return 1; }\n";
+    let debug = [
+        format!("-fdebug-prefix-map={cwd}=/CWD"),
+        "-fdebug-prefix-map=pm_=/S/".into(),
+    ];
+    let macros = ["-fmacro-prefix-map=pm_=/M/"];
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let mut flags: Vec<&str> = vec!["-g"];
+        flags.extend(debug.iter().map(String::as_str));
+        let asm = asm_for_with("pm_dbg", triple, src, &flags);
+        assert!(asm.contains(".file 1 \"/S/dbg.c\""), "{triple}:\n{asm}");
+        assert!(asm.contains(".asciz \"/CWD\""), "{triple}:\n{asm}");
+        assert!(!asm.contains(cwd), "{triple}:\n{asm}");
+        // __FILE__ is untouched by the debug map.
+        assert!(asm.contains("\"pm_dbg.c\""), "{triple}:\n{asm}");
+
+        let mut flags: Vec<&str> = vec!["-g"];
+        flags.extend(macros);
+        let asm = asm_for_with("pm_dbg", triple, src, &flags);
+        assert!(asm.contains("\"/M/dbg.c\""), "{triple}:\n{asm}");
+        assert!(asm.contains(".file 1 \"pm_dbg.c\""), "{triple}:\n{asm}");
+    }
+}
+
+/// A path holding `"` or `\` is escaped wherever it is written into the
+/// assembly -- the `.file` table, DW_AT_name, DW_AT_comp_dir -- and in the
+/// literal `__FILE__` makes. Unescaped, the `"` ended the `.file` string
+/// early and the assembler rejected the line.
+#[test]
+fn codegen_debug_paths_are_escaped() {
+    let cwd = std::env::current_dir().unwrap();
+    let cwd = cwd.to_str().unwrap();
+    let src = "const char *f = __FILE__;\nint g(void) { return 1; }\n";
+    let map = format!("-fdebug-prefix-map={cwd}=/c\"w\\d");
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("q\"d\\e/f", triple, src, &["-g", &map]);
+        let file = r#"q\"d\\e/f.c"#;
+        assert!(
+            asm.contains(&format!(".file 1 \"{file}\"")),
+            "{triple}:\n{asm}"
+        );
+        // DW_AT_name, and the `__FILE__` literal.
+        assert!(
+            asm.contains(&format!(".asciz \"{file}\"")),
+            "{triple}:\n{asm}"
+        );
+        assert!(asm.contains(r#".asciz "/c\"w\\d""#), "{triple}:\n{asm}");
+        assert!(!asm.contains("q\"d\\e"), "{triple}: unescaped path:\n{asm}");
+    }
+}

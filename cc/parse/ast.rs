@@ -857,10 +857,10 @@ pub enum ExprKind {
 
     /// GNU label address: `&&label`, of type `void *`.
     ///
-    /// The label need not be declared yet -- taking its address before the
-    /// labelled statement is the usual shape -- so this holds the name and is
-    /// resolved when the function is linearized.
-    LabelAddr(StringId),
+    /// The label need not be defined yet -- taking its address before the
+    /// labelled statement is the usual shape -- so this holds the label's
+    /// identity and the block is found when the function is linearized.
+    LabelAddr(LabelId),
 
     /// Initializer list: {1, 2, 3} or {.x = 1, [0] = 2}
     InitList {
@@ -2092,11 +2092,49 @@ pub struct AsmOperand {
     pub expr: Expr,
 }
 
+/// Which declaration of a label name a label or a jump means.
+///
+/// A label is the function's unless a GNU `__label__` declaration at the
+/// head of an enclosing block or statement expression names it, which makes
+/// it local to that block and shadows any outer label of the same name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LabelScope {
+    /// An ordinary label, whose scope is the whole function (C17 6.2.1p3).
+    Function,
+    /// A label declared by `__label__`. Each declaration gets its own
+    /// number, unique within the translation unit, so two expansions of one
+    /// macro declare two different labels.
+    Local(u32),
+}
+
+/// A label's identity: its spelling and the declaration it resolves to.
+///
+/// Resolved by the parser, which alone sees which `__label__` declarations
+/// are in force; every later consumer keys labels by this rather than by
+/// the spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct LabelId {
+    /// The label as written.
+    pub name: StringId,
+    /// Which declaration of `name` it is.
+    pub scope: LabelScope,
+}
+
+impl LabelId {
+    /// An ordinary function-scope label.
+    pub fn function(name: StringId) -> Self {
+        LabelId {
+            name,
+            scope: LabelScope::Function,
+        }
+    }
+}
+
 /// One label of a [`Stmt::Labeled`] (C17 6.8.1).
 #[derive(Debug, Clone)]
 pub enum Label {
     /// `name:`, the target of a `goto`.
-    Named { name: StringId, pos: Position },
+    Named { label: LabelId, pos: Position },
 
     /// Case label: `case expr:`, or the GNU range `case lo ... hi:`.
     ///
@@ -2161,7 +2199,7 @@ pub enum Stmt {
     Continue(Position),
 
     /// Goto statement: goto label;
-    Goto { name: StringId, pos: Position },
+    Goto { label: LabelId, pos: Position },
 
     /// GNU computed goto: `goto *expr;`. The operand is a label address
     /// produced by [`ExprKind::LabelAddr`], though C says only that it is a
@@ -2205,7 +2243,7 @@ pub enum Stmt {
         /// Clobber list: registers and special values ("memory", "cc")
         clobbers: Vec<String>,
         /// Goto labels for asm goto (4th colon): labels the asm can jump to
-        goto_labels: Vec<StringId>,
+        goto_labels: Vec<LabelId>,
     },
 }
 
@@ -2590,11 +2628,36 @@ pub struct SymbolAttrs {
     /// `visibility("...")`: ELF visibility, verbatim -- "default", "hidden",
     /// "protected" or "internal".
     pub visibility: Option<String>,
-    /// `alias("target")`: this declaration is not a reference to storage
-    /// defined elsewhere but a second name for `target`, which this
+    /// `alias("target")` or `ifunc("resolver")`: this declaration is not a
+    /// reference to storage defined elsewhere but a name for a symbol this
     /// translation unit defines. Becomes an `ir::SymbolAlias`, never a
     /// definition or an extern reference of its own.
-    pub alias: Option<String>,
+    pub alias: Option<AliasAttr>,
+    /// `cleanup(fn)`: the function to call with the variable's address when
+    /// it leaves scope. Only ever read off a pending declarator: the parser
+    /// turns it into [`InitDeclarator::cleanup`] for an automatic variable
+    /// and drops it with a warning from anything else, so no symbol is ever
+    /// emitted carrying it.
+    pub cleanup: Option<SymbolId>,
+}
+
+/// How a name declared with `alias` or `ifunc` is bound to the symbol its
+/// attribute names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AliasForm {
+    /// `alias("target")`: the same address as `target`.
+    Alias,
+    /// `ifunc("resolver")`: a GNU indirect function, bound at load time to
+    /// whatever `resolver` returns. ELF only.
+    Ifunc,
+}
+
+/// An `alias("target")` or `ifunc("resolver")` request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasAttr {
+    /// The symbol the attribute names, as written.
+    pub target: String,
+    pub form: AliasForm,
 }
 
 impl SymbolAttrs {
@@ -2617,6 +2680,9 @@ impl SymbolAttrs {
         }
         if other.alias.is_some() {
             self.alias = other.alias.clone();
+        }
+        if other.cleanup.is_some() {
+            self.cleanup = other.cleanup;
         }
     }
 }
@@ -2649,6 +2715,10 @@ pub struct InitDeclarator {
     /// __attribute__((__pure__));` is the only thing that says `strlen`
     /// writes nothing.
     pub fn_effect: MemEffect,
+    /// `__attribute__((cleanup(fn)))` on an automatic variable: the call
+    /// `fn(&var)`, already checked as any call is, which the linearizer
+    /// emits on every path out of the variable's scope.
+    pub cleanup: Option<Expr>,
     /// Source position of the declarator itself.
     ///
     /// Recorded independently of `init` so that a declaration with no
@@ -2666,6 +2736,7 @@ impl Declaration {
             declarators: vec![InitDeclarator {
                 symbol_attrs: Default::default(),
                 fn_effect: Default::default(),
+                cleanup: None,
                 pos: Position::default(),
                 symbol,
                 typ,
@@ -2797,9 +2868,30 @@ pub struct FunctionAttrs {
     /// `__attribute__((noreturn))`. What a call site reads is the function
     /// *type*'s `noreturn`, which the declarator is given from this.
     pub noreturn: bool,
+    /// `__attribute__((target("...")))`: the ISA this function alone is
+    /// compiled for, relative to the translation unit's.
+    pub target: Option<crate::target::IsaRequest>,
+    /// `__attribute__((target_clones(...)))`: the versions besides
+    /// `default` this function is compiled as, dispatched by a resolver.
+    /// `None` when there is nothing to dispatch.
+    pub clones: Option<crate::target_attr::TargetClones>,
 }
 
 impl FunctionAttrs {
+    /// Whether a definition with these attributes is a GNU inline-only body:
+    /// `extern inline` under GNU inline semantics, selected by the attribute
+    /// or by `-fgnu89-inline`. It emits nothing and is there to be inlined.
+    ///
+    /// Only the definition's own specifiers count, as in gcc: an `extern`
+    /// on another declaration of the name does not make a plain `inline`
+    /// definition inline-only, and an `extern inline` declaration does not
+    /// make the definition after it one either. `storage` is the
+    /// definition's storage-class specifiers and `inline`.
+    pub fn gnu_inline_only(&self, storage: TypeModifiers) -> bool {
+        (self.gnu_inline || crate::builtins::gnu89_inline())
+            && storage.contains(TypeModifiers::EXTERN | TypeModifiers::INLINE)
+    }
+
     /// Fold `other` in, letting a present attribute win.
     ///
     /// Attributes reach a function definition from more than one place --
@@ -2825,6 +2917,13 @@ impl FunctionAttrs {
         // wins, as it does for an object.
         self.align = self.align.max(other.align);
         self.noreturn |= other.noreturn;
+        // A later declaration's ISA request replaces an earlier one's.
+        if other.target.is_some() {
+            self.target = other.target.clone();
+        }
+        if other.clones.is_some() {
+            self.clones = other.clones.clone();
+        }
     }
 }
 

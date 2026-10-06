@@ -889,6 +889,7 @@ mod tests {
         module.aliases.push(super::super::SymbolAlias {
             name: "b".to_string(),
             target: "a".to_string(),
+            form: crate::parse::ast::AliasForm::Alias,
             is_static: false,
             weak: false,
             visibility: None,

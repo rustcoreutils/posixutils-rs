@@ -109,6 +109,9 @@ Supported:
 - Variably modified types everywhere C17 admits them, including a `typedef` of
   one (6.7.7), whose extents are evaluated at the typedef rather than at each use
 - `-fverbose-asm`, annotating each instruction with the source names it came from
+- `-fdebug-prefix-map=OLD=NEW`, `-fmacro-prefix-map=OLD=NEW` and
+  `-ffile-prefix-map=OLD=NEW`, with gcc's rules: the last matching option
+  wins, `OLD` is a plain string prefix, and the argument splits at its last `=`
 - `-fpermissive`, downgrading to warnings the handful of C17 constraints gcc
   warns about rather than refusing: pre-C99 implicit `int`, an implicit
   function declaration, a `return` whose value-ness does not match the

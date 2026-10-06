@@ -14,6 +14,7 @@
 //
 
 mod gcc_flags;
+mod prefix_map;
 
 use crate::common::{create_c_file, run_c17};
 use std::path::{Path, PathBuf};
@@ -2121,6 +2122,68 @@ fn driver_fgnu89_inline_flips_which_inline_emits_a_body() {
                 "{target} {flags:?}: `{absent}` should have none:\n{}",
                 r.stdout
             );
+        }
+    }
+}
+
+/// Under `-fgnu89-inline`, as under the attribute, an `extern inline` body
+/// is inline-only: the real definition may follow it, and nothing else may
+/// follow a definition. Whether a definition is inline-only is read off its
+/// own specifiers alone, so an `extern` elsewhere leaves a plain `inline`
+/// definition the real one. Each case is what gcc does.
+#[test]
+fn driver_fgnu89_inline_definition_order() {
+    // (name, source, Some(the error) or None for a unit that defines `g`)
+    let cases: &[(&str, &str, Option<&str>)] = &[
+        (
+            "gnu89_inline_only_then_real",
+            "extern inline int g(void) { return 1; }\nint g(void) { return 0; }\n",
+            None,
+        ),
+        (
+            "gnu89_inline_only_then_inline",
+            "extern inline int g(void) { return 1; }\ninline int g(void) { return 0; }\n",
+            None,
+        ),
+        (
+            "gnu89_extern_decl_then_inline",
+            "extern int g(void);\ninline int g(void) { return 0; }\n",
+            None,
+        ),
+        (
+            "gnu89_inline_then_extern_inline_decl",
+            "inline int g(void) { return 0; }\nextern inline int g(void);\n",
+            None,
+        ),
+        (
+            "gnu89_real_then_inline_only",
+            "int g(void) { return 0; }\nextern inline int g(void) { return 1; }\n",
+            Some("redefinition of 'g'"),
+        ),
+        (
+            "gnu89_two_inline_only",
+            "extern inline int g(void) { return 1; }\nextern inline int g(void) { return 1; }\n",
+            Some("redefinition of 'g'"),
+        ),
+    ];
+    for (name, body, error) in cases {
+        let src = create_c_file(name, &format!("{body}int main(void) {{ return g(); }}\n"));
+        let path = src.path().to_string_lossy().to_string();
+        let r = run_c17(&["-fgnu89-inline", "-S", "-o", "-", &path]);
+        match error {
+            Some(msg) => assert!(
+                !r.success && r.stderr.contains(msg),
+                "{name}: expected `{msg}`:\n{}",
+                r.stderr
+            ),
+            None => {
+                assert!(r.success, "{name} should compile:\n{}", r.stderr);
+                assert!(
+                    defines_label(&r.stdout, "g"),
+                    "{name}: `g` should have an out-of-line body:\n{}",
+                    r.stdout
+                );
+            }
         }
     }
 }

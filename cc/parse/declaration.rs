@@ -227,12 +227,15 @@ impl<'a> SpecifierTally<'a> {
 /// specifiers it may hold.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpecContext {
-    /// A declaration, including a parameter declaration (C17 6.7p1): every
-    /// specifier. A parameter may carry no storage class but `register`
+    /// A declaration (C17 6.7p1): every specifier, and gcc's `__auto_type`.
+    Declaration,
+    /// A parameter declaration, in a prototype or a K&R declaration list:
+    /// every specifier but `__auto_type`, which has no initializer to take
+    /// a type from. A parameter may carry no storage class but `register`
     /// (6.7.6.3p2), but that diagnostic names the parameter, so it is made
     /// once the declarator has supplied the name
     /// ([`Parser::check_parameter_specifiers`]).
-    Declaration,
+    Parameter,
     /// A structure or union member (6.7.2.1p1): a specifier-qualifier list,
     /// which admits an alignment specifier but no storage class or function
     /// specifier.
@@ -240,6 +243,14 @@ pub(crate) enum SpecContext {
     /// A type-name (6.7.7p1): a specifier-qualifier list, and no alignment
     /// specifier either (6.7.5p2).
     TypeName,
+}
+
+impl SpecContext {
+    /// Whether the list is a declaration's, which admits storage-class and
+    /// function specifiers and has a declarator to name.
+    fn is_declaration(self) -> bool {
+        matches!(self, SpecContext::Declaration | SpecContext::Parameter)
+    }
 }
 
 /// The declaration a redeclaration check is for.
@@ -274,6 +285,11 @@ pub(crate) struct DeclSpecifiers {
     /// `typeof(int[n])` or `typeof(v)` -- outermost-first. They cannot ride on the type:
     /// `int[n]`, `int[m]` and `int[]` all intern to one `TypeId`.
     pub(crate) vm_dims: Vec<Expr>,
+    /// Where `__auto_type` was written, if it was: the declarator takes the
+    /// type of its initializer, and `ty` holds only the qualifiers and
+    /// specifiers written beside it. Only a [`SpecContext::Declaration`]
+    /// list admits one, so no other consumer meets it.
+    pub(crate) inferred: Option<Position>,
 }
 
 /// A type specifier that names a complete type by itself.
@@ -863,6 +879,7 @@ impl<'a> Parser<'a> {
         // loop below merely overwrites `base_kind`, so the specifiers are
         // recorded here and checked once the list is complete.
         let mut tally = SpecifierTally::default();
+        let mut inferred: Option<Position> = None;
 
         // Skip any leading __attribute__
         self.skip_extensions();
@@ -1209,14 +1226,25 @@ impl<'a> Parser<'a> {
                     resolved = Some(Resolved::Id(self.types.without_decl_specifiers(typ)));
                     vm_dims = dims;
                 }
+                crate::kw::GNU_AUTO_TYPE => {
+                    // A data type for the tally, so `__auto_type int` and
+                    // `long __auto_type` draw gcc's 6.7.2p2 diagnostics -- and
+                    // where it is refused, no missing type specifier is
+                    // reported after it.
+                    tally.note_data_type("__auto_type", pos);
+                    if self.reject_auto_type_in(ctx) {
+                        continue;
+                    }
+                    inferred.get_or_insert(pos);
+                    self.advance();
+                }
                 crate::kw::ENUM | crate::kw::STRUCT | crate::kw::UNION => {
                     // Nothing written ahead of it, so a `;` right after makes
                     // this the declaration `struct S;` (C17 6.7.2.3p7). A
                     // qualifier or storage class ahead of it makes an empty
                     // declaration that redeclares nothing.
-                    let alone = ctx == SpecContext::Declaration
-                        && modifiers.is_empty()
-                        && !tally.has_type_specifier();
+                    let alone =
+                        ctx.is_declaration() && modifiers.is_empty() && !tally.has_type_specifier();
                     tally.note_data_type(idents.get(name_id), pos);
                     let tag_start = self.pos;
                     let parsed = if name_id == crate::kw::ENUM {
@@ -1354,7 +1382,7 @@ impl<'a> Parser<'a> {
 
         // A member or a type-name has no `;`-only form and no identifier
         // list: nothing but a missing type specifier leaves it without one.
-        if ctx != SpecContext::Declaration {
+        if !ctx.is_declaration() {
             self.check_implicit_int(explicit, start);
         }
 
@@ -1384,6 +1412,7 @@ impl<'a> Parser<'a> {
             id,
             explicit,
             vm_dims,
+            inferred,
         })
     }
 
@@ -1392,7 +1421,7 @@ impl<'a> Parser<'a> {
     /// Reported in gcc's words and skipped, so the list recovers as if it
     /// had not been written. Answers whether it did.
     fn reject_outside_declaration(&mut self, ctx: SpecContext) -> bool {
-        if ctx == SpecContext::Declaration {
+        if ctx.is_declaration() {
             return false;
         }
         let spelled = self.current_ident().map_or("", |id| self.idents.get(id));
@@ -1401,6 +1430,26 @@ impl<'a> Parser<'a> {
             "expected specifier-qualifier-list before '{0}'",
             &[spelled],
         );
+        self.advance();
+        true
+    }
+
+    /// Refuse `__auto_type` anywhere but an ordinary declaration, in gcc's
+    /// words, and step over it. A parameter has no initializer to take a type
+    /// from, and gcc does not take the keyword for a specifier in a
+    /// specifier-qualifier list at all. Answers whether it did.
+    fn reject_auto_type_in(&mut self, ctx: SpecContext) -> bool {
+        match ctx {
+            SpecContext::Declaration => return false,
+            SpecContext::Parameter => diag::error(
+                self.current_pos(),
+                "expected ';', ',' or ')' before '__auto_type'",
+            ),
+            SpecContext::Member | SpecContext::TypeName => diag::error(
+                self.current_pos(),
+                "expected specifier-qualifier-list before '__auto_type'",
+            ),
+        }
         self.advance();
         true
     }
@@ -1489,6 +1538,7 @@ impl Parser<'_> {
         declarators.push(InitDeclarator {
             symbol_attrs: Default::default(),
             fn_effect: MemEffect::Unknown,
+            cleanup: None,
             symbol: id,
             typ,
             storage_class: TypeModifiers::TYPEDEF,

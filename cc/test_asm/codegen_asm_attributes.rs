@@ -383,3 +383,76 @@ int *use(void) { return &u; }
         }
     }
 }
+
+/// The directives an indirect function is made of, as gcc writes them on
+/// ELF: `.globl` unless static, visibility, `.type @gnu_indirect_function`,
+/// then `.set` naming the resolver. A static resolver nothing else names
+/// survives the optimizer. Calls go through the PLT and the address through
+/// the GOT, so what the program sees is the binding the resolver chose.
+#[test]
+fn codegen_ifunc_attribute_asm() {
+    let src = r#"
+static int impl(int x) { return x; }
+static void *res(void) { return (void *)impl; }
+int f(int) __attribute__((ifunc("res")));
+static int g(int) __attribute__((ifunc("res")));
+int h(int) __attribute__((ifunc("res"), visibility("hidden")));
+int call(void) { return f(1) + g(2) + h(3); }
+void *addr(void) { return (void *)f; }
+"#;
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("ifunc_asm", triple, src, &["-O2"]);
+        let lines: Vec<&str> = asm.lines().map(str::trim).collect();
+        let at = |want: &str| {
+            lines
+                .iter()
+                .position(|l| *l == want)
+                .unwrap_or_else(|| panic!("{triple}: missing {want:?}:\n{asm}"))
+        };
+        // In gcc's order: binding, visibility, type, value.
+        let order = [".globl f", ".type f, @gnu_indirect_function", ".set f, res"];
+        assert!(
+            order.windows(2).all(|w| at(w[0]) < at(w[1])),
+            "{triple}:\n{asm}"
+        );
+        let order = [
+            ".globl h",
+            ".hidden h",
+            ".type h, @gnu_indirect_function",
+            ".set h, res",
+        ];
+        assert!(
+            order.windows(2).all(|w| at(w[0]) < at(w[1])),
+            "{triple}:\n{asm}"
+        );
+        at(".type g, @gnu_indirect_function");
+        at(".set g, res");
+        assert!(
+            !lines.contains(&".globl g"),
+            "{triple}: static g exported:\n{asm}"
+        );
+        // The resolver is kept, and stays local.
+        at("res:");
+        assert!(!lines.contains(&".globl res"), "{triple}:\n{asm}");
+        // Never a body or a `.size` for the indirect function itself.
+        assert!(!lines.contains(&"f:"), "{triple}:\n{asm}");
+        assert!(!asm.contains(".size f,"), "{triple}:\n{asm}");
+
+        let call = body_of(&asm, "call");
+        let addr = body_of(&asm, "addr");
+        if triple == X86_64_LINUX {
+            for want in ["call f@PLT", "call g@PLT", "call h@PLT"] {
+                assert!(call.contains(want), "{triple}: no {want:?}:\n{call}");
+            }
+            assert!(addr.contains("f@GOTPCREL(%rip)"), "{triple}:\n{addr}");
+        } else {
+            for want in ["bl f", "bl g", "bl h"] {
+                assert!(
+                    call.lines().any(|l| l.trim() == want),
+                    "{triple}: no {want:?}:\n{call}"
+                );
+            }
+            assert!(addr.contains(":got:f"), "{triple}:\n{addr}");
+        }
+    }
+}

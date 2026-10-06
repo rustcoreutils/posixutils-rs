@@ -199,6 +199,17 @@ fn cpu_test(supports: bool, name: &str) -> Option<(CpuWord, BinaryOp, u32)> {
     }
 }
 
+/// Where `__builtin_cpu_supports(name)` looks, for code built without the
+/// parser -- a `target_clones` resolver: the runtime object, the byte offset
+/// of the word in it, and the feature's mask. `None` for a name gcc rejects.
+pub(crate) fn cpu_feature_location(name: &str) -> Option<(&'static str, i64, u32)> {
+    let (word, _, mask) = cpu_test(true, name)?;
+    Some(match word {
+        CpuWord::Features2(i) => ("__cpu_features2", 4 * i64::from(i), mask),
+        _ => ("__cpu_model", 12, mask),
+    })
+}
+
 impl Parser<'_> {
     /// `__builtin_cpu_init`, `__builtin_cpu_supports` and `__builtin_cpu_is`.
     pub(super) fn parse_cpu_builtin(
@@ -475,6 +486,23 @@ mod tests {
             ("graniterapids", S, 30), ("graniterapids-d", S, 31),
         ]
     };
+
+    /// A resolver reads the words gcc's resolvers read: `sse4.2` at byte 13
+    /// of `__cpu_model` (bit 0 of its high byte), `x86-64-v2` in the third
+    /// word of `__cpu_features2`.
+    #[test]
+    fn cpu_feature_location_matches_gcc_resolvers() {
+        assert_eq!(
+            cpu_feature_location("sse4.2"),
+            Some(("__cpu_model", 12, 1 << 8))
+        );
+        assert_eq!(cpu_feature_location("popcnt"), Some(("__cpu_model", 12, 4)));
+        assert_eq!(
+            cpu_feature_location("x86-64-v2"),
+            Some(("__cpu_features2", 8, 1))
+        );
+        assert_eq!(cpu_feature_location("nosuch"), None);
+    }
 
     /// Every feature gcc 13 knows tests the bit gcc's code tests, and the
     /// table names nothing gcc rejects.

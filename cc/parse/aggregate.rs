@@ -757,8 +757,13 @@ impl Parser<'_> {
                 }
 
                 // VLAs are not allowed in struct members
-                let ParsedDeclarator { name, typ, vla, .. } =
-                    self.parse_declarator(member_base_type_id, DeclaratorContext::Declaration)?;
+                let ParsedDeclarator {
+                    name,
+                    typ,
+                    vla,
+                    pos: member_pos,
+                    ..
+                } = self.parse_declarator(member_base_type_id, DeclaratorContext::Declaration)?;
 
                 // C99 6.7.5.2: VLAs cannot be members of structures or unions
                 if !vla.is_empty() {
@@ -796,6 +801,7 @@ impl Parser<'_> {
 
                 // Skip any __attribute__ after member declaration
                 self.skip_extensions();
+                self.drop_pending_cleanup(member_pos);
 
                 // A member's type attributes are the member's: consuming
                 // them here sizes the member, and keeps a `mode(M)` from

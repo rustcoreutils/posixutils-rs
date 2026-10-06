@@ -307,8 +307,47 @@ thread_local! {
     /// `-fpermissive`; see [`set_permissive`].
     static PERMISSIVE: Cell<bool> = const { Cell::new(false) };
 
+    /// `-pedantic` and its relatives; see [`Pedantic`].
+    static PEDANTIC: Cell<Pedantic> = const { Cell::new(Pedantic::OFF) };
+
     /// Where diagnostics go when not to stderr; see [`capture_diagnostics`].
     static CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+
+    /// The diagnostics given so far inside [`each_once`], which gives no
+    /// diagnostic twice; `None` outside it.
+    static GIVEN: RefCell<Option<std::collections::HashSet<DiagKey>>> =
+        const { RefCell::new(None) };
+}
+
+/// What makes two diagnostics the same one: severity, place and text.
+type DiagKey = (bool, u16, u32, u16, String);
+
+/// Run `f`, giving each distinct diagnostic it reports once, however many
+/// times it is reported: for work that lowers one piece of source several
+/// times, such as the versions of a `target_clones` body. A repeat is neither
+/// printed nor counted; the first report already counted it.
+pub fn each_once<R>(f: impl FnOnce() -> R) -> R {
+    let outer = GIVEN.replace(Some(std::collections::HashSet::new()));
+    let result = f();
+    GIVEN.set(outer);
+    result
+}
+
+/// Whether this diagnostic was given before inside [`each_once`]; the first
+/// time, it is recorded.
+fn given_before(level: DiagLevel, pos: Position, msg: &str) -> bool {
+    GIVEN.with_borrow_mut(|given| {
+        given.as_mut().is_some_and(|given| {
+            let key = (
+                level == DiagLevel::Error,
+                pos.stream,
+                pos.line,
+                pos.col,
+                msg.to_string(),
+            );
+            !given.insert(key)
+        })
+    })
 }
 
 /// Suppress warning output for the rest of this thread's compilation (`-w`).
@@ -391,6 +430,87 @@ pub fn permissive_error(pos: Position, msg: &str) {
     } else {
         error(pos, msg);
     }
+}
+
+/// The `-pedantic` switch: whether the diagnostics gcc gives only under
+/// `-Wpedantic` are given, and whether as errors.
+///
+/// These are the constraint violations gcc accepts in silence as GNU
+/// extensions -- a function pointer against `void *`, `int f(...)` -- so they
+/// are off by default here too. Every one goes through [`pedwarn`], which
+/// asks this and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pedantic {
+    /// `-pedantic` or `-Wpedantic`, and not a later `-Wno-pedantic`.
+    enabled: bool,
+    /// `-pedantic-errors`. gcc keeps it through a later `-Wno-pedantic`,
+    /// which silences the diagnostics outright, and a later `-Wpedantic`
+    /// brings them back as errors.
+    errors: bool,
+}
+
+impl Pedantic {
+    /// gcc's default: no pedantic diagnostics at all.
+    pub const OFF: Pedantic = Pedantic {
+        enabled: false,
+        errors: false,
+    };
+
+    /// Fold one `-W<name>` warning option into the switch, in command-line
+    /// order, as gcc does: the last of `-Wpedantic` and `-Wno-pedantic` wins.
+    /// The driver passes `-pedantic` as the name `pedantic` and
+    /// `-pedantic-errors` as `pedantic-errors`. Answers `None` for any other
+    /// name.
+    pub fn after(self, name: &str) -> Option<Pedantic> {
+        match name {
+            "pedantic" => Some(Pedantic {
+                enabled: true,
+                ..self
+            }),
+            "pedantic-errors" => Some(Pedantic {
+                enabled: true,
+                errors: true,
+            }),
+            "no-pedantic" => Some(Pedantic {
+                enabled: false,
+                ..self
+            }),
+            _ => None,
+        }
+    }
+
+    /// The switch after every `-W<name>` in `names`, in order.
+    pub fn from_warning_options<'a>(names: impl IntoIterator<Item = &'a str>) -> Pedantic {
+        names
+            .into_iter()
+            .fold(Pedantic::OFF, |p, name| p.after(name).unwrap_or(p))
+    }
+}
+
+/// Set the `-pedantic` switch for the rest of this thread's compilation.
+pub fn set_pedantic(p: Pedantic) {
+    PEDANTIC.set(p);
+}
+
+/// Report a constraint violation gcc diagnoses only under `-pedantic`: nothing
+/// by default, a warning under `-pedantic` or `-Wpedantic`, an error under
+/// `-pedantic-errors`.
+pub fn pedwarn(pos: Position, msg: &str) {
+    let p = PEDANTIC.get();
+    if !p.enabled {
+        return;
+    }
+    let level = if p.errors {
+        DiagLevel::Error
+    } else {
+        DiagLevel::Warning
+    };
+    do_diag(level, pos, msg);
+}
+
+/// [`pedwarn`] with a translatable template; see [`warning_args`].
+pub fn pedwarn_args(pos: Position, template: &str, args: &[&str]) {
+    pedwarn(pos, &gettext_args(template, args));
 }
 
 pub fn has_error() -> u32 {
@@ -487,6 +607,9 @@ fn prettify_path(path: &str) -> String {
 }
 
 fn do_diag(level: DiagLevel, pos: Position, msg: &str) {
+    if given_before(level, pos, msg) {
+        return;
+    }
     // Track errors/warnings
     match level {
         DiagLevel::Error => {
@@ -584,6 +707,30 @@ pub fn error_plural(pos: Position, singular: &str, plural: &str, n: usize, args:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Inside `each_once` a repeated diagnostic is neither printed nor
+    /// counted, a different one still is, and outside it repeats are given
+    /// again.
+    #[test]
+    fn each_once_gives_a_diagnostic_once() {
+        clear_streams();
+        let stream = init_stream("once.c");
+        let (a, b) = (Position::new(stream, 3, 7), Position::new(stream, 4, 1));
+        reset_counts();
+        capture_diagnostics();
+        each_once(|| {
+            for _ in 0..3 {
+                error(a, "bad goto");
+                warning(b, "odd");
+            }
+            error(b, "bad goto");
+        });
+        error(a, "bad goto");
+        let lines = take_captured_diagnostics();
+        assert_eq!(error_count(), 3, "{lines:?}");
+        assert_eq!(warning_count(), 1, "{lines:?}");
+        assert_eq!(lines.len(), 4, "{lines:?}");
+    }
 
     #[test]
     fn test_position_display() {

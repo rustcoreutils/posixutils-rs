@@ -183,6 +183,22 @@ fn test_predefined_arch() {
     assert!(pp.is_defined("__x86_64__") || pp.is_defined("__aarch64__"));
 }
 
+/// The version macros spell `GNUC_VERSION`, which the driver's
+/// `-dumpversion` and `-dumpfullversion` print.
+#[test]
+fn test_predefined_gnuc_version_is_gnuc_version() {
+    let (tokens, idents) =
+        preprocess_str("__GNUC__ __GNUC_MINOR__ __GNUC_PATCHLEVEL__ __VERSION__");
+    let strs = get_token_strings(&tokens, &idents);
+    assert_eq!(strs[..3], GNUC_VERSION);
+    let version = format!(
+        "\"c17 {} (gcc compatible {})\"",
+        env!("CARGO_PKG_VERSION"),
+        GNUC_VERSION.join(".")
+    );
+    assert_eq!(strs[3], version);
+}
+
 #[test]
 fn test_line_macro() {
     let (tokens, _idents) = preprocess_str("__LINE__");
@@ -914,6 +930,42 @@ fn test_base_file_macro() {
     let (tokens, _idents) = preprocess_str("__BASE_FILE__");
     // Should have a string token
     assert!(tokens.iter().any(|t| t.typ == TokenType::String));
+}
+
+/// `-fmacro-prefix-map` rewrites `__FILE__`, `__BASE_FILE__`, and a name a
+/// `#line` gave, by the last matching map; the payload is the mapped name's
+/// bytes, one `char` each, for both macros.
+#[test]
+fn test_file_macros_follow_the_macro_prefix_map() {
+    let mut map = crate::prefix_map::PrefixMap::default();
+    map.push("/src", "/OLD");
+    map.push("/src/d\u{e9}", "/N\u{e9}");
+    let config = PreprocessConfig {
+        macro_prefix_map: map,
+        ..Default::default()
+    };
+    let input = "__FILE__ __BASE_FILE__\n#line 9 \"/src/x.c\"\n__FILE__ \"/src/y.c\"\n";
+    let mut idents = IdentTable::new();
+    let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
+    let (out, _) = preprocess_collecting(
+        tokens,
+        &Target::host(),
+        &mut idents,
+        "/src/d\u{e9}/t.c",
+        &config,
+    );
+    let payloads: Vec<String> = out
+        .iter()
+        .filter_map(|t| match &t.value {
+            TokenValue::String(s) => Some(payload_text(s)),
+            _ => None,
+        })
+        .collect();
+    // An ordinary string literal is not a file name and is left alone.
+    assert_eq!(
+        payloads,
+        ["/N\u{e9}/t.c", "/N\u{e9}/t.c", "/OLD/x.c", "/src/y.c"]
+    );
 }
 
 // Tests for ternary operator in #if expressions
@@ -1693,6 +1745,35 @@ fn test_line_directive_sets_file() {
         strs.contains(&"fake.c".to_string()),
         "Expected __FILE__ to be 'fake.c', got {:?}",
         strs
+    );
+}
+
+/// A `#line` or linemarker name is a string literal, so its escapes are
+/// interpreted; `__FILE__` spells the name back with `"` and `\` escaped,
+/// as `__BASE_FILE__` does the main file's.
+#[test]
+fn test_file_macros_escape_quote_and_backslash() {
+    let input = "__BASE_FILE__\n#line 7 \"a\\\\b\\\"c\\x41\"\n__FILE__\n# 9 \"x\\\\y\"\n__FILE__\n";
+    let mut idents = IdentTable::new();
+    let tokens = Tokenizer::new(input.as_bytes(), 0, &mut idents).tokenize();
+    let (out, _) = preprocess_collecting(
+        tokens,
+        &Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux),
+        &mut idents,
+        "q\"d\\e/f.c",
+        &PreprocessConfig::default(),
+    );
+    let spelled: Vec<String> = out
+        .iter()
+        .filter_map(|t| match &t.value {
+            TokenValue::String(s) => Some(payload_text(s)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        spelled,
+        ["q\\\"d\\\\e/f.c", "a\\\\b\\\"cA", "x\\\\y"],
+        "file-name macros must spell their names escaped"
     );
 }
 

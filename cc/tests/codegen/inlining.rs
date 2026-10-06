@@ -1909,3 +1909,65 @@ float probe(void) { struct P q = {1, 2, 3}; return sum(q); }
         "expected the inlined parameter copy to reach offset 8 at all:\n{ir}"
     );
 }
+
+/// A gnu_inline `extern inline` body followed by the unit's real definition
+/// of the same name: the real one is the function, at every level and
+/// through its address. Both bodies reached the module under one name, and
+/// the inliner took the first -- the inline-only one -- from -O1 up.
+#[test]
+fn codegen_real_definition_wins_over_gnu_inline_body() {
+    compile_and_run_everywhere(
+        "gnu_inline_then_real",
+        r#"
+/* A gnu_inline `extern inline` body is only an inlining hint; the
+   translation unit's real definition of the same name is the function. gcc
+   calls (or inlines) the real one here at every level. */
+extern inline __attribute__((gnu_inline)) int f(void) { return 1; }
+int f(void) { return 0; }
+
+/* The address names the real definition too. */
+static int (*volatile pf)(void) = f;
+
+int main(void)
+{
+    if (f() != 0) return 1;
+    if (pf() != 0) return 3;
+    return 0;
+}
+"#,
+    );
+}
+
+/// Under GNU inline semantics only the definition's own `extern` makes it
+/// inline-only. A plain `inline` gnu_inline definition is the real one even
+/// with an `extern` declaration before it or after it, so its body is
+/// emitted: gcc links all three of these calls against it.
+#[test]
+fn codegen_gnu_inline_definition_reads_only_its_own_extern() {
+    compile_and_run_everywhere(
+        "gnu_inline_own_extern",
+        r#"
+extern int before(void);
+inline __attribute__((gnu_inline)) int before(void) { return 1; }
+
+inline __attribute__((gnu_inline)) int after(void) { return 2; }
+extern int after(void);
+
+/* The inline-only body, then the real definition written `inline`. */
+extern inline __attribute__((gnu_inline)) int both(void) { return 9; }
+inline __attribute__((gnu_inline)) int both(void) { return 3; }
+
+static int (*volatile pb)(void) = before;
+static int (*volatile pa)(void) = after;
+static int (*volatile pboth)(void) = both;
+
+int main(void)
+{
+    if (before() != 1 || pb() != 1) return 1;
+    if (after() != 2 || pa() != 2) return 2;
+    if (both() != 3 || pboth() != 3) return 3;
+    return 0;
+}
+"#,
+    );
+}

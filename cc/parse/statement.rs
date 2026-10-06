@@ -9,9 +9,10 @@
 // Statement parsing (C17 6.8) and GNU statement expressions
 //
 
-use super::ast::{BlockItem, Expr, ExprKind, ForInit, Label, Stmt};
+use super::ast::{BlockItem, Expr, ExprKind, ForInit, Label, LabelId, LabelScope, Stmt};
 use super::parser::{ParseError, ParseResult, Parser};
 use crate::diag;
+use crate::strings::StringId;
 use crate::token::lexer::{Position, SpecialToken, TokenType};
 use gettextrs::gettext;
 
@@ -75,7 +76,8 @@ impl Parser<'_> {
         let name = self.expect_identifier()?;
         if self.is_special(b':') {
             self.advance();
-            return Ok(Some(Label::Named { name, pos }));
+            let label = self.resolve_label(name);
+            return Ok(Some(Label::Named { label, pos }));
         }
         // Not a label, backtrack
         self.pos = saved_pos;
@@ -120,7 +122,8 @@ impl Parser<'_> {
                     }
                     let name = self.expect_identifier()?;
                     self.expect_special(b';')?;
-                    return Ok(Stmt::Goto { name, pos });
+                    let label = self.resolve_label(name);
+                    return Ok(Stmt::Goto { label, pos });
                 }
                 crate::kw::SWITCH => return self.parse_switch_stmt(),
                 // GCC extended inline assembly
@@ -378,8 +381,88 @@ impl Parser<'_> {
         Ok(Label::Default(pos))
     }
 
-    /// Parse block items (declarations and statements) until closing brace
+    /// The label `name` names here: the innermost `__label__` declaration of
+    /// it in force, or else the function's label of that name.
+    pub(crate) fn resolve_label(&self, name: StringId) -> LabelId {
+        let local = self
+            .local_labels
+            .iter()
+            .rev()
+            .flat_map(|scope| scope.iter())
+            .find(|(declared, _)| *declared == name);
+        match local {
+            Some(&(_, n)) => LabelId {
+                name,
+                scope: LabelScope::Local(n),
+            },
+            None => LabelId::function(name),
+        }
+    }
+
+    /// GNU `__label__ a, b;`: labels local to the block being parsed,
+    /// declared at its head, before any declaration or statement. Each name
+    /// is a new label, shadowing any outer label of that name in the block.
+    ///
+    /// Anywhere else `__label__` is not a declaration, and gcc's complaint
+    /// there is the expression parser's (see `parse_primary_expr`).
+    fn parse_local_label_decls(&mut self) -> ParseResult<()> {
+        let mut declared = false;
+        while self.current_ident() == Some(crate::kw::GNU_LABEL) {
+            self.advance();
+            declared = true;
+            loop {
+                let pos = self.current_pos();
+                let name = self.expect_identifier()?;
+                self.declare_local_label(name, pos);
+                if !self.is_special(b',') {
+                    break;
+                }
+                self.advance();
+            }
+            self.expect_special(b';')?;
+        }
+        // gcc's grammar takes the declarations as a prefix of the block's
+        // items, not as items: a block of nothing else is still missing one.
+        if declared && self.is_special(b'}') {
+            return Err(ParseError::new(
+                gettext("expected declaration or statement before '}' token"),
+                self.current_pos(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Declare `name`, written at `pos`, a label local to the innermost block.
+    fn declare_local_label(&mut self, name: StringId, pos: Position) {
+        let scope = self
+            .local_labels
+            .last_mut()
+            .expect("a block's local-label scope is open while its head is parsed");
+        if scope.iter().any(|(declared, _)| *declared == name) {
+            diag::error_args(
+                pos,
+                "duplicate label declaration '{0}'",
+                &[self.idents.get(name)],
+            );
+            return;
+        }
+        scope.push((name, self.next_local_label));
+        self.next_local_label += 1;
+    }
+
+    /// Parse block items (declarations and statements) until closing brace,
+    /// with the block's own scope for local labels open around them.
     fn parse_block_items(&mut self) -> ParseResult<Vec<BlockItem>> {
+        self.local_labels.push(Vec::new());
+        let items = self
+            .parse_local_label_decls()
+            .and_then(|()| self.parse_block_item_list());
+        self.local_labels.pop();
+        items
+    }
+
+    /// The declarations and statements of a block, up to its closing brace.
+    fn parse_block_item_list(&mut self) -> ParseResult<Vec<BlockItem>> {
         let mut items = Vec::new();
         while !self.is_special(b'}') && !self.is_eof() {
             // An attribute declaration starts like a declaration but is a

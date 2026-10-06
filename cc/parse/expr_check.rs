@@ -207,13 +207,19 @@ impl Parser<'_> {
                 continue;
             }
             let n = (i + 1).to_string();
+            let callee = callee.and_then(|id| self.idents.get_opt(id));
             if fault == AssignFault::FunctionPointerVoid {
-                if diag::warning_group_enabled(crate::types::FUNCTION_POINTER_CONV) {
-                    diag::warning_args(
+                match callee {
+                    Some(f) => diag::pedwarn_args(
+                        arg.pos,
+                        "ISO C forbids passing argument {0} of '{1}' between function pointer and 'void *'",
+                        &[&n, f],
+                    ),
+                    None => diag::pedwarn_args(
                         arg.pos,
                         "ISO C forbids passing argument {0} between function pointer and 'void *'",
                         &[&n],
-                    );
+                    ),
                 }
                 continue;
             }
@@ -221,7 +227,6 @@ impl Parser<'_> {
                 self.types.format_type(param, Some(self.idents)),
                 self.types.format_type(a, Some(self.idents)),
             );
-            let callee = callee.and_then(|id| self.idents.get_opt(id));
             Self::report_argument_fault(fault, arg.pos, &n, callee, &p_name, &a_name);
             if fault.is_error() {
                 sound = false;
@@ -537,6 +542,13 @@ impl Parser<'_> {
                 );
                 true
             }
+            OperandVerdict::FunctionPointerVoid => {
+                diag::pedwarn(
+                    pos,
+                    &gettext("ISO C forbids comparison of 'void *' with function pointer"),
+                );
+                true
+            }
         }
     }
 
@@ -728,20 +740,18 @@ impl Parser<'_> {
             return;
         };
         if fault == AssignFault::FunctionPointerVoid {
-            if diag::warning_group_enabled(crate::types::FUNCTION_POINTER_CONV) {
-                let msg = match site {
-                    ConversionSite::Assignment => {
-                        gettext("ISO C forbids assignment between function pointer and 'void *'")
-                    }
-                    ConversionSite::Initialization => gettext(
-                        "ISO C forbids initialization between function pointer and 'void *'",
-                    ),
-                    ConversionSite::Return => {
-                        gettext("ISO C forbids return between function pointer and 'void *'")
-                    }
-                };
-                diag::warning(pos, &msg);
-            }
+            let msg = match site {
+                ConversionSite::Assignment => {
+                    gettext("ISO C forbids assignment between function pointer and 'void *'")
+                }
+                ConversionSite::Initialization => {
+                    gettext("ISO C forbids initialization between function pointer and 'void *'")
+                }
+                ConversionSite::Return => {
+                    gettext("ISO C forbids return between function pointer and 'void *'")
+                }
+            };
+            diag::pedwarn(pos, &msg);
             return;
         }
         if fault.is_error() {

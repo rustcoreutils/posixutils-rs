@@ -10,7 +10,9 @@
 // declarators to the symbols they bind, at file scope and block scope alike
 //
 
-use super::ast::{Declaration, Expr, ExternalDecl, FunctionAttrs, InitDeclarator};
+use super::ast::{
+    Declaration, Expr, ExprKind, ExternalDecl, FunctionAttrs, InitDeclarator, UnaryOp,
+};
 use super::attribute::SpecifierAttrs;
 use super::declaration::{Redeclared, SpecContext};
 use super::linkage::Declared;
@@ -42,8 +44,8 @@ pub(super) struct DeclSpecs {
     /// The specified type, still carrying the storage-class and function
     /// specifiers.
     ty: Type,
-    /// `ty` interned: the base type every declarator derives from.
-    base: TypeId,
+    /// The type every declarator derives from, or `__auto_type`.
+    base: DeclBase,
     /// The storage-class specifiers and `inline` ([`Type::STORAGE_CLASS`]),
     /// which the declaration records rather than the type.
     pub(super) storage_class: TypeModifiers,
@@ -54,6 +56,29 @@ pub(super) struct DeclSpecs {
     /// -- through a variably modified typedef name or `typeof(int[n])` --
     /// which are the innermost levels of every declarator's type.
     vm_dims: Vec<Expr>,
+}
+
+/// The type a declaration's declarators derive from.
+#[derive(Clone, Copy)]
+enum DeclBase {
+    /// The type the specifiers name, interned.
+    Given(TypeId),
+    /// `__auto_type`, written at `pos`: the declaration's one declarator
+    /// takes the type of its initializer ([`Parser::infer_auto_type`]).
+    /// `placeholder` is the specifiers' type, `int` standing in for the data
+    /// type; the declarator is parsed against it, so one that derives
+    /// anything from it is told from a plain identifier.
+    Inferred { pos: Position, placeholder: TypeId },
+}
+
+impl DeclBase {
+    /// The type the declarator is parsed against.
+    fn parse_against(self) -> TypeId {
+        match self {
+            DeclBase::Given(typ) => typ,
+            DeclBase::Inferred { placeholder, .. } => placeholder,
+        }
+    }
 }
 
 impl DeclSpecs {
@@ -74,6 +99,14 @@ enum Bound {
     /// A block-scope redeclaration the symbol table refused, which binds
     /// nothing new.
     Nothing,
+}
+
+/// A `cleanup(func)` written on the declarator of `var`, whose type is `typ`.
+struct Cleanup {
+    func: SymbolId,
+    var: SymbolId,
+    typ: TypeId,
+    pos: Position,
 }
 
 /// No automatic storage duration, so no stack slot to size.
@@ -128,17 +161,27 @@ impl Parser<'_> {
             // At file scope a variably modified specifier is refused with the
             // declarator, so only a block binds its extents.
             let dims = std::mem::take(&mut specs.vm_dims);
-            specs.vm_dims =
-                self.bind_specifier_extents(dims, specs.base, specs.pos, &mut declarators);
+            specs.vm_dims = self.bind_specifier_extents(
+                dims,
+                specs.base.parse_against(),
+                specs.pos,
+                &mut declarators,
+            );
         }
 
         // `struct point { int x; };` -- a tag, and no declarators.
         if self.is_special(b';') {
-            self.check_declares_something(specs.pos, &specs.ty);
+            match specs.base {
+                DeclBase::Inferred { pos, .. } => {
+                    diag::error(pos, &gettext("'__auto_type' in empty declaration"));
+                }
+                DeclBase::Given(_) => self.check_declares_something(specs.pos, &specs.ty),
+            }
         } else {
             let mut first = true;
             loop {
-                let d = self.parse_declarator(specs.base, DeclaratorContext::Declaration)?;
+                let d = self
+                    .parse_declarator(specs.base.parse_against(), DeclaratorContext::Declaration)?;
                 // An attribute may follow any declarator, and so may an asm
                 // label.
                 self.skip_extensions_after_declarator();
@@ -209,7 +252,14 @@ impl Parser<'_> {
         }
         // For struct/union types with tags, use existing TypeId to preserve
         // forward declarations
-        let base = self.intern_type_with_tag(&ty);
+        let interned = self.intern_type_with_tag(&ty);
+        let base = match parsed.inferred {
+            Some(pos) => DeclBase::Inferred {
+                pos,
+                placeholder: interned,
+            },
+            None => DeclBase::Given(interned),
+        };
         Ok(DeclSpecs {
             pos,
             storage_class: ty.modifiers & Type::STORAGE_CLASS,
@@ -292,6 +342,19 @@ impl Parser<'_> {
             ..
         } = d;
         let is_typedef = specs.is_typedef();
+
+        // `__auto_type`: the initializer is parsed first, for its type.
+        let mut inferred_init = None;
+        if let DeclBase::Inferred {
+            pos: auto_pos,
+            placeholder,
+        } = specs.base
+        {
+            let (inferred, init) =
+                self.infer_auto_type(specs, auto_pos, typ == placeholder, first)?;
+            typ = inferred;
+            inferred_init = Some(init);
+        }
 
         // The specifiers' extents are the innermost levels, after the
         // declarator's own -- the ordering `try_parse_type_name_vm` applies
@@ -384,8 +447,12 @@ impl Parser<'_> {
             // Bound before the initializer: C99 6.2.1p7 starts the scope just
             // after the declarator, so `int *p = sizeof *p ...` sees `p`.
             let symbol = self.declare_in(scope, sym, name);
-            let init =
-                self.parse_declarator_initializer(specs, scope, name, pos, &mut typ, symbol)?;
+            let init = match inferred_init {
+                Some(init) => Some(self.settle_initializer(specs, scope, &mut typ, symbol, init)),
+                None => {
+                    self.parse_declarator_initializer(specs, scope, name, pos, &mut typ, symbol)?
+                }
+            };
             if !is_fn && !specs.is_extern() {
                 self.check_object_complete(scope, name, typ, &vla, pos);
             }
@@ -435,9 +502,23 @@ impl Parser<'_> {
         // declarator does not inherit it; a function takes the effect every
         // declaration of its name has promised.
         let pending_effect = self.take_pending_fn_effect();
+        let mut symbol_attrs = std::mem::take(&mut self.pending_symbol_attrs);
+        if !is_fn {
+            Self::drop_ifunc(&mut symbol_attrs, pos);
+        }
+        let cleanup = symbol_attrs.cleanup.take().and_then(|func| {
+            let var = Cleanup {
+                func,
+                var: symbol,
+                typ,
+                pos,
+            };
+            self.declarator_cleanup(var, specs.storage_class, scope, is_fn)
+        });
         Ok(Bound::Decl(InitDeclarator {
-            symbol_attrs: std::mem::take(&mut self.pending_symbol_attrs),
+            symbol_attrs,
             fn_effect: fn_attrs.map_or(pending_effect, |a| a.effect),
+            cleanup,
             symbol,
             typ,
             storage_class: specs.storage_class,
@@ -447,6 +528,58 @@ impl Parser<'_> {
             explicit_align: if is_fn { None } else { align },
             pos,
         }))
+    }
+
+    /// The call `__attribute__((cleanup(fn)))` asks for on the declarator
+    /// `var` describes, with storage class `storage` at `scope`.
+    ///
+    /// Only a variable with automatic storage has a scope to leave. gcc
+    /// ignores the attribute with a warning on a typedef, a function, a
+    /// `static` and anything at file scope -- and in silence on a
+    /// block-scope `extern`, which this matches.
+    ///
+    /// The call is built here, where it is checked as any call is: an
+    /// argument the function's prototype cannot take draws the usual
+    /// diagnostic, and taking the address of a `register` variable is the
+    /// usual error.
+    fn declarator_cleanup(
+        &mut self,
+        var: Cleanup,
+        storage: TypeModifiers,
+        scope: DeclScope,
+        is_fn: bool,
+    ) -> Option<Expr> {
+        let automatic = matches!(scope, DeclScope::Block { .. })
+            && !is_fn
+            && !storage.intersects(NO_AUTO_DURATION);
+        if automatic {
+            return Some(self.cleanup_call(var));
+        }
+        let block_extern = matches!(scope, DeclScope::Block { .. })
+            && !is_fn
+            && storage.contains(TypeModifiers::EXTERN);
+        if !block_extern {
+            Self::warn_cleanup_ignored(var.pos);
+        }
+        None
+    }
+
+    /// `func(&var)`, checked as the call it is.
+    fn cleanup_call(&mut self, c: Cleanup) -> Expr {
+        let func_typ = self.symbols.get(c.func).typ;
+        let callee = Self::typed_expr(ExprKind::Ident(c.func), func_typ, c.pos);
+        let operand = Self::typed_expr(ExprKind::Ident(c.var), c.typ, c.pos);
+        self.check_addressable(&operand, c.pos);
+        let ptr = self.types.pointer_to(c.typ);
+        let arg = Self::typed_expr(
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                operand: Box::new(operand),
+            },
+            ptr,
+            c.pos,
+        );
+        self.checked_call(callee, vec![arg], c.pos, c.pos)
     }
 
     /// The storage-class and function specifiers a declarator of this kind,
@@ -693,7 +826,22 @@ impl Parser<'_> {
             ));
         }
         self.advance();
-        let mut init = self.parse_initializer()?;
+        let init = self.parse_initializer()?;
+        Ok(Some(
+            self.settle_initializer(specs, scope, typ, symbol, init),
+        ))
+    }
+
+    /// Check a declarator's initializer against the declared type, and let it
+    /// complete that type.
+    fn settle_initializer(
+        &mut self,
+        specs: &DeclSpecs,
+        scope: DeclScope,
+        typ: &mut TypeId,
+        symbol: Option<SymbolId>,
+        mut init: Expr,
+    ) -> Expr {
         self.walk_initializer(*typ, &mut init);
 
         // 6.7.9p5: an identifier declared `extern` at block scope has
@@ -720,7 +868,62 @@ impl Parser<'_> {
                 self.symbols.get_mut(id).typ = sized;
             }
         }
-        Ok(Some(init))
+        init
+    }
+
+    /// The type an `__auto_type` declarator takes, and the initializer it
+    /// takes it from (gcc's extension).
+    ///
+    /// The declarator must be the declaration's only one, a plain identifier
+    /// (`plain`), and initialized: gcc's diagnostics for each, in its order.
+    /// The initializer is an expression, parsed here, ahead of the
+    /// declaration: the name is not yet in scope inside it, so
+    /// `__auto_type x = x;` names an outer `x` or none, as in gcc. Its type is
+    /// lvalue-converted -- an array or a function decays, and top-level
+    /// qualifiers drop (C17 6.3.2.1) -- and then takes the qualifiers written
+    /// with `__auto_type`.
+    fn infer_auto_type(
+        &mut self,
+        specs: &DeclSpecs,
+        auto_pos: Position,
+        plain: bool,
+        first: bool,
+    ) -> ParseResult<(TypeId, Expr)> {
+        if !first {
+            return Err(ParseError::new(
+                gettext("'__auto_type' may only be used with a single declarator"),
+                auto_pos,
+            ));
+        }
+        if !plain {
+            return Err(ParseError::new(
+                gettext("'__auto_type' requires a plain identifier as declarator"),
+                auto_pos,
+            ));
+        }
+        if !self.is_special(b'=') {
+            return Err(ParseError::new(
+                gettext("'__auto_type' requires an initialized data declaration"),
+                auto_pos,
+            ));
+        }
+        if specs.is_typedef() {
+            return Err(ParseError::new(
+                "typedef cannot have initializer",
+                self.current_pos(),
+            ));
+        }
+        self.advance(); // consume '='
+        let init = self.parse_assignment_expr()?;
+        if self.bit_field_designated(&init).is_some() {
+            diag::error(
+                auto_pos,
+                &gettext("'__auto_type' used with a bit-field initializer"),
+            );
+        }
+        let value = self.lvalue_converted_type(init.typ.unwrap_or(self.types.int_id));
+        let quals = specs.ty.modifiers & Type::QUALIFIERS;
+        Ok((self.types.qualified_with(value, quals), init))
     }
 
     /// C17 6.7p7: an object's type must be complete where it is defined.

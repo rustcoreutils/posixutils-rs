@@ -895,6 +895,48 @@ int  arg_plain(char c)          { return c; }
     );
 }
 
+/// `-funsigned-char` / `-fsigned-char` override the target's default, the
+/// last one winning, and leave the explicit `signed char` alone.
+#[test]
+fn codegen_plain_char_follows_the_signedness_flag() {
+    let src = r#"
+int  ld_plain(char *p)          { return *p; }
+int  ld_signed(signed char *p)  { return *p; }
+"#;
+
+    // x86-64 defaults to signed; -funsigned-char makes plain char zero-extend.
+    let x = asm_for_with(
+        "char_flag_x64",
+        X86_64_LINUX,
+        src,
+        &["-O", "-funsigned-char"],
+    );
+    let plain = body_of(&x, "ld_plain");
+    assert!(
+        plain.contains("movzb") && !plain.contains("movsb"),
+        "x86-64 -funsigned-char: plain char must zero-extend:\n{plain}"
+    );
+    let signed = body_of(&x, "ld_signed");
+    assert!(
+        signed.contains("movsb"),
+        "x86-64 -funsigned-char: signed char must still sign-extend:\n{signed}"
+    );
+
+    // aarch64 Linux defaults to unsigned; the last flag (-fno-unsigned-char)
+    // makes plain char signed.
+    let a = asm_for_with(
+        "char_flag_a64",
+        AARCH64_LINUX,
+        src,
+        &["-O", "-funsigned-char", "-fno-unsigned-char"],
+    );
+    let plain = body_of(&a, "ld_plain");
+    assert!(
+        plain.contains("ldrsb") || plain.contains("sxtb"),
+        "aarch64 -fno-unsigned-char: plain char must sign-extend:\n{plain}"
+    );
+}
+
 /// Apple arm64 makes narrowing to a small integer type *the ABI's* business,
 /// so the narrowed value must be extended by its own signedness.
 ///

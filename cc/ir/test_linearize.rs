@@ -329,6 +329,7 @@ fn test_linearize_for() {
             init: Some(ForInit::Declaration(Declaration {
                 declarators: vec![crate::parse::ast::InitDeclarator {
                     fn_effect: Default::default(),
+                    cleanup: None,
                     symbol_attrs: Default::default(),
                     pos: Position::default(),
                     symbol: i_sym,
@@ -612,6 +613,7 @@ fn test_local_var_emits_load_store() {
             BlockItem::Declaration(Declaration {
                 declarators: vec![crate::parse::ast::InitDeclarator {
                     fn_effect: Default::default(),
+                    cleanup: None,
                     symbol_attrs: Default::default(),
                     pos: Position::default(),
                     symbol: x_sym,
@@ -679,6 +681,7 @@ fn test_ssa_converts_local_to_phi() {
             BlockItem::Declaration(Declaration {
                 declarators: vec![crate::parse::ast::InitDeclarator {
                     fn_effect: Default::default(),
+                    cleanup: None,
                     symbol_attrs: Default::default(),
                     pos: Position::default(),
                     symbol: x_sym,
@@ -750,6 +753,7 @@ fn test_ssa_loop_variable() {
             BlockItem::Declaration(Declaration {
                 declarators: vec![crate::parse::ast::InitDeclarator {
                     fn_effect: Default::default(),
+                    cleanup: None,
                     symbol_attrs: Default::default(),
                     pos: Position::default(),
                     symbol: i_sym,
@@ -1339,6 +1343,7 @@ fn test_incomplete_struct_type_resolution() {
         body: Stmt::Block(vec![BlockItem::Declaration(Declaration {
             declarators: vec![InitDeclarator {
                 fn_effect: Default::default(),
+                cleanup: None,
                 symbol_attrs: Default::default(),
                 pos: Position::default(),
                 symbol: f_sym,
@@ -1550,6 +1555,7 @@ fn test_alias_declarations_become_symbol_aliases() {
         crate::ir::SymbolAlias {
             name: name.to_string(),
             target: target.to_string(),
+            form: crate::parse::ast::AliasForm::Alias,
             is_static,
             weak,
             visibility: vis.map(str::to_string),
@@ -1580,9 +1586,168 @@ fn test_alias_declarations_become_symbol_aliases() {
     }
 }
 
+/// An `ifunc` declaration becomes a `SymbolAlias` of the `Ifunc` form naming
+/// its resolver -- not a definition, and not the resolver: a call to it is a
+/// call to an external symbol, reached through the GOT, which is where the
+/// binding the resolver chose is stored. An ordinary redeclaration does not
+/// make it a second record.
+#[test]
+fn test_ifunc_declarations_become_indirect_functions() {
+    use crate::parse::ast::AliasForm;
+    let src = "static int impl(int x) { return x; }\n\
+               static void *res(void) { return (void *)impl; }\n\
+               int f(int) __attribute__((ifunc(\"res\")));\n\
+               int f(int);\n\
+               static int g(int) __attribute__((ifunc(\"res\"), visibility(\"hidden\")));\n\
+               int use(void) { return f(1) + g(2); }\n";
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    let module = linearize_source(src, &target);
+    let ifunc = |name: &str, is_static: bool, vis: Option<&str>| crate::ir::SymbolAlias {
+        name: name.to_string(),
+        target: "res".to_string(),
+        form: AliasForm::Ifunc,
+        is_static,
+        weak: false,
+        visibility: vis.map(str::to_string),
+    };
+    assert_eq!(
+        module.aliases,
+        [ifunc("f", false, None), ifunc("g", true, Some("hidden"))]
+    );
+    for name in ["f", "g"] {
+        assert!(
+            module.extern_symbols.contains(name),
+            "{name} is reached via the GOT"
+        );
+        assert!(
+            !module.functions.iter().any(|f| f.name == name),
+            "{name} has no body"
+        );
+    }
+}
+
+/// A gnu_inline `extern inline` body followed by the real definition of the
+/// same name leaves one function under that name in the module: the real
+/// one, emitted. Two entries let the inliner take the first by name -- the
+/// inline-only body -- while the emitted symbol was the second.
+///
+/// A plain `inline` gnu_inline definition after an `extern` declaration is
+/// the real one too: only the definition's own `extern` makes it
+/// inline-only.
+#[test]
+fn test_real_definition_replaces_gnu_inline_body() {
+    let src = "int one(void);\nint zero(void);\n\
+               extern inline __attribute__((gnu_inline)) int f(void) { return one(); }\n\
+               int f(void) { return zero(); }\n\
+               extern int h(void);\n\
+               inline __attribute__((gnu_inline)) int h(void) { return zero(); }\n";
+    for arch in [crate::target::Arch::X86_64, crate::target::Arch::Aarch64] {
+        let target = Target::new(arch, crate::target::Os::Linux);
+        let module = linearize_source(src, &target);
+        for name in ["f", "h"] {
+            let found: Vec<&Function> =
+                module.functions.iter().filter(|f| f.name == name).collect();
+            assert_eq!(found.len(), 1, "{arch}: one `{name}` in the module");
+            let func = found[0];
+            assert!(func.emit, "{arch}: `{name}` is the emitted definition");
+            let callees: Vec<&str> = func
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insns)
+                .filter_map(|i| i.local_callee())
+                .collect();
+            assert_eq!(callees, ["zero"], "{arch}: `{name}` is the real body");
+        }
+    }
+}
+
 /// x86-64 Linux, whose x87 `long double` holds `0x1p62L + 1.0L` exactly --
 /// a test about that names the target rather than taking the host's, since
 /// on an arm64 Mac `long double` is `double`.
 pub(super) fn x86_64_linux() -> Target {
     Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux)
+}
+
+/// A `target_clones` function becomes its versions -- local, each compiled
+/// for its ISA, sharing one copy of each static local -- a resolver, and an
+/// indirect function of its own name bound to the resolver. A `target`
+/// function is compiled for its ISA, and its neighbours for the unit's.
+#[test]
+fn test_target_clones_become_versions_and_a_resolver() {
+    use crate::parse::ast::AliasForm;
+    use crate::target::{X86Isa, X86Simd};
+    let src = "__attribute__((target_clones(\"sse4.2\", \"default\")))\n\
+               int sum(int x) { static int calls; calls++; return x + calls; }\n\
+               __attribute__((target(\"ssse3\"))) int t(int x) { return x; }\n\
+               int plain(int x) { return sum(x); }\n";
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    let module = linearize_source(src, &target);
+    let func = |name: &str| {
+        module
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("no {name}"))
+    };
+    let sse42 = X86Isa {
+        simd: X86Simd::Sse42,
+        popcnt: true,
+    };
+    assert!(func("sum.default").is_static);
+    assert_eq!(func("sum.default").isa, X86Isa::default());
+    assert!(func("sum.sse4_2").is_static);
+    assert_eq!(func("sum.sse4_2").isa, sse42);
+    assert!(!func("sum.resolver").is_static);
+    assert!(func("sum.resolver").symbol_attrs.weak);
+    assert_eq!(func("t").isa.simd, X86Simd::Ssse3);
+    assert_eq!(func("plain").isa, X86Isa::default());
+    assert!(module.functions.iter().all(|f| f.name != "sum"));
+    let alias = module.aliases.iter().find(|a| a.name == "sum").unwrap();
+    assert_eq!(alias.target, "sum.resolver");
+    assert_eq!(alias.form, AliasForm::Ifunc);
+    assert!(module.extern_symbols.contains("sum"));
+    let statics: Vec<_> = module
+        .globals
+        .iter()
+        .filter(|g| g.name.contains("calls"))
+        .collect();
+    assert_eq!(statics.len(), 1, "one static shared by both versions");
+}
+
+/// A `target_clones` function's attributes divide among its symbols as gcc
+/// divides them: `constructor` and `destructor`, priority and all, register
+/// the default version; `section` reaches every version but the default one,
+/// `used` every version and the resolver; `visibility` and `weak` go nowhere,
+/// so a `hidden` function's name is exported, as gcc 13 exports it.
+#[test]
+fn test_target_clones_divide_attributes_as_gcc() {
+    let src = "__attribute__((target_clones(\"sse4.2\", \"default\"), constructor(101), \
+               destructor, used, weak, section(\".text.hot\"), visibility(\"hidden\")))\n\
+               void init(void) { }\n";
+    let module = linearize_source(src, &x86_64_linux());
+    let func = |name: &str| {
+        module
+            .functions
+            .iter()
+            .find(|f| f.name == name)
+            .unwrap_or_else(|| panic!("no {name}"))
+    };
+    let default = func("init.default");
+    assert_eq!(default.constructor, Some(Some(101)));
+    assert_eq!(default.destructor, Some(None));
+    let other = func("init.sse4_2");
+    assert_eq!((other.constructor, other.destructor), (None, None));
+    for version in [default, other] {
+        assert!(version.symbol_attrs.used, "{}", version.name);
+        assert!(!version.symbol_attrs.weak, "{}", version.name);
+        assert_eq!(version.symbol_attrs.visibility, None, "{}", version.name);
+    }
+    assert_eq!(default.symbol_attrs.section, None);
+    assert_eq!(other.symbol_attrs.section.as_deref(), Some(".text.hot"));
+    let resolver = func("init.resolver");
+    assert!(resolver.symbol_attrs.used);
+    assert_eq!((resolver.constructor, resolver.destructor), (None, None));
+    let alias = module.aliases.iter().find(|a| a.name == "init").unwrap();
+    assert_eq!(alias.visibility, None);
+    assert!(!alias.weak);
 }

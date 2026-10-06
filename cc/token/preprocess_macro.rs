@@ -664,12 +664,7 @@ impl<'a> Preprocessor<'a> {
                     // C99 6.10.3.2p2: insert \ before each " and \ including delimiters
                     result.push('\\');
                     result.push('"');
-                    for ch in s.chars() {
-                        if ch == '"' || ch == '\\' {
-                            result.push('\\');
-                        }
-                        result.push(ch);
-                    }
+                    result.push_str(&escape_c_string(s));
                     result.push('\\');
                     result.push('"');
                 }
@@ -685,12 +680,7 @@ impl<'a> Preprocessor<'a> {
                     });
                     // C99 6.10.3.2p2: insert \ before each " and \ in char constants
                     result.push('\'');
-                    for ch in c.chars() {
-                        if ch == '\\' || ch == '"' {
-                            result.push('\\');
-                        }
-                        result.push(ch);
-                    }
+                    result.push_str(&escape_c_string(c));
                     result.push('\'');
                 }
                 // 6.10.3.2p2 asks for "the spelling of the preprocessing
@@ -1635,14 +1625,11 @@ impl<'a> Preprocessor<'a> {
                 *pos,
                 TokenValue::Number(pos.line.to_string()),
             )]),
-            BuiltinMacro::File => {
-                let effective_file = self.presumed_file_name().to_string();
-                Some(vec![Token::with_value(
-                    TokenType::String,
-                    *pos,
-                    TokenValue::String(literal_payload(&effective_file)),
-                )])
-            }
+            BuiltinMacro::File => Some(vec![Token::with_value(
+                TokenType::String,
+                *pos,
+                TokenValue::String(self.file_macro_payload(self.presumed_file_name())),
+            )]),
             BuiltinMacro::Date => Some(vec![Token::with_value(
                 TokenType::String,
                 *pos,
@@ -1670,7 +1657,7 @@ impl<'a> Preprocessor<'a> {
             BuiltinMacro::BaseFile => Some(vec![Token::with_value(
                 TokenType::String,
                 *pos,
-                TokenValue::String(self.base_file.clone()),
+                TokenValue::String(self.file_macro_payload(&self.base_file)),
             )]),
             BuiltinMacro::HasAttribute
             | BuiltinMacro::HasBuiltin

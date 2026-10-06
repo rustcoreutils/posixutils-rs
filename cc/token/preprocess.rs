@@ -19,15 +19,16 @@ use std::time::SystemTime;
 
 use super::cursor::{Provenance, TokenCursor};
 use super::lexer::{
-    literal_payload, payload_bytes, payload_text, show_token, tokens_to_source_bytes, write_token,
-    IdentTable, LexerMode, Position, Punctuator, SpecialToken, Spelling, Token, TokenType,
-    TokenValue, Tokenizer,
+    decode_string_spelling, escape_c_string, literal_payload, payload_bytes, payload_text,
+    show_token, tokens_to_source_bytes, write_token, IdentTable, LexerMode, Position, Punctuator,
+    SpecialToken, Spelling, Token, TokenType, TokenValue, Tokenizer,
 };
 use super::literal;
 use crate::arch;
 use crate::builtin_headers;
 use crate::diag;
 use crate::os;
+use crate::prefix_map::PrefixMap;
 use crate::target::{IntType, Target, STDC_VERSION};
 use gettextrs::gettext;
 
@@ -517,6 +518,10 @@ pub struct Preprocessor<'a> {
     /// Base file name (for __BASE_FILE__ - the main input file)
     base_file: String,
 
+    /// `-fmacro-prefix-map`: rewrites what `__FILE__` and `__BASE_FILE__`
+    /// expand to.
+    macro_prefix_map: PrefixMap,
+
     /// Current file directory (for relative includes)
     current_dir: String,
 
@@ -647,6 +652,15 @@ struct LineMarker {
 /// The payload prefix a marker uses when it carries a pragma c17 does not act
 /// on and only needs to reproduce.
 const PRAGMA_TEXT_PREFIX: &str = "text:";
+
+/// The gcc release c17 claims to be, as `[major, minor, patchlevel]`.
+///
+/// One value for every place the claim is made: `__GNUC__`,
+/// `__GNUC_MINOR__`, `__GNUC_PATCHLEVEL__` and `__VERSION__` here, and the
+/// driver's `-dumpversion`, `-dumpfullversion` and `-v` banner. A configure
+/// script that compares the two must find them agreeing. Why it is 7.5.0 is
+/// set out where the macros are defined.
+pub const GNUC_VERSION: [&str; 3] = ["7", "5", "0"];
 
 /// The directive a marker token stands for, when it is one c17 only carries.
 ///
@@ -953,6 +967,7 @@ impl<'a> Preprocessor<'a> {
             quote_include_paths: Vec::with_capacity(DEFAULT_INCLUDE_PATH_CAPACITY),
             current_file: filename.to_string(),
             base_file: filename.to_string(),
+            macro_prefix_map: PrefixMap::default(),
             current_dir,
             counter: 0,
             include_depth: 0,
@@ -1065,17 +1080,16 @@ impl<'a> Preprocessor<'a> {
         //        by name
         //   8.0  <tgmath.h> needs `__builtin_tgmath`, and <sys/cdefs.h>
         //        the `nonstring` attribute. That is the ceiling.
-        self.define_macro(Macro::predefined("__GNUC__", Some("7")));
-        self.define_macro(Macro::predefined("__GNUC_MINOR__", Some("5")));
-        self.define_macro(Macro::predefined("__GNUC_PATCHLEVEL__", Some("0")));
-        self.define_macro(Macro::predefined(
-            "__VERSION__",
-            Some(concat!(
-                "\"c17 ",
-                env!("CARGO_PKG_VERSION"),
-                " (gcc compatible 7.5.0)\""
-            )),
-        ));
+        let [major, minor, patchlevel] = GNUC_VERSION;
+        self.define_macro(Macro::predefined("__GNUC__", Some(major)));
+        self.define_macro(Macro::predefined("__GNUC_MINOR__", Some(minor)));
+        self.define_macro(Macro::predefined("__GNUC_PATCHLEVEL__", Some(patchlevel)));
+        let version = format!(
+            "\"c17 {} (gcc compatible {})\"",
+            env!("CARGO_PKG_VERSION"),
+            GNUC_VERSION.join(".")
+        );
+        self.define_macro(Macro::predefined("__VERSION__", Some(&version)));
         self.define_macro(Macro::predefined("__GNUC_STDC_INLINE__", Some("1")));
 
         // GCC type keyword compatibility
@@ -1530,6 +1544,14 @@ impl<'a> Preprocessor<'a> {
             .get(&self.physical_stream)
             .and_then(|lm| lm.name.as_deref())
             .unwrap_or(&self.current_file)
+    }
+
+    /// The string-literal payload a file-name macro expands to: `name`
+    /// through `-fmacro-prefix-map`, spelled with its `"` and `\` escaped.
+    /// Both `__FILE__` and `__BASE_FILE__` come here, so the two cannot be
+    /// mapped differently.
+    fn file_macro_payload(&self, name: &str) -> String {
+        escape_c_string(&literal_payload(&self.macro_prefix_map.apply(name)))
     }
 
     /// Establish that the physical line after the current directive is line
@@ -2615,6 +2637,8 @@ pub struct PreprocessConfig<'a> {
     pub position: crate::target::PositionIndependence,
     /// The x86-64 extensions the code may assume; see [`define_isa_macros`].
     pub isa: crate::target::X86Isa,
+    /// `-fmacro-prefix-map` (and the macro half of `-ffile-prefix-map`).
+    pub macro_prefix_map: PrefixMap,
     /// What optimization was asked for.
     ///
     /// The same value the optimizer is given, so `__OPTIMIZE__`,
@@ -2729,6 +2753,7 @@ pub fn preprocess_collecting(
     pp.trigraphs = config.trigraphs;
     pp.preprocessed = config.preprocessed;
     pp.collect_dependencies = config.collect_dependencies;
+    pp.macro_prefix_map = config.macro_prefix_map.clone();
 
     define_optimization_macros(&mut pp, config.optimization);
     define_pic_macros(&mut pp, target, config.position);
@@ -2807,6 +2832,9 @@ pub struct AsmPreprocessConfig<'a> {
     pub position: crate::target::PositionIndependence,
     /// See [`PreprocessConfig::isa`].
     pub isa: crate::target::X86Isa,
+    /// See [`PreprocessConfig::macro_prefix_map`]: `__FILE__` in a `.S` file
+    /// is mapped as in C.
+    pub macro_prefix_map: PrefixMap,
 }
 
 /// A `.S` operand that could not be preprocessed.
@@ -2867,6 +2895,7 @@ pub fn preprocess_asm_file(
 
     // Use assembly lexer mode for included files as well
     pp.lexer_mode = LexerMode::Assembly;
+    pp.macro_prefix_map = config.macro_prefix_map.clone();
 
     // Undefine C-specific macros that don't apply to assembly
     pp.undef_macro("__STDC__");

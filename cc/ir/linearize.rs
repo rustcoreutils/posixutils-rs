@@ -24,8 +24,8 @@ use crate::ir::linearize_emit::CompoundAssign;
 use crate::ir::linearize_stmt::SwitchCtx;
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef,
-    GnuAtomicOp, InitElement, InlineLibraryFn, MemoryFn, NarrowedLibraryCall, OffsetOfPath,
-    ParamStyle, TranslationUnit, UnaryOp,
+    GnuAtomicOp, InitElement, InlineLibraryFn, LabelId, MemoryFn, NarrowedLibraryCall,
+    OffsetOfPath, ParamStyle, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
@@ -546,6 +546,9 @@ pub(crate) struct Scope {
     /// The `vla_marks` depth on entry; every mark above it belongs to this
     /// scope and is released when it ends.
     pub(crate) vla_entry: usize,
+    /// The `cleanups` depth on entry; every cleanup above it belongs to a
+    /// variable this scope declares, and runs when it ends.
+    pub(crate) cleanup_entry: usize,
 }
 
 /// A captured stack pointer and the loop/switch nesting it was captured at.
@@ -670,8 +673,9 @@ pub struct Linearizer<'a> {
     /// declaration -- a typedef inside a loop -- overwrites the entry, which
     /// is exactly what "each time it is reached" asks for.
     pub(crate) vm_typedef_dims: HashMap<SymbolId, Vec<VmDim>>,
-    /// Label -> basic block mapping
-    pub(crate) label_map: HashMap<String, BasicBlockId>,
+    /// Each label's basic block, keyed by the label's resolved identity: two
+    /// local labels of one spelling are two labels.
+    pub(crate) label_map: HashMap<LabelId, BasicBlockId>,
     /// Break target stack (for loops)
     pub(crate) break_targets: Vec<BasicBlockId>,
     /// Continue target stack (for loops)
@@ -712,14 +716,14 @@ pub struct Linearizer<'a> {
     /// `asm goto` -- with where each was written. Checked against
     /// `defined_labels` once the body is walked, because a forward reference
     /// is legal and only the end of the function settles it.
-    pub(crate) label_refs: Vec<(String, crate::diag::Position)>,
+    pub(crate) label_refs: Vec<(LabelId, crate::diag::Position)>,
 
     /// Labels this function actually defines.
-    pub(crate) defined_labels: std::collections::HashSet<String>,
+    pub(crate) defined_labels: std::collections::HashSet<LabelId>,
     /// Every label written in this function's body, including one inside an
     /// operand that is never evaluated -- `sizeof(({ L: x; }))` -- and so
     /// never defined by lowering.
-    pub(crate) written_labels: std::collections::HashSet<String>,
+    pub(crate) written_labels: std::collections::HashSet<LabelId>,
     /// How many VLA marks were in force at each label already linearized, for
     /// a function that declares a variable-length array.
     ///
@@ -763,6 +767,14 @@ pub struct Linearizer<'a> {
     /// loop body, including a VLA declared before the switch, and asking the
     /// break depth there found no mark to undo.
     pub(crate) vla_marks: Vec<VlaMark>,
+    /// The `cleanup(fn)` calls of the variables in scope, outermost first.
+    /// See [`super::linearize_cleanup`].
+    pub(crate) cleanups: Vec<super::linearize_cleanup::PendingCleanup>,
+    /// For each label, the variables with a cleanup in whose scope it lies,
+    /// outermost first: a `goto` runs the cleanup of every variable in scope
+    /// at the jump and not at its label. Taken from the jump-scope walk,
+    /// because a forward `goto` is lowered before its label.
+    pub(crate) label_cleanups: std::collections::HashMap<LabelId, Vec<SymbolId>>,
     /// Whether this function declares anything variably modified, and so
     /// needs the bookkeeping above.
     pub(crate) func_has_vla: bool,
@@ -831,6 +843,23 @@ pub struct Linearizer<'a> {
     /// is emitted even where its answer is known. `-fno-trapping-math` turns
     /// it off.
     pub(crate) trapping_math: bool,
+    /// The x86-64 ISA of the function being linearized: what decides which
+    /// vector operations are one packed instruction. See
+    /// [`Linearizer::function_isa`].
+    pub(crate) isa: crate::target::X86Isa,
+    /// While the versions of a `target_clones` function are linearized: the
+    /// global each of its static locals became in the first version, which
+    /// every later one shares, as gcc's clones share them.
+    pub(crate) clone_statics: Option<HashMap<SymbolId, String>>,
+}
+
+/// One compilation of a function definition other than its own: a
+/// `target_clones` version, under its own name and ISA, with the share of the
+/// function's attributes `target_clones::Division` gives it.
+pub(crate) struct FnVersion {
+    pub(crate) name: String,
+    pub(crate) isa: crate::target::X86Isa,
+    pub(crate) attrs: super::target_clones::VersionAttrs,
 }
 
 impl<'a> Linearizer<'a> {
@@ -869,6 +898,8 @@ impl<'a> Linearizer<'a> {
             label_vla_depth: std::collections::HashMap::new(),
             pending_goto_vla: Vec::new(),
             vla_marks: Vec::new(),
+            cleanups: Vec::new(),
+            label_cleanups: std::collections::HashMap::new(),
             volatile_init_object: None,
             static_init_nesting: StaticInitNesting::default(),
             func_has_vla: false,
@@ -886,6 +917,8 @@ impl<'a> Linearizer<'a> {
             declared_aliases: Vec::new(),
             defined_functions: std::collections::HashSet::new(),
             trapping_math: true,
+            isa: target.x86_isa,
+            clone_statics: None,
         }
     }
 
@@ -913,17 +946,21 @@ impl<'a> Linearizer<'a> {
         self.local_scope_stack.push(Vec::new());
         Scope {
             vla_entry: self.vla_marks.len(),
+            cleanup_entry: self.cleanups.len(),
         }
     }
 
-    /// Leave the scope `scope` opened: release the VLAs declared in it and
-    /// restore every local it shadowed.
+    /// Leave the scope `scope` opened: run the cleanups of the variables
+    /// declared in it, release its VLAs and restore every local it shadowed.
     ///
-    /// The stack restore comes first, while the block the scope ends in is
-    /// still the current one, and is emitted only on the falling-out path --
-    /// a `break`, `continue`, `goto` or `return` that left already did its
-    /// own unwinding and terminated the block.
+    /// The cleanups come first, while every variable they name is still in
+    /// scope and still has its storage; then the stack restore, while the
+    /// block the scope ends in is still the current one. Both are emitted
+    /// only on the falling-out path -- a `break`, `continue`, `goto` or
+    /// `return` that left already did its own unwinding and terminated the
+    /// block.
     pub(crate) fn pop_scope(&mut self, scope: Scope) {
+        self.close_cleanup_scope(&scope);
         self.close_vla_scope(&scope);
         self.end_lifetimes();
         if let Some(entries) = self.local_scope_stack.pop() {
@@ -1111,9 +1148,10 @@ impl<'a> Linearizer<'a> {
             .collect();
         for item in &tu.items {
             match item {
-                ExternalDecl::FunctionDef(func) => {
-                    self.linearize_function(func);
-                }
+                ExternalDecl::FunctionDef(func) => match &func.attrs.clones {
+                    Some(clones) => self.linearize_target_clones(func, clones),
+                    None => self.linearize_function(func),
+                },
                 ExternalDecl::Declaration(decl) => {
                     self.linearize_global_decl(decl);
                 }
@@ -1801,7 +1839,7 @@ impl<'a> Linearizer<'a> {
     /// block scope has already dropped every mark -- but it is entered the
     /// same way as any other scope so that no site can enter one without the
     /// other.
-    fn reset_for_function(&mut self, func: &FunctionDef) -> Scope {
+    fn reset_for_function(&mut self, func: &FunctionDef, name: &str) -> Scope {
         // Reset per-function state
         self.next_pseudo = 0;
         self.next_bb = 0;
@@ -1814,7 +1852,7 @@ impl<'a> Linearizer<'a> {
         self.struct_return_ptr = None;
         self.reg_aggregate_return_type = None;
         self.vector_return = None;
-        self.current_func_name = self.emitted_name(func.name);
+        self.current_func_name = name.to_string();
         self.current_func_ident = func.name;
         self.addr_taken_labels.clear();
         self.label_refs.clear();
@@ -1822,6 +1860,7 @@ impl<'a> Linearizer<'a> {
         self.label_vla_depth.clear();
         self.pending_goto_vla.clear();
         self.vla_marks.clear();
+        self.cleanups.clear();
         self.func_has_vla = Self::declares_vla(&func.body);
         self.indirect_dispatch = None;
         // Remove from extern_symbols since we're defining this function
@@ -1872,7 +1911,24 @@ impl<'a> Linearizer<'a> {
         }
     }
 
+    /// The x86-64 ISA a function is compiled for, given what its
+    /// `target(...)` attribute asks: the translation unit's, edited by the
+    /// request. The one rule for every function and version.
+    pub(crate) fn function_isa(
+        &self,
+        request: Option<&crate::target::IsaRequest>,
+    ) -> crate::target::X86Isa {
+        let unit = self.target.x86_isa;
+        request.map_or(unit, |r| unit.with_request(r))
+    }
+
     pub(crate) fn linearize_function(&mut self, func: &FunctionDef) {
+        self.linearize_function_as(func, None)
+    }
+
+    /// Linearize `func` as itself, or as `version`: a local function of the
+    /// version's name, compiled for its ISA.
+    pub(crate) fn linearize_function_as(&mut self, func: &FunctionDef, version: Option<FnVersion>) {
         // Set current position for debug info (function definition location)
         self.current_pos = Some(func.pos);
 
@@ -1880,14 +1936,18 @@ impl<'a> Linearizer<'a> {
         // variably modified identifier without executing its declaration
         // leaves the object's size never computed. gcc holds a statement
         // expression to the same rule.
-        let written_labels = self.check_jumps_into_protected_scopes(&func.body);
+        let labels = self.check_jumps_into_protected_scopes(&func.body);
 
-        let func_scope = self.reset_for_function(func);
-        self.written_labels = written_labels;
+        let name = version
+            .as_ref()
+            .map_or_else(|| self.emitted_name(func.name), |v| v.name.clone());
+        let func_scope = self.reset_for_function(func, &name);
+        self.written_labels = labels.written;
+        self.label_cleanups = labels.cleanups;
 
         // Create function - use storage class from FunctionDef
         let modifiers = self.types.modifiers(func.return_type);
-        let is_static = func.is_static;
+        let is_static = func.is_static || version.is_some();
         let is_inline = func.is_inline;
         let is_extern = modifiers.contains(TypeModifiers::EXTERN);
         let is_noreturn = modifiers.contains(TypeModifiers::NORETURN);
@@ -1895,8 +1955,12 @@ impl<'a> Linearizer<'a> {
         // The definition is compiled under its own type's convention.
         self.current_calling_conv = func.calling_conv;
 
-        let mut ir_func = Function::new(self.emitted_name(func.name), func.return_type);
+        let mut ir_func = Function::new(name, func.return_type);
         ir_func.conv = func.calling_conv;
+        ir_func.isa = version
+            .as_ref()
+            .map_or_else(|| self.function_isa(func.attrs.target.as_ref()), |v| v.isa);
+        self.isa = ir_func.isa;
 
         // Whether this is an *inline definition*, which provides no external
         // definition and so must not be emitted.
@@ -1911,7 +1975,9 @@ impl<'a> Linearizer<'a> {
         // GNU inline, selected by `__gnu_inline__`, is the exact opposite on
         // the `extern` question: there `extern inline` is the one that
         // provides no external definition. glibc's `__fortify_function` relies
-        // on it.
+        // on it. Unlike C99's, that question is asked of the definition's own
+        // specifiers alone, as the parser asks it to allow the real
+        // definition after the inline-only one (`gnu_inline_only`).
         //
         // `static inline` is neither -- it has internal linkage and is emitted
         // like any other static function.
@@ -1920,13 +1986,14 @@ impl<'a> Linearizer<'a> {
         // `-fgnu89-inline` makes the GNU rule the default for every inline
         // function, which is what the attribute selects one at a time.
         let gnu_inline = func.attrs.gnu_inline || crate::builtins::gnu89_inline();
-        let is_inline_definition = is_inline
-            && !is_static
-            && if gnu_inline {
-                has_extern_decl
-            } else {
-                !has_extern_decl && all_decls_inline
-            };
+        let is_inline_definition = if gnu_inline {
+            let mut storage = TypeModifiers::empty();
+            storage.set(TypeModifiers::EXTERN, is_extern);
+            storage.set(TypeModifiers::INLINE, is_inline);
+            func.attrs.gnu_inline_only(storage)
+        } else {
+            is_inline && !is_static && !has_extern_decl && all_decls_inline
+        };
 
         // C99 6.7.4p3 constrains an inline *definition*, not every non-static
         // inline function: what it forbids -- naming an identifier with
@@ -1941,20 +2008,34 @@ impl<'a> Linearizer<'a> {
         ir_func.emit = !is_inline_definition;
         ir_func.is_noreturn = is_noreturn;
         ir_func.is_inline = is_inline;
-        ir_func.symbol_attrs = func.attrs.symbol.clone();
-        // `alias` on a definition -- written on it, or on an earlier
-        // prototype -- asks for two things one symbol cannot be. Recorded
-        // like any other alias, so `resolve_aliases` reports it once.
+        // How the symbol is emitted: by the definition's own attributes, or
+        // by a version's share of them.
+        match &version {
+            Some(v) => {
+                ir_func.symbol_attrs = v.attrs.symbol.clone();
+                ir_func.constructor = v.attrs.constructor;
+                ir_func.destructor = v.attrs.destructor;
+            }
+            None => {
+                ir_func.symbol_attrs = func.attrs.symbol.clone();
+                ir_func.constructor = func.attrs.constructor;
+                ir_func.destructor = func.attrs.destructor;
+            }
+        }
+        // `alias` or `ifunc` on a definition -- written on it, or on an
+        // earlier prototype -- asks for two things one symbol cannot be.
+        // Recorded like any other alias, so `resolve_aliases` reports it once.
         if ir_func.symbol_attrs.alias.take().is_some() {
-            let kind = super::linearize_init::AliasKind::Function;
-            self.declare_alias(&ir_func.name, &func.attrs.symbol, is_static, kind, func.pos);
+            let typ = self
+                .symbols
+                .lookup(func.name, crate::symbol::Namespace::Ordinary)
+                .map_or(func.return_type, |s| s.typ);
+            self.declare_alias(&ir_func.name, &func.attrs.symbol, is_static, typ, func.pos);
         }
         ir_func.align = func.attrs.align;
         ir_func.is_noinline = func.attrs.noinline;
         ir_func.declared_effect = func.attrs.effect;
         ir_func.is_always_inline = func.attrs.always_inline;
-        ir_func.constructor = func.attrs.constructor;
-        ir_func.destructor = func.attrs.destructor;
 
         let ret_kind = self.types.kind(func.return_type);
         // A vector is returned as its carrier, which is what the function
@@ -2312,7 +2393,7 @@ impl<'a> Linearizer<'a> {
             let val = self.linearize_converted(e, ret_type);
             let size = self.types.size_bits(ret_type);
             self.emit(Instruction::store(val, sret_ptr, 0, ret_type, size));
-            self.emit(Instruction::ret_typed(
+            self.emit_return(Instruction::ret_typed(
                 Some(sret_ptr),
                 self.types.void_ptr_id,
                 64,
@@ -2336,7 +2417,9 @@ impl<'a> Linearizer<'a> {
         };
         self.emit_block_copy(sret_ptr, src_addr, struct_bytes as i64, vol);
 
-        self.emit(Instruction::ret_typed(
+        // The value is in the caller's buffer before any cleanup runs, so a
+        // cleanup that scrubs the variable returned does not reach it.
+        self.emit_return(Instruction::ret_typed(
             Some(sret_ptr),
             self.types.void_ptr_id,
             64,
@@ -2408,9 +2491,12 @@ impl<'a> Linearizer<'a> {
         // lives, because the inliner has to ask the same question of the
         // `Ret` this emits.
         if super::aggregate_ret_is_address(&ret_class, struct_size) {
+            // The `Ret` reads the value through the address when the function
+            // returns, which is after the cleanups have run.
+            let src_addr = self.outlive_cleanups(src_addr, ret_type, 0);
             let mut ret_insn = Instruction::ret_typed(Some(src_addr), ret_type, struct_size);
             ret_insn.extra_mut().abi_info = Some(Box::new(CallAbiInfo::new(vec![], ret_class)));
-            self.emit(ret_insn);
+            self.emit_return(ret_insn);
             return;
         }
 
@@ -2447,7 +2533,7 @@ impl<'a> Linearizer<'a> {
         let mut ret_insn = Instruction::ret_typed(Some(low_temp), ret_type, struct_size);
         ret_insn.src.push(high_temp);
         ret_insn.extra_mut().abi_info = Some(Box::new(CallAbiInfo::new(vec![], ret_class)));
-        self.emit(ret_insn);
+        self.emit_return(ret_insn);
     }
 
     // Expression linearization
@@ -2892,6 +2978,37 @@ impl<'a> Linearizer<'a> {
         addr
     }
 
+    /// Whether a value of `typ` is carried as the address of its storage: a
+    /// complex number, a vector, or an aggregate that does not travel by
+    /// value ([`Self::aggregate_travels_by_value`]).
+    fn value_is_storage(&self, typ: TypeId) -> bool {
+        self.types.is_complex(typ)
+            || self.types.is_vector(typ)
+            || matches!(self.types.kind(typ), TypeKind::Struct | TypeKind::Union)
+                && !self.aggregate_travels_by_value(typ)
+    }
+
+    /// `value`, a value of type `typ`, in storage of its own: when
+    /// [`Self::value_is_storage`], a copy in a frame temporary that lives as
+    /// long as the function, and otherwise `value` itself.
+    ///
+    /// For a value that has to outlive whatever storage it was read from --
+    /// an object whose lifetime ends, or that a cleanup is about to change --
+    /// before anything has used it.
+    pub(crate) fn detach_value(&mut self, value: PseudoId, typ: TypeId) -> PseudoId {
+        if !self.value_is_storage(typ) {
+            return value;
+        }
+        let copy = self.frame_temp_addr("__value_copy", typ);
+        let bytes = self.types.size_bytes(typ) as i64;
+        let vol = BlockVolatility {
+            dst: false,
+            src: self.types.contains_volatile(typ),
+        };
+        self.emit_block_copy(copy, value, bytes, vol);
+        copy
+    }
+
     /// Whether a struct or union of this type travels in the IR as its value
     /// rather than its address: it does when it fits in one register, the
     /// threshold [`Self::read_object`] applies. A complex value always
@@ -2910,7 +3027,15 @@ impl<'a> Linearizer<'a> {
     /// decays (C17 6.3.2.1p3, 7.16p3), a function designator converts to a
     /// pointer (6.3.2.1p4), and an aggregate that does not travel by value
     /// ([`Self::aggregate_travels_by_value`]) is used where it lies.
+    ///
+    /// So is a complex object, at every size: every consumer of a complex
+    /// value reads its halves through an address. Reading one as a single
+    /// wide load handed `({ v; })` and `(0, v)` the number's bits where its
+    /// address was wanted, and they were dereferenced.
     pub(crate) fn object_reads_as_address(&self, typ: TypeId) -> bool {
+        if self.types.is_complex(typ) {
+            return true;
+        }
         match self.types.kind(typ) {
             TypeKind::Array | TypeKind::Function => true,
             TypeKind::VaList => !self.types.va_list_is_pointer(),
@@ -6420,8 +6545,8 @@ impl<'a> Linearizer<'a> {
     }
 
     /// GNU `&&label`: the address of a label, for a computed goto.
-    fn linearize_label_addr(&mut self, name: &StringId, expr: &Expr) -> PseudoId {
-        let Some(sym) = self.take_label_address(*name, expr.pos) else {
+    fn linearize_label_addr(&mut self, label: LabelId, expr: &Expr) -> PseudoId {
+        let Some(sym) = self.take_label_address(label, expr.pos) else {
             return self.emit_const(0, self.types.void_ptr_id);
         };
         let sym_pseudo = self.sym_pseudo(sym);
@@ -6582,7 +6707,7 @@ impl<'a> Linearizer<'a> {
             // exactly this spelling -- `Label::name()` -- and both backends
             // already lower a leading-`.` global to a pc-relative address, so
             // this needs no opcode of its own.
-            ExprKind::LabelAddr(name) => self.linearize_label_addr(name, expr),
+            ExprKind::LabelAddr(label) => self.linearize_label_addr(*label, expr),
 
             // One extent of a variably modified `typedef`, evaluated when the
             // typedef's declaration was reached and stored in a hidden local
@@ -6846,7 +6971,13 @@ impl<'a> Linearizer<'a> {
                 }
                 // The result is the value of the final expression, computed
                 // before the scope ends: it may read the VLA being released.
+                // A value carried as an address is copied out of the block
+                // first. It may name an object declared here, whose slot is
+                // free for reuse once the block ends -- `f(({ struct S x =
+                // ...; x; }), ({ struct S y = ...; y; }))` passed `y` twice
+                // -- or one a cleanup run below changes.
                 let value = self.linearize_expr(result);
+                let value = self.detach_value(value, self.expr_type(result));
                 self.switch_stack = enclosing_switches;
                 self.pop_scope(scope);
                 value
@@ -6925,6 +7056,9 @@ mod test_linearize_call;
 #[cfg(test)]
 #[path = "test_linearize_cfg.rs"]
 mod test_linearize_cfg;
+#[cfg(test)]
+#[path = "test_linearize_cleanup.rs"]
+mod test_linearize_cleanup;
 #[cfg(test)]
 #[path = "test_linearize_expr.rs"]
 mod test_linearize_expr;

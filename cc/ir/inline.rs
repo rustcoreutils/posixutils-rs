@@ -173,6 +173,19 @@ pub struct InlineCandidate {
     pub call_count: usize,
     /// Whether the function returns a complex value (should not inline)
     pub ret_is_address: bool,
+    /// The x86-64 ISA the body was compiled for; see [`isa_allows_inlining`].
+    pub isa: crate::target::X86Isa,
+}
+
+/// Whether a body compiled for `callee` may be spliced into a function
+/// compiled for `caller`: only when the caller has every extension the
+/// callee's code may use, gcc's rule for `target` functions. A
+/// `target("sse4.1")` body inlined into a baseline function would run SSE4.1
+/// instructions wherever the baseline one runs -- the very thing the runtime
+/// dispatch around it exists to prevent. The other way is safe: baseline
+/// code is valid in an SSE4.1 function, and gcc inlines it.
+fn isa_allows_inlining(caller: crate::target::X86Isa, callee: crate::target::X86Isa) -> bool {
+    caller.includes(callee)
 }
 
 impl InlineCandidate {
@@ -248,6 +261,7 @@ fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> In
         is_interposable: func.symbol_attrs.weak && !func.is_static,
         has_inline_hint: func.is_inline,
         ret_is_address: func.ret_is_address,
+        isa: func.isa,
         ..Default::default()
     };
 
@@ -1516,6 +1530,7 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
             // number of small callees each pass the growth and stack caps
             // against the same unchanged size.
             let mut caller_size = function_size(&module.functions[func_idx]);
+            let caller_isa = module.functions[func_idx].isa;
 
             // Check if caller is recursive (calls itself directly).
             // NOTE: mutual recursion (A→B→A) is not detected; those callers
@@ -1539,6 +1554,7 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
                     if let Some(candidate) = candidates.get(callee_name) {
                         // Don't inline recursive calls
                         if callee_name != caller_name
+                            && isa_allows_inlining(caller_isa, candidate.isa)
                             && should_inline(
                                 candidate,
                                 opt,
@@ -1873,6 +1889,7 @@ mod tests {
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
+            isa: Default::default(),
         };
 
         // Small function should always inline at -O1
@@ -1905,6 +1922,7 @@ mod tests {
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
+            isa: Default::default(),
         };
 
         assert!(
@@ -1955,6 +1973,7 @@ mod tests {
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
+            isa: Default::default(),
         };
 
         // Varargs functions should never inline
@@ -1981,6 +2000,7 @@ mod tests {
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
+            isa: Default::default(),
         };
 
         // Recursive functions should not inline
@@ -2007,6 +2027,7 @@ mod tests {
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
+            isa: Default::default(),
         };
 
         // Should not inline at -O0
@@ -2033,6 +2054,7 @@ mod tests {
             call_count: 1,
             is_noinline: false,
             is_always_inline: false,
+            isa: Default::default(),
         };
 
         // 30 instructions with inline hint should inline
@@ -2244,6 +2266,7 @@ mod tests {
         module.aliases.push(crate::ir::SymbolAlias {
             name: "api".to_string(),
             target: "impl".to_string(),
+            form: crate::parse::ast::AliasForm::Alias,
             is_static: false,
             weak: false,
             visibility: None,
@@ -3150,6 +3173,35 @@ mod tests {
         assert_eq!(function_size(&module.functions[1]), 10);
         run(&mut module, opt_at(2));
         assert_eq!(calls_left(&module, "big", "leaf"), 4);
+    }
+
+    /// A `target("sse4.1")` body is never spliced into a baseline function,
+    /// where its SSE4.1 instructions would run on any CPU; a baseline body is
+    /// spliced into an SSE4.1 function, where it is valid. gcc 13 decides
+    /// both the same way.
+    #[test]
+    fn test_inlining_respects_the_target_isa() {
+        let src = r#"
+static int base(int x) { return x * 3 + 1; }
+__attribute__((target("sse4.1"))) static int hi(int x) { return x * 5 + 2; }
+__attribute__((target("sse4.1"))) int callhi(int x) { return base(x); }
+int callbase(int x) { return hi(x); }
+__attribute__((target("sse4.1"))) int callsame(int x) { return hi(x); }
+"#;
+        let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+        let mut module = crate::ir::linearize::test_linearize::linearize_source(src, &target);
+        run(&mut module, opt_at(2));
+        assert_eq!(
+            calls_left(&module, "callbase", "hi"),
+            1,
+            "SSE4.1 into baseline"
+        );
+        assert_eq!(
+            calls_left(&module, "callhi", "base"),
+            0,
+            "baseline into SSE4.1"
+        );
+        assert_eq!(calls_left(&module, "callsame", "hi"), 0, "same ISA");
     }
 
     /// The edges of a spliced body are the ones its instructions name, and

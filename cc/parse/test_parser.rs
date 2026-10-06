@@ -14,8 +14,8 @@
 use crate::float::IntegralRounding;
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, CalleeBinding, Declaration, Designator, Expr, ExprKind,
-    ExternalDecl, ForInit, FpTest, FunctionDef, InlineLibraryFn, Label, LibFn, MathErrno, MemoryFn,
-    Stmt, TranslationUnit, UnaryOp,
+    ExternalDecl, ForInit, FpTest, FunctionDef, InlineLibraryFn, Label, LabelScope, LibFn,
+    MathErrno, MemoryFn, Stmt, TranslationUnit, UnaryOp,
 };
 use crate::parse::parser::{ParseResult, Parser};
 use crate::strings::{StringId, StringTable};
@@ -1781,7 +1781,10 @@ fn test_continue_stmt() {
 fn test_goto_stmt() {
     let (stmt, strings) = parse_stmt("goto label;").unwrap();
     match stmt {
-        Stmt::Goto { name, .. } => check_name(&strings, name, "label"),
+        Stmt::Goto { label, .. } => {
+            check_name(&strings, label.name, "label");
+            assert_eq!(label.scope, LabelScope::Function);
+        }
         _ => panic!("Expected Goto"),
     }
 }
@@ -1814,10 +1817,10 @@ fn test_labeled_stmt() {
     let (stmt, strings) = parse_stmt("label: x = 1;").unwrap();
     match stmt {
         Stmt::Labeled { labels, stmt } => {
-            let [Label::Named { name, .. }] = labels.as_slice() else {
+            let [Label::Named { label, .. }] = labels.as_slice() else {
                 panic!("expected one goto label: {labels:?}");
             };
-            check_name(&strings, *name, "label");
+            check_name(&strings, label.name, "label");
             assert!(matches!(*stmt, Stmt::Expr(_)));
         }
         _ => panic!("Expected Label"),
@@ -1833,13 +1836,13 @@ fn test_consecutive_labels_are_one_list() {
     let Stmt::Labeled { labels, stmt } = stmt else {
         panic!("expected a labeled statement: {stmt:?}");
     };
-    let [Label::Case(_, None), Label::Named { name: a, .. }, Label::Default(_), Label::Case(_, Some(_)), Label::Named { name: b, .. }] =
+    let [Label::Case(_, None), Label::Named { label: a, .. }, Label::Default(_), Label::Case(_, Some(_)), Label::Named { label: b, .. }] =
         labels.as_slice()
     else {
         panic!("labels out of order: {labels:?}");
     };
-    check_name(&strings, *a, "a");
-    check_name(&strings, *b, "b");
+    check_name(&strings, a.name, "a");
+    check_name(&strings, b.name, "b");
     assert!(matches!(*stmt, Stmt::Expr(_)), "{stmt:?}");
 }
 
@@ -8363,17 +8366,23 @@ fn test_attributes_follow_their_declarator_in_a_list() {
     assert_eq!(weak, [("wa".to_string(), true), ("wb".to_string(), true)]);
 }
 
-/// `alias("target")` is a symbol attribute like `weak`: it reaches the
-/// declarator it is written on and no other, in either spelling.
+/// `alias("target")` and `ifunc("resolver")` are symbol attributes like
+/// `weak`: each reaches the declarator it is written on and no other, in
+/// either spelling, and says which of the two it is. `ifunc` on a variable
+/// is dropped.
 #[test]
 fn test_alias_attribute_reaches_its_declarator() {
+    use crate::parse::ast::AliasForm;
     let (tu, _types, strings, symbols) = parse_tu(
         "int a;\n\
          extern int b __attribute__((alias(\"a\"))), c;\n\
-         int f(void) __attribute__((__alias__(\"g\")));\n",
+         int f(void) __attribute__((__alias__(\"g\")));\n\
+         int h(void) __attribute__((ifunc(\"r\"))), i(void);\n\
+         int j(void) __attribute__((__ifunc__(\"r\")));\n\
+         int v __attribute__((ifunc(\"r\")));\n",
     )
     .unwrap();
-    let got: Vec<(String, Option<String>)> = tu
+    let got: Vec<(String, Option<(String, AliasForm)>)> = tu
         .items
         .iter()
         .filter_map(|item| match item {
@@ -8383,14 +8392,24 @@ fn test_alias_attribute_reaches_its_declarator() {
         .flatten()
         .map(|d| {
             let name = strings.get(symbols.get(d.symbol).name).to_string();
-            (name, d.symbol_attrs.alias.clone())
+            let attr = d.symbol_attrs.alias.clone();
+            (name, attr.map(|a| (a.target, a.form)))
         })
         .collect();
-    let want: Vec<(String, Option<String>)> =
-        [("a", None), ("b", Some("a")), ("c", None), ("f", Some("g"))]
-            .into_iter()
-            .map(|(n, t)| (n.to_string(), t.map(str::to_string)))
-            .collect();
+    let want: Vec<(String, Option<(String, AliasForm)>)> = [
+        ("a", None),
+        ("b", Some(("a", AliasForm::Alias))),
+        ("c", None),
+        ("f", Some(("g", AliasForm::Alias))),
+        ("h", Some(("r", AliasForm::Ifunc))),
+        ("i", None),
+        ("j", Some(("r", AliasForm::Ifunc))),
+        // Only a function can be indirect: gcc warns and drops it.
+        ("v", None),
+    ]
+    .into_iter()
+    .map(|(n, t)| (n.to_string(), t.map(|(t, f)| (t.to_string(), f))))
+    .collect();
     assert_eq!(got, want);
 }
 
@@ -9594,6 +9613,7 @@ struct OperandTypes {
     union: crate::types::TypeId,
     complex_int: crate::types::TypeId,
     long_ptr: crate::types::TypeId,
+    fn_ptr: crate::types::TypeId,
 }
 
 fn operand_types() -> OperandTypes {
@@ -9603,12 +9623,15 @@ fn operand_types() -> OperandTypes {
     let union = types.intern(Type::union_type(CompositeType::incomplete(None)));
     let complex_int = types.make_complex(types.int_id);
     let long_ptr = types.intern(Type::pointer(types.long_id));
+    let function = types.intern(Type::function(types.int_id, vec![], false, false));
+    let fn_ptr = types.intern(Type::pointer(function));
     OperandTypes {
         types,
         structure,
         union,
         complex_int,
         long_ptr,
+        fn_ptr,
     }
 }
 
@@ -9699,7 +9722,11 @@ fn binary_operand_verdicts() {
         v(ty.int_ptr_id),
         v(t.structure),
     );
-    let (lptr, vptr) = (v(t.long_ptr), v(ty.void_ptr_id));
+    let (lptr, vptr, fptr) = (v(t.long_ptr), v(ty.void_ptr_id), v(t.fn_ptr));
+    let vnull = Operand {
+        typ: ty.void_ptr_id,
+        null_constant: true,
+    };
     use BinaryOp::*;
     let table = [
         // Aggregates satisfy no operator.
@@ -9743,6 +9770,14 @@ fn binary_operand_verdicts() {
         (Eq, ptr, zero, Valid),
         (Gt, ptr, zero, Valid),
         (Eq, ptr, dbl, Invalid),
+        // `void *` against a function pointer: gcc's -pedantic extension
+        // for equality, unless the `void *` is a null pointer constant, and
+        // distinct types for ordering.
+        (Eq, vptr, fptr, FunctionPointerVoid),
+        (Ne, fptr, vptr, FunctionPointerVoid),
+        (Eq, fptr, vnull, Valid),
+        (Lt, vptr, fptr, DistinctPointers),
+        (Eq, ptr, fptr, DistinctPointers),
         // Logical operators take any scalar.
         (LogOr, ptr, cplx, Valid),
         (LogAnd, s, int, Invalid),
@@ -9871,4 +9906,117 @@ fn test_conditional_mismatched_arms_are_errors() {
         parse_tu(src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
         assert!(crate::diag::error_count() > before, "{src}: accepted");
     }
+}
+
+/// `cleanup(fn)` belongs to the declarator it is written on, or to every
+/// declarator when written among the specifiers, as gcc reads it; a trailing
+/// one replaces the specifiers'. Each becomes the checked call `fn(&var)`,
+/// and a `static` gets none.
+#[test]
+fn test_cleanup_attribute_reaches_its_declarator() {
+    let src = "void c(int *p); void d(int *p);\n\
+               void f(void) {\n\
+                 int a, b __attribute__((cleanup(c))), e;\n\
+                 __attribute__((cleanup(d))) int g, h __attribute__((__cleanup__(c)));\n\
+                 int __attribute__((cleanup(c))) i = 1, j = 2;\n\
+                 static int s __attribute__((cleanup(c)));\n\
+                 int k __attribute__((cleanup(d))) = sizeof(long), l;\n\
+               }\n";
+    let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+    let (tu, _types, strings, symbols) = parse_tu_for(src, &target).unwrap();
+    let name = |sym| strings.get(symbols.get(sym).name).to_string();
+    let body = tu
+        .items
+        .iter()
+        .find_map(|item| match item {
+            ExternalDecl::FunctionDef(f) => Some(&f.body),
+            _ => None,
+        })
+        .unwrap();
+    let Stmt::Block(items) = body else {
+        panic!("a function body is a block");
+    };
+    let mut got = Vec::new();
+    for item in items {
+        let BlockItem::Declaration(decl) = item else {
+            continue;
+        };
+        for d in &decl.declarators {
+            let cleanup = d.cleanup.as_ref().map(|call| {
+                let ExprKind::Call { func, args, .. } = &call.kind else {
+                    panic!("a cleanup is a call");
+                };
+                let ExprKind::Ident(callee) = func.kind else {
+                    panic!("a cleanup calls its function by name");
+                };
+                // The one argument is the variable's own address.
+                let [arg] = &args[..] else {
+                    panic!("a cleanup takes one argument");
+                };
+                assert!(
+                    matches!(&arg.kind, ExprKind::Unary { op: UnaryOp::AddrOf, operand }
+                        if matches!(operand.kind, ExprKind::Ident(v) if v == d.symbol)),
+                    "the argument of {}'s cleanup is &{0}",
+                    name(d.symbol)
+                );
+                name(callee)
+            });
+            got.push((name(d.symbol), cleanup));
+        }
+    }
+    let want: Vec<(String, Option<String>)> = [
+        ("a", None),
+        ("b", Some("c")),
+        ("e", None),
+        ("g", Some("d")),
+        ("h", Some("c")),
+        ("i", Some("c")),
+        ("j", Some("c")),
+        ("s", None),
+        ("k", Some("d")),
+        ("l", None),
+    ]
+    .into_iter()
+    .map(|(n, c)| (n.to_string(), c.map(str::to_string)))
+    .collect();
+    assert_eq!(got, want);
+}
+
+/// `target("...")` and `target_clones(...)` reach the definition's
+/// attributes, accumulated over its declarations as gcc accumulates them:
+/// one written on a prototype applies to the definition after it.
+#[test]
+fn test_target_attributes_reach_the_definition() {
+    use crate::target::{Arch, Os};
+    use crate::target_attr::{parse_target, parse_target_clones};
+    let x86 = Target::new(Arch::X86_64, Os::Linux);
+    let (tu, _types, strings, _symbols) = parse_tu_for(
+        "__attribute__((__target__(\"sse4.1,popcnt\"))) int e(int);\n\
+         int e(int x) { return x; }\n\
+         __attribute__((target_clones(\"sse4.2\", \"default\"))) int s(int x) { return x; }\n\
+         int p(int x) { return x; }\n",
+        &x86,
+    )
+    .unwrap();
+    let def = |name: &str| {
+        tu.items
+            .iter()
+            .find_map(|item| match item {
+                ExternalDecl::FunctionDef(f) if strings.get(f.name) == name => Some(f),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(
+        def("e").attrs.target,
+        Some(parse_target("sse4.1,popcnt", Arch::X86_64).0)
+    );
+    assert!(def("e").attrs.clones.is_none());
+    let items = ["sse4.2".to_string(), "default".to_string()];
+    assert_eq!(
+        def("s").attrs.clones,
+        parse_target_clones(&items, Arch::X86_64).0
+    );
+    assert!(def("s").attrs.clones.is_some());
+    assert!(def("p").attrs.target.is_none() && def("p").attrs.clones.is_none());
 }

@@ -71,29 +71,41 @@ pub fn is_variadic_function(func: &Function) -> bool {
     false
 }
 
-/// Escape a string for assembly output (.ascii/.asciz directives)
-/// Non-printable and non-ASCII characters are escaped as octal byte sequences.
+/// Escape a literal payload for assembly output (.ascii/.asciz directives).
+///
+/// A payload holds one `char` per byte (see `literal_payload`); a `char`
+/// beyond a byte is written as its UTF-8.
 pub fn escape_string(s: &str) -> String {
-    let mut result = String::new();
+    let mut bytes = Vec::with_capacity(s.len());
     for c in s.chars() {
-        match c {
-            '\n' => result.push_str("\\n"),
-            '\r' => result.push_str("\\r"),
-            '\t' => result.push_str("\\t"),
-            '\\' => result.push_str("\\\\"),
-            '"' => result.push_str("\\\""),
-            c if c.is_ascii_graphic() || c == ' ' => result.push(c),
-            c => {
-                // String literals represent raw byte values (0-255).
-                // Emit as single octal byte, not UTF-8 encoded.
-                if (c as u32) <= 255 {
-                    result.push_str(&format!("\\{:03o}", c as u8));
-                } else {
-                    for byte in c.to_string().as_bytes() {
-                        result.push_str(&format!("\\{:03o}", byte));
-                    }
-                }
-            }
+        match u8::try_from(c) {
+            Ok(b) => bytes.push(b),
+            Err(_) => bytes.extend_from_slice(c.to_string().as_bytes()),
+        }
+    }
+    escape_bytes(&bytes)
+}
+
+/// Escape a file name for an assembler string operand: `.file`, and the
+/// DWARF unit name and directory. A path is Rust text, so its bytes are its
+/// UTF-8.
+pub fn escape_path(path: &str) -> String {
+    escape_bytes(path.as_bytes())
+}
+
+/// The one escaping rule for every string written into assembly: `"` and
+/// `\` escaped, control and non-ASCII bytes as octal.
+fn escape_bytes(bytes: &[u8]) -> String {
+    let mut result = String::with_capacity(bytes.len());
+    for &b in bytes {
+        match b {
+            b'\n' => result.push_str("\\n"),
+            b'\r' => result.push_str("\\r"),
+            b'\t' => result.push_str("\\t"),
+            b'\\' => result.push_str("\\\\"),
+            b'"' => result.push_str("\\\""),
+            b if b.is_ascii_graphic() || b == b' ' => result.push(char::from(b)),
+            b => result.push_str(&format!("\\{:03o}", b)),
         }
     }
     result
@@ -113,6 +125,9 @@ pub struct CodeGenBase<I: LirInst> {
     pub lir_buffer: Vec<I>,
     /// Current function name (for label generation)
     pub current_fn: String,
+    /// The x86-64 ISA of the function being emitted (`ir::Function::isa`),
+    /// which picks the instructions a vector operation becomes.
+    pub isa: crate::target::X86Isa,
     /// Whether to emit unwind tables (the CFI procedures and their frame rules)
     pub emit_unwind_tables: bool,
     /// A source position for the function being emitted, for a backend
@@ -156,6 +171,7 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     /// Create a new CodeGenBase for the given target
     pub fn new(target: Target) -> Self {
         Self {
+            isa: target.x86_isa,
             target,
             output: String::new(),
             lir_buffer: Vec::with_capacity(DEFAULT_LIR_BUFFER_CAPACITY),
@@ -348,9 +364,11 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
         }
     }
 
-    /// `__attribute__((alias))` symbols, as gcc writes them on ELF: the
-    /// binding, the visibility, then `.set`. No `.type` or `.size` -- the
-    /// assembler copies both from the target.
+    /// `__attribute__((alias))` and `__attribute__((ifunc))` symbols, as gcc
+    /// writes them on ELF: the binding, the visibility, then `.set`. An alias
+    /// has no `.type` or `.size` -- the assembler copies both from the
+    /// target -- and an indirect function is typed `@gnu_indirect_function`,
+    /// which is what makes `.set` name its resolver rather than itself.
     pub fn emit_symbol_aliases(&mut self, module: &Module) {
         for alias in &module.aliases {
             let sym = Symbol::global(&alias.name);
@@ -364,6 +382,12 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             }
             if let Some(how) = &alias.visibility {
                 self.push_directive(Directive::Visibility(sym.clone(), how.clone()));
+            }
+            if alias.form == crate::parse::ast::AliasForm::Ifunc {
+                self.push_directive(Directive::Type {
+                    sym: sym.clone(),
+                    kind: crate::arch::lir::SymbolType::GnuIndirectFunction,
+                });
             }
             self.push_directive(Directive::SymbolAlias {
                 sym,

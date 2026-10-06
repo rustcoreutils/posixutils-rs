@@ -348,6 +348,12 @@ pub struct Parser<'a> {
     /// How many `switch` bodies enclose the statement being parsed, which is
     /// all a `fallthrough` attribute statement needs to know to be valid.
     pub(super) switch_depth: u32,
+    /// The GNU `__label__` declarations in force, one list per enclosing
+    /// block or statement expression, innermost last: each name with the
+    /// number of its [`super::ast::LabelScope::Local`].
+    pub(super) local_labels: Vec<Vec<(StringId, u32)>>,
+    /// The number the next `__label__` declaration takes.
+    pub(super) next_local_label: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -398,6 +404,8 @@ impl<'a> Parser<'a> {
             vm_typedefs: HashMap::new(),
             library_call_policy: Default::default(),
             switch_depth: 0,
+            local_labels: Vec::new(),
+            next_local_label: 0,
             pack_current: None,
             pack_stack: Vec::new(),
         }

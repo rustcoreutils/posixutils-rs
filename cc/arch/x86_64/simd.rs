@@ -95,7 +95,7 @@ impl X86_64CodeGen {
         } else {
             (XmmReg::Xmm15, XmmReg::Xmm14)
         };
-        let sse41 = self.base.target.x86_isa.simd >= X86Simd::Sse41;
+        let sse41 = self.base.isa.simd >= X86Simd::Sse41;
         let packed = |op, src, dst| X86Inst::Packed { op, src, dst };
         match op {
             SimdOp::Not => {

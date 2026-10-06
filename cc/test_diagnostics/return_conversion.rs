@@ -14,7 +14,8 @@
 //
 
 use crate::test_compile::{
-    compile, compile_expect_error, compile_expect_no_diagnostic, compile_expect_warning,
+    compile, compile_accepted, compile_expect_error, compile_expect_no_diagnostic,
+    compile_expect_warning,
 };
 
 const INT_TO_POINTER: &str = "makes pointer from integer without a cast";
@@ -126,10 +127,13 @@ fn return_pointer_integer_conversions_are_warned() {
         "int f(int *p){ return p; }\n",
         "returning 'int *' from a function with return type 'int' makes integer from pointer without a cast",
     );
-    compile_expect_warning(
-        "ret_fn_to_void_ptr",
-        "int *f(void); void *g(void){ return f; }\n",
-        "ISO C forbids return between function pointer and 'void *'",
+    // gcc's -pedantic extension: silent by default, flagged when asked.
+    let src = "int *f(void); void *g(void){ return f; }\n";
+    compile_expect_no_diagnostic("ret_fn_to_void_ptr", src, "ISO C forbids");
+    let stderr = compile_accepted("ret_fn_to_void_ptr_pedantic", src, &["-pedantic"]);
+    assert!(
+        stderr.contains("ISO C forbids return between function pointer and 'void *'"),
+        "{stderr}"
     );
 }
 

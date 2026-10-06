@@ -55,8 +55,10 @@ enum AttrArgs {
     /// Every argument is an integer constant expression.
     Integers(IntArgRole),
     /// A leading name, then strings and integer constants: `format(printf,
-    /// 1, 2)`, `mode(QI)`, `section("x")`, `cleanup(fn)`.
+    /// 1, 2)`, `mode(QI)`, `section("x")`.
     General,
+    /// `cleanup(fn)`: exactly one argument, the name of a function.
+    Cleanup,
     /// An attribute c17 does not recognise, whose arguments are not read.
     Unknown,
 }
@@ -75,6 +77,7 @@ impl AttrArgs {
             | "nonnull_if_nonzero"
             | "sentinel"
             | "regparm" => AttrArgs::Integers(IntArgRole::Unused),
+            "cleanup" if recognised => AttrArgs::Cleanup,
             _ if recognised => AttrArgs::General,
             _ => AttrArgs::Unknown,
         }
@@ -324,9 +327,15 @@ impl AttributeList {
         self.init_priority("destructor")
     }
 
-    /// Collect the attributes that affect how a function is emitted.
-    pub fn function_attrs(&self) -> crate::parse::ast::FunctionAttrs {
+    /// Collect the attributes that affect how a function is emitted, for
+    /// `target`.
+    pub fn function_attrs(
+        &self,
+        target: &crate::target::Target,
+    ) -> crate::parse::ast::FunctionAttrs {
         crate::parse::ast::FunctionAttrs {
+            target: self.target_request(target),
+            clones: self.target_clones(target),
             symbol: self.symbol_attrs(),
             noinline: self.has_noinline(),
             always_inline: self.has_always_inline(),
@@ -340,9 +349,10 @@ impl AttributeList {
         }
     }
 
-    /// The `weak`, `used`, `section(...)`, `visibility(...)` and `alias(...)`
-    /// requests in this list.
+    /// The `weak`, `used`, `section(...)`, `visibility(...)`, `alias(...)` and
+    /// `ifunc(...)` requests in this list.
     pub fn symbol_attrs(&self) -> crate::parse::ast::SymbolAttrs {
+        use crate::parse::ast::{AliasAttr, AliasForm};
         let mut out = crate::parse::ast::SymbolAttrs::default();
         for attr in &self.attrs {
             let text = |a: &Attribute| match a.args.first() {
@@ -350,12 +360,14 @@ impl AttributeList {
                 Some(AttributeArg::Ident(s)) => Some(s.clone()),
                 _ => None,
             };
+            let alias = |a: &Attribute, form| text(a).map(|target| AliasAttr { target, form });
             match attr.name.trim_matches('_') {
                 "weak" => out.weak = true,
                 "used" => out.used = true,
                 "section" => out.section = text(attr),
                 "visibility" => out.visibility = text(attr),
-                "alias" => out.alias = text(attr),
+                "alias" => out.alias = alias(attr, AliasForm::Alias),
+                "ifunc" => out.alias = alias(attr, AliasForm::Ifunc),
                 _ => {}
             }
         }
@@ -446,6 +458,9 @@ impl Parser<'_> {
         grammar: AttrArgs,
         first: bool,
     ) -> Result<Option<AttributeArg>, Diagnosed> {
+        if grammar == AttrArgs::Cleanup {
+            return self.parse_cleanup_arg(first);
+        }
         if grammar == AttrArgs::General && first && self.at_bare_attribute_name() {
             let ident = self.get_ident_name(self.current()).ok_or(Diagnosed)?;
             self.advance();
@@ -493,10 +508,13 @@ impl Parser<'_> {
         name: &str,
         grammar: AttrArgs,
     ) -> Result<Vec<AttributeArg>, Diagnosed> {
+        let pos = self.current_pos();
         let mut args = Vec::new();
         let mut result = Ok(());
         let mut first = true;
+        let mut count = 0;
         while !self.is_special(b')') && !self.is_eof() {
+            count += 1;
             if grammar == AttrArgs::Unknown {
                 // An attribute c17 does not know has a grammar c17 does not
                 // know either -- clang's `availability(macos, introduced=10.4)`
@@ -525,7 +543,64 @@ impl Parser<'_> {
         if self.is_special(b')') {
             self.advance();
         }
+        if grammar == AttrArgs::Cleanup && count != 1 && result.is_ok() {
+            Self::report_cleanup_arg_count(pos);
+            result = Err(Diagnosed);
+        }
         result.map(|()| args)
+    }
+
+    /// One argument of `cleanup`. Only the first is read, and it has to be a
+    /// bare name; a second is the count error [`Self::parse_attribute_args`]
+    /// reports once the list is read.
+    fn parse_cleanup_arg(&mut self, first: bool) -> Result<Option<AttributeArg>, Diagnosed> {
+        if first && self.at_bare_attribute_name() {
+            let ident = self.get_ident_name(self.current()).ok_or(Diagnosed)?;
+            self.advance();
+            return Ok(Some(AttributeArg::Ident(ident)));
+        }
+        let pos = self.current_pos();
+        self.skip_attribute_arg();
+        if first {
+            diag::error(pos, &gettext("cleanup argument not an identifier"));
+            return Err(Diagnosed);
+        }
+        Ok(None)
+    }
+
+    /// `cleanup` takes exactly one argument, in gcc's words.
+    fn report_cleanup_arg_count(pos: Position) {
+        diag::error_args(
+            pos,
+            "wrong number of arguments specified for '{0}' attribute",
+            &["cleanup"],
+        );
+    }
+
+    /// Check that the name `cleanup(fn)` gives is a function: the name of a
+    /// variable, even a pointer to one, is an error, as in gcc. `Err` drops
+    /// the attribute.
+    fn check_cleanup_function(
+        &self,
+        args: &[AttributeArg],
+        pos: Position,
+    ) -> Result<(), Diagnosed> {
+        let [AttributeArg::Ident(name)] = args else {
+            Self::report_cleanup_arg_count(pos);
+            return Err(Diagnosed);
+        };
+        if self.cleanup_function(name).is_some() {
+            return Ok(());
+        }
+        diag::error(pos, &gettext("cleanup argument not a function"));
+        Err(Diagnosed)
+    }
+
+    /// The function a `cleanup(name)` names, if `name` is one.
+    fn cleanup_function(&self, name: &str) -> Option<crate::symbol::SymbolId> {
+        let id = self.idents.lookup(name)?;
+        let symbol = self.symbols.lookup_id(id, Namespace::Ordinary)?;
+        (self.symbols.get(symbol).kind == crate::symbol::SymbolKind::Function).then_some(symbol)
     }
 
     /// Check the arguments of an integer-valued attribute against what its
@@ -603,8 +678,21 @@ impl Parser<'_> {
         } else {
             Vec::new()
         };
-        if let AttrArgs::Integers(role) = grammar {
-            self.check_integer_args(&name, role, &args, pos).ok()?;
+        match grammar {
+            AttrArgs::Integers(role) => self.check_integer_args(&name, role, &args, pos).ok()?,
+            AttrArgs::Cleanup => self.check_cleanup_function(&args, pos).ok()?,
+            _ => {}
+        }
+        let target_attr = match name.trim_matches('_') {
+            "target" => Some(false),
+            "target_clones" => Some(true),
+            _ => None,
+        };
+        if let (true, Some(clones)) = (recognised, target_attr) {
+            let target = self.types.target();
+            if !super::target_attr::check_target_args(clones, &args, pos, &target) {
+                return None;
+            }
         }
 
         // A mode or a vector width replaces the declared type, so each is
@@ -719,8 +807,47 @@ impl Parser<'_> {
     }
 
     /// Accumulate the symbol-emission attributes from one attribute list.
+    ///
+    /// `cleanup(fn)` is resolved to its function here, as the declaration is
+    /// read: gcc looks the name up where the attribute is written, so
+    /// `int c __attribute__((cleanup(c)))` names the function, not the
+    /// variable being declared.
     pub(super) fn merge_symbol_attrs(&mut self, attrs: &AttributeList) {
-        self.pending_symbol_attrs.merge(&attrs.symbol_attrs());
+        let mut symbol_attrs = attrs.symbol_attrs();
+        symbol_attrs.cleanup = attrs.find("cleanup").and_then(|a| match a.args.first() {
+            Some(AttributeArg::Ident(name)) => self.cleanup_function(name),
+            _ => None,
+        });
+        self.pending_symbol_attrs.merge(&symbol_attrs);
+    }
+
+    /// `cleanup(fn)` on something that has no scope to leave -- a member, a
+    /// parameter -- is dropped with gcc's warning.
+    pub(super) fn drop_pending_cleanup(&mut self, pos: Position) {
+        if self.pending_symbol_attrs.cleanup.take().is_some() {
+            Self::warn_cleanup_ignored(pos);
+        }
+    }
+
+    /// `ifunc("resolver")` on anything but a function is dropped with gcc's
+    /// warning: only a function can be indirect, and the object is declared
+    /// as written.
+    pub(super) fn drop_ifunc(attrs: &mut crate::parse::ast::SymbolAttrs, pos: Position) {
+        let form = attrs.alias.as_ref().map(|a| a.form);
+        if form != Some(crate::parse::ast::AliasForm::Ifunc) {
+            return;
+        }
+        attrs.alias = None;
+        if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
+            diag::warning_args(pos, "'{0}' attribute ignored", &["ifunc"]);
+        }
+    }
+
+    /// gcc's warning for a `cleanup(fn)` it ignores.
+    pub(super) fn warn_cleanup_ignored(pos: Position) {
+        if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
+            diag::warning_args(pos, "'{0}' attribute ignored", &["cleanup"]);
+        }
     }
 
     /// `transparent_union` is a union attribute. gcc warns and ignores it
@@ -1012,7 +1139,7 @@ impl Parser<'_> {
                 self.pending_packed |= attrs.has_packed();
                 self.merge_symbol_attrs(&attrs);
                 self.merge_calling_conv(&attrs, pos);
-                let fn_attrs = attrs.function_attrs();
+                let fn_attrs = attrs.function_attrs(&self.types.target());
                 self.pending_fn_attrs.merge(&fn_attrs);
             } else if self.is_asm_keyword() {
                 self.parse_asm_label();

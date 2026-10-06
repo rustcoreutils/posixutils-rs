@@ -225,7 +225,7 @@ impl<'a> Preprocessor<'a> {
         if let Some(tok) = iter.peek() {
             if !tok.pos.newline && tok.typ == TokenType::String {
                 if let TokenValue::String(spelled) = &tok.value {
-                    name = Some(payload_text(spelled));
+                    name = Some(decode_string_spelling(spelled));
                 }
                 iter.next();
             }
@@ -1594,7 +1594,7 @@ impl<'a> Preprocessor<'a> {
         // position and the debug line table all follow it. A file's name
         // keeps the system-header status it had.
         let name = tokens.get(1).and_then(|t| match &t.value {
-            TokenValue::String(s) => Some(payload_text(s)),
+            TokenValue::String(s) => Some(decode_string_spelling(s)),
             _ => None,
         });
         let is_system = diag::stream_is_system(self.physical_stream);

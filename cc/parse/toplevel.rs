@@ -297,6 +297,14 @@ impl Parser<'_> {
     }
 
     pub(crate) fn parse_external_decl(&mut self) -> ParseResult<ExternalDecl> {
+        // `__label__` declares labels local to a block; at file scope gcc
+        // reads it as a misplaced keyword where a declarator should begin.
+        if self.current_ident() == Some(crate::kw::GNU_LABEL) {
+            return Err(ParseError::new(
+                gettext("expected identifier or '(' before '__label__'"),
+                self.current_pos(),
+            ));
+        }
         if self.at_attribute_declaration() {
             return self.parse_file_attribute_declaration();
         }
@@ -316,8 +324,9 @@ impl Parser<'_> {
         pos: Position,
         typ: TypeId,
         params: Option<Vec<RawParam>>,
-        attrs: FunctionAttrs,
+        mut attrs: FunctionAttrs,
     ) -> ParseResult<FunctionDef> {
+        super::target_attr::resolve_target_conflict(&mut attrs, pos);
         let mut params = params.unwrap_or_default();
         let typ = self.parse_old_style_parameters(typ, &mut params)?;
         self.check_parameters_complete(&params, pos);
@@ -343,13 +352,9 @@ impl Parser<'_> {
             ParamStyle::IdentifierList => Redeclared::IdentifierListDefinition,
         };
         self.check_redeclaration(name, typ, pos, form);
-        // A GNU inline-only body -- `extern inline` under `gnu_inline`
-        // semantics -- emits nothing, so a real definition may join it.
-        let gnu_inline = attrs.gnu_inline || crate::builtins::gnu89_inline();
-        let inline_only = gnu_inline
-            && specs
-                .storage_class
-                .contains(TypeModifiers::EXTERN | TypeModifiers::INLINE);
+        // A GNU inline-only body emits nothing, so a real definition may
+        // follow it.
+        let inline_only = attrs.gnu_inline_only(specs.storage_class);
         let linkage = self.declare_linkage(Declared {
             name,
             typ,
@@ -497,7 +502,7 @@ impl Parser<'_> {
             declared = true;
             let knr_pos = self.current_pos();
             let knr_type = self
-                .parse_declaration_specifiers(SpecContext::Declaration)?
+                .parse_declaration_specifiers(SpecContext::Parameter)?
                 .ty;
             let knr_base_id = self.intern_type_with_tag(&knr_type);
             loop {

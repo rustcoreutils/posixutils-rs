@@ -120,7 +120,9 @@ pub fn frame_size(asm: &str, func: &str) -> Option<i64> {
 }
 
 /// The host's assembly for `src` at `-O0`, for tests that need to see the
-/// directives rather than the program's answer.
+/// directives rather than the program's answer. Its only caller is gated to
+/// the one host whose frame layout it inspects.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub fn host_asm(prefix: &str, src: &str) -> String {
     crate::common::asm_for_at(prefix, src, &[])
 }

@@ -274,7 +274,7 @@ impl<'a> Preprocessor<'a> {
         let is_va_args = matches!(&token.value, TokenValue::Ident(id)
             if token.typ == TokenType::Ident && idents.get_opt(*id) == Some("__VA_ARGS__"));
         if is_va_args {
-            diag::warning(
+            diag::pedwarn_default(
                 token.pos,
                 &gettext("__VA_ARGS__ can only appear in the expansion of a C99 variadic macro"),
             );
@@ -317,7 +317,7 @@ impl<'a> Preprocessor<'a> {
     fn warn_extra_tokens(&self, iter: &mut TokenCursor, directive: &str) {
         if iter.peek().is_some_and(|t| !t.pos.newline) {
             let pos = iter.peek().map(|t| t.pos).unwrap_or_default();
-            diag::warning_args(pos, "extra tokens at end of #{0} directive", &[directive]);
+            diag::pedwarn_default_args(pos, "extra tokens at end of #{0} directive", &[directive]);
         }
         self.skip_to_eol(iter);
     }
@@ -495,7 +495,7 @@ impl<'a> Preprocessor<'a> {
         if !is_function {
             if let Some(next) = iter.peek() {
                 if !next.pos.newline && !next.pos.whitespace {
-                    diag::warning(
+                    diag::pedwarn_default(
                         next.pos,
                         &gettext("ISO C99 requires whitespace after the macro name"),
                     );
@@ -537,7 +537,11 @@ impl<'a> Preprocessor<'a> {
         // break a great deal of code that redefines a macro benignly.
         if let Some(existing) = self.macros.get(&name) {
             if let Some(why) = macro_redefinition_conflict(existing, &mac) {
-                diag::warning_args(name_pos, "'{0}' redefined: {1}", &[&name.to_string(), why]);
+                diag::pedwarn_default_args(
+                    name_pos,
+                    "'{0}' redefined: {1}",
+                    &[&name.to_string(), why],
+                );
             }
         }
 
@@ -770,7 +774,7 @@ impl<'a> Preprocessor<'a> {
             TokenValue::String(_) | TokenValue::HeaderName(_)
         );
         if header_name && expanded_tokens.len() > 1 {
-            diag::warning(
+            diag::pedwarn_default(
                 expanded_tokens[1].pos,
                 &gettext("extra tokens at end of #include directive"),
             );
@@ -1601,7 +1605,7 @@ impl<'a> Preprocessor<'a> {
         }
         // gcc warns and still takes the line number and file name.
         if tokens.len() > 2 {
-            diag::warning(
+            diag::pedwarn_default(
                 tokens[2].pos,
                 &gettext("extra tokens at end of #line directive"),
             );

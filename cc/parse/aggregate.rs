@@ -737,7 +737,7 @@ impl Parser<'_> {
                     .as_ref()
                     .is_some_and(|c| c.tag.is_some());
                 if tagged || !spelled_tag {
-                    diag::warning(
+                    diag::pedwarn_default(
                         self.current_pos(),
                         &gettext("declaration does not declare anything"),
                     );

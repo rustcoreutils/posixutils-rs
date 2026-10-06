@@ -669,16 +669,16 @@ impl Parser<'_> {
             }
             // 6.7.4p4: no function specifier on `main` in a hosted program.
             if file && spelled == "main" && storage.contains(TypeModifiers::INLINE) {
-                diag::warning(pos, &gettext("cannot inline function 'main'"));
+                diag::pedwarn_default(pos, &gettext("cannot inline function 'main'"));
             }
             return;
         }
         // 6.7.4p1: the function specifiers are for functions only. gcc warns.
         if storage.contains(TypeModifiers::INLINE) {
-            diag::warning_args(pos, "variable '{0}' declared 'inline'", &[spelled]);
+            diag::pedwarn_default_args(pos, "variable '{0}' declared 'inline'", &[spelled]);
         }
         if specs.ty.modifiers.contains(TypeModifiers::NORETURN) {
-            diag::warning_args(pos, "variable '{0}' declared '_Noreturn'", &[spelled]);
+            diag::pedwarn_default_args(pos, "variable '{0}' declared '_Noreturn'", &[spelled]);
         }
         if file {
             // 6.9p2: no `auto` or `register` on an external declaration --

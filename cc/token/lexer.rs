@@ -1238,7 +1238,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             if cu == b'\n' {
                 // Error: newline in string/char literal - emit warning
                 let delim_char = if delim == b'"' { '"' } else { '\'' };
-                diag::warning_args(
+                diag::pedwarn_default_args(
                     pos,
                     "missing terminating {0} character",
                     &[&delim_char.to_string()],

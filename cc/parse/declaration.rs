@@ -436,7 +436,7 @@ impl Parser<'_> {
         }
         // Only the first value initializes the scalar (6.7.9p11).
         if elements.len() > 1 {
-            diag::warning(init.pos, &gettext("excess elements in scalar initializer"));
+            diag::pedwarn_default(init.pos, &gettext("excess elements in scalar initializer"));
         }
         let mut first = elements.swap_remove(0).value;
         self.strip_scalar_braces(&mut first, levels + 1);
@@ -678,7 +678,7 @@ impl Parser<'_> {
         // The elements the subobjects take, each one or -- by brace
         // elision -- as many as its own subobjects take (6.7.9p20).
         if crate::parse::ast::initializer_list_end(self.types, elements, typ) < elements.len() {
-            diag::warning(init.pos, &gettext(message));
+            diag::pedwarn_default(init.pos, &gettext(message));
         }
     }
 
@@ -1500,9 +1500,13 @@ impl<'a> Parser<'a> {
                 continue;
             }
             if spelled.is_empty() {
-                diag::warning_args(pos, "unnamed parameter declared '{0}'", &[specifier]);
+                diag::pedwarn_default_args(pos, "unnamed parameter declared '{0}'", &[specifier]);
             } else {
-                diag::warning_args(pos, "parameter '{0}' declared '{1}'", &[spelled, specifier]);
+                diag::pedwarn_default_args(
+                    pos,
+                    "parameter '{0}' declared '{1}'",
+                    &[spelled, specifier],
+                );
             }
         }
     }
@@ -1908,7 +1912,7 @@ impl Parser<'_> {
             // flag changes only whether the translation unit is rejected.
             let msg = gettext("type specifier missing; implicit 'int' was removed in C99");
             if diag::permissive() {
-                diag::warning(pos, &msg);
+                diag::pedwarn_default(pos, &msg);
             } else {
                 diag::error(pos, &msg);
             }

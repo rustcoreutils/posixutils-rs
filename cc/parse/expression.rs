@@ -361,7 +361,7 @@ impl<'a> Parser<'a> {
                     return self.report_conditional_mismatch(pos);
                 }
                 if !self.is_null_pointer_constant(other) {
-                    diag::warning(
+                    diag::pedwarn_default(
                         pos,
                         &gettext("pointer/integer type mismatch in conditional expression"),
                     );
@@ -429,7 +429,7 @@ impl<'a> Parser<'a> {
             self.types.composite_type(tp, ep)
         } else {
             // gcc's answer, unqualified whatever the arms pointed to.
-            diag::warning(
+            diag::pedwarn_default(
                 pos,
                 &gettext("pointer type mismatch in conditional expression"),
             );
@@ -1785,7 +1785,7 @@ impl<'a> Parser<'a> {
             Some(name) => self.idents.get_opt(name).map_or(0, str::len),
             None => {
                 let spelled = self.idents.get_opt(spelled).unwrap_or("__func__");
-                diag::warning_args(
+                diag::pedwarn_default_args(
                     pos,
                     "'{0}' is not defined outside of function scope",
                     &[spelled],
@@ -2594,7 +2594,7 @@ impl<'a> Parser<'a> {
                         // keeps a misspelled variable from silently becoming a
                         // function.
                         let name_str = self.idents.get_opt(name_id).unwrap_or("").to_string();
-                        diag::warning_args(
+                        diag::pedwarn_default_args(
                             token_pos,
                             "implicit declaration of function '{0}'",
                             &[&name_str],
@@ -2973,7 +2973,7 @@ impl<'a> Parser<'a> {
                 // A truncated constant was already reported as too large;
                 // gcc says nothing more about the low bits it kept.
                 if !truncated {
-                    diag::warning(
+                    diag::pedwarn_default(
                         pos,
                         &gettext("integer constant is so large that it is unsigned"),
                     );

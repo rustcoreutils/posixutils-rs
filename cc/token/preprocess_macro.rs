@@ -489,7 +489,7 @@ impl<'a> Preprocessor<'a> {
                             Some(_) => {
                                 // gcc warns and leaves it alone rather than
                                 // rejecting the definition.
-                                diag::warning(
+                                diag::pedwarn_default(
                                     token.pos,
                                     &gettext("__VA_OPT__ is only meaningful in a variadic macro"),
                                 );

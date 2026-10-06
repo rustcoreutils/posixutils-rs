@@ -92,9 +92,9 @@ impl Parser<'_> {
     pub(super) fn parse_file_attribute_declaration(&mut self) -> ParseResult<ExternalDecl> {
         let (pos, attrs) = self.parse_attribute_declaration()?;
         if attrs.find(FALLTHROUGH).is_none() {
-            diag::warning(pos, &gettext("empty declaration"));
+            diag::pedwarn_default(pos, &gettext("empty declaration"));
         } else {
-            diag::group_warning(
+            diag::group_pedwarn_default(
                 ATTRIBUTE_WARNING,
                 pos,
                 &gettext("'fallthrough' attribute at top level"),
@@ -113,7 +113,7 @@ impl Parser<'_> {
         if attrs.find(FALLTHROUGH).is_some() {
             self.check_fallthrough_statement(pos, &attrs);
         } else {
-            diag::warning(pos, &gettext("empty declaration"));
+            diag::pedwarn_default(pos, &gettext("empty declaration"));
         }
         Ok(Stmt::Empty)
     }
@@ -126,7 +126,7 @@ impl Parser<'_> {
         if self.switch_depth == 0 {
             diag::error(pos, &gettext("invalid use of attribute 'fallthrough'"));
         } else if !self.may_reach_label() {
-            diag::warning(
+            diag::pedwarn_default(
                 pos,
                 &gettext("attribute 'fallthrough' not preceding a case label or default label"),
             );

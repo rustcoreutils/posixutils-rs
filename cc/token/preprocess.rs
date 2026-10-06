@@ -2146,7 +2146,7 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             // so. gcc warns here rather than erroring, so the expression still
             // evaluates.
             if !self.suppressed && !(0..64).contains(&right.v) {
-                diag::warning(
+                diag::pedwarn_default(
                     op_pos,
                     &gettext("integer overflow in preprocessor expression"),
                 );

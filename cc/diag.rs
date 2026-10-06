@@ -643,6 +643,15 @@ pub fn pedwarn_default_args(pos: Position, template: &str, args: &[&str]) {
     pedwarn_default(pos, &gettext_args(template, args));
 }
 
+/// [`pedwarn_default`] for a pedwarn in the warning group `name`: off under
+/// `-Wno-<name>`, and an error under `-Werror=<name>` as well as under
+/// `-pedantic-errors`.
+pub fn group_pedwarn_default(name: &str, pos: Position, msg: &str) {
+    if warning_group_enabled(name) {
+        give_pedwarn(Some(name), pos, msg);
+    }
+}
+
 /// A pedwarn that is given: an error under `-pedantic-errors`, a warning
 /// otherwise, in `group` as far as `-Werror` is concerned. As in gcc, `-w`
 /// and a system header leave it a warning, which is then not shown --

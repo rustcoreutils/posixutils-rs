@@ -543,3 +543,72 @@ fn test_paired_gnu_long_name_records_skip_the_whole_group() {
         "the diagnostic should report the member's real name: {err}"
     );
 }
+
+/// POSIX ustar: for typeflags 3, 4 and 6 "no data logical records shall be
+/// stored on the medium. Additionally, for type 6, the size field shall be
+/// ignored when reading." A FIFO header whose size field says 1024 must not
+/// swallow the member after it as its data.
+#[test]
+fn test_fifo_size_field_is_ignored() {
+    let mut a = Ustar {
+        name: b"fifo",
+        typeflag: b'6',
+        size: Some(1024),
+        ..Default::default()
+    }
+    .header()
+    .to_vec();
+    a.extend_from_slice(
+        &Ustar {
+            name: b"hidden.txt",
+            body: b"HIDDEN\n",
+            ..Default::default()
+        }
+        .member(),
+    );
+    a.extend_from_slice(
+        &Ustar {
+            name: b"visible.txt",
+            body: b"VISIBLE\n",
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let output = run_pax_with_stdin_bytes(&[], &a);
+    assert_success(&output, "list");
+    assert_eq!(stdout_str(&output), "fifo\nhidden.txt\nvisible.txt\n");
+}
+
+/// The same for character and block special files, whose headers carry no
+/// data either.
+#[test]
+fn test_device_size_field_carries_no_data() {
+    for typeflag in *b"34" {
+        let mut a = Ustar {
+            name: b"dev",
+            typeflag,
+            size: Some(512),
+            ..Default::default()
+        }
+        .header()
+        .to_vec();
+        a.extend_from_slice(
+            &Ustar {
+                name: b"next.txt",
+                body: b"NEXT\n",
+                ..Default::default()
+            }
+            .archive(),
+        );
+
+        let output = run_pax_with_stdin_bytes(&[], &a);
+        assert_success(&output, "list");
+        assert_eq!(
+            stdout_str(&output),
+            "dev\nnext.txt\n",
+            "typeflag {}",
+            typeflag as char
+        );
+    }
+}

@@ -115,7 +115,10 @@ impl<R: Read> ArchiveReader for UstarReader<R> {
             // own name field is truncated. The records and the member are
             // dropped together -- there can be more than one record.
             if long_name_record(header[TYPEFLAG_OFF]).is_some() {
-                skip_long_name_records(&mut self.reader, header)?;
+                self.current_size =
+                    consume_long_name_group(&mut self.reader, header, SizeRule::Ustar)?;
+                self.bytes_read = 0;
+                self.skip_data()?;
                 continue;
             }
 
@@ -246,7 +249,11 @@ pub(crate) enum SizeRule {
 
 impl SizeRule {
     /// The number of data bytes that actually follow this header.
-    fn data_size(self, entry_type: EntryType, declared: u64) -> u64 {
+    ///
+    /// `declared` is the size the archive records for the member -- the ustar
+    /// field, or a pax `size=` record that overrides it. Either way the type
+    /// decides whether any data follows.
+    pub(crate) fn data_size(self, entry_type: EntryType, declared: u64) -> u64 {
         match entry_type {
             // A directory's size field is a directory size limit, not a
             // length: POSIX says a system that does not implement such
@@ -255,6 +262,12 @@ impl SizeRule {
             EntryType::Directory => 0,
             EntryType::Symlink => 0,
             EntryType::Hardlink if self == SizeRule::Ustar => 0,
+            // Types 3, 4 and 6: "no data logical records shall be stored on
+            // the medium. Additionally, for type 6, the size field shall be
+            // ignored when reading." A device's size field has no meaning
+            // either, and libarchive ignores it for all three, so none of them
+            // is diagnosed.
+            EntryType::CharDevice | EntryType::BlockDevice | EntryType::Fifo => 0,
             _ => declared,
         }
     }
@@ -566,7 +579,7 @@ pub(crate) fn next_header_block(reader: &mut impl Read) -> PaxResult<Option<[u8;
 /// a long link target and a long name, so a reader that assumes exactly one
 /// record mistakes the second record's *header* for the member, and then reads
 /// the real member header as an ordinary one -- restoring it under the
-/// truncated name it was trying to avoid. `skip_long_name_records` consumes the
+/// truncated name it was trying to avoid. `consume_long_name_group` consumes the
 /// whole run.
 pub(crate) fn consume_long_name_record(
     reader: &mut impl Read,
@@ -585,20 +598,22 @@ pub(crate) fn consume_long_name_record(
     Ok(data[..end].to_vec())
 }
 
-/// Consume every long-name record preceding a member, then the member itself,
+/// Consume every long-name record preceding a member, and the member's header,
 /// and report the whole group as unsupported.
 ///
-/// `header` is the first record's header. Returns once the member has been
-/// stepped over, so the caller's next read is the following member.
+/// `header` is the first record's header. Returns the length of the member's
+/// data, which the caller steps over -- by seeking, where it can -- so that its
+/// next read is the following member.
 ///
 /// Implementing the extension is separate work. What this avoids is the
 /// alternative: extracting `././@LongLink` as a file of its own and the member
 /// under a name truncated to 100 bytes -- two wrong files, and the name that
 /// got path-checked is not the name the archive meant.
-pub(crate) fn skip_long_name_records(
+pub(crate) fn consume_long_name_group(
     reader: &mut impl Read,
     mut header: [u8; BLOCK_SIZE],
-) -> PaxResult<()> {
+    rule: SizeRule,
+) -> PaxResult<u64> {
     let mut long_name: Option<Vec<u8>> = None;
     let mut kinds: Vec<&'static str> = Vec::new();
 
@@ -614,7 +629,7 @@ pub(crate) fn skip_long_name_records(
         let Some(next) = next_header_block(reader)? else {
             // The archive ends after the record, with no member to skip.
             report_long_name_group(&long_name, &header, &kinds);
-            return Ok(());
+            return Ok(0);
         };
         if !verify_checksum(&next) {
             return Err(PaxError::InvalidHeader("checksum mismatch".to_string()));
@@ -624,7 +639,7 @@ pub(crate) fn skip_long_name_records(
 
     // `header` is now the member the records described.
     report_long_name_group(&long_name, &header, &kinds);
-    skip_member_data(reader, &header)
+    member_data_size(&header, rule)
 }
 
 /// Name the member that is being skipped, and the extensions that describe it.
@@ -648,10 +663,12 @@ fn report_long_name_group(
     );
 }
 
-/// Step over a member's data blocks without interpreting them.
-pub(crate) fn skip_member_data(reader: &mut impl Read, header: &[u8; BLOCK_SIZE]) -> PaxResult<()> {
-    let size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
-    skip_bytes(reader, round_up_block(size))
+/// The length of the data that follows a member header, by the same rule
+/// `parse_header` applies, without interpreting the rest of the header.
+fn member_data_size(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResult<u64> {
+    let declared = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
+    let entry_type = parse_typeflag(header[TYPEFLAG_OFF]).entry_type();
+    Ok(rule.data_size(entry_type, declared))
 }
 
 /// Verify header checksum
@@ -932,6 +949,23 @@ mod tests {
         header[NAME_OFF..NAME_OFF + 4].copy_from_slice(b"test");
         let checksum = calculate_checksum(&header);
         assert!(checksum > 0);
+    }
+
+    /// POSIX: no data records follow types 3, 4 and 6, whatever their size
+    /// field says, under either rule.
+    #[test]
+    fn test_special_files_carry_no_data() {
+        for rule in [SizeRule::Ustar, SizeRule::Pax] {
+            for t in [
+                EntryType::CharDevice,
+                EntryType::BlockDevice,
+                EntryType::Fifo,
+            ] {
+                assert_eq!(rule.data_size(t, 1024), 0);
+                assert!(!rule.size_must_be_zero(t));
+            }
+            assert_eq!(rule.data_size(EntryType::Regular, 1024), 1024);
+        }
     }
 
     #[test]

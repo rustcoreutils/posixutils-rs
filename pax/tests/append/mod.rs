@@ -629,3 +629,86 @@ fn test_append_to_pax_archive_whose_first_member_needs_no_extended_header() {
         assert!(listed.contains(name), "{name} missing from: {listed}");
     }
 }
+
+/// Append a file to a hand-built archive and return the member names a
+/// listing then reports.
+fn append_and_list(archive_bytes: &[u8]) -> Vec<String> {
+    let temp = TempDir::new().unwrap();
+    let archive = temp.path().join("a.tar");
+    fs::write(&archive, archive_bytes).unwrap();
+    fs::write(temp.path().join("newfile"), "NEW\n").unwrap();
+
+    let output = run_pax_in_dir(
+        &["-w", "-a", "-f", archive.to_str().unwrap(), "newfile"],
+        temp.path(),
+    );
+    assert_success(&output, "pax -w -a");
+
+    let output = run_pax_in_dir(&["-f", archive.to_str().unwrap()], temp.path());
+    assert_success(&output, "pax list after append");
+    stdout_str(&output).lines().map(String::from).collect()
+}
+
+/// A pax `size=` record overrides the ustar size field -- it is how members
+/// over 8 GiB are written. Finding the end of the archive by the ustar field
+/// alone reads the member's data as headers: here its zero blocks pass for the
+/// end-of-archive marker, and -a overwrites everything after them.
+#[test]
+fn test_append_honors_pax_size_record() {
+    let body = vec![0u8; 2048];
+    let mut a = Ustar {
+        name: b"PaxHeaders/big",
+        typeflag: b'x',
+        body: &pax_record("size", b"2048"),
+        ..Default::default()
+    }
+    .member();
+    let mut big = Ustar {
+        name: b"big",
+        size: Some(0),
+        ..Default::default()
+    }
+    .header()
+    .to_vec();
+    let mut data = body.clone();
+    pad_to_block(&mut data);
+    big.extend_from_slice(&data);
+    a.extend_from_slice(&big);
+    a.extend_from_slice(
+        &Ustar {
+            name: b"after",
+            body: b"AFTER\n",
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    assert_eq!(append_and_list(&a), ["big", "after", "newfile"]);
+}
+
+/// A directory's size field is a limit, not a length: no data follows it, and
+/// the reader already skips nothing. The append scan has to agree, or it skips
+/// the following members as the directory's "data" -- here past the end of the
+/// archive, so the new member lands after the trailer where no reader sees it.
+#[test]
+fn test_append_directory_with_nonzero_size_field() {
+    let mut a = Ustar {
+        name: b"d/",
+        typeflag: b'5',
+        mode: 0o755,
+        size: Some(10240),
+        ..Default::default()
+    }
+    .header()
+    .to_vec();
+    a.extend_from_slice(
+        &Ustar {
+            name: b"d/after",
+            body: b"AFTER\n",
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    assert_eq!(append_and_list(&a), ["d/", "d/after", "newfile"]);
+}

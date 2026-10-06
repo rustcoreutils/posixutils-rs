@@ -33,10 +33,11 @@ use crate::formats::ustar::{
     PREFIX_LEN, PREFIX_OFF, REGTYPE, SIZE_OFF, SYMTYPE, TYPEFLAG_OFF, UID_OFF, UNAME_LEN,
     UNAME_OFF, VERSION_OFF, ZERO_BLOCK,
 };
+use crate::formats::ArchiveStream;
 use crate::options::FormatOptions;
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
 
@@ -755,24 +756,51 @@ fn write_pax_record(data: &mut Vec<u8>, keyword: &str, value: &str) {
 
 /// pax archive reader
 pub struct PaxReader<R: Read> {
-    reader: R,
+    reader: ArchiveStream<R>,
     current_size: u64,
     bytes_read: u64,
     global_header: ExtendedHeader,
     /// `-o` options consulted on read (currently `delete=` keyword removal).
     options: FormatOptions,
+    /// Where the member being read begins, counting any extended header that
+    /// describes it. Once `read_entry` has returned `None` this is where the
+    /// end-of-archive indicator begins.
+    member_offset: u64,
+    /// Whether any `x` or `g` header has been read.
+    saw_extended_header: bool,
 }
 
 impl<R: Read> PaxReader<R> {
     /// Create a new pax reader
     pub fn new(reader: R) -> Self {
+        Self::from_stream(ArchiveStream::new(reader))
+    }
+
+    fn from_stream(reader: ArchiveStream<R>) -> Self {
         PaxReader {
             reader,
             current_size: 0,
             bytes_read: 0,
             global_header: ExtendedHeader::new(),
             options: FormatOptions::default(),
+            member_offset: 0,
+            saw_extended_header: false,
         }
+    }
+
+    /// The offset at which the end-of-archive indicator begins, once
+    /// `read_entry` has returned `None`.
+    ///
+    /// An `x` header with no member after it is left out, so that whatever is
+    /// written there next is not described by it. A trailing `g` header is
+    /// not: it applies to every member that follows, appended ones included.
+    pub fn end_of_archive(&self) -> u64 {
+        self.member_offset
+    }
+
+    /// Whether the archive has used any pax extended header so far.
+    pub fn saw_extended_header(&self) -> bool {
+        self.saw_extended_header
     }
 
     /// Attach `-o` format options (e.g. `delete=`) consulted while extracting.
@@ -815,6 +843,14 @@ impl<R: Read> PaxReader<R> {
     }
 }
 
+impl<R: Read + Seek> PaxReader<R> {
+    /// A reader over a seekable file, positioned at the start of the archive,
+    /// that seeks over member data instead of reading it.
+    pub fn seekable(reader: R) -> Self {
+        Self::from_stream(ArchiveStream::seekable(reader))
+    }
+}
+
 impl<R: Read> ArchiveReader for PaxReader<R> {
     fn read_entry(&mut self) -> PaxResult<Option<ArchiveEntry>> {
         // Skip any remaining data from previous entry
@@ -823,6 +859,9 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
         let mut extended_header: Option<ExtendedHeader> = None;
 
         loop {
+            if extended_header.is_none() {
+                self.member_offset = self.reader.offset();
+            }
             let header = match self.read_header_block()? {
                 Some(h) => h,
                 None => return Ok(None),
@@ -835,19 +874,27 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
                     // Global extended header - affects all subsequent files
                     let size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
                     self.global_header = self.read_extended_header(size)?;
+                    self.saw_extended_header = true;
                 }
                 PAX_XHDR => {
                     // Per-file extended header
                     let size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
                     extended_header = Some(self.read_extended_header(size)?);
+                    self.saw_extended_header = true;
                 }
                 _ if crate::formats::ustar::long_name_record(typeflag).is_some() => {
                     // A GNU long-name record describes the member that
                     // follows, whose own name field is truncated to 100 bytes.
                     // The records and the member are dropped together, and
                     // there can be more than one record -- see
-                    // skip_long_name_records.
-                    crate::formats::ustar::skip_long_name_records(&mut self.reader, header)?;
+                    // consume_long_name_group.
+                    self.current_size = crate::formats::ustar::consume_long_name_group(
+                        &mut self.reader,
+                        header,
+                        SizeRule::Pax,
+                    )?;
+                    self.bytes_read = 0;
+                    self.skip_data()?;
                 }
                 _ => {
                     // Regular file entry - parse and apply extended headers
@@ -862,6 +909,11 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
                     if let Some(ref ext) = extended_header {
                         ext.apply_to_filtered(&mut entry, &self.options);
                     }
+
+                    // A `size=` record replaces the size field, not the rule
+                    // for which types carry data: a directory or FIFO has
+                    // none whichever of the two records its size.
+                    entry.size = SizeRule::Pax.data_size(entry.entry_type, entry.size);
 
                     self.current_size = entry.size;
                     self.bytes_read = 0;
@@ -889,7 +941,7 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
         let to_skip = total_bytes.saturating_sub(self.bytes_read);
 
         if to_skip > 0 {
-            skip_bytes(&mut self.reader, to_skip)?;
+            self.reader.skip(to_skip)?;
         }
 
         self.bytes_read = total_bytes;
@@ -1289,18 +1341,6 @@ fn padding_needed(bytes: u64) -> usize {
     }
 }
 
-/// Skip bytes in a reader
-fn skip_bytes<R: Read>(reader: &mut R, count: u64) -> PaxResult<()> {
-    let mut remaining = count;
-    let mut buf = [0u8; 4096];
-    while remaining > 0 {
-        let to_read = std::cmp::min(remaining, buf.len() as u64) as usize;
-        reader.read_exact(&mut buf[..to_read])?;
-        remaining -= to_read as u64;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1472,5 +1512,45 @@ mod tests {
         let ext = ExtendedHeader::from_entry(&entry, &FormatOptions::default());
         assert!(ext.uid.is_some());
         assert!(ext.mtime.is_some());
+    }
+
+    /// A pax archive of one empty member whose name needs a `path=` record.
+    fn archive_with_extended_header() -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut writer = PaxWriter::with_options(&mut out, FormatOptions::default());
+        let name = "n".repeat(NAME_LEN + 1);
+        let entry = ArchiveEntry::new(PathBuf::from(name), EntryType::Regular);
+        writer.write_entry(&entry).unwrap();
+        writer.finish_entry().unwrap();
+        writer.finish().unwrap();
+        out
+    }
+
+    fn end_of(archive: &[u8]) -> (u64, bool) {
+        let mut reader = PaxReader::seekable(std::io::Cursor::new(archive));
+        while reader.read_entry().unwrap().is_some() {}
+        (reader.end_of_archive(), reader.saw_extended_header())
+    }
+
+    /// -a writes where `end_of_archive` says, so it has to be the first block
+    /// of the end-of-archive indicator.
+    #[test]
+    fn test_end_of_archive_is_the_indicator() {
+        let archive = archive_with_extended_header();
+        let indicator = archive.len() as u64 - 2 * BLOCK_SIZE as u64;
+        assert_eq!(end_of(&archive), (indicator, true));
+    }
+
+    /// An `x` header with no member after it would describe whatever is
+    /// appended next, so the end is placed before it.
+    #[test]
+    fn test_end_of_archive_drops_a_dangling_extended_header() {
+        let archive = archive_with_extended_header();
+        // The extended header is everything before the member's own header
+        // block and the two-block indicator.
+        let dangling = archive.len() - 3 * BLOCK_SIZE;
+        let mut truncated = archive[..dangling].to_vec();
+        truncated.extend_from_slice(&[0u8; 2 * BLOCK_SIZE]);
+        assert_eq!(end_of(&truncated), (0, true));
     }
 }

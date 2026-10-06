@@ -2504,3 +2504,25 @@ fn test_if_shift_values_match_gcc() {
         assert_eq!(get_token_strings(&tokens, &idents), ["yes"], "#if {cond}");
     }
 }
+
+/// A substituted argument is spaced as its parameter was in the body: the
+/// first token of `-1` stands where `a` stood in `x - a`, after a space.
+/// Without it, `-E` printed `x --1` and re-lexing changed the program;
+/// libffi's `.org BASE + X * 8` came out as `.org.Lstore_table`.
+#[test]
+fn test_argument_takes_its_parameters_leading_space() {
+    for (src, want) in [
+        ("#define F(a) x - a\nF(-1)\n", &[true, true, false][..]),
+        ("#define F(a) x -a\nF( -1)\n", &[true, false, false]),
+        ("#define P(a) x - a ## b\nP(y)\n", &[true, true]),
+    ] {
+        let (tokens, _) = preprocess_str(src);
+        let spacing: Vec<bool> = tokens
+            .iter()
+            .filter(|t| !matches!(t.typ, TokenType::StreamBegin | TokenType::StreamEnd))
+            .skip(1)
+            .map(|t| t.pos.whitespace)
+            .collect();
+        assert_eq!(spacing, want, "{src:?}");
+    }
+}

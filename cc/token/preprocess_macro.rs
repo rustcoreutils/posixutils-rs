@@ -1116,6 +1116,7 @@ impl<'a> Preprocessor<'a> {
                 }
                 MacroTokenValue::Param(idx) => {
                     let arg = args.get(*idx).cloned().unwrap_or_default();
+                    let arg_start = result.len();
 
                     if next_is_paste || prev_was_paste {
                         // Don't expand for token pasting
@@ -1164,6 +1165,16 @@ impl<'a> Preprocessor<'a> {
                             expanded_args[*idx] = Some(out);
                         }
                         result.extend(expanded_args[*idx].as_ref().unwrap().iter().cloned());
+                    }
+                    // The argument stands where its parameter stood, so it is
+                    // spaced as the parameter was in the body, as
+                    // `__VA_ARGS__` is below. Keeping the argument's own
+                    // spacing glued `x - a` with `-1` into `x --1` in `-E`
+                    // output, and libffi's `.org BASE` into `.org.Ltab`.
+                    if !prev_was_paste {
+                        if let Some(first) = result.get_mut(arg_start) {
+                            first.pos.whitespace = mt.whitespace;
+                        }
                     }
                 }
                 MacroTokenValue::VaArgs => {

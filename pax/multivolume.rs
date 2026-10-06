@@ -37,6 +37,7 @@
 //! - Volume scripts are executed synchronously
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
+use crate::blocked_io::{BlockedReader, BlockedWriter};
 use crate::error::{PaxError, PaxResult};
 use crate::formats::ustar::parse_octal;
 use std::fs::File;
@@ -83,13 +84,15 @@ pub struct MultiVolumeWriter {
     volume_size: u64,
     /// Options for volume handling
     options: MultiVolumeOptions,
+    /// Bytes per write to a volume (-b)
+    record_size: usize,
     /// Current output file
-    writer: Option<File>,
+    writer: Option<BlockedWriter<File>>,
 }
 
 impl MultiVolumeWriter {
-    /// Create a new multi-volume writer
-    pub fn new(options: MultiVolumeOptions) -> PaxResult<Self> {
+    /// Create a new multi-volume writer that writes `record_size` bytes at a time
+    pub fn new(options: MultiVolumeOptions, record_size: usize) -> PaxResult<Self> {
         let volume_size = options.volume_size.unwrap_or(u64::MAX);
 
         let mut writer = MultiVolumeWriter {
@@ -97,6 +100,7 @@ impl MultiVolumeWriter {
             bytes_written: 0,
             volume_size,
             options,
+            record_size,
             writer: None,
         };
 
@@ -146,7 +150,7 @@ impl MultiVolumeWriter {
             );
         }
 
-        self.writer = Some(File::create(&path)?);
+        self.writer = Some(BlockedWriter::new(File::create(&path)?, self.record_size));
 
         Ok(())
     }
@@ -204,11 +208,15 @@ impl MultiVolumeWriter {
 
     /// Check if we need to switch volumes
     fn check_volume_space(&mut self, needed: u64) -> PaxResult<bool> {
-        if self.bytes_written + needed > self.volume_size {
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        Ok(self.volume_bytes(self.bytes_written + needed) > self.volume_size)
+    }
+
+    /// The size of a volume holding `content` bytes of members: they are
+    /// followed by the end-of-archive marker, and the last record is padded
+    /// out whole.
+    fn volume_bytes(&self, content: u64) -> u64 {
+        let record = self.record_size as u64;
+        (content + 2 * BLOCK_SIZE as u64).div_ceil(record) * record
     }
 }
 
@@ -219,7 +227,7 @@ impl ArchiveWriter for MultiVolumeWriter {
         // past the tape length and producing a volume that silently exceeds the
         // limit the user asked for.
         let needed = BLOCK_SIZE as u64 + entry.size.div_ceil(BLOCK_SIZE as u64) * BLOCK_SIZE as u64;
-        if needed > self.volume_size {
+        if self.volume_bytes(needed) > self.volume_size {
             return Err(PaxError::InvalidFormat(format!(
                 "{}: {} bytes does not fit in a {}-byte volume",
                 entry.path.display(),
@@ -296,7 +304,7 @@ pub struct MultiVolumeReader {
     /// Current volume number (1-based)
     current_volume: u32,
     /// Current reader
-    reader: Option<File>,
+    reader: Option<BlockedReader<File>>,
     /// Options
     options: MultiVolumeOptions,
     /// Current entry size remaining (for current volume's portion)
@@ -376,7 +384,7 @@ impl MultiVolumeReader {
             );
         }
 
-        self.reader = Some(File::open(&path)?);
+        self.reader = Some(BlockedReader::new(File::open(&path)?));
         Ok(true)
     }
 
@@ -747,12 +755,29 @@ mod tests {
             bytes_written: 0,
             volume_size: 1024,
             options,
+            record_size: 512,
             writer: None,
         };
 
         assert_eq!(writer.volume_path(1), PathBuf::from("/tmp/test.tar"));
         assert_eq!(writer.volume_path(2), PathBuf::from("/tmp/test.tar.2"));
         assert_eq!(writer.volume_path(3), PathBuf::from("/tmp/test.tar.3"));
+    }
+
+    #[test]
+    fn test_volume_bytes_counts_trailer_and_record_padding() {
+        let writer = MultiVolumeWriter {
+            current_volume: 1,
+            bytes_written: 0,
+            volume_size: 20480,
+            options: MultiVolumeOptions::default(),
+            record_size: 10240,
+            writer: None,
+        };
+        assert_eq!(writer.volume_bytes(0), 10240);
+        assert_eq!(writer.volume_bytes(9216), 10240);
+        // No room left for the end-of-archive marker in the first record.
+        assert_eq!(writer.volume_bytes(9728), 20480);
     }
 
     #[test]

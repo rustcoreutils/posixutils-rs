@@ -14,12 +14,13 @@
 //! - **record**: multiple blocks written in a single I/O operation
 //! - **blocking factor**: number of 512-byte blocks per record
 //!
-//! For tape drives and block devices, I/O must be performed at exact
-//! record boundaries. This module provides readers and writers that
-//! ensure all I/O operations are done at the specified block size.
+//! A tape drive transfers one record per read(2) or write(2). The writer
+//! here issues every write as one whole record of the requested size; the
+//! reader issues reads large enough for any record, so the blocking of an
+//! archive being read is whatever it was written with.
 
 use crate::error::{PaxError, PaxResult};
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -45,15 +46,28 @@ pub const DEFAULT_RECORD_SIZE: usize = DEFAULT_BLOCKING_FACTOR * TAR_BLOCK_SIZE;
 /// Maximum record size per POSIX (32256 bytes = 63 blocks)
 pub const MAX_RECORD_SIZE: usize = 32256;
 
-/// A reader that reads data in fixed-size records
+/// How much every read of the archive asks for.
 ///
-/// This is essential for reading from tape drives where each read()
-/// must be exactly the right size to match what was written.
+/// A tape drive -- or a datagram socket -- returns one record per read, and
+/// drops whatever part of that record the read had no room for. So a read is
+/// never smaller than this: larger than any record POSIX lets pax write
+/// (`MAX_RECORD_SIZE`) and than BSD pax's 64512-byte maximum.
+pub const READ_SIZE: usize = 64 * 1024;
+
+/// A reader for an archive in records of unknown size
+///
+/// "Blocking shall be automatically determined on input": each read(2)
+/// offers `READ_SIZE` bytes, so a device that returns one record per read
+/// hands over a whole record, whatever its size, and the record size is
+/// simply what the reads return. A pipe or file returning fewer bytes than a
+/// record is no different -- what came back is served, and the next read
+/// picks up where it left off.
+///
+/// It is also the one place the raw archive is buffered: looking ahead at
+/// the archive (`peek`, `BufRead`) reads through it rather than past it.
 pub struct BlockedReader<R: Read> {
     reader: R,
-    /// Size of each record in bytes
-    record_size: usize,
-    /// Buffer holding the current record
+    /// Bytes read and not yet consumed are `buffer[pos..valid]`
     buffer: Vec<u8>,
     /// Current position within the buffer
     pos: usize,
@@ -66,12 +80,16 @@ pub struct BlockedReader<R: Read> {
 }
 
 impl<R: Read> BlockedReader<R> {
+    /// Create a blocked reader
+    pub fn new(reader: R) -> Self {
+        Self::with_counter(reader, ByteCounter::default())
+    }
+
     /// Create a blocked reader that adds every byte it reads to `counter`
-    pub fn with_counter(reader: R, record_size: usize, counter: ByteCounter) -> Self {
+    pub fn with_counter(reader: R, counter: ByteCounter) -> Self {
         BlockedReader {
             reader,
-            record_size,
-            buffer: vec![0u8; record_size],
+            buffer: Vec::new(),
             pos: 0,
             valid: 0,
             eof: false,
@@ -79,56 +97,62 @@ impl<R: Read> BlockedReader<R> {
         }
     }
 
-    /// Read the next record from the underlying reader
-    ///
-    /// For tape drives, this performs a single read() of exactly record_size bytes.
-    /// Returns the number of bytes actually read (may be less at EOF).
-    fn fill_buffer(&mut self) -> PaxResult<usize> {
-        if self.eof {
-            return Ok(0);
+    /// Read until `n` bytes are buffered or the archive ends, and return
+    /// the buffered bytes without consuming them.
+    pub fn peek(&mut self, n: usize) -> std::io::Result<&[u8]> {
+        while self.valid - self.pos < n && !self.eof {
+            self.read_more()?;
         }
+        Ok(&self.buffer[self.pos..self.valid])
+    }
 
-        // Perform a single read of exactly record_size bytes
-        // This is critical for tape drives
-        let n = self.reader.read(&mut self.buffer)?;
-
+    /// One read(2) of `READ_SIZE` bytes, kept after what is already buffered.
+    ///
+    /// The buffer grows to make room rather than shrinking the read, which
+    /// would cut a record short.
+    fn read_more(&mut self) -> std::io::Result<()> {
+        if self.pos == self.valid {
+            self.pos = 0;
+            self.valid = 0;
+        }
+        let end = self.valid + READ_SIZE;
+        if self.buffer.len() < end {
+            self.buffer.resize(end, 0);
+        }
+        let n = loop {
+            match self.reader.read(&mut self.buffer[self.valid..end]) {
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                result => break result?,
+            }
+        };
         if n == 0 {
             self.eof = true;
-            self.valid = 0;
-            self.pos = 0;
-            return Ok(0);
         }
-
-        // For tape drives, a short read indicates end of data
-        // Zero-fill the rest of the buffer for consistency
-        if n < self.record_size {
-            self.buffer[n..].fill(0);
-        }
-
         self.counter.fetch_add(n as u64, Ordering::Relaxed);
-        self.valid = n;
-        self.pos = 0;
-        Ok(n)
+        self.valid += n;
+        Ok(())
+    }
+}
+
+impl<R: Read> BufRead for BlockedReader<R> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if self.pos == self.valid && !self.eof {
+            self.read_more()?;
+        }
+        Ok(&self.buffer[self.pos..self.valid])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.pos = std::cmp::min(self.pos + amt, self.valid);
     }
 }
 
 impl<R: Read> Read for BlockedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // If buffer is exhausted, read next record
-        if self.pos >= self.valid {
-            match self.fill_buffer() {
-                Ok(0) => return Ok(0),
-                Ok(_) => {}
-                Err(e) => return Err(std::io::Error::other(e.to_string())),
-            }
-        }
-
-        // Copy from buffer to output
-        let available = self.valid - self.pos;
-        let to_copy = std::cmp::min(available, buf.len());
-        buf[..to_copy].copy_from_slice(&self.buffer[self.pos..self.pos + to_copy]);
-        self.pos += to_copy;
-
+        let available = self.fill_buf()?;
+        let to_copy = std::cmp::min(available.len(), buf.len());
+        buf[..to_copy].copy_from_slice(&available[..to_copy]);
+        self.consume(to_copy);
         Ok(to_copy)
     }
 }
@@ -149,6 +173,8 @@ pub struct BlockedWriter<W: Write> {
     sent: usize,
     /// Whether finish() has been called (to avoid double-flush in Drop)
     finished: bool,
+    /// Whether the last record is padded out to a whole one
+    pad_last: bool,
     /// Total bytes written to the underlying writer
     counter: ByteCounter,
 }
@@ -168,13 +194,25 @@ impl<W: Write> BlockedWriter<W> {
             pos: 0,
             sent: 0,
             finished: false,
+            pad_last: true,
             counter,
         }
     }
 
+    /// Leave the last record as short as its data.
+    ///
+    /// For compressed output to a regular file, as bsdtar does: no device
+    /// needs the padding there, and gzip(1) on BSD and macOS warns about zeros
+    /// after the gzip trailer. Every record but the last is still whole.
+    pub fn unpadded_last_record(mut self) -> Self {
+        self.pad_last = false;
+        self
+    }
+
     /// Flush the current record to the underlying writer
     ///
-    /// This writes exactly record_size bytes, zero-padding if necessary.
+    /// This writes exactly record_size bytes, zero-padding if necessary --
+    /// except a last record left short by `unpadded_last_record`.
     ///
     /// Bytes the underlying writer has accepted are never offered to it again.
     /// A write can be partial -- a pipe, a file at its size limit -- and fail on
@@ -193,11 +231,14 @@ impl<W: Write> BlockedWriter<W> {
         }
 
         // Zero-fill the rest of the record
-        self.buffer[self.pos..].fill(0);
-        self.pos = self.record_size;
+        if self.pad_last {
+            self.buffer[self.pos..].fill(0);
+            self.pos = self.record_size;
+        }
+        let len = self.pos;
 
-        while self.sent < self.record_size {
-            match self.writer.write(&self.buffer[self.sent..]) {
+        while self.sent < len {
+            match self.writer.write(&self.buffer[self.sent..len]) {
                 Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
                 Ok(n) => {
                     self.sent += n;
@@ -367,6 +408,14 @@ mod tests {
     }
 
     #[test]
+    fn test_blocked_writer_unpadded_last_record() {
+        let mut writer = BlockedWriter::new(Vec::new(), 512).unpadded_last_record();
+        writer.write_all(&[9u8; 700]).unwrap();
+        let out = writer.finish().unwrap();
+        assert_eq!(out, vec![9u8; 700]);
+    }
+
+    #[test]
     fn test_blocked_writer_multiple_records() {
         let output = Vec::new();
         let mut writer = BlockedWriter::new(output, 512);
@@ -451,42 +500,66 @@ mod tests {
         assert_eq!(out.len(), 1024);
     }
 
-    #[test]
-    fn test_blocked_reader_basic() {
-        // Create a buffer with exactly one record
-        let mut data = vec![0u8; 1024];
-        data[..5].copy_from_slice(b"Hello");
+    /// Returns one record per read, as a tape drive does, and loses the
+    /// part of the record a read had no room for.
+    struct Tape {
+        records: Vec<Vec<u8>>,
+    }
 
-        let cursor = Cursor::new(data);
-        let mut reader = BlockedReader::with_counter(cursor, 1024, ByteCounter::default());
-
-        let mut buf = [0u8; 100];
-        let n = reader.read(&mut buf).unwrap();
-
-        assert_eq!(n, 100);
-        assert_eq!(&buf[..5], b"Hello");
+    impl Read for Tape {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.records.is_empty() {
+                return Ok(0);
+            }
+            let record = self.records.remove(0);
+            let n = record.len().min(buf.len());
+            buf[..n].copy_from_slice(&record[..n]);
+            Ok(n)
+        }
     }
 
     #[test]
-    fn test_blocked_reader_multiple_records() {
-        // Create two records
-        let mut data = vec![0u8; 2048];
-        data[..5].copy_from_slice(b"Hello");
-        data[1024..1029].copy_from_slice(b"World");
+    fn test_blocked_reader_takes_whole_records() {
+        let data: Vec<u8> = (0..3 * 10240u32).map(|i| (i % 251) as u8).collect();
+        let tape = Tape {
+            records: data.chunks(10240).map(<[u8]>::to_vec).collect(),
+        };
+        let counter = ByteCounter::default();
+        let mut reader = BlockedReader::with_counter(tape, ByteCounter::clone(&counter));
 
-        let cursor = Cursor::new(data);
-        let mut reader = BlockedReader::with_counter(cursor, 1024, ByteCounter::default());
+        // Small reads by the caller never become small reads of the tape.
+        let mut out = Vec::new();
+        let mut buf = [0u8; 512];
+        loop {
+            let n = reader.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(out, data);
+        assert_eq!(counter.load(Ordering::Relaxed), data.len() as u64);
+    }
 
-        // Read across record boundary
-        let mut buf = vec![0u8; 2048];
-        let n = reader.read(&mut buf).unwrap();
-        assert_eq!(n, 1024); // First record
+    #[test]
+    fn test_blocked_reader_peek_spans_reads() {
+        // A pipe may return a byte at a time; peek keeps reading, and every
+        // read still offers a full READ_SIZE.
+        let data = b"\x1f\x8brest".to_vec();
+        let tape = Tape {
+            records: data.chunks(1).map(<[u8]>::to_vec).collect(),
+        };
+        let mut reader = BlockedReader::new(tape);
+        assert_eq!(reader.peek(2).unwrap(), b"\x1f\x8b");
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).unwrap();
+        assert_eq!(out, data);
+    }
 
-        let n = reader.read(&mut buf[1024..]).unwrap();
-        assert_eq!(n, 1024); // Second record
-
-        assert_eq!(&buf[..5], b"Hello");
-        assert_eq!(&buf[1024..1029], b"World");
+    #[test]
+    fn test_blocked_reader_peek_stops_at_eof() {
+        let mut reader = BlockedReader::new(Cursor::new(vec![7u8; 3]));
+        assert_eq!(reader.peek(512).unwrap(), &[7u8; 3]);
     }
 
     #[test]
@@ -501,7 +574,7 @@ mod tests {
 
         // Read with blocking
         let cursor = Cursor::new(written);
-        let mut reader = BlockedReader::with_counter(cursor, 512, ByteCounter::default());
+        let mut reader = BlockedReader::new(cursor);
         let mut result = vec![0u8; original.len()];
         reader.read_exact(&mut result).unwrap();
 

@@ -30,7 +30,7 @@ use blocked_io::{
 };
 use clap::{Parser, ValueEnum};
 use cli::ProgramMode;
-use compression::{is_gzip, GzipReader, GzipWriter};
+use compression::{is_gzip, GzipReader, GzipWriter, GZIP_MAGIC};
 use error::{PaxError, PaxResult};
 use formats::CpioFormat;
 use gettextrs::gettext;
@@ -44,6 +44,7 @@ use pattern::Pattern;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::os::fd::AsFd;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use subst::Substitution;
@@ -513,32 +514,25 @@ fn run_write(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
 
     // Determine record size for blocked I/O. With no explicit -b, the default
     // depends on the output format (cpio/pax: 5120, ustar: 10240).
-    let record_size = match args.blocksize {
-        Some(b) => parse_blocksize(b)?,
-        None => default_record_size(format),
-    };
+    let record_size = write_record_size(args, default_record_size(format))?;
 
-    let counter = || ByteCounter::clone(archive_bytes);
-    if let Some(ref path) = args.archive {
-        let file = File::create(path)?;
-        if args.gzip {
-            let gzip_writer = GzipWriter::new(file)?;
-            let blocked_writer = BlockedWriter::with_counter(gzip_writer, record_size, counter());
-            modes::create_archive(blocked_writer, &files, format, &options)
+    let raw = match args.archive {
+        Some(ref path) => File::create(path)?,
+        None => stdio_file(io::stdout())?,
+    };
+    let regular_file = raw.metadata()?.is_file();
+    // -b is the size of every write to the archive file, and with -z the
+    // archive file holds the compressed stream: that is what gets blocked.
+    let blocked = BlockedWriter::with_counter(raw, record_size, ByteCounter::clone(archive_bytes));
+    if args.gzip {
+        let blocked = if regular_file {
+            blocked.unpadded_last_record()
         } else {
-            let blocked_writer = BlockedWriter::with_counter(file, record_size, counter());
-            modes::create_archive(blocked_writer, &files, format, &options)
-        }
+            blocked
+        };
+        modes::create_archive(GzipWriter::new(blocked)?, &files, format, &options)
     } else {
-        let stdout = io::stdout().lock();
-        if args.gzip {
-            let gzip_writer = GzipWriter::new(stdout)?;
-            let blocked_writer = BlockedWriter::with_counter(gzip_writer, record_size, counter());
-            modes::create_archive(blocked_writer, &files, format, &options)
-        } else {
-            let blocked_writer = BlockedWriter::with_counter(stdout, record_size, counter());
-            modes::create_archive(blocked_writer, &files, format, &options)
-        }
+        modes::create_archive(blocked, &files, format, &options)
     }
 }
 
@@ -578,7 +572,18 @@ fn run_write_multi_volume(
         verbose: args.verbose,
     };
 
-    let mut writer = multivolume::MultiVolumeWriter::new(mv_options)?;
+    // A volume holds whole records. Without -b, a tape length shorter than
+    // the format's default record makes the record no larger than the volume.
+    let fit = (volume_size / TAR_BLOCK_SIZE as u64).max(1) * TAR_BLOCK_SIZE as u64;
+    let default = (default_record_size(format) as u64).min(fit) as usize;
+    let record_size = write_record_size(args, default)?;
+    if record_size as u64 > volume_size {
+        return Err(PaxError::InvalidFormat(format!(
+            "a {}-byte volume cannot hold a {}-byte record",
+            volume_size, record_size
+        )));
+    }
+    let mut writer = multivolume::MultiVolumeWriter::new(mv_options, record_size)?;
 
     // Write each file to the multi-volume archive, then its trailer
     modes::write::write_files_to_archive(&mut writer, files, options)
@@ -621,10 +626,7 @@ fn run_append(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
     let requested_format = args.format.map(ArchiveFormat::from);
     // Appended members are blocked like any other write; append used to bypass
     // the blocked writer entirely and so ignored -b.
-    let record_size = match args.blocksize {
-        Some(bs) => parse_blocksize(bs)?,
-        None => DEFAULT_RECORD_SIZE,
-    };
+    let record_size = write_record_size(args, DEFAULT_RECORD_SIZE)?;
     modes::append_to_archive(
         archive_path,
         &files,
@@ -694,43 +696,50 @@ fn open_archive_for_read(
     args: &Args,
     archive_bytes: &ByteCounter,
 ) -> PaxResult<(Box<dyn Read>, ArchiveFormat)> {
-    // Determine record size for blocked I/O. On read the format is auto-detected
-    // after this point, so an unspecified -b just sets the read granularity.
-    let record_size = match args.blocksize {
-        Some(b) => parse_blocksize(b)?,
-        None => DEFAULT_RECORD_SIZE,
+    // -b sets the size of writes only; on input the blocking is whatever the
+    // reads return (see BlockedReader). A bad value is still diagnosed.
+    if let Some(b) = args.blocksize {
+        parse_blocksize(b)?;
+    }
+
+    let raw: Box<dyn Read> = match args.archive {
+        Some(ref path) => Box::new(File::open(path)?),
+        None => Box::new(stdio_file(io::stdin())?),
     };
 
-    // Create the underlying reader
-    let raw_reader: Box<dyn Read> = if let Some(ref path) = args.archive {
-        Box::new(File::open(path)?)
-    } else {
-        Box::new(io::stdin())
-    };
-
-    // First, peek to detect if this is a gzip archive
-    let mut peek_reader = PeekReader::new(raw_reader, 512);
-    let peek_buf = peek_reader.peek()?;
-    let is_gzip_archive = is_gzip(peek_buf);
-
-    // If gzip detected or -z flag set, wrap in gzip decompressor
+    // Everything that looks at the raw archive, gzip detection included, goes
+    // through the one blocked reader: a smaller read of its own would cut the
+    // first record short.
+    let mut blocked = BlockedReader::with_counter(raw, ByteCounter::clone(archive_bytes));
+    let is_gzip_archive = is_gzip(blocked.peek(GZIP_MAGIC.len())?);
     let reader: Box<dyn Read> = if is_gzip_archive || args.gzip {
-        Box::new(GzipReader::new(peek_reader)?)
+        Box::new(GzipReader::new(blocked)?)
     } else {
-        Box::new(peek_reader)
+        Box::new(blocked)
     };
-
-    // Wrap in blocked reader for proper tape drive support
-    let blocked_reader =
-        BlockedReader::with_counter(reader, record_size, ByteCounter::clone(archive_bytes));
 
     // For format detection, we need to peek at the (decompressed) archive
-    let mut buf_reader = PeekReader::new(Box::new(blocked_reader), 512);
+    let mut buf_reader = PeekReader::new(reader, 512);
     let peek_buf = buf_reader.peek()?;
 
     let format = detect_format_from_bytes(peek_buf)?;
 
     Ok((Box::new(buf_reader), format))
+}
+
+/// The bytes per write to the archive: -b, or `default` without it.
+fn write_record_size(args: &Args, default: usize) -> PaxResult<usize> {
+    args.blocksize.map_or(Ok(default), parse_blocksize)
+}
+
+/// Standard input or output as a `File`, for archive I/O by raw read(2) and
+/// write(2) on the descriptor.
+///
+/// std's `Stdin` reads through an 8 KiB buffer, and `Stdout` is a `LineWriter`
+/// that splits each write at its last newline. Either way a record would not
+/// be moved in one system call, which a tape drive requires.
+fn stdio_file(stream: impl AsFd) -> io::Result<File> {
+    Ok(File::from(stream.as_fd().try_clone_to_owned()?))
 }
 
 /// Detect format from peek buffer

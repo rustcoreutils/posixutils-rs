@@ -1327,3 +1327,104 @@ fn test_cpio_hardlink_set_listed_as_link() {
     assert!(lines[0].ends_with(" a"), "first name: {}", lines[0]);
     assert!(lines[1].ends_with(" b == a"), "later name: {}", lines[1]);
 }
+
+/// A datagram socket behaves like a tape: each read returns one record, and
+/// the part of a record a short read did not take is lost.
+/// The buffers are raised so a 10240-byte record fits in one datagram;
+/// macOS defaults to 2048.
+fn datagram_pair() -> (
+    std::os::unix::net::UnixDatagram,
+    std::os::unix::net::UnixDatagram,
+) {
+    use std::os::fd::AsRawFd;
+    let (a, b) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    for sock in [&a, &b] {
+        for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+            let size: libc::c_int = 256 * 1024;
+            let r = unsafe {
+                libc::setsockopt(
+                    sock.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    opt,
+                    &size as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&size) as libc::socklen_t,
+                )
+            };
+            assert_eq!(r, 0, "setsockopt: {}", std::io::Error::last_os_error());
+        }
+    }
+    (a, b)
+}
+
+/// Two files whose archive spans more than one 10240-byte record.
+fn blocking_fixture(src: &Path) -> Vec<u8> {
+    fs::create_dir(src).unwrap();
+    fs::write(src.join("f1"), vec![b'1'; 8000]).unwrap();
+    fs::write(src.join("f2"), vec![b'2'; 2000]).unwrap();
+    let output = run_pax_in_dir(&["-w", "-x", "ustar", "f1", "f2"], src);
+    assert_success(&output, "pax -w");
+    assert_eq!(output.stdout.len() % 10240, 0);
+    assert!(output.stdout.len() > 10240);
+    output.stdout
+}
+
+/// "Blocking shall be automatically determined on input": an archive read
+/// one record per read must be read whole-record at a time, not in smaller
+/// reads that drop the rest of each record.
+#[test]
+fn test_read_determines_blocking_from_input() {
+    use std::os::fd::OwnedFd;
+    let temp = TempDir::new().unwrap();
+    let archive = blocking_fixture(&temp.path().join("src"));
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+
+    let (tx, rx) = datagram_pair();
+    let child = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .arg("-r")
+        .current_dir(&dst)
+        .stdin(std::process::Stdio::from(OwnedFd::from(rx)))
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    for record in archive.chunks(10240) {
+        tx.send(record).unwrap();
+    }
+    drop(tx);
+    let output = child.wait_with_output().unwrap();
+    assert_success(&output, "pax -r from one-record reads");
+
+    assert_eq!(fs::read(dst.join("f1")).unwrap(), vec![b'1'; 8000]);
+    assert_eq!(fs::read(dst.join("f2")).unwrap(), vec![b'2'; 2000]);
+}
+
+/// -b sets the bytes per write: every write to standard output is one whole
+/// record, however the archive's data happens to fall.
+#[test]
+fn test_write_issues_whole_records() {
+    use std::os::fd::OwnedFd;
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    blocking_fixture(&src);
+    // Data with newlines, which a line-buffered stdout splits writes at.
+    fs::write(src.join("lines"), "a\nb\nc\n".repeat(3000)).unwrap();
+
+    let (tx, rx) = datagram_pair();
+    let status = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["-w", "-b", "10240", "-x", "ustar", "f1", "lines", "f2"])
+        .current_dir(&src)
+        .stdout(std::process::Stdio::from(OwnedFd::from(tx)))
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    // pax has exited, so every record it wrote is already queued.
+    rx.set_nonblocking(true).unwrap();
+    let mut buf = vec![0u8; 65536];
+    let mut sizes = Vec::new();
+    while let Ok(n) = rx.recv(&mut buf) {
+        sizes.push(n);
+    }
+    assert!(!sizes.is_empty());
+    assert!(sizes.iter().all(|&n| n == 10240), "write sizes: {sizes:?}");
+}

@@ -472,3 +472,56 @@ fn test_write_subst_to_empty_keeps_the_subtree() {
     names.sort();
     assert_eq!(names, ["d/sub/", "d/sub/y", "d/x"]);
 }
+
+/// List a one-member archive named `name` under `-s expr` and the locale
+/// `lc_all`, returning standard output. Both may be any bytes.
+fn list_substituted(name: &[u8], expr: &[u8], lc_all: &str) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let a = Ustar {
+        name,
+        body: b"X\n",
+        ..Default::default()
+    }
+    .archive();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pax"))
+        .arg("-s")
+        .arg(std::ffi::OsStr::from_bytes(expr))
+        .env("LC_ALL", lc_all)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&a).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_success(&output, "pax -s");
+    output.stdout
+}
+
+/// `g` replaces empty matches as sed does: one at every position not just
+/// after an earlier match, the end of the name included.
+#[test]
+fn test_subst_global_empty_matches_follow_sed() {
+    assert_eq!(list_substituted(b"abc", b",x*,-,g", "C"), b"-a-b-c-\n");
+    assert_eq!(list_substituted(b"abc", b",b*,-,g", "C"), b"-a-c-\n");
+    assert_eq!(list_substituted(b"abc", b",$,-,g", "C"), b"abc-\n");
+}
+
+/// A name the regex cannot read as text in a UTF-8 locale is simply not
+/// matched: the macOS regexec's REG_ILLSEQ is no zero-length match at the
+/// start to insert the replacement at.
+#[test]
+fn test_subst_unreadable_name_is_not_matched() {
+    assert_eq!(
+        list_substituted(b"caf\xe9", b",e,E,", "en_US.UTF-8"),
+        b"caf\xe9\n"
+    );
+}
+
+/// An -s option-argument is bytes, like the names it rewrites: one that is
+/// not UTF-8 is still an expression.
+#[test]
+fn test_subst_expression_need_not_be_utf8() {
+    assert_eq!(list_substituted(b"caf\xe9", b",\xe9,E,", "C"), b"cafE\n");
+    assert_eq!(list_substituted(b"cafe", b",e,\xe9,", "C"), b"caf\xe9\n");
+}

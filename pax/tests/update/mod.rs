@@ -328,3 +328,45 @@ fn test_update_compares_the_name_before_substitution() {
     assert_success(&output, "pax -r -u -s");
     assert!(!temp.path().join("g").exists(), "-u should have rejected f");
 }
+
+/// -u compares modification times to the nanosecond when both sides carry
+/// them: a pax archive's `mtime` record, and the file's own.
+#[test]
+fn test_update_compares_subsecond_times() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir(&src).unwrap();
+    let at = |nsec| filetime::FileTime::from_unix_time(1_600_000_000, nsec);
+    fs::write(src.join("f"), "archived\n").unwrap();
+    filetime::set_file_mtime(src.join("f"), at(700_000_000)).unwrap();
+    let output = run_pax_in_dir(&["-w", "-x", "pax", "-f", "../a.pax", "f"], &src);
+    assert_success(&output, "pax -w -x pax");
+
+    for (dest_nsec, replaced) in [(200_000_000, true), (900_000_000, false)] {
+        let dest = temp.path().join(format!("dest{dest_nsec}"));
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("f"), "disk\n").unwrap();
+        filetime::set_file_mtime(dest.join("f"), at(dest_nsec)).unwrap();
+        let output = run_pax_in_dir(&["-r", "-u", "-f", "../a.pax"], &dest);
+        assert_success(&output, "pax -r -u");
+        let want = if replaced { "archived\n" } else { "disk\n" };
+        assert_eq!(
+            fs::read_to_string(dest.join("f")).unwrap(),
+            want,
+            "read, {dest_nsec}"
+        );
+
+        // Copy mode compares the same way.
+        let copy = temp.path().join(format!("copy{dest_nsec}"));
+        fs::create_dir(&copy).unwrap();
+        fs::write(copy.join("f"), "disk\n").unwrap();
+        filetime::set_file_mtime(copy.join("f"), at(dest_nsec)).unwrap();
+        let output = run_pax_in_dir(&["-r", "-w", "-u", "f", copy.to_str().unwrap()], &src);
+        assert_success(&output, "pax -rw -u");
+        assert_eq!(
+            fs::read_to_string(copy.join("f")).unwrap(),
+            want,
+            "copy, {dest_nsec}"
+        );
+    }
+}

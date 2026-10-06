@@ -50,6 +50,10 @@ pub struct ReadOptions {
     pub interactive: bool,
     /// Update mode - only extract if archive member is newer
     pub update: bool,
+    /// cpio: the `update` check keeps a newer file at the name the member is
+    /// extracted under, made once `-r` has renamed it -- not, as pax's `-u`,
+    /// part of selecting the member by its archived name.
+    pub update_final_name: bool,
     /// Path substitutions (-s option)
     pub substitutions: Vec<Substitution>,
     /// Select only first archive member matching each pattern (-n)
@@ -85,6 +89,7 @@ impl Default for ReadOptions {
             preserve_owner: false,
             interactive: false,
             update: false,
+            update_final_name: false,
             substitutions: Vec::new(),
             first_match: false,
             umask: 0,
@@ -180,7 +185,8 @@ fn report_unless_fatal(entry: &ArchiveEntry, result: PaxResult<()>) -> PaxResult
 /// In POSIX's order: the patterns as modified by -c, -n and -u select it, and
 /// then -s and -i rename it. `-u` compares against the file of the member's
 /// own name, before any renaming, and a member it turns away does not use up
-/// a pattern under -n.
+/// a pattern under -n. cpio's refusal to replace a newer file instead looks
+/// at the file the member would replace, under the name it ends up with.
 fn select_member(
     selector: &mut Selector,
     entry: &mut ArchiveEntry,
@@ -191,10 +197,10 @@ fn select_member(
     let Some(selection) = selector.select(entry) else {
         return Ok(false);
     };
-    if options.update && !is_archive_newer(tree, entry) {
+    if options.update && !options.update_final_name && !is_archive_newer(tree, entry) {
         return Ok(false);
     }
-    selector.take(selection, entry);
+    selector.take(selection);
 
     // -s, then --strip-components, both before the name is offered for
     // renaming, so an interactive prompt shows the name that will actually be
@@ -202,15 +208,14 @@ fn select_member(
     if !rename_member(entry, &options.substitutions, options.strip_components) {
         return Ok(false);
     }
-    let Some(p) = prompter else {
-        return Ok(true);
-    };
-    match p.prompt(&entry.path)? {
-        RenameResult::Skip => return Ok(false),
-        RenameResult::UseOriginal => {}
-        RenameResult::Rename(new_path) => entry.path = new_path,
+    if let Some(p) = prompter {
+        match p.prompt(&entry.path)? {
+            RenameResult::Skip => return Ok(false),
+            RenameResult::UseOriginal => {}
+            RenameResult::Rename(new_path) => entry.path = new_path,
+        }
     }
-    Ok(true)
+    Ok(!(options.update && options.update_final_name && !is_archive_newer(tree, entry)))
 }
 
 /// The `-o keyword=value` and `-o keyword:=value` records the caller has to
@@ -878,7 +883,8 @@ fn copy_file_data<R: ArchiveReader>(archive: &mut R, file: &mut File, size: u64)
 }
 
 /// `-u`: whether the archive member is newer than the file already at its
-/// name, or there is none.
+/// name, or there is none. Times compare to the nanosecond; a member whose
+/// format holds whole seconds has none to add.
 ///
 /// A policy check, not a security control: it reads the destination and then
 /// decides. Every component is opened without following a symlink, and the
@@ -892,8 +898,10 @@ fn is_archive_newer(tree: &DirTree, entry: &ArchiveEntry) -> bool {
         return true; // no such directory, so nothing there: extract it
     };
     // A directory created here only to hold earlier members is not one.
-    stat_at(parent.as_fd(), &member.leaf)
-        .is_none_or(|st| tree.is_implicit(&st) || entry.mtime > tree.mtime_before_run(&st))
+    stat_at(parent.as_fd(), &member.leaf).is_none_or(|st| {
+        tree.is_implicit(&st)
+            || (entry.mtime, i64::from(entry.mtime_nsec)) > tree.mtime_before_run(&st)
+    })
 }
 
 /// The ids to give an extracted file.

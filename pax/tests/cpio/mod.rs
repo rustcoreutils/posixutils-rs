@@ -662,3 +662,51 @@ fn test_cpio_pattern_file_only_in_copy_in() {
     assert_failure(&out, "cpio -p -E");
     assert_eq!(fs::read_dir(temp.path().join("dest")).unwrap().count(), 0);
 }
+
+/// cpio without -u keeps a newer file -- the one at the name the member is
+/// extracted under. With -r that is the name typed at the prompt: a newer file
+/// there is kept, and one at the archived name does not stop the member.
+#[test]
+fn test_cpio_rename_keeps_newer_file_at_the_new_name() {
+    use crate::common::{front_end, PtyPax, PtyStdio};
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir(&src).unwrap();
+    let mtime = |secs| filetime::FileTime::from_unix_time(secs, 0);
+    fs::write(src.join("f"), "archived\n").unwrap();
+    filetime::set_file_mtime(src.join("f"), mtime(1_000_000_000)).unwrap();
+    let out = run_cpio(&["-o"], &src, b"f\n");
+    assert_success(&out, "cpio -o");
+    fs::write(temp.path().join("a.cpio"), &out.stdout).unwrap();
+
+    let rename_to_g = |newer_at: &str| {
+        let dest = temp.path().join(format!("dest-{newer_at}"));
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join(newer_at), "newer\n").unwrap();
+        filetime::set_file_mtime(dest.join(newer_at), mtime(2_000_000_000)).unwrap();
+        let pty = PtyPax::spawn_program(
+            &front_end("cpio"),
+            &["-i", "-r", "-I", "../a.cpio"],
+            &dest,
+            b"g\n",
+            PtyStdio::StdinOnly,
+        );
+        let (out, tty) = pty
+            .finish(std::time::Duration::from_secs(20))
+            .expect("cpio -i -r did not finish");
+        assert_success(&out, "cpio -i -r");
+        assert!(
+            String::from_utf8_lossy(&tty).contains(" => "),
+            "no prompt: {:?}",
+            String::from_utf8_lossy(&tty)
+        );
+        dest
+    };
+
+    let dest = rename_to_g("g");
+    assert_eq!(fs::read_to_string(dest.join("g")).unwrap(), "newer\n");
+
+    let dest = rename_to_g("f");
+    assert_eq!(fs::read_to_string(dest.join("g")).unwrap(), "archived\n");
+    assert_eq!(fs::read_to_string(dest.join("f")).unwrap(), "newer\n");
+}

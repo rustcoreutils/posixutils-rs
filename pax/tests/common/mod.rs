@@ -546,6 +546,23 @@ pub struct PtyPax {
 
 impl PtyPax {
     pub fn spawn(args: &[&str], dir: &Path, typed: &[u8], stdio: PtyStdio) -> PtyPax {
+        Self::spawn_program(
+            Path::new(env!("CARGO_BIN_EXE_pax")),
+            args,
+            dir,
+            typed,
+            stdio,
+        )
+    }
+
+    /// `spawn`, running `program` (a front-end) in place of pax.
+    pub fn spawn_program(
+        program: &Path,
+        args: &[&str],
+        dir: &Path,
+        typed: &[u8],
+        stdio: PtyStdio,
+    ) -> PtyPax {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
         use std::process::Stdio;
@@ -585,7 +602,7 @@ impl PtyPax {
             PtyStdio::All => (tty(), tty(), tty()),
             PtyStdio::OutputOnly => (Stdio::piped(), tty(), tty()),
         };
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_pax"));
+        let mut cmd = Command::new(program);
         cmd.args(args)
             .current_dir(dir)
             .stdin(stdin)

@@ -725,3 +725,43 @@ fn test_tar_empty_files_from_selects_nothing_on_extract_and_list() {
     assert_success(&out, "tar -t -T empty a.txt");
     assert_eq!(stdout_str(&out), "a.txt\n");
 }
+
+/// GNU tar's exclusion patterns: a wildcard matches a leading '.', and a
+/// pattern naming a directory excludes what is below it, when listing and
+/// extracting as when archiving.
+#[test]
+fn test_tar_exclude_matches_dot_files_and_directory_contents() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir_all(src.join("d")).unwrap();
+    fs::create_dir_all(src.join("e/.h")).unwrap();
+    fs::write(src.join(".hid"), "h\n").unwrap();
+    fs::write(src.join("d/x"), "x\n").unwrap();
+    fs::write(src.join("e/.h/q"), "q\n").unwrap();
+    assert_success(
+        &run_tar(&["-cf", "../t.tar", ".hid", "d", "e"], &src),
+        "tar -cf",
+    );
+
+    let list = |exclude: &str| {
+        let out = run_tar(
+            &["-tf", "t.tar", &format!("--exclude={exclude}")],
+            temp.path(),
+        );
+        assert_success(&out, "tar -tf --exclude");
+        stdout_str(&out)
+    };
+    assert_eq!(list("*"), "");
+    assert_eq!(list("d"), ".hid\ne/\ne/.h/\ne/.h/q\n");
+    assert_eq!(list(".h"), ".hid\nd/\nd/x\ne/\n");
+    assert_eq!(list("*h*"), "d/\nd/x\ne/\n");
+
+    let dest = temp.path().join("dest");
+    fs::create_dir(&dest).unwrap();
+    assert_success(
+        &run_tar(&["-xf", "../t.tar", "--exclude=e/.h"], &dest),
+        "tar -xf --exclude",
+    );
+    assert!(dest.join("e").is_dir());
+    assert!(!dest.join("e/.h").exists(), "e/.h/q was extracted");
+}

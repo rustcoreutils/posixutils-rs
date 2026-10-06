@@ -20,13 +20,29 @@
 //! pattern free for a later member of the same name.
 
 use crate::archive::ArchiveEntry;
-use crate::pattern::{matches_excluded, Name, Pattern};
+use crate::pattern::{matches_excluded, Name, Pattern, Selected};
 
 /// What selects a member.
-#[derive(Clone, Copy)]
+#[derive(Default)]
 pub(crate) struct Selection {
-    /// The pattern operand that matched it, if one did.
-    pattern: Option<usize>,
+    /// The pattern operands it is the first match for under `-n` -- every one
+    /// that matches it otherwise -- each with the hierarchy it goes on to
+    /// select under `-n`.
+    patterns: Vec<(usize, Option<Hierarchy>)>,
+    /// `-n`: the patterns whose hierarchy this member is the directory at the
+    /// root of, met after members below it.
+    roots: Vec<usize>,
+}
+
+/// `-n`: the directory a pattern selected, whose hierarchy it still selects.
+#[derive(Clone)]
+struct Hierarchy {
+    /// Its name, as [`trim_dir`] leaves it.
+    dir: Vec<u8>,
+    /// The member naming the directory itself has been selected; until it
+    /// is, as in an archive listing a directory after its contents, it is
+    /// selected when it comes.
+    root_seen: bool,
 }
 
 /// Per pattern operand state.
@@ -37,7 +53,7 @@ struct PatternState {
     /// `-n`: it has selected its one member.
     taken: bool,
     /// `-n`: the directory it selected, whose hierarchy it still selects.
-    dir: Option<Vec<u8>>,
+    hierarchy: Option<Hierarchy>,
 }
 
 /// The pattern operands of list and read mode, and what they have selected.
@@ -74,6 +90,9 @@ impl<'a> Selector<'a> {
 
     /// Whether the patterns select `entry`, before `-u`. Nothing is recorded
     /// against `-n` until the caller [`take`](Self::take)s it.
+    ///
+    /// Every pattern that matches the member is marked matched, not only the
+    /// first: overlapping operands (`d d/x`) each match something.
     pub(crate) fn select(&mut self, entry: &ArchiveEntry) -> Option<Selection> {
         let path = crate::rawpath::as_bytes(&entry.path);
 
@@ -81,56 +100,69 @@ impl<'a> Selector<'a> {
         if matches_excluded(self.exclude_patterns, path) {
             return None;
         }
+        // No pattern selects every member; under -c, no pattern excepts any.
         if self.patterns.is_empty() {
-            return (!self.exclude).then_some(Selection { pattern: None });
+            return Some(Selection::default());
         }
 
-        let name = Name::new(path);
-        // A name stored as "./x" is also tried as "x".
-        let stripped = path.strip_prefix(b"./").map(Name::new);
-
+        let member = Member::new(path, entry.is_dir());
         if self.exclude {
             // -c: a member any pattern matches is left out. The pattern still
             // matched something, so it is not reported as unmatched.
             let mut any = false;
             for (pattern, state) in self.patterns.iter().zip(&mut self.state) {
-                if selects(pattern, &name, stripped.as_ref(), self.expand_subtree) {
+                if member.selected_by(pattern, self.expand_subtree).is_some() {
                     state.matched = true;
                     any = true;
                 }
             }
-            return (!any).then_some(Selection { pattern: None });
+            return (!any).then(Selection::default);
         }
 
+        let mut selection = Selection::default();
+        let mut any = false;
         for (idx, pattern) in self.patterns.iter().enumerate() {
-            let state = &self.state[idx];
+            let state = &mut self.state[idx];
             if self.first_match && state.taken {
                 // -n: a pattern that selected a directory still selects the
                 // file hierarchy rooted at it; otherwise it is used up.
-                if state.dir.as_deref().is_some_and(|dir| is_below(path, dir)) {
-                    return Some(Selection { pattern: None });
+                match &state.hierarchy {
+                    Some(h) if is_below(path, &h.dir) => any = true,
+                    Some(h) if !h.root_seen && member.is_dir && trim_dir(path) == h.dir => {
+                        selection.roots.push(idx);
+                        any = true;
+                    }
+                    _ => {}
                 }
                 continue;
             }
-            if selects(pattern, &name, stripped.as_ref(), self.expand_subtree) {
-                self.state[idx].matched = true;
-                return Some(Selection { pattern: Some(idx) });
+            if let Some((how, name)) = member.selected_by(pattern, self.expand_subtree) {
+                state.matched = true;
+                any = true;
+                let hierarchy = self
+                    .first_match
+                    .then(|| hierarchy_of(how, name, member.is_dir))
+                    .flatten();
+                selection.patterns.push((idx, hierarchy));
             }
         }
-        None
+        any.then_some(selection)
     }
 
     /// Record that `entry`, which [`select`](Self::select) picked, has passed
     /// `-u` and is selected.
-    pub(crate) fn take(&mut self, selection: Selection, entry: &ArchiveEntry) {
-        let Some(idx) = selection.pattern else {
-            return;
-        };
-        let state = &mut self.state[idx];
-        state.taken = true;
-        if self.first_match && self.expand_subtree && entry.is_dir() {
-            let path = crate::rawpath::as_bytes(&entry.path);
-            state.dir = Some(trim_dir(path).to_vec());
+    pub(crate) fn take(&mut self, selection: Selection) {
+        for (idx, hierarchy) in selection.patterns {
+            let state = &mut self.state[idx];
+            state.taken = true;
+            if self.expand_subtree {
+                state.hierarchy = hierarchy;
+            }
+        }
+        for idx in selection.roots {
+            if let Some(h) = &mut self.state[idx].hierarchy {
+                h.root_seen = true;
+            }
         }
     }
 
@@ -140,7 +172,7 @@ impl<'a> Selector<'a> {
         self.first_match
             && !self.exclude
             && !self.patterns.is_empty()
-            && self.state.iter().all(|s| s.taken && s.dir.is_none())
+            && self.state.iter().all(|s| s.taken && s.hierarchy.is_none())
     }
 
     /// Diagnose each pattern operand no archive member matched (POSIX
@@ -158,20 +190,63 @@ impl<'a> Selector<'a> {
     }
 }
 
-/// Whether `pattern` selects the member `name`, or its "./"-less spelling.
-fn selects(pattern: &Pattern, name: &Name, stripped: Option<&Name>, expand: bool) -> bool {
-    pattern.selects(name, expand) || stripped.is_some_and(|s| pattern.selects(s, expand))
+/// A member's name, ready for the patterns.
+struct Member<'p> {
+    path: &'p [u8],
+    name: Name<'p>,
+    /// A name stored as "./x" is also tried as "x".
+    stripped: Option<Name<'p>>,
+    is_dir: bool,
 }
 
-/// A directory member's name without its trailing slashes or leading "./".
+impl<'p> Member<'p> {
+    fn new(path: &'p [u8], is_dir: bool) -> Self {
+        Member {
+            path,
+            name: Name::member(path, is_dir),
+            stripped: path.strip_prefix(b"./").map(|p| Name::member(p, is_dir)),
+            is_dir,
+        }
+    }
+
+    /// How `pattern` selects the member, if it does, and the spelling of
+    /// its name that it matched.
+    fn selected_by(&self, pattern: &Pattern, expand: bool) -> Option<(Selected, &'p [u8])> {
+        if let Some(how) = pattern.selects(&self.name, expand) {
+            return Some((how, self.path));
+        }
+        let how = pattern.selects(self.stripped.as_ref()?, expand)?;
+        Some((how, &self.path[2..]))
+    }
+}
+
+/// `-n`: the hierarchy a pattern selecting a member as `how` goes on to
+/// select -- the directory it matched, the member's own or one above it.
+fn hierarchy_of(how: Selected, name: &[u8], is_dir: bool) -> Option<Hierarchy> {
+    let (dir, root_seen) = match how {
+        Selected::Itself if is_dir => (name, true),
+        Selected::Itself => return None,
+        Selected::Below(len) => (&name[..len], false),
+    };
+    Some(Hierarchy {
+        dir: trim_dir(dir).to_vec(),
+        root_seen,
+    })
+}
+
+/// A directory member's name without its trailing slashes or leading "./"
+/// ("." for "./" itself; "" for "/").
 fn trim_dir(path: &[u8]) -> &[u8] {
-    let path = path.strip_prefix(b"./").unwrap_or(path);
     let end = path.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1);
-    &path[..end]
+    let path = &path[..end];
+    path.strip_prefix(b"./").unwrap_or(path)
 }
 
 /// Whether `path` names something below the directory `dir`.
 fn is_below(path: &[u8], dir: &[u8]) -> bool {
+    if dir == b"." {
+        return path.starts_with(b"./") && trim_dir(path) != b".";
+    }
     let path = path.strip_prefix(b"./").unwrap_or(path);
     path.len() > dir.len() + 1 && path.starts_with(dir) && path[dir.len()] == b'/'
 }
@@ -192,7 +267,7 @@ mod tests {
         let mut sel = Selector::new(&patterns, false, true, false, &[]);
         let mut run = |name: &str, t: EntryType| {
             let e = entry(name, t);
-            sel.select(&e).map(|s| sel.take(s, &e)).is_some()
+            sel.select(&e).map(|s| sel.take(s)).is_some()
         };
         assert!(run("d/", EntryType::Directory));
         assert!(run("d/x", EntryType::Regular));
@@ -211,7 +286,7 @@ mod tests {
         // Selected but turned away (-u): the pattern stays free.
         assert!(sel.select(&f).is_some());
         let s = sel.select(&f).unwrap();
-        sel.take(s, &f);
+        sel.take(s);
         assert!(sel.is_done());
         assert!(sel.select(&f).is_none());
     }
@@ -219,6 +294,10 @@ mod tests {
     #[test]
     fn test_trim_and_below() {
         assert_eq!(trim_dir(b"./d//"), b"d");
+        assert_eq!(trim_dir(b"./"), b".");
+        assert!(is_below(b"./x", b"."));
+        assert!(!is_below(b"./", b"."));
+        assert!(is_below(b"/abs", b""));
         assert!(is_below(b"d/x", b"d"));
         assert!(is_below(b"./d/x", b"d"));
         assert!(!is_below(b"d/", b"d"));

@@ -185,7 +185,7 @@ pub(crate) struct DirTree {
     /// into it, before any member created below it changed that. -u compares
     /// against this: a `find -depth` list names a directory after its
     /// contents, by which time its own mtime is this run's doing.
-    pre_run_mtimes: RefCell<HashMap<(u64, u64), i64>>,
+    pre_run_mtimes: RefCell<HashMap<(u64, u64), (i64, i64)>>,
 }
 
 impl DirTree {
@@ -266,7 +266,7 @@ impl DirTree {
                     self.pre_run_mtimes
                         .borrow_mut()
                         .entry(file_id(&st))
-                        .or_insert(st.st_mtime);
+                        .or_insert(mtime_of(&st));
                 }
             }
             let next = Rc::new(next);
@@ -296,17 +296,22 @@ impl DirTree {
         self.implicit.borrow_mut().remove(&file_id(st))
     }
 
-    /// The mtime `st` had before this run put anything below it, for -u.
-    pub(crate) fn mtime_before_run(&self, st: &libc::stat) -> i64 {
-        // Cast needed: `time_t` is i64 on both platforms, but not by name.
-        #[allow(clippy::unnecessary_cast)]
-        let now = st.st_mtime as i64;
+    /// The mtime `st` had before this run put anything below it, for -u, as
+    /// seconds and nanoseconds.
+    pub(crate) fn mtime_before_run(&self, st: &libc::stat) -> (i64, i64) {
         self.pre_run_mtimes
             .borrow()
             .get(&file_id(st))
             .copied()
-            .unwrap_or(now)
+            .unwrap_or_else(|| mtime_of(st))
     }
+}
+
+/// `st`'s modification time, as seconds and nanoseconds.
+fn mtime_of(st: &libc::stat) -> (i64, i64) {
+    // Casts needed: the field types are i64 on both platforms, but not by name.
+    #[allow(clippy::unnecessary_cast)]
+    (st.st_mtime as i64, st.st_mtime_nsec as i64)
 }
 
 /// The directories `DirTree` walked to last, a descriptor per level.

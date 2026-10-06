@@ -68,7 +68,7 @@ pub fn list_archive<R: ArchiveReader, W: Write>(
             records.apply(&mut entry);
         }
         if let Some(selection) = selector.select(&entry) {
-            selector.take(selection, &entry);
+            selector.take(selection);
             // Rename as extraction would, hard link targets included, so the
             // listing shows the names `-r` would create (`tar -t` what `tar -x`).
             if crate::modes::read::rename_member(

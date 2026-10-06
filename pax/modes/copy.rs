@@ -454,9 +454,11 @@ impl CopyWalk<'_> {
 
     /// Whether the source is newer than the destination already there (`-u`)
     /// -- as it was before this run, which a `find -depth` list has already
-    /// written into by the time it names the directory.
+    /// written into by the time it names the directory. Times compare to the
+    /// nanosecond.
     fn is_source_newer(&self, src_metadata: &ftw::Metadata, dest: Option<&libc::stat>) -> bool {
-        dest.is_none_or(|st| src_metadata.mtime() > self.tree.mtime_before_run(st))
+        let src = (src_metadata.mtime(), src_metadata.mtime_nsec());
+        dest.is_none_or(|st| src > self.tree.mtime_before_run(st))
     }
 
     /// -v: name the source file on standard error.

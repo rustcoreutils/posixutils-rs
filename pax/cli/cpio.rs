@@ -349,9 +349,11 @@ fn finish(mut st: State) -> PaxResult<Args> {
     }
 
     // Without -u, cpio refuses to replace a file with an older archived copy --
-    // which is exactly what pax's -u does.
+    // which is what pax's -u does, except that the file is the one at the name
+    // the member is extracted under, after any -r rename.
     if !st.unconditional && mode != Mode::CopyOut {
         st.args.update = true;
+        st.args.update_final_name = true;
     }
 
     // The block total goes to stderr for the two modes that move an archive.
@@ -504,6 +506,7 @@ mod tests {
         let plain = cpio(&["-i"]).unwrap();
         assert_eq!(plain.privs, ["m"]);
         assert!(plain.update);
+        assert!(plain.update_final_name);
 
         let both = cpio(&["-imu"]).unwrap();
         assert_eq!(both.privs, Vec::<String>::new());

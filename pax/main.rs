@@ -143,9 +143,10 @@ struct Args {
     format_options: Vec<String>,
 
     // An option-argument is taken verbatim (XBD 12.2, guideline 7), so an
-    // expression delimited by '-' (`-s -a-b-`) is a value, not an option.
+    // expression delimited by '-' (`-s -a-b-`) is a value, not an option. It
+    // rewrites names, which are bytes, so it is bytes too.
     #[arg(short = 's', action = clap::ArgAction::Append, allow_hyphen_values = true, help = gettext("Modify file/archive member names using substitution expression"))]
-    substitutions: Vec<String>,
+    substitutions: Vec<OsString>,
 
     #[arg(short = 't', long, help = gettext("Reset access times of files after reading them"))]
     reset_atime: bool,
@@ -210,6 +211,11 @@ struct Args {
     /// cpio: report the archive size as a count of 512-byte blocks on stderr
     #[arg(skip)]
     report_blocks: bool,
+
+    /// cpio: `update` keeps a newer file at the name a member is extracted
+    /// under, after `-r`, rather than selecting by the archived name
+    #[arg(skip)]
+    update_final_name: bool,
 }
 
 /// Operation mode
@@ -374,9 +380,10 @@ fn parse_format_options(args: &Args) -> PaxResult<FormatOptions> {
 
 /// Parse all -s substitution expressions from arguments
 fn parse_substitutions(args: &Args) -> PaxResult<Vec<Substitution>> {
+    use std::os::unix::ffi::OsStrExt;
     args.substitutions
         .iter()
-        .map(|s| Substitution::parse(s))
+        .map(|s| Substitution::parse(s.as_bytes()))
         .collect()
 }
 
@@ -463,6 +470,7 @@ fn run_read(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
         preserve_owner: should_preserve_owner(&args.privs),
         interactive: args.interactive,
         update: args.update,
+        update_final_name: args.update_final_name,
         substitutions,
         first_match: args.first_match,
         umask: current_umask(),
@@ -1231,7 +1239,7 @@ mod tests {
     #[test]
     fn test_option_arguments_may_begin_with_a_dash() {
         let args = Args::parse_from(["pax", "-w", "-s", "-a-b-", "-v", "f"]);
-        assert_eq!(args.substitutions, vec!["-a-b-".to_string()]);
+        assert_eq!(args.substitutions, vec![OsString::from("-a-b-")]);
         assert!(args.verbose, "-v after the -s argument is still an option");
         let args = Args::parse_from(["pax", "-r", "-f", "-v"]);
         assert_eq!(args.archive.as_deref(), Some(std::path::Path::new("-v")));

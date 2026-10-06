@@ -514,3 +514,156 @@ fn test_listing_write_error_fails_once() {
     assert_eq!(stderr.lines().count(), 1, "stderr:\n{stderr}");
     assert!(!stderr.contains("member-"), "blamed a member:\n{stderr}");
 }
+
+/// An archive of empty members by name; a name ending in '/' is a directory.
+fn archive_of(names: &[&[u8]]) -> Vec<u8> {
+    let mut a = Vec::new();
+    for &name in names {
+        let dir = name.ends_with(b"/");
+        a.extend_from_slice(
+            &Ustar {
+                name,
+                typeflag: if dir { b'5' } else { b'0' },
+                mode: if dir { 0o755 } else { 0o644 },
+                ..Default::default()
+            }
+            .member(),
+        );
+    }
+    a.extend_from_slice(&ustar_trailer());
+    a
+}
+
+/// List `archive` with `args`, returning the exit code, stdout and stderr.
+fn list(archive: &[u8], args: &[&str]) -> (i32, String, String) {
+    let output = run_pax_with_stdin_bytes(args, archive);
+    (
+        output.status.code().unwrap_or(-1),
+        stdout_str(&output),
+        stderr_str(&output),
+    )
+}
+
+/// POSIX: a diagnostic is due only for a pattern "not matched by at least one
+/// ... archive member". `d/x` matches d/x even though `d` selected it too.
+#[test]
+fn test_overlapping_patterns_are_all_matched() {
+    let a = archive_of(&[b"d/", b"d/x", b"d/y"]);
+    for args in [&["d", "d/x"][..], &["-n", "d", "d/x"], &["d/x", "d"]] {
+        let (code, out, err) = list(&a, args);
+        assert_eq!(
+            (code, out.as_str(), err.as_str()),
+            (0, "d/\nd/x\nd/y\n", ""),
+            "{args:?}"
+        );
+    }
+}
+
+/// -n: "members of type directory shall still match the file hierarchy
+/// rooted at that file" -- also when the archive names the directory after
+/// its contents, as `find -depth` lists it.
+#[test]
+fn test_n_keeps_the_hierarchy_of_a_depth_first_archive() {
+    let a = archive_of(&[b"d/x", b"d/y", b"d/", b"e"]);
+    let (code, out, _) = list(&a, &["-n", "d"]);
+    assert_eq!((code, out.as_str()), (0, "d/x\nd/y\nd/\n"));
+}
+
+/// -n with the pattern `.` selects the whole hierarchy of an archive made
+/// from `.`.
+#[test]
+fn test_n_dot_keeps_its_hierarchy() {
+    let a = archive_of(&[b"./", b"./x", b"./d/", b"./d/y"]);
+    let (code, out, _) = list(&a, &["-n", "."]);
+    assert_eq!((code, out.as_str()), (0, "./\n./x\n./d/\n./d/y\n"));
+}
+
+/// A pattern with a trailing slash names the directory, and so its hierarchy;
+/// it does not name a file that is not a directory.
+#[test]
+fn test_pattern_trailing_slash_selects_the_hierarchy() {
+    let a = archive_of(&[b"d/", b"d/x", b"f"]);
+    let (code, out, _) = list(&a, &["d/"]);
+    assert_eq!((code, out.as_str()), (0, "d/\nd/x\n"));
+    let (code, out, _) = list(&a, &["f/"]);
+    assert_eq!((code, out.as_str()), (1, ""));
+}
+
+/// `a/*` names what is in the directory a, not a itself (stored as "a/").
+#[test]
+fn test_pattern_star_after_slash_skips_the_directory() {
+    let a = archive_of(&[b"a/", b"a/f"]);
+    let (code, out, _) = list(&a, &["a/*"]);
+    assert_eq!((code, out.as_str()), (0, "a/f\n"));
+    let (_, out, _) = list(&a, &["-d", "a/*"]);
+    assert_eq!(out, "a/f\n");
+}
+
+/// XCU 2.14.3, which pax patterns follow: "If a <slash> character is found
+/// following an unescaped <left-square-bracket> character before a
+/// corresponding <right-square-bracket> is found, the open bracket shall be
+/// treated as an ordinary character."
+#[test]
+fn test_pattern_slash_in_bracket_makes_it_literal() {
+    let a = archive_of(&[b"a[/]f", b"a/f"]);
+    let (code, out, _) = list(&a, &["a[/]f"]);
+    assert_eq!((code, out.as_str()), (0, "a[/]f\n"));
+}
+
+/// An absolute name's leading '/' is no empty directory a pattern can name:
+/// neither `*` nor the empty pattern selects it. `/` does.
+#[test]
+fn test_pattern_does_not_match_the_empty_root_prefix() {
+    let a = archive_of(&[b"/abs/k"]);
+    for pattern in ["*", ""] {
+        let (code, out, _) = list(&a, &[pattern]);
+        assert_eq!((code, out.as_str()), (1, ""), "{pattern:?}");
+    }
+    let (code, out, _) = list(&a, &["/"]);
+    assert_eq!((code, out.as_str()), (0, "/abs/k\n"));
+}
+
+/// -c: "Match all file or archive members except those specified by the
+/// pattern or file operands." With none, nothing is excepted.
+#[test]
+fn test_c_without_patterns_selects_everything() {
+    let a = archive_of(&[b"d/", b"d/x"]);
+    let (code, out, _) = list(&a, &["-c"]);
+    assert_eq!((code, out.as_str()), (0, "d/\nd/x\n"));
+}
+
+/// Bracket expressions read characters as `LC_CTYPE` encodes them, not as
+/// UTF-8: in a Latin-1 locale the byte 0xE9 is 'é', a letter in the range
+/// à-ÿ. Skipped where the locale is not installed.
+#[test]
+fn test_pattern_brackets_follow_a_single_byte_locale() {
+    use std::os::unix::ffi::OsStrExt;
+    let locale = ["en_US.ISO8859-1", "en_US.iso88591"].into_iter().find(|l| {
+        Command::new("locale")
+            .arg("-a")
+            .output()
+            .is_ok_and(|o| o.stdout.split(|&b| b == b'\n').any(|n| n == l.as_bytes()))
+    });
+    let Some(locale) = locale else {
+        return;
+    };
+    let a = archive_of(&[b"\xe9"]);
+    for pattern in [&b"[[:alpha:]]"[..], b"[\xe0-\xff]"] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_pax"))
+            .arg(std::ffi::OsStr::from_bytes(pattern))
+            .env("LC_ALL", locale)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(&a).unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            output.stdout,
+            b"\xe9\n",
+            "{}",
+            String::from_utf8_lossy(pattern)
+        );
+    }
+}

@@ -394,7 +394,7 @@ fn finish(mut st: State) -> PaxResult<Args> {
         // Without -P, tar stores pathnames relative: a leading slash run is
         // dropped from the *stored* name only. An empty result (the operand was
         // "/") makes pax skip the member, which is the right outcome.
-        st.args.substitutions.insert(0, ",^//*,,".to_string());
+        st.args.substitutions.insert(0, ",^//*,,".into());
     }
 
     // tar always writes an interchange format; only the flavor is selectable.
@@ -579,7 +579,7 @@ mod tests {
     fn test_create_strips_leading_slashes_unless_dash_p() {
         let relative = tar(&["-cf", "a.tar", "/etc"]).unwrap();
         assert_eq!(
-            relative.substitutions.first().map(String::as_str),
+            relative.substitutions.first().and_then(|s| s.to_str()),
             Some(",^//*,,")
         );
 

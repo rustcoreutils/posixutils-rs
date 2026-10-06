@@ -21,7 +21,10 @@
 //!   bracket expression.
 //! - A `.` at the start of the name or just after a `/` is matched only by a
 //!   literal `.`.
-//! - A `[` that does not begin a complete bracket expression matches itself.
+//! - A `[` that does not begin a complete bracket expression matches itself,
+//!   and so does one whose expression would hold a `/` (XCU 2.14.3).
+//! - A trailing `/` names a directory: the pattern matches only a directory
+//!   member, by the rest of the pattern.
 //!
 //! Names and patterns are bytes. They are split into characters under the
 //! current `LC_CTYPE`; a byte that does not begin a valid character is a
@@ -36,6 +39,8 @@
 #[derive(Debug, Clone)]
 pub struct Pattern {
     tokens: Vec<Token>,
+    /// It ended in `/`, so it matches only a directory.
+    dir_only: bool,
     /// The original pattern string, retained for "not found" diagnostics when a
     /// pattern operand matches no archive member.
     pub source: String,
@@ -88,41 +93,66 @@ impl Unit<'_> {
 /// A name split into characters, ready to be matched against any number of
 /// patterns.
 pub struct Name<'a> {
+    /// The characters, without the trailing `/`s a directory member is
+    /// stored with (all but one, when that is all there is).
     units: Vec<Unit<'a>>,
+    /// It names a directory.
+    is_dir: bool,
 }
 
 impl<'a> Name<'a> {
+    /// A name, which names a directory when it ends in `/`.
     pub fn new(bytes: &'a [u8]) -> Self {
-        Name {
-            units: split_units(bytes),
-        }
+        Self::member(bytes, false)
     }
 
-    /// The name without a single trailing `/`, as a directory member is
-    /// stored; `None` when there is none.
-    fn without_trailing_slash(&self) -> Option<&[Unit<'a>]> {
-        match self.units.split_last() {
-            Some((last, rest)) if last.is(b'/') => Some(rest),
-            _ => None,
+    /// The name of a member, which is a directory when `is_dir` says so (a
+    /// cpio directory has no trailing `/`) or the name ends in `/`.
+    pub fn member(bytes: &'a [u8], is_dir: bool) -> Self {
+        let mut units = split_units(bytes);
+        let slash = units.last().is_some_and(|u| u.is(b'/'));
+        while units.len() > 1 && units.last().is_some_and(|u| u.is(b'/')) {
+            units.pop();
+        }
+        Name {
+            units,
+            is_dir: is_dir || slash,
         }
     }
 }
 
-/// Split bytes into characters under the current `LC_CTYPE`.
+/// How a pattern selects a member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selected {
+    /// It matches the member's name.
+    Itself,
+    /// It matches the directory whose name is the first this many bytes of
+    /// the member's, and so the member, which is in its hierarchy.
+    Below(usize),
+}
+
+/// Split bytes into characters under the current `LC_CTYPE`, each with the
+/// character it encodes there, if any.
 fn split_units(bytes: &[u8]) -> Vec<Unit<'_>> {
-    fn unit(b: &[u8]) -> Unit<'_> {
-        Unit {
-            bytes: b,
-            ch: std::str::from_utf8(b).ok().and_then(|s| s.chars().next()),
-        }
-    }
     if bytes.is_ascii() {
         // Every locale this runs in encodes ASCII as itself, one byte each.
-        return bytes.chunks(1).map(unit).collect();
+        return bytes
+            .chunks(1)
+            .map(|b| Unit {
+                bytes: b,
+                ch: Some(b[0] as char),
+            })
+            .collect();
     }
     plib::locale::mb_char_slices(bytes)
         .into_iter()
-        .map(unit)
+        .map(|b| Unit {
+            bytes: b,
+            ch: match plib::locale::MbDecoder::new().decode(b).as_slice() {
+                [Some(c)] => Some(*c),
+                _ => None,
+            },
+        })
         .collect()
 }
 
@@ -131,44 +161,62 @@ impl Pattern {
     /// begins no bracket expression is an ordinary character.
     pub fn new(pattern: impl AsRef<[u8]>) -> Self {
         let pattern = pattern.as_ref();
+        // A name, so its trailing slashes say "a directory" and nothing more.
+        let name = Name::new(pattern);
         Pattern {
-            tokens: parse_pattern(&split_units(pattern)),
+            tokens: parse_pattern(&name.units),
+            // `/` alone is the root, not a name with a trailing slash.
+            dir_only: name.is_dir && !(name.units.len() == 1 && name.units[0].is(b'/')),
             source: String::from_utf8_lossy(pattern).into_owned(),
         }
     }
 
     /// Whether the whole of `name` matches.
     pub fn matches(&self, name: &[u8]) -> bool {
-        self.matches_units(&Name::new(name).units)
+        self.matches_name(&Name::new(name))
     }
 
-    /// Whether this pattern selects `name`: the name itself, a directory
-    /// member stored as `dir/` by `dir`, or -- when `expand_subtree` is set --
-    /// any name below a directory the pattern matches.
+    /// Whether the whole of `name` matches; a directory member stored as
+    /// `dir/` is matched as `dir`.
+    fn matches_name(&self, name: &Name) -> bool {
+        self.matches_run(&name.units, name.is_dir, Periods::Explicit)
+    }
+
+    /// Whether the characters `text`, naming a directory if `is_dir`, match.
+    fn matches_run(&self, text: &[Unit], is_dir: bool, periods: Periods) -> bool {
+        (is_dir || !self.dir_only) && match_tokens(&self.tokens, text, periods)
+    }
+
+    /// How this pattern selects `name`, if it does: by matching the name
+    /// itself or -- when `expand_subtree` is set -- a directory above it.
     ///
     /// Per POSIX, a pattern that selects a directory member also selects the
     /// entire file hierarchy rooted at that directory; `-d`
     /// (`expand_subtree == false`) restricts the match to the directory itself.
-    pub fn selects(&self, name: &Name, expand_subtree: bool) -> bool {
-        if self.matches_units(&name.units) {
-            return true;
-        }
-        let trimmed = name.without_trailing_slash().unwrap_or(&name.units);
-        if trimmed.len() != name.units.len() && self.matches_units(trimmed) {
-            return true;
+    /// The directory is the topmost the pattern matches, so its hierarchy
+    /// holds every other. An absolute name's leading `/` is the directory `/`.
+    pub fn selects(&self, name: &Name, expand_subtree: bool) -> Option<Selected> {
+        if self.matches_name(name) {
+            return Some(Selected::Itself);
         }
         if !expand_subtree {
-            return false;
+            return None;
         }
-        (0..trimmed.len())
-            .rev()
-            .filter(|&i| trimmed[i].is(b'/'))
-            .any(|i| self.matches_units(&trimmed[..i]))
+        let units = &name.units;
+        (0..units.len())
+            .filter(|&i| units[i].is(b'/'))
+            .map(|i| &units[..i.max(1)])
+            .find(|dir| self.matches_run(dir, true, Periods::Explicit))
+            .map(|dir| Selected::Below(dir.iter().map(|u| u.bytes.len()).sum()))
     }
+}
 
-    fn matches_units(&self, text: &[Unit]) -> bool {
-        match_tokens(&self.tokens, text)
-    }
+/// Whether a leading `.` must be matched by a literal `.`, as in pax
+/// patterns, or may be matched by a wildcard, as in tar's exclusions.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Periods {
+    Explicit,
+    Wild,
 }
 
 /// Parse a pattern into tokens.
@@ -215,6 +263,13 @@ fn parse_bracket(units: &[Unit]) -> Option<(Bracket, usize)> {
     let mut first = true;
     loop {
         let u = *units.get(i)?;
+        // XCU 2.14.3: "If a <slash> character is found following an unescaped
+        // <left-square-bracket> character before a corresponding
+        // <right-square-bracket> is found, the open bracket shall be treated as
+        // an ordinary character."
+        if u.is(b'/') {
+            return None;
+        }
         if u.is(b']') && !first {
             return Some((Bracket { negated, items }, i + 1));
         }
@@ -257,7 +312,11 @@ fn parse_bracket(units: &[Unit]) -> Option<(Bracket, usize)> {
 fn bracket_char<'a>(units: &[Unit<'a>]) -> Option<(Unit<'a>, usize)> {
     let u = *units.first()?;
     if u.is(b'\\') {
-        return units.get(1).map(|&next| (next, 2));
+        // An escaped '/' is still a '/': the '[' is ordinary.
+        return units
+            .get(1)
+            .filter(|next| !next.is(b'/'))
+            .map(|&next| (next, 2));
     }
     Some((u, 1))
 }
@@ -276,6 +335,9 @@ fn parse_bracket_term(units: &[Unit]) -> Option<(BracketItem, usize)> {
     }
     let close =
         (1..units.len().saturating_sub(1)).find(|&j| units[j].is(kind) && units[j + 1].is(b']'))?;
+    if units[1..close].iter().any(|u| u.is(b'/')) {
+        return None;
+    }
     let body: Vec<u8> = units[1..close]
         .iter()
         .flat_map(|u| u.bytes.iter().copied())
@@ -334,12 +396,15 @@ fn is_leading_period(text: &[Unit], pos: usize) -> bool {
 }
 
 /// Whether a single-character token matches the character at `pos`.
-fn token_matches(token: &Token, text: &[Unit], pos: usize) -> bool {
+fn token_matches(token: &Token, text: &[Unit], pos: usize, periods: Periods) -> bool {
     let u = &text[pos];
+    // A wildcard never matches a '/', nor -- in a pax pattern -- a leading '.'.
+    let explicit_period = periods == Periods::Explicit && is_leading_period(text, pos);
+    let wild_ok = || !u.is(b'/') && !explicit_period;
     match token {
         Token::Literal(bytes) => u.bytes == bytes.as_slice(),
-        Token::Any => !u.is(b'/') && !is_leading_period(text, pos),
-        Token::Bracket(b) => !u.is(b'/') && !is_leading_period(text, pos) && b.matches(u),
+        Token::Any => wild_ok(),
+        Token::Bracket(b) => wild_ok() && b.matches(u),
         Token::Star => unreachable!("handled by match_tokens"),
     }
 }
@@ -350,7 +415,7 @@ fn token_matches(token: &Token, text: &[Unit], pos: usize) -> bool {
 /// needs to take one more character: an earlier one is confined to its own
 /// pathname component, which the text after it has already fixed. That one
 /// backtracking point keeps this linear in each `*` instead of exponential.
-fn match_tokens(tokens: &[Token], text: &[Unit]) -> bool {
+fn match_tokens(tokens: &[Token], text: &[Unit], periods: Periods) -> bool {
     let (mut p, mut s) = (0, 0);
     // Where to resume after the most recent `*`: the token after it, and the
     // text position it will next try to start from.
@@ -362,14 +427,14 @@ fn match_tokens(tokens: &[Token], text: &[Unit]) -> bool {
                 while p < tokens.len() && matches!(tokens[p], Token::Star) {
                     p += 1;
                 }
-                if s < text.len() && is_leading_period(text, s) {
+                if periods == Periods::Explicit && s < text.len() && is_leading_period(text, s) {
                     // Not even an empty `*` may stand before a leading '.'.
                     return false;
                 }
                 backtrack = Some((p, s));
                 continue;
             }
-            if s < text.len() && token_matches(&tokens[p], text, s) {
+            if s < text.len() && token_matches(&tokens[p], text, s, periods) {
                 p += 1;
                 s += 1;
                 continue;
@@ -392,24 +457,30 @@ fn match_tokens(tokens: &[Token], text: &[Unit]) -> bool {
 
 /// Check whether `path` is excluded by any of `patterns` (tar's `--exclude`).
 ///
-/// Unlike the pax pattern operands, tar exclusion patterns are *unanchored*: a
-/// pattern is tried against the whole name and against every suffix that starts
-/// just after a `/`, so `--exclude=build` drops `src/build` and `--exclude=*.o`
-/// drops `src/obj/x.o`. An empty list excludes nothing.
+/// As in GNU tar, exclusion patterns are *unanchored*, match a leading `.`
+/// with a wildcard, and take a directory's contents with it: a pattern is
+/// tried against every run of whole components, so `--exclude=build` drops
+/// `src/build` and everything below it, `--exclude=*.o` drops `src/obj/x.o`,
+/// and `--exclude=*` drops `.profile`. An empty list excludes nothing.
 pub fn matches_excluded(patterns: &[Pattern], path: &[u8]) -> bool {
     if patterns.is_empty() {
         return false;
     }
     let name = Name::new(path);
-    // A directory member arrives as "dir/"; match it as "dir".
-    let units = name.without_trailing_slash().unwrap_or(&name.units);
-    std::iter::once(0)
-        .chain(
-            (0..units.len())
-                .filter(|&i| units[i].is(b'/'))
-                .map(|i| i + 1),
-        )
-        .any(|start| patterns.iter().any(|p| p.matches_units(&units[start..])))
+    let units = &name.units;
+    let slashes = || (0..units.len()).filter(|&i| units[i].is(b'/'));
+    let mut starts = std::iter::once(0).chain(slashes().map(|i| i + 1));
+    starts.any(|start| {
+        // Every run that ends before a '/' is a directory.
+        let ends = slashes()
+            .map(|end| (end, true))
+            .chain(std::iter::once((units.len(), name.is_dir)));
+        ends.filter(|&(end, _)| end > start).any(|(end, is_dir)| {
+            patterns
+                .iter()
+                .any(|p| p.matches_run(&units[start..end], is_dir, Periods::Wild))
+        })
+    })
 }
 
 /// Check if any pattern matches the given path. No patterns means match all.
@@ -418,7 +489,7 @@ pub fn matches_any(patterns: &[Pattern], path: &[u8]) -> bool {
         return true;
     }
     let name = Name::new(path);
-    patterns.iter().any(|p| p.matches_units(&name.units))
+    patterns.iter().any(|p| p.matches_name(&name))
 }
 
 #[cfg(test)]
@@ -440,7 +511,10 @@ mod tests {
         // ...but only on a whole component boundary.
         assert!(!matches_excluded(&pats, b"rebuild"));
         assert!(!matches_excluded(&pats, b"src/rebuild"));
-        assert!(!matches_excluded(&pats, b"build/x"));
+        assert!(!matches_excluded(&pats, b"builder/x"));
+        // A directory takes its contents with it.
+        assert!(matches_excluded(&pats, b"build/x"));
+        assert!(matches_excluded(&pats, b"src/build/x/y"));
 
         // A directory member arrives with a trailing slash and still matches.
         assert!(matches_excluded(&pats, b"src/build/"));
@@ -456,6 +530,15 @@ mod tests {
         assert!(matches_excluded(&pats, b"x.o"));
         assert!(matches_excluded(&pats, b"src/obj/x.o"));
         assert!(!matches_excluded(&pats, b"x.c"));
+
+        // A wildcard matches a leading '.' here, as in GNU tar.
+        assert!(matches_excluded(&[Pattern::new("*")], b".profile"));
+        assert!(matches_excluded(&[Pattern::new("?h")], b"e/.h/q"));
+        // A trailing '/' names only a directory.
+        let dirs = [Pattern::new("x/")];
+        assert!(matches_excluded(&dirs, b"x/"));
+        assert!(matches_excluded(&dirs, b"x/f"));
+        assert!(!matches_excluded(&dirs, b"a/x"));
     }
 
     #[test]
@@ -507,9 +590,13 @@ mod tests {
         assert!(m(r"[\]]", "]"));
         // An unknown class matches nothing.
         assert!(!m("[[:nosuch:]]", "a"));
-        // A bracket expression never matches '/'.
+        // A bracket expression never matches '/': one that would hold a '/'
+        // is no bracket expression, and its '[' is an ordinary character.
         assert!(!m("a[!x]b", "a/b"));
         assert!(!m("a[/]b", "a/b"));
+        assert!(m("a[/]b", "a[/]b"));
+        assert!(m(r"a[\/]b", "a[/]b"));
+        assert!(m("a[[:x/y:]]", "a[[:x/y:]]"));
     }
 
     #[test]
@@ -575,11 +662,37 @@ mod tests {
         let sel = |name: &str, expand| p.selects(&Name::new(name.as_bytes()), expand);
 
         // Without expansion, only the directory itself matches (stored "dir/").
-        assert!(sel("dir/", false));
-        assert!(!sel("dir/sub/f", false));
+        assert_eq!(sel("dir/", false), Some(Selected::Itself));
+        assert_eq!(sel("dir/sub/f", false), None);
         // With expansion, the whole subtree matches via an ancestor.
-        assert!(sel("dir/sub/f", true));
+        assert_eq!(sel("dir/sub/f", true), Some(Selected::Below(3)));
         // An unrelated sibling never matches.
-        assert!(!sel("dirfoo", true));
+        assert_eq!(sel("dirfoo", true), None);
+    }
+
+    #[test]
+    fn test_selects_by_directory_names() {
+        let sel = |pattern: &str, name: &str| {
+            Pattern::new(pattern).selects(&Name::new(name.as_bytes()), true)
+        };
+        // A trailing '/' names a directory, and so its hierarchy.
+        assert_eq!(sel("d/", "d/"), Some(Selected::Itself));
+        assert_eq!(sel("d/", "d/x"), Some(Selected::Below(1)));
+        assert_eq!(sel("f/", "f"), None);
+        assert_eq!(
+            Pattern::new("d/").selects(&Name::member(b"d", true), true),
+            Some(Selected::Itself)
+        );
+        // 'a/*' is what is in a, not a itself.
+        assert_eq!(sel("a/*", "a/"), None);
+        assert_eq!(sel("a/*", "a/f"), Some(Selected::Itself));
+        // The topmost directory matched is the hierarchy's root.
+        assert_eq!(sel("a*", "a/ab/c"), Some(Selected::Below(1)));
+        // An absolute name's leading '/' is the directory '/', which neither
+        // '*' nor '' names.
+        assert_eq!(sel("*", "/abs/k"), None);
+        assert_eq!(sel("", "/abs/k"), None);
+        assert_eq!(sel("/", "/abs/k"), Some(Selected::Below(1)));
+        assert_eq!(sel("/abs", "/abs/k"), Some(Selected::Below(4)));
     }
 }

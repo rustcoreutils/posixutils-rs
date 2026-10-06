@@ -1784,3 +1784,61 @@ fn test_target_clones_divide_attributes_as_gcc() {
     assert_eq!(alias.visibility, None);
     assert!(!alias.weak);
 }
+
+/// A file-scope `extern` declaration with an initializer is an external
+/// definition (C17 6.9.2p1), defined exactly once whatever declares the name
+/// before or after it: a later tentative or plain declaration refers to it,
+/// and after a `static` declaration it has internal linkage (6.2.2p4).
+#[test]
+fn test_initialized_extern_declaration_is_a_definition() {
+    let src = "extern int y = 5;\nint y;\nextern int y;\nint *p = &y;\n\
+               static int x;\nextern int x = 7;\n\
+               int u;\nextern int u = 3;\n\
+               extern const char s[] = \"hi\";\n\
+               extern struct { int a, b; } pt = {1, 2};\n\
+               extern _Thread_local int t = 1;\n";
+    for arch in [crate::target::Arch::X86_64, crate::target::Arch::Aarch64] {
+        let target = Target::new(arch, crate::target::Os::Linux);
+        let module = linearize_source(src, &target);
+        let only = |name: &str| {
+            let found: Vec<&crate::ir::GlobalDef> =
+                module.globals.iter().filter(|g| g.name == name).collect();
+            assert_eq!(found.len(), 1, "{arch}: one `{name}` in the module");
+            assert!(
+                !module.extern_symbols.contains(name),
+                "{arch}: `{name}` is defined, not external"
+            );
+            found[0]
+        };
+        for (name, value, local) in [("y", 5, false), ("x", 7, true), ("u", 3, false)] {
+            let g = only(name);
+            assert!(
+                matches!(g.init, Initializer::Int(v) if v == value),
+                "{arch}: `{name}` = {value}, got {:?}",
+                g.init
+            );
+            assert_eq!(g.is_static, local, "{arch}: `{name}` linkage");
+        }
+        let s = only("s");
+        assert!(
+            matches!(&s.init, Initializer::String(v) if v.starts_with("hi")),
+            "{arch}: `s` = \"hi\", got {:?}",
+            s.init
+        );
+        assert!(s.is_const && !s.is_static, "{arch}: `s` is const, external");
+        assert!(!only("pt").is_static, "{arch}: `pt` is external");
+        let t = only("t");
+        assert!(
+            t.is_thread_local && !t.is_static && matches!(t.init, Initializer::Int(1)),
+            "{arch}: `t` is an external thread-local = 1"
+        );
+        assert!(
+            !module.extern_tls_symbols.contains("t"),
+            "{arch}: `t` is defined"
+        );
+        assert!(
+            matches!(only("p").init, Initializer::SymAddr(ref n) if n == "y"),
+            "{arch}: `p` = &y"
+        );
+    }
+}

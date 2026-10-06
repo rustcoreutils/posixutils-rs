@@ -18,6 +18,7 @@ use crate::parse::ast::{
     AliasForm, BinaryOp, Declaration, Designator, Expr, ExprKind, InitElement, UnaryOp,
 };
 use crate::strings::StringId;
+use crate::symbol::Linkage;
 use crate::token::lexer::Position;
 use crate::types::{MemberInfo, Type, TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::{BTreeMap, HashMap};
@@ -222,12 +223,14 @@ impl<'a> super::linearize::Linearizer<'a> {
                 continue;
             }
 
-            // Skip extern declarations - they don't define storage
-            // But track them so codegen can use GOT access on macOS
+            // An `extern` declaration without an initializer defines no
+            // storage, but is tracked so codegen can use GOT access on macOS.
             // Only add to extern_symbols if not already defined (handles both cases:
             // extern int x; int x = 1;  - x is defined, not extern
             // int x = 1; extern int x;  - x is defined, not extern)
-            if storage_class.contains(TypeModifiers::EXTERN) {
+            // With an initializer it is an external definition (C17 6.9.2p1,
+            // `extern int i3 = 3;` in 6.9.2p4), defined below like any other.
+            if storage_class.contains(TypeModifiers::EXTERN) && declarator.init.is_none() {
                 // Check if this symbol is already defined in globals
                 if self.module.globals.iter().any(|g| g.name == name) {
                     // An attribute on a declaration after the definition is
@@ -256,8 +259,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.ast_init_to_ir(e, declarator.typ)
             });
 
+            // Internal linkage comes from `static` here or, for an `extern`
+            // definition, from a prior `static` declaration (6.2.2p4).
+            let is_static = storage_class.contains(TypeModifiers::STATIC)
+                || self.symbols.get(declarator.symbol).linkage == Linkage::Internal;
+
             // Track file-scope static variables for inline semantic checks
-            if storage_class.contains(TypeModifiers::STATIC) {
+            if is_static {
                 self.file_scope_statics.insert(name.clone());
             }
 
@@ -275,7 +283,6 @@ impl<'a> super::linearize::Linearizer<'a> {
             self.module.extern_symbols.remove(&name);
             self.module.extern_object_align.remove(&name);
 
-            let is_static = storage_class.contains(TypeModifiers::STATIC);
             // Const-qualified at the object level. For arrays, the element type
             // carries the qualifier (e.g., `const int a[10]`), so look through
             // arrays to their element type.

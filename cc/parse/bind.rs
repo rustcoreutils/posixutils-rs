@@ -425,6 +425,10 @@ impl Parser<'_> {
             typ = self.align_typedef_type(typ, align);
             (self.bind_typedef_name(scope, name, pos, typ, &vla)?, None)
         } else {
+            // gcc words this ahead of anything the declaration conflicts with.
+            if !is_fn && (inferred_init.is_some() || self.is_special(b'=')) {
+                self.check_extern_initializer(specs, scope, name, pos);
+            }
             // C17 6.2.7p4: two declarations of one object with linkage
             // describe it by their composite type.
             typ = self.composite_with_prior_declaration(name, typ, specs.storage_class);
@@ -450,12 +454,12 @@ impl Parser<'_> {
             // after the declarator, so `int *p = sizeof *p ...` sees `p`.
             let symbol = self.declare_in(scope, sym, name);
             let init = match inferred_init {
-                Some(init) => Some(self.settle_initializer(specs, scope, &mut typ, symbol, init)),
-                None => {
-                    self.parse_declarator_initializer(specs, scope, name, pos, &mut typ, symbol)?
-                }
+                Some(init) => Some(self.settle_initializer(&mut typ, symbol, init)),
+                None => self.parse_declarator_initializer(name, pos, &mut typ, symbol)?,
             };
-            if !is_fn && !specs.is_extern() {
+            // An initialized `extern` declaration is a definition (6.9.2p1),
+            // so its object needs a size like any other.
+            if !is_fn && (!specs.is_extern() || init.is_some()) {
                 self.check_object_complete(scope, name, typ, &vla, pos);
             }
             // A tentative definition of an array without its extent, which a
@@ -804,12 +808,37 @@ impl Parser<'_> {
         Some(existing)
     }
 
+    /// An initializer on an `extern` declaration, in gcc's words.
+    ///
+    /// 6.7.9p5: an identifier declared `extern` at block scope has linkage,
+    /// so it refers to a definition elsewhere and cannot carry one here. At
+    /// *file* scope the same spelling is an external definition (6.9.2p1),
+    /// which gcc only warns about.
+    fn check_extern_initializer(
+        &self,
+        specs: &DeclSpecs,
+        scope: DeclScope,
+        name: StringId,
+        pos: Position,
+    ) {
+        if !specs.is_extern() {
+            return;
+        }
+        let spelled = [self.idents.get(name)];
+        match scope {
+            DeclScope::File => {
+                diag::warning_args(pos, "'{0}' initialized and declared 'extern'", &spelled)
+            }
+            DeclScope::Block { .. } => {
+                diag::error_args(pos, "'{0}' has both 'extern' and initializer", &spelled)
+            }
+        }
+    }
+
     /// Parse the initializer after a declarator, if one follows, and let it
     /// complete the declared type.
     fn parse_declarator_initializer(
         &mut self,
-        specs: &DeclSpecs,
-        scope: DeclScope,
         name: StringId,
         pos: Position,
         typ: &mut TypeId,
@@ -829,34 +858,18 @@ impl Parser<'_> {
         }
         self.advance();
         let init = self.parse_initializer()?;
-        Ok(Some(
-            self.settle_initializer(specs, scope, typ, symbol, init),
-        ))
+        Ok(Some(self.settle_initializer(typ, symbol, init)))
     }
 
     /// Check a declarator's initializer against the declared type, and let it
     /// complete that type.
     fn settle_initializer(
         &mut self,
-        specs: &DeclSpecs,
-        scope: DeclScope,
         typ: &mut TypeId,
         symbol: Option<SymbolId>,
         mut init: Expr,
     ) -> Expr {
         self.walk_initializer(*typ, &mut init);
-
-        // 6.7.9p5: an identifier declared `extern` at block scope has
-        // linkage, so it refers to a definition elsewhere and cannot carry
-        // one here. At *file* scope the same spelling is a definition with
-        // external linkage, which gcc only warns about.
-        if specs.is_extern() {
-            let msg = gettext("'extern' variable has an initializer");
-            match scope {
-                DeclScope::File => diag::warning(init.pos, &msg),
-                DeclScope::Block { .. } => diag::error(init.pos, &msg),
-            }
-        }
 
         // For incomplete array types, infer size from initializer
         let sized = self.infer_array_size_from_init(*typ, &init);

@@ -4014,7 +4014,8 @@ impl Module {
     ///
     /// A C tentative definition is completed rather than duplicated: if a
     /// global of the same name exists with `Initializer::None`, this
-    /// definition replaces it.
+    /// definition replaces it, and a tentative definition after an
+    /// initialized one is merged into it.
     pub(crate) fn define_global(
         &mut self,
         name: impl Into<String>,
@@ -4051,6 +4052,12 @@ impl Module {
                 if align.is_some() {
                     existing.explicit_align = align;
                 }
+                return;
+            }
+            // A tentative definition after the definition refers to it
+            // (6.9.2p2): `int y = 5; int y;` is one `y`.
+            if matches!(init, Initializer::None) {
+                existing.explicit_align = existing.explicit_align.max(align);
                 return;
             }
         }

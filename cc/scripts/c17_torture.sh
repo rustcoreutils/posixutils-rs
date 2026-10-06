@@ -987,7 +987,14 @@ comm -12 "$BASELINE" "$ATTEMPTED" > "$RELEVANT"
 # sub-suite to it did -- makes every comparison vacuous, and the gate would
 # have reported "no regressions (0 of 3076 attempted)" and exited 0 for a
 # compiler that failed everything.
-if [ ! -s "$RELEVANT" ]; then
+#
+# A filtered run (-f) may legitimately select only tests the baseline does not
+# hold yet -- checking a fix for tests that never passed -- so it reports that
+# and goes on; an unfiltered run still catches a changed tag format here.
+if [ ! -s "$RELEVANT" ] && [ -n "$FILTER" ]; then
+    echo
+    echo "NOTE: no baseline test matches -f '$FILTER'; nothing can regress."
+elif [ ! -s "$RELEVANT" ]; then
     echo
     echo "FATAL: the baseline and this run have no test in common." >&2
     echo "       $(wc -l < "$BASELINE") baseline entries, $(wc -l < "$ATTEMPTED") attempted." >&2

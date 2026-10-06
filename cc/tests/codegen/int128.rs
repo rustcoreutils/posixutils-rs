@@ -1592,3 +1592,36 @@ int main(void) {
         assert_eq!(rc, 0, "aarch64 at -O1");
     }
 }
+
+/// A function returning a 128-bit constant directly returns both halves.
+///
+/// aarch64's return path loaded a stack-resident `__int128` into X0/X1 with
+/// one `ldp`, and for any other location moved the low half to X0 and zeroed
+/// X1 -- so a constant operand, an immediate, came back with its high half
+/// lost: `return (i128)(~(u128)0 >> 1);` returned 2^64 - 1. x86-64 was right.
+#[test]
+fn codegen_int128_return_of_a_constant_keeps_its_high_half() {
+    let code = r#"
+typedef __int128 i128;
+typedef unsigned __int128 u128;
+
+__attribute__((noinline)) i128 max128(void) { return (i128)(~(u128)0 >> 1); }
+__attribute__((noinline)) i128 min128(void) { return -(i128)(~(u128)0 >> 1) - 1; }
+__attribute__((noinline)) u128 big(void) {
+    return ((u128)0x1122334455667788ull << 64) | 0x99aabbccddeeff00ull;
+}
+__attribute__((noinline)) u128 high_only(void) { return (u128)1 << 100; }
+
+int main(void) {
+    if ((u128)max128() >> 64 != 0x7fffffffffffffffull) return 1;
+    if ((unsigned long long)max128() != 0xffffffffffffffffull) return 2;
+    if ((u128)min128() >> 64 != 0x8000000000000000ull) return 3;
+    if ((unsigned long long)min128() != 0) return 4;
+    if (big() >> 64 != 0x1122334455667788ull) return 5;
+    if ((unsigned long long)big() != 0x99aabbccddeeff00ull) return 6;
+    if (high_only() >> 64 != 1ull << 36) return 7;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("cg_int128_return_constant", code);
+}

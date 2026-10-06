@@ -1433,6 +1433,11 @@ impl Aarch64CodeGen {
                         dst1: Reg::X0,
                         dst2: Reg::X1,
                     });
+                } else if let Loc::Imm(v) = loc {
+                    // A constant: both halves. The fallback below zeroed the
+                    // high one, so `return (i128)1 << 100;` returned 0.
+                    self.emit_mov_imm(Reg::X0, v as u64 as i64, 64);
+                    self.emit_mov_imm(Reg::X1, (v >> 64) as u64 as i64, 64);
                 } else {
                     // Fallback: load lo half to X0, zero X1
                     self.emit_move(src, Reg::X0, 64);

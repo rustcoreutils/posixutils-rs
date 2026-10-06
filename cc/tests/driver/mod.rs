@@ -15,6 +15,7 @@
 
 mod f_options;
 mod gcc_flags;
+mod link_options;
 mod linker_input;
 mod prefix_map;
 mod warn_options;

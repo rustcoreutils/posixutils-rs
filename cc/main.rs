@@ -2106,6 +2106,22 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             result.push("-D".to_string());
             result.push("_REENTRANT".to_string());
             i += 1;
+        } else if let Some(file) = arg.strip_prefix("-specs=") {
+            // A gcc spec file, in gcc's driver language, so the host driver
+            // that links reads it. Debian's are link specs (package notes,
+            // `-no-pie`) and `-fno-PIE` self-specs, which change nothing a
+            // link with c17's position-independent objects needs. gcc reads
+            // the file whether or not it links, and a missing one is fatal.
+            if let Err(e) = File::open(file) {
+                eprintln!(
+                    "c17: {} '{file}': {}",
+                    gettext("fatal error: cannot read spec file"),
+                    plib::diag::io_error_text(&e)
+                );
+                std::process::exit(1);
+            }
+            result.push(format!("--c17-linker-flag={arg}"));
+            i += 1;
         } else if arg == "-rdynamic" {
             // -rdynamic -> pass to linker
             result.push("--c17-linker-flag=-rdynamic".to_string());

@@ -329,6 +329,10 @@ pub struct Parser<'a> {
     /// expression of `_Generic`, an arm a constant condition discards. gcc
     /// reports no overflow in one, its `c_inhibit_evaluation_warnings`.
     pub(super) unevaluated: u32,
+    /// Whether the struct, union or enum specifier just parsed named a tag
+    /// already declared, without defining it; see
+    /// [`super::declaration::TagSpecifier`].
+    pub(super) last_tag_reference: bool,
     /// How many parameter lists are being parsed, one inside another.
     pub(super) param_list_depth: u32,
     /// Where a `[*]` was written directly in the parameter list being
@@ -418,6 +422,7 @@ impl<'a> Parser<'a> {
             defined_functions: std::collections::HashSet::new(),
             linked_names: std::collections::HashMap::new(),
             unevaluated: 0,
+            last_tag_reference: false,
             param_list_depth: 0,
             star_in_params: None,
             layout_pragmas,

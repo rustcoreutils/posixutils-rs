@@ -62,6 +62,9 @@ pub(super) struct DeclSpecs {
     /// A `scalar_storage_order` written on a reference to an existing tag,
     /// which each declarator applies or ignores.
     written_order: Option<WrittenOrder>,
+    /// How the specifiers were spelled, for a declaration that declares
+    /// nothing.
+    written: super::declaration::WrittenSpecifiers,
 }
 
 /// The type a declaration's declarators derive from.
@@ -187,6 +190,7 @@ impl Parser<'_> {
                     specs.pos,
                     &specs.ty,
                     specs.explicit,
+                    specs.written,
                     scope == DeclScope::File,
                 ),
             }
@@ -315,6 +319,7 @@ impl Parser<'_> {
             attrs: self.specifier_attrs(),
             vm_dims: parsed.vm_dims,
             written_order: parsed.written_order,
+            written: parsed.written,
             ty,
         })
     }

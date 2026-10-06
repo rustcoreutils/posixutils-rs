@@ -294,6 +294,37 @@ pub(crate) struct DeclSpecifiers {
     /// or union, which `ty` does not include: whether it applies depends on
     /// the declarator ([`Parser::apply_written_storage_order`]).
     pub(crate) written_order: Option<super::aggregate::WrittenOrder>,
+    /// How the specifiers were spelled, where a declaration that declares
+    /// nothing has to say so.
+    pub(crate) written: WrittenSpecifiers,
+}
+
+/// How a list of declaration specifiers was written, beyond the type it
+/// names: what gcc's diagnostics for an empty declaration distinguish.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct WrittenSpecifiers {
+    /// `__thread`, where the type records only that the object is
+    /// thread-local.
+    pub(crate) gnu_thread: bool,
+    /// The struct, union or enum specifier written, if one was; a typedef
+    /// name for such a type is not one.
+    pub(crate) tag: Option<TagSpecifier>,
+}
+
+/// The storage-class specifiers proper, which an empty declaration reports
+/// as one: `_Thread_local` has its own words, and `inline` is a function
+/// specifier gcc refuses there instead.
+const EMPTY_DECL_STORAGE: TypeModifiers = Type::STORAGE_CLASS
+    .difference(TypeModifiers::THREAD_LOCAL)
+    .difference(TypeModifiers::INLINE);
+
+/// What a struct, union or enum specifier did with its tag.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TagSpecifier {
+    /// Defined the type, or declared a tag not declared before.
+    Declares,
+    /// Named a tag already declared, without defining it.
+    Reference,
 }
 
 /// A type specifier that names a complete type by itself.
@@ -884,6 +915,7 @@ impl<'a> Parser<'a> {
         let mut tally = SpecifierTally::default();
         let mut inferred: Option<Position> = None;
         let mut written_order = None;
+        let mut written = WrittenSpecifiers::default();
 
         // Skip any leading __attribute__
         self.skip_extensions();
@@ -928,6 +960,7 @@ impl<'a> Parser<'a> {
                     if self.reject_outside_declaration(ctx) {
                         continue;
                     }
+                    written.gnu_thread = name_id == crate::kw::GNU_THREAD;
                     self.advance();
                     modifiers |= TypeModifiers::THREAD_LOCAL;
                 }
@@ -1260,11 +1293,17 @@ impl<'a> Parser<'a> {
                         ctx.is_declaration() && modifiers.is_empty() && !tally.has_type_specifier();
                     tally.note_data_type(idents.get(name_id), pos);
                     let tag_start = self.pos;
+                    self.last_tag_reference = false;
                     let parsed = if name_id == crate::kw::ENUM {
                         self.parse_enum_specifier()
                     } else {
                         self.parse_struct_or_union_specifier(name_id == crate::kw::UNION, alone)
                     };
+                    written.tag = Some(if std::mem::take(&mut self.last_tag_reference) {
+                        TagSpecifier::Reference
+                    } else {
+                        TagSpecifier::Declares
+                    });
                     written_order = self.take_written_storage_order();
                     resolved = Some(match parsed {
                         Ok(typ) => Resolved::Built(typ),
@@ -1428,6 +1467,7 @@ impl<'a> Parser<'a> {
             vm_dims,
             inferred,
             written_order,
+            written,
         })
     }
 
@@ -1936,51 +1976,41 @@ impl Parser<'_> {
     ///
     /// gcc refuses a function specifier here, and `auto` or `register` at file
     /// scope, where they could not apply to anything even with a declarator.
-    /// The rest it only warns about -- a pedwarn, so an error under
-    /// `-pedantic-errors`: "useless type name" when a type was named, and
-    /// otherwise "empty declaration" after a plain warning naming the
-    /// specifier that does nothing. `explicit` is whether a type specifier
-    /// was written.
+    /// The rest it only warns about. A pedwarn -- an error under
+    /// `-pedantic-errors` -- for a type named for nothing ("useless type
+    /// name"), an untagged structure, and a specifier on a reference to a tag
+    /// already declared, which therefore declares nothing new ("does not
+    /// redeclare tag"). Failing those, a plain warning naming the specifier
+    /// that does nothing -- on a tag declaration as much as anywhere -- and,
+    /// when no tag was declared, the pedwarn "empty declaration". `explicit`
+    /// is whether a type specifier was written.
     pub(super) fn check_declares_something(
         &mut self,
         pos: Position,
         base_type: &Type,
         explicit: bool,
+        written: WrittenSpecifiers,
         file_scope: bool,
     ) {
-        // A tag -- declared or defined -- is the thing this declaration form
-        // exists to express, so it always counts. A structure or union with
-        // no tag declares nothing it could be named by again (an enumeration
-        // still declares its constants), which gcc warns about.
-        if matches!(
-            base_type.kind,
-            TypeKind::Struct | TypeKind::Union | TypeKind::Enum
-        ) {
-            let untagged = base_type
-                .composite
-                .as_ref()
-                .is_some_and(|c| c.tag.is_none());
-            if untagged && base_type.kind != TypeKind::Enum {
-                diag::pedwarn_default(
-                    pos,
-                    &gettext("unnamed struct/union that defines no instances"),
-                );
-            }
-            return;
-        }
-
         let m = base_type.modifiers;
-        if explicit {
-            diag::pedwarn_default(pos, &gettext("useless type name in empty declaration"));
-        }
-        let mut refused = false;
+        let alignas = self.pending_alignas_kw.is_some();
+        // gcc's `warned`: given a diagnostic the useless-specifier warnings
+        // below defer to.
+        let mut warned = match written.tag {
+            Some(tag) => self.check_empty_tag_declaration(pos, base_type, tag, alignas),
+            None if explicit => {
+                diag::pedwarn_default(pos, &gettext("useless type name in empty declaration"));
+                true
+            }
+            None => false,
+        };
         for (bit, spec) in [
             (TypeModifiers::INLINE, "inline"),
             (TypeModifiers::NORETURN, "_Noreturn"),
         ] {
             if m.contains(bit) {
                 diag::error_args(pos, "'{0}' in empty declaration", &[spec]);
-                refused = true;
+                warned = true;
             }
         }
         if file_scope {
@@ -1990,30 +2020,85 @@ impl Parser<'_> {
             ] {
                 if m.contains(bit) {
                     diag::error_args(pos, "'{0}' in file-scope empty declaration", &[spec]);
-                    refused = true;
+                    warned = true;
                 }
             }
         }
-        if explicit || refused {
+        if warned {
             return;
         }
-        let storage = Type::STORAGE_CLASS.difference(TypeModifiers::THREAD_LOCAL);
-        if m.intersects(storage) {
+        if m.intersects(EMPTY_DECL_STORAGE) {
             diag::warning(
                 pos,
                 &gettext("useless storage class specifier in empty declaration"),
             );
         } else if m.contains(TypeModifiers::THREAD_LOCAL) {
-            diag::warning(
-                pos,
-                &gettext("useless '_Thread_local' in empty declaration"),
-            );
+            let spelled = if written.gnu_thread {
+                "__thread"
+            } else {
+                "_Thread_local"
+            };
+            diag::warning_args(pos, "useless '{0}' in empty declaration", &[spelled]);
         } else if m.intersects(Type::QUALIFIERS) {
             diag::warning(pos, &gettext("useless type qualifier in empty declaration"));
-        } else if self.pending_alignas_kw.is_some() {
+        } else if alignas {
             diag::warning(pos, &gettext("useless '_Alignas' in empty declaration"));
         }
-        diag::pedwarn_default(pos, &gettext("empty declaration"));
+        if written.tag.is_none() {
+            diag::pedwarn_default(pos, &gettext("empty declaration"));
+        }
+    }
+
+    /// The diagnostics of an empty declaration particular to its struct,
+    /// union or enum specifier `tag`, of type `base_type`; `alignas` is
+    /// whether `_Alignas` was written. Answers whether one was given that
+    /// the specifier warnings defer to.
+    fn check_empty_tag_declaration(
+        &self,
+        pos: Position,
+        base_type: &Type,
+        tag: TagSpecifier,
+        alignas: bool,
+    ) -> bool {
+        let m = base_type.modifiers;
+        let mut warned = false;
+        if m.contains(TypeModifiers::RESTRICT) {
+            diag::error(pos, &gettext("invalid use of 'restrict'"));
+            warned = true;
+        }
+        let untagged = base_type
+            .composite
+            .as_ref()
+            .is_some_and(|c| c.tag.is_none());
+        if untagged {
+            // An enumeration still declares its constants.
+            if !warned && base_type.kind != TypeKind::Enum {
+                diag::pedwarn_default(
+                    pos,
+                    &gettext("unnamed struct/union that defines no instances"),
+                );
+                warned = true;
+            }
+            return warned;
+        }
+        if tag == TagSpecifier::Declares || warned {
+            return warned;
+        }
+        let what = if m.intersects(EMPTY_DECL_STORAGE) {
+            "storage class specifier"
+        } else if m.intersects(Type::QUALIFIERS) {
+            "type qualifier"
+        } else if alignas {
+            "'_Alignas'"
+        } else {
+            return false;
+        };
+        diag::pedwarn_default_args(
+            pos,
+            "empty declaration with {0} does not redeclare tag",
+            &[what],
+        );
+        true
     }
 }
 

@@ -9,7 +9,7 @@
 
 //! List mode implementation - list archive contents
 
-use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveReader, EntryType};
+use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveReader, EntryType, LinkSets};
 use crate::error::PaxResult;
 use crate::formats::{CpioReader, PaxReader, UstarReader};
 use crate::options::{
@@ -19,6 +19,7 @@ use crate::pattern::{find_matching_pattern_subtree, matches_excluded, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
 use std::collections::HashSet;
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 /// Options for list mode
 #[derive(Default)]
@@ -87,6 +88,9 @@ fn list_entries<R: ArchiveReader, W: Write>(
 ) -> PaxResult<()> {
     // Track which patterns have been matched (for -n first_match option)
     let mut matched_patterns: HashSet<usize> = HashSet::new();
+    // The first listed name of each cpio link set, for the later ones to show
+    // as `== first`, the way extraction links them.
+    let mut link_sets: LinkSets<PathBuf> = LinkSets::default();
 
     while let Some(mut entry) = archive.read_entry()? {
         if let Some(should_output) = should_list(&entry, options, &mut matched_patterns) {
@@ -128,7 +132,8 @@ fn list_entries<R: ArchiveReader, W: Write>(
                     }
                 }
             }
-            if let Err(e) = print_entry(writer, &entry, options) {
+            let linked_to = link_set_target(&mut link_sets, &entry);
+            if let Err(e) = print_entry(writer, &entry, linked_to.as_deref(), options) {
                 crate::error::report_error(&entry.path, e);
             }
         }
@@ -219,10 +224,25 @@ fn should_list(
     }
 }
 
-/// Print an entry
+/// The name a later name of a cpio link set is linked to on extraction: the
+/// first listed name of the set. `None` for any other member, which starts a set
+/// if it is the first name of one.
+fn link_set_target(link_sets: &mut LinkSets<PathBuf>, entry: &ArchiveEntry) -> Option<PathBuf> {
+    let key = LinkSets::<PathBuf>::key(entry)?;
+    if let Some(first) = link_sets.get_mut(key) {
+        let first = first.clone();
+        link_sets.name_seen(key);
+        return Some(first);
+    }
+    link_sets.insert(key, entry.nlink, entry.path.clone());
+    None
+}
+
+/// Print an entry. `linked_to` is the earlier name a cpio member is linked to.
 fn print_entry<W: Write>(
     writer: &mut W,
     entry: &ArchiveEntry,
+    linked_to: Option<&Path>,
     options: &ListOptions,
 ) -> PaxResult<()> {
     // Check for custom list format (listopt)
@@ -238,7 +258,7 @@ fn print_entry<W: Write>(
             writer.write_all(b"\n")?;
         }
     } else if options.verbose {
-        print_verbose(writer, entry)?;
+        print_verbose(writer, entry, linked_to)?;
     } else {
         // The name goes out as the bytes the archive recorded. `display()`
         // would render an invalid byte as U+FFFD, so the listing would not
@@ -250,7 +270,11 @@ fn print_entry<W: Write>(
 }
 
 /// Print verbose ls -l style output
-fn print_verbose<W: Write>(writer: &mut W, entry: &ArchiveEntry) -> PaxResult<()> {
+fn print_verbose<W: Write>(
+    writer: &mut W,
+    entry: &ArchiveEntry,
+    linked_to: Option<&Path>,
+) -> PaxResult<()> {
     let mode_str = format_mode_symbolic(entry.mode, entry.entry_type);
     let nlink = entry.nlink;
     let owner = format_owner(entry);
@@ -267,7 +291,7 @@ fn print_verbose<W: Write>(writer: &mut W, entry: &ArchiveEntry) -> PaxResult<()
         mode_str, nlink, owner, group, size, mtime
     )?;
     crate::escape::write_name(writer, path, crate::escape::stdout_style())?;
-    write_link_suffix(writer, entry)?;
+    write_link_suffix(writer, entry, linked_to)?;
     writer.write_all(b"\n")?;
 
     Ok(())
@@ -295,18 +319,23 @@ fn display_name(name: Option<&[u8]>, id: u32) -> String {
     }
 }
 
-/// Write the ` -> target` / ` == target` suffix a link carries.
+/// Write the ` -> target` / ` == target` suffix a link carries -- a hard link
+/// either by its typeflag or, in cpio, as a later name of a link set.
 ///
 /// Writes rather than returning a `String`, so the target's bytes never pass
 /// through one -- which is what stops this drifting back to `display()`.
-fn write_link_suffix<W: Write>(writer: &mut W, entry: &ArchiveEntry) -> PaxResult<()> {
-    let marker = match (&entry.entry_type, &entry.link_target) {
-        (EntryType::Symlink, Some(_)) => b" -> ".as_slice(),
-        (EntryType::Hardlink, Some(_)) => b" == ".as_slice(),
+fn write_link_suffix<W: Write>(
+    writer: &mut W,
+    entry: &ArchiveEntry,
+    linked_to: Option<&Path>,
+) -> PaxResult<()> {
+    let (marker, target) = match (&entry.entry_type, &entry.link_target, linked_to) {
+        (EntryType::Symlink, Some(target), _) => (b" -> ".as_slice(), target.as_path()),
+        (EntryType::Hardlink, Some(target), _) => (b" == ".as_slice(), target.as_path()),
+        (_, _, Some(target)) => (b" == ".as_slice(), target),
         _ => return Ok(()),
     };
     writer.write_all(marker)?;
-    let target = entry.link_target.as_ref().expect("matched Some above");
     crate::escape::write_name(writer, target, crate::escape::stdout_style())?;
     Ok(())
 }

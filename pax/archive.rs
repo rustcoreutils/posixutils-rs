@@ -305,38 +305,60 @@ impl HardLinkTracker {
     }
 }
 
-/// Tracks extracted files for hard link creation during extraction
-#[derive(Debug, Default)]
-pub struct ExtractedLinks {
-    /// Maps (dev, ino) to the extracted path
-    extracted: HashMap<(u64, u64), PathBuf>,
+/// The link sets of a cpio archive: members that are names of one file.
+///
+/// cpio has no link typeflag. Each name of a multiply-linked file is a member
+/// of its own, and what ties them together is a shared (c_dev, c_ino) with a
+/// c_nlink above one -- POSIX says such files "shall be" linked again when they
+/// are restored. Directories are left out: their link count only counts their
+/// subdirectories. Only cpio records a link count, so for every other format
+/// this finds nothing.
+///
+/// `T` is what the caller remembers about a set: the names extraction created
+/// for it, the first name a listing showed. A set is forgotten once all c_nlink
+/// of its names have gone by, so what is held is bounded by the sets still
+/// open rather than by the size of the archive.
+#[derive(Debug)]
+pub struct LinkSets<T> {
+    /// Maps (dev, ino) to what was remembered and how many names are to come
+    sets: HashMap<(u64, u64), (T, u32)>,
 }
 
-impl ExtractedLinks {
-    /// Create a new tracker
-    pub fn new() -> Self {
-        ExtractedLinks {
-            extracted: HashMap::new(),
+impl<T> Default for LinkSets<T> {
+    fn default() -> Self {
+        LinkSets {
+            sets: HashMap::new(),
         }
     }
+}
 
-    /// Record that we extracted a file
-    pub fn record(&mut self, entry: &ArchiveEntry, path: &Path) {
-        if entry.nlink > 1 {
-            let key = (entry.dev, entry.ino);
-            self.extracted
-                .entry(key)
-                .or_insert_with(|| path.to_path_buf());
-        }
+impl<T> LinkSets<T> {
+    /// The set `entry` is a name of, or `None` for a member that is not one of
+    /// several names of a file.
+    pub fn key(entry: &ArchiveEntry) -> Option<(u64, u64)> {
+        (entry.entry_type == EntryType::Regular && entry.nlink > 1)
+            .then_some((entry.dev, entry.ino))
     }
 
-    /// Get the path to link to, if this is a hard link
-    pub fn get_link_target(&self, entry: &ArchiveEntry) -> Option<&PathBuf> {
-        if entry.nlink <= 1 {
-            return None;
+    /// What was remembered about a set an earlier name started.
+    pub fn get_mut(&mut self, key: (u64, u64)) -> Option<&mut T> {
+        self.sets.get_mut(&key).map(|(value, _)| value)
+    }
+
+    /// Start a set at its first name; `nlink` counts that name too.
+    pub fn insert(&mut self, key: (u64, u64), nlink: u32, value: T) {
+        self.sets.insert(key, (value, nlink.saturating_sub(1)));
+    }
+
+    /// Note that one more name of a started set has gone by, forgetting the
+    /// set once the last has.
+    pub fn name_seen(&mut self, key: (u64, u64)) {
+        if let Some((_, remaining)) = self.sets.get_mut(&key) {
+            *remaining = remaining.saturating_sub(1);
+            if *remaining == 0 {
+                self.sets.remove(&key);
+            }
         }
-        let key = (entry.dev, entry.ino);
-        self.extracted.get(&key)
     }
 }
 
@@ -358,5 +380,42 @@ impl std::fmt::Display for ArchiveFormat {
             ArchiveFormat::Cpio => write!(f, "cpio"),
             ArchiveFormat::Pax => write!(f, "pax"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn member(entry_type: EntryType, ino: u64, nlink: u32) -> ArchiveEntry {
+        ArchiveEntry {
+            entry_type,
+            ino,
+            nlink,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_link_sets_group_names_and_forget_complete_sets() {
+        let mut sets: LinkSets<&str> = LinkSets::default();
+        // Only a regular file with more than one name belongs to a set.
+        assert_eq!(
+            LinkSets::<&str>::key(&member(EntryType::Regular, 4, 1)),
+            None
+        );
+        assert_eq!(
+            LinkSets::<&str>::key(&member(EntryType::Directory, 4, 3)),
+            None
+        );
+
+        let key = LinkSets::<&str>::key(&member(EntryType::Regular, 4, 3)).unwrap();
+        sets.insert(key, 3, "a");
+        assert_eq!(sets.get_mut(key).copied(), Some("a"));
+        sets.name_seen(key);
+        assert_eq!(sets.get_mut(key).copied(), Some("a"));
+        // The third name completes the set.
+        sets.name_seen(key);
+        assert_eq!(sets.get_mut(key), None);
     }
 }

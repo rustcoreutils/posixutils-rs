@@ -9,7 +9,7 @@
 
 //! Read mode implementation - extract archive contents
 
-use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveReader, EntryType, ExtractedLinks};
+use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveReader, EntryType, LinkSets};
 use crate::error::{PaxError, PaxResult};
 use crate::formats::{CpioReader, PaxReader, UstarReader};
 use crate::interactive::{InteractivePrompter, RenameResult};
@@ -24,7 +24,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Options for read/extract mode
 pub struct ReadOptions {
@@ -126,7 +126,7 @@ pub fn extract_archive_from_reader<R: ArchiveReader>(
 
 /// Extract entries from any archive reader
 fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> PaxResult<()> {
-    let mut extracted_links = ExtractedLinks::new();
+    let mut link_sets: LinkSets<CreatedSet> = LinkSets::default();
     // Extraction is anchored at an open descriptor for the working directory,
     // and every member path is resolved relative to it without following a
     // symlink.
@@ -218,7 +218,7 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
                 archive,
                 &entry,
                 options,
-                &mut extracted_links,
+                &mut link_sets,
                 &tree,
                 &mut pending_dirs,
             ) {
@@ -415,7 +415,7 @@ fn extract_entry<R: ArchiveReader>(
     archive: &mut R,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-    extracted_links: &mut ExtractedLinks,
+    link_sets: &mut LinkSets<CreatedSet>,
     tree: &DirTree,
     pending_dirs: &mut Vec<(MemberPath, ArchiveEntry)>,
 ) -> PaxResult<()> {
@@ -480,13 +480,12 @@ fn extract_entry<R: ArchiveReader>(
             archive.skip_data()?;
         }
         EntryType::Hardlink => {
-            extract_hardlink(tree, pfd, name, entry, options, extracted_links)?;
+            extract_hardlink(tree, pfd, name, entry, options)?;
             archive.skip_data()?;
         }
         EntryType::Regular => {
-            extract_file(archive, pfd, name, entry, options)?;
+            extract_regular(archive, tree, pfd, &member, entry, options, link_sets)?;
             archive.skip_data()?; // Skip padding to block boundary
-            extracted_links.record(entry, &member.display);
         }
         EntryType::BlockDevice | EntryType::CharDevice => {
             extract_device(pfd, name, entry, options)?;
@@ -616,13 +615,8 @@ fn extract_hardlink(
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-    extracted_links: &ExtractedLinks,
 ) -> PaxResult<()> {
-    let target = if let Some(ref link_target) = entry.link_target {
-        link_target.clone()
-    } else if let Some(existing) = extracted_links.get_link_target(entry) {
-        existing.clone()
-    } else {
+    let Some(target) = entry.link_target.clone() else {
         return Err(PaxError::InvalidHeader(
             "hard link target not found".to_string(),
         ));
@@ -651,6 +645,139 @@ fn extract_hardlink(
     )?;
 
     Ok(())
+}
+
+/// What extraction remembers about a cpio link set.
+struct CreatedSet {
+    /// The names created for the set so far, as extracted (after -s and -i).
+    names: Vec<PathBuf>,
+    /// (st_dev, st_ino) of the file they share on disk -- not the archive's
+    /// c_dev/c_ino.
+    file: (u64, u64),
+    /// Whether that file has its contents yet. newc stores them with the last
+    /// name of a set only, so the earlier names are created empty.
+    has_data: bool,
+}
+
+/// Extract a regular file, linking it to the file already on disk when it is a
+/// later name of a cpio link set.
+///
+/// A set starts at the first of its names that is actually created, so a name
+/// left out by a pattern, -u or -k does not stop the next one being extracted.
+fn extract_regular<R: ArchiveReader>(
+    archive: &mut R,
+    tree: &DirTree,
+    dirfd: BorrowedFd<'_>,
+    member: &MemberPath,
+    entry: &ArchiveEntry,
+    options: &ReadOptions,
+    link_sets: &mut LinkSets<CreatedSet>,
+) -> PaxResult<()> {
+    let name = member.leaf.as_c_str();
+    let Some(key) = LinkSets::<CreatedSet>::key(entry) else {
+        extract_file(archive, dirfd, name, entry, options)?;
+        return Ok(());
+    };
+
+    if let Some(set) = link_sets.get_mut(key) {
+        let result = join_link_set(archive, tree, dirfd, member, entry, options, set);
+        link_sets.name_seen(key);
+        return result;
+    }
+
+    if let Some(file) = extract_file(archive, dirfd, name, entry, options)? {
+        let set = CreatedSet {
+            names: vec![member.display.clone()],
+            file,
+            has_data: entry.size > 0,
+        };
+        link_sets.insert(key, entry.nlink, set);
+    }
+    Ok(())
+}
+
+/// Extract a later name of a link set whose file is already on disk.
+///
+/// When that file has its contents -- or this name brings none -- the name is
+/// linked to it. Otherwise this is the name newc stores the data with: it is
+/// created fresh, exclusively, and the earlier names are moved over to it.
+/// Opening an earlier name to write the data through it could reach whatever
+/// someone else had linked there since.
+fn join_link_set<R: ArchiveReader>(
+    archive: &mut R,
+    tree: &DirTree,
+    dirfd: BorrowedFd<'_>,
+    member: &MemberPath,
+    entry: &ArchiveEntry,
+    options: &ReadOptions,
+    set: &mut CreatedSet,
+) -> PaxResult<()> {
+    let name = member.leaf.as_c_str();
+
+    if set.has_data || entry.size == 0 {
+        // An earlier name may since have been replaced by another member of
+        // the same name; only one still holding the file will do.
+        let holder = set
+            .names
+            .iter()
+            .find_map(|path| holding_name(tree, path, set.file));
+        if let Some((src_dir, src_leaf)) = holder {
+            link_replacing(
+                src_dir.as_raw_fd(),
+                &src_leaf,
+                dirfd,
+                name,
+                options.no_clobber,
+            )?;
+            // -k leaves an existing name alone, and that name is no part of
+            // the set.
+            if id_at(dirfd, name) == Some(set.file) {
+                set.names.push(member.display.clone());
+            }
+            return Ok(());
+        }
+    }
+
+    let holders: Vec<_> = set
+        .names
+        .iter()
+        .filter_map(|path| holding_name(tree, path, set.file).map(|h| (h, path)))
+        .collect();
+    let Some(file) = extract_file(archive, dirfd, name, entry, options)? else {
+        return Ok(());
+    };
+    let mut names = Vec::with_capacity(holders.len() + 1);
+    for ((dir, leaf), path) in holders {
+        // These names were created by this extraction, so they are replaced
+        // even under -k.
+        link_replacing(dirfd.as_raw_fd(), name, dir.as_fd(), &leaf, false)?;
+        names.push(path.clone());
+    }
+    names.push(member.display.clone());
+    *set = CreatedSet {
+        names,
+        file,
+        has_data: set.has_data || entry.size > 0,
+    };
+    Ok(())
+}
+
+/// The directory and leaf of an extracted name, if it still names `file`.
+fn holding_name(tree: &DirTree, path: &Path, file: (u64, u64)) -> Option<(OwnedFd, CString)> {
+    let member = MemberPath::parse(path).ok()??;
+    let dir = tree.parent_of(&member, false).ok()?;
+    (id_at(dir.as_fd(), &member.leaf) == Some(file)).then_some((dir, member.leaf))
+}
+
+/// (st_dev, st_ino) of a name below `dirfd`, not following a symlink.
+fn id_at(dirfd: BorrowedFd<'_>, name: &CStr) -> Option<(u64, u64)> {
+    stat_at(dirfd, name).map(|st| (st.st_dev as u64, st.st_ino))
+}
+
+/// (st_dev, st_ino) of an open file.
+fn file_id(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
 }
 
 /// Extract a block or character device (requires root privileges)
@@ -738,14 +865,15 @@ fn extract_fifo(
     set_times_at(dirfd, name, entry, options)
 }
 
-/// Extract a regular file
+/// Extract a regular file, returning the (st_dev, st_ino) of the file created,
+/// or `None` when -k left an existing one in place.
 fn extract_file<R: ArchiveReader>(
     archive: &mut R,
     dirfd: BorrowedFd<'_>,
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-) -> PaxResult<()> {
+) -> PaxResult<Option<(u64, u64)>> {
     let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     let mut opened: Option<File> = None;
 
@@ -769,13 +897,14 @@ fn extract_file<R: ArchiveReader>(
         // -k: the name already exists, so the member is skipped. Its data is
         // consumed by the caller's skip_data.
         debug_assert!(!created);
-        return Ok(());
+        return Ok(None);
     };
 
     copy_file_data(archive, &mut file, entry.size)?;
 
     // Through the descriptor the data was just written to, not by name.
-    set_attrs_fd(file.as_fd(), &attrs_of(entry), &policy_of(options))
+    set_attrs_fd(file.as_fd(), &attrs_of(entry), &policy_of(options))?;
+    Ok(Some(file_id(&file.metadata()?)))
 }
 
 /// Copy file data from archive to file

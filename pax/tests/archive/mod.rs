@@ -14,6 +14,7 @@ use plib::tmp::TempDir;
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -1197,4 +1198,132 @@ fn test_hardlink_operand_repeated_roundtrip() {
     let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst);
     assert_success(&output, "pax -r of an archive naming f twice");
     assert_eq!(fs::read_to_string(dst.join("f")).unwrap(), "DATA\n");
+}
+
+/// GNU cpio and bsdcpio write a newc hard-link set with the data on the last
+/// link only; the earlier names carry c_filesize 0. Extraction has to re-create
+/// one inode holding the data, not an empty file beside a full one.
+#[test]
+fn test_cpio_newc_hardlink_data_on_last_link() {
+    let temp = TempDir::new().unwrap();
+    let mut archive = CpioNewc {
+        name: b"a",
+        ino: 7,
+        nlink: 2,
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &CpioNewc {
+            name: b"b",
+            body: b"DATA\n",
+            ino: 7,
+            nlink: 2,
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, temp.path());
+    assert_success(&output, "pax -r of a newc hard-link set");
+
+    let a = fs::metadata(temp.path().join("a")).unwrap();
+    let b = fs::metadata(temp.path().join("b")).unwrap();
+    assert_eq!(a.ino(), b.ino(), "a and b should be one inode");
+    assert_eq!(fs::read_to_string(temp.path().join("a")).unwrap(), "DATA\n");
+}
+
+/// odc stores the data with every link. POSIX: "it shall be an error if these
+/// files cannot be linked" -- so they must come back linked, not as copies.
+#[test]
+fn test_cpio_odc_hardlinks_are_relinked() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let dst = temp.path().join("dst");
+    fs::create_dir(&src).unwrap();
+    fs::create_dir(&dst).unwrap();
+    fs::write(src.join("a"), "DATA\n").unwrap();
+    fs::hard_link(src.join("a"), src.join("b")).unwrap();
+    let archive = temp.path().join("a.cpio");
+
+    let output = run_pax_in_dir(
+        &[
+            "-w",
+            "-x",
+            "cpio",
+            "-f",
+            archive.to_str().unwrap(),
+            "a",
+            "b",
+        ],
+        &src,
+    );
+    assert_success(&output, "pax -w -x cpio");
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst);
+    assert_success(&output, "pax -r of a cpio hard-link set");
+
+    let a = fs::metadata(dst.join("a")).unwrap();
+    let b = fs::metadata(dst.join("b")).unwrap();
+    assert_eq!(a.ino(), b.ino(), "a and b should be one inode");
+    assert_eq!(fs::read_to_string(dst.join("b")).unwrap(), "DATA\n");
+}
+
+/// A newc set of three names, renamed by -s on the way out: the two empty
+/// earlier names must end up sharing the inode the last one brings the data in.
+#[test]
+fn test_cpio_newc_hardlink_set_renamed() {
+    let temp = TempDir::new().unwrap();
+    let link = |name, body| CpioNewc {
+        name,
+        body,
+        ino: 9,
+        nlink: 3,
+        ..Default::default()
+    };
+    let mut archive = link(b"a", b"").member();
+    archive.extend_from_slice(&link(b"b", b"").member());
+    archive.extend_from_slice(&link(b"c", b"DATA\n").archive());
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r", "-s", ",^,new_,"], &archive, temp.path());
+    assert_success(&output, "pax -r -s of a newc hard-link set");
+
+    let ino = |n: &str| fs::metadata(temp.path().join(n)).unwrap().ino();
+    assert_eq!(ino("new_a"), ino("new_c"));
+    assert_eq!(ino("new_b"), ino("new_c"));
+    assert_eq!(fs::metadata(temp.path().join("new_c")).unwrap().nlink(), 3);
+    assert_eq!(
+        fs::read_to_string(temp.path().join("new_a")).unwrap(),
+        "DATA\n"
+    );
+}
+
+/// The -v listing shows a later name of a cpio set as linked to the first,
+/// which is what extraction makes of it.
+#[test]
+fn test_cpio_hardlink_set_listed_as_link() {
+    let temp = TempDir::new().unwrap();
+    let mut archive = CpioNewc {
+        name: b"a",
+        ino: 7,
+        nlink: 2,
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &CpioNewc {
+            name: b"b",
+            body: b"DATA\n",
+            ino: 7,
+            nlink: 2,
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-v"], &archive, temp.path());
+    assert_success(&output, "pax -v of a newc hard-link set");
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = listing.lines().collect();
+    assert!(lines[0].ends_with(" a"), "first name: {}", lines[0]);
+    assert!(lines[1].ends_with(" b == a"), "later name: {}", lines[1]);
 }

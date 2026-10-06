@@ -369,7 +369,7 @@ impl Aapcs64Abi {
         // For arrays, the element contributes however many members it has.
         if kind == TypeKind::Array {
             let elem_ty = typ.base?;
-            let len = typ.array_size?;
+            let len = typ.extent.known()?;
             let elem_kind = types.kind(elem_ty);
             // A scalar element is one member; an aggregate element is as
             // many as it flattens to. AAPCS64 5.9.5 counts a composite's
@@ -515,23 +515,57 @@ impl Abi for Aapcs64Abi {
         true
     }
 
-    fn vector_carrier(&self, vec: TypeId, types: &TypeTable) -> Option<TypeId> {
+    /// gcc's convention ([`super::native_vector_carrier`]), but for a
+    /// vector of four bytes or fewer, where each compiler has its own:
+    ///
+    /// - clang on Darwin coerces any one -- integer or floating lanes -- to
+    ///   `i32`: a general register, or four bytes of the stack once those
+    ///   run out, whatever its size. So the one- and two-byte `v1qi`,
+    ///   `v2qi`, `v1hi` and `v1hf` travel as an `unsigned int` too; as the
+    ///   integer of their own size they took one or two bytes of the stack,
+    ///   and every stacked argument after them was misplaced.
+    /// - gcc gives a floating one neither register class: it lays it on the
+    ///   stack in an eight-byte slot and sends every later general-register
+    ///   argument there too, leaving the V registers alone. Its carrier is a
+    ///   type of its own, classed [`ArgClass::Stacked`]. An integer one is
+    ///   the unsigned integer of its size.
+    fn vector_carrier(&self, vec: TypeId, types: &TypeTable) -> TypeId {
+        if self.darwin && types.size_bytes(vec) <= 4 {
+            return types.uint_id;
+        }
+        if types.is_small_float_vector(vec) {
+            return types.vector_stack_carrier(vec);
+        }
         super::native_vector_carrier(vec, types)
     }
 
-    /// clang on Darwin passes an integer vector of four bytes or fewer in a
-    /// general register, as gcc does, but returns it in V0: a single lane in
-    /// its low bits -- as a `float` carrying those bits travels -- and
-    /// several widened to fill D0 ([`Self::vector_return_widened`]).
-    fn vector_return_carrier(&self, vec: TypeId, types: &TypeTable) -> Option<TypeId> {
+    /// A vector of four bytes or fewer is returned other than it is passed.
+    ///
+    /// gcc returns a floating one in a general register, as the unsigned
+    /// integer of its size is -- W0, zero-extended at two bytes.
+    ///
+    /// clang on Darwin returns any one in V0: a single lane in its low bits
+    /// -- as a `float` carrying those bits travels, or a `_Float16` for the
+    /// two-byte `v1hf`, which LLVM returns in H0 -- and integer lanes, when
+    /// there are several, widened to fill D0
+    /// ([`Self::vector_return_widened`]). Floating lanes are not widened:
+    /// LLVM legalizes `<2 x half>` by adding lanes, so `v2hf` is the low
+    /// four bytes of D0, as a `float` carrying them is.
+    fn vector_return_carrier(&self, vec: TypeId, types: &TypeTable) -> TypeId {
         if let Some(widened) = self.vector_return_widened(vec, types) {
             return self.vector_carrier(widened, types);
         }
-        let small_integer = types
-            .vector_lanes(vec)
-            .is_some_and(|(lane, _)| types.is_integer(lane) && types.size_bytes(vec) <= 4);
-        if self.darwin && small_integer {
-            return Some(types.float_id);
+        let bytes = types.size_bytes(vec);
+        let small = types.vector_lanes(vec).is_some() && bytes <= 4;
+        if self.darwin && small {
+            return if types.is_small_float_vector(vec) && bytes == 2 {
+                types.float16_id
+            } else {
+                types.float_id
+            };
+        }
+        if types.is_small_float_vector(vec) {
+            return super::small_vector_bits(bytes, types);
         }
         self.vector_carrier(vec, types)
     }
@@ -545,9 +579,11 @@ impl Abi for Aapcs64Abi {
 
     fn classify_param(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
         if types.is_vector(ty) {
-            return match self.vector_carrier(ty, types) {
-                Some(carrier) => self.classify_param(carrier, types),
-                None => super::uncarried_vector_class(ty, types),
+            return self.classify_param(self.vector_carrier(ty, types), types);
+        }
+        if types.is_vector_stack_carrier(ty) {
+            return ArgClass::Stacked {
+                size_bytes: types.size_bytes(ty),
             };
         }
         let kind = types.kind(ty);
@@ -666,10 +702,7 @@ impl Abi for Aapcs64Abi {
 
     fn classify_return(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
         if types.is_vector(ty) {
-            return match self.vector_return_carrier(ty, types) {
-                Some(carrier) => self.classify_return(carrier, types),
-                None => super::uncarried_vector_class(ty, types),
-            };
+            return self.classify_return(self.vector_return_carrier(ty, types), types);
         }
         let kind = types.kind(ty);
         let size_bits = types.size_bits(ty);
@@ -816,6 +849,7 @@ mod tests {
                 member_align,
                 is_complete: true,
                 transparent: false,
+                reverse_order: false,
                 anon_id: None,
                 tag_type: None,
             }))
@@ -899,6 +933,7 @@ mod tests {
             member_align: 8,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         }));
@@ -924,6 +959,7 @@ mod tests {
             member_align: 8,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         }));
@@ -965,6 +1001,7 @@ mod tests {
             member_align: align,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         }))

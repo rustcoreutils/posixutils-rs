@@ -293,6 +293,17 @@ struct Args {
     )]
     plain_char: Option<target::CharSignedness>,
 
+    /// `-fcf-protection[=level]` and `-fno-cf-protection`, rewritten by
+    /// `preprocess_args_from` into one option, the last occurrence winning.
+    #[arg(
+        long = "c17-cf-protection",
+        hide = true,
+        value_name = "level",
+        value_parser = parse_cf_protection,
+        overrides_with = "cf_protection"
+    )]
+    cf_protection: Option<target::CfProtection>,
+
     /// `-fdebug-prefix-map=`, `-fmacro-prefix-map=` and `-ffile-prefix-map=`,
     /// each carried in its gcc spelling by `preprocess_args_from` so the three
     /// stay in one list in command-line order, which decides which map wins.
@@ -945,12 +956,13 @@ fn emit_preprocessed(
             // dropping it would lose the packing, which is the one thing
             // the marker exists to carry.
             let pragma = if token.typ == TokenType::Pragma {
-                // `pack` travels decoded, because the parser acts on it;
-                // every other pragma travels as its own text. Dropping the
-                // second kind is what made `c17 -E` keep one pragma line
-                // out of five, so an `-E`/compile split silently meant
-                // something different from compiling in one step.
-                match token::preprocess::PackAction::from_token(token) {
+                // `pack` and `scalar_storage_order` travel decoded, because
+                // the parser acts on them; every other pragma travels as its
+                // own text. Dropping the second kind is what made `c17 -E`
+                // keep one pragma line out of five, so an `-E`/compile split
+                // silently meant something different from compiling in one
+                // step.
+                match token::preprocess::LayoutPragma::from_token(token) {
                     Some(action) => Some(action.to_pragma_text()),
                     None => match token::preprocess::pragma_text(token) {
                         Some(text) => Some(text),
@@ -1232,6 +1244,7 @@ fn process_file(
         pic: position_independence(args, target).pic,
         unwind_tables: !args.no_unwind_tables,
         verbose_asm: args.verbose_asm,
+        cf_protection: args.cf_protection.unwrap_or_default(),
         source_name: path,
         debug_prefix_map: &prefix_maps.debug,
     };
@@ -1534,6 +1547,12 @@ fn parse_plain_char(s: &str) -> Result<target::CharSignedness, String> {
     }
 }
 
+/// The value of the internal `--c17-cf-protection` option: a level already
+/// validated by `preprocess_args_from`.
+fn parse_cf_protection(s: &str) -> Result<target::CfProtection, String> {
+    target::CfProtection::from_level(s).ok_or_else(|| format!("invalid cf-protection level '{s}'"))
+}
+
 /// The value of the internal `--c17-prefix-map` option: a prefix-map
 /// option in its gcc spelling, already validated by `preprocess_args_from`.
 fn parse_prefix_map(s: &str) -> Result<MapOption, String> {
@@ -1549,6 +1568,33 @@ fn plain_char_flag(arg: &str) -> Option<&'static str> {
         "-funsigned-char" | "-fno-signed-char" => Some("unsigned"),
         _ => None,
     }
+}
+
+/// The level a `-fcf-protection` spelling selects, as the value of
+/// `--c17-cf-protection`. The bare flag is gcc's `full`, and
+/// `-fno-cf-protection` is `none`. A level gcc does not know is an error, in
+/// its words.
+fn cf_protection_level(arg: &str) -> &str {
+    let level = match arg {
+        "-fno-cf-protection" => "none",
+        "-fcf-protection" => "full",
+        _ => match arg.strip_prefix("-fcf-protection=") {
+            Some(level) => level,
+            None => {
+                eprintln!("c17: {}: {}", gettext("unrecognized option"), arg);
+                std::process::exit(1);
+            }
+        },
+    };
+    if target::CfProtection::from_level(level).is_none() {
+        eprintln!(
+            "c17: {}: {}",
+            gettext("unknown Control-Flow Protection Level"),
+            level
+        );
+        std::process::exit(1);
+    }
+    level
 }
 
 fn is_valid_opt_level(s: &str) -> bool {
@@ -1660,6 +1706,8 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     let mut lang_overrides = Vec::new();
     // `-g` and its levels, last one wins: `-g3 -g0` is no debug information.
     let mut debug: Option<bool> = None;
+    // `-fsignaling-nans`, last one wins.
+    let mut signaling_nans = false;
 
     while i < raw_args.len() {
         let arg = &raw_args[i];
@@ -1861,6 +1909,9 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             // through to the catch-all below, accepted and ignored.
             result.push(format!("--c17-inline={}", arg == "-finline"));
             i += 1;
+        } else if arg == "-fno-cf-protection" || arg.starts_with("-fcf-protection") {
+            result.push(format!("--c17-cf-protection={}", cf_protection_level(arg)));
+            i += 1;
         } else if let Some(signedness) = plain_char_flag(arg) {
             result.push(format!("--c17-plain-char={signedness}"));
             i += 1;
@@ -1878,6 +1929,15 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             i += 1;
         } else if arg == "-fpermissive" {
             result.push("--fpermissive".to_string());
+            i += 1;
+        } else if arg == "-fsignaling-nans" || arg == "-fno-signaling-nans" {
+            // Nothing c17 folds assumes a NaN is quiet, so the optimizer is
+            // already what gcc's is under `-fsignaling-nans`: an identity
+            // like `x * 1.0 -> x`, which would hand back a signalling `x`
+            // where the multiplication quiets it, is not one it makes. What
+            // the flag still changes is gcc's `__SUPPORT_SNAN__`, which
+            // glibc's <math.h> and <fenv.h> read.
+            signaling_nans = arg == "-fsignaling-nans";
             i += 1;
         } else if arg == "-fgnu89-inline"
             || arg == "-fno-gnu89-inline"
@@ -2053,6 +2113,10 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     let mut trailer = lang_overrides;
     if debug == Some(true) {
         trailer.push("-g".to_string());
+    }
+    if signaling_nans {
+        trailer.push("-D".to_string());
+        trailer.push("__SUPPORT_SNAN__".to_string());
     }
     let at = result
         .iter()
@@ -3136,6 +3200,64 @@ mod tests {
         );
     }
 
+    /// `-fcf-protection[=level]` and `-fno-cf-protection` are one option,
+    /// the last occurrence winning. No flag is `none`, the bare flag is
+    /// `full`, and `check` builds what `none` does, as in gcc.
+    #[test]
+    fn test_cf_protection_last_flag_wins() {
+        use target::CfProtection;
+        let parse = |argv: &[&str]| {
+            let result = run_preprocess(argv);
+            assert!(
+                !result
+                    .iter()
+                    .any(|a| a.starts_with("-fcf") || a.starts_with("-fno-cf")),
+                "{result:?}"
+            );
+            Args::parse_from(result).cf_protection.unwrap_or_default()
+        };
+        let none = CfProtection::default();
+        let full = CfProtection {
+            branch: true,
+            ret: true,
+        };
+        let branch = CfProtection {
+            branch: true,
+            ret: false,
+        };
+        let ret = CfProtection {
+            branch: false,
+            ret: true,
+        };
+        assert_eq!(parse(&["foo.c"]), none);
+        assert_eq!(parse(&["-fcf-protection", "foo.c"]), full);
+        assert_eq!(parse(&["-fcf-protection=full", "foo.c"]), full);
+        assert_eq!(parse(&["-fcf-protection=branch", "foo.c"]), branch);
+        assert_eq!(parse(&["-fcf-protection=return", "foo.c"]), ret);
+        assert_eq!(parse(&["-fcf-protection=none", "foo.c"]), none);
+        assert_eq!(parse(&["-fcf-protection=check", "foo.c"]), none);
+        assert_eq!(parse(&["-fno-cf-protection", "foo.c"]), none);
+        assert_eq!(
+            parse(&["-fcf-protection", "-fno-cf-protection", "foo.c"]),
+            none
+        );
+        assert_eq!(
+            parse(&["-fno-cf-protection", "foo.c", "-fcf-protection=return"]),
+            ret
+        );
+        assert_eq!(
+            parse(&["-fcf-protection=branch", "-fcf-protection=none", "foo.c"]),
+            none
+        );
+        assert_eq!(
+            parse(&["-fcf-protection=none", "-fcf-protection=branch", "foo.c"]),
+            branch
+        );
+        assert_eq!(CfProtection::from_level("bogus"), None);
+        assert_eq!(CfProtection::from_level(""), None);
+        assert_eq!(CfProtection::from_level("Full"), None);
+    }
+
     #[test]
     fn test_prefix_maps_keep_command_line_order() {
         // The three spellings share one list, so a later `-fdebug-prefix-map`
@@ -3491,6 +3613,34 @@ mod tests {
         // Should also define _REENTRANT
         assert!(result.contains(&"-D".to_string()));
         assert!(result.contains(&"_REENTRANT".to_string()));
+    }
+
+    /// `-fsignaling-nans` defines gcc's `__SUPPORT_SNAN__`, the last of it
+    /// and `-fno-signaling-nans` wins, and neither is passed on.
+    #[test]
+    fn test_preprocess_signaling_nans() {
+        let defines = |args: &[&str]| {
+            let result = run_preprocess(args);
+            assert!(!result.iter().any(|a| a.contains("signaling-nans")));
+            result.contains(&"__SUPPORT_SNAN__".to_string())
+        };
+        assert!(defines(&["-fsignaling-nans", "foo.c"]));
+        assert!(!defines(&["foo.c"]));
+        assert!(!defines(&[
+            "-fsignaling-nans",
+            "-fno-signaling-nans",
+            "foo.c"
+        ]));
+        assert!(defines(&[
+            "-fno-signaling-nans",
+            "-fsignaling-nans",
+            "foo.c"
+        ]));
+        // Ahead of `--`, after which everything is an operand.
+        let result = run_preprocess(&["-fsignaling-nans", "--", "foo.c"]);
+        let snan = result.iter().position(|a| a == "__SUPPORT_SNAN__");
+        let dashes = result.iter().position(|a| a == "--");
+        assert!(snan < dashes, "{result:?}");
     }
 
     #[test]

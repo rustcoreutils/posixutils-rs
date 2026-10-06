@@ -574,6 +574,13 @@ pub fn get_constraint_info(
         return Some((clobbers, involved));
     }
 
+    if insn.is_builtin_setjmp() {
+        return Some(crate::arch::regalloc::builtin_setjmp_constraint(
+            insn,
+            Reg::allocatable(),
+        ));
+    }
+
     // Opcode-level hardware constraints, plus the R10/R11 scratch
     // clobbers for any opcode whose codegen helper uses them.
     let constraints = opcode_constraints(insn.op);
@@ -1149,6 +1156,13 @@ impl RegAlloc {
         if win64 {
             self.used_callee_saved
                 .extend_from_slice(&super::win64::CALLEE_SAVED_GP);
+        }
+        if func.receives_nonlocal_goto() {
+            for &reg in Reg::allocatable() {
+                if reg.is_callee_saved() && !self.used_callee_saved.contains(&reg) {
+                    self.used_callee_saved.push(reg);
+                }
+            }
         }
         // Use shared identify_fp_pseudos with type-checker closure
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));

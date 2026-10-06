@@ -641,6 +641,7 @@ fn test_struct_deref_returns_address() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        reverse_order: false,
         anon_id: None,
         tag_type: None,
     });
@@ -1697,6 +1698,57 @@ fn test_void_cast_of_a_float_converts_nothing() {
         .filter(|i| matches!(i.op, Opcode::FCvtS | Opcode::FCvtU))
         .count();
     assert_eq!(converts, 0);
+}
+
+/// A floating constant converted to an integer folds when linearized, as
+/// gcc's front end folds it at -O0 -- saturated where it is out of range,
+/// which is what gcc.c-torture's 20031003-1 checks: `(int)2147483648.0f` is
+/// `INT_MAX`, where x86-64's `cvttss2si` gives `INT_MIN`. A cast, a `return`,
+/// an initializer, an assignment and a prototyped argument all fold; a value
+/// known only at run time still converts.
+#[test]
+fn test_float_constant_to_integer_folds_saturated() {
+    let src = "int take(int);\n\
+               int cast(void) { return (int)2147483648.0f; }\n\
+               int ret(void) { return 1e10; }\n\
+               int init(void) { int x = -1e10; return x; }\n\
+               unsigned asg(void) { unsigned u; u = -5.0; return u; }\n\
+               int arg(void) { return take(__builtin_nan(\"\")); }\n\
+               short narrow(void) { return (short)1.5e5; }\n\
+               int inrange(void) { return (int)-2.5; }\n\
+               int runtime(double d) { return (int)d; }\n";
+    let module = linearize_source(src, &Target::host());
+    let func = |name: &str| module.functions.iter().find(|f| f.name == name).unwrap();
+    let converts = |name: &str| {
+        func(name)
+            .blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .filter(|i| matches!(i.op, Opcode::FCvtS | Opcode::FCvtU))
+            .count()
+    };
+    let consts = |name: &str| -> Vec<i128> {
+        let f = func(name);
+        f.blocks
+            .iter()
+            .flat_map(|bb| bb.insns.iter())
+            .filter(|i| i.op == Opcode::SetVal)
+            .filter_map(|i| f.const_val(i.target?))
+            .collect()
+    };
+    for (name, want) in [
+        ("cast", i128::from(i32::MAX)),
+        ("ret", i128::from(i32::MAX)),
+        ("init", i128::from(i32::MIN)),
+        ("asg", 0),
+        ("arg", 0),
+        ("narrow", i128::from(i16::MAX)),
+        ("inrange", -2),
+    ] {
+        assert_eq!(converts(name), 0, "{name}: folded, not converted");
+        assert!(consts(name).contains(&want), "{name}: {:?}", consts(name));
+    }
+    assert_eq!(converts("runtime"), 1, "a run-time value still converts");
 }
 
 /// A conversion to `_Bool` is a comparison against zero, and a comparison

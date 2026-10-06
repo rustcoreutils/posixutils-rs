@@ -108,9 +108,8 @@ frame through `movabsq`-materialised displacements, and aarch64 through
 `movz`/`movk` into a scratch register. The diagnostic exists so that c17 never
 emits a wrapped frame.
 
-The torture harness skips the tests that need it by name,
-`NEEDS_64BIT_FRAMES` in `cc/scripts/c17_torture.sh` (`compile/20031023-1..4`,
-`compile/stack-check-1`). Deleting that list is part of finishing this.
+The torture tests that need it (`compile/20031023-1..4`,
+`compile/stack-check-1`) fail with that diagnostic.
 
 What it takes:
 

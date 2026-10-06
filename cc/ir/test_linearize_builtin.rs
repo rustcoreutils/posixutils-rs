@@ -15,6 +15,7 @@ use super::test_linearize::{
     test_pos, TestContext,
 };
 use super::*;
+use crate::float::FpFormat;
 use crate::ir::NanCompare;
 use crate::parse::ast::{
     BlockItem, Declaration, ExprKind, ExternalDecl, FunctionDef, InitDeclarator, ParamStyle,
@@ -754,4 +755,425 @@ fn test_a_relational_arm_is_not_evaluated_unconditionally() {
     assert!(branches("r"), "a signaling compare stays behind its branch");
     assert!(!branches("e"), "a quiet compare is speculated");
     assert!(!branches("i"), "an integer compare is speculated");
+}
+
+// `__builtin_issignaling`: a test of the representation
+
+/// Run `f`, the linearized `int f(T x) { return __builtin_issignaling(x); }`,
+/// with `x` holding the bytes `image`: what `f`'s integer loads from the
+/// temporary that `x` is stored to read back. Everything else it computes is
+/// straight-line integer arithmetic, evaluated by the optimizer's own
+/// folding.
+fn run_issignaling(module: &Module, image: [u8; 16]) -> i128 {
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let mut vals: std::collections::HashMap<PseudoId, i128> = Default::default();
+    let mut temp = None;
+    for insn in f.blocks.iter().flat_map(|bb| bb.insns.iter()) {
+        let value = |vals: &std::collections::HashMap<PseudoId, i128>, id: PseudoId| {
+            vals.get(&id)
+                .copied()
+                .or_else(|| match f.get_pseudo(id)?.kind {
+                    PseudoKind::Val(v) => Some(v),
+                    _ => None,
+                })
+        };
+        match insn.op {
+            Opcode::SymAddr => {
+                let sym = f.get_pseudo(insn.src[0]).map(|p| &p.kind);
+                if matches!(sym, Some(PseudoKind::Sym(n)) if n.starts_with("__snan")) {
+                    temp = insn.target;
+                }
+            }
+            Opcode::Load if Some(insn.src[0]) == temp => {
+                let at = insn.offset as usize;
+                let bytes = insn.size as usize / 8;
+                let mut word = [0u8; 16];
+                word[..bytes].copy_from_slice(&image[at..at + bytes]);
+                vals.insert(insn.target.unwrap(), u128::from_le_bytes(word) as i128);
+            }
+            Opcode::Ret => return value(&vals, insn.src[0]).expect("a computed result"),
+            op if crate::ir::constfold::is_int_foldable(op) || op == Opcode::Copy => {
+                let ops: Vec<i128> = insn.src.iter().filter_map(|&s| value(&vals, s)).collect();
+                if ops.len() != insn.src.len() {
+                    continue; // the floating operand, on its way to the store
+                }
+                let v = if op == Opcode::Copy {
+                    ops[0]
+                } else {
+                    crate::ir::constfold::eval_int(insn, &ops).expect("folds")
+                };
+                vals.insert(insn.target.unwrap(), v);
+            }
+            _ => {}
+        }
+    }
+    panic!("f returned nothing")
+}
+
+/// The interesting values of `fmt`, each with whether it is a signalling
+/// NaN, as images of the format's bits.
+fn issignaling_cases(fmt: FpFormat) -> Vec<(String, u128, bool)> {
+    use crate::float::{FloatVal, NanKind};
+    let mut values = vec![
+        (
+            "sNaN",
+            FloatVal::nan_with_payload(fmt, 0, NanKind::Signalling),
+            true,
+        ),
+        (
+            "sNaN 0x123",
+            FloatVal::nan_with_payload(fmt, 0x123, NanKind::Signalling),
+            true,
+        ),
+        (
+            "sNaN 1",
+            FloatVal::nan_with_payload(fmt, 1, NanKind::Signalling),
+            true,
+        ),
+        (
+            "qNaN",
+            FloatVal::nan_with_payload(fmt, 0, NanKind::Quiet),
+            false,
+        ),
+        (
+            "qNaN 0x234",
+            FloatVal::nan_with_payload(fmt, 0x234, NanKind::Quiet),
+            false,
+        ),
+        ("inf", FloatVal::infinity(false), false),
+        ("zero", FloatVal::ZERO, false),
+        ("1.5", FloatVal::from_f64(1.5), false),
+        (
+            "min subnormal",
+            FloatVal::from_parts(false, 1, -16000),
+            false,
+        ),
+    ];
+    // Every sign: issignaling ignores it.
+    let negated: Vec<_> = values
+        .iter()
+        .map(|&(n, v, s)| (n, v.negated(), s))
+        .collect();
+    values.extend(negated);
+    let mut cases: Vec<(String, u128, bool)> = values
+        .into_iter()
+        .map(|(n, v, s)| (format!("{n} (sign {})", v.sign_bit()), v.to_bits(fmt), s))
+        .collect();
+    let top = |bits: u32| 1u128 << (bits - 1);
+    match fmt {
+        // The x87 encodings no IEEE format has, as gcc and glibc count them:
+        // a nonzero exponent with the integer bit clear signals.
+        FpFormat::X87Extended => {
+            let x87 = |sign_exp: u128, sig: u128| (sign_exp << 64) | sig;
+            for (name, bits, s) in [
+                ("pseudo-infinity", x87(0x7fff, 0), true),
+                ("pseudo-NaN", x87(0x7fff, 42), true),
+                (
+                    "pseudo-NaN, quiet bit",
+                    x87(0xffff, 0x4000_0000_0000_0042),
+                    true,
+                ),
+                ("unnormal", x87(0x42, 0), true),
+                ("unnormal 42", x87(0x8042, 42), true),
+                ("pseudo-denormal", x87(0, 0x8000_0000_0000_0000), false),
+                ("denormal", x87(0x8000, 42), false),
+                ("indefinite", x87(0xffff, 0xc000_0000_0000_0000), false),
+                ("normal", x87(0x42, 0x8000_0000_0000_0042), false),
+            ] {
+                cases.push((name.to_string(), bits, s));
+            }
+        }
+        // A payload in the low word alone: the half the test folds into the
+        // high one.
+        FpFormat::Binary128 => {
+            let exp = 0x7fffu128 << 112;
+            cases.push(("sNaN, low word".to_string(), exp | 1, true));
+            cases.push(("sNaN, bit 63".to_string(), exp | top(64), true));
+            cases.push(("qNaN, low word".to_string(), exp | top(112) | 1, false));
+        }
+        _ => {}
+    }
+    cases
+}
+
+/// `__builtin_issignaling` reads every format's representation correctly, on
+/// each target: signalling NaNs of either sign and every payload position
+/// are 1; quiet NaNs, infinities, zeros, numbers are 0; and on x87 the
+/// encodings the hardware no longer accepts are 1, as in gcc. No floating
+/// comparison or conversion is made, since either would quiet or raise.
+#[test]
+fn test_issignaling_tests_the_representation() {
+    let x86 = Target::new(Arch::X86_64, Os::Linux);
+    let a64 = Target::new(Arch::Aarch64, Os::Linux);
+    let apple = Target::new(Arch::Aarch64, Os::MacOS);
+    let cases = [
+        (&x86, "float", FpFormat::Binary32),
+        (&x86, "double", FpFormat::Binary64),
+        (&x86, "long double", FpFormat::X87Extended),
+        (&x86, "_Float16", FpFormat::Binary16),
+        (&x86, "_Float128", FpFormat::Binary128),
+        (&x86, "_Float64x", FpFormat::X87Extended),
+        (&a64, "float", FpFormat::Binary32),
+        (&a64, "double", FpFormat::Binary64),
+        (&a64, "long double", FpFormat::Binary128),
+        (&a64, "_Float16", FpFormat::Binary16),
+        (&a64, "_Float32x", FpFormat::Binary64),
+        (&apple, "long double", FpFormat::Binary64),
+    ];
+    for (target, t, fmt) in cases {
+        let src = format!("int f({t} x) {{ return __builtin_issignaling(x); }}");
+        let module = linearize_source(&src, target);
+        let insns = insns_of(&module, "f");
+        assert!(
+            !insns.iter().any(|i| i.op.is_float_comparison()
+                || matches!(i.op, Opcode::FCvtF | Opcode::Call)),
+            "{:?} {t}: a floating operation",
+            target.arch
+        );
+        for (name, bits, want) in issignaling_cases(fmt) {
+            let got = run_issignaling(&module, bits.to_le_bytes());
+            assert_eq!(
+                got,
+                i128::from(want),
+                "{:?} {t}: {name} {bits:#x}",
+                target.arch
+            );
+        }
+    }
+}
+
+/// A constant operand folds in the linearizer, at every level: no store, no
+/// load, just the answer -- with the constant quieted wherever the program
+/// would have quieted it.
+#[test]
+fn test_issignaling_of_a_constant_folds() {
+    let target = Target::new(Arch::X86_64, Os::Linux);
+    for (arg, want) in [
+        ("__builtin_nans(\"\")", 1),
+        ("-__builtin_nansl(\"\")", 1),
+        ("__builtin_nansf128(\"\")", 1),
+        ("__builtin_nan(\"\")", 0),
+        ("(float)__builtin_nans(\"\")", 0),
+        ("__builtin_nans(\"\") + 1.0", 0),
+        ("2.5f", 0),
+    ] {
+        let src = format!("int f(void) {{ return __builtin_issignaling({arg}); }}");
+        let module = linearize_source(&src, &target);
+        let insns = insns_of(&module, "f");
+        assert!(
+            !insns
+                .iter()
+                .any(|i| matches!(i.op, Opcode::Store | Opcode::Load)),
+            "{arg}: not folded"
+        );
+        assert_eq!(run_issignaling(&module, [0; 16]), want, "{arg}");
+    }
+}
+
+/// `__builtin_stack_save` is a `StackSave`, and `__builtin_stack_restore`
+/// a `StackRestore` of the value it gave, on both targets.
+#[test]
+fn test_stack_save_and_restore_are_their_opcodes() {
+    let src = "void g(int n) { void *m = __builtin_stack_save();\n\
+               __builtin_stack_restore(m); }\n";
+    for arch in [Arch::X86_64, Arch::Aarch64] {
+        let module = linearize_source(src, &Target::new(arch, Os::Linux));
+        let insns = insns_of(&module, "g");
+        let save = insns
+            .iter()
+            .find(|i| i.op == Opcode::StackSave)
+            .expect("a StackSave");
+        let restore = insns
+            .iter()
+            .find(|i| i.op == Opcode::StackRestore)
+            .expect("a StackRestore");
+        assert_eq!(save.size, 64, "{arch:?}");
+        assert_eq!(restore.src.len(), 1, "{arch:?}");
+        // `m` is promoted: the restore reads the save's own result, through
+        // the copy that was the assignment.
+        let mut mark = restore.src[0];
+        while let Some(copy) = insns
+            .iter()
+            .find(|i| i.op == Opcode::Copy && i.target == Some(mark))
+        {
+            mark = copy.src[0];
+        }
+        assert_eq!(Some(mark), save.target, "{arch:?}");
+    }
+}
+
+// __builtin_object_size
+
+/// What became of `f`'s `__builtin_object_size`, compiled optimizing or not:
+/// `Err(type)` deferred as an `ObjectSize` placeholder of that type, or
+/// `Ok(constants)` answered while parsing, the answer among the constants
+/// `f` uses.
+fn object_size(
+    src: &str,
+    optimizing: bool,
+) -> Result<Vec<i128>, crate::parse::ast::ObjectSizeType> {
+    let policy = crate::parse::LibraryCallPolicy {
+        optimizing,
+        math_errno: true,
+    };
+    let (module, _) = linearize_source_under(src, &Target::new(Arch::X86_64, Os::Linux), policy);
+    let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+    let insns = insns_of(&module, "f");
+    if let Some(insn) = insns.iter().find(|i| matches!(i.op, Opcode::ObjectSize(_))) {
+        let Opcode::ObjectSize(otype) = insn.op else {
+            unreachable!()
+        };
+        return Err(otype);
+    }
+    Ok(insns
+        .iter()
+        .flat_map(|i| &i.src)
+        .filter_map(|&s| f.const_val(s))
+        .collect())
+}
+
+/// A pointer whose object only propagation finds is deferred when
+/// optimizing, with its type, and answered as an unknown object at `-O0`,
+/// as gcc does: `(size_t)-1` for a maximum, 0 for a minimum.
+#[test]
+fn test_object_size_of_a_pointer_variable_is_deferred_when_optimizing() {
+    use crate::parse::ast::ObjectSizeType;
+    for (otype, unknown) in [(0, -1), (1, -1), (2, 0), (3, 0)] {
+        let src = format!(
+            "char buf[32];\n\
+             unsigned long f(void) {{ char *p = buf + 4; return __builtin_object_size(p, {otype}); }}\n"
+        );
+        assert_eq!(
+            object_size(&src, true),
+            Err(ObjectSizeType::from_bits(otype))
+        );
+        let answered = object_size(&src, false).expect("answered at -O0");
+        assert!(answered.contains(&unknown), "type {otype}: {answered:?}");
+    }
+}
+
+/// What the expression itself names is answered while parsing, at every
+/// level; only the rest waits.
+#[test]
+fn test_object_size_of_a_named_object_is_answered_at_once() {
+    let src = "char buf[32];\n\
+               unsigned long f(void) { return __builtin_object_size(buf + 4, 0); }\n";
+    for optimizing in [false, true] {
+        let answered = object_size(src, optimizing).expect("answered while parsing");
+        assert!(answered.contains(&28), "{answered:?}");
+    }
+}
+
+/// The builtin does not evaluate its argument: one with a side effect, or
+/// a `volatile` read, is an unknown object at once, as in gcc.
+#[test]
+fn test_object_size_of_a_side_effect_is_unknown_at_once() {
+    for body in [
+        "char *p = buf; return __builtin_object_size(p++, 0);",
+        "char *p; return __builtin_object_size(p = buf, 0);",
+        "return __builtin_object_size(g(), 0);",
+        "char *volatile p = buf; return __builtin_object_size(p, 0);",
+    ] {
+        let src = format!("char buf[32];\nchar *g(void);\nunsigned long f(void) {{ {body} }}\n");
+        let answered = object_size(&src, true).expect("answered at once");
+        assert!(answered.contains(&-1), "{body}: {answered:?}");
+    }
+}
+
+// __builtin_constant_p
+
+/// Whether `f`'s `__builtin_constant_p` was deferred to the optimizer as a
+/// `ConstantP` placeholder, rather than answered while linearizing.
+fn constant_p_deferred(src: &str) -> bool {
+    let module = linearize_source(src, &Target::new(Arch::X86_64, Os::Linux));
+    insns_of(&module, "f")
+        .iter()
+        .any(|i| i.op == Opcode::ConstantP)
+}
+
+/// The operand of a deferred `__builtin_constant_p` is computed only to be
+/// asked about and is then deleted unrun, so a read that may trap, a
+/// division and a floating operation are all deferred: gcc answers each 1
+/// where propagation proves it constant (`"hi"[0]` in gcc.c-torture bcp-1).
+#[test]
+fn test_constant_p_defers_an_operand_that_may_trap() {
+    for body in [
+        "return __builtin_constant_p(\"hi\"[0]);",
+        "return __builtin_constant_p(*\"hi\");",
+        "int x = 6, y = 2; return __builtin_constant_p(x / y);",
+        "int x = 6, y = 4; return __builtin_constant_p(x % y);",
+        "int a[2] = { 1, 2 }; return __builtin_constant_p(a[1]);",
+        "struct { int m; } s = { 1 }, *p = &s; return __builtin_constant_p(p->m);",
+        "double d = 2.0; return __builtin_constant_p(d * 3.0);",
+        "double d = 2.5; return __builtin_constant_p((int)d);",
+    ] {
+        let src = format!("int f(void) {{ {body} }}\n");
+        assert!(constant_p_deferred(&src), "{body}");
+    }
+}
+
+/// An operand with a side effect is never evaluated, so it is answered 0 at
+/// once -- as is a `volatile` read, the observable kind of read.
+#[test]
+fn test_constant_p_answers_a_side_effect_at_once() {
+    for body in [
+        "int x = 1; return __builtin_constant_p(x++);",
+        "int x = 1; return __builtin_constant_p(x = 2);",
+        "return __builtin_constant_p(g());",
+        "volatile int v = 1; return __builtin_constant_p(v);",
+        "volatile int a[2] = { 1, 2 }; return __builtin_constant_p(a[1]);",
+        "volatile int v = 1, *p = &v; return __builtin_constant_p(*p);",
+    ] {
+        let src = format!("int g(void);\nint f(void) {{ {body} }}\n");
+        assert!(!constant_p_deferred(&src), "{body}");
+    }
+}
+
+/// A vector travels by address, which is never a constant, so its
+/// `__builtin_constant_p` asks about each lane: one `ConstantP` per lane,
+/// each over a load of that lane, for `sccp` to answer once load forwarding
+/// has found the stored values. A `volatile` vector is answered at once.
+#[test]
+fn test_constant_p_of_a_vector_asks_each_lane() {
+    let decls = "typedef int v4si __attribute__((vector_size(16)));\n\
+                 typedef double v2df __attribute__((vector_size(16)));\n";
+    for (body, lanes, width) in [
+        (
+            "v4si v = { 1, 2, 3, 4 }; return __builtin_constant_p(v);",
+            4,
+            32,
+        ),
+        (
+            "v2df d = { 1.0, 2.0 }; return __builtin_constant_p(d);",
+            2,
+            64,
+        ),
+    ] {
+        let src = format!("{decls}int f(void) {{ {body} }}\n");
+        let module = linearize_source(&src, &Target::new(Arch::X86_64, Os::Linux));
+        let insns = insns_of(&module, "f");
+        let asked: Vec<_> = insns.iter().filter(|i| i.op == Opcode::ConstantP).collect();
+        assert_eq!(asked.len(), lanes, "{body}");
+        for cp in asked {
+            let load = insns
+                .iter()
+                .find(|i| i.target == Some(cp.src[0]))
+                .expect("the operand is defined");
+            assert_eq!((load.op, load.size), (Opcode::Load, width), "{body}");
+        }
+    }
+    let src = format!("{decls}int f(void) {{ volatile v4si v = {{ 1, 2, 3, 4 }}; return __builtin_constant_p(v); }}\n");
+    assert!(!constant_p_deferred(&src));
+}
+
+/// The trapping operand a deferred `__builtin_constant_p` admits is not
+/// admitted where an expression is evaluated speculatively: a conditional
+/// with a division in an arm still branches.
+#[test]
+fn test_a_trapping_arm_is_still_not_speculated() {
+    let src = "int f(int c, int x, int y) { return c ? x / y : 0; }\n";
+    let module = linearize_source(src, &Target::new(Arch::X86_64, Os::Linux));
+    assert!(!insns_of(&module, "f")
+        .iter()
+        .any(|i| i.op == Opcode::Select));
 }

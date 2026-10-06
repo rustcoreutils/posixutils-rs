@@ -583,6 +583,7 @@ fn test_mixed_designated_positional_struct_init() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        reverse_order: false,
         anon_id: None,
         tag_type: None,
     };
@@ -812,6 +813,7 @@ fn test_designator_chain_nested_struct_init() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        reverse_order: false,
         anon_id: None,
         tag_type: None,
     }));
@@ -847,6 +849,7 @@ fn test_designator_chain_nested_struct_init() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        reverse_order: false,
         anon_id: None,
         tag_type: None,
     }));
@@ -941,6 +944,7 @@ fn test_designator_chain_array_member_init() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        reverse_order: false,
         anon_id: None,
         tag_type: None,
     }));
@@ -1112,6 +1116,7 @@ fn test_skip_unnamed_bitfield_positional_init() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        reverse_order: false,
         anon_id: None,
         tag_type: None,
     }));
@@ -1211,6 +1216,7 @@ fn test_union_first_named_member_positional_init() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        reverse_order: false,
         anon_id: None,
         tag_type: None,
     }));
@@ -1335,6 +1341,7 @@ fn test_bitfield_designated_init_multiple_same_offset() {
             member_align: 1,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         })),
@@ -1488,6 +1495,7 @@ fn test_bitfield_designated_init_local_var() {
         member_align: 1,
         is_complete: true,
         transparent: false,
+        reverse_order: false,
         anon_id: None,
         tag_type: None,
     }));
@@ -1644,6 +1652,7 @@ fn test_compound_literal_zero_init_lvalue() {
             member_align: 8,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         })),
@@ -1803,6 +1812,7 @@ fn test_complex_struct_member_init_stores_both_halves() {
         member_align: 8,
         is_complete: true,
         transparent: false,
+        reverse_order: false,
         anon_id: None,
         tag_type: None,
     });

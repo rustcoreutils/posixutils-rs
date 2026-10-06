@@ -736,8 +736,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
         let name_str = self.symbol_name(declarator.symbol);
 
-        // C99 6.7.4p3: A non-static inline function cannot define a non-const
-        // function-local static variable
+        // C99 6.7.4p3: an inline definition shall not define a modifiable
+        // object with static storage duration. gcc only warns, in its own
+        // words -- an error under `-pedantic-errors`.
         if self.current_func_is_inline_definition {
             let is_const = self
                 .types
@@ -745,12 +746,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                 .contains(TypeModifiers::CONST);
             if !is_const {
                 if let Some(pos) = self.current_pos {
-                    error(
+                    crate::diag::pedwarn_default_args(
                         pos,
-                        &format!(
-                            "inline definition of '{}' cannot define non-const static variable '{}'",
-                            self.current_func_name, name_str
-                        ),
+                        "'{0}' is static but declared in inline function '{1}' which is not static",
+                        &[name_str.as_str(), self.current_func_name.as_str()],
                     );
                 }
             }
@@ -811,6 +810,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 .contains(TypeModifiers::THREAD_LOCAL),
         };
         self.module.define_global(
+            self.types,
             &global_name,
             declarator.typ,
             init,
@@ -2103,7 +2103,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         // always has room.
         let capacity = self
             .types
-            .array_size(arr_typ)
+            .array_extent(arr_typ)
+            .known()
             .filter(|&n| n > 0)
             .unwrap_or(units.len() + 1);
 
@@ -2197,6 +2198,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                 matches!(op, UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::Deref)
                     || self.expr_is_runtime(operand)
             }
+            // A shift by a negative count is left to run time: gcc does not
+            // fold it, and neither does the constant walk.
+            ExprKind::Binary {
+                op: BinaryOp::Shl | BinaryOp::Shr,
+                right,
+                ..
+            } if self.eval_const_expr(right).is_some_and(|count| count < 0) => true,
             ExprKind::Binary { left, right, .. } => {
                 self.expr_is_runtime(left) || self.expr_is_runtime(right)
             }
@@ -3058,10 +3066,19 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// the register, where the IR otherwise keeps a vector at an address. A
     /// sixteen-byte vector in an `"x"` operand was handed over as its address
     /// in a general register, and read back eight bytes wide.
+    ///
+    /// A vector of four bytes or fewer is the unsigned integer of its own
+    /// size, whatever the convention passes it as: Darwin passes a
+    /// one-byte `v1qi` as an `unsigned int`, and an output operand of that
+    /// type stored four bytes into one.
     fn asm_operand_type(&self, e: &Expr, is_memory: bool) -> TypeId {
         let typ = self.expr_type(e);
         if is_memory || !self.types.is_vector(typ) {
             return typ;
+        }
+        let bytes = self.types.size_bytes(typ);
+        if bytes <= 4 {
+            return crate::abi::small_vector_bits(bytes, self.types);
         }
         self.vector_carrier(typ, crate::abi::CallingConv::C)
     }
@@ -3071,7 +3088,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     fn asm_value(&mut self, e: &Expr, typ: TypeId) -> PseudoId {
         if self.types.is_vector(self.expr_type(e)) && !self.types.is_vector(typ) {
             let addr = self.vector_addr(e);
-            return self.vector_to_carrier(addr, typ);
+            return self.vector_to_carrier(addr, self.expr_type(e), typ);
         }
         self.linearize_expr(e)
     }
@@ -3793,8 +3810,8 @@ impl crate::constexpr::ConstEnv for Linearizer<'_> {
     /// A static initializer needs an answer; the linearizer's other folds --
     /// a constant `?:` condition, chiefly -- are optimizations, and one of
     /// those is exactly the shape `__builtin_constant_p` is written in.
-    fn deferred_constant_p(&self, scope: ConstScope) -> Option<i128> {
-        matches!(scope, ConstScope::StaticInitializer).then_some(0)
+    fn deferred_builtin(&self, settled: i128, scope: ConstScope) -> Option<i128> {
+        matches!(scope, ConstScope::StaticInitializer).then_some(settled)
     }
 
     fn types(&self) -> &TypeTable {
@@ -3807,7 +3824,7 @@ impl crate::constexpr::ConstEnv for Linearizer<'_> {
             return symbol.enum_value;
         }
         match scope {
-            ConstScope::Standard => None,
+            ConstScope::Standard | ConstScope::ArrayBound => None,
             ConstScope::StaticInitializer => self.const_object_value(sym),
         }
     }
@@ -3837,7 +3854,7 @@ impl crate::constexpr::ConstEnv for Linearizer<'_> {
         scope: ConstScope,
     ) -> Option<FloatVal> {
         match scope {
-            ConstScope::Standard => None,
+            ConstScope::Standard | ConstScope::ArrayBound => None,
             ConstScope::StaticInitializer => self.const_object_float_value(sym),
         }
     }

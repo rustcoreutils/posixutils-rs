@@ -20,7 +20,7 @@
 //
 
 use super::{is_aggregate, is_float, is_integer, is_pointer, Abi, ArgClass, RegClass};
-use crate::types::{TypeId, TypeKind, TypeTable};
+use crate::types::{ArrayExtent, TypeId, TypeKind, TypeTable};
 
 /// Maximum aggregate size (in bits) that can be passed in registers.
 /// Structs larger than 128 bits (16 bytes) must use sret.
@@ -171,11 +171,11 @@ fn sole_scalar_content(ty: TypeId, types: &TypeTable) -> Option<TypeId> {
         }
         // A sixteen-byte vector is one SSE+SSEUP unit, as its carrier is.
         TypeKind::Array if types.is_vector(ty) => {
-            return super::native_vector_carrier(ty, types).filter(|c| types.size_bytes(*c) == 16);
+            return (types.size_bytes(ty) == 16).then(|| super::native_vector_carrier(ty, types));
         }
         TypeKind::Array => {
             let typ = types.get(ty);
-            if typ.array_size != Some(1) {
+            if typ.extent != ArrayExtent::Known(1) {
                 return None;
             }
             sole_scalar_content(typ.base?, types)?
@@ -303,10 +303,8 @@ impl SysVAmd64Abi {
             if types.vector_wrapper_carrier(ty).is_some() {
                 return RegClass::Memory;
             }
-            return match super::native_vector_carrier(ty, types) {
-                Some(carrier) => self.classify_eightbyte(carrier, _offset_bits, _size_bits, types),
-                None => RegClass::Memory,
-            };
+            let carrier = self.vector_carrier(ty, types);
+            return self.classify_eightbyte(carrier, _offset_bits, _size_bits, types);
         }
 
         // Arrays - classify element type
@@ -466,20 +464,22 @@ impl Abi for SysVAmd64Abi {
     /// gcc's System V convention, but for one-lane floating vectors --
     /// `float` or `double` -- which it passes in memory and returns through a
     /// hidden pointer: those travel as a struct holding the vector, which is
-    /// classed MEMORY just as gcc classes them.
-    fn vector_carrier(&self, vec: TypeId, types: &TypeTable) -> Option<TypeId> {
+    /// classed MEMORY just as gcc classes them. A floating vector of four
+    /// bytes and several lanes -- `v2hf` -- is SSE class, the low four bytes
+    /// of XMM0 both ways, as a `float` carrying them is.
+    fn vector_carrier(&self, vec: TypeId, types: &TypeTable) -> TypeId {
         if let Some(wrapper) = types.vector_wrapper_carrier(vec) {
-            return Some(wrapper);
+            return wrapper;
+        }
+        if types.is_small_float_vector(vec) {
+            return types.float_id;
         }
         super::native_vector_carrier(vec, types)
     }
 
     fn classify_param(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
         if types.is_vector(ty) {
-            return match self.vector_carrier(ty, types) {
-                Some(carrier) => self.classify_param(carrier, types),
-                None => super::uncarried_vector_class(ty, types),
-            };
+            return self.classify_param(self.vector_carrier(ty, types), types);
         }
         let kind = types.kind(ty);
         let size_bits = types.size_bits(ty);
@@ -587,10 +587,7 @@ impl Abi for SysVAmd64Abi {
 
     fn classify_return(&self, ty: TypeId, types: &TypeTable) -> ArgClass {
         if types.is_vector(ty) {
-            return match self.vector_return_carrier(ty, types) {
-                Some(carrier) => self.classify_return(carrier, types),
-                None => super::uncarried_vector_class(ty, types),
-            };
+            return self.classify_return(self.vector_return_carrier(ty, types), types);
         }
         let kind = types.kind(ty);
         let size_bits = types.size_bits(ty);
@@ -720,6 +717,7 @@ mod tests {
             member_align: align,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         }))
@@ -879,6 +877,7 @@ mod tests {
             member_align: 16,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         }));

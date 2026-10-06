@@ -75,13 +75,33 @@ struct Solver {
     /// Which pseudos are copies of which, for deciding `x - x` and `x == x`
     /// when the two sides are one value under two names.
     consts: ConstMap,
+    /// Whether a `__builtin_constant_p` of a value not proved constant may
+    /// be answered 0 yet. See [`run_before_inlining`].
+    final_answers: bool,
 }
 
 /// Run SCCP over `func`, returning whether anything changed.
 pub fn run(func: &mut Function) -> bool {
+    solve(func, true)
+}
+
+/// [`run`], on a function not yet inlined into its callers.
+///
+/// Every answer is final except one: `__builtin_constant_p` of a value not
+/// known here -- a parameter, chiefly -- is left unanswered, because inlining
+/// is what makes it known. gcc answers `inline int f(int x) { return
+/// __builtin_constant_p(x); }` with 1 where `f(1)` is inlined, and answering 0
+/// in `f`'s body before the inliner copies it would have settled that for
+/// every caller.
+pub fn run_before_inlining(func: &mut Function) -> bool {
+    solve(func, false)
+}
+
+fn solve(func: &mut Function, final_answers: bool) -> bool {
     Solver {
         core: Sparse::new(func, Val::Const),
         consts: ConstMap::new(func),
+        final_answers,
     }
     .run(func)
 }
@@ -201,11 +221,16 @@ impl SparseAnalysis for Solver {
             // is the operand a constant once propagation has run? `Top` is
             // not yet an answer -- a value still `Top` at fixpoint is in
             // unreachable code, and `ir::lower` answers 0 for whatever is
-            // left over.
-            Opcode::ConstantP => match insn.src.first().map(|s| self.get(*s)) {
-                Some(Val::Const(_)) => Val::Const(1),
-                Some(Val::Top) => Val::Top,
-                _ => Val::Const(0),
+            // left over. A float constant is in no lattice cell (see
+            // `dataflow`), so the operand is also asked whether it copies
+            // one; a float is never narrowed by a `Copy`, so any width
+            // follows the chain.
+            Opcode::ConstantP => match insn.src.first().map(|s| (*s, self.get(*s))) {
+                Some((_, Val::Const(_))) => Val::Const(1),
+                Some((_, Val::Top)) => Val::Top,
+                Some((s, _)) if self.consts.fget(s, 0).is_some() => Val::Const(1),
+                _ if self.final_answers => Val::Const(0),
+                _ => Val::Bottom,
             },
 
             op if is_int_foldable(op) => self.int_op(insn),
@@ -719,6 +744,11 @@ mod tests {
     /// A function with `ConstantP` over a pseudo of the given kind; returns
     /// the constant it folded to, or `None` if it did not fold.
     fn constant_p_over(operand: Pseudo) -> Option<i128> {
+        constant_p_over_with(operand, run)
+    }
+
+    /// [`constant_p_over`], solved by `solve`.
+    fn constant_p_over_with(operand: Pseudo, solve: fn(&mut Function) -> bool) -> Option<i128> {
         let types = host_types();
         let mut func = Function::new("t", types.int_id);
         let operand_id = operand.id;
@@ -738,7 +768,7 @@ mod tests {
         func.add_block(b0);
         func.entry = BasicBlockId(0);
 
-        run(&mut func);
+        solve(&mut func);
         let insn = &func.blocks[0].insns[1];
         if insn.op != Opcode::Copy {
             return None;
@@ -751,11 +781,30 @@ mod tests {
         assert_eq!(constant_p_over(Pseudo::val(PseudoId(1), 42)), Some(1));
     }
 
-    /// An argument is never a constant, and saying so is the whole point:
-    /// `__builtin_constant_p` guards the branch a program takes when the
-    /// value is *not* known.
+    /// An argument of a function inlined everywhere it will be is never a
+    /// constant, and saying so is the whole point: `__builtin_constant_p`
+    /// guards the branch a program takes when the value is *not* known.
     #[test]
     fn constant_p_answers_zero_for_an_unknown_value() {
         assert_eq!(constant_p_over(Pseudo::arg(PseudoId(1), 0)), Some(0));
+    }
+
+    /// Before inlining, an argument may yet be a constant -- the one a
+    /// caller passes -- so that answer waits; a proved constant does not.
+    #[test]
+    fn constant_p_before_inlining_answers_only_a_constant() {
+        let arg = Pseudo::arg(PseudoId(1), 0);
+        assert_eq!(constant_p_over_with(arg, run_before_inlining), None);
+        let val = Pseudo::val(PseudoId(1), 42);
+        assert_eq!(constant_p_over_with(val, run_before_inlining), Some(1));
+    }
+
+    /// A float constant is in no lattice cell, and is no less a constant.
+    #[test]
+    fn constant_p_answers_one_for_a_float_constant() {
+        let fval = Pseudo::fval(PseudoId(1), crate::float::FloatVal::from_f64(2.5));
+        assert_eq!(constant_p_over(fval), Some(1));
+        let fval = Pseudo::fval(PseudoId(1), crate::float::FloatVal::from_f64(2.5));
+        assert_eq!(constant_p_over_with(fval, run_before_inlining), Some(1));
     }
 }

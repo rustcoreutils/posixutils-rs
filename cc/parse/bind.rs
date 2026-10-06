@@ -10,6 +10,7 @@
 // declarators to the symbols they bind, at file scope and block scope alike
 //
 
+use super::aggregate::{VariantAllowed, WrittenOrder};
 use super::ast::{
     Declaration, Expr, ExprKind, ExternalDecl, FunctionAttrs, InitDeclarator, UnaryOp,
 };
@@ -19,7 +20,7 @@ use super::linkage::Declared;
 use super::parser::{DeclaratorContext, ParseError, ParseResult, ParsedDeclarator, Parser};
 use crate::diag;
 use crate::strings::StringId;
-use crate::symbol::{Namespace, Symbol, SymbolId};
+use crate::symbol::{Linkage, Namespace, Symbol, SymbolId};
 use crate::token::lexer::Position;
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
@@ -46,6 +47,8 @@ pub(super) struct DeclSpecs {
     ty: Type,
     /// The type every declarator derives from, or `__auto_type`.
     base: DeclBase,
+    /// Whether a type specifier was written, rather than `int` defaulted.
+    explicit: bool,
     /// The storage-class specifiers and `inline` ([`Type::STORAGE_CLASS`]),
     /// which the declaration records rather than the type.
     pub(super) storage_class: TypeModifiers,
@@ -56,6 +59,9 @@ pub(super) struct DeclSpecs {
     /// -- through a variably modified typedef name or `typeof(int[n])` --
     /// which are the innermost levels of every declarator's type.
     vm_dims: Vec<Expr>,
+    /// A `scalar_storage_order` written on a reference to an existing tag,
+    /// which each declarator applies or ignores.
+    written_order: Option<WrittenOrder>,
 }
 
 /// The type a declaration's declarators derive from.
@@ -152,8 +158,10 @@ impl Parser<'_> {
             return nothing();
         }
 
+        let declared_before = self.symbols.current_scope_symbols().len();
         let mut specs = self.parse_decl_specs(scope)?;
         if scope == (DeclScope::Block { for_init: true }) {
+            self.check_for_init_declares_no_enumerator(declared_before, specs.pos);
             self.check_for_init_declares_no_tag(&specs);
         }
         let mut declarators = Vec::new();
@@ -175,13 +183,29 @@ impl Parser<'_> {
                 DeclBase::Inferred { pos, .. } => {
                     diag::error(pos, &gettext("'__auto_type' in empty declaration"));
                 }
-                DeclBase::Given(_) => self.check_declares_something(specs.pos, &specs.ty),
+                DeclBase::Given(_) => self.check_declares_something(
+                    specs.pos,
+                    &specs.ty,
+                    specs.explicit,
+                    scope == DeclScope::File,
+                ),
             }
         } else {
             let mut first = true;
             loop {
-                let d = self
+                let mut d = self
                     .parse_declarator(specs.base.parse_against(), DeclaratorContext::Declaration)?;
+                let variant_allowed = if specs.is_typedef() {
+                    VariantAllowed::Typedef
+                } else {
+                    VariantAllowed::No
+                };
+                d.typ = self.apply_written_storage_order(
+                    specs.written_order,
+                    specs.base.parse_against(),
+                    d.typ,
+                    variant_allowed,
+                );
                 // An attribute may follow any declarator, and so may an asm
                 // label.
                 self.skip_extensions_after_declarator();
@@ -230,6 +254,29 @@ impl Parser<'_> {
         }
     }
 
+    /// C17 6.8.5p3: an enumeration constant the `for` declaration's
+    /// specifiers introduce -- `for (enum { A } e;;)` -- is not an object.
+    /// Every symbol the specifiers added to the `for`'s own scope sits after
+    /// `declared_before`.
+    fn check_for_init_declares_no_enumerator(&self, declared_before: usize, pos: Position) {
+        for &id in &self.symbols.current_scope_symbols()[declared_before..] {
+            let sym = self.symbols.get(id);
+            if sym.is_enum_constant() {
+                self.report_for_init_non_variable(sym.name, pos);
+            }
+        }
+    }
+
+    /// gcc's words for a `for` declaration that declares something other
+    /// than an object (C17 6.8.5p3).
+    fn report_for_init_non_variable(&self, name: StringId, pos: Position) {
+        diag::error_args(
+            pos,
+            "declaration of non-variable '{0}' in 'for' loop initial declaration",
+            &[self.idents.get_opt(name).unwrap_or("")],
+        );
+    }
+
     /// Parse the declaration specifiers and check what they may combine.
     fn parse_decl_specs(&mut self, scope: DeclScope) -> ParseResult<DeclSpecs> {
         let pos = self.current_pos();
@@ -264,8 +311,10 @@ impl Parser<'_> {
             pos,
             storage_class: ty.modifiers & Type::STORAGE_CLASS,
             base,
+            explicit: parsed.explicit,
             attrs: self.specifier_attrs(),
             vm_dims: parsed.vm_dims,
+            written_order: parsed.written_order,
             ty,
         })
     }
@@ -414,20 +463,25 @@ impl Parser<'_> {
             }
         }
 
+        // C17 6.8.5p3: a `for` declaration declares objects; a typedef name
+        // and a function are not.
+        if (is_typedef || is_fn) && scope == (DeclScope::Block { for_init: true }) {
+            self.report_for_init_non_variable(name, pos);
+        }
         let (symbol, init) = if is_typedef {
-            if scope == (DeclScope::Block { for_init: true }) {
-                diag::error_args(
-                    pos,
-                    "declaration of non-variable '{0}' in 'for' loop initial declaration",
-                    &[self.idents.get_opt(name).unwrap_or("")],
-                );
-            }
             typ = self.align_typedef_type(typ, align);
             (self.bind_typedef_name(scope, name, pos, typ, &vla)?, None)
         } else {
-            // C17 6.2.7p4: two declarations of one object with linkage
-            // describe it by their composite type.
-            typ = self.composite_with_prior_declaration(name, typ, specs.storage_class);
+            // gcc words this ahead of anything the declaration conflicts with.
+            if !is_fn && (inferred_init.is_some() || self.is_special(b'=')) {
+                self.check_extern_initializer(specs, scope, name, pos);
+            }
+            // C17 6.2.7p4: two declarations of one object or function with
+            // linkage describe it by their composite type. Every file-scope
+            // declaration has linkage (6.2.2p3, p5); at block scope only an
+            // `extern` one or a function does (6.2.2p4, p5).
+            let has_linkage = scope == DeclScope::File || is_fn || specs.is_extern();
+            typ = self.composite_with_prior_declaration(name, typ, has_linkage);
             self.check_redeclaration(name, typ, pos, Redeclared::Declaration);
             let linkage = self.declare_linkage(Declared {
                 name,
@@ -438,7 +492,9 @@ impl Parser<'_> {
                 // An initializer makes an object's declaration a definition
                 // (6.9.2p1); one without is at most a tentative definition.
                 defines: !is_fn && self.is_special(b'='),
-                inline_only: false,
+                gnu_extern_inline: fn_attrs
+                    .as_ref()
+                    .is_some_and(|attrs| attrs.gnu_inline_only(specs.storage_class)),
             });
             let sym = self
                 .declared_symbol(name, typ, align)
@@ -448,21 +504,20 @@ impl Parser<'_> {
             // after the declarator, so `int *p = sizeof *p ...` sees `p`.
             let symbol = self.declare_in(scope, sym, name);
             let init = match inferred_init {
-                Some(init) => Some(self.settle_initializer(specs, scope, &mut typ, symbol, init)),
-                None => {
-                    self.parse_declarator_initializer(specs, scope, name, pos, &mut typ, symbol)?
-                }
+                Some(init) => Some(self.settle_initializer(&mut typ, symbol, init)),
+                None => self.parse_declarator_initializer(name, pos, &mut typ, symbol)?,
             };
-            if !is_fn && !specs.is_extern() {
-                self.check_object_complete(scope, name, typ, &vla, pos);
+            // An initialized `extern` declaration is a definition (6.9.2p1),
+            // so its object needs a size like any other.
+            if !is_fn && (!specs.is_extern() || init.is_some()) {
+                self.check_object_complete(scope, name, typ, pos);
             }
             // A tentative definition of an array without its extent, which a
             // later declaration in the unit may still supply (6.9.2p2).
             if scope == DeclScope::File
                 && init.is_none()
                 && !specs.is_extern()
-                && self.types.kind(typ) == TypeKind::Array
-                && self.types.unsized_array_levels(typ) > 0
+                && self.types.is_incomplete_array(typ)
             {
                 if let Some(id) = symbol {
                     self.tentative_arrays.push((id, pos));
@@ -515,6 +570,16 @@ impl Parser<'_> {
             };
             self.declarator_cleanup(var, specs.storage_class, scope, is_fn)
         });
+        // An object of static storage duration is defined by its type alone:
+        // the storage class travels apart, in `storage_class`. `static int x;`
+        // and `extern int x = 7;` are one object of one type, and the
+        // definition must not depend on which declaration spelled what
+        // (`Module::define_global`).
+        let static_duration =
+            scope == DeclScope::File || specs.storage_class.contains(TypeModifiers::STATIC);
+        if !is_fn && !is_typedef && static_duration {
+            typ = self.types.without_decl_specifiers(typ);
+        }
         Ok(Bound::Decl(InitDeclarator {
             symbol_attrs,
             fn_effect: fn_attrs.map_or(pending_effect, |a| a.effect),
@@ -774,40 +839,66 @@ impl Parser<'_> {
     /// already bound in this scope.
     ///
     /// C allows any number of file-scope declarations of one object or
-    /// function, so there the existing symbol is reused -- and a declaration
-    /// that knows an array's extent completes an earlier `extern int a[];`
-    /// (6.2.7p4). A block-scope repeat binds nothing.
+    /// function, so there the existing symbol is reused, and takes the
+    /// composite type of both declarations (6.2.7p4): `int (*q)[3];` completes
+    /// an earlier `int (*q)[];` as `int a[3];` does `extern int a[];`. So
+    /// is a block-scope repeat of a declaration with linkage, `extern int
+    /// z[]; extern int z[3];` in one block; any other block-scope repeat
+    /// binds nothing.
     fn declare_in(&mut self, scope: DeclScope, sym: Symbol, name: StringId) -> Option<SymbolId> {
         let typ = sym.typ;
         let is_typedef = sym.is_typedef();
+        let has_linkage = sym.linkage != Linkage::None;
         if let Ok(id) = self.symbols.declare(sym) {
             return Some(id);
-        }
-        if scope != DeclScope::File {
-            return None;
         }
         let existing = self
             .symbols
             .lookup_id(name, Namespace::Ordinary)
             .expect("redeclaration should find existing symbol");
-        if !is_typedef
-            && self
-                .types
-                .unsized_array_levels(self.symbols.get(existing).typ)
-                > 0
-            && self.types.unsized_array_levels(typ) == 0
+        if scope != DeclScope::File
+            && !(has_linkage && self.symbols.get(existing).linkage != Linkage::None)
         {
-            self.symbols.get_mut(existing).typ = typ;
+            return None;
+        }
+        let prior = self.symbols.get(existing).typ;
+        if !is_typedef && self.types.types_compatible(prior, typ) {
+            self.symbols.get_mut(existing).typ = self.types.composite_type(typ, prior);
         }
         Some(existing)
+    }
+
+    /// An initializer on an `extern` declaration, in gcc's words.
+    ///
+    /// 6.7.9p5: an identifier declared `extern` at block scope has linkage,
+    /// so it refers to a definition elsewhere and cannot carry one here. At
+    /// *file* scope the same spelling is an external definition (6.9.2p1),
+    /// which gcc only warns about.
+    fn check_extern_initializer(
+        &self,
+        specs: &DeclSpecs,
+        scope: DeclScope,
+        name: StringId,
+        pos: Position,
+    ) {
+        if !specs.is_extern() {
+            return;
+        }
+        let spelled = [self.idents.get(name)];
+        match scope {
+            DeclScope::File => {
+                diag::warning_args(pos, "'{0}' initialized and declared 'extern'", &spelled)
+            }
+            DeclScope::Block { .. } => {
+                diag::error_args(pos, "'{0}' has both 'extern' and initializer", &spelled)
+            }
+        }
     }
 
     /// Parse the initializer after a declarator, if one follows, and let it
     /// complete the declared type.
     fn parse_declarator_initializer(
         &mut self,
-        specs: &DeclSpecs,
-        scope: DeclScope,
         name: StringId,
         pos: Position,
         typ: &mut TypeId,
@@ -827,34 +918,18 @@ impl Parser<'_> {
         }
         self.advance();
         let init = self.parse_initializer()?;
-        Ok(Some(
-            self.settle_initializer(specs, scope, typ, symbol, init),
-        ))
+        Ok(Some(self.settle_initializer(typ, symbol, init)))
     }
 
     /// Check a declarator's initializer against the declared type, and let it
     /// complete that type.
     fn settle_initializer(
         &mut self,
-        specs: &DeclSpecs,
-        scope: DeclScope,
         typ: &mut TypeId,
         symbol: Option<SymbolId>,
         mut init: Expr,
     ) -> Expr {
         self.walk_initializer(*typ, &mut init);
-
-        // 6.7.9p5: an identifier declared `extern` at block scope has
-        // linkage, so it refers to a definition elsewhere and cannot carry
-        // one here. At *file* scope the same spelling is a definition with
-        // external linkage, which gcc only warns about.
-        if specs.is_extern() {
-            let msg = gettext("'extern' variable has an initializer");
-            match scope {
-                DeclScope::File => diag::warning(init.pos, &msg),
-                DeclScope::Block { .. } => diag::error(init.pos, &msg),
-            }
-        }
 
         // For incomplete array types, infer size from initializer
         let sized = self.infer_array_size_from_init(*typ, &init);
@@ -939,7 +1014,6 @@ impl Parser<'_> {
         scope: DeclScope,
         name: StringId,
         typ: TypeId,
-        vla: &[Expr],
         pos: Position,
     ) {
         let is_array = self.types.kind(typ) == TypeKind::Array;
@@ -950,7 +1024,7 @@ impl Parser<'_> {
                 }
             }
             DeclScope::Block { .. } if is_array => {
-                if self.types.get(typ).array_size.is_none() && vla.is_empty() {
+                if self.types.is_incomplete_array(typ) {
                     diag::error_args(pos, "array size missing in '{0}'", &[self.idents.get(name)]);
                 }
             }

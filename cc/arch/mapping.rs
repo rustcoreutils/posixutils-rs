@@ -146,21 +146,16 @@ pub fn complex_div_name(routine: ComplexRoutineFormat) -> &'static str {
 
 // Utility helpers
 
-/// Get the rtlib suffix for a float type kind on the given target.
-pub(crate) fn float_suffix(kind: TypeKind, target: &Target) -> &'static str {
-    match kind {
-        TypeKind::Float => "sf",
-        TypeKind::Double => "df",
-        // binary128 is TFmode wherever it appears.
-        TypeKind::Float128 => "tf",
-        TypeKind::LongDouble => {
-            if target.arch == Arch::X86_64 {
-                "xf"
-            } else {
-                "tf"
-            }
-        }
-        _ => "",
+/// The rtlib mode suffix for floating type `typ`: its real format on the
+/// target `types` describes, so Apple arm64's binary64 `long double` is
+/// `df`. `_Float16` has none here (empty string): callers route it apart.
+pub(crate) fn float_suffix(types: &TypeTable, typ: TypeId) -> &'static str {
+    match types.fp_format(typ) {
+        Some(FpFormat::Binary32) => "sf",
+        Some(FpFormat::Binary64) => "df",
+        Some(FpFormat::X87Extended) => "xf",
+        Some(FpFormat::Binary128) => "tf",
+        Some(FpFormat::Binary16) | None => "",
     }
 }
 
@@ -1722,8 +1717,7 @@ pub(crate) fn map_int128_float_convert(
                 return None;
             }
             let dst_typ = insn.typ?;
-            let dst_kind = types.kind(dst_typ);
-            let fsuf = float_suffix(dst_kind, target);
+            let fsuf = float_suffix(types, dst_typ);
             if fsuf.is_empty() {
                 return None;
             }
@@ -1752,8 +1746,7 @@ pub(crate) fn map_int128_float_convert(
                 return None;
             }
             let src_typ = insn.src_typ?;
-            let src_kind = types.kind(src_typ);
-            let fsuf = float_suffix(src_kind, target);
+            let fsuf = float_suffix(types, src_typ);
             if fsuf.is_empty() {
                 return None;
             }
@@ -1951,16 +1944,15 @@ fn map_binary128(insn: &Instruction, ctx: &mut MappingCtx<'_>) -> Option<MappedI
             // `long double` <-> `__float128` conversion unlowered, and it fell
             // through to a hardware path that has no such instruction.
             let other = if src_quad { dst_typ } else { src_typ };
-            let name: &'static str =
-                match (src_quad, float_suffix(ctx.types.kind(other), ctx.target)) {
-                    (true, "sf") => "__trunctfsf2",
-                    (true, "df") => "__trunctfdf2",
-                    (true, "xf") => "__trunctfxf2",
-                    (false, "sf") => "__extendsftf2",
-                    (false, "df") => "__extenddftf2",
-                    (false, "xf") => "__extendxftf2",
-                    _ => return None,
-                };
+            let name: &'static str = match (src_quad, float_suffix(ctx.types, other)) {
+                (true, "sf") => "__trunctfsf2",
+                (true, "df") => "__trunctfdf2",
+                (true, "xf") => "__trunctfxf2",
+                (false, "sf") => "__extendsftf2",
+                (false, "df") => "__extenddftf2",
+                (false, "xf") => "__extendxftf2",
+                _ => return None,
+            };
             let call = build_convert_rtlib_call(insn, name, ctx.types, ctx.target);
             Some(MappedInsn::Replace(vec![call]))
         }

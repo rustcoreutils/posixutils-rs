@@ -770,3 +770,154 @@ fn builtins_va_arg_pack_outside_a_forwarding_function_is_rejected() {
         "va_arg_pack",
     );
 }
+
+/// gcc's `__builtin_longjmp` takes only the constant 1, and both builtins
+/// are prototyped, so a wrong count is reported as for any call -- each in
+/// gcc's words. `0 + 1` is the constant 1 and is accepted.
+#[test]
+fn builtins_setjmp_longjmp_arguments_are_checked() {
+    for (name, src, expected) in [
+        (
+            "longjmp_two",
+            "void *b[5]; void f(void){ __builtin_longjmp(b, 2); }",
+            "'__builtin_longjmp' second argument must be 1",
+        ),
+        (
+            "longjmp_variable",
+            "void *b[5]; void f(int v){ __builtin_longjmp(b, v); }",
+            "'__builtin_longjmp' second argument must be 1",
+        ),
+        (
+            "longjmp_one_arg",
+            "void *b[5]; void f(void){ __builtin_longjmp(b); }",
+            "too few arguments to function '__builtin_longjmp'",
+        ),
+        (
+            "setjmp_no_arg",
+            "int f(void){ return __builtin_setjmp(); }",
+            "too few arguments to function '__builtin_setjmp'",
+        ),
+        (
+            "setjmp_two_args",
+            "void *b[5]; int f(void){ return __builtin_setjmp(b, b); }",
+            "too many arguments to function '__builtin_setjmp'",
+        ),
+    ] {
+        compile_expect_error(name, src, expected);
+    }
+    compile_expect_no_diagnostic(
+        "longjmp_constant_expression",
+        "void *b[5]; void f(void){ __builtin_longjmp(b, 0 + 1); }",
+        "second argument",
+    );
+}
+
+// ============================================================================
+// tests/builtins/gcc_lowering.rs:
+// The builtins gcc makes for its own lowering, misused
+// ============================================================================
+
+/// `__builtin_clear_padding` takes one pointer to a complete, non-`const`
+/// object type with well-defined padding, and returns nothing; the others
+/// are checked through gcc's prototypes. Each in gcc 13's words.
+#[test]
+fn builtins_gcc_lowering_misuse_is_rejected() {
+    for (name, src, expected) in [
+        (
+            "padding_not_pointer",
+            "struct S { int a; char b; }; void f(struct S s){__builtin_clear_padding(s);}",
+            "argument 1 in call to function '__builtin_clear_padding' does not have pointer type",
+        ),
+        (
+            "padding_null_constant",
+            "void f(void){__builtin_clear_padding(0);}",
+            "does not have pointer type",
+        ),
+        (
+            "padding_void",
+            "void f(void *p){__builtin_clear_padding(p);}",
+            "argument 1 in call to function '__builtin_clear_padding' points to incomplete type",
+        ),
+        (
+            "padding_incomplete_struct",
+            "struct I; void f(struct I *p){__builtin_clear_padding(p);}",
+            "points to incomplete type",
+        ),
+        (
+            "padding_incomplete_array",
+            "void f(int (*p)[]){__builtin_clear_padding(p);}",
+            "points to incomplete type",
+        ),
+        (
+            "padding_const",
+            "struct S { int a; char b; }; void f(const struct S *p){__builtin_clear_padding(p);}",
+            "argument 1 in call to function '__builtin_clear_padding' has pointer to 'const' type ('const struct S *')",
+        ),
+        (
+            "padding_flexible",
+            "struct F { int n; char c[]; }; void f(struct F *p){__builtin_clear_padding(p);}",
+            "flexible array member 'c' does not have well defined padding bits for '__builtin_clear_padding'",
+        ),
+        (
+            "padding_too_many",
+            "struct S { int a; }; void f(struct S *p){__builtin_clear_padding(p, 1);}",
+            "too many arguments to function '__builtin_clear_padding'",
+        ),
+        (
+            "padding_too_few",
+            "void f(void){__builtin_clear_padding();}",
+            "too few arguments to function '__builtin_clear_padding'",
+        ),
+        (
+            "padding_void_value",
+            "struct S { int a; }; int f(struct S *p){return __builtin_clear_padding(p);}",
+            "void value not ignored as it ought to be",
+        ),
+        (
+            "stack_save_args",
+            "void f(void){__builtin_stack_save(1);}",
+            "too many arguments to function '__builtin_stack_save'",
+        ),
+        (
+            "stack_restore_double",
+            "void f(void){__builtin_stack_restore(1.0);}",
+            "incompatible type for argument 1 of '__builtin_stack_restore'",
+        ),
+        (
+            "stack_restore_void_value",
+            "int f(void){return __builtin_stack_restore(0);}",
+            "void value not ignored as it ought to be",
+        ),
+        (
+            "cexpi_pointer",
+            "void f(int *p){__builtin_cexpi(p);}",
+            "incompatible type for argument 1 of '__builtin_cexpi'",
+        ),
+        (
+            "cpow_arity",
+            "void f(void){__builtin_cpow(1.0);}",
+            "too few arguments to function '__builtin_cpow'",
+        ),
+    ] {
+        compile_expect_error(name, src, expected);
+    }
+}
+
+/// What gcc accepts: a pointer to a variable length array, an array that
+/// decays to a pointer, a `volatile` object and a pointer to a function.
+#[test]
+fn builtins_clear_padding_accepts_what_gcc_does() {
+    compile_expect_no_diagnostic(
+        "padding_accepted",
+        "struct S { char a; long b; };\n\
+         void f(int n, volatile struct S *v, void (*fn)(void)) {\n\
+             struct S a[n][2], b[3];\n\
+             __builtin_clear_padding(a);\n\
+             __builtin_clear_padding(&a);\n\
+             __builtin_clear_padding(b);\n\
+             __builtin_clear_padding(v);\n\
+             __builtin_clear_padding(fn);\n\
+         }\n",
+        "__builtin_clear_padding",
+    );
+}

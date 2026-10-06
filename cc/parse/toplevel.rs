@@ -23,9 +23,9 @@ use super::parser::{
 };
 use crate::diag;
 use crate::strings::StringId;
-use crate::symbol::{Symbol, SymbolId};
+use crate::symbol::{Linkage, Symbol, SymbolId};
 use crate::token::lexer::{payload_text, Position, TokenType};
-use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
+use crate::types::{ArrayExtent, Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
 use std::collections::HashMap;
 
@@ -39,6 +39,7 @@ impl Parser<'_> {
             // Try to determine if this is a function definition or a declaration
             // Both start with type specifier + declarator
             let external_decl = self.parse_external_decl()?;
+            self.report_reverse_atomic_members();
             tu.add(external_decl);
         }
 
@@ -74,15 +75,15 @@ impl Parser<'_> {
         }
         for &id in &order {
             let typ = self.symbols.get(id).typ;
-            if self.types.unsized_array_levels(typ) == 0 {
+            if !self.types.is_incomplete_array(typ) {
                 continue;
             }
             let name = self.symbols.get(id).name;
             let spelled = self.idents.get_opt(name).unwrap_or("");
             // A block-scope `extern` may have given the object its extent.
             let completed = match self.linked_type(name) {
-                Some((linked, late)) if self.types.unsized_array_levels(linked) == 0 => {
-                    if late && self.types.get(linked).array_size != Some(1) {
+                Some((linked, late)) if !self.types.is_incomplete_array(linked) => {
+                    if late && self.types.array_extent(linked) != ArrayExtent::Known(1) {
                         diag::error_args(
                             last[&id],
                             "type of array '{0}' completed incompatibly with implicit initialization",
@@ -108,8 +109,13 @@ impl Parser<'_> {
                 continue;
             };
             for d in &mut decl.declarators {
-                if last.contains_key(&d.symbol) && self.types.unsized_array_levels(d.typ) > 0 {
-                    d.typ = self.symbols.get(d.symbol).typ;
+                if last.contains_key(&d.symbol) && self.types.is_incomplete_array(d.typ) {
+                    // The symbol's type is the last declaration's, which
+                    // spelled its own storage class; the declarator's is
+                    // the object's alone (see `bind_declarator`).
+                    d.typ = self
+                        .types
+                        .without_decl_specifiers(self.symbols.get(d.symbol).typ);
                 }
             }
         }
@@ -206,7 +212,7 @@ impl Parser<'_> {
         } else {
             // Could not evaluate at compile time
             return Err(ParseError::new(
-                "_Static_assert expression is not a constant expression",
+                "expression in static assertion is not constant",
                 pos,
             ));
         }
@@ -342,7 +348,7 @@ impl Parser<'_> {
         // C17 6.9.1p3: a definition returns `void` or a complete object
         // type, since its `return` makes one.
         if self.types.kind(return_type) != TypeKind::Void
-            && self.type_name_is_incomplete(return_type, 0)
+            && self.type_name_is_incomplete(return_type)
         {
             diag::error(pos, &gettext("return type is an incomplete type"));
         }
@@ -354,7 +360,6 @@ impl Parser<'_> {
         self.check_redeclaration(name, typ, pos, form);
         // A GNU inline-only body emits nothing, so a real definition may
         // follow it.
-        let inline_only = attrs.gnu_inline_only(specs.storage_class);
         let linkage = self.declare_linkage(Declared {
             name,
             typ,
@@ -362,11 +367,17 @@ impl Parser<'_> {
             storage: specs.storage_class,
             scope: DeclScope::File,
             defines: true,
-            inline_only,
+            gnu_extern_inline: attrs.gnu_inline_only(specs.storage_class),
         });
-        let _ = self
-            .symbols
-            .declare(Symbol::function(name, typ, self.symbols.depth()).with_linkage(linkage));
+        // After the definition the name has the composite type of it and any
+        // earlier declaration (C17 6.2.7p4): `int (*fp(void))[6] { .. }`
+        // keeps the extent an earlier `int (*fp(void))[];` lacked, and an
+        // earlier one supplies what the definition left out. The body itself
+        // is checked against the definition's own type.
+        let symbol_typ = self.composite_with_prior_declaration(name, typ, true);
+        let _ = self.symbols.declare(
+            Symbol::function(name, symbol_typ, self.symbols.depth()).with_linkage(linkage),
+        );
         // A weak definition may be replaced at link time, so gcc leaves the
         // builtin in place of it; so does this.
         if !attrs.symbol.weak {
@@ -406,7 +417,9 @@ impl Parser<'_> {
             param_style,
             body,
             pos: specs.pos,
-            is_static: specs.storage_class.contains(TypeModifiers::STATIC),
+            // The linkage, not the specifier: `static int f(void);` makes
+            // a later `int f(void) {..}` static too (C17 6.2.2p5, p4).
+            is_static: linkage == Linkage::Internal,
             is_inline: specs.storage_class.contains(TypeModifiers::INLINE),
             calling_conv: self.types.get(typ).conv,
             attrs,
@@ -418,8 +431,7 @@ impl Parser<'_> {
     /// A prototype that is not a definition may name an incomplete type.
     fn check_parameters_complete(&self, params: &[RawParam], pos: Position) {
         for (i, raw) in params.iter().enumerate() {
-            if self.types.kind(raw.typ) == TypeKind::Void
-                || !self.type_name_is_incomplete(raw.typ, 0)
+            if self.types.kind(raw.typ) == TypeKind::Void || !self.type_name_is_incomplete(raw.typ)
             {
                 continue;
             }
@@ -501,9 +513,9 @@ impl Parser<'_> {
         while self.is_declaration_start() {
             declared = true;
             let knr_pos = self.current_pos();
-            let knr_type = self
-                .parse_declaration_specifiers(SpecContext::Parameter)?
-                .ty;
+            let knr_specs = self.parse_declaration_specifiers(SpecContext::Parameter)?;
+            self.ignore_written_storage_order(knr_specs.written_order);
+            let knr_type = knr_specs.ty;
             let knr_base_id = self.intern_type_with_tag(&knr_type);
             loop {
                 let ParsedDeclarator {
@@ -512,7 +524,6 @@ impl Parser<'_> {
                     ..
                 } = self.parse_declarator(knr_base_id, DeclaratorContext::OldStyleParameter)?;
                 self.check_parameter_specifiers(knr_type.modifiers, decl_name, knr_pos);
-                self.check_not_vector_value(Some(decl_typ), self.current_pos());
                 // C99 6.7.5.3: array/function params adjusted to pointers;
                 // a vector is passed by value.
                 let adjusted = self.types.get(decl_typ);

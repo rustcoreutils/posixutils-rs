@@ -57,7 +57,7 @@ pub(super) fn parse_expr_for(
     parse_expr_on(input, &[], Default::default(), target)
 }
 
-fn parse_expr_on(
+pub(super) fn parse_expr_on(
     input: &str,
     vars: &[&str],
     policy: super::LibraryCallPolicy,
@@ -1939,7 +1939,7 @@ fn test_pointer_decl() {
 fn test_array_decl() {
     let (decl, types, _strings, _symbols) = parse_decl("int arr[10];").unwrap();
     assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::Array);
-    assert_eq!(types.get(decl.declarators[0].typ).array_size, Some(10));
+    assert_eq!(types.get(decl.declarators[0].typ).extent.known(), Some(10));
 }
 
 #[test]
@@ -1966,34 +1966,40 @@ fn test_long_long_decl() {
     assert_eq!(types.kind(decl.declarators[0].typ), TypeKind::LongLong);
 }
 
+/// An object of static storage duration is declared with its storage class
+/// in `storage_class` and its type without one, at every level: `extern int
+/// *p` is a `extern` declaration of an `int *`.
 #[test]
-fn test_extern_pointer_modifier_propagation() {
+fn test_extern_pointer_storage_class_is_not_its_type() {
     let (decl, types, _strings, _symbols) = parse_decl("extern int *p;").unwrap();
-    let ptr_typ = decl.declarators[0].typ;
-
-    // Verify it's a pointer type
-    assert_eq!(types.kind(ptr_typ), TypeKind::Pointer);
-
-    // Verify EXTERN modifier is on the pointer type
-    assert!(
-        types.get(ptr_typ).modifiers.contains(TypeModifiers::EXTERN),
-        "EXTERN modifier should propagate to pointer type"
-    );
+    let d = &decl.declarators[0];
+    assert_eq!(types.kind(d.typ), TypeKind::Pointer);
+    assert!(d.storage_class.contains(TypeModifiers::EXTERN));
+    assert!(!types
+        .modifiers(d.typ)
+        .intersects(crate::types::Type::DECL_SPECIFIERS));
+    let pointee = types.base_type(d.typ).expect("pointee");
+    assert!(!types
+        .modifiers(pointee)
+        .intersects(crate::types::Type::DECL_SPECIFIERS));
 }
 
+/// An object of static storage duration is declared with its storage class
+/// in `storage_class` and its type without one, at every level: `static int
+/// *p` is a `static` declaration of an `int *`.
 #[test]
-fn test_static_pointer_modifier_propagation() {
+fn test_static_pointer_storage_class_is_not_its_type() {
     let (decl, types, _strings, _symbols) = parse_decl("static int *p;").unwrap();
-    let ptr_typ = decl.declarators[0].typ;
-
-    // Verify it's a pointer type
-    assert_eq!(types.kind(ptr_typ), TypeKind::Pointer);
-
-    // Verify STATIC modifier is on the pointer type
-    assert!(
-        types.get(ptr_typ).modifiers.contains(TypeModifiers::STATIC),
-        "STATIC modifier should propagate to pointer type"
-    );
+    let d = &decl.declarators[0];
+    assert_eq!(types.kind(d.typ), TypeKind::Pointer);
+    assert!(d.storage_class.contains(TypeModifiers::STATIC));
+    assert!(!types
+        .modifiers(d.typ)
+        .intersects(crate::types::Type::DECL_SPECIFIERS));
+    let pointee = types.base_type(d.typ).expect("pointee");
+    assert!(!types
+        .modifiers(pointee)
+        .intersects(crate::types::Type::DECL_SPECIFIERS));
 }
 
 #[test]
@@ -4550,7 +4556,7 @@ fn test_incomplete_array_string_literal_size() {
         let typ = decl.declarators[0].typ;
         assert_eq!(types.kind(typ), TypeKind::Array);
         assert_eq!(
-            types.get(typ).array_size,
+            types.get(typ).extent.known(),
             Some(4),
             "Array size should be 4 (3 chars + null terminator)"
         );
@@ -4568,7 +4574,7 @@ fn test_incomplete_array_empty_string() {
         let typ = decl.declarators[0].typ;
         assert_eq!(types.kind(typ), TypeKind::Array);
         assert_eq!(
-            types.get(typ).array_size,
+            types.get(typ).extent.known(),
             Some(1),
             "Array size should be 1 (just null terminator)"
         );
@@ -4585,7 +4591,7 @@ fn test_incomplete_array_designator_size() {
         let typ = decl.declarators[0].typ;
         assert_eq!(types.kind(typ), TypeKind::Array);
         assert_eq!(
-            types.get(typ).array_size,
+            types.get(typ).extent.known(),
             Some(11),
             "Array size should be 11 for {{[10] = 1}}"
         );
@@ -4602,7 +4608,7 @@ fn test_incomplete_array_designator_sequence_size() {
         let typ = decl.declarators[0].typ;
         assert_eq!(types.kind(typ), TypeKind::Array);
         assert_eq!(
-            types.get(typ).array_size,
+            types.get(typ).extent.known(),
             Some(7),
             "Array size should be 7 for {{1,2,[5]=5,6}}"
         );
@@ -4730,7 +4736,7 @@ fn test_wide_string_literal_basic() {
     let elem_type = types.get(typ).base.unwrap();
     assert_eq!(elem_type, types.wchar_id);
     // Array size should be 6 (5 chars + null terminator)
-    assert_eq!(types.array_size(typ), Some(6));
+    assert_eq!(types.array_extent(typ).known(), Some(6));
 }
 
 #[test]
@@ -4755,7 +4761,7 @@ fn test_wide_string_array_size_inference() {
         let typ = decl.declarators[0].typ;
         assert_eq!(types.kind(typ), TypeKind::Array);
         assert_eq!(
-            types.get(typ).array_size,
+            types.get(typ).extent.known(),
             Some(4),
             "Wide string array size should be 4 (3 chars + null terminator)"
         );
@@ -6434,12 +6440,22 @@ pub(super) fn with_statement_expr<R>(
     stmt: &str,
     f: impl FnOnce(&mut Parser, &Expr) -> R,
 ) -> R {
+    with_statement_expr_for(&Target::host(), decls, stmt, f)
+}
+
+/// [`with_statement_expr`] for `target`.
+pub(super) fn with_statement_expr_for<R>(
+    target: &Target,
+    decls: &str,
+    stmt: &str,
+    f: impl FnOnce(&mut Parser, &Expr) -> R,
+) -> R {
     let src = format!("{decls}\nvoid t(void) {{ {stmt}; }}");
     let mut strings = StringTable::new();
     let mut tokenizer = Tokenizer::new(src.as_bytes(), 0, &mut strings);
     let tokens = tokenizer.tokenize();
     let mut symbols = SymbolTable::new();
-    let mut types = TypeTable::new(&Target::host());
+    let mut types = TypeTable::new(target);
     let mut parser = Parser::new(&tokens, &strings, &mut symbols, &mut types, Vec::new());
     let tu = parser.parse_translation_unit().unwrap();
     let Stmt::Expr(expr) = first_statement(&tu) else {
@@ -8252,6 +8268,106 @@ fn test_signbit_is_type_generic() {
     }
 }
 
+/// `__builtin_issignaling` tests its operand at the operand's own type, on
+/// every target and for every floating type: unlike `signbit`, it can take
+/// no conversion on the way, since converting a signalling NaN to another
+/// format quiets it.
+#[test]
+fn test_issignaling_tests_its_operand_unconverted() {
+    use crate::target::{Arch, Os};
+    let types = [
+        "float",
+        "double",
+        "long double",
+        "_Float16",
+        "_Float32",
+        "_Float64",
+        "_Float128",
+        "_Float32x",
+        "_Float64x",
+    ];
+    for arch in [Arch::X86_64, Arch::Aarch64] {
+        let target = Target::new(arch, Os::Linux);
+        for t in types {
+            with_statement_expr_for(
+                &target,
+                &format!("{t} v;"),
+                "__builtin_issignaling(v)",
+                |p, e| {
+                    assert_eq!(e.typ, Some(p.types.int_id), "{arch:?} {t}");
+                    let ExprKind::FpTest {
+                        test: FpTest::IsSignaling,
+                        arg,
+                    } = &e.kind
+                    else {
+                        panic!(
+                            "{arch:?} {t}: expected an issignaling test, got {:?}",
+                            e.kind
+                        );
+                    };
+                    assert!(
+                        matches!(arg.kind, ExprKind::Ident(_)),
+                        "{arch:?} {t}: the operand is converted: {:?}",
+                        arg.kind
+                    );
+                    assert_eq!(p.eval_const_expr(e), None, "{arch:?} {t}: a variable");
+                },
+            );
+        }
+    }
+}
+
+/// `__builtin_issignaling` of a constant is an integer constant expression,
+/// as in gcc 13, and the constant is quieted wherever the program would
+/// quiet it: a conversion to another format and arithmetic quiet it, a
+/// negation and a conversion to the same format do not.
+#[test]
+fn test_issignaling_of_a_constant_is_a_constant_expression() {
+    use crate::target::{Arch, Os};
+    let cases = [
+        ("__builtin_nans(\"\")", 1),
+        ("__builtin_nansf(\"0x123\")", 1),
+        ("__builtin_nansl(\"\")", 1),
+        ("__builtin_nansf16(\"\")", 1),
+        ("__builtin_nansf128(\"\")", 1),
+        ("__builtin_nansf32x(\"\")", 1),
+        ("__builtin_nansf64x(\"\")", 1),
+        ("-__builtin_nans(\"\")", 1),
+        ("(double)__builtin_nansf32x(\"\")", 1),
+        ("__builtin_nan(\"\")", 0),
+        ("__builtin_nanl(\"0x234\")", 0),
+        ("__builtin_inf()", 0),
+        ("-__builtin_inff()", 0),
+        ("0.0L", 0),
+        ("1.5", 0),
+        ("(float)__builtin_nans(\"\")", 0),
+        ("(long double)__builtin_nans(\"\")", 0),
+        ("__builtin_nans(\"\") * 1.0", 0),
+        ("__builtin_nansf(\"\") + 0.0f", 0),
+    ];
+    for target in [
+        Target::new(Arch::X86_64, Os::Linux),
+        Target::new(Arch::Aarch64, Os::Linux),
+        Target::new(Arch::Aarch64, Os::MacOS),
+    ] {
+        for (arg, want) in cases {
+            // Apple has no binary128, so neither of the types that are one.
+            let wide = arg.contains("f128") || arg.contains("f64x");
+            if wide && target.os == Os::MacOS {
+                continue;
+            }
+            // Apple's `long double` is `double`, so that conversion is none.
+            let same_format = target.os == Os::MacOS && arg.starts_with("(long double)");
+            let want = if same_format { 1 } else { want };
+            let call = format!("__builtin_issignaling({arg})");
+            with_statement_expr_for(&target, "", &call, |p, e| {
+                let at = (target.arch, target.os);
+                assert_eq!(p.eval_const_expr(e), Some(want), "{at:?}: {call}");
+            });
+        }
+    }
+}
+
 /// `vector_size` marks its type, so a vector is not the same type as a plain
 /// array of its elements -- which is what lets a value use of one be told
 /// apart and refused.
@@ -8859,8 +8975,8 @@ fn test_later_declarators_align_and_complete() {
     };
     assert_eq!(types.get(find("B")).explicit_align, Some(16));
     assert_eq!(types.get(find("A")).explicit_align, None);
-    assert_eq!(types.get(find("p")).array_size, Some(4));
-    assert_eq!(types.get(find("q")).array_size, Some(5));
+    assert_eq!(types.get(find("p")).extent.known(), Some(4));
+    assert_eq!(types.get(find("q")).extent.known(), Some(5));
 }
 
 /// `ms_abi` belongs to the function *type*, as gcc has it: a definition, a
@@ -9050,16 +9166,48 @@ fn test_constant_expression_floating_folds_are_exact() {
     }
 }
 
-/// A conversion C leaves undefined is not an integer constant expression:
-/// gcc makes `int a[(int)1e300 > 0];` a VLA for the same reason.
+/// A conversion C leaves undefined folds as gcc folds it, saturated and a
+/// NaN to 0, wherever gcc takes the value: an enumerator, `_Static_assert`,
+/// a `case` label, a bit-field width, `_Alignas`, `__builtin_constant_p`.
+/// Each answer is gcc 13's.
 #[test]
-fn test_out_of_range_float_cast_is_not_an_integer_constant() {
+fn test_out_of_range_float_cast_saturates_in_a_constant_expression() {
+    let src = "\
+        enum { E = (int)1e300, F = (short)-1e10, G = (unsigned char)300.0 };\n\
+        _Static_assert(E == 2147483647 && F == -32768 && G == 255, \"enum\");\n\
+        _Static_assert((int)__builtin_nan(\"\") == 0, \"NaN\");\n\
+        _Static_assert((unsigned)-1.0 == 0, \"negative to unsigned\");\n\
+        _Static_assert((int)2147483648.0f == 2147483647, \"one past\");\n\
+        _Static_assert((long long)-__builtin_inf() == -9223372036854775807LL - 1, \"-inf\");\n\
+        _Static_assert((unsigned __int128)1e300 == ~(unsigned __int128)0, \"u128\");\n\
+        _Static_assert(__builtin_constant_p((int)1e10), \"constant\");\n\
+        struct W { unsigned f : (unsigned char)300.0 / 32; };\n\
+        struct A { _Alignas((unsigned char)1e10 / 16 + 1) char c; };\n\
+        _Static_assert(_Alignof(struct A) == 16, \"align\");\n\
+        int f(int x) { switch (x) { case (int)1e10: return 1; case (int)-1e10: return 2; } return 0; }\n";
+    if let Err(e) = parse_tu(src) {
+        panic!("should have parsed: {e}");
+    }
+}
+
+/// An array's size alone refuses the saturated value: gcc makes
+/// `int a[(int)1e300 > 0];` a VLA, so at file scope it is an error, while an
+/// in-range conversion is a constant size. Each is gcc 13's answer on both
+/// targets.
+#[test]
+fn test_out_of_range_float_cast_makes_an_array_variable_length() {
     for src in [
-        "enum { E = (int)1e300 };",
-        "_Static_assert((int)__builtin_nan(\"\") == 0, \"\");",
-        "_Static_assert((unsigned)-1.0 == 0, \"\");",
+        "int a[(int)1e300 > 0];",
+        "int b[(signed char)-1e10 + 200];",
+        "int c[(unsigned)1e10 > 0];",
+        "int d[(short)1e10 > 0];",
     ] {
-        assert!(parse_tu(src).is_err(), "{src} should be rejected");
+        assert!(parse_tu(src).is_err(), "{src} should be a VLA");
+    }
+    for src in ["int a[(int)1e3 > 0];", "int b[(unsigned char)255.5];"] {
+        if let Err(e) = parse_tu(src) {
+            panic!("{src} should have a constant size: {e}");
+        }
     }
 }
 
@@ -9836,9 +9984,9 @@ fn test_array_suffix_derivation_order() {
 
     let (decl, types, _, _) = parse_decl("int (a[2])[3];").unwrap();
     let typ = decl.declarators[0].typ;
-    assert_eq!(types.get(typ).array_size, Some(2));
+    assert_eq!(types.get(typ).extent.known(), Some(2));
     let elem = types.base_type(typ).unwrap();
-    assert_eq!(types.get(elem).array_size, Some(3));
+    assert_eq!(types.get(elem).extent.known(), Some(3));
     assert_eq!(types.kind(types.base_type(elem).unwrap()), TypeKind::Int);
 }
 
@@ -9887,6 +10035,25 @@ fn test_conditional_pointer_result_types() {
         };
         let typ = decl.declarators[0].typ;
         assert_eq!(types.format_type(typ, None), want, "{expr}");
+    }
+}
+
+/// One `void` arm makes the conditional `void`, as gcc types it, whichever
+/// arm it is and whatever the other is -- so its value cannot be used, and
+/// the only diagnostic is gcc's `-pedantic` one, which is off here.
+#[test]
+fn test_conditional_with_one_void_arm_is_void() {
+    let decls = "void f(void); int c, x; int *p; struct S { int a; } s;";
+    for expr in ["c ? f() : x", "c ? x : f()", "c ? p : f()", "c ? f() : s"] {
+        let src = format!("{decls} __typeof__({expr}) *r;");
+        let before = crate::diag::error_count();
+        let (tu, types, _, _) = parse_tu(&src).unwrap();
+        assert_eq!(crate::diag::error_count(), before, "{expr}: an error");
+        let Some(ExternalDecl::Declaration(decl)) = tu.items.last() else {
+            panic!("{expr}: expected a declaration");
+        };
+        let typ = decl.declarators[0].typ;
+        assert_eq!(types.format_type(typ, None), "void *", "{expr}");
     }
 }
 

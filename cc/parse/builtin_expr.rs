@@ -11,10 +11,12 @@
 //
 
 use super::ast::{
-    BinaryOp, CalleeBinding, Expr, ExprKind, FpCompare, GnuAtomicOp, LibFn, OffsetOfPath, UnaryOp,
+    BinaryOp, CalleeBinding, Expr, ExprKind, FpCompare, GnuAtomicOp, JmpKind, LibFn, OffsetOfPath,
+    UnaryOp,
 };
 use super::builtin_args::ConstantArgument;
 use super::library_builtin::LibraryBuiltin;
+use super::lowering_builtin::CEXPI_BUILTINS;
 use super::parser::{ParseError, ParseResult, Parser};
 use crate::diag;
 use crate::float::{FloatVal, NanKind};
@@ -89,6 +91,100 @@ impl ObjectExtent {
 }
 
 impl Parser<'_> {
+    /// `__builtin_constant_p(arg)`: the answer, or the operand deferred.
+    ///
+    /// gcc's rules (`fold_builtin_constant_p`), in its order:
+    ///
+    /// 1. A constant is 1. Constant-ness, not integer-ness:
+    ///    `__builtin_constant_p(3.14)` is 1 in gcc. The integer folder
+    ///    deliberately refuses a floating literal, since 6.6 makes one an
+    ///    integer constant expression only as the operand of a cast, so the
+    ///    floating fold has to be asked as well.
+    /// 2. The address of a string literal's first character is 1
+    ///    ([`Self::is_string_literal_start`]).
+    /// 3. Anything else of pointer or aggregate type is 0 at once -- even
+    ///    `char *p = (char *)16;` asked about `p` -- and so is everything at
+    ///    `-O0`, where no optimization will run to prove it constant. gcc
+    ///    then answers on the spot: the answer is a constant, and
+    ///    `if (__builtin_constant_p(n))` drops its arm as any other constant
+    ///    condition does (gcc.c-torture 20030330-1).
+    /// 4. The rest is deferred. Answering 1 here is final -- nothing later
+    ///    makes a constant unconstant -- but answering 0 is not: gcc decides
+    ///    *after* optimization, so `int x = 42; __builtin_constant_p(x)` is 1
+    ///    at `-O1` and above, and only propagation knows. The linearizer
+    ///    answers an operand with side effects 0, and `sccp` the rest.
+    fn constant_p(&self, arg: Expr) -> ExprKind {
+        let is_constant = self.eval_const_expr(&arg).is_some()
+            || crate::constexpr::eval_float(self, crate::constexpr::ConstScope::Standard, &arg)
+                .is_some();
+        if is_constant || self.is_string_literal_start(&arg) {
+            ExprKind::IntLit(1)
+        } else if !self.library_call_policy.optimizing
+            || arg.typ.is_some_and(|t| {
+                // A GNU vector is a value, not an aggregate: gcc answers 1
+                // for a vector of constants once optimized.
+                matches!(
+                    self.types.kind(t),
+                    TypeKind::Pointer
+                        | TypeKind::Array
+                        | TypeKind::Struct
+                        | TypeKind::Union
+                        | TypeKind::Function
+                ) && !self.types.is_vector(t)
+            })
+        {
+            ExprKind::IntLit(0)
+        } else {
+            ExprKind::ConstantP(Box::new(arg))
+        }
+    }
+
+    /// Whether `expr` is the address of a string literal's first character,
+    /// which `__builtin_constant_p` answers 1 as gcc does: the literal itself
+    /// (`"hi"`, which decays to it), `&"hi"`, `&"hi"[0]`, `&*"hi"` and
+    /// `"hi" + 0`, through any conversion that keeps the representation --
+    /// to a pointer, or to an integer as wide as one (gcc's `STRIP_NOPS`).
+    /// `(int)"hi"` on LP64 truncates, and `"hi" + 1` is not the start.
+    fn is_string_literal_start(&self, expr: &Expr) -> bool {
+        let is_zero = |e: &Expr| self.eval_const_expr(e) == Some(0);
+        match &expr.kind {
+            _ if expr.is_string_literal() => true,
+            ExprKind::Cast {
+                cast_type,
+                expr: inner,
+            } => {
+                let keeps = match self.types.kind(*cast_type) {
+                    TypeKind::Pointer => true,
+                    _ => {
+                        self.types.is_integer(*cast_type)
+                            && self.types.size_bits(*cast_type)
+                                == self.types.size_bits(self.types.void_ptr_id)
+                    }
+                };
+                keeps && self.is_string_literal_start(inner)
+            }
+            ExprKind::Unary {
+                op: UnaryOp::AddrOf,
+                operand,
+            } => match &operand.kind {
+                _ if operand.is_string_literal() => true,
+                ExprKind::Index { array, index } => array.is_string_literal() && is_zero(index),
+                ExprKind::Unary {
+                    op: UnaryOp::Deref,
+                    operand: inner,
+                } => self.is_string_literal_start(inner),
+                _ => false,
+            },
+            ExprKind::Binary {
+                op: BinaryOp::Add | BinaryOp::Sub,
+                left,
+                right,
+                ..
+            } => self.is_string_literal_start(left) && is_zero(right),
+            _ => false,
+        }
+    }
+
     /// Whether an expression is a literal constant, with nothing to evaluate.
     ///
     /// Used to decide whether a discarded operand can be dropped outright or
@@ -345,7 +441,7 @@ impl Parser<'_> {
                 let type_pos = self.current_pos();
                 let (arg_type, dims) = self.parse_type_name_vm()?;
                 self.expect_special(b')')?;
-                if !self.check_va_arg_type(arg_type, dims.len(), type_pos) {
+                if !self.check_va_arg_type(arg_type, type_pos) {
                     return Ok(self.diagnosed_call(self.types.int_id, token_pos));
                 }
                 let value = Self::typed_expr(
@@ -444,7 +540,7 @@ impl Parser<'_> {
     /// type is an error; one the default argument promotions change can
     /// never match what a caller passed, a warning. `false` once the error is
     /// reported. Types are named unqualified, as gcc names them.
-    fn check_va_arg_type(&mut self, typ: TypeId, extents: usize, pos: Position) -> bool {
+    fn check_va_arg_type(&mut self, typ: TypeId, pos: Position) -> bool {
         let typ = self.types.unqualified(typ);
         let named = self.types.format_type(typ, Some(self.idents));
         if self.types.kind(typ) == TypeKind::Function {
@@ -455,7 +551,7 @@ impl Parser<'_> {
             );
             return false;
         }
-        if self.type_name_is_incomplete(typ, extents) {
+        if self.type_name_is_incomplete(typ) {
             diag::error_args(
                 pos,
                 "second argument to 'va_arg' is of incomplete type '{0}'",
@@ -495,12 +591,24 @@ impl Parser<'_> {
                 let cond_pos = self.current_pos();
                 let cond = self.parse_assignment_expr()?;
                 self.expect_special(b',')?;
+                let then_mark = self.reverse_atomic_mark();
                 let then_expr = self.parse_assignment_expr()?;
                 self.expect_special(b',')?;
+                let else_mark = self.reverse_atomic_mark();
                 let else_expr = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
                 match self.eval_const_expr(&cond) {
-                    Some(v) => Ok(if v != 0 { then_expr } else { else_expr }),
+                    Some(v) => {
+                        // The arm not chosen accesses nothing, as in gcc.
+                        let else_held = self.take_reverse_atomic_members(else_mark);
+                        if v != 0 {
+                            Ok(then_expr)
+                        } else {
+                            self.take_reverse_atomic_members(then_mark);
+                            self.reverse_atomic_members.extend(else_held);
+                            Ok(else_expr)
+                        }
+                    }
                     None => {
                         diag::error(
                             cond_pos,
@@ -516,13 +624,41 @@ impl Parser<'_> {
         }
     }
 
-    /// `alloca`, bare or reserved.
+    /// `alloca`, bare or reserved, the stack pointer's save and restore,
+    /// and `__builtin_clear_padding`.
     fn parse_memory_builtin(
         &mut self,
         name_id: StringId,
         token_pos: Position,
     ) -> Option<ParseResult<Expr>> {
         match name_id {
+            crate::kw::BUILTIN_STACK_SAVE => Some((|| {
+                // gcc's `void *__builtin_stack_save(void)`.
+                use super::library_builtin::ProtoType::VoidPtr;
+                let void_ptr = self.types.void_ptr_id;
+                if self
+                    .parse_prototyped_builtin(name_id, VoidPtr, &[], false)?
+                    .is_none()
+                {
+                    return Ok(self.diagnosed_call(void_ptr, token_pos));
+                }
+                Ok(Self::typed_expr(ExprKind::StackSave, void_ptr, token_pos))
+            })()),
+            crate::kw::BUILTIN_STACK_RESTORE => Some((|| {
+                // gcc's `void __builtin_stack_restore(void *)`.
+                use super::library_builtin::ProtoType::{Void, VoidPtr};
+                let void = self.types.void_id;
+                let args = self.parse_prototyped_builtin(name_id, Void, &[VoidPtr], false)?;
+                let Some(ptr) = args.and_then(|args| args.into_iter().next()) else {
+                    return Ok(self.diagnosed_call(void, token_pos));
+                };
+                Ok(Self::typed_expr(
+                    ExprKind::StackRestore { ptr: Box::new(ptr) },
+                    void,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_CLEAR_PADDING => Some(self.parse_clear_padding(token_pos)),
             crate::kw::BUILTIN_ALLOCA | crate::kw::ALLOCA => Some((|| {
                 // gcc's prototype is `void *(size_t)`, for either spelling.
                 use super::library_builtin::ProtoType::{SizeT, VoidPtr};
@@ -548,6 +684,10 @@ impl Parser<'_> {
         name_id: StringId,
         token_pos: Position,
     ) -> Option<ParseResult<Expr>> {
+        if let Some(&(_, real, complex, cexp)) = CEXPI_BUILTINS.iter().find(|row| row.0 == name_id)
+        {
+            return Some(self.parse_cexpi(name_id, real, complex, cexp, token_pos));
+        }
         if let Some(&(_, value, suffix)) = FLOAT_CONSTANT_BUILTINS
             .iter()
             .find(|(id, _, _)| *id == name_id)
@@ -612,35 +752,7 @@ impl Parser<'_> {
                 self.expect_special(b'(')?;
                 let arg = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
-                // Constant-ness, not integer-ness: `__builtin_constant_p(3.14)`
-                // is 1 in gcc. The integer folder deliberately refuses a
-                // floating literal, since 6.6 makes one an integer constant
-                // expression only as the operand of a cast, so the floating
-                // fold has to be asked as well.
-                let is_constant = self.eval_const_expr(&arg).is_some()
-                    || crate::constexpr::eval_float(
-                        self,
-                        crate::constexpr::ConstScope::Standard,
-                        &arg,
-                    )
-                    .is_some();
-                // Answering 1 here is final -- nothing later makes a constant
-                // unconstant. Answering 0 is not: gcc decides this *after*
-                // optimization, so `int x = 42; __builtin_constant_p(x)` is 1
-                // at `-O1` and above, and only propagation knows. What the
-                // parser cannot fold is deferred rather than refused.
-                //
-                // At `-O0` there is no optimization to wait for, and gcc
-                // answers 0 on the spot: the answer is then a constant, and
-                // `if (__builtin_constant_p(n))` drops its arm as any other
-                // constant condition does (gcc.c-torture 20030330-1).
-                let kind = if is_constant {
-                    ExprKind::IntLit(1)
-                } else if !self.library_call_policy.optimizing {
-                    ExprKind::IntLit(0)
-                } else {
-                    ExprKind::ConstantP(Box::new(arg))
-                };
+                let kind = self.constant_p(arg);
                 Ok(Self::typed_expr(kind, self.types.int_id, token_pos))
             })()),
             crate::kw::BUILTIN_EXPECT => Some((|| {
@@ -878,7 +990,10 @@ impl Parser<'_> {
                 let env = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
                 Ok(Self::typed_expr(
-                    ExprKind::Setjmp { env: Box::new(env) },
+                    ExprKind::Setjmp {
+                        env: Box::new(env),
+                        kind: JmpKind::Library,
+                    },
                     self.types.int_id,
                     token_pos,
                 ))
@@ -895,6 +1010,51 @@ impl Parser<'_> {
                     ExprKind::Longjmp {
                         env: Box::new(env),
                         val: Box::new(val),
+                        kind: JmpKind::Library,
+                    },
+                    self.types.void_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_SETJMP => Some((|| {
+                // gcc's `int __builtin_setjmp(void *)`: 0 directly, 1 when
+                // `__builtin_longjmp` resumes it.
+                use super::library_builtin::ProtoType::{Int, VoidPtr};
+                let args = self.parse_prototyped_builtin(name_id, Int, &[VoidPtr], false)?;
+                let Some(env) = args.and_then(|args| args.into_iter().next()) else {
+                    return Ok(self.diagnosed_call(self.types.int_id, token_pos));
+                };
+                Ok(Self::typed_expr(
+                    ExprKind::Setjmp {
+                        env: Box::new(env),
+                        kind: JmpKind::Builtin,
+                    },
+                    self.types.int_id,
+                    token_pos,
+                ))
+            })()),
+            crate::kw::BUILTIN_LONGJMP => Some((|| {
+                // gcc's `void __builtin_longjmp(void *, int)`. The value is
+                // not passed anywhere: the setjmp it resumes always returns
+                // 1, and gcc rejects any other.
+                use super::library_builtin::ProtoType::{Int, Void, VoidPtr};
+                let args = self.parse_prototyped_builtin(name_id, Void, &[VoidPtr, Int], false)?;
+                let Some([env, val]) = args.and_then(|args| <[Expr; 2]>::try_from(args).ok())
+                else {
+                    return Ok(self.diagnosed_call(self.types.void_id, token_pos));
+                };
+                if self.constant_argument(&val, 1..=1) != ConstantArgument::InRange(1) {
+                    diag::error(
+                        token_pos,
+                        &gettext("'__builtin_longjmp' second argument must be 1"),
+                    );
+                    return Ok(self.diagnosed_call(self.types.void_id, token_pos));
+                }
+                Ok(Self::typed_expr(
+                    ExprKind::Longjmp {
+                        env: Box::new(env),
+                        val: Box::new(val),
+                        kind: JmpKind::Builtin,
                     },
                     self.types.void_id,
                     token_pos,
@@ -2129,6 +2289,9 @@ impl Parser<'_> {
                 | crate::kw::BUILTIN_POW
                 | crate::kw::BUILTIN_POWF
                 | crate::kw::BUILTIN_POWL
+                | crate::kw::BUILTIN_CPOW
+                | crate::kw::BUILTIN_CPOWF
+                | crate::kw::BUILTIN_CPOWL
                 | crate::kw::BUILTIN_FMAL
                 | crate::kw::BUILTIN_BCMP
                 | crate::kw::BUILTIN_BZERO

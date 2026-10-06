@@ -11,6 +11,7 @@
 // the one declaration-specifier loop, in declaration.rs.
 //
 
+use super::aggregate::VariantAllowed;
 use super::ast::Expr;
 use super::declaration::SpecContext;
 use super::parser::{DeclaratorContext, ParseError, ParseResult, ParsedDeclarator, Parser};
@@ -67,8 +68,9 @@ impl Parser<'_> {
     /// A type-name together with the size expressions of its variably-modified
     /// array levels, outermost-first.
     ///
-    /// The size cannot be recovered afterwards: `int[n]`, `int[m]` and
-    /// `int[]` all intern to one `TypeId`. So whatever evaluates or measures
+    /// The size cannot be recovered afterwards: `int[n]` and `int[m]` intern
+    /// to one `TypeId`, whose extent says only that it is variable. So
+    /// whatever evaluates or measures
     /// the type keeps them -- `sizeof`, `typeof`, and a cast, compound literal
     /// or `va_arg`, whose value carries them
     /// ([`Self::with_type_name_extents`]); a caller that wants the type alone
@@ -151,6 +153,12 @@ impl Parser<'_> {
                 // right for one shape and wrong for another.
                 let mut dims = vla;
                 dims.extend(specs.vm_dims);
+                let typ = self.apply_written_storage_order(
+                    specs.written_order,
+                    base,
+                    typ,
+                    VariantAllowed::TypeName,
+                );
                 (self.apply_type_name_attrs(typ), dims)
             }
             // The declarator after a committed specifier-qualifier list is

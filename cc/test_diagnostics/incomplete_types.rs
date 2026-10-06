@@ -178,3 +178,96 @@ fn tagged_struct_in_member_list_is_not_a_member() {
         run.stderr
     );
 }
+
+/// C17 6.5.3.4p1: `sizeof` of an array of unknown size is refused however
+/// the array is reached -- through a pointer, a typedef, `__typeof__`, a
+/// flexible array member -- in gcc's words. The type used to be unable to
+/// tell `int[]` from a variable length array, so only a bare identifier was
+/// examined.
+#[test]
+fn sizeof_of_an_unknown_extent_is_rejected_however_reached() {
+    const MSG: &str = "invalid application of 'sizeof' to incomplete type 'int[]'";
+    let cases = [
+        (
+            "szu_deref_file",
+            "int (*q)[];\nunsigned long s = sizeof *q;\n",
+        ),
+        (
+            "szu_deref_fn",
+            "int (*q)[];\nunsigned long f(void) { return sizeof *q; }\n",
+        ),
+        (
+            "szu_deref_paren",
+            "unsigned long f(int (*q)[]) { return sizeof(*q); }\n",
+        ),
+        (
+            "szu_typeof",
+            "int (*q)[];\nunsigned long f(void) { return sizeof(__typeof__(*q)); }\n",
+        ),
+        ("szu_type_name", "unsigned long s = sizeof(int[]);\n"),
+        (
+            "szu_fam",
+            "struct S { int n; int fam[]; } s;\nunsigned long f(void) { return sizeof s.fam; }\n",
+        ),
+    ];
+    for (name, src) in cases {
+        compile_expect_error(name, src, MSG);
+    }
+}
+
+/// Stepping a pointer to an array of unknown size has no stride: gcc refuses
+/// a subscript and `+`, and so does c17, in gcc's words.
+#[test]
+fn arithmetic_on_a_pointer_to_an_unknown_extent_is_rejected() {
+    const MSG: &str = "invalid use of array with unspecified bounds";
+    let cases = [
+        (
+            "pau_index",
+            "int (*q)[];\nint f(void) { return q[1][0]; }\n",
+        ),
+        ("pau_add", "int (*q)[];\nvoid f(void) { (void)(q + 1); }\n"),
+        ("pau_inc", "int (*q)[];\nvoid f(void) { q++; }\n"),
+    ];
+    for (name, src) in cases {
+        compile_expect_error(name, src, MSG);
+    }
+}
+
+/// The accept side: a variable length array is complete, so its `sizeof`
+/// and `__typeof__` work through a pointer, a typedef and a type-name, and a
+/// pointer to one steps; and an array of unknown size may still be indexed
+/// once dereferenced, or assigned to and from a pointer to a sized array.
+#[test]
+fn variable_and_unknown_extents_accept_side() {
+    let cases = [
+        (
+            "vla_ext_deref",
+            "unsigned long f(int n) { int (*q)[n] = 0; return sizeof *q; }\n",
+        ),
+        (
+            "vla_ext_typeof",
+            "unsigned long f(int n) { int (*q)[n] = 0; __typeof__(*q) z; \
+             return sizeof z + sizeof(__typeof__(*q)); }\n",
+        ),
+        (
+            "vla_ext_typedef",
+            "unsigned long f(int n) { typedef int T[n]; T a; return sizeof a; }\n",
+        ),
+        (
+            "vla_ext_step",
+            "int f(int n) { int (*q)[n] = 0; q++; q += 2; return q[1][0]; }\n",
+        ),
+        (
+            "unknown_ext_use",
+            "int (*q)[];\nint (*r)[3];\n\
+             int f(void) { r = q; q = r; return (*q)[1]; }\n",
+        ),
+        (
+            "unknown_ext_ptr_typeof",
+            "int (*q)[];\nvoid f(void) { __typeof__(*q) *zp = q; (void)zp; }\n",
+        ),
+    ];
+    for (name, src) in cases {
+        compile_expect_ok(name, src);
+    }
+}

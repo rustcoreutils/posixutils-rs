@@ -26,8 +26,8 @@ use crate::ir::loadfwd;
 use crate::ir::mem2reg::mem2reg;
 use crate::ir::memexpand;
 use crate::ir::memloc;
+use crate::ir::objsize::{self, ObjectSizes, Settle};
 use crate::ir::sccp;
-use crate::ir::strdata::ConstBytes;
 use crate::ir::vrp;
 use crate::ir::{Function, Module, Opcode};
 use crate::target::Target;
@@ -157,6 +157,8 @@ struct PassCtx<'a> {
     known: &'a constglobal::KnownGlobals,
     mi: &'a memloc::ModuleInfo,
     fold: &'a libcall_fold::FoldCtx<'a>,
+    /// The sizes of the module's named objects, for `objsize`.
+    sizes: &'a ObjectSizes,
 }
 
 /// One per-function pass: its name, and a run that answers whether it
@@ -165,7 +167,7 @@ type Pass = (&'static str, fn(&mut Function, &PassCtx) -> bool);
 
 /// The fixed-point loop's passes, in order. The order is load-bearing: each
 /// pass hands the next one a shape it could not have seen for itself.
-const PASSES: [Pass; 12] = [
+const PASSES: [Pass; 13] = [
     // `constglobal` before anything looks at a value: a load of a `const`
     // global becomes its initializer, which every pass below treats as the
     // constant it is.
@@ -194,6 +196,14 @@ const PASSES: [Pass; 12] = [
     // block, which is what makes the two relationals inside it comparable
     // at all.
     ("ifconv", |f, c| ifconv::run(f, c.types)),
+    // `objsize` answers each `__builtin_object_size` whose object the
+    // passes above have uncovered -- a load forwarded, a choice collapsed --
+    // so that `sccp` sees its answer as the constant it is, and
+    // `libcall_fold` sees the size a `_chk` call checks against. One whose
+    // object is still unknown waits for the end: see `optimize_function`.
+    ("objsize", |f, c| {
+        objsize::run(f, c.types, c.sizes, Settle::Known)
+    }),
     // `sccp` proves branches dead, which `instcombine` cannot, and leaves
     // behind `Copy` from a constant -- exactly the shape `instcombine`'s
     // `ConstMap` follows.
@@ -225,7 +235,7 @@ const PASSES: [Pass; 12] = [
 /// emits, so it should see the code that will be emitted -- not branches
 /// SCCP is about to delete or copies `copyprop` is about to forward.
 const BEFORE_INLINING: [fn(&mut Function, &TypeTable) -> bool; 5] = [
-    |f, _| sccp::run(f),
+    |f, _| sccp::run_before_inlining(f),
     instcombine::run,
     copyprop::run,
     |f, _| dce::run(f),
@@ -584,14 +594,14 @@ fn optimize_functions(
     // graph and the set of globals are final.
     let known = constglobal::KnownGlobals::collect(module, types);
     let mi = memloc::ModuleInfo::build(module, types);
-    let bytes = ConstBytes::build(module, types);
+    let sizes = ObjectSizes::build(module, types);
     let (functions, strings, callees) = module.split_for_rewrite();
     let literals = libcall_fold::NewLiterals::new(strings);
     let fold = libcall_fold::FoldCtx {
         types,
         target,
         mi: &mi,
-        bytes: &bytes,
+        bytes: known.bytes(),
         callees,
         literals: &literals,
     };
@@ -600,6 +610,7 @@ fn optimize_functions(
         known: &known,
         mi: &mi,
         fold: &fold,
+        sizes: &sizes,
     };
     let mut report = OptReport::default();
     for func in functions {
@@ -615,6 +626,12 @@ fn optimize_functions(
 
 /// Optimize a single function by running `PASSES` until none changes it, or
 /// for `max_iterations` rounds.
+///
+/// A `__builtin_object_size` whose object is still unknown when nothing
+/// changes any more is unknown for good, and is answered so -- `(size_t)-1`
+/// or 0 -- after which the passes run to a fixed point again: the answer is
+/// what lets `libcall_fold` turn a `_chk` call of an unknown size into the
+/// plain call, which may fold in turn.
 fn optimize_function(func: &mut Function, ctx: &PassCtx, max_iterations: usize) -> Convergence {
     let mut c = Convergence {
         function: func.name.clone(),
@@ -622,6 +639,16 @@ fn optimize_function(func: &mut Function, ctx: &PassCtx, max_iterations: usize) 
         changes: [0; PASSES.len()],
         still_changing: Vec::new(),
     };
+    run_passes(func, ctx, max_iterations, &mut c);
+    if objsize::run(func, ctx.types, ctx.sizes, Settle::Everything) {
+        run_passes(func, ctx, max_iterations, &mut c);
+    }
+    c
+}
+
+/// Run `PASSES` over `func` until none changes it, or for `max_iterations`
+/// rounds, recording how it went in `c`.
+fn run_passes(func: &mut Function, ctx: &PassCtx, max_iterations: usize, c: &mut Convergence) {
     for _ in 0..max_iterations {
         c.iterations += 1;
         c.still_changing.clear();
@@ -639,7 +666,6 @@ fn optimize_function(func: &mut Function, ctx: &PassCtx, max_iterations: usize) 
             break;
         }
     }
-    c
 }
 
 #[cfg(test)]
@@ -709,6 +735,41 @@ mod tests {
         let mut module = Module::default();
         module.functions.extend([count, main]);
         module
+    }
+
+    /// The resume point of a `__builtin_setjmp` is inside the instruction,
+    /// so the optimizer sees an ordinary instruction whose result it cannot
+    /// know: at -O2 the setjmp survives as the builtin, and so do both arms
+    /// of the branch on its result -- the one only a `__builtin_longjmp`
+    /// reaches included.
+    #[test]
+    fn builtin_setjmp_and_its_resume_arm_survive_optimization() {
+        let src = r#"
+void *buf[5];
+extern void g(void);
+int f(void) { if (__builtin_setjmp(buf)) return 7; g(); return 0; }
+"#;
+        for target in [
+            Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux),
+            Target::new(crate::target::Arch::Aarch64, crate::target::Os::Linux),
+        ] {
+            let (mut module, types) =
+                crate::ir::linearize::test_linearize::linearize_source_with_types(src, &target);
+            let opt = Optimization::from_flag("2").expect("valid level");
+            optimize_module(&mut module, &types, opt, &target);
+            let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+            assert!(f.receives_nonlocal_goto(), "the builtin setjmp was removed");
+            let insns: Vec<&Instruction> = f.blocks.iter().flat_map(|b| &b.insns).collect();
+            assert!(
+                insns.iter().any(|i| i.local_callee() == Some("g")),
+                "the direct arm was removed"
+            );
+            let sevens = f
+                .pseudos
+                .iter()
+                .any(|p| matches!(p.kind, crate::ir::PseudoKind::Val(7)));
+            assert!(sevens, "the resume arm's `return 7` was removed");
+        }
     }
 
     /// A taken address is found where it is taken, a call is not an address,

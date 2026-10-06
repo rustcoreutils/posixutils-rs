@@ -148,14 +148,8 @@ impl Parser<'_> {
         callee: Option<StringId>,
         args: &[Expr],
     ) -> bool {
-        // A vector argument goes by value under gcc, in vector registers; the
-        // array model would pass its address. Checked for every argument,
-        // prototyped or not.
         let mut sound = true;
         for arg in args {
-            if self.check_not_vector_value(arg.typ, arg.pos) {
-                sound = false;
-            }
             // An argument is a value (C17 6.5.2.2p4), which a void
             // expression is not -- under a prototype or not.
             // `__builtin_va_arg_pack()` stands for the caller's arguments.
@@ -183,7 +177,7 @@ impl Parser<'_> {
             // C17 6.5.2.2p4 assigns the argument to the parameter, which
             // needs an object of the parameter's type; a prototype may name an
             // incomplete one, but a call cannot be made through it.
-            if self.type_name_is_incomplete(param, 0) && self.types.kind(param) != TypeKind::Void {
+            if self.type_name_is_incomplete(param) && self.types.kind(param) != TypeKind::Void {
                 let n = (i + 1).to_string();
                 diag::error_args(arg.pos, "type of formal parameter {0} is incomplete", &[&n]);
                 sound = false;
@@ -371,28 +365,6 @@ impl Parser<'_> {
         is_void
     }
 
-    /// Refuse a `vector_size` value as a function's argument, parameter or
-    /// return value when the target's convention has no type that travels as
-    /// gcc passes it (`Abi::vector_carrier`): a one-lane `float` vector on
-    /// aarch64, which gcc passes on the stack with the arguments after it and
-    /// returns in a general register. Every other vector goes as its carrier.
-    pub(super) fn check_not_vector_value(&self, typ: Option<TypeId>, pos: Position) -> bool {
-        let Some(t) = typ.filter(|&t| self.types.is_vector(t)) else {
-            return false;
-        };
-        let target = self.types.target();
-        let unpassable = crate::abi::get_abi(&target)
-            .vector_carrier(t, self.types)
-            .is_none();
-        if unpassable {
-            diag::error(
-                pos,
-                &gettext("c17 does not pass or return this vector type on this target"),
-            );
-        }
-        unpassable
-    }
-
     /// Check the operand of a unary operator against the type its operator
     /// requires (C17 6.5.3.3p1, 6.5.2.4p1, 6.5.3.1p1).
     ///
@@ -436,8 +408,16 @@ impl Parser<'_> {
         let Some(pointee) = self.types.base_type(typ) else {
             return true;
         };
-        // An unsized array pointee is not tested: the type table interns
-        // `int[n]` and `int[]` alike, and stepping over the former is C.
+        // An array of unknown size has no size to step by; a variable length
+        // one does, at run time, and stepping over it is C. gcc words the
+        // former its own way for a subscript and for `+`.
+        if self.types.is_incomplete_array(pointee) {
+            diag::error(
+                pos,
+                &gettext("invalid use of array with unspecified bounds"),
+            );
+            return false;
+        }
         let incomplete = matches!(
             self.types.kind(pointee),
             TypeKind::Struct | TypeKind::Union | TypeKind::Enum
@@ -909,7 +889,7 @@ impl Parser<'_> {
     /// terminating null then has no room, and is dropped -- but may not
     /// overrun it. gcc warns and truncates, and so does c17.
     fn check_string_fits_array(&self, target: TypeId, init: &Expr) {
-        let Some(capacity) = self.types.array_size(target).filter(|&n| n > 0) else {
+        let Some(capacity) = self.types.array_extent(target).known().filter(|&n| n > 0) else {
             return;
         };
         let units = match &init.kind {
@@ -989,12 +969,15 @@ impl Parser<'_> {
     /// An integer constant expression may cast only arithmetic types to
     /// integer types (C17 6.6p6), so `(int)(char *)0` folds to zero but is no
     /// integer constant expression, and so no null pointer constant. The
-    /// operand of `sizeof`, `_Alignof` and `__builtin_constant_p` is not
-    /// evaluated, and may be anything.
+    /// operand of `sizeof`, `_Alignof`, `__builtin_constant_p` and
+    /// `__builtin_object_size` is not evaluated, and may be anything.
     fn evaluates_a_pointer(&self, expr: &Expr) -> bool {
         if matches!(
             expr.kind,
-            ExprKind::SizeofExpr(_) | ExprKind::AlignofExpr(_) | ExprKind::ConstantP(_)
+            ExprKind::SizeofExpr(_)
+                | ExprKind::AlignofExpr(_)
+                | ExprKind::ConstantP(_)
+                | ExprKind::ObjectSize { .. }
         ) {
             return false;
         }
@@ -1094,6 +1077,9 @@ impl Parser<'_> {
             );
             return;
         }
+        if self.check_reverse_order_address(operand, pos) {
+            return;
+        }
         // The address of a member is the address of the object it is in, so
         // `&s.a` of a `register` structure asks for the register's.
         let mut root = operand;
@@ -1117,6 +1103,109 @@ impl Parser<'_> {
                 pos,
                 "address of register variable '{0}' requested",
                 &[&name],
+            );
+        }
+    }
+
+    /// gcc's restrictions on the address of an object stored in reverse
+    /// byte order (`scalar_storage_order`), which a pointer type cannot
+    /// carry: a scalar's address is an error, and an array of them draws a
+    /// warning, since gcc lets one be taken for a block copy. A struct or
+    /// union's own address is fine. True when the address was refused.
+    fn check_reverse_order_address(&self, operand: &Expr, pos: Position) -> bool {
+        let Some(typ) = operand.typ else {
+            return false;
+        };
+        if self.types.reverses_storage(typ) {
+            diag::error(
+                pos,
+                &gettext("cannot take address of scalar with reverse storage order"),
+            );
+            return true;
+        }
+        let is_array = self.types.kind(typ) == TypeKind::Array && !self.types.is_vector(typ);
+        if is_array
+            && self
+                .types
+                .reverses_storage(self.types.innermost_element(typ))
+            && diag::warning_group_enabled("scalar-storage-order")
+        {
+            diag::warning(
+                pos,
+                &gettext("address of array with reverse scalar storage order requested"),
+            );
+        }
+        false
+    }
+
+    /// Is `expr` a member access naming an `_Atomic` scalar stored in reverse
+    /// byte order?
+    fn is_reverse_atomic_member(&self, expr: &Expr) -> bool {
+        matches!(expr.kind, ExprKind::Member { .. } | ExprKind::Arrow { .. })
+            && expr
+                .typ
+                .is_some_and(|t| self.types.is_atomic(t) && self.types.reverses_storage(t))
+    }
+
+    /// Record a member access just built, if it names an `_Atomic` scalar of
+    /// a `scalar_storage_order` structure stored in reverse order.
+    ///
+    /// Every access to such an object is an atomic operation on its address,
+    /// which a reversed scalar does not have, so gcc refuses each one: a read,
+    /// a write, a compound assignment, `++` and `--` -- even in an operand
+    /// that is never evaluated, `sizeof (s.a + 1)`. What it allows is the
+    /// member as the *whole* operand of `sizeof`, `_Alignof`, `typeof` or a
+    /// `_Generic` controlling expression, which read nothing, and in an
+    /// association or `__builtin_choose_expr` arm that is not selected.
+    ///
+    /// Postfix parsing cannot know which of these it is in, so the access is
+    /// held here until those operators have had the chance to clear it
+    /// ([`Self::exempt_reverse_atomic_operand`],
+    /// [`Self::take_reverse_atomic_members`]), and whatever remains is
+    /// reported by [`Self::report_reverse_atomic_members`].
+    ///
+    /// An element of an `_Atomic` array member is not held: gcc reads and
+    /// writes it as an ordinary reversed scalar.
+    pub(super) fn note_reverse_atomic_member(&mut self, expr: &Expr) {
+        if self.is_reverse_atomic_member(expr) {
+            self.reverse_atomic_members.push(expr.pos);
+        }
+    }
+
+    /// `operand` is the whole operand of an operator that does not access
+    /// it; if it is a member [`Self::note_reverse_atomic_member`] held, it
+    /// was the last one held, and is no access after all.
+    pub(super) fn exempt_reverse_atomic_operand(&mut self, operand: &Expr) {
+        if self.is_reverse_atomic_member(operand)
+            && self.reverse_atomic_members.last() == Some(&operand.pos)
+        {
+            self.reverse_atomic_members.pop();
+        }
+    }
+
+    /// How many members are held, to pass to
+    /// [`Self::take_reverse_atomic_members`] once an operand is parsed.
+    pub(super) fn reverse_atomic_mark(&self) -> usize {
+        self.reverse_atomic_members.len()
+    }
+
+    /// The members held since `mark`, removed: an operand that is not
+    /// evaluated, or one parsed and then abandoned, gives them up, and a
+    /// `_Generic` association puts its own back once it is selected.
+    pub(super) fn take_reverse_atomic_members(&mut self, mark: usize) -> Vec<Position> {
+        let mark = mark.min(self.reverse_atomic_members.len());
+        self.reverse_atomic_members.split_off(mark)
+    }
+
+    /// Report every member access still held: each one reads or writes the
+    /// object. A tentative parse that was rewound may have held one twice.
+    pub(super) fn report_reverse_atomic_members(&mut self) {
+        let mut held = std::mem::take(&mut self.reverse_atomic_members);
+        held.dedup();
+        for pos in held {
+            diag::error(
+                pos,
+                &gettext("cannot take address of scalar with reverse storage order"),
             );
         }
     }

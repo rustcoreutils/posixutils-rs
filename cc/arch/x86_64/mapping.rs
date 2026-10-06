@@ -112,7 +112,7 @@ impl X86_64Mapper {
                 let src_kind = types.kind(src_typ);
                 let dst_kind = types.kind(dst_typ);
                 if src_kind == TypeKind::Float16 {
-                    let to_suffix = float_suffix(dst_kind, ctx.target);
+                    let to_suffix = float_suffix(types, dst_typ);
                     let rtlib = RtlibNames::new(ctx.target);
                     let func_name = rtlib.float16_convert("hf", to_suffix)?;
                     let call = build_f16_convert_call(
@@ -120,7 +120,7 @@ impl X86_64Mapper {
                     );
                     Some(MappedInsn::Replace(vec![call]))
                 } else if dst_kind == TypeKind::Float16 {
-                    let from_suffix = float_suffix(src_kind, ctx.target);
+                    let from_suffix = float_suffix(types, src_typ);
                     let rtlib = RtlibNames::new(ctx.target);
                     let func_name = rtlib.float16_convert(from_suffix, "hf")?;
                     let call = build_f16_convert_call(

@@ -79,6 +79,8 @@ pub struct CodegenOptions<'a> {
     pub unwind_tables: bool,
     /// `-fverbose-asm`.
     pub verbose_asm: bool,
+    /// `-fcf-protection`.
+    pub cf_protection: crate::target::CfProtection,
     /// The name DWARF records for the primary source file.
     pub source_name: &'a str,
     /// `-fdebug-prefix-map`: rewrites every path the debug information and
@@ -149,7 +151,7 @@ pub fn compile_tokens(
     // point at which the order is the translation unit's own -- an include is
     // preprocessed separately and spliced in, so nothing recorded earlier
     // survives with a usable index.
-    let pack_directives = token::preprocess::extract_pragma_directives(&mut preprocessed);
+    let layout_pragmas = token::preprocess::extract_pragma_directives(&mut preprocessed);
 
     // Parse (this also binds symbols to the symbol table)
     let mut parser = Parser::new(
@@ -157,7 +159,7 @@ pub fn compile_tokens(
         strings,
         &mut symbols,
         &mut types,
-        pack_directives,
+        layout_pragmas,
     );
     parser.set_library_call_policy(parse::LibraryCallPolicy {
         optimizing: opts.optimization.optimizes(),
@@ -278,6 +280,7 @@ pub fn compile_tokens(
         opts.pic,
         opts.shared_mode,
         opts.verbose_asm,
+        opts.cf_protection,
     );
     let asm = codegen.generate(&module, &types);
 

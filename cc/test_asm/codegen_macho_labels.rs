@@ -56,7 +56,7 @@ fn codegen_macho_private_labels_use_the_l_prefix() {
                 "{triple} {opts:?}: `.L` names are ordinary symbols on Mach-O:\n{}",
                 leaked.join("\n")
             );
-            for label in ["\nLepilogue_", "\nLC0:", "\nLdispatch_"] {
+            for label in ["\nLepilogue_", "\nLC0:", "\nLdispatch_", "\nL.sjlj_resume."] {
                 assert!(
                     asm.contains(label),
                     "{triple} {opts:?}: expected a private label `{}`:\n{asm}",
@@ -72,6 +72,7 @@ fn codegen_macho_private_labels_use_the_l_prefix() {
             "\n.LC0:",
             "\n.Ldispatch_",
             "\n.Ldebug_line0:",
+            "\n.L.sjlj_resume.",
         ] {
             assert!(
                 asm.contains(label),

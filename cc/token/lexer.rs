@@ -931,14 +931,29 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
     }
 
     /// Skip whitespace, tracking whitespace/newline flags
+    ///
+    /// A null character between tokens is no source character C17 5.2.1
+    /// names; gcc ignores it as whitespace with a warning, once per run of
+    /// them, and so does this.
     fn skip_whitespace(&mut self) -> i32 {
+        let mut nul_run = false;
         loop {
             let c = self.nextchar();
             if c == EOF {
                 return EOF;
             }
+            let was_nul_run = std::mem::take(&mut nul_run);
             match c as u8 {
                 b' ' | b'\t' | b'\x0C' | b'\x0B' => {
+                    self.whitespace = true;
+                }
+                b'\0' => {
+                    if !was_nul_run {
+                        let mut pos = self.pos();
+                        pos.col = pos.col.saturating_sub(1);
+                        diag::warning(pos, &gettext("null character(s) ignored"));
+                    }
+                    nul_run = true;
                     self.whitespace = true;
                 }
                 b'\n' => {

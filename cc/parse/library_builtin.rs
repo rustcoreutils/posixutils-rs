@@ -504,6 +504,9 @@ static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
         plain(kw::POW,              Double,            &[Double, Double],        FIXED),
         plain(kw::POWF,             Float,             &[Float, Float],          FIXED),
         plain(kw::POWL,             LongDouble,        &[LongDouble, LongDouble], FIXED),
+        plain(kw::CPOW,             ComplexDouble,     &[ComplexDouble, ComplexDouble], FIXED),
+        plain(kw::CPOWF,            ComplexFloat,      &[ComplexFloat, ComplexFloat], FIXED),
+        plain(kw::CPOWL,            ComplexLongDouble, &[ComplexLongDouble, ComplexLongDouble], FIXED),
         plain(kw::FMOD,             Double,            &[Double, Double],        FIXED),
         plain(kw::FMODF,            Float,             &[Float, Float],          FIXED),
         plain(kw::FMODL,            LongDouble,        &[LongDouble, LongDouble], FIXED),
@@ -545,20 +548,22 @@ static LIBRARY_BUILTINS: &[LibraryBuiltin] = {
         plain(kw::NANF128,          Float128,          &[ConstCharPtr],          FIXED),
         plain(kw::SQRTF128,         Float128,          &[Float128],              FIXED),
         plain(kw::FMAF128,          Float128,          &[Float128, Float128, Float128], FIXED),
-        plain(kw::MEMCPY_CHK,       VoidPtr,           &[VoidPtr, ConstVoidPtr, SizeT, SizeT], FIXED),
-        plain(kw::MEMMOVE_CHK,      VoidPtr,           &[VoidPtr, ConstVoidPtr, SizeT, SizeT], FIXED),
-        plain(kw::MEMPCPY_CHK,      VoidPtr,           &[VoidPtr, ConstVoidPtr, SizeT, SizeT], FIXED),
-        plain(kw::MEMSET_CHK,       VoidPtr,           &[VoidPtr, Int, SizeT, SizeT], FIXED),
-        plain(kw::STRCPY_CHK,       CharPtr,           &[CharPtr, ConstCharPtr, SizeT], FIXED),
-        plain(kw::STPCPY_CHK,       CharPtr,           &[CharPtr, ConstCharPtr, SizeT], FIXED),
-        plain(kw::STRCAT_CHK,       CharPtr,           &[CharPtr, ConstCharPtr, SizeT], FIXED),
-        plain(kw::STRNCPY_CHK,      CharPtr,           &[CharPtr, ConstCharPtr, SizeT, SizeT], FIXED),
-        plain(kw::STPNCPY_CHK,      CharPtr,           &[CharPtr, ConstCharPtr, SizeT, SizeT], FIXED),
-        plain(kw::STRNCAT_CHK,      CharPtr,           &[CharPtr, ConstCharPtr, SizeT, SizeT], FIXED),
-        plain(kw::SPRINTF_CHK,      Int,               &[CharPtr, Int, SizeT, ConstCharPtr], VARIADIC),
-        plain(kw::SNPRINTF_CHK,     Int,               &[CharPtr, SizeT, Int, SizeT, ConstCharPtr], VARIADIC),
-        plain(kw::VSPRINTF_CHK,     Int,               &[CharPtr, Int, SizeT, ConstCharPtr, VaList], FIXED),
-        plain(kw::VSNPRINTF_CHK,    Int,               &[CharPtr, SizeT, Int, SizeT, ConstCharPtr, VaList], FIXED),
+        //    name               returns      parameters                                            `...`     calls
+        known(kw::MEMCPY_CHK,    VoidPtr,     &[VoidPtr, ConstVoidPtr, SizeT, SizeT],               FIXED,    L::MemcpyChk),
+        known(kw::MEMMOVE_CHK,   VoidPtr,     &[VoidPtr, ConstVoidPtr, SizeT, SizeT],               FIXED,    L::MemmoveChk),
+        known(kw::MEMPCPY_CHK,   VoidPtr,     &[VoidPtr, ConstVoidPtr, SizeT, SizeT],               FIXED,    L::MempcpyChk),
+        known(kw::MEMSET_CHK,    VoidPtr,     &[VoidPtr, Int, SizeT, SizeT],                        FIXED,    L::MemsetChk),
+        known(kw::STRCPY_CHK,    CharPtr,     &[CharPtr, ConstCharPtr, SizeT],                      FIXED,    L::StrcpyChk),
+        known(kw::STPCPY_CHK,    CharPtr,     &[CharPtr, ConstCharPtr, SizeT],                      FIXED,    L::StpcpyChk),
+        known(kw::STRCAT_CHK,    CharPtr,     &[CharPtr, ConstCharPtr, SizeT],                      FIXED,    L::StrcatChk),
+        known(kw::STRNCPY_CHK,   CharPtr,     &[CharPtr, ConstCharPtr, SizeT, SizeT],               FIXED,    L::StrncpyChk),
+        known(kw::STPNCPY_CHK,   CharPtr,     &[CharPtr, ConstCharPtr, SizeT, SizeT],               FIXED,    L::StpncpyChk),
+        known(kw::STRNCAT_CHK,   CharPtr,     &[CharPtr, ConstCharPtr, SizeT, SizeT],               FIXED,    L::StrncatChk),
+        known(kw::SPRINTF_CHK,   Int,         &[CharPtr, Int, SizeT, ConstCharPtr],                 VARIADIC, L::SprintfChk),
+        known(kw::SNPRINTF_CHK,  Int,         &[CharPtr, SizeT, Int, SizeT, ConstCharPtr],          VARIADIC, L::SnprintfChk),
+        known(kw::VSPRINTF_CHK,  Int,         &[CharPtr, Int, SizeT, ConstCharPtr, VaList],         FIXED,    L::VsprintfChk),
+        known(kw::VSNPRINTF_CHK, Int,         &[CharPtr, SizeT, Int, SizeT, ConstCharPtr, VaList],  FIXED,    L::VsnprintfChk),
+        //    name               returns           parameters                                   `...`
         plain(kw::SNPRINTF,         Int,               &[CharPtr, SizeT, ConstCharPtr], VARIADIC),
         plain(kw::BCMP,             Int,               &[ConstVoidPtr, ConstVoidPtr, SizeT], FIXED),
         plain(kw::BZERO,            Void,              &[VoidPtr, SizeT],        FIXED),
@@ -582,11 +587,21 @@ impl LibFn {
     /// The type the function returns: what a call an optimizer pass makes
     /// to it answers.
     pub fn return_type(self, t: &TypeTable) -> TypeId {
+        self.row().return_type(t)
+    }
+
+    /// How many parameters the prototype names, before any `...`.
+    #[cfg(test)]
+    pub fn param_count(self) -> usize {
+        self.row().params.len()
+    }
+
+    /// The function's row in the library-builtin table.
+    fn row(self) -> &'static LibraryBuiltin {
         LIBRARY_BUILTINS
             .iter()
             .find(|lb| lb.called() == Some(self))
             .expect("every LibFn a program can call has a row")
-            .return_type(t)
     }
 }
 
@@ -994,8 +1009,15 @@ mod tests {
             assert_eq!(f.only_reads(), f.family() == K::StringQuery, "{f:?}");
         }
         let count = |k| all.iter().filter(|f| f.family() == k).count();
-        let sizes = [K::StringQuery, K::StringWrite, K::Output, K::ComplexArith].map(count);
-        assert_eq!(sizes, [11, 6, 16, 2]);
+        let sizes = [
+            K::StringQuery,
+            K::StringWrite,
+            K::Output,
+            K::ComplexArith,
+            K::Fortified,
+        ]
+        .map(count);
+        assert_eq!(sizes, [11, 6, 16, 2, 14]);
         assert_eq!(sizes.iter().sum::<usize>(), all.len());
     }
 

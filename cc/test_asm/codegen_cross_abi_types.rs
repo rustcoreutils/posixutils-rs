@@ -168,6 +168,38 @@ fn codegen_aarch64_darwin_long_double_stays_double() {
     );
 }
 
+/// A conversion between `long double` and `__int128` is a libgcc call named
+/// by the floating format, and Darwin's `long double` is binary64: the call
+/// is `__fixdfti`/`__floattidf`, never the binary128 `tf` routine, which
+/// Apple's runtime does not have (the link failed on macOS). aarch64 Linux,
+/// whose `long double` is binary128, keeps `tf`.
+#[test]
+fn codegen_darwin_long_double_int128_conversions_use_double_routines() {
+    let src = r#"
+        __int128 s(long double x) { return x; }
+        unsigned __int128 u(long double x) { return x; }
+        long double fs(__int128 i) { return i; }
+        long double fu(unsigned __int128 i) { return i; }
+    "#;
+    let cases = [
+        ("s", "fixdfti", "fixtfti"),
+        ("u", "fixunsdfti", "fixunstfti"),
+        ("fs", "floattidf", "floattitf"),
+        ("fu", "floatuntidf", "floatuntitf"),
+    ];
+    let darwin = asm_for("ld_i128_darwin", AARCH64_DARWIN, src);
+    let linux = asm_for("ld_i128_linux", AARCH64_LINUX, src);
+    for (f, df, tf) in cases {
+        let body = body_of(&darwin, f);
+        assert!(
+            body.contains(df) && !body.contains(tf),
+            "Darwin {f} must call __{df}:\n{body}"
+        );
+        let body = body_of(&linux, f);
+        assert!(body.contains(tf), "Linux {f} must call __{tf}:\n{body}");
+    }
+}
+
 /// `long double _Complex` used to panic the compiler outright -- the codegen
 /// reached an `unreachable!("x87 extended not available on AArch64")` because
 /// `complex_fp_info` answered `Extended` for a 128-bit base.

@@ -15,6 +15,7 @@ use super::ast::ExprKind;
 use super::parser::Parser;
 use crate::diag;
 use crate::symbol::Namespace;
+use crate::target::ByteOrder;
 use crate::token::lexer::{payload_text, Position, TokenType};
 use crate::types::{TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
@@ -152,10 +153,16 @@ impl IntArgRole {
                 pos,
                 &gettext("'vector_size' attribute argument is not an integer constant"),
             ),
-            (IntArgRole::VectorSize, _) => diag::error(
-                pos,
-                &gettext("'vector_size' requires a positive byte count"),
-            ),
+            (IntArgRole::VectorSize, IntArgFault::Zero) => {
+                diag::error(pos, &gettext("zero vector size"))
+            }
+            (IntArgRole::VectorSize, IntArgFault::OutOfRange(n) | IntArgFault::TooLarge(n)) => {
+                diag::error_args(
+                    pos,
+                    "'vector_size' attribute argument value '{0}' is negative",
+                    &[&n.to_string()],
+                )
+            }
             (IntArgRole::Priority, _) => diag::error_args(
                 pos,
                 "{0} priorities must be integers from 0 to 65535 inclusive",
@@ -293,6 +300,34 @@ impl AttributeList {
     /// `__attribute__((packed))`, in either spelling.
     pub(super) fn has_packed(&self) -> bool {
         self.has_attr("packed")
+    }
+
+    /// The byte order `__attribute__((scalar_storage_order("...")))` names,
+    /// or `None` when the attribute is absent.
+    ///
+    /// An argument that names no order is gcc's error, reported here, and
+    /// the attribute is then ignored.
+    pub(super) fn storage_order(&self, pos: Position) -> Option<ByteOrder> {
+        let attr = self.find("scalar_storage_order")?;
+        match attr.args.as_slice() {
+            [AttributeArg::String(s)] if s == "big-endian" => Some(ByteOrder::BigEndian),
+            [AttributeArg::String(s)] if s == "little-endian" => Some(ByteOrder::LittleEndian),
+            [_] => {
+                diag::error(
+                    pos,
+                    "attribute 'scalar_storage_order' argument must be one of 'big-endian' or 'little-endian'",
+                );
+                None
+            }
+            _ => {
+                diag::error_args(
+                    pos,
+                    "wrong number of arguments specified for '{0}' attribute",
+                    &["scalar_storage_order"],
+                );
+                None
+            }
+        }
     }
 
     /// Whether an attribute is present, in either spelling.
@@ -632,7 +667,8 @@ impl Parser<'_> {
                 Some(IntArgFault::TooLarge(n))
             }
             (IntArgRole::VectorSize, None) => Some(IntArgFault::Count),
-            (IntArgRole::VectorSize, Some(n)) if n <= 0 => Some(IntArgFault::OutOfRange(n)),
+            (IntArgRole::VectorSize, Some(0)) => Some(IntArgFault::Zero),
+            (IntArgRole::VectorSize, Some(n)) if n < 0 => Some(IntArgFault::OutOfRange(n)),
             (IntArgRole::Priority, Some(n)) if !(0..=i128::from(u16::MAX)).contains(&n) => {
                 Some(IntArgFault::OutOfRange(n))
             }
@@ -969,8 +1005,16 @@ impl Parser<'_> {
             return typ;
         };
         let elem_size = self.types.size_bytes(typ);
-        if elem_size == 0 || !self.types.is_arithmetic(typ) {
-            diag::error(pos, "'vector_size' requires an arithmetic element type");
+        // A lane is a real number: no complex type, and no `_Bool`.
+        let t = &*self.types;
+        let lane = (t.is_integer(typ) || t.is_float(typ))
+            && !t.is_complex(typ)
+            && t.kind(typ) != TypeKind::Bool;
+        if elem_size == 0 || !lane {
+            diag::error(
+                pos,
+                &gettext("invalid vector type for attribute 'vector_size'"),
+            );
             return typ;
         }
         // The same ceiling `derive_array_type` applies, and for the same
@@ -988,15 +1032,23 @@ impl Parser<'_> {
             return typ;
         }
         if bytes % elem_size as u64 != 0 {
-            let named = self.types.format_type(typ, Some(self.idents));
-            diag::error_args(
+            diag::error(
                 pos,
-                "'vector_size' of {0} is not a multiple of sizeof({1})",
-                &[&bytes.to_string(), &named],
+                &gettext("vector size not an integral multiple of component size"),
             );
             return typ;
         }
+        // gcc refuses any other lane count at the declaration, so every
+        // vector a convention has to pass is one of its widths.
         let count = bytes / elem_size as u64;
+        if !count.is_power_of_two() {
+            diag::error_args(
+                pos,
+                "number of vector components {0} not a power of two",
+                &[&count.to_string()],
+            );
+            return typ;
+        }
         // An `aligned(n)` written alongside has to be applied here rather
         // than left to the later attribute pass, since an explicit alignment
         // may not reduce one already recorded.
@@ -1135,6 +1187,13 @@ impl Parser<'_> {
                 }
                 if attrs.has_transparent_union() {
                     self.pending_transparent_union = Some(self.current_pos());
+                }
+                // A struct or union's order is written in its specifier; on
+                // a declaration or declarator gcc ignores it, and says so.
+                if attrs.find("scalar_storage_order").is_some()
+                    && diag::warning_group_enabled(ATTRIBUTE_WARNING)
+                {
+                    diag::warning_args(pos, "'{0}' attribute ignored", &["scalar_storage_order"]);
                 }
                 self.pending_packed |= attrs.has_packed();
                 self.merge_symbol_attrs(&attrs);

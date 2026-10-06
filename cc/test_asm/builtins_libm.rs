@@ -144,7 +144,7 @@ fn libm_sqrt_of_constants() {
     compile_expect_error(
         "sqrt_static_domain",
         "double sqrt(double);\nstatic double z = sqrt(-1.0);\ndouble *p = &z;\n",
-        "cannot initialize an object with static storage duration",
+        "initializer element is not constant",
     );
 }
 
@@ -285,7 +285,7 @@ fn libm_rounding_of_constants() {
     compile_expect_error(
         "rint_static_inexact",
         "double rint(double);\nstatic double z = rint(2.5);\ndouble *p = &z;\n",
-        "cannot initialize an object with static storage duration",
+        "initializer element is not constant",
     );
 }
 
@@ -313,7 +313,7 @@ fn libm_constant_call_is_a_constant_at_every_level() {
     compile_expect_error(
         "sqrt_static_domain_error",
         "double sqrt(double);\nstatic double z = sqrt(-1.0);\ndouble *p = &z;\n",
-        "cannot initialize an object with static storage duration",
+        "initializer element is not constant",
     );
 }
 
@@ -425,6 +425,6 @@ fn libm_min_max_fma_of_constants() {
         "fmin_static_nan",
         "double fmin(double, double);\nstatic double z = fmin(__builtin_nan(\"\"), 3.0);\n\
          double *p = &z;\n",
-        "cannot initialize an object with static storage duration",
+        "initializer element is not constant",
     );
 }

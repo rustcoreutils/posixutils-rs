@@ -1346,7 +1346,20 @@ impl<'a> Preprocessor<'a> {
                             // because that is the only ordering that survives
                             // include splicing.
                             let mut marker = Token::new(TokenType::Pragma, pos);
-                            marker.value = TokenValue::String(action.encode());
+                            marker.value = TokenValue::String(LayoutPragma::Pack(action).encode());
+                            output.push(marker);
+                        }
+                        self.skip_to_eol(iter);
+                        return;
+                    } else if name == "scalar_storage_order" {
+                        // Layout too, and carried the same way. Read from
+                        // the line's text, which spells `big-endian` whole
+                        // where its tokens are `big`, `-` and `endian`.
+                        let pos = self.remap_pos(token.pos);
+                        let body = verbatim.strip_prefix("#pragma").unwrap_or(&verbatim);
+                        if let Some(pragma) = parse_pragma_text(body, pos) {
+                            let mut marker = Token::new(TokenType::Pragma, pos);
+                            marker.value = TokenValue::String(pragma.encode());
                             output.push(marker);
                         }
                         self.skip_to_eol(iter);
@@ -1497,7 +1510,7 @@ impl<'a> Preprocessor<'a> {
             let pos = self.remap_pos(token.pos);
             let mut marker = Token::new(TokenType::Pragma, pos);
             marker.value = TokenValue::String(match parse_pragma_text(body, token.pos) {
-                Some(action) => action.encode(),
+                Some(pragma) => pragma.encode(),
                 // Not one c17 acts on, so it travels as the directive it
                 // stands for. C99 6.10.9p1 makes `_Pragma("x")` mean
                 // `#pragma x`, and the operand is a string literal, so the
@@ -1537,7 +1550,9 @@ impl<'a> Preprocessor<'a> {
         }
 
         let tokens = self.collect_to_eol(iter);
-        let tokens = self.expand_if_tokens(&tokens, idents);
+        // Macro-replaced as ordinary text (C17 6.10.4p5), not as a `#if`
+        // operand: an identifier left over is no line number, not a zero.
+        let tokens = self.preprocess(tokens, idents);
         if tokens.is_empty() {
             diag::error(directive_pos, &gettext("#line requires a line number"));
             return;
@@ -1545,25 +1560,17 @@ impl<'a> Preprocessor<'a> {
 
         // C17 6.10.4p3: the operand is a digit sequence in [1, 2147483647].
         let line_num = match &tokens[0].value {
-            TokenValue::Number(n) => match n.parse::<u32>() {
-                Ok(num) if (1..=2147483647).contains(&num) => num,
-                Ok(_) => {
-                    diag::error_args(
-                        tokens[0].pos,
-                        "#line number '{0}' is out of range [1, 2147483647]",
-                        &[&n.to_string()],
-                    );
-                    return;
-                }
-                Err(_) => {
-                    diag::error_args(
-                        tokens[0].pos,
-                        "#line requires a decimal line number, found '{0}'",
-                        &[&n.to_string()],
-                    );
-                    return;
-                }
-            },
+            TokenValue::Number(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+                Self::line_number_operand(n, tokens[0].pos)
+            }
+            TokenValue::Number(n) => {
+                diag::error_args(
+                    tokens[0].pos,
+                    "#line requires a decimal line number, found '{0}'",
+                    &[&n.to_string()],
+                );
+                return;
+            }
             _ => {
                 diag::error(
                     tokens[0].pos,
@@ -1599,6 +1606,26 @@ impl<'a> Preprocessor<'a> {
         });
         let is_system = diag::stream_is_system(self.physical_stream);
         self.set_line_marker(line_num, name, is_system);
+    }
+
+    /// The line number a `#line` digit sequence names, as gcc reads it.
+    ///
+    /// 6.10.4p3 bounds it to [1, 2147483647], but going outside is undefined
+    /// rather than a constraint violation: gcc says so only under
+    /// `-pedantic`, and keeps the number. One too large for its 32-bit line
+    /// counter it warns about by default and wraps, and so does this.
+    fn line_number_operand(digits: &str, pos: Position) -> u32 {
+        let wide = digits.parse::<u64>().ok();
+        let wrapped = digits.bytes().fold(0u32, |v, b| {
+            v.wrapping_mul(10).wrapping_add(u32::from(b - b'0'))
+        });
+        let message = gettext("line number out of range");
+        match wide {
+            Some(n) if (1..=2147483647).contains(&n) => {}
+            Some(n) if n <= u64::from(u32::MAX) => diag::pedwarn(pos, &message),
+            _ => diag::pedwarn_default(pos, &message),
+        }
+        wrapped
     }
 
     /// `__has_include` / `__has_include_next`: whether the `#include` or

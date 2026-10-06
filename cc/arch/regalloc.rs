@@ -387,6 +387,19 @@ pub fn find_call_positions(func: &Function, is_call_like: impl Fn(Opcode) -> boo
     call_positions
 }
 
+/// The constraint point of a `__builtin_setjmp`, which clobbers every
+/// register in `regs`: control comes back to it from a `__builtin_longjmp`
+/// with only the frame and stack pointers restored, so no value may be in a
+/// register across it. The result alone is exempt -- both paths write it,
+/// after they join -- and not the buffer operand, which a value read again
+/// later would otherwise keep in a register the resumed path has lost.
+pub fn builtin_setjmp_constraint<R: Copy>(
+    insn: &Instruction,
+    regs: &[R],
+) -> (Vec<R>, Vec<PseudoId>) {
+    (regs.to_vec(), insn.target.into_iter().collect())
+}
+
 /// Check if a live interval crosses any call position.
 /// Note: We use <= for the end check because values used as call arguments
 /// (where interval.end == call_pos) need to survive until after argument
@@ -802,12 +815,52 @@ where
         })
         .collect();
 
+    extend_across_returns_twice(
+        func,
+        &mut result,
+        block_end_pos.last().copied().unwrap_or(0),
+    );
     result.sort_by_key(|i| (i.start, i.pseudo.0));
     LivenessResult {
         intervals: result,
         constraint_points,
         live_in,
         live_out,
+    }
+}
+
+/// Stretch every value live across a `setjmp` to the end of the function.
+///
+/// A `longjmp` resumes at the setjmp from whatever call it is made under,
+/// and the CFG has no edge for that: a value live across the setjmp is read
+/// again on the second return, after code the liveness analysis believed it
+/// was dead in -- the path that led to the `longjmp`. A slot or register
+/// handed to another value there is overwritten before the value is read
+/// back. Every call after the setjmp may be the one that jumps, so the value
+/// must survive to the end. This is the pseudo-level counterpart of
+/// `local_lifetimes`, which spans every local over the whole function.
+///
+/// The setjmp's own result starts there, and is written again on each
+/// return, so it is not stretched.
+fn extend_across_returns_twice(func: &Function, intervals: &mut [LiveInterval], last: usize) {
+    let positions: Vec<usize> = func
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insns)
+        .enumerate()
+        .filter(|(_, insn)| insn.op == Opcode::Setjmp)
+        .map(|(pos, _)| pos)
+        .collect();
+    if positions.is_empty() {
+        return;
+    }
+    for interval in intervals.iter_mut() {
+        if positions
+            .iter()
+            .any(|&p| interval.start < p && p < interval.end)
+        {
+            interval.end = interval.end.max(last);
+        }
     }
 }
 
@@ -1891,6 +1944,88 @@ mod tests {
         assert_eq!(b, (3, 4), "b");
         assert!(a.1 < b.0, "disjoint: {a:?} {b:?}");
         assert_eq!(p.0, 0, "a parameter's local from entry: {p:?}");
+    }
+
+    /// `%3 = load p; %4 = setjmp; cbr %4, .L1, .L2; .L1: ret %3;
+    /// .L2: %5 = load p; ret %5` -- `%3` is last read in `.L1`, laid out
+    /// before `.L2`, which is where the `longjmp` comes from. Its interval
+    /// reaches the end of the function, or `.L2` could take its slot and the
+    /// second return read `%5`. `%5`, defined after the setjmp, and the
+    /// setjmp's own result are not stretched.
+    fn value_across_setjmp(kind: crate::parse::ast::JmpKind) -> Function {
+        use crate::ir::{BasicBlock, Pseudo};
+        let types = TypeTable::new(&crate::target::Target::host());
+        let mut f = Function::new("f", types.int_id);
+        f.add_param("p", types.int_id);
+        f.add_pseudo(Pseudo::sym(PseudoId(2), "p".into()));
+        f.add_local("p", PseudoId(2), types.int_id, None, None);
+        for id in 3..6 {
+            f.add_pseudo(Pseudo::reg(PseudoId(id), id));
+        }
+        f.next_pseudo = 6;
+        let (b0, b1, b2) = (BasicBlockId(0), BasicBlockId(1), BasicBlockId(2));
+        let mut entry = BasicBlock::new(b0);
+        entry.add_insn(Instruction::new(Opcode::Entry));
+        entry.add_insn(Instruction::load(
+            PseudoId(3),
+            PseudoId(2),
+            0,
+            types.int_id,
+            32,
+        ));
+        let mut setjmp = Instruction::new(Opcode::Setjmp)
+            .with_target(PseudoId(4))
+            .with_type_and_size(types.int_id, 32);
+        setjmp.extra_mut().jmp_kind = kind;
+        entry.add_insn(setjmp);
+        entry.add_insn(Instruction::cbr(PseudoId(4), b1, b2));
+        entry.children = vec![b1, b2];
+        let mut resumed = BasicBlock::new(b1);
+        resumed.add_insn(Instruction::ret(Some(PseudoId(3))));
+        resumed.parents = vec![b0];
+        let mut direct = BasicBlock::new(b2);
+        direct.add_insn(Instruction::load(
+            PseudoId(5),
+            PseudoId(2),
+            0,
+            types.int_id,
+            32,
+        ));
+        direct.add_insn(Instruction::ret(Some(PseudoId(5))));
+        direct.parents = vec![b0];
+        for b in [entry, resumed, direct] {
+            f.add_block(b);
+        }
+        f.entry = b0;
+        f
+    }
+
+    #[test]
+    fn a_value_live_across_setjmp_spans_to_the_end() {
+        use crate::parse::ast::JmpKind;
+        for kind in [JmpKind::Library, JmpKind::Builtin] {
+            let f = value_across_setjmp(kind);
+            let last = 6;
+            assert_eq!(
+                lifetime_of(&f, 3),
+                (1, last),
+                "{kind:?}: the value read on return"
+            );
+            assert_eq!(
+                lifetime_of(&f, 4).0,
+                2,
+                "{kind:?}: the result starts at the setjmp"
+            );
+            assert!(
+                lifetime_of(&f, 4).1 < last,
+                "{kind:?}: the result is not stretched"
+            );
+            assert_eq!(
+                lifetime_of(&f, 5),
+                (5, 6),
+                "{kind:?}: a value after the setjmp"
+            );
+        }
     }
 
     /// Where `setjmp` can bring control back unseen, every local spans the

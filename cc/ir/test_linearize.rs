@@ -1309,6 +1309,7 @@ fn test_incomplete_struct_type_resolution() {
         member_align: 4,
         is_complete: true,
         transparent: false,
+        reverse_order: false,
         anon_id: None,
         tag_type: None,
     };
@@ -1661,6 +1662,39 @@ fn test_real_definition_replaces_gnu_inline_body() {
     }
 }
 
+/// A `static` definition after a gnu_inline `extern inline` body is the one
+/// function of its name, emitted and local. A gnu_inline `extern inline`
+/// body after a `static` declaration has internal linkage, so it is no
+/// inline-only body: it is emitted, local, as gcc emits it.
+#[test]
+fn test_static_definition_after_gnu_inline_body() {
+    let src = "int one(void);\nint zero(void);\n\
+               extern inline __attribute__((gnu_inline)) int f(void) { return one(); }\n\
+               static int f(void) { return zero(); }\n\
+               static int h(void);\n\
+               extern inline __attribute__((gnu_inline)) int h(void) { return zero(); }\n\
+               int (*fp)(void) = f;\nint (*hp)(void) = h;\n";
+    for arch in [crate::target::Arch::X86_64, crate::target::Arch::Aarch64] {
+        let target = Target::new(arch, crate::target::Os::Linux);
+        let module = linearize_source(src, &target);
+        for name in ["f", "h"] {
+            let found: Vec<&Function> =
+                module.functions.iter().filter(|f| f.name == name).collect();
+            assert_eq!(found.len(), 1, "{arch}: one `{name}` in the module");
+            let func = found[0];
+            assert!(func.emit, "{arch}: `{name}` is emitted");
+            assert!(func.is_static, "{arch}: `{name}` is local");
+            let callees: Vec<&str> = func
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insns)
+                .filter_map(|i| i.local_callee())
+                .collect();
+            assert_eq!(callees, ["zero"], "{arch}: `{name}` is the static body");
+        }
+    }
+}
+
 /// x86-64 Linux, whose x87 `long double` holds `0x1p62L + 1.0L` exactly --
 /// a test about that names the target rather than taking the host's, since
 /// on an arm64 Mac `long double` is `double`.
@@ -1750,4 +1784,186 @@ fn test_target_clones_divide_attributes_as_gcc() {
     let alias = module.aliases.iter().find(|a| a.name == "init").unwrap();
     assert_eq!(alias.visibility, None);
     assert!(!alias.weak);
+}
+
+/// A file-scope `extern` declaration with an initializer is an external
+/// definition (C17 6.9.2p1), defined exactly once whatever declares the name
+/// before or after it: a later tentative or plain declaration refers to it,
+/// and after a `static` declaration it has internal linkage (6.2.2p4).
+#[test]
+fn test_initialized_extern_declaration_is_a_definition() {
+    let src = "extern int y = 5;\nint y;\nextern int y;\nint *p = &y;\n\
+               static int x;\nextern int x = 7;\n\
+               int u;\nextern int u = 3;\n\
+               extern const char s[] = \"hi\";\n\
+               extern struct { int a, b; } pt = {1, 2};\n\
+               extern _Thread_local int t = 1;\n";
+    for arch in [crate::target::Arch::X86_64, crate::target::Arch::Aarch64] {
+        let target = Target::new(arch, crate::target::Os::Linux);
+        let module = linearize_source(src, &target);
+        let only = |name: &str| {
+            let found: Vec<&crate::ir::GlobalDef> =
+                module.globals.iter().filter(|g| g.name == name).collect();
+            assert_eq!(found.len(), 1, "{arch}: one `{name}` in the module");
+            assert!(
+                !module.extern_symbols.contains(name),
+                "{arch}: `{name}` is defined, not external"
+            );
+            found[0]
+        };
+        for (name, value, local) in [("y", 5, false), ("x", 7, true), ("u", 3, false)] {
+            let g = only(name);
+            assert!(
+                matches!(g.init, Initializer::Int(v) if v == value),
+                "{arch}: `{name}` = {value}, got {:?}",
+                g.init
+            );
+            assert_eq!(g.is_static, local, "{arch}: `{name}` linkage");
+        }
+        let s = only("s");
+        assert!(
+            matches!(&s.init, Initializer::String(v) if v.starts_with("hi")),
+            "{arch}: `s` = \"hi\", got {:?}",
+            s.init
+        );
+        assert!(s.is_const && !s.is_static, "{arch}: `s` is const, external");
+        assert!(!only("pt").is_static, "{arch}: `pt` is external");
+        let t = only("t");
+        assert!(
+            t.is_thread_local && !t.is_static && matches!(t.init, Initializer::Int(1)),
+            "{arch}: `t` is an external thread-local = 1"
+        );
+        assert!(
+            !module.extern_tls_symbols.contains("t"),
+            "{arch}: `t` is defined"
+        );
+        assert!(
+            matches!(only("p").init, Initializer::SymAddr(ref n) if n == "y"),
+            "{arch}: `p` = &y"
+        );
+    }
+}
+
+/// A global's type is its object type alone, whichever declaration spelled
+/// which storage class: `static int x; extern int x = 7;` reached
+/// `define_global` once as `static int` and once as `extern int`, two type
+/// ids for one object. Qualifiers stay -- `const` routes the object to
+/// read-only data -- and a later declaration that completes the type gives
+/// the global the completed one.
+#[test]
+fn test_global_type_is_the_object_type_alone() {
+    let src = "extern int y = 5;\nint y;\nextern int y;\n\
+               static int x;\nextern int x = 7;\n\
+               int u;\nextern int u = 3;\n\
+               static const int c;\nextern const int c = 4;\n\
+               static volatile int v;\nextern volatile int v = 1;\n\
+               static int a[3];\nextern int a[3] = {1, 2, 3};\n\
+               static int e[];\nextern int e[3] = {1, 2, 3};\n\
+               int (*q)[];\nint (*q)[3] = 0;\n\
+               static int *ptr;\nextern int *ptr = &u;\n\
+               static _Thread_local int t;\nextern _Thread_local int t = 2;\n\
+               extern struct { int a, b; } pt = {1, 2};\n\
+               int f(void) { static int n; static const int k = 3; return ++n + k; }\n";
+    for arch in [crate::target::Arch::X86_64, crate::target::Arch::Aarch64] {
+        let target = Target::new(arch, crate::target::Os::Linux);
+        let (module, mut types) = linearize_source_with_types(src, &target);
+        for g in &module.globals {
+            assert_eq!(
+                types.without_decl_specifiers(g.typ),
+                g.typ,
+                "{arch}: `{}` is typed `{}`, with a storage class",
+                g.name,
+                types.format_type(g.typ, None)
+            );
+        }
+        let only = |name: &str| {
+            let found: Vec<&crate::ir::GlobalDef> =
+                module.globals.iter().filter(|g| g.name == name).collect();
+            assert_eq!(found.len(), 1, "{arch}: one `{name}` in the module");
+            found[0]
+        };
+        let spelled = |name: &str| types.format_type(only(name).typ, None);
+        for name in ["y", "x", "u"] {
+            assert_eq!(spelled(name), "int", "{arch}: `{name}`");
+        }
+        assert_eq!(spelled("c"), "const int", "{arch}: `c`");
+        assert!(only("c").is_const, "{arch}: `c` is read-only");
+        assert_eq!(spelled("v"), "volatile int", "{arch}: `v`");
+        assert!(!only("v").is_const, "{arch}: `v` is writable");
+        assert_eq!(spelled("a"), "int[3]", "{arch}: `a`");
+        assert_eq!(spelled("e"), "int[3]", "{arch}: `e` completed");
+        assert_eq!(spelled("q"), "int (*)[3]", "{arch}: `q` completed");
+        assert_eq!(spelled("ptr"), "int *", "{arch}: `ptr`");
+        assert_eq!(spelled("t"), "int", "{arch}: `t`");
+        assert!(
+            only("t").is_thread_local && only("t").is_static,
+            "{arch}: `t`"
+        );
+        assert!(
+            only("x").is_static && !only("u").is_static,
+            "{arch}: linkage"
+        );
+    }
+}
+
+/// GNU `&&a - &&b` in a static initializer is a label difference at the
+/// object's width, with any constant around it folded into one addend, in
+/// bytes: a `void *` difference counts bytes, and an integer added to a
+/// `void *` or `char *` does too. A label cancelled against itself is the
+/// constant gcc folds it to, and a function whose labels a static names is
+/// marked so the inliner never copies it.
+#[test]
+fn test_label_difference_initializers() {
+    let src = "int f(int i) {\n\
+               static const int t[] = {&&a - &&a, &&b - &&a, &&b - &&a + 3};\n\
+               static const short s = -(&&a - &&b) - 2;\n\
+               static const long w = (&&b + 4) - &&a;\n\
+               static const char c = (char *)&&a - (char *)&&b;\n\
+               static const long l = (long)&&b - (long)&&a;\n\
+               goto *(&&a + t[i] + s + w + c + l);\n\
+               a: return 1;\n\
+               b: return 2;\n\
+               }\n";
+    for arch in [crate::target::Arch::X86_64, crate::target::Arch::Aarch64] {
+        let target = Target::new(arch, crate::target::Os::Linux);
+        let module = linearize_source(src, &target);
+        let init = |name: &str| {
+            &module
+                .globals
+                .iter()
+                .find(|g| g.name == name)
+                .unwrap_or_else(|| panic!("{arch}: no `{name}`"))
+                .init
+        };
+        let diff = |init: &Initializer| match init {
+            Initializer::LabelDiff { end, start, addend } => (end.clone(), start.clone(), *addend),
+            other => panic!("{arch}: not a label difference: {other:?}"),
+        };
+        let Initializer::Array {
+            elem_size,
+            elements,
+            ..
+        } = init("f.t.0")
+        else {
+            panic!("{arch}: `t` is an array");
+        };
+        assert_eq!(*elem_size, 4);
+        assert!(
+            matches!(elements[0].1, Initializer::Int(0)),
+            "{arch}: &&a - &&a"
+        );
+        let (b, a, k) = diff(&elements[1].1);
+        assert!(
+            a.starts_with(".Lf_") && b.starts_with(".Lf_") && a != b,
+            "{arch}"
+        );
+        assert_eq!(k, 0);
+        assert_eq!(diff(&elements[2].1), (b.clone(), a.clone(), 3));
+        assert_eq!(diff(init("f.s.1")), (b.clone(), a.clone(), -2));
+        assert_eq!(diff(init("f.w.2")), (b.clone(), a.clone(), 4));
+        assert_eq!(diff(init("f.c.3")), (a.clone(), b.clone(), 0));
+        assert_eq!(diff(init("f.l.4")), (b, a, 0));
+        let f = module.functions.iter().find(|f| f.name == "f").unwrap();
+        assert!(f.saves_label_in_static, "{arch}: `f` saves its labels");
+    }
 }

@@ -28,13 +28,27 @@ use crate::symbol::SymbolId;
 use crate::target::Target;
 use crate::types::{TypeId, TypeKind, TypeTable};
 
-/// Which identifiers carry a value in a constant expression.
+/// Which constant expression is asked for: which identifiers carry a value
+/// in it, and whether a conversion C leaves undefined still gives one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum ConstScope {
     /// C's own rule: an enumeration constant is the only identifier with a
-    /// value here. Array sizes, `case` labels, `_Static_assert`, enumerators
-    /// and bit-field widths all ask this one, and gcc is equally strict.
+    /// value here. `case` labels, `_Static_assert`, enumerators, bit-field
+    /// widths and `_Alignas` all ask this one, and gcc is equally strict.
     Standard,
+    /// An array's size: [`Self::Standard`], except that a floating value out
+    /// of the integer type it converts to makes the expression no constant,
+    /// and the array a VLA. gcc marks the saturated value it folds as an
+    /// overflow; an enumerator or a `case` label takes it with a warning,
+    /// and the array size alone refuses it -- `int a[(int)1e300 > 0];` is
+    /// "variably modified" at file scope.
+    ///
+    /// Refusing every such conversion is the uniform rule nearest gcc's,
+    /// not gcc's exactly: some of its folds drop the overflow mark again --
+    /// a comparison of a value saturated low (`(int)-1e300 < 0`), a NaN from
+    /// `__builtin_nan`, and on x86-64 alone a negative value converted to
+    /// `unsigned` -- and gcc then takes the size as a constant.
+    ArrayBound,
     /// Additionally a `const`-qualified object with a visible constant
     /// initializer, which gcc folds in a static initializer and nowhere else.
     StaticInitializer,
@@ -45,25 +59,28 @@ pub(crate) trait ConstEnv {
     fn types(&self) -> &TypeTable;
 
     /// The value of an identifier, or `None` when it is not a constant in this
-    /// scope. An enumeration constant answers in both scopes; a `const` object
+    /// scope. An enumeration constant answers in every scope; a `const` object
     /// answers only in [`ConstScope::StaticInitializer`].
     fn ident_value(&self, sym: SymbolId, scope: ConstScope) -> Option<i128>;
 
-    /// The value of a deferred `__builtin_constant_p`, or `None` where the
-    /// question is better left to the optimizer.
+    /// The value of a deferred builtin -- `__builtin_constant_p` or
+    /// `__builtin_object_size` -- or `None` where the question is better
+    /// left to the optimizer. `settled` is what the builtin answers when
+    /// nothing more is learnt about its operand: 0 for the first, the
+    /// unknown object's size for the second.
     ///
-    /// The parser builds that node only for an operand it could not fold, so
-    /// 0 is its honest answer -- and where C *requires* a constant
-    /// expression there has to be one: `__builtin_choose_expr`'s condition,
-    /// an array bound, a `case` label, a static initializer. gcc answers 0 in
-    /// every one of them.
+    /// The parser builds such a node only for an operand it could not fold,
+    /// so `settled` is its honest answer -- and where C *requires* a
+    /// constant expression there has to be one: `__builtin_choose_expr`'s
+    /// condition, an array bound, a `case` label, a static initializer. gcc
+    /// answers it in every one of them.
     ///
     /// Where a fold is merely an optimization the answer must be withheld,
     /// or the builtin is resolved before propagation has run and gives the
     /// wrong one. `linearize_ternary` is the case that matters:
     /// `__builtin_constant_p(x) ? a : b` is the idiom the builtin exists for,
     /// and folding its condition here decides it as 0 forever.
-    fn deferred_constant_p(&self, scope: ConstScope) -> Option<i128>;
+    fn deferred_builtin(&self, settled: i128, scope: ConstScope) -> Option<i128>;
 
     /// The value of an identifier of floating type, or `None` when it is not
     /// a constant in this scope: [`Self::ident_value`] for a `const double`.
@@ -156,9 +173,13 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
         ExprKind::Ident(symbol_id) => env.ident_value(*symbol_id, scope),
         ExprKind::Index { .. } | ExprKind::Member { .. } => env.subobject_value(expr, scope),
 
-        // A deferred `__builtin_constant_p`. Whether it answers at all is
-        // the asker's business: see [`ConstEnv::deferred_constant_p`].
-        ExprKind::ConstantP(_) => env.deferred_constant_p(scope),
+        // A deferred `__builtin_constant_p` or `__builtin_object_size`.
+        // Whether it answers at all is the asker's business: see
+        // [`ConstEnv::deferred_builtin`].
+        ExprKind::ConstantP(_) => env.deferred_builtin(0, scope),
+        ExprKind::ObjectSize { otype, .. } => {
+            env.deferred_builtin(i128::from(otype.unknown()), scope)
+        }
 
         // The address of a member of a pointer constant is itself an integer
         // constant; see [`eval_pointer`].
@@ -205,6 +226,15 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
             arg,
         } => Some(i128::from(eval_float(env, scope, arg)?.sign_bit())),
 
+        // `issignaling` of a floating constant, which gcc folds the same way:
+        // `enum { E = __builtin_issignaling(__builtin_nans("")) };` is 1. The
+        // constant walk quiets a NaN wherever the program would -- a
+        // conversion, arithmetic -- so `(float)__builtin_nans("")` is 0.
+        ExprKind::FpTest {
+            test: FpTest::IsSignaling,
+            arg,
+        } => Some(i128::from(eval_float(env, scope, arg)?.is_signalling_nan())),
+
         // `abs` of a constant, in a static initializer only: a call is not an
         // integer constant expression, and gcc rejects `int a[abs(-2)];` at
         // file scope while folding `static int b = abs(-2);`. The argument
@@ -243,8 +273,8 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
 
         // sizeof(type), constant for a complete type but *not* for a variable
         // length array, whose size 6.5.3.4p2 computes at run time. The type
-        // table cannot tell `int[n]` from `int[]`, so answering from it alone
-        // gave 0 -- and a 0 that was still an integer constant expression, so
+        // holds no size for `int[n]`, so answering from it alone gave 0 -- and
+        // a 0 that was still an integer constant expression, so
         // `int z[sizeof(int[n])];` silently became a zero-length array.
         ExprKind::SizeofType(type_id, dims) => {
             if crate::parse::ast::sizeof_type_is_runtime(env.types(), *type_id, dims) {
@@ -257,10 +287,10 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
             // `sizeof a` where `a` is a variable-length array is computed at
             // run time (6.5.3.4p2) and is not an integer constant expression.
             //
-            // A `TypeId` for `int[n]` is indistinguishable from one for `int[]`,
-            // so the question has to be asked of the levels, not the size.
+            // Any variable level makes the size a run-time one: `int[3][n]`
+            // as much as `int[n]`.
             let typ = inner.typ?;
-            if env.types().unsized_array_levels(typ) > 0 {
+            if env.types().variable_array_levels(typ) > 0 {
                 return None;
             }
             Some(env.types().size_bytes(typ) as i128)
@@ -287,12 +317,11 @@ fn eval_unnormalized(env: &impl ConstEnv, scope: ConstScope, expr: &Expr) -> Opt
             {
                 return match (eval_as_integer(env, scope, inner, *cast_type)?, scope) {
                     (IntConversion::InRange(v), _) => Some(v),
-                    // A value C does not define is no integer constant
-                    // expression -- gcc makes `int a[(int)1e300 > 0];` a VLA.
-                    (IntConversion::Saturated(_), ConstScope::Standard) => None,
-                    // A static initializer must have a value, and gcc's is
-                    // the saturated one.
-                    (IntConversion::Saturated(v), ConstScope::StaticInitializer) => Some(v),
+                    // An array size refuses the value C does not define --
+                    // gcc makes `int a[(int)1e300 > 0];` a VLA.
+                    (IntConversion::Saturated(_), ConstScope::ArrayBound) => None,
+                    // Every other context takes gcc's saturated one.
+                    (IntConversion::Saturated(v), _) => Some(v),
                 };
             }
             eval(env, scope, inner)
@@ -485,6 +514,14 @@ fn eval_binary(
             // there is no single gcc answer to match; c17 diverges knowingly
             // and consistently. The *warning* is emitted by
             // `check_shift_count`, where the shift's type is computed.
+            //
+            // A negative count is the exception: gcc does not fold that
+            // shift at all, so where C requires a constant expression --
+            // a static initializer, an enumerator, a `case` label, an array
+            // size -- `1 << -1` is not one, while `1 << 40` is.
+            if r < 0 {
+                return None;
+            }
             let width = left
                 .typ
                 .map(|t| env.types().size_bits(t))
@@ -682,8 +719,8 @@ pub(crate) fn float_to_integer(types: &TypeTable, val: FloatVal, to: TypeId) -> 
     }
 }
 
-/// [`float_to_integer`] for a context that must have a value, with gcc's
-/// saturated answer where C gives none: see
+/// [`float_to_integer`] with gcc's folded answer where C gives none,
+/// saturated: see
 /// [`FloatVal::to_integer_saturating`].
 fn float_to_integer_saturating(types: &TypeTable, val: FloatVal, to: TypeId) -> i128 {
     match integer_shape(types, to) {
@@ -953,6 +990,15 @@ pub(crate) fn eval_as_float(
 pub(crate) enum IntConversion {
     InRange(i128),
     Saturated(i128),
+}
+
+impl IntConversion {
+    /// The converted value, whichever it is.
+    pub(crate) fn value(self) -> i128 {
+        match self {
+            Self::InRange(v) | Self::Saturated(v) => v,
+        }
+    }
 }
 
 /// The constant `expr` of floating or complex type converted to the integer

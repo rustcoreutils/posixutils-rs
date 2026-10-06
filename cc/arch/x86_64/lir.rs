@@ -674,6 +674,18 @@ pub enum X86Inst {
     /// Used for __builtin_unreachable() to signal unreachable code
     Ud2,
 
+    /// ENDBR64 - the landing pad an indirect branch needs under CET's
+    /// indirect-branch tracking; a NOP otherwise.
+    Endbr64,
+
+    /// RDSSPQ - read the shadow-stack pointer. A NOP when the shadow stack
+    /// is off, leaving `dst` as it was.
+    Rdssp { dst: Reg },
+
+    /// INCSSPQ - pop `count`'s low eight bits' worth of entries off the
+    /// shadow stack. Faults when the shadow stack is off.
+    Incssp { count: Reg },
+
     // ========================================================================
     // Floating-Point (SSE)
     // ========================================================================
@@ -1134,6 +1146,18 @@ impl EmitAsm for X86Inst {
 
             X86Inst::Ud2 => {
                 let _ = writeln!(out, "    ud2");
+            }
+
+            X86Inst::Endbr64 => {
+                let _ = writeln!(out, "    endbr64");
+            }
+
+            X86Inst::Rdssp { dst } => {
+                let _ = writeln!(out, "    rdsspq {}", dst.name64());
+            }
+
+            X86Inst::Incssp { count } => {
+                let _ = writeln!(out, "    incsspq {}", count.name64());
             }
 
             // Floating-Point

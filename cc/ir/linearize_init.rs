@@ -18,6 +18,8 @@ use crate::parse::ast::{
     AliasForm, BinaryOp, Declaration, Designator, Expr, ExprKind, InitElement, UnaryOp,
 };
 use crate::strings::StringId;
+use crate::symbol::Linkage;
+use crate::target::ByteOrder;
 use crate::token::lexer::Position;
 use crate::types::{MemberInfo, Type, TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::{BTreeMap, HashMap};
@@ -58,36 +60,50 @@ const OVERFLOW_WARNING: &str = "overflow";
 /// generally starts earlier -- `unsigned a:1` after a `char` sits at bit 8 of
 /// a span based at byte 0 -- and writing the whole span would blank the
 /// members sharing it.
+///
+/// `order` is the order the field's struct stores its scalars in, which
+/// decides the end of each byte the field's bits are counted from: the least
+/// significant for little-endian, the most significant for big-endian, where
+/// the field's own most significant bit comes first.
 fn bitfield_carrier_bytes(
     bit_offset: u32,
     bit_width: u32,
     value: i128,
-) -> impl Iterator<Item = (usize, u8, u8)> {
+    order: ByteOrder,
+) -> Vec<(usize, u8, u8)> {
     // A field with no bits, or one no carrier could hold, occupies no byte.
-    // Otherwise the mask comes of shifting `u128::MAX` down rather than
-    // `1 << width` up, for the reason `bitfield_value_mask` records: the
-    // latter overflows at the carrier's own width.
-    let fits = bit_width > 0 && u64::from(bit_offset) + u64::from(bit_width) <= 128;
-    let (shift, width_mask) = if fits {
-        (bit_offset, u128::MAX >> (128 - bit_width))
-    } else {
-        (0, 0)
-    };
-    let placed = ((value as u128) & width_mask) << shift;
-    let owned = width_mask << shift;
-    let bytes = if fits {
-        (bit_offset / 8) as usize..((bit_offset + bit_width - 1) / 8) as usize + 1
-    } else {
-        0..0
-    };
-    bytes.map(move |byte| {
-        let shift = byte * 8;
-        (
-            byte,
-            ((placed >> shift) & 0xff) as u8,
-            ((owned >> shift) & 0xff) as u8,
-        )
-    })
+    if bit_width == 0 || u64::from(bit_offset) + u64::from(bit_width) > 128 {
+        return Vec::new();
+    }
+    let value = value as u128;
+    let (lo, hi) = (bit_offset, bit_offset + bit_width);
+    (lo / 8..hi.div_ceil(8))
+        .map(|byte| {
+            let (mut bits, mut mask) = (0u8, 0u8);
+            for t in 0..8 {
+                // Bit `t` of the byte, counted from its least significant,
+                // is bit `place` of the object, counted in `order`.
+                let place = match order {
+                    ByteOrder::LittleEndian => byte * 8 + t,
+                    ByteOrder::BigEndian => byte * 8 + 7 - t,
+                };
+                if !(lo..hi).contains(&place) {
+                    continue;
+                }
+                // And bit `j` of the value, which runs up from the field's
+                // first bit, or down from it.
+                let j = match order {
+                    ByteOrder::LittleEndian => place - lo,
+                    ByteOrder::BigEndian => hi - 1 - place,
+                };
+                mask |= 1 << t;
+                if (value >> j) & 1 != 0 {
+                    bits |= 1 << t;
+                }
+            }
+            (byte as usize, bits, mask)
+        })
+        .collect()
 }
 
 /// The bytes a bit-field member's own bits occupy, measured from the first
@@ -222,12 +238,14 @@ impl<'a> super::linearize::Linearizer<'a> {
                 continue;
             }
 
-            // Skip extern declarations - they don't define storage
-            // But track them so codegen can use GOT access on macOS
+            // An `extern` declaration without an initializer defines no
+            // storage, but is tracked so codegen can use GOT access on macOS.
             // Only add to extern_symbols if not already defined (handles both cases:
             // extern int x; int x = 1;  - x is defined, not extern
             // int x = 1; extern int x;  - x is defined, not extern)
-            if storage_class.contains(TypeModifiers::EXTERN) {
+            // With an initializer it is an external definition (C17 6.9.2p1,
+            // `extern int i3 = 3;` in 6.9.2p4), defined below like any other.
+            if storage_class.contains(TypeModifiers::EXTERN) && declarator.init.is_none() {
                 // Check if this symbol is already defined in globals
                 if self.module.globals.iter().any(|g| g.name == name) {
                     // An attribute on a declaration after the definition is
@@ -256,8 +274,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                 self.ast_init_to_ir(e, declarator.typ)
             });
 
+            // Internal linkage comes from `static` here or, for an `extern`
+            // definition, from a prior `static` declaration (6.2.2p4).
+            let is_static = storage_class.contains(TypeModifiers::STATIC)
+                || self.symbols.get(declarator.symbol).linkage == Linkage::Internal;
+
             // Track file-scope static variables for inline semantic checks
-            if storage_class.contains(TypeModifiers::STATIC) {
+            if is_static {
                 self.file_scope_statics.insert(name.clone());
             }
 
@@ -275,7 +298,6 @@ impl<'a> super::linearize::Linearizer<'a> {
             self.module.extern_symbols.remove(&name);
             self.module.extern_object_align.remove(&name);
 
-            let is_static = storage_class.contains(TypeModifiers::STATIC);
             // Const-qualified at the object level. For arrays, the element type
             // carries the qualifier (e.g., `const int a[10]`), so look through
             // arrays to their element type.
@@ -286,6 +308,7 @@ impl<'a> super::linearize::Linearizer<'a> {
                 is_thread_local: storage_class.contains(TypeModifiers::THREAD_LOCAL),
             };
             self.module.define_global(
+                self.types,
                 &name,
                 declarator.typ,
                 init,
@@ -311,7 +334,26 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// than one cannot hold it: gcc rejects `char k = (long)arr;` as not
     /// computable at load time, where emitting the relocation wrote eight
     /// bytes over a one-byte object and its neighbours.
+    ///
+    /// An address cannot be stored in reverse order -- the linker writes it
+    /// in the target's -- so gcc refuses one for a reversed scalar, as
+    /// [`Self::reject_address_in_reversed`] does for the other members of a
+    /// reversed aggregate.
     pub(crate) fn ast_init_to_ir(&mut self, expr: &Expr, typ: TypeId) -> Initializer {
+        let init = self.ast_init_in_native_order(expr, typ);
+        if self.types.reverses_storage(typ) && init.holds_address() {
+            error(self.expr_pos(expr), "initializer element is not constant");
+            return Initializer::None;
+        }
+        self.in_storage_order(init, typ)
+    }
+
+    /// [`Self::ast_init_to_ir`], with the value in the target's byte order
+    /// whatever order `typ` is stored in: what a bit-field's initializer
+    /// needs, since its bits are placed by the struct's own lowering, and
+    /// what a conversion or a conditional folds to before the one reversal
+    /// at the end.
+    fn ast_init_in_native_order(&mut self, expr: &Expr, typ: TypeId) -> Initializer {
         let init = self.ast_init_value(expr, typ);
         let is_address = matches!(
             init,
@@ -338,6 +380,13 @@ impl<'a> super::linearize::Linearizer<'a> {
             if let Some(init) = self.complex_initializer(expr, typ) {
                 return init;
             }
+        }
+
+        // GNU `&&a - &&b`: before the arithmetic fold below, which would give
+        // up on the label addresses and diagnose them, or read one as a
+        // non-null address for a `_Bool`.
+        if let Some(init) = self.label_difference_init(expr, typ) {
+            return init;
         }
 
         // An arithmetic object is initialized with the *object's* encoding,
@@ -483,7 +532,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             // Cast expression - evaluate the inner expression
-            ExprKind::Cast { expr: inner, .. } => self.ast_init_to_ir(inner, typ),
+            ExprKind::Cast { expr: inner, .. } => self.ast_init_in_native_order(inner, typ),
 
             // Initializer list for arrays/structs
             ExprKind::InitList { elements } => self.ast_init_list_to_ir(elements, typ),
@@ -644,8 +693,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             // value of the true arm, so folding it needs no temporary.
             ExprKind::CondElvis { cond, else_expr } => {
                 match self.const_condition(cond) {
-                    Some(true) => return self.ast_init_to_ir(cond, typ),
-                    Some(false) => return self.ast_init_to_ir(else_expr, typ),
+                    Some(true) => return self.ast_init_in_native_order(cond, typ),
+                    Some(false) => return self.ast_init_in_native_order(else_expr, typ),
                     None => self.reject_initializer(cond),
                 }
                 Initializer::None
@@ -658,8 +707,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                 else_expr,
             } => {
                 match self.const_condition(cond) {
-                    Some(true) => return self.ast_init_to_ir(then_expr, typ),
-                    Some(false) => return self.ast_init_to_ir(else_expr, typ),
+                    Some(true) => return self.ast_init_in_native_order(then_expr, typ),
+                    Some(false) => return self.ast_init_in_native_order(else_expr, typ),
                     None => self.reject_initializer(cond),
                 }
                 Initializer::None
@@ -872,12 +921,46 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// Report an initializer that is not a constant expression we can fold.
+    /// gcc.dg/sso-1.c: an address constant cannot initialize a member of a
+    /// struct or union stored in reverse order -- gcc refuses it whether the
+    /// member is a pointer (which it stores natively) or an array of them.
+    /// A member that is itself a struct or union, or an array of them, has
+    /// its own order, and its own members answer to it. `init` is the
+    /// member's initializer, which is dropped once refused.
+    fn reject_address_in_reversed(
+        &self,
+        aggregate: TypeId,
+        member: TypeId,
+        init: Initializer,
+        pos: Position,
+    ) -> Initializer {
+        let reversed = self
+            .types
+            .get(aggregate)
+            .composite
+            .as_ref()
+            .is_some_and(|c| c.reverse_order);
+        let mut element = member;
+        while self.types.kind(element) == TypeKind::Array {
+            element = self.types.base_type(element).unwrap_or(self.types.int_id);
+        }
+        if !reversed
+            || matches!(self.types.kind(element), TypeKind::Struct | TypeKind::Union)
+            || !init.holds_address()
+        {
+            return init;
+        }
+        error(pos, "initializer element is not constant");
+        Initializer::None
+    }
+
+    /// Report an initializer that is not a constant expression we can fold:
+    /// gcc's words, then which part of the expression is to blame.
     fn reject_initializer(&self, expr: &Expr) {
         error(
             self.expr_pos(expr),
             &format!(
-                "{} is not a constant expression, so it cannot initialize an object with static storage duration",
+                "initializer element is not constant: {} is not a constant expression",
                 describe_expr(&expr.kind)
             ),
         );
@@ -932,21 +1015,29 @@ impl<'a> super::linearize::Linearizer<'a> {
             constexpr::IntConversion::InRange(v) => return Some(Initializer::Int(v)),
             constexpr::IntConversion::Saturated(v) => v,
         };
-        // Out of range, where C gives no value and a static object must still
-        // have one: gcc's, with gcc's warning.
-        if crate::diag::warning_group_enabled(OVERFLOW_WARNING) {
-            let from = expr
-                .typ
-                .map_or_else(String::new, |t| self.types.format_type(t, None));
-            crate::diag::warning(
-                self.expr_pos(expr),
-                &format!(
-                    "overflow in conversion from '{from}' to '{}' changes value",
-                    self.types.format_type(typ, None)
-                ),
-            );
-        }
+        // Out of range, where C gives no value: gcc's, with gcc's warning.
+        self.warn_saturated_conversion(expr, typ);
         Some(Initializer::Int(v))
+    }
+
+    /// gcc's warning for a floating constant that an implicit conversion
+    /// takes out of the range of the integer type `typ`, folding it to the
+    /// saturated value. An explicit cast says the program means it, and gcc
+    /// is silent there.
+    pub(crate) fn warn_saturated_conversion(&self, expr: &Expr, typ: TypeId) {
+        if !crate::diag::warning_group_enabled(OVERFLOW_WARNING) {
+            return;
+        }
+        let from = expr
+            .typ
+            .map_or_else(String::new, |t| self.types.format_type(t, None));
+        crate::diag::warning(
+            self.expr_pos(expr),
+            &format!(
+                "overflow in conversion from '{from}' to '{}' changes value",
+                self.types.format_type(typ, None)
+            ),
+        );
     }
 
     /// The position to report for `expr`.
@@ -954,7 +1045,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// `linearize_global_decl` has no statement to set `current_pos` from, so
     /// at file scope it stays `None` and a diagnostic reads `file:0`. The
     /// expression carries its own position; prefer it.
-    fn expr_pos(&self, expr: &Expr) -> Position {
+    pub(crate) fn expr_pos(&self, expr: &Expr) -> Position {
         if expr.pos != Position::default() {
             expr.pos
         } else {
@@ -1016,7 +1107,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         // GNU zero-length array -- so nothing in the list can be excess.
         let last_index = self
             .types
-            .array_size(array_typ)
+            .array_extent(array_typ)
+            .known()
             .filter(|&n| n > 0)
             .map(|n| n as i64 - 1);
         let in_bounds = |idx: i64| last_index.is_none_or(|last| (0..=last).contains(&idx));
@@ -1293,7 +1385,7 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
         let form = match &visit.kind {
             // A designator into the member, `.s[1] = c`, initializes elements.
-            StructFieldVisitKind::Expr(expr) if self.types.unsized_array_levels(visit.typ) > 0 => {
+            StructFieldVisitKind::Expr(expr) if self.types.is_incomplete_array(visit.typ) => {
                 match &expr.kind {
                     ExprKind::InitList { elements } if elements.is_empty() => FamInit::Empty,
                     ExprKind::InitList { elements } => match elements.as_slice() {
@@ -1980,7 +2072,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         let Initializer::Int(value) = later.init else {
             return None;
         };
-        bitfield_carrier_bytes(bit_offset, bit_width, value)
+        bitfield_carrier_bytes(bit_offset, bit_width, value, self.bit_order(later.typ))
+            .into_iter()
             .map(|(byte, bits, _)| {
                 let inner = (later.offset + byte).checked_sub(union_start)?;
                 Some((inner, 1, Initializer::Int(i128::from(bits))))
@@ -2022,7 +2115,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         let Some(base) = later.offset.checked_sub(earlier.offset + offset) else {
             return false;
         };
-        for (byte, bits, mask) in bitfield_carrier_bytes(bit_offset, bit_width, value) {
+        let order = self.bit_order(later.typ);
+        for (byte, bits, mask) in bitfield_carrier_bytes(bit_offset, bit_width, value, order) {
             if !replace_carrier_bits(fields, base + byte, bits, mask) {
                 return false;
             }
@@ -2158,14 +2252,22 @@ impl<'a> super::linearize::Linearizer<'a> {
                     let outer = self.enter_static_subobject(false);
                     for visit in visits {
                         let held = self.held_union_members(visit.typ, &visit.kind, visit.offset);
+                        let pos = self.visit_pos(&visit);
                         let field_init = match visit.kind {
                             StructFieldVisitKind::BraceElision(sub_elements) => {
                                 self.ast_init_list_to_ir(&sub_elements, visit.typ)
+                            }
+                            // A bit-field's value is placed bit by bit
+                            // below, in the struct's order.
+                            StructFieldVisitKind::Expr(expr) if visit.bit_width.is_some() => {
+                                self.ast_init_in_native_order(&expr, visit.typ)
                             }
                             StructFieldVisitKind::Expr(expr) => {
                                 self.ast_init_to_ir(&expr, visit.typ)
                             }
                         };
+                        let field_init =
+                            self.reject_address_in_reversed(typ, visit.typ, field_init, pos);
                         raw_fields.push(RawFieldInit {
                             offset: visit.offset,
                             field_size: visit.field_size,
@@ -2213,7 +2315,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                         let Initializer::Int(value) = field.init else {
                             continue;
                         };
-                        for (byte, bits, _) in bitfield_carrier_bytes(bit_off, bit_width, value) {
+                        let order = self.bit_order(field.typ);
+                        for (byte, bits, _) in
+                            bitfield_carrier_bytes(bit_off, bit_width, value, order)
+                        {
                             *bitfield_bytes.entry(field.offset + byte).or_default() |= bits;
                         }
                     }
@@ -2910,7 +3015,24 @@ mod tests {
     use crate::parse::ast::Expr;
     use crate::symbol::SymbolTable;
     use crate::target::Target;
-    use crate::types::Type;
+    use crate::types::{ArrayExtent, Type};
+
+    /// A bit-field's bytes, counted from the least significant bit of each
+    /// byte for a little-endian struct and from the most significant for a
+    /// big-endian one: gcc's 20230630-2 shape, `short i : 12` then
+    /// `char c : 1`, holding 341 and 1.
+    #[test]
+    fn a_bitfields_bits_are_placed_in_its_structs_order() {
+        let little = |k, w, v| bitfield_carrier_bytes(k, w, v, ByteOrder::LittleEndian);
+        let big = |k, w, v| bitfield_carrier_bytes(k, w, v, ByteOrder::BigEndian);
+        assert_eq!(little(0, 12, 341), vec![(0, 0x55, 0xff), (1, 0x01, 0x0f)]);
+        assert_eq!(little(12, 1, 1), vec![(1, 0x10, 0x10)]);
+        assert_eq!(big(0, 12, 341), vec![(0, 0x15, 0xff), (1, 0x50, 0xf0)]);
+        assert_eq!(big(12, 1, 1), vec![(1, 0x08, 0x08)]);
+        // Wider than the carrier can hold, or no bits at all: no bytes.
+        assert!(big(120, 16, 1).is_empty());
+        assert!(big(3, 0, 1).is_empty());
+    }
 
     /// A positional initializer element holding an `int` constant.
     fn positional(value: i64, types: &TypeTable) -> InitElement {
@@ -2938,12 +3060,8 @@ mod tests {
         let target = Target::host();
         let mut types = TypeTable::new(&target);
         let elements = build(&types);
-        let array = types.intern(Type {
-            kind: TypeKind::Array,
-            base: Some(types.int_id),
-            array_size: size,
-            ..Default::default()
-        });
+        let extent = size.map_or(ArrayExtent::Unknown, ArrayExtent::Known);
+        let array = types.intern(Type::array_of(types.int_id, extent));
         let symbols = SymbolTable::new();
         let strings = crate::strings::StringTable::new();
         let lin = Linearizer::new(&symbols, &types, &strings, &target);
@@ -3068,12 +3186,7 @@ mod tests {
         let mut types = TypeTable::new(&target);
         let mut strings = crate::strings::StringTable::new();
         let (n, s) = (strings.intern("n"), strings.intern("s"));
-        let chars = types.intern(Type {
-            kind: TypeKind::Array,
-            base: Some(types.char_id),
-            array_size: None,
-            ..Default::default()
-        });
+        let chars = types.intern(Type::array_of(types.char_id, ArrayExtent::Unknown));
         let v = types.intern(Type::struct_type(composite(
             vec![member(n, types.int_id, 0), member(s, chars, 4)],
             4,

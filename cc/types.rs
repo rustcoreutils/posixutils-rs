@@ -167,7 +167,13 @@ impl StructMember {
     /// (6.7.9p9). An anonymous structure or union *is* reached: it is the
     /// member its own members live in (6.7.2.1p13).
     pub fn is_initializable(&self) -> bool {
-        self.name != StringId::EMPTY || self.bit_width.is_none()
+        !self.is_unnamed_bitfield()
+    }
+
+    /// An unnamed bit-field, zero-width or not: padding that lays out the
+    /// members around it (C17 6.7.2.1p12).
+    pub fn is_unnamed_bitfield(&self) -> bool {
+        self.name == StringId::EMPTY && self.bit_width.is_some()
     }
 }
 
@@ -274,6 +280,12 @@ pub struct CompositeType {
     /// union is passed as its first member would be. Unions only; gcc's
     /// attribute governs calls, so assignment and `return` stay strict.
     pub transparent: bool,
+    /// Whether this struct or union stores its scalars in the reverse of the
+    /// target's byte order (gcc's `scalar_storage_order`). The member types
+    /// say it for the scalars themselves; this says it of the aggregate, which
+    /// a member gcc does not reverse -- a pointer -- still answers to: an
+    /// address constant cannot initialize one statically.
+    pub reverse_order: bool,
     /// Which definition a tagless struct, union or enum came from; `None` for
     /// a tagged or synthesized one.
     ///
@@ -314,6 +326,7 @@ impl CompositeType {
             member_align: 1,
             is_complete: false,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         }
@@ -382,6 +395,15 @@ bitflags::bitflags! {
         // where any vector of integer lanes of that shape takes it -- so
         // `unsigned_v = a < b` is valid where `unsigned_v = signed_v` is not.
         const VECTOR_MASK = 1 << 20;
+
+        // A scalar stored in the byte order opposite to the target's: a
+        // member, or an element of an array member, of a struct or union
+        // whose `scalar_storage_order` differs from the target's. Every load
+        // of such an object swaps its bytes after reading them and every
+        // store swaps them before writing (see `Linearizer::emit`). Not part
+        // of what makes two types compatible, and dropped by lvalue
+        // conversion: only an *object* is stored in an order, never a value.
+        const REVERSE_ORDER = 1 << 21;
     }
 }
 
@@ -508,6 +530,35 @@ impl FloatClass {
 
 // Type Representation
 
+/// How many elements an array type has (C17 6.7.6.2p4): a number the
+/// declaration fixed, a number fixed only at run time, or none at all.
+///
+/// The last two were once a single `None`, so `int[n]` and `int[]` interned
+/// to one type and nothing that held only a `TypeId` could say whether
+/// `sizeof` of it was a run-time value or a constraint violation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ArrayExtent {
+    /// `int[3]`: an array of known constant size, complete.
+    Known(usize),
+    /// `int[n]` or a prototype's `int[*]`: a variable length array. Complete,
+    /// but its size is an expression the declaration evaluates, so the type
+    /// does not hold it; the declaration's extents are recorded elsewhere.
+    Variable,
+    /// `int[]`: an array of unknown size, incomplete until a later
+    /// declaration or an initializer gives it one.
+    Unknown,
+}
+
+impl ArrayExtent {
+    /// The element count, when the type itself knows it.
+    pub fn known(self) -> Option<usize> {
+        match self {
+            ArrayExtent::Known(n) => Some(n),
+            ArrayExtent::Variable | ArrayExtent::Unknown => None,
+        }
+    }
+}
+
 /// A C type (compositional structure)
 ///
 /// Types are built compositionally using TypeId references:
@@ -527,8 +578,9 @@ pub struct Type {
     /// Base type for pointers, arrays, and function return types (interned TypeId)
     pub base: Option<TypeId>,
 
-    /// Array size (for arrays)
-    pub array_size: Option<usize>,
+    /// The number of elements, for an array; [`ArrayExtent::Unknown`] for
+    /// every other kind, which has none.
+    pub extent: ArrayExtent,
 
     /// Function parameter types (interned TypeIds)
     pub params: Option<Vec<TypeId>>,
@@ -563,7 +615,7 @@ impl Default for Type {
             kind: TypeKind::Int,
             modifiers: TypeModifiers::empty(),
             base: None,
-            array_size: None,
+            extent: ArrayExtent::Unknown,
             params: None,
             variadic: false,
             noreturn: false,
@@ -600,12 +652,18 @@ impl Type {
         }
     }
 
-    /// Create an array type (element type is a TypeId)
+    /// Create an array of a known number of elements (element type is a
+    /// TypeId)
     pub fn array(base: TypeId, size: usize) -> Self {
+        Self::array_of(base, ArrayExtent::Known(size))
+    }
+
+    /// Create an array type of any extent
+    pub fn array_of(base: TypeId, extent: ArrayExtent) -> Self {
         Self {
             kind: TypeKind::Array,
             base: Some(base),
-            array_size: Some(size),
+            extent,
             ..Default::default()
         }
     }
@@ -782,7 +840,8 @@ impl Type {
             .union(REDUNDANT_SIZE)
             .union(Self::DECL_SPECIFIERS)
             .union(TypeModifiers::MS_VA_LIST)
-            .union(TypeModifiers::VECTOR_MASK);
+            .union(TypeModifiers::VECTOR_MASK)
+            .union(TypeModifiers::REVERSE_ORDER);
 
         // Compare modifiers (ignoring top-level qualifiers)
         let self_mods = self.modifiers.difference(ignored);
@@ -804,9 +863,10 @@ impl Type {
         // passing an ordinary `int m[2][2]` gave "passing argument 3 as
         // 'int[]*' from 'int[2]*' incompatible pointer type" where gcc is
         // silent even under -Wall.
-        match (self.array_size, other.array_size) {
-            (Some(a), Some(b)) if a != b => return false,
-            _ => {}
+        if let (ArrayExtent::Known(a), ArrayExtent::Known(b)) = (self.extent, other.extent) {
+            if a != b {
+                return false;
+            }
         }
 
         // Compare variadic flag. A function type without a prototype says
@@ -908,10 +968,10 @@ impl fmt::Display for Type {
             }
             TypeKind::Array => {
                 if let Some(base) = self.base {
-                    if let Some(size) = self.array_size {
-                        write!(f, "T{}[{}]", base.0, size)
-                    } else {
-                        write!(f, "T{}[]", base.0)
+                    match self.extent {
+                        ArrayExtent::Known(size) => write!(f, "T{}[{}]", base.0, size),
+                        ArrayExtent::Variable => write!(f, "T{}[*]", base.0),
+                        ArrayExtent::Unknown => write!(f, "T{}[]", base.0),
                     }
                 } else {
                     write!(f, "[]")
@@ -954,7 +1014,7 @@ enum TypeKey {
     /// Pointer to interned type
     Pointer(TypeId, u32), // base_id, modifiers
     /// Array of interned type
-    Array(TypeId, Option<usize>, u32), // base_id, size, modifiers
+    Array(TypeId, ArrayExtent, u32), // base_id, extent, modifiers
     /// Function type
     Function {
         ret: TypeId,
@@ -1114,6 +1174,11 @@ pub struct TypeTable {
     /// what System V passes such a vector as. See
     /// [`Self::vector_wrapper_carrier`].
     vector_wrapper_carriers: std::collections::HashMap<(TypeId, u32), TypeId>,
+    /// For each (size, alignment) of a floating vector of four bytes or
+    /// fewer, a struct of that size and alignment holding nothing but
+    /// bytes: what gcc's AAPCS64 passes such a vector as. See
+    /// [`Self::vector_stack_carrier`].
+    vector_stack_carriers: std::collections::HashMap<(usize, u32), TypeId>,
     /// For each integer vector of several lanes and four bytes or fewer, the
     /// vector of as many lanes widened to fill eight bytes: what clang
     /// returns it as on Darwin, by lane count. See [`Self::vector_widened`].
@@ -1195,6 +1260,7 @@ impl TypeTable {
             complex_of: std::collections::HashMap::new(),
             vector_memory_carriers: std::collections::HashMap::new(),
             vector_wrapper_carriers: std::collections::HashMap::new(),
+            vector_stack_carriers: std::collections::HashMap::new(),
             vector_widened: std::collections::HashMap::new(),
             complex_float_id: TypeId::INVALID,
             complex_double_id: TypeId::INVALID,
@@ -1452,7 +1518,7 @@ impl TypeTable {
             }
             TypeKind::Array => {
                 let base = typ.base?;
-                Some(TypeKey::Array(base, typ.array_size, typ.modifiers.bits()))
+                Some(TypeKey::Array(base, typ.extent, typ.modifiers.bits()))
             }
             TypeKind::Function => {
                 let ret = typ.base?;
@@ -1586,8 +1652,9 @@ impl TypeTable {
 
     // Type-shape accessors
 
-    pub fn array_size(&self, id: TypeId) -> Option<usize> {
-        self.get(id).array_size
+    /// The extent of an array type; [`ArrayExtent::Unknown`] for any other.
+    pub fn array_extent(&self, id: TypeId) -> ArrayExtent {
+        self.get(id).extent
     }
 
     /// Has this struct or union been defined, as opposed to merely declared?
@@ -1606,7 +1673,14 @@ impl TypeTable {
     /// Whether `member` is a flexible array member: an array with no bound,
     /// which C17 6.7.2.1p18 allows only as the last member of a structure.
     pub fn is_flexible_array_member(&self, member: &StructMember) -> bool {
-        member.bit_width.is_none() && self.unsized_array_levels(member.typ) > 0
+        member.bit_width.is_none() && self.is_incomplete_array(member.typ)
+    }
+
+    /// Whether `id` is an array of unknown size (C17 6.2.5p22) -- `int[]`,
+    /// not `int[n]`, which is complete.
+    pub fn is_incomplete_array(&self, id: TypeId) -> bool {
+        let typ = self.get(id);
+        typ.kind == TypeKind::Array && typ.extent == ArrayExtent::Unknown
     }
 
     /// Whether an object of type `id` ends in storage with no bound: it is an
@@ -1614,7 +1688,7 @@ impl TypeTable {
     /// last.
     pub fn has_unbounded_tail(&self, id: TypeId) -> bool {
         match self.kind(id) {
-            TypeKind::Array => self.get(id).array_size.is_none(),
+            TypeKind::Array => self.get(id).extent == ArrayExtent::Unknown,
             TypeKind::Struct => self
                 .get(id)
                 .composite
@@ -1625,24 +1699,21 @@ impl TypeTable {
         }
     }
 
-    /// How many array levels of `id`, outermost-first, have no extent.
-    ///
-    /// The type table cannot tell a variably-modified array from an incomplete
-    /// one: `int[n]`, `int[m]` and `int[]` all intern to the same `TypeId`,
-    /// because the key holds `array_size`, which is `None` for all three. So
-    /// this counts the levels that *need* a size expression supplied from
-    /// outside, which is exactly what `record_vm_extents` consumes one
-    /// expression for -- and therefore also the count that says whether a
-    /// given list of expressions describes the whole type or only part of it.
+    /// How many array levels of `id`, outermost-first, are variable length:
+    /// the levels whose extent a declaration's size expression supplies, so
+    /// exactly what `record_vm_extents` consumes one expression for -- and
+    /// therefore also the count that says whether a given list of
+    /// expressions describes the whole type or only part of it. An unknown
+    /// `[]` level is not one: it has no expression.
     ///
     /// Stops at the first non-array level, so a pointer to a variably-modified
     /// array counts zero: its size is the pointer's.
-    pub fn unsized_array_levels(&self, id: TypeId) -> usize {
+    pub fn variable_array_levels(&self, id: TypeId) -> usize {
         let mut levels = 0;
         let mut cur = id;
         while self.kind(cur) == TypeKind::Array {
             let typ = self.get(cur);
-            if typ.array_size.is_none() {
+            if typ.extent == ArrayExtent::Variable {
                 levels += 1;
             }
             match typ.base {
@@ -1800,7 +1871,7 @@ impl TypeTable {
                 let elem = typ.base.map(|b| self.format_type(b, idents));
                 name.push_str(&format!(
                     "__vector({}) {}",
-                    typ.array_size.unwrap_or(0),
+                    typ.extent.known().unwrap_or(0),
                     elem.unwrap_or_default()
                 ));
                 if !decl.is_empty() {
@@ -1819,9 +1890,12 @@ impl TypeTable {
                         break Some(cur);
                     }
                     // Outermost extent first, as the declaration writes it.
-                    match t.array_size {
-                        Some(size) => extents.push_str(&format!("[{}]", size)),
-                        None => extents.push_str("[]"),
+                    // gcc names a variable extent by its expression, which
+                    // the type does not hold; `[]` is what it would print
+                    // for none.
+                    match t.extent {
+                        ArrayExtent::Known(size) => extents.push_str(&format!("[{}]", size)),
+                        ArrayExtent::Variable | ArrayExtent::Unknown => extents.push_str("[]"),
                     }
                     match t.base {
                         Some(base) => cur = base,
@@ -1983,10 +2057,20 @@ impl TypeTable {
     }
 
     /// The alignment a vector of `id`'s size has when none is written.
+    ///
+    /// It also keys the vector's carriers, whatever a written `aligned` made
+    /// of the type: gcc passes a vector as its main variant, so a raised or
+    /// lowered alignment moves no argument -- a `typedef v8si w
+    /// __attribute__((aligned(64)))` starts where a `v8si` would, on a
+    /// 32-byte boundary.
     fn natural_vector_align(&self, id: TypeId) -> u32 {
-        self.size_bytes(id)
-            .next_power_of_two()
-            .min(self.vector_align_cap()) as u32
+        self.natural_vector_align_of_size(self.size_bytes(id))
+    }
+
+    /// The alignment a vector of `bytes` has when none is written: its
+    /// width rounded up to a power of two, capped by the target.
+    fn natural_vector_align_of_size(&self, bytes: usize) -> u32 {
+        bytes.next_power_of_two().min(self.vector_align_cap()) as u32
     }
 
     /// The most a vector aligns to when none is written; see
@@ -2015,22 +2099,35 @@ impl TypeTable {
     /// layout. An `aligned(n)` written alongside, `align`, takes precedence,
     /// which is what `<link.h>` does: `__vector_size__(32), __aligned__(16)`.
     pub fn vector_of(&mut self, elem: TypeId, count: usize, align: Option<u32>) -> TypeId {
-        let bytes = self.size_bytes(elem) * count;
-        let natural = bytes.next_power_of_two().min(self.vector_align_cap()) as u32;
-        let align = align.unwrap_or(natural);
-        if bytes > 16 {
-            self.intern_vector_memory_carrier(bytes, align);
-        }
-        let vector = self.intern(Type {
+        let natural = self.natural_vector_align_of_size(self.size_bytes(elem) * count);
+        let vector = |align| Type {
             kind: TypeKind::Array,
             base: Some(elem),
-            array_size: Some(count),
+            extent: ArrayExtent::Known(count),
             modifiers: TypeModifiers::VECTOR,
             explicit_align: Some(align),
             ..Default::default()
-        });
+        };
+        let plain = self.intern(vector(natural));
+        self.intern_vector_carriers(plain, elem, count, natural);
+        match align {
+            Some(align) if align != natural => self.intern(vector(align)),
+            _ => plain,
+        }
+    }
+
+    /// Make the carriers of the vector `vector` -- `count` lanes of `elem`,
+    /// at its natural alignment `align` -- once.
+    fn intern_vector_carriers(&mut self, vector: TypeId, elem: TypeId, count: usize, align: u32) {
+        let bytes = self.size_bytes(vector);
+        if bytes > 16 {
+            self.intern_vector_memory_carrier(bytes, align);
+        }
         if count == 1 && self.is_float(elem) {
             self.intern_vector_wrapper_carrier(vector, elem, align);
+        }
+        if bytes <= 4 && self.is_float(elem) {
+            self.intern_vector_stack_carrier(bytes, align);
         }
         if count > 1
             && bytes <= 4
@@ -2041,7 +2138,6 @@ impl TypeTable {
             let widened = self.vector_of(lane, count, None);
             self.vector_widened.insert(count, widened);
         }
-        vector
     }
 
     /// The vector of `vec`'s lane count whose lanes are widened to fill
@@ -2083,6 +2179,7 @@ impl TypeTable {
             member_align: align as usize,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         };
@@ -2098,11 +2195,19 @@ impl TypeTable {
     /// one floating lane: System V classes such a vector MEMORY, as it does
     /// a struct holding one, and no scalar C type travels that way.
     pub fn vector_wrapper_carrier(&self, vec: TypeId) -> Option<TypeId> {
-        let (elem, _) = self.vector_lanes(vec)?;
-        let align = self.get(vec).explicit_align?;
-        self.vector_wrapper_carriers
-            .get(&(self.float_lane_key(elem), align))
-            .copied()
+        let (elem, count) = self.vector_lanes(vec)?;
+        if count != 1 || !self.is_float(elem) {
+            return None;
+        }
+        let key = (self.float_lane_key(elem), self.natural_vector_align(vec));
+        Some(self.vector_wrapper_carriers[&key])
+    }
+
+    /// Whether `id` is a carrier of [`Self::vector_wrapper_carrier`]. A
+    /// struct the program declares holding such a vector is an ordinary
+    /// composite.
+    pub fn is_vector_wrapper_carrier(&self, id: TypeId) -> bool {
+        self.vector_wrapper_carriers.values().any(|&c| c == id)
     }
 
     /// The floating kind and class of `elem`, as a stable key: one-lane
@@ -2114,9 +2219,23 @@ impl TypeTable {
 
     /// Make the memory carrier for vectors of `bytes` and `align`, once.
     fn intern_vector_memory_carrier(&mut self, bytes: usize, align: u32) {
-        if self.vector_memory_carriers.contains_key(&(bytes, align)) {
-            return;
+        if !self.vector_memory_carriers.contains_key(&(bytes, align)) {
+            let id = self.intern_byte_struct(bytes, align);
+            self.vector_memory_carriers.insert((bytes, align), id);
         }
+    }
+
+    /// Make the stack carrier for floating vectors of `bytes` and `align`,
+    /// once.
+    fn intern_vector_stack_carrier(&mut self, bytes: usize, align: u32) {
+        if !self.vector_stack_carriers.contains_key(&(bytes, align)) {
+            let id = self.intern_byte_struct(bytes, align);
+            self.vector_stack_carriers.insert((bytes, align), id);
+        }
+    }
+
+    /// A fresh struct of `bytes` and `align` holding nothing but bytes.
+    fn intern_byte_struct(&mut self, bytes: usize, align: u32) -> TypeId {
         let array = self.intern(Type::array(self.uchar_id, bytes));
         let member = StructMember {
             name: StringId::EMPTY,
@@ -2136,26 +2255,47 @@ impl TypeTable {
             member_align: align as usize,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         };
-        let id = self.intern(Type {
+        self.intern(Type {
             kind: TypeKind::Struct,
             composite: Some(Box::new(composite)),
             ..Default::default()
-        });
-        self.vector_memory_carriers.insert((bytes, align), id);
+        })
+    }
+
+    /// The struct a floating vector of type `vec`, four bytes or fewer, is
+    /// passed as under gcc's AAPCS64: on the stack whatever registers are
+    /// left, with every later general-register argument after it
+    /// ([`crate::abi::ArgClass::Stacked`]) -- like no C type, so the
+    /// carrier is a type of its own, recognised by identity
+    /// ([`Self::is_vector_stack_carrier`]). A struct the program declares
+    /// holding such a vector is an ordinary composite.
+    pub fn vector_stack_carrier(&self, vec: TypeId) -> TypeId {
+        self.vector_stack_carriers[&(self.size_bytes(vec), self.natural_vector_align(vec))]
+    }
+
+    /// Whether `id` is a carrier of [`Self::vector_stack_carrier`].
+    pub fn is_vector_stack_carrier(&self, id: TypeId) -> bool {
+        self.vector_stack_carriers.values().any(|&c| c == id)
+    }
+
+    /// Whether `vec` is a floating vector of four bytes or fewer: the one
+    /// shape no machine register width describes, so each convention has a
+    /// rule of its own for it.
+    pub fn is_small_float_vector(&self, vec: TypeId) -> bool {
+        self.vector_lanes(vec)
+            .is_some_and(|(lane, _)| self.is_float(lane) && self.size_bytes(vec) <= 4)
     }
 
     /// The struct a vector of type `vec`, over sixteen bytes, is passed and
     /// returned as: gcc's conventions treat such a vector exactly as an
     /// aggregate of its size and alignment -- MEMORY class on System V, by
     /// reference on AAPCS64 and Win64, returned through a hidden pointer.
-    pub fn vector_memory_carrier(&self, vec: TypeId) -> Option<TypeId> {
-        let align = self.get(vec).explicit_align?;
-        self.vector_memory_carriers
-            .get(&(self.size_bytes(vec), align))
-            .copied()
+    pub fn vector_memory_carrier(&self, vec: TypeId) -> TypeId {
+        self.vector_memory_carriers[&(self.size_bytes(vec), self.natural_vector_align(vec))]
     }
 
     /// The element type and the number of elements of a vector type, or
@@ -2165,7 +2305,7 @@ impl TypeTable {
             return None;
         }
         let typ = self.get(id);
-        Some((typ.base?, typ.array_size?))
+        Some((typ.base?, typ.extent.known()?))
     }
 
     /// The type of a comparison of two vectors of type `id`: as many lanes,
@@ -2715,13 +2855,87 @@ impl TypeTable {
     /// *value* an lvalue yields: `volatile int v; v + 0` has type `int`, and
     /// nothing downstream may conclude from the sum's type that the addition
     /// touched a volatile object.
+    ///
+    /// The storage order goes with them: a value read out of a big-endian
+    /// member is an ordinary number, and an rvalue that kept the order would
+    /// make `__auto_type v = s.m;` a local stored back to front.
     pub fn unqualified(&mut self, id: TypeId) -> TypeId {
-        if self.qualifiers(id).is_empty() {
+        let dropped = Type::QUALIFIERS.union(TypeModifiers::REVERSE_ORDER);
+        if !self.modifiers(id).intersects(dropped) {
             return id;
         }
         let mut unqualified = self.get(id).clone();
-        unqualified.modifiers.remove(Type::QUALIFIERS);
+        unqualified.modifiers.remove(dropped);
         self.intern(unqualified)
+    }
+
+    /// Is an object of type `id` stored in the byte order opposite to the
+    /// target's? See [`TypeModifiers::REVERSE_ORDER`].
+    pub fn reverses_storage(&self, id: TypeId) -> bool {
+        self.modifiers(id).contains(TypeModifiers::REVERSE_ORDER)
+    }
+
+    /// The type a member declared as `id` has in a struct or union whose
+    /// scalars are stored in the reverse of the target's byte order.
+    ///
+    /// gcc's rule: the order reaches the scalar members -- integers, enums,
+    /// floating and complex types -- and the elements of an array of them,
+    /// at any depth. It does not reach a pointer or a vector, which gcc does
+    /// not count as scalars here, nor a struct or union, which has the order
+    /// its own type was defined with.
+    pub fn in_reverse_storage(&mut self, id: TypeId) -> TypeId {
+        if self.kind(id) == TypeKind::Array && !self.is_vector(id) {
+            let Some(elem) = self.base_type(id) else {
+                return id;
+            };
+            let reversed = self.in_reverse_storage(elem);
+            if reversed == elem {
+                return id;
+            }
+            let mut array = self.get(id).clone();
+            array.base = Some(reversed);
+            return self.intern(array);
+        }
+        if !self.is_arithmetic(id) || self.reverses_storage(id) {
+            return id;
+        }
+        let mut reversed = self.get(id).clone();
+        reversed.modifiers |= TypeModifiers::REVERSE_ORDER;
+        self.intern(reversed)
+    }
+
+    /// `id` stored in the target's own byte order, through arrays: the
+    /// inverse of [`Self::in_reverse_storage`]. An object declared from the
+    /// type of a member -- `typeof (s.m) v;` -- is an ordinary object.
+    pub fn in_native_storage(&mut self, id: TypeId) -> TypeId {
+        if self.kind(id) == TypeKind::Array && !self.is_vector(id) {
+            let Some(elem) = self.base_type(id) else {
+                return id;
+            };
+            let native = self.in_native_storage(elem);
+            if native == elem {
+                return id;
+            }
+            let mut array = self.get(id).clone();
+            array.base = Some(native);
+            return self.intern(array);
+        }
+        if !self.reverses_storage(id) {
+            return id;
+        }
+        let mut native = self.get(id).clone();
+        native.modifiers.remove(TypeModifiers::REVERSE_ORDER);
+        self.intern(native)
+    }
+
+    /// The innermost element of an array type, or `id` itself.
+    pub fn innermost_element(&self, id: TypeId) -> TypeId {
+        match self.base_type(id) {
+            Some(elem) if self.kind(id) == TypeKind::Array && !self.is_vector(id) => {
+                self.innermost_element(elem)
+            }
+            _ => id,
+        }
     }
 
     /// Whether `id` is an unsigned integer type.
@@ -3016,7 +3230,8 @@ impl TypeTable {
             // keeps a too-wide type from looking small.
             TypeKind::Array => {
                 let elem_size = typ.base.map(|b| self.size_bits(b)).unwrap_or(0) as u64;
-                let count = typ.array_size.unwrap_or(0) as u64;
+                // A variable or unknown extent has no size the type knows.
+                let count = typ.extent.known().unwrap_or(0) as u64;
                 elem_size.saturating_mul(count).min(u32::MAX as u64) as u32
             }
             TypeKind::Struct | TypeKind::Union => {
@@ -3122,7 +3337,7 @@ impl TypeTable {
             TypeKind::Function => 1,
             TypeKind::Array => {
                 let elem = typ.base.map(|b| self.size_bytes(b)).unwrap_or(0);
-                let count = typ.array_size.unwrap_or(0);
+                let count = typ.extent.known().unwrap_or(0);
                 elem.saturating_mul(count)
             }
             _ => (self.size_bits(id) / 8) as usize,
@@ -3584,10 +3799,19 @@ impl TypeTable {
             composite.base = Some(self.composite_type(x, y));
         }
         match composite.kind {
-            // "Unknown" is spelled both as no size and as zero; see
+            // A known size wins, then a variable one (6.2.7p3). "Unknown" is
+            // spelled both as no size and as zero; see
             // `redeclaration_compatible`.
-            TypeKind::Array if matches!(composite.array_size, None | Some(0)) => {
-                composite.array_size = other.array_size.or(composite.array_size);
+            TypeKind::Array => {
+                composite.extent = match (composite.extent, other.extent) {
+                    (ArrayExtent::Known(0), other @ ArrayExtent::Known(_)) => other,
+                    (known @ ArrayExtent::Known(_), _) => known,
+                    (_, known @ ArrayExtent::Known(_)) => known,
+                    (ArrayExtent::Variable, _) | (_, ArrayExtent::Variable) => {
+                        ArrayExtent::Variable
+                    }
+                    (ArrayExtent::Unknown, ArrayExtent::Unknown) => ArrayExtent::Unknown,
+                };
             }
             TypeKind::Function => match (&composite.params, &other.params) {
                 (None, Some(_)) => {
@@ -3645,9 +3869,11 @@ impl TypeTable {
     ///
     /// The System V ABI allocates every member from a running *bit* offset
     /// measured from the start of the struct. A bitfield takes the next free
-    /// bits; its declared type contributes the struct's alignment and the size
-    /// of the window the field may not straddle, but never an allocation of
-    /// its own. So two bitfields of different declared types share a unit
+    /// bits; its declared type contributes the size of the window the field
+    /// may not straddle and the struct's alignment, but never an allocation of
+    /// its own. An unnamed bit-field contributes the alignment, and reserves
+    /// the window, only where [`Self::unnamed_bitfields_align_aggregate`]
+    /// says so. So two bitfields of different declared types share a unit
     /// freely, and a bitfield reuses the padding left by the plain member
     /// before it.
     /// `pack_cap` is the `#pragma pack(n)` in force, if any. A struct-level
@@ -3706,11 +3932,13 @@ impl TypeTable {
                 // struct 8 bytes with alignment 4 -- and unlike an ordinary
                 // member's, that contribution survives packing, so it is kept
                 // out of `max_align` and applied afterwards. Both are gcc's
-                // answers on the respective target.
-                if self.target_arch == Arch::Aarch64 {
-                    zero_width_align = zero_width_align.max(self.alignment(member.typ));
+                // answers on the respective target; Apple arm64 gives the
+                // x86-64 one (see `unnamed_bitfields_align_aggregate`).
+                let align = self.zero_width_alignment(member);
+                if self.unnamed_bitfields_align_aggregate() {
+                    zero_width_align = zero_width_align.max(align);
                 }
-                bit_offset = bit_offset.next_multiple_of(unit_bits);
+                bit_offset = bit_offset.next_multiple_of(unit_bits.max(align as u128 * 8));
                 member.offset = bytes_of(bit_offset);
                 member.bit_offset = None;
                 member.access_bytes = None;
@@ -3718,12 +3946,26 @@ impl TypeTable {
             }
 
             let align = self.member_alignment(member, pack_cap);
-            max_align = max_align.max(align);
+            // An unnamed field, on an ABI where its type does not shape the
+            // aggregate, is placed by the same rules as any bit-field but is
+            // padding as far as the aggregate is concerned: it neither aligns
+            // it nor reserves a window -- nothing ever accesses the field --
+            // so the size need only cover the bytes its bits touch. gcc makes
+            // `struct { char a; long :3; char b; }` 3 bytes on x86-64.
+            let shapes_aggregate =
+                !member.is_unnamed_bitfield() || self.unnamed_bitfields_align_aggregate();
+            if shapes_aggregate {
+                max_align = max_align.max(align);
+            }
             // An alignment written on the field places it, as it places any
             // member: `int b:3 __attribute__((aligned(8)))` starts at the
-            // next 8-byte boundary, packed or not. Without one, the rules below
+            // next 8-byte boundary, packed or not. So does one its type
+            // carries from a typedef's `aligned`, unless packing drops it:
+            // gcc puts `ai8 b:3` at 8 too. Without either, the rules below
             // place it.
-            if member.align.written.is_some() {
+            if member.align.written.is_some()
+                || self.alignment(member.typ) > self.natural_alignment(member.typ)
+            {
                 bit_offset = bit_offset.next_multiple_of(align as u128 * 8);
             }
 
@@ -3738,10 +3980,7 @@ impl TypeTable {
                 // free bit, and its access span is exactly the bytes its own
                 // bits touch: never wider than the object, so `window_end`
                 // takes no contribution here.
-                let within = bit_offset % 8;
-                member.offset = bytes_of(bit_offset);
-                member.bit_offset = Some(within as u32);
-                member.access_bytes = Some((within + bit_width).div_ceil(8) as u32);
+                Self::place_in_own_bytes(member, bit_offset, bit_width);
             } else {
                 // Advance only when the field would otherwise straddle a unit
                 // boundary, then read and write it through the
@@ -3754,11 +3993,15 @@ impl TypeTable {
                 if bit_offset % unit_bits + bit_width > unit_bits {
                     bit_offset = bit_offset.next_multiple_of(unit_bits);
                 }
-                let offset_bits = bit_offset / unit_bits * unit_bits;
-                member.offset = bytes_of(offset_bits);
-                member.bit_offset = Some((bit_offset - offset_bits) as u32);
-                member.access_bytes = Some(unit_bytes as u32);
-                window_end = window_end.max(offset_bits + unit_bits);
+                if shapes_aggregate {
+                    let offset_bits = bit_offset / unit_bits * unit_bits;
+                    member.offset = bytes_of(offset_bits);
+                    member.bit_offset = Some((bit_offset - offset_bits) as u32);
+                    member.access_bytes = Some(unit_bytes as u32);
+                    window_end = window_end.max(offset_bits + unit_bits);
+                } else {
+                    Self::place_in_own_bytes(member, bit_offset, bit_width);
+                }
             }
 
             bit_offset += bit_width;
@@ -3792,6 +4035,43 @@ impl TypeTable {
         };
         let raised = member.align.written.map_or(base, |w| base.max(w as usize));
         pack_cap.map_or(raised, |cap| raised.min(cap as usize))
+    }
+
+    /// Record a bit-field at `bit_offset` as spanning exactly the bytes its
+    /// own bits touch: the first of them is its offset, and its bit offset
+    /// within that byte is below 8.
+    fn place_in_own_bytes(member: &mut StructMember, bit_offset: u128, bit_width: u128) {
+        let within = bit_offset % 8;
+        member.offset = usize::try_from(bit_offset / 8).unwrap_or(usize::MAX);
+        member.bit_offset = Some(within as u32);
+        member.access_bytes = Some((within + bit_width).div_ceil(8) as u32);
+    }
+
+    /// The boundary a zero-width bit-field forces the next member to, in
+    /// bytes, beyond its storage unit: its type's alignment, raised by any
+    /// alignment written on it. Packing lowers neither -- gcc leaves
+    /// `int :0 __attribute__((aligned(8)))` at an 8-byte boundary under
+    /// `#pragma pack(1)` -- and it is also what the field contributes to its
+    /// aggregate's alignment where [`Self::unnamed_bitfields_align_aggregate`].
+    fn zero_width_alignment(&self, member: &StructMember) -> usize {
+        let written = member.align.written.map_or(1, |w| w as usize);
+        self.alignment(member.typ).max(written)
+    }
+
+    /// Whether an unnamed bit-field's declared type shapes its aggregate:
+    /// raises the struct's or union's alignment to its own -- zero-width or
+    /// not, and through packing for a zero-width one -- and reserves the
+    /// `sizeof(T)` window a named field would be accessed through.
+    ///
+    /// The x86-64 psABI says it does not ("unnamed bit-fields' types do not
+    /// affect the alignment of a structure or union"), on Linux and Darwin
+    /// alike. AAPCS64 says it does, and gcc follows it on aarch64 Linux.
+    /// Apple arm64 does not: clang's `DarwinAArch64TargetInfo` turns
+    /// `UseZeroLengthBitfieldAlignment` off, and with it off
+    /// `ItaniumRecordLayoutBuilder::LayoutBitField` drops an anonymous
+    /// bit-field's alignment from the record -- the x86-64 answer.
+    pub fn unnamed_bitfields_align_aggregate(&self) -> bool {
+        self.target_arch == Arch::Aarch64 && self.target_os != Os::MacOS
     }
 
     /// Whether a bit-field is laid out packed -- at the next free bit, through
@@ -3834,6 +4114,13 @@ impl TypeTable {
             // and no storage unit, rather than left as it was found: this
             // computes a layout, so every field of it is an output, and
             // `compute_struct_layout` clears the same two for the same reason.
+            // An unnamed bit-field, where the ABI ignores its type, is
+            // padding: as in a struct it spans only the bytes its bits touch
+            // and adds no alignment, so gcc makes `union { int :20; char c; }`
+            // three bytes on x86-64.
+            let shapes_aggregate =
+                !member.is_unnamed_bitfield() || self.unnamed_bitfields_align_aggregate();
+            let own_bytes = !shapes_aggregate || Self::packs_bitfield(member, pack_cap);
             if let Some(w) = member.bit_width.filter(|w| *w > 0) {
                 member.bit_offset = Some(0);
                 // Packed, the span is the bytes the field's own bits touch, as
@@ -3841,7 +4128,7 @@ impl TypeTable {
                 // bytes under gcc, not 4. Unpacked the two spellings coincide
                 // on both targets, and gating on the cap keeps that output
                 // bit-identical.
-                member.access_bytes = Some(if Self::packs_bitfield(member, pack_cap) {
+                member.access_bytes = Some(if own_bytes {
                     w.div_ceil(8)
                 } else {
                     self.size_bytes(member.typ) as u32
@@ -3860,8 +4147,8 @@ impl TypeTable {
                 // Except on AAPCS64, where it still demands its type's
                 // alignment -- and, as in a struct, packing does not suppress
                 // that. The union's size follows from the rounding.
-                if self.target_arch == Arch::Aarch64 {
-                    zero_width_align = zero_width_align.max(self.alignment(member.typ));
+                if self.unnamed_bitfields_align_aggregate() {
+                    zero_width_align = zero_width_align.max(self.zero_width_alignment(member));
                 }
                 continue;
             }
@@ -3870,13 +4157,13 @@ impl TypeTable {
             // is what makes `packed union { unsigned a:20; char c; }` three
             // bytes rather than four.
             let member_size = match member.bit_width {
-                Some(w) if w > 0 && Self::packs_bitfield(member, pack_cap) => {
-                    w.div_ceil(8) as usize
-                }
+                Some(w) if own_bytes => w.div_ceil(8) as usize,
                 _ => self.size_bytes(member.typ),
             };
             max_size = max_size.max(member_size);
-            max_align = max_align.max(self.member_alignment(member, pack_cap));
+            if shapes_aggregate {
+                max_align = max_align.max(self.member_alignment(member, pack_cap));
+            }
         }
 
         let max_align = max_align.max(zero_width_align);
@@ -3966,6 +4253,7 @@ mod tests {
             member_align: 4,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         };
@@ -4100,6 +4388,7 @@ mod tests {
             member_align: 4,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         };
@@ -4349,6 +4638,7 @@ mod tests {
             member_align: 8,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         };
@@ -4413,6 +4703,7 @@ mod tests {
             member_align: 8,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         };
@@ -4459,7 +4750,7 @@ mod tests {
         let mut types = TypeTable::new(&Target::host());
         let int_arr_id = types.intern(Type::array(types.int_id, 10));
         assert_eq!(types.kind(int_arr_id), TypeKind::Array);
-        assert_eq!(types.array_size(int_arr_id), Some(10));
+        assert_eq!(types.array_extent(int_arr_id), ArrayExtent::Known(10));
 
         let base_id = types.base_type(int_arr_id).unwrap();
         assert_eq!(types.kind(base_id), TypeKind::Int);
@@ -4661,48 +4952,108 @@ mod tests {
         }
     }
 
-    /// `unsized_array_levels` counts the array levels that need a size
+    /// `variable_array_levels` counts the array levels that need a size
     /// expression supplied from outside. It is what says whether a list of
-    /// such expressions describes the whole type or only part of it, so
-    /// `int[][n]` (two unsized levels, one expression) can be told from
-    /// `int[n]` (one and one).
+    /// such expressions describes the whole type or only part of it, and an
+    /// unknown `[]` level is not among them.
     #[test]
-    fn test_unsized_array_levels() {
-        let mut types = TypeTable::new(&Target::host());
+    fn test_variable_array_levels() {
+        let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+        let mut types = TypeTable::new(&target);
         let int_id = types.int_id;
 
         // Not an array at all.
-        assert_eq!(types.unsized_array_levels(int_id), 0);
+        assert_eq!(types.variable_array_levels(int_id), 0);
 
         // Fully sized arrays need nothing.
         let a4 = types.intern(Type::array(int_id, 4));
-        assert_eq!(types.unsized_array_levels(a4), 0);
+        assert_eq!(types.variable_array_levels(a4), 0);
         let a3x4 = types.intern(Type::array(a4, 3));
-        assert_eq!(types.unsized_array_levels(a3x4), 0);
+        assert_eq!(types.variable_array_levels(a3x4), 0);
 
-        // An absent extent counts once, at whichever level it sits. This is
-        // how a variably-modified dimension is represented: the size lives in
-        // a side-channel expression, not in the type.
-        fn unsized_array(types: &mut TypeTable, base: TypeId) -> TypeId {
-            let mut t = Type::array(base, 0);
-            t.array_size = None;
-            types.intern(t)
-        }
-        let an = unsized_array(&mut types, int_id);
-        assert_eq!(types.unsized_array_levels(an), 1);
+        // A variable extent counts once, at whichever level it sits.
+        let an = types.intern(Type::array_of(int_id, ArrayExtent::Variable));
+        assert_eq!(types.variable_array_levels(an), 1);
 
         // `int[3][n]`: outer sized, inner not.
         let a3xn = types.intern(Type::array(an, 3));
-        assert_eq!(types.unsized_array_levels(a3xn), 1);
+        assert_eq!(types.variable_array_levels(a3xn), 1);
 
-        // `int[n][m]`: both absent.
-        let anxm = unsized_array(&mut types, an);
-        assert_eq!(types.unsized_array_levels(anxm), 2);
+        // `int[n][m]`: both variable.
+        let anxm = types.intern(Type::array_of(an, ArrayExtent::Variable));
+        assert_eq!(types.variable_array_levels(anxm), 2);
+
+        // `int[][n]`: the unknown level has no expression.
+        let unknown_xn = types.intern(Type::array_of(an, ArrayExtent::Unknown));
+        assert_eq!(types.variable_array_levels(unknown_xn), 1);
+        let unknown = types.intern(Type::array_of(int_id, ArrayExtent::Unknown));
+        assert_eq!(types.variable_array_levels(unknown), 0);
 
         // A pointer to a variably-modified array stops at the pointer: its
         // size is the pointer's, and nothing about its extent is needed.
         let ptr = types.intern(Type::pointer(an));
-        assert_eq!(types.unsized_array_levels(ptr), 0);
+        assert_eq!(types.variable_array_levels(ptr), 0);
+    }
+
+    /// `int[]` and `int[n]` are two types: the first is incomplete, the
+    /// second a complete variable length array. They intern apart, and
+    /// neither is the same as `int[3]`, though all three are compatible.
+    #[test]
+    fn array_extents_are_distinct_types() {
+        let target = Target::new(crate::target::Arch::Aarch64, crate::target::Os::Linux);
+        let mut types = TypeTable::new(&target);
+        let int_id = types.int_id;
+        let unknown = types.intern(Type::array_of(int_id, ArrayExtent::Unknown));
+        let variable = types.intern(Type::array_of(int_id, ArrayExtent::Variable));
+        let three = types.intern(Type::array(int_id, 3));
+        let four = types.intern(Type::array(int_id, 4));
+
+        assert_ne!(unknown, variable);
+        assert_eq!(types.array_extent(unknown), ArrayExtent::Unknown);
+        assert_eq!(types.array_extent(variable), ArrayExtent::Variable);
+        assert_eq!(types.array_extent(three), ArrayExtent::Known(3));
+        assert_eq!(types.array_extent(int_id), ArrayExtent::Unknown);
+        assert_eq!(ArrayExtent::Known(3).known(), Some(3));
+        assert_eq!(ArrayExtent::Variable.known(), None);
+        assert_eq!(ArrayExtent::Unknown.known(), None);
+
+        // Interning the same extent twice gives the same type.
+        assert_eq!(
+            types.intern(Type::array_of(int_id, ArrayExtent::Variable)),
+            variable
+        );
+
+        // Only the unknown extent is incomplete; a flexible array member is
+        // one, a variable length array is not.
+        assert!(types.is_incomplete_array(unknown));
+        assert!(!types.is_incomplete_array(variable));
+        assert!(!types.is_incomplete_array(three));
+        assert!(!types.is_incomplete_array(int_id));
+        assert!(types.has_unbounded_tail(unknown));
+        assert!(!types.has_unbounded_tail(variable));
+
+        // C17 6.7.6.2p6: only two constant sizes can disagree.
+        assert!(types.types_compatible(unknown, variable));
+        assert!(types.types_compatible(unknown, three));
+        assert!(types.types_compatible(variable, three));
+        assert!(!types.types_compatible(three, four));
+
+        // C17 6.2.7p3: the composite takes a known size, else a variable one.
+        assert_eq!(types.composite_type(unknown, three), three);
+        assert_eq!(types.composite_type(variable, three), three);
+        assert_eq!(types.composite_type(three, variable), three);
+        assert_eq!(types.composite_type(unknown, variable), variable);
+        assert_eq!(types.composite_type(variable, unknown), variable);
+
+        // Neither has a size the type knows.
+        assert_eq!(types.size_bytes(unknown), 0);
+        assert_eq!(types.size_bytes(variable), 0);
+        assert_eq!(types.size_bytes(three), 12);
+
+        // A variable extent is spelled as gcc spells a missing one, since the
+        // type does not hold the expression.
+        assert_eq!(types.format_type(variable, None), "int[]");
+        assert_eq!(types.format_type(unknown, None), "int[]");
     }
 
     /// A zero-width bit-field forces the next member to a boundary on every
@@ -4755,23 +5106,239 @@ mod tests {
             }
         }
 
-        let x86 = Target::new(Arch::X86_64, Os::Linux);
         let arm = Target::new(Arch::Aarch64, Os::Linux);
-
-        // Struct: the boundary applies everywhere, the alignment does not.
-        assert_eq!(layout(&x86, None, false), (5, 1));
+        // Apple arm64 takes the x86-64 answer: clang turns AAPCS64's
+        // zero-length bit-field alignment off for it.
+        for x86 in [
+            Target::new(Arch::X86_64, Os::Linux),
+            Target::new(Arch::X86_64, Os::MacOS),
+            Target::new(Arch::Aarch64, Os::MacOS),
+        ] {
+            // Struct: the boundary applies everywhere, the alignment does not.
+            assert_eq!(layout(&x86, None, false), (5, 1));
+            // Packing caps an ordinary member's alignment but not this one.
+            assert_eq!(layout(&x86, Some(1), false), (5, 1));
+            // Union: a zero-width bitfield occupies no storage, so it cannot
+            // widen the union.
+            assert_eq!(layout(&x86, None, true), (1, 1));
+            assert_eq!(layout(&x86, Some(1), true), (1, 1));
+        }
         assert_eq!(layout(&arm, None, false), (8, 4));
-
-        // Packing caps an ordinary member's alignment but not this one.
-        assert_eq!(layout(&x86, Some(1), false), (5, 1));
         assert_eq!(layout(&arm, Some(1), false), (8, 4));
-
-        // Union: a zero-width bitfield occupies no storage, so it cannot
-        // widen the union.
-        assert_eq!(layout(&x86, None, true), (1, 1));
         assert_eq!(layout(&arm, None, true), (4, 4));
-        assert_eq!(layout(&x86, Some(1), true), (1, 1));
         assert_eq!(layout(&arm, Some(1), true), (4, 4));
+    }
+
+    /// An unnamed bit-field of non-zero width is placed as any bit-field is
+    /// on every target; whether its declared type also aligns the aggregate,
+    /// and widens it to the `sizeof(T)` window, is the ABI's call. The x86-64
+    /// psABI (Linux and Darwin) and Apple arm64 say no; AAPCS64 says yes.
+    /// Each row is gcc's on x86-64 and aarch64 Linux, measured, and clang's
+    /// record-layout rule for Apple arm64.
+    #[test]
+    fn test_unnamed_bitfield_alignment_is_abi_specific() {
+        #[derive(Clone, Copy)]
+        enum T {
+            Char,
+            Short,
+            Int,
+            Long,
+            LongLong,
+            Int128,
+        }
+        // (type, width, named); a width of None is an ordinary member.
+        type Shape = &'static [(T, Option<u32>, bool)];
+        fn layout(target: &Target, shape: Shape, union_: bool, pack: Option<u32>) -> Vec<usize> {
+            let types = TypeTable::new(target);
+            let mut idents = crate::strings::StringTable::new();
+            let name = idents.intern("m");
+            let mut members: Vec<_> = shape
+                .iter()
+                .map(|&(t, bit_width, named)| StructMember {
+                    name: if named { name } else { StringId::EMPTY },
+                    typ: match t {
+                        T::Char => types.char_id,
+                        T::Short => types.short_id,
+                        T::Int => types.int_id,
+                        T::Long => types.long_id,
+                        T::LongLong => types.longlong_id,
+                        T::Int128 => types.uint128_id,
+                    },
+                    offset: 0,
+                    bit_offset: None,
+                    bit_width,
+                    access_bytes: None,
+                    align: MemberAlign::NATURAL,
+                })
+                .collect();
+            let (size, align) = if union_ {
+                types.compute_union_layout(&mut members, pack)
+            } else {
+                types.compute_struct_layout(&mut members, pack)
+            };
+            // The span invariant: no member is accessed past the aggregate.
+            for m in &members {
+                if let Some(access) = m.access_bytes {
+                    assert!(m.offset + access as usize <= size, "{target:?}");
+                }
+            }
+            // Size, alignment, then the offset of every named member.
+            let named = members.iter().filter(|m| m.name != StringId::EMPTY);
+            [size, align]
+                .into_iter()
+                .chain(named.map(|m| m.offset))
+                .collect()
+        }
+        use T::*;
+        const C: (T, Option<u32>, bool) = (Char, None, true);
+        const SH: (T, Option<u32>, bool) = (Short, None, true);
+        // (shape, union, pack, x86-64 and Apple arm64, aarch64 Linux)
+        type Row = (Shape, bool, Option<u32>, &'static [usize], &'static [usize]);
+        #[rustfmt::skip]
+        let rows: &[Row] = &[
+            // { char a; int :5; char b; }
+            (&[C, (Int, Some(5), false), C], false, None, &[3, 1, 0, 2], &[4, 4, 0, 2]),
+            // { char a; long :3; char b; }
+            (&[C, (Long, Some(3), false), C], false, None, &[3, 1, 0, 2], &[8, 8, 0, 2]),
+            // { int :20; char c; }
+            (&[(Int, Some(20), false), C], false, None, &[4, 1, 3], &[4, 4, 3]),
+            // { char a; int :5; int :7; char b; }
+            (&[C, (Int, Some(5), false), (Int, Some(7), false), C], false, None,
+             &[4, 1, 0, 3], &[4, 4, 0, 3]),
+            // { short a; int :31; char b; }
+            (&[SH, (Int, Some(31), false), C], false, None, &[10, 2, 0, 8], &[12, 4, 0, 8]),
+            // { unsigned __int128 :96; } -- never accessed, so no carrier
+            (&[(Int128, Some(96), false)], false, None, &[12, 1], &[16, 16]),
+            // { char a; long long :40; char b; }
+            (&[C, (LongLong, Some(40), false), C], false, None, &[7, 1, 0, 6], &[8, 8, 0, 6]),
+            // { char a; long :33; } -- trailing: the size covers its bits
+            (&[C, (Long, Some(33), false)], false, None, &[6, 1, 0], &[8, 8, 0]),
+            // { char a; long :3; int b; } -- a named member still aligns
+            (&[C, (Long, Some(3), false), (Int, None, true)], false, None,
+             &[8, 4, 0, 4], &[8, 8, 0, 4]),
+            // { char a; int b:5; char c; } -- named: the same everywhere
+            (&[C, (Int, Some(5), true), C], false, None, &[4, 4, 0, 0, 2], &[4, 4, 0, 0, 2]),
+            // #pragma pack(2) { char a; int :5; char b; }
+            (&[C, (Int, Some(5), false), C], false, Some(2), &[3, 1, 0, 2], &[4, 2, 0, 2]),
+            // union { int :20; char c; }
+            (&[(Int, Some(20), false), C], true, None, &[3, 1, 0], &[4, 4, 0]),
+            // union { char c; long :33; }
+            (&[C, (Long, Some(33), false)], true, None, &[5, 1, 0], &[8, 8, 0]),
+            // union { short s; long :17; }
+            (&[SH, (Long, Some(17), false)], true, None, &[4, 2, 0], &[8, 8, 0]),
+        ];
+        let aapcs64 = Target::new(Arch::Aarch64, Os::Linux);
+        for (i, &(shape, union_, pack, psabi, aapcs)) in rows.iter().enumerate() {
+            for target in [
+                Target::new(Arch::X86_64, Os::Linux),
+                Target::new(Arch::X86_64, Os::MacOS),
+                Target::new(Arch::Aarch64, Os::MacOS),
+            ] {
+                assert_eq!(
+                    layout(&target, shape, union_, pack),
+                    psabi,
+                    "row {i} {target:?}"
+                );
+            }
+            assert_eq!(
+                layout(&aapcs64, shape, union_, pack),
+                aapcs,
+                "row {i} aarch64 Linux"
+            );
+        }
+    }
+
+    /// An alignment written on a bit-field, or carried by its typedef'd type,
+    /// places the field at that boundary on every target; whether it also
+    /// aligns the aggregate follows the same per-ABI rule as the field's type
+    /// does. A zero-width field's boundary is raised by it too, and packing
+    /// does not lower that. Every row is gcc's on x86-64 and aarch64 Linux.
+    #[test]
+    fn test_bitfield_alignment_attributes_place_the_field() {
+        // { char a; <T> :<w> [aligned(8)]; char b; } -> (size, align, offsetof b)
+        fn layout(
+            target: &Target,
+            ai8: bool,
+            written: Option<u32>,
+            width: u32,
+            named: bool,
+            pack: Option<u32>,
+        ) -> (usize, usize, usize) {
+            let mut types = TypeTable::new(target);
+            let mut idents = crate::strings::StringTable::new();
+            let name = idents.intern("m");
+            let int = types.int_id;
+            let typ = if ai8 {
+                types.intern(Type {
+                    explicit_align: Some(8),
+                    ..types.get(int).clone()
+                })
+            } else {
+                int
+            };
+            let member = |typ, bit_width, written, name| StructMember {
+                name,
+                typ,
+                offset: 0,
+                bit_offset: None,
+                bit_width,
+                access_bytes: None,
+                align: MemberAlign {
+                    written,
+                    packed: false,
+                },
+            };
+            let char_id = types.char_id;
+            let mut members = vec![
+                member(char_id, None, None, name),
+                member(
+                    typ,
+                    Some(width),
+                    written,
+                    if named { name } else { StringId::EMPTY },
+                ),
+                member(char_id, None, None, name),
+            ];
+            let (size, align) = types.compute_struct_layout(&mut members, pack);
+            (size, align, members[2].offset)
+        }
+        let psabi = [
+            Target::new(Arch::X86_64, Os::Linux),
+            Target::new(Arch::X86_64, Os::MacOS),
+            Target::new(Arch::Aarch64, Os::MacOS),
+        ];
+        let aapcs64 = Target::new(Arch::Aarch64, Os::Linux);
+        // (typedef aligned(8), written, width, named, pack, psABI, AAPCS64)
+        type Layout = (usize, usize, usize);
+        type Row = (bool, Option<u32>, u32, bool, Option<u32>, Layout, Layout);
+        let rows: &[Row] = &[
+            // int :5 __attribute__((aligned(8)))
+            (false, Some(8), 5, false, None, (10, 1, 9), (16, 8, 9)),
+            // int :0 __attribute__((aligned(8))), with and without pack(1)
+            (false, Some(8), 0, false, None, (9, 1, 8), (16, 8, 8)),
+            (false, Some(8), 0, false, Some(1), (9, 1, 8), (16, 8, 8)),
+            // ai8 :5 and ai8 :0
+            (true, None, 5, false, None, (10, 1, 9), (16, 8, 9)),
+            (true, None, 0, false, None, (9, 1, 8), (16, 8, 8)),
+            // ai8 x:5 -- named, so the aggregate is aligned everywhere
+            (true, None, 5, true, None, (16, 8, 9), (16, 8, 9)),
+            // ai8 :5 under pack(1): the cap drops the typedef's alignment
+            (true, None, 5, false, Some(1), (3, 1, 2), (3, 1, 2)),
+        ];
+        for (i, &(ai8, written, width, named, pack, sysv, aapcs)) in rows.iter().enumerate() {
+            for target in &psabi {
+                assert_eq!(
+                    layout(target, ai8, written, width, named, pack),
+                    sysv,
+                    "row {i} {target:?}"
+                );
+            }
+            assert_eq!(
+                layout(&aapcs64, ai8, written, width, named, pack),
+                aapcs,
+                "row {i} aarch64 Linux"
+            );
+        }
     }
 
     /// One rule aligns a member: `packed` (on it, or on its whole aggregate)
@@ -4982,7 +5549,7 @@ mod tests {
         assert_eq!(types.kind(ptr_to_arr_id), TypeKind::Pointer);
         let base_id = types.base_type(ptr_to_arr_id).unwrap();
         assert_eq!(types.kind(base_id), TypeKind::Array);
-        assert_eq!(types.array_size(base_id), Some(10));
+        assert_eq!(types.array_extent(base_id), ArrayExtent::Known(10));
     }
 
     #[test]
@@ -5068,6 +5635,7 @@ mod tests {
             member_align: size,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         };
@@ -5355,8 +5923,10 @@ mod tests {
     #[test]
     fn test_struct_layout_past_u64_bits() {
         let mut types = TypeTable::new(&Target::host());
+        // Named: an unnamed bit-field is padding, laid out by its own rule.
+        let name = crate::strings::StringTable::new().intern("m");
         let member = |typ, bit_width| StructMember {
-            name: StringId::EMPTY,
+            name,
             typ,
             offset: 0,
             bit_offset: None,
@@ -5497,10 +6067,7 @@ mod tests {
     #[test]
     fn composite_type_of_compatible_types() {
         let mut t = TypeTable::new(&Target::host());
-        let unknown = t.intern(Type {
-            array_size: None,
-            ..Type::array(t.int_id, 0)
-        });
+        let unknown = t.intern(Type::array_of(t.int_id, ArrayExtent::Unknown));
         let three = t.intern(Type::array(t.int_id, 3));
         assert_eq!(t.composite_type(unknown, three), three);
         assert_eq!(t.composite_type(three, unknown), three);
@@ -5540,5 +6107,49 @@ mod tests {
         let plain = t.intern(Type::array(t.int_id, 3));
         assert_eq!(t.base_type(bare), Some(plain));
         assert_eq!(t.qualified_with(bare, TypeModifiers::CONST), grid);
+    }
+
+    /// The storage order reaches the scalars a struct stores -- through
+    /// arrays of them -- and nothing else; it is not part of compatibility,
+    /// and an rvalue never carries it.
+    #[test]
+    fn reverse_storage_reaches_scalars_only() {
+        use crate::target::{Arch, Os};
+        let mut t = TypeTable::new(&Target::new(Arch::X86_64, Os::Linux));
+        let int = t.int_id;
+        let rev_int = t.in_reverse_storage(int);
+        assert!(t.reverses_storage(rev_int));
+        assert!(!t.reverses_storage(int));
+        assert_eq!(t.in_reverse_storage(rev_int), rev_int, "idempotent");
+        assert!(t.types_compatible(int, rev_int));
+        assert_eq!(t.size_bytes(rev_int), 4);
+
+        // Not a pointer, and not a struct.
+        let ptr = t.intern(Type::pointer(int));
+        assert_eq!(t.in_reverse_storage(ptr), ptr);
+        let s = t.intern(Type::struct_type(CompositeType::incomplete(None)));
+        assert_eq!(t.in_reverse_storage(s), s);
+
+        // An array's elements, at every depth.
+        let row = t.intern(Type::array(int, 3));
+        let grid = t.intern(Type::array(row, 2));
+        let rev_grid = t.in_reverse_storage(grid);
+        assert!(!t.reverses_storage(rev_grid));
+        assert_eq!(t.innermost_element(rev_grid), rev_int);
+        assert_eq!(t.in_native_storage(rev_grid), grid);
+
+        // Floating and complex types are scalars too.
+        let dbl = t.double_id;
+        let rev_dbl = t.in_reverse_storage(dbl);
+        assert!(t.reverses_storage(rev_dbl));
+        let cplx = t.make_complex(dbl);
+        let rev_cplx = t.in_reverse_storage(cplx);
+        assert!(t.reverses_storage(rev_cplx));
+
+        // Lvalue conversion drops the order along with the qualifiers.
+        let const_rev = t.qualified_with(rev_int, TypeModifiers::CONST);
+        assert!(t.reverses_storage(const_rev));
+        assert_eq!(t.unqualified(const_rev), int);
+        assert_eq!(t.unqualified(rev_int), int);
     }
 }

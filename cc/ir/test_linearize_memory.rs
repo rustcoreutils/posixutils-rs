@@ -20,7 +20,9 @@ use crate::parse::ast::{
 };
 use crate::strings::StringTable;
 use crate::target::{Arch, Os, Target};
-use crate::types::{CompositeType, MemberAlign, StructMember, Type, TypeModifiers, TypeTable};
+use crate::types::{
+    ArrayExtent, CompositeType, MemberAlign, StructMember, Type, TypeModifiers, TypeTable,
+};
 
 // Static local variables
 
@@ -201,10 +203,9 @@ fn test_type_name_extents_get_no_storage() {
     let test_id = ctx.str("test");
     let int_type = ctx.types.int_id;
     let int_ptr = ctx.ptr(int_type);
-    let vla_row = ctx.types.intern(Type {
-        array_size: None,
-        ..Type::array(int_type, 0)
-    });
+    let vla_row = ctx
+        .types
+        .intern(Type::array_of(int_type, ArrayExtent::Variable));
     let row_ptr = ctx.types.intern(Type::pointer(vla_row));
     let n_sym = ctx.var("n", int_type);
     let p_sym = ctx.var("p", int_ptr);
@@ -304,6 +305,7 @@ fn test_large_struct_copy_from_array() {
             member_align: 8,
             is_complete: true,
             transparent: false,
+            reverse_order: false,
             anon_id: None,
             tag_type: None,
         })),

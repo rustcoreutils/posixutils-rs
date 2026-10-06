@@ -261,3 +261,65 @@ fn test_native_shuffles_and_conversions() {
     assert_eq!(count(unsigned, &x86), 0);
     assert!(ops_of(unsigned, "f", &a64).contains(&Opcode::Simd(SimdOp::CvtUF)));
 }
+
+/// gcc's AAPCS64 lays a floating vector of four bytes or fewer on the stack,
+/// so its parameter arrives as bytes in the incoming argument area, not as a
+/// value: the callee takes the `Arg`'s address and copies out of it, as a
+/// System V MEMORY-class argument is read. The caller hands the vector's
+/// address, so an inlined body -- which substitutes that address for the
+/// `Arg` -- reads the vector through it instead of storing the address as
+/// its bits.
+#[test]
+fn test_stacked_small_float_vector_param_arrives_by_value() {
+    use crate::ir::PseudoKind;
+    use crate::target::{Arch, Os};
+    let src = "typedef float v1sf __attribute__((vector_size(4)));\n\
+               float f(v1sf a, long i) { return a[0] + i; }\n";
+    let (module, types) = super::test_linearize::linearize_source_with_types(
+        src,
+        &Target::new(Arch::Aarch64, Os::Linux),
+    );
+    let func = module.functions.iter().find(|f| f.name == "f").unwrap();
+    assert!(types.is_vector_stack_carrier(func.params[0].1));
+    let arg_addressed = insns_of(&module, "f").into_iter().any(|i| {
+        i.op == Opcode::SymAddr
+            && i.src.first().is_some_and(|&s| {
+                matches!(
+                    func.get_pseudo(s).map(|p| &p.kind),
+                    Some(PseudoKind::Arg(0))
+                )
+            })
+    });
+    assert!(arg_addressed, "the vector parameter is not read in place");
+}
+
+/// Darwin passes a vector of four bytes or fewer as an `unsigned int`. A
+/// one- or two-byte one is loaded at its own width and zero-extended, not
+/// loaded four bytes wide past its end. An `asm` register operand holding
+/// one is the integer of its own size, so an output stores only the
+/// vector's bytes.
+#[test]
+fn test_darwin_small_vector_argument_reads_only_its_bytes() {
+    use crate::target::{Arch, Os};
+    let src = "typedef char v1qi __attribute__((vector_size(1)));\n\
+               typedef short v1hi __attribute__((vector_size(2)));\n\
+               void take(v1qi, v1hi);\n\
+               void call(v1qi *q, v1hi *h) { take(*q, *h); }\n\
+               void out(v1qi *q) { __asm__(\"\" : \"=r\"(*q)); }\n";
+    let module = linearize_source(src, &Target::new(Arch::Aarch64, Os::MacOS));
+    let call = insns_of(&module, "call");
+    let loads: Vec<u32> = call
+        .iter()
+        .filter(|i| i.op == Opcode::Load)
+        .map(|i| i.size)
+        .collect();
+    assert!(loads.contains(&8) && loads.contains(&16), "{loads:?}");
+    assert!(!loads.contains(&32), "{loads:?}");
+    assert!(call.iter().any(|i| i.op == Opcode::Zext), "no widening");
+    let stores: Vec<u32> = insns_of(&module, "out")
+        .iter()
+        .filter(|i| i.op == Opcode::Store)
+        .map(|i| i.size)
+        .collect();
+    assert_eq!(stores, [8], "the asm output stores {stores:?}");
+}

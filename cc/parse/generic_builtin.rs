@@ -17,7 +17,7 @@
 // the pointer of `__builtin_object_size`), the call is checked through it.
 //
 
-use super::ast::{CheckedOp, Expr, ExprKind, FpTest};
+use super::ast::{CheckedOp, Expr, ExprKind, FpTest, ObjectSizeType};
 use super::builtin_args::{BuiltinArgs, ConstantArgument};
 use super::library_builtin::ProtoType;
 use super::parser::{ParseResult, Parser};
@@ -48,6 +48,7 @@ const FP_TESTS: &[(StringId, FpTest, Option<ProtoType>)] = {
         (kw::BUILTIN_SIGNBIT,     SignBit,   None),
         (kw::BUILTIN_SIGNBITF,    SignBit,   Some(Float)),
         (kw::BUILTIN_SIGNBITL,    SignBit,   Some(LongDouble)),
+        (kw::BUILTIN_ISSIGNALING, IsSignaling, None),
     ]
 };
 
@@ -431,15 +432,23 @@ impl Parser<'_> {
             );
             return Ok(self.diagnosed_call(size_t, pos));
         };
+        let otype = ObjectSizeType::from_bits(otype as u64);
         let size = match self.object_extent(&ptr) {
             // A statically known object has the same minimum and maximum
             // size, so bit 1 does not change the answer.
-            Some(extent) => extent.remaining(otype & 1 != 0),
-            // Unknown: the documented answers are the ones that make a
-            // `_FORTIFY_SOURCE` check pass rather than fire, which is the
-            // largest value for a maximum and zero for a minimum.
-            None if otype & 2 != 0 => 0,
-            None => u64::MAX,
+            Some(extent) => extent.remaining(otype.subobject),
+            // Not known from the expression: gcc finds the object after
+            // inlining and propagation, which only an optimizing compile
+            // runs. At `-O0` it answers at once, with the answer for an
+            // unknown object.
+            None if self.library_call_policy.optimizing => {
+                let deferred = ExprKind::ObjectSize {
+                    ptr: Box::new(ptr),
+                    otype,
+                };
+                return Ok(Self::typed_expr(deferred, size_t, pos));
+            }
+            None => otype.unknown(),
         };
         Ok(Self::typed_expr(ExprKind::IntLit(size as i64), size_t, pos))
     }

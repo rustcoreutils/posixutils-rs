@@ -29,6 +29,7 @@ use crate::builtin_headers;
 use crate::diag;
 use crate::os;
 use crate::prefix_map::PrefixMap;
+use crate::target::ByteOrder;
 use crate::target::{IntType, Target, STDC_VERSION};
 use gettextrs::gettext;
 
@@ -664,8 +665,9 @@ pub const GNUC_VERSION: [&str; 3] = ["7", "5", "0"];
 
 /// The directive a marker token stands for, when it is one c17 only carries.
 ///
-/// `#pragma pack` is the one pragma that changes what the compiler does, so it
-/// travels decoded, as a [`PackAction`]. Everything else travels as its own
+/// `#pragma pack` and `#pragma scalar_storage_order` are the pragmas that
+/// change what the compiler does, so they travel decoded, as a
+/// [`LayoutPragma`]. Everything else travels as its own
 /// text: c17 does not act on `#pragma GCC diagnostic` or an OpenMP directive,
 /// but POSIX makes a `.i` a valid operand and c17 compiles one, so dropping
 /// them made preprocessing and compiling in two steps mean something different
@@ -674,6 +676,103 @@ pub fn pragma_text(token: &Token) -> Option<String> {
     match &token.value {
         TokenValue::String(s) => s.strip_prefix(PRAGMA_TEXT_PREFIX).map(str::to_string),
         _ => None,
+    }
+}
+
+/// A pragma that changes how the parser lays out the structures and unions
+/// defined after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutPragma {
+    /// `#pragma pack`: the alignment cap on every member.
+    Pack(PackAction),
+    /// `#pragma scalar_storage_order`: the byte order of the scalars of a
+    /// struct or union that does not name one in an attribute.
+    StorageOrder(StorageOrderPragma),
+}
+
+impl LayoutPragma {
+    /// Encoded into the marker token's payload, since `TokenValue` carries
+    /// strings rather than arbitrary data.
+    fn encode(self) -> String {
+        match self {
+            LayoutPragma::Pack(action) => action.encode(),
+            LayoutPragma::StorageOrder(order) => format!("sso:{}", order.spelling()),
+        }
+    }
+
+    /// Spell the pragma back as the directive that produced it, for `-E`.
+    pub fn to_pragma_text(self) -> String {
+        match self {
+            LayoutPragma::Pack(action) => action.to_pragma_text(),
+            LayoutPragma::StorageOrder(order) => {
+                format!("#pragma scalar_storage_order {}", order.spelling())
+            }
+        }
+    }
+
+    /// Recover the pragma from a `TokenType::Pragma` marker's payload.
+    pub fn from_token(token: &Token) -> Option<LayoutPragma> {
+        match &token.value {
+            TokenValue::String(s) => LayoutPragma::decode(s),
+            _ => None,
+        }
+    }
+
+    fn decode(s: &str) -> Option<LayoutPragma> {
+        if let Some(word) = s.strip_prefix("sso:") {
+            return StorageOrderPragma::from_word(word).map(LayoutPragma::StorageOrder);
+        }
+        PackAction::decode(s).map(LayoutPragma::Pack)
+    }
+}
+
+/// What `#pragma scalar_storage_order` makes the default storage order of the
+/// structs and unions defined after it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageOrderPragma {
+    /// `big-endian` or `little-endian`.
+    Order(ByteOrder),
+    /// `default`: the target's own order.
+    Default,
+}
+
+impl StorageOrderPragma {
+    fn from_word(word: &str) -> Option<StorageOrderPragma> {
+        match word {
+            "big-endian" => Some(StorageOrderPragma::Order(ByteOrder::BigEndian)),
+            "little-endian" => Some(StorageOrderPragma::Order(ByteOrder::LittleEndian)),
+            "default" => Some(StorageOrderPragma::Default),
+            _ => None,
+        }
+    }
+
+    fn spelling(self) -> &'static str {
+        match self {
+            StorageOrderPragma::Order(ByteOrder::BigEndian) => "big-endian",
+            StorageOrderPragma::Order(ByteOrder::LittleEndian) => "little-endian",
+            StorageOrderPragma::Default => "default",
+        }
+    }
+
+    /// Read the body of `#pragma scalar_storage_order`, the text after the
+    /// pragma's name, warning as gcc does about a missing or unknown order.
+    fn parse_body(body: &str, pos: Position) -> Option<StorageOrderPragma> {
+        let word: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        if word.is_empty() {
+            diag::warning(
+                pos,
+                &gettext("missing 'big-endian', 'little-endian', or 'default' after '#pragma scalar_storage_order'"),
+            );
+            return None;
+        }
+        let order = StorageOrderPragma::from_word(&word);
+        if order.is_none() {
+            diag::warning(
+                pos,
+                &gettext("expected 'big-endian', 'little-endian', or 'default' after '#pragma scalar_storage_order'"),
+            );
+        }
+        order
     }
 }
 
@@ -716,14 +815,6 @@ impl PackAction {
         }
     }
 
-    /// Recover the action from a `TokenType::Pragma` marker's payload.
-    pub fn from_token(token: &Token) -> Option<PackAction> {
-        match &token.value {
-            TokenValue::String(s) => PackAction::decode(s),
-            _ => None,
-        }
-    }
-
     fn decode(s: &str) -> Option<PackAction> {
         let mut parts = s.split(':');
         if parts.next()? != "pack" {
@@ -751,7 +842,7 @@ impl PackAction {
 /// cursor reaches it. Doing this after preprocessing finishes is what makes
 /// the ordering trustworthy: by then every include has been spliced in and
 /// the vector is the translation unit in the order the parser walks it.
-pub fn extract_pragma_directives(tokens: &mut Vec<Token>) -> Vec<(usize, PackAction)> {
+pub fn extract_pragma_directives(tokens: &mut Vec<Token>) -> Vec<(usize, LayoutPragma)> {
     let mut directives = Vec::new();
     let mut kept = 0usize;
     tokens.retain(|t| {
@@ -760,8 +851,8 @@ pub fn extract_pragma_directives(tokens: &mut Vec<Token>) -> Vec<(usize, PackAct
             return true;
         }
         if let TokenValue::String(s) = &t.value {
-            if let Some(action) = PackAction::decode(s) {
-                directives.push((kept, action));
+            if let Some(pragma) = LayoutPragma::decode(s) {
+                directives.push((kept, pragma));
             }
         }
         false
@@ -833,11 +924,12 @@ fn parse_pack_body(toks: &[PackTok], pos: Position) -> Option<PackAction> {
     }
 }
 
-/// Reduce the text of a `_Pragma("...")` operand to `PackTok`s.
+/// Read the text of a pragma c17 acts on: `pack`, as `PackTok`s, or
+/// `scalar_storage_order`.
 ///
-/// Returns `None` for anything that is not a `pack` pragma, which is every
-/// pragma c17 does not act on.
-fn parse_pragma_text(body: &str, pos: Position) -> Option<PackAction> {
+/// Returns `None` for anything else, which is every pragma c17 does not act
+/// on, and for a body of one of the two that names nothing it can apply.
+fn parse_pragma_text(body: &str, pos: Position) -> Option<LayoutPragma> {
     let mut chars = body.trim_start().chars().peekable();
     let mut word = String::new();
     while chars
@@ -845,6 +937,10 @@ fn parse_pragma_text(body: &str, pos: Position) -> Option<PackAction> {
         .is_some_and(|c| c.is_alphanumeric() || *c == '_')
     {
         word.push(chars.next().unwrap());
+    }
+    if word == "scalar_storage_order" {
+        let rest: String = chars.collect();
+        return StorageOrderPragma::parse_body(&rest, pos).map(LayoutPragma::StorageOrder);
     }
     if word != "pack" {
         return None;
@@ -874,7 +970,7 @@ fn parse_pragma_text(body: &str, pos: Position) -> Option<PackAction> {
             toks.push(PackTok::Punct(c));
         }
     }
-    parse_pack_body(&toks, pos)
+    parse_pack_body(&toks, pos).map(LayoutPragma::Pack)
 }
 
 impl<'a> Preprocessor<'a> {
@@ -1530,7 +1626,7 @@ impl<'a> Preprocessor<'a> {
         match self.linemarkers.get(&pos.stream) {
             Some(lm) => Position {
                 stream: lm.target,
-                line: (pos.line as i64 + lm.delta).max(1) as u32,
+                line: (pos.line as i64 + lm.delta).max(0) as u32,
                 ..pos
             },
             None => pos,
@@ -2468,20 +2564,18 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         }
         let suffix_unsigned = suffix.contains('u') || suffix.contains('U');
 
-        match u64::from_str_radix(body, radix) {
-            Ok(v) => {
-                // Too large for intmax_t means the constant's type is
-                // uintmax_t, even without a suffix.
-                let unsigned = suffix_unsigned || v > i64::MAX as u64;
-                PpValue::from_parts(v as i128, unsigned)
-            }
-            // The body is all digits of the radix, so the only way to fail is
-            // to be wider than `uintmax_t`.
-            Err(_) => {
-                self.err_token(pos, "integer constant \"{0}\" is too large", s);
-                PpValue::signed(0)
-            }
+        // The body is all digits of the radix, so the only way to fail is
+        // to be wider than `uintmax_t`, which keeps the low bits. gcc says so
+        // in an unevaluated operand too: it is the constant that is wrong.
+        let (v, truncated) =
+            crate::token::literal::integer_digits_value(body, radix).unwrap_or((0, false));
+        if truncated {
+            crate::token::literal::report_too_large_integer(pos);
         }
+        // Too large for intmax_t means the constant's type is uintmax_t, even
+        // without a suffix.
+        let unsigned = suffix_unsigned || v > i64::MAX as u64;
+        PpValue::from_parts(v as i128, unsigned)
     }
 }
 

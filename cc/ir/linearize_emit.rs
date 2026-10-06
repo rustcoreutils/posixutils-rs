@@ -14,7 +14,7 @@ use super::{
     BasicBlockId, CallAbiInfo, FloatCmp, Instruction, NanCompare, Opcode, Pseudo, PseudoId,
 };
 use crate::abi::get_abi_for_conv;
-use crate::constexpr::ConstScope;
+use crate::constexpr::{ConstScope, IntConversion};
 use crate::diag::{error, Position};
 use crate::float::FloatVal;
 use crate::parse::ast::{AssignOp, BinaryOp, Expr, ExprKind, FpCompare, LibFn, MathErrno, UnaryOp};
@@ -610,10 +610,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         typ: TypeId,
     ) -> PseudoId {
         let Bitfield {
-            offset: byte_offset,
-            bit_offset,
             bit_width,
             access_bytes: storage_size,
+            ..
         } = bf;
         // A span that is not one addressable unit has to be assembled a byte at
         // a time. Only a packed bit-field produces one, and only then can the
@@ -634,18 +633,12 @@ impl<'a> super::linearize::Linearizer<'a> {
         let storage_bits = storage_size * 8;
         let volatile = self.types.contains_volatile(typ);
 
-        // 1. Load the entire storage unit
+        // 1. Load the entire storage unit, as a number in the target's order:
+        // a unit stored in reverse order is swapped, and its fields are then
+        // numbered from the most significant bit (see `bitfield_bit_offset`).
         let storage_val = self.alloc_pseudo();
-        self.emit(
-            Instruction::load(
-                storage_val,
-                base,
-                byte_offset as i64,
-                storage_type,
-                storage_bits,
-            )
-            .with_volatile(volatile),
-        );
+        self.load_bitfield_unit(storage_val, base, bf, typ, volatile);
+        let bit_offset = self.bitfield_bit_offset(bf, typ);
 
         // 2. Shift right by bit_offset (using logical shift for unsigned extraction)
         let shifted = if bit_offset > 0 {
@@ -799,6 +792,9 @@ impl<'a> super::linearize::Linearizer<'a> {
         let byte_type = self.types.uchar_id;
         // Every byte of a volatile field is part of the one observable read.
         let volatile = self.types.contains_volatile(typ);
+        // In reverse order the field's bits run from the most significant end
+        // of each byte, so its last byte holds its least significant bits.
+        let reversed = self.types.reverses_storage(typ);
 
         let mut acc: Option<PseudoId> = None;
         let (field_lo, field_hi) = (bit_offset, bit_offset + bit_width);
@@ -825,7 +821,14 @@ impl<'a> super::linearize::Linearizer<'a> {
             // Byte `i` covers bits `8i..8i+8` of the span, and the field starts
             // at `bit_offset`, so this byte lands at `8i - bit_offset` --
             // negative only for the first byte, which shifts *down* instead.
-            let shift = 8i64 * i as i64 - bit_offset as i64;
+            // In reverse order the field *ends* in the last byte, at its least
+            // significant bit, so a byte lands where the field's end is above
+            // the byte's: negative only for the last.
+            let shift = if reversed {
+                i64::from(field_hi) - i64::from(byte_hi)
+            } else {
+                8i64 * i as i64 - bit_offset as i64
+            };
             let placed = if shift == 0 {
                 widened
             } else {
@@ -946,9 +949,9 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) {
         let Bitfield {
             offset: byte_offset,
-            bit_offset,
             bit_width,
             access_bytes: storage_size,
+            ..
         } = bf;
         if !matches!(storage_size, 1 | 2 | 4 | 8 | 16) {
             return self.emit_bitfield_store_bytewise(base, bf, new_value, typ);
@@ -959,18 +962,10 @@ impl<'a> super::linearize::Linearizer<'a> {
         let storage_bits = storage_size * 8;
         let volatile = self.types.contains_volatile(typ);
 
-        // 1. Load current storage unit value
+        // 1. Load current storage unit value, as `emit_bitfield_load` does.
         let old_val = self.alloc_pseudo();
-        self.emit(
-            Instruction::load(
-                old_val,
-                base,
-                byte_offset as i64,
-                storage_type,
-                storage_bits,
-            )
-            .with_volatile(volatile),
-        );
+        self.load_bitfield_unit(old_val, base, bf, typ, volatile);
+        let bit_offset = self.bitfield_bit_offset(bf, typ);
 
         // 2. Create mask for the bitfield bits: ~(((1 << width) - 1) << offset)
         //
@@ -1032,17 +1027,69 @@ impl<'a> super::linearize::Linearizer<'a> {
             storage_bits,
         ));
 
-        // 6. Store back
-        self.emit(
-            Instruction::store(
-                combined,
-                base,
-                byte_offset as i64,
-                storage_type,
-                storage_bits,
-            )
-            .with_volatile(volatile),
-        );
+        // 6. Store back, in the unit's own order.
+        if self.bitfield_unit_reversed(bf, typ) {
+            self.emit_reversed_store(combined, base, byte_offset as i64, storage_type, volatile);
+        } else {
+            self.emit(
+                Instruction::store(
+                    combined,
+                    base,
+                    byte_offset as i64,
+                    storage_type,
+                    storage_bits,
+                )
+                .with_volatile(volatile),
+            );
+        }
+    }
+
+    /// Load the access unit of bit-field `bf`, whose type as accessed is
+    /// `typ`, into `target` as a number in the target's byte order.
+    fn load_bitfield_unit(
+        &mut self,
+        target: PseudoId,
+        base: PseudoId,
+        bf: Bitfield,
+        typ: TypeId,
+        volatile: bool,
+    ) {
+        let storage_type = self.bitfield_storage_type(bf.access_bytes as usize);
+        let offset = bf.offset as i64;
+        if self.bitfield_unit_reversed(bf, typ) {
+            self.emit_reversed_load(target, base, offset, storage_type, volatile);
+        } else {
+            let bits = bf.access_bytes * 8;
+            self.emit(
+                Instruction::load(target, base, offset, storage_type, bits).with_volatile(volatile),
+            );
+        }
+    }
+
+    /// Whether the access unit of `bf` is stored in reverse byte order: the
+    /// field's type says so, and the unit is wider than a byte.
+    fn bitfield_unit_reversed(&self, bf: Bitfield, typ: TypeId) -> bool {
+        bf.access_bytes > 1 && self.types.reverses_storage(typ)
+    }
+
+    /// Where field `bf` begins in its access unit read as a number, counted
+    /// from the least significant bit.
+    ///
+    /// The layout gives every field its place as a run of bits from the start
+    /// of the object, and that is the same in either storage order. What
+    /// differs is which end of a byte, and of a unit, the run starts from:
+    /// the least significant on the targets here, the most significant on a
+    /// big-endian one -- and gcc lays out a struct stored in reverse order as
+    /// that big-endian target would. So a field at bits `[k, k + w)` of an
+    /// `n`-bit unit stored in reverse order is bits `[n - k - w, n - k)` of
+    /// the unit's value, the unit read in its own order. A one-byte unit has
+    /// no bytes to swap and still counts its bits from the top.
+    fn bitfield_bit_offset(&self, bf: Bitfield, typ: TypeId) -> u32 {
+        if self.types.reverses_storage(typ) {
+            bf.access_bytes * 8 - bf.bit_offset - bf.bit_width
+        } else {
+            bf.bit_offset
+        }
     }
 
     /// Write a bit-field occupying an arbitrary byte range, one byte at a time.
@@ -1074,6 +1121,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         let carrier_bits = if wide { 64 } else { 32 };
         let byte_type = self.types.uchar_id;
         let volatile = self.types.contains_volatile(typ);
+        // See `emit_bitfield_load_bytewise`.
+        let reversed = self.types.reverses_storage(typ);
 
         // The value, masked to its width once, so no byte can contribute bits
         // the field does not have.
@@ -1100,8 +1149,15 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             // Bits [lo,hi) of the span come from bits [lo-field_lo, hi-field_lo)
-            // of the value and land at bit `lo - byte_lo` of this byte.
-            let from = lo - field_lo;
+            // of the value and land at bit `lo - byte_lo` of this byte. In
+            // reverse order both run the other way: from bits
+            // [field_hi-hi, field_hi-lo) of the value, landing at bit
+            // `byte_hi - hi`.
+            let (from, within) = if reversed {
+                (field_hi - hi, byte_hi - hi)
+            } else {
+                (lo - field_lo, lo - byte_lo)
+            };
             let shifted = if from == 0 {
                 value
             } else {
@@ -1119,7 +1175,6 @@ impl<'a> super::linearize::Linearizer<'a> {
             };
             let piece = self.emit_convert(shifted, carrier, byte_type);
 
-            let within = lo - byte_lo;
             let covered = hi - lo;
             let byte_mask = (bitfield_value_mask(covered) as u32) << within;
             let placed = if within == 0 {
@@ -2389,6 +2444,8 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// - to a complex type, the operand at that precision, or a real operand
     ///   as the real half with a zero imaginary half (C17 6.3.1.7p1);
     /// - from a complex type to a real one, [`Self::complex_to_real_at`];
+    /// - a floating constant to an integer type, the constant it folds to
+    ///   ([`Self::implicit_float_to_integer_const`]);
     /// - otherwise the scalar conversion, [`Self::emit_convert`].
     ///
     /// It is handed the *expression* rather than a value because only the
@@ -2400,6 +2457,9 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// the address's bit pattern.
     pub(crate) fn linearize_converted(&mut self, expr: &Expr, to_typ: TypeId) -> PseudoId {
         let from_typ = self.expr_type(expr);
+        if let Some(folded) = self.implicit_float_to_integer_const(expr, to_typ) {
+            return folded;
+        }
         if self.types.is_complex(to_typ) {
             return if self.types.is_complex(from_typ) {
                 self.complex_operand_at_precision(expr, to_typ)
@@ -2413,6 +2473,44 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
         let val = self.linearize_expr(expr);
         self.emit_convert(val, from_typ, to_typ)
+    }
+
+    /// `expr`, a floating or complex constant expression, converted to the
+    /// integer type `to` as gcc's front end converts it at every level, `-O0`
+    /// included: `(int)2147483648.0f` is the constant `INT_MAX`. Out of
+    /// range, where C gives no value (6.3.1.4p1), the answer is gcc's
+    /// saturated one ([`crate::float::FloatVal::to_integer_saturating`]).
+    ///
+    /// `None` when `expr` is not a constant expression, or when `to` is not
+    /// an integer type or is `_Bool`, whose conversion is a comparison and
+    /// defined for every value. A conversion of a value known only at run
+    /// time stays an instruction and gives the target's answer, as in gcc.
+    pub(crate) fn fold_float_to_integer(&self, expr: &Expr, to: TypeId) -> Option<IntConversion> {
+        let from = self.expr_type(expr);
+        if !(self.types.is_float(from) || self.types.is_complex(from))
+            || !self.types.is_integer(to)
+            || self.types.is_complex(to)
+            || self.types.kind(to) == TypeKind::Bool
+        {
+            return None;
+        }
+        crate::constexpr::eval_as_integer(self, ConstScope::Standard, expr, to)
+    }
+
+    /// [`Self::fold_float_to_integer`] for an implicit conversion -- by
+    /// assignment, `return`, initialization or a prototyped argument --
+    /// emitted as the constant it folds to, with gcc's `-Woverflow` warning
+    /// when it saturates.
+    pub(crate) fn implicit_float_to_integer_const(
+        &mut self,
+        expr: &Expr,
+        to: TypeId,
+    ) -> Option<PseudoId> {
+        let c = self.fold_float_to_integer(expr, to)?;
+        if matches!(c, IntConversion::Saturated(_)) {
+            self.warn_saturated_conversion(expr, to);
+        }
+        Some(self.emit_const(c.value(), to))
     }
 
     /// Turn `expr` into the 0/1 truth value a branch or logical operator wants.
@@ -2968,7 +3066,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         let common = self.types.common_type(target_typ, self.expr_type(value));
         if self.types.is_complex(target_typ) {
             let target_addr = self.linearize_lvalue(target);
-            let lhs = self.complex_addr_at_precision(target_addr, target_typ, common);
+            let current = self.complex_in_native_order(target_addr, target_typ);
+            let lhs = self.complex_addr_at_precision(current, target_typ, common);
             let rhs = self.linearize_converted(value, common);
             let result = self.emit_complex_binary(binop, lhs, rhs, common);
             let result = self.complex_addr_at_precision(result, common, target_typ);
@@ -2998,6 +3097,12 @@ impl<'a> super::linearize::Linearizer<'a> {
     ) {
         let (real, imag, base_typ, base_bits) = self.load_complex_halves(src, complex_typ);
         let imag_offset = offset + (base_bits / 8) as i64;
+        if self.types.reverses_storage(complex_typ) {
+            let volatile = self.types.contains_volatile(complex_typ);
+            self.emit_reversed_store(real, dst, offset, base_typ, volatile);
+            self.emit_reversed_store(imag, dst, imag_offset, base_typ, volatile);
+            return;
+        }
         self.emit(Instruction::store(real, dst, offset, base_typ, base_bits));
         self.emit(Instruction::store(
             imag,

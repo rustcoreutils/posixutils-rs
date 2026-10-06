@@ -1971,3 +1971,36 @@ int main(void)
 "#,
     );
 }
+
+/// Under `-fgnu89-inline`, an `extern inline` body followed by a `static`
+/// definition of the same name: gcc accepts it, the static one being the
+/// function (gcc.c-torture `compile/20021120-1`, `-2`). c17 rejected it as a
+/// static declaration following a non-static one.
+#[test]
+fn codegen_gnu89_extern_inline_then_static_definition() {
+    let src = r#"
+/* -fgnu89-inline: an extern inline body, then a static definition of the
+   same name. The static one is the function the unit calls. */
+extern inline int one(void) { return 1; }
+extern inline int bar(void) { return 10; }
+static inline int bar(void) { return one() + 1; }
+int one(void) { return 1; }
+int main(void) { return bar() == 2 ? 0 : 1; }
+"#;
+    for level in ["-O0", "-O2"] {
+        let flags = [level.to_string(), "-fgnu89-inline".to_string()];
+        assert_eq!(
+            compile_and_run("gnu89_then_static", src, &flags),
+            0,
+            "{level}"
+        );
+        if let Some(rc) = crate::common::compile_and_run_aarch64_with(
+            "gnu89_then_static_a64",
+            src,
+            &[level, "-fgnu89-inline"],
+            &[],
+        ) {
+            assert_eq!(rc, 0, "aarch64 {level}");
+        }
+    }
+}

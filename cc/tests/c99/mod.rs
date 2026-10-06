@@ -20,6 +20,7 @@ mod complex;
 mod complex_abi;
 mod complex_conversion;
 mod expressions;
+mod extern_definitions;
 mod features;
 mod identifiers;
 mod initializers;

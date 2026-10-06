@@ -15,7 +15,7 @@ use super::frame::UNROLL_LIMIT_BYTES;
 use super::lir::{Aarch64Inst, GpOperand, MemAddr};
 use super::regalloc::{Loc, Reg, VReg};
 use crate::arch::codegen::BswapSize;
-use crate::arch::lir::{CallTarget, CondCode, FpSize, OperandSize, Symbol};
+use crate::arch::lir::{CallTarget, CondCode, Directive, FpSize, OperandSize, Symbol};
 use crate::ir::Instruction;
 use crate::types::TypeTable;
 
@@ -65,6 +65,10 @@ enum VaAggKind {
     /// to memory and pass a *pointer* to the copy, so one general slot holds
     /// the address and the object is read through it.
     Indirect { bytes: i32 },
+    /// gcc's floating vector of four bytes or fewer
+    /// ([`crate::abi::ArgClass::Stacked`]): always on the stack, and every
+    /// later general-register argument with it.
+    Stacked { bytes: i32 },
 }
 
 impl VaAggKind {
@@ -88,6 +92,7 @@ impl VaAggKind {
         match abi.classify_param(typ, types) {
             crate::abi::ArgClass::Hfa { base, count } => VaAggKind::Hfa(HfaElem::of(base), count),
             crate::abi::ArgClass::Indirect { .. } => VaAggKind::Indirect { bytes },
+            crate::abi::ArgClass::Stacked { .. } => VaAggKind::Stacked { bytes },
             _ => VaAggKind::Gp {
                 qwords: ((bytes + 7) / 8) as u8,
                 bytes,
@@ -319,7 +324,7 @@ impl Aarch64CodeGen {
                 self.emit_va_arg_bytes(dst_loc, scratch0, 0, bytes, bytes <= 8);
                 ((bytes + 7) & !7) as i64
             }
-            VaAggKind::Gp { bytes, .. } => {
+            VaAggKind::Gp { bytes, .. } | VaAggKind::Stacked { bytes } => {
                 self.emit_va_arg_bytes(dst_loc, scratch0, 0, bytes, bytes <= 8);
                 ((bytes + 7) & !7) as i64
             }
@@ -407,7 +412,9 @@ impl Aarch64CodeGen {
             VaAggKind::Hfa(elem, count) => {
                 Self::va_slot_bytes((count as u32) * (elem.bytes as u32) * 8)
             }
-            VaAggKind::Gp { bytes, .. } => Self::va_slot_bytes(bytes as u32 * 8),
+            VaAggKind::Gp { bytes, .. } | VaAggKind::Stacked { bytes } => {
+                Self::va_slot_bytes(bytes as u32 * 8)
+            }
             // Only the pointer is on the stack, not the object.
             VaAggKind::Indirect { .. } => 8,
             VaAggKind::Scalar => Self::va_slot_bytes(type_bits),
@@ -419,6 +426,11 @@ impl Aarch64CodeGen {
             VaAggKind::Hfa(_, count) => 16 * count as i64,
             VaAggKind::Gp { qwords, .. } => 8 * qwords as i64,
             VaAggKind::Indirect { .. } => 8,
+            // More than the whole save area: `offs + reg_step` is positive
+            // whatever `offs` was, so the argument comes off the stack, and
+            // the committed offset pins every later general argument there
+            // too -- NGRN becoming 8, as the caller had it.
+            VaAggKind::Stacked { .. } => i64::from(VA_GR_SAVE_BYTES) + 8,
             VaAggKind::Scalar if is_fp => 16,
             VaAggKind::Scalar => stack_step,
         };
@@ -585,7 +597,7 @@ impl Aarch64CodeGen {
         });
 
         match agg {
-            VaAggKind::Gp { bytes, .. } => {
+            VaAggKind::Gp { bytes, .. } | VaAggKind::Stacked { bytes } => {
                 // Contiguous in both sources: consecutive eightbyte slots in
                 // the save area, and the object itself on the stack.
                 self.emit_va_arg_bytes(dst_loc, scratch0, 0, bytes, type_bits <= 64);
@@ -1362,6 +1374,123 @@ impl Aarch64CodeGen {
         // Emit brk after longjmp since it never returns
         // This helps catch any bugs where longjmp somehow returns
         self.push_lir(Aarch64Inst::Brk { imm: 1 });
+    }
+
+    /// gcc's `__builtin_setjmp(buf)`: inline, with no library call.
+    ///
+    /// The five-word buffer gets gcc's layout -- x29, the resume address,
+    /// sp -- and the result is 0 straight through and 1 at the resume point:
+    ///
+    /// ```text
+    ///     str x29, [buf]; adrp/add t, resume; str t, [buf, 8]
+    ///     mov t, sp; str t, [buf, 16]; mov r, 0; b done
+    /// resume:                     // x29 and sp are back, nothing else is
+    ///     mov r, 1
+    /// done:
+    /// ```
+    ///
+    /// Nothing else survives the jump. The allocator keeps no value in a
+    /// register across this instruction (`get_constraint_info_aarch64`) and
+    /// the prologue saves every callee-saved register, so the only state to
+    /// re-establish is an over-aligned frame's base register.
+    pub(super) fn emit_builtin_setjmp(&mut self, insn: &Instruction) {
+        let (Some(&env), Some(target)) = (insn.src.first(), insn.target) else {
+            return;
+        };
+        let resume = self.next_unique_label("sjlj_resume");
+        let done = self.next_unique_label("sjlj_done");
+        let word = |offset| MemAddr::BaseOffset {
+            base: Reg::X9,
+            offset,
+        };
+
+        self.emit_move(env, Reg::X9, 64);
+        self.push_lir(Aarch64Inst::Str {
+            size: OperandSize::B64,
+            src: Reg::X29,
+            addr: word(0),
+        });
+        let sym = resume.symbol();
+        self.push_lir(Aarch64Inst::Adrp {
+            sym: sym.clone(),
+            dst: Reg::X10,
+        });
+        self.push_lir(Aarch64Inst::AddSymOffset {
+            sym,
+            base: Reg::X10,
+            dst: Reg::X10,
+        });
+        self.push_lir(Aarch64Inst::Str {
+            size: OperandSize::B64,
+            src: Reg::X10,
+            addr: word(8),
+        });
+        self.push_lir(Aarch64Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::SP),
+            dst: Reg::X10,
+        });
+        self.push_lir(Aarch64Inst::Str {
+            size: OperandSize::B64,
+            src: Reg::X10,
+            addr: word(16),
+        });
+        self.push_lir(Aarch64Inst::Mov {
+            size: OperandSize::B32,
+            src: GpOperand::Imm(0),
+            dst: Reg::X10,
+        });
+        self.push_lir(Aarch64Inst::B {
+            target: done.clone(),
+        });
+
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(resume)));
+        self.emit_frame_base_latch();
+        self.push_lir(Aarch64Inst::Mov {
+            size: OperandSize::B32,
+            src: GpOperand::Imm(1),
+            dst: Reg::X10,
+        });
+
+        self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(done)));
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::X10, &dst_loc, u32::BITS);
+    }
+
+    /// gcc's `__builtin_longjmp(buf, 1)`: put back the x29 and sp the
+    /// matching `__builtin_setjmp` saved, and branch to its resume address.
+    /// All three words are loaded before x29 changes, since the buffer's
+    /// address may well be reached through the x29 being replaced.
+    pub(super) fn emit_builtin_longjmp(&mut self, insn: &Instruction) {
+        let Some(&env) = insn.src.first() else {
+            return;
+        };
+        let word = |offset| MemAddr::BaseOffset {
+            base: Reg::X9,
+            offset,
+        };
+        self.emit_move(env, Reg::X9, 64);
+        self.push_lir(Aarch64Inst::Ldr {
+            size: OperandSize::B64,
+            addr: word(8),
+            dst: Reg::X10,
+        });
+        self.push_lir(Aarch64Inst::Ldr {
+            size: OperandSize::B64,
+            addr: word(16),
+            dst: Reg::X11,
+        });
+        self.push_lir(Aarch64Inst::Ldr {
+            size: OperandSize::B64,
+            addr: word(0),
+            dst: Reg::X29,
+        });
+        self.push_lir(Aarch64Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::X11),
+            dst: Reg::SP,
+        });
+        self.push_lir(Aarch64Inst::BrReg { reg: Reg::X10 });
     }
 
     /// Leave the frame pointer `levels` frames up in X9.

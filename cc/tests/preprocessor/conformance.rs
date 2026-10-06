@@ -521,11 +521,6 @@ fn preprocessor_line_directive_rejects_bad_arguments() {
             "non-numeric operand",
         ),
         (
-            "line_out_of_range",
-            "#line 99999999999\nint x;\n",
-            "operand above 2147483647",
-        ),
-        (
             "line_bad_filename",
             "#line 42 notastring\nint x;\n",
             "filename that is not a string literal",
@@ -540,6 +535,32 @@ fn preprocessor_line_directive_rejects_bad_arguments() {
             r.stderr
         );
     }
+}
+
+/// A `#line` number too large for the 32-bit line counter is gcc's default
+/// warning, not an error, and wraps; one merely past C17's 2147483647 is
+/// diagnosed only under `-pedantic`.
+#[test]
+fn preprocessor_line_directive_out_of_range_warns() {
+    let r = preprocess_text("line_wraps", "#line 99999999999\nint x = __LINE__;\n", &[]);
+    assert!(
+        r.stderr.contains("warning: line number out of range") && !r.stderr.contains("error"),
+        "{}",
+        r.stderr
+    );
+    // 99999999999 mod 2^32.
+    assert!(r.stdout.contains("int x = 1215752191;"), "{}", r.stdout);
+    let quiet = preprocess_text(
+        "line_past_c17",
+        "#line 3000000000\nint y = __LINE__;\n",
+        &[],
+    );
+    assert!(quiet.stderr.is_empty(), "{}", quiet.stderr);
+    assert!(
+        quiet.stdout.contains("int y = 3000000000;"),
+        "{}",
+        quiet.stdout
+    );
 }
 
 /// The valid forms must stay silent.

@@ -276,6 +276,16 @@ impl Linearizer<'_> {
             return None;
         }
 
+        // An atomic operation works on the object's address, and a scalar
+        // stored in reverse order (`scalar_storage_order`) has none a pointer
+        // can carry. The parser refuses an access to such an `_Atomic` member
+        // as gcc does; an element of an `_Atomic` array member, which gcc
+        // reads and writes as an ordinary reversed scalar, takes the ordinary
+        // path here too, so that its bytes are swapped.
+        if self.types.reverses_storage(typ) {
+            return None;
+        }
+
         if !self.is_lock_free(typ) {
             // Warn and fall through to the ordinary (non-atomic) path.
             //

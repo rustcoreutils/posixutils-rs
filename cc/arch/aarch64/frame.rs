@@ -134,28 +134,7 @@ impl Aarch64CodeGen {
         // Emit prologue (save fp/lr, callee-saved regs, allocate stack)
         self.emit_prologue(total_frame, &callee_saved, &callee_saved_fp);
 
-        // Compute aligned base register (x19) for over-aligned locals
-        if let FrameBase::Aligned {
-            reg: base,
-            align: max_align,
-        } = self.frame_base
-        {
-            let base_offset = 16 + self.callee_saved_size;
-            // base = (FP + base_offset + max_align - 1) & ~(max_align - 1)
-            self.push_lir(Aarch64Inst::Add {
-                size: OperandSize::B64,
-                dst: base,
-                src1: Reg::X29,
-                src2: GpOperand::Imm((base_offset + max_align - 1) as i64),
-            });
-            // AND with bitmask: aarch64 AND (immediate) encodes bitmasks
-            self.push_lir(Aarch64Inst::And {
-                size: OperandSize::B64,
-                dst: base,
-                src1: base,
-                src2: GpOperand::Imm(-(max_align as i64)),
-            });
-        }
+        self.emit_frame_base_latch();
 
         // For variadic functions on Linux/FreeBSD, save argument registers
         if is_variadic && !is_darwin {
@@ -210,6 +189,35 @@ impl Aarch64CodeGen {
         // Only now is every branch and label of the function in place.
         let base = &mut self.base;
         super::relax::relax_branches(&mut base.lir_buffer[first_inst..], &base.target);
+    }
+
+    /// Compute an over-aligned frame's base register (x19) from x29.
+    ///
+    /// Once in the prologue, and again wherever a `__builtin_longjmp`
+    /// resumes, which restores x29 and sp and nothing else.
+    pub(super) fn emit_frame_base_latch(&mut self) {
+        let FrameBase::Aligned {
+            reg: base,
+            align: max_align,
+        } = self.frame_base
+        else {
+            return;
+        };
+        let base_offset = 16 + self.callee_saved_size;
+        // base = (FP + base_offset + max_align - 1) & ~(max_align - 1)
+        self.push_lir(Aarch64Inst::Add {
+            size: OperandSize::B64,
+            dst: base,
+            src1: Reg::X29,
+            src2: GpOperand::Imm((base_offset + max_align - 1) as i64),
+        });
+        // AND with bitmask: aarch64 AND (immediate) encodes bitmasks
+        self.push_lir(Aarch64Inst::And {
+            size: OperandSize::B64,
+            dst: base,
+            src1: base,
+            src2: GpOperand::Imm(-(max_align as i64)),
+        });
     }
 
     /// Record what `-g` has to say about this function.
@@ -819,6 +827,13 @@ impl Aarch64CodeGen {
                 None
             };
 
+            // On the stack whatever registers are left, taking the general
+            // registers with it; the body reads its pseudo where it lies.
+            if self.stacked_arg_bytes(*typ, types).is_some() {
+                int_arg_idx = arg_regs.len();
+                continue;
+            }
+
             // The pseudo for this argument; each early exit leaves the block.
             // With sret, params have arg_idx = i + 1, but still use arg_regs[i].
             'arg: {
@@ -1425,6 +1440,11 @@ impl Aarch64CodeGen {
                         dst1: Reg::X0,
                         dst2: Reg::X1,
                     });
+                } else if let Loc::Imm(v) = loc {
+                    // A constant: both halves. The fallback below zeroed the
+                    // high one, so `return (i128)1 << 100;` returned 0.
+                    self.emit_mov_imm(Reg::X0, v as u64 as i64, 64);
+                    self.emit_mov_imm(Reg::X1, (v >> 64) as u64 as i64, 64);
                 } else {
                     // Fallback: load lo half to X0, zero X1
                     self.emit_move(src, Reg::X0, 64);

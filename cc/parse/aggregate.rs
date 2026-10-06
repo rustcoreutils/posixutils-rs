@@ -9,20 +9,42 @@
 // struct, union and enum specifiers, and the bit-field constraints
 //
 
-use super::attribute::AttributeList;
+use super::attribute::{AttributeList, ATTRIBUTE_WARNING};
 use super::declaration::SpecContext;
 use super::parser::{DeclaratorContext, ParseError, ParseResult, ParsedDeclarator, Parser};
 use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId};
+use crate::target::ByteOrder;
 use crate::token::lexer::{Position, TokenType, TokenValue};
+use crate::token::preprocess::StorageOrderPragma;
 use crate::types::{
     CompositeType, EnumConstant, MemberAlign, StructMember, Type, TypeId, TypeKind, TypeModifiers,
 };
-use gettextrs::gettext;
+use gettextrs::{gettext, gettext_args};
 
 const DEFAULT_MEMBER_CAPACITY: usize = 16;
 const DEFAULT_ENUM_CAPACITY: usize = 16;
+
+/// A `scalar_storage_order` attribute written on a reference to an existing
+/// struct or union, which the declaration it begins applies or ignores
+/// ([`Parser::apply_written_storage_order`]).
+#[derive(Clone, Copy)]
+pub(crate) struct WrittenOrder {
+    pub(crate) order: ByteOrder,
+    pub(crate) pos: Position,
+}
+
+/// Where a declarator may take a struct's variant in another storage order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VariantAllowed {
+    /// A typedef name.
+    Typedef,
+    /// A type-name, which gcc warns about.
+    TypeName,
+    /// Anything else, which ignores the order.
+    No,
+}
 
 impl Parser<'_> {
     /// The integer type an enumerated type is compatible with, and its size.
@@ -135,6 +157,7 @@ impl Parser<'_> {
             let mut constant_syms: Vec<SymbolId> = Vec::new();
 
             while !self.is_special(b'}') && !self.is_eof() {
+                let name_pos = self.current_pos();
                 let name = self.expect_identifier()?;
 
                 let value = if self.is_special(b'=') {
@@ -143,18 +166,23 @@ impl Parser<'_> {
                     let expr = self.parse_conditional_expr()?;
                     // Evaluate constant expression
                     let v = self.eval_const_expr(&expr).ok_or_else(|| {
-                        ParseError::new("enum value must be constant", self.current_pos())
+                        ParseError::new(
+                            gettext_args(
+                                "enumerator value for '{0}' is not an integer constant",
+                                &[self.idents.get_opt(name).unwrap_or("")],
+                            ),
+                            name_pos,
+                        )
                     })?;
                     // C17 6.7.2.2p2 requires an enumerator to be
                     // representable as `int`, so exceeding it is a constraint
-                    // violation and 5.1.1.3 requires it be diagnosed. gcc
-                    // widens the enumerated type rather than rejecting, and
-                    // so does c17 -- but not in silence.
+                    // violation. gcc widens the enumerated type rather than
+                    // rejecting, and says so only under `-pedantic`; so does
+                    // c17.
                     if v < i32::MIN as i128 || v > i32::MAX as i128 {
-                        diag::warning_args(
+                        diag::pedwarn(
                             value_pos,
-                            "enumerator value {0} is outside the range of 'int'",
-                            &[&v.to_string()],
+                            &gettext("ISO C restricts enumerator values to range of 'int'"),
                         );
                     }
                     v
@@ -234,6 +262,7 @@ impl Parser<'_> {
                 member_align: size,
                 is_complete: true,
                 transparent: false,
+                reverse_order: false,
                 anon_id: tag.is_none().then(|| self.types.fresh_anon_id()),
                 tag_type: None,
             };
@@ -427,6 +456,9 @@ impl Parser<'_> {
         let mut is_transparent = early_attrs.has_transparent_union();
         // Track struct-level aligned attribute (max across all positions)
         let mut struct_align: Option<u32> = early_attrs.get_alignment();
+        // `scalar_storage_order`, accepted at the same three positions; the
+        // last one written decides, as in gcc.
+        let mut storage_order = early_attrs.storage_order(specifier_pos);
 
         // Parse __attribute__ after tag name but before '{'
         let pre_attrs = self.parse_attributes();
@@ -435,6 +467,7 @@ impl Parser<'_> {
         if let Some(a) = pre_attrs.get_alignment() {
             struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
         }
+        storage_order = pre_attrs.storage_order(specifier_pos).or(storage_order);
 
         // Check for definition vs forward reference
         if self.is_special(b'{') {
@@ -458,8 +491,10 @@ impl Parser<'_> {
             if let Some(a) = attrs.get_alignment() {
                 struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
             }
+            storage_order = attrs.storage_order(specifier_pos).or(storage_order);
 
             self.check_flexible_array_members(&members, is_union);
+            let reverse_order = self.apply_storage_order(&mut members, storage_order);
 
             // Compute layout. `__attribute__((packed))` on the struct or union
             // is `packed` on every member, which is how gcc defines it; a
@@ -525,6 +560,7 @@ impl Parser<'_> {
                 member_align,
                 is_complete: true,
                 transparent: is_transparent && is_union,
+                reverse_order,
                 anon_id: tag.is_none().then(|| self.types.fresh_anon_id()),
                 tag_type: None,
             };
@@ -599,6 +635,13 @@ impl Parser<'_> {
                         TypeKind::Struct
                     };
                     self.check_tag_kind(tag_name, existing, kind);
+                    // What the order does to a reference depends on the
+                    // declarator, which is not parsed yet: the specifier
+                    // names the tag's own type, and the consumer decides.
+                    self.written_storage_order = storage_order.map(|order| WrittenOrder {
+                        order,
+                        pos: specifier_pos,
+                    });
                     Ok(self.types.get(existing).clone())
                 } else {
                     // Create new incomplete type and register it in symbol table
@@ -652,6 +695,9 @@ impl Parser<'_> {
             // Parse member declaration
             let specs_start = self.pos;
             let member_specs = self.parse_declaration_specifiers(SpecContext::Member)?;
+            // A member never takes another storage order from its own
+            // declaration; the struct it is in decides.
+            self.ignore_written_storage_order(member_specs.written_order);
             // Whether the specifiers spell out a structure or union -- the
             // only thing that can make an anonymous member -- rather than
             // naming one through a typedef.
@@ -737,15 +783,22 @@ impl Parser<'_> {
                     self.advance(); // consume ':'
                     let width = self.parse_bitfield_width()?;
                     self.validate_bitfield(member_base_type_id, width, false)?;
+                    // Attributes after the width are this field's, as after
+                    // a named one: `int :5 __attribute__((aligned(8)))`
+                    // places it at the next 8-byte boundary under gcc, and
+                    // `packed` packs it.
+                    self.skip_extensions();
+                    let typ = self.apply_pending_type_attrs(member_base_type_id);
+                    let align = specifier_align.merge(self.take_member_align());
 
                     members.push(StructMember {
                         name: StringId::EMPTY,
-                        typ: member_base_type_id,
+                        typ,
                         offset: 0,
                         bit_offset: None,
                         bit_width: Some(width),
                         access_bytes: None,
-                        align: MemberAlign::NATURAL, // padding: nothing written aligns it
+                        align,
                     });
 
                     if self.is_special(b',') {
@@ -866,14 +919,14 @@ impl Parser<'_> {
             }
 
             // C17 6.7.2.1 requires the `;`. gcc accepts a member list
-            // whose last declaration lacks one and warns, and
-            // `-fpermissive` is where c17 keeps that kind of leniency --
-            // there is nothing ambiguous about `struct S { int a; int b }`,
-            // the `}` says the list ended.
-            if self.is_special(b'}') && diag::permissive() {
-                diag::warning(
+            // whose last declaration lacks one, with a warning that
+            // `-pedantic-errors` makes an error -- there is nothing
+            // ambiguous about `struct S { int a; int b }`, the `}` says the
+            // list ended.
+            if self.is_special(b'}') {
+                diag::pedwarn_default(
                     self.current_pos(),
-                    &gettext("the last member of a struct or union needs a ';'"),
+                    &gettext("no semicolon at end of struct or union"),
                 );
             } else {
                 self.expect_special(b';')?;
@@ -892,7 +945,7 @@ impl Parser<'_> {
             TypeKind::Function => "field '{0}' declared as a function",
             // An array's element type was checked by its declarator.
             TypeKind::Array => return true,
-            _ if self.type_name_is_incomplete(typ, 0) => "field '{0}' has incomplete type",
+            _ if self.type_name_is_incomplete(typ) => "field '{0}' has incomplete type",
             _ => return true,
         };
         diag::error_args(self.current_pos(), message, &[&spelled]);
@@ -940,7 +993,9 @@ impl Parser<'_> {
     fn check_wide_bitfields_have_a_carrier(&self, members: &[StructMember]) {
         for m in members {
             let Some(width) = m.bit_width else { continue };
-            if width <= 64 || m.access_bytes == Some(16) {
+            // An unnamed field is never accessed, so needs no carrier: on an
+            // ABI where it is padding its span is only the bytes it touches.
+            if width <= 64 || m.access_bytes == Some(16) || m.is_unnamed_bitfield() {
                 continue;
             }
             diag::error_args(
@@ -949,6 +1004,123 @@ impl Parser<'_> {
                 &[&width.to_string()],
             );
         }
+    }
+
+    /// Give the members of the struct or union being defined the storage
+    /// order its `scalar_storage_order` attribute names, or failing that the
+    /// one `#pragma scalar_storage_order` has in force.
+    ///
+    /// Only an order that differs from the target's changes anything, and
+    /// only for the members gcc counts as scalars -- see
+    /// [`crate::types::TypeTable::in_reverse_storage`]. The order is a
+    /// property of the member types from here on: everything that reads or
+    /// writes a member learns it from the type it accesses the member at.
+    /// Answers whether the order is the reverse of the target's, which the
+    /// aggregate records too.
+    fn apply_storage_order(
+        &mut self,
+        members: &mut [StructMember],
+        written: Option<ByteOrder>,
+    ) -> bool {
+        let order = match written {
+            Some(order) => order,
+            None => match self.current_storage_order() {
+                StorageOrderPragma::Order(order) => order,
+                StorageOrderPragma::Default => return false,
+            },
+        };
+        if order == self.types.target().byte_order() {
+            return false;
+        }
+        for member in members {
+            member.typ = self.types.in_reverse_storage(member.typ);
+        }
+        true
+    }
+
+    /// The order a `scalar_storage_order` attribute wrote on a reference to
+    /// an existing struct or union, taken from the specifier just parsed.
+    pub(super) fn take_written_storage_order(&mut self) -> Option<WrittenOrder> {
+        self.written_storage_order.take()
+    }
+
+    /// What gcc does with `scalar_storage_order` written on a reference to
+    /// an existing tag, once the declarator is known: `base` is the tag's
+    /// type as the specifiers qualified it, and `declared` what the
+    /// declarator derived from it.
+    ///
+    /// A typedef or a type-name that derives nothing gets gcc's variant of
+    /// the type in that order -- `typedef struct S __attribute__((...))
+    /// BE;` -- which has the same members and layout and is not compatible
+    /// with `struct S` when the order differs; a type-name says the
+    /// attribute came after the definition. Anything else -- an object, a
+    /// parameter, a member, a function, or a pointer or array declarator --
+    /// ignores the attribute and says so: `struct S __attribute__((...)) x;`
+    /// declares a plain `struct S`.
+    pub(super) fn apply_written_storage_order(
+        &mut self,
+        written: Option<WrittenOrder>,
+        base: TypeId,
+        declared: TypeId,
+        variant_allowed: VariantAllowed,
+    ) -> TypeId {
+        let Some(written) = written else {
+            return declared;
+        };
+        let warn = diag::warning_group_enabled(ATTRIBUTE_WARNING);
+        if variant_allowed == VariantAllowed::No || declared != base {
+            if warn {
+                diag::warning_args(
+                    written.pos,
+                    "'{0}' attribute ignored",
+                    &["scalar_storage_order"],
+                );
+            }
+            return declared;
+        }
+        if variant_allowed == VariantAllowed::TypeName && warn {
+            diag::warning_args(
+                written.pos,
+                "ignoring attributes applied to '{0}' after definition",
+                &[&self.types.format_type(base, Some(self.idents))],
+            );
+        }
+        let variant = self.in_written_storage_order(base, written.order);
+        self.types.intern(variant)
+    }
+
+    /// [`Self::apply_written_storage_order`] where no declarator can take the
+    /// variant: the attribute is ignored, with gcc's warning.
+    pub(super) fn ignore_written_storage_order(&mut self, written: Option<WrittenOrder>) {
+        let int = self.types.int_id;
+        self.apply_written_storage_order(written, int, int, VariantAllowed::No);
+    }
+
+    /// The struct or union `typ` in the storage order `order`: a type of its
+    /// own when that is not the order `typ` already has, otherwise `typ`.
+    fn in_written_storage_order(&mut self, typ: TypeId, order: ByteOrder) -> Type {
+        let mut variant = self.types.get(typ).clone();
+        let reverse = order != self.types.target().byte_order();
+        let Some(composite) = variant.composite.as_deref_mut() else {
+            return variant;
+        };
+        let mut changed = composite.reverse_order != reverse;
+        composite.reverse_order = reverse;
+        for member in &mut composite.members {
+            let typ = if reverse {
+                self.types.in_reverse_storage(member.typ)
+            } else {
+                self.types.in_native_storage(member.typ)
+            };
+            changed |= typ != member.typ;
+            member.typ = typ;
+        }
+        if changed {
+            // A type of its own, not a copy of the tag's: interning a copy
+            // answers with the tag's `TypeId`, which has the other order.
+            composite.tag_type = None;
+        }
+        variant
     }
 
     fn check_flexible_array_members(&self, members: &[StructMember], is_union: bool) {
@@ -976,7 +1148,7 @@ impl Parser<'_> {
         if members
             .iter()
             .take(first)
-            .all(|m| m.name == StringId::EMPTY && m.bit_width.is_some())
+            .all(StructMember::is_unnamed_bitfield)
         {
             diag::error(
                 pos,

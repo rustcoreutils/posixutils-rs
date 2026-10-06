@@ -262,7 +262,9 @@ fn extract_refs_from_expr(
         | ExprKind::Popcount { arg }
         | ExprKind::Popcountl { arg }
         | ExprKind::Popcountll { arg }
-        | ExprKind::Alloca { size: arg } => {
+        | ExprKind::Alloca { size: arg }
+        | ExprKind::StackRestore { ptr: arg }
+        | ExprKind::ClearPadding { ptr: arg, .. } => {
             extract_refs_from_expr(arg, strings, symbols, xref);
         }
         _ => {}

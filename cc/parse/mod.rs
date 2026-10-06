@@ -27,6 +27,7 @@ mod expression;
 mod generic_builtin;
 mod library_builtin;
 mod linkage;
+mod lowering_builtin;
 mod operand_rule;
 pub mod parser;
 mod statement;
@@ -36,6 +37,8 @@ mod typename;
 mod vector_builtin;
 mod vector_check;
 
+#[cfg(test)]
+mod test_constant_p;
 #[cfg(test)]
 mod test_declarations;
 #[cfg(test)]
@@ -52,6 +55,8 @@ mod test_member_list;
 mod test_parser;
 #[cfg(test)]
 mod test_specifiers;
+#[cfg(test)]
+mod test_storage_order;
 #[cfg(test)]
 mod test_vectors;
 

@@ -2208,3 +2208,38 @@ fn test_line_directive_maps_token_positions() {
     assert_eq!(b.pos.line, 77);
     assert_eq!(crate::diag::stream_name(b.pos.stream), "renamed.c");
 }
+
+/// `#pragma scalar_storage_order` reaches the parser as a layout marker, in
+/// either spelling, and a body naming no order is dropped with a warning.
+#[test]
+fn test_storage_order_pragma_becomes_a_layout_marker() {
+    let (mut tokens, _) = preprocess_str(
+        "#pragma scalar_storage_order big-endian\n\
+         int a;\n\
+         _Pragma(\"scalar_storage_order little-endian\")\n\
+         #pragma scalar_storage_order default\n\
+         #pragma scalar_storage_order sideways\n\
+         int b;\n",
+    );
+    let pragmas = extract_pragma_directives(&mut tokens);
+    let orders: Vec<LayoutPragma> = pragmas.iter().map(|(_, p)| *p).collect();
+    assert_eq!(
+        orders,
+        [
+            LayoutPragma::StorageOrder(StorageOrderPragma::Order(ByteOrder::BigEndian)),
+            LayoutPragma::StorageOrder(StorageOrderPragma::Order(ByteOrder::LittleEndian)),
+            LayoutPragma::StorageOrder(StorageOrderPragma::Default),
+        ]
+    );
+    // The first stands before `int a`, the others after it.
+    assert!(pragmas[0].0 < pragmas[1].0);
+    // And each one spells itself back for `-E`.
+    assert_eq!(
+        orders[0].to_pragma_text(),
+        "#pragma scalar_storage_order big-endian"
+    );
+    assert_eq!(
+        orders[2].to_pragma_text(),
+        "#pragma scalar_storage_order default"
+    );
+}

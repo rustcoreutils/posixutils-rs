@@ -21,6 +21,11 @@
 // closes because `instcombine` folds the conversion and the comparison
 // once the `Load` has become a `SetVal`.
 //
+// A byte of an object whose bytes are all known for the whole run -- a
+// string literal (C17 6.4.5p7) or a `const` `char` array -- folds the same
+// way and for the same reason: `"hi"[0]` is `'h'`, as gcc folds it, and
+// that is what makes `__builtin_constant_p("hi"[0])` 1.
+//
 // What it declines is as load-bearing as what it folds, and each refusal
 // below names the thing that could otherwise change the value underneath
 // it: an `extern` declaration whose definition is in another translation
@@ -30,10 +35,12 @@
 // cannot see.
 //
 
-use super::memloc::{same_register_file, AddrMap, GlobalFacts, MemBase};
+use super::constfold::at_width;
+use super::memloc::{same_register_file, AddrMap, GlobalFacts, MemBase, MemLoc};
 use super::propagate;
+use super::strdata::ConstBytes;
 use super::{ConstValue, Function, Initializer, Instruction, Module, Opcode};
-use crate::types::{TypeId, TypeTable};
+use crate::types::{TypeId, TypeKind, TypeTable};
 use std::collections::HashMap;
 
 /// A global whose value is known for the whole run.
@@ -45,9 +52,15 @@ struct KnownGlobal {
 
 /// The globals whose value is known for the whole run, by name: a fact about
 /// the module, gathered once and read by every function.
-pub struct KnownGlobals(HashMap<String, KnownGlobal>);
+pub struct KnownGlobals {
+    /// The scalars, whose initializer is the value of the whole object.
+    scalars: HashMap<String, KnownGlobal>,
+    /// The objects whose every byte is known.
+    bytes: ConstBytes,
+}
 
-/// Replace every load of a `const` global in `func` with its initializer.
+/// Replace every load of a `const` global in `func` with its initializer,
+/// and every byte load of a known byte object with the byte.
 /// Returns whether anything changed.
 ///
 /// A load is matched to its global by the address it reads, resolved the way
@@ -56,12 +69,21 @@ pub struct KnownGlobals(HashMap<String, KnownGlobal>);
 /// address resolves only once `instcombine` has folded the arithmetic that
 /// forms it.
 pub fn run(func: &mut Function, types: &TypeTable, known: &KnownGlobals) -> bool {
-    !known.0.is_empty() && propagate(func, types, &known.0)
+    !(known.scalars.is_empty() && known.bytes.is_empty()) && propagate(func, types, known)
 }
 
 impl KnownGlobals {
     pub fn collect(module: &Module, types: &TypeTable) -> KnownGlobals {
-        KnownGlobals(collect(module, types))
+        KnownGlobals {
+            scalars: collect(module, types),
+            bytes: ConstBytes::build(module, types),
+        }
+    }
+
+    /// The objects whose every byte is known, which `libcall_fold` reads
+    /// strings out of.
+    pub(crate) fn bytes(&self) -> &ConstBytes {
+        &self.bytes
     }
 }
 
@@ -118,7 +140,7 @@ pub(crate) fn qualifies(g: &super::GlobalDef, types: &TypeTable) -> bool {
 }
 
 /// Rewrite the loads in one function.
-fn propagate(func: &mut Function, types: &TypeTable, known: &HashMap<String, KnownGlobal>) -> bool {
+fn propagate(func: &mut Function, types: &TypeTable, known: &KnownGlobals) -> bool {
     // Collected first: the rewrite needs `&mut func` for the pseudo, and the
     // scan needs the pseudo table to resolve each `Sym`.
     let am = AddrMap::build(func);
@@ -143,7 +165,7 @@ fn foldable_load(
     func: &Function,
     am: &AddrMap,
     types: &TypeTable,
-    known: &HashMap<String, KnownGlobal>,
+    known: &KnownGlobals,
     insn: &Instruction,
 ) -> Option<ConstValue> {
     if insn.op != Opcode::Load || insn.src.len() != 1 {
@@ -157,13 +179,24 @@ fn foldable_load(
     if insn.is_volatile_access() {
         return None;
     }
+    let loc = am.resolve(func, insn.src[0], insn.offset, insn.size, insn.typ);
+    scalar_load(types, &known.scalars, insn, &loc)
+        .or_else(|| byte_load(types, &known.bytes, insn, &loc))
+}
+
+/// The initializer of the scalar `insn` loads whole from `loc`.
+fn scalar_load(
+    types: &TypeTable,
+    scalars: &HashMap<String, KnownGlobal>,
+    insn: &Instruction,
+    loc: &MemLoc,
+) -> Option<ConstValue> {
     // The start of the object: a member or an element is not the
     // initializer, which is the whole object's value.
-    let loc = am.resolve(func, insn.src[0], insn.offset, insn.size, insn.typ);
     let (MemBase::Global(name), Some(0)) = (&loc.base, loc.offset) else {
         return None;
     };
-    let g = known.get(name.as_str())?;
+    let g = scalars.get(name.as_str())?;
 
     // The whole object, at its own width. A narrower load is reading part of
     // it, and the initializer is not that part.
@@ -178,6 +211,34 @@ fn foldable_load(
     }
 
     Some(g.value)
+}
+
+/// The byte `insn` loads from `loc`, a known byte object, read as the
+/// integer type the load has.
+///
+/// One byte, so that no byte order is involved; a wider load out of a
+/// string is a type pun this leaves alone. A `_Bool` is not an integer any
+/// byte is a value of.
+fn byte_load(
+    types: &TypeTable,
+    bytes: &ConstBytes,
+    insn: &Instruction,
+    loc: &MemLoc,
+) -> Option<ConstValue> {
+    let typ = insn.typ?;
+    if insn.size != 8 || !types.is_integer(typ) || types.kind(typ) == TypeKind::Bool {
+        return None;
+    }
+    let MemBase::Global(name) = &loc.base else {
+        return None;
+    };
+    let at = usize::try_from(loc.offset?).ok()?;
+    let byte = *bytes.object(name)?.get(at)?;
+    Some(ConstValue::Int(at_width(
+        i128::from(byte),
+        8,
+        !types.is_unsigned(typ),
+    )))
 }
 
 #[cfg(test)]
@@ -356,6 +417,90 @@ mod tests {
         let g = const_global("k", types.long_id, Initializer::Int(1));
         let mut m = module_loading(g, &types, types.double_id);
         assert_eq!(fold(&mut m, &types).0, Opcode::Load, "int read as float");
+    }
+
+    /// A module whose function loads one `typ` of `size` bits, `offset`
+    /// bytes into the string literal `.LC0`, which holds `bytes`.
+    fn module_loading_a_string(
+        types: &TypeTable,
+        bytes: &str,
+        typ: TypeId,
+        size: u32,
+        offset: i64,
+    ) -> Module {
+        let mut func = Function::new("t", types.int_id);
+        func.add_pseudo(Pseudo::sym(PseudoId(0), ".LC0".to_string()));
+        func.next_pseudo = 4;
+        let mut b0 = BasicBlock::new(BasicBlockId(0));
+        b0.add_insn(Instruction::new(Opcode::Entry));
+        b0.add_insn(Instruction::sym_addr(
+            PseudoId(2),
+            PseudoId(0),
+            types.char_id,
+        ));
+        let mut load = Instruction::new(Opcode::Load)
+            .with_target(PseudoId(1))
+            .with_src(PseudoId(2))
+            .with_type_and_size(typ, size);
+        load.offset = offset;
+        b0.add_insn(load);
+        b0.add_insn(Instruction::ret(Some(PseudoId(1))));
+        func.add_block(b0);
+        func.entry = BasicBlockId(0);
+        let mut module = Module::default();
+        module.strings.push((".LC0".to_string(), bytes.to_string()));
+        module.functions.push(func);
+        module
+    }
+
+    /// The value a byte load out of `.LC0` folded to, or `None`.
+    fn string_byte(
+        types: &TypeTable,
+        bytes: &str,
+        typ: TypeId,
+        size: u32,
+        at: i64,
+    ) -> Option<i128> {
+        let mut m = module_loading_a_string(types, bytes, typ, size, at);
+        let known = KnownGlobals::collect(&m, types);
+        run(&mut m.functions[0], types, &known);
+        let func = &m.functions[0];
+        (func.blocks[0].insns[2].op == Opcode::SetVal)
+            .then(|| func.const_val(PseudoId(1)))
+            .flatten()
+    }
+
+    /// A byte of a string literal is the byte: `"hi"[0]` is `'h'`, read as
+    /// the load's type -- and the terminator is a byte of it too.
+    #[test]
+    fn a_byte_of_a_string_literal_folds() {
+        for target in [
+            Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux),
+            Target::new(crate::target::Arch::Aarch64, crate::target::Os::Linux),
+        ] {
+            let types = TypeTable::new(&target);
+            let (sc, uc) = (types.schar_id, types.uchar_id);
+            assert_eq!(string_byte(&types, "hi", sc, 8, 0), Some(i128::from(b'h')));
+            assert_eq!(string_byte(&types, "hi", sc, 8, 1), Some(i128::from(b'i')));
+            assert_eq!(string_byte(&types, "hi", sc, 8, 2), Some(0));
+            // `\xff` as a signed and as an unsigned `char`.
+            assert_eq!(string_byte(&types, "\u{ff}", sc, 8, 0), Some(-1));
+            assert_eq!(string_byte(&types, "\u{ff}", uc, 8, 0), Some(255));
+        }
+    }
+
+    /// Past the object, a wider load (a pun whose answer would need a byte
+    /// order) and a `_Bool` are all left alone.
+    #[test]
+    fn a_string_load_that_is_not_one_known_byte_is_left_alone() {
+        let types = TypeTable::new(&Target::new(
+            crate::target::Arch::X86_64,
+            crate::target::Os::Linux,
+        ));
+        assert_eq!(string_byte(&types, "hi", types.schar_id, 8, 3), None);
+        assert_eq!(string_byte(&types, "hi", types.schar_id, 8, -1), None);
+        assert_eq!(string_byte(&types, "hi", types.short_id, 16, 0), None);
+        assert_eq!(string_byte(&types, "hi", types.bool_id, 8, 0), None);
     }
 
     /// A load narrower than the object is reading part of it.

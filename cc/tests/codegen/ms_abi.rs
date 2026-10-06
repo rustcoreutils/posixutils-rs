@@ -477,6 +477,164 @@ fn codegen_ms_abi_interoperates_with_gcc() {
     );
 }
 
+const SMALL_VECTOR_TYPES: &str = r#"
+#define MS __attribute__((ms_abi))
+typedef float v1sf __attribute__((vector_size(4)));
+typedef double v1df __attribute__((vector_size(8)));
+typedef _Float16 v1hf __attribute__((vector_size(2)));
+typedef __float128 v1tf __attribute__((vector_size(16)));
+typedef _Float16 v2hf __attribute__((vector_size(4)));
+typedef _Float16 v4hf __attribute__((vector_size(8)));
+typedef float v2sf __attribute__((vector_size(8)));
+typedef signed char v1qi __attribute__((vector_size(1)));
+typedef signed char v2qi __attribute__((vector_size(2)));
+typedef signed char v4qi __attribute__((vector_size(4)));
+typedef short v1hi __attribute__((vector_size(2)));
+typedef short v2hi __attribute__((vector_size(4)));
+typedef short v4hi __attribute__((vector_size(8)));
+typedef int v1si __attribute__((vector_size(4)));
+typedef int v2si __attribute__((vector_size(8)));
+typedef long v1di __attribute__((vector_size(8)));
+MS long floats(v1sf a, int k, v1df b, v1hf c, v1sf d, v1df e, v1tf f);
+MS long halves(v2hf a, v4hf b, v2sf c, int k, v2hf d, v4hf e);
+MS long ints(v1qi a, v2qi b, v4qi c, v1hi d, v2hi e, v4hi f, v1si g, v2si h, v1di i);
+MS v1sf r1sf(int k);
+MS v1df r1df(int k);
+MS v1hf r1hf(int k);
+MS v1tf r1tf(int k);
+MS v2hf r2hf(int k);
+MS v4hf r4hf(int k);
+MS v2sf r2sf(int k);
+MS v1qi r1qi(int k);
+MS v2qi r2qi(int k);
+MS v4qi r4qi(int k);
+MS v1hi r1hi(int k);
+MS v2hi r2hi(int k);
+MS v4hi r4hi(int k);
+MS v1si r1si(int k);
+MS v2si r2si(int k);
+MS v1di r1di(int k);
+"#;
+
+const SMALL_VECTOR_CALLEE: &str = r#"
+MS long floats(v1sf a, int k, v1df b, v1hf c, v1sf d, v1df e, v1tf f) {
+    /* The callee owns a by-reference copy, so writing it is allowed. */
+    a[0] += 1;
+    return (long)a[0] + k * 10 + (long)b[0] * 100 + (long)c[0] * 1000
+        + (long)d[0] * 10000 + (long)e[0] * 100000 + (long)f[0] * 1000000;
+}
+MS long halves(v2hf a, v4hf b, v2sf c, int k, v2hf d, v4hf e) {
+    return (long)a[1] + (long)b[3] * 10 + (long)c[1] * 100 + k * 1000
+        + (long)d[0] * 10000 + (long)e[2] * 100000;
+}
+MS long ints(v1qi a, v2qi b, v4qi c, v1hi d, v2hi e, v4hi f, v1si g, v2si h, v1di i) {
+    return a[0] + b[1] * 2L + c[3] * 3L + d[0] * 5L + e[1] * 7L + f[3] * 11L
+        + g[0] * 13L + h[1] * 17L + i[0] * 19L;
+}
+MS v1sf r1sf(int k) { v1sf v = {k + 0.5f}; return v; }
+MS v1df r1df(int k) { v1df v = {k + 0.25}; return v; }
+MS v1hf r1hf(int k) { v1hf v = {k}; return v; }
+MS v1tf r1tf(int k) { v1tf v = {k * 3}; return v; }
+MS v2hf r2hf(int k) { v2hf v = {k, k * 2}; return v; }
+MS v4hf r4hf(int k) { v4hf v = {k, k * 2, k * 3, k * 4}; return v; }
+MS v2sf r2sf(int k) { v2sf v = {k, k * 2}; return v; }
+MS v1qi r1qi(int k) { v1qi v = {k}; return v; }
+MS v2qi r2qi(int k) { v2qi v = {k, -k}; return v; }
+MS v4qi r4qi(int k) { v4qi v = {k, -k, k * 2, -k * 2}; return v; }
+MS v1hi r1hi(int k) { v1hi v = {k * 100}; return v; }
+MS v2hi r2hi(int k) { v2hi v = {k, k * 100}; return v; }
+MS v4hi r4hi(int k) { v4hi v = {k, k * 2, k * 3, k * 400}; return v; }
+MS v1si r1si(int k) { v1si v = {k * 1000}; return v; }
+MS v2si r2si(int k) { v2si v = {k, k * 1000}; return v; }
+MS v1di r1di(int k) { v1di v = {k * 100000L}; return v; }
+"#;
+
+const SMALL_VECTOR_CALLER: &str = r#"
+int main(void) {
+    v1sf a = {1}, d = {4};
+    v1df b = {2}, e = {5};
+    v1hf c = {3};
+    v1tf f = {6};
+    if (floats(a, 7, b, c, d, e, f) != 6543272) return 1;
+    if (a[0] != 1) return 2;
+    v2hf h2 = {1, 2}, d2 = {5, 6};
+    v4hf h4 = {1, 2, 3, 4}, e4 = {7, 8, 9, 6};
+    v2sf s2 = {1, 3};
+    if (halves(h2, h4, s2, 8, d2, e4) != 958342) return 3;
+    v1qi q1 = {1};
+    v2qi q2 = {0, 2};
+    v4qi q4 = {0, 0, 0, 3};
+    v1hi i1 = {4};
+    v2hi i2 = {0, 5};
+    v4hi i4 = {0, 0, 0, 6};
+    v1si s1 = {7};
+    v2si si2 = {0, 8};
+    v1di l1 = {9};
+    if (ints(q1, q2, q4, i1, i2, i4, s1, si2, l1) != 1 + 4 + 9 + 20 + 35 + 66 + 91 + 136 + 171)
+        return 4;
+    if (r1sf(2)[0] != 2.5f) return 5;
+    if (r1df(3)[0] != 3.25) return 6;
+    if (r1hf(4)[0] != 4) return 7;
+    if (r1tf(5)[0] != 15) return 8;
+    v2hf rh = r2hf(3);
+    if (rh[0] != 3 || rh[1] != 6) return 9;
+    v4hf rh4 = r4hf(2);
+    if (rh4[0] != 2 || rh4[3] != 8) return 10;
+    v2sf rs = r2sf(7);
+    if (rs[0] != 7 || rs[1] != 14) return 11;
+    if (r1qi(-9)[0] != -9) return 12;
+    v2qi rq = r2qi(5);
+    if (rq[0] != 5 || rq[1] != -5) return 13;
+    v4qi rq4 = r4qi(6);
+    if (rq4[1] != -6 || rq4[3] != -12) return 14;
+    if (r1hi(3)[0] != 300) return 15;
+    v2hi rh2 = r2hi(4);
+    if (rh2[0] != 4 || rh2[1] != 400) return 16;
+    v4hi rh4i = r4hi(2);
+    if (rh4i[2] != 6 || rh4i[3] != 800) return 17;
+    if (r1si(6)[0] != 6000) return 18;
+    v2si rs2 = r2si(3);
+    if (rs2[0] != 3 || rs2[1] != 3000) return 19;
+    if (r1di(7)[0] != 700000) return 20;
+    return 0;
+}
+"#;
+
+/// Every vector shape of sixteen bytes or fewer under `ms_abi`, as argument
+/// and return value, against gcc in every pairing (gcc 13 -O2 -S):
+///
+/// - A one-lane floating vector -- `v1sf`, `v1df`, `v1hf`, `v1tf` -- is
+///   passed by reference to a copy, in a register position or past the
+///   fourth (`addss (%rbx)`, `cvttss2sil (%rdx)`). It is returned in RAX at
+///   eight bytes or fewer, and `v1tf` through the hidden pointer.
+/// - Every other vector of eight bytes or fewer, integer or floating
+///   lanes, travels in its integer position by value and comes back in
+///   RAX, as an aggregate of its size does.
+///
+/// c17 passed the one-lane floating vectors by value. Linux only: these
+/// are gcc's rules, and `__float128` is absent on Apple.
+#[test]
+fn codegen_ms_abi_small_vectors_interoperate_with_gcc() {
+    if !cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        return;
+    }
+    interop_host(
+        "ms_abi_small_vec",
+        &format!("{SMALL_VECTOR_TYPES}{SMALL_VECTOR_CALLEE}"),
+        &format!("{SMALL_VECTOR_TYPES}{SMALL_VECTOR_CALLER}"),
+    );
+    // One translation unit, so the inliner splices the by-reference
+    // parameters into a System V caller.
+    let src = format!("{SMALL_VECTOR_TYPES}{SMALL_VECTOR_CALLEE}{SMALL_VECTOR_CALLER}");
+    for opt in ["-O1", "-O2", "-O3"] {
+        assert_eq!(
+            compile_and_run("ms_abi_small_vec_inline", &src, &[opt.to_string()]),
+            0,
+            "{opt}"
+        );
+    }
+}
+
 /// Both conventions in one translation unit, so the inliner meets them: an
 /// `ms_abi` function inlined into a System V caller and the reverse must
 /// agree on how each argument travels.

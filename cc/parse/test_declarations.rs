@@ -77,6 +77,71 @@ fn test_redeclaration_rules() {
     }
 }
 
+/// A `static` declaration may take over a name declared GNU `extern inline`
+/// -- gcc's one exception to C17 6.2.2p7 -- and the static definition is the
+/// function. Every verdict is gcc 13's.
+#[test]
+fn test_static_takes_over_gnu_extern_inline() {
+    const EI: &str = "extern inline __attribute__((gnu_inline))";
+    for src in [
+        format!("{EI} int k(void) {{ return 1; }} static int k(void) {{ return 2; }}"),
+        format!("{EI} int k(void) {{ return 1; }} static inline int k(void) {{ return 2; }}"),
+        format!("int k(void); {EI} int k(void) {{ return 1; }} static int k(void) {{ return 2; }}"),
+        format!("extern int k(void); {EI} int k(void) {{ return 1; }} static int k(void);"),
+        format!("{EI} int k(void) {{ return 1; }} int k(void); static int k(void) {{ return 2; }}"),
+        format!("{EI} int k(void); static int k(void) {{ return 2; }}"),
+        format!("{EI} int k(void); int k(void); static int k(void) {{ return 2; }}"),
+        format!("{EI} int k(void) {{ return 1; }} static int k(void) {{ return 2; }} int k(void);"),
+        format!("static int k(void); {EI} int k(void) {{ return 1; }}"),
+    ] {
+        parse_tu(&src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+    }
+    for src in [
+        // The static one already defined it, then the name is internal.
+        format!("static int k(void) {{ return 2; }} {EI} int k(void) {{ return 1; }}"),
+        "int k(void); static int k(void) { return 2; }".to_string(),
+        // A plain `inline` promises the external definition.
+        format!(
+            "{EI} int k(void); inline __attribute__((gnu_inline)) int k(void); static int k(void);"
+        ),
+        "inline __attribute__((gnu_inline)) int k(void) { return 1; } static int k(void);"
+            .to_string(),
+        // So does the real definition.
+        format!("{EI} int k(void) {{ return 1; }} int k(void) {{ return 3; }} static int k(void);"),
+        // Without GNU inline semantics, C17 6.2.2p7.
+        "extern inline int k(void) { return 1; } static int k(void) { return 2; }".to_string(),
+        // The static one is a declaration of the same function.
+        format!("{EI} int k(void) {{ return 1; }} static long k(void) {{ return 2; }}"),
+    ] {
+        assert_rejected(&src);
+    }
+}
+
+/// A function definition has the linkage its name has, not only the one its
+/// own specifiers spell: after `static int f(void);`, `int f(void) {..}` and
+/// a GNU `extern inline` body are both static (C17 6.2.2p4, p5).
+#[test]
+fn test_definition_takes_prior_internal_linkage() {
+    for src in [
+        "static int f(void); int f(void) { return 0; }",
+        "static int f(void); extern inline __attribute__((gnu_inline)) int f(void) { return 0; }",
+        "extern inline __attribute__((gnu_inline)) int f(void) { return 1; }\n\
+         static int f(void) { return 0; }",
+    ] {
+        let (tu, _, strings, _) = parse_tu(src).unwrap();
+        let f = strings.lookup("f").expect("interned");
+        let defs: Vec<bool> = tu
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ExternalDecl::FunctionDef(def) if def.name == f => Some(def.is_static),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(defs.last(), Some(&true), "{src}");
+    }
+}
+
 #[test]
 fn test_tag_rules() {
     for src in [
@@ -446,7 +511,7 @@ fn test_designator_chain_continuation_checks_and_sizes() {
         ),
     ] {
         let (types, typ, _) = last_initializer(src);
-        assert_eq!(types.array_size(typ), Some(len), "{src}");
+        assert_eq!(types.array_extent(typ).known(), Some(len), "{src}");
     }
 }
 
@@ -511,4 +576,115 @@ fn test_continuation_into_an_anonymous_member_is_spelled_by_position() {
     ] {
         assert_clean(src);
     }
+}
+
+/// The type the file-scope identifier `name` has once `src` is parsed.
+fn file_scope_type(src: &str, name: &str) -> (TypeTable, TypeId) {
+    let (_, types, strings, symbols) = parse_tu_for(src, &wchar_is_int()).unwrap();
+    let id = strings.lookup(name).expect("interned");
+    let typ = symbols
+        .lookup(id, Namespace::Ordinary)
+        .expect("declared")
+        .typ;
+    (types, typ)
+}
+
+/// C17 6.2.7p3-4: after a later declaration of the same object, the
+/// identifier has the composite type, wherever in the type the incomplete
+/// array it completes sits. Only a top-level array used to be merged, so
+/// `int (*q)[]; int (*q)[3];` left `sizeof *q` at 0.
+#[test]
+fn test_redeclaration_has_the_composite_type() {
+    for src in [
+        // A pointer to an array, completed by the later declaration and kept
+        // complete by a later incomplete one.
+        "int (*q)[]; int (*q)[3]; _Static_assert(sizeof *q == 12, \"\");",
+        "int (*q)[3]; int (*q)[]; _Static_assert(sizeof *q == 12, \"\");",
+        "extern int (*q)[]; extern int (*q)[3]; _Static_assert(sizeof *q == 12, \"\");",
+        // Nested arrays: the outer extent completes, the inner one is kept.
+        "extern int m[][4]; int m[2][4]; _Static_assert(sizeof m == 32, \"\");",
+        "int m[2][4]; extern int m[][4]; _Static_assert(sizeof m == 32, \"\");",
+        // A pointer to a pointer to an array.
+        "int (**pp)[]; int (**pp)[2]; _Static_assert(sizeof **pp == 8, \"\");",
+        // Qualifiers on the element type survive the composite.
+        "const int (*c)[]; const int (*c)[2]; _Static_assert(sizeof *c == 8, \"\");",
+        // A function returning a pointer to an incomplete array, completed
+        // by a later declaration or by the definition.
+        "int (*fp(void))[]; int (*fp(void))[6]; \
+         _Static_assert(sizeof *fp() == 24, \"\");",
+        "extern int (*fp(void))[]; int (*fp(void))[6] { return 0; } \
+         _Static_assert(sizeof *fp() == 24, \"\");",
+        "int (*fp(void))[6]; int (*fp(void))[] { return 0; } \
+         _Static_assert(sizeof *fp() == 24, \"\");",
+    ] {
+        assert_clean(src);
+    }
+}
+
+/// A function's composite type composes its parameters (C17 6.2.7p3), and
+/// takes the prototype when only one declaration has one.
+#[test]
+fn test_function_redeclaration_composes_parameters() {
+    let param = |src: &str| {
+        let (types, f) = file_scope_type(src, "f");
+        let params = types.get(f).params.clone().expect("a prototype");
+        let pointee = types.base_type(params[0]).expect("a pointer");
+        types.get(pointee).extent.known()
+    };
+    assert_eq!(param("int f(int (*a)[]); int f(int (*a)[5]);"), Some(5));
+    assert_eq!(param("int f(int (*a)[5]); int f(int (*a)[]);"), Some(5));
+    assert_eq!(
+        param("int f(int (*a)[]); int f(int (*a)[5]) { return sizeof *a; }"),
+        Some(5)
+    );
+    assert_eq!(
+        param("int f(int (*a)[5]); int f(int (*a)[]) { return 0; }"),
+        Some(5)
+    );
+    // A parameter that is itself a pointer to a function of a pointer to
+    // an array.
+    let (types, g) = file_scope_type(
+        "void g(void (*)(int (*)[])); void g(void (*)(int (*)[7]));",
+        "g",
+    );
+    let callback = types.get(g).params.as_ref().unwrap()[0];
+    let callback_fn = types.base_type(callback).unwrap();
+    let array_ptr = types.get(callback_fn).params.as_ref().unwrap()[0];
+    let array = types.base_type(array_ptr).unwrap();
+    assert_eq!(types.get(array).extent.known(), Some(7));
+
+    // Prototyped and unprototyped, in either order: the prototype wins.
+    for src in ["int f(); int f(int (*)[]);", "int f(int (*)[]); int f();"] {
+        let (types, f) = file_scope_type(src, "f");
+        assert_eq!(types.get(f).params.as_ref().map(Vec::len), Some(1), "{src}");
+    }
+    // A block-scope declaration without a prototype gets the file-scope one,
+    // so a call through it is checked against it, as gcc does.
+    assert_rejected("int h(int); void k(void) { int h(); h(1, 2); }");
+}
+
+/// A block-scope declaration with linkage composes with the visible
+/// file-scope one (C17 6.2.7p4), and with a repeat in its own block; one
+/// without linkage is a different object.
+#[test]
+fn test_block_scope_extern_has_the_composite_type() {
+    for src in [
+        "int (*q)[3]; void g(void) { extern int (*q)[]; \
+         _Static_assert(sizeof *q == 12, \"\"); }",
+        "extern int (*q)[]; void g(void) { extern int (*q)[3]; \
+         _Static_assert(sizeof *q == 12, \"\"); }",
+        "int (*fp(void))[6]; void g(void) { int (*fp(void))[]; \
+         _Static_assert(sizeof *fp() == 24, \"\"); }",
+        "void g(void) { extern int z[]; extern int z[3]; \
+         _Static_assert(sizeof z == 12, \"\"); }",
+        "void g(void) { extern int (*z)[]; extern int (*z)[3]; \
+         _Static_assert(sizeof *z == 12, \"\"); }",
+    ] {
+        assert_clean(src);
+    }
+    // The inner `q` is its own object, which the outer declaration does not
+    // complete.
+    assert_rejected(
+        "int (*q)[3]; void g(void) { int (*q)[]; _Static_assert(sizeof *q == 12, \"\"); }",
+    );
 }

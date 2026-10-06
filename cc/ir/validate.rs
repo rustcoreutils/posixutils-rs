@@ -35,11 +35,11 @@
 //        switch's, and an `asm goto`'s labels.
 //
 //   I4 — NO PLACEHOLDER SURVIVES LOWERING
-//        `ConstantP` and `VaArgPackLen` stand for a value something
-//        downstream resolves. Neither backend knows them, and both end their
-//        opcode match in a catch-all, so one left in an emitted function
-//        would be dropped in silence and its target left undefined. Checked
-//        after lowering only; a function codegen skips is exempt.
+//        `ConstantP`, `ObjectSize` and `VaArgPackLen` stand for a value
+//        something downstream resolves. Neither backend knows them, and both
+//        end their opcode match in a catch-all, so one left in an emitted
+//        function would be dropped in silence and its target left undefined.
+//        Checked after lowering only; a function codegen skips is exempt.
 //
 //   I5 — A MEMORY ACCESS OTHER THAN A `Load` HAS SIDE EFFECTS
 //        A property of the opcode table, not of any program; see below.
@@ -513,7 +513,10 @@ impl<'a> Walk<'a> {
         // I4
         if self.stage == Stage::Lowered
             && self.func.emit
-            && matches!(insn.op, Opcode::ConstantP | Opcode::VaArgPackLen)
+            && matches!(
+                insn.op,
+                Opcode::ConstantP | Opcode::ObjectSize(_) | Opcode::VaArgPackLen
+            )
         {
             self.report(at, Invariant::UnresolvedPlaceholder);
         }

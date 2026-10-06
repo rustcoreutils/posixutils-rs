@@ -18,7 +18,7 @@ use crate::test_compile::compile_expect_error;
 /// relocation was emitted as eight bytes over the one- or four-byte object.
 #[test]
 fn codegen_address_into_a_narrow_integer_is_not_a_static_initializer() {
-    let what = "cannot initialize an object with static storage duration";
+    let what = "initializer element is not constant";
     for (name, src) in [
         (
             "narrow_addr_char",

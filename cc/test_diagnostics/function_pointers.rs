@@ -286,8 +286,9 @@ fn diagnostics_transparent_union_warning_can_be_silenced() {
 // ==== void operands and subscripts (C17 6.5.6p2, 6.5.15p3, 6.5.2.1p1) ====
 
 /// An operand has to have a value. A call to a `void` function has none, so
-/// `v() + 1` and `1 ? v() : 2` are constraint violations -- both used to
-/// compile, the conditional taking whichever arm's type came first. And a
+/// `v() + 1` is a constraint violation, and `1 ? v() : 2` -- which gcc types
+/// `void` -- cannot initialize an `int`. Both used to compile, the
+/// conditional taking whichever arm's type came first. And a
 /// subscript needs a pointer on one side; `a[0]` where `a` is an `int` was
 /// silently given the element type `int` and indexed anyway.
 #[test]

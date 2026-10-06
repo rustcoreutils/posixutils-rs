@@ -305,6 +305,16 @@ impl Aarch64CodeGen {
         })
     }
 
+    /// The size of an argument of type `typ` that is classed
+    /// [`ArgClass::Stacked`], or `None` for any other.
+    pub(super) fn stacked_arg_bytes(&self, typ: TypeId, types: &TypeTable) -> Option<i32> {
+        let abi = crate::abi::get_abi_for_conv(crate::abi::CallingConv::C, &self.base.target);
+        match abi.classify_param(typ, types) {
+            ArgClass::Stacked { size_bytes } => i32::try_from(size_bytes).ok(),
+            _ => None,
+        }
+    }
+
     /// Assign each argument in `args` to its AAPCS64 register, returning the
     /// ones that did not fit and must travel on the stack, in parameter order.
     fn assign_arg_registers(
@@ -325,6 +335,21 @@ impl Aarch64CodeGen {
         for (i, &arg) in insn.src.iter().enumerate().take(args.end).skip(args.start) {
             let arg_type = insn.extra().arg_types.get(i).copied();
             if self.arg_is_ignored(arg_type, types) {
+                continue;
+            }
+            // gcc's floating vector of four bytes or fewer goes on the stack
+            // whatever registers are left, its bytes copied from the address
+            // the pseudo carries, and takes the general registers with it:
+            // NGRN becomes 8, while the V registers stay available.
+            if let Some(bytes) = arg_type.and_then(|t| self.stacked_arg_bytes(t, types)) {
+                stack_args_info.push(StackArg {
+                    pseudo: arg,
+                    is_fp: false,
+                    size: 64,
+                    typ: arg_type,
+                    kind: StackKind::Composite { bytes },
+                });
+                int_arg_idx = int_arg_regs.len();
                 continue;
             }
             let is_complex = arg_type.is_some_and(|t| types.is_complex_float(t));
@@ -1142,6 +1167,9 @@ impl Aarch64CodeGen {
             }
             ArgClass::X87 { .. } => {
                 unreachable!("x87 FPU returns not available on AArch64");
+            }
+            ArgClass::Stacked { .. } => {
+                unreachable!("an argument-only class: no type is returned stacked");
             }
             ArgClass::Ignore => {
                 // Void return, nothing to do

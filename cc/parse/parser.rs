@@ -14,9 +14,9 @@ use super::ast::Expr;
 use crate::constexpr::ConstScope;
 use crate::diag;
 use crate::strings::StringId;
-use crate::symbol::{Namespace, Symbol, SymbolId, SymbolTable};
+use crate::symbol::{Linkage, Namespace, Symbol, SymbolId, SymbolTable};
 use crate::token::lexer::{IdentTable, Position, SpecialToken, Token, TokenType, TokenValue};
-use crate::token::preprocess::PackAction;
+use crate::token::preprocess::{LayoutPragma, PackAction, StorageOrderPragma};
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers, TypeTable};
 use gettextrs::gettext;
 use std::collections::{BTreeMap, HashMap};
@@ -287,6 +287,15 @@ pub struct Parser<'a> {
     /// still makes `f` a constructor. Reading the definition's own attributes
     /// alone would silently drop it.
     pub(super) declared_fn_attrs: BTreeMap<StringId, crate::parse::ast::FunctionAttrs>,
+    /// `_Atomic` members of reverse-storage-order structures named so far,
+    /// awaiting a verdict: each is an error unless its whole expression turns
+    /// out to be the operand of an operator that does not read it. See
+    /// [`Self::note_reverse_atomic_member`].
+    pub(super) reverse_atomic_members: Vec<Position>,
+    /// The `scalar_storage_order` written on the reference to an existing
+    /// tag the struct or union specifier just parsed, for the declaration
+    /// specifiers to collect.
+    pub(super) written_storage_order: Option<crate::parse::aggregate::WrittenOrder>,
     /// The GCC asm label seen in the declaration being parsed, awaiting the
     /// declarator it renames. Accumulated like `pending_fn_attrs` because
     /// `__asm__("...")` can appear before or after an `__attribute__` --
@@ -320,17 +329,21 @@ pub struct Parser<'a> {
     /// Where a `[*]` was written directly in the parameter list being
     /// parsed; see [`ParameterList::star`].
     pub(super) star_in_params: Option<Position>,
-    /// `#pragma pack` directives, and where they stood in the token stream.
+    /// `#pragma pack` and `#pragma scalar_storage_order` directives, and
+    /// where they stood in the token stream.
     ///
-    /// Sorted by index; `pack_cursor` is how far the parser has consumed
+    /// Sorted by index; `layout_cursor` is how far the parser has consumed
     /// them. A directive takes effect for every structure defined after it,
     /// so applying them lazily as the parse position passes each one gives
     /// exactly the right answer without a second traversal.
-    pack_directives: Vec<(usize, PackAction)>,
-    pack_cursor: usize,
+    layout_pragmas: Vec<(usize, LayoutPragma)>,
+    layout_cursor: usize,
     /// The alignment cap currently in force, and the `push`ed stack of caps.
     pack_current: Option<u32>,
     pack_stack: Vec<Option<u32>>,
+    /// The storage order `#pragma scalar_storage_order` gives a struct or
+    /// union whose own attributes name none.
+    storage_order_current: StorageOrderPragma,
     /// Typedef names that specify a variably modified type, and how many
     /// run-time extents each carries (C17 6.7.7).
     ///
@@ -359,7 +372,7 @@ pub struct Parser<'a> {
 impl<'a> Parser<'a> {
     /// Create a new parser with a symbol table and type table.
     ///
-    /// `pack_directives` comes from `extract_pragma_directives`, which every
+    /// `layout_pragmas` comes from `extract_pragma_directives`, which every
     /// caller must run over the preprocessed stream: it removes the pragma
     /// markers the preprocessor leaves behind as well as reporting them, and
     /// a stream still carrying them is not one this parser can read.
@@ -368,7 +381,7 @@ impl<'a> Parser<'a> {
         idents: &'a IdentTable,
         symbols: &'a mut SymbolTable,
         types: &'a mut TypeTable,
-        pack_directives: Vec<(usize, PackAction)>,
+        layout_pragmas: Vec<(usize, LayoutPragma)>,
     ) -> Self {
         Self {
             tokens,
@@ -391,6 +404,8 @@ impl<'a> Parser<'a> {
             pending_calling_conv: None,
             enclosing_function: EnclosingFunction::default(),
             declared_fn_attrs: BTreeMap::new(),
+            reverse_atomic_members: Vec::new(),
+            written_storage_order: None,
             pending_asm_label: None,
             declared_asm_labels: BTreeMap::new(),
             declared_extern_fns: std::collections::BTreeSet::new(),
@@ -399,8 +414,8 @@ impl<'a> Parser<'a> {
             linked_names: std::collections::HashMap::new(),
             param_list_depth: 0,
             star_in_params: None,
-            pack_directives,
-            pack_cursor: 0,
+            layout_pragmas,
+            layout_cursor: 0,
             vm_typedefs: HashMap::new(),
             library_call_policy: Default::default(),
             switch_depth: 0,
@@ -408,6 +423,7 @@ impl<'a> Parser<'a> {
             next_local_label: 0,
             pack_current: None,
             pack_stack: Vec::new(),
+            storage_order_current: StorageOrderPragma::Default,
         }
     }
 
@@ -425,31 +441,50 @@ impl<'a> Parser<'a> {
     /// treating it as a reset -- would silently change the layout of every
     /// structure after an unbalanced pragma.
     pub(super) fn current_pack(&mut self) -> Option<u32> {
+        self.apply_layout_pragmas();
+        self.pack_current
+    }
+
+    /// The storage order `#pragma scalar_storage_order` puts on a struct or
+    /// union defined here.
+    pub(super) fn current_storage_order(&mut self) -> StorageOrderPragma {
+        self.apply_layout_pragmas();
+        self.storage_order_current
+    }
+
+    /// Apply every layout pragma the parse position has now passed.
+    fn apply_layout_pragmas(&mut self) {
         while self
-            .pack_directives
-            .get(self.pack_cursor)
+            .layout_pragmas
+            .get(self.layout_cursor)
             .is_some_and(|(idx, _)| *idx <= self.pos)
         {
-            let (_, action) = self.pack_directives[self.pack_cursor];
-            self.pack_cursor += 1;
-            match action {
-                PackAction::Set(n) => self.pack_current = n,
-                PackAction::Push(n) => {
-                    self.pack_stack.push(self.pack_current);
-                    if n.is_some() {
-                        self.pack_current = n;
-                    }
-                }
-                PackAction::Pop => match self.pack_stack.pop() {
-                    Some(prev) => self.pack_current = prev,
-                    None => diag::warning(
-                        self.current_pos(),
-                        &gettext("'#pragma pack(pop)' with no matching push"),
-                    ),
-                },
+            let (_, pragma) = self.layout_pragmas[self.layout_cursor];
+            self.layout_cursor += 1;
+            match pragma {
+                LayoutPragma::Pack(action) => self.apply_pack(action),
+                LayoutPragma::StorageOrder(order) => self.storage_order_current = order,
             }
         }
-        self.pack_current
+    }
+
+    fn apply_pack(&mut self, action: PackAction) {
+        match action {
+            PackAction::Set(n) => self.pack_current = n,
+            PackAction::Push(n) => {
+                self.pack_stack.push(self.pack_current);
+                if n.is_some() {
+                    self.pack_current = n;
+                }
+            }
+            PackAction::Pop => match self.pack_stack.pop() {
+                Some(prev) => self.pack_current = prev,
+                None => diag::warning(
+                    self.current_pos(),
+                    &gettext("'#pragma pack(pop)' with no matching push"),
+                ),
+            },
+        }
     }
 
     // Token Navigation
@@ -701,57 +736,62 @@ impl Parser<'_> {
         self.symbols.lookup_typedef(name_id).is_some()
     }
 
-    /// Evaluate an integer constant expression: array bounds, enumerators,
-    /// `case` labels, bit-field widths, `_Static_assert`.
+    /// Evaluate an integer constant expression: enumerators, `case` labels,
+    /// bit-field widths, `_Static_assert`.
     ///
     /// The walk itself lives in [`crate::constexpr`], shared with the
     /// linearizer's static-initializer folding. The parser answers only
-    /// [`ConstScope::Standard`]: it has no emitted globals to read a `const`
-    /// object's value out of, and no context here would accept one anyway.
+    /// [`ConstScope::Standard`] and, for an array's size,
+    /// [`Self::eval_array_bound`]: it has no emitted globals to read a
+    /// `const` object's value out of, and no context here would accept one
+    /// anyway.
     pub(crate) fn eval_const_expr(&self, expr: &Expr) -> Option<i128> {
         crate::constexpr::eval(self, ConstScope::Standard, expr)
     }
 
+    /// An array's size as an integer constant expression, or `None` for a
+    /// VLA: [`ConstScope::ArrayBound`], which refuses an out-of-range
+    /// floating conversion as gcc does.
+    pub(crate) fn eval_array_bound(&self, expr: &Expr) -> Option<i128> {
+        crate::constexpr::eval(self, ConstScope::ArrayBound, expr)
+    }
+
     /// The composite type of this declaration and a visible prior one of the
-    /// same object (C17 6.2.7p4).
+    /// same object or function (C17 6.2.7p4).
     ///
-    /// Two declarations of an identifier *with linkage* describe one object,
-    /// so an inner `extern char i[];` under an outer `extern char i[10];` is
-    /// the same complete array -- `sizeof i` is 10, and gcc answers so. c17
-    /// took the inner declaration's own incomplete type and refused the
-    /// `sizeof` outright.
+    /// Two declarations of an identifier *with linkage* describe one entity,
+    /// and after the second the identifier has the composite type of both
+    /// (6.2.7p3): an incomplete array completed at any depth -- `int (*q)[];
+    /// int (*q)[3];` makes `sizeof *q` 12 -- and a prototype supplied to a
+    /// declarator without one. So does an inner `extern char i[];` under an
+    /// outer `extern char i[10];`: `sizeof i` is 10, as gcc answers.
     ///
-    /// Only the array-extent half of the composite is formed here, which is
-    /// the half that changes an answer: a prototype against an unprototyped
-    /// declarator is already handled by `redeclaration_compatible`.
+    /// `has_linkage` says whether this declaration gives the identifier
+    /// linkage; a plain block-scope object is a different object from any
+    /// outer one, and so is a prior declaration without linkage. Incompatible
+    /// types are left alone, for `check_redeclaration` to diagnose the type
+    /// as written.
     pub(super) fn composite_with_prior_declaration(
-        &self,
+        &mut self,
         name: StringId,
         typ: TypeId,
-        modifiers: TypeModifiers,
+        has_linkage: bool,
     ) -> TypeId {
-        // Only a declaration with linkage names an object another declaration
-        // could also name. A plain block-scope object is a different object.
-        if !modifiers.contains(TypeModifiers::EXTERN) {
-            return typ;
-        }
-        if self.types.kind(typ) != TypeKind::Array || self.types.get(typ).array_size.is_some() {
+        if !has_linkage {
             return typ;
         }
         let Some(prior_id) = self.symbols.lookup_id(name, Namespace::Ordinary) else {
             return typ;
         };
-        let prior = self.symbols.get(prior_id).typ;
-        if self.types.kind(prior) != TypeKind::Array || self.types.get(prior).array_size.is_none() {
+        let prior = self.symbols.get(prior_id);
+        if prior.linkage == Linkage::None || prior.is_typedef() {
             return typ;
         }
-        // The element types still have to agree, or these are not two
-        // declarations of one object and the conflict belongs to
-        // `check_redeclaration`.
-        match (self.types.base_type(typ), self.types.base_type(prior)) {
-            (Some(a), Some(b)) if self.types.types_compatible(a, b) => prior,
-            _ => typ,
+        let prior = prior.typ;
+        if !self.types.types_compatible(typ, prior) {
+            return typ;
         }
+        self.types.composite_type(typ, prior)
     }
 
     /// Build the symbol for a declared name, choosing its kind from its type.
@@ -873,8 +913,8 @@ impl Parser<'_> {
 impl crate::constexpr::ConstEnv for Parser<'_> {
     /// Every constant expression the parser folds is one C requires, so it
     /// always answers.
-    fn deferred_constant_p(&self, _scope: ConstScope) -> Option<i128> {
-        Some(0)
+    fn deferred_builtin(&self, settled: i128, _scope: ConstScope) -> Option<i128> {
+        Some(settled)
     }
 
     fn types(&self) -> &TypeTable {

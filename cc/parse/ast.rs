@@ -133,6 +133,40 @@ pub enum MathErrno {
     Ignored,
 }
 
+/// The second argument of `__builtin_object_size`, an integer constant from
+/// 0 to 3: bit 0 asks about the closest surrounding subobject rather than the
+/// whole object, and bit 1 for the fewest bytes that may remain rather than
+/// the most.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ObjectSizeType {
+    /// Bit 0: the closest surrounding subobject.
+    pub subobject: bool,
+    /// Bit 1: a minimum, where clear a maximum.
+    pub minimum: bool,
+}
+
+impl ObjectSizeType {
+    /// The type from its argument's value, which the parser has checked is
+    /// 0 to 3.
+    pub const fn from_bits(bits: u64) -> ObjectSizeType {
+        ObjectSizeType {
+            subobject: bits & 1 != 0,
+            minimum: bits & 2 != 0,
+        }
+    }
+
+    /// What the builtin answers when nothing is known about the object:
+    /// the answer that lets a `_FORTIFY_SOURCE` check pass rather than fire,
+    /// which is `(size_t)-1` for a maximum and 0 for a minimum.
+    pub fn unknown(self) -> u64 {
+        if self.minimum {
+            0
+        } else {
+            u64::MAX
+        }
+    }
+}
+
 /// A library function whose call stays a call, but whose result the
 /// optimizer may know from its arguments (C17 7.1.4p1): `strlen("abc")` is 3,
 /// `strchr(s, 0)` is `s + strlen(s)`.
@@ -188,6 +222,24 @@ pub enum LibFn {
     /// libgcc's `__div?c3`, which a floating complex `/` calls; as
     /// [`LibFn::MulComplex`].
     DivComplex,
+    /// glibc's checking forms of the functions that write into a buffer,
+    /// which `_FORTIFY_SOURCE` calls through `__builtin___memcpy_chk` and
+    /// its kin with the destination's `__builtin_object_size`
+    /// ([`LibFamily::Fortified`]).
+    MemcpyChk,
+    MempcpyChk,
+    MemmoveChk,
+    MemsetChk,
+    StrcpyChk,
+    StpcpyChk,
+    StrncpyChk,
+    StpncpyChk,
+    StrcatChk,
+    StrncatChk,
+    SprintfChk,
+    SnprintfChk,
+    VsprintfChk,
+    VsnprintfChk,
 }
 
 /// The kinds of [`LibFn`], by what a call to one does: the optimizer folds
@@ -203,6 +255,9 @@ pub enum LibFamily {
     Output,
     /// A libgcc complex `*` or `/` routine.
     ComplexArith,
+    /// A `_chk` function that checks a write against the size of the object
+    /// written to, and is the plain function where the write provably fits.
+    Fortified,
 }
 
 impl LibFn {
@@ -241,6 +296,20 @@ impl LibFn {
             | L::Fputc
             | L::Fwrite => LibFamily::Output,
             L::MulComplex | L::DivComplex => LibFamily::ComplexArith,
+            L::MemcpyChk
+            | L::MempcpyChk
+            | L::MemmoveChk
+            | L::MemsetChk
+            | L::StrcpyChk
+            | L::StpcpyChk
+            | L::StrncpyChk
+            | L::StpncpyChk
+            | L::StrcatChk
+            | L::StrncatChk
+            | L::SprintfChk
+            | L::SnprintfChk
+            | L::VsprintfChk
+            | L::VsnprintfChk => LibFamily::Fortified,
         }
     }
 
@@ -289,6 +358,20 @@ impl LibFn {
             L::Putchar => "putchar",
             L::Fputc => "fputc",
             L::Fwrite => "fwrite",
+            L::MemcpyChk => "__memcpy_chk",
+            L::MempcpyChk => "__mempcpy_chk",
+            L::MemmoveChk => "__memmove_chk",
+            L::MemsetChk => "__memset_chk",
+            L::StrcpyChk => "__strcpy_chk",
+            L::StpcpyChk => "__stpcpy_chk",
+            L::StrncpyChk => "__strncpy_chk",
+            L::StpncpyChk => "__stpncpy_chk",
+            L::StrcatChk => "__strcat_chk",
+            L::StrncatChk => "__strncat_chk",
+            L::SprintfChk => "__sprintf_chk",
+            L::SnprintfChk => "__snprintf_chk",
+            L::VsprintfChk => "__vsprintf_chk",
+            L::VsnprintfChk => "__vsnprintf_chk",
             L::MulComplex | L::DivComplex => return None,
         })
     }
@@ -468,6 +551,10 @@ pub enum FpTest {
     /// sign is set, which no comparison can tell, so this one is a bit test.
     /// Answers 0 or 1.
     SignBit,
+    /// Is it a signalling NaN, of either sign? `__builtin_issignaling`
+    /// (gcc 13): a bit test too, since any floating operation on a
+    /// signalling NaN -- a comparison included -- quiets it or raises.
+    IsSignaling,
 }
 
 /// Which read-modify-write a [`ExprKind::GnuAtomicRmw`] performs.
@@ -797,7 +884,7 @@ pub enum ExprKind {
     /// is not variably modified, which is the ordinary case.
     ///
     /// They have to ride on the node because they cannot be recovered from the
-    /// `TypeId`: `int[n]`, `int[m]` and `int[]` all intern to one type. Use
+    /// `TypeId`: `int[n]` and `int[m]` intern to one type. Use
     /// [`sizeof_type_is_runtime`] rather than testing the `Vec` directly.
     SizeofType(TypeId, Vec<Expr>),
 
@@ -929,6 +1016,17 @@ pub enum ExprKind {
     /// so this carries only the cases that might yet become constant. It
     /// resolves to 0 if nothing proves otherwise, which is what `-O0` gets.
     ConstantP(Box<Expr>),
+
+    /// `__builtin_object_size(ptr, type)` that the parser could not answer
+    /// from the expression as written: `ptr` is a pointer variable, a
+    /// choice, or anything else whose object only propagation finds. gcc
+    /// answers it after inlining and propagation, at `-O1` and above, so it
+    /// is deferred to `ir::objsize`; at `-O0` the parser answers it
+    /// [`ObjectSizeType::unknown`] at once, as gcc does.
+    ObjectSize {
+        ptr: Box<Expr>,
+        otype: ObjectSizeType,
+    },
 
     /// __builtin_va_copy(dest, src)
     /// Copies a va_list
@@ -1087,6 +1185,27 @@ pub enum ExprKind {
         size: Box<Expr>,
     },
 
+    /// `__builtin_stack_save()`: the stack pointer, as a `void *`, for a
+    /// later [`ExprKind::StackRestore`] to put back.
+    StackSave,
+
+    /// `__builtin_stack_restore(ptr)`: put the stack pointer back to what a
+    /// `__builtin_stack_save` answered, releasing every `alloca` and VLA
+    /// allocated since.
+    StackRestore {
+        /// The saved stack pointer, converted to `void *`
+        ptr: Box<Expr>,
+    },
+
+    /// `__builtin_clear_padding(ptr)`: zero every padding bit of the object
+    /// `ptr` points at, leaving its members' bits alone.
+    ClearPadding {
+        /// The pointer, as written (an array argument is not yet decayed)
+        ptr: Box<Expr>,
+        /// The type of the object it points at
+        pointee: TypeId,
+    },
+
     // =========================================================================
     // Floating-point builtins
     // =========================================================================
@@ -1197,6 +1316,8 @@ pub enum ExprKind {
     Setjmp {
         /// The jmp_buf to save the context to
         env: Box<Expr>,
+        /// The library's `setjmp`, or gcc's `__builtin_setjmp`.
+        kind: JmpKind,
     },
 
     /// longjmp(env, val)
@@ -1208,6 +1329,9 @@ pub enum ExprKind {
         env: Box<Expr>,
         /// The value to return from setjmp (1 if 0 is passed)
         val: Box<Expr>,
+        /// The library's `longjmp`, or gcc's `__builtin_longjmp`, whose
+        /// `val` is always the constant 1.
+        kind: JmpKind,
     },
 
     // =========================================================================
@@ -1461,23 +1585,24 @@ pub struct InitElement {
 ///   `sizeof(T)`;
 /// - a pointer to a variably-modified array. `sizeof(int(*)[n])` is the
 ///   pointer's size, and gcc does not evaluate `n` there either;
-/// - a type whose unsized levels outnumber the expressions supplied, as in
-///   `sizeof(int[][n])`, which is invalid C anyway -- gcc rejects it as an
-///   incomplete type.
+/// - an array of unknown size, as in `sizeof(int[][n])`, which is invalid C
+///   anyway -- gcc rejects it as an incomplete type.
 ///
 /// Five consumers need this same answer, so it is asked in one place: the
 /// linearizer, both constant folders, `is_pure_expr` and `expr_is_runtime`.
 pub fn sizeof_type_is_runtime(types: &TypeTable, typ: TypeId, dims: &[Expr]) -> bool {
     !dims.is_empty()
         && types.kind(typ) == TypeKind::Array
-        && types.unsized_array_levels(typ) == dims.len()
+        && !types.is_incomplete_array(typ)
+        && types.variable_array_levels(typ) == dims.len()
 }
 
 /// How many variable extents the type of `expr` has, counted as a
-/// declarator's size expressions count them: an array's unsized levels, or a
-/// pointer's pointee's. Zero unless `expr` is rooted in an object -- or a
+/// declarator's size expressions count them: an array's variable levels, or
+/// a pointer's pointee's. Zero unless `expr` is rooted in an object -- or a
 /// type-name's value ([`ExprKind::VmTypeName`]) -- declared variably
-/// modified, since the type cannot tell `int[n]` from the incomplete `int[]`.
+/// modified, since the extents' values are recorded with that declaration
+/// and an expression reached any other way has nowhere to read them from.
 ///
 /// `typeof(expr)` names this many extents, and `sizeof` evaluates an operand
 /// of array type that has any.
@@ -1489,7 +1614,7 @@ pub(crate) fn vm_extent_count(types: &TypeTable, symbols: &SymbolTable, expr: &E
         TypeKind::Pointer => types.base_type(typ),
         _ => Some(typ),
     };
-    let levels = array.map_or(0, |a| types.unsized_array_levels(a));
+    let levels = array.map_or(0, |a| types.variable_array_levels(a));
     let declared_vm = expr
         .vm_index_base()
         .is_some_and(|(root, _)| symbols.get(root).array_is_variably_modified);
@@ -1796,7 +1921,7 @@ impl<'a> ObjectWalk<'a> {
     fn positional(&self, typ: TypeId, cursor: usize) -> Option<Subobject> {
         match self.types.kind(typ) {
             TypeKind::Array => {
-                let size = self.types.get(typ).array_size;
+                let size = self.types.array_extent(typ).known();
                 if size.is_some_and(|n| cursor >= n) {
                     return None;
                 }
@@ -2076,6 +2201,24 @@ pub enum CalleeBinding {
     /// The external library function of that name. Never inlined and never
     /// a recursive call; the linker, not this unit, supplies the body.
     Library,
+}
+
+/// Which non-local jump a `setjmp`/`longjmp` pair is.
+///
+/// The two never mix: a buffer one fills only the other's partner reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JmpKind {
+    /// The C library's `setjmp`/`longjmp` (and `_setjmp`/`_longjmp`): a call,
+    /// which saves the callee-saved registers and whatever else the library
+    /// keeps in a `jmp_buf`.
+    #[default]
+    Library,
+    /// gcc's `__builtin_setjmp`/`__builtin_longjmp`: inline code over a
+    /// five-word buffer holding the frame pointer, the resume address and
+    /// the stack pointer. Nothing else is saved, so the function containing
+    /// the setjmp assumes every register is lost when control resumes there,
+    /// and saves every callee-saved register in its prologue.
+    Builtin,
 }
 
 // Inline Assembly Support (GCC Extended Asm)
@@ -2374,6 +2517,7 @@ impl Expr {
             | K::VaArgPack
             | K::VaArgPackLen
             | K::Unreachable
+            | K::StackSave
             | K::FrameAddress { .. }
             | K::ReturnAddress { .. }
             | K::OffsetOf { .. } => Vec::new(),
@@ -2404,6 +2548,7 @@ impl Expr {
             | K::VaArg { ap: a, .. }
             | K::VaEnd { ap: a }
             | K::ConstantP(a)
+            | K::ObjectSize { ptr: a, .. }
             | K::Bswap16 { arg: a }
             | K::Bswap32 { arg: a }
             | K::Bswap64 { arg: a }
@@ -2420,8 +2565,10 @@ impl Expr {
             | K::Popcountl { arg: a }
             | K::Popcountll { arg: a }
             | K::Alloca { size: a }
+            | K::StackRestore { ptr: a }
+            | K::ClearPadding { ptr: a, .. }
             | K::FpTest { arg: a, .. }
-            | K::Setjmp { env: a }
+            | K::Setjmp { env: a, .. }
             | K::C11AtomicThreadFence { order: a }
             | K::C11AtomicSignalFence { order: a } => vec![a],
             K::Binary {
@@ -2440,7 +2587,7 @@ impl Expr {
             | K::VaCopy { dest: a, src: b }
             | K::FpCompare { lhs: a, rhs: b, .. }
             | K::BuiltinComplex { real: a, imag: b }
-            | K::Longjmp { env: a, val: b }
+            | K::Longjmp { env: a, val: b, .. }
             | K::C11AtomicInit { ptr: a, val: b }
             | K::C11AtomicLoad { ptr: a, order: b } => vec![a, b],
             K::Conditional {

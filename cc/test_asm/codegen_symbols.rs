@@ -11,7 +11,9 @@
 // must assemble, link or run stay in `tests/codegen/symbols.rs`.
 //
 
-use super::asm_probe::{asm_for_at, asm_for_with, body_of, AARCH64_LINUX, X86_64_LINUX};
+use super::asm_probe::{
+    asm_for_at, asm_for_with, body_of, AARCH64_DARWIN, AARCH64_LINUX, X86_64_LINUX,
+};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::asm_probe::{host_asm, section_of};
 
@@ -401,5 +403,54 @@ void set(long v) { gb.y = v; }
                 );
             }
         }
+    }
+}
+
+/// An initialized file-scope `extern` declaration is a definition (C17
+/// 6.9.2p1), and Mach-O emits it as one: each object labelled once, global
+/// unless a prior `static` made it internal, thread-local as a descriptor,
+/// and reached directly rather than through the GOT, as a defined symbol is.
+#[test]
+fn codegen_macho_initialized_extern_is_a_definition() {
+    let src = r#"
+extern int y = 5;
+int y;
+static int x;
+extern int x = 7;
+extern const char s[] = "hi";
+extern _Thread_local int t = 1;
+/* `s[i]`: a byte at a constant index folds, leaving no reference to `s`. */
+int get(int i) { return y + x + s[i] + t; }
+"#;
+    let asm = asm_for_with("macho_extern_def", AARCH64_DARWIN, src, &["-O2", "-w"]);
+    for name in ["_y", "_x", "_s", "_t", "_t$tlv$init"] {
+        assert_eq!(
+            asm.matches(&format!("\n{name}:\n")).count(),
+            1,
+            "{name} defined once:\n{asm}"
+        );
+    }
+    assert!(
+        asm.contains(".globl _y\n.p2align 2\n_y:\n    .long 5\n"),
+        "external y = 5:\n{asm}"
+    );
+    assert!(
+        asm.contains(".p2align 2\n_x:\n    .long 7\n") && !asm.contains(".globl _x"),
+        "x = 7, local:\n{asm}"
+    );
+    assert!(
+        asm.contains(".section __TEXT,__const\n.globl _s\n_s:\n    .ascii \"hi\"\n"),
+        "external const s:\n{asm}"
+    );
+    assert!(
+        asm.contains(".globl _t\n") && asm.contains("_t$tlv$init:\n    .long 1\n"),
+        "external thread-local t = 1:\n{asm}"
+    );
+    let body = body_of(&asm, "get");
+    for name in ["_y", "_x", "_s"] {
+        assert!(
+            body.contains(&format!("{name}@PAGEOFF")) && !body.contains(&format!("{name}@GOTPAGE")),
+            "{name} reached directly:\n{body}"
+        );
     }
 }

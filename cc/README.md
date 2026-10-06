@@ -101,7 +101,8 @@ Supported:
   `b`/`h`/`s`/`d`/`q` width modifiers on AArch64
 - GNU extensions real code depends on: case ranges (`case 1 ... 9:`),
   designated-initializer ranges (`[0 ... 3] = v`), computed goto (`&&label`
-  and `goto *p`), the omitted middle operand (`a ?: b`, with `a` evaluated
+  and `goto *p`, with `&&a - &&b` as a constant for jump tables of offsets),
+  the omitted middle operand (`a ?: b`, with `a` evaluated
   once), statement expressions, `typeof`, `__attribute__` including `mode` and
   `vector_size`, `__builtin_*` (see [BUILTIN.md](BUILTIN.md)), and case-range-style
   `...` spacing matching gcc's (`case 1...9:` is one pp-number and is rejected
@@ -112,12 +113,15 @@ Supported:
 - `-fdebug-prefix-map=OLD=NEW`, `-fmacro-prefix-map=OLD=NEW` and
   `-ffile-prefix-map=OLD=NEW`, with gcc's rules: the last matching option
   wins, `OLD` is a plain string prefix, and the argument splits at its last `=`
-- `-fpermissive`, downgrading to warnings the handful of C17 constraints gcc
-  warns about rather than refusing: pre-C99 implicit `int`, an implicit
-  function declaration, a `return` whose value-ness does not match the
-  function's type, a struct member list whose last declaration has no `;`, and
-  an inline definition reading a file-scope static.  A named list, not a
-  dialect: everything else C17 requires is still checked
+- `-fpermissive`, downgrading to warnings the handful of C17 constraints GCC
+  13 warns about and GCC 14 refuses: pre-C99 implicit `int`, an implicit
+  function declaration, and a `return` whose value-ness does not match the
+  function's type.  A named list, not a dialect: everything else C17 requires
+  is still checked
+- gcc's diagnostic severities: what gcc refuses is an error, what it warns
+  about by default is a warning, and what it reports only under `-pedantic`
+  is silent by default. `-pedantic-errors` makes errors of both kinds of
+  warning, as in gcc
 - Cross-compilation as far as `-S`: `--sysroot`, `-isystem` and `-idirafter`
   give `--target` the target's headers. `as` and `cc` are still the host's, so
   assembling and linking for another target is not supported
@@ -128,8 +132,6 @@ Not yet implemented:
   stops at SSE4.2, and `-march=x86-64-v3` claims no more than v2. The SSE
   through SSE4.2 headers and a core `<arm_neon.h>` are bundled, written in C
   over `vector_size` values
-- a `vector_size` value of floating lanes four bytes wide or less at a call
-  boundary, which gcc passes like no type c17 has
 
 Will not implement:
 - `__auto_type`; nested functions and `__label__`. Clang refuses nested

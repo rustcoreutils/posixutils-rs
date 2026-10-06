@@ -44,13 +44,9 @@ enum Lanes {
 
 impl Linearizer<'_> {
     /// The type the convention `conv` passes and returns vectors of type
-    /// `vec` as (`Abi::vector_carrier`). The parser refuses a vector at a
-    /// call boundary that has none, so a missing one is the vector itself,
-    /// which every path below then refuses to take apart.
+    /// `vec` as (`Abi::vector_carrier`).
     pub(crate) fn vector_carrier(&self, vec: TypeId, conv: CallingConv) -> TypeId {
-        get_abi_for_conv(conv, self.target)
-            .vector_carrier(vec, self.types)
-            .unwrap_or(vec)
+        get_abi_for_conv(conv, self.target).vector_carrier(vec, self.types)
     }
 
     /// `typ`, or the carrier of `typ` if it is a vector: what a parameter or
@@ -70,9 +66,7 @@ impl Linearizer<'_> {
         if !self.types.is_vector(typ) {
             return typ;
         }
-        get_abi_for_conv(conv, self.target)
-            .vector_return_carrier(typ, self.types)
-            .unwrap_or(typ)
+        get_abi_for_conv(conv, self.target).vector_return_carrier(typ, self.types)
     }
 
     /// The vector `vec` is widened to, lane by lane, to be returned under
@@ -95,7 +89,8 @@ impl Linearizer<'_> {
             Some(widened) => self.convert_vector_at(addr, vec, widened),
             None => addr,
         };
-        self.vector_to_carrier(addr, carrier)
+        let returned = self.vector_return_widened(vec, conv).unwrap_or(vec);
+        self.vector_to_carrier(addr, returned, carrier)
     }
 
     /// The vector of type `vec` a call under `conv` returned as `carrier` in
@@ -132,7 +127,7 @@ impl Linearizer<'_> {
         let carrier = self.vector_carrier(vec, conv);
         let addr = self.vector_addr(a);
         if !self.carrier_is_aggregate(carrier) {
-            return (self.vector_to_carrier(addr, carrier), carrier);
+            return (self.vector_to_carrier(addr, vec, carrier), carrier);
         }
         let val = if self.passed_by_reference(carrier, conv) {
             let vol = self.block_volatility(carrier, vec);
@@ -143,12 +138,28 @@ impl Linearizer<'_> {
         (val, carrier)
     }
 
-    /// The bits of the vector at `addr`, as a value of the scalar `carrier`.
-    pub(crate) fn vector_to_carrier(&mut self, addr: PseudoId, carrier: TypeId) -> PseudoId {
-        let bits = self.types.size_bits(carrier);
+    /// The bits of the vector of type `vec` at `addr`, as a value of the
+    /// scalar `carrier`. An integer carrier wider than the vector -- Darwin
+    /// passes a one-byte `v1qi` as an `unsigned int` -- is the vector's own
+    /// bytes, zero-extended: loading the carrier's width read past the
+    /// vector.
+    pub(crate) fn vector_to_carrier(
+        &mut self,
+        addr: PseudoId,
+        vec: TypeId,
+        carrier: TypeId,
+    ) -> PseudoId {
+        let bytes = self.types.size_bytes(vec);
+        let narrow = bytes < self.types.size_bytes(carrier) && self.types.is_integer(carrier);
+        let typ = if narrow {
+            crate::abi::small_vector_bits(bytes, self.types)
+        } else {
+            carrier
+        };
         let value = self.alloc_reg_pseudo();
-        self.emit(Instruction::load(value, addr, 0, carrier, bits));
-        value
+        let bits = self.types.size_bits(typ);
+        self.emit(Instruction::load(value, addr, 0, typ, bits));
+        self.emit_convert(value, typ, carrier)
     }
 
     /// The vector of type `vec` whose bits are `value`, of the scalar
@@ -385,6 +396,37 @@ impl Linearizer<'_> {
         let long = self.types.long_id;
         let at = self.emit_binary(BinaryOp::Add, addr, offset, long, long);
         self.load_lane(at, 0, lane)
+    }
+
+    /// `__builtin_constant_p` of the vector expression `e`, whose
+    /// discardability the caller has checked: 1 when every lane is a
+    /// constant, as gcc answers a vector of constants once optimized.
+    ///
+    /// A vector travels by address, and an address is no constant, so the
+    /// question is asked of each lane -- one `ConstantP` per lane load, which
+    /// load forwarding turns into the stored value for `sccp` to answer --
+    /// and the answers are and-ed. A lane `sccp` never answers is 0 in
+    /// `ir::lower`, and so is the whole.
+    pub(crate) fn vector_constant_p(&mut self, e: &Expr) -> PseudoId {
+        let int = self.types.int_id;
+        let (lane, count, size) = self.vector_shape(self.expr_type(e));
+        let addr = self.vector_addr(e);
+        let mut answer: Option<PseudoId> = None;
+        for i in 0..count {
+            let value = self.load_lane(addr, i as i64 * size, lane);
+            let constant = self.alloc_reg_pseudo();
+            self.emit(
+                Instruction::new(Opcode::ConstantP)
+                    .with_target(constant)
+                    .with_src(value)
+                    .with_type_and_size(int, 32),
+            );
+            answer = Some(match answer {
+                Some(acc) => self.emit_binary(BinaryOp::BitAnd, acc, constant, int, int),
+                None => constant,
+            });
+        }
+        answer.unwrap_or_else(|| self.emit_const(1, int))
     }
 
     /// The lane type, lane count and lane size in bytes of vector `typ`.
@@ -697,7 +739,7 @@ impl Linearizer<'_> {
     /// The vector of type `vec` at `addr`, loaded whole as its carrier.
     fn carrier_of(&mut self, addr: PseudoId, vec: TypeId) -> PseudoId {
         let carrier = self.native_carrier(vec);
-        self.vector_to_carrier(addr, carrier)
+        self.vector_to_carrier(addr, vec, carrier)
     }
 
     /// The `Simd(op)` instruction on `values` -- carriers, or a scalar for a
@@ -745,7 +787,7 @@ impl Linearizer<'_> {
         let bytes = self.types.size_bytes(typ);
         match self.register_carrier(typ) {
             Some(carrier) if !vol.dst && !vol.src => {
-                let value = self.vector_to_carrier(src, carrier);
+                let value = self.vector_to_carrier(src, typ, carrier);
                 let bits = self.types.size_bits(carrier);
                 self.emit(Instruction::store(value, dst, 0, carrier, bits));
             }

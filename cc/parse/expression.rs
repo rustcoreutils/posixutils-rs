@@ -18,7 +18,7 @@ use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol};
 use crate::token::lexer::{Position, SpecialToken, TokenType, TokenValue};
 use crate::token::literal;
-use crate::types::{FloatClass, Type, TypeId, TypeKind, TypeModifiers};
+use crate::types::{ArrayExtent, FloatClass, Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
 
 const DEFAULT_ARG_LIST_CAPACITY: usize = 8;
@@ -306,8 +306,7 @@ impl<'a> Parser<'a> {
         else_expr: &Expr,
         pos: Position,
     ) -> Option<TypeId> {
-        // An arm diagnosed already, or one with no value -- whose mismatch
-        // with a valued arm `check_not_void` has reported.
+        // An arm diagnosed already.
         let (then_typ, else_typ) = (then_expr.typ?, else_expr.typ?);
         // GNU vectors: two of one type, and nothing else.
         if self.types.is_vector(then_typ) || self.types.is_vector(else_typ) {
@@ -516,13 +515,17 @@ impl<'a> Parser<'a> {
             let else_typ = else_expr.typ.unwrap_or(self.types.int_id);
 
             // C17 6.5.15p3: either both arms have type void, or neither does.
-            // A mismatch means one arm has no value for the expression to
-            // take.
+            // gcc accepts one `void` arm as an extension and objects only
+            // under `-pedantic`; the conditional then has type `void`
+            // (`conditional_result_type`), so the other arm's value is
+            // discarded and using the whole as a value is still an error.
             let then_void = self.types.kind(then_typ) == TypeKind::Void;
             let else_void = self.types.kind(else_typ) == TypeKind::Void;
             if then_void != else_void {
-                let culprit = if then_void { &then_expr } else { &else_expr };
-                self.check_not_void(culprit, culprit.pos);
+                diag::pedwarn(
+                    colon_pos,
+                    &gettext("ISO C forbids conditional expr with only one void side"),
+                );
             }
 
             let typ = self.conditional_result_type(&then_expr, &else_expr, colon_pos);
@@ -790,6 +793,8 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
+            // `&` refuses a reversed scalar itself.
+            self.exempt_reverse_atomic_operand(&operand);
             self.check_addressable(&operand, op_pos);
             // AddrOf produces pointer to operand's type
             let base_type = operand.typ.unwrap_or(self.types.int_id);
@@ -955,8 +960,15 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let operand = self.parse_unary_expr()?;
                 let op_typ = operand.typ.unwrap_or(self.types.double_id);
+                // A half of a complex object stored in reverse order is
+                // stored so too, and assigning through it has to know.
                 let result_typ = if self.types.is_complex(op_typ) {
-                    self.types.complex_base(op_typ)
+                    let half = self.types.complex_base(op_typ);
+                    if self.types.reverses_storage(op_typ) {
+                        self.types.in_reverse_storage(half)
+                    } else {
+                        half
+                    }
                 } else {
                     op_typ
                 };
@@ -1012,12 +1024,16 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
 
+        // A rewind parses the operand again; what it held goes with it.
+        let mark = self.reverse_atomic_mark();
         let Ok(expr) = self.parse_expression() else {
             self.pos = saved;
+            self.take_reverse_atomic_members(mark);
             return Ok(None);
         };
         if !self.is_special(b')') {
             self.pos = saved;
+            self.take_reverse_atomic_members(mark);
             return Ok(None);
         }
         self.advance(); // consume typeof's `)`
@@ -1252,15 +1268,17 @@ impl<'a> Parser<'a> {
         };
 
         // An incomplete array type takes its size from the initializer.
-        // `parse_declarator` spells "no size given" as `None`, which is what
-        // `int a[]` means; the type-name parser this replaced spelled it
-        // `Some(0)`, conflating it with the GNU zero-length array. Accept
+        // `parse_declarator` spells "no size given" as `Unknown`, which is
+        // what `int a[]` means; the type-name parser this replaced spelled it
+        // `Known(0)`, conflating it with the GNU zero-length array. Accept
         // both, since the declaration path (`infer_array_size_from_init`)
         // also does.
         self.walk_initializer_elements(typ, &mut elements);
         let final_typ = if self.types.kind(typ) == TypeKind::Array
-            && matches!(self.types.get(typ).array_size, None | Some(0))
-        {
+            && matches!(
+                self.types.array_extent(typ),
+                ArrayExtent::Unknown | ArrayExtent::Known(0)
+            ) {
             let elem_type = self.types.base_type(typ).unwrap_or(self.types.int_id);
             // `(char[]){"hi"}` is the string in braces (C17 6.7.9p14), three
             // characters, not an array of one element.
@@ -1342,7 +1360,7 @@ impl<'a> Parser<'a> {
                         sizeof_pos,
                     ));
                 }
-                self.check_sizeof_operand_is_complete(typ, &dims, sizeof_pos);
+                self.check_sizeof_operand_is_complete(typ, sizeof_pos);
                 return Ok(Expr::typed(
                     ExprKind::SizeofType(typ, dims),
                     size_t,
@@ -1372,23 +1390,14 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// 6.5.3.4p1 for the *expression* form of `sizeof`.
-    ///
-    /// `check_sizeof_operand_is_complete` answers for a type-name, where the
-    /// extents ride on the node. An expression has only its type, and the type
-    /// cannot tell an incomplete array from a variably modified one -- `int[]`,
-    /// `int[n]` and `int[m]` all intern to one `TypeId`. So the question is put
-    /// to the *declaration*: `Symbol::array_is_variably_modified` records
-    /// whether the declarator carried size expressions. Without it `extern int
-    /// a[]; sizeof a` answered 0 where gcc rejects it, while a local VLA's
-    /// `sizeof` had to keep working.
-    ///
-    /// An incomplete structure, union or enumeration is incomplete whatever
-    /// the expression -- `sizeof *p` for a `struct S *p` whose tag has no
-    /// definition yet. For an array only an identifier is examined: a
-    /// subscript or a member reaches an element whose type is complete by
-    /// construction, and a call cannot return an array.
-    fn check_sizeof_expr_operand(&self, expr: &Expr, pos: Position) {
+    /// 6.5.3.4p1 for the *expression* form of `sizeof`: not a bit-field, and
+    /// not of incomplete type -- `extern int a[]; sizeof a`, `sizeof *q` for
+    /// an `int (*q)[]`, or `sizeof *p` for a `struct S *p` whose tag has no
+    /// definition yet. A variable length array is complete, and its `sizeof`
+    /// is computed at run time. `void` is gcc's extension, as for a
+    /// type-name.
+    fn check_sizeof_expr_operand(&mut self, expr: &Expr, pos: Position) {
+        self.exempt_reverse_atomic_operand(expr);
         // C17 6.5.3.4p1: not a bit-field, which has no size in bytes.
         if self.bit_field_designated(expr).is_some() {
             diag::error(pos, &gettext("'sizeof' applied to a bit-field"));
@@ -1397,45 +1406,23 @@ impl<'a> Parser<'a> {
         let Some(typ) = expr.typ else {
             return;
         };
-        if matches!(
-            self.types.kind(typ),
-            TypeKind::Struct | TypeKind::Union | TypeKind::Enum
-        ) && self.type_name_is_incomplete(typ, 0)
-        {
+        if self.types.kind(typ) != TypeKind::Void && self.type_name_is_incomplete(typ) {
             let named = self.types.format_type(typ, Some(self.idents));
             diag::error_args(
                 pos,
                 "invalid application of 'sizeof' to incomplete type '{0}'",
                 &[&named],
             );
-            return;
         }
-        let ExprKind::Ident(symbol_id) = expr.kind else {
-            return;
-        };
-        if self.types.kind(typ) != TypeKind::Array
-            || self.types.unsized_array_levels(typ) == 0
-            || self.symbols.get(symbol_id).array_is_variably_modified
-        {
-            return;
-        }
-        let named = self.types.format_type(typ, Some(self.idents));
-        diag::error_args(
-            pos,
-            "invalid application of 'sizeof' to incomplete type '{0}'",
-            &[&named],
-        );
     }
 
-    /// Whether the type named by a type-name is incomplete (C17 6.2.5p1):
-    /// `void`, a declared but undefined structure, union or enumeration, or
-    /// an array with an extent neither written nor supplied by one of the
-    /// type-name's own size expressions (`extents`, which `int[n]` has and
-    /// `int[]` does not).
-    pub(crate) fn type_name_is_incomplete(&self, typ: TypeId, extents: usize) -> bool {
+    /// Whether `typ` is incomplete (C17 6.2.5p1): `void`, a declared but
+    /// undefined structure, union or enumeration, or an array of unknown
+    /// size. A variable length array is complete.
+    pub(crate) fn type_name_is_incomplete(&self, typ: TypeId) -> bool {
         match self.types.kind(typ) {
             TypeKind::Void => true,
-            TypeKind::Array => self.types.unsized_array_levels(typ) > extents,
+            TypeKind::Array => self.types.is_incomplete_array(typ),
             TypeKind::Struct | TypeKind::Union | TypeKind::Enum => {
                 !self.types.is_composite_complete(typ)
             }
@@ -1445,9 +1432,9 @@ impl<'a> Parser<'a> {
 
     /// `sizeof (void)` is gcc's extension (it is 1); every other incomplete
     /// type-name is an error.
-    fn check_sizeof_operand_is_complete(&self, typ: TypeId, dims: &[Expr], pos: Position) {
+    fn check_sizeof_operand_is_complete(&self, typ: TypeId, pos: Position) {
         let incomplete =
-            self.types.kind(typ) != TypeKind::Void && self.type_name_is_incomplete(typ, dims.len());
+            self.types.kind(typ) != TypeKind::Void && self.type_name_is_incomplete(typ);
         if incomplete {
             crate::diag::error(
                 pos,
@@ -1490,9 +1477,7 @@ impl<'a> Parser<'a> {
                 // `void`, as an extension, and so does c17. A variable length
                 // array's extents are its own size expressions, so `int[n]`
                 // is complete.
-                if self.types.kind(typ) != TypeKind::Void
-                    && self.type_name_is_incomplete(typ, dims.len())
-                {
+                if self.types.kind(typ) != TypeKind::Void && self.type_name_is_incomplete(typ) {
                     let named = self.types.format_type(typ, Some(self.idents));
                     diag::error_args(
                         alignof_pos,
@@ -1535,6 +1520,7 @@ impl<'a> Parser<'a> {
     /// implementation: the constant evaluator and the linearizer each computed
     /// this from `expr.typ` alone and so disagreed with gcc identically.
     fn alignof_expr(&mut self, expr: Expr, size_t: TypeId, pos: Position) -> Expr {
+        self.exempt_reverse_atomic_operand(&expr);
         if self.bit_field_designated(&expr).is_some() {
             diag::error(pos, &gettext("'_Alignof' applied to a bit-field"));
         }
@@ -1663,6 +1649,7 @@ impl<'a> Parser<'a> {
                     member_type,
                     base_pos,
                 );
+                self.note_reverse_atomic_member(&expr);
             } else if self.is_special_token(SpecialToken::Arrow) {
                 // Pointer member access
                 let arrow_pos = self.current_pos();
@@ -1725,6 +1712,7 @@ impl<'a> Parser<'a> {
                     member_type,
                     base_pos,
                 );
+                self.note_reverse_atomic_member(&expr);
             } else if self.is_special(b'(') {
                 // Function call
                 let call_pos = self.current_pos();
@@ -1771,7 +1759,7 @@ impl<'a> Parser<'a> {
         // a prototype may name an incomplete one, but a call has a
         // value of it to make.
         if self.types.kind(return_type) != TypeKind::Void
-            && self.type_name_is_incomplete(return_type, 0)
+            && self.type_name_is_incomplete(return_type)
         {
             let named = self.types.format_type(return_type, Some(self.idents));
             diag::error_args(call_pos, "invalid use of undefined type '{0}'", &[&named]);
@@ -2397,13 +2385,17 @@ impl<'a> Parser<'a> {
         // conversion: array-to-pointer, function-to-pointer, and every
         // top-level qualifier removed.
         let controlling = self.parse_assignment_expr()?;
+        self.exempt_reverse_atomic_operand(&controlling);
         let controlling_typ = controlling.typ.unwrap_or(self.types.int_id);
         let selector = self.lvalue_converted_type(controlling_typ);
 
         self.expect_special(b',')?;
 
-        let mut selected: Option<Expr> = None;
-        let mut default_expr: Option<Expr> = None;
+        // Each association's held reversed `_Atomic` members, kept back
+        // until it is known whether it is the one selected: gcc does not
+        // look inside the others.
+        let mut selected: Option<(Expr, Vec<Position>)> = None;
+        let mut default_expr: Option<(Expr, Vec<Position>)> = None;
         let mut default_pos: Option<Position> = None;
         // Association types seen so far, for the "no two compatible" check.
         let mut seen: Vec<(TypeId, Position)> = Vec::new();
@@ -2414,7 +2406,9 @@ impl<'a> Parser<'a> {
             if self.is_keyword(crate::kw::DEFAULT) {
                 self.advance();
                 self.expect_special(b':')?;
+                let mark = self.reverse_atomic_mark();
                 let expr = self.parse_assignment_expr()?;
+                let held = self.take_reverse_atomic_members(mark);
 
                 if default_pos.is_some() {
                     diag::error(
@@ -2423,7 +2417,7 @@ impl<'a> Parser<'a> {
                     );
                 } else {
                     default_pos = Some(assoc_pos);
-                    default_expr = Some(expr);
+                    default_expr = Some((expr, held));
                 }
             } else {
                 let (assoc_typ, dims) = self.parse_type_name_vm()?;
@@ -2443,14 +2437,16 @@ impl<'a> Parser<'a> {
                         assoc_pos,
                         &gettext("'_Generic' association has function type"),
                     );
-                } else if self.type_name_is_incomplete(assoc_typ, dims.len()) {
+                } else if self.type_name_is_incomplete(assoc_typ) {
                     diag::error(
                         assoc_pos,
                         &gettext("'_Generic' association has incomplete type"),
                     );
                 }
                 self.expect_special(b':')?;
+                let mark = self.reverse_atomic_mark();
                 let expr = self.parse_assignment_expr()?;
+                let held = self.take_reverse_atomic_members(mark);
 
                 // 6.5.1.1p2: no two associations may name compatible types.
                 // The comparison is qualifier-sensitive, so `int` and
@@ -2470,7 +2466,7 @@ impl<'a> Parser<'a> {
 
                 if self.types.types_compatible_qualified(selector, assoc_typ) && selected.is_none()
                 {
-                    selected = Some(expr);
+                    selected = Some((expr, held));
                 }
             }
 
@@ -2484,7 +2480,10 @@ impl<'a> Parser<'a> {
         self.expect_special(b')')?;
 
         match selected.or(default_expr) {
-            Some(expr) => Ok(expr),
+            Some((expr, held)) => {
+                self.reverse_atomic_members.extend(held);
+                Ok(expr)
+            }
             None => {
                 diag::error_args(
                     token_pos,
@@ -2940,17 +2939,21 @@ impl<'a> Parser<'a> {
             let is_long = long == IntLong::Long;
 
             // Parse as u64 first to handle large unsigned values, then reinterpret as i64
-            let value_u64: u64 = if is_hex {
+            let (digits, radix) = if is_hex {
                 // Strip 0x or 0X prefix
-                u64::from_str_radix(&body[2..], 16)
+                (&body[2..], 16)
             } else if let Some(bin_part) = body.strip_prefix("0b") {
-                u64::from_str_radix(bin_part, 2)
+                (bin_part, 2)
             } else if body.starts_with('0') && body.len() > 1 {
-                u64::from_str_radix(&body, 8)
+                (&body[..], 8)
             } else {
-                body.parse()
+                (&body[..], 10)
+            };
+            let (value_u64, truncated) = crate::token::literal::integer_digits_value(digits, radix)
+                .ok_or_else(|| ParseError::new(format!("invalid integer literal: {}", s), pos))?;
+            if truncated {
+                crate::token::literal::report_too_large_integer(pos);
             }
-            .map_err(|_| ParseError::new(format!("invalid integer literal: {}", s), pos))?;
 
             // Reinterpret bits as i64 (preserves bit pattern for unsigned values)
             let value = value_u64 as i64;
@@ -2961,10 +2964,14 @@ impl<'a> Parser<'a> {
             // to a negative `long long`, so `18446744073709551615 > 0` was 0.
             let is_decimal = !is_hex && !body.starts_with('0') && !body.starts_with("0b");
             if is_decimal && !is_unsigned && value_u64 > i64::MAX as u64 {
-                diag::warning(
-                    pos,
-                    &gettext("integer constant is so large that it is unsigned"),
-                );
+                // A truncated constant was already reported as too large;
+                // gcc says nothing more about the low bits it kept.
+                if !truncated {
+                    diag::warning(
+                        pos,
+                        &gettext("integer constant is so large that it is unsigned"),
+                    );
+                }
                 let typ = self.types.int128_id;
                 let lit = Self::typed_expr(ExprKind::Int128Lit(i128::from(value_u64)), typ, pos);
                 return Ok(self.imaginary_if(lit, is_imaginary, typ, pos));

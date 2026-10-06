@@ -33,7 +33,9 @@ mod linearize_atomic;
 mod linearize_cleanup;
 mod linearize_emit;
 mod linearize_init;
+mod linearize_label_diff;
 mod linearize_stmt;
+mod linearize_storage_order;
 mod linearize_vector;
 pub mod loadfwd;
 pub mod lower;
@@ -41,6 +43,8 @@ pub mod mach_o_dtors;
 pub mod mem2reg;
 pub mod memexpand;
 pub mod memloc;
+pub mod objsize;
+pub(crate) mod padding;
 pub mod propagate;
 pub mod range;
 pub mod sccp;
@@ -451,6 +455,14 @@ pub enum Opcode {
     /// `ir::lower` to 0 otherwise -- which is every case at `-O0`, where
     /// the optimizer does not run at all.
     ConstantP,
+    /// `__builtin_object_size(src[0], type)`, deferred until inlining and
+    /// propagation have shown what object `src[0]` points into.
+    ///
+    /// Answered by `ir::objsize` -- the moment its object is known, and
+    /// with the unknown object's answer once the optimizer has converged --
+    /// and by `ir::lower` with the unknown object's answer for anything
+    /// left. The parser answers at `-O0`, so no `-O0` function has one.
+    ObjectSize(crate::parse::ast::ObjectSizeType),
 
     // Byte-swapping builtins
     Bswap16, // Byte-swap 16-bit value
@@ -474,7 +486,9 @@ pub enum Opcode {
     /// Capture the stack pointer, so a later [`Opcode::StackRestore`] can put
     /// it back. Defines a pointer-sized pseudo and reads nothing.
     ///
-    /// Exists for inlining. A call to a function that `alloca`s releases that
+    /// A VLA's scope is bracketed by the pair, and the program can write them
+    /// itself as `__builtin_stack_save` / `__builtin_stack_restore`. They also
+    /// exist for inlining. A call to a function that `alloca`s releases that
     /// memory when it returns; splicing the body into the caller would instead
     /// hold it until the *caller* returns, so `for (...) use(n)` with an
     /// `alloca` in `use` would grow the stack every iteration until it
@@ -884,13 +898,13 @@ impl Opcode {
             | ModS | Shl | Lsr | Asr | And | Or | Xor | SetEq | SetNe | SetLt | SetLe | SetGt
             | SetGe | SetB | SetBe | SetA | SetAe | Not | Neg | Trunc | Zext | Sext | Load
             | Store | Phi | PhiSource | Copy | SymAddr | TlsAddr | Select | SetVal | Nop
-            | VaStart | VaArg | VaEnd | VaCopy | VaArgPackLen | ConstantP | Bswap16 | Bswap32
-            | Bswap64 | Ctz32 | Ctz64 | Clz32 | Clz64 | Popcount32 | Popcount64 | Alloca
-            | StackSave | StackRestore | Memset | Memcpy | Memmove | Unreachable | FrameAddress
-            | ReturnAddress | Setjmp | Longjmp | AtomicLoad | AtomicStore | AtomicSwap
-            | AtomicCas | AtomicFetchAdd | AtomicFetchSub | AtomicFetchAnd | AtomicFetchOr
-            | AtomicFetchXor | Fence | Lo64 | Hi64 | Pair64 | AddC | AdcC | SubC | SbcC
-            | UMulHi | LifetimeEnd => FpRaise::Never,
+            | VaStart | VaArg | VaEnd | VaCopy | VaArgPackLen | ConstantP | ObjectSize(_)
+            | Bswap16 | Bswap32 | Bswap64 | Ctz32 | Ctz64 | Clz32 | Clz64 | Popcount32
+            | Popcount64 | Alloca | StackSave | StackRestore | Memset | Memcpy | Memmove
+            | Unreachable | FrameAddress | ReturnAddress | Setjmp | Longjmp | AtomicLoad
+            | AtomicStore | AtomicSwap | AtomicCas | AtomicFetchAdd | AtomicFetchSub
+            | AtomicFetchAnd | AtomicFetchOr | AtomicFetchXor | Fence | Lo64 | Hi64 | Pair64
+            | AddC | AdcC | SubC | SbcC | UMulHi | LifetimeEnd => FpRaise::Never,
         }
     }
 
@@ -1137,6 +1151,7 @@ impl Opcode {
             Opcode::VaCopy => "va_copy",
             Opcode::VaArgPackLen => "va_arg_pack_len",
             Opcode::ConstantP => "constant_p",
+            Opcode::ObjectSize(_) => "object_size",
             Opcode::Bswap16 => "bswap16",
             Opcode::Bswap32 => "bswap32",
             Opcode::Bswap64 => "bswap64",
@@ -1236,12 +1251,17 @@ macro_rules! every_opcode {
                 Opcode::Simd(SimdOp::CvtUF),
                 Opcode::Simd(SimdOp::CvtFS),
                 Opcode::Simd(SimdOp::CvtFU),
+                Opcode::ObjectSize(crate::parse::ast::ObjectSizeType::from_bits(0)),
+                Opcode::ObjectSize(crate::parse::ast::ObjectSizeType::from_bits(1)),
+                Opcode::ObjectSize(crate::parse::ast::ObjectSizeType::from_bits(2)),
+                Opcode::ObjectSize(crate::parse::ast::ObjectSizeType::from_bits(3)),
             ];
 
             /// The exhaustiveness guard behind [`Opcode::ALL`]; always true.
             fn is_listed(self) -> bool {
                 match self {
                     $(Opcode::$op)|* => true,
+                    Opcode::ObjectSize(_) => true,
                     Opcode::RoundToIntegral(
                         IntegralRounding::Floor
                         | IntegralRounding::Ceil
@@ -1827,6 +1847,9 @@ pub struct InsnExtra {
     pub lifetime_of: Option<PseudoId>,
     /// For `Simd(Shuffle)`: the lanes it picks.
     pub shuffle: Option<ShuffleIndices>,
+    /// For `Setjmp` and `Longjmp`: the library's, or gcc's builtin pair.
+    /// Read it through [`Instruction::jmp_kind`].
+    pub jmp_kind: crate::parse::ast::JmpKind,
 }
 
 /// What an instruction with no extra fields answers: every one empty.
@@ -1847,6 +1870,7 @@ static NO_EXTRA: InsnExtra = InsnExtra {
     fence_scope: FenceScope::Thread,
     lifetime_of: None,
     shuffle: None,
+    jmp_kind: crate::parse::ast::JmpKind::Library,
 };
 
 impl Default for Instruction {
@@ -2010,6 +2034,21 @@ impl Instruction {
             Some(name) => name,
             None => panic!("{:?} was built without its library callee", self.op),
         }
+    }
+
+    /// Which `setjmp`/`longjmp` a `Setjmp` or `Longjmp` is: the library's,
+    /// a call naming [`Self::library_callee`], or gcc's builtin pair, which
+    /// names none and is generated inline.
+    pub fn jmp_kind(&self) -> crate::parse::ast::JmpKind {
+        self.extra().jmp_kind
+    }
+
+    /// Is this gcc's `__builtin_setjmp`? Control resumes just after it with
+    /// no register intact but the frame and stack pointers, so the register
+    /// allocator keeps nothing in a register across it, and the function
+    /// saves every callee-saved register.
+    pub fn is_builtin_setjmp(&self) -> bool {
+        self.op == Opcode::Setjmp && self.jmp_kind() == crate::parse::ast::JmpKind::Builtin
     }
 
     /// Set bit size
@@ -3234,6 +3273,18 @@ impl Function {
         self.locals.get(name)
     }
 
+    /// Does this function contain a `__builtin_setjmp`, the receiver of a
+    /// non-local goto? gcc never copies such a function, and its prologue
+    /// saves every callee-saved register: a `__builtin_longjmp` skips the
+    /// epilogues of the frames it unwinds, so whatever they changed is still
+    /// changed when control resumes here.
+    pub fn receives_nonlocal_goto(&self) -> bool {
+        self.blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .any(Instruction::is_builtin_setjmp)
+    }
+
     /// The local variable that `sym` *is*, if it is one.
     ///
     /// Asking `locals` by name cannot answer this: a parameter is registered
@@ -3534,9 +3585,30 @@ pub enum Initializer {
     SymAddr(String),
     /// Address of a symbol plus offset (for pointer initializers like `int *p = &s.field;`)
     SymAddrOffset(String, i64),
+    /// GNU `&&end - &&start + addend`: the distance in bytes between two
+    /// labels of one function, which the assembler writes as a symbol
+    /// difference at the object's width. Both are block-label symbols.
+    LabelDiff {
+        end: String,
+        start: String,
+        addend: i64,
+    },
 }
 
 impl Initializer {
+    /// Whether the linker writes any of it: an address, or a difference of
+    /// labels, here or in an element of an array.
+    pub fn holds_address(&self) -> bool {
+        match self {
+            Initializer::SymAddr(_)
+            | Initializer::SymAddrOffset(..)
+            | Initializer::LabelDiff { .. } => true,
+            Initializer::Array { elements, .. } => elements.iter().any(|(_, e)| e.holds_address()),
+            Initializer::Struct { fields, .. } => fields.iter().any(|(_, _, f)| f.holds_address()),
+            _ => false,
+        }
+    }
+
     /// A string literal initializing an array of `total_size` bytes, as the
     /// element list it stands for: one `Int` per code unit that fits, each
     /// `elem_size` bytes wide. `None` for anything that is not a string.
@@ -3567,6 +3639,35 @@ impl Initializer {
         })
     }
 
+    /// Call `f` with every symbol this initializer names: the target of an
+    /// address and both labels of a label difference.
+    pub fn for_each_symbol(&self, f: &mut impl FnMut(&str)) {
+        match self {
+            Initializer::SymAddr(name) | Initializer::SymAddrOffset(name, _) => f(name),
+            Initializer::LabelDiff { end, start, .. } => {
+                f(end);
+                f(start);
+            }
+            Initializer::Array { elements, .. } => {
+                for (_, init) in elements {
+                    init.for_each_symbol(f);
+                }
+            }
+            Initializer::Struct { fields, .. } => {
+                for (_, _, init) in fields {
+                    init.for_each_symbol(f);
+                }
+            }
+            Initializer::None
+            | Initializer::Int(_)
+            | Initializer::Float(_)
+            | Initializer::Float128(_)
+            | Initializer::String(_)
+            | Initializer::Utf16String(_)
+            | Initializer::Utf32String(_) => {}
+        }
+    }
+
     /// Recursively determine whether this initializer evaluates to all zero bytes.
     ///
     /// Used to route static / extern globals whose initial contents are entirely
@@ -3590,7 +3691,11 @@ impl Initializer {
                 fields.iter().all(|(_, _, init)| init.is_all_zero())
             }
             // Address-of expressions are never zero — they take an address.
-            Initializer::SymAddr(_) | Initializer::SymAddrOffset(_, _) => false,
+            // A label difference is not known until the function is
+            // assembled, so it needs data of its own either way.
+            Initializer::SymAddr(_)
+            | Initializer::SymAddrOffset(_, _)
+            | Initializer::LabelDiff { .. } => false,
         }
     }
 
@@ -3608,7 +3713,10 @@ impl Initializer {
             Initializer::Struct { fields, .. } => {
                 fields.iter().any(|(_, _, init)| init.has_reloc())
             }
-            Initializer::Float128(_)
+            // Two labels of one section: the assembler resolves their
+            // distance, and nothing is left for the loader to fix up.
+            Initializer::LabelDiff { .. }
+            | Initializer::Float128(_)
             | Initializer::None
             | Initializer::Int(_)
             | Initializer::Float(_)
@@ -3653,6 +3761,13 @@ impl fmt::Display for Initializer {
                 write!(f, " }}")
             }
             Initializer::SymAddr(name) => write!(f, "&{}", name),
+            Initializer::LabelDiff { end, start, addend } => {
+                write!(f, "&&{}-&&{}", end, start)?;
+                if *addend != 0 {
+                    write!(f, "{:+}", addend)?;
+                }
+                Ok(())
+            }
             Initializer::SymAddrOffset(name, offset) => {
                 if *offset >= 0 {
                     write!(f, "&{}+{}", name, offset)
@@ -3916,7 +4031,31 @@ impl AppendIndex {
 /// called something else -- `strstr(s, "c")` becomes `strchr(s, 'c')` --
 /// by their C names.
 pub const FOLD_CALLEES: &[&str] = &[
-    "strlen", "strchr", "strcpy", "memcpy", "memset", "puts", "putchar", "fputs", "fputc", "fwrite",
+    "strlen",
+    "strchr",
+    "strcpy",
+    "memcpy",
+    "memset",
+    "puts",
+    "putchar",
+    "fputs",
+    "fputc",
+    "fwrite",
+    // What a `_chk` call is without its check (`libcall_fold::fortify`).
+    "memmove",
+    "stpcpy",
+    "strncpy",
+    "stpncpy",
+    "strcat",
+    "strncat",
+    "sprintf",
+    "snprintf",
+    "vsprintf",
+    "vsnprintf",
+    // ... and a `_chk` call whose result is unused.
+    "__memcpy_chk",
+    "__strcpy_chk",
+    "__strncpy_chk",
 ];
 
 /// [`Module::strings`] and its index, borrowed apart from the rest of the
@@ -4014,9 +4153,18 @@ impl Module {
     ///
     /// A C tentative definition is completed rather than duplicated: if a
     /// global of the same name exists with `Initializer::None`, this
-    /// definition replaces it.
+    /// definition replaces it, and a tentative definition after an
+    /// initialized one is merged into it.
+    ///
+    /// `typ` is the object's type alone: its storage class is in `storage`,
+    /// and the parser gives every declarator of static storage duration its
+    /// type without one, so `static int x; extern int x = 7;` is one `int`.
+    /// The declarations of one object have compatible, identically qualified
+    /// types (C17 6.2.7p2); a later one may complete an earlier one (`int
+    /// (*p)[]; int (*p)[3] = 0;`), so the definition's type is the global's.
     pub(crate) fn define_global(
         &mut self,
+        types: &TypeTable,
         name: impl Into<String>,
         typ: TypeId,
         init: Initializer,
@@ -4029,15 +4177,21 @@ impl Module {
             is_thread_local,
         } = storage;
         let name = name.into();
+        debug_assert!(
+            !types
+                .modifiers(typ)
+                .intersects(crate::types::Type::DECL_SPECIFIERS),
+            "global '{name}' typed with its declaration's specifiers"
+        );
         // Check for existing tentative definition
         if let Some(existing) = self.global_mut(&name) {
             // Replace tentative definition with actual definition
             if matches!(existing.init, Initializer::None) {
-                debug_assert_eq!(
-                    existing.typ, typ,
-                    "tentative definition type mismatch for '{}'",
-                    name
+                debug_assert!(
+                    types.types_compatible_qualified(existing.typ, typ),
+                    "tentative definition type mismatch for '{name}'"
                 );
+                existing.typ = typ;
                 existing.init = init;
                 existing.is_static = is_static;
                 // Const-ness is a property of the declaration that ultimately
@@ -4051,6 +4205,12 @@ impl Module {
                 if align.is_some() {
                     existing.explicit_align = align;
                 }
+                return;
+            }
+            // A tentative definition after the definition refers to it
+            // (6.9.2p2): `int y = 5; int y;` is one `y`.
+            if matches!(init, Initializer::None) {
+                existing.explicit_align = existing.explicit_align.max(align);
                 return;
             }
         }
@@ -4170,6 +4330,36 @@ mod tests {
     use crate::abi::{ArgClass, RegClass};
     use crate::target::{Arch, Target};
     use crate::types::{Type, TypeTable};
+
+    /// An initializer holds an address when the linker writes any part of
+    /// it, at any depth; a value, a string and nothing do not.
+    #[test]
+    fn initializer_holds_address() {
+        let addr = Initializer::SymAddr("x".into());
+        assert!(addr.holds_address());
+        assert!(Initializer::SymAddrOffset("x".into(), 4).holds_address());
+        assert!(Initializer::LabelDiff {
+            end: "b".into(),
+            start: "a".into(),
+            addend: 0,
+        }
+        .holds_address());
+        let array = |elements| Initializer::Array {
+            elem_size: 8,
+            total_size: 16,
+            elements,
+        };
+        assert!(array(vec![(0, Initializer::Int(0)), (8, addr.clone())]).holds_address());
+        assert!(!array(vec![(0, Initializer::Int(1))]).holds_address());
+        let nested = Initializer::Struct {
+            total_size: 16,
+            fields: vec![(0, 16, array(vec![(8, addr)]))],
+        };
+        assert!(nested.holds_address());
+        assert!(!Initializer::None.holds_address());
+        assert!(!Initializer::Int(7).holds_address());
+        assert!(!Initializer::String("s".into()).holds_address());
+    }
 
     /// `-fvisibility=` reaches every external definition that named none,
     /// and nothing else.
@@ -4885,12 +5075,19 @@ mod tests {
         let plain = storage(false, false, false);
 
         // Add a tentative definition (no initializer)
-        module.define_global("x", types.int_id, Initializer::None, None, plain);
+        module.define_global(&types, "x", types.int_id, Initializer::None, None, plain);
         assert_eq!(module.globals.len(), 1);
         assert!(matches!(module.globals[0].init, Initializer::None));
 
         // Add actual definition - should replace the tentative one
-        module.define_global("x", types.int_id, Initializer::Int(42), Some(4), plain);
+        module.define_global(
+            &types,
+            "x",
+            types.int_id,
+            Initializer::Int(42),
+            Some(4),
+            plain,
+        );
         assert_eq!(module.globals.len(), 1); // Still only one global
         assert!(matches!(module.globals[0].init, Initializer::Int(42)));
         assert_eq!(module.globals[0].explicit_align, Some(4));
@@ -4903,11 +5100,11 @@ mod tests {
         let plain = storage(false, false, false);
 
         // Add a real definition (with initializer)
-        module.define_global("x", types.int_id, Initializer::Int(10), None, plain);
+        module.define_global(&types, "x", types.int_id, Initializer::Int(10), None, plain);
         assert_eq!(module.globals.len(), 1);
 
         // Add another definition with same name - should NOT replace (adds new entry)
-        module.define_global("x", types.int_id, Initializer::Int(20), None, plain);
+        module.define_global(&types, "x", types.int_id, Initializer::Int(20), None, plain);
         assert_eq!(module.globals.len(), 2); // Two globals now (linker will error)
     }
 
@@ -4918,13 +5115,20 @@ mod tests {
         let tls = storage(false, false, true);
 
         // Add a TLS tentative definition
-        module.define_global("tls_var", types.int_id, Initializer::None, None, tls);
+        module.define_global(
+            &types,
+            "tls_var",
+            types.int_id,
+            Initializer::None,
+            None,
+            tls,
+        );
         assert_eq!(module.globals.len(), 1);
         assert!(matches!(module.globals[0].init, Initializer::None));
 
         // Add actual TLS definition - should replace
         let init = Initializer::Int(100);
-        module.define_global("tls_var", types.int_id, init, Some(8), tls);
+        module.define_global(&types, "tls_var", types.int_id, init, Some(8), tls);
         assert_eq!(module.globals.len(), 1);
         assert!(matches!(module.globals[0].init, Initializer::Int(100)));
         assert!(module.globals[0].is_thread_local);
@@ -4940,7 +5144,7 @@ mod tests {
         for bits in 0..8u8 {
             let st = storage(bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
             let name = format!("g{bits}");
-            module.define_global(&name, types.int_id, Initializer::Int(1), None, st);
+            module.define_global(&types, &name, types.int_id, Initializer::Int(1), None, st);
             all.push((name, st));
         }
         assert_eq!(module.globals.len(), 8);
@@ -4960,6 +5164,7 @@ mod tests {
         let mut module = Module::default();
         let int = types.int_id;
         module.define_global(
+            &types,
             "a",
             int,
             Initializer::None,
@@ -4967,6 +5172,7 @@ mod tests {
             storage(true, true, true),
         );
         module.define_global(
+            &types,
             "a",
             int,
             Initializer::Int(1),
@@ -4981,6 +5187,7 @@ mod tests {
         assert_eq!(a.explicit_align, Some(16));
 
         module.define_global(
+            &types,
             "b",
             int,
             Initializer::None,
@@ -4988,6 +5195,7 @@ mod tests {
             storage(false, false, false),
         );
         module.define_global(
+            &types,
             "b",
             int,
             Initializer::Int(2),

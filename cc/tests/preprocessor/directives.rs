@@ -508,6 +508,28 @@ int main(void) {
     assert_eq!(compile_and_run("pack_two_step", src, &[]), 0);
 }
 
+/// `#pragma scalar_storage_order` survives `-E`, in either spelling, as the
+/// directive it stands for: the order of every struct after it depends on it.
+#[test]
+fn preprocessor_storage_order_pragma_survives_dash_e() {
+    let src = "#pragma scalar_storage_order big-endian\n\
+               struct S { int i; };\n\
+               _Pragma(\"scalar_storage_order default\")\n\
+               int q;\n";
+    let r = preprocess_text("sso_pragma_e", src, &[]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    for want in [
+        "#pragma scalar_storage_order big-endian",
+        "#pragma scalar_storage_order default",
+    ] {
+        assert!(
+            r.stdout.contains(want),
+            "expected {want:?} in:\n{}",
+            r.stdout
+        );
+    }
+}
+
 /// `#include_next` resumes the search *after* the directory the current file
 /// came from -- and `-I` directories are part of that search.
 ///

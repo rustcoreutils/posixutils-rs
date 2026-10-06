@@ -1573,6 +1573,235 @@ impl X86_64CodeGen {
         self.push_lir(X86Inst::Ud2);
     }
 
+    /// gcc's `__builtin_setjmp(buf)`: inline, with no library call.
+    ///
+    /// The five-word buffer gets gcc's layout ([`SjljLayout`]) -- the frame
+    /// pointer, the resume address, under `-fcf-protection=return` the
+    /// shadow-stack pointer, then the stack pointer -- and the result is 0
+    /// straight through and 1 at the resume point:
+    ///
+    /// ```text
+    ///     movq %rbp, 0(buf); leaq resume(%rip), t; movq t, 8(buf)
+    ///     [movl $0, t; rdsspq t; movq t, 16(buf)]          # return
+    ///     movq %rsp, sp(buf); movl $0, r; jmp done
+    /// resume:                     # %rbp and %rsp are back, nothing else is
+    ///     [endbr64]                                         # branch
+    ///     movl $1, r
+    /// done:
+    /// ```
+    ///
+    /// The shadow-stack word is zeroed before `rdsspq`, which does nothing
+    /// when the shadow stack is off, so it reads 0 then, as gcc's does. A
+    /// `longjmp` reaches the resume point by an indirect jump, which is why
+    /// it starts with the landing pad indirect-branch tracking requires.
+    ///
+    /// Nothing else survives the jump. The allocator keeps no value in a
+    /// register across this instruction (`get_constraint_info`) and the
+    /// prologue saves every callee-saved register, so the only state to
+    /// re-establish is an over-aligned frame's base register.
+    pub(super) fn emit_builtin_setjmp(&mut self, insn: &Instruction) {
+        let (Some(&env), Some(target)) = (insn.src.first(), insn.target) else {
+            return;
+        };
+        let cf = self.base.cf_protection;
+        let layout = SjljLayout::for_protection(cf);
+        let id = self.unique_label_counter;
+        self.unique_label_counter += 1;
+        let resume = Label::internal("sjlj_resume", id);
+        let done = Label::internal("sjlj_done", id);
+        let word = |offset| {
+            GpOperand::Mem(MemAddr::BaseOffset {
+                base: Reg::R10,
+                offset,
+            })
+        };
+
+        self.emit_move(env, Reg::R10, 64);
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rbp),
+            dst: word(SjljLayout::FP),
+        });
+        self.push_lir(X86Inst::Lea {
+            addr: MemAddr::RipRelative(resume.symbol()),
+            dst: Reg::R11,
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::R11),
+            dst: word(SjljLayout::RESUME),
+        });
+        if let Some(ssp) = layout.ssp {
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B32,
+                src: GpOperand::Imm(0),
+                dst: GpOperand::Reg(Reg::R11),
+            });
+            self.push_lir(X86Inst::Rdssp { dst: Reg::R11 });
+            self.push_lir(X86Inst::Mov {
+                size: OperandSize::B64,
+                src: GpOperand::Reg(Reg::R11),
+                dst: word(ssp),
+            });
+        }
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: GpOperand::Reg(Reg::Rsp),
+            dst: word(layout.sp),
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B32,
+            src: GpOperand::Imm(0),
+            dst: GpOperand::Reg(Reg::R11),
+        });
+        self.push_lir(X86Inst::Jmp {
+            target: done.clone(),
+        });
+
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(resume)));
+        if cf.branch {
+            self.push_lir(X86Inst::Endbr64);
+        }
+        self.emit_frame_base_latch_from_rbp();
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B32,
+            src: GpOperand::Imm(1),
+            dst: GpOperand::Reg(Reg::R11),
+        });
+
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(done)));
+        let dst_loc = self.get_location(target);
+        self.emit_move_to_loc(Reg::R11, &dst_loc, u32::BITS);
+    }
+
+    /// gcc's `__builtin_longjmp(buf, 1)`: put back the frame and stack
+    /// pointers the matching `__builtin_setjmp` saved, and jump to its resume
+    /// address. The buffer's address is read into a scratch register first,
+    /// since it may well be addressed from the `%rbp` being replaced.
+    ///
+    /// Under `-fcf-protection=return` the shadow stack is unwound to where
+    /// the setjmp found it first, by gcc's own sequence: `incsspq` pops at
+    /// most 255 entries at a time.
+    ///
+    /// ```text
+    ///     movl $0, %eax; rdsspq %rax; subq 16(buf), %rax; je done
+    ///     negq %rax; shrq $3, %rax; cmpq $255, %rax; jbe last
+    /// loop:
+    ///     movl $255, %ecx; incsspq %rcx; subq $255, %rax
+    ///     cmpq $255, %rax; ja loop
+    /// last:
+    ///     incsspq %rax
+    /// done:
+    /// ```
+    ///
+    /// With the shadow stack off `rdsspq` leaves the 0 and the setjmp saved
+    /// 0, so the difference is 0 and no `incsspq` -- which faults then -- is
+    /// reached. Every register is free to use: control never comes back.
+    pub(super) fn emit_builtin_longjmp(&mut self, insn: &Instruction) {
+        let Some(&env) = insn.src.first() else {
+            return;
+        };
+        let layout = SjljLayout::for_protection(self.base.cf_protection);
+        let word = |offset| {
+            GpOperand::Mem(MemAddr::BaseOffset {
+                base: Reg::R11,
+                offset,
+            })
+        };
+        self.emit_move(env, Reg::R11, 64);
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: word(SjljLayout::RESUME),
+            dst: GpOperand::Reg(Reg::R10),
+        });
+        if let Some(ssp) = layout.ssp {
+            self.emit_shadow_stack_unwind(word(ssp));
+        }
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: word(SjljLayout::FP),
+            dst: GpOperand::Reg(Reg::Rbp),
+        });
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B64,
+            src: word(layout.sp),
+            dst: GpOperand::Reg(Reg::Rsp),
+        });
+        self.push_lir(X86Inst::JmpIndirect { reg: Reg::R10 });
+    }
+
+    /// Pop the shadow stack back to the pointer `saved` holds, as described
+    /// at [`Self::emit_builtin_longjmp`]. Uses `%rax` and `%rcx`.
+    fn emit_shadow_stack_unwind(&mut self, saved: GpOperand) {
+        let id = self.unique_label_counter;
+        self.unique_label_counter += 1;
+        let pop_loop = Label::internal("sjlj_ssp_loop", id);
+        let last = Label::internal("sjlj_ssp_last", id);
+        let done = Label::internal("sjlj_ssp_done", id);
+        let max = GpOperand::Imm(255);
+
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B32,
+            src: GpOperand::Imm(0),
+            dst: GpOperand::Reg(Reg::Rax),
+        });
+        self.push_lir(X86Inst::Rdssp { dst: Reg::Rax });
+        self.push_lir(X86Inst::Sub {
+            size: OperandSize::B64,
+            src: saved,
+            dst: Reg::Rax,
+        });
+        self.push_lir(X86Inst::Jcc {
+            cc: CondCode::Eq,
+            target: done.clone(),
+        });
+        // Bytes to entries: the saved pointer is the higher one.
+        self.push_lir(X86Inst::Neg {
+            size: OperandSize::B64,
+            dst: Reg::Rax,
+        });
+        self.push_lir(X86Inst::Shr {
+            size: OperandSize::B64,
+            count: ShiftCount::Imm(3),
+            dst: Reg::Rax,
+        });
+        self.push_lir(X86Inst::Cmp {
+            size: OperandSize::B64,
+            src: max.clone(),
+            dst: GpOperand::Reg(Reg::Rax),
+        });
+        self.push_lir(X86Inst::Jcc {
+            cc: CondCode::Ule,
+            target: last.clone(),
+        });
+
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(pop_loop.clone())));
+        self.push_lir(X86Inst::Mov {
+            size: OperandSize::B32,
+            src: max.clone(),
+            dst: GpOperand::Reg(Reg::Rcx),
+        });
+        self.push_lir(X86Inst::Incssp { count: Reg::Rcx });
+        self.push_lir(X86Inst::Sub {
+            size: OperandSize::B64,
+            src: max.clone(),
+            dst: Reg::Rax,
+        });
+        self.push_lir(X86Inst::Cmp {
+            size: OperandSize::B64,
+            src: max,
+            dst: GpOperand::Reg(Reg::Rax),
+        });
+        self.push_lir(X86Inst::Jcc {
+            cc: CondCode::Ugt,
+            target: pop_loop,
+        });
+
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(last)));
+        self.push_lir(X86Inst::Incssp { count: Reg::Rax });
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(done)));
+    }
+
     /// Emit __builtin_alloca - dynamic stack allocation
     pub(super) fn emit_alloca(&mut self, insn: &Instruction) {
         let size = match insn.src.first() {
@@ -1802,5 +2031,37 @@ impl X86_64CodeGen {
         });
         let dst_loc = self.get_location(target);
         self.emit_move_to_loc(Reg::R10, &dst_loc, 64);
+    }
+}
+
+/// Where gcc's `__builtin_setjmp` buffer keeps each word on x86-64, the one
+/// layout c17's `__builtin_setjmp` and `__builtin_longjmp` both follow, so
+/// either can meet a gcc-built other half.
+///
+/// It depends on `-fcf-protection`: with return protection gcc saves the
+/// shadow-stack pointer in the third word and moves the stack pointer to the
+/// fourth, whether or not the shadow stack is on when the program runs.
+struct SjljLayout {
+    /// The shadow-stack pointer's word, under return protection only.
+    ssp: Option<i32>,
+    /// The stack pointer's word.
+    sp: i32,
+}
+
+impl SjljLayout {
+    /// The frame pointer's word.
+    const FP: i32 = 0;
+    /// The resume address's word.
+    const RESUME: i32 = 8;
+
+    fn for_protection(cf: crate::target::CfProtection) -> Self {
+        if cf.ret {
+            Self {
+                ssp: Some(16),
+                sp: 24,
+            }
+        } else {
+            Self { ssp: None, sp: 16 }
+        }
     }
 }

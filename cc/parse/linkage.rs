@@ -24,6 +24,7 @@ use crate::types::{TypeId, TypeKind, TypeModifiers};
 
 /// What the translation unit has said so far about one identifier with
 /// linkage, in whichever scopes it said it.
+#[derive(Clone, Copy)]
 pub(crate) struct LinkedName {
     linkage: Linkage,
     /// The type the declarations so far agree on: the first one's, given
@@ -40,6 +41,11 @@ pub(crate) struct LinkedName {
     /// under `gnu_inline` semantics), which emits nothing and so may be
     /// followed by the real one -- the one further definition allowed.
     inline_only: bool,
+    /// Whether the declarations so far leave the name GNU `extern inline`:
+    /// one said `extern inline` under GNU inline semantics, and no plain
+    /// `inline` declaration or real definition has followed. gcc lets a
+    /// `static` declaration take such a name over.
+    gnu_extern_inline: bool,
 }
 
 /// One declaration of an object or a function, as linkage sees it.
@@ -54,8 +60,21 @@ pub(super) struct Declared {
     /// initializer, or a function with a body. A tentative definition is not
     /// one (6.9.2p2).
     pub(super) defines: bool,
-    /// For a function definition, whether it is GNU inline-only.
-    pub(super) inline_only: bool,
+    /// For a function, whether its own specifiers say `extern inline` under
+    /// GNU inline semantics ([`FunctionAttrs::gnu_inline_only`]). With a
+    /// body and external linkage, it is the inline-only one.
+    ///
+    /// [`FunctionAttrs::gnu_inline_only`]: super::ast::FunctionAttrs::gnu_inline_only
+    pub(super) gnu_extern_inline: bool,
+}
+
+impl Declared {
+    /// Whether this is a GNU inline-only body under `linkage`. One with
+    /// internal linkage -- `extern inline` after a `static` declaration -- is
+    /// an ordinary static function, emitted as gcc emits it.
+    pub(super) fn inline_only(&self, linkage: Linkage) -> bool {
+        self.defines && self.gnu_extern_inline && linkage == Linkage::External
+    }
 }
 
 impl Parser<'_> {
@@ -132,19 +151,32 @@ impl Parser<'_> {
             return linkage;
         }
 
-        let Some(prior) = self.linked_names.get(&d.name) else {
-            self.linked_names.insert(
-                d.name,
-                LinkedName {
-                    linkage,
-                    typ: d.typ,
-                    completed_late: false,
-                    defined: d.defines,
-                    inline_only: d.inline_only,
-                },
-            );
+        let inline_only = d.inline_only(linkage);
+        let first = LinkedName {
+            linkage,
+            typ: d.typ,
+            completed_late: false,
+            defined: d.defines,
+            inline_only,
+            gnu_extern_inline: d.gnu_extern_inline && linkage == Linkage::External,
+        };
+        let Some(&prior) = self.linked_names.get(&d.name) else {
+            self.linked_names.insert(d.name, first);
             return linkage;
         };
+
+        // gcc's exception to 6.2.2p7: a `static` declaration silently takes
+        // over a name the unit has so far declared GNU `extern inline`, and
+        // the static one is the function -- of its calls, of `&f`, and of any
+        // inline-only body before it (gcc.c-torture `compile/20021120-1`).
+        if prior.linkage == Linkage::External
+            && linkage == Linkage::Internal
+            && prior.gnu_extern_inline
+        {
+            self.check_linked_type(&d, prior.typ, same_scope.is_some(), &spelled);
+            self.linked_names.insert(d.name, first);
+            return linkage;
+        }
 
         // 6.2.2p7: one identifier, two linkages, is undefined; gcc rejects
         // it, in both directions.
@@ -157,39 +189,21 @@ impl Parser<'_> {
             diag::error_args(d.pos, msg, &[&spelled]);
         }
 
-        // 6.2.7p2: every declaration of one entity has a compatible type.
-        // One in the same scope was compared by `check_redeclaration`; this
-        // is every other -- a block-scope `extern` against the file's, or
-        // two blocks' against each other.
-        if same_scope.is_none() {
-            let old = self.types.without_decl_specifiers(prior.typ);
-            let new = self.types.without_decl_specifiers(d.typ);
-            if !self.redeclaration_compatible(old, new, Redeclared::Declaration) {
-                diag::error_args(
-                    d.pos,
-                    "conflicting types for '{0}': '{1}' then '{2}'",
-                    &[
-                        &spelled,
-                        &self.types.format_type(old, Some(self.idents)),
-                        &self.types.format_type(new, Some(self.idents)),
-                    ],
-                );
-            }
-        }
+        self.check_linked_type(&d, prior.typ, same_scope.is_some(), &spelled);
 
         // 6.9p3, p5: one definition. A GNU inline-only body defines nothing
         // here, so the real one may follow it -- and only that: gcc rejects
         // an inline-only body after the real one, and a second inline-only
         // body after the first.
-        let redefined = d.defines && prior.defined && !(prior.inline_only && !d.inline_only);
+        let redefined = d.defines && prior.defined && !(prior.inline_only && !inline_only);
         if redefined {
             diag::error_args(d.pos, "redefinition of '{0}'", &[&spelled]);
         }
 
         // 6.2.7p3: an extent, from any scope, completes the array.
-        let completes = self.types.unsized_array_levels(prior.typ) > 0
+        let completes = self.types.is_incomplete_array(prior.typ)
             && self.types.kind(d.typ) == TypeKind::Array
-            && self.types.unsized_array_levels(d.typ) == 0;
+            && !self.types.is_incomplete_array(d.typ);
         let late = completes && !file && self.has_tentative_array(d.name);
 
         let prior = self.linked_names.get_mut(&d.name).expect("present");
@@ -197,13 +211,43 @@ impl Parser<'_> {
             prior.typ = d.typ;
             prior.completed_late = late;
         }
-        if d.defines && !d.inline_only {
+        if d.defines && !inline_only {
             prior.inline_only = false;
         } else if d.defines && !prior.defined {
             prior.inline_only = true;
         }
         prior.defined |= d.defines;
+        // A plain `inline` declaration promises the external definition, as
+        // a real definition is one; either ends the GNU `extern inline` state.
+        if d.gnu_extern_inline {
+            prior.gnu_extern_inline = true;
+        } else if d.storage.contains(TypeModifiers::INLINE) || d.defines {
+            prior.gnu_extern_inline = false;
+        }
         linkage
+    }
+
+    /// 6.2.7p2: every declaration of one entity has a compatible type. One
+    /// in the same scope was compared by `check_redeclaration`; this is
+    /// every other -- a block-scope `extern` against the file's, or two
+    /// blocks' against each other.
+    fn check_linked_type(&mut self, d: &Declared, prior: TypeId, same_scope: bool, spelled: &str) {
+        if same_scope {
+            return;
+        }
+        let old = self.types.without_decl_specifiers(prior);
+        let new = self.types.without_decl_specifiers(d.typ);
+        if !self.redeclaration_compatible(old, new, Redeclared::Declaration) {
+            diag::error_args(
+                d.pos,
+                "conflicting types for '{0}': '{1}' then '{2}'",
+                &[
+                    spelled,
+                    &self.types.format_type(old, Some(self.idents)),
+                    &self.types.format_type(new, Some(self.idents)),
+                ],
+            );
+        }
     }
 
     /// Whether a file-scope definition of `name` was written as an array

@@ -16,35 +16,6 @@ than rediscover the choice.
 
 ## Settled — do not re-open
 
-### `_FORTIFY_SOURCE` compiles but checks nothing
-
-**Deferred indefinitely by maintainer decision** -- a decision, not a backlog
-item, and this is its only record. `_FORTIFY_SOURCE`,
-`__builtin_object_size` and the `_chk` family appear nowhere in POSIX.1-2024
-or C17, so this is not a conformance gap.
-
-What the build needs already works: c17 accepts `-D_FORTIFY_SOURCE=2` (and
-`=3`, whose `__builtin_dynamic_object_size` falls back to
-`__builtin_object_size`), compiles glibc's fortified headers, and links.
-Distro builds pass the flag by default -- Debian's `dpkg-buildflags` does --
-so this part is load-bearing. With `-O`, `__OPTIMIZE__` is predefined, glibc
-compiles its wrappers, and c17 emits the `__*_chk` calls.
-
-What it does not do is *check*. `__builtin_object_size` folds at parse time
-from what the expression shows (an array, a member, `&lvalue`, constant
-pointer arithmetic). Inside a glibc wrapper its argument is the wrapper's own
-parameter, which at parse time is unknown, so it folds to `(size_t)-1` -- the
-encoding for "do not check". The program pays for the wrappers and checks
-nothing, and anyone who sets the flag expecting hardening gets no diagnostic
-saying so.
-
-Doing it properly means folding `__builtin_object_size` after inlining. There
-is no IR representation for an unresolved builtin query -- no opcode, no
-expression node that survives linearization, and no post-inline
-pointer-provenance analysis to build one on. `instcombine` refuses to touch
-`Call` and every memory-touching opcode, and its `Simplification` enum can
-only copy or fold to a constant. That is the cost the deferral weighs.
-
 ### Trigraphs are off by default — decided, not deferred
 
 **Settled. Not a to-do, not an open conformance item, not awaiting a
@@ -96,12 +67,34 @@ optimizer decides which comparisons qualify by the same rule
 
 Arithmetic, negation, comparison and conversion fold over float constants, at
 the format the program computes in rather than at the 128 significand bits a
-literal is carried in. Arithmetic and conversion leave to run time every
-operation that would raise invalid, divide-by-zero or overflow: a NaN or
-infinite operand, a division by zero, a result or narrowing that overflows
-(`ir/constfold.rs`). C lets a program read those flags through `<fenv.h>`,
-and folding the operation would take the flag with it. An inexact or
-underflowing result is folded, as gcc folds it without `-frounding-math`.
+literal is carried in. Arithmetic and float-to-float conversion leave to run
+time every operation that would raise invalid, divide-by-zero or overflow: a
+NaN or infinite arithmetic operand, a signalling NaN converted, a division by
+zero, a result or narrowing that overflows (`ir/constfold.rs`). C lets a
+program read those flags through `<fenv.h>`, and folding the operation would
+take the flag with it. An inexact or underflowing result is folded, as gcc
+folds it without `-frounding-math`, and so is a conversion of an infinity or
+a quiet NaN to another float format, which raises nothing.
+
+A conversion to an integer type is the other exception, chosen to match gcc.
+A value outside the type's range -- an infinity, a NaN, a huge or a negative
+value to an unsigned type -- is undefined (C17 6.3.1.4p1) and raises
+`FE_INVALID` at run time, where the instruction's answer differs by target:
+x86-64 gives the minimum, aarch64 saturates. gcc folds a constant one in
+every context, at `-O0` as well, and saturates: the maximum above the range,
+the minimum (0 for unsigned) below it, and 0 for any NaN, signalling or not,
+with or without `-fsignaling-nans`. c17 folds the same constants to the same
+answers, dropping the flag as gcc does, by one rule
+(`FloatVal::to_integer_saturating`): static initializers and integer
+constant expressions (`constexpr.rs`), a constant cast or implicitly
+converted in code (`fold_float_to_integer` in the linearizer, at every
+level), and the optimizer's `FCvtS`/`FCvtU` (`constfold::eval_fcvt`).
+gcc.c-torture's `execute/20031003-1` requires it. Only an array size refuses
+the saturated value, making the array a VLA as gcc does for
+`int a[(int)1e300 > 0];`. A conversion of a value not known until run time
+is the hardware's. One gap remains: a 128-bit conversion becomes a libgcc
+call before the optimizer runs, so a constant that reaches one through a
+variable is converted at run time, where gcc folds it from `-O1`.
 
 Comparisons are the exception, as in gcc: from `-O1` one whose answer no
 operand value can change folds -- against a NaN every ordered predicate to 0
@@ -146,8 +139,7 @@ themselves. No torture test depends on it.
 |---|---|
 | `mode` with a vector mode | `mode(V4SI)` and the other vector modes warn that they are not implemented and leave the declared type unchanged, so `sizeof` is the element's (4) where gcc's is the vector's (16). Scalar modes (`QI`..`TI`, `SF`, `DF`, ...) bind as in gcc, on a declarator, a struct member or a parameter. gcc itself deprecates vector modes in favour of `vector_size` |
 | `return` with the wrong value-ness | `return expr;` in a `void` function, and a bare `return;` in a non-`void` one, are errors, as they are by default from GCC 14 (`-Wreturn-mismatch`); GCC 13 and earlier warn. Both are C17 6.8.6.4p1 constraint violations. `-fpermissive` downgrades them, as it does implicit `int` |
-| An octal or hex escape out of range | `'\400'`, `"\x123"`, `u"\x12345"`: an escape its element type cannot represent is an error here and a warning in gcc. C17 6.4.4.4p9 makes it a constraint violation. `-fpermissive` downgrades it, and the literal then keeps the low bits, as gcc's does |
-| `_FORTIFY_SOURCE` | Compiles the wrappers and emits `__*_chk` calls, but checks nothing; see the settled entry above |
+| `_FORTIFY_SOURCE` | `__builtin_object_size` is answered after inlining (`ir/objsize.rs`) and the `_chk` calls are decided as gcc decides them (`ir/libcall_fold/fortify.rs`), with four differences. The IR does not record subobjects, so type 1 of a pointer whose object only propagation finds is the whole object's remaining size, which never fires where gcc's would not, and type 3 is 0; the parser answers both exactly where the expression names the member. A `malloc` or other `alloc_size` result is an unknown object. A provable overflow is left to abort at run time without gcc's compile-time `-Wstringop-overflow` warning, which c17 does not have. And gcc's strlen pass re-expresses some checks that stay -- `__strncat_chk` with a bound no shorter than its source as `__strcat_chk`, `__strcat_chk` onto a string of known length as `__strcpy_chk` or `__memcpy_chk` at its end -- where c17 keeps the call as written; the check is made either way |
 | Identifier characters U+FD3E, U+FD3F | Rejected here; GCC's binary accepts them. Ornate parentheses, which C17 Annex D excludes between its F900-FD3D and FD40-FDCF ranges -- GCC's own `ucnid.tab` does not list them and Clang's table does not either, so the table is followed rather than the binary |
 | Darwin: an over-aligned variadic aggregate | clang disagrees with itself, so no compiler satisfies this in both directions. Measured on macOS CI: its caller stacks the aggregate at the next eight-byte granule and its `va_arg` rounds the cursor up to the type's own alignment, reading somewhere else. A program built entirely with clang has the same defect. c17 follows `va_arg` -- its caller realigns the outgoing area so the argument really is that aligned -- which means a c17 caller reaches a clang callee and a clang caller does not reach a c17 callee. `codegen_over_aligned_argument_area` therefore does not put this shape through its host-compiler cross-check on Apple; the pure-c17 runs still cover it at every optimization level |
 | Darwin: a vector that is not one of the machine's widths | gcc and clang disagree about these on System V, and c17 follows gcc. A vector wider than sixteen bytes has no register class unless AVX is on, so gcc gives it memory and a hidden return pointer while clang legalizes it into a pair of SSE registers -- on every target it compiles for, Linux included. A one-lane vector (`double`, `long long` or `float` under `vector_size`, and a register-sized struct holding one) is memory to gcc and the bare scalar in its own register to clang. So a clang caller of a c17 callee returning `int __attribute__((vector_size(32)))` reads the wrong place, and `va_arg` disagrees likewise. Neither compiler is wrong -- the psABI classifies no such type -- so `vector_abi_interop_host` leaves these shapes out of its host-compiler cross-check on Apple and runs them with c17 on both sides, which `GCC_VECTORS` in its sources keys off `__APPLE__` and `C17_ALONE` to do |
@@ -219,78 +211,19 @@ them too (see "SIMD headers").
 `__ARM_NEON__` is not defined on aarch64: it is the AArch32 spelling, and gcc
 does not define it there.
 
-## Torture tests skipped by decision
+## Torture tests
 
-### Out of scope, and so skipped rather than counted
-
-Anything GNU-specific or newer than C17 is **out of scope**: the harness
-(`scripts/c17_torture.sh`) skips it with a named reason instead of reporting a
-failure, because counting it measures a decision rather than a defect.
-
-The names live in the harness's lists, one shell variable per category, and
-are not repeated here. Each entry there is `<sub-suite>/<name>`, because a
-test name is not unique across sub-suites: `20021204-1`, `20031011-1` and
-`20050119-1` each name a nested-function test in `compile/` **and** a
-different test in `execute/` that passes.
-
-| Category | Harness list | Why |
-|---|---|---|
-| Nested functions | `OUT_OF_SCOPE_NESTED_FN` | Needs a static chain and executable trampolines |
-| VLA as a struct member | `OUT_OF_SCOPE_VLA_MEMBER` | Needs struct layout computed at run time, and `offsetof` through it |
-| Post-C17 | `OUT_OF_SCOPE_POST_C17` | `_Decimal64` (TR 24732), C23 `[[...]]` attributes, C23 `enum E : bool`, C2y `uabs` |
-| GNU-only attribute | `OUT_OF_SCOPE_GNU_ATTR` | `scalar_storage_order`; needs reverse-endian load/store lowering |
-| gcc's own front ends | `OUT_OF_SCOPE_GCC_INTERNAL` | `-fgimple`, which parses gcc's internal representation rather than C; gcc rejects them without the flag too |
-| Builtins gcc synthesizes for itself | `OUT_OF_SCOPE_GCC_INTERNAL_BUILTIN` | `__builtin_setjmp`, `__builtin_apply`, `__builtin_stack_save` and the like, which no header declares; recorded in `BUILTIN.md`'s "Not implemented" table |
-| `-fgnu89-inline` semantics | `OUT_OF_SCOPE_GNU89_INLINE` | `compile/20021120-1`, `-2` redefine an `extern inline` function under `-fgnu89-inline`. c17 honours the flag and compiles both; the skip rests on c17 not rejecting the same redefinition without the flag, as gcc does, which the tests themselves do not exercise |
-| Another target's backend | `OUT_OF_SCOPE_OTHER_TARGET` | `mipscop-1`..`-4` |
-| `__builtin_issignaling` | `OUT_OF_SCOPE_ISSIGNALING` | No system header uses the builtin (`<math.h>`'s `issignaling` is its own macro), and seven of the nine tests need a format c17 does not have (`_Float128`, `_Float64x`, `bfloat16`) |
-| Pre-C99 implicit `int` with no dialect request | `NEEDS_PRE_C99_DIALECT` | `compile/pr29201`. C17 6.7.2p2 requires a type specifier and GCC 14 made it an error too. A test that asks for `-fpermissive` passes; one that asks for `-std=gnu89` passes because the harness translates that to `-fpermissive` -- c17 itself ignores `-std=gnu89` |
-| Vector values | `OUT_OF_SCOPE_VECTOR_ARITH` | A vector of floating lanes four bytes wide or less at a call boundary, which gcc passes like no type c17 has. Every other vector operation runs |
-| `__label__` | `OUT_OF_SCOPE_LOCAL_LABELS` | Block-scope label declarations, ruled out with nested functions |
-| Label difference as a constant | `OUT_OF_SCOPE_LABEL_DIFF` | `&&a - &&b` in a static initializer. Labels as values are supported; the difference needs a symbol-difference relocation |
-| A C17 constraint gcc only warns about | `C17_CONSTRAINT_GCC_WARNS` | `compile/pr38857`: 6.7.4p3, an external inline definition referring to a static. `-fpermissive` relaxes it |
-| gcc-specific *behaviour* | `OUT_OF_SCOPE_GCC_BEHAVIOUR` | See below |
-
-The gcc-specific behaviour list holds four kinds of test:
-
-- `execute/20031003-1`: `(int)2147483648.0f` is undefined behaviour (C17
-  6.3.1.4p1); gcc's folder saturates it to `INT_MAX`, and aarch64 agrees by
-  hardware accident.
-- A conditional with one `void` arm, which C17 6.5.15p3 forbids and gcc
-  accepts without comment: `execute/pr46309`, `compile/pr26725`,
-  `compile/20000211-1`. c17 rejects it, and `-fpermissive` does not relax it.
-- `compile/950919-1`: a GNU preprocessor assertion (`#cpu(m68k)`), which gcc
-  itself calls deprecated.
-- An empty write kept as a call: `builtins/printf`, `builtins/fprintf`,
-  `builtins/fputs`, `execute/printf-chk-1`, `execute/fprintf-chk-1`,
-  `execute/vprintf-chk-1`, `execute/vfprintf-chk-1` abort when `printf("")`,
-  `fprintf(fp, "")` or `fputs("", fp)` reaches the library at `-O1` and up.
-  C17 7.21.2p4 gives a stream its orientation from the first input or output
-  function applied to it, whether or not a byte moves, so c17 keeps every
-  empty write; gcc drops them and loses the orientation (`fwide(stdout, 0)`
-  after `printf("")` is negative under c17 and 0 under gcc).
-
-These are listed **by name** in the harness, never matched against the source.
-A content match is wrong: `pr86659-1`, `pr86659-2` and `pr87623` all mention
-`scalar_storage_order` and **pass**, so a scan for the feature would throw
-away cases c17 gets right. A name list also keeps every skip auditable, and a
-test added to the suite later shows up as a new failure and gets triaged then
--- which is the right moment to decide.
-
-Nothing is matched by content: every test is attempted unless a list names it,
-and a test's `.x` file is read for the few shapes the suite uses rather than
-taken as "skip". Matching the source, the `dg-require-effective-target` names,
-or the mere presence of a `.x` file would hide tests c17 passes and bugs it
-has.
-
-Skipping a test that is in the passing baseline is reported as a regression,
-by name. A skip of a test that was never in the baseline is not caught that
-way.
+The harness (`scripts/c17_torture.sh`) attempts every test except those in
+its `SKIP_BY_NAME` table, which holds what is out of scope -- nested
+functions, VLA struct members, post-C17 features, gcc's own internals,
+another target's assembly -- and the odd test gcc itself rejects, each with
+its reason. The suite's own directives (a `.x` file, `dg-skip-if`, a `dg-do`
+target selector) skip the rest. A failure that is a c17 gap or bug is fixed,
+not listed.
 
 ### Deliberate divergences from gcc
 
-The gcc-specific behaviour above is skipped. Two more divergences c17 keeps
-but does **not** skip, because they are not GNU-specific:
+Two divergences c17 keeps, which the tests below see as failures:
 
 | Test | Why c17 does not follow |
 |---|---|

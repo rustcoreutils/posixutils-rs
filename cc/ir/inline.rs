@@ -169,6 +169,11 @@ pub struct InlineCandidate {
     /// `Function::saves_label_in_static`. That table names the blocks of the
     /// out-of-line body, so no copy of the body can use it.
     pub saves_label_in_static: bool,
+    /// Whether the function contains a `__builtin_setjmp` -- see
+    /// `Function::receives_nonlocal_goto`. gcc never copies one ("can never
+    /// be copied because it receives a non-local goto"), and neither does
+    /// c17: the resume point belongs to the function's own frame.
+    pub receives_nonlocal_goto: bool,
     /// Number of times this function is called in the module
     pub call_count: usize,
     /// Whether the function returns a complex value (should not inline)
@@ -207,6 +212,7 @@ impl InlineCandidate {
             || self.is_recursive
             || self.has_computed_goto
             || self.saves_label_in_static
+            || self.receives_nonlocal_goto
             || self.ret_is_address
             || self.is_noinline
     }
@@ -256,6 +262,7 @@ pub fn analyze_all_functions(module: &Module) -> HashMap<String, InlineCandidate
 fn analyze_function(func: &Function, call_counts: &HashMap<String, usize>) -> InlineCandidate {
     let mut candidate = InlineCandidate {
         saves_label_in_static: func.saves_label_in_static,
+        receives_nonlocal_goto: func.receives_nonlocal_goto(),
         is_noinline: func.is_noinline,
         is_always_inline: func.is_always_inline,
         is_interposable: func.symbol_attrs.weak && !func.is_static,
@@ -1624,39 +1631,17 @@ pub fn run(module: &mut Module, opt: Optimization) -> bool {
     any_changed
 }
 
-/// Collect all function address references from an initializer (recursive)
+/// Collect every function an initializer takes the address of.
 pub(crate) fn collect_func_refs_from_initializer(
     init: &super::Initializer,
     func_names: &HashSet<String>,
     address_taken: &mut HashSet<String>,
 ) {
-    use super::Initializer;
-    match init {
-        Initializer::SymAddr(name) | Initializer::SymAddrOffset(name, _) => {
-            // Check if this symbol is a function name
-            if func_names.contains(name) {
-                address_taken.insert(name.clone());
-            }
+    init.for_each_symbol(&mut |name| {
+        if func_names.contains(name) {
+            address_taken.insert(name.to_string());
         }
-        Initializer::Float128(_) => {}
-        Initializer::Array { elements, .. } => {
-            for (_, elem_init) in elements {
-                collect_func_refs_from_initializer(elem_init, func_names, address_taken);
-            }
-        }
-        Initializer::Struct { fields, .. } => {
-            for (_, _, field_init) in fields {
-                collect_func_refs_from_initializer(field_init, func_names, address_taken);
-            }
-        }
-        // Other initializer types don't contain function references
-        Initializer::None
-        | Initializer::Int(_)
-        | Initializer::Float(_)
-        | Initializer::String(_)
-        | Initializer::Utf16String(_)
-        | Initializer::Utf32String(_) => {}
-    }
+    });
 }
 
 /// Remove functions that are static and have no callers -- with
@@ -1669,8 +1654,9 @@ fn remove_dead_functions(module: &mut Module, only_inline: bool) {
     loop {
         let referenced = collect_referenced_functions(module);
         let before = module.functions.len();
+        let mut dead_labels = HashSet::new();
         module.functions.retain(|f| {
-            f.name == "main"
+            let keep = f.name == "main"
                 || !f.is_static
                 || (only_inline && !f.is_inline)
                 // `__attribute__((used))` means exactly "keep this even
@@ -1681,11 +1667,41 @@ fn remove_dead_functions(module: &mut Module, only_inline: bool) {
                 // reference is the `.init_array` / `.fini_array` entry the
                 // backend emits, which is created after this pass runs.
                 || f.constructor.is_some()
-                || f.destructor.is_some()
+                || f.destructor.is_some();
+            if !keep && f.saves_label_in_static {
+                dead_labels.extend(f.blocks.iter().map(|bb| bb.id.label_symbol(&f.name)));
+            }
+            keep
         });
+        remove_tables_of_dead_labels(module, dead_labels);
         if module.functions.len() == before {
             return;
         }
+    }
+}
+
+/// Remove the static objects that name a label of a function just removed.
+///
+/// `static void *t[] = {&&a}` and `static const int d[] = {&&a - &&b}` name
+/// blocks that no longer exist, and the assembler rejects a reference to a
+/// label nothing defines. Such an object is a static local of the removed
+/// function -- `&&` names nothing at file scope, and a function that saves a
+/// label in a static is never inlined -- so nothing else can refer to it but
+/// another static local of the same function, which goes with it. gcc drops
+/// them too.
+fn remove_tables_of_dead_labels(module: &mut Module, mut dead: HashSet<String>) {
+    while !dead.is_empty() {
+        let mut removed = HashSet::new();
+        module.globals.retain(|g| {
+            let mut names_dead = false;
+            g.init
+                .for_each_symbol(&mut |sym| names_dead |= dead.contains(sym));
+            if names_dead {
+                removed.insert(g.name.clone());
+            }
+            !names_dead
+        });
+        dead = removed;
     }
 }
 
@@ -1884,6 +1900,7 @@ mod tests {
             consumes_va_list: false,
             has_computed_goto: false,
             saves_label_in_static: false,
+            receives_nonlocal_goto: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -1917,6 +1934,7 @@ mod tests {
             consumes_va_list: true,
             has_computed_goto: false,
             saves_label_in_static: false,
+            receives_nonlocal_goto: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -1968,6 +1986,7 @@ mod tests {
             consumes_va_list: true,
             has_computed_goto: false,
             saves_label_in_static: false,
+            receives_nonlocal_goto: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -1995,6 +2014,7 @@ mod tests {
             consumes_va_list: false,
             has_computed_goto: false,
             saves_label_in_static: false,
+            receives_nonlocal_goto: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -2022,6 +2042,7 @@ mod tests {
             consumes_va_list: false,
             has_computed_goto: false,
             saves_label_in_static: false,
+            receives_nonlocal_goto: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -2049,6 +2070,7 @@ mod tests {
             consumes_va_list: false,
             has_computed_goto: false,
             saves_label_in_static: false,
+            receives_nonlocal_goto: false,
             ret_is_address: false,
             is_interposable: false,
             call_count: 1,
@@ -2250,6 +2272,43 @@ mod tests {
 
         assert!(module.functions.iter().any(|f| f.name == "kept"));
         assert!(!module.functions.iter().any(|f| f.name == "dropped"));
+    }
+
+    /// A static table naming the labels of a function that is removed goes
+    /// with it, and so does a static that names the table: what is left
+    /// would reference labels nothing defines, which the assembler rejects.
+    /// A table of a surviving function, and an unrelated global, stay.
+    #[test]
+    fn test_label_tables_of_a_dead_function_go_with_it() {
+        let types = TypeTable::new(&Target::host());
+        let mut module = Module::default();
+        let mut dead = static_fn(&types, "dead", None);
+        dead.saves_label_in_static = true;
+        let mut live = static_fn(&types, "live", None);
+        live.saves_label_in_static = true;
+        let mut main = static_fn(&types, "main", Some("live"));
+        main.is_static = false;
+        let label = |f: &str| BasicBlockId(0).label_symbol(f);
+        let diff = |f: &str| Initializer::LabelDiff {
+            end: label(f),
+            start: label(f),
+            addend: 4,
+        };
+        module.functions.extend([dead, live, main]);
+        for (name, init) in [
+            ("dead.d.0", diff("dead")),
+            ("dead.t.1", Initializer::SymAddr(label("dead"))),
+            ("dead.p.2", Initializer::SymAddr("dead.d.0".to_string())),
+            ("live.d.0", diff("live")),
+            ("other", Initializer::Int(1)),
+        ] {
+            module.add_global(name, types.int_id, init);
+        }
+
+        remove_dead_functions(&mut module, false);
+
+        let names: Vec<&str> = module.globals.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, ["live.d.0", "other"]);
     }
 
     /// `__attribute__((alias))` names its target in a `.set` the backend
@@ -3022,6 +3081,39 @@ mod tests {
         let mut table = label_address_callee(&types);
         table.saves_label_in_static = true;
         assert!(analyze_function(&table, &HashMap::new()).cannot_be_inlined());
+    }
+
+    /// A function containing `__builtin_setjmp` receives a non-local goto,
+    /// which gcc never copies ("can never be copied because it receives a
+    /// non-local goto"): it stays a call even where it is small, static and
+    /// called once -- and `always_inline` cannot override it.
+    #[test]
+    fn test_builtin_setjmp_receiver_is_not_inlined() {
+        let src = r#"
+void *buf[5];
+extern void g(void);
+static int recv(void) { if (__builtin_setjmp(buf)) return 1; g(); return 0; }
+int caller(void) { return recv(); }
+"#;
+        let target = Target::new(crate::target::Arch::X86_64, crate::target::Os::Linux);
+        let mut module = crate::ir::linearize::test_linearize::linearize_source(src, &target);
+        let candidates = analyze_all_functions(&module);
+        assert!(candidates["recv"].receives_nonlocal_goto);
+        assert!(candidates["recv"].cannot_be_inlined());
+        run(&mut module, opt_at(2));
+        assert_eq!(calls_left(&module, "caller", "recv"), 1, "recv was inlined");
+
+        let mut forced = candidates["recv"].clone();
+        forced.is_always_inline = true;
+        assert!(!should_inline(
+            &forced,
+            opt_at(2),
+            CallerSize {
+                now: 10,
+                original: 10
+            },
+            false
+        ));
     }
 
     #[test]

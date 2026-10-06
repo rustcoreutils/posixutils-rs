@@ -931,6 +931,12 @@ pub fn param_layout(
                 }
             }
             ArgClass::Ignore => ParamPlace::Absent,
+            // gcc's floating vector of four bytes or fewer: on the stack
+            // whatever is left, and NGRN becomes 8 behind it.
+            ArgClass::Stacked { .. } => {
+                ngrn = REGS;
+                stack(&mut next, false)
+            }
             // Integer, pointer and everything else -- including a composite
             // over sixteen bytes, which travels as a pointer to a copy (stage
             // C.4) -- takes one X register or one eight-byte slot.
@@ -1134,6 +1140,14 @@ pub fn get_constraint_info_aarch64(
             return None;
         }
         return Some((clobbers, involved));
+    }
+
+    if insn.is_builtin_setjmp() {
+        let mut clobbers = Reg::allocatable().to_vec();
+        clobbers.extend(AARCH64_SCRATCH_REGS);
+        return Some(crate::arch::regalloc::builtin_setjmp_constraint(
+            insn, &clobbers,
+        ));
     }
 
     // Non-asm opcodes — declare scratches clobbered for the broad
@@ -1373,6 +1387,12 @@ impl RegAlloc {
         self.frame_base = FrameBase::of(func, types);
         if let Some(base) = self.frame_base.reg() {
             self.free_regs.retain(|r| *r != base);
+        }
+        if func.receives_nonlocal_goto() {
+            self.used_callee_saved
+                .extend(Reg::allocatable().iter().filter(|r| r.is_callee_saved()));
+            self.used_callee_saved_fp
+                .extend(VReg::allocatable().iter().filter(|r| r.is_callee_saved()));
         }
         // Use shared identify_fp_pseudos with type-checker closure
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));

@@ -75,7 +75,8 @@ Checked by gcc's own rules, in its words, with the shared helpers of
 `is_integral`, `parse_generic_builtin_args`):
 
 - the type-generic classification builtins (`isnan`, `isinf`, `isfinite`,
-  `isnormal`, `isinf_sign`, `signbit`, and `fpclassify`'s last argument)
+  `isnormal`, `isinf_sign`, `signbit`, `issignaling`, and `fpclassify`'s
+  last argument)
   require a real floating argument; the unordered relations require one of
   their two (`parse_fp_compare`);
 - `__builtin_fpclassify` takes six arguments, and its five class codes,
@@ -199,7 +200,7 @@ value gcc folds them to on both targets; at run time they stay undefined.
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_constant_p(expr)` | 1 if `expr` is a compile-time constant. A parse-time constant (integer or floating) answers 1 at once; anything else answers 0 at `-O0`, and at `-O1`+ becomes `Opcode::ConstantP`, which `sccp` resolves to 1 if propagation proves the operand constant and `ir::lower` resolves to 0 otherwise -- so a local holding a constant is one only when optimizing, as in gcc. An operand with side effects answers 0 and is not linearized; the argument is never evaluated |
+| `__builtin_constant_p(expr)` | 1 if `expr` is a compile-time constant, by gcc's rules. A parse-time constant (integer or floating) and the address of a string literal's first character (`"hi"`, `&"hi"[0]`, through a conversion that keeps the representation) answer 1 at once; any other pointer or aggregate, and anything at `-O0`, answers 0 at once. The rest becomes `Opcode::ConstantP` at `-O1`+, which `sccp` resolves to 1 if propagation proves the operand constant -- after inlining, so an inline function's parameter is one where the caller passes a constant -- and `ir::lower` resolves to 0 otherwise. An operand with side effects answers 0 and is not linearized; one that may only trap (`"hi"[0]`, `x / y`) is computed for the question and deleted unrun once it is answered |
 | `__builtin_types_compatible_p(t1, t2)` | `TypeTable::types_compatible` of two type names, top-level qualifiers ignored. **Bug:** an enumerated type is compatible with no integer type here (C17 6.7.2.2p4 makes it compatible with one; gcc uses `unsigned int`, or `int` with a negative enumerator), so `__builtin_types_compatible_p(enum E, unsigned)` is 0 where gcc answers 1, and `_Generic` misses the same association |
 | `__builtin_classify_type(expr)` | A code for the type family after the usual conversions: 0 void, 1 integer (including `char`, enumerations and `_Bool`), 5 pointer (including arrays, functions and string literals), 8 real floating, 9 complex, 12 struct, 13 union. The argument is not evaluated |
 | `__builtin_choose_expr(c, a, b)` | `a` or `b` by the constant `c`, selected in the parser; the other arm is parsed (so an undeclared name or unknown member in it is still an error) and then discarded, so it is never evaluated or linearized |
@@ -210,6 +211,8 @@ value gcc folds them to on both targets; at run time they stay undefined.
 |---------|-------------|
 | `__builtin_alloca(size)`, `alloca(size)` | `Opcode::Alloca`, freed on return. An inlined callee's `alloca` is bracketed by `StackSave`/`StackRestore` so it is freed when the call would have returned. The bare `alloca` is displaced by a non-function declaration or `-fno-builtin[-alloca]`; `<alloca.h>`'s function declaration does not displace it. Either spelling is checked through gcc's prototype `void *(size_t)` |
 | `memset`, `memcpy`, `memmove`, `mempcpy`, `bcopy` and their `__builtin_` spellings | Computed in place (next section) |
+| `__builtin_stack_save()`, `__builtin_stack_restore(p)` | `void *(void)` and `void (void *)`: `Opcode::StackSave` and `Opcode::StackRestore`, the pair c17 brackets a VLA's scope and an inlined `alloca` with. The restore frees every `alloca` and VLA made since the save; nothing else frees an `alloca` before the function returns. Every local is addressed from the frame pointer and every epilogue resets the stack pointer from it, so moving the stack pointer disturbs neither; a VLA whose scope then ends restores its own mark, which is never below the program's. A save live across a `setjmp` survives the `longjmp` back to it, as any value live there does |
+| `__builtin_clear_padding(p)` | Zeroes every padding bit of `*p` and leaves its members' bits alone (`ir/padding.rs`), as gcc 13 does: the gaps between members and the tail; the bits of a bit-field's bytes no named bit-field uses (an unnamed bit-field is padding); in a union, only the bits that are padding in every member, a bit-field directly in a union covering whole bytes; the 6 unused bytes of x87 `long double`, in each half of a complex one; each element of an array. A byte of padding is a zero store (runs of them a `Memset`, expanded like any other), a byte partly a bit-field's is and-ed with the bits to keep. A pointer to a variable length array clears its innermost fixed-size element in a loop; an array argument points at its first element only. `p` must be a pointer to a complete type that is not `const` and has no flexible array member, with gcc's errors; a pointer to a function is accepted and clears nothing |
 | `__builtin_prefetch(addr[, rw[, locality]])` | Emits nothing. `addr` is evaluated (`__builtin_prefetch((q = p))` assigns `q`). `rw` (0 or 1) and locality (0 to 3) must be integer constants, so there is nothing in them to evaluate; one out of range is a warning, as in gcc. Further arguments are accepted and ignored, as gcc ignores them |
 
 ## Library Functions Computed in Place
@@ -324,12 +327,30 @@ error.
 | `__builtin_isinf_sign(x)` | +1 for +inf, -1 for -inf, 0 otherwise |
 | `__builtin_isfinite(x)`, `__builtin_isnormal(x)` | As C's macros. No suffixed spellings, as in gcc |
 | `__builtin_fpclassify(nan, inf, normal, subnormal, zero, x)` | Whichever of the five codes describes `x`. The codes convert to `int` and must be integer constants |
+| `__builtin_issignaling(x)` | 1 for a signalling NaN of either sign, else 0. Any real floating type, tested at its own width and never converted, since a conversion quiets. On x86-64's `long double`, as in gcc and glibc, also 1 for every encoding with a nonzero exponent and the integer bit clear (pseudo-infinity, pseudo-NaN, unnormal). Of a constant it is an integer constant expression |
 | `__builtin_flt_rounds()` | The integer constant 1, whatever the current rounding mode (clang reads the mode; gcc has no such builtin) |
 
 The classification builtins are `ExprKind::FpTest` / `FpClassify`, lowered by
 `linearize_fp_test` / `linearize_fp_classify` into comparisons and bit tests;
-`signbit` is `Opcode::Signbit`. Only `signbit` folds as a constant
-expression.
+`signbit` is `Opcode::Signbit`. `issignaling` cannot compare at all -- any
+floating operation on a signalling NaN, a quiet comparison included, quiets
+it or raises -- so its operand is stored to a temporary at its own type and
+read back as integers (`emit_is_signaling`). Only `signbit` and
+`issignaling` fold as constant expressions.
+
+`-fsignaling-nans` defines gcc's `__SUPPORT_SNAN__` and changes nothing else:
+no fold c17 makes assumes a NaN is quiet, which is what the flag asks of
+gcc. An operation that consumes a signalling NaN constant is not folded
+(`constfold`) and raises *invalid* at run time; `x * 1.0`, `x - 0.0` and
+`fmin(x, x)` stay operations that quiet `x`. A conversion to an integer type
+is the exception: it folds to 0, as gcc folds it with or without the flag,
+and like every float-to-integer fold it drops the *invalid* (DECISIONS.md,
+"Float constant folding stops where an operation raises"). One difference
+remains: under
+the flag gcc stops taking a conversion of, or arithmetic on, a signalling NaN
+constant as an integer constant expression, so `enum { E =
+__builtin_issignaling((float)__builtin_nans("")) };` is an error there; c17
+folds it to 0 with or without the flag, as gcc does without it.
 
 ### The unordered-safe relations (C99 7.12.14)
 
@@ -367,10 +388,36 @@ C23 7.12.17.1 requires. The results are exact.
 | `__builtin___clear_cache(begin, end)` | A call to libgcc's `__clear_cache`: a no-op on x86-64, required on AArch64 for code written as data |
 | `setjmp(env)`, `_setjmp(env)` | Bare names parsed as builtins: `Opcode::Setjmp`, calling the library function under the name its declaration gives it. `setjmp()` with no argument is an ordinary unprototyped call |
 | `longjmp(env, val)`, `_longjmp(env, val)` | `Opcode::Longjmp`, a terminator |
+| `__builtin_setjmp(buf)` | `int (void *)`. `Opcode::Setjmp` with `JmpKind::Builtin`: inline code, no library call. Returns 0, and 1 when resumed |
+| `__builtin_longjmp(buf, 1)` | `void (void *, int)`. `Opcode::Longjmp` with `JmpKind::Builtin`, a terminator. A value other than the constant 1 is an error, as in gcc |
 
 `setjmp` and `longjmp` are displaced only by a declaration that is not a
 function, or by `-fno-builtin`; `<setjmp.h>`'s function declarations keep
 them.
+
+`__builtin_setjmp` stores gcc's layout in the first three of its five words:
+the frame pointer, the address of a resume label inside the instruction's own
+code, and the stack pointer. `__builtin_longjmp` loads all three, then sets
+the frame and stack pointers and jumps to the label (`jmp *` / `br`). The
+code is the same on every target, Mach-O included. No signal mask and no
+other register is saved, so the function containing the setjmp:
+
+- keeps no value in a register across it: the setjmp is a constraint point
+  that clobbers every allocatable register (`builtin_setjmp_constraint`), and
+  a call-like opcode, so floating values go to the stack too;
+- saves every callee-saved register in its prologue, since the jump skips the
+  epilogues of the frames it unwinds;
+- re-establishes an over-aligned frame's base register at the resume label;
+- is never inlined (`Function::receives_nonlocal_goto`), as gcc never copies
+  it.
+
+The resume label belongs to the instruction, not to a block, so the
+optimizer sees a plain side-effecting instruction with an unknown result and
+nothing can delete the resume path. As with every `setjmp`, a value live
+across it has its interval stretched to the end of the function
+(`extend_across_returns_twice`), since the jump comes from a path the CFG
+does not connect back to it. gcc's rule that the `__builtin_longjmp` must
+not be in the same function as its setjmp is not diagnosed, by gcc either.
 
 ## Control Flow and Hints
 
@@ -396,6 +443,8 @@ them.
 |---------|-------------|
 | `__builtin_complex(re, im)` | `ExprKind::BuiltinComplex`, of the complex type of `re`'s type. Usable in static initializers and at file scope (`<complex.h>`'s `I` and `CMPLX` macros use it), at every precision. The operands must be of one real floating type, as gcc requires |
 | `__builtin_creal`, `crealf`, `creall`, `cimag`, `cimagf`, `cimagl`, `conj`, `conjf`, `conjl` | Computed in place (above) |
+| `__builtin_cexpi(x)`, `cexpif`, `cexpil` | `cos x + i sin x`: a call to `cexp` (`cexpf`, `cexpl`) of `+0 + xi`, so the answer is exactly `cexp(I * x)`'s. gcc calls `sincos` where it exists, which glibc's `cexp` computes the same way, scaled by `exp(+0)`; `cexp` exists everywhere, macOS included. The argument converts to the real type, as gcc's prototype says |
+| `__builtin_cpow(z, w)`, `cpowf`, `cpowl` | The library's `cpow` (below) |
 
 Complex integer types (`_Complex int` and the rest, a GNU extension) are
 supported as two integers laid end to end; multiply and divide are
@@ -466,6 +515,7 @@ implicit declaration of one of these names takes the row's return type.
 | `__builtin_printf`, `sprintf`, `snprintf`, `fprintf`, `puts`, `putchar`, `fputs`, `fputc`, `fwrite` | |
 | `__builtin_printf_unlocked`, `fprintf_unlocked`, `fputs_unlocked` | glibc defines none of these; a program using one supplies it (gcc.c-torture's `builtins/` tests do) |
 | `__builtin_pow`, `fmod`, `atan2`, `hypot`, `fdim`, `remainder`, `nextafter` and `f`/`l` forms | |
+| `__builtin_cpow`, `cpowf`, `cpowl` | Through the complex prototype, so a real argument converts to it (`__builtin_cpow(x, 75)`) |
 | `__builtin_cbrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `asinh`, `acosh`, `atanh`, `exp`, `exp2`, `expm1`, `log`, `log2`, `log10`, `log1p`, `logb`, `ilogb`, `tgamma`, `lgamma`, `erf`, `erfc` and `f`/`l` forms | |
 | `__builtin_modf`, `frexp`, `ldexp` and `f`/`l` forms | The second parameter is a pointer or an `int` |
 | `__builtin_ceill`, `floorl`, `truncl`, `roundl`, `rintl`, `nearbyintl`, `fminl`, `fmaxl`, `fmal` | The `long double` forms of functions computed in place |
@@ -495,8 +545,12 @@ incompatible declaration keep the bare name's call.
   `s` is `strcpy(d, s)`.
 - `printf`, `fprintf`, `vprintf`, `vfprintf`, `fputs`, their `_unlocked`
   forms and `__printf_chk`, `__vprintf_chk`, `__fprintf_chk`,
-  `__vfprintf_chk` (`stdio.rs`), result unused: `printf("")` goes,
-  `printf("x")` is `putchar('x')`, `printf("text\n")` and `printf("%s\n", s)`
+  `__vfprintf_chk` (`stdio.rs`), result unused: a write of nothing --
+  `printf("")`, `printf("%s", "")`, `fprintf(fp, "")`,
+  `fprintf(fp, "%s", "")`, `fputs("", fp)`, an empty `v` format -- goes,
+  its arguments still evaluated, as gcc deletes it, although C17 7.21.2p4
+  has even an empty write orient the stream; `printf("x")` is
+  `putchar('x')`, `printf("text\n")` and `printf("%s\n", s)`
   are `puts`, `printf("%c", c)` is `putchar(c)`; `fprintf(fp, "text")` and
   `fprintf(fp, "%s", s)` are `fputs`, `fprintf(fp, "%c", c)` is `fputc`;
   `fputs` of a known string is nothing, `fputc` or `fwrite`. The `v` forms
@@ -507,17 +561,27 @@ incompatible declaration keep the bare name's call.
 
 | Builtin | Description |
 |---------|-------------|
-| `__builtin_object_size(ptr, type)` | Bytes left in the object `ptr` points into, folded **at parse time** (`parse_object_size`) from what the expression shows: an array, a string literal, `&lvalue`, member and constant-index chains, casts and constant pointer arithmetic. Unknown is `(size_t)-1` for types 0/1 and 0 for 2/3. `type` must be an integer constant from 0 to 3 |
+| `__builtin_object_size(ptr, type)` | Bytes left in the object `ptr` points into. Folded at parse time (`parse_object_size`) from what the expression shows: an array, a string literal, `&lvalue`, member and constant-index chains, casts and constant pointer arithmetic. Anything else becomes `Opcode::ObjectSize` at `-O1`+, answered by `ir::objsize` after inlining by walking the pointer back through copies, constant displacements, `?:` and phis to a local, a named object, a string literal or a constant `alloca` -- the largest arm for types 0/1, the smallest for 2/3. Unknown is `(size_t)-1` for types 0/1 and 0 for 2/3, given at `-O0`, for an operand with side effects, and for whatever the walk cannot see once the optimizer has converged. Type 1 through the IR is the whole object's remaining size, and type 3 is 0 (see `DECISIONS.md`). `type` must be an integer constant from 0 to 3 |
 | `__builtin_dynamic_object_size(ptr, type)` | The same builtin: every static answer is a correct one for it, and c17 gives no run-time sizes |
-| `__builtin___memcpy_chk`, `memmove_chk`, `mempcpy_chk`, `memset_chk` | Calls to `__memcpy_chk` etc. |
+| `__builtin___memcpy_chk`, `memmove_chk`, `mempcpy_chk`, `memset_chk` | Calls to `__memcpy_chk` etc., decided at `-O1`+ as below |
 | `__builtin___strcpy_chk`, `stpcpy_chk`, `strncpy_chk`, `stpncpy_chk`, `strcat_chk`, `strncat_chk` | |
-| `__builtin___printf_chk`, `fprintf_chk`, `sprintf_chk`, `snprintf_chk`, `vsprintf_chk`, `vsnprintf_chk` | |
+| `__builtin___sprintf_chk`, `snprintf_chk`, `vsprintf_chk`, `vsnprintf_chk` | |
+| `__builtin___printf_chk`, `fprintf_chk` | Folded with their plain forms (`stdio.rs`) |
 
-With `_FORTIFY_SOURCE` set and `-O`, glibc's fortified wrappers compile and
-emit `__*_chk` calls, but check nothing useful: a wrapper asks
-`__builtin_object_size` of its own parameter, which at parse time is
-unknown. Folding it after inlining is the remaining work; see the
-`_FORTIFY_SOURCE` entry in `DECISIONS.md`.
+With `_FORTIFY_SOURCE` set and `-O`, glibc's fortified wrappers are inlined
+and their `__builtin_object_size` answered for the caller's object. A `_chk`
+call is then the plain function (`libcall_fold/fortify.rs`, one table-driven
+rule, gcc's) where the size is `(size_t)-1`, or where what it writes is known
+to fit: a constant length or the largest of a choice of constants, a known
+string or the longest of several with its terminator, an empty `strcat` or
+one onto a destination string of known length, a
+`sprintf`/`vsprintf` format with no directive or `sprintf`'s `"%s"` of a
+known string. The `printf` forms drop the check under a nonzero flag only for
+a format with no directive but `"%s"`. Otherwise the check stays, and a
+provable overflow aborts at run time; a `__strcpy_chk` of a known string is
+`__memcpy_chk` of its length and terminator. With the result unused,
+`__mempcpy_chk`, `__stpcpy_chk` and `__stpncpy_chk` are first `__memcpy_chk`,
+`__strcpy_chk` and `__strncpy_chk`. At `-O0` every check stays.
 
 ## Atomic Builtins
 
@@ -601,12 +665,7 @@ Their absence is silent and changes which branch a guarded header takes.
 
 | Builtin | Consequence |
 |---------|-------------|
-| `__builtin_setjmp`, `__builtin_longjmp` | Use `setjmp`/`longjmp`, which are builtins (above) |
 | `__builtin_strnlen`, `__builtin_vprintf`, `__builtin_vfprintf` | `strnlen`, `vprintf`, `vfprintf` are known by their bare names only |
-| `__builtin_clear_padding` | Would have to walk a type to find its padding |
-| `__builtin_issignaling` | `<math.h>` defines `issignaling` itself, so nothing fails to build |
-| `__builtin_stack_save`, `__builtin_stack_restore` | c17 frees a VLA at the end of its block without them. The IR has `StackSave`/`StackRestore` for inlining, but no builtin reaches them |
-| `__builtin_cexpi`, `__builtin_cpow` | Complex libm entry points gcc synthesizes; no header declares them |
 | `__builtin_bswap128` | No 128-bit byte swap |
 
 ## Adding a Builtin

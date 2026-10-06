@@ -202,6 +202,19 @@ pub enum ArgClass {
         /// Original size in bits
         size_bits: u32,
     },
+    /// On the stack by value, in the next stacked-argument slot, whatever
+    /// registers remain -- and with it every later argument that would have
+    /// taken a general register, as when stage C.11 sets NGRN to 8. The V
+    /// registers stay available.
+    ///
+    /// AAPCS64 only, and only for the carrier of a floating vector of four
+    /// bytes or fewer ([`crate::types::TypeTable::vector_stack_carrier`]):
+    /// gcc gives such a vector neither register class and lays it on the
+    /// stack, like no C type.
+    Stacked {
+        /// Size in bytes of the value.
+        size_bytes: usize,
+    },
     /// x87 FPU return (long double returned in ST(0)).
     /// Only used for return values on x86-64.
     X87 {
@@ -294,15 +307,16 @@ pub trait Abi {
     /// The type a GNU vector of type `vec` travels as under this
     /// convention: one whose own passing and returning are gcc's for the
     /// vector, so every path built for that type -- in the linearizer, both
-    /// backends and `va_arg` -- serves the vector unchanged. `None` for a
-    /// vector gcc passes in a way no type here does.
-    fn vector_carrier(&self, vec: TypeId, types: &TypeTable) -> Option<TypeId>;
+    /// backends and `va_arg` -- serves the vector unchanged. Every vector
+    /// has one: the declaration admits only a power-of-two lane count, so
+    /// every size is a register width or travels as an aggregate.
+    fn vector_carrier(&self, vec: TypeId, types: &TypeTable) -> TypeId;
 
     /// The type a GNU vector of type `vec` is *returned* as: its carrier
     /// ([`Self::vector_carrier`]), unless the convention returns it some
     /// other way than it passes it -- then the carrier of the vector it is
     /// widened to ([`Self::vector_return_widened`]), or a type of its own.
-    fn vector_return_carrier(&self, vec: TypeId, types: &TypeTable) -> Option<TypeId> {
+    fn vector_return_carrier(&self, vec: TypeId, types: &TypeTable) -> TypeId {
         match self.vector_return_widened(vec, types) {
             Some(widened) => self.vector_carrier(widened, types),
             None => self.vector_carrier(vec, types),
@@ -326,28 +340,24 @@ pub trait Abi {
 /// - more than sixteen as an aggregate of that size: in memory, or by
 ///   reference, and returned through a hidden pointer.
 ///
-/// Four bytes or fewer of floating lanes have no carrier: gcc passes
-/// `vector_size(4) float` in memory on System V and on the stack on AAPCS64,
-/// and returns it in a general register there -- like no C type.
-pub(crate) fn native_vector_carrier(vec: TypeId, types: &TypeTable) -> Option<TypeId> {
-    let bytes = types.size_bytes(vec);
-    let (lane, _) = types.vector_lanes(vec)?;
-    match bytes {
+/// Four bytes or fewer of floating lanes are where they part
+/// ([`TypeTable::is_small_float_vector`]), so each convention answers for
+/// those before it asks this.
+pub(crate) fn native_vector_carrier(vec: TypeId, types: &TypeTable) -> TypeId {
+    match types.size_bytes(vec) {
         17.. => types.vector_memory_carrier(vec),
-        16 => Some(types.float128_id),
-        8 => Some(types.double_id),
-        _ if types.is_float(lane) => None,
-        _ => types.unsigned_of_size(bytes),
+        16 => types.float128_id,
+        8 => types.double_id,
+        bytes => small_vector_bits(bytes, types),
     }
 }
 
-/// The class of a vector with no carrier (see [`Abi::vector_carrier`]): in
-/// memory.
-pub(crate) fn uncarried_vector_class(vec: TypeId, types: &TypeTable) -> ArgClass {
-    ArgClass::Indirect {
-        align: types.alignment(vec) as u32,
-        size_bytes: types.size_bytes(vec),
-    }
+/// The unsigned integer a vector of `bytes`, four or fewer, travels as: a
+/// lane count that is a power of two makes the width one, two or four.
+pub(crate) fn small_vector_bits(bytes: usize, types: &TypeTable) -> TypeId {
+    types
+        .unsigned_of_size(bytes)
+        .expect("a vector's size is a power of two")
 }
 
 // ABI Factory
@@ -655,16 +665,16 @@ mod tests {
             let v8si = types.vector_of(types.int_id, 8, None);
             let v1sf = types.vector_of(types.float_id, 1, None);
             let abi = get_abi(&target);
-            assert_eq!(abi.vector_carrier(v4si, &types), Some(types.float128_id));
-            assert_eq!(abi.vector_carrier(v2si, &types), Some(types.double_id));
-            assert_eq!(abi.vector_carrier(v2hi, &types), Some(types.uint_id));
+            assert_eq!(abi.vector_carrier(v4si, &types), types.float128_id);
+            assert_eq!(abi.vector_carrier(v2si, &types), types.double_id);
+            assert_eq!(abi.vector_carrier(v2hi, &types), types.uint_id);
             // A one-lane floating vector: in memory on System V, as a struct
-            // holding it; nothing travels like it on AAPCS64.
+            // holding it; on the stack on AAPCS64, as a type of its own.
             let v1df = types.vector_of(types.double_id, 1, None);
             match arch {
                 Arch::X86_64 => {
                     let wrapper = types.vector_wrapper_carrier(v1sf).unwrap();
-                    assert_eq!(abi.vector_carrier(v1sf, &types), Some(wrapper));
+                    assert_eq!(abi.vector_carrier(v1sf, &types), wrapper);
                     assert!(matches!(
                         abi.classify_param(v1sf, &types),
                         ArgClass::Indirect { .. }
@@ -675,17 +685,30 @@ mod tests {
                     ));
                 }
                 Arch::Aarch64 => {
-                    assert_eq!(abi.vector_carrier(v1sf, &types), None);
-                    assert_eq!(abi.vector_carrier(v1df, &types), Some(types.double_id));
+                    let stacked = types.vector_stack_carrier(v1sf);
+                    assert_eq!(abi.vector_carrier(v1sf, &types), stacked);
+                    assert_eq!(abi.vector_carrier(v1df, &types), types.double_id);
                 }
             }
-            let carrier = types.vector_memory_carrier(v8si).unwrap();
-            assert_eq!(abi.vector_carrier(v8si, &types), Some(carrier));
+            let carrier = types.vector_memory_carrier(v8si);
+            assert_eq!(abi.vector_carrier(v8si, &types), carrier);
             assert_eq!(types.size_bytes(carrier), 32);
             assert_eq!(types.alignment(carrier), types.alignment(v8si));
+            // A written alignment, raised or lowered, moves no argument: gcc
+            // passes the main variant.
+            for align in [16, 64] {
+                let written = types.vector_of(types.int_id, 8, Some(align));
+                assert_eq!(types.alignment(written), align as usize);
+                assert_eq!(abi.vector_carrier(written, &types), carrier);
+                let one = types.vector_of(types.float_id, 1, Some(align));
+                assert_eq!(
+                    abi.vector_carrier(one, &types),
+                    abi.vector_carrier(v1sf, &types)
+                );
+            }
             // Classified as the carrier is, and in agreement with it.
             for v in [v4si, v2si, v2hi, v8si] {
-                let c = abi.vector_carrier(v, &types).unwrap();
+                let c = abi.vector_carrier(v, &types);
                 assert_eq!(abi.classify_param(v, &types), abi.classify_param(c, &types));
                 assert_eq!(
                     abi.classify_return(v, &types),
@@ -713,6 +736,7 @@ mod tests {
                     member_align: 16,
                     is_complete: true,
                     transparent: false,
+                    reverse_order: false,
                     anon_id: None,
                     tag_type: None,
                 })),
@@ -739,7 +763,8 @@ mod tests {
     }
 
     /// Darwin's compiler is clang, which passes an integer vector of four
-    /// bytes or fewer in a general register, as gcc does, but returns it in
+    /// bytes or fewer in a general register as gcc does -- but as `i32`
+    /// whatever its size, where gcc uses its own size -- and returns it in
     /// V0: one lane in its low bits, several widened to fill eight bytes.
     /// Linux keeps gcc's general register both ways.
     #[test]
@@ -757,9 +782,16 @@ mod tests {
             let v2si = types.vector_of(types.int_id, 2, None);
             let abi = get_abi(&target);
             for v in [v2hi, v2qi, v4qi, v1si, v1qi] {
-                let param = abi.vector_carrier(v, &types).unwrap();
+                let param = abi.vector_carrier(v, &types);
                 assert!(types.is_integer(param), "{os:?}: passed in a GPR");
-                let ret = abi.vector_return_carrier(v, &types).unwrap();
+                // clang's `i32`, whatever the vector's size; gcc's integer
+                // of its own size.
+                let want = match os {
+                    Os::MacOS => types.uint_id,
+                    _ => types.unsigned_of_size(types.size_bytes(v)).unwrap(),
+                };
+                assert_eq!(param, want, "{os:?}");
+                let ret = abi.vector_return_carrier(v, &types);
                 assert_eq!(types.is_float(ret), os == Os::MacOS, "{os:?}");
                 assert_eq!(
                     abi.classify_return(v, &types),
@@ -773,21 +805,83 @@ mod tests {
                     let (lane, count) = types.vector_lanes(w).unwrap();
                     assert_eq!(count, types.vector_lanes(v).unwrap().1);
                     assert_eq!(types.size_bytes(lane), lane_bytes);
-                    assert_eq!(abi.vector_return_carrier(v, &types), Some(types.double_id));
+                    assert_eq!(abi.vector_return_carrier(v, &types), types.double_id);
                 }
                 assert_eq!(widened(v1si), None);
-                assert_eq!(
-                    abi.vector_return_carrier(v1qi, &types),
-                    Some(types.float_id)
-                );
+                assert_eq!(abi.vector_return_carrier(v1qi, &types), types.float_id);
             } else {
                 assert_eq!(widened(v2hi), None);
             }
             assert_eq!(widened(v2si), None);
-            assert_eq!(
-                abi.vector_return_carrier(v2si, &types),
-                Some(types.double_id)
-            );
+            assert_eq!(abi.vector_return_carrier(v2si, &types), types.double_id);
+        }
+    }
+
+    /// A floating vector of four bytes or fewer, by each compiler's rule:
+    /// gcc's AAPCS64 stacks it and returns it in W0, clang on Darwin passes
+    /// it in a general register and returns it in V0, and gcc's System V
+    /// carries `v2hf` in XMM0 -- the one-lane shapes go in memory there.
+    #[test]
+    fn test_small_float_vector_classification() {
+        use crate::target::Os;
+        use crate::types::TypeTable;
+        for (arch, os) in [
+            (Arch::Aarch64, Os::Linux),
+            (Arch::Aarch64, Os::MacOS),
+            (Arch::X86_64, Os::Linux),
+        ] {
+            let target = Target::new(arch, os);
+            let mut types = TypeTable::new(&target);
+            let v1sf = types.vector_of(types.float_id, 1, None);
+            let v2hf = types.vector_of(types.float16_id, 2, None);
+            let v1hf = types.vector_of(types.float16_id, 1, None);
+            let abi = get_abi(&target);
+            for v in [v1sf, v2hf, v1hf] {
+                assert!(types.is_small_float_vector(v));
+                let bytes = types.size_bytes(v);
+                let param = abi.vector_carrier(v, &types);
+                let ret = abi.vector_return_carrier(v, &types);
+                match (arch, os) {
+                    (Arch::Aarch64, Os::Linux) => {
+                        assert_eq!(param, types.vector_stack_carrier(v));
+                        assert!(types.is_vector_stack_carrier(param));
+                        assert_eq!(
+                            abi.classify_param(v, &types),
+                            ArgClass::Stacked { size_bytes: bytes }
+                        );
+                        assert_eq!(Some(ret), types.unsigned_of_size(bytes));
+                    }
+                    (Arch::Aarch64, _) => {
+                        assert_eq!(param, types.uint_id);
+                        let want = if bytes == 2 {
+                            types.float16_id
+                        } else {
+                            types.float_id
+                        };
+                        assert_eq!(ret, want);
+                    }
+                    _ => {
+                        if v == v2hf {
+                            assert_eq!(param, types.float_id);
+                            assert_eq!(ret, types.float_id);
+                        } else {
+                            assert_eq!(Some(param), types.vector_wrapper_carrier(v));
+                            assert!(matches!(
+                                abi.classify_param(v, &types),
+                                ArgClass::Indirect { .. }
+                            ));
+                        }
+                    }
+                }
+                assert_eq!(
+                    abi.classify_return(v, &types),
+                    abi.classify_return(ret, &types)
+                );
+            }
+            // An integer vector that small is untouched by any of it.
+            let v2hi = types.vector_of(types.short_id, 2, None);
+            assert!(!types.is_small_float_vector(v2hi));
+            assert_eq!(abi.vector_carrier(v2hi, &types), types.uint_id);
         }
     }
 
@@ -801,8 +895,8 @@ mod tests {
         let v4si = types.vector_of(types.int_id, 4, None);
         let v2sf = types.vector_of(types.float_id, 2, None);
         let abi = get_abi_for_conv(CallingConv::Win64, &target);
-        assert_eq!(abi.vector_carrier(v4si, &types), Some(types.int128_id));
-        assert_eq!(abi.vector_carrier(v2sf, &types), Some(types.ulong_id));
+        assert_eq!(abi.vector_carrier(v4si, &types), types.int128_id);
+        assert_eq!(abi.vector_carrier(v2sf, &types), types.ulong_id);
         assert_eq!(
             abi.classify_return(v4si, &types),
             ArgClass::Direct {
@@ -810,5 +904,40 @@ mod tests {
                 size_bits: 128
             }
         );
+        // gcc passes a one-lane floating vector by reference whatever its
+        // size, and returns it by its size: RAX up to eight bytes, the
+        // hidden pointer at sixteen.
+        let integer = |bits| ArgClass::Direct {
+            classes: vec![RegClass::Integer],
+            size_bits: bits,
+        };
+        for (lane, bits) in [
+            (types.float16_id, 16),
+            (types.float_id, 32),
+            (types.double_id, 64),
+            (types.float128_id, 128),
+        ] {
+            let v = types.vector_of(lane, 1, None);
+            let bytes = bits as usize / 8;
+            let by_reference = ArgClass::Indirect {
+                align: bytes as u32,
+                size_bytes: bytes,
+            };
+            assert_eq!(abi.classify_param(v, &types), by_reference, "{bits}");
+            let ret = abi.classify_return(v, &types);
+            match types.unsigned_of_size(bytes) {
+                Some(bits_of) => {
+                    assert_eq!(ret, abi.classify_return(bits_of, &types), "{bits}");
+                }
+                None => assert_eq!(ret, by_reference),
+            }
+        }
+        // Several floating lanes, or integer ones, travel by value.
+        let v2hf = types.vector_of(types.float16_id, 2, None);
+        let v1si = types.vector_of(types.int_id, 1, None);
+        for v in [v2hf, v1si] {
+            assert_eq!(abi.classify_param(v, &types), integer(32));
+            assert_eq!(abi.classify_return(v, &types), integer(32));
+        }
     }
 }

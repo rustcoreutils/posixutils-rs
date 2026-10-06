@@ -75,8 +75,8 @@ struct sv4 gs4(struct sv4 x);
 struct sv5 gs5(struct sv5 x);
 /* One lane of `double`, `long long` or `float`: gcc passes these in memory on
    System V, and a struct holding one small enough to fit a register is
-   memory class there too. The aarch64 one-float vector is a gcc quirk c17
-   does not reproduce, so it is x86-64 only. */
+   memory class there too. The one-float vector is x86-64 only here; every
+   target's rule for it is `SMALL_DECLS`'s. */
 typedef double v1df __attribute__((vector_size(8)));
 typedef long long v1di __attribute__((vector_size(8)));
 struct s1df { v1df a; int i; };
@@ -287,6 +287,414 @@ fn vector_abi_interop_aarch64() {
         &format!("{DECLS}{CALLEE}"),
         &format!("{DECLS}{CALLER}int main(void) {{ return run_vectors(); }}\n"),
     );
+}
+
+/// Floating vectors of four bytes or fewer -- `v1sf`, `v2hf`, `v1hf` -- which
+/// no machine register width describes, so each compiler has its own rule:
+///
+/// - gcc on aarch64 lays each one on the stack, in an eight-byte slot, and
+///   sends every later general-register argument there too (NGRN becomes
+///   8) while the V registers stay available; it returns one in W0.
+/// - clang on Darwin passes one in a general register and returns it in V0.
+/// - gcc on System V passes a one-lane one in memory and `v2hf` in XMM0.
+///
+/// Clang on x86-64 differs from gcc, so Apple x86-64 sits this out
+/// (`GCC_VECTORS`); on Apple arm64 the other half is clang, which is the
+/// point.
+const SMALL_DECLS: &str = r#"
+#if !defined(__APPLE__) || defined(C17_ALONE) || defined(__aarch64__)
+#define SMALL_FLOAT_VECTORS 1
+#endif
+#ifdef SMALL_FLOAT_VECTORS
+typedef float v1sf __attribute__((vector_size(4)));
+typedef _Float16 v2hf __attribute__((vector_size(4)));
+typedef _Float16 v1hf __attribute__((vector_size(2)));
+v1sf sf_ret(float x);
+v2hf hf2_ret(_Float16 x, _Float16 y);
+v1hf hf1_ret(_Float16 x);
+float sf_arg(v1sf a);
+float hf2_arg(v2hf a);
+float hf1_arg(v1hf a);
+double sf_mix(int i, v1sf a, float f, long l, v1sf b, double d, int j);
+double hf_mix(v2hf a, int i, v1hf b, float f, long l);
+double sf_full(long a, long b, long c, long d, long e, long f, long g, long h,
+               v1sf v, long k, float z);
+double sf_many(v1sf a0, v1sf a1, v1sf a2, v1sf a3, v1sf a4, v1sf a5,
+               v1sf a6, v1sf a7, v1sf a8, v1sf a9, int k, float z);
+double hf_many(v2hf a0, v1hf a1, v2hf a2, v1hf a3, v2hf a4, v1hf a5,
+               v2hf a6, v1hf a7, v2hf a8, v1hf a9, double d, long l);
+v1sf sf_chain(v1sf a, int k, v1sf b);
+v2hf hf2_chain(v2hf a, int k);
+v1hf hf1_chain(int k, v1hf a);
+/* A struct holding one is an ordinary composite on aarch64, and classed by
+   the vector's own SSE eightbyte on System V. */
+struct sa { v1sf a; float f; };
+struct sb { v2hf a; int i; };
+struct sc { v1hf a, b; };
+struct sa gsa(struct sa x, int k);
+struct sb gsb(struct sb x);
+struct sc gsc(struct sc x);
+#endif
+"#;
+
+const SMALL_CALLEE: &str = r#"
+#ifdef SMALL_FLOAT_VECTORS
+v1sf sf_ret(float x) { v1sf r = {x * 2}; return r; }
+v2hf hf2_ret(_Float16 x, _Float16 y) { v2hf r = {x + 1, y * 2}; return r; }
+v1hf hf1_ret(_Float16 x) { v1hf r = {x - 1}; return r; }
+float sf_arg(v1sf a) { return a[0] + 1; }
+float hf2_arg(v2hf a) { return (float)a[0] * 10 + (float)a[1]; }
+float hf1_arg(v1hf a) { return (float)a[0] * 3; }
+double sf_mix(int i, v1sf a, float f, long l, v1sf b, double d, int j)
+{ return i + a[0] * 10 + f * 100 + l * 1000 + b[0] * 10000 + d * 100000 + j * 1000000.0; }
+double hf_mix(v2hf a, int i, v1hf b, float f, long l)
+{ return (double)a[0] + a[1] * 10 + i * 100 + b[0] * 1000 + f * 10000 + l * 100000.0; }
+double sf_full(long a, long b, long c, long d, long e, long f, long g, long h,
+               v1sf v, long k, float z)
+{ return a + b * 2 + c * 3 + d * 4 + e * 5 + f * 6 + g * 7 + h * 8 + v[0] * 100 + k * 1000 + z * 10000.0; }
+double sf_many(v1sf a0, v1sf a1, v1sf a2, v1sf a3, v1sf a4, v1sf a5,
+               v1sf a6, v1sf a7, v1sf a8, v1sf a9, int k, float z)
+{
+    return a0[0] + a1[0] * 2 + a2[0] * 3 + a3[0] * 4 + a4[0] * 5 + a5[0] * 6
+         + a6[0] * 7 + a7[0] * 8 + a8[0] * 9 + a9[0] * 10 + k * 1000 + z * 10000.0;
+}
+double hf_many(v2hf a0, v1hf a1, v2hf a2, v1hf a3, v2hf a4, v1hf a5,
+               v2hf a6, v1hf a7, v2hf a8, v1hf a9, double d, long l)
+{
+    return a0[0] + a0[1] * 2 + a1[0] * 3 + a2[1] * 4 + a3[0] * 5 + a4[0] * 6
+         + a5[0] * 7 + a6[1] * 8 + a7[0] * 9 + a8[0] * 10 + a8[1] * 11
+         + a9[0] * 12 + d * 1000 + l * 10000.0;
+}
+v1sf sf_chain(v1sf a, int k, v1sf b) { return a * b + (float)k; }
+v2hf hf2_chain(v2hf a, int k) { v2hf r = {a[1] + k, a[0] - k}; return r; }
+v1hf hf1_chain(int k, v1hf a) { v1hf r = {a[0] * (_Float16)k}; return r; }
+struct sa gsa(struct sa x, int k) { x.a += x.f; x.f = k; return x; }
+struct sb gsb(struct sb x) { x.a[0] += 1; x.i++; return x; }
+struct sc gsc(struct sc x) { struct sc r = {x.b, x.a}; return r; }
+#endif
+"#;
+
+const SMALL_CALLER: &str = r#"
+#ifdef SMALL_FLOAT_VECTORS
+/* Inlined at -O2: the inlined body reads the vector from the address the
+   call passes, as the out-of-line callee reads its stacked bytes. */
+static v1sf local_sf(v1sf a, long n, v1sf b) { return a * 2 + b + (float)n; }
+static v2hf local_hf(int k, v2hf a) { v2hf r = {a[1] + k, a[0]}; return r; }
+#endif
+static int run_small(void) {
+#ifdef SMALL_FLOAT_VECTORS
+    v1sf s1 = {1.5f}, s2 = {2.0f}, s3 = {3.0f};
+    v2hf h2 = {2, 3};
+    v1hf h1 = {4};
+    if (sf_ret(1.25f)[0] != 2.5f) return 1;
+    v2hf r2 = hf2_ret(2, 3);
+    if (r2[0] != 3 || r2[1] != 6) return 2;
+    if (hf1_ret(5)[0] != 4) return 3;
+    if (sf_arg(s1) != 2.5f) return 4;
+    if (hf2_arg(h2) != 23) return 5;
+    if (hf1_arg(h1) != 12) return 6;
+    if (sf_mix(1, s2, 3.0f, 4, s3, 5.0, 6) != 6534321.0) return 7;
+    if (hf_mix(h2, 4, h1, 5.0f, 6) != 654432.0) return 8;
+    if (sf_full(1, 1, 1, 1, 1, 1, 1, 1, s2, 3, 4.0f) != 43236.0) return 9;
+    v1sf o = {1.0f};
+    if (sf_many(o, o, o, o, o, o, o, o, s2, s3, 5, 6.0f) != 65084.0) return 10;
+    if (hf_many(h2, h1, h2, h1, h2, h1, h2, h1, h2, h1, 7.0, 8) != 87253.0) return 11;
+    v1sf c = sf_chain(s2, 7, s3);
+    if (c[0] != 13.0f) return 12;
+    v2hf c2 = hf2_chain(h2, 1);
+    if (c2[0] != 4 || c2[1] != 1) return 13;
+    if (hf1_chain(3, h1)[0] != 12) return 14;
+    struct sa ta = gsa((struct sa){{1.5f}, 2.0f}, 7);
+    if (ta.a[0] != 3.5f || ta.f != 7) return 15;
+    struct sb tb = gsb((struct sb){{2, 3}, 4});
+    if (tb.a[0] != 3 || tb.a[1] != 3 || tb.i != 5) return 16;
+    struct sc tc = gsc((struct sc){{1}, {2}});
+    if (tc.a[0] != 2 || tc.b[0] != 1) return 17;
+    if (local_sf(s1, 3, s2)[0] != 8.0f) return 18;
+    v2hf lh = local_hf(5, h2);
+    if (lh[0] != 8 || lh[1] != 2) return 19;
+#endif
+    return 0;
+}
+"#;
+
+/// The floating vectors of four bytes or fewer (`SMALL_DECLS`) against the
+/// host compiler in every pairing.
+#[test]
+fn vector_abi_small_float_interop_host() {
+    let caller = format!("{SMALL_DECLS}{SMALL_CALLER}int main(void) {{ return run_small(); }}\n");
+    interop_host(
+        "vec_small_float",
+        &format!("{SMALL_DECLS}{SMALL_CALLEE}"),
+        &caller,
+    );
+}
+
+/// The floating vectors of four bytes or fewer against aarch64 gcc in every
+/// pairing, under qemu. Exit codes 1..=19 name the check in `SMALL_CALLER`.
+#[test]
+fn vector_abi_small_float_interop_aarch64() {
+    if !aarch64_cross_available() {
+        return;
+    }
+    interop_aarch64(
+        "vec_small_float",
+        &format!("{SMALL_DECLS}{SMALL_CALLEE}"),
+        &format!("{SMALL_DECLS}{SMALL_CALLER}int main(void) {{ return run_small(); }}\n"),
+    );
+}
+
+/// Vectors whose alignment is written -- raised by a typedef, raised or
+/// lowered beside `vector_size` -- travel as their natural shape does: gcc
+/// passes a vector as its main variant. A `typedef v8si w
+/// __attribute__((aligned(64)))` was refused at every call boundary, and a
+/// 64-byte-aligned `v8si` or a 16-byte-aligned `v1sf` started on its own
+/// boundary on the stack where gcc starts it on the natural one.
+const ALIGNED_DECLS: &str = r#"
+typedef int v8si __attribute__((vector_size(32)));
+typedef v8si w8si __attribute__((aligned(64)));
+typedef int l8si __attribute__((vector_size(32), aligned(16)));
+typedef int a8si __attribute__((vector_size(32), aligned(64)));
+typedef a8si t8si __attribute__((aligned(128)));
+typedef float v1sf __attribute__((vector_size(4)));
+typedef v1sf w1sf __attribute__((aligned(16)));
+typedef float a1sf __attribute__((vector_size(4), aligned(16)));
+typedef int a4si __attribute__((vector_size(16), aligned(64)));
+typedef short v2hi __attribute__((vector_size(4)));
+typedef v2hi w2hi __attribute__((aligned(16)));
+int f8(int a, v8si v, int b, v8si w);
+int w8(int a, w8si v, int b, w8si w);
+int l8(int a, l8si v, int b, l8si w);
+int a8(long x1, long x2, long x3, long x4, long x5, long x6, int a, a8si v, int b, a8si w);
+int t8(int a, t8si v, int b, t8si w);
+float w1(int a, w1sf v, double d, w1sf w, int b);
+float a1(int a, a1sf v, int b, a1sf w);
+int a4(int a, a4si v, int b, a4si w);
+int w2(int a, w2hi v, int b, w2hi w);
+a8si ra8(int k);
+w8si rw8(int k);
+w1sf rw1(float k);
+a4si ra4(int k);
+w2hi rw2(short k);
+"#;
+
+const ALIGNED_CALLEE: &str = r#"
+int f8(int a, v8si v, int b, v8si w) { return a + v[1] + b * 10 + w[2] * 100; }
+int w8(int a, w8si v, int b, w8si w) { return a + v[1] + b * 10 + w[2] * 100; }
+int l8(int a, l8si v, int b, l8si w) { return a + v[1] + b * 10 + w[2] * 100; }
+int a8(long x1, long x2, long x3, long x4, long x5, long x6, int a, a8si v, int b, a8si w) {
+    return a + v[1] + b * 10 + w[2] * 100 + (int)(x1 + x6);
+}
+int t8(int a, t8si v, int b, t8si w) { return a + v[1] + b * 10 + w[2] * 100; }
+float w1(int a, w1sf v, double d, w1sf w, int b) { return a + v[0] + d + w[0] * 10 + b * 100; }
+float a1(int a, a1sf v, int b, a1sf w) { return a + v[0] + b * 10 + w[0] * 100; }
+int a4(int a, a4si v, int b, a4si w) { return a + v[1] + b * 10 + w[2] * 100; }
+int w2(int a, w2hi v, int b, w2hi w) { return a + v[1] + b * 10 + w[0] * 100; }
+a8si ra8(int k) { a8si v = {k, 2, 3, 4, 5, 6, 7, k * 9}; return v; }
+w8si rw8(int k) { w8si v = {k, 2, 3, 4, 5, 6, 7, k * 3}; return v; }
+w1sf rw1(float k) { w1sf v = {k * 3}; return v; }
+a4si ra4(int k) { a4si v = {k, k + 1, k + 2, k * 9}; return v; }
+w2hi rw2(short k) { w2hi v = {k, (short)(k * 3)}; return v; }
+"#;
+
+const ALIGNED_CALLER: &str = r#"
+int main(void) {
+    v8si v = {1, 2, 3, 4}, w = {5, 6, 7, 8};
+    w8si wv = {1, 2, 3, 4}, ww = {5, 6, 7, 8};
+    l8si lv = {1, 2, 3, 4}, lw = {5, 6, 7, 8};
+    a8si av = {1, 2, 3, 4}, aw = {5, 6, 7, 8};
+    t8si tv = {1, 2, 3, 4}, tw = {5, 6, 7, 8};
+    w1sf sv = {1.5f}, sw = {2.5f};
+    a1sf xv = {1.5f}, xw = {2.5f};
+    a4si qv = {1, 2, 3, 4}, qw = {5, 6, 7, 8};
+    w2hi hv = {3, 4}, hw = {5, 6};
+    if (f8(1, v, 2, w) != 723) return 1;
+    if (w8(1, wv, 2, ww) != 723) return 2;
+    if (l8(1, lv, 2, lw) != 723) return 3;
+    if (a8(10, 0, 0, 0, 0, 20, 1, av, 2, aw) != 753) return 4;
+    if (t8(1, tv, 2, tw) != 723) return 5;
+    if (w1(1, sv, 0.5, sw, 3) != 328.0f) return 6;
+    if (a1(1, xv, 2, xw) != 272.5f) return 7;
+    if (a4(1, qv, 2, qw) != 723) return 8;
+    if (w2(1, hv, 2, hw) != 525) return 9;
+    a8si r8 = ra8(3);
+    if (r8[0] != 3 || r8[7] != 27) return 10;
+    w8si s8 = rw8(4);
+    if (s8[0] != 4 || s8[7] != 12) return 11;
+    if (rw1(1.5f)[0] != 4.5f) return 12;
+    a4si r4 = ra4(4);
+    if (r4[1] != 5 || r4[3] != 36) return 13;
+    w2hi r2 = rw2(7);
+    if (r2[0] != 7 || r2[1] != 21) return 14;
+    return 0;
+}
+"#;
+
+/// The written-alignment vectors (`ALIGNED_DECLS`) against the host gcc in
+/// every pairing. Linux only: these are gcc's rules, and clang's for the
+/// wide and one-lane shapes are its own.
+#[cfg(target_os = "linux")]
+#[test]
+fn vector_abi_aligned_interop_host() {
+    interop_host(
+        "vec_aligned",
+        &format!("{ALIGNED_DECLS}{ALIGNED_CALLEE}"),
+        &format!("{ALIGNED_DECLS}{ALIGNED_CALLER}"),
+    );
+}
+
+/// The written-alignment vectors against aarch64 gcc in every pairing,
+/// under qemu. Exit codes 1..=14 name the check in `ALIGNED_CALLER`.
+#[test]
+fn vector_abi_aligned_interop_aarch64() {
+    if !aarch64_cross_available() {
+        return;
+    }
+    interop_aarch64(
+        "vec_aligned",
+        &format!("{ALIGNED_DECLS}{ALIGNED_CALLEE}"),
+        &format!("{ALIGNED_DECLS}{ALIGNED_CALLER}"),
+    );
+}
+
+/// Integer vectors of one and two bytes past the general registers. clang
+/// on Darwin passes each as `i32`, four bytes of the stack apiece; c17 used
+/// the integer of the vector's own size, which Darwin packs at one or two
+/// bytes, so every stacked argument after the first was misplaced. gcc
+/// gives each an eight-byte slot. The host pairing is the Darwin gate on
+/// Apple arm64, where the other compiler is clang.
+const SMALL_INT_DECLS: &str = r#"
+typedef char v2qi __attribute__((vector_size(2)));
+typedef short v1hi __attribute__((vector_size(2)));
+typedef unsigned char v1qi __attribute__((vector_size(1)));
+int many(v2qi a0, v2qi a1, v2qi a2, v2qi a3, v2qi a4, v2qi a5, v2qi a6, v2qi a7,
+         v2qi a8, v1hi h, v1qi q, v2qi a9, int k);
+"#;
+
+const SMALL_INT_CALLEE: &str = r#"
+int many(v2qi a0, v2qi a1, v2qi a2, v2qi a3, v2qi a4, v2qi a5, v2qi a6, v2qi a7,
+         v2qi a8, v1hi h, v1qi q, v2qi a9, int k) {
+    return a0[0] + a7[1] * 2 + a8[0] * 3 + a8[1] * 5 + h[0] * 7 + q[0] * 11
+        + a9[1] * 13 + k * 17;
+}
+"#;
+
+const SMALL_INT_CALLER: &str = r#"
+int main(void) {
+    v2qi a = {1, 2}, b = {3, 4}, c = {-5, 6};
+    v1hi h = {-300};
+    v1qi q = {200};
+    /* 1 + 4 + 9 + 20 - 2100 + 2200 + 78 + 17 */
+    if (many(a, a, a, a, a, a, a, a, b, h, q, c, 1) != 229) return 1;
+    return 0;
+}
+"#;
+
+/// The one- and two-byte integer vectors (`SMALL_INT_DECLS`) against the
+/// host compiler in every pairing.
+#[test]
+fn vector_abi_small_integer_stacked_interop_host() {
+    interop_host(
+        "vec_small_int",
+        &format!("{SMALL_INT_DECLS}{SMALL_INT_CALLEE}"),
+        &format!("{SMALL_INT_DECLS}{SMALL_INT_CALLER}"),
+    );
+}
+
+/// The one- and two-byte integer vectors against aarch64 gcc in every
+/// pairing, under qemu.
+#[test]
+fn vector_abi_small_integer_stacked_interop_aarch64() {
+    if !aarch64_cross_available() {
+        return;
+    }
+    interop_aarch64(
+        "vec_small_int",
+        &format!("{SMALL_INT_DECLS}{SMALL_INT_CALLEE}"),
+        &format!("{SMALL_INT_DECLS}{SMALL_INT_CALLER}"),
+    );
+}
+
+/// A floating vector of four bytes or fewer through `...` on aarch64 Linux.
+///
+/// gcc contradicts itself here: its caller lays the vector on the stack and
+/// moves NGRN to 8, as for a named one, while its `va_arg` reads the vector
+/// out of the general-register save area. c17's `va_arg` follows gcc's
+/// caller, so a gcc caller and c17 on both sides agree, and the one pairing
+/// left out -- a c17 caller of a gcc `va_arg` -- fails between two gcc units
+/// as well.
+#[test]
+fn vector_abi_small_float_variadic_aarch64() {
+    if !aarch64_cross_available() {
+        return;
+    }
+    const VA_CALLEE: &str = r#"
+#include <stdarg.h>
+typedef float v1sf __attribute__((vector_size(4)));
+typedef _Float16 v2hf __attribute__((vector_size(4)));
+typedef _Float16 v1hf __attribute__((vector_size(2)));
+double va_small(int n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    double s = 0;
+    for (int i = 0; i < n; i++) {
+        v1sf a = va_arg(ap, v1sf);
+        long l = va_arg(ap, long);
+        v2hf b = va_arg(ap, v2hf);
+        double d = va_arg(ap, double);
+        v1hf c = va_arg(ap, v1hf);
+        int k = va_arg(ap, int);
+        s = s * 10 + a[0] + l * 2 + b[0] * 3 + b[1] * 4 + d * 5 + c[0] * 6 + k * 7;
+    }
+    va_end(ap);
+    return s;
+}
+"#;
+    const VA_CALLER: &str = r#"
+typedef float v1sf __attribute__((vector_size(4)));
+typedef _Float16 v2hf __attribute__((vector_size(4)));
+typedef _Float16 v1hf __attribute__((vector_size(2)));
+double va_small(int n, ...);
+int main(void) {
+    v1sf a = {1.0f};
+    v2hf b = {2, 3};
+    v1hf c = {4};
+    /* 1 + 2 + 6 + 12 + 5 + 24 + 7 = 57; then 570 + 57 */
+    if (va_small(1, a, 1L, b, 1.0, c, 1) != 57.0) return 1;
+    if (va_small(2, a, 1L, b, 1.0, c, 1, a, 1L, b, 1.0, c, 1) != 627.0) return 2;
+    return 0;
+}
+"#;
+    let dir = plib::tmp::Builder::new()
+        .prefix("vec_small_va_")
+        .tempdir()
+        .unwrap();
+    let callee_c = crate::common::create_c_file("vec_small_va_callee", VA_CALLEE);
+    let caller_c = crate::common::create_c_file("vec_small_va_caller", VA_CALLER);
+    let callee_src = callee_c.path().to_string_lossy().into_owned();
+    let caller_src = caller_c.path().to_string_lossy().into_owned();
+    for opt in ["-O0", "-O2"] {
+        let asm = |src: &str, n: &str| {
+            let s = dir.path().join(format!("{n}{opt}.s"));
+            let mut args = crate::common::AARCH64_TARGET_ARGS.to_vec();
+            args.extend_from_slice(&[opt, "-w", "-S", "-o", s.to_str().unwrap(), src]);
+            let run = crate::common::run_c17(&args);
+            assert!(run.success, "c17 failed on {n}:\n{}", run.stderr);
+            s.to_string_lossy().into_owned()
+        };
+        let callee_s = asm(&callee_src, "callee");
+        let caller_s = asm(&caller_src, "caller");
+        assert_eq!(
+            crate::common::cross_link_and_run("vec_small_va_cc", &[&caller_s, &callee_s]),
+            0,
+            "c17 both, {opt}"
+        );
+        assert_eq!(
+            crate::common::cross_link_and_run("vec_small_va_gc", &[&caller_src, &callee_s]),
+            0,
+            "gcc caller, c17 callee, {opt}"
+        );
+    }
 }
 
 /// Win64 passes a sixteen-byte vector by reference and returns it in XMM0,

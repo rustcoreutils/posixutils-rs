@@ -91,6 +91,37 @@ pub struct PositionIndependence {
     pub pie: bool,
 }
 
+/// `-fcf-protection`: which of Intel CET's two protections x86-64 code is
+/// built to cooperate with. The default is neither, as Debian's gcc has it.
+///
+/// c17 honours it only where code built by another compiler reads what c17
+/// wrote: gcc's `__builtin_setjmp` buffer, whose layout and `longjmp`
+/// sequence follow `ret`, and whose resume point starts with `endbr64`
+/// under `branch`. Nothing else c17 emits changes with it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CfProtection {
+    /// Indirect-branch tracking: an indirect jump lands on an `endbr64`.
+    pub branch: bool,
+    /// The shadow stack: return addresses are kept on a second stack.
+    pub ret: bool,
+}
+
+impl CfProtection {
+    /// The protection `-fcf-protection=<level>` selects, or `None` for a
+    /// level gcc does not have. `check` concerns only gcc's link-time
+    /// optimization, and gcc builds under it what it builds under `none`.
+    pub fn from_level(level: &str) -> Option<Self> {
+        let (branch, ret) = match level {
+            "none" | "check" => (false, false),
+            "branch" => (true, false),
+            "return" => (false, true),
+            "full" => (true, true),
+            _ => return None,
+        };
+        Some(Self { branch, ret })
+    }
+}
+
 /// The x86-64 SIMD extensions code may assume beyond the SSE2 baseline,
 /// in order: each implies the ones before it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -607,6 +638,16 @@ impl TlsAccess {
     }
 }
 
+/// The order in which the bytes of a multi-byte scalar lie in memory: what
+/// gcc's `scalar_storage_order` attribute and pragma name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteOrder {
+    /// Most significant byte first.
+    BigEndian,
+    /// Least significant byte first.
+    LittleEndian,
+}
+
 /// Target configuration
 #[derive(Debug, Clone)]
 pub struct Target {
@@ -687,6 +728,15 @@ impl Target {
     pub fn little_endian(&self) -> bool {
         match self.arch {
             Arch::X86_64 | Arch::Aarch64 => true,
+        }
+    }
+
+    /// The order this target stores the bytes of a scalar in.
+    pub fn byte_order(&self) -> ByteOrder {
+        if self.little_endian() {
+            ByteOrder::LittleEndian
+        } else {
+            ByteOrder::BigEndian
         }
     }
 

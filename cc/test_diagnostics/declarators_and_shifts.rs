@@ -1,5 +1,5 @@
 use crate::test_compile::{
-    compile, compile_expect_error, compile_expect_ok, compile_expect_warning,
+    compile, compile_expect_error, compile_expect_ok, compile_expect_warning, compile_rejected,
 };
 
 // ============================================================================
@@ -176,6 +176,84 @@ fn diagnostics_shift_count_in_range_is_silent() {
     }
 }
 
+/// A shift by a negative count is no constant expression: gcc warns and then
+/// refuses it wherever C requires one -- a static initializer at file or
+/// block scope, an enumerator, a `case` label, `_Static_assert`, a file-scope
+/// array size -- in these words. A count past the width is constant (it only
+/// warns), and so is a negative value shifted.
+#[test]
+fn diagnostics_negative_shift_count_is_not_constant() {
+    const INIT: &str = "initializer element is not constant";
+    for (name, src, expected) in [
+        ("negshift_file", "int x = 1 << -1;\n", INIT),
+        ("negshift_right_file", "int x = 1 >> -1;\n", INIT),
+        ("negshift_long_file", "long x = 1L >> -3;\n", INIT),
+        ("negshift_expr_file", "int x = 1 << (0 - 1);\n", INIT),
+        ("negshift_static_file", "static int x = 1 << -1;\n", INIT),
+        (
+            "negshift_static_block",
+            "int f(void) { static int x = 1 << -1; return x; }\n",
+            INIT,
+        ),
+        (
+            "negshift_enum",
+            "enum { E = 1 << -1 };\n",
+            "enumerator value for 'E' is not an integer constant",
+        ),
+        (
+            "negshift_static_assert",
+            "_Static_assert((1 << -1) || 1, \"\");\n",
+            "expression in static assertion is not constant",
+        ),
+        (
+            "negshift_case",
+            "int f(int v) { switch (v) { case 1 << -1: return 1; } return 0; }\n",
+            "case label is not an integer constant expression",
+        ),
+        (
+            "negshift_array_file",
+            "int a[1 << -1 ? 1 : 2];\n",
+            "variable length arrays cannot have file scope",
+        ),
+    ] {
+        let stderr = compile_rejected(name, src);
+        assert!(
+            stderr.contains("shift count is negative") && stderr.contains(expected),
+            "'{name}': expected the warning and {expected:?}.\nstderr:\n{stderr}"
+        );
+    }
+}
+
+/// The accept side: the same shift where no constant is required, a count
+/// past the width, a negative value shifted, and a negative count that is
+/// never evaluated.
+#[test]
+fn diagnostics_negative_shift_count_where_no_constant_is_needed() {
+    for (name, src) in [
+        (
+            "negshift_auto_ok",
+            "int f(void) { int x = 1 << -1; return x; }\n",
+        ),
+        ("bigshift_file_ok", "int x = 1 << 40;\n"),
+        ("bigshift_enum_ok", "enum { E = 1 << 40 };\n"),
+        ("bigshift_right_file_ok", "int x = 1 >> 40;\n"),
+        ("negvalue_file_ok", "int x = -1 << 1;\nint y = -1 >> 1;\n"),
+        ("negvalue_enum_ok", "enum { E = -1 << 1 };\n"),
+        (
+            "negvalue_static_block_ok",
+            "int f(void) { static int x = -1 << 1; return x; }\n",
+        ),
+        ("negshift_unevaluated_ok", "int x = 0 ? 1 << -1 : 2;\n"),
+        (
+            "negshift_short_circuit_ok",
+            "int x = 1 || (1 << -1);\nint y = 0 && (1 << -1);\n",
+        ),
+        ("negshift_sizeof_ok", "int x = sizeof(1 << -1);\n"),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}
+
 /// `-Wno-shift-count-overflow` and `-Wno-shift-count-negative` turn the two
 /// groups off separately, as gcc spells them.
 #[test]
@@ -276,15 +354,80 @@ fn diagnostics_vector_size_is_bounded() {
         "'vector_size' attribute argument value '9223372036854775808' exceeds \
          9223372036854775807",
     );
-    compile_expect_error(
-        "vector_size_negative",
-        "typedef float V __attribute__((vector_size(-16)));\nint main(void){ return 0; }\n",
-        "positive byte count",
-    );
-    compile_expect_error(
-        "vector_size_not_multiple",
-        "typedef double V __attribute__((vector_size(12)));\nint main(void){ return 0; }\n",
-        "not a multiple",
+}
+
+/// A `vector_size` declaration gcc refuses is refused in gcc's words: a
+/// width that is zero, negative or no whole number of lanes, a lane count
+/// that is not a power of two, and a lane that is complex or `_Bool`. The
+/// lane count is what makes every vector a convention has to pass one of
+/// its register or memory widths.
+#[test]
+fn diagnostics_vector_size_shapes_gcc_refuses() {
+    for (name, decl, expected) in [
+        (
+            "zero",
+            "short V __attribute__((vector_size(0)))",
+            "zero vector size",
+        ),
+        (
+            "negative",
+            "float V __attribute__((vector_size(-16)))",
+            "'vector_size' attribute argument value '-16' is negative",
+        ),
+        (
+            "not_multiple",
+            "short V __attribute__((vector_size(5)))",
+            "vector size not an integral multiple of component size",
+        ),
+        (
+            "three_shorts",
+            "short V __attribute__((vector_size(6)))",
+            "number of vector components 3 not a power of two",
+        ),
+        (
+            "three_chars",
+            "char V __attribute__((vector_size(3)))",
+            "number of vector components 3 not a power of two",
+        ),
+        (
+            "three_doubles",
+            "double V __attribute__((vector_size(24)))",
+            "number of vector components 3 not a power of two",
+        ),
+        (
+            "many_ints",
+            "int V __attribute__((vector_size(1536)))",
+            "number of vector components 384 not a power of two",
+        ),
+        (
+            "complex",
+            "_Complex float V __attribute__((vector_size(16)))",
+            "invalid vector type for attribute 'vector_size'",
+        ),
+        (
+            "bool",
+            "_Bool V __attribute__((vector_size(4)))",
+            "invalid vector type for attribute 'vector_size'",
+        ),
+    ] {
+        for form in ["typedef {D};\n", "{D} obj;\n", "struct S { {D}; };\n"] {
+            compile_expect_error(
+                &format!("vector_size_{name}"),
+                &format!(
+                    "{}int main(void){{ return 0; }}\n",
+                    form.replace("{D}", decl)
+                ),
+                expected,
+            );
+        }
+    }
+    compile_expect_ok(
+        "vector_size_powers_of_two",
+        "typedef char V1 __attribute__((vector_size(1)));\n\
+         typedef short V2 __attribute__((vector_size(4)));\n\
+         typedef double V4 __attribute__((vector_size(32)));\n\
+         typedef int V64 __attribute__((vector_size(256)));\n\
+         _Static_assert(sizeof(V1) + sizeof(V2) + sizeof(V4) + sizeof(V64) == 293, \"\");\n",
     );
 }
 
@@ -372,4 +515,23 @@ fn diagnostics_attribute_integer_arguments() {
              void *m(int) __attribute__((alloc_size(I), malloc));\n{main}"
         ),
     );
+}
+
+/// A decimal constant too large for any type draws gcc's one warning,
+/// "integer constant is too large for its type"; c17 added "so large that
+/// it is unsigned" about the truncated value.
+#[test]
+fn too_large_decimal_constant_warns_once() {
+    let out = crate::test_compile::compile_accepted(
+        "too_large_decimal",
+        "unsigned long long x = 123456789012345678901234567890;\n",
+        &[],
+    );
+    assert_eq!(
+        out.matches("integer constant is too large for its type")
+            .count(),
+        1,
+        "{out}"
+    );
+    assert!(!out.contains("so large that it is unsigned"), "{out}");
 }

@@ -605,7 +605,7 @@ fn diagnostics_repeated_declaration_parts_are_rejected() {
     compile_expect_error(
         "decl_extern_init_block",
         "void f(void){ extern int e = 1; (void)e; }\n",
-        "'extern' variable has an initializer",
+        "'e' has both 'extern' and initializer",
     );
 }
 
@@ -617,7 +617,29 @@ fn diagnostics_file_scope_extern_initializer_only_warns() {
     compile_expect_warning(
         "decl_extern_init_file",
         "extern int e = 1;\n",
-        "'extern' variable has an initializer",
+        "'e' initialized and declared 'extern'",
+    );
+}
+
+/// An initialized `extern` declaration is a definition (C17 6.9.2p1), so a
+/// second definition of the name is a redefinition, as gcc reports, and the
+/// object needs a complete type like any other definition.
+#[test]
+fn diagnostics_extern_definition_is_defined_once() {
+    compile_expect_error(
+        "decl_extern_def_redefined",
+        "extern int y = 5;\nint y = 6;\n",
+        "redefinition of 'y'",
+    );
+    compile_expect_error(
+        "decl_extern_def_redefined_extern",
+        "extern int y = 5;\nextern int y = 6;\n",
+        "redefinition of 'y'",
+    );
+    compile_expect_error(
+        "decl_extern_def_incomplete",
+        "struct T;\nextern struct T t = {0};\n",
+        "storage size",
     );
 }
 
@@ -663,4 +685,44 @@ fn diagnostics_ordinary_declarations_are_accepted() {
     ] {
         compile_expect_ok(name, src);
     }
+}
+
+/// GNU `&&a - &&b` is an integer the assembler writes at a data directive's
+/// width, so an object it cannot be written into is gcc's "not computable at
+/// load time": `_Bool` (which would need a comparison), a floating type and
+/// `__int128` (no directive is that wide). An integer is no address either,
+/// so a pointer stays a non-constant initializer. A label of another
+/// function is a label this one uses but never defines.
+#[test]
+fn diagnostics_label_difference_needs_an_integer_object() {
+    for typ in ["_Bool", "double", "__int128"] {
+        compile_expect_error(
+            "label_diff_bad_type",
+            &format!(
+                "int f(int i) {{ static const {typ} d[] = {{&&b - &&a}};\n\
+                 goto *(&&a + (long)d[i]); a: return 1; b: return 2; }}\n"
+            ),
+            "initializer element is not computable at load time",
+        );
+    }
+    compile_expect_error(
+        "label_diff_pointer",
+        "int f(void) { static void *p = (void *)(&&b - &&a);\n\
+         goto *p; a: return 1; b: return 2; }\n",
+        "non-constant pointer expression in global initializer",
+    );
+    compile_expect_error(
+        "label_diff_other_function",
+        "int g(void) { y: return 0; }\n\
+         int f(void) { static const int d[] = {&&a - &&y};\n\
+         goto *(&&a + d[0]); a: return 1; }\n",
+        "label 'y' used but not defined",
+    );
+    compile_expect_ok(
+        "label_diff_widths",
+        "int f(int i) { static const char c[] = {&&b - &&a};\n\
+         static const unsigned short s[] = {&&b - &&a};\n\
+         static const unsigned long long q[] = {&&b - &&a - 1};\n\
+         goto *(&&a + c[i] + s[i] + q[i]); a: return 1; b: return 2; }\n",
+    );
 }

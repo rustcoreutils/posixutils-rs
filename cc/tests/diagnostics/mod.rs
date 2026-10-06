@@ -1227,13 +1227,18 @@ int helper(int x) { return x + 1; }
 // What `-fpermissive` relaxes
 // ============================================================================
 
-/// A `vector_size` value passed to or returned from a function is refused
-/// only where the target's convention has no type that travels as gcc
-/// passes it: a one-lane `float` vector on aarch64. On x86-64 it goes in
-/// memory, as gcc's does, and every other vector goes as its carrier.
+/// Every vector a declaration admits is passed and returned: gcc refuses a
+/// lane count that is not a power of two where the type is declared, so
+/// each size left is a register width or an aggregate. A one-lane `float`
+/// vector goes on the stack on aarch64 and in memory on x86-64, as gcc
+/// passes it, and a vector whose alignment a typedef raises travels too --
+/// it had no carrier, and was refused.
 #[test]
-fn diagnostics_vector_passing_is_refused_only_without_a_carrier() {
+fn diagnostics_every_declared_vector_is_passed() {
     let prelude = "typedef float V1SF __attribute__((vector_size(4)));\n\
+                   typedef int V8SI __attribute__((vector_size(32)));\n\
+                   typedef V8SI W8SI __attribute__((aligned(64)));\n\
+                   typedef V1SF W1SF __attribute__((aligned(16)));\n\
                    typedef int V2SI __attribute__((vector_size(8)));\n\
                    long f(); long l; int c;\n";
     let compile = |name: &str, body: &str, target: &str| {
@@ -1241,29 +1246,29 @@ fn diagnostics_vector_passing_is_refused_only_without_a_carrier() {
         let path = c.path().to_string_lossy().into_owned();
         run_c17(&["--target", target, "-S", "-o", "/dev/null", &path])
     };
-    for (name, body) in [
-        ("argument", "void t(void) { V1SF v = {1}; f(v); }"),
-        ("parameter", "long t(V1SF v) { return 0; }"),
-        ("return", "V1SF t(void) { V1SF v = {1}; return v; }"),
+    for (name, shape) in [
+        ("argument", "void t(void) { V v = {1}; f(v); }"),
+        ("parameter", "long t(V v) { return 0; }"),
+        ("return", "V t(void) { V v = {1}; return v; }"),
     ] {
-        let a64 = compile(
-            &format!("vector_value_{name}"),
-            body,
+        for target in [
             "aarch64-unknown-linux-gnu",
-        );
-        assert!(!a64.success, "{name} accepted on aarch64");
-        assert!(
-            a64.stderr
-                .contains("c17 does not pass or return this vector type on this target"),
-            "{}",
-            a64.stderr
-        );
-        let x86 = compile(
-            &format!("vector_value_{name}_x86"),
-            body,
+            "aarch64-apple-darwin",
             "x86_64-unknown-linux-gnu",
-        );
-        assert!(x86.success, "{name} on x86-64: {}", x86.stderr);
+        ] {
+            for vector in ["V1SF", "W1SF", "W8SI"] {
+                let passed = compile(
+                    &format!("vector_value_{name}_{vector}"),
+                    &shape.replace('V', vector),
+                    target,
+                );
+                assert!(
+                    passed.success,
+                    "{name} of {vector} on {target}: {}",
+                    passed.stderr
+                );
+            }
+        }
     }
     compile_expect_ok(
         "vector_value_passed",
@@ -1747,8 +1752,8 @@ fn diagnostics_specifier_qualifier_list_rejects_declaration_only_specifiers() {
 /// An octal or hex escape's value must be representable in the literal's
 /// element type: `unsigned char` for a plain literal, and the unsigned type
 /// of `wchar_t`, `char16_t` or `char32_t` for a prefixed one. gcc warns and
-/// truncates; c17 was silent. A constraint gcc only warns about is an error
-/// here, and `-fpermissive` makes it a warning with gcc's truncation.
+/// truncates, an error only under `-pedantic-errors`; c17 was silent, and now
+/// does as gcc does.
 #[test]
 fn diagnostics_escape_out_of_range() {
     for (name, src, msg) in [
@@ -1805,24 +1810,24 @@ fn diagnostics_escape_out_of_range() {
             "hex escape sequence out of range",
         ),
     ] {
-        let strict = compile_with(name, src, &[]);
+        let warned = compile_with(name, src, &[]);
         assert!(
-            !strict.success && strict.stderr.contains("error:") && strict.stderr.contains(msg),
-            "{name}: expected an error mentioning {msg:?}:\n{}",
-            strict.stderr
+            warned.success && warned.stderr.contains(&format!("warning: {msg}")),
+            "{name}: expected a warning {msg:?}:\n{}",
+            warned.stderr
         );
-        let lax = compile_with(name, src, &["-fpermissive"]);
+        let strict = compile_with(name, src, &["-pedantic-errors"]);
         assert!(
-            lax.success && lax.stderr.contains("warning:") && lax.stderr.contains(msg),
-            "{name}: -fpermissive should warn {msg:?}:\n{}",
-            lax.stderr
+            !strict.success && strict.stderr.contains(&format!("error: {msg}")),
+            "{name}: -pedantic-errors should refuse it with {msg:?}:\n{}",
+            strict.stderr
         );
     }
 }
 
-/// Under `-fpermissive` the program keeps gcc's truncation to the low bits.
+/// The program keeps gcc's truncation to the low bits.
 #[test]
-fn diagnostics_escape_out_of_range_truncates_under_fpermissive() {
+fn diagnostics_escape_out_of_range_truncates_as_gcc_does() {
     let src = r#"
 typedef __CHAR16_TYPE__ char16_t;
 int main(void) {
@@ -1833,8 +1838,44 @@ int main(void) {
     return 0;
 }
 "#;
+    assert_eq!(compile_and_run("esc_truncate", src, &[]), 0);
+}
+
+/// The constructs gcc only warns about compile, warn, and run as gcc's do:
+/// a conditional with one `void` arm discards the other arm's value; a
+/// member list missing its last `;` still has that member; a constant too
+/// large for any type keeps its low 64 bits -- `2^64` is an `int` zero --
+/// in `#if` as in the program; a `#line` number past 32 bits wraps, and
+/// `#line 0` names line 0; a null character is whitespace; and an inline
+/// definition may still read its file-scope static (never called here: it
+/// has no external definition to call).
+#[test]
+fn diagnostics_gcc_warnings_compile_to_gccs_program() {
+    let src = "static int hits;\n\
+               static int counter = 7;\n\
+               inline int next(void) { return counter; }\n\
+               void f(void) { hits += 10; }\n\
+               int g(int c, int x) { c ? f() : x; c ? x++ : f(); return hits + x; }\n\
+               struct S { int a; int b };\n\
+               int main(void) {\n\
+                   unsigned long long a = 123456789012345678901234567890;\n\
+                   struct S s = { 1, 2 };\0\n\
+                   if (g(1, 5) != 16 || g(0, 5) != 25) return 1;\n\
+                   if (a != 0xc373e0ee4e3f0ad2ULL) return 2;\n\
+                   if (sizeof(18446744073709551616) != sizeof(int)) return 3;\n\
+                   if (s.b != 2) return 4;\n\
+               #if 123456789012345678901234567890 != 0xc373e0ee4e3f0ad2\n\
+                   return 5;\n\
+               #endif\n\
+               #line 0\n\
+                   if (__LINE__ != 0) return 6;\n\
+               #line 4294967297\n\
+                   if (__LINE__ != 1) return 7;\n\
+                   return 0;\n\
+               }\n";
+    assert_eq!(compile_and_run("gcc_warnings_run", src, &[]), 0);
     assert_eq!(
-        compile_and_run("esc_truncate", src, &["-fpermissive".to_string()]),
+        compile_and_run("gcc_warnings_run_o2", src, &["-O2".to_string()]),
         0
     );
 }

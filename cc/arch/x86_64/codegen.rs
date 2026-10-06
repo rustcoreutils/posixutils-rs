@@ -21,6 +21,7 @@ use crate::arch::x86_64::lir::{GpOperand, MemAddr, X86Inst, XmmOperand};
 use crate::arch::x86_64::regalloc::{FrameBase, Loc, Reg, X87ControlWords, X87Scratch, XmmReg};
 use crate::arch::x86_64::x87::{is_x87_float_to_int, is_x87_fp_cvt, is_x87_int_to_float};
 use crate::ir::{Instruction, Module, NanCompare, Opcode, PseudoId, PseudoKind};
+use crate::parse::ast::JmpKind;
 use crate::target::{Os, Target};
 use crate::types::TypeTable;
 use std::collections::{HashMap, HashSet};
@@ -1232,13 +1233,15 @@ impl X86_64CodeGen {
             }
 
             // setjmp/longjmp support
-            Opcode::Setjmp => {
-                self.emit_setjmp(insn);
-            }
+            Opcode::Setjmp => match insn.jmp_kind() {
+                JmpKind::Library => self.emit_setjmp(insn),
+                JmpKind::Builtin => self.emit_builtin_setjmp(insn),
+            },
 
-            Opcode::Longjmp => {
-                self.emit_longjmp(insn);
-            }
+            Opcode::Longjmp => match insn.jmp_kind() {
+                JmpKind::Library => self.emit_longjmp(insn),
+                JmpKind::Builtin => self.emit_builtin_longjmp(insn),
+            },
 
             Opcode::Asm => {
                 self.emit_inline_asm(insn);
@@ -1741,5 +1744,9 @@ impl CodeGenerator for X86_64CodeGen {
 
     fn set_verbose_asm(&mut self, verbose: bool) {
         self.base.verbose_asm = verbose;
+    }
+
+    fn set_cf_protection(&mut self, cf_protection: crate::target::CfProtection) {
+        self.base.cf_protection = cf_protection;
     }
 }

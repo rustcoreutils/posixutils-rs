@@ -26,6 +26,7 @@ use crate::arch::codegen::{BswapSize, CodeGenBase, CodeGenerator, UnaryOp};
 use crate::arch::lir::{CondCode, Directive, FpSize, Label, OperandSize, Symbol};
 use crate::float::FloatVal;
 use crate::ir::{Instruction, Module, Opcode, PseudoId, PseudoKind};
+use crate::parse::ast::JmpKind;
 use crate::target::{Os, Target};
 use crate::types::{TypeId, TypeTable};
 use std::collections::{HashMap, HashSet};
@@ -854,13 +855,15 @@ impl Aarch64CodeGen {
             }
 
             // setjmp/longjmp support
-            Opcode::Setjmp => {
-                self.emit_setjmp(insn);
-            }
+            Opcode::Setjmp => match insn.jmp_kind() {
+                JmpKind::Library => self.emit_setjmp(insn),
+                JmpKind::Builtin => self.emit_builtin_setjmp(insn),
+            },
 
-            Opcode::Longjmp => {
-                self.emit_longjmp(insn);
-            }
+            Opcode::Longjmp => match insn.jmp_kind() {
+                JmpKind::Library => self.emit_longjmp(insn),
+                JmpKind::Builtin => self.emit_builtin_longjmp(insn),
+            },
 
             // Inline Assembly
             Opcode::Asm => {
@@ -1481,6 +1484,10 @@ impl CodeGenerator for Aarch64CodeGen {
 
     fn set_verbose_asm(&mut self, verbose: bool) {
         self.base.verbose_asm = verbose;
+    }
+
+    fn set_cf_protection(&mut self, cf_protection: crate::target::CfProtection) {
+        self.base.cf_protection = cf_protection;
     }
 }
 

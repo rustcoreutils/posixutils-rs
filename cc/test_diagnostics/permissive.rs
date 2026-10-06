@@ -163,13 +163,14 @@ int main(void) { bad(1, 42L); return 0; }
 // What `-fpermissive` relaxes
 // ============================================================================
 
-/// The constraints gcc lets through, and c17 relaxes only when asked.
+/// The constraints GCC 13 only warns about and GCC 14 refuses, which c17
+/// relaxes only when asked.
 ///
 /// Each is a genuine C17 constraint violation, and each appears in source old
-/// enough that gcc chose to warn rather than refuse. `-fpermissive` is where
-/// c17 keeps that leniency: it already covers implicit `int` and implicit
-/// function declarations, and these join them rather than becoming warnings
-/// for everybody.
+/// enough that gcc once chose to warn rather than refuse. `-fpermissive` is
+/// where c17 keeps that leniency: it already covers implicit `int` and
+/// implicit function declarations, and these join them. The constraints gcc
+/// still only warns about are warnings here too (`default_pedwarns.rs`).
 #[test]
 fn diagnostics_permissive_relaxes_the_constraints_gcc_warns_about() {
     const CASES: &[(&str, &str, &str)] = &[
@@ -182,21 +183,6 @@ fn diagnostics_permissive_relaxes_the_constraints_gcc_warns_about() {
             "return_with_value",
             "void h(int v) { return v; }\n",
             "'return' with a value",
-        ),
-        (
-            "struct_member_missing_semicolon",
-            "struct S { int a; int b };\nint main(void){ return 0; }\n",
-            "needs a ';'",
-        ),
-        (
-            "inline_reads_a_file_scope_static",
-            "static const int k = 3;\ninline int f(void) { return k; }\nint main(void){ return f() - 3; }\n",
-            "cannot reference file-scope static",
-        ),
-        (
-            "inline_updates_a_file_scope_static",
-            "static int k;\ninline void f(void) { k += 3; }\nint main(void){ f(); return k - 3; }\n",
-            "cannot reference file-scope static",
         ),
     ];
 
@@ -367,13 +353,18 @@ fn diagnostics_static_object_larger_than_a_frame_slot_is_accepted() {
     }
 }
 
-/// A `vector_size` value passed to or returned from a function is refused
-/// only where the target's convention has no type that travels as gcc
-/// passes it: a one-lane `float` vector on aarch64. On x86-64 it goes in
-/// memory, as gcc's does, and every other vector goes as its carrier.
+/// Every vector a declaration admits is passed and returned: gcc refuses a
+/// lane count that is not a power of two where the type is declared, so
+/// each size left is a register width or an aggregate. A one-lane `float`
+/// vector goes on the stack on aarch64 and in memory on x86-64, as gcc
+/// passes it, and a vector whose alignment a typedef raises travels too --
+/// it had no carrier, and was refused.
 #[test]
-fn diagnostics_vector_passing_is_refused_only_without_a_carrier() {
+fn diagnostics_every_declared_vector_is_passed() {
     let prelude = "typedef float V1SF __attribute__((vector_size(4)));\n\
+                   typedef int V8SI __attribute__((vector_size(32)));\n\
+                   typedef V8SI W8SI __attribute__((aligned(64)));\n\
+                   typedef V1SF W1SF __attribute__((aligned(16)));\n\
                    typedef int V2SI __attribute__((vector_size(8)));\n\
                    long f(); long l; int c;\n";
     let compile_for = |name: &str, body: &str, target: &str| {
@@ -383,29 +374,29 @@ fn diagnostics_vector_passing_is_refused_only_without_a_carrier() {
             &[&format!("--target={target}")],
         )
     };
-    for (name, body) in [
-        ("argument", "void t(void) { V1SF v = {1}; f(v); }"),
-        ("parameter", "long t(V1SF v) { return 0; }"),
-        ("return", "V1SF t(void) { V1SF v = {1}; return v; }"),
+    for (name, shape) in [
+        ("argument", "void t(void) { V v = {1}; f(v); }"),
+        ("parameter", "long t(V v) { return 0; }"),
+        ("return", "V t(void) { V v = {1}; return v; }"),
     ] {
-        let a64 = compile_for(
-            &format!("vector_value_{name}"),
-            body,
+        for target in [
             "aarch64-unknown-linux-gnu",
-        );
-        assert!(!a64.success, "{name} accepted on aarch64");
-        assert!(
-            a64.stderr
-                .contains("c17 does not pass or return this vector type on this target"),
-            "{}",
-            a64.stderr
-        );
-        let x86 = compile_for(
-            &format!("vector_value_{name}_x86"),
-            body,
+            "aarch64-apple-darwin",
             "x86_64-unknown-linux-gnu",
-        );
-        assert!(x86.success, "{name} on x86-64: {}", x86.stderr);
+        ] {
+            for vector in ["V1SF", "W1SF", "W8SI"] {
+                let passed = compile_for(
+                    &format!("vector_value_{name}_{vector}"),
+                    &shape.replace('V', vector),
+                    target,
+                );
+                assert!(
+                    passed.success,
+                    "{name} of {vector} on {target}: {}",
+                    passed.stderr
+                );
+            }
+        }
     }
     compile_expect_ok(
         "vector_value_passed",

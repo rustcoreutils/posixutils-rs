@@ -333,7 +333,8 @@ Use `returns_via_sret()` and `returns_two_regs()` to query return strategy.
 
 | Opcode | Description |
 |--------|-------------|
-| `constant_p` | `__builtin_constant_p`, held back until propagation has run: `sccp` answers 1 when it proves the operand constant, and `lower` answers 0 for every one left -- all of them at `-O0` |
+| `constant_p` | `__builtin_constant_p`, held back until propagation has run (made only when optimizing; the parser answers at `-O0`): `sccp` answers 1 when it proves the operand constant, and 0 otherwise once inlining is done -- the round before inlining leaves the 0s, since inlining a constant argument answers 1 -- and `lower` answers 0 for every one left |
+| `object_size` | `__builtin_object_size(src[0], type)`, the type in the opcode, held back until inlining and propagation have shown the object (made only when optimizing; the parser answers at `-O0`): `objsize` answers it once the object is known, and as an unknown object once the optimizer has converged; `lower` answers any left as unknown |
 
 ### Bit Manipulation Builtins
 
@@ -364,8 +365,8 @@ Operands are `(dst, src-or-byte, n)`. The back ends emit the libc call; one whos
 | Opcode | Description |
 |--------|-------------|
 | `alloca` | Dynamic stack allocation |
-| `stacksave`, `stackrestore` | Capture and restore the stack pointer. The inliner brackets a callee that `alloca`s with them, so its allocation is released where the call would have returned instead of accumulating in the caller (a loop would otherwise grow the stack every iteration) |
-| `setjmp` | Save context; returns 0, or the value a `longjmp` passed (`longjmp` is a terminator, above) |
+| `stacksave`, `stackrestore` | Capture and restore the stack pointer. A VLA's scope is bracketed with them, and so is an inlined callee that `alloca`s, so its allocation is released where the call would have returned instead of accumulating in the caller (a loop would otherwise grow the stack every iteration). `__builtin_stack_save` and `__builtin_stack_restore` are these two |
+| `setjmp` | Save context; returns 0, or the value a `longjmp` passed (`longjmp` is a terminator, above). `JmpKind::Builtin` is gcc's `__builtin_setjmp`, generated inline: no register survives it, and it always resumes with 1 |
 | `frame_address` | `__builtin_frame_address(level)`; the level is `frame_level()` |
 | `return_address` | `__builtin_return_address(level)` |
 
@@ -546,9 +547,11 @@ The optimizer, from `-O1` up, runs:
   on every function, so the inliner sizes a callee by the code it will emit;
 - `inline`, then `memexpand`;
 - the passes in `opt::PASSES` to a fixed point: `constglobal`, `memexpand`,
-  `loadfwd`, `vrp`, `ifconv`, `sccp`, `instcombine`, `libcall_fold`,
-  `copyprop`, `dse`, `dce`, `simplify_cfg`. This runs for at most
-  `MAX_ITERATIONS` rounds;
+  `loadfwd`, `vrp`, `ifconv`, `objsize`, `sccp`, `instcombine`,
+  `libcall_fold`, `copyprop`, `dse`, `dce`, `simplify_cfg`. This runs for at
+  most `MAX_ITERATIONS` rounds; if `objsize` then has an `object_size` left
+  whose object is unknown, it answers it as unknown and the passes run to a
+  fixed point again;
 - then `mem2reg`.
 
 The order inside the loop matters, and `PASSES` gives the reason for each
@@ -568,12 +571,12 @@ after that, because merging would undo the splitting the copies depend on. See
 
 | File | Purpose |
 |------|---------|
-| `linearize.rs` (+ `_init.rs`, `_stmt.rs`, `_emit.rs`, `_atomic.rs`) | AST to IR, with every local in memory. `linearize.rs` holds functions and expressions, `_init.rs` initializers and globals, `_stmt.rs` statements, `_emit.rs` shared emitters (constants, block copies, bit-fields, assignments), and `_atomic.rs` ordinary operators on `_Atomic` objects as atomic RMW loops. Marks each block-scope local's `lifetime.end` |
+| `linearize.rs` (+ `_init.rs`, `_label_diff.rs`, `_stmt.rs`, `_emit.rs`, `_atomic.rs`) | AST to IR, with every local in memory. `linearize.rs` holds functions and expressions, `_init.rs` initializers and globals, `_label_diff.rs` GNU `&&a - &&b` static initializers, `_stmt.rs` statements, `_emit.rs` shared emitters (constants, block copies, bit-fields, assignments), and `_atomic.rs` ordinary operators on `_Atomic` objects as atomic RMW loops. Marks each block-scope local's `lifetime.end` |
 | `ssa.rs` | Promotes each eligible local out of memory into SSA values. A local is eligible when it is scalar, not volatile or atomic, never has its address taken, and is only accessed whole. φs go at iterated dominance frontiers, followed by renaming over the dominator tree. Runs once, during linearization |
 | `mem2reg.rs` | Despite the name, it promotes nothing: it deletes the locals no instruction names any more, with their lifetime markers, so they get no stack slot. Runs after `ssa` and again after the optimizer |
 | `mach_o_dtors.rs` | Mach-O does not run a `destructor` listed in `__mod_term_func` for an executable, so each one is registered with `atexit` from a synthesized constructor |
 | `tls.rs` | Expands `tlsaddr` into its call for the call-based TLS models (ELF TLS descriptors, every Darwin access), so the register allocator sees the clobbers |
-| `lower.rs` | Out of SSA. It answers each remaining `constant_p` with 0, splits critical edges, then eliminates φs into copies, which it sequentializes as a parallel copy |
+| `lower.rs` | Out of SSA. It answers each remaining `constant_p` with 0 and `object_size` as unknown, splits critical edges, then eliminates φs into copies, which it sequentializes as a parallel copy |
 
 ### Optimization passes
 
@@ -581,13 +584,14 @@ after that, because merging would undo the splitting the copies depend on. See
 |------|---------|
 | `inline.rs` | Inlines at the call site by callee size: always below a small threshold, larger ones with an `inline` hint, under a per-caller growth cap. `always_inline` callees are inlined at every level. A callee that `alloca`s is bracketed with `stacksave`/`stackrestore`. Afterwards it deletes `static` functions with no callers left |
 | `memexpand.rs` | A `memcpy`, `memset` or `memmove` of a small constant length becomes integer loads and stores, at every level. It also owns the chunking and size limit that the linearizer's aggregate copies use |
-| `constglobal.rs` | A load of a `const` global, by name or through its address, becomes its initializer. Needs no alias or escape analysis, because modifying a `const`-defined object is undefined behaviour (C17 6.7.3p6) |
+| `constglobal.rs` | A load of a `const` global, by name or through its address, becomes its initializer, and a one-byte load at a constant offset into a string literal or `const` `char` array (`strdata`) becomes the byte. Needs no alias or escape analysis, because modifying a `const`-defined object is undefined behaviour (C17 6.7.3p6) |
 | `loadfwd.rs` | Store-to-load forwarding and redundant-load elimination, across blocks, using `memloc`/`escape`/`effects`. Also `MemOracle`: the value a location holds just before an instruction, as a pseudo or, for one byte, a constant |
 | `vrp.rs` | Value-range propagation over `range.rs` intervals, on the `dataflow` solver. Unlike `sccp`, it attaches facts to CFG *edges*: `var <= 0` being false gives `var >= 1` on that edge. It runs before `ifconv`, which would otherwise collapse the diamond the fact hangs on |
 | `ifconv.rs` | Turns a short-circuit `&&`/`\|\|` diamond into a `sel` when the arm is safe to speculate (no memory access, call or trap). This puts the two comparisons in one block, where `instcombine` can relate them |
 | `sccp.rs` | Sparse conditional constant propagation (Wegman–Zadeck) on the `dataflow` solver. It folds constant branches, removing the dead edge; `dce` then deletes the unreachable blocks |
 | `instcombine.rs` | Per-instruction rewriting of pure operations: constant folding through `constfold`, algebraic identities (`x - x`, `x ^ x`, ...), and pairs of comparisons over the same operands. It never moves or reorders instructions |
-| `libcall_fold/` | Folds calls the parser tagged as known library functions (`Instruction::known`). Results the arguments decide become constants: `strlen("abc")` is 3, and `strcmp(p, "")` is the first byte of `p`. An output call whose result is unused becomes a cheaper one that writes the same bytes: `printf("hi\n")` becomes `puts("hi")`. A `memmove` whose blocks cannot overlap becomes a `memcpy`. A dispatcher, with one module per family of functions |
+| `libcall_fold/` | Folds calls the parser tagged as known library functions (`Instruction::known`). Results the arguments decide become constants: `strlen("abc")` is 3, and `strcmp(p, "")` is the first byte of `p`. An output call whose result is unused becomes a cheaper one that writes the same bytes: `printf("hi\n")` becomes `puts("hi")`. A `memmove` whose blocks cannot overlap becomes a `memcpy`. A `_chk` call whose write is known to fit, or whose object is unknown, becomes the plain function (`fortify.rs`). A dispatcher, with one module per family of functions |
+| `objsize.rs` | Answers `object_size` after inlining: walks the pointer back through copies, constant displacements, `sel` and φs to the objects it may point into, and takes the largest (or, for a minimum, the smallest) remaining size. A pointer stepped round a loop adds nothing where the step cannot raise the answer |
 | `copyprop.rs` | Each use of a no-op `copy` (same width, same register class) reads the copy's source instead; `dce` collects the copies |
 | `dse.rs` | Dead-store elimination, for two cases: a store whose every byte is overwritten before any is read (a forward walk within a block), and a store to a non-escaping local that nothing reads before the function returns (a backward walk over the CFG) |
 | `dce.rs` | Mark-sweep from the roots, which are any opcode with `has_side_effects()` plus any volatile access. It also folds a branch into a block that does nothing but `unreachable`, and removes unreachable blocks |

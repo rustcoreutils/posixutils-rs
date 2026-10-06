@@ -568,6 +568,8 @@ define_keywords! {
     (BUILTIN_TYPES_COMPATIBLE_P, "__builtin_types_compatible_p", BUILTIN),
     (BUILTIN_CLASSIFY_TYPE, "__builtin_classify_type", BUILTIN),
     (BUILTIN_UNREACHABLE, "__builtin_unreachable", BUILTIN),
+    (BUILTIN_SETJMP,    "__builtin_setjmp",   BUILTIN),
+    (BUILTIN_LONGJMP,   "__builtin_longjmp",  BUILTIN),
     (BUILTIN_OFFSETOF,  "__builtin_offsetof", BUILTIN),
     (OFFSETOF,          "offsetof",           BUILTIN),
     (BUILTIN_INF,       "__builtin_inf",      BUILTIN),
@@ -631,6 +633,7 @@ define_keywords! {
     (BUILTIN_ISFINITE,  "__builtin_isfinite", BUILTIN),
     (BUILTIN_ISNORMAL,  "__builtin_isnormal", BUILTIN),
     (BUILTIN_FPCLASSIFY,"__builtin_fpclassify", BUILTIN),
+    (BUILTIN_ISSIGNALING, "__builtin_issignaling", BUILTIN),
     // gcc's atomic builtins. These are not `__builtin_`-prefixed, and they
     // are reserved spellings all the same: `__sync_` and `__atomic_` both
     // start with two underscores, so no conforming program defines one.
@@ -1097,6 +1100,7 @@ define_keywords! {
     (_, "ms_abi",                  SUPPORTED_ATTR | X86_64_ONLY),
     (_, "mode",                    SUPPORTED_ATTR),
     (_, "vector_size",             SUPPORTED_ATTR),
+    (_, "scalar_storage_order",    SUPPORTED_ATTR),
     // Parsed and ignored. Recognised so that a build does not drown in
     // warnings for the attributes glibc's headers put on everything; each
     // is semantically free, or free enough that ignoring it cannot change
@@ -1154,6 +1158,7 @@ define_keywords! {
     (_, "__ms_abi__",                SUPPORTED_ATTR | X86_64_ONLY),
     (_, "__mode__",                  SUPPORTED_ATTR),
     (_, "__vector_size__",           SUPPORTED_ATTR),
+    (_, "__scalar_storage_order__",  SUPPORTED_ATTR),
     (_, "__nonnull__",               SUPPORTED_ATTR),
     (_, "__returns_nonnull__",       SUPPORTED_ATTR),
     (_, "__nothrow__",               SUPPORTED_ATTR),
@@ -1199,6 +1204,23 @@ define_keywords! {
     // `__label__`: declares labels local to a block, at its head. A
     // statement keyword, so it is never itself a label. Appended, as above.
     (GNU_LABEL,         "__label__",         STMT_KW | RESERVED_NAME),
+    // Builtins gcc makes for its own lowering, which code may also call.
+    // Appended, as above. `cexp` and `cpow` are what the complex ones call.
+    (BUILTIN_STACK_SAVE,    "__builtin_stack_save",    BUILTIN),
+    (BUILTIN_STACK_RESTORE, "__builtin_stack_restore", BUILTIN),
+    (BUILTIN_CLEAR_PADDING, "__builtin_clear_padding", BUILTIN),
+    (BUILTIN_CEXPI,     "__builtin_cexpi",   BUILTIN),
+    (BUILTIN_CEXPIF,    "__builtin_cexpif",  BUILTIN),
+    (BUILTIN_CEXPIL,    "__builtin_cexpil",  BUILTIN),
+    (BUILTIN_CPOW,      "__builtin_cpow",    BUILTIN),
+    (BUILTIN_CPOWF,     "__builtin_cpowf",   BUILTIN),
+    (BUILTIN_CPOWL,     "__builtin_cpowl",   BUILTIN),
+    (CEXP,              "cexp",              0),
+    (CEXPF,             "cexpf",             0),
+    (CEXPL,             "cexpl",             0),
+    (CPOW,              "cpow",              0),
+    (CPOWF,             "cpowf",             0),
+    (CPOWL,             "cpowl",             0),
 }
 
 // Tag query API

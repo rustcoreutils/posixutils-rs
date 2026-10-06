@@ -17,20 +17,21 @@ use super::{
     Initializer, Instruction, MemoryOrder, Module, Opcode, Pseudo, PseudoId, PseudoKind,
 };
 use crate::abi::{get_abi_for_conv, CallingConv};
+use crate::constexpr::ConstScope;
 use crate::diag::{get_all_stream_names, Position};
-use crate::float::FloatVal;
+use crate::float::{FloatVal, FpFormat};
 use crate::ir::linearize_atomic::{AtomicLvalue, OrderedAccess};
 use crate::ir::linearize_emit::CompoundAssign;
 use crate::ir::linearize_stmt::SwitchCtx;
 use crate::parse::ast::{
     AssignOp, BinaryOp, BlockItem, Expr, ExprKind, ExternalDecl, FpCompare, FpTest, FunctionDef,
-    GnuAtomicOp, InitElement, InlineLibraryFn, LabelId, MemoryFn, NarrowedLibraryCall,
+    GnuAtomicOp, InitElement, InlineLibraryFn, JmpKind, LabelId, MemoryFn, NarrowedLibraryCall,
     OffsetOfPath, ParamStyle, TranslationUnit, UnaryOp,
 };
 use crate::strings::{StringId, StringTable};
 use crate::symbol::{SymbolId, SymbolTable};
 use crate::target::Target;
-use crate::types::{MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
+use crate::types::{ArrayExtent, MemberInfo, TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::{HashMap, HashSet};
 
 const DEFAULT_LOCALS_CAPACITY: usize = 64;
@@ -43,6 +44,22 @@ const DEFAULT_FILE_SCOPE_CAPACITY: usize = 16;
 enum ComplexHalf {
     Real,
     Imag,
+}
+
+/// What an expression is computed for, when the linearizer asks whether it
+/// is pure: both forbid a write, a call and a `volatile` access, and differ
+/// on what may trap or raise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evaluation {
+    /// Where the program would not have computed it -- a conditional's arm
+    /// lowered to a select -- so it must not trap or raise a floating-point
+    /// exception either.
+    Speculative,
+    /// Only to be asked about, after which the computation is dead and `dce`
+    /// deletes it unrun: the operand of a deferred `__builtin_constant_p`.
+    /// A load, a division or a floating operation that never runs cannot
+    /// trap.
+    Discarded,
 }
 
 /// One array extent of a variably-modified type.
@@ -1256,6 +1273,12 @@ impl<'a> Linearizer<'a> {
     /// Add an instruction to the current basic block
     pub(crate) fn emit(&mut self, insn: Instruction) {
         let insn = self.mark_volatile_access(insn);
+        // An access to a scalar stored in reverse byte order becomes an
+        // access in the target's order and a swap: the one place it can be
+        // done for every access, as for the volatile marker above.
+        let Some(insn) = self.reverse_order_access(insn) else {
+            return;
+        };
         let insn = self.displacement_in_range(insn);
         if let Some(bb_id) = self.current_bb {
             // Attach current source position for debug info
@@ -1701,8 +1724,20 @@ impl<'a> Linearizer<'a> {
         // A convention that passes such a value by reference instead --
         // AAPCS64, Win64 -- hands over a pointer to the caller's copy,
         // which the pointer path below copies out of.
-        let arrived_by_value = !abi.indirect_param_is_reference()
-            && crate::arch::lir::memory_class_bytes(self.types, typ).is_some();
+        //
+        // AAPCS64's own by-value stack argument, gcc's floating vector of
+        // four bytes or fewer, arrives the same way: the caller copied its
+        // bytes into the argument area from the address the call names.
+        // Reading it as a value instead broke inlining, which puts that
+        // address in the `Arg`'s place: only this address-of turns into a
+        // copy of it there.
+        let stacked = matches!(
+            abi.classify_param(typ, self.types),
+            crate::abi::ArgClass::Stacked { .. }
+        );
+        let arrived_by_value = stacked
+            || !abi.indirect_param_is_reference()
+                && crate::arch::lir::memory_class_bytes(self.types, typ).is_some();
         if arrived_by_value {
             // Passed by value on the stack. `arg_pseudo` is an IncomingArg
             // naming the struct data; take its address, then copy each
@@ -1986,11 +2021,13 @@ impl<'a> Linearizer<'a> {
         // `-fgnu89-inline` makes the GNU rule the default for every inline
         // function, which is what the attribute selects one at a time.
         let gnu_inline = func.attrs.gnu_inline || crate::builtins::gnu89_inline();
+        // `extern inline` after a `static` declaration has internal linkage
+        // and is an ordinary static function, as in gcc.
         let is_inline_definition = if gnu_inline {
             let mut storage = TypeModifiers::empty();
             storage.set(TypeModifiers::EXTERN, is_extern);
             storage.set(TypeModifiers::INLINE, is_inline);
-            func.attrs.gnu_inline_only(storage)
+            !is_static && func.attrs.gnu_inline_only(storage)
         } else {
             is_inline && !is_static && !has_extern_decl && all_decls_inline
         };
@@ -2649,12 +2686,37 @@ impl<'a> Linearizer<'a> {
     /// it is pure, and converting it raises no floating-point exception --
     /// `c ? n : 0.0f` with a large `int n` is inexact where `c` is false.
     pub(crate) fn is_speculatable_arm(&self, arm: &Expr, result_typ: TypeId) -> bool {
-        self.is_pure_expr(arm) && !self.converting_raises_fp(arm, self.expr_type(arm), result_typ)
+        self.is_pure_arm(arm, result_typ, Evaluation::Speculative)
     }
 
-    /// Check if an expression is "pure": safe to evaluate where the program
-    /// would not have. Pure expressions can be speculatively evaluated,
-    /// enabling cmov/csel codegen.
+    /// [`Self::is_speculatable_arm`], for the evaluation `how`
+    /// ([`Evaluation`]): a discarded conversion raises nothing anyone sees.
+    fn is_pure_arm(&self, arm: &Expr, result_typ: TypeId, how: Evaluation) -> bool {
+        self.is_pure_expr(arm, how)
+            && !(how == Evaluation::Speculative
+                && self.converting_raises_fp(arm, self.expr_type(arm), result_typ))
+    }
+
+    /// Whether evaluating the lvalue `expr` reads a `volatile` object.
+    ///
+    /// `contains_volatile`, not the top-level qualifier: reading a struct
+    /// with a `volatile` member reads that member. The type of a member or
+    /// an element carries the object's qualifiers (C17 6.5.2.3p3), so this
+    /// covers a volatile member and a member of a volatile object alike.
+    fn reads_volatile(&self, expr: &Expr) -> bool {
+        expr.typ
+            .is_some_and(|typ| self.types.contains_volatile(typ))
+    }
+
+    /// Whether `expr` may be computed for the operand of a deferred
+    /// `__builtin_constant_p` ([`Evaluation::Discarded`]).
+    pub(crate) fn is_discardable(&self, expr: &Expr) -> bool {
+        self.is_pure_expr(expr, Evaluation::Discarded)
+    }
+
+    /// Check if an expression is "pure" for the evaluation `how`
+    /// ([`Evaluation`]). A speculatively pure expression is safe to evaluate
+    /// where the program would not have, enabling cmov/csel codegen.
     ///
     /// An expression is pure if it contains NO:
     /// - Function calls
@@ -2662,11 +2724,15 @@ impl<'a> Linearizer<'a> {
     /// - Pre/post increment/decrement (++, --)
     /// - Assignments (=, +=, -=, etc.)
     /// - Statement expressions (GNU extension with potential side effects)
+    ///
+    /// and, speculatively, NO:
+    /// - Operation that may trap: a division, a dereference, a subscript
     /// - Operation that can raise a floating-point exception ([`FpRaise`]):
     ///   c17 defines `__STDC_IEC_559__`, so the flags are something the
     ///   program observes, and `c ? a * b : 0` evaluated as a select reports
     ///   an overflow where `c` is false.
-    pub(crate) fn is_pure_expr(&self, expr: &Expr) -> bool {
+    fn is_pure_expr(&self, expr: &Expr, how: Evaluation) -> bool {
+        let speculative = how == Evaluation::Speculative;
         match &expr.kind {
             // Writes through its third argument.
             ExprKind::CheckedArith { .. } => false,
@@ -2674,7 +2740,7 @@ impl<'a> Linearizer<'a> {
             // effect, and re-reading it is what makes the extent stable.
             ExprKind::VmTypedefExtent(..) | ExprKind::VmObjectExtent(..) => true,
             ExprKind::VmTypeName { dims, expr, .. } => {
-                dims.iter().all(|d| self.is_pure_expr(d)) && self.is_pure_expr(expr)
+                dims.iter().all(|d| self.is_pure_expr(d, how)) && self.is_pure_expr(expr, how)
             }
             // A label's address is a constant of the function.
             ExprKind::LabelAddr(_) => true,
@@ -2682,9 +2748,9 @@ impl<'a> Linearizer<'a> {
             // nothing. `VaArgPack` is not a value at all -- the call it sits
             // in carries it -- but it is no less pure for that.
             ExprKind::VaArgPack | ExprKind::VaArgPackLen => true,
-            // Answers a question *about* its operand without evaluating it:
+            // Answer a question *about* their operand without evaluating it:
             // an impure one is never linearized at all (see below).
-            ExprKind::ConstantP(_) => true,
+            ExprKind::ConstantP(_) | ExprKind::ObjectSize { .. } => true,
             // Literals are always pure
             ExprKind::IntLit(_)
             | ExprKind::Int128Lit(_)
@@ -2696,14 +2762,7 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Utf32StringLit(_) => true,
 
             // Identifiers are pure unless volatile.
-            //
-            // `contains_volatile`, not the top-level modifier: reading a
-            // struct with a `volatile` member reads that member, and asking
-            // only what was written on the struct answered no.
-            ExprKind::Ident(_) => match expr.typ {
-                Some(typ) => !self.types.contains_volatile(typ),
-                None => true,
-            },
+            ExprKind::Ident(_) => !self.reads_volatile(expr),
 
             // __func__ is a pure string-like value
             ExprKind::FuncName => true,
@@ -2717,18 +2776,22 @@ impl<'a> Linearizer<'a> {
             ExprKind::Binary {
                 op, left, right, ..
             } => {
-                !matches!(op, BinaryOp::Div | BinaryOp::Mod)
-                    && !self.binary_raises_fp(expr, *op, left, right)
-                    && self.is_pure_expr(left)
-                    && self.is_pure_expr(right)
+                (!speculative
+                    || (!matches!(op, BinaryOp::Div | BinaryOp::Mod)
+                        && !self.binary_raises_fp(expr, *op, left, right)))
+                    && self.is_pure_expr(left, how)
+                    && self.is_pure_expr(right, how)
             }
 
             // Unary ops are pure if operand is pure, except for pre-inc/dec and dereference.
             // Dereference (*ptr) can cause UB/crash if the pointer is NULL or invalid,
             // so we must not eagerly evaluate it in conditional expressions.
+            // Discarded, a dereference is a read like any other.
             ExprKind::Unary { op, operand, .. } => match op {
-                UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::Deref => false,
-                _ => self.is_pure_expr(operand),
+                UnaryOp::PreInc | UnaryOp::PreDec => false,
+                UnaryOp::Deref if speculative => false,
+                UnaryOp::Deref => !self.reads_volatile(expr) && self.is_pure_expr(operand, how),
+                _ => self.is_pure_expr(operand, how),
             },
 
             // Post-increment/decrement have side effects
@@ -2742,9 +2805,9 @@ impl<'a> Linearizer<'a> {
                 else_expr,
             } => {
                 let typ = self.expr_type(expr);
-                self.is_pure_expr(cond)
-                    && self.is_speculatable_arm(then_expr, typ)
-                    && self.is_speculatable_arm(else_expr, typ)
+                self.is_pure_expr(cond, how)
+                    && self.is_pure_arm(then_expr, typ, how)
+                    && self.is_pure_arm(else_expr, typ, how)
             }
 
             // `a ?: b` evaluates `a` once and `b` only when `a` is false, so
@@ -2752,7 +2815,8 @@ impl<'a> Linearizer<'a> {
             // the program takes where it is nonzero, and converting a zero
             // is exact.
             ExprKind::CondElvis { cond, else_expr } => {
-                self.is_pure_expr(cond) && self.is_speculatable_arm(else_expr, self.expr_type(expr))
+                self.is_pure_expr(cond, how)
+                    && self.is_pure_arm(else_expr, self.expr_type(expr), how)
             }
 
             // Function calls are never pure (may have side effects)
@@ -2764,34 +2828,39 @@ impl<'a> Linearizer<'a> {
             // volatile read an observable event, so speculating one is a read
             // the program never asked for: asking about the base alone let
             // `c ? s.status : s.other` load both members unconditionally into
-            // a branchless select, at `-O0` too. The member's type carries the
-            // object's qualifiers (C17 6.5.2.3p3), so this covers a volatile
-            // member and a member of a volatile object alike.
+            // a branchless select, at `-O0` too.
             ExprKind::Member { expr: base, .. } => {
-                !expr
-                    .typ
-                    .is_some_and(|typ| self.types.contains_volatile(typ))
-                    && self.is_pure_expr(base)
+                !self.reads_volatile(expr) && self.is_pure_expr(base, how)
             }
 
             // Arrow access (ptr->member) can cause UB/crash if ptr is NULL,
             // so we must not eagerly evaluate it in conditional expressions.
-            ExprKind::Arrow { .. } => false,
+            // Discarded, it is a read like any other.
+            ExprKind::Arrow { expr: base, .. } => {
+                !speculative && !self.reads_volatile(expr) && self.is_pure_expr(base, how)
+            }
 
             // Array indexing can cause UB/crash if the pointer is invalid,
             // so we must not eagerly evaluate it in conditional expressions.
-            ExprKind::Index { .. } => false,
+            // Discarded, it is a read like any other.
+            ExprKind::Index { array, index } => {
+                !speculative
+                    && !self.reads_volatile(expr)
+                    && self.is_pure_expr(array, how)
+                    && self.is_pure_expr(index, how)
+            }
 
             // Casts are pure if the operand is pure and the conversion
             // raises nothing: `(float)d` can overflow, `(int)d` is invalid
             // for a NaN.
             ExprKind::Cast { expr: inner, .. } => {
-                self.is_pure_expr(inner)
-                    && !self.converting_raises_fp(
-                        inner,
-                        self.expr_type(inner),
-                        self.expr_type(expr),
-                    )
+                self.is_pure_expr(inner, how)
+                    && !(speculative
+                        && self.converting_raises_fp(
+                            inner,
+                            self.expr_type(inner),
+                            self.expr_type(expr),
+                        ))
             }
 
             // Assignments have side effects
@@ -2805,18 +2874,18 @@ impl<'a> Linearizer<'a> {
             // false, against 6.5.15p4.
             ExprKind::SizeofType(typ, dims) => {
                 !crate::parse::ast::sizeof_type_is_runtime(self.types, *typ, dims)
-                    || dims.iter().all(|d| self.is_pure_expr(d))
+                    || dims.iter().all(|d| self.is_pure_expr(d, how))
             }
 
             // `sizeof` evaluates a variably modified operand (6.5.3.4p2);
             // the other two never evaluate anything.
             ExprKind::SizeofExpr(inner) => {
-                !self.sizeof_evaluates(inner) || self.is_pure_expr(inner)
+                !self.sizeof_evaluates(inner) || self.is_pure_expr(inner, how)
             }
             ExprKind::AlignofType(_) | ExprKind::AlignofExpr(_) => true,
 
             // Comma expressions: pure if all sub-expressions are pure
-            ExprKind::Comma(exprs) => exprs.iter().all(|e| self.is_pure_expr(e)),
+            ExprKind::Comma(exprs) => exprs.iter().all(|e| self.is_pure_expr(e, how)),
 
             // Compound literals may have side effects in initializers
             ExprKind::CompoundLiteral { .. } => false,
@@ -2852,31 +2921,36 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Popcount { arg }
             | ExprKind::Popcountl { arg }
             | ExprKind::Popcountll { arg }
-            | ExprKind::FpTest { arg, .. } => self.is_pure_expr(arg),
+            | ExprKind::FpTest { arg, .. } => self.is_pure_expr(arg, how),
 
             ExprKind::InlineLibraryCall {
                 func, args, name, ..
             } => {
                 !func.has_side_effects()
-                    && !self.library_call_raises_fp(*func)
+                    && !(speculative && self.library_call_raises_fp(*func))
                     && !func.is_displaced(*name, &self.defined_functions)
-                    && args.iter().all(|a| self.is_pure_expr(a))
+                    && args.iter().all(|a| self.is_pure_expr(a, how))
             }
 
             // Pure iff both operands are: the relation itself reads nothing
             // else and raises nothing, which is the point of the family.
             ExprKind::FpCompare { lhs, rhs, .. } => {
-                self.is_pure_expr(lhs) && self.is_pure_expr(rhs)
+                self.is_pure_expr(lhs, how) && self.is_pure_expr(rhs, how)
             }
 
             // Pure iff everything it reads is: the class codes are ordinary
             // expressions, not constants, so they count too.
             ExprKind::FpClassify { classes, arg } => {
-                self.is_pure_expr(arg) && classes.iter().all(|c| self.is_pure_expr(c))
+                self.is_pure_expr(arg, how) && classes.iter().all(|c| self.is_pure_expr(c, how))
             }
 
             // Alloca allocates memory - not pure
             ExprKind::Alloca { .. } => false,
+
+            // They read or move the stack pointer, or write memory.
+            ExprKind::StackSave | ExprKind::StackRestore { .. } | ExprKind::ClearPadding { .. } => {
+                false
+            }
 
             // Unreachable is pure (no side effects, just UB hint)
             ExprKind::Unreachable => true,
@@ -2927,6 +3001,16 @@ impl<'a> Linearizer<'a> {
     /// bits gets them dereferenced as an address. Which crash you got depended
     /// on the syntax at the use site.
     pub(crate) fn complex_operand_addr(&mut self, expr: &Expr) -> PseudoId {
+        let addr = self.complex_storage_addr(expr);
+        let typ = self.expr_type(expr);
+        self.complex_in_native_order(addr, typ)
+    }
+
+    /// The address of the storage `expr` names, for an lvalue, or of its
+    /// materialized value otherwise -- what [`Self::complex_operand_addr`]
+    /// reads, and what `__real__ z = v` writes through, in whatever order
+    /// the object is stored in.
+    fn complex_storage_addr(&mut self, expr: &Expr) -> PseudoId {
         let is_lvalue = matches!(
             expr.kind,
             ExprKind::Ident(_)
@@ -3072,6 +3156,13 @@ impl<'a> Linearizer<'a> {
     pub(crate) fn read_object(&mut self, place: ObjectPlace, typ: TypeId) -> PseudoId {
         if self.reject_incomplete_object(typ) {
             return self.emit_const(0, self.types.int_id);
+        }
+        if self.types.is_complex(typ) && self.types.reverses_storage(typ) {
+            let addr = match place {
+                ObjectPlace::Sym(sym) => self.rvalue_addr(sym, typ),
+                ObjectPlace::At(base, offset) => self.offset_address(base, offset),
+            };
+            return self.complex_in_native_order(addr, typ);
         }
         if self.object_reads_as_address(typ) {
             return match place {
@@ -3258,7 +3349,7 @@ impl<'a> Linearizer<'a> {
                 operand,
             } => {
                 let op_typ = self.expr_type(operand);
-                let addr = self.complex_operand_addr(operand);
+                let addr = self.complex_storage_addr(operand);
                 if *op == UnaryOp::Real || !self.types.is_complex(op_typ) {
                     return addr;
                 }
@@ -3309,6 +3400,14 @@ impl<'a> Linearizer<'a> {
         // above, so only -O0 raised it.
         if self.types.kind(cast_type) == TypeKind::Void {
             return self.linearize_expr(inner_expr);
+        }
+
+        // A floating constant to an integer type folds, saturated where it
+        // is out of range, as gcc's front end folds it at every level. A cast
+        // says the program means it, so unlike an implicit conversion
+        // (`linearize_converted`) it draws no warning.
+        if let Some(c) = self.fold_float_to_integer(inner_expr, cast_type) {
+            return self.emit_const(c.value(), cast_type);
         }
 
         // Into or out of a complex type (C17 6.3.1.7), by the rule every
@@ -3506,30 +3605,33 @@ impl<'a> Linearizer<'a> {
         let mut dims: Vec<VmDim> = Vec::new();
         let mut exprs = vm_exprs.iter();
         let mut elem_type = array_type;
-        // An unsized level with no expression is incomplete -- the `[]` of
-        // `int (*p)[][m]` -- and only the outermost may be (6.7.6.2p1), so
-        // the expressions belong to the innermost unsized levels. Handing
-        // them out from the outside gave `m` to the `[]` and left the row
-        // extent 0.
-        let mut incomplete = self
+        // Should a variable level outnumber the expressions, the ones given
+        // belong to the innermost levels, which are the ones a stride needs.
+        let mut unsupplied = self
             .types
-            .unsized_array_levels(array_type)
+            .variable_array_levels(array_type)
             .saturating_sub(vm_exprs.len());
 
         while self.types.kind(elem_type) == TypeKind::Array {
             let level = elem_type;
             elem_type = self.types.base_type(level).unwrap_or(self.types.int_id);
 
-            if let Some(n) = self.types.get(level).array_size {
-                dims.push(VmDim::Const(n));
-                continue;
-            }
-
-            let next = if incomplete == 0 { exprs.next() } else { None };
-            let Some(size_expr) = next else {
-                // Nothing to evaluate and nothing measurable; the entry
-                // keeps every later level at its own index.
-                incomplete = incomplete.saturating_sub(1);
+            let size_expr = match self.types.array_extent(level) {
+                ArrayExtent::Known(n) => {
+                    dims.push(VmDim::Const(n));
+                    continue;
+                }
+                // The `[]` of `int (*p)[][m]`: nothing to evaluate and
+                // nothing measurable; the entry keeps every later level at
+                // its own index.
+                ArrayExtent::Unknown => None,
+                ArrayExtent::Variable if unsupplied > 0 => {
+                    unsupplied -= 1;
+                    None
+                }
+                ArrayExtent::Variable => exprs.next(),
+            };
+            let Some(size_expr) = size_expr else {
                 dims.push(VmDim::Const(0));
                 continue;
             };
@@ -3632,6 +3734,13 @@ impl<'a> Linearizer<'a> {
     /// expression, so `isnan(f())` would call `f` twice.
     fn linearize_fp_test(&mut self, test: FpTest, arg: &Expr) -> PseudoId {
         let typ = self.expr_type(arg);
+        if test == FpTest::IsSignaling {
+            // A constant answers at every level, as gcc's front end does.
+            if let Some(v) = crate::constexpr::eval_float(self, ConstScope::Standard, arg) {
+                let int = self.types.int_id;
+                return self.emit_const(i128::from(v.is_signalling_nan()), int);
+            }
+        }
         let val = self.linearize_expr(arg);
 
         match test {
@@ -3659,7 +3768,136 @@ impl<'a> Linearizer<'a> {
                 self.emit_bool_combine(Opcode::And, finite, magnitude)
             }
             FpTest::SignBit => self.emit_signbit(val, typ),
+            FpTest::IsSignaling => self.emit_is_signaling(val, typ),
         }
+    }
+
+    /// `__builtin_issignaling(x)` of `x`, a value of the real floating type
+    /// `typ`: 1 for a signalling NaN of either sign, 0 otherwise.
+    ///
+    /// A test of the representation, as gcc's is. No floating operation can
+    /// ask: every one of them, a quiet comparison included, delivers a
+    /// signalling NaN quieted or raises *invalid* on it. So `x` is stored to
+    /// a temporary at its own type -- a plain move on every target, which
+    /// keeps the bits -- and read back as integers. Every target is
+    /// little-endian, so the low word is at offset 0.
+    fn emit_is_signaling(&mut self, x: PseudoId, typ: TypeId) -> PseudoId {
+        debug_assert!(self.target.little_endian());
+        let fmt = self
+            .types
+            .fp_format(typ)
+            .expect("issignaling takes a real floating operand");
+        let image = self.frame_temp_addr("__snan", typ);
+        let bits = self.types.size_bits(typ);
+        self.emit(Instruction::store(x, image, 0, typ, bits));
+        let u64t = self.types.ulonglong_id;
+        match fmt {
+            FpFormat::X87Extended => self.x87_is_signaling(image),
+            FpFormat::Binary128 => {
+                // The high word with the low word's "any bit set" folded into
+                // its lowest payload bit, which leaves the test to one word.
+                let lo = self.load_word(image, 0, u64t);
+                let hi = self.load_word(image, 8, u64t);
+                let zero = self.emit_const(0, u64t);
+                let lo_set = self.emit_compare(Opcode::SetNe, lo, zero, u64t);
+                let lo_set = self.emit_convert(lo_set, self.types.int_id, u64t);
+                let hi = self.emit_int_binop(Opcode::Or, hi, lo_set, u64t, 64);
+                self.ieee_word_is_signaling(hi, u64t, 64, 112 - 64)
+            }
+            _ => {
+                let word_typ = match bits {
+                    16 => self.types.ushort_id,
+                    32 => self.types.uint_id,
+                    _ => u64t,
+                };
+                let word = self.load_word(image, 0, word_typ);
+                let (word, word_typ) = match bits {
+                    16 => {
+                        let uint = self.types.uint_id;
+                        (self.emit_convert(word, word_typ, uint), uint)
+                    }
+                    _ => (word, word_typ),
+                };
+                let fraction = fmt.precision() - 1;
+                self.ieee_word_is_signaling(word, word_typ, bits, fraction)
+            }
+        }
+    }
+
+    /// One integer of type `typ` read from `addr + offset`.
+    fn load_word(&mut self, addr: PseudoId, offset: i64, typ: TypeId) -> PseudoId {
+        let value = self.alloc_reg_pseudo();
+        let size = self.types.size_bits(typ);
+        self.emit(Instruction::load(value, addr, offset, typ, size));
+        value
+    }
+
+    /// Whether `word`, the top `width` bits of an IEEE interchange format
+    /// whose `fraction` lowest bits are the trailing significand, is a
+    /// signalling NaN. `word` is zero above `width` and is held in `typ`.
+    ///
+    /// gcc's test: with the sign cleared and the quiet bit flipped, a
+    /// signalling NaN -- exponent all ones, quiet bit clear, payload nonzero
+    /// -- is exactly what lies above the exponent-all-ones-and-quiet-bit
+    /// pattern. A quiet NaN falls below it once its quiet bit is flipped
+    /// away, and an infinity lands on it.
+    fn ieee_word_is_signaling(
+        &mut self,
+        word: PseudoId,
+        typ: TypeId,
+        width: u32,
+        fraction: u32,
+    ) -> PseudoId {
+        let size = self.types.size_bits(typ);
+        let magnitude_mask = (1i128 << (width - 1)) - 1;
+        let quiet = 1i128 << (fraction - 1);
+        let exponent = magnitude_mask & !((1i128 << fraction) - 1);
+        let mask = self.emit_const(magnitude_mask, typ);
+        let magnitude = self.emit_int_binop(Opcode::And, word, mask, typ, size);
+        let quiet_bit = self.emit_const(quiet, typ);
+        let flipped = self.emit_int_binop(Opcode::Xor, magnitude, quiet_bit, typ, size);
+        let threshold = self.emit_const(exponent | quiet, typ);
+        self.emit_compare(Opcode::SetA, flipped, threshold, typ)
+    }
+
+    /// [`Self::emit_is_signaling`] for the x87 80-bit format, whose integer
+    /// bit is explicit (bit 63 of the 64-bit significand at offset 0; the
+    /// quiet bit is 62) and whose sign and exponent are the 16 bits at
+    /// offset 8.
+    ///
+    /// Signalling, as gcc and glibc count it: a NaN with the integer bit set,
+    /// the quiet bit clear and the rest of the significand nonzero -- and
+    /// every encoding with a nonzero exponent and the integer bit clear
+    /// (pseudo-NaN, pseudo-infinity, unnormal), which the x87 no longer
+    /// accepts as an operand and raises *invalid* on, as it does for a
+    /// signalling NaN.
+    fn x87_is_signaling(&mut self, image: PseudoId) -> PseudoId {
+        const INTEGER_BIT: i128 = 1 << 63;
+        const QUIET_BIT: i128 = 1 << 62;
+        let u64t = self.types.ulonglong_id;
+        let uint = self.types.uint_id;
+        let sig = self.load_word(image, 0, u64t);
+        let sign_exp = self.load_word(image, 8, self.types.ushort_id);
+        let sign_exp = self.emit_convert(sign_exp, self.types.ushort_id, uint);
+        let exp_mask = self.emit_const(0x7fff, uint);
+        let exp = self.emit_int_binop(Opcode::And, sign_exp, exp_mask, uint, 32);
+
+        // A NaN with the integer bit set: flipping the quiet bit puts a
+        // signalling one above integer-and-quiet bits alone.
+        let all_ones = self.emit_compare(Opcode::SetEq, exp, exp_mask, uint);
+        let quiet = self.emit_const(QUIET_BIT, u64t);
+        let flipped = self.emit_int_binop(Opcode::Xor, sig, quiet, u64t, 64);
+        let threshold = self.emit_const(INTEGER_BIT | QUIET_BIT, u64t);
+        let payload = self.emit_compare(Opcode::SetA, flipped, threshold, u64t);
+        let nan = self.emit_bool_combine(Opcode::And, all_ones, payload);
+
+        // A nonzero exponent without the integer bit.
+        let zero = self.emit_const(0, uint);
+        let exp_set = self.emit_compare(Opcode::SetNe, exp, zero, uint);
+        let integer = self.emit_const(INTEGER_BIT, u64t);
+        let no_integer = self.emit_compare(Opcode::SetB, sig, integer, u64t);
+        let unnormal = self.emit_bool_combine(Opcode::And, exp_set, no_integer);
+        self.emit_bool_combine(Opcode::Or, nan, unnormal)
     }
 
     /// The C99 7.12.14 relations, each yielding 0 or 1.
@@ -3828,7 +4066,7 @@ impl<'a> Linearizer<'a> {
     /// None unless `expr` is rooted in a local -- or a type-name's value --
     /// whose declaration recorded extents. A pointer's are those of what it
     /// points at, one step further in than the pointer itself.
-    fn vm_type_extents(&self, expr: &Expr) -> Option<(Vec<VmDim>, TypeId)> {
+    pub(crate) fn vm_type_extents(&self, expr: &Expr) -> Option<(Vec<VmDim>, TypeId)> {
         let (symbol_id, depth) = expr.vm_index_base()?;
         let info = self.locals.get(&symbol_id)?;
         let elem = info.vla_elem_type?;
@@ -4414,6 +4652,13 @@ impl<'a> Linearizer<'a> {
         param: Option<TypeId>,
         sig: &CalleeSignature,
     ) -> (PseudoId, TypeId) {
+        // A floating constant for an integer parameter folds, as every
+        // other implicit conversion of one does (`linearize_converted`).
+        if let Some(pt) = param {
+            if let Some(folded) = self.implicit_float_to_integer_const(a, pt) {
+                return (folded, pt);
+            }
+        }
         let mut val = self.linearize_expr(a);
 
         // Implicit argument conversion when actual type differs from
@@ -5194,21 +5439,21 @@ impl<'a> Linearizer<'a> {
         self.file_scope_statics.contains(&name).then_some(name)
     }
 
-    /// Report a reference [`Self::inline_static_reference`] refuses.
+    /// Report a reference [`Self::inline_static_reference`] objects to, in
+    /// gcc's words. A violation of C99 6.7.4p3, but gcc only warns -- an error
+    /// under `-pedantic-errors` -- and real source contains it: ffmpeg's
+    /// `dv_guess_qnos` reads a file-scope `static const int` from an inline
+    /// definition.
     pub(crate) fn check_inline_static_reference(&self, symbol_id: SymbolId) {
         let Some(name) = self.inline_static_reference(symbol_id) else {
             return;
         };
         if let Some(pos) = self.current_pos {
-            let msg = format!(
-                "inline definition of '{}' cannot reference file-scope static variable '{}'",
-                self.current_func_name, name
+            crate::diag::pedwarn_default_args(
+                pos,
+                "'{0}' is static but used in inline function '{1}' which is not static",
+                &[name.as_str(), self.current_func_name.as_str()],
             );
-            // gcc does not enforce this one, so real source contains it --
-            // ffmpeg's `dv_guess_qnos` reads a file-scope `static const int`
-            // from an inline definition. It is relaxed by `-fpermissive`,
-            // which is where c17 keeps the constraints gcc lets through.
-            crate::diag::permissive_error(pos, &msg);
         }
     }
 
@@ -5921,6 +6166,31 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
+            ExprKind::StackSave => {
+                let result = self.alloc_reg_pseudo();
+                self.emit(
+                    Instruction::new(Opcode::StackSave)
+                        .with_target(result)
+                        .with_type_and_size(self.types.void_ptr_id, self.ptr_bits()),
+                );
+                result
+            }
+
+            ExprKind::StackRestore { ptr } => {
+                let mark = self.linearize_expr(ptr);
+                self.emit(
+                    Instruction::new(Opcode::StackRestore)
+                        .with_src(mark)
+                        .with_type_and_size(self.types.void_ptr_id, self.ptr_bits()),
+                );
+                self.emit_const(0, self.types.int_id)
+            }
+
+            ExprKind::ClearPadding { ptr, pointee } => {
+                self.linearize_clear_padding(ptr, *pointee);
+                self.emit_const(0, self.types.int_id)
+            }
+
             ExprKind::FpTest { test, arg } => self.linearize_fp_test(*test, arg),
             ExprKind::FpCompare { cmp, lhs, rhs } => self.linearize_fp_compare(*cmp, lhs, rhs),
 
@@ -5962,31 +6232,44 @@ impl<'a> Linearizer<'a> {
                 result
             }
 
-            ExprKind::Setjmp { env } => {
+            ExprKind::Setjmp { env, kind } => {
                 // setjmp(env) - saves execution context, returns int
                 let env_val = self.linearize_expr(env);
                 let result = self.alloc_pseudo();
 
-                let insn = Instruction::new(Opcode::Setjmp)
-                    .with_func(self.library_function_name("setjmp"))
+                let mut insn = Instruction::new(Opcode::Setjmp)
                     .with_target(result)
                     .with_src(env_val)
                     .with_type_and_size(self.types.int_id, 32);
+                match kind {
+                    JmpKind::Library => insn = insn.with_func(self.library_function_name("setjmp")),
+                    JmpKind::Builtin => insn.extra_mut().jmp_kind = JmpKind::Builtin,
+                }
                 self.emit(insn);
                 result
             }
 
-            ExprKind::Longjmp { env, val } => {
+            ExprKind::Longjmp { env, val, kind } => {
                 // longjmp(env, val) - restores execution context (never returns)
                 let env_val = self.linearize_expr(env);
-                let val_val = self.linearize_expr(val);
                 let result = self.alloc_pseudo();
 
-                let mut insn = Instruction::new(Opcode::Longjmp)
-                    .with_func(self.library_function_name("longjmp"));
+                let mut insn = Instruction::new(Opcode::Longjmp);
                 insn.target = Some(result);
-                insn.src = vec![env_val, val_val];
                 insn.typ = Some(self.types.void_id);
+                match kind {
+                    JmpKind::Library => {
+                        let val_val = self.linearize_expr(val);
+                        insn = insn.with_func(self.library_function_name("longjmp"));
+                        insn.src = vec![env_val, val_val];
+                    }
+                    // The value is the constant 1, which the parser checked,
+                    // and the setjmp's receiver supplies it itself.
+                    JmpKind::Builtin => {
+                        insn.extra_mut().jmp_kind = JmpKind::Builtin;
+                        insn.src = vec![env_val];
+                    }
+                }
                 self.emit_no_return(insn);
                 result
             }
@@ -6575,25 +6858,25 @@ impl<'a> Linearizer<'a> {
     }
 
     /// One extent of an object expression's type, read from the hidden
-    /// locals its object's declaration stored: that of its `level`-th unsized
-    /// array level, which is how [`crate::parse::ast::vm_extent_count`]
-    /// counts them. An incomplete `[]` among them reads as 0.
+    /// locals its object's declaration stored: that of its `level`-th
+    /// variable array level, which is how
+    /// [`crate::parse::ast::vm_extent_count`] counts them.
     fn linearize_vm_object_extent(&mut self, object: &Expr, level: u32) -> PseudoId {
         let typ = self.expr_type(object);
         let array = match self.types.kind(typ) {
             TypeKind::Pointer => self.types.base_type(typ).unwrap_or(typ),
             _ => typ,
         };
-        let mut unsized_at = Vec::new();
+        let mut variable_at = Vec::new();
         let mut cur = array;
         while self.types.kind(cur) == TypeKind::Array {
-            unsized_at.push(self.types.get(cur).array_size.is_none());
+            variable_at.push(self.types.array_extent(cur) == ArrayExtent::Variable);
             cur = self.types.base_type(cur).unwrap_or(self.types.int_id);
         }
-        let position = unsized_at
+        let position = variable_at
             .iter()
             .enumerate()
-            .filter(|(_, is_unsized)| **is_unsized)
+            .filter(|(_, is_variable)| **is_variable)
             .nth(level as usize)
             .map(|(i, _)| i);
         let dim = position.and_then(|i| {
@@ -6671,15 +6954,22 @@ impl<'a> Linearizer<'a> {
             // `__builtin_constant_p`, for an operand the parser could not
             // fold. gcc answers it after optimization, so it is deferred to
             // `sccp` -- and to `ir::lower`, which answers 0 for whatever is
-            // left, including everything at `-O0`.
+            // left. Only an optimizing compile defers: at `-O0` the parser
+            // has answered already.
             //
             // The builtin does not evaluate its argument, so an operand with
-            // side effects is answered 0 outright rather than linearized. A
-            // pure one costs nothing: its computation is dead once the
-            // placeholder folds, and `dce` collects it.
+            // side effects is answered 0 outright rather than linearized, as
+            // gcc does. One without costs nothing: its computation is dead
+            // once `sccp` answers the placeholder, and `dce` collects it
+            // unrun -- which is why a read that may trap, a division or a
+            // floating operation is no objection ([`Evaluation::Discarded`]),
+            // and why `"hi"[0]` is 1.
             ExprKind::ConstantP(inner) => {
-                if !self.is_pure_expr(inner) {
+                if !self.is_discardable(inner) {
                     return self.emit_const(0, self.types.int_id);
+                }
+                if self.types.is_vector(self.expr_type(inner)) {
+                    return self.vector_constant_p(inner);
                 }
                 let operand = self.linearize_expr(inner);
                 let result = self.alloc_reg_pseudo();
@@ -6688,6 +6978,29 @@ impl<'a> Linearizer<'a> {
                         .with_target(result)
                         .with_src(operand)
                         .with_type_and_size(self.types.int_id, 32),
+                );
+                result
+            }
+            // `__builtin_object_size`, for a pointer whose object the parser
+            // could not see. gcc answers it once inlining and propagation have
+            // shown the object, so it is deferred to `ir::objsize`, which
+            // walks the pointer back to it, and to `ir::lower` for anything
+            // left. As for `ConstantP`, the builtin does not evaluate its
+            // argument: gcc answers one with side effects as an unknown
+            // object at once, and a computation without is dead once the
+            // placeholder is answered.
+            ExprKind::ObjectSize { ptr, otype } => {
+                let size_t = self.types.ulong_id;
+                if !self.is_discardable(ptr) {
+                    return self.emit_const(super::objsize::size_constant(otype.unknown()), size_t);
+                }
+                let operand = self.linearize_expr(ptr);
+                let result = self.alloc_reg_pseudo();
+                self.emit(
+                    Instruction::new(Opcode::ObjectSize(*otype))
+                        .with_target(result)
+                        .with_src(operand)
+                        .with_type_and_size(size_t, self.types.size_bits(size_t)),
                 );
                 result
             }
@@ -6912,6 +7225,9 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Popcountl { .. }
             | ExprKind::Popcountll { .. }
             | ExprKind::Alloca { .. }
+            | ExprKind::StackSave
+            | ExprKind::StackRestore { .. }
+            | ExprKind::ClearPadding { .. }
             | ExprKind::FpTest { .. }
             | ExprKind::FpCompare { .. }
             | ExprKind::FpClassify { .. }
@@ -7068,6 +7384,10 @@ mod test_linearize_init;
 #[cfg(test)]
 #[path = "test_linearize_memory.rs"]
 mod test_linearize_memory;
+
+#[cfg(test)]
+#[path = "test_linearize_storage_order.rs"]
+mod test_linearize_storage_order;
 
 #[cfg(test)]
 #[path = "test_linearize_vector.rs"]

@@ -305,11 +305,9 @@ fn diagnostics_variably_modified_jumps_point_at_the_jump() {
 /// #C90 closed the type-name form and left this one: `extern int a[]; sizeof a`
 /// compiled and answered **0**.
 ///
-/// Neither the type nor the completeness helpers can settle it, because
-/// `int[]`, `int[n]` and `int[m]` all intern to one `TypeId` -- the extent
-/// lives on the declarator. `Symbol::array_is_variably_modified` records
-/// whether one was given, so a VLA's `sizeof` keeps working while an
-/// incomplete array's is refused.
+/// The array type's extent settles it: `int[]` is `ArrayExtent::Unknown` and
+/// incomplete, while `int[n]` is `ArrayExtent::Variable` and complete, so a
+/// VLA's `sizeof` keeps working while an incomplete array's is refused.
 #[test]
 fn diagnostics_sizeof_of_an_incomplete_array_expression_is_rejected() {
     for (name, src) in [
@@ -760,4 +758,45 @@ fn diagnostics_floating_literal_is_not_an_integer_constant() {
     ] {
         compile_expect_error(name, src, message);
     }
+}
+
+/// A floating constant an implicit conversion takes out of an integer
+/// type's range draws gcc's `-Woverflow` warning in code as it does in a
+/// static initializer: `return`, initialization, assignment and a prototyped
+/// argument. An explicit cast is silent, as in gcc, and `-Wno-overflow`
+/// silences the rest.
+#[test]
+fn diagnostics_saturating_implicit_conversion_warns() {
+    for (name, src, to) in [
+        ("sat_return", "int f(void) { return 1e10; }\n", "int"),
+        (
+            "sat_init",
+            "int f(void) { int x = -1e10; return x; }\n",
+            "int",
+        ),
+        (
+            "sat_assign",
+            "unsigned f(void) { unsigned u; u = -5.0; return u; }\n",
+            "unsigned int",
+        ),
+        (
+            "sat_arg",
+            "int g(int);\nint f(void) { return g(1e10); }\n",
+            "int",
+        ),
+    ] {
+        let want = format!("overflow in conversion from 'double' to '{to}' changes value");
+        compile_expect_warning(name, src, &want);
+        let quiet = crate::test_compile::compile_expect_warning_with(
+            name,
+            src,
+            &["-Wno-overflow".to_string()],
+        );
+        assert!(!quiet.contains("overflow"), "{name}: {quiet}");
+    }
+    crate::test_compile::compile_expect_no_diagnostic(
+        "sat_cast",
+        "int f(void) { return (int)1e10 + (unsigned char)-1.0; }\n",
+        "overflow",
+    );
 }

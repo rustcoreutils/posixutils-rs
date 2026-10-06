@@ -579,6 +579,30 @@ impl X86_64CodeGen {
         self.stack_alloc_size = alloc_size;
     }
 
+    /// Re-establish an over-aligned frame's base register from `%rbp` alone,
+    /// where a `__builtin_longjmp` resumes and nothing but `%rbp` and `%rsp`
+    /// is restored. The value is the one the prologue latched: `%rsp` just
+    /// after its `subq` is `%rbp` less what was pushed and what was
+    /// allocated, and the `andq` rounds that down.
+    pub(super) fn emit_frame_base_latch_from_rbp(&mut self) {
+        let FrameBase::Aligned { reg, align } = self.frame_base else {
+            return;
+        };
+        let pushed = self.callee_saved_regs.len() as i32 * 8 + self.win64_xmm_area_bytes();
+        self.push_lir(X86Inst::Lea {
+            addr: MemAddr::BaseOffset {
+                base: Reg::Rbp,
+                offset: -(pushed + self.stack_alloc_size),
+            },
+            dst: reg,
+        });
+        self.push_lir(X86Inst::And {
+            size: OperandSize::B64,
+            src: GpOperand::Imm(-(align as i64)),
+            dst: reg,
+        });
+    }
+
     /// Emit stores for arguments spilled from caller-saved registers to stack
     fn store_spilled_args(&mut self, alloc: &RegAlloc) {
         for spilled in alloc.spilled_args() {

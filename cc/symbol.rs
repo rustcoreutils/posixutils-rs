@@ -376,6 +376,11 @@ impl SymbolTable {
         }
     }
 
+    /// The symbols declared in the current scope so far, oldest first.
+    pub fn current_scope_symbols(&self) -> &[SymbolId] {
+        &self.scopes[self.current_scope as usize].symbols
+    }
+
     /// Get the current scope depth
     pub fn depth(&self) -> u32 {
         self.scope_depth

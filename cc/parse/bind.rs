@@ -154,8 +154,10 @@ impl Parser<'_> {
             return nothing();
         }
 
+        let declared_before = self.symbols.current_scope_symbols().len();
         let mut specs = self.parse_decl_specs(scope)?;
         if scope == (DeclScope::Block { for_init: true }) {
+            self.check_for_init_declares_no_enumerator(declared_before, specs.pos);
             self.check_for_init_declares_no_tag(&specs);
         }
         let mut declarators = Vec::new();
@@ -235,6 +237,29 @@ impl Parser<'_> {
                 &[keyword, self.idents.get_opt(tag).unwrap_or("")],
             );
         }
+    }
+
+    /// C17 6.8.5p3: an enumeration constant the `for` declaration's
+    /// specifiers introduce -- `for (enum { A } e;;)` -- is not an object.
+    /// Every symbol the specifiers added to the `for`'s own scope sits after
+    /// `declared_before`.
+    fn check_for_init_declares_no_enumerator(&self, declared_before: usize, pos: Position) {
+        for &id in &self.symbols.current_scope_symbols()[declared_before..] {
+            let sym = self.symbols.get(id);
+            if sym.is_enum_constant() {
+                self.report_for_init_non_variable(sym.name, pos);
+            }
+        }
+    }
+
+    /// gcc's words for a `for` declaration that declares something other
+    /// than an object (C17 6.8.5p3).
+    fn report_for_init_non_variable(&self, name: StringId, pos: Position) {
+        diag::error_args(
+            pos,
+            "declaration of non-variable '{0}' in 'for' loop initial declaration",
+            &[self.idents.get_opt(name).unwrap_or("")],
+        );
     }
 
     /// Parse the declaration specifiers and check what they may combine.
@@ -422,14 +447,12 @@ impl Parser<'_> {
             }
         }
 
+        // C17 6.8.5p3: a `for` declaration declares objects; a typedef name
+        // and a function are not.
+        if (is_typedef || is_fn) && scope == (DeclScope::Block { for_init: true }) {
+            self.report_for_init_non_variable(name, pos);
+        }
         let (symbol, init) = if is_typedef {
-            if scope == (DeclScope::Block { for_init: true }) {
-                diag::error_args(
-                    pos,
-                    "declaration of non-variable '{0}' in 'for' loop initial declaration",
-                    &[self.idents.get_opt(name).unwrap_or("")],
-                );
-            }
             typ = self.align_typedef_type(typ, align);
             (self.bind_typedef_name(scope, name, pos, typ, &vla)?, None)
         } else {

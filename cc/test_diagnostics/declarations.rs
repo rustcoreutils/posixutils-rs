@@ -194,6 +194,39 @@ fn storage_classes_where_they_belong() {
             "void f(void) { for (struct S { int a; } s = {0};;) break; }\n",
             "'struct S' declared in 'for' loop initial declaration",
         ),
+        // C17 6.8.5p3: a function is not an object, however its type is
+        // spelled -- a declarator, a parenthesized one, a typedef, or an old
+        // style list -- nor is an enumeration constant.
+        (
+            "sc_for_function",
+            "void f(void) { for (int g(void);;) break; }\n",
+            "declaration of non-variable 'g' in 'for' loop initial declaration",
+        ),
+        (
+            "sc_for_function_second",
+            "void f(void) { for (int a = 0, g(void);;) break; }\n",
+            "declaration of non-variable 'g' in 'for' loop initial declaration",
+        ),
+        (
+            "sc_for_function_paren",
+            "void f(void) { for (int (g)(void);;) break; }\n",
+            "declaration of non-variable 'g' in 'for' loop initial declaration",
+        ),
+        (
+            "sc_for_function_typedef",
+            "typedef int F(void);\nvoid f(void) { for (F g;;) break; }\n",
+            "declaration of non-variable 'g' in 'for' loop initial declaration",
+        ),
+        (
+            "sc_for_function_knr",
+            "void f(void) { for (int g();;) break; }\n",
+            "declaration of non-variable 'g' in 'for' loop initial declaration",
+        ),
+        (
+            "sc_for_enumerator",
+            "void f(void) { for (enum { A, B } e = A;;) break; }\n",
+            "declaration of non-variable 'B' in 'for' loop initial declaration",
+        ),
         (
             "vm_typedef_redef",
             "void f(int n) { typedef int T[n]; typedef int T[n]; }\n",
@@ -205,6 +238,16 @@ fn storage_classes_where_they_belong() {
         "struct P { int q; };\n\
          void f(int n) { static _Thread_local int a; extern _Thread_local int b; \
          for (struct P *p = 0; p; ) break; (void)a; (void)n; }\n",
+    );
+    // A pointer to a function, an array of them, and an object of an
+    // untagged type are all objects.
+    compile_expect_ok(
+        "sc_for_objects_ok",
+        "int g(void) { return 0; }\n\
+         int f(void) { int r = 0; \
+         for (int (*p)(void) = g, (*q[1])(void) = { g }; r < 1; r++) r += p() + q[0](); \
+         for (struct { int x; } s = { 1 }; s.x; s.x--) r++; \
+         for (register int i = 0, j = 1; i < j; i++) r++; return r; }\n",
     );
     // gcc's global register variable names its register, and is accepted.
     if cfg!(target_arch = "x86_64") {

@@ -497,6 +497,16 @@ fn write_file<W: ArchiveWriter>(
 
     // Check for hard link
     if let Some(original_path) = link_tracker.check(&entry) {
+        // The same file met again under the very name it was first archived
+        // as (`pax -w f f`, or `find tree | pax -w` reaching it from both the
+        // list and the walk). "f == f" extracts by unlinking f and then failing
+        // to link it, and archiving the data again would split f from any
+        // other name linked to it in between. The earlier member already says
+        // everything this one could.
+        if original_path == entry.path {
+            return Ok(());
+        }
+
         // Only claim the link in formats that can express one. cpio cannot, so
         // recording the type there would degrade the member to a regular file
         // -- and combined with the size=0 below, to an empty one.

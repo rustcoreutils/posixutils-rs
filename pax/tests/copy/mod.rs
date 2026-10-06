@@ -758,3 +758,43 @@ fn test_copy_hard_link_follows_the_sanitized_member_name() {
         "the second name is not a link to the first copy"
     );
 }
+
+/// `pax -rwl tree .` names each source file as its own destination. linkat()
+/// reports EEXIST, and the replace-on-EEXIST path must not then unlink the
+/// name -- it is the source. BSD pax says "Unable to link file to itself" and
+/// leaves the tree alone.
+#[test]
+fn test_copy_link_onto_itself_keeps_source() {
+    let temp = TempDir::new().unwrap();
+    let tree = temp.path().join("tree");
+    fs::create_dir(&tree).unwrap();
+    fs::write(tree.join("f"), "DATA\n").unwrap();
+    fs::hard_link(tree.join("f"), tree.join("g")).unwrap();
+    fs::write(tree.join("s"), "x\n").unwrap();
+
+    run_pax_in_dir(&["-rwl", "tree", "."], temp.path());
+
+    assert_eq!(fs::read_to_string(tree.join("f")).unwrap(), "DATA\n");
+    assert_eq!(fs::read_to_string(tree.join("g")).unwrap(), "DATA\n");
+    assert_eq!(fs::read_to_string(tree.join("s")).unwrap(), "x\n");
+}
+
+/// A multiply-linked file reached twice -- `find tree | pax -rw` visits it as
+/// an operand and again while walking `tree` -- must still come out as both
+/// of its names, not lose one to a link of the destination onto itself.
+#[test]
+fn test_copy_hardlink_visited_twice() {
+    let temp = TempDir::new().unwrap();
+    let tree = temp.path().join("tree");
+    let out = temp.path().join("out");
+    fs::create_dir(&tree).unwrap();
+    fs::create_dir(&out).unwrap();
+    fs::write(tree.join("f"), "DATA\n").unwrap();
+    fs::hard_link(tree.join("f"), tree.join("g")).unwrap();
+
+    let output = run_pax_in_dir_with_stdin(&["-rw", "out"], temp.path(), "tree\ntree/f\ntree/g\n");
+    assert_success(&output, "pax -rw of a list naming a hard link twice");
+
+    assert_eq!(fs::read_to_string(out.join("tree/f")).unwrap(), "DATA\n");
+    assert_eq!(fs::read_to_string(out.join("tree/g")).unwrap(), "DATA\n");
+}

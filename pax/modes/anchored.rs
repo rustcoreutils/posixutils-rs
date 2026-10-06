@@ -267,6 +267,60 @@ where
     }
 }
 
+/// Hard-link `from_name` (in `from_dir`) to `name` (in `dirfd`), replacing
+/// whatever holds `name` the way `create_replacing` does -- unless it already
+/// *is* the file being linked.
+///
+/// That case cannot go through the unlink-and-retry: the name in the way may
+/// be the link source itself (`pax -rwl tree .`, or a member linked to its own
+/// name), and unlinking it destroys the only thing there was to link. Nothing
+/// is changed and `true` is returned; the caller decides whether that merits a
+/// diagnostic. Identity is (dev, ino) of both names, neither followed, since
+/// `linkat` with flags 0 links the name itself.
+pub(crate) fn link_replacing(
+    from_dir: libc::c_int,
+    from_name: &CStr,
+    dirfd: BorrowedFd<'_>,
+    name: &CStr,
+    no_clobber: bool,
+) -> PaxResult<bool> {
+    let link = || {
+        // flags 0: link `from_name` itself, never anything it points at.
+        let r = unsafe {
+            libc::linkat(
+                from_dir,
+                from_name.as_ptr(),
+                dirfd.as_raw_fd(),
+                name.as_ptr(),
+                0,
+            )
+        };
+        if r != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    };
+
+    match link() {
+        Ok(()) => return Ok(false),
+        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    if no_clobber {
+        return Ok(false);
+    }
+    if let (Some(src), Some(dst)) = (stat_raw(from_dir, from_name), stat_at(dirfd, name)) {
+        if (src.st_dev, src.st_ino) == (dst.st_dev, dst.st_ino) {
+            return Ok(true);
+        }
+    }
+
+    unlink_at(dirfd, name)?;
+    link()?;
+    Ok(false)
+}
+
 /// Open a source file from the descriptor of the directory it was found in.
 ///
 /// One component, resolved once, rather than a whole pathname re-resolved by
@@ -520,15 +574,13 @@ pub(crate) fn set_link_attrs_at(
 /// `fstatat` with `AT_SYMLINK_NOFOLLOW`, for asking what a name *is* without
 /// following it anywhere.
 pub(crate) fn stat_at(dirfd: BorrowedFd<'_>, name: &CStr) -> Option<libc::stat> {
+    stat_raw(dirfd.as_raw_fd(), name)
+}
+
+/// The same, from a raw directory descriptor such as a walk entry's.
+fn stat_raw(dirfd: libc::c_int, name: &CStr) -> Option<libc::stat> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let r = unsafe {
-        libc::fstatat(
-            dirfd.as_raw_fd(),
-            name.as_ptr(),
-            &mut st,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
+    let r = unsafe { libc::fstatat(dirfd, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
     (r == 0).then_some(st)
 }
 
@@ -608,5 +660,40 @@ mod tests {
         assert_eq!(policy(true, true).creation_mode(&attrs(0o4755)), 0o755);
         // Without -p p the normal file-creation action applies the umask.
         assert_eq!(policy(false, false).creation_mode(&attrs(0o4777)), 0o755);
+    }
+
+    /// A link onto a name that already is the source must keep the file:
+    /// unlinking it to retry would destroy what was to be linked.
+    #[test]
+    fn test_link_replacing_onto_itself_keeps_the_file() {
+        let temp = plib::tmp::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("f"), "DATA\n").unwrap();
+        let dir = DirTree::open_path(temp.path()).unwrap();
+        let f = CString::new("f").unwrap();
+
+        let same = link_replacing(dir.root().as_raw_fd(), &f, dir.root(), &f, false).unwrap();
+        assert!(same, "the name was already the source");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("f")).unwrap(),
+            "DATA\n"
+        );
+    }
+
+    /// Any other file in the way is still replaced by the link.
+    #[test]
+    fn test_link_replacing_replaces_another_file() {
+        let temp = plib::tmp::TempDir::new().unwrap();
+        std::fs::write(temp.path().join("f"), "DATA\n").unwrap();
+        std::fs::write(temp.path().join("g"), "old\n").unwrap();
+        let dir = DirTree::open_path(temp.path()).unwrap();
+        let f = CString::new("f").unwrap();
+        let g = CString::new("g").unwrap();
+
+        let same = link_replacing(dir.root().as_raw_fd(), &f, dir.root(), &g, false).unwrap();
+        assert!(!same);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("g")).unwrap(),
+            "DATA\n"
+        );
     }
 }

@@ -17,8 +17,8 @@ use crate::archive::HardLinkTracker;
 use crate::error::{PaxError, PaxResult};
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
-    create_replacing, open_dir_at, set_attrs_fd, set_link_attrs_at, stat_at, AttrPolicy, Attrs,
-    DirTree, MemberPath,
+    create_replacing, link_replacing, open_dir_at, set_attrs_fd, set_link_attrs_at, stat_at,
+    AttrPolicy, Attrs, DirTree, MemberPath,
 };
 use crate::pattern::{matches_any, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
@@ -587,26 +587,22 @@ fn copy_file(
 
     // -l: link to the source rather than copying it.
     if options.link {
-        let linked = create_replacing(dirfd, name, options.no_clobber, || {
-            // From the descriptor of the directory the walk found it in, not
-            // by re-resolving the whole source path. flags 0: link the source
-            // itself, never what it points at.
-            let r = unsafe {
-                libc::linkat(
-                    entry.dir_fd(),
-                    entry.file_name().as_ptr(),
-                    dirfd.as_raw_fd(),
-                    name.as_ptr(),
-                    0,
-                )
-            };
-            if r != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+        // From the descriptor of the directory the walk found it in, not by
+        // re-resolving the whole source path. Never by unlinking the source:
+        // `pax -rwl tree .` names every file as its own destination.
+        let linked = link_replacing(
+            entry.dir_fd(),
+            entry.file_name(),
+            dirfd,
+            name,
+            options.no_clobber,
+        );
         match linked {
-            Ok(_) => return Ok(()),
+            Ok(false) => return Ok(()),
+            Ok(true) => {
+                crate::error::report_error(src, "Unable to link file to itself");
+                return Ok(());
+            }
             Err(e) => {
                 // Hard link failed (maybe cross-device), fall back to copy
                 crate::error::report_error(src, format!("hard link failed, copying: {e}"));
@@ -631,24 +627,17 @@ fn copy_file(
             return do_copy_file(entry, dirfd, name, metadata, options);
         };
         let target_dir = tree.parent_of(&target, false)?;
-        create_replacing(dirfd, name, options.no_clobber, || {
-            // Resolved one component at a time from the destination anchor, the
-            // same way the file itself was created. flags 0: link that file
-            // itself, never anything it might point at.
-            let r = unsafe {
-                libc::linkat(
-                    target_dir.as_raw_fd(),
-                    target.leaf.as_ptr(),
-                    dirfd.as_raw_fd(),
-                    name.as_ptr(),
-                    0,
-                )
-            };
-            if r != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        })?;
+        // Resolved one component at a time from the destination anchor, the
+        // same way the file itself was created. A name that already is that
+        // copy -- this very name visited again, from the list and from the
+        // walk -- is left alone rather than unlinked out from under itself.
+        link_replacing(
+            target_dir.as_raw_fd(),
+            &target.leaf,
+            dirfd,
+            name,
+            options.no_clobber,
+        )?;
         return Ok(());
     }
 

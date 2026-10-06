@@ -14,7 +14,7 @@ use crate::error::{PaxError, PaxResult};
 use crate::formats::{CpioReader, PaxReader, UstarReader};
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
-    create_replacing, set_attrs_fd, stat_at, AttrPolicy, Attrs, DirTree, MemberPath,
+    create_replacing, link_replacing, set_attrs_fd, stat_at, AttrPolicy, Attrs, DirTree, MemberPath,
 };
 use crate::pattern::{find_matching_pattern_subtree, matches_excluded, Pattern};
 use crate::subst::{apply_substitutions, SubstResult, Substitution};
@@ -637,25 +637,18 @@ fn extract_hardlink(
     // the target must already have been extracted.
     let target_parent = tree.parent_of(&target_member, false)?;
 
-    create_replacing(dirfd, name, options.no_clobber, || {
-        // flags = 0, never AT_SYMLINK_FOLLOW. fs::hard_link resolves the whole
-        // target path, so a symlink planted at the target -- possibly by an
-        // earlier member of this very archive -- could link a file from outside
-        // the extraction directory into it.
-        let r = unsafe {
-            libc::linkat(
-                target_parent.as_raw_fd(),
-                target_member.leaf.as_ptr(),
-                dirfd.as_raw_fd(),
-                name.as_ptr(),
-                0,
-            )
-        };
-        if r != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    })?;
+    // flags = 0, never AT_SYMLINK_FOLLOW. fs::hard_link resolves the whole
+    // target path, so a symlink planted at the target -- possibly by an
+    // earlier member of this very archive -- could link a file from outside
+    // the extraction directory into it. A member linked to its own name, or
+    // to a name it already shares, finds the file in place and keeps it.
+    link_replacing(
+        target_parent.as_raw_fd(),
+        &target_member.leaf,
+        dirfd,
+        name,
+        options.no_clobber,
+    )?;
 
     Ok(())
 }

@@ -1177,3 +1177,24 @@ fn test_reset_atime_stamps_the_file_that_was_read() {
         "-L -t left the target's access time disturbed"
     );
 }
+
+/// The same multiply-linked file named twice must not be archived as a hard
+/// link to itself: extracting "f == f" unlinks f and then fails to link it.
+#[test]
+fn test_hardlink_operand_repeated_roundtrip() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let dst = temp.path().join("dst");
+    fs::create_dir(&src).unwrap();
+    fs::create_dir(&dst).unwrap();
+    fs::write(src.join("f"), "DATA\n").unwrap();
+    fs::hard_link(src.join("f"), src.join("g")).unwrap();
+    let archive = temp.path().join("a.tar");
+
+    let output = run_pax_in_dir(&["-w", "-f", archive.to_str().unwrap(), "f", "f"], &src);
+    assert_success(&output, "pax -w f f");
+
+    let output = run_pax_in_dir(&["-r", "-f", archive.to_str().unwrap()], &dst);
+    assert_success(&output, "pax -r of an archive naming f twice");
+    assert_eq!(fs::read_to_string(dst.join("f")).unwrap(), "DATA\n");
+}

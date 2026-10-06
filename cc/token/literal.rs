@@ -65,6 +65,9 @@ pub(crate) enum Escaped {
         spelled: u32,
         digits: u8,
     },
+    /// `\x` with no hex digit after it (C17 6.4.4.4p1 requires one). It
+    /// names nothing, so it is an error; it decodes as its letter.
+    EmptyHex,
 }
 
 /// An octal or hexadecimal escape's value.
@@ -152,6 +155,7 @@ pub(crate) fn check_elements(elements: &[Escaped], unit_bits: u32, pos: Position
                     &format!("incomplete universal character name \\{letter}{digits}"),
                 );
             }
+            Escaped::EmptyHex => crate::diag::error(pos, "\\x used with no following hex digits"),
             Escaped::Numeric(n) if !n.fits(unit_bits) => {
                 crate::diag::pedwarn_default(pos, n.out_of_range_message())
             }
@@ -248,7 +252,7 @@ pub(crate) fn parse_escape_sequence(chars: &[char], i: usize) -> (Escaped, usize
                     1 + hex_chars,
                 )
             } else {
-                (Escaped::Unit(u32::from(b'x')), 1) // \x with no hex digits - just 'x'
+                (Escaped::EmptyHex, 1)
             }
         }
         'u' => {
@@ -414,6 +418,10 @@ pub(crate) fn literal_utf16_units(elements: &[Escaped]) -> Vec<u16> {
                 flush(&mut run, &mut out);
                 out.push(if *long { 'U' } else { 'u' } as u16);
             }
+            Escaped::EmptyHex => {
+                flush(&mut run, &mut out);
+                out.push(u16::from(b'x'));
+            }
         }
     }
     flush(&mut run, &mut out);
@@ -474,6 +482,7 @@ pub(crate) fn literal_bytes(elements: &[Escaped]) -> String {
             // written so the rest of the literal still makes sense.
             Escaped::ForbiddenUcn(v) => out.push(*v as u8 as char),
             Escaped::IncompleteUcn { long, .. } => out.push(if *long { 'U' } else { 'u' }),
+            Escaped::EmptyHex => out.push('x'),
             Escaped::CodePoint(c) => {
                 let mut buf = [0u8; 4];
                 for b in c.encode_utf8(&mut buf).as_bytes() {
@@ -517,6 +526,10 @@ pub(crate) fn literal_wide_chars(elements: &[Escaped]) -> Vec<u32> {
             Escaped::IncompleteUcn { long, .. } => {
                 flush(&mut run, &mut out);
                 out.push(if *long { 'U' } else { 'u' } as u32);
+            }
+            Escaped::EmptyHex => {
+                flush(&mut run, &mut out);
+                out.push(u32::from(b'x'));
             }
             Escaped::CodePoint(c) => {
                 flush(&mut run, &mut out);

@@ -58,6 +58,16 @@ const DEFAULT_PEDWARNS: &[(&str, &str, &str)] = &[
         "integer overflow in preprocessor expression",
     ),
     (
+        "addition_overflow_in_if",
+        "#if 9223372036854775807 + 1\n#endif\nint x;\n",
+        "integer overflow in preprocessor expression",
+    ),
+    (
+        "negation_overflow_in_if",
+        "#if -(-9223372036854775807 - 1)\n#endif\nint x;\n",
+        "integer overflow in preprocessor expression",
+    ),
+    (
         "va_opt_in_non_variadic_macro",
         "#define F(a) __VA_OPT__(a)\nint x;\n",
         "__VA_OPT__ is only meaningful in a variadic macro",

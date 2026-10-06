@@ -376,7 +376,7 @@ fn preprocessor_null_directive_keeps_the_following_line() {
     assert!(r.success, "null directive should not fail: {}", r.stderr);
     assert_has(&r.stdout, "kept_one", "#P2");
     assert_has(&r.stdout, "kept_two", "#P2");
-    assert_lacks(&r.stderr, "unknown preprocessor directive", "#P2");
+    assert_lacks(&r.stderr, "invalid preprocessing directive", "#P2");
 }
 
 /// A null directive must not disturb the directives around it.
@@ -1519,10 +1519,10 @@ fn preprocessor_malformed_if_is_diagnosed() {
     }
 }
 
-/// A shift count outside [0, 64) is undefined. c17 clamps it, which is a fine
-/// answer, but clamping in silence made `#if (1 << 64) == 0` false with
-/// nothing to explain it. gcc warns rather than erroring, so the expression
-/// still evaluates and the file still compiles.
+/// A shift count outside [0, 64) is undefined. c17 gives gcc's value -- every
+/// bit shifted out, so `(1 << 64) == 0` holds -- and gcc's warning, since a
+/// set bit of a signed value was lost. A warning rather than an error, so
+/// the expression still evaluates and the file still compiles.
 #[test]
 fn preprocessor_out_of_range_shift_warns() {
     let src = "#if (1 << 64) == 0\nint taken = 1;\n#endif\nint main(void){return 0;}\n";
@@ -1538,6 +1538,7 @@ fn preprocessor_out_of_range_shift_warns() {
         "expected an overflow warning, got:\n{}",
         r.stderr
     );
+    assert!(r.stdout.contains("int taken = 1;"), "{}", r.stdout);
 }
 
 /// A short-circuited operand is not evaluated, so nothing in it may be

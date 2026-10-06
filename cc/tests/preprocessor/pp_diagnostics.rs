@@ -265,3 +265,85 @@ fn pp_paste_result_keeps_left_operand_spacing() {
         r.stdout
     );
 }
+
+/// `-E` decodes no literal, so gcc says nothing about `\x` with no digits
+/// and copies it through; only a compile refuses it.
+#[test]
+fn pp_empty_hex_escape_is_copied_quietly() {
+    let r = preprocess_text(
+        "hex_e",
+        "const char *s = \"\\x\";\nint c = '\\x';\n",
+        &["-P"],
+    );
+    assert!(r.success && r.stderr.is_empty(), "{}", r.stderr);
+    assert!(r.stdout.contains("\"\\x\""), "{}", r.stdout);
+    let c = crate::common::compile_rejected("hex_c", "const char *s = \"\\x\";\n");
+    assert!(
+        c.contains("error: \\x used with no following hex digits"),
+        "{c}"
+    );
+}
+
+/// gcc's `-E` gives its pedwarn about a literal left open and copies the
+/// line as written -- no quote is invented; a compile refuses the token.
+#[test]
+fn pp_unterminated_literal_is_copied_as_written() {
+    let src = "const char *s = \"abc;\nint c = 'a;\nint x;\n";
+    let r = preprocess_text("open_literal_e", src, &["-P"]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(
+        r.stderr
+            .contains("warning: missing terminating \" character")
+            && r.stderr
+                .contains("warning: missing terminating ' character"),
+        "{}",
+        r.stderr
+    );
+    assert!(r.stdout.contains("= \"abc;\n"), "{}", r.stdout);
+    assert!(r.stdout.contains("= 'a;\n"), "{}", r.stdout);
+    let c = crate::common::compile_rejected(
+        "open_literal_c",
+        "unsigned long n = sizeof \"abc\n;\nint main(void){return 0;}\n",
+    );
+    assert!(c.contains("error: missing terminating \" character"), "{c}");
+}
+
+/// An unterminated comment and an invalid directive are errors under `-E`
+/// as well, as gcc's are.
+#[test]
+fn pp_unterminated_comment_and_invalid_directive_fail() {
+    for (name, src, msg) in [
+        (
+            "open_comment_e",
+            "int a;\n/* foo\n",
+            "error: unterminated comment",
+        ),
+        (
+            "bad_directive_e",
+            "#foo bar\nint x;\n",
+            "error: invalid preprocessing directive #foo",
+        ),
+    ] {
+        let r = preprocess_text(name, src, &[]);
+        assert!(!r.success, "{name}: should fail:\n{}", r.stderr);
+        assert!(r.stderr.contains(msg), "{name}: {}", r.stderr);
+    }
+}
+
+/// gcc's default pedwarn for signed overflow in `#if`, which `-w` hides.
+#[test]
+fn pp_if_signed_overflow_warns() {
+    let src = "#if 9223372036854775807 + 1\n#endif\n#if 9223372036854775807 + 1u\n#endif\n";
+    let r = preprocess_text("if_overflow", src, &[]);
+    assert!(r.success, "{}", r.stderr);
+    assert_eq!(
+        r.stderr
+            .matches("warning: integer overflow in preprocessor expression")
+            .count(),
+        1,
+        "{}",
+        r.stderr
+    );
+    let quiet = preprocess_text("if_overflow_w", src, &["-w"]);
+    assert!(quiet.success && quiet.stderr.is_empty(), "{}", quiet.stderr);
+}

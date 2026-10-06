@@ -532,7 +532,7 @@ fn driver_asm_apostrophe_in_comment() {
         r.stderr
     );
     assert!(
-        !r.stderr.contains("unknown preprocessor directive"),
+        !r.stderr.contains("invalid preprocessing directive"),
         "a `#` comment was reported as a directive:\n{}",
         r.stderr
     );

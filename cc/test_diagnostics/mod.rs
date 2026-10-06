@@ -49,6 +49,7 @@ mod incomplete_types;
 mod inline_static_reference;
 mod jumps_and_characters;
 mod keywords_and_suffixes;
+mod lexical_errors;
 mod misc;
 mod objects_and_constants;
 mod permissive;

@@ -665,8 +665,12 @@ impl<'a> Preprocessor<'a> {
                     result.push('\\');
                     result.push('"');
                     result.push_str(&escape_c_string(s));
-                    result.push('\\');
-                    result.push('"');
+                    // A literal left open is spelled as written, as gcc
+                    // stringifies it: without the quote it never had.
+                    if !token.is_unterminated_literal() {
+                        result.push('\\');
+                        result.push('"');
+                    }
                 }
                 TokenValue::Char(c)
                 | TokenValue::WideChar(c)
@@ -681,7 +685,9 @@ impl<'a> Preprocessor<'a> {
                     // C99 6.10.3.2p2: insert \ before each " and \ in char constants
                     result.push('\'');
                     result.push_str(&escape_c_string(c));
-                    result.push('\'');
+                    if !token.is_unterminated_literal() {
+                        result.push('\'');
+                    }
                 }
                 // 6.10.3.2p2 asks for "the spelling of the preprocessing
                 // token", which for a punctuator means its own spelling: a

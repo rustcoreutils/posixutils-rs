@@ -2269,3 +2269,159 @@ fn test_storage_order_pragma_becomes_a_layout_marker() {
         "#pragma scalar_storage_order default"
     );
 }
+
+/// Preprocess `src` and return every diagnostic it produced.
+fn preprocess_diagnostics(src: &str) -> Vec<String> {
+    crate::diag::capture_diagnostics();
+    preprocess_str(src);
+    crate::diag::take_captured_diagnostics()
+}
+
+/// Whether any diagnostic line contains `needle`.
+fn mentions(lines: &[String], needle: &str) -> bool {
+    lines.iter().any(|l| l.contains(needle))
+}
+
+/// C17 6.10p1: a `#` that starts a line in an active group begins a
+/// directive, and one whose name is none of the directives is invalid. gcc
+/// errors, naming the token that follows the `#`.
+#[test]
+fn test_invalid_directive_is_an_error() {
+    for (src, spelled) in [
+        ("#foo\nint x;\n", "#foo"),
+        ("#foo bar baz\nint x;\n", "#foo"),
+        ("#Define X 1\nint x;\n", "#Define"),
+        ("#!foo\nint x;\n", "#!"),
+        ("#+\nint x;\n", "#+"),
+        ("#\"x\"\nint x;\n", "#\"x\""),
+    ] {
+        let lines = preprocess_diagnostics(src);
+        let want = format!("error: invalid preprocessing directive {spelled}");
+        assert!(
+            lines.iter().any(|l| l.ends_with(&want)),
+            "{src:?}: expected {want:?}, got {lines:?}"
+        );
+    }
+}
+
+/// A linemarker's line number must be a number: gcc's error names the token.
+#[test]
+fn test_linemarker_needs_a_positive_integer() {
+    let lines = preprocess_diagnostics("# 12abc\nint x;\n");
+    assert!(
+        mentions(&lines, "error: \"12abc\" after # is not a positive integer"),
+        "{lines:?}"
+    );
+}
+
+/// The null directive and a linemarker are valid, and a skipped group is
+/// only scanned for the directives that nest: gcc says nothing about any of
+/// these.
+#[test]
+fn test_valid_and_skipped_directives_are_quiet() {
+    let lines = preprocess_diagnostics(
+        "#\n# 33 \"file.c\"\n#123\n#if 0\n#foo\n#!\n#+ bar\n# 12abc\n#endif\nint x;\n",
+    );
+    assert!(lines.is_empty(), "{lines:?}");
+}
+
+/// In assembly `#` also introduces a comment, so a line naming no directive
+/// is prose. gcc passes it through without a word.
+#[test]
+fn test_assembly_leaves_unknown_directives_alone() {
+    crate::diag::capture_diagnostics();
+    let out = preprocess_asm_file(
+        b"# save the frame pointer\n#! odd\n#foo bar\n\tnop\n",
+        &Target::host(),
+        "t.S",
+        &AsmPreprocessConfig::default(),
+    );
+    let lines = crate::diag::take_captured_diagnostics();
+    assert!(out.is_ok(), "{lines:?}");
+    assert!(lines.is_empty(), "{lines:?}");
+}
+
+/// C17 6.10.1p4 evaluates `#if` in `intmax_t`, where signed overflow is
+/// undefined. gcc's default pedwarn "integer overflow in preprocessor
+/// expression" covers `+`, `-`, `*`, `/`, unary `-` and a signed left shift
+/// that loses bits -- and nothing in the unsigned domain, `%`, a right shift,
+/// or an operand that is not evaluated.
+#[test]
+fn test_if_signed_overflow_is_diagnosed_as_gcc_does() {
+    const MAX: &str = "9223372036854775807";
+    let cases: &[(String, bool)] = &[
+        (format!("{MAX} + 1"), true),
+        (format!("-{MAX} - 2"), true),
+        (format!("{MAX} * 2"), true),
+        (format!("-{MAX} * 2"), true),
+        ("4294967296 * 4294967296".to_string(), true),
+        (format!("(-{MAX}-1) * -1"), true),
+        (format!("(-{MAX}-1) / -1"), true),
+        (format!("-(-{MAX}-1)"), true),
+        ("1 << 63".to_string(), true),
+        ("3 << 62".to_string(), true),
+        ("2 << 62".to_string(), true),
+        ("1 << 64".to_string(), true),
+        ("-1 << 64".to_string(), true),
+        ("4 >> -62".to_string(), true),
+        ("1 >> -64".to_string(), true),
+        ("1 << 18446744073709551615u".to_string(), true),
+        (format!("-{MAX} - 1"), false),
+        (format!("{MAX} * -1"), false),
+        (format!("(-{MAX}-1) % -1"), false),
+        (format!("{MAX} + 1u"), false),
+        ("18446744073709551615u + 1".to_string(), false),
+        ("0u - 1".to_string(), false),
+        ("-1 + 0u".to_string(), false),
+        ("~0 + 1".to_string(), false),
+        ("1 << 62".to_string(), false),
+        ("-1 << 1".to_string(), false),
+        ("-1 << 63".to_string(), false),
+        ("0 << 64".to_string(), false),
+        ("1u << 63".to_string(), false),
+        ("1u << 64".to_string(), false),
+        ("1 >> 64".to_string(), false),
+        ("-1 >> 70".to_string(), false),
+        ("1 << -1".to_string(), false),
+        (format!("0 && {MAX} + 1"), false),
+        (format!("1 || {MAX} * 2"), false),
+        (format!("0 ? ({MAX} + 1) : 1"), false),
+    ];
+    let faults: Vec<String> = cases
+        .iter()
+        .filter_map(|(expr, overflows)| {
+            let lines = preprocess_diagnostics(&format!("#if {expr}\n#endif\nint x;\n"));
+            let warned = mentions(
+                &lines,
+                "warning: integer overflow in preprocessor expression",
+            );
+            let other = lines
+                .iter()
+                .any(|l| !l.contains("integer overflow in preprocessor expression"));
+            (warned != *overflows || other).then(|| format!("#if {expr}: {lines:?}"))
+        })
+        .collect();
+    assert!(faults.is_empty(), "{}", faults.join("\n"));
+}
+
+/// The value of an out-of-range shift is gcc's: a negative count shifts the
+/// other way, and a count of 64 or more shifts every bit out.
+#[test]
+fn test_if_shift_values_match_gcc() {
+    for cond in [
+        "(1 << -1) == 0",
+        "(4 >> -1) == 8",
+        "(1u << 64) == 0",
+        "(1 << 64) == 0",
+        "(1 >> 64) == 0",
+        "(-1 >> 70) == -1",
+        "(-1 << 64) == 0",
+        "(1 << 63) < 0",
+        "!((4 >> -62) < 0)",
+        "(1 >> -64) == 0",
+        "(1 << 18446744073709551615u) == 0",
+    ] {
+        let (tokens, idents) = preprocess_str(&format!("#if {cond}\nyes\n#else\nno\n#endif\n"));
+        assert_eq!(get_token_strings(&tokens, &idents), ["yes"], "#if {cond}");
+    }
+}

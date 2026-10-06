@@ -1045,7 +1045,7 @@ fn test_newline_in_string() {
 
 #[test]
 fn test_unterminated_block_comment() {
-    // Unterminated block comment (warning emitted)
+    // Unterminated block comment (an error, reported where it opened)
     let (tokens, idents) = tokenize_str("a /* unterminated");
     assert_eq!(tokens.len(), 3); // StreamBegin, a, StreamEnd
     assert_eq!(show_token(&tokens[1], &idents), "a");
@@ -1053,7 +1053,7 @@ fn test_unterminated_block_comment() {
 
 #[test]
 fn test_hex_escape_no_digits() {
-    // \x without hex digits should warn
+    // \x without hex digits is kept as written; the decoder reports it
     let (tokens, _) = tokenize_str("\"\\xg\"");
     assert_eq!(tokens[1].typ, TokenType::String);
     if let TokenValue::String(s) = &tokens[1].value {
@@ -1063,7 +1063,7 @@ fn test_hex_escape_no_digits() {
 
 #[test]
 fn test_hex_escape_at_end() {
-    // \x at end of string should warn
+    // \x at end of string is kept as written; the decoder reports it
     let (tokens, _) = tokenize_str("\"\\x\"");
     assert_eq!(tokens[1].typ, TokenType::String);
     if let TokenValue::String(s) = &tokens[1].value {
@@ -1566,4 +1566,62 @@ fn test_null_character_is_whitespace() {
         .collect();
     assert_eq!(spelled, ["int", "x", ";"]);
     assert!(tokens[2].pos.whitespace);
+}
+
+/// Tokenize `input` and return the tokens with every diagnostic produced.
+fn tokenize_diagnostics(input: &str) -> (Vec<Token>, StringTable, Vec<String>) {
+    crate::diag::capture_diagnostics();
+    let (tokens, strings) = tokenize_str(input);
+    (tokens, strings, crate::diag::take_captured_diagnostics())
+}
+
+/// A comment that runs off the end of the file is gcc's error
+/// "unterminated comment", at the `/*` that opened it.
+#[test]
+fn test_unterminated_block_comment_is_an_error() {
+    let (_, _, lines) = tokenize_diagnostics("int a;\n/* foo\n");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].ends_with(":2:1: error: unterminated comment"),
+        "{lines:?}"
+    );
+}
+
+/// `\x` with no digits is a phase-5 error, which the lexer leaves to whoever
+/// decodes the literal: a literal in a skipped group or one only copied by
+/// `-E` is never decoded, and gcc says nothing about either.
+#[test]
+fn test_lexer_leaves_empty_hex_escape_to_the_decoder() {
+    let (tokens, _, lines) = tokenize_diagnostics("\"\\x\" '\\x' \"\\xg\"");
+    assert!(lines.is_empty(), "{lines:?}");
+    assert_eq!(tokens[1].typ, TokenType::String);
+    assert_eq!(tokens[2].typ, TokenType::Char);
+}
+
+/// A literal missing its closing quote is still a token, so the line keeps
+/// lexing, but it is marked: `-E` copies it as written, without inventing a
+/// quote, and only a compile rejects it. gcc's default pedwarn is the same
+/// at a newline and at the end of the file.
+#[test]
+fn test_unterminated_literals_are_marked_and_spelled_as_written() {
+    for (src, delim) in [
+        ("\"abc;\nint x;", '"'),
+        ("'a;\nint x;", '\''),
+        ("u8\"abc", '"'),
+        ("L'ab", '\''),
+        ("\"abc", '"'),
+    ] {
+        let (tokens, strings, lines) = tokenize_diagnostics(src);
+        let want = format!("warning: missing terminating {delim} character");
+        assert!(
+            lines.len() == 1 && lines[0].ends_with(&want),
+            "{src:?}: {lines:?}"
+        );
+        assert!(tokens[1].is_unterminated_literal(), "{src:?}");
+        let first_line = src.split('\n').next().unwrap();
+        assert_eq!(show_token(&tokens[1], &strings), first_line, "{src:?}");
+    }
+    let (tokens, _, lines) = tokenize_diagnostics("\"abc\" 'a' u8\"x\"");
+    assert!(lines.is_empty(), "{lines:?}");
+    assert!(tokens[1..4].iter().all(|t| !t.is_unterminated_literal()));
 }

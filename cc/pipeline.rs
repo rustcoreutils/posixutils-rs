@@ -152,6 +152,7 @@ pub fn compile_tokens(
     // preprocessed separately and spliced in, so nothing recorded earlier
     // survives with a usable index.
     let layout_pragmas = token::preprocess::extract_pragma_directives(&mut preprocessed);
+    token::lexer::report_unterminated_literals(&preprocessed);
 
     // Parse (this also binds symbols to the symbol table)
     let mut parser = Parser::new(

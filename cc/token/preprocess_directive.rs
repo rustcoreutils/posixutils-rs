@@ -131,7 +131,15 @@ impl<'a> Preprocessor<'a> {
                     self.handle_linemarker(iter, &directive_token);
                     return;
                 }
-                // Consume rest of line
+                // Anything else after the `#` -- a punctuator, a literal --
+                // names no directive.
+                if self.reports_invalid_directives() {
+                    diag::error_args(
+                        directive_token.pos,
+                        "invalid preprocessing directive #{0}",
+                        &[&show_token(&directive_token, idents)],
+                    );
+                }
                 self.skip_to_eol(iter);
                 return;
             }
@@ -182,23 +190,29 @@ impl<'a> Preprocessor<'a> {
             // about both, and `survives_preprocessing` names them.
             crate::kw::PP_IDENT | crate::kw::SCCS => self.skip_to_eol(iter),
             _ => {
-                // Unknown directive.
-                //
-                // In assembly, `#` introduces a comment, so a line that names
-                // no directive is prose rather than a mistake -- `# save the
-                // frame pointer` is ordinary in a `.S` file. GCC is silent
-                // about those.
-                if !self.is_skipping() && self.lexer_mode != LexerMode::Assembly {
+                // C17 6.10p1: no directive has this name.
+                if self.reports_invalid_directives() {
                     let name = idents.get_opt(directive_id).unwrap_or("unknown");
-                    diag::warning_args(
-                        hash_token.pos,
-                        "unknown preprocessor directive #{0}",
+                    diag::error_args(
+                        directive_token.pos,
+                        "invalid preprocessing directive #{0}",
                         &[name],
                     );
                 }
                 self.skip_to_eol(iter);
             }
         }
+    }
+
+    /// Whether a `#` line that names no directive is an error here.
+    ///
+    /// Not in a skipped group, whose lines are only searched for the
+    /// conditionals that nest (C17 6.10.1p6). And not in assembly, where `#`
+    /// also introduces a comment, so such a line is prose rather than a
+    /// mistake -- `# save the frame pointer` is ordinary in a `.S` file. gcc
+    /// is silent about both.
+    fn reports_invalid_directives(&self) -> bool {
+        !self.is_skipping() && self.lexer_mode != LexerMode::Assembly
     }
 
     /// Consume a `# N ["file" [flags]]` linemarker and record the attribution
@@ -214,6 +228,18 @@ impl<'a> Preprocessor<'a> {
             self.skip_to_eol(iter);
             return;
         };
+        // A pp-number such as `12abc` is no line number; gcc refuses it.
+        if !text.bytes().all(|b| b.is_ascii_digit()) {
+            if self.reports_invalid_directives() {
+                diag::error_args(
+                    number.pos,
+                    "\"{0}\" after # is not a positive integer",
+                    &[text],
+                );
+            }
+            self.skip_to_eol(iter);
+            return;
+        }
         let Ok(line) = text.parse::<u32>() else {
             self.skip_to_eol(iter);
             return;

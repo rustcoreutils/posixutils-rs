@@ -1825,6 +1825,47 @@ impl PpValue {
         self.v
     }
 
+    /// The signed result `v` of an operation computed exactly, and whether it
+    /// overflowed `intmax_t`. An unsigned result wraps by definition.
+    fn checked(v: i128, unsigned: bool) -> (Self, bool) {
+        let value = Self::from_parts(v, unsigned);
+        (value, !unsigned && value.v != v)
+    }
+
+    /// `self << count`, or `>>` when `left` is false, as gcc evaluates it: a
+    /// negative count shifts the other way, and a count of 64 or more shifts
+    /// every bit out. Only a signed left shift can overflow -- when the
+    /// result, shifted back, is not the value it started from.
+    fn shift(self, count: PpValue, left: bool) -> (Self, bool) {
+        let (left, n) = if !count.unsigned && count.v < 0 {
+            (!left, count.v.unsigned_abs())
+        } else {
+            (left, count.v as u128)
+        };
+        let n = u32::try_from(n).unwrap_or(u32::MAX);
+        if self.unsigned {
+            let u = self.v as u64;
+            let v = if n >= 64 {
+                0
+            } else if left {
+                u << n
+            } else {
+                u >> n
+            };
+            return (Self::unsigned(i128::from(v)), false);
+        }
+        let a = self.v as i64;
+        if !left {
+            let v = if n >= 64 { a >> 63 } else { a >> n };
+            return (Self::signed(i128::from(v)), false);
+        }
+        if n >= 64 {
+            return (Self::signed(0), a != 0);
+        }
+        let v = a << n;
+        (Self::signed(i128::from(v)), v >> n != a)
+    }
+
     /// Apply the usual arithmetic conversions: if either operand is unsigned,
     /// both are taken in the unsigned domain and so is the result.
     fn promote(a: PpValue, b: PpValue) -> (i128, i128, bool) {
@@ -1886,6 +1927,14 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
         }
         self.had_error = true;
         diag::error_args(pos, template, &[arg]);
+    }
+
+    /// gcc's default pedwarn for an evaluated operation whose signed result
+    /// does not fit `intmax_t` -- undefined in C, and wrapped here.
+    fn overflow(&self, overflowed: bool, pos: Position) {
+        if overflowed && !self.suppressed {
+            diag::pedwarn_default(pos, &gettext("integer overflow in preprocessor expression"));
+        }
     }
 
     /// C17 6.10.1p4: the line is *one* controlling expression. Anything left
@@ -2142,24 +2191,11 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             let right = self.expr_additive();
             // A shift does not apply the usual arithmetic conversions: the
             // result takes the left operand's type (C17 6.5.7p3). A count
-            // outside [0, 64) is undefined; clamp rather than panic, but say
-            // so. gcc warns here rather than erroring, so the expression still
-            // evaluates.
-            if !self.suppressed && !(0..64).contains(&right.v) {
-                diag::pedwarn_default(
-                    op_pos,
-                    &gettext("integer overflow in preprocessor expression"),
-                );
-            }
-            let count = right.v.clamp(0, 63) as u32;
-            let v = if is_left {
-                left.raw() << count
-            } else if left.unsigned {
-                ((left.raw() as u64) >> count) as i128
-            } else {
-                (left.raw() as i64 >> count) as i128
-            };
-            left = PpValue::from_parts(v, left.unsigned);
+            // outside [0, 64) is undefined; c17 gives gcc's value, and gcc's
+            // warning where bits of a signed value are lost.
+            let (v, overflowed) = left.shift(right, is_left);
+            self.overflow(overflowed, op_pos);
+            left = v;
         }
         left
     }
@@ -2171,15 +2207,15 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             if !is_add && !self.is_special(b'-' as u32) {
                 break;
             }
+            let op_pos = self.here();
             self.advance();
             let right = self.expr_multiplicative();
             let (a, b, u) = PpValue::promote(left, right);
-            let v = if is_add {
-                a.wrapping_add(b)
-            } else {
-                a.wrapping_sub(b)
-            };
-            left = PpValue::from_parts(v, u);
+            // Exact in the 128-bit carrier, so `checked` sees any overflow.
+            let v = if is_add { a + b } else { a - b };
+            let (v, overflowed) = PpValue::checked(v, u);
+            self.overflow(overflowed, op_pos);
+            left = v;
         }
         left
     }
@@ -2202,6 +2238,10 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             self.advance();
             let right = self.expr_unary();
             let (a, b, u) = PpValue::promote(left, right);
+            // A signed product is exact in the 128-bit carrier, so `checked`
+            // sees any overflow; an unsigned one can exceed it, but wrapping
+            // keeps the low 64 bits, which are all an unsigned result has.
+            // `%` cannot overflow: gcc gives `INTMAX_MIN % -1` as 0, quietly.
             let v = match op {
                 b'*' => a.wrapping_mul(b),
                 _ if b == 0 => {
@@ -2215,10 +2255,12 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
                     }
                     0
                 }
-                b'/' => a.wrapping_div(b),
-                _ => a.wrapping_rem(b),
+                b'/' => a / b,
+                _ => a % b,
             };
-            left = PpValue::from_parts(v, u);
+            let (v, overflowed) = PpValue::checked(v, u);
+            self.overflow(overflowed, op_pos);
+            left = v;
         }
         left
     }
@@ -2235,9 +2277,12 @@ impl<'a, 'b> ExprEvaluator<'a, 'b> {
             return PpValue::from_parts(!val.raw(), val.unsigned);
         }
         if self.is_special(b'-' as u32) {
+            let op_pos = self.here();
             self.advance();
             let val = self.expr_unary();
-            return PpValue::from_parts(val.raw().wrapping_neg(), val.unsigned);
+            let (v, overflowed) = PpValue::checked(-val.raw(), val.unsigned);
+            self.overflow(overflowed, op_pos);
+            return v;
         }
         if self.is_special(b'+' as u32) {
             self.advance();

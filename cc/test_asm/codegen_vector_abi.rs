@@ -123,6 +123,58 @@ int c2(v2hi a) { return ext(a)[1]; }
     }
 }
 
+/// clang on Darwin passes every vector of four bytes or fewer as `i32`, so
+/// the one- and two-byte integer vectors `v2qi`, `v1hi` and `v1qi` each take
+/// four bytes of the stack once the general registers run out: offsets 0, 4
+/// and 8, read off `llc -mtriple=arm64-apple-macos` for `i32` arguments.
+/// They were passed as the integer of their own size, which Darwin packs
+/// at its own size -- offsets 0, 2 and 4. Linux gives each an eight-byte
+/// slot either way.
+#[test]
+fn vector_abi_darwin_stacks_small_integer_vectors_as_i32() {
+    let src = r#"
+typedef char v2qi __attribute__((vector_size(2)));
+typedef short v1hi __attribute__((vector_size(2)));
+typedef char v1qi __attribute__((vector_size(1)));
+void take(v2qi, v2qi, v2qi, v2qi, v2qi, v2qi, v2qi, v2qi, v2qi, v1hi, v1qi);
+void caller(v2qi a, v1hi h, v1qi q) { take(a, a, a, a, a, a, a, a, a, h, q); }
+int callee(v2qi a0, v2qi a1, v2qi a2, v2qi a3, v2qi a4, v2qi a5, v2qi a6, v2qi a7,
+           v2qi a8, v1hi h, v1qi q) {
+    return a8[1] + h[0] * 3 + q[0] * 5;
+}
+"#;
+    for (triple, slot) in [(AARCH64_DARWIN, 4), (AARCH64_LINUX, 8)] {
+        let asm = asm_for("vec_small_int_stack", triple, src);
+        let caller = body_of(&asm, "caller");
+        let before_call = caller.split_once("bl ").map_or(caller, |(head, _)| head);
+        for at in [
+            "[sp]".to_string(),
+            format!("[sp, #{slot}]"),
+            format!("[sp, #{}]", 2 * slot),
+        ] {
+            assert!(
+                before_call.contains(&at),
+                "{triple} caller, {at}:\n{caller}"
+            );
+        }
+        assert!(
+            !before_call.contains("[sp, #2]"),
+            "{triple} caller:\n{caller}"
+        );
+        // The callee reads them above its frame, at the same offsets.
+        let callee = body_of(&asm, "callee");
+        let frame: i64 = callee
+            .split_once("stp x29, x30, [sp, #-")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .and_then(|(n, _)| n.parse().ok())
+            .unwrap_or_else(|| panic!("{triple} callee frame:\n{callee}"));
+        for k in 0..3 {
+            let at = format!("[x29, #{}]", frame + k * slot);
+            assert!(callee.contains(&at), "{triple} callee, {at}:\n{callee}");
+        }
+    }
+}
+
 /// Whether `asm` names V0 at any width: `v0`, `d0`, `s0`, `h0` or `b0`.
 fn mentions_v0(asm: &str) -> bool {
     asm.split(|c: char| !c.is_ascii_alphanumeric())

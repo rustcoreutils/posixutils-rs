@@ -292,3 +292,34 @@ fn test_stacked_small_float_vector_param_arrives_by_value() {
     });
     assert!(arg_addressed, "the vector parameter is not read in place");
 }
+
+/// Darwin passes a vector of four bytes or fewer as an `unsigned int`. A
+/// one- or two-byte one is loaded at its own width and zero-extended, not
+/// loaded four bytes wide past its end. An `asm` register operand holding
+/// one is the integer of its own size, so an output stores only the
+/// vector's bytes.
+#[test]
+fn test_darwin_small_vector_argument_reads_only_its_bytes() {
+    use crate::target::{Arch, Os};
+    let src = "typedef char v1qi __attribute__((vector_size(1)));\n\
+               typedef short v1hi __attribute__((vector_size(2)));\n\
+               void take(v1qi, v1hi);\n\
+               void call(v1qi *q, v1hi *h) { take(*q, *h); }\n\
+               void out(v1qi *q) { __asm__(\"\" : \"=r\"(*q)); }\n";
+    let module = linearize_source(src, &Target::new(Arch::Aarch64, Os::MacOS));
+    let call = insns_of(&module, "call");
+    let loads: Vec<u32> = call
+        .iter()
+        .filter(|i| i.op == Opcode::Load)
+        .map(|i| i.size)
+        .collect();
+    assert!(loads.contains(&8) && loads.contains(&16), "{loads:?}");
+    assert!(!loads.contains(&32), "{loads:?}");
+    assert!(call.iter().any(|i| i.op == Opcode::Zext), "no widening");
+    let stores: Vec<u32> = insns_of(&module, "out")
+        .iter()
+        .filter(|i| i.op == Opcode::Store)
+        .map(|i| i.size)
+        .collect();
+    assert_eq!(stores, [8], "the asm output stores {stores:?}");
+}

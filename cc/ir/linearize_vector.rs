@@ -89,7 +89,8 @@ impl Linearizer<'_> {
             Some(widened) => self.convert_vector_at(addr, vec, widened),
             None => addr,
         };
-        self.vector_to_carrier(addr, carrier)
+        let returned = self.vector_return_widened(vec, conv).unwrap_or(vec);
+        self.vector_to_carrier(addr, returned, carrier)
     }
 
     /// The vector of type `vec` a call under `conv` returned as `carrier` in
@@ -126,7 +127,7 @@ impl Linearizer<'_> {
         let carrier = self.vector_carrier(vec, conv);
         let addr = self.vector_addr(a);
         if !self.carrier_is_aggregate(carrier) {
-            return (self.vector_to_carrier(addr, carrier), carrier);
+            return (self.vector_to_carrier(addr, vec, carrier), carrier);
         }
         let val = if self.passed_by_reference(carrier, conv) {
             let vol = self.block_volatility(carrier, vec);
@@ -137,12 +138,28 @@ impl Linearizer<'_> {
         (val, carrier)
     }
 
-    /// The bits of the vector at `addr`, as a value of the scalar `carrier`.
-    pub(crate) fn vector_to_carrier(&mut self, addr: PseudoId, carrier: TypeId) -> PseudoId {
-        let bits = self.types.size_bits(carrier);
+    /// The bits of the vector of type `vec` at `addr`, as a value of the
+    /// scalar `carrier`. An integer carrier wider than the vector -- Darwin
+    /// passes a one-byte `v1qi` as an `unsigned int` -- is the vector's own
+    /// bytes, zero-extended: loading the carrier's width read past the
+    /// vector.
+    pub(crate) fn vector_to_carrier(
+        &mut self,
+        addr: PseudoId,
+        vec: TypeId,
+        carrier: TypeId,
+    ) -> PseudoId {
+        let bytes = self.types.size_bytes(vec);
+        let narrow = bytes < self.types.size_bytes(carrier) && self.types.is_integer(carrier);
+        let typ = if narrow {
+            crate::abi::small_vector_bits(bytes, self.types)
+        } else {
+            carrier
+        };
         let value = self.alloc_reg_pseudo();
-        self.emit(Instruction::load(value, addr, 0, carrier, bits));
-        value
+        let bits = self.types.size_bits(typ);
+        self.emit(Instruction::load(value, addr, 0, typ, bits));
+        self.emit_convert(value, typ, carrier)
     }
 
     /// The vector of type `vec` whose bits are `value`, of the scalar
@@ -691,7 +708,7 @@ impl Linearizer<'_> {
     /// The vector of type `vec` at `addr`, loaded whole as its carrier.
     fn carrier_of(&mut self, addr: PseudoId, vec: TypeId) -> PseudoId {
         let carrier = self.native_carrier(vec);
-        self.vector_to_carrier(addr, carrier)
+        self.vector_to_carrier(addr, vec, carrier)
     }
 
     /// The `Simd(op)` instruction on `values` -- carriers, or a scalar for a
@@ -739,7 +756,7 @@ impl Linearizer<'_> {
         let bytes = self.types.size_bytes(typ);
         match self.register_carrier(typ) {
             Some(carrier) if !vol.dst && !vol.src => {
-                let value = self.vector_to_carrier(src, carrier);
+                let value = self.vector_to_carrier(src, typ, carrier);
                 let bits = self.types.size_bits(carrier);
                 self.emit(Instruction::store(value, dst, 0, carrier, bits));
             }

@@ -515,26 +515,28 @@ impl Abi for Aapcs64Abi {
         true
     }
 
-    /// gcc's convention ([`super::native_vector_carrier`]), and for a
-    /// floating vector of four bytes or fewer -- `v1sf`, `v2hf`, `v1hf` --
-    /// the compiler's own:
+    /// gcc's convention ([`super::native_vector_carrier`]), but for a
+    /// vector of four bytes or fewer, where each compiler has its own:
     ///
-    /// - gcc gives one neither register class: it lays it on the stack in an
-    ///   eight-byte slot and sends every later general-register argument
-    ///   there too, leaving the V registers alone. Its carrier is a type of
-    ///   its own, classed [`ArgClass::Stacked`].
-    /// - clang on Darwin coerces one to `i32` -- a general register, or four
-    ///   bytes of the stack once those run out -- whatever its size, so the
-    ///   two-byte `v1hf` travels as an `unsigned int` too.
+    /// - clang on Darwin coerces any one -- integer or floating lanes -- to
+    ///   `i32`: a general register, or four bytes of the stack once those
+    ///   run out, whatever its size. So the one- and two-byte `v1qi`,
+    ///   `v2qi`, `v1hi` and `v1hf` travel as an `unsigned int` too; as the
+    ///   integer of their own size they took one or two bytes of the stack,
+    ///   and every stacked argument after them was misplaced.
+    /// - gcc gives a floating one neither register class: it lays it on the
+    ///   stack in an eight-byte slot and sends every later general-register
+    ///   argument there too, leaving the V registers alone. Its carrier is a
+    ///   type of its own, classed [`ArgClass::Stacked`]. An integer one is
+    ///   the unsigned integer of its size.
     fn vector_carrier(&self, vec: TypeId, types: &TypeTable) -> TypeId {
-        if !types.is_small_float_vector(vec) {
-            return super::native_vector_carrier(vec, types);
+        if self.darwin && types.size_bytes(vec) <= 4 {
+            return types.uint_id;
         }
-        if self.darwin {
-            types.uint_id
-        } else {
-            types.vector_stack_carrier(vec)
+        if types.is_small_float_vector(vec) {
+            return types.vector_stack_carrier(vec);
         }
+        super::native_vector_carrier(vec, types)
     }
 
     /// A vector of four bytes or fewer is returned other than it is passed.

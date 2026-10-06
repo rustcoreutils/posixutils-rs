@@ -3066,10 +3066,19 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// the register, where the IR otherwise keeps a vector at an address. A
     /// sixteen-byte vector in an `"x"` operand was handed over as its address
     /// in a general register, and read back eight bytes wide.
+    ///
+    /// A vector of four bytes or fewer is the unsigned integer of its own
+    /// size, whatever the convention passes it as: Darwin passes a
+    /// one-byte `v1qi` as an `unsigned int`, and an output operand of that
+    /// type stored four bytes into one.
     fn asm_operand_type(&self, e: &Expr, is_memory: bool) -> TypeId {
         let typ = self.expr_type(e);
         if is_memory || !self.types.is_vector(typ) {
             return typ;
+        }
+        let bytes = self.types.size_bytes(typ);
+        if bytes <= 4 {
+            return crate::abi::small_vector_bits(bytes, self.types);
         }
         self.vector_carrier(typ, crate::abi::CallingConv::C)
     }
@@ -3079,7 +3088,7 @@ impl<'a> super::linearize::Linearizer<'a> {
     fn asm_value(&mut self, e: &Expr, typ: TypeId) -> PseudoId {
         if self.types.is_vector(self.expr_type(e)) && !self.types.is_vector(typ) {
             let addr = self.vector_addr(e);
-            return self.vector_to_carrier(addr, typ);
+            return self.vector_to_carrier(addr, self.expr_type(e), typ);
         }
         self.linearize_expr(e)
     }

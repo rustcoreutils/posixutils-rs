@@ -557,6 +557,64 @@ fn vector_abi_aligned_interop_aarch64() {
     );
 }
 
+/// Integer vectors of one and two bytes past the general registers. clang
+/// on Darwin passes each as `i32`, four bytes of the stack apiece; c17 used
+/// the integer of the vector's own size, which Darwin packs at one or two
+/// bytes, so every stacked argument after the first was misplaced. gcc
+/// gives each an eight-byte slot. The host pairing is the Darwin gate on
+/// Apple arm64, where the other compiler is clang.
+const SMALL_INT_DECLS: &str = r#"
+typedef char v2qi __attribute__((vector_size(2)));
+typedef short v1hi __attribute__((vector_size(2)));
+typedef unsigned char v1qi __attribute__((vector_size(1)));
+int many(v2qi a0, v2qi a1, v2qi a2, v2qi a3, v2qi a4, v2qi a5, v2qi a6, v2qi a7,
+         v2qi a8, v1hi h, v1qi q, v2qi a9, int k);
+"#;
+
+const SMALL_INT_CALLEE: &str = r#"
+int many(v2qi a0, v2qi a1, v2qi a2, v2qi a3, v2qi a4, v2qi a5, v2qi a6, v2qi a7,
+         v2qi a8, v1hi h, v1qi q, v2qi a9, int k) {
+    return a0[0] + a7[1] * 2 + a8[0] * 3 + a8[1] * 5 + h[0] * 7 + q[0] * 11
+        + a9[1] * 13 + k * 17;
+}
+"#;
+
+const SMALL_INT_CALLER: &str = r#"
+int main(void) {
+    v2qi a = {1, 2}, b = {3, 4}, c = {-5, 6};
+    v1hi h = {-300};
+    v1qi q = {200};
+    /* 1 + 4 + 9 + 20 - 2100 + 2200 + 78 + 17 */
+    if (many(a, a, a, a, a, a, a, a, b, h, q, c, 1) != 229) return 1;
+    return 0;
+}
+"#;
+
+/// The one- and two-byte integer vectors (`SMALL_INT_DECLS`) against the
+/// host compiler in every pairing.
+#[test]
+fn vector_abi_small_integer_stacked_interop_host() {
+    interop_host(
+        "vec_small_int",
+        &format!("{SMALL_INT_DECLS}{SMALL_INT_CALLEE}"),
+        &format!("{SMALL_INT_DECLS}{SMALL_INT_CALLER}"),
+    );
+}
+
+/// The one- and two-byte integer vectors against aarch64 gcc in every
+/// pairing, under qemu.
+#[test]
+fn vector_abi_small_integer_stacked_interop_aarch64() {
+    if !aarch64_cross_available() {
+        return;
+    }
+    interop_aarch64(
+        "vec_small_int",
+        &format!("{SMALL_INT_DECLS}{SMALL_INT_CALLEE}"),
+        &format!("{SMALL_INT_DECLS}{SMALL_INT_CALLER}"),
+    );
+}
+
 /// A floating vector of four bytes or fewer through `...` on aarch64 Linux.
 ///
 /// gcc contradicts itself here: its caller lays the vector on the stack and

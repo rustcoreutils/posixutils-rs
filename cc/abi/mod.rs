@@ -763,7 +763,8 @@ mod tests {
     }
 
     /// Darwin's compiler is clang, which passes an integer vector of four
-    /// bytes or fewer in a general register, as gcc does, but returns it in
+    /// bytes or fewer in a general register as gcc does -- but as `i32`
+    /// whatever its size, where gcc uses its own size -- and returns it in
     /// V0: one lane in its low bits, several widened to fill eight bytes.
     /// Linux keeps gcc's general register both ways.
     #[test]
@@ -783,6 +784,13 @@ mod tests {
             for v in [v2hi, v2qi, v4qi, v1si, v1qi] {
                 let param = abi.vector_carrier(v, &types);
                 assert!(types.is_integer(param), "{os:?}: passed in a GPR");
+                // clang's `i32`, whatever the vector's size; gcc's integer
+                // of its own size.
+                let want = match os {
+                    Os::MacOS => types.uint_id,
+                    _ => types.unsigned_of_size(types.size_bytes(v)).unwrap(),
+                };
+                assert_eq!(param, want, "{os:?}");
                 let ret = abi.vector_return_carrier(v, &types);
                 assert_eq!(types.is_float(ret), os == Os::MacOS, "{os:?}");
                 assert_eq!(

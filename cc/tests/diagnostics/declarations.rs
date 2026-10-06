@@ -14,7 +14,7 @@
 // and a block-scope redeclaration simply bound nothing.
 //
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_expect_error, compile_object_run};
 
 /// What these rules must keep accepting.
 #[test]
@@ -95,4 +95,33 @@ fn tentative_array_completed_later_in_the_unit() {
                    return 0;\n\
                }\n";
     assert_eq!(compile_and_run("tentative_array_block_extern", src, &[]), 0);
+}
+
+/// A tag declaration with a specifier that applies to nothing (C17 6.7p2):
+/// gcc's warning naming the useless specifier, its pedwarn for a reference
+/// that redeclares nothing, and its error for a specifier it refuses. The
+/// tag is still declared, and usable after.
+#[test]
+fn tag_declaration_with_useless_specifier() {
+    let src = "static struct S1 { int a; };\n\
+               const struct S2 { int a; };\n\
+               _Alignas(8) struct S3 { int a; };\n\
+               static struct S1;\n\
+               int main(void) { struct S1 x = { 1 }; struct S2 y = { 2 }; struct S3 z = { 3 }; return x.a + y.a + z.a == 6 ? 0 : 1; }\n";
+    let run = compile_object_run("tag_useless", src, &[]);
+    assert!(run.success, "{}", run.stderr);
+    for want in [
+        ":1:1: warning: useless storage class specifier in empty declaration",
+        ":2:1: warning: useless type qualifier in empty declaration",
+        ":3:1: warning: useless '_Alignas' in empty declaration",
+        ":4:1: warning: empty declaration with storage class specifier does not redeclare tag",
+    ] {
+        assert!(run.stderr.contains(want), "{want}:\n{}", run.stderr);
+    }
+    assert_eq!(compile_and_run("tag_useless_run", src, &[]), 0);
+    compile_expect_error(
+        "tag_inline",
+        "inline struct S { int a; };\n",
+        "'inline' in empty declaration",
+    );
 }

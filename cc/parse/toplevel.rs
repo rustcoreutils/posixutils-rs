@@ -587,7 +587,7 @@ impl Parser<'_> {
                     continue;
                 };
                 let spelled = self.idents.get_opt(name).unwrap_or("").to_string();
-                diag::warning(
+                diag::pedwarn_default(
                     self.current_pos(),
                     &format!("type of '{spelled}' defaults to 'int'"),
                 );

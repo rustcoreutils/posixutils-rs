@@ -265,11 +265,25 @@ impl Drop for Aarch64Asm {
     }
 }
 
+/// The options an executable is built with: the default models, and each
+/// model `-ftls-model=` can force on code that ends up in an executable --
+/// Local Exec for another unit's thread-locals, Initial Exec and the
+/// descriptor call for `-fPIC` code.
+const EXECUTABLE_OPTS: &[&[&str]] = &[
+    &["-O0"],
+    &["-O2"],
+    &["-O2", "-fPIE"],
+    &["-O2", "-ftls-model=local-exec"],
+    &["-O0", "-fPIC", "-ftls-model=local-exec"],
+    &["-O2", "-fPIC", "-ftls-model=initial-exec"],
+    &["-O2", "-fPIC", "-ftls-model=local-dynamic"],
+];
+
 /// A host executable: Local Exec for its own thread-locals and Initial Exec for
 /// another unit's on ELF hosts, the TLV getter on a macOS host.
 #[test]
 fn tls_models_host_executable() {
-    for opts in [&["-O0"][..], &["-O2"], &["-O2", "-fPIE"]] {
+    for opts in EXECUTABLE_OPTS {
         let opts: Vec<String> = opts.iter().map(|s| s.to_string()).collect();
         assert_eq!(
             compile_and_run_two_units("tls_models", USER, DEF, &opts),
@@ -285,7 +299,7 @@ fn tls_models_aarch64_executable() {
         eprintln!("SKIP tls_models_aarch64_executable: no aarch64 cross toolchain");
         return;
     }
-    for opts in [&["-O0"][..], &["-O2"], &["-O2", "-fPIE"]] {
+    for &opts in EXECUTABLE_OPTS {
         let user = Aarch64Asm::new("tls_user", USER, opts);
         let def = create_c_file("tls_def", DEF);
         let code = cross_link_and_run("tls_models", &[&user.path, &def.path().to_string_lossy()]);
@@ -541,6 +555,71 @@ int *addr_te(void) { return &te; }
             compile_and_run_two_units("tls_threads", a, b, &opts),
             0,
             "at {opt}"
+        );
+    }
+}
+
+/// Inline-asm operands of every constraint class on thread-locals defined in
+/// this unit (Local Exec in an executable) and in another (Initial Exec), and
+/// in a position-independent build (the descriptor model): register operands
+/// arrive loaded, memory operands are reached by the model-aware path, and
+/// the backend's model-blind operand paths, which now report an internal
+/// error for a thread-local, are never taken.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn tls_inline_asm_operands_of_every_class() {
+    let user = r#"
+struct S { int a; long b; int c[4]; };
+__thread int t = 5;
+__thread struct S st = {1, 2, {3, 4, 5, 6}};
+static __thread char tc = 7;
+__thread long long tll = 9;
+extern __thread int te;
+extern __thread struct S ste;
+
+static int rd(int k)
+{
+    int r = 0;
+    switch (k) {
+    case 0: __asm__("movl %1, %0" : "=r"(r) : "r"(t)); break;
+    case 1: __asm__("movl %1, %0" : "=r"(r) : "m"(t)); break;
+    case 2: __asm__("movl %1, %0" : "=r"(r) : "g"(te)); break;
+    case 3: __asm__("movl %1, %0" : "=r"(r) : "rm"(te)); break;
+    case 4: __asm__("movl %1, %0" : "=r"(r) : "m"(st.c[2])); break;
+    case 5: __asm__("movl %1, %0" : "=r"(r) : "m"(ste.c[3])); break;
+    }
+    return r;
+}
+
+int main(void)
+{
+    if (rd(0) != 5 || rd(1) != 5 || rd(2) != 11 || rd(3) != 11) return 1;
+    if (rd(4) != 5 || rd(5) != 17) return 2;
+    __asm__("movl $21, %0" : "=r"(t));
+    __asm__("movl $22, %0" : "=m"(te));
+    __asm__("movq $23, %0" : "=g"(st.b));
+    __asm__("movq $24, %0" : "=m"(ste.b));
+    if (t != 21 || te != 22 || st.b != 23 || ste.b != 24) return 3;
+    __asm__("incl %0" : "+r"(t));
+    __asm__("incl %0" : "+m"(te));
+    __asm__("incb %0" : "+q"(tc));
+    __asm__("incq %0" : "+rm"(tll));
+    __asm__("incl %0" : "=r"(ste.a) : "0"(ste.a));
+    if (t != 22 || te != 23 || tc != 8 || tll != 10 || ste.a != 13) return 4;
+    return 0;
+}
+"#;
+    let def = r#"
+struct S { int a; long b; int c[4]; };
+__thread int te = 11;
+__thread struct S ste = {12, 13, {14, 15, 16, 17}};
+"#;
+    for opts in [&["-O0"][..], &["-O2"], &["-O2", "-fPIE"], &["-O2", "-fPIC"]] {
+        let opts: Vec<String> = opts.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            compile_and_run_two_units("tls_asm_operands", user, def, &opts),
+            0,
+            "at {opts:?}"
         );
     }
 }

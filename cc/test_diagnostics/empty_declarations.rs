@@ -188,6 +188,215 @@ fn diagnostics_declarations_that_do_declare_something_are_accepted() {
     }
 }
 
+/// A tag declaration with a specifier that applies to nothing: the tag is
+/// declared, so there is no "empty declaration" pedwarn, but the specifier
+/// draws gcc's plain warning naming it -- the storage class first, then
+/// `_Thread_local`, then a qualifier, then `_Alignas`, and only the first.
+/// These were silent: a struct, union or enum specifier left the check
+/// before it looked at any specifier.
+#[test]
+fn diagnostics_useless_specifier_on_a_tag_declaration_warns() {
+    const STORAGE: &str = "useless storage class specifier in empty declaration";
+    const QUALIFIER: &str = "useless type qualifier in empty declaration";
+    for (name, src, want) in [
+        ("tagspec_static", "static struct S { int a; };\n", STORAGE),
+        ("tagspec_extern", "extern struct S { int a; };\n", STORAGE),
+        ("tagspec_typedef", "typedef struct S { int a; };\n", STORAGE),
+        ("tagspec_union", "static union U { int a; };\n", STORAGE),
+        ("tagspec_enum", "static enum E { A };\n", STORAGE),
+        ("tagspec_anon_enum", "static enum { A };\n", STORAGE),
+        ("tagspec_first_ref", "static struct New;\n", STORAGE),
+        (
+            "tagspec_static_const",
+            "static const struct S { int a; };\n",
+            STORAGE,
+        ),
+        ("tagspec_const", "const struct S { int a; };\n", QUALIFIER),
+        (
+            "tagspec_volatile",
+            "volatile struct S { int a; };\n",
+            QUALIFIER,
+        ),
+        (
+            "tagspec_atomic",
+            "_Atomic struct S { int a; };\n",
+            QUALIFIER,
+        ),
+        ("tagspec_const_enum", "const enum E { A };\n", QUALIFIER),
+        ("tagspec_const_first_ref", "const struct New;\n", QUALIFIER),
+        (
+            "tagspec_thread_local",
+            "_Thread_local struct S { int a; };\n",
+            "useless '_Thread_local' in empty declaration",
+        ),
+        (
+            "tagspec_gnu_thread",
+            "__thread struct S { int a; };\n",
+            "useless '__thread' in empty declaration",
+        ),
+        (
+            "tagspec_thread_local_ref",
+            "struct S { int a; };\n_Thread_local struct S;\n",
+            "useless '_Thread_local' in empty declaration",
+        ),
+        (
+            "tagspec_alignas",
+            "_Alignas(8) struct S { int a; };\n",
+            "useless '_Alignas' in empty declaration",
+        ),
+        (
+            "tagspec_alignas_union",
+            "_Alignas(16) union U { int a; };\n",
+            "useless '_Alignas' in empty declaration",
+        ),
+        (
+            "tagspec_block_static",
+            "void f(void) { static struct L { int a; }; }\n",
+            STORAGE,
+        ),
+        (
+            "tagspec_block_register",
+            "void f(void) { register struct L { int a; }; }\n",
+            STORAGE,
+        ),
+        (
+            "tagspec_block_auto",
+            "void f(void) { auto struct L { int a; }; }\n",
+            STORAGE,
+        ),
+        (
+            "tagspec_block_const",
+            "void f(void) { const struct L { int b; }; }\n",
+            QUALIFIER,
+        ),
+    ] {
+        // A plain warning, which `-pedantic-errors` leaves a warning.
+        let warned = compile_accepted(name, src, &["-pedantic-errors"]);
+        let diags: Vec<&str> = warned
+            .lines()
+            .filter(|l| l.contains(": warning: "))
+            .collect();
+        assert_eq!(diags.len(), 1, "{name}: expected one warning:\n{warned}");
+        assert!(
+            diags[0].ends_with(&format!("warning: {want}")),
+            "{name}:\n{warned}"
+        );
+    }
+}
+
+/// A reference to a tag that is already declared, with a storage class,
+/// qualifier or `_Alignas`, declares nothing new: gcc's pedwarn says the tag
+/// is not redeclared, and `-pedantic-errors` makes it an error.
+#[test]
+fn diagnostics_tag_reference_with_specifier_does_not_redeclare() {
+    for (name, src, what) in [
+        (
+            "tagref_static",
+            "struct S { int a; };\nstatic struct S;\n",
+            "storage class specifier",
+        ),
+        (
+            "tagref_static_alignas",
+            "struct S { int a; };\nstatic _Alignas(4) struct S;\n",
+            "storage class specifier",
+        ),
+        (
+            "tagref_enum",
+            "enum E { A };\nstatic enum E;\n",
+            "storage class specifier",
+        ),
+        (
+            "tagref_const",
+            "struct S { int a; };\nconst struct S;\n",
+            "type qualifier",
+        ),
+        (
+            "tagref_block",
+            "struct S { int a; };\nvoid f(void) { const struct S; }\n",
+            "type qualifier",
+        ),
+        (
+            "tagref_alignas",
+            "struct S { int a; };\n_Alignas(8) struct S;\n",
+            "'_Alignas'",
+        ),
+        (
+            "tagref_alignas_enum",
+            "enum E { A };\n_Alignas(4) enum E;\n",
+            "'_Alignas'",
+        ),
+    ] {
+        let want = format!("empty declaration with {what} does not redeclare tag");
+        let warned = compile_accepted(name, src, &[]);
+        let diags: Vec<&str> = warned
+            .lines()
+            .filter(|l| l.contains(": warning: "))
+            .collect();
+        assert_eq!(diags.len(), 1, "{name}: expected one warning:\n{warned}");
+        assert!(
+            diags[0].ends_with(&format!("warning: {want}")),
+            "{name}:\n{warned}"
+        );
+        let refused = compile_rejected_with(name, src, &["-pedantic-errors"]);
+        assert!(
+            refused.contains(&format!("error: {want}")),
+            "{name}:\n{refused}"
+        );
+    }
+}
+
+/// The specifiers gcc refuses on a tag declaration, as on any other empty
+/// one.
+#[test]
+fn diagnostics_refused_specifier_on_a_tag_declaration() {
+    for (name, src, msg) in [
+        (
+            "tagbad_register",
+            "register struct S { int a; };\n",
+            "'register' in file-scope empty declaration",
+        ),
+        (
+            "tagbad_auto",
+            "auto struct S { int a; };\n",
+            "'auto' in file-scope empty declaration",
+        ),
+        (
+            "tagbad_inline",
+            "inline struct S { int a; };\n",
+            "'inline' in empty declaration",
+        ),
+        (
+            "tagbad_noreturn",
+            "_Noreturn struct S { int a; };\n",
+            "'_Noreturn' in empty declaration",
+        ),
+        (
+            "tagbad_restrict",
+            "restrict struct S { int a; };\n",
+            "invalid use of 'restrict'",
+        ),
+    ] {
+        let refused = compile_rejected_with(name, src, &[]);
+        assert!(
+            refused.contains(&format!("error: {msg}")),
+            "{name}:\n{refused}"
+        );
+        assert!(!refused.contains("useless"), "{name}:\n{refused}");
+    }
+    // A reference draws both the pedwarn and the refusal.
+    let refused = compile_rejected_with(
+        "tagbad_register_ref",
+        "struct S { int a; };\nregister struct S;\n",
+        &[],
+    );
+    assert!(
+        refused.contains(
+            "warning: empty declaration with storage class specifier does not redeclare tag"
+        ) && refused.contains("error: 'register' in file-scope empty declaration"),
+        "{refused}"
+    );
+}
+
 /// The implicit-int diagnostic must survive: it belongs to declarations that
 /// *do* declare a declarator, which is the case this change routes around.
 #[test]

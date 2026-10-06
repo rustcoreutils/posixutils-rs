@@ -96,9 +96,14 @@ Options beyond the POSIX set (`-B -c -D -E -G -g -I -L -l -O -o -R -s -U`):
  * `--dump-tokens`, `--dump-ast`, `--dump-ir`, `--dump-ir-func` — developer
    diagnostics.
  * A GCC-compatibility argument rewriter accepts and maps `-std=`, `-f*`,
-   `-m*`, `-fPIC`/`-fpic`/`-fPIE`/`-fpie`/`-fno-pie`, `-pie`/`-no-pie`,
+   `-m*`, the `-fpic` family (`-fPIC`/`-fpic`/`-fPIE`/`-fpie` and their
+   `-fno-` forms, last one wins), `-ftls-model=`, `-pie`/`-no-pie`,
    `-shared`, `-Wl,`, `-Xlinker`, `-pthread`, `-rdynamic`, `-pipe`, `-p`/`-pg`,
-   `-fsanitize*` and `-ffreestanding`/`-fhosted`.
+   and `-ffreestanding`/`-fhosted`.  The `-f*` options it knows are
+   classified in `cc/f_options.rs`; one gcc would do something with that
+   c17 does not (`-fstack-protector*`, `-fsanitize=`, ...) draws the warning
+   group `-Wc17-unsupported-option`, which plain `-Werror` leaves a warning,
+   and an unknown one is refused as gcc refuses it.
  * A bare `-` operand is accepted as a pathname.  POSIX says standard input is
    "Not used".
 
@@ -141,8 +146,10 @@ Language and preprocessor additions:
  * On Linux, `_GNU_SOURCE`, `_XOPEN_SOURCE=800` and `_XOPEN_SOURCE_EXTENDED`
    are predefined unconditionally.
 
-Deviation: `-std=` is accepted and discarded — `__STDC_VERSION__` is always
-`201112L`, not the `201710L` the utility's name implies.
+Deviation: `-std=` selects nothing — the language is C17 and
+`__STDC_VERSION__` is `201710L` whatever it names.  A C99, C11 or C17
+spelling is taken in silence; C90 (`-ansi` included) draws a warning that
+`-Wno-c17-dialect` silences; a revision after C17 is an error.
 
 ### cflow
 

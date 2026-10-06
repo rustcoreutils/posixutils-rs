@@ -131,7 +131,15 @@ impl<'a> Preprocessor<'a> {
                     self.handle_linemarker(iter, &directive_token);
                     return;
                 }
-                // Consume rest of line
+                // Anything else after the `#` -- a punctuator, a literal --
+                // names no directive.
+                if self.reports_invalid_directives() {
+                    diag::error_args(
+                        directive_token.pos,
+                        "invalid preprocessing directive #{0}",
+                        &[&show_token(&directive_token, idents)],
+                    );
+                }
                 self.skip_to_eol(iter);
                 return;
             }
@@ -182,23 +190,29 @@ impl<'a> Preprocessor<'a> {
             // about both, and `survives_preprocessing` names them.
             crate::kw::PP_IDENT | crate::kw::SCCS => self.skip_to_eol(iter),
             _ => {
-                // Unknown directive.
-                //
-                // In assembly, `#` introduces a comment, so a line that names
-                // no directive is prose rather than a mistake -- `# save the
-                // frame pointer` is ordinary in a `.S` file. GCC is silent
-                // about those.
-                if !self.is_skipping() && self.lexer_mode != LexerMode::Assembly {
+                // C17 6.10p1: no directive has this name.
+                if self.reports_invalid_directives() {
                     let name = idents.get_opt(directive_id).unwrap_or("unknown");
-                    diag::warning_args(
-                        hash_token.pos,
-                        "unknown preprocessor directive #{0}",
+                    diag::error_args(
+                        directive_token.pos,
+                        "invalid preprocessing directive #{0}",
                         &[name],
                     );
                 }
                 self.skip_to_eol(iter);
             }
         }
+    }
+
+    /// Whether a `#` line that names no directive is an error here.
+    ///
+    /// Not in a skipped group, whose lines are only searched for the
+    /// conditionals that nest (C17 6.10.1p6). And not in assembly, where `#`
+    /// also introduces a comment, so such a line is prose rather than a
+    /// mistake -- `# save the frame pointer` is ordinary in a `.S` file. gcc
+    /// is silent about both.
+    fn reports_invalid_directives(&self) -> bool {
+        !self.is_skipping() && self.lexer_mode != LexerMode::Assembly
     }
 
     /// Consume a `# N ["file" [flags]]` linemarker and record the attribution
@@ -214,6 +228,18 @@ impl<'a> Preprocessor<'a> {
             self.skip_to_eol(iter);
             return;
         };
+        // A pp-number such as `12abc` is no line number; gcc refuses it.
+        if !text.bytes().all(|b| b.is_ascii_digit()) {
+            if self.reports_invalid_directives() {
+                diag::error_args(
+                    number.pos,
+                    "\"{0}\" after # is not a positive integer",
+                    &[text],
+                );
+            }
+            self.skip_to_eol(iter);
+            return;
+        }
         let Ok(line) = text.parse::<u32>() else {
             self.skip_to_eol(iter);
             return;
@@ -274,7 +300,7 @@ impl<'a> Preprocessor<'a> {
         let is_va_args = matches!(&token.value, TokenValue::Ident(id)
             if token.typ == TokenType::Ident && idents.get_opt(*id) == Some("__VA_ARGS__"));
         if is_va_args {
-            diag::warning(
+            diag::pedwarn_default(
                 token.pos,
                 &gettext("__VA_ARGS__ can only appear in the expansion of a C99 variadic macro"),
             );
@@ -317,7 +343,7 @@ impl<'a> Preprocessor<'a> {
     fn warn_extra_tokens(&self, iter: &mut TokenCursor, directive: &str) {
         if iter.peek().is_some_and(|t| !t.pos.newline) {
             let pos = iter.peek().map(|t| t.pos).unwrap_or_default();
-            diag::warning_args(pos, "extra tokens at end of #{0} directive", &[directive]);
+            diag::pedwarn_default_args(pos, "extra tokens at end of #{0} directive", &[directive]);
         }
         self.skip_to_eol(iter);
     }
@@ -495,7 +521,7 @@ impl<'a> Preprocessor<'a> {
         if !is_function {
             if let Some(next) = iter.peek() {
                 if !next.pos.newline && !next.pos.whitespace {
-                    diag::warning(
+                    diag::pedwarn_default(
                         next.pos,
                         &gettext("ISO C99 requires whitespace after the macro name"),
                     );
@@ -537,7 +563,11 @@ impl<'a> Preprocessor<'a> {
         // break a great deal of code that redefines a macro benignly.
         if let Some(existing) = self.macros.get(&name) {
             if let Some(why) = macro_redefinition_conflict(existing, &mac) {
-                diag::warning_args(name_pos, "'{0}' redefined: {1}", &[&name.to_string(), why]);
+                diag::pedwarn_default_args(
+                    name_pos,
+                    "'{0}' redefined: {1}",
+                    &[&name.to_string(), why],
+                );
             }
         }
 
@@ -770,7 +800,7 @@ impl<'a> Preprocessor<'a> {
             TokenValue::String(_) | TokenValue::HeaderName(_)
         );
         if header_name && expanded_tokens.len() > 1 {
-            diag::warning(
+            diag::pedwarn_default(
                 expanded_tokens[1].pos,
                 &gettext("extra tokens at end of #include directive"),
             );
@@ -1146,6 +1176,15 @@ impl<'a> Preprocessor<'a> {
         // brought it in: that is what lets a diagnostic inside a header name
         // the chain that reached it.
         let stream_id = diag::init_included_stream(&self.current_file, hash_token.pos);
+        // A system header, as gcc has it, is one found in a system directory,
+        // or found beside a system header that included it -- whatever the
+        // spelling. Its warnings are not shown, and neither `-Werror` nor
+        // `-pedantic-errors` reaches it.
+        let is_system = match search_pos {
+            Some(pos) => matches!(pos, SearchPos::System(_) | SearchPos::Bundled),
+            None => diag::stream_is_system(hash_token.pos.stream),
+        };
+        diag::set_stream_system(stream_id, is_system);
 
         // Tokenize the included file using the same shared string table
         // Since we use the same StringTable, all StringIds are consistent
@@ -1223,6 +1262,8 @@ impl<'a> Preprocessor<'a> {
         // Create a stream for this builtin header, with the `#include` that
         // asked for it; see `include_file`.
         let stream_id = diag::init_included_stream(&self.current_file, hash_token.pos);
+        // The bundled headers are the compiler's own, gcc's system headers.
+        diag::set_stream_system(stream_id, true);
 
         // Tokenize the builtin content
         let tokens = {
@@ -1590,7 +1631,7 @@ impl<'a> Preprocessor<'a> {
         }
         // gcc warns and still takes the line number and file name.
         if tokens.len() > 2 {
-            diag::warning(
+            diag::pedwarn_default(
                 tokens[2].pos,
                 &gettext("extra tokens at end of #line directive"),
             );

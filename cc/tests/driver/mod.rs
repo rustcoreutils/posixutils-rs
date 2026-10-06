@@ -13,8 +13,12 @@
 // drive the binary with a raw argument vector instead.
 //
 
+mod f_options;
 mod gcc_flags;
+mod linker_input;
 mod prefix_map;
+mod warn_options;
+mod werror;
 
 use crate::common::{create_c_file, run_c17};
 use std::path::{Path, PathBuf};
@@ -529,7 +533,7 @@ fn driver_asm_apostrophe_in_comment() {
         r.stderr
     );
     assert!(
-        !r.stderr.contains("unknown preprocessor directive"),
+        !r.stderr.contains("invalid preprocessing directive"),
         "a `#` comment was reported as a directive:\n{}",
         r.stderr
     );
@@ -2009,20 +2013,15 @@ fn driver_deps_allow_one_source_and_stdout() {
     );
 }
 
-/// An unrecognised `-f` flag says so; a known-ignorable one does not.
+/// An unrecognised `-f` flag is refused; a known-ignorable one is silent.
 ///
 /// The `-f*` arm of `preprocess_args` used to discard every flag it did not
 /// handle, without a word. That is worse than either honouring it or rejecting
 /// it, because a build system cannot tell a flag that took effect from one
 /// that was thrown away — which is how `-fpermissive` appeared not to work
 /// when it had simply never reached the driver, and how `-fno-builtin` sat
-/// parsed-and-unread for as long as it did.
-///
-/// gcc errors on an unknown `-f`. c17 warns instead, because erroring would
-/// break builds that pass flags it has no opinion about; the flags it stays
-/// quiet about are the ones that name an optimisation c17 either does not
-/// perform or performs unconditionally, so honouring and ignoring them are the
-/// same program.
+/// parsed-and-unread for as long as it did. gcc errors on an unknown `-f`,
+/// and so does c17; `cc/f_options.rs` classifies the ones it knows.
 #[test]
 fn driver_unknown_f_flag_is_reported_not_swallowed() {
     let src = create_c_file("driver_fflag", "int main(void){return 0;}\n");
@@ -2032,31 +2031,22 @@ fn driver_unknown_f_flag_is_reported_not_swallowed() {
     for flag in [
         "-fno-strict-aliasing", // CPython's configure passes this
         "-fwrapv",              // the torture suite's dg-options do
-        "-fvisibility=hidden",  // a prefix-matched, value-carrying form
+        "-fvisibility=hidden",  // a value-carrying form
         "-fno-tree-dse",        // gcc-internal pass c17 has no equivalent of
         "-fomit-frame-pointer",
     ] {
         let r = run_c17(&[flag, "-S", "-o", "/dev/null", &path]);
         assert!(r.success, "{flag} should be accepted:\n{}", r.stderr);
-        assert!(
-            !r.stderr.contains("unrecognized"),
-            "{flag} is known and should not be reported:\n{}",
-            r.stderr
-        );
+        assert!(r.stderr.is_empty(), "{flag}:\n{}", r.stderr);
     }
 
-    // Reported: c17 has no idea what these are.
+    // Refused: c17 has no idea what these are, and neither has gcc.
     for flag in ["-fzzznonsense", "-fwibble", "-fno-such-option"] {
         let r = run_c17(&[flag, "-S", "-o", "/dev/null", &path]);
-        assert!(
-            r.success,
-            "{flag} should still compile — the flag is ignored, not fatal:\n{}",
-            r.stderr
-        );
-        assert!(
-            r.stderr.contains("unrecognized") && r.stderr.contains(flag),
-            "{flag} was swallowed silently:\n{}",
-            r.stderr
+        assert!(!r.success, "{flag} was accepted:\n{}", r.stderr);
+        assert_eq!(
+            r.stderr,
+            format!("c17: error: unrecognized command-line option '{flag}'\n")
         );
     }
 }

@@ -141,15 +141,17 @@ pub struct CodeGenBase<I: LirInst> {
     pub last_debug_file: u16,
     /// Whether to emit debug info (.file/.loc directives)
     pub emit_debug: bool,
-    /// Whether the output has to be able to live in a shared object, which is
-    /// what selects the thread-local access model. Set for `-shared` and for
-    /// `-fPIC`; see [`CodeGenBase::use_tls_dynamic`].
-    pub shared_mode: bool,
+    /// What selects the thread-local access model: whether the output has
+    /// to be able to live in a shared object (`-shared`, `-fpic`, `-fPIC`),
+    /// and `-ftls-model=`; see [`CodeGenBase::use_tls_dynamic`].
+    pub tls: crate::target::TlsPolicy,
     /// `-fverbose-asm`: annotate the generated instructions.
     pub verbose_asm: bool,
     /// `-fcf-protection`, which only x86-64's `__builtin_setjmp` and
     /// `__builtin_longjmp` read.
     pub cf_protection: crate::target::CfProtection,
+    /// `-fstack-clash-protection`; see [`CodeGenBase::check_stack_clash`].
+    pub stack_clash: bool,
     /// Trailing comments to hang off individual LIR instructions, by their
     /// index in `lir_buffer`.
     ///
@@ -184,12 +186,46 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
             last_debug_line: 0,
             last_debug_file: 0,
             emit_debug: false,
-            shared_mode: false,
+            tls: crate::target::TlsPolicy::default(),
             verbose_asm: false,
             cf_protection: crate::target::CfProtection::default(),
+            stack_clash: false,
             lir_comments: std::collections::HashMap::new(),
             value_widths: ValueWidths::default(),
             fn_dies: Vec::new(),
+        }
+    }
+
+    /// Under `-fstack-clash-protection`, warn that `func` is unprobed if gcc
+    /// would probe it: when its prologue moves the stack pointer by
+    /// `adjustment` bytes, enough to step over the guard page, or when it
+    /// allocates on the stack at run time (`alloca`, a VLA). c17 emits no
+    /// probes. Any other function needs none: its prologue's step is
+    /// smaller than the guard, and the store the prologue makes at the new
+    /// stack pointer (x86-64's return address below it, aarch64's frame
+    /// record at it) touches the guard if anything does. The guard is gcc's
+    /// default: 4 KiB on x86-64; 64 KiB on aarch64, less the 1 KiB a caller
+    /// may leave untouched below its own frame.
+    pub fn check_stack_clash(&self, func: &Function, adjustment: i64) {
+        if !self.stack_clash {
+            return;
+        }
+        let guard = match self.target.arch {
+            crate::target::Arch::X86_64 => 4096,
+            crate::target::Arch::Aarch64 => 64 * 1024 - 1024,
+        };
+        let dynamic = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insns)
+            .any(|i| i.op == Opcode::Alloca);
+        if adjustment >= guard || dynamic {
+            crate::diag::group_warning_args(
+                crate::f_options::UNSUPPORTED_WARNING,
+                self.func_pos,
+                "'-fstack-clash-protection' is not supported; the stack of '{0}' is not probed",
+                &[&self.current_fn],
+            );
         }
     }
 
@@ -209,10 +245,11 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     /// surplus -- so a library `dlopen`ed later with a large block is rejected.
     /// Only the dynamic model has no such limit.
     ///
-    /// `shared_mode` is set for `-shared` and for `-fPIC`, which asks for code
-    /// that can live in a shared object -- the same requirement. It is *not*
-    /// set for `-fPIE` or the PIE default, because a PIE executable still
-    /// resolves its own thread-locals at link time.
+    /// `tls.shared_code` is set for `-shared` and for `-fPIC`, which asks for
+    /// code that can live in a shared object -- the same requirement. It is
+    /// *not* set for `-fPIE` or the PIE default, because a PIE executable
+    /// still resolves its own thread-locals at link time. And
+    /// `-ftls-model=initial-exec` or `local-exec` waives the requirement.
     ///
     /// Must agree with the condition `ir::tls::expand_dynamic_tls` was given,
     /// since that pass is what puts the address computation where the register
@@ -224,22 +261,18 @@ impl<I: LirInst + EmitAsm> CodeGenBase<I> {
     /// How this target obtains a thread-local's address; see
     /// [`crate::target::Target::tls_access`], which `ir::tls` asks too.
     pub fn tls_access(&self) -> crate::target::TlsAccess {
-        self.target.tls_access(self.shared_mode)
+        self.target.tls_access(self.tls)
     }
 
     /// Whether a thread-local access must use the Initial Exec model rather
-    /// than Local Exec.
+    /// than Local Exec; see [`crate::target::TlsPolicy::initial_exec`].
     ///
-    /// Local Exec fixes the offset from the thread pointer at link time, which
-    /// only holds for the main executable and for a thread-local defined in
-    /// this object. Code for a shared object (`shared_mode`), and any symbol
-    /// defined elsewhere -- which is what `is_extern` reports -- needs the
-    /// offset loaded from the GOT instead. On Linux shared code takes the
-    /// descriptor model before it gets here; on FreeBSD, which stays with the
-    /// static models, leaving `shared_mode` out put Local Exec in a shared
-    /// object -- `%fs:t@TPOFF`, a relocation `ld -shared` refuses.
+    /// On Linux shared code takes the descriptor model before it gets here;
+    /// on FreeBSD, which stays with the static models, leaving shared code
+    /// out put Local Exec in a shared object -- `%fs:t@TPOFF`, a relocation
+    /// `ld -shared` refuses.
     pub fn use_tls_ie(&self, is_extern: bool) -> bool {
-        self.use_tls_dynamic() || is_extern || self.shared_mode
+        self.use_tls_dynamic() || self.tls.initial_exec(is_extern)
     }
 
     pub fn push_lir(&mut self, inst: I) {
@@ -1176,16 +1209,17 @@ pub trait CodeGenerator {
     /// Set position-independent code mode (for shared libraries and PIE)
     fn set_pic_mode(&mut self, pic: bool);
 
-    /// Set shared library mode (for TLS model selection)
-    /// In shared library mode, TLS uses Initial Exec/General Dynamic model.
-    /// In PIE/executable mode, TLS uses Local Exec for local variables.
-    fn set_shared_mode(&mut self, shared: bool);
+    /// Set what thread-local accesses may assume, which selects their model.
+    fn set_tls_policy(&mut self, tls: crate::target::TlsPolicy);
 
     /// Set `-fverbose-asm`: annotate the generated instructions.
     fn set_verbose_asm(&mut self, verbose: bool);
 
     /// Set `-fcf-protection`.
     fn set_cf_protection(&mut self, cf_protection: crate::target::CfProtection);
+
+    /// Set `-fstack-clash-protection`.
+    fn set_stack_clash(&mut self, on: bool);
 }
 
 /// The alignment, in bytes, a global definition is emitted at: an explicit
@@ -1233,16 +1267,26 @@ pub fn check_tls_reached_only_by_address(
                 continue;
             };
             if tls_symbols.contains(name) {
-                crate::diag::error_args(
-                    pos,
-                    "internal error: the thread-local '{0}' reached code generation \
-                     without its address being computed",
-                    &[name],
-                );
+                report_tls_operand(pos, name);
                 return;
             }
         }
     }
+}
+
+/// Report the thread-local `name` reaching a backend path that cannot access
+/// it correctly: an internal error rather than wrong code.
+///
+/// Besides the call-based models above, this guards the x86-64 paths that
+/// print a global operand without asking the TLS model at all
+/// (`X86_64CodeGen::reject_tls_operand`).
+pub fn report_tls_operand(pos: crate::diag::Position, name: &str) {
+    crate::diag::error_args(
+        pos,
+        "internal error: the thread-local '{0}' reached code generation \
+         without its address being computed",
+        &[name],
+    );
 }
 
 /// What a store lowering needs to know about a local's stack slot.
@@ -1457,9 +1501,10 @@ pub fn create_codegen(
     target: Target,
     emit_unwind_tables: bool,
     pic_mode: bool,
-    shared_mode: bool,
+    tls: crate::target::TlsPolicy,
     verbose_asm: bool,
     cf_protection: crate::target::CfProtection,
+    stack_clash: bool,
 ) -> Box<dyn CodeGenerator> {
     use crate::target::Arch;
 
@@ -1469,9 +1514,10 @@ pub fn create_codegen(
     };
     codegen.set_emit_unwind_tables(emit_unwind_tables);
     codegen.set_pic_mode(pic_mode);
-    codegen.set_shared_mode(shared_mode);
+    codegen.set_tls_policy(tls);
     codegen.set_verbose_asm(verbose_asm);
     codegen.set_cf_protection(cf_protection);
+    codegen.set_stack_clash(stack_clash);
     codegen
 }
 

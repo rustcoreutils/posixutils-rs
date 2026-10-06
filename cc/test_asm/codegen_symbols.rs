@@ -43,6 +43,37 @@ int main(void) {
     );
 }
 
+/// The `-fpic` family folds to its last member, and every `-fno-` spelling
+/// asks for the position-dependent code `-fno-pie` gets: a global reached
+/// directly rather than through the GOT. `-fno-pic` was ignored, so its code
+/// came out position independent.
+#[test]
+fn codegen_fno_pic_family_reaches_globals_directly() {
+    let src = "int g = 3;\nint read_g(void) { return g; }\n";
+    for flags in [
+        &["-fno-pic"][..],
+        &["-fno-PIC"],
+        &["-fno-PIE"],
+        &["-fPIC", "-fno-pic"],
+        &["-fpie", "-fno-PIC"],
+    ] {
+        let asm = asm_for_with("fno_pic", X86_64_LINUX, src, flags);
+        let body = body_of(&asm, "read_g");
+        assert!(
+            body.contains("g(%rip)") && !body.contains("@GOTPCREL"),
+            "{flags:?}: expected a direct access:\n{body}"
+        );
+    }
+    for flags in [&["-fno-pic", "-fPIC"][..], &["-fno-pie", "-fpic"]] {
+        let asm = asm_for_with("fno_pic", X86_64_LINUX, src, flags);
+        let body = body_of(&asm, "read_g");
+        assert!(
+            body.contains("g@GOTPCREL(%rip)"),
+            "{flags:?}: expected a GOT access:\n{body}"
+        );
+    }
+}
+
 #[test]
 fn codegen_debug_file_loc() {
     // With -g

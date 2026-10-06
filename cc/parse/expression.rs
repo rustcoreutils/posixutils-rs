@@ -12,6 +12,7 @@
 use super::ast::{AssignOp, BinaryOp, Designator, Expr, ExprKind, InitElement, UnaryOp};
 use super::operand_rule::UnaryOperator;
 use super::parser::{ParseError, ParseResult, Parser};
+use crate::constexpr::ConstScope;
 use crate::diag;
 use crate::float::FloatVal;
 use crate::strings::StringId;
@@ -361,7 +362,7 @@ impl<'a> Parser<'a> {
                     return self.report_conditional_mismatch(pos);
                 }
                 if !self.is_null_pointer_constant(other) {
-                    diag::warning(
+                    diag::pedwarn_default(
                         pos,
                         &gettext("pointer/integer type mismatch in conditional expression"),
                     );
@@ -429,7 +430,7 @@ impl<'a> Parser<'a> {
             self.types.composite_type(tp, ep)
         } else {
             // gcc's answer, unqualified whatever the arms pointed to.
-            diag::warning(
+            diag::pedwarn_default(
                 pos,
                 &gettext("pointer type mismatch in conditional expression"),
             );
@@ -476,6 +477,8 @@ impl<'a> Parser<'a> {
         if self.is_special(b'?') {
             self.advance();
             let cond_tested = self.check_truth_value(&cond);
+            // The arm a constant condition discards is not evaluated.
+            let truth = self.constant_truth(&cond);
 
             // GNU `a ?: b`: the middle operand may be omitted, and then the
             // condition is also the value when it is true. Kept as its own
@@ -484,7 +487,8 @@ impl<'a> Parser<'a> {
             let colon_pos = self.current_pos();
             if self.is_special(b':') {
                 self.advance();
-                let else_expr = self.parse_conditional_expr()?;
+                let else_expr =
+                    self.unevaluated_if(truth == Some(true), Self::parse_conditional_expr)?;
 
                 // The condition is also an arm here, so one that cannot be
                 // tested has been reported as the operand it is.
@@ -505,11 +509,12 @@ impl<'a> Parser<'a> {
                 });
             }
 
-            let then_expr = self.parse_expression()?;
+            let then_expr = self.unevaluated_if(truth == Some(false), Self::parse_expression)?;
             let colon_pos = self.current_pos();
             self.expect_special(b':')?;
             // Right-to-left: parse else as another conditional
-            let else_expr = self.parse_conditional_expr()?;
+            let else_expr =
+                self.unevaluated_if(truth == Some(true), Self::parse_conditional_expr)?;
 
             let then_typ = then_expr.typ.unwrap_or(self.types.int_id);
             let else_typ = else_expr.typ.unwrap_or(self.types.int_id);
@@ -549,9 +554,12 @@ impl<'a> Parser<'a> {
         let mut left = self.parse_logical_and_expr()?;
 
         while self.is_special_token(SpecialToken::LogicalOr) {
+            let op_pos = self.current_pos();
             self.advance();
-            let right = self.parse_logical_and_expr()?;
-            left = self.make_binary(BinaryOp::LogOr, left, right);
+            // Not evaluated when the left operand decides (6.5.14p4).
+            let dead = self.constant_truth(&left) == Some(true);
+            let right = self.unevaluated_if(dead, Self::parse_logical_and_expr)?;
+            left = self.make_binary(BinaryOp::LogOr, left, right, op_pos);
         }
 
         Ok(left)
@@ -561,9 +569,12 @@ impl<'a> Parser<'a> {
         let mut left = self.parse_bitwise_or_expr()?;
 
         while self.is_special_token(SpecialToken::LogicalAnd) {
+            let op_pos = self.current_pos();
             self.advance();
-            let right = self.parse_bitwise_or_expr()?;
-            left = self.make_binary(BinaryOp::LogAnd, left, right);
+            // Not evaluated when the left operand decides (6.5.13p4).
+            let dead = self.constant_truth(&left) == Some(false);
+            let right = self.unevaluated_if(dead, Self::parse_bitwise_or_expr)?;
+            left = self.make_binary(BinaryOp::LogAnd, left, right, op_pos);
         }
 
         Ok(left)
@@ -574,9 +585,10 @@ impl<'a> Parser<'a> {
 
         // | but not ||
         while self.is_special(b'|') && !self.is_special_token(SpecialToken::LogicalOr) {
+            let op_pos = self.current_pos();
             self.advance();
             let right = self.parse_bitwise_xor_expr()?;
-            left = self.make_binary(BinaryOp::BitOr, left, right);
+            left = self.make_binary(BinaryOp::BitOr, left, right, op_pos);
         }
 
         Ok(left)
@@ -586,9 +598,10 @@ impl<'a> Parser<'a> {
         let mut left = self.parse_bitwise_and_expr()?;
 
         while self.is_special(b'^') && !self.is_special_token(SpecialToken::XorAssign) {
+            let op_pos = self.current_pos();
             self.advance();
             let right = self.parse_bitwise_and_expr()?;
-            left = self.make_binary(BinaryOp::BitXor, left, right);
+            left = self.make_binary(BinaryOp::BitXor, left, right, op_pos);
         }
 
         Ok(left)
@@ -599,9 +612,10 @@ impl<'a> Parser<'a> {
 
         // & but not &&
         while self.is_special(b'&') && !self.is_special_token(SpecialToken::LogicalAnd) {
+            let op_pos = self.current_pos();
             self.advance();
             let right = self.parse_equality_expr()?;
-            left = self.make_binary(BinaryOp::BitAnd, left, right);
+            left = self.make_binary(BinaryOp::BitAnd, left, right, op_pos);
         }
 
         Ok(left)
@@ -620,9 +634,10 @@ impl<'a> Parser<'a> {
             };
 
             if let Some(binary_op) = op {
+                let op_pos = self.current_pos();
                 self.advance();
                 let right = self.parse_relational_expr()?;
-                left = self.make_binary(binary_op, left, right);
+                left = self.make_binary(binary_op, left, right, op_pos);
             } else {
                 break;
             }
@@ -648,9 +663,10 @@ impl<'a> Parser<'a> {
             };
 
             if let Some(binary_op) = op {
+                let op_pos = self.current_pos();
                 self.advance();
                 let right = self.parse_shift_expr()?;
-                left = self.make_binary(binary_op, left, right);
+                left = self.make_binary(binary_op, left, right, op_pos);
             } else {
                 break;
             }
@@ -672,9 +688,10 @@ impl<'a> Parser<'a> {
             };
 
             if let Some(binary_op) = op {
+                let op_pos = self.current_pos();
                 self.advance();
                 let right = self.parse_additive_expr()?;
-                left = self.make_binary(binary_op, left, right);
+                left = self.make_binary(binary_op, left, right, op_pos);
             } else {
                 break;
             }
@@ -696,9 +713,10 @@ impl<'a> Parser<'a> {
             };
 
             if let Some(binary_op) = op {
+                let op_pos = self.current_pos();
                 self.advance();
                 let right = self.parse_multiplicative_expr()?;
-                left = self.make_binary(binary_op, left, right);
+                left = self.make_binary(binary_op, left, right, op_pos);
             } else {
                 break;
             }
@@ -722,9 +740,10 @@ impl<'a> Parser<'a> {
             };
 
             if let Some(binary_op) = op {
+                let op_pos = self.current_pos();
                 self.advance();
                 let right = self.parse_unary_expr()?;
-                left = self.make_binary(binary_op, left, right);
+                left = self.make_binary(binary_op, left, right, op_pos);
             } else {
                 break;
             }
@@ -888,7 +907,9 @@ impl<'a> Parser<'a> {
                 op_pos,
             );
             e.bitfield_bits = width;
-            return Ok(Self::typed_if(e, valid));
+            let e = Self::typed_if(e, valid);
+            self.check_constant_overflow(&e, op_pos);
+            return Ok(e);
         }
 
         if self.is_special(b'~') {
@@ -931,7 +952,7 @@ impl<'a> Parser<'a> {
         if let Some(name_id) = self.current_ident() {
             if name_id == crate::kw::SIZEOF {
                 self.advance();
-                return self.parse_sizeof();
+                return self.unevaluated_if(true, Self::parse_sizeof);
             }
             if matches!(
                 name_id,
@@ -942,7 +963,7 @@ impl<'a> Parser<'a> {
             ) && !self.builtin_is_shadowed(name_id)
             {
                 self.advance();
-                return self.parse_alignof();
+                return self.unevaluated_if(true, Self::parse_alignof);
             }
             // GCC's `__real__` / `__imag__`. The result type is the
             // operand's base type when it is complex, and the operand's own
@@ -1785,7 +1806,7 @@ impl<'a> Parser<'a> {
             Some(name) => self.idents.get_opt(name).map_or(0, str::len),
             None => {
                 let spelled = self.idents.get_opt(spelled).unwrap_or("__func__");
-                diag::warning_args(
+                diag::pedwarn_default_args(
                     pos,
                     "'{0}' is not defined outside of function scope",
                     &[spelled],
@@ -1987,7 +2008,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Create a typed binary expression, computing result type from operands
-    fn make_binary(&mut self, op: BinaryOp, left: Expr, right: Expr) -> Expr {
+    fn make_binary(&mut self, op: BinaryOp, left: Expr, right: Expr, op_pos: Position) -> Expr {
         let valid = self.check_binary_operands(op, &left, &right, left.pos);
 
         // A bit-field operand promotes before anything else looks at it
@@ -2041,7 +2062,86 @@ impl<'a> Parser<'a> {
             pos,
         );
         e.bitfield_bits = width;
-        Self::typed_if(e, valid)
+        let e = Self::typed_if(e, valid);
+        if matches!(
+            op,
+            BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod
+        ) {
+            self.check_constant_overflow(&e, op_pos);
+        }
+        e
+    }
+
+    /// Run `parse` with the operand it parses marked as never evaluated
+    /// when `skip` says so; see [`Parser::unevaluated`].
+    pub(super) fn unevaluated_if<T>(
+        &mut self,
+        skip: bool,
+        parse: impl FnOnce(&mut Self) -> ParseResult<T>,
+    ) -> ParseResult<T> {
+        let skip = u32::from(skip);
+        self.unevaluated += skip;
+        let parsed = parse(self);
+        self.unevaluated -= skip;
+        parsed
+    }
+
+    /// Whether `cond` is a constant that is nonzero, when it is a constant.
+    fn constant_truth(&self, cond: &Expr) -> Option<bool> {
+        crate::constexpr::eval_truth(self, ConstScope::Standard, cond)
+    }
+
+    /// gcc's `-Woverflow` for `e`, an arithmetic operation on constants
+    /// whose signed result its type cannot hold (C17 6.5p5): at `op_pos`,
+    /// the operator's position, and only at the operation that overflowed --
+    /// an operand that overflowed was reported when it was built, and what is
+    /// computed from it is not reported again, as in gcc. Not in an operand
+    /// that is never evaluated.
+    ///
+    /// Here rather than in the constant walk for the reason
+    /// [`Self::check_shift_count`] gives: the walk is asked speculatively and
+    /// repeatedly, and an operation is built exactly once.
+    fn check_constant_overflow(&self, e: &Expr, op_pos: Position) {
+        if self.unevaluated > 0 {
+            return;
+        }
+        let Some(typ) = e
+            .typ
+            .filter(|&t| self.types.is_integer(t) && !self.types.is_unsigned(t))
+        else {
+            return;
+        };
+        let operands: Vec<&Expr> = match &e.kind {
+            ExprKind::Binary { left, right, .. } => vec![right, left],
+            ExprKind::Unary { operand, .. } => vec![operand],
+            _ => return,
+        };
+        // An operand that is no constant makes the whole none; asked of the
+        // right one first, which in a chain `a + b + c` is the cheap one.
+        let mut operand_overflowed = false;
+        for operand in operands {
+            match crate::constexpr::eval_noting_overflow(self, ConstScope::Standard, operand) {
+                None => return,
+                Some((_, overflowed)) => operand_overflowed |= overflowed,
+            }
+        }
+        if operand_overflowed {
+            return;
+        }
+        let Some((value, true)) =
+            crate::constexpr::eval_noting_overflow(self, ConstScope::Standard, e)
+        else {
+            return;
+        };
+        let typ = self.types.gcc_type_name(typ, Some(self.idents));
+        let msg = if matches!(e.kind, ExprKind::Unary { .. }) {
+            // gcc names the expression by its folded value, the minimum
+            // negated -- which is the minimum again.
+            format!("integer overflow in expression '{value}' of type '{typ}' results in '{value}'")
+        } else {
+            format!("integer overflow in expression of type '{typ}' results in '{value}'")
+        };
+        diag::group_warning(crate::constexpr::OVERFLOW_WARNING, op_pos, &msg);
     }
 
     /// The type of `left op right`, where `left` has type `left_type` and
@@ -2150,11 +2250,17 @@ impl<'a> Parser<'a> {
 
         // gcc spells these as two groups, and so does `-Wno-`.
         if count < 0 {
-            if crate::diag::warning_group_enabled("shift-count-negative") {
-                crate::diag::warning(right.pos, &format!("{} shift count is negative", side));
-            }
-        } else if count >= width && crate::diag::warning_group_enabled("shift-count-overflow") {
-            crate::diag::warning(right.pos, &format!("{} shift count >= width of type", side));
+            crate::diag::group_warning(
+                "shift-count-negative",
+                right.pos,
+                &format!("{} shift count is negative", side),
+            );
+        } else if count >= width {
+            crate::diag::group_warning(
+                "shift-count-overflow",
+                right.pos,
+                &format!("{} shift count >= width of type", side),
+            );
         }
     }
 
@@ -2384,7 +2490,7 @@ impl<'a> Parser<'a> {
         // The controlling expression contributes only its type, after lvalue
         // conversion: array-to-pointer, function-to-pointer, and every
         // top-level qualifier removed.
-        let controlling = self.parse_assignment_expr()?;
+        let controlling = self.unevaluated_if(true, Self::parse_assignment_expr)?;
         self.exempt_reverse_atomic_operand(&controlling);
         let controlling_typ = controlling.typ.unwrap_or(self.types.int_id);
         let selector = self.lvalue_converted_type(controlling_typ);
@@ -2588,7 +2694,7 @@ impl<'a> Parser<'a> {
                         // keeps a misspelled variable from silently becoming a
                         // function.
                         let name_str = self.idents.get_opt(name_id).unwrap_or("").to_string();
-                        diag::warning_args(
+                        diag::pedwarn_default_args(
                             token_pos,
                             "implicit declaration of function '{0}'",
                             &[&name_str],
@@ -2967,7 +3073,7 @@ impl<'a> Parser<'a> {
                 // A truncated constant was already reported as too large;
                 // gcc says nothing more about the low bits it kept.
                 if !truncated {
-                    diag::warning(
+                    diag::pedwarn_default(
                         pos,
                         &gettext("integer constant is so large that it is unsigned"),
                     );

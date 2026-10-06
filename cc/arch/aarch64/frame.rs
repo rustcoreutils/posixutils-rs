@@ -120,6 +120,7 @@ impl Aarch64CodeGen {
         // they take the plain name: a verbatim asm-label marker belongs only
         // on the symbol the assembler is asked for.
         self.base.current_fn = crate::arch::lir::undecorated(&func.name).to_string();
+        self.base.func_pos = crate::arch::func_pos(func);
         self.frame_size = total_frame;
         self.callee_saved_size = callee_saved_size;
         self.reg_save_area_size = reg_save_area_size;
@@ -133,6 +134,7 @@ impl Aarch64CodeGen {
 
         // Emit prologue (save fp/lr, callee-saved regs, allocate stack)
         self.emit_prologue(total_frame, &callee_saved, &callee_saved_fp);
+        self.base.check_stack_clash(func, total_frame as i64);
 
         self.emit_frame_base_latch();
 

@@ -13,6 +13,7 @@
 
 use posixutils_cc::builtins;
 use posixutils_cc::diag;
+use posixutils_cc::f_options::{self, Effect};
 use posixutils_cc::ir;
 use posixutils_cc::linkargs;
 use posixutils_cc::opt;
@@ -25,6 +26,7 @@ use posixutils_cc::symbol;
 use posixutils_cc::target;
 use posixutils_cc::token;
 use posixutils_cc::types;
+use posixutils_cc::warn_options::{self, Verdict};
 
 use clap::Parser;
 use gettextrs::{gettext, gettext_args};
@@ -234,20 +236,28 @@ struct Args {
     #[arg(long = "fno-unwind-tables", help = gettext("Disable CFI unwind table generation"))]
     no_unwind_tables: bool,
 
-    /// Generate position-independent code (for shared libraries)
-    /// Set by preprocess_args() when -fPIC or -fpic is passed
-    #[arg(long = "c17-fpic", hide = true)]
-    fpic: bool,
+    /// A member of gcc's `-fpic` family (`-fpic`, `-fPIC`, `-fpie`, `-fPIE`
+    /// and their `-fno-` forms), carried in its gcc spelling by
+    /// `preprocess_args_from`; the last one given wins.
+    #[arg(
+        long = "c17-pic",
+        hide = true,
+        value_name = "flag",
+        value_parser = parse_pic_flag,
+        overrides_with = "pic_flag"
+    )]
+    pic_flag: Option<target::PositionIndependence>,
 
-    /// Generate position-independent executable code (PIE)
-    /// Set by preprocess_args() when -fPIE or -fpie is passed
-    #[arg(long = "c17-fpie", action = clap::ArgAction::SetTrue, hide = true)]
-    fpie: bool,
-
-    /// Disable PIE code generation (GCC compatibility)
-    /// Set by preprocess_args() when -fno-pie is passed
-    #[arg(long = "c17-fno-pie", action = clap::ArgAction::SetTrue, hide = true)]
-    fno_pie: bool,
+    /// `-ftls-model=<model>`, validated by `preprocess_args_from`; the last
+    /// one given wins.
+    #[arg(
+        long = "c17-tls-model",
+        hide = true,
+        value_name = "model",
+        value_parser = parse_tls_model,
+        overrides_with = "tls_model"
+    )]
+    tls_model: Option<target::TlsModel>,
 
     /// Produce a shared library
     #[arg(long = "shared", help = gettext("Produce a shared library"))]
@@ -429,6 +439,25 @@ struct Args {
     /// (rewritten by `preprocess_args_from`); see [`Args::lang_of`].
     #[arg(long = "c17-x", action = clap::ArgAction::Append, value_name = "lang:path", hide = true)]
     lang_overrides: Vec<String>,
+
+    /// The options accepted and ignored, each warned about once `-w` and
+    /// `-Werror` are known (rewritten by `preprocess_args_from`).
+    #[arg(long = "c17-ignored", action = clap::ArgAction::Append, value_name = "option",
+          allow_hyphen_values = true, hide = true)]
+    ignored_options: Vec<String>,
+
+    /// The `-f` options c17 takes without doing what they ask, each warned
+    /// about once `-w` and the `-W` options are known (rewritten by
+    /// `preprocess_args_from`).
+    #[arg(long = "c17-unsupported", action = clap::ArgAction::Append, value_name = "option",
+          allow_hyphen_values = true, hide = true)]
+    unsupported_options: Vec<String>,
+
+    /// `-fstack-clash-protection`, last of it and `-fno-` winning (rewritten
+    /// by `preprocess_args_from`): c17 probes no stack, and warns for each
+    /// function whose stack gcc would probe.
+    #[arg(long = "c17-stack-clash", hide = true)]
+    stack_clash: bool,
 }
 
 /// The `-Wno-` name for the "`-std=` was not honoured" warning.
@@ -447,6 +476,37 @@ fn driver_warning(msg: &str) {
     eprintln!("c17: {}: {}", gettext("warning"), msg);
 }
 
+/// A linker input named in a run that links nothing (`-c`, `-S`, `-E`).
+///
+/// Said whatever the warning options: gcc's driver gives this one under `-w`
+/// and leaves it a warning under `-Werror`.
+fn unused_linker_input(path: &str) {
+    eprintln!(
+        "c17: {}: {}: {}",
+        gettext("warning"),
+        path,
+        gettext("linker input file unused because linking not done")
+    );
+}
+
+/// A command-line problem gcc refuses outright and c17 lets through with a
+/// warning: an option it does not know, or one output named for several.
+/// Under `-Werror` that leniency is withdrawn -- the warning is an error,
+/// tagged as gcc tags a promoted one, and the run fails, as gcc's would --
+/// because a configure probe adds `-Werror` exactly to find out whether the
+/// compiler accepts what it is given. Answers whether it was an error.
+///
+/// The warnings gcc's driver gives itself stay [`driver_warning`]s: gcc's
+/// `-Werror` does not reach them.
+fn driver_leniency(msg: &str) -> bool {
+    if diag::warnings_suppressed() || !diag::werror_all() {
+        driver_warning(msg);
+        return false;
+    }
+    eprintln!("c17: {}: {} [-Werror]", gettext("error"), msg);
+    true
+}
+
 impl Args {
     /// Classify `-std=`, if one was given.
     ///
@@ -458,15 +518,6 @@ impl Args {
             None => Ok(None),
             Some(spec) => classify_std(spec).map(Some).ok_or(spec.as_str()),
         }
-    }
-
-    /// Is the warning named `name` turned off, by `-w` or `-Wno-<name>`?
-    fn warning_suppressed(&self, name: &str) -> bool {
-        self.no_warnings
-            || self
-                .warnings
-                .iter()
-                .any(|w| w.strip_prefix("no-") == Some(name))
     }
 }
 
@@ -1233,18 +1284,26 @@ fn process_file(
         );
     }
 
-    let shared_mode = producing_shared(args) || args.fpic;
+    // A shared object gets shared-object code whatever the `-fpic` family
+    // said. gcc compiles `-shared` alone as a PIE, which a shared object
+    // cannot always hold.
+    let position = position_independence(args, target);
+    let tls = target::TlsPolicy {
+        shared_code: producing_shared(args) || position.is_shared_code(),
+        floor: args.tls_model.unwrap_or_default(),
+    };
     let codegen_opts = pipeline::CodegenOptions {
         optimization: args.optimization(),
         math_errno: !args.fno_math_errno,
         debug: args.debug > 0,
         trapping_math: !args.fno_trapping_math,
         default_visibility: args.default_visibility.as_deref(),
-        shared_mode,
-        pic: position_independence(args, target).pic,
+        tls,
+        pic: producing_shared(args) || position.is_pic(),
         unwind_tables: !args.no_unwind_tables,
         verbose_asm: args.verbose_asm,
         cf_protection: args.cf_protection.unwrap_or_default(),
+        stack_clash: args.stack_clash,
         source_name: path,
         debug_prefix_map: &prefix_maps.debug,
     };
@@ -1372,16 +1431,41 @@ impl StripBy {
 /// fixed-address static executable, and c17 compiles position-independent
 /// code by default, which is what makes `-pie` the default here. Only
 /// `-static-pie` asks for both.
-fn link_mode_flag(args: &Args, target: &Target) -> &'static str {
+///
+/// `None` for an executable on macOS: a Mach-O executable is always
+/// position independent there, and Apple's driver answers `-pie` and
+/// `-no-pie` alike with "argument unused during compilation". A `-static`,
+/// `-static-pie`, `-pie` or `-no-pie` on the command line still reaches it
+/// as written, among the other linker flags.
+fn link_mode_flag(args: &Args, target: &Target) -> Option<&'static str> {
     let has = |flag: &str| args.linker_flags.iter().any(|f| f == flag);
-    if producing_shared(args) {
+    Some(if producing_shared(args) {
         "-shared"
+    } else if target.os == Os::MacOS {
+        return None;
     } else if has("-static-pie") {
         "-static-pie"
-    } else if has("-static") || !pie_enabled(args, target) {
+    } else if has("-static") || !link_pie(args, target) {
         "-no-pie"
     } else {
         "-pie"
+    })
+}
+
+/// Whether an executable is linked as a PIE: as the last of `-pie` and
+/// `-no-pie` says, or else as the code was compiled. gcc links a PIE by
+/// default even after `-fno-pic`, which works only if the objects happen to
+/// be position independent; c17 links position-dependent code into the
+/// executable it was compiled for.
+fn link_pie(args: &Args, target: &Target) -> bool {
+    match args
+        .linker_flags
+        .iter()
+        .rev()
+        .find(|f| *f == "-pie" || *f == "-no-pie")
+    {
+        Some(flag) => flag == "-pie",
+        None => position_independence(args, target).is_pic(),
     }
 }
 
@@ -1393,7 +1477,9 @@ fn link_objects(
     target: &Target,
 ) -> io::Result<()> {
     let mut link_cmd = linkargs::host_driver();
-    link_cmd.arg(link_mode_flag(args, target));
+    if let Some(mode) = link_mode_flag(args, target) {
+        link_cmd.arg(mode);
+    }
     link_cmd.args(["-o", exe_file]);
 
     // -B selects which form of a library `-l` prefers. GNU ld spells this
@@ -1513,12 +1599,7 @@ impl Args {
             Some("cpp-output") => Lang::Preprocessed,
             Some("assembler") => Lang::Asm,
             Some(_) => Lang::AsmCpp,
-            None if is_preprocessed_file(path) => Lang::Preprocessed,
-            None if is_source_file(path) => Lang::C,
-            None if path.ends_with(".S") => Lang::AsmCpp,
-            None if is_asm_file(path) => Lang::Asm,
-            None if is_object_file(path) => Lang::Object,
-            None => Lang::Unknown,
+            None => lang_by_suffix(path),
         }
     }
 
@@ -1551,6 +1632,36 @@ fn parse_plain_char(s: &str) -> Result<target::CharSignedness, String> {
 /// validated by `preprocess_args_from`.
 fn parse_cf_protection(s: &str) -> Result<target::CfProtection, String> {
     target::CfProtection::from_level(s).ok_or_else(|| format!("invalid cf-protection level '{s}'"))
+}
+
+/// The value of the internal `--c17-pic` option: a member of the `-fpic`
+/// family, in its gcc spelling.
+fn parse_pic_flag(s: &str) -> Result<target::PositionIndependence, String> {
+    target::PositionIndependence::from_flag(s).ok_or_else(|| format!("not a -fpic option: '{s}'"))
+}
+
+/// The value of the internal `--c17-tls-model` option: a model name already
+/// validated by `preprocess_args_from`.
+fn parse_tls_model(s: &str) -> Result<target::TlsModel, String> {
+    target::TlsModel::from_name(s).ok_or_else(|| format!("unknown TLS model '{s}'"))
+}
+
+/// The model a `-ftls-model=` option names, as the value of
+/// `--c17-tls-model`. A name gcc does not know is an error, in its words.
+fn tls_model_name(model: &str) -> &str {
+    if model.is_empty() {
+        eprintln!("c17: error: missing argument to '-ftls-model='");
+        std::process::exit(1);
+    }
+    if target::TlsModel::from_name(model).is_none() {
+        eprintln!("c17: error: unknown TLS model '{model}'");
+        eprintln!(
+            "c17: note: valid arguments to '-ftls-model=' are: {}",
+            target::TlsModel::NAMES
+        );
+        std::process::exit(1);
+    }
+    model
 }
 
 /// The value of the internal `--c17-prefix-map` option: a prefix-map
@@ -1621,82 +1732,12 @@ fn preprocess_args() -> Vec<String> {
 ///
 /// Takes the raw argument vector rather than reading the environment so the
 /// unit tests exercise this exact function.
-/// `-f` flags c17 accepts and ignores without comment.
-///
-/// Each names an optimisation or code-generation choice that c17 either does
-/// not make at all, or makes unconditionally, so honouring it and ignoring it
-/// are the same program. Everything outside this list draws a warning, because
-/// a flag that is silently dropped is indistinguishable from one that worked.
-fn is_known_ignorable_f_flag(arg: &str) -> bool {
-    // An exact spelling, or a prefix for the `=`-valued ones.
-    const EXACT: &[&str] = &[
-        // Aliasing and overflow assumptions c17 does not exploit.
-        "-fstrict-aliasing",
-        "-fno-strict-aliasing",
-        "-fstrict-overflow",
-        "-fno-strict-overflow",
-        "-fwrapv",
-        "-fno-wrapv",
-        "-ftrapv",
-        "-fno-trapv",
-        // Inlining and frame choices c17 makes on its own.
-        "-fomit-frame-pointer",
-        "-fno-omit-frame-pointer",
-        "-finline-functions",
-        "-fno-inline-functions",
-        "-fno-inline",
-        "-finline-small-functions",
-        // Tree and loop passes c17 has no equivalent of.
-        "-ftree-vectorize",
-        "-fno-tree-vectorize",
-        "-ftree-loop-distribution",
-        "-fno-tree-loop-distribute-patterns",
-        "-fno-tree-dse",
-        "-fno-tracer",
-        "-fno-ipa-ra",
-        "-funroll-loops",
-        "-fno-unroll-loops",
-        "-fpeel-loops",
-        "-fno-peel-loops",
-        "-ftracer",
-        "-fmodulo-sched",
-        "-foptimize-strlen",
-        "-fno-optimize-strlen",
-        "-fno-vect-cost-model",
-        "-fivopts",
-        "-fno-ivopts",
-        "-fschedule-insns",
-        "-fno-schedule-insns",
-        "-fschedule-insns2",
-        "-fno-schedule-insns2",
-        // Floating point c17 already treats strictly.
-        "-ffloat-store",
-        "-fno-float-store",
-        "-fsigned-zeros",
-        "-fno-signed-zeros",
-        // Linkage and layout.
-        "-fno-common",
-        "-fcommon",
-        "-fno-zero-initialized-in-bss",
-        "-fnon-call-exceptions",
-        "-fno-non-call-exceptions",
-        "-fexceptions",
-        "-fno-exceptions",
-        "-fasynchronous-unwind-tables",
-        "-fno-asynchronous-unwind-tables",
-        "-fno-semantic-interposition",
-        "-fsemantic-interposition",
-    ];
-    const PREFIX: &[&str] = &["-fpack-struct=", "-fstack-protector"];
-    EXACT.contains(&arg) || PREFIX.iter().any(|p| arg.starts_with(p))
-}
-
 fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     let mut result = Vec::with_capacity(raw_args.len());
     let mut i = 0;
     let mut o_flag_idx: Option<usize> = None; // index into result of the -O flag
     let mut std_flag_idx: Option<usize> = None; // index into result of the -std= value
-    let mut seen_fpic = false;
+
     // `-x LANG`: the language every operand after it is read as, until the
     // next `-x` (`none` restores reading by suffix).
     let mut lang: Option<&'static str> = None;
@@ -1708,6 +1749,20 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     let mut debug: Option<bool> = None;
     // `-fsignaling-nans`, last one wins.
     let mut signaling_nans = false;
+    // The options accepted and ignored with a warning, which waits for the
+    // parse: `-w` and `-Werror` decide what it is, wherever they stand.
+    let mut ignored = Vec::new();
+    // The `-f` options taken without their effect, by what each asks for
+    // (`f_options::family`): a later one of a family replaces an earlier
+    // one, and `-fno-<family>` withdraws it. Warned about after the parse.
+    let mut unsupported: Vec<(String, String)> = Vec::new();
+    // `-fstack-clash-protection`, last one wins.
+    let mut stack_clash = false;
+    // The `-W<name>` and `-f<name>` options refused as gcc refuses them: by
+    // its driver, and -- only if the driver let everything through -- by
+    // its compiler.
+    let mut driver_errors = Vec::new();
+    let mut werror_errors = Vec::new();
 
     while i < raw_args.len() {
         let arg = &raw_args[i];
@@ -1740,7 +1795,13 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             }
             i += 1;
         } else if arg.starts_with("-W") && arg.len() > 2 && !arg.starts_with("-Wl,") {
-            // -Wall → -W all, -Wextra → -W extra, etc.
+            // -Wall → -W all, -Wextra → -W extra, etc. -- once the name is
+            // known to be one gcc would take.
+            match warn_options::classify(&arg[2..]) {
+                Verdict::DriverError(lines) => driver_errors.extend(lines),
+                Verdict::CompilerError(line) => werror_errors.push(line),
+                Verdict::Known(_) | Verdict::PassThrough | Verdict::UnknownNegation => {}
+            }
             result.push("-W".to_string());
             result.push(arg[2..].to_string());
             i += 1;
@@ -1820,23 +1881,15 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             // Debug-format and debug-content tuning: c17 emits one kind of
             // DWARF, so these change nothing it could honour.
             if !is_known_ignorable_g_flag(arg) {
-                eprintln!("c17: {}: {}", gettext("unrecognized option, ignored"), arg);
+                ignored.push(format!("--c17-ignored={arg}"));
             }
             i += 1;
-        } else if arg == "-fPIC" || arg == "-fpic" {
-            // -fPIC / -fpic → --c17-fpic (internal flag) (first one only)
-            if !seen_fpic {
-                result.push("--c17-fpic".to_string());
-                seen_fpic = true;
-            }
+        } else if target::PositionIndependence::from_flag(arg).is_some() {
+            // The `-fpic` family, whose last member wins.
+            result.push(format!("--c17-pic={arg}"));
             i += 1;
-        } else if arg == "-fPIE" || arg == "-fpie" {
-            // -fPIE / -fpie → --c17-fpie (internal flag)
-            result.push("--c17-fpie".to_string());
-            i += 1;
-        } else if arg == "-fno-pie" {
-            // -fno-pie → --c17-fno-pie (internal flag)
-            result.push("--c17-fno-pie".to_string());
+        } else if let Some(model) = arg.strip_prefix("-ftls-model=") {
+            result.push(format!("--c17-tls-model={}", tls_model_name(model)));
             i += 1;
         } else if arg == "-shared" {
             // -shared → --shared
@@ -1851,14 +1904,6 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             result.push("--c17-fno-builtin-func".to_string());
             result.push(func.to_string());
             i += 1;
-        } else if arg == "-fstrict-overflow"
-            || arg == "-fno-strict-overflow"
-            || arg == "-fwrapv"
-            || arg == "-fstrict-aliasing"
-            || arg == "-fno-strict-aliasing"
-        {
-            // GCC optimization flags - silently ignore (c17 doesn't have these optimizations)
-            i += 1;
         } else if arg.starts_with("-m") && arg.len() > 2 {
             // Machine flags are judged once the target is known.
             result.push(format!("--c17-mflag={}", arg));
@@ -1872,19 +1917,6 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
                 std::process::exit(1);
             }
             result.push(format!("--c17-visibility={}", how));
-            i += 1;
-        } else if arg == "-fno-semantic-interposition"
-            || arg.starts_with("-fstack-protector")
-            || arg == "-fno-reorder-blocks-and-partition"
-            || arg == "-fno-plt"
-            || arg == "-fno-common"
-            || arg == "-fexceptions"
-            || arg == "-fno-exceptions"
-        {
-            // GCC flags - silently ignore
-            i += 1;
-        } else if arg.starts_with("-fsanitize") {
-            // Sanitizer flags - silently ignore (c17 doesn't support sanitizers)
             i += 1;
         } else if arg == "-ffreestanding" || arg == "-fhosted" {
             // Not swallowed by the catch-all below: there is no freestanding
@@ -1948,25 +1980,35 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
         {
             result.push(format!("-{arg}"));
             i += 1;
-        } else if arg.starts_with("-f") && !arg.starts_with("-fno-builtin") {
-            // Not a catch-all any more. gcc *errors* on an unrecognised `-f`
-            // flag, and silently discarding one is worse than either answer:
-            // a build system cannot tell a flag that took effect from one that
-            // was thrown away, which is how `-fpermissive` appeared not to
-            // work and how `-fno-builtin` sat inert for as long as it did.
-            //
-            // Erroring outright would break builds that pass flags c17 has no
-            // opinion about, so the middle course is to classify: the flags
-            // below name optimisations and code-generation choices c17 either
-            // does not make or already makes unconditionally, so ignoring them
-            // changes nothing and they stay quiet. Anything else says so.
-            //
-            // The list is drawn from what real builds actually pass -- CPython's
-            // configure and the gcc torture suite's own dg-options -- rather
-            // than from gcc's manual. Add to it when a corpus needs it, not in
-            // anticipation.
-            if !is_known_ignorable_f_flag(arg) {
-                eprintln!("c17: {}: {}", gettext("unrecognized option, ignored"), arg);
+        } else if arg == "-fstack-clash-protection" || arg == "-fno-stack-clash-protection" {
+            stack_clash = arg == "-fstack-clash-protection";
+            i += 1;
+        } else if arg.starts_with("-fuse-ld=")
+            && f_options::classify(&arg[2..]) == f_options::Verdict::Known(Effect::Implemented)
+        {
+            // Which linker the host driver runs, so it goes to the link.
+            result.push(format!("--c17-linker-flag={arg}"));
+            i += 1;
+        } else if let Some(name) = arg.strip_prefix("-f") {
+            // Every other `-f` option, as `f_options` classifies it: taken
+            // in silence when c17's output already is what it asks for, taken
+            // with a warning when its effect is missing, and refused in gcc's
+            // words when gcc would not know it.
+            match f_options::classify(name) {
+                f_options::Verdict::Known(Effect::Accepted(_)) => {}
+                f_options::Verdict::Known(Effect::Unsupported) => {
+                    let family = f_options::family(name);
+                    unsupported.retain(|(f, _)| f != family);
+                    unsupported.push((family.to_string(), arg.clone()));
+                }
+                f_options::Verdict::Known(Effect::Implemented) => {
+                    debug_assert!(false, "{arg} is implemented, so parsed above");
+                }
+                f_options::Verdict::Error(lines) => driver_errors.extend(lines),
+            }
+            // `-fno-<family>` withdraws an earlier request.
+            if let Some(family) = name.strip_prefix("no-") {
+                unsupported.retain(|(f, _)| f != family);
             }
             i += 1;
         } else if arg == "--param" || arg.starts_with("--param=") {
@@ -2037,15 +2079,10 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
         } else if arg == "-pipe" {
             // Misc GCC flags - silently ignore
             i += 1;
-        } else if arg == "-pie" {
-            // -pie enables PIE link mode
-            result.push("--c17-fpie".to_string());
-            result.push("--c17-linker-flag=-pie".to_string());
-            i += 1;
-        } else if arg == "-no-pie" {
-            // -no-pie disables PIE link mode
-            result.push("--c17-fno-pie".to_string());
-            result.push("--c17-linker-flag=-no-pie".to_string());
+        } else if arg == "-pie" || arg == "-no-pie" {
+            // Link options only: what the code is compiled as is the `-fpic`
+            // family's business, as it is gcc's. See `link_mode_flag`.
+            result.push(format!("--c17-linker-flag={arg}"));
             i += 1;
         } else if arg.starts_with("-Wl,") {
             // Handed to the host driver as written, which is what splits the
@@ -2076,10 +2113,7 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
         } else if arg == "-static" || arg == "-static-pie" {
             // For the link step, which reads them to choose its leading
             // option: see `link_mode_flag`. clap would read `-static` as the
-            // short cluster `-s -t -a ...`. A static PIE is still a PIE.
-            if arg == "-static-pie" {
-                result.push("--c17-fpie".to_string());
-            }
+            // short cluster `-s -t -a ...`.
             result.push(format!("--c17-linker-flag={arg}"));
             i += 1;
         } else if let Some(status) = answer_driver_query(arg, &raw_args) {
@@ -2108,9 +2142,33 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
         }
     }
 
+    // A configure probe passes a `-W` or `-f` option to learn whether the
+    // compiler takes it, so one c17 does not know fails the run as gcc's
+    // would.
+    let refused = if driver_errors.is_empty() {
+        werror_errors
+    } else {
+        driver_errors
+    };
+    if !refused.is_empty() {
+        for line in refused {
+            eprintln!("c17: {line}");
+        }
+        std::process::exit(1);
+    }
+
     // Options gathered over the whole scan, placed ahead of any `--`, after
     // which everything is an operand.
     let mut trailer = lang_overrides;
+    trailer.append(&mut ignored);
+    trailer.extend(
+        unsupported
+            .into_iter()
+            .map(|(_, arg)| format!("--c17-unsupported={arg}")),
+    );
+    if stack_clash {
+        trailer.push("--c17-stack-clash".to_string());
+    }
     if debug == Some(true) {
         trailer.push("-g".to_string());
     }
@@ -2334,32 +2392,69 @@ fn is_preprocessed_file(path: &str) -> bool {
     path.ends_with(".i")
 }
 
-/// Check if a file is an assembly file (by extension)
-/// .s = pure assembly, .S = assembly with C preprocessor directives
-fn is_asm_file(path: &str) -> bool {
-    path.ends_with(".s") || path.ends_with(".S")
-}
+/// Suffixes gcc hands to a front end c17 does not have, each with what c17
+/// says about it. gcc fails on these when that front end is not installed
+/// ("cannot execute 'cc1plus'"), so c17 fails too, rather than passing a
+/// source file to the linker. A C++ header (`.hpp`, ...) is C++ here: gcc
+/// precompiles it with the C++ front end.
+const FOREIGN_SUFFIXES: &[(&str, &[&str])] = &[
+    (
+        "c17 does not compile C++",
+        &[
+            "cc", "cp", "cxx", "cpp", "CPP", "c++", "C", "ii", "hh", "H", "hp", "hxx", "hpp",
+            "HPP", "h++", "tcc",
+        ],
+    ),
+    ("c17 does not compile Objective-C", &["m", "mi"]),
+    ("c17 does not compile Objective-C++", &["mm", "M", "mii"]),
+    (
+        "c17 does not compile Fortran",
+        &[
+            "f", "for", "ftn", "F", "FOR", "FTN", "fpp", "FPP", "f90", "f95", "f03", "f08", "F90",
+            "F95", "F03", "F08",
+        ],
+    ),
+    ("c17 does not compile Go", &["go"]),
+    ("c17 does not compile D", &["d", "di", "dd"]),
+    ("c17 does not compile Ada", &["ads", "adb"]),
+    ("c17 does not compile Modula-2", &["mod"]),
+];
 
-/// Check if a file is an object file or library (by extension)
-fn is_object_file(path: &str) -> bool {
-    path.ends_with(".o")
-        || path.ends_with(".a")
-        || path.ends_with(".so")
-        || path.ends_with(".dylib")
-        || path.contains(".so.") // versioned .so files like libz.so.1.3.1
+/// What an operand's suffix says it is, as gcc reads suffixes. One that names
+/// no language is a linker input -- an object or library under any name, a
+/// linker script, a version script -- which gcc passes to the linker as-is.
+fn lang_by_suffix(path: &str) -> Lang {
+    if is_preprocessed_file(path) {
+        return Lang::Preprocessed;
+    }
+    if is_source_file(path) {
+        return Lang::C;
+    }
+    let suffix = Path::new(path).extension().and_then(|s| s.to_str());
+    match suffix {
+        Some("S" | "sx") => Lang::AsmCpp,
+        Some("s") => Lang::Asm,
+        Some("h") => Lang::Header,
+        Some(suffix) => FOREIGN_SUFFIXES
+            .iter()
+            .find(|(_, suffixes)| suffixes.contains(&suffix))
+            .map_or(Lang::LinkerInput, |(why, _)| Lang::Foreign(why)),
+        None => Lang::LinkerInput,
+    }
 }
 
 /// What kind of thing a pathname operand names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OperandKind {
-    /// `.c`, `.i`, or a bare `-`.
+    /// `.c`, `.i`, or a bare `-`; or a `.h` under `-E`, `-M` or `-MM`.
     Source,
-    /// `.s` or `.S`.
+    /// `.s`, `.S` or `.sx`.
     Asm,
-    /// `.o`, `.a`, `.so`, `.dylib`, or a versioned `.so.N`.
-    Object,
-    /// Anything else: warned about and skipped.
-    Unknown,
+    /// Anything the linker reads: an object or library, a linker script, or
+    /// whatever else names no language. It goes to the linker in its place.
+    LinkerInput,
+    /// A language c17 does not compile, with what to say about it.
+    Foreign(&'static str),
 }
 
 /// A pathname operand together with its kind, keeping argument order.
@@ -2379,11 +2474,16 @@ enum Lang {
     Preprocessed,
     /// Assembly: `.s`, or `-x assembler`.
     Asm,
-    /// Assembly to preprocess first: `.S`, or `-x assembler-with-cpp`.
+    /// Assembly to preprocess first: `.S`, `.sx`, or
+    /// `-x assembler-with-cpp`.
     AsmCpp,
-    /// An object or a library.
-    Object,
-    Unknown,
+    /// A C header, `.h`: gcc preprocesses it under `-E`, `-M` and `-MM`, and
+    /// otherwise writes a precompiled header.
+    Header,
+    /// A suffix that names no language: for the linker.
+    LinkerInput,
+    /// A language gcc compiles and c17 does not, with what to say about it.
+    Foreign(&'static str),
 }
 
 /// Whether a linker-input operand never reaches the linker in this run, so
@@ -2392,13 +2492,11 @@ enum Lang {
 /// gcc errors "linker input file not found" for a missing linker input when
 /// nothing is linked (`-c`, `-S`, `-E`); a build naming a file it never made
 /// must fail, not succeed with a warning. When linking, the linker reports a
-/// missing object itself. An unrecognized suffix never reaches c17's link
-/// line, so it is checked whether or not this run links.
+/// missing input itself.
 fn bypasses_linker(kind: OperandKind, link_phase: bool) -> bool {
     match kind {
-        OperandKind::Unknown => true,
-        OperandKind::Object => !link_phase,
-        OperandKind::Source | OperandKind::Asm => false,
+        OperandKind::LinkerInput => !link_phase,
+        OperandKind::Source | OperandKind::Asm | OperandKind::Foreign(_) => false,
     }
 }
 
@@ -2406,9 +2504,13 @@ impl Operand {
     fn classify(path: String, args: &Args) -> Self {
         let kind = match args.lang_of(&path) {
             Lang::C | Lang::Preprocessed => OperandKind::Source,
+            Lang::Header if args.preprocess_only || args.dependencies_replace_output() => {
+                OperandKind::Source
+            }
+            Lang::Header => OperandKind::Foreign("c17 does not write precompiled headers"),
             Lang::Asm | Lang::AsmCpp => OperandKind::Asm,
-            Lang::Object => OperandKind::Object,
-            Lang::Unknown => OperandKind::Unknown,
+            Lang::LinkerInput => OperandKind::LinkerInput,
+            Lang::Foreign(why) => OperandKind::Foreign(why),
         };
         Operand { path, kind }
     }
@@ -2645,24 +2747,14 @@ fn producing_shared(args: &Args) -> bool {
     args.shared || args.shared_object
 }
 
-/// The position independence this compilation generates code with.
+/// The position independence this compilation generates code with, and its
+/// `__PIC__`/`__PIE__` macros describe: the last of the `-fpic` family, or
+/// the target's default. `-shared` is a link option and changes neither, as
+/// in gcc; the code generator makes shared-object code of its own accord
+/// (see `process_file`).
 fn position_independence(args: &Args, target: &Target) -> target::PositionIndependence {
-    let pie = pie_enabled(args, target);
-    target::PositionIndependence {
-        pic: args.fpic || producing_shared(args) || pie,
-        pie,
-    }
-}
-
-/// Determine whether PIE should be enabled for this compilation.
-fn pie_enabled(args: &Args, target: &Target) -> bool {
-    if producing_shared(args) || args.fno_pie {
-        return false;
-    }
-    if args.fpie {
-        return true;
-    }
-    target.os == Os::Linux
+    args.pic_flag
+        .unwrap_or_else(|| target::PositionIndependence::target_default(target))
 }
 
 /// The stack the compiler runs on.
@@ -2735,18 +2827,28 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     if !args.fno_builtin_funcs.is_empty() {
         builtins::set_no_builtin_funcs(args.fno_builtin_funcs.iter().cloned().collect());
     }
-    // `-Wno-<name>` reaches the places that emit warnings, which are nowhere
-    // near here. The one group that is off by default is `-Wpedantic`, which
-    // has a switch of its own because `-pedantic-errors` makes it fatal.
-    diag::set_pedantic(diag::Pedantic::from_warning_options(
-        args.warnings.iter().map(String::as_str),
-    ));
-    diag::suppress_warning_groups(
-        args.warnings
-            .iter()
-            .filter_map(|w| w.strip_prefix("no-").map(str::to_string))
-            .collect(),
-    );
+    // The `-W` options reach the places that emit warnings, which are
+    // nowhere near here: the groups `-Wno-<name>` turns off, `-Wpedantic`
+    // and `-pedantic-errors`, and `-Werror` with its relatives.
+    let warning_options: Vec<&str> = args.warnings.iter().map(String::as_str).collect();
+    diag::set_warning_options(&warning_options);
+
+    // Set when `-Werror` makes an error of a command-line warning; see
+    // `driver_leniency`. Every such warning is given before stopping.
+    let mut refused = false;
+    for option in &args.ignored_options {
+        refused |= driver_leniency(&format!(
+            "{}: {}",
+            gettext("unrecognized option, ignored"),
+            option
+        ));
+    }
+    for option in &args.unsupported_options {
+        refused |= diag::command_line_group_warning(
+            f_options::UNSUPPORTED_WARNING,
+            &gettext_args("'{0}' is not supported; ignored", &[option]),
+        );
+    }
 
     // Validate -std= alongside the other argument checks, before any
     // early-return path, so a typo is never silently accepted.
@@ -2759,11 +2861,13 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
             );
             std::process::exit(1);
         }
-        // Say plainly that an older revision was not honoured. c17 compiles
-        // C17 and only C17, so the flag is accepted -- build systems pass it
-        // unconditionally -- but silently ignoring it is what let
-        // __STDC_VERSION__ disagree with the binary's own name once already.
-        Ok(Some(StdRequest::Older)) if !args.warning_suppressed(STD_DIALECT_WARNING) => {
+        // Say plainly that C90 was not honoured.
+        // c17 compiles C17 and only C17, so the flag is accepted -- build
+        // systems pass it unconditionally -- but silently ignoring it is what
+        // let __STDC_VERSION__ disagree with the binary's own name once
+        // already. A C99 or C11 program is a C17 program, so asking for
+        // either is met.
+        Ok(Some(StdRequest::Ignored)) if diag::warning_group_enabled(STD_DIALECT_WARNING) => {
             let spec = args.c17_std.as_deref().unwrap_or_default();
             driver_warning(&gettext_args(
                 "'-std={0}' ignored; c17 compiles C17 (ISO/IEC 9899:2018) only",
@@ -2834,16 +2938,6 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|f| Operand::classify(f.clone(), &args))
         .collect();
 
-    for op in &operands {
-        if op.kind == OperandKind::Unknown {
-            driver_warning(&format!(
-                "{}: {}",
-                gettext("unrecognized file type"),
-                op.path
-            ));
-        }
-    }
-
     let source_count = operands
         .iter()
         .filter(|o| o.kind == OperandKind::Source)
@@ -2854,7 +2948,7 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     // spec leaves this unspecified (88338-88343); say so rather than silently
     // producing one object.
     if args.compile_only && args.output.is_some() && source_count > 1 {
-        driver_warning(&format!(
+        refused |= driver_leniency(&format!(
             "{} ({})",
             gettext("-o applies only to the last source operand with -c"),
             source_count
@@ -2885,11 +2979,14 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     // overwrite. Still worth saying, since a makefile expecting one .i per
     // source gets one file holding all of them.
     if args.preprocess_only && args.output.is_some() && source_count > 1 {
-        driver_warning(&format!(
+        refused |= driver_leniency(&format!(
             "{} ({})",
             gettext("-o collects every source operand into one file with -E"),
             source_count
         ));
+    }
+    if refused {
+        std::process::exit(1);
     }
 
     if let Some(mode) = args.binding.as_deref() {
@@ -2913,7 +3010,7 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pp_out = preprocess_sink(&args)?;
     // The object each operand contributes to the link, by operand index.
     // `None` means the operand contributes nothing (`-c`, an early-exit mode,
-    // or an unrecognized file).
+    // or a language c17 does not compile).
     let mut operand_objects: Vec<Option<String>> = vec![None; operands.len()];
     // CONSEQUENCES OF ERRORS (88185-88187): diagnose, keep compiling the
     // remaining operands, skip the link, exit non-zero.
@@ -2922,11 +3019,15 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     let link_phase = !args.compile_only
         && !args.asm_only
         && !args.preprocess_only
+        && !args.dependencies_replace_output()
         && !args.dump_tokens
         && !args.dump_ast
         && args.dump_ir.is_none();
 
     for (idx, op) in operands.iter().enumerate() {
+        if op.kind == OperandKind::LinkerInput && !link_phase {
+            unused_linker_input(&op.path);
+        }
         if bypasses_linker(op.kind, link_phase) {
             if let Err(e) = std::fs::metadata(&op.path) {
                 eprintln!(
@@ -2941,14 +3042,19 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         match op.kind {
-            OperandKind::Unknown => {}
-            OperandKind::Object => operand_objects[idx] = Some(op.path.clone()),
+            OperandKind::Foreign(why) => {
+                eprintln!("c17: {}: {}: {}", gettext("error"), op.path, gettext(why));
+                failed = true;
+            }
+            OperandKind::LinkerInput => operand_objects[idx] = Some(op.path.clone()),
             // 87883-87885: with -E "no compilation shall be performed", so an
             // assembler operand is never handed to `as`. Not assembling is not
             // the same as producing nothing, though: preprocess it and write
             // the text, as gcc does.
             OperandKind::Asm if args.preprocess_only => {
-                match preprocess_asm_operand(&op.path, &args, &target, &mut pp_out) {
+                let result = preprocess_asm_operand(&op.path, &args, &target, &mut pp_out);
+                diag::finish_unit();
+                match result {
                     Ok(()) => {}
                     Err(e) => {
                         eprintln!("c17: {}: {}", op.path, plib::diag::io_error_text(&e));
@@ -2957,7 +3063,9 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             OperandKind::Asm => {
-                match assemble_operand(&op.path, &args, &target, scratch.path(), idx) {
+                let result = assemble_operand(&op.path, &args, &target, scratch.path(), idx);
+                diag::finish_unit();
+                match result {
                     Ok(Some(obj)) => operand_objects[idx] = Some(obj),
                     Ok(None) => {}
                     Err(e) => {
@@ -2972,7 +3080,12 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
                     object: &obj_name,
                     preprocessed: &mut pp_out,
                 };
-                match process_file(&op.path, &args, &target, &mut outputs, scratch.path(), idx) {
+                let result =
+                    process_file(&op.path, &args, &target, &mut outputs, scratch.path(), idx);
+                // gcc's "warnings being treated as errors" closes the unit's
+                // own diagnostics, ahead of the driver's verdict on it.
+                diag::finish_unit();
+                match result {
                     Ok(Compiled::Nothing) => {}
                     Ok(Compiled::Object { path, temporary }) => {
                         if temporary {
@@ -3026,60 +3139,74 @@ mod tests {
     }
 
     /// Only a linker input the linker will not see is checked by the driver:
-    /// an object only when nothing is linked, an unknown suffix always.
+    /// one named when nothing is linked.
     #[test]
     fn test_bypasses_linker() {
         for link_phase in [false, true] {
-            assert!(bypasses_linker(OperandKind::Unknown, link_phase));
             assert!(!bypasses_linker(OperandKind::Source, link_phase));
             assert!(!bypasses_linker(OperandKind::Asm, link_phase));
+            assert!(!bypasses_linker(OperandKind::Foreign("x"), link_phase));
         }
-        assert!(bypasses_linker(OperandKind::Object, false));
-        assert!(!bypasses_linker(OperandKind::Object, true));
+        assert!(bypasses_linker(OperandKind::LinkerInput, false));
+        assert!(!bypasses_linker(OperandKind::LinkerInput, true));
     }
 
-    // Tests for is_object_file()
-
+    /// Objects and libraries under their usual names, and everything else
+    /// that names no language, are for the linker.
     #[test]
-    fn test_is_object_file_object() {
-        assert!(is_object_file("foo.o"));
-        assert!(is_object_file("/path/to/bar.o"));
-    }
-
-    #[test]
-    fn test_is_object_file_static_archive() {
-        assert!(is_object_file("libfoo.a"));
-        assert!(is_object_file("/usr/lib/libbar.a"));
-    }
-
-    #[test]
-    fn test_is_object_file_shared_object() {
-        assert!(is_object_file("libfoo.so"));
-        assert!(is_object_file("/usr/lib/libbar.so"));
-    }
-
-    #[test]
-    fn test_is_object_file_dylib() {
-        assert!(is_object_file("libfoo.dylib"));
-        assert!(is_object_file("/usr/lib/libbar.dylib"));
-    }
-
-    #[test]
-    fn test_is_object_file_versioned_so() {
-        // Versioned shared objects like libz.so.1.3.1
-        assert!(is_object_file("libz.so.1"));
-        assert!(is_object_file("libz.so.1.3"));
-        assert!(is_object_file("libz.so.1.3.1"));
-        assert!(is_object_file("/usr/lib/libssl.so.3"));
+    fn test_lang_by_suffix_linker_input() {
+        for path in [
+            "foo.o",
+            "/path/to/bar.o",
+            "libfoo.a",
+            "libfoo.so",
+            "libfoo.dylib",
+            "libz.so.1.3.1",
+            "/usr/lib/libssl.so.3",
+            "f.weird",
+            "extra.ld",
+            "exports.map",
+            "baz.txt",
+            "t.def",
+            "noext",
+            "dir.d/noext",
+        ] {
+            assert_eq!(lang_by_suffix(path), Lang::LinkerInput, "{path}");
+        }
     }
 
     #[test]
-    fn test_is_object_file_negative() {
-        assert!(!is_object_file("foo.c"));
-        assert!(!is_object_file("bar.h"));
-        assert!(!is_object_file("baz.txt"));
-        assert!(!is_object_file("myso.txt")); // should not match .so
-        assert!(!is_object_file("also.conf")); // should not match .so
+    fn test_lang_by_suffix_languages() {
+        assert_eq!(lang_by_suffix("a.c"), Lang::C);
+        assert_eq!(lang_by_suffix("-"), Lang::C);
+        assert_eq!(lang_by_suffix("a.i"), Lang::Preprocessed);
+        assert_eq!(lang_by_suffix("a.s"), Lang::Asm);
+        assert_eq!(lang_by_suffix("a.S"), Lang::AsmCpp);
+        assert_eq!(lang_by_suffix("a.sx"), Lang::AsmCpp);
+        assert_eq!(lang_by_suffix("a.h"), Lang::Header);
+    }
+
+    /// Every suffix gcc gives another front end is refused, naming it.
+    #[test]
+    fn test_lang_by_suffix_foreign() {
+        for (path, why) in [
+            ("a.cpp", "c17 does not compile C++"),
+            ("a.cc", "c17 does not compile C++"),
+            ("a.c++", "c17 does not compile C++"),
+            ("a.C", "c17 does not compile C++"),
+            ("a.ii", "c17 does not compile C++"),
+            ("a.hpp", "c17 does not compile C++"),
+            ("a.m", "c17 does not compile Objective-C"),
+            ("a.mm", "c17 does not compile Objective-C++"),
+            ("a.f90", "c17 does not compile Fortran"),
+            ("a.F", "c17 does not compile Fortran"),
+            ("a.go", "c17 does not compile Go"),
+            ("a.d", "c17 does not compile D"),
+            ("a.adb", "c17 does not compile Ada"),
+            ("a.mod", "c17 does not compile Modula-2"),
+        ] {
+            assert_eq!(lang_by_suffix(path), Lang::Foreign(why), "{path}");
+        }
     }
 
     // Tests for is_source_file()
@@ -3147,15 +3274,22 @@ mod tests {
         assert_eq!(parse(&["foo.c"]).std_request(), Ok(None));
         assert_eq!(
             parse(&["-std=c17", "foo.c"]).std_request(),
-            Ok(Some(StdRequest::C17))
+            Ok(Some(StdRequest::Compiled))
         );
-        // Recognized but older: accepted, and reported as not honoured.
+        // A C99 program is a C17 program.
         assert_eq!(
             parse(&["-std=c99", "foo.c"]).std_request(),
-            Ok(Some(StdRequest::Older))
+            Ok(Some(StdRequest::Compiled))
+        );
+        // Recognized but not C17's: accepted, and reported as not honoured.
+        assert_eq!(
+            parse(&["-std=c90", "foo.c"]).std_request(),
+            Ok(Some(StdRequest::Ignored))
         );
         // A typo is still an error, not a silently ignored value.
         assert_eq!(parse(&["-std=c42", "foo.c"]).std_request(), Err("c42"));
+        // So is a revision after C17, which c17 cannot compile.
+        assert_eq!(parse(&["-std=c23", "foo.c"]).std_request(), Err("c23"));
     }
 
     #[test]
@@ -3348,14 +3482,14 @@ mod tests {
     #[test]
     fn test_preprocess_fpic_uppercase() {
         let result = run_preprocess(&["-fPIC", "foo.c"]);
-        assert!(result.contains(&"--c17-fpic".to_string()));
+        assert!(result.contains(&"--c17-pic=-fPIC".to_string()));
         assert!(!result.contains(&"-fPIC".to_string()));
     }
 
     #[test]
     fn test_preprocess_fpic_lowercase() {
         let result = run_preprocess(&["-fpic", "foo.c"]);
-        assert!(result.contains(&"--c17-fpic".to_string()));
+        assert!(result.contains(&"--c17-pic=-fpic".to_string()));
         assert!(!result.contains(&"-fpic".to_string()));
     }
 
@@ -3389,7 +3523,7 @@ mod tests {
     #[test]
     fn test_preprocess_combined() {
         let result = run_preprocess(&["-fPIC", "-shared", "-lz", "-L.", "foo.c"]);
-        assert!(result.contains(&"--c17-fpic".to_string()));
+        assert!(result.contains(&"--c17-pic=-fPIC".to_string()));
         assert!(result.contains(&"--shared".to_string()));
         assert!(result.contains(&"-l".to_string()));
         assert!(result.contains(&"z".to_string()));
@@ -3407,46 +3541,110 @@ mod tests {
         assert!(result.contains(&"foo.c".to_string()));
     }
 
+    /// An option whose effect c17 does not provide reaches the driver as a
+    /// request to warn, the last of its family winning and a later `-fno-`
+    /// withdrawing it.
     #[test]
-    fn test_preprocess_fstack_protector_ignored() {
+    fn test_preprocess_unsupported_f_flags_are_kept_for_the_warning() {
         for flag in &[
             "-fstack-protector",
             "-fstack-protector-strong",
             "-fstack-protector-all",
+            "-fsanitize=address",
+            "-fcommon",
         ] {
             let result = run_preprocess(&[flag, "foo.c"]);
             assert!(
-                !result.contains(&flag.to_string()),
-                "flag {} not ignored",
-                flag
+                result.contains(&format!("--c17-unsupported={flag}")),
+                "{flag}: {result:?}"
             );
             assert!(result.contains(&"foo.c".to_string()));
         }
+        let unsupported = |args: &[&str]| -> Vec<String> {
+            run_preprocess(args)
+                .into_iter()
+                .filter(|a| a.starts_with("--c17-unsupported="))
+                .collect()
+        };
+        assert_eq!(
+            unsupported(&["-fstack-protector", "-fstack-protector-strong"]),
+            ["--c17-unsupported=-fstack-protector-strong"]
+        );
+        assert!(unsupported(&["-fstack-protector-all", "-fno-stack-protector"]).is_empty());
+        assert_eq!(
+            unsupported(&["-fno-stack-protector", "-fstack-protector"]),
+            ["--c17-unsupported=-fstack-protector"]
+        );
     }
 
+    /// What c17's output already is is taken in silence, and leaves nothing
+    /// behind.
     #[test]
-    fn test_preprocess_misc_f_flags_ignored() {
+    fn test_preprocess_accepted_f_flags_leave_nothing() {
         for flag in &[
             "-fno-semantic-interposition",
             "-fno-reorder-blocks-and-partition",
             "-fno-plt",
             "-fno-common",
+            "-fdiagnostics-color=always",
+            "-flto=auto",
+            "-ffat-lto-objects",
         ] {
             let result = run_preprocess(&[flag, "foo.c"]);
-            assert!(
-                !result.contains(&flag.to_string()),
-                "flag {} not ignored",
-                flag
-            );
+            assert_eq!(result, ["c17", "foo.c"], "{flag}");
         }
     }
 
+    /// Every option the table says the driver implements is parsed before
+    /// the table is consulted: a debug build asserts it.
     #[test]
-    fn test_preprocess_catchall_f_flags_ignored() {
-        // Unknown -f flags should be silently ignored
-        let result = run_preprocess(&["-funknown-flag", "foo.c"]);
-        assert!(!result.contains(&"-funknown-flag".to_string()));
-        assert!(result.contains(&"foo.c".to_string()));
+    fn test_preprocess_implemented_f_flags_are_parsed() {
+        for flag in &[
+            "-fPIC",
+            "-fno-pie",
+            "-fcf-protection",
+            "-fcf-protection=branch",
+            "-fno-cf-protection",
+            "-ffile-prefix-map=/a=/b",
+            "-fdebug-prefix-map=/a=/b",
+            "-fmacro-prefix-map=/a=/b",
+            "-fgnu89-inline",
+            "-fno-gnu89-inline",
+            "-fhosted",
+            "-finline",
+            "-fno-inline",
+            "-fmath-errno",
+            "-fno-math-errno",
+            "-fno-builtin",
+            "-fno-builtin-memcpy",
+            "-fpermissive",
+            "-fsignaling-nans",
+            "-fno-signaling-nans",
+            "-fsigned-char",
+            "-fno-unsigned-char",
+            "-fstack-clash-protection",
+            "-fno-stack-clash-protection",
+            "-ftls-model=initial-exec",
+            "-ftrapping-math",
+            "-fno-trapping-math",
+            "-fuse-ld=lld",
+            "-fverbose-asm",
+            "-fvisibility=hidden",
+        ] {
+            assert_eq!(
+                posixutils_cc::f_options::classify(&flag[2..]),
+                posixutils_cc::f_options::Verdict::Known(Effect::Implemented),
+                "{flag}"
+            );
+            run_preprocess(&[flag, "foo.c"]);
+        }
+        let result = run_preprocess(&["-fuse-ld=lld", "foo.c"]);
+        assert!(result.contains(&"--c17-linker-flag=-fuse-ld=lld".to_string()));
+        assert!(run_preprocess(&["-fstack-clash-protection"]).contains(&"--c17-stack-clash".into()));
+        assert!(
+            !run_preprocess(&["-fstack-clash-protection", "-fno-stack-clash-protection"])
+                .contains(&"--c17-stack-clash".into())
+        );
     }
 
     #[test]
@@ -3521,36 +3719,60 @@ mod tests {
         assert!(result.contains(&"foo.c".to_string()));
     }
 
+    /// The `-fpic` family is one option, the last member winning: every
+    /// `-fno-` spelling is position-dependent code, PIE included, and the link
+    /// options `-pie`, `-no-pie` and `-static-pie` are not members.
     #[test]
-    fn test_preprocess_fpie() {
-        let result = run_preprocess(&["-fPIE", "foo.c"]);
-        assert!(result.contains(&"--c17-fpie".to_string()));
+    fn test_pic_family_last_one_wins() {
+        use target::{PicLevel, PositionIndependence as P};
+        let linux = Target::new(target::Arch::X86_64, Os::Linux);
+        let position = |argv: &[&str]| {
+            let args = Args::parse_from(run_preprocess(argv));
+            position_independence(&args, &linux)
+        };
+        assert_eq!(position(&["foo.c"]), P::Pie(PicLevel::Large));
+        assert_eq!(position(&["-fpic", "foo.c"]), P::Pic(PicLevel::Small));
+        assert_eq!(position(&["-fPIE", "foo.c"]), P::Pie(PicLevel::Large));
+        for flag in ["-fno-pic", "-fno-PIC", "-fno-pie", "-fno-PIE"] {
+            assert_eq!(position(&[flag, "foo.c"]), P::Absolute, "{flag}");
+        }
+        assert_eq!(position(&["-fPIC", "-fno-pie", "foo.c"]), P::Absolute);
+        assert_eq!(
+            position(&["-fno-pic", "-fpie", "foo.c"]),
+            P::Pie(PicLevel::Small)
+        );
+        assert_eq!(
+            position(&["-fpie", "-fPIC", "foo.c"]),
+            P::Pic(PicLevel::Large)
+        );
+        for link in ["-pie", "-no-pie", "-static-pie", "-shared"] {
+            assert_eq!(
+                position(&[link, "foo.c"]),
+                P::Pie(PicLevel::Large),
+                "{link}"
+            );
+        }
+        let mac = Target::new(target::Arch::Aarch64, Os::MacOS);
+        let args = Args::parse_from(run_preprocess(&["foo.c"]));
+        assert_eq!(position_independence(&args, &mac), P::Absolute);
     }
 
     #[test]
-    fn test_preprocess_fpie_lowercase() {
-        let result = run_preprocess(&["-fpie", "foo.c"]);
-        assert!(result.contains(&"--c17-fpie".to_string()));
+    fn test_preprocess_pic_family_keeps_its_spelling() {
+        for flag in ["-fpic", "-fPIC", "-fpie", "-fPIE", "-fno-pic", "-fno-PIE"] {
+            let result = run_preprocess(&[flag, "foo.c"]);
+            assert!(result.contains(&format!("--c17-pic={flag}")), "{result:?}");
+            assert!(!result.contains(&flag.to_string()), "{result:?}");
+        }
     }
 
     #[test]
-    fn test_preprocess_fno_pie() {
-        let result = run_preprocess(&["-fno-pie", "foo.c"]);
-        assert!(result.contains(&"--c17-fno-pie".to_string()));
-    }
-
-    #[test]
-    fn test_preprocess_pie_linker_flag() {
-        let result = run_preprocess(&["-pie", "foo.c"]);
-        assert!(result.contains(&"--c17-fpie".to_string()));
-        assert!(result.contains(&"--c17-linker-flag=-pie".to_string()));
-    }
-
-    #[test]
-    fn test_preprocess_no_pie_linker_flag() {
-        let result = run_preprocess(&["-no-pie", "foo.c"]);
-        assert!(result.contains(&"--c17-fno-pie".to_string()));
-        assert!(result.contains(&"--c17-linker-flag=-no-pie".to_string()));
+    fn test_preprocess_pie_is_a_linker_flag() {
+        for flag in ["-pie", "-no-pie", "-static-pie"] {
+            let result = run_preprocess(&[flag, "foo.c"]);
+            assert!(result.contains(&format!("--c17-linker-flag={flag}")));
+            assert!(!result.iter().any(|a| a.starts_with("--c17-pic")), "{flag}");
+        }
     }
 
     #[test]
@@ -3559,15 +3781,12 @@ mod tests {
         let result = run_preprocess(&["-static", "foo.c"]);
         assert!(result.contains(&"--c17-linker-flag=-static".to_string()));
         assert!(!result.contains(&"-static".to_string()));
-        assert!(!result.contains(&"--c17-fpie".to_string()));
-
-        let result = run_preprocess(&["-static-pie", "foo.c"]);
-        assert!(result.contains(&"--c17-linker-flag=-static-pie".to_string()));
-        assert!(result.contains(&"--c17-fpie".to_string()));
     }
 
     /// A static link leads with `-no-pie` whatever PIE request came with it;
-    /// only `-static-pie` makes a static PIE.
+    /// only `-static-pie` makes a static PIE. Otherwise the last of `-pie`
+    /// and `-no-pie` decides, and without either, position-dependent code is
+    /// linked into a position-dependent executable.
     #[test]
     fn test_link_mode_flag() {
         let linux = Target::new(target::Arch::X86_64, Os::Linux);
@@ -3575,13 +3794,44 @@ mod tests {
             let args = Args::parse_from(run_preprocess(argv));
             link_mode_flag(&args, &linux)
         };
-        assert_eq!(mode(&["foo.c"]), "-pie");
-        assert_eq!(mode(&["-no-pie", "foo.c"]), "-no-pie");
-        assert_eq!(mode(&["-static", "foo.c"]), "-no-pie");
-        assert_eq!(mode(&["-pie", "-static", "foo.c"]), "-no-pie");
-        assert_eq!(mode(&["-static", "-fPIE", "foo.c"]), "-no-pie");
-        assert_eq!(mode(&["-static-pie", "foo.c"]), "-static-pie");
-        assert_eq!(mode(&["-shared", "-static", "foo.c"]), "-shared");
+        assert_eq!(mode(&["foo.c"]), Some("-pie"));
+        assert_eq!(mode(&["-no-pie", "foo.c"]), Some("-no-pie"));
+        assert_eq!(mode(&["-no-pie", "-pie", "foo.c"]), Some("-pie"));
+        assert_eq!(mode(&["-pie", "-no-pie", "foo.c"]), Some("-no-pie"));
+        assert_eq!(mode(&["-fno-pic", "foo.c"]), Some("-no-pie"));
+        assert_eq!(mode(&["-fno-pic", "-pie", "foo.c"]), Some("-pie"));
+        assert_eq!(mode(&["-fPIC", "foo.c"]), Some("-pie"));
+        assert_eq!(mode(&["-fPIE", "-no-pie", "foo.c"]), Some("-no-pie"));
+        assert_eq!(mode(&["-static", "foo.c"]), Some("-no-pie"));
+        assert_eq!(mode(&["-pie", "-static", "foo.c"]), Some("-no-pie"));
+        assert_eq!(mode(&["-static", "-fPIE", "foo.c"]), Some("-no-pie"));
+        assert_eq!(mode(&["-static-pie", "foo.c"]), Some("-static-pie"));
+        assert_eq!(mode(&["-shared", "-static", "foo.c"]), Some("-shared"));
+    }
+
+    /// A Mach-O executable on arm64 is always position independent, and
+    /// Apple's driver ignores `-pie`/`-no-pie` with "argument unused during
+    /// compilation": no executable link mode is passed there, whatever was
+    /// asked. A shared library still says so.
+    #[test]
+    fn test_link_mode_flag_macos() {
+        let macos = Target::new(target::Arch::Aarch64, Os::MacOS);
+        let mode = |argv: &[&str]| {
+            let args = Args::parse_from(run_preprocess(argv));
+            link_mode_flag(&args, &macos)
+        };
+        for argv in [
+            &["foo.c"][..],
+            &["-fno-pic", "foo.c"],
+            &["-no-pie", "foo.c"],
+            &["-pie", "foo.c"],
+            &["-fPIC", "foo.c"],
+            &["-static", "foo.c"],
+            &["-static-pie", "foo.c"],
+        ] {
+            assert_eq!(mode(argv), None, "{argv:?}");
+        }
+        assert_eq!(mode(&["-shared", "foo.c"]), Some("-shared"));
     }
 
     // Tests for linker passthrough flags
@@ -3685,8 +3935,9 @@ mod tests {
         // Silently-ignored flags should NOT appear
         assert!(!result.contains(&"-fvisibility=hidden".to_string()));
         assert!(!result.contains(&"-fno-semantic-interposition".to_string()));
-        assert!(!result.contains(&"-fstack-protector-strong".to_string()));
         assert!(!result.contains(&"-fno-plt".to_string()));
+        // The stack protector c17 does not provide is kept for its warning.
+        assert!(result.contains(&"--c17-unsupported=-fstack-protector-strong".to_string()));
         assert!(!result.contains(&"-pipe".to_string()));
         // Linker flags should be passed through
         assert!(result.iter().any(|a| a.starts_with("--c17-linker-flag=")));

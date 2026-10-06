@@ -57,6 +57,10 @@ pub enum Spelling {
     /// `<: :> <% %> %: %:%:`. 6.4.6p3 makes them behave exactly as
     /// `[ ] { } # ##` "except for their spelling".
     Digraph,
+    /// A string or character literal whose line ended before its closing
+    /// quote. It is spelled as written, without one; the lexer has already
+    /// warned, and the compiler refuses it (gcc's `CPP_OTHER`).
+    Unterminated { utf8_prefix: bool },
 }
 
 /// A punctuator token that was written as a digraph. The value is the primary
@@ -664,11 +668,20 @@ impl Token {
     /// that do not imply one. Only `u8` qualifies: `L`, `u` and `U` are each
     /// a token type of their own.
     pub fn encoding_prefix(&self) -> &'static str {
-        if self.spelling == Spelling::Utf8Prefix {
-            "u8"
-        } else {
-            ""
+        match self.spelling {
+            Spelling::Utf8Prefix
+            | Spelling::Unterminated {
+                utf8_prefix: true, ..
+            } => "u8",
+            _ => "",
         }
+    }
+
+    /// A string or character literal missing its closing quote. Only a
+    /// token that reaches the compiler is an error; see
+    /// [`Spelling::Unterminated`].
+    pub fn is_unterminated_literal(&self) -> bool {
+        matches!(self.spelling, Spelling::Unterminated { .. })
     }
 
     /// How this token's punctuator is written.
@@ -1195,32 +1208,22 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         let pos = self.pos();
         let mut content = String::new();
         let mut escape = false;
-        let mut want_hex = false; // Track if we just saw \x
+        let mut terminated = false;
 
+        // Escapes are left as written: what they mean is translation phase
+        // 5, which happens only to a literal that is decoded -- not to one in
+        // a skipped group, nor to one `-E` copies through. `literal` reports
+        // a malformed escape there, as gcc does.
         loop {
             let c = self.nextchar();
-            if c == EOF {
-                // Unterminated string/char - emit warning
-                diag::warning(pos, &gettext("End of file in middle of string"));
+            if c == EOF || c == b'\n' as i32 {
                 break;
             }
             let cu = c as u8;
 
-            // Check for \x without hex digits
-            if want_hex {
-                if !cu.is_ascii_hexdigit() {
-                    diag::warning(pos, &gettext("\\x used with no following hex digits"));
-                }
-                want_hex = false;
-            }
-
             if escape {
                 content.push(cu as char);
                 escape = false;
-                // Track if this is \x escape
-                if cu == b'x' {
-                    want_hex = true;
-                }
                 continue;
             }
 
@@ -1231,27 +1234,24 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             }
 
             if cu == delim {
-                // End of literal
-                break;
-            }
-
-            if cu == b'\n' {
-                // Error: newline in string/char literal - emit warning
-                let delim_char = if delim == b'"' { '"' } else { '\'' };
-                diag::warning_args(
-                    pos,
-                    "missing terminating {0} character",
-                    &[&delim_char.to_string()],
-                );
+                terminated = true;
                 break;
             }
 
             content.push(cu as char);
         }
 
-        // Check for trailing \x at end of string
-        if want_hex {
-            diag::warning(pos, &gettext("\\x used with no following hex digits"));
+        if !terminated {
+            // C17 6.4.5p1 and 6.4.4.4p1: a literal ends on its own line. gcc's
+            // lexer gives a default pedwarn and keeps the text as a token; the
+            // compiler refuses that token if it gets there (see
+            // `Token::is_unterminated_literal`).
+            let delim_char = if delim == b'"' { '"' } else { '\'' };
+            diag::pedwarn_default_args(
+                pos,
+                "missing terminating {0} character",
+                &[&delim_char.to_string()],
+            );
         }
 
         let (typ, value) = if delim == b'"' {
@@ -1283,7 +1283,10 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         let mut token = Token::with_value(typ, pos, value);
         // `u8` is folded into the narrow type above; the flag is what keeps
         // the spelling, which `#` and `-E` both have to reproduce.
-        if enc == LiteralEncoding::Utf8 {
+        let utf8_prefix = enc == LiteralEncoding::Utf8;
+        if !terminated {
+            token.spelling = Spelling::Unterminated { utf8_prefix };
+        } else if utf8_prefix {
             token.spelling = Spelling::Utf8Prefix;
         }
         token
@@ -1299,23 +1302,24 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
         }
     }
 
-    /// Skip a block comment (/* ... */)
-    fn skip_block_comment(&mut self) {
-        let pos = self.pos(); // Save position for warning
-                              // Save newline state before the comment and restore it after.
-                              // This matches sparse's drop_stream_comment() behavior:
-                              // a comment is transparent to newline tracking, so the token
-                              // after the comment inherits the newline flag from before it.
-                              // This prevents multi-line comments inside macros from breaking
-                              // the EOL boundary, while also preserving start-of-line status
-                              // for tokens that follow a comment at the beginning of a line.
+    /// Skip a block comment (/* ... */) whose `/` is at `pos`.
+    fn skip_block_comment(&mut self, pos: Position) {
+        // Save newline state before the comment and restore it after.
+        // This matches sparse's drop_stream_comment() behavior:
+        // a comment is transparent to newline tracking, so the token
+        // after the comment inherits the newline flag from before it.
+        // This prevents multi-line comments inside macros from breaking
+        // the EOL boundary, while also preserving start-of-line status
+        // for tokens that follow a comment at the beginning of a line.
         let saved_newline = self.newline;
         let mut next = self.nextchar();
         loop {
             let curr = next;
             if curr == EOF {
-                // Unterminated comment - emit warning
-                diag::warning(pos, &gettext("End of file in the middle of a comment"));
+                // C17 6.4.9p1: a comment ends with `*/`. gcc refuses one that
+                // runs off the end of the file -- in a skipped group too,
+                // since the comment is removed before directives are seen.
+                diag::error(pos, &gettext("unterminated comment"));
                 break;
             }
             next = self.nextchar();
@@ -1376,7 +1380,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
             }
             if next == b'*' as i32 {
                 self.nextchar();
-                self.skip_block_comment();
+                self.skip_block_comment(pos);
                 self.whitespace = true;
                 return None; // No token, continue tokenizing
             }
@@ -1718,6 +1722,25 @@ fn literal_parts(token: &Token) -> Option<(&'static str, u8, &str)> {
     Some((prefix, delim, payload.as_str()))
 }
 
+/// Refuse every literal left open among `tokens`, the translation unit the
+/// compiler is about to parse.
+///
+/// The lexer only warns: a literal missing its quote is harmless in a skipped
+/// group, in a macro never expanded, or in `-E` output, and gcc accepts all
+/// three. What reaches the compiler is no literal at all (gcc's `CPP_OTHER`),
+/// and gcc's parser refuses it with the lexer's words.
+pub fn report_unterminated_literals(tokens: &[Token]) {
+    for token in tokens.iter().filter(|t| t.is_unterminated_literal()) {
+        if let Some((_, delim, _)) = literal_parts(token) {
+            diag::error_args(
+                token.pos,
+                "missing terminating {0} character",
+                &[&char::from(delim).to_string()],
+            );
+        }
+    }
+}
+
 /// Spell `text` as the body of a C string literal: `"` and `\` get a
 /// backslash (C17 6.10.3.2p2) and a newline becomes `\n`. Every other
 /// character stands as itself, so it serves a payload and Rust text alike.
@@ -1794,7 +1817,9 @@ pub fn write_token(out: &mut Vec<u8>, token: &Token, strings: &StringTable) {
             out.extend_from_slice(prefix.as_bytes());
             out.push(delim);
             out.extend(payload_bytes(payload));
-            out.push(delim);
+            if !token.is_unterminated_literal() {
+                out.push(delim);
+            }
         }
         None => match &token.value {
             // A header name already carries its own delimiters.

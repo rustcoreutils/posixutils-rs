@@ -22,6 +22,7 @@ use crate::strings::StringTable;
 use crate::target::{self, Target};
 use crate::token::preprocess::SystemSearch;
 use crate::token::{preprocess_collecting, PreprocessConfig};
+use crate::warn_options::{self, Verdict};
 
 /// The stack a compile runs on, as the driver's own compiler thread: the
 /// front end recurses per nesting level, and the test harness's default
@@ -46,11 +47,13 @@ pub struct Compiled {
 struct Options {
     optimization: Optimization,
     debug: bool,
-    pic: bool,
-    pie: bool,
-    no_pie: bool,
+    /// The last of the `-fpic` family, if any.
+    position: Option<target::PositionIndependence>,
+    /// `-ftls-model=`.
+    tls_model: target::TlsModel,
     shared: bool,
     no_unwind_tables: bool,
+    stack_clash: bool,
     verbose_asm: bool,
     cf_protection: target::CfProtection,
     math_errno: bool,
@@ -80,18 +83,23 @@ fn apply_flags(flags: &[&str]) -> Options {
         trapping_math: true,
         ..Options::default()
     };
-    let mut no_groups = std::collections::HashSet::new();
     let mut no_builtin_funcs = std::collections::HashSet::new();
-    let mut pedantic = diag::Pedantic::OFF;
+    // The `-W<name>` options, in order, as the driver folds them. As there,
+    // `-pedantic` and `-pedantic-errors` are among them.
+    let mut warning_options = Vec::new();
     for &flag in flags {
-        // As the driver: `-pedantic` and `-pedantic-errors` are `-W` options
-        // by the time the switch is folded.
-        let w_name = match flag {
-            "-pedantic" | "-pedantic-errors" => Some(&flag[1..]),
-            _ => flag.strip_prefix("-W"),
-        };
-        if let Some(next) = w_name.and_then(|name| pedantic.after(name)) {
-            pedantic = next;
+        if let "-pedantic" | "-pedantic-errors" = flag {
+            warning_options.push(&flag[1..]);
+            continue;
+        }
+        if let Some(name) = flag.strip_prefix("-W") {
+            // The driver refuses a name gcc would; so does this.
+            if let Verdict::DriverError(_) | Verdict::CompilerError(_) =
+                warn_options::classify(name)
+            {
+                panic!("test_compile: unsupported option {flag}");
+            }
+            warning_options.push(name);
             continue;
         }
         match flag {
@@ -101,12 +109,10 @@ fn apply_flags(flags: &[&str]) -> Options {
             "-fgnu89-inline" => crate::builtins::set_gnu89_inline(true),
             "-g" => o.debug = true,
             "-O" => o.optimization = Optimization::from_flag("1").unwrap(),
-            "-fPIC" | "-fpic" => o.pic = true,
-            "-fPIE" | "-fpie" => o.pie = true,
-            "-fno-pie" => o.no_pie = true,
             "-shared" | "--shared" | "-G" => o.shared = true,
             "--fno-unwind-tables" => o.no_unwind_tables = true,
             "-fverbose-asm" => o.verbose_asm = true,
+            "-fstack-clash-protection" => o.stack_clash = true,
             "-fmath-errno" => o.math_errno = true,
             "-fno-math-errno" => o.math_errno = false,
             "-fno-trapping-math" => o.trapping_math = false,
@@ -119,12 +125,14 @@ fn apply_flags(flags: &[&str]) -> Options {
                 o.plain_char = Some(target::CharSignedness::Unsigned)
             }
             _ => {
-                if let Some(level) = flag.strip_prefix("-O") {
+                if let Some(position) = target::PositionIndependence::from_flag(flag) {
+                    o.position = Some(position);
+                } else if let Some(model) = flag.strip_prefix("-ftls-model=") {
+                    o.tls_model = target::TlsModel::from_name(model).unwrap();
+                } else if let Some(level) = flag.strip_prefix("-O") {
                     o.optimization = Optimization::from_flag(level).unwrap();
                 } else if let Some(map) = MapOption::parse(flag) {
                     o.prefix_maps.push(map.unwrap());
-                } else if let Some(name) = flag.strip_prefix("-Wno-") {
-                    no_groups.insert(name.to_string());
                 } else if let Some(name) = flag.strip_prefix("-fno-builtin-") {
                     no_builtin_funcs.insert(name.to_string());
                 } else if let Some(d) = flag.strip_prefix("-D") {
@@ -148,8 +156,7 @@ fn apply_flags(flags: &[&str]) -> Options {
     if let Some(enabled) = o.inlining {
         o.optimization.set_inlining(enabled);
     }
-    diag::suppress_warning_groups(no_groups);
-    diag::set_pedantic(pedantic);
+    diag::set_warning_options(&warning_options);
     crate::builtins::set_no_builtin_funcs(no_builtin_funcs);
     o
 }
@@ -173,13 +180,10 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
     if let Some(signedness) = o.plain_char {
         target.plain_char = signedness;
     }
-    // As the driver's `position_independence`: PIE is the Linux default
-    // unless a shared object or `-fno-pie` asks otherwise, and implies PIC.
-    let pie = !(o.shared || o.no_pie) && (o.pie || target.os == target::Os::Linux);
-    let position = target::PositionIndependence {
-        pic: o.pic || o.shared || pie,
-        pie,
-    };
+    // As the driver's `position_independence`.
+    let position = o
+        .position
+        .unwrap_or_else(|| target::PositionIndependence::target_default(&target));
 
     let prefix_maps = PrefixMaps::from_options(&o.prefix_maps);
     let mut strings = StringTable::new();
@@ -215,16 +219,21 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         debug: o.debug,
         trapping_math: o.trapping_math,
         default_visibility: None,
-        shared_mode: o.shared || o.pic,
-        pic: position.pic,
+        tls: target::TlsPolicy {
+            shared_code: o.shared || position.is_shared_code(),
+            floor: o.tls_model,
+        },
+        pic: o.shared || position.is_pic(),
         unwind_tables: !o.no_unwind_tables,
         verbose_asm: o.verbose_asm,
         cf_protection: o.cf_protection,
+        stack_clash: o.stack_clash,
         source_name: &source_name,
         debug_prefix_map: &prefix_maps.debug,
     };
     let result = pipeline::compile_tokens(preprocessed, &strings, &target, &opts, &mut Quiet);
 
+    diag::finish_unit();
     let mut diags = diag::take_captured_diagnostics();
     let asm = match result {
         Ok(asm) => asm,
@@ -343,6 +352,24 @@ pub fn compile_expect_no_diagnostic(name: &str, content: &str, forbidden: &str) 
         !stderr.contains(forbidden),
         "'{name}' compiled, but a diagnostic mentioned {forbidden:?}.\nstderr:\n{stderr}"
     );
+}
+
+/// The warnings a translation unit that must compile draws, each as
+/// `line:col: message` -- for a test that has to see every one, where it
+/// points, and that there are no others.
+#[track_caller]
+pub fn compile_warnings(name: &str, src: &str, flags: &[&str]) -> Vec<String> {
+    let c = compile(name, src, flags);
+    assert!(c.success, "'{name}' should have compiled:\n{}", c.stderr);
+    let prefix = format!("{name}.c:");
+    c.stderr
+        .lines()
+        .filter_map(|l| l.strip_prefix(&prefix))
+        .filter_map(|l| {
+            let (at, msg) = l.split_once(": warning: ")?;
+            Some(format!("{at}: {msg}"))
+        })
+        .collect()
 }
 
 /// The assembly of a translation unit that must compile.

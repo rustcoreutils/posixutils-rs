@@ -2061,6 +2061,32 @@ fn test_has_include_next_searches_past_the_current_file() {
     assert_eq!(strs, ["NEXT_YES"]);
 }
 
+/// A header found in a system directory is a system header for diagnostics
+/// too -- the warnings `-w` would hide are not shown, and `-Werror` and
+/// `-pedantic-errors` do not reach it -- and so is one it includes from
+/// beside itself, or a bundled one. A `-I` header is not, however spelled.
+#[test]
+fn test_headers_from_system_directories_are_system_streams() {
+    let tree = SearchTree::new(&[
+        ("q/mine.h", ""),
+        ("sys/theirs.h", "#include \"beside.h\"\n"),
+        ("sys/beside.h", ""),
+    ]);
+    crate::diag::clear_streams();
+    tree.preprocess("#include <mine.h>\n#include \"theirs.h\"\n#include <stddef.h>\n");
+    let system = |suffix: &str| {
+        let name = crate::diag::get_all_stream_names()
+            .into_iter()
+            .find(|n| n.ends_with(suffix))
+            .unwrap_or_else(|| panic!("no stream for {suffix}"));
+        crate::diag::stream_is_system(crate::diag::find_or_add_stream(&name))
+    };
+    assert!(!system("q/mine.h"));
+    assert!(system("sys/theirs.h"));
+    assert!(system("sys/beside.h"));
+    assert!(system("<builtin:stddef.h>"));
+}
+
 /// A header found through `-I` is the project's, which `-MM` lists; only one
 /// found in a system directory is a system header, however it was spelled.
 #[test]
@@ -2160,9 +2186,10 @@ fn test_if_conditional_operator() {
 /// independence the code is generated with.
 #[test]
 fn test_pic_macros_follow_the_configuration() {
-    let expand = |pic: bool, pie: bool, target: &Target| {
+    use crate::target::{PicLevel, PositionIndependence as P};
+    let expand = |position: P, target: &Target| {
         let config = PreprocessConfig {
-            position: crate::target::PositionIndependence { pic, pie },
+            position,
             isa: Default::default(),
             ..Default::default()
         };
@@ -2172,19 +2199,31 @@ fn test_pic_macros_follow_the_configuration() {
         get_token_strings(&out, &idents)
     };
     let linux = Target::from_triple("x86_64-unknown-linux-gnu").unwrap();
-    assert_eq!(expand(true, true, &linux), ["2", "2", "2", "2"]);
     assert_eq!(
-        expand(true, false, &linux),
+        expand(P::Pie(PicLevel::Large), &linux),
+        ["2", "2", "2", "2"]
+    );
+    // `-fpie` and `-fpic` say 1, as gcc does.
+    assert_eq!(
+        expand(P::Pie(PicLevel::Small), &linux),
+        ["1", "1", "1", "1"]
+    );
+    assert_eq!(
+        expand(P::Pic(PicLevel::Small), &linux),
+        ["1", "1", "__PIE__", "__pie__"]
+    );
+    assert_eq!(
+        expand(P::Pic(PicLevel::Large), &linux),
         ["2", "2", "__PIE__", "__pie__"]
     );
     assert_eq!(
-        expand(false, false, &linux),
+        expand(P::Absolute, &linux),
         ["__PIC__", "__pic__", "__PIE__", "__pie__"]
     );
     // Mach-O code is position independent whatever was asked.
     let darwin = Target::from_triple("aarch64-apple-darwin").unwrap();
     assert_eq!(
-        expand(false, false, &darwin),
+        expand(P::Absolute, &darwin),
         ["2", "2", "__PIE__", "__pie__"]
     );
 }
@@ -2242,4 +2281,160 @@ fn test_storage_order_pragma_becomes_a_layout_marker() {
         orders[2].to_pragma_text(),
         "#pragma scalar_storage_order default"
     );
+}
+
+/// Preprocess `src` and return every diagnostic it produced.
+fn preprocess_diagnostics(src: &str) -> Vec<String> {
+    crate::diag::capture_diagnostics();
+    preprocess_str(src);
+    crate::diag::take_captured_diagnostics()
+}
+
+/// Whether any diagnostic line contains `needle`.
+fn mentions(lines: &[String], needle: &str) -> bool {
+    lines.iter().any(|l| l.contains(needle))
+}
+
+/// C17 6.10p1: a `#` that starts a line in an active group begins a
+/// directive, and one whose name is none of the directives is invalid. gcc
+/// errors, naming the token that follows the `#`.
+#[test]
+fn test_invalid_directive_is_an_error() {
+    for (src, spelled) in [
+        ("#foo\nint x;\n", "#foo"),
+        ("#foo bar baz\nint x;\n", "#foo"),
+        ("#Define X 1\nint x;\n", "#Define"),
+        ("#!foo\nint x;\n", "#!"),
+        ("#+\nint x;\n", "#+"),
+        ("#\"x\"\nint x;\n", "#\"x\""),
+    ] {
+        let lines = preprocess_diagnostics(src);
+        let want = format!("error: invalid preprocessing directive {spelled}");
+        assert!(
+            lines.iter().any(|l| l.ends_with(&want)),
+            "{src:?}: expected {want:?}, got {lines:?}"
+        );
+    }
+}
+
+/// A linemarker's line number must be a number: gcc's error names the token.
+#[test]
+fn test_linemarker_needs_a_positive_integer() {
+    let lines = preprocess_diagnostics("# 12abc\nint x;\n");
+    assert!(
+        mentions(&lines, "error: \"12abc\" after # is not a positive integer"),
+        "{lines:?}"
+    );
+}
+
+/// The null directive and a linemarker are valid, and a skipped group is
+/// only scanned for the directives that nest: gcc says nothing about any of
+/// these.
+#[test]
+fn test_valid_and_skipped_directives_are_quiet() {
+    let lines = preprocess_diagnostics(
+        "#\n# 33 \"file.c\"\n#123\n#if 0\n#foo\n#!\n#+ bar\n# 12abc\n#endif\nint x;\n",
+    );
+    assert!(lines.is_empty(), "{lines:?}");
+}
+
+/// In assembly `#` also introduces a comment, so a line naming no directive
+/// is prose. gcc passes it through without a word.
+#[test]
+fn test_assembly_leaves_unknown_directives_alone() {
+    crate::diag::capture_diagnostics();
+    let out = preprocess_asm_file(
+        b"# save the frame pointer\n#! odd\n#foo bar\n\tnop\n",
+        &Target::host(),
+        "t.S",
+        &AsmPreprocessConfig::default(),
+    );
+    let lines = crate::diag::take_captured_diagnostics();
+    assert!(out.is_ok(), "{lines:?}");
+    assert!(lines.is_empty(), "{lines:?}");
+}
+
+/// C17 6.10.1p4 evaluates `#if` in `intmax_t`, where signed overflow is
+/// undefined. gcc's default pedwarn "integer overflow in preprocessor
+/// expression" covers `+`, `-`, `*`, `/`, unary `-` and a signed left shift
+/// that loses bits -- and nothing in the unsigned domain, `%`, a right shift,
+/// or an operand that is not evaluated.
+#[test]
+fn test_if_signed_overflow_is_diagnosed_as_gcc_does() {
+    const MAX: &str = "9223372036854775807";
+    let cases: &[(String, bool)] = &[
+        (format!("{MAX} + 1"), true),
+        (format!("-{MAX} - 2"), true),
+        (format!("{MAX} * 2"), true),
+        (format!("-{MAX} * 2"), true),
+        ("4294967296 * 4294967296".to_string(), true),
+        (format!("(-{MAX}-1) * -1"), true),
+        (format!("(-{MAX}-1) / -1"), true),
+        (format!("-(-{MAX}-1)"), true),
+        ("1 << 63".to_string(), true),
+        ("3 << 62".to_string(), true),
+        ("2 << 62".to_string(), true),
+        ("1 << 64".to_string(), true),
+        ("-1 << 64".to_string(), true),
+        ("4 >> -62".to_string(), true),
+        ("1 >> -64".to_string(), true),
+        ("1 << 18446744073709551615u".to_string(), true),
+        (format!("-{MAX} - 1"), false),
+        (format!("{MAX} * -1"), false),
+        (format!("(-{MAX}-1) % -1"), false),
+        (format!("{MAX} + 1u"), false),
+        ("18446744073709551615u + 1".to_string(), false),
+        ("0u - 1".to_string(), false),
+        ("-1 + 0u".to_string(), false),
+        ("~0 + 1".to_string(), false),
+        ("1 << 62".to_string(), false),
+        ("-1 << 1".to_string(), false),
+        ("-1 << 63".to_string(), false),
+        ("0 << 64".to_string(), false),
+        ("1u << 63".to_string(), false),
+        ("1u << 64".to_string(), false),
+        ("1 >> 64".to_string(), false),
+        ("-1 >> 70".to_string(), false),
+        ("1 << -1".to_string(), false),
+        (format!("0 && {MAX} + 1"), false),
+        (format!("1 || {MAX} * 2"), false),
+        (format!("0 ? ({MAX} + 1) : 1"), false),
+    ];
+    let faults: Vec<String> = cases
+        .iter()
+        .filter_map(|(expr, overflows)| {
+            let lines = preprocess_diagnostics(&format!("#if {expr}\n#endif\nint x;\n"));
+            let warned = mentions(
+                &lines,
+                "warning: integer overflow in preprocessor expression",
+            );
+            let other = lines
+                .iter()
+                .any(|l| !l.contains("integer overflow in preprocessor expression"));
+            (warned != *overflows || other).then(|| format!("#if {expr}: {lines:?}"))
+        })
+        .collect();
+    assert!(faults.is_empty(), "{}", faults.join("\n"));
+}
+
+/// The value of an out-of-range shift is gcc's: a negative count shifts the
+/// other way, and a count of 64 or more shifts every bit out.
+#[test]
+fn test_if_shift_values_match_gcc() {
+    for cond in [
+        "(1 << -1) == 0",
+        "(4 >> -1) == 8",
+        "(1u << 64) == 0",
+        "(1 << 64) == 0",
+        "(1 >> 64) == 0",
+        "(-1 >> 70) == -1",
+        "(-1 << 64) == 0",
+        "(1 << 63) < 0",
+        "!((4 >> -62) < 0)",
+        "(1 >> -64) == 0",
+        "(1 << 18446744073709551615u) == 0",
+    ] {
+        let (tokens, idents) = preprocess_str(&format!("#if {cond}\nyes\n#else\nno\n#endif\n"));
+        assert_eq!(get_token_strings(&tokens, &idents), ["yes"], "#if {cond}");
+    }
 }

@@ -23,6 +23,9 @@ mod constraint_sweep;
 mod declarations;
 mod expressions;
 mod function_compatibility;
+mod integer_overflow;
+mod mode_attribute;
+mod narrow_initializers;
 
 use crate::common::{
     compile_and_run, compile_and_run_two_units, compile_expect_error, compile_expect_ok,

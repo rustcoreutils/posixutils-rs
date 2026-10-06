@@ -2456,6 +2456,19 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// number where its caller read an address, and `double d = z;` stored
     /// the address's bit pattern.
     pub(crate) fn linearize_converted(&mut self, expr: &Expr, to_typ: TypeId) -> PseudoId {
+        self.linearize_converted_into(expr, to_typ, None)
+    }
+
+    /// [`Self::linearize_converted`] for a value bound for a bit-field of
+    /// `bit_width` bits, whose width a constant has to fit as well as the
+    /// declared type's ([`Self::warn_converted_integer_constant`]).
+    pub(crate) fn linearize_converted_into(
+        &mut self,
+        expr: &Expr,
+        to_typ: TypeId,
+        bit_width: Option<u32>,
+    ) -> PseudoId {
+        self.warn_converted_integer_constant(expr, to_typ, bit_width);
         let from_typ = self.expr_type(expr);
         if let Some(folded) = self.implicit_float_to_integer_const(expr, to_typ) {
             return folded;
@@ -2877,6 +2890,19 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
+    /// The width of the bit-field `target` designates, if it designates one.
+    fn designated_bitfield_width(&self, target: &Expr) -> Option<u32> {
+        let (struct_type, member) = match &target.kind {
+            ExprKind::Member { expr, member } => (self.expr_type(expr), *member),
+            ExprKind::Arrow { expr, member } => {
+                (self.types.base_type(self.expr_type(expr))?, *member)
+            }
+            _ => return None,
+        };
+        let info = self.types.find_member(struct_type, member)?;
+        info.bitfield().map(|bf| bf.bit_width)
+    }
+
     /// The place a struct or union member occupies, relative to `base`.
     fn member_place(
         &mut self,
@@ -3228,7 +3254,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             // at `int` and stores `(unsigned char)-10`.
             self.linearize_expr(value)
         } else {
-            self.linearize_converted(value, target_typ)
+            let bit_width = self.designated_bitfield_width(target);
+            self.linearize_converted_into(value, target_typ, bit_width)
         };
 
         // The target is resolved exactly once (C17 6.5.16.2p3) and the same

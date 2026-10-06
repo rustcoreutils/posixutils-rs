@@ -14,6 +14,8 @@ use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::io::{self, Write};
 
+use crate::warn_options::{self, Verdict};
+
 // Source Position
 
 /// Source position tracking for tokens and diagnostics.
@@ -310,6 +312,20 @@ thread_local! {
     /// `-pedantic` and its relatives; see [`Pedantic`].
     static PEDANTIC: Cell<Pedantic> = const { Cell::new(Pedantic::OFF) };
 
+    /// `-Werror` and its relatives; see [`Werror`].
+    static WERROR: RefCell<Werror> = RefCell::new(Werror::default());
+
+    /// Warnings made errors by [`WERROR`] in this translation unit, for
+    /// [`finish_unit`].
+    static PROMOTED: Cell<u32> = const { Cell::new(0) };
+
+    /// The `-Wno-<name>` options naming no warning c17 knows, in
+    /// command-line order, for [`finish_unit`]'s notes.
+    static UNKNOWN_NEGATIONS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+
+    /// Diagnostics shown in this translation unit, for [`finish_unit`].
+    static SHOWN: Cell<u32> = const { Cell::new(0) };
+
     /// Where diagnostics go when not to stderr; see [`capture_diagnostics`].
     static CAPTURE: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
 
@@ -355,14 +371,69 @@ pub fn suppress_warnings() {
     SUPPRESS_WARNINGS.set(true);
 }
 
-/// Record the `-Wno-<name>` groups.
-pub fn suppress_warning_groups(names: std::collections::HashSet<String>) {
-    SUPPRESSED_GROUPS.replace(names);
+/// The warning groups the `-W<name>` options in `names` leave off, folded
+/// in command-line order: `-Wno-<name>` turns a group off, and `-W<name>` or
+/// `-Werror=<name>` -- which gcc makes enable the group too -- turn it back
+/// on.
+fn suppressed_groups<'a>(
+    names: impl IntoIterator<Item = &'a str>,
+) -> std::collections::HashSet<String> {
+    let mut off = std::collections::HashSet::new();
+    for name in names {
+        if name == "no-error" || name.starts_with("no-error=") {
+            continue;
+        }
+        if let Some(group) = name.strip_prefix("no-") {
+            off.insert(group.to_string());
+        } else {
+            off.remove(name.strip_prefix("error=").unwrap_or(name));
+        }
+    }
+    off
 }
 
-/// Is the warning group `name` still on?
+/// Set every switch the `-W<name>` options in `names` select, in
+/// command-line order, for the rest of this thread's compilation: the groups
+/// left on, [`Pedantic`] and [`Werror`]. The driver passes `-pedantic` as the
+/// name `pedantic` and `-pedantic-errors` as `pedantic-errors`.
+pub fn set_warning_options(names: &[&str]) {
+    UNKNOWN_NEGATIONS.replace(
+        names
+            .iter()
+            .filter(|name| warn_options::classify(name) == Verdict::UnknownNegation)
+            .map(|name| name.to_string())
+            .collect(),
+    );
+    SUPPRESSED_GROUPS.replace(suppressed_groups(names.iter().copied()));
+    PEDANTIC.set(Pedantic::from_warning_options(names.iter().copied()));
+    WERROR.replace(Werror::from_warning_options(names.iter().copied()));
+}
+
+/// Is `-pedantic` (or `-pedantic-errors`) in effect? For a warning gcc gives
+/// in its own group only when pedantic, which [`pedwarn`] cannot express.
+pub fn pedantic() -> bool {
+    PEDANTIC.get().enabled
+}
+
+/// Is the warning group `name` still on? A diagnostic in a group goes
+/// through [`group_warning`], which asks this itself.
 pub fn warning_group_enabled(name: &str) -> bool {
     !SUPPRESSED_GROUPS.with_borrow(|groups| groups.contains(name))
+}
+
+/// Report a warning in the group `name` -- the one `-Wno-<name>` turns off
+/// and `-Werror=<name>` makes an error -- unless the group is off.
+pub fn group_warning(name: &str, pos: Position, msg: &str) {
+    if warning_group_enabled(name) {
+        give_warning(Some(name), pos, msg);
+    }
+}
+
+/// [`group_warning`] with a translatable template; see [`warning_args`].
+pub fn group_warning_args(name: &str, pos: Position, template: &str, args: &[&str]) {
+    if warning_group_enabled(name) {
+        give_warning(Some(name), pos, &gettext_args(template, args));
+    }
 }
 
 /// Are warnings being printed?
@@ -443,7 +514,7 @@ pub fn permissive_error(pos: Position, msg: &str) {
 /// struct member list with no `;` after its last member; each goes through
 /// [`pedwarn_default`]. Both ask this and nothing else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Pedantic {
+struct Pedantic {
     /// `-pedantic` or `-Wpedantic`, and not a later `-Wno-pedantic`.
     enabled: bool,
     /// `-pedantic-errors`. gcc keeps it through a later `-Wno-pedantic`,
@@ -454,7 +525,7 @@ pub struct Pedantic {
 
 impl Pedantic {
     /// gcc's default: no pedantic diagnostics at all.
-    pub const OFF: Pedantic = Pedantic {
+    const OFF: Pedantic = Pedantic {
         enabled: false,
         errors: false,
     };
@@ -464,7 +535,7 @@ impl Pedantic {
     /// The driver passes `-pedantic` as the name `pedantic` and
     /// `-pedantic-errors` as `pedantic-errors`. Answers `None` for any other
     /// name.
-    pub fn after(self, name: &str) -> Option<Pedantic> {
+    fn after(self, name: &str) -> Option<Pedantic> {
         match name {
             "pedantic" => Some(Pedantic {
                 enabled: true,
@@ -478,21 +549,130 @@ impl Pedantic {
                 enabled: false,
                 ..self
             }),
+            // gcc's `-Werror=<name>` enables the group it names.
+            "error=pedantic" => Some(Pedantic {
+                enabled: true,
+                ..self
+            }),
             _ => None,
         }
     }
 
     /// The switch after every `-W<name>` in `names`, in order.
-    pub fn from_warning_options<'a>(names: impl IntoIterator<Item = &'a str>) -> Pedantic {
+    fn from_warning_options<'a>(names: impl IntoIterator<Item = &'a str>) -> Pedantic {
         names
             .into_iter()
             .fold(Pedantic::OFF, |p, name| p.after(name).unwrap_or(p))
     }
 }
 
-/// Set the `-pedantic` switch for the rest of this thread's compilation.
-pub fn set_pedantic(p: Pedantic) {
-    PEDANTIC.set(p);
+/// `-Werror` and its relatives: which of the warnings given are errors.
+///
+/// gcc keeps two things. `-Werror` asks for every warning, and a later
+/// `-Wno-error` withdraws that. `-Werror=<name>` and `-Wno-error=<name>`
+/// give one group a verdict of its own, which outranks the first and which
+/// neither `-Werror` nor `-Wno-error` changes; the last for a group wins.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Werror {
+    /// `-Werror`, and not a later `-Wno-error`.
+    all: bool,
+    /// Each named group's verdict: an error (`-Werror=<name>`) or not
+    /// (`-Wno-error=<name>`).
+    groups: std::collections::HashMap<String, bool>,
+}
+
+impl Werror {
+    /// Fold one `-W<name>` warning option in, in command-line order. Answers
+    /// `None` for a name that is not one of the four.
+    fn after(mut self, name: &str) -> Option<Werror> {
+        match name {
+            "error" => self.all = true,
+            "no-error" => self.all = false,
+            _ => {
+                let (group, verdict) = match name.strip_prefix("error=") {
+                    Some(group) => (group, true),
+                    None => (name.strip_prefix("no-error=")?, false),
+                };
+                self.groups.insert(group.to_string(), verdict);
+            }
+        }
+        Some(self)
+    }
+
+    /// The switch after every `-W<name>` in `names`, in order.
+    fn from_warning_options<'a>(names: impl IntoIterator<Item = &'a str>) -> Werror {
+        names.into_iter().fold(Werror::default(), |w, name| {
+            let unchanged = w.clone();
+            w.after(name).unwrap_or(unchanged)
+        })
+    }
+
+    /// Is a warning in `group` (`None`: in none gcc names) an error? Plain
+    /// `-Werror` does not reach a group in [`BEYOND_PLAIN_WERROR`].
+    fn promotes(&self, group: Option<&str>) -> bool {
+        match group.and_then(|g| self.groups.get(g).copied()) {
+            Some(verdict) => verdict,
+            None => self.all && !group.is_some_and(|g| BEYOND_PLAIN_WERROR.contains(&g)),
+        }
+    }
+}
+
+/// The warning groups only `-Werror=<name>` makes errors of. c17's
+/// "'-fX' is not supported" is one: a distribution's default flags give it
+/// on every compile, and a build that adds `-Werror` asks about its own
+/// code, not about the compiler's.
+const BEYOND_PLAIN_WERROR: &[&str] = &[crate::f_options::UNSUPPORTED_WARNING];
+
+/// A warning in the group `name` about the command line, which has no
+/// source position: given as the driver gives its own, unless `-w` or
+/// `-Wno-<name>` silences it, and an error, tagged as gcc tags one, when
+/// `-Werror` reaches the group. Answers whether it was an error.
+pub fn command_line_group_warning(name: &str, msg: &str) -> bool {
+    if warnings_suppressed() || !warning_group_enabled(name) {
+        return false;
+    }
+    if WERROR.with_borrow(|w| w.promotes(Some(name))) {
+        emit_line(format!("c17: {}: {msg} [-Werror={name}]", gettext("error")));
+        return true;
+    }
+    emit_line(format!("c17: {}: {msg}", gettext("warning")));
+    false
+}
+
+/// Is `-Werror` in effect for every warning -- what gcc calls "all warnings
+/// being treated as errors"? A command-line warning answers to this alone,
+/// having no group.
+pub fn werror_all() -> bool {
+    WERROR.with_borrow(|w| w.all)
+}
+
+/// Close a translation unit's diagnostics as gcc does. If any were shown,
+/// each `-Wno-<name>` that named no known warning gets a note, last first,
+/// saying it may have been meant to silence one. Then, if a warning was
+/// made an error, the closing line: "all" under `-Werror`, "some" when only
+/// named groups were. Given once, and the next unit starts again -- which
+/// is why this, and not [`reset_counts`], clears the tallies: a unit's
+/// failure path may reset the counts before its error is reported.
+pub fn finish_unit() {
+    if SHOWN.replace(0) > 0 {
+        UNKNOWN_NEGATIONS.with_borrow(|names| {
+            for name in names.iter().rev() {
+                emit_line(format!(
+                    "c17: {}",
+                    warn_options::unknown_negation_note(name)
+                ));
+            }
+        });
+    }
+    if PROMOTED.replace(0) == 0 {
+        return;
+    }
+    let line = if werror_all() {
+        gettext("all warnings being treated as errors")
+    } else {
+        gettext("some warnings being treated as errors")
+    };
+    emit_line(format!("c17: {line}"));
 }
 
 /// Report a constraint violation gcc diagnoses only under `-pedantic`: nothing
@@ -500,7 +680,7 @@ pub fn set_pedantic(p: Pedantic) {
 /// `-pedantic-errors`.
 pub fn pedwarn(pos: Position, msg: &str) {
     if PEDANTIC.get().enabled {
-        give_pedwarn(pos, msg);
+        give_pedwarn(Some("pedantic"), pos, msg);
     }
 }
 
@@ -513,7 +693,7 @@ pub fn pedwarn_args(pos: Position, template: &str, args: &[&str]) {
 /// about: a warning, and an error under `-pedantic-errors`. `-Wno-pedantic`
 /// does not silence it, as it does not in gcc.
 pub fn pedwarn_default(pos: Position, msg: &str) {
-    give_pedwarn(pos, msg);
+    give_pedwarn(None, pos, msg);
 }
 
 /// [`pedwarn_default`] with a translatable template; see [`warning_args`].
@@ -521,18 +701,48 @@ pub fn pedwarn_default_args(pos: Position, template: &str, args: &[&str]) {
     pedwarn_default(pos, &gettext_args(template, args));
 }
 
+/// [`pedwarn_default`] for a pedwarn in the warning group `name`: off under
+/// `-Wno-<name>`, and an error under `-Werror=<name>` as well as under
+/// `-pedantic-errors`.
+pub fn group_pedwarn_default(name: &str, pos: Position, msg: &str) {
+    if warning_group_enabled(name) {
+        give_pedwarn(Some(name), pos, msg);
+    }
+}
+
 /// A pedwarn that is given: an error under `-pedantic-errors`, a warning
-/// otherwise. As in gcc, `-w` and a system header leave it a warning, which
-/// is then not shown -- `-pedantic-errors` does not reach into libc's
-/// headers, which use the extensions it objects to.
-fn give_pedwarn(pos: Position, msg: &str) {
-    let hidden = warnings_suppressed() || STREAMS.with(|s| s.borrow().is_system(pos.stream));
-    let level = if PEDANTIC.get().errors && !hidden {
-        DiagLevel::Error
+/// otherwise, in `group` as far as `-Werror` is concerned. As in gcc, `-w`
+/// and a system header leave it a warning, which is then not shown --
+/// `-pedantic-errors` does not reach into libc's headers, which use the
+/// extensions it objects to.
+fn give_pedwarn(group: Option<&str>, pos: Position, msg: &str) {
+    if PEDANTIC.get().errors && !hidden(pos) {
+        do_diag(DiagLevel::Error, pos, msg);
     } else {
-        DiagLevel::Warning
+        give_warning(group, pos, msg);
+    }
+}
+
+/// Is a warning at `pos` not shown: under `-w`, or in a system header?
+fn hidden(pos: Position) -> bool {
+    warnings_suppressed() || STREAMS.with(|s| s.borrow().is_system(pos.stream))
+}
+
+/// Every warning goes through here: a warning in `group` (`None`: in none
+/// gcc names), or the error `-Werror` makes of it, tagged as gcc tags one --
+/// `[-Werror=<group>]`, or `[-Werror]` for a warning with no name. A warning
+/// that is not shown is not promoted either.
+fn give_warning(group: Option<&str>, pos: Position, msg: &str) {
+    if hidden(pos) || !WERROR.with_borrow(|w| w.promotes(group)) {
+        do_diag(DiagLevel::Warning, pos, msg);
+        return;
+    }
+    PROMOTED.set(PROMOTED.get() + 1);
+    let tag = match group {
+        Some(group) => format!("-Werror={group}"),
+        None => "-Werror".to_string(),
     };
-    do_diag(level, pos, msg);
+    do_diag(DiagLevel::Error, pos, &format!("{msg} [{tag}]"));
 }
 
 pub fn has_error() -> u32 {
@@ -649,6 +859,8 @@ fn do_diag(level: DiagLevel, pos: Position, msg: &str) {
         }
     }
 
+    SHOWN.set(SHOWN.get() + 1);
+
     // Format the message
     let (filename, line, col) = STREAMS.with(|s| s.borrow().effective_position(pos));
     let filename = prettify_path(&filename);
@@ -691,7 +903,7 @@ fn do_diag(level: DiagLevel, pos: Position, msg: &str) {
 // Public Diagnostic Functions
 
 pub fn warning(pos: Position, msg: &str) {
-    do_diag(DiagLevel::Warning, pos, msg);
+    give_warning(None, pos, msg);
 }
 
 pub fn error(pos: Position, msg: &str) {
@@ -706,7 +918,7 @@ pub fn error(pos: Position, msg: &str) {
 /// time, leaving the catalog to be searched for a string no extractor ever saw,
 /// so the message can never be translated.
 pub fn warning_args(pos: Position, template: &str, args: &[&str]) {
-    do_diag(DiagLevel::Warning, pos, &gettext_args(template, args));
+    give_warning(None, pos, &gettext_args(template, args));
 }
 
 /// Print an error built from a translatable template. See [`warning_args`].
@@ -838,5 +1050,67 @@ mod tests {
 
         reset_counts();
         assert_eq!(error_count(), 0);
+    }
+
+    fn werror(names: &[&str]) -> Werror {
+        Werror::from_warning_options(names.iter().copied())
+    }
+
+    /// `-Werror` and `-Wno-error`: the last wins, for every warning.
+    #[test]
+    fn werror_all_folds_in_order() {
+        assert!(!werror(&[]).promotes(None));
+        assert!(werror(&["error"]).promotes(None));
+        assert!(werror(&["error"]).promotes(Some("overflow")));
+        assert!(!werror(&["error", "no-error"]).promotes(None));
+        assert!(werror(&["no-error", "error"]).promotes(None));
+        // Other options leave it alone.
+        assert!(werror(&["error", "all", "no-overflow", "pedantic"]).promotes(None));
+        assert_eq!(Werror::default().after("all"), None);
+    }
+
+    /// A group's own verdict outranks `-Werror` and `-Wno-error`, whichever
+    /// order they come in, and the last one for the group wins.
+    #[test]
+    fn werror_named_groups_fold_in_order() {
+        let w = werror(&["error=overflow"]);
+        assert!(w.promotes(Some("overflow")));
+        assert!(!w.promotes(Some("attributes")));
+        assert!(!w.promotes(None));
+
+        let w = werror(&["error", "no-error=attributes"]);
+        assert!(w.promotes(Some("overflow")));
+        assert!(!w.promotes(Some("attributes")));
+        assert!(w.promotes(None));
+
+        assert!(werror(&["no-error=overflow", "error"]).promotes(None));
+        assert!(!werror(&["no-error=overflow", "error"]).promotes(Some("overflow")));
+        assert!(werror(&["error=overflow", "no-error"]).promotes(Some("overflow")));
+        assert!(!werror(&["error=overflow", "no-error=overflow"]).promotes(Some("overflow")));
+        assert!(werror(&["no-error=overflow", "error=overflow"]).promotes(Some("overflow")));
+    }
+
+    /// `-Wno-<name>` turns a group off; `-W<name>` and `-Werror=<name>` turn
+    /// it back on, and `-Wno-error=<name>` does neither.
+    #[test]
+    fn suppressed_groups_fold_in_order() {
+        let off = |names: &[&str]| suppressed_groups(names.iter().copied());
+        assert!(off(&["no-overflow"]).contains("overflow"));
+        assert!(off(&["no-overflow", "overflow"]).is_empty());
+        assert!(off(&["no-overflow", "error=overflow"]).is_empty());
+        assert!(off(&["error=overflow", "no-overflow"]).contains("overflow"));
+        assert!(off(&["no-overflow", "no-error=overflow"]).contains("overflow"));
+        assert!(off(&["no-error=overflow", "no-error", "error"]).is_empty());
+    }
+
+    /// `-Werror=pedantic` turns `-Wpedantic` on, as gcc's does, without
+    /// making the default pedwarns errors.
+    #[test]
+    fn werror_pedantic_enables_the_pedantic_group() {
+        let p = Pedantic::from_warning_options(["error=pedantic"]);
+        assert!(p.enabled && !p.errors);
+        let p = Pedantic::from_warning_options(["error=pedantic", "no-pedantic"]);
+        assert!(!p.enabled);
+        assert_eq!(Pedantic::OFF.after("no-error=pedantic"), None);
     }
 }

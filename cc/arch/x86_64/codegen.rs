@@ -254,17 +254,28 @@ impl X86_64CodeGen {
             Loc::FImm(_, _) => GpOperand::Imm(0), // FP immediates handled separately
             Loc::Xmm(_) => GpOperand::Imm(0),     // XMM handled separately
             Loc::Global(name) => {
-                let symbol = Symbol::named(name.clone());
-                // Use TLS addressing for thread-local variables (Linux only)
-                if self.is_tls_symbol(name) {
-                    GpOperand::Mem(MemAddr::TlsLocalExec(symbol))
-                } else {
-                    // Note: For GOT access (PIC mode/external symbols), special handling
-                    // is needed - see emit_global_load* and emit_global_store* functions
-                    // which generate the two-instruction GOT sequence
-                    GpOperand::Mem(MemAddr::RipRelative(symbol))
-                }
+                // Note: For GOT access (PIC mode/external symbols), special handling
+                // is needed - see emit_global_load* and emit_global_store* functions
+                // which generate the two-instruction GOT sequence
+                self.reject_tls_operand(name);
+                GpOperand::Mem(MemAddr::RipRelative(Symbol::named(name.clone())))
             }
+        }
+    }
+
+    /// Report `name` as an internal error if it is a thread-local. For the
+    /// paths that print a global operand without asking the TLS model.
+    ///
+    /// A thread-local reaches the backend as a symbol only under the static
+    /// ELF models, and then only through the paths that choose Local or
+    /// Initial Exec for it -- `global_mem`, the load and store paths, an
+    /// inline-asm memory operand. A register operand arrives already loaded.
+    /// So nothing brings one to a model-blind path, and any operand such a
+    /// path could print -- `%fs:sym@TPOFF`, `sym(%rip)` -- would be wrong for
+    /// an `extern` or shared-mode thread-local.
+    pub(super) fn reject_tls_operand(&self, name: &str) {
+        if self.is_tls_symbol(name) {
+            crate::arch::codegen::report_tls_operand(self.base.func_pos, name);
         }
     }
 
@@ -1738,8 +1749,8 @@ impl CodeGenerator for X86_64CodeGen {
         self.pic_mode = pic;
     }
 
-    fn set_shared_mode(&mut self, shared: bool) {
-        self.base.shared_mode = shared;
+    fn set_tls_policy(&mut self, tls: crate::target::TlsPolicy) {
+        self.base.tls = tls;
     }
 
     fn set_verbose_asm(&mut self, verbose: bool) {
@@ -1748,5 +1759,9 @@ impl CodeGenerator for X86_64CodeGen {
 
     fn set_cf_protection(&mut self, cf_protection: crate::target::CfProtection) {
         self.base.cf_protection = cf_protection;
+    }
+
+    fn set_stack_clash(&mut self, on: bool) {
+        self.base.stack_clash = on;
     }
 }

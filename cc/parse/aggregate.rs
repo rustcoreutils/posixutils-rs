@@ -241,6 +241,8 @@ impl Parser<'_> {
             }
 
             self.expect_special(b'}')?;
+            // A definition, whatever its enumerators referred to.
+            self.last_tag_reference = false;
             let packed = early_attrs.has_packed() || self.parse_attributes().has_packed();
 
             // C17 6.7.2.2p4: the enumerated type is compatible with some
@@ -315,6 +317,7 @@ impl Parser<'_> {
                 if let Some(existing) = self.symbols.lookup_tag(tag_name) {
                     let existing = existing.typ;
                     self.check_tag_kind(tag_name, existing, TypeKind::Enum);
+                    self.last_tag_reference = true;
                     Ok(self.types.get(existing).clone())
                 } else {
                     // Registered, so that the definition completes this
@@ -483,6 +486,8 @@ impl Parser<'_> {
             let mut members = members?;
 
             self.expect_special(b'}')?;
+            // A definition, whatever its members referred to.
+            self.last_tag_reference = false;
 
             // Parse trailing __attribute__ (e.g., __attribute__((packed)))
             let attrs = self.parse_attributes();
@@ -635,6 +640,7 @@ impl Parser<'_> {
                         TypeKind::Struct
                     };
                     self.check_tag_kind(tag_name, existing, kind);
+                    self.last_tag_reference = true;
                     // What the order does to a reference depends on the
                     // declarator, which is not parsed yet: the specifier
                     // names the tag's own type, and the consumer decides.
@@ -737,7 +743,7 @@ impl Parser<'_> {
                     .as_ref()
                     .is_some_and(|c| c.tag.is_some());
                 if tagged || !spelled_tag {
-                    diag::warning(
+                    diag::pedwarn_default(
                         self.current_pos(),
                         &gettext("declaration does not declare anything"),
                     );
@@ -1067,19 +1073,18 @@ impl Parser<'_> {
         let Some(written) = written else {
             return declared;
         };
-        let warn = diag::warning_group_enabled(ATTRIBUTE_WARNING);
         if variant_allowed == VariantAllowed::No || declared != base {
-            if warn {
-                diag::warning_args(
-                    written.pos,
-                    "'{0}' attribute ignored",
-                    &["scalar_storage_order"],
-                );
-            }
+            diag::group_warning_args(
+                ATTRIBUTE_WARNING,
+                written.pos,
+                "'{0}' attribute ignored",
+                &["scalar_storage_order"],
+            );
             return declared;
         }
-        if variant_allowed == VariantAllowed::TypeName && warn {
-            diag::warning_args(
+        if variant_allowed == VariantAllowed::TypeName {
+            diag::group_warning_args(
+                ATTRIBUTE_WARNING,
                 written.pos,
                 "ignoring attributes applied to '{0}' after definition",
                 &[&self.types.format_type(base, Some(self.idents))],

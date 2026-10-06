@@ -291,6 +291,14 @@ impl X86_64CodeGen {
             Vec::new()
         };
         self.emit_prologue(stack_size, reg_save_area_size, &homes);
+        // An over-aligned frame's `andq` moves `%rsp` on by up to the
+        // alignment.
+        let realign = match self.frame_base {
+            FrameBase::Aligned { align, .. } => align as i64,
+            _ => 0,
+        };
+        self.base
+            .check_stack_clash(func, self.stack_alloc_size as i64 + realign);
 
         // Store spilled arguments before any calls can clobber them
         self.store_spilled_args(&alloc);

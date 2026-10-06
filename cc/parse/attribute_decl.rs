@@ -92,9 +92,13 @@ impl Parser<'_> {
     pub(super) fn parse_file_attribute_declaration(&mut self) -> ParseResult<ExternalDecl> {
         let (pos, attrs) = self.parse_attribute_declaration()?;
         if attrs.find(FALLTHROUGH).is_none() {
-            diag::warning(pos, &gettext("empty declaration"));
-        } else if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
-            diag::warning(pos, &gettext("'fallthrough' attribute at top level"));
+            diag::pedwarn_default(pos, &gettext("empty declaration"));
+        } else {
+            diag::group_pedwarn_default(
+                ATTRIBUTE_WARNING,
+                pos,
+                &gettext("'fallthrough' attribute at top level"),
+            );
         }
         Ok(ExternalDecl::Declaration(Declaration {
             declarators: vec![],
@@ -109,7 +113,7 @@ impl Parser<'_> {
         if attrs.find(FALLTHROUGH).is_some() {
             self.check_fallthrough_statement(pos, &attrs);
         } else {
-            diag::warning(pos, &gettext("empty declaration"));
+            diag::pedwarn_default(pos, &gettext("empty declaration"));
         }
         Ok(Stmt::Empty)
     }
@@ -122,7 +126,7 @@ impl Parser<'_> {
         if self.switch_depth == 0 {
             diag::error(pos, &gettext("invalid use of attribute 'fallthrough'"));
         } else if !self.may_reach_label() {
-            diag::warning(
+            diag::pedwarn_default(
                 pos,
                 &gettext("attribute 'fallthrough' not preceding a case label or default label"),
             );
@@ -132,19 +136,22 @@ impl Parser<'_> {
     /// The rest of a `fallthrough` statement's attributes, which apply to
     /// nothing. An unrecognised one has already been warned about as such.
     fn warn_ignored_beside_fallthrough(&self, pos: Position, attrs: &AttributeList) {
-        if !diag::warning_group_enabled(ATTRIBUTE_WARNING) {
-            return;
-        }
         for attr in &attrs.attrs {
             if attr.is_named(FALLTHROUGH) {
                 if !attr.args.is_empty() {
-                    diag::warning(
+                    diag::group_warning(
+                        ATTRIBUTE_WARNING,
                         pos,
                         &gettext("'fallthrough' attribute specified with a parameter"),
                     );
                 }
             } else if self.is_supported_attribute(&attr.name) {
-                diag::warning_args(pos, "'{0}' attribute ignored", &[&attr.name]);
+                diag::group_warning_args(
+                    ATTRIBUTE_WARNING,
+                    pos,
+                    "'{0}' attribute ignored",
+                    &[&attr.name],
+                );
             }
         }
     }

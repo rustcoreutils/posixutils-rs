@@ -43,9 +43,7 @@ fn clone_items(strings: &[&str]) -> Vec<String> {
 
 /// A warning in the `-Wattributes` group.
 fn attr_warning(pos: Position, template: &str, args: &[&str]) {
-    if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
-        diag::warning_args(pos, template, args);
-    }
+    diag::group_warning_args(ATTRIBUTE_WARNING, pos, template, args);
 }
 
 fn report_target_issue(pos: Position, issue: &TargetIssue) {

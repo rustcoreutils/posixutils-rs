@@ -145,3 +145,32 @@ fn integer_digits_keep_the_low_64_bits() {
     assert_eq!(integer_digits_value("09", 8), None);
     assert_eq!(integer_digits_value("", 10), None);
 }
+
+/// C17 6.4.4.4p1: `\x` takes at least one hex digit. Without one it names no
+/// value, which gcc errors on wherever the literal is decoded -- in a string,
+/// a character constant, or `#if`.
+#[test]
+fn hex_escape_without_digits_is_an_error() {
+    for payload in ["\\x", "\\xg", "a\\x"] {
+        let elements = parse_string_literal(payload);
+        assert!(
+            elements.iter().any(|e| matches!(e, Escaped::EmptyHex)),
+            "{payload}"
+        );
+        crate::diag::capture_diagnostics();
+        check_elements(&elements, CHAR_UNIT_BITS, Position::default());
+        let lines = crate::diag::take_captured_diagnostics();
+        assert!(
+            lines.len() == 1 && lines[0].ends_with("error: \\x used with no following hex digits"),
+            "{payload}: {lines:?}"
+        );
+    }
+    crate::diag::capture_diagnostics();
+    check_elements(
+        &parse_string_literal("\\x41"),
+        CHAR_UNIT_BITS,
+        Position::default(),
+    );
+    let lines = crate::diag::take_captured_diagnostics();
+    assert!(lines.is_empty(), "{lines:?}");
+}

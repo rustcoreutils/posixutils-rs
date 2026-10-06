@@ -27,12 +27,16 @@ pub const STDC_VERSION: &str = "201710L";
 /// mode, and `-std=` exists only because build systems pass it unconditionally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StdRequest {
-    /// A C17 spelling (`c17`, `c18`, `gnu17`, `gnu18`, `iso9899:2017/2018`) —
-    /// what we compile anyway, so it passes without comment.
-    C17,
-    /// An older revision (`c89`, `c99`, `c11`, the `gnu*` and `iso9899:`
-    /// equivalents). Accepted and compiled as C17; the driver says so.
-    Older,
+    /// C17, or C99 or C11 (`c99`, `c11`, `c17`, their `gnu*` and `iso9899:`
+    /// equivalents and draft names): a program in any of them is a C17
+    /// program, so it passes without comment.
+    Compiled,
+    /// C90 (`c89`, `c90`, `gnu89`, `gnu90`, `iso9899:1990`, `iso9899:199409`),
+    /// whose implicit `int` and implicit declarations C17 refuses. Accepted
+    /// and compiled as C17; the driver says so. A revision after C17 is not
+    /// accepted at all: c17 cannot compile it, and a configure probe for it
+    /// must be told no.
+    Ignored,
 }
 
 /// Classify the argument of `-std=`, e.g. `c17`, `gnu11`, `iso9899:1999`.
@@ -47,8 +51,8 @@ pub fn classify_std(spec: &str) -> Option<StdRequest> {
     // compiler defines, and far likelier a typo than a request.
     if let Some(year) = spec.strip_prefix("iso9899:") {
         return match year {
-            "2017" | "2018" => Some(StdRequest::C17),
-            "1990" | "199409" | "199x" | "1999" | "2011" => Some(StdRequest::Older),
+            "199x" | "1999" | "2011" | "2017" | "2018" => Some(StdRequest::Compiled),
+            "1990" | "199409" => Some(StdRequest::Ignored),
             _ => None,
         };
     }
@@ -57,8 +61,8 @@ pub fn classify_std(spec: &str) -> Option<StdRequest> {
         .strip_prefix("gnu")
         .or_else(|| spec.strip_prefix('c'))?;
     match rev {
-        "17" | "18" => Some(StdRequest::C17),
-        "89" | "90" | "9x" | "99" | "1x" | "11" => Some(StdRequest::Older),
+        "9x" | "99" | "1x" | "11" | "17" | "18" => Some(StdRequest::Compiled),
+        "89" | "90" => Some(StdRequest::Ignored),
         _ => None,
     }
 }
@@ -79,16 +83,103 @@ impl fmt::Display for Arch {
     }
 }
 
-/// The position independence code is generated with.
+/// Which spelling of a position-independence option asked for it: gcc's
+/// `-fpic`/`-fpie` (1 in `__PIC__`) or `-fPIC`/`-fPIE` (2).
+///
+/// c17 generates the same code for both -- the unrestricted GOT access of the
+/// upper-case spelling, which is valid wherever the lower-case one is -- so
+/// the level is only ever what the macros report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PicLevel {
+    Small,
+    Large,
+}
+
+impl PicLevel {
+    /// The value of `__PIC__` and `__PIE__`.
+    pub fn macro_value(self) -> &'static str {
+        match self {
+            PicLevel::Small => "1",
+            PicLevel::Large => "2",
+        }
+    }
+}
+
+/// The position independence code is generated with: what gcc's `-fpic`
+/// family selects.
+///
+/// `-fpic`, `-fPIC`, `-fpie`, `-fPIE`, `-fno-pic`, `-fno-PIC`, `-fno-pie` and
+/// `-fno-PIE` are one option to gcc: the last one given wins, and every
+/// `-fno-` spelling means position-dependent code, PIE included. The link
+/// options (`-pie`, `-no-pie`, `-static-pie`, `-shared`) are not members.
 ///
 /// One value drives both code generation and the `__PIC__`/`__PIE__` macros
 /// that describe it, so a header that tests the macro sees the code it gets.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PositionIndependence {
-    /// Position-independent code: `-fPIC`, `-shared`, or a PIE.
-    pub pic: bool,
-    /// Code for a position-independent executable.
-    pub pie: bool,
+pub enum PositionIndependence {
+    /// Position-dependent code: `-fno-pic` and the other `-fno-` spellings.
+    #[default]
+    Absolute,
+    /// Code that can go in a shared object: `-fpic`, `-fPIC`.
+    Pic(PicLevel),
+    /// Code for a position-independent executable: `-fpie`, `-fPIE`.
+    Pie(PicLevel),
+}
+
+impl PositionIndependence {
+    /// What one member of the `-fpic` family asks for, or `None` for an
+    /// option outside it.
+    pub fn from_flag(flag: &str) -> Option<Self> {
+        Some(match flag {
+            "-fpic" => Self::Pic(PicLevel::Small),
+            "-fPIC" => Self::Pic(PicLevel::Large),
+            "-fpie" => Self::Pie(PicLevel::Small),
+            "-fPIE" => Self::Pie(PicLevel::Large),
+            "-fno-pic" | "-fno-PIC" | "-fno-pie" | "-fno-PIE" => Self::Absolute,
+            _ => return None,
+        })
+    }
+
+    /// What a compilation gets when no member of the family is given: a
+    /// large-model PIE on Linux, as Debian's gcc is configured
+    /// (`--enable-default-pie`), and position-dependent code elsewhere --
+    /// Mach-O code is position independent whatever it is told, see
+    /// [`Self::macro_level`].
+    pub fn target_default(target: &Target) -> Self {
+        match target.os {
+            Os::Linux => Self::Pie(PicLevel::Large),
+            Os::MacOS | Os::FreeBSD => Self::Absolute,
+        }
+    }
+
+    /// Whether the code is position independent.
+    pub fn is_pic(self) -> bool {
+        self != Self::Absolute
+    }
+
+    /// Whether the code is for a position-independent executable.
+    pub fn is_pie(self) -> bool {
+        matches!(self, Self::Pie(_))
+    }
+
+    /// Whether the code was asked to be able to live in a shared object
+    /// (`-fpic`, `-fPIC`), which is what gcc calls `flag_shlib`. A PIE is
+    /// position independent yet still resolves its own symbols, thread-locals
+    /// included, at link time.
+    pub fn is_shared_code(self) -> bool {
+        matches!(self, Self::Pic(_))
+    }
+
+    /// The value `__PIC__` is defined to, or `None` to leave it undefined.
+    /// Mach-O code is always position independent, and clang defines
+    /// `__PIC__` as 2 there whatever was asked.
+    pub fn macro_level(self, target: &Target) -> Option<PicLevel> {
+        match self {
+            Self::Pic(level) | Self::Pie(level) => Some(level),
+            Self::Absolute if target.os == Os::MacOS => Some(PicLevel::Large),
+            Self::Absolute => None,
+        }
+    }
 }
 
 /// `-fcf-protection`: which of Intel CET's two protections x86-64 code is
@@ -638,6 +729,71 @@ impl TlsAccess {
     }
 }
 
+/// gcc's four ELF thread-local models, from the one that assumes least to
+/// the one that assumes most, which is the order `Ord` gives them.
+///
+/// c17 has no Local Dynamic sequence: where gcc would use it, c17 uses the
+/// descriptor call of Global Dynamic, which is valid wherever Local Dynamic
+/// is (gcc's own aarch64 code makes the same choice).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TlsModel {
+    #[default]
+    GlobalDynamic,
+    LocalDynamic,
+    InitialExec,
+    LocalExec,
+}
+
+impl TlsModel {
+    /// The model `-ftls-model=<name>` names, in gcc's spelling.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "global-dynamic" => Self::GlobalDynamic,
+            "local-dynamic" => Self::LocalDynamic,
+            "initial-exec" => Self::InitialExec,
+            "local-exec" => Self::LocalExec,
+            _ => return None,
+        })
+    }
+
+    /// The names [`Self::from_name`] takes, in the order gcc lists them.
+    pub const NAMES: &'static str = "global-dynamic initial-exec local-dynamic local-exec";
+}
+
+/// What a compilation's thread-local accesses may assume, from which every
+/// access's model follows: see [`TlsPolicy::initial_exec`] and
+/// [`Target::tls_access`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TlsPolicy {
+    /// The code may live in a shared object (`-shared`, `-fpic`, `-fPIC`),
+    /// so not even a thread-local it defines has an offset known at link
+    /// time.
+    pub shared_code: bool,
+    /// `-ftls-model=`: the least optimized model any access may use. An
+    /// access takes this or the model the code can prove, whichever assumes
+    /// more, which is how gcc combines them.
+    pub floor: TlsModel,
+}
+
+impl TlsPolicy {
+    /// Whether the code must reach its thread-locals through a call, under
+    /// a dynamic model: shared code, unless `-ftls-model=` allows a static
+    /// one.
+    pub fn dynamic(self) -> bool {
+        self.shared_code && self.floor < TlsModel::InitialExec
+    }
+
+    /// Whether a static access to a thread-local is Initial Exec rather than
+    /// Local Exec. Local Exec fixes the offset from the thread pointer at
+    /// link time, which only holds for the executable's own thread-locals:
+    /// one defined elsewhere (`is_extern`), or any in shared code, needs the
+    /// offset loaded from the GOT -- unless `-ftls-model=local-exec` says the
+    /// link will fix it anyway.
+    pub fn initial_exec(self, is_extern: bool) -> bool {
+        self.floor < TlsModel::LocalExec && (is_extern || self.shared_code)
+    }
+}
+
 /// The order in which the bytes of a multi-byte scalar lie in memory: what
 /// gcc's `scalar_storage_order` attribute and pragma name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -926,18 +1082,18 @@ impl Default for Target {
 }
 
 impl Target {
-    /// How this target obtains a thread-local's address. `shared_mode` is
-    /// set for `-shared` and `-fPIC`: code that may be `dlopen`ed.
+    /// How this target obtains a thread-local's address under `policy`.
     ///
     /// ELF (Linux, FreeBSD) folds Local and Initial Exec into the access and
-    /// needs a descriptor call only for shared code, and only Linux takes the
-    /// descriptor model here: FreeBSD's shared code uses Initial Exec, never
-    /// Local Exec (see `CodeGenBase::use_tls_ie`). Mach-O always calls the TLV
-    /// getter.
-    pub fn tls_access(&self, shared_mode: bool) -> TlsAccess {
+    /// needs a descriptor call only where the policy is dynamic, and only
+    /// Linux takes the descriptor model here: FreeBSD's shared code uses
+    /// Initial Exec, never Local Exec (see [`TlsPolicy::initial_exec`]).
+    /// Mach-O always calls the TLV getter, whatever `-ftls-model=` says, as
+    /// clang does.
+    pub fn tls_access(&self, policy: TlsPolicy) -> TlsAccess {
         match self.os {
             Os::MacOS => TlsAccess::MachOTlv,
-            Os::Linux if shared_mode => TlsAccess::ElfDescriptor,
+            Os::Linux if policy.dynamic() => TlsAccess::ElfDescriptor,
             Os::Linux | Os::FreeBSD => TlsAccess::ElfStatic,
         }
     }
@@ -1179,18 +1335,90 @@ mod tests {
     /// and only Linux takes the descriptor model; FreeBSD is ELF too.
     #[test]
     fn test_tls_access_per_target() {
+        let exe = TlsPolicy::default();
+        let shared = TlsPolicy {
+            shared_code: true,
+            ..TlsPolicy::default()
+        };
         for arch in [Arch::X86_64, Arch::Aarch64] {
             let mac = Target::new(arch, Os::MacOS);
-            assert_eq!(mac.tls_access(false), TlsAccess::MachOTlv);
-            assert_eq!(mac.tls_access(true), TlsAccess::MachOTlv);
+            assert_eq!(mac.tls_access(exe), TlsAccess::MachOTlv);
+            assert_eq!(mac.tls_access(shared), TlsAccess::MachOTlv);
             let linux = Target::new(arch, Os::Linux);
-            assert_eq!(linux.tls_access(false), TlsAccess::ElfStatic);
-            assert_eq!(linux.tls_access(true), TlsAccess::ElfDescriptor);
+            assert_eq!(linux.tls_access(exe), TlsAccess::ElfStatic);
+            assert_eq!(linux.tls_access(shared), TlsAccess::ElfDescriptor);
             let bsd = Target::new(arch, Os::FreeBSD);
-            assert_eq!(bsd.tls_access(false), TlsAccess::ElfStatic);
+            assert_eq!(bsd.tls_access(exe), TlsAccess::ElfStatic);
+            assert_eq!(bsd.tls_access(shared), TlsAccess::ElfStatic);
         }
         assert!(TlsAccess::MachOTlv.is_call() && TlsAccess::ElfDescriptor.is_call());
         assert!(!TlsAccess::ElfStatic.is_call());
+    }
+
+    /// `-ftls-model=` is the least optimized model an access may take: the
+    /// access is that or what the code proves, whichever assumes more.
+    #[test]
+    fn test_tls_policy_floor() {
+        use TlsModel::*;
+        let policy = |shared_code, floor| TlsPolicy { shared_code, floor };
+        // (shared code, floor) -> (dynamic, IE for a defined one, IE for an extern one)
+        for (shared, floor, want) in [
+            (false, GlobalDynamic, (false, false, true)),
+            (false, LocalDynamic, (false, false, true)),
+            (false, InitialExec, (false, false, true)),
+            (false, LocalExec, (false, false, false)),
+            (true, GlobalDynamic, (true, true, true)),
+            (true, LocalDynamic, (true, true, true)),
+            (true, InitialExec, (false, true, true)),
+            (true, LocalExec, (false, false, false)),
+        ] {
+            let p = policy(shared, floor);
+            assert_eq!(
+                (p.dynamic(), p.initial_exec(false), p.initial_exec(true)),
+                want,
+                "{p:?}"
+            );
+        }
+        for name in TlsModel::NAMES.split(' ') {
+            assert!(TlsModel::from_name(name).is_some(), "{name}");
+        }
+        assert_eq!(TlsModel::from_name("local-exec"), Some(LocalExec));
+        assert_eq!(TlsModel::from_name("bogus"), None);
+        assert!(GlobalDynamic < LocalDynamic && InitialExec < LocalExec);
+    }
+
+    /// The `-fpic` family: each spelling, the per-target default, and what
+    /// the macros report.
+    #[test]
+    fn test_position_independence_flags() {
+        use PositionIndependence::*;
+        let linux = Target::new(Arch::X86_64, Os::Linux);
+        let mac = Target::new(Arch::Aarch64, Os::MacOS);
+        assert_eq!(
+            PositionIndependence::from_flag("-fpic"),
+            Some(Pic(PicLevel::Small))
+        );
+        assert_eq!(
+            PositionIndependence::from_flag("-fPIE"),
+            Some(Pie(PicLevel::Large))
+        );
+        for flag in ["-fno-pic", "-fno-PIC", "-fno-pie", "-fno-PIE"] {
+            assert_eq!(PositionIndependence::from_flag(flag), Some(Absolute));
+        }
+        assert_eq!(PositionIndependence::from_flag("-pie"), None);
+        assert_eq!(
+            PositionIndependence::target_default(&linux),
+            Pie(PicLevel::Large)
+        );
+        assert_eq!(PositionIndependence::target_default(&mac), Absolute);
+        assert!(Pie(PicLevel::Small).is_pic() && !Pie(PicLevel::Small).is_shared_code());
+        assert!(Pic(PicLevel::Small).is_shared_code() && !Pic(PicLevel::Small).is_pie());
+        assert_eq!(Absolute.macro_level(&linux), None);
+        assert_eq!(Absolute.macro_level(&mac), Some(PicLevel::Large));
+        assert_eq!(
+            Pic(PicLevel::Small).macro_level(&linux),
+            Some(PicLevel::Small)
+        );
     }
 
     #[test]
@@ -1214,36 +1442,48 @@ mod tests {
     #[test]
     fn test_classify_std_spellings() {
         for spec in [
+            "c9x",
+            "c99",
+            "c1x",
+            "c11",
             "c17",
             "c18",
+            "gnu9x",
+            "gnu99",
+            "gnu1x",
+            "gnu11",
             "gnu17",
             "gnu18",
+            "iso9899:199x",
+            "iso9899:1999",
+            "iso9899:2011",
             "iso9899:2017",
             "iso9899:2018",
         ] {
-            assert_eq!(classify_std(spec), Some(StdRequest::C17), "{spec}");
+            assert_eq!(classify_std(spec), Some(StdRequest::Compiled), "{spec}");
         }
 
         for spec in [
             "c89",
             "c90",
-            "c9x",
-            "c99",
-            "c1x",
-            "c11",
             "gnu89",
             "gnu90",
-            "gnu9x",
-            "gnu99",
-            "gnu1x",
-            "gnu11",
             "iso9899:1990",
             "iso9899:199409",
-            "iso9899:199x",
-            "iso9899:1999",
-            "iso9899:2011",
         ] {
-            assert_eq!(classify_std(spec), Some(StdRequest::Older), "{spec}");
+            assert_eq!(classify_std(spec), Some(StdRequest::Ignored), "{spec}");
+        }
+
+        for spec in [
+            "c2x",
+            "c23",
+            "c2y",
+            "gnu2x",
+            "gnu23",
+            "gnu2y",
+            "iso9899:2024",
+        ] {
+            assert_eq!(classify_std(spec), None, "{spec}");
         }
     }
 

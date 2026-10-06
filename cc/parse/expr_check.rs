@@ -251,12 +251,12 @@ impl Parser<'_> {
                 "incompatible type for argument {0}: expected '{1}', got '{2}'",
                 &[n, p_name, a_name],
             ),
-            (false, Some(f)) => diag::warning_args(
+            (false, Some(f)) => diag::pedwarn_default_args(
                 pos,
                 "passing argument {0} of '{1}' as '{2}' from '{3}' {4}",
                 &[n, f, p_name, a_name, fault.describe()],
             ),
-            (false, None) => diag::warning_args(
+            (false, None) => diag::pedwarn_default_args(
                 pos,
                 "passing argument {0} as '{1}' from '{2}' {3}",
                 &[n, p_name, a_name, fault.describe()],
@@ -512,11 +512,11 @@ impl Parser<'_> {
                 false
             }
             OperandVerdict::PointerInteger => {
-                diag::warning(pos, &gettext("comparison between pointer and integer"));
+                diag::pedwarn_default(pos, &gettext("comparison between pointer and integer"));
                 true
             }
             OperandVerdict::DistinctPointers => {
-                diag::warning(
+                diag::pedwarn_default(
                     pos,
                     &gettext("comparison of distinct pointer types lacks a cast"),
                 );
@@ -777,7 +777,7 @@ impl Parser<'_> {
         if fault.is_error() {
             diag::error_args(pos, template, args);
         } else {
-            diag::warning_args(pos, template, args);
+            diag::pedwarn_default_args(pos, template, args);
         }
     }
 
@@ -901,7 +901,7 @@ impl Parser<'_> {
         if units > capacity {
             let elem = self.types.base_type(target).unwrap_or(self.types.char_id);
             let named = self.types.format_type(elem, Some(self.idents));
-            diag::warning_args(
+            diag::pedwarn_default_args(
                 init.pos,
                 "initializer-string for array of '{0}' is too long",
                 &[&named],
@@ -1128,9 +1128,9 @@ impl Parser<'_> {
             && self
                 .types
                 .reverses_storage(self.types.innermost_element(typ))
-            && diag::warning_group_enabled("scalar-storage-order")
         {
-            diag::warning(
+            diag::group_warning(
+                "scalar-storage-order",
                 pos,
                 &gettext("address of array with reverse scalar storage order requested"),
             );

@@ -498,8 +498,9 @@ impl Parser<'_> {
             );
             return false;
         }
-        if function.last_param != Some(last) && diag::warning_group_enabled("varargs") {
-            diag::warning(
+        if function.last_param != Some(last) {
+            diag::group_warning(
+                "varargs",
                 last_pos,
                 &gettext("second parameter of 'va_start' not last named argument"),
             );

@@ -20,17 +20,30 @@
 
 use crate::common::{preprocess_text, run_c17};
 
-/// The `-std=` spellings that name C17 itself. Exhaustive.
+/// The `-std=` spellings c17 takes in silence: C17 itself, and C99 and C11,
+/// whose programs C17 compiles as written. Exhaustive.
 const C17_SPELLINGS: &[&str] = &[
+    "c9x",
+    "c99",
+    "c1x",
+    "c11",
     "c17",
     "c18",
+    "gnu9x",
+    "gnu99",
+    "gnu1x",
+    "gnu11",
     "gnu17",
     "gnu18",
+    "iso9899:199x",
+    "iso9899:1999",
+    "iso9899:2011",
     "iso9899:2017",
     "iso9899:2018",
 ];
 
-/// The `-std=` spellings naming an older revision. Exhaustive.
+/// The `-std=` spellings naming C90, whose implicit `int` and implicit
+/// declarations C17 refuses: accepted, with a warning. Exhaustive.
 ///
 /// Together with `C17_SPELLINGS` this is every spelling `classify_std`
 /// accepts, so "every accepted spelling behaves identically" is a claim these
@@ -38,21 +51,10 @@ const C17_SPELLINGS: &[&str] = &[
 const OLDER_SPELLINGS: &[&str] = &[
     "c89",
     "c90",
-    "c9x",
-    "c99",
-    "c1x",
-    "c11",
     "gnu89",
     "gnu90",
-    "gnu9x",
-    "gnu99",
-    "gnu1x",
-    "gnu11",
     "iso9899:1990",
     "iso9899:199409",
-    "iso9899:199x",
-    "iso9899:1999",
-    "iso9899:2011",
 ];
 
 /// Every `-std=` spelling c17 accepts.
@@ -238,7 +240,21 @@ fn c17_rejects_an_unknown_std() {
     // Accepting and discarding a dialect request is exactly how the version
     // macro came to disagree with the binary's own name. A typo must not pass
     // silently just because the value would have been ignored anyway.
-    for spec in ["c42", "gnu42", "c++17", "nonsense"] {
+    // A revision after C17 is refused too: c17 cannot compile it, and a
+    // configure probe for C23 support must get "no", not a warning.
+    for spec in [
+        "c42",
+        "gnu42",
+        "c++17",
+        "nonsense",
+        "c2x",
+        "c23",
+        "c2y",
+        "gnu2x",
+        "gnu23",
+        "gnu2y",
+        "iso9899:2024",
+    ] {
         let run = run_c17(&[&format!("-std={spec}"), "--print-targets"]);
         assert!(!run.success, "-std={spec} should be rejected");
         assert!(
@@ -303,26 +319,32 @@ fn c17_glibc_minor_matches_the_host() {
     );
 }
 
-/// Asking for an older revision is accepted but not honoured, and c17 says so.
+/// Asking for C90, or for a revision after C17, is accepted but not
+/// honoured, and c17 says so.
 ///
 /// Silence would be the same failure the audit filed against `-std=` in the
 /// first place: a flag taken and thrown away, leaving the user to believe a
 /// request was met. The compiler cannot honour it -- there is one language --
-/// so the least it can do is not pretend otherwise.
+/// so the least it can do is not pretend otherwise. `-ansi` is gcc's
+/// `-std=c90`, and is named that way.
 #[test]
 fn c17_warns_that_an_older_std_was_not_honoured() {
+    let warning = |spec: &str| {
+        format!("c17: warning: '-std={spec}' ignored; c17 compiles C17 (ISO/IEC 9899:2018) only\n")
+    };
     for spec in OLDER_SPELLINGS {
         let run = run_c17(&[&format!("-std={spec}"), "--print-targets"]);
         assert!(run.success, "-std={spec} must still be accepted");
-        assert!(
-            run.stderr.contains("warning") && run.stderr.contains(spec),
-            "-std={spec} should warn and name the spelling, got: {}",
-            run.stderr
-        );
+        assert_eq!(run.stderr, warning(spec), "-std={spec}");
     }
+    let run = run_c17(&["-ansi", "--print-targets"]);
+    assert!(run.success, "{}", run.stderr);
+    assert_eq!(run.stderr, warning("c90"));
 }
 
-/// A C17 spelling asks for what we compile, so there is nothing to report.
+/// A C99, C11 or C17 spelling asks for a language whose programs c17
+/// compiles as they are, so there is nothing to report. `__STDC_VERSION__`
+/// stays C17's (see above): the language is C17 whatever was asked.
 #[test]
 fn c17_does_not_warn_for_a_c17_std() {
     for spec in C17_SPELLINGS {
@@ -345,7 +367,7 @@ fn c17_does_not_warn_for_a_c17_std() {
 #[test]
 fn c17_dialect_warning_can_be_silenced() {
     for silencer in ["-w", "-Wno-c17-dialect"] {
-        let run = run_c17(&["-std=c11", silencer, "--print-targets"]);
+        let run = run_c17(&["-std=c90", silencer, "--print-targets"]);
         assert!(run.success, "{silencer} should be accepted: {}", run.stderr);
         assert!(
             !run.stderr.contains("warning"),
@@ -355,7 +377,7 @@ fn c17_dialect_warning_can_be_silenced() {
     }
 
     // An unrelated -Wno- must not silence it, or the flag name means nothing.
-    let run = run_c17(&["-std=c11", "-Wno-unused", "--print-targets"]);
+    let run = run_c17(&["-std=c90", "-Wno-unused", "--print-targets"]);
     assert!(
         run.stderr.contains("warning"),
         "-Wno-unused should leave the dialect warning alone, got: {}",

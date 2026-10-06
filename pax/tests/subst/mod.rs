@@ -525,3 +525,17 @@ fn test_subst_expression_need_not_be_utf8() {
     assert_eq!(list_substituted(b"caf\xe9", b",\xe9,E,", "C"), b"cafE\n");
     assert_eq!(list_substituted(b"cafe", b",e,\xe9,", "C"), b"caf\xe9\n");
 }
+
+/// Under `g`, `^` matches only at the start of the original name: a
+/// replacement at the start that leaves text there does not make that text
+/// a new start of the name (sed: `s,^[^/]*/,,g` on "top/x/README" gives
+/// "x/README").
+#[test]
+fn test_subst_global_caret_anchors_once() {
+    assert_eq!(
+        list_substituted(b"top/x/README", b",^[^/]*/,,g", "C"),
+        b"x/README\n"
+    );
+    assert_eq!(list_substituted(b"aa", b",^a,,g", "C"), b"a\n");
+    assert_eq!(list_substituted(b"aab", b",^a,X,g", "C"), b"Xab\n");
+}

@@ -512,6 +512,22 @@ impl Regex {
 
     /// As [`Regex::captures_at`], over bytes.
     pub fn captures_at_bytes(&self, text: &[u8], offset: usize) -> Option<Vec<Match>> {
+        self.captures_at_bytes_notbol(text, offset, offset > 0)
+    }
+
+    /// As [`Regex::captures_at_bytes`], with the caller saying whether
+    /// `offset` is not the beginning of a line (`not_bol`), so `^` must not
+    /// match there.
+    ///
+    /// A caller that rewrites `text` as it goes needs this: once a
+    /// replacement at the start has been made, offset 0 of the new text is no
+    /// longer the beginning of the original line.
+    pub fn captures_at_bytes_notbol(
+        &self,
+        text: &[u8],
+        offset: usize,
+        not_bol: bool,
+    ) -> Option<Vec<Match>> {
         if offset > text.len() {
             return None;
         }
@@ -524,11 +540,9 @@ impl Regex {
 
         let mut pmatch: [RegMatchT; MAX_CAPTURES] = unsafe { std::mem::zeroed() };
 
-        // Past the start of `text`, the substring's first byte is not the
-        // beginning of a line, so `^` must not match there.  Without
-        // REG_NOTBOL a global substitute re-anchors `^` at every restart:
-        // `s/^/> /g` on "abc" produced "> a> b> c> ".
-        let flags = if offset == 0 { 0 } else { REG_NOTBOL };
+        // Without REG_NOTBOL a global substitute re-anchors `^` at every
+        // restart: `s/^/> /g` on "abc" produced "> a> b> c> ".
+        let flags = if not_bol { REG_NOTBOL } else { 0 };
 
         let result = unsafe {
             regexec(
@@ -931,6 +945,17 @@ mod tests {
     }
 
     /// `$` is unaffected: the substring really does end where the text ends.
+    #[test]
+    fn test_captures_at_bytes_notbol_follows_the_caller() {
+        // Text rewritten in place: offset 0 is no longer the start of a line
+        // once a replacement has been made there.
+        let re = Regex::new("^a", RegexFlags::bre()).unwrap();
+        assert!(re.captures_at_bytes_notbol(b"ab", 0, false).is_some());
+        assert!(re.captures_at_bytes_notbol(b"ab", 0, true).is_none());
+        let caret = Regex::new("^", RegexFlags::bre()).unwrap();
+        assert!(caret.captures_at_bytes_notbol(b"ab", 1, false).is_some());
+    }
+
     #[test]
     fn test_captures_at_still_matches_eol() {
         let re = Regex::new("$", RegexFlags::bre()).unwrap();

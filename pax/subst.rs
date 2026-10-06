@@ -22,6 +22,7 @@
 //! This implementation uses plib::regex for POSIX BRE support.
 
 use crate::error::{PaxError, PaxResult};
+use plib::locale::next_char_offset;
 use plib::regex::{Match, Regex, RegexFlags};
 use std::path::{Path, PathBuf};
 
@@ -178,13 +179,19 @@ impl Substitution {
         // Where the previous replacement ended, in `result`.
         let mut prev_end = None;
 
-        while let Some(matches) = self.regex.captures_at_bytes(&result, pos) {
+        // `result` is rewritten as the scan goes, so once a match has been
+        // replaced its offset 0 is no longer the start of the name: `^` must
+        // not match there again (`s,^a,,g` makes "aa" "a").
+        while let Some(matches) =
+            self.regex
+                .captures_at_bytes_notbol(&result, pos, pos > 0 || any_match)
+        {
             let match_start = matches[0].start;
             let match_end = matches[0].end;
 
             if match_start == match_end && prev_end == Some(match_start) {
                 // An empty match adjoining the previous one is no match.
-                match step_char(&result, match_start) {
+                match next_char_offset(&result, match_start) {
                     Some(next) => {
                         pos = next;
                         continue;
@@ -209,7 +216,7 @@ impl Substitution {
             } else {
                 // An empty match consumed nothing: step over a character of
                 // the name, or the same position matches forever.
-                match step_char(&result, end) {
+                match next_char_offset(&result, end) {
                     Some(next) => next,
                     None => break,
                 }
@@ -226,14 +233,6 @@ impl Substitution {
             SubstResult::Changed(result)
         }
     }
-}
-
-/// The offset just past the character at `pos` in `result`; `None` at the
-/// end. Stepping by a whole character, rather than one byte, keeps the offset
-/// on a character boundary for the next match.
-fn step_char(result: &[u8], pos: usize) -> Option<usize> {
-    let rest = result.get(pos..).filter(|rest| !rest.is_empty())?;
-    Some(pos + plib::locale::mb_char_slices(&rest[..rest.len().min(16)])[0].len())
 }
 
 /// Build the replacement text for one match.

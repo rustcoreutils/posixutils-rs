@@ -716,6 +716,41 @@ fn gcc_flags_link_queries_are_forwarded_to_the_host_driver() {
     }
 }
 
+/// The two-dash spellings of `-print-prog-name=` and `-print-file-name=`
+/// take their value as the next argument too: binutils' configure asks
+/// `$CC $CFLAGS --print-prog-name liblto_plugin.so`, and c17 stopped with
+/// clap's `unexpected argument '--print-prog-name'`.
+#[test]
+fn gcc_flags_two_dash_name_queries_take_a_separate_value() {
+    for args in [
+        &["--print-prog-name", "liblto_plugin.so"][..],
+        &["--print-prog-name=liblto_plugin.so"],
+        &["-print-prog-name=liblto_plugin.so"],
+        &["-g", "-O2", "--print-prog-name", "liblto_plugin.so"],
+    ] {
+        let r = run_c17(args);
+        assert!(r.success, "{args:?}: {}", r.stderr);
+        assert_eq!(r.stdout, "liblto_plugin.so\n", "{args:?}");
+    }
+
+    let want = std::process::Command::new("cc")
+        .arg("-print-file-name=libc.a")
+        .output()
+        .expect("run host cc");
+    let r = run_c17(&["-O2", "--print-file-name", "libc.a"]);
+    assert!(r.success, "{}", r.stderr);
+    assert_eq!(r.stdout, String::from_utf8_lossy(&want.stdout));
+
+    for query in ["--print-prog-name", "--print-file-name"] {
+        let r = run_c17(&[query]);
+        assert!(!r.success);
+        assert_eq!(
+            r.stderr,
+            format!("c17: error: missing argument to '{query}'\n")
+        );
+    }
+}
+
 /// Bare `-v` is gcc's version banner on stderr, which libtool and autoconf
 /// run and log; with operands it is still c17's verbose compile.
 #[test]

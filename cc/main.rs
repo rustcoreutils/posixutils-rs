@@ -453,6 +453,19 @@ fn driver_warning(msg: &str) {
     eprintln!("c17: {}: {}", gettext("warning"), msg);
 }
 
+/// A linker input named in a run that links nothing (`-c`, `-S`, `-E`).
+///
+/// Said whatever the warning options: gcc's driver gives this one under `-w`
+/// and leaves it a warning under `-Werror`.
+fn unused_linker_input(path: &str) {
+    eprintln!(
+        "c17: {}: {}: {}",
+        gettext("warning"),
+        path,
+        gettext("linker input file unused because linking not done")
+    );
+}
+
 /// A command-line problem gcc refuses outright and c17 lets through with a
 /// warning: an option it does not know, or one output named for several.
 /// Under `-Werror` that leniency is withdrawn -- the warning is an error,
@@ -1528,12 +1541,7 @@ impl Args {
             Some("cpp-output") => Lang::Preprocessed,
             Some("assembler") => Lang::Asm,
             Some(_) => Lang::AsmCpp,
-            None if is_preprocessed_file(path) => Lang::Preprocessed,
-            None if is_source_file(path) => Lang::C,
-            None if path.ends_with(".S") => Lang::AsmCpp,
-            None if is_asm_file(path) => Lang::Asm,
-            None if is_object_file(path) => Lang::Object,
-            None => Lang::Unknown,
+            None => lang_by_suffix(path),
         }
     }
 
@@ -2353,32 +2361,69 @@ fn is_preprocessed_file(path: &str) -> bool {
     path.ends_with(".i")
 }
 
-/// Check if a file is an assembly file (by extension)
-/// .s = pure assembly, .S = assembly with C preprocessor directives
-fn is_asm_file(path: &str) -> bool {
-    path.ends_with(".s") || path.ends_with(".S")
-}
+/// Suffixes gcc hands to a front end c17 does not have, each with what c17
+/// says about it. gcc fails on these when that front end is not installed
+/// ("cannot execute 'cc1plus'"), so c17 fails too, rather than passing a
+/// source file to the linker. A C++ header (`.hpp`, ...) is C++ here: gcc
+/// precompiles it with the C++ front end.
+const FOREIGN_SUFFIXES: &[(&str, &[&str])] = &[
+    (
+        "c17 does not compile C++",
+        &[
+            "cc", "cp", "cxx", "cpp", "CPP", "c++", "C", "ii", "hh", "H", "hp", "hxx", "hpp",
+            "HPP", "h++", "tcc",
+        ],
+    ),
+    ("c17 does not compile Objective-C", &["m", "mi"]),
+    ("c17 does not compile Objective-C++", &["mm", "M", "mii"]),
+    (
+        "c17 does not compile Fortran",
+        &[
+            "f", "for", "ftn", "F", "FOR", "FTN", "fpp", "FPP", "f90", "f95", "f03", "f08", "F90",
+            "F95", "F03", "F08",
+        ],
+    ),
+    ("c17 does not compile Go", &["go"]),
+    ("c17 does not compile D", &["d", "di", "dd"]),
+    ("c17 does not compile Ada", &["ads", "adb"]),
+    ("c17 does not compile Modula-2", &["mod"]),
+];
 
-/// Check if a file is an object file or library (by extension)
-fn is_object_file(path: &str) -> bool {
-    path.ends_with(".o")
-        || path.ends_with(".a")
-        || path.ends_with(".so")
-        || path.ends_with(".dylib")
-        || path.contains(".so.") // versioned .so files like libz.so.1.3.1
+/// What an operand's suffix says it is, as gcc reads suffixes. One that names
+/// no language is a linker input -- an object or library under any name, a
+/// linker script, a version script -- which gcc passes to the linker as-is.
+fn lang_by_suffix(path: &str) -> Lang {
+    if is_preprocessed_file(path) {
+        return Lang::Preprocessed;
+    }
+    if is_source_file(path) {
+        return Lang::C;
+    }
+    let suffix = Path::new(path).extension().and_then(|s| s.to_str());
+    match suffix {
+        Some("S" | "sx") => Lang::AsmCpp,
+        Some("s") => Lang::Asm,
+        Some("h") => Lang::Header,
+        Some(suffix) => FOREIGN_SUFFIXES
+            .iter()
+            .find(|(_, suffixes)| suffixes.contains(&suffix))
+            .map_or(Lang::LinkerInput, |(why, _)| Lang::Foreign(why)),
+        None => Lang::LinkerInput,
+    }
 }
 
 /// What kind of thing a pathname operand names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OperandKind {
-    /// `.c`, `.i`, or a bare `-`.
+    /// `.c`, `.i`, or a bare `-`; or a `.h` under `-E`, `-M` or `-MM`.
     Source,
-    /// `.s` or `.S`.
+    /// `.s`, `.S` or `.sx`.
     Asm,
-    /// `.o`, `.a`, `.so`, `.dylib`, or a versioned `.so.N`.
-    Object,
-    /// Anything else: warned about and skipped.
-    Unknown,
+    /// Anything the linker reads: an object or library, a linker script, or
+    /// whatever else names no language. It goes to the linker in its place.
+    LinkerInput,
+    /// A language c17 does not compile, with what to say about it.
+    Foreign(&'static str),
 }
 
 /// A pathname operand together with its kind, keeping argument order.
@@ -2398,11 +2443,16 @@ enum Lang {
     Preprocessed,
     /// Assembly: `.s`, or `-x assembler`.
     Asm,
-    /// Assembly to preprocess first: `.S`, or `-x assembler-with-cpp`.
+    /// Assembly to preprocess first: `.S`, `.sx`, or
+    /// `-x assembler-with-cpp`.
     AsmCpp,
-    /// An object or a library.
-    Object,
-    Unknown,
+    /// A C header, `.h`: gcc preprocesses it under `-E`, `-M` and `-MM`, and
+    /// otherwise writes a precompiled header.
+    Header,
+    /// A suffix that names no language: for the linker.
+    LinkerInput,
+    /// A language gcc compiles and c17 does not, with what to say about it.
+    Foreign(&'static str),
 }
 
 /// Whether a linker-input operand never reaches the linker in this run, so
@@ -2411,13 +2461,11 @@ enum Lang {
 /// gcc errors "linker input file not found" for a missing linker input when
 /// nothing is linked (`-c`, `-S`, `-E`); a build naming a file it never made
 /// must fail, not succeed with a warning. When linking, the linker reports a
-/// missing object itself. An unrecognized suffix never reaches c17's link
-/// line, so it is checked whether or not this run links.
+/// missing input itself.
 fn bypasses_linker(kind: OperandKind, link_phase: bool) -> bool {
     match kind {
-        OperandKind::Unknown => true,
-        OperandKind::Object => !link_phase,
-        OperandKind::Source | OperandKind::Asm => false,
+        OperandKind::LinkerInput => !link_phase,
+        OperandKind::Source | OperandKind::Asm | OperandKind::Foreign(_) => false,
     }
 }
 
@@ -2425,9 +2473,13 @@ impl Operand {
     fn classify(path: String, args: &Args) -> Self {
         let kind = match args.lang_of(&path) {
             Lang::C | Lang::Preprocessed => OperandKind::Source,
+            Lang::Header if args.preprocess_only || args.dependencies_replace_output() => {
+                OperandKind::Source
+            }
+            Lang::Header => OperandKind::Foreign("c17 does not write precompiled headers"),
             Lang::Asm | Lang::AsmCpp => OperandKind::Asm,
-            Lang::Object => OperandKind::Object,
-            Lang::Unknown => OperandKind::Unknown,
+            Lang::LinkerInput => OperandKind::LinkerInput,
+            Lang::Foreign(why) => OperandKind::Foreign(why),
         };
         Operand { path, kind }
     }
@@ -2857,16 +2909,6 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|f| Operand::classify(f.clone(), &args))
         .collect();
 
-    for op in &operands {
-        if op.kind == OperandKind::Unknown {
-            driver_warning(&format!(
-                "{}: {}",
-                gettext("unrecognized file type"),
-                op.path
-            ));
-        }
-    }
-
     let source_count = operands
         .iter()
         .filter(|o| o.kind == OperandKind::Source)
@@ -2939,7 +2981,7 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pp_out = preprocess_sink(&args)?;
     // The object each operand contributes to the link, by operand index.
     // `None` means the operand contributes nothing (`-c`, an early-exit mode,
-    // or an unrecognized file).
+    // or a language c17 does not compile).
     let mut operand_objects: Vec<Option<String>> = vec![None; operands.len()];
     // CONSEQUENCES OF ERRORS (88185-88187): diagnose, keep compiling the
     // remaining operands, skip the link, exit non-zero.
@@ -2948,11 +2990,15 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     let link_phase = !args.compile_only
         && !args.asm_only
         && !args.preprocess_only
+        && !args.dependencies_replace_output()
         && !args.dump_tokens
         && !args.dump_ast
         && args.dump_ir.is_none();
 
     for (idx, op) in operands.iter().enumerate() {
+        if op.kind == OperandKind::LinkerInput && !link_phase {
+            unused_linker_input(&op.path);
+        }
         if bypasses_linker(op.kind, link_phase) {
             if let Err(e) = std::fs::metadata(&op.path) {
                 eprintln!(
@@ -2967,8 +3013,11 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         match op.kind {
-            OperandKind::Unknown => {}
-            OperandKind::Object => operand_objects[idx] = Some(op.path.clone()),
+            OperandKind::Foreign(why) => {
+                eprintln!("c17: {}: {}: {}", gettext("error"), op.path, gettext(why));
+                failed = true;
+            }
+            OperandKind::LinkerInput => operand_objects[idx] = Some(op.path.clone()),
             // 87883-87885: with -E "no compilation shall be performed", so an
             // assembler operand is never handed to `as`. Not assembling is not
             // the same as producing nothing, though: preprocess it and write
@@ -3061,60 +3110,74 @@ mod tests {
     }
 
     /// Only a linker input the linker will not see is checked by the driver:
-    /// an object only when nothing is linked, an unknown suffix always.
+    /// one named when nothing is linked.
     #[test]
     fn test_bypasses_linker() {
         for link_phase in [false, true] {
-            assert!(bypasses_linker(OperandKind::Unknown, link_phase));
             assert!(!bypasses_linker(OperandKind::Source, link_phase));
             assert!(!bypasses_linker(OperandKind::Asm, link_phase));
+            assert!(!bypasses_linker(OperandKind::Foreign("x"), link_phase));
         }
-        assert!(bypasses_linker(OperandKind::Object, false));
-        assert!(!bypasses_linker(OperandKind::Object, true));
+        assert!(bypasses_linker(OperandKind::LinkerInput, false));
+        assert!(!bypasses_linker(OperandKind::LinkerInput, true));
     }
 
-    // Tests for is_object_file()
-
+    /// Objects and libraries under their usual names, and everything else
+    /// that names no language, are for the linker.
     #[test]
-    fn test_is_object_file_object() {
-        assert!(is_object_file("foo.o"));
-        assert!(is_object_file("/path/to/bar.o"));
-    }
-
-    #[test]
-    fn test_is_object_file_static_archive() {
-        assert!(is_object_file("libfoo.a"));
-        assert!(is_object_file("/usr/lib/libbar.a"));
-    }
-
-    #[test]
-    fn test_is_object_file_shared_object() {
-        assert!(is_object_file("libfoo.so"));
-        assert!(is_object_file("/usr/lib/libbar.so"));
-    }
-
-    #[test]
-    fn test_is_object_file_dylib() {
-        assert!(is_object_file("libfoo.dylib"));
-        assert!(is_object_file("/usr/lib/libbar.dylib"));
-    }
-
-    #[test]
-    fn test_is_object_file_versioned_so() {
-        // Versioned shared objects like libz.so.1.3.1
-        assert!(is_object_file("libz.so.1"));
-        assert!(is_object_file("libz.so.1.3"));
-        assert!(is_object_file("libz.so.1.3.1"));
-        assert!(is_object_file("/usr/lib/libssl.so.3"));
+    fn test_lang_by_suffix_linker_input() {
+        for path in [
+            "foo.o",
+            "/path/to/bar.o",
+            "libfoo.a",
+            "libfoo.so",
+            "libfoo.dylib",
+            "libz.so.1.3.1",
+            "/usr/lib/libssl.so.3",
+            "f.weird",
+            "extra.ld",
+            "exports.map",
+            "baz.txt",
+            "t.def",
+            "noext",
+            "dir.d/noext",
+        ] {
+            assert_eq!(lang_by_suffix(path), Lang::LinkerInput, "{path}");
+        }
     }
 
     #[test]
-    fn test_is_object_file_negative() {
-        assert!(!is_object_file("foo.c"));
-        assert!(!is_object_file("bar.h"));
-        assert!(!is_object_file("baz.txt"));
-        assert!(!is_object_file("myso.txt")); // should not match .so
-        assert!(!is_object_file("also.conf")); // should not match .so
+    fn test_lang_by_suffix_languages() {
+        assert_eq!(lang_by_suffix("a.c"), Lang::C);
+        assert_eq!(lang_by_suffix("-"), Lang::C);
+        assert_eq!(lang_by_suffix("a.i"), Lang::Preprocessed);
+        assert_eq!(lang_by_suffix("a.s"), Lang::Asm);
+        assert_eq!(lang_by_suffix("a.S"), Lang::AsmCpp);
+        assert_eq!(lang_by_suffix("a.sx"), Lang::AsmCpp);
+        assert_eq!(lang_by_suffix("a.h"), Lang::Header);
+    }
+
+    /// Every suffix gcc gives another front end is refused, naming it.
+    #[test]
+    fn test_lang_by_suffix_foreign() {
+        for (path, why) in [
+            ("a.cpp", "c17 does not compile C++"),
+            ("a.cc", "c17 does not compile C++"),
+            ("a.c++", "c17 does not compile C++"),
+            ("a.C", "c17 does not compile C++"),
+            ("a.ii", "c17 does not compile C++"),
+            ("a.hpp", "c17 does not compile C++"),
+            ("a.m", "c17 does not compile Objective-C"),
+            ("a.mm", "c17 does not compile Objective-C++"),
+            ("a.f90", "c17 does not compile Fortran"),
+            ("a.F", "c17 does not compile Fortran"),
+            ("a.go", "c17 does not compile Go"),
+            ("a.d", "c17 does not compile D"),
+            ("a.adb", "c17 does not compile Ada"),
+            ("a.mod", "c17 does not compile Modula-2"),
+        ] {
+            assert_eq!(lang_by_suffix(path), Lang::Foreign(why), "{path}");
+        }
     }
 
     // Tests for is_source_file()

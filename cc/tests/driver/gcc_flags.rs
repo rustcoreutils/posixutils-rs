@@ -70,7 +70,8 @@ fn gcc_flags_x_selects_the_language() {
     );
     assert!(r.success, "{}", r.stderr);
 
-    // `-x none` goes back to suffixes, so a later `.h` is not compiled.
+    // `-x none` goes back to suffixes, so a later `.h` is a header again,
+    // which gcc would precompile and c17 refuses.
     let (dir, path) = scratch("later.h", MAIN);
     let c = dir.path().join("first.c");
     std::fs::write(&c, MAIN).unwrap();
@@ -86,7 +87,12 @@ fn gcc_flags_x_selects_the_language() {
         "-o",
         obj.to_str().unwrap(),
     ]);
-    assert!(r.stderr.contains("unrecognized file type"), "{}", r.stderr);
+    assert!(!r.success, "{}", r.stderr);
+    assert!(
+        r.stderr.contains("c17 does not write precompiled headers"),
+        "{}",
+        r.stderr
+    );
 
     // A language c17 does not compile is an error, not a guess.
     let r = compile_with("c.c", MAIN, &["-x", "c++"]);

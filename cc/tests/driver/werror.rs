@@ -192,7 +192,8 @@ fn werror_leaves_driver_warnings_alone() {
     let r = compile_in(dir.path(), &path, &["-Werror", unknown.to_str().unwrap()]);
     assert!(r.success, "{}", r.stderr);
     assert!(
-        r.stderr.contains("c17: warning: unrecognized file type"),
+        r.stderr
+            .contains("linker input file unused because linking not done"),
         "{}",
         r.stderr
     );

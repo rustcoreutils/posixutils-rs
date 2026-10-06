@@ -14,6 +14,7 @@
 //
 
 mod gcc_flags;
+mod linker_input;
 mod prefix_map;
 mod werror;
 

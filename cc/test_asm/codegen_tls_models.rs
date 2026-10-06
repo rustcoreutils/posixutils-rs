@@ -389,3 +389,44 @@ int *addr(void) { return &t; }
         }
     }
 }
+
+/// Inline-asm operands on thread-locals, of every constraint class, in a
+/// FreeBSD shared object: Initial Exec for all of them, the one place the
+/// static models give a thread-local defined in this file Initial Exec.
+///
+/// Four model-blind backend paths printed a thread-local as `%fs:t@TPOFF` or
+/// `t(%rip)`. None is reached -- a register operand arrives as a loaded value
+/// and a memory operand goes through the model-aware path -- and each now
+/// reports an internal error; this is the case that would show one firing.
+#[test]
+fn tls_freebsd_shared_asm_operands_use_initial_exec() {
+    let src = r#"
+struct S { int a; long b; };
+_Thread_local int t;
+_Thread_local struct S s;
+extern _Thread_local int e;
+int f(void)
+{
+    int r, q;
+    __asm__("movl %1, %0" : "=r"(r) : "r"(t));
+    __asm__("movl %1, %0" : "=r"(q) : "m"(s.a));
+    __asm__("incl %0" : "+rm"(e));
+    __asm__("incl %0" : "+m"(t));
+    __asm__("movq $1, %0" : "=g"(s.b));
+    __asm__("incl %0" : "=r"(t) : "0"(t));
+    __asm__("" : : "X"(t), "X"(e));
+    return r + q;
+}
+"#;
+    for flags in [&["-O0", "-fPIC"][..], &["-O2", "--shared"]] {
+        let asm = asm_for_with("tls_freebsd_so_asm", "x86_64-unknown-freebsd", src, flags);
+        assert!(
+            asm.contains("t@GOTTPOFF(%rip)")
+                && asm.contains("e@GOTTPOFF(%rip)")
+                && asm.contains("s@GOTTPOFF(%rip)")
+                && !asm.contains("@TPOFF")
+                && !asm.contains("t(%rip)"),
+            "{flags:?}: expected Initial Exec only:\n{asm}"
+        );
+    }
+}

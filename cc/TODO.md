@@ -57,19 +57,6 @@ Done is R10 and R11 in `Reg::allocatable()`, with each of those emitters
 either confined to one instruction's lowering or declaring its scratch as a
 constraint.
 
-### Latent Local-Exec paths in the x86-64 backend
-
-Four sites print a thread-local as a Local-Exec operand whatever the model:
-`loc_to_gp_operand` (`MemAddr::TlsLocalExec`), the two inline-asm operand
-paths in `arch/x86_64/inline_asm.rs` (`%fs:sym@TPOFF`), and
-`loc_to_asm_string`, which formats a thread-local as a plain `name(%rip)`.
-None is reachable from C source -- under the dynamic model `ir::tls` removes
-thread-local operands before codegen, and the static model's accesses go
-through other paths -- and three are `&self`, so they cannot emit an Initial
-Exec sequence. They should report an internal error, as the backends already
-do for a thread-local named anywhere but a `TlsAddr`, rather than print an
-access that is wrong for an `extern` or shared-mode thread-local.
-
 ---
 
 ## Future Features

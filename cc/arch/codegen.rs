@@ -1233,16 +1233,26 @@ pub fn check_tls_reached_only_by_address(
                 continue;
             };
             if tls_symbols.contains(name) {
-                crate::diag::error_args(
-                    pos,
-                    "internal error: the thread-local '{0}' reached code generation \
-                     without its address being computed",
-                    &[name],
-                );
+                report_tls_operand(pos, name);
                 return;
             }
         }
     }
+}
+
+/// Report the thread-local `name` reaching a backend path that cannot access
+/// it correctly: an internal error rather than wrong code.
+///
+/// Besides the call-based models above, this guards the x86-64 paths that
+/// print a global operand without asking the TLS model at all
+/// (`X86_64CodeGen::reject_tls_operand`).
+pub fn report_tls_operand(pos: crate::diag::Position, name: &str) {
+    crate::diag::error_args(
+        pos,
+        "internal error: the thread-local '{0}' reached code generation \
+         without its address being computed",
+        &[name],
+    );
 }
 
 /// What a store lowering needs to know about a local's stack slot.

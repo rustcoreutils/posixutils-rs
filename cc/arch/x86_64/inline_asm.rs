@@ -891,15 +891,8 @@ impl X86_64CodeGen {
                 ))));
             }
             Loc::Global(name) => {
-                // Check TLS before GOT - TLS symbols need special access pattern
-                if self.is_tls_symbol(name) {
-                    self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                        "{} %fs:{}@TPOFF, %{}",
-                        mov,
-                        self.format_symbol_name(name),
-                        dest_name
-                    ))));
-                } else if self.needs_got_access(name) {
+                self.reject_tls_operand(name);
+                if self.needs_got_access(name) {
                     // GOT indirection always uses 64-bit address load
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
                         "movq {}@GOTPCREL(%rip), %r11",
@@ -958,14 +951,8 @@ impl X86_64CodeGen {
                 ))));
             }
             Loc::Global(name) => {
-                if self.is_tls_symbol(name) {
-                    self.push_lir(X86Inst::Directive(Directive::Raw(format!(
-                        "{} %{}, %fs:{}@TPOFF",
-                        mov,
-                        src_name,
-                        self.format_symbol_name(name)
-                    ))));
-                } else if self.needs_got_access(name) {
+                self.reject_tls_operand(name);
+                if self.needs_got_access(name) {
                     // GOT indirection always uses 64-bit address load
                     self.push_lir(X86Inst::Directive(Directive::Raw(format!(
                         "movq {}@GOTPCREL(%rip), %r11",
@@ -1069,9 +1056,7 @@ impl X86_64CodeGen {
             Loc::Imm(v) => format!("${}", *v as i64),
             Loc::Xmm(xmm) => xmm.name().to_string(),
             Loc::FImm(v, fp_size) => format!("${}", v.to_bits_at_width(*fp_size)),
-            Loc::Global(name) => {
-                format!("{}(%rip)", self.format_symbol_name(name))
-            }
+            Loc::Global(name) => self.global_asm_text(name),
         }
     }
 
@@ -1092,10 +1077,15 @@ impl X86_64CodeGen {
             // reach here; `emit_inline_asm` materializes or diagnoses them
             // first.
             Loc::FImm(v, fp_size) => AsmOperandValue::Float(*v, *fp_size),
-            Loc::Global(name) => {
-                AsmOperandValue::Mem(format!("{}(%rip)", self.format_symbol_name(name)))
-            }
+            Loc::Global(name) => AsmOperandValue::Mem(self.global_asm_text(name)),
         }
+    }
+
+    /// A global's own storage as an operand: `sym(%rip)`. Never a
+    /// thread-local's, which is only reached through `global_mem`.
+    fn global_asm_text(&self, name: &str) -> String {
+        self.reject_tls_operand(name);
+        format!("{}(%rip)", self.format_symbol_name(name))
     }
 
     /// Format a symbol name with platform-specific decoration: the one rule,
@@ -1231,5 +1221,97 @@ impl X86_64CodeGen {
             // 64-bit (q) - default
             _ => self.reg_name_64(reg),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arch::x86_64::lir::{GpOperand, MemAddr};
+    use crate::diag;
+    use crate::target::{Arch, Os, Target};
+
+    /// A Linux code generator for which `t` is a thread-local and `g` an
+    /// ordinary global, with diagnostics captured.
+    fn codegen() -> X86_64CodeGen {
+        let mut cg = X86_64CodeGen::new(Target::new(Arch::X86_64, Os::Linux));
+        cg.tls_symbols.insert("t".to_string());
+        diag::clear_streams();
+        cg.base.func_pos = diag::Position::new(diag::init_stream("tls.c"), 3, 1);
+        diag::reset_counts();
+        diag::capture_diagnostics();
+        cg
+    }
+
+    /// The diagnostics captured since `codegen`, of which exactly `errors`
+    /// are errors.
+    fn captured(errors: u32) -> Vec<String> {
+        let lines = diag::take_captured_diagnostics();
+        assert_eq!(diag::error_count(), errors, "{lines:?}");
+        lines
+    }
+
+    type Site = fn(&mut X86_64CodeGen, &Loc) -> String;
+
+    /// Every path that prints a global without asking the TLS model reports a
+    /// thread-local as an internal error instead of printing it as Local Exec
+    /// (`%fs:t@TPOFF`) or as a plain `t(%rip)`.
+    #[test]
+    fn model_blind_operand_paths_reject_a_thread_local() {
+        let tls = Loc::Global("t".into());
+        let sites: [(&str, Site); 5] = [
+            ("loc_to_gp_operand", |cg, loc| {
+                format!("{:?}", cg.loc_to_gp_operand(loc))
+            }),
+            ("emit_raw_mov_from_loc", |cg, loc| {
+                cg.emit_raw_mov_from_loc(loc, Reg::Rax, 32);
+                format!("{:?}", cg.base.lir_buffer)
+            }),
+            ("emit_raw_mov_to_loc", |cg, loc| {
+                cg.emit_raw_mov_to_loc(Reg::Rax, loc, 32);
+                format!("{:?}", cg.base.lir_buffer)
+            }),
+            ("loc_to_asm_string", |cg, loc| cg.loc_to_asm_string(loc)),
+            ("loc_to_asm_operand", |cg, loc| {
+                format!("{:?}", cg.loc_to_asm_operand(loc, 32))
+            }),
+        ];
+        for (site, emit) in sites {
+            let mut cg = codegen();
+            let text = emit(&mut cg, &tls);
+            let lines = captured(1);
+            assert!(
+                lines.len() == 1
+                    && lines[0]
+                        .contains("internal error: the thread-local 't' reached code generation"),
+                "{site}: {lines:?}"
+            );
+            assert!(!text.contains("TPOFF"), "{site} printed Local Exec: {text}");
+        }
+    }
+
+    /// An ordinary global through the same paths is no error, and is its
+    /// RIP-relative symbol.
+    #[test]
+    fn model_blind_operand_paths_accept_an_ordinary_global() {
+        let g = Loc::Global("g".into());
+        let mut cg = codegen();
+        assert!(matches!(
+            cg.loc_to_gp_operand(&g),
+            GpOperand::Mem(MemAddr::RipRelative(_))
+        ));
+        cg.emit_raw_mov_from_loc(&g, Reg::Rax, 32);
+        cg.emit_raw_mov_to_loc(Reg::Rax, &g, 32);
+        assert_eq!(cg.loc_to_asm_string(&g), "g(%rip)");
+        assert!(matches!(
+            cg.loc_to_asm_operand(&g, 32),
+            AsmOperandValue::Mem(m) if m == "g(%rip)"
+        ));
+        captured(0);
+        let text = format!("{:?}", cg.base.lir_buffer);
+        assert!(
+            text.contains("movl g(%rip), %eax") && text.contains("movl %eax, g(%rip)"),
+            "{text}"
+        );
     }
 }

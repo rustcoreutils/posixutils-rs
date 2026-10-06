@@ -72,8 +72,9 @@ pub struct CodegenOptions<'a> {
     pub trapping_math: bool,
     /// `-fvisibility=`.
     pub default_visibility: Option<&'a str>,
-    /// Code for a shared object (`-shared` or `-fPIC`): selects the TLS model.
-    pub shared_mode: bool,
+    /// What thread-local accesses may assume: whether the code is for a
+    /// shared object (`-shared`, `-fpic`, `-fPIC`), and `-ftls-model=`.
+    pub tls: crate::target::TlsPolicy,
     /// Position-independent code.
     pub pic: bool,
     pub unwind_tables: bool,
@@ -236,13 +237,9 @@ pub fn compile_tokens(
     // Expand thread-local accesses for the dynamic TLS model. Must run before
     // `optimize_module`, because register allocation is downstream of it and
     // has to see the address computation -- see `ir::tls`. The backend below
-    // is given the same `shared_mode`, so the pass and the backend agree on
+    // is given the same `TlsPolicy`, so the pass and the backend agree on
     // the model.
-    ir::tls::expand_dynamic_tls(
-        &mut module,
-        target.tls_access(opts.shared_mode).is_call(),
-        &types,
-    );
+    ir::tls::expand_dynamic_tls(&mut module, target.tls_access(opts.tls).is_call(), &types);
 
     observer.stage("post-tls", &module, &types, None);
     ir::validate::verify(&module, ir::validate::Stage::Ssa, "target mapping");
@@ -270,8 +267,8 @@ pub fn compile_tokens(
         return Ok(None);
     }
 
-    // Generate assembly. `shared_mode` selects the TLS model and nothing
-    // else. `-fPIC` asks for code that can live in a shared object, which is
+    // Generate assembly. `opts.tls` selects the TLS model and nothing else.
+    // `-fPIC` asks for code that can live in a shared object, which is
     // exactly what Local Exec cannot satisfy, while `-fPIE` and the PIE
     // default do not, because a PIE executable still resolves its own
     // thread-locals at link time. gcc draws the line in the same place.
@@ -279,7 +276,7 @@ pub fn compile_tokens(
         target.clone(),
         opts.unwind_tables,
         opts.pic,
-        opts.shared_mode,
+        opts.tls,
         opts.verbose_asm,
         opts.cf_protection,
     );

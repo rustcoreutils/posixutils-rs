@@ -97,7 +97,8 @@ Options beyond the POSIX set (`-B -c -D -E -G -g -I -L -l -O -o -R -s -U`):
    diagnostics.
  * A GCC-compatibility argument rewriter accepts and maps `-std=`, `-f*`,
    `-m*`, the `-fpic` family (`-fPIC`/`-fpic`/`-fPIE`/`-fpie` and their
-   `-fno-` forms, last one wins), `-pie`/`-no-pie`, `-shared`, `-Wl,`, `-Xlinker`, `-pthread`, `-rdynamic`, `-pipe`, `-p`/`-pg`,
+   `-fno-` forms, last one wins), `-ftls-model=`, `-pie`/`-no-pie`,
+   `-shared`, `-Wl,`, `-Xlinker`, `-pthread`, `-rdynamic`, `-pipe`, `-p`/`-pg`,
    `-fsanitize*` and `-ffreestanding`/`-fhosted`.
  * A bare `-` operand is accepted as a pathname.  POSIX says standard input is
    "Not used".

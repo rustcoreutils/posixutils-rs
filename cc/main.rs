@@ -247,6 +247,17 @@ struct Args {
     )]
     pic_flag: Option<target::PositionIndependence>,
 
+    /// `-ftls-model=<model>`, validated by `preprocess_args_from`; the last
+    /// one given wins.
+    #[arg(
+        long = "c17-tls-model",
+        hide = true,
+        value_name = "model",
+        value_parser = parse_tls_model,
+        overrides_with = "tls_model"
+    )]
+    tls_model: Option<target::TlsModel>,
+
     /// Produce a shared library
     #[arg(long = "shared", help = gettext("Produce a shared library"))]
     shared: bool,
@@ -1263,14 +1274,17 @@ fn process_file(
     // said. gcc compiles `-shared` alone as a PIE, which a shared object
     // cannot always hold.
     let position = position_independence(args, target);
-    let shared_mode = producing_shared(args) || position.is_shared_code();
+    let tls = target::TlsPolicy {
+        shared_code: producing_shared(args) || position.is_shared_code(),
+        floor: args.tls_model.unwrap_or_default(),
+    };
     let codegen_opts = pipeline::CodegenOptions {
         optimization: args.optimization(),
         math_errno: !args.fno_math_errno,
         debug: args.debug > 0,
         trapping_math: !args.fno_trapping_math,
         default_visibility: args.default_visibility.as_deref(),
-        shared_mode,
+        tls,
         pic: producing_shared(args) || position.is_pic(),
         unwind_tables: !args.no_unwind_tables,
         verbose_asm: args.verbose_asm,
@@ -1601,6 +1615,30 @@ fn parse_pic_flag(s: &str) -> Result<target::PositionIndependence, String> {
     target::PositionIndependence::from_flag(s).ok_or_else(|| format!("not a -fpic option: '{s}'"))
 }
 
+/// The value of the internal `--c17-tls-model` option: a model name already
+/// validated by `preprocess_args_from`.
+fn parse_tls_model(s: &str) -> Result<target::TlsModel, String> {
+    target::TlsModel::from_name(s).ok_or_else(|| format!("unknown TLS model '{s}'"))
+}
+
+/// The model a `-ftls-model=` option names, as the value of
+/// `--c17-tls-model`. A name gcc does not know is an error, in its words.
+fn tls_model_name(model: &str) -> &str {
+    if model.is_empty() {
+        eprintln!("c17: error: missing argument to '-ftls-model='");
+        std::process::exit(1);
+    }
+    if target::TlsModel::from_name(model).is_none() {
+        eprintln!("c17: error: unknown TLS model '{model}'");
+        eprintln!(
+            "c17: note: valid arguments to '-ftls-model=' are: {}",
+            target::TlsModel::NAMES
+        );
+        std::process::exit(1);
+    }
+    model
+}
+
 /// The value of the internal `--c17-prefix-map` option: a prefix-map
 /// option in its gcc spelling, already validated by `preprocess_args_from`.
 fn parse_prefix_map(s: &str) -> Result<MapOption, String> {
@@ -1887,6 +1925,9 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
         } else if target::PositionIndependence::from_flag(arg).is_some() {
             // The `-fpic` family, whose last member wins.
             result.push(format!("--c17-pic={arg}"));
+            i += 1;
+        } else if let Some(model) = arg.strip_prefix("-ftls-model=") {
+            result.push(format!("--c17-tls-model={}", tls_model_name(model)));
             i += 1;
         } else if arg == "-shared" {
             // -shared → --shared

@@ -725,6 +725,71 @@ impl TlsAccess {
     }
 }
 
+/// gcc's four ELF thread-local models, from the one that assumes least to
+/// the one that assumes most, which is the order `Ord` gives them.
+///
+/// c17 has no Local Dynamic sequence: where gcc would use it, c17 uses the
+/// descriptor call of Global Dynamic, which is valid wherever Local Dynamic
+/// is (gcc's own aarch64 code makes the same choice).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TlsModel {
+    #[default]
+    GlobalDynamic,
+    LocalDynamic,
+    InitialExec,
+    LocalExec,
+}
+
+impl TlsModel {
+    /// The model `-ftls-model=<name>` names, in gcc's spelling.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name {
+            "global-dynamic" => Self::GlobalDynamic,
+            "local-dynamic" => Self::LocalDynamic,
+            "initial-exec" => Self::InitialExec,
+            "local-exec" => Self::LocalExec,
+            _ => return None,
+        })
+    }
+
+    /// The names [`Self::from_name`] takes, in the order gcc lists them.
+    pub const NAMES: &'static str = "global-dynamic initial-exec local-dynamic local-exec";
+}
+
+/// What a compilation's thread-local accesses may assume, from which every
+/// access's model follows: see [`TlsPolicy::initial_exec`] and
+/// [`Target::tls_access`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TlsPolicy {
+    /// The code may live in a shared object (`-shared`, `-fpic`, `-fPIC`),
+    /// so not even a thread-local it defines has an offset known at link
+    /// time.
+    pub shared_code: bool,
+    /// `-ftls-model=`: the least optimized model any access may use. An
+    /// access takes this or the model the code can prove, whichever assumes
+    /// more, which is how gcc combines them.
+    pub floor: TlsModel,
+}
+
+impl TlsPolicy {
+    /// Whether the code must reach its thread-locals through a call, under
+    /// a dynamic model: shared code, unless `-ftls-model=` allows a static
+    /// one.
+    pub fn dynamic(self) -> bool {
+        self.shared_code && self.floor < TlsModel::InitialExec
+    }
+
+    /// Whether a static access to a thread-local is Initial Exec rather than
+    /// Local Exec. Local Exec fixes the offset from the thread pointer at
+    /// link time, which only holds for the executable's own thread-locals:
+    /// one defined elsewhere (`is_extern`), or any in shared code, needs the
+    /// offset loaded from the GOT -- unless `-ftls-model=local-exec` says the
+    /// link will fix it anyway.
+    pub fn initial_exec(self, is_extern: bool) -> bool {
+        self.floor < TlsModel::LocalExec && (is_extern || self.shared_code)
+    }
+}
+
 /// The order in which the bytes of a multi-byte scalar lie in memory: what
 /// gcc's `scalar_storage_order` attribute and pragma name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1013,18 +1078,18 @@ impl Default for Target {
 }
 
 impl Target {
-    /// How this target obtains a thread-local's address. `shared_mode` is
-    /// set for `-shared` and `-fPIC`: code that may be `dlopen`ed.
+    /// How this target obtains a thread-local's address under `policy`.
     ///
     /// ELF (Linux, FreeBSD) folds Local and Initial Exec into the access and
-    /// needs a descriptor call only for shared code, and only Linux takes the
-    /// descriptor model here: FreeBSD's shared code uses Initial Exec, never
-    /// Local Exec (see `CodeGenBase::use_tls_ie`). Mach-O always calls the TLV
-    /// getter.
-    pub fn tls_access(&self, shared_mode: bool) -> TlsAccess {
+    /// needs a descriptor call only where the policy is dynamic, and only
+    /// Linux takes the descriptor model here: FreeBSD's shared code uses
+    /// Initial Exec, never Local Exec (see [`TlsPolicy::initial_exec`]).
+    /// Mach-O always calls the TLV getter, whatever `-ftls-model=` says, as
+    /// clang does.
+    pub fn tls_access(&self, policy: TlsPolicy) -> TlsAccess {
         match self.os {
             Os::MacOS => TlsAccess::MachOTlv,
-            Os::Linux if shared_mode => TlsAccess::ElfDescriptor,
+            Os::Linux if policy.dynamic() => TlsAccess::ElfDescriptor,
             Os::Linux | Os::FreeBSD => TlsAccess::ElfStatic,
         }
     }
@@ -1266,18 +1331,56 @@ mod tests {
     /// and only Linux takes the descriptor model; FreeBSD is ELF too.
     #[test]
     fn test_tls_access_per_target() {
+        let exe = TlsPolicy::default();
+        let shared = TlsPolicy {
+            shared_code: true,
+            ..TlsPolicy::default()
+        };
         for arch in [Arch::X86_64, Arch::Aarch64] {
             let mac = Target::new(arch, Os::MacOS);
-            assert_eq!(mac.tls_access(false), TlsAccess::MachOTlv);
-            assert_eq!(mac.tls_access(true), TlsAccess::MachOTlv);
+            assert_eq!(mac.tls_access(exe), TlsAccess::MachOTlv);
+            assert_eq!(mac.tls_access(shared), TlsAccess::MachOTlv);
             let linux = Target::new(arch, Os::Linux);
-            assert_eq!(linux.tls_access(false), TlsAccess::ElfStatic);
-            assert_eq!(linux.tls_access(true), TlsAccess::ElfDescriptor);
+            assert_eq!(linux.tls_access(exe), TlsAccess::ElfStatic);
+            assert_eq!(linux.tls_access(shared), TlsAccess::ElfDescriptor);
             let bsd = Target::new(arch, Os::FreeBSD);
-            assert_eq!(bsd.tls_access(false), TlsAccess::ElfStatic);
+            assert_eq!(bsd.tls_access(exe), TlsAccess::ElfStatic);
+            assert_eq!(bsd.tls_access(shared), TlsAccess::ElfStatic);
         }
         assert!(TlsAccess::MachOTlv.is_call() && TlsAccess::ElfDescriptor.is_call());
         assert!(!TlsAccess::ElfStatic.is_call());
+    }
+
+    /// `-ftls-model=` is the least optimized model an access may take: the
+    /// access is that or what the code proves, whichever assumes more.
+    #[test]
+    fn test_tls_policy_floor() {
+        use TlsModel::*;
+        let policy = |shared_code, floor| TlsPolicy { shared_code, floor };
+        // (shared code, floor) -> (dynamic, IE for a defined one, IE for an extern one)
+        for (shared, floor, want) in [
+            (false, GlobalDynamic, (false, false, true)),
+            (false, LocalDynamic, (false, false, true)),
+            (false, InitialExec, (false, false, true)),
+            (false, LocalExec, (false, false, false)),
+            (true, GlobalDynamic, (true, true, true)),
+            (true, LocalDynamic, (true, true, true)),
+            (true, InitialExec, (false, true, true)),
+            (true, LocalExec, (false, false, false)),
+        ] {
+            let p = policy(shared, floor);
+            assert_eq!(
+                (p.dynamic(), p.initial_exec(false), p.initial_exec(true)),
+                want,
+                "{p:?}"
+            );
+        }
+        for name in TlsModel::NAMES.split(' ') {
+            assert!(TlsModel::from_name(name).is_some(), "{name}");
+        }
+        assert_eq!(TlsModel::from_name("local-exec"), Some(LocalExec));
+        assert_eq!(TlsModel::from_name("bogus"), None);
+        assert!(GlobalDynamic < LocalDynamic && InitialExec < LocalExec);
     }
 
     /// The `-fpic` family: each spelling, the per-target default, and what

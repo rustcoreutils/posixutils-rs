@@ -1718,7 +1718,7 @@ int main(void) {
 ///
 /// Local Exec bakes the offset from the thread pointer in at link time, which
 /// only works for the main executable. c17 recognised `-fPIC` and folded it
-/// into `pic_mode`, but the TLS decision reads `shared_mode`, so `-fPIC`
+/// into `pic_mode`, but the TLS decision read `shared_mode`, so `-fPIC`
 /// silently produced `%fs:tv@TPOFF` -- a code-generation flag with no effect
 /// on code generation.
 ///

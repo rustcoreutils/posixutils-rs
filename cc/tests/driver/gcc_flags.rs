@@ -919,3 +919,40 @@ fn gcc_flags_cf_protection() {
         r.stderr
     );
 }
+
+/// `-ftls-model=` takes gcc's four model names, and refuses anything else in
+/// gcc's words. It was ignored with a warning.
+#[test]
+fn gcc_flags_tls_model() {
+    let src = "_Thread_local int t;\nint main(void) { return t; }\n";
+    for model in [
+        "global-dynamic",
+        "local-dynamic",
+        "initial-exec",
+        "local-exec",
+    ] {
+        let flag = format!("-ftls-model={model}");
+        let r = compile_with("tls.c", src, &[&flag]);
+        assert!(r.success, "{flag}: {}", r.stderr);
+        assert!(r.stderr.is_empty(), "{flag}: {}", r.stderr);
+    }
+    let r = compile_with("tls.c", src, &["-ftls-model=bogus"]);
+    assert!(!r.success);
+    assert!(
+        r.stderr.contains("error: unknown TLS model 'bogus'")
+            && r.stderr.contains(
+                "note: valid arguments to '-ftls-model=' are: \
+                 global-dynamic initial-exec local-dynamic local-exec"
+            ),
+        "{}",
+        r.stderr
+    );
+    let r = compile_with("tls.c", src, &["-ftls-model="]);
+    assert!(!r.success);
+    assert!(
+        r.stderr
+            .contains("error: missing argument to '-ftls-model='"),
+        "{}",
+        r.stderr
+    );
+}

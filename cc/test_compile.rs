@@ -49,6 +49,8 @@ struct Options {
     debug: bool,
     /// The last of the `-fpic` family, if any.
     position: Option<target::PositionIndependence>,
+    /// `-ftls-model=`.
+    tls_model: target::TlsModel,
     shared: bool,
     no_unwind_tables: bool,
     verbose_asm: bool,
@@ -123,6 +125,8 @@ fn apply_flags(flags: &[&str]) -> Options {
             _ => {
                 if let Some(position) = target::PositionIndependence::from_flag(flag) {
                     o.position = Some(position);
+                } else if let Some(model) = flag.strip_prefix("-ftls-model=") {
+                    o.tls_model = target::TlsModel::from_name(model).unwrap();
                 } else if let Some(level) = flag.strip_prefix("-O") {
                     o.optimization = Optimization::from_flag(level).unwrap();
                 } else if let Some(map) = MapOption::parse(flag) {
@@ -213,7 +217,10 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         debug: o.debug,
         trapping_math: o.trapping_math,
         default_visibility: None,
-        shared_mode: o.shared || position.is_shared_code(),
+        tls: target::TlsPolicy {
+            shared_code: o.shared || position.is_shared_code(),
+            floor: o.tls_model,
+        },
         pic: o.shared || position.is_pic(),
         unwind_tables: !o.no_unwind_tables,
         verbose_asm: o.verbose_asm,

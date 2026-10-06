@@ -265,11 +265,25 @@ impl Drop for Aarch64Asm {
     }
 }
 
+/// The options an executable is built with: the default models, and each
+/// model `-ftls-model=` can force on code that ends up in an executable --
+/// Local Exec for another unit's thread-locals, Initial Exec and the
+/// descriptor call for `-fPIC` code.
+const EXECUTABLE_OPTS: &[&[&str]] = &[
+    &["-O0"],
+    &["-O2"],
+    &["-O2", "-fPIE"],
+    &["-O2", "-ftls-model=local-exec"],
+    &["-O0", "-fPIC", "-ftls-model=local-exec"],
+    &["-O2", "-fPIC", "-ftls-model=initial-exec"],
+    &["-O2", "-fPIC", "-ftls-model=local-dynamic"],
+];
+
 /// A host executable: Local Exec for its own thread-locals and Initial Exec for
 /// another unit's on ELF hosts, the TLV getter on a macOS host.
 #[test]
 fn tls_models_host_executable() {
-    for opts in [&["-O0"][..], &["-O2"], &["-O2", "-fPIE"]] {
+    for opts in EXECUTABLE_OPTS {
         let opts: Vec<String> = opts.iter().map(|s| s.to_string()).collect();
         assert_eq!(
             compile_and_run_two_units("tls_models", USER, DEF, &opts),
@@ -285,7 +299,7 @@ fn tls_models_aarch64_executable() {
         eprintln!("SKIP tls_models_aarch64_executable: no aarch64 cross toolchain");
         return;
     }
-    for opts in [&["-O0"][..], &["-O2"], &["-O2", "-fPIE"]] {
+    for &opts in EXECUTABLE_OPTS {
         let user = Aarch64Asm::new("tls_user", USER, opts);
         let def = create_c_file("tls_def", DEF);
         let code = cross_link_and_run("tls_models", &[&user.path, &def.path().to_string_lossy()]);

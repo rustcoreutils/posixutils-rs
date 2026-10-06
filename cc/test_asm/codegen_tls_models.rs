@@ -430,3 +430,110 @@ int f(void)
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// -ftls-model=
+// ---------------------------------------------------------------------------
+
+/// The ELF access a function's thread-local reference took.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Access {
+    /// A descriptor call: the dynamic models.
+    Dynamic,
+    InitialExec,
+    LocalExec,
+}
+
+/// Which access `body` uses, by the relocations it names.
+fn access_in(body: &str) -> Access {
+    let dynamic = body.contains("@TLSDESC") || body.contains(":tlsdesc:");
+    let ie = body.contains("@GOTTPOFF") || body.contains(":gottprel:");
+    let le = body.contains("@TPOFF") || body.contains(":tprel_hi12:");
+    match (dynamic, ie, le) {
+        (true, false, false) => Access::Dynamic,
+        (false, true, false) => Access::InitialExec,
+        (false, false, true) => Access::LocalExec,
+        _ => panic!("no single thread-local access in:\n{body}"),
+    }
+}
+
+/// `-ftls-model=` names the least optimized model the compilation may use,
+/// and the access is the stronger of that and what the code can prove, as
+/// gcc decides it: an executable keeps Local Exec for its own thread-locals
+/// whatever is asked, `initial-exec` takes shared code off the descriptor
+/// call, and `local-exec` is Local Exec for everything, a thread-local
+/// defined elsewhere included. c17 has no Local Dynamic sequence and gives
+/// `local-dynamic` the descriptor call, which is a valid Global Dynamic
+/// access (gcc's own aarch64 code uses the descriptor for both). The option
+/// was ignored with a warning.
+///
+/// gcc 13, x86-64 and aarch64 alike, for a defined `t` and an `extern` `e`:
+///
+/// | flags                          | t  | e  |
+/// |--------------------------------|----|----|
+/// | (none), `global-dynamic`, `local-dynamic`, `initial-exec` | LE | IE |
+/// | `local-exec`                   | LE | LE |
+/// | `-fPIC`, `-fPIC global-dynamic`, `-fPIC local-dynamic` | GD | GD |
+/// | `-fPIC initial-exec`           | IE | IE |
+/// | `-fPIC local-exec`             | LE | LE |
+#[test]
+fn tls_model_option_sets_the_least_optimized_model() {
+    use Access::{Dynamic as GD, InitialExec as IE, LocalExec as LE};
+    let src = "_Thread_local int t;\nextern _Thread_local int e;\n\
+               int rt(void) { return t; }\nint re(void) { return e; }\n";
+    let rows: &[(&[&str], Access, Access)] = &[
+        (&[], LE, IE),
+        (&["-ftls-model=global-dynamic"], LE, IE),
+        (&["-ftls-model=local-dynamic"], LE, IE),
+        (&["-ftls-model=initial-exec"], LE, IE),
+        (&["-ftls-model=local-exec"], LE, LE),
+        (&["-fPIC"], GD, GD),
+        (&["-fPIC", "-ftls-model=global-dynamic"], GD, GD),
+        (&["-fPIC", "-ftls-model=local-dynamic"], GD, GD),
+        (&["-fPIC", "-ftls-model=initial-exec"], IE, IE),
+        (&["-fPIC", "-ftls-model=local-exec"], LE, LE),
+        // The last one given wins.
+        (
+            &[
+                "-fPIC",
+                "-ftls-model=local-exec",
+                "-ftls-model=initial-exec",
+            ],
+            IE,
+            IE,
+        ),
+        (&["-shared", "-ftls-model=initial-exec"], IE, IE),
+    ];
+    for triple in [
+        super::asm_probe::X86_64_LINUX,
+        super::asm_probe::AARCH64_LINUX,
+    ] {
+        for opt in ["-O0", "-O2"] {
+            for &(flags, t, e) in rows {
+                let mut all = vec![opt];
+                all.extend_from_slice(flags);
+                let asm = asm_for_with("tls_model_opt", triple, src, &all);
+                let got = (
+                    access_in(body_of(&asm, "rt")),
+                    access_in(body_of(&asm, "re")),
+                );
+                assert_eq!(got, (t, e), "{triple} {all:?}:\n{asm}");
+            }
+        }
+    }
+}
+
+/// Mach-O has one thread-local access, the TLV getter call, and the option
+/// leaves it alone, as clang does.
+#[test]
+fn tls_model_option_leaves_macho_alone() {
+    let src = "_Thread_local int t;\nint rt(void) { return t; }\n";
+    let asm = asm_for_with(
+        "tls_model_macho",
+        super::asm_probe::AARCH64_DARWIN,
+        src,
+        &["-O2", "-ftls-model=local-exec"],
+    );
+    let body = body_of(&asm, "_rt");
+    assert!(body.contains("@TLVPPAGE"), "{body}");
+}

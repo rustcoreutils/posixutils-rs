@@ -1478,8 +1478,8 @@ impl CodeGenerator for Aarch64CodeGen {
         self.pic_mode = pic;
     }
 
-    fn set_shared_mode(&mut self, shared: bool) {
-        self.base.shared_mode = shared;
+    fn set_tls_policy(&mut self, tls: crate::target::TlsPolicy) {
+        self.base.tls = tls;
     }
 
     fn set_verbose_asm(&mut self, verbose: bool) {

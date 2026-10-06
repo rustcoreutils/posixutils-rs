@@ -195,6 +195,10 @@ struct Args {
     #[arg(long = "sysroot", value_name = "dir", help = gettext("Use dir as the root of the target's system directories"))]
     sysroot: Option<String>,
 
+    /// Include directories searched for `#include "..."` only, ahead of `-I`.
+    #[arg(long = "iquote", action = clap::ArgAction::Append, value_name = "dir", help = gettext("Add an include path for #include \"...\" only, searched before -I"))]
+    iquote_paths: Vec<String>,
+
     /// System include directories searched ahead of the target's own.
     #[arg(long = "isystem", action = clap::ArgAction::Append, value_name = "dir", help = gettext("Add a system include path, searched before the target's own"))]
     isystem_paths: Vec<String>,
@@ -696,6 +700,7 @@ enum Compiled {
 /// The system header search this invocation asked for.
 fn system_search(args: &Args) -> token::preprocess::SystemSearch<'_> {
     token::preprocess::SystemSearch {
+        iquote: &args.iquote_paths,
         sysroot: args.sysroot.as_deref(),
         isystem: &args.isystem_paths,
         idirafter: &args.idirafter_paths,
@@ -2056,7 +2061,13 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             } else {
                 i += 1;
             }
-        } else if arg == "-isystem" || arg == "-idirafter" || arg == "--sysroot" {
+        } else if let Some(dir) = arg.strip_prefix("-iquote").filter(|d| !d.is_empty()) {
+            // gcc takes the directory joined as well; guile writes `-iquote.`.
+            result.push("--iquote".to_string());
+            result.push(dir.to_string());
+            i += 1;
+        } else if arg == "-iquote" || arg == "-isystem" || arg == "-idirafter" || arg == "--sysroot"
+        {
             // Value options gcc spells with one dash. `--sysroot` is already
             // two, but takes its value as a separate word here either way.
             let long = if arg.starts_with("--") {

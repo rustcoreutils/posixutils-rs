@@ -1910,8 +1910,8 @@ fn test_pragma_operator_destringify() {
 // The search chain: `-I`, then the bundled headers, then the system
 // directories, with `#include_next` resuming just past the current file.
 
-/// A temporary tree of headers: `q` stands for a `-I` directory, `sys` for a
-/// system one, and each file is written as given.
+/// A temporary tree of headers: `iq` stands for a `-iquote` directory, `q`
+/// for a `-I` one, `sys` for a system one, and each file is written as given.
 struct SearchTree {
     dir: plib::tmp::TempDir,
 }
@@ -1922,7 +1922,7 @@ impl SearchTree {
             .prefix("c17_search_chain_")
             .tempdir()
             .unwrap();
-        for sub in ["q", "sys"] {
+        for sub in ["iq", "q", "sys"] {
             std::fs::create_dir(dir.path().join(sub)).unwrap();
         }
         for (path, text) in files {
@@ -1935,15 +1935,17 @@ impl SearchTree {
         self.dir.path().join(sub).to_string_lossy().into_owned()
     }
 
-    /// Preprocess `input` with `q` as the only `-I` directory and `sys` as the
-    /// only system directory, returning the token spellings and the headers
-    /// depended on.
+    /// Preprocess `input` with `iq` as the only `-iquote` directory, `q` as the
+    /// only `-I` directory and `sys` as the only system directory, returning
+    /// the token spellings and the headers depended on.
     fn preprocess(&self, input: &str) -> (Vec<String>, Vec<(PathBuf, bool)>) {
+        let iquote = [self.path("iq")];
         let include_paths = [self.path("q")];
         let isystem = [self.path("sys")];
         let config = PreprocessConfig {
             include_paths: &include_paths,
             search: SystemSearch {
+                iquote: &iquote,
                 isystem: &isystem,
                 no_std_inc: true,
                 ..Default::default()
@@ -1961,10 +1963,15 @@ impl SearchTree {
 
 #[test]
 fn test_search_pos_order_is_the_search_order() {
+    assert!(SearchPos::IQuote(7) < SearchPos::Quote(0));
     assert!(SearchPos::Quote(7) < SearchPos::Bundled);
     assert!(SearchPos::Bundled < SearchPos::System(0));
     assert!(SearchPos::System(0) < SearchPos::System(1));
-    assert_eq!(SearchPos::after(None), SearchPos::Quote(0));
+    assert_eq!(SearchPos::after(None), SearchPos::IQuote(0));
+    assert_eq!(
+        SearchPos::after(Some(SearchPos::IQuote(0))),
+        SearchPos::IQuote(1)
+    );
     assert_eq!(
         SearchPos::after(Some(SearchPos::Quote(2))),
         SearchPos::Quote(3)
@@ -1977,6 +1984,26 @@ fn test_search_pos_order_is_the_search_order() {
         SearchPos::after(Some(SearchPos::System(4))),
         SearchPos::System(5)
     );
+}
+
+/// `-iquote` directories are searched for the `"..."` form only, after the
+/// including file's own directory and ahead of `-I`; `#include_next` from a
+/// header found there goes on to the rest of the chain.
+#[test]
+fn test_iquote_serves_quote_includes_only() {
+    let tree = SearchTree::new(&[
+        ("iq/h.h", "#define WHERE iquote\n"),
+        ("q/h.h", "#define WHERE dash_i\n"),
+        ("iq/n.h", "#include_next \"n.h\"\nFIRST\n"),
+        ("q/n.h", "SECOND\n"),
+    ]);
+    let (strs, deps) = tree.preprocess("#include \"h.h\"\nWHERE");
+    assert_eq!(strs, ["iquote"]);
+    assert_eq!(deps, [(Path::new(&tree.path("iq")).join("h.h"), false)]);
+    let (strs, _) = tree.preprocess("#include <h.h>\nWHERE");
+    assert_eq!(strs, ["dash_i"]);
+    let (strs, _) = tree.preprocess("#include \"n.h\"\n");
+    assert_eq!(strs, ["SECOND", "FIRST"]);
 }
 
 /// The bundled <limits.h> forwards to the system's, which, like glibc's, would

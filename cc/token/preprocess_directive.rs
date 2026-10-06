@@ -935,7 +935,7 @@ impl<'a> Preprocessor<'a> {
         let start = if is_include_next {
             SearchPos::after(self.current_search_pos)
         } else {
-            SearchPos::Quote(0)
+            SearchPos::IQuote(0)
         };
         let search_dirs = |dirs: &[String], at: fn(usize) -> SearchPos| {
             dirs.iter()
@@ -949,6 +949,11 @@ impl<'a> Preprocessor<'a> {
                 })
         };
 
+        if !is_system {
+            if let Some(found) = search_dirs(&self.iquote_include_paths, SearchPos::IQuote) {
+                return Some(found);
+            }
+        }
         if let Some(found) = search_dirs(&self.quote_include_paths, SearchPos::Quote) {
             return Some(found);
         }

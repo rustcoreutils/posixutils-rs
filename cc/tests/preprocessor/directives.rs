@@ -578,6 +578,45 @@ fn preprocessor_include_next_walks_the_dash_i_path() {
     );
 }
 
+/// `-iquote DIR` and `-iquoteDIR` add a directory searched for `"..."`
+/// includes ahead of `-I`, and not for `<...>` ones. guile builds libguile
+/// with `-iquote.` and dpkg with `-iquote .`; c17 refused both as clap's
+/// `unexpected argument '-i'`.
+#[test]
+fn preprocessor_iquote_serves_quote_includes() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_iquote_")
+        .tempdir()
+        .unwrap();
+    let (iq, i) = (dir.path().join("iq"), dir.path().join("i"));
+    for d in [&iq, &i] {
+        std::fs::create_dir(d).unwrap();
+    }
+    std::fs::write(iq.join("h.h"), "#define WHERE iquote\n").unwrap();
+    std::fs::write(i.join("h.h"), "#define WHERE dash_i\n").unwrap();
+    let src = dir.path().join("sub").join("m.c");
+    std::fs::create_dir(src.parent().unwrap()).unwrap();
+    std::fs::write(
+        &src,
+        "#include \"h.h\"\nq WHERE\n#undef WHERE\n#include <h.h>\na WHERE\n",
+    )
+    .unwrap();
+
+    let dash_i = format!("-I{}", i.display());
+    let joined = format!("-iquote{}", iq.display());
+    let iq_s = iq.to_string_lossy();
+    for spelling in [&["-iquote", iq_s.as_ref()][..], &[joined.as_str()]] {
+        let mut args = vec!["-E", "-P", dash_i.as_str()];
+        args.extend(spelling);
+        let src_s = src.to_string_lossy();
+        args.push(&src_s);
+        let r = run_c17(&args);
+        assert!(r.success, "{spelling:?}: {}", r.stderr);
+        let text: String = r.stdout.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(text, "q iquote a dash_i", "{spelling:?}");
+    }
+}
+
 /// The other half of the same chain: a file found on a *system* path still
 /// resumes after that path, not from the front of it. `-I` directories come
 /// first on the chain -- mistaking a system position for a `-I` one would

@@ -49,14 +49,17 @@ const DEFAULT_INCLUDE_TRACK_CAPACITY: usize = 32;
 
 /// Where on the search chain a header was found.
 ///
-/// The chain is gcc's: the `-I` directories, then the directory of headers
-/// the compiler owns (here, the bundled ones), then the system directories.
+/// The chain is gcc's: the `-iquote` directories (for the `"..."` form
+/// only), the `-I` directories, then the directory of headers the compiler
+/// owns (here, the bundled ones), then the system directories.
 /// `#include_next` resumes just after the position the current file came
 /// from, so a bundled header that forwards reaches the system's, and a `-I`
 /// header that forwards reaches the bundled one first. The variant order is
 /// the search order, which is what `Ord` compares.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SearchPos {
+    /// The `-iquote` directory at this index.
+    IQuote(usize),
     /// The `-I` directory at this index.
     Quote(usize),
     /// The bundled headers.
@@ -71,7 +74,8 @@ impl SearchPos {
     /// it, or the start of the chain for a file not found on it at all.
     pub(super) fn after(from: Option<SearchPos>) -> SearchPos {
         match from {
-            None => SearchPos::Quote(0),
+            None => SearchPos::IQuote(0),
+            Some(SearchPos::IQuote(i)) => SearchPos::IQuote(i + 1),
             Some(SearchPos::Quote(i)) => SearchPos::Quote(i + 1),
             Some(SearchPos::Bundled) => SearchPos::System(0),
             Some(SearchPos::System(i)) => SearchPos::System(i + 1),
@@ -509,6 +513,9 @@ pub struct Preprocessor<'a> {
 
     /// Include paths for angle-bracket includes
     system_include_paths: Vec<String>,
+
+    /// `-iquote`: searched for the `"..."` form only, ahead of `-I`.
+    iquote_include_paths: Vec<String>,
 
     /// Include paths for quote includes (searched first)
     quote_include_paths: Vec<String>,
@@ -1060,6 +1067,7 @@ impl<'a> Preprocessor<'a> {
             pushed_macros: HashMap::new(),
             cond_stack: Vec::with_capacity(DEFAULT_COND_STACK_CAPACITY),
             system_include_paths: Vec::with_capacity(DEFAULT_INCLUDE_PATH_CAPACITY),
+            iquote_include_paths: search.iquote.to_vec(),
             quote_include_paths: Vec::with_capacity(DEFAULT_INCLUDE_PATH_CAPACITY),
             current_file: filename.to_string(),
             base_file: filename.to_string(),
@@ -2729,6 +2737,11 @@ fn suffix_is_valid(suffix: &str) -> bool {
 /// construction, before any other option is applied.
 #[derive(Debug, Clone, Default)]
 pub struct SystemSearch<'a> {
+    /// `-iquote`: directories searched for the `"..."` form only, after the
+    /// including file's own and ahead of `-I`. Here rather than beside `-I`
+    /// in [`PreprocessConfig`] so that `.S` files, which have their own
+    /// configuration, search them too.
+    pub iquote: &'a [String],
     /// `--sysroot`: the target's directories are read from under this prefix.
     pub sysroot: Option<&'a str>,
     /// `-isystem`: system directories searched ahead of the target's own.

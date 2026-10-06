@@ -958,8 +958,15 @@ impl<'a> Parser<'a> {
                 self.advance();
                 let operand = self.parse_unary_expr()?;
                 let op_typ = operand.typ.unwrap_or(self.types.double_id);
+                // A half of a complex object stored in reverse order is
+                // stored so too, and assigning through it has to know.
                 let result_typ = if self.types.is_complex(op_typ) {
-                    self.types.complex_base(op_typ)
+                    let half = self.types.complex_base(op_typ);
+                    if self.types.reverses_storage(op_typ) {
+                        self.types.in_reverse_storage(half)
+                    } else {
+                        half
+                    }
                 } else {
                     op_typ
                 };

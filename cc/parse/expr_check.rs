@@ -1094,6 +1094,9 @@ impl Parser<'_> {
             );
             return;
         }
+        if self.check_reverse_order_address(operand, pos) {
+            return;
+        }
         // The address of a member is the address of the object it is in, so
         // `&s.a` of a `register` structure asks for the register's.
         let mut root = operand;
@@ -1119,6 +1122,37 @@ impl Parser<'_> {
                 &[&name],
             );
         }
+    }
+
+    /// gcc's restrictions on the address of an object stored in reverse
+    /// byte order (`scalar_storage_order`), which a pointer type cannot
+    /// carry: a scalar's address is an error, and an array of them draws a
+    /// warning, since gcc lets one be taken for a block copy. A struct or
+    /// union's own address is fine. True when the address was refused.
+    fn check_reverse_order_address(&self, operand: &Expr, pos: Position) -> bool {
+        let Some(typ) = operand.typ else {
+            return false;
+        };
+        if self.types.reverses_storage(typ) {
+            diag::error(
+                pos,
+                &gettext("cannot take address of scalar with reverse storage order"),
+            );
+            return true;
+        }
+        let is_array = self.types.kind(typ) == TypeKind::Array && !self.types.is_vector(typ);
+        if is_array
+            && self
+                .types
+                .reverses_storage(self.types.innermost_element(typ))
+            && diag::warning_group_enabled("scalar-storage-order")
+        {
+            diag::warning(
+                pos,
+                &gettext("address of array with reverse scalar storage order requested"),
+            );
+        }
+        false
     }
 
     /// Report a target that cannot be assigned to or stepped (C17 6.5.16p2,

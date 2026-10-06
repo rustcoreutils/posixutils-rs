@@ -16,7 +16,7 @@ use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Linkage, Namespace, Symbol, SymbolId, SymbolTable};
 use crate::token::lexer::{IdentTable, Position, SpecialToken, Token, TokenType, TokenValue};
-use crate::token::preprocess::PackAction;
+use crate::token::preprocess::{LayoutPragma, PackAction, StorageOrderPragma};
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers, TypeTable};
 use gettextrs::gettext;
 use std::collections::{BTreeMap, HashMap};
@@ -320,17 +320,21 @@ pub struct Parser<'a> {
     /// Where a `[*]` was written directly in the parameter list being
     /// parsed; see [`ParameterList::star`].
     pub(super) star_in_params: Option<Position>,
-    /// `#pragma pack` directives, and where they stood in the token stream.
+    /// `#pragma pack` and `#pragma scalar_storage_order` directives, and
+    /// where they stood in the token stream.
     ///
-    /// Sorted by index; `pack_cursor` is how far the parser has consumed
+    /// Sorted by index; `layout_cursor` is how far the parser has consumed
     /// them. A directive takes effect for every structure defined after it,
     /// so applying them lazily as the parse position passes each one gives
     /// exactly the right answer without a second traversal.
-    pack_directives: Vec<(usize, PackAction)>,
-    pack_cursor: usize,
+    layout_pragmas: Vec<(usize, LayoutPragma)>,
+    layout_cursor: usize,
     /// The alignment cap currently in force, and the `push`ed stack of caps.
     pack_current: Option<u32>,
     pack_stack: Vec<Option<u32>>,
+    /// The storage order `#pragma scalar_storage_order` gives a struct or
+    /// union whose own attributes name none.
+    storage_order_current: StorageOrderPragma,
     /// Typedef names that specify a variably modified type, and how many
     /// run-time extents each carries (C17 6.7.7).
     ///
@@ -359,7 +363,7 @@ pub struct Parser<'a> {
 impl<'a> Parser<'a> {
     /// Create a new parser with a symbol table and type table.
     ///
-    /// `pack_directives` comes from `extract_pragma_directives`, which every
+    /// `layout_pragmas` comes from `extract_pragma_directives`, which every
     /// caller must run over the preprocessed stream: it removes the pragma
     /// markers the preprocessor leaves behind as well as reporting them, and
     /// a stream still carrying them is not one this parser can read.
@@ -368,7 +372,7 @@ impl<'a> Parser<'a> {
         idents: &'a IdentTable,
         symbols: &'a mut SymbolTable,
         types: &'a mut TypeTable,
-        pack_directives: Vec<(usize, PackAction)>,
+        layout_pragmas: Vec<(usize, LayoutPragma)>,
     ) -> Self {
         Self {
             tokens,
@@ -399,8 +403,8 @@ impl<'a> Parser<'a> {
             linked_names: std::collections::HashMap::new(),
             param_list_depth: 0,
             star_in_params: None,
-            pack_directives,
-            pack_cursor: 0,
+            layout_pragmas,
+            layout_cursor: 0,
             vm_typedefs: HashMap::new(),
             library_call_policy: Default::default(),
             switch_depth: 0,
@@ -408,6 +412,7 @@ impl<'a> Parser<'a> {
             next_local_label: 0,
             pack_current: None,
             pack_stack: Vec::new(),
+            storage_order_current: StorageOrderPragma::Default,
         }
     }
 
@@ -425,31 +430,50 @@ impl<'a> Parser<'a> {
     /// treating it as a reset -- would silently change the layout of every
     /// structure after an unbalanced pragma.
     pub(super) fn current_pack(&mut self) -> Option<u32> {
+        self.apply_layout_pragmas();
+        self.pack_current
+    }
+
+    /// The storage order `#pragma scalar_storage_order` puts on a struct or
+    /// union defined here.
+    pub(super) fn current_storage_order(&mut self) -> StorageOrderPragma {
+        self.apply_layout_pragmas();
+        self.storage_order_current
+    }
+
+    /// Apply every layout pragma the parse position has now passed.
+    fn apply_layout_pragmas(&mut self) {
         while self
-            .pack_directives
-            .get(self.pack_cursor)
+            .layout_pragmas
+            .get(self.layout_cursor)
             .is_some_and(|(idx, _)| *idx <= self.pos)
         {
-            let (_, action) = self.pack_directives[self.pack_cursor];
-            self.pack_cursor += 1;
-            match action {
-                PackAction::Set(n) => self.pack_current = n,
-                PackAction::Push(n) => {
-                    self.pack_stack.push(self.pack_current);
-                    if n.is_some() {
-                        self.pack_current = n;
-                    }
-                }
-                PackAction::Pop => match self.pack_stack.pop() {
-                    Some(prev) => self.pack_current = prev,
-                    None => diag::warning(
-                        self.current_pos(),
-                        &gettext("'#pragma pack(pop)' with no matching push"),
-                    ),
-                },
+            let (_, pragma) = self.layout_pragmas[self.layout_cursor];
+            self.layout_cursor += 1;
+            match pragma {
+                LayoutPragma::Pack(action) => self.apply_pack(action),
+                LayoutPragma::StorageOrder(order) => self.storage_order_current = order,
             }
         }
-        self.pack_current
+    }
+
+    fn apply_pack(&mut self, action: PackAction) {
+        match action {
+            PackAction::Set(n) => self.pack_current = n,
+            PackAction::Push(n) => {
+                self.pack_stack.push(self.pack_current);
+                if n.is_some() {
+                    self.pack_current = n;
+                }
+            }
+            PackAction::Pop => match self.pack_stack.pop() {
+                Some(prev) => self.pack_current = prev,
+                None => diag::warning(
+                    self.current_pos(),
+                    &gettext("'#pragma pack(pop)' with no matching push"),
+                ),
+            },
+        }
     }
 
     // Token Navigation

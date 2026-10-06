@@ -15,6 +15,7 @@ use super::ast::ExprKind;
 use super::parser::Parser;
 use crate::diag;
 use crate::symbol::Namespace;
+use crate::target::ByteOrder;
 use crate::token::lexer::{payload_text, Position, TokenType};
 use crate::types::{TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
@@ -293,6 +294,34 @@ impl AttributeList {
     /// `__attribute__((packed))`, in either spelling.
     pub(super) fn has_packed(&self) -> bool {
         self.has_attr("packed")
+    }
+
+    /// The byte order `__attribute__((scalar_storage_order("...")))` names,
+    /// or `None` when the attribute is absent.
+    ///
+    /// An argument that names no order is gcc's error, reported here, and
+    /// the attribute is then ignored.
+    pub(super) fn storage_order(&self, pos: Position) -> Option<ByteOrder> {
+        let attr = self.find("scalar_storage_order")?;
+        match attr.args.as_slice() {
+            [AttributeArg::String(s)] if s == "big-endian" => Some(ByteOrder::BigEndian),
+            [AttributeArg::String(s)] if s == "little-endian" => Some(ByteOrder::LittleEndian),
+            [_] => {
+                diag::error(
+                    pos,
+                    "attribute 'scalar_storage_order' argument must be one of 'big-endian' or 'little-endian'",
+                );
+                None
+            }
+            _ => {
+                diag::error_args(
+                    pos,
+                    "wrong number of arguments specified for '{0}' attribute",
+                    &["scalar_storage_order"],
+                );
+                None
+            }
+        }
     }
 
     /// Whether an attribute is present, in either spelling.
@@ -1135,6 +1164,13 @@ impl Parser<'_> {
                 }
                 if attrs.has_transparent_union() {
                     self.pending_transparent_union = Some(self.current_pos());
+                }
+                // A struct or union's order is written in its specifier; on
+                // a declaration or declarator gcc ignores it, and says so.
+                if attrs.find("scalar_storage_order").is_some()
+                    && diag::warning_group_enabled(ATTRIBUTE_WARNING)
+                {
+                    diag::warning_args(pos, "'{0}' attribute ignored", &["scalar_storage_order"]);
                 }
                 self.pending_packed |= attrs.has_packed();
                 self.merge_symbol_attrs(&attrs);

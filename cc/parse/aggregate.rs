@@ -15,7 +15,9 @@ use super::parser::{DeclaratorContext, ParseError, ParseResult, ParsedDeclarator
 use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Namespace, Symbol, SymbolId};
+use crate::target::ByteOrder;
 use crate::token::lexer::{Position, TokenType, TokenValue};
+use crate::token::preprocess::StorageOrderPragma;
 use crate::types::{
     CompositeType, EnumConstant, MemberAlign, StructMember, Type, TypeId, TypeKind, TypeModifiers,
 };
@@ -426,6 +428,9 @@ impl Parser<'_> {
         let mut is_transparent = early_attrs.has_transparent_union();
         // Track struct-level aligned attribute (max across all positions)
         let mut struct_align: Option<u32> = early_attrs.get_alignment();
+        // `scalar_storage_order`, accepted at the same three positions; the
+        // last one written decides, as in gcc.
+        let mut storage_order = early_attrs.storage_order(specifier_pos);
 
         // Parse __attribute__ after tag name but before '{'
         let pre_attrs = self.parse_attributes();
@@ -434,6 +439,7 @@ impl Parser<'_> {
         if let Some(a) = pre_attrs.get_alignment() {
             struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
         }
+        storage_order = pre_attrs.storage_order(specifier_pos).or(storage_order);
 
         // Check for definition vs forward reference
         if self.is_special(b'{') {
@@ -457,8 +463,10 @@ impl Parser<'_> {
             if let Some(a) = attrs.get_alignment() {
                 struct_align = Some(struct_align.map_or(a, |e| e.max(a)));
             }
+            storage_order = attrs.storage_order(specifier_pos).or(storage_order);
 
             self.check_flexible_array_members(&members, is_union);
+            self.apply_storage_order(&mut members, storage_order);
 
             // Compute layout. `__attribute__((packed))` on the struct or union
             // is `packed` on every member, which is how gcc defines it; a
@@ -598,7 +606,7 @@ impl Parser<'_> {
                         TypeKind::Struct
                     };
                     self.check_tag_kind(tag_name, existing, kind);
-                    Ok(self.types.get(existing).clone())
+                    Ok(self.in_written_storage_order(existing, storage_order))
                 } else {
                     // Create new incomplete type and register it in symbol table
                     // This ensures that when the type is completed later, we can update
@@ -957,6 +965,64 @@ impl Parser<'_> {
                 &[&width.to_string()],
             );
         }
+    }
+
+    /// Give the members of the struct or union being defined the storage
+    /// order its `scalar_storage_order` attribute names, or failing that the
+    /// one `#pragma scalar_storage_order` has in force.
+    ///
+    /// Only an order that differs from the target's changes anything, and
+    /// only for the members gcc counts as scalars -- see
+    /// [`crate::types::TypeTable::in_reverse_storage`]. The order is a
+    /// property of the member types from here on: everything that reads or
+    /// writes a member learns it from the type it accesses the member at.
+    fn apply_storage_order(&mut self, members: &mut [StructMember], written: Option<ByteOrder>) {
+        let order = match written {
+            Some(order) => order,
+            None => match self.current_storage_order() {
+                StorageOrderPragma::Order(order) => order,
+                StorageOrderPragma::Default => return,
+            },
+        };
+        if order == self.types.target().byte_order() {
+            return;
+        }
+        for member in members {
+            member.typ = self.types.in_reverse_storage(member.typ);
+        }
+    }
+
+    /// The struct or union `typ` as a reference to it with a
+    /// `scalar_storage_order` attribute sees it: gcc's variant of the type
+    /// in that order -- `typedef struct S __attribute__((...)) BE;` -- which
+    /// has the same members and layout and is not compatible with `typ` when
+    /// the order differs. Without an attribute, or with the order the type
+    /// already has, the type itself.
+    fn in_written_storage_order(&mut self, typ: TypeId, written: Option<ByteOrder>) -> Type {
+        let mut variant = self.types.get(typ).clone();
+        let Some(order) = written else {
+            return variant;
+        };
+        let reverse = order != self.types.target().byte_order();
+        let Some(composite) = variant.composite.as_deref_mut() else {
+            return variant;
+        };
+        let mut changed = false;
+        for member in &mut composite.members {
+            let typ = if reverse {
+                self.types.in_reverse_storage(member.typ)
+            } else {
+                self.types.in_native_storage(member.typ)
+            };
+            changed |= typ != member.typ;
+            member.typ = typ;
+        }
+        if changed {
+            // A type of its own, not a copy of the tag's: interning a copy
+            // answers with the tag's `TypeId`, which has the other order.
+            composite.tag_type = None;
+        }
+        variant
     }
 
     fn check_flexible_array_members(&self, members: &[StructMember], is_union: bool) {

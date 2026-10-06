@@ -388,6 +388,15 @@ bitflags::bitflags! {
         // where any vector of integer lanes of that shape takes it -- so
         // `unsigned_v = a < b` is valid where `unsigned_v = signed_v` is not.
         const VECTOR_MASK = 1 << 20;
+
+        // A scalar stored in the byte order opposite to the target's: a
+        // member, or an element of an array member, of a struct or union
+        // whose `scalar_storage_order` differs from the target's. Every load
+        // of such an object swaps its bytes after reading them and every
+        // store swaps them before writing (see `Linearizer::emit`). Not part
+        // of what makes two types compatible, and dropped by lvalue
+        // conversion: only an *object* is stored in an order, never a value.
+        const REVERSE_ORDER = 1 << 21;
     }
 }
 
@@ -788,7 +797,8 @@ impl Type {
             .union(REDUNDANT_SIZE)
             .union(Self::DECL_SPECIFIERS)
             .union(TypeModifiers::MS_VA_LIST)
-            .union(TypeModifiers::VECTOR_MASK);
+            .union(TypeModifiers::VECTOR_MASK)
+            .union(TypeModifiers::REVERSE_ORDER);
 
         // Compare modifiers (ignoring top-level qualifiers)
         let self_mods = self.modifiers.difference(ignored);
@@ -2721,13 +2731,87 @@ impl TypeTable {
     /// *value* an lvalue yields: `volatile int v; v + 0` has type `int`, and
     /// nothing downstream may conclude from the sum's type that the addition
     /// touched a volatile object.
+    ///
+    /// The storage order goes with them: a value read out of a big-endian
+    /// member is an ordinary number, and an rvalue that kept the order would
+    /// make `__auto_type v = s.m;` a local stored back to front.
     pub fn unqualified(&mut self, id: TypeId) -> TypeId {
-        if self.qualifiers(id).is_empty() {
+        let dropped = Type::QUALIFIERS.union(TypeModifiers::REVERSE_ORDER);
+        if !self.modifiers(id).intersects(dropped) {
             return id;
         }
         let mut unqualified = self.get(id).clone();
-        unqualified.modifiers.remove(Type::QUALIFIERS);
+        unqualified.modifiers.remove(dropped);
         self.intern(unqualified)
+    }
+
+    /// Is an object of type `id` stored in the byte order opposite to the
+    /// target's? See [`TypeModifiers::REVERSE_ORDER`].
+    pub fn reverses_storage(&self, id: TypeId) -> bool {
+        self.modifiers(id).contains(TypeModifiers::REVERSE_ORDER)
+    }
+
+    /// The type a member declared as `id` has in a struct or union whose
+    /// scalars are stored in the reverse of the target's byte order.
+    ///
+    /// gcc's rule: the order reaches the scalar members -- integers, enums,
+    /// floating and complex types -- and the elements of an array of them,
+    /// at any depth. It does not reach a pointer or a vector, which gcc does
+    /// not count as scalars here, nor a struct or union, which has the order
+    /// its own type was defined with.
+    pub fn in_reverse_storage(&mut self, id: TypeId) -> TypeId {
+        if self.kind(id) == TypeKind::Array && !self.is_vector(id) {
+            let Some(elem) = self.base_type(id) else {
+                return id;
+            };
+            let reversed = self.in_reverse_storage(elem);
+            if reversed == elem {
+                return id;
+            }
+            let mut array = self.get(id).clone();
+            array.base = Some(reversed);
+            return self.intern(array);
+        }
+        if !self.is_arithmetic(id) || self.reverses_storage(id) {
+            return id;
+        }
+        let mut reversed = self.get(id).clone();
+        reversed.modifiers |= TypeModifiers::REVERSE_ORDER;
+        self.intern(reversed)
+    }
+
+    /// `id` stored in the target's own byte order, through arrays: the
+    /// inverse of [`Self::in_reverse_storage`]. An object declared from the
+    /// type of a member -- `typeof (s.m) v;` -- is an ordinary object.
+    pub fn in_native_storage(&mut self, id: TypeId) -> TypeId {
+        if self.kind(id) == TypeKind::Array && !self.is_vector(id) {
+            let Some(elem) = self.base_type(id) else {
+                return id;
+            };
+            let native = self.in_native_storage(elem);
+            if native == elem {
+                return id;
+            }
+            let mut array = self.get(id).clone();
+            array.base = Some(native);
+            return self.intern(array);
+        }
+        if !self.reverses_storage(id) {
+            return id;
+        }
+        let mut native = self.get(id).clone();
+        native.modifiers.remove(TypeModifiers::REVERSE_ORDER);
+        self.intern(native)
+    }
+
+    /// The innermost element of an array type, or `id` itself.
+    pub fn innermost_element(&self, id: TypeId) -> TypeId {
+        match self.base_type(id) {
+            Some(elem) if self.kind(id) == TypeKind::Array && !self.is_vector(id) => {
+                self.innermost_element(elem)
+            }
+            _ => id,
+        }
     }
 
     /// Whether `id` is an unsigned integer type.
@@ -5827,5 +5911,49 @@ mod tests {
         let plain = t.intern(Type::array(t.int_id, 3));
         assert_eq!(t.base_type(bare), Some(plain));
         assert_eq!(t.qualified_with(bare, TypeModifiers::CONST), grid);
+    }
+
+    /// The storage order reaches the scalars a struct stores -- through
+    /// arrays of them -- and nothing else; it is not part of compatibility,
+    /// and an rvalue never carries it.
+    #[test]
+    fn reverse_storage_reaches_scalars_only() {
+        use crate::target::{Arch, Os};
+        let mut t = TypeTable::new(&Target::new(Arch::X86_64, Os::Linux));
+        let int = t.int_id;
+        let rev_int = t.in_reverse_storage(int);
+        assert!(t.reverses_storage(rev_int));
+        assert!(!t.reverses_storage(int));
+        assert_eq!(t.in_reverse_storage(rev_int), rev_int, "idempotent");
+        assert!(t.types_compatible(int, rev_int));
+        assert_eq!(t.size_bytes(rev_int), 4);
+
+        // Not a pointer, and not a struct.
+        let ptr = t.intern(Type::pointer(int));
+        assert_eq!(t.in_reverse_storage(ptr), ptr);
+        let s = t.intern(Type::struct_type(CompositeType::incomplete(None)));
+        assert_eq!(t.in_reverse_storage(s), s);
+
+        // An array's elements, at every depth.
+        let row = t.intern(Type::array(int, 3));
+        let grid = t.intern(Type::array(row, 2));
+        let rev_grid = t.in_reverse_storage(grid);
+        assert!(!t.reverses_storage(rev_grid));
+        assert_eq!(t.innermost_element(rev_grid), rev_int);
+        assert_eq!(t.in_native_storage(rev_grid), grid);
+
+        // Floating and complex types are scalars too.
+        let dbl = t.double_id;
+        let rev_dbl = t.in_reverse_storage(dbl);
+        assert!(t.reverses_storage(rev_dbl));
+        let cplx = t.make_complex(dbl);
+        let rev_cplx = t.in_reverse_storage(cplx);
+        assert!(t.reverses_storage(rev_cplx));
+
+        // Lvalue conversion drops the order along with the qualifiers.
+        let const_rev = t.qualified_with(rev_int, TypeModifiers::CONST);
+        assert!(t.reverses_storage(const_rev));
+        assert_eq!(t.unqualified(const_rev), int);
+        assert_eq!(t.unqualified(rev_int), int);
     }
 }

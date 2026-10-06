@@ -1257,6 +1257,12 @@ impl<'a> Linearizer<'a> {
     /// Add an instruction to the current basic block
     pub(crate) fn emit(&mut self, insn: Instruction) {
         let insn = self.mark_volatile_access(insn);
+        // An access to a scalar stored in reverse byte order becomes an
+        // access in the target's order and a swap: the one place it can be
+        // done for every access, as for the volatile marker above.
+        let Some(insn) = self.reverse_order_access(insn) else {
+            return;
+        };
         let insn = self.displacement_in_range(insn);
         if let Some(bb_id) = self.current_bb {
             // Attach current source position for debug info
@@ -2935,6 +2941,16 @@ impl<'a> Linearizer<'a> {
     /// bits gets them dereferenced as an address. Which crash you got depended
     /// on the syntax at the use site.
     pub(crate) fn complex_operand_addr(&mut self, expr: &Expr) -> PseudoId {
+        let addr = self.complex_storage_addr(expr);
+        let typ = self.expr_type(expr);
+        self.complex_in_native_order(addr, typ)
+    }
+
+    /// The address of the storage `expr` names, for an lvalue, or of its
+    /// materialized value otherwise -- what [`Self::complex_operand_addr`]
+    /// reads, and what `__real__ z = v` writes through, in whatever order
+    /// the object is stored in.
+    fn complex_storage_addr(&mut self, expr: &Expr) -> PseudoId {
         let is_lvalue = matches!(
             expr.kind,
             ExprKind::Ident(_)
@@ -3080,6 +3096,13 @@ impl<'a> Linearizer<'a> {
     pub(crate) fn read_object(&mut self, place: ObjectPlace, typ: TypeId) -> PseudoId {
         if self.reject_incomplete_object(typ) {
             return self.emit_const(0, self.types.int_id);
+        }
+        if self.types.is_complex(typ) && self.types.reverses_storage(typ) {
+            let addr = match place {
+                ObjectPlace::Sym(sym) => self.rvalue_addr(sym, typ),
+                ObjectPlace::At(base, offset) => self.offset_address(base, offset),
+            };
+            return self.complex_in_native_order(addr, typ);
         }
         if self.object_reads_as_address(typ) {
             return match place {
@@ -3266,7 +3289,7 @@ impl<'a> Linearizer<'a> {
                 operand,
             } => {
                 let op_typ = self.expr_type(operand);
-                let addr = self.complex_operand_addr(operand);
+                let addr = self.complex_storage_addr(operand);
                 if *op == UnaryOp::Real || !self.types.is_complex(op_typ) {
                     return addr;
                 }
@@ -7253,6 +7276,10 @@ mod test_linearize_init;
 #[cfg(test)]
 #[path = "test_linearize_memory.rs"]
 mod test_linearize_memory;
+
+#[cfg(test)]
+#[path = "test_linearize_storage_order.rs"]
+mod test_linearize_storage_order;
 
 #[cfg(test)]
 #[path = "test_linearize_vector.rs"]

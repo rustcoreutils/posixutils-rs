@@ -1100,6 +1100,7 @@ define_keywords! {
     (_, "ms_abi",                  SUPPORTED_ATTR | X86_64_ONLY),
     (_, "mode",                    SUPPORTED_ATTR),
     (_, "vector_size",             SUPPORTED_ATTR),
+    (_, "scalar_storage_order",    SUPPORTED_ATTR),
     // Parsed and ignored. Recognised so that a build does not drown in
     // warnings for the attributes glibc's headers put on everything; each
     // is semantically free, or free enough that ignoring it cannot change
@@ -1157,6 +1158,7 @@ define_keywords! {
     (_, "__ms_abi__",                SUPPORTED_ATTR | X86_64_ONLY),
     (_, "__mode__",                  SUPPORTED_ATTR),
     (_, "__vector_size__",           SUPPORTED_ATTR),
+    (_, "__scalar_storage_order__",  SUPPORTED_ATTR),
     (_, "__nonnull__",               SUPPORTED_ATTR),
     (_, "__returns_nonnull__",       SUPPORTED_ATTR),
     (_, "__nothrow__",               SUPPORTED_ATTR),

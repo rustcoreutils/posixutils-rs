@@ -54,6 +54,8 @@ mod test_parser;
 #[cfg(test)]
 mod test_specifiers;
 #[cfg(test)]
+mod test_storage_order;
+#[cfg(test)]
 mod test_vectors;
 
 // Re-export parser used by main.rs

@@ -1346,7 +1346,20 @@ impl<'a> Preprocessor<'a> {
                             // because that is the only ordering that survives
                             // include splicing.
                             let mut marker = Token::new(TokenType::Pragma, pos);
-                            marker.value = TokenValue::String(action.encode());
+                            marker.value = TokenValue::String(LayoutPragma::Pack(action).encode());
+                            output.push(marker);
+                        }
+                        self.skip_to_eol(iter);
+                        return;
+                    } else if name == "scalar_storage_order" {
+                        // Layout too, and carried the same way. Read from
+                        // the line's text, which spells `big-endian` whole
+                        // where its tokens are `big`, `-` and `endian`.
+                        let pos = self.remap_pos(token.pos);
+                        let body = verbatim.strip_prefix("#pragma").unwrap_or(&verbatim);
+                        if let Some(pragma) = parse_pragma_text(body, pos) {
+                            let mut marker = Token::new(TokenType::Pragma, pos);
+                            marker.value = TokenValue::String(pragma.encode());
                             output.push(marker);
                         }
                         self.skip_to_eol(iter);
@@ -1497,7 +1510,7 @@ impl<'a> Preprocessor<'a> {
             let pos = self.remap_pos(token.pos);
             let mut marker = Token::new(TokenType::Pragma, pos);
             marker.value = TokenValue::String(match parse_pragma_text(body, token.pos) {
-                Some(action) => action.encode(),
+                Some(pragma) => pragma.encode(),
                 // Not one c17 acts on, so it travels as the directive it
                 // stands for. C99 6.10.9p1 makes `_Pragma("x")` mean
                 // `#pragma x`, and the operand is a string literal, so the

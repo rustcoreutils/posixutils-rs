@@ -149,7 +149,7 @@ pub fn compile_tokens(
     // point at which the order is the translation unit's own -- an include is
     // preprocessed separately and spliced in, so nothing recorded earlier
     // survives with a usable index.
-    let pack_directives = token::preprocess::extract_pragma_directives(&mut preprocessed);
+    let layout_pragmas = token::preprocess::extract_pragma_directives(&mut preprocessed);
 
     // Parse (this also binds symbols to the symbol table)
     let mut parser = Parser::new(
@@ -157,7 +157,7 @@ pub fn compile_tokens(
         strings,
         &mut symbols,
         &mut types,
-        pack_directives,
+        layout_pragmas,
     );
     parser.set_library_call_policy(parse::LibraryCallPolicy {
         optimizing: opts.optimization.optimizes(),

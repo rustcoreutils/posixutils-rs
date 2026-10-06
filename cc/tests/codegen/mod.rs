@@ -49,6 +49,7 @@ mod scaling;
 mod sections;
 mod simd_headers;
 mod stacked_args;
+mod storage_order;
 mod symbols;
 mod tls_models;
 mod trapping_folds;

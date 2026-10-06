@@ -1223,7 +1223,11 @@ impl<'a> Parser<'a> {
                     // The operand's declaration contributes its type and
                     // qualifiers, never its storage class: `static int g;
                     // typeof(g) c;` declares an automatic `c`.
-                    resolved = Some(Resolved::Id(self.types.without_decl_specifiers(typ)));
+                    // Nor its storage order: an object declared from a
+                    // member's type is an ordinary one, as in gcc, where the
+                    // order belongs to the struct and not the member type.
+                    let typ = self.types.without_decl_specifiers(typ);
+                    resolved = Some(Resolved::Id(self.types.in_native_storage(typ)));
                     vm_dims = dims;
                 }
                 crate::kw::GNU_AUTO_TYPE => {

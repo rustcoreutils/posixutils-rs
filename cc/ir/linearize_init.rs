@@ -19,6 +19,7 @@ use crate::parse::ast::{
 };
 use crate::strings::StringId;
 use crate::symbol::Linkage;
+use crate::target::ByteOrder;
 use crate::token::lexer::Position;
 use crate::types::{MemberInfo, Type, TypeId, TypeKind, TypeModifiers, TypeTable};
 use std::collections::{BTreeMap, HashMap};
@@ -59,36 +60,50 @@ const OVERFLOW_WARNING: &str = "overflow";
 /// generally starts earlier -- `unsigned a:1` after a `char` sits at bit 8 of
 /// a span based at byte 0 -- and writing the whole span would blank the
 /// members sharing it.
+///
+/// `order` is the order the field's struct stores its scalars in, which
+/// decides the end of each byte the field's bits are counted from: the least
+/// significant for little-endian, the most significant for big-endian, where
+/// the field's own most significant bit comes first.
 fn bitfield_carrier_bytes(
     bit_offset: u32,
     bit_width: u32,
     value: i128,
-) -> impl Iterator<Item = (usize, u8, u8)> {
+    order: ByteOrder,
+) -> Vec<(usize, u8, u8)> {
     // A field with no bits, or one no carrier could hold, occupies no byte.
-    // Otherwise the mask comes of shifting `u128::MAX` down rather than
-    // `1 << width` up, for the reason `bitfield_value_mask` records: the
-    // latter overflows at the carrier's own width.
-    let fits = bit_width > 0 && u64::from(bit_offset) + u64::from(bit_width) <= 128;
-    let (shift, width_mask) = if fits {
-        (bit_offset, u128::MAX >> (128 - bit_width))
-    } else {
-        (0, 0)
-    };
-    let placed = ((value as u128) & width_mask) << shift;
-    let owned = width_mask << shift;
-    let bytes = if fits {
-        (bit_offset / 8) as usize..((bit_offset + bit_width - 1) / 8) as usize + 1
-    } else {
-        0..0
-    };
-    bytes.map(move |byte| {
-        let shift = byte * 8;
-        (
-            byte,
-            ((placed >> shift) & 0xff) as u8,
-            ((owned >> shift) & 0xff) as u8,
-        )
-    })
+    if bit_width == 0 || u64::from(bit_offset) + u64::from(bit_width) > 128 {
+        return Vec::new();
+    }
+    let value = value as u128;
+    let (lo, hi) = (bit_offset, bit_offset + bit_width);
+    (lo / 8..hi.div_ceil(8))
+        .map(|byte| {
+            let (mut bits, mut mask) = (0u8, 0u8);
+            for t in 0..8 {
+                // Bit `t` of the byte, counted from its least significant,
+                // is bit `place` of the object, counted in `order`.
+                let place = match order {
+                    ByteOrder::LittleEndian => byte * 8 + t,
+                    ByteOrder::BigEndian => byte * 8 + 7 - t,
+                };
+                if !(lo..hi).contains(&place) {
+                    continue;
+                }
+                // And bit `j` of the value, which runs up from the field's
+                // first bit, or down from it.
+                let j = match order {
+                    ByteOrder::LittleEndian => place - lo,
+                    ByteOrder::BigEndian => hi - 1 - place,
+                };
+                mask |= 1 << t;
+                if (value >> j) & 1 != 0 {
+                    bits |= 1 << t;
+                }
+            }
+            (byte as usize, bits, mask)
+        })
+        .collect()
 }
 
 /// The bytes a bit-field member's own bits occupy, measured from the first
@@ -320,6 +335,16 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// computable at load time, where emitting the relocation wrote eight
     /// bytes over a one-byte object and its neighbours.
     pub(crate) fn ast_init_to_ir(&mut self, expr: &Expr, typ: TypeId) -> Initializer {
+        let init = self.ast_init_in_native_order(expr, typ);
+        self.in_storage_order(init, typ)
+    }
+
+    /// [`Self::ast_init_to_ir`], with the value in the target's byte order
+    /// whatever order `typ` is stored in: what a bit-field's initializer
+    /// needs, since its bits are placed by the struct's own lowering, and
+    /// what a conversion or a conditional folds to before the one reversal
+    /// at the end.
+    fn ast_init_in_native_order(&mut self, expr: &Expr, typ: TypeId) -> Initializer {
         let init = self.ast_init_value(expr, typ);
         let is_address = matches!(
             init,
@@ -498,7 +523,7 @@ impl<'a> super::linearize::Linearizer<'a> {
             }
 
             // Cast expression - evaluate the inner expression
-            ExprKind::Cast { expr: inner, .. } => self.ast_init_to_ir(inner, typ),
+            ExprKind::Cast { expr: inner, .. } => self.ast_init_in_native_order(inner, typ),
 
             // Initializer list for arrays/structs
             ExprKind::InitList { elements } => self.ast_init_list_to_ir(elements, typ),
@@ -659,8 +684,8 @@ impl<'a> super::linearize::Linearizer<'a> {
             // value of the true arm, so folding it needs no temporary.
             ExprKind::CondElvis { cond, else_expr } => {
                 match self.const_condition(cond) {
-                    Some(true) => return self.ast_init_to_ir(cond, typ),
-                    Some(false) => return self.ast_init_to_ir(else_expr, typ),
+                    Some(true) => return self.ast_init_in_native_order(cond, typ),
+                    Some(false) => return self.ast_init_in_native_order(else_expr, typ),
                     None => self.reject_initializer(cond),
                 }
                 Initializer::None
@@ -673,8 +698,8 @@ impl<'a> super::linearize::Linearizer<'a> {
                 else_expr,
             } => {
                 match self.const_condition(cond) {
-                    Some(true) => return self.ast_init_to_ir(then_expr, typ),
-                    Some(false) => return self.ast_init_to_ir(else_expr, typ),
+                    Some(true) => return self.ast_init_in_native_order(then_expr, typ),
+                    Some(false) => return self.ast_init_in_native_order(else_expr, typ),
                     None => self.reject_initializer(cond),
                 }
                 Initializer::None
@@ -1995,7 +2020,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         let Initializer::Int(value) = later.init else {
             return None;
         };
-        bitfield_carrier_bytes(bit_offset, bit_width, value)
+        bitfield_carrier_bytes(bit_offset, bit_width, value, self.bit_order(later.typ))
+            .into_iter()
             .map(|(byte, bits, _)| {
                 let inner = (later.offset + byte).checked_sub(union_start)?;
                 Some((inner, 1, Initializer::Int(i128::from(bits))))
@@ -2037,7 +2063,8 @@ impl<'a> super::linearize::Linearizer<'a> {
         let Some(base) = later.offset.checked_sub(earlier.offset + offset) else {
             return false;
         };
-        for (byte, bits, mask) in bitfield_carrier_bytes(bit_offset, bit_width, value) {
+        let order = self.bit_order(later.typ);
+        for (byte, bits, mask) in bitfield_carrier_bytes(bit_offset, bit_width, value, order) {
             if !replace_carrier_bits(fields, base + byte, bits, mask) {
                 return false;
             }
@@ -2177,6 +2204,11 @@ impl<'a> super::linearize::Linearizer<'a> {
                             StructFieldVisitKind::BraceElision(sub_elements) => {
                                 self.ast_init_list_to_ir(&sub_elements, visit.typ)
                             }
+                            // A bit-field's value is placed bit by bit
+                            // below, in the struct's order.
+                            StructFieldVisitKind::Expr(expr) if visit.bit_width.is_some() => {
+                                self.ast_init_in_native_order(&expr, visit.typ)
+                            }
                             StructFieldVisitKind::Expr(expr) => {
                                 self.ast_init_to_ir(&expr, visit.typ)
                             }
@@ -2228,7 +2260,10 @@ impl<'a> super::linearize::Linearizer<'a> {
                         let Initializer::Int(value) = field.init else {
                             continue;
                         };
-                        for (byte, bits, _) in bitfield_carrier_bytes(bit_off, bit_width, value) {
+                        let order = self.bit_order(field.typ);
+                        for (byte, bits, _) in
+                            bitfield_carrier_bytes(bit_off, bit_width, value, order)
+                        {
                             *bitfield_bytes.entry(field.offset + byte).or_default() |= bits;
                         }
                     }
@@ -2926,6 +2961,23 @@ mod tests {
     use crate::symbol::SymbolTable;
     use crate::target::Target;
     use crate::types::Type;
+
+    /// A bit-field's bytes, counted from the least significant bit of each
+    /// byte for a little-endian struct and from the most significant for a
+    /// big-endian one: gcc's 20230630-2 shape, `short i : 12` then
+    /// `char c : 1`, holding 341 and 1.
+    #[test]
+    fn a_bitfields_bits_are_placed_in_its_structs_order() {
+        let little = |k, w, v| bitfield_carrier_bytes(k, w, v, ByteOrder::LittleEndian);
+        let big = |k, w, v| bitfield_carrier_bytes(k, w, v, ByteOrder::BigEndian);
+        assert_eq!(little(0, 12, 341), vec![(0, 0x55, 0xff), (1, 0x01, 0x0f)]);
+        assert_eq!(little(12, 1, 1), vec![(1, 0x10, 0x10)]);
+        assert_eq!(big(0, 12, 341), vec![(0, 0x15, 0xff), (1, 0x50, 0xf0)]);
+        assert_eq!(big(12, 1, 1), vec![(1, 0x08, 0x08)]);
+        // Wider than the carrier can hold, or no bits at all: no bytes.
+        assert!(big(120, 16, 1).is_empty());
+        assert!(big(3, 0, 1).is_empty());
+    }
 
     /// A positional initializer element holding an `int` constant.
     fn positional(value: i64, types: &TypeTable) -> InitElement {

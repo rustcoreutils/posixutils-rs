@@ -35,6 +35,7 @@ mod linearize_emit;
 mod linearize_init;
 mod linearize_label_diff;
 mod linearize_stmt;
+mod linearize_storage_order;
 mod linearize_vector;
 pub mod loadfwd;
 pub mod lower;

@@ -607,6 +607,16 @@ impl TlsAccess {
     }
 }
 
+/// The order in which the bytes of a multi-byte scalar lie in memory: what
+/// gcc's `scalar_storage_order` attribute and pragma name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteOrder {
+    /// Most significant byte first.
+    BigEndian,
+    /// Least significant byte first.
+    LittleEndian,
+}
+
 /// Target configuration
 #[derive(Debug, Clone)]
 pub struct Target {
@@ -687,6 +697,15 @@ impl Target {
     pub fn little_endian(&self) -> bool {
         match self.arch {
             Arch::X86_64 | Arch::Aarch64 => true,
+        }
+    }
+
+    /// The order this target stores the bytes of a scalar in.
+    pub fn byte_order(&self) -> ByteOrder {
+        if self.little_endian() {
+            ByteOrder::LittleEndian
+        } else {
+            ByteOrder::BigEndian
         }
     }
 

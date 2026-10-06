@@ -56,6 +56,10 @@ struct State {
     /// --quiet: do not report the block count
     quiet: bool,
     format: Option<Format>,
+    /// The spelling the archive was named with: -F, -I or -O
+    archive_option: Option<char>,
+    /// -E: the file of patterns, for copy-in only
+    pattern_file: Option<OsString>,
     operands: Vec<OsString>,
 }
 
@@ -70,6 +74,8 @@ impl State {
             null: false,
             quiet: false,
             format: None,
+            archive_option: None,
+            pattern_file: None,
             operands: Vec::new(),
         }
     }
@@ -151,7 +157,10 @@ fn apply_value(c: char, value: &OsStr, st: &mut State) -> PaxResult<()> {
     match c {
         // -F names one archive for either direction; -I and -O are the
         // input-only and output-only spellings of the same thing.
-        'F' | 'I' | 'O' => st.args.archive = Some(PathBuf::from(value)),
+        'F' | 'I' | 'O' => {
+            st.args.archive = Some(PathBuf::from(value));
+            st.archive_option = Some(c);
+        }
         'C' => {
             let size = parse_number(PROG, "-C", value)?;
             if size == 0 || size > u32::MAX as u64 {
@@ -166,10 +175,7 @@ fn apply_value(c: char, value: &OsStr, st: &mut State) -> PaxResult<()> {
             st.args.blocksize = Some(size as u32);
         }
         'H' => st.format = Some(archive_format(value)?),
-        'E' => st
-            .args
-            .files_and_patterns
-            .extend(read_name_list(value, false)?),
+        'E' => st.pattern_file = Some(value.to_owned()),
         'R' => return Err(unsupported(PROG, "-R", "ownership cannot be reassigned")),
         'M' => return Err(unsupported(PROG, "-M", "no multi-volume media prompts")),
         _ => unreachable!("takes_arg and apply_value disagree about -{}", c),
@@ -295,6 +301,8 @@ fn finish(mut st: State) -> PaxResult<Args> {
         st.args.name_lists.push(NameList::stdin(b'\0'));
     }
 
+    check_mode_options(&st, mode)?;
+
     match mode {
         Mode::CopyOut => {
             if !st.operands.is_empty() {
@@ -311,6 +319,11 @@ fn finish(mut st: State) -> PaxResult<Args> {
                 st.args.read_mode = true;
             }
             st.args.files_and_patterns.extend(st.operands);
+            if let Some(file) = &st.pattern_file {
+                st.args
+                    .files_and_patterns
+                    .extend(read_name_list(file, false)?);
+            }
         }
         Mode::PassThrough => {
             let [dest] = st.operands.as_slice() else {
@@ -345,6 +358,33 @@ fn finish(mut st: State) -> PaxResult<Args> {
     st.args.report_blocks = !st.quiet && mode != Mode::PassThrough;
 
     Ok(st.args)
+}
+
+/// Refuse the options that mean nothing in `mode`, as GNU cpio does.
+///
+/// -I names an archive to read and -O one to write, and pass-through has no
+/// archive at all. -E is a file of patterns for selecting members, which only
+/// copy-in has. Each of these used to be taken some other way: `-o -I x`
+/// overwrote x with the new archive, and -E in copy-out or pass-through became
+/// the list of files, with the one on standard input ignored.
+fn check_mode_options(st: &State, mode: Mode) -> PaxResult<()> {
+    let name = match mode {
+        Mode::CopyOut => "-o",
+        Mode::CopyIn => "-i",
+        Mode::PassThrough => "-p",
+    };
+    let archive_fits = |c: char| match mode {
+        Mode::CopyOut => c != 'I',
+        Mode::CopyIn => c != 'O',
+        Mode::PassThrough => false,
+    };
+    if let Some(c) = st.archive_option.filter(|&c| !archive_fits(c)) {
+        return Err(usage(PROG, format!("-{} is meaningless with {}", c, name)));
+    }
+    if st.pattern_file.is_some() && mode != Mode::CopyIn {
+        return Err(usage(PROG, format!("-E is meaningless with {}", name)));
+    }
+    Ok(())
 }
 
 const USAGE: &str = "\
@@ -487,9 +527,9 @@ mod tests {
 
     #[test]
     fn test_archive_file_spellings_are_equivalent() {
-        for opt in ["-F", "-I", "-O"] {
+        for (mode, opt) in [("-o", "-F"), ("-o", "-O"), ("-i", "-F"), ("-i", "-I")] {
             assert_eq!(
-                cpio(&["-o", opt, "a.cpio"]).unwrap().archive.as_deref(),
+                cpio(&[mode, opt, "a.cpio"]).unwrap().archive.as_deref(),
                 Some(Path::new("a.cpio"))
             );
         }
@@ -497,6 +537,19 @@ mod tests {
             cpio(&["-o", "--file=a.cpio"]).unwrap().archive.as_deref(),
             Some(Path::new("a.cpio"))
         );
+    }
+
+    /// -I with copy-out used to name the output and overwrite it; -E outside
+    /// copy-in replaced the name list. GNU cpio refuses both.
+    #[test]
+    fn test_options_meaningless_in_a_mode_are_refused() {
+        assert!(cpio(&["-o", "-I", "a.cpio"]).is_err());
+        assert!(cpio(&["-i", "-O", "a.cpio"]).is_err());
+        for opt in ["-F", "-I", "-O"] {
+            assert!(cpio(&["-p", opt, "a.cpio", "dest"]).is_err());
+        }
+        assert!(cpio(&["-o", "-E", "pats"]).is_err());
+        assert!(cpio(&["-p", "-E", "pats", "dest"]).is_err());
     }
 
     #[test]

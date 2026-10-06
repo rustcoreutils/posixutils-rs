@@ -10,8 +10,8 @@
 //! Integration tests for the `cpio` compatibility front-end.
 
 use crate::common::{
-    assert_failure, assert_success, run_cpio, run_front_end, run_system_ok, stderr_str, stdout_str,
-    system_tool,
+    assert_failure, assert_success, run_cpio, run_front_end, run_pax_with_stdin_bytes_in_dir,
+    run_system_ok, stderr_str, stdout_str, system_tool, CpioNewc,
 };
 use plib::tmp::TempDir;
 use std::fs;
@@ -494,4 +494,171 @@ fn test_cpio_pass_read_only_directory() {
     let _ = fs::set_permissions(dst.join("ro"), fs::Permissions::from_mode(0o755));
     assert_success(&out, "cpio -pd of a read-only directory");
     assert_eq!(copied.unwrap(), "F\n");
+}
+
+/// (st_dev, st_ino) of a name, not following a symbolic link.
+fn file_id(path: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::symlink_metadata(path).unwrap();
+    (meta.dev(), meta.ino())
+}
+
+/// A newc link set of two names, `a` and `b`, sharing c_ino 5: each carries
+/// the body given.
+fn newc_pair(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let link = |name, body| CpioNewc {
+        name,
+        body,
+        ino: 5,
+        nlink: 2,
+        ..Default::default()
+    };
+    let mut archive = link(b"a", a).member();
+    archive.extend_from_slice(&link(b"b", b).archive());
+    archive
+}
+
+/// Every unlinked member used to take a c_ino of its own, so once the field's
+/// range had gone by -- 65535 members in the old binary format cpio writes by
+/// default -- every later link set was written unlinked and came back as
+/// separate files. Here one file named 65540 times uses the range up.
+#[test]
+fn test_cpio_links_survive_past_the_c_ino_range() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("f"), "f\n").unwrap();
+    fs::write(src.join("zz_a"), "linked\n").unwrap();
+    fs::hard_link(src.join("zz_a"), src.join("zz_b")).unwrap();
+
+    let mut list = "f\n".repeat(65_540);
+    list.push_str("zz_a\nzz_b\n");
+    let out = run_cpio(&["-o", "--quiet"], &src, list.as_bytes());
+    assert_success(&out, "cpio -o of 65542 names");
+
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+    assert_success(&run_cpio(&["-id", "zz_*"], &dst, &out.stdout), "cpio -id");
+    assert_eq!(file_id(&dst.join("zz_a")), file_id(&dst.join("zz_b")));
+    assert_eq!(fs::read_to_string(dst.join("zz_b")).unwrap(), "linked\n");
+}
+
+/// A name list can reach a file's names more often than its link count --
+/// `find` output with a name repeated. The repeat must keep the set's c_ino,
+/// and the reader must still know the set when it arrives, or the pair is
+/// split on extraction.
+#[test]
+fn test_cpio_repeated_name_stays_linked() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir(&src).unwrap();
+    fs::write(src.join("a"), "hello\n").unwrap();
+    fs::hard_link(src.join("a"), src.join("b")).unwrap();
+
+    let out = run_cpio(&["-o", "-H", "odc", "--quiet"], &src, b"a\nb\nb\n");
+    assert_success(&out, "cpio -o naming b twice");
+
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+    let res = run_pax_with_stdin_bytes_in_dir(&["-r"], &out.stdout, &dst);
+    assert_success(&res, "pax -r");
+    assert_eq!(file_id(&dst.join("a")), file_id(&dst.join("b")));
+    assert_eq!(fs::read_to_string(dst.join("b")).unwrap(), "hello\n");
+}
+
+/// Members sharing (c_dev, c_ino) with c_nlink 2 whose data differs are not
+/// names of one file -- writers that truncate inode numbers make such
+/// collisions. Each must keep its own data rather than the second becoming a
+/// link to the first.
+#[test]
+fn test_cpio_colliding_inode_with_different_data_is_not_linked() {
+    let temp = TempDir::new().unwrap();
+    let archive = newc_pair(b"AAAA\n", b"BBBBBBBB\n");
+
+    assert_success(&run_cpio(&["-id"], temp.path(), &archive), "cpio -id");
+    assert_eq!(fs::read_to_string(temp.path().join("a")).unwrap(), "AAAA\n");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("b")).unwrap(),
+        "BBBBBBBB\n"
+    );
+    assert_ne!(
+        file_id(&temp.path().join("a")),
+        file_id(&temp.path().join("b"))
+    );
+
+    // The listing agrees: b is not shown as a link to a.
+    let out = run_pax_with_stdin_bytes_in_dir(&["-v"], &archive, temp.path());
+    assert_success(&out, "pax -v");
+    assert!(!stdout_str(&out).contains("=="), "{}", stdout_str(&out));
+}
+
+/// newc stores a link set's data with its last name only. When that name is
+/// not extracted -- not selected, kept by -k, renamed away by -s -- the data
+/// must still reach the earlier names, not leave them empty.
+#[test]
+fn test_cpio_newc_set_data_reaches_earlier_names_when_last_is_skipped() {
+    let archive = newc_pair(b"", b"hello\n");
+
+    let temp = TempDir::new().unwrap();
+    assert_success(
+        &run_cpio(&["-id", "a"], temp.path(), &archive),
+        "cpio -id a",
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("a")).unwrap(),
+        "hello\n"
+    );
+    assert!(!temp.path().join("b").exists());
+
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("b"), "keep\n").unwrap();
+    let out = run_pax_with_stdin_bytes_in_dir(&["-r", "-k"], &archive, temp.path());
+    assert_success(&out, "pax -r -k");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("a")).unwrap(),
+        "hello\n"
+    );
+    assert_eq!(fs::read_to_string(temp.path().join("b")).unwrap(), "keep\n");
+
+    let temp = TempDir::new().unwrap();
+    let out = run_pax_with_stdin_bytes_in_dir(&["-r", "-s", ",^b$,,"], &archive, temp.path());
+    assert_success(&out, "pax -r -s");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("a")).unwrap(),
+        "hello\n"
+    );
+    // Nothing is left behind but the extracted name.
+    let names: Vec<_> = fs::read_dir(temp.path()).unwrap().collect();
+    assert_eq!(names.len(), 1);
+}
+
+/// -I names the input archive; copy-out has none. GNU cpio refuses the
+/// combination, and accepting it as the output silently truncated the file.
+#[test]
+fn test_cpio_copy_out_refuses_input_archive() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+    fs::write(src.join("x"), "precious\n").unwrap();
+
+    let out = run_cpio(&["-o", "-I", "x"], &src, NAME_LIST.as_bytes());
+    assert_failure(&out, "cpio -o -I");
+    assert_eq!(fs::read_to_string(src.join("x")).unwrap(), "precious\n");
+}
+
+/// -E is a file of patterns for copy-in. In copy-out and pass-through it used
+/// to become the list of names, with the one on standard input ignored.
+#[test]
+fn test_cpio_pattern_file_only_in_copy_in() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+    fs::write(src.join("pats"), "./sub/b.txt\n").unwrap();
+    fs::create_dir(temp.path().join("dest")).unwrap();
+
+    let out = run_cpio(&["-o", "-E", "pats"], &src, NAME_LIST.as_bytes());
+    assert_failure(&out, "cpio -o -E");
+    assert!(out.stdout.is_empty());
+
+    let out = run_cpio(&["-p", "-E", "pats", "../dest"], &src, NAME_LIST.as_bytes());
+    assert_failure(&out, "cpio -p -E");
+    assert_eq!(fs::read_dir(temp.path().join("dest")).unwrap().count(), 0);
 }

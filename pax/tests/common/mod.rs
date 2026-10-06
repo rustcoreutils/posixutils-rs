@@ -156,28 +156,35 @@ pub fn run_program(program: &Path, args: &[&str], dir: &Path, stdin_data: Option
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn {}: {}", name, e));
 
-    {
-        // Dropping stdin closes it, so a child reading a name list from a pipe
-        // sees EOF instead of blocking forever.
-        let mut stdin = child.stdin.take().expect("stdin was piped");
-        if let Some(data) = stdin_data {
-            match stdin.write_all(data) {
-                Ok(()) => {}
-                // A front-end that rejects its command line exits before it
-                // ever reads the name list, which closes the read end of this
-                // pipe. That is the behavior under test, so losing the write is
-                // the expected outcome, not a harness failure. Whether the
-                // write lands at all is a race the child usually loses on
-                // macOS and usually wins on Linux.
-                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-                Err(e) => panic!("failed to write stdin to {}: {}", name, e),
-            }
-        }
-    }
+    // Fed from a thread of its own: a child that writes its output while
+    // still reading -- cpio archiving a long name list -- would otherwise fill
+    // its stdout pipe while this side is still blocked filling its stdin.
+    // Dropping stdin closes it, so a child reading a name list from a pipe
+    // sees EOF instead of blocking forever.
+    let mut stdin = child.stdin.take().expect("stdin was piped");
+    let data = stdin_data.map(<[u8]>::to_vec);
+    let feeder = std::thread::spawn(move || match data {
+        Some(data) => match stdin.write_all(&data) {
+            Ok(()) => Ok(()),
+            // A front-end that rejects its command line exits before it ever
+            // reads the name list, which closes the read end of this pipe.
+            // That is the behavior under test, so losing the write is the
+            // expected outcome, not a harness failure. Whether the write lands
+            // at all is a race the child usually loses on macOS and usually
+            // wins on Linux.
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(e) => Err(e),
+        },
+        None => Ok(()),
+    });
 
-    child
+    let output = child
         .wait_with_output()
-        .unwrap_or_else(|e| panic!("failed to wait for {}: {}", name, e))
+        .unwrap_or_else(|e| panic!("failed to wait for {}: {}", name, e));
+    if let Err(e) = feeder.join().expect("stdin feeder panicked") {
+        panic!("failed to write stdin to {}: {}", name, e);
+    }
+    output
 }
 
 /// Whether `program` writes its first `record` bytes of output while its

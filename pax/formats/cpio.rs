@@ -303,11 +303,12 @@ pub struct CpioWriter<W: Write> {
     format: CpioFormat,
     bytes_written: u64,
     current_size: u64,
-    /// The last c_ino handed out
-    inode_counter: u64,
-    /// c_ino given to each multiply-linked file, by its (dev, ino) on disk,
-    /// with the count of its names still to come
-    link_inos: HashMap<(u64, u64), (u64, u32)>,
+    /// The last c_ino given to a member that is its file's only name
+    single_ino: u64,
+    /// The last c_ino given to a multiply-linked file
+    linked_ino: u64,
+    /// c_ino given to each multiply-linked file, by its (dev, ino) on disk
+    link_inos: HashMap<(u64, u64), u64>,
 }
 
 impl<W: Write> CpioWriter<W> {
@@ -318,7 +319,8 @@ impl<W: Write> CpioWriter<W> {
             format,
             bytes_written: 0,
             current_size: 0,
-            inode_counter: 0,
+            single_ino: 0,
+            linked_ino: format.max_ino() + 1,
             link_inos: HashMap::new(),
         }
     }
@@ -329,33 +331,42 @@ impl<W: Write> CpioWriter<W> {
     /// for names of one file, so the real inode number will not do: the
     /// fields are narrower than it, and two unrelated files whose numbers
     /// agree in the bits kept would be merged into one -- whichever came
-    /// second losing its data. Every member is numbered afresh instead, as
-    /// libarchive does, and the names of one file share the number its first
-    /// name was given. A number past what the field holds is recorded with a
-    /// c_nlink of one, so it cannot join anything.
+    /// second losing its data. Numbers are archive-local instead, and the
+    /// names of one file share the number its first name was given, for the
+    /// whole archive: a name list may name a file more often than it has
+    /// links.
+    ///
+    /// Only multiply-linked files need a number no other set has. They count
+    /// down from the top of the field, and every other member -- which no
+    /// reader joins to anything -- counts up from the bottom, wrapping, so an
+    /// archive of any number of members still links its sets. Should the sets
+    /// alone outnumber the field, the file is stored unlinked, and said so.
     fn archive_ids(&mut self, entry: &ArchiveEntry) -> (u64, u64) {
-        let key = (entry.dev, entry.ino);
         let linked = entry.entry_type != EntryType::Directory && entry.nlink > 1;
-        if linked {
-            if let Some((ino, remaining)) = self.link_inos.get_mut(&key) {
-                let ino = *ino;
-                *remaining -= 1;
-                if *remaining == 0 {
-                    self.link_inos.remove(&key);
-                }
-                return (ino, header_nlink(entry));
-            }
+        if !linked {
+            return (self.next_single_ino(), header_nlink(entry));
         }
 
-        self.inode_counter += 1;
-        let ino = self.inode_counter;
-        if ino > self.format.max_ino() {
-            return (ino, 1);
+        let key = (entry.dev, entry.ino);
+        if let Some(&ino) = self.link_inos.get(&key) {
+            return (ino, header_nlink(entry));
         }
-        if linked {
-            self.link_inos.insert(key, (ino, entry.nlink - 1));
+        if self.linked_ino <= 1 {
+            crate::error::report_error(
+                &entry.path,
+                "too many linked files for the cpio c_ino field; stored without its links",
+            );
+            return (self.next_single_ino(), 1);
         }
-        (ino, header_nlink(entry))
+        self.linked_ino -= 1;
+        self.link_inos.insert(key, self.linked_ino);
+        (self.linked_ino, header_nlink(entry))
+    }
+
+    /// The next c_ino for a member no other one is a name of.
+    fn next_single_ino(&mut self) -> u64 {
+        self.single_ino = self.single_ino % self.format.max_ino() + 1;
+        self.single_ino
     }
 
     /// Emit `n` NUL bytes of alignment padding (`n` is under 4 by construction)
@@ -818,12 +829,21 @@ fn parse_mode_type(mode: u32) -> EntryType {
 // ============================================================================
 
 /// Device major/minor packed into a single traditional cpio c_rdev field.
-fn packed_rdev(entry: &ArchiveEntry) -> u64 {
-    if entry.is_device() {
-        pack_rdev(entry.devmajor, entry.devminor)
-    } else {
-        0
+///
+/// That field holds eight bits of each. A device whose numbers are wider is
+/// refused rather than stored masked, which would restore it as some other
+/// device.
+fn packed_rdev(entry: &ArchiveEntry) -> PaxResult<u64> {
+    if !entry.is_device() {
+        return Ok(0);
     }
+    if entry.devmajor > 0xff || entry.devminor > 0xff {
+        return Err(PaxError::InvalidHeader(format!(
+            "device number {},{} does not fit the odc or binary cpio format",
+            entry.devmajor, entry.devminor
+        )));
+    }
+    Ok(pack_rdev(entry.devmajor, entry.devminor))
 }
 
 /// The packing itself, for a caller holding the numbers rather than an entry --
@@ -856,8 +876,7 @@ fn build_odc_header(
     // c_dev (identity only; mask on overflow — large real dev numbers are normal)
     write_octal_field_masked(&mut header, entry.dev, 6);
 
-    // c_ino (archive-local; one too wide is masked, and archive_ids has
-    // already recorded it as unlinked so the mask cannot merge it with another)
+    // c_ino (archive-local; archive_ids keeps it within the field)
     write_octal_field_masked(&mut header, ino, 6);
 
     // c_mode (file type + permissions)
@@ -874,7 +893,7 @@ fn build_odc_header(
     write_octal_field(&mut header, nlink, 6)?;
 
     // c_rdev (device major/minor for block/char devices)
-    write_octal_field(&mut header, packed_rdev(entry), 6)?;
+    write_octal_field(&mut header, packed_rdev(entry)?, 6)?;
 
     // c_mtime
     write_octal_field(&mut header, entry.unsigned_mtime()?, 11)?;
@@ -965,7 +984,7 @@ fn build_bin_header(
     push_u16(entry.uid as u64 & 0xffff);
     push_u16(entry.gid as u64 & 0xffff);
     push_u16(nlink & 0xffff);
-    push_u16(packed_rdev(entry));
+    push_u16(packed_rdev(entry)?);
 
     let mtime = entry.unsigned_mtime()?;
     if mtime > u32::MAX as u64 {
@@ -1287,7 +1306,8 @@ mod tests {
     /// Two unrelated linked files whose inode numbers agree in the 18 bits an
     /// odc c_ino holds used to be written with the same (c_dev, c_ino), and a
     /// reader merged them -- the second losing its data. Numbering is now
-    /// archive-local: one number per file, shared by all its names.
+    /// archive-local: one number per file, shared by all its names -- also a
+    /// name met more often than the file has links.
     #[test]
     fn test_archive_ids_never_merge_unrelated_files() {
         let mut w = CpioWriter::with_format(Vec::new(), CpioFormat::Odc);
@@ -1298,8 +1318,7 @@ mod tests {
         assert_ne!(a1, b1);
         assert_eq!(w.archive_ids(&a), (a1, 2));
         assert_eq!(w.archive_ids(&b), (b1, 2));
-        // Both sets are complete, so nothing is held for them any more.
-        assert!(w.link_inos.is_empty());
+        assert_eq!(w.archive_ids(&b), (b1, 2), "a repeated name keeps the set");
 
         // A directory's link count names no other member.
         let dir = ArchiveEntry {
@@ -1311,16 +1330,53 @@ mod tests {
         assert_ne!(d1, d2);
     }
 
-    /// Past what the field holds, a number would be masked onto an earlier
-    /// one; such a member is recorded unlinked so it cannot join that one.
+    /// Members that are their file's only name used to use the field up: past
+    /// 65535 of them in the old binary format, every link set was written
+    /// unlinked. They no longer take numbers from the sets.
     #[test]
-    fn test_archive_ids_unlink_a_number_past_the_field() {
+    fn test_archive_ids_unlinked_members_leave_sets_their_numbers() {
         let mut w = CpioWriter::with_format(Vec::new(), CpioFormat::Binary);
-        w.inode_counter = CpioFormat::Binary.max_ino() - 1;
-        assert_eq!(w.archive_ids(&linked(1, 7, 2)), (0xffff, 2));
-        assert_eq!(w.archive_ids(&linked(1, 8, 2)), (0x1_0000, 1));
-        // The set numbered in range still links.
-        assert_eq!(w.archive_ids(&linked(1, 7, 2)), (0xffff, 2));
+        for _ in 0..0x1_0004 {
+            let (ino, nlink) = w.archive_ids(&linked(1, 3, 1));
+            assert!((1..=0xffff).contains(&ino));
+            assert_eq!(nlink, 1);
+        }
+        let (ino, nlink) = w.archive_ids(&linked(1, 7, 2));
+        assert_eq!(nlink, 2);
+        assert_eq!(w.archive_ids(&linked(1, 7, 2)), (ino, 2));
+    }
+
+    /// When the sets alone outnumber the field, a further set is recorded
+    /// unlinked -- a number shared with another set would merge the two --
+    /// and the sets numbered before it still link.
+    #[test]
+    fn test_archive_ids_unlink_a_set_past_the_field() {
+        let mut w = CpioWriter::with_format(Vec::new(), CpioFormat::Binary);
+        w.linked_ino = 2;
+        assert_eq!(w.archive_ids(&linked(1, 7, 2)), (1, 2));
+        assert_eq!(w.archive_ids(&linked(1, 8, 2)).1, 1);
+        assert_eq!(w.archive_ids(&linked(1, 7, 2)), (1, 2));
+    }
+
+    /// The traditional c_rdev holds eight bits each of major and minor; a
+    /// wider device number used to be masked onto some other device.
+    #[test]
+    fn test_wide_device_numbers_are_refused_by_odc_and_binary() {
+        let device = |devmajor, devminor| ArchiveEntry {
+            path: PathBuf::from("dev"),
+            entry_type: EntryType::CharDevice,
+            devmajor,
+            devminor,
+            ..Default::default()
+        };
+        for (major, minor) in [(300, 1), (1, 300)] {
+            assert!(build_odc_header(&device(major, minor), (1, 1), 4).is_err());
+            assert!(build_bin_header(&device(major, minor), (1, 1), 4).is_err());
+        }
+        assert!(build_odc_header(&device(255, 255), (1, 1), 4).is_ok());
+        assert!(build_bin_header(&device(255, 255), (1, 1), 4).is_ok());
+        // newc has a field for each, and stores them whole.
+        assert!(build_newc_header(&device(300, 300), (1, 1), 4, CpioFormat::Newc).is_ok());
     }
 
     #[test]

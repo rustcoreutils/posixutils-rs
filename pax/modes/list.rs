@@ -105,13 +105,10 @@ pub(crate) fn listing_error(e: std::io::Error) -> PaxError {
 /// first listed name of the set. `None` for any other member, which starts a set
 /// if it is the first name of one.
 fn link_set_target(link_sets: &mut LinkSets<PathBuf>, entry: &ArchiveEntry) -> Option<PathBuf> {
-    let key = LinkSets::<PathBuf>::key(entry)?;
-    if let Some(first) = link_sets.get_mut(key) {
-        let first = first.clone();
-        link_sets.name_seen(key);
-        return Some(first);
+    if let Some(first) = link_sets.find_mut(entry) {
+        return Some(first.clone());
     }
-    link_sets.insert(key, entry.nlink, entry.path.clone());
+    link_sets.insert(entry, || entry.path.clone());
     None
 }
 

@@ -360,14 +360,14 @@ pub trait ArchiveWriter {
 /// Tracks hard links during archive creation and copying.
 ///
 /// A file is remembered for the whole run, not only until `nlink` of its
-/// names have gone by as cpio's [`LinkSets`] does: a name list can reach the
-/// same name twice (`find tree | pax -w` lists it and walks it), and a file
-/// forgotten before the repeat would be stored again in full -- splitting a
-/// hard-linked pair on extraction, depending on the order.
+/// names have gone by: a name list can reach the same name twice (`find tree |
+/// pax -w` lists it and walks it), and a file forgotten before the repeat would
+/// be stored again in full -- splitting a hard-linked pair on extraction,
+/// depending on the order.
 #[derive(Debug, Default)]
 pub struct HardLinkTracker {
-    /// The first path each file was stored under
-    sets: LinkSets<PathBuf>,
+    /// The first path each file was stored under, by (dev, ino)
+    stored: HashMap<(u64, u64), PathBuf>,
 }
 
 impl HardLinkTracker {
@@ -382,7 +382,7 @@ impl HardLinkTracker {
         if nlink <= 1 {
             return None;
         }
-        self.sets.get((dev, ino)).cloned()
+        self.stored.get(&(dev, ino)).cloned()
     }
 
     /// Note that a file's first name has been stored, as `stored`: the archive
@@ -393,8 +393,10 @@ impl HardLinkTracker {
     /// its data was read made every later name of an unreadable file a link
     /// to a member that was never written.
     pub fn record(&mut self, dev: u64, ino: u64, nlink: u32, stored: &Path) {
-        if nlink > 1 && self.sets.get((dev, ino)).is_none() {
-            self.sets.insert((dev, ino), nlink, stored.to_path_buf());
+        if nlink > 1 {
+            self.stored
+                .entry((dev, ino))
+                .or_insert_with(|| stored.to_path_buf());
         }
     }
 }
@@ -408,14 +410,37 @@ impl HardLinkTracker {
 /// subdirectories. Only cpio records a link count, so for every other format
 /// this finds nothing.
 ///
+/// A set is remembered for the whole archive, as GNU cpio does, not only until
+/// c_nlink of its names have gone by: a name list may name a file more often
+/// than it has links, and the repeat would otherwise be extracted as a file of
+/// its own, splitting the set.
+///
+/// The key alone is not trusted. Writers that truncate inode numbers to the
+/// field -- GNU cpio, and this pax before archive-local numbering -- give
+/// unrelated files the same one. A member bringing data that differs in size,
+/// mode or modification time from the data the set already has is therefore
+/// no name of it.
+///
 /// `T` is what the caller remembers about a set: the names extraction created
-/// for it, the first name a listing showed. A set is forgotten once all c_nlink
-/// of its names have gone by, so what is held is bounded by the sets still
-/// open rather than by the size of the archive.
+/// for it, the first name a listing showed.
 #[derive(Debug)]
 pub struct LinkSets<T> {
-    /// Maps (dev, ino) to what was remembered and how many names are to come
-    sets: HashMap<(u64, u64), (T, u32)>,
+    sets: HashMap<(u64, u64), LinkSet<T>>,
+}
+
+/// One set of [`LinkSets`].
+#[derive(Debug)]
+struct LinkSet<T> {
+    /// What the caller remembered
+    value: T,
+    /// The (size, mode, mtime) of the first of its names to carry data. newc
+    /// stores the data with the last name only, the earlier ones empty.
+    data: Option<(u64, u32, i64)>,
+}
+
+/// The (size, mode, mtime) a member carrying data brings, if it brings any.
+fn data_shape(entry: &ArchiveEntry) -> Option<(u64, u32, i64)> {
+    (entry.size > 0).then_some((entry.size, entry.mode, entry.mtime))
 }
 
 impl<T> Default for LinkSets<T> {
@@ -427,36 +452,35 @@ impl<T> Default for LinkSets<T> {
 }
 
 impl<T> LinkSets<T> {
-    /// The set `entry` is a name of, or `None` for a member that is not one of
-    /// several names of a file.
-    pub fn key(entry: &ArchiveEntry) -> Option<(u64, u64)> {
+    /// The key of the set `entry` would be a name of, or `None` for a member
+    /// that is not one of several names of a file.
+    fn key(entry: &ArchiveEntry) -> Option<(u64, u64)> {
         (entry.entry_type == EntryType::Regular && entry.nlink > 1)
             .then_some((entry.dev, entry.ino))
     }
 
-    /// What was remembered about a set an earlier name started.
-    pub fn get(&self, key: (u64, u64)) -> Option<&T> {
-        self.sets.get(&key).map(|(value, _)| value)
+    /// What was remembered about the set an earlier name started, when
+    /// `entry` is a later name of it. A member whose data differs from the
+    /// set's is not, and gets `None` like a member of no set.
+    pub fn find_mut(&mut self, entry: &ArchiveEntry) -> Option<&mut T> {
+        let set = self.sets.get_mut(&Self::key(entry)?)?;
+        match (set.data, data_shape(entry)) {
+            (Some(have), Some(this)) if have != this => return None,
+            (None, this) => set.data = this,
+            _ => {}
+        }
+        Some(&mut set.value)
     }
 
-    /// What was remembered about a set an earlier name started, to update.
-    pub fn get_mut(&mut self, key: (u64, u64)) -> Option<&mut T> {
-        self.sets.get_mut(&key).map(|(value, _)| value)
-    }
-
-    /// Start a set at its first name; `nlink` counts that name too.
-    pub fn insert(&mut self, key: (u64, u64), nlink: u32, value: T) {
-        self.sets.insert(key, (value, nlink.saturating_sub(1)));
-    }
-
-    /// Note that one more name of a started set has gone by, forgetting the
-    /// set once the last has.
-    pub fn name_seen(&mut self, key: (u64, u64)) {
-        if let Some((_, remaining)) = self.sets.get_mut(&key) {
-            *remaining = remaining.saturating_sub(1);
-            if *remaining == 0 {
-                self.sets.remove(&key);
-            }
+    /// Start a set at `entry`, its first name. Nothing happens for a member
+    /// that is not one of several names of a file, or whose set has already
+    /// started -- which `find_mut` turned away for its differing data.
+    pub fn insert(&mut self, entry: &ArchiveEntry, value: impl FnOnce() -> T) {
+        if let Some(key) = Self::key(entry) {
+            self.sets.entry(key).or_insert_with(|| LinkSet {
+                value: value(),
+                data: data_shape(entry),
+            });
         }
     }
 }
@@ -495,27 +519,47 @@ mod tests {
         }
     }
 
+    fn named(ino: u64, nlink: u32, size: u64) -> ArchiveEntry {
+        ArchiveEntry {
+            size,
+            ..member(EntryType::Regular, ino, nlink)
+        }
+    }
+
     #[test]
-    fn test_link_sets_group_names_and_forget_complete_sets() {
+    fn test_link_sets_group_names_for_the_whole_archive() {
         let mut sets: LinkSets<&str> = LinkSets::default();
         // Only a regular file with more than one name belongs to a set.
-        assert_eq!(
-            LinkSets::<&str>::key(&member(EntryType::Regular, 4, 1)),
-            None
-        );
-        assert_eq!(
-            LinkSets::<&str>::key(&member(EntryType::Directory, 4, 3)),
-            None
-        );
+        sets.insert(&member(EntryType::Regular, 4, 1), || "solo");
+        assert_eq!(sets.find_mut(&member(EntryType::Regular, 4, 1)), None);
+        sets.insert(&member(EntryType::Directory, 5, 3), || "dir");
+        assert_eq!(sets.find_mut(&member(EntryType::Directory, 5, 3)), None);
 
-        let key = LinkSets::<&str>::key(&member(EntryType::Regular, 4, 3)).unwrap();
-        sets.insert(key, 3, "a");
-        assert_eq!(sets.get_mut(key).copied(), Some("a"));
-        sets.name_seen(key);
-        assert_eq!(sets.get_mut(key).copied(), Some("a"));
-        // The third name completes the set.
-        sets.name_seen(key);
-        assert_eq!(sets.get_mut(key), None);
+        sets.insert(&named(6, 2, 0), || "a");
+        // More names than the link count still join the set.
+        for _ in 0..3 {
+            assert_eq!(sets.find_mut(&named(6, 2, 0)).copied(), Some("a"));
+        }
+    }
+
+    /// Members sharing a key whose data differs are unrelated files; the
+    /// newc set whose data arrives with its last name is still one file.
+    #[test]
+    fn test_link_sets_turn_away_differing_data() {
+        let mut sets: LinkSets<&str> = LinkSets::default();
+        sets.insert(&named(7, 2, 5), || "a");
+        assert_eq!(sets.find_mut(&named(7, 2, 9)), None);
+        // Turned away, it does not replace the set either.
+        sets.insert(&named(7, 2, 9), || "b");
+        assert_eq!(sets.find_mut(&named(7, 2, 5)).copied(), Some("a"));
+        // A name with no data of its own joins whatever the set has.
+        assert_eq!(sets.find_mut(&named(7, 2, 0)).copied(), Some("a"));
+
+        sets.insert(&named(8, 3, 0), || "c");
+        assert_eq!(sets.find_mut(&named(8, 3, 0)).copied(), Some("c"));
+        assert_eq!(sets.find_mut(&named(8, 3, 6)).copied(), Some("c"));
+        // From then on the set has data, and differing data is turned away.
+        assert_eq!(sets.find_mut(&named(8, 3, 4)), None);
     }
 
     #[test]

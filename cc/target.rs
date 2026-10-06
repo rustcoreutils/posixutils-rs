@@ -79,16 +79,103 @@ impl fmt::Display for Arch {
     }
 }
 
-/// The position independence code is generated with.
+/// Which spelling of a position-independence option asked for it: gcc's
+/// `-fpic`/`-fpie` (1 in `__PIC__`) or `-fPIC`/`-fPIE` (2).
+///
+/// c17 generates the same code for both -- the unrestricted GOT access of the
+/// upper-case spelling, which is valid wherever the lower-case one is -- so
+/// the level is only ever what the macros report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PicLevel {
+    Small,
+    Large,
+}
+
+impl PicLevel {
+    /// The value of `__PIC__` and `__PIE__`.
+    pub fn macro_value(self) -> &'static str {
+        match self {
+            PicLevel::Small => "1",
+            PicLevel::Large => "2",
+        }
+    }
+}
+
+/// The position independence code is generated with: what gcc's `-fpic`
+/// family selects.
+///
+/// `-fpic`, `-fPIC`, `-fpie`, `-fPIE`, `-fno-pic`, `-fno-PIC`, `-fno-pie` and
+/// `-fno-PIE` are one option to gcc: the last one given wins, and every
+/// `-fno-` spelling means position-dependent code, PIE included. The link
+/// options (`-pie`, `-no-pie`, `-static-pie`, `-shared`) are not members.
 ///
 /// One value drives both code generation and the `__PIC__`/`__PIE__` macros
 /// that describe it, so a header that tests the macro sees the code it gets.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PositionIndependence {
-    /// Position-independent code: `-fPIC`, `-shared`, or a PIE.
-    pub pic: bool,
-    /// Code for a position-independent executable.
-    pub pie: bool,
+pub enum PositionIndependence {
+    /// Position-dependent code: `-fno-pic` and the other `-fno-` spellings.
+    #[default]
+    Absolute,
+    /// Code that can go in a shared object: `-fpic`, `-fPIC`.
+    Pic(PicLevel),
+    /// Code for a position-independent executable: `-fpie`, `-fPIE`.
+    Pie(PicLevel),
+}
+
+impl PositionIndependence {
+    /// What one member of the `-fpic` family asks for, or `None` for an
+    /// option outside it.
+    pub fn from_flag(flag: &str) -> Option<Self> {
+        Some(match flag {
+            "-fpic" => Self::Pic(PicLevel::Small),
+            "-fPIC" => Self::Pic(PicLevel::Large),
+            "-fpie" => Self::Pie(PicLevel::Small),
+            "-fPIE" => Self::Pie(PicLevel::Large),
+            "-fno-pic" | "-fno-PIC" | "-fno-pie" | "-fno-PIE" => Self::Absolute,
+            _ => return None,
+        })
+    }
+
+    /// What a compilation gets when no member of the family is given: a
+    /// large-model PIE on Linux, as Debian's gcc is configured
+    /// (`--enable-default-pie`), and position-dependent code elsewhere --
+    /// Mach-O code is position independent whatever it is told, see
+    /// [`Self::macro_level`].
+    pub fn target_default(target: &Target) -> Self {
+        match target.os {
+            Os::Linux => Self::Pie(PicLevel::Large),
+            Os::MacOS | Os::FreeBSD => Self::Absolute,
+        }
+    }
+
+    /// Whether the code is position independent.
+    pub fn is_pic(self) -> bool {
+        self != Self::Absolute
+    }
+
+    /// Whether the code is for a position-independent executable.
+    pub fn is_pie(self) -> bool {
+        matches!(self, Self::Pie(_))
+    }
+
+    /// Whether the code was asked to be able to live in a shared object
+    /// (`-fpic`, `-fPIC`), which is what gcc calls `flag_shlib`. A PIE is
+    /// position independent yet still resolves its own symbols, thread-locals
+    /// included, at link time.
+    pub fn is_shared_code(self) -> bool {
+        matches!(self, Self::Pic(_))
+    }
+
+    /// The value `__PIC__` is defined to, or `None` to leave it undefined.
+    /// Mach-O code is always position independent, and clang defines
+    /// `__PIC__` as 2 there whatever was asked.
+    pub fn macro_level(self, target: &Target) -> Option<PicLevel> {
+        match self {
+            Self::Pic(level) | Self::Pie(level) => Some(level),
+            Self::Absolute if target.os == Os::MacOS => Some(PicLevel::Large),
+            Self::Absolute => None,
+        }
+    }
 }
 
 /// `-fcf-protection`: which of Intel CET's two protections x86-64 code is
@@ -1191,6 +1278,40 @@ mod tests {
         }
         assert!(TlsAccess::MachOTlv.is_call() && TlsAccess::ElfDescriptor.is_call());
         assert!(!TlsAccess::ElfStatic.is_call());
+    }
+
+    /// The `-fpic` family: each spelling, the per-target default, and what
+    /// the macros report.
+    #[test]
+    fn test_position_independence_flags() {
+        use PositionIndependence::*;
+        let linux = Target::new(Arch::X86_64, Os::Linux);
+        let mac = Target::new(Arch::Aarch64, Os::MacOS);
+        assert_eq!(
+            PositionIndependence::from_flag("-fpic"),
+            Some(Pic(PicLevel::Small))
+        );
+        assert_eq!(
+            PositionIndependence::from_flag("-fPIE"),
+            Some(Pie(PicLevel::Large))
+        );
+        for flag in ["-fno-pic", "-fno-PIC", "-fno-pie", "-fno-PIE"] {
+            assert_eq!(PositionIndependence::from_flag(flag), Some(Absolute));
+        }
+        assert_eq!(PositionIndependence::from_flag("-pie"), None);
+        assert_eq!(
+            PositionIndependence::target_default(&linux),
+            Pie(PicLevel::Large)
+        );
+        assert_eq!(PositionIndependence::target_default(&mac), Absolute);
+        assert!(Pie(PicLevel::Small).is_pic() && !Pie(PicLevel::Small).is_shared_code());
+        assert!(Pic(PicLevel::Small).is_shared_code() && !Pic(PicLevel::Small).is_pie());
+        assert_eq!(Absolute.macro_level(&linux), None);
+        assert_eq!(Absolute.macro_level(&mac), Some(PicLevel::Large));
+        assert_eq!(
+            Pic(PicLevel::Small).macro_level(&linux),
+            Some(PicLevel::Small)
+        );
     }
 
     #[test]

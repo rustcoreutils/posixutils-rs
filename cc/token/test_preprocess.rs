@@ -2186,9 +2186,10 @@ fn test_if_conditional_operator() {
 /// independence the code is generated with.
 #[test]
 fn test_pic_macros_follow_the_configuration() {
-    let expand = |pic: bool, pie: bool, target: &Target| {
+    use crate::target::{PicLevel, PositionIndependence as P};
+    let expand = |position: P, target: &Target| {
         let config = PreprocessConfig {
-            position: crate::target::PositionIndependence { pic, pie },
+            position,
             isa: Default::default(),
             ..Default::default()
         };
@@ -2198,19 +2199,31 @@ fn test_pic_macros_follow_the_configuration() {
         get_token_strings(&out, &idents)
     };
     let linux = Target::from_triple("x86_64-unknown-linux-gnu").unwrap();
-    assert_eq!(expand(true, true, &linux), ["2", "2", "2", "2"]);
     assert_eq!(
-        expand(true, false, &linux),
+        expand(P::Pie(PicLevel::Large), &linux),
+        ["2", "2", "2", "2"]
+    );
+    // `-fpie` and `-fpic` say 1, as gcc does.
+    assert_eq!(
+        expand(P::Pie(PicLevel::Small), &linux),
+        ["1", "1", "1", "1"]
+    );
+    assert_eq!(
+        expand(P::Pic(PicLevel::Small), &linux),
+        ["1", "1", "__PIE__", "__pie__"]
+    );
+    assert_eq!(
+        expand(P::Pic(PicLevel::Large), &linux),
         ["2", "2", "__PIE__", "__pie__"]
     );
     assert_eq!(
-        expand(false, false, &linux),
+        expand(P::Absolute, &linux),
         ["__PIC__", "__pic__", "__PIE__", "__pie__"]
     );
     // Mach-O code is position independent whatever was asked.
     let darwin = Target::from_triple("aarch64-apple-darwin").unwrap();
     assert_eq!(
-        expand(false, false, &darwin),
+        expand(P::Absolute, &darwin),
         ["2", "2", "__PIE__", "__pie__"]
     );
 }

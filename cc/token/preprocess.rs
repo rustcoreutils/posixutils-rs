@@ -2818,21 +2818,23 @@ fn define_optimization_macros(pp: &mut Preprocessor, opt: crate::opt::Optimizati
 /// tests them -- inline asm and `.S` files choosing between a GOT and a direct
 /// access -- otherwise took the absolute path in position-independent code.
 ///
-/// The value is 2, the "large model" of `-fPIC`/`-fPIE`, which is what c17
-/// generates for `-fpic`/`-fpie` too. Mach-O code is always position
-/// independent, and clang defines `__PIC__` there unconditionally.
+/// The value is gcc's: 1 for `-fpic`/`-fpie`, 2 for `-fPIC`/`-fPIE` and the
+/// PIE default. Mach-O code is always position independent, and clang
+/// defines `__PIC__` there unconditionally.
 fn define_pic_macros(
     pp: &mut Preprocessor,
     target: &Target,
     pos: crate::target::PositionIndependence,
 ) {
-    if pos.pic || target.os == crate::target::Os::MacOS {
-        pp.define_macro(Macro::predefined("__PIC__", Some("2")));
-        pp.define_macro(Macro::predefined("__pic__", Some("2")));
-    }
-    if pos.pie {
-        pp.define_macro(Macro::predefined("__PIE__", Some("2")));
-        pp.define_macro(Macro::predefined("__pie__", Some("2")));
+    let Some(level) = pos.macro_level(target) else {
+        return;
+    };
+    let value = Some(level.macro_value());
+    pp.define_macro(Macro::predefined("__PIC__", value));
+    pp.define_macro(Macro::predefined("__pic__", value));
+    if pos.is_pie() {
+        pp.define_macro(Macro::predefined("__PIE__", value));
+        pp.define_macro(Macro::predefined("__pie__", value));
     }
 }
 

@@ -235,20 +235,17 @@ struct Args {
     #[arg(long = "fno-unwind-tables", help = gettext("Disable CFI unwind table generation"))]
     no_unwind_tables: bool,
 
-    /// Generate position-independent code (for shared libraries)
-    /// Set by preprocess_args() when -fPIC or -fpic is passed
-    #[arg(long = "c17-fpic", hide = true)]
-    fpic: bool,
-
-    /// Generate position-independent executable code (PIE)
-    /// Set by preprocess_args() when -fPIE or -fpie is passed
-    #[arg(long = "c17-fpie", action = clap::ArgAction::SetTrue, hide = true)]
-    fpie: bool,
-
-    /// Disable PIE code generation (GCC compatibility)
-    /// Set by preprocess_args() when -fno-pie is passed
-    #[arg(long = "c17-fno-pie", action = clap::ArgAction::SetTrue, hide = true)]
-    fno_pie: bool,
+    /// A member of gcc's `-fpic` family (`-fpic`, `-fPIC`, `-fpie`, `-fPIE`
+    /// and their `-fno-` forms), carried in its gcc spelling by
+    /// `preprocess_args_from`; the last one given wins.
+    #[arg(
+        long = "c17-pic",
+        hide = true,
+        value_name = "flag",
+        value_parser = parse_pic_flag,
+        overrides_with = "pic_flag"
+    )]
+    pic_flag: Option<target::PositionIndependence>,
 
     /// Produce a shared library
     #[arg(long = "shared", help = gettext("Produce a shared library"))]
@@ -1262,7 +1259,11 @@ fn process_file(
         );
     }
 
-    let shared_mode = producing_shared(args) || args.fpic;
+    // A shared object gets shared-object code whatever the `-fpic` family
+    // said. gcc compiles `-shared` alone as a PIE, which a shared object
+    // cannot always hold.
+    let position = position_independence(args, target);
+    let shared_mode = producing_shared(args) || position.is_shared_code();
     let codegen_opts = pipeline::CodegenOptions {
         optimization: args.optimization(),
         math_errno: !args.fno_math_errno,
@@ -1270,7 +1271,7 @@ fn process_file(
         trapping_math: !args.fno_trapping_math,
         default_visibility: args.default_visibility.as_deref(),
         shared_mode,
-        pic: position_independence(args, target).pic,
+        pic: producing_shared(args) || position.is_pic(),
         unwind_tables: !args.no_unwind_tables,
         verbose_asm: args.verbose_asm,
         cf_protection: args.cf_protection.unwrap_or_default(),
@@ -1407,10 +1408,27 @@ fn link_mode_flag(args: &Args, target: &Target) -> &'static str {
         "-shared"
     } else if has("-static-pie") {
         "-static-pie"
-    } else if has("-static") || !pie_enabled(args, target) {
+    } else if has("-static") || !link_pie(args, target) {
         "-no-pie"
     } else {
         "-pie"
+    }
+}
+
+/// Whether an executable is linked as a PIE: as the last of `-pie` and
+/// `-no-pie` says, or else as the code was compiled. gcc links a PIE by
+/// default even after `-fno-pic`, which works only if the objects happen to
+/// be position independent; c17 links position-dependent code into the
+/// executable it was compiled for.
+fn link_pie(args: &Args, target: &Target) -> bool {
+    match args
+        .linker_flags
+        .iter()
+        .rev()
+        .find(|f| *f == "-pie" || *f == "-no-pie")
+    {
+        Some(flag) => flag == "-pie",
+        None => position_independence(args, target).is_pic(),
     }
 }
 
@@ -1577,6 +1595,12 @@ fn parse_cf_protection(s: &str) -> Result<target::CfProtection, String> {
     target::CfProtection::from_level(s).ok_or_else(|| format!("invalid cf-protection level '{s}'"))
 }
 
+/// The value of the internal `--c17-pic` option: a member of the `-fpic`
+/// family, in its gcc spelling.
+fn parse_pic_flag(s: &str) -> Result<target::PositionIndependence, String> {
+    target::PositionIndependence::from_flag(s).ok_or_else(|| format!("not a -fpic option: '{s}'"))
+}
+
 /// The value of the internal `--c17-prefix-map` option: a prefix-map
 /// option in its gcc spelling, already validated by `preprocess_args_from`.
 fn parse_prefix_map(s: &str) -> Result<MapOption, String> {
@@ -1720,7 +1744,7 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     let mut i = 0;
     let mut o_flag_idx: Option<usize> = None; // index into result of the -O flag
     let mut std_flag_idx: Option<usize> = None; // index into result of the -std= value
-    let mut seen_fpic = false;
+
     // `-x LANG`: the language every operand after it is read as, until the
     // next `-x` (`none` restores reading by suffix).
     let mut lang: Option<&'static str> = None;
@@ -1860,20 +1884,9 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
                 ignored.push(format!("--c17-ignored={arg}"));
             }
             i += 1;
-        } else if arg == "-fPIC" || arg == "-fpic" {
-            // -fPIC / -fpic → --c17-fpic (internal flag) (first one only)
-            if !seen_fpic {
-                result.push("--c17-fpic".to_string());
-                seen_fpic = true;
-            }
-            i += 1;
-        } else if arg == "-fPIE" || arg == "-fpie" {
-            // -fPIE / -fpie → --c17-fpie (internal flag)
-            result.push("--c17-fpie".to_string());
-            i += 1;
-        } else if arg == "-fno-pie" {
-            // -fno-pie → --c17-fno-pie (internal flag)
-            result.push("--c17-fno-pie".to_string());
+        } else if target::PositionIndependence::from_flag(arg).is_some() {
+            // The `-fpic` family, whose last member wins.
+            result.push(format!("--c17-pic={arg}"));
             i += 1;
         } else if arg == "-shared" {
             // -shared → --shared
@@ -2074,15 +2087,10 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
         } else if arg == "-pipe" {
             // Misc GCC flags - silently ignore
             i += 1;
-        } else if arg == "-pie" {
-            // -pie enables PIE link mode
-            result.push("--c17-fpie".to_string());
-            result.push("--c17-linker-flag=-pie".to_string());
-            i += 1;
-        } else if arg == "-no-pie" {
-            // -no-pie disables PIE link mode
-            result.push("--c17-fno-pie".to_string());
-            result.push("--c17-linker-flag=-no-pie".to_string());
+        } else if arg == "-pie" || arg == "-no-pie" {
+            // Link options only: what the code is compiled as is the `-fpic`
+            // family's business, as it is gcc's. See `link_mode_flag`.
+            result.push(format!("--c17-linker-flag={arg}"));
             i += 1;
         } else if arg.starts_with("-Wl,") {
             // Handed to the host driver as written, which is what splits the
@@ -2113,10 +2121,7 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
         } else if arg == "-static" || arg == "-static-pie" {
             // For the link step, which reads them to choose its leading
             // option: see `link_mode_flag`. clap would read `-static` as the
-            // short cluster `-s -t -a ...`. A static PIE is still a PIE.
-            if arg == "-static-pie" {
-                result.push("--c17-fpie".to_string());
-            }
+            // short cluster `-s -t -a ...`.
             result.push(format!("--c17-linker-flag={arg}"));
             i += 1;
         } else if let Some(status) = answer_driver_query(arg, &raw_args) {
@@ -2741,24 +2746,14 @@ fn producing_shared(args: &Args) -> bool {
     args.shared || args.shared_object
 }
 
-/// The position independence this compilation generates code with.
+/// The position independence this compilation generates code with, and its
+/// `__PIC__`/`__PIE__` macros describe: the last of the `-fpic` family, or
+/// the target's default. `-shared` is a link option and changes neither, as
+/// in gcc; the code generator makes shared-object code of its own accord
+/// (see `process_file`).
 fn position_independence(args: &Args, target: &Target) -> target::PositionIndependence {
-    let pie = pie_enabled(args, target);
-    target::PositionIndependence {
-        pic: args.fpic || producing_shared(args) || pie,
-        pie,
-    }
-}
-
-/// Determine whether PIE should be enabled for this compilation.
-fn pie_enabled(args: &Args, target: &Target) -> bool {
-    if producing_shared(args) || args.fno_pie {
-        return false;
-    }
-    if args.fpie {
-        return true;
-    }
-    target.os == Os::Linux
+    args.pic_flag
+        .unwrap_or_else(|| target::PositionIndependence::target_default(target))
 }
 
 /// The stack the compiler runs on.
@@ -3471,14 +3466,14 @@ mod tests {
     #[test]
     fn test_preprocess_fpic_uppercase() {
         let result = run_preprocess(&["-fPIC", "foo.c"]);
-        assert!(result.contains(&"--c17-fpic".to_string()));
+        assert!(result.contains(&"--c17-pic=-fPIC".to_string()));
         assert!(!result.contains(&"-fPIC".to_string()));
     }
 
     #[test]
     fn test_preprocess_fpic_lowercase() {
         let result = run_preprocess(&["-fpic", "foo.c"]);
-        assert!(result.contains(&"--c17-fpic".to_string()));
+        assert!(result.contains(&"--c17-pic=-fpic".to_string()));
         assert!(!result.contains(&"-fpic".to_string()));
     }
 
@@ -3512,7 +3507,7 @@ mod tests {
     #[test]
     fn test_preprocess_combined() {
         let result = run_preprocess(&["-fPIC", "-shared", "-lz", "-L.", "foo.c"]);
-        assert!(result.contains(&"--c17-fpic".to_string()));
+        assert!(result.contains(&"--c17-pic=-fPIC".to_string()));
         assert!(result.contains(&"--shared".to_string()));
         assert!(result.contains(&"-l".to_string()));
         assert!(result.contains(&"z".to_string()));
@@ -3644,36 +3639,60 @@ mod tests {
         assert!(result.contains(&"foo.c".to_string()));
     }
 
+    /// The `-fpic` family is one option, the last member winning: every
+    /// `-fno-` spelling is position-dependent code, PIE included, and the link
+    /// options `-pie`, `-no-pie` and `-static-pie` are not members.
     #[test]
-    fn test_preprocess_fpie() {
-        let result = run_preprocess(&["-fPIE", "foo.c"]);
-        assert!(result.contains(&"--c17-fpie".to_string()));
+    fn test_pic_family_last_one_wins() {
+        use target::{PicLevel, PositionIndependence as P};
+        let linux = Target::new(target::Arch::X86_64, Os::Linux);
+        let position = |argv: &[&str]| {
+            let args = Args::parse_from(run_preprocess(argv));
+            position_independence(&args, &linux)
+        };
+        assert_eq!(position(&["foo.c"]), P::Pie(PicLevel::Large));
+        assert_eq!(position(&["-fpic", "foo.c"]), P::Pic(PicLevel::Small));
+        assert_eq!(position(&["-fPIE", "foo.c"]), P::Pie(PicLevel::Large));
+        for flag in ["-fno-pic", "-fno-PIC", "-fno-pie", "-fno-PIE"] {
+            assert_eq!(position(&[flag, "foo.c"]), P::Absolute, "{flag}");
+        }
+        assert_eq!(position(&["-fPIC", "-fno-pie", "foo.c"]), P::Absolute);
+        assert_eq!(
+            position(&["-fno-pic", "-fpie", "foo.c"]),
+            P::Pie(PicLevel::Small)
+        );
+        assert_eq!(
+            position(&["-fpie", "-fPIC", "foo.c"]),
+            P::Pic(PicLevel::Large)
+        );
+        for link in ["-pie", "-no-pie", "-static-pie", "-shared"] {
+            assert_eq!(
+                position(&[link, "foo.c"]),
+                P::Pie(PicLevel::Large),
+                "{link}"
+            );
+        }
+        let mac = Target::new(target::Arch::Aarch64, Os::MacOS);
+        let args = Args::parse_from(run_preprocess(&["foo.c"]));
+        assert_eq!(position_independence(&args, &mac), P::Absolute);
     }
 
     #[test]
-    fn test_preprocess_fpie_lowercase() {
-        let result = run_preprocess(&["-fpie", "foo.c"]);
-        assert!(result.contains(&"--c17-fpie".to_string()));
+    fn test_preprocess_pic_family_keeps_its_spelling() {
+        for flag in ["-fpic", "-fPIC", "-fpie", "-fPIE", "-fno-pic", "-fno-PIE"] {
+            let result = run_preprocess(&[flag, "foo.c"]);
+            assert!(result.contains(&format!("--c17-pic={flag}")), "{result:?}");
+            assert!(!result.contains(&flag.to_string()), "{result:?}");
+        }
     }
 
     #[test]
-    fn test_preprocess_fno_pie() {
-        let result = run_preprocess(&["-fno-pie", "foo.c"]);
-        assert!(result.contains(&"--c17-fno-pie".to_string()));
-    }
-
-    #[test]
-    fn test_preprocess_pie_linker_flag() {
-        let result = run_preprocess(&["-pie", "foo.c"]);
-        assert!(result.contains(&"--c17-fpie".to_string()));
-        assert!(result.contains(&"--c17-linker-flag=-pie".to_string()));
-    }
-
-    #[test]
-    fn test_preprocess_no_pie_linker_flag() {
-        let result = run_preprocess(&["-no-pie", "foo.c"]);
-        assert!(result.contains(&"--c17-fno-pie".to_string()));
-        assert!(result.contains(&"--c17-linker-flag=-no-pie".to_string()));
+    fn test_preprocess_pie_is_a_linker_flag() {
+        for flag in ["-pie", "-no-pie", "-static-pie"] {
+            let result = run_preprocess(&[flag, "foo.c"]);
+            assert!(result.contains(&format!("--c17-linker-flag={flag}")));
+            assert!(!result.iter().any(|a| a.starts_with("--c17-pic")), "{flag}");
+        }
     }
 
     #[test]
@@ -3682,15 +3701,12 @@ mod tests {
         let result = run_preprocess(&["-static", "foo.c"]);
         assert!(result.contains(&"--c17-linker-flag=-static".to_string()));
         assert!(!result.contains(&"-static".to_string()));
-        assert!(!result.contains(&"--c17-fpie".to_string()));
-
-        let result = run_preprocess(&["-static-pie", "foo.c"]);
-        assert!(result.contains(&"--c17-linker-flag=-static-pie".to_string()));
-        assert!(result.contains(&"--c17-fpie".to_string()));
     }
 
     /// A static link leads with `-no-pie` whatever PIE request came with it;
-    /// only `-static-pie` makes a static PIE.
+    /// only `-static-pie` makes a static PIE. Otherwise the last of `-pie`
+    /// and `-no-pie` decides, and without either, position-dependent code is
+    /// linked into a position-dependent executable.
     #[test]
     fn test_link_mode_flag() {
         let linux = Target::new(target::Arch::X86_64, Os::Linux);
@@ -3700,6 +3716,12 @@ mod tests {
         };
         assert_eq!(mode(&["foo.c"]), "-pie");
         assert_eq!(mode(&["-no-pie", "foo.c"]), "-no-pie");
+        assert_eq!(mode(&["-no-pie", "-pie", "foo.c"]), "-pie");
+        assert_eq!(mode(&["-pie", "-no-pie", "foo.c"]), "-no-pie");
+        assert_eq!(mode(&["-fno-pic", "foo.c"]), "-no-pie");
+        assert_eq!(mode(&["-fno-pic", "-pie", "foo.c"]), "-pie");
+        assert_eq!(mode(&["-fPIC", "foo.c"]), "-pie");
+        assert_eq!(mode(&["-fPIE", "-no-pie", "foo.c"]), "-no-pie");
         assert_eq!(mode(&["-static", "foo.c"]), "-no-pie");
         assert_eq!(mode(&["-pie", "-static", "foo.c"]), "-no-pie");
         assert_eq!(mode(&["-static", "-fPIE", "foo.c"]), "-no-pie");

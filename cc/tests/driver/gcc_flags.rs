@@ -165,31 +165,113 @@ fn gcc_flags_cpu_selection_is_accepted() {
     }
 }
 
-/// `__PIC__`/`__pic__` whenever the code is position independent, and
-/// `__PIE__`/`__pie__` when it is for a PIE -- the macros a `.S` file or an
-/// inline asm statement tests before choosing a GOT access.
+/// The `-fpic` family -- `-fpic`, `-fPIC`, `-fpie`, `-fPIE` and their four
+/// `-fno-` forms -- is one option: the last one given wins, and any `-fno-`
+/// form turns position independence off altogether, PIE included. The
+/// `__PIC__`/`__pic__` and `__PIE__`/`__pie__` macros say what it chose: 1
+/// for the lower-case spellings, 2 for the upper-case ones and for the PIE
+/// default. `-pie`, `-no-pie`, `-static-pie` and `-shared` are link options
+/// and change none of them. Every row is gcc 13's answer.
+///
+/// `-fno-pic` was refused as an unrecognized option, and `-fPIC -fno-pie`
+/// still claimed `__PIC__`.
 #[test]
-fn gcc_flags_pic_macros_follow_the_code() {
+fn gcc_flags_pic_family_last_one_wins() {
     let probe = "PIC=__PIC__ pic=__pic__ PIE=__PIE__ pie=__pie__\n";
     let defined = |flags: &[&str]| {
         let r = preprocess_text("pic_probe", probe, flags);
-        assert!(r.success, "{}", r.stderr);
+        assert!(r.success, "{flags:?}: {}", r.stderr);
+        assert!(r.stderr.is_empty(), "{flags:?}: {}", r.stderr);
         r.stdout
     };
-    let out = defined(&["-fPIC", "-fno-pie"]);
-    assert!(out.contains("PIC=2 pic=2 PIE=__PIE__"), "{out}");
-    let out = defined(&["-fpie"]);
-    assert!(out.contains("PIC=2 pic=2 PIE=2 pie=2"), "{out}");
+    const NONE: &str = "PIC=__PIC__ pic=__pic__ PIE=__PIE__ pie=__pie__";
+    const PIC1: &str = "PIC=1 pic=1 PIE=__PIE__ pie=__pie__";
+    const PIC2: &str = "PIC=2 pic=2 PIE=__PIE__ pie=__pie__";
+    const PIE1: &str = "PIC=1 pic=1 PIE=1 pie=1";
+    const PIE2: &str = "PIC=2 pic=2 PIE=2 pie=2";
     if cfg!(target_os = "linux") {
-        // PIE is the Linux default, as it is for gcc there.
-        let out = defined(&[]);
-        assert!(out.contains("PIC=2 pic=2 PIE=2 pie=2"), "{out}");
-        let out = defined(&["-fno-pie"]);
-        assert!(out.contains("PIC=__PIC__"), "{out}");
+        for (flags, want) in [
+            (&[][..], PIE2),
+            (&["-fpic"], PIC1),
+            (&["-fPIC"], PIC2),
+            (&["-fpie"], PIE1),
+            (&["-fPIE"], PIE2),
+            (&["-fno-pic"], NONE),
+            (&["-fno-PIC"], NONE),
+            (&["-fno-pie"], NONE),
+            (&["-fno-PIE"], NONE),
+            (&["-fPIC", "-fno-pie"], NONE),
+            (&["-fpie", "-fno-pic"], NONE),
+            (&["-fno-pic", "-fpie"], PIE1),
+            (&["-fPIC", "-fpie"], PIE1),
+            (&["-fpie", "-fPIC"], PIC2),
+            (&["-fno-pie", "-fPIC"], PIC2),
+            (&["-fpic", "-fPIE"], PIE2),
+            (&["-pie"], PIE2),
+            (&["-no-pie"], PIE2),
+            (&["-static-pie"], PIE2),
+            (&["-shared"], PIE2),
+            (&["-fno-pic", "-pie"], NONE),
+            (&["-shared", "-fno-pic"], NONE),
+        ] {
+            let out = defined(flags);
+            assert!(out.contains(want), "{flags:?}: want {want}, got {out}");
+        }
     }
     if cfg!(target_os = "macos") {
-        let out = defined(&["-fno-pie"]);
-        assert!(out.contains("PIC=2"), "Mach-O is always PIC: {out}");
+        // Mach-O code is position independent whatever was asked, and
+        // clang says so.
+        for flag in ["-fno-pic", "-fno-pie"] {
+            let out = defined(&[flag]);
+            assert!(out.contains("PIC=2 pic=2"), "{flag}: {out}");
+        }
+    }
+}
+
+/// Code built with `-fno-pic` links into a fixed-address executable and
+/// runs: a global defined in the unit is reached directly, one defined in
+/// the other unit through a copy relocation, as gcc's code reaches it.
+#[cfg(target_os = "linux")]
+#[test]
+fn gcc_flags_fno_pic_links_into_a_no_pie_executable() {
+    let dir = plib::tmp::Builder::new()
+        .prefix("c17_nopic_")
+        .tempdir()
+        .expect("tempdir");
+    let p = |name: &str| dir.path().join(name).to_string_lossy().into_owned();
+    std::fs::write(
+        p("a.c"),
+        "extern int other; extern int (*other_fn)(int);\n\
+         static int local = 5; int mine = 7;\n\
+         int twice(int x) { return 2 * x; }\n\
+         int (*pick(int x))(int) { return x ? twice : other_fn; }\n\
+         int main(void) { int *p = &mine; return pick(1)(other) + local + *p + pick(0)(1); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        p("b.c"),
+        "int other = 10;\nstatic int three(int x) { return x + 2; }\n\
+         int (*other_fn)(int) = three;\n",
+    )
+    .unwrap();
+    for flags in [
+        &["-fno-pic"][..],
+        &["-fno-PIE", "-O2"],
+        &["-fPIC", "-fno-pic"],
+    ] {
+        for unit in ["a", "b"] {
+            let mut args = flags.to_vec();
+            let (obj, src) = (p(&format!("{unit}.o")), p(&format!("{unit}.c")));
+            args.extend(["-c", "-o", &obj, &src]);
+            let r = run_c17(&args);
+            assert!(r.success, "{flags:?}: {}", r.stderr);
+            assert!(r.stderr.is_empty(), "{flags:?}: {}", r.stderr);
+        }
+        let r = run_c17(&["-no-pie", "-o", &p("prog"), &p("a.o"), &p("b.o")]);
+        assert!(r.success, "{flags:?}: {}", r.stderr);
+        assert_eq!(elf_linkage(Path::new(&p("prog"))).e_type, 2, "{flags:?}");
+        let status = std::process::Command::new(p("prog")).status().unwrap();
+        assert_eq!(status.code(), Some(20 + 5 + 7 + 3), "{flags:?}");
     }
 }
 

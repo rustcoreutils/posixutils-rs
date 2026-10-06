@@ -47,9 +47,8 @@ pub struct Compiled {
 struct Options {
     optimization: Optimization,
     debug: bool,
-    pic: bool,
-    pie: bool,
-    no_pie: bool,
+    /// The last of the `-fpic` family, if any.
+    position: Option<target::PositionIndependence>,
     shared: bool,
     no_unwind_tables: bool,
     verbose_asm: bool,
@@ -107,9 +106,6 @@ fn apply_flags(flags: &[&str]) -> Options {
             "-fgnu89-inline" => crate::builtins::set_gnu89_inline(true),
             "-g" => o.debug = true,
             "-O" => o.optimization = Optimization::from_flag("1").unwrap(),
-            "-fPIC" | "-fpic" => o.pic = true,
-            "-fPIE" | "-fpie" => o.pie = true,
-            "-fno-pie" => o.no_pie = true,
             "-shared" | "--shared" | "-G" => o.shared = true,
             "--fno-unwind-tables" => o.no_unwind_tables = true,
             "-fverbose-asm" => o.verbose_asm = true,
@@ -125,7 +121,9 @@ fn apply_flags(flags: &[&str]) -> Options {
                 o.plain_char = Some(target::CharSignedness::Unsigned)
             }
             _ => {
-                if let Some(level) = flag.strip_prefix("-O") {
+                if let Some(position) = target::PositionIndependence::from_flag(flag) {
+                    o.position = Some(position);
+                } else if let Some(level) = flag.strip_prefix("-O") {
                     o.optimization = Optimization::from_flag(level).unwrap();
                 } else if let Some(map) = MapOption::parse(flag) {
                     o.prefix_maps.push(map.unwrap());
@@ -176,13 +174,10 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
     if let Some(signedness) = o.plain_char {
         target.plain_char = signedness;
     }
-    // As the driver's `position_independence`: PIE is the Linux default
-    // unless a shared object or `-fno-pie` asks otherwise, and implies PIC.
-    let pie = !(o.shared || o.no_pie) && (o.pie || target.os == target::Os::Linux);
-    let position = target::PositionIndependence {
-        pic: o.pic || o.shared || pie,
-        pie,
-    };
+    // As the driver's `position_independence`.
+    let position = o
+        .position
+        .unwrap_or_else(|| target::PositionIndependence::target_default(&target));
 
     let prefix_maps = PrefixMaps::from_options(&o.prefix_maps);
     let mut strings = StringTable::new();
@@ -218,8 +213,8 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
         debug: o.debug,
         trapping_math: o.trapping_math,
         default_visibility: None,
-        shared_mode: o.shared || o.pic,
-        pic: position.pic,
+        shared_mode: o.shared || position.is_shared_code(),
+        pic: o.shared || position.is_pic(),
         unwind_tables: !o.no_unwind_tables,
         verbose_asm: o.verbose_asm,
         cf_protection: o.cf_protection,

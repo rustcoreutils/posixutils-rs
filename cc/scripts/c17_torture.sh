@@ -23,7 +23,7 @@
 # for aarch64 code generation: every `compile/` output is assembled with
 # `aarch64-linux-gnu-as`, and every executable is linked with
 # `aarch64-linux-gnu-gcc -static` and run under `qemu-aarch64-static`. The same
-# directives, skip lists and sub-suite handling apply; result tags carry an
+# directives and sub-suite handling apply; result tags carry an
 # `aarch64/` prefix so they can never be mistaken for host results. It needs
 # the cross toolchain and qemu-user, and refuses to run without them.
 #
@@ -205,12 +205,9 @@ dg_scan() {
                 if (o ~ /-std=(gnu89|c89|gnu90|c90|iso9899:1990)/)
                     o = o " -fpermissive"
                 gsub(/-std=[a-z0-9:]+/, "", o)
-                # A machine flag is a request about the target, and c17
-                # rejects the ones it does not implement rather than
-                # ignoring them. Forwarding one turns "this test tunes for
-                # i686" into a c17 failure, which it is not: gcc compiles
-                # these and so does c17 without the flag.
-                if (o ~ /(^| )-m[a-z]/) skip = "needs a machine flag c17 does not implement"
+                # A machine flag is forwarded like any other: c17
+                # implements the SSE levels, -march= and -mtune=, and one it
+                # does not implement is a compile failure worth seeing.
                 flags = flags " " o
             }
             else if (d ~ /dg-do/) {
@@ -258,8 +255,7 @@ dg_scan() {
             # `label_values` tests long after c17 had all four, and hid three
             # bugs behind them; modelling each name instead skipped avx512,
             # `-fexceptions` and profiling tests that c17 compiles. Every test
-            # is attempted, and one that needs something c17 has decided not
-            # to have is skipped by name in a list below.
+            # is attempted; nothing is skipped by name.
             else if (d ~ /dg-timeout-factor/) {
                 if (match(text, /[0-9]+/)) mult = substr(text, RSTART, RLENGTH)
             }
@@ -516,192 +512,11 @@ x_file_verdict() {
 }
 
 
-# Features c17 has decided not to implement: GNU-only language extensions, and
-# anything newer than C17. A test that needs one is **out of scope**, not a
-# failure -- counting it as one measures a decision rather than a defect, and
-# invites the same triage every few months.
-#
-# Listed by name, never matched against the source. Scanning for the feature
-# looked tidier and was wrong: `pr86659-1`, `pr86659-2` and `pr87623` all
-# mention `scalar_storage_order` and **pass** anyway, so a content match threw
-# away three cases c17 gets right -- the same trap the note above describes.
-# A name list also means every skip is auditable, and a test added to the suite
-# later shows up as a new failure and gets triaged then, which is the right
-# moment to decide.
-#
-# Post-C17: `_Decimal32/64/128` is TR 24732, folded into C23; `[[...]]` is the
-# C23 attribute syntax; `uabs` is C2y.
-OUT_OF_SCOPE_POST_C17=" execute/pr80692 execute/pr123978 execute/pr124358 \
- execute/pr125291 compile/pr111059-7 compile/pr111059-8 compile/pr111059-9 \
- compile/pr111059-10 compile/pr111059-11 compile/pr111059-12 \
- compile/pr111911-2 builtins/uabs-1 builtins/uabs-2 builtins/uabs-3 "
-
-# gcc's own GIMPLE front end (`-fgimple`), which parses its internal
-# representation rather than C. gcc itself rejects these without the flag.
-OUT_OF_SCOPE_GCC_INTERNAL=" compile/pr115143-2 compile/pr115143-3 "
-
-# `-fgnu89-inline` selects pre-C99 `inline` semantics, where `extern inline`
-# is a definition another may override. c17 honours the flag; these two also
-# want gcc to *reject* a redefinition without it, which c17 does not diagnose.
-OUT_OF_SCOPE_GNU89_INLINE=" execute/20021120-1 compile/20021120-1 \
- compile/20021120-2 "
-
-# Written for a target c17 does not have a backend for.
-OUT_OF_SCOPE_OTHER_TARGET=" compile/mipscop-1 compile/mipscop-2 \
- compile/mipscop-3 compile/mipscop-4 "
-
-# A GNU-only attribute: reverse-endian load/store lowering.
-OUT_OF_SCOPE_GNU_ATTR=" execute/20230630-2 execute/20230630-4 "
-
-# Two more GNU-only features, each named in cc/DECISIONS.md with what it would
-# take.
-#
-# Nested function definitions: a static chain and executable trampolines.
-OUT_OF_SCOPE_NESTED_FN=" execute/20010209-1 compile/20010209-1 \
- execute/20010605-1 compile/20010605-1 execute/20030501-1 execute/20040520-1 \
- execute/20090219-1 execute/nest-align-1 execute/nestfunc-7 \
- execute/nest-stdar-1 execute/pr103405 execute/pr22061-3 execute/pr22061-4 \
- compile/20010903-2 compile/20011023-1 compile/20020309-1 compile/20021204-1 \
- compile/20030418-1 compile/20030716-1 compile/20031011-1 compile/20040310-1 \
- compile/20040317-3 compile/20050119-1 compile/951116-1 compile/nested-2 \
- compile/nested-3 compile/pr35006 compile/pr99324 execute/20061220-1 \
- compile/20010226-1 compile/20040323-1 compile/930506-2 compile/pr27889 \
- compile/nested-1 execute/20000822-1 execute/920612-2 execute/921017-1 \
- execute/921215-1 execute/931002-1 execute/nestfunc-1 execute/nestfunc-2 \
- execute/nestfunc-3 execute/pr71494 "
-
-# A variable-length array as a struct or union member: struct layout computed
-# at run time, and `offsetof` through it.
-OUT_OF_SCOPE_VLA_MEMBER=" execute/20020412-1 execute/20040308-1 \
- execute/20040423-1 execute/20041218-2 execute/20070919-1 compile/20070919-1 \
- execute/align-nest execute/pr41935 execute/pr82210 compile/20020210-1 \
- compile/20030224-1 compile/20050801-2 compile/920428-4 compile/920501-16 \
- compile/pr42956 compile/pr77754-6 compile/pr82564 compile/pr39394 "
-
-# gcc-specific *behaviour*, as opposed to a gcc-specific feature. Neither is
-# required by C17 and c17 deliberately does something else; see the
-# "Deliberate divergences" table in cc/DECISIONS.md.
-#
-#   20031003-1  (int)2147483648.0f is undefined behaviour; gcc's folder
-#               saturates to INT_MAX. aarch64 agrees by hardware accident.
-#   pr46309     a conditional with one `void` arm, which gcc takes as an
-#               extension and C17 6.5.15p3 forbids.
-#   printf, fprintf, fputs, printf-chk-1, fprintf-chk-1, vprintf-chk-1,
-#   vfprintf-chk-1
-#               abort when an empty write -- `printf("")`, `fprintf(fp, "")`,
-#               `fputs("", fp)` -- reaches the library at -O1 and up. C17
-#               7.21.2p4 orients a stream on the first output function applied
-#               to it whether or not a byte moves, so c17 keeps the call; gcc
-#               drops it and the orientation with it.
-OUT_OF_SCOPE_GCC_BEHAVIOUR=" execute/20031003-1 execute/pr46309 \
- compile/pr26725 compile/20000211-1 compile/950919-1 \
- builtins/printf builtins/fprintf builtins/fputs execute/printf-chk-1 \
- execute/fprintf-chk-1 execute/vprintf-chk-1 execute/vfprintf-chk-1 "
-
-# Tests gcc on this machine fails exactly as c17 does, verified by running both
-# at -O0 and -O2. Counting them as c17 failures overstates the gap, and they are
-# the kind of thing that gets re-triaged every few months because nothing says
-# otherwise.
-#
-# Each list is deliberately narrow. A test where gcc fails but c17 *passes* is
-# not here -- `20101011-1` is one, and skipping it would have thrown away a
-# case c17 gets right. Nor is one where gcc fails at only one level:
-# `pr124358` passes under gcc at -O0 and fails under c17, so it stays a real
-# failure.
-
-# Calls an undefined function the optimizer is expected to delete. Neither
-# compiler can link it at -O0; gcc's own harness runs these at -O1 and above.
-# They pass at -O2 under both, so skipping them outright would lose that.
-NEEDS_OPTIMIZATION=" execute/20001121-1 compile/20001121-1 execute/20020107-1 \
- execute/930526-1 execute/961223-1 execute/loop-2c execute/p18298 \
- execute/restrict-1 execute/unroll-1 "
-
-# Pre-C99 implicit `int` in a test that never asks for a pre-C99 dialect.
-# C17 6.7.2p2 requires a type specifier, and gcc made it an error in 14 too,
-# so the test is simply older than the rule it breaks. Tests that *do* ask --
-# `dg-additional-options "-std=gnu89"` or `"-fpermissive"` -- are honoured and
-# pass, which is why this list is two names rather than a hundred.
-NEEDS_PRE_C99_DIALECT=" compile/pr29201 "
-
-# Builtins gcc synthesizes for its own use and no header declares:
-# `__builtin_stack_save`/`stack_restore` are the marks gcc puts around a VLA's
-# lifetime, and c17 frees a VLA at the end of its block without them;
-# `__builtin_clear_padding` would have to walk a type to find its padding; and
-# `__builtin_cexpi`/`cpow` are complex libm entry points;
-# `__builtin_setjmp`/`__builtin_longjmp` are gcc's own lightweight nonlocal
-# goto, next to the ordinary `setjmp`/`longjmp` c17 has; and `__builtin_apply`
-# forwards an untyped argument block. Every `builtins/*-chk` test reaches
-# `__builtin_setjmp` through its shared `chk.h`. See BUILTIN.md's
-# "Not implemented" table, which is where these are recorded.
-OUT_OF_SCOPE_GCC_INTERNAL_BUILTIN=" compile/20071117-1 compile/pr98087 \
- compile/pr110266 compile/pr54428 builtins/memcpy-chk builtins/memmove-chk \
- builtins/mempcpy-chk builtins/memset-chk builtins/pr23484-chk \
- builtins/pr93262-chk builtins/snprintf-chk builtins/sprintf-chk \
- builtins/stpcpy-chk builtins/stpncpy-chk builtins/strcat-chk \
- builtins/strcpy-chk builtins/strncat-chk builtins/strncpy-chk \
- builtins/vsnprintf-chk builtins/vsprintf-chk compile/20011029-1 \
- compile/complex-6 compile/pr89280 compile/pr82337 execute/built-in-setjmp \
- execute/pr60003 execute/pr64242 execute/pr84521 execute/pr47237 "
-
-# `__builtin_issignaling`, which distinguishes a signalling NaN from a quiet
-# one. No system header uses it -- `<math.h>` has `issignaling` as its own
-# macro and does not reach for a builtin -- so nothing fails to build without
-# it, and seven of the nine tests need a format c17 does not have at all
-# (`_Float128`, `_Float64x`, `bfloat16`).
-OUT_OF_SCOPE_ISSIGNALING=" ieee/builtin-issignaling-1 \
- ieee/bfloat16-builtin-issignaling-1 ieee/float128-builtin-issignaling-1 \
- ieee/float128x-builtin-issignaling-1 ieee/float16-builtin-issignaling-1 \
- ieee/float32-builtin-issignaling-1 ieee/float32x-builtin-issignaling-1 \
- ieee/float64-builtin-issignaling-1 ieee/float64x-builtin-issignaling-1 "
-
-# A vector of floating lanes four bytes wide or less at a call boundary,
-# which gcc passes like no type c17 has. Every other vector operation runs.
-OUT_OF_SCOPE_VECTOR_ARITH=" ieee/fp-cmp-cond-1 "
-
-# `__label__`, a block-scope label declaration. cc/DECISIONS.md rules it out
-# together with nested functions, which are what it exists for.
-OUT_OF_SCOPE_LOCAL_LABELS=" compile/20000326-2 compile/20000518-1 \
- compile/20050122-2 compile/920415-1 compile/930118-1 compile/981006-1 \
- compile/pr21728 execute/920415-1 execute/920428-2 execute/920501-7 \
- execute/920721-4 execute/930406-1 execute/980526-1 execute/comp-goto-2 \
- execute/nestfunc-5 execute/nestfunc-6 execute/pr24135 execute/pr51447 "
-
-# The difference of two label addresses, `&&a - &&b`, as a constant in a
-# static initializer: a GNU extension on top of labels as values, which c17
-# has. The initializer would need a symbol difference relocation.
-OUT_OF_SCOPE_LABEL_DIFF=" compile/labels-3 execute/pr70460 "
-
-# A C17 constraint gcc only warns about: 6.7.4p3 forbids an inline definition
-# with external linkage from referring to an identifier with internal linkage.
-# c17 diagnoses it as the constraint it is, and `-fpermissive` relaxes it;
-# the test passes neither.
-C17_CONSTRAINT_GCC_WARNS=" compile/pr38857 "
-
-# aarch64 only: `"s"` and `"i"` operands holding an address, which the test
-# guards with `nonpic`. c17 builds position-independent code by default, as
-# gcc does on these targets, and under it gcc rejects both operands too
-# ("impossible constraint"); x86-64 accepts them either way.
-NEEDS_NONPIC_AARCH64=" compile/pr27528 "
-
-# A local array of 2 GiB to 1 TiB. This is a gap in c17, not a decision: an
-# automatic object past `MAX_STACK_OBJECT_BYTES` is refused with a diagnostic,
-# because both backends address the frame through a signed 32-bit
-# displacement, and gcc handles the same object with 64-bit frame addressing.
-# cc/TODO.md's "64-bit stack frames" says what supporting it takes. Delete this
-# list when that lands, so these become ordinary tests again.
-NEEDS_64BIT_FRAMES=" compile/20031023-1 compile/20031023-2 compile/20031023-3 \
- compile/20031023-4 compile/stack-check-1 "
-
 # `dg-do compile` tests whose asm template is deliberately not an instruction
 # -- `asm("%0" :: "r"(1.5))`, `asm("f")` -- so they only mean something up to
 # `-S`, which is where gcc stops. aarch64 mode assembles every other compile
 # test, since rejected output is what it exists to catch; these stop at `-S`.
 TEMPLATE_NOT_ASSEMBLED=" compile/920520-1 compile/920521-1 "
-
-# gcc rejects or fails these at every level here.
-GCC_ALSO_FAILS=" execute/980608-1 execute/bcp-1 execute/eeprof-1 \
- execute/pr117432 execute/pr123864 execute/va-arg-7 execute/va-arg-8 \
- compile/dll "
 
 # ------------------------------------------------------------------ one test
 run_one() {
@@ -737,70 +552,6 @@ run_one() {
         flags:*) xflags=${xv#flags:};;
     esac
     local key="$suite/$base"
-    case "$GCC_ALSO_FAILS" in
-        *" $key "*) echo "SKIP	$tag	gcc fails this too"; return;;
-    esac
-    case "$NEEDS_OPTIMIZATION" in
-        *" $key "*)
-            # Only at -O0, where neither compiler can link it.
-            case "$opt" in
-                *-O0*) echo "SKIP	$tag	needs -O1+ to link; gcc cannot either"; return;;
-            esac;;
-    esac
-
-    case "$OUT_OF_SCOPE_POST_C17" in
-        *" $key "*) echo "SKIP	$tag	out of scope: post-C17 feature"; return;;
-    esac
-    case "$OUT_OF_SCOPE_GNU_ATTR" in
-        *" $key "*) echo "SKIP	$tag	out of scope: GNU-only attribute"; return;;
-    esac
-    case "$OUT_OF_SCOPE_NESTED_FN" in
-        *" $key "*) echo "SKIP	$tag	out of scope: nested functions"; return;;
-    esac
-    case "$OUT_OF_SCOPE_VLA_MEMBER" in
-        *" $key "*) echo "SKIP	$tag	out of scope: VLA as a struct member"; return;;
-    esac
-    case "$OUT_OF_SCOPE_GCC_BEHAVIOUR" in
-        *" $key "*) echo "SKIP	$tag	out of scope: gcc-specific behaviour"; return;;
-    esac
-    case "$OUT_OF_SCOPE_GCC_INTERNAL" in
-        *" $key "*) echo "SKIP	$tag	out of scope: gcc's GIMPLE front end"; return;;
-    esac
-    case "$OUT_OF_SCOPE_GNU89_INLINE" in
-        *" $key "*) echo "SKIP	$tag	out of scope: -fgnu89-inline semantics"; return;;
-    esac
-    case "$OUT_OF_SCOPE_OTHER_TARGET" in
-        *" $key "*) echo "SKIP	$tag	out of scope: another target's backend"; return;;
-    esac
-    case "$NEEDS_PRE_C99_DIALECT" in
-        *" $key "*) echo "SKIP	$tag	implicit int without a dialect request"; return;;
-    esac
-    case "$OUT_OF_SCOPE_ISSIGNALING" in
-        *" $key "*) echo "SKIP	$tag	out of scope: __builtin_issignaling"; return;;
-    esac
-    case "$OUT_OF_SCOPE_GCC_INTERNAL_BUILTIN" in
-        *" $key "*) echo "SKIP	$tag	out of scope: a gcc-internal builtin"; return;;
-    esac
-    case "$OUT_OF_SCOPE_VECTOR_ARITH" in
-        *" $key "*) echo "SKIP	$tag	out of scope: vector values"; return;;
-    esac
-    case "$OUT_OF_SCOPE_LOCAL_LABELS" in
-        *" $key "*) echo "SKIP	$tag	out of scope: __label__"; return;;
-    esac
-    case "$OUT_OF_SCOPE_LABEL_DIFF" in
-        *" $key "*) echo "SKIP	$tag	out of scope: label difference as a constant"; return;;
-    esac
-    case "$C17_CONSTRAINT_GCC_WARNS" in
-        *" $key "*) echo "SKIP	$tag	a C17 constraint gcc does not enforce"; return;;
-    esac
-    case "$NEEDS_64BIT_FRAMES" in
-        *" $key "*) echo "SKIP	$tag	needs 64-bit frames"; return;;
-    esac
-    if [ "$TORTURE_TARGET" = aarch64 ]; then
-        case "$NEEDS_NONPIC_AARCH64" in
-            *" $key "*) echo "SKIP	$tag	needs non-PIC code on aarch64"; return;;
-        esac
-    fi
     local scan skip flags mult stack dgdo errlines
     scan=$(dg_scan "$src" "$opt")
     skip=${scan%%|*}; scan=${scan#*|}
@@ -1025,14 +776,7 @@ default_mode() {
 export -f run_one dg_scan x_file_verdict default_mode expect_reject
 export -f target_compile_only target_build target_run
 export TORTURE_TARGET TARGET_FLAGS TAG_PREFIX TEMPLATE_NOT_ASSEMBLED
-export GCC_ALSO_FAILS NEEDS_OPTIMIZATION TORTURE_TRIPLE
-export OUT_OF_SCOPE_POST_C17 OUT_OF_SCOPE_GNU_ATTR
-export OUT_OF_SCOPE_NESTED_FN OUT_OF_SCOPE_VLA_MEMBER
-export OUT_OF_SCOPE_GCC_BEHAVIOUR OUT_OF_SCOPE_GCC_INTERNAL
-export OUT_OF_SCOPE_GNU89_INLINE OUT_OF_SCOPE_OTHER_TARGET
-export NEEDS_PRE_C99_DIALECT OUT_OF_SCOPE_ISSIGNALING
-export OUT_OF_SCOPE_GCC_INTERNAL_BUILTIN NEEDS_64BIT_FRAMES
-export NEEDS_NONPIC_AARCH64 OUT_OF_SCOPE_VECTOR_ARITH OUT_OF_SCOPE_LOCAL_LABELS OUT_OF_SCOPE_LABEL_DIFF C17_CONSTRAINT_GCC_WARNS
+export TORTURE_TRIPLE
 
 # ------------------------------------------------------------- collect tests
 # Each line is `<sub-suite>:<path>`, so a worker knows which sub-suite it is in

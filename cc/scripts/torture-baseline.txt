@@ -8,6 +8,8 @@ builtins/abs-3@-O0
 builtins/abs-3@-O2
 builtins/complex-1@-O0
 builtins/complex-1@-O2
+builtins/fprintf@-O0
+builtins/fputs@-O0
 builtins/memchr@-O0
 builtins/memchr@-O2
 builtins/memcmp@-O0
@@ -28,6 +30,7 @@ builtins/pr22237-1@-O0
 builtins/pr22237-1@-O2
 builtins/pr22237@-O0
 builtins/pr22237@-O2
+builtins/printf@-O0
 builtins/sprintf@-O0
 builtins/sprintf@-O2
 builtins/strcat@-O0
@@ -72,6 +75,7 @@ builtins/strstr-asm@-O0
 builtins/strstr-asm@-O2
 builtins/strstr@-O0
 builtins/strstr@-O2
+builtins/uabs-2@-O0
 compile/103818@-O0
 compile/103818@-O2
 compile/20000105-1@-O0
@@ -96,6 +100,8 @@ compile/20000319-1@-O0
 compile/20000319-1@-O2
 compile/20000326-1@-O0
 compile/20000326-1@-O2
+compile/20000326-2@-O0
+compile/20000326-2@-O2
 compile/20000329-1@-O0
 compile/20000329-1@-O2
 compile/20000403-1@-O0
@@ -126,6 +132,8 @@ compile/20000511-1@-O0
 compile/20000511-1@-O2
 compile/20000517-1@-O0
 compile/20000517-1@-O2
+compile/20000518-1@-O0
+compile/20000518-1@-O2
 compile/20000523-1@-O0
 compile/20000523-1@-O2
 compile/20000605-1@-O0
@@ -170,6 +178,7 @@ compile/20001109-2@-O0
 compile/20001109-2@-O2
 compile/20001116-1@-O0
 compile/20001116-1@-O2
+compile/20001121-1@-O0
 compile/20001121-1@-O2
 compile/20001123-1@-O0
 compile/20001123-1@-O2
@@ -209,6 +218,8 @@ compile/20010124-1@-O0
 compile/20010124-1@-O2
 compile/20010202-1@-O0
 compile/20010202-1@-O2
+compile/20010209-1@-O0
+compile/20010209-1@-O2
 compile/20010227-1@-O0
 compile/20010227-1@-O2
 compile/20010313-1@-O0
@@ -741,6 +752,8 @@ compile/20070906-1@-O0
 compile/20070906-1@-O2
 compile/20070915-1@-O0
 compile/20070915-1@-O2
+compile/20070919-1@-O0
+compile/20070919-1@-O2
 compile/20071027-1@-O0
 compile/20071027-1@-O2
 compile/20071102-1@-O0
@@ -1155,6 +1168,8 @@ compile/930111-1@-O0
 compile/930111-1@-O2
 compile/930117-1@-O0
 compile/930117-1@-O2
+compile/930118-1@-O0
+compile/930118-1@-O2
 compile/930120-1@-O0
 compile/930120-1@-O2
 compile/930126-1@-O0
@@ -1377,6 +1392,8 @@ compile/981001-3@-O0
 compile/981001-3@-O2
 compile/981001-4@-O0
 compile/981001-4@-O2
+compile/981006-1@-O0
+compile/981006-1@-O2
 compile/981007-1@-O0
 compile/981007-1@-O2
 compile/981107-1@-O0
@@ -3514,6 +3531,8 @@ compile/pr87647@-O0
 compile/pr87647@-O2
 compile/pr88140@-O0
 compile/pr88140@-O2
+compile/pr88423@-O0
+compile/pr88423@-O2
 compile/pr89235@-O0
 compile/pr89235@-O2
 compile/pr89399@-O0
@@ -4098,6 +4117,7 @@ execute/20001111-1@-O0
 execute/20001111-1@-O2
 execute/20001112-1@-O0
 execute/20001112-1@-O2
+execute/20001121-1@-O0
 execute/20001121-1@-O2
 execute/20001124-1@-O0
 execute/20001124-1@-O2
@@ -4209,6 +4229,7 @@ execute/20011223-1@-O0
 execute/20011223-1@-O2
 execute/20020103-1@-O0
 execute/20020103-1@-O2
+execute/20020107-1@-O0
 execute/20020107-1@-O2
 execute/20020108-1@-O0
 execute/20020108-1@-O2
@@ -4330,6 +4351,8 @@ execute/20021118-3@-O0
 execute/20021118-3@-O2
 execute/20021119-1@-O0
 execute/20021119-1@-O2
+execute/20021120-1@-O0
+execute/20021120-1@-O2
 execute/20021120-2@-O0
 execute/20021120-2@-O2
 execute/20021120-3@-O0
@@ -4994,6 +5017,8 @@ execute/930126-1@-O0
 execute/930126-1@-O2
 execute/930208-1@-O0
 execute/930208-1@-O2
+execute/930406-1@-O0
+execute/930406-1@-O2
 execute/930408-1@-O0
 execute/930408-1@-O2
 execute/930429-1@-O0
@@ -5006,6 +5031,7 @@ execute/930513-2@-O0
 execute/930513-2@-O2
 execute/930518-1@-O0
 execute/930518-1@-O2
+execute/930526-1@-O0
 execute/930526-1@-O2
 execute/930527-1@-O0
 execute/930527-1@-O2
@@ -5255,6 +5281,7 @@ execute/961206-1@-O0
 execute/961206-1@-O2
 execute/961213-1@-O0
 execute/961213-1@-O2
+execute/961223-1@-O0
 execute/961223-1@-O2
 execute/970214-1@-O0
 execute/970214-1@-O2
@@ -5280,6 +5307,8 @@ execute/980506-2@-O0
 execute/980506-2@-O2
 execute/980506-3@-O0
 execute/980506-3@-O2
+execute/980526-1@-O0
+execute/980526-1@-O2
 execute/980526-2@-O0
 execute/980526-2@-O2
 execute/980526-3@-O0
@@ -5292,6 +5321,8 @@ execute/980604-1@-O0
 execute/980604-1@-O2
 execute/980605-1@-O0
 execute/980605-1@-O2
+execute/980608-1@-O0
+execute/980608-1@-O2
 execute/980612-1@-O0
 execute/980612-1@-O2
 execute/980617-1@-O0
@@ -5582,6 +5613,7 @@ execute/fprintf-1@-O0
 execute/fprintf-1@-O2
 execute/fprintf-2@-O0
 execute/fprintf-2@-O2
+execute/fprintf-chk-1@-O0
 execute/frame-address@-O0
 execute/frame-address@-O2
 execute/func-ptr-1@-O0
@@ -5620,6 +5652,7 @@ execute/loop-1@-O0
 execute/loop-1@-O2
 execute/loop-2b@-O0
 execute/loop-2b@-O2
+execute/loop-2c@-O0
 execute/loop-2c@-O2
 execute/loop-2d@-O0
 execute/loop-2d@-O2
@@ -5709,6 +5742,7 @@ execute/multi-ix@-O0
 execute/multi-ix@-O2
 execute/nestfunc-4@-O0
 execute/nestfunc-4@-O2
+execute/p18298@-O0
 execute/p18298@-O2
 execute/packed-1@-O0
 execute/packed-1@-O2
@@ -6990,6 +7024,7 @@ execute/printf-1@-O0
 execute/printf-1@-O2
 execute/printf-2@-O0
 execute/printf-2@-O2
+execute/printf-chk-1@-O0
 execute/pta-field-1@-O0
 execute/pta-field-1@-O2
 execute/pta-field-2@-O0
@@ -7002,6 +7037,7 @@ execute/pushpop_macro@-O0
 execute/pushpop_macro@-O2
 execute/regstack-1@-O0
 execute/regstack-1@-O2
+execute/restrict-1@-O0
 execute/restrict-1@-O2
 execute/return-addr@-O0
 execute/return-addr@-O2
@@ -7107,6 +7143,7 @@ execute/switch-1@-O0
 execute/switch-1@-O2
 execute/tstdi-1@-O0
 execute/tstdi-1@-O2
+execute/unroll-1@-O0
 execute/unroll-1@-O2
 execute/usad-run@-O0
 execute/usad-run@-O2
@@ -7156,6 +7193,10 @@ execute/va-arg-5@-O0
 execute/va-arg-5@-O2
 execute/va-arg-6@-O0
 execute/va-arg-6@-O2
+execute/va-arg-7@-O0
+execute/va-arg-7@-O2
+execute/va-arg-8@-O0
+execute/va-arg-8@-O2
 execute/va-arg-9@-O0
 execute/va-arg-9@-O2
 execute/va-arg-pack-1@-O0
@@ -7164,10 +7205,12 @@ execute/va-arg-trap-1@-O0
 execute/va-arg-trap-1@-O2
 execute/vfprintf-1@-O0
 execute/vfprintf-1@-O2
+execute/vfprintf-chk-1@-O0
 execute/vla-dealloc-1@-O0
 execute/vla-dealloc-1@-O2
 execute/vprintf-1@-O0
 execute/vprintf-1@-O2
+execute/vprintf-chk-1@-O0
 execute/vrp-1@-O0
 execute/vrp-1@-O2
 execute/vrp-2@-O0
@@ -7274,6 +7317,8 @@ ieee/fp-cmp-8@-O0
 ieee/fp-cmp-8@-O2
 ieee/fp-cmp-9@-O0
 ieee/fp-cmp-9@-O2
+ieee/fp-cmp-cond-1@-O0
+ieee/fp-cmp-cond-1@-O2
 ieee/hugeval@-O0
 ieee/hugeval@-O2
 ieee/inf-1@-O0

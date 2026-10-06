@@ -219,78 +219,15 @@ them too (see "SIMD headers").
 `__ARM_NEON__` is not defined on aarch64: it is the AArch32 spelling, and gcc
 does not define it there.
 
-## Torture tests skipped by decision
+## Torture tests
 
-### Out of scope, and so skipped rather than counted
-
-Anything GNU-specific or newer than C17 is **out of scope**: the harness
-(`scripts/c17_torture.sh`) skips it with a named reason instead of reporting a
-failure, because counting it measures a decision rather than a defect.
-
-The names live in the harness's lists, one shell variable per category, and
-are not repeated here. Each entry there is `<sub-suite>/<name>`, because a
-test name is not unique across sub-suites: `20021204-1`, `20031011-1` and
-`20050119-1` each name a nested-function test in `compile/` **and** a
-different test in `execute/` that passes.
-
-| Category | Harness list | Why |
-|---|---|---|
-| Nested functions | `OUT_OF_SCOPE_NESTED_FN` | Needs a static chain and executable trampolines |
-| VLA as a struct member | `OUT_OF_SCOPE_VLA_MEMBER` | Needs struct layout computed at run time, and `offsetof` through it |
-| Post-C17 | `OUT_OF_SCOPE_POST_C17` | `_Decimal64` (TR 24732), C23 `[[...]]` attributes, C23 `enum E : bool`, C2y `uabs` |
-| GNU-only attribute | `OUT_OF_SCOPE_GNU_ATTR` | `scalar_storage_order`; needs reverse-endian load/store lowering |
-| gcc's own front ends | `OUT_OF_SCOPE_GCC_INTERNAL` | `-fgimple`, which parses gcc's internal representation rather than C; gcc rejects them without the flag too |
-| Builtins gcc synthesizes for itself | `OUT_OF_SCOPE_GCC_INTERNAL_BUILTIN` | `__builtin_setjmp`, `__builtin_apply`, `__builtin_stack_save` and the like, which no header declares; recorded in `BUILTIN.md`'s "Not implemented" table |
-| `-fgnu89-inline` semantics | `OUT_OF_SCOPE_GNU89_INLINE` | `compile/20021120-1`, `-2` redefine an `extern inline` function under `-fgnu89-inline`. c17 honours the flag and compiles both; the skip rests on c17 not rejecting the same redefinition without the flag, as gcc does, which the tests themselves do not exercise |
-| Another target's backend | `OUT_OF_SCOPE_OTHER_TARGET` | `mipscop-1`..`-4` |
-| `__builtin_issignaling` | `OUT_OF_SCOPE_ISSIGNALING` | No system header uses the builtin (`<math.h>`'s `issignaling` is its own macro), and seven of the nine tests need a format c17 does not have (`_Float128`, `_Float64x`, `bfloat16`) |
-| Pre-C99 implicit `int` with no dialect request | `NEEDS_PRE_C99_DIALECT` | `compile/pr29201`. C17 6.7.2p2 requires a type specifier and GCC 14 made it an error too. A test that asks for `-fpermissive` passes; one that asks for `-std=gnu89` passes because the harness translates that to `-fpermissive` -- c17 itself ignores `-std=gnu89` |
-| Vector values | `OUT_OF_SCOPE_VECTOR_ARITH` | A vector of floating lanes four bytes wide or less at a call boundary, which gcc passes like no type c17 has. Every other vector operation runs |
-| `__label__` | `OUT_OF_SCOPE_LOCAL_LABELS` | Block-scope label declarations, ruled out with nested functions |
-| Label difference as a constant | `OUT_OF_SCOPE_LABEL_DIFF` | `&&a - &&b` in a static initializer. Labels as values are supported; the difference needs a symbol-difference relocation |
-| A C17 constraint gcc only warns about | `C17_CONSTRAINT_GCC_WARNS` | `compile/pr38857`: 6.7.4p3, an external inline definition referring to a static. `-fpermissive` relaxes it |
-| gcc-specific *behaviour* | `OUT_OF_SCOPE_GCC_BEHAVIOUR` | See below |
-
-The gcc-specific behaviour list holds four kinds of test:
-
-- `execute/20031003-1`: `(int)2147483648.0f` is undefined behaviour (C17
-  6.3.1.4p1); gcc's folder saturates it to `INT_MAX`, and aarch64 agrees by
-  hardware accident.
-- A conditional with one `void` arm, which C17 6.5.15p3 forbids and gcc
-  accepts without comment: `execute/pr46309`, `compile/pr26725`,
-  `compile/20000211-1`. c17 rejects it, and `-fpermissive` does not relax it.
-- `compile/950919-1`: a GNU preprocessor assertion (`#cpu(m68k)`), which gcc
-  itself calls deprecated.
-- An empty write kept as a call: `builtins/printf`, `builtins/fprintf`,
-  `builtins/fputs`, `execute/printf-chk-1`, `execute/fprintf-chk-1`,
-  `execute/vprintf-chk-1`, `execute/vfprintf-chk-1` abort when `printf("")`,
-  `fprintf(fp, "")` or `fputs("", fp)` reaches the library at `-O1` and up.
-  C17 7.21.2p4 gives a stream its orientation from the first input or output
-  function applied to it, whether or not a byte moves, so c17 keeps every
-  empty write; gcc drops them and loses the orientation (`fwide(stdout, 0)`
-  after `printf("")` is negative under c17 and 0 under gcc).
-
-These are listed **by name** in the harness, never matched against the source.
-A content match is wrong: `pr86659-1`, `pr86659-2` and `pr87623` all mention
-`scalar_storage_order` and **pass**, so a scan for the feature would throw
-away cases c17 gets right. A name list also keeps every skip auditable, and a
-test added to the suite later shows up as a new failure and gets triaged then
--- which is the right moment to decide.
-
-Nothing is matched by content: every test is attempted unless a list names it,
-and a test's `.x` file is read for the few shapes the suite uses rather than
-taken as "skip". Matching the source, the `dg-require-effective-target` names,
-or the mere presence of a `.x` file would hide tests c17 passes and bugs it
-has.
-
-Skipping a test that is in the passing baseline is reported as a regression,
-by name. A skip of a test that was never in the baseline is not caught that
-way.
+The harness (`scripts/c17_torture.sh`) attempts every test; nothing is
+skipped by name. Only the suite's own directives -- a `.x` file, `dg-skip-if`,
+a `dg-do` target selector -- keep a test from running.
 
 ### Deliberate divergences from gcc
 
-The gcc-specific behaviour above is skipped. Two more divergences c17 keeps
-but does **not** skip, because they are not GNU-specific:
+Two divergences c17 keeps, which the tests below see as failures:
 
 | Test | Why c17 does not follow |
 |---|---|

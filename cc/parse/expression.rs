@@ -2150,11 +2150,17 @@ impl<'a> Parser<'a> {
 
         // gcc spells these as two groups, and so does `-Wno-`.
         if count < 0 {
-            if crate::diag::warning_group_enabled("shift-count-negative") {
-                crate::diag::warning(right.pos, &format!("{} shift count is negative", side));
-            }
-        } else if count >= width && crate::diag::warning_group_enabled("shift-count-overflow") {
-            crate::diag::warning(right.pos, &format!("{} shift count >= width of type", side));
+            crate::diag::group_warning(
+                "shift-count-negative",
+                right.pos,
+                &format!("{} shift count is negative", side),
+            );
+        } else if count >= width {
+            crate::diag::group_warning(
+                "shift-count-overflow",
+                right.pos,
+                &format!("{} shift count >= width of type", side),
+            );
         }
     }
 

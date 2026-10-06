@@ -131,14 +131,11 @@ impl IntArgRole {
                 &gettext("requested alignment is not an integer constant"),
             ),
             // gcc warns and ignores `aligned(0)` rather than refusing it.
-            (IntArgRole::Alignment, IntArgFault::Zero) => {
-                if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
-                    diag::warning(
-                        pos,
-                        &gettext("requested alignment '0' is not a positive power of 2"),
-                    );
-                }
-            }
+            (IntArgRole::Alignment, IntArgFault::Zero) => diag::group_warning(
+                ATTRIBUTE_WARNING,
+                pos,
+                &gettext("requested alignment '0' is not a positive power of 2"),
+            ),
             (IntArgRole::Alignment, IntArgFault::OutOfRange(n)) => diag::error_args(
                 pos,
                 "requested alignment '{0}' is not a positive power of 2",
@@ -168,15 +165,12 @@ impl IntArgRole {
                 "{0} priorities must be integers from 0 to 65535 inclusive",
                 &[name],
             ),
-            (IntArgRole::Unused, _) => {
-                if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
-                    diag::warning_args(
-                        pos,
-                        "'{0}' attribute argument is not an integer constant",
-                        &[name],
-                    );
-                }
-            }
+            (IntArgRole::Unused, _) => diag::group_warning_args(
+                ATTRIBUTE_WARNING,
+                pos,
+                "'{0}' attribute argument is not an integer constant",
+                &[name],
+            ),
         }
     }
 }
@@ -703,8 +697,13 @@ impl Parser<'_> {
         // not for one that changes what the type *is*.
         let arch = self.types.target().arch;
         let recognised = id.is_some_and(|id| crate::kw::attribute_supported(id, arch));
-        if !recognised && diag::warning_group_enabled(ATTRIBUTE_WARNING) {
-            diag::warning_args(pos, "'{0}' attribute directive ignored", &[&name]);
+        if !recognised {
+            diag::group_warning_args(
+                ATTRIBUTE_WARNING,
+                pos,
+                "'{0}' attribute directive ignored",
+                &[&name],
+            );
         }
 
         let grammar = AttrArgs::of(&name, recognised);
@@ -874,16 +873,22 @@ impl Parser<'_> {
             return;
         }
         attrs.alias = None;
-        if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
-            diag::warning_args(pos, "'{0}' attribute ignored", &["ifunc"]);
-        }
+        diag::group_warning_args(
+            ATTRIBUTE_WARNING,
+            pos,
+            "'{0}' attribute ignored",
+            &["ifunc"],
+        );
     }
 
     /// gcc's warning for a `cleanup(fn)` it ignores.
     pub(super) fn warn_cleanup_ignored(pos: Position) {
-        if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
-            diag::warning_args(pos, "'{0}' attribute ignored", &["cleanup"]);
-        }
+        diag::group_warning_args(
+            ATTRIBUTE_WARNING,
+            pos,
+            "'{0}' attribute ignored",
+            &["cleanup"],
+        );
     }
 
     /// `transparent_union` is a union attribute. gcc warns and ignores it
@@ -894,12 +899,11 @@ impl Parser<'_> {
     /// Shared by the two routes that can reach the mistake: on the
     /// struct-or-union specifier, and trailing after the declarator.
     pub(super) fn warn_transparent_union_ignored(&self, pos: Position) {
-        if crate::diag::warning_group_enabled(ATTRIBUTE_WARNING) {
-            diag::warning(
-                pos,
-                &gettext("'transparent_union' attribute ignored on a non-union type"),
-            );
-        }
+        diag::group_warning(
+            ATTRIBUTE_WARNING,
+            pos,
+            &gettext("'transparent_union' attribute ignored on a non-union type"),
+        );
     }
 
     /// Apply every type attribute held over from the declarator: the machine
@@ -970,17 +974,16 @@ impl Parser<'_> {
                 self.types.intern(ptr)
             }
             _ => {
-                if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
-                    let name = match conv {
-                        crate::abi::CallingConv::Win64 => "ms_abi",
-                        crate::abi::CallingConv::C => "sysv_abi",
-                    };
-                    diag::warning_args(
-                        pos,
-                        "'{0}' attribute only applies to function types",
-                        &[name],
-                    );
-                }
+                let name = match conv {
+                    crate::abi::CallingConv::Win64 => "ms_abi",
+                    crate::abi::CallingConv::C => "sysv_abi",
+                };
+                diag::group_warning_args(
+                    ATTRIBUTE_WARNING,
+                    pos,
+                    "'{0}' attribute only applies to function types",
+                    &[name],
+                );
                 typ
             }
         }
@@ -1128,13 +1131,12 @@ impl Parser<'_> {
                 }
             }
             None => {
-                if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
-                    diag::warning_args(
-                        pos,
-                        "'mode({0})' is not implemented; the declared type is used unchanged",
-                        &[&mode],
-                    );
-                }
+                diag::group_warning_args(
+                    ATTRIBUTE_WARNING,
+                    pos,
+                    "'mode({0})' is not implemented; the declared type is used unchanged",
+                    &[&mode],
+                );
                 typ
             }
         }
@@ -1190,10 +1192,13 @@ impl Parser<'_> {
                 }
                 // A struct or union's order is written in its specifier; on
                 // a declaration or declarator gcc ignores it, and says so.
-                if attrs.find("scalar_storage_order").is_some()
-                    && diag::warning_group_enabled(ATTRIBUTE_WARNING)
-                {
-                    diag::warning_args(pos, "'{0}' attribute ignored", &["scalar_storage_order"]);
+                if attrs.find("scalar_storage_order").is_some() {
+                    diag::group_warning_args(
+                        ATTRIBUTE_WARNING,
+                        pos,
+                        "'{0}' attribute ignored",
+                        &["scalar_storage_order"],
+                    );
                 }
                 self.pending_packed |= attrs.has_packed();
                 self.merge_symbol_attrs(&attrs);

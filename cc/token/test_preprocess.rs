@@ -2061,6 +2061,32 @@ fn test_has_include_next_searches_past_the_current_file() {
     assert_eq!(strs, ["NEXT_YES"]);
 }
 
+/// A header found in a system directory is a system header for diagnostics
+/// too -- the warnings `-w` would hide are not shown, and `-Werror` and
+/// `-pedantic-errors` do not reach it -- and so is one it includes from
+/// beside itself, or a bundled one. A `-I` header is not, however spelled.
+#[test]
+fn test_headers_from_system_directories_are_system_streams() {
+    let tree = SearchTree::new(&[
+        ("q/mine.h", ""),
+        ("sys/theirs.h", "#include \"beside.h\"\n"),
+        ("sys/beside.h", ""),
+    ]);
+    crate::diag::clear_streams();
+    tree.preprocess("#include <mine.h>\n#include \"theirs.h\"\n#include <stddef.h>\n");
+    let system = |suffix: &str| {
+        let name = crate::diag::get_all_stream_names()
+            .into_iter()
+            .find(|n| n.ends_with(suffix))
+            .unwrap_or_else(|| panic!("no stream for {suffix}"));
+        crate::diag::stream_is_system(crate::diag::find_or_add_stream(&name))
+    };
+    assert!(!system("q/mine.h"));
+    assert!(system("sys/theirs.h"));
+    assert!(system("sys/beside.h"));
+    assert!(system("<builtin:stddef.h>"));
+}
+
 /// A header found through `-I` is the project's, which `-MM` lists; only one
 /// found in a system directory is a system header, however it was spelled.
 #[test]

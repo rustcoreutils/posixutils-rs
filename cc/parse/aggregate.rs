@@ -1067,19 +1067,18 @@ impl Parser<'_> {
         let Some(written) = written else {
             return declared;
         };
-        let warn = diag::warning_group_enabled(ATTRIBUTE_WARNING);
         if variant_allowed == VariantAllowed::No || declared != base {
-            if warn {
-                diag::warning_args(
-                    written.pos,
-                    "'{0}' attribute ignored",
-                    &["scalar_storage_order"],
-                );
-            }
+            diag::group_warning_args(
+                ATTRIBUTE_WARNING,
+                written.pos,
+                "'{0}' attribute ignored",
+                &["scalar_storage_order"],
+            );
             return declared;
         }
-        if variant_allowed == VariantAllowed::TypeName && warn {
-            diag::warning_args(
+        if variant_allowed == VariantAllowed::TypeName {
+            diag::group_warning_args(
+                ATTRIBUTE_WARNING,
                 written.pos,
                 "ignoring attributes applied to '{0}' after definition",
                 &[&self.types.format_type(base, Some(self.idents))],

@@ -429,6 +429,12 @@ struct Args {
     /// (rewritten by `preprocess_args_from`); see [`Args::lang_of`].
     #[arg(long = "c17-x", action = clap::ArgAction::Append, value_name = "lang:path", hide = true)]
     lang_overrides: Vec<String>,
+
+    /// The options accepted and ignored, each warned about once `-w` and
+    /// `-Werror` are known (rewritten by `preprocess_args_from`).
+    #[arg(long = "c17-ignored", action = clap::ArgAction::Append, value_name = "option",
+          allow_hyphen_values = true, hide = true)]
+    ignored_options: Vec<String>,
 }
 
 /// The `-Wno-` name for the "`-std=` was not honoured" warning.
@@ -447,6 +453,24 @@ fn driver_warning(msg: &str) {
     eprintln!("c17: {}: {}", gettext("warning"), msg);
 }
 
+/// A command-line problem gcc refuses outright and c17 lets through with a
+/// warning: an option it does not know, or one output named for several.
+/// Under `-Werror` that leniency is withdrawn -- the warning is an error,
+/// tagged as gcc tags a promoted one, and the run fails, as gcc's would --
+/// because a configure probe adds `-Werror` exactly to find out whether the
+/// compiler accepts what it is given. Answers whether it was an error.
+///
+/// The warnings gcc's driver gives itself stay [`driver_warning`]s: gcc's
+/// `-Werror` does not reach them.
+fn driver_leniency(msg: &str) -> bool {
+    if diag::warnings_suppressed() || !diag::werror_all() {
+        driver_warning(msg);
+        return false;
+    }
+    eprintln!("c17: {}: {} [-Werror]", gettext("error"), msg);
+    true
+}
+
 impl Args {
     /// Classify `-std=`, if one was given.
     ///
@@ -458,15 +482,6 @@ impl Args {
             None => Ok(None),
             Some(spec) => classify_std(spec).map(Some).ok_or(spec.as_str()),
         }
-    }
-
-    /// Is the warning named `name` turned off, by `-w` or `-Wno-<name>`?
-    fn warning_suppressed(&self, name: &str) -> bool {
-        self.no_warnings
-            || self
-                .warnings
-                .iter()
-                .any(|w| w.strip_prefix("no-") == Some(name))
     }
 }
 
@@ -1708,6 +1723,9 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     let mut debug: Option<bool> = None;
     // `-fsignaling-nans`, last one wins.
     let mut signaling_nans = false;
+    // The options accepted and ignored with a warning, which waits for the
+    // parse: `-w` and `-Werror` decide what it is, wherever they stand.
+    let mut ignored = Vec::new();
 
     while i < raw_args.len() {
         let arg = &raw_args[i];
@@ -1820,7 +1838,7 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             // Debug-format and debug-content tuning: c17 emits one kind of
             // DWARF, so these change nothing it could honour.
             if !is_known_ignorable_g_flag(arg) {
-                eprintln!("c17: {}: {}", gettext("unrecognized option, ignored"), arg);
+                ignored.push(format!("--c17-ignored={arg}"));
             }
             i += 1;
         } else if arg == "-fPIC" || arg == "-fpic" {
@@ -1966,7 +1984,7 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
             // than from gcc's manual. Add to it when a corpus needs it, not in
             // anticipation.
             if !is_known_ignorable_f_flag(arg) {
-                eprintln!("c17: {}: {}", gettext("unrecognized option, ignored"), arg);
+                ignored.push(format!("--c17-ignored={arg}"));
             }
             i += 1;
         } else if arg == "--param" || arg.starts_with("--param=") {
@@ -2111,6 +2129,7 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
     // Options gathered over the whole scan, placed ahead of any `--`, after
     // which everything is an operand.
     let mut trailer = lang_overrides;
+    trailer.append(&mut ignored);
     if debug == Some(true) {
         trailer.push("-g".to_string());
     }
@@ -2735,18 +2754,22 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     if !args.fno_builtin_funcs.is_empty() {
         builtins::set_no_builtin_funcs(args.fno_builtin_funcs.iter().cloned().collect());
     }
-    // `-Wno-<name>` reaches the places that emit warnings, which are nowhere
-    // near here. The one group that is off by default is `-Wpedantic`, which
-    // has a switch of its own because `-pedantic-errors` makes it fatal.
-    diag::set_pedantic(diag::Pedantic::from_warning_options(
-        args.warnings.iter().map(String::as_str),
-    ));
-    diag::suppress_warning_groups(
-        args.warnings
-            .iter()
-            .filter_map(|w| w.strip_prefix("no-").map(str::to_string))
-            .collect(),
-    );
+    // The `-W` options reach the places that emit warnings, which are
+    // nowhere near here: the groups `-Wno-<name>` turns off, `-Wpedantic`
+    // and `-pedantic-errors`, and `-Werror` with its relatives.
+    let warning_options: Vec<&str> = args.warnings.iter().map(String::as_str).collect();
+    diag::set_warning_options(&warning_options);
+
+    // Set when `-Werror` makes an error of a command-line warning; see
+    // `driver_leniency`. Every such warning is given before stopping.
+    let mut refused = false;
+    for option in &args.ignored_options {
+        refused |= driver_leniency(&format!(
+            "{}: {}",
+            gettext("unrecognized option, ignored"),
+            option
+        ));
+    }
 
     // Validate -std= alongside the other argument checks, before any
     // early-return path, so a typo is never silently accepted.
@@ -2763,7 +2786,7 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
         // C17 and only C17, so the flag is accepted -- build systems pass it
         // unconditionally -- but silently ignoring it is what let
         // __STDC_VERSION__ disagree with the binary's own name once already.
-        Ok(Some(StdRequest::Older)) if !args.warning_suppressed(STD_DIALECT_WARNING) => {
+        Ok(Some(StdRequest::Older)) if diag::warning_group_enabled(STD_DIALECT_WARNING) => {
             let spec = args.c17_std.as_deref().unwrap_or_default();
             driver_warning(&gettext_args(
                 "'-std={0}' ignored; c17 compiles C17 (ISO/IEC 9899:2018) only",
@@ -2854,7 +2877,7 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     // spec leaves this unspecified (88338-88343); say so rather than silently
     // producing one object.
     if args.compile_only && args.output.is_some() && source_count > 1 {
-        driver_warning(&format!(
+        refused |= driver_leniency(&format!(
             "{} ({})",
             gettext("-o applies only to the last source operand with -c"),
             source_count
@@ -2885,11 +2908,14 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     // overwrite. Still worth saying, since a makefile expecting one .i per
     // source gets one file holding all of them.
     if args.preprocess_only && args.output.is_some() && source_count > 1 {
-        driver_warning(&format!(
+        refused |= driver_leniency(&format!(
             "{} ({})",
             gettext("-o collects every source operand into one file with -E"),
             source_count
         ));
+    }
+    if refused {
+        std::process::exit(1);
     }
 
     if let Some(mode) = args.binding.as_deref() {
@@ -2948,7 +2974,9 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
             // the same as producing nothing, though: preprocess it and write
             // the text, as gcc does.
             OperandKind::Asm if args.preprocess_only => {
-                match preprocess_asm_operand(&op.path, &args, &target, &mut pp_out) {
+                let result = preprocess_asm_operand(&op.path, &args, &target, &mut pp_out);
+                diag::report_promoted_warnings();
+                match result {
                     Ok(()) => {}
                     Err(e) => {
                         eprintln!("c17: {}: {}", op.path, plib::diag::io_error_text(&e));
@@ -2957,7 +2985,9 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             OperandKind::Asm => {
-                match assemble_operand(&op.path, &args, &target, scratch.path(), idx) {
+                let result = assemble_operand(&op.path, &args, &target, scratch.path(), idx);
+                diag::report_promoted_warnings();
+                match result {
                     Ok(Some(obj)) => operand_objects[idx] = Some(obj),
                     Ok(None) => {}
                     Err(e) => {
@@ -2972,7 +3002,12 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
                     object: &obj_name,
                     preprocessed: &mut pp_out,
                 };
-                match process_file(&op.path, &args, &target, &mut outputs, scratch.path(), idx) {
+                let result =
+                    process_file(&op.path, &args, &target, &mut outputs, scratch.path(), idx);
+                // gcc's "warnings being treated as errors" closes the unit's
+                // own diagnostics, ahead of the driver's verdict on it.
+                diag::report_promoted_warnings();
+                match result {
                     Ok(Compiled::Nothing) => {}
                     Ok(Compiled::Object { path, temporary }) => {
                         if temporary {

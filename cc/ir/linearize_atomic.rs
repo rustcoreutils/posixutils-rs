@@ -153,8 +153,9 @@ impl Linearizer<'_> {
         else {
             return MemoryOrder::SeqCst;
         };
-        if fail as u8 > succ as u8 && diag::warning_group_enabled(MEMORY_MODEL_WARNING) {
-            diag::warning_args(
+        if fail as u8 > succ as u8 {
+            diag::group_warning_args(
+                MEMORY_MODEL_WARNING,
                 failure.pos,
                 "failure memory model '{0}' cannot be stronger than success memory \
                  model '{1}' for an atomic compare-exchange",
@@ -180,14 +181,17 @@ impl Linearizer<'_> {
             Some(order) => (Some(order), format!("'{}'", order_name(order))),
             None => (None, value.to_string()),
         };
-        if diag::warning_group_enabled(MEMORY_MODEL_WARNING) {
-            let template = if access == OrderedAccess::CasFailure && order.is_some() {
-                "invalid failure memory model {0} for an atomic compare-exchange"
-            } else {
-                "invalid memory model {0} for {1}"
-            };
-            diag::warning_args(expr.pos, template, &[&shown, access.name()]);
-        }
+        let template = if access == OrderedAccess::CasFailure && order.is_some() {
+            "invalid failure memory model {0} for an atomic compare-exchange"
+        } else {
+            "invalid memory model {0} for {1}"
+        };
+        diag::group_warning_args(
+            MEMORY_MODEL_WARNING,
+            expr.pos,
+            template,
+            &[&shown, access.name()],
+        );
         RequestedOrder::Invalid
     }
 

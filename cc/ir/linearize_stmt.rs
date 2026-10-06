@@ -1920,8 +1920,9 @@ impl<'a> super::linearize::Linearizer<'a> {
             || CaseConv::new(128, false),
             |t| CaseConv::of(self.types, t),
         );
-        if own.convert(converted) != val && crate::diag::warning_group_enabled(CASE_RANGE_WARNING) {
-            crate::diag::warning(
+        if own.convert(converted) != val {
+            crate::diag::group_warning(
+                CASE_RANGE_WARNING,
                 expr.pos,
                 &format!(
                     "overflow converting case value to switch condition type \

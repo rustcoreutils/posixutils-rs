@@ -1146,6 +1146,15 @@ impl<'a> Preprocessor<'a> {
         // brought it in: that is what lets a diagnostic inside a header name
         // the chain that reached it.
         let stream_id = diag::init_included_stream(&self.current_file, hash_token.pos);
+        // A system header, as gcc has it, is one found in a system directory,
+        // or found beside a system header that included it -- whatever the
+        // spelling. Its warnings are not shown, and neither `-Werror` nor
+        // `-pedantic-errors` reaches it.
+        let is_system = match search_pos {
+            Some(pos) => matches!(pos, SearchPos::System(_) | SearchPos::Bundled),
+            None => diag::stream_is_system(hash_token.pos.stream),
+        };
+        diag::set_stream_system(stream_id, is_system);
 
         // Tokenize the included file using the same shared string table
         // Since we use the same StringTable, all StringIds are consistent
@@ -1223,6 +1232,8 @@ impl<'a> Preprocessor<'a> {
         // Create a stream for this builtin header, with the `#include` that
         // asked for it; see `include_file`.
         let stream_id = diag::init_included_stream(&self.current_file, hash_token.pos);
+        // The bundled headers are the compiler's own, gcc's system headers.
+        diag::set_stream_system(stream_id, true);
 
         // Tokenize the builtin content
         let tokens = {

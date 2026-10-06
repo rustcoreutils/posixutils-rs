@@ -93,8 +93,12 @@ impl Parser<'_> {
         let (pos, attrs) = self.parse_attribute_declaration()?;
         if attrs.find(FALLTHROUGH).is_none() {
             diag::warning(pos, &gettext("empty declaration"));
-        } else if diag::warning_group_enabled(ATTRIBUTE_WARNING) {
-            diag::warning(pos, &gettext("'fallthrough' attribute at top level"));
+        } else {
+            diag::group_warning(
+                ATTRIBUTE_WARNING,
+                pos,
+                &gettext("'fallthrough' attribute at top level"),
+            );
         }
         Ok(ExternalDecl::Declaration(Declaration {
             declarators: vec![],
@@ -132,19 +136,22 @@ impl Parser<'_> {
     /// The rest of a `fallthrough` statement's attributes, which apply to
     /// nothing. An unrecognised one has already been warned about as such.
     fn warn_ignored_beside_fallthrough(&self, pos: Position, attrs: &AttributeList) {
-        if !diag::warning_group_enabled(ATTRIBUTE_WARNING) {
-            return;
-        }
         for attr in &attrs.attrs {
             if attr.is_named(FALLTHROUGH) {
                 if !attr.args.is_empty() {
-                    diag::warning(
+                    diag::group_warning(
+                        ATTRIBUTE_WARNING,
                         pos,
                         &gettext("'fallthrough' attribute specified with a parameter"),
                     );
                 }
             } else if self.is_supported_attribute(&attr.name) {
-                diag::warning_args(pos, "'{0}' attribute ignored", &[&attr.name]);
+                diag::group_warning_args(
+                    ATTRIBUTE_WARNING,
+                    pos,
+                    "'{0}' attribute ignored",
+                    &[&attr.name],
+                );
             }
         }
     }

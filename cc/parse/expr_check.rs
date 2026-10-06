@@ -1128,9 +1128,9 @@ impl Parser<'_> {
             && self
                 .types
                 .reverses_storage(self.types.innermost_element(typ))
-            && diag::warning_group_enabled("scalar-storage-order")
         {
-            diag::warning(
+            diag::group_warning(
+                "scalar-storage-order",
                 pos,
                 &gettext("address of array with reverse scalar storage order requested"),
             );

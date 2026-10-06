@@ -58,3 +58,4 @@ mod specifiers;
 mod storage_order;
 mod target_attr;
 mod va_arg_pack;
+mod werror;

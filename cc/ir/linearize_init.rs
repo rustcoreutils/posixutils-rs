@@ -1025,13 +1025,11 @@ impl<'a> super::linearize::Linearizer<'a> {
     /// saturated value. An explicit cast says the program means it, and gcc
     /// is silent there.
     pub(crate) fn warn_saturated_conversion(&self, expr: &Expr, typ: TypeId) {
-        if !crate::diag::warning_group_enabled(OVERFLOW_WARNING) {
-            return;
-        }
         let from = expr
             .typ
             .map_or_else(String::new, |t| self.types.format_type(t, None));
-        crate::diag::warning(
+        crate::diag::group_warning(
+            OVERFLOW_WARNING,
             self.expr_pos(expr),
             &format!(
                 "overflow in conversion from '{from}' to '{}' changes value",

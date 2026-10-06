@@ -15,6 +15,7 @@
 
 mod gcc_flags;
 mod prefix_map;
+mod werror;
 
 use crate::common::{create_c_file, run_c17};
 use std::path::{Path, PathBuf};

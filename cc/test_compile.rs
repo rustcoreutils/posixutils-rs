@@ -80,18 +80,17 @@ fn apply_flags(flags: &[&str]) -> Options {
         trapping_math: true,
         ..Options::default()
     };
-    let mut no_groups = std::collections::HashSet::new();
     let mut no_builtin_funcs = std::collections::HashSet::new();
-    let mut pedantic = diag::Pedantic::OFF;
+    // The `-W<name>` options, in order, as the driver folds them. As there,
+    // `-pedantic` and `-pedantic-errors` are among them.
+    let mut warning_options = Vec::new();
     for &flag in flags {
-        // As the driver: `-pedantic` and `-pedantic-errors` are `-W` options
-        // by the time the switch is folded.
         let w_name = match flag {
             "-pedantic" | "-pedantic-errors" => Some(&flag[1..]),
             _ => flag.strip_prefix("-W"),
         };
-        if let Some(next) = w_name.and_then(|name| pedantic.after(name)) {
-            pedantic = next;
+        if let Some(name) = w_name {
+            warning_options.push(name);
             continue;
         }
         match flag {
@@ -123,8 +122,6 @@ fn apply_flags(flags: &[&str]) -> Options {
                     o.optimization = Optimization::from_flag(level).unwrap();
                 } else if let Some(map) = MapOption::parse(flag) {
                     o.prefix_maps.push(map.unwrap());
-                } else if let Some(name) = flag.strip_prefix("-Wno-") {
-                    no_groups.insert(name.to_string());
                 } else if let Some(name) = flag.strip_prefix("-fno-builtin-") {
                     no_builtin_funcs.insert(name.to_string());
                 } else if let Some(d) = flag.strip_prefix("-D") {
@@ -148,8 +145,7 @@ fn apply_flags(flags: &[&str]) -> Options {
     if let Some(enabled) = o.inlining {
         o.optimization.set_inlining(enabled);
     }
-    diag::suppress_warning_groups(no_groups);
-    diag::set_pedantic(pedantic);
+    diag::set_warning_options(&warning_options);
     crate::builtins::set_no_builtin_funcs(no_builtin_funcs);
     o
 }
@@ -225,6 +221,7 @@ fn compile_here(name: &str, src: &str, flags: &[&str]) -> Compiled {
     };
     let result = pipeline::compile_tokens(preprocessed, &strings, &target, &opts, &mut Quiet);
 
+    diag::report_promoted_warnings();
     let mut diags = diag::take_captured_diagnostics();
     let asm = match result {
         Ok(asm) => asm,

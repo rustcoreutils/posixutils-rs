@@ -32,13 +32,14 @@ use crate::formats::ustar::{
     LINKNAME_OFF, MAGIC_OFF, MODE_OFF, MTIME_OFF, NAME_LEN, NAME_OFF, PREFIX_LEN, PREFIX_OFF,
     SIZE_OFF, TYPEFLAG_OFF, UID_OFF, UNAME_LEN, UNAME_OFF, VERSION_OFF, ZERO_BLOCK,
 };
-use crate::formats::ArchiveStream;
+use crate::formats::{ArchiveStream, MAX_NAME};
 use crate::options::FormatOptions;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::{Read, Seek, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 // The header block layout, the typeflags and the zero block all come from
 // `formats::ustar`: a pax archive *is* a ustar archive with extra headers, and
@@ -225,6 +226,35 @@ impl ExtendedHeader {
         self.deleted.retain(|keyword| keep(keyword));
     }
 
+    /// This header without its extension records (`extra`): the typed fields,
+    /// and which of them were deleted.
+    ///
+    /// What a member's records start from in place of a full copy of the
+    /// global ones: the extensions are shared instead (see `ExtRecords`), and
+    /// a deletion of one matters only when this header is merged into
+    /// another, which a member's records never are.
+    fn typed_only(&self) -> ExtendedHeader {
+        ExtendedHeader {
+            atime: self.atime,
+            mtime: self.mtime,
+            ctime: self.ctime,
+            path: self.path.clone(),
+            linkpath: self.linkpath.clone(),
+            size: self.size,
+            uid: self.uid,
+            gid: self.gid,
+            uname: self.uname.clone(),
+            gname: self.gname.clone(),
+            hdrcharset: self.hdrcharset.clone(),
+            extra: HashMap::new(),
+            deleted: STANDARD_KEYWORDS
+                .iter()
+                .filter(|keyword| self.deleted.contains(**keyword))
+                .map(|keyword| keyword.to_string())
+                .collect(),
+        }
+    }
+
     /// The records a set of `-o` operands stands for, in a stable order so
     /// that a bad value is always the same one reported. `assign` is the
     /// operator they were given with (`=` or `:=`), for the diagnostic.
@@ -290,6 +320,17 @@ impl ExtendedHeader {
         self.deleted.remove(keyword);
         // A pathname keyword keeps its bytes whatever they are; under
         // hdrcharset=BINARY they are deliberately not UTF-8.
+        //
+        // Its length is held to the limit every other header's pathname is
+        // (a GNU long name, a cpio name): a record may otherwise run to the
+        // whole extended header, and a short compressed archive could then
+        // hand extraction a name of millions of components to walk.
+        if matches!(keyword, "path" | "linkpath") && value_bytes.len() as u64 > MAX_NAME {
+            return Err(PaxError::InvalidHeader(format!(
+                "{keyword} record of {} bytes exceeds the {MAX_NAME} byte limit",
+                value_bytes.len()
+            )));
+        }
         match keyword {
             "path" => {
                 self.path = Some(value_bytes.to_vec());
@@ -557,6 +598,11 @@ impl ExtendedHeader {
         }
         for (keyword, value) in &self.extra {
             entry.set_ext_record(keyword, value);
+        }
+        // A deleted record also deletes the global value beneath it, which
+        // the entry holds shared rather than here.
+        for keyword in &self.deleted {
+            entry.ext_records.hide(keyword);
         }
         if self.deleted.contains("uname") {
             entry.uname = None;
@@ -909,8 +955,14 @@ pub struct PaxReader<R: Read> {
     current_size: u64,
     bytes_read: u64,
     /// The global values in force: `-o keyword=value` first, then every `g`
-    /// header read so far, each layered over the last.
+    /// header read so far, each layered over the last. Its extension records
+    /// are kept in `global_extra` instead.
     global_header: ExtendedHeader,
+    /// The extension records of `global_header`, less any `-o delete=`
+    /// removes: held once and shared by every member they apply to, since
+    /// cloning them into each one made a large `g` header cost its size
+    /// times the number of members.
+    global_extra: Arc<HashMap<String, String>>,
     /// `-o keyword:=value`, appended to every member's extended header.
     per_file_options: ExtendedHeader,
     /// `-o` options consulted on read (`delete=` keyword removal).
@@ -931,6 +983,7 @@ impl<R: Read> PaxReader<R> {
             current_size: 0,
             bytes_read: 0,
             global_header: ExtendedHeader::new(),
+            global_extra: Arc::default(),
             per_file_options: ExtendedHeader::new(),
             options: FormatOptions::default(),
             member_offset: 0,
@@ -957,10 +1010,32 @@ impl<R: Read> PaxReader<R> {
     /// the keyword records described at [`OptionRecords`].
     pub fn with_options(mut self, options: FormatOptions) -> PaxResult<Self> {
         let records = OptionRecords::new(&options)?;
-        self.global_header = records.global;
-        self.per_file_options = records.per_file;
         self.options = options;
+        self.global_header = ExtendedHeader::new();
+        self.global_extra = Arc::default();
+        self.merge_global(records.global);
+        self.per_file_options = records.per_file;
         Ok(self)
+    }
+
+    /// Layer a `g` header -- or the `-o keyword=value` records that act as
+    /// one -- over the global values in force.
+    ///
+    /// Its extension records go straight into the shared map, which no member
+    /// still holds by the time the next header is read, so this costs the
+    /// size of `later` rather than of everything global so far.
+    fn merge_global(&mut self, mut later: ExtendedHeader) {
+        let extra = std::mem::take(&mut later.extra);
+        let shared = Arc::make_mut(&mut self.global_extra);
+        for keyword in &later.deleted {
+            shared.remove(keyword);
+        }
+        for (keyword, value) in extra {
+            if !self.options.should_delete_keyword(&keyword) {
+                shared.insert(keyword, value);
+            }
+        }
+        self.global_header.merge(&later);
     }
 
     /// Read a raw header block
@@ -984,8 +1059,11 @@ impl<R: Read> PaxReader<R> {
     /// `-o delete=` removes the archive's records, so a removed keyword falls
     /// back to the header block value; the operator's own `:=` records are
     /// applied whatever it matches.
+    ///
+    /// The global extension records are not among them: they are shared
+    /// through `global_extra` rather than copied into every member.
     fn member_records(&self, extended_header: Option<&ExtendedHeader>) -> ExtendedHeader {
-        let mut records = self.global_header.clone();
+        let mut records = self.global_header.typed_only();
         if let Some(ext) = extended_header {
             records.merge(ext);
         }
@@ -1046,7 +1124,7 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
                     // for the keywords it names; the rest stay in force.
                     let size = parse_numeric(&header[SIZE_OFF..SIZE_OFF + 12])?;
                     let global = self.read_extended_header(size)?;
-                    self.global_header.merge(&global);
+                    self.merge_global(global);
                     self.saw_extended_header = true;
                 }
                 PAX_XHDR => {
@@ -1078,6 +1156,7 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
 
                     self.member_records(extended_header.as_ref())
                         .apply_to(&mut entry);
+                    entry.ext_records.share(&self.global_extra);
 
                     // A `size=` record replaces the size field, not the rule
                     // for which types carry data: a directory or FIFO has

@@ -180,6 +180,47 @@ pub fn run_program(program: &Path, args: &[&str], dir: &Path, stdin_data: Option
         .unwrap_or_else(|e| panic!("failed to wait for {}: {}", name, e))
 }
 
+/// Whether `program` writes its first `record` bytes of output while its
+/// standard input is still open, after being fed only `names`.
+///
+/// For the name-list readers, which must archive each name as it arrives
+/// rather than wait for the producer to finish. Gives up after five seconds,
+/// and kills the child either way.
+pub fn writes_before_list_ends(
+    program: &Path,
+    args: &[&str],
+    dir: &Path,
+    names: &[u8],
+    record: usize,
+) -> bool {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(names).unwrap();
+    stdin.flush().unwrap();
+
+    let mut stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; record];
+        let _ = tx.send(stdout.read_exact(&mut buf).is_ok());
+    });
+    let got = rx.recv_timeout(Duration::from_secs(5));
+
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    got == Ok(true)
+}
+
 /// Run `tar` in `dir`.
 pub fn run_tar(args: &[&str], dir: &Path) -> Output {
     run_front_end("tar", args, dir, None)

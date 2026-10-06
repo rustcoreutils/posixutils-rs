@@ -37,7 +37,7 @@ use gettextrs::gettext;
 use modes::copy::CopyOptions;
 use modes::list::ListOptions;
 use modes::read::ReadOptions;
-use modes::write::WriteOptions;
+use modes::write::{FileNames, NameList, WriteOptions};
 use multivolume::{MultiVolumeOptions, MultiVolumeReader};
 use options::FormatOptions;
 use pattern::Pattern;
@@ -182,10 +182,12 @@ struct Args {
     #[arg(help = gettext("Pathnames, patterns and file operands to be processed"))]
     files_and_patterns: Vec<OsString>,
 
-    /// The names to archive were given explicitly (tar `-T`), so an empty
-    /// list means archive nothing rather than read names from stdin.
+    /// Lists of pathnames to process ahead of the operands, read as they are
+    /// needed: tar's `-T`, and cpio's NUL-separated standard input. A list
+    /// given explicitly is never replaced by standard input, so an empty `-T`
+    /// list archives nothing.
     #[arg(skip)]
-    names_given: bool,
+    name_lists: Vec<NameList>,
 
     /// tar `-C`: change to this directory before operating. Applied after the
     /// `-f` pathname has been resolved, since that one is relative to the
@@ -280,6 +282,7 @@ fn run(mut args: Args) -> PaxResult<()> {
     apply_chdir(&mut args)?;
 
     let mode = determine_mode(&args);
+    let name_lists = std::mem::take(&mut args.name_lists);
 
     // Counts the archive bytes read or written, for the block total cpio
     // reports when it is done.
@@ -288,9 +291,9 @@ fn run(mut args: Args) -> PaxResult<()> {
     let result = match mode {
         PaxMode::List => run_list(&args, &archive_bytes),
         PaxMode::Read => run_read(&args, &archive_bytes),
-        PaxMode::Write => run_write(&args, &archive_bytes),
-        PaxMode::Append => run_append(&args, &archive_bytes),
-        PaxMode::Copy => run_copy(&args),
+        PaxMode::Write => run_write(&args, name_lists, &archive_bytes),
+        PaxMode::Append => run_append(&args, name_lists, &archive_bytes),
+        PaxMode::Copy => run_copy(&args, name_lists),
     };
 
     // cpio reports the size of the archive it just handled. Copy mode moves no
@@ -502,9 +505,8 @@ fn reject_dash_c(args: &Args, mode: &str) -> PaxResult<()> {
     Ok(())
 }
 
-fn run_write(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
+fn run_write(args: &Args, name_lists: Vec<NameList>, archive_bytes: &ByteCounter) -> PaxResult<()> {
     reject_dash_c(args, "write")?;
-    let files = get_files_to_archive(args)?;
     let substitutions = parse_substitutions(args)?;
     let format_options = parse_format_options(args)?;
 
@@ -527,9 +529,15 @@ fn run_write(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
 
     let format = ArchiveFormat::from(selected);
 
+    // The first name is read before the archive is created, so a list that
+    // cannot be read at all fails before an existing archive is truncated.
+    // The rest is read as the walk goes.
+    let mut files = source_names(name_lists, &args.files_and_patterns).peekable();
+    files.peek();
+
     // Check for multi-volume mode
     if args.multi_volume {
-        return run_write_multi_volume(args, &files, format, &options);
+        return run_write_multi_volume(args, &mut files, format, &options);
     }
 
     // Determine record size for blocked I/O. With no explicit -b, the default
@@ -550,16 +558,16 @@ fn run_write(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
         } else {
             blocked
         };
-        modes::create_archive(GzipWriter::new(blocked)?, &files, format, &options)
+        modes::create_archive(GzipWriter::new(blocked)?, &mut files, format, &options)
     } else {
-        modes::create_archive(blocked, &files, format, &options)
+        modes::create_archive(blocked, &mut files, format, &options)
     }
 }
 
 /// Run write mode with multi-volume support
 fn run_write_multi_volume(
     args: &Args,
-    files: &[PathBuf],
+    files: &mut FileNames<'_>,
     format: ArchiveFormat,
     options: &WriteOptions,
 ) -> PaxResult<()> {
@@ -610,7 +618,11 @@ fn run_write_multi_volume(
 }
 
 /// Run append mode (-w -a)
-fn run_append(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
+fn run_append(
+    args: &Args,
+    name_lists: Vec<NameList>,
+    archive_bytes: &ByteCounter,
+) -> PaxResult<()> {
     // Append mode requires an archive file (not stdin/stdout)
     let archive_path = args
         .archive
@@ -620,10 +632,9 @@ fn run_append(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
     // Check if archive exists - if not, create it instead of appending
     if !archive_path.exists() {
         // Fall back to create mode
-        return run_write(args, archive_bytes);
+        return run_write(args, name_lists, archive_bytes);
     }
 
-    let files = get_files_to_archive(args)?;
     let substitutions = parse_substitutions(args)?;
     let format_options = parse_format_options(args)?;
 
@@ -649,7 +660,7 @@ fn run_append(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
     let record_size = write_record_size(args, DEFAULT_RECORD_SIZE)?;
     modes::append_to_archive(
         archive_path,
-        &files,
+        &mut source_names(name_lists, &args.files_and_patterns),
         &mut options,
         requested_format,
         record_size,
@@ -658,31 +669,18 @@ fn run_append(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
 }
 
 /// Run copy mode (-r -w)
-fn run_copy(args: &Args) -> PaxResult<()> {
+fn run_copy(args: &Args, name_lists: Vec<NameList>) -> PaxResult<()> {
     reject_dash_c(args, "copy")?;
 
-    // In copy mode, the last argument is the destination directory
-    // All other arguments are files/directories to copy
-    if args.files_and_patterns.is_empty() {
+    // In copy mode, the last argument is the destination directory; all the
+    // others are files/directories to copy, and with none the names are read
+    // from standard input.
+    let Some((dest, sources)) = args.files_and_patterns.split_last() else {
         return Err(PaxError::InvalidFormat(
             "copy mode requires a destination directory".to_string(),
         ));
-    }
-
-    let (files, dest_dir) = if args.files_and_patterns.len() == 1 {
-        // Only destination provided, read file list from stdin
-        let files = modes::write::read_file_list(io::stdin())?;
-        let dest = PathBuf::from(&args.files_and_patterns[0]);
-        (files, dest)
-    } else {
-        // Last arg is destination, rest are files
-        let dest = PathBuf::from(args.files_and_patterns.last().unwrap());
-        let files: Vec<PathBuf> = args.files_and_patterns[..args.files_and_patterns.len() - 1]
-            .iter()
-            .map(PathBuf::from)
-            .collect();
-        (files, dest)
     };
+    let dest_dir = PathBuf::from(dest);
 
     // Copy mode has no pattern operands: every operand is a source pathname.
     let patterns = compile_patterns(&[]);
@@ -709,7 +707,7 @@ fn run_copy(args: &Args) -> PaxResult<()> {
         umask: current_umask(),
     };
 
-    modes::copy_files(&files, &dest_dir, &options)
+    modes::copy_files(&mut source_names(name_lists, sources), &dest_dir, &options)
 }
 
 /// Open the archive for reading, detecting its format.
@@ -884,14 +882,30 @@ fn compile_patterns(patterns: &[OsString]) -> Vec<Pattern> {
         .collect()
 }
 
-/// Get files to archive (from args or stdin)
-fn get_files_to_archive(args: &Args) -> PaxResult<Vec<PathBuf>> {
-    if args.files_and_patterns.is_empty() && !args.names_given {
-        // Read from stdin
-        modes::write::read_file_list(io::stdin())
+/// The pathnames write, append and copy mode act on: the names in any lists
+/// (tar `-T`, cpio `-0`), then `operands`, and with neither the names on
+/// standard input, one per line.
+///
+/// A list is read as the walk asks for each name. One that cannot be read is
+/// diagnosed and ends there; what was archived before it stays archived, and
+/// the archive is still finished properly.
+fn source_names(lists: Vec<NameList>, operands: &[OsString]) -> impl Iterator<Item = PathBuf> + '_ {
+    let lists = if lists.is_empty() && operands.is_empty() {
+        vec![NameList::stdin(b'\n')]
     } else {
-        Ok(args.files_and_patterns.iter().map(PathBuf::from).collect())
-    }
+        lists
+    };
+    lists
+        .into_iter()
+        .flat_map(|list| list.names().map_while(report_list_error))
+        .chain(operands.iter().map(PathBuf::from))
+}
+
+/// A name from a list, or `None` -- ending the list -- after diagnosing a
+/// failure to read it.
+fn report_list_error(name: PaxResult<PathBuf>) -> Option<PathBuf> {
+    name.map_err(|e| error::report_error(gettext("pathname list"), e))
+        .ok()
 }
 
 /// Parse the -p privilege strings and return preservation flags.
@@ -1169,7 +1183,7 @@ mod tests {
         let name = OsString::from_vec(b"caf\xe9".to_vec());
         let args = Args::try_parse_from([OsString::from("pax"), "-w".into(), name.clone()])
             .expect("a non-UTF-8 operand is a pathname, not a usage error");
-        let files = get_files_to_archive(&args).unwrap();
+        let files: Vec<PathBuf> = source_names(Vec::new(), &args.files_and_patterns).collect();
         assert_eq!(files[0].as_os_str().as_bytes(), b"caf\xe9");
 
         // As a pattern it selects the member of that name.

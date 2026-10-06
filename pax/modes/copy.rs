@@ -21,6 +21,7 @@ use crate::modes::anchored::{
     restore_dir_atime, set_attrs_fd, set_link_attrs_at, stat_at, AttrPolicy, Attrs, DirTree,
     MemberPath, PendingDirs,
 };
+use crate::modes::write::FileNames;
 use crate::pattern::{matches_any, Pattern};
 use crate::subst::{substitute_name, Substitution};
 use std::cell::RefCell;
@@ -76,7 +77,11 @@ pub struct CopyOptions {
 }
 
 /// Copy files to a destination directory
-pub fn copy_files(files: &[PathBuf], dest_dir: &Path, options: &CopyOptions) -> PaxResult<()> {
+pub fn copy_files(
+    files: &mut FileNames<'_>,
+    dest_dir: &Path,
+    options: &CopyOptions,
+) -> PaxResult<()> {
     // Verify destination is a directory
     if !dest_dir.exists() {
         return Err(PaxError::Io(std::io::Error::new(
@@ -135,9 +140,9 @@ pub fn copy_files(files: &[PathBuf], dest_dir: &Path, options: &CopyOptions) -> 
 
 impl CopyWalk<'_> {
     /// Walk each operand in turn, stopping at the first fatal error.
-    fn copy_operands(&self, files: &[PathBuf]) -> PaxResult<()> {
+    fn copy_operands(&self, files: &mut FileNames<'_>) -> PaxResult<()> {
         for path in files {
-            self.copy_operand(path)?;
+            self.copy_operand(&path)?;
         }
         Ok(())
     }
@@ -152,6 +157,10 @@ impl CopyWalk<'_> {
             ftw::TraverseDirectoryOpts {
                 follow_symlinks_on_args: options.cli_dereference,
                 follow_symlinks: options.dereference,
+                // The destination tree keeps a descriptor open per level it
+                // has walked (see `DirTree`), which the walk has to leave
+                // room for.
+                caller_fds_per_level: 1,
                 ..Default::default()
             },
         );
@@ -171,7 +180,9 @@ impl CopyWalk<'_> {
 /// The destination side is untouched by this: every leaf is still resolved
 /// with `MemberPath::parse` and `DirTree::parent_of` from the anchor, because
 /// `-s` can rewrite a member to a path that is not under the current
-/// destination directory at all.
+/// destination directory at all. `DirTree` keeps the directories it last
+/// walked through open, so following the depth-first walk costs a directory
+/// per member rather than a walk from the anchor.
 struct CopyWalk<'a> {
     tree: &'a DirTree,
     options: &'a CopyOptions,
@@ -725,19 +736,76 @@ fn do_copy_file(
         return Ok(());
     };
 
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = src_file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        dest_file.write_all(&buf[..n])?;
-    }
+    copy_contents(&mut src_file, &mut dest_file, metadata.size())?;
     if options.reset_atime {
         restore_atime(src_file.as_fd(), entry.path().as_inner(), metadata);
     }
 
     set_attrs_fd(dest_file.as_fd(), &attrs_of(metadata), &policy_of(options))
+}
+
+/// The largest buffer `copy_contents` reads through.
+const COPY_BUFFER: u64 = 128 * 1024;
+
+/// Copy everything left to read in `src` to `dest`.
+///
+/// On Linux the kernel moves the data (`copy_file_range`), which spares the
+/// round trip through user space and lets a filesystem that can share or
+/// clone extents do so. Where it cannot -- across filesystems on an older
+/// kernel, or a filesystem that does not support it -- what is left goes
+/// through a buffer instead, as it does everywhere else. `size` is only the
+/// size the walk saw, for sizing that buffer: the copy runs to end of file.
+fn copy_contents(src: &mut File, dest: &mut File, size: u64) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if kernel_copy(src, dest)? {
+        return Ok(());
+    }
+
+    // No larger than the file needs, so copying many small files does not
+    // allocate a large buffer for each; one more byte than its size reads
+    // end of file in the same pass.
+    let mut buf = vec![0u8; size.saturating_add(1).clamp(512, COPY_BUFFER) as usize];
+    loop {
+        let n = match src.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        dest.write_all(&buf[..n])?;
+    }
+}
+
+/// `copy_file_range` from `src` to `dest` until end of file: `Ok(false)` when
+/// the kernel cannot copy between these two files, with whatever it did copy
+/// already reflected in both file offsets, so the caller carries on from there.
+#[cfg(target_os = "linux")]
+fn kernel_copy(src: &File, dest: &File) -> std::io::Result<bool> {
+    loop {
+        let n = unsafe {
+            libc::copy_file_range(
+                src.as_raw_fd(),
+                std::ptr::null_mut(),
+                dest.as_raw_fd(),
+                std::ptr::null_mut(),
+                1 << 30,
+                0,
+            )
+        };
+        if n == 0 {
+            return Ok(true);
+        }
+        if n < 0 {
+            let err = std::io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(
+                    libc::EXDEV | libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP | libc::EPERM,
+                ) => return Ok(false),
+                _ => return Err(err),
+            }
+        }
+    }
 }
 
 /// A source file's attributes, in the shape the anchored helpers take.
@@ -823,7 +891,12 @@ mod tests {
             ..Default::default()
         };
 
-        copy_files(std::slice::from_ref(&src_file), dest_dir.path(), &options).unwrap();
+        copy_files(
+            &mut std::iter::once(src_file.clone()),
+            dest_dir.path(),
+            &options,
+        )
+        .unwrap();
 
         // An absolute operand is stored under its path with the leading slash
         // removed, exactly as an archive would record it, so that is where it
@@ -846,7 +919,12 @@ mod tests {
 
         let options = CopyOptions::default();
 
-        copy_files(std::slice::from_ref(&subdir), dest_dir.path(), &options).unwrap();
+        copy_files(
+            &mut std::iter::once(subdir.clone()),
+            dest_dir.path(),
+            &options,
+        )
+        .unwrap();
 
         let copied_subdir = dest_dir.path().join(member_name(&subdir));
         assert!(copied_subdir.is_dir());
@@ -879,7 +957,7 @@ mod tests {
             ..Default::default()
         };
 
-        copy_files(&[src_file], dest_dir.path(), &options).unwrap();
+        copy_files(&mut std::iter::once(src_file), dest_dir.path(), &options).unwrap();
 
         // Destination should still have original content
         assert_eq!(fs::read_to_string(&dest_file).unwrap(), "existing content");
@@ -900,7 +978,12 @@ mod tests {
 
         let options = CopyOptions::default();
 
-        copy_files(std::slice::from_ref(&src_link), dest_dir.path(), &options).unwrap();
+        copy_files(
+            &mut std::iter::once(src_link.clone()),
+            dest_dir.path(),
+            &options,
+        )
+        .unwrap();
 
         let dest_link = dest_dir.path().join(member_name(&src_link));
         assert!(dest_link.symlink_metadata().unwrap().is_symlink());

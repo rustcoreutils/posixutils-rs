@@ -13,8 +13,8 @@
 //! tar accepts. Anything outside it is rejected by name rather than ignored.
 
 use super::{
-    cluster_letters, parse_number, parse_options, read_name_list, split_long, unknown, unsupported,
-    usage, ArgCursor,
+    cluster_letters, open_name_list, parse_number, parse_options, read_name_list, split_long,
+    unknown, unsupported, usage, ArgCursor,
 };
 use crate::error::{PaxError, PaxResult};
 use crate::{Args, Format};
@@ -208,12 +208,7 @@ fn apply_value(c: char, value: &OsStr, st: &mut State) -> PaxResult<()> {
     match c {
         'f' => set_archive(st, value),
         'C' => set_chdir(st, value)?,
-        'T' => {
-            st.args.names_given = true;
-            st.args
-                .files_and_patterns
-                .extend(read_name_list(value, st.null)?)
-        }
+        'T' => st.args.name_lists.push(open_name_list(value, st.null)?),
         'X' => st
             .args
             .exclude_patterns
@@ -644,8 +639,14 @@ mod tests {
         let dir = plib::tmp::TempDir::new().unwrap();
         let list = dir.path().join("list");
         std::fs::write(&list, b"caf\xe9\nplain\n").unwrap();
-        let args = parse_raw(&[b"-cf", b"a.tar", b"-T", list.as_os_str().as_bytes()]);
-        assert_eq!(args.files_and_patterns, [raw(b"caf\xe9"), raw(b"plain")]);
+        let mut args = parse_raw(&[b"-cf", b"a.tar", b"-T", list.as_os_str().as_bytes()]);
+        let names: Vec<OsString> = args
+            .name_lists
+            .remove(0)
+            .names()
+            .map(|name| name.unwrap().into_os_string())
+            .collect();
+        assert_eq!(names, [raw(b"caf\xe9"), raw(b"plain")]);
     }
 
     #[test]

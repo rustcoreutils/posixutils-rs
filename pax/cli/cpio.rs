@@ -17,6 +17,7 @@ use super::{
     usage, ArgCursor,
 };
 use crate::error::{PaxError, PaxResult};
+use crate::modes::write::NameList;
 use crate::{Args, Format};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
@@ -288,13 +289,11 @@ fn finish(mut st: State) -> PaxResult<Args> {
     }
 
     // cpio names files on standard input for copy-out and pass-through. With
-    // -0 that list is NUL-separated, which pax cannot read for itself, so it is
-    // collected here and handed over as operands instead.
-    let names = if st.null && mode != Mode::CopyIn {
-        read_name_list(OsStr::new("-"), true)?
-    } else {
-        Vec::new()
-    };
+    // -0 that list is NUL-separated, which pax does not read by default, so
+    // it is handed over as a list of its own.
+    if st.null && mode != Mode::CopyIn {
+        st.args.name_lists.push(NameList::stdin(b'\0'));
+    }
 
     match mode {
         Mode::CopyOut => {
@@ -302,7 +301,6 @@ fn finish(mut st: State) -> PaxResult<Args> {
                 return Err(usage(PROG, "-o takes its file list on standard input"));
             }
             st.args.write_mode = true;
-            st.args.files_and_patterns.extend(names);
             // GNU cpio writes the old binary format unless told otherwise.
             st.args.format = Some(st.format.unwrap_or(Format::Bcpio));
         }
@@ -321,9 +319,8 @@ fn finish(mut st: State) -> PaxResult<Args> {
             st.args.read_mode = true;
             st.args.write_mode = true;
             // Copy mode reads the sources from stdin when the destination is
-            // the only operand; with -0 they were read above and go in front.
+            // the only operand -- or from the -0 list above.
             let dest = dest.clone();
-            st.args.files_and_patterns.extend(names);
             st.args.files_and_patterns.push(dest);
         }
     }

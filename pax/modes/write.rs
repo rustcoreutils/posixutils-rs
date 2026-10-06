@@ -19,7 +19,7 @@ use crate::subst::{substitute_name, Substitution};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, Write};
+use std::io::{BufRead, Read, Seek, Write};
 use std::os::fd::AsFd;
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
@@ -99,10 +99,18 @@ fn file_mtime_secs(metadata: &ftw::Metadata) -> i64 {
     }
 }
 
+/// The pathnames write, append and copy mode act on, in order.
+///
+/// An iterator rather than a slice so a list read from standard input or a
+/// `-T` file is consumed as the walk asks for it: collecting it first cost
+/// memory linear in the list and wrote nothing until its producer had exited,
+/// which is what stops `find / | pax -w | ssh ...` from streaming.
+pub type FileNames<'a> = dyn Iterator<Item = PathBuf> + 'a;
+
 /// Create an archive from files
 pub fn create_archive<W: Write>(
     writer: W,
-    files: &[PathBuf],
+    files: &mut FileNames<'_>,
     format: ArchiveFormat,
     options: &WriteOptions,
 ) -> PaxResult<()> {
@@ -125,7 +133,7 @@ pub fn create_archive<W: Write>(
 /// itself marked as the archive's (see `ArchiveSink`).
 fn write_archive<A: ArchiveWriter>(
     archive: &mut A,
-    files: &[PathBuf],
+    files: &mut FileNames<'_>,
     options: &WriteOptions,
 ) -> PaxResult<()> {
     let mut sink = ArchiveSink(archive);
@@ -199,7 +207,7 @@ impl<A: ArchiveWriter> ArchiveWriter for ArchiveSink<'_, A> {
 /// it has to be. Everything under it is not.
 fn write_files<W: ArchiveWriter>(
     archive: &mut W,
-    files: &[PathBuf],
+    files: &mut FileNames<'_>,
     options: &WriteOptions,
 ) -> PaxResult<()> {
     let prompter = if options.interactive {
@@ -219,7 +227,7 @@ fn write_files<W: ArchiveWriter>(
 
     for path in files {
         let _ = ftw::traverse_directory(
-            path,
+            &path,
             |entry| walk.visit(entry),
             |entry, exit| walk.leave_directory(&entry, exit),
             |entry, err| crate::error::report_error(entry.path().as_inner(), err.inner()),
@@ -565,7 +573,9 @@ fn write_file<W: ArchiveWriter>(
     };
 
     // Check for hard link
-    if let Some(original_path) = link_tracker.lookup(entry.dev, entry.ino, entry.nlink) {
+    let original = link_tracker.lookup(entry.dev, entry.ino, entry.nlink);
+    let later_name = original.is_some();
+    if let Some(original_path) = original {
         // The same file met again under the very name it was first archived
         // as (`pax -w f f`, or `find tree | pax -w` reaching it from both the
         // list and the walk). "f == f" extracts by unlinking f and then failing
@@ -632,7 +642,9 @@ fn write_file<W: ArchiveWriter>(
 
     archive.finish_entry()?;
     // Only now is there a member for a later name of this file to link to.
-    link_tracker.record(entry.dev, entry.ino, entry.nlink, &entry.path);
+    if !later_name {
+        link_tracker.record(entry.dev, entry.ino, entry.nlink, &entry.path);
+    }
 
     if options.reset_atime {
         crate::modes::anchored::restore_atime(file.as_fd(), src_path, metadata);
@@ -804,53 +816,112 @@ fn build_entry(
 /// multi-volume support)
 pub fn write_files_to_archive<W: ArchiveWriter>(
     archive: &mut W,
-    files: &[PathBuf],
+    files: &mut FileNames<'_>,
     options: &WriteOptions,
 ) -> PaxResult<()> {
     write_archive(archive, files, options)
 }
 
-/// Read file list from stdin (one path per line)
-pub fn read_file_list<R: Read>(reader: R) -> PaxResult<Vec<PathBuf>> {
-    read_file_list_sep(reader, b'\n')
-}
-
-/// Read a list of pathnames separated by `sep`.
+/// A list of pathnames for write, append or copy mode: standard input, or a
+/// file named by tar's `-T`, separated by `sep`.
 ///
 /// `sep` is `b'\n'` for the usual `find | pax` pipeline and `b'\0'` for the
 /// `find -print0` pipeline that tar's `--null` and cpio's `-0` select, which is
 /// the only way a pathname containing a newline survives the trip.
+///
+/// Nothing is read until [`names`](Self::names) is iterated. A `-T` file is
+/// opened when the command line is parsed, though, so its name is resolved
+/// from the directory the command was invoked in rather than from tar's `-C`.
+#[derive(Debug)]
+pub struct NameList {
+    source: NameSource,
+    sep: u8,
+}
+
+#[derive(Debug)]
+enum NameSource {
+    Stdin,
+    File(File),
+}
+
+impl NameList {
+    /// The names on standard input.
+    pub fn stdin(sep: u8) -> Self {
+        NameList {
+            source: NameSource::Stdin,
+            sep,
+        }
+    }
+
+    /// The names in an open file.
+    pub fn file(file: File, sep: u8) -> Self {
+        NameList {
+            source: NameSource::File(file),
+            sep,
+        }
+    }
+
+    /// The names, read one at a time as they are asked for.
+    pub fn names(self) -> NameReader<Box<dyn BufRead>> {
+        let reader: Box<dyn BufRead> = match self.source {
+            NameSource::Stdin => Box::new(std::io::stdin().lock()),
+            NameSource::File(file) => Box::new(std::io::BufReader::new(file)),
+        };
+        NameReader {
+            reader,
+            sep: self.sep,
+            done: false,
+        }
+    }
+}
+
+/// The pathnames of a [`NameList`], one per `next`.
 ///
 /// A name holding a NUL byte -- `find -print0` piped to a list read by lines --
 /// can name no file, since the system interfaces end a pathname at the first
 /// NUL. It is diagnosed here and left out, so the exit status records it and
 /// the rest of the list is still processed, rather than handed on to a walk
 /// that would otherwise act on the prefix before the NUL instead.
-pub fn read_file_list_sep<R: Read>(reader: R, sep: u8) -> PaxResult<Vec<PathBuf>> {
-    use std::io::BufRead;
+///
+/// A read error ends the list: it is returned once, and nothing follows it.
+pub struct NameReader<R> {
+    reader: R,
+    sep: u8,
+    done: bool,
+}
 
-    let mut reader = std::io::BufReader::new(reader);
-    let mut files = Vec::new();
-    let mut buf = Vec::new();
+impl<R: BufRead> Iterator for NameReader<R> {
+    type Item = PaxResult<PathBuf>;
 
-    loop {
-        buf.clear();
-        if reader.read_until(sep, &mut buf)? == 0 {
-            return Ok(files);
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut buf = Vec::new();
+        while !self.done {
+            buf.clear();
+            match self.reader.read_until(self.sep, &mut buf) {
+                Ok(0) => self.done = true,
+                Ok(_) => {
+                    if buf.last() == Some(&self.sep) {
+                        buf.pop();
+                    }
+                    // Keep the name verbatim so pathnames with leading or
+                    // trailing spaces survive; skip only a wholly empty entry
+                    // (e.g. a trailing separator).
+                    if buf.contains(&0) {
+                        crate::error::report_error(
+                            &path_from_bytes(std::mem::take(&mut buf)),
+                            gettextrs::gettext("pathname contains a NUL byte"),
+                        );
+                    } else if !buf.is_empty() {
+                        return Some(Ok(path_from_bytes(buf)));
+                    }
+                }
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e.into()));
+                }
+            }
         }
-        if buf.last() == Some(&sep) {
-            buf.pop();
-        }
-        // Keep the name verbatim so pathnames with leading or trailing spaces
-        // survive; skip only a wholly empty entry (e.g. a trailing separator).
-        if buf.contains(&0) {
-            crate::error::report_error(
-                &path_from_bytes(&buf),
-                gettextrs::gettext("pathname contains a NUL byte"),
-            );
-        } else if !buf.is_empty() {
-            files.push(path_from_bytes(&buf));
-        }
+        None
     }
 }
 
@@ -859,14 +930,14 @@ pub fn read_file_list_sep<R: Read>(reader: R, sep: u8) -> PaxResult<Vec<PathBuf>
 /// A pathname is bytes, not text, so on unix the bytes are kept exactly --
 /// which is the point of reading the list this way rather than by lines.
 #[cfg(unix)]
-fn path_from_bytes(bytes: &[u8]) -> PathBuf {
-    use std::os::unix::ffi::OsStrExt;
-    PathBuf::from(std::ffi::OsStr::from_bytes(bytes).to_owned())
+fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
+    use std::os::unix::ffi::OsStringExt;
+    PathBuf::from(std::ffi::OsString::from_vec(bytes))
 }
 
 #[cfg(not(unix))]
-fn path_from_bytes(bytes: &[u8]) -> PathBuf {
-    PathBuf::from(String::from_utf8_lossy(bytes).into_owned())
+fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[cfg(test)]

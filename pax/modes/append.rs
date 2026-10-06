@@ -35,7 +35,7 @@ use std::path::PathBuf;
 /// Append files to an existing archive
 pub fn append_to_archive(
     archive_path: &PathBuf,
-    files: &[PathBuf],
+    files: &mut crate::modes::write::FileNames<'_>,
     options: &mut WriteOptions,
     requested_format: Option<ArchiveFormat>,
     record_size: usize,

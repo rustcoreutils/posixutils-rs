@@ -10,7 +10,8 @@
 //! Integration tests for the `tar` compatibility front-end.
 
 use crate::common::{
-    assert_failure, assert_success, run_system_ok, run_tar, stderr_str, stdout_str, system_tool,
+    assert_failure, assert_success, front_end, run_system_ok, run_tar, stderr_str, stdout_str,
+    system_tool, writes_before_list_ends,
 };
 use plib::tmp::TempDir;
 use std::fs;
@@ -601,4 +602,34 @@ fn test_tar_empty_name_list_archives_nothing() {
     let out = run_tar(&["-tf", "x.tar"], temp.path());
     assert_success(&out, "tar -t");
     assert_eq!(stdout_str(&out), "");
+}
+
+/// `tar -T -` and `cpio -o -0` archive each name as it arrives, as pax does
+/// with its own standard-input list: both used to read the whole list while
+/// parsing the command line, before anything was written.
+#[test]
+fn test_front_end_name_lists_stream() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("big"), vec![b'B'; 64 * 1024]).unwrap();
+
+    assert!(
+        writes_before_list_ends(
+            &front_end("tar"),
+            &["-cf", "-", "-T", "-"],
+            temp.path(),
+            b"big\n",
+            10240,
+        ),
+        "tar -T -: no record written while the list was open"
+    );
+    assert!(
+        writes_before_list_ends(
+            &front_end("cpio"),
+            &["-o", "-0", "-H", "newc"],
+            temp.path(),
+            b"big\0",
+            512,
+        ),
+        "cpio -o -0: no record written while the list was open"
+    );
 }

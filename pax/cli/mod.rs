@@ -25,11 +25,10 @@ pub mod cpio;
 pub mod tar;
 
 use crate::error::{PaxError, PaxResult};
-use crate::modes;
+use crate::modes::write::NameList;
 use crate::rawpath;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -87,26 +86,32 @@ fn unknown(prog: &str, opt: &str) -> PaxError {
     usage(prog, format!("unrecognized option '{}'", opt))
 }
 
-/// Read a list of names from `path`, one per line (or per NUL when `nul`).
+/// Open a list of names in `path`, one per line (or per NUL when `nul`), to be
+/// read as the names are needed.
 ///
-/// `-` means standard input, matching tar's `-T -`. The list is read before the
-/// operation starts, and therefore before any `-C` has changed the working
-/// directory, which is what makes the names in the file relative to where the
-/// command was invoked.
+/// `-` means standard input, matching tar's `-T -`. The file is opened now,
+/// before any `-C` has changed the working directory, so a relative `path` is
+/// resolved from where the command was invoked.
+fn open_name_list(path: &OsStr, nul: bool) -> PaxResult<NameList> {
+    let sep = if nul { b'\0' } else { b'\n' };
+    if path == "-" {
+        return Ok(NameList::stdin(sep));
+    }
+    let file = File::open(path)
+        .map_err(|e| PaxError::Usage(format!("{}: {}", Path::new(path).display(), e)))?;
+    Ok(NameList::file(file, sep))
+}
+
+/// Read a whole list of names from `path`, for a list that is needed in full
+/// before anything else happens (tar's `-X`). See `open_name_list`.
 ///
 /// The names are kept as the bytes the list holds: a list naming `caf\351`
-/// must not archive some other file whose name is its lossy rendering.
+/// must not exclude some other file whose name is its lossy rendering.
 fn read_name_list(path: &OsStr, nul: bool) -> PaxResult<Vec<OsString>> {
-    let sep = if nul { b'\0' } else { b'\n' };
-    let names = if path == "-" {
-        modes::write::read_file_list_sep(io::stdin(), sep)?
-    } else {
-        let file = File::open(path)
-            .map_err(|e| PaxError::Usage(format!("{}: {}", Path::new(path).display(), e)))?;
-        modes::write::read_file_list_sep(file, sep)?
-    };
-
-    Ok(names.into_iter().map(PathBuf::into_os_string).collect())
+    open_name_list(path, nul)?
+        .names()
+        .map(|name| name.map(PathBuf::into_os_string))
+        .collect()
 }
 
 /// A cursor over the command line, shared by both front-end parsers.

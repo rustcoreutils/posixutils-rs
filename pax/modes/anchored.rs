@@ -23,7 +23,7 @@
 use crate::error::{PaxError, PaxResult};
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::ffi::{CStr, CString, OsString};
+use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
@@ -33,7 +33,11 @@ use std::rc::Rc;
 /// A member pathname reduced to the directory components that must be walked
 /// and the final component to create.
 pub(crate) struct MemberPath {
-    pub(crate) dirs: Vec<CString>,
+    /// The directory components, each ended by a NUL, in one buffer: a name
+    /// of many components costs one allocation rather than one per component.
+    dirs: Vec<u8>,
+    /// How many components `dirs` holds.
+    depth: usize,
     pub(crate) leaf: CString,
     /// The same path as text, for diagnostics and hard-link bookkeeping.
     pub(crate) display: PathBuf,
@@ -52,10 +56,10 @@ impl MemberPath {
     pub(crate) fn parse(path: &Path) -> PaxResult<Option<Self>> {
         use std::path::Component;
 
-        let mut parts: Vec<OsString> = Vec::new();
+        let mut parts: Vec<&OsStr> = Vec::new();
         for comp in path.components() {
             match comp {
-                Component::Normal(c) => parts.push(c.to_os_string()),
+                Component::Normal(c) => parts.push(c),
                 Component::ParentDir => {
                     parts.pop();
                 }
@@ -66,24 +70,32 @@ impl MemberPath {
         let Some(leaf_os) = parts.pop() else {
             return Ok(None);
         };
+        if path.as_os_str().as_bytes().contains(&0) {
+            return Err(PaxError::InvalidHeader("path contains null".to_string()));
+        }
 
-        let to_c = |s: &OsString| {
-            CString::new(s.as_bytes())
-                .map_err(|_| PaxError::InvalidHeader("path contains null".to_string()))
-        };
-
-        let dirs = parts.iter().map(to_c).collect::<PaxResult<Vec<_>>>()?;
-        let mut display = PathBuf::new();
+        let mut dirs = Vec::with_capacity(parts.iter().map(|p| p.len() + 1).sum());
+        let mut display = PathBuf::with_capacity(dirs.capacity() + leaf_os.len());
         for p in &parts {
+            dirs.extend_from_slice(p.as_bytes());
+            dirs.push(0);
             display.push(p);
         }
-        display.push(&leaf_os);
+        display.push(leaf_os);
 
         Ok(Some(MemberPath {
             dirs,
-            leaf: to_c(&leaf_os)?,
+            depth: parts.len(),
+            leaf: CString::new(leaf_os.as_bytes()).expect("NUL was checked for above"),
             display,
         }))
+    }
+
+    /// The directory components to walk, in order.
+    fn dirs(&self) -> impl Iterator<Item = &CStr> {
+        self.dirs
+            .split_inclusive(|&b| b == 0)
+            .map(|c| CStr::from_bytes_with_nul(c).expect("each component ends in its NUL"))
     }
 
     /// Whether this name refers to the extraction directory itself rather
@@ -107,7 +119,7 @@ impl MemberPath {
 
     /// How deep the member sits, for ordering the deferred directory pass.
     pub(crate) fn depth(&self) -> usize {
-        self.dirs.len()
+        self.depth
     }
 }
 
@@ -147,12 +159,24 @@ const WALK_FLAGS: libc::c_int =
 /// follow `sub -> /elsewhere`.
 pub(crate) struct DirTree {
     root: OwnedFd,
-    /// The parent most recently walked to, by its components. Consecutive
-    /// members of one directory -- nearly every member of a typical archive --
-    /// then share one walk instead of each reopening the whole chain. Any
-    /// member that could replace one of those components names a shorter
-    /// chain, and so replaces this entry before it can be reused.
-    last_parent: RefCell<Option<(Vec<CString>, Rc<OwnedFd>)>>,
+    /// The directories most recently walked through, one descriptor per
+    /// level from the anchor down, so the next member reopens only the
+    /// components its path does not share with the last one's. Consecutive
+    /// members of one directory share the whole walk, and a depth-first tree
+    /// -- copy mode, or an archive written by one -- opens one directory per
+    /// member instead of re-walking its whole chain, which made a deep tree
+    /// cost the square of its depth.
+    ///
+    /// Only the last member's own chain is ever kept. A member that could
+    /// replace one of its components names that component as its leaf, so it
+    /// shares less of the chain than that, and cuts the chain off there before
+    /// anything below it can be reused.
+    chain: RefCell<Chain>,
+    /// How many levels `chain` may hold: each is an open descriptor.
+    max_levels: usize,
+    /// The parent most recently walked to, so consecutive members of one
+    /// directory deeper than `max_levels` still share one walk.
+    last_parent: RefCell<Option<(Vec<u8>, Rc<OwnedFd>)>>,
     /// `(st_dev, st_ino)` of the directories this run created only to hold a
     /// member below them. Such a directory is not a pre-existing file: a member
     /// that names it later (`find -depth` order) still gives it its attributes.
@@ -180,6 +204,8 @@ impl DirTree {
         }
         Ok(DirTree {
             root: unsafe { OwnedFd::from_raw_fd(fd) },
+            chain: RefCell::new(Chain::default()),
+            max_levels: cached_levels_budget(),
             last_parent: RefCell::new(None),
             implicit: RefCell::new(HashSet::new()),
         })
@@ -203,8 +229,12 @@ impl DirTree {
             }
         }
 
-        let mut cur: Option<OwnedFd> = None;
-        for comp in &member.dirs {
+        let mut chain = self.chain.borrow_mut();
+        let shared = chain.shared_with(member);
+        chain.truncate(shared);
+        let mut cur = chain.levels.last().map(|(_, fd)| Rc::clone(fd));
+
+        for comp in member.dirs().skip(shared) {
             let at = cur.as_ref().map_or(self.root.as_fd(), |fd| fd.as_fd());
             let (next, created) = open_or_create_dir_at(at, comp, create_missing)?;
             if created {
@@ -212,12 +242,16 @@ impl DirTree {
                     self.implicit.borrow_mut().insert(file_id(&st));
                 }
             }
+            let next = Rc::new(next);
+            if chain.levels.len() < self.max_levels {
+                chain.push(comp, Rc::clone(&next));
+            }
             cur = Some(next);
         }
-        let fd = Rc::new(match cur {
+        let fd = match cur {
             Some(fd) => fd,
-            None => self.root.try_clone()?,
-        });
+            None => Rc::new(self.root.try_clone()?),
+        };
         *self.last_parent.borrow_mut() = Some((member.dirs.clone(), Rc::clone(&fd)));
         Ok(fd)
     }
@@ -227,6 +261,62 @@ impl DirTree {
     pub(crate) fn is_implicit(&self, st: &libc::stat) -> bool {
         self.implicit.borrow().contains(&file_id(st))
     }
+}
+
+/// The directories `DirTree` walked to last, a descriptor per level.
+#[derive(Default)]
+struct Chain {
+    /// The components, each ended by a NUL, as in `MemberPath::dirs`.
+    names: Vec<u8>,
+    /// For each level, where its name ends in `names` and its descriptor.
+    levels: Vec<(usize, Rc<OwnedFd>)>,
+}
+
+impl Chain {
+    /// How many of `member`'s leading directories this chain holds.
+    fn shared_with(&self, member: &MemberPath) -> usize {
+        self.names
+            .split_inclusive(|&b| b == 0)
+            .zip(member.dirs.split_inclusive(|&b| b == 0))
+            .take_while(|(a, b)| a == b)
+            .count()
+    }
+
+    /// Forget every level below the first `depth`.
+    fn truncate(&mut self, depth: usize) {
+        self.levels.truncate(depth);
+        let end = self.levels.last().map_or(0, |(end, _)| *end);
+        self.names.truncate(end);
+    }
+
+    fn push(&mut self, name: &CStr, fd: Rc<OwnedFd>) {
+        self.names.extend_from_slice(name.to_bytes_with_nul());
+        self.levels.push((self.names.len(), fd));
+    }
+}
+
+/// How many directory descriptors a `DirTree` may hold open for reuse.
+///
+/// Half of what the descriptor limit leaves once the reserve `ftw` keeps for
+/// its callers is set aside -- the same figure `ftw` derives its own budget
+/// from. Copy mode's walk takes the other half: it is told this tree holds a
+/// descriptor per level (`caller_fds_per_level`), and conserves its own once
+/// the two together would not fit.
+fn cached_levels_budget() -> usize {
+    const RESERVE: u64 = 16;
+    const MAX: u64 = 4096;
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // Casts needed: `rlim_t` is u64 on both platforms, but not by name.
+    #[allow(clippy::unnecessary_cast)]
+    let limit = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
+        rl.rlim_cur as u64
+    } else {
+        1024
+    };
+    (limit.saturating_sub(RESERVE).clamp(1, MAX) / 2) as usize
 }
 
 /// `(st_dev, st_ino)` of a stat result.
@@ -300,7 +390,7 @@ fn apply_dir_attrs(tree: &DirTree, dir: &PendingDir, policy: &AttrPolicy) -> Pax
 /// Open one directory component below `dirfd` without following a symlink.
 pub(crate) fn open_dir_at(
     dirfd: BorrowedFd<'_>,
-    name: &CString,
+    name: &CStr,
     create_missing: bool,
 ) -> PaxResult<OwnedFd> {
     open_or_create_dir_at(dirfd, name, create_missing).map(|(fd, _)| fd)
@@ -309,7 +399,7 @@ pub(crate) fn open_dir_at(
 /// `open_dir_at`, also saying whether the directory had to be created.
 fn open_or_create_dir_at(
     dirfd: BorrowedFd<'_>,
-    name: &CString,
+    name: &CStr,
     create_missing: bool,
 ) -> PaxResult<(OwnedFd, bool)> {
     let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), WALK_FLAGS) };
@@ -808,6 +898,95 @@ fn stat_raw(dirfd: libc::c_int, name: &CStr) -> Option<libc::stat> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn member(path: &str) -> MemberPath {
+        MemberPath::parse(Path::new(path)).unwrap().unwrap()
+    }
+
+    /// The inode a descriptor refers to.
+    fn ino_of(fd: &OwnedFd) -> u64 {
+        stat_at(fd.as_fd(), c".").unwrap().st_ino
+    }
+
+    fn ino_at(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path).unwrap().ino()
+    }
+
+    #[test]
+    fn test_member_path_components() {
+        let m = member("/x/./y/../z/leaf");
+        assert_eq!(m.depth(), 2);
+        assert_eq!(m.dirs().collect::<Vec<_>>(), [c"x", c"z"]);
+        assert_eq!(m.leaf.as_c_str(), c"leaf");
+        assert_eq!(m.display, Path::new("x/z/leaf"));
+        assert!(MemberPath::parse(Path::new("a/../..")).unwrap().is_none());
+        assert!(MemberPath::parse(Path::new("a\0b/c")).is_err());
+    }
+
+    /// Each member reopens only the directories its path does not share with
+    /// the last one's, so a depth-first walk opens one directory per member.
+    #[test]
+    fn test_parent_of_follows_the_last_chain() {
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let tree = DirTree::open_path(dir.path()).unwrap();
+        let levels = || tree.chain.borrow().levels.len();
+
+        let fd = tree.parent_of(&member("a/b/c/x"), true).unwrap();
+        assert_eq!(ino_of(&fd), ino_at(&dir.path().join("a/b/c")));
+        assert_eq!(levels(), 3);
+
+        let fd = tree.parent_of(&member("a/b/y"), true).unwrap();
+        assert_eq!(ino_of(&fd), ino_at(&dir.path().join("a/b")));
+        assert_eq!(levels(), 2);
+
+        let fd = tree.parent_of(&member("a/b/c/d/z"), true).unwrap();
+        assert_eq!(ino_of(&fd), ino_at(&dir.path().join("a/b/c/d")));
+        assert_eq!(levels(), 4);
+
+        let fd = tree.parent_of(&member("e/z"), true).unwrap();
+        assert_eq!(ino_of(&fd), ino_at(&dir.path().join("e")));
+        assert_eq!(levels(), 1);
+    }
+
+    /// A member naming one of the chain's directories as its leaf -- the
+    /// member that could replace it -- cuts the chain there, so a symbolic
+    /// link put in its place is met by a fresh `O_NOFOLLOW` open.
+    #[test]
+    fn test_parent_of_never_reuses_a_replaceable_directory() {
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let outside = plib::tmp::TempDir::new().unwrap();
+        let tree = DirTree::open_path(dir.path()).unwrap();
+
+        tree.parent_of(&member("a/b/x"), true).unwrap();
+        tree.parent_of(&member("a/b"), true).unwrap();
+        std::fs::remove_dir(dir.path().join("a/b")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("a/b")).unwrap();
+
+        assert!(tree.parent_of(&member("a/b/z"), true).is_err());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    /// Past the descriptor budget the chain stops growing, and a walk still
+    /// reaches the right directory.
+    #[test]
+    fn test_parent_of_past_the_level_budget() {
+        let dir = plib::tmp::TempDir::new().unwrap();
+        let mut tree = DirTree::open_path(dir.path()).unwrap();
+        tree.max_levels = 2;
+
+        for (path, parent) in [
+            ("a/b/c/d/x", "a/b/c/d"),
+            ("a/b/c/d/y", "a/b/c/d"),
+            ("a/b/c/d/e/z", "a/b/c/d/e"),
+            ("a/b/c/w", "a/b/c"),
+            ("a/v", "a"),
+        ] {
+            let fd = tree.parent_of(&member(path), true).unwrap();
+            assert_eq!(ino_of(&fd), ino_at(&dir.path().join(parent)), "{path}");
+            assert!(tree.chain.borrow().levels.len() <= 2, "{path}");
+        }
+    }
 
     fn attrs(mode: u32) -> Attrs {
         Attrs {

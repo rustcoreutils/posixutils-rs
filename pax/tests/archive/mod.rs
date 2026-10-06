@@ -1655,3 +1655,248 @@ fn test_cross_tool_we_read_system_pax() {
         );
     }
 }
+
+/// Names read from standard input are archived as they arrive. Buffering the
+/// whole list first costs memory linear in the list and means nothing is
+/// written until the producer exits, so `find / | pax -w | ssh ...` cannot
+/// stream. Here the first file fills a record, which must come out while the
+/// list is still open.
+#[test]
+fn test_write_streams_names_from_stdin() {
+    use std::io::Read;
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("big"), vec![b'B'; 64 * 1024]).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["-w", "-x", "ustar"])
+        .current_dir(temp.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"big\n").unwrap();
+    stdin.flush().unwrap();
+
+    let mut stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut record = vec![0u8; 10240];
+        let _ = tx.send(stdout.read_exact(&mut record).is_ok());
+    });
+    let got = rx.recv_timeout(std::time::Duration::from_secs(5));
+
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(got, Ok(true), "no record written while the list was open");
+}
+
+/// Extended-header processing is linear in the number of records: a header
+/// of 40000 unknown keywords used to take seconds (a linear search per
+/// keyword) and should list instantly.
+#[test]
+fn test_many_extended_records_are_linear() {
+    let temp = TempDir::new().unwrap();
+    let mut records = Vec::new();
+    for i in 0..40_000 {
+        records.extend_from_slice(&pax_record(&format!("VENDOR.k{i}"), b"v"));
+    }
+    fs::write(
+        temp.path().join("a.pax"),
+        archive_with_ext_records(&records),
+    )
+    .unwrap();
+
+    let output = run_pax_with_deadline(
+        &["-f", "a.pax"],
+        temp.path(),
+        std::time::Duration::from_secs(2),
+    )
+    .expect("listing 40000 extended records took over 2 s");
+    assert_success(&output, "list");
+    assert_eq!(stdout_str(&output), "f\n");
+}
+
+/// A `g` header followed by `members` plain members, `f0` to `f<members-1>`.
+fn archive_with_global_records(records: &[u8], members: usize) -> Vec<u8> {
+    let mut a = Ustar {
+        name: b"GlobalHead",
+        typeflag: b'g',
+        body: records,
+        ..Default::default()
+    }
+    .member();
+    for i in 0..members {
+        let name = format!("f{i}");
+        a.extend_from_slice(
+            &Ustar {
+                name: name.as_bytes(),
+                ..Default::default()
+            }
+            .member(),
+        );
+    }
+    a.extend_from_slice(&ustar_trailer());
+    a
+}
+
+/// A global header's records apply to every member after it, but are held
+/// once: copying them into each member made listing cost the number of
+/// global records times the number of members (and squared again by the
+/// per-keyword search), so this listing took minutes.
+#[test]
+fn test_global_records_are_not_copied_per_member() {
+    let temp = TempDir::new().unwrap();
+    let mut records = Vec::new();
+    for i in 0..5_000 {
+        records.extend_from_slice(&pax_record(&format!("VENDOR.k{i}"), b"v"));
+    }
+    fs::write(
+        temp.path().join("g.pax"),
+        archive_with_global_records(&records, 2_000),
+    )
+    .unwrap();
+
+    let output = run_pax_with_deadline(
+        &["-f", "g.pax", "-o", "listopt=%(VENDOR.k4999)s"],
+        temp.path(),
+        std::time::Duration::from_secs(3),
+    )
+    .expect("listing 2000 members under 5000 global records took over 3 s");
+    assert_success(&output, "list");
+    assert_eq!(stdout_str(&output), "v\n".repeat(2_000));
+}
+
+/// The shared global records still layer the way POSIX says: a member's own
+/// `x` record overrides one, a zero-length `x` record deletes it for that
+/// member only, and `-o delete=` removes it everywhere.
+#[test]
+fn test_global_records_layer_under_member_records() {
+    let temp = TempDir::new().unwrap();
+    let global = [
+        pax_record("VENDOR.a", b"g"),
+        pax_record("VENDOR.b", b"g"),
+        pax_record("VENDOR.c", b"g"),
+    ]
+    .concat();
+    let own = [pax_record("VENDOR.a", b"x"), pax_record("VENDOR.b", b"")].concat();
+    let mut a = Ustar {
+        name: b"GlobalHead",
+        typeflag: b'g',
+        body: &global,
+        ..Default::default()
+    }
+    .member();
+    a.extend_from_slice(
+        &Ustar {
+            name: b"PaxHeaders/f0",
+            typeflag: b'x',
+            body: &own,
+            ..Default::default()
+        }
+        .member(),
+    );
+    for name in [&b"f0"[..], b"f1"] {
+        a.extend_from_slice(
+            &Ustar {
+                name,
+                ..Default::default()
+            }
+            .member(),
+        );
+    }
+    a.extend_from_slice(&ustar_trailer());
+    fs::write(temp.path().join("g.pax"), a).unwrap();
+
+    let list = |extra: &[&str]| {
+        let mut args = vec![
+            "-f",
+            "g.pax",
+            "-o",
+            "listopt=%f:%(VENDOR.a)s|%(VENDOR.b)s|%(VENDOR.c)s",
+        ];
+        args.extend_from_slice(extra);
+        let output = run_pax_in_dir(&args, temp.path());
+        assert_success(&output, "list");
+        stdout_str(&output)
+    };
+    // An absent extension keyword is echoed, as for any name the listing
+    // has no value for.
+    assert_eq!(list(&[]), "f0:x|%(VENDOR.b)s|g\nf1:g|g|g\n");
+    assert_eq!(
+        list(&["-o", "delete=VENDOR.c"]),
+        "f0:x|%(VENDOR.b)s|%(VENDOR.c)s\nf1:g|g|%(VENDOR.c)s\n"
+    );
+    assert_eq!(list(&["-o", "VENDOR.b:=o"]), "f0:x|o|g\nf1:g|o|g\n");
+}
+
+/// A `path` or `linkpath` record is held to the limit every other header's
+/// pathname is (64 KiB). Without it a record could run to the whole 64 MiB
+/// extended header: a 4 KB compressed archive whose name had two million
+/// components drove extraction to 156 MiB.
+#[test]
+fn test_overlong_path_records_are_rejected() {
+    let temp = TempDir::new().unwrap();
+    let limit = 64 * 1024;
+    // Exactly at the limit is a name like any other.
+    let at_limit = format!("{}f", "a/".repeat((limit - 1) / 2));
+    fs::write(
+        temp.path().join("ok.pax"),
+        archive_with_ext_records(&pax_record("path", at_limit.as_bytes())),
+    )
+    .unwrap();
+    let output = run_pax_in_dir(&["-f", "ok.pax"], temp.path());
+    assert_success(&output, "list a name at the limit");
+    assert_eq!(stdout_str(&output), format!("{at_limit}\n"));
+
+    for keyword in ["path", "linkpath"] {
+        let long = format!("{}f", "a/".repeat(limit / 2));
+        let name = format!("{keyword}.pax");
+        fs::write(
+            temp.path().join(&name),
+            archive_with_ext_records(&pax_record(keyword, long.as_bytes())),
+        )
+        .unwrap();
+        // A file where the name's first directory would go keeps a reader
+        // that accepts the record from creating thousands of directories.
+        let dest = temp.path().join(format!("{keyword}-dest"));
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("a"), b"").unwrap();
+        let output = run_pax_in_dir(&["-r", "-f", &format!("../{name}")], &dest);
+        assert_failure(&output, keyword);
+        let stderr = stderr_str(&output);
+        assert!(
+            stderr.contains(&format!("{keyword} record of")),
+            "{keyword}: {}",
+            &stderr[..stderr.len().min(200)]
+        );
+        assert_eq!(fs::read_dir(&dest).unwrap().count(), 1, "{keyword}");
+    }
+}
+
+/// A name list can reach a file more than once -- `find tree | pax -w` names
+/// every file twice, once listed and once in the walk of `tree`. A file the
+/// writer forgot after all its names went by is stored again in full, and
+/// depending on the order that splits a hard-linked pair on extraction.
+#[test]
+fn test_find_style_list_keeps_hard_links() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let dst = temp.path().join("dst");
+    fs::create_dir_all(src.join("tree")).unwrap();
+    fs::create_dir(&dst).unwrap();
+    fs::write(src.join("tree/f"), "DATA\n").unwrap();
+    fs::hard_link(src.join("tree/f"), src.join("tree/g")).unwrap();
+
+    let output =
+        run_pax_in_dir_with_stdin(&["-w", "-f", "../a.tar"], &src, "tree/f\ntree/g\ntree/f\n");
+    assert_success(&output, "pax -w of a find-style list");
+    let output = run_pax_in_dir(&["-r", "-f", "../a.tar"], &dst);
+    assert_success(&output, "pax -r");
+
+    let f = fs::metadata(dst.join("tree/f")).unwrap();
+    let g = fs::metadata(dst.join("tree/g")).unwrap();
+    assert_eq!(f.ino(), g.ino(), "tree/f and tree/g should be one inode");
+}

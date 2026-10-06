@@ -10,6 +10,7 @@
 use crate::error::{PaxError, PaxResult};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Type of archive entry
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -136,11 +137,8 @@ pub struct ArchiveEntry {
     /// implementation extensions the archive used.
     ///
     /// POSIX listopt rule 7 admits all of them as a `%(keyword)`, which is the
-    /// only thing that reads them -- none has any effect on extraction. A
-    /// `Vec` rather than a map because it is empty for almost every member and
-    /// one to three entries long otherwise, and because the order records
-    /// arrive in is the order that decides precedence.
-    pub ext_records: Vec<(String, String)>,
+    /// only thing that reads them -- none has any effect on extraction.
+    pub ext_records: ExtRecords,
     /// The header this member was read from, when it was read from one.
     ///
     /// `None` for an entry built from a file on disk, which has no header yet.
@@ -173,7 +171,7 @@ impl ArchiveEntry {
             devmajor: 0,
             devminor: 0,
             data_checksum: None,
-            ext_records: Vec::new(),
+            ext_records: ExtRecords::default(),
             source_header: None,
         }
     }
@@ -198,10 +196,7 @@ impl ArchiveEntry {
 
     /// The value of an extended-header record this member carried.
     pub fn ext_record(&self, keyword: &str) -> Option<&str> {
-        self.ext_records
-            .iter()
-            .find(|(k, _)| k == keyword)
-            .map(|(_, v)| v.as_str())
+        self.ext_records.get(keyword)
     }
 
     /// Record an extended-header value, replacing any already held under the
@@ -211,12 +206,9 @@ impl ArchiveEntry {
     /// is applied before the per-file `x` header, and `-o keyword:=value`
     /// after both, so the last writer of a keyword wins.
     pub fn set_ext_record(&mut self, keyword: &str, value: &str) {
-        match self.ext_records.iter_mut().find(|(k, _)| k == keyword) {
-            Some(slot) => slot.1 = value.to_string(),
-            None => self
-                .ext_records
-                .push((keyword.to_string(), value.to_string())),
-        }
+        self.ext_records
+            .own
+            .insert(keyword.to_string(), Some(value.to_string()));
     }
 
     /// Check if this entry is a special device file
@@ -230,6 +222,43 @@ impl ArchiveEntry {
     /// Check if this is a directory
     pub fn is_dir(&self) -> bool {
         self.entry_type == EntryType::Directory
+    }
+}
+
+/// The extended-header records a member carried that no typed field of
+/// `ArchiveEntry` holds, as a map from keyword to value.
+///
+/// Two layers, because a pax archive's global `g` records apply to every
+/// member after them: copying them into each member cost time and memory
+/// proportional to the global records times the members, so they are held
+/// once and shared. A member's own records lie over them.
+#[derive(Debug, Clone, Default)]
+pub struct ExtRecords {
+    /// The global records in force for this member, shared with every other
+    /// member they apply to.
+    shared: Arc<HashMap<String, String>>,
+    /// The member's own records. `None` is a keyword its own header deleted,
+    /// which hides the shared value.
+    own: HashMap<String, Option<String>>,
+}
+
+impl ExtRecords {
+    /// The value in force for `keyword`.
+    pub fn get(&self, keyword: &str) -> Option<&str> {
+        match self.own.get(keyword) {
+            Some(value) => value.as_deref(),
+            None => self.shared.get(keyword).map(String::as_str),
+        }
+    }
+
+    /// Lay this member's records over `shared`.
+    pub fn share(&mut self, shared: &Arc<HashMap<String, String>>) {
+        self.shared = Arc::clone(shared);
+    }
+
+    /// Hide the shared value of `keyword`, unless this member set its own.
+    pub fn hide(&mut self, keyword: &str) {
+        self.own.entry(keyword.to_string()).or_insert(None);
     }
 }
 
@@ -328,19 +357,23 @@ pub trait ArchiveWriter {
     }
 }
 
-/// Tracks hard links during archive creation
+/// Tracks hard links during archive creation and copying.
+///
+/// A file is remembered for the whole run, not only until `nlink` of its
+/// names have gone by as cpio's [`LinkSets`] does: a name list can reach the
+/// same name twice (`find tree | pax -w` lists it and walks it), and a file
+/// forgotten before the repeat would be stored again in full -- splitting a
+/// hard-linked pair on extraction, depending on the order.
 #[derive(Debug, Default)]
 pub struct HardLinkTracker {
-    /// Maps (dev, ino) to the first path seen
-    seen: HashMap<(u64, u64), PathBuf>,
+    /// The first path each file was stored under
+    sets: LinkSets<PathBuf>,
 }
 
 impl HardLinkTracker {
     /// Create a new tracker
     pub fn new() -> Self {
-        HardLinkTracker {
-            seen: HashMap::new(),
-        }
+        Self::default()
     }
 
     /// The name a multiply-linked file was first stored under, if one of its
@@ -349,7 +382,7 @@ impl HardLinkTracker {
         if nlink <= 1 {
             return None;
         }
-        self.seen.get(&(dev, ino)).cloned()
+        self.sets.get((dev, ino)).cloned()
     }
 
     /// Note that a file's first name has been stored, as `stored`: the archive
@@ -360,10 +393,8 @@ impl HardLinkTracker {
     /// its data was read made every later name of an unreadable file a link
     /// to a member that was never written.
     pub fn record(&mut self, dev: u64, ino: u64, nlink: u32, stored: &Path) {
-        if nlink > 1 {
-            self.seen
-                .entry((dev, ino))
-                .or_insert_with(|| stored.to_path_buf());
+        if nlink > 1 && self.sets.get((dev, ino)).is_none() {
+            self.sets.insert((dev, ino), nlink, stored.to_path_buf());
         }
     }
 }
@@ -404,6 +435,11 @@ impl<T> LinkSets<T> {
     }
 
     /// What was remembered about a set an earlier name started.
+    pub fn get(&self, key: (u64, u64)) -> Option<&T> {
+        self.sets.get(&key).map(|(value, _)| value)
+    }
+
+    /// What was remembered about a set an earlier name started, to update.
     pub fn get_mut(&mut self, key: (u64, u64)) -> Option<&mut T> {
         self.sets.get_mut(&key).map(|(value, _)| value)
     }
@@ -480,5 +516,21 @@ mod tests {
         // The third name completes the set.
         sets.name_seen(key);
         assert_eq!(sets.get_mut(key), None);
+    }
+
+    #[test]
+    fn test_hard_link_tracker_keeps_the_first_name() {
+        let mut links = HardLinkTracker::new();
+        // A file with one name is never remembered.
+        links.record(1, 7, 1, Path::new("solo"));
+        assert_eq!(links.lookup(1, 7, 1), None);
+
+        links.record(1, 9, 2, Path::new("a"));
+        // Recording a second time keeps the first name, and the file stays
+        // remembered however many of its names go by.
+        links.record(1, 9, 2, Path::new("b"));
+        for _ in 0..3 {
+            assert_eq!(links.lookup(1, 9, 2).as_deref(), Some(Path::new("a")));
+        }
     }
 }

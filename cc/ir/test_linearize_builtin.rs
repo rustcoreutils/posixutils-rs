@@ -1129,6 +1129,43 @@ fn test_constant_p_answers_a_side_effect_at_once() {
     }
 }
 
+/// A vector travels by address, which is never a constant, so its
+/// `__builtin_constant_p` asks about each lane: one `ConstantP` per lane,
+/// each over a load of that lane, for `sccp` to answer once load forwarding
+/// has found the stored values. A `volatile` vector is answered at once.
+#[test]
+fn test_constant_p_of_a_vector_asks_each_lane() {
+    let decls = "typedef int v4si __attribute__((vector_size(16)));\n\
+                 typedef double v2df __attribute__((vector_size(16)));\n";
+    for (body, lanes, width) in [
+        (
+            "v4si v = { 1, 2, 3, 4 }; return __builtin_constant_p(v);",
+            4,
+            32,
+        ),
+        (
+            "v2df d = { 1.0, 2.0 }; return __builtin_constant_p(d);",
+            2,
+            64,
+        ),
+    ] {
+        let src = format!("{decls}int f(void) {{ {body} }}\n");
+        let module = linearize_source(&src, &Target::new(Arch::X86_64, Os::Linux));
+        let insns = insns_of(&module, "f");
+        let asked: Vec<_> = insns.iter().filter(|i| i.op == Opcode::ConstantP).collect();
+        assert_eq!(asked.len(), lanes, "{body}");
+        for cp in asked {
+            let load = insns
+                .iter()
+                .find(|i| i.target == Some(cp.src[0]))
+                .expect("the operand is defined");
+            assert_eq!((load.op, load.size), (Opcode::Load, width), "{body}");
+        }
+    }
+    let src = format!("{decls}int f(void) {{ volatile v4si v = {{ 1, 2, 3, 4 }}; return __builtin_constant_p(v); }}\n");
+    assert!(!constant_p_deferred(&src));
+}
+
 /// The trapping operand a deferred `__builtin_constant_p` admits is not
 /// admitted where an expression is evaluated speculatively: a conditional
 /// with a division in an arm still branches.

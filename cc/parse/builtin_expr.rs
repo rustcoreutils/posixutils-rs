@@ -121,6 +121,8 @@ impl Parser<'_> {
             ExprKind::IntLit(1)
         } else if !self.library_call_policy.optimizing
             || arg.typ.is_some_and(|t| {
+                // A GNU vector is a value, not an aggregate: gcc answers 1
+                // for a vector of constants once optimized.
                 matches!(
                     self.types.kind(t),
                     TypeKind::Pointer
@@ -128,7 +130,7 @@ impl Parser<'_> {
                         | TypeKind::Struct
                         | TypeKind::Union
                         | TypeKind::Function
-                )
+                ) && !self.types.is_vector(t)
             })
         {
             ExprKind::IntLit(0)
@@ -589,12 +591,24 @@ impl Parser<'_> {
                 let cond_pos = self.current_pos();
                 let cond = self.parse_assignment_expr()?;
                 self.expect_special(b',')?;
+                let then_mark = self.reverse_atomic_mark();
                 let then_expr = self.parse_assignment_expr()?;
                 self.expect_special(b',')?;
+                let else_mark = self.reverse_atomic_mark();
                 let else_expr = self.parse_assignment_expr()?;
                 self.expect_special(b')')?;
                 match self.eval_const_expr(&cond) {
-                    Some(v) => Ok(if v != 0 { then_expr } else { else_expr }),
+                    Some(v) => {
+                        // The arm not chosen accesses nothing, as in gcc.
+                        let else_held = self.take_reverse_atomic_members(else_mark);
+                        if v != 0 {
+                            Ok(then_expr)
+                        } else {
+                            self.take_reverse_atomic_members(then_mark);
+                            self.reverse_atomic_members.extend(else_held);
+                            Ok(else_expr)
+                        }
+                    }
                     None => {
                         diag::error(
                             cond_pos,

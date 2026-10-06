@@ -9,7 +9,7 @@
 // struct, union and enum specifiers, and the bit-field constraints
 //
 
-use super::attribute::AttributeList;
+use super::attribute::{AttributeList, ATTRIBUTE_WARNING};
 use super::declaration::SpecContext;
 use super::parser::{DeclaratorContext, ParseError, ParseResult, ParsedDeclarator, Parser};
 use crate::diag;
@@ -25,6 +25,26 @@ use gettextrs::{gettext, gettext_args};
 
 const DEFAULT_MEMBER_CAPACITY: usize = 16;
 const DEFAULT_ENUM_CAPACITY: usize = 16;
+
+/// A `scalar_storage_order` attribute written on a reference to an existing
+/// struct or union, which the declaration it begins applies or ignores
+/// ([`Parser::apply_written_storage_order`]).
+#[derive(Clone, Copy)]
+pub(crate) struct WrittenOrder {
+    pub(crate) order: ByteOrder,
+    pub(crate) pos: Position,
+}
+
+/// Where a declarator may take a struct's variant in another storage order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VariantAllowed {
+    /// A typedef name.
+    Typedef,
+    /// A type-name, which gcc warns about.
+    TypeName,
+    /// Anything else, which ignores the order.
+    No,
+}
 
 impl Parser<'_> {
     /// The integer type an enumerated type is compatible with, and its size.
@@ -615,7 +635,14 @@ impl Parser<'_> {
                         TypeKind::Struct
                     };
                     self.check_tag_kind(tag_name, existing, kind);
-                    Ok(self.in_written_storage_order(existing, storage_order))
+                    // What the order does to a reference depends on the
+                    // declarator, which is not parsed yet: the specifier
+                    // names the tag's own type, and the consumer decides.
+                    self.written_storage_order = storage_order.map(|order| WrittenOrder {
+                        order,
+                        pos: specifier_pos,
+                    });
+                    Ok(self.types.get(existing).clone())
                 } else {
                     // Create new incomplete type and register it in symbol table
                     // This ensures that when the type is completed later, we can update
@@ -668,6 +695,9 @@ impl Parser<'_> {
             // Parse member declaration
             let specs_start = self.pos;
             let member_specs = self.parse_declaration_specifiers(SpecContext::Member)?;
+            // A member never takes another storage order from its own
+            // declaration; the struct it is in decides.
+            self.ignore_written_storage_order(member_specs.written_order);
             // Whether the specifiers spell out a structure or union -- the
             // only thing that can make an anonymous member -- rather than
             // naming one through a typedef.
@@ -1008,17 +1038,68 @@ impl Parser<'_> {
         true
     }
 
-    /// The struct or union `typ` as a reference to it with a
-    /// `scalar_storage_order` attribute sees it: gcc's variant of the type
-    /// in that order -- `typedef struct S __attribute__((...)) BE;` -- which
-    /// has the same members and layout and is not compatible with `typ` when
-    /// the order differs. Without an attribute, or with the order the type
-    /// already has, the type itself.
-    fn in_written_storage_order(&mut self, typ: TypeId, written: Option<ByteOrder>) -> Type {
-        let mut variant = self.types.get(typ).clone();
-        let Some(order) = written else {
-            return variant;
+    /// The order a `scalar_storage_order` attribute wrote on a reference to
+    /// an existing struct or union, taken from the specifier just parsed.
+    pub(super) fn take_written_storage_order(&mut self) -> Option<WrittenOrder> {
+        self.written_storage_order.take()
+    }
+
+    /// What gcc does with `scalar_storage_order` written on a reference to
+    /// an existing tag, once the declarator is known: `base` is the tag's
+    /// type as the specifiers qualified it, and `declared` what the
+    /// declarator derived from it.
+    ///
+    /// A typedef or a type-name that derives nothing gets gcc's variant of
+    /// the type in that order -- `typedef struct S __attribute__((...))
+    /// BE;` -- which has the same members and layout and is not compatible
+    /// with `struct S` when the order differs; a type-name says the
+    /// attribute came after the definition. Anything else -- an object, a
+    /// parameter, a member, a function, or a pointer or array declarator --
+    /// ignores the attribute and says so: `struct S __attribute__((...)) x;`
+    /// declares a plain `struct S`.
+    pub(super) fn apply_written_storage_order(
+        &mut self,
+        written: Option<WrittenOrder>,
+        base: TypeId,
+        declared: TypeId,
+        variant_allowed: VariantAllowed,
+    ) -> TypeId {
+        let Some(written) = written else {
+            return declared;
         };
+        let warn = diag::warning_group_enabled(ATTRIBUTE_WARNING);
+        if variant_allowed == VariantAllowed::No || declared != base {
+            if warn {
+                diag::warning_args(
+                    written.pos,
+                    "'{0}' attribute ignored",
+                    &["scalar_storage_order"],
+                );
+            }
+            return declared;
+        }
+        if variant_allowed == VariantAllowed::TypeName && warn {
+            diag::warning_args(
+                written.pos,
+                "ignoring attributes applied to '{0}' after definition",
+                &[&self.types.format_type(base, Some(self.idents))],
+            );
+        }
+        let variant = self.in_written_storage_order(base, written.order);
+        self.types.intern(variant)
+    }
+
+    /// [`Self::apply_written_storage_order`] where no declarator can take the
+    /// variant: the attribute is ignored, with gcc's warning.
+    pub(super) fn ignore_written_storage_order(&mut self, written: Option<WrittenOrder>) {
+        let int = self.types.int_id;
+        self.apply_written_storage_order(written, int, int, VariantAllowed::No);
+    }
+
+    /// The struct or union `typ` in the storage order `order`: a type of its
+    /// own when that is not the order `typ` already has, otherwise `typ`.
+    fn in_written_storage_order(&mut self, typ: TypeId, order: ByteOrder) -> Type {
+        let mut variant = self.types.get(typ).clone();
         let reverse = order != self.types.target().byte_order();
         let Some(composite) = variant.composite.as_deref_mut() else {
             return variant;

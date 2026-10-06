@@ -683,6 +683,7 @@ impl Parser<'_> {
             // Parse parameter type
             let param_pos = self.current_pos();
             let param_specs = self.parse_declaration_specifiers(SpecContext::Parameter)?;
+            self.ignore_written_storage_order(param_specs.written_order);
             let param_type = param_specs.ty;
             // C11 6.7.5p2: not on a parameter.
             self.reject_alignas_in("a parameter");

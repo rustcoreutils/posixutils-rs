@@ -290,6 +290,10 @@ pub(crate) struct DeclSpecifiers {
     /// specifiers written beside it. Only a [`SpecContext::Declaration`]
     /// list admits one, so no other consumer meets it.
     pub(crate) inferred: Option<Position>,
+    /// A `scalar_storage_order` written on a reference to an existing struct
+    /// or union, which `ty` does not include: whether it applies depends on
+    /// the declarator ([`Parser::apply_written_storage_order`]).
+    pub(crate) written_order: Option<super::aggregate::WrittenOrder>,
 }
 
 /// A type specifier that names a complete type by itself.
@@ -879,6 +883,7 @@ impl<'a> Parser<'a> {
         // recorded here and checked once the list is complete.
         let mut tally = SpecifierTally::default();
         let mut inferred: Option<Position> = None;
+        let mut written_order = None;
 
         // Skip any leading __attribute__
         self.skip_extensions();
@@ -1212,6 +1217,7 @@ impl<'a> Parser<'a> {
                         Some(named) => named,
                         None => {
                             let expr = self.parse_expression()?;
+                            self.exempt_reverse_atomic_operand(&expr);
                             let dims = self.typeof_object_extents(&expr);
                             (expr.typ.unwrap_or(self.types.int_id), dims)
                         }
@@ -1255,6 +1261,7 @@ impl<'a> Parser<'a> {
                     } else {
                         self.parse_struct_or_union_specifier(name_id == crate::kw::UNION, alone)
                     };
+                    written_order = self.take_written_storage_order();
                     resolved = Some(match parsed {
                         Ok(typ) => Resolved::Built(typ),
                         // A type-name reports the fault where it arose and
@@ -1416,6 +1423,7 @@ impl<'a> Parser<'a> {
             explicit,
             vm_dims,
             inferred,
+            written_order,
         })
     }
 

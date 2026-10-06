@@ -6968,6 +6968,9 @@ impl<'a> Linearizer<'a> {
                 if !self.is_discardable(inner) {
                     return self.emit_const(0, self.types.int_id);
                 }
+                if self.types.is_vector(self.expr_type(inner)) {
+                    return self.vector_constant_p(inner);
+                }
                 let operand = self.linearize_expr(inner);
                 let result = self.alloc_reg_pseudo();
                 self.emit(

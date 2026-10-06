@@ -1138,6 +1138,78 @@ impl Parser<'_> {
         false
     }
 
+    /// Is `expr` a member access naming an `_Atomic` scalar stored in reverse
+    /// byte order?
+    fn is_reverse_atomic_member(&self, expr: &Expr) -> bool {
+        matches!(expr.kind, ExprKind::Member { .. } | ExprKind::Arrow { .. })
+            && expr
+                .typ
+                .is_some_and(|t| self.types.is_atomic(t) && self.types.reverses_storage(t))
+    }
+
+    /// Record a member access just built, if it names an `_Atomic` scalar of
+    /// a `scalar_storage_order` structure stored in reverse order.
+    ///
+    /// Every access to such an object is an atomic operation on its address,
+    /// which a reversed scalar does not have, so gcc refuses each one: a read,
+    /// a write, a compound assignment, `++` and `--` -- even in an operand
+    /// that is never evaluated, `sizeof (s.a + 1)`. What it allows is the
+    /// member as the *whole* operand of `sizeof`, `_Alignof`, `typeof` or a
+    /// `_Generic` controlling expression, which read nothing, and in an
+    /// association or `__builtin_choose_expr` arm that is not selected.
+    ///
+    /// Postfix parsing cannot know which of these it is in, so the access is
+    /// held here until those operators have had the chance to clear it
+    /// ([`Self::exempt_reverse_atomic_operand`],
+    /// [`Self::take_reverse_atomic_members`]), and whatever remains is
+    /// reported by [`Self::report_reverse_atomic_members`].
+    ///
+    /// An element of an `_Atomic` array member is not held: gcc reads and
+    /// writes it as an ordinary reversed scalar.
+    pub(super) fn note_reverse_atomic_member(&mut self, expr: &Expr) {
+        if self.is_reverse_atomic_member(expr) {
+            self.reverse_atomic_members.push(expr.pos);
+        }
+    }
+
+    /// `operand` is the whole operand of an operator that does not access
+    /// it; if it is a member [`Self::note_reverse_atomic_member`] held, it
+    /// was the last one held, and is no access after all.
+    pub(super) fn exempt_reverse_atomic_operand(&mut self, operand: &Expr) {
+        if self.is_reverse_atomic_member(operand)
+            && self.reverse_atomic_members.last() == Some(&operand.pos)
+        {
+            self.reverse_atomic_members.pop();
+        }
+    }
+
+    /// How many members are held, to pass to
+    /// [`Self::take_reverse_atomic_members`] once an operand is parsed.
+    pub(super) fn reverse_atomic_mark(&self) -> usize {
+        self.reverse_atomic_members.len()
+    }
+
+    /// The members held since `mark`, removed: an operand that is not
+    /// evaluated, or one parsed and then abandoned, gives them up, and a
+    /// `_Generic` association puts its own back once it is selected.
+    pub(super) fn take_reverse_atomic_members(&mut self, mark: usize) -> Vec<Position> {
+        let mark = mark.min(self.reverse_atomic_members.len());
+        self.reverse_atomic_members.split_off(mark)
+    }
+
+    /// Report every member access still held: each one reads or writes the
+    /// object. A tentative parse that was rewound may have held one twice.
+    pub(super) fn report_reverse_atomic_members(&mut self) {
+        let mut held = std::mem::take(&mut self.reverse_atomic_members);
+        held.dedup();
+        for pos in held {
+            diag::error(
+                pos,
+                &gettext("cannot take address of scalar with reverse storage order"),
+            );
+        }
+    }
+
     /// Report a target that cannot be assigned to or stepped (C17 6.5.16p2,
     /// 6.5.3.1p1). `verb` names the operator for the message, matching what
     /// gcc says so that the two agree on the wording users search for.

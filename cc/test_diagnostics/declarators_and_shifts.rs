@@ -516,3 +516,22 @@ fn diagnostics_attribute_integer_arguments() {
         ),
     );
 }
+
+/// A decimal constant too large for any type draws gcc's one warning,
+/// "integer constant is too large for its type"; c17 added "so large that
+/// it is unsigned" about the truncated value.
+#[test]
+fn too_large_decimal_constant_warns_once() {
+    let out = crate::test_compile::compile_accepted(
+        "too_large_decimal",
+        "unsigned long long x = 123456789012345678901234567890;\n",
+        &[],
+    );
+    assert_eq!(
+        out.matches("integer constant is too large for its type")
+            .count(),
+        1,
+        "{out}"
+    );
+    assert!(!out.contains("so large that it is unsigned"), "{out}");
+}

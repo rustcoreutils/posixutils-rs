@@ -793,6 +793,8 @@ impl<'a> Parser<'a> {
             let op_pos = self.current_pos();
             self.advance();
             let operand = self.parse_unary_expr()?;
+            // `&` refuses a reversed scalar itself.
+            self.exempt_reverse_atomic_operand(&operand);
             self.check_addressable(&operand, op_pos);
             // AddrOf produces pointer to operand's type
             let base_type = operand.typ.unwrap_or(self.types.int_id);
@@ -1022,12 +1024,16 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
 
+        // A rewind parses the operand again; what it held goes with it.
+        let mark = self.reverse_atomic_mark();
         let Ok(expr) = self.parse_expression() else {
             self.pos = saved;
+            self.take_reverse_atomic_members(mark);
             return Ok(None);
         };
         if !self.is_special(b')') {
             self.pos = saved;
+            self.take_reverse_atomic_members(mark);
             return Ok(None);
         }
         self.advance(); // consume typeof's `)`
@@ -1390,7 +1396,8 @@ impl<'a> Parser<'a> {
     /// definition yet. A variable length array is complete, and its `sizeof`
     /// is computed at run time. `void` is gcc's extension, as for a
     /// type-name.
-    fn check_sizeof_expr_operand(&self, expr: &Expr, pos: Position) {
+    fn check_sizeof_expr_operand(&mut self, expr: &Expr, pos: Position) {
+        self.exempt_reverse_atomic_operand(expr);
         // C17 6.5.3.4p1: not a bit-field, which has no size in bytes.
         if self.bit_field_designated(expr).is_some() {
             diag::error(pos, &gettext("'sizeof' applied to a bit-field"));
@@ -1513,6 +1520,7 @@ impl<'a> Parser<'a> {
     /// implementation: the constant evaluator and the linearizer each computed
     /// this from `expr.typ` alone and so disagreed with gcc identically.
     fn alignof_expr(&mut self, expr: Expr, size_t: TypeId, pos: Position) -> Expr {
+        self.exempt_reverse_atomic_operand(&expr);
         if self.bit_field_designated(&expr).is_some() {
             diag::error(pos, &gettext("'_Alignof' applied to a bit-field"));
         }
@@ -1641,6 +1649,7 @@ impl<'a> Parser<'a> {
                     member_type,
                     base_pos,
                 );
+                self.note_reverse_atomic_member(&expr);
             } else if self.is_special_token(SpecialToken::Arrow) {
                 // Pointer member access
                 let arrow_pos = self.current_pos();
@@ -1703,6 +1712,7 @@ impl<'a> Parser<'a> {
                     member_type,
                     base_pos,
                 );
+                self.note_reverse_atomic_member(&expr);
             } else if self.is_special(b'(') {
                 // Function call
                 let call_pos = self.current_pos();
@@ -2375,13 +2385,17 @@ impl<'a> Parser<'a> {
         // conversion: array-to-pointer, function-to-pointer, and every
         // top-level qualifier removed.
         let controlling = self.parse_assignment_expr()?;
+        self.exempt_reverse_atomic_operand(&controlling);
         let controlling_typ = controlling.typ.unwrap_or(self.types.int_id);
         let selector = self.lvalue_converted_type(controlling_typ);
 
         self.expect_special(b',')?;
 
-        let mut selected: Option<Expr> = None;
-        let mut default_expr: Option<Expr> = None;
+        // Each association's held reversed `_Atomic` members, kept back
+        // until it is known whether it is the one selected: gcc does not
+        // look inside the others.
+        let mut selected: Option<(Expr, Vec<Position>)> = None;
+        let mut default_expr: Option<(Expr, Vec<Position>)> = None;
         let mut default_pos: Option<Position> = None;
         // Association types seen so far, for the "no two compatible" check.
         let mut seen: Vec<(TypeId, Position)> = Vec::new();
@@ -2392,7 +2406,9 @@ impl<'a> Parser<'a> {
             if self.is_keyword(crate::kw::DEFAULT) {
                 self.advance();
                 self.expect_special(b':')?;
+                let mark = self.reverse_atomic_mark();
                 let expr = self.parse_assignment_expr()?;
+                let held = self.take_reverse_atomic_members(mark);
 
                 if default_pos.is_some() {
                     diag::error(
@@ -2401,7 +2417,7 @@ impl<'a> Parser<'a> {
                     );
                 } else {
                     default_pos = Some(assoc_pos);
-                    default_expr = Some(expr);
+                    default_expr = Some((expr, held));
                 }
             } else {
                 let (assoc_typ, dims) = self.parse_type_name_vm()?;
@@ -2428,7 +2444,9 @@ impl<'a> Parser<'a> {
                     );
                 }
                 self.expect_special(b':')?;
+                let mark = self.reverse_atomic_mark();
                 let expr = self.parse_assignment_expr()?;
+                let held = self.take_reverse_atomic_members(mark);
 
                 // 6.5.1.1p2: no two associations may name compatible types.
                 // The comparison is qualifier-sensitive, so `int` and
@@ -2448,7 +2466,7 @@ impl<'a> Parser<'a> {
 
                 if self.types.types_compatible_qualified(selector, assoc_typ) && selected.is_none()
                 {
-                    selected = Some(expr);
+                    selected = Some((expr, held));
                 }
             }
 
@@ -2462,7 +2480,10 @@ impl<'a> Parser<'a> {
         self.expect_special(b')')?;
 
         match selected.or(default_expr) {
-            Some(expr) => Ok(expr),
+            Some((expr, held)) => {
+                self.reverse_atomic_members.extend(held);
+                Ok(expr)
+            }
             None => {
                 diag::error_args(
                     token_pos,
@@ -2943,10 +2964,14 @@ impl<'a> Parser<'a> {
             // to a negative `long long`, so `18446744073709551615 > 0` was 0.
             let is_decimal = !is_hex && !body.starts_with('0') && !body.starts_with("0b");
             if is_decimal && !is_unsigned && value_u64 > i64::MAX as u64 {
-                diag::warning(
-                    pos,
-                    &gettext("integer constant is so large that it is unsigned"),
-                );
+                // A truncated constant was already reported as too large;
+                // gcc says nothing more about the low bits it kept.
+                if !truncated {
+                    diag::warning(
+                        pos,
+                        &gettext("integer constant is so large that it is unsigned"),
+                    );
+                }
                 let typ = self.types.int128_id;
                 let lit = Self::typed_expr(ExprKind::Int128Lit(i128::from(value_u64)), typ, pos);
                 return Ok(self.imaginary_if(lit, is_imaginary, typ, pos));

@@ -398,6 +398,37 @@ impl Linearizer<'_> {
         self.load_lane(at, 0, lane)
     }
 
+    /// `__builtin_constant_p` of the vector expression `e`, whose
+    /// discardability the caller has checked: 1 when every lane is a
+    /// constant, as gcc answers a vector of constants once optimized.
+    ///
+    /// A vector travels by address, and an address is no constant, so the
+    /// question is asked of each lane -- one `ConstantP` per lane load, which
+    /// load forwarding turns into the stored value for `sccp` to answer --
+    /// and the answers are and-ed. A lane `sccp` never answers is 0 in
+    /// `ir::lower`, and so is the whole.
+    pub(crate) fn vector_constant_p(&mut self, e: &Expr) -> PseudoId {
+        let int = self.types.int_id;
+        let (lane, count, size) = self.vector_shape(self.expr_type(e));
+        let addr = self.vector_addr(e);
+        let mut answer: Option<PseudoId> = None;
+        for i in 0..count {
+            let value = self.load_lane(addr, i as i64 * size, lane);
+            let constant = self.alloc_reg_pseudo();
+            self.emit(
+                Instruction::new(Opcode::ConstantP)
+                    .with_target(constant)
+                    .with_src(value)
+                    .with_type_and_size(int, 32),
+            );
+            answer = Some(match answer {
+                Some(acc) => self.emit_binary(BinaryOp::BitAnd, acc, constant, int, int),
+                None => constant,
+            });
+        }
+        answer.unwrap_or_else(|| self.emit_const(1, int))
+    }
+
     /// The lane type, lane count and lane size in bytes of vector `typ`.
     fn vector_shape(&self, typ: TypeId) -> (TypeId, usize, i64) {
         let (lane, count) = self

@@ -93,6 +93,18 @@ fn a_pointer_or_aggregate_is_answered_at_once() {
     }
 }
 
+/// A GNU vector is a value, not an aggregate: like a scalar it waits for the
+/// optimizer, which answers a vector of constants 1 as gcc does, and is 0 at
+/// once at `-O0`.
+#[test]
+fn a_vector_is_deferred_like_a_scalar() {
+    for target in targets() {
+        let operand = "(int __attribute__((vector_size(8))))(long)x";
+        assert_eq!(answer(operand, true, &target), None);
+        assert_eq!(answer(operand, false, &target), Some(0));
+    }
+}
+
 /// An arithmetic operand the parser cannot fold waits for the optimizer --
 /// the trapping ones too, which the linearizer decides about -- and is 0 at
 /// once at `-O0`.

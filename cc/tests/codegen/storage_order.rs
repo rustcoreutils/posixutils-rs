@@ -549,3 +549,38 @@ int main(void)
 "#;
     compile_and_run_everywhere("storage_order_pragma", SRC);
 }
+
+/// The attribute written on a variable of an existing struct is ignored, as
+/// gcc ignores it: the object is the native struct and assigns to and from
+/// one. An element of an `_Atomic` array member of a big-endian struct is
+/// read and written in the struct's order, as gcc does.
+#[test]
+fn codegen_storage_order_written_on_a_reference() {
+    const SRC: &str = r#"/* A variable declared with the attribute on an existing tag is native;
+   an `_Atomic` array element in a big-endian struct is stored big-endian. */
+#include <string.h>
+
+struct S { int a; };
+struct S __attribute__((scalar_storage_order("big-endian"))) x, y;
+struct S z;
+
+struct __attribute__((scalar_storage_order("big-endian"))) B { int b; _Atomic int arr[2]; };
+struct B g;
+
+int main(void)
+{
+    x.a = 0x01020304;
+    y = x;
+    z = y;
+    if (*(unsigned char *)&x != 0x04 || z.a != 0x01020304) return 1;
+
+    g.arr[1] = 0x01020304;
+    g.arr[0] += 0x0a0b0c0d;
+    static const unsigned char want[] = {0, 0, 0, 0, 0x0a, 0x0b, 0x0c, 0x0d, 1, 2, 3, 4};
+    if (memcmp(&g, want, sizeof want) != 0) return 2;
+    if (g.arr[1] != 0x01020304 || g.arr[0] != 0x0a0b0c0d) return 3;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("storage_order_reference", SRC);
+}

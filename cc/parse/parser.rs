@@ -287,6 +287,15 @@ pub struct Parser<'a> {
     /// still makes `f` a constructor. Reading the definition's own attributes
     /// alone would silently drop it.
     pub(super) declared_fn_attrs: BTreeMap<StringId, crate::parse::ast::FunctionAttrs>,
+    /// `_Atomic` members of reverse-storage-order structures named so far,
+    /// awaiting a verdict: each is an error unless its whole expression turns
+    /// out to be the operand of an operator that does not read it. See
+    /// [`Self::note_reverse_atomic_member`].
+    pub(super) reverse_atomic_members: Vec<Position>,
+    /// The `scalar_storage_order` written on the reference to an existing
+    /// tag the struct or union specifier just parsed, for the declaration
+    /// specifiers to collect.
+    pub(super) written_storage_order: Option<crate::parse::aggregate::WrittenOrder>,
     /// The GCC asm label seen in the declaration being parsed, awaiting the
     /// declarator it renames. Accumulated like `pending_fn_attrs` because
     /// `__asm__("...")` can appear before or after an `__attribute__` --
@@ -395,6 +404,8 @@ impl<'a> Parser<'a> {
             pending_calling_conv: None,
             enclosing_function: EnclosingFunction::default(),
             declared_fn_attrs: BTreeMap::new(),
+            reverse_atomic_members: Vec::new(),
+            written_storage_order: None,
             pending_asm_label: None,
             declared_asm_labels: BTreeMap::new(),
             declared_extern_fns: std::collections::BTreeSet::new(),

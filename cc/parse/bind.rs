@@ -10,6 +10,7 @@
 // declarators to the symbols they bind, at file scope and block scope alike
 //
 
+use super::aggregate::{VariantAllowed, WrittenOrder};
 use super::ast::{
     Declaration, Expr, ExprKind, ExternalDecl, FunctionAttrs, InitDeclarator, UnaryOp,
 };
@@ -58,6 +59,9 @@ pub(super) struct DeclSpecs {
     /// -- through a variably modified typedef name or `typeof(int[n])` --
     /// which are the innermost levels of every declarator's type.
     vm_dims: Vec<Expr>,
+    /// A `scalar_storage_order` written on a reference to an existing tag,
+    /// which each declarator applies or ignores.
+    written_order: Option<WrittenOrder>,
 }
 
 /// The type a declaration's declarators derive from.
@@ -189,8 +193,19 @@ impl Parser<'_> {
         } else {
             let mut first = true;
             loop {
-                let d = self
+                let mut d = self
                     .parse_declarator(specs.base.parse_against(), DeclaratorContext::Declaration)?;
+                let variant_allowed = if specs.is_typedef() {
+                    VariantAllowed::Typedef
+                } else {
+                    VariantAllowed::No
+                };
+                d.typ = self.apply_written_storage_order(
+                    specs.written_order,
+                    specs.base.parse_against(),
+                    d.typ,
+                    variant_allowed,
+                );
                 // An attribute may follow any declarator, and so may an asm
                 // label.
                 self.skip_extensions_after_declarator();
@@ -299,6 +314,7 @@ impl Parser<'_> {
             explicit: parsed.explicit,
             attrs: self.specifier_attrs(),
             vm_dims: parsed.vm_dims,
+            written_order: parsed.written_order,
             ty,
         })
     }

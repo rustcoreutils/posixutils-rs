@@ -39,6 +39,7 @@ impl Parser<'_> {
             // Try to determine if this is a function definition or a declaration
             // Both start with type specifier + declarator
             let external_decl = self.parse_external_decl()?;
+            self.report_reverse_atomic_members();
             tu.add(external_decl);
         }
 
@@ -512,9 +513,9 @@ impl Parser<'_> {
         while self.is_declaration_start() {
             declared = true;
             let knr_pos = self.current_pos();
-            let knr_type = self
-                .parse_declaration_specifiers(SpecContext::Parameter)?
-                .ty;
+            let knr_specs = self.parse_declaration_specifiers(SpecContext::Parameter)?;
+            self.ignore_written_storage_order(knr_specs.written_order);
+            let knr_type = knr_specs.ty;
             let knr_base_id = self.intern_type_with_tag(&knr_type);
             loop {
                 let ParsedDeclarator {

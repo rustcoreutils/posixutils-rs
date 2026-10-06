@@ -301,3 +301,174 @@ fn diagnostics_storage_order_reversed_aggregate_initializers_gcc_allows() {
          int f(void) { struct Rec c = { 3, &i, { &i } }; return *c.p + *c.in.q; }\n",
     );
 }
+
+/// An `_Atomic` member of a reverse-storage-order struct cannot be accessed:
+/// gcc rejects every read, write and compound assignment, as each needs the
+/// member's address. c17 read and wrote it in native order.
+#[test]
+fn storage_order_atomic_member_is_refused() {
+    for (name, body) in [
+        ("sso_atomic_read", "int rd(void) { return g.a; }"),
+        ("sso_atomic_write", "void wr(void) { g.a = 5; }"),
+        ("sso_atomic_rmw", "void inc(void) { g.a += 1; }"),
+    ] {
+        let src = format!(
+            "struct __attribute__((scalar_storage_order(\"big-endian\"))) S {{ _Atomic int a; int b; }};\n\
+             struct S g;\n{body}\n"
+        );
+        crate::test_compile::compile_expect_error(
+            name,
+            &src,
+            "cannot take address of scalar with reverse storage order",
+        );
+    }
+}
+
+/// Written on a variable declaration of an existing tag, the attribute is
+/// ignored with a warning, as gcc ignores it: `x` and `y` are the plain
+/// `struct S`, and one assigns to the other. c17 made each use a fresh,
+/// incompatible type.
+#[test]
+fn storage_order_on_a_variable_declaration_is_ignored() {
+    let src = "struct S { int a; };\n\
+               struct S __attribute__((scalar_storage_order(\"big-endian\"))) x, y;\n\
+               struct S z;\n\
+               void f(void) { x = y; z = x; }\n";
+    let out = crate::test_compile::compile_accepted("sso_var_decl", src, &[]);
+    assert!(
+        out.contains("'scalar_storage_order' attribute ignored"),
+        "{out}"
+    );
+}
+
+/// gcc refuses a reversed `_Atomic` member wherever it is an operand --
+/// even an unevaluated one, `sizeof (g.a + 1)`, or an arm a constant
+/// condition skips -- and allows it only as the whole operand of `sizeof`,
+/// `_Alignof`, `typeof` or a `_Generic` controlling expression, and in an
+/// association or `__builtin_choose_expr` arm not selected. An element of
+/// an `_Atomic` array member is an ordinary reversed scalar to gcc.
+#[test]
+fn storage_order_atomic_member_unevaluated_operands() {
+    const DECLS: &str =
+        "struct __attribute__((scalar_storage_order(\"big-endian\"))) S { _Atomic int a; int b; _Atomic int arr[2]; };\n\
+         struct S g;\n";
+    const REFUSED: &str = "cannot take address of scalar with reverse storage order";
+    for (name, body) in [
+        (
+            "sso_at_sizeof",
+            "int f(void) { return sizeof g.a + sizeof (g.a); }",
+        ),
+        ("sso_at_alignof", "int f(void) { return _Alignof(g.a); }"),
+        (
+            "sso_at_typeof",
+            "int f(void) { __typeof__(g.a) t = 0; return t + sizeof(__typeof__(g.a)); }",
+        ),
+        (
+            "sso_at_generic_ctl",
+            "int f(void) { return _Generic(g.a, int: 1, default: 2); }",
+        ),
+        (
+            "sso_at_generic_arm",
+            "int f(void) { return _Generic(0, int: 1, default: g.a); }",
+        ),
+        (
+            "sso_at_choose",
+            "int f(void) { return __builtin_choose_expr(1, 0, g.a); }",
+        ),
+        (
+            "sso_at_array",
+            "int f(void) { g.arr[1] = 2; return g.arr[1]; }",
+        ),
+        (
+            "sso_at_other",
+            "int f(void) { struct S h = { 1, 2 }; return g.b + h.b; }",
+        ),
+    ] {
+        let stderr = compile_accepted(name, &format!("{DECLS}{body}\n"), &[LINUX]);
+        assert!(!stderr.contains(REFUSED), "{name}:\n{stderr}");
+    }
+    for (name, body) in [
+        (
+            "sso_at_sizeof_sum",
+            "int f(void) { return sizeof(g.a + 1); }",
+        ),
+        ("sso_at_dead_arm", "int f(void) { return 1 ? 0 : g.a; }"),
+        (
+            "sso_at_generic_sel",
+            "int f(void) { return _Generic(0, int: g.a); }",
+        ),
+        (
+            "sso_at_choose_sel",
+            "int f(void) { return __builtin_choose_expr(0, 0, g.a); }",
+        ),
+        (
+            "sso_at_constant_p",
+            "int f(void) { return __builtin_constant_p(g.a); }",
+        ),
+        ("sso_at_arrow", "int f(struct S *p) { return p->a; }"),
+        ("sso_at_discard", "void f(void) { (void)g.a; }"),
+    ] {
+        expect_error(name, &format!("{DECLS}{body}\n"), REFUSED);
+    }
+    // `&` refuses it once, in its own words.
+    let stderr = compile_rejected_with(
+        "sso_at_addr",
+        &format!("{DECLS}int *f(void) {{ return (int *)&g.a; }}\n"),
+        &[LINUX],
+    );
+    assert_eq!(stderr.matches(REFUSED).count(), 1, "{stderr}");
+}
+
+/// Written on a reference to an existing tag, the attribute makes a variant
+/// only for a typedef or a type-name that derives nothing -- the type-name
+/// with gcc's "after definition" warning -- and each such typedef is a type
+/// of its own. A parameter, a member, a function, a pointer typedef and a
+/// cast to a pointer all ignore it, with a warning.
+#[test]
+fn storage_order_written_on_a_reference() {
+    const SSO: &str = "__attribute__((scalar_storage_order(\"big-endian\")))";
+    const IGNORED: &str = "'scalar_storage_order' attribute ignored";
+    for (name, decl) in [
+        (
+            "sso_ref_param",
+            "int f(struct S SSO p) { struct S q = p; return q.a; }",
+        ),
+        (
+            "sso_ref_member",
+            "struct U { struct S SSO m; } u; struct S z; void f(void) { z = u.m; }",
+        ),
+        (
+            "sso_ref_return",
+            "struct S SSO f(void) { struct S s = { 1 }; return s; }",
+        ),
+        (
+            "sso_ref_ptr_typedef",
+            "typedef struct S SSO *P; struct S z; P p = &z;",
+        ),
+        ("sso_ref_extern", "extern struct S SSO e; struct S e;"),
+        (
+            "sso_ref_array",
+            "struct S SSO arr[2]; struct S z; void f(void) { z = arr[0]; }",
+        ),
+        (
+            "sso_ref_cast",
+            "struct S z; int f(void) { return ((struct S SSO *)&z)->a; }",
+        ),
+    ] {
+        let src = format!("struct S {{ int a; }};\n{}\n", decl.replace("SSO", SSO));
+        expect_warning(name, &src, IGNORED);
+    }
+    expect_warning(
+        "sso_ref_type_name",
+        &format!("struct S {{ int a; }};\nint n = sizeof(struct S {SSO});\n"),
+        "ignoring attributes applied to 'struct S' after definition",
+    );
+    expect_error(
+        "sso_ref_typedefs_differ",
+        &format!(
+            "struct S {{ int a; }};\ntypedef struct S {SSO} A, B;\n\
+             void f(void) {{ A a = {{ 1 }}; B b; b = a; }}\n"
+        ),
+        "incompatible types",
+    );
+}

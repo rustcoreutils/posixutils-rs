@@ -201,3 +201,37 @@ fn test_a_reversed_aggregate_records_its_order() {
         .typ;
     assert!(reversed(nb));
 }
+
+/// On anything but a typedef or a bare type-name the attribute is ignored,
+/// as in gcc: an object, a pointer typedef and a parameter of `struct S`
+/// written with it all have the tag's own type.
+#[test]
+fn test_an_object_of_an_existing_tag_ignores_the_order() {
+    let src = "struct S { int i; };\n\
+               struct S __attribute__((scalar_storage_order(\"big-endian\"))) x, y;\n\
+               typedef struct S __attribute__((scalar_storage_order(\"big-endian\"))) *P;\n\
+               int f(struct S __attribute__((scalar_storage_order(\"big-endian\"))) p);\n";
+    let (_, types, strings, symbols) = parse_tu_for(src, &x86_64_linux()).unwrap();
+    let tag = symbols
+        .lookup(strings.lookup("S").unwrap(), Namespace::Tag)
+        .unwrap()
+        .typ;
+    let ordinary = |name: &str| {
+        symbols
+            .lookup(strings.lookup(name).unwrap(), Namespace::Ordinary)
+            .expect("declared")
+            .typ
+    };
+    assert_eq!(ordinary("x"), tag);
+    assert_eq!(ordinary("y"), tag);
+    let p = symbols
+        .lookup_typedef(strings.lookup("P").unwrap())
+        .expect("typedef declared");
+    assert_eq!(types.base_type(p), Some(tag));
+    let param = types
+        .get(ordinary("f"))
+        .params
+        .as_ref()
+        .expect("prototyped")[0];
+    assert_eq!(param, tag);
+}

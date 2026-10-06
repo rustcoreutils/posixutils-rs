@@ -21,7 +21,8 @@ use crate::common::compile_and_run_everywhere;
 ///   address -- even one whose value is known.
 /// - `good*` is 1 at every level: a constant, and the address of a string
 ///   literal's first character, however it is spelled.
-/// - `opt*` is 1 once optimized and 0 at -O0: an inline function's
+/// - `opt*` is 1 once optimized and 0 at -O0 (a GNU vector of constants
+///   included -- it is a value, not an aggregate): an inline function's
 ///   parameter after inlining a constant argument, a byte of a string
 ///   literal, and computations -- a division, a subscript, a floating
 ///   multiply -- that only propagation proves constant. The answer to the
@@ -70,13 +71,19 @@ int opt2(void) { return __builtin_constant_p("hi"[0]); }
 int opt3(void) { int x = 6, y = 2; return __builtin_constant_p(x / y); }
 int opt4(void) { int a[2] = { 1, 2 }; return __builtin_constant_p(a[1]); }
 int opt5(void) { double d = 2.0; return __builtin_constant_p(d * 3.0); }
+typedef int v4si_cp __attribute__((vector_size(16)));
+int opt6(void) { v4si_cp v = {1, 2, 3, 4}; return __builtin_constant_p(v); }
+typedef double v2df_cp __attribute__((vector_size(16)));
+int opt7(void) { v2df_cp d = {1.0, 2.0}; return __builtin_constant_p(d); }
+/* One lane unknown makes the vector unknown. */
+int bad14(int x) { v4si_cp v = {1, x, 3, 4}; return __builtin_constant_p(v); }
 
 typedef int (*fn0)(void);
 static fn0 volatile zero[] = { bad0, bad1, bad5, bad7, bad8, bad10, bad11, bad12, bad13 };
-static int (*volatile zero_int[])(int) = { bad2, bad3, bad6 };
+static int (*volatile zero_int[])(int) = { bad2, bad3, bad6, bad14 };
 static int (*volatile zero_str[])(const char *) = { bad4, bad9 };
 static fn0 volatile one[] = { good0, good1, good2, good3, good4, good5, good6 };
-static fn0 volatile opt[] = { opt0, opt1, opt2, opt3, opt4, opt5 };
+static fn0 volatile opt[] = { opt0, opt1, opt2, opt3, opt4, opt5, opt6, opt7 };
 
 #define N(a) (int)(sizeof(a) / sizeof *(a))
 

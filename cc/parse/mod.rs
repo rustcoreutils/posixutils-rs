@@ -54,6 +54,8 @@ mod test_local_labels;
 #[cfg(test)]
 mod test_member_list;
 #[cfg(test)]
+mod test_overflow_p_constant;
+#[cfg(test)]
 mod test_parser;
 #[cfg(test)]
 mod test_specifiers;

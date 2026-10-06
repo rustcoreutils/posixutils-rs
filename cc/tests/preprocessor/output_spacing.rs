@@ -57,3 +57,31 @@ fn preprocessor_argument_keeps_its_parameters_space() {
         ".balign 8; .org .Ltab + 3 * 8"
     );
 }
+
+/// Tokens from different places can meet with nothing between them: a macro
+/// boundary, an argument, an empty expansion. Written side by side they must
+/// still read back as the tokens they are, or `-M` (with `M` defined as `-`)
+/// becomes `--`. Tokens that came from the source together keep their
+/// spacing. gcc agrees on every pair here but `N+1`, which it writes `1 +1`
+/// for fear of an exponent; `1+` is no pp-number, so nothing is needed.
+#[test]
+fn preprocessor_output_never_pastes_tokens_together() {
+    let src = "#define M -\n\
+               #define E\n\
+               #define I(a) a\n\
+               #define P L\n\
+               #define D .\n\
+               #define N 1\n\
+               #define S /\n\
+               -M; -E-; +I(+)+; x-I(-1); P\"x\"; D.D; N.; I(1)e+1; S/ S*x*/; \
+               <I(:); I(%):; I(<)<=; a+++b; 1+2; a.b; p->q; f(x); x+=1; 1e+5; \
+               I(x)I(y); I(1)N; D N; N+1; P'c'; I(%:)%:\n";
+    let r = preprocess_text("pp_avoid_paste", src, &["-P"]);
+    assert!(r.success, "-E failed: {}", r.stderr);
+    assert_eq!(
+        line_with(&r.stdout, "a+++b"),
+        "- -; - -; + + +; x- -1; L \"x\"; . . .; 1 .; 1 e+1; / / / *x*/; \
+         < :; % :; < <=; a+++b; 1+2; a.b; p->q; f(x); x+=1; 1e+5; \
+         x y; 1 1; . 1; 1+1; L 'c'; %: %:"
+    );
+}

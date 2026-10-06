@@ -1141,19 +1141,11 @@ fn emit_preprocessed(
                     current_line += 1;
                     at_line_start = true;
                 } else {
-                    // Need a space if:
-                    // 1. Original had whitespace, OR
-                    // 2. Adjacent tokens would merge (both alphanumeric/underscore)
+                    // A space where the source had one, and wherever the
+                    // two would otherwise lex back as different tokens.
                     let next_text = show_token(next, strings);
-                    let needs_space = next.pos.whitespace
-                        || (text
-                            .chars()
-                            .last()
-                            .is_some_and(|c| c.is_alphanumeric() || c == '_')
-                            && next_text
-                                .chars()
-                                .next()
-                                .is_some_and(|c| c.is_alphanumeric() || c == '_'));
+                    let needs_space =
+                        next.pos.whitespace || token::spellings_merge(&text, &next_text);
                     if needs_space {
                         write!(out.preprocessed, " ")?;
                     }

@@ -1837,6 +1837,52 @@ pub fn write_token(out: &mut Vec<u8>, token: &Token, strings: &StringTable) {
     }
 }
 
+/// Every punctuator of C17 6.4.6, digraphs included.
+const PUNCTUATORS: &[&str] = &[
+    "[", "]", "(", ")", "{", "}", ".", "->", "++", "--", "&", "*", "+", "-", "~", "!", "/", "%",
+    "<<", ">>", "<", ">", "<=", ">=", "==", "!=", "^", "|", "&&", "||", "?", ":", ";", "...", "=",
+    "*=", "/=", "%=", "+=", "-=", "<<=", ">>=", "&=", "^=", "|=", ",", "#", "##", "<:", ":>", "<%",
+    "%>", "%:", "%:%:",
+];
+
+/// Whether the token spelled `left`, written directly before the one spelled
+/// `right`, would be read back as something else.
+///
+/// `-E` output is lexed again, so two tokens that meet with no white space
+/// between them -- across a macro boundary, an argument, an empty expansion
+/// -- need a space whenever maximal munch would take more than `left`, or
+/// the pair would open a comment. Tokens the lexer produced side by side
+/// already pass this test, so it only ever separates the ones that would
+/// otherwise change meaning, as `#define M -` then `-M` printed as `--`.
+pub fn spellings_merge(left: &str, right: &str) -> bool {
+    let (Some(lc), Some(rc)) = (left.chars().last(), right.chars().next()) else {
+        return false;
+    };
+    let word = |c: char| c.is_alphanumeric() || c == '_' || c == '$' || !c.is_ascii();
+    let bytes = left.as_bytes();
+    let number = bytes[0].is_ascii_digit()
+        || (bytes[0] == b'.' && bytes.get(1).is_some_and(u8::is_ascii_digit));
+    if number {
+        // A pp-number swallows identifier characters, `.`, and a sign after
+        // an exponent letter (6.4.8).
+        return word(rc)
+            || rc == '.'
+            || (matches!(lc, 'e' | 'E' | 'p' | 'P') && matches!(rc, '+' | '-'));
+    }
+    if left.chars().all(word) {
+        // An identifier grows, or prefixes a literal as its encoding.
+        return word(rc) || (matches!(rc, '"' | '\'') && matches!(left, "L" | "u" | "U" | "u8"));
+    }
+    if matches!(lc, '"' | '\'') || !PUNCTUATORS.contains(&left) {
+        return false;
+    }
+    if (left == "/" && matches!(rc, '/' | '*')) || (left == "." && rc.is_ascii_digit()) {
+        return true;
+    }
+    let grown = format!("{left}{rc}");
+    PUNCTUATORS.iter().any(|p| p.starts_with(&grown))
+}
+
 /// Format a token for display.
 ///
 /// Lossy for a literal holding bytes that are not valid UTF-8; use

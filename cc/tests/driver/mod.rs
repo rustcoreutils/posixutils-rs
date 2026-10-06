@@ -2165,6 +2165,49 @@ fn driver_fgnu89_inline_definition_order() {
             "extern inline int g(void) { return 1; }\nextern inline int g(void) { return 1; }\n",
             Some("redefinition of 'g'"),
         ),
+        // A `static` declaration takes over a name declared `extern inline`
+        // (gcc.c-torture `compile/20021120-1`, `-2`).
+        (
+            "gnu89_inline_only_then_static",
+            "extern inline int g(void) { return 1; }\nstatic int g(void) { return 0; }\n",
+            None,
+        ),
+        (
+            "gnu89_inline_only_then_static_inline",
+            "extern inline int g(void) { return 1; }\nstatic inline int g(void) { return 0; }\n",
+            None,
+        ),
+        (
+            "gnu89_decl_inline_only_then_static",
+            "int g(void);\nextern inline int g(void) { return 1; }\nstatic int g(void) { return 0; }\n",
+            None,
+        ),
+        (
+            "gnu89_extern_inline_decl_then_static",
+            "extern inline int g(void);\nstatic int g(void) { return 0; }\n",
+            None,
+        ),
+        (
+            "gnu89_static_decl_then_extern_inline",
+            "static int g(void);\nextern inline int g(void) { return 0; }\n",
+            None,
+        ),
+        (
+            "gnu89_static_then_inline_only",
+            "static int g(void) { return 0; }\nextern inline int g(void) { return 1; }\n",
+            Some("redefinition of 'g'"),
+        ),
+        (
+            "gnu89_decl_then_static",
+            "int g(void);\nstatic int g(void) { return 0; }\n",
+            Some("static declaration of 'g' follows non-static declaration"),
+        ),
+        (
+            "gnu89_real_then_static",
+            "extern inline int g(void) { return 1; }\nint g(void) { return 0; }\n\
+             static int g(void) { return 0; }\n",
+            Some("redefinition of 'g'"),
+        ),
     ];
     for (name, body, error) in cases {
         let src = create_c_file(name, &format!("{body}int main(void) {{ return g(); }}\n"));
@@ -2181,6 +2224,14 @@ fn driver_fgnu89_inline_definition_order() {
                 assert!(
                     defines_label(&r.stdout, "g"),
                     "{name}: `g` should have an out-of-line body:\n{}",
+                    r.stdout
+                );
+                // The static one's symbol is local.
+                let globl = format!(".globl {}g", crate::common::asm_prefix(&r.stdout, "main"));
+                assert_eq!(
+                    r.stdout.lines().any(|line| line.trim() == globl),
+                    !name.contains("static"),
+                    "{name}: `g` binding:\n{}",
                     r.stdout
                 );
             }

@@ -438,7 +438,9 @@ impl Parser<'_> {
                 // An initializer makes an object's declaration a definition
                 // (6.9.2p1); one without is at most a tentative definition.
                 defines: !is_fn && self.is_special(b'='),
-                inline_only: false,
+                gnu_extern_inline: fn_attrs
+                    .as_ref()
+                    .is_some_and(|attrs| attrs.gnu_inline_only(specs.storage_class)),
             });
             let sym = self
                 .declared_symbol(name, typ, align)

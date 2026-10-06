@@ -23,7 +23,7 @@ use super::parser::{
 };
 use crate::diag;
 use crate::strings::StringId;
-use crate::symbol::{Symbol, SymbolId};
+use crate::symbol::{Linkage, Symbol, SymbolId};
 use crate::token::lexer::{payload_text, Position, TokenType};
 use crate::types::{Type, TypeId, TypeKind, TypeModifiers};
 use gettextrs::gettext;
@@ -354,7 +354,6 @@ impl Parser<'_> {
         self.check_redeclaration(name, typ, pos, form);
         // A GNU inline-only body emits nothing, so a real definition may
         // follow it.
-        let inline_only = attrs.gnu_inline_only(specs.storage_class);
         let linkage = self.declare_linkage(Declared {
             name,
             typ,
@@ -362,7 +361,7 @@ impl Parser<'_> {
             storage: specs.storage_class,
             scope: DeclScope::File,
             defines: true,
-            inline_only,
+            gnu_extern_inline: attrs.gnu_inline_only(specs.storage_class),
         });
         let _ = self
             .symbols
@@ -406,7 +405,9 @@ impl Parser<'_> {
             param_style,
             body,
             pos: specs.pos,
-            is_static: specs.storage_class.contains(TypeModifiers::STATIC),
+            // The linkage, not the specifier: `static int f(void);` makes
+            // a later `int f(void) {..}` static too (C17 6.2.2p5, p4).
+            is_static: linkage == Linkage::Internal,
             is_inline: specs.storage_class.contains(TypeModifiers::INLINE),
             calling_conv: self.types.get(typ).conv,
             attrs,

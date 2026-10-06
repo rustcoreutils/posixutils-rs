@@ -413,6 +413,10 @@ aarch64/compile/20021110@-O0
 aarch64/compile/20021110@-O2
 aarch64/compile/20021119-1@-O0
 aarch64/compile/20021119-1@-O2
+aarch64/compile/20021120-1@-O0
+aarch64/compile/20021120-1@-O2
+aarch64/compile/20021120-2@-O0
+aarch64/compile/20021120-2@-O2
 aarch64/compile/20021124-1@-O0
 aarch64/compile/20021124-1@-O2
 aarch64/compile/20021205-1@-O0

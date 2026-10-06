@@ -1986,11 +1986,13 @@ impl<'a> Linearizer<'a> {
         // `-fgnu89-inline` makes the GNU rule the default for every inline
         // function, which is what the attribute selects one at a time.
         let gnu_inline = func.attrs.gnu_inline || crate::builtins::gnu89_inline();
+        // `extern inline` after a `static` declaration has internal linkage
+        // and is an ordinary static function, as in gcc.
         let is_inline_definition = if gnu_inline {
             let mut storage = TypeModifiers::empty();
             storage.set(TypeModifiers::EXTERN, is_extern);
             storage.set(TypeModifiers::INLINE, is_inline);
-            func.attrs.gnu_inline_only(storage)
+            !is_static && func.attrs.gnu_inline_only(storage)
         } else {
             is_inline && !is_static && !has_extern_decl && all_decls_inline
         };

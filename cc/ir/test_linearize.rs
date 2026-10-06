@@ -1661,6 +1661,39 @@ fn test_real_definition_replaces_gnu_inline_body() {
     }
 }
 
+/// A `static` definition after a gnu_inline `extern inline` body is the one
+/// function of its name, emitted and local. A gnu_inline `extern inline`
+/// body after a `static` declaration has internal linkage, so it is no
+/// inline-only body: it is emitted, local, as gcc emits it.
+#[test]
+fn test_static_definition_after_gnu_inline_body() {
+    let src = "int one(void);\nint zero(void);\n\
+               extern inline __attribute__((gnu_inline)) int f(void) { return one(); }\n\
+               static int f(void) { return zero(); }\n\
+               static int h(void);\n\
+               extern inline __attribute__((gnu_inline)) int h(void) { return zero(); }\n\
+               int (*fp)(void) = f;\nint (*hp)(void) = h;\n";
+    for arch in [crate::target::Arch::X86_64, crate::target::Arch::Aarch64] {
+        let target = Target::new(arch, crate::target::Os::Linux);
+        let module = linearize_source(src, &target);
+        for name in ["f", "h"] {
+            let found: Vec<&Function> =
+                module.functions.iter().filter(|f| f.name == name).collect();
+            assert_eq!(found.len(), 1, "{arch}: one `{name}` in the module");
+            let func = found[0];
+            assert!(func.emit, "{arch}: `{name}` is emitted");
+            assert!(func.is_static, "{arch}: `{name}` is local");
+            let callees: Vec<&str> = func
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insns)
+                .filter_map(|i| i.local_callee())
+                .collect();
+            assert_eq!(callees, ["zero"], "{arch}: `{name}` is the static body");
+        }
+    }
+}
+
 /// x86-64 Linux, whose x87 `long double` holds `0x1p62L + 1.0L` exactly --
 /// a test about that names the target rather than taking the host's, since
 /// on an arm64 Mac `long double` is `double`.

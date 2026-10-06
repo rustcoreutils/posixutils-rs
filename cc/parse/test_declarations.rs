@@ -77,6 +77,71 @@ fn test_redeclaration_rules() {
     }
 }
 
+/// A `static` declaration may take over a name declared GNU `extern inline`
+/// -- gcc's one exception to C17 6.2.2p7 -- and the static definition is the
+/// function. Every verdict is gcc 13's.
+#[test]
+fn test_static_takes_over_gnu_extern_inline() {
+    const EI: &str = "extern inline __attribute__((gnu_inline))";
+    for src in [
+        format!("{EI} int k(void) {{ return 1; }} static int k(void) {{ return 2; }}"),
+        format!("{EI} int k(void) {{ return 1; }} static inline int k(void) {{ return 2; }}"),
+        format!("int k(void); {EI} int k(void) {{ return 1; }} static int k(void) {{ return 2; }}"),
+        format!("extern int k(void); {EI} int k(void) {{ return 1; }} static int k(void);"),
+        format!("{EI} int k(void) {{ return 1; }} int k(void); static int k(void) {{ return 2; }}"),
+        format!("{EI} int k(void); static int k(void) {{ return 2; }}"),
+        format!("{EI} int k(void); int k(void); static int k(void) {{ return 2; }}"),
+        format!("{EI} int k(void) {{ return 1; }} static int k(void) {{ return 2; }} int k(void);"),
+        format!("static int k(void); {EI} int k(void) {{ return 1; }}"),
+    ] {
+        parse_tu(&src).unwrap_or_else(|e| panic!("{src}: {e:?}"));
+    }
+    for src in [
+        // The static one already defined it, then the name is internal.
+        format!("static int k(void) {{ return 2; }} {EI} int k(void) {{ return 1; }}"),
+        "int k(void); static int k(void) { return 2; }".to_string(),
+        // A plain `inline` promises the external definition.
+        format!(
+            "{EI} int k(void); inline __attribute__((gnu_inline)) int k(void); static int k(void);"
+        ),
+        "inline __attribute__((gnu_inline)) int k(void) { return 1; } static int k(void);"
+            .to_string(),
+        // So does the real definition.
+        format!("{EI} int k(void) {{ return 1; }} int k(void) {{ return 3; }} static int k(void);"),
+        // Without GNU inline semantics, C17 6.2.2p7.
+        "extern inline int k(void) { return 1; } static int k(void) { return 2; }".to_string(),
+        // The static one is a declaration of the same function.
+        format!("{EI} int k(void) {{ return 1; }} static long k(void) {{ return 2; }}"),
+    ] {
+        assert_rejected(&src);
+    }
+}
+
+/// A function definition has the linkage its name has, not only the one its
+/// own specifiers spell: after `static int f(void);`, `int f(void) {..}` and
+/// a GNU `extern inline` body are both static (C17 6.2.2p4, p5).
+#[test]
+fn test_definition_takes_prior_internal_linkage() {
+    for src in [
+        "static int f(void); int f(void) { return 0; }",
+        "static int f(void); extern inline __attribute__((gnu_inline)) int f(void) { return 0; }",
+        "extern inline __attribute__((gnu_inline)) int f(void) { return 1; }\n\
+         static int f(void) { return 0; }",
+    ] {
+        let (tu, _, strings, _) = parse_tu(src).unwrap();
+        let f = strings.lookup("f").expect("interned");
+        let defs: Vec<bool> = tu
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                ExternalDecl::FunctionDef(def) if def.name == f => Some(def.is_static),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(defs.last(), Some(&true), "{src}");
+    }
+}
+
 #[test]
 fn test_tag_rules() {
     for src in [

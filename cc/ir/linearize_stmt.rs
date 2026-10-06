@@ -2197,6 +2197,13 @@ impl<'a> super::linearize::Linearizer<'a> {
                 matches!(op, UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::Deref)
                     || self.expr_is_runtime(operand)
             }
+            // A shift by a negative count is left to run time: gcc does not
+            // fold it, and neither does the constant walk.
+            ExprKind::Binary {
+                op: BinaryOp::Shl | BinaryOp::Shr,
+                right,
+                ..
+            } if self.eval_const_expr(right).is_some_and(|count| count < 0) => true,
             ExprKind::Binary { left, right, .. } => {
                 self.expr_is_runtime(left) || self.expr_is_runtime(right)
             }

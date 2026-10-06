@@ -514,6 +514,14 @@ fn eval_binary(
             // there is no single gcc answer to match; c17 diverges knowingly
             // and consistently. The *warning* is emitted by
             // `check_shift_count`, where the shift's type is computed.
+            //
+            // A negative count is the exception: gcc does not fold that
+            // shift at all, so where C requires a constant expression --
+            // a static initializer, an enumerator, a `case` label, an array
+            // size -- `1 << -1` is not one, while `1 << 40` is.
+            if r < 0 {
+                return None;
+            }
             let width = left
                 .typ
                 .map(|t| env.types().size_bits(t))

@@ -912,12 +912,13 @@ impl<'a> super::linearize::Linearizer<'a> {
         }
     }
 
-    /// Report an initializer that is not a constant expression we can fold.
+    /// Report an initializer that is not a constant expression we can fold:
+    /// gcc's words, then which part of the expression is to blame.
     fn reject_initializer(&self, expr: &Expr) {
         error(
             self.expr_pos(expr),
             &format!(
-                "{} is not a constant expression, so it cannot initialize an object with static storage duration",
+                "initializer element is not constant: {} is not a constant expression",
                 describe_expr(&expr.kind)
             ),
         );

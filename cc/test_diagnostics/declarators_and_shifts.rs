@@ -1,5 +1,5 @@
 use crate::test_compile::{
-    compile, compile_expect_error, compile_expect_ok, compile_expect_warning,
+    compile, compile_expect_error, compile_expect_ok, compile_expect_warning, compile_rejected,
 };
 
 // ============================================================================
@@ -171,6 +171,84 @@ fn diagnostics_shift_count_in_range_is_silent() {
             "shift_var_count_ok",
             "int n = 3;\nint main(void){ return (1 << n) - 8; }\n",
         ),
+    ] {
+        compile_expect_ok(name, src);
+    }
+}
+
+/// A shift by a negative count is no constant expression: gcc warns and then
+/// refuses it wherever C requires one -- a static initializer at file or
+/// block scope, an enumerator, a `case` label, `_Static_assert`, a file-scope
+/// array size -- in these words. A count past the width is constant (it only
+/// warns), and so is a negative value shifted.
+#[test]
+fn diagnostics_negative_shift_count_is_not_constant() {
+    const INIT: &str = "initializer element is not constant";
+    for (name, src, expected) in [
+        ("negshift_file", "int x = 1 << -1;\n", INIT),
+        ("negshift_right_file", "int x = 1 >> -1;\n", INIT),
+        ("negshift_long_file", "long x = 1L >> -3;\n", INIT),
+        ("negshift_expr_file", "int x = 1 << (0 - 1);\n", INIT),
+        ("negshift_static_file", "static int x = 1 << -1;\n", INIT),
+        (
+            "negshift_static_block",
+            "int f(void) { static int x = 1 << -1; return x; }\n",
+            INIT,
+        ),
+        (
+            "negshift_enum",
+            "enum { E = 1 << -1 };\n",
+            "enumerator value for 'E' is not an integer constant",
+        ),
+        (
+            "negshift_static_assert",
+            "_Static_assert((1 << -1) || 1, \"\");\n",
+            "expression in static assertion is not constant",
+        ),
+        (
+            "negshift_case",
+            "int f(int v) { switch (v) { case 1 << -1: return 1; } return 0; }\n",
+            "case label is not an integer constant expression",
+        ),
+        (
+            "negshift_array_file",
+            "int a[1 << -1 ? 1 : 2];\n",
+            "variable length arrays cannot have file scope",
+        ),
+    ] {
+        let stderr = compile_rejected(name, src);
+        assert!(
+            stderr.contains("shift count is negative") && stderr.contains(expected),
+            "'{name}': expected the warning and {expected:?}.\nstderr:\n{stderr}"
+        );
+    }
+}
+
+/// The accept side: the same shift where no constant is required, a count
+/// past the width, a negative value shifted, and a negative count that is
+/// never evaluated.
+#[test]
+fn diagnostics_negative_shift_count_where_no_constant_is_needed() {
+    for (name, src) in [
+        (
+            "negshift_auto_ok",
+            "int f(void) { int x = 1 << -1; return x; }\n",
+        ),
+        ("bigshift_file_ok", "int x = 1 << 40;\n"),
+        ("bigshift_enum_ok", "enum { E = 1 << 40 };\n"),
+        ("bigshift_right_file_ok", "int x = 1 >> 40;\n"),
+        ("negvalue_file_ok", "int x = -1 << 1;\nint y = -1 >> 1;\n"),
+        ("negvalue_enum_ok", "enum { E = -1 << 1 };\n"),
+        (
+            "negvalue_static_block_ok",
+            "int f(void) { static int x = -1 << 1; return x; }\n",
+        ),
+        ("negshift_unevaluated_ok", "int x = 0 ? 1 << -1 : 2;\n"),
+        (
+            "negshift_short_circuit_ok",
+            "int x = 1 || (1 << -1);\nint y = 0 && (1 << -1);\n",
+        ),
+        ("negshift_sizeof_ok", "int x = sizeof(1 << -1);\n"),
     ] {
         compile_expect_ok(name, src);
     }

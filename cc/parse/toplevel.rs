@@ -211,7 +211,7 @@ impl Parser<'_> {
         } else {
             // Could not evaluate at compile time
             return Err(ParseError::new(
-                "_Static_assert expression is not a constant expression",
+                "expression in static assertion is not constant",
                 pos,
             ));
         }

@@ -21,7 +21,7 @@ use crate::token::preprocess::StorageOrderPragma;
 use crate::types::{
     CompositeType, EnumConstant, MemberAlign, StructMember, Type, TypeId, TypeKind, TypeModifiers,
 };
-use gettextrs::gettext;
+use gettextrs::{gettext, gettext_args};
 
 const DEFAULT_MEMBER_CAPACITY: usize = 16;
 const DEFAULT_ENUM_CAPACITY: usize = 16;
@@ -137,6 +137,7 @@ impl Parser<'_> {
             let mut constant_syms: Vec<SymbolId> = Vec::new();
 
             while !self.is_special(b'}') && !self.is_eof() {
+                let name_pos = self.current_pos();
                 let name = self.expect_identifier()?;
 
                 let value = if self.is_special(b'=') {
@@ -145,7 +146,13 @@ impl Parser<'_> {
                     let expr = self.parse_conditional_expr()?;
                     // Evaluate constant expression
                     let v = self.eval_const_expr(&expr).ok_or_else(|| {
-                        ParseError::new("enum value must be constant", self.current_pos())
+                        ParseError::new(
+                            gettext_args(
+                                "enumerator value for '{0}' is not an integer constant",
+                                &[self.idents.get_opt(name).unwrap_or("")],
+                            ),
+                            name_pos,
+                        )
                     })?;
                     // C17 6.7.2.2p2 requires an enumerator to be
                     // representable as `int`, so exceeding it is a constraint

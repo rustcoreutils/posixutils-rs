@@ -13,6 +13,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 /// Run pax with given arguments and return output
 pub fn run_pax(args: &[&str]) -> Output {
@@ -323,6 +324,8 @@ pub struct Ustar<'a> {
     /// what a well-formed member has; `Some` is how a fixture makes the header
     /// lie about how much data follows.
     pub size: Option<u64>,
+    /// The `mtime` field (136), seconds since the epoch.
+    pub mtime: u64,
 }
 
 impl Default for Ustar<'_> {
@@ -341,6 +344,7 @@ impl Default for Ustar<'_> {
             uname: b"",
             gname: b"",
             size: None,
+            mtime: 0,
         }
     }
 }
@@ -356,7 +360,7 @@ impl Ustar<'_> {
         h[116..124].copy_from_slice(format!("{:07o}\0", self.gid).as_bytes());
         let size = self.size.unwrap_or(self.body.len() as u64);
         h[124..136].copy_from_slice(format!("{:011o}\0", size).as_bytes());
-        h[136..148].copy_from_slice(b"00000000000\0"); // mtime
+        h[136..148].copy_from_slice(format!("{:011o}\0", self.mtime).as_bytes());
         h[148..156].copy_from_slice(b"        "); // spaces while summing
         h[156] = self.typeflag;
         h[157..157 + self.linkname.len()].copy_from_slice(self.linkname);
@@ -390,6 +394,31 @@ impl Ustar<'_> {
         out.extend_from_slice(&ustar_trailer());
         out
     }
+}
+
+/// Run pax on `args` in `dir`, killing it if it has not finished within
+/// `limit`; `None` when it had to be killed. For a test whose regression is a
+/// hang or a crawl rather than a wrong answer. Output is collected only once
+/// pax exits, so it must fit in a pipe buffer.
+pub fn run_pax_with_deadline(args: &[&str], dir: &Path, limit: Duration) -> Option<Output> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(args)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + limit;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Some(child.wait_with_output().unwrap())
 }
 
 /// The end-of-archive indicator: two 512-byte blocks of zeros (POSIX).

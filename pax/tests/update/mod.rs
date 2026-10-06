@@ -270,3 +270,61 @@ fn test_reset_atime_write_mode() {
         "Access time should be restored after reading with -t"
     );
 }
+
+/// POSIX: members are "selected based on the user-specified pattern operands
+/// as modified by the -c, -n, and -u options". A member -u turns away is not
+/// selected, so under -n it must not use up its pattern: the newer member of
+/// the same name later in the archive is the first one selected.
+#[test]
+fn test_update_rejection_does_not_use_up_first_match() {
+    let temp = TempDir::new().unwrap();
+    let file = temp.path().join("f");
+    fs::write(&file, "disk\n").unwrap();
+    let on_disk = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+    filetime::set_file_mtime(&file, filetime::FileTime::from_system_time(on_disk)).unwrap();
+
+    let mut a = Ustar {
+        name: b"f",
+        body: b"older\n",
+        mtime: 1_000_000_000,
+        ..Default::default()
+    }
+    .member();
+    a.extend_from_slice(
+        &Ustar {
+            name: b"f",
+            body: b"newer\n",
+            mtime: 3_000_000_000,
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r", "-u", "-n", "f"], &a, temp.path());
+    assert_success(&output, "pax -r -u -n");
+    assert_eq!(fs::read_to_string(&file).unwrap(), "newer\n");
+}
+
+/// -u compares against the file of the member's own name: POSIX applies -s
+/// only to members already selected.
+#[test]
+fn test_update_compares_the_name_before_substitution() {
+    let temp = TempDir::new().unwrap();
+    // The archived name has a newer file on disk; the renamed one has none.
+    let original = temp.path().join("f");
+    fs::write(&original, "disk\n").unwrap();
+    let on_disk = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+    filetime::set_file_mtime(&original, filetime::FileTime::from_system_time(on_disk)).unwrap();
+
+    let a = Ustar {
+        name: b"f",
+        body: b"archived\n",
+        mtime: 1_000_000_000,
+        ..Default::default()
+    }
+    .archive();
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r", "-u", "-s", ",f,g,"], &a, temp.path());
+    assert_success(&output, "pax -r -u -s");
+    assert!(!temp.path().join("g").exists(), "-u should have rejected f");
+}

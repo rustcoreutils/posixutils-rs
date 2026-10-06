@@ -13,7 +13,9 @@ pub mod cpio;
 pub mod pax;
 pub mod ustar;
 
+use crate::archive::{ArchiveFormat, ArchiveReader};
 use crate::error::{PaxError, PaxResult};
+use crate::options::FormatOptions;
 use std::io::{Read, Seek, SeekFrom};
 
 /// Largest extended-header record set (pax `x`/`g`) this will accept.
@@ -163,6 +165,22 @@ fn seek_over<R: Read + Seek>(reader: &mut R, count: u64) -> std::io::Result<()> 
     let ahead = i64::try_from(count - 1).map_err(|_| std::io::ErrorKind::UnexpectedEof)?;
     reader.seek(SeekFrom::Current(ahead))?;
     reader.read_exact(&mut [0u8; 1])
+}
+
+/// A reader for an archive in `format`, over `stream`. `options` are the `-o`
+/// options of list and read mode, which the pax reader applies itself.
+pub fn open_reader<'a, R: Read + 'a>(
+    stream: ArchiveStream<R>,
+    format: ArchiveFormat,
+    options: &FormatOptions,
+) -> PaxResult<Box<dyn ArchiveReader + 'a>> {
+    Ok(match format {
+        ArchiveFormat::Ustar => Box::new(UstarReader::from_stream(stream)),
+        ArchiveFormat::Cpio => Box::new(CpioReader::from_stream(stream)),
+        ArchiveFormat::Pax => {
+            Box::new(PaxReader::from_stream(stream).with_options(options.clone())?)
+        }
+    })
 }
 
 pub use cpio::{checksum_bytes, CpioFormat, CpioReader, CpioWriter};

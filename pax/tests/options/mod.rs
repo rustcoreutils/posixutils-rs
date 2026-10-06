@@ -2441,3 +2441,54 @@ fn test_non_utf8_argument_is_a_pathname() {
         assert_exit_code(&output, 1, program);
     }
 }
+
+/// POSIX: "If any specified pattern or file operands are not matched by at
+/// least one file or archive member, pax shall write a diagnostic message to
+/// standard error for each one that did not match and exit with a non-zero
+/// exit status." That holds under -c too, as BSD pax does it.
+#[test]
+fn test_c_reports_an_unmatched_pattern() {
+    let a = Ustar {
+        name: b"a",
+        body: b"A\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let output = run_pax_with_stdin_bytes(&["-c", "nosuch"], &a);
+    assert_eq!(stdout_str(&output), "a\n");
+    assert!(
+        stderr_str(&output).contains("nosuch"),
+        "{}",
+        stderr_str(&output)
+    );
+    assert!(!output.status.success());
+
+    // A pattern that did exclude something matched it.
+    let output = run_pax_with_stdin_bytes(&["-c", "a"], &a);
+    assert_success(&output, "pax -c a");
+    assert_eq!(stdout_str(&output), "");
+}
+
+/// -n: once every pattern has selected its member, nothing later in the
+/// archive can be selected, so pax stops reading -- as BSD pax does. What
+/// follows is never looked at, damaged or not.
+#[test]
+fn test_n_stops_once_every_pattern_is_matched() {
+    let mut a = Ustar {
+        name: b"a",
+        body: b"A\n",
+        ..Default::default()
+    }
+    .member();
+    // A block that is not a header: reading on would fail the checksum.
+    a.extend_from_slice(&[b'x'; 512]);
+
+    let output = run_pax_with_stdin_bytes(&["-n", "a"], &a);
+    assert_success(&output, "pax -n a");
+    assert_eq!(stdout_str(&output), "a\n");
+
+    // Without -n the damage is reached and reported.
+    let output = run_pax_with_stdin_bytes(&["a"], &a);
+    assert!(!output.status.success());
+}

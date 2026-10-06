@@ -14,6 +14,7 @@ pub mod append;
 pub mod copy;
 pub mod list;
 pub mod read;
+pub(crate) mod select;
 pub mod write;
 
 pub use append::append_to_archive;

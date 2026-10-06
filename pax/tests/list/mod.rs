@@ -13,6 +13,7 @@ use crate::common::*;
 use plib::tmp::TempDir;
 use std::fs::{self, File};
 use std::io::Write;
+use std::process::Command;
 
 #[test]
 fn test_list_mode() {
@@ -262,5 +263,189 @@ fn test_verbose_list_reports_a_link_count_of_one() {
         nlink, "1",
         "a member read from a ustar header must list one link, not {} (line: {})",
         nlink, line
+    );
+}
+
+/// -n selects the first member matching each pattern -- and a directory's
+/// hierarchy comes with it, as without -n.
+#[test]
+fn test_n_keeps_the_matched_directory_hierarchy() {
+    let mut a = Ustar {
+        name: b"d/",
+        typeflag: b'5',
+        mode: 0o755,
+        ..Default::default()
+    }
+    .member();
+    a.extend_from_slice(
+        &Ustar {
+            name: b"d/x",
+            body: b"X\n",
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let output = run_pax_with_stdin_bytes(&["-n", "d"], &a);
+    assert_success(&output, "pax -n d");
+    assert_eq!(stdout_str(&output), "d/\nd/x\n");
+}
+
+/// Bracket expressions follow XCU 2.13: character classes work, and a
+/// bracket expression never matches the '/' of a pathname.
+#[test]
+fn test_pattern_bracket_classes_and_slash() {
+    let mut a = Vec::new();
+    for name in [&b"a1"[..], b"ab", b"a/b"] {
+        a.extend_from_slice(
+            &Ustar {
+                name,
+                body: b"X\n",
+                ..Default::default()
+            }
+            .member(),
+        );
+    }
+    a.extend_from_slice(&ustar_trailer());
+
+    let output = run_pax_with_stdin_bytes(&["a[[:digit:]]"], &a);
+    assert_eq!(stdout_str(&output), "a1\n");
+    let output = run_pax_with_stdin_bytes(&["a[!x]b"], &a);
+    assert_eq!(stdout_str(&output), "", "a bracket matched '/'");
+}
+
+/// An unterminated '[' is an ordinary character, not a fatal error.
+#[test]
+fn test_pattern_unterminated_bracket_is_literal() {
+    let a = Ustar {
+        name: b"x[y",
+        body: b"X\n",
+        ..Default::default()
+    }
+    .archive();
+    let output = run_pax_with_stdin_bytes(&["x[y"], &a);
+    assert_success(&output, "pattern with an unterminated bracket");
+    assert_eq!(stdout_str(&output), "x[y\n");
+}
+
+/// A long run of '*' must not blow the stack or take exponential time. pax
+/// is killed if it has not finished in time, so a regression fails the test
+/// rather than hanging the suite.
+#[test]
+fn test_pattern_many_stars_is_fast() {
+    let a = Ustar {
+        name: "a".repeat(60).as_bytes(),
+        body: b"X\n",
+        ..Default::default()
+    }
+    .archive();
+    let pattern = format!("{}b", "*".repeat(5000));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .arg(&pattern)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&a).unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if std::time::Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let status = status.expect("pax did not finish matching within 5 s");
+    assert!(status.code().is_some(), "pax was killed by a signal");
+}
+
+/// A directory member replaces an existing non-directory of the same name
+/// (unless -k), the way a regular-file member replaces a file.
+#[test]
+fn test_directory_member_replaces_regular_file() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("d"), "old\n").unwrap();
+    let mut a = Ustar {
+        name: b"d/",
+        typeflag: b'5',
+        mode: 0o755,
+        ..Default::default()
+    }
+    .member();
+    a.extend_from_slice(
+        &Ustar {
+            name: b"d/x",
+            body: b"X\n",
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &a, temp.path());
+    assert_success(&output, "pax -r over a file named like the directory");
+    assert_eq!(fs::read_to_string(temp.path().join("d/x")).unwrap(), "X\n");
+}
+
+/// GNU tar writes base-256 numbers (high bit set) for values that do not fit
+/// the octal field. pax should read them, not abandon the archive.
+#[test]
+fn test_gnu_base256_size_and_uid_are_read() {
+    let mut member = Ustar {
+        name: b"big-uid",
+        body: b"X\n",
+        ..Default::default()
+    };
+    member.uid = 0;
+    let mut a = member.member();
+    // uid field (108..116): base-256, value 3000000.
+    let uid = 3_000_000u64;
+    a[108] = 0x80;
+    a[109..116].copy_from_slice(&uid.to_be_bytes()[1..]);
+    // Recompute the checksum over the altered header.
+    a[148..156].copy_from_slice(b"        ");
+    let sum: u32 = a[..512].iter().map(|&b| b as u32).sum();
+    a[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
+    a.extend_from_slice(
+        &Ustar {
+            name: b"next",
+            body: b"N\n",
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let output = run_pax_with_stdin_bytes(&["-o", "listopt=%(uid)d %F"], &a);
+    assert_success(&output, "list");
+    assert_eq!(stdout_str(&output), "3000000 big-uid\n0 next\n");
+}
+
+/// Under the C locale a non-ASCII member name must not panic -s.
+#[test]
+fn test_subst_non_ascii_name_in_c_locale() {
+    let a = Ustar {
+        name: "café".as_bytes(),
+        body: b"X\n",
+        ..Default::default()
+    }
+    .archive();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pax"));
+    cmd.args(["-s", ",f.,X,"])
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(&a).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.code().is_some_and(|c| c != 101),
+        "{}",
+        stderr_str(&output)
     );
 }

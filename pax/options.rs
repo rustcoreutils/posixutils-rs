@@ -255,18 +255,8 @@ impl FormatOptions {
                 GlobexthdrName => self.globexthdr_name = value.map(|s| s.to_string()),
                 Delete => {
                     if let Some(pattern) = value {
-                        match Pattern::new(pattern) {
-                            Ok(compiled) => {
-                                self.delete_patterns.push(pattern.to_string());
-                                self.delete_patterns_compiled.push(compiled);
-                            }
-                            Err(e) => {
-                                return Err(PaxError::PatternError(format!(
-                                    "invalid delete pattern '{}': {}",
-                                    pattern, e
-                                )));
-                            }
-                        }
+                        self.delete_patterns.push(pattern.to_string());
+                        self.delete_patterns_compiled.push(Pattern::new(pattern));
                     }
                 }
                 Invalid => {
@@ -343,7 +333,7 @@ impl FormatOptions {
     pub fn should_delete_keyword(&self, keyword: &str) -> bool {
         self.delete_patterns_compiled
             .iter()
-            .any(|pattern| pattern.matches(keyword))
+            .any(|pattern| pattern.matches(keyword.as_bytes()))
     }
 
     /// The header character set the operator asked for, if any.

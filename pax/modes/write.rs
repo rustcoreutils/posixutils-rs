@@ -278,7 +278,7 @@ impl<W: ArchiveWriter> WriteWalk<'_, W> {
         // and before any stat. Declining to descend takes the whole subtree.
         if matches_excluded(
             &self.options.exclude_patterns,
-            crate::rawpath::MatchName::of(path).as_str(),
+            crate::rawpath::as_bytes(path),
         ) {
             return Ok(false);
         }

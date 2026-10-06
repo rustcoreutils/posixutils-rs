@@ -24,23 +24,20 @@
 //! so nothing about the in-memory model needed to change; the corruption was
 //! entirely at the edges, and this module is those edges.
 //!
-//! ## The one place bytes are still given up
-//!
 //! Pattern matching (`pattern.rs`) and `-s` substitution (`subst.rs`) work on
-//! `&str`, and converting for them is lossy. That is a real limitation, not an
-//! oversight: a member whose name is not UTF-8 may fail to match a pattern that
-//! ought to select it. It is confined to *selecting and renaming*, never to the
-//! name that reaches the filesystem or a header.
+//! the bytes too.
 //!
-//! [`MatchName`] is that boundary, made explicit. It implements no `Display`,
-//! no `AsRef<Path>` and no `Into<PathBuf>`, so a lossy name cannot be printed,
-//! stored, or written into a header by accident -- the compiler refuses. The
-//! complete list of places this crate gives up bytes is `MatchName::of`,
-//! [`from_substituted`], and the `uname`/`gname` fields, which are text by
-//! definition.
+//! ## Where bytes are still given up
+//!
+//! [`MatchName`] is the lossy form of a name, for the comparisons that still
+//! use one. It implements no `Display`, no `AsRef<Path>` and no
+//! `Into<PathBuf>`, so a lossy name cannot be printed, stored, or written into
+//! a header by accident -- the compiler refuses. The complete list of places
+//! this crate gives up bytes is `MatchName::of` and the `uname`/`gname`
+//! fields, which are text by definition.
 
 use std::borrow::Cow;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
@@ -69,14 +66,12 @@ pub fn join(prefix: &[u8], name: &[u8]) -> PathBuf {
     from_bytes(&joined)
 }
 
-/// A pathname rendered for pattern matching and `-s` substitution, which work
-/// on `&str` and so cannot see a name that is not UTF-8 as it really is.
+/// A pathname rendered as `&str`, which cannot show a name that is not UTF-8
+/// as it really is.
 ///
 /// Deliberately not printable, not storable and not convertible back to a
 /// `Path`: this is the lossy form, and the type is what keeps it from leaking
-/// into an extracted filename or a header field. To get a name *out* of a
-/// substitution, use [`from_substituted`], which says in its own name that the
-/// bytes have been through a `&str`.
+/// into an extracted filename or a header field.
 pub struct MatchName<'a>(Cow<'a, str>);
 
 impl<'a> MatchName<'a> {
@@ -88,17 +83,6 @@ impl<'a> MatchName<'a> {
     pub fn as_str(&self) -> &str {
         &self.0
     }
-}
-
-/// A member name produced by `-s` substitution.
-///
-/// `-s` matches against the lossy form, so a name that is not UTF-8 and that a
-/// substitution *changes* comes back laundered -- there is nowhere for the
-/// original bytes to survive once a regex has rewritten the text. A
-/// substitution that leaves a name unchanged does not reach this function, and
-/// that is the case that still round-trips exactly.
-pub fn from_substituted(s: &str) -> PathBuf {
-    PathBuf::from(OsStr::from_bytes(s.as_bytes()).to_owned())
 }
 
 /// The byte offsets at which each *display unit* of `bytes` begins.

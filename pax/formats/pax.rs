@@ -26,7 +26,7 @@
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType};
 use crate::error::{PaxError, PaxResult};
 use crate::formats::ustar::{
-    calculate_checksum, entry_type_to_flag, parse_header as parse_ustar_header, parse_octal,
+    calculate_checksum, entry_type_to_flag, parse_header as parse_ustar_header, parse_numeric,
     try_split_path, ustar_path_bytes, verify_checksum, write_field, SizeRule, BLOCK_SIZE,
     CHKSUM_OFF, DEVMAJOR_OFF, DEVMINOR_OFF, GID_OFF, GNAME_LEN, GNAME_OFF, LINKNAME_LEN,
     LINKNAME_OFF, MAGIC_OFF, MODE_OFF, MTIME_OFF, NAME_LEN, NAME_OFF, PREFIX_LEN, PREFIX_OFF,
@@ -924,12 +924,8 @@ pub struct PaxReader<R: Read> {
 }
 
 impl<R: Read> PaxReader<R> {
-    /// Create a new pax reader
-    pub fn new(reader: R) -> Self {
-        Self::from_stream(ArchiveStream::new(reader))
-    }
-
-    fn from_stream(reader: ArchiveStream<R>) -> Self {
+    /// A pax reader over an archive stream
+    pub fn from_stream(reader: ArchiveStream<R>) -> Self {
         PaxReader {
             reader,
             current_size: 0,
@@ -1048,14 +1044,14 @@ impl<R: Read> ArchiveReader for PaxReader<R> {
                 PAX_GHDR => {
                     // Global extended header - affects all subsequent files,
                     // for the keywords it names; the rest stay in force.
-                    let size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
+                    let size = parse_numeric(&header[SIZE_OFF..SIZE_OFF + 12])?;
                     let global = self.read_extended_header(size)?;
                     self.global_header.merge(&global);
                     self.saw_extended_header = true;
                 }
                 PAX_XHDR => {
                     // Per-file extended header
-                    let size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
+                    let size = parse_numeric(&header[SIZE_OFF..SIZE_OFF + 12])?;
                     extended_header = Some(self.read_extended_header(size)?);
                     self.saw_extended_header = true;
                 }

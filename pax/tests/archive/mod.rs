@@ -1620,3 +1620,53 @@ fn test_one_file_system_archives_the_mount_point() {
     names.sort();
     assert_eq!(names, ["tree/", "tree/f", "tree/mnt/"]);
 }
+
+/// Listing an archive in a regular file seeks over member data instead of
+/// reading it. The member here is 32 GiB of hole, which reading takes many
+/// seconds to get through and seeking skips at once; pax is killed if it is
+/// still at it after the deadline.
+#[test]
+fn test_list_seeks_over_member_data() {
+    let temp = TempDir::new().unwrap();
+    let path = temp.path().join("big.tar");
+    const SIZE: u64 = 32 << 30;
+
+    let mut head = Ustar {
+        name: b"PaxHeaders/big",
+        typeflag: b'x',
+        body: &pax_record("size", SIZE.to_string().as_bytes()),
+        ..Default::default()
+    }
+    .member();
+    head.extend_from_slice(
+        &Ustar {
+            name: b"big",
+            ..Default::default()
+        }
+        .header(),
+    );
+    let tail = Ustar {
+        name: b"after",
+        body: b"A\n",
+        ..Default::default()
+    }
+    .archive();
+
+    let mut f = File::create(&path).unwrap();
+    f.write_all(&head).unwrap();
+    // A hole: no disk space, and no real data to read.
+    f.set_len(head.len() as u64 + SIZE).unwrap();
+    use std::io::Seek;
+    f.seek(std::io::SeekFrom::End(0)).unwrap();
+    f.write_all(&tail).unwrap();
+    drop(f);
+
+    let output = run_pax_with_deadline(
+        &["-f", "big.tar"],
+        temp.path(),
+        std::time::Duration::from_secs(3),
+    )
+    .expect("pax read through the member data instead of seeking over it");
+    assert_success(&output, "pax -f big.tar");
+    assert_eq!(stdout_str(&output), "big\nafter\n");
+}

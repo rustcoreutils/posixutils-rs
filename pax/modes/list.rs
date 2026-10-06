@@ -9,16 +9,15 @@
 
 //! List mode implementation - list archive contents
 
-use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveReader, EntryType, LinkSets};
+use crate::archive::{ArchiveEntry, ArchiveReader, EntryType, LinkSets};
 use crate::error::PaxResult;
-use crate::formats::{CpioReader, PaxReader, UstarReader};
+use crate::modes::select::Selector;
 use crate::options::{
     format_list_entry, format_mode_symbolic, format_time_traditional, FormatOptions, ListEntryInfo,
 };
-use crate::pattern::{find_matching_pattern_subtree, matches_excluded, Pattern};
+use crate::pattern::Pattern;
 use crate::subst::Substitution;
-use std::collections::HashSet;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Options for list mode
@@ -45,50 +44,19 @@ pub struct ListOptions {
     pub strip_components: usize,
 }
 
-/// List archive contents
-pub fn list_archive<R: Read, W: Write>(
-    reader: R,
-    writer: &mut W,
-    format: ArchiveFormat,
-    options: &ListOptions,
-) -> PaxResult<()> {
-    match format {
-        ArchiveFormat::Ustar => {
-            let mut archive = UstarReader::new(reader);
-            list_entries(&mut archive, writer, options)
-        }
-        ArchiveFormat::Cpio => {
-            let mut archive = CpioReader::new(reader);
-            list_entries(&mut archive, writer, options)
-        }
-        ArchiveFormat::Pax => {
-            // Same as read mode: without the options the reader ignores
-            // `-o delete=`, so a keyword suppressed on extract was still shown
-            // in the listing.
-            let mut archive =
-                PaxReader::new(reader).with_options(options.format_options.clone())?;
-            list_entries(&mut archive, writer, options)
-        }
-    }
-}
-
-/// List archive contents from an ArchiveReader (for multi-volume support)
-pub fn list_archive_from_reader<R: ArchiveReader, W: Write>(
+/// List the members of an archive
+pub fn list_archive<R: ArchiveReader, W: Write>(
     archive: &mut R,
     writer: &mut W,
     options: &ListOptions,
 ) -> PaxResult<()> {
-    list_entries(archive, writer, options)
-}
-
-/// List entries from any archive reader
-fn list_entries<R: ArchiveReader, W: Write>(
-    archive: &mut R,
-    writer: &mut W,
-    options: &ListOptions,
-) -> PaxResult<()> {
-    // Track which patterns have been matched (for -n first_match option)
-    let mut matched_patterns: HashSet<usize> = HashSet::new();
+    let mut selector = Selector::new(
+        &options.patterns,
+        options.exclude,
+        options.first_match,
+        options.dir_only,
+        &options.exclude_patterns,
+    );
     let option_records =
         crate::modes::read::caller_option_records(archive, &options.format_options)?;
     // The first listed name of each cpio link set, for the later ones to show
@@ -99,112 +67,29 @@ fn list_entries<R: ArchiveReader, W: Write>(
         if let Some(ref records) = option_records {
             records.apply(&mut entry);
         }
-        if let Some(should_output) = should_list(&entry, options, &mut matched_patterns) {
-            if !should_output {
-                // Entry matched a pattern that's already been matched (first_match mode)
-                archive.skip_data()?;
-                continue;
-            }
+        if let Some(selection) = selector.select(&entry) {
+            selector.take(selection, &entry);
             // Rename as extraction would, hard link targets included, so the
             // listing shows the names `-r` would create (`tar -t` what `tar -x`).
-            if !crate::modes::read::rename_member(
+            if crate::modes::read::rename_member(
                 &mut entry,
                 &options.substitutions,
                 options.strip_components,
             ) {
-                archive.skip_data()?;
-                continue;
-            }
-            let linked_to = link_set_target(&mut link_sets, &entry);
-            if let Err(e) = print_entry(writer, &entry, linked_to.as_deref(), options) {
-                crate::error::report_error(&entry.path, e);
+                let linked_to = link_set_target(&mut link_sets, &entry);
+                if let Err(e) = print_entry(writer, &entry, linked_to.as_deref(), options) {
+                    crate::error::report_error(&entry.path, e);
+                }
             }
         }
         archive.skip_data()?;
-    }
-
-    // Diagnose any pattern operand that matched no archive member (non-exclude
-    // mode) and set a non-zero exit status (POSIX DESCRIPTION).
-    if !options.exclude {
-        for (idx, pat) in options.patterns.iter().enumerate() {
-            if !matched_patterns.contains(&idx) {
-                crate::error::report_error(&pat.source, gettextrs::gettext("not found"));
-            }
+        if selector.is_done() {
+            break;
         }
     }
 
+    selector.report_unmatched();
     Ok(())
-}
-
-/// Check if entry should be listed
-/// Returns:
-/// - None: entry should not be listed (doesn't match patterns or excluded)
-/// - Some(true): entry should be listed
-/// - Some(false): entry matches but pattern already matched (first_match mode)
-fn should_list(
-    entry: &ArchiveEntry,
-    options: &ListOptions,
-    matched_patterns: &mut HashSet<usize>,
-) -> Option<bool> {
-    let name = crate::rawpath::MatchName::of(&entry.path);
-    let path = name.as_str();
-
-    // tar's exclusion list is independent of the pattern operands and wins over
-    // them, so it is applied to the stored name before anything else.
-    if matches_excluded(&options.exclude_patterns, path) {
-        return None;
-    }
-
-    // Try matching against both the full path and the path with "./" prefix stripped
-    let path_stripped = path.strip_prefix("./").unwrap_or(path);
-
-    if options.patterns.is_empty() {
-        // No patterns means match all
-        if options.exclude {
-            return None; // Exclude all
-        }
-        return Some(true); // Match all
-    }
-
-    // Find which pattern matches (if any). A pattern selecting a directory also
-    // selects its whole subtree unless `-d` (dir_only) was given.
-    let expand_subtree = !options.dir_only;
-    let matching_pattern = find_matching_pattern_subtree(&options.patterns, path, expand_subtree)
-        .or_else(|| {
-            // Only worth a second pass when stripping actually changed
-            // something; otherwise this repeats the first pass verbatim for
-            // every non-matching member.
-            if std::ptr::eq(path_stripped, path) {
-                None
-            } else {
-                find_matching_pattern_subtree(&options.patterns, path_stripped, expand_subtree)
-            }
-        });
-
-    match matching_pattern {
-        Some(pattern_idx) => {
-            if options.exclude {
-                // Entry matched a pattern, so exclude it
-                None
-            } else if options.first_match && matched_patterns.contains(&pattern_idx) {
-                // first_match (-n): this pattern has already selected a member
-                Some(false)
-            } else {
-                // Record the match (for the unmatched-pattern sweep and -n) and
-                // select the entry.
-                matched_patterns.insert(pattern_idx);
-                Some(true)
-            }
-        }
-        None => {
-            // No pattern matched
-            if options.exclude {
-                Some(true) // Exclude mode: output entries that don't match
-            } else {
-                None // Normal mode: skip entries that don't match
-            }
-        }
-    }
 }
 
 /// The name a later name of a cpio link set is linked to on extraction: the

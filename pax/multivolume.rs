@@ -39,7 +39,7 @@
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter};
 use crate::blocked_io::{BlockedReader, BlockedWriter};
 use crate::error::{PaxError, PaxResult};
-use crate::formats::ustar::parse_octal;
+use crate::formats::ustar::{parse_numeric, parse_octal};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
@@ -438,7 +438,7 @@ impl MultiVolumeReader {
         if header.len() < 381 {
             return 0;
         }
-        parse_octal(&header[369..381]).unwrap_or(0)
+        parse_numeric(&header[369..381]).unwrap_or(0)
     }
 
     /// Check if a block is all zeros (end of archive marker)
@@ -521,7 +521,7 @@ impl ArchiveReader for MultiVolumeReader {
             if Self::is_continuation_header(&header) {
                 // This is a continuation of a split file from previous volume
                 let offset = Self::parse_continuation_offset(&header);
-                let remaining_size = parse_octal(&header[124..136])?;
+                let remaining_size = parse_numeric(&header[124..136])?;
 
                 if self.options.verbose {
                     // A member name out of the archive, so it goes out as its
@@ -575,7 +575,7 @@ impl ArchiveReader for MultiVolumeReader {
                     self.read_exact_from_reader(&mut header)?;
 
                     if Self::is_continuation_header(&header) {
-                        let remaining_size = parse_octal(&header[124..136])?;
+                        let remaining_size = parse_numeric(&header[124..136])?;
                         self.current_size = remaining_size;
                         self.bytes_read = 0;
                         // Continue reading

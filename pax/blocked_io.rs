@@ -20,7 +20,7 @@
 //! archive being read is whatever it was written with.
 
 use crate::error::{PaxError, PaxResult};
-use std::io::{BufRead, Read, Write};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -154,6 +154,32 @@ impl<R: Read> Read for BlockedReader<R> {
         buf[..to_copy].copy_from_slice(&available[..to_copy]);
         self.consume(to_copy);
         Ok(to_copy)
+    }
+}
+
+/// Seeking forward over an archive in a regular file, to step over member data
+/// without reading it. Only a forward seek relative to the current position
+/// is supported -- that is all stepping over data takes. Bytes seeked over are
+/// counted as read, so the archive size still comes out whole.
+impl<R: Read + Seek> Seek for BlockedReader<R> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        let SeekFrom::Current(ahead) = pos else {
+            return Err(std::io::ErrorKind::Unsupported.into());
+        };
+        let ahead = u64::try_from(ahead).map_err(|_| std::io::ErrorKind::Unsupported)?;
+        let buffered = (self.valid - self.pos) as u64;
+        if ahead <= buffered {
+            self.consume(ahead as usize);
+            let end = self.reader.stream_position()?;
+            return Ok(end - (self.valid - self.pos) as u64);
+        }
+        let past = ahead - buffered;
+        let delta = i64::try_from(past).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+        let end = self.reader.seek(SeekFrom::Current(delta))?;
+        self.pos = 0;
+        self.valid = 0;
+        self.counter.fetch_add(past, Ordering::Relaxed);
+        Ok(end)
     }
 }
 
@@ -560,6 +586,32 @@ mod tests {
     fn test_blocked_reader_peek_stops_at_eof() {
         let mut reader = BlockedReader::new(Cursor::new(vec![7u8; 3]));
         assert_eq!(reader.peek(512).unwrap(), &[7u8; 3]);
+    }
+
+    /// Seeking forward lands where reading the same bytes would, whether the
+    /// target is still buffered or past the buffer, and counts what it skips.
+    #[test]
+    fn test_blocked_reader_seeks_forward() {
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let counter = ByteCounter::default();
+        let mut reader = BlockedReader::with_counter(Cursor::new(data.clone()), counter.clone());
+        let mut byte = [0u8; 1];
+
+        reader.read_exact(&mut byte).unwrap();
+        // Within the buffer.
+        assert_eq!(reader.seek(SeekFrom::Current(99)).unwrap(), 100);
+        reader.read_exact(&mut byte).unwrap();
+        assert_eq!(byte[0], data[100]);
+        // Past it.
+        assert_eq!(reader.seek(SeekFrom::Current(150_000)).unwrap(), 150_101);
+        reader.read_exact(&mut byte).unwrap();
+        assert_eq!(byte[0], data[150_101]);
+
+        reader.read_to_end(&mut Vec::new()).unwrap();
+        assert_eq!(counter.load(Ordering::Relaxed), data.len() as u64);
+
+        assert!(reader.seek(SeekFrom::Start(0)).is_err());
+        assert!(reader.seek(SeekFrom::Current(-1)).is_err());
     }
 
     #[test]

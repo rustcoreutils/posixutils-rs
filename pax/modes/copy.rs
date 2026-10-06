@@ -268,8 +268,7 @@ impl CopyWalk<'_> {
         // Selection and substitution both act on the member name, so they
         // reach every file in the subtree rather than only the operands.
         if !self.options.patterns.is_empty() {
-            let name = crate::rawpath::MatchName::of(&member);
-            let matches = matches_any(&self.options.patterns, name.as_str());
+            let matches = matches_any(&self.options.patterns, crate::rawpath::as_bytes(&member));
             if self.options.exclude == matches {
                 return Ok(false);
             }

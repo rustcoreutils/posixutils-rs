@@ -34,6 +34,7 @@
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType, SourceHeader};
 use crate::error::{PaxError, PaxResult};
+use crate::formats::ArchiveStream;
 use std::io::{Read, Write};
 
 pub(crate) const BLOCK_SIZE: usize = 512;
@@ -80,14 +81,14 @@ pub(crate) const DEVMINOR_OFF: usize = 337;
 
 /// ustar archive reader
 pub struct UstarReader<R: Read> {
-    reader: R,
+    reader: ArchiveStream<R>,
     current_size: u64,
     bytes_read: u64,
 }
 
 impl<R: Read> UstarReader<R> {
-    /// Create a new ustar reader
-    pub fn new(reader: R) -> Self {
+    /// A ustar reader over an archive stream
+    pub fn from_stream(reader: ArchiveStream<R>) -> Self {
         UstarReader {
             reader,
             current_size: 0,
@@ -148,7 +149,7 @@ impl<R: Read> ArchiveReader for UstarReader<R> {
         let to_skip = total_bytes.saturating_sub(self.bytes_read);
 
         if to_skip > 0 {
-            skip_bytes(&mut self.reader, to_skip)?;
+            self.reader.skip(to_skip)?;
         }
 
         // Reset state - we've finished with this entry's data
@@ -289,11 +290,11 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
 
     let path = crate::rawpath::join(prefix, name);
 
-    let mode = parse_octal(&header[MODE_OFF..MODE_OFF + 8])? as u32;
-    let uid = parse_octal(&header[UID_OFF..UID_OFF + 8])? as u32;
-    let gid = parse_octal(&header[GID_OFF..GID_OFF + 8])? as u32;
-    let declared_size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
-    let mtime = parse_octal(&header[MTIME_OFF..MTIME_OFF + 12])?;
+    let mode = parse_numeric(&header[MODE_OFF..MODE_OFF + 8])? as u32;
+    let uid = parse_numeric(&header[UID_OFF..UID_OFF + 8])? as u32;
+    let gid = parse_numeric(&header[GID_OFF..GID_OFF + 8])? as u32;
+    let declared_size = parse_numeric(&header[SIZE_OFF..SIZE_OFF + 12])?;
+    let mtime = parse_signed_numeric(&header[MTIME_OFF..MTIME_OFF + 12])?;
 
     let typeflag = header[TYPEFLAG_OFF];
     let flag = parse_typeflag(typeflag);
@@ -339,8 +340,8 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
     let gname = name_field(&header[GNAME_OFF..GNAME_OFF + GNAME_LEN]);
 
     // Parse device major/minor for block/char devices
-    let devmajor = parse_octal(&header[DEVMAJOR_OFF..DEVMAJOR_OFF + 8])? as u32;
-    let devminor = parse_octal(&header[DEVMINOR_OFF..DEVMINOR_OFF + 8])? as u32;
+    let devmajor = parse_numeric(&header[DEVMAJOR_OFF..DEVMAJOR_OFF + 8])? as u32;
+    let devminor = parse_numeric(&header[DEVMINOR_OFF..DEVMINOR_OFF + 8])? as u32;
 
     Ok(ArchiveEntry {
         path,
@@ -348,8 +349,7 @@ pub(crate) fn parse_header(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResu
         uid,
         gid,
         size,
-        // At most twelve octal digits: always a valid time_t.
-        mtime: mtime as i64,
+        mtime,
         entry_type,
         link_target,
         uname: if uname.is_empty() {
@@ -568,6 +568,54 @@ pub(crate) fn next_header_block(reader: &mut impl Read) -> PaxResult<Option<[u8;
     }
 }
 
+/// Parse an unsigned numeric header field: octal digits, or the base-256 form
+/// GNU tar writes for a value too large for them.
+pub(crate) fn parse_numeric(bytes: &[u8]) -> PaxResult<u64> {
+    match parse_base256(bytes)? {
+        None => parse_octal(bytes),
+        Some(v) => u64::try_from(v)
+            .map_err(|_| PaxError::InvalidHeader(format!("negative numeric field: {v}"))),
+    }
+}
+
+/// Parse a signed numeric header field (mtime): octal digits, or base-256,
+/// where a negative value is a time before the epoch.
+pub(crate) fn parse_signed_numeric(bytes: &[u8]) -> PaxResult<i64> {
+    match parse_base256(bytes)? {
+        Some(v) => Ok(v),
+        None => {
+            let v = parse_octal(bytes)?;
+            i64::try_from(v)
+                .map_err(|_| PaxError::InvalidHeader(format!("numeric field out of range: {v}")))
+        }
+    }
+}
+
+/// A GNU base-256 field, `None` when the field is not one.
+///
+/// The high bit of the first byte marks the form, and the field is then a
+/// big-endian two's complement number in the remaining bits: GNU tar writes a
+/// non-negative N as 256^len/2 + N (first byte 0x80) and a negative one as
+/// 256^len - N (first byte 0xff), so bit 6 of the first byte is the sign.
+fn parse_base256(bytes: &[u8]) -> PaxResult<Option<i64>> {
+    let Some((&first, rest)) = bytes.split_first() else {
+        return Ok(None);
+    };
+    if first & 0x80 == 0 {
+        return Ok(None);
+    }
+    let out_of_range =
+        || PaxError::InvalidHeader("base-256 numeric field out of range".to_string());
+    let mut value = i64::from(first & 0x3f) - i64::from(first & 0x40);
+    for &b in rest {
+        value = value
+            .checked_mul(256)
+            .and_then(|v| v.checked_add(i64::from(b)))
+            .ok_or_else(out_of_range)?;
+    }
+    Ok(Some(value))
+}
+
 /// Read and discard a GNU `L`/`K` long-name record, returning its recorded
 /// value.
 ///
@@ -584,7 +632,7 @@ pub(crate) fn consume_long_name_record(
     header: &[u8; BLOCK_SIZE],
     what: &str,
 ) -> PaxResult<Vec<u8>> {
-    let size = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
+    let size = parse_numeric(&header[SIZE_OFF..SIZE_OFF + 12])?;
     let data = crate::formats::read_declared(reader, size, crate::formats::MAX_NAME, what)?;
     let padding = (BLOCK_SIZE - (size as usize % BLOCK_SIZE)) % BLOCK_SIZE;
     if padding > 0 {
@@ -664,7 +712,7 @@ fn report_long_name_group(
 /// The length of the data that follows a member header, by the same rule
 /// `parse_header` applies, without interpreting the rest of the header.
 fn member_data_size(header: &[u8; BLOCK_SIZE], rule: SizeRule) -> PaxResult<u64> {
-    let declared = parse_octal(&header[SIZE_OFF..SIZE_OFF + 12])?;
+    let declared = parse_numeric(&header[SIZE_OFF..SIZE_OFF + 12])?;
     let entry_type = parse_typeflag(header[TYPEFLAG_OFF]).entry_type();
     Ok(rule.data_size(entry_type, declared))
 }
@@ -876,18 +924,6 @@ fn padding_needed(bytes_written: u64) -> usize {
     }
 }
 
-/// Skip bytes in a reader
-fn skip_bytes<R: Read>(reader: &mut R, count: u64) -> PaxResult<()> {
-    let mut remaining = count;
-    let mut buf = [0u8; 4096];
-    while remaining > 0 {
-        let to_read = std::cmp::min(remaining, buf.len() as u64) as usize;
-        reader.read_exact(&mut buf[..to_read])?;
-        remaining -= to_read as u64;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -907,6 +943,30 @@ mod tests {
         assert_eq!(name_field(b"\0root"), b"");
         // Not UTF-8, and preserved rather than replaced.
         assert_eq!(name_field(b"gr\xffup\0"), b"gr\xffup");
+    }
+
+    #[test]
+    fn test_parse_base256() {
+        // GNU tar's encoding: 0x80 then the value, big-endian.
+        let mut field = [0u8; 8];
+        field[0] = 0x80;
+        field[5..].copy_from_slice(&[0x2d, 0xc6, 0xc0]);
+        assert_eq!(parse_numeric(&field).unwrap(), 3_000_000);
+
+        let mut size = [0u8; 12];
+        size[0] = 0x80;
+        size[4..].copy_from_slice(&(1u64 << 36).to_be_bytes());
+        assert_eq!(parse_numeric(&size).unwrap(), 1 << 36);
+
+        // A negative mtime is two's complement, first byte 0xff.
+        let mut mtime = [0xffu8; 12];
+        mtime[11] = 0xfe;
+        assert_eq!(parse_signed_numeric(&mtime).unwrap(), -2);
+        assert!(parse_numeric(&mtime).is_err());
+
+        // Octal is unchanged.
+        assert_eq!(parse_numeric(b"0000755\0").unwrap(), 0o755);
+        assert_eq!(parse_signed_numeric(b"00000000017\0").unwrap(), 0o17);
     }
 
     #[test]

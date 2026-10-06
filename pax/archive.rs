@@ -254,6 +254,26 @@ pub trait ArchiveReader {
     }
 }
 
+/// A boxed reader, as `formats::open_reader` returns for a format detected at
+/// run time.
+impl<T: ArchiveReader + ?Sized> ArchiveReader for Box<T> {
+    fn read_entry(&mut self) -> PaxResult<Option<ArchiveEntry>> {
+        (**self).read_entry()
+    }
+
+    fn read_data(&mut self, buf: &mut [u8]) -> PaxResult<usize> {
+        (**self).read_data(buf)
+    }
+
+    fn skip_data(&mut self) -> PaxResult<()> {
+        (**self).skip_data()
+    }
+
+    fn applies_option_records(&self) -> bool {
+        (**self).applies_option_records()
+    }
+}
+
 /// Trait for writing archives
 pub trait ArchiveWriter {
     /// Write an entry header to the archive

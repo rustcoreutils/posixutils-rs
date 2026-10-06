@@ -44,7 +44,7 @@ pub enum SubstResult {
     /// No pattern matched, path unchanged
     Unchanged,
     /// Path was transformed to the new value
-    Changed(String),
+    Changed(Vec<u8>),
     /// Path became empty (file should be skipped)
     Empty,
 }
@@ -133,13 +133,18 @@ impl Substitution {
         })
     }
 
-    /// Apply this substitution to a path
-    pub fn apply(&self, path: &str) -> SubstResult {
-        let mut result = path.to_string();
+    /// Apply this substitution to a path.
+    ///
+    /// A pathname is bytes, and so is everything here: the regex reports
+    /// byte offsets, which need not fall on a character boundary when the
+    /// name is not valid text in the current locale (a non-ASCII name under
+    /// `LC_ALL=C`), and a name that is not UTF-8 keeps its bytes.
+    pub fn apply(&self, path: &[u8]) -> SubstResult {
+        let mut result = path.to_vec();
         let mut pos = 0;
         let mut any_match = false;
 
-        while let Some(matches) = self.regex.captures_at(&result, pos) {
+        while let Some(matches) = self.regex.captures_at_bytes(&result, pos) {
             any_match = true;
 
             // Build the replacement string
@@ -149,14 +154,7 @@ impl Substitution {
             let match_start = matches[0].start;
             let match_end = matches[0].end;
 
-            // Replace the matched portion efficiently using with_capacity and push_str
-            let new_len = result.len() - (match_end - match_start) + replacement.len();
-            let mut new_result = String::with_capacity(new_len);
-            new_result.push_str(&result[..match_start]);
-            new_result.push_str(&replacement);
-            new_result.push_str(&result[match_end..]);
-
-            result = new_result;
+            result.splice(match_start..match_end, replacement.iter().copied());
 
             // If not global, stop after first replacement
             if !self.global {
@@ -196,9 +194,9 @@ impl Substitution {
 ///   string grows without bound -- `-s ',x*,-,g'` never terminated.
 ///
 /// Stepping by a whole character, rather than one byte, keeps the offset on a
-/// UTF-8 boundary for the next match.
+/// character boundary for the next match.
 fn next_scan_pos(
-    result: &str,
+    result: &[u8],
     match_start: usize,
     match_end: usize,
     replacement_len: usize,
@@ -207,48 +205,44 @@ fn next_scan_pos(
     if match_end > match_start {
         return Some(resume);
     }
-    let next_char = result[resume..].chars().next()?;
-    Some(resume + next_char.len_utf8())
+    let rest = result.get(resume..).filter(|rest| !rest.is_empty())?;
+    Some(resume + plib::locale::mb_char_slices(&rest[..rest.len().min(16)])[0].len())
 }
 
 /// Build the replacement string from template and match groups
-fn build_replacement(template: &str, input: &str, matches: &[Match]) -> String {
+fn build_replacement(template: &str, input: &[u8], matches: &[Match]) -> Vec<u8> {
     // Pre-allocate with a reasonable estimate (template length + some extra for expansions)
-    let mut result = String::with_capacity(template.len() + 32);
-    let mut chars = template.chars().peekable();
+    let mut result = Vec::with_capacity(template.len() + 32);
+    // Byte by byte: every special character is ASCII, and no byte of a
+    // multibyte UTF-8 character is.
+    let mut bytes = template.bytes().peekable();
 
-    while let Some(c) = chars.next() {
-        if c == '&' {
+    while let Some(c) = bytes.next() {
+        if c == b'&' {
             // & is replaced by entire match
             if !matches.is_empty() && matches[0].end > matches[0].start {
-                result.push_str(&input[matches[0].start..matches[0].end]);
+                result.extend_from_slice(&input[matches[0].start..matches[0].end]);
             }
-        } else if c == '\\' {
-            if let Some(&next) = chars.peek() {
-                if next.is_ascii_digit() && next != '0' {
+        } else if c == b'\\' {
+            match bytes.peek() {
+                Some(&next @ b'1'..=b'9') => {
                     // \1 through \9 - backreference
-                    let idx = (next as usize) - ('0' as usize);
+                    let idx = (next - b'0') as usize;
                     if idx < matches.len()
                         && idx < MAX_CAPTURES
                         && matches[idx].end > matches[idx].start
                     {
-                        result.push_str(&input[matches[idx].start..matches[idx].end]);
+                        result.extend_from_slice(&input[matches[idx].start..matches[idx].end]);
                     }
-                    chars.next();
-                } else if next == '\\' {
-                    // \\ -> literal backslash
-                    result.push('\\');
-                    chars.next();
-                } else if next == '&' {
-                    // \& -> literal &
-                    result.push('&');
-                    chars.next();
-                } else {
-                    // Keep other backslash sequences as-is
-                    result.push(c);
+                    bytes.next();
                 }
-            } else {
-                result.push(c);
+                // \\ -> literal backslash, \& -> literal &
+                Some(&next @ (b'\\' | b'&')) => {
+                    result.push(next);
+                    bytes.next();
+                }
+                // Keep other backslash sequences as-is
+                _ => result.push(c),
             }
         } else {
             result.push(c);
@@ -314,10 +308,8 @@ pub fn substitute_link_target(substitutions: &[Substitution], path: &Path) -> Op
 
 fn substituted(substitutions: &[Substitution], path: &Path, report: bool) -> Option<PathBuf> {
     match apply_substitutions(substitutions, path, report) {
-        // Keep the original bytes: this is the only case that round-trips a
-        // name that is not UTF-8 exactly.
         SubstResult::Unchanged => Some(path.to_path_buf()),
-        SubstResult::Changed(new) => Some(crate::rawpath::from_substituted(&new)),
+        SubstResult::Changed(new) => Some(crate::rawpath::from_bytes(&new)),
         SubstResult::Empty => None,
     }
 }
@@ -325,14 +317,12 @@ fn substituted(substitutions: &[Substitution], path: &Path, report: bool) -> Opt
 /// Apply the `-s` expressions to a member name, in order, stopping at the
 /// first that changes it.
 ///
-/// Takes the pathname rather than its lossy rendering so that the `p` flag can
-/// report the name as it really is. The matching itself is still done on the
-/// lossy form -- see `crate::rawpath::MatchName` -- which is why the left-hand
-/// side of the report comes from `path` and not from what the regex saw.
+/// The regex sees the name's own bytes, so a name that is not UTF-8 is
+/// matched, rewritten and reported exactly as it is.
 fn apply_substitutions(substitutions: &[Substitution], path: &Path, report: bool) -> SubstResult {
-    let name = crate::rawpath::MatchName::of(path);
+    let name = crate::rawpath::as_bytes(path);
     for subst in substitutions {
-        match subst.apply(name.as_str()) {
+        match subst.apply(name) {
             SubstResult::Unchanged => continue,
             result => {
                 if report && subst.print {
@@ -340,7 +330,7 @@ fn apply_substitutions(substitutions: &[Substitution], path: &Path, report: bool
                     line.extend_from_slice(crate::rawpath::as_bytes(path));
                     line.extend_from_slice(b" >> ");
                     match &result {
-                        SubstResult::Changed(new) => line.extend_from_slice(new.as_bytes()),
+                        SubstResult::Changed(new) => line.extend_from_slice(new),
                         SubstResult::Empty | SubstResult::Unchanged => {}
                     }
                     crate::escape::write_stderr_line(&line);
@@ -448,23 +438,23 @@ mod tests {
     fn test_apply_basic() {
         let s = Substitution::parse("/foo/bar/").unwrap();
         assert_eq!(
-            s.apply("hello_foo_world"),
-            SubstResult::Changed("hello_bar_world".to_string())
+            s.apply("hello_foo_world".as_bytes()),
+            SubstResult::Changed("hello_bar_world".as_bytes().to_vec())
         );
     }
 
     #[test]
     fn test_apply_no_match() {
         let s = Substitution::parse("/foo/bar/").unwrap();
-        assert_eq!(s.apply("hello_world"), SubstResult::Unchanged);
+        assert_eq!(s.apply("hello_world".as_bytes()), SubstResult::Unchanged);
     }
 
     #[test]
     fn test_apply_global() {
         let s = Substitution::parse("/foo/bar/g").unwrap();
         assert_eq!(
-            s.apply("foo_foo_foo"),
-            SubstResult::Changed("bar_bar_bar".to_string())
+            s.apply("foo_foo_foo".as_bytes()),
+            SubstResult::Changed("bar_bar_bar".as_bytes().to_vec())
         );
     }
 
@@ -475,19 +465,31 @@ mod tests {
     #[test]
     fn test_apply_global_deletion() {
         let s = Substitution::parse("/a//g").unwrap();
-        assert_eq!(s.apply("aab"), SubstResult::Changed("b".to_string()));
-        assert_eq!(s.apply("banana"), SubstResult::Changed("bnn".to_string()));
+        assert_eq!(
+            s.apply("aab".as_bytes()),
+            SubstResult::Changed("b".as_bytes().to_vec())
+        );
+        assert_eq!(
+            s.apply("banana".as_bytes()),
+            SubstResult::Changed("bnn".as_bytes().to_vec())
+        );
 
         // Deleting a multi-character match, adjacent occurrences.
         let s = Substitution::parse("/ab//g").unwrap();
-        assert_eq!(s.apply("xababy"), SubstResult::Changed("xy".to_string()));
+        assert_eq!(
+            s.apply("xababy".as_bytes()),
+            SubstResult::Changed("xy".as_bytes().to_vec())
+        );
     }
 
     /// Shortening (but non-empty) replacements hit the same advance logic.
     #[test]
     fn test_apply_global_shortening() {
         let s = Substitution::parse("/aa/a/g").unwrap();
-        assert_eq!(s.apply("aaaa"), SubstResult::Changed("aa".to_string()));
+        assert_eq!(
+            s.apply("aaaa".as_bytes()),
+            SubstResult::Changed("aa".as_bytes().to_vec())
+        );
     }
 
     /// The one-character bump that guards against an empty match must land on a
@@ -496,36 +498,39 @@ mod tests {
     fn test_apply_global_empty_match_non_ascii() {
         // `x*` matches empty at every position.
         let s = Substitution::parse("/x*/-/g").unwrap();
-        match s.apply("éöü") {
+        match s.apply("éöü".as_bytes()) {
             SubstResult::Changed(_) => {}
             other => panic!("expected a substitution, got {:?}", other),
         }
 
         let s = Substitution::parse("/é//g").unwrap();
-        assert_eq!(s.apply("éaéb"), SubstResult::Changed("ab".to_string()));
+        assert_eq!(
+            s.apply("éaéb".as_bytes()),
+            SubstResult::Changed("ab".as_bytes().to_vec())
+        );
     }
 
     #[test]
     fn test_apply_non_global() {
         let s = Substitution::parse("/foo/bar/").unwrap();
         assert_eq!(
-            s.apply("foo_foo_foo"),
-            SubstResult::Changed("bar_foo_foo".to_string())
+            s.apply("foo_foo_foo".as_bytes()),
+            SubstResult::Changed("bar_foo_foo".as_bytes().to_vec())
         );
     }
 
     #[test]
     fn test_apply_empty_result() {
         let s = Substitution::parse("/.*//").unwrap();
-        assert_eq!(s.apply("hello"), SubstResult::Empty);
+        assert_eq!(s.apply("hello".as_bytes()), SubstResult::Empty);
     }
 
     #[test]
     fn test_apply_ampersand_replacement() {
         let s = Substitution::parse("/foo/[&]/").unwrap();
         assert_eq!(
-            s.apply("hello_foo_world"),
-            SubstResult::Changed("hello_[foo]_world".to_string())
+            s.apply("hello_foo_world".as_bytes()),
+            SubstResult::Changed("hello_[foo]_world".as_bytes().to_vec())
         );
     }
 
@@ -535,8 +540,8 @@ mod tests {
         // Pattern: \(.*\)_\(.*\)$ matches "hello_world" with groups
         let s = Substitution::parse("/\\(.*\\)_\\(.*\\)$/\\2_\\1/").unwrap();
         assert_eq!(
-            s.apply("hello_world"),
-            SubstResult::Changed("world_hello".to_string())
+            s.apply("hello_world".as_bytes()),
+            SubstResult::Changed("world_hello".as_bytes().to_vec())
         );
     }
 
@@ -545,8 +550,8 @@ mod tests {
         // Add prefix using ^ anchor
         let s = Substitution::parse("/^/prefix\\//").unwrap();
         assert_eq!(
-            s.apply("foo/bar"),
-            SubstResult::Changed("prefix/foo/bar".to_string())
+            s.apply("foo/bar".as_bytes()),
+            SubstResult::Changed("prefix/foo/bar".as_bytes().to_vec())
         );
     }
 
@@ -556,8 +561,8 @@ mod tests {
         // In BRE, \. matches literal dot
         let s = Substitution::parse("/\\.txt$//").unwrap();
         assert_eq!(
-            s.apply("file.txt"),
-            SubstResult::Changed("file".to_string())
+            s.apply("file.txt".as_bytes()),
+            SubstResult::Changed("file".as_bytes().to_vec())
         );
     }
 
@@ -569,7 +574,7 @@ mod tests {
         ];
         assert_eq!(
             apply_substitutions(&subs, Path::new("foo"), false),
-            SubstResult::Changed("first".to_string())
+            SubstResult::Changed("first".as_bytes().to_vec())
         );
     }
 
@@ -581,7 +586,7 @@ mod tests {
         ];
         assert_eq!(
             apply_substitutions(&subs, Path::new("foo"), false),
-            SubstResult::Changed("second".to_string())
+            SubstResult::Changed("second".as_bytes().to_vec())
         );
     }
 
@@ -600,6 +605,9 @@ mod tests {
     #[test]
     fn test_escaped_ampersand() {
         let s = Substitution::parse("/foo/\\&/").unwrap();
-        assert_eq!(s.apply("foo"), SubstResult::Changed("&".to_string()));
+        assert_eq!(
+            s.apply("foo".as_bytes()),
+            SubstResult::Changed("&".as_bytes().to_vec())
+        );
     }
 }

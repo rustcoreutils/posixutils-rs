@@ -23,7 +23,7 @@ mod rawpath;
 mod subst;
 mod userdb;
 
-use archive::ArchiveFormat;
+use archive::{ArchiveFormat, ArchiveReader};
 use blocked_io::{
     default_record_size, parse_blocksize, BlockedReader, BlockedWriter, ByteCounter,
     DEFAULT_RECORD_SIZE, TAR_BLOCK_SIZE,
@@ -32,7 +32,7 @@ use clap::{Parser, ValueEnum};
 use cli::ProgramMode;
 use compression::{is_gzip, GzipReader, GzipWriter, GZIP_MAGIC};
 use error::{PaxError, PaxResult};
-use formats::CpioFormat;
+use formats::{ArchiveStream, CpioFormat};
 use gettextrs::gettext;
 use modes::copy::CopyOptions;
 use modes::list::ListOptions;
@@ -359,7 +359,7 @@ fn parse_substitutions(args: &Args) -> PaxResult<Vec<Substitution>> {
 
 /// Run list mode
 fn run_list(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
-    let patterns = compile_patterns(&args.files_and_patterns)?;
+    let patterns = compile_patterns(&args.files_and_patterns);
     let format_options = parse_format_options(args)?;
     let substitutions = parse_substitutions(args)?;
 
@@ -371,7 +371,7 @@ fn run_list(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
         substitutions,
         first_match: args.first_match,
         dir_only: args.dir_no_follow,
-        exclude_patterns: compile_patterns(&args.exclude_patterns)?,
+        exclude_patterns: compile_patterns(&args.exclude_patterns),
         strip_components: args.strip_components,
     };
 
@@ -380,12 +380,12 @@ fn run_list(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
         return run_list_multi_volume(args, &options);
     }
 
-    let (reader, format) = open_archive_for_read(args, archive_bytes)?;
+    let mut archive = open_archive_for_read(args, archive_bytes, &options.format_options)?;
     // StdoutLock is a LineWriter, so an unbuffered listing costs one write(2)
     // per member (two under -o listopt). Buffer it.
     let mut stdout = io::BufWriter::new(io::stdout().lock());
 
-    modes::list_archive(reader, &mut stdout, format, &options)?;
+    modes::list_archive(&mut archive, &mut stdout, &options)?;
     stdout.flush()?;
     Ok(())
 }
@@ -407,12 +407,12 @@ fn run_list_multi_volume(args: &Args, options: &ListOptions) -> PaxResult<()> {
     let mut stdout = io::stdout().lock();
 
     // Multi-volume is always ustar format
-    modes::list::list_archive_from_reader(&mut reader, &mut stdout, options)
+    modes::list_archive(&mut reader, &mut stdout, options)
 }
 
 /// Run read/extract mode
 fn run_read(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
-    let patterns = compile_patterns(&args.files_and_patterns)?;
+    let patterns = compile_patterns(&args.files_and_patterns);
     let substitutions = parse_substitutions(args)?;
     let format_options = parse_format_options(args)?;
 
@@ -432,7 +432,7 @@ fn run_read(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
         umask: current_umask(),
         format_options,
         dir_only: args.dir_no_follow,
-        exclude_patterns: compile_patterns(&args.exclude_patterns)?,
+        exclude_patterns: compile_patterns(&args.exclude_patterns),
         strip_components: args.strip_components,
         to_stdout: args.to_stdout,
     };
@@ -442,8 +442,8 @@ fn run_read(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
         return run_read_multi_volume(args, &options);
     }
 
-    let (reader, format) = open_archive_for_read(args, archive_bytes)?;
-    modes::extract_archive(reader, format, &options)
+    let mut archive = open_archive_for_read(args, archive_bytes, &options.format_options)?;
+    modes::extract_archive(&mut archive, &options)
 }
 
 /// Run read/extract mode with multi-volume support
@@ -462,7 +462,7 @@ fn run_read_multi_volume(args: &Args, options: &ReadOptions) -> PaxResult<()> {
     let mut reader = MultiVolumeReader::new(mv_options)?;
 
     // Multi-volume is always ustar format
-    modes::read::extract_archive_from_reader(&mut reader, options)
+    modes::extract_archive(&mut reader, options)
 }
 
 /// Run write/create mode
@@ -500,7 +500,7 @@ fn run_write(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
         substitutions,
         format_options,
         cpio_format: CpioFormat::from(selected),
-        exclude_patterns: compile_patterns(&args.exclude_patterns)?,
+        exclude_patterns: compile_patterns(&args.exclude_patterns),
         // -u selects among existing members, which write mode has none of.
         update_times: None,
     };
@@ -618,7 +618,7 @@ fn run_append(args: &Args, archive_bytes: &ByteCounter) -> PaxResult<()> {
         substitutions,
         format_options,
         cpio_format: args.format.map(CpioFormat::from).unwrap_or_default(),
-        exclude_patterns: compile_patterns(&args.exclude_patterns)?,
+        exclude_patterns: compile_patterns(&args.exclude_patterns),
         // Filled in by append_to_archive once it knows the archive's format.
         update_times: None,
     };
@@ -665,7 +665,7 @@ fn run_copy(args: &Args) -> PaxResult<()> {
     };
 
     // Copy mode has no pattern operands: every operand is a source pathname.
-    let patterns = compile_patterns(&[])?;
+    let patterns = compile_patterns(&[]);
     let substitutions = parse_substitutions(args)?;
 
     let options = CopyOptions {
@@ -692,40 +692,48 @@ fn run_copy(args: &Args) -> PaxResult<()> {
     modes::copy_files(&files, &dest_dir, &options)
 }
 
-/// Open archive for reading with format detection
+/// Open the archive for reading, detecting its format.
+///
+/// A regular file -- named by -f, or on standard input -- is read through a
+/// stream that seeks over the member data list and read mode skip, rather than
+/// reading it. A compressed archive, a pipe or a device is read throughout.
 fn open_archive_for_read(
     args: &Args,
     archive_bytes: &ByteCounter,
-) -> PaxResult<(Box<dyn Read>, ArchiveFormat)> {
+    format_options: &FormatOptions,
+) -> PaxResult<Box<dyn ArchiveReader>> {
     // -b sets the size of writes only; on input the blocking is whatever the
     // reads return (see BlockedReader). A bad value is still diagnosed.
     if let Some(b) = args.blocksize {
         parse_blocksize(b)?;
     }
 
-    let raw: Box<dyn Read> = match args.archive {
-        Some(ref path) => Box::new(File::open(path)?),
-        None => Box::new(stdio_file(io::stdin())?),
+    let raw = match args.archive {
+        Some(ref path) => File::open(path)?,
+        None => stdio_file(io::stdin())?,
     };
+    let seekable = raw.metadata().is_ok_and(|m| m.is_file());
 
     // Everything that looks at the raw archive, gzip detection included, goes
     // through the one blocked reader: a smaller read of its own would cut the
     // first record short.
     let mut blocked = BlockedReader::with_counter(raw, ByteCounter::clone(archive_bytes));
     let is_gzip_archive = is_gzip(blocked.peek(GZIP_MAGIC.len())?);
-    let reader: Box<dyn Read> = if is_gzip_archive || args.gzip {
-        Box::new(GzipReader::new(blocked)?)
+    if is_gzip_archive || args.gzip {
+        // For format detection, peek at the decompressed archive.
+        let mut reader = PeekReader::new(Box::new(GzipReader::new(blocked)?), 512);
+        let format = detect_format_from_bytes(reader.peek()?)?;
+        return formats::open_reader(ArchiveStream::new(reader), format, format_options);
+    }
+
+    let peeked = blocked.peek(512)?;
+    let format = detect_format_from_bytes(&peeked[..peeked.len().min(512)])?;
+    let stream = if seekable {
+        ArchiveStream::seekable(blocked)
     } else {
-        Box::new(blocked)
+        ArchiveStream::new(blocked)
     };
-
-    // For format detection, we need to peek at the (decompressed) archive
-    let mut buf_reader = PeekReader::new(reader, 512);
-    let peek_buf = buf_reader.peek()?;
-
-    let format = detect_format_from_bytes(peek_buf)?;
-
-    Ok((Box::new(buf_reader), format))
+    formats::open_reader(stream, format, format_options)
 }
 
 /// The bytes per write to the archive: -b, or `default` without it.
@@ -846,13 +854,13 @@ fn is_valid_tar_checksum(buf: &[u8]) -> bool {
 
 /// Compile pattern operands into Pattern objects.
 ///
-/// Patterns match against [`rawpath::MatchName`], the lossy text form of a
-/// member name, so an operand that is not UTF-8 is converted the same way:
-/// `caf\351` then still selects the member stored as `caf\351`.
-fn compile_patterns(patterns: &[OsString]) -> PaxResult<Vec<Pattern>> {
+/// Patterns and member names are both bytes, so an operand that is not UTF-8
+/// -- `caf\351` -- selects the member stored under exactly those bytes.
+fn compile_patterns(patterns: &[OsString]) -> Vec<Pattern> {
+    use std::os::unix::ffi::OsStrExt;
     patterns
         .iter()
-        .map(|s| Pattern::new(&s.to_string_lossy()))
+        .map(|s| Pattern::new(s.as_bytes()))
         .collect()
 }
 
@@ -1145,9 +1153,9 @@ mod tests {
         assert_eq!(files[0].as_os_str().as_bytes(), b"caf\xe9");
 
         // As a pattern it selects the member of that name.
-        let pat = &compile_patterns(&[name]).unwrap().remove(0);
-        let member = rawpath::from_bytes(b"caf\xe9");
-        assert!(pat.matches(rawpath::MatchName::of(&member).as_str()));
-        assert!(!pat.matches("caf"));
+        let pat = &compile_patterns(&[name]).remove(0);
+        assert!(pat.matches(b"caf\xe9"));
+        assert!(!pat.matches(b"caf"));
+        assert!(!pat.matches("caf\u{fffd}".as_bytes()));
     }
 }

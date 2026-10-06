@@ -50,7 +50,7 @@
 
 use crate::archive::{ArchiveEntry, ArchiveReader, ArchiveWriter, EntryType, SourceHeader};
 use crate::error::{PaxError, PaxResult};
-use crate::formats::{read_header, truncated_header};
+use crate::formats::{read_header, truncated_header, ArchiveStream};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -155,7 +155,7 @@ const C_PERM_MASK: u32 = 0o7777;
 
 /// cpio archive reader
 pub struct CpioReader<R: Read> {
-    reader: R,
+    reader: ArchiveStream<R>,
     current_size: u64,
     bytes_read: u64,
     finished: bool,
@@ -165,8 +165,8 @@ pub struct CpioReader<R: Read> {
 }
 
 impl<R: Read> CpioReader<R> {
-    /// Create a new cpio reader
-    pub fn new(reader: R) -> Self {
+    /// A cpio reader over an archive stream
+    pub fn from_stream(reader: ArchiveStream<R>) -> Self {
         CpioReader {
             reader,
             current_size: 0,
@@ -283,13 +283,13 @@ impl<R: Read> ArchiveReader for CpioReader<R> {
     fn skip_data(&mut self) -> PaxResult<()> {
         let remaining = self.current_size.saturating_sub(self.bytes_read);
         if remaining > 0 {
-            skip_bytes(&mut self.reader, remaining)?;
+            self.reader.skip(remaining)?;
             self.bytes_read = self.current_size;
         }
 
         // Skip padding (newc format pads data to 4-byte boundary)
         if self.data_padding > 0 {
-            skip_bytes(&mut self.reader, self.data_padding)?;
+            self.reader.skip(self.data_padding)?;
             self.data_padding = 0;
         }
         Ok(())
@@ -1087,18 +1087,6 @@ fn write_hex_field_masked(buf: &mut Vec<u8>, val: u64) {
 // ============================================================================
 // Utility functions
 // ============================================================================
-
-/// Skip bytes in a reader
-fn skip_bytes<R: Read>(reader: &mut R, count: u64) -> PaxResult<()> {
-    let mut remaining = count;
-    let mut buf = [0u8; 4096];
-    while remaining > 0 {
-        let to_read = std::cmp::min(remaining, buf.len() as u64) as usize;
-        reader.read_exact(&mut buf[..to_read])?;
-        remaining -= to_read as u64;
-    }
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {

@@ -24,7 +24,7 @@ use crate::target::Target;
 use crate::token::lexer::Tokenizer;
 use crate::types::{FloatClass, TypeId, TypeKind, TypeModifiers, TypeTable};
 
-fn parse_expr(input: &str) -> ParseResult<(Expr, TypeTable, StringTable, SymbolTable)> {
+pub(super) fn parse_expr(input: &str) -> ParseResult<(Expr, TypeTable, StringTable, SymbolTable)> {
     parse_expr_with_vars(input, &[])
 }
 

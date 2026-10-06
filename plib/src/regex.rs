@@ -35,8 +35,7 @@
 //! ```
 
 use ffi::{
-    regcomp, regerror, regexec, regfree, RegMatchT, RegexT, REG_EXTENDED, REG_ICASE, REG_NOMATCH,
-    REG_NOTBOL,
+    regcomp, regerror, regexec, regfree, RegMatchT, RegexT, REG_EXTENDED, REG_ICASE, REG_NOTBOL,
 };
 use std::ffi::{c_char, c_int, CString};
 use std::io::{Error, ErrorKind};
@@ -47,7 +46,7 @@ use std::ptr;
 mod ffi {
     pub use libc::{
         regcomp, regerror, regex_t as RegexT, regexec, regfree, regmatch_t as RegMatchT,
-        REG_EXTENDED, REG_ICASE, REG_NOMATCH, REG_NOTBOL,
+        REG_EXTENDED, REG_ICASE, REG_NOTBOL,
     };
 }
 
@@ -79,7 +78,6 @@ mod ffi {
     pub const REG_EXTENDED: c_int = 1;
     pub const REG_ICASE: c_int = 2;
     pub const REG_NOTBOL: c_int = 1;
-    pub const REG_NOMATCH: c_int = 1;
 
     extern "C" {
         #[link_name = "plib_regcomp"]
@@ -102,6 +100,14 @@ mod ffi {
             errbuf_size: usize,
         ) -> usize;
     }
+}
+
+/// Whether `regexec` returned a match. Anything but 0 is none: `REG_NOMATCH`,
+/// or an error -- macOS's `REG_ILLSEQ` for text that is not valid in the
+/// locale's encoding -- which leaves the match offsets unset. Taking an error
+/// for a match made it an empty one at the start of the text.
+fn matched(result: c_int) -> bool {
+    result == 0
 }
 
 /// Maximum number of capture groups supported
@@ -341,7 +347,7 @@ impl Regex {
 
         let result = unsafe { regexec(&self.raw, c_text.as_ptr(), 0, ptr::null_mut(), 0) };
 
-        result != REG_NOMATCH
+        matched(result)
     }
 
     /// Find the first match in the input string.
@@ -379,7 +385,7 @@ impl Regex {
             )
         };
 
-        if result == REG_NOMATCH || pmatch.rm_so < 0 {
+        if !matched(result) || pmatch.rm_so < 0 {
             return None;
         }
 
@@ -417,7 +423,7 @@ impl Regex {
             )
         };
 
-        if result == REG_NOMATCH || pmatch.rm_so < 0 {
+        if !matched(result) || pmatch.rm_so < 0 {
             return None;
         }
 
@@ -466,7 +472,7 @@ impl Regex {
             )
         };
 
-        if result == REG_NOMATCH {
+        if !matched(result) {
             return None;
         }
 
@@ -534,7 +540,7 @@ impl Regex {
             )
         };
 
-        if result == REG_NOMATCH {
+        if !matched(result) {
             return None;
         }
 

@@ -1001,3 +1001,64 @@ fn test_stack_save_and_restore_are_their_opcodes() {
         assert_eq!(Some(mark), save.target, "{arch:?}");
     }
 }
+
+// __builtin_constant_p
+
+/// Whether `f`'s `__builtin_constant_p` was deferred to the optimizer as a
+/// `ConstantP` placeholder, rather than answered while linearizing.
+fn constant_p_deferred(src: &str) -> bool {
+    let module = linearize_source(src, &Target::new(Arch::X86_64, Os::Linux));
+    insns_of(&module, "f")
+        .iter()
+        .any(|i| i.op == Opcode::ConstantP)
+}
+
+/// The operand of a deferred `__builtin_constant_p` is computed only to be
+/// asked about and is then deleted unrun, so a read that may trap, a
+/// division and a floating operation are all deferred: gcc answers each 1
+/// where propagation proves it constant (`"hi"[0]` in gcc.c-torture bcp-1).
+#[test]
+fn test_constant_p_defers_an_operand_that_may_trap() {
+    for body in [
+        "return __builtin_constant_p(\"hi\"[0]);",
+        "return __builtin_constant_p(*\"hi\");",
+        "int x = 6, y = 2; return __builtin_constant_p(x / y);",
+        "int x = 6, y = 4; return __builtin_constant_p(x % y);",
+        "int a[2] = { 1, 2 }; return __builtin_constant_p(a[1]);",
+        "struct { int m; } s = { 1 }, *p = &s; return __builtin_constant_p(p->m);",
+        "double d = 2.0; return __builtin_constant_p(d * 3.0);",
+        "double d = 2.5; return __builtin_constant_p((int)d);",
+    ] {
+        let src = format!("int f(void) {{ {body} }}\n");
+        assert!(constant_p_deferred(&src), "{body}");
+    }
+}
+
+/// An operand with a side effect is never evaluated, so it is answered 0 at
+/// once -- as is a `volatile` read, the observable kind of read.
+#[test]
+fn test_constant_p_answers_a_side_effect_at_once() {
+    for body in [
+        "int x = 1; return __builtin_constant_p(x++);",
+        "int x = 1; return __builtin_constant_p(x = 2);",
+        "return __builtin_constant_p(g());",
+        "volatile int v = 1; return __builtin_constant_p(v);",
+        "volatile int a[2] = { 1, 2 }; return __builtin_constant_p(a[1]);",
+        "volatile int v = 1, *p = &v; return __builtin_constant_p(*p);",
+    ] {
+        let src = format!("int g(void);\nint f(void) {{ {body} }}\n");
+        assert!(!constant_p_deferred(&src), "{body}");
+    }
+}
+
+/// The trapping operand a deferred `__builtin_constant_p` admits is not
+/// admitted where an expression is evaluated speculatively: a conditional
+/// with a division in an arm still branches.
+#[test]
+fn test_a_trapping_arm_is_still_not_speculated() {
+    let src = "int f(int c, int x, int y) { return c ? x / y : 0; }\n";
+    let module = linearize_source(src, &Target::new(Arch::X86_64, Os::Linux));
+    assert!(!insns_of(&module, "f")
+        .iter()
+        .any(|i| i.op == Opcode::Select));
+}

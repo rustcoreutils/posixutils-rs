@@ -333,7 +333,7 @@ Use `returns_via_sret()` and `returns_two_regs()` to query return strategy.
 
 | Opcode | Description |
 |--------|-------------|
-| `constant_p` | `__builtin_constant_p`, held back until propagation has run: `sccp` answers 1 when it proves the operand constant, and `lower` answers 0 for every one left -- all of them at `-O0` |
+| `constant_p` | `__builtin_constant_p`, held back until propagation has run (made only when optimizing; the parser answers at `-O0`): `sccp` answers 1 when it proves the operand constant, and 0 otherwise once inlining is done -- the round before inlining leaves the 0s, since inlining a constant argument answers 1 -- and `lower` answers 0 for every one left |
 
 ### Bit Manipulation Builtins
 
@@ -581,7 +581,7 @@ after that, because merging would undo the splitting the copies depend on. See
 |------|---------|
 | `inline.rs` | Inlines at the call site by callee size: always below a small threshold, larger ones with an `inline` hint, under a per-caller growth cap. `always_inline` callees are inlined at every level. A callee that `alloca`s is bracketed with `stacksave`/`stackrestore`. Afterwards it deletes `static` functions with no callers left |
 | `memexpand.rs` | A `memcpy`, `memset` or `memmove` of a small constant length becomes integer loads and stores, at every level. It also owns the chunking and size limit that the linearizer's aggregate copies use |
-| `constglobal.rs` | A load of a `const` global, by name or through its address, becomes its initializer. Needs no alias or escape analysis, because modifying a `const`-defined object is undefined behaviour (C17 6.7.3p6) |
+| `constglobal.rs` | A load of a `const` global, by name or through its address, becomes its initializer, and a one-byte load at a constant offset into a string literal or `const` `char` array (`strdata`) becomes the byte. Needs no alias or escape analysis, because modifying a `const`-defined object is undefined behaviour (C17 6.7.3p6) |
 | `loadfwd.rs` | Store-to-load forwarding and redundant-load elimination, across blocks, using `memloc`/`escape`/`effects`. Also `MemOracle`: the value a location holds just before an instruction, as a pseudo or, for one byte, a constant |
 | `vrp.rs` | Value-range propagation over `range.rs` intervals, on the `dataflow` solver. Unlike `sccp`, it attaches facts to CFG *edges*: `var <= 0` being false gives `var >= 1` on that edge. It runs before `ifconv`, which would otherwise collapse the diamond the fact hangs on |
 | `ifconv.rs` | Turns a short-circuit `&&`/`\|\|` diamond into a `sel` when the arm is safe to speculate (no memory access, call or trap). This puts the two comparisons in one block, where `instcombine` can relate them |

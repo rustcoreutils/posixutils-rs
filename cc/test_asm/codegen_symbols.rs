@@ -419,7 +419,8 @@ static int x;
 extern int x = 7;
 extern const char s[] = "hi";
 extern _Thread_local int t = 1;
-int get(void) { return y + x + s[0] + t; }
+/* `s[i]`: a byte at a constant index folds, leaving no reference to `s`. */
+int get(int i) { return y + x + s[i] + t; }
 "#;
     let asm = asm_for_with("macho_extern_def", AARCH64_DARWIN, src, &["-O2", "-w"]);
     for name in ["_y", "_x", "_s", "_t", "_t$tlv$init"] {

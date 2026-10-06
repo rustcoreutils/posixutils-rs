@@ -80,6 +80,16 @@ impl ConstBytes {
         ConstBytes { objects, read_only }
     }
 
+    /// Whether no object's bytes are known.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+    }
+
+    /// The bytes of the object named `name`, when every one is known.
+    pub(crate) fn object(&self, name: &str) -> Option<&[u8]> {
+        self.objects.get(name).map(Vec::as_slice)
+    }
+
     /// Whether the object named `name` is one whose contents never change,
     /// so that nothing the program may do writes to it.
     pub(crate) fn is_read_only(&self, name: &str) -> bool {

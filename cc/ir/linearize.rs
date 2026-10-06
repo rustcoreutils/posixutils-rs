@@ -46,6 +46,22 @@ enum ComplexHalf {
     Imag,
 }
 
+/// What an expression is computed for, when the linearizer asks whether it
+/// is pure: both forbid a write, a call and a `volatile` access, and differ
+/// on what may trap or raise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Evaluation {
+    /// Where the program would not have computed it -- a conditional's arm
+    /// lowered to a select -- so it must not trap or raise a floating-point
+    /// exception either.
+    Speculative,
+    /// Only to be asked about, after which the computation is dead and `dce`
+    /// deletes it unrun: the operand of a deferred `__builtin_constant_p`.
+    /// A load, a division or a floating operation that never runs cannot
+    /// trap.
+    Discarded,
+}
+
 /// One array extent of a variably-modified type.
 ///
 /// A variably-modified type can mix constant and run-time extents
@@ -2658,12 +2674,37 @@ impl<'a> Linearizer<'a> {
     /// it is pure, and converting it raises no floating-point exception --
     /// `c ? n : 0.0f` with a large `int n` is inexact where `c` is false.
     pub(crate) fn is_speculatable_arm(&self, arm: &Expr, result_typ: TypeId) -> bool {
-        self.is_pure_expr(arm) && !self.converting_raises_fp(arm, self.expr_type(arm), result_typ)
+        self.is_pure_arm(arm, result_typ, Evaluation::Speculative)
     }
 
-    /// Check if an expression is "pure": safe to evaluate where the program
-    /// would not have. Pure expressions can be speculatively evaluated,
-    /// enabling cmov/csel codegen.
+    /// [`Self::is_speculatable_arm`], for the evaluation `how`
+    /// ([`Evaluation`]): a discarded conversion raises nothing anyone sees.
+    fn is_pure_arm(&self, arm: &Expr, result_typ: TypeId, how: Evaluation) -> bool {
+        self.is_pure_expr(arm, how)
+            && !(how == Evaluation::Speculative
+                && self.converting_raises_fp(arm, self.expr_type(arm), result_typ))
+    }
+
+    /// Whether evaluating the lvalue `expr` reads a `volatile` object.
+    ///
+    /// `contains_volatile`, not the top-level qualifier: reading a struct
+    /// with a `volatile` member reads that member. The type of a member or
+    /// an element carries the object's qualifiers (C17 6.5.2.3p3), so this
+    /// covers a volatile member and a member of a volatile object alike.
+    fn reads_volatile(&self, expr: &Expr) -> bool {
+        expr.typ
+            .is_some_and(|typ| self.types.contains_volatile(typ))
+    }
+
+    /// Whether `expr` may be computed for the operand of a deferred
+    /// `__builtin_constant_p` ([`Evaluation::Discarded`]).
+    pub(crate) fn is_discardable(&self, expr: &Expr) -> bool {
+        self.is_pure_expr(expr, Evaluation::Discarded)
+    }
+
+    /// Check if an expression is "pure" for the evaluation `how`
+    /// ([`Evaluation`]). A speculatively pure expression is safe to evaluate
+    /// where the program would not have, enabling cmov/csel codegen.
     ///
     /// An expression is pure if it contains NO:
     /// - Function calls
@@ -2671,11 +2712,15 @@ impl<'a> Linearizer<'a> {
     /// - Pre/post increment/decrement (++, --)
     /// - Assignments (=, +=, -=, etc.)
     /// - Statement expressions (GNU extension with potential side effects)
+    ///
+    /// and, speculatively, NO:
+    /// - Operation that may trap: a division, a dereference, a subscript
     /// - Operation that can raise a floating-point exception ([`FpRaise`]):
     ///   c17 defines `__STDC_IEC_559__`, so the flags are something the
     ///   program observes, and `c ? a * b : 0` evaluated as a select reports
     ///   an overflow where `c` is false.
-    pub(crate) fn is_pure_expr(&self, expr: &Expr) -> bool {
+    fn is_pure_expr(&self, expr: &Expr, how: Evaluation) -> bool {
+        let speculative = how == Evaluation::Speculative;
         match &expr.kind {
             // Writes through its third argument.
             ExprKind::CheckedArith { .. } => false,
@@ -2683,7 +2728,7 @@ impl<'a> Linearizer<'a> {
             // effect, and re-reading it is what makes the extent stable.
             ExprKind::VmTypedefExtent(..) | ExprKind::VmObjectExtent(..) => true,
             ExprKind::VmTypeName { dims, expr, .. } => {
-                dims.iter().all(|d| self.is_pure_expr(d)) && self.is_pure_expr(expr)
+                dims.iter().all(|d| self.is_pure_expr(d, how)) && self.is_pure_expr(expr, how)
             }
             // A label's address is a constant of the function.
             ExprKind::LabelAddr(_) => true,
@@ -2705,14 +2750,7 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Utf32StringLit(_) => true,
 
             // Identifiers are pure unless volatile.
-            //
-            // `contains_volatile`, not the top-level modifier: reading a
-            // struct with a `volatile` member reads that member, and asking
-            // only what was written on the struct answered no.
-            ExprKind::Ident(_) => match expr.typ {
-                Some(typ) => !self.types.contains_volatile(typ),
-                None => true,
-            },
+            ExprKind::Ident(_) => !self.reads_volatile(expr),
 
             // __func__ is a pure string-like value
             ExprKind::FuncName => true,
@@ -2726,18 +2764,22 @@ impl<'a> Linearizer<'a> {
             ExprKind::Binary {
                 op, left, right, ..
             } => {
-                !matches!(op, BinaryOp::Div | BinaryOp::Mod)
-                    && !self.binary_raises_fp(expr, *op, left, right)
-                    && self.is_pure_expr(left)
-                    && self.is_pure_expr(right)
+                (!speculative
+                    || (!matches!(op, BinaryOp::Div | BinaryOp::Mod)
+                        && !self.binary_raises_fp(expr, *op, left, right)))
+                    && self.is_pure_expr(left, how)
+                    && self.is_pure_expr(right, how)
             }
 
             // Unary ops are pure if operand is pure, except for pre-inc/dec and dereference.
             // Dereference (*ptr) can cause UB/crash if the pointer is NULL or invalid,
             // so we must not eagerly evaluate it in conditional expressions.
+            // Discarded, a dereference is a read like any other.
             ExprKind::Unary { op, operand, .. } => match op {
-                UnaryOp::PreInc | UnaryOp::PreDec | UnaryOp::Deref => false,
-                _ => self.is_pure_expr(operand),
+                UnaryOp::PreInc | UnaryOp::PreDec => false,
+                UnaryOp::Deref if speculative => false,
+                UnaryOp::Deref => !self.reads_volatile(expr) && self.is_pure_expr(operand, how),
+                _ => self.is_pure_expr(operand, how),
             },
 
             // Post-increment/decrement have side effects
@@ -2751,9 +2793,9 @@ impl<'a> Linearizer<'a> {
                 else_expr,
             } => {
                 let typ = self.expr_type(expr);
-                self.is_pure_expr(cond)
-                    && self.is_speculatable_arm(then_expr, typ)
-                    && self.is_speculatable_arm(else_expr, typ)
+                self.is_pure_expr(cond, how)
+                    && self.is_pure_arm(then_expr, typ, how)
+                    && self.is_pure_arm(else_expr, typ, how)
             }
 
             // `a ?: b` evaluates `a` once and `b` only when `a` is false, so
@@ -2761,7 +2803,8 @@ impl<'a> Linearizer<'a> {
             // the program takes where it is nonzero, and converting a zero
             // is exact.
             ExprKind::CondElvis { cond, else_expr } => {
-                self.is_pure_expr(cond) && self.is_speculatable_arm(else_expr, self.expr_type(expr))
+                self.is_pure_expr(cond, how)
+                    && self.is_pure_arm(else_expr, self.expr_type(expr), how)
             }
 
             // Function calls are never pure (may have side effects)
@@ -2773,34 +2816,39 @@ impl<'a> Linearizer<'a> {
             // volatile read an observable event, so speculating one is a read
             // the program never asked for: asking about the base alone let
             // `c ? s.status : s.other` load both members unconditionally into
-            // a branchless select, at `-O0` too. The member's type carries the
-            // object's qualifiers (C17 6.5.2.3p3), so this covers a volatile
-            // member and a member of a volatile object alike.
+            // a branchless select, at `-O0` too.
             ExprKind::Member { expr: base, .. } => {
-                !expr
-                    .typ
-                    .is_some_and(|typ| self.types.contains_volatile(typ))
-                    && self.is_pure_expr(base)
+                !self.reads_volatile(expr) && self.is_pure_expr(base, how)
             }
 
             // Arrow access (ptr->member) can cause UB/crash if ptr is NULL,
             // so we must not eagerly evaluate it in conditional expressions.
-            ExprKind::Arrow { .. } => false,
+            // Discarded, it is a read like any other.
+            ExprKind::Arrow { expr: base, .. } => {
+                !speculative && !self.reads_volatile(expr) && self.is_pure_expr(base, how)
+            }
 
             // Array indexing can cause UB/crash if the pointer is invalid,
             // so we must not eagerly evaluate it in conditional expressions.
-            ExprKind::Index { .. } => false,
+            // Discarded, it is a read like any other.
+            ExprKind::Index { array, index } => {
+                !speculative
+                    && !self.reads_volatile(expr)
+                    && self.is_pure_expr(array, how)
+                    && self.is_pure_expr(index, how)
+            }
 
             // Casts are pure if the operand is pure and the conversion
             // raises nothing: `(float)d` can overflow, `(int)d` is invalid
             // for a NaN.
             ExprKind::Cast { expr: inner, .. } => {
-                self.is_pure_expr(inner)
-                    && !self.converting_raises_fp(
-                        inner,
-                        self.expr_type(inner),
-                        self.expr_type(expr),
-                    )
+                self.is_pure_expr(inner, how)
+                    && !(speculative
+                        && self.converting_raises_fp(
+                            inner,
+                            self.expr_type(inner),
+                            self.expr_type(expr),
+                        ))
             }
 
             // Assignments have side effects
@@ -2814,18 +2862,18 @@ impl<'a> Linearizer<'a> {
             // false, against 6.5.15p4.
             ExprKind::SizeofType(typ, dims) => {
                 !crate::parse::ast::sizeof_type_is_runtime(self.types, *typ, dims)
-                    || dims.iter().all(|d| self.is_pure_expr(d))
+                    || dims.iter().all(|d| self.is_pure_expr(d, how))
             }
 
             // `sizeof` evaluates a variably modified operand (6.5.3.4p2);
             // the other two never evaluate anything.
             ExprKind::SizeofExpr(inner) => {
-                !self.sizeof_evaluates(inner) || self.is_pure_expr(inner)
+                !self.sizeof_evaluates(inner) || self.is_pure_expr(inner, how)
             }
             ExprKind::AlignofType(_) | ExprKind::AlignofExpr(_) => true,
 
             // Comma expressions: pure if all sub-expressions are pure
-            ExprKind::Comma(exprs) => exprs.iter().all(|e| self.is_pure_expr(e)),
+            ExprKind::Comma(exprs) => exprs.iter().all(|e| self.is_pure_expr(e, how)),
 
             // Compound literals may have side effects in initializers
             ExprKind::CompoundLiteral { .. } => false,
@@ -2861,27 +2909,27 @@ impl<'a> Linearizer<'a> {
             | ExprKind::Popcount { arg }
             | ExprKind::Popcountl { arg }
             | ExprKind::Popcountll { arg }
-            | ExprKind::FpTest { arg, .. } => self.is_pure_expr(arg),
+            | ExprKind::FpTest { arg, .. } => self.is_pure_expr(arg, how),
 
             ExprKind::InlineLibraryCall {
                 func, args, name, ..
             } => {
                 !func.has_side_effects()
-                    && !self.library_call_raises_fp(*func)
+                    && !(speculative && self.library_call_raises_fp(*func))
                     && !func.is_displaced(*name, &self.defined_functions)
-                    && args.iter().all(|a| self.is_pure_expr(a))
+                    && args.iter().all(|a| self.is_pure_expr(a, how))
             }
 
             // Pure iff both operands are: the relation itself reads nothing
             // else and raises nothing, which is the point of the family.
             ExprKind::FpCompare { lhs, rhs, .. } => {
-                self.is_pure_expr(lhs) && self.is_pure_expr(rhs)
+                self.is_pure_expr(lhs, how) && self.is_pure_expr(rhs, how)
             }
 
             // Pure iff everything it reads is: the class codes are ordinary
             // expressions, not constants, so they count too.
             ExprKind::FpClassify { classes, arg } => {
-                self.is_pure_expr(arg) && classes.iter().all(|c| self.is_pure_expr(c))
+                self.is_pure_expr(arg, how) && classes.iter().all(|c| self.is_pure_expr(c, how))
             }
 
             // Alloca allocates memory - not pure
@@ -6876,14 +6924,18 @@ impl<'a> Linearizer<'a> {
             // `__builtin_constant_p`, for an operand the parser could not
             // fold. gcc answers it after optimization, so it is deferred to
             // `sccp` -- and to `ir::lower`, which answers 0 for whatever is
-            // left, including everything at `-O0`.
+            // left. Only an optimizing compile defers: at `-O0` the parser
+            // has answered already.
             //
             // The builtin does not evaluate its argument, so an operand with
-            // side effects is answered 0 outright rather than linearized. A
-            // pure one costs nothing: its computation is dead once the
-            // placeholder folds, and `dce` collects it.
+            // side effects is answered 0 outright rather than linearized, as
+            // gcc does. One without costs nothing: its computation is dead
+            // once `sccp` answers the placeholder, and `dce` collects it
+            // unrun -- which is why a read that may trap, a division or a
+            // floating operation is no objection ([`Evaluation::Discarded`]),
+            // and why `"hi"[0]` is 1.
             ExprKind::ConstantP(inner) => {
-                if !self.is_pure_expr(inner) {
+                if !self.is_discardable(inner) {
                     return self.emit_const(0, self.types.int_id);
                 }
                 let operand = self.linearize_expr(inner);

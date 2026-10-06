@@ -38,6 +38,8 @@ mod vector_builtin;
 mod vector_check;
 
 #[cfg(test)]
+mod test_constant_p;
+#[cfg(test)]
 mod test_declarations;
 #[cfg(test)]
 mod test_expr_constraints;

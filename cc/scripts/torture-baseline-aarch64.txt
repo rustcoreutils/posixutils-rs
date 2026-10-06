@@ -5513,6 +5513,8 @@ aarch64/execute/ashldi-1@-O0
 aarch64/execute/ashldi-1@-O2
 aarch64/execute/ashrdi-1@-O0
 aarch64/execute/ashrdi-1@-O2
+aarch64/execute/bcp-1@-O0
+aarch64/execute/bcp-1@-O2
 aarch64/execute/bf64-1@-O0
 aarch64/execute/bf64-1@-O2
 aarch64/execute/bf-layout-1@-O0

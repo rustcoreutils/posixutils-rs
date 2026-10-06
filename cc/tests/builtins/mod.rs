@@ -19,6 +19,7 @@
 mod argument_checks;
 mod bit_ops;
 mod call_semantics;
+mod constant_p;
 mod copy_fold;
 mod frame_address;
 mod gcc_lowering;

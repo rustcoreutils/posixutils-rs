@@ -57,7 +57,7 @@ pub(super) fn parse_expr_for(
     parse_expr_on(input, &[], Default::default(), target)
 }
 
-fn parse_expr_on(
+pub(super) fn parse_expr_on(
     input: &str,
     vars: &[&str],
     policy: super::LibraryCallPolicy,

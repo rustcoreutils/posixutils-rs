@@ -5520,6 +5520,8 @@ execute/ashldi-1@-O0
 execute/ashldi-1@-O2
 execute/ashrdi-1@-O0
 execute/ashrdi-1@-O2
+execute/bcp-1@-O0
+execute/bcp-1@-O2
 execute/bf64-1@-O0
 execute/bf64-1@-O2
 execute/bf-layout-1@-O0

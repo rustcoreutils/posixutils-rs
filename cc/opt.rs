@@ -27,7 +27,6 @@ use crate::ir::mem2reg::mem2reg;
 use crate::ir::memexpand;
 use crate::ir::memloc;
 use crate::ir::sccp;
-use crate::ir::strdata::ConstBytes;
 use crate::ir::vrp;
 use crate::ir::{Function, Module, Opcode};
 use crate::target::Target;
@@ -225,7 +224,7 @@ const PASSES: [Pass; 12] = [
 /// emits, so it should see the code that will be emitted -- not branches
 /// SCCP is about to delete or copies `copyprop` is about to forward.
 const BEFORE_INLINING: [fn(&mut Function, &TypeTable) -> bool; 5] = [
-    |f, _| sccp::run(f),
+    |f, _| sccp::run_before_inlining(f),
     instcombine::run,
     copyprop::run,
     |f, _| dce::run(f),
@@ -584,14 +583,13 @@ fn optimize_functions(
     // graph and the set of globals are final.
     let known = constglobal::KnownGlobals::collect(module, types);
     let mi = memloc::ModuleInfo::build(module, types);
-    let bytes = ConstBytes::build(module, types);
     let (functions, strings, callees) = module.split_for_rewrite();
     let literals = libcall_fold::NewLiterals::new(strings);
     let fold = libcall_fold::FoldCtx {
         types,
         target,
         mi: &mi,
-        bytes: &bytes,
+        bytes: known.bytes(),
         callees,
         literals: &literals,
     };

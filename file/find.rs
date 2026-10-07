@@ -377,11 +377,23 @@ fn parse_expression(args: &[&str]) -> Result<Expr, String> {
     parse_or_expr(&tokens, &mut idx)
 }
 
+/// Is `tok` the OR operator? `-or` is GNU's spelling of `-o`, forced by
+/// debhelper (dh_install, dh_installdocs, dh_shlibdeps, `-X` exclusions).
+fn is_or(tok: &str) -> bool {
+    tok == "-o" || tok == "-or"
+}
+
+/// Is `tok` the AND operator? `-and` is GNU's spelling of `-a`, forced by
+/// debhelper (dh_install, dh_installdocs, dh_installexamples).
+fn is_and(tok: &str) -> bool {
+    tok == "-a" || tok == "-and"
+}
+
 /// Parse OR expression (lowest precedence)
 fn parse_or_expr(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
     let mut left = parse_and_expr(tokens, idx)?;
 
-    while *idx < tokens.len() && tokens[*idx] == "-o" {
+    while *idx < tokens.len() && is_or(tokens[*idx]) {
         *idx += 1;
         let right = parse_and_expr(tokens, idx)?;
         left = Expr::Or(Box::new(left), Box::new(right));
@@ -396,14 +408,14 @@ fn parse_and_expr(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
 
     while *idx < tokens.len() {
         let tok = tokens[*idx];
-        if tok == "-o" || tok == ")" {
+        if is_or(tok) || tok == ")" {
             break;
         }
-        if tok == "-a" {
+        if is_and(tok) {
             *idx += 1;
         }
         // Implicit AND by juxtaposition
-        if *idx >= tokens.len() || tokens[*idx] == "-o" || tokens[*idx] == ")" {
+        if *idx >= tokens.len() || is_or(tokens[*idx]) || tokens[*idx] == ")" {
             break;
         }
         let right = parse_unary_expr(tokens, idx)?;

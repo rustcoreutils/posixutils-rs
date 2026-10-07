@@ -515,3 +515,34 @@ fn find_regex_unsupported_is_an_error() {
         1,
     );
 }
+
+/// `-or` and `-and`, GNU spellings of `-o` and `-a` with the same
+/// precedence: dh_install, dh_installdocs, dh_shlibdeps and the `-X`
+/// exclusions (`-regex .*X.* -or -regex .*Y.*`).
+#[test]
+fn find_or_and_spellings() {
+    let dir = make_pkg_tree("or_and");
+    expect_words(
+        &dir,
+        "( -type f -or -type l ) -and -name *e*",
+        &["./exe", "./doc/pkg/examples/ex.txt", "./doc/pkg/Notes.HTML"],
+    );
+    // `-and` binds tighter than `-or`.
+    expect_words(
+        &dir,
+        "-name e* -and -type d -or -name plain",
+        &["./emptydir", "./doc/pkg/examples", "./plain"],
+    );
+    expect_words(
+        &dir,
+        r"! ( -regex .*\.HTML.* -or -regex .*xampl.* ) -and -path ./doc*",
+        &["./doc", "./doc/pkg", "./doc/pkg/README"],
+    );
+    run_test_find(
+        &[".", "-name", "x", "-or"],
+        "",
+        "find: unexpected end of expression\n",
+        1,
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}

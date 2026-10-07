@@ -427,9 +427,26 @@ impl<'a> Entry<'a> {
     }
 
     /// Check if this `Entry` is an empty directory.
+    ///
+    /// The directory is opened through the containing directory's descriptor with the same
+    /// hardening as a descent: `O_DIRECTORY`, `O_NOFOLLOW` unless this entry is a symbolic link the
+    /// walk followed, and a check that the opened directory is the one the walk stat'ed. An entry
+    /// swapped for a symbolic link or for another directory since then is an error rather than
+    /// an answer about some other directory.
     pub fn is_empty_dir(&self) -> io::Result<bool> {
-        let file_descriptor =
-            FileDescriptor::open_at(self.dir_file_descriptor, self.file_name(), libc::O_RDONLY)?;
+        let followed = self.is_symlink == Some(true)
+            && self.metadata.as_ref().is_some_and(|md| !md.is_symlink());
+        let nofollow = if followed { 0 } else { libc::O_NOFOLLOW };
+        let file_descriptor = FileDescriptor::open_at(
+            self.dir_file_descriptor,
+            self.file_name(),
+            libc::O_RDONLY | libc::O_DIRECTORY | nofollow,
+        )?;
+        if let Some(md) = &self.metadata {
+            if !fd_matches(&file_descriptor, md.0.st_dev, md.0.st_ino) {
+                return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+            }
+        }
         match OwnedDir::new(file_descriptor) {
             Ok(dir) => {
                 let mut num_entries = 0;
@@ -1096,20 +1113,11 @@ where
                                         // very file we stat'd. A concurrent swap to a different
                                         // directory passes `O_NOFOLLOW`/`O_DIRECTORY` but changes
                                         // (dev, ino), so the walk would otherwise be redirected.
-                                        let verified = {
-                                            let mut sb = MaybeUninit::<libc::stat>::uninit();
-                                            let r = unsafe {
-                                                libc::fstat(
-                                                    new_dir.file_descriptor().as_raw_fd(),
-                                                    sb.as_mut_ptr(),
-                                                )
-                                            };
-                                            r == 0 && {
-                                                let sb = unsafe { sb.assume_init() };
-                                                sb.st_dev == want_dev && sb.st_ino == want_ino
-                                            }
-                                        };
-                                        if !verified {
+                                        if !fd_matches(
+                                            new_dir.file_descriptor(),
+                                            want_dev,
+                                            want_ino,
+                                        ) {
                                             refuse_descent!(
                                                 entry,
                                                 Error::new(
@@ -1240,6 +1248,18 @@ where
     }
 
     success
+}
+
+/// Whether the open descriptor `fd` refers to the file identified by `(dev, ino)`, the identity a
+/// walk recorded when it stat'ed the entry. This is the post-open re-verification that turns a
+/// concurrent swap of the entry for a different file into a refusal instead of a redirection.
+fn fd_matches(fd: &FileDescriptor, dev: libc::dev_t, ino: libc::ino_t) -> bool {
+    let mut sb = MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd.as_raw_fd(), sb.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let sb = unsafe { sb.assume_init() };
+    sb.st_dev == dev && sb.st_ino == ino
 }
 
 fn cstring_to_rc(filename: &CStr) -> Rc<[libc::c_char]> {

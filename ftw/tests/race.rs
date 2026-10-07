@@ -18,6 +18,7 @@
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fs;
+use std::io;
 use std::os::unix;
 use std::path::Path;
 
@@ -174,6 +175,107 @@ fn descent_refuses_dir_swapped_for_other_dir() {
     assert!(
         *errors.borrow() > 0,
         "the dev/ino mismatch must report an error"
+    );
+}
+
+/// Ask `Entry::is_empty_dir` about `swapme` after the handler has replaced it with whatever
+/// `swap` puts there. Returns the answer.
+fn is_empty_dir_after_swap(tag: &str, swap: impl Fn(&Path, &Path)) -> io::Result<bool> {
+    let tmp = plib::tmp::Builder::new()
+        .prefix(tag)
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let base = tmp.path();
+    let root = base.join("root");
+    let outside = base.join("outside");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::create_dir(root.join("swapme")).unwrap();
+
+    let mut answer = None;
+    traverse_directory(
+        &root,
+        |entry| {
+            if basename(&entry) == "swapme" {
+                swap(&root.join("swapme"), &outside);
+                answer = Some(entry.is_empty_dir());
+                return Ok(false);
+            }
+            Ok(true)
+        },
+        |_entry, _exit| Ok(()),
+        |_entry, _err| {},
+        TraverseDirectoryOpts::default(),
+    );
+    answer.expect("the walk never reached swapme")
+}
+
+/// `is_empty_dir` opens the entry it was handed. An empty directory swapped for a symlink to an
+/// (also empty) directory outside the tree must not be followed: `find -empty -delete` would
+/// otherwise act on what the link points to.
+#[test]
+fn is_empty_dir_refuses_dir_swapped_for_symlink() {
+    let answer = is_empty_dir_after_swap("ftw_race_empty_symlink", |swapme, outside| {
+        fs::remove_dir(swapme).unwrap();
+        unix::fs::symlink(outside, swapme).unwrap();
+    });
+    assert!(
+        answer.is_err(),
+        "is_empty_dir followed a symlink swapped in for the directory: {answer:?}"
+    );
+}
+
+/// The same for a swap to a different real directory, which only the `(dev, ino)` check catches.
+#[test]
+fn is_empty_dir_refuses_dir_swapped_for_other_dir() {
+    let answer = is_empty_dir_after_swap("ftw_race_empty_other", |swapme, outside| {
+        fs::remove_dir(swapme).unwrap();
+        fs::rename(outside, swapme).unwrap();
+    });
+    assert!(
+        answer.is_err(),
+        "is_empty_dir read a directory whose (dev, ino) changed under it: {answer:?}"
+    );
+}
+
+/// `is_empty_dir` on a symbolic link the walk followed reads the directory it points to.
+#[test]
+fn is_empty_dir_reads_a_followed_symlink() {
+    let tmp = plib::tmp::Builder::new()
+        .prefix("ftw_empty_followed")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let root = tmp.path().join("root");
+    fs::create_dir_all(root.join("empty")).unwrap();
+    fs::create_dir_all(root.join("full/x")).unwrap();
+    unix::fs::symlink("empty", root.join("to_empty")).unwrap();
+    unix::fs::symlink("full", root.join("to_full")).unwrap();
+
+    let mut answers = Vec::new();
+    traverse_directory(
+        &root,
+        |entry| {
+            let name = basename(&entry);
+            if name.starts_with("to_") {
+                answers.push((name, entry.is_empty_dir().unwrap()));
+                return Ok(false);
+            }
+            Ok(true)
+        },
+        |_entry, _exit| Ok(()),
+        |entry, err| panic!("unexpected error on {}: {:?}", entry.path(), err.kind()),
+        TraverseDirectoryOpts {
+            follow_symlinks: true,
+            ..Default::default()
+        },
+    );
+    answers.sort();
+    assert_eq!(
+        answers,
+        [
+            ("to_empty".to_string(), true),
+            ("to_full".to_string(), false)
+        ]
     );
 }
 

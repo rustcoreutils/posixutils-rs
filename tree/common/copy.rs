@@ -1769,8 +1769,9 @@ fn copy_special_file(
     // 4.b. A FIFO takes the source's permission bits (POSIX 90683-90685), all twelve of them:
     // unlike a regular file a set-user-ID FIFO is inert, and GNU reproduces the bit too. For the
     // other special types the permissions are implementation-defined, so keep only the ordinary
-    // nine. `mknodat` applies the umask, and `-p` restores the exact bits afterwards through
-    // `copy_characteristics`.
+    // nine. `mknodat` applies the umask, and `-p` sets the exact bits afterwards through
+    // `preserve_made`, which checks and pins the node first (`preserve_made_node`) and clears
+    // set-user-ID and set-group-ID if the owner could not be duplicated.
     let perm = source_md.mode() & if is_fifo { 0o7777 } else { 0o777 };
 
     // 4.a: "The dest_file shall be created with the same file type as source_file." Passing no

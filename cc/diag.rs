@@ -492,6 +492,23 @@ pub fn permissive() -> bool {
     PERMISSIVE.get()
 }
 
+/// Is a pre-C99 construct in the warning group `group` -- `implicit-int` or
+/// `implicit-function-declaration` -- accepted? It is an error by default,
+/// as in gcc 14; `-fpermissive` accepts it with a warning, and
+/// `-Wno-<group>` accepts it in silence. If accepted, give the diagnostic
+/// that remains via [`permerror_warning`].
+pub fn permerror_accepted(group: &str) -> bool {
+    permissive() || !warning_group_enabled(group)
+}
+
+/// The warning an accepted [`permerror_accepted`] construct still draws:
+/// none once `-Wno-<group>` has turned the group off.
+pub fn permerror_warning(group: &str, pos: Position, msg: &str) {
+    if warning_group_enabled(group) {
+        give_pedwarn(Some(group), pos, msg);
+    }
+}
+
 /// A constraint violation gcc lets through with only a warning: an error
 /// here, and a warning under `-fpermissive`, which is where c17 keeps that
 /// leniency.

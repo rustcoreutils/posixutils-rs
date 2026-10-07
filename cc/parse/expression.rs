@@ -20,7 +20,7 @@ use crate::symbol::{Namespace, Symbol};
 use crate::token::lexer::{Position, SpecialToken, TokenType, TokenValue};
 use crate::token::literal;
 use crate::types::{ArrayExtent, FloatClass, Type, TypeId, TypeKind, TypeModifiers};
-use gettextrs::gettext;
+use gettextrs::{gettext, gettext_args};
 
 const DEFAULT_ARG_LIST_CAPACITY: usize = 8;
 const DEFAULT_INIT_CAPACITY: usize = 8;
@@ -2682,8 +2682,11 @@ impl<'a> Parser<'a> {
                     if let Some(symbol_id) = self.symbols.lookup_id(name_id, Namespace::Ordinary) {
                         let typ = self.symbols.get(symbol_id).typ;
                         Ok(Self::typed_expr(ExprKind::Ident(symbol_id), typ, token_pos))
-                    } else if diag::permissive() && self.is_special(b'(') {
-                        // `-fpermissive`: C89 6.3.2.2 let a call to an
+                    } else if self.is_special(b'(')
+                        && diag::permerror_accepted("implicit-function-declaration")
+                    {
+                        // `-fpermissive` or `-Wno-implicit-function-declaration`,
+                        // as gcc 14 has them: C89 6.3.2.2 let a call to an
                         // undeclared function declare it implicitly as
                         // `extern int f();` -- unprototyped, so no argument is
                         // checked or converted. C99 6.5.1p2 removed the rule.
@@ -2694,10 +2697,10 @@ impl<'a> Parser<'a> {
                         // keeps a misspelled variable from silently becoming a
                         // function.
                         let name_str = self.idents.get_opt(name_id).unwrap_or("").to_string();
-                        diag::pedwarn_default_args(
+                        diag::permerror_warning(
+                            "implicit-function-declaration",
                             token_pos,
-                            "implicit declaration of function '{0}'",
-                            &[&name_str],
+                            &gettext_args("implicit declaration of function '{0}'", &[&name_str]),
                         );
                         // A name c17 knows as a library builtin gets that
                         // builtin's return type, not `int`. gcc does the same,

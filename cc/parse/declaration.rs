@@ -1951,12 +1951,13 @@ impl Parser<'_> {
     /// where a type is genuinely required.
     pub(super) fn check_implicit_int(&self, explicit: bool, pos: Position) {
         if !explicit {
-            // `-fpermissive` downgrades this to a warning. The recovery below
-            // is the same either way -- the type defaults to `int` -- so the
-            // flag changes only whether the translation unit is rejected.
+            // `-fpermissive` downgrades this to a warning, and
+            // `-Wno-implicit-int` silences it. The recovery below is the same
+            // either way -- the type defaults to `int` -- so the flags change
+            // only whether the translation unit is rejected.
             let msg = gettext("type specifier missing; implicit 'int' was removed in C99");
-            if diag::permissive() {
-                diag::pedwarn_default(pos, &msg);
+            if diag::permerror_accepted("implicit-int") {
+                diag::permerror_warning("implicit-int", pos, &msg);
             } else {
                 diag::error(pos, &msg);
             }

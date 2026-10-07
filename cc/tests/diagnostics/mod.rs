@@ -907,6 +907,61 @@ fn diagnostics_fpermissive_allows_implicit_function_declaration() {
     );
 }
 
+/// `-Wno-implicit-int` and `-Wno-implicit-function-declaration` each accept
+/// their one construct, in silence, as gcc 14 does: there the two are errors
+/// by default that `-fpermissive` makes warnings and the `-Wno-` spelling
+/// turns off. Debian's readline passes both to build rlfe, whose configure
+/// probes the compiler with `main(){exit(0);}` and stops at "Can't run the
+/// compiler" when it does not compile.
+#[test]
+fn diagnostics_wno_implicit_accepts_its_own_construct() {
+    let probe = "main(){exit(0);}\n";
+    let both = ["-Wno-implicit-int", "-Wno-implicit-function-declaration"];
+    let run = compile_with("wno_implicit_both", probe, &both);
+    assert!(run.success, "{}", run.stderr);
+    assert!(run.stderr.is_empty(), "{}", run.stderr);
+
+    // Each turns off its own construct and nothing else.
+    let run = compile_with("wno_implicit_int_only", probe, &["-Wno-implicit-int"]);
+    assert!(
+        !run.success,
+        "implicit declaration accepted:\n{}",
+        run.stderr
+    );
+    assert!(!run.stderr.contains("type specifier"), "{}", run.stderr);
+    let run = compile_with(
+        "wno_implicit_fn_only",
+        probe,
+        &["-Wno-implicit-function-declaration"],
+    );
+    assert!(!run.success, "implicit int accepted:\n{}", run.stderr);
+    assert!(
+        run.stderr.contains("type specifier missing"),
+        "{}",
+        run.stderr
+    );
+
+    // In command-line order: a later `-W<name>` turns the error back on.
+    let run = compile_with(
+        "wno_implicit_reenabled",
+        "static counter;\n",
+        &["-Wno-implicit-int", "-Wimplicit-int"],
+    );
+    assert!(!run.success, "{}", run.stderr);
+
+    // A bare undeclared name is still no function.
+    let run = compile_with(
+        "wno_implicit_bare_name",
+        "int main(void){ return mispelled_var; }\n",
+        &both,
+    );
+    assert!(
+        !run.success && run.stderr.contains("undeclared identifier"),
+        "{}",
+        run.stderr
+    );
+}
+
 /// The implicit declaration is for a *call*. A bare undeclared identifier was
 /// never implicitly declared by any C standard, and must stay an error even
 /// under `-fpermissive` -- otherwise a misspelled variable silently becomes a

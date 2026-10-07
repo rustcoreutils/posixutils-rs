@@ -775,3 +775,29 @@ fn test_enumerator_attributes() {
     assert_eq!(value("C"), Some(6));
     assert_eq!(value("D"), Some(0));
 }
+
+/// `-Wno-implicit-int` and `-Wno-implicit-function-declaration` each accept
+/// their own pre-C99 construct without a word, as gcc 14 does, and nothing
+/// else.
+#[test]
+fn test_wno_implicit_accepts_its_own_construct() {
+    let implicit_int = "static counter; f(void) { return counter; }";
+    let implicit_call = "int g(void) { return h(1); }";
+    let bare_name = "int k(void) { return nowhere; }";
+
+    crate::diag::set_warning_options(&["no-implicit-int"]);
+    assert_clean(implicit_int);
+    assert_rejected(implicit_call);
+
+    crate::diag::set_warning_options(&["no-implicit-function-declaration"]);
+    assert_clean(implicit_call);
+    assert_rejected(implicit_int);
+    assert_rejected(bare_name);
+
+    crate::diag::set_warning_options(&["no-implicit-int", "implicit-int"]);
+    assert_rejected(implicit_int);
+
+    crate::diag::set_warning_options(&[]);
+    assert_rejected(implicit_int);
+    assert_rejected(implicit_call);
+}

@@ -8,6 +8,7 @@
 //
 
 mod debhelper;
+mod race;
 
 use plib::testing::{run_test, TestPlan};
 use std::ffi::CString;

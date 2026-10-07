@@ -314,7 +314,12 @@ where
                 libc::O_NOFOLLOW
             };
 
-        let create_target_then_copy = || -> io::Result<()> {
+        // -n creates exclusively: a destination that appears after the existence check below is
+        // left alone (EEXIST is a skip), and O_EXCL also refuses to create through a symbolic
+        // link. Returns whether the copy was made.
+        let create_flags =
+            libc::O_WRONLY | libc::O_CREAT | if cfg.no_clobber { libc::O_EXCL } else { 0 };
+        let create_target_then_copy = || -> io::Result<bool> {
             let source_fd = unsafe {
                 libc::openat(
                     source.dir_fd(),
@@ -339,16 +344,13 @@ where
             // run it. GNU masks the same way, and -p restores them later through
             // `copy_characteristics`, which clears them if the ownership could not be duplicated.
             let create_mode = source_md.mode() & if cfg.preserve { 0o7777 } else { 0o777 };
-            let target_fd = unsafe {
-                libc::openat(
-                    target_dirfd,
-                    target_filename,
-                    libc::O_WRONLY | libc::O_CREAT,
-                    create_mode,
-                )
-            };
+            let target_fd =
+                unsafe { libc::openat(target_dirfd, target_filename, create_flags, create_mode) };
             if target_fd == -1 {
                 let e = io::Error::last_os_error();
+                if cfg.no_clobber && e.raw_os_error() == Some(libc::EEXIST) {
+                    return Ok(false);
+                }
 
                 // `ErrorKind::IsADirectory` is unstable:
                 // https://github.com/rust-lang/rust/issues/86442
@@ -371,7 +373,7 @@ where
             // 3.d
             io::copy(&mut source_file, &mut target_file)?;
 
-            Ok(())
+            Ok(true)
         };
 
         // -n: any existing destination, a dangling link included, is left alone.
@@ -474,6 +476,10 @@ where
                 unsafe { libc::symlinkat(link_target.as_ptr(), target_dirfd, target_filename) };
             if ret != 0 {
                 let e = io::Error::last_os_error();
+                // -n: a destination that appeared since the existence check is left alone.
+                if cfg.no_clobber && e.raw_os_error() == Some(libc::EEXIST) {
+                    return Ok(CopyResult::Skipped);
+                }
                 return Err(io::Error::other(gettext!(
                     "cannot create symbolic link '{}': {}",
                     target.display(),
@@ -537,7 +543,9 @@ where
                     }
 
                     // 3.b
-                    create_target_then_copy()?;
+                    if !create_target_then_copy()? {
+                        return Ok(CopyResult::Skipped);
+                    }
                 } else {
                     // The open that failed was for writing, and without -f there is no
                     // second attempt. Same wording as GNU cp.
@@ -552,8 +560,8 @@ where
             }
 
         // 3.b
-        } else {
-            create_target_then_copy()?;
+        } else if !create_target_then_copy()? {
+            return Ok(CopyResult::Skipped);
         }
 
         state.created_files.insert(target.to_path_buf());

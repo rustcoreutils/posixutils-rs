@@ -41,6 +41,10 @@ pub struct PatchApplier<'a> {
     /// under -l), kept in step with it, so locating a hunk costs one pass
     /// over the file rather than one comparison per file line per hunk line.
     line_hashes: Vec<u64>,
+    /// Prefix hashes of `line_hashes` ([`Self::prefix_hashes`]), built when a
+    /// search first needs them and dropped when the file changes, so hunks
+    /// that are rejected one after another share one.
+    prefix: Option<Vec<u64>>,
     hasher: RandomState,
     offset: i64,
     /// Whether the resulting file's last line currently has no trailing newline.
@@ -67,6 +71,7 @@ impl<'a> PatchApplier<'a> {
             config,
             file_lines,
             line_hashes,
+            prefix: None,
             hasher,
             offset: 0,
             eof_no_newline: !orig_trailing_newline,
@@ -325,7 +330,6 @@ impl<'a> PatchApplier<'a> {
             .unwrap_or(usize::MAX)
             .min(self.file_lines.len());
 
-        let prefix = self.prefix_hashes();
         let max_fuzz = self
             .config
             .max_fuzz
@@ -338,7 +342,7 @@ impl<'a> PatchApplier<'a> {
                 hunk.fuzz_window(fuzz)
             };
             let Some(window) = window else { continue };
-            if let Some(pos) = self.locate_hunk(&window, expected, &prefix) {
+            if let Some(pos) = self.locate_hunk(&window, expected) {
                 self.apply_window(hunk, &window, pos);
                 // The lines the hunk really carries, not its header's counts,
                 // which nothing has checked.
@@ -375,11 +379,11 @@ impl<'a> PatchApplier<'a> {
     /// lines before the text that was actually verified.
     ///
     /// `expected` is at most the file's length, so each direction runs off
-    /// the file within that many steps. A position is compared line by line
-    /// only when the window's hash matches the file's there (`prefix`, from
-    /// [`Self::prefix_hashes`]), so the whole search is linear in the file
-    /// and the window, whatever the file repeats.
-    fn locate_hunk(&self, window: &MatchWindow, expected: usize, prefix: &[u64]) -> Option<usize> {
+    /// the file within that many steps. Past `expected` itself, a position is
+    /// compared line by line only when the window's hash matches the file's
+    /// there (from the cached prefix hashes), so the whole search is linear
+    /// in the file and the window, whatever the file repeats.
+    fn locate_hunk(&mut self, window: &MatchWindow, expected: usize) -> Option<usize> {
         let old_lines = window.old_lines();
         let skip = window.lead_skip;
         let len = old_lines.len();
@@ -388,7 +392,14 @@ impl<'a> PatchApplier<'a> {
         }
         // Furthest hunk start at which the window still fits inside the file.
         let last_start = self.file_lines.len() - (len + skip);
+        if expected <= last_start && self.lines_match_at(&old_lines, expected + skip) {
+            return Some(expected);
+        }
 
+        if self.prefix.is_none() {
+            self.prefix = Some(self.prefix_hashes());
+        }
+        let prefix = self.prefix.as_deref().unwrap_or_default();
         let want = old_lines.iter().fold(0u64, |h, l| {
             h.wrapping_mul(HASH_BASE)
                 .wrapping_add(line_hash(&self.hasher, self.config, l))
@@ -401,7 +412,7 @@ impl<'a> PatchApplier<'a> {
         };
 
         let reach = expected.max(last_start.saturating_sub(expected));
-        for delta in 0..=reach {
+        for delta in 1..=reach {
             if expected + delta <= last_start && matches(expected + delta) {
                 return Some(expected + delta);
             }
@@ -478,6 +489,7 @@ impl<'a> PatchApplier<'a> {
             .map(|l| line_hash(&self.hasher, self.config, l))
             .collect();
         self.line_hashes.splice(at..remove_end, hashes);
+        self.prefix = None;
         self.file_lines.splice(at..remove_end, replacement);
         if write_end == self.file_lines.len() {
             self.eof_no_newline = no_newline;

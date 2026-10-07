@@ -156,3 +156,30 @@ fn test_patch_repetitive_file_no_match_is_linear() {
     }
     cleanup_test_dir(&dir);
 }
+
+// Many hunks that each apply where they say: no hunk pays for a search of
+// the whole file.
+#[test]
+fn test_patch_many_hunks_in_place() {
+    let dir = setup_test_dir("bounds_many_hunks");
+    let n = 200_000;
+    let file = lines(n, |i| format!("line {}", i));
+    let mut patch = String::from("--- f.txt\n+++ f.txt\n");
+    for i in (1..n - 1).step_by(5) {
+        patch.push_str(&format!(
+            "@@ -{},3 +{},3 @@\n line {}\n-line {}\n+LINE {}\n line {}\n",
+            i,
+            i,
+            i - 1,
+            i,
+            i,
+            i + 1
+        ));
+    }
+    let (code, took) = timed(&dir, &file, &patch, &["-F", "0"]);
+    assert_eq!(code, 0);
+    assert!(took < LIMIT, "took {:?}", took);
+    let out = fs::read_to_string(dir.join("f.txt")).unwrap();
+    assert!(out.starts_with("line 0\nLINE 1\nline 2\n"));
+    cleanup_test_dir(&dir);
+}

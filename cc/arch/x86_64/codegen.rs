@@ -1387,7 +1387,11 @@ impl X86_64CodeGen {
 
         if is_fp {
             let fmt = self.fp_format(insn.typ, size, types);
-            self.emit_select_fp(ops, fmt);
+            if fmt == FpSize::Extended {
+                self.emit_x87_select(ops);
+            } else {
+                self.emit_select_fp(ops, fmt);
+            }
         } else {
             self.emit_select_int(ops);
         }
@@ -1450,6 +1454,47 @@ impl X86_64CodeGen {
         // Done: move xmm15 → dst.
         self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
         self.emit_fp_move_from_xmm(XmmReg::Xmm15, &dst_loc, size);
+    }
+
+    /// Emit a `long double` select: the chosen operand is `fldt`-loaded on
+    /// either side of a branch and `fstpt`-stored once. An x87 value lives in
+    /// memory and has no XMM form, so the XMM path's `movt` was no
+    /// instruction at all: bash's `seq` builtin, `if (ret == -0.0) ret =
+    /// 0.0;` if-converted, failed to assemble. `fldt` changes no flags, so
+    /// the one test serves the branch.
+    fn emit_x87_select(&mut self, ops: SelectOperands) {
+        let SelectOperands {
+            cond,
+            then_val,
+            else_val,
+            target,
+            ..
+        } = ops;
+        let dst = self.get_x87_mem_addr(target);
+        if let Loc::Imm(v) = self.get_location(cond) {
+            let src = self.get_x87_mem_addr(if v != 0 { then_val } else { else_val });
+            self.push_lir(X86Inst::X87Load { addr: src });
+            self.push_lir(X86Inst::X87Store { addr: dst });
+            return;
+        }
+        self.emit_condition_test(cond, Reg::R11);
+        let then_label = Label::internal("sel_then", self.unique_label_counter);
+        let done_label = Label::internal("sel_done", self.unique_label_counter + 1);
+        self.unique_label_counter += 2;
+        self.push_lir(X86Inst::Jcc {
+            cc: CondCode::Ne,
+            target: then_label.clone(),
+        });
+        let else_addr = self.get_x87_mem_addr(else_val);
+        self.push_lir(X86Inst::X87Load { addr: else_addr });
+        self.push_lir(X86Inst::Jmp {
+            target: done_label.clone(),
+        });
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(then_label)));
+        let then_addr = self.get_x87_mem_addr(then_val);
+        self.push_lir(X86Inst::X87Load { addr: then_addr });
+        self.push_lir(X86Inst::Directive(Directive::BlockLabel(done_label)));
+        self.push_lir(X86Inst::X87Store { addr: dst });
     }
 
     /// Emit integer select using CMOVcc

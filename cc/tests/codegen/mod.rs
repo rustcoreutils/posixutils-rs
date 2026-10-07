@@ -39,6 +39,7 @@ mod inline_asm;
 mod inlining;
 mod int128;
 mod label_diff;
+mod long_double_select;
 mod macho_labels;
 mod memopt;
 mod memopt_blockops;

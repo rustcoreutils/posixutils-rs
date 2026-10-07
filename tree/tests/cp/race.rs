@@ -168,6 +168,42 @@ fn cp_r_does_not_write_through_a_dangling_link_below_the_operand() {
     let _ = fs::remove_dir_all(&base);
 }
 
+/// `cp --parents` never follows a symbolic link in the destination path
+/// below the target operand, made or found: one that "already exists" may
+/// have been planted a moment before cp's `mkdirat`, and the two cannot be
+/// told apart. (GNU follows a pre-existing one.)
+#[test]
+fn cp_parents_refuses_a_symlink_component_in_the_destination() {
+    use std::os::unix::fs::symlink;
+
+    let base = scratch("parents_symlink_component");
+    fs::create_dir_all(base.join("dir/sub")).unwrap();
+    fs::write(base.join("dir/sub/f"), b"f").unwrap();
+    fs::create_dir_all(base.join("t")).unwrap();
+    fs::create_dir(base.join("elsewhere")).unwrap();
+    symlink("../elsewhere", base.join("t/dir")).unwrap();
+
+    let out = Command::new(get_binary_path("cp"))
+        .args(["--parents", "dir/sub/f", "t"])
+        .current_dir(&base)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to execute cp");
+    assert_eq!(
+        fs::read_dir(base.join("elsewhere")).unwrap().count(),
+        0,
+        "cp --parents followed a symlink in the destination path"
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("'t/dir' exists but is not a directory"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
+
 /// `cp -R src dst` makes `dst/sub` with `mkdirat` and then opens it to copy
 /// `src/sub`'s contents into. A directory swapped for a symbolic link in
 /// between must not be followed.

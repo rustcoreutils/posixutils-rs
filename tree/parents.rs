@@ -55,10 +55,13 @@ fn cstring(bytes: &[u8]) -> io::Result<CString> {
 /// Make every directory in `source`'s parent path under `target`, returning the ones made and
 /// a descriptor for the last one, where the copy itself goes.
 ///
-/// A directory that already exists is used as it is, a symbolic link to one included, as GNU cp
-/// does. A directory this call made is opened with `O_NOFOLLOW`: one swapped for a symbolic link
-/// between the `mkdirat` and the `openat` is refused, so neither the copy nor `-p`'s owner, mode
-/// and times can be redirected through it.
+/// The target operand and the source path are resolved as the user wrote them. Below the target,
+/// every destination component is opened from the held parent descriptor with
+/// `O_DIRECTORY | O_NOFOLLOW`, whether this call made it or found it: a symbolic link there is
+/// refused, so neither the copy nor `-p`'s owner, mode and times can be redirected through it.
+/// GNU cp follows a symbolic link it finds, but a link planted between a failed lookup and the
+/// `mkdirat` is indistinguishable from one that was there before, so none is followed. Nothing
+/// is stat'ed before its open; the identity used afterwards is the opened descriptor's own.
 fn make_parents(source: &Path, target: &Path) -> io::Result<(Vec<MadeDir>, File)> {
     let mut made = Vec::new();
     let mut dest_dir = open_dir_at(libc::AT_FDCWD, &cstring(target.as_os_str().as_bytes())?, 0)?;
@@ -100,14 +103,14 @@ fn make_parents(source: &Path, target: &Path) -> io::Result<(Vec<MadeDir>, File)
                 )));
             }
         }
-        let nofollow = if created { libc::O_NOFOLLOW } else { 0 };
-        let next_dest = open_dir_at(dest_dir.as_raw_fd(), &name, nofollow).map_err(|e| {
-            io::Error::other(gettext!(
-                "'{}' exists but is not a directory: {}",
-                dest_path.display(),
-                error_string(&e)
-            ))
-        })?;
+        let next_dest =
+            open_dir_at(dest_dir.as_raw_fd(), &name, libc::O_NOFOLLOW).map_err(|e| {
+                io::Error::other(gettext!(
+                    "'{}' exists but is not a directory: {}",
+                    dest_path.display(),
+                    error_string(&e)
+                ))
+            })?;
         if created {
             made.push(MadeDir {
                 dest: next_dest.try_clone()?,

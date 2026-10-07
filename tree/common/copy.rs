@@ -85,8 +85,225 @@ pub struct CopyConfig {
 
 enum CopyResult {
     CopyingDirectory,
-    CopiedFile,
+    /// A non-directory was copied. Carries any failure to duplicate its characteristics (-p),
+    /// which is reported but never undoes the copy.
+    CopiedFile(Option<io::Error>),
     Skipped,
+}
+
+/// S_ISUID | S_ISGID, whose values POSIX fixes.
+const ID_BITS: u32 = 0o6000;
+
+/// The mode -p gives the copy: the source's twelve permission bits, less set-user-ID and
+/// set-group-ID when the owner could not be duplicated (POSIX cp 90720-90721, mv 108104-108105).
+fn preserved_mode(source_md: &impl MetadataExt, chown_ok: bool) -> libc::mode_t {
+    let mut mode = source_md.mode() & 0o7777;
+    if !chown_ok {
+        mode &= !ID_BITS;
+    }
+    mode as libc::mode_t
+}
+
+/// The source's [access, modification] times, as `futimens`/`utimensat` take them.
+fn source_times(source_md: &impl MetadataExt) -> [libc::timespec; 2] {
+    [
+        libc::timespec {
+            tv_sec: source_md.atime(),
+            tv_nsec: source_md.atime_nsec(),
+        },
+        libc::timespec {
+            tv_sec: source_md.mtime(),
+            tv_nsec: source_md.mtime_nsec(),
+        },
+    ]
+}
+
+fn preserve_times_error(target: &Path, e: &io::Error) -> io::Error {
+    io::Error::other(gettext!(
+        "failed to preserve times for '{}': {}",
+        target.display(),
+        error_string(e)
+    ))
+}
+
+fn preserve_mode_error(target: &Path, e: &io::Error) -> io::Error {
+    io::Error::other(gettext!(
+        "failed to preserve permissions for '{}': {}",
+        target.display(),
+        error_string(e)
+    ))
+}
+
+/// -p through a descriptor cp holds for the destination it created or opened: times, then
+/// owner, then mode. Nothing is resolved by name, so a file renamed over the destination after
+/// cp opened it is never touched. The mode (set-user-ID included) is applied last, only to a
+/// file whose owner is already final.
+fn preserve_through_fd(
+    fd: libc::c_int,
+    source_md: &impl MetadataExt,
+    target: &Path,
+) -> io::Result<()> {
+    let times = source_times(source_md);
+    if unsafe { libc::futimens(fd, times.as_ptr()) } != 0 {
+        return Err(preserve_times_error(target, &io::Error::last_os_error()));
+    }
+    // A failure to duplicate the owner is not itself reported (POSIX leaves it unspecified);
+    // its consequence is the mode below.
+    let chown_ok = unsafe { libc::fchown(fd, source_md.uid(), source_md.gid()) } == 0;
+    if unsafe { libc::fchmod(fd, preserved_mode(source_md, chown_ok)) } != 0 {
+        return Err(preserve_mode_error(target, &io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
+/// The source's metadata as it is now (reading it may have moved its access time), through the
+/// directory descriptor the walk used, and required to be the very file the walk recorded: an
+/// entry swapped since must not lend its owner and mode to the copy.
+fn fresh_source_md(source: &ftw::Entry) -> io::Result<ftw::Metadata> {
+    let changed = || io::Error::other(gettext!("'{}' changed during the copy", source.path()));
+    let recorded = source.metadata().ok_or_else(changed)?;
+    // The walk recorded a followed link's referent; stat the same thing.
+    let follow = source.is_symlink() == Some(true) && !recorded.is_symlink();
+    let md = ftw::Metadata::new(source.dir_fd(), source.file_name(), follow)?;
+    if md.dev() != recorded.dev() || md.ino() != recorded.ino() {
+        return Err(changed());
+    }
+    Ok(md)
+}
+
+/// -p for a symbolic link or special file cp just made with `symlinkat`/`mknodat`, which return
+/// no descriptor.
+///
+/// What the name holds must be what cp made: the same file type, owned by cp's effective user.
+/// On Linux the node is then pinned with an `O_PATH | O_NOFOLLOW` descriptor whose `(dev, ino)`
+/// must match that check, and every change goes through it: owner and times with
+/// `AT_EMPTY_PATH`, the mode of a special file through `/proc/self/fd`, which names exactly
+/// that inode. Elsewhere the changes are made by name with `AT_SYMLINK_NOFOLLOW`, each after
+/// re-checking the identity -- the residual is a replacement between that check and the call.
+/// A symbolic link's own mode is never set: Linux has none to set, and no access check reads
+/// it anywhere.
+fn preserve_made_node(
+    dirfd: libc::c_int,
+    name: &CStr,
+    made_type: ftw::FileType,
+    source_md: &ftw::Metadata,
+    target: &Path,
+) -> io::Result<()> {
+    let md = ftw::Metadata::new(dirfd, name, false)?;
+    if md.file_type() != made_type || md.uid() != unsafe { libc::geteuid() } {
+        return Err(io::Error::other(gettext!(
+            "'{}' was replaced during the copy",
+            target.display()
+        )));
+    }
+    preserve_node_attributes(dirfd, name, &md, made_type, source_md, target)
+}
+
+#[cfg(target_os = "linux")]
+fn preserve_node_attributes(
+    dirfd: libc::c_int,
+    name: &CStr,
+    made: &ftw::Metadata,
+    made_type: ftw::FileType,
+    source_md: &ftw::Metadata,
+    target: &Path,
+) -> io::Result<()> {
+    let fd = unsafe {
+        libc::openat(
+            dirfd,
+            name.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    let pinned = fs::File::from(fd);
+    let pinned_md = pinned.metadata()?;
+    if pinned_md.dev() != made.dev() || pinned_md.ino() != made.ino() {
+        return Err(io::Error::other(gettext!(
+            "'{}' was replaced during the copy",
+            target.display()
+        )));
+    }
+    let fd = pinned.as_raw_fd();
+    let empty = c"";
+
+    let times = source_times(source_md);
+    if unsafe { libc::utimensat(fd, empty.as_ptr(), times.as_ptr(), libc::AT_EMPTY_PATH) } != 0 {
+        return Err(preserve_times_error(target, &io::Error::last_os_error()));
+    }
+    let chown_ok = unsafe {
+        libc::fchownat(
+            fd,
+            empty.as_ptr(),
+            source_md.uid(),
+            source_md.gid(),
+            libc::AT_EMPTY_PATH,
+        )
+    } == 0;
+    if made_type != ftw::FileType::SymbolicLink {
+        let proc_path = CString::new(format!("/proc/self/fd/{fd}")).unwrap();
+        let mode = preserved_mode(source_md, chown_ok);
+        if unsafe { libc::fchmodat(libc::AT_FDCWD, proc_path.as_ptr(), mode, 0) } != 0 {
+            return Err(preserve_mode_error(target, &io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn preserve_node_attributes(
+    dirfd: libc::c_int,
+    name: &CStr,
+    made: &ftw::Metadata,
+    made_type: ftw::FileType,
+    source_md: &ftw::Metadata,
+    target: &Path,
+) -> io::Result<()> {
+    let still_made = || -> io::Result<()> {
+        let md = ftw::Metadata::new(dirfd, name, false)?;
+        if md.dev() != made.dev() || md.ino() != made.ino() {
+            return Err(io::Error::other(gettext!(
+                "'{}' was replaced during the copy",
+                target.display()
+            )));
+        }
+        Ok(())
+    };
+
+    still_made()?;
+    let times = source_times(source_md);
+    if unsafe {
+        libc::utimensat(
+            dirfd,
+            name.as_ptr(),
+            times.as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(preserve_times_error(target, &io::Error::last_os_error()));
+    }
+    still_made()?;
+    let chown_ok = unsafe {
+        libc::fchownat(
+            dirfd,
+            name.as_ptr(),
+            source_md.uid(),
+            source_md.gid(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == 0;
+    if made_type != ftw::FileType::SymbolicLink {
+        still_made()?;
+        let mode = preserved_mode(source_md, chown_ok);
+        if unsafe { libc::fchmodat(dirfd, name.as_ptr(), mode, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+            return Err(preserve_mode_error(target, &io::Error::last_os_error()));
+        }
+    }
+    Ok(())
 }
 
 // Implements the algorithm for `cp`:
@@ -281,13 +498,16 @@ where
                 // Creates the target directory with the same file permission bits as the source,
                 // modified by the umask of the process. Copying the permission bits without the
                 // umask is postponed to the `postprocess_dir` closure on the call to
-                // `traverse_directory` inside `copy_file`.
-                let ret = libc::mkdirat(
-                    target_dirfd,
-                    target_filename,
+                // `traverse_directory` inside `copy_file`. Under -p it is made owner-only: until
+                // that closure duplicates the owner, the directory belongs to whoever ran cp, and
+                // group or other write permission would let others plant entries in it.
+                let mode = if cfg.preserve {
+                    libc::S_IRWXU
+                } else {
                     // OR'ed with S_IRWXU according to the spec
-                    source_md.mode() as libc::mode_t | libc::S_IRWXU,
-                );
+                    source_md.mode() as libc::mode_t | libc::S_IRWXU
+                };
+                let ret = libc::mkdirat(target_dirfd, target_filename, mode);
 
                 if ret != 0 {
                     let e = io::Error::last_os_error();
@@ -301,7 +521,7 @@ where
             }
         }
 
-        return Ok(CopyResult::CopyingDirectory);
+        Ok(CopyResult::CopyingDirectory)
     } else {
         // 3. If source_file is of type regular file
 
@@ -327,7 +547,8 @@ where
             } else {
                 libc::O_EXCL
             };
-        let create_target_then_copy = || -> io::Result<bool> {
+        // Returns the source and the new destination, both still open, or `None` for a -n skip.
+        let create_target_then_copy = || -> io::Result<Option<(fs::File, fs::File)>> {
             let source_fd = unsafe {
                 libc::openat(
                     source.dir_fd(),
@@ -347,17 +568,29 @@ where
             let mut source_file = unsafe { fs::File::from_raw_fd(source_fd) };
 
             // 3.b. POSIX 90670-90671 asks for source_file's permission bits. The set-user-ID and
-            // set-group-ID bits are masked off unless -p was given: the copy belongs to whoever
-            // ran cp, so carrying them over would hand that user's privileges to anyone who can
-            // run it. GNU masks the same way, and -p restores them later through
-            // `copy_characteristics`, which clears them if the ownership could not be duplicated.
-            let create_mode = source_md.mode() & if cfg.preserve { 0o7777 } else { 0o777 };
-            let target_fd =
-                unsafe { libc::openat(target_dirfd, target_filename, create_flags, create_mode) };
+            // set-group-ID bits are masked off: the copy belongs to whoever ran cp, so carrying
+            // them over would hand that user's privileges to anyone who can run it. Under -p the
+            // file is created owner-only, because until the copy is complete and its owner
+            // duplicated it holds another user's data under the invoker's ownership; the final
+            // mode, set-user-ID included, is applied through this same descriptor afterwards
+            // (`preserve_through_fd`), only once the owner is right. GNU creates it the same way.
+            let create_mode = if cfg.preserve {
+                0o600
+            } else {
+                source_md.mode() & 0o777
+            };
+            let target_fd = unsafe {
+                libc::openat(
+                    target_dirfd,
+                    target_filename,
+                    create_flags | libc::O_CLOEXEC,
+                    create_mode,
+                )
+            };
             if target_fd == -1 {
                 let e = io::Error::last_os_error();
                 if cfg.no_clobber && e.raw_os_error() == Some(libc::EEXIST) {
-                    return Ok(false);
+                    return Ok(None);
                 }
 
                 // `ErrorKind::IsADirectory` is unstable:
@@ -381,7 +614,7 @@ where
             // 3.d
             io::copy(&mut source_file, &mut target_file)?;
 
-            Ok(true)
+            Ok(Some((source_file, target_file)))
         };
 
         // -n: any existing destination, a dangling link included, is left alone.
@@ -469,7 +702,14 @@ where
                 target_exists,
                 state.created_files,
             ) {
-                Ok(()) => Ok(CopyResult::CopiedFile),
+                Ok(()) => Ok(CopyResult::CopiedFile(preserve_made(
+                    cfg,
+                    source,
+                    target_dirfd,
+                    target_filename,
+                    source_file_type,
+                    target,
+                ))),
                 Err(e) if cfg.no_clobber && e.kind() == io::ErrorKind::AlreadyExists => {
                     Ok(CopyResult::Skipped)
                 }
@@ -517,7 +757,18 @@ where
                     error_string(&e)
                 )));
             }
-        } else if replacing_existing {
+            state.created_files.insert(target.to_path_buf());
+            return Ok(CopyResult::CopiedFile(preserve_made(
+                cfg,
+                source,
+                target_dirfd,
+                target_filename,
+                ftw::FileType::SymbolicLink,
+                target,
+            )));
+        }
+
+        let (source_file, target_file) = if replacing_existing {
             if target_is_dir {
                 let err_str = gettext!(
                     "cannot overwrite directory '{}' with non-directory '{}'",
@@ -551,13 +802,14 @@ where
                 libc::openat(
                     target_dirfd,
                     target_filename,
-                    libc::O_WRONLY | libc::O_TRUNC,
+                    libc::O_WRONLY | libc::O_TRUNC | libc::O_CLOEXEC,
                 )
             };
             if target_fd != -1 {
                 let mut target_file = unsafe { fs::File::from_raw_fd(target_fd) };
 
                 io::copy(&mut source_file, &mut target_file)?;
+                (source_file, target_file)
             } else {
                 // 3.a.iii
                 if cfg.force {
@@ -574,8 +826,9 @@ where
                     }
 
                     // 3.b
-                    if !create_target_then_copy()? {
-                        return Ok(CopyResult::Skipped);
+                    match create_target_then_copy()? {
+                        Some(pair) => pair,
+                        None => return Ok(CopyResult::Skipped),
                     }
                 } else {
                     // The open that failed was for writing, and without -f there is no
@@ -589,16 +842,48 @@ where
                     return Err(io::Error::other(err_str));
                 }
             }
-
-        // 3.b
-        } else if !create_target_then_copy()? {
-            return Ok(CopyResult::Skipped);
-        }
+        } else {
+            // 3.b
+            match create_target_then_copy()? {
+                Some(pair) => pair,
+                None => return Ok(CopyResult::Skipped),
+            }
+        };
 
         state.created_files.insert(target.to_path_buf());
-    }
 
-    Ok(CopyResult::CopiedFile)
+        // -p through the descriptor just written, before it is closed; the source's metadata
+        // from its own descriptor, as it is after the read.
+        let preserve_error = if cfg.preserve {
+            source_file
+                .metadata()
+                .and_then(|source_md| {
+                    preserve_through_fd(target_file.as_raw_fd(), &source_md, target)
+                })
+                .err()
+        } else {
+            None
+        };
+        Ok(CopyResult::CopiedFile(preserve_error))
+    }
+}
+
+/// -p for a symbolic link or special file this copy just made (no descriptor to act through).
+fn preserve_made(
+    cfg: &CopyConfig,
+    source: &ftw::Entry,
+    target_dirfd: libc::c_int,
+    target_filename: *const libc::c_char,
+    made_type: ftw::FileType,
+    target: &Path,
+) -> Option<io::Error> {
+    if !cfg.preserve {
+        return None;
+    }
+    let name = unsafe { CStr::from_ptr(target_filename) };
+    fresh_source_md(source)
+        .and_then(|source_md| preserve_made_node(target_dirfd, name, made_type, &source_md, target))
+        .err()
 }
 
 pub fn copy_file<F>(
@@ -749,7 +1034,7 @@ where
                     // Recording a skipped copy pointed a later hard link at a target that does
                     // not exist, and every directory reports nlink > 1, so directories were
                     // recorded too.
-                    if matches!(copy_result, CopyResult::CopiedFile) {
+                    if matches!(copy_result, CopyResult::CopiedFile(_)) {
                         if let Some(inode_map) = inode_map.as_deref_mut() {
                             // Only files that have hard links are worth tracking.
                             if source_md.nlink() > 1 {
@@ -820,29 +1105,20 @@ where
 
                             true
                         }
-                        CopyResult::CopiedFile => {
-                            // Immediately copy the metadata if copying a file. Directories are
-                            // handled on the `postprocess_dir` closure below.
-                            if cfg.preserve {
-                                if let Err(e) = copy_characteristics(
-                                    &source,
-                                    &target,
-                                    target_dirfd.as_raw_fd(),
-                                    target_filename_cstr.as_ptr(),
-                                ) {
-                                    // A characteristics-duplication failure is never fatal: cp
-                                    // reports it and sets a non-zero exit status; mv reports it but
-                                    // must NOT modify its exit status (108114-108115) and still
-                                    // completes the move.
-                                    eprintln!("{}: {}", cfg.prog, error_string(&e));
-                                    if cfg.continue_on_error {
-                                        *had_error.borrow_mut() = true;
-                                    }
+                        CopyResult::CopiedFile(preserve_error) => {
+                            // `copy_file_impl` already applied -p to the file; directories are
+                            // handled in the `postprocess_dir` closure below.
+                            if let Some(e) = preserve_error {
+                                // A characteristics-duplication failure is never fatal: cp
+                                // reports it and sets a non-zero exit status; mv reports it but
+                                // must NOT modify its exit status (108114-108115) and still
+                                // completes the move.
+                                eprintln!("{}: {}", cfg.prog, error_string(&e));
+                                if cfg.continue_on_error {
+                                    *had_error.borrow_mut() = true;
                                 }
-                                true
-                            } else {
-                                true
                             }
+                            true
                         }
                         CopyResult::Skipped => false,
                     }
@@ -869,27 +1145,18 @@ where
             let mut target_dirfd_stack_borrowed = target_dirfd_stack.borrow_mut();
             let mut target_dir_path_borrowed = target_dir_path.borrow_mut();
 
+            let dir_path = target_dir_path_borrowed.clone();
             target_dir_path_borrowed.pop();
-            target_dirfd_stack_borrowed.pop();
+            let target_dir = target_dirfd_stack_borrowed.pop();
 
             // Preserve metadata for directories. Must do this inside this closure to ensure no
-            // further last access time changes to the source will be made.
-            if cfg.preserve {
-                let target_dirfd = target_dirfd_stack_borrowed.last().unwrap();
-
-                let target_filename = if target_dirfd_stack_borrowed.len() == 1 {
-                    top_name
-                } else {
-                    OsStr::from_bytes(source.file_name().to_bytes())
-                };
-                let target_filename_cstr = CString::new(target_filename.as_bytes()).unwrap();
-
-                if let Err(e) = copy_characteristics(
-                    &source,
-                    &target_dir_path_borrowed,
-                    target_dirfd.as_raw_fd(),
-                    target_filename_cstr.as_ptr(),
-                ) {
+            // further last access time changes to the source will be made. Applied through the
+            // descriptor this copy has held for the directory since it entered it, never by
+            // name.
+            if let (true, Some(target_dir)) = (cfg.preserve, target_dir) {
+                if let Err(e) = fresh_source_md(&source).and_then(|source_md| {
+                    preserve_through_fd(target_dir.as_raw_fd(), &source_md, &dir_path)
+                }) {
                     // Same policy as the file case: never fatal, exit-status only for cp.
                     eprintln!("{}: {}", cfg.prog, error_string(&e));
                     if cfg.continue_on_error {
@@ -1075,106 +1342,4 @@ fn copy_special_file(
         // The kind is kept so that -n can tell a destination that appeared meanwhile.
         Err(io::Error::new(e.kind(), err_str))
     }
-}
-
-// Copy the metadata in `source_md` to the target.
-fn copy_characteristics(
-    source: &ftw::Entry,
-    target: &Path,
-    target_dirfd: libc::c_int,
-    target_filename: *const libc::c_char,
-) -> io::Result<()> {
-    // Get a new metadata instead because the source's last access time is updated on reads (i.e,
-    // `io::copy`).
-    // Should fix sporadic errors on `test_cp_preserve_slink_time` where `dangle` has a later
-    // access time than `d2`.
-    let source_md = unsafe { ftw::Metadata::new(source.dir_fd(), source.file_name(), false) }?;
-
-    // [last_access_time, last_modified_time]
-    let times = [
-        libc::timespec {
-            tv_sec: source_md.atime(),
-            tv_nsec: source_md.atime_nsec(),
-        },
-        libc::timespec {
-            tv_sec: source_md.mtime(),
-            tv_nsec: source_md.mtime_nsec(),
-        },
-    ];
-
-    unsafe {
-        // Copy last access and last modified times
-        let ret = libc::utimensat(
-            target_dirfd,
-            target_filename,
-            times.as_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW, // Update the file itself if a symlink
-        );
-        if ret != 0 {
-            let err_str = gettext!(
-                "failed to preserve times for '{}': {}",
-                target.display(),
-                io::Error::last_os_error()
-            );
-            return Err(io::Error::other(err_str));
-        }
-
-        // Copy user and group. Per cp's APPLICATION USAGE / RATIONALE and mv's DESCRIPTION, a
-        // failure here is not fatal (cp: "it is unspecified whether cp writes a diagnostic"; the
-        // dest is not deleted), but it has a security consequence handled below.
-        let ret = libc::fchownat(
-            target_dirfd,
-            target_filename,
-            source_md.uid(),
-            source_md.gid(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        );
-        let chown_ok = ret == 0;
-        if !chown_ok {
-            // Ignore errors
-            errno::set_errno(errno::Errno(0));
-        }
-
-        // Copy permissions. POSIX cp 90720-90721 and mv 108104-108105: "If the user ID or the
-        // group ID cannot be duplicated, the file permission bits S_ISUID and S_ISGID shall be
-        // cleared." This prevents a set-user-ID / set-group-ID program from being copied to a file
-        // owned by a different user (a privilege leak). When ownership was duplicated successfully,
-        // the bits are preserved.
-        let mut mode = source_md.mode();
-        if !chown_ok {
-            #[allow(clippy::unnecessary_cast)]
-            let id_bits = (libc::S_ISUID | libc::S_ISGID) as u32;
-            mode &= !id_bits;
-        }
-        let ret = libc::fchmodat(
-            target_dirfd,
-            target_filename,
-            mode as libc::mode_t,
-            libc::AT_SYMLINK_NOFOLLOW,
-        );
-        if ret != 0 {
-            let fchmodat_error = io::Error::last_os_error();
-
-            // Symbolic link permissions are ignored on Linux
-            #[cfg(target_os = "linux")]
-            if let Ok(md) = ftw::Metadata::new(target_dirfd, CStr::from_ptr(target_filename), false)
-            {
-                if md.file_type() == ftw::FileType::SymbolicLink {
-                    if let Some(errno) = fchmodat_error.raw_os_error() {
-                        if errno == libc::EOPNOTSUPP {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-
-            let err_str = gettext!(
-                "failed to preserve permissions for '{}': {}",
-                target.display(),
-                io::Error::last_os_error()
-            );
-            return Err(io::Error::other(err_str));
-        }
-    }
-    Ok(())
 }

@@ -62,7 +62,7 @@ fn cstring(bytes: &[u8]) -> io::Result<CString> {
 /// GNU cp follows a symbolic link it finds, but a link planted between a failed lookup and the
 /// `mkdirat` is indistinguishable from one that was there before, so none is followed. Nothing
 /// is stat'ed before its open; the identity used afterwards is the opened descriptor's own.
-fn make_parents(source: &Path, target: &Path) -> io::Result<(Vec<MadeDir>, File)> {
+fn make_parents(source: &Path, target: &Path, preserve: bool) -> io::Result<(Vec<MadeDir>, File)> {
     let mut made = Vec::new();
     let mut dest_dir = open_dir_at(libc::AT_FDCWD, &cstring(target.as_os_str().as_bytes())?, 0)?;
     let Some(parent) = source.parent() else {
@@ -89,9 +89,15 @@ fn make_parents(source: &Path, target: &Path) -> io::Result<(Vec<MadeDir>, File)
         })?;
         let src_md = next_src.metadata()?;
 
-        // Owner search and write are needed to fill the directory; -p restores the exact
-        // mode afterwards, and without -p the umask applies as it does to cp -R.
-        let mode = (src_md.mode() & 0o7777) as libc::mode_t | libc::S_IRWXU;
+        // Owner search and write are needed to fill the directory; without -p the umask
+        // applies as it does to cp -R. Under -p it is made owner-only, and `preserve_dir` sets
+        // the exact mode through its descriptor once the owner is duplicated: until then it
+        // belongs to whoever ran cp, and must not let others plant entries in it.
+        let mode = if preserve {
+            libc::S_IRWXU
+        } else {
+            (src_md.mode() & 0o7777) as libc::mode_t | libc::S_IRWXU
+        };
         let created = unsafe { libc::mkdirat(dest_dir.as_raw_fd(), name.as_ptr(), mode) } == 0;
         if !created {
             let e = io::Error::last_os_error();
@@ -167,7 +173,7 @@ where
     let mut ok = true;
     let mut created_files = HashSet::new();
     for source in sources {
-        let (made, dest_dir) = match make_parents(source, target) {
+        let (made, dest_dir) = match make_parents(source, target, cfg.preserve) {
             Ok(pair) => pair,
             Err(e) => {
                 eprintln!("cp: {}", error_string(&e));

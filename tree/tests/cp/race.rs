@@ -204,6 +204,127 @@ fn cp_parents_refuses_a_symlink_component_in_the_destination() {
     let _ = fs::remove_dir_all(&base);
 }
 
+/// A large set-user-ID source with an old modification time, for the `-p` races below: the copy
+/// takes long enough that the destination exists for a while before cp finishes with it.
+fn big_setuid_source(dir: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let source = dir.join("source");
+    fs::write(&source, vec![0x5a_u8; 32 << 20]).unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o4755)).unwrap();
+    let old = std::time::UNIX_EPOCH + Duration::from_secs(946_684_800);
+    fs::File::options()
+        .write(true)
+        .open(&source)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_accessed(old).set_modified(old))
+        .unwrap();
+    source
+}
+
+/// `cp -p` applies the source's times, owner and mode to the file it created. Doing that by
+/// name after closing the file acts on whatever the name holds by then: here a file renamed over
+/// the destination mid-copy, which cp must leave exactly as it was (as root, an attacker's
+/// executable would have been made set-user-ID to the source's owner).
+#[test]
+fn cp_p_never_applies_attributes_to_a_file_renamed_over_the_destination() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let dir = scratch("p_rename_over");
+    let source = big_setuid_source(&dir);
+    let target = dir.join("target");
+    let victim = dir.join("victim");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut swaps = 0;
+    while Instant::now() < deadline {
+        let _ = fs::remove_file(&target);
+        fs::write(&victim, b"attacker").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
+        let victim_ino = fs::metadata(&victim).unwrap().ino();
+
+        let mut child = Command::new(get_binary_path("cp"))
+            .args(["-p".as_ref(), source.as_os_str(), target.as_os_str()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to execute cp");
+        // Swap as soon as cp has created the destination.
+        let mut swapped = false;
+        while child.try_wait().unwrap().is_none() {
+            if fs::symlink_metadata(&target).is_ok() {
+                swapped = fs::rename(&victim, &target).is_ok();
+                break;
+            }
+        }
+        child.wait().unwrap();
+        if !swapped {
+            continue;
+        }
+        swaps += 1;
+
+        let md = fs::symlink_metadata(&target).unwrap();
+        if md.ino() == victim_ino {
+            assert!(
+                md.mode() & 0o7777 == 0o600 && md.mtime() != 946_684_800,
+                "cp -p applied the source's attributes to a file renamed over its \
+                 destination: mode {:o}, mtime {}",
+                md.mode() & 0o7777,
+                md.mtime()
+            );
+        }
+    }
+    assert!(swaps > 0, "no round swapped the destination mid-copy");
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `cp -p` of a set-user-ID file: until the copy is complete (and owned as the source is), the
+/// destination must carry no set-user-ID bit and no group or other permissions. Creating it with
+/// the source's full mode left a set-user-ID file owned by the invoker, with another user's
+/// partial content, readable and executable by anyone.
+#[test]
+fn cp_p_creates_the_destination_without_setuid_or_group_other_bits() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = scratch("p_create_mode");
+    let source = big_setuid_source(&dir);
+    let full = fs::metadata(&source).unwrap().len();
+    let target = dir.join("target");
+
+    for _ in 0..5 {
+        let _ = fs::remove_file(&target);
+        let mut child = Command::new(get_binary_path("cp"))
+            .args(["-p".as_ref(), source.as_os_str(), target.as_os_str()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to execute cp");
+        while child.try_wait().unwrap().is_none() {
+            if let Ok(md) = fs::symlink_metadata(&target) {
+                // The mode is read first: a size read first could be stale by the time the
+                // final mode is applied.
+                let mode = md.mode() & 0o7777;
+                if md.len() < full {
+                    assert_eq!(
+                        mode & 0o7077,
+                        0,
+                        "a partial cp -p destination had mode {mode:o}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            fs::metadata(&target).unwrap().mode() & 0o7777,
+            0o4755,
+            "the finished copy keeps the source's mode"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// `cp -R src dst` makes `dst/sub` with `mkdirat` and then opens it to copy
 /// `src/sub`'s contents into. A directory swapped for a symbolic link in
 /// between must not be followed.

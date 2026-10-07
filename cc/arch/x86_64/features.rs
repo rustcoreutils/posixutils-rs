@@ -1003,72 +1003,25 @@ impl X86_64CodeGen {
         }
     }
 
-    pub(super) fn emit_bswap(&mut self, insn: &Instruction, swap_size: BswapSize) {
-        let src = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let dst = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
+    // Byte-swapping and bit-scanning builtins
+    //
+    // Each loads its operand into R10 with `emit_move` and stores the result
+    // with `emit_move_to_loc`, which know every location an operand can have.
+    // Matching the locations here instead left one out -- an argument the
+    // caller passed on the stack, read in place -- and for it emitted no
+    // instruction at all.
 
-        let src_loc = self.get_location(src);
-        let dst_loc = self.get_location(dst);
+    /// Emit byte-swap instruction for 16/32/64-bit values
+    pub(super) fn emit_bswap(&mut self, insn: &Instruction, swap_size: BswapSize) {
+        let (Some(&src), Some(dst)) = (insn.src.first(), insn.target) else {
+            return;
+        };
         let op_size = match swap_size {
             BswapSize::B16 => OperandSize::B16,
             BswapSize::B32 => OperandSize::B32,
             BswapSize::B64 => OperandSize::B64,
         };
-
-        // Load source into R10 (scratch register)
-        match (&src_loc, &swap_size) {
-            // 16-bit: use zero-extending moves
-            (Loc::Reg(r), BswapSize::B16) if *r != Reg::R10 => {
-                self.push_lir(X86Inst::Movzx {
-                    src_size: OperandSize::B16,
-                    dst_size: OperandSize::B32,
-                    src: GpOperand::Reg(*r),
-                    dst: Reg::R10,
-                });
-            }
-            (Loc::Stack(off), BswapSize::B16) => {
-                self.push_lir(X86Inst::Movzx {
-                    src_size: OperandSize::B16,
-                    dst_size: OperandSize::B32,
-                    src: GpOperand::Mem(self.stack_field(*off, 0)),
-                    dst: Reg::R10,
-                });
-            }
-            // 32/64-bit: use regular moves
-            (Loc::Reg(r), _) if *r != Reg::R10 => {
-                self.push_lir(X86Inst::Mov {
-                    size: op_size,
-                    src: GpOperand::Reg(*r),
-                    dst: GpOperand::Reg(Reg::R10),
-                });
-            }
-            (Loc::Stack(off), _) => {
-                self.push_lir(X86Inst::Mov {
-                    size: op_size,
-                    src: GpOperand::Mem(self.stack_field(*off, 0)),
-                    dst: GpOperand::Reg(Reg::R10),
-                });
-            }
-            (Loc::Imm(v), _) => {
-                self.push_lir(X86Inst::Mov {
-                    size: if matches!(swap_size, BswapSize::B16) {
-                        OperandSize::B32
-                    } else {
-                        op_size
-                    },
-                    src: GpOperand::Imm(*v as i64),
-                    dst: GpOperand::Reg(Reg::R10),
-                });
-            }
-            (Loc::Reg(_), _) => {} // Already in R10
-            _ => return,
-        }
+        self.emit_move(src, Reg::R10, op_size.bits());
 
         // Perform byte-swap: 16-bit uses ROR, 32/64-bit uses BSWAP
         match swap_size {
@@ -1076,6 +1029,14 @@ impl X86_64CodeGen {
                 self.push_lir(X86Inst::Ror {
                     size: OperandSize::B16,
                     count: ShiftCount::Imm(8),
+                    dst: Reg::R10,
+                });
+                // The result is the low half; a register destination gets
+                // it zero-extended.
+                self.push_lir(X86Inst::Movzx {
+                    src_size: OperandSize::B16,
+                    dst_size: OperandSize::B32,
+                    src: GpOperand::Reg(Reg::R10),
                     dst: Reg::R10,
                 });
             }
@@ -1087,191 +1048,46 @@ impl X86_64CodeGen {
             }
         }
 
-        // Store result
-        match (&dst_loc, &swap_size) {
-            // 16-bit: use zero-extending move for register destination
-            (Loc::Reg(r), BswapSize::B16) if *r != Reg::R10 => {
-                self.push_lir(X86Inst::Movzx {
-                    src_size: OperandSize::B16,
-                    dst_size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: *r,
-                });
-            }
-            (Loc::Stack(off), BswapSize::B16) => {
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B16,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: GpOperand::Mem(self.stack_field(*off, 0)),
-                });
-            }
-            // 32/64-bit: use regular moves
-            (Loc::Reg(r), _) if *r != Reg::R10 => {
-                self.push_lir(X86Inst::Mov {
-                    size: op_size,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: GpOperand::Reg(*r),
-                });
-            }
-            (Loc::Stack(off), _) => {
-                self.push_lir(X86Inst::Mov {
-                    size: op_size,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: GpOperand::Mem(self.stack_field(*off, 0)),
-                });
-            }
-            _ => {}
-        }
+        let dst_loc = self.get_location(dst);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, op_size.bits());
     }
 
-    /// Emit count trailing zeros
+    /// Emit count trailing zeros: BSF gives the index of the least
+    /// significant set bit, which is the count. The result is an `int`.
     pub(super) fn emit_ctz(&mut self, insn: &Instruction, src_size: OperandSize) {
-        let src = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
+        let (Some(&src), Some(dst)) = (insn.src.first(), insn.target) else {
+            return;
         };
-        let dst = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        let src_loc = self.get_location(src);
-        let dst_loc = self.get_location(dst);
-
-        // BSF (bit scan forward) finds index of least significant set bit
-        // which is equivalent to count of trailing zeros
-        // Use R10 as scratch register
-        match src_loc {
-            Loc::Reg(r) => {
-                self.push_lir(X86Inst::Bsf {
-                    size: src_size,
-                    src: GpOperand::Reg(r),
-                    dst: Reg::R10,
-                });
-            }
-            Loc::Stack(off) => {
-                self.push_lir(X86Inst::Bsf {
-                    size: src_size,
-                    src: GpOperand::Mem(self.stack_field(off, 0)),
-                    dst: Reg::R10,
-                });
-            }
-            Loc::Imm(v) => {
-                // Load immediate first, then BSF
-                self.push_lir(X86Inst::Mov {
-                    size: src_size,
-                    src: GpOperand::Imm(v as i64),
-                    dst: GpOperand::Reg(Reg::R10),
-                });
-                self.push_lir(X86Inst::Bsf {
-                    size: src_size,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: Reg::R10,
-                });
-            }
-            _ => return,
-        }
-
-        // Store result (return type is int, always 32-bit)
-        match dst_loc {
-            Loc::Reg(r) => {
-                if r != Reg::R10 {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B32,
-                        src: GpOperand::Reg(Reg::R10),
-                        dst: GpOperand::Reg(r),
-                    });
-                }
-            }
-            Loc::Stack(off) => {
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: GpOperand::Mem(self.stack_field(off, 0)),
-                });
-            }
-            _ => {}
-        }
-    }
-
-    /// Emit count leading zeros: CLZ(x) = operand_bits - 1 - BSR(x)
-    pub(super) fn emit_clz(&mut self, insn: &Instruction, src_size: OperandSize) {
-        let src = match insn.src.first() {
-            Some(&s) => s,
-            None => return,
-        };
-        let dst = match insn.target {
-            Some(t) => t,
-            None => return,
-        };
-
-        let src_loc = self.get_location(src);
-        let dst_loc = self.get_location(dst);
-
-        // BSR (bit scan reverse) finds index of most significant set bit
-        // CLZ = (operand_size - 1) - BSR_result
-        // Use R10 as scratch register
-        match src_loc {
-            Loc::Reg(r) => {
-                self.push_lir(X86Inst::Bsr {
-                    size: src_size,
-                    src: GpOperand::Reg(r),
-                    dst: Reg::R10,
-                });
-            }
-            Loc::Stack(off) => {
-                self.push_lir(X86Inst::Bsr {
-                    size: src_size,
-                    src: GpOperand::Mem(self.stack_field(off, 0)),
-                    dst: Reg::R10,
-                });
-            }
-            Loc::Imm(v) => {
-                // Load immediate first, then BSR
-                self.push_lir(X86Inst::Mov {
-                    size: src_size,
-                    src: GpOperand::Imm(v as i64),
-                    dst: GpOperand::Reg(Reg::R10),
-                });
-                self.push_lir(X86Inst::Bsr {
-                    size: src_size,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: Reg::R10,
-                });
-            }
-            _ => return,
-        }
-
-        // XOR R10 with (size - 1) to convert BSR result to CLZ
-        // Since BSR gives index from LSB, we need (size_bits - 1) - result
-        // XOR with (size_bits - 1) achieves this for valid inputs (non-zero)
-        let xor_value = (src_size.bits() - 1) as i64;
-        self.push_lir(X86Inst::Xor {
-            size: OperandSize::B32, // Result is always 32-bit int
-            src: GpOperand::Imm(xor_value),
+        self.emit_move(src, Reg::R10, src_size.bits());
+        self.push_lir(X86Inst::Bsf {
+            size: src_size,
+            src: GpOperand::Reg(Reg::R10),
             dst: Reg::R10,
         });
+        let dst_loc = self.get_location(dst);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, u32::BITS);
+    }
 
-        // Store result (return type is int, always 32-bit)
-        match dst_loc {
-            Loc::Reg(r) => {
-                if r != Reg::R10 {
-                    self.push_lir(X86Inst::Mov {
-                        size: OperandSize::B32,
-                        src: GpOperand::Reg(Reg::R10),
-                        dst: GpOperand::Reg(r),
-                    });
-                }
-            }
-            Loc::Stack(off) => {
-                self.push_lir(X86Inst::Mov {
-                    size: OperandSize::B32,
-                    src: GpOperand::Reg(Reg::R10),
-                    dst: GpOperand::Mem(self.stack_field(off, 0)),
-                });
-            }
-            _ => {}
-        }
+    /// Emit count leading zeros: CLZ(x) = operand_bits - 1 - BSR(x), which
+    /// for a non-zero operand is BSR(x) XOR (operand_bits - 1). The result
+    /// is an `int`.
+    pub(super) fn emit_clz(&mut self, insn: &Instruction, src_size: OperandSize) {
+        let (Some(&src), Some(dst)) = (insn.src.first(), insn.target) else {
+            return;
+        };
+        self.emit_move(src, Reg::R10, src_size.bits());
+        self.push_lir(X86Inst::Bsr {
+            size: src_size,
+            src: GpOperand::Reg(Reg::R10),
+            dst: Reg::R10,
+        });
+        self.push_lir(X86Inst::Xor {
+            size: OperandSize::B32,
+            src: GpOperand::Imm((src_size.bits() - 1) as i64),
+            dst: Reg::R10,
+        });
+        let dst_loc = self.get_location(dst);
+        self.emit_move_to_loc(Reg::R10, &dst_loc, u32::BITS);
     }
 
     /// Emit population count with the baseline sequence of

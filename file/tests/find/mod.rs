@@ -8,6 +8,7 @@
 //
 
 mod debhelper;
+mod race;
 
 use std::fs::{remove_file, File};
 use std::io::Write;

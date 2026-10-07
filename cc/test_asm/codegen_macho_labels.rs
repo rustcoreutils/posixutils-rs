@@ -82,3 +82,39 @@ fn codegen_macho_private_labels_use_the_l_prefix() {
         }
     }
 }
+
+/// Every Mach-O unit ends with `.subsections_via_symbols`, as clang's do: it
+/// tells Apple's linker that each symbol starts its own atom, which is what
+/// lets a weak definition yield to a strong one in another object (without
+/// it a `#pragma weak` or `__attribute__((weak))` definition is a "duplicate
+/// symbol") and lets `-dead_strip` drop one function. It is only sound
+/// because every label c17 makes up inside a function or object is
+/// assembler-private (`L`), which the test above checks on the same program.
+/// ELF has no such directive.
+#[test]
+fn codegen_macho_units_declare_subsections_via_symbols() {
+    for triple in [AARCH64_DARWIN, X86_64_DARWIN] {
+        for opts in OPTION_SETS {
+            let asm = asm_for_with("macho_subsections", triple, PROGRAM, opts);
+            assert_eq!(
+                asm.matches(".subsections_via_symbols").count(),
+                1,
+                "{triple} {opts:?}: one `.subsections_via_symbols` per unit:\n{asm}"
+            );
+            let last = asm
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("");
+            assert_eq!(
+                last.trim(),
+                ".subsections_via_symbols",
+                "{triple} {opts:?}: it closes the unit"
+            );
+        }
+    }
+    for triple in [X86_64_LINUX, AARCH64_LINUX] {
+        let asm = asm_for_with("elf_no_subsections", triple, PROGRAM, &["-O2"]);
+        assert!(!asm.contains(".subsections_via_symbols"), "{triple}");
+    }
+}

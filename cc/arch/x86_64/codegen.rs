@@ -1757,14 +1757,7 @@ impl CodeGenerator for X86_64CodeGen {
             super::super::dwarf::generate_debug_info(&mut self.base, &unit, &fns, types);
         }
 
-        // Emit .note.GNU-stack section to mark stack as non-executable (ELF only)
-        // This prevents the "missing .note.GNU-stack section" linker warning
-        // Used on Linux, FreeBSD, and other ELF platforms (not macOS which uses Mach-O)
-        if !matches!(self.base.target.os, Os::MacOS) {
-            self.base.push_directive(Directive::Raw(
-                ".section .note.GNU-stack,\"\",@progbits".into(),
-            ));
-        }
+        self.base.push_directive(Directive::UnitEnd);
 
         // Emit all buffered LIR instructions to output string
         self.base.emit_all();

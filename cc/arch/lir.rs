@@ -1071,6 +1071,17 @@ pub enum Directive {
     /// Raw assembly string (emitted verbatim) - used for inline asm
     Raw(String),
 
+    /// The unit's last line. On ELF, the empty `.note.GNU-stack` section
+    /// that marks the stack non-executable (without it the linker warns and
+    /// makes the stack executable). On Mach-O, `.subsections_via_symbols`,
+    /// as clang ends every unit: it lets Apple's linker split each section
+    /// at every non-private symbol, so a weak definition can yield to a
+    /// strong one in another object (otherwise `duplicate symbol`) and
+    /// `-dead_strip` can drop one function. Sound only because nothing c17
+    /// emits falls through or reaches by fixed offset from one non-private
+    /// symbol into the next: every label it invents is `L`-private.
+    UnitEnd,
+
     /// A file-scope asm's text, written exactly as the source gave it and
     /// ended with a newline, as gcc writes it.
     Verbatim(String),
@@ -1639,6 +1650,14 @@ impl EmitAsm for Directive {
             Directive::Raw(text) => {
                 let _ = writeln!(out, "    {}", text);
             }
+            Directive::UnitEnd => match target.os {
+                Os::MacOS => {
+                    let _ = writeln!(out, ".subsections_via_symbols");
+                }
+                _ => {
+                    let _ = writeln!(out, "    .section .note.GNU-stack,\"\",@progbits");
+                }
+            },
             Directive::Verbatim(text) => {
                 let _ = writeln!(out, "{}", text);
             }

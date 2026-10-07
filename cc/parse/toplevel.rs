@@ -25,7 +25,7 @@ use crate::diag;
 use crate::strings::StringId;
 use crate::symbol::{Linkage, Symbol, SymbolId};
 use crate::token::lexer::{payload_text, Position, TokenType};
-use crate::types::{ArrayExtent, Type, TypeId, TypeKind, TypeModifiers};
+use crate::types::{ArrayExtent, Type, TypeId, TypeKind};
 use gettextrs::gettext;
 use std::collections::HashMap;
 
@@ -425,7 +425,7 @@ impl Parser<'_> {
             // The linkage, not the specifier: `static int f(void);` makes
             // a later `int f(void) {..}` static too (C17 6.2.2p5, p4).
             is_static: linkage == Linkage::Internal,
-            is_inline: specs.storage_class.contains(TypeModifiers::INLINE),
+            storage_class: specs.storage_class,
             calling_conv: self.types.get(typ).conv,
             attrs,
         })

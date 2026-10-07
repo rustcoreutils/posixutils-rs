@@ -142,6 +142,43 @@ fn test_definition_takes_prior_internal_linkage() {
     }
 }
 
+/// A function definition records its own storage-class specifiers and
+/// `inline`, whatever it returns. They were read off the return type, which
+/// for a struct specifier is the tag's one shared type: `extern` was lost
+/// there.
+#[test]
+fn test_definition_records_its_own_storage_class() {
+    use crate::types::TypeModifiers;
+    const EI: TypeModifiers = TypeModifiers::EXTERN.union(TypeModifiers::INLINE);
+    const SI: TypeModifiers = TypeModifiers::STATIC.union(TypeModifiers::INLINE);
+    for ret in ["int", "int *", "struct S", "struct S *", "T", "T *"] {
+        for (specs, want) in [
+            ("extern inline __attribute__((gnu_inline))", EI),
+            ("extern inline", EI),
+            ("static inline", SI),
+            ("inline", TypeModifiers::INLINE),
+            ("extern", TypeModifiers::EXTERN),
+            ("", TypeModifiers::empty()),
+        ] {
+            let src = format!(
+                "struct S {{ int b; }}; typedef struct S T;\n\
+                 {specs} {ret} f(void) {{ {ret} r = {{0}}; return r; }}"
+            );
+            let (tu, _, strings, _) = parse_tu(&src).unwrap();
+            let f = strings.lookup("f").expect("interned");
+            let def = tu
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    ExternalDecl::FunctionDef(def) if def.name == f => Some(def),
+                    _ => None,
+                })
+                .expect("defined");
+            assert_eq!(def.storage_class, want, "{src}");
+        }
+    }
+}
+
 #[test]
 fn test_tag_rules() {
     for src in [

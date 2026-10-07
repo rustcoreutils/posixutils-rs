@@ -3104,8 +3104,15 @@ pub struct FunctionDef {
     pub pos: Position,
     /// Whether function has static linkage
     pub is_static: bool,
-    /// Whether function is inline
-    pub is_inline: bool,
+    /// The definition's own storage-class specifiers and `inline`
+    /// ([`Type::STORAGE_CLASS`](crate::types::Type::STORAGE_CLASS)).
+    ///
+    /// They belong to the declaration, not to any type: a struct specifier
+    /// names the tag's one shared type, so a return type cannot carry them,
+    /// and a gnu_inline `extern inline` returning a struct read as a plain
+    /// `inline` and was emitted. `is_static` is the linkage, which an
+    /// earlier declaration can make internal without `static` here.
+    pub storage_class: TypeModifiers,
     /// The calling convention of the function's type, which
     /// `__attribute__((ms_abi))` sets: the definition is compiled under it.
     pub calling_conv: crate::abi::CallingConv,

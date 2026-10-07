@@ -2003,12 +2003,11 @@ impl<'a> Linearizer<'a> {
         self.written_labels = labels.written;
         self.label_cleanups = labels.cleanups;
 
-        // Create function - use storage class from FunctionDef
-        let modifiers = self.types.modifiers(func.return_type);
+        // The definition's own specifiers; the linkage, which an earlier
+        // declaration may have made internal, is `is_static`.
         let is_static = func.is_static || version.is_some();
-        let is_inline = func.is_inline;
-        let is_extern = modifiers.contains(TypeModifiers::EXTERN);
-        let is_noreturn = modifiers.contains(TypeModifiers::NORETURN);
+        let is_inline = func.storage_class.contains(TypeModifiers::INLINE);
+        let is_extern = func.storage_class.contains(TypeModifiers::EXTERN);
 
         // The definition is compiled under its own type's convention.
         self.current_calling_conv = func.calling_conv;
@@ -2047,10 +2046,7 @@ impl<'a> Linearizer<'a> {
         // `extern inline` after a `static` declaration has internal linkage
         // and is an ordinary static function, as in gcc.
         let is_inline_definition = if gnu_inline {
-            let mut storage = TypeModifiers::empty();
-            storage.set(TypeModifiers::EXTERN, is_extern);
-            storage.set(TypeModifiers::INLINE, is_inline);
-            !is_static && func.attrs.gnu_inline_only(storage)
+            !is_static && func.attrs.gnu_inline_only(func.storage_class)
         } else {
             is_inline && !is_static && !has_extern_decl && all_decls_inline
         };
@@ -2066,7 +2062,6 @@ impl<'a> Linearizer<'a> {
 
         ir_func.is_static = is_static;
         ir_func.emit = !is_inline_definition;
-        ir_func.is_noreturn = is_noreturn;
         ir_func.is_inline = is_inline;
         // How the symbol is emitted: by the definition's own attributes, or
         // by a version's share of them.

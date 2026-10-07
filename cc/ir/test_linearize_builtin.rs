@@ -44,7 +44,7 @@ fn test_frame_address_emits_opcode() {
         body: Stmt::Return(Some(frame_addr_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -83,7 +83,7 @@ fn test_return_address_emits_opcode() {
         body: Stmt::Return(Some(return_addr_expr)),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -136,7 +136,7 @@ fn test_valist_parameter_stored_as_pointer() {
         body: Stmt::Block(vec![]),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -201,7 +201,7 @@ fn test_valist_local_not_indirect() {
         body: Stmt::Block(vec![BlockItem::Declaration(lva_decl)]),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };
@@ -282,7 +282,7 @@ fn test_valist_expression_decay() {
         body: Stmt::Block(vec![BlockItem::Declaration(ptr_decl)]),
         pos: test_pos(),
         is_static: false,
-        is_inline: false,
+        storage_class: TypeModifiers::empty(),
         calling_conv: crate::abi::CallingConv::default(),
         param_style: ParamStyle::Prototype,
     };

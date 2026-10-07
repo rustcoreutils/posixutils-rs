@@ -33,6 +33,7 @@ mod float_to_int_saturation;
 mod floating;
 mod fp_compare_traps;
 mod fp_untaken_arms;
+mod gnu_inline_linkage;
 mod ifunc;
 mod inline_asm;
 mod inlining;

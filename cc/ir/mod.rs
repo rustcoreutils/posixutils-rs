@@ -3060,8 +3060,6 @@ pub struct Function {
     /// source: the backends write it after that many of
     /// [`Module::toplevel_asm`] and before the next.
     pub asm_before: usize,
-    /// Is this function noreturn (never returns)?
-    pub is_noreturn: bool,
     /// The calling convention of the function's type: how its parameters
     /// arrive, its value leaves, and which registers it must preserve.
     pub conv: CallingConv,
@@ -3154,7 +3152,6 @@ impl Default for Function {
             is_static: false,
             emit: true,
             asm_before: 0,
-            is_noreturn: false,
             conv: CallingConv::C,
             is_noinline: false,
             isa: Default::default(),

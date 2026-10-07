@@ -786,9 +786,7 @@ impl Type {
     /// What a declaration records as its storage class, and what a declarator
     /// carries from its specifiers onto the type it derives. `inline` is a
     /// function specifier rather than a storage class, but it travels with
-    /// them: without it `FunctionDef::is_inline` was false for every ordinary
-    /// definition, and a pointer-returning `inline` function -- `memcpy` is
-    /// exactly that shape in glibc -- lost the bit.
+    /// them, into `FunctionDef::storage_class` among the rest.
     pub const STORAGE_CLASS: TypeModifiers = TypeModifiers::STATIC
         .union(TypeModifiers::EXTERN)
         .union(TypeModifiers::REGISTER)

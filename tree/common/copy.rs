@@ -401,11 +401,73 @@ fn preserve_node_attributes(
         )
     } == 0;
     if made_type != ftw::FileType::SymbolicLink {
-        let proc_path = CString::new(format!("/proc/self/fd/{fd}")).unwrap();
-        let mode = preserved_mode(source_md, chown_ok);
-        if unsafe { libc::fchmodat(libc::AT_FDCWD, proc_path.as_ptr(), mode, 0) } != 0 {
-            return Err(preserve_mode_error(target, &io::Error::last_os_error()));
+        chmod_pinned(fd, preserved_mode(source_md, chown_ok))
+            .map_err(|e| preserve_mode_error(target, &e))?;
+    }
+    Ok(())
+}
+
+/// The `fchmodat2` system call number, where it is the generic one (Linux 6.6 and later).
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64",
+        target_arch = "s390x"
+    )
+))]
+const SYS_FCHMODAT2: Option<libc::c_long> = Some(452);
+#[cfg(all(
+    target_os = "linux",
+    not(any(
+        target_arch = "x86_64",
+        target_arch = "x86",
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "riscv64",
+        target_arch = "loongarch64",
+        target_arch = "powerpc64",
+        target_arch = "s390x"
+    ))
+))]
+const SYS_FCHMODAT2: Option<libc::c_long> = None;
+
+/// Set the mode of the inode an `O_PATH` descriptor pins, which `fchmod` refuses (EBADF).
+///
+/// First `fchmodat2(fd, "", mode, AT_EMPTY_PATH)` (Linux 6.6 and later), which acts on that
+/// inode directly. Where it does not exist (ENOSYS) or does not take `AT_EMPTY_PATH` (EINVAL),
+/// `fchmodat` on `self/fd/N` relative to a `/proc` descriptor verified to be procfs, which
+/// names the same inode. With neither, the mode is not set and the failure is reported: a
+/// by-name fallback could act on whatever the name holds by then.
+#[cfg(target_os = "linux")]
+fn chmod_pinned(fd: libc::c_int, mode: libc::mode_t) -> io::Result<()> {
+    if let Some(sys_fchmodat2) = SYS_FCHMODAT2 {
+        let ret = unsafe {
+            libc::syscall(
+                sys_fchmodat2,
+                fd,
+                c"".as_ptr(),
+                libc::c_uint::from(mode),
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if ret == 0 {
+            return Ok(());
         }
+        let e = io::Error::last_os_error();
+        if !matches!(e.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EINVAL)) {
+            return Err(e);
+        }
+    }
+    let proc_dir = procfs_dir()?;
+    let pinned = proc_fd_name(fd);
+    if unsafe { libc::fchmodat(proc_dir.as_raw_fd(), pinned.as_ptr(), mode, 0) } != 0 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }

@@ -1408,11 +1408,16 @@ impl RegAlloc {
             self.free_regs.retain(|r| *r != base);
         }
         // Before any other slot: the first is the highest, just under the
-        // variadic save area and the caller's frame, which is where the
-        // canary has to be.
+        // variadic save area and the saved registers, which is where the
+        // canary has to be -- and the arrays right under it.
         self.guard_slot = self
             .guard_requested
             .then(|| LocalSlot::from_displacement(self.new_frame_slot(8, 8)));
+        let (arrays, rest) = crate::arch::regalloc::LocalSet::of(self.guard_requested);
+        if let Some(arrays) = arrays {
+            let early = self.compute_live_intervals(func);
+            self.place_locals(func, types, &early.intervals, arrays);
+        }
         if func.receives_nonlocal_goto() {
             self.used_callee_saved
                 .extend(Reg::allocatable().iter().filter(|r| r.is_callee_saved()));
@@ -1449,7 +1454,7 @@ impl RegAlloc {
             )
         });
         self.allocate_alloca_to_stack(func);
-        self.place_locals(func, types, &intervals);
+        self.place_locals(func, types, &intervals, rest);
         self.run_chordal_color(func, types, intervals, &call_positions, &constraint_points);
 
         crate::arch::regalloc::LocationMap::from(self.locations.clone())
@@ -1685,11 +1690,16 @@ impl RegAlloc {
     }
 
     /// Give every local its frame slot; see `arch::regalloc::place_locals`.
-    fn place_locals(&mut self, func: &Function, types: &TypeTable, intervals: &[LiveInterval]) {
+    fn place_locals(
+        &mut self,
+        func: &Function,
+        types: &TypeTable,
+        intervals: &[LiveInterval],
+        set: crate::arch::regalloc::LocalSet,
+    ) {
         let pos = self.func_pos;
-        let guarded = self.guard_requested;
         let placed =
-            crate::arch::regalloc::place_locals(func, types, pos, intervals, guarded, |b, a| {
+            crate::arch::regalloc::place_locals(func, types, pos, intervals, set, |b, a| {
                 self.new_frame_slot(b, a)
             });
         for (local, offset) in placed {

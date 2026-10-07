@@ -31,6 +31,72 @@ use std::collections::HashSet;
 /// copy is linear in the object.
 pub(super) const UNROLL_LIMIT_BYTES: i64 = crate::ir::memexpand::INLINE_LIMIT_BYTES;
 
+/// Where a frame's areas lie, as displacements up from x29, which points at
+/// the frame record at the bottom of the frame.
+///
+/// The ordinary layout is `[fp/lr][callee-saved][locals][va save area]`.
+/// A function with a stack-protector canary moves the callee-saved
+/// registers to the top and adds a second copy of the frame record above
+/// them, `[fp/lr][locals][va save area][callee-saved][fp/lr copy]`, which
+/// the epilogue reloads x29 and x30 from: the area `alloca` carves lies
+/// right under the bottom record, so an overrun of it would otherwise reach
+/// the return address and the saved registers without crossing the canary
+/// at the top of the locals -- what gcc fixed for CVE-2023-4039 by moving
+/// its record above the locals. The bottom record stays for the frame
+/// chain, which `__builtin_frame_address` and debuggers walk.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct FrameLayout {
+    /// The callee-saved registers' area.
+    pub saves_at: i32,
+    /// Where the locals begin; an over-aligned frame's base register is
+    /// rounded up from here.
+    pub locals_base: i32,
+    /// Where the locals end: a slot's displacement is measured down from it.
+    pub locals_top: i32,
+    /// A protected function's copy of the frame record.
+    pub record_copy: Option<i32>,
+}
+
+impl FrameLayout {
+    /// The layout of a frame with `saves` bytes of callee-saved registers,
+    /// `locals` bytes of locals and a `va_area`-byte variadic save area,
+    /// with the variadic area's displacement and the frame's size.
+    ///
+    /// The variadic area's displacement is rounded to 16, which is not
+    /// cosmetic: the SIMD half is written with `str q`, and that
+    /// instruction's immediate is either scaled by 16 or unscaled within
+    /// +/-256. An offset that is neither -- which is what an odd `locals`
+    /// produces -- has no encoding at all, and the assembler rejects the
+    /// function outright ("immediate offset out of range"). `x29` is
+    /// 16-aligned at any public interface, so a 16-aligned displacement
+    /// from it keeps every slot 16-aligned too.
+    pub fn of(guarded: bool, saves: i32, locals: i32, va_area: i32) -> (Self, i32, i32) {
+        let round = |n: i32| (n + 15) & !15;
+        if guarded {
+            let locals_top = round(16 + locals);
+            let saves_at = locals_top + va_area;
+            let record = saves_at + saves;
+            let layout = FrameLayout {
+                saves_at,
+                locals_base: 16,
+                locals_top,
+                record_copy: Some(record),
+            };
+            return (layout, locals_top, record + 16);
+        }
+        let save_area_base = round(16 + saves + locals);
+        // The padding the rounding introduces has to be inside the frame.
+        let total = round(save_area_base + va_area);
+        let layout = FrameLayout {
+            saves_at: 16,
+            locals_base: 16 + saves,
+            locals_top: total - va_area,
+            record_copy: None,
+        };
+        (layout, save_area_base, total)
+    }
+}
+
 impl Aarch64CodeGen {
     pub(super) fn emit_function(&mut self, func: &Function, types: &TypeTable) {
         self.base.func_pos = crate::arch::func_pos(func);
@@ -92,31 +158,14 @@ impl Aarch64CodeGen {
         let callee_saved_fp_size = callee_saved_fp_pairs as i32 * 16; // 8 bytes per d-reg, 16 per pair
         let callee_saved_size = callee_saved_gp_size + callee_saved_fp_size;
 
-        // Track register save area offset for va_start (offset from FP).
-        // Layout: [fp/lr][GP callee-saved][FP callee-saved][locals][reg_save_area]
-        //
-        // Rounded to 16, which is not cosmetic: the SIMD half is written with
-        // `str q`, and that instruction's immediate is either scaled by 16 or
-        // unscaled within +/-256. An offset that is neither -- which is what
-        // an odd `stack_size` produces -- has no encoding at all, and the
-        // assembler rejects the function outright ("immediate offset out of
-        // range"). `q0` at 223 assembles as the unscaled form and `q5` at 303
-        // does not, so the failure appears only once the frame is large
-        // enough, which is why an over-aligned local is what surfaces it.
-        //
-        // `x29` is 16-aligned at any public interface, so a 16-aligned
-        // displacement from it keeps every slot 16-aligned too.
-        let save_area_base = (16 + callee_saved_size + stack_size + 15) & !15;
+        let (layout, save_area_base, total_frame) = FrameLayout::of(
+            self.stack_guard.is_some(),
+            callee_saved_size,
+            stack_size,
+            reg_save_area_size,
+        );
+        self.layout = layout;
         self.reg_save_area_offset = if is_variadic { save_area_base } else { 0 };
-
-        // The padding the rounding introduces has to be inside the frame.
-        let total_frame = if is_variadic {
-            save_area_base + reg_save_area_size
-        } else {
-            16 + callee_saved_size + stack_size
-        };
-        // Ensure 16-byte alignment
-        let total_frame = (total_frame + 15) & !15;
 
         // Save function name, frame size, and callee-saved size for label generation and offset calculation
         // Local labels are derived from this and are compiler-internal, so
@@ -125,8 +174,6 @@ impl Aarch64CodeGen {
         self.base.current_fn = crate::arch::lir::undecorated(&func.name).to_string();
         self.base.func_pos = crate::arch::func_pos(func);
         self.frame_size = total_frame;
-        self.callee_saved_size = callee_saved_size;
-        self.reg_save_area_size = reg_save_area_size;
         self.stack_alloc_size = stack_size;
 
         // Emit function header (directives, label, CFI start)
@@ -209,7 +256,7 @@ impl Aarch64CodeGen {
         else {
             return;
         };
-        let base_offset = 16 + self.callee_saved_size;
+        let base_offset = self.layout.locals_base;
         // base = (FP + base_offset + max_align - 1) & ~(max_align - 1)
         self.push_lir(Aarch64Inst::Add {
             size: OperandSize::B64,
@@ -428,6 +475,21 @@ impl Aarch64CodeGen {
         // x29 (fp) is saved at [sp+0], x30 (lr) is saved at [sp+8]
         self.push_cfi(Directive::cfi_offset("x29", -total_frame));
         self.push_cfi(Directive::cfi_offset("x30", -(total_frame - 8)));
+        // A protected function's copy, which the epilogue reloads, and so
+        // the unwinder too.
+        if let Some(copy) = self.layout.record_copy {
+            self.push_lir(Aarch64Inst::Stp {
+                size: OperandSize::B64,
+                src1: fp,
+                src2: lr,
+                addr: MemAddr::BaseOffset {
+                    base: Reg::SP,
+                    offset: copy,
+                },
+            });
+            self.push_cfi(Directive::cfi_offset("x29", -(total_frame - copy)));
+            self.push_cfi(Directive::cfi_offset("x30", -(total_frame - copy - 8)));
+        }
         // Set up frame pointer: mov x29, sp
         self.push_lir(Aarch64Inst::Mov {
             size: OperandSize::B64,
@@ -440,7 +502,7 @@ impl Aarch64CodeGen {
         self.save_callee_saved_gp_regs(total_frame, callee_saved);
 
         // Save callee-saved FP registers in pairs
-        let gp_offset = 16 + (callee_saved.len().div_ceil(2) as i32 * 16);
+        let gp_offset = self.layout.saves_at + (callee_saved.len().div_ceil(2) as i32 * 16);
         self.save_callee_saved_fp_regs(total_frame, callee_saved_fp, gp_offset);
     }
 
@@ -521,7 +583,7 @@ impl Aarch64CodeGen {
 
     /// Save callee-saved GP registers in pairs (or single if odd count)
     fn save_callee_saved_gp_regs(&mut self, total_frame: i32, callee_saved: &[Reg]) {
-        let mut offset = 16; // Start after fp/lr
+        let mut offset = self.layout.saves_at;
         let mut i = 0;
         while i < callee_saved.len() {
             if i + 1 < callee_saved.len() {
@@ -1486,7 +1548,7 @@ impl Aarch64CodeGen {
         // reloaded: its slot is about to fall below SP, where a signal frame
         // may overwrite it.
         if self.frame_size > 16 {
-            let mut offset = 16;
+            let mut offset = self.layout.saves_at;
             let mut i = 0;
             while i < callee_saved.len() {
                 if i + 1 < callee_saved.len() {
@@ -1554,7 +1616,21 @@ impl Aarch64CodeGen {
         const MAX_LDP_OFFSET: i32 = 504;
         let dealloc = self.frame_size;
 
-        if dealloc <= MAX_LDP_OFFSET {
+        if let Some(copy) = self.layout.record_copy {
+            // A protected function's copy, above the canary.
+            self.push_lir(Aarch64Inst::Ldp {
+                size: OperandSize::B64,
+                addr: MemAddr::BaseOffset {
+                    base: Reg::sp(),
+                    offset: copy,
+                },
+                dst1: Reg::fp(),
+                dst2: Reg::lr(),
+            });
+            self.push_cfi(Directive::cfi_restore("x30"));
+            self.push_cfi(Directive::cfi_restore("x29"));
+            self.emit_sp_adjust(dealloc, dealloc);
+        } else if dealloc <= MAX_LDP_OFFSET {
             // Combined restore and deallocate: ldp x29, x30, [sp], #N
             self.push_lir(Aarch64Inst::Ldp {
                 size: OperandSize::B64,
@@ -1656,5 +1732,35 @@ impl Aarch64CodeGen {
             )),
         });
         self.push_lir(Aarch64Inst::Directive(Directive::BlockLabel(intact)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FrameLayout;
+
+    /// Without a canary the layout is the ordinary one: record, saves,
+    /// locals, variadic area.
+    #[test]
+    fn frame_layout_unguarded() {
+        let (l, va, total) = FrameLayout::of(false, 32, 40, 192);
+        assert_eq!((l.saves_at, l.locals_base, l.record_copy), (16, 48, None));
+        assert_eq!((va, total), (96, 288));
+        assert_eq!(l.locals_top, 96);
+        let (l, _, total) = FrameLayout::of(false, 16, 8, 0);
+        assert_eq!((total, l.locals_top), (48, 48));
+    }
+
+    /// With one, the locals sit right over the bottom record and everything
+    /// the epilogue reloads lies above them and the variadic area.
+    #[test]
+    fn frame_layout_guarded() {
+        let (l, va, total) = FrameLayout::of(true, 32, 40, 192);
+        assert_eq!((l.locals_base, l.locals_top), (16, 64));
+        assert_eq!(va, 64);
+        assert_eq!(l.saves_at, 64 + 192);
+        assert_eq!(l.record_copy, Some(64 + 192 + 32));
+        assert_eq!(total, 64 + 192 + 32 + 16);
+        assert_eq!(total % 16, 0);
     }
 }

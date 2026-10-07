@@ -220,6 +220,94 @@ fn stack_protector_over_aligned_vla_and_setjmp_frames() {
     }
 }
 
+/// Of several arrays and scalars, an overrun of the array nearest the
+/// canary -- the first `char` array, wherever it was declared -- is caught,
+/// and the scalars declared around it are not what it overwrites on the way.
+const HIGHEST: &str = r#"
+#include <stdio.h>
+volatile int n = NBYTES;
+__attribute__((noinline)) int victim(void) {
+    volatile long before = 1;
+    int words[4] = { 1, 2, 3, 4 };
+    char top[16];
+    volatile long mid = 2;
+    char next[16];
+    volatile long after = 3;
+    for (int i = 0; i < 16; i++) next[i] = 'a';
+    for (int i = 0; i < n; i++) top[i] = 'z';
+    return (int)(before + mid + after) + words[3] + next[0] + top[0];
+}
+int main(void) {
+    printf("%d\n", victim());
+    return 0;
+}
+"#;
+
+#[test]
+fn stack_protector_catches_the_highest_array() {
+    for opt in ["-O0", "-O2"] {
+        let flags = ["-fstack-protector-strong", opt];
+        let ok = HIGHEST.replace("NBYTES", "16");
+        let out = run_host("ssp_high_ok", &ok, &flags);
+        assert!(out.status.success(), "{opt}: {:?}", out.status);
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "229\n", "{opt}");
+        let bad = HIGHEST.replace("NBYTES", "48");
+        let out = run_host("ssp_high_bad", &bad, &flags);
+        assert!(smashed(&out), "{opt}: {:?}", out.status);
+        if let Some(out) = compile_and_capture_aarch64("ssp_a64_high", &ok, &flags, &[]) {
+            assert!(out.status.success(), "aarch64 {opt}: {:?}", out.status);
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "229\n", "{opt}");
+            let out = compile_and_capture_aarch64("ssp_a64_high_bad", &bad, &flags, &[]).unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains("*** stack smashing detected ***"),
+                "aarch64 {opt}: {stderr}"
+            );
+        }
+    }
+}
+
+/// On aarch64 the area a VLA takes lies right under the frame record at
+/// `[x29]`. A protected function reloads x29 and x30 -- and its callee-saved
+/// registers -- from above the canary instead, so an overrun of the VLA into
+/// that record does not reach the return address: the function returns
+/// where it was called from, with what it computed.
+const VLA_RECORD: &str = r#"
+#include <stdio.h>
+volatile int len = 32;
+volatile int past = 16;
+extern long g(long);
+long g(long v) { return v * 3; }
+__attribute__((noinline)) long f(void) {
+    long a = g(len), b = g(a), c = g(b);
+    char buf[len];
+    for (int i = 0; i < len + past; i++)
+        buf[i] = 7;
+    return a + b + c + buf[0];
+}
+int main(void) {
+    printf("%ld\n", f());
+    return 0;
+}
+"#;
+
+#[test]
+fn stack_protector_aarch64_vla_overrun_keeps_the_return_address() {
+    for opt in ["-O0", "-O2"] {
+        let flags = ["-fstack-protector", opt];
+        let Some(out) = compile_and_capture_aarch64("ssp_a64_vla", VLA_RECORD, &flags, &[]) else {
+            return;
+        };
+        assert!(
+            out.status.success(),
+            "{opt}: {:?}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "1255\n", "{opt}");
+    }
+}
+
 /// aarch64, under qemu: the guard comes from `__stack_chk_guard` there.
 #[test]
 fn stack_protector_aarch64() {

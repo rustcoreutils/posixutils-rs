@@ -47,13 +47,10 @@ pub struct Aarch64CodeGen {
     pub(super) pseudos: crate::arch::codegen::PseudoTable,
     /// Total frame size for current function
     pub(super) frame_size: i32,
-    /// Size of callee-saved register area (for computing local variable offsets)
-    pub(super) callee_saved_size: i32,
+    /// Where the current function's frame areas lie.
+    pub(super) layout: crate::arch::aarch64::frame::FrameLayout,
     /// Offset from FP to register save area (for variadic functions)
     pub(super) reg_save_area_offset: i32,
-    /// Size of register save area (for variadic functions)
-    /// Used to compute correct FP-relative offsets for local variables
-    pub(super) reg_save_area_size: i32,
     /// Number of fixed GP parameters (for variadic functions)
     pub(super) num_fixed_gp_params: usize,
     /// Number of fixed FP/SIMD parameters (for variadic functions)
@@ -97,9 +94,8 @@ impl Aarch64CodeGen {
             locations: crate::arch::regalloc::LocationMap::new(),
             pseudos: Default::default(),
             frame_size: 0,
-            callee_saved_size: 0,
+            layout: Default::default(),
             reg_save_area_offset: 0,
-            reg_save_area_size: 0,
             num_fixed_gp_params: 0,
             num_fixed_fp_params: 0,
             named_stack_param_bytes: 0,
@@ -144,10 +140,9 @@ impl Aarch64CodeGen {
                 let base_rounded = self.stack_alloc_size - (align - 1);
                 base_rounded + offset
             } else {
-                // Local variable: use frame size minus reg_save_area
-                // Layout: [fp/lr][callee-saved][locals][reg_save_area]
-                // Locals are at offsets from (frame_size - reg_save_area_size)
-                (self.frame_size - self.reg_save_area_size) + offset
+                // Measured down from the top of the locals; see
+                // `FrameLayout`.
+                self.layout.locals_top + offset
             }
         } else {
             // Positive offset = stack args (passed by caller)

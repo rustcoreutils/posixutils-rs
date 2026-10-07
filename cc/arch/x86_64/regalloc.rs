@@ -1172,8 +1172,14 @@ impl RegAlloc {
             self.used_callee_saved.push(base);
         }
         // Before any other slot: the first is the highest, nearest the saved
-        // registers, which is where the canary has to be.
+        // registers, which is where the canary has to be -- and the arrays
+        // right under it.
         self.guard_slot = self.guard_requested.then(|| self.new_frame_slot(8, 8));
+        let (arrays, rest) = crate::arch::regalloc::LocalSet::of(self.guard_requested);
+        if let Some(arrays) = arrays {
+            let early = self.compute_live_intervals(func);
+            self.place_locals(func, types, &early.intervals, arrays);
+        }
         let win64 = func.conv == crate::abi::CallingConv::Win64;
         if win64 {
             self.used_callee_saved
@@ -1220,7 +1226,7 @@ impl RegAlloc {
             )
         });
         self.allocate_alloca_to_stack(func);
-        self.place_locals(func, types, &intervals);
+        self.place_locals(func, types, &intervals, rest);
         self.run_chordal_color(
             func,
             intervals,
@@ -2081,11 +2087,16 @@ impl RegAlloc {
     }
 
     /// Give every local its frame slot; see `arch::regalloc::place_locals`.
-    fn place_locals(&mut self, func: &Function, types: &TypeTable, intervals: &[LiveInterval]) {
+    fn place_locals(
+        &mut self,
+        func: &Function,
+        types: &TypeTable,
+        intervals: &[LiveInterval],
+        set: crate::arch::regalloc::LocalSet,
+    ) {
         let pos = self.func_pos;
-        let guarded = self.guard_requested;
         let placed =
-            crate::arch::regalloc::place_locals(func, types, pos, intervals, guarded, |b, a| {
+            crate::arch::regalloc::place_locals(func, types, pos, intervals, set, |b, a| {
                 self.new_frame_slot(b, a)
             });
         for (local, offset) in placed {

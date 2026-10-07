@@ -67,6 +67,7 @@ mod codegen_promotion;
 mod codegen_regalloc;
 mod codegen_sections;
 mod codegen_stack_protector;
+mod codegen_stack_protector_layout;
 mod codegen_stacked_args;
 mod codegen_symbols;
 mod codegen_target_attr;

@@ -898,16 +898,41 @@ pub fn local_slot(
 /// agree in size and alignment and its interval -- its lifetime, see
 /// `local_lifetimes` -- overlaps none the slot has held.
 ///
-/// A function with a stack-protector canary (`guarded`) lays its arrays out
-/// first, `char` arrays before the rest, as gcc does: the canary is the slot
-/// before them, so an array that overruns reaches it without passing over a
-/// scalar the function may still read before it returns.
+/// Which of a function's locals [`place_locals`] lays out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalSet {
+    /// Every local, in declaration order: a function without a canary.
+    All,
+    /// A protected function's arrays and aggregates holding one.
+    Arrays,
+    /// A protected function's other locals.
+    Rest,
+}
+
+impl LocalSet {
+    /// The two sets a function with a canary (`guarded`) lays out, in order,
+    /// or the one set of one without.
+    pub fn of(guarded: bool) -> (Option<Self>, Self) {
+        if guarded {
+            (Some(Self::Arrays), Self::Rest)
+        } else {
+            (None, Self::All)
+        }
+    }
+}
+
+/// `set` says which locals: a function with a stack-protector canary lays
+/// its arrays out first ([`LocalSet::Arrays`]), right after the canary and
+/// before any other slot, `char` arrays before the rest, as gcc does -- so
+/// an array that overruns reaches the canary without passing over a spilled
+/// argument or a scalar the function may still read before it returns --
+/// and the rest ([`LocalSet::Rest`]) where the others go.
 pub fn place_locals(
     func: &Function,
     types: &TypeTable,
     pos: crate::diag::Position,
     intervals: &[LiveInterval],
-    guarded: bool,
+    set: LocalSet,
     mut new_slot: impl FnMut(i32, i32) -> i32,
 ) -> Vec<(PseudoId, i32)> {
     struct Shared {
@@ -925,10 +950,16 @@ pub fn place_locals(
         .values()
         .filter(|l| lifetime.contains_key(&l.sym))
         .collect();
-    if guarded {
-        locals.sort_by_key(|l| (crate::arch::stack_protect::placement(l.typ, types), l.sym.0));
-    } else {
+    let phase = |l: &&crate::ir::LocalVar| crate::arch::stack_protect::placement(l.typ, types);
+    match set {
+        LocalSet::All => {}
+        LocalSet::Arrays => locals.retain(|l| phase(l) < 2),
+        LocalSet::Rest => locals.retain(|l| phase(l) == 2),
+    }
+    if set == LocalSet::All {
         locals.sort_by_key(|l| l.sym.0);
+    } else {
+        locals.sort_by_key(|l| (phase(l), l.sym.0));
     }
     let mut slots: Vec<Shared> = Vec::new();
     let mut placed = Vec::with_capacity(locals.len());

@@ -276,8 +276,30 @@ pub fn delete_target(
     }
     if target.exists() {
         fs::remove_file(target)?;
+        prune_empty_parents(target);
     }
     Ok(())
+}
+
+/// Remove the directories a removed file leaves empty, innermost first, as
+/// GNU patch does; stop at the first that is not empty. Only a relative name
+/// is pruned, and only below the working directory: an absolute name is the
+/// user's own operand, and the directories above it are none of patch's
+/// business.
+fn prune_empty_parents(removed: &Path) {
+    if !removed
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
+    {
+        return;
+    }
+    let mut dir = removed.parent();
+    while let Some(d) = dir {
+        if d.as_os_str().is_empty() || d == Path::new(".") || fs::remove_dir(d).is_err() {
+            break;
+        }
+        dir = d.parent();
+    }
 }
 
 /// Write content to the output file, handling backup if needed.

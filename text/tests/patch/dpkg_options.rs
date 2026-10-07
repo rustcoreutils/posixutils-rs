@@ -269,3 +269,31 @@ fn test_patch_reject_file_long_form() {
     assert!(!dir.join("m.txt.rej").exists());
     cleanup_test_dir(&dir);
 }
+
+// Removing a file also removes the directories it leaves empty, up to (not
+// including) the working directory, as GNU patch does. Debian glibc's patches
+// delete the only file in advisories/, and GNU leaves no advisories/ behind.
+#[test]
+fn test_patch_removal_prunes_empty_directories() {
+    let dir = setup_test_dir("prune_dirs");
+    fs::create_dir_all(dir.join("d1/d2")).unwrap();
+    fs::write(dir.join("d1/d2/f.txt"), "x\n").unwrap();
+    fs::create_dir_all(dir.join("k")).unwrap();
+    fs::write(dir.join("k/e.txt"), "a\n").unwrap();
+    fs::write(dir.join("k/keep"), "z\n").unwrap();
+    let patch = format!(
+        "{}{}",
+        "--- a/d1/d2/f.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n",
+        "--- a/k/e.txt\n+++ b/k/e.txt\n@@ -1 +0,0 @@\n-a\n"
+    );
+    let args = quilt_args("p9");
+    let args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let (code, err) = run_in(&dir, &args, &patch);
+    assert_eq!(code, 0, "stderr: {}", err);
+    assert!(!dir.join("d1").exists(), "d1/d2 and d1 are left empty");
+    assert!(!dir.join("k/e.txt").exists());
+    assert!(dir.join("k/keep").exists(), "k still holds a file");
+    assert_eq!(read(&dir, ".pc/p9/d1/d2/f.txt"), "x\n");
+    assert!(dir.exists(), "the working directory itself stays");
+    cleanup_test_dir(&dir);
+}

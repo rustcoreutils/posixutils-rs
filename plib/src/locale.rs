@@ -753,6 +753,19 @@ pub fn mb_char_slices(bytes: &[u8]) -> Vec<&[u8]> {
     result
 }
 
+/// The offset just past the character that starts at `pos` in `bytes`, under
+/// the current `LC_CTYPE`, or `None` when `pos` is at (or past) the end.
+///
+/// A scan that steps over an empty regex match must step by a whole
+/// character, not one byte: an offset inside a multibyte character is not
+/// valid text for `regexec`, which then reports no match at all.
+pub fn next_char_offset(bytes: &[u8], pos: usize) -> Option<usize> {
+    let rest = bytes.get(pos..).filter(|rest| !rest.is_empty())?;
+    // No encoding has a character longer than this.
+    const MAX_CHAR_LEN: usize = 16;
+    Some(pos + mb_char_len_fn()(&rest[..rest.len().min(MAX_CHAR_LEN)]))
+}
+
 /// A function giving the byte length of the character that starts a non-empty
 /// slice, between 1 and the slice's length, for [`mb_char_slices`]. On Unix it
 /// owns the `mbrtowc` conversion state across calls.
@@ -1521,6 +1534,19 @@ mod windows_tests {
         let slices = mb_char_slices(s.as_bytes());
         let want: Vec<&[u8]> = vec![b"a", "é".as_bytes(), "世".as_bytes(), "🦀".as_bytes()];
         assert_eq!(slices, want);
+    }
+
+    #[test]
+    fn next_char_offset_steps_whole_characters() {
+        let _mode = ctype(CtypeMode::Unicode);
+        let s = "aé🦀".as_bytes();
+        assert_eq!(next_char_offset(s, 0), Some(1));
+        assert_eq!(next_char_offset(s, 1), Some(3));
+        assert_eq!(next_char_offset(s, 3), Some(7));
+        assert_eq!(next_char_offset(s, 7), None);
+        assert_eq!(next_char_offset(s, 8), None);
+        // A byte that begins no character is one of its own.
+        assert_eq!(next_char_offset(b"\xA9x", 0), Some(1));
     }
 
     #[test]

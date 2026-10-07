@@ -543,3 +543,615 @@ fn test_paired_gnu_long_name_records_skip_the_whole_group() {
         "the diagnostic should report the member's real name: {err}"
     );
 }
+
+/// POSIX ustar: for typeflags 3, 4 and 6 "no data logical records shall be
+/// stored on the medium. Additionally, for type 6, the size field shall be
+/// ignored when reading." A FIFO header whose size field says 1024 must not
+/// swallow the member after it as its data.
+#[test]
+fn test_fifo_size_field_is_ignored() {
+    let mut a = Ustar {
+        name: b"fifo",
+        typeflag: b'6',
+        size: Some(1024),
+        ..Default::default()
+    }
+    .header()
+    .to_vec();
+    a.extend_from_slice(
+        &Ustar {
+            name: b"hidden.txt",
+            body: b"HIDDEN\n",
+            ..Default::default()
+        }
+        .member(),
+    );
+    a.extend_from_slice(
+        &Ustar {
+            name: b"visible.txt",
+            body: b"VISIBLE\n",
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let output = run_pax_with_stdin_bytes(&[], &a);
+    assert_success(&output, "list");
+    assert_eq!(stdout_str(&output), "fifo\nhidden.txt\nvisible.txt\n");
+}
+
+/// The same for character and block special files, whose headers carry no
+/// data either.
+#[test]
+fn test_device_size_field_carries_no_data() {
+    for typeflag in *b"34" {
+        let mut a = Ustar {
+            name: b"dev",
+            typeflag,
+            size: Some(512),
+            ..Default::default()
+        }
+        .header()
+        .to_vec();
+        a.extend_from_slice(
+            &Ustar {
+                name: b"next.txt",
+                body: b"NEXT\n",
+                ..Default::default()
+            }
+            .archive(),
+        );
+
+        let output = run_pax_with_stdin_bytes(&[], &a);
+        assert_success(&output, "list");
+        assert_eq!(
+            stdout_str(&output),
+            "dev\nnext.txt\n",
+            "typeflag {}",
+            typeflag as char
+        );
+    }
+}
+
+/// An archive cut off inside a header block -- an interrupted download -- is
+/// not a clean end of archive. The members before the cut are still listed,
+/// but pax must say the archive is truncated and exit non-zero, as bsdtar and
+/// BSD pax do, rather than silently report a shorter archive.
+#[test]
+fn test_ustar_truncated_inside_header_is_an_error() {
+    let mut a = Ustar {
+        name: b"one",
+        body: b"ONE\n",
+        ..Default::default()
+    }
+    .member();
+    let cut = a.len() + 300;
+    a.extend_from_slice(
+        &Ustar {
+            name: b"two",
+            body: b"TWO\n",
+            ..Default::default()
+        }
+        .archive(),
+    );
+    a.truncate(cut);
+
+    let output = run_pax_with_stdin_bytes(&[], &a);
+    assert_exit_code(&output, 1, "list of an archive cut inside a header");
+    assert_eq!(stdout_str(&output), "one\n");
+}
+
+/// The cpio form: a stray partial header after the last whole member.
+#[test]
+fn test_cpio_truncated_inside_header_is_an_error() {
+    let mut a = CpioNewc {
+        name: b"one",
+        body: b"ONE\n",
+        ..Default::default()
+    }
+    .member();
+    a.push(b'0');
+
+    let output = run_pax_with_stdin_bytes(&[], &a);
+    assert_exit_code(&output, 1, "list of a cpio archive cut inside a header");
+    assert_eq!(stdout_str(&output), "one\n");
+}
+
+/// A fatal error part-way through still leaves the directories already
+/// extracted with their archived attributes: the deferred pass is what gives
+/// a directory its mode and times, and skipping it on the error path left
+/// them with the creation mode and the time of extraction.
+#[test]
+fn test_fatal_read_error_still_applies_directory_attributes() {
+    let temp = plib::tmp::TempDir::new().unwrap();
+    let mut archive = Ustar {
+        name: b"d/",
+        typeflag: b'5',
+        mode: 0o750,
+        mtime: 1_000_000_000,
+        ..Default::default()
+    }
+    .member();
+    // A member whose header promises far more data than follows: reading it
+    // runs out of archive, which ends the extraction.
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"d/f",
+            body: b"x",
+            size: Some(100_000),
+            ..Default::default()
+        }
+        .member(),
+    );
+
+    let out = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, temp.path());
+    assert!(!out.status.success(), "a truncated archive must fail");
+    let meta = std::fs::metadata(temp.path().join("d")).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(meta.mtime(), 1_000_000_000, "{}", stderr_str(&out));
+}
+
+/// An extended header member: an `x` or `g` header whose data is `records`.
+fn ext_header(typeflag: u8, records: &[u8]) -> Vec<u8> {
+    Ustar {
+        name: b"PaxHeaders/h",
+        typeflag,
+        body: records,
+        ..Default::default()
+    }
+    .member()
+}
+
+/// A GNU `L` long-name record carrying `name`.
+fn gnu_long_name(name: &[u8]) -> Vec<u8> {
+    let body = [name, b"\0"].concat();
+    Ustar {
+        name: b"././@LongLink",
+        typeflag: b'L',
+        body: &body,
+        ..Default::default()
+    }
+    .member()
+}
+
+/// Each `g` header is capped, but every one is layered over the global values
+/// already in force, so a run of them naming distinct keywords piled up
+/// without limit: sixteen 16 MiB headers held 256 MiB. The merged global set
+/// is capped as a whole.
+#[test]
+fn test_global_headers_are_capped_in_total() {
+    let temp = plib::tmp::TempDir::new().unwrap();
+    let value = vec![b'v'; 33 * 1024 * 1024];
+    let mut archive = ext_header(b'g', &pax_record("one", &value));
+    archive.extend_from_slice(&ext_header(b'g', &pax_record("two", &value)));
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"f",
+            ..Default::default()
+        }
+        .archive(),
+    );
+    let path = temp.path().join("g.tar");
+    std::fs::write(&path, &archive).unwrap();
+
+    let output = run_pax(&["-f", path.to_str().unwrap()]);
+    assert_exit_code(
+        &output,
+        1,
+        "list an archive whose global records exceed the cap",
+    );
+    assert!(
+        stderr_str(&output).contains("global extended header"),
+        "the cap must be named: {}",
+        stderr_str(&output)
+    );
+}
+
+/// POSIX: a record is "%d %s=%s\n", and its length is a decimal number. A
+/// record whose last byte is not the <newline>, or whose length has a sign,
+/// is malformed -- reading it anyway dropped the value's last byte.
+#[test]
+fn test_malformed_record_framing_is_rejected() {
+    for records in [b"11 path=abc".as_slice(), b"+13 path=abc\n"] {
+        let output = run_pax_with_stdin_bytes(&[], &archive_with_ext_records(records));
+        assert_exit_code(&output, 1, "list a malformed extended header record");
+        assert!(
+            !stdout_str(&output).contains("ab"),
+            "{:?} must not name the member: {}",
+            String::from_utf8_lossy(records),
+            stdout_str(&output)
+        );
+    }
+}
+
+/// A numeric record value is decimal digits (a time may be negative), and
+/// Rust's `parse` also takes a leading '+'. bsdtar does not, so `size=+5`
+/// framed the member one way for pax and another for bsdtar -- a member one
+/// tool sees and the other does not.
+#[test]
+fn test_numeric_record_with_a_plus_sign_is_rejected() {
+    for (keyword, value) in [
+        ("size", b"+5".as_slice()),
+        ("uid", b"+1"),
+        ("gid", b"+1"),
+        ("mtime", b"+1"),
+        ("atime", b"+1.5"),
+    ] {
+        let mut archive = ext_header(b'x', &pax_record(keyword, value));
+        archive.extend_from_slice(
+            &Ustar {
+                name: b"f",
+                body: b"hello",
+                ..Default::default()
+            }
+            .archive(),
+        );
+        let output = run_pax_with_stdin_bytes(&[], &archive);
+        assert_exit_code(&output, 1, &format!("list {keyword}=+"));
+        let value = std::str::from_utf8(value).unwrap();
+        assert!(
+            stderr_str(&output).contains(&format!("invalid {keyword}: {value}"))
+                || stderr_str(&output).contains(&format!("invalid pax time: {value}")),
+            "the diagnostic must name {keyword}={value}: {}",
+            stderr_str(&output)
+        );
+    }
+}
+
+/// The same for a newc header's hexadecimal fields: `from_str_radix` takes a
+/// leading '+', GNU and BSD cpio do not.
+#[test]
+fn test_newc_hex_field_with_a_plus_sign_is_rejected() {
+    let mut archive = CpioNewc {
+        name: b"f",
+        body: b"hello",
+        ..Default::default()
+    }
+    .archive();
+    // c_filesize: the seventh eight-digit field after the six-byte magic.
+    let filesize = 6 + 6 * 8;
+    archive[filesize..filesize + 8].copy_from_slice(b"+0000005");
+
+    let output = run_pax_with_stdin_bytes(&["-x", "cpio"], &archive);
+    assert_exit_code(&output, 1, "list a newc header with a signed field");
+    assert!(
+        !stdout_str(&output).contains('f'),
+        "the member must not be listed: {}",
+        stdout_str(&output)
+    );
+}
+
+/// An `x` header whose `size=` record describes a member that a GNU `L`
+/// record also describes: the member is skipped, and it has to be skipped by
+/// the size the `x` header gave it, or its data is read as headers.
+#[test]
+fn test_extended_size_applies_across_a_gnu_long_name_group() {
+    let long = [b'L'; 150];
+    let mut archive = ext_header(b'x', &pax_record("size", b"1024"));
+    archive.extend_from_slice(&gnu_long_name(&long));
+    archive.extend_from_slice(
+        &Ustar {
+            name: &long[..100],
+            size: Some(0),
+            ..Default::default()
+        }
+        .header(),
+    );
+    archive.extend_from_slice(&[b'B'; 1024]);
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"after",
+            body: b"after\n",
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let output = run_pax_with_stdin_bytes(&[], &archive);
+    assert_eq!(stdout_str(&output), "after\n", "{}", stderr_str(&output));
+    assert!(
+        !stderr_str(&output).contains("checksum"),
+        "the member's data must be skipped, not read as a header: {}",
+        stderr_str(&output)
+    );
+}
+
+/// An `x` header between a GNU `L` record and the member they both describe
+/// is not the member. Taking it for one skipped the `x` header's data and
+/// then read the real member under its truncated 100-byte name -- exactly
+/// the name the skip is there to avoid. An `x` header that names the member
+/// itself makes the `L` record moot, and the member is read under that name.
+#[test]
+fn test_extended_header_after_a_gnu_long_name_record() {
+    let long = [b'L'; 150];
+    let build = |records: &[u8]| {
+        let mut archive = gnu_long_name(&long);
+        archive.extend_from_slice(&ext_header(b'x', records));
+        archive.extend_from_slice(
+            &Ustar {
+                name: &long[..100],
+                body: b"data\n",
+                ..Default::default()
+            }
+            .member(),
+        );
+        archive.extend_from_slice(
+            &Ustar {
+                name: b"after",
+                body: b"after\n",
+                ..Default::default()
+            }
+            .archive(),
+        );
+        archive
+    };
+
+    let output = run_pax_with_stdin_bytes(&[], &build(&pax_record("uname", b"u")));
+    assert_eq!(stdout_str(&output), "after\n", "{}", stderr_str(&output));
+    assert!(stderr_str(&output).contains("GNU long name record"));
+
+    let output = run_pax_with_stdin_bytes(&[], &build(&pax_record("path", b"named")));
+    assert_success(&output, "list a member an x header names over an L record");
+    assert_eq!(stdout_str(&output), "named\nafter\n");
+}
+
+/// An old GNU header (magic "ustar  \0") has no prefix field: those bytes
+/// hold the access and change times. Joining them onto the name made
+/// `dir/file` into `14524770401/dir/file`.
+#[test]
+fn test_old_gnu_header_has_no_prefix_field() {
+    let mut archive = Ustar {
+        name: b"dir/file",
+        body: b"hello",
+        ..Default::default()
+    }
+    .archive();
+    archive[257..265].copy_from_slice(b"ustar  \0");
+    archive[345..357].copy_from_slice(b"14524770401\0");
+    archive[357..369].copy_from_slice(b"14524770402\0");
+    reseal_header(&mut archive);
+
+    let output = run_pax_with_stdin_bytes(&[], &archive);
+    assert_success(&output, "list an old GNU archive");
+    assert_eq!(stdout_str(&output), "dir/file\n");
+}
+
+/// A base-256 id or mode wider than 32 bits has no value pax can give the
+/// file. Truncating it made a uid of 2^32 into 0 -- root, on a setuid file.
+#[test]
+fn test_base256_field_beyond_32_bits_is_refused() {
+    for offset in [100, 108, 116] {
+        let mut archive = Ustar {
+            name: b"wide",
+            body: b"x",
+            mode: 0o4755,
+            ..Default::default()
+        }
+        .archive();
+        archive[offset] = 0x80;
+        archive[offset + 1..offset + 8].copy_from_slice(&(1u64 << 32).to_be_bytes()[1..]);
+        reseal_header(&mut archive);
+
+        let output = run_pax_with_stdin_bytes(&["-v"], &archive);
+        assert_exit_code(&output, 1, "list a header with a 33-bit field");
+        assert!(
+            !stdout_str(&output).contains("wide"),
+            "field at {offset} must not be truncated: {}",
+            stdout_str(&output)
+        );
+    }
+}
+
+/// Historical writers pad numeric fields with leading spaces, and sum the
+/// checksum over signed bytes. Format detection already accepted both; the
+/// header parser then refused the archive it had just detected.
+#[test]
+fn test_historical_numeric_fields_are_accepted() {
+    let mut spaced = Ustar {
+        name: b"lead",
+        body: b"hello",
+        ..Default::default()
+    }
+    .archive();
+    spaced[100..108].copy_from_slice(b"   644 \0");
+    spaced[124..136].copy_from_slice(b"          5 ");
+    // The checksum field itself in the "%6o" form, leading spaces included.
+    let sum: u32 = {
+        let mut h = spaced[..BLOCK].to_vec();
+        h[148..156].copy_from_slice(b"        ");
+        h.iter().map(|&b| b as u32).sum()
+    };
+    spaced[148..156].copy_from_slice(format!("{sum:6o}\0 ").as_bytes());
+
+    let output = run_pax_with_stdin_bytes(&["-v"], &spaced);
+    assert_success(&output, "list a header with space-padded numbers");
+    assert!(stdout_str(&output).contains("-rw-r--r--"));
+    assert!(stdout_str(&output).contains("lead"));
+
+    let mut signed = Ustar {
+        name: b"caf\xe9",
+        body: b"x",
+        ..Default::default()
+    }
+    .archive();
+    signed[148..156].copy_from_slice(b"        ");
+    let sum: i32 = signed[..BLOCK].iter().map(|&b| b as i8 as i32).sum();
+    signed[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+
+    let output = run_pax_with_stdin_bytes(&[], &signed);
+    assert_success(&output, "list a header with a signed checksum");
+    assert_eq!(output.stdout, b"caf\xe9\n");
+}
+
+/// Before typeflag 5, a directory was a regular-file header whose name ends
+/// in a slash, and GNU and BSD tar still read it so. Extracting it as a file
+/// named `olddir` left nowhere to put `olddir/f`.
+#[test]
+fn test_regular_typeflag_with_trailing_slash_is_a_directory() {
+    let temp = plib::tmp::TempDir::new().unwrap();
+    let mut archive = Ustar {
+        name: b"olddir/",
+        mode: 0o755,
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"olddir/f",
+            body: b"hi",
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, temp.path());
+    assert_success(&output, "extract an old-style directory");
+    assert!(temp.path().join("olddir").is_dir());
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("olddir/f")).unwrap(),
+        "hi"
+    );
+}
+
+/// The old-style directory rule is about the member, not its header block: a
+/// `size` record replaces the size field before the rule looks at it. A header
+/// named `x/` with an empty size field but `size=1024` is a 1024-byte file
+/// named by its `path` record, and those bytes are its data. Deciding on the
+/// raw fields made it an empty directory and read the data as further members
+/// -- a member bsdtar extracts as file contents, smuggled in as a file of its
+/// own.
+#[test]
+fn test_size_record_overrides_old_style_directory() {
+    let mut records = pax_record("path", b"file.bin");
+    records.extend_from_slice(&pax_record("size", b"1024"));
+    let mut archive = ext_header(b'x', &records);
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"x/",
+            size: Some(0),
+            ..Default::default()
+        }
+        .header(),
+    );
+    let mut data = Ustar {
+        name: b"smuggled",
+        body: b"payload",
+        ..Default::default()
+    }
+    .member();
+    data.resize(1024, 0);
+    archive.extend_from_slice(&data);
+    archive.extend_from_slice(&ustar_trailer());
+
+    let output = run_pax_with_stdin_bytes(&["-o", "listopt=%(size)d %F"], &archive);
+    assert_success(&output, "list a member sized by its size record");
+    assert_eq!(stdout_str(&output), "1024 file.bin\n");
+}
+
+/// The rule looks at the member's final name too. Python's tarfile and pax
+/// itself put the first 100 bytes of a long name in the name field and the
+/// whole name in a `path` record, and those 100 bytes can end in a slash. An
+/// empty file at such a path was extracted as a directory; bsdtar extracts
+/// the file.
+#[test]
+fn test_path_record_overrides_old_style_directory() {
+    let temp = plib::tmp::TempDir::new().unwrap();
+    let mut archive = archive_with_ext_records(&pax_record("path", b"pkg/__init__.py"));
+    // `archive_with_ext_records` names the member `f`; give it the truncated
+    // spelling instead, which ends in a slash.
+    let member = 2 * BLOCK;
+    archive[member..member + 100].fill(0);
+    archive[member..member + 4].copy_from_slice(b"pkg/");
+    reseal_header(&mut archive[member..]);
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, temp.path());
+    assert_success(&output, "extract a member named by its path record");
+    let extracted = temp.path().join("pkg/__init__.py");
+    assert!(
+        extracted.is_file(),
+        "pkg/__init__.py was not a regular file"
+    );
+
+    // A `path` record that itself ends in a slash is still a directory.
+    let archive = archive_with_ext_records(&pax_record("path", b"olddir/"));
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, temp.path());
+    assert_success(&output, "extract an old-style directory named by a record");
+    assert!(temp.path().join("olddir").is_dir());
+}
+
+/// pax's own writer: an empty file whose name needs a `path` record, and
+/// whose name field is cut where the 100th byte is a slash, must read back
+/// as the file it was.
+#[test]
+fn test_long_name_cut_at_a_slash_round_trips() {
+    let temp = plib::tmp::TempDir::new().unwrap();
+    let dir = "a".repeat(99);
+    let file = format!("{dir}/{}", "b".repeat(200));
+    std::fs::create_dir(temp.path().join(&dir)).unwrap();
+    std::fs::write(temp.path().join(&file), "").unwrap();
+
+    let output = run_pax_in_dir(&["-w", "-x", "pax", &file], temp.path());
+    assert_success(&output, "archive a long name");
+    // The name field is a fallback for a reader without extended headers;
+    // it must not spell a directory for a file.
+    let header = &output.stdout[2 * BLOCK..3 * BLOCK];
+    assert_ne!(header[99], b'/', "name field of a file ends in a slash");
+
+    let out = temp.path().join("out");
+    std::fs::create_dir(&out).unwrap();
+    let read = run_pax_with_stdin_bytes_in_dir(&["-r"], &output.stdout, &out);
+    assert_success(&read, "extract the long name");
+    assert!(out.join(&file).is_file(), "{file} was not a regular file");
+}
+
+/// An archive cut off inside the second block of its end-of-archive indicator
+/// lost nothing: the first zero block already ended it. bsdtar reads it.
+#[test]
+fn test_archive_cut_inside_the_end_indicator_is_complete() {
+    let mut archive = Ustar {
+        name: b"f",
+        body: b"x\n",
+        ..Default::default()
+    }
+    .archive();
+    archive.truncate(archive.len() - BLOCK + 100);
+
+    let output = run_pax_with_stdin_bytes(&[], &archive);
+    assert_success(&output, "list an archive cut inside its end indicator");
+    assert_eq!(stdout_str(&output), "f\n");
+}
+
+/// A plain ustar archive's hard link carries no data, whatever its size field
+/// says -- the pre-POSIX convention repeated the linked file's size there.
+/// Only a pax archive may give typeflag 1 data, so reading every archive with
+/// the ustar magic by the pax rule swallowed the members after such a link.
+#[test]
+fn test_ustar_hard_link_size_does_not_swallow_members() {
+    let mut archive = Ustar {
+        name: b"a",
+        body: b"hello",
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"b",
+            typeflag: b'1',
+            linkname: b"a",
+            size: Some(5),
+            ..Default::default()
+        }
+        .header(),
+    );
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"c",
+            body: b"see",
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let output = run_pax_with_stdin_bytes(&[], &archive);
+    assert_eq!(stdout_str(&output), "a\nb\nc\n", "{}", stderr_str(&output));
+}

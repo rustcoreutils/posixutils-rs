@@ -758,3 +758,460 @@ fn test_copy_hard_link_follows_the_sanitized_member_name() {
         "the second name is not a link to the first copy"
     );
 }
+
+/// `pax -rwl tree/f tree/g tree/s .` names each source file as its own
+/// destination. linkat() reports EEXIST, and the replace-on-EEXIST path must
+/// not then unlink the name -- it is the source. BSD pax says "Unable to link
+/// file to itself" for each and leaves the tree alone. `pax -rwl tree .` is
+/// refused one level up, at the directory.
+#[test]
+fn test_copy_link_onto_itself_keeps_source() {
+    let temp = TempDir::new().unwrap();
+    let tree = temp.path().join("tree");
+    fs::create_dir(&tree).unwrap();
+    fs::write(tree.join("f"), "DATA\n").unwrap();
+    fs::hard_link(tree.join("f"), tree.join("g")).unwrap();
+    fs::write(tree.join("s"), "x\n").unwrap();
+    let ino = |n: &str| fs::metadata(tree.join(n)).unwrap().ino();
+    let before = [ino("f"), ino("g"), ino("s")];
+
+    let files = ["tree/f", "tree/g", "tree/s"];
+    for (operands, diagnostics) in [(&files[..], 3), (&["tree"][..], 1)] {
+        let mut args = vec!["-rwl"];
+        args.extend_from_slice(operands);
+        args.push(".");
+        let output = run_pax_in_dir(&args, temp.path());
+        assert_exit_code(&output, 1, &format!("pax {args:?}"));
+        assert_eq!(
+            stderr_str(&output).lines().count(),
+            diagnostics,
+            "{args:?}: {}",
+            stderr_str(&output)
+        );
+
+        assert_eq!(fs::read_to_string(tree.join("f")).unwrap(), "DATA\n");
+        assert_eq!(fs::read_to_string(tree.join("g")).unwrap(), "DATA\n");
+        assert_eq!(fs::read_to_string(tree.join("s")).unwrap(), "x\n");
+        assert_eq!([ino("f"), ino("g"), ino("s")], before, "{args:?}");
+    }
+}
+
+/// A multiply-linked file reached twice -- `find tree | pax -rw` visits it as
+/// an operand and again while walking `tree` -- must still come out as both
+/// of its names, not lose one to a link of the destination onto itself.
+#[test]
+fn test_copy_hardlink_visited_twice() {
+    let temp = TempDir::new().unwrap();
+    let tree = temp.path().join("tree");
+    let out = temp.path().join("out");
+    fs::create_dir(&tree).unwrap();
+    fs::create_dir(&out).unwrap();
+    fs::write(tree.join("f"), "DATA\n").unwrap();
+    fs::hard_link(tree.join("f"), tree.join("g")).unwrap();
+
+    let output = run_pax_in_dir_with_stdin(&["-rw", "out"], temp.path(), "tree\ntree/f\ntree/g\n");
+    assert_success(&output, "pax -rw of a list naming a hard link twice");
+
+    assert_eq!(fs::read_to_string(out.join("tree/f")).unwrap(), "DATA\n");
+    assert_eq!(fs::read_to_string(out.join("tree/g")).unwrap(), "DATA\n");
+}
+
+/// -l with -L: POSIX, "the hard link created in the destination file hierarchy
+/// shall be to the file referenced by the symbolic link" -- not to the link.
+#[test]
+fn test_copy_link_with_dereference_links_the_target() {
+    let temp = TempDir::new().unwrap();
+    let out = temp.path().join("out");
+    fs::create_dir(&out).unwrap();
+    fs::write(temp.path().join("t"), "T\n").unwrap();
+    std::os::unix::fs::symlink("t", temp.path().join("s")).unwrap();
+
+    for follow in ["-L", "-H"] {
+        let output = run_pax_in_dir(&["-rwl", follow, "s", "out"], temp.path());
+        assert_success(&output, &format!("pax -rwl {follow}"));
+        let copied = fs::symlink_metadata(out.join("s")).unwrap();
+        assert!(copied.file_type().is_file(), "{follow}: not a regular file");
+        let target = fs::metadata(temp.path().join("t")).unwrap();
+        assert_eq!(
+            copied.ino(),
+            target.ino(),
+            "{follow}: not linked to the target"
+        );
+        fs::remove_file(out.join("s")).unwrap();
+    }
+}
+
+/// -l with -H/-L where the destination name already *is* the file the source
+/// symbolic link refers to. linkat reports EEXIST; the "already the same file"
+/// check has to follow the link the way linkat does, or it sees two different
+/// inodes, unlinks the destination -- the only copy of the data -- and the
+/// retried link then has nothing to link to.
+#[test]
+fn test_copy_link_follow_onto_the_link_target_keeps_it() {
+    for follow in ["-H", "-L"] {
+        let temp = TempDir::new().unwrap();
+        let d = temp.path().join("D");
+        fs::create_dir(&d).unwrap();
+        fs::write(d.join("x"), "DATA\n").unwrap();
+        std::os::unix::fs::symlink("D/x", temp.path().join("x")).unwrap();
+
+        let output = run_pax_in_dir(&["-rwl", follow, "x", "D"], temp.path());
+        assert_eq!(
+            fs::read_to_string(d.join("x")).unwrap_or_default(),
+            "DATA\n",
+            "{follow}: the link target was destroyed: {}",
+            stderr_str(&output)
+        );
+        assert!(
+            stderr_str(&output).contains("to itself"),
+            "{follow}: linking a file onto itself is diagnosed as elsewhere: {}",
+            stderr_str(&output)
+        );
+    }
+}
+
+/// -l across devices cannot link; POSIX says the file is then copied, and
+/// that expected fallback is neither diagnosed nor a failure.
+#[test]
+fn test_copy_link_across_devices_copies_quietly() {
+    let temp = TempDir::new().unwrap();
+    let mnt = temp.path().join("mnt");
+    let out = temp.path().join("out");
+    fs::create_dir(&mnt).unwrap();
+    fs::create_dir(&out).unwrap();
+    let Some(_mount) = ScratchMount::mount(temp.path(), &mnt) else {
+        return; // no unprivileged way to get a second device here
+    };
+    fs::write(mnt.join("f"), "F\n").unwrap();
+
+    let output = run_pax_in_dir(&["-rwl", "f", out.to_str().unwrap()], &mnt);
+    assert_success(&output, "pax -rwl across devices");
+    assert_eq!(stderr_str(&output), "");
+    assert_eq!(fs::read_to_string(out.join("f")).unwrap(), "F\n");
+}
+
+/// -X: a directory on another device is itself copied; only what is below
+/// it is not.
+#[test]
+fn test_copy_one_file_system_keeps_the_mount_point() {
+    let temp = TempDir::new().unwrap();
+    let tree = temp.path().join("tree");
+    let out = temp.path().join("out");
+    fs::create_dir_all(tree.join("mnt")).unwrap();
+    fs::create_dir(&out).unwrap();
+    fs::write(tree.join("f"), "F\n").unwrap();
+    let Some(_mount) = ScratchMount::mount(temp.path(), &tree.join("mnt")) else {
+        return;
+    };
+    fs::write(tree.join("mnt/inside"), "I\n").unwrap();
+
+    let output = run_pax_in_dir(&["-rwX", "tree", "out"], temp.path());
+    assert_success(&output, "pax -rwX");
+    assert!(out.join("tree/f").is_file());
+    assert!(out.join("tree/mnt").is_dir(), "mount point not copied");
+    assert!(!out.join("tree/mnt/inside").exists(), "descended below it");
+}
+
+/// Copy mode's -k leaves an existing destination directory as it is, the way
+/// it leaves an existing file: its contents are still copied, but its mode is
+/// not replaced by the source's.
+#[test]
+fn test_copy_keep_existing_directory_attributes() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir_all(src.join("d")).unwrap();
+    fs::write(src.join("d/f"), "F\n").unwrap();
+    fs::set_permissions(src.join("d"), fs::Permissions::from_mode(0o755)).unwrap();
+    let dst = temp.path().join("dst");
+    fs::create_dir_all(dst.join("d")).unwrap();
+    fs::set_permissions(dst.join("d"), fs::Permissions::from_mode(0o700)).unwrap();
+
+    let out = run_pax_in_dir(&["-rw", "-k", "-pp", "d", dst.to_str().unwrap()], &src);
+    assert_success(&out, "pax -rw -k");
+    assert_eq!(fs::read_to_string(dst.join("d/f")).unwrap(), "F\n");
+    let mode = fs::metadata(dst.join("d")).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o700, "-k replaced an existing directory's mode");
+}
+
+/// -u likewise: a destination directory newer than its source keeps its own
+/// attributes, while its contents are still each considered.
+#[test]
+fn test_copy_update_keeps_newer_directory_attributes() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir_all(src.join("d")).unwrap();
+    fs::write(src.join("d/f"), "F\n").unwrap();
+    fs::set_permissions(src.join("d"), fs::Permissions::from_mode(0o755)).unwrap();
+    // Make the source directory old, so the destination one is newer.
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+    File::open(src.join("d"))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
+    let dst = temp.path().join("dst");
+    fs::create_dir_all(dst.join("d")).unwrap();
+    fs::set_permissions(dst.join("d"), fs::Permissions::from_mode(0o700)).unwrap();
+
+    let out = run_pax_in_dir(&["-rw", "-u", "-pp", "d", dst.to_str().unwrap()], &src);
+    assert_success(&out, "pax -rw -u");
+    assert_eq!(fs::read_to_string(dst.join("d/f")).unwrap(), "F\n");
+    let mode = fs::metadata(dst.join("d")).unwrap().permissions().mode() & 0o7777;
+    assert_eq!(mode, 0o700, "-u replaced a newer directory's mode");
+}
+
+/// A source directory that only its owner may enter must not be copied to one
+/// anyone may enter, not even while the copy runs: until the run ends its
+/// copy, and the 0644 files in it, were open to everyone -- for good, if the
+/// run never finished.
+#[test]
+fn test_copy_private_directory_is_not_exposed_during_the_copy() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    let dst = temp.path().join("dst");
+    fs::create_dir_all(src.join("home/alice")).unwrap();
+    fs::create_dir(&dst).unwrap();
+    fs::write(src.join("home/alice/f"), "secret\n").unwrap();
+    fs::set_permissions(src.join("home/alice"), fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(["-rw", dst.to_str().unwrap()])
+        .current_dir(&src)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"home/alice\n").unwrap();
+    stdin.flush().unwrap();
+
+    // The name list is still open: pax has copied the subtree but cannot
+    // have finished the run.
+    let copied = dst.join("home/alice/f");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !copied.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let mode = fs::metadata(dst.join("home/alice"))
+        .map(|m| m.permissions().mode() & 0o777)
+        .ok();
+    drop(stdin);
+    child.wait().unwrap();
+
+    assert!(copied.exists(), "the subtree was never copied");
+    assert_eq!(
+        mode.map(|m| m & 0o077),
+        Some(0),
+        "a 0700 directory's copy was open to others during the run: {mode:?}"
+    );
+    let mode = fs::metadata(dst.join("home/alice"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700);
+}
+
+/// A `find -depth` list names a directory after its contents. A directory
+/// already at the destination has been written to by then -- by this run --
+/// so -u must compare the source with what the destination was *before* the
+/// run, or the source directory's mode and time are never applied. cpio -p
+/// implies -u, which made `find . -depth | cpio -pdm` leave them behind.
+#[test]
+fn test_copy_update_depth_first_uses_pre_run_directory_time() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir_all(src.join("a")).unwrap();
+    fs::write(src.join("a/f"), "F\n").unwrap();
+    fs::set_permissions(src.join("a"), fs::Permissions::from_mode(0o700)).unwrap();
+    let src_time = filetime::FileTime::from_unix_time(1_577_836_800, 0); // 2020
+    filetime::set_file_mtime(src.join("a"), src_time).unwrap();
+
+    let list = b"./a/f\n./a\n.\n";
+    let runs: [(&str, &[&str]); 2] = [
+        ("cpio", &["-pdm", "../dst"]),
+        ("pax", &["-rw", "-d", "-u", "-pe", "../dst"]),
+    ];
+    for (tool, args) in runs {
+        let dst = temp.path().join("dst");
+        let _ = fs::remove_dir_all(&dst);
+        fs::create_dir_all(dst.join("a")).unwrap();
+        fs::set_permissions(dst.join("a"), fs::Permissions::from_mode(0o755)).unwrap();
+        let dst_time = filetime::FileTime::from_unix_time(1_546_300_800, 0); // 2019
+        filetime::set_file_mtime(dst.join("a"), dst_time).unwrap();
+
+        let out = if tool == "cpio" {
+            run_cpio(args, &src, list)
+        } else {
+            run_program(
+                std::path::Path::new(env!("CARGO_BIN_EXE_pax")),
+                args,
+                &src,
+                Some(list),
+            )
+        };
+        assert_success(&out, tool);
+        assert_eq!(fs::read_to_string(dst.join("a/f")).unwrap(), "F\n");
+        let meta = fs::metadata(dst.join("a")).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o700, "{tool}: mode");
+        assert_eq!(meta.mtime(), 1_577_836_800, "{tool}: mtime");
+    }
+}
+
+/// -s renaming a directory to `.` puts its contents straight into the
+/// destination, as extracting the same members from an archive does. The
+/// whole subtree used to be dropped, silently.
+#[test]
+fn test_copy_subst_directory_to_dot_copies_its_contents() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("src/sub")).unwrap();
+    fs::write(temp.path().join("src/sub/f"), "F\n").unwrap();
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+
+    let out = run_pax_in_dir(&["-rw", "-s", ",^src,.,", "src", "dst"], temp.path());
+    assert_success(&out, "pax -rw -s to .");
+    assert_eq!(fs::read_to_string(dst.join("sub/f")).unwrap(), "F\n");
+}
+
+/// `pax -rw tree .` names every file as its own destination. Copying one
+/// onto itself must neither rewrite it nor split its hard links: BSD pax says
+/// "file would overwrite itself" and leaves it alone.
+#[test]
+fn test_copy_onto_itself_leaves_the_source_alone() {
+    let temp = TempDir::new().unwrap();
+    let tree = temp.path().join("tree");
+    fs::create_dir(&tree).unwrap();
+    fs::write(tree.join("f"), "DATA\n").unwrap();
+    fs::hard_link(tree.join("f"), tree.join("g")).unwrap();
+    let ino = fs::metadata(tree.join("f")).unwrap().ino();
+
+    for operands in [&["tree", "."][..], &["tree/f", "."][..]] {
+        let mut args = vec!["-rw"];
+        args.extend_from_slice(operands);
+        let out = run_pax_in_dir(&args, temp.path());
+        assert!(
+            stderr_str(&out).contains("itself"),
+            "{operands:?}: copying a file onto itself is not diagnosed: {}",
+            stderr_str(&out)
+        );
+        for name in ["f", "g"] {
+            let meta = fs::metadata(tree.join(name)).unwrap();
+            assert_eq!(meta.ino(), ino, "{operands:?}: {name} was replaced");
+            assert_eq!(meta.nlink(), 2, "{operands:?}: {name}'s link was split");
+        }
+        assert_eq!(fs::read_to_string(tree.join("f")).unwrap(), "DATA\n");
+    }
+}
+
+/// A directory replaces a non-directory already at its destination name, as
+/// it does when extracted from an archive.
+#[test]
+fn test_copy_directory_replaces_existing_file() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("src/d")).unwrap();
+    fs::write(temp.path().join("src/d/f"), "F\n").unwrap();
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+    fs::write(dst.join("d"), "old\n").unwrap();
+
+    let out = run_pax_in_dir(&["-rw", "d", "../dst"], &temp.path().join("src"));
+    assert_success(&out, "pax -rw over a file");
+    assert_eq!(fs::read_to_string(dst.join("d/f")).unwrap(), "F\n");
+}
+
+/// A directory that maps onto itself is not copied, but -s can still send
+/// its contents elsewhere, each under its own name, as a round trip through
+/// an archive does. The whole subtree used to be skipped.
+#[test]
+fn test_copy_directory_onto_itself_still_copies_renamed_children() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("src/sub")).unwrap();
+    fs::write(temp.path().join("src/x"), "X\n").unwrap();
+    fs::write(temp.path().join("src/sub/y"), "Y\n").unwrap();
+
+    let out = run_pax_in_dir(&["-rw", "-s", ",^src/,dst/,", "src", "."], temp.path());
+    assert_success(&out, "pax -rw -s with the directory mapped onto itself");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("dst/x")).unwrap(),
+        "X\n"
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("dst/sub/y")).unwrap(),
+        "Y\n"
+    );
+}
+
+/// Without -s or -i everything below a directory that maps onto itself maps
+/// onto itself too: one diagnostic says so, not one per file.
+#[test]
+fn test_copy_directory_onto_itself_is_diagnosed_once() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir_all(temp.path().join("src/sub")).unwrap();
+    fs::write(temp.path().join("src/x"), "X\n").unwrap();
+    fs::write(temp.path().join("src/sub/y"), "Y\n").unwrap();
+
+    let out = run_pax_in_dir(&["-rw", "src", "."], temp.path());
+    assert_failure(&out, "pax -rw src .");
+    let err = stderr_str(&out);
+    assert_eq!(err.matches("itself").count(), 1, "{err}");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("src/x")).unwrap(),
+        "X\n"
+    );
+}
+
+/// Under -H or -L the walk follows a symbolic link operand, but the link
+/// itself is still the source: copying it into its own directory names it as
+/// its own destination. It used to be unlinked and replaced -- by an empty
+/// directory, or under -l by nothing at all.
+#[test]
+fn test_copy_followed_link_onto_itself_keeps_the_link() {
+    let temp = TempDir::new().unwrap();
+    let sub = temp.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    fs::write(sub.join("file"), "payload\n").unwrap();
+    fs::write(temp.path().join("f"), "F\n").unwrap();
+    std::os::unix::fs::symlink("sub", temp.path().join("ld")).unwrap();
+    std::os::unix::fs::symlink("f", temp.path().join("lf")).unwrap();
+
+    let runs: [(&str, &[&str]); 8] = [
+        ("pax", &["-rw", "-H", "ld", "."]),
+        ("pax", &["-rw", "-L", "ld", "."]),
+        ("pax", &["-rw", "-H", "lf", "."]),
+        ("pax", &["-rw", "-L", "lf", "."]),
+        ("pax", &["-rw", "-l", "-H", "lf", "."]),
+        ("pax", &["-rw", "-l", "-L", "lf", "."]),
+        ("cpio", &["-pL", "."]),
+        ("cpio", &["-plL", "."]),
+    ];
+    for (tool, args) in runs {
+        let out = if tool == "cpio" {
+            run_cpio(args, temp.path(), b"ld\nlf\n")
+        } else {
+            run_pax_in_dir(args, temp.path())
+        };
+        let ctx = format!("{tool} {args:?}");
+        assert!(
+            stderr_str(&out).contains("itself"),
+            "{ctx}: {}",
+            stderr_str(&out)
+        );
+        for (link, target) in [("ld", "sub"), ("lf", "f")] {
+            let meta = fs::symlink_metadata(temp.path().join(link)).unwrap();
+            assert!(meta.is_symlink(), "{ctx}: {link} was replaced");
+            assert_eq!(
+                fs::read_link(temp.path().join(link)).unwrap(),
+                std::path::Path::new(target),
+                "{ctx}"
+            );
+        }
+        assert_eq!(fs::read_to_string(sub.join("file")).unwrap(), "payload\n");
+        assert_eq!(fs::read_to_string(temp.path().join("f")).unwrap(), "F\n");
+    }
+}

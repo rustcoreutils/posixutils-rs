@@ -885,3 +885,30 @@ fn is_executable_at_follows_access_semantics() {
     // No execute bit at all: not executable, even for the superuser.
     assert!(!ask("plain"));
 }
+
+/// A path holding a NUL byte names no file. It used to reach `CString::new(..).unwrap()` and panic;
+/// it must instead be reported, by its full name, and visit nothing.
+#[test]
+fn path_with_nul_byte_is_reported_not_walked() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = Path::new(std::ffi::OsStr::from_bytes(b"a\0b"));
+    let mut visited = 0;
+    let mut errors = Vec::new();
+    let ok = ftw::traverse_directory(
+        path,
+        |_| {
+            visited += 1;
+            Ok(true)
+        },
+        |_, _| Ok(()),
+        |entry, error| {
+            errors.push((entry.path().as_inner().to_path_buf(), error.kind()));
+        },
+        ftw::TraverseDirectoryOpts::default(),
+    );
+
+    assert!(!ok);
+    assert_eq!(visited, 0);
+    assert_eq!(errors, [(PathBuf::from("a\\0b"), ftw::ErrorKind::Open)]);
+}

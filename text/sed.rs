@@ -9,6 +9,7 @@
 
 use clap::Parser;
 use gettextrs::gettext;
+use plib::locale::next_char_offset;
 use plib::regex::{Regex as PlibRegex, RegexFlags};
 use std::rc::Rc;
 use std::sync::Mutex;
@@ -504,7 +505,9 @@ impl Command {
 /// non-overlapping; each entry holds the capture ranges, the whole match
 /// first. An empty match adjacent to the previous match is not a match (so
 /// `s/b*/x/g` on `abc` gives `xaxcx`). After an empty match the search
-/// resumes one byte on, as GNU sed does in every locale.
+/// resumes one whole character on under `LC_CTYPE`: one byte forward can
+/// land inside a multibyte character, where the regex matches nothing and
+/// every later match was lost (GNU sed steps one byte and splits it).
 fn find_matches(re: &PlibRegex, haystack: &[u8]) -> Vec<Vec<Range<usize>>> {
     let mut matches: Vec<Vec<Range<usize>>> = vec![];
     let mut offset = 0;
@@ -515,10 +518,10 @@ fn find_matches(re: &PlibRegex, haystack: &[u8]) -> Vec<Vec<Range<usize>>> {
             matches.push(caps.iter().map(|m| m.start..m.end).collect());
         }
         offset = if whole.is_empty() {
-            if whole.end >= haystack.len() {
-                break;
+            match next_char_offset(haystack, whole.end) {
+                Some(next) => next,
+                None => break,
             }
-            whole.end + 1
         } else {
             whole.end
         };
@@ -1490,17 +1493,19 @@ fn execute_replace(
         unreachable!();
     };
     let matches = find_matches(&re.0, pattern_space);
+    let n = flags
+        .iter()
+        .find_map(|f| match f {
+            ReplaceFlag::ReplaceNth(n) => Some(*n),
+            _ => None,
+        })
+        .unwrap_or(1);
+    // With `g` the Nth match and every later one (`s/x/y/2g`).
+    let skip = n.saturating_sub(1).min(matches.len());
     let selected: Vec<&Vec<Range<usize>>> = if flags.contains(&ReplaceFlag::ReplaceAll) {
-        matches.iter().collect()
+        matches[skip..].iter().collect()
     } else {
-        let n = flags
-            .iter()
-            .find_map(|f| match f {
-                ReplaceFlag::ReplaceNth(n) => Some(*n),
-                _ => None,
-            })
-            .unwrap_or(1);
-        matches.get(n.saturating_sub(1)).into_iter().collect()
+        matches.get(skip).into_iter().collect()
     };
     let replace = !selected.is_empty();
     if replace {

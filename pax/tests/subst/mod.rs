@@ -13,6 +13,8 @@ use crate::common::*;
 use plib::tmp::TempDir;
 use std::fs::{self, File};
 use std::io::Write;
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 
 #[test]
 fn test_subst_basic_list() {
@@ -384,4 +386,156 @@ fn test_subst_backreference() {
         "backreference swap should work: {}",
         stdout
     );
+}
+
+/// -s renames a hard link's target along with the member, since the target is
+/// a member name too. Linking the renamed P/b to the unsubstituted "a" would
+/// reach an unrelated ./a that happened to be in the extraction directory.
+#[test]
+fn test_subst_renames_hardlink_target() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("a"), "UNRELATED\n").unwrap();
+    let mut archive = Ustar {
+        name: b"a",
+        body: b"DATA\n",
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &Ustar {
+            name: b"b",
+            typeflag: b'1',
+            linkname: b"a",
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r", "-s", ",^,P/,"], &archive, temp.path());
+    assert_success(&output, "pax -r -s of a hard link");
+
+    let pa = fs::metadata(temp.path().join("P/a")).unwrap();
+    let pb = fs::metadata(temp.path().join("P/b")).unwrap();
+    assert_eq!(pa.ino(), pb.ino(), "P/b should be linked to P/a");
+    assert_eq!(
+        fs::read_to_string(temp.path().join("a")).unwrap(),
+        "UNRELATED\n"
+    );
+}
+
+/// Build d/x and d/sub/y under `root`.
+fn subst_tree(root: &Path) {
+    fs::create_dir_all(root.join("d/sub")).unwrap();
+    fs::write(root.join("d/x"), "X\n").unwrap();
+    fs::write(root.join("d/sub/y"), "Y\n").unwrap();
+}
+
+/// Copy mode is defined "as if" written to an archive and extracted, so -s
+/// applies once to each source pathname -- not again to a name built from an
+/// already-substituted parent, which compounded the prefix per level.
+#[test]
+fn test_copy_subst_applies_once_per_name() {
+    let temp = TempDir::new().unwrap();
+    subst_tree(temp.path());
+    fs::create_dir(temp.path().join("out")).unwrap();
+
+    let output = run_pax_in_dir(&["-rw", "-s", ",^,pre/,", "d", "out"], temp.path());
+    assert_success(&output, "pax -rw -s");
+
+    assert_eq!(
+        fs::read_to_string(temp.path().join("out/pre/d/x")).unwrap(),
+        "X\n"
+    );
+    assert_eq!(
+        fs::read_to_string(temp.path().join("out/pre/d/sub/y")).unwrap(),
+        "Y\n"
+    );
+    assert!(!temp.path().join("out/pre/pre").exists());
+}
+
+/// A name -s maps to the empty string is ignored -- that name, not the
+/// hierarchy below it, whose own names are substituted on their own.
+#[test]
+fn test_write_subst_to_empty_keeps_the_subtree() {
+    let temp = TempDir::new().unwrap();
+    subst_tree(temp.path());
+    let archive = temp.path().join("a.tar");
+
+    let output = run_pax_in_dir(
+        &["-w", "-s", ",^d$,,", "-f", archive.to_str().unwrap(), "d"],
+        temp.path(),
+    );
+    assert_success(&output, "pax -w -s to empty");
+
+    let output = run_pax_in_dir(&["-f", archive.to_str().unwrap()], temp.path());
+    let mut names: Vec<String> = stdout_str(&output).lines().map(String::from).collect();
+    names.sort();
+    assert_eq!(names, ["d/sub/", "d/sub/y", "d/x"]);
+}
+
+/// List a one-member archive named `name` under `-s expr` and the locale
+/// `lc_all`, returning standard output. Both may be any bytes.
+fn list_substituted(name: &[u8], expr: &[u8], lc_all: &str) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let a = Ustar {
+        name,
+        body: b"X\n",
+        ..Default::default()
+    }
+    .archive();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_pax"))
+        .arg("-s")
+        .arg(std::ffi::OsStr::from_bytes(expr))
+        .env("LC_ALL", lc_all)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&a).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_success(&output, "pax -s");
+    output.stdout
+}
+
+/// `g` replaces empty matches as sed does: one at every position not just
+/// after an earlier match, the end of the name included.
+#[test]
+fn test_subst_global_empty_matches_follow_sed() {
+    assert_eq!(list_substituted(b"abc", b",x*,-,g", "C"), b"-a-b-c-\n");
+    assert_eq!(list_substituted(b"abc", b",b*,-,g", "C"), b"-a-c-\n");
+    assert_eq!(list_substituted(b"abc", b",$,-,g", "C"), b"abc-\n");
+}
+
+/// A name the regex cannot read as text in a UTF-8 locale is simply not
+/// matched: the macOS regexec's REG_ILLSEQ is no zero-length match at the
+/// start to insert the replacement at.
+#[test]
+fn test_subst_unreadable_name_is_not_matched() {
+    assert_eq!(
+        list_substituted(b"caf\xe9", b",e,E,", "en_US.UTF-8"),
+        b"caf\xe9\n"
+    );
+}
+
+/// An -s option-argument is bytes, like the names it rewrites: one that is
+/// not UTF-8 is still an expression.
+#[test]
+fn test_subst_expression_need_not_be_utf8() {
+    assert_eq!(list_substituted(b"caf\xe9", b",\xe9,E,", "C"), b"cafE\n");
+    assert_eq!(list_substituted(b"cafe", b",e,\xe9,", "C"), b"caf\xe9\n");
+}
+
+/// Under `g`, `^` matches only at the start of the original name: a
+/// replacement at the start that leaves text there does not make that text
+/// a new start of the name (sed: `s,^[^/]*/,,g` on "top/x/README" gives
+/// "x/README").
+#[test]
+fn test_subst_global_caret_anchors_once() {
+    assert_eq!(
+        list_substituted(b"top/x/README", b",^[^/]*/,,g", "C"),
+        b"x/README\n"
+    );
+    assert_eq!(list_substituted(b"aa", b",^a,,g", "C"), b"a\n");
+    assert_eq!(list_substituted(b"aab", b",^a,X,g", "C"), b"Xab\n");
 }

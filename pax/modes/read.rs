@@ -9,22 +9,24 @@
 
 //! Read mode implementation - extract archive contents
 
-use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveReader, EntryType, ExtractedLinks};
+use crate::archive::{ArchiveEntry, ArchiveReader, EntryType, LinkSets};
 use crate::error::{PaxError, PaxResult};
-use crate::formats::{CpioReader, PaxReader, UstarReader};
+use crate::formats::OptionRecords;
 use crate::interactive::{InteractivePrompter, RenameResult};
 use crate::modes::anchored::{
-    create_replacing, set_attrs_fd, stat_at, AttrPolicy, Attrs, DirTree, MemberPath,
+    chmod_at, create_replacing, link_replacing, make_dir_at, set_attrs_fd, set_owner, stat_at,
+    unlink_at, AttrPolicy, Attrs, DirTree, MemberPath, PendingDirs,
 };
-use crate::pattern::{find_matching_pattern_subtree, matches_excluded, Pattern};
-use crate::subst::{apply_substitutions, SubstResult, Substitution};
-use std::collections::HashSet;
+use crate::modes::select::Selector;
+use crate::pattern::Pattern;
+use crate::subst::{substitute_link_target, substitute_name, Substitution};
 use std::ffi::{CStr, CString};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// Options for read/extract mode
 pub struct ReadOptions {
@@ -48,6 +50,10 @@ pub struct ReadOptions {
     pub interactive: bool,
     /// Update mode - only extract if archive member is newer
     pub update: bool,
+    /// cpio: the `update` check keeps a newer file at the name the member is
+    /// extracted under, made once `-r` has renamed it -- not, as pax's `-u`,
+    /// part of selecting the member by its archived name.
+    pub update_final_name: bool,
     /// Path substitutions (-s option)
     pub substitutions: Vec<Substitution>,
     /// Select only first archive member matching each pattern (-n)
@@ -55,7 +61,8 @@ pub struct ReadOptions {
     /// Process file-creation mask, applied to the mode of extracted files when
     /// the mode is not explicitly preserved (no `-p p`/`-p e`).
     pub umask: u32,
-    /// `-o` extended-header options (delete=/keyword:=value) applied on extract.
+    /// `-o` extended-header options (delete=, keyword=value, keyword:=value)
+    /// applied on extract.
     pub format_options: crate::options::FormatOptions,
     /// `-d`: a directory pattern matches only the directory itself, not its
     /// subtree.
@@ -82,6 +89,7 @@ impl Default for ReadOptions {
             preserve_owner: false,
             interactive: false,
             update: false,
+            update_final_name: false,
             substitutions: Vec::new(),
             first_match: false,
             umask: 0,
@@ -94,49 +102,37 @@ impl Default for ReadOptions {
     }
 }
 
-/// Extract archive contents
-pub fn extract_archive<R: Read>(
-    reader: R,
-    format: ArchiveFormat,
-    options: &ReadOptions,
-) -> PaxResult<()> {
-    match format {
-        ArchiveFormat::Ustar => {
-            let mut archive = UstarReader::new(reader);
-            extract_entries(&mut archive, options)
-        }
-        ArchiveFormat::Cpio => {
-            let mut archive = CpioReader::new(reader);
-            extract_entries(&mut archive, options)
-        }
-        ArchiveFormat::Pax => {
-            let mut archive = PaxReader::new(reader).with_options(options.format_options.clone());
-            extract_entries(&mut archive, options)
-        }
-    }
-}
-
-/// Extract archive contents from an ArchiveReader (for multi-volume support)
-pub fn extract_archive_from_reader<R: ArchiveReader>(
-    archive: &mut R,
-    options: &ReadOptions,
-) -> PaxResult<()> {
-    extract_entries(archive, options)
-}
-
-/// Extract entries from any archive reader
-fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> PaxResult<()> {
-    let mut extracted_links = ExtractedLinks::new();
+/// Extract the members of an archive
+pub fn extract_archive<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> PaxResult<()> {
     // Extraction is anchored at an open descriptor for the working directory,
     // and every member path is resolved relative to it without following a
     // symlink.
     let tree = DirTree::open_cwd()?;
     // Directories take their archived attributes only once the whole archive
-    // has been extracted; see apply_pending_dirs.
-    let mut pending_dirs: Vec<(MemberPath, ArchiveEntry)> = Vec::new();
+    // has been extracted -- and still do when a fatal error stops it early,
+    // for the directories that were created by then.
+    let mut pending_dirs = PendingDirs::default();
+    let result = extract_members(archive, options, &tree, &mut pending_dirs);
+    pending_dirs.apply(&tree, &policy_of(options));
+    result
+}
 
-    // Track which patterns have been matched (for -n first_match option)
-    let mut matched_patterns: HashSet<usize> = HashSet::new();
+/// The member loop of `extract_archive`.
+fn extract_members<R: ArchiveReader>(
+    archive: &mut R,
+    options: &ReadOptions,
+    tree: &DirTree,
+    pending_dirs: &mut PendingDirs,
+) -> PaxResult<()> {
+    let mut link_sets: LinkSets<CreatedSet> = LinkSets::default();
+    let mut selector = Selector::new(
+        &options.patterns,
+        options.exclude,
+        options.first_match,
+        options.dir_only,
+        &options.exclude_patterns,
+    );
+    let option_records = caller_option_records(archive, &options.format_options)?;
 
     // Create interactive prompter if needed
     let mut prompter = if options.interactive {
@@ -145,164 +141,139 @@ fn extract_entries<R: ArchiveReader>(archive: &mut R, options: &ReadOptions) -> 
         None
     };
 
+    // Whether the loop met the end of the archive, rather than stopping
+    // short of it under -n.
+    let mut reached_end = true;
     while let Some(mut entry) = archive.read_entry()? {
-        if let Some(should_output) = should_extract(&entry, options, &mut matched_patterns) {
-            if !should_output {
-                // Entry matched a pattern that's already been matched (first_match mode)
-                archive.skip_data()?;
-                continue;
-            }
-            // Apply `-o keyword:=value` overrides before substitutions/rename so a
-            // forced path/uid/gid/etc. takes effect on the extracted file.
-            apply_keyword_overrides(&mut entry, &options.format_options);
-            // Apply substitutions first (per POSIX: -s applies before -i)
-            if !options.substitutions.is_empty() {
-                match apply_substitutions(&options.substitutions, &entry.path) {
-                    SubstResult::Unchanged => {
-                        // Keep the original bytes: this is the only case that
-                        // round-trips a name that is not UTF-8 exactly.
-                    }
-                    SubstResult::Changed(new_path) => {
-                        entry.path = crate::rawpath::from_substituted(&new_path);
-                    }
-                    SubstResult::Empty => {
-                        // Skip this entry
-                        archive.skip_data()?;
-                        continue;
-                    }
-                }
-            }
-
-            // --strip-components reshapes the member name before it is offered
-            // for renaming, so an interactive prompt shows the name that will
-            // actually be created. A member with no components left over names
-            // nothing to extract and is dropped, as GNU tar does.
-            if options.strip_components > 0 {
-                match strip_leading_components(&entry.path, options.strip_components) {
-                    Some(stripped) => entry.path = stripped,
-                    None => {
-                        archive.skip_data()?;
-                        continue;
-                    }
-                }
-                // A hard link's target is another member name, so it has to be
-                // stripped in step. A symlink's target is not: it is resolved in
-                // the extracted tree and must be left alone.
-                if entry.entry_type == EntryType::Hardlink {
-                    if let Some(target) = &entry.link_target {
-                        entry.link_target =
-                            strip_leading_components(target, options.strip_components);
-                    }
-                }
-            }
-
-            // Handle interactive rename if enabled
-            if let Some(ref mut p) = prompter {
-                match p.prompt(&entry.path)? {
-                    RenameResult::Skip => {
-                        archive.skip_data()?;
-                        continue;
-                    }
-                    RenameResult::UseOriginal => {
-                        // Keep the original path
-                    }
-                    RenameResult::Rename(new_path) => {
-                        entry.path = new_path;
-                    }
-                }
-            }
+        if let Some(ref records) = option_records {
+            records.apply(&mut entry);
+        }
+        if select_member(&mut selector, &mut entry, options, &mut prompter, tree)? {
             // Per POSIX CONSEQUENCES OF ERRORS: diagnose a per-file failure and
             // set a non-zero exit, but continue with the next member. Skip any
             // unconsumed data of the failed entry to realign the reader.
-            if let Err(e) = extract_entry(
-                archive,
-                &entry,
-                options,
-                &mut extracted_links,
-                &tree,
-                &mut pending_dirs,
-            ) {
-                crate::error::report_error(&entry.path, e);
-                let _ = archive.skip_data();
-            }
-        } else {
-            archive.skip_data()?;
+            // A failure every later member would meet too -- -O's output
+            // gone, end of file on the terminal -- ends the run instead.
+            let r = extract_entry(archive, &entry, options, &mut link_sets, tree, pending_dirs);
+            report_unless_fatal(&entry, r)?;
+        } else if let Some(set) = link_sets.find_mut(&entry) {
+            let r = fill_link_set(archive, tree, &entry, options, set);
+            report_unless_fatal(&entry, r)?;
+        }
+        archive.skip_data()?;
+        // A newc set's data comes with its last name, which -n must still
+        // read even when every pattern has been used by an earlier one.
+        if selector.is_done() && link_sets.values().all(|set| set.has_data) {
+            reached_end = false;
+            break;
         }
     }
 
-    apply_pending_dirs(&tree, &mut pending_dirs, options);
-
-    // Diagnose any pattern operand that matched no archive member (non-exclude
-    // mode) and set a non-zero exit status (POSIX DESCRIPTION).
-    if !options.exclude {
-        for (idx, pat) in options.patterns.iter().enumerate() {
-            if !matched_patterns.contains(&idx) {
-                crate::error::report_error(&pat.source, gettextrs::gettext("not found"));
-            }
-        }
-    }
-
-    Ok(())
+    selector.report_unmatched();
+    archive.finish(reached_end)
 }
 
-/// Apply `-o keyword:=value` per-file overrides to an entry on extract.
+/// Diagnose a member's failure and carry on, unless it is one that ends the
+/// run (`modes::is_fatal`), which is handed back instead.
+fn report_unless_fatal(entry: &ArchiveEntry, result: PaxResult<()>) -> PaxResult<()> {
+    match result {
+        Err(e) if crate::modes::is_fatal(&e) => Err(e),
+        Err(e) => {
+            crate::error::report_error(&entry.path, e);
+            Ok(())
+        }
+        Ok(()) => Ok(()),
+    }
+}
+
+/// Decide whether a member is extracted, renaming it as -s and -i direct.
 ///
-/// The `:=` form forces the value regardless of what the archive carried, so it
-/// is applied after the reader has merged any extended-header records. The
-/// standard keywords that map onto an entry field are applied to it; every
-/// other keyword is recorded as an extended-header value, which has no
-/// extraction effect but is what `-o listopt=%(keyword)` reports. `delete=` is
-/// handled in the pax reader (so the ustar value remains), not here.
-pub(crate) fn apply_keyword_overrides(
+/// In POSIX's order: the patterns as modified by -c, -n and -u select it, and
+/// then -s and -i rename it. `-u` compares against the file of the member's
+/// own name, before any renaming, and a member it turns away does not use up
+/// a pattern under -n. cpio's refusal to replace a newer file instead looks
+/// at the file the member would replace, under the name it ends up with.
+fn select_member(
+    selector: &mut Selector,
     entry: &mut ArchiveEntry,
-    opts: &crate::options::FormatOptions,
-) {
-    for (keyword, value) in opts.per_file_options() {
-        match keyword.as_str() {
-            "uid" => {
-                if let Ok(v) = value.parse() {
-                    entry.uid = v;
-                }
-            }
-            "gid" => {
-                if let Ok(v) = value.parse() {
-                    entry.gid = v;
-                }
-            }
-            "uname" => entry.uname = Some(value.clone().into_bytes()),
-            "gname" => entry.gname = Some(value.clone().into_bytes()),
-            "path" => entry.path = PathBuf::from(value),
-            "linkpath" => entry.link_target = Some(PathBuf::from(value)),
-            "size" => {
-                if let Ok(v) = value.parse() {
-                    entry.size = v;
-                }
-            }
-            "mtime" => {
-                if let Ok(t) = value.parse::<f64>() {
-                    entry.mtime = t as u64;
-                    entry.mtime_nsec = (t.fract() * 1_000_000_000.0) as u32;
-                }
-            }
-            "atime" => {
-                if let Ok(t) = value.parse::<f64>() {
-                    entry.atime = Some(t as u64);
-                    entry.atime_nsec = (t.fract() * 1_000_000_000.0) as u32;
-                }
-            }
-            "ctime" => {
-                if let Ok(t) = value.parse::<f64>() {
-                    entry.ctime = Some(t as u64);
-                    entry.ctime_nsec = (t.fract() * 1_000_000_000.0) as u32;
-                }
-            }
-            // Every remaining keyword is an extended-header record with no
-            // extraction effect -- `charset`, `comment`, `hdrcharset`, an
-            // implementation extension. It still has to reach the entry, or
-            // `-o charset:=x` would force a value the listing then denied.
-            other => entry.set_ext_record(other, value),
+    options: &ReadOptions,
+    prompter: &mut Option<InteractivePrompter>,
+    tree: &DirTree,
+) -> PaxResult<bool> {
+    let Some(selection) = selector.select(entry) else {
+        return Ok(false);
+    };
+    if options.update && !options.update_final_name && !is_archive_newer(tree, entry) {
+        return Ok(false);
+    }
+    selector.take(selection);
+
+    // -s, then --strip-components, both before the name is offered for
+    // renaming, so an interactive prompt shows the name that will actually be
+    // created.
+    if !rename_member(entry, &options.substitutions, options.strip_components) {
+        return Ok(false);
+    }
+    if let Some(p) = prompter {
+        match p.prompt(&entry.path)? {
+            RenameResult::Skip => return Ok(false),
+            RenameResult::UseOriginal => {}
+            RenameResult::Rename(new_path) => entry.path = new_path,
         }
     }
+    Ok(!(options.update && options.update_final_name && !is_archive_newer(tree, entry)))
+}
+
+/// The `-o keyword=value` and `-o keyword:=value` records the caller has to
+/// apply to each member itself: `None` when the reader applies them, as the
+/// pax reader does among the archive's own extended headers.
+///
+/// They are applied before anything looks at the member, the way an extended
+/// header record would be, so a `path:=` name is the one patterns match.
+pub(crate) fn caller_option_records<R: ArchiveReader>(
+    archive: &R,
+    opts: &crate::options::FormatOptions,
+) -> PaxResult<Option<OptionRecords>> {
+    if archive.applies_option_records() {
+        return Ok(None);
+    }
+    OptionRecords::new(opts).map(Some)
+}
+
+/// Rename a member the way -s and --strip-components direct. `false` when its
+/// own name is dropped -- substituted to the empty string, or left with no
+/// components -- and the member is to be ignored, as POSIX says of `-s`.
+///
+/// A hard link's target is another member's name, so it is renamed in step:
+/// leaving it alone linked the renamed member to whatever file sat at the old
+/// name, or to nothing. A symlink's target is its contents, not a member name;
+/// it is resolved in the extracted tree, and `-s` leaves it alone (the `s`
+/// flag). A target that is itself dropped becomes `None`: the member it names
+/// was never extracted, and the link is diagnosed as having nothing to link to.
+pub(crate) fn rename_member(
+    entry: &mut ArchiveEntry,
+    substitutions: &[Substitution],
+    strip_components: usize,
+) -> bool {
+    let strip = |name: PathBuf| {
+        if strip_components == 0 {
+            Some(name)
+        } else {
+            strip_leading_components(&name, strip_components)
+        }
+    };
+    let Some(path) = substitute_name(substitutions, &entry.path).and_then(strip) else {
+        return false;
+    };
+    entry.path = path;
+    if entry.entry_type == EntryType::Hardlink {
+        entry.link_target = entry
+            .link_target
+            .as_deref()
+            .and_then(|target| substitute_link_target(substitutions, target))
+            .and_then(strip);
+    }
+    true
 }
 
 /// Drop the first `n` pathname components from an archive member name.
@@ -339,85 +310,14 @@ pub(crate) fn strip_leading_components(name: &std::path::Path, n: usize) -> Opti
     Some(crate::rawpath::from_bytes(&stripped))
 }
 
-/// Check if entry should be extracted
-/// Returns:
-/// - None: entry should not be extracted (doesn't match patterns or excluded)
-/// - Some(true): entry should be extracted
-/// - Some(false): entry matches but pattern already matched (first_match mode)
-fn should_extract(
-    entry: &ArchiveEntry,
-    options: &ReadOptions,
-    matched_patterns: &mut HashSet<usize>,
-) -> Option<bool> {
-    let name = crate::rawpath::MatchName::of(&entry.path);
-    let path = name.as_str();
-
-    // tar's exclusion list is independent of the pattern operands and wins over
-    // them, so it is applied to the stored name before anything else.
-    if matches_excluded(&options.exclude_patterns, path) {
-        return None;
-    }
-
-    // Try matching against both the full path and the path with "./" prefix stripped
-    let path_stripped = path.strip_prefix("./").unwrap_or(path);
-
-    if options.patterns.is_empty() {
-        // No patterns means match all
-        if options.exclude {
-            return None; // Exclude all
-        }
-        return Some(true); // Match all
-    }
-
-    // Find which pattern matches (if any). A pattern selecting a directory also
-    // selects its whole subtree unless `-d` (dir_only) was given.
-    let expand_subtree = !options.dir_only;
-    let matching_pattern = find_matching_pattern_subtree(&options.patterns, path, expand_subtree)
-        .or_else(|| {
-            // Only worth a second pass when stripping actually changed
-            // something; otherwise this repeats the first pass verbatim for
-            // every non-matching member.
-            if std::ptr::eq(path_stripped, path) {
-                None
-            } else {
-                find_matching_pattern_subtree(&options.patterns, path_stripped, expand_subtree)
-            }
-        });
-
-    match matching_pattern {
-        Some(pattern_idx) => {
-            if options.exclude {
-                // Entry matched a pattern, so exclude it
-                None
-            } else if options.first_match && matched_patterns.contains(&pattern_idx) {
-                // first_match (-n): this pattern has already selected a member
-                Some(false)
-            } else {
-                // Record the match (used for the unmatched-pattern sweep and for
-                // -n first-match tracking) and select the entry.
-                matched_patterns.insert(pattern_idx);
-                Some(true)
-            }
-        }
-        None => {
-            // No pattern matched
-            if options.exclude {
-                Some(true) // Exclude mode: extract entries that don't match
-            } else {
-                None // Normal mode: skip entries that don't match
-            }
-        }
-    }
-}
-
 /// Extract a single entry
 fn extract_entry<R: ArchiveReader>(
     archive: &mut R,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-    extracted_links: &mut ExtractedLinks,
+    link_sets: &mut LinkSets<CreatedSet>,
     tree: &DirTree,
-    pending_dirs: &mut Vec<(MemberPath, ArchiveEntry)>,
+    pending_dirs: &mut PendingDirs,
 ) -> PaxResult<()> {
     // -O turns extraction into a dump: nothing is created on disk, so none of
     // the pathname resolution below applies.
@@ -447,15 +347,6 @@ fn extract_entry<R: ArchiveReader>(
     let pfd = parent.as_fd();
     let name = member.leaf.as_c_str();
 
-    // -u is a policy check, not a security control: it reads the destination
-    // and then decides. fstatat cannot be redirected by a planted symlink, and
-    // the write that follows is exclusive on this same descriptor, so losing
-    // this race can only produce a wrong skip decision, never an escape.
-    if options.update && !is_archive_newer_at(entry, pfd, name) {
-        archive.skip_data()?;
-        return Ok(());
-    }
-
     if options.verbose {
         let mut line = Vec::new();
         crate::escape::push_escaped(
@@ -469,9 +360,12 @@ fn extract_entry<R: ArchiveReader>(
 
     match entry.entry_type {
         EntryType::Directory => {
-            if extract_directory(pfd, name, entry, options)? {
-                // Its attributes are applied once the subtree exists.
-                pending_dirs.push((member, entry.clone()));
+            if extract_directory(tree, pfd, name, entry, options)? {
+                // Its attributes are applied once the subtree exists, if it
+                // is still this directory then.
+                if let Some(st) = stat_at(pfd, name) {
+                    pending_dirs.push(&member, &st, attrs_of(entry, options));
+                }
             }
             archive.skip_data()?;
         }
@@ -480,13 +374,12 @@ fn extract_entry<R: ArchiveReader>(
             archive.skip_data()?;
         }
         EntryType::Hardlink => {
-            extract_hardlink(tree, pfd, name, entry, options, extracted_links)?;
+            extract_hardlink(tree, pfd, name, entry, options)?;
             archive.skip_data()?;
         }
         EntryType::Regular => {
-            extract_file(archive, pfd, name, entry, options)?;
+            extract_regular(archive, tree, pfd, &member, entry, options, link_sets)?;
             archive.skip_data()?; // Skip padding to block boundary
-            extracted_links.record(entry, &member.display);
         }
         EntryType::BlockDevice | EntryType::CharDevice => {
             extract_device(pfd, name, entry, options)?;
@@ -497,14 +390,11 @@ fn extract_entry<R: ArchiveReader>(
             archive.skip_data()?;
         }
         EntryType::Socket => {
-            // Sockets cannot be extracted from archives
-            if options.verbose {
-                eprintln!(
-                    "{}: skipping socket: {}",
-                    crate::error::program_name(),
-                    member.display.display()
-                );
-            }
+            // Nothing makes a socket out of an archive member: bind(2)
+            // creates one only to listen on. libarchive refuses one the same
+            // way; skipping it in silence reported an incomplete extraction
+            // as a complete one.
+            crate::error::report_error(&member.display, "cannot create a socket; skipped");
             archive.skip_data()?;
         }
     }
@@ -542,9 +432,9 @@ fn copy_member_to_stdout<R: ArchiveReader>(
             if n == 0 {
                 break;
             }
-            stdout.write_all(&buf[..n])?;
+            stdout.write_all(&buf[..n]).map_err(PaxError::StdoutWrite)?;
         }
-        stdout.flush()?;
+        stdout.flush().map_err(PaxError::StdoutWrite)?;
     }
 
     archive.skip_data()?;
@@ -553,29 +443,13 @@ fn copy_member_to_stdout<R: ArchiveReader>(
 
 /// Extract a directory. Returns whether its attributes should be applied later.
 fn extract_directory(
+    tree: &DirTree,
     dirfd: BorrowedFd<'_>,
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
 ) -> PaxResult<bool> {
-    // Force owner search/write permission so the directory can be populated;
-    // the archived mode is applied once the subtree exists. An archived 0555
-    // used to be set immediately and then rejected every child with EACCES.
-    let mode = (entry.mode as libc::mode_t) | 0o700;
-
-    let r = unsafe { libc::mkdirat(dirfd.as_raw_fd(), name.as_ptr(), mode) };
-    if r != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::EEXIST) {
-            return Err(err.into());
-        }
-        // Extracting onto an existing directory is not an error (POSIX), but
-        // with -k the existing one is left entirely alone.
-        if options.no_clobber {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    make_dir_at(tree, dirfd, name, entry.mode, options.no_clobber)
 }
 
 /// Extract a symlink
@@ -616,13 +490,8 @@ fn extract_hardlink(
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-    extracted_links: &ExtractedLinks,
 ) -> PaxResult<()> {
-    let target = if let Some(ref link_target) = entry.link_target {
-        link_target.clone()
-    } else if let Some(existing) = extracted_links.get_link_target(entry) {
-        existing.clone()
-    } else {
+    let Some(target) = entry.link_target.clone() else {
         return Err(PaxError::InvalidHeader(
             "hard link target not found".to_string(),
         ));
@@ -637,27 +506,234 @@ fn extract_hardlink(
     // the target must already have been extracted.
     let target_parent = tree.parent_of(&target_member, false)?;
 
-    create_replacing(dirfd, name, options.no_clobber, || {
-        // flags = 0, never AT_SYMLINK_FOLLOW. fs::hard_link resolves the whole
-        // target path, so a symlink planted at the target -- possibly by an
-        // earlier member of this very archive -- could link a file from outside
-        // the extraction directory into it.
-        let r = unsafe {
-            libc::linkat(
-                target_parent.as_raw_fd(),
-                target_member.leaf.as_ptr(),
-                dirfd.as_raw_fd(),
-                name.as_ptr(),
-                0,
-            )
-        };
-        if r != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    })?;
+    // flags = 0, never AT_SYMLINK_FOLLOW. fs::hard_link resolves the whole
+    // target path, so a symlink planted at the target -- possibly by an
+    // earlier member of this very archive -- could link a file from outside
+    // the extraction directory into it. A member linked to its own name, or
+    // to a name it already shares, finds the file in place and keeps it.
+    link_replacing(
+        target_parent.as_raw_fd(),
+        &target_member.leaf,
+        dirfd,
+        name,
+        options.no_clobber,
+    )?;
 
     Ok(())
+}
+
+/// What extraction remembers about a cpio link set.
+struct CreatedSet {
+    /// The names created for the set so far, as extracted (after -s and -i).
+    names: Vec<PathBuf>,
+    /// (st_dev, st_ino) of the file they share on disk -- not the archive's
+    /// c_dev/c_ino.
+    file: (u64, u64),
+    /// Whether that file has its contents yet. newc stores them with the last
+    /// name of a set only, so the earlier names are created empty.
+    has_data: bool,
+    /// The file held open until its data arrives. Its names can be replaced
+    /// by other members meanwhile, and a filesystem that reuses inode numbers
+    /// (ext4) then hands this file's number to the next file created, which
+    /// `file` would take for this one. Open, it keeps its number.
+    _pin: Option<OwnedFd>,
+}
+
+impl CreatedSet {
+    /// The set as created at `name` below `dirfd`: pinned while the data is
+    /// still to come on a later name.
+    fn new(
+        names: Vec<PathBuf>,
+        file: (u64, u64),
+        has_data: bool,
+        dirfd: BorrowedFd<'_>,
+        name: &CStr,
+    ) -> Self {
+        let _pin = (!has_data).then(|| pin_file(dirfd, name, file)).flatten();
+        CreatedSet {
+            names,
+            file,
+            has_data,
+            _pin,
+        }
+    }
+
+    /// The names that still hold the set's file, each with the directory and
+    /// leaf it was found at: an earlier name may since have been replaced by
+    /// another member of the same name.
+    fn holders(&self, tree: &DirTree) -> Vec<((Rc<OwnedFd>, CString), PathBuf)> {
+        self.names
+            .iter()
+            .filter_map(|path| holding_name(tree, path, self.file).map(|h| (h, path.clone())))
+            .collect()
+    }
+}
+
+/// Extract a regular file, linking it to the file already on disk when it is a
+/// later name of a cpio link set.
+///
+/// A set starts at the first of its names that is actually created, so a name
+/// left out by a pattern, -u or -k does not stop the next one being extracted.
+fn extract_regular<R: ArchiveReader>(
+    archive: &mut R,
+    tree: &DirTree,
+    dirfd: BorrowedFd<'_>,
+    member: &MemberPath,
+    entry: &ArchiveEntry,
+    options: &ReadOptions,
+    link_sets: &mut LinkSets<CreatedSet>,
+) -> PaxResult<()> {
+    if let Some(set) = link_sets.find_mut(entry) {
+        return join_link_set(archive, tree, dirfd, member, entry, options, set);
+    }
+
+    if let Some(file) = extract_file(archive, dirfd, member.leaf.as_c_str(), entry, options)? {
+        link_sets.insert(entry, || {
+            let names = vec![member.display.clone()];
+            CreatedSet::new(names, file, entry.size > 0, dirfd, &member.leaf)
+        });
+    }
+    Ok(())
+}
+
+/// Extract a later name of a link set whose file is already on disk.
+///
+/// When that file has its contents -- or this name brings none -- the name is
+/// linked to it. Otherwise this is the name newc stores the data with: it is
+/// created fresh, exclusively, and the earlier names are moved over to it.
+/// Opening an earlier name to write the data through it could reach whatever
+/// someone else had linked there since.
+fn join_link_set<R: ArchiveReader>(
+    archive: &mut R,
+    tree: &DirTree,
+    dirfd: BorrowedFd<'_>,
+    member: &MemberPath,
+    entry: &ArchiveEntry,
+    options: &ReadOptions,
+    set: &mut CreatedSet,
+) -> PaxResult<()> {
+    let name = member.leaf.as_c_str();
+
+    if set.has_data || entry.size == 0 {
+        // An earlier name may since have been replaced by another member of
+        // the same name; only one still holding the file will do.
+        let holder = set
+            .names
+            .iter()
+            .find_map(|path| holding_name(tree, path, set.file));
+        if let Some((src_dir, src_leaf)) = holder {
+            link_replacing(
+                src_dir.as_raw_fd(),
+                &src_leaf,
+                dirfd,
+                name,
+                options.no_clobber,
+            )?;
+            // -k leaves an existing name alone, and that name is no part of
+            // the set.
+            if id_at(dirfd, name) == Some(set.file) {
+                set.names.push(member.display.clone());
+            }
+            return Ok(());
+        }
+    }
+
+    let holders = set.holders(tree);
+    let Some(file) = extract_file(archive, dirfd, name, entry, options)? else {
+        // -k kept what was there; the data is still the earlier names'.
+        return fill_link_set(archive, tree, entry, options, set);
+    };
+    let mut names = move_names_to(holders, dirfd, name)?;
+    names.push(member.display.clone());
+    // Created empty when no earlier name survived to link to: the data is
+    // then still to come, on a later name.
+    *set = CreatedSet::new(names, file, entry.size > 0, dirfd, name);
+    Ok(())
+}
+
+/// Bring the data of a newc set, which arrives with its last name, to the
+/// earlier names when that one is not extracted -- not selected, renamed away,
+/// kept by -k. Left alone, the names that were extracted stay empty.
+///
+/// As in `join_link_set`, the data goes into a file created fresh, here under
+/// a temporary name beside the first of them, and the names are moved over to
+/// it rather than the data written through one of them.
+fn fill_link_set<R: ArchiveReader>(
+    archive: &mut R,
+    tree: &DirTree,
+    entry: &ArchiveEntry,
+    options: &ReadOptions,
+    set: &mut CreatedSet,
+) -> PaxResult<()> {
+    if set.has_data || entry.size == 0 {
+        return Ok(());
+    }
+    let holders = set.holders(tree);
+    let Some(((dir, _), _)) = holders.first() else {
+        return Ok(());
+    };
+    let dir = Rc::clone(dir);
+    let (temp, file) = create_temp_file(dir.as_fd(), entry, options)?;
+    let filled = write_file_data(archive, file, entry, options)
+        .and_then(|id| Ok((id, move_names_to(holders, dir.as_fd(), &temp)?)));
+    let removed = unlink_at(dir.as_fd(), &temp);
+    let (file, names) = filled?;
+    removed?;
+    *set = CreatedSet {
+        names,
+        file,
+        has_data: true,
+        _pin: None,
+    };
+    Ok(())
+}
+
+/// Link each of `holders` -- names of a set, with the directory and leaf they
+/// were found at -- to `name` in `dirfd`, returning their paths.
+fn move_names_to(
+    holders: Vec<((Rc<OwnedFd>, CString), PathBuf)>,
+    dirfd: BorrowedFd<'_>,
+    name: &CStr,
+) -> PaxResult<Vec<PathBuf>> {
+    let mut names = Vec::with_capacity(holders.len() + 1);
+    for ((dir, leaf), path) in holders {
+        // These names were created by this extraction, so they are replaced
+        // even under -k.
+        link_replacing(dirfd.as_raw_fd(), name, dir.as_fd(), &leaf, false)?;
+        names.push(path);
+    }
+    Ok(names)
+}
+
+/// The directory and leaf of an extracted name, if it still names `file`.
+fn holding_name(tree: &DirTree, path: &Path, file: (u64, u64)) -> Option<(Rc<OwnedFd>, CString)> {
+    let member = MemberPath::parse(path).ok()??;
+    let dir = tree.parent_of(&member, false).ok()?;
+    (id_at(dir.as_fd(), &member.leaf) == Some(file)).then_some((dir, member.leaf))
+}
+
+/// The file at `name` below `dirfd`, opened without following a symlink or
+/// blocking, when it is still the file `file`. A failure only leaves the set
+/// unpinned.
+fn pin_file(dirfd: BorrowedFd<'_>, name: &CStr, file: (u64, u64)) -> Option<OwnedFd> {
+    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(dirfd.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return None;
+    }
+    let file_held = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    (file_id(&file_held.metadata().ok()?) == file).then(|| file_held.into())
+}
+
+/// (st_dev, st_ino) of a name below `dirfd`, not following a symlink.
+fn id_at(dirfd: BorrowedFd<'_>, name: &CStr) -> Option<(u64, u64)> {
+    stat_at(dirfd, name).map(|st| crate::modes::anchored::file_id(&st))
+}
+
+/// (st_dev, st_ino) of an open file.
+fn file_id(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
 }
 
 /// Extract a block or character device (requires root privileges)
@@ -682,7 +758,7 @@ fn extract_device(
     // Created without the set-id bits; set_permissions_at applies the archived
     // mode below, once the node exists.
     let mode: libc::mode_t =
-        (policy_of(options).creation_mode(&attrs_of(entry)) as libc::mode_t) | type_bits;
+        (policy_of(options).creation_mode(&attrs_of(entry, options)) as libc::mode_t) | type_bits;
 
     let created = create_replacing(dirfd, name, options.no_clobber, || {
         let r = unsafe { libc::mknodat(dirfd.as_raw_fd(), name.as_ptr(), mode, dev) };
@@ -703,8 +779,8 @@ fn extract_device(
         Err(e) => return Err(e),
     }
 
-    set_owner_at(dirfd, name, entry, options)?;
-    set_permissions_at(dirfd, name, entry, options)?;
+    let owner_set = set_owner_at(dirfd, name, entry, options)?;
+    set_permissions_at(dirfd, name, entry, options, owner_set)?;
     set_times_at(dirfd, name, entry, options)
 }
 
@@ -720,7 +796,7 @@ fn extract_fifo(
             libc::mkfifoat(
                 dirfd.as_raw_fd(),
                 name.as_ptr(),
-                policy_of(options).creation_mode(&attrs_of(entry)) as libc::mode_t,
+                policy_of(options).creation_mode(&attrs_of(entry, options)) as libc::mode_t,
             )
         };
         if r != 0 {
@@ -740,49 +816,94 @@ fn extract_fifo(
         Err(e) => return Err(e),
     }
 
-    set_owner_at(dirfd, name, entry, options)?;
-    set_permissions_at(dirfd, name, entry, options)?;
+    let owner_set = set_owner_at(dirfd, name, entry, options)?;
+    set_permissions_at(dirfd, name, entry, options, owner_set)?;
     set_times_at(dirfd, name, entry, options)
 }
 
-/// Extract a regular file
+/// Extract a regular file, returning the (st_dev, st_ino) of the file created,
+/// or `None` when -k left an existing one in place.
 fn extract_file<R: ArchiveReader>(
     archive: &mut R,
     dirfd: BorrowedFd<'_>,
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-) -> PaxResult<()> {
-    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+) -> PaxResult<Option<(u64, u64)>> {
     let mut opened: Option<File> = None;
-
     let created = create_replacing(dirfd, name, options.no_clobber, || {
-        let fd = unsafe {
-            libc::openat(
-                dirfd.as_raw_fd(),
-                name.as_ptr(),
-                flags,
-                policy_of(options).creation_mode(&attrs_of(entry)) as libc::c_uint,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        opened = Some(unsafe { File::from_raw_fd(fd) });
+        opened = Some(create_file(dirfd, name, entry, options)?);
         Ok(())
     })?;
 
-    let Some(mut file) = opened else {
+    let Some(file) = opened else {
         // -k: the name already exists, so the member is skipped. Its data is
         // consumed by the caller's skip_data.
         debug_assert!(!created);
-        return Ok(());
+        return Ok(None);
     };
+    write_file_data(archive, file, entry, options).map(Some)
+}
 
+/// Create `name` in `dirfd` exclusively, never following a symlink, with the
+/// mode the member is created with.
+fn create_file(
+    dirfd: BorrowedFd<'_>,
+    name: &CStr,
+    entry: &ArchiveEntry,
+    options: &ReadOptions,
+) -> std::io::Result<File> {
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe {
+        libc::openat(
+            dirfd.as_raw_fd(),
+            name.as_ptr(),
+            flags,
+            policy_of(options).creation_mode(&attrs_of(entry, options)) as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Create a file under a fresh temporary name in `dirfd`, for `fill_link_set`.
+fn create_temp_file(
+    dirfd: BorrowedFd<'_>,
+    entry: &ArchiveEntry,
+    options: &ReadOptions,
+) -> PaxResult<(CString, File)> {
+    const TRIES: u32 = 100;
+    for n in 0..TRIES {
+        let name = CString::new(format!(".pax-link.{}.{}", std::process::id(), n))
+            .expect("no NUL in a formatted number");
+        match create_file(dirfd, &name, entry, options) {
+            Ok(file) => return Ok((name, file)),
+            Err(e) if e.raw_os_error() == Some(libc::EEXIST) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(std::io::Error::from_raw_os_error(libc::EEXIST).into())
+}
+
+/// Write a member's data into `file`, just created for it, and give it the
+/// member's attributes, returning its (st_dev, st_ino).
+fn write_file_data<R: ArchiveReader>(
+    archive: &mut R,
+    mut file: File,
+    entry: &ArchiveEntry,
+    options: &ReadOptions,
+) -> PaxResult<(u64, u64)> {
     copy_file_data(archive, &mut file, entry.size)?;
 
     // Through the descriptor the data was just written to, not by name.
-    set_attrs_fd(file.as_fd(), &attrs_of(entry), &policy_of(options))
+    set_attrs_fd(file.as_fd(), &attrs_of(entry, options), &policy_of(options))?;
+    let id = file_id(&file.metadata()?);
+    // A filesystem that defers writes -- NFS, a quota checked late -- reports
+    // their failure here, and the member is then not extracted after all.
+    crate::blocked_io::close_file(file)?;
+    Ok(id)
 }
 
 /// Copy file data from archive to file
@@ -803,21 +924,26 @@ fn copy_file_data<R: ArchiveReader>(archive: &mut R, file: &mut File, size: u64)
     Ok(())
 }
 
-/// Whether the archive member is newer than what is already at `name`.
-fn is_archive_newer_at(entry: &ArchiveEntry, dirfd: BorrowedFd<'_>, name: &CStr) -> bool {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let r = unsafe {
-        libc::fstatat(
-            dirfd.as_raw_fd(),
-            name.as_ptr(),
-            &mut st,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
+/// `-u`: whether the archive member is newer than the file already at its
+/// name, or there is none. Times compare to the nanosecond; a member whose
+/// format holds whole seconds has none to add.
+///
+/// A policy check, not a security control: it reads the destination and then
+/// decides. Every component is opened without following a symlink, and the
+/// file is examined with fstatat, so a planted symlink cannot redirect it;
+/// losing a race here can only produce a wrong skip decision, never an escape.
+fn is_archive_newer(tree: &DirTree, entry: &ArchiveEntry) -> bool {
+    let Ok(Some(member)) = MemberPath::parse(&entry.path) else {
+        return true;
     };
-    if r != 0 {
-        return true; // nothing there: extract it
-    }
-    entry.mtime as i64 > st.st_mtime
+    let Ok(parent) = tree.parent_of(&member, false) else {
+        return true; // no such directory, so nothing there: extract it
+    };
+    // A directory created here only to hold earlier members is not one.
+    stat_at(parent.as_fd(), &member.leaf).is_none_or(|st| {
+        tree.is_implicit(&st)
+            || (entry.mtime, i64::from(entry.mtime_nsec)) > tree.mtime_before_run(&st)
+    })
 }
 
 /// The ids to give an extracted file.
@@ -854,15 +980,22 @@ fn owner_ids(entry: &ArchiveEntry) -> (u32, u32) {
 }
 
 /// The archived attributes of a member, in the shared shape.
-fn attrs_of(entry: &ArchiveEntry) -> Attrs {
-    let (uid, gid) = owner_ids(entry);
+///
+/// The owner is only ever applied under `-p o`, so only then are the user and
+/// group databases consulted for it: a lookup per member is not free.
+fn attrs_of(entry: &ArchiveEntry, options: &ReadOptions) -> Attrs {
+    let (uid, gid) = if options.preserve_owner {
+        owner_ids(entry)
+    } else {
+        (entry.uid, entry.gid)
+    };
     Attrs {
         mode: entry.mode,
         uid,
         gid,
-        mtime: entry.mtime as i64,
+        mtime: entry.mtime,
         mtime_nsec: entry.mtime_nsec as i64,
-        atime: entry.atime.map(|a| a as i64),
+        atime: entry.atime,
         atime_nsec: entry.atime_nsec as i64,
     }
 }
@@ -878,51 +1011,34 @@ fn policy_of(options: &ReadOptions) -> AttrPolicy {
     }
 }
 
-/// Set file permissions on a name below `dirfd`.
-///
-/// `fchmodat` has no portable way to refuse a symbolic link -- Linux rejects
-/// `AT_SYMLINK_NOFOLLOW` outright -- so the type is checked first and a link is
-/// refused. Callers that hold a descriptor for the file should use
+/// Set file permissions on a name below `dirfd`, never through a symbolic
+/// link (`chmod_at`). Callers that hold a descriptor for the file should use
 /// `set_attrs_fd` instead, which cannot be redirected at all.
 fn set_permissions_at(
     dirfd: BorrowedFd<'_>,
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
+    owner_set: bool,
 ) -> PaxResult<()> {
-    let Some(st) = stat_at(dirfd, name) else {
-        return Err(std::io::Error::last_os_error().into());
-    };
-    if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
-        // Whatever this name was when it was created, it is a symbolic link
-        // now. Following it would apply the archived mode to the file it
-        // points at, anywhere on the system.
-        return Err(PaxError::InvalidHeader(
-            "refusing to set permissions through a symbolic link".to_string(),
-        ));
-    }
-
-    let mode = policy_of(options).mode(&attrs_of(entry));
-    let r = unsafe { libc::fchmodat(dirfd.as_raw_fd(), name.as_ptr(), mode as libc::mode_t, 0) };
-    if r != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
+    let mode = policy_of(options).mode(&attrs_of(entry, options), owner_set);
+    chmod_at(dirfd, name, mode)
 }
 
-/// Set file owner (uid/gid) - requires privileges
+/// Set file owner (uid/gid) - requires privileges. Returns whether it was set,
+/// which decides whether `set_permissions_at` may apply set-id bits.
 fn set_owner_at(
     dirfd: BorrowedFd<'_>,
     name: &CStr,
     entry: &ArchiveEntry,
     options: &ReadOptions,
-) -> PaxResult<()> {
+) -> PaxResult<bool> {
     if !options.preserve_owner {
-        return Ok(());
+        return Ok(false);
     }
 
     let (uid, gid) = owner_ids(entry);
-    let result = unsafe {
+    set_owner(uid, gid, |uid, gid| unsafe {
         libc::fchownat(
             dirfd.as_raw_fd(),
             name.as_ptr(),
@@ -930,20 +1046,7 @@ fn set_owner_at(
             gid,
             libc::AT_SYMLINK_NOFOLLOW,
         )
-    };
-
-    if result != 0 {
-        let err = std::io::Error::last_os_error();
-        // EPERM usually means we're not root - warn but continue
-        if err.raw_os_error() == Some(libc::EPERM) {
-            eprintln!("pax: cannot change owner: Operation not permitted");
-            crate::error::note_error();
-            return Ok(());
-        }
-        return Err(err.into());
-    }
-
-    Ok(())
+    })
 }
 
 /// Set file access and modification times
@@ -953,7 +1056,7 @@ fn set_times_at(
     entry: &ArchiveEntry,
     options: &ReadOptions,
 ) -> PaxResult<()> {
-    let Some(times) = policy_of(options).times(&attrs_of(entry)) else {
+    let Some(times) = policy_of(options).times(&attrs_of(entry, options)) else {
         return Ok(());
     };
 
@@ -978,55 +1081,6 @@ fn set_times_at(
     }
 
     Ok(())
-}
-
-/// Apply the archived attributes of every extracted directory, deepest first.
-///
-/// Directories cannot take their attributes at creation time: an archived mode
-/// denying write or search stops its own contents being written, and the mtime
-/// is invalidated by every child created afterwards. Both are applied here,
-/// once the whole archive has been extracted.
-fn apply_pending_dirs(
-    tree: &DirTree,
-    pending: &mut [(MemberPath, ArchiveEntry)],
-    options: &ReadOptions,
-) {
-    // Deepest first, so a parent is stamped only after its children are done.
-    pending.sort_by_key(|(member, _)| std::cmp::Reverse(member.depth()));
-
-    for (member, entry) in pending.iter() {
-        let parent = match tree.parent_of(member, false) {
-            Ok(p) => p,
-            Err(e) => {
-                crate::error::report_error(&member.display, e);
-                continue;
-            }
-        };
-        let pfd = parent.as_fd();
-        let name = member.leaf.as_c_str();
-
-        // Reopen the directory itself and work through that descriptor. This
-        // pass runs after the whole archive has been extracted, so the name
-        // need not still be the directory that was created for this member --
-        // a later member can have replaced it with a symbolic link, and
-        // applying the archived mode by name would then chmod whatever the
-        // link points at. `O_NOFOLLOW` refuses the link, and `O_DIRECTORY`
-        // refuses anything else that took its place.
-        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        let fd = unsafe { libc::openat(pfd.as_raw_fd(), name.as_ptr(), flags) };
-        if fd < 0 {
-            crate::error::report_error(
-                &member.display,
-                PaxError::from(std::io::Error::last_os_error()),
-            );
-            continue;
-        }
-        let dir = unsafe { OwnedFd::from_raw_fd(fd) };
-
-        if let Err(e) = set_attrs_fd(dir.as_fd(), &attrs_of(entry), &policy_of(options)) {
-            crate::error::report_error(&member.display, e);
-        }
-    }
 }
 
 #[cfg(all(test, unix))]
@@ -1068,7 +1122,11 @@ mod tests {
             gname: Some(group.name.clone().into_bytes()),
             ..Default::default()
         };
-        let attrs = attrs_of(&named);
+        let owner = ReadOptions {
+            preserve_owner: true,
+            ..Default::default()
+        };
+        let attrs = attrs_of(&named, &owner);
         assert_eq!(
             (attrs.uid, attrs.gid),
             (euid, egid),
@@ -1084,7 +1142,7 @@ mod tests {
             gname: Some(b"nosuchgroup.pax.test".to_vec()),
             ..Default::default()
         };
-        let attrs = attrs_of(&unknown);
+        let attrs = attrs_of(&unknown, &owner);
         assert_eq!((attrs.uid, attrs.gid), (4242, 4243));
 
         // And a format that records no name at all -- cpio has no such field
@@ -1094,8 +1152,50 @@ mod tests {
             gid: 8,
             ..Default::default()
         };
-        let attrs = attrs_of(&bare);
+        let attrs = attrs_of(&bare, &owner);
         assert_eq!((attrs.uid, attrs.gid), (7, 8));
+
+        // Without -p o the owner is never applied, and never looked up.
+        let attrs = attrs_of(&named, &ReadOptions::default());
+        assert_eq!((attrs.uid, attrs.gid), (0xffff_fff0, 0xffff_fff0));
+    }
+
+    #[test]
+    fn test_rename_member_renames_hardlink_target_only() {
+        let subs = [Substitution::parse(",^,P/,").unwrap()];
+        let linked = |entry_type| {
+            let mut entry = ArchiveEntry::new(PathBuf::from("b"), entry_type);
+            entry.link_target = Some(PathBuf::from("a"));
+            entry
+        };
+
+        // A hard link's target is a member name and follows the member.
+        let mut hard = linked(EntryType::Hardlink);
+        assert!(rename_member(&mut hard, &subs, 0));
+        assert_eq!(hard.path, PathBuf::from("P/b"));
+        assert_eq!(hard.link_target, Some(PathBuf::from("P/a")));
+
+        // A symlink's target is its contents, and stays as archived.
+        let mut soft = linked(EntryType::Symlink);
+        assert!(rename_member(&mut soft, &subs, 0));
+        assert_eq!(soft.link_target, Some(PathBuf::from("a")));
+
+        // Substitution, then stripping, applies to the target as well.
+        let mut stripped = linked(EntryType::Hardlink);
+        assert!(rename_member(&mut stripped, &subs, 1));
+        assert_eq!(stripped.path, PathBuf::from("b"));
+        assert_eq!(stripped.link_target, Some(PathBuf::from("a")));
+
+        // A target -s ignores leaves the link nothing to link to; the member's
+        // own name is kept so extraction can diagnose it.
+        let drop_a = [Substitution::parse(",^a$,,").unwrap()];
+        let mut orphan = linked(EntryType::Hardlink);
+        assert!(rename_member(&mut orphan, &drop_a, 0));
+        assert_eq!(orphan.link_target, None);
+
+        // A member whose own name is ignored is dropped.
+        let drop_b = [Substitution::parse(",^b$,,").unwrap()];
+        assert!(!rename_member(&mut linked(EntryType::Hardlink), &drop_b, 0));
     }
 
     #[test]
@@ -1156,7 +1256,7 @@ mod tests {
             umask: 0o022,
             ..Default::default()
         };
-        set_permissions_at(dir.as_fd(), &name, &entry, &opts).unwrap();
+        set_permissions_at(dir.as_fd(), &name, &entry, &opts, false).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o755
@@ -1168,7 +1268,7 @@ mod tests {
             umask: 0o022,
             ..Default::default()
         };
-        set_permissions_at(dir.as_fd(), &name, &entry, &opts).unwrap();
+        set_permissions_at(dir.as_fd(), &name, &entry, &opts, false).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o777

@@ -12,10 +12,10 @@
 //! This module provides transparent gzip compression and decompression
 //! as a filter layer that wraps Read/Write streams.
 
-use flate2::read::MultiGzDecoder;
+use flate2::bufread::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, Read, Write};
 
 /// Gzip magic bytes (first two bytes of a gzip file)
 pub const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
@@ -25,76 +25,98 @@ pub fn is_gzip(data: &[u8]) -> bool {
     data.len() >= 2 && data[0] == GZIP_MAGIC[0] && data[1] == GZIP_MAGIC[1]
 }
 
-/// Gzip decompression wrapper for Read streams
+/// Gzip decompression wrapper for buffered Read streams
 ///
-/// `MultiGzDecoder`, not `GzDecoder`: a gzip stream may hold more than one
-/// deflate member, and `GzDecoder` stops at the end of the first one. That is
-/// not a corner case -- `gzip -c a >> x.gz`, `cat a.gz b.gz` and bgzip all
-/// produce multi-member streams -- and the failure is silent truncation of the
-/// archive, or a short read part way through a member.
-pub struct GzipReader<R: Read> {
-    decoder: MultiGzDecoder<R>,
+/// A gzip stream may hold more than one deflate member -- `gzip -c a >> x.gz`,
+/// `cat a.gz b.gz` and bgzip all produce one -- and stopping at the end of the
+/// first is silent truncation of the archive. So after each member, a next
+/// one is started if there is more input.
+///
+/// More input that starts with a zero byte is not another member but the zero
+/// padding of the last record: pax blocks the compressed stream (see
+/// `GzipWriter`), as do tar implementations writing to a tape, and gzip(1)
+/// itself ignores trailing zeros. `MultiGzDecoder` would reject them as a bad
+/// header.
+pub struct GzipReader<R: BufRead> {
+    /// The member being decoded; `None` once the stream has ended
+    decoder: Option<GzDecoder<R>>,
 }
 
-impl<R: Read> GzipReader<R> {
+impl<R: BufRead> GzipReader<R> {
     /// Create a new gzip decompressor wrapping the given reader
     ///
     /// A malformed gzip header is reported by the first [`Read::read`] rather
     /// than here, because the decoder parses the header lazily.
     pub fn new(reader: R) -> io::Result<Self> {
         Ok(GzipReader {
-            decoder: MultiGzDecoder::new(reader),
+            decoder: Some(GzDecoder::new(reader)),
         })
     }
 }
 
-impl<R: Read> Read for GzipReader<R> {
+impl<R: BufRead> Read for GzipReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.decoder.read(buf)
+        loop {
+            let Some(decoder) = self.decoder.as_mut() else {
+                return Ok(0);
+            };
+            let n = decoder.read(buf)?;
+            if n > 0 || buf.is_empty() {
+                return Ok(n);
+            }
+            // The member has ended; the bufread decoder has consumed exactly it.
+            let Some(mut inner) = self.decoder.take().map(GzDecoder::into_inner) else {
+                return Ok(0);
+            };
+            let next = inner.fill_buf()?;
+            if next.first().is_some_and(|&b| b != 0) {
+                self.decoder = Some(GzDecoder::new(inner));
+            }
+        }
     }
 }
 
 /// Gzip compression wrapper for Write streams
+///
+/// Under it is the blocked archive writer, so the compressed stream is what is
+/// written in records. The archive writers flush once, when the archive is
+/// complete, and that flush is what ends the gzip stream: a flush of the
+/// blocked writer pads out the last record, and that padding has to come after
+/// the gzip trailer, not before it.
 pub struct GzipWriter<W: Write> {
-    encoder: Option<GzEncoder<W>>,
+    encoder: GzEncoder<W>,
+    /// Whether `flush` has ended the stream
+    finished: bool,
 }
 
 impl<W: Write> GzipWriter<W> {
     /// Create a new gzip compressor wrapping the given writer
     pub fn new(writer: W) -> io::Result<Self> {
         Ok(GzipWriter {
-            encoder: Some(GzEncoder::new(writer, Compression::default())),
+            encoder: GzEncoder::new(writer, Compression::default()),
+            finished: false,
         })
     }
 }
 
 impl<W: Write> Write for GzipWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Some(ref mut encoder) = self.encoder {
-            encoder.write(buf)
-        } else {
-            Err(io::Error::other("GzipWriter already finished"))
+        if self.finished {
+            return Err(io::Error::other("GzipWriter already finished"));
         }
+        self.encoder.write(buf)
     }
 
+    /// End the gzip stream, then flush what is under it.
     fn flush(&mut self) -> io::Result<()> {
-        if let Some(ref mut encoder) = self.encoder {
-            encoder.flush()
-        } else {
-            Ok(())
-        }
+        self.encoder.try_finish()?;
+        self.finished = true;
+        self.encoder.get_mut().flush()
     }
 }
 
-impl<W: Write> Drop for GzipWriter<W> {
-    fn drop(&mut self) {
-        // If encoder hasn't been finished yet, finish it now
-        if let Some(encoder) = self.encoder.take() {
-            // Ignore errors during drop - nothing we can do about them
-            let _ = encoder.finish();
-        }
-    }
-}
+// Dropping a GzipWriter that was never flushed still ends the stream:
+// GzEncoder's own Drop writes the trailer.
 
 #[cfg(test)]
 mod tests {
@@ -156,5 +178,41 @@ mod tests {
         }
 
         assert_eq!(decompressed, original);
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        let mut compressed = Vec::new();
+        let mut writer = GzipWriter::new(&mut compressed).unwrap();
+        writer.write_all(data).unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+        compressed
+    }
+
+    #[test]
+    fn test_gzip_multi_member_and_record_padding() {
+        // Two members, then the zero padding of a blocked last record.
+        let mut stream = gzip(b"first ");
+        stream.extend(gzip(b"second"));
+        stream.extend([0u8; 700]);
+
+        let mut decompressed = Vec::new();
+        GzipReader::new(Cursor::new(stream))
+            .unwrap()
+            .read_to_end(&mut decompressed)
+            .unwrap();
+        assert_eq!(decompressed, b"first second");
+    }
+
+    #[test]
+    fn test_gzip_flush_ends_the_stream() {
+        let mut compressed = Vec::new();
+        let mut writer = GzipWriter::new(&mut compressed).unwrap();
+        writer.write_all(b"data").unwrap();
+        writer.flush().unwrap();
+        assert!(writer.write(b"more").is_err());
+        drop(writer);
+        // Dropping after the flush adds nothing past the trailer.
+        assert_eq!(compressed, gzip(b"data"));
     }
 }

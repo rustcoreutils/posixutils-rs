@@ -9,16 +9,16 @@
 
 //! List mode implementation - list archive contents
 
-use crate::archive::{ArchiveEntry, ArchiveFormat, ArchiveReader, EntryType};
-use crate::error::PaxResult;
-use crate::formats::{CpioReader, PaxReader, UstarReader};
+use crate::archive::{ArchiveEntry, ArchiveReader, EntryType, LinkSets};
+use crate::error::{PaxError, PaxResult};
+use crate::modes::select::Selector;
 use crate::options::{
     format_list_entry, format_mode_symbolic, format_time_traditional, FormatOptions, ListEntryInfo,
 };
-use crate::pattern::{find_matching_pattern_subtree, matches_excluded, Pattern};
-use crate::subst::{apply_substitutions, SubstResult, Substitution};
-use std::collections::HashSet;
-use std::io::{Read, Write};
+use crate::pattern::Pattern;
+use crate::subst::Substitution;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 /// Options for list mode
 #[derive(Default)]
@@ -44,201 +44,97 @@ pub struct ListOptions {
     pub strip_components: usize,
 }
 
-/// List archive contents
-pub fn list_archive<R: Read, W: Write>(
-    reader: R,
-    writer: &mut W,
-    format: ArchiveFormat,
-    options: &ListOptions,
-) -> PaxResult<()> {
-    match format {
-        ArchiveFormat::Ustar => {
-            let mut archive = UstarReader::new(reader);
-            list_entries(&mut archive, writer, options)
-        }
-        ArchiveFormat::Cpio => {
-            let mut archive = CpioReader::new(reader);
-            list_entries(&mut archive, writer, options)
-        }
-        ArchiveFormat::Pax => {
-            // Same as read mode: without the options the reader ignores
-            // `-o delete=`, so a keyword suppressed on extract was still shown
-            // in the listing.
-            let mut archive = PaxReader::new(reader).with_options(options.format_options.clone());
-            list_entries(&mut archive, writer, options)
-        }
-    }
-}
-
-/// List archive contents from an ArchiveReader (for multi-volume support)
-pub fn list_archive_from_reader<R: ArchiveReader, W: Write>(
+/// List the members of an archive
+pub fn list_archive<R: ArchiveReader, W: Write>(
     archive: &mut R,
     writer: &mut W,
     options: &ListOptions,
 ) -> PaxResult<()> {
-    list_entries(archive, writer, options)
-}
+    let mut selector = Selector::new(
+        &options.patterns,
+        options.exclude,
+        options.first_match,
+        options.dir_only,
+        &options.exclude_patterns,
+    );
+    let option_records =
+        crate::modes::read::caller_option_records(archive, &options.format_options)?;
+    // The first listed name of each cpio link set, for the later ones to show
+    // as `== first`, the way extraction links them.
+    let mut link_sets: LinkSets<PathBuf> = LinkSets::default();
 
-/// List entries from any archive reader
-fn list_entries<R: ArchiveReader, W: Write>(
-    archive: &mut R,
-    writer: &mut W,
-    options: &ListOptions,
-) -> PaxResult<()> {
-    // Track which patterns have been matched (for -n first_match option)
-    let mut matched_patterns: HashSet<usize> = HashSet::new();
-
+    // Whether the loop met the end of the archive, rather than stopping
+    // short of it under -n.
+    let mut reached_end = true;
     while let Some(mut entry) = archive.read_entry()? {
-        if let Some(should_output) = should_list(&entry, options, &mut matched_patterns) {
-            if !should_output {
-                // Entry matched a pattern that's already been matched (first_match mode)
-                archive.skip_data()?;
-                continue;
-            }
-            // `-o keyword:=value` forces a value regardless of what the archive
-            // carried, and the listing must report what extraction would use.
-            crate::modes::read::apply_keyword_overrides(&mut entry, &options.format_options);
-            // Apply substitutions
-            if !options.substitutions.is_empty() {
-                match apply_substitutions(&options.substitutions, &entry.path) {
-                    SubstResult::Unchanged => {
-                        // Keep the original bytes.
-                    }
-                    SubstResult::Changed(new_path) => {
-                        entry.path = crate::rawpath::from_substituted(&new_path);
-                    }
-                    SubstResult::Empty => {
-                        // Skip this entry
-                        archive.skip_data()?;
-                        continue;
-                    }
-                }
-            }
-            // --strip-components reshapes the name the listing reports, so that
-            // `tar -t` shows what `tar -x` would create.
-            if options.strip_components > 0 {
-                match crate::modes::read::strip_leading_components(
-                    &entry.path,
-                    options.strip_components,
-                ) {
-                    Some(stripped) => entry.path = stripped,
-                    None => {
-                        archive.skip_data()?;
-                        continue;
-                    }
-                }
-            }
-            if let Err(e) = print_entry(writer, &entry, options) {
-                crate::error::report_error(&entry.path, e);
+        if let Some(ref records) = option_records {
+            records.apply(&mut entry);
+        }
+        if let Some(selection) = selector.select(&entry) {
+            selector.take(selection);
+            // Rename as extraction would, hard link targets included, so the
+            // listing shows the names `-r` would create (`tar -t` what `tar -x`).
+            if crate::modes::read::rename_member(
+                &mut entry,
+                &options.substitutions,
+                options.strip_components,
+            ) {
+                let linked_to = link_set_target(&mut link_sets, &entry);
+                // A failure to write the listing is not about this member and
+                // recurs for every one after it, so it ends the run.
+                print_entry(writer, &entry, linked_to.as_deref(), options)
+                    .map_err(listing_error)?;
             }
         }
         archive.skip_data()?;
-    }
-
-    // Diagnose any pattern operand that matched no archive member (non-exclude
-    // mode) and set a non-zero exit status (POSIX DESCRIPTION).
-    if !options.exclude {
-        for (idx, pat) in options.patterns.iter().enumerate() {
-            if !matched_patterns.contains(&idx) {
-                crate::error::report_error(&pat.source, gettextrs::gettext("not found"));
-            }
+        if selector.is_done() {
+            reached_end = false;
+            break;
         }
     }
 
-    Ok(())
+    selector.report_unmatched();
+    archive.finish(reached_end)
 }
 
-/// Check if entry should be listed
-/// Returns:
-/// - None: entry should not be listed (doesn't match patterns or excluded)
-/// - Some(true): entry should be listed
-/// - Some(false): entry matches but pattern already matched (first_match mode)
-fn should_list(
-    entry: &ArchiveEntry,
-    options: &ListOptions,
-    matched_patterns: &mut HashSet<usize>,
-) -> Option<bool> {
-    let name = crate::rawpath::MatchName::of(&entry.path);
-    let path = name.as_str();
-
-    // tar's exclusion list is independent of the pattern operands and wins over
-    // them, so it is applied to the stored name before anything else.
-    if matches_excluded(&options.exclude_patterns, path) {
-        return None;
-    }
-
-    // Try matching against both the full path and the path with "./" prefix stripped
-    let path_stripped = path.strip_prefix("./").unwrap_or(path);
-
-    if options.patterns.is_empty() {
-        // No patterns means match all
-        if options.exclude {
-            return None; // Exclude all
-        }
-        return Some(true); // Match all
-    }
-
-    // Find which pattern matches (if any). A pattern selecting a directory also
-    // selects its whole subtree unless `-d` (dir_only) was given.
-    let expand_subtree = !options.dir_only;
-    let matching_pattern = find_matching_pattern_subtree(&options.patterns, path, expand_subtree)
-        .or_else(|| {
-            // Only worth a second pass when stripping actually changed
-            // something; otherwise this repeats the first pass verbatim for
-            // every non-matching member.
-            if std::ptr::eq(path_stripped, path) {
-                None
-            } else {
-                find_matching_pattern_subtree(&options.patterns, path_stripped, expand_subtree)
-            }
-        });
-
-    match matching_pattern {
-        Some(pattern_idx) => {
-            if options.exclude {
-                // Entry matched a pattern, so exclude it
-                None
-            } else if options.first_match && matched_patterns.contains(&pattern_idx) {
-                // first_match (-n): this pattern has already selected a member
-                Some(false)
-            } else {
-                // Record the match (for the unmatched-pattern sweep and -n) and
-                // select the entry.
-                matched_patterns.insert(pattern_idx);
-                Some(true)
-            }
-        }
-        None => {
-            // No pattern matched
-            if options.exclude {
-                Some(true) // Exclude mode: output entries that don't match
-            } else {
-                None // Normal mode: skip entries that don't match
-            }
-        }
-    }
+/// A failure to write the listing, which ends the run.
+pub(crate) fn listing_error(e: std::io::Error) -> PaxError {
+    PaxError::Io(std::io::Error::new(
+        e.kind(),
+        format!("writing the listing: {e}"),
+    ))
 }
 
-/// Print an entry
+/// The name a later name of a cpio link set is linked to on extraction: the
+/// first listed name of the set. `None` for any other member, which starts a set
+/// if it is the first name of one.
+fn link_set_target(link_sets: &mut LinkSets<PathBuf>, entry: &ArchiveEntry) -> Option<PathBuf> {
+    if let Some(first) = link_sets.find_mut(entry) {
+        return Some(first.clone());
+    }
+    link_sets.insert(entry, || entry.path.clone());
+    None
+}
+
+/// Print an entry. `linked_to` is the earlier name a cpio member is linked to.
 fn print_entry<W: Write>(
     writer: &mut W,
     entry: &ArchiveEntry,
+    linked_to: Option<&Path>,
     options: &ListOptions,
-) -> PaxResult<()> {
+) -> std::io::Result<()> {
     // Check for custom list format (listopt)
     if let Some(ref format) = options.format_options.list_format {
         let info = ListEntryInfo {
             entry,
             style: crate::escape::stdout_style(),
         };
-        let output = format_list_entry(format, &info);
-        writer.write_all(&output)?;
-        // Add newline if format doesn't end with one
-        if output.last() != Some(&b'\n') {
-            writer.write_all(b"\n")?;
-        }
+        writer.write_all(&format_list_entry(format, &info))?;
+        // POSIX: "The pax utility shall append a <newline> to the listopt
+        // output for each selected file" -- even one ending in a <newline>.
+        writer.write_all(b"\n")?;
     } else if options.verbose {
-        print_verbose(writer, entry)?;
+        print_verbose(writer, entry, linked_to)?;
     } else {
         // The name goes out as the bytes the archive recorded. `display()`
         // would render an invalid byte as U+FFFD, so the listing would not
@@ -250,7 +146,11 @@ fn print_entry<W: Write>(
 }
 
 /// Print verbose ls -l style output
-fn print_verbose<W: Write>(writer: &mut W, entry: &ArchiveEntry) -> PaxResult<()> {
+fn print_verbose<W: Write>(
+    writer: &mut W,
+    entry: &ArchiveEntry,
+    linked_to: Option<&Path>,
+) -> std::io::Result<()> {
     let mode_str = format_mode_symbolic(entry.mode, entry.entry_type);
     let nlink = entry.nlink;
     let owner = format_owner(entry);
@@ -267,7 +167,7 @@ fn print_verbose<W: Write>(writer: &mut W, entry: &ArchiveEntry) -> PaxResult<()
         mode_str, nlink, owner, group, size, mtime
     )?;
     crate::escape::write_name(writer, path, crate::escape::stdout_style())?;
-    write_link_suffix(writer, entry)?;
+    write_link_suffix(writer, entry, linked_to)?;
     writer.write_all(b"\n")?;
 
     Ok(())
@@ -278,7 +178,9 @@ fn print_verbose<W: Write>(writer: &mut W, entry: &ArchiveEntry) -> PaxResult<()
 /// A name is bytes, and this column is padded to a width, so it is rendered as
 /// display text rather than written through. A name that is not UTF-8 -- which
 /// `hdrcharset=BINARY` permits -- would otherwise mis-align every following
-/// column. `-o listopt=%(uname)s` is the lossless way to read one.
+/// column. `-o listopt=%(uname)s` is the lossless way to read one. It comes
+/// from the archive like the pathname, so it is escaped like one; escaping
+/// keeps one unit per unit, so the column width is unchanged.
 fn format_owner(entry: &ArchiveEntry) -> String {
     display_name(entry.uname.as_deref(), entry.uid)
 }
@@ -290,23 +192,32 @@ fn format_group(entry: &ArchiveEntry) -> String {
 
 fn display_name(name: Option<&[u8]>, id: u32) -> String {
     match name {
-        Some(name) => String::from_utf8_lossy(name).into_owned(),
+        Some(name) => {
+            let mut shown = Vec::with_capacity(name.len());
+            crate::escape::push_escaped(&mut shown, name, crate::escape::stdout_style());
+            String::from_utf8_lossy(&shown).into_owned()
+        }
         None => id.to_string(),
     }
 }
 
-/// Write the ` -> target` / ` == target` suffix a link carries.
+/// Write the ` -> target` / ` == target` suffix a link carries -- a hard link
+/// either by its typeflag or, in cpio, as a later name of a link set.
 ///
 /// Writes rather than returning a `String`, so the target's bytes never pass
 /// through one -- which is what stops this drifting back to `display()`.
-fn write_link_suffix<W: Write>(writer: &mut W, entry: &ArchiveEntry) -> PaxResult<()> {
-    let marker = match (&entry.entry_type, &entry.link_target) {
-        (EntryType::Symlink, Some(_)) => b" -> ".as_slice(),
-        (EntryType::Hardlink, Some(_)) => b" == ".as_slice(),
+fn write_link_suffix<W: Write>(
+    writer: &mut W,
+    entry: &ArchiveEntry,
+    linked_to: Option<&Path>,
+) -> std::io::Result<()> {
+    let (marker, target) = match (&entry.entry_type, &entry.link_target, linked_to) {
+        (EntryType::Symlink, Some(target), _) => (b" -> ".as_slice(), target.as_path()),
+        (EntryType::Hardlink, Some(target), _) => (b" == ".as_slice(), target.as_path()),
+        (_, _, Some(target)) => (b" == ".as_slice(), target),
         _ => return Ok(()),
     };
     writer.write_all(marker)?;
-    let target = entry.link_target.as_ref().expect("matched Some above");
     crate::escape::write_name(writer, target, crate::escape::stdout_style())?;
     Ok(())
 }

@@ -13,6 +13,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 /// Run pax with given arguments and return output
 pub fn run_pax(args: &[&str]) -> Output {
@@ -100,6 +101,24 @@ pub fn run_pax_in_dir(args: &[&str], dir: &Path) -> Output {
         .expect("Failed to run pax")
 }
 
+/// Run pax in `dir` in a session of its own, with no controlling terminal --
+/// as under cron or CI -- so that opening `/dev/tty` fails.
+pub fn run_pax_without_tty(args: &[&str], dir: &Path) -> Output {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_pax"));
+    cmd.args(args).current_dir(dir).stdin(Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    cmd.output().expect("Failed to run pax")
+}
+
 /// Run pax with stdin input in a specific directory
 pub fn run_pax_in_dir_with_stdin(args: &[&str], dir: &Path, stdin_data: &str) -> Output {
     use std::process::Stdio;
@@ -138,8 +157,15 @@ pub fn front_end(name: &str) -> std::path::PathBuf {
 
 /// Run `tar` or `cpio` in `dir`, feeding `stdin_data` if given.
 pub fn run_front_end(name: &str, args: &[&str], dir: &Path, stdin_data: Option<&[u8]>) -> Output {
+    run_program(&front_end(name), args, dir, stdin_data)
+}
+
+/// Run `program` in `dir` with its standard input fed from `stdin_data` (or
+/// empty), collecting its output.
+pub fn run_program(program: &Path, args: &[&str], dir: &Path, stdin_data: Option<&[u8]>) -> Output {
     use std::process::Stdio;
-    let mut child = Command::new(front_end(name))
+    let name = program.display();
+    let mut child = Command::new(program)
         .args(args)
         .current_dir(dir)
         .stdin(Stdio::piped())
@@ -148,28 +174,76 @@ pub fn run_front_end(name: &str, args: &[&str], dir: &Path, stdin_data: Option<&
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn {}: {}", name, e));
 
-    {
-        // Dropping stdin closes it, so a child reading a name list from a pipe
-        // sees EOF instead of blocking forever.
-        let mut stdin = child.stdin.take().expect("stdin was piped");
-        if let Some(data) = stdin_data {
-            match stdin.write_all(data) {
-                Ok(()) => {}
-                // A front-end that rejects its command line exits before it
-                // ever reads the name list, which closes the read end of this
-                // pipe. That is the behavior under test, so losing the write is
-                // the expected outcome, not a harness failure. Whether the
-                // write lands at all is a race the child usually loses on
-                // macOS and usually wins on Linux.
-                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
-                Err(e) => panic!("failed to write stdin to {}: {}", name, e),
-            }
-        }
-    }
+    // Fed from a thread of its own: a child that writes its output while
+    // still reading -- cpio archiving a long name list -- would otherwise fill
+    // its stdout pipe while this side is still blocked filling its stdin.
+    // Dropping stdin closes it, so a child reading a name list from a pipe
+    // sees EOF instead of blocking forever.
+    let mut stdin = child.stdin.take().expect("stdin was piped");
+    let data = stdin_data.map(<[u8]>::to_vec);
+    let feeder = std::thread::spawn(move || match data {
+        Some(data) => match stdin.write_all(&data) {
+            Ok(()) => Ok(()),
+            // A front-end that rejects its command line exits before it ever
+            // reads the name list, which closes the read end of this pipe.
+            // That is the behavior under test, so losing the write is the
+            // expected outcome, not a harness failure. Whether the write lands
+            // at all is a race the child usually loses on macOS and usually
+            // wins on Linux.
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            Err(e) => Err(e),
+        },
+        None => Ok(()),
+    });
 
-    child
+    let output = child
         .wait_with_output()
-        .unwrap_or_else(|e| panic!("failed to wait for {}: {}", name, e))
+        .unwrap_or_else(|e| panic!("failed to wait for {}: {}", name, e));
+    if let Err(e) = feeder.join().expect("stdin feeder panicked") {
+        panic!("failed to write stdin to {}: {}", name, e);
+    }
+    output
+}
+
+/// Whether `program` writes its first `record` bytes of output while its
+/// standard input is still open, after being fed only `names`.
+///
+/// For the name-list readers, which must archive each name as it arrives
+/// rather than wait for the producer to finish. Gives up after five seconds,
+/// and kills the child either way.
+pub fn writes_before_list_ends(
+    program: &Path,
+    args: &[&str],
+    dir: &Path,
+    names: &[u8],
+    record: usize,
+) -> bool {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = Command::new(program)
+        .args(args)
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(names).unwrap();
+    stdin.flush().unwrap();
+
+    let mut stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; record];
+        let _ = tx.send(stdout.read_exact(&mut buf).is_ok());
+    });
+    let got = rx.recv_timeout(Duration::from_secs(5));
+
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+    got == Ok(true)
 }
 
 /// Run `tar` in `dir`.
@@ -182,13 +256,40 @@ pub fn run_cpio(args: &[&str], dir: &Path, stdin_data: &[u8]) -> Output {
     run_front_end("cpio", args, dir, Some(stdin_data))
 }
 
-/// Whether a system tool of this name can be run, for the cross-tool checks.
-pub fn have_tool(name: &str) -> bool {
-    Command::new(name)
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+/// The system's own `name` -- the first executable of that name on `$PATH` --
+/// for the cross-tool checks, or `None` when there is none.
+///
+/// Absence is the only reason a cross-tool test may skip. Once the tool
+/// exists, anything it does wrong is the test's failure: a check that also
+/// skipped when the tool failed passed whatever pax wrote. Found by looking,
+/// not by running `name --version`, which BSD pax and some cpio do not
+/// accept.
+pub fn system_tool(name: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let found = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(name))
+            .find(|p| {
+                fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            })
+    });
+    if found.is_none() {
+        eprintln!("skipping cross-tool check: no system {}", name);
+    }
+    found
+}
+
+/// Run the system `tool` and require it to succeed.
+pub fn run_system_ok(tool: &Path, args: &[&str], dir: &Path, stdin_data: Option<&[u8]>) -> Output {
+    let out = run_program(tool, args, dir, stdin_data);
+    assert!(
+        out.status.success(),
+        "system {} {:?} failed: {}",
+        tool.display(),
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
 }
 
 /// Create a test directory with standard test files
@@ -323,6 +424,8 @@ pub struct Ustar<'a> {
     /// what a well-formed member has; `Some` is how a fixture makes the header
     /// lie about how much data follows.
     pub size: Option<u64>,
+    /// The `mtime` field (136), seconds since the epoch.
+    pub mtime: u64,
 }
 
 impl Default for Ustar<'_> {
@@ -341,6 +444,7 @@ impl Default for Ustar<'_> {
             uname: b"",
             gname: b"",
             size: None,
+            mtime: 0,
         }
     }
 }
@@ -351,25 +455,24 @@ impl Ustar<'_> {
     pub fn header(&self) -> [u8; BLOCK] {
         let mut h = [0u8; BLOCK];
         h[..self.name.len()].copy_from_slice(self.name);
-        h[100..108].copy_from_slice(format!("{:07o}\0", self.mode).as_bytes());
-        h[108..116].copy_from_slice(format!("{:07o}\0", self.uid).as_bytes());
-        h[116..124].copy_from_slice(format!("{:07o}\0", self.gid).as_bytes());
-        let size = self.size.unwrap_or(self.body.len() as u64);
-        h[124..136].copy_from_slice(format!("{:011o}\0", size).as_bytes());
-        h[136..148].copy_from_slice(b"00000000000\0"); // mtime
-        h[148..156].copy_from_slice(b"        "); // spaces while summing
+        numeric_field(&mut h[100..108], self.mode.into());
+        numeric_field(&mut h[108..116], self.uid.into());
+        numeric_field(&mut h[116..124], self.gid.into());
+        numeric_field(
+            &mut h[124..136],
+            self.size.unwrap_or(self.body.len() as u64),
+        );
+        numeric_field(&mut h[136..148], self.mtime);
         h[156] = self.typeflag;
         h[157..157 + self.linkname.len()].copy_from_slice(self.linkname);
         h[257..263].copy_from_slice(b"ustar\0");
         h[263..265].copy_from_slice(b"00");
-        h[329..337].copy_from_slice(format!("{:07o}\0", self.devmajor).as_bytes());
-        h[337..345].copy_from_slice(format!("{:07o}\0", self.devminor).as_bytes());
+        numeric_field(&mut h[329..337], self.devmajor.into());
+        numeric_field(&mut h[337..345], self.devminor.into());
         h[265..265 + self.uname.len()].copy_from_slice(self.uname);
         h[297..297 + self.gname.len()].copy_from_slice(self.gname);
         h[345..345 + self.prefix.len()].copy_from_slice(self.prefix);
-
-        let sum: u32 = h.iter().map(|&b| b as u32).sum();
-        h[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
+        reseal_header(&mut h);
         h
     }
 
@@ -389,6 +492,234 @@ impl Ustar<'_> {
         let mut out = self.member();
         out.extend_from_slice(&ustar_trailer());
         out
+    }
+}
+
+/// Write `value` into a ustar numeric field: NUL-terminated octal when it
+/// fits, else the GNU base-256 form (first byte 0x80, the value big-endian in
+/// the rest). A uid from the test host -- 2097152 and up is ordinary on CI --
+/// does not fit seven octal digits.
+fn numeric_field(field: &mut [u8], value: u64) {
+    let digits = field.len() - 1;
+    let octal = format!("{value:0digits$o}\0");
+    if octal.len() == field.len() {
+        field.copy_from_slice(octal.as_bytes());
+    } else {
+        let be = value.to_be_bytes();
+        let n = digits.min(be.len());
+        assert!(
+            be[..be.len() - n].iter().all(|&b| b == 0),
+            "numeric field value too big"
+        );
+        field.fill(0);
+        field[0] = 0x80;
+        let start = field.len() - n;
+        field[start..].copy_from_slice(&be[be.len() - n..]);
+    }
+}
+
+/// Recompute the checksum of the header block that `block` begins with, for a
+/// fixture that edits a field after the header was built.
+pub fn reseal_header(block: &mut [u8]) {
+    block[148..156].copy_from_slice(b"        "); // spaces while summing
+    let sum: u32 = block[..BLOCK].iter().map(|&b| b as u32).sum();
+    block[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
+}
+
+/// Run pax on `args` in `dir`, killing it if it has not finished within
+/// `limit`; `None` when it had to be killed. For a test whose regression is a
+/// hang or a crawl rather than a wrong answer. Output is collected only once
+/// pax exits, so it must fit in a pipe buffer.
+pub fn run_pax_with_deadline(args: &[&str], dir: &Path, limit: Duration) -> Option<Output> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pax"))
+        .args(args)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + limit;
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    Some(child.wait_with_output().unwrap())
+}
+
+/// Run pax in `dir` with a fresh pseudo-terminal as its controlling terminal,
+/// so that `/dev/tty` is that terminal and `-i` prompts on it. `typed` is
+/// queued as terminal input before pax starts. Returns pax's output and
+/// everything it wrote to the terminal, or `None` if it had to be killed
+/// after `limit` -- a pax that keeps prompting would otherwise hang the test.
+pub fn run_pax_on_tty(
+    args: &[&str],
+    dir: &Path,
+    typed: &[u8],
+    limit: Duration,
+) -> Option<(Output, Vec<u8>)> {
+    PtyPax::spawn(args, dir, typed, PtyStdio::StdinOnly).finish(limit)
+}
+
+/// `run_pax_on_tty` with standard output and standard error on the terminal
+/// as well, the way an interactive user runs pax; their output is then part of
+/// the terminal's.
+pub fn run_pax_on_terminal(args: &[&str], dir: &Path, limit: Duration) -> Option<Vec<u8>> {
+    PtyPax::spawn(args, dir, b"", PtyStdio::All)
+        .finish(limit)
+        .map(|(_, tty)| tty)
+}
+
+/// Which of pax's standard streams are the terminal.
+pub enum PtyStdio {
+    /// Standard input only; output and errors are piped.
+    StdinOnly,
+    /// All three.
+    All,
+    /// Output and errors; standard input is a pipe the test writes to.
+    OutputOnly,
+}
+
+/// A pax running with a pseudo-terminal as its controlling terminal.
+pub struct PtyPax {
+    pub child: std::process::Child,
+    master: File,
+    /// Everything pax has written to the terminal so far.
+    pub seen: Vec<u8>,
+}
+
+impl PtyPax {
+    pub fn spawn(args: &[&str], dir: &Path, typed: &[u8], stdio: PtyStdio) -> PtyPax {
+        Self::spawn_program(
+            Path::new(env!("CARGO_BIN_EXE_pax")),
+            args,
+            dir,
+            typed,
+            stdio,
+        )
+    }
+
+    /// `spawn`, running `program` (a front-end) in place of pax.
+    pub fn spawn_program(
+        program: &Path,
+        args: &[&str],
+        dir: &Path,
+        typed: &[u8],
+        stdio: PtyStdio,
+    ) -> PtyPax {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+
+        let (mut master, mut slave) = (-1, -1);
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                // `*mut` on macOS, `*const` on Linux; a null `*mut` suits both.
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+        // Not inherited by the children other tests spawn meanwhile: a stray
+        // copy of the slave would keep the terminal open after pax exits.
+        for fd in [master, slave] {
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+        let mut master = unsafe { File::from_raw_fd(master) };
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        master.write_all(typed).unwrap();
+        // Drained as pax runs, never with a blocking read: on macOS a read of
+        // the master does not return once the slave is closed, it just waits.
+        unsafe {
+            let flags = libc::fcntl(master.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        // At least one of pax's own descriptors is the slave: macOS stops
+        // `/dev/tty` opening once no descriptor for the terminal is left open.
+        let tty = || Stdio::from(slave.try_clone().unwrap());
+        let (stdin, out, err) = match stdio {
+            PtyStdio::StdinOnly => (tty(), Stdio::piped(), Stdio::piped()),
+            PtyStdio::All => (tty(), tty(), tty()),
+            PtyStdio::OutputOnly => (Stdio::piped(), tty(), tty()),
+        };
+        let mut cmd = Command::new(program);
+        cmd.args(args)
+            .current_dir(dir)
+            .stdin(stdin)
+            .stdout(out)
+            .stderr(err);
+        let slave_fd = slave.as_raw_fd();
+        unsafe {
+            cmd.pre_exec(move || {
+                // A new session with the slave as its controlling terminal.
+                if libc::setsid() < 0 || libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().unwrap();
+        // The parent's copies of the slave go here, so that pax holds the
+        // only ones.
+        drop(cmd);
+        drop(slave);
+        PtyPax {
+            child,
+            master,
+            seen: Vec::new(),
+        }
+    }
+
+    /// Collect whatever pax has written to the terminal since the last call.
+    pub fn drain(&mut self) {
+        use std::io::Read;
+        let mut buf = [0u8; 1024];
+        while let Ok(n) = self.master.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            self.seen.extend_from_slice(&buf[..n]);
+        }
+    }
+
+    /// Wait up to `limit` for `needle` to appear on the terminal.
+    pub fn wait_for(&mut self, needle: &[u8], limit: Duration) -> bool {
+        let deadline = Instant::now() + limit;
+        loop {
+            self.drain();
+            if self.seen.windows(needle.len()).any(|w| w == needle) {
+                return true;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Wait for pax to exit, killing it after `limit`; `None` if it had to be.
+    pub fn finish(mut self, limit: Duration) -> Option<(Output, Vec<u8>)> {
+        let deadline = Instant::now() + limit;
+        while self.child.try_wait().unwrap().is_none() {
+            self.drain();
+            if Instant::now() > deadline {
+                self.child.kill().unwrap();
+                self.child.wait().unwrap();
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.drain();
+        let output = self.child.wait_with_output().unwrap();
+        Some((output, self.seen))
     }
 }
 
@@ -550,4 +881,64 @@ pub fn stdout_str(output: &Output) -> String {
 /// Get stderr as string
 pub fn stderr_str(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+/// A small file system mounted at a directory, for the tests that need a
+/// mount point (`-X`) or a second device (`-l` across devices). Unmounted when
+/// dropped.
+///
+/// Only macOS can do this unprivileged (`hdiutil`); elsewhere `mount` returns
+/// `None` and the caller skips.
+pub struct ScratchMount {
+    mount_point: std::path::PathBuf,
+}
+
+impl ScratchMount {
+    /// Mount a fresh 1 MB file system at `mount_point`, which must be an
+    /// empty directory. `scratch` holds the disk image.
+    pub fn mount(scratch: &Path, mount_point: &Path) -> Option<ScratchMount> {
+        if !cfg!(target_os = "macos") {
+            return None;
+        }
+        let image = scratch.join("scratch.dmg");
+        let hdiutil = |args: &[&std::ffi::OsStr]| {
+            Command::new("hdiutil")
+                .args(args)
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        let created = hdiutil(&[
+            "create".as_ref(),
+            "-size".as_ref(),
+            "1m".as_ref(),
+            "-fs".as_ref(),
+            "HFS+".as_ref(),
+            "-volname".as_ref(),
+            "paxtest".as_ref(),
+            image.as_os_str(),
+        ]);
+        let attached = created
+            && hdiutil(&[
+                "attach".as_ref(),
+                "-nobrowse".as_ref(),
+                "-mountpoint".as_ref(),
+                mount_point.as_os_str(),
+                image.as_os_str(),
+            ]);
+        attached.then(|| ScratchMount {
+            mount_point: mount_point.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for ScratchMount {
+    fn drop(&mut self) {
+        let _ = Command::new("hdiutil")
+            .args([
+                "detach".as_ref(),
+                "-force".as_ref(),
+                self.mount_point.as_os_str(),
+            ])
+            .output();
+    }
 }

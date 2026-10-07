@@ -24,23 +24,14 @@
 //! so nothing about the in-memory model needed to change; the corruption was
 //! entirely at the edges, and this module is those edges.
 //!
-//! ## The one place bytes are still given up
-//!
 //! Pattern matching (`pattern.rs`) and `-s` substitution (`subst.rs`) work on
-//! `&str`, and converting for them is lossy. That is a real limitation, not an
-//! oversight: a member whose name is not UTF-8 may fail to match a pattern that
-//! ought to select it. It is confined to *selecting and renaming*, never to the
-//! name that reaches the filesystem or a header.
+//! the bytes too.
 //!
-//! [`MatchName`] is that boundary, made explicit. It implements no `Display`,
-//! no `AsRef<Path>` and no `Into<PathBuf>`, so a lossy name cannot be printed,
-//! stored, or written into a header by accident -- the compiler refuses. The
-//! complete list of places this crate gives up bytes is `MatchName::of`,
-//! [`from_substituted`], and the `uname`/`gname` fields, which are text by
-//! definition.
+//! ## Where bytes are still given up
+//!
+//! Only in the `uname`/`gname` fields, which are text by definition.
 
-use std::borrow::Cow;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
@@ -52,6 +43,33 @@ pub fn as_bytes(path: &Path) -> &[u8] {
 /// A pathname from the bytes a header recorded, exactly as recorded.
 pub fn from_bytes(bytes: &[u8]) -> PathBuf {
     PathBuf::from(OsString::from_vec(bytes.to_vec()))
+}
+
+/// `path` with any trailing slashes removed, as bytes.
+///
+/// A directory member is stored as `dir/` but named `dir` while it is being
+/// written; `-u` compares the two, so both sides drop the slash.
+pub fn trim_trailing_slashes(path: &Path) -> &Path {
+    let bytes = as_bytes(path);
+    let end = bytes.iter().rposition(|&b| b != b'/').map_or(0, |i| i + 1);
+    Path::new(std::ffi::OsStr::from_bytes(&bytes[..end]))
+}
+
+/// Whether two pathnames are spellings of one name: they differ only in empty
+/// and `.` components, so `./h/a`, `h//a` and `h/a/` all name `h/a`. A leading
+/// `/` is significant. `..` is not resolved, since where it leads depends on
+/// what the components before it are.
+pub fn same_name(a: &Path, b: &Path) -> bool {
+    fn parts(path: &Path) -> (bool, impl Iterator<Item = &[u8]>) {
+        let bytes = as_bytes(path);
+        let parts = bytes
+            .split(|&b| b == b'/')
+            .filter(|part| !part.is_empty() && *part != b".");
+        (bytes.starts_with(b"/"), parts)
+    }
+    let (a_root, a_parts) = parts(a);
+    let (b_root, b_parts) = parts(b);
+    a_root == b_root && a_parts.eq(b_parts)
 }
 
 /// Join a ustar `prefix` field to its `name` field.
@@ -67,38 +85,6 @@ pub fn join(prefix: &[u8], name: &[u8]) -> PathBuf {
     joined.push(b'/');
     joined.extend_from_slice(name);
     from_bytes(&joined)
-}
-
-/// A pathname rendered for pattern matching and `-s` substitution, which work
-/// on `&str` and so cannot see a name that is not UTF-8 as it really is.
-///
-/// Deliberately not printable, not storable and not convertible back to a
-/// `Path`: this is the lossy form, and the type is what keeps it from leaking
-/// into an extracted filename or a header field. To get a name *out* of a
-/// substitution, use [`from_substituted`], which says in its own name that the
-/// bytes have been through a `&str`.
-pub struct MatchName<'a>(Cow<'a, str>);
-
-impl<'a> MatchName<'a> {
-    /// The only sanctioned lossy conversion of a pathname in this crate.
-    pub fn of(path: &'a Path) -> Self {
-        MatchName(path.to_string_lossy())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// A member name produced by `-s` substitution.
-///
-/// `-s` matches against the lossy form, so a name that is not UTF-8 and that a
-/// substitution *changes* comes back laundered -- there is nowhere for the
-/// original bytes to survive once a regex has rewritten the text. A
-/// substitution that leaves a name unchanged does not reach this function, and
-/// that is the case that still round-trips exactly.
-pub fn from_substituted(s: &str) -> PathBuf {
-    PathBuf::from(OsStr::from_bytes(s.as_bytes()).to_owned())
 }
 
 /// The byte offsets at which each *display unit* of `bytes` begins.
@@ -149,6 +135,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn same_name_ignores_empty_and_dot_components() {
+        let same = |a: &str, b: &str| same_name(Path::new(a), Path::new(b));
+        assert!(same("h/a", "./h/a"));
+        assert!(same("h/a", ".//h/./a/"));
+        assert!(same("/h/a", "//h/a"));
+        assert!(!same("/h/a", "h/a"));
+        assert!(!same("h/a", "h/b"));
+        assert!(!same("h/a", "h/a/b"));
+        assert!(!same("d/../h/a", "h/a"));
+    }
+
+    #[test]
+    fn test_trim_trailing_slashes_keeps_bytes() {
+        assert_eq!(
+            as_bytes(trim_trailing_slashes(&from_bytes(b"d\xfe//"))),
+            b"d\xfe"
+        );
+        assert_ne!(
+            trim_trailing_slashes(&from_bytes(b"n\xfe")),
+            trim_trailing_slashes(&from_bytes(b"n\xff"))
+        );
+        assert_eq!(as_bytes(trim_trailing_slashes(Path::new("/"))), b"");
+    }
+
+    #[test]
     fn test_round_trip_keeps_invalid_bytes() {
         let raw = b"na\xffme.txt";
         let path = from_bytes(raw);
@@ -162,9 +173,6 @@ mod tests {
         let a = from_bytes(b"a\xffb");
         let b = from_bytes(b"a\xfeb");
         assert_ne!(a, b);
-        // ...whereas the lossy form of each is the same string, which is
-        // exactly why matching is documented as a limitation.
-        assert_eq!(MatchName::of(&a).as_str(), MatchName::of(&b).as_str());
     }
 
     #[test]

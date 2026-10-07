@@ -9,11 +9,13 @@
 
 //! Integration tests for the `tar` compatibility front-end.
 
-use crate::common::{assert_failure, assert_success, have_tool, run_tar, stderr_str, stdout_str};
+use crate::common::{
+    assert_failure, assert_success, front_end, run_system_ok, run_tar, stderr_str, stdout_str,
+    system_tool, writes_before_list_ends,
+};
 use plib::tmp::TempDir;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// Build the tree every test archives: a file, a subdirectory with two files
 /// (one of which the exclusion tests target), and a symlink.
@@ -367,7 +369,8 @@ fn test_tar_rejects_unsupported_and_unknown_options() {
     assert!(stderr_str(&out).contains("unrecognized option"));
 
     let out = run_tar(&["-cf", "../out.tar"], &src);
-    assert_success(&out, "tar -cf with no operands");
+    assert_failure(&out, "tar -cf with no operands");
+    assert!(stderr_str(&out).contains("empty archive"));
     let out = run_tar(&["-f", "../out.tar"], &src);
     assert_failure(&out, "tar with no operation");
     assert!(stderr_str(&out).contains("is required"));
@@ -557,25 +560,12 @@ fn test_tar_help_and_version_exit_zero() {
 fn test_tar_cross_tool_system_tar_reads_ours() {
     let temp = TempDir::new().unwrap();
     let src = setup(temp.path());
-    if !have_tool("tar") {
-        eprintln!("skipping cross-tool test: no system tar");
-        return;
-    }
-
-    assert_success(&run_tar(&["-cf", "../out.tar", "."], &src), "tar -cf");
-    let out = Command::new("tar")
-        .args(["-tf", "out.tar"])
-        .current_dir(temp.path())
-        .output();
-    let Ok(out) = out else {
-        eprintln!("skipping cross-tool test: system tar would not run");
+    let Some(tar) = system_tool("tar") else {
         return;
     };
-    assert!(
-        out.status.success(),
-        "system tar could not read our archive: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+
+    assert_success(&run_tar(&["-cf", "../out.tar", "."], &src), "tar -cf");
+    let out = run_system_ok(&tar, &["-tf", "out.tar"], temp.path(), None);
     assert!(String::from_utf8_lossy(&out.stdout).contains("a.txt"));
 }
 
@@ -585,24 +575,283 @@ fn test_tar_cross_tool_we_read_system_tar() {
     let src = setup(temp.path());
     let dest = temp.path().join("dest");
     fs::create_dir(&dest).unwrap();
-    if !have_tool("tar") {
-        eprintln!("skipping cross-tool test: no system tar");
-        return;
-    }
-
-    let made = Command::new("tar")
-        .args(["-cf", "../sys.tar", "."])
-        .current_dir(&src)
-        .output();
-    let Ok(made) = made else {
-        eprintln!("skipping cross-tool test: system tar would not run");
+    let Some(tar) = system_tool("tar") else {
         return;
     };
-    if !made.status.success() {
-        eprintln!("skipping cross-tool test: system tar failed to create");
-        return;
-    }
+
+    run_system_ok(&tar, &["-cf", "../sys.tar", "."], &src, None);
 
     assert_success(&run_tar(&["-xf", "../sys.tar"], &dest), "tar -xf sys.tar");
     assert_eq!(fs::read_to_string(dest.join("a.txt")).unwrap(), "alpha\n");
+}
+
+/// An empty -T list names no files: tar must archive nothing, not fall back to
+/// reading names from standard input.
+#[test]
+fn test_tar_empty_name_list_archives_nothing() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("f"), "F\n").unwrap();
+    fs::write(temp.path().join("empty.list"), "").unwrap();
+
+    let out = crate::common::run_front_end(
+        "tar",
+        &["-cf", "x.tar", "-T", "empty.list"],
+        temp.path(),
+        Some(b"f\n"),
+    );
+    assert_success(&out, "tar -T empty.list");
+    let out = run_tar(&["-tf", "x.tar"], temp.path());
+    assert_success(&out, "tar -t");
+    assert_eq!(stdout_str(&out), "");
+}
+
+/// `tar -T -` and `cpio -o -0` archive each name as it arrives, as pax does
+/// with its own standard-input list: both used to read the whole list while
+/// parsing the command line, before anything was written.
+#[test]
+fn test_front_end_name_lists_stream() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("big"), vec![b'B'; 64 * 1024]).unwrap();
+
+    assert!(
+        writes_before_list_ends(
+            &front_end("tar"),
+            &["-cf", "-", "-T", "-"],
+            temp.path(),
+            b"big\n",
+            10240,
+        ),
+        "tar -T -: no record written while the list was open"
+    );
+    assert!(
+        writes_before_list_ends(
+            &front_end("cpio"),
+            &["-o", "-0", "-H", "newc"],
+            temp.path(),
+            b"big\0",
+            512,
+        ),
+        "cpio -o -0: no record written while the list was open"
+    );
+}
+
+/// The names in a `-T` list select members on extraction and listing just as
+/// operands do. They used to be read only when creating, so `tar -x -T list`
+/// extracted -- and overwrote -- every member.
+#[test]
+fn test_tar_files_from_selects_members_on_extract_and_list() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+    assert_success(
+        &run_tar(&["-cf", "../t.tar", "a.txt", "sub"], &src),
+        "tar -c",
+    );
+    let dst = temp.path().join("dst");
+    fs::create_dir_all(dst.join("sub")).unwrap();
+    fs::write(dst.join("sub/b.txt"), "LOCAL\n").unwrap();
+    fs::write(dst.join("list"), "a.txt\n").unwrap();
+
+    let out = run_tar(&["-tf", "../t.tar", "-T", "list"], &dst);
+    assert_success(&out, "tar -t -T");
+    assert_eq!(stdout_str(&out), "a.txt\n");
+
+    let out = run_tar(&["-xf", "../t.tar", "-T", "list"], &dst);
+    assert_success(&out, "tar -x -T");
+    assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "alpha\n");
+    assert_eq!(
+        fs::read_to_string(dst.join("sub/b.txt")).unwrap(),
+        "LOCAL\n",
+        "a member not in the list was extracted"
+    );
+    assert!(!dst.join("sub/c.o").exists());
+}
+
+/// A name list that cannot be read is diagnosed before the archive is
+/// created: `File::create` truncated an existing archive first, so the
+/// failed command destroyed it.
+#[test]
+fn test_tar_unreadable_files_from_keeps_existing_archive() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+    assert_success(&run_tar(&["-cf", "../keep.tar", "a.txt"], &src), "tar -c");
+    let before = fs::read(temp.path().join("keep.tar")).unwrap();
+    fs::create_dir(temp.path().join("somedir")).unwrap();
+
+    let out = run_tar(&["-cf", "keep.tar", "-T", "somedir"], temp.path());
+    assert_failure(&out, "tar -c -T directory");
+    assert_eq!(fs::read(temp.path().join("keep.tar")).unwrap(), before);
+}
+
+/// `tar -r` appends in whatever tar format the archive is already in. It used
+/// to ask for ustar explicitly, which append refuses for a pax archive.
+#[test]
+fn test_tar_append_to_pax_archive() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+    let long = "p".repeat(120);
+    fs::write(src.join(&long), "P\n").unwrap();
+    assert_success(
+        &run_tar(&["--format=pax", "-cf", "../p.tar", &long], &src),
+        "tar -c pax",
+    );
+    let out = run_tar(&["-rf", "../p.tar", "a.txt"], &src);
+    assert_success(&out, "tar -r on a pax archive");
+    assert_eq!(
+        members(temp.path(), "p.tar"),
+        vec!["a.txt".to_string(), long]
+    );
+}
+
+/// An empty `-T` list adds no names, so with no operands either there are no
+/// patterns at all, and every member is selected -- as bsdtar and GNU tar do.
+/// The archive is still read: a missing one is an error.
+#[test]
+fn test_tar_empty_files_from_selects_every_member_on_extract_and_list() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+    assert_success(&run_tar(&["-cf", "../t.tar", "a.txt"], &src), "tar -c");
+    let dst = temp.path().join("dst");
+    fs::create_dir(&dst).unwrap();
+    fs::write(dst.join("empty.list"), "").unwrap();
+
+    let out = run_tar(&["-tf", "../t.tar", "-T", "empty.list"], &dst);
+    assert_success(&out, "tar -t -T empty");
+    assert_eq!(stdout_str(&out), "a.txt\n");
+
+    let out = run_tar(&["-xf", "../t.tar", "-T", "empty.list"], &dst);
+    assert_success(&out, "tar -x -T empty");
+    assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "alpha\n");
+
+    // Operands still select alongside the empty list.
+    fs::write(src.join("z.txt"), "zed\n").unwrap();
+    assert_success(
+        &run_tar(&["-cf", "../t2.tar", "a.txt", "z.txt"], &src),
+        "tar -c",
+    );
+    let out = run_tar(&["-tf", "../t2.tar", "-T", "empty.list", "a.txt"], &dst);
+    assert_success(&out, "tar -t -T empty a.txt");
+    assert_eq!(stdout_str(&out), "a.txt\n");
+
+    for mode in ["-tf", "-xf"] {
+        let out = run_tar(&[mode, "../missing.tar", "-T", "empty.list"], &dst);
+        assert_failure(&out, &format!("tar {mode} missing.tar -T empty"));
+    }
+}
+
+/// GNU tar skips a socket with a warning, "socket ignored", and exits 0 --
+/// bsdtar likewise. pax itself diagnoses one as POSIX requires.
+#[test]
+fn test_tar_create_skips_socket_with_a_warning() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+    let _sock = std::os::unix::net::UnixListener::bind(src.join("s")).unwrap();
+    let out = run_tar(&["-cf", "../t.tar", "s", "a.txt"], &src);
+    assert_success(&out, "tar -c with a socket");
+    assert!(
+        stderr_str(&out).contains("s: socket ignored"),
+        "{}",
+        stderr_str(&out)
+    );
+    let out = run_tar(&["-tf", "../t.tar"], &src);
+    assert_eq!(stdout_str(&out), "a.txt\n");
+}
+
+/// GNU tar's exclusion patterns: a wildcard matches a leading '.', and a
+/// pattern naming a directory excludes what is below it, when listing and
+/// extracting as when archiving.
+#[test]
+fn test_tar_exclude_matches_dot_files_and_directory_contents() {
+    let temp = TempDir::new().unwrap();
+    let src = temp.path().join("src");
+    fs::create_dir_all(src.join("d")).unwrap();
+    fs::create_dir_all(src.join("e/.h")).unwrap();
+    fs::write(src.join(".hid"), "h\n").unwrap();
+    fs::write(src.join("d/x"), "x\n").unwrap();
+    fs::write(src.join("e/.h/q"), "q\n").unwrap();
+    assert_success(
+        &run_tar(&["-cf", "../t.tar", ".hid", "d", "e"], &src),
+        "tar -cf",
+    );
+
+    let list = |exclude: &str| {
+        let out = run_tar(
+            &["-tf", "t.tar", &format!("--exclude={exclude}")],
+            temp.path(),
+        );
+        assert_success(&out, "tar -tf --exclude");
+        stdout_str(&out)
+    };
+    assert_eq!(list("*"), "");
+    assert_eq!(list("d"), ".hid\ne/\ne/.h/\ne/.h/q\n");
+    assert_eq!(list(".h"), ".hid\nd/\nd/x\ne/\n");
+    assert_eq!(list("*h*"), "d/\nd/x\ne/\n");
+
+    let dest = temp.path().join("dest");
+    fs::create_dir(&dest).unwrap();
+    assert_success(
+        &run_tar(&["-xf", "../t.tar", "--exclude=e/.h"], &dest),
+        "tar -xf --exclude",
+    );
+    assert!(dest.join("e").is_dir());
+    assert!(!dest.join("e/.h").exists(), "e/.h/q was extracted");
+}
+
+/// `--file=` gives the empty string as the archive name; it must not take
+/// the next argument instead. It took `a.txt`, so `tar -c --file= a.txt`
+/// truncated the file it was asked to archive.
+#[test]
+fn test_tar_empty_long_option_value_is_not_the_next_argument() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+    let out = run_tar(&["-c", "--file=", "a.txt"], &src);
+    assert_failure(&out, "tar -c --file=");
+    assert_eq!(fs::read_to_string(src.join("a.txt")).unwrap(), "alpha\n");
+
+    // cpio's long options share the parser.
+    let out = run_tar(&["-cf", "../a.tar", "a.txt"], &src);
+    assert_success(&out, "tar -cf");
+    let out = crate::common::run_cpio(&["-t", "--file=", "../a.tar"], &src, b"");
+    assert_failure(&out, "cpio -t --file=");
+}
+
+/// `tar -c` with no file operands and no `-T` has nothing to archive. It read
+/// names from standard input, as `pax -w` does; GNU tar refuses.
+#[test]
+fn test_tar_create_without_operands_is_refused() {
+    let temp = TempDir::new().unwrap();
+    let src = setup(temp.path());
+    let out = crate::common::run_front_end("tar", &["-cf", "out.tar"], &src, Some(b"a.txt\n"));
+    assert_failure(&out, "tar -cf with no operands");
+    assert!(
+        stderr_str(&out).contains("empty archive"),
+        "{}",
+        stderr_str(&out)
+    );
+    assert!(!src.join("out.tar").exists());
+
+    // Appending nothing leaves the archive as it was, without reading stdin.
+    let out = run_tar(&["-cf", "out.tar", "a.txt"], &src);
+    assert_success(&out, "tar -cf");
+    for mode in ["-rf", "-uf"] {
+        let out =
+            crate::common::run_front_end("tar", &[mode, "out.tar"], &src, Some(b"sub/b.txt\n"));
+        assert_success(&out, &format!("tar {mode} with no operands"));
+        assert_eq!(members(&src, "out.tar"), vec!["a.txt"], "tar {mode}");
+    }
+}
+
+/// A usage error is two lines. On a terminal the message is escaped, but its
+/// own newline has to stay a newline: it came out as `?`.
+#[test]
+fn test_tar_usage_error_newline_on_terminal() {
+    use crate::common::{PtyPax, PtyStdio};
+    let temp = TempDir::new().unwrap();
+    let Some((_, tty)) =
+        PtyPax::spawn_program(&front_end("tar"), &["-q"], temp.path(), b"", PtyStdio::All)
+            .finish(std::time::Duration::from_secs(20))
+    else {
+        panic!("tar -q did not exit");
+    };
+    let tty = String::from_utf8_lossy(&tty);
+    assert!(tty.contains("'-q'\r\nTry 'tar --help'."), "{tty:?}");
 }

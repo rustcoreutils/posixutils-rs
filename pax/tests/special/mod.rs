@@ -216,17 +216,15 @@ fn test_read_special_files_from_system_tar() {
     }
 
     // Create archive with system tar
-    let output = Command::new("tar")
-        .args(["-cf"])
-        .arg(&archive)
-        .arg(".")
-        .current_dir(&src_dir)
-        .output();
-
-    if output.is_err() || !output.as_ref().unwrap().status.success() {
-        eprintln!("Skipping test: system tar not available");
+    let Some(tar) = system_tool("tar") else {
         return;
-    }
+    };
+    run_system_ok(
+        &tar,
+        &["-cf", archive.to_str().unwrap(), "."],
+        &src_dir,
+        None,
+    );
 
     // List with our pax
     let output = run_pax(&["-v", "-f", archive.to_str().unwrap()]);
@@ -650,4 +648,247 @@ fn test_listopt_literal_tab_survives() {
         output.stdout, b"a.txt\t2\n",
         "the tab is part of the format, not part of a name"
     );
+}
+
+/// A NUL inside a pathname read from standard input -- the common slip
+/// `find -print0 | pax -w` -- can name no file. pax must diagnose that name and
+/// go on with the rest, not panic after the archive was already created.
+#[test]
+fn test_write_list_with_nul_byte_is_diagnosed() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("good"), "G\n").unwrap();
+    let archive = temp.path().join("a.tar");
+
+    let output = run_pax_with_stdin_bytes_in_dir(
+        &["-w", "-f", archive.to_str().unwrap()],
+        b"a\0b\ngood\n",
+        temp.path(),
+    );
+    assert_exit_code(&output, 1, "pax -w with a NUL in a listed name");
+
+    let output = run_pax_in_dir(&["-f", archive.to_str().unwrap()], temp.path());
+    assert_success(&output, "list");
+    assert_eq!(stdout_str(&output), "good\n");
+}
+
+/// The same name list in copy mode.
+#[test]
+fn test_copy_list_with_nul_byte_is_diagnosed() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("good"), "G\n").unwrap();
+    fs::create_dir(temp.path().join("out")).unwrap();
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-rw", "out"], b"a\0b\ngood\n", temp.path());
+    assert_exit_code(&output, 1, "pax -rw with a NUL in a listed name");
+    assert!(temp.path().join("out/good").exists());
+}
+
+/// A write error on the archive is the archive's failure, not each source
+/// file's. With the file-size limit exceeded (EFBIG), pax must stop and say so
+/// once -- not go on reporting "File too large" against every remaining file
+/// as though that file were at fault.
+#[test]
+fn test_archive_write_error_is_fatal_and_reported_once() {
+    let temp = TempDir::new().unwrap();
+    let mut names = Vec::new();
+    for i in 0..20 {
+        let name = format!("f{i:02}");
+        fs::write(temp.path().join(&name), vec![b'x'; 4096]).unwrap();
+        names.push(name);
+    }
+
+    // SIGXFSZ ignored so the over-limit write fails with EFBIG instead of
+    // killing the process; a 1-block limit is exceeded by the first record.
+    let script = format!(
+        "trap '' XFSZ; ulimit -f 1; exec \"$0\" -w -f a.tar {}",
+        names.join(" ")
+    );
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(&script)
+        .arg(env!("CARGO_BIN_EXE_pax"))
+        .current_dir(temp.path())
+        .output()
+        .unwrap();
+
+    assert_exit_code(&output, 1, "pax -w past the file-size limit");
+    let stderr = stderr_str(&output);
+    assert_eq!(stderr.lines().count(), 1, "stderr:\n{stderr}");
+    assert!(!stderr.contains("f0"), "blamed a source file:\n{stderr}");
+}
+
+/// On a terminal, nothing taken from an archive reaches it raw: not the name,
+/// not a symbolic link's target, and not the owner and group names in the
+/// `-v` columns, which were rendered without escaping.
+#[test]
+fn test_terminal_listing_escapes_every_archive_field() {
+    let temp = TempDir::new().unwrap();
+    let mut archive = crate::common::Ustar {
+        name: b"n\x1b[31m",
+        body: b"x\n",
+        uname: b"u\x1b[32m",
+        gname: b"g\x1b[33m",
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &crate::common::Ustar {
+            name: b"l",
+            typeflag: b'2',
+            linkname: b"t\x1b[34m",
+            ..Default::default()
+        }
+        .archive(),
+    );
+    fs::write(temp.path().join("a.tar"), &archive).unwrap();
+
+    let tty = run_pax_on_terminal(
+        &["-v", "-f", "a.tar"],
+        temp.path(),
+        std::time::Duration::from_secs(20),
+    )
+    .expect("pax -v did not finish");
+    assert!(
+        !tty.contains(&0x1b),
+        "an escape sequence reached the terminal: {:?}",
+        String::from_utf8_lossy(&tty)
+    );
+    assert!(
+        tty.windows(2).any(|w| w == b"t?"),
+        "{:?}",
+        String::from_utf8_lossy(&tty)
+    );
+}
+
+/// A diagnostic that ends the run is escaped like every per-file one: the
+/// final message was printed as it was, archive bytes and all.
+#[test]
+fn test_terminal_fatal_diagnostic_is_escaped() {
+    let temp = TempDir::new().unwrap();
+    let archive = archive_with_ext_records(&pax_record("size", b"1\x1b[31m"));
+    fs::write(temp.path().join("a.tar"), &archive).unwrap();
+
+    let tty = run_pax_on_terminal(
+        &["-f", "a.tar"],
+        temp.path(),
+        std::time::Duration::from_secs(20),
+    )
+    .expect("pax did not finish");
+    assert!(
+        tty.windows(2).any(|w| w == b"1?"),
+        "the diagnostic should quote the value: {:?}",
+        String::from_utf8_lossy(&tty)
+    );
+    assert!(
+        !tty.contains(&0x1b),
+        "an escape sequence reached the terminal: {:?}",
+        String::from_utf8_lossy(&tty)
+    );
+}
+
+/// A socket member (cpio can hold one) cannot be created: nothing makes a
+/// listening socket out of an archive. Skipping it in silence, with exit
+/// status 0, reported an extraction that left a file out as complete.
+#[test]
+fn test_socket_member_is_diagnosed_on_extract() {
+    let temp = TempDir::new().unwrap();
+    let mut archive = CpioNewc {
+        name: b"sock",
+        mode: 0o140644,
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &CpioNewc {
+            name: b"after",
+            body: b"after\n",
+            ino: 2,
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, temp.path());
+    assert_exit_code(&output, 1, "extract a socket member");
+    assert!(
+        stderr_str(&output).contains("sock"),
+        "the socket must be named: {}",
+        stderr_str(&output)
+    );
+    assert!(!temp.path().join("sock").exists());
+    assert_eq!(
+        fs::read_to_string(temp.path().join("after")).unwrap(),
+        "after\n"
+    );
+}
+
+/// The root of macOS's sealed, read-only system volume, where creating a name
+/// fails with EROFS (below it, SIP answers EPERM first). `None` where a probe
+/// does not fail that way, so the tests below never write outside their
+/// temporary directory.
+#[cfg(target_os = "macos")]
+fn read_only_dir() -> Option<&'static std::path::Path> {
+    let dir = std::path::Path::new("/");
+    let probe = dir.join("pax-erofs-probe");
+    match fs::create_dir(&probe) {
+        Err(e) if e.kind() == std::io::ErrorKind::ReadOnlyFilesystem => Some(dir),
+        Ok(()) => {
+            let _ = fs::remove_dir(&probe);
+            None
+        }
+        Err(_) => None,
+    }
+}
+
+/// POSIX CONSEQUENCES OF ERRORS: a file that cannot be created is diagnosed,
+/// and processing continues. A read-only destination used to end the run at
+/// the first member, with a message naming none of them.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_read_only_destination_is_diagnosed_per_member_on_extract() {
+    let Some(root) = read_only_dir() else {
+        return;
+    };
+    let mut archive = CpioNewc {
+        name: b"pax-erofs-a",
+        body: b"a\n",
+        ..Default::default()
+    }
+    .member();
+    archive.extend_from_slice(
+        &CpioNewc {
+            name: b"pax-erofs-b",
+            body: b"b\n",
+            ino: 2,
+            ..Default::default()
+        }
+        .archive(),
+    );
+
+    let output = run_pax_with_stdin_bytes_in_dir(&["-r"], &archive, root);
+    assert_exit_code(&output, 1, "extract onto a read-only filesystem");
+    let stderr = stderr_str(&output);
+    assert!(stderr.contains("pax-erofs-a"), "stderr:\n{stderr}");
+    assert!(stderr.contains("pax-erofs-b"), "stderr:\n{stderr}");
+}
+
+/// The same in copy mode: every file is diagnosed, not just the first.
+#[cfg(target_os = "macos")]
+#[test]
+fn test_read_only_destination_is_diagnosed_per_file_on_copy() {
+    let Some(dest) = read_only_dir() else {
+        return;
+    };
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("pax-erofs-a"), "a\n").unwrap();
+    fs::write(temp.path().join("pax-erofs-b"), "b\n").unwrap();
+
+    let output = run_pax_in_dir(
+        &["-rw", "pax-erofs-a", "pax-erofs-b", dest.to_str().unwrap()],
+        temp.path(),
+    );
+    assert_exit_code(&output, 1, "copy onto a read-only filesystem");
+    let stderr = stderr_str(&output);
+    assert!(stderr.contains("pax-erofs-a"), "stderr:\n{stderr}");
+    assert!(stderr.contains("pax-erofs-b"), "stderr:\n{stderr}");
 }

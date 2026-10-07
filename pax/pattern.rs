@@ -184,7 +184,9 @@ impl Pattern {
 
     /// Whether the characters `text`, naming a directory if `is_dir`, match.
     fn matches_run(&self, text: &[Unit], is_dir: bool, periods: Periods) -> bool {
-        (is_dir || !self.dir_only) && match_tokens(&self.tokens, text, periods)
+        (is_dir || !self.dir_only)
+            && !(is_root(text) && self.tokens.iter().any(|t| matches!(t, Token::Star)))
+            && match_tokens(&self.tokens, text, periods)
     }
 
     /// How this pattern selects `name`, if it does: by matching the name
@@ -386,6 +388,14 @@ impl Bracket {
         });
         found != self.negated
     }
+}
+
+/// Whether `text` is the root directory `/`. Its name below the slash is
+/// empty, and no `*` stands for an empty filename: `/*` names what is in `/`,
+/// not `/` itself -- whose hierarchy would take in every absolute name,
+/// `/.hidden` included, past the leading-period rule.
+fn is_root(text: &[Unit]) -> bool {
+    !text.is_empty() && text.iter().all(|u| u.is(b'/'))
 }
 
 /// Whether the character at `pos` is a '.' in a leading position -- at the
@@ -684,5 +694,10 @@ mod tests {
         assert_eq!(sel("", "/abs/k"), None);
         assert_eq!(sel("/", "/abs/k"), Some(Selected::Below(1)));
         assert_eq!(sel("/abs", "/abs/k"), Some(Selected::Below(4)));
+        // '/*' names what is in '/', not '/' -- whose hierarchy would take in
+        // '/.hidden' past the leading-period rule.
+        assert_eq!(sel("/*", "/.hidden"), None);
+        assert_eq!(sel("/*", "/.hidden/k"), None);
+        assert_eq!(sel("/*", "/abs/k"), Some(Selected::Below(4)));
     }
 }

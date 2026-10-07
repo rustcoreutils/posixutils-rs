@@ -374,17 +374,34 @@ pub fn expire_stack_intervals(
 /// a live pseudo into a caller-saved register that the codegen helper's
 /// embedded libc call silently overwrites — see `memory/MEMORY.md`
 pub fn find_call_positions(func: &Function, is_call_like: impl Fn(Opcode) -> bool) -> Vec<usize> {
+    find_insn_positions(func, |insn| is_call_like(insn.op))
+}
+
+/// [`find_call_positions`] deciding per instruction: the positions of every
+/// instruction `clobbers` answers true for.
+pub fn find_insn_positions(func: &Function, clobbers: impl Fn(&Instruction) -> bool) -> Vec<usize> {
     let mut call_positions = Vec::with_capacity(DEFAULT_CALL_POS_CAPACITY);
     let mut pos = 0usize;
     for block in &func.blocks {
         for insn in &block.insns {
-            if is_call_like(insn.op) {
+            if clobbers(insn) {
                 call_positions.push(pos);
             }
             pos += 1;
         }
     }
     call_positions
+}
+
+/// The registers an inline asm's clobber list names that `parse` knows --
+/// one bank's worth. Nothing for any other instruction.
+pub fn asm_clobbered<R>(insn: &Instruction, parse: impl Fn(&str) -> Option<R>) -> Vec<R> {
+    match insn.extra().asm_data.as_deref() {
+        Some(asm) if insn.op == Opcode::Asm => {
+            asm.clobbers.iter().filter_map(|c| parse(c)).collect()
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// The constraint point of a `__builtin_setjmp`, which clobbers every

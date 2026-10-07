@@ -47,8 +47,9 @@ use super::x87::{is_x87_float_to_int, uses_x87_scratch};
 use crate::arch::asm_constraints::{AsmOperandClass, AsmRegClass, PinnedGp};
 use crate::arch::lir::FpSize;
 use crate::arch::regalloc::{
-    compute_live_intervals, find_call_positions, identify_fp_pseudos, interval_crosses_call,
-    ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
+    asm_clobbered, compute_live_intervals, find_call_positions, find_insn_positions,
+    identify_fp_pseudos, interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval,
+    LivenessResult,
 };
 use crate::float::FloatVal;
 use crate::ir::{AsmConstraint, AsmData, Function, Instruction, Opcode, PseudoId, PseudoKind};
@@ -485,6 +486,17 @@ fn asm_written_regs(func: &Function) -> impl Iterator<Item = Reg> + '_ {
             let clobbered = asm.clobbers.iter().filter_map(|c| parse_gp_clobber_name(c));
             pinned.chain(clobbered).collect::<Vec<_>>()
         })
+}
+
+/// The number of the vector register a clobber-list name means: `xmm3`,
+/// `ymm3` and `zmm3` all write register 3, optionally with gcc's leading
+/// `%`. `None` for any other name.
+fn parse_xmm_clobber_name(raw: &str) -> Option<u8> {
+    let s = raw.trim_start_matches('%').to_ascii_lowercase();
+    let n = ["xmm", "ymm", "zmm"]
+        .iter()
+        .find_map(|p| s.strip_prefix(p))?;
+    n.parse().ok().filter(|&n: &u8| n < 32)
 }
 
 /// Map a clobber-list register name (lowercase, GCC-style) to the
@@ -1238,7 +1250,7 @@ impl RegAlloc {
         let intervals = result.intervals;
         let constraint_points = result.constraint_points;
         let call_positions = find_call_positions(func, is_call_like_x86_64);
-        let fp_call_positions = self.fp_call_positions(func, &call_positions);
+        let fp_call_positions = self.fp_call_positions(func);
 
         self.spill_args_across_calls(func, types, &intervals, &call_positions);
         self.spill_gp_args(&intervals, |interval, reg| {
@@ -1331,11 +1343,16 @@ impl RegAlloc {
     /// across it has to be where one is live across a call: on the stack.
     /// The ELF descriptor resolver preserves them all, so there it adds
     /// nothing.
-    fn fp_call_positions(&self, func: &Function, call_positions: &[usize]) -> Vec<usize> {
-        if self.tls_access != crate::target::TlsAccess::MachOTlv {
-            return call_positions.to_vec();
-        }
-        find_call_positions(func, |op| is_call_like_x86_64(op) || op == Opcode::TlsAddr)
+    ///
+    /// An inline asm that clobbers an XMM register is one too: the clobber
+    /// list is all the allocator knows of what the template writes.
+    fn fp_call_positions(&self, func: &Function) -> Vec<usize> {
+        let tlv = self.tls_access == crate::target::TlsAccess::MachOTlv;
+        find_insn_positions(func, |insn| {
+            is_call_like_x86_64(insn.op)
+                || (tlv && insn.op == Opcode::TlsAddr)
+                || !asm_clobbered(insn, parse_xmm_clobber_name).is_empty()
+        })
     }
 
     /// Reset allocator state for a new function
@@ -2815,6 +2832,16 @@ mod tests {
         assert_eq!(parse_gp_clobber_name("r10d"), Some(Reg::R10));
         assert_eq!(parse_gp_clobber_name("r10w"), Some(Reg::R10));
         assert_eq!(parse_gp_clobber_name("r10b"), Some(Reg::R10));
+    }
+
+    #[test]
+    fn parse_xmm_clobber_name_every_width() {
+        for name in ["xmm3", "ymm3", "zmm3", "%xmm3", "XMM3"] {
+            assert_eq!(parse_xmm_clobber_name(name), Some(3), "{name}");
+        }
+        for name in ["xmm32", "rax", "st", "mm0", "memory"] {
+            assert_eq!(parse_xmm_clobber_name(name), None, "{name}");
+        }
     }
 
     #[test]

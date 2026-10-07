@@ -17,6 +17,7 @@ mod aggregate_abi;
 mod asm_attributes;
 mod asm_callee_saved;
 mod asm_constraint_letters;
+mod asm_fp_clobbers;
 mod asm_operand_modifiers;
 pub mod asm_probe;
 mod asm_template_syntax;

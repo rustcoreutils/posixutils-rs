@@ -41,8 +41,9 @@
 
 use crate::abi::aapcs64::{StackSlot, StackedArgs};
 use crate::arch::regalloc::{
-    compute_live_intervals, find_call_positions, identify_fp_pseudos, interval_crosses_call,
-    ConstraintPoint, FreeSlot, LiveInterval, LivenessResult,
+    asm_clobbered, compute_live_intervals, find_call_positions, find_insn_positions,
+    identify_fp_pseudos, interval_crosses_call, ConstraintPoint, FreeSlot, LiveInterval,
+    LivenessResult,
 };
 use crate::float::FloatVal;
 use crate::ir::{Function, Instruction, Opcode, PseudoId, PseudoKind};
@@ -1109,6 +1110,22 @@ pub(super) fn parse_gp_clobber_name(raw: &str) -> Option<Reg> {
     })
 }
 
+/// The SIMD/FP register a clobber-list name means -- `v8`, `q8`, `d8`,
+/// `s8`, `h8` and `b8` all write register 8, optionally with a leading `%` --
+/// among those the allocator hands out. `None` for any other name, and for
+/// the codegen scratch registers, which hold nothing across an instruction.
+fn parse_fp_clobber_name(raw: &str) -> Option<VReg> {
+    let s = raw.trim_start_matches('%').to_ascii_lowercase();
+    let n: u8 = s
+        .strip_prefix(['v', 'q', 'd', 's', 'h', 'b'])?
+        .parse()
+        .ok()?;
+    VReg::allocatable()
+        .iter()
+        .copied()
+        .find(|v| v.name_d().strip_prefix('d') == Some(n.to_string().as_str()))
+}
+
 /// Get constraint info for an instruction (aarch64 — mirror of
 /// x86_64's `get_constraint_info`).
 ///
@@ -1434,6 +1451,16 @@ impl RegAlloc {
                 self.used_callee_saved.push(reg);
             }
         }
+        let fp_clobbers = func
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insns)
+            .flat_map(|insn| asm_clobbered(insn, parse_fp_clobber_name));
+        for reg in fp_clobbers {
+            if reg.is_callee_saved() && !self.used_callee_saved_fp.contains(&reg) {
+                self.used_callee_saved_fp.push(reg);
+            }
+        }
         // Use shared identify_fp_pseudos with type-checker closure
         self.fp_pseudos = identify_fp_pseudos(func, |typ| types.is_float(typ));
         // An asm operand in a `"w"` register is defined only by the asm,
@@ -1453,8 +1480,14 @@ impl RegAlloc {
         let intervals = result.intervals;
         let constraint_points = result.constraint_points;
         let call_positions = find_call_positions(func, is_call_like_aarch64);
+        // An inline asm that clobbers a SIMD/FP register ends every FP value
+        // live across it, as a call does: the clobber list is all the
+        // allocator knows of what the template writes.
+        let fp_call_positions = find_insn_positions(func, |insn| {
+            is_call_like_aarch64(insn.op) || !asm_clobbered(insn, parse_fp_clobber_name).is_empty()
+        });
 
-        self.spill_args_across_calls(func, types, &intervals, &call_positions);
+        self.spill_args_across_calls(func, types, &intervals, &call_positions, &fp_call_positions);
         self.spill_gp_args(&intervals, |interval, reg| {
             crate::arch::regalloc::clobbered_while_live(
                 interval,
@@ -1465,7 +1498,14 @@ impl RegAlloc {
         });
         self.allocate_alloca_to_stack(func);
         self.place_locals(func, types, &intervals, rest);
-        self.run_chordal_color(func, types, intervals, &call_positions, &constraint_points);
+        self.run_chordal_color(
+            func,
+            types,
+            intervals,
+            &call_positions,
+            &fp_call_positions,
+            &constraint_points,
+        );
 
         crate::arch::regalloc::LocationMap::from(self.locations.clone())
     }
@@ -1570,6 +1610,7 @@ impl RegAlloc {
         types: &TypeTable,
         intervals: &[LiveInterval],
         call_positions: &[usize],
+        fp_call_positions: &[usize],
     ) {
         self.spill_gp_args(intervals, |interval, _| {
             interval_crosses_call(interval, call_positions)
@@ -1580,7 +1621,8 @@ impl RegAlloc {
         let lowering = crate::arch::regalloc::AbiLowering::new(func);
         for interval in intervals {
             if let Some(Loc::VReg(reg)) = self.locations.get(&interval.pseudo) {
-                if fp_arg_regs_set.contains(reg) && interval_crosses_call(interval, call_positions)
+                if fp_arg_regs_set.contains(reg)
+                    && interval_crosses_call(interval, fp_call_positions)
                 {
                     let from_reg = *reg;
                     // Reserve what the value actually needs: a binary128
@@ -1780,6 +1822,7 @@ impl RegAlloc {
         types: &TypeTable,
         intervals: Vec<LiveInterval>,
         call_positions: &[usize],
+        fp_call_positions: &[usize],
         constraint_points: &[ConstraintPoint<Reg>],
     ) {
         // -------- Phase 1: pre-pass --------
@@ -1883,7 +1926,7 @@ impl RegAlloc {
                 // FP cross-call/block → stack (avoids the chordal pass
                 // having to model V-bank cross-call eviction, which is
                 // not implemented yet; matches the x86_64 XMM policy).
-                let crosses_call = interval_crosses_call(interval, call_positions);
+                let crosses_call = interval_crosses_call(interval, fp_call_positions);
                 let crosses_block = crosses_blocks.contains(&interval.pseudo);
                 if crosses_call || crosses_block {
                     let bytes = fp_pseudo_bytes(func, interval.pseudo);
@@ -2439,6 +2482,18 @@ mod tests {
         assert_eq!(parse_gp_clobber_name("x18"), None); // platform reserved
         assert_eq!(parse_gp_clobber_name(""), None);
         assert_eq!(parse_gp_clobber_name("not_a_reg"), None);
+    }
+
+    #[test]
+    fn parse_fp_clobber_name_every_width() {
+        for name in ["v8", "q8", "d8", "s8", "h8", "b8", "%D8"] {
+            assert_eq!(parse_fp_clobber_name(name), Some(VReg::V8), "{name}");
+        }
+        assert_eq!(parse_fp_clobber_name("v31"), Some(VReg::V31));
+        // Codegen scratch, out of range, and not registers at all.
+        for name in ["v16", "v32", "sp", "x8", "memory", "d"] {
+            assert_eq!(parse_fp_clobber_name(name), None, "{name}");
+        }
     }
 
     #[test]

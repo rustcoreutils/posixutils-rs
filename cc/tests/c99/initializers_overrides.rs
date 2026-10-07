@@ -610,6 +610,50 @@ int main(void)
     );
 }
 
+/// The GNU index range after a field designator: `.m[lo ... hi] = v`, as
+/// binutils' i386-dis.c initializes its decoder state
+/// (`.op_index[0 ... MAX_OPERANDS - 1] = -1`). Each index in the range gets
+/// `v`, and what the range does not name keeps its own initializer; the next
+/// positional initializer continues after `hi`.
+#[test]
+fn c99_index_range_after_a_field_designator() {
+    let code = r#"
+struct In { int k[3]; char c; };
+struct S { int a; int m[6]; struct In in[3]; long t; };
+
+static struct S g = { .m[1 ... 3] = -1, 8, .in[0 ... 1].k[1 ... 2] = 5, .t = 9 };
+
+__attribute__((noinline)) static int check(const struct S *s)
+{
+    static const int want_m[6] = { 0, -1, -1, -1, 8, 0 };
+    for (int i = 0; i < 6; i++)
+        if (s->m[i] != want_m[i]) return 1 + i;
+    for (int j = 0; j < 3; j++)
+        for (int i = 0; i < 3; i++)
+            if (s->in[j].k[i] != (j < 2 && i >= 1 ? 5 : 0)) return 10 + 3 * j + i;
+    if (s->t != 9 || s->a != 0) return 20;
+    return 0;
+}
+
+int main(void)
+{
+    int r;
+    if ((r = check(&g)) != 0) return r;
+    struct S l = { .m[1 ... 3] = -1, 8, .in[0 ... 1].k[1 ... 2] = 5, .t = 9 };
+    if ((r = check(&l)) != 0) return 30 + r;
+    /* A later designator overrides one element of the range. */
+    struct S o = { .m[0 ... 5] = 4, .m[2] = 1 };
+    if (o.m[0] != 4 || o.m[2] != 1 || o.m[5] != 4) return 60;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("index_range_after_field", code, &[]), 0);
+    assert_eq!(
+        compile_and_run("index_range_after_field_o2", code, &["-O2".to_string()]),
+        0
+    );
+}
+
 // Kept separate: the only test run at exactly -O0 and -O2 (no matrix level).
 /// A later designator reaching inside something a whole *value* initialized
 /// keeps the rest of that value, through a union exactly as through a

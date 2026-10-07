@@ -25,6 +25,10 @@ use gettextrs::{gettext, gettext_args};
 const DEFAULT_ARG_LIST_CAPACITY: usize = 8;
 const DEFAULT_INIT_CAPACITY: usize = 8;
 
+/// The most elements an index range after a field designator is spelled out
+/// as; see `Parser::push_init_element`.
+const MAX_EXPANDED_RANGE: i128 = 1 << 16;
+
 impl<'a> Parser<'a> {
     // Expression parsing, one function per precedence level: the chain below
     // runs from lowest (comma) to highest (primary), each level delegating to
@@ -161,7 +165,7 @@ impl<'a> Parser<'a> {
         loop {
             // Parse one initializer element (with optional designators)
             let element = self.parse_init_element()?;
-            elements.push(element);
+            self.push_init_element(&mut elements, element)?;
 
             // Check for comma or end
             if self.is_special(b',') {
@@ -177,6 +181,68 @@ impl<'a> Parser<'a> {
 
         self.expect_special(b'}')?;
         Ok(Expr::new(ExprKind::InitList { elements }, list_pos))
+    }
+
+    /// Add `element` to `elements`. A GNU index range anywhere but first in
+    /// its designator chain -- `.m[0 ... 3] = v`, `[1].m[0 ... 3] = v` -- is
+    /// spelled out as one element per index, since resolving a chain yields
+    /// the one subobject it names, where such a range names many. A range
+    /// first in the chain is kept whole; the initializer walk handles it.
+    ///
+    /// gcc evaluates the value of a range once, so the expansion is made only
+    /// for an integer constant value, whose copies cannot be told apart from
+    /// it. binutils' i386-dis.c needs it: `.op_index[0 ... MAX_OPERANDS - 1]
+    /// = -1`.
+    fn push_init_element(
+        &self,
+        elements: &mut Vec<InitElement>,
+        element: InitElement,
+    ) -> ParseResult<()> {
+        let inner_range = element
+            .designators
+            .iter()
+            .skip(1)
+            .any(|d| matches!(d, Designator::IndexRange(..)));
+        if !inner_range {
+            elements.push(element);
+            return Ok(());
+        }
+        if self.eval_const_expr(&element.value).is_none() {
+            return Err(ParseError::new(
+                "an index range after a field designator needs a constant value; \
+                 write '.field = { [lo ... hi] = value }'",
+                element.value.pos,
+            ));
+        }
+        // Every index of every range in the chain, the last varying fastest.
+        let mut chains: Vec<Vec<Designator>> = vec![Vec::new()];
+        for d in &element.designators {
+            let Designator::IndexRange(lo, hi) = *d else {
+                chains.iter_mut().for_each(|c| c.push(d.clone()));
+                continue;
+            };
+            if chains.len() as i128 * (hi - lo + 1) as i128 > MAX_EXPANDED_RANGE {
+                return Err(ParseError::new(
+                    "index range after a field designator is too large",
+                    element.value.pos,
+                ));
+            }
+            chains = chains
+                .into_iter()
+                .flat_map(|c| {
+                    (lo..=hi).map(move |i| {
+                        let mut c = c.clone();
+                        c.push(Designator::Index(i));
+                        c
+                    })
+                })
+                .collect();
+        }
+        elements.extend(chains.into_iter().map(|designators| InitElement {
+            designators,
+            value: element.value.clone(),
+        }));
+        Ok(())
     }
 
     /// Parse a single element of an initializer list
@@ -258,16 +324,6 @@ impl<'a> Parser<'a> {
                             self.current_pos(),
                         ));
                     }
-                }
-                // A range that follows a field designator -- `.m[0 ... 3] = v`
-                // -- resolves through `resolve_designator_chain`, which yields
-                // one offset where a range names many. The nested spelling
-                // `.m = {[0 ... 3] = v}` does the same job and works.
-                if high.is_some() && !designators.is_empty() {
-                    return Err(ParseError::new(
-                        "an index range is not supported after a field designator;                          write '.field = { [lo ... hi] = value }'",
-                        self.current_pos(),
-                    ));
                 }
                 designators.push(match high {
                     None => Designator::Index(index),

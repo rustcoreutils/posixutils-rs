@@ -42,6 +42,8 @@ mod test_constant_p;
 #[cfg(test)]
 mod test_declarations;
 #[cfg(test)]
+mod test_designator_ranges;
+#[cfg(test)]
 mod test_expr_constraints;
 #[cfg(test)]
 mod test_file_scope_asm;

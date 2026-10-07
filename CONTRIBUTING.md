@@ -122,10 +122,8 @@ compiler in `cc/` (see [cc/README.md](cc/README.md)).
 	   static input data, and compares output with
 	   static output data (OS reference data).
 * Use plib's TestPlan framework for integration tests.
-* Put test logic in `$crate/tests/$category/mod.rs`, with the
-  integration test harness holding only `mod` statements.  Some crates
-  (`sh`, `make`, `awk`, `m4`, `ftw`, ...) predate this and keep tests in
-  the harness; follow the layout the crate already uses.
+* Integration test harness should ONLY contain `mod` statements.
+  Test logic is in $module/tests/$category/mod.rs files.
 * Only "quick" tests should be run automatically in `cargo test`
 * Longer tests, or tests requiring root access, go behind the
   `posixutils_test_all` and `requires_root` feature flags (see README

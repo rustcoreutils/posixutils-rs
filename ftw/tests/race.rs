@@ -356,3 +356,60 @@ fn symlink_target_available_without_following() {
         ]
     );
 }
+
+/// In descriptor-conserving mode a directory is reopened by path from an ancestor's descriptor
+/// every time the walk comes back to it. A directory swapped for a different real directory
+/// between two visits must be refused on the reopen, exactly as on a first descent: the walk must
+/// not go on to enumerate the decoy as if it were the directory it stat'ed.
+#[test]
+fn deferred_reopen_refuses_dir_swapped_for_other_dir() {
+    let tmp = plib::tmp::Builder::new()
+        .prefix("ftw_race_deferred")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let base = tmp.path();
+
+    let root = base.join("root");
+    let decoy = base.join("decoy");
+    fs::create_dir_all(root.join("a/b")).unwrap();
+    fs::write(root.join("a/x"), b"x").unwrap();
+    fs::create_dir(&decoy).unwrap();
+    fs::write(decoy.join("DECOY.txt"), b"should never be visited").unwrap();
+
+    let visited: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    let errors = RefCell::new(0usize);
+    let swapped = RefCell::new(false);
+
+    traverse_directory(
+        &root,
+        |entry| {
+            let name = basename(&entry);
+            visited.borrow_mut().insert(name.clone());
+            // `a` has been opened and is being enumerated; when the walk returns to it after `b`
+            // it reopens `root/a` by path, which is now the decoy.
+            if name == "b" && !*swapped.borrow() {
+                fs::rename(root.join("a"), base.join("a_moved")).unwrap();
+                fs::rename(&decoy, root.join("a")).unwrap();
+                *swapped.borrow_mut() = true;
+            }
+            Ok(true)
+        },
+        |_entry, _exit| Ok(()),
+        |_entry, _err| {
+            *errors.borrow_mut() += 1;
+        },
+        TraverseDirectoryOpts {
+            // Conserve descriptors from the first level on.
+            caller_fds_per_level: 4096,
+            ..Default::default()
+        },
+    );
+
+    let visited = visited.into_inner();
+    assert!(*swapped.borrow(), "the swap must have run");
+    assert!(
+        !visited.contains("DECOY.txt"),
+        "a reopened deferred directory was not checked against its (dev, ino): {visited:?}"
+    );
+    assert!(*errors.borrow() > 0, "the refused reopen must be reported");
+}

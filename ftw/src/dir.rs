@@ -7,7 +7,7 @@
 // SPDX-License-Identifier: MIT
 //
 
-use crate::{open_long_filename, Error, ErrorKind, FileDescriptor};
+use crate::{fd_matches, open_long_filename, Error, ErrorKind, FileDescriptor};
 use std::{
     cell::{RefCell, RefMut},
     collections::HashSet,
@@ -155,6 +155,9 @@ pub struct DeferredDir {
     /// Flags OR'ed into the leaf `openat` when (re)opening this directory. Carries the same
     /// `O_DIRECTORY`/`O_NOFOLLOW` hardening as the non-deferred descent path.
     descent_flags: libc::c_int,
+    /// `(st_dev, st_ino)` the walk recorded when it stat'ed this directory. Every reopen is
+    /// checked against it, as a first descent is.
+    identity: (libc::dev_t, libc::ino_t),
 }
 
 impl DeferredDir {
@@ -162,12 +165,14 @@ impl DeferredDir {
         parent: Rc<(FileDescriptor, PathBuf)>,
         path: PathBuf,
         descent_flags: libc::c_int,
+        identity: (libc::dev_t, libc::ino_t),
     ) -> Self {
         Self {
             parent,
             path,
             visited: RefCell::new(HashSet::new()),
             descent_flags,
+            identity,
         }
     }
 
@@ -213,13 +218,18 @@ impl DeferredDir {
 
         // Same descent hardening as the non-deferred path. `O_NOFOLLOW` here makes a leaf that was
         // concurrently swapped for a symlink fail the reopen (fail-closed) rather than redirecting
-        // the walk. Note: the deferred path has no captured dev/ino baseline, so a swap to a
-        // different real directory is not detected here (documented residual).
-        FileDescriptor::open_at(
+        // the walk. The prefix is resolved by the kernel and may cross a symbolic link swapped in
+        // for an intermediate directory; the identity check below catches that too, since
+        // whatever the path reaches must be the very directory the walk stat'ed.
+        let fd = FileDescriptor::open_at(
             &starting_dir,
             &filename_cstr,
             libc::O_RDONLY | self.descent_flags,
-        )
+        )?;
+        if !fd_matches(&fd, self.identity.0, self.identity.1) {
+            return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+        }
+        Ok(fd)
     }
 
     pub fn parent(&self) -> &Rc<(FileDescriptor, PathBuf)> {

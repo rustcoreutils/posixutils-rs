@@ -1109,6 +1109,7 @@ where
                                             Rc::new((anchor, path.parent().unwrap().to_path_buf())),
                                             path,
                                             descent_flags,
+                                            (want_dev, want_ino),
                                         );
                                         TreeNode {
                                             dir: HybridDir::Deferred(slow_dir),
@@ -1123,6 +1124,7 @@ where
                                             current_dir.parent().clone(),
                                             build_path(&path_stack, &entry_filename),
                                             descent_flags,
+                                            (want_dev, want_ino),
                                         );
                                         TreeNode {
                                             dir: HybridDir::Deferred(slow_dir),

@@ -255,6 +255,8 @@ but no daemon to run them.  Behavior follows Vixie cron:
  * `-true` / `-false` — primaries that are always true / always false.
    Forced by debhelper (`dh_fixperms` joins every walk with `-a -true`,
    `dh_compress` prunes with `-prune -false`).
+ * `-size nk` — the size in KiB, rounded up.  No other GNU unit is
+   accepted.  Forced by debhelper (`dh_compress` `-size +4k`).
 
 ### gettext / ngettext
 

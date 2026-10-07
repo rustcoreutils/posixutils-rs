@@ -178,9 +178,10 @@ enum Primary {
     // matches), preserving the "unknown user/group → no match" behavior.
     User(Option<u32>),
     Group(Option<u32>),
+    /// `-size`: the file size in `unit`-byte units, rounded up
     Size {
         cmp: NumericComparison,
-        in_bytes: bool,
+        unit: u64,
     },
     ATime(NumericComparison),
     CTime(NumericComparison),
@@ -502,8 +503,8 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
         }
         "-size" => {
             let size_str = get_arg(tokens, idx, "-size")?;
-            let (cmp, in_bytes) = parse_size(size_str)?;
-            Ok(Expr::Primary(Primary::Size { cmp, in_bytes }))
+            let (cmp, unit) = parse_size(size_str)?;
+            Ok(Expr::Primary(Primary::Size { cmp, unit }))
         }
         "-atime" => {
             let n = get_arg(tokens, idx, "-atime")?;
@@ -699,16 +700,20 @@ fn parse_mode_value(mode_str: &str) -> Result<u32, String> {
     }
 }
 
-/// Parse -size argument
-fn parse_size(s: &str) -> Result<(NumericComparison, bool), String> {
-    let (num_str, in_bytes) = if let Some(n) = s.strip_suffix('c') {
-        (n, true)
+/// Parse a `-size` argument into the comparison and its unit in bytes:
+/// 512-byte blocks by default, bytes with POSIX `c`, and KiB with GNU `k`
+/// (forced by debhelper's dh_compress `-size +4k`; no other GNU unit is).
+fn parse_size(s: &str) -> Result<(NumericComparison, u64), String> {
+    let (num_str, unit) = if let Some(n) = s.strip_suffix('c') {
+        (n, 1)
+    } else if let Some(n) = s.strip_suffix('k') {
+        (n, 1024)
     } else {
-        (s, false)
+        (s, 512)
     };
 
     let cmp = NumericComparison::parse(num_str)?;
-    Ok((cmp, in_bytes))
+    Ok((cmp, unit))
 }
 
 /// Resolve username to UID
@@ -965,13 +970,8 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
         }
         Primary::User(uid) => EvalResult::new(*uid == Some(ctx.metadata.uid())),
         Primary::Group(gid) => EvalResult::new(*gid == Some(ctx.metadata.gid())),
-        Primary::Size { cmp, in_bytes } => {
-            let size = if *in_bytes {
-                ctx.metadata.len() as i64
-            } else {
-                // Size in 512-byte blocks, rounded up
-                ctx.metadata.len().div_ceil(512) as i64
-            };
+        Primary::Size { cmp, unit } => {
+            let size = ctx.metadata.len().div_ceil(*unit) as i64;
             EvalResult::new(cmp.matches(size))
         }
         Primary::ATime(cmp) => {

@@ -370,3 +370,33 @@ fn find_true_false() {
     );
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// [`expect_lines`] with the arguments given as whitespace-separated words.
+fn expect_words(dir: &Path, words: &str, expected: &[&str]) {
+    let args: Vec<&str> = words.split_whitespace().collect();
+    expect_lines(dir, &args, expected);
+}
+
+/// `-size +4k` (dh_compress): GNU's `k` counts KiB, rounding up like the
+/// POSIX 512-byte blocks. Only the `k` unit is accepted.
+#[test]
+fn find_size_kilobytes() {
+    let dir = make_pkg_tree("size_k");
+    expect_words(&dir, "-type f -size +4k", &["./fourplus", "./big"]);
+    expect_words(&dir, "-type f -size 4k", &["./four"]);
+    expect_words(&dir, "-type f -size -1k", &["./plain"]);
+    expect_words(
+        &dir,
+        "-type f -size 1k",
+        &[
+            "./exe",
+            "./ux",
+            "./DEBIAN/control",
+            "./doc/pkg/README",
+            "./doc/pkg/Notes.HTML",
+            "./doc/pkg/examples/ex.txt",
+        ],
+    );
+    run_test_find(&[".", "-size", "1M"], "", "find: invalid number: 1M\n", 1);
+    fs::remove_dir_all(&dir).unwrap();
+}

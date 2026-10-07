@@ -20,7 +20,9 @@ use gettextrs::gettext;
 use std::{ffi::CStr, io};
 
 // cp and mv
-pub use copy::{copy_file, copy_file_at, copy_files, CopyConfig, DerefMode, InodeMap};
+pub use copy::{
+    copy_file, copy_file_at, copy_files, verify_made_dir, CopyConfig, DerefMode, InodeMap,
+};
 
 // chgrp and chown
 pub use change_ownership::{chown_traverse, ChangeOwnershipArgs};

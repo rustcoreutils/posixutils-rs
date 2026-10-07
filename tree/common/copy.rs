@@ -15,7 +15,6 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::{CStr, CString, OsStr},
     fs, io,
-    mem::MaybeUninit,
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::{ffi::OsStrExt, fs::MetadataExt},
@@ -83,8 +82,52 @@ pub struct CopyConfig {
     pub continue_on_error: bool,
 }
 
+/// Where the destination directory of a `CopyingDirectory` came from, so that the descriptor
+/// later opened for it can be checked to be that directory.
+enum DirOrigin {
+    /// This copy made it with `mkdirat`.
+    Made,
+    /// It already existed, with the identity the decision's `lstat` saw.
+    Found { dev: u64, ino: u64 },
+}
+
+/// `fstat` of a descriptor the caller keeps open (and goes on owning).
+fn fd_metadata(fd: libc::c_int) -> io::Result<fs::Metadata> {
+    std::mem::ManuallyDrop::new(unsafe { fs::File::from_raw_fd(fd) }).metadata()
+}
+
+/// Check a directory cp has just made with `mkdirat` in `parent_fd` and then opened as `dir_fd`
+/// (`O_DIRECTORY | O_NOFOLLOW`): between the two, anyone else who can rename entries in the
+/// parent could have swapped in a directory of their own, and cp would copy into it (and,
+/// under -p, give it the source's owner and mode).
+///
+/// Only the parent's owner, and anyone with group or other write permission on it when it is
+/// not sticky, can do that; when that is nobody but cp's own user, there is nothing to check.
+/// Otherwise the directory must be what a fresh `mkdirat` yields: owned by cp's effective user,
+/// and empty. (Group or other write permission granted by an ACL shows in the group bits.)
+pub fn verify_made_dir(parent_fd: libc::c_int, dir_fd: libc::c_int, dir: &Path) -> io::Result<()> {
+    let euid = unsafe { libc::geteuid() };
+    // An operand resolved from the working directory has no parent descriptor to examine, so
+    // it is always checked.
+    let others_can_rename = parent_fd == libc::AT_FDCWD || {
+        let parent = fd_metadata(parent_fd)?;
+        // S_ISVTX is 0o1000 (fixed by POSIX).
+        parent.uid() != euid || (parent.mode() & 0o022 != 0 && parent.mode() & 0o1000 == 0)
+    };
+    if !others_can_rename {
+        return Ok(());
+    }
+    if fd_metadata(dir_fd)?.uid() != euid || !ftw::is_empty_dir_fd(dir_fd)? {
+        return Err(io::Error::other(gettext!(
+            "'{}' was replaced after it was made",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
 enum CopyResult {
-    CopyingDirectory,
+    CopyingDirectory(DirOrigin),
     /// A non-directory was copied. Carries any failure to duplicate its characteristics (-p),
     /// which is reported but never undoes the copy.
     CopiedFile(Option<io::Error>),
@@ -521,7 +564,13 @@ where
             }
         }
 
-        Ok(CopyResult::CopyingDirectory)
+        Ok(CopyResult::CopyingDirectory(match &target_symlink_md {
+            Some(md) => DirOrigin::Found {
+                dev: md.dev(),
+                ino: md.ino(),
+            },
+            None => DirOrigin::Made,
+        }))
     } else {
         // 3. If source_file is of type regular file
 
@@ -1083,7 +1132,7 @@ where
                     }
 
                     match copy_result {
-                        CopyResult::CopyingDirectory => {
+                        CopyResult::CopyingDirectory(origin) => {
                             // mkdir/mkdirat doesn't return a file descriptor so a new one must be
                             // opened here. Using O_CREAT | O_DIRECTORY in a call to open/openat would
                             // not allow atomically creating a directory then opening it:
@@ -1095,21 +1144,51 @@ where
                             // `O_NOFOLLOW` refuses one swapped in since, which would otherwise
                             // redirect everything copied below it. (A trailing slash on the
                             // operand still resolves, for the open as for the `lstat`.)
-                            let new_target_dirfd = match unsafe {
-                                ftw::FileDescriptor::open_at(
-                                    target_dirfd,
-                                    &target_filename_cstr,
-                                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-                                )
-                            } {
-                                Ok(fd) => fd,
+                            //
+                            // The descriptor must then be the directory decided on: the one the
+                            // `lstat` saw, or for one this copy made, what a fresh `mkdirat`
+                            // yields (`verify_made_dir`). Its identity is read from the
+                            // descriptor, never by name.
+                            let opened = ftw::FileDescriptor::open_at(
+                                target_dirfd,
+                                &target_filename_cstr,
+                                libc::O_RDONLY
+                                    | libc::O_DIRECTORY
+                                    | libc::O_NOFOLLOW
+                                    | libc::O_CLOEXEC,
+                            )
+                            .map_err(|e| {
+                                io::Error::other(gettext!(
+                                    "cannot open directory '{}': {}",
+                                    target.display(),
+                                    error_string(&e)
+                                ))
+                            })
+                            .and_then(|fd| {
+                                let md = fd_metadata(fd.as_raw_fd())?;
+                                match origin {
+                                    DirOrigin::Found { dev, ino }
+                                        if dev != md.dev() || ino != md.ino() =>
+                                    {
+                                        Err(io::Error::other(gettext!(
+                                            "'{}' was replaced after it was checked",
+                                            target.display()
+                                        )))
+                                    }
+                                    DirOrigin::Found { .. } => Ok((fd, md)),
+                                    DirOrigin::Made => {
+                                        verify_made_dir(
+                                            target_dirfd.as_raw_fd(),
+                                            fd.as_raw_fd(),
+                                            &target,
+                                        )?;
+                                        Ok((fd, md))
+                                    }
+                                }
+                            });
+                            let (new_target_dirfd, new_target_md) = match opened {
+                                Ok(pair) => pair,
                                 Err(e) => {
-                                    let err_str = gettext!(
-                                        "cannot open directory '{}': {}",
-                                        target.display(),
-                                        error_string(&e)
-                                    );
-                                    let e = io::Error::other(err_str);
                                     if cfg.continue_on_error {
                                         eprintln!("{}: {}", cfg.prog, error_string(&e));
                                         *had_error.borrow_mut() = true;
@@ -1124,17 +1203,9 @@ where
                             // Record what this destination directory *is*, from the descriptor
                             // already in hand rather than by name. Recording on entry, not on
                             // creation, so a destination that existed beforehand counts too.
-                            let mut st = MaybeUninit::<libc::stat>::uninit();
-                            if unsafe { libc::fstat(new_target_dirfd.as_raw_fd(), st.as_mut_ptr()) }
-                                == 0
-                            {
-                                let st = unsafe { st.assume_init() };
-                                // Casts needed: `dev_t`/`ino_t` are not u64 on every platform.
-                                #[allow(clippy::unnecessary_cast)]
-                                dest_dir_ids
-                                    .borrow_mut()
-                                    .insert((st.st_dev as u64, st.st_ino as u64));
-                            }
+                            dest_dir_ids
+                                .borrow_mut()
+                                .insert((new_target_md.dev(), new_target_md.ino()));
 
                             target_dirfd_stack_borrowed.push(Rc::new(new_target_dirfd));
                             target_dir_path_borrowed.push(target_filename);

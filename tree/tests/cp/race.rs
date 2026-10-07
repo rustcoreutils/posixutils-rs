@@ -433,6 +433,93 @@ fn cp_p_creates_the_destination_without_setuid_or_group_other_bits() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Run `cp args` in `base` repeatedly for two seconds while a thread replaces each of `made`
+/// -- an empty directory cp has just made -- with a non-empty directory of its own. After each
+/// run, no planted directory may have received anything from cp.
+fn cp_racing_a_made_dir_swap(base: &std::path::Path, args: &[&str], made: &[PathBuf]) {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let decoys: Vec<PathBuf> = (0..made.len())
+        .map(|i| base.join(format!("decoy{i}")))
+        .collect();
+    let dest = made[0].parent().unwrap().to_path_buf();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut rounds = 0;
+    while Instant::now() < deadline {
+        rounds += 1;
+        let _ = fs::remove_dir_all(&dest);
+        fs::create_dir(&dest).unwrap();
+        // Others may write here, which is what makes the swap possible.
+        fs::set_permissions(&dest, fs::Permissions::from_mode(0o777)).unwrap();
+        for decoy in &decoys {
+            let _ = fs::remove_dir_all(decoy);
+            fs::create_dir(decoy).unwrap();
+            fs::write(decoy.join("planted"), b"").unwrap();
+        }
+
+        let done = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(Ordering::Relaxed) {
+                    for (dir, decoy) in made.iter().zip(&decoys) {
+                        // Succeeds only on the empty directory cp just made.
+                        if fs::remove_dir(dir).is_ok() {
+                            let _ = fs::rename(decoy, dir);
+                        }
+                    }
+                }
+            });
+            let _ = Command::new(get_binary_path("cp"))
+                .args(args)
+                .current_dir(base)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .expect("failed to execute cp");
+            done.store(true, Ordering::Relaxed);
+        });
+
+        for dir in made {
+            if dir.join("planted").exists() {
+                let entries = fs::read_dir(dir).unwrap().count();
+                assert_eq!(
+                    entries, 1,
+                    "cp copied into a directory swapped for one it made (round {rounds})"
+                );
+            }
+        }
+    }
+}
+
+/// `cp -R` makes each destination directory with `mkdirat` and then opens it. One swapped in
+/// between by someone who can write the parent must not receive the copy.
+#[test]
+fn cp_r_never_copies_into_a_directory_swapped_for_a_made_one() {
+    let base = scratch("made_dir_swap");
+    const DIRS: usize = 32;
+    for i in 0..DIRS {
+        fs::create_dir_all(base.join(format!("src/sub{i}"))).unwrap();
+        fs::write(base.join(format!("src/sub{i}/f")), b"f").unwrap();
+    }
+    let made: Vec<PathBuf> = (0..DIRS)
+        .map(|i| base.join(format!("dst/sub{i}")))
+        .collect();
+    cp_racing_a_made_dir_swap(&base, &["-R", "src/.", "dst"], &made);
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// The same for the directories `cp --parents` makes.
+#[test]
+fn cp_parents_never_copies_into_a_directory_swapped_for_a_made_one() {
+    let base = scratch("parents_made_dir_swap");
+    fs::create_dir_all(base.join("dir")).unwrap();
+    fs::write(base.join("dir/f"), b"f").unwrap();
+    cp_racing_a_made_dir_swap(&base, &["--parents", "dir/f", "t"], &[base.join("t/dir")]);
+    let _ = fs::remove_dir_all(&base);
+}
+
 /// `cp -R src dst` makes `dst/sub` with `mkdirat` and then opens it to copy
 /// `src/sub`'s contents into. A directory swapped for a symbolic link in
 /// between must not be followed.

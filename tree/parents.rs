@@ -15,7 +15,7 @@
 //! the directory the previous step opened, and `-p` applies attributes through those same
 //! descriptors.
 
-use crate::common::{copy_file_at, error_string, CopyConfig, InodeMap};
+use crate::common::{copy_file_at, error_string, verify_made_dir, CopyConfig, InodeMap};
 use gettextrs::gettext;
 use std::collections::HashSet;
 use std::ffi::CString;
@@ -118,6 +118,9 @@ fn make_parents(source: &Path, target: &Path, preserve: bool) -> io::Result<(Vec
                 ))
             })?;
         if created {
+            // Between the `mkdirat` and the open, anyone else who can rename entries in the
+            // parent could have swapped in a directory of their own.
+            verify_made_dir(dest_dir.as_raw_fd(), next_dest.as_raw_fd(), &dest_path)?;
             made.push(MadeDir {
                 dest: next_dest.try_clone()?,
                 source: src_md,

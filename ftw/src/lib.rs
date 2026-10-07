@@ -483,30 +483,7 @@ impl<'a> Entry<'a> {
                 return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
             }
         }
-        match OwnedDir::new(file_descriptor) {
-            Ok(dir) => {
-                let mut num_entries = 0;
-
-                // Manually count the number of entries.
-                for entry_or_err in dir.iter() {
-                    let entry = match entry_or_err {
-                        Ok(entry) => entry,
-                        Err(e) => {
-                            return Err(e);
-                        }
-                    };
-
-                    if entry.is_dot_or_double_dot() {
-                        continue;
-                    }
-
-                    num_entries += 1;
-                }
-
-                Ok(num_entries == 0)
-            }
-            Err(e) => Err(e),
-        }
+        lists_nothing(OwnedDir::new(file_descriptor)?)
     }
 
     /// Returns whether this entry is a `..` or a `..`.
@@ -1352,6 +1329,34 @@ where
     }
 
     success
+}
+
+/// Whether `dir` lists nothing but `.` and `..`.
+fn lists_nothing(dir: OwnedDir) -> io::Result<bool> {
+    for entry in dir.iter() {
+        if !entry?.is_dot_or_double_dot() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Whether the directory open on `dir_fd` is empty.
+///
+/// It is read through a new open of `.` relative to `dir_fd` -- the same directory, which no
+/// rename can swap -- so `dir_fd`'s own read position is left alone.
+pub fn is_empty_dir_fd(dir_fd: RawFd) -> io::Result<bool> {
+    let fd = unsafe {
+        libc::openat(
+            dir_fd,
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    lists_nothing(OwnedDir::new(FileDescriptor { fd })?)
 }
 
 /// Whether the open descriptor `fd` refers to the file identified by `(dev, ino)`, the identity a

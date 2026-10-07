@@ -198,6 +198,9 @@ enum Primary {
     /// `-regex`: GNU extension, forced by debhelper (dh_md5sums, dh_fixperms,
     /// `-X`). Compiled from the Emacs syntax by [`emacs_regex_to_ere`].
     Regex(plib::regex::Regex),
+    /// `-empty`: GNU extension, forced by debhelper (dh_install,
+    /// dh_installdocs)
+    Empty,
 
     // Actions
     Print,
@@ -565,6 +568,7 @@ fn parse_primary(tokens: &[&str], idx: &mut usize) -> Result<Expr, String> {
         "-nouser" => Ok(Expr::Primary(Primary::NoUser)),
         "-true" => Ok(Expr::Primary(Primary::Const(true))),
         "-false" => Ok(Expr::Primary(Primary::Const(false))),
+        "-empty" => Ok(Expr::Primary(Primary::Empty)),
         "-regex" => {
             let pattern = get_arg(tokens, idx, "-regex")?;
             let ere = emacs_regex_to_ere(pattern)?;
@@ -1125,6 +1129,7 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
             }
         }
         Primary::Const(value) => EvalResult::new(*value),
+        Primary::Empty => EvalResult::new(is_empty(ctx, state)),
         Primary::Regex(re) => EvalResult::new(re.is_match_bytes(ctx.path.as_os_str().as_bytes())),
         Primary::NoUser => {
             let uid = ctx.metadata.uid();
@@ -1237,6 +1242,30 @@ fn evaluate_primary(primary: &Primary, ctx: &EvalContext, state: &mut FindState)
                     EvalResult::new(false)
                 }
             }
+        }
+    }
+}
+
+/// `-empty`: a regular file of size zero, or a directory with no entries.
+/// A directory that cannot be read is reported and is not empty.
+fn is_empty(ctx: &EvalContext, state: &mut FindState) -> bool {
+    let ft = ctx.metadata.file_type();
+    if ft.is_file() {
+        return ctx.metadata.len() == 0;
+    }
+    if !ft.is_dir() {
+        return false;
+    }
+    match fs::read_dir(ctx.path) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(e) => {
+            eprintln!(
+                "find: '{}': {}",
+                ctx.path.display(),
+                plib::diag::io_error_text(&e)
+            );
+            state.had_error = true;
+            false
         }
     }
 }

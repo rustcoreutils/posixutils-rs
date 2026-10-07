@@ -565,3 +565,23 @@ fn find_perm_any_bits() {
     run_test_find(&[".", "-perm", "/9"], "", "find: invalid mode: 9\n", 1);
     fs::remove_dir_all(&dir).unwrap();
 }
+
+/// `-empty`: an empty regular file or a directory with no entries; never a
+/// symlink. dh_install copies `-type d -and -empty`, dh_installdocs skips
+/// `! -empty`.
+#[test]
+fn find_empty() {
+    let dir = make_pkg_tree("empty");
+    expect_words(&dir, "-empty", &["./plain", "./emptydir"]);
+    expect_words(&dir, "( -type d -and -empty )", &["./emptydir"]);
+    expect_words(
+        &dir,
+        "doc ( -type f -or -type l ) -and ! -empty",
+        &[
+            "doc/pkg/README",
+            "doc/pkg/Notes.HTML",
+            "doc/pkg/examples/ex.txt",
+        ],
+    );
+    fs::remove_dir_all(&dir).unwrap();
+}

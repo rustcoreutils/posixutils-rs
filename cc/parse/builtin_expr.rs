@@ -1081,6 +1081,9 @@ impl Parser<'_> {
                 // Parse member-designator starting with field name (no dot prefix for first field)
                 // Subsequent components use .field or [index] syntax
                 let mut path = Vec::new();
+                // The indices that are not constants, by their place in
+                // `path`, where each stands as index 0.
+                let mut variable: Vec<(usize, Expr)> = Vec::new();
                 // Expect identifier for first member
                 let first_field = self.expect_identifier()?;
                 path.push(OffsetOfPath::Field(first_field));
@@ -1092,18 +1095,24 @@ impl Parser<'_> {
                         path.push(OffsetOfPath::Field(field));
                     } else if self.is_special(b'[') {
                         self.advance();
-                        // Parse constant expression for index
-                        let index_expr = self.parse_conditional_expr()?;
+                        let index_expr = self.parse_expression()?;
                         let index_pos = index_expr.pos;
                         self.expect_special(b']')?;
-                        // Evaluate as constant - offsetof requires compile-time constant
-                        let index_val = self.eval_const_expr(&index_expr).ok_or_else(|| {
-                            ParseError::new(
-                                "array index in offsetof must be a constant expression",
+                        if !index_expr.typ.is_some_and(|t| self.types.is_integer(t)) {
+                            return Err(ParseError::new(
+                                "array index in offsetof is not an integer",
                                 index_pos,
-                            )
-                        })?;
-                        path.push(OffsetOfPath::Index(index_val as i64));
+                            ));
+                        }
+                        match self.eval_const_expr(&index_expr) {
+                            Some(index_val) => path.push(OffsetOfPath::Index(index_val as i64)),
+                            // A GNU extension: C17 7.19p3 makes the
+                            // designator one whose address is a constant.
+                            None => {
+                                variable.push((path.len(), index_expr));
+                                path.push(OffsetOfPath::Index(0));
+                            }
+                        }
                     } else {
                         break;
                     }
@@ -1113,7 +1122,17 @@ impl Parser<'_> {
                 // `&(t.member-designator)` is a constant -- so never a
                 // bit-field.
                 let mut current = type_id;
-                for step in &path {
+                // The element size each variable index scales by.
+                let mut scales: Vec<(Expr, usize)> = Vec::new();
+                let mut variable = variable.into_iter().peekable();
+                for (at, step) in path.iter().enumerate() {
+                    if let (OffsetOfPath::Index(_), Some(elem)) =
+                        (step, self.types.base_type(current))
+                    {
+                        if let Some((_, index)) = variable.next_if(|(place, _)| *place == at) {
+                            scales.push((index, self.types.size_bytes(elem)));
+                        }
+                    }
                     current = match step {
                         OffsetOfPath::Field(name) => match self.types.find_member(current, *name) {
                             Some(m) if m.bit_width.is_some() => {
@@ -1133,15 +1152,55 @@ impl Parser<'_> {
                         },
                     };
                 }
-                Ok(Self::typed_expr(
+                let constant = Self::typed_expr(
                     ExprKind::OffsetOf { type_id, path },
                     self.types.ulong_id, // size_t is typically unsigned long
                     token_pos,
-                ))
+                );
+                Ok(self.offsetof_plus_variable_indices(constant, scales))
             })()),
             // Atomic builtins (Clang __c11_atomic_* for C11 stdatomic.h)
             _ => None,
         }
+    }
+
+    /// `offsetof` whose designator has array indices that are not constants
+    /// (a GNU extension): `constant`, the offset with each of them taken as
+    /// 0, plus each index converted to `size_t` times its element size --
+    /// an ordinary run-time `size_t` expression. With no such index it is
+    /// `constant` itself, an integer constant expression.
+    fn offsetof_plus_variable_indices(&self, constant: Expr, scales: Vec<(Expr, usize)>) -> Expr {
+        let size_t = self.types.ulong_id;
+        scales.into_iter().fold(constant, |sum, (index, scale)| {
+            let pos = index.pos;
+            let index = Self::typed_expr(
+                ExprKind::Cast {
+                    cast_type: size_t,
+                    expr: Box::new(index),
+                },
+                size_t,
+                pos,
+            );
+            let scale = Self::typed_expr(ExprKind::IntLit(scale as i64), size_t, pos);
+            let term = Self::typed_expr(
+                ExprKind::Binary {
+                    op: BinaryOp::Mul,
+                    left: Box::new(index),
+                    right: Box::new(scale),
+                },
+                size_t,
+                pos,
+            );
+            Self::typed_expr(
+                ExprKind::Binary {
+                    op: BinaryOp::Add,
+                    left: Box::new(sum),
+                    right: Box::new(term),
+                },
+                size_t,
+                pos,
+            )
+        })
     }
 
     /// `__c11_atomic_fetch_<op>(ptr, val, order)`: apply the operation and

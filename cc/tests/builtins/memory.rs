@@ -11,7 +11,7 @@
 // Consolidates: alloca, offsetof tests
 //
 
-use crate::common::compile_and_run;
+use crate::common::{compile_and_run, compile_and_run_everywhere, compile_expect_error};
 
 // ============================================================================
 // Mega-test: Memory builtins (alloca, offsetof)
@@ -565,4 +565,81 @@ int main(void) {
             "memory builtins failed at {opt}"
         );
     }
+}
+
+/// `offsetof` with an array index that is not a constant, a GNU extension
+/// (C17 7.19p3 wants an address constant): the offset of the indexed
+/// element, computed at run time. util-linux's lsns.c needs it through
+/// `list_entry(p, struct lsns_process, ns_siblings[ns->type])`, and
+/// libblkid's atari.c and bcache.c through `offsetof(T, part[i])`.
+#[test]
+fn builtins_offsetof_with_a_variable_index() {
+    let code = r#"
+#include <stddef.h>
+
+struct list_head { struct list_head *next, *prev; };
+struct proc { int pid; struct list_head siblings[3]; char tail; };
+struct S { char c; struct { int x; short y[3]; } a[4]; long z; };
+
+#define container_of(ptr, type, member) \
+    ((type *)((char *)(ptr) - offsetof(type, member)))
+
+__attribute__((noinline)) static size_t at(int i, int j)
+{
+    return offsetof(struct S, a[i].y[j]);
+}
+
+__attribute__((noinline)) static size_t elem(long i)
+{
+    return __builtin_offsetof(struct S, a[i]);
+}
+
+int main(void)
+{
+    struct proc p;
+    for (int t = 0; t < 3; t++)
+        if (container_of(&p.siblings[t], struct proc, siblings[t]) != &p)
+            return 1 + t;
+    for (int i = 0; i < 4; i++) {
+        if (elem(i) != offsetof(struct S, a[0]) + i * sizeof(((struct S *)0)->a[0]))
+            return 10 + i;
+        for (int j = 0; j < 3; j++)
+            if (at(i, j) != (size_t)((char *)&((struct S *)0)->a[i].y[j] - (char *)0))
+                return 20 + 3 * i + j;
+    }
+    /* A negative index, as in the extension. */
+    if (elem(-1) != offsetof(struct S, a[0]) - sizeof(((struct S *)0)->a[0]))
+        return 40;
+    /* The index is evaluated once. */
+    int n = 1;
+    if (offsetof(struct S, a[n++]) != offsetof(struct S, a[1]) || n != 2)
+        return 41;
+    /* A constant index is still an integer constant expression. */
+    _Static_assert(offsetof(struct S, a[2].y[1]) == offsetof(struct S, a[0]) + 2 * 12 + 4 + 2,
+                   "constant index");
+    static const size_t k = offsetof(struct S, a[3]);
+    if (k != elem(3))
+        return 42;
+    return 0;
+}
+"#;
+    compile_and_run_everywhere("builtins_offsetof_with_a_variable_index", code);
+}
+
+/// A variable index makes `offsetof` no constant, which a static
+/// initializer needs.
+#[test]
+fn builtins_offsetof_with_a_variable_index_is_not_a_static_initializer() {
+    compile_expect_error(
+        "offsetof_variable_index_static",
+        r#"
+struct S { int a[4]; };
+unsigned long f(int n)
+{
+    static unsigned long v = __builtin_offsetof(struct S, a[n]);
+    return v;
+}
+"#,
+        "not constant",
+    );
 }

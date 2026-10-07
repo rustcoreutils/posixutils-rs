@@ -530,6 +530,12 @@ fn read_operand(file: &mut File) -> std::io::Result<(Vec<u8>, Metadata)> {
 /// too, as with GNU strip. The kernel clears the set-user-ID and
 /// set-group-ID bits when a non-root user writes a file; they are put
 /// back as they were (`before`).
+///
+/// The data is flushed to the file's storage before returning: a write
+/// error the filesystem reports only later (NFS, quotas, a failing disk)
+/// would otherwise surface at no point strip looks -- dropping the `File`
+/// discards `close`'s result -- and strip would report success on a file
+/// it had left truncated or half written.
 fn write_operand(file: &mut File, before: &Metadata, bytes: &[u8]) -> std::io::Result<()> {
     file.seek(SeekFrom::Start(0))?;
     file.write_all(bytes)?;
@@ -544,7 +550,7 @@ fn write_operand(file: &mut File, before: &Metadata, bytes: &[u8]) -> std::io::R
     }
     #[cfg(not(unix))]
     let _ = before;
-    Ok(())
+    file.sync_all()
 }
 
 fn strip_file(file: &OsStr, opts: &Options) {

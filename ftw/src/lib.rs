@@ -849,10 +849,32 @@ where
             &mut err_reporter,
         ) {
             ProcessFileResult::ProcessedDirectory(entry) => {
-                // `O_DIRECTORY` rejects a non-directory; `O_NOFOLLOW` is intentionally NOT used for
-                // the root operand so that a symlinked directory argument is still honored per
-                // `follow_symlinks_on_args`.
-                match OwnedDir::open_at(&starting_dir, dir_filename.as_ptr(), libc::O_DIRECTORY) {
+                // `O_DIRECTORY` rejects a non-directory. `O_NOFOLLOW` is added unless the walk
+                // follows a symlinked starting point (-H/-L), so a directory swapped for a
+                // symlink after the stat above is not followed; the (dev, ino) check then refuses
+                // a swap for a different directory, as on every descent. (A trailing slash still
+                // resolves a symlinked operand, as it did for the stat.)
+                let root_flags = if follow_symlinks_on_args || follow_symlinks {
+                    libc::O_DIRECTORY
+                } else {
+                    libc::O_DIRECTORY | libc::O_NOFOLLOW
+                };
+                let (want_dev, want_ino) = {
+                    let md = entry.metadata.as_ref().unwrap();
+                    (md.0.st_dev, md.0.st_ino)
+                };
+                let opened = OwnedDir::open_at(&starting_dir, dir_filename.as_ptr(), root_flags)
+                    .and_then(|dir| {
+                        if fd_matches(dir.file_descriptor(), want_dev, want_ino) {
+                            Ok(dir)
+                        } else {
+                            Err(Error::new(
+                                io::Error::from_raw_os_error(libc::ENOTDIR),
+                                ErrorKind::OpenDir,
+                            ))
+                        }
+                    });
+                match opened {
                     Ok(new_dir) => {
                         let node = TreeNode {
                             dir: HybridDir::Owned(new_dir),

@@ -1308,9 +1308,10 @@ fn openat_guarded(
 /// inode must be a regular file, and the blocking open is of that inode itself, through
 /// `self/fd/N` in a `/proc` verified to be procfs: no name is resolved again, so nothing
 /// swapped in after the pin is reached, and a regular file's open cannot block on a missing
-/// FIFO peer. Without procfs (and on other systems) the name is `fstatat`'ed with
-/// `AT_SYMLINK_NOFOLLOW` and must be a regular file just before the blocking open; the residual
-/// is a FIFO swapped in between those two calls. A non-regular file fails with ENXIO, the error
+/// FIFO peer. Without procfs (and on other systems) the name is `fstatat`'ed -- following a
+/// symbolic link exactly when the caller's flags do -- and must be a regular file just before
+/// the blocking open; the residual is a FIFO swapped in between those two calls. A non-regular
+/// file fails with ENXIO, the error
 /// a non-blocking open of a FIFO would have given.
 fn reopen_regular_blocking(
     dirfd: libc::c_int,
@@ -1349,8 +1350,15 @@ fn reopen_regular_blocking(
             )
         };
     }
+    // The check resolves the name as the open below will: it follows a symbolic link exactly
+    // when the caller's flags do (-L, or the operand link POSIX writes through), so a copy
+    // through a link to a leased file waits for the lease like any other. Residual, accepted:
+    // without procfs (and off Linux) nothing pins the inode between this check and the
+    // blocking open, so a FIFO swapped in for the name (or for the link's target) in that
+    // window is opened and can block it.
     let name_cstr = unsafe { CStr::from_ptr(name) };
-    match ftw::Metadata::new(dirfd, name_cstr, false) {
+    let follow = flags & libc::O_NOFOLLOW == 0;
+    match ftw::Metadata::new(dirfd, name_cstr, follow) {
         Ok(md) if md.file_type() == ftw::FileType::RegularFile => {}
         Ok(_) => return not_regular(),
         Err(_) => return -1,

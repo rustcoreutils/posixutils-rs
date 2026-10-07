@@ -1790,15 +1790,14 @@ fn test_cp_special_fifo_keeps_set_id_bits() {
     fs::remove_dir_all(test_dir).unwrap();
 }
 
-/// Under a seccomp filter that answers `fchmodat2` with EPERM, as older runc and systemd's
-/// `SystemCallFilter=` do for system calls they do not know, `cp -p` still sets a made FIFO's
-/// mode, through the verified procfs path.
+/// Make `command`'s process answer system call `nr` with EPERM, through a seccomp filter
+/// installed just before exec -- as a container runtime or systemd's `SystemCallFilter=` does.
+/// Every other system call is allowed.
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-#[test]
-fn test_cp_p_sets_a_fifo_mode_when_seccomp_refuses_fchmodat2() {
+pub(crate) fn deny_syscall_with_eperm(command: &mut Command, nr: u32) {
     use std::os::unix::process::CommandExt;
 
     #[repr(C)]
@@ -1814,8 +1813,7 @@ fn test_cp_p_sets_a_fifo_mode_when_seccomp_refuses_fchmodat2() {
         filter: *const SockFilter,
     }
     // BPF_LD|BPF_W|BPF_ABS, BPF_JMP|BPF_JEQ|BPF_K, BPF_RET|BPF_K; SECCOMP_RET_ERRNO and
-    // SECCOMP_RET_ALLOW. Offset 0 of the seccomp data is the system call number; fchmodat2 is
-    // 452 on both architectures.
+    // SECCOMP_RET_ALLOW. Offset 0 of the seccomp data is the system call number.
     const LD_NR: u16 = 0x20;
     const JEQ: u16 = 0x15;
     const RET: u16 = 0x06;
@@ -1824,6 +1822,61 @@ fn test_cp_p_sets_a_fifo_mode_when_seccomp_refuses_fchmodat2() {
     const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
     const PR_SET_SECCOMP: libc::c_int = 22;
     const SECCOMP_MODE_FILTER: libc::c_ulong = 2;
+    let eperm = RET_ERRNO | u32::try_from(libc::EPERM).unwrap();
+
+    unsafe {
+        command.pre_exec(move || {
+            let filter = [
+                SockFilter {
+                    code: LD_NR,
+                    jt: 0,
+                    jf: 0,
+                    k: 0,
+                },
+                SockFilter {
+                    code: JEQ,
+                    jt: 0,
+                    jf: 1,
+                    k: nr,
+                },
+                SockFilter {
+                    code: RET,
+                    jt: 0,
+                    jf: 0,
+                    k: eperm,
+                },
+                SockFilter {
+                    code: RET,
+                    jt: 0,
+                    jf: 0,
+                    k: RET_ALLOW,
+                },
+            ];
+            let prog = SockFprog {
+                len: filter.len() as u16,
+                filter: filter.as_ptr(),
+            };
+            if libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
+                || libc::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Under a seccomp filter that answers `fchmodat2` with EPERM, as older runc and systemd's
+/// `SystemCallFilter=` do for system calls they do not know, `cp -p` still sets a made FIFO's
+/// mode, through the verified procfs path.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn test_cp_p_sets_a_fifo_mode_when_seccomp_refuses_fchmodat2() {
+    // fchmodat2 is 452 on both architectures.
+    const SYS_FCHMODAT2: u32 = 452;
 
     let test_dir = &format!(
         "{}/test_cp_p_sets_a_fifo_mode_when_seccomp_refuses_fchmodat2",
@@ -1836,51 +1889,10 @@ fn test_cp_p_sets_a_fifo_mode_when_seccomp_refuses_fchmodat2() {
     mkfifo_at(fifo, 0o640);
     fs::set_permissions(fifo, fs::Permissions::from_mode(0o4640)).unwrap();
 
-    let out = unsafe {
-        Command::new(env!("CARGO_BIN_EXE_cp"))
-            .args(["-pR", fifo, copy])
-            .stdin(Stdio::null())
-            .pre_exec(|| {
-                let filter = [
-                    SockFilter {
-                        code: LD_NR,
-                        jt: 0,
-                        jf: 0,
-                        k: 0,
-                    },
-                    SockFilter {
-                        code: JEQ,
-                        jt: 0,
-                        jf: 1,
-                        k: 452,
-                    },
-                    SockFilter {
-                        code: RET,
-                        jt: 0,
-                        jf: 0,
-                        k: RET_ERRNO | libc::EPERM as u32,
-                    },
-                    SockFilter {
-                        code: RET,
-                        jt: 0,
-                        jf: 0,
-                        k: RET_ALLOW,
-                    },
-                ];
-                let prog = SockFprog {
-                    len: filter.len() as u16,
-                    filter: filter.as_ptr(),
-                };
-                if libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
-                    || libc::prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) != 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            })
-            .output()
-            .unwrap()
-    };
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cp"));
+    command.args(["-pR", fifo, copy]).stdin(Stdio::null());
+    deny_syscall_with_eperm(&mut command, SYS_FCHMODAT2);
+    let out = command.output().unwrap();
     assert_eq!(
         out.status.code(),
         Some(0),

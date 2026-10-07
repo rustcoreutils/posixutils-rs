@@ -306,6 +306,19 @@ fn cp_against_a_lease(
     lease: libc::c_int,
     writable: bool,
 ) -> (Option<i32>, String) {
+    cp_against_a_lease_with(base, &["source", "target"], leased, lease, writable, |_| {})
+}
+
+/// `cp_against_a_lease` with cp's arguments, and a last adjustment of its `Command`.
+#[cfg(target_os = "linux")]
+fn cp_against_a_lease_with(
+    base: &std::path::Path,
+    args: &[&str],
+    leased: &std::path::Path,
+    lease: libc::c_int,
+    writable: bool,
+    configure: impl FnOnce(&mut Command),
+) -> (Option<i32>, String) {
     use std::os::fd::AsRawFd;
 
     // The kernel signals the lease holder (this process) with SIGIO when the lease must break;
@@ -328,14 +341,15 @@ fn cp_against_a_lease(
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    let child = Command::new(get_binary_path("cp"))
-        .args(["source", "target"])
+    let mut command = Command::new(get_binary_path("cp"));
+    command
+        .args(args)
         .current_dir(base)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to execute cp");
+        .stderr(Stdio::piped());
+    configure(&mut command);
+    let child = command.spawn().expect("failed to execute cp");
     std::thread::sleep(Duration::from_secs(1));
     unsafe { libc::fcntl(holder.as_raw_fd(), libc::F_SETLEASE, libc::F_UNLCK) };
     drop(holder);
@@ -370,6 +384,42 @@ fn cp_waits_for_a_lease_on_the_source() {
     let (status, stderr) = cp_against_a_lease(&base, &base.join("source"), libc::F_WRLCK, true);
     assert_eq!(status, Some(0), "stderr: {stderr}");
     assert_eq!(fs::read(base.join("target")).unwrap(), b"source");
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// The lease retry where `/proc` cannot be used (here: `fstatfs` refused, so procfs cannot be
+/// verified): the destination operand is a symbolic link to a leased file, which POSIX writes
+/// through. The check before the blocking open must follow the link as the open does, not
+/// refuse it as "not a regular file".
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn cp_waits_for_a_lease_through_an_operand_link_without_procfs() {
+    #[cfg(target_arch = "x86_64")]
+    const SYS_FSTATFS: u32 = 138;
+    #[cfg(target_arch = "aarch64")]
+    const SYS_FSTATFS: u32 = 44;
+
+    let base = scratch("lease_link_no_procfs");
+    fs::write(base.join("source"), b"source").unwrap();
+    fs::write(base.join("leased"), b"old").unwrap();
+    std::os::unix::fs::symlink("leased", base.join("link")).unwrap();
+    let (status, stderr) = cp_against_a_lease_with(
+        &base,
+        &["source", "link"],
+        &base.join("leased"),
+        libc::F_RDLCK,
+        false,
+        |command| super::deny_syscall_with_eperm(command, SYS_FSTATFS),
+    );
+    assert_eq!(status, Some(0), "stderr: {stderr}");
+    assert_eq!(fs::read(base.join("leased")).unwrap(), b"source");
+    assert!(fs::symlink_metadata(base.join("link"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
     let _ = fs::remove_dir_all(&base);
 }
 

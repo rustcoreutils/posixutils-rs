@@ -3,6 +3,19 @@
  *
  * Builtin header for c17 compiler.
  */
+
+/*
+ * <complex.h> is the C library's header, not the compiler's (gcc ships none),
+ * and a hosted glibc declares more than this one does: `clog10` and the
+ * _FloatN functions under _GNU_SOURCE, which c17 predefines. Standing in for
+ * it hid those, so a hosted glibc build uses the library's own, which c17
+ * parses as it is. Its guard is also `_COMPLEX_H`, so this test must come
+ * before the one below.
+ */
+#if __STDC_HOSTED__ && defined(__GLIBC__) && !defined(_COMPLEX_H)
+#include_next <complex.h>
+#endif
+
 #ifndef _COMPLEX_H
 #define _COMPLEX_H
 

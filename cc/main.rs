@@ -18,6 +18,7 @@ use posixutils_cc::f_options::{self, Effect};
 use posixutils_cc::ir;
 use posixutils_cc::linkargs;
 use posixutils_cc::opt;
+use posixutils_cc::os;
 use posixutils_cc::parse;
 use posixutils_cc::pipeline;
 use posixutils_cc::prefix_map::{MapOption, PrefixMap, PrefixMaps};
@@ -2371,6 +2372,49 @@ fn query_target(raw_args: &[String]) -> Target {
     })
 }
 
+/// gcc's `-v` report of where `#include` looks, in the order c17 looks there.
+///
+/// Programs read it to learn the compiler's header directories: perl's h2ph
+/// converts the headers it finds in them (`cc -v -E - </dev/null`), CMake
+/// records them as implicit. Only existing directories are listed, as gcc
+/// lists them. The bundled headers have no directory of their own; their
+/// slot names the one c17 answers for `-print-file-name=include` -- the host
+/// driver's, whose files those headers stand in for -- and is left out when
+/// that is not a directory or the bundled headers are off.
+fn include_search_list(args: &Args, target: &Target) -> String {
+    let search = system_search(args);
+    let mut angle: Vec<String> = args.include_paths.clone();
+    if !args.no_std_inc && !args.no_builtin_inc {
+        angle.extend(host_include_dir());
+    }
+    angle.extend(search.isystem.iter().cloned());
+    if !search.no_std_inc {
+        angle.extend(os::get_include_paths(target, search.sysroot));
+    }
+    angle.extend(search.idirafter.iter().cloned());
+
+    let exists = |dir: &&String| Path::new(dir).is_dir();
+    let entry = |dir: &String| format!(" {dir}\n");
+    let mut out = String::from("#include \"...\" search starts here:\n");
+    out.extend(search.iquote.iter().filter(exists).map(entry));
+    out.push_str("#include <...> search starts here:\n");
+    out.extend(angle.iter().filter(exists).map(entry));
+    out.push_str("End of search list.\n");
+    out
+}
+
+/// The host driver's answer to `-print-file-name=include`, when that is a
+/// directory.
+fn host_include_dir() -> Option<String> {
+    let out = linkargs::host_driver()
+        .arg("-print-file-name=include")
+        .output()
+        .ok()?;
+    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && Path::new(&dir).is_absolute() && Path::new(&dir).is_dir())
+        .then_some(dir)
+}
+
 /// Put `query` to the host driver and pass on its answer and exit status.
 fn forward_to_host_driver(query: &str) -> i32 {
     match linkargs::host_driver().arg(query).output() {
@@ -3131,6 +3175,14 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .filter(|o| o.kind == OperandKind::Source)
         .count();
+
+    if args.verbose
+        && operands
+            .iter()
+            .any(|o| matches!(o.kind, OperandKind::Source | OperandKind::Asm))
+    {
+        eprint!("{}", include_search_list(&args, &target));
+    }
 
     // A single -o names one output. With -c and several sources it would name
     // each of them in turn, so every object but the last is overwritten. The

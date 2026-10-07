@@ -754,6 +754,72 @@ fn gcc_flags_bare_v_prints_a_version_banner() {
     assert!(r.success, "{}", r.stderr);
 }
 
+/// The directories between `start` and gcc's "End of search list." line of a
+/// `-v` stderr, one per line, as perl's h2ph and CMake read them.
+fn search_list<'a>(stderr: &'a str, start: &str) -> Vec<&'a str> {
+    stderr
+        .lines()
+        .skip_while(|l| *l != start)
+        .skip(1)
+        .take_while(|l| l.starts_with(' '))
+        .map(str::trim)
+        .collect()
+}
+
+/// `-v` with an operand to preprocess prints gcc's include search list on
+/// stderr. perl's h2ph runs `cc -v -E - </dev/null` and converts the headers
+/// it finds in those directories; with no list it converted only
+/// /usr/include, so Debian's perl shipped a syslog.ph requiring a stdarg.ph
+/// nothing had made. The bundled headers' slot names the directory c17
+/// answers for `-print-file-name=include`.
+#[test]
+fn gcc_flags_v_prints_the_include_search_list() {
+    let (dir, src) = scratch("empty.c", "");
+    let quote = dir.path().join("q");
+    let angle = dir.path().join("a");
+    std::fs::create_dir(&quote).unwrap();
+    std::fs::create_dir(&angle).unwrap();
+    let r = run_c17(&[
+        "-v",
+        "-E",
+        "-iquote",
+        quote.to_str().unwrap(),
+        "-I",
+        angle.to_str().unwrap(),
+        src.to_str().unwrap(),
+    ]);
+    assert!(r.success, "{}", r.stderr);
+    assert!(r.stderr.contains("End of search list.\n"), "{}", r.stderr);
+    let quoted = search_list(&r.stderr, "#include \"...\" search starts here:");
+    assert_eq!(quoted, [quote.to_str().unwrap()], "{}", r.stderr);
+    let system = search_list(&r.stderr, "#include <...> search starts here:");
+    assert_eq!(
+        system.first(),
+        Some(&angle.to_str().unwrap()),
+        "{}",
+        r.stderr
+    );
+
+    let include = run_c17(&["-print-file-name=include"]).stdout;
+    let include = include.trim();
+    let bundled = Path::new(include).is_absolute() && Path::new(include).is_dir();
+    assert_eq!(system.contains(&include), bundled, "{}", r.stderr);
+    if cfg!(target_os = "linux") {
+        // The bundled headers come ahead of the system's, as c17 searches.
+        assert_eq!(system.last(), Some(&"/usr/include"), "{}", r.stderr);
+        if bundled {
+            assert!(system[1..].starts_with(&[include]), "{}", r.stderr);
+        }
+    }
+
+    // -nostdinc drops the bundled headers and the target's directories, and
+    // the list says so.
+    let r = run_c17(&["-v", "-E", "-nostdinc", src.to_str().unwrap()]);
+    assert!(r.success, "{}", r.stderr);
+    let system = search_list(&r.stderr, "#include <...> search starts here:");
+    assert!(system.is_empty(), "{}", r.stderr);
+}
+
 // ---------------------------------------------------------------------------
 // Response files
 // ---------------------------------------------------------------------------

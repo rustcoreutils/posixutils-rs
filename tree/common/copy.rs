@@ -1130,9 +1130,9 @@ fn open_source(
 /// swapped in for the expected regular file cannot hold the open.
 ///
 /// A regular file under a lease (a Samba oplock, a knfsd delegation) fails a non-blocking open
-/// with EAGAIN/EWOULDBLOCK instead of waiting for the lease to break. That open is retried
-/// blocking, as cp opened before the guard existed: a FIFO's open never fails with EAGAIN, so
-/// the retry cannot reach one, and the caller's identity and type check follows either open.
+/// with EAGAIN/EWOULDBLOCK instead of waiting for the lease to break, so that open is retried
+/// blocking (`reopen_regular_blocking`) -- without letting the retry reach a FIFO swapped in
+/// after the first attempt. The caller's identity and type check follows either open.
 /// Returns -1 with `errno` set on failure.
 fn openat_guarded(
     dirfd: libc::c_int,
@@ -1140,14 +1140,104 @@ fn openat_guarded(
     flags: libc::c_int,
     guard: bool,
 ) -> libc::c_int {
-    if guard {
-        let fd = unsafe { libc::openat(dirfd, name, flags | libc::O_NONBLOCK) };
-        let errno = io::Error::last_os_error().raw_os_error();
-        if fd != -1 || !matches!(errno, Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK) {
-            return fd;
+    if !guard {
+        return unsafe { libc::openat(dirfd, name, flags) };
+    }
+    let fd = unsafe { libc::openat(dirfd, name, flags | libc::O_NONBLOCK) };
+    let errno = io::Error::last_os_error().raw_os_error();
+    if fd != -1 || !matches!(errno, Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK) {
+        return fd;
+    }
+    reopen_regular_blocking(dirfd, name, flags)
+}
+
+/// The blocking retry of `openat_guarded`, which may wait for a lease to break and so must
+/// only ever open a regular file.
+///
+/// On Linux the name is pinned with `O_PATH` (plus the caller's `O_NOFOLLOW`), the pinned
+/// inode must be a regular file, and the blocking open is of that inode itself, through
+/// `self/fd/N` in a `/proc` verified to be procfs: no name is resolved again, so nothing
+/// swapped in after the pin is reached, and a regular file's open cannot block on a missing
+/// FIFO peer. Without procfs (and on other systems) the name is `fstatat`'ed with
+/// `AT_SYMLINK_NOFOLLOW` and must be a regular file just before the blocking open; the residual
+/// is a FIFO swapped in between those two calls. A non-regular file fails with ENXIO, the error
+/// a non-blocking open of a FIFO would have given.
+fn reopen_regular_blocking(
+    dirfd: libc::c_int,
+    name: *const libc::c_char,
+    flags: libc::c_int,
+) -> libc::c_int {
+    let not_regular = || {
+        errno::set_errno(errno::Errno(libc::ENXIO));
+        -1
+    };
+    #[cfg(target_os = "linux")]
+    if let Ok(proc_dir) = procfs_dir() {
+        let pin = unsafe {
+            libc::openat(
+                dirfd,
+                name,
+                libc::O_PATH | libc::O_CLOEXEC | (flags & libc::O_NOFOLLOW),
+            )
+        };
+        if pin == -1 {
+            return -1;
         }
+        let pin = unsafe { fs::File::from_raw_fd(pin) };
+        match pin.metadata() {
+            Ok(md) if md.is_file() => {}
+            Ok(_) => return not_regular(),
+            Err(_) => return -1,
+        }
+        // The magic link is followed to the pinned inode: `O_NOFOLLOW` would refuse it.
+        let pinned = proc_fd_name(pin.as_raw_fd());
+        return unsafe {
+            libc::openat(
+                proc_dir.as_raw_fd(),
+                pinned.as_ptr(),
+                flags & !libc::O_NOFOLLOW,
+            )
+        };
+    }
+    let name_cstr = unsafe { CStr::from_ptr(name) };
+    match ftw::Metadata::new(dirfd, name_cstr, false) {
+        Ok(md) if md.file_type() == ftw::FileType::RegularFile => {}
+        Ok(_) => return not_regular(),
+        Err(_) => return -1,
     }
     unsafe { libc::openat(dirfd, name, flags) }
+}
+
+/// `/proc`, opened and verified to be procfs (`PROC_SUPER_MAGIC`), so that `self/fd/N` names
+/// exactly the inode open on descriptor N rather than whatever else is mounted or planted there.
+#[cfg(target_os = "linux")]
+fn procfs_dir() -> io::Result<fs::File> {
+    const PROC_SUPER_MAGIC: u32 = 0x9fa0;
+    let fd = unsafe {
+        libc::open(
+            c"/proc".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let dir = unsafe { fs::File::from_raw_fd(fd) };
+    let mut st = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if unsafe { libc::fstatfs(dir.as_raw_fd(), st.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // `f_type` is a signed word whose width varies by architecture; the magic is its low bits.
+    if unsafe { st.assume_init() }.f_type as u32 != PROC_SUPER_MAGIC {
+        return Err(io::Error::other(gettext("/proc is not a procfs mount")));
+    }
+    Ok(dir)
+}
+
+/// `self/fd/N`, relative to `procfs_dir`.
+#[cfg(target_os = "linux")]
+fn proc_fd_name(fd: libc::c_int) -> CString {
+    CString::new(format!("self/fd/{fd}")).unwrap()
 }
 
 /// Clear `O_NONBLOCK` on a descriptor opened with it only to keep a swapped-in FIFO from

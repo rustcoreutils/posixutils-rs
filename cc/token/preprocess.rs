@@ -3031,6 +3031,18 @@ pub struct AsmPreprocessConfig<'a> {
     /// See [`PreprocessConfig::macro_prefix_map`]: `__FILE__` in a `.S` file
     /// is mapped as in C.
     pub macro_prefix_map: PrefixMap,
+    /// See [`PreprocessConfig::collect_dependencies`]: a `.S` is preprocessed,
+    /// so the `-M` family has a rule to write for it.
+    pub collect_dependencies: bool,
+}
+
+/// A preprocessed `.S`: the text for `as`, and the headers it read.
+#[derive(Debug, Default)]
+pub struct AsmPreprocessed {
+    /// The preprocessed assembly, as bytes; see [`preprocess_asm_file`].
+    pub text: Vec<u8>,
+    /// See [`PreprocessOutcome::dependencies`].
+    pub dependencies: Vec<(PathBuf, bool)>,
 }
 
 /// A `.S` operand that could not be preprocessed.
@@ -3054,7 +3066,8 @@ impl std::error::Error for AsmPreprocessFailed {}
 /// comment syntax (`;` for line comments, no `//` or `/* */`).
 ///
 /// # Returns
-/// The preprocessed assembly text, as bytes: a string literal's payload is a
+/// The preprocessed assembly text, as bytes, with the headers read when
+/// [`AsmPreprocessConfig::collect_dependencies`] asks: a string literal's payload is a
 /// byte sequence, so rendering it through a Rust `String` would re-encode
 /// every byte >= 0x80. `Err` means this call reported a diagnostic -- a
 /// `#error`, a missing include -- and the bytes are not worth assembling.
@@ -3069,7 +3082,7 @@ pub fn preprocess_asm_file(
     target: &Target,
     filename: &str,
     config: &AsmPreprocessConfig<'_>,
-) -> Result<Vec<u8>, AsmPreprocessFailed> {
+) -> Result<AsmPreprocessed, AsmPreprocessFailed> {
     let errors_on_entry = diag::error_count();
     // Create string table for tokenization
     let mut strings = IdentTable::new();
@@ -3092,6 +3105,7 @@ pub fn preprocess_asm_file(
     // Use assembly lexer mode for included files as well
     pp.lexer_mode = LexerMode::Assembly;
     pp.macro_prefix_map = config.macro_prefix_map.clone();
+    pp.collect_dependencies = config.collect_dependencies;
 
     // Undefine C-specific macros that don't apply to assembly
     pp.undef_macro("__STDC__");
@@ -3136,7 +3150,10 @@ pub fn preprocess_asm_file(
     if diag::error_count() != errors_on_entry {
         return Err(AsmPreprocessFailed);
     }
-    Ok(text)
+    Ok(AsmPreprocessed {
+        text,
+        dependencies: std::mem::take(&mut pp.dependencies),
+    })
 }
 
 #[cfg(test)]

@@ -801,14 +801,33 @@ impl Args {
 /// The same pass `assemble_operand` runs before handing a `.S` to `as`, with
 /// the result going to the preprocessed sink instead of a scratch file. A `.s`
 /// has no directives to act on, so this is a copy for it -- which is also what
-/// gcc does rather than skipping the operand.
+/// gcc does rather than skipping the operand. Under `-M`/`-MM` the rule is the
+/// whole output, so the text is not written.
 fn preprocess_asm_operand(
     path: &str,
     args: &Args,
     target: &Target,
     out: &mut dyn Write,
 ) -> io::Result<()> {
+    let preprocessed = preprocess_asm(path, args, target)?;
+    if args.dependencies_replace_output() {
+        return Ok(());
+    }
+    out.write_all(&preprocessed)?;
+    out.flush()
+}
+
+/// Run the preprocessor over an assembler operand, the `.S` form's first
+/// step, and write its dependency rule when one was asked for.
+///
+/// A BOM is stripped for the same reason it is on every other reader:
+/// translation phase 1 has no byte for it, and `as` reads the leading 0xEF as
+/// the first character of a mnemonic.
+fn preprocess_asm(path: &str, args: &Args, target: &Target) -> io::Result<Vec<u8>> {
     let content = strip_bom(&std::fs::read(path)?).to_vec();
+    // Only a `.S` is preprocessed, so only a `.S` has a rule: gcc writes none
+    // for a `.s`, under `-M` or `-MD`.
+    let collect_dependencies = args.wants_dependencies() && args.lang_of(path) == Lang::AsmCpp;
     let config = AsmPreprocessConfig {
         optimization: args.optimization(),
         position: position_independence(args, target),
@@ -819,13 +838,17 @@ fn preprocess_asm_operand(
         search: system_search(args),
         no_std_inc: args.no_std_inc,
         macro_prefix_map: args.prefix_maps().macros,
+        collect_dependencies,
     };
+    // Catches #error, a missing include, and friends.
     let preprocessed = preprocess_asm_file(&content, target, path, &config).map_err(|e| {
         diag::reset_counts();
         io::Error::new(io::ErrorKind::InvalidData, e.to_string())
     })?;
-    out.write_all(&preprocessed)?;
-    out.flush()
+    if collect_dependencies {
+        write_dependency_rule(args, path, &preprocessed.dependencies)?;
+    }
+    Ok(preprocessed.text)
 }
 
 /// Write the make rule for one translation unit.
@@ -2766,30 +2789,7 @@ fn assemble_operand(
     let needs_cpp = args.lang_of(path) == Lang::AsmCpp;
     let asm_to_assemble = if needs_cpp {
         let temp_s = scratch_path(scratch, operand_id, stem, "s");
-        // A BOM is stripped here for the same reason it is on every other
-        // reader: translation phase 1 has no byte for it, and `as` reads the
-        // leading 0xEF as the first character of a mnemonic. `-E` on the same
-        // file already stripped it, so without this a BOM'd `.S` preprocessed
-        // clean and failed to assemble. Only `.S` gets this -- a `.s` is handed
-        // to `as` untouched, which is what gcc does with it too.
-        let content = strip_bom(&std::fs::read(path)?).to_vec();
-        let asm_config = AsmPreprocessConfig {
-            optimization: args.optimization(),
-            position: position_independence(args, target),
-            isa: target::X86Isa::from_flags(&args.mflags),
-            defines: &args.defines,
-            undefines: &args.undefines,
-            include_paths: &args.include_paths,
-            search: system_search(args),
-            no_std_inc: args.no_std_inc,
-            macro_prefix_map: args.prefix_maps().macros,
-        };
-        // Catches #error, a missing include, and friends.
-        let preprocessed =
-            preprocess_asm_file(&content, target, path, &asm_config).map_err(|e| {
-                diag::reset_counts();
-                io::Error::other(e.to_string())
-            })?;
+        let preprocessed = preprocess_asm(path, args, target)?;
         std::fs::write(&temp_s, &preprocessed)?;
         temp_s
     } else {
@@ -3241,7 +3241,7 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
             // assembler operand is never handed to `as`. Not assembling is not
             // the same as producing nothing, though: preprocess it and write
             // the text, as gcc does.
-            OperandKind::Asm if args.preprocess_only => {
+            OperandKind::Asm if args.preprocess_only || args.dependencies_replace_output() => {
                 let result = preprocess_asm_operand(&op.path, &args, &target, &mut pp_out);
                 diag::finish_unit();
                 match result {

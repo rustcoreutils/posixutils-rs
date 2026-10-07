@@ -1961,6 +1961,33 @@ impl SearchTree {
     }
 }
 
+/// A `.S` is preprocessed like C, so it reports the headers it read when asked
+/// (the `-M` family) and nothing when not.
+#[test]
+fn test_assembly_collects_dependencies_when_asked() {
+    let tree = SearchTree::new(&[("q/regs.h", "#define RET ret\n")]);
+    let include_paths = [tree.path("q")];
+    let run = |collect_dependencies| {
+        let config = AsmPreprocessConfig {
+            include_paths: &include_paths,
+            collect_dependencies,
+            ..Default::default()
+        };
+        preprocess_asm_file(
+            b"#include \"regs.h\"\n\tRET\n",
+            &Target::host(),
+            "t.S",
+            &config,
+        )
+        .expect("preprocesses")
+    };
+    let asked = run(true);
+    assert_eq!(asked.dependencies.len(), 1, "{:?}", asked.dependencies);
+    assert!(asked.dependencies[0].0.ends_with("regs.h"));
+    assert!(String::from_utf8_lossy(&asked.text).contains("ret"));
+    assert!(run(false).dependencies.is_empty());
+}
+
 #[test]
 fn test_search_pos_order_is_the_search_order() {
     assert!(SearchPos::IQuote(7) < SearchPos::Quote(0));

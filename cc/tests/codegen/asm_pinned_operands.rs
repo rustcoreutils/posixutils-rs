@@ -49,3 +49,38 @@ int main(void) {
         0
     );
 }
+
+/// What stays precolored: a `"+a"` operand, which the asm itself rewrites in
+/// its register, and an `asm goto` output, which no move after the template
+/// could reach on the jump -- here with a division, which writes %rax and
+/// %rdx, between the asm and the output's later use (gcc's asmgoto-4).
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn asm_pinned_read_write_and_goto_outputs_stay_in_their_register() {
+    let src = r#"
+__attribute__((noinline)) long twice(long x) {
+    for (int i = 0; i < 3; i++)
+        __asm__("addq %0, %0" : "+a"(x));
+    return x;
+}
+__attribute__((noinline)) long jump(long *p2, long *p3, long d) {
+    long *p4;
+    __asm__ goto("leaq 8(%2), %1\n\tjmp %l[lab2]" : "=r"(*p2), "=a"(p4) : "r"(p2) : "r8" : lab, lab2);
+lab:
+    return (p2 - p4) / d;
+lab2:
+    return (p4 - p3) / d;
+}
+int main(void) {
+    long a[4] = { 0 };
+    if (twice(3) != 24) return 1;
+    if (jump(&a[0], &a[0], 1) != 1) return 2;
+    return 0;
+}
+"#;
+    assert_eq!(compile_and_run("asm_pinned_rw_goto", src, &[]), 0);
+    assert_eq!(
+        compile_and_run("asm_pinned_rw_goto_o2", src, &["-O2".to_string()]),
+        0
+    );
+}

@@ -2339,6 +2339,28 @@ impl RegAlloc {
                 all_vertices.insert(pid);
             }
         }
+        // Each asm's outputs, by position: an asm writing its own pinned
+        // output -- a `"+a"` operand, live on both sides -- is the value
+        // arriving in that register, not something overwriting it.
+        // An `asm goto` output, though, has to be in its register: the jump
+        // skips any move after the template, so it is precolored as before.
+        let mut asm_outputs_at: HashMap<usize, Vec<PseudoId>> = HashMap::new();
+        let mut goto_outputs: HashSet<PseudoId> = HashSet::new();
+        for (pos, insn) in func.blocks.iter().flat_map(|b| &b.insns).enumerate() {
+            if let Some(asm) = insn.extra().asm_data.as_deref() {
+                let outputs = asm.outputs.iter().map(|o| o.pseudo);
+                if !asm.goto_labels.is_empty() {
+                    goto_outputs.extend(outputs.clone());
+                }
+                asm_outputs_at.insert(pos, outputs.collect());
+            }
+        }
+        let writes_it = |cp: &ConstraintPoint<Reg>, interval: &LiveInterval| {
+            exempt_from_clobber(cp, interval)
+                || asm_outputs_at
+                    .get(&cp.position)
+                    .is_some_and(|outs| outs.contains(&interval.pseudo))
+        };
         for (pid, reg) in collect_asm_fixed_precolors_x86_64(func) {
             // Only pre-color if the pseudo is a GP candidate. The
             // lowering already routes pinned-operand registers
@@ -2360,10 +2382,10 @@ impl RegAlloc {
                     interval,
                     reg,
                     constraint_points,
-                    exempt_from_clobber,
+                    writes_it,
                 )
             });
-            if overwritten && !pre_colored.contains_key(&pid) {
+            if overwritten && !pre_colored.contains_key(&pid) && !goto_outputs.contains(&pid) {
                 continue;
             }
             // If the pseudo is already pre-colored (ABI-pinned, or an

@@ -68,11 +68,10 @@ fn strip_section(section: &Section, is_relocatable: bool) -> bool {
     if is_relocatable {
         return false;
     }
-    // by removing all the symbols in the symbol table,
-    // the below sections will all be empty
-    section.sh_type == elf::SHT_GROUP
-        || section.sh_type == elf::SHT_RELA
-        || section.sh_type == elf::SHT_REL
+    // Relocations against the symbol table go with it. Dynamic relocations
+    // (.rela.dyn, .rela.plt) index .dynsym, which stays: the dynamic loader
+    // applies them to every PIE and shared object.
+    matches!(section.data, SectionData::Relocation(_))
         // after we removed all symbols, the
         // symbol table contains only the undefined
         // symbol entry, which can be removed

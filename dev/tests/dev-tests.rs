@@ -8,6 +8,7 @@
 //
 
 mod lex;
+mod strip;
 mod yacc;
 
 use object::{Object, ObjectSection, ObjectSymbol};

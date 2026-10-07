@@ -312,6 +312,53 @@ fn cp_parents_refuses_a_symlink_component_in_the_destination() {
     let _ = fs::remove_dir_all(&base);
 }
 
+/// POSIX writes through a dangling destination link named as the operand. A file that appears at
+/// the link's target between cp's check and its open is written as the link's target, from the
+/// start: replaced, never left with the tail of what it held.
+#[test]
+fn cp_through_a_dangling_operand_link_truncates_a_target_that_appears() {
+    use std::os::unix::fs::symlink;
+
+    let dir = scratch("dangling_appears");
+    let source = dir.join("source");
+    let link = dir.join("link");
+    let referent = dir.join("referent");
+    let staged = dir.join("staged");
+    fs::write(&source, b"source").unwrap();
+    let long = vec![b'X'; 4096];
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut round: u64 = 0;
+    while Instant::now() < deadline {
+        round += 1;
+        let _ = fs::remove_file(&referent);
+        let _ = fs::remove_file(&link);
+        symlink("referent", &link).unwrap();
+        fs::write(&staged, &long).unwrap();
+        let mut child = Command::new(get_binary_path("cp"))
+            .args([source.as_os_str(), link.as_os_str()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to execute cp");
+        std::thread::sleep(Duration::from_micros((round * 397) % 1500));
+        // Appears complete, or not at all if cp created it first.
+        let _ = fs::hard_link(&staged, &referent);
+        child.wait().unwrap();
+        let _ = fs::remove_file(&staged);
+
+        assert_eq!(
+            fs::read(&referent).unwrap(),
+            b"source",
+            "cp wrote through a dangling link into a file that appeared, without truncating \
+             it (round {round})"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A large set-user-ID source with an old modification time, for the `-p` races below: the copy
 /// takes long enough that the destination exists for a while before cp finishes with it.
 fn big_setuid_source(dir: &std::path::Path) -> PathBuf {

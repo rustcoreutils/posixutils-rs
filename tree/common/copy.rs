@@ -588,11 +588,17 @@ where
         // Under -n that EEXIST is the skip; otherwise it is reported. The one non-exclusive
         // create is POSIX's write through a dangling symbolic link that is the operand itself
         // (see below). Returns whether the copy was made.
+        //
+        // That write-through also truncates: a file that appears at the link's target between
+        // the check and the open is what the link now names, so it is replaced as a resolving
+        // operand link's target is, never written into with its old tail left behind. There is
+        // no earlier identity to compare it with -- the referent did not exist when checked --
+        // and the link followed is the operand itself, resolved in the directory cp holds.
         let write_through_dangling = target_is_dangling_symlink && !cfg.no_clobber;
         let create_flags = libc::O_WRONLY
             | libc::O_CREAT
             | if write_through_dangling {
-                0
+                libc::O_TRUNC
             } else {
                 libc::O_EXCL
             };

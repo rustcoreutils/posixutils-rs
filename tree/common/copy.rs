@@ -73,6 +73,8 @@ pub struct CopyConfig {
     pub interactive: bool,
     pub preserve: bool,
     pub recursive: bool,
+    /// GNU `-n`: a non-directory whose destination already exists is skipped silently.
+    pub no_clobber: bool,
     /// Diagnostic prefix (`"cp"` or `"mv"`) for messages emitted directly by the copy engine.
     pub prog: &'static str,
     /// When `true` (cp), a per-file failure is reported and the walk continues with same-level and
@@ -372,6 +374,11 @@ where
             Ok(())
         };
 
+        // -n: any existing destination, a dangling link included, is left alone.
+        if cfg.no_clobber && target_exists {
+            return Ok(CopyResult::Skipped);
+        }
+
         // 3.a
         if target_exists && !target_is_dangling_symlink {
             if state.created_files.contains(target) {
@@ -626,6 +633,10 @@ where
                     // else failed
                     else {
                         let e = io::Error::last_os_error();
+                        // Under -n an existing destination is kept, linked or not.
+                        if cfg.no_clobber && e.raw_os_error() == Some(libc::EEXIST) {
+                            return Ok(false);
+                        }
                         if cfg.continue_on_error {
                             eprintln!("{}: {}", cfg.prog, error_string(&e));
                             *had_error.borrow_mut() = true;

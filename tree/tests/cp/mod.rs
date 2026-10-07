@@ -7,6 +7,8 @@
 // SPDX-License-Identifier: MIT
 //
 
+mod debhelper;
+
 use plib::testing::{run_test, TestPlan};
 use std::ffi::CString;
 use std::io::{Read, Write};

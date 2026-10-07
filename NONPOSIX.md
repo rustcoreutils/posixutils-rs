@@ -176,6 +176,27 @@ spelling is taken in silence; C90 (`-ansi` included) draws a warning that
  * A `source/.` operand copies the contents of `source` rather than the
    directory itself.
 
+The rest are the GNU options debhelper passes for nearly every Debian
+package (`cp -an --reflink=auto` in Dh_Lib's file restore, `cp -a` in
+dh_install, dh_installdocs, dh_installexamples and dh_strip,
+`cp --parents -dp` and `cp --parents -a` in dh_install, dh_installdocs and
+dh_installexamples), with GNU cp's meaning:
+
+ * `-a` / `--archive` — `-R -P -p`, and files hard-linked to each other in
+   the source are hard-linked in the copy.  Extended attributes are not
+   copied.
+ * `-d` — `-P`, with hard links kept as for `-a`.
+ * `-n` / `--no-clobber` — an existing destination (other than a directory
+   being merged into) is left alone, silently and without affecting the exit
+   status.
+ * `--reflink=auto` — accepted, and files are copied normally: `auto` asks
+   for a copy-on-write clone only where one is available, so an ordinary copy
+   is always a correct result.  Any other `--reflink` form is refused.
+ * `--parents` — the destination of each source is the target directory
+   followed by the source's path, and missing directories on that path are
+   made from the source's (with `-p`, their owner, mode and times too).  The
+   target must be an existing directory.
+
 ### cpio
 
 The whole utility is an addition: a compatibility front-end over `pax`

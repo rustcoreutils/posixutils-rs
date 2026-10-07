@@ -702,6 +702,12 @@ where
             }
         }
 
+        // Only a prefix is opened here. The last component is the entry itself, which the
+        // caller stats and opens with its own follow semantics: a symbolic link loop there
+        // (ELOOP above) is an entry to report, not a directory to step into.
+        if path_components.clone().nth(1).is_none() {
+            break;
+        }
         let Some(component) = path_components.next() else {
             break;
         };

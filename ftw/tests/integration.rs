@@ -830,6 +830,35 @@ fn postprocess_entry_says_whether_it_is_a_symlink() {
     );
 }
 
+/// A starting point that is a symbolic link loop is still an entry: a walk that does not follow
+/// links stats the link itself. `ELOOP` from resolving the whole path made the walk open it one
+/// component at a time, and opening the last component -- the loop -- failed.
+#[test]
+fn symlink_loop_operand_is_an_entry() {
+    let tmp_dir = plib::tmp::Builder::new()
+        .prefix("symlink_loop_operand")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
+    let operand = tmp_dir.path().join("self");
+    unix::fs::symlink("self", &operand).unwrap();
+
+    let mut seen = Vec::new();
+    let mut errors = Vec::new();
+    ftw::traverse_directory(
+        &operand,
+        |entry| {
+            seen.push((entry.path().to_string(), entry.is_symlink()));
+            Ok(true)
+        },
+        |_, _| Ok(()),
+        |entry, e| errors.push((entry.path().to_string(), e.kind())),
+        ftw::TraverseDirectoryOpts::default(),
+    );
+
+    assert_eq!(errors, []);
+    assert_eq!(seen, [(operand.to_string_lossy().to_string(), Some(true))]);
+}
+
 /// `is_executable_at` answers as `access(2)` with `X_OK` does, relative to a directory
 /// descriptor: for the real user, following a final symbolic link.
 #[test]

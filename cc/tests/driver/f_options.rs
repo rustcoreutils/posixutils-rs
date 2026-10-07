@@ -267,3 +267,77 @@ fn use_ld_reaches_the_link() {
         assert!(!r.success, "-fuse-ld=mold did not reach the link");
     }
 }
+
+/// Run c17 in `dir` with `args`, feeding it `stdin`.
+fn run_in_with_stdin(dir: &Path, args: &[&str], stdin: &str) -> std::process::Output {
+    use std::io::Write;
+    let mut child = std::process::Command::new(plib::testing::get_binary_path("c17"))
+        .args(args)
+        .current_dir(dir)
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn c17");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(stdin.as_bytes())
+        .expect("write stdin");
+    child.wait_with_output().expect("wait for c17")
+}
+
+/// The names in `dir`, sorted.
+fn listing(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// `-fsyntax-only` checks the translation unit and writes nothing: no
+/// object, no assembly, no link. libxcrypt's `compute-symver-floor` asks the
+/// compiler `cc -fsyntax-only -xc -` whether a preprocessor condition holds,
+/// to choose the versions of its compatibility symbols. Refused, every
+/// condition read as false, and libcrypt.so.1 exported `crypt@GLIBC_2.0`
+/// instead of the `crypt@GLIBC_2.2.5` every x86-64 binary links against.
+#[test]
+fn syntax_only_checks_and_writes_nothing() {
+    let (dir, path) = scratch("t.c", CLEAN);
+    let out = run_in_with_stdin(dir.path(), &["-fsyntax-only", path.to_str().unwrap()], "");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.is_empty(), "{err}");
+    assert_eq!(listing(dir.path()), ["t.c"]);
+
+    let probe = |cond: &str| {
+        let src = format!(
+            "#include <limits.h>\n#if !({cond})\n#error nope\n#endif\n\
+             int avoid_empty_translation_unit;\n"
+        );
+        let out = run_in_with_stdin(dir.path(), &["-fsyntax-only", "-xc", "-"], &src);
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (ok, err) = probe("ULONG_MAX >= UINT_MAX");
+    assert!(ok, "{err}");
+    let (ok, err) = probe("ULONG_MAX < UINT_MAX");
+    assert!(!ok, "a false condition passed");
+    assert!(err.contains("nope"), "{err}");
+
+    // A syntax error and a constraint violation fail, as they do compiling.
+    for bad in [
+        "int f(void) { return }\n",
+        "int f(void) { return undeclared; }\n",
+    ] {
+        let out = run_in_with_stdin(dir.path(), &["-fsyntax-only", "-xc", "-"], bad);
+        assert!(!out.status.success(), "{bad}");
+    }
+    assert_eq!(listing(dir.path()), ["t.c"]);
+}

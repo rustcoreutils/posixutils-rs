@@ -173,6 +173,10 @@ struct Args {
     #[arg(long = "dump-ast", help = gettext("Parse and dump AST to stdout"))]
     dump_ast: bool,
 
+    /// `-fsyntax-only`: preprocess and parse, diagnose, and write nothing.
+    #[arg(long = "fsyntax-only", help = gettext("Check the source for errors; write nothing"))]
+    syntax_only: bool,
+
     /// Dump IR at a named stage (for debugging)
     /// Stages: post-linearize, post-mapping, post-opt, post-lower, all
     /// Bare --dump-ir = post-opt (backward compat)
@@ -630,7 +634,7 @@ impl pipeline::Observer for DriverObserver<'_> {
             println!("{:#?}", ast);
             return Ok(false);
         }
-        Ok(true)
+        Ok(!self.args.syntax_only)
     }
 
     fn linearized(
@@ -1998,6 +2002,9 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
         } else if arg == "-fverbose-asm" {
             result.push("--fverbose-asm".to_string());
             i += 1;
+        } else if arg == "-fsyntax-only" {
+            result.push("--fsyntax-only".to_string());
+            i += 1;
         } else if arg == "-fpermissive" {
             result.push("--fpermissive".to_string());
             i += 1;
@@ -3171,6 +3178,7 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
         && !args.dependencies_replace_output()
         && !args.dump_tokens
         && !args.dump_ast
+        && !args.syntax_only
         && args.dump_ir.is_none();
 
     for (idx, op) in operands.iter().enumerate() {
@@ -3778,6 +3786,7 @@ mod tests {
             "-fno-trapping-math",
             "-fuse-ld=lld",
             "-fverbose-asm",
+            "-fsyntax-only",
             "-fvisibility=hidden",
         ] {
             assert_eq!(

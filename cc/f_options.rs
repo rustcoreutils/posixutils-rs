@@ -268,6 +268,8 @@ const PLAIN: &[(&str, Effect)] = &[
     ("stack-protector-strong", Unsupported),
     ("strict-aliasing", Accepted(Permission)),
     ("strict-overflow", Accepted(Permission)),
+    // Main driver: check, write nothing. libxcrypt's symbol-version probe.
+    ("syntax-only", Implemented),
     ("tracer", Accepted(Pass)),
     ("trapping-math", Implemented),
     // Signed overflow wraps rather than aborting.

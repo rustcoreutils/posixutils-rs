@@ -1357,18 +1357,26 @@ int main(void)
 /// first) failed with "undefined reference to `ctf_open'".
 #[test]
 fn codegen_pragma_weak() {
+    // Whether a weak reference no definition satisfies *links* is the
+    // platform linker's policy: ELF resolves it to null, Apple's ld refuses
+    // it. So that half runs off Darwin only, as for `__attribute__((weak))`
+    // in codegen::asm_attributes; the yielding definition runs everywhere.
     let unit_a = r#"
+#ifndef __APPLE__
 #pragma weak absent_later
 int absent_before(void);
 int absent_later(void);
 #pragma weak absent_before
+#endif
 #pragma weak hook
 int hook(void) { return 1; }
 
 int main(void)
 {
+#ifndef __APPLE__
     if (&absent_before != 0) return 1;
     if (&absent_later != 0) return 2;
+#endif
     if (hook() != 2) return 3;
     return 0;
 }

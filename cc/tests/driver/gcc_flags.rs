@@ -1059,3 +1059,82 @@ fn gcc_flags_unknown_option_is_refused_in_gccs_words() {
     assert!(r.stderr.starts_with("c17: error: "), "{}", r.stderr);
     assert!(!r.stderr.contains("Usage:"), "{}", r.stderr);
 }
+
+/// An option that takes an argument takes the next word as it, even one that
+/// begins with `-` (POSIX.2024 XBD 12.2, Utility Syntax Guidelines 6 and 7;
+/// gcc does the same). zstd's educational decoder passes `-I -I/common` when
+/// a Makefile variable is empty: a directory named `-I/common`, not a missing
+/// argument.
+#[test]
+fn gcc_flags_option_argument_may_begin_with_a_hyphen() {
+    // -I and -L: a directory that happens to start with '-'.
+    let c = compile_with("hy_i.c", MAIN, &["-I", "-I/common"]);
+    assert!(c.success, "{}", c.stderr);
+    let c = compile_with("hy_l.c", MAIN, &["-L", "-Lnowhere"]);
+    assert!(c.success, "{}", c.stderr);
+    // -D: the next word is the macro definition, whatever it looks like;
+    // `-DX` is not a valid macro name, so that is the complaint, as in gcc,
+    // not a missing argument.
+    let pp = preprocess_text("hy_d.c", "int v;\n", &["-D", "-DX"]);
+    assert!(!pp.stderr.contains("missing argument"), "{}", pp.stderr);
+    // -o: the output file may be named "-out".
+    let (dir, path) = scratch("hy_o.c", MAIN);
+    let out = dir.path().join("-out");
+    let r = run_c17(&["-c", "-o", out.to_str().unwrap(), path.to_str().unwrap()]);
+    assert!(r.success && out.exists(), "{}", r.stderr);
+    let r = std::process::Command::new(env!("CARGO_BIN_EXE_c17"))
+        .current_dir(dir.path())
+        .args(["-c", "-o", "-out2", path.to_str().unwrap()])
+        .output()
+        .expect("run c17");
+    assert!(
+        r.status.success() && dir.path().join("-out2").exists(),
+        "{}",
+        String::from_utf8_lossy(&r.stderr)
+    );
+}
+
+/// The header options and `-l` take a hyphen-led argument too: a directory
+/// `-inc`, a file `-pre.h`, a library `-lfoo`.
+#[test]
+fn gcc_flags_header_and_library_options_take_a_hyphen_argument() {
+    let (dir, path) = scratch(
+        "hy_h.c",
+        "#include \"h.h\"\nint main(void) { return V + W; }\n",
+    );
+    std::fs::create_dir(dir.path().join("-inc")).unwrap();
+    std::fs::write(dir.path().join("-inc/h.h"), "#define V 0\n").unwrap();
+    std::fs::write(dir.path().join("-pre.h"), "#define W 0\n").unwrap();
+    let c17 = |args: &[&str]| {
+        let r = std::process::Command::new(env!("CARGO_BIN_EXE_c17"))
+            .current_dir(dir.path())
+            .args(args)
+            .output()
+            .expect("run c17");
+        (
+            r.status.success(),
+            String::from_utf8_lossy(&r.stderr).into_owned(),
+        )
+    };
+    let src = path.to_str().unwrap();
+    for opt in ["-I", "-iquote", "-isystem", "-idirafter"] {
+        let (ok, stderr) = c17(&[opt, "-inc", "-include", "-pre.h", "-c", "-o", "o.o", src]);
+        assert!(ok, "{opt}: {stderr}");
+    }
+    // The library `-lc17nosuch` is looked for and not found; the complaint
+    // is the linker's, not a missing argument.
+    let (ok, stderr) = c17(&[
+        "-I",
+        "-inc",
+        "-include",
+        "-pre.h",
+        src,
+        "-o",
+        "a.out",
+        "-l",
+        "-lc17nosuch",
+    ]);
+    assert!(!ok);
+    assert!(!stderr.contains("missing argument"), "{stderr}");
+    assert!(stderr.contains("-lc17nosuch"), "{stderr}");
+}

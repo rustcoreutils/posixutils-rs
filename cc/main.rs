@@ -30,7 +30,7 @@ use posixutils_cc::token;
 use posixutils_cc::types;
 use posixutils_cc::warn_options::{self, Verdict};
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::{gettext, gettext_args};
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -351,7 +351,7 @@ struct Args {
     prefix_maps: Vec<MapOption>,
 
     #[arg(short = 'W', action = clap::ArgAction::Append, value_name = "warning",
-          num_args = 0..=1, default_missing_value = "extra", help = gettext("Warning flags (e.g., -Wall, -Wextra, -Wno-unused)"))]
+          help = gettext("Warning flags (e.g., -Wall, -Wextra, -Wno-unused)"))]
     warnings: Vec<String>,
 
     #[arg(short = 'w', help = gettext("Suppress all warnings"))]
@@ -1853,7 +1853,21 @@ fn preprocess_args_from(raw_args: Vec<String>) -> Vec<String> {
         let f_spelling = two_dash_prefix_map(arg);
         let arg = f_spelling.as_ref().unwrap_or(arg);
 
-        if arg == "-O" {
+        if arg == "-W" {
+            // gcc's old spelling of `-Wextra`. Given its value here, `-W`
+            // is an option like `-I` that always has one.
+            result.push("-W".to_string());
+            result.push("extra".to_string());
+            i += 1;
+        } else if takes_separate_value(arg) && i + 1 < raw_args.len() {
+            // `-I dir`, `-o file`, `-l lib`, ...: the next word is the value
+            // as written, even one that looks like an option (`-I -I/common`),
+            // so none of the rewriting below may touch it. At the end of the
+            // line the option goes on alone, for clap's "missing argument".
+            result.push(arg.clone());
+            result.push(raw_args[i + 1].clone());
+            i += 2;
+        } else if arg == "-O" {
             // Standalone -O: check if next arg is a valid optimization level
             let new_flag = if i + 1 < raw_args.len() && is_valid_opt_level(&raw_args[i + 1]) {
                 let flag = format!("-O{}", raw_args[i + 1]);
@@ -2430,6 +2444,63 @@ fn forward_to_host_driver(query: &str) -> i32 {
     }
 }
 
+/// Whether `arg` takes exactly one value, given as its own word or joined.
+///
+/// These are the options POSIX.2024 XBD 12.2 Guidelines 6 and 7 speak of:
+/// the word after one is its option-argument, whatever it looks like. An
+/// optional-valued option (`-O`, `--dump-ir`) is not one: its value is only
+/// ever joined.
+fn takes_one_value(arg: &clap::Arg) -> bool {
+    !arg.is_positional()
+        && arg.get_action().takes_values()
+        && arg
+            .get_num_args()
+            .is_none_or(|n| n.min_values() == 1 && n.max_values() == 1)
+}
+
+/// The spellings, in the rewritten vector, of every option that takes its
+/// value as the next word: `-I`, `-o`, `--isystem` and the rest, read off
+/// `Args` so that adding an option there is all it takes.
+fn separate_value_options() -> &'static [String] {
+    static SPELLINGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    SPELLINGS.get_or_init(|| {
+        Args::command()
+            .get_arguments()
+            .filter(|a| takes_one_value(a))
+            .flat_map(|a| {
+                let short = a.get_short().map(|c| format!("-{c}"));
+                let long = a.get_long().map(|l| format!("--{l}"));
+                short.into_iter().chain(long)
+            })
+            .collect()
+    })
+}
+
+/// Whether the word after `arg` is its option-argument; see
+/// [`separate_value_options`].
+fn takes_separate_value(arg: &str) -> bool {
+    separate_value_options().iter().any(|s| s == arg)
+}
+
+/// Parse a rewritten command line with clap.
+///
+/// Every option that takes one value takes the next word as it even when that
+/// word begins with `-` (XBD 12.2, Guideline 7: an option-argument is not
+/// optional), as gcc does: a Makefile whose variable is empty passes
+/// `-I -I/common`, which is the directory `-I/common`. clap would otherwise
+/// read the second word as an option and call the first one's value missing.
+fn try_parse(argv: &[String]) -> Result<Args, clap::Error> {
+    let command = Args::command().mut_args(|a| {
+        if takes_one_value(&a) {
+            a.allow_hyphen_values(true)
+        } else {
+            a
+        }
+    });
+    let mut matches = command.try_get_matches_from(argv)?;
+    Args::from_arg_matches_mut(&mut matches)
+}
+
 /// Parse the rewritten command line, refusing it as gcc's driver would.
 ///
 /// clap's own refusal named no program, followed it with a usage block, and
@@ -2440,7 +2511,7 @@ fn forward_to_host_driver(query: &str) -> i32 {
 /// them. The status is gcc's 1, not clap's 2.
 fn parse_args(argv: Vec<String>) -> Args {
     use clap::error::ErrorKind;
-    match Args::try_parse_from(&argv) {
+    match try_parse(&argv) {
         Ok(args) => args,
         Err(e) => match e.kind() {
             ErrorKind::DisplayHelp
@@ -2497,7 +2568,7 @@ fn unknown_option_culprit<'a>(argv: &'a [String], reported: &'a str) -> &'a str 
         return reported;
     }
     let fails_on_reported = |arg: &str| {
-        let Err(e) = Args::try_parse_from([argv[0].as_str(), arg]) else {
+        let Err(e) = try_parse(&[argv[0].clone(), arg.to_string()]) else {
             return false;
         };
         e.kind() == ErrorKind::UnknownArgument
@@ -2915,9 +2986,9 @@ impl AssemblerCommand {
 /// object each operand contributes, if any. Walking `scanned` therefore places
 /// every `-L`/`-l`/`-R` exactly where it appeared relative to the operands.
 ///
-/// If the rescan disagrees with what clap collected — which would mean
-/// `VALUE_OPTIONS` in `linkargs` has drifted from `Args` — the ordering is not
-/// trustworthy, so this falls back to the unordered shape (every object, then
+/// If the rescan disagrees with what clap collected — which would mean the
+/// rescan read an option's value as an operand, or the reverse — the ordering
+/// is not trustworthy, so this falls back to the unordered shape (every object, then
 /// every `-L`, then every `-l`, then every `-R`) rather than emitting a
 /// scrambled link line.
 fn build_link_line(
@@ -3037,7 +3108,7 @@ fn compile_main() -> Result<(), Box<dyn std::error::Error>> {
     // Rescan for the -L/-l/-R order relative to the operands, which clap's
     // per-flag collection cannot preserve. Done before parsing so a parse
     // failure still exits the usual way.
-    let scanned = linkargs::scan(argv.iter().cloned());
+    let scanned = linkargs::scan(argv.iter().cloned(), takes_separate_value);
     let args = parse_args(argv);
 
     if args.no_warnings {
@@ -4216,5 +4287,94 @@ mod tests {
         assert!(!result.contains(&"-pipe".to_string()));
         // Linker flags should be passed through
         assert!(result.iter().any(|a| a.starts_with("--c17-linker-flag=")));
+    }
+
+    /// Every option that takes a value takes the next word as it, even one
+    /// that begins with `-` (XBD 12.2, Guidelines 6 and 7), in each spelling
+    /// gcc gives it. `-Wall` would be rewritten if the rewriting reached it.
+    #[test]
+    fn option_argument_may_begin_with_a_hyphen() {
+        let v = "-Wall";
+        let parse = |opt: &str| {
+            let args = try_parse(&run_preprocess(&[opt, v, "foo.c"]))
+                .unwrap_or_else(|e| panic!("{opt} {v}: {e}"));
+            assert_eq!(args.files, ["foo.c"], "{opt}");
+            assert!(args.warnings.is_empty(), "{opt}");
+            args
+        };
+        let one = |o: Option<String>| o.into_iter().collect::<Vec<_>>();
+        type Field = fn(Args) -> Vec<String>;
+        let cases: &[(&str, Field)] = &[
+            ("-I", |a| a.include_paths),
+            ("-D", |a| a.defines),
+            ("-U", |a| a.undefines),
+            ("-L", |a| a.lib_paths),
+            ("-l", |a| a.libraries),
+            ("-R", |a| a.run_paths),
+            ("-iquote", |a| a.iquote_paths),
+            ("-isystem", |a| a.isystem_paths),
+            ("-idirafter", |a| a.idirafter_paths),
+            ("-include", |a| a.pre_includes),
+            ("-MT", |a| a.deps_target),
+            ("--dump-ir-func", |a| a.dump_ir_func.into_iter().collect()),
+        ];
+        for (opt, field) in cases {
+            assert_eq!(field(parse(opt)), [v], "{opt}");
+        }
+        assert_eq!(one(parse("-o").output), [v]);
+        assert_eq!(one(parse("-B").binding), [v]);
+        assert_eq!(one(parse("-MF").deps_file), [v]);
+        assert_eq!(one(parse("-aux-info").aux_info), [v]);
+        assert_eq!(one(parse("--sysroot").sysroot), [v]);
+        assert_eq!(one(parse("--target").target), [v]);
+        assert_eq!(one(parse("--rtlib").rtlib), [v]);
+        // Joined spellings are untouched.
+        let args = try_parse(&run_preprocess(&["-I-I/common", "-L-Lx", "foo.c"])).unwrap();
+        assert_eq!(args.include_paths, ["-I/common"]);
+        assert_eq!(args.lib_paths, ["-Lx"]);
+    }
+
+    /// An option with nothing after it is still missing its argument, in
+    /// gcc's words.
+    #[test]
+    fn option_at_the_end_is_missing_its_argument() {
+        for opt in ["-I", "-D", "-o", "-l", "-L"] {
+            let argv = run_preprocess(&["foo.c", opt]);
+            let err = try_parse(&argv).err().expect(opt);
+            assert_eq!(
+                parse_error_text(&err, &argv),
+                format!("error: missing argument to '{opt}'")
+            );
+        }
+    }
+
+    /// Bare `-W` is gcc's `-Wextra`, and takes no word after it.
+    #[test]
+    fn bare_w_is_wextra_and_takes_no_argument() {
+        let args = try_parse(&run_preprocess(&["-W", "-c", "foo.c"])).unwrap();
+        assert_eq!(args.warnings, ["extra"]);
+        assert!(args.compile_only);
+        let args = try_parse(&run_preprocess(&["foo.c", "-W"])).unwrap();
+        assert_eq!(args.warnings, ["extra"]);
+    }
+
+    /// The link-order rescan knows the same options as the parser: a value is
+    /// never an operand, and one that looks like an option is still a value.
+    #[test]
+    fn link_rescan_reads_values_as_the_parser_does() {
+        use linkargs::LinkArg;
+        let scan = |argv: &[&str]| linkargs::scan(run_preprocess(argv), takes_separate_value);
+        assert_eq!(
+            scan(&["-std=c17", "-iquote", "inc", "a.c", "-l", "m"]),
+            [LinkArg::Operand("a.c".into()), LinkArg::Library("m".into())]
+        );
+        assert_eq!(
+            scan(&["-L", "-Lx", "a.c", "-l", "-lfoo", "-I", "-I/common"]),
+            [
+                LinkArg::LibPath("-Lx".into()),
+                LinkArg::Operand("a.c".into()),
+                LinkArg::Library("-lfoo".into()),
+            ]
+        );
     }
 }

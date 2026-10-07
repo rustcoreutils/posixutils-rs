@@ -10,9 +10,10 @@
  * _FloatN functions under _GNU_SOURCE, which c17 predefines. Standing in for
  * it hid those, so a hosted glibc build uses the library's own, which c17
  * parses as it is. Its guard is also `_COMPLEX_H`, so this test must come
- * before the one below.
+ * before the one below. The test is the GNU/Linux target, not `__GLIBC__`,
+ * which only glibc's <features.h> defines.
  */
-#if __STDC_HOSTED__ && defined(__GLIBC__) && !defined(_COMPLEX_H)
+#if __STDC_HOSTED__ && defined(__gnu_linux__) && !defined(_COMPLEX_H)
 #include_next <complex.h>
 #endif
 

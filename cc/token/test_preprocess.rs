@@ -580,9 +580,9 @@ fn test_macro_redefinition_conflict_detection() {
 #[test]
 fn test_replacement_lists_ignore_leading_whitespace() {
     // Whitespace before the first replacement token is not a separation
-    // *within* the list. Without this, every compilation against glibc
-    // warned: we predefine __GLIBC__ with no leading space, while
-    // features.h writes `#define __GLIBC__ 2` with one.
+    // *within* the list. Without this, a predefined macro (spelled with no
+    // leading space) that a header redefines as `#define NAME 2`, with one,
+    // was reported as a conflicting redefinition.
     let a = vec![MacroToken {
         typ: TokenType::Number,
         value: MacroTokenValue::Number("2".into()),

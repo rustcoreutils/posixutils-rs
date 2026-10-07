@@ -20,9 +20,11 @@
  * glibc's headers include <stdint.h> expecting it to bring in <features.h>
  * and <sys/cdefs.h> (`__BEGIN_DECLS`, `__THROW`, `__flexarr`), and
  * <sys/eventfd.h>, <sys/inotify.h> and others include nothing else. Its guard
- * is also `_STDINT_H`, so this test must come before the one below.
+ * is also `_STDINT_H`, so this test must come before the one below. The
+ * test is the GNU/Linux target, not `__GLIBC__`, which only glibc's
+ * <features.h> defines.
  */
-#if __STDC_HOSTED__ && defined(__GLIBC__) && !defined(_STDINT_H)
+#if __STDC_HOSTED__ && defined(__gnu_linux__) && !defined(_STDINT_H)
 #include_next <stdint.h>
 #endif
 

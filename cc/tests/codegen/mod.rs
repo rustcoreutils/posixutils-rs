@@ -19,6 +19,7 @@ mod asm_callee_saved;
 mod asm_constraint_letters;
 mod asm_fp_clobbers;
 mod asm_operand_modifiers;
+mod asm_pinned_operands;
 pub mod asm_probe;
 mod asm_template_syntax;
 mod binary128;

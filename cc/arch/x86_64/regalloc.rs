@@ -2348,6 +2348,24 @@ impl RegAlloc {
             if !gp_candidates.contains(&pid) {
                 continue;
             }
+            // Nor if something else writes that register while the pseudo
+            // is live -- the next `mulq` of three in a row, whose `"=a"` and
+            // `"=d"` outputs are pinned to the same two registers. Precolored,
+            // every product sat in %rax/%rdx and each asm overwrote the last
+            // one's; uncolored, the pseudo is placed like any other value,
+            // kept out of the register by that constraint point, and the asm
+            // codegen moves it in and out.
+            let overwritten = by_pseudo.get(&pid).is_some_and(|interval| {
+                crate::arch::regalloc::clobbered_while_live(
+                    interval,
+                    reg,
+                    constraint_points,
+                    exempt_from_clobber,
+                )
+            });
+            if overwritten && !pre_colored.contains_key(&pid) {
+                continue;
+            }
             // If the pseudo is already pre-colored (ABI-pinned, or an
             // earlier asm operand pinned it), `or_insert` keeps the
             // existing register. We must mirror exactly that choice

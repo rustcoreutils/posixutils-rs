@@ -271,6 +271,15 @@ enum DereferenceSymbolicLink {
     None,
 }
 
+/// Whether a directory operand is listed by its contents or as itself.
+enum DirectoryOperands {
+    /// -d: every operand is written as itself.
+    AsFiles,
+    /// A directory operand's contents are written. `follow_symlinks` says whether a symbolic link
+    /// to a directory counts as one: POSIX follows it unless -F or -l is given without -H or -L.
+    Contents { follow_symlinks: bool },
+}
+
 #[allow(clippy::enum_variant_names)]
 enum FileTimeOption {
     LastModificationTime,
@@ -289,6 +298,7 @@ struct Config {
     sort_by: SortBy,
     classify_files: ClassifyFiles,
     dereference_symbolic_link: DereferenceSymbolicLink,
+    directory_operands: DirectoryOperands,
     file_time_option: FileTimeOption,
     file_inclusion: FileInclusion,
     inode: bool,
@@ -443,6 +453,17 @@ impl Config {
             _ => unreachable!(), // -H and -L are mutually exclusive
         };
 
+        let directory_operands = if args.directory {
+            DirectoryOperands::AsFiles
+        } else {
+            DirectoryOperands::Contents {
+                follow_symlinks: !matches!(
+                    dereference_symbolic_link,
+                    DereferenceSymbolicLink::None
+                ) || !(args.classify || long_format_enabled),
+            }
+        };
+
         let file_time_option = match (args.use_last_status_change_time, args.use_last_access_time) {
             (false, false) => FileTimeOption::LastModificationTime,
             (true, false) => FileTimeOption::LastStatusChangeTime,
@@ -480,6 +501,7 @@ impl Config {
             sort_by,
             classify_files,
             dereference_symbolic_link,
+            directory_operands,
             file_time_option,
             file_inclusion,
 
@@ -644,25 +666,27 @@ fn calc_optimal_padding(
     unreachable!()
 }
 
-fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str>) {
-    match &config.sort_by {
-        SortBy::DirectoryOrder => (), // Already sorted by directory order
-        other_sorting => {
-            entries.sort_by(|a, b| {
-                let sort_fn = match other_sorting {
-                    SortBy::Lexicographical => Entry::sorting_cmp_lexicographic,
-                    SortBy::FileSize => Entry::sorting_cmp_size,
-                    SortBy::Time => Entry::sorting_cmp_time,
-                    SortBy::DirectoryOrder => unreachable!(), // Already handled
-                };
-                if config.reverse_sorting {
-                    sort_fn(a, b).reverse()
-                } else {
-                    sort_fn(a, b)
-                }
-            });
+/// Sort `items` by the `Entry` each carries, in the order -S, -t, -r and -f select. -f keeps the
+/// order they arrived in.
+fn sort_by_entry<T>(items: &mut [T], entry: impl Fn(&T) -> &Entry, config: &Config) {
+    let sort_fn = match &config.sort_by {
+        SortBy::DirectoryOrder => return,
+        SortBy::Lexicographical => Entry::sorting_cmp_lexicographic,
+        SortBy::FileSize => Entry::sorting_cmp_size,
+        SortBy::Time => Entry::sorting_cmp_time,
+    };
+    items.sort_by(|a, b| {
+        let order = sort_fn(entry(a), entry(b));
+        if config.reverse_sorting {
+            order.reverse()
+        } else {
+            order
         }
-    }
+    });
+}
+
+fn display_entries(entries: &mut [Entry], config: &Config, dir_path: Option<&str>) {
+    sort_by_entry(entries, |e| e, config);
 
     let mut display_total_size = config.display_size;
     if let OutputFormat::Long(_) = &config.output_format {
@@ -862,6 +886,32 @@ fn report_operand_error(path: &Path, e: &io::Error) {
     );
 }
 
+/// Whether operand `path` is listed by its contents rather than written as itself.
+fn lists_contents(path: &Path, config: &Config) -> bool {
+    let DirectoryOperands::Contents { follow_symlinks } = config.directory_operands else {
+        return false;
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_symlink() => follow_symlinks && path.is_dir(),
+        Ok(md) => md.is_dir(),
+        // Reported when it is listed as a file
+        Err(_) => false,
+    }
+}
+
+/// The `Entry` a directory operand sorts by. A symbolic link operand that reached here is followed.
+fn directory_operand_entry(path: &Path, config: &Config) -> io::Result<Entry> {
+    let path_cstr = CString::new(path.as_os_str().as_bytes())?;
+    let metadata = ftw::Metadata::new(libc::AT_FDCWD, &path_cstr, true)?;
+    Entry::new(
+        None,
+        path.as_os_str().to_os_string(),
+        &metadata,
+        config,
+        path,
+    )
+}
+
 fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
     let mut exit_code = 0;
 
@@ -871,12 +921,25 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
 
     // Categorize into directories/files
     for path in paths {
-        if path.is_dir() {
+        if lists_contents(&path, config) {
             directories.push(path);
         } else {
             files.push(path);
         }
     }
+    // POSIX sorts directory operands like file operands, by the same keys.
+    let mut directories: Vec<(Entry, PathBuf)> = directories
+        .into_iter()
+        .filter_map(|path| match directory_operand_entry(&path, config) {
+            Ok(entry) => Some((entry, path)),
+            Err(e) => {
+                report_operand_error(&path, &e);
+                exit_code = exit_code.max(1);
+                None
+            }
+        })
+        .collect();
+    sort_by_entry(&mut directories, |(entry, _)| entry, config);
 
     let num_directory_args = directories.len();
     let num_file_args = files.len();
@@ -953,7 +1016,7 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
     }
 
     let mut is_first_dir_arg = true;
-    for path in directories.into_iter() {
+    for (_, path) in directories {
         exit_code = exit_code.max(process_single_dir(
             path,
             config,

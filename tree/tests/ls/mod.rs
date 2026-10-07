@@ -378,6 +378,77 @@ fn test_ls_directory_operand_listed_each_time_it_is_named() {
     );
 }
 
+/// POSIX: directory operands are sorted like any other names (and by -r/-t/-S),
+/// not listed in command-line order.
+#[test]
+fn test_ls_directory_operands_are_sorted() {
+    let dir = plib::tmp::tempdir().unwrap();
+    make_hard_link_tree(dir.path());
+    let d1 = dir.path().join("d1");
+    let d1s = d1.to_str().unwrap();
+    let d2 = d1.join("d2");
+    let d2s = d2.to_str().unwrap();
+    let d1_listing = format!("{d1s}:\nd2\nempty\nhl\n");
+    let d2_listing = format!("{d2s}:\nf1\nf2\nf2same\nsub\n");
+
+    ls_test(&[d2s, d1s], &format!("{d1_listing}\n{d2_listing}"), "", 0);
+    ls_test(
+        &["-r", d1s, d2s],
+        &format!("{d2s}:\nsub\nf2same\nf2\nf1\n\n{d1s}:\nhl\nempty\nd2\n"),
+        "",
+        0,
+    );
+}
+
+/// -d lists a directory operand as itself, not its contents.
+#[test]
+fn test_ls_d_lists_directory_operands_as_files() {
+    let dir = plib::tmp::tempdir().unwrap();
+    make_hard_link_tree(dir.path());
+    let d1 = dir.path().join("d1");
+    let d1s = d1.to_str().unwrap();
+    let hl = d1.join("hl");
+    let hls = hl.to_str().unwrap();
+    let lnk = dir.path().join("lnk");
+    let lnks = lnk.to_str().unwrap();
+
+    ls_test(&["-d", hls, d1s], &format!("{d1s}\n{hls}\n"), "", 0);
+    ls_test(&["-d", lnks], &format!("{lnks}\n"), "", 0);
+    ls_test_with_checker(&["-ld", d1s], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.starts_with('d'), "{stdout:?}");
+        assert!(stdout.ends_with(&format!(" {d1s}\n")), "{stdout:?}");
+        assert_eq!(stdout.lines().count(), 1, "{stdout:?}");
+    });
+}
+
+/// POSIX: with -d, -F or -l and neither -H nor -L, a symbolic link to a
+/// directory named as an operand is written as the link itself.
+#[test]
+fn test_ls_symlink_operand_not_followed_under_d_f_l() {
+    let dir = plib::tmp::tempdir().unwrap();
+    make_hard_link_tree(dir.path());
+    let lnk = dir.path().join("lnk");
+    let lnks = lnk.to_str().unwrap();
+
+    ls_test(&["-F", lnks], &format!("{lnks}@\n"), "", 0);
+    ls_test_with_checker(&["-l", lnks], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.starts_with('l'), "{stdout:?}");
+        assert!(
+            stdout.ends_with(&format!(" {lnks} -> d1/d2\n")),
+            "{stdout:?}"
+        );
+    });
+    // -H follows it again, so -l lists the directory's contents.
+    ls_test_with_checker(&["-lH", lnks], |_, output| {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.starts_with("total "), "{stdout:?}");
+        assert!(stdout.contains(" f2same\n"), "{stdout:?}");
+    });
+    ls_test(&["-FL", lnks], "f1\nf2\nf2same\nsub/\n", "", 0);
+}
+
 /// A `-R` cycle refuses only the entry that closes it; the rest of the tree is
 /// still listed, as GNU does.
 #[test]
